@@ -22,15 +22,15 @@ trap 'exit 1' HUP INT TERM
     else
         shasum -a 256 -c "$host.sha256"
     fi
-)
+) >&2
 gzip -dc "bootstrap/$host.gz" > "$work/seed"
 chmod 755 "$work/seed"
-"$work/seed" build "selfhost/$entry.ddr" -o "$work/stage2"
-"$work/stage2" build "selfhost/$entry.ddr" -o "$work/stage3"
+"$work/seed" build "selfhost/$entry.ddr" -o "$work/stage2" >&2
+"$work/stage2" build "selfhost/$entry.ddr" -o "$work/stage3" >&2
 if ! cmp -s "$work/stage2" "$work/stage3"; then
     # A new compiler can intentionally change its own emitted code. Rebuild
     # once more with the new emitter, then require an identical fixed point.
-    "$work/stage3" build "selfhost/$entry.ddr" -o "$work/stage4"
+    "$work/stage3" build "selfhost/$entry.ddr" -o "$work/stage4" >&2
     cmp "$work/stage3" "$work/stage4"
 fi
 mv -f "$work/stage3" "$dir/dunder"
