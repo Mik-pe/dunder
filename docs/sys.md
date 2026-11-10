@@ -1,7 +1,7 @@
-# sys på macOS
+# sys på macOS och Linux
 
 `import sys` laddar Dunders medföljande systembibliotek. Den första
-implementationen riktar sig till ARM64/macOS och använder Dunders egen
+implementationen stöder ARM64/macOS, ARM64/Linux och x86-64/Linux med Dunders egen
 native-backend. Källfiler har ändelsen `.ddr`; importer skrivs utan suffix.
 
 ```dunder
@@ -48,7 +48,7 @@ implementeras i [native-backenden](../src/native/sys.rs).
 | `sys.error_message(error)` | `string` | Kort meddelande för vanliga fel; annars `"OS error N"`. |
 | `sys.file_kind(info)` | `sys.FileKind` | `Other`, `File` eller `Directory` från en `Metadata`. Kontrollera först `info.ok`. |
 | `sys.error_from_code(code)` | `sys.IoError` | Namngivet fel eller `Other(code)` för en okänd kod. |
-| `sys.error_code(error)` | `i32` | Ursprunglig felkod, även för `Other(code)`. |
+| `sys.error_code(error)` | `i32` | Dunders felkod, även för `Other(code)`. |
 | `sys.io_error_message(error)` | `string` | Feltext för ett typat `IoError`. |
 | `sys.write_bytes(path, &bytes)` | `sys.Status` | Skriver `[]i32` som råa byte; kräver värden 0–255. |
 | `sys.decode_utf8(&bytes)` | `sys.TextResult` | Validerar byteintervallet och avkodar giltig UTF-8. |
@@ -135,7 +135,7 @@ begränsat av processens umask. Befintliga filers behörigheter bevaras.
 
 Läsning/skrivning och metadata följer symboliska länkar. `remove_file`
 tar bort länken själv. Borttagning är inte rekursiv. `rename` kan misslyckas
-över filsystemsgränser och följer macOS regler för befintliga destinationer.
+över filsystemsgränser och följer målplattformens regler för befintliga destinationer.
 
 ## Gränser och fel
 
@@ -151,7 +151,12 @@ Om plats saknas ger `read_text` fel 12, stänger filen och lämnar programmet
 igång. En tidigare lyckad läsning behåller sitt värde. Vanlig strängbyggnad
 har fortsatt sitt befintliga fatala arenafel; sys ändrar inte den regeln.
 
-`.error` är Darwin errno i denna macOS-version. Vanliga värden:
+`.error` använder Dunders ursprungliga Darwin-kompatibla felkoder. På Linux
+översätts kända errno-värden till samma koder, så exempelvis `NotFound`,
+`NotEmpty` och `InvalidUtf8` har samma betydelse på båda plattformarna.
+Linuxfel utan motsvarande kod representeras som `10000 + errno` och blir
+`Other(code)`; de råkar därför inte få betydelsen av ett annat Darwinfel.
+Vanliga värden:
 
 | Fel | Betydelse |
 | --- | --- |
@@ -199,7 +204,8 @@ stängda filhandtag. En signerad binär körs även utan källfiler och med tom 
 Implementationens syscallnummer och stat-layout är verifierade mot
 [Apples XNU-anrop](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master)
 och [stat-definitioner](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stat.h),
-samt den installerade macOS-SDK:n och verkliga körningar på denna Mac.
-Direkta Darwin-anrop är en plattformsdetalj som kan behöva anpassas för
-andra OS-versioner/mål. Binärläsning, kataloglistning, rekursiva katalogverktyg,
+samt tidigare macOS-körningar. Linux använder direkta systemanrop och respektive
+arkitekturs stat-layout. Se [målplattformarnas verifiering](targets.md).
+Systemanropen är en plattformsdetalj som anpassas per mål.
+Binärläsning, kataloglistning, rekursiva katalogverktyg,
 strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.

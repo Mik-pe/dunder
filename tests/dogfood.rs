@@ -28,7 +28,13 @@ impl Workspace {
             .output()
             .unwrap()
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn native(source: &str) -> std::process::Output {
         use std::os::unix::fs::PermissionsExt;
         let work = Self::new();
@@ -37,12 +43,15 @@ impl Workspace {
         let path = work.0.join("program");
         fs::write(&path, image).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let signed = Command::new("/usr/bin/codesign")
-            .arg("--verify")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(signed.status.success());
+        #[cfg(target_os = "macos")]
+        {
+            let signed = Command::new("/usr/bin/codesign")
+                .arg("--verify")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(signed.status.success());
+        }
         Command::new(path).env_clear().output().unwrap()
     }
 }
@@ -145,7 +154,13 @@ fn attached_cases_and_struct_inputs_are_statically_checked() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn tail_expressions_return_values_without_returning_from_ordinary_blocks() {
     let source = r#"
 fn maximum(a:i32,b:i32)->i32{if a>b{a}else{b}}
@@ -163,7 +178,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn struct_layout_copying_and_field_expression_order_are_native() {
     let source = r#"
 struct Mixed{enabled:bool,n:i64,small:i32,ready:bool}
@@ -190,7 +211,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn tagged_case_failures_test_the_actual_function_and_boolean_expressions() {
     let work = Workspace::new();
     work.write(
@@ -217,7 +244,13 @@ fn main(){print(div_by_five(20))}
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn shorthand_cases_cannot_be_redirected_by_a_local_name() {
     let work = Workspace::new();
     work.write(
@@ -242,7 +275,13 @@ fn div_by_five(x:i32)->i32{x/5}
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn exported_structs_have_nominal_types_across_modules_and_callbacks() {
     let work = Workspace::new();
     work.write("geometry.ddr","pub struct Point{x:i32,y:i32}\nstruct Secret{x:i32}\npub fn squared(p:Point)->i32{p.x*p.x+p.y*p.y}");
@@ -280,7 +319,13 @@ fn squared(p:geometry.Point)->i32{geometry.squared(p)}
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn collection_values_copy_and_iterator_snapshots_are_independent() {
     let source = r#"fn main(){
         original:=[1,2,3]
@@ -300,7 +345,13 @@ fn collection_values_copy_and_iterator_snapshots_are_independent() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn range_loops_cover_boundaries_continue_break_and_evaluate_bounds_once() {
     let source = r#"
 fn lower()->i32{print(90);return -2}
@@ -322,7 +373,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn arrays_preserve_layout_types_and_parameters_beyond_eight_arguments() {
     let source = r#"
 fn inspect(a:[i32;3],n:i64,b:i32,c:i32,d:i32,e:i32,f:i32,g:i32,last:[i64;2])->i64{
@@ -352,7 +409,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn array_bounds_and_assertions_fail_with_defined_statuses() {
     for (source, status) in [
         ("fn main(){a:=[1,2];print(a[-1])}", 103),
@@ -367,7 +430,13 @@ fn array_bounds_and_assertions_fail_with_defined_statuses() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn real_dogfood_programs_compile_run_and_self_check() {
     let work = Workspace::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("dogfood");
@@ -408,7 +477,13 @@ fn real_dogfood_programs_compile_run_and_self_check() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn test_command_isolates_failures_skips_main_and_reports_captured_output() {
     let work = Workspace::new();
     work.write(
@@ -432,7 +507,13 @@ fn main(){assert(false)}
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn test_command_times_out_and_continues_to_the_next_test() {
     let work = Workspace::new();
     work.write(
@@ -448,7 +529,13 @@ fn test_command_times_out_and_continues_to_the_next_test() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn test_mode_needs_no_main_deduplicates_imports_and_honors_the_manifest() {
     let work = Workspace::new();
     work.write("dunder.toml", "name = \"suite\"\nroot = \"suite.ddr\"\n");

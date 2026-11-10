@@ -27,7 +27,13 @@ impl Work {
             .output()
             .unwrap()
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn native(source: &str) -> std::process::Output {
         let w = Self::new();
         w.write("main.ddr", source);
@@ -97,7 +103,13 @@ fn enum_declarations_constructors_nominality_and_match_coverage_are_checked() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn value_enums_keep_numeric_values_in_structs_arrays_stack_arguments_and_cases() {
     let o = Work::native(
         r#"
@@ -121,7 +133,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn tagged_enums_copy_payloads_and_return_through_recursion_and_callbacks() {
     let o = Work::native(
         r#"
@@ -167,7 +185,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn enums_preserve_identity_across_imports_and_private_variants_stay_private() {
     let w = Work::new();
     w.write("types.ddr","pub enum Reply{Text(string),Code(i32)} enum Secret{Hidden}\npub fn value()->Reply{.Text(\"hello\")} pub fn hidden()->Secret{.Hidden}");
@@ -185,14 +209,26 @@ fn enums_preserve_identity_across_imports_and_private_variants_stay_private() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn invalid_integer_to_enum_conversion_has_a_defined_status() {
     let o = Work::native("enum Kind{A=1,B=9} fn main(){x:=Kind(2)}");
     assert_eq!(o.status.code(), Some(108));
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn enum_return_values_work_with_real_filesystem_results() {
     let w = Work::new();
     w.write("input", "Hej 🌍");

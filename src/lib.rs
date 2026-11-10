@@ -2,6 +2,8 @@ pub mod check;
 pub mod modules;
 pub mod native;
 pub mod syntax;
+pub mod target;
+pub(crate) mod x86_64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Span {
@@ -55,4 +57,10 @@ pub fn check_tests(source: &str) -> Result<check::Program, Error> {
 pub fn compile(source: &str) -> Result<Vec<u8>, Error> {
     let program = check(source)?;
     native::compile(&program).map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
+}
+
+pub fn compile_for(source: &str, target: target::Target) -> Result<Vec<u8>, Error> {
+    let program = check(source)?;
+    native::compile_for(&program, target)
+        .map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
 }

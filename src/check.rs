@@ -1041,12 +1041,12 @@ impl Checker<'_> {
                     let rune_op = a.ty == Type::Rune && !arithmetic;
                     let enum_op = self.types.scalar_enum(a.ty) && matches!(*op, "==" | "!=");
                     let float_op = a.ty.float() && *op != "%";
-                    if !a.ty.integer()
-                        && !float_op
-                        && !enum_op
-                        && !string_op
-                        && !rune_op
-                        && !(matches!(*op, "==" | "!=") && a.ty == Type::Bool)
+                    if !(a.ty.integer()
+                        || float_op
+                        || enum_op
+                        || string_op
+                        || rune_op
+                        || matches!(*op, "==" | "!=") && a.ty == Type::Bool)
                     {
                         return Err(Error::new(
                             "E0206",
@@ -1185,23 +1185,21 @@ impl Checker<'_> {
                         },
                         kind: ExprKind::StringView(Box::new(base)),
                     }
-                } else {
-                    if name == "iter" && self.types.array(base.ty).is_some() {
-                        let id = match base.ty {
-                            Type::Array(i) | Type::Iterator(i) => i,
-                            _ => unreachable!(),
-                        };
-                        Expr {
-                            ty: Type::Iterator(id),
-                            kind: ExprKind::Iterator(Box::new(base)),
-                        }
-                    } else {
-                        return Err(Error::new(
-                            "E0250",
-                            e.span,
-                            "method is not supported by this value",
-                        ));
+                } else if name == "iter" && self.types.array(base.ty).is_some() {
+                    let id = match base.ty {
+                        Type::Array(i) | Type::Iterator(i) => i,
+                        _ => unreachable!(),
+                    };
+                    Expr {
+                        ty: Type::Iterator(id),
+                        kind: ExprKind::Iterator(Box::new(base)),
                     }
+                } else {
+                    return Err(Error::new(
+                        "E0250",
+                        e.span,
+                        "method is not supported by this value",
+                    ));
                 }
             }
             A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if n=="assert") => {

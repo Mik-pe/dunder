@@ -31,7 +31,13 @@ impl Workspace {
         dunder::modules::check_path(self.0.join("main.ddr"))
             .unwrap_or_else(|e| panic!("{}", e.render()))
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn run(&self, source: &str) -> std::process::Output {
         self.write("main.ddr", source);
         self.cli(&["run", "main.ddr"])
@@ -75,7 +81,13 @@ fn bundled_sys_is_typed_deduplicated_and_distinct_from_explicit_local_modules() 
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn aggregate_returns_copy_into_caller_storage_across_recursion_callbacks_and_mixed_args() {
     let work = Workspace::new();
     let out = work.run(
@@ -106,7 +118,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native_filesystem_round_trip_metadata_append_rename_and_cleanup() {
     let work = Workspace::new();
     let out = work.run(
@@ -138,7 +156,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn filesystem_errors_are_values_and_invalid_paths_do_not_truncate_names() {
     let work = Workspace::new();
     let out=work.run(r#"
@@ -169,7 +193,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn read_text_validates_utf8_without_rejecting_nul_or_valid_unicode() {
     let work = Workspace::new();
     let invalid: Vec<&[u8]> = vec![
@@ -214,7 +244,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn reads_cover_short_empty_large_and_oversized_files_and_allocation_failure() {
     let work = Workspace::new();
     fs::write(work.0.join("large"), vec![b'x'; 1024 * 1024]).unwrap();
@@ -240,7 +276,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn success_and_error_paths_close_handles_and_symlink_removal_preserves_the_target() {
     use std::os::unix::fs::symlink;
     let work = Workspace::new();
@@ -283,7 +325,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn sys_is_embedded_reproducible_and_runs_after_sources_are_removed() {
     let work = Workspace::new();
     work.write("main.ddr", "import sys\nfn main(){r:=sys.read_text(\"input\");assert(r.ok);print(r.value);assert(sys.write_text(\"output\",r.value).ok)}");
@@ -300,12 +348,15 @@ fn sys_is_embedded_reproducible_and_runs_after_sources_are_removed() {
     let built = work.cli(&["build", "main.ddr", "-o", "program"]);
     success(&built);
     assert_eq!(fs::read(work.0.join("program")).unwrap(), image);
-    let signed = Command::new("/usr/bin/codesign")
-        .arg("--verify")
-        .arg(work.0.join("program"))
-        .output()
-        .unwrap();
-    success(&signed);
+    #[cfg(target_os = "macos")]
+    {
+        let signed = Command::new("/usr/bin/codesign")
+            .arg("--verify")
+            .arg(work.0.join("program"))
+            .output()
+            .unwrap();
+        success(&signed);
+    }
     fs::remove_file(work.0.join("main.ddr")).unwrap();
     let run = Command::new(work.0.join("program"))
         .current_dir(&work.0)
@@ -321,7 +372,13 @@ fn sys_is_embedded_reproducible_and_runs_after_sources_are_removed() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn byte_io_utf8_decoding_and_program_arguments_preserve_their_contracts() {
     use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
     let work = Workspace::new();
@@ -406,4 +463,122 @@ fn main(){var m:=map.new();print(length(&m));print(local.local());print(sys.pid(
         work.write("main.ddr", source);
         assert!(dunder::modules::check_path(work.0.join("main.ddr")).is_err());
     }
+}
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn same_file_and_metadata_use_the_targets_device_inode_and_mode_layout() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let work = Workspace::new();
+    work.write("original", "different inode, identical bytes");
+    work.write("copy", "different inode, identical bytes");
+    fs::hard_link(work.0.join("original"), work.0.join("hardlink")).unwrap();
+    symlink("original", work.0.join("symlink")).unwrap();
+    symlink("missing", work.0.join("dangling")).unwrap();
+    fs::create_dir(work.0.join("directory")).unwrap();
+    symlink("directory", work.0.join("directory-link")).unwrap();
+    let _socket = UnixListener::bind(work.0.join("socket")).unwrap();
+    let out = work.run(
+        r#"
+import sys
+fn main(){
+    assert(sys.same_file("original","original"))
+    assert(sys.same_file("original","hardlink"))
+    assert(sys.same_file("symlink","hardlink"))
+    assert(sys.same_file("directory","directory-link"))
+    assert(!sys.same_file("original","copy"))
+    assert(!sys.same_file("missing","missing"))
+    assert(!sys.same_file("dangling","original"))
+    assert(!sys.same_file("original\0tail","original"))
+    file:=sys.metadata("symlink")
+    assert(file.ok&&file.is_file&&!file.is_dir&&file.size==32)
+    directory:=sys.metadata("directory-link")
+    assert(directory.ok&&!directory.is_file&&directory.is_dir)
+    socket:=sys.metadata("socket")
+    assert(socket.ok&&!socket.is_file&&!socket.is_dir)
+    missing:=sys.metadata("dangling")
+    assert(!missing.ok&&missing.error==2&&missing.size==0&&!missing.is_file&&!missing.is_dir)
+    assert(sys.remove_file("hardlink").ok)
+    assert(sys.read_text("original").ok)
+    print("stat layouts ok")
+}
+"#,
+    );
+    success(&out);
+    assert_eq!(out.stdout, b"stat layouts ok\n");
+}
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn kernel_filesystem_errors_keep_portable_codes_and_fifo_io_does_not_block() {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{symlink, OpenOptionsExt},
+    };
+    // POSIX is used only to prepare the fixture; compiled Dunder calls no libc.
+    unsafe extern "C" {
+        fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> std::os::raw::c_int;
+    }
+    let work = Workspace::new();
+    work.write("regular", "contents");
+    fs::create_dir(work.0.join("not-empty")).unwrap();
+    work.write("not-empty/child", "contents");
+    symlink("loop", work.0.join("loop")).unwrap();
+    let fifo = work.0.join("fifo");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe { mkfifo(path.as_ptr(), 0o600) },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // A reader makes FIFO writes reach the file-type check instead of ENXIO.
+    let _reader = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(if cfg!(target_os = "macos") {
+            0x4
+        } else {
+            0x800
+        })
+        .open(&fifo)
+        .unwrap();
+    work.write(
+        "main.ddr",
+        r#"
+import sys
+@test fn filesystem_edges(){
+    assert(sys.metadata("regular/child").error==20)
+    assert(sys.remove_dir("regular").error==20)
+    assert(sys.remove_dir("not-empty").error==66)
+    assert(sys.metadata("loop").error==62)
+    assert(!sys.same_file("loop","loop"))
+    var component:="";for i in 0..300{component=component+"a"}
+    assert(sys.mkdir(component).error==63)
+    assert(sys.metadata(component).error==63)
+    assert(sys.error_message(sys.mkdir(component).error)=="path too long")
+    assert(sys.read_text("fifo").error==45)
+    assert(sys.write_text("fifo","x").error==45)
+    assert(sys.append_text("fifo","x").error==45)
+    info:=sys.metadata("fifo")
+    assert(info.ok&&!info.is_file&&!info.is_dir)
+}
+"#,
+    );
+    // A syscall regression must fail on a deadline instead of hanging cargo test.
+    let out = work.cli(&["test", "main.ddr", "--timeout-ms", "2000"]);
+    success(&out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("filesystem_edges"));
+    assert_eq!(fs::read(work.0.join("regular")).unwrap(), b"contents");
 }

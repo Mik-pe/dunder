@@ -226,11 +226,17 @@ impl Code<'_> {
         self.imm(0, 0);
         self.imm(1, ARENA);
         self.imm(2, 3);
-        self.imm(3, 0x1002);
+        self.imm(
+            3,
+            if self.target == crate::target::Target::Arm64Macos {
+                0x1002
+            } else {
+                0x22
+            },
+        );
         self.imm(4, u64::MAX);
         self.imm(5, 0);
-        self.imm(16, 0x20000c5);
-        self.emit(0xd4001001);
+        self.syscall(197);
         self.branch(self.collections.exhausted, Branch::Cond(2));
         self.mov(21, 0);
         self.imm(1, ARENA);
@@ -311,8 +317,7 @@ impl Code<'_> {
         self.branch(self.collections.grow, Branch::Jump);
         self.mark(self.collections.exhausted);
         self.imm(0, 109);
-        self.imm(16, 0x2000001);
-        self.emit(0xd4001001);
+        self.syscall(1);
         self.emit(0xd4200000);
     }
 }

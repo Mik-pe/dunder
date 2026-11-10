@@ -69,14 +69,19 @@ fn execute(
     }
 }
 
-pub fn run(project: &Checked, output: &Path, timeout: Duration) -> Result<i32, String> {
+pub fn run(
+    project: &Checked,
+    output: &Path,
+    timeout: Duration,
+    target: dunder::target::Target,
+) -> Result<i32, String> {
     let scratch = Scratch::create(output)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut passed = 0;
     let mut failed = 0;
     for (index, test) in project.program.tests.iter().enumerate() {
         let path = scratch.0.join(format!("test-{index}"));
-        let image = dunder::native::compile_entry(&project.program, test.function)?;
+        let image = dunder::native::compile_entry_for(&project.program, test.function, target)?;
         super::publish(&path, &image).map_err(|e| e.to_string())?;
         let executable = fs::canonicalize(&path).map_err(|e| e.to_string())?;
         let stdout = scratch.0.join(format!("stdout-{index}"));
@@ -102,6 +107,7 @@ pub fn run(project: &Checked, output: &Path, timeout: Duration) -> Result<i32, S
                     Some(107) => "floating conversion out of range".into(),
                     Some(108) => "invalid enum value".into(),
                     Some(109) => "dynamic storage exhausted".into(),
+                    Some(110) => "stack exhausted".into(),
                     Some(n) => format!("exit {n}"),
                     None => "terminated by signal".into(),
                 }

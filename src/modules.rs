@@ -64,6 +64,10 @@ impl Checked {
         crate::native::compile(&self.program)
             .map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
     }
+    pub fn compile_for(&self, target: crate::target::Target) -> Result<Vec<u8>, Error> {
+        crate::native::compile_for(&self.program, target)
+            .map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
+    }
     pub fn render(&self, error: &Error) -> String {
         let source = &self.sources.files[error.file];
         error.render(&source.path.display().to_string(), &source.text)

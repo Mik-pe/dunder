@@ -1,9 +1,10 @@
-//! macOS/arm64 filesystem boundary. Constants/layout follow Apple's XNU and
-//! macOS SDK: stat64 is 144 bytes, st_mode at 4, st_size at 96. No libc calls.
+//! ARM64 OS boundary, using Darwin or Linux system calls directly.
+//! Linux errors are translated to Dunder's existing portable error codes.
 use super::{Branch, Code, Label};
 use crate::{
     check::{Expr, SysOp},
     syntax::Type,
+    target::Target,
 };
 
 const FRAME: usize = 2448;
@@ -65,7 +66,11 @@ impl Code<'_> {
         self.branch(failed, Branch::Cond(2));
         self.local_addr(STAT);
         self.mov(0, 9);
-        self.typed_load(Type::I32);
+        self.typed_load(if self.target == Target::Arm64Macos {
+            Type::I32
+        } else {
+            Type::I64
+        });
         self.store(4, 0);
         self.local_addr(STAT);
         self.add_imm(0, 9, 8);
@@ -79,7 +84,11 @@ impl Code<'_> {
         self.branch(failed, Branch::Cond(2));
         self.local_addr(STAT);
         self.mov(0, 9);
-        self.typed_load(Type::I32);
+        self.typed_load(if self.target == Target::Arm64Macos {
+            Type::I32
+        } else {
+            Type::I64
+        });
         self.mov(1, 0);
         self.load(4);
         self.cmp(0, 1);
@@ -232,9 +241,130 @@ impl Code<'_> {
             self.mov(0, 9);
         }
     }
-    fn syscall(&mut self, number: u64) {
-        self.imm(16, 0x2000000 + number);
-        self.emit(0xd4001001);
+    // `number` names the existing Darwin operation; only this boundary knows
+    // the selected kernel's call numbers and register conventions. Both paths
+    // return positive Dunder errors with carry set, or a result with carry clear.
+    pub(super) fn syscall(&mut self, number: u64) {
+        if self.target == Target::Arm64Macos {
+            self.imm(16, 0x2000000 + number);
+            self.emit(0xd4001001);
+            return;
+        }
+        let linux_number = match number {
+            1 => 93, // exit
+            3 => 63, // read
+            4 => 64, // write
+            5 => {
+                // openat(AT_FDCWD, path, flags, mode)
+                self.mov(3, 2);
+                self.mov(2, 1);
+                self.mov(1, 0);
+                self.imm(0, (-100_i64) as u64);
+                56
+            }
+            6 => 57, // close
+            10 | 137 => {
+                // unlinkat(AT_FDCWD, path, flags)
+                self.mov(1, 0);
+                self.imm(0, (-100_i64) as u64);
+                self.imm(2, if number == 137 { 0x200 } else { 0 });
+                35
+            }
+            15 | 136 => {
+                // fchmodat / mkdirat(AT_FDCWD, path, mode)
+                self.mov(2, 1);
+                self.mov(1, 0);
+                self.imm(0, (-100_i64) as u64);
+                if number == 15 {
+                    53
+                } else {
+                    34
+                }
+            }
+            20 => 172, // getpid
+            128 => {
+                // renameat(AT_FDCWD, from, AT_FDCWD, to)
+                self.mov(3, 1);
+                self.mov(1, 0);
+                self.imm(0, (-100_i64) as u64);
+                self.imm(2, (-100_i64) as u64);
+                38
+            }
+            197 => 222, // mmap (flags are selected by the caller)
+            201 => 46,  // ftruncate
+            338 => {
+                // newfstatat(AT_FDCWD, path, stat, 0)
+                self.mov(2, 1);
+                self.mov(1, 0);
+                self.imm(0, (-100_i64) as u64);
+                self.imm(3, 0);
+                79
+            }
+            339 => 80, // fstat
+            _ => unreachable!("unmapped system call {number}"),
+        };
+        self.imm(8, linux_number);
+        self.emit(0xd4000001); // svc #0
+        if number == 1 {
+            return;
+        }
+        // Linux reports errors as -errno, with no carry convention. Keep x1/x2
+        // intact: the printing loop uses them across writes.
+        let done = self.label();
+        let error = self.label();
+        self.imm(16, (-4095_i64) as u64);
+        self.cmp(0, 16);
+        self.branch(done, Branch::Cond(3));
+        self.emit(0xcb0003e0); // neg x0,x0
+        for (linux, dunder) in [
+            (11, 35),
+            (35, 11),
+            (36, 63),
+            (37, 77),
+            (38, 78),
+            (39, 66),
+            (40, 62),
+            (42, 91),
+            (43, 90),
+            (75, 84),
+            (84, 92),
+            (95, 45),
+        ] {
+            let next = self.label();
+            self.imm(16, linux);
+            self.cmp(0, 16);
+            self.branch(next, Branch::Cond(1));
+            self.imm(0, dunder);
+            self.branch(error, Branch::Jump);
+            self.mark(next);
+        }
+        self.imm(16, 34);
+        self.cmp(0, 16);
+        self.branch(error, Branch::Cond(9));
+        // Unknown Linux errors get a separate namespace rather than accidentally
+        // becoming an unrelated Darwin/Dunder error with the same number.
+        self.imm(16, 10000);
+        self.add(0, 0, 16);
+        self.mark(error);
+        self.cmp(31, 31); // carry=1
+        self.mark(done);
+    }
+    fn stat_size(&mut self) {
+        self.local_addr(STAT);
+        let offset = if self.target == Target::Arm64Macos {
+            96
+        } else {
+            48
+        };
+        self.emit(0xf9400120 | (offset / 8) << 10);
+    }
+    fn stat_mode(&mut self) {
+        self.local_addr(STAT);
+        self.emit(match self.target {
+            Target::Arm64Macos => 0x79400920,  // ldrh w0,[x9,#4]
+            Target::Arm64Linux => 0xb9401120,  // ldr w0,[x9,#16]
+            Target::X86_64Linux => 0xb9401920, // ldr w0,[x9,#24]
+        });
     }
     fn sys_type(&self, op: SysOp) -> Type {
         let types = self.sys_types.unwrap();
@@ -350,11 +480,9 @@ impl Code<'_> {
         self.mov(1, 9);
         self.syscall(338);
         self.branch(done, Branch::Cond(2));
-        self.local_addr(STAT);
-        self.emit(0xf9403120); // ldr x0,[x9,#96]
+        self.stat_size();
         self.sys_field(ty, "size", 0);
-        self.local_addr(STAT);
-        self.emit(0x79400920); // ldrh w0,[x9,#4]
+        self.stat_mode();
         self.imm(1, 0xf000);
         self.and(0, 0, 1);
         self.mov(2, 0);
@@ -383,12 +511,17 @@ impl Code<'_> {
         self.mark(open);
         self.local_addr(PATH1);
         self.mov(0, 9);
-        let flags = 0x01000004
-            | if reading {
-                0
-            } else {
-                1 | 0x200 | if op == SysOp::AppendText { 8 } else { 0 }
-            };
+        let flags = if self.target == Target::Arm64Macos {
+            0x01000004 // O_CLOEXEC | O_NONBLOCK
+                | if reading { 0 } else {
+                    1 | 0x200 | if op == SysOp::AppendText { 8 } else { 0 }
+                }
+        } else {
+            0x80000 | 0x800 // O_CLOEXEC | O_NONBLOCK
+                | if reading { 0 } else {
+                    1 | 0x40 | if op == SysOp::AppendText { 0x400 } else { 0 }
+                }
+        };
         self.imm(1, flags);
         self.imm(2, 0o600);
         self.syscall(5);
@@ -413,8 +546,7 @@ impl Code<'_> {
         self.branch(stat, Branch::Cond(0));
         self.branch(opened_error, Branch::Jump);
         self.mark(stated);
-        self.local_addr(STAT);
-        self.emit(0x79400920);
+        self.stat_mode();
         self.imm(1, 0xf000);
         self.and(0, 0, 1);
         let regular = self.label();
@@ -432,8 +564,7 @@ impl Code<'_> {
         self.branch(opened_error, Branch::Jump);
         self.mark(regular);
         if reading {
-            self.local_addr(STAT);
-            self.emit(0xf9403120);
+            self.stat_size();
             self.imm(1, MAX_READ);
             self.cmp(0, 1);
             let fits = self.label();

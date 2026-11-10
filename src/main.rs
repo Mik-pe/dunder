@@ -100,9 +100,16 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
 }
 
 fn run() -> Result<i32, String> {
+    use dunder::target::Target;
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.ddr] [-o output] [--timings]\n  dunder run [file.ddr] [-o output] [--timings] [-- program-args...]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--timeout-ms 5000]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        println!("Dunder — typed source to native executables\n\n  dunder build [file.ddr] [-o output] [--target target] [--timings]\n  dunder run [file.ddr] [-o output] [--target target] [--timings] [-- program-args...]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--target target] [--timeout-ms 5000]\n  dunder --list-targets\n\nWithout a file, finds the nearest dunder.toml. Default target: current host.\nCross-compilation needs no external toolchain or target SDK.\nrun and test require a target matching the current host.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        return Ok(0);
+    }
+    if args[0] == "--list-targets" && args.len() == 1 {
+        for target in Target::ALL {
+            println!("{target}");
+        }
         return Ok(0);
     }
     let command = &args[0];
@@ -116,6 +123,7 @@ fn run() -> Result<i32, String> {
     let mut timings = false;
     let mut timeout = 5000;
     let mut program_args = Vec::new();
+    let mut target = None;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--" && command == "run" {
@@ -128,6 +136,14 @@ fn run() -> Result<i32, String> {
                 output = Some(PathBuf::from(args.get(i).ok_or("-o requires a path")?));
             }
             "--timings" => timings = true,
+            "--target" => {
+                i += 1;
+                let value = args.get(i).ok_or("--target requires a target name")?;
+                if target.is_some() {
+                    return Err("--target may only be specified once".into());
+                }
+                target = Some(value.parse::<Target>()?);
+            }
             "--timeout-ms" if command == "test" => {
                 i += 1;
                 timeout = args
@@ -145,6 +161,19 @@ fn run() -> Result<i32, String> {
         }
         i += 1;
     }
+    // Checking source does not need a supported native host.
+    let target = if command == "check" {
+        target
+    } else {
+        let selected = target.map(Ok).unwrap_or_else(Target::host)?;
+        if matches!(command.as_str(), "run" | "test") && !selected.can_run_on_host() {
+            return Err(format!(
+                "cannot {command} target {selected} on {}-{}; use 'dunder build --target {selected}' and run the binary on its target system",
+                env::consts::ARCH, env::consts::OS
+            ));
+        }
+        Some(selected)
+    };
     let start = Instant::now();
     let (source_path, name) = if let Some(p) = source_path {
         let n = p
@@ -167,8 +196,14 @@ fn run() -> Result<i32, String> {
     .map_err(|e| e.render())?;
     let check_time = start.elapsed() - load_time;
     if command == "test" {
-        let output = output.unwrap_or_else(|| PathBuf::from("build/arm64-macos/tests").join(name));
-        let result = test_runner::run(&checked, &output, Duration::from_millis(timeout))?;
+        let target = target.unwrap();
+        let output = output.unwrap_or_else(|| {
+            PathBuf::from("build")
+                .join(target.name())
+                .join("tests")
+                .join(name)
+        });
+        let result = test_runner::run(&checked, &output, Duration::from_millis(timeout), target)?;
         if timings {
             eprintln!(
                 "modules={module_count} load+parse={:.3}ms check={:.3}ms test-total={:.3}ms",
@@ -183,9 +218,12 @@ fn run() -> Result<i32, String> {
         println!("checked {} ({module_count} modules)", source_path.display());
         return Ok(0);
     }
-    let image = checked.compile().map_err(|e| checked.render(&e))?;
+    let target = target.unwrap();
+    let image = checked
+        .compile_for(target)
+        .map_err(|e| checked.render(&e))?;
     let native_time = start.elapsed() - load_time - check_time;
-    let output = output.unwrap_or_else(|| PathBuf::from("build/arm64-macos").join(name));
+    let output = output.unwrap_or_else(|| PathBuf::from("build").join(target.name()).join(name));
     if let Ok(existing) = fs::canonicalize(&output) {
         if checked.sources.files.iter().any(|s| s.path == existing) {
             return Err("output must not overwrite the source file".into());
@@ -199,7 +237,7 @@ fn run() -> Result<i32, String> {
     }
     if timings {
         eprintln!(
-            "modules={module_count} load+parse={:.3}ms check={:.3}ms native+sign={:.3}ms total={:.3}ms",
+            "target={target} modules={module_count} load+parse={:.3}ms check={:.3}ms native={:.3}ms total={:.3}ms",
             load_time.as_secs_f64() * 1000.,
             check_time.as_secs_f64() * 1000.,
             native_time.as_secs_f64() * 1000.,

@@ -4,7 +4,13 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 static NEXT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native(source: &str) -> std::process::Output {
     let dir = std::env::temp_dir().join(format!(
         "dunder-collections-{}-{}",
@@ -53,7 +59,13 @@ fn borrows_and_dynamic_mutation_obey_types_and_immutability() {
     }
 }
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn arrays_grow_clone_and_borrow_without_losing_value_semantics() {
     let o = native(
         r#"
@@ -78,7 +90,13 @@ fn main(){
     assert_eq!(o.stdout, "49995000\n🌍\n".as_bytes());
 }
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn arrays_in_records_enums_callbacks_and_returns_are_deep_copies() {
     let o = native(
         r#"
@@ -102,7 +120,13 @@ fn main(){
     assert_eq!(o.stdout, b"a\n3\n");
 }
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn dynamic_bounds_empty_pop_and_excess_capacity_have_defined_failures() {
     for (source, status) in [
         ("fn main(){var a:[]i32=[];print(a[0])}", 103),
@@ -121,7 +145,13 @@ fn dynamic_bounds_empty_pop_and_excess_capacity_have_defined_failures() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn dynamic_scalar_layouts_nested_aggregates_and_call_snapshots_are_consistent() {
     let o = native(
         r#"
@@ -153,7 +183,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn map_and_set_match_independent_host_operations_in_a_large_native_image() {
     use std::collections::{HashMap, HashSet};
     let mut map = HashMap::<String, i64>::new();

@@ -1,7 +1,9 @@
 # Dunder-status
 
-2026-11-10: första typade nativekompilatorn finns på `language/typed-native`
-i `/Users/mikpe/dev/dunder-language`.
+2026-11-10: bootstrapkompilatorn på `main` stöder ARM64/macOS, ARM64/Linux och
+x86-64/Linux. `--target` väljer utdata oberoende av värdplattform; inga externa
+kompileringsverktyg eller mål-SDK:er behövs för Dunderbygget.
+Se [målplattformar och korskompilering](targets.md).
 
 ## Implementerat
 
@@ -64,7 +66,7 @@ i `/Users/mikpe/dev/dunder-language`.
   flyttalsfält/-arrayer, callbacks, returer och oberoende FP-/heltalsregister
   med stackspill. Decimalutskriften är skriven i `runtime/float.ddr`, bäddas
   in vid behov och använder exakta intervall för korta roundtrip-värden.
-- Medföljande `import sys` för ARM64/macOS: textläsning/-skrivning, append,
+- Medföljande `import sys` för macOS och Linux: textläsning/-skrivning, append,
   metadata, kataloger, rename, borttagning, process-ID och felmeddelanden.
   Nominella resultatstructar har `.ok`/`.error`, läst text finns i `.value`.
   Vanliga I/O-fel avbryter inte processen. UTF-8 valideras före exponering.
@@ -90,11 +92,29 @@ i `/Users/mikpe/dev/dunder-language`.
   med valfri `test_root`, atomisk
   publicering av utdata och `--timings`. `main` ger exitkod 0 eller en explicit
   i32-retur; `run` för vidare exitkoden och kör aldrig gammal utdata vid typfel.
-- Direkt kodgenerering från typade funktioner till ARM64. Egen Mach-O-skrivare,
-  SHA-256 och ad hoc-signering. Inga externa crates. Den normala byggvägen
+- Kodgenerering till ARM64 och x86-64 med egen ELF-/Mach-O-skrivare,
+  SHA-256 och macOS ad hoc-signering. Inga externa crates. Den normala byggvägen
   startar inga andra verktyg. Körbara filer behöver ingen språkinterpreter.
 
-## Verifiering
+## Verifiering av Linux och korskompilering
+
+Lokalt på Linux/x86-64, 2026-11-10:
+
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` och
+  `cargo build --release` passerar med Rust 1.90.0.
+- `cargo test --no-fail-fast -- --test-threads=1`: 84 testfunktioner passerar.
+  En parallell körning fick ett tillfälligt Linuxfel `ETXTBSY` vid processstart;
+  det berörda callbacktestet passerade separat och hela sviten passerade seriellt.
+- Releasekompilatorns `dunder test` kör alla 44 Dunder-testgrupper med tom
+  verktygssökväg. Alla passerar.
+- ARM64/Linux under QEMU: 16 exempel/dogfood-program med exakt utdata,
+  samtliga 44 testgrupper och separata prov av systemanrop, argument, felkoder
+  och flyttal. Den valfria verifieraren finns i `tools/verify-arm64.rs`.
+- 17 ARM64/macOS-bilder, inklusive selfhost-kompilatorn, är byteidentiska
+  med originalets utdata. macOS-processkörning och `codesign` har inte körts
+  i Linuxmiljön; motsvarande tester är fortsatt aktiva på macOS.
+
+## Tidigare verifiering på macOS
 
 `cargo test`: 80 testfunktioner passerar (två signerings-/bildtester, sexton
 dogfood-, elva språk-, nio modul-, åtta sträng-, åtta flyttals-, tio system-,
@@ -221,7 +241,7 @@ Ingen inkrementell cache.
 Enums saknar ännu generics, likhet för data-enums, mönsterguards och generell
 `match` som uttryck. Direkt rekursiva inlinevärden kräver indirection;
 arena-dogfood använder indexhandtag. Se [enumreglerna](enums.md).
-sys riktar sig bara till macOS/ARM64. Textläsning kräver vanliga UTF-8-filer,
+sys stöder macOS/ARM64 och Linux på ARM64/x86-64. Textläsning kräver vanliga UTF-8-filer,
 högst 4 MiB per fil, och delar strängarenans 16 MiB. Binärläsning, kataloglistning,
 rekursiva katalogverktyg och filströmmar återstår. Se [sys-kontraktet](sys.md).
 Flyttal saknar än så länge fullständigt matematikbibliotek, trigonometriska

@@ -1,5 +1,11 @@
 # Dunders första arkitektur
 
+**Plattformsstöd 2026-11-10:** bootstrapen skriver nu ARM64/macOS,
+ARM64/Linux och x86-64/Linux med explicit målval. ELF, Mach-O, systemanrop
+och kodgenerering ingår i kompilatorn. x86-64 sänker den delade interna
+instruktionsvokabulären till nativekod vid kompilering; det finns ingen
+runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
+
 **Lägesändring 2026-11-10:** användaren prioriterade det riktiga typade
 källspråket före fortsatt fröarbete. Den första Rust-bootstrapkompilatorn
 och dess native backend är implementerade; se [syntaxen](syntax.md) och

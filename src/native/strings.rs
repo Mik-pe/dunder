@@ -199,11 +199,17 @@ impl Code<'_> {
         self.imm(0, 0);
         self.imm(1, ARENA_BYTES);
         self.imm(2, 3); // read/write
-        self.imm(3, 0x1002);
+        self.imm(
+            3,
+            if self.target == crate::target::Target::Arm64Macos {
+                0x1002
+            } else {
+                0x22
+            },
+        );
         self.imm(4, u64::MAX);
         self.imm(5, 0); // MAP_ANON | MAP_PRIVATE
-        self.imm(16, 0x20000c5);
-        self.emit(0xd4001001); // Darwin mmap
+        self.syscall(197); // anonymous private mmap
         self.branch(map_failed, Branch::Cond(2));
         self.mov(19, 0);
         self.imm(1, ARENA_BYTES);
@@ -556,8 +562,7 @@ impl Code<'_> {
         ] {
             self.mark(label);
             self.imm(0, status);
-            self.imm(16, 0x2000001);
-            self.emit(0xd4001001);
+            self.syscall(1);
             self.emit(0xd4200000);
         }
     }

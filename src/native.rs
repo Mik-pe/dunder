@@ -1,18 +1,20 @@
-//! Direct typed-tree to AArch64 emission, Mach-O layout and ad hoc signing.
+//! Direct typed-tree to AArch64 emission, ELF/Mach-O layout and ad hoc signing.
 //! No assembler, linker, interpreter or external signer is invoked.
 use crate::{
     check::{Expr, ExprKind, Program, Stmt},
     syntax::{Type, Types},
+    target::Target,
 };
 mod collections;
+pub(crate) mod elf;
 mod enums;
 mod floats;
 mod reachable;
 mod strings;
 mod sys;
 
-type Label = usize;
-enum Branch {
+pub(crate) type Label = usize;
+pub(crate) enum Branch {
     Jump,
     Call,
     Cond(u32),
@@ -21,6 +23,8 @@ enum Branch {
     Address(u32),
 }
 struct Code<'a> {
+    target: Target,
+    data_start: usize,
     types: &'a Types,
     words: Vec<u32>,
     labels: Vec<Option<usize>>,
@@ -47,6 +51,8 @@ struct Code<'a> {
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
         let mut c = Self {
+            target: Target::Arm64Macos,
+            data_start: 0,
             types,
             words: Vec::new(),
             labels: Vec::new(),
@@ -852,8 +858,7 @@ impl<'a> Code<'a> {
         let again = self.label();
         self.mark(again);
         self.imm(0, 1);
-        self.imm(16, 0x2000004);
-        self.emit(0xd4001001);
+        self.syscall(4);
         self.branch(self.io_error, Branch::Cond(2));
         self.branch(self.io_error, Branch::Zero(0));
         self.emit(0xcb000042);
@@ -871,19 +876,26 @@ impl<'a> Code<'a> {
         ] {
             self.mark(label);
             self.imm(0, status);
-            self.imm(16, 0x2000001);
-            self.emit(0xd4001001);
+            self.syscall(1);
             self.emit(0xd4200000);
         }
     }
     fn finish(mut self) -> Result<Vec<u8>, String> {
+        if self.target == Target::X86_64Linux {
+            return crate::x86_64::lower(&self.words, &self.labels, &self.fixups, self.data_start);
+        }
         for (at, label, kind) in self.fixups {
             let to = self.labels[label].ok_or("unresolved function or branch")?;
             let delta = to as i64 - at as i64;
             if let Branch::Address(reg) = kind {
-                // __text starts at byte 432 in the page-aligned __TEXT mapping.
-                let from = 432 + at * 4;
-                let target = 432 + to * 4;
+                // Address fixups use the selected image layout, never the host OS.
+                let text_offset = if self.target == Target::Arm64Macos {
+                    432
+                } else {
+                    elf::TEXT_OFFSET
+                };
+                let from = text_offset + at * 4;
+                let target = text_offset + to * 4;
                 let pages = (target / 4096) as i64 - (from / 4096) as i64;
                 if !(-(1 << 20)..(1 << 20)).contains(&pages) {
                     return Err("address exceeds ADRP range".into());
@@ -923,12 +935,23 @@ impl<'a> Code<'a> {
 }
 
 pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
-    compile_entry(
+    compile_for(program, Target::host()?)
+}
+pub fn compile_for(program: &Program, target: Target) -> Result<Vec<u8>, String> {
+    compile_entry_for(
         program,
         program.main.ok_or("program has no main entrypoint")?,
+        target,
     )
 }
 pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String> {
+    compile_entry_for(program, entry, Target::host()?)
+}
+pub fn compile_entry_for(
+    program: &Program,
+    entry: usize,
+    target: Target,
+) -> Result<Vec<u8>, String> {
     if program
         .functions
         .get(entry)
@@ -937,11 +960,17 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         return Err("entrypoint must be a function with no parameters".into());
     }
     let mut code = Code::new(program.functions.len(), &program.types);
+    code.target = target;
     let reachable = reachable::functions(program, entry);
     code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
     code.sys_types = program.sys_types;
-    code.mov(23, 0); // LC_MAIN argc and argv, retained across Dunder calls
-    code.mov(24, 1);
+    if target == Target::Arm64Macos {
+        code.mov(23, 0); // LC_MAIN argc and argv, retained across Dunder calls
+        code.mov(24, 1);
+    } else {
+        code.emit(0xf94003f7); // ELF entry: ldr x23,[sp] (argc)
+        code.emit(0x910023f8); // add x24,sp,#8 (argv)
+    }
     code.emit(0xd51b441f); // msr fpcr,xzr: IEEE rounding and gradual underflow
                            // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
     code.imm(19, 0); // lazily mapped string arena cursor
@@ -949,8 +978,7 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
     code.imm(21, 0); // lazily mapped dynamic storage arena
     code.imm(22, 0);
     code.branch(code.functions[entry], Branch::Call);
-    code.imm(16, 0x2000001);
-    code.emit(0xd4001001);
+    code.syscall(1);
     code.emit(0xd4200000);
     for (i, f) in program.functions.iter().enumerate() {
         if !reachable[i] {
@@ -994,8 +1022,14 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
     }
     code.runtime();
     code.collections_runtime();
+    code.data_start = code.words.len();
     code.string_literals();
-    Ok(macho(&code.finish()?))
+    let text = code.finish()?;
+    Ok(match target {
+        Target::Arm64Macos => macho(&text),
+        Target::Arm64Linux => elf::executable(&text, 183),
+        Target::X86_64Linux => elf::executable(&text, 62),
+    })
 }
 
 // Darwin packs stack arguments at their natural size and alignment, then

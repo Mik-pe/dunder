@@ -1,9 +1,9 @@
 # Dunder ⚡
 
 Ett statiskt typat, kompilerat språk med filändelsen **`.ddr`**.
-Den första kompilatorn läser vanlig
-Dunder-källkod och skriver en körbar ARM64/Mach-O-fil för macOS, inklusive
-ad hoc-signatur. Kodgenerering, bildskrivning och signering görs i kompilatorn.
+Kompilatorn läser vanlig Dunder-källkod och skriver körbara filer för
+ARM64/macOS, ARM64/Linux och x86-64/Linux. Kodgenerering, ELF-/Mach-O-skrivning
+och macOS ad hoc-signering görs i kompilatorn.
 
 ```dunder
 fn add(a: i32, b: i32) -> i32 {
@@ -43,9 +43,25 @@ cargo run --release -- build examples/hello.ddr -o build/hello --timings
 
 Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer, Python,
 assembler, länkare eller signeringsverktyg för att bygga Dunder-källkod.
-Den färdiga binären körs som en vanlig macOS-process. Systemets verktyg får
-användas för oberoende verifiering; `cargo test` kontrollerar bland annat
-signaturerna med `codesign --verify` och kör riktiga binärer.
+Den färdiga binären körs som en vanlig process på målplattformen. Linuxbinärer
+är fristående och behöver varken libc eller en dynamisk laddare. Systemets
+verktyg får användas för oberoende verifiering; `cargo test` kör riktiga binärer
+på värdplattformen och verifierar även signaturer med `codesign` på macOS.
+
+Målet väljs automatiskt för den egna plattformen. Korskompilering fungerar med
+samma kompilator, utan extra SDK, targetpaket, assembler eller länkare:
+
+```sh
+# Exempelvis på macOS: bygg fristående Linuxprogram för båda arkitekturerna.
+dunder build examples/hello.ddr --target x86_64-linux -o build/hello-linux
+dunder build examples/hello.ddr --target arm64-linux -o build/hello-linux-arm64
+# Även på Linux: bygg en signerad macOS-binär.
+dunder build examples/hello.ddr --target arm64-macos -o build/hello-macos
+dunder --list-targets
+```
+
+`dunder run` och `dunder test` kräver att målet matchar maskinen där de körs.
+Läs [målplattformar och korskompilering](docs/targets.md) för detaljer.
 
 ```sh
 cargo run --release -- check examples/fibonacci.ddr
@@ -80,7 +96,8 @@ root = "examples/hello.ddr"
 test_root = "dogfood/tests.ddr"
 ```
 
-Utdata hamnar då i `build/arm64-macos/hello`. `name` och `root` krävs;
+Utdata hamnar då i `build/<target>/hello`, exempelvis `build/x86_64-linux/hello`.
+`name` och `root` krävs;
 `test_root` är valfri och väljer rotfil för `dunder test`. Utan den används
 `root` även för tester. Kompileringsfel har fil, rad, kolumn och
 felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
@@ -131,7 +148,7 @@ typkontroll av kropparna, så ömsesidig rekursion fungerar även över
 cirkulära importer. Endast rotmodulens `main` är programstart.
 
 Hela modulträdet byggs till samma körbara fil med Dunders egen kodgenerering,
-symbolupplösning, Mach-O-skrivning och signering. Dunder-kompileringen anropar
+symbolupplösning, ELF-/Mach-O-skrivning och eventuell signering. Dunder-kompileringen anropar
 varken GCC, LLVM, extern assembler, extern länkare eller extern signerare.
 Rust används fortfarande för att bygga själva bootstrapkompilatorn.
 
@@ -342,7 +359,7 @@ Kör `cargo run --release -- test dogfood/numeric/main.ddr` för sju numeriska
 testgrupper med vektorer, stabil summering, rotberäkning och numerisk
 integration. Läs [flyttalsreglerna och begränsningarna](docs/floating.md).
 
-## Systembibliotek på macOS
+## Systembibliotek på macOS och Linux
 
 `sys` följer med kompilatorn och kräver ingen lokal biblioteksfil:
 

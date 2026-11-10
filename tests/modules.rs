@@ -42,7 +42,13 @@ impl Project {
             .output()
             .unwrap()
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn execute(&self, image: &[u8]) -> String {
         use std::os::unix::fs::PermissionsExt;
         let output = self.0.join("program");
@@ -51,16 +57,19 @@ impl Project {
         fs::write(&tmp, image).unwrap();
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
         fs::rename(&tmp, &output).unwrap();
-        let verify = Command::new("/usr/bin/codesign")
-            .arg("--verify")
-            .arg(&output)
-            .output()
-            .unwrap();
-        assert!(
-            verify.status.success(),
-            "{}",
-            String::from_utf8_lossy(&verify.stderr)
-        );
+        #[cfg(target_os = "macos")]
+        {
+            let verify = Command::new("/usr/bin/codesign")
+                .arg("--verify")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                verify.status.success(),
+                "{}",
+                String::from_utf8_lossy(&verify.stderr)
+            );
+        }
         let run = Command::new(output).env_clear().output().unwrap();
         assert!(run.status.success());
         String::from_utf8(run.stdout).unwrap()
@@ -79,7 +88,13 @@ fn compile(project: &dunder::modules::Checked) -> Vec<u8> {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn actual_module_example_builds_without_external_tools() {
     let project = Project::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/modules/main.ddr");
@@ -172,7 +187,13 @@ fn import_names_paths_and_diagnostics_are_checked() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn aliases_private_helpers_and_same_named_functions_stay_separate() {
     let project = Project::new();
     project.write("main.ddr","import a\nimport b\nimport \"foo-bar\" as more\nfn main(){print(a.value());print(b.value());print(more.value())}");
@@ -189,7 +210,13 @@ fn aliases_private_helpers_and_same_named_functions_stay_separate() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn diamonds_relative_paths_and_symlinks_load_each_file_once() {
     use std::os::unix::fs::symlink;
     let project = Project::new();
@@ -211,7 +238,13 @@ fn diamonds_relative_paths_and_symlinks_load_each_file_once() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn import_cycles_support_cross_module_mutual_recursion() {
     let project = Project::new();
     project.write(
@@ -232,7 +265,13 @@ fn import_cycles_support_cross_module_mutual_recursion() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn function_types_are_shared_across_module_boundaries() {
     let project = Project::new();
     project.write(
@@ -257,7 +296,13 @@ fn function_types_are_shared_across_module_boundaries() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn builds_are_reproducible_relocatable_and_see_dependency_edits() {
     let a = Project::new();
     let b = Project::new();
@@ -293,7 +338,11 @@ fn only_root_main_is_an_entrypoint_and_failed_builds_preserve_all_sources() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let before = fs::read(project.0.join("build/arm64-macos/demo")).unwrap();
+    let before = fs::read(project.0.join(format!(
+        "build/{}/demo",
+        dunder::target::Target::host().unwrap().name()
+    )))
+    .unwrap();
     let overwrite = project.cli(&["build", "-o", "math.ddr"]);
     assert!(!overwrite.status.success());
     assert_eq!(
@@ -305,7 +354,11 @@ fn only_root_main_is_an_entrypoint_and_failed_builds_preserve_all_sources() {
     assert!(!bad.status.success());
     assert!(bad.stdout.is_empty());
     assert_eq!(
-        fs::read(project.0.join("build/arm64-macos/demo")).unwrap(),
+        fs::read(project.0.join(format!(
+            "build/{}/demo",
+            dunder::target::Target::host().unwrap().name()
+        )))
+        .unwrap(),
         before
     );
     project.write("math.ddr", dependency);

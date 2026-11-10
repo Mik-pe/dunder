@@ -72,7 +72,13 @@ fn source_positions_and_multiline_calls() {
     .unwrap_or_else(|e| panic!("{}", e.message));
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native(source: &str) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt;
     let dir = Dir::new();
@@ -81,21 +87,30 @@ fn native(source: &str) -> std::process::Output {
         dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.ddr", source)));
     fs::write(&path, &image).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    let signed = Command::new("/usr/bin/codesign")
-        .args(["--verify"])
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(
-        signed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&signed.stderr)
-    );
+    #[cfg(target_os = "macos")]
+    {
+        let signed = Command::new("/usr/bin/codesign")
+            .args(["--verify"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            signed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    }
     Command::new(&path).env_clear().output().unwrap()
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn compiled_examples_and_runtime_control_flow() {
     for (source,expected,status) in [
         (include_str!("../examples/hello.ddr"),"42\ntrue\n",0),
@@ -113,7 +128,13 @@ fn compiled_examples_and_runtime_control_flow() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn integer_checks_apply_to_computed_values() {
     for (source, status) in [
         ("fn main(){x:=2147483647;print(x+1)}", 101),
@@ -159,7 +180,10 @@ fn cli_manifest_and_failed_build_preserve_previous_binary() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let output = dir.0.join("build/arm64-macos/demo");
+    let output = dir.0.join(format!(
+        "build/{}/demo",
+        dunder::target::Target::host().unwrap().name()
+    ));
     let before = fs::read(&output).unwrap();
     fs::write(&src, "fn main(){x:bool=42}").unwrap();
     let bad = Command::new(compiler)
@@ -182,7 +206,13 @@ fn cli_manifest_and_failed_build_preserve_previous_binary() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native_integer_and_comparison_results_match_independent_reference() {
     let mut source = String::new();
     for ty in ["i32", "i64"] {
@@ -251,7 +281,13 @@ fn function_signatures_returns_and_main_are_checked() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn callbacks_returned_functions_and_nested_calls_execute() {
     for (source,expected) in [
         ("fn add(a:i32,b:i32)->i32{return a+b} fn mark(n:i32)->i32{print(n);return n} fn factory()->fn(i32,i32)->i32{print(0);return add} fn main(){print(factory()(mark(1),mark(2)))}","0\n1\n2\n3\n"),
@@ -265,7 +301,13 @@ fn callbacks_returned_functions_and_nested_calls_execute() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn stack_arguments_preserve_types_alignment_and_recursion() {
     let source = r#"
 fn double(n:i32)->i32{return n*2}
@@ -310,7 +352,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn run_uses_main_and_propagates_its_exit_status() {
     let dir = Dir::new();
     let source = dir.0.join("program.ddr");

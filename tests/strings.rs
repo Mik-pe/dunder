@@ -17,7 +17,13 @@ impl Workspace {
         fs::create_dir(&path).unwrap();
         Self(path)
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn native(source: &str) -> std::process::Output {
         use std::os::unix::fs::PermissionsExt;
         let work = Self::new();
@@ -26,16 +32,19 @@ impl Workspace {
         let path = work.0.join("program");
         fs::write(&path, image).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let signed = Command::new("/usr/bin/codesign")
-            .arg("--verify")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            signed.status.success(),
-            "{}",
-            String::from_utf8_lossy(&signed.stderr)
-        );
+        #[cfg(target_os = "macos")]
+        {
+            let signed = Command::new("/usr/bin/codesign")
+                .arg("--verify")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                signed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&signed.stderr)
+            );
+        }
         Command::new(path).env_clear().output().unwrap()
     }
     fn cli(&self, args: &[&str]) -> std::process::Output {
@@ -87,7 +96,13 @@ fn string_and_rune_types_and_utf8_literals_are_checked() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native_strings_support_values_returns_concatenation_slices_and_embedded_nul() {
     let out = Workspace::native(
         r#"
@@ -125,7 +140,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn rune_and_byte_iteration_preserve_scalar_boundaries_and_loop_control() {
     let out = Workspace::native(
         r#"
@@ -158,7 +179,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn strings_and_runes_work_in_structs_arrays_callbacks_and_stack_arguments() {
     let out = Workspace::native(
         r#"
@@ -188,7 +215,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn scalar_formatting_and_rune_conversion_cover_full_ranges() {
     let out = Workspace::native(
         r#"
@@ -215,7 +248,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn invalid_string_indices_boundaries_and_unicode_scalars_fail_predictably() {
     for (expression, status) in [
         ("\"å\"[-1]", 103),
@@ -242,7 +281,13 @@ fn invalid_string_indices_boundaries_and_unicode_scalars_fail_predictably() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native_unicode_matches_independent_rust_byte_and_scalar_reference() {
     let samples = [
         "",
@@ -295,7 +340,13 @@ fn native_unicode_matches_independent_rust_byte_and_scalar_reference() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn string_module_tests_use_real_runtime_values_and_report_unicode_failures() {
     let work = Workspace::new();
     fs::write(

@@ -16,7 +16,13 @@ impl Workspace {
         fs::create_dir(&path).unwrap();
         Self(path)
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     fn native(source: &str) -> std::process::Output {
         use std::os::unix::fs::PermissionsExt;
         let work = Self::new();
@@ -25,12 +31,15 @@ impl Workspace {
             dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("float.ddr", source)));
         fs::write(&path, image).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let signed = Command::new("/usr/bin/codesign")
-            .arg("--verify")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(signed.status.success());
+        #[cfg(target_os = "macos")]
+        {
+            let signed = Command::new("/usr/bin/codesign")
+                .arg("--verify")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(signed.status.success());
+        }
         Command::new(path).env_clear().output().unwrap()
     }
     fn cli(&self, args: &[&str]) -> std::process::Output {
@@ -87,7 +96,13 @@ fn floating_literals_types_and_methods_are_checked() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn arithmetic_ieee_comparisons_math_and_casts_execute_natively() {
     let out = Workspace::native(
         r#"
@@ -131,7 +146,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn shortest_decimal_formatting_handles_common_values_and_ieee_extremes() {
     let out = Workspace::native(
         r#"
@@ -153,7 +174,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn float_values_preserve_layout_callbacks_and_independent_register_banks() {
     let out = Workspace::native(
         r#"
@@ -189,7 +216,13 @@ fn main(){
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn float_to_integer_rejects_nan_infinity_and_truncated_out_of_range_values() {
     for expr in [
         "i32(2147483648.0)",
@@ -207,7 +240,13 @@ fn float_to_integer_rejects_nan_infinity_and_truncated_out_of_range_values() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn native_floating_results_match_independent_rust_ieee_reference() {
     let doubles = [
         0.0f64,
@@ -276,7 +315,13 @@ fn native_floating_results_match_independent_rust_ieee_reference() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn formatted_floats_round_trip_against_independent_rust_parser() {
     let mut doubles = vec![
         0.0f64,
@@ -344,7 +389,13 @@ fn formatted_floats_round_trip_against_independent_rust_parser() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn imported_float_types_tagged_cases_and_runtime_errors_compose() {
     let work = Workspace::new();
     fs::write(work.0.join("math.ddr"),"pub struct Point{x:f32,y:f32}\n@test{(Point{x:3.0,y:4.0})->5.0}\npub fn length(p:Point)->f32{(p.x*p.x+p.y*p.y).sqrt()}").unwrap();
