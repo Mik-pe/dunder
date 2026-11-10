@@ -111,8 +111,9 @@ läser `math.ddr`. Undermappar och alias skrivs exempelvis
 `import "util/predicates" as predicates`. `import "math"` stöds också.
 Ingen importform innehåller `.ddr`.
 
-Typer följer samma regel: `struct Point` är privat och `pub struct Point`
-exporteras. En importerad typ skrivs exempelvis `geometry.Point`, både i
+Typer följer samma regel: `struct Point` och `enum Command` är privata;
+`pub struct Point` och `pub enum Command` exporteras.
+En importerad typ skrivs exempelvis `geometry.Point`, både i
 signaturer och i uttrycket `geometry.Point { x: 3, y: 4 }`.
 
 Kör [exemplet med tre moduler](examples/modules/main.ddr):
@@ -206,6 +207,30 @@ callbacks, iteratorer, structar och en indexbaserad arena över en fast typad
 buffert. Arenan är ett fungerande bump-allokeringsprogram; språket har ännu
 inget allmänt allokerings- eller låne-API.
 
+## Enums och match
+
+Både namngivna värden och varianter med data är typade värden:
+
+```dunder
+enum FileKind { Other = 0, File = 1, Directory = 2 }
+enum Command { Stop, Print(string), Move(i32, i32) }
+
+fn evaluate(command: Command) -> i32 {
+    match command {
+        .Stop => 0,
+        .Print(text) => text.len,
+        .Move(x, y) => x + y,
+    }
+}
+```
+
+Skriv `Command.Move(20, 22)` eller `.Move(20, 22)` när typen framgår av
+kontexten. `match` kontrolleras för saknade och dubbla fall. Payloads ligger
+direkt i värdet, kopieras med värdesemantik och kan innehålla structar,
+arrayer, andra enums och funktionsvärden. Matchningen använder taggar och
+direkta grenar utan vtables. Läs [enumreglerna](docs/enums.md) och prova
+`cargo run --release -- run dogfood/enums.ddr`.
+
 ## UTF-8-strängar
 
 ```dunder
@@ -293,15 +318,18 @@ import sys
 fn main() {
     saved := sys.write_text("hello.txt", "Hej från Dunder 🌍\n")
     if !saved.ok { print(sys.error_message(saved.error)); return }
-    content := sys.read_text("hello.txt")
-    if content.ok { print(content.value) }
-    else { print(sys.error_message(content.error)) }
+    match sys.read("hello.txt") {
+        .Ok(text) => { print(text) },
+        .Err(error) => { print(sys.io_error_message(error)) },
+    }
 }
 ```
 
 API:t omfattar läsning, skrivning, append, metadata, mkdir, rename och
-borttagning av filer/tomma kataloger. Resultaten har `.ok` och `.error`;
-lästa strängar finns i `.value`. Vanliga I/O-fel avbryter inte processen.
+borttagning av filer/tomma kataloger. `read` ger `Ok(string)` eller
+`Err(IoError)`. Övriga I/O-resultat och den lägre läsfunktionen `read_text`
+har `.ok` och `.error`; lästa strängar finns då i `.value`.
+Vanliga I/O-fel avbryter inte processen.
 `read_text` validerar UTF-8 och läser högst 4 MiB per fil till strängarenan.
 Läs [sys-reglerna](docs/sys.md) för beteende och begränsningar och kör
 `cargo run --release -- test dogfood/filesystem.ddr` för filsystemets dogfood.
@@ -313,10 +341,11 @@ till lagring hos anroparen och fungerar även genom callbacks och rekursion.
 
 Implementerat: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,
 callbacks, funktioner som returvärden, framåtanrop och rekursion,
-filmoduler med explicita importer, alias, namnrymder och privata/exporterade funktioner och structar,
+filmoduler med explicita importer, alias, namnrymder och privata/exporterade funktioner och typer,
 härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/else`,
 `while`, `for`, `break/continue`, typade arrayer och arrayiteratorer,
-struct-uttryck och fältåtkomst, `@test`, `assert`, kortslutande booleska operatorer,
+struct-uttryck och fältåtkomst, värde-enums och varianter med data, uttömmande `match`,
+`@test`, `assert`, kortslutande booleska operatorer,
 heltals- och flyttalsaritmetik, kontrollerade konverteringar och `print`.
 Läs [syntaxen](docs/syntax.md).
 
@@ -325,9 +354,11 @@ Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
 infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
 och körbar kod; optimering och byggprestanda är inte uppmätta.
 Bootstrapkompilatorn är skriven i Rust och är ännu inte självhostad.
-Structfält och arrayelement stöder i dag `i32`, `i64`, `f32`, `f64`, `bool`, `string` och `rune`.
-Arrayer och structar kan returneras från funktioner med värdesemantik.
-Nästlade aggregat, arrayslices, allmänt allokerings-API, ägande/lån och
+Structfält och arrayelement stöder i dag `i32`, `i64`, `f32`, `f64`, `bool`,
+`string`, `rune` och enums utan payload. Arrayer, structar och data-enums kan
+returneras från funktioner med värdesemantik. Data-enums kan innehålla
+aggregat; nästlade structar och aggregat som arrayelement återstår.
+Arrayslices, allmänt allokerings-API, ägande/lån och
 användardefinierade iteratorer återstår. Stränginterpolering, normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
 

@@ -43,6 +43,7 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
 | `[i32; 8]` | En array med åtta element; längden ingår i typen. |
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
+| `Command` / `sys.ReadResult` | En nominell enum med namngivna värden eller payload-varianter. |
 | `range` | Ett halvöppet intervall med `i32`-gränser. |
 
 Literaler får typ från en annotering, funktionens parameter/returtyp eller
@@ -66,6 +67,8 @@ matchande typer. Division avrundar mot noll; resten har täljarens tecken.
 Spill i `+`, `-`, `*`, unärt minus, divisionen `MIN/-1` och avsmalnande
 konvertering avslutar processen med status 101. Division/rest med noll ger
 102. Ogiltiga arrayindex ger 103 och en misslyckad `assert` ger 104.
+Konvertering från `i32` till en enum utan payload kontrollerar deklarerade
+värden och ger 108 för okända värden; se [enums och match](enums.md).
 Reglerna gäller även optimerade byggen. Wraparound är ännu inte en
 språkoperation. Statuskoderna är den första felmekanismen; källkopplade
 runtime-diagnoser återstår.
@@ -232,8 +235,8 @@ fn main() {
 
 `fn` är privat; `pub fn` exporterar en namngiven funktion. Samma fil kan
 anropa sina privata funktioner. Andra moduler får bara använda dess publika
-funktioner via sitt importalias. `struct` och `pub struct` följer samma
-synlighetsregel; typens fält följer typens synlighet i denna version.
+funktioner via sitt importalias. `struct`/`pub struct` och `enum`/`pub enum`
+följer samma synlighetsregel; fält och varianter följer typens synlighet.
 Funktionsvärden och deras strukturella typer
 fungerar likadant över modulgränser som inom en fil.
 
@@ -244,7 +247,7 @@ samma fil. Lokala värden får skugga ett alias; det skuggade namnet ger då
 inte längre tillgång till modulen i det scopet. En moduls egna importer
 exporteras inte vidare. Varje fil importerar sina egna beroenden uttryckligt.
 
-Moduler innehåller funktioner och struct-deklarationer, inga globala värden
+Moduler innehåller funktioner, struct- och enumdeklarationer, inga globala värden
 eller initialiseringskod. Typer och signaturer från hela grafen fastställs före kropparna.
 Cirkulära importer är därför tillåtna och kan innehålla ömsesidig rekursion.
 Den kanoniska filsökvägen identifierar en modul: flera alias, gemensamma
@@ -288,7 +291,8 @@ Structar är nominella: olika deklarationer ger olika typer även med samma
 fält. Importerade typer behåller sin identitet över moduler och i callbacks.
 Alla fält måste anges exakt en gång; deras ordning i uttrycket är valfri.
 Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får vara
-`i32`, `i64`, `f32`, `f64`, `bool`, `string` eller `rune`; nästlade structar och arrayfält återstår.
+`i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune` eller en enum utan payload;
+nästlade structar och arrayfält återstår.
 
 En struct kopieras vid bindning, tilldelning och parameteröverföring.
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
@@ -322,7 +326,8 @@ fn main() {
 
 `[a, b, c]` bygger en array. `[value; N]` utvärderar `value` en gång och
 upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
-`i32`, `i64`, `f32`, `f64`, `bool`, `string` eller `rune`; den härleds eller hämtas från förväntad arraytyp.
+`i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune` eller en enum utan payload;
+den härleds eller hämtas från förväntad arraytyp.
 En array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
 Nästlade arrayer, structelement och slices är ännu inte implementerade.
 

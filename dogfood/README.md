@@ -8,7 +8,7 @@ Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 28 passed, 0 failed
+# 32 passed, 0 failed
 ```
 
 Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
@@ -33,6 +33,7 @@ Med kompilatorn kopierad till `build/dunder` används samma kommandon som
 | [structs.ddr](structs.ddr) | Exporterad struct, uttryck som input, värdekopia och fältändring. | `25`, `32`, `3` |
 | [numeric/main.ddr](numeric/main.ddr) | f32-vektor, kompenserad f64-summering och rotberäkning med callback. | `5.0`, `2.0`, `true` |
 | [filesystem.ddr](filesystem.ddr) | Medföljande sys, UTF-8-fil, append, metadata, rename och städning. | `18`, `filesystem ok` |
+| [enums.ddr](enums.ddr) | Namngivna värden, payloads, uttömmande match och nästlade Ok/Err. | `42`, `enums ok` |
 | [utf8.ddr](utf8.ddr) | UTF-8, byte/kodpunkter, ordräkning, strängretur och text i structar. | `bytes=25`, `runes=20`, `words=5`, `🌍 Hej världen` |
 | [tokenizer.ddr](tokenizer.ddr) | UTF-8-ord, ASCII-skiljetecken och citerade strängar med escapes. | `fn\|hälsa\|(\|namn\|)\|{\|print\|(\|"Hej 🌍"\|)\|}` |
 
@@ -62,16 +63,24 @@ Standardtidsgränsen är fem sekunder per grupp; `--timeout-ms` ändrar den.
 
 Arrayer, structar och arrayiteratorer har värdesemantik och kopieras vid
 bindning och anrop. Iteratorer tar en kopia av arrayen; de lånar den inte.
-Structfält och arrayelement är ännu begränsade till `i32`, `i64`, `f32`, `f64`, `bool`, `string` och `rune`.
-Structar och fasta arrayer kan returneras med värdesemantik.
+Structfält och arrayelement stöder `i32`, `i64`, `f32`, `f64`, `bool`,
+`string`, `rune` och enums utan payload.
+Structar, fasta arrayer och data-enums kan returneras med värdesemantik.
 Användardefinierade iteratorer återstår.
 
 [filesystem.ddr](filesystem.ddr) använder `import sys`, som är inbäddat i
 kompilatorn. Programmet skapar en egen katalog med process-ID, provar
 filflödet och städar de kända objekten. Det har två testgrupper, och sys
-lägger till en grupp för felmeddelanden. Kör `dunder test dogfood/filesystem.ddr`.
-Resultatens `.ok` och `.error` håller vanliga OS-fel i programmets kontrollflöde.
+lägger till två grupper för felmeddelanden och typade felkoder.
+Kör `dunder test dogfood/filesystem.ddr` för alla fyra.
+`sys.read` ger `Ok(string)` / `Err(IoError)`; övriga resultat har `.ok` och
+`.error`. Vanliga OS-fel hanteras i programmets kontrollflöde.
 Läs [sys-kontraktet](../docs/sys.md) för textgränser och skrivbeteende.
+
+[enums.ddr](enums.ddr) har tre egna testgrupper för payload-utvärdering,
+nästlade resultat och namngivna värden i arrayer och structfält. Med sys
+blir det fem grupper: `dunder test dogfood/enums.ddr`.
+Taggar och direkta grenar används utan vtables. Se [enumreglerna](../docs/enums.md).
 
 [numeric/math.ddr](numeric/math.ddr) testar vektorlängd, omskalad hypotenusa,
 toleranser och kompenserad summering. [numeric/ode.ddr](numeric/ode.ddr)

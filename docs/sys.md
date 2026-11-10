@@ -35,6 +35,7 @@ implementeras i [native-backenden](../src/native/sys.rs).
 
 | Funktion | Returtyp | Beteende |
 | --- | --- | --- |
+| `sys.read(path)` | `sys.ReadResult` | UTF-8-läsning med `Ok(string)` / `Err(IoError)`. |
 | `sys.read_text(path)` | `sys.TextResult` | Läser en vanlig fil och validerar UTF-8. |
 | `sys.write_text(path, text)` | `sys.Status` | Skapar filen eller ersätter hela dess innehåll. |
 | `sys.append_text(path, text)` | `sys.Status` | Skapar filen eller lägger till text sist. |
@@ -45,9 +46,34 @@ implementeras i [native-backenden](../src/native/sys.rs).
 | `sys.remove_dir(path)` | `sys.Status` | Tar bort en tom katalog. |
 | `sys.pid()` | `i32` | Processens ID. |
 | `sys.error_message(error)` | `string` | Kort meddelande för vanliga fel; annars `"OS error N"`. |
+| `sys.file_kind(info)` | `sys.FileKind` | `Other`, `File` eller `Directory` från en `Metadata`. Kontrollera först `info.ok`. |
+| `sys.error_from_code(code)` | `sys.IoError` | Namngivet fel eller `Other(code)` för en okänd kod. |
+| `sys.error_code(error)` | `i32` | Ursprunglig felkod, även för `Other(code)`. |
+| `sys.io_error_message(error)` | `string` | Feltext för ett typat `IoError`. |
 
-Samtliga sökvägar och textargument har typen `string`. Resultaten är vanliga
-nominella structar, som kan skickas och returneras mellan funktioner:
+Samtliga sökvägar och textargument har typen `string`. `read` använder enums:
+
+```dunder
+pub enum FileKind { Other = 0, File = 1, Directory = 2 }
+pub enum ReadResult { Ok(string), Err(IoError) }
+```
+
+`IoError` har bland annat `NotFound`, `PermissionDenied`, `InvalidUtf8` och
+`Other(i32)`. Den sistnämnda bevarar fel som ännu saknar ett eget namn.
+Hela deklarationen finns i [sys.ddr](../stdlib/sys.ddr).
+
+```dunder
+fn load(path: string) -> string {
+    match sys.read(path) {
+        .Ok(text) => text,
+        .Err(error) => { print(sys.io_error_message(error)); return "" },
+    }
+}
+```
+
+`read` är en Dunder-wrapper över `read_text` med samma läsregler och gränser.
+Övriga I/O-funktioner och `read_text` använder nominella resultatstructar,
+som också kan skickas och returneras mellan funktioner:
 
 ```dunder
 pub struct Status { ok: bool, error: i32 }
@@ -66,7 +92,8 @@ tom och metadatafält noll/falska. Det skiljer en tom fil som lästes korrekt
 från ett misslyckat anrop. `.size` räknar byte, inte Unicode-kodpunkter.
 Ett normalt I/O-fel är ett resultat; det avbryter inte processen.
 Koden väljer själv hur felet hanteras. Det finns ännu ingen `?`-operator
-eller generell Result/Option-typ.
+eller generell Result/Option-typ. Konkreta enums och `match` fungerar redan;
+se [enumreglerna](enums.md).
 
 ## Sökvägar och filer
 
@@ -141,7 +168,7 @@ cargo run --release -- run dogfood/filesystem.ddr
 # 18
 # filesystem ok
 cargo run --release -- test dogfood/filesystem.ddr
-# 3 passed, 0 failed
+# 4 passed, 0 failed
 ```
 
 Dogfood-programmet skapar en egen katalog med process-ID i namnet, provar

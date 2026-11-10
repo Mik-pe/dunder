@@ -4,6 +4,7 @@ use crate::{
     check::{Expr, ExprKind, Program, Stmt},
     syntax::{Type, Types},
 };
+mod enums;
 mod floats;
 mod strings;
 mod sys;
@@ -38,6 +39,7 @@ struct Code<'a> {
     return_slot: Option<usize>,
     sys: sys::Runtime,
     sys_types: Option<crate::check::SysTypes>,
+    invalid_enum: Label,
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -62,6 +64,7 @@ impl<'a> Code<'a> {
             return_slot: None,
             sys: sys::Runtime::default(),
             sys_types: None,
+            invalid_enum: 0,
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -75,6 +78,7 @@ impl<'a> Code<'a> {
         c.strings = strings::Runtime::new(&mut c);
         c.float_conversion = c.label();
         c.sys = sys::Runtime::new(&mut c);
+        c.invalid_enum = c.label();
         c
     }
     fn label(&mut self) -> Label {
@@ -148,6 +152,7 @@ impl<'a> Code<'a> {
         self.emit(0x8b0903a9); // add x9,x29,x9, past saved FP/LR
         self.emit(match ty {
             Type::I32 | Type::Rune => 0xb9800120,
+            _ if self.types.scalar_enum(ty) => 0xb9800120,
             Type::F32 => 0xb9400120,
             Type::Bool => 0x39400120,
             _ => 0xf9400120,
@@ -166,6 +171,7 @@ impl<'a> Code<'a> {
     fn typed_load(&mut self, ty: Type) {
         self.emit(match ty {
             Type::I32 | Type::Rune => 0xb9800000,
+            _ if self.types.scalar_enum(ty) => 0xb9800000,
             Type::F32 => 0xb9400000,
             Type::Bool => 0x39400000,
             _ => 0xf9400000,
@@ -178,6 +184,7 @@ impl<'a> Code<'a> {
         self.emit(
             (match ty {
                 Type::I32 | Type::Rune | Type::F32 => 0xb9000000,
+                _ if self.types.scalar_enum(ty) => 0xb9000000,
                 Type::Bool => 0x39000000,
                 _ => 0xf9000000,
             }) | base << 5
@@ -217,6 +224,22 @@ impl<'a> Code<'a> {
     }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::Enum {
+                tag,
+                fields,
+                storage,
+            } => self.enum_value(e.ty, *tag, fields, *storage),
+            ExprKind::EnumFromInt(value) => {
+                self.expr(value);
+                let valid = self.label();
+                for variant in &self.types.enumeration(e.ty).unwrap().variants {
+                    self.imm(1, variant.tag as i64 as u64);
+                    self.cmp(0, 1);
+                    self.branch(valid, Branch::Cond(0));
+                }
+                self.branch(self.invalid_enum, Branch::Jump);
+                self.mark(valid);
+            }
             ExprKind::Float(bits) => self.imm(0, *bits),
             ExprKind::FloatOp(op, value) => self.float_expr(*op, value, e.ty),
             ExprKind::SysCall(op, args, storage) => self.sys_expr(*op, args, *storage),
@@ -321,7 +344,7 @@ impl<'a> Code<'a> {
                     self.push(0);
                 }
                 let (locations, outgoing) =
-                    arguments(&args.iter().map(|a| a.ty).collect::<Vec<_>>());
+                    arguments(&args.iter().map(|a| a.ty).collect::<Vec<_>>(), self.types);
                 self.stack_adjust(outgoing, true);
                 for (arg, location) in locations.into_iter().enumerate() {
                     self.sp_addr(outgoing + (args.len() - 1 - arg) * 16);
@@ -336,6 +359,7 @@ impl<'a> Code<'a> {
                             self.sp_addr(offset);
                             self.emit(match args[arg].ty {
                                 Type::I32 | Type::Rune | Type::F32 => 0xb900012a,
+                                _ if self.types.scalar_enum(args[arg].ty) => 0xb900012a,
                                 Type::Bool => 0x3900012a,
                                 _ => 0xf900012a,
                             });
@@ -531,6 +555,12 @@ impl<'a> Code<'a> {
     fn stmts(&mut self, body: &[Stmt]) {
         for stmt in body {
             match stmt {
+                Stmt::Match {
+                    source,
+                    slot,
+                    storage,
+                    arms,
+                } => self.enum_match(source, *slot, *storage, arms),
                 Stmt::Store(slot, e) => {
                     self.expr(e);
                     self.store(*slot, 0);
@@ -766,6 +796,7 @@ impl<'a> Code<'a> {
             (self.bounds, 103),
             (self.assertion, 104),
             (self.float_conversion, 107),
+            (self.invalid_enum, 108),
         ] {
             self.mark(label);
             self.imm(0, status);
@@ -839,7 +870,7 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         if let Some(slot) = f.return_slot {
             code.store(slot, 8);
         }
-        let (locations, _) = arguments(&f.params);
+        let (locations, _) = arguments(&f.params, &program.types);
         for (param, location) in locations.iter().enumerate() {
             if let Argument::General(reg) = location {
                 code.store(f.param_slots[param], *reg);
@@ -881,7 +912,7 @@ enum Argument {
     Float(u32),
     Stack(usize),
 }
-fn arguments(types: &[Type]) -> (Vec<Argument>, usize) {
+fn arguments(types: &[Type], layouts: &Types) -> (Vec<Argument>, usize) {
     let mut next = 0;
     let mut locations = Vec::new();
     let mut general = 0;
@@ -900,6 +931,7 @@ fn arguments(types: &[Type]) -> (Vec<Argument>, usize) {
         let size = match ty {
             Type::Bool => 1,
             Type::I32 | Type::Rune | Type::F32 => 4,
+            _ if layouts.scalar_enum(*ty) => 4,
             _ => 8,
         };
         next = align(next, size);

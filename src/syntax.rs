@@ -18,6 +18,7 @@ pub enum Type {
     Range,
     Named(usize),
     Record(usize),
+    Enum(usize),
 }
 impl Type {
     pub fn integer(self) -> bool {
@@ -47,6 +48,7 @@ impl Type {
             Self::Range => "range",
             Self::Named(_) => "type",
             Self::Record(_) => "struct",
+            Self::Enum(_) => "enum",
         }
     }
 }
@@ -63,6 +65,21 @@ pub struct Types {
     arrays: Vec<ArrayType>,
     names: Vec<NamedType>,
     records: Vec<RecordType>,
+    enums: Vec<EnumType>,
+}
+#[derive(Clone, Debug)]
+pub struct EnumType {
+    pub name: String,
+    pub module: usize,
+    pub data: bool,
+    pub variants: Vec<Variant>,
+    pub bytes: usize,
+}
+#[derive(Clone, Debug)]
+pub struct Variant {
+    pub name: String,
+    pub tag: i32,
+    pub fields: Vec<RecordField>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedType {
@@ -91,7 +108,7 @@ impl ArrayType {
     pub fn elem_size(self) -> usize {
         match self.elem {
             Type::Bool => 1,
-            Type::I32 | Type::Rune | Type::F32 => 4,
+            Type::I32 | Type::Rune | Type::F32 | Type::Enum(_) => 4,
             _ => 8,
         }
     }
@@ -100,6 +117,33 @@ impl ArrayType {
     }
 }
 impl Types {
+    pub fn declare_enum(&mut self, module: usize, name: String, data: bool) -> Type {
+        let index = self.enums.len();
+        self.enums.push(EnumType {
+            name,
+            module,
+            data,
+            variants: Vec::new(),
+            bytes: 4,
+        });
+        Type::Enum(index)
+    }
+    pub fn enumeration(&self, ty: Type) -> Option<&EnumType> {
+        if let Type::Enum(i) = ty {
+            self.enums.get(i)
+        } else {
+            None
+        }
+    }
+    pub fn define_enum(&mut self, ty: Type, variants: Vec<Variant>, bytes: usize) {
+        if let Type::Enum(i) = ty {
+            self.enums[i].variants = variants;
+            self.enums[i].bytes = bytes;
+        }
+    }
+    pub fn scalar_enum(&self, ty: Type) -> bool {
+        self.enumeration(ty).is_some_and(|e| !e.data)
+    }
     pub fn named(&mut self, module: usize, name: String) -> Type {
         let item = NamedType { module, name };
         let index = self
@@ -146,12 +190,15 @@ impl Types {
         self.array(ty)
             .map(|a| a.bytes())
             .or_else(|| self.record(ty).map(|r| r.bytes))
+            .or_else(|| self.enumeration(ty).filter(|e| e.data).map(|e| e.bytes))
     }
     pub fn array_type(&mut self, elem: Type, len: usize, span: Span) -> Result<Type, Error> {
         if !matches!(
             elem,
             Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune | Type::F32 | Type::F64
-        ) {
+        ) && !matches!(elem, Type::Named(_))
+            && !self.scalar_enum(elem)
+        {
             return Err(Error::new(
                 "E0220",
                 span,
@@ -159,7 +206,7 @@ impl Types {
             ));
         }
         let array = ArrayType { elem, len };
-        if len > 65536 || array.bytes() > 65536 {
+        if len > 65536 || (!matches!(elem, Type::Named(_)) && array.bytes() > 65536) {
             return Err(Error::new(
                 "E0220",
                 span,
@@ -208,6 +255,9 @@ impl Types {
         if let Some(r) = self.record(ty) {
             return r.name.clone();
         }
+        if let Some(e) = self.enumeration(ty) {
+            return e.name.clone();
+        }
         if let Some(a) = self.array(ty) {
             let name = format!("[{}; {}]", self.name(a.elem), a.len);
             return if matches!(ty, Type::Iterator(_)) {
@@ -236,12 +286,28 @@ pub struct Program {
     pub types: Types,
     pub imports: Vec<Import>,
     pub records: Vec<Record>,
+    pub enums: Vec<Enumeration>,
 }
 
 pub struct Module {
     pub functions: Vec<Function>,
     pub imports: Vec<Import>,
     pub records: Vec<Record>,
+    pub enums: Vec<Enumeration>,
+}
+#[derive(Debug)]
+pub struct Enumeration {
+    pub name: String,
+    pub public: bool,
+    pub variants: Vec<EnumVariant>,
+    pub span: Span,
+}
+#[derive(Debug)]
+pub struct EnumVariant {
+    pub name: String,
+    pub fields: Vec<Type>,
+    pub tag: Option<i128>,
+    pub span: Span,
 }
 #[derive(Debug)]
 pub struct Record {
@@ -286,6 +352,7 @@ enum Token {
     At,
     Newline,
     Arrow,
+    FatArrow,
     Op(&'static str),
     Eof,
 }
@@ -587,6 +654,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             (':', Some('=')) => Some(Token::Define),
             ('-', Some('>')) => Some(Token::Arrow),
             ('=', Some('=')) => Some(Token::Op("==")),
+            ('=', Some('>')) => Some(Token::FatArrow),
             ('!', Some('=')) => Some(Token::Op("!=")),
             ('<', Some('=')) => Some(Token::Op("<=")),
             ('>', Some('=')) => Some(Token::Op(">=")),
@@ -704,6 +772,13 @@ pub enum StmtKind {
     Block(Vec<Stmt>),
     Break,
     Continue,
+    Match(Expr, Vec<MatchArm>),
+}
+#[derive(Debug)]
+pub struct MatchArm {
+    pub pattern: Expr,
+    pub body: Vec<Stmt>,
+    pub span: Span,
 }
 #[derive(Debug)]
 pub struct Expr {
@@ -718,6 +793,7 @@ pub enum ExprKind {
     String(String),
     Rune(char),
     Name(String),
+    Variant(String),
     TestTarget(String),
     Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>),
@@ -900,6 +976,59 @@ impl Parser<'_> {
             span,
         })
     }
+    fn enum_decl(&mut self, public: bool) -> Result<Enumeration, Error> {
+        let span = self.take().span;
+        let (name, _) = self.name()?;
+        self.newlines();
+        self.expect(Token::Open, "'{'")?;
+        self.separators();
+        let mut variants = Vec::new();
+        while *self.peek() != Token::Close {
+            let (name, span) = self.name()?;
+            let mut fields = Vec::new();
+            if self.accept(Token::Left) {
+                while *self.peek() != Token::Right {
+                    fields.push(self.ty()?);
+                    if !self.accept(Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Token::Right, "')'")?;
+            }
+            let tag = if self.accept(Token::Equal) {
+                let negative = self.accept(Token::Op("-"));
+                let token = self.take();
+                let Token::Number(value) = token.token else {
+                    return Err(Error::new(
+                        "E0270",
+                        token.span,
+                        "enum tags must be integer literals",
+                    ));
+                };
+                Some(if negative { -value } else { value })
+            } else {
+                None
+            };
+            variants.push(EnumVariant {
+                name,
+                fields,
+                tag,
+                span,
+            });
+            if self.accept(Token::Comma) || self.accept(Token::Newline) {
+                self.separators();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::Close, "'}'")?;
+        Ok(Enumeration {
+            name,
+            public,
+            variants,
+            span,
+        })
+    }
     fn header_expr(&mut self) -> Result<Expr, Error> {
         let saved = self.record_literals;
         self.record_literals = false;
@@ -1058,6 +1187,45 @@ impl Parser<'_> {
             let expected = self.expr(0)?;
             self.end_stmt()?;
             StmtKind::Case(args, expected)
+        } else if self.is_word("match") {
+            self.take();
+            let source = self.header_expr()?;
+            self.expect(Token::Open, "'{'")?;
+            self.separators();
+            let mut arms = Vec::new();
+            while *self.peek() != Token::Close {
+                let span = self.span();
+                let pattern = self.header_expr()?;
+                self.expect(Token::FatArrow, "'=>'")?;
+                self.newlines();
+                let body = if *self.peek() == Token::Open {
+                    self.block()?
+                } else {
+                    let expr = self.expr(0)?;
+                    vec![Stmt {
+                        kind: StmtKind::Tail(expr),
+                        span,
+                    }]
+                };
+                arms.push(MatchArm {
+                    pattern,
+                    body,
+                    span,
+                });
+                if *self.peek() == Token::Close {
+                    break;
+                }
+                if !self.accept(Token::Comma) && !self.accept(Token::Newline) {
+                    return Err(Error::new(
+                        "E0100",
+                        self.span(),
+                        "expected ',' or newline after match arm",
+                    ));
+                }
+                self.separators();
+            }
+            self.expect(Token::Close, "'}'")?;
+            StmtKind::Match(source, arms)
         } else if self.is_word("if") {
             self.take();
             let condition = self.header_expr()?;
@@ -1188,6 +1356,16 @@ impl Parser<'_> {
         let t = self.take();
         let span = t.span;
         let mut left = match t.token {
+            Token::Dot => {
+                let (name, end) = self.name()?;
+                Expr {
+                    kind: ExprKind::Variant(name),
+                    span: Span {
+                        start: span.start,
+                        end: end.end,
+                    },
+                }
+            }
             Token::Number(n) => Expr {
                 kind: ExprKind::Number(n),
                 span,
@@ -1373,6 +1551,7 @@ pub fn parse(source: &str) -> Result<Program, Error> {
         functions: module.functions,
         imports: module.imports,
         records: module.records,
+        enums: module.enums,
         types,
     })
 }
@@ -1393,6 +1572,7 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
     let mut functions = Vec::new();
     let mut imports = Vec::new();
     let mut records = Vec::new();
+    let mut enums = Vec::new();
     parser.separators();
     while *parser.peek() != Token::Eof {
         if parser.is_word("import") {
@@ -1422,6 +1602,18 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
             let public = parser.is_word("pub");
             if public {
                 parser.take();
+            }
+            if parser.is_word("enum") {
+                if tagged {
+                    return Err(Error::new(
+                        "E0108",
+                        parser.span(),
+                        "@test applies to a function",
+                    ));
+                }
+                enums.push(parser.enum_decl(public)?);
+                parser.separators();
+                continue;
             }
             if parser.is_word("struct") {
                 if tagged {
@@ -1462,6 +1654,7 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
         functions,
         imports,
         records,
+        enums,
     })
 }
 
@@ -1475,6 +1668,12 @@ fn implicit_return(body: &mut [Stmt]) {
                 implicit_return(&mut b);
                 StmtKind::If(c, a, b)
             }
+            StmtKind::Match(source, mut arms) => {
+                for arm in &mut arms {
+                    implicit_return(&mut arm.body);
+                }
+                StmtKind::Match(source, arms)
+            }
             StmtKind::Block(mut b) => {
                 implicit_return(&mut b);
                 StmtKind::Block(b)
@@ -1487,6 +1686,11 @@ fn implicit_return(body: &mut [Stmt]) {
 fn lower_cases(body: &mut [Stmt], target: &str) {
     for stmt in body {
         match &mut stmt.kind {
+            StmtKind::Match(_, arms) => {
+                for arm in arms {
+                    lower_cases(&mut arm.body, target);
+                }
+            }
             StmtKind::If(_, a, b) => {
                 lower_cases(a, target);
                 lower_cases(b, target);

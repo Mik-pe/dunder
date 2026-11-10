@@ -379,6 +379,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         ("structs.ddr", "25\n32\n3\n"),
         ("numeric/main.ddr", "5.0\n2.0\ntrue\n"),
         ("filesystem.ddr", "18\nfilesystem ok\n"),
+        ("enums.ddr", "42\nenums ok\n"),
         ("collections.ddr", "-2\n-1\n0\n1\n13\n3\n"),
         ("utf8.ddr", "bytes=25\nrunes=20\nwords=5\n🌍 Hej världen\n"),
         (
@@ -402,7 +403,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("28 passed, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("32 passed, 0 failed"));
 }
 
 #[test]

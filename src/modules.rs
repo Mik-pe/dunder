@@ -96,6 +96,7 @@ impl Loader {
             functions: module.functions,
             imports: Vec::new(),
             records: module.records,
+            enums: module.enums,
             standard_sys: true,
         });
         Ok(id)
@@ -127,6 +128,7 @@ impl Loader {
             functions: module.functions,
             imports: Vec::new(),
             records: module.records,
+            enums: module.enums,
             standard_sys: false,
         });
         for import in module.imports {

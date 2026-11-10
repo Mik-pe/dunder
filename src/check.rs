@@ -3,6 +3,7 @@ use crate::{
     Error, Span,
 };
 use std::collections::HashMap;
+mod enums;
 
 pub struct Program {
     pub types: Types,
@@ -26,6 +27,7 @@ pub struct Module {
     pub functions: Vec<ast::Function>,
     pub imports: Vec<Import>,
     pub records: Vec<ast::Record>,
+    pub enums: Vec<ast::Enumeration>,
     pub standard_sys: bool,
 }
 pub struct Import {
@@ -55,6 +57,12 @@ pub struct Function {
     pub return_slot: Option<usize>,
 }
 pub enum Stmt {
+    Match {
+        source: Expr,
+        slot: usize,
+        storage: Option<usize>,
+        arms: Vec<EnumArm>,
+    },
     Store(usize, Expr),
     StoreAggregate(usize, usize, Expr),
     StoreIndex(Expr, Expr, Expr),
@@ -76,11 +84,28 @@ pub enum Stmt {
     Break,
     Continue,
 }
+pub struct EnumArm {
+    pub tag: Option<i32>,
+    pub bindings: Vec<EnumBinding>,
+    pub body: Vec<Stmt>,
+}
+pub struct EnumBinding {
+    pub ty: Type,
+    pub offset: usize,
+    pub slot: usize,
+    pub storage: Option<usize>,
+}
 pub struct Expr {
     pub ty: Type,
     pub kind: ExprKind,
 }
 pub enum ExprKind {
+    Enum {
+        tag: i32,
+        fields: Vec<(usize, Expr)>,
+        storage: Option<usize>,
+    },
+    EnumFromInt(Box<Expr>),
     Number(i64),
     Float(u64),
     FloatOp(FloatOp, Box<Expr>),
@@ -198,6 +223,8 @@ fn reserved(name: &str) -> bool {
             | "rune"
             | "f32"
             | "f64"
+            | "enum"
+            | "match"
     )
 }
 fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
@@ -341,6 +368,15 @@ impl Checker<'_> {
     }
     fn hint(&self, expr: &ast::Expr) -> Option<Type> {
         match &expr.kind {
+            ast::ExprKind::Variant(_) => None,
+            ast::ExprKind::Member(_, _)
+                if self.enum_variant(expr, None).ok().flatten().is_some() =>
+            {
+                self.enum_variant(expr, None)
+                    .ok()
+                    .flatten()
+                    .map(|(ty, _)| ty)
+            }
             ast::ExprKind::String(_) => Some(Type::String),
             ast::ExprKind::Rune(_) => Some(Type::Rune),
             ast::ExprKind::TestTarget(n) => self.global(n).map(|(_, ty)| ty),
@@ -365,6 +401,12 @@ impl Checker<'_> {
                 .or_else(|| self.member(base, name, expr.span).ok().map(|(_, ty)| ty)),
             ast::ExprKind::Record(name, _) => self.constructor_type(name).ok(),
             ast::ExprKind::Call(callee, _) => {
+                if let Some((ty, _)) = self.enum_variant(callee, None).ok().flatten() {
+                    return Some(ty);
+                }
+                if let Some(ty) = self.enum_type_expr(callee).ok().flatten() {
+                    return Some(ty);
+                }
                 if let ast::ExprKind::Name(n) = &callee.kind {
                     if n == "i32" {
                         return Some(Type::I32);
@@ -544,6 +586,41 @@ impl Checker<'_> {
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
+            A::Call(callee, args) if self.enum_variant(callee, expected)?.is_some() => {
+                self.enum_construct(callee, args, expected)?
+            }
+            A::Member(_, _) | A::Variant(_) if self.enum_variant(e, expected)?.is_some() => {
+                self.enum_construct(e, &[], expected)?
+            }
+            A::Variant(_) => {
+                return Err(Error::new(
+                    "E0271",
+                    e.span,
+                    "a short enum variant needs an enum type context",
+                ))
+            }
+            A::Call(callee, args) if self.enum_type_expr(callee)?.is_some() => {
+                let ty = self.enum_type_expr(callee)?.unwrap();
+                if !self.types.scalar_enum(ty) {
+                    return Err(Error::new(
+                        "E0271",
+                        e.span,
+                        "construct a data enum with a variant and its payload",
+                    ));
+                }
+                if args.len() != 1 {
+                    return Err(Error::new(
+                        "E0207",
+                        e.span,
+                        "enum conversion expects one i32",
+                    ));
+                }
+                let arg = self.expr(&args[0], Some(Type::I32))?;
+                Expr {
+                    ty,
+                    kind: ExprKind::EnumFromInt(Box::new(arg)),
+                }
+            }
             A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.sys_signature(n).is_some()) =>
             {
                 let A::Name(name) = &callee.kind else {
@@ -577,7 +654,7 @@ impl Checker<'_> {
             },
             A::Record(name, fields) => {
                 let ty = self.constructor_type(name)?;
-                let record = self.types.record(ty).unwrap().clone();
+                let record = self.types.record(ty).ok_or_else(||Error::new("E0240",e.span,"a struct literal requires a struct type; construct enum variants with Type.Variant"))?.clone();
                 let mut seen = std::collections::HashSet::new();
                 let mut values = Vec::new();
                 for (name, value, span) in fields {
@@ -837,9 +914,11 @@ impl Checker<'_> {
                     let string_op = a.ty == Type::String
                         && matches!(*op, "+" | "==" | "!=" | "<" | "<=" | ">" | ">=");
                     let rune_op = a.ty == Type::Rune && !arithmetic;
+                    let enum_op = self.types.scalar_enum(a.ty) && matches!(*op, "==" | "!=");
                     let float_op = a.ty.float() && *op != "%";
                     if !a.ty.integer()
                         && !float_op
+                        && !enum_op
                         && !string_op
                         && !rune_op
                         && !(matches!(*op, "==" | "!=") && a.ty == Type::Bool)
@@ -1064,7 +1143,9 @@ impl Checker<'_> {
                             ty
                         })),
                 )?;
-                if !(inner.ty.numeric() || inner.ty == Type::Rune)
+                if !(inner.ty.numeric()
+                    || inner.ty == Type::Rune
+                    || (ty.integer() && self.types.scalar_enum(inner.ty)))
                     || (ty.float() && inner.ty == Type::Rune)
                     || (ty == Type::Rune && inner.ty.float())
                 {
@@ -1160,6 +1241,7 @@ impl Checker<'_> {
         let mut returns = false;
         for s in stmts {
             let (stmt, ends) = match &s.kind {
+                ast::StmtKind::Match(source, arms) => self.check_match(source, arms, s.span)?,
                 ast::StmtKind::Decl {
                     name,
                     ty,
@@ -1392,6 +1474,7 @@ pub fn check_mode(program: ast::Program, mode: Mode) -> Result<Program, Error> {
             functions: program.functions,
             imports: Vec::new(),
             records: program.records,
+            enums: program.enums,
             standard_sys: false,
         }],
         program.types,
@@ -1415,6 +1498,22 @@ pub(crate) fn check_modules(
     for (module, input) in modules.iter().enumerate() {
         symbols[module].standard_sys = input.standard_sys;
         let mut names = std::collections::HashSet::new();
+        for e in &input.enums {
+            if reserved(&e.name) {
+                return Err(Error::new("E0200", e.span, "reserved enum name").in_file(module));
+            }
+            if !names.insert(e.name.clone()) {
+                return Err(Error::new("E0203", e.span, "duplicate enum name").in_file(module));
+            }
+            let ty = types.declare_enum(
+                module,
+                e.name.clone(),
+                e.variants.iter().any(|v| !v.fields.is_empty()),
+            );
+            symbols[module]
+                .records
+                .insert(e.name.clone(), (ty, e.public));
+        }
         for record in &input.records {
             if reserved(&record.name) {
                 return Err(Error::new(
@@ -1493,6 +1592,7 @@ pub(crate) fn check_modules(
                     Type::Bool => 1,
                     Type::I32 | Type::Rune | Type::F32 => 4,
                     Type::I64 | Type::String | Type::F64 => 8,
+                    _ if types.scalar_enum(ty) => 4,
                     _ => {
                         return Err(Error::new(
                             "E0240",
@@ -1524,6 +1624,7 @@ pub(crate) fn check_modules(
         }
     }
     let mut index = 0;
+    enums::define_enums(&modules, &symbols, &mut types)?;
     for (module, input) in modules.iter_mut().enumerate() {
         let mut test_names = std::collections::HashSet::new();
         for f in &mut input.functions {
@@ -1755,7 +1856,7 @@ fn lookup_type(symbols: &[Symbols], module: usize, name: &str, span: Span) -> Re
         return Err(Error::new(
             "E0403",
             span,
-            format!("type '{name}' is private; export it with 'pub struct'"),
+            format!("type '{name}' is private; export it with 'pub struct' or 'pub enum'"),
         ));
     }
     Ok(*ty)
@@ -1768,6 +1869,11 @@ fn resolve_type(
 ) -> Result<Type, Error> {
     if let Some(named) = types.named_ref(ty).cloned() {
         return lookup_type(symbols, named.module, &named.name, span);
+    }
+    if matches!(ty, Type::Array(_)) {
+        let array = types.array(ty).unwrap();
+        let elem = resolve_type(types, symbols, array.elem, span)?;
+        return types.array_type(elem, array.len, span);
     }
     if let Some(signature) = types.signature(ty).cloned() {
         let params = signature

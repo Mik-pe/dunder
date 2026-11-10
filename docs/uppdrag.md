@@ -49,6 +49,14 @@ också säkra struct- och arrayreturer med lagring hos anroparen. Fortsätt
 dogfooda genom riktiga filer i egna testkataloger och dokumentera gränserna:
 UTF-8, vanliga filer, 4 MiB per läsning och den befintliga strängarenan.
 
+Användaren bekräftade båda formerna av enums: namngivna heltalsvärden och
+varianter med data. Båda är implementerade med `enum`/`pub enum`, kontextuell
+`.Variant`, värdekopiering och statiskt uttömmande `match`. Payloads lagras
+direkt med en tagg; dispatch använder grenar utan vtables. `sys.read`
+dogfoodar `ReadResult { Ok(string), Err(IoError) }` och bevarar okända felkoder.
+Koppla inte ihop enums med ett krav på en viss allokerare. Generics, allmänt
+allokerings-API och färdig ägar-/lånemodell återstår; se [enumreglerna](enums.md).
+
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera
 körda exempel med verifierade resultat. Språkets användare skriver Dunder,
