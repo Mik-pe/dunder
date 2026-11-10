@@ -1,0 +1,125 @@
+// Per-group receipts. Resolve dependencies against flattened module names (including
+// function values and callbacks), and treat every raw/system path as observable.
+import cache_io
+import cli
+import lexer
+import modules
+import std.bytes as bytes
+import std.map as map
+import std.text as text
+import sys
+
+struct Graph {
+    ids: map.Map, body: []string, observable: []bool,
+    first: []i32, end: []i32, edge_start: []i32, edges: []i32,
+    context: string, ok: bool,
+}
+fn symbol(t: &lexer.Tokens, i: i32, s: string) -> bool { t.kinds[i] == .Symbol && t.texts[i] == s }
+fn graph(source: string) -> Graph {
+    var g := Graph { ids: map.new(), body: [], observable: [], first: [], end: [],
+        edge_start: [], edges: [], context: "", ok: false }
+    t := lexer.scan(source, false)
+    if !t.ok { return g }
+    var shared: []u8 = []; var pos := 0; var i := 0; var external := false
+    while i + 1 < t.kinds.len {
+        if symbol(&t,i,"@") && t.texts[i+1] == "extern" { external = true }
+        if t.kinds[i] != .Keyword || t.texts[i] != "fn" || t.kinds[i+1] != .Name { i = i + 1; continue }
+        name := t.texts[i+1]
+        map.put(&mut g.ids, name, i64(g.body.len))
+        if external {
+            g.first.push(0); g.end.push(0); g.body.push(""); g.observable.push(true)
+            external = false; i = i + 2; continue
+        }
+        var open := i + 2
+        while open < t.kinds.len && !symbol(&t,open,"{") { open = open + 1 }
+        if open >= t.kinds.len { return g }
+        var end := open + 1; var depth := 1; var effects := i > 0 && t.texts[i-1] == "unsafe"
+        while end < t.kinds.len && depth > 0 {
+            if symbol(&t,end,"{") { depth = depth + 1 }
+            if symbol(&t,end,"}") { depth = depth - 1 }
+            if t.kinds[end] == .Name {
+                word := t.texts[end]
+                if word == "unsafe" || word == "ptr" || word == "ffi_fn" || text.starts_with(word,"__sys_") { effects = true }
+            }
+            end = end + 1
+        }
+        if depth != 0 { return g }
+        bytes.append_utf8(&mut shared, source[pos..t.ends[open]])
+        pos = t.starts[end-1]
+        g.body.push(cache_io.digest(source[t.starts[open]..t.ends[end-1]]))
+        g.first.push(open+1); g.end.push(end-1); g.observable.push(effects)
+        i = end
+    }
+    bytes.append_utf8(&mut shared, source[pos..source.len])
+    context := sys.decode_u8(&shared); if !context.ok { return g }
+    g.context = cache_io.digest(context.value)
+    for f in 0..g.body.len {
+        g.edge_start.push(g.edges.len)
+        for token in g.first[f]..g.end[f] {
+            if t.kinds[token] == .Name {
+                dep := i32(map.get_or(&g.ids,t.texts[token],-1))
+                if dep >= 0 { g.edges.push(dep) }
+            }
+        }
+    }
+    g.edge_start.push(g.edges.len); g.ok = true; g
+}
+fn closure(g: &Graph, name: string, identity: string) -> string {
+    root := i32(map.get_or(&g.ids,name,-1)); if root < 0 { return "" }
+    var visited: []bool = []
+    for i in 0..g.body.len { visited.push(false) }
+    var queue: []i32 = [root]; var next := 0; visited[root] = true
+    while next < queue.len {
+        f := queue[next]; if g.observable[f] { return "" }
+        for e in g.edge_start[f]..g.edge_start[f+1] {
+            child := g.edges[e]; if !visited[child] { visited[child] = true; queue.push(child) }
+        }
+        next = next + 1
+    }
+    var input: []u8 = []
+    bytes.append_utf8(&mut input, identity + g.context)
+    for i in 0..visited.len { if visited[i] { bytes.append_utf8(&mut input, i.str() + ":" + g.body[i]) } }
+    payload := sys.decode_u8(&input); cache_io.digest(payload.value)
+}
+pub fn keys(loaded: &modules.Loaded, output: string, platform: i32, timeout_ms: i64) -> []string {
+    var keys: []string = []
+    for group in loaded.groups { keys.push("") }
+    if keys.len == 0 || loaded.calls.len != keys.len { return keys }
+    root := cache_io.root(loaded.paths[0]); if root == "" { return keys }
+    compiler := cache_io.compiler(platform); if compiler == "" { return keys }
+    g := graph(loaded.source); if !g.ok { return keys }
+    env := "dunder-passes-v1:" + compiler + ":" + platform.str() + ":" + timeout_ms.str() + ":"
+    for i in 0..keys.len {
+        id := cache_io.digest(root.len.str() + ":" + root + loaded.groups[i])
+        hash := closure(&g, loaded.calls[i], env)
+        if hash != "" { keys[i] = output + "/.affected/" + id + ".pass" + hash }
+    }
+    keys
+}
+pub fn seen(key: string) -> bool {
+    if key.len <= 64 { return false }
+    n := key.len - 64; receipt := sys.read_text(key[0..n])
+    receipt.ok && receipt.value == key[n..key.len]
+}
+pub fn update(key: string, passed: bool) {
+    if key.len <= 64 { return }
+    n := key.len - 64; path := key[0..n]
+    if !passed { removed := sys.remove_file(path); return }
+    if !cli.prepare_parent(path) { return }
+    temp := path + "." + sys.pid().str() + ".tmp"
+    written := sys.write_text(temp, key[n..key.len])
+    if written.ok { result := sys.rename(temp,path); if result.ok { return } }
+    removed := sys.remove_file(temp)
+}
+@test fn dependency_closure_follows_function_values_and_ignores_other_bodies() {
+    source := "fn helper()->i32 { 1 } fn unused()->i32 { 2 } fn test() { f := helper; assert(f() == 1) }"
+    a := graph(source)
+    b := graph("fn helper()->i32 { 1 } fn unused()->i32 { 9 } fn test() { f := helper; assert(f() == 1) }")
+    c := graph("fn helper()->i32 { 0 } fn unused()->i32 { 2 } fn test() { f := helper; assert(f() == 1) }")
+    a.ok && b.ok && c.ok
+    closure(&a,"test","x") != ""
+    closure(&a,"test","x") == closure(&b,"test","x")
+    closure(&a,"test","x") != closure(&c,"test","x")
+    d := graph("@extern(\"c\",\"getpid\") unsafe fn external()->i32\nfn wrapper()->i32 { external() }")
+    closure(&d,"wrapper","x") == ""
+}

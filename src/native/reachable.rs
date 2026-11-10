@@ -9,11 +9,18 @@ pub(super) struct Dependencies {
 
 pub(super) fn dependencies(program: &Program, function: usize) -> Dependencies {
     let f = &program.functions[function];
-    let mut deps = Dependencies { external_effects: f.external.is_some(), ..Dependencies::default() };
-    if f.uses_float_format { deps.functions.extend(program.float_formatter); }
+    let mut deps = Dependencies {
+        external_effects: f.external.is_some(),
+        ..Dependencies::default()
+    };
+    if f.uses_float_format {
+        deps.functions.extend(program.float_formatter);
+    }
     visit_body(&f.body, false, &mut |e, _| match e.kind {
         ExprKind::Function(index) | ExprKind::Callback(index) => deps.functions.push(index),
-        ExprKind::Call(ref t, _, _) if matches!(t.ty, crate::syntax::Type::ExternFunction(_)) => deps.external_effects = true,
+        ExprKind::Call(ref t, _, _) if matches!(t.ty, crate::syntax::Type::ExternFunction(_)) => {
+            deps.external_effects = true
+        }
         ExprKind::SysCall(..) => deps.external_effects = true,
         _ if matches!(e.ty, crate::syntax::Type::Ptr) => deps.external_effects = true,
         _ => {}
@@ -37,7 +44,8 @@ pub(super) fn visit_expr(e: &Expr, visit: &mut impl FnMut(&Expr)) {
     use ExprKind::*;
     match &e.kind {
         Function(_) | Callback(_) | StaticBytes { .. } => {}
-        ScratchAlloc { count: a, .. } | Deref(a)
+        ScratchAlloc { count: a, .. }
+        | Deref(a)
         | ManagedString(a, _, _)
         | Offset(a, _)
         | Clone(a, _)
@@ -67,10 +75,7 @@ pub(super) fn visit_expr(e: &Expr, visit: &mut impl FnMut(&Expr)) {
                 visit_expr(v, visit);
             }
         }
-        StringOp(_, args)
-        | SysCall(_, args, _)
-        | Array(args, _)
-        | Dynamic(args, _) => {
+        StringOp(_, args) | SysCall(_, args, _) | Array(args, _) | Dynamic(args, _) => {
             for v in args {
                 visit_expr(v, visit);
             }

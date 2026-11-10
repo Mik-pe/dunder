@@ -259,7 +259,11 @@ fn macho_imports(text: &[u8], imports: &super::ffi::Imports) -> Vec<u8> {
     macho_imports_with_storage(text, imports, RUNTIME_GLOBAL_BYTES)
 }
 
-pub(super) fn macho_imports_with_storage(text: &[u8], imports: &super::ffi::Imports, global_bytes: usize) -> Vec<u8> {
+pub(super) fn macho_imports_with_storage(
+    text: &[u8],
+    imports: &super::ffi::Imports,
+    global_bytes: usize,
+) -> Vec<u8> {
     let symbols = &imports.symbols;
     let text_offset = text_offset(imports);
     let commands = commands_size(imports);
@@ -547,6 +551,27 @@ mod tests {
         );
         let main = command(&image, 0x80000028);
         assert_eq!(le64(&image, main + 8), DYNAMIC_TEXT_OFFSET as u64);
+    }
+
+    #[test]
+    fn long_dylib_command_lists_move_text_and_bind_high_ordinals() {
+        let mut imports = super::super::ffi::Imports::default();
+        imports.libraries.push(LIBSYSTEM.into());
+        for i in 1..131 {
+            imports
+                .libraries
+                .push(format!("/tmp/{}/{i}.dylib", "a".repeat(128)));
+        }
+        imports.symbols.push((130, "last".into()));
+        let text = 0xd65f03c0u32.to_le_bytes();
+        let image = macho_imports(&text, &imports);
+        let entry = command(&image, 0x80000028);
+        let off = le64(&image, entry + 8) as usize;
+        assert!(off > PAGE);
+        assert_eq!(image[off..off + 4], text);
+        let info = command(&image, 0x80000022);
+        let binds = le32(&image, info + 16) as usize;
+        assert_eq!(&image[binds + 4..binds + 7], &[0x20, 0x83, 0x01]);
     }
 
     #[test]

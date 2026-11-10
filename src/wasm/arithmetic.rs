@@ -19,6 +19,11 @@ impl Emitter<'_, '_> {
         }
     }
     pub(super) fn cast(&mut self, from: Type, to: Type) -> Result<(), String> {
+        let from = if from == Type::Rune || self.m.types.scalar_enum(from) {
+            Type::I32
+        } else {
+            from
+        };
         let (a, b) = (val(from), val(to));
         if from == to {
             return Ok(());
@@ -124,7 +129,23 @@ impl Emitter<'_, '_> {
         }
         let ty = val(a.ty);
         if a.ty == Type::String {
-            return Err("computed string operations are unavailable".into());
+            self.expr(b)?;
+            if op == "+" {
+                self.runtime_call("str_concat");
+            } else {
+                self.runtime_call("str_cmp");
+                self.int(I32, 0);
+                self.op(match op {
+                    "==" => 0x46,
+                    "!=" => 0x47,
+                    "<" => 0x48,
+                    ">" => 0x4a,
+                    "<=" => 0x4c,
+                    ">=" => 0x4e,
+                    _ => return Err("unsupported string operator".into()),
+                });
+            }
+            return Ok(());
         }
         if a.ty.float() {
             self.expr(b)?;

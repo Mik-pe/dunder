@@ -32,7 +32,16 @@ den behöver inte vara en kompileringstidskonstant.
 
 ## Bygg och kör
 
-Bygg bootstrapkompilatorn med systemets Rust, utan externa crates:
+En fryst Dunder-kompilator kan bygga verktygskedjan på nytt från Dunder-källkod:
+
+```sh
+./tools/bootstrap.sh
+```
+
+Kommandot skriver ut sökvägen till den färdiga kompilatorn.
+[Fröbinärer och återbyggnad](bootstrap/README.md) beskriver hur varje mål verifieras.
+
+Bygg den optimerande Rust-kompilatorn med systemets Rust, utan externa crates:
 
 ```sh
 cargo build --release
@@ -106,6 +115,25 @@ felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
 Läs om [FFI, C-layout och modulkapabiliteter](docs/ffi.md),
 [funktionscachen, `check --agent` och `test --affected`](docs/incremental.md)
 samt [en delad triangel på WebGPU, Metal och Vulkan](dogfood/webgpu/README.md).
+
+## Verifierad täckning och återstående arbete
+
+Native-självbyggen för macOS/ARM64, Linux/ARM64 och Linux/x86-64 når
+byteidentiska fixpunkter och kör dogfood-sviten. Grafikbiblioteken för Metal
+med AppKit och Vulkan med SDL är Dunder-kod. Rust-bootstrapens Wasm-backend
+kör de portabla dogfood-grupperna och WebGPU-exemplet använder samma
+triangeldata som nativeexemplen.
+
+Rust-bootstrapen finns kvar som optimerande kompilator och återställningsväg.
+Självhostens Wasm-backend omfattar skalärer, flyttal och typade importer.
+Fullständigt stöd för hanterade samlingar i den backenden återstår, liksom
+full diagnostik- och lånekontrollsparitet. Modulkapabiliteter och delegerade
+filhandtag finns, medan legacy-API:erna i `sys` fortfarande ger direkt OS-åtkomst.
+
+[Bygg- och agentmätningar](benchmarks/compiler/2026-11-10-macos-arm64/README.md)
+och [runtimejämförelser](benchmarks/runtime/README.md) redovisar mätbara
+framsteg och kvarvarande avstånd till målen för självhostens genomströmning,
+C-prestanda och ändrade tester under 15 ms.
 
 ## Moduler
 

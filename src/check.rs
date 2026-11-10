@@ -152,7 +152,12 @@ pub enum ExprKind {
     Callback(usize),
     Call(Box<Expr>, Vec<Expr>, Option<usize>),
     SysCall(SysOp, Vec<Expr>, Option<usize>),
-    StaticBytes { module: usize, site: usize, bytes: usize, platform: String },
+    StaticBytes {
+        module: usize,
+        site: usize,
+        bytes: usize,
+        platform: String,
+    },
     Print(Box<Expr>),
     Cast(Box<Expr>),
     Unary(&'static str, Box<Expr>),
@@ -272,12 +277,7 @@ struct Checker<'a> {
 
 fn reserved(name: &str) -> bool {
     ffi::scalar(name).is_some()
-        || matches!(
-            name,
-            "unsafe"
-                | "extern"
-                | "capability"
-        )
+        || matches!(name, "unsafe" | "extern" | "capability")
         || matches!(
             name,
             "fn" | "var"
@@ -563,7 +563,10 @@ impl Checker<'_> {
                 }
                 if let ast::ExprKind::Name(n) = &callee.kind {
                     if self.bound_name(n) {
-                        return self.hint(callee).and_then(|t| self.types.signature(t)).map(|s| s.ret);
+                        return self
+                            .hint(callee)
+                            .and_then(|t| self.types.signature(t))
+                            .map(|s| s.ret);
                     }
                     if let Some(ty) =
                         ffi::scalar(n).or_else(|| n.strip_prefix("load_").and_then(ffi::scalar))
@@ -805,18 +808,42 @@ impl Checker<'_> {
             A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "static_bytes") => {
                 self.require_unsafe(e.span)?;
                 let [platform, length] = args.as_slice() else {
-                    return Err(Error::new("E0291", e.span, "static_bytes expects a native platform string and a constant byte count"));
+                    return Err(Error::new(
+                        "E0291",
+                        e.span,
+                        "static_bytes expects a native platform string and a constant byte count",
+                    ));
                 };
                 let A::String(platform) = &platform.kind else {
-                    return Err(Error::new("E0291", platform.span, "expected a platform string"));
+                    return Err(Error::new(
+                        "E0291",
+                        platform.span,
+                        "expected a platform string",
+                    ));
                 };
                 if !matches!(platform.as_str(), "linux" | "macos" | "native") {
-                    return Err(Error::new("E0291", e.span, "static storage platform must be linux, macos or native"));
+                    return Err(Error::new(
+                        "E0291",
+                        e.span,
+                        "static storage platform must be linux, macos or native",
+                    ));
                 }
                 let A::Number(bytes @ 1..=16777216) = length.kind else {
-                    return Err(Error::new("E0291", length.span, "static byte count must be a constant between 1 and 16777216"));
+                    return Err(Error::new(
+                        "E0291",
+                        length.span,
+                        "static byte count must be a constant between 1 and 16777216",
+                    ));
                 };
-                Expr { ty: Type::Ptr, kind: ExprKind::StaticBytes { module: self.module, site: e.span.start, bytes: bytes as usize, platform: platform.clone() } }
+                Expr {
+                    ty: Type::Ptr,
+                    kind: ExprKind::StaticBytes {
+                        module: self.module,
+                        site: e.span.start,
+                        bytes: bytes as usize,
+                        platform: platform.clone(),
+                    },
+                }
             }
             A::Borrow(base, mutable) => {
                 let Some((inner, allowed_mut)) = expected.and_then(|t| self.types.referenced(t))
@@ -1662,7 +1689,9 @@ impl Checker<'_> {
                 ast::StmtKind::Expr(e) | ast::StmtKind::Tail(e) => {
                     if let ast::ExprKind::Call(callee, args) = &e.kind {
                         if let ast::ExprKind::Name(name) = &callee.kind {
-                            if !self.bound_name(name) && name.strip_prefix("store_").and_then(ffi::scalar).is_some() {
+                            if !self.bound_name(name)
+                                && name.strip_prefix("store_").and_then(ffi::scalar).is_some()
+                            {
                                 result.push(self.raw_store(name, args, s.span)?);
                                 continue;
                             }

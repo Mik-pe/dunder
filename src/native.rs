@@ -5,22 +5,22 @@ use crate::{
     syntax::{Type, Types},
     target::Target,
 };
-mod collections;
 mod cache;
+mod collections;
 pub use cache::{CacheStats, Incremental};
-mod regions;
 pub(crate) mod elf;
 mod enums;
-mod floats;
 pub(crate) mod ffi;
 mod fingerprint;
+mod floats;
+mod regions;
 use fingerprint::Fingerprints;
 mod image;
 pub(crate) mod optimize;
 mod reachable;
 mod strings;
-mod unsigned;
 mod sys;
+mod unsigned;
 
 pub(crate) type Label = usize;
 pub(crate) enum Branch {
@@ -133,6 +133,7 @@ impl<'a> Code<'a> {
         self.emit(0);
     }
     fn mark(&mut self, l: Label) {
+        self.locals.last_read = None; // incoming branches may carry different values
         assert!(self.labels[l].is_none());
         self.labels[l] = Some(self.words.len());
     }
@@ -183,6 +184,7 @@ impl<'a> Code<'a> {
         self.emit(0xcb0903a9);
     } // sub x9,x29,x9
     fn store(&mut self, slot: usize, reg: u32) {
+        self.locals.write_slot(slot);
         if let Some(home) = self.locals.register(slot) {
             self.mov(home, reg);
             return;
@@ -363,9 +365,13 @@ impl<'a> Code<'a> {
         let a = self.types.array(base.ty);
         let dynamic = self.types.dynamic_elem(base.ty);
         let fixed = self.locals.fixed_array(base);
+        let bounded = fixed
+            && matches!(index.kind, ExprKind::Local(slot) if self.locals.bounded_index == Some(slot));
         if fixed {
             self.expr(index);
-            self.cmp(0, 15);
+            if !bounded {
+                self.cmp(0, 15);
+            }
         } else {
             self.operands(base, index);
             if dynamic.is_some() {
@@ -375,16 +381,24 @@ impl<'a> Code<'a> {
             }
             self.cmp(0, 2);
         }
-        self.branch(self.bounds, Branch::Cond(2));
+        if !bounded {
+            self.branch(self.bounds, Branch::Cond(2));
+        }
         let data = if fixed { 14 } else { 1 };
         let stride = if let Some(elem) = dynamic {
-            if !fixed { self.ldr(1, 1); }
-            self.types.storage_bytes(elem).unwrap_or_else(|| self.types.scalar_size(elem)).max(1)
+            if !fixed {
+                self.ldr(1, 1);
+            }
+            self.types
+                .storage_bytes(elem)
+                .unwrap_or_else(|| self.types.scalar_size(elem))
+                .max(1)
         } else {
             a.unwrap().elem_size()
         };
         if stride.is_power_of_two() {
-            self.emit(0x8b000000 | (data << 5) | (stride.trailing_zeros() << 10)); // add x0,x1,x0,lsl #log2(stride)
+            self.emit(0x8b000000 | (data << 5) | (stride.trailing_zeros() << 10));
+        // add x0,x1,x0,lsl #log2(stride)
         } else {
             self.imm(2, stride as u64);
             self.emit(0x9b027c00);
@@ -393,36 +407,42 @@ impl<'a> Code<'a> {
     }
     fn record_value(&mut self, ty: Type, fields: &[(usize, Expr)], storage: usize) {
         self.release_storage(storage, ty);
-                self.local_addr(storage);
-                self.imm(11, self.types.storage_bytes(ty).unwrap() as u64);
-                let zero = self.label();
-                self.mark(zero);
-                self.emit(0x3900013f);
-                self.emit(0x91000529);
-                self.emit(0xf100056b);
-                self.branch(zero, Branch::Cond(1));
-                for (offset, value) in fields {
-                    self.expr(value);
-                    self.retain_string(value.ty);
-                    self.local_addr(storage);
-                    self.imm(11, *offset as u64);
-                    self.emit(0x8b0b0129);
-                    if self.types.storage_bytes(value.ty).is_some() {
-                        self.mov(1, 9);
-                        self.clone_into(value.ty);
-                    } else {
-                        self.typed_store(value.ty, 9);
-                    }
-                }
-                self.local_addr(storage);
-                self.mov(0, 9);
+        self.local_addr(storage);
+        self.imm(11, self.types.storage_bytes(ty).unwrap() as u64);
+        let zero = self.label();
+        self.mark(zero);
+        self.emit(0x3900013f);
+        self.emit(0x91000529);
+        self.emit(0xf100056b);
+        self.branch(zero, Branch::Cond(1));
+        for (offset, value) in fields {
+            self.expr(value);
+            self.retain_string(value.ty);
+            self.local_addr(storage);
+            self.imm(11, *offset as u64);
+            self.emit(0x8b0b0129);
+            if self.types.storage_bytes(value.ty).is_some() {
+                self.mov(1, 9);
+                self.clone_into(value.ty);
+            } else {
+                self.typed_store(value.ty, 9);
+            }
+        }
+        self.local_addr(storage);
+        self.mov(0, 9);
     }
     fn expr(&mut self, e: &Expr) {
         if self.optimized_expr(e) {
             return;
         }
         match &e.kind {
-            ExprKind::ScratchAlloc { area, cursor, limit, count, storage } => {
+            ExprKind::ScratchAlloc {
+                area,
+                cursor,
+                limit,
+                count,
+                storage,
+            } => {
                 let elem = self.types.dynamic_elem(e.ty).unwrap();
                 self.scratch_alloc(*area, *cursor, *limit, count, *storage, elem);
             }
@@ -563,9 +583,18 @@ impl<'a> Code<'a> {
                 self.mov(0, 9);
             }
             ExprKind::Index(base, index) => {
-                self.index_addr(base, index);
-                if self.types.storage_bytes(e.ty).is_none() {
-                    self.typed_load(e.ty);
+                let key = self.locals.read_key(base, index);
+                if key.is_some() && key == self.locals.last_read {
+                    self.mov(0, 16);
+                } else {
+                    self.index_addr(base, index);
+                    if self.types.storage_bytes(e.ty).is_none() {
+                        self.typed_load(e.ty);
+                    }
+                    if key.is_some() {
+                        self.mov(16, 0);
+                        self.locals.last_read = key;
+                    }
                 }
             }
             ExprKind::Number(n) => self.imm(0, *n as u64),
@@ -618,22 +647,22 @@ impl<'a> Code<'a> {
                         self.expr(arg);
                         self.push(0);
                     }
-                self.stack_adjust(outgoing, true);
-                for (arg, location) in locations.into_iter().enumerate() {
-                    self.sp_addr(outgoing + (args.len() - 1 - arg) * 16);
-                    match location {
-                        Argument::General(reg) => self.emit(0xf9400120 | reg),
-                        Argument::Float(reg) => {
-                            self.emit(0xf940012a);
-                            self.bits_to_fp(reg, 10, args[arg].ty);
-                        }
-                        Argument::Stack(offset) => {
-                            self.emit(0xf940012a);
-                            self.sp_addr(offset);
-                            self.typed_store_reg(args[arg].ty, 9, 10);
+                    self.stack_adjust(outgoing, true);
+                    for (arg, location) in locations.into_iter().enumerate() {
+                        self.sp_addr(outgoing + (args.len() - 1 - arg) * 16);
+                        match location {
+                            Argument::General(reg) => self.emit(0xf9400120 | reg),
+                            Argument::Float(reg) => {
+                                self.emit(0xf940012a);
+                                self.bits_to_fp(reg, 10, args[arg].ty);
+                            }
+                            Argument::Stack(offset) => {
+                                self.emit(0xf940012a);
+                                self.sp_addr(offset);
+                                self.typed_store_reg(args[arg].ty, 9, 10);
+                            }
                         }
                     }
-                }
                     outgoing + args.len() * 16
                 };
                 if let Some(storage) = storage {
@@ -834,10 +863,25 @@ impl<'a> Code<'a> {
         }
     }
     fn stmts(&mut self, body: &[Stmt]) {
-        for stmt in body {
+        for (position, stmt) in body.iter().enumerate() {
             match stmt {
                 Stmt::StorePlace(address, value) => {
-                    self.operands(address, value);
+                    if let ExprKind::Index(base, index) = &value.kind {
+                        let key = self.locals.read_key(base, index);
+                        if key.is_some()
+                            && key == self.locals.last_read
+                            && matches!(&address.kind, ExprKind::ElementAddress(base, idx) if self.locals.fixed_array(base) && optimize::Subscript::new(idx).is_some())
+                        {
+                            self.expr(address);
+                            self.mov(1, 0);
+                            self.mov(0, 16);
+                        } else {
+                            self.operands(address, value);
+                        }
+                    } else {
+                        self.operands(address, value);
+                    }
+                    self.locals.last_read = None; // may overwrite a cached element
                     if self.types.storage_bytes(value.ty).is_some() {
                         self.replace_into(value.ty);
                     } else if matches!(value.ty, Type::String | Type::Bytes | Type::Runes) {
@@ -855,6 +899,7 @@ impl<'a> Code<'a> {
                 Stmt::Store(slot, e) => {
                     if let Some(home) = self.locals.register(*slot) {
                         self.expr_into(e, home);
+                        self.locals.write_slot(*slot);
                         continue;
                     }
                     if self.take_string(e, *slot) {
@@ -954,6 +999,23 @@ impl<'a> Code<'a> {
                     self.mark(end);
                 }
                 Stmt::While(c, b) => {
+                    let previous = position.checked_sub(1).map(|n| &body[n]);
+                    if let Some(index) = self.locals.scan_index(previous, c, b) {
+                        let test = self.label();
+                        let work = self.label();
+                        let done = self.label();
+                        self.loops.push((test, done));
+                        self.branch(test, Branch::Jump);
+                        self.mark(work);
+                        self.locals.bounded_index = Some(index);
+                        self.stmts(b);
+                        self.locals.bounded_index = None;
+                        self.mark(test);
+                        self.condition(c, work, true);
+                        self.mark(done);
+                        self.loops.pop();
+                        continue;
+                    }
                     let head = self.label();
                     let end = self.label();
                     self.loops.push((head, end));
@@ -1009,44 +1071,39 @@ impl<'a> Code<'a> {
                     self.cmp(1, 0);
                     self.branch(done, Branch::Cond(10));
                     if matches!(source.ty, Type::Bytes | Type::Runes) {
-                        self.load(*source_slot);
-                        self.emit(0x91002000); // inline bytes after length
-                        self.push(0);
-                        self.load(*cursor);
-                        self.pop(1);
-                        self.emit(0x8b000020); // data + byte cursor
+                        self.load_reg(*source_slot, 2);
+                        self.load_reg(*cursor, 0);
+                        self.add(0, 2, 0);
+                        self.add_imm(0, 0, 8); // byte data follows the length
                         if source.ty == Type::Runes {
-                            self.branch(self.strings.decode, Branch::Call); // rune x0, width x1
+                            self.branch(self.strings.decode, Branch::Call);
                         } else {
-                            self.emit(0x39400000);
+                            self.ldrb(0, 0);
                             self.imm(1, 1);
                         }
-                        // Advance before the body, so continue uses the decoded width.
-                        self.push(0);
-                        self.push(1);
-                        self.load(*cursor);
-                        self.pop(1);
-                        self.emit(0x8b010000);
-                        self.store(*cursor, 0);
-                        self.pop(0);
-                    } else if let Some(a) = self.types.array(source.ty) {
-                        self.load(*source_slot);
-                        self.push(0);
-                        self.load(*cursor);
-                        self.pop(1);
-                        self.imm(2, a.elem_size() as u64);
-                        self.emit(0x9b027c00);
-                        self.emit(0x8b000020);
-                        self.typed_load(a.elem);
-                    } else if let Some(elem) = self.types.dynamic_elem(source.ty) {
-                        self.load(*source_slot);
-                        self.ldr(0, 0);
-                        self.push(0);
-                        self.load(*cursor);
-                        self.pop(1);
-                        self.imm(2, self.types.scalar_size(elem) as u64);
-                        self.emit(0x9b027c00);
-                        self.add(0, 1, 0);
+                        // Advance before the body. x0 retains the decoded scalar.
+                        self.load_reg(*cursor, 2);
+                        self.add(2, 2, 1);
+                        self.store(*cursor, 2);
+                    } else if self.types.array(source.ty).is_some()
+                        || self.types.dynamic_elem(source.ty).is_some()
+                    {
+                        self.load_reg(*source_slot, 1);
+                        self.load_reg(*cursor, 0);
+                        let (elem, stride) = if let Some(a) = self.types.array(source.ty) {
+                            (a.elem, a.elem_size())
+                        } else {
+                            self.ldr(1, 1);
+                            let elem = self.types.dynamic_elem(source.ty).unwrap();
+                            (elem, self.types.scalar_size(elem))
+                        };
+                        if stride.is_power_of_two() {
+                            self.emit(0x8b000020 | stride.trailing_zeros() << 10);
+                        } else {
+                            self.imm(2, stride as u64);
+                            self.emit(0x9b027c00);
+                            self.add(0, 1, 0);
+                        }
                         self.typed_load(elem);
                     } else {
                         self.load(*cursor);
@@ -1242,30 +1299,54 @@ impl<'a> Code<'a> {
 
 // Assign writable image storage before emitting functions so warm cache hits and
 // inlined calls resolve every syntactic allocation to the same address.
-fn plan_static_storage(code: &mut Code<'_>, program: &Program, reachable: &[bool]) -> Result<usize, String> {
+fn plan_static_storage(
+    code: &mut Code<'_>,
+    program: &Program,
+    reachable: &[bool],
+) -> Result<usize, String> {
     let imports = code.import_count;
     // Reserve image cells used by native runtime bookkeeping and callback entry.
-    let mut offset = (imports + if code.has_callbacks { 8 } else { 2 }) * 8;
+    let mut offset = (imports + if code.has_callbacks { 9 } else { 2 }) * 8;
     for (index, function) in program.functions.iter().enumerate() {
-        if !reachable[index] { continue; }
+        if !reachable[index] {
+            continue;
+        }
         let mut mismatch = None;
         reachable::visit_body(&function.body, false, &mut |expr, _| {
-            if matches!(expr.kind, ExprKind::SysCall(..)) { code.sys_types = program.sys_types; }
-            if let ExprKind::StaticBytes { module, site, bytes, platform } = &expr.kind {
+            if matches!(expr.kind, ExprKind::SysCall(..)) {
+                code.sys_types = program.sys_types;
+            }
+            if let ExprKind::StaticBytes {
+                module,
+                site,
+                bytes,
+                platform,
+            } = &expr.kind
+            {
                 if (platform == "macos" && code.target != Target::Arm64Macos)
-                        || (platform == "linux" && code.target == Target::Arm64Macos) {
-                    mismatch = Some(if platform == "linux" { "Linux" } else { "macOS" });
+                    || (platform == "linux" && code.target == Target::Arm64Macos)
+                {
+                    mismatch = Some(if platform == "linux" {
+                        "Linux"
+                    } else {
+                        "macOS"
+                    });
                 }
-                code.static_slots.entry((*module, *site)).or_insert_with(|| {
-                    offset = align(offset, 16);
-                    let slot = offset / 8;
-                    offset += *bytes;
-                    slot
-                });
+                code.static_slots
+                    .entry((*module, *site))
+                    .or_insert_with(|| {
+                        offset = align(offset, 16);
+                        let slot = offset / 8;
+                        offset += *bytes;
+                        slot
+                    });
             }
         });
         if let Some(required) = mismatch {
-            return Err(format!("native module requires {required}; selected target is {}", code.target));
+            return Err(format!(
+                "native module requires {required}; selected target is {}",
+                code.target
+            ));
         }
     }
     Ok(offset - imports * 8)
@@ -1292,7 +1373,12 @@ pub fn compile_entry_for(
     compile_cached(program, entry, target, None)
 }
 
-fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Option<&mut Incremental>) -> Result<Vec<u8>, String> {
+fn compile_cached(
+    program: &Program,
+    entry: usize,
+    target: Target,
+    mut cache: Option<&mut Incremental>,
+) -> Result<Vec<u8>, String> {
     if program
         .functions
         .get(entry)
@@ -1315,7 +1401,8 @@ fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Op
     let imports = ffi::Imports::collect(&mut code, program, &reachable)?;
     code.prepare_callbacks(program, &reachable);
     let global_bytes = plan_static_storage(&mut code, program, &reachable)?;
-    let dynamic = !imports.symbols.is_empty() || code.has_callbacks || !code.static_slots.is_empty();
+    let dynamic =
+        !imports.symbols.is_empty() || code.has_callbacks || !code.static_slots.is_empty();
     code.text_offset = match target {
         Target::Arm64Macos if dynamic => image::text_offset(&imports),
         Target::Arm64Macos => 432,
@@ -1338,7 +1425,14 @@ fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Op
     code.syscall(1);
     code.emit(0xd4200000);
     let global_labels = code.labels.len();
-    let import_key = cache.as_ref().map(|_| fingerprint::digest((&code.foreign_slots, code.import_count, &code.callbacks, &code.static_slots)));
+    let import_key = cache.as_ref().map(|_| {
+        fingerprint::digest((
+            &code.foreign_slots,
+            code.import_count,
+            &code.callbacks,
+            &code.static_slots,
+        ))
+    });
     for (i, f) in program.functions.iter().enumerate() {
         if !reachable[i] || f.external.is_some() {
             continue;
@@ -1354,7 +1448,9 @@ fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Op
             }
             cache.stats.misses += 1;
             Some((path, cache::Mark::new(&mut code)))
-        } else { None };
+        } else {
+            None
+        };
         code.locals = optimize::LocalPlan::new(f, &code.leaves, target, &program.types);
         code.prologue((f.slots + code.locals.inline_slots) * 8);
         for reg in code.locals.registers() {
@@ -1406,7 +1502,10 @@ fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Op
         code.imm(0, 0);
         code.function_epilogue();
         code.locals = optimize::LocalPlan::default();
-        if let Some((path, start)) = recording { cache::save(&mut code, start, &path, global_labels).map_err(|e| format!("saving function cache: {e}"))?; }
+        if let Some((path, start)) = recording {
+            cache::save(&mut code, start, &path, global_labels)
+                .map_err(|e| format!("saving function cache: {e}"))?;
+        }
     }
     code.callback_entries(program);
     code.runtime();
@@ -1415,7 +1514,9 @@ fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Op
     code.string_literals();
     let text = code.finish()?;
     Ok(match target {
-        Target::Arm64Macos if dynamic => image::macho_imports_with_storage(&text, &imports, global_bytes),
+        Target::Arm64Macos if dynamic => {
+            image::macho_imports_with_storage(&text, &imports, global_bytes)
+        }
         Target::Arm64Macos => macho(&text),
         Target::Arm64Linux if dynamic => {
             elf::dynamic_executable(&text, 183, &imports, global_bytes.max(4096))

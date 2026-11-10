@@ -1,4 +1,5 @@
 use dunder::modules::Checked;
+use std::os::unix::process::CommandExt;
 use std::{
     fs,
     io::Read,
@@ -7,6 +8,17 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+fn terminate_group(child: &mut std::process::Child) {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // The child is its own group leader; descendants inherit that group.
+    unsafe {
+        kill(-(child.id() as i32), 9);
+    }
+    let _ = child.kill();
+}
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -44,6 +56,7 @@ fn execute(
     timeout: Duration,
 ) -> Result<(ExitStatus, bool), String> {
     let mut child = Command::new(path)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(fs::File::create(stdout).map_err(|e| e.to_string())?)
         .stderr(fs::File::create(stderr).map_err(|e| e.to_string())?)
@@ -55,13 +68,13 @@ fn execute(
             Ok(Some(status)) => return Ok((status, false)),
             Ok(None) => {}
             Err(e) => {
-                let _ = child.kill();
+                terminate_group(&mut child);
                 let _ = child.wait();
                 return Err(e.to_string());
             }
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_group(&mut child);
             let status = child.wait().map_err(|e| e.to_string())?;
             return Ok((status, true));
         }
@@ -120,7 +133,7 @@ pub fn run(
         } else {
             dunder::native::compile_entry_for(&project.program, test.function, target)?
         };
-        super::publish(&path, &image).map_err(|e| e.to_string())?;
+        super::write_atomic(&path, &image, 0o755, false).map_err(|e| e.to_string())?;
         let executable = fs::canonicalize(&path).map_err(|e| e.to_string())?;
         let stdout = scratch.0.join(format!("stdout-{index}"));
         let stderr = scratch.0.join(format!("stderr-{index}"));
@@ -129,7 +142,7 @@ pub fn run(
         let source = source.strip_prefix(&cwd).unwrap_or(source);
         if status.success() && !timed_out {
             if let Some(key) = key {
-                super::publish_file(&receipt, &key, 0o600).map_err(|e| e.to_string())?;
+                super::write_atomic(&receipt, &key, 0o600, false).map_err(|e| e.to_string())?;
             }
             passed += 1;
             println!("PASS {}::{}", source.display(), test.name);

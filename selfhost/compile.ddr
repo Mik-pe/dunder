@@ -1,6 +1,9 @@
+import borrows
+import fragments
 import lexer
 import arm64 as arm
 import ffi_arm64 as abi
+import imports as native_libs
 import x86
 import std.map as map
 import std.parse as parse
@@ -14,18 +17,22 @@ import wasm_emit as wasm
 
 // Native Dunder compiler. Values use eight-byte cells; aggregates have value semantics.
 // Primitive IDs: ()=0, i32=1, i64=2, bool=3, string=4, rune=5.
-pub struct Imports { libraries: []string, symbols: []string, sites: []i32, slots: []i32 }
-fn imports() -> Imports { Imports { libraries: [], symbols: [], sites: [], slots: [] } }
+pub struct Imports { globals: i32, libraries: []string, symbols: []string, sites: []i32, slots: []i32 }
+fn imports() -> Imports { Imports { globals: 0, libraries: [], symbols: [], sites: [], slots: [] } }
+pub struct Bindings { reused: i32, emitted: i32, offsets: []i32, names: []string, types: []string }
+pub fn bindings() -> Bindings { Bindings { reused: 0, emitted: 0, offsets: [], names: [], types: [] } }
 pub struct Result { ok: bool, error: string, offset: i32, text: []u8, imports: Imports }
 struct Compiler {
     tokens: lexer.Tokens, closes: []i32, block_end: i32, tail: bool, block_depth: i32, cursor: i32, ok: bool, error: string, error_at: i32,
     test_functions: []bool, testing: bool,
+    report: bool, source_end: i32, bindings: Bindings, param_tokens: []i32,
     functions: map.Map, names: []string, starts: []i32, ends: []i32, returns: []i32,
     param_starts: []i32, param_counts: []i32, param_names: []string, param_types: []i32,
     wasm: wasm.Code, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports, libraries: []string, symbols: []string, unsafe_functions: []bool,
+    current_owner: i32, opaque_owner: []i32, function_owners: []i32,
     unsafe_capable: bool, unsafe_scope: bool, inline_place: bool, c_record: []bool, c_sizes: []i32, c_aligns: []i32,
-    ffi_types: []i32, ffi_params: []i32,
+    ffi_types: []i32, ffi_params: []i32, callback_labels: []i32, has_callbacks: bool,
     type_names: []string, type_kinds: []i32, type_bases: []i32, type_starts: []i32, type_counts: []i32, type_clones: []i32, type_drops: []i32,
     field_names: []string, field_types: []i32, field_values: []i64, payload_starts: []i32, payload_counts: []i32, payload_types: []i32, address: i32, writable: bool, scratch_place: i32,
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
@@ -56,7 +63,7 @@ fn identifier(name: string) -> bool {
 }
 fn add_type(c: &mut Compiler, name: string, kind: i32, base: i32) -> i32 {
     id := c.type_names.len
-    c.c_record.push(false); c.c_sizes.push(0); c.c_aligns.push(0)
+    c.opaque_owner.push(-1); c.c_record.push(false); c.c_sizes.push(0); c.c_aligns.push(0)
     c.type_names.push(name); c.type_kinds.push(kind); c.type_bases.push(base)
     c.type_starts.push(0); c.type_counts.push(0); c.type_clones.push(arm.label(&mut c.code)); c.type_drops.push(arm.label(&mut c.code))
     id
@@ -179,7 +186,20 @@ fn valid_foreign_name(value: string) -> bool {
     for i in 0..value.len { if value[i] == 0 { return false } }
     true
 }
-fn headers(c: &mut Compiler) {
+fn source_owner(offset: i32, starts: &[]i32, files: &[]i32) -> i32 {
+    var lo := 0; var hi := starts.len
+    while lo < hi {
+        mid := lo + (hi - lo) / 2
+        if starts[mid] <= offset { lo = mid + 1 } else { hi = mid }
+    }
+    if lo == 0 { return 0 }; files[lo - 1]
+}
+fn opaque_access(c: &mut Compiler, ty: i32) {
+    if c.opaque_owner[ty] >= 0 && c.opaque_owner[ty] != c.current_owner {
+        fail(&mut c, "an opaque struct can only be constructed or opened by its defining module")
+    }
+}
+fn headers(c: &mut Compiler, module_starts: &[]i32, module_files: &[]i32) {
     var stack: []i32 = []
     for i in 0..c.tokens.kinds.len {
         if c.tokens.kinds[i] == .Symbol {
@@ -215,7 +235,10 @@ fn headers(c: &mut Compiler) {
         unchecked := eat(&mut c, "unsafe")
         if unchecked && !c.unsafe_capable { fail(&mut c, "module requires capability unsafe"); break }
         if library != "" && !unchecked { fail(&mut c, "@extern requires unsafe fn"); break }
+        opaque := eat(&mut c, "opaque")
+        owner := source_owner(c.tokens.starts[c.cursor], &module_starts, &module_files)
         what := advance(&mut c)
+        if opaque && what != "struct" { fail(&mut c, "expected opaque struct"); break }
         if what != "fn" && what != "struct" && what != "enum" { fail(&mut c, "expected fn, struct or enum (imports must be loaded first)"); break }
         name := advance(&mut c)
         if (layout && what != "struct") || (unchecked && what != "fn") { fail(&mut c, "invalid declaration attribute"); break }
@@ -224,10 +247,10 @@ fn headers(c: &mut Compiler) {
         if what != "fn" {
             if type_id(&c, name) >= 0 { fail(&mut c, "duplicate type") }
             var kind := 2; if what == "enum" { kind = 3 }
-            ty = add_type(&mut c, name, kind, 0); c.c_record[ty] = layout
+            ty = add_type(&mut c, name, kind, 0); c.c_record[ty] = layout; if opaque { c.opaque_owner[ty] = owner }
         } else {
             if map.contains(&c.functions, name) || reserved(name) { fail(&mut c, "duplicate or reserved function name") }
-            c.test_functions.push(test)
+            c.function_owners.push(owner); c.test_functions.push(test)
             c.libraries.push(library); c.symbols.push(symbol); c.unsafe_functions.push(unchecked)
             map.put(&mut c.functions, name, i64(c.names.len)); c.names.push(name); c.fn_labels.push(arm.label(&mut c.code)); c.needed.push(false)
         }
@@ -280,7 +303,7 @@ fn headers(c: &mut Compiler) {
         } else {
             expect(&mut c, "("); first := c.param_names.len
             while c.ok && !is(&c, ")") {
-                parameter := advance(&mut c); expect(&mut c, ":"); pt := type_name(&mut c)
+                c.param_tokens.push(c.cursor); parameter := advance(&mut c); expect(&mut c, ":"); pt := type_name(&mut c)
                 c.param_names.push(parameter); c.param_types.push(pt)
                 if !eat(&mut c, ",") { break }
             }
@@ -313,7 +336,29 @@ fn local(c: &Compiler, name: string) -> i32 {
     while i >= 0 { if c.local_names[i] == name { return i }; i = i - 1 }
     -1
 }
-fn bind(c: &mut Compiler, name: string, ty: i32, mutable: bool, index: i32) {
+fn type_spelling(c: &Compiler, ty: i32) -> string {
+    kind := c.type_kinds[ty]
+    if c.type_names[ty] != "" { return c.type_names[ty] }
+    if kind == 8 || kind == 9 {
+        var args := ""; for i in 0..c.type_counts[ty] {
+            if i > 0 { args = args + ", " }
+            args = args + type_spelling(&c, c.ffi_params[c.type_starts[ty] + i])
+        }
+        var fn_name := "fn"; if kind == 8 { fn_name = "extern fn" }
+        return fn_name + "(" + args + ") -> " + type_spelling(&c, c.type_bases[ty])
+    }
+    if kind == 20 { return "region" }
+    base := type_spelling(&c, c.type_bases[ty])
+    if kind == 1 || kind == 21 { return "[]" + base }
+    if kind == 6 { return "[" + base + "; " + c.type_counts[ty].str() + "]" }
+    if kind == 4 { return "&" + base }; if kind == 5 { return "&mut " + base }
+    if kind == 10 { return "iter<" + base + ">" }
+    base
+}
+fn bind(c: &mut Compiler, name: string, ty: i32, mutable: bool, index: i32, at: i32) {
+    if c.report && at >= 0 && c.tokens.starts[at] < c.source_end {
+        c.bindings.offsets.push(c.tokens.starts[at]); c.bindings.names.push(name); c.bindings.types.push(type_spelling(&c, ty))
+    }
     if !identifier(name) { fail(&mut c, "this compiler stage supports ASCII identifiers") }
     if reserved(name) { fail(&mut c, "reserved local name") }
     for i in 0..c.local_names.len { if c.local_names[i] == name && c.local_scopes[i] == c.scope { fail(&mut c, "duplicate local name") } }
@@ -401,10 +446,13 @@ fn length_value(c: &mut Compiler, ty: i32) -> i32 {
 }
 // Record only referenced imports and leave one page-relative GOT load for the image writer.
 fn import_address(c: &mut Compiler, f: i32) {
-    library := c.libraries[f]; symbol := c.symbols[f]
+    library := native_libs.library_name(c.libraries[f], c.code.platform == 0); symbol := c.symbols[f]
     var index := 0
     while index < c.imports.symbols.len {
-        if c.imports.symbols[index] == symbol && c.imports.libraries[index] == library { break }
+        if c.imports.symbols[index] == symbol {
+            if c.imports.libraries[index] == library { break }
+            if c.code.platform != 0 { fail(&mut c, "ELF cannot bind one symbol to two libraries; select a handle with std.dl"); return }
+        }
         index = index + 1
     }
     if index == c.imports.symbols.len { c.imports.libraries.push(library); c.imports.symbols.push(symbol) }
@@ -428,6 +476,11 @@ fn hfa(c: &Compiler, ty: i32, depth: i32) -> i32 {
         if shape < -4 || shape > 4 { return 0 }
     }
     shape
+}
+// Negative relocation slots indicate byte offsets in writable process storage.
+fn static_address(c: &mut Compiler, offset: i32) {
+    c.imports.sites.push(c.code.words.len * 4); c.imports.slots.push(-1 - offset)
+    arm.emit(&mut c.code, 0); arm.emit(&mut c.code, 0)
 }
 fn foreign_width(ty: i32) -> i32 { abi.width(ty) }
 fn transfer_c(c: &mut Compiler, ty: i32, reg: i32, base: i32, load: bool) {
@@ -515,8 +568,26 @@ fn foreign_call(c: &mut Compiler, sig: i32, direct: i32) -> i32 {
         i = i - 1
     }
     if indirect_result { arm.load(&mut c.code, result_slot) }
+    if c.has_callbacks {
+        if c.imports.globals < 64 { c.imports.globals = 64 }
+        static_address(&mut c, 0)
+        abi.load(&mut c.code, 10, 16, 48, 8); arm.store(&mut c.code, callee, 10)
+        abi.thread_token(&mut c.code); abi.store(&mut c.code, 10, 16, 48, 8)
+        if c.code.platform == 2 { arm.emit(&mut c.code, 4194304000) } // store suspended x86 register bank
+        else { for reg in 19..25 { abi.store(&mut c.code, reg, 16, (reg - 19) * 8, 8) } }
+    }
     if c.code.platform == 2 { arm.emit(&mut c.code, 4261412864 + i64(gp) * 65536 + i64(fp) * 256 + i64(outgoing / 16)) }
-    else { arm.emit(&mut c.code, 3594453536) } // blr x17
+    else {
+        arm.emit(&mut c.code, 3594453536) // blr x17
+        if c.has_callbacks {
+            static_address(&mut c, 0)
+            for reg in 19..25 { abi.load(&mut c.code, reg, 16, (reg - 19) * 8, 8) }
+        }
+    }
+    if c.has_callbacks {
+        arm.mov(&mut c.code, 13, 0); arm.load(&mut c.code, callee); static_address(&mut c, 0)
+        abi.store(&mut c.code, 0, 16, 48, 8); arm.mov(&mut c.code, 0, 13)
+    }
     if outgoing > 0 { arm.emit(&mut c.code, 2432697343 + i64(outgoing) * 1024) }
     if c.c_record[ret] {
         arm.load(&mut c.code, result_slot)
@@ -540,6 +611,7 @@ fn c_layout(c: &mut Compiler, ty: i32) {
             ft := c.field_types[field_index]; c_layout(&mut c, ft)
             if !c.ok { return }
             child := c.c_aligns[ft]
+            if size > 2147483647 - child || c.c_sizes[ft] > 2147483647 - child - size { fail(&mut c,"C record layout exceeds supported size"); return }
             size = (size + child - 1) / child * child
             c.field_values[field_index] = i64(size)
             if child > alignment { alignment = child }
@@ -550,6 +622,7 @@ fn c_layout(c: &mut Compiler, ty: i32) {
     } else if c.type_kinds[ty] == 6 {
         child := c.type_bases[ty]; c_layout(&mut c, child)
         if !c.ok { return }
+        if c.c_sizes[child] > 0 && c.type_counts[ty] > 2147483647 / c.c_sizes[child] { fail(&mut c,"C array layout exceeds supported size"); return }
         alignment = c.c_aligns[child]; size = c.type_counts[ty] * c.c_sizes[child]
     } else if foreign_scalar(&c, ty) || ty == 3 {
         alignment = foreign_width(ty); size = alignment
@@ -580,6 +653,9 @@ fn c_offset(c: &mut Compiler, offset: i64) {
 }
 // An inline array gets a stack descriptor for indexing, length and borrows.
 // The surrounding record owns the byte range.
+fn fixed_pod(c: &Compiler, ty: i32) -> bool {
+    c.type_kinds[ty] == 6 && (foreign_scalar(&c, c.type_bases[ty]) || c.type_bases[ty] == 3)
+}
 fn inline_value(c: &mut Compiler, ty: i32) {
     if c.c_record[ty] { return }
     if c.type_kinds[ty] != 6 { transfer_c(&mut c, ty, 0, 0, true); return }
@@ -606,6 +682,62 @@ fn store_inline(c: &mut Compiler, ty: i32) {
     }
     transfer_c(&mut c, ty, 0, 1, false)
 }
+// Bridge a synchronous C entry onto the suspended Dunder runtime on this thread.
+fn callback_entry(c: &mut Compiler, id: i32) {
+    if c.imports.globals < 64 { c.imports.globals = 64 }
+    arm.mark(&mut c.code, c.callback_labels[id])
+    if c.code.platform == 2 {
+        static_address(&mut c, 0)
+        // Lower this relocation directly into host rax before reacquiring r15.
+        c.code.words[c.code.words.len - 2] = 4244635648
+        arm.emit(&mut c.code, 4227858432)
+    } else { arm.emit(&mut c.code, 2432697326) } // x14 = incoming C SP
+    count := c.param_counts[id]; first := c.param_starts[id]
+    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, count)
+    if c.code.platform != 2 {
+        static_address(&mut c, 0)
+        abi.thread_token(&mut c.code)
+        abi.load(&mut c.code, 11, 16, 48, 8); arm.emit(&mut c.code, 3943367007)
+        active := arm.label(&mut c.code); arm.branch(&mut c.code, active, 2)
+        arm.exit(&mut c.code, 111); arm.mark(&mut c.code, active)
+        for reg in 19..25 { arm.push(&mut c.code, reg); abi.load(&mut c.code, reg, 16, (reg - 19) * 8, 8) }
+    }
+    var gp := 0; var fp := 0; var stack := 0; var limit := 8
+    if c.code.platform == 2 { limit = 6 }
+    for p in 0..count {
+        ty := c.param_types[first + p]
+        if floats.has(ty) && fp < 8 { abi.fp(&mut c.code, fp, 10, foreign_width(ty), false); fp = fp + 1 }
+        else if !floats.has(ty) && gp < limit { arm.mov(&mut c.code, 10, gp); gp = gp + 1 }
+        else {
+            var size := 8; if c.code.platform == 0 { size = foreign_width(ty) }
+            stack = (stack + size - 1) / size * size
+            arm.imm(&mut c.code, 10, i64(stack)); arm.emit(&mut c.code, 2332688845) // add x13,x14,x10
+            abi.load(&mut c.code, 10, 13, 0, foreign_width(ty)); stack = stack + size
+        }
+        if !floats.has(ty) && foreign_width(ty) < 8 {
+            var op: i64 = 3544186880; if ty == 1 { op = 2470445056 }
+            arm.emit(&mut c.code, op + i64(foreign_width(ty) * 8 - 1) * 1024 + 330)
+        }
+        arm.store(&mut c.code, p, 10)
+    }
+    var p := count - 1
+    while p >= 8 { arm.load(&mut c.code, p); arm.push(&mut c.code, 0); p = p - 1 }
+    while p >= 0 { arm.load(&mut c.code, p); arm.mov(&mut c.code, p, 0); p = p - 1 }
+    arm.branch(&mut c.code, c.fn_labels[id], 1)
+    for extra in 8..count { arm.pop(&mut c.code, 9) }
+    if floats.has(c.returns[id]) { abi.fp(&mut c.code, 0, 0, foreign_width(c.returns[id]), true) }
+    if c.code.platform == 2 {
+        arm.emit(&mut c.code, 2432697279); arm.emit(&mut c.code, 2831252477); arm.emit(&mut c.code, 4211081216)
+    } else {
+        static_address(&mut c, 0)
+        var reg := 24
+        while reg >= 19 {
+            abi.store(&mut c.code, reg, 16, (reg - 19) * 8, 8); arm.pop(&mut c.code, reg); reg = reg - 1
+        }
+        arm.ret(&mut c.code)
+    }
+}
+
 fn require_unsafe(c: &mut Compiler) {
     if !c.unsafe_scope { fail(&mut c, "operation requires unsafe function or block") }
 }
@@ -626,6 +758,39 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         require_unsafe(&mut c); expect(&mut c, ")")
         if !c.c_record[expected] { fail(&mut c, "zeroed requires a C record"); return 0 }
         zero_record(&mut c, expected); return expected
+    }
+    if name == "callback" {
+        require_unsafe(&mut c)
+        if c.code.platform == 3 { fail(&mut c, "native callback requires a native target"); return 0 }
+        symbol := advance(&mut c); expect(&mut c, ")")
+        id := i32(map.get_or(&c.functions, symbol, -1))
+        if id < 0 || c.libraries[id] != "" { fail(&mut c, "callback requires a named Dunder function"); return 0 }
+        var params: []i32 = []
+        for i in c.param_starts[id]..c.param_starts[id] + c.param_counts[id] {
+            ty := c.param_types[i]
+            if !foreign_scalar(&c, ty) { fail(&mut c, "callbacks require C scalar parameters"); return 0 }
+            params.push(ty)
+        }
+        if c.returns[id] != 0 && !foreign_scalar(&c, c.returns[id]) { fail(&mut c, "callbacks require a C scalar return"); return 0 }
+        if c.callback_labels[id] < 0 { label := arm.label(&mut c.code); c.callback_labels[id] = label }
+        c.needed[id] = true
+        arm.branch(&mut c.code, c.callback_labels[id], 20)
+        return foreign_type(&mut c, &params, c.returns[id])
+    }
+    if name == "static_bytes" {
+        require_unsafe(&mut c)
+        if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "static storage requires a platform literal"); return 0 }
+        platform := advance(&mut c); expect(&mut c, ",")
+        if c.tokens.kinds[c.cursor] != .Integer { fail(&mut c, "static storage requires a positive constant size"); return 0 }
+        length := parse.integer(advance(&mut c)); expect(&mut c, ")")
+        if !length.ok || length.value < 1 || length.value > 16777216 { fail(&mut c, "static byte count must be 1..16777216"); return 0 }
+        if c.code.platform == 3 || (platform != "native" && !(platform == "macos" && c.code.platform == 0) && !(platform == "linux" && c.code.platform != 0)) {
+            fail(&mut c, "static storage requires the selected native platform"); return 0
+        }
+        var offset := (c.imports.globals + 15) / 16 * 16
+        if offset < 64 { offset = 64 }
+        c.imports.globals = offset + i32(length.value)
+        static_address(&mut c, offset); arm.mov(&mut c.code, 0, 16); return 13
     }
     if name == "cstr" {
         require_unsafe(&mut c)
@@ -652,7 +817,6 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         if name == "ptr" { return 13 }
         if name == "ffi_fn" { if c.type_kinds[expected] != 8 { fail(&mut c,"ffi_fn needs an extern fn type") }; return expected }
         if c.type_kinds[expected] != 4 && c.type_kinds[expected] != 5 { fail(&mut c,"ref_at needs a reference parameter type"); return 0 }
-        if c.c_record[c.type_bases[expected]] { index := slot(&mut c); arm.store(&mut c.code, index, 0); address_slot(&mut c, index) }
         return expected
     }
     if name.len > 5 && name[0..5] == "load_" && raw_memory_type(&c, name, 5) >= 0 {
@@ -711,21 +875,26 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         if c.code.platform == 3 { fail(&mut c, "indirect calls need a native target"); return 0 }
         address = slot(&mut c); arm.load(&mut c.code, c.local_slots[callee]); arm.store(&mut c.code, address, 0)
     } else {
-        if f < 0 { fail(&mut c, "unknown function '" + name + "'"); return 0 }
+        if f < 0 { fail(&mut c, "unknown function '" + name + "'"); c.error_at = c.tokens.starts[c.cursor - 2]; return 0 }
         if c.unsafe_functions[f] && !c.unsafe_scope { fail(&mut c, "call requires unsafe"); return 0 }
         if c.libraries[f] != "" { if c.code.platform != 3 { import_address(&mut c, f) }; return foreign_call(&mut c, c.ffi_types[f], f) }
         c.needed[f] = true; signature = c.ffi_types[f]
     }
+    invoke(&mut c, signature, address, f)
+}
+fn invoke(c: &mut Compiler, signature: i32, address: i32, f: i32) -> i32 {
     first := c.type_starts[signature]; count := c.type_counts[signature]
-    var provided := 0; var args: []i32 = []
+    var provided := 0; var args: []i32 = []; var arg_starts: []i32 = []; var arg_ends: []i32 = []
     while c.ok && !is(&c, ")") {
         if provided >= count { fail(&mut c, "too many arguments"); break }
+        arg_starts.push(c.cursor)
         want := c.ffi_params[first + provided]
         ty := expression(&mut c, 0, want); same(&mut c, want, ty); copy_value(&mut c, ty)
-        index := slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index); provided = provided + 1
+        index := slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index); arg_ends.push(c.cursor); provided = provided + 1
         if !eat(&mut c, ",") { break }
     }
     expect(&mut c, ")"); if provided != count { fail(&mut c, "wrong argument count") }
+    if !borrows.compatible(&c.tokens, &arg_starts, &arg_ends) { fail(&mut c, "conflicting borrows or mutation of a projected argument"); return 0 }
     var i := provided - 1
     while i >= 8 { arm.load(&mut c.code, args[i]); arm.push(&mut c.code, 0); i = i - 1 }
     // Load x0 last: the slot helper uses x0/x9 only.
@@ -736,19 +905,49 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     for unused in 8..provided { arm.pop(&mut c.code, 9) }
     c.type_bases[signature]
 }
+// An index made only of scalar loads and arithmetic cannot invalidate the
+// receiver. Calls (including callbacks and methods) take the retained path.
+fn read_only_index(tokens: &lexer.Tokens, first: i32) -> bool {
+    var depth := 0; var pos := first
+    while pos < tokens.kinds.len && pos - first < 24 {
+        kind := tokens.kinds[pos]
+        if kind != .Integer && kind != .Name {
+            if kind != .Symbol { return false }
+            op := tokens.texts[pos]
+            if op == "]" {
+                if depth == 0 { return true }; depth = depth - 1
+            } else if op == "[" { depth = depth + 1 }
+            else if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" && op != "." && op != ".." { return false }
+        }
+        pos = pos + 1
+    }
+    false
+}
 fn primary(c: &mut Compiler, expected: i32) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
     c.address = -1; c.writable = false; c.scratch_place = 0
+    first_token := c.cursor
     var ty := primary_inner(&mut c, expected)
     if c.code.platform == 3 && c.ok && ((!wasm.scalar(ty) && c.type_kinds[ty] != 8) || is(&c, "[")) { fail(&mut c, "selfhost wasm32 supports scalar integer, pointer and bool expressions") }
-    while c.ok && (is(&c, ".") || is(&c, "[")) {
-        if eat(&mut c, "[") {
+    while c.ok && (is(&c, ".") || is(&c, "[") || is(&c, "(")) {
+        if eat(&mut c, "(") {
+            if c.type_kinds[ty] == 8 { ty = foreign_call(&mut c, ty, -1) }
+            else if c.type_kinds[ty] == 9 && c.code.platform != 3 {
+                callee := slot(&mut c); arm.store(&mut c.code, callee, 0); ty = invoke(&mut c, ty, callee, -1)
+            } else { fail(&mut c, "this value is not callable for the selected target"); return 0 }
+            ty = temporary(&mut c, ty); c.address = -1; c.writable = false
+        } else if eat(&mut c, "[") {
             packed := c.inline_place && c.type_kinds[ty] == 6
             writable := c.writable
-            if ty == 4 { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
+            if ty == 4 && !read_only_index(&c.tokens, c.cursor) { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
             arm.push(&mut c.code, 0)
+            index_start := c.cursor
             index_type := expression(&mut c, 1, 1); same(&mut c, 1, index_type)
+            if collection(&c, ty) {
+                base := borrows.root(&c.tokens, first_token, index_start)
+                if base >= 0 && borrows.changes(&c.tokens, base, index_start, index_start, c.cursor) { fail(&mut c, "compute array mutations before indexing"); return 0 }
+            }
             if eat(&mut c, "..") {
                 if ty != 4 { fail(&mut c, "slice requires a string") }
                 arm.push(&mut c.code, 0); last := expression(&mut c, 0, 1); same(&mut c, 1, last); expect(&mut c, "]")
@@ -772,11 +971,17 @@ fn primary(c: &mut Compiler, expected: i32) -> i32 {
             } else { fail(&mut c, "index requires an array or string") }
         } else {
             expect(&mut c, "."); name := advance(&mut c)
-            if is(&c, "(") { result := method(&mut c, ty, name); ty = temporary(&mut c, result); c.address = -1; c.writable = false }
+            if is(&c, "(") && c.type_kinds[ty] == 2 && field(&c,ty,name) >= 0 {
+                member := field(&c,ty,name); sig := c.field_types[member]
+                if c.type_kinds[sig] != 8 { fail(&mut c,"field is not a C function"); return 0 }
+                if c.c_record[ty] { c_offset(&mut c,c.field_values[member]) } else { c_offset(&mut c,i64(member - c.type_starts[ty]) * 8) }
+                load_mem(&mut c,0,0,0); expect(&mut c,"("); ty = foreign_call(&mut c,sig,-1); c.address = -1; c.writable = false
+            } else if is(&c, "(") { result := method(&mut c, ty, name, first_token, c.cursor - 2); ty = temporary(&mut c, result); c.address = -1; c.writable = false }
             else if name == "len" && (ty == 4 || collection(&c, ty) || c.type_kinds[ty]==21) {
                 ty = length_value(&mut c, ty); c.address = -1; c.writable = false
             } else if c.type_kinds[ty] == 2 {
                 if c.scratch_place!=0 {c.scratch_place=2}
+                opaque_access(&mut c, ty)
                 found := field(&c, ty, name)
                 if found < 0 { fail(&mut c, "unknown field '" + name + "'") }
                 else if c.c_record[ty] {
@@ -824,7 +1029,13 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         }
         if c.address < 0 { fail(&mut c, "borrow requires a stored value"); return 0 }
         if mutable && !c.writable { fail(&mut c, "mutable borrow requires var or &mut") }
-        arm.load(&mut c.code, c.address); c.address = -1; c.writable = false
+        if c.c_record[ty] {
+            // x0 already addresses the POD payload. Borrowed storage cannot be replaced or freed.
+        } else if fixed_pod(&c, ty) {
+            load_mem(&mut c, 0, 0, 0)
+        } else if c.inline_place && c.type_kinds[ty] == 6 {
+            backing := slot(&mut c); arm.store(&mut c.code,backing,0); address_slot(&mut c,backing)
+        } else { arm.load(&mut c.code, c.address) }; c.address = -1; c.writable = false
         var kind := 4; if mutable { kind = 5 }; return compound(&mut c, kind, ty)
     }
     if eat(&mut c, "-") {
@@ -872,7 +1083,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
     if kind == .String || kind == .Rune {
         text := advance(&mut c); target := arm.label(&mut c.code)
         c.strings.push(text); c.string_labels.push(target); arm.branch(&mut c.code, target, 20)
-        if kind == .Rune { arm.branch(&mut c.code, c.runtime.string_runes, 1); runes_ty := compound(&mut c, 1, 5); saved_runes := temporary(&mut c, runes_ty); load_mem(&mut c, 0, 0, 0); load_mem(&mut c, 0, 0, 0); return 5 }; return 4
+        if kind == .Rune { arm.branch(&mut c.code, c.runtime.string_runes, 1); runes_ty := compound(&mut c, 1, 5); saved_runes := temporary(&mut c, runes_ty); load_mem(&mut c, 0, 0, 0); unsigned.transfer(&mut c.code, 5, 0, 0, true); return 5 }; return 4
     }
     if kind == .Name {
         name := advance(&mut c); nominal := type_id(&c, name)
@@ -885,6 +1096,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         }
         if enum_type(&c, nominal) && eat(&mut c, ".") { return enumeration(&mut c, nominal) }
         if nominal >= 0 && c.type_kinds[nominal] == 2 && eat(&mut c, "{") {
+            opaque_access(&mut c, nominal)
             if c.c_record[nominal] { zero_record(&mut c, nominal) } else { arm.imm(&mut c.code, 0, i64(c.type_counts[nominal]) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1) }
             saved := slot(&mut c); arm.store(&mut c.code, saved, 0); var provided: []bool = []
             for i in 0..c.type_counts[nominal] { provided.push(false) }; separators(&mut c)
@@ -918,7 +1130,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         }
         if found < 0 {
             f := i32(map.get_or(&c.functions, name, -1))
-            if f < 0 { fail(&mut c, "unknown local '" + name + "'"); return 0 }
+            if f < 0 { fail(&mut c, "unknown local '" + name + "'"); c.error_at = c.tokens.starts[c.cursor - 1]; return 0 }
             if c.unsafe_functions[f] { fail(&mut c, "unsafe function requires a foreign function pointer"); return 0 }
             c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.ffi_types[f]
         }
@@ -926,13 +1138,36 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         var ty := c.local_types[found]; c.writable = c.local_mutable[found]
         if c.type_kinds[ty]==20 {fail(&mut c,"region is only valid in an allocation");return 0}
         if c.type_kinds[ty]==21 {c.scratch_place=3}
-        if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { arm.load(&mut c.code, c.local_slots[found]); c.writable = c.type_kinds[ty] == 5; ty = c.type_bases[ty] }
+        if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { arm.load(&mut c.code, c.local_slots[found]); c.writable = c.type_kinds[ty] == 5; ty = c.type_bases[ty]
+            if c.c_record[ty] || fixed_pod(&c, ty) {
+                c_layout(&mut c, ty)
+                save_address(&mut c); c.inline_place = true; inline_value(&mut c, ty); return ty
+            }
+        }
         else { address_slot(&mut c, c.local_slots[found]) }
         save_address(&mut c); unsigned.transfer(&mut c.code, ty, 0, 0, true); return ty
     }
     fail(&mut c, "expected expression"); 0
 }
-fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
+// Re-read a named dynamic-array descriptor after evaluating a method argument
+// that can reassign its receiver. Dotted paths contain only ordinary records.
+fn reload_receiver(c: &mut Compiler, first: i32, last: i32) {
+    root := borrows.root(&c.tokens, first, last); binding := local(&c, c.tokens.texts[root])
+    if binding < 0 { fail(&mut c, "array mutation needs a stored receiver"); return }
+    var ty := c.local_types[binding]; arm.load(&mut c.code, c.local_slots[binding])
+    if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { load_mem(&mut c, 0, 0, 0); ty = c.type_bases[ty] }
+    var i := root + 1
+    while i < last {
+        if c.tokens.texts[i] == "." {
+            found := field(&c, ty, c.tokens.texts[i + 1])
+            if found < 0 { fail(&mut c, "invalid receiver field"); return }
+            load_mem(&mut c, 0, 0, (found - c.type_starts[ty]) * 8); ty = c.field_types[found]; i = i + 1
+        }
+        i = i + 1
+    }
+}
+fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_end: i32) -> i32 {
+    args_at := c.cursor
     if c.code.platform == 3 && !floats.has(ty) && !(name == "bit_not" || name == "bit_and" || name == "bit_or" || name == "bit_xor" || name == "shl" || name == "shr" || name == "wrapping_add" || name == "wrapping_sub" || name == "wrapping_mul") { fail(&mut c, "unsupported selfhost wasm32 method"); return 0 }
     writable := c.writable; expect(&mut c, "(")
     if floats.has(ty) {
@@ -999,7 +1234,15 @@ fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
     }
     if target < 0 { fail(&mut c, "unknown method '" + name + "'"); return 0 }
     expect(&mut c, ")")
-    if count == 1 { arm.mov(&mut c.code, 1, 0) }; arm.pop(&mut c.code, 0); arm.branch(&mut c.code, target, 1); ret
+    if count == 1 { arm.mov(&mut c.code, 1, 0) }; arm.pop(&mut c.code, 0)
+    if c.type_kinds[ty] == 1 && count == 1 {
+        root := borrows.root(&c.tokens, first_token, receiver_end)
+        if root >= 0 && borrows.changes(&c.tokens, root, receiver_end, args_at, c.cursor) {
+            if receiver_end != root + 1 && !borrows.fields_only(&c.tokens, first_token, receiver_end) { fail(&mut c, "compute mutations before using a projected array receiver"); return ret }
+            arm.push(&mut c.code, 1); reload_receiver(&mut c, first_token, receiver_end); arm.pop(&mut c.code, 1)
+        }
+    }
+    arm.branch(&mut c.code, target, 1); if name == "pop" && ret == 1 { arm.emit(&mut c.code,2470476800) }; ret
 }
 fn precedence(operator: string) -> i32 {
     if operator == "||" { return 1 }
@@ -1101,7 +1344,7 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
     while c.ok {
         operator := peek(&c); priority := precedence(operator)
         if priority == 0 || priority < minimum { break }
-        consumed := advance(&mut c)
+        consumed := advance(&mut c); newlines(&mut c)
         if operator == "&&" || operator == "||" {
             same(&mut c, 3, ty)
             done := arm.label(&mut c.code)
@@ -1220,7 +1463,7 @@ fn match_statement(c: &mut Compiler) -> bool {
                     binding := advance(&mut c)
                     if binding != "_" {
                         pt := c.payload_types[c.payload_starts[found] + i]; index := slot(&mut c)
-                        bind(&mut c, binding, pt, false, index); arm.load(&mut c.code, saved); load_mem(&mut c, 0, 0, (i + 1) * 8); copy_value(&mut c, pt)
+                        bind(&mut c, binding, pt, false, index, c.cursor - 1); arm.load(&mut c.code, saved); load_mem(&mut c, 0, 0, (i + 1) * 8); copy_value(&mut c, pt)
                         if owned(&c, pt) { save_owner(&mut c, index, pt, false) } else { arm.store(&mut c.code, index, 0) }
                     }
                 }
@@ -1258,7 +1501,7 @@ fn scratch_width(c:&Compiler, ty:i32)->i32 {
     foreign_width(ty)
 }
 fn scratch_block(c:&mut Compiler)->bool {
-    name:=advance(&mut c)
+    name_at := c.cursor; name:=advance(&mut c)
     if c.code.platform==3 {fail(&mut c,"selfhost scratch regions require a native target");return false}
     if eat(&mut c,"(") { ty:=expression(&mut c,0,1);same(&mut c,1,ty);expect(&mut c,")") }
     else {arm.imm(&mut c.code,0,65536)}
@@ -1269,7 +1512,7 @@ fn scratch_block(c:&mut Compiler)->bool {
     arm.branch(&mut c.code,c.runtime.alloc,1)
     // Raw allocator blocks and strings share the runtime's retain/release header.
     save_owner(&mut c,area,4,false)
-    enter(&mut c);token:=compound(&mut c,20,0);bind(&mut c,name,token,false,area)
+    enter(&mut c);token:=compound(&mut c,20,0);bind(&mut c,name,token,false,area, name_at)
     if !is(&c,"{"){fail(&mut c,"expected region body");return false}
     after:=c.closes[c.cursor]+1;allowed:=c.tail && terminal(&c,after,true)
     ends:=block(&mut c,allowed)
@@ -1293,7 +1536,7 @@ fn scratch_declaration(c:&mut Compiler, name:string, mutable:bool)->bool {
     for unused in 0..3 { slot_for_descriptor:=slot(&mut c) }
     descriptor:=slot(&mut c)
     scratch.allocate(&mut c.code,area,descriptor,width,align,c.bounds,unsigned.shift(elem))
-    arm.store(&mut c.code,binding,0);bind(&mut c,name,view,mutable,binding);end_statement(&mut c)
+    arm.store(&mut c.code,binding,0);bind(&mut c,name,view,mutable,binding,start - 1);end_statement(&mut c)
     true
 }
 
@@ -1328,7 +1571,7 @@ fn statement(c: &mut Compiler) -> bool {
         return false
     }
     if eat(&mut c, "for") {
-        name := advance(&mut c); expect(&mut c, "in")
+        name_at := c.cursor; name := advance(&mut c); expect(&mut c, "in")
         low := expression(&mut c, 1, 1); cursor := slot(&mut c); limit := slot(&mut c); values := slot(&mut c); binding := slot(&mut c)
         var base := 1; var array := false
         if eat(&mut c, "..") {
@@ -1350,7 +1593,7 @@ fn statement(c: &mut Compiler) -> bool {
         }
         head := arm.label(&mut c.code); next := arm.label(&mut c.code); done := arm.label(&mut c.code)
         enter(&mut c)
-        if array { bind(&mut c, name, base, false, binding) } else { bind(&mut c, name, 1, false, cursor) }
+        if array { bind(&mut c, name, base, false, binding, name_at) } else { bind(&mut c, name, 1, false, cursor, name_at) }
         arm.mark(&mut c.code, head); arm.load(&mut c.code, cursor); arm.push(&mut c.code, 0); arm.load(&mut c.code, limit); arm.pop(&mut c.code, 1)
         arm.emit(&mut c.code, 3942645823); arm.branch(&mut c.code, done, 12)
         if array {
@@ -1380,14 +1623,14 @@ fn statement(c: &mut Compiler) -> bool {
     var mutable := false
     if eat(&mut c, "var") { mutable = true }
     if c.tokens.kinds[c.cursor] == .Name && (c.tokens.texts[c.cursor + 1] == ":=" || c.tokens.texts[c.cursor + 1] == ":") {
-        name := advance(&mut c); var expected := 0
+        name_at := c.cursor; name := advance(&mut c); var expected := 0
         if scratch_declaration(&mut c,name,mutable) {return false}
         if eat(&mut c, ":") { expected = type_name(&mut c); expect(&mut c, "=") } else { expect(&mut c, ":=") }
         ty := expression(&mut c, 0, expected)
         if expected != 0 { same(&mut c, expected, ty) }
         if ty == 0 { fail(&mut c, "local requires a value") }
         if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { fail(&mut c, "borrows are limited to function parameters") }
-        copy_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index)
+        copy_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index, name_at)
         if c.code.platform == 3 { wasm.indexed(&mut c.wasm, 33, index) }
         if owned(&c, ty) { save_owner(&mut c, index, ty, false) } else { arm.store(&mut c.code, index, 0) }
         end_statement(&mut c)
@@ -1396,11 +1639,29 @@ fn statement(c: &mut Compiler) -> bool {
     if mutable { fail(&mut c, "expected declaration after var"); return false }
     first_token := c.cursor
     ty := expression(&mut c, 0, c.ret_type)
+    assignment := c.cursor
     if eat(&mut c, "=") {
-        destination := c.address; writable := c.writable; packed := c.inline_place
+        var destination := c.address; writable := c.writable; packed := c.inline_place; scratch_target:=c.scratch_place
+        if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch bindings cannot be reassigned");return false}
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
         if c.code.platform == 3 { wasm.op(&mut c.wasm, 26) }
-        value := expression(&mut c, 0, ty); same(&mut c, ty, value)
+        rhs := c.cursor; value := expression(&mut c, 0, ty); same(&mut c, ty, value)
+        base := borrows.root(&c.tokens, first_token, assignment)
+        if borrows.projected(&c.tokens, base, assignment) && borrows.changes(&c.tokens, base, assignment, rhs, c.cursor) {
+            if !borrows.fields_only(&c.tokens, first_token, assignment) { fail(&mut c, "compute mutations before assigning an array element"); return false }
+            // A call on the right can replace a heap-backed record. Resolve the
+            // pure field chain again so the write lands in its current storage.
+            end := c.cursor; arm.push(&mut c.code, 0); c.cursor = first_token
+            checked := expression(&mut c, 0, ty); destination = c.address
+            c.cursor = end; arm.pop(&mut c.code, 0)
+        }
+        if scratch_target==1 {
+            arm.mov(&mut c.code,1,0);arm.load(&mut c.code,destination)
+            if c.type_kinds[ty]==2 {
+                for i in 0..c.type_counts[ty] {load_mem(&mut c,2,1,i*8);store_mem(&mut c,2,0,i*8)}
+            }else{transfer_c(&mut c,ty,1,0,false)}
+            end_statement(&mut c);return false
+        }
         if packed {
             arm.push(&mut c.code,0); arm.load(&mut c.code,destination); arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0)
             store_inline(&mut c,ty); end_statement(&mut c); return false
@@ -1493,19 +1754,38 @@ fn clones(c: &mut Compiler) {
 }
 pub fn compile(source: string) -> Result { compile_for(source, 0) }
 pub fn compile_for(source: string, platform: i32) -> Result {
-    var tokens := lexer.lex(source)
+    none: []i32 = []
+    compile_modules(source, platform, &none, &none)
+}
+pub fn compile_modules(source: string, platform: i32, module_starts: &[]i32, module_files: &[]i32) -> Result {
+    var ignored := bindings()
+    compile_mode(source, platform, &module_starts, &module_files, false, false, &mut ignored)
+}
+pub fn compile_mode(source: string, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings) -> Result {
+    var tokens := lexer.scan(source, false)
+    compile_tokens(&mut tokens, platform, &module_starts, &module_files, check_all, report, &mut records)
+}
+pub fn compile_tokens(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings) -> Result {
+    compile_cached(&mut tokens,platform,&module_starts,&module_files,check_all,report,&mut records,"","")
+}
+pub fn compile_cached(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string) -> Result {
+    source_end := tokens.starts[tokens.starts.len - 1]
     // Tokenize the formatter only for programs that mention floating values.
     var uses_float := false
     for i in 0..tokens.kinds.len {
         if tokens.kinds[i] == .Float || (tokens.kinds[i] == .Name && (tokens.texts[i] == "f32" || tokens.texts[i] == "f64")) { uses_float = true; break }
     }
     if uses_float && tokens.ok && platform != 3 {
-        start := tokens.kinds.len - 1
-        tokens = lexer.lex(source + "\n" + bundled.float_formatter())
-        // The module loader reserves this prefix in user inputs. Keep the
-        // formatter private even when another module defines format_float_bits.
-        for i in start..tokens.kinds.len {
-            if tokens.texts[i] == "format_float_bits" { tokens.texts[i] = "__dunder_module_format_float_bits"; break }
+        fragment := lexer.scan("\n" + bundled.float_formatter(), false)
+        // Replace EOF with a separator and append tokens without lexing the
+        // user's original modules again. The loader reserves the runtime name.
+        last := tokens.kinds.len - 1
+        tokens.kinds[last] = .Newline; tokens.texts[last] = "\n"
+        for i in 0..fragment.kinds.len {
+            var value := fragment.texts[i]
+            if value == "format_float_bits" { value = "__dunder_module_format_float_bits" }
+            tokens.kinds.push(fragment.kinds[i]); tokens.texts.push(value)
+            tokens.starts.push(source_end + 1 + fragment.starts[i])
         }
     }
     if !tokens.ok { return Result { ok: false, error: tokens.error, offset: tokens.error_at, text: [], imports: imports() } }
@@ -1513,16 +1793,32 @@ pub fn compile_for(source: string, platform: i32) -> Result {
     var c := Compiler {
         tokens: tokens, closes: [], block_end: 0, tail: false, block_depth: 0, cursor: 0, ok: true, error: "", error_at: 0,
         test_functions: [], testing: false,
+        report: report, source_end: source_end, bindings: bindings(), param_tokens: [],
         functions: map.new(), names: [], starts: [], ends: [], returns: [], param_starts: [], param_counts: [], param_names: [], param_types: [],
-        wasm: wasm.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [],
+        wasm: wasm.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, opaque_owner: [], function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [], callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], type_drops: [], field_names: [], field_types: [], field_values: [], payload_starts: [], payload_counts: [], payload_types: [], address: -1, writable: false, scratch_place: 0,
         fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
         loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
     for name in ["()", "i32", "i64", "bool", "string", "rune", "f32", "f64", "u8", "u16", "u32", "u64", "usize", "ptr", "range"] { added := add_type(&mut c, name, 0, 0) }
-    for i in 0..c.tokens.kinds.len { c.closes.push(-1) }
-    headers(&mut c)
+    for i in 0..c.tokens.kinds.len {
+        c.closes.push(-1)
+        if c.tokens.kinds[i] == .Name && c.tokens.texts[i] == "callback" { c.has_callbacks = true }
+    }
+    headers(&mut c, &module_starts, &module_files)
     for t in 0..c.type_names.len { if c.c_record[t] { c_layout(&mut c, t) } }
+    // Forward record declarations acquire their field types during headers().
+    // Check all foreign signatures once the layout of every record is known.
+    for sig in 0..c.type_kinds.len {
+        if c.type_kinds[sig] == 8 {
+            ret := c.type_bases[sig]
+            if c.c_record[ret] && hfa(&c, ret, 0) == 0 { fail(&mut c, "pass non-homogeneous C records by pointer") }
+            for i in c.type_starts[sig]..c.type_starts[sig] + c.type_counts[sig] {
+                ty := c.ffi_params[i]
+                if c.c_record[ty] && hfa(&c, ty, 0) == 0 { fail(&mut c, "pass non-homogeneous C records by pointer") }
+            }
+        }
+    }
     entry := map.get_or(&c.functions, "main", -1)
     if entry < 0 { fail(&mut c, "program needs main") }
     if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
@@ -1538,15 +1834,38 @@ pub fn compile_for(source: string, platform: i32) -> Result {
     arm.branch(&mut c.code, c.fn_labels[main_id], 1)
     arm.syscall(&mut c.code, 33554433, 94); arm.emit(&mut c.code, 3558866944)
     c.needed[main_id] = true; var compiled: []bool = []
-    for f in 0..c.names.len { compiled.push(false) }
+    for f in 0..c.names.len { compiled.push(false); c.callback_labels.push(-1) }
+    globals := c.code.labels.len
+    var cache := ""
+    if !check_all && platform != 3 && directory != "" {
+        cache = fragments.context(&c.tokens,&c.starts,&c.ends,&c.function_owners,&c.opaque_owner,platform,globals,c.has_callbacks,identity)
+    }
     var more := true
     while c.ok && more {
         more = false
         for f in 0..c.names.len {
-            if !c.ok { break }; if !c.needed[f] || compiled[f] { continue }
+            if !c.ok { break }; if (!check_all && !c.needed[f]) || compiled[f] || c.libraries[f] != "" { continue }
             compiled[f] = true; more = true
+            begin := fragments.start(&c.code); types_before := c.type_names.len
+            strings_before := c.strings.len; sites_before := c.imports.sites.len
+            globals_before := c.imports.globals
+            var fingerprint := ""; var path := ""
+            if cache != "" {
+                fingerprint = fragments.key(cache,f,&c.tokens,c.starts[f],c.ends[f])
+                path = directory + "/" + f.str() + ".fn"
+                if fragments.restore(&mut c.code,globals,c.fn_labels[f],path,fingerprint) {
+                    c.bindings.reused = c.bindings.reused + 1
+                    for r in begin.relocations..c.code.target.len {
+                        label := c.code.target[r]
+                        if label < globals { for id in 0..c.fn_labels.len { if c.fn_labels[id] == label { c.needed[id] = true; break } } }
+                    }
+                    continue
+                }
+            }
+            c.bindings.emitted = c.bindings.emitted + 1
             c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
             c.owned_slots.clear(); c.owned_types.clear(); c.owner_temps.clear()
+            c.current_owner = c.function_owners[f]
             c.testing = c.test_functions[f]
             c.unsafe_scope = c.unsafe_functions[f]
             c.cleanup = arm.label(&mut c.code)
@@ -1554,7 +1873,7 @@ pub fn compile_for(source: string, platform: i32) -> Result {
             arm.mark(&mut c.code, c.fn_labels[f]); frame := arm.prologue(&mut c.code)
             first := c.param_starts[f]
             for p in 0..c.param_counts[f] {
-                index := slot(&mut c); bind(&mut c, c.param_names[first + p], c.param_types[first + p], false, index)
+                index := slot(&mut c); bind(&mut c, c.param_names[first + p], c.param_types[first + p], false, index, c.param_tokens[first + p])
                 if owned(&c, c.param_types[first + p]) { remember_owner(&mut c, index, c.param_types[first + p], false) }
                 if p < 8 { arm.store(&mut c.code, index, p) }
                 else { load_mem(&mut c, 0, 29, 16 + (p - 8) * 16); arm.store(&mut c.code, index, 0) }
@@ -1575,11 +1894,22 @@ pub fn compile_for(source: string, platform: i32) -> Result {
             for o in param_owners..c.owned_slots.len { arm.store(&mut c.code, c.owned_slots[o], 31) }
             arm.branch(&mut c.code, body, 0)
             if platform == 3 { wasm.finish_fn(&mut c.wasm, c.slots, c.ret_type) }
-            if c.ok { arm.frame(&mut c.code, frame, c.slots) }
+            if c.ok {
+                arm.frame(&mut c.code, frame, c.slots)
+                if fingerprint != "" && !c.has_callbacks && c.type_names.len == types_before && c.strings.len == strings_before && c.imports.sites.len == sites_before && c.imports.globals == globals_before {
+                    fragments.save(&c.code,begin,globals,path,fingerprint)
+                }
+            }
         }
     }
     if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
+    records.reused = c.bindings.reused; records.emitted = c.bindings.emitted
+    if check_all {
+        if report { records = c.bindings }
+        return Result { ok: true, error: "", offset: 0, text: [], imports: imports() }
+    }
     if platform == 3 { return Result { ok: true, error: "", offset: 0, text: wasm.image(&c.wasm, main_id, &c.libraries, &c.symbols, &c.param_starts, &c.param_counts, &c.param_types, &c.returns), imports: imports() } }
+    for id in 0..c.callback_labels.len { if c.callback_labels[id] >= 0 { callback_entry(&mut c, id) } }
     arm.mark(&mut c.code, c.float_trap); arm.exit(&mut c.code, 107)
     arm.mark(&mut c.code, c.bounds); arm.exit(&mut c.code, 103)
     clones(&mut c)
@@ -1588,11 +1918,11 @@ pub fn compile_for(source: string, platform: i32) -> Result {
     data_start := c.code.words.len
     literals(&mut c)
     if platform == 2 {
-        native := x86.finish(&c.code, data_start, &c.imports.sites)
+        native := x86.finish(&c.code, data_start, &c.imports.sites, &c.imports.slots)
         c.imports.sites = native.imports
         return Result { ok: native.ok, error: native.error, offset: 0, text: native.text, imports: c.imports }
     }
-    text := arm.finish_for(&mut c.code, c.imports.symbols.len > 0)
+    text := arm.finish_for(&mut c.code, c.imports.symbols.len > 0 || c.imports.globals > 0)
     Result { ok: true, error: "", offset: 0, text: text, imports: c.imports }
 }
 @test fn compiler_checks_types_before_emitting_an_image() {

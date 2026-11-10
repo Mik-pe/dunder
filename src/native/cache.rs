@@ -220,7 +220,10 @@ pub(super) fn restore(c: &mut Code, path: &Path, globals: usize) -> Option<()> {
     let first = c.words.len();
     c.words.extend(
         words
-            .as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)),
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w)),
     );
     let literals = strings
         .iter()

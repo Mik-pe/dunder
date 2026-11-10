@@ -1,7 +1,13 @@
+import lexer
+import cache_io
 // Shared module loading, target selection, diagnostics and atomic publication.
+import bundle
+import agent
 import cli
 import compile as compiler
 import modules
+import process
+import receipts
 import elf
 import macho
 import sys
@@ -25,7 +31,7 @@ fn failure(message: string) -> i32 {
 
 pub fn build(default_target: i32) -> i32 {
     if sys.arg_count() == 1 || sys.arg(1) == "--help" || sys.arg(1) == "-h" {
-        print("dunder-ddr build|build-tests [input.ddr] [-o output] [--target target]")
+        print("dunder-ddr build|run|test|build-tests|check [input.ddr] [-o output] [--target target]\ndunder-ddr check [input.ddr] [--agent] [--target target] [--app]")
         print("dunder-ddr --list-targets")
         return 0
     }
@@ -35,34 +41,76 @@ pub fn build(default_target: i32) -> i32 {
     }
     options := cli.options(default_target)
     if options.error != "" {
-        diagnostic := sys.eprint(options.error + "\ndunder-ddr build|build-tests [input.ddr] [-o output] [--target target]")
+        diagnostic := sys.eprint(options.error + "\ndunder-ddr build|run|test|build-tests|check [input.ddr] [-o output] [--target target]\ndunder-ddr check [input.ddr] [--agent] [--target target] [--app]")
         return 2
     }
     platform := options.platform
-    output := options.output
-    loaded := modules.load_mode(options.input, options.tests)
-    if !loaded.ok { report(loaded.path, loaded.source, loaded.offset, loaded.error); return 1 }
+    if (options.run || options.run_tests) && (platform != default_target || platform == 3) {
+        return failure("selected target cannot run on this host")
+    }
+    var output := options.output
+    if options.run_tests { output = output + "/suite-" + sys.pid().str() }
+    var tokens := lexer.empty(false)
+    loaded := modules.load_for(options.input, options.tests, !options.tests, &mut tokens)
+    if !loaded.ok {
+        if options.agent { agent.error(loaded.path, loaded.source, loaded.offset, loaded.error) }
+        else { report(loaded.path, loaded.source, loaded.offset, loaded.error) }
+        return 1
+    }
+    if options.tests { tokens = lexer.scan(loaded.source, false) }
+    if options.checking {
+        var records := compiler.bindings()
+        checked := compiler.compile_tokens(&mut tokens, platform, &loaded.map_starts, &loaded.map_files, true, options.agent, &mut records)
+        if !checked.ok {
+            location := modules.location(&loaded, checked.offset)
+            if options.agent { agent.error(location.path, location.source, location.offset, checked.error) }
+            else { report(location.path, location.source, location.offset, checked.error) }
+            return 1
+        }
+        if options.agent { agent.success(&loaded, &records) }
+        else { print("checked " + options.input + " (" + loaded.paths.len.str() + " modules)") }
+        return 0
+    }
     for path in loaded.paths {
         if path.len > 0 && path[0] != 60 {
             if path == output || sys.same_file(path, output) { return failure("output must not overwrite source") }
         }
     }
-    result := compiler.compile_for(loaded.source, platform)
+    var ignored := compiler.bindings()
+    var cache := ""; var identity := ""
+    if options.incremental && platform != 3 {
+        root := cache_io.root(options.input)
+        if root != "" {
+            cache = "build/.dunder-cache/selfhost/" + cache_io.digest(root + ":" + platform.str())
+            identity = cache_io.compiler(default_target)
+        }
+    }
+    result := compiler.compile_cached(&mut tokens, platform, &loaded.map_starts, &loaded.map_files, false, false, &mut ignored, cache, identity)
     if !result.ok {
         location := modules.location(&loaded, result.offset)
         report(location.path, location.source, location.offset, result.error)
         return 1
     }
+    if options.timings {
+        emitted := sys.eprint("functions " + ignored.reused.str() + " reused, " + ignored.emitted.str() + " emitted")
+    }
     var image: []u8 = []
     if platform == 3 { image = result.text }
-    else if result.imports.symbols.len > 0 {
-        if platform == 0 { image = macho.dynamic_image(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots) }
-        else if platform == 2 { image = elf.dynamic_image_for(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 62) }
-        else { image = elf.dynamic_image(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots) }
+    else if result.imports.symbols.len > 0 || result.imports.globals > 0 {
+        if platform == 0 { image = macho.dynamic_storage(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, result.imports.globals) }
+        else if platform == 2 { image = elf.dynamic_storage(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 62, result.imports.globals) }
+        else { image = elf.dynamic_storage(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 183, result.imports.globals) }
     }
     else if platform == 2 { image = elf.image_for(&result.text, 62) }
     else if platform == 1 { image = elf.image(&result.text) }
     else { image = macho.image(&result.text) }
+    if options.app {
+        error := bundle.publish(output, &mut image, &loaded.paths)
+        if error != "" { return failure(error) }
+        if options.run { return process.run(output + "/Contents/MacOS/" + bundle.name(output), &options.args, 0, default_target) }
+        print("built " + output)
+        return 0
+    }
     if !cli.prepare_parent(output) { return failure("cannot create output directory") }
     temporary := output + ".dunder-" + sys.pid().str() + ".tmp"
     if sys.metadata(temporary).ok { return failure("temporary output already exists") }
@@ -74,6 +122,16 @@ pub fn build(default_target: i32) -> i32 {
     }
     published := sys.rename(temporary, output)
     if !published.ok { removed := sys.remove_file(temporary); return failure(sys.error_message(published.error)) }
+    if options.run { return process.run(output, &options.args, 0, default_target) }
+    if options.run_tests {
+        var keys: []string = []
+        if options.affected || sys.metadata(options.output + "/.affected").is_dir {
+            keys = receipts.keys(&loaded, options.output, platform, options.timeout_ms)
+        }
+        result_code := process.tests(output, &loaded.groups, &keys, options.affected, options.timeout_ms, default_target)
+        removed := sys.remove_file(output)
+        return result_code
+    }
     print("built " + output)
     0
 }

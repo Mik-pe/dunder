@@ -106,7 +106,7 @@ fn assert_target_image(image: &[u8], target: Target) {
 fn every_target_builds_reproducibly_without_host_toolchains() {
     let work = Workspace::new();
     let source = fs::read_to_string(work.0.join("main.ddr")).unwrap();
-    for target in [Target::Arm64Macos, Target::Arm64Linux, Target::X86_64Linux] {
+    for target in Target::ALL {
         let direct = dunder::compile_for(&source, target).unwrap();
         assert_target_image(&direct, target);
         assert_eq!(direct, dunder::compile_for(&source, target).unwrap());
@@ -116,7 +116,15 @@ fn every_target_builds_reproducibly_without_host_toolchains() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        let artifact = work.0.join("build").join(target.name()).join("demo");
+        let artifact = work
+            .0
+            .join("build")
+            .join(target.name())
+            .join(if target == Target::Wasm32 {
+                "demo.wasm"
+            } else {
+                "demo"
+            });
         assert_eq!(fs::read(artifact).unwrap(), direct);
     }
 }
@@ -147,7 +155,7 @@ fn foreign_run_and_test_fail_before_publishing_or_executing() {
         "@test fn probe(){assert(true)} fn main(){print(42)}",
     )
     .unwrap();
-    for target in [Target::Arm64Macos, Target::Arm64Linux, Target::X86_64Linux] {
+    for target in Target::ALL {
         if target.can_run_on_host() {
             continue;
         }

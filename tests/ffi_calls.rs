@@ -16,6 +16,10 @@ fn c_abi_roundtrips_scalars_float_aggregates_and_nested_callbacks() {
         &c,
         r#"
 #include <stdint.h>
+#include <pthread.h>
+typedef void (*NoArgs)(void);
+static void *from_worker(void *arg) { (*(NoArgs *)arg)(); return 0; }
+void on_worker(NoArgs f) { pthread_t t; if (!pthread_create(&t, 0, from_worker, &f)) pthread_join(t, 0); }
 typedef struct { float a, b, c; } Triple;
 typedef struct { double a, b; } Pair;
 typedef struct { Pair origin, size; } Rect;
@@ -45,7 +49,7 @@ double mixed(int64_t a, double f, int32_t b, float g, uint8_t c, int64_t d,
         } else {
             "-shared"
         })
-        .args(["-fPIC", "-o"])
+        .args(["-pthread", "-fPIC", "-o"])
         .arg(&library)
         .arg(&c)
         .output()
@@ -100,6 +104,20 @@ fn main() {{
     fs::write(&binary, image).unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     let output = Command::new(binary).env_clear().output().unwrap();
-    let _ = fs::remove_dir_all(work);
     assert!(output.status.success(), "{output:?}");
+    let invalid = format!(
+        r#"
+capability unsafe
+@extern("{}", "on_worker") unsafe fn on_worker(f: extern fn())
+fn noop() {{}}
+fn main() {{ unsafe {{ on_worker(callback(noop)) }} }}
+"#,
+        library.display()
+    );
+    let invalid_binary = work.join("worker");
+    fs::write(&invalid_binary, dunder::compile(&invalid).unwrap()).unwrap();
+    fs::set_permissions(&invalid_binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new(invalid_binary).status().unwrap();
+    let _ = fs::remove_dir_all(work);
+    assert_eq!(status.code(), Some(111));
 }

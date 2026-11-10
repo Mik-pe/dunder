@@ -5,6 +5,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 
 
 def main():
@@ -22,22 +23,25 @@ def main():
         group, separator, name = line.partition(" ")
         if group != str(index) or not separator or not name:
             raise ValueError(f"invalid group listing: {line!r}")
-        try:
-            result = subprocess.run([suite, group], capture_output=True,
-                                    stdin=subprocess.DEVNULL, timeout=args.timeout)
-        except subprocess.TimeoutExpired:
-            print(f"FAIL {name} (timeout)")
-            failed += 1
-            continue
-        if result.returncode == 0:
-            print(f"PASS {name}")
-            passed += 1
-        else:
-            print(f"FAIL {name} (exit {result.returncode})")
-            for output in (result.stdout, result.stderr):
-                if output:
-                    print(output[:4096].decode(errors="replace").rstrip())
-            failed += 1
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            try:
+                result = subprocess.run([suite, group], stdout=stdout, stderr=stderr,
+                                        stdin=subprocess.DEVNULL, timeout=args.timeout)
+            except subprocess.TimeoutExpired:
+                print(f"FAIL {name} (timeout)")
+                failed += 1
+                continue
+            if result.returncode == 0:
+                print(f"PASS {name}")
+                passed += 1
+            else:
+                print(f"FAIL {name} (exit {result.returncode})")
+                for stream in (stdout, stderr):
+                    stream.seek(0)
+                    output = stream.read(4096)
+                    if output:
+                        print(output.decode(errors="replace").rstrip())
+                failed += 1
     print(f"{passed} passed, {failed} failed")
     return int(failed > 0)
 

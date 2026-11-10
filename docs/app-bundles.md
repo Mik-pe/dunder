@@ -72,3 +72,9 @@ non-UTF-8 or control-character resource filenames, unknown files in
 `_CodeSignature`, and entries outside the bundle's `Contents` directory. It also
 requires real directories in the bundle rather than directory symlinks. These
 checks finish before publication and preserve unsupported files in place.
+
+The self-hosted compiler accepts the same build form, including cross-builds
+from Linux. For example, `dunder-ddr build dogfood/metal/triangle.ddr --app
+--target arm64-macos -o build/Triangle.app` writes and signs the bundle in
+Dunder. Existing resource files are hashed as binary data. The packager uses
+POSIX directory and file operations on the build host.

@@ -127,6 +127,186 @@ mod macos {
         );
     }
     #[test]
+    fn selfhost_function_cache_relocates_and_invalidates_individual_fragments() {
+        let work = Work::new();
+        let compiler = work.bootstrap();
+        let build = |source: &str| {
+            fs::write(work.0.join("input.ddr"), source).unwrap();
+            Command::new(&compiler)
+                .args([
+                    "build",
+                    "input.ddr",
+                    "--incremental",
+                    "--timings",
+                    "-o",
+                    "program",
+                ])
+                .current_dir(&work.0)
+                .output()
+                .unwrap()
+        };
+        let original = "fn main()->i32{alpha(20)+beta(0)} fn alpha(x:i32)->i32{helper(x)*2} fn beta(x:i32)->i32{if x>0{return 9};0} fn helper(x:i32)->i32{if x>0{return x+1};0}";
+        success(&build(original));
+        assert_eq!(work.run().status.code(), Some(42));
+        let cache = work.0.join("build/.dunder-cache/selfhost");
+        let directory = fs::read_dir(cache).unwrap().next().unwrap().unwrap().path();
+        let snapshot = || -> Vec<(Vec<u8>, std::time::SystemTime)> {
+            (0..4)
+                .map(|id| {
+                    let path = directory.join(format!("{id}.fn"));
+                    (
+                        fs::read(&path).unwrap(),
+                        fs::metadata(path).unwrap().modified().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let cold = fs::read(work.0.join("program")).unwrap();
+        let first = snapshot();
+        let warm = build(original);
+        success(&warm);
+        assert!(String::from_utf8_lossy(&warm.stderr).contains("functions 4 reused, 0 emitted"));
+        assert_eq!(fs::read(work.0.join("program")).unwrap(), cold);
+        assert_eq!(
+            snapshot(),
+            first,
+            "warm builds must restore checked fragments"
+        );
+
+        let edited = original.replace("return x+1", "return x+2");
+        success(&build(&edited));
+        assert_eq!(work.run().status.code(), Some(44));
+        let second = snapshot();
+        assert_eq!(
+            &second[..3],
+            &first[..3],
+            "callee body edits keep callers relocatable"
+        );
+        assert_ne!(second[3].0, first[3].0);
+
+        let reordered = format!("fn inserted()->i32{{3}} {edited}");
+        success(&build(&reordered));
+        assert_eq!(
+            work.run().status.code(),
+            Some(44),
+            "changed declaration slots must invalidate cached references"
+        );
+
+        fs::write(directory.join("1.fn"), "corrupt").unwrap();
+        success(&build(&reordered));
+        assert_eq!(work.run().status.code(), Some(44));
+        assert!(fs::read(directory.join("1.fn")).unwrap().len() > 7);
+        let ill_typed = reordered.replace("helper(x)*2", "helper(true)*2");
+        assert!(!build(&ill_typed).status.success());
+    }
+
+    #[test]
+    fn selfhost_c_layout_preserves_nested_records_arrays_and_foreign_pointers() {
+        let work = Work::new();
+        let compiler = work.bootstrap();
+        success(&work.build(&compiler, include_str!("fixtures/c_layout.ddr")));
+        let output = work.run();
+        success(&output);
+        assert_eq!(output.stdout, b"555\n2\n");
+    }
+    #[test]
+    fn selfhost_test_image_lists_imported_groups_and_runs_failures_in_isolation() {
+        let work = Work::new();
+        let compiler = work.bootstrap();
+        fs::write(
+            work.0.join("library.ddr"),
+            r#"
+@test { for i in 0..3 { (i) -> true && false } }
+pub fn negative(i: i32) -> bool { i < 0 }
+@test fn failing_assertion() { false }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            work.0.join("suite.ddr"),
+            r#"
+import library
+import library as second
+fn main() { assert(false) }
+@test fn valid() { !library.negative(42) }
+"#,
+        )
+        .unwrap();
+        let result = Command::new(compiler)
+            .current_dir(&work.0)
+            .args(["build-tests", "suite.ddr", "-o", "suite"])
+            .output()
+            .unwrap();
+        success(&result);
+        let run = |arg| {
+            Command::new(work.0.join("suite"))
+                .arg(arg)
+                .output()
+                .unwrap()
+        };
+        let groups = run("--list");
+        success(&groups);
+        assert_eq!(
+            groups.stdout,
+            b"0 suite.ddr::valid\n1 library.ddr::negative\n2 library.ddr::failing_assertion\n"
+        );
+        success(&run("0"));
+        assert_eq!(run("2").status.code(), Some(104));
+        success(&run("1"));
+        assert_eq!(run("3").status.code(), Some(2));
+    }
+
+    #[test]
+    fn selfhost_bundle_seals_binary_resources_and_protects_sources() {
+        let work = Work::new();
+        let compiler = work.bootstrap();
+        let app = work.0.join("A & Dunder.app");
+        let resource = app.join("Contents/Resources/binary.dat");
+        let executable = app.join("Contents/MacOS/A & Dunder");
+        fs::write(work.0.join("input.ddr"), "fn main(){print(42)}").unwrap();
+        let build = || {
+            Command::new(&compiler)
+                .current_dir(&work.0)
+                .args(["build", "input.ddr", "--app", "-o"])
+                .arg(&app)
+                .env("PATH", "/no-external-tools")
+                .output()
+                .unwrap()
+        };
+        let verify = || {
+            Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&app)
+                .output()
+                .unwrap()
+        };
+        success(&build());
+        fs::create_dir_all(resource.parent().unwrap()).unwrap();
+        fs::write(&resource, [0, 31, 128, 255]).unwrap();
+        success(&build());
+        success(&verify());
+        assert_eq!(Command::new(&executable).output().unwrap().stdout, b"42\n");
+        fs::write(&resource, [1, 31, 128, 255]).unwrap();
+        assert!(!verify().status.success());
+        success(&build());
+        success(&verify());
+        let original = fs::read(&executable).unwrap();
+        std::os::unix::fs::symlink(work.0.join("input.ddr"), resource.with_extension("link"))
+            .unwrap();
+        assert!(!build().status.success());
+        assert_eq!(fs::read(&executable).unwrap(), original);
+        fs::remove_file(resource.with_extension("link")).unwrap();
+        let info = app.join("Contents/Info.plist");
+        fs::remove_file(&info).unwrap();
+        fs::hard_link(work.0.join("input.ddr"), info).unwrap();
+        assert!(!build().status.success());
+        assert_eq!(
+            fs::read_to_string(work.0.join("input.ddr")).unwrap(),
+            "fn main(){print(42)}"
+        );
+    }
+
+    #[test]
     fn dunder_written_pipeline_matches_bootstrap_for_checked_scalar_programs() {
         let w = Work::new();
         let compiler = w.bootstrap();
@@ -212,6 +392,9 @@ fn main(){
             "fn main()->i64{0}",
             "fn main(){var a:[i32;3]=[1,2]}",
             "fn main(){var a:[i32;3]=[1;3];a.push(4)}",
+            "fn f(x:&mut i32,y:&i32){} fn main(){var x:=1;f(&mut x,&x)}",
+            "fn reset(x:&mut []i32)->i32{x.clear();1} fn main(){var a:[]i32=[1];a[0]=reset(&mut a)}",
+            "fn put(x:&mut i32,y:i32){} fn reset(a:&mut []i32)->i32{a.clear();1} fn main(){var a:[]i32=[1];put(&mut a[0],reset(&mut a))}",
             "enum V{A,B(i32)} fn main(){v:V=.A;match v{.A=>{}}}",
             "enum V{A,B(i32)} fn main(){v:V=.A;match v{.B=>{},_=>{}}}",
             "enum V{A,B(i32)} fn main(){v:V=.A;match v{_=>{},.A=>{}}}",
@@ -339,7 +522,7 @@ mod native {
             if cfg!(target_os = "macos") {
                 assert_eq!(image.get(..4), Some(&[0xcf, 0xfa, 0xed, 0xfe][..]));
             } else {
-                assert_arm64_elf(&image);
+                assert_arm64_elf(&image, source == compiler_source());
             }
         }
     }
@@ -409,6 +592,17 @@ mod native {
                 Self::Native => Command::new(image),
                 Self::Qemu(qemu) => {
                     let mut command = Command::new(qemu);
+                    let prefix = std::env::var_os("DUNDER_QEMU_LD_PREFIX")
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            let path = PathBuf::from("/usr/aarch64-linux-gnu");
+                            path.join("lib/ld-linux-aarch64.so.1")
+                                .is_file()
+                                .then_some(path)
+                        });
+                    if let Some(prefix) = prefix {
+                        command.arg("-L").arg(prefix);
+                    }
                     command.arg(image);
                     command
                 }
@@ -425,7 +619,7 @@ mod native {
         }
     }
 
-    fn assert_arm64_elf(image: &[u8]) {
+    fn assert_arm64_elf(image: &[u8], compiler: bool) {
         assert!(image.len() >= 64, "truncated ELF header");
         assert_eq!(&image[..7], b"\x7fELF\x02\x01\x01");
         let u16_at = |offset| u16::from_le_bytes(image[offset..offset + 2].try_into().unwrap());
@@ -445,8 +639,18 @@ mod native {
         for i in 0..count {
             let offset = table + i * stride;
             let kind = u32_at(offset);
-            assert_ne!(kind, 2, "selfhost output must not require dynamic linking");
-            assert_ne!(kind, 3, "selfhost output must not require an interpreter");
+            if !compiler {
+                assert_ne!(
+                    kind, 2,
+                    "ordinary standalone programs need no dynamic libraries"
+                );
+                assert_ne!(kind, 3, "ordinary standalone programs need no interpreter");
+            } else if kind == 3 {
+                // The compiler's process driver imports libc to run programs.
+                let at = u64_at(offset + 8) as usize;
+                let size = u64_at(offset + 32) as usize;
+                assert_eq!(&image[at..at + size], b"/lib/ld-linux-aarch64.so.1\0");
+            }
             if kind == 1 {
                 let flags = u32_at(offset + 4);
                 let file_offset = u64_at(offset + 8);
@@ -499,6 +703,13 @@ fn main(){
  assert(saved=="prefix17");print("ok")
 }"#,
             "ok\n",
+        ),
+        (
+            "field_reassignment",
+            r#"struct Box{items:[]i32,n:i32}
+fn replace(box:&mut Box)->i32{box=Box{items:[2,3],n:0};4}
+fn main(){var box:=Box{items:[1],n:0};box.items.push(replace(&mut box));print(box.items[2]);box.n=replace(&mut box);print(box.n)}"#,
+            "4\n4\n",
         ),
         (
             "owned_enum_payloads",
@@ -758,6 +969,49 @@ fn main(){var a:=Values{items:[]};a.items.reserve(8);append(&mut a,3);append(&mu
             assert_eq!(actual.stdout, expected.stdout, "{entry}");
             assert_eq!(actual.stderr, expected.stderr, "{entry}");
         }
+        let higher_order = work.0.join("chained-functions");
+        work.build(
+            runner.command(&stage3),
+            &root.join("examples/functions.ddr"),
+            &higher_order,
+        );
+        let actual = runner.run(&higher_order, &work.0);
+        success("stage3 chained function values", &actual);
+        assert_eq!(actual.stdout, b"42\n42\n-42\n");
+
+        let app = work.0.join("check.ddr");
+        let module = work.0.join("unused.ddr");
+        fs::write(&app, "import unused\nfn main(){counter:=42;print(counter)}").unwrap();
+        fs::write(&module, "pub fn dead(){value:=missing()}").unwrap();
+        let check = || {
+            runner
+                .command(&stage3)
+                .args(["check", "--agent"])
+                .arg(&app)
+                .current_dir(&work.0)
+                .env_clear()
+                .env("PATH", "/no-external-tools")
+                .output()
+                .unwrap()
+        };
+        let invalid = check();
+        assert_eq!(invalid.status.code(), Some(1));
+        let diagnostic = String::from_utf8(invalid.stdout).unwrap();
+        assert!(
+            diagnostic.contains("\"kind\":\"error\"")
+                && diagnostic.contains("unused.ddr\",\"start\":21,\"end\":28"),
+            "{diagnostic}"
+        );
+        fs::write(&module, "pub fn dead(){value:=2}").unwrap();
+        let valid = check();
+        success("selfhost check --agent", &valid);
+        let records = String::from_utf8(valid.stdout).unwrap();
+        assert!(
+            records.contains("\"name\":\"value\",\"type\":\"i32\"")
+                && records.contains("\"name\":\"counter\",\"type\":\"i32\"")
+                && records.contains("\"kind\":\"ok\",\"modules\":2"),
+            "{records}"
+        );
         let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/tabell");
         let tabell = work.0.join("tabell");
         work.build(runner.command(&stage3), &project.join("main.ddr"), &tabell);

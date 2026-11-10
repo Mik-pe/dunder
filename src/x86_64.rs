@@ -316,12 +316,24 @@ impl Lower {
         let rn = (w >> 5) & 31;
         let rm = (w >> 16) & 31;
         let wide = w >> 31 != 0;
+        if w == 0xd53bd04a {
+            self.emit(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]); // mov rax,fs:[0]
+            self.store(10, 0);
+            return Ok(());
+        }
         if w >> 24 == 0xfd {
             self.emit(&[0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);
             self.emit(&[0x48, 0x8d, 0x05]); // lea rax,[rip+callback context]
             self.globals
                 .push((self.code.len(), (w & 0xffffff) as usize));
             self.disp32(0);
+            self.emit(&[0x64, 0x4c, 0x8b, 0x1c, 0x25, 0, 0, 0, 0]); // mov r11,fs:[0]
+            self.emit(&[0x4c, 0x3b, 0x58, 48]); // cmp r11,[rax+active pthread]
+            let active = self.local_jump(Some(4));
+            self.imm64(7, 111);
+            self.imm64(0, 231);
+            self.emit(&[0x0f, 0x05, 0x0f, 0x0b]);
+            self.patch_here(active);
             self.emit(&[0x4c, 0x8b, 0x38, 0x48, 0x8b, 0x68, 8]); // r15,rbp = suspended Dunder state
             for (arg, reg) in [7, 6, 2, 1, 8, 9].into_iter().enumerate() {
                 self.store(arg as u32, reg);

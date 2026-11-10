@@ -19,6 +19,7 @@ pub(super) struct Runtime {
     path: Label,
     utf8: Label,
     pack: Label,
+    write_packed: Label,
 }
 impl Runtime {
     pub fn new(code: &mut Code<'_>) -> Self {
@@ -27,6 +28,7 @@ impl Runtime {
             path: code.label(),
             utf8: code.label(),
             pack: code.label(),
+            write_packed: code.label(),
         }
     }
 }
@@ -255,11 +257,16 @@ impl Code<'_> {
             self.local_addr(storage);
             self.mov(8, 9);
         }
+        let mut target = self.sys.calls[index(op)];
         if matches!(op, SysOp::DecodeUtf8 | SysOp::WriteBytes) {
             let array = self.types.value_type(args.last().unwrap().ty);
-            self.imm(2, u64::from(self.types.dynamic_elem(array) == Some(Type::U8)));
+            let packed = self.types.dynamic_elem(array) == Some(Type::U8);
+            self.imm(2, u64::from(packed));
+            if packed && op == SysOp::WriteBytes {
+                target = self.sys.write_packed;
+            }
         }
-        self.branch(self.sys.calls[index(op)], Branch::Call);
+        self.branch(target, Branch::Call);
         if let Some(storage) = storage {
             self.local_addr(storage);
             self.mov(0, 9);
@@ -385,8 +392,8 @@ impl Code<'_> {
     fn stat_mode(&mut self) {
         self.local_addr(STAT);
         self.emit(match self.target {
-            Target::Arm64Macos => 0x79400920,  // ldrh w0,[x9,#4]
-            Target::Arm64Linux => 0xb9401120,  // ldr w0,[x9,#16]
+            Target::Arm64Macos => 0x79400920, // ldrh w0,[x9,#4]
+            Target::Arm64Linux => 0xb9401120, // ldr w0,[x9,#16]
             Target::Wasm32 => unreachable!("native syscall lowering"),
             Target::X86_64Linux => 0xb9401920, // ldr w0,[x9,#24]
         });
@@ -417,6 +424,9 @@ impl Code<'_> {
     }
     fn sys_begin(&mut self, op: SysOp) -> Type {
         self.mark(self.sys.calls[index(op)]);
+        self.sys_frame(op)
+    }
+    fn sys_frame(&mut self, op: SysOp) -> Type {
         self.prologue(FRAME);
         self.store(0, 8);
         self.store(1, 0);
@@ -570,7 +580,22 @@ impl Code<'_> {
     }
     fn sys_io(&mut self, op: SysOp) {
         let reading = op == SysOp::ReadText;
-        let ty = self.sys_begin(op);
+        let ty = if op == SysOp::WriteText {
+            // Both entry points share file checks and short-write handling.
+            // x2 distinguishes an array descriptor from a string handle.
+            let joined = self.label();
+            self.mark(self.sys.calls[index(op)]);
+            self.imm(2, 0);
+            self.branch(joined, Branch::Jump);
+            self.mark(self.sys.write_packed);
+            self.imm(2, 1);
+            self.mark(joined);
+            let ty = self.sys_frame(op);
+            self.store(12, 2);
+            ty
+        } else {
+            self.sys_begin(op)
+        };
         if reading {
             self.imm(0, 0);
             self.store(5, 0); // owned read allocation, until transferred to result
@@ -653,10 +678,26 @@ impl Code<'_> {
             self.branch(opened_error, Branch::Jump);
             self.mark(allocated);
             self.store(5, 0);
+            self.add_imm(0, 0, 8);
+            self.store(10, 0);
         } else {
             self.load(2);
-            self.store(5, 0);
+            let ready = self.label();
+            if op == SysOp::WriteText {
+                let text = self.label();
+                self.load_reg(12, 1);
+                self.branch(text, Branch::Zero(1));
+                self.ldr(1, 0); // contiguous []u8 data
+                self.store(10, 1);
+                self.add_imm(0, 0, 8);
+                self.ldr(0, 0); // byte length
+                self.branch(ready, Branch::Jump);
+                self.mark(text);
+            }
+            self.add_imm(1, 0, 8);
+            self.store(10, 1);
             self.ldr(0, 0);
+            self.mark(ready);
             self.store(7, 0);
             if op == SysOp::WriteText {
                 let truncate = self.label();
@@ -689,8 +730,7 @@ impl Code<'_> {
         self.mark(attempt);
         self.load(3);
         self.push(0);
-        self.load(5);
-        self.add_imm(0, 0, 8);
+        self.load(10);
         self.push(0);
         self.load(6);
         self.pop(1);

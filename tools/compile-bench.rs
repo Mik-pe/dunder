@@ -35,10 +35,12 @@ fn tokens(source: &str) -> usize {
     count
 }
 fn main() {
-    let args: Vec<_> = env::args().collect();
+    let mut args: Vec<_> = env::args().collect();
+    let phases = !args.get(1).is_some_and(|a| a == "--no-phases");
+    if !phases { args.remove(1); }
     assert!(
         args.len() >= 3,
-        "compile-bench COMPILER REPORT.csv [ROUNDS]"
+        "compile-bench [--no-phases] COMPILER REPORT.csv [ROUNDS]"
     );
     let compiler = fs::canonicalize(&args[1]).unwrap();
     let rounds: usize = args.get(3).map_or(30, |s| s.parse().unwrap());
@@ -84,10 +86,10 @@ fn main() {
     for round in 0..rounds {
         let out = root.join(format!("out-{round}"));
         let start = Instant::now();
-        let result = Command::new(&compiler)
-            .args(["build", "main.ddr", "-o"])
-            .arg(&out)
-            .arg("--timings")
+        let mut command = Command::new(&compiler);
+        command.args(["build", "main.ddr", "-o"]).arg(&out);
+        if phases { command.arg("--timings"); }
+        let result = command
             .env("PATH", "/no-external-tools")
             .current_dir(&root)
             .output()

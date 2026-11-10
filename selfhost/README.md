@@ -7,8 +7,7 @@ oberoende förväntade resultat. Fixpunkten har körts direkt på ARM64 för bå
 
 Lexer, modulladdare, parser, typkontroll, kodgenerering, runtime och
 ELF- och Mach-O-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
-assembler eller länkare. QEMU används bara för att köra ARM64-binärer
-på en annan processor.
+assembler eller länkare. QEMU används för Linux-körningar med en annan processorarkitektur än värddatorns.
 
 ARM64-backendens runtime återanvänder minnesblock per storleksklass i en
 512 MiB-pool och räknar referenser till dynamiska strängar. Kompilatorn
@@ -26,7 +25,10 @@ som Rust-bootstrapen.
 ## Byggkedjan
 
 Kör från repositoryts rot. På ARM64/Linux kan stage 2 och stage 3 köras
-direkt; på andra processorer behövs `qemu-aarch64` för dessa steg.
+direkt. På andra processorer behövs `qemu-aarch64` och ett ARM64-Linux-
+användarland med glibc för att köra kompilatorn. Processdrivrutinen använder
+libc när den startar en körbar fil. Ange sysroot med QEMU:s `-L` eller
+`DUNDER_QEMU_LD_PREFIX` i integrationstestet.
 
 ```sh
 # Stage 0: den befintliga Rust-bootstrapen.
@@ -90,12 +92,48 @@ och rad. Den skyddar indata och importerade filer från överskrivning,
 även via symboliska och hårda länkar. Utdata publiceras med temporär fil
 och rename efter ett lyckat bygge.
 
-Vid vanliga byggen kontrollerar självhosten nåbara funktionskroppar. Den
+Vanliga byggen skickar modulladdarens namnupplösta tokenström direkt till
+kompilatorn. Varje källfil lexas en gång, och tokenpositionerna mappas
+till ursprunglig modul. Testbyggen använder fortfarande den sammansatta
+källtexten för att lägga till testfunktioner och teststart.
+
+`build` genererar kod för nåbara funktionskroppar. `check` kontrollerar
+även oanropade funktioner i hela importträdet och skriver ingen körbar fil.
+`check --agent` skriver JSONL med modulens sökväg, ursprungliga UTF-8-
+byteoffsetar och lokala bindningars härledda typer. `build-tests` hanterar
+testkroppar separat. Den
 stöder skalära arrayelement och enkla enumvarianter i arrayer. Den generella
 lånekontrollen, alla typer av nästlade arrayelement och en fullständig
 paritetskontroll av ogiltiga program återstår. Syntax- och typfel från
 självhosten rapporteras fortfarande med den gemensamma koden E1000.
-Rust-bootstrapen behövs för hela CLI:t och paketeringen av en macOS-app.
+CLI:t stöder även `run`, `test --affected`, tidsgränser för tester, manifest,
+målval och macOS-appar med resurssignering. Nativebyggen kan återanvända
+funktionsfragment med `--incremental`. Rust-bootstrapens optimeringar och
+Wasm-stöd har fortfarande bredare täckning.
+
+### Modulprivilegier och filhandtag
+
+Vid filbaserade byggen kontrollerar modulladdaren `capability unsafe` i
+varje fil, även i onåbara funktioner. Ett uppslag av en funktion med
+`@requires(filesystem)` kräver filens eget `capability filesystem`. Det
+gäller även funktionsvärden. Endast den deklarerande modulen får konstruera
+en `opaque struct` eller öppna ett fält i säker kod. Den kontrollen sker vid
+typkontroll av funktionskroppen, så en typberoende överträdelse i en helt
+onåbar kropp upptäcks först när kroppen kompileras.
+[Filhandtag och legacy-API:er](../docs/ffi.md#filåtkomst-genom-delegerade-handtag)
+
+### Wasm32 från den självbyggda kompilatorn
+
+Bygg `selfhost/wasm.ddr` med den inbyggda kompilatorn för värdplattformen.
+Den färdiga kompilatorn skriver Wasm-moduler med en exporterad `main` och
+ett linjärt minne. Den stöder typade värdimporter, C-strängar, råa
+skalärläsningar och skrivningar, typade indirekta importanrop, heltal,
+booleska värden, f32/f64 och strukturerat kontrollflöde. Skalärutskrifter
+går till funktioner i värdmodulen `dunder`, exempelvis `print_f64`.
+`tests/selfhost_wasm.rs` bygger denna kompilator med stage 2, kontrollerar
+ett blandat C-anrop i Node och kontrollerar diagnostiken för en array utanför
+denna backends delmängd. Rust-bootstrapens Wasm-backend beskrivs i
+[måldokumentationen](../docs/targets.md).
 
 ## Filer
 
@@ -139,6 +177,22 @@ De tidigare macOS-testerna för 800 genererade uttryck, runtimefel och
 signaturer finns kvar och körs på ARM64/macOS.
 
 Behåll Rust-bootstrapens källkod som återställningsväg. En ren checkout
-kan byggas med Rust utan någon befintlig Dunder-binär. Versionsmärkta
-bootstrap-binärer och deras källrevisioner kan senare göra installationen
-enklare; självhosting ersätter inte behovet av en första fungerande binär.
+kan byggas med Rust utan någon befintlig Dunder-binär. Frysta
+[startkompilatorer](../bootstrap/README.md) finns för alla tre nativevärdar.
+`tools/bootstrap.sh` bygger och jämför två efterföljande självbyggen utan Rust.
+
+
+## Testgrupper med den självbyggda kompilatorn
+
+På programmets målplattform kan stage 3 bygga och köra alla testgrupper
+från rotfilens importträd. Varje grupp får en egen process och en tidsgräns.
+
+```sh
+build/stage3 build-tests dogfood/tests.ddr -o build/dogfood-tests
+python3 tools/selfhost-tests.py build/dogfood-tests
+```
+
+Binären listar gruppnummer och ursprungliga namn med `--list`. Kör ett
+enskilt gruppnummer för att återupprepa ett fel. Kopplade `@test { (args)
+-> resultat }` och fristående `@test fn` använder samma urval.
+`--timeout 15` på Python-kommandot ger varje grupp 15 sekunder.

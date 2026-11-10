@@ -39,7 +39,7 @@ källor, indata, kontrollsummor och FNV-1a-fingeravtryck. FNV används enbart f�
 reproducerbarhet, inte som kryptografiskt integritetsskydd. En byggtid per
 variant sparas som diagnostik; den är ingen statistisk byggprestandamätning.
 
-Detta är fyra avgränsade arbetsfall, utan C/C++-referens. Resultaten visar
+Före/efter-mätningarna jämför de fyra arbetsfallen mellan två Dunder-versioner. Resultaten visar
 effekten av denna kompilatorändring på dessa program och styrker varken
 generell prestandaparitet eller samma snabbhet på andra processorer.
 ARM64-körning under QEMU lämpar sig för korrekthetskontroll, inte för
@@ -72,3 +72,35 @@ syns i tabellen; mätningen är ingen garanti för varje enskild körning.
 och [sammanställda råmått](2026-11-10-linux-x86_64/summary.csv) följer med.
 Detta mäter den samlade ändringen i delad kodgenerering och x86-64-lowering;
 det isolerar inte varje deloptimerings bidrag.
+
+## ARM64 macOS och optimerad C
+
+Program byggda med Rust-bootstrappen kördes på Apple M5 med 30 växelvis ordnade processer
+per variant. Dunders kontroller för heltalsöverflöde och arraygränser är
+aktiva. Tabellen visar medianen för Dunder dividerad med medianen för den
+angivna C-varianten. Varje kolumn kommer från en egen parvis mätning.
+
+| Arbetsfall | Dunder före → efter senaste loopändringen, ms | Mot clang `-O3 -ftrapv` | Mot clang `-O3` |
+| --- | ---: | ---: | ---: |
+| Numerik | 6,470 → 5,776 | 1,40× | 1,40× |
+| Arrayläsning | 6,520 → 2,136 | 1,13× | 1,69× |
+| UTF-8-text | 3,421 → 3,216 | 1,67× | 1,78× |
+| Sortering | 4,898 → 2,907 | 1,75× | 1,70× |
+
+Tiderna omfattar processstart, argument och utskrift. Alla program måste
+producera samma kontrollsumma. Råvärden inklusive p95 och kompilatorernas
+checksummor finns för [Dunder före/efter](2026-11-10-macos-arm64/loops/),
+[clang med overflowkontroll](2026-11-10-macos-arm64/clang-trapv/) och
+[clang med vanliga optimeringsflaggor](2026-11-10-macos-arm64/clang/).
+
+Den självhostade Stage 3-kompilatorn har en separat kodgenerator. Program
+byggda med den tog 3,37× så lång tid som clang `-O3` för numerik, 12,82×
+för arrayläsning, 17,19× för UTF-8 och 7,37× för sortering. Samma arbetsfall,
+indata och verifiering användes i 30 parvisa körningar. Stage 3-binärens SHA-256
+var `ceebbe5822ca29edaf7b24cde9e3f5b994c7b040ae4426d0c9cfb1778043e48f`.
+[Sammanställning och råmätningar](2026-11-10-macos-arm64/selfhost-clang/).
+
+```sh
+build/runtime-bench-driver --compare-c /usr/bin/clang /path/to/dunder build/versus-checked-c 30
+build/runtime-bench-driver --compare-c-unchecked /usr/bin/clang /path/to/dunder build/versus-c 30
+```

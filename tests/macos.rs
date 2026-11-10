@@ -235,9 +235,15 @@ fn main(){print(poll())}"#,
 fn main(){f:fn(macos.Window)=macos.close;f(macos.Window{id:0})}"#,
     ] {
         let image = project.compile(source);
-        assert_eq!(dynamic_libraries(&image), ["/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib"]);
+        assert_eq!(
+            dynamic_libraries(&image),
+            ["/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib"]
+        );
         let binds = bind_stream(&image).expect("reachable native API needs dynamic bindings");
-        for symbol in [b"_objc_msgSend\0".as_slice(), b"_sel_registerName\0".as_slice()] {
+        for symbol in [
+            b"_objc_msgSend\0".as_slice(),
+            b"_sel_registerName\0".as_slice(),
+        ] {
             assert!(binds.windows(symbol.len()).any(|window| window == symbol));
         }
     }
@@ -345,9 +351,7 @@ fn main(){close:fn(macos.Window)=macos.close;close(macos.Window{id:0})}"#,
             assert_eq!(error.code, "E0300");
             assert_eq!(
                 error.message,
-                format!(
-                    "native module requires macOS; selected target is {target}"
-                )
+                format!("native module requires macOS; selected target is {target}")
             );
         }
     }

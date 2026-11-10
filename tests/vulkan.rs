@@ -163,7 +163,15 @@ import std.vulkan as other
 import .vulkan as local
 fn main(){color:other.Color=vk.rgb(1.0,0.0,0.0);window:other.Window=vk.Window{id:0};print(color.alpha==1.0);print(window.id);print(local.answer())}
 "#);
-    assert_eq!(checked.sources.files.iter().filter(|s| s.path.to_string_lossy() == "<stdlib/vulkan.ddr>").count(), 1);
+    assert_eq!(
+        checked
+            .sources
+            .files
+            .iter()
+            .filter(|s| s.path.to_string_lossy() == "<stdlib/vulkan.ddr>")
+            .count(),
+        1
+    );
     for (source, code) in [
         ("import std.vulkan as vk\nfn main(){r:=vk.open_headless(1,true)}", "E0201"),
         ("import std.vulkan as vk\nfn main(){r:=vk.open_headless(1)}", "E0207"),
@@ -408,7 +416,10 @@ fn main()->i32 {{
 }
 
 #[test]
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn sdl_surface_and_events_round_trip_through_the_public_window_api() {
     if !std::env::var_os("DUNDER_SDL_TEST").is_some_and(|value| value == "1") {
         return;
@@ -472,6 +483,8 @@ fn main() {
     vk.close(w)
     print("SDL surface and events ok")
 }
-"#, &[("SDL_VIDEODRIVER", "dummy")]);
+"#,
+        &[("SDL_VIDEODRIVER", "dummy")],
+    );
     assert_eq!(result.stdout, b"SDL surface and events ok\n");
 }

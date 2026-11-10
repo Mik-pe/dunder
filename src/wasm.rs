@@ -4,10 +4,12 @@ use crate::{
     check::{Expr, Function, Program},
     syntax::{Type, Types},
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 mod arithmetic;
 mod function;
+mod memory;
 
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
@@ -74,6 +76,12 @@ struct Import {
 }
 struct Module<'a> {
     types: &'a Types,
+    runtime: &'static Program,
+    runtime_base: usize,
+    emitting_runtime: bool,
+    needed: BTreeSet<usize>,
+    formatter: Option<usize>,
+    needs_formatter: bool,
     signatures: Vec<Signature>,
     imports: Vec<Import>,
     indices: Vec<Option<usize>>,
@@ -109,7 +117,7 @@ impl Module<'_> {
         if let Some(&off) = self.strings.get(s) {
             return off;
         }
-        let off = self.data.len().next_multiple_of(4);
+        let off = self.data.len().next_multiple_of(8) + 8; // immortal reference count precedes the length
         self.data.resize(off, 0);
         self.data.extend((s.len() as u64).to_le_bytes());
         self.data.extend(s.bytes());
@@ -122,13 +130,29 @@ pub(super) fn compile(p: &Program, entry: usize, reachable: &[bool]) -> Result<V
     if p.types.pointer_bytes() != 4 {
         return Err("wasm32 requires checking with its 32-bit pointer layout".into());
     }
+    static RUNTIME: OnceLock<Result<Program, String>> = OnceLock::new();
+    let runtime = RUNTIME
+        .get_or_init(|| {
+            let src = include_str!("../runtime/wasm.ddr");
+            crate::check_for(src, crate::target::Target::Wasm32)
+                .map_err(|e| e.render("runtime/wasm.ddr", src))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let total = p.functions.len() + runtime.functions.len();
     let mut m = Module {
         types: &p.types,
+        runtime,
+        runtime_base: p.functions.len(),
+        emitting_runtime: false,
+        needed: BTreeSet::new(),
+        formatter: p.float_formatter,
+        needs_formatter: false,
         signatures: vec![],
         imports: vec![],
-        indices: vec![None; p.functions.len()],
+        indices: vec![None; total],
         table: vec![0; p.functions.len()],
-        data: vec![0; 8],
+        data: vec![0; 128],
         strings: HashMap::new(),
     };
     let mut internal = vec![];
@@ -143,8 +167,15 @@ pub(super) fn compile(p: &Program, entry: usize, reachable: &[bool]) -> Result<V
         funcs.push(id);
         let sig = m.signature(Signature::new(&p.types, &f.params, f.ret));
         if let Some((module, name)) = &f.external {
-            if f.params.iter().chain([&f.ret]).any(|t| p.types.storage_bytes(*t).is_some()) {
-                return Err("wasm32 host imports take scalar values; pass C-layout records by pointer".into());
+            if f.params
+                .iter()
+                .chain([&f.ret])
+                .any(|t| p.types.storage_bytes(*t).is_some())
+            {
+                return Err(
+                    "wasm32 host imports take scalar values; pass C-layout records by pointer"
+                        .into(),
+                );
             }
             m.indices[id] = Some(m.import(module, name, sig));
         } else {
@@ -156,6 +187,31 @@ pub(super) fn compile(p: &Program, entry: usize, reachable: &[bool]) -> Result<V
         let f = &p.functions[id];
         let b = function::compile(&mut m, f).map_err(|e| format!("wasm32: {}: {e}", f.name))?;
         bodies.push(b);
+    }
+    if m.needs_formatter {
+        let id = m.formatter.ok_or("missing float formatter")?;
+        let f = &p.functions[id];
+        let sig = m.signature(Signature::new(m.types, &f.params, f.ret));
+        internal.push((id, sig));
+        bodies.push(function::compile(&mut m, f)?);
+    }
+    m.types = &runtime.types;
+    m.emitting_runtime = true;
+    let mut compiled = vec![false; runtime.functions.len()];
+    while let Some(id) = m.needed.pop_first() {
+        if compiled[id] {
+            continue;
+        }
+        compiled[id] = true;
+        let f = &runtime.functions[id];
+        let sig = m.signature(Signature::new(m.types, &f.params, f.ret));
+        internal.push((m.runtime_base + id, sig));
+        let body = if let Some((_, name)) = &f.external {
+            memory::builtin(name)?
+        } else {
+            function::compile(&mut m, f)?
+        };
+        bodies.push(body);
     }
     for (i, &(id, _)) in internal.iter().enumerate() {
         m.indices[id] = Some(m.imports.len() + i);
@@ -267,6 +323,7 @@ struct Emitter<'a, 'p> {
     params: usize,
     frame: usize,
     frame_used: bool,
+    frame_required: bool,
     address_taken: HashSet<usize>,
     depth: usize,
     loops: Vec<(usize, usize)>,
@@ -323,7 +380,26 @@ impl Emitter<'_, '_> {
     fn branch(&mut self, op: u8, label: usize) {
         self.arg(op, self.depth - label);
     }
+    fn runtime_call(&mut self, name: &str) {
+        let id = self
+            .m
+            .runtime
+            .functions
+            .iter()
+            .position(|f| f.name.strip_prefix("m0.") == Some(name))
+            .expect("known runtime helper");
+        self.m.needed.insert(id);
+        self.call_id(self.m.runtime_base + id);
+    }
     fn direct_call(&mut self, id: usize) {
+        if self.m.emitting_runtime {
+            self.m.needed.insert(id);
+            self.call_id(self.m.runtime_base + id);
+        } else {
+            self.call_id(id);
+        }
+    }
+    fn call_id(&mut self, id: usize) {
         self.op(0x10);
         self.body.calls.push((self.body.bytes.len(), id));
     }

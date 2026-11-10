@@ -473,7 +473,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("58 passed, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("59 passed, 0 failed"));
 }
 
 #[test]

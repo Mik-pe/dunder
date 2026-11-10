@@ -1,9 +1,10 @@
 use super::*;
-use crate::check::{EnumArm, ExprKind as E, Stmt as S, StringOp};
+use crate::check::{EnumArm, ExprKind as E, Stmt as S};
 
 pub(super) fn compile(m: &mut Module<'_>, f: &Function) -> Result<Body, String> {
     let params = f.params.len() + usize::from(f.return_slot.is_some());
     let mut taken = HashSet::new();
+    let mut frame_required = f.param_storage.iter().any(Option::is_some);
     loop {
         let mut c = Emitter {
             m,
@@ -17,15 +18,18 @@ pub(super) fn compile(m: &mut Module<'_>, f: &Function) -> Result<Body, String> 
             params,
             frame: params,
             frame_used: false,
+            frame_required,
             address_taken: taken.clone(),
             depth: 0,
             loops: vec![],
         };
         c.tmp(I32); // saved incoming stack pointer, also the frame base
         c.stmts(&f.body)?;
-        if c.address_taken != taken {
+        let needs_frame = c.frame_used || frame_required;
+        if c.address_taken != taken || needs_frame != frame_required {
             // LocalAddress may follow a read or write. Re-emit once with the
             // complete spill set so those earlier accesses see the same cell.
+            frame_required = needs_frame;
             taken = c.address_taken;
             continue;
         }
@@ -37,21 +41,32 @@ pub(super) fn compile(m: &mut Module<'_>, f: &Function) -> Result<Body, String> 
         c.op(0x0b);
         let body = std::mem::take(&mut c.body.bytes);
         let mut calls = std::mem::take(&mut c.body.calls);
-        let frame = c.frame_used || f.param_storage.iter().any(Option::is_some);
-        c.arg(0x23, 0);
-        c.set(c.frame);
-        if frame {
-            c.reserve_frame()?;
+        if frame_required {
+            if c.m.emitting_runtime {
+                return Err("internal Wasm runtime requires a scalar-only allocator".into());
+            }
+            let n = f
+                .slots
+                .checked_mul(8)
+                .filter(|n| *n <= i32::MAX as usize)
+                .ok_or("frame too large")?;
+            c.int(I32, n as i64);
+            c.runtime_call("alloc");
+            c.tee(c.frame);
+            c.int(I32, 0);
+            c.int(I32, n as i64);
+            c.bytes(&[0xfc, 11, 0]);
         }
         for (i, &slot) in f.param_slots.iter().enumerate() {
             let ty = f.params[i];
             if let Some(storage) = f.param_storage[i] {
                 c.address(storage);
                 c.get(i);
-                c.copy(c.m.types.storage_bytes(ty).unwrap());
+                c.replace(ty);
                 c.address(storage);
             } else {
                 c.get(i);
+                c.retain(ty);
             }
             c.write(slot, ty);
         }
@@ -64,44 +79,12 @@ pub(super) fn compile(m: &mut Module<'_>, f: &Function) -> Result<Body, String> 
     }
 }
 impl Emitter<'_, '_> {
-    fn reserve_frame(&mut self) -> Result<(), String> {
-        let size = self
-            .f
-            .slots
-            .checked_mul(8)
-            .filter(|n| *n <= i32::MAX as usize)
-            .ok_or("frame too large")?;
-        self.get(self.frame);
-        self.int(I32, size as i64);
-        self.op(0x6a);
-        let top = self.save(I32);
-        self.get(top);
-        self.get(self.frame);
-        self.op(0x49);
-        self.trap_if();
-        self.get(top);
-        self.int(I32, 1);
-        self.op(0x6b);
-        self.int(I32, 16);
-        self.op(0x76);
-        self.int(I32, 1);
-        self.op(0x6a);
-        let needed = self.save(I32);
-        self.get(needed);
-        self.bytes(&[0x3f, 0, 0x4b, 0x04, EMPTY]);
-        self.get(needed);
-        self.bytes(&[0x3f, 0, 0x6b, 0x40, 0]);
-        self.int(I32, -1);
-        self.op(0x46);
-        self.trap_if();
-        self.op(0x0b);
-        self.get(top);
-        self.arg(0x24, 0);
-        Ok(())
-    }
     fn restore(&mut self) {
-        self.get(self.frame);
-        self.arg(0x24, 0);
+        self.drop_storage(&self.f.owned_storage);
+        if self.frame_required {
+            self.get(self.frame);
+            self.runtime_call("free");
+        }
     }
     pub(super) fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match &e.kind {
@@ -222,31 +205,22 @@ impl Emitter<'_, '_> {
                 let i = self.m.import("dunder", name, sig);
                 self.arg(0x10, i);
             }
-            E::ManagedString(a, _, _) | E::Iterator(a) | E::StringView(a) => self.expr(a)?,
+            E::ManagedString(a, slot, fresh) => {
+                self.expr(a)?;
+                if !fresh {
+                    self.retain(e.ty);
+                }
+                self.read(*slot, e.ty);
+                self.runtime_call("str_release");
+                self.write(*slot, e.ty);
+                self.read(*slot, e.ty);
+            }
+            E::Iterator(a) | E::StringView(a) => self.expr(a)?,
             E::String(s) => {
                 let p = self.m.literal(s);
                 self.int(I32, p as i64);
             }
-            E::StringOp(StringOp::Len, args) => {
-                self.expr(&args[0])?;
-                self.load_store(Type::U32, false, 0);
-            }
-            E::StringOp(StringOp::ByteAt, args) => {
-                let base = self.eval_saved(&args[0])?;
-                let at = self.eval_saved(&args[1])?;
-                self.get(at);
-                self.get(base);
-                self.load_store(Type::U32, false, 0);
-                self.op(0x4f);
-                self.trap_if();
-                self.get(base);
-                self.get(at);
-                self.op(0x6a);
-                self.load_store(Type::U8, false, 8);
-            }
-            E::StringOp(_, _) => {
-                return Err("this string operation requires the native string runtime".into())
-            }
+            E::StringOp(op, args) => self.string_method(*op, args)?,
             E::Range(a, b) => {
                 self.expr(a)?;
                 self.op(0xad);
@@ -264,7 +238,7 @@ impl Emitter<'_, '_> {
             E::Clone(a, s) => {
                 self.address(*s);
                 self.expr(a)?;
-                self.copy(self.m.types.storage_bytes(e.ty).unwrap());
+                self.replace(e.ty);
                 self.address(*s);
             }
             E::Deref(a) => {
@@ -311,31 +285,18 @@ impl Emitter<'_, '_> {
             }
             E::Record(fields, s) => self.record(e.ty, *s, fields)?,
             E::ElementAddress(a, i) | E::Index(a, i) => {
-                let arr = self
-                    .m
-                    .types
-                    .array(a.ty)
-                    .ok_or("dynamic indexing requires the collection runtime")?;
-                let base = self.eval_saved(a)?;
-                let at = self.eval_saved(i)?;
-                self.get(at);
-                self.int(I32, arr.len as i64);
-                self.op(0x4f);
-                self.trap_if();
-                self.get(base);
-                self.get(at);
-                self.int(I32, arr.elem_size() as i64);
-                self.op(0x6c);
-                self.op(0x6a);
-                if matches!(&e.kind, E::Index(..)) {
+                self.element_address(a, i)?;
+                if matches!(e.kind, E::Index(..)) && self.m.types.storage_bytes(e.ty).is_none() {
                     self.load_store(e.ty, false, 0);
                 }
             }
             E::Array(values, s) => {
                 let arr = self.m.types.array(e.ty).unwrap();
+                self.drop_slot(*s, e.ty);
                 for (i, v) in values.iter().enumerate() {
                     self.address(*s);
                     self.expr(v)?;
+                    self.retain(arr.elem);
                     self.load_store(arr.elem, true, i * arr.elem_size());
                 }
                 self.address(*s);
@@ -343,6 +304,7 @@ impl Emitter<'_, '_> {
             E::Repeat(v, s) => {
                 let arr = self.m.types.array(e.ty).unwrap();
                 let value = self.eval_saved(v)?;
+                self.drop_slot(*s, e.ty);
                 if arr.len != 0 {
                     self.address(*s);
                     let data = self.save(I32);
@@ -351,6 +313,7 @@ impl Emitter<'_, '_> {
                     self.bytes(&[0x03, EMPTY]);
                     self.get(data);
                     self.get(value);
+                    self.retain(arr.elem);
                     self.load_store(arr.elem, true, 0);
                     self.get(data);
                     self.add_offset(arr.elem_size());
@@ -364,37 +327,80 @@ impl Emitter<'_, '_> {
                 }
                 self.address(*s);
             }
+            E::SysCall(crate::check::SysOp::DecodeUtf8, args, Some(storage)) => {
+                self.drop_slot(*storage, e.ty);
+                let record = self.m.types.record(e.ty).unwrap();
+                let offset = |name: &str| {
+                    record
+                        .fields
+                        .iter()
+                        .find(|f| f.name == name)
+                        .unwrap()
+                        .offset
+                };
+                let (ok, value, error) = (offset("ok"), offset("value"), offset("error"));
+                let empty = self.m.literal("");
+                self.address(*storage);
+                self.int(I32, empty as i64);
+                self.load_store(Type::Ptr, true, value);
+                self.expr(&args[0])?;
+                let array = self.m.types.value_type(args[0].ty);
+                self.int(
+                    I32,
+                    i64::from(self.m.types.dynamic_elem(array) == Some(Type::U8)),
+                );
+                self.address(*storage);
+                self.add_offset(value);
+                self.runtime_call("decode_utf8");
+                let err = self.save(I32);
+                self.address(*storage);
+                self.get(err);
+                self.load_store(Type::I32, true, error);
+                self.address(*storage);
+                self.get(err);
+                self.op(0x45);
+                self.load_store(Type::Bool, true, ok);
+                self.address(*storage);
+            }
             E::SysCall(..) => {
                 return Err("native system calls require an explicit wasm host import".into())
             }
-            E::StaticBytes { .. } => return Err("native static storage requires a native target".into()),
-            E::Dynamic(..) | E::DynamicOp(..) => {
-                return Err("dynamic arrays require the native collection runtime".into())
+            E::StaticBytes { .. } => {
+                return Err("native static storage requires a native target".into())
             }
-            #[allow(unreachable_patterns)]
-            _ => return Err("unsupported expression for wasm32".into()),
+            E::Dynamic(values, s) => self.dynamic(e.ty, values, *s)?,
+            E::DynamicOp(op, base, arg) => self.dynamic_op(*op, base, arg.as_deref())?,
+            E::ScratchAlloc {
+                area,
+                cursor,
+                limit,
+                count,
+                storage,
+            } => self.scratch(e.ty, *area, *cursor, *limit, count, *storage)?,
         }
         Ok(())
     }
-    fn add_offset(&mut self, n: usize) {
+    pub(super) fn add_offset(&mut self, n: usize) {
         if n != 0 {
             self.int(I32, n as i64);
             self.op(0x6a);
         }
     }
     fn record(&mut self, ty: Type, s: usize, fields: &[(usize, Expr)]) -> Result<(), String> {
+        self.drop_slot(s, ty);
         self.address(s);
         self.int(I32, 0);
         self.int(I32, self.m.types.storage_bytes(ty).unwrap() as i64);
         self.bytes(&[0xfc, 11, 0]);
         for (off, v) in fields {
             self.address(s);
-            if let Some(n) = self.m.types.storage_bytes(v.ty) {
+            if self.m.types.storage_bytes(v.ty).is_some() {
                 self.add_offset(*off);
                 self.expr(v)?;
-                self.copy(n);
+                self.replace(v.ty);
             } else {
                 self.expr(v)?;
+                self.retain(v.ty);
                 self.load_store(v.ty, true, *off);
             }
         }
@@ -406,12 +412,13 @@ impl Emitter<'_, '_> {
             match s {
                 S::Return(e) => {
                     if let Some(e) = e {
-                        if let Some(n) = self.m.types.storage_bytes(e.ty) {
+                        if self.m.types.storage_bytes(e.ty).is_some() {
                             self.get(self.f.params.len());
                             self.expr(e)?;
-                            self.copy(n);
+                            self.replace(e.ty);
                         } else {
                             self.expr(e)?;
+                            self.retain(e.ty);
                         }
                     }
                     self.restore();
@@ -419,23 +426,19 @@ impl Emitter<'_, '_> {
                 }
                 S::Store(slot, e) => {
                     self.expr(e)?;
-                    self.write(*slot, e.ty);
+                    self.replace_local(*slot, e.ty);
                 }
                 S::StoreAggregate(slot, s, e) => {
                     self.address(*s);
                     self.expr(e)?;
-                    self.copy(self.m.types.storage_bytes(e.ty).unwrap());
+                    self.replace(e.ty);
                     self.address(*s);
                     self.write(*slot, e.ty);
                 }
                 S::StorePlace(a, v) => {
                     self.expr(a)?;
                     self.expr(v)?;
-                    if let Some(n) = self.m.types.storage_bytes(v.ty) {
-                        self.copy(n);
-                    } else {
-                        self.load_store(v.ty, true, 0);
-                    }
+                    self.store_value(v.ty);
                 }
                 S::Expr(e) => {
                     self.expr(e)?;
@@ -444,7 +447,7 @@ impl Emitter<'_, '_> {
                     }
                 }
                 S::Block(b) => self.stmts(b)?,
-                S::DropStorage(_) => {}
+                S::DropStorage(slots) => self.drop_storage(slots),
                 S::If(c, a, b) => {
                     self.expr(c)?;
                     self.begin(0x04);
@@ -497,10 +500,10 @@ impl Emitter<'_, '_> {
         body: &[S],
     ) -> Result<(), String> {
         let aggregate = self.m.types.storage_bytes(source.ty);
-        if let (Some(s), Some(n)) = (storage, aggregate) {
+        if let (Some(s), Some(_)) = (storage, aggregate) {
             self.address(s);
             self.expr(source)?;
-            self.copy(n);
+            self.replace(source.ty);
             self.address(s);
         } else {
             self.expr(source)?;
@@ -523,7 +526,11 @@ impl Emitter<'_, '_> {
             if let Some(arr) = self.m.types.array(source.ty) {
                 self.int(I32, arr.len as i64);
                 Some((arr.elem, arr.elem_size(), 0))
-            } else if source.ty == Type::Bytes {
+            } else if let Some(elem) = self.m.types.dynamic_elem(source.ty) {
+                self.get(base);
+                self.load_store(Type::I32, false, 8);
+                Some((elem, self.m.types.scalar_size(elem), 0))
+            } else if matches!(source.ty, Type::Bytes | Type::Runes) {
                 self.get(base);
                 self.load_store(Type::I32, false, 0);
                 Some((Type::U8, 1, 8))
@@ -538,14 +545,22 @@ impl Emitter<'_, '_> {
         self.get(end);
         self.op(0x4e);
         self.branch(0x0d, done);
-        if let Some((ty, stride, off)) = element {
+        if source.ty == Type::Runes {
             self.get(base);
+            self.get(cursor);
+            self.runtime_call("rune_at_byte");
+            self.write(binding, Type::Rune);
+        } else if let Some((ty, stride, off)) = element {
+            self.get(base);
+            if self.m.types.dynamic_elem(source.ty).is_some() {
+                self.load_store(Type::Ptr, false, 0);
+            }
             self.get(cursor);
             self.int(I32, stride as i64);
             self.op(0x6c);
             self.op(0x6a);
             self.load_store(ty, false, off);
-            self.write(binding, ty);
+            self.replace_local(binding, ty);
         } else {
             self.get(cursor);
             self.write(binding, Type::I32);
@@ -556,12 +571,28 @@ impl Emitter<'_, '_> {
         self.loops.pop();
         self.end();
         self.get(cursor);
-        self.int(I32, 1);
+        if source.ty == Type::Runes {
+            self.get(base);
+            self.get(cursor);
+            self.op(0x6a);
+            self.load_store(Type::U8, false, 8);
+            self.runtime_call("rune_width");
+        } else {
+            self.int(I32, 1);
+        }
         self.op(0x6a);
         self.set(cursor);
         self.branch(0x0c, head);
         self.end();
         self.end();
+        if let Some((ty, _, _)) = element {
+            if ty == Type::String {
+                self.drop_slot(binding, ty);
+            }
+        }
+        if let Some(s) = storage {
+            self.drop_slot(s, source.ty);
+        }
         Ok(())
     }
     fn match_enum(
@@ -573,7 +604,7 @@ impl Emitter<'_, '_> {
         if let Some(s) = storage {
             self.address(s);
             self.expr(source)?;
-            self.copy(self.m.types.storage_bytes(source.ty).unwrap());
+            self.replace(source.ty);
             self.address(s);
         } else {
             self.expr(source)?;
@@ -597,13 +628,13 @@ impl Emitter<'_, '_> {
                     self.address(s);
                     self.get(base);
                     self.add_offset(bind.offset);
-                    self.copy(self.m.types.storage_bytes(bind.ty).unwrap());
+                    self.replace(bind.ty);
                     self.address(s);
                 } else {
                     self.get(base);
                     self.load_store(bind.ty, false, bind.offset);
                 }
-                self.write(bind.slot, bind.ty);
+                self.replace_local(bind.slot, bind.ty);
             }
             self.stmts(&arm.body)?;
             self.branch(0x0c, done);

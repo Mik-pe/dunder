@@ -57,8 +57,12 @@ impl Program {
             let binary = self.0.join("program");
             let image = dunder::compile_for(source, target)
                 .unwrap_or_else(|error| panic!("{}", error.render("optimization.ddr", source)));
-            fs::write(&binary, image).unwrap();
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            // macOS caches signatures by vnode. Publish each new image on a
+            // fresh inode just like the compiler's ordinary build command.
+            let next = self.0.join("program.new");
+            fs::write(&next, image).unwrap();
+            fs::set_permissions(&next, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::rename(&next, &binary).unwrap();
             let stdout = self.0.join("stdout");
             let stderr = self.0.join("stderr");
             let mut command = if let Some(emulator) = emulator {
@@ -403,5 +407,98 @@ fn unsigned_arithmetic_and_conversions_trap_before_wraparound() {
         "i64(u64(9223372036854775808))",
     ] {
         program.check(&format!("fn main(){{print({expr})}}"), 101, "");
+    }
+}
+
+#[test]
+fn reciprocal_quotients_and_remainders_match_signed_division() {
+    let divisors = [
+        2i64,
+        3,
+        7,
+        16,
+        127,
+        255,
+        1024,
+        1009,
+        2_147_483_647,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    let mut source = String::new();
+    for (i, d) in divisors.iter().enumerate() {
+        source.push_str(&format!(
+            "fn check{i}(x:i64,q:i64,r:i64){{assert(x/{d}==q);assert(x%{d}==r)}}\n"
+        ));
+    }
+    source.push_str("fn main(){");
+    let mut state = 42u64;
+    for (i, &d) in divisors.iter().enumerate() {
+        let random = (0..48).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state as i64
+        });
+        for x in [
+            i64::MIN,
+            i64::MIN + 1,
+            -d,
+            -d + 1,
+            -1,
+            0,
+            1,
+            d - 1,
+            d,
+            i64::MAX,
+        ]
+        .into_iter()
+        .chain(random)
+        {
+            source.push_str(&format!("check{i}({x},{},{})\n", x / d, x % d));
+        }
+    }
+    source.push_str("print(42)}");
+    Program::new().check(&source, 0, "42\n");
+}
+
+#[test]
+fn reused_array_reads_observe_stores_index_changes_and_loop_joins() {
+    Program::new().check(
+        r#"
+fn move_values(a:&mut []i64, n:i32)->i64{
+    var j:=n
+    var sum:i64=0
+    while j>0 && a[j-1]>0 {
+        a[j]=a[j-1]
+        a[j-1]=a[j-1]+1
+        sum=sum+a[j-1]
+        j=j-1
+    }
+    return sum+a[0]
+}
+fn scan(a:&[]i64)->i64{
+    var sum:i64=0
+    var i:=0
+    while i<a.len {sum=sum+a[i];i=i+1}
+    return sum
+}
+fn main(){
+    var a:[]i64=[2,3,4,5]
+    assert(move_values(&mut a,3)==15)
+    assert(a[0]==3&&a[1]==2&&a[2]==3&&a[3]==4)
+    assert(scan(&a)==12)
+    a.clear()
+    assert(scan(&a)==0)
+    print(42)
+}"#,
+        0,
+        "42\n",
+    );
+    for body in [
+        "var i:=-1;while i<a.len {sum=sum+a[i];i=i+1}",
+        "var i:=0;while i<a.len {i=-1;sum=sum+a[i];i=i+1}",
+        "var i:=0;while i<a.len {a.clear();sum=sum+a[i];i=i+1}",
+    ] {
+        let source = format!("fn walk(a:&mut []i64)->i64{{var sum:i64=0;{body};return sum}} fn main(){{var a:[]i64=[9];print(walk(&mut a))}}");
+        Program::new().check(&source, 103, "");
     }
 }

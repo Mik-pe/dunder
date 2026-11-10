@@ -1,0 +1,157 @@
+// Native relocatable code. The header digest identifies the fixed global label
+// table. Function-private labels and instruction locations are stored as offsets.
+import arm64 as arm
+import cache_io
+import cli
+import lexer
+import std.bytes as bytes
+import sys
+
+pub struct Start { words: i32, labels: i32, relocations: i32 }
+pub fn start(code: &arm.Code) -> Start {
+    Start { words: code.words.len, labels: code.labels.len, relocations: code.at.len }
+}
+fn tag(kind: lexer.Kind) -> u8 {
+    match kind {
+        .End => 0, .Name => 1, .Keyword => 2, .Integer => 3, .Float => 4,
+        .String => 5, .Rune => 6, .Symbol => 7, .Newline => 8,
+    }
+}
+fn tokens(output: &mut []u8, input: &lexer.Tokens, first: i32, last: i32) {
+    for i in first..last {
+        output.push(tag(input.kinds[i]))
+        spelling := input.texts[i]
+        bytes.append_le(&mut output, i64(spelling.len), 4)
+        bytes.append_utf8(&mut output, spelling)
+    }
+}
+pub fn context(input: &lexer.Tokens, starts: &[]i32, ends: &[]i32,
+    owners: &[]i32, type_owners: &[]i32, platform: i32, globals: i32,
+    callbacks: bool, identity: string) -> string {
+    if identity == "" { return "" }
+    var raw: []u8 = []
+    bytes.append_utf8(&mut raw, identity + ":native3:" + platform.str() + ":" + globals.str())
+    if callbacks { raw.push(1) } else { raw.push(0) }
+    for owner in owners { bytes.append_le(&mut raw, i64(owner), 4) }
+    for owner in type_owners { bytes.append_le(&mut raw, i64(owner), 4) }
+    var position := 0
+    for i in 0..starts.len {
+        if starts[i] > 0 {
+            tokens(&mut raw, &input, position, starts[i])
+            position = ends[i]
+        }
+    }
+    tokens(&mut raw, &input, position, input.kinds.len)
+    cache_io.binary_hash(&raw)
+}
+pub fn key(context: string, function: i32, input: &lexer.Tokens, first: i32, last: i32) -> string {
+    if context == "" { return "" }
+    var raw: []u8 = []
+    bytes.append_utf8(&mut raw, context)
+    bytes.append_le(&mut raw, i64(function), 4)
+    tokens(&mut raw, &input, first, last)
+    cache_io.binary_hash(&raw)
+}
+fn put(output: &mut []u8, value: i64) {
+    digits := "0123456789abcdef"
+    for i in 0..8 { output.push(u8(digits[i32(value.shr((7 - i) * 4).bit_and(15))])) }
+}
+fn values(source: string) -> []i64 {
+    var result: []i64 = []
+    if source.len % 8 != 0 { return result }
+    result.reserve(source.len / 8)
+    var value: i64 = 0
+    for i in 0..source.len {
+        byte := source[i]
+        var digit := byte - 48
+        if byte >= 97 && byte <= 102 { digit = byte - 87 }
+        else if byte < 48 || byte > 57 { return [] }
+        value = value * 16 + i64(digit)
+        if i % 8 == 7 { result.push(value); value = 0 }
+    }
+    result
+}
+pub fn save(code: &arm.Code, begin: Start, globals: i32, path: string, key: string) {
+    if key == "" { return }
+    var output: []u8 = []
+    put(&mut output, i64(code.words.len - begin.words))
+    put(&mut output, i64(code.labels.len - begin.labels))
+    put(&mut output, i64(code.at.len - begin.relocations))
+    for i in begin.words..code.words.len { put(&mut output, code.words[i]) }
+    for i in begin.labels..code.labels.len {
+        offset := code.labels[i]
+        if offset < 0 { put(&mut output, 4294967295) }
+        else {
+            if offset < begin.words { return }
+            put(&mut output, i64(offset - begin.words))
+        }
+    }
+    for i in begin.relocations..code.at.len {
+        target := code.target[i]
+        put(&mut output, i64(code.at[i] - begin.words))
+        if target < globals { put(&mut output, 2147483648 + i64(target)) }
+        else if target >= begin.labels { put(&mut output, i64(target - begin.labels)) }
+        else { return }
+        put(&mut output, i64(code.kinds[i]))
+    }
+    if !cli.prepare_parent(path) { return }
+    payload := sys.decode_u8(&output)
+    temporary := path + "." + sys.pid().str() + ".tmp"
+    signature := cache_io.digest(key + payload.value)
+    written := sys.write_text(temporary, key + signature + payload.value)
+    if written.ok {
+        updated := sys.rename(temporary, path)
+        if updated.ok { return }
+    }
+    removed := sys.remove_file(temporary)
+}
+pub fn restore(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string) -> bool {
+    if key == "" { return false }
+    info := sys.metadata(path)
+    if !info.is_file || info.size < 152 || info.size > 67108864 { return false }
+    read := sys.read_text(path)
+    if !read.ok || read.value.len < 152 || read.value[0..64] != key { return false }
+    payload := read.value[128..read.value.len]
+    if read.value[64..128] != cache_io.digest(key + payload) { return false }
+    data := values(payload)
+    if data.len < 3 { return false }
+    if i64(3) + data[0] + data[1] + i64(3) * data[2] != i64(data.len) || data[0] == 0 { return false }
+    words := i32(data[0])
+    labels := i32(data[1])
+    relocations := i32(data[2])
+    label_start := 3 + words
+    relocation_start := label_start + labels
+    for i in 0..labels {
+        offset := data[label_start + i]
+        if offset != 4294967295 && offset > i64(words) { return false }
+    }
+    for i in 0..relocations {
+        at := data[relocation_start + i * 3]
+        target := data[relocation_start + i * 3 + 1]
+        kind := data[relocation_start + i * 3 + 2]
+        if at >= i64(words) || kind > 20 || (kind >= 2 && at + 1 >= i64(words)) { return false }
+        if target >= 2147483648 {
+            if target - 2147483648 >= i64(globals) { return false }
+        } else if target >= i64(labels) || data[label_start + i32(target)] == 4294967295 { return false }
+    }
+    // Only mutate compiler state after every length and symbolic target is valid.
+    base := code.words.len
+    first := code.labels.len
+    arm.mark(&mut code, entry)
+    for i in 0..words { code.words.push(data[3 + i]) }
+    for i in 0..labels {
+        offset := data[label_start + i]
+        if offset == 4294967295 { code.labels.push(-1) }
+        else { code.labels.push(base + i32(offset)) }
+    }
+    for i in 0..relocations {
+        destination := data[relocation_start + i * 3 + 1]
+        var target := 0
+        if destination >= 2147483648 { target = i32(destination - 2147483648) }
+        else { target = first + i32(destination) }
+        code.at.push(base + i32(data[relocation_start + i * 3]))
+        code.kinds.push(i32(data[relocation_start + i * 3 + 2]))
+        code.target.push(target)
+    }
+    true
+}

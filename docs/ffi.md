@@ -57,7 +57,8 @@ anrop. `callback(namn)` ger en C-funktionspekare till en namngiven
 Dunder-funktion med skalära argument och skalärt eller tomt resultat. En
 native-callback lånar det pågående Dunder-anropets exekveringstillstånd.
 C-biblioteket får anropa den synkront på samma OS-tråd medan anropet från
-Dunder till C fortfarande pågår.
+Dunder till C fortfarande pågår. Om ett C-bibliotek anropar funktionen från
+en annan tråd eller utan ett aktivt anrop avslutas processen med kod 111.
 
 Den osäkra primitiven `static_bytes("native", 16)` ger adressen till ett
 16-byte-justerat och initialt nollställt område i programmets skrivbara

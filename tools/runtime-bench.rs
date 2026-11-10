@@ -123,13 +123,19 @@ fn quantile(samples: &[f64], percentile: f64) -> f64 {
 }
 fn main() {
     let mut args: Vec<_> = env::args().collect();
-    let c_reference = args.get(1).is_some_and(|arg| arg == "--compare-c");
+    let c_mode = args.get(1).map(String::as_str);
+    let trap_overflow = c_mode == Some("--compare-c");
+    let c_reference = trap_overflow || c_mode == Some("--compare-c-unchecked");
+    let mut c_flags = vec!["-std=c11", "-O3"];
+    if trap_overflow {
+        c_flags.push("-ftrapv");
+    }
     if c_reference {
         args.remove(1);
     }
     assert!(
         (4..=5).contains(&args.len()),
-        "runtime-bench [--compare-c] BASELINE_COMPILER CANDIDATE REPORT_DIR [ROUNDS]"
+        "runtime-bench [--compare-c|--compare-c-unchecked] BASELINE_COMPILER CANDIDATE REPORT_DIR [ROUNDS]"
     );
     let compilers = [
         fs::canonicalize(&args[1]).unwrap(),
@@ -155,7 +161,8 @@ fn main() {
             .output()
             .unwrap();
         metadata += &format!(
-            "baseline=C\nc_flags=-std=c11 -O3 -ftrapv\nc_version={}\nc_source_fnv={:016x}\n",
+            "baseline=C\nc_flags={}\nc_version={}\nc_source_fnv={:016x}\n",
+            c_flags.join(" "),
             String::from_utf8_lossy(&version.stdout).trim(),
             hash(&fs::read(root.join("benchmarks/runtime/reference.c")).unwrap())
         );
@@ -210,7 +217,7 @@ fn main() {
             let mut compiler = Command::new(&compilers[i]);
             if c_reference && i == 0 {
                 compiler
-                    .args(["-std=c11", "-O3", "-ftrapv"])
+                    .args(&c_flags)
                     .arg(format!("-DCASE_{}", case.name))
                     .arg(root.join("benchmarks/runtime/reference.c"));
             } else {

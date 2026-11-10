@@ -104,11 +104,15 @@ impl Code<'_> {
 
     pub(super) fn string_literal(&mut self, s: &str) -> Label {
         if let Some((_, label)) = self.strings.literals.iter().find(|(text, _)| text == s) {
-            if let Some(trace) = &mut self.literal_trace { trace.push(*label); }
+            if let Some(trace) = &mut self.literal_trace {
+                trace.push(*label);
+            }
             return *label;
         }
         let label = self.label();
-        if let Some(trace) = &mut self.literal_trace { trace.push(label); }
+        if let Some(trace) = &mut self.literal_trace {
+            trace.push(label);
+        }
         self.strings.literals.push((s.into(), label));
         label
     }

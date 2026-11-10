@@ -58,6 +58,20 @@ utanför loopar lämna över sitt ägarskap till destinationen. En överlämnad
 strängreferens eller arraydeskriptor nollställs på källplatsen innan den
 vanliga städningen körs.
 
+På ARM64 kan en lövfunktion som tar en enda lånad dynamisk array behålla
+dess datapekare och längd i register. Analysen tillåter indexering och
+längdläsning och kräver att deskriptorn förblir oförändrad. Två läsningar
+av samma element kan dela det laddade värdet fram till en skrivning,
+en ändring av indexvariabeln eller en sammanfogning av kontrollflödet.
+För en framåtriktad `while i < values.len` med konstant icke-negativ start
+och en enda avslutande `i = i + 1` bevisar loopvillkoret både intervallet
+för `values[i]` och att inkrementet ryms i `i32`.
+
+Division och rest med positiva heltalskonstanter större än ett använder
+skift eller ett förberäknat reciprokvärde. Tester jämför kvot och rest
+mot signerad heltalsdivision för positiva och negativa indata ända ut
+till typens gränsvärden.
+
 ## x86-64-register
 
 | Gemensamt arbetsregister | Fast x86-64-register |
@@ -108,4 +122,6 @@ i millisekunder var 6,985 → 6,030 för numerik, 6,510 → 5,920 för arrayläs
 3,322 → 3,294 för text och 5,682 → 5,534 för sortering. p95 ökade för numerik,
 text och sortering. Alla körningar kontrollerades mot oberoende facit.
 [Råvärden och maskinmetadata](../benchmarks/runtime/2026-11-10-macos-arm64/)
-finns för alla fyra arbetsfall. En jämförelse med C/C++ återstår.
+finns för alla fyra arbetsfall. En efterföljande mätning av hela bootstrapen
+täcker även loopoptimeringarna ovan och jämför med clang `-O3`.
+[Resultat mot C](../benchmarks/runtime/README.md#arm64-macos-och-optimerad-c)

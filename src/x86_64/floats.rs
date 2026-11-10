@@ -192,8 +192,8 @@ impl Lower {
                 self.load(0, src);
                 self.emit(&[0x48, 0x85, 0xc0]); // test rax,rax
                 let small = self.float_jump(Some(9)); // jns
-                // Fold the low bit into the half before rounding. This preserves
-                // ties-to-even for the subsequent exact multiplication by two.
+                                                      // Fold the low bit into the half before rounding. This preserves
+                                                      // ties-to-even for the subsequent exact multiplication by two.
                 self.emit(&[0x48, 0x89, 0xc1, 0x83, 0xe1, 1]);
                 self.emit(&[0x48, 0xd1, 0xe8, 0x48, 0x09, 0xc8]);
                 self.emit(&[prefix, 0x48, 0x0f, 0x2a, 0xc0]);
@@ -213,7 +213,9 @@ impl Lower {
                 let limit = if wide { 0x43e0000000000000 } else { 0x5f000000 };
                 self.imm64(0, limit);
                 self.emit(&[0x66, 0x48, 0x0f, 0x6e, 0xc8]); // movq xmm1,rax
-                if wide { self.emit(&[0x66]); }
+                if wide {
+                    self.emit(&[0x66]);
+                }
                 self.emit(&[0x0f, 0x2e, 0xc1]); // ucomiss/ucomisd xmm0,xmm1
                 let small = self.float_jump(Some(2)); // jb
                 self.emit(&[prefix, 0x0f, 0x5c, 0xc1]); // subss/subsd xmm0,xmm1

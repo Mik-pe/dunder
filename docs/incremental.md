@@ -49,3 +49,22 @@ alltid hela sviten.
 Resultatkvitton och kodfragment finns i den valda testutdatakatalogen
 (`-o`). Sammanfattningen anger hur många grupper som hoppades över och hur
 många som gick igenom eller misslyckades.
+
+## Den självhostade kompilatorn
+
+Samma flaggor finns i `selfhost/`. Dess nativecache ligger i
+`build/.dunder-cache/selfhost` och aktiveras uttryckligen med `--incremental`.
+Nyckeln innehåller kompilatorns kryptografiska identitet, målet, deklarationernas
+layout och funktionens tokenström. På macOS används SHA-256 av den laddade
+bildens kodsignatur och på Linux SHA-256 av den körande ELF-filen genom
+`/proc/self/exe`. Identiteten följer därmed processen även om ett nytt bygge
+ersätter dess sökväg. Symboliska hopp placeras om vid varje
+bygge. Funktioner som skapar nya typer, strängliteraler, importplatser eller
+statisk lagring emitteras på nytt. Program med C-callbacks emitteras på nytt.
+Det håller återanvändningen konservativ tills dessa resurser kan spelas upp
+från cacheformatet. `--timings` visar återanvända och emitterade funktioner.
+
+`test --affected` använder transitiva beroenden och kompilatoridentitet även
+här. Godkända resultat kan återanvändas för rena grupper. Processdrivrutinen
+startar varje grupp separat, bevarar argument exakt och dödar samt väntar in
+en grupp som överskrider `--timeout-ms`. Standardgränsen är 5 000 ms.

@@ -1,0 +1,163 @@
+// Cache identity uses the actual compiler executable and the canonical project root.
+capability unsafe
+import std.dl as dl
+import std.bytes as bytes
+import std.sha256 as sha
+import sys
+
+@extern("c","fopen") unsafe fn file_open(path: ptr, mode: ptr) -> ptr
+@extern("c","fread") unsafe fn file_read(dst: ptr, width: usize, count: usize, file: ptr) -> usize
+@extern("c","fseek") unsafe fn seek_file(file:ptr, offset:i64, whence:i32)->i32
+@extern("c","ftell") unsafe fn tell_file(file:ptr)->i64
+@extern("c","fileno") unsafe fn descriptor(file:ptr)->i32
+@extern("c","mmap") unsafe fn map_file(p:ptr,size:usize,protection:i32,flags:i32,fd:i32,offset:i64)->ptr
+@extern("c","munmap") unsafe fn unmap_file(p:ptr,size:usize)->i32
+@extern("c","ferror") unsafe fn file_error(file: ptr) -> i32
+@extern("c","fclose") unsafe fn file_close(file: ptr) -> i32
+@extern("c","realpath") unsafe fn absolute_path(path: ptr, dst: ptr) -> ptr
+@extern("c","free") unsafe fn release(p: ptr)
+
+pub fn binary_hash(input: &[]u8) -> string {
+    digest := sha.digest_bytes(&input); var wide: []i32 = []
+    for b in digest { wide.push(i32(b)) }
+    bytes.hex(&wide)
+}
+pub fn digest(source: string) -> string { hash := sha.text(source); bytes.hex(&hash) }
+fn terminated(value: string) -> []u8 {
+    var data: []u8 = []
+    for b in value.bytes() { if b == 0 { return [] }; data.push(u8(b)) }
+    data.push(0); data
+}
+pub fn root(path: string) -> string {
+    data := terminated(path); if data.len == 0 { return "" }
+    unsafe {
+        p := absolute_path(addr(&data[0]), ptr(0)); if usize(p) == 0 { return "" }
+        var out: []u8 = []; var i: usize = 0
+        while true {
+            b := load_u8(ptr(usize(p) + i)); if b == 0 { break }
+            out.push(b); i = i + 1
+        }
+        release(p); decoded := sys.decode_u8(&out)
+        if decoded.ok { return decoded.value }
+    }
+    ""
+}
+// Use a mapped executable and the OS implementation of SHA-256 when present.
+unsafe fn mapped_digest(file: ptr, platform: i32) -> string {
+    if seek_file(file,0,2) != 0 { return "" }
+    length := tell_file(file)
+    if seek_file(file,0,0) != 0 || length <= 0 || length > 2147483647 { return "" }
+    n := usize(length)
+    var library := ptr(0); var routine := ptr(0)
+    if platform == 0 {
+        library = dl.open(ptr(0), 1)
+        if usize(library) != 0 { routine = dl.symbol(library, cstr("CC_SHA256")) }
+    } else {
+        library = dl.open(cstr("libcrypto.so.3"),1)
+        if usize(library) != 0 { routine = dl.symbol(library,cstr("SHA256")) }
+    }
+    var result := ""
+    if usize(routine) != 0 {
+        mapped := map_file(ptr(0),n,1,2,descriptor(file),0)
+        if usize(mapped).wrapping_add(1) != 0 {
+            var out: [u8;32] = [0;32]; var answer := ptr(0)
+            if platform == 0 {
+                digest32: extern fn(ptr,u32,ptr)->ptr = ffi_fn(routine)
+                answer = digest32(mapped,u32(length),addr(&mut out[0]))
+            } else {
+                digest64: extern fn(ptr,usize,ptr)->ptr = ffi_fn(routine)
+                answer = digest64(mapped,n,addr(&mut out[0]))
+            }
+            if usize(answer) != 0 {
+                var wide: []i32 = []; for b in out { wide.push(i32(b)) }
+                result = bytes.hex(&wide)
+            }
+            unmapped := unmap_file(mapped,n)
+        }
+    }
+    if usize(library) != 0 { closed := dl.close(library) }
+    result
+}
+// The mapped signature belongs to the running image even after another build
+// atomically replaces its pathname. CodeDirectory hashes cover its original pages.
+unsafe fn running_mach_identity() -> string {
+    handle := dl.open(ptr(0), 1)
+    if usize(handle) == 0 { return "" }
+    image_symbol := dl.symbol(handle, cstr("_dyld_get_image_header"))
+    digest_symbol := dl.symbol(handle, cstr("CC_SHA256"))
+    var result := ""
+    if usize(image_symbol) != 0 && usize(digest_symbol) != 0 {
+        header_of: extern fn(u32)->ptr = ffi_fn(image_symbol)
+        digest: extern fn(ptr,u32,ptr)->ptr = ffi_fn(digest_symbol)
+        header := header_of(0)
+        if usize(header) != 0 && load_u32(header) == 4277009103 {
+            count := load_u32(ptr(usize(header) + 16))
+            limit := usize(load_u32(ptr(usize(header) + 20))) + 32
+            var command: usize = 32
+            var text_address: usize = 0
+            var link_address: usize = 0
+            var link_offset: usize = 0
+            var link_size: usize = 0
+            var signature: usize = 0
+            var signature_size: u32 = 0
+            if count < 65536 && limit < 16777216 {
+                for i in 0..i32(count) {
+                    if command + 8 > limit { break }
+                    item := ptr(usize(header) + command)
+                    kind := load_u32(item)
+                    size := usize(load_u32(ptr(usize(item) + 4)))
+                    if size < 8 || command + size > limit { break }
+                    if kind == 25 && size >= 72 {
+                        offset := usize(load_u64(ptr(usize(item) + 40)))
+                        file_size := usize(load_u64(ptr(usize(item) + 48)))
+                        address := usize(load_u64(ptr(usize(item) + 24)))
+                        // Compare the fixed segment names using their first bytes.
+                        name := ptr(usize(item) + 8)
+                        if load_u32(name) == 1163157343 && offset == 0 && file_size > 0 { text_address = address }
+                        if load_u32(name) == 1229741919 {
+                            link_address = address; link_offset = offset; link_size = file_size
+                        }
+                    }
+                    if kind == 29 && size >= 16 {
+                        signature = usize(load_u32(ptr(usize(item) + 8)))
+                        signature_size = load_u32(ptr(usize(item) + 12))
+                    }
+                    command = command + size
+                }
+                if text_address > 0 && link_address >= text_address && signature_size > 0 &&
+                    signature >= link_offset && signature - link_offset + usize(signature_size) <= link_size {
+                    data := ptr(usize(header) + link_address - text_address + signature - link_offset)
+                    var out: [u8;32] = [0;32]
+                    hashed := digest(data,signature_size,addr(&mut out[0]))
+                    if usize(hashed) != 0 {
+                        var wide: []i32 = []
+                        for b in out { wide.push(i32(b)) }
+                        result = bytes.hex(&wide)
+                    }
+                }
+            }
+        }
+    }
+    closed := dl.close(handle)
+    result
+}
+pub fn compiler(platform: i32) -> string {
+    unsafe {
+        if platform == 0 { return running_mach_identity() }
+        file := file_open(cstr("/proc/self/exe"), cstr("rb"))
+        if usize(file) == 0 { return "" }
+        fast := mapped_digest(file, platform); if fast != "" { closed := file_close(file); return fast }
+        var part: [u8; 16384] = [0;16384]; var data: []u8 = []
+        while true {
+            n := file_read(addr(&mut part[0]),1,16384,file)
+            for i in 0..i32(n) { data.push(part[i]) }
+            if n < 16384 { break }
+        }
+        err := file_error(file); closed := file_close(file)
+        if err != 0 || closed != 0 || data.len == 0 { return "" }
+        hash := sha.digest_bytes(&data); var wide: []i32 = []
+        for b in hash { wide.push(i32(b)) }
+        return bytes.hex(&wide)
+    }
+    ""
+}

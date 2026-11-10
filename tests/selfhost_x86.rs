@@ -54,6 +54,26 @@ fn dunder_emits_x86_elf_and_rebuilds_itself_on_linux_x86() {
         0x401000
     );
 
+    let rejected = work.0.join("rejected.ddr");
+    for action in [
+        "other:=data",
+        "data=[]",
+        "data.reserve(2)",
+        "mutate(&mut data)",
+    ] {
+        fs::write(&rejected, format!("fn mutate(x:&mut []i32){{x.clear()}} fn main(){{region s{{var data:[]i32=s.alloc(1);{action}}}}}")).unwrap();
+        let failure = Command::new(&stage1)
+            .arg("build")
+            .arg(&rejected)
+            .arg("-o")
+            .arg(work.0.join("invalid"))
+            .output()
+            .unwrap();
+        assert!(!failure.status.success(), "accepted {action}");
+        assert!(!work.0.join("invalid").exists());
+    }
+    let fixture = root.join("tests/fixtures/regions.ddr");
+    build(&stage1, root, &fixture, &work.0.join("region"));
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         let stage3 = work.0.join("stage3");
         build(&stage2, root, &source, &stage3);
@@ -64,6 +84,7 @@ fn dunder_emits_x86_elf_and_rebuilds_itself_on_linux_x86() {
         for (input, expected) in [
             ("examples/fibonacci.ddr", "6765\ntrue\n"),
             ("dogfood/arena/main.ddr", "28\n"),
+            ("tests/fixtures/regions.ddr", "3000000011\n"),
         ] {
             let output = work.0.join("program");
             build(&stage3, root, &root.join(input), &output);

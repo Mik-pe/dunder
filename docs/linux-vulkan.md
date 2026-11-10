@@ -124,4 +124,7 @@ och kör två händelser genom den riktiga SDL-kön med dess dummy-videodrivruti
 Detta är en första synkron renderingsväg. Vulkan-swapchain, flera samtidiga
 fönster, texturer, egen shaderkod och textlayout återstår. Readback och
 mjukvarupresentation gör den olämplig som prestandareferens för en framtida
-GPU-driven swapchain. Grafikmodulen byggs med bootstrapkompilatorns FFI-stöd.
+GPU-driven swapchain. Både Rust-bootstrapen och Dunders självbyggda
+kompilator kan bygga triangeln för ARM64/Linux och x86-64/Linux. På båda
+målen gav de två kompilatorerna byteidentiska PPM-bilder från lavapipe, och
+den självbyggda kompilatorns binärer presenterade tre bildrutor via SDL.

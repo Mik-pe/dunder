@@ -140,3 +140,40 @@ en tillåten arraytyp. Kompilatorn avvisar tilldelning, retur, råadresser och
 storleksändringar av själva vyn. En för liten region, negativt elementantal
 eller index utanför vyn ger status 103. Negativ eller omöjlig begäran om
 regionkapacitet ger arrayallokerarens status 109.
+
+
+Selfhost-kompilatorns native-mål stöder samma syntax och markörallokering
+för skalärer och vanliga, flata structar med skalära värdefält. För ett lån
+till ett skalärt element eller en hel vy kräver selfhost att elementens
+representation matchar funktionsparameterns lagring. Enskilda structfält
+kan lånas under ett anrop. `tests/fixtures/regions.ddr` används av båda
+kompilatorernas regressionstester.
+
+
+### Packade bytebuffertar
+
+`[]u8` använder en byte per element. `std.bytes.append_utf8` och
+`std.bytes.decode` arbetar med packade buffertar. Tabells CSV-fält, SHA-256
+och selfhost-kompilatorns kodbild och signatur använder samma representation.
+`sys.write_u8` och `sys.decode_u8` tar `&[]u8`. Befintlig kod med
+`&[]i32` kan använda `sys.write_bytes` och `sys.decode_utf8`.
+
+På Apple M5 med macOS 27.2 fyllde ett prov 8 388 608 element och skrev ut
+sista värdet 255. Tabellen visar medianen av fem separata processer per
+cell med `/usr/bin/time -l` den 10 november 2026.
+
+| Kompilator som byggde provet | Maximal RSS med `[]u8` | Maximal RSS med `[]i32` |
+| --- | ---: | ---: |
+| Rust-bootstrap för arm64-macos | 9 912 320 byte | 35 078 144 byte |
+| Selfhost, steg 3 för arm64-macos | 9 912 320 byte | 35 078 144 byte |
+
+Bygg provet igen med `i32` på båda ställen för fyrabytesvarianten.
+
+```dunder
+fn main() {
+    var data: []u8 = []
+    data.reserve(8388608)
+    for i in 0..8388608 { data.push(u8(i % 256)) }
+    print(data[8388607])
+}
+```

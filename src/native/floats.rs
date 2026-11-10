@@ -67,7 +67,11 @@ impl Code<'_> {
             return;
         }
         if from.integer() && to.float() {
-            let opcode = if from.unsigned() { 0x9e230000 } else { 0x9e220000 };
+            let opcode = if from.unsigned() {
+                0x9e230000
+            } else {
+                0x9e220000
+            };
             self.emit(opcode | Self::fp_width(to)); // ucvtf/scvtf s0/d0,x0
             self.fp_to_bits(0, 0, to);
         } else if from.float() && to.float() {
@@ -96,7 +100,11 @@ impl Code<'_> {
                 self.branch(self.float_conversion, Branch::Cond(6)); // NaN
                 self.branch(self.float_conversion, Branch::Cond(condition));
             }
-            let opcode = if to.unsigned() { 0x9e390000 } else { 0x9e380000 };
+            let opcode = if to.unsigned() {
+                0x9e390000
+            } else {
+                0x9e380000
+            };
             self.emit(opcode | Self::fp_width(from)); // fcvtzu/fcvtzs x0,s0/d0
         }
     }

@@ -124,7 +124,8 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   modulladdare, parser, typkontroll, kodgenerering, runtime och ELF-skrivare
   är Dunder-kod. Stage 2 och stage 3 är byteidentiska, verifierat under QEMU.
   Stage 3 bygger och kör fristående program med bitoperationer, structar,
-  arrayer och UTF-8. Full språkparitet och självbyggd macOS/x86-64 återstår.
+  arrayer och UTF-8. Motsvarande fixpunkter körs även på ARM64/macOS och x86-64/Linux.
+  [Selfhost-dokumentationen](../selfhost/README.md) beskriver aktuell täckning.
 - Structar och fasta arrayer kan returneras med kopiering till anroparens
   lagring, även genom callbacks och rekursion. Ingen pekare till avslutad
   stacklagring returneras.
@@ -304,13 +305,11 @@ binär och utdata får inte skriva över källan.
 ## Begränsningar och nästa steg
 
 Bootstrapkompilatorn är skriven i Rust och behålls som återställningsväg.
-Den självbyggda Dunder-kompilatorn riktar sig till ARM64/Linux och har ännu
-en mindre språkdelmängd: endast nåbara funktionskroppar kontrolleras,
-testblock tas bort, och fullständiga payload-enums/match, flyttal,
-funktionsvärden och fasta arrayer återstår. Nästa steg är språkparitet och
-självbyggd kodgenerering för x86-64 och macOS. Den Dunder-skrivna backenden
-behöver också portning av bootstrapens nya minnesmodell; dess egen runtime
-använder fortfarande bump-allokering.
+Den självbyggda Dunder-kompilatorn bygger byteidentiska nativefixpunkter på
+alla tre värdmål. Den har flyttal, payload-enums, funktionsvärden,
+referensräkning, deterministisk ägarstädning, testkörning och macOS-appar.
+Dess Wasm-backend behöver fortfarande stöd för hanterade samlingar.
+Full paritet för diagnostik och lånekontroll återstår.
 Arrayelement är begränsade till primitiva skalärer och enums utan payload.
 Fasta arrayer och inline-aggregat får vara högst 64 KiB. Nästlade aggregat
 fungerar som structfält och enumpayloads. Arrayslices, generiskt allokerings-API
@@ -320,14 +319,17 @@ till funktionsparametrar. Dynamiska arraybuffertar återvinns i en separat
 en extra sida bokföring. Storleksklasserna delar eller sammanfogar ännu inte
 fria block, så blandade storlekar kan fragmentera lagringen. Poolernas
 mappningar behålls till processlut. Strängliteraler bor i programbilden.
-Generell ägande-/lånekontroll, flyttar och trådsäker delning återstår.
+Generell ägande-/lånekontroll och trådsäker delning återstår.
+Bootstrapen flyttar samlingar vid verifierad sista användning.
 Normalisering, grapheme-kluster, interpolation och
 fullständig Unicode-klassificering återstår.
-Dogfood-arenan är bump-allokering över en fast stackbuffert med index som
-handtag; den är ännu inget allmänt allokerings- eller låne-API.
+Dogfood-arenan använder en fast stackbuffert med indexhandtag. Språket har
+också lexikala `region`-block med kontrollerade lån, beskrivet i
+[minnesarkitekturen](memory.md).
 Iteratorer är inbyggda arraykopior, inte ett användardefinierat protokoll.
-Globala konstanter, paketregister och dynamiska bibliotek återstår.
-Ingen inkrementell cache.
+Globala konstanter, paketregister och produktion av egna delade bibliotek återstår.
+Nativebyggen har en [funktionscache](incremental.md) och typade importer från
+delade bibliotek.
 Enums saknar ännu generics, likhet för data-enums, mönsterguards och generell
 `match` som uttryck. Direkt rekursiva inlinevärden kräver indirection;
 arena-dogfood använder indexhandtag. Se [enumreglerna](enums.md).
@@ -347,7 +349,8 @@ Unicode-operationer ger definierad exitstatus;
 källpositioner och värden i runtimefel återstår. Backend använder lokala
 stackplatser med optimerad operandkod, konstanta uttryck och direkta
 villkorshopp. x86-64 håller vanliga arbetsvärden och stackpekaren i CPU-register.
-Full registerallokering, inlining och vektorisering återstår. Se
+Looplokaler kan hållas i register och små rena funktioner inlinas inom en budget.
+Full registerallokering och vektorisering återstår. Se
 [maskinkodsoptimeringen](optimization.md).
 [Byggmätningarna](../benchmarks/README.md) avser ett genererat stresskorpus;
 de bevisar inte hela 100k-rader/s-kontraktet eller C-paritet.

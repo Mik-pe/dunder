@@ -84,6 +84,10 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
 }
 
 fn publish_file(path: &Path, image: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic(path, image, mode, true)
+}
+
+fn write_atomic(path: &Path, image: &[u8], mode: u32, durable: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -98,7 +102,9 @@ fn publish_file(path: &Path, image: &[u8], mode: u32) -> io::Result<()> {
     let result = (|| {
         f.write_all(image)?;
         f.set_permissions(fs::Permissions::from_mode(mode))?;
-        f.sync_all()?;
+        if durable {
+            f.sync_all()?;
+        }
         fs::rename(&temp, path)
     })();
     if result.is_err() {
@@ -557,7 +563,12 @@ fn run() -> Result<i32, String> {
         guard_sources(&output, &checked.sources)?;
         &output
     };
-    publish(executable, &image).map_err(|e| format!("{}: {e}", executable.display()))?;
+    if target == Target::Wasm32 {
+        publish_file(executable, &image, 0o644)
+    } else {
+        publish(executable, &image)
+    }
+    .map_err(|e| format!("{}: {e}", executable.display()))?;
     if let Some(bundle) = &bundle {
         publish_file(&bundle.info_path, bundle.info.as_bytes(), 0o644)
             .map_err(|e| format!("{}: {e}", bundle.info_path.display()))?;

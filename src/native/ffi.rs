@@ -261,6 +261,11 @@ impl Code<'_> {
         let context_reg = 15;
         if self.has_callbacks {
             self.callback_context(context_reg);
+            self.load_piece(10, context_reg, 48, 8);
+            self.sp_addr(target_slot);
+            self.str(10, 9); // replace used callee address with suspended thread token
+            self.thread_token();
+            self.store_piece(10, context_reg, 48, 8);
             if self.target != Target::X86_64Linux {
                 for reg in 19..=24 {
                     self.store_piece(reg, context_reg, (reg - 19) as usize * 8, 8);
@@ -286,6 +291,12 @@ impl Code<'_> {
                     self.load_piece(reg, context_reg, (reg - 19) as usize * 8, 8);
                 }
             }
+        }
+        if self.has_callbacks {
+            self.callback_context(context_reg);
+            self.sp_addr(target_slot);
+            self.ldr(10, 9);
+            self.store_piece(10, context_reg, 48, 8);
         }
         self.stack_adjust(size, false);
         if let Some(storage) = storage {
@@ -331,6 +342,16 @@ impl Code<'_> {
 
     // First two private globals belong to the graphics libraries. The callback
     // context starts two words later and is valid on the originating thread.
+    fn thread_token(&mut self) {
+        // Darwin keeps its pthread address in TPIDRRO_EL0, with low bits
+        // reserved. Linux uses TPIDR_EL0 (FS:0 for the SysV lowerer).
+        if self.target == Target::Arm64Macos {
+            self.emit(0xd53bd06a);
+            self.emit(0xd343fd4a); // lsr x10,x10,#3
+        } else {
+            self.emit(0xd53bd04a);
+        }
+    }
     fn callback_context(&mut self, reg: u32) {
         self.data_slot(self.import_count + 2, reg);
     }
@@ -351,6 +372,15 @@ impl Code<'_> {
             self.prologue(0);
             if !x86 {
                 self.callback_context(15);
+                self.thread_token();
+                self.load_piece(11, 15, 48, 8);
+                self.cmp(10, 11);
+                let active = self.label();
+                self.branch(active, super::Branch::Cond(0));
+                self.imm(0, 111);
+                self.syscall(1);
+                self.emit(0xd4200000);
+                self.mark(active);
                 for reg in 19..=24 {
                     self.push(reg);
                     self.load_piece(reg, 15, (reg - 19) as usize * 8, 8);
