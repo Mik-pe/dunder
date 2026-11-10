@@ -6,10 +6,24 @@ syntax, statiska typer och program som kompileras och körs. Användaren valde
 `:=` för deklaration med härledd typ, `: i32 =` för explicit typ och
 oföränderlighet som standard.
 
-Nästa implementerade steg är filmoduler. Användaren kräver importer utan
+Filmoduler är implementerade. Användaren kräver importer utan
 filändelse: `import math` läser math.dn. Lägg till explicita exporter och
 typkontroll över modulgränser. Dunder-kod ska fortsätta kompileras med egen
 backend och bildskrivare utan GCC eller LLVM.
+
+Fortsätt genom program som faktiskt använder språket: rekursion, moduler,
+for-loopar, iteratorer, arrayer och arenaallokering. De första dogfood-programmen
+och en indexbaserad arena över en fast array finns nu i `dogfood/`.
+Nästa minnesmodell ska utvecklas vidare utan att beskriva den fasta bufferten
+som färdig heapallokering eller lån.
+
+`dunder test` ska själv vara dogfood. Användaren valde taggade tester och
+föreslog kopplade block: `@test { (20) -> 4 } fn div_by_five(x: i32) -> i32 { x / 5 }`.
+Stöd vanliga uttryck i argument och förväntade värden samt lokala variabler,
+booleska assertions och kontrollflöde i blocket. Det senaste kravet är
+struct-uttryck som input, exempelvis `(Point { x: 3, y: 4 }) -> 25`.
+Detta är implementerat tillsammans med grundläggande typade structar,
+värdekopiering, fältåtkomst och retur med sista uttrycket.
 
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera

@@ -41,7 +41,13 @@ pub struct Checked {
 }
 impl Loaded {
     pub fn check(self) -> Result<Checked, Diagnostic> {
-        match check::check_modules(self.modules, self.types) {
+        self.check_mode(check::Mode::Program)
+    }
+    pub fn check_tests(self) -> Result<Checked, Diagnostic> {
+        self.check_mode(check::Mode::Test)
+    }
+    fn check_mode(self, mode: check::Mode) -> Result<Checked, Diagnostic> {
+        match check::check_modules(self.modules, self.types, mode) {
             Ok(program) => Ok(Checked {
                 sources: self.sources,
                 program,
@@ -93,11 +99,12 @@ impl Loader {
             path: path.clone(),
             text,
         });
-        let module = syntax::parse_module(&self.sources.files[id].text, &mut self.types)
+        let module = syntax::parse_module_at(&self.sources.files[id].text, &mut self.types, id)
             .map_err(|e| e.in_file(id))?;
         self.modules.push(check::Module {
             functions: module.functions,
             imports: Vec::new(),
+            records: module.records,
         });
         for import in module.imports {
             let logical = Path::new(&import.path);

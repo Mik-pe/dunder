@@ -37,6 +37,9 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `bool` | `true` eller `false`; ingen implicit konvertering till/från heltal. |
 | `()` | Inget returvärde; implicit returtyp för funktioner utan `->`. |
 | `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
+| `[i32; 8]` | En array med åtta element; längden ingår i typen. |
+| `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
+| `range` | Ett halvöppet intervall med `i32`-gränser. |
 
 Literaler får typ från en annotering, funktionens parameter/returtyp eller
 den andra heltalsoperanden. Befintliga värden konverteras aldrig implicit
@@ -56,7 +59,8 @@ matchande typer. Division avrundar mot noll; resten har täljarens tecken.
 
 Spill i `+`, `-`, `*`, unärt minus, divisionen `MIN/-1` och avsmalnande
 konvertering avslutar processen med status 101. Division/rest med noll ger
-102. Reglerna gäller även optimerade byggen. Wraparound är ännu inte en
+102. Ogiltiga arrayindex ger 103 och en misslyckad `assert` ger 104.
+Reglerna gäller även optimerade byggen. Wraparound är ännu inte en
 språkoperation. Statuskoderna är den första felmekanismen; källkopplade
 runtime-diagnoser återstår.
 
@@ -96,6 +100,23 @@ kopiera till en `var`-lokal om de behöver ändras. De första åtta argumenten
 processens exitstatus enligt operativsystemets vanliga regler. Övriga
 funktioner med returvärde måste returnera på varje väg. Kontrollen behandlar
 loopar konservativt: lägg en retur efter loopen om funktionen returnerar ett värde.
+
+Funktionens sista uttryck utan semikolon får ge returvärdet:
+
+```dunder
+fn div_by_five(x: i32) -> i32 {
+    x / 5
+}
+
+fn maximum(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
+}
+```
+
+Det gäller även slutliga grenar i `if/else` och slutliga nästlade block.
+Ett semikolon gör uttrycket till en vanlig sats och ger inget returvärde.
+`if` är ännu inte ett allmänt uttryck som kan tilldelas en variabel.
+Ett vanligt block i en funktion utan returvärde fortsätter till nästa sats.
 
 ### Funktionsvärden och callbacks
 
@@ -151,6 +172,7 @@ aldrig en tidigare binär från samma utdataplats.
 `if` och `while` kräver `bool`, aldrig ett heltal. `else if`, `else`, `break`
 och `continue` stöds. Block ger lexikala scope. `print` är den första inbyggda
 I/O-operationen: ett `i32`, `i64` eller `bool`, följt av radbrytning.
+`assert(condition)` kräver `bool` och avslutar processen vid `false`.
 
 Vanliga enkla satser avslutas med radbrytning eller valfritt semikolon.
 `}` får avsluta den sista satsen i ett block. Parenteser tillåter flerradiga
@@ -199,7 +221,9 @@ fn main() {
 
 `fn` är privat; `pub fn` exporterar en namngiven funktion. Samma fil kan
 anropa sina privata funktioner. Andra moduler får bara använda dess publika
-funktioner via sitt importalias. Funktionsvärden och deras strukturella typer
+funktioner via sitt importalias. `struct` och `pub struct` följer samma
+synlighetsregel; typens fält följer typens synlighet i denna version.
+Funktionsvärden och deras strukturella typer
 fungerar likadant över modulgränser som inom en fil.
 
 En import kopierar inga namn till aktuell namnrymd. `math.double` fungerar;
@@ -209,8 +233,8 @@ samma fil. Lokala värden får skugga ett alias; det skuggade namnet ger då
 inte längre tillgång till modulen i det scopet. En moduls egna importer
 exporteras inte vidare. Varje fil importerar sina egna beroenden uttryckligt.
 
-Moduler har i denna version bara funktioner, inga globala värden eller
-initialiseringskod. Signaturer från hela grafen fastställs före kropparna.
+Moduler innehåller funktioner och struct-deklarationer, inga globala värden
+eller initialiseringskod. Typer och signaturer från hela grafen fastställs före kropparna.
 Cirkulära importer är därför tillåtna och kan innehålla ömsesidig rekursion.
 Den kanoniska filsökvägen identifierar en modul: flera alias, gemensamma
 beroenden och symboliska länkar laddar samma fil en gång. Filernas och
@@ -228,9 +252,151 @@ inte dynamiska bibliotek. Ingen GCC/LLVM-, assembler- eller länkprocess startas
 under Dunder-kompileringen. Bibliotekets strängbaserade `check`/`compile`
 använder en fil; filimporter kräver `modules::check_path` för en verklig rotfil.
 
+## Structar och uttryck som argument
+
+```dunder
+pub struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn length_squared(p: Point) -> i32 {
+    p.x * p.x + p.y * p.y
+}
+
+fn main() {
+    original := Point { x: 6 / 2, y: 2 + 2 }
+    var moved := original
+    moved.x = moved.x + 1
+    print(length_squared(Point { x: 3, y: 4 }))
+    print(original.x)
+}
+```
+
+Structar är nominella: olika deklarationer ger olika typer även med samma
+fält. Importerade typer behåller sin identitet över moduler och i callbacks.
+Alla fält måste anges exakt en gång; deras ordning i uttrycket är valfri.
+Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får vara
+`i32`, `i64` eller `bool`; nästlade structar och arrayfält återstår.
+
+En struct kopieras vid bindning, tilldelning och parameteröverföring.
+Ändringar i `moved` påverkar därför inte `original`. Parametrar är
+oföränderliga; kopiera till en `var` för att ändra fält. Structar kan ännu
+inte returneras från funktioner. Det undviker pekare till avslutad stacklagring
+innan en ordentlig returkonvention för aggregat finns.
+
+I `if`-/`while`-villkor och `for`-huvuden behöver ett direkt struct-uttryck
+parenteser runt sig för att skiljas från kontrollflödets block. I vanliga
+anropsargument, deklarationer och testfall behövs inga extra parenteser.
+
+## Arrayer, intervall och iteratorer
+
+```dunder
+fn sum(values: [i32; 4]) -> i32 {
+    var result := 0
+    for value in values { result = result + value }
+    result
+}
+
+fn main() {
+    var values: [i32; 4] = [0; 4]
+    for i in 0..len(values) { values[i] = i + 1 }
+    snapshot := values.iter()
+    values[0] = 99
+    for value in snapshot { print(value) }
+    print(sum([1, 2, 3, 4]))
+}
+```
+
+`[a, b, c]` bygger en array. `[value; N]` utvärderar `value` en gång och
+upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
+`i32`, `i64` eller `bool`; den härleds eller hämtas från förväntad arraytyp.
+En array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
+Nästlade arrayer, structelement och slices är ännu inte implementerade.
+
+Arrayer kopieras som värden, även till parametrar. `var` krävs för att
+tilldela ett element. Index har typen `i32`; negativa index och index vid
+eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
+längden som `i32`. Arrayer kan ännu inte returneras från funktioner.
+
+`start..end` har typen `range`, inkluderar start och utesluter slut.
+Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
+Om start är större än eller lika med slut blir det noll varv. Intervall kan
+lagras, skickas och returneras som vanliga värden.
+
+`for` stöder intervall, arrayer och `.iter()`-värden. Loopvariabeln är
+oföränderlig och lokal till loopen. `break` lämnar närmaste loop; `continue`
+går till nästa element. Arrayiteration tar en kopia vid loopstart. `.iter()`
+skapar en ägd kopia vid anropet, som kan itereras flera gånger och kopieras
+till andra bindningar eller parametrar. Ändringar i ursprungsarrayen påverkar
+inte kopian. Iteratorns typ härleds med `:=`; den saknar ännu egen
+typstavning, `.next()` och användardefinierat iteratorprotokoll.
+
+## Taggade tester
+
+```dunder
+@test {
+    (20) -> 4
+    (10 + 5) -> 2 + 1
+    var x := 0
+    for i in 0..4 { x = x + i }
+    div_by_five(x + 14) == 4
+}
+fn div_by_five(x: i32) -> i32 {
+    x / 5
+}
+```
+
+`@test { ... }` hör till den direkt följande funktionen. Varje rad
+`(arg1, arg2, ...) -> expected` anropar just den funktionen och kontrollerar
+likhet. Samtliga argument och det förväntade värdet är vanliga typkontrollerade
+uttryck. Struct-uttryck fungerar direkt:
+
+```dunder
+struct Point { x: i32, y: i32 }
+
+@test {
+    (Point { x: 3, y: 4 }) -> 25
+    point := Point { x: 6 / 2, y: 2 + 2 }
+    length_squared(point) == 25
+}
+fn length_squared(p: Point) -> i32 {
+    p.x * p.x + p.y * p.y
+}
+```
+
+Testblocket har eget scope och får använda vanliga deklarationer, uttryck,
+anrop, villkor och loopar. Ett fristående bool-uttryck blir en assertion;
+`assert(...)` fungerar också. Oanvända taluttryck är fel. Förväntade
+tabellresultat måste stödja likhet; structar och arrayer saknar ännu
+likhetsoperator. Kortformen anropar alltid den annoterade funktionen, även
+om en lokal bindning i testblocket skuggar dess namn.
+
+Fristående tester skrivs `@test fn descriptive_name() { ... }`. En sådan
+testfunktion ska sakna parametrar och returnera `()`. Den ingår bara i
+testbyggen; den vanliga funktionen efter ett kopplat testblock ingår i
+både testbyggen och vanliga byggen.
+
+`dunder test [file.dn]` samlar tester ur hela det explicit importerade trädet,
+en gång per kanonisk fil. Saknad `main` är tillåten och en befintlig `main`
+körs inte. Varje testfunktion eller kopplat block blir en egen nativeprocess.
+Första felaktiga assertionen avbryter det blocket; nästa test körs ändå.
+Fel redovisar testnamn, felorsak och upp till 4096 byte vardera av stdout
+och stderr. Assertionens exakta källrad och värden redovisas ännu inte.
+
+Standardtidsgränsen är fem sekunder per test, ändringsbar med
+`--timeout-ms 1000`. Runnern stoppar och väntar in en process som överskrider
+gränsen. `-o directory` väljer baskatalog för tillfälliga testbinärer;
+varje körning får en egen underkatalog som städas efteråt. Exitstatus är 0
+när alla tester passerar, annars 1. Noll hittade tester rapporteras uttryckligt.
+
+Utan fil väljer `dunder test` manifestets valfria `test_root`, annars `root`.
+`build`, `run` och `check` använder alltid `root`. Manifestet kräver `name`
+och `root`; alla tre fält är enkla citerade strängar.
+
 ## Nästa språkbeslut
 
-Poster och fältåtkomst, strängar, arrayer/slices, ägande och
-lån ska utformas genom riktiga program och feltester. Inga syntaxer för dem
-utlovas av denna version. Självhosting och den minimala frökedjan är separata
-senare projektsteg och blockerar inte användningen av källspråket här.
+Strängvärden, nästlade aggregat, aggregatreturer, slices, heapallokering,
+ägande/lån och egna iteratorer ska utvecklas genom riktiga program och
+feltester. Dogfood-arenan är tills vidare indexbaserad bump-allokering över
+en fast typad buffert. Självhosting är ett separat senare steg.

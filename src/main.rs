@@ -1,13 +1,14 @@
 use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+mod test_runner;
 use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-fn manifest() -> Result<(PathBuf, String), String> {
+fn manifest(testing: bool) -> Result<(PathBuf, String), String> {
     let mut dir = env::current_dir().map_err(|e| e.to_string())?;
     loop {
         let path = dir.join("dunder.toml");
@@ -15,6 +16,7 @@ fn manifest() -> Result<(PathBuf, String), String> {
             let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let mut name = None;
             let mut root = None;
+            let mut test_root = None;
             for (i, line) in text.lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -39,6 +41,7 @@ fn manifest() -> Result<(PathBuf, String), String> {
                 match key.trim() {
                     "name" if name.is_none() => name = Some(value),
                     "root" if root.is_none() => root = Some(value),
+                    "test_root" if test_root.is_none() => test_root = Some(value),
                     _ => {
                         return Err(format!(
                             "{}:{}: unknown or duplicate key",
@@ -56,7 +59,13 @@ fn manifest() -> Result<(PathBuf, String), String> {
             {
                 return Err("manifest name must contain only letters, digits, '_' or '-'".into());
             }
-            return Ok((dir.join(root.ok_or("manifest requires root")?), name));
+            let root = root.ok_or("manifest requires root")?;
+            let selected = if testing {
+                test_root.unwrap_or(root)
+            } else {
+                root
+            };
+            return Ok((dir.join(selected), name));
         }
         if !dir.pop() {
             return Err(
@@ -93,18 +102,19 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
 fn run() -> Result<i32, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.dn] [-o output] [--timings]\n  dunder run [file.dn] [-o output] [--timings]\n  dunder check [file.dn]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.dn] [-o output] [--timings]\n  dunder run [file.dn] [-o output] [--timings]\n  dunder check [file.dn]\n  dunder test [file.dn] [-o directory] [--timeout-ms 5000]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
         return Ok(0);
     }
     let command = &args[0];
-    if !matches!(command.as_str(), "build" | "check" | "run") {
+    if !matches!(command.as_str(), "build" | "check" | "run" | "test") {
         return Err(format!(
-            "unknown command '{command}'; use build, run or check"
+            "unknown command '{command}'; use build, run, check or test"
         ));
     }
     let mut source_path = None;
     let mut output = None;
     let mut timings = false;
+    let mut timeout = 5000;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -113,6 +123,17 @@ fn run() -> Result<i32, String> {
                 output = Some(PathBuf::from(args.get(i).ok_or("-o requires a path")?));
             }
             "--timings" => timings = true,
+            "--timeout-ms" if command == "test" => {
+                i += 1;
+                timeout = args
+                    .get(i)
+                    .ok_or("--timeout-ms requires milliseconds")?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid --timeout-ms value")?;
+                if timeout == 0 {
+                    return Err("--timeout-ms must be positive".into());
+                }
+            }
             arg if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
             _ if source_path.is_none() => source_path = Some(PathBuf::from(&args[i])),
             _ => return Err("expected a single source file".into()),
@@ -128,13 +149,31 @@ fn run() -> Result<i32, String> {
             .into_owned();
         (p, n)
     } else {
-        manifest()?
+        manifest(command == "test")?
     };
     let loaded = dunder::modules::load(&source_path).map_err(|e| e.render())?;
     let module_count = loaded.sources.files.len();
     let load_time = start.elapsed();
-    let checked = loaded.check().map_err(|e| e.render())?;
+    let checked = if command == "test" {
+        loaded.check_tests()
+    } else {
+        loaded.check()
+    }
+    .map_err(|e| e.render())?;
     let check_time = start.elapsed() - load_time;
+    if command == "test" {
+        let output = output.unwrap_or_else(|| PathBuf::from("build/arm64-macos/tests").join(name));
+        let result = test_runner::run(&checked, &output, Duration::from_millis(timeout))?;
+        if timings {
+            eprintln!(
+                "modules={module_count} load+parse={:.3}ms check={:.3}ms test-total={:.3}ms",
+                load_time.as_secs_f64() * 1000.,
+                check_time.as_secs_f64() * 1000.,
+                start.elapsed().as_secs_f64() * 1000.
+            );
+        }
+        return Ok(result);
+    }
     if command == "check" {
         println!("checked {} ({module_count} modules)", source_path.display());
         return Ok(0);

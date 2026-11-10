@@ -7,6 +7,11 @@ pub enum Type {
     Bool,
     Unit,
     Function(usize),
+    Array(usize),
+    Iterator(usize),
+    Range,
+    Named(usize),
+    Record(usize),
 }
 impl Type {
     pub fn integer(self) -> bool {
@@ -19,6 +24,11 @@ impl Type {
             Self::Bool => "bool",
             Self::Unit => "()",
             Self::Function(_) => "fn",
+            Self::Array(_) => "array",
+            Self::Iterator(_) => "iterator",
+            Self::Range => "range",
+            Self::Named(_) => "type",
+            Self::Record(_) => "struct",
         }
     }
 }
@@ -32,8 +42,125 @@ pub struct FunctionType {
 #[derive(Default, Debug)]
 pub struct Types {
     functions: Vec<FunctionType>,
+    arrays: Vec<ArrayType>,
+    names: Vec<NamedType>,
+    records: Vec<RecordType>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedType {
+    pub module: usize,
+    pub name: String,
+}
+#[derive(Clone, Debug)]
+pub struct RecordField {
+    pub name: String,
+    pub ty: Type,
+    pub offset: usize,
+}
+#[derive(Clone, Debug)]
+pub struct RecordType {
+    pub name: String,
+    pub module: usize,
+    pub fields: Vec<RecordField>,
+    pub bytes: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayType {
+    pub elem: Type,
+    pub len: usize,
+}
+impl ArrayType {
+    pub fn elem_size(self) -> usize {
+        match self.elem {
+            Type::Bool => 1,
+            Type::I32 => 4,
+            _ => 8,
+        }
+    }
+    pub fn bytes(self) -> usize {
+        self.elem_size() * self.len
+    }
 }
 impl Types {
+    pub fn named(&mut self, module: usize, name: String) -> Type {
+        let item = NamedType { module, name };
+        let index = self
+            .names
+            .iter()
+            .position(|n| *n == item)
+            .unwrap_or_else(|| {
+                self.names.push(item);
+                self.names.len() - 1
+            });
+        Type::Named(index)
+    }
+    pub fn named_ref(&self, ty: Type) -> Option<&NamedType> {
+        if let Type::Named(i) = ty {
+            self.names.get(i)
+        } else {
+            None
+        }
+    }
+    pub fn declare_record(&mut self, module: usize, name: String) -> Type {
+        let index = self.records.len();
+        self.records.push(RecordType {
+            name,
+            module,
+            fields: Vec::new(),
+            bytes: 1,
+        });
+        Type::Record(index)
+    }
+    pub fn record(&self, ty: Type) -> Option<&RecordType> {
+        if let Type::Record(i) = ty {
+            self.records.get(i)
+        } else {
+            None
+        }
+    }
+    pub fn define_record(&mut self, ty: Type, fields: Vec<RecordField>, bytes: usize) {
+        if let Type::Record(i) = ty {
+            self.records[i].fields = fields;
+            self.records[i].bytes = bytes;
+        }
+    }
+    pub fn storage_bytes(&self, ty: Type) -> Option<usize> {
+        self.array(ty)
+            .map(|a| a.bytes())
+            .or_else(|| self.record(ty).map(|r| r.bytes))
+    }
+    pub fn array_type(&mut self, elem: Type, len: usize, span: Span) -> Result<Type, Error> {
+        if !matches!(elem, Type::I32 | Type::I64 | Type::Bool) {
+            return Err(Error::new(
+                "E0220",
+                span,
+                "array elements must be i32, i64 or bool in this version",
+            ));
+        }
+        let array = ArrayType { elem, len };
+        if len > 65536 || array.bytes() > 65536 {
+            return Err(Error::new(
+                "E0220",
+                span,
+                "a fixed array may occupy at most 65536 bytes in this version",
+            ));
+        }
+        let index = self
+            .arrays
+            .iter()
+            .position(|a| *a == array)
+            .unwrap_or_else(|| {
+                self.arrays.push(array);
+                self.arrays.len() - 1
+            });
+        Ok(Type::Array(index))
+    }
+    pub fn array(&self, ty: Type) -> Option<ArrayType> {
+        match ty {
+            Type::Array(i) | Type::Iterator(i) => self.arrays.get(i).copied(),
+            _ => None,
+        }
+    }
     pub fn function(&mut self, params: Vec<Type>, ret: Type) -> Type {
         let signature = FunctionType { params, ret };
         let index = self
@@ -54,6 +181,20 @@ impl Types {
         }
     }
     pub fn name(&self, ty: Type) -> String {
+        if let Some(n) = self.named_ref(ty) {
+            return n.name.clone();
+        }
+        if let Some(r) = self.record(ty) {
+            return r.name.clone();
+        }
+        if let Some(a) = self.array(ty) {
+            let name = format!("[{}; {}]", self.name(a.elem), a.len);
+            return if matches!(ty, Type::Iterator(_)) {
+                format!("iter<{name}>")
+            } else {
+                name
+            };
+        }
         match self.signature(ty) {
             Some(f) => format!(
                 "fn({}) -> {}",
@@ -73,11 +214,26 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub types: Types,
     pub imports: Vec<Import>,
+    pub records: Vec<Record>,
 }
 
 pub struct Module {
     pub functions: Vec<Function>,
     pub imports: Vec<Import>,
+    pub records: Vec<Record>,
+}
+#[derive(Debug)]
+pub struct Record {
+    pub name: String,
+    pub public: bool,
+    pub fields: Vec<Field>,
+    pub span: Span,
+}
+#[derive(Debug)]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
 }
 #[derive(Debug)]
 pub struct Import {
@@ -93,6 +249,8 @@ enum Token {
     String(String),
     Left,
     Right,
+    Square,
+    EndSquare,
     Open,
     Close,
     Colon,
@@ -100,7 +258,9 @@ enum Token {
     Equal,
     Comma,
     Dot,
+    Range,
     Semi,
+    At,
     Newline,
     Arrow,
     Op(&'static str),
@@ -160,7 +320,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                                     start,
                                     end: chars.get(i).map_or(source.len(), |x| x.0),
                                 },
-                                "only \\\\ and \\\" escapes are allowed in an import path",
+                                "only \\\\ and \\\" escapes are allowed in a quoted string",
                             ))
                         }
                     }
@@ -174,7 +334,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                 return Err(Error::new(
                     "E0004",
                     Span { start, end },
-                    "unterminated import path",
+                    "unterminated quoted string",
                 ));
             }
             out.push(Lexeme {
@@ -261,6 +421,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             ('>', Some('=')) => Some(Token::Op(">=")),
             ('&', Some('&')) => Some(Token::Op("&&")),
             ('|', Some('|')) => Some(Token::Op("||")),
+            ('.', Some('.')) => Some(Token::Range),
             _ => None,
         };
         let (token, len) = if let Some(t) = pair {
@@ -276,6 +437,14 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                         parens = parens.saturating_sub(1);
                         Token::Right
                     }
+                    '[' => {
+                        parens += 1;
+                        Token::Square
+                    }
+                    ']' => {
+                        parens = parens.saturating_sub(1);
+                        Token::EndSquare
+                    }
                     '{' => Token::Open,
                     '}' => Token::Close,
                     ':' => Token::Colon,
@@ -283,6 +452,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                     ',' => Token::Comma,
                     '.' => Token::Dot,
                     ';' => Token::Semi,
+                    '@' => Token::At,
                     '+' => Token::Op("+"),
                     '-' => Token::Op("-"),
                     '*' => Token::Op("*"),
@@ -325,6 +495,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
 #[derive(Debug)]
 pub struct Function {
     pub public: bool,
+    pub test: Option<String>,
     pub name: String,
     pub params: Vec<Param>,
     pub ret: Type,
@@ -351,10 +522,14 @@ pub enum StmtKind {
         init: Expr,
     },
     Assign(String, Expr),
+    AssignIndex(Expr, Expr),
     Return(Option<Expr>),
     Expr(Expr),
+    Tail(Expr),
+    Case(Vec<Expr>, Expr),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
+    For(String, Expr, Vec<Stmt>),
     Block(Vec<Stmt>),
     Break,
     Continue,
@@ -369,10 +544,16 @@ pub enum ExprKind {
     Number(i128),
     Bool(bool),
     Name(String),
+    TestTarget(String),
     Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>),
     Unary(&'static str, Box<Expr>),
     Binary(&'static str, Box<Expr>, Box<Expr>),
+    Array(Vec<Expr>),
+    Repeat(Box<Expr>, usize),
+    Index(Box<Expr>, Box<Expr>),
+    Range(Box<Expr>, Box<Expr>),
+    Record(Box<Expr>, Vec<(String, Expr, Span)>),
 }
 
 struct Parser<'a> {
@@ -380,6 +561,9 @@ struct Parser<'a> {
     pos: usize,
     depth: usize,
     types: &'a mut Types,
+    cases: bool,
+    module: usize,
+    record_literals: bool,
 }
 impl Parser<'_> {
     fn peek(&self) -> &Token {
@@ -457,6 +641,14 @@ impl Parser<'_> {
         result
     }
     fn type_inner(&mut self) -> Result<Type, Error> {
+        if self.accept(Token::Square) {
+            let span = self.span();
+            let elem = self.ty()?;
+            self.expect(Token::Semi, "';' before array length")?;
+            let len = self.array_len()?;
+            self.expect(Token::EndSquare, "']'")?;
+            return self.types.array_type(elem, len, span);
+        }
         if self.is_word("fn") {
             self.take();
             self.expect(Token::Left, "'(' after fn")?;
@@ -488,15 +680,65 @@ impl Parser<'_> {
             self.expect(Token::Right, "')'")?;
             return Ok(Type::Unit);
         }
-        let (n, span) = self.name()?;
+        let (n, _) = self.name()?;
         match n.as_str() {
             "i32" => Ok(Type::I32),
             "i64" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
+            "range" => Ok(Type::Range),
+            _ => {
+                let mut name = n;
+                while self.accept(Token::Dot) {
+                    name.push('.');
+                    name.push_str(&self.name()?.0);
+                }
+                Ok(self.types.named(self.module, name))
+            }
+        }
+    }
+    fn record_decl(&mut self, public: bool) -> Result<Record, Error> {
+        let span = self.take().span;
+        let (name, _) = self.name()?;
+        self.newlines();
+        self.expect(Token::Open, "'{'")?;
+        let mut fields = Vec::new();
+        self.newlines();
+        while *self.peek() != Token::Close {
+            let (name, span) = self.name()?;
+            self.expect(Token::Colon, "':'")?;
+            let ty = self.ty()?;
+            fields.push(Field { name, ty, span });
+            if self.accept(Token::Comma) || self.accept(Token::Newline) {
+                self.newlines();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::Close, "'}'")?;
+        Ok(Record {
+            name,
+            public,
+            fields,
+            span,
+        })
+    }
+    fn header_expr(&mut self) -> Result<Expr, Error> {
+        let saved = self.record_literals;
+        self.record_literals = false;
+        let result = self.expr(0);
+        self.record_literals = saved;
+        result
+    }
+    fn array_len(&mut self) -> Result<usize, Error> {
+        let t = self.take();
+        match t.token {
+            Token::Number(n) => {
+                usize::try_from(n).map_err(|_| Error::new("E0220", t.span, "invalid array length"))
+            }
             _ => Err(Error::new(
-                "E0103",
-                span,
-                format!("unknown type '{n}'; available types: i32, i64, bool"),
+                "E0220",
+                t.span,
+                "array length must be a nonnegative integer literal",
             )),
         }
     }
@@ -578,20 +820,69 @@ impl Parser<'_> {
         } else {
             Type::Unit
         };
+        let mut body = self.block()?;
+        if ret != Type::Unit {
+            implicit_return(&mut body);
+        }
         Ok(Function {
             public,
+            test: None,
             name,
             params,
             ret,
-            body: self.block()?,
+            body,
             span,
         })
     }
+    fn case_start(&self) -> bool {
+        if *self.peek() != Token::Left {
+            return false;
+        }
+        let mut depth = 0;
+        for i in self.pos..self.tokens.len() {
+            match self.tokens[i].token {
+                Token::Left => depth += 1,
+                Token::Right => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.tokens[i + 1..]
+                            .iter()
+                            .find(|t| t.token != Token::Newline)
+                            .is_some_and(|t| t.token == Token::Arrow);
+                    }
+                }
+                Token::Eof => break,
+                _ => {}
+            }
+        }
+        false
+    }
+    fn tail_position(&self) -> bool {
+        self.tokens[self.pos..]
+            .iter()
+            .find(|t| t.token != Token::Newline)
+            .is_some_and(|t| t.token == Token::Close)
+    }
     fn stmt(&mut self) -> Result<Stmt, Error> {
         let span = self.span();
-        let kind = if self.is_word("if") {
+        let kind = if self.cases && self.case_start() {
             self.take();
-            let condition = self.expr(0)?;
+            let mut args = Vec::new();
+            while *self.peek() != Token::Right {
+                args.push(self.expr(0)?);
+                if !self.accept(Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::Right, "')'")?;
+            self.newlines();
+            self.expect(Token::Arrow, "'->'")?;
+            let expected = self.expr(0)?;
+            self.end_stmt()?;
+            StmtKind::Case(args, expected)
+        } else if self.is_word("if") {
+            self.take();
+            let condition = self.header_expr()?;
             let yes = self.block()?;
             self.newlines();
             let no = if self.is_word("else") {
@@ -605,9 +896,22 @@ impl Parser<'_> {
                 Vec::new()
             };
             StmtKind::If(condition, yes, no)
+        } else if self.is_word("for") {
+            self.take();
+            let (name, _) = self.name()?;
+            if !self.is_word("in") {
+                return Err(Error::new(
+                    "E0100",
+                    self.span(),
+                    "expected 'in' after loop variable",
+                ));
+            }
+            self.take();
+            let values = self.header_expr()?;
+            StmtKind::For(name, values, self.block()?)
         } else if self.is_word("while") {
             self.take();
-            let condition = self.expr(0)?;
+            let condition = self.header_expr()?;
             StmtKind::While(condition, self.block()?)
         } else if *self.peek() == Token::Open {
             StmtKind::Block(self.block()?)
@@ -675,8 +979,20 @@ impl Parser<'_> {
                 StmtKind::Assign(name, value)
             } else {
                 let value = self.expr(0)?;
-                self.end_stmt()?;
-                StmtKind::Expr(value)
+                if self.accept(Token::Equal) {
+                    self.newlines();
+                    let rhs = self.expr(0)?;
+                    self.end_stmt()?;
+                    StmtKind::AssignIndex(value, rhs)
+                } else {
+                    let tail = self.tail_position();
+                    self.end_stmt()?;
+                    if tail {
+                        StmtKind::Tail(value)
+                    } else {
+                        StmtKind::Expr(value)
+                    }
+                }
             }
         };
         Ok(Stmt { kind, span })
@@ -711,13 +1027,81 @@ impl Parser<'_> {
                 span,
             },
             Token::Left => {
+                let saved = self.record_literals;
+                self.record_literals = true;
                 let e = self.expr(0)?;
                 self.expect(Token::Right, "')'")?;
+                self.record_literals = saved;
                 e
+            }
+            Token::Square => {
+                let kind = if self.accept(Token::EndSquare) {
+                    ExprKind::Array(Vec::new())
+                } else {
+                    let first = self.expr(0)?;
+                    if self.accept(Token::Semi) {
+                        let len = self.array_len()?;
+                        self.expect(Token::EndSquare, "']'")?;
+                        ExprKind::Repeat(Box::new(first), len)
+                    } else {
+                        let mut values = vec![first];
+                        while self.accept(Token::Comma) {
+                            if *self.peek() == Token::EndSquare {
+                                break;
+                            }
+                            values.push(self.expr(0)?);
+                        }
+                        self.expect(Token::EndSquare, "']'")?;
+                        ExprKind::Array(values)
+                    }
+                };
+                Expr { kind, span }
             }
             _ => return Err(Error::new("E0106", span, "expected an expression")),
         };
         loop {
+            if self.record_literals
+                && *self.peek() == Token::Open
+                && matches!(left.kind, ExprKind::Name(_) | ExprKind::Member(_, _))
+            {
+                self.take();
+                self.newlines();
+                let mut fields = Vec::new();
+                while *self.peek() != Token::Close {
+                    let (name, span) = self.name()?;
+                    self.expect(Token::Colon, "':' after field name")?;
+                    let value = self.expr(0)?;
+                    fields.push((name, value, span));
+                    self.newlines();
+                    if !self.accept(Token::Comma) {
+                        break;
+                    }
+                    self.newlines();
+                }
+                let end = self.span().end;
+                self.expect(Token::Close, "'}'")?;
+                left = Expr {
+                    span: Span {
+                        start: left.span.start,
+                        end,
+                    },
+                    kind: ExprKind::Record(Box::new(left), fields),
+                };
+                continue;
+            }
+            if self.accept(Token::Square) {
+                let index = self.expr(0)?;
+                let end = self.span().end;
+                self.expect(Token::EndSquare, "']'")?;
+                left = Expr {
+                    span: Span {
+                        start: left.span.start,
+                        end,
+                    },
+                    kind: ExprKind::Index(Box::new(left), Box::new(index)),
+                };
+                continue;
+            }
             if self.accept(Token::Dot) {
                 let (member, span) = self.name()?;
                 left = Expr {
@@ -730,6 +1114,8 @@ impl Parser<'_> {
                 continue;
             }
             if self.accept(Token::Left) {
+                let saved = self.record_literals;
+                self.record_literals = true;
                 let mut args = Vec::new();
                 while *self.peek() != Token::Right {
                     args.push(self.expr(0)?);
@@ -739,12 +1125,25 @@ impl Parser<'_> {
                 }
                 let end = self.span().end;
                 self.expect(Token::Right, "')'")?;
+                self.record_literals = saved;
                 left = Expr {
                     span: Span {
                         start: left.span.start,
                         end,
                     },
                     kind: ExprKind::Call(Box::new(left), args),
+                };
+                continue;
+            }
+            if *self.peek() == Token::Range && min == 0 {
+                self.take();
+                let end = self.expr(1)?;
+                left = Expr {
+                    span: Span {
+                        start: left.span.start,
+                        end: end.span.end,
+                    },
+                    kind: ExprKind::Range(Box::new(left), Box::new(end)),
                 };
                 continue;
             }
@@ -783,31 +1182,161 @@ pub fn parse(source: &str) -> Result<Program, Error> {
     Ok(Program {
         functions: module.functions,
         imports: module.imports,
+        records: module.records,
         types,
     })
 }
 
 pub fn parse_module(source: &str, types: &mut Types) -> Result<Module, Error> {
+    parse_module_at(source, types, 0)
+}
+pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result<Module, Error> {
     let mut parser = Parser {
         tokens: lex(source)?,
         pos: 0,
         depth: 0,
         types,
+        cases: false,
+        module,
+        record_literals: true,
     };
     let mut functions = Vec::new();
     let mut imports = Vec::new();
+    let mut records = Vec::new();
     parser.separators();
     while *parser.peek() != Token::Eof {
         if parser.is_word("import") {
             imports.push(parser.import()?);
         } else {
+            let tagged = parser.accept(Token::At);
+            if tagged {
+                let (tag, span) = parser.name()?;
+                if tag != "test" {
+                    return Err(Error::new(
+                        "E0108",
+                        span,
+                        format!("unknown tag '@{tag}'; available tag: @test"),
+                    ));
+                }
+                parser.newlines();
+            }
+            let mut cases = if tagged && *parser.peek() == Token::Open {
+                parser.cases = true;
+                let body = parser.block()?;
+                parser.cases = false;
+                parser.newlines();
+                Some(body)
+            } else {
+                None
+            };
             let public = parser.is_word("pub");
             if public {
                 parser.take();
             }
-            functions.push(parser.function(public)?);
+            if parser.is_word("struct") {
+                if tagged {
+                    return Err(Error::new(
+                        "E0108",
+                        parser.span(),
+                        "@test applies to a function",
+                    ));
+                }
+                records.push(parser.record_decl(public)?);
+                parser.separators();
+                continue;
+            }
+            let mut function = parser.function(public)?;
+            if tagged && cases.is_none() {
+                function.test = Some(function.name.clone());
+            }
+            if let Some(body) = &mut cases {
+                lower_cases(body, &function.name);
+                let tests = Function {
+                    public: false,
+                    test: Some(function.name.clone()),
+                    name: format!("$cases{}", functions.len()),
+                    params: Vec::new(),
+                    ret: Type::Unit,
+                    body: std::mem::take(body),
+                    span: function.span,
+                };
+                functions.push(function);
+                functions.push(tests);
+            } else {
+                functions.push(function);
+            }
         }
         parser.separators();
     }
-    Ok(Module { functions, imports })
+    Ok(Module {
+        functions,
+        imports,
+        records,
+    })
+}
+
+fn implicit_return(body: &mut [Stmt]) {
+    if let Some(last) = body.last_mut() {
+        let kind = std::mem::replace(&mut last.kind, StmtKind::Block(Vec::new()));
+        last.kind = match kind {
+            StmtKind::Tail(value) => StmtKind::Return(Some(value)),
+            StmtKind::If(c, mut a, mut b) => {
+                implicit_return(&mut a);
+                implicit_return(&mut b);
+                StmtKind::If(c, a, b)
+            }
+            StmtKind::Block(mut b) => {
+                implicit_return(&mut b);
+                StmtKind::Block(b)
+            }
+            other => other,
+        };
+    }
+}
+
+fn lower_cases(body: &mut [Stmt], target: &str) {
+    for stmt in body {
+        match &mut stmt.kind {
+            StmtKind::If(_, a, b) => {
+                lower_cases(a, target);
+                lower_cases(b, target);
+            }
+            StmtKind::While(_, b) | StmtKind::For(_, _, b) | StmtKind::Block(b) => {
+                lower_cases(b, target)
+            }
+            StmtKind::Case(_, _) => {
+                let StmtKind::Case(args, expected) =
+                    std::mem::replace(&mut stmt.kind, StmtKind::Block(Vec::new()))
+                else {
+                    unreachable!()
+                };
+                let span = stmt.span;
+                let actual = Expr {
+                    span,
+                    kind: ExprKind::Call(
+                        Box::new(Expr {
+                            span,
+                            kind: ExprKind::TestTarget(target.into()),
+                        }),
+                        args,
+                    ),
+                };
+                let equal = Expr {
+                    span,
+                    kind: ExprKind::Binary("==", Box::new(actual), Box::new(expected)),
+                };
+                stmt.kind = StmtKind::Expr(Expr {
+                    span,
+                    kind: ExprKind::Call(
+                        Box::new(Expr {
+                            span,
+                            kind: ExprKind::Name("assert".into()),
+                        }),
+                        vec![equal],
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
 }

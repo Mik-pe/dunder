@@ -11,7 +11,9 @@ i `/Users/mikpe/dev/dunder-language`.
   Samlade signaturer stödjer cykliska importer och ömsesidig rekursion.
   Kanoniska filsökvägar deduplicerar delade beroenden och symboliska länkar.
   Importerade funktioner är vanliga typade funktionsvärden.
-
+- Nominella `struct`/`pub struct`, typade fält, struct-uttryck med vanliga
+  uttryck som fältvärden, kvalificerade typer och konstruktorer över moduler.
+  Structar kopieras vid bindning, tilldelning och anrop; `var` medger fältändring.
 - Användarens syntax: `x := 42`, `x: i32 = 42`, oföränderlighet som standard.
   `var x := 0` väljer muterbarhet och `x = ...` tilldelar.
 - `i32`, `i64`, `bool`, explicita funktionssignaturer, lokala typinferenser,
@@ -19,9 +21,19 @@ i `/Users/mikpe/dev/dunder-language`.
 - Typade funktionsvärden, callbacks och funktioner som returvärden med
   strukturell signaturkontroll. Indirekta anrop, inklusive `choose()(42)`,
   och fler än åtta parametrar med typade stackargument.
+- Sista uttrycket utan semikolon ger funktionens returvärde, även i slutliga
+  `if/else`-grenar. Explicit `return` fungerar parallellt.
+- Fasta typade arrayer, literaler och repetition, indexläsning/-skrivning,
+  `len`, värdekopiering, gränskontroller, `for` över halvöppna `i32`-intervall,
+  arrayer och ägda arrayiteratorer. `.iter()` tar en återanvändbar kopia.
+- `@test fn` och kopplade `@test { (args) -> expected }`-block. Argument och
+  förväntade värden är fullständiga uttryck, inklusive structargument.
+  Bool-uttryck i testblock blir assertions; vanliga satser och loopar stöds.
+  Testkortformen pekar alltid på den annoterade funktionen även vid lokal skuggning.
 - Typfel med fil/rad/kolumn och felkod. Kontrollerad heltalsaritmetik och
   konvertering, samt kortslutande booleska uttryck.
-- `dunder check`, `dunder build`, `dunder run`, enkelt dunder.toml, atomisk
+- `dunder check`, `dunder build`, `dunder run`, `dunder test`, enkelt dunder.toml
+  med valfri `test_root`, atomisk
   publicering av utdata och `--timings`. `main` ger exitkod 0 eller en explicit
   i32-retur; `run` för vidare exitkoden och kör aldrig gammal utdata vid typfel.
 - Direkt kodgenerering från typade funktioner till ARM64. Egen Mach-O-skrivare,
@@ -30,8 +42,8 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Verifiering
 
-`cargo test`: 21 testfunktioner passerar (en hashreferens, elva språk-
-och nio modultester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
+`cargo test`: 37 testfunktioner passerar (en hashreferens, sexton dogfood-,
+elva språk- och nio modultester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
 och `cargo build --release` är genomförda.
 
 Releasekompilatorn har dessutom byggt hello och fibonacci med `PATH` satt
@@ -39,10 +51,27 @@ till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
 förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.dn
 -o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
 
+`dunder test` kör nu tolv Dunder-testgrupper i dogfood-trädet: rekursion,
+moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
+arena, tabellfall och structargument. Varje grupp kompileras till en riktig
+nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
+ett misslyckat eller fastnat test hindrar inte nästa grupp. Tester kräver
+ingen main, kör inte befintlig main och dedupliceras över importer.
+Manifestets `test_root` och den vanliga programroten provas separat.
+
+Structtesten kontrollerar typidentitet över moduler, felaktiga/saknade/dubbla
+fält, oföränderlighet, kopior, fältens evalueringsordning, tomma structar,
+blandad bool/i64/i32-layout och structargument på stacken. Arraytesten
+kontrollerar kopior och iterationskopior, blandade elementtyper, fler än
+åtta parametrar, gränsfel och intervall vid i32-gränserna. Kortformen provas
+mot felaktiga resultat och lokal skuggning så att testfallen verkligen kan fallera.
+
 `cargo test` kör typkontroll och negativa felprov samt verkliga ARM64-binärer
-på denna Mac. Varje native-test verifierar signaturen oberoende med
-`codesign --verify`. Programmen körs med tom processmiljö, utan källfil och
-utan kompilator i sin körväg.
+på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
+`codesign --verify` och körs med tom processmiljö, utan källfil och utan
+kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
+verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
+och structprogrammet.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
 Modulprogrammet i examples/modules/main.dn laddar tre filer och skriver
@@ -71,12 +100,17 @@ binär och utdata får inte skriva över källan.
 ## Begränsningar och nästa steg
 
 Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
-Inga poster, strängvärden, arrayer/slices eller ägande/lån ännu.
-Moduler exporterar funktioner; typer, globala konstanter, paketregister och
-dynamiska bibliotek ingår inte i första modulversionen. Ingen inkrementell cache.
+Structfält och arrayelement är än så länge begränsade till i32/i64/bool.
+Arrayer får vara högst 64 KiB. Aggregatreturer, nästlade aggregat,
+strängvärden, slices, heapallokering och ägande/lån återstår.
+Dogfood-arenan är bump-allokering över en fast stackbuffert med index som
+handtag; den är ännu inget allmänt allokerings- eller låne-API.
+Iteratorer är inbyggda arraykopior, inte ett användardefinierat protokoll.
+Globala konstanter, paketregister och dynamiska bibliotek återstår.
+Ingen inkrementell cache.
 Anonyma funktioner och closures med infångade lokaler återstår.
-Overflow/division med noll ger definierad exitstatus;
-källpositioner i runtimefel återstår. Backend använder stackplatser och
+Overflow/division med noll, gränsfel och assertions ger definierad exitstatus;
+källpositioner och värden i runtimefel återstår. Backend använder stackplatser och
 saknar ännu optimeringar. Inga anspråk på 100k rader/s eller C-paritet.
 
 Den gamla GLM-körningen stoppades efter kvotfelet. Dess ofärdiga fröarbete

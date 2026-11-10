@@ -48,6 +48,9 @@ impl Error {
 pub fn check(source: &str) -> Result<check::Program, Error> {
     check::check(syntax::parse(source)?)
 }
+pub fn check_tests(source: &str) -> Result<check::Program, Error> {
+    check::check_mode(syntax::parse(source)?, check::Mode::Test)
+}
 
 pub fn compile(source: &str) -> Result<Vec<u8>, Error> {
     let program = check(source)?;

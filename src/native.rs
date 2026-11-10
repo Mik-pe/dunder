@@ -2,7 +2,7 @@
 //! No assembler, linker, interpreter or external signer is invoked.
 use crate::{
     check::{Expr, ExprKind, Program, Stmt},
-    syntax::Type,
+    syntax::{Type, Types},
 };
 
 type Label = usize;
@@ -14,7 +14,8 @@ enum Branch {
     Nonzero(u32),
     Address(u32),
 }
-struct Code {
+struct Code<'a> {
+    types: &'a Types,
     words: Vec<u32>,
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label, Branch)>,
@@ -25,11 +26,14 @@ struct Code {
     overflow: Label,
     divide_zero: Label,
     io_error: Label,
+    bounds: Label,
+    assertion: Label,
     loops: Vec<(Label, Label)>,
 }
-impl Code {
-    fn new(functions: usize) -> Self {
+impl<'a> Code<'a> {
+    fn new(functions: usize, types: &'a Types) -> Self {
         let mut c = Self {
+            types,
             words: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
@@ -40,6 +44,8 @@ impl Code {
             overflow: 0,
             divide_zero: 0,
             io_error: 0,
+            bounds: 0,
+            assertion: 0,
             loops: Vec::new(),
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
@@ -49,6 +55,8 @@ impl Code {
         c.overflow = c.label();
         c.divide_zero = c.label();
         c.io_error = c.label();
+        c.bounds = c.label();
+        c.assertion = c.label();
         c
     }
     fn label(&mut self) -> Label {
@@ -136,8 +144,131 @@ impl Code {
         self.cmp(0, 2);
         self.branch(self.overflow, Branch::Cond(1));
     }
+    fn typed_load(&mut self, ty: Type) {
+        self.emit(match ty {
+            Type::I32 => 0xb9800000,
+            Type::Bool => 0x39400000,
+            _ => 0xf9400000,
+        });
+    }
+    fn typed_store(&mut self, ty: Type, base: u32) {
+        self.emit(
+            (match ty {
+                Type::I32 => 0xb9000000,
+                Type::Bool => 0x39000000,
+                _ => 0xf9000000,
+            }) | base << 5,
+        );
+    }
+    fn copy_value(&mut self, storage: usize, ty: Type) {
+        let bytes = self.types.storage_bytes(ty).unwrap();
+        self.mov(10, 0);
+        self.local_addr(storage);
+        if bytes > 0 {
+            self.imm(11, bytes as u64);
+            let again = self.label();
+            self.mark(again);
+            self.emit(0x3940014c);
+            self.emit(0x3900012c);
+            self.emit(0x9100054a);
+            self.emit(0x91000529);
+            self.emit(0xf100056b);
+            self.branch(again, Branch::Cond(1));
+        }
+        self.local_addr(storage);
+        self.mov(0, 9);
+    }
+    fn index_addr(&mut self, base: &Expr, index: &Expr) {
+        let a = self.types.array(base.ty).unwrap();
+        self.expr(base);
+        self.push(0);
+        self.expr(index);
+        self.pop(1);
+        self.imm(2, a.len as u64);
+        self.cmp(0, 2);
+        self.branch(self.bounds, Branch::Cond(2));
+        self.imm(2, a.elem_size() as u64);
+        self.emit(0x9b027c00);
+        self.emit(0x8b000020);
+    }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::Record(fields, storage) => {
+                self.local_addr(*storage);
+                self.imm(11, self.types.storage_bytes(e.ty).unwrap() as u64);
+                let zero = self.label();
+                self.mark(zero);
+                self.emit(0x3900013f);
+                self.emit(0x91000529);
+                self.emit(0xf100056b);
+                self.branch(zero, Branch::Cond(1));
+                for (offset, value) in fields {
+                    self.expr(value);
+                    self.local_addr(*storage);
+                    self.imm(11, *offset as u64);
+                    self.emit(0x8b0b0129);
+                    self.typed_store(value.ty, 9);
+                }
+                self.local_addr(*storage);
+                self.mov(0, 9);
+            }
+            ExprKind::Field(base, offset) => {
+                self.expr(base);
+                self.imm(2, *offset as u64);
+                self.emit(0x8b020000);
+                self.typed_load(e.ty);
+            }
+            ExprKind::Assert(condition) => {
+                self.expr(condition);
+                self.branch(self.assertion, Branch::Zero(0));
+                self.imm(0, 0);
+            }
+            ExprKind::Range(a, b) => {
+                self.expr(a);
+                self.push(0);
+                self.expr(b);
+                self.pop(1);
+                self.emit(0xd3607c00);
+                self.emit(0x2a0103e1);
+                self.emit(0xaa010000);
+            }
+            ExprKind::Iterator(base) => self.expr(base),
+            ExprKind::Len(base, len) => {
+                self.expr(base);
+                self.imm(0, *len as u64);
+            }
+            ExprKind::Array(values, storage) => {
+                let a = self.types.array(e.ty).unwrap();
+                for (i, value) in values.iter().enumerate() {
+                    self.expr(value);
+                    self.local_addr(*storage);
+                    self.imm(11, (i * a.elem_size()) as u64);
+                    self.emit(0x8b0b0129);
+                    self.typed_store(a.elem, 9);
+                }
+                self.local_addr(*storage);
+                self.mov(0, 9);
+            }
+            ExprKind::Repeat(value, storage) => {
+                let a = self.types.array(e.ty).unwrap();
+                self.expr(value);
+                self.local_addr(*storage);
+                if a.len > 0 {
+                    self.imm(11, a.len as u64);
+                    let again = self.label();
+                    self.mark(again);
+                    self.typed_store(a.elem, 9);
+                    self.emit(0x91000129 | (a.elem_size() as u32) << 10);
+                    self.emit(0xf100056b);
+                    self.branch(again, Branch::Cond(1));
+                }
+                self.local_addr(*storage);
+                self.mov(0, 9);
+            }
+            ExprKind::Index(base, index) => {
+                self.index_addr(base, index);
+                self.typed_load(e.ty);
+            }
             ExprKind::Number(n) => self.imm(0, *n as u64),
             ExprKind::Bool(b) => self.imm(0, u64::from(*b)),
             ExprKind::Local(s) => self.load(*s),
@@ -315,6 +446,27 @@ impl Code {
                     self.expr(e);
                     self.store(*slot, 0);
                 }
+                Stmt::StoreAggregate(slot, storage, e) => {
+                    self.expr(e);
+                    self.copy_value(*storage, e.ty);
+                    self.store(*slot, 0);
+                }
+                Stmt::StoreIndex(base, index, value) => {
+                    self.index_addr(base, index);
+                    self.push(0);
+                    self.expr(value);
+                    self.pop(1);
+                    self.typed_store(value.ty, 1);
+                }
+                Stmt::StoreField(base, offset, value) => {
+                    self.expr(base);
+                    self.imm(2, *offset as u64);
+                    self.emit(0x8b020000);
+                    self.push(0);
+                    self.expr(value);
+                    self.pop(1);
+                    self.typed_store(value.ty, 1);
+                }
                 Stmt::Return(e) => {
                     if let Some(e) = e {
                         self.expr(e);
@@ -346,6 +498,65 @@ impl Code {
                     self.stmts(b);
                     self.branch(head, Branch::Jump);
                     self.mark(end);
+                    self.loops.pop();
+                }
+                Stmt::For {
+                    source,
+                    source_slot,
+                    cursor,
+                    end,
+                    binding,
+                    storage,
+                    body,
+                } => {
+                    self.expr(source);
+                    if let Some(storage) = storage {
+                        self.copy_value(*storage, source.ty);
+                    }
+                    self.store(*source_slot, 0);
+                    if source.ty == Type::Range {
+                        self.emit(0x93407c00);
+                        self.store(*cursor, 0);
+                        self.load(*source_slot);
+                        self.emit(0x9360fc00);
+                        self.store(*end, 0);
+                    } else {
+                        self.imm(0, 0);
+                        self.store(*cursor, 0);
+                        self.imm(0, self.types.array(source.ty).unwrap().len as u64);
+                        self.store(*end, 0);
+                    }
+                    let head = self.label();
+                    let next = self.label();
+                    let done = self.label();
+                    self.loops.push((next, done));
+                    self.mark(head);
+                    self.load(*cursor);
+                    self.push(0);
+                    self.load(*end);
+                    self.pop(1);
+                    self.cmp(1, 0);
+                    self.branch(done, Branch::Cond(10));
+                    if let Some(a) = self.types.array(source.ty) {
+                        self.load(*source_slot);
+                        self.push(0);
+                        self.load(*cursor);
+                        self.pop(1);
+                        self.imm(2, a.elem_size() as u64);
+                        self.emit(0x9b027c00);
+                        self.emit(0x8b000020);
+                        self.typed_load(a.elem);
+                    } else {
+                        self.load(*cursor);
+                    }
+                    self.store(*binding, 0);
+                    self.stmts(body);
+                    self.mark(next);
+                    self.load(*cursor);
+                    self.emit(0x91000400);
+                    self.store(*cursor, 0);
+                    self.branch(head, Branch::Jump);
+                    self.mark(done);
                     self.loops.pop();
                 }
                 Stmt::Break => self.branch(self.loops.last().unwrap().1, Branch::Jump),
@@ -422,6 +633,8 @@ impl Code {
             (self.overflow, 101),
             (self.divide_zero, 102),
             (self.io_error, 74),
+            (self.bounds, 103),
+            (self.assertion, 104),
         ] {
             self.mark(label);
             self.imm(0, status);
@@ -462,8 +675,21 @@ impl Code {
 }
 
 pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
-    let mut code = Code::new(program.functions.len());
-    code.branch(code.functions[program.main], Branch::Call);
+    compile_entry(
+        program,
+        program.main.ok_or("program has no main entrypoint")?,
+    )
+}
+pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String> {
+    if program
+        .functions
+        .get(entry)
+        .is_none_or(|f| !f.params.is_empty())
+    {
+        return Err("entrypoint must be a function with no parameters".into());
+    }
+    let mut code = Code::new(program.functions.len(), &program.types);
+    code.branch(code.functions[entry], Branch::Call);
     code.imm(16, 0x2000001);
     code.emit(0xd4001001);
     code.emit(0xd4200000);
@@ -473,10 +699,17 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
         let (offsets, _) = stack_arguments(&f.params);
         for (param, ty) in f.params.iter().enumerate() {
             if param < 8 {
-                code.store(param, param as u32);
+                code.store(f.param_slots[param], param as u32);
             } else {
                 code.load_stack_param(offsets[param - 8], *ty);
-                code.store(param, 0);
+                code.store(f.param_slots[param], 0);
+            }
+        }
+        for (param, storage) in f.param_storage.iter().enumerate() {
+            if let Some(storage) = storage {
+                code.load(f.param_slots[param]);
+                code.copy_value(*storage, f.params[param]);
+                code.store(f.param_slots[param], 0);
             }
         }
         code.stmts(&f.body);
