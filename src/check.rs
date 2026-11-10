@@ -1,16 +1,17 @@
 use crate::{
-    syntax::{self as ast, Type},
+    syntax::{self as ast, Type, Types},
     Error, Span,
 };
 use std::collections::HashMap;
 
 pub struct Program {
+    pub types: Types,
     pub functions: Vec<Function>,
     pub main: usize,
 }
 pub struct Function {
     pub name: String,
-    pub params: usize,
+    pub params: Vec<Type>,
     pub slots: usize,
     pub body: Vec<Stmt>,
 }
@@ -32,7 +33,8 @@ pub enum ExprKind {
     Number(i64),
     Bool(bool),
     Local(usize),
-    Call(usize, Vec<Expr>),
+    Function(usize),
+    Call(Box<Expr>, Vec<Expr>),
     Print(Box<Expr>),
     Cast(Box<Expr>),
     Unary(&'static str, Box<Expr>),
@@ -44,12 +46,9 @@ struct Binding {
     slot: usize,
     mutable: bool,
 }
-struct Signature {
-    params: Vec<Type>,
-    ret: Type,
-}
 struct Checker<'a> {
-    signatures: &'a HashMap<String, (usize, Signature)>,
+    signatures: &'a HashMap<String, (usize, Type)>,
+    types: &'a Types,
     scopes: Vec<HashMap<String, Binding>>,
     slots: usize,
     ret: Type,
@@ -74,11 +73,15 @@ fn reserved(name: &str) -> bool {
             | "print"
     )
 }
-fn mismatch(span: Span, expected: Type, actual: Type) -> Error {
+fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
     Error::new(
         "E0201",
         span,
-        format!("expected {}, found {}", expected.name(), actual.name()),
+        format!(
+            "expected {}, found {}",
+            types.name(expected),
+            types.name(actual)
+        ),
     )
 }
 
@@ -114,12 +117,22 @@ impl Checker<'_> {
     }
     fn hint(&self, expr: &ast::Expr) -> Option<Type> {
         match &expr.kind {
-            ast::ExprKind::Name(n) => self.lookup(n).map(|b| b.ty),
-            ast::ExprKind::Call(n, _) => match n.as_str() {
-                "i32" => Some(Type::I32),
-                "i64" => Some(Type::I64),
-                _ => self.signatures.get(n).map(|(_, s)| s.ret),
-            },
+            ast::ExprKind::Name(n) => self
+                .lookup(n)
+                .map(|b| b.ty)
+                .or_else(|| self.signatures.get(n).map(|(_, ty)| *ty)),
+            ast::ExprKind::Call(callee, _) => {
+                if let ast::ExprKind::Name(n) = &callee.kind {
+                    if n == "i32" {
+                        return Some(Type::I32);
+                    }
+                    if n == "i64" {
+                        return Some(Type::I64);
+                    }
+                }
+                self.hint(callee)
+                    .and_then(|ty| self.types.signature(ty).map(|f| f.ret))
+            }
             ast::ExprKind::Unary("-", e) => self.hint(e),
             ast::ExprKind::Binary(op, a, b) if matches!(*op, "+" | "-" | "*" | "/" | "%") => {
                 self.hint(a).or_else(|| self.hint(b))
@@ -154,12 +167,18 @@ impl Checker<'_> {
                 kind: ExprKind::Bool(*b),
             },
             A::Name(n) => {
-                let b = self.lookup(n).ok_or_else(|| {
-                    Error::new("E0205", e.span, format!("unknown variable '{n}'"))
-                })?;
-                Expr {
-                    ty: b.ty,
-                    kind: ExprKind::Local(b.slot),
+                if let Some(b) = self.lookup(n) {
+                    Expr {
+                        ty: b.ty,
+                        kind: ExprKind::Local(b.slot),
+                    }
+                } else if let Some((index, ty)) = self.signatures.get(n) {
+                    Expr {
+                        ty: *ty,
+                        kind: ExprKind::Function(*index),
+                    }
+                } else {
+                    return Err(Error::new("E0205", e.span, format!("unknown name '{n}'")));
                 }
             }
             A::Unary("-", inner) if matches!(inner.kind, A::Number(_)) => {
@@ -222,12 +241,12 @@ impl Checker<'_> {
                     }
                 }
             }
-            A::Call(n, args) if n == "print" => {
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "print") => {
                 if args.len() != 1 {
                     return Err(Error::new("E0207", e.span, "print expects one argument"));
                 }
                 let value = self.expr(&args[0], None)?;
-                if value.ty == Type::Unit {
+                if !matches!(value.ty, Type::I32 | Type::I64 | Type::Bool) {
                     return Err(Error::new(
                         "E0206",
                         e.span,
@@ -239,7 +258,8 @@ impl Checker<'_> {
                     kind: ExprKind::Print(Box::new(value)),
                 }
             }
-            A::Call(n, args) if n == "i32" || n == "i64" => {
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "i32" || n == "i64") =>
+            {
                 if args.len() != 1 {
                     return Err(Error::new(
                         "E0207",
@@ -247,7 +267,11 @@ impl Checker<'_> {
                         "an integer conversion expects one argument",
                     ));
                 }
-                let ty = if n == "i32" { Type::I32 } else { Type::I64 };
+                let ty = if matches!(&callee.kind, A::Name(n) if n == "i32") {
+                    Type::I32
+                } else {
+                    Type::I64
+                };
                 let inner = self.expr(&args[0], self.hint(&args[0]).or(Some(ty)))?;
                 if !inner.ty.integer() {
                     return Err(Error::new(
@@ -261,29 +285,29 @@ impl Checker<'_> {
                     kind: ExprKind::Cast(Box::new(inner)),
                 }
             }
-            A::Call(n, args) => {
-                if self.lookup(n).is_some() {
-                    return Err(Error::new(
+            A::Call(callee, args) => {
+                let target = self.expr(callee, None)?;
+                let sig = self.types.signature(target.ty).ok_or_else(|| {
+                    Error::new(
                         "E0206",
-                        e.span,
-                        format!("'{n}' is a variable, not a callable function"),
-                    ));
-                }
-                let (index, sig) = self.signatures.get(n).ok_or_else(|| {
-                    Error::new("E0205", e.span, format!("unknown function '{n}'"))
+                        callee.span,
+                        format!(
+                            "{} is not callable; expected a function",
+                            self.types.name(target.ty)
+                        ),
+                    )
                 })?;
                 if args.len() != sig.params.len() {
                     return Err(Error::new(
                         "E0207",
                         e.span,
                         format!(
-                            "'{n}' expects {} arguments, found {}",
+                            "function expects {} arguments, found {}",
                             sig.params.len(),
                             args.len()
                         ),
                     ));
                 }
-                let index = *index;
                 let ret = sig.ret;
                 let types = sig.params.clone();
                 let values = args
@@ -293,13 +317,13 @@ impl Checker<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 Expr {
                     ty: ret,
-                    kind: ExprKind::Call(index, values),
+                    kind: ExprKind::Call(Box::new(target), values),
                 }
             }
         };
         if let Some(t) = expected {
             if t != typed.ty {
-                return Err(mismatch(e.span, t, typed.ty));
+                return Err(mismatch(self.types, e.span, t, typed.ty));
             }
         }
         Ok(typed)
@@ -344,7 +368,7 @@ impl Checker<'_> {
                         .map(|v| self.expr(v, Some(self.ret)))
                         .transpose()?;
                     if v.is_none() && self.ret != Type::Unit {
-                        return Err(mismatch(s.span, self.ret, Type::Unit));
+                        return Err(mismatch(self.types, s.span, self.ret, Type::Unit));
                     }
                     (Stmt::Return(v), true)
                 }
@@ -401,7 +425,11 @@ impl Checker<'_> {
     }
 }
 
-pub fn check(functions: Vec<ast::Function>) -> Result<Program, Error> {
+pub fn check(program: ast::Program) -> Result<Program, Error> {
+    let ast::Program {
+        functions,
+        mut types,
+    } = program;
     let mut signatures = HashMap::new();
     for (i, f) in functions.iter().enumerate() {
         if reserved(&f.name) {
@@ -411,22 +439,12 @@ pub fn check(functions: Vec<ast::Function>) -> Result<Program, Error> {
                 format!("'{}' is reserved", f.name),
             ));
         }
-        if f.params.len() > 8 {
-            return Err(Error::new(
-                "E0211",
-                f.span,
-                "this first compiler supports at most eight parameters",
-            ));
-        }
         if signatures
             .insert(
                 f.name.clone(),
                 (
                     i,
-                    Signature {
-                        params: f.params.iter().map(|p| p.ty).collect(),
-                        ret: f.ret,
-                    },
+                    types.function(f.params.iter().map(|p| p.ty).collect(), f.ret),
                 ),
             )
             .is_some()
@@ -439,17 +457,18 @@ pub fn check(functions: Vec<ast::Function>) -> Result<Program, Error> {
         }
     }
     let span = Span { start: 0, end: 0 };
-    let (main, sig) = signatures.get("main").ok_or_else(|| {
+    let (main, main_type) = signatures.get("main").ok_or_else(|| {
         Error::new(
             "E0212",
             span,
             "program needs 'fn main()' or 'fn main() -> i32'",
         )
     })?;
+    let sig = types.signature(*main_type).unwrap();
     if !sig.params.is_empty() || !matches!(sig.ret, Type::I32 | Type::Unit) {
         return Err(Error::new(
             "E0212",
-            span,
+            functions[*main].span,
             "main must take no arguments and return i32 or ()",
         ));
     }
@@ -458,6 +477,7 @@ pub fn check(functions: Vec<ast::Function>) -> Result<Program, Error> {
     for f in functions {
         let mut c = Checker {
             signatures: &signatures,
+            types: &types,
             scopes: vec![HashMap::new()],
             slots: 0,
             ret: f.ret,
@@ -480,12 +500,13 @@ pub fn check(functions: Vec<ast::Function>) -> Result<Program, Error> {
         }
         checked.push(Function {
             name: f.name,
-            params: f.params.len(),
+            params: f.params.iter().map(|p| p.ty).collect(),
             slots: c.slots,
             body,
         });
     }
     Ok(Program {
+        types,
         functions: checked,
         main,
     })

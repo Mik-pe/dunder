@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
 use std::{
     env, fs,
     io::{self, Write},
@@ -60,7 +60,7 @@ fn manifest() -> Result<(PathBuf, String), String> {
         }
         if !dir.pop() {
             return Err(
-                "no dunder.toml found; run 'dunder build file.dunder' or create a manifest".into(),
+                "no dunder.toml found; run 'dunder build file.dn' or create a manifest".into(),
             );
         }
     }
@@ -90,15 +90,17 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
     result
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<i32, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.dunder] [-o output] [--timings]\n  dunder check [file.dunder]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
-        return Ok(());
+        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.dn] [-o output] [--timings]\n  dunder run [file.dn] [-o output] [--timings]\n  dunder check [file.dn]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        return Ok(0);
     }
     let command = &args[0];
-    if !matches!(command.as_str(), "build" | "check") {
-        return Err(format!("unknown command '{command}'; use build or check"));
+    if !matches!(command.as_str(), "build" | "check" | "run") {
+        return Err(format!(
+            "unknown command '{command}'; use build, run or check"
+        ));
     }
     let mut source_path = None;
     let mut output = None;
@@ -136,7 +138,7 @@ fn run() -> Result<(), String> {
     let check_time = start.elapsed() - read_time;
     if command == "check" {
         println!("checked {}", source_path.display());
-        return Ok(());
+        return Ok(0);
     }
     let image = dunder::native::compile(&checked)?;
     let native_time = start.elapsed() - read_time - check_time;
@@ -147,7 +149,11 @@ fn run() -> Result<(), String> {
         }
     }
     publish(&output, &image).map_err(|e| format!("{}: {e}", output.display()))?;
-    println!("built {}", output.display());
+    if command == "run" {
+        eprintln!("built {}", output.display());
+    } else {
+        println!("built {}", output.display());
+    }
     if timings {
         eprintln!(
             "read={:.3}ms parse+check={:.3}ms native+sign={:.3}ms total={:.3}ms",
@@ -157,12 +163,24 @@ fn run() -> Result<(), String> {
             start.elapsed().as_secs_f64() * 1000.
         );
     }
-    Ok(())
+    if command == "run" {
+        let executable = fs::canonicalize(&output).map_err(|e| e.to_string())?;
+        let status = process::Command::new(executable)
+            .status()
+            .map_err(|e| format!("could not run {}: {e}", output.display()))?;
+        return Ok(status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
+    }
+    Ok(0)
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("{e}");
-        process::exit(1);
+    match run() {
+        Ok(code) => process::exit(code),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
     }
 }

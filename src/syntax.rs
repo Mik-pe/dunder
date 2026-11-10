@@ -6,6 +6,7 @@ pub enum Type {
     I64,
     Bool,
     Unit,
+    Function(usize),
 }
 impl Type {
     pub fn integer(self) -> bool {
@@ -17,8 +18,60 @@ impl Type {
             Self::I64 => "i64",
             Self::Bool => "bool",
             Self::Unit => "()",
+            Self::Function(_) => "fn",
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionType {
+    pub params: Vec<Type>,
+    pub ret: Type,
+}
+
+#[derive(Default, Debug)]
+pub struct Types {
+    functions: Vec<FunctionType>,
+}
+impl Types {
+    pub fn function(&mut self, params: Vec<Type>, ret: Type) -> Type {
+        let signature = FunctionType { params, ret };
+        let index = self
+            .functions
+            .iter()
+            .position(|f| *f == signature)
+            .unwrap_or_else(|| {
+                self.functions.push(signature);
+                self.functions.len() - 1
+            });
+        Type::Function(index)
+    }
+    pub fn signature(&self, ty: Type) -> Option<&FunctionType> {
+        if let Type::Function(i) = ty {
+            self.functions.get(i)
+        } else {
+            None
+        }
+    }
+    pub fn name(&self, ty: Type) -> String {
+        match self.signature(ty) {
+            Some(f) => format!(
+                "fn({}) -> {}",
+                f.params
+                    .iter()
+                    .map(|t| self.name(*t))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.name(f.ret)
+            ),
+            None => ty.name().into(),
+        }
+    }
+}
+
+pub struct Program {
+    pub functions: Vec<Function>,
+    pub types: Types,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -252,7 +305,7 @@ pub enum ExprKind {
     Number(i128),
     Bool(bool),
     Name(String),
-    Call(String, Vec<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
     Unary(&'static str, Box<Expr>),
     Binary(&'static str, Box<Expr>, Box<Expr>),
 }
@@ -261,6 +314,7 @@ struct Parser {
     tokens: Vec<Lexeme>,
     pos: usize,
     depth: usize,
+    types: Types,
 }
 impl Parser {
     fn peek(&self) -> &Token {
@@ -329,6 +383,42 @@ impl Parser {
         }
     }
     fn ty(&mut self) -> Result<Type, Error> {
+        self.depth += 1;
+        if self.depth > 128 {
+            return Err(Error::new("E0104", self.span(), "type nesting is too deep"));
+        }
+        let result = self.type_inner();
+        self.depth -= 1;
+        result
+    }
+    fn type_inner(&mut self) -> Result<Type, Error> {
+        if self.is_word("fn") {
+            self.take();
+            self.expect(Token::Left, "'(' after fn")?;
+            let mut params = Vec::new();
+            while *self.peek() != Token::Right {
+                let span = self.span();
+                let ty = self.ty()?;
+                if ty == Type::Unit {
+                    return Err(Error::new(
+                        "E0202",
+                        span,
+                        "a function parameter must have a value type",
+                    ));
+                }
+                params.push(ty);
+                if !self.accept(Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::Right, "')'")?;
+            let ret = if self.accept(Token::Arrow) {
+                self.ty()?
+            } else {
+                Type::Unit
+            };
+            return Ok(self.types.function(params, ret));
+        }
         if self.accept(Token::Left) {
             self.expect(Token::Right, "')'")?;
             return Ok(Type::Unit);
@@ -518,22 +608,10 @@ impl Parser {
                 kind: ExprKind::Bool(n == "true"),
                 span,
             },
-            Token::Name(n) => {
-                let kind = if self.accept(Token::Left) {
-                    let mut args = Vec::new();
-                    while *self.peek() != Token::Right {
-                        args.push(self.expr(0)?);
-                        if !self.accept(Token::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(Token::Right, "')'")?;
-                    ExprKind::Call(n, args)
-                } else {
-                    ExprKind::Name(n)
-                };
-                Expr { kind, span }
-            }
+            Token::Name(n) => Expr {
+                kind: ExprKind::Name(n),
+                span,
+            },
             Token::Op(op @ ("-" | "!")) => Expr {
                 kind: ExprKind::Unary(op, Box::new(self.expr(7)?)),
                 span,
@@ -545,7 +623,27 @@ impl Parser {
             }
             _ => return Err(Error::new("E0106", span, "expected an expression")),
         };
-        while let Token::Op(op) = self.peek() {
+        loop {
+            if self.accept(Token::Left) {
+                let mut args = Vec::new();
+                while *self.peek() != Token::Right {
+                    args.push(self.expr(0)?);
+                    if !self.accept(Token::Comma) {
+                        break;
+                    }
+                }
+                let end = self.span().end;
+                self.expect(Token::Right, "')'")?;
+                left = Expr {
+                    span: Span {
+                        start: left.span.start,
+                        end,
+                    },
+                    kind: ExprKind::Call(Box::new(left), args),
+                };
+                continue;
+            }
+            let Token::Op(op) = self.peek() else { break };
             let op = *op;
             let prec = match op {
                 "||" => 1,
@@ -574,11 +672,12 @@ impl Parser {
     }
 }
 
-pub fn parse(source: &str) -> Result<Vec<Function>, Error> {
+pub fn parse(source: &str) -> Result<Program, Error> {
     let mut parser = Parser {
         tokens: lex(source)?,
         pos: 0,
         depth: 0,
+        types: Types::default(),
     };
     let mut functions = Vec::new();
     parser.separators();
@@ -586,5 +685,8 @@ pub fn parse(source: &str) -> Result<Vec<Function>, Error> {
         functions.push(parser.function()?);
         parser.separators();
     }
-    Ok(functions)
+    Ok(Program {
+        functions,
+        types: parser.types,
+    })
 }

@@ -12,6 +12,7 @@ enum Branch {
     Cond(u32),
     Zero(u32),
     Nonzero(u32),
+    Address(u32),
 }
 struct Code {
     words: Vec<u32>,
@@ -101,12 +102,29 @@ impl Code {
     fn prologue(&mut self, size: usize) {
         self.emit(0xa9bf7bfd);
         self.emit(0x910003fd);
-        let mut left = (size + 15) & !15;
+        self.stack_adjust(align(size, 16), true);
+    }
+    fn stack_adjust(&mut self, size: usize, allocate: bool) {
+        let mut left = size;
         while left > 0 {
             let part = left.min(4080);
-            self.emit(0xd10003ff | (part as u32) << 10);
+            self.emit((if allocate { 0xd10003ff } else { 0x910003ff }) | (part as u32) << 10);
             left -= part;
         }
+    }
+    fn sp_addr(&mut self, offset: usize) {
+        self.emit(0x910003e9); // mov x9,sp
+        self.imm(11, offset as u64);
+        self.emit(0x8b0b0129); // add x9,x9,x11
+    }
+    fn load_stack_param(&mut self, offset: usize, ty: Type) {
+        self.imm(9, (offset + 16) as u64);
+        self.emit(0x8b0903a9); // add x9,x29,x9, past saved FP/LR
+        self.emit(match ty {
+            Type::I32 => 0xb9800120,
+            Type::Bool => 0x39400120,
+            _ => 0xf9400120,
+        });
     }
     fn epilogue(&mut self) {
         self.emit(0x910003bf);
@@ -123,15 +141,50 @@ impl Code {
             ExprKind::Number(n) => self.imm(0, *n as u64),
             ExprKind::Bool(b) => self.imm(0, u64::from(*b)),
             ExprKind::Local(s) => self.load(*s),
-            ExprKind::Call(f, args) => {
+            ExprKind::Function(f) => self.branch(self.functions[*f], Branch::Address(0)),
+            ExprKind::Call(target, args) => {
+                let direct = if let ExprKind::Function(f) = &target.kind {
+                    Some(*f)
+                } else {
+                    None
+                };
+                if direct.is_none() {
+                    self.expr(target);
+                    self.push(0);
+                }
                 for arg in args {
                     self.expr(arg);
                     self.push(0);
                 }
-                for reg in (0..args.len()).rev() {
-                    self.pop(reg as u32);
+                let (offsets, outgoing) =
+                    stack_arguments(&args.iter().map(|a| a.ty).collect::<Vec<_>>());
+                self.stack_adjust(outgoing, true);
+                for (i, offset) in offsets.into_iter().enumerate() {
+                    let arg = i + 8;
+                    self.sp_addr(outgoing + (args.len() - 1 - arg) * 16);
+                    self.emit(0xf940012a); // ldr x10,[x9] from evaluation temporary
+                    self.sp_addr(offset);
+                    self.emit(match args[arg].ty {
+                        Type::I32 => 0xb900012a,
+                        Type::Bool => 0x3900012a,
+                        _ => 0xf900012a,
+                    });
                 }
-                self.branch(self.functions[*f], Branch::Call);
+                for reg in 0..args.len().min(8) {
+                    self.sp_addr(outgoing + (args.len() - 1 - reg) * 16);
+                    self.emit(0xf9400120 | reg as u32);
+                }
+                if let Some(f) = direct {
+                    self.branch(self.functions[f], Branch::Call);
+                } else {
+                    self.sp_addr(outgoing + args.len() * 16);
+                    self.emit(0xf9400128);
+                    self.emit(0xd63f0100); // blr x8
+                }
+                self.stack_adjust(
+                    outgoing + args.len() * 16 + if direct.is_none() { 16 } else { 0 },
+                    false,
+                );
             }
             ExprKind::Print(x) => {
                 self.expr(x);
@@ -381,12 +434,22 @@ impl Code {
         for (at, label, kind) in self.fixups {
             let to = self.labels[label].ok_or("unresolved function or branch")?;
             let delta = to as i64 - at as i64;
+            if let Branch::Address(reg) = kind {
+                let bytes = delta * 4;
+                if !(-(1 << 20)..(1 << 20)).contains(&bytes) {
+                    return Err("function address exceeds the first backend's ADR range".into());
+                }
+                let bits = bytes as u32 & 0x1fffff;
+                self.words[at] = 0x10000000 | (bits & 3) << 29 | (bits >> 2) << 5 | reg;
+                continue;
+            }
             let (base, bits) = match kind {
                 Branch::Jump => (0x14000000, 26),
                 Branch::Call => (0x94000000, 26),
                 Branch::Cond(c) => (0x54000000 | c, 19),
                 Branch::Zero(r) => (0xb4000000 | r, 19),
                 Branch::Nonzero(r) => (0xb5000000 | r, 19),
+                Branch::Address(_) => unreachable!(),
             };
             if delta < -(1i64 << (bits - 1)) || delta >= 1i64 << (bits - 1) {
                 return Err("program exceeds the first backend's branch range".into());
@@ -407,8 +470,14 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     for (i, f) in program.functions.iter().enumerate() {
         code.mark(code.functions[i]);
         code.prologue(f.slots * 8);
-        for param in 0..f.params {
-            code.store(param, param as u32);
+        let (offsets, _) = stack_arguments(&f.params);
+        for (param, ty) in f.params.iter().enumerate() {
+            if param < 8 {
+                code.store(param, param as u32);
+            } else {
+                code.load_stack_param(offsets[param - 8], *ty);
+                code.store(param, 0);
+            }
         }
         code.stmts(&f.body);
         code.imm(0, 0);
@@ -416,6 +485,24 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
     }
     code.runtime();
     Ok(macho(&code.finish()?))
+}
+
+// Darwin packs stack arguments at their natural size and alignment, then
+// requires the caller's SP to remain 16-byte aligned. No FFI is exposed yet.
+fn stack_arguments(types: &[Type]) -> (Vec<usize>, usize) {
+    let mut next = 0;
+    let mut offsets = Vec::new();
+    for ty in types.iter().skip(8) {
+        let size = match ty {
+            Type::Bool => 1,
+            Type::I32 => 4,
+            _ => 8,
+        };
+        next = align(next, size);
+        offsets.push(next);
+        next += size;
+    }
+    (offsets, align(next, 16))
 }
 
 fn align(n: usize, to: usize) -> usize {

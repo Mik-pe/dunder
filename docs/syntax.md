@@ -5,6 +5,8 @@ program. Håll stavning och struktur regelbundna så att både människor och
 kodagenter kan använda vanliga mönster för funktioner, uttryck och block.
 Detta är ett prövbart designval, inte ett påstående om mätt agentpreferens.
 
+Källfiler använder **`.dn`**, till exempel `main.dn` och `functions.dn`.
+
 ## Deklarationer och muterbarhet
 
 ```dunder
@@ -34,6 +36,7 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `i64` | Signerat 64-bitars heltal. |
 | `bool` | `true` eller `false`; ingen implicit konvertering till/från heltal. |
 | `()` | Inget returvärde; implicit returtyp för funktioner utan `->`. |
+| `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
 
 Literaler får typ från en annotering, funktionens parameter/returtyp eller
 den andra heltalsoperanden. Befintliga värden konverteras aldrig implicit
@@ -85,13 +88,65 @@ fn main() {
 
 Parameter- och returtyper i funktionssignaturer är explicita. Framåtanrop,
 rekursion och ömsesidig rekursion tillåts. Parametrarna är oföränderliga;
-kopiera till en `var`-lokal om de behöver ändras. Funktioner får högst åtta
-parametrar i den första backendversionen; fler avvisas med ett tydligt fel.
+kopiera till en `var`-lokal om de behöver ändras. De första åtta argumenten
+överförs i register och ytterligare argument på stacken. Blandade `i32`,
+`i64`, `bool` och funktionsargument stöds även på stacken.
 
 `main` tar inga argument och returnerar `()` eller `i32`. En `i32`-retur blir
 processens exitstatus enligt operativsystemets vanliga regler. Övriga
 funktioner med returvärde måste returnera på varje väg. Kontrollen behandlar
 loopar konservativt: lägg en retur efter loopen om funktionen returnerar ett värde.
+
+### Funktionsvärden och callbacks
+
+```dunder
+fn double(value: i32) -> i32 {
+    return value * 2
+}
+
+fn selected() -> fn(i32) -> i32 {
+    return double
+}
+
+fn apply(transform: fn(i32) -> i32, value: i32) -> i32 {
+    return transform(value)
+}
+
+fn main() -> i32 {
+    transform := selected()
+    explicit: fn(i32) -> i32 = double
+    print(apply(transform, 21))
+    print(explicit(21))
+    print(selected()(21))
+    return 0
+}
+```
+
+Ett namngivet funktionsnamn utan `(...)` är ett värde. `:=` härleder hela
+funktionstypen. Typen skrivs `fn(Parametertyper) -> Returtyp`, utan
+parameternamn; `fn(i32)` betyder `fn(i32) -> ()`.
+
+Parameter- och returtyper måste matcha exakt när en funktion lagras, skickas,
+returneras eller tilldelas. Funktionsvärden är oföränderliga som standard;
+`var transform := double` tillåter byte till en annan funktion med samma typ.
+Funktioner kan ta och returnera andra funktionsvärden, även i flera nivåer.
+Anrop utvärderar först funktionen och därefter argumenten från vänster till
+höger. Inbyggda operationer som `print` är ännu inte funktionsvärden; skriv
+en vanlig `fn` som omslag vid behov. Funktionslikhet och anonyma closures är
+ännu inte språkoperationer.
+
+### Startpunkt och returvärden
+
+`fn main()` körs vid programstart och ger exitkod 0. Med `fn main() -> i32`
+används returvärdet som processens exitkod. Exempelvis ger `return 7` exitkod
+7, även genom `dunder run`. Felaktig eller saknad `main` upptäcks vid
+typkontroll. En vanlig funktion utan `->` returnerar `()`; den får använda
+`return` utan värde eller nå slutet av kroppen. En funktion med returtyp
+måste returnera ett värde av rätt typ på alla vägar enligt kontrollen ovan.
+
+`dunder run [fil.dn]` bygger och kör den nya binären. Byggmeddelanden går
+till stderr och programmets stdout bevaras. Ett kompileringsfel startar
+aldrig en tidigare binär från samma utdataplats.
 
 `if` och `while` kräver `bool`, aldrig ett heltal. `else if`, `else`, `break`
 och `continue` stöds. Block ger lexikala scope. `print` är den första inbyggda

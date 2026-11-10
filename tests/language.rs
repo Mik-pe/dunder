@@ -64,8 +64,8 @@ fn source_positions_and_multiline_calls() {
     let source = "fn main() {\n    ålder := true\n    x: i32 = ålder\n}\n";
     let e = dunder::check(source).err().unwrap();
     assert!(e
-        .render("bad.dunder", source)
-        .starts_with("bad.dunder:3:14: error[E0201]"));
+        .render("bad.dn", source)
+        .starts_with("bad.dn:3:14: error[E0201]"));
     dunder::check(
         "fn plus(a:i32,b:i32)->i32{return a+b}\nfn main(){x:=plus(\n 1,\n 2,\n); print(x)}",
     )
@@ -78,7 +78,7 @@ fn native(source: &str) -> std::process::Output {
     let dir = Dir::new();
     let path = dir.0.join("program");
     let image =
-        dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.dunder", source)));
+        dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.dn", source)));
     fs::write(&path, &image).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     let signed = Command::new("/usr/bin/codesign")
@@ -98,8 +98,9 @@ fn native(source: &str) -> std::process::Output {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn compiled_examples_and_runtime_control_flow() {
     for (source,expected,status) in [
-        (include_str!("../examples/hello.dunder"),"42\ntrue\n",0),
-        (include_str!("../examples/fibonacci.dunder"),"6765\ntrue\n",0),
+        (include_str!("../examples/hello.dn"),"42\ntrue\n",0),
+        (include_str!("../examples/fibonacci.dn"),"6765\ntrue\n",0),
+        (include_str!("../examples/functions.dn"),"42\n42\n-42\n",0),
         ("fn fact(n:i32)->i32{if n<=1{return 1}else{return n*fact(n-1)}} fn main()->i32{print(fact(6));return 7}","720\n",7),
         ("fn main(){var x:=0; var total:=0; while x<10{x=x+1; if x==3{continue}; if x==8{break}; total=total+x}; print(total)}","25\n",0),
         ("fn side()->bool{print(9);return true} fn main(){print(false&&side());print(true||side());print(!true)}","false\ntrue\nfalse\n",0),
@@ -142,10 +143,10 @@ fn cli_manifest_and_failed_build_preserve_previous_binary() {
     let dir = Dir::new();
     fs::write(
         dir.0.join("dunder.toml"),
-        "name = \"demo\"\nroot = \"main.dunder\"\n",
+        "name = \"demo\"\nroot = \"main.dn\"\n",
     )
     .unwrap();
-    let src = dir.0.join("main.dunder");
+    let src = dir.0.join("main.dn");
     fs::write(&src, "fn main(){print(42)}").unwrap();
     let compiler = env!("CARGO_BIN_EXE_dunder");
     let first = Command::new(compiler)
@@ -172,7 +173,7 @@ fn cli_manifest_and_failed_build_preserve_previous_binary() {
     let valid = "fn main(){print(42)}";
     fs::write(&src, valid).unwrap();
     let overwrite = Command::new(compiler)
-        .args(["build", "main.dunder", "-o", "main.dunder"])
+        .args(["build", "main.dn", "-o", "main.dn"])
         .current_dir(&dir.0)
         .output()
         .unwrap();
@@ -211,4 +212,134 @@ fn native_integer_and_comparison_results_match_independent_reference() {
     let out = native(&source);
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn function_signatures_returns_and_main_are_checked() {
+    for (source, code) in [
+        ("fn main()->bool{return true}", "E0212"),
+        ("fn main(arg:i32){}", "E0212"),
+        ("fn helper(){}", "E0212"),
+        ("fn main(){} fn main(){}", "E0203"),
+        ("fn f()->i32{return} fn main(){}", "E0201"),
+        ("fn f(){return 1} fn main(){}", "E0201"),
+        ("fn f()->bool{return 1} fn main(){}", "E0201"),
+        ("fn f(n:i32)->i32{return n} fn main(){f(true)}", "E0201"),
+        (
+            "fn f(n:i32)->i32{return n} fn main(){g:fn(i32)->i64=f}",
+            "E0201",
+        ),
+        (
+            "fn f(n:i32)->i32{return n} fn choose()->fn(i64)->i32{return f} fn main(){}",
+            "E0201",
+        ),
+        (
+            "fn f(n:i32)->i32{return n} fn use(g:fn(i64)->i32){} fn main(){use(f)}",
+            "E0201",
+        ),
+        ("fn main(){g:=1;print(g(2))}", "E0206"),
+        ("fn f(){} fn main(){g:=f;g=f}", "E0208"),
+        ("fn f(){} fn main(){print(f)}", "E0206"),
+        ("fn f(){} fn main(){print(f==f)}", "E0206"),
+    ] {
+        rejects(source, code);
+    }
+    let source = "fn f(n:i32)->i32{return n} fn main(){g:fn(i32)->i64=f}";
+    let e = dunder::check(source).err().unwrap();
+    assert_eq!(e.message, "expected fn(i32) -> i64, found fn(i32) -> i32");
+    dunder::check("fn main()->(){return}").unwrap_or_else(|e| panic!("{}", e.message));
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn callbacks_returned_functions_and_nested_calls_execute() {
+    for (source,expected) in [
+        ("fn add(a:i32,b:i32)->i32{return a+b} fn mark(n:i32)->i32{print(n);return n} fn factory()->fn(i32,i32)->i32{print(0);return add} fn main(){print(factory()(mark(1),mark(2)))}","0\n1\n2\n3\n"),
+        ("fn plus(n:i32)->i32{return n+1} fn minus(n:i32)->i32{return n-1} fn main(){var step:=plus;print(step(2));step=minus;print(step(2));print((plus)(41))}","3\n1\n42\n"),
+        ("fn show(n:i32){print(n);return} fn main(){consumer:fn(i32)=show;consumer(42)}","42\n"),
+        ("fn even(n:i32)->bool{if n==0{return true};return odd(n-1)} fn odd(n:i32)->bool{if n==0{return false};return even(n-1)} fn main(){predicate:fn(i32)->bool=even;print(predicate(100));print(predicate(101))}","true\nfalse\n"),
+        ("fn double(n:i32)->i32{return n*2} fn get()->fn(i32)->i32{return double} fn main(){f:=get();var i:=0;var sum:=0;while i<10000{sum=sum+f(i);i=i+1};print(sum)}","99990000\n"),
+    ] {
+        let out=native(source);assert!(out.status.success(),"{source}");assert_eq!(String::from_utf8_lossy(&out.stdout),expected,"{source}");
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn stack_arguments_preserve_types_alignment_and_recursion() {
+    let source = r#"
+fn double(n:i32)->i32{return n*2}
+fn mixed(a:i32,b:i32,c:i32,d:i32,e:i32,f:i32,g:i32,h:i32,
+         flag:bool,x:i32,wide:i64,other:bool,y:i32,transform:fn(i32)->i32)->i64 {
+    if flag && !other { return wide+i64(transform(x+y))+i64(a+b+c+d+e+f+g+h) }
+    return 0
+}
+fn walk(n:i32,a:i32,b:i32,c:i32,d:i32,e:i32,f:i32,g:i32,last:i64)->i64 {
+    if n==0 { return last }
+    return walk(n-1,a,b,c,d,e,f,g,last)+1
+}
+fn main(){
+    callback:=mixed
+    print(callback(1,2,3,4,5,6,7,8,true,-5,10000000000,false,7,double))
+    print(walk(100,1,2,3,4,5,6,7,9000000000))
+}
+"#;
+    let out = native(source);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10000000040\n9000000100\n"
+    );
+    // Exercise a much larger argument list, including negative signed stack values.
+    let params = (0..40)
+        .map(|i| format!("a{i}:i64"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let args = (0..40)
+        .map(|i| (i as i64 - 20).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sum = (0..40)
+        .map(|i| format!("a{i}"))
+        .collect::<Vec<_>>()
+        .join("+");
+    let source = format!("fn sum({params})->i64{{return {sum}}} fn main(){{print(sum({args}))}}");
+    let out = native(&source);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-20\n");
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_uses_main_and_propagates_its_exit_status() {
+    let dir = Dir::new();
+    let source = dir.0.join("program.dn");
+    fs::write(&source, "fn main()->i32{print(42);return 7}").unwrap();
+    let compiler = env!("CARGO_BIN_EXE_dunder");
+    let output = Command::new(compiler)
+        .args(["run", "program.dn", "-o", "program"])
+        .current_dir(&dir.0)
+        .env("PATH", "/no-external-tools")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    let before = fs::read(dir.0.join("program")).unwrap();
+    fs::write(&source, "fn main()->bool{return true}").unwrap();
+    let bad = Command::new(compiler)
+        .args(["run", "program.dn", "-o", "program"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(bad.stdout.is_empty());
+    assert_eq!(fs::read(dir.0.join("program")).unwrap(), before);
+    fs::write(&source, "fn main(){print(true);return}").unwrap();
+    let unit = Command::new(compiler)
+        .args(["run", "program.dn"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(unit.status.success());
+    assert_eq!(String::from_utf8_lossy(&unit.stdout), "true\n");
 }
