@@ -497,14 +497,14 @@ Normalisering, case folding, fullständig Unicode-klassificering och synliga
 teckenkluster stöds ännu inte. Dogfood-ordräknaren känner bara igen de
 blanktecken som uttryckligen listas i dess Dunder-källa.
 
-Första minnesmodellen använder statiska literaler i programbilden och en
-separat 16 MiB arena för dynamiska strängar. Arenan mappas först vid behov
-och lever till processlut, även för returnerade strängar och vyer.
-Kopior av string delar data säkert genom oföränderligheten. Sammanslagning,
-snitt och konvertering av heltal/rune kopierar data till arenan. Ingen GC
-eller återvinning av enskilda strängar under körning finns ännu; många
-upprepade operationer kan därför fylla arenan även när gamla värden inte
-längre används. Gränsen räknar också metadata och justering.
+Minnesmodellen använder statiska literaler i programbilden och en separat
+återanvändbar 16 MiB pool för dynamiska strängar. Kopior av `string`,
+`.bytes()` och `.runes()` delar data med icke-atomär referensräkning;
+strängen frigörs när sista ägaren försvinner. Sammanslagning, snitt och
+konvertering av heltal/rune skapar nya strängar. Även temporärer behåller
+sina värden över senare sidoeffekter i samma uttryck. Ingen spårande GC
+används. Poolen kan fyllas av levande värden, metadata och fragmentering;
+se [minneskontraktet](memory.md).
 
 Runtimefel: 103 för ogiltiga index eller intervall, 105 för full arena eller
 misslyckad mappning, 106 för snitt mitt i en UTF-8-sekvens eller ogiltigt
@@ -517,4 +517,5 @@ Nästlade aggregat, dynamiska arrayer och begränsade funktionsborrows fungerar
 nu; se [standardbiblioteket](standard.md). Arrayslices, ett generellt
 allokerings-API, generell ägar-/lånekontroll och egna iteratorer återstår.
 Den äldre dogfood-arenan använder fortfarande indexhandtag över en fast
-typad buffert. [Självhosting](../selfhost/README.md) är påbörjad men inte uppnådd.
+typad buffert. [Självhosting](../selfhost/README.md) fungerar för ARM64/Linux;
+full språk- och minnesmodellparitet återstår.

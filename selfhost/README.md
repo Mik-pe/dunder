@@ -11,6 +11,12 @@ ELF-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
 assembler eller länkare. QEMU används bara för att köra ARM64-binärer
 på en annan processor.
 
+Rust-bootstrapens genererade program har nu deterministisk bufferfrigöring
+och referensräknade strängar. Den Dunder-skrivna backendens egen runtime
+använder fortfarande bump-allokering. Stage 1 får den nya minnesmodellen;
+stage 2 och senare behöver ännu samma portning. En byteidentisk fixpunkt
+verifierar självbygget, inte minnesmodellparitet. Se [minnesarkitekturen](../docs/memory.md).
+
 ## Byggkedjan
 
 Kör från repositoryts rot. På ARM64/Linux kan stage 2 och stage 3 köras

@@ -1,5 +1,6 @@
 //! Immutable UTF-8 values: one-word handles to [u64 byte_length, UTF-8 bytes].
-//! Literals live in the image; dynamic values live in a bounded process arena.
+//! Literals are immortal; dynamic values use non-atomic reference counting and
+//! reusable size-class blocks in a bounded arena. Immutable leaves cannot cycle.
 //! x19/x20 are reserved across all generated Dunder code for its cursor/end.
 use super::{Branch, Code, Label};
 use crate::{
@@ -8,11 +9,18 @@ use crate::{
 };
 
 const ARENA_BYTES: u64 = 16 * 1024 * 1024;
+const MAPPING_BYTES: u64 = ARENA_BYTES + 4096;
+const BIN_BYTES: u32 = 512;
+// Dynamic block: [class + 1, free-list next, references, byte length, bytes...].
+// Handles address byte length, so public string layout remains [length, bytes].
+// The allocator never moves live strings; only the final release recycles them.
 
 #[derive(Default)]
 pub(super) struct Runtime {
     pub alloc: Label,
     pub try_alloc: Label,
+    pub retain: Label,
+    pub release: Label,
     pub compare: Label,
     pub concat: Label,
     pub slice: Label,
@@ -33,6 +41,8 @@ impl Runtime {
         Self {
             alloc: c.label(),
             try_alloc: c.label(),
+            retain: c.label(),
+            release: c.label(),
             compare: c.label(),
             concat: c.label(),
             slice: c.label(),
@@ -105,6 +115,8 @@ impl Code<'_> {
             if !self.words.len().is_multiple_of(2) {
                 self.emit(0);
             }
+            self.emit(0); // zero reference count means an immortal literal
+            self.emit(0);
             self.mark(label);
             let len = text.len() as u64;
             self.emit(len as u32);
@@ -194,10 +206,13 @@ impl Code<'_> {
         let mapped = self.label();
         let map_failed = self.label();
         let exhausted = self.label();
+        self.imm(1, ARENA_BYTES);
+        self.cmp(0, 1);
+        self.branch(exhausted, Branch::Cond(8));
         self.branch(mapped, Branch::Nonzero(19));
         self.push(0);
         self.imm(0, 0);
-        self.imm(1, ARENA_BYTES);
+        self.imm(1, MAPPING_BYTES);
         self.imm(2, 3); // read/write
         self.imm(
             3,
@@ -212,25 +227,122 @@ impl Code<'_> {
         self.syscall(197); // anonymous private mmap
         self.branch(map_failed, Branch::Cond(2));
         self.mov(19, 0);
-        self.imm(1, ARENA_BYTES);
+        self.imm(1, MAPPING_BYTES);
         self.add(20, 19, 1);
+        self.add_imm(19, 19, BIN_BYTES);
         self.pop(0);
         self.mark(mapped);
-        self.add_imm(2, 0, 15);
-        self.lsr(2, 2, 3);
-        self.lsl(2, 2, 3);
-        self.add(3, 19, 2);
+        // Capacity excludes the 32-byte block header. Even an exact 16 MiB
+        // payload fits; the extra mapping page pays for bins and headers.
+        self.imm(1, 16);
+        self.imm(2, 0);
+        let classify = self.label();
+        let classified = self.label();
+        let fresh = self.label();
+        let initialize = self.label();
+        self.mark(classify);
+        self.cmp(1, 0);
+        self.branch(classified, Branch::Cond(2));
+        self.lsl(1, 1, 1);
+        self.add_imm(2, 2, 1);
+        self.branch(classify, Branch::Jump);
+        self.mark(classified);
+        self.imm(3, MAPPING_BYTES);
+        self.sub(4, 20, 3);
+        self.lsl(3, 2, 3);
+        self.add(4, 4, 3);
+        self.ldr(5, 4);
+        self.branch(fresh, Branch::Zero(5));
+        self.add_imm(3, 5, 8);
+        self.ldr(3, 3);
+        self.str(3, 4);
+        self.branch(initialize, Branch::Jump);
+        self.mark(fresh);
+        self.add_imm(1, 1, 32);
+        self.add(3, 19, 1);
         self.cmp(3, 20);
         self.branch(exhausted, Branch::Cond(8));
-        self.mov(2, 19);
+        self.mov(5, 19);
         self.mov(19, 3);
-        self.str(0, 2);
-        self.mov(0, 2);
+        self.mark(initialize);
+        self.add_imm(2, 2, 1);
+        self.str(2, 5); // allocated class + 1; zero denotes a free block
+        self.add_imm(3, 5, 16);
+        self.imm(1, 1);
+        self.str(1, 3);
+        self.add_imm(5, 5, 24);
+        self.str(0, 5);
+        self.mov(0, 5);
         self.ret();
         self.mark(map_failed);
         self.pop(0);
         self.mark(exhausted);
         self.imm(0, 0);
+        self.ret();
+
+        // Both ownership helpers preserve x0 and every other integer register.
+        // This permits use while walking inline records and array elements.
+        self.mark(self.strings.retain);
+        let retained = self.label();
+        self.push(9);
+        self.push(10);
+        self.branch(retained, Branch::Zero(0));
+        self.sub_imm(9, 0, 8);
+        self.ldr(10, 9);
+        self.branch(retained, Branch::Zero(10));
+        // MAX is the freed sentinel; MAX-1 cannot be incremented safely.
+        self.push(11);
+        self.imm(11, u64::MAX - 1);
+        self.cmp(10, 11);
+        self.branch(self.strings.exhausted, Branch::Cond(2));
+        self.pop(11);
+        self.add_imm(10, 10, 1);
+        self.str(10, 9);
+        self.mark(retained);
+        self.pop(10);
+        self.pop(9);
+        self.ret();
+
+        self.mark(self.strings.release);
+        let released = self.label();
+        let still_live = self.label();
+        for register in 9..=13 {
+            self.push(register);
+        }
+        self.branch(released, Branch::Zero(0));
+        self.sub_imm(9, 0, 8);
+        self.ldr(10, 9);
+        self.branch(released, Branch::Zero(10));
+        self.imm(11, u64::MAX);
+        self.cmp(10, 11);
+        self.branch(self.strings.exhausted, Branch::Cond(0));
+        self.sub_imm(10, 10, 1);
+        self.branch(still_live, Branch::Nonzero(10));
+        self.str(11, 9); // freed handles must not look like immortal literals
+        self.sub_imm(9, 0, 24);
+        self.ldr(10, 9);
+        self.branch(self.strings.exhausted, Branch::Zero(10));
+        self.imm(11, 21);
+        self.cmp(10, 11);
+        self.branch(self.strings.exhausted, Branch::Cond(8));
+        self.imm(11, 0);
+        self.str(11, 9);
+        self.sub_imm(10, 10, 1);
+        self.lsl(10, 10, 3);
+        self.imm(11, MAPPING_BYTES);
+        self.sub(12, 20, 11);
+        self.add(12, 12, 10);
+        self.ldr(13, 12);
+        self.add_imm(11, 9, 8);
+        self.str(13, 11);
+        self.str(9, 12);
+        self.branch(released, Branch::Jump);
+        self.mark(still_live);
+        self.str(10, 9);
+        self.mark(released);
+        for register in (9..=13).rev() {
+            self.pop(register);
+        }
         self.ret();
 
         self.mark(self.strings.compare); // left x1, right x0; result -1/0/1
@@ -553,7 +665,10 @@ impl Code<'_> {
         self.mark(self.strings.print_rune);
         self.prologue(0);
         self.branch(self.strings.from_rune, Branch::Call);
+        self.push(0);
         self.branch(self.strings.print, Branch::Call);
+        self.pop(0);
+        self.branch(self.strings.release, Branch::Call);
         self.epilogue();
 
         for (label, status) in [

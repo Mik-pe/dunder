@@ -111,8 +111,9 @@ skrivs `nan`, `inf`, `-inf`, `0.0` och `-0.0`.
 ännu ingen sträng-till-flyttal-parser. Formatbredd och valbar precision är
 inte implementerade. Formatteraren prioriterar korrekthet och använder
 exakt heltalsarbete; den har ännu inget uppmätt prestandamål.
-Utskriftssträngar använder den befintliga 16 MiB processarenan och kan
-fylla den vid många upprepade utskrifter.
+Utskriftssträngar använder den återanvändbara 16 MiB strängpoolen.
+Direkt utskrift frigör sin formatteringssträng efter skrivningen;
+`.str()` returnerar ett referensräknat värde. Se [minnesmodellen](memory.md).
 
 ## Körda program och gränser
 

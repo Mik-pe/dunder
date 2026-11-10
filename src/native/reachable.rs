@@ -22,6 +22,7 @@ fn expr(e: &Expr, pending: &mut Vec<usize>) {
     match &e.kind {
         Function(f) => pending.push(*f),
         Deref(a)
+        | ManagedString(a, _, _)
         | Offset(a, _)
         | Clone(a, _)
         | EnumFromInt(a)
@@ -103,7 +104,7 @@ fn statements(body: &[Stmt], pending: &mut Vec<usize>) {
                     statements(&a.body, pending);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break | Stmt::Continue | Stmt::DropStorage(_) => {}
         }
     }
 }

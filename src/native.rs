@@ -46,6 +46,7 @@ struct Code<'a> {
     float_formatter: Option<Label>,
     float_conversion: Label,
     return_slot: Option<usize>,
+    owned_storage: Vec<(usize, Type)>,
     sys: sys::Runtime,
     sys_types: Option<crate::check::SysTypes>,
     invalid_enum: Label,
@@ -81,6 +82,7 @@ impl<'a> Code<'a> {
             float_formatter: None,
             float_conversion: 0,
             return_slot: None,
+            owned_storage: Vec::new(),
             sys: sys::Runtime::default(),
             sys_types: None,
             invalid_enum: 0,
@@ -290,7 +292,88 @@ impl<'a> Code<'a> {
         self.local_addr(storage);
         self.mov(1, 9);
         self.pop(0);
+        self.replace_into(ty);
+    }
+    // Clone before releasing the destination: the source can be the same value
+    // or a field within it. The scratch descriptor owns the clone until the
+    // final byte copy transfers it into the destination.
+    fn replace_into(&mut self, ty: Type) {
+        if !self.needs_drop(ty) {
+            self.clone_into(ty);
+            return;
+        }
+        let bytes = self.types.storage_bytes(ty).unwrap();
+        let scratch = align(bytes, 16);
+        self.push(1);
+        self.stack_adjust(scratch, true);
+        self.sp_addr(0);
+        self.mov(1, 9);
         self.clone_into(ty);
+        self.push(0);
+        self.sp_addr(scratch + 16);
+        self.ldr(0, 9);
+        self.drop_value(ty);
+        self.pop(0);
+        self.sp_addr(scratch);
+        self.ldr(1, 9);
+        self.mov(10, 0);
+        self.mov(11, 1);
+        self.imm(12, bytes as u64);
+        self.copy_bytes(11, 10, 12, 13);
+        self.mov(0, 1);
+        self.stack_adjust(scratch, false);
+        self.pop(1);
+    }
+    fn release_storage(&mut self, storage: usize, ty: Type) {
+        if self.needs_drop(ty) {
+            self.local_addr(storage);
+            self.mov(0, 9);
+            self.drop_value(ty);
+        }
+    }
+    fn retain_string(&mut self, ty: Type) {
+        if matches!(ty, Type::String | Type::Bytes | Type::Runes) {
+            self.branch(self.strings.retain, Branch::Call);
+        }
+    }
+    // x0 is a borrowed new handle; x1 addresses an initialized owning slot.
+    fn replace_string(&mut self) {
+        self.branch(self.strings.retain, Branch::Call);
+        self.push(0);
+        self.ldr(0, 1);
+        self.branch(self.strings.release, Branch::Call);
+        self.pop(0);
+        self.str(0, 1);
+    }
+    fn store_string(&mut self, slot: usize) {
+        self.local_addr(slot);
+        self.mov(1, 9);
+        self.replace_string();
+    }
+    fn initialize_owned_storage(&mut self, param_slots: &[usize]) {
+        for (slot, ty) in self.owned_storage.clone() {
+            if !self.needs_drop(ty) {
+                continue;
+            }
+            // Incoming scalar parameter handles have already been captured.
+            if matches!(ty, Type::String | Type::Bytes | Type::Runes) && param_slots.contains(&slot)
+            {
+                continue;
+            }
+            self.local_addr(slot);
+            self.imm(10, self.types.storage_bytes(ty).unwrap_or(8).max(1) as u64);
+            let again = self.label();
+            self.mark(again);
+            self.strb(31, 9);
+            self.add_imm(9, 9, 1);
+            self.sub_imm(10, 10, 1);
+            self.branch(again, Branch::Nonzero(10));
+        }
+    }
+    fn release_owned_storage(&mut self) {
+        for (slot, ty) in self.owned_storage.clone().into_iter().rev() {
+            self.release_storage(slot, ty);
+        }
     }
     fn index_addr(&mut self, base: &Expr, index: &Expr) {
         let a = self.types.array(base.ty);
@@ -318,6 +401,16 @@ impl<'a> Code<'a> {
     }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::ManagedString(value, slot, fresh) => {
+                self.expr(value);
+                if !fresh {
+                    self.retain_string(e.ty);
+                }
+                self.push(0);
+                self.release_storage(*slot, e.ty);
+                self.pop(0);
+                self.store(*slot, 0);
+            }
             ExprKind::IntOp(op, base, arg) => self.integer_expr(*op, base, arg.as_deref()),
             ExprKind::ReferenceAddress(slot) => self.load(*slot),
             ExprKind::LocalAddress(slot) => {
@@ -340,7 +433,10 @@ impl<'a> Code<'a> {
                 self.expr(value);
                 self.copy_value(*storage, e.ty);
             }
-            ExprKind::Dynamic(values, storage) => self.dynamic_value(e.ty, values, *storage),
+            ExprKind::Dynamic(values, storage) => {
+                self.release_storage(*storage, e.ty);
+                self.dynamic_value(e.ty, values, *storage);
+            }
             ExprKind::DynamicOp(op, base, arg) => {
                 self.dynamic_expr(*op, base, arg.as_deref(), e.ty)
             }
@@ -348,7 +444,12 @@ impl<'a> Code<'a> {
                 tag,
                 fields,
                 storage,
-            } => self.enum_value(e.ty, *tag, fields, *storage),
+            } => {
+                if let Some(storage) = storage {
+                    self.release_storage(*storage, e.ty);
+                }
+                self.enum_value(e.ty, *tag, fields, *storage);
+            }
             ExprKind::EnumFromInt(value) => {
                 self.expr(value);
                 let valid = self.label();
@@ -362,9 +463,24 @@ impl<'a> Code<'a> {
             }
             ExprKind::Float(bits) => self.imm(0, *bits),
             ExprKind::FloatOp(op, value) => self.float_expr(*op, value, e.ty),
-            ExprKind::SysCall(op, args, storage) => self.sys_expr(*op, args, *storage),
-            ExprKind::MacCall(op, args, storage) => self.mac_expr(*op, args, *storage),
-            ExprKind::Vulkan(op, args, storage) => self.vulkan_expr(*op, args, *storage),
+            ExprKind::SysCall(op, args, storage) => {
+                if let Some(storage) = storage {
+                    self.release_storage(*storage, e.ty);
+                }
+                self.sys_expr(*op, args, *storage);
+            }
+            ExprKind::MacCall(op, args, storage) => {
+                if let Some(storage) = storage {
+                    self.release_storage(*storage, e.ty);
+                }
+                self.mac_expr(*op, args, *storage);
+            }
+            ExprKind::Vulkan(op, args, storage) => {
+                if let Some(storage) = storage {
+                    self.release_storage(*storage, e.ty);
+                }
+                self.vulkan_expr(*op, args, *storage);
+            }
             ExprKind::String(s) => {
                 let label = self.string_literal(s);
                 self.branch(label, Branch::Address(0));
@@ -372,6 +488,7 @@ impl<'a> Code<'a> {
             ExprKind::StringView(base) => self.expr(base),
             ExprKind::StringOp(op, args) => self.string_expr(*op, args),
             ExprKind::Record(fields, storage) => {
+                self.release_storage(*storage, e.ty);
                 self.local_addr(*storage);
                 self.imm(11, self.types.storage_bytes(e.ty).unwrap() as u64);
                 let zero = self.label();
@@ -382,6 +499,7 @@ impl<'a> Code<'a> {
                 self.branch(zero, Branch::Cond(1));
                 for (offset, value) in fields {
                     self.expr(value);
+                    self.retain_string(value.ty);
                     self.local_addr(*storage);
                     self.imm(11, *offset as u64);
                     self.emit(0x8b0b0129);
@@ -423,9 +541,11 @@ impl<'a> Code<'a> {
                 self.imm(0, *len as u64);
             }
             ExprKind::Array(values, storage) => {
+                self.release_storage(*storage, e.ty);
                 let a = self.types.array(e.ty).unwrap();
                 for (i, value) in values.iter().enumerate() {
                     self.expr(value);
+                    self.retain_string(value.ty);
                     self.local_addr(*storage);
                     self.imm(11, (i * a.elem_size()) as u64);
                     self.emit(0x8b0b0129);
@@ -435,6 +555,7 @@ impl<'a> Code<'a> {
                 self.mov(0, 9);
             }
             ExprKind::Repeat(value, storage) => {
+                self.release_storage(*storage, e.ty);
                 let a = self.types.array(e.ty).unwrap();
                 self.expr(value);
                 self.local_addr(*storage);
@@ -442,6 +563,7 @@ impl<'a> Code<'a> {
                     self.imm(11, a.len as u64);
                     let again = self.label();
                     self.mark(again);
+                    self.retain_string(a.elem);
                     self.typed_store(a.elem, 9);
                     self.emit(0x91000129 | (a.elem_size() as u32) << 10);
                     self.emit(0xf100056b);
@@ -464,6 +586,9 @@ impl<'a> Code<'a> {
             }
             ExprKind::Function(f) => self.branch(self.functions[*f], Branch::Address(0)),
             ExprKind::Call(target, args, storage) => {
+                if let Some(storage) = storage {
+                    self.release_storage(*storage, e.ty);
+                }
                 let direct = if let ExprKind::Function(f) = &target.kind {
                     Some(*f)
                 } else {
@@ -527,6 +652,7 @@ impl<'a> Code<'a> {
                 self.expr(x);
                 if x.ty.float() {
                     self.float_to_string(x.ty);
+                    self.push(0);
                 }
                 self.branch(
                     match x.ty {
@@ -538,6 +664,10 @@ impl<'a> Code<'a> {
                     },
                     Branch::Call,
                 );
+                if x.ty.float() {
+                    self.pop(0);
+                    self.branch(self.strings.release, Branch::Call);
+                }
                 self.imm(0, 0);
             }
             ExprKind::Cast(x) => {
@@ -695,7 +825,9 @@ impl<'a> Code<'a> {
                     self.expr(value);
                     self.pop(1);
                     if self.types.storage_bytes(value.ty).is_some() {
-                        self.clone_into(value.ty);
+                        self.replace_into(value.ty);
+                    } else if matches!(value.ty, Type::String | Type::Bytes | Type::Runes) {
+                        self.replace_string();
                     } else {
                         self.typed_store(value.ty, 1);
                     }
@@ -708,7 +840,11 @@ impl<'a> Code<'a> {
                 } => self.enum_match(source, *slot, *storage, arms),
                 Stmt::Store(slot, e) => {
                     self.expr(e);
-                    self.store(*slot, 0);
+                    if matches!(e.ty, Type::String | Type::Bytes | Type::Runes) {
+                        self.store_string(*slot);
+                    } else {
+                        self.store(*slot, 0);
+                    }
                 }
                 Stmt::StoreAggregate(slot, storage, e) => {
                     self.expr(e);
@@ -718,9 +854,7 @@ impl<'a> Code<'a> {
                 Stmt::Return(e) => {
                     if let Some(e) = e {
                         self.expr(e);
-                        if e.ty.float() {
-                            self.bits_to_fp(0, 0, e.ty);
-                        }
+                        self.retain_string(e.ty);
                         if self.types.storage_bytes(e.ty).is_some() {
                             self.push(0);
                             self.load(self.return_slot.expect("aggregate return destination"));
@@ -731,10 +865,23 @@ impl<'a> Code<'a> {
                     } else {
                         self.imm(0, 0);
                     }
+                    self.push(0);
+                    self.release_owned_storage();
+                    self.pop(0);
+                    if let Some(e) = e {
+                        if e.ty.float() {
+                            self.bits_to_fp(0, 0, e.ty);
+                        }
+                    }
                     self.epilogue();
                 }
                 Stmt::Expr(e) => self.expr(e),
                 Stmt::Block(b) => self.stmts(b),
+                Stmt::DropStorage(owners) => {
+                    for &(slot, ty) in owners.iter().rev() {
+                        self.release_storage(slot, ty);
+                    }
+                }
                 Stmt::If(c, yes, no) => {
                     let other = self.label();
                     let end = self.label();
@@ -847,7 +994,17 @@ impl<'a> Code<'a> {
                     } else {
                         self.load(*cursor);
                     }
-                    self.store(*binding, 0);
+                    let string_item = self
+                        .types
+                        .array(source.ty)
+                        .map(|a| a.elem)
+                        .or_else(|| self.types.dynamic_elem(source.ty))
+                        .filter(|ty| matches!(ty, Type::String | Type::Bytes | Type::Runes));
+                    if string_item.is_some() {
+                        self.store_string(*binding);
+                    } else {
+                        self.store(*binding, 0);
+                    }
                     self.stmts(body);
                     self.mark(next);
                     if !matches!(source.ty, Type::Bytes | Type::Runes) {
@@ -857,6 +1014,12 @@ impl<'a> Code<'a> {
                     }
                     self.branch(head, Branch::Jump);
                     self.mark(done);
+                    if let Some(ty) = string_item {
+                        self.release_storage(*binding, ty);
+                    }
+                    if let Some(storage) = storage {
+                        self.release_storage(*storage, source.ty);
+                    }
                     self.loops.pop();
                 }
                 Stmt::Break => self.branch(self.loops.last().unwrap().1, Branch::Jump),
@@ -1095,6 +1258,7 @@ pub fn compile_entry_for(
             continue;
         }
         code.return_slot = f.return_slot;
+        code.owned_storage = f.owned_storage.clone();
         code.mark(code.functions[i]);
         code.prologue(f.slots * 8);
         if let Some(slot) = f.return_slot {
@@ -1119,6 +1283,13 @@ pub fn compile_entry_for(
                 Argument::General(_) => {}
             }
         }
+        code.initialize_owned_storage(&f.param_slots);
+        for (param, ty) in f.params.iter().enumerate() {
+            if matches!(ty, Type::String | Type::Bytes | Type::Runes) {
+                code.load(f.param_slots[param]);
+                code.retain_string(*ty);
+            }
+        }
         for (param, storage) in f.param_storage.iter().enumerate() {
             if let Some(storage) = storage {
                 code.load(f.param_slots[param]);
@@ -1127,6 +1298,7 @@ pub fn compile_entry_for(
             }
         }
         code.stmts(&f.body);
+        code.release_owned_storage();
         code.imm(0, 0);
         code.epilogue();
     }

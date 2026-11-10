@@ -9,8 +9,9 @@ runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
 Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
 GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
 begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
-Ägarmodellen, registeroptimeringarna och den inkrementella cachen nedan är
-fortsatt designmål, inte färdiga funktioner.
+Automatisk frigöring för arrayer och strängar är implementerad i bootstrapens
+kodgenerering. Generella livstider, explicita flyttar, registeroptimeringarna
+och den inkrementella cachen nedan är fortsatt designmål.
 
 ## Språkets kostnadsmodell
 
@@ -20,7 +21,20 @@ För vanlig heltalsaritmetik föreslår vi kontrollerat spill, med explicit omsl
 
 ## Minne utan GC
 
-Föreslagen första modell är **unikt ägarskap, flytt av värden och lexikalt avgränsade lån**. Stackvärden lever till slutet av sitt scope. Heapminne begärs från en uttrycklig allokator och hålls av ett ägarvärde. När ägaren lämnar sitt scope frigörs resursen deterministiskt. En flytt överför det ansvaret. Referensräkning ingår inte i grundmodellen.
+Den implementerade modellen kombinerar **unika arraybuffertar, värdekopior,
+lexikal städning och referensräknade oföränderliga strängar**. Tilldelning
+ersätter och frigör gamla resurser; scope-slut, `break`, `continue` och retur
+städar ägda värden. Nästlade structar och aktiva enumpayloads städas rekursivt.
+String-, byte- och runevyer behåller strängen tills sista ägaren försvinner.
+Referensräkningen är icke-atomär och omfattar enbart oföränderliga löv utan
+cykler. Det reviderar det tidigare designmålet att helt undvika
+referensräkning: strängkopior behåller nu billig delning och säker livslängd
+utan att hålla kvar alla strängar till processlut. Ingen spårande GC behövs.
+Läs [layout, allokering, tester och gränser](memory.md).
+
+Explicita flyttar, användarvalda allokatorer och generella livstider är nästa
+designsteg. Tabellen beskriver målen för den fulla lånemodellen; dagens
+referenser är begränsade till funktionsparametrar.
 
 | Situation | Vad kompilatorn ska tillåta eller upptäcka |
 | --- | --- |

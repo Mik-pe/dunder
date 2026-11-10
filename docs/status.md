@@ -91,8 +91,12 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   kontrollerade byteindex och strängsnitt. `.len` räknar byte; `.bytes()`
   och `.runes()` är återanvändbara vyer med indexering och `for`.
   Heltal, bool och runes har `.str()`. Strängar kan returneras, gå genom
-  callbacks och lagras i structfält och arrayer. Dynamiska strängar använder
-  en begränsad processarena utan GC; se begränsningarna nedan.
+  callbacks och lagras i structfält och arrayer. Dynamiska strängar har
+  icke-atomär referensräkning och återanvändbar lagring utan spårande GC.
+- Deterministisk frigöring av unikt ägda arraybuffertar, nästlade värden och
+  strängreferenser vid tilldelning, scope-slut, `break`, `continue` och retur.
+  Strängtemporärer behåller rätt värde över senare sidoeffekter. Se
+  [minnesarkitekturen och regressionstesterna](memory.md).
 - `f32`/`f64`, kontexttypade decimal- och exponentliteraler, IEEE-aritmetik
   och jämförelser, NaN, oändlighet, signerad noll och subnormala tal.
   Explicita numeriska konverteringar; till heltal trunkeras och kontrolleras
@@ -302,18 +306,20 @@ Den självbyggda Dunder-kompilatorn riktar sig till ARM64/Linux och har ännu
 en mindre språkdelmängd: endast nåbara funktionskroppar kontrolleras,
 testblock tas bort, och fullständiga payload-enums/match, flyttal,
 funktionsvärden och fasta arrayer återstår. Nästa steg är språkparitet och
-självbyggd kodgenerering för x86-64 och macOS.
+självbyggd kodgenerering för x86-64 och macOS. Den Dunder-skrivna backenden
+behöver också portning av bootstrapens nya minnesmodell; dess egen runtime
+använder fortfarande bump-allokering.
 Arrayelement är begränsade till primitiva skalärer och enums utan payload.
 Fasta arrayer och inline-aggregat får vara högst 64 KiB. Nästlade aggregat
 fungerar som structfält och enumpayloads. Arrayslices, generiskt allokerings-API
 och generell ägar-/lånekontroll återstår. Borrows är tills vidare begränsade
-till funktionsparametrar. Dynamiska arraybuffertar använder en separat
-512 MiB processarena och återvinns inte individuellt.
-Strängliteraler bor i programbilden. Dynamiska strängar bor i en separat
-16 MiB arena, som mappas vid första behov och återlämnas vid processlut.
-Enskilda strängar återvinns ännu inte under körning; upprepade operationer
-kan fylla arenan. Detta är en första dogfood-körmodell utan GC, inte färdig
-ägande-/lånekontroll. Normalisering, grapheme-kluster, interpolation och
+till funktionsparametrar. Dynamiska arraybuffertar återvinns i en separat
+512 MiB pool; dynamiska strängar återvinns i en 16 MiB pool. Varje pool har
+en extra sida bokföring. Storleksklasserna delar eller sammanfogar ännu inte
+fria block, så blandade storlekar kan fragmentera lagringen. Poolernas
+mappningar behålls till processlut. Strängliteraler bor i programbilden.
+Generell ägande-/lånekontroll, flyttar och trådsäker delning återstår.
+Normalisering, grapheme-kluster, interpolation och
 fullständig Unicode-klassificering återstår.
 Dogfood-arenan är bump-allokering över en fast stackbuffert med index som
 handtag; den är ännu inget allmänt allokerings- eller låne-API.

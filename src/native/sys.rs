@@ -151,11 +151,16 @@ impl Code<'_> {
         self.load(2);
         self.branch(self.sys.pack, Branch::Call);
         self.branch(failed, Branch::Nonzero(1));
+        self.store(4, 0); // packed bytes are owned only during this write
         self.mov(1, 0);
         self.load(0);
         self.mov(8, 0);
         self.load(1);
         self.branch(self.sys.calls[index(SysOp::WriteText)], Branch::Call);
+        self.push(0);
+        self.load(4);
+        self.branch(self.strings.release, Branch::Call);
+        self.pop(0);
         self.epilogue();
         self.mark(failed);
         self.mov(0, 1);
@@ -168,7 +173,14 @@ impl Code<'_> {
         self.branch(failed, Branch::Nonzero(1));
         self.store(4, 0);
         self.branch(self.sys.utf8, Branch::Call);
-        self.branch(done, Branch::Nonzero(0));
+        let valid = self.label();
+        self.branch(valid, Branch::Zero(0));
+        self.push(0);
+        self.load(4);
+        self.branch(self.strings.release, Branch::Call);
+        self.pop(0);
+        self.branch(done, Branch::Jump);
+        self.mark(valid);
         self.load(4);
         self.sys_field(ty, "value", 0);
         self.imm(0, 0);
@@ -219,6 +231,8 @@ impl Code<'_> {
         self.imm(1, 0);
         self.epilogue();
         self.mark(invalid);
+        self.load(3);
+        self.branch(self.strings.release, Branch::Call);
         self.imm(1, 22);
         self.mark(done);
         self.imm(0, 0);
@@ -547,6 +561,10 @@ impl Code<'_> {
     fn sys_io(&mut self, op: SysOp) {
         let reading = op == SysOp::ReadText;
         let ty = self.sys_begin(op);
+        if reading {
+            self.imm(0, 0);
+            self.store(5, 0); // owned read allocation, until transferred to result
+        }
         let done = self.label();
         let opened_error = self.label();
         let close = self.label();
@@ -755,10 +773,18 @@ impl Code<'_> {
             self.branch(failed, Branch::Nonzero(0));
             self.load(5);
             self.sys_field(ty, "value", 0);
+            self.imm(0, 0);
+            self.store(5, 0); // result now owns the string
             self.mark(failed);
         }
         self.load(4);
         self.mark(done);
+        if reading {
+            self.push(0);
+            self.load(5);
+            self.branch(self.strings.release, Branch::Call);
+            self.pop(0);
+        }
         self.sys_finish(ty);
     }
     fn sys_path_runtime(&mut self) {

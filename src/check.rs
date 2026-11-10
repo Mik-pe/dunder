@@ -62,6 +62,8 @@ pub struct Function {
     pub param_slots: Vec<usize>,
     pub param_storage: Vec<Option<usize>>,
     pub return_slot: Option<usize>,
+    /// Owned aggregate storage and immutable string handles, including temporaries.
+    pub owned_storage: Vec<(usize, Type)>,
     pub uses_float_format: bool,
     pub uses_macos: bool,
     pub uses_vulkan: bool,
@@ -90,6 +92,7 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     Block(Vec<Stmt>),
+    DropStorage(Vec<(usize, Type)>),
     Break,
     Continue,
 }
@@ -109,6 +112,7 @@ pub struct Expr {
     pub kind: ExprKind,
 }
 pub enum ExprKind {
+    ManagedString(Box<Expr>, usize, bool),
     ReferenceAddress(usize),
     LocalAddress(usize),
     Deref(Box<Expr>),
@@ -268,8 +272,10 @@ struct Checker<'a> {
     types: &'a mut Types,
     scopes: Vec<HashMap<String, Binding>>,
     slots: usize,
+    owned_storage: Vec<(usize, Type)>,
     ret: Type,
     loops: usize,
+    loop_owned_starts: Vec<usize>,
     testing: bool,
     needs_float_format: bool,
     uses_macos: bool,
@@ -332,7 +338,9 @@ impl Checker<'_> {
         self.types.storage_bytes(ty).map(|bytes| {
             let words = bytes.div_ceil(8).max(1);
             self.slots += words;
-            self.slots - 1
+            let slot = self.slots - 1;
+            self.owned_storage.push((slot, ty));
+            slot
         })
     }
     fn constructor_type(&self, expr: &ast::Expr) -> Result<Type, Error> {
@@ -438,6 +446,9 @@ impl Checker<'_> {
         }
         let slot = self.slot();
         let storage = self.storage(ty);
+        if matches!(ty, Type::String | Type::Bytes | Type::Runes) {
+            self.owned_storage.push((slot, ty));
+        }
         self.scopes.last_mut().unwrap().insert(
             name.into(),
             Binding {
@@ -721,6 +732,33 @@ impl Checker<'_> {
         Some((op, count, symbols.records[result].0))
     }
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
+        let value = self.unmanaged_expr(e, expected)?;
+        if !matches!(value.ty, Type::String | Type::Bytes | Type::Runes) {
+            return Ok(value);
+        }
+        // Even a read needs a retained snapshot before later operands can mutate
+        // its source. Fresh runtime results already carry their first ownership.
+        let fresh = match &value.kind {
+            ExprKind::Binary("+", _, _)
+            | ExprKind::Call(_, _, _)
+            | ExprKind::SysCall(_, _, _)
+            | ExprKind::Vulkan(_, _, _)
+            | ExprKind::DynamicOp(DynamicOp::Pop, _, _)
+            | ExprKind::StringOp(StringOp::Slice, _) => true,
+            ExprKind::StringOp(StringOp::ToString, args) => {
+                !matches!(args[0].ty, Type::String | Type::Bool)
+            }
+            _ => false,
+        };
+        let slot = self.slot();
+        let ty = value.ty;
+        self.owned_storage.push((slot, ty));
+        Ok(Expr {
+            ty,
+            kind: ExprKind::ManagedString(Box::new(value), slot, fresh),
+        })
+    }
+    fn unmanaged_expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
             A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.mac_op(n).is_some()) =>
@@ -1526,10 +1564,16 @@ impl Checker<'_> {
         })
     }
     fn block(&mut self, stmts: &[ast::Stmt]) -> Result<(Vec<Stmt>, bool), Error> {
+        let first_owner = self.owned_storage.len();
         self.scopes.push(HashMap::new());
         let result = self.statements(stmts);
         self.scopes.pop();
-        result
+        result.map(|(mut body, returns)| {
+            body.push(Stmt::DropStorage(
+                self.owned_storage[first_owner..].to_vec(),
+            ));
+            (body, returns)
+        })
     }
     fn statements(&mut self, stmts: &[ast::Stmt]) -> Result<(Vec<Stmt>, bool), Error> {
         let mut result = Vec::new();
@@ -1639,7 +1683,9 @@ impl Checker<'_> {
                 ast::StmtKind::While(c, body) => {
                     let cond = self.expr(c, Some(Type::Bool))?;
                     self.loops += 1;
+                    self.loop_owned_starts.push(self.owned_storage.len());
                     let (body, _) = self.block(body)?;
+                    self.loop_owned_starts.pop();
                     self.loops -= 1;
                     (Stmt::While(cond, body), false)
                 }
@@ -1672,7 +1718,9 @@ impl Checker<'_> {
                     let end = self.slot();
                     let storage = self.storage(source.ty);
                     self.loops += 1;
+                    self.loop_owned_starts.push(self.owned_storage.len());
                     let (body, _) = self.block(body)?;
+                    self.loop_owned_starts.pop();
                     self.loops -= 1;
                     self.scopes.pop();
                     (
@@ -1700,6 +1748,10 @@ impl Checker<'_> {
                             "break/continue requires a while loop",
                         ));
                     }
+                    let first_owner = *self.loop_owned_starts.last().unwrap();
+                    result.push(Stmt::DropStorage(
+                        self.owned_storage[first_owner..].to_vec(),
+                    ));
                     (
                         if matches!(s.kind, ast::StmtKind::Break) {
                             Stmt::Break
@@ -1963,8 +2015,10 @@ pub(crate) fn check_modules(
                     types: &mut types,
                     scopes: vec![HashMap::new()],
                     slots: 0,
+                    owned_storage: Vec::new(),
                     ret: f.ret,
                     loops: 0,
+                    loop_owned_starts: Vec::new(),
                     testing: f.test.is_some(),
                     needs_float_format: false,
                     uses_macos: false,
@@ -1998,6 +2052,7 @@ pub(crate) fn check_modules(
                     param_slots,
                     param_storage,
                     return_slot,
+                    owned_storage: c.owned_storage,
                     uses_float_format: c.needs_float_format,
                     uses_macos: c.uses_macos,
                     uses_vulkan: c.uses_vulkan,
@@ -2053,8 +2108,10 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             types,
             scopes: vec![HashMap::new()],
             slots: 0,
+            owned_storage: Vec::new(),
             ret: Type::String,
             loops: 0,
+            loop_owned_starts: Vec::new(),
             testing: false,
             needs_float_format: false,
             uses_macos: false,
@@ -2080,6 +2137,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             param_slots,
             param_storage: vec![None, None],
             return_slot: None,
+            owned_storage: c.owned_storage,
             uses_float_format: false,
             uses_macos: false,
             uses_vulkan: false,

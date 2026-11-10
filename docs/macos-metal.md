@@ -178,5 +178,5 @@ Atlas visar moduler, structar, värde-enums, muterbara borrows, dynamiska
 arrayer, flyttal, loopar och inmatningsstyrt tillstånd i ett verkligt program.
 Dess ringar, cirklar, roterade kort, fontgrafik och sinusapproximationer är
 implementerade under `dogfood/metal/`. Vertexbufferten reserveras en gång
-och töms med `clear()` inför varje bild. Det återanvänder lagringen i Dunders
-nuvarande processarena i stället för att skapa en ny array varje bild.
+och töms med `clear()` inför varje bild. Det återanvänder lagringen och
+undviker både nyallokering och frigöring av vertexbufferten varje bild.

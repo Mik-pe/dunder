@@ -256,9 +256,10 @@ funktionsanrop. Referenser kan ännu inte returneras eller lagras.
 
 Map (`string` → `i64`), set av strängar, arrayalgoritmer, text, bytekodning,
 decimalparsning, hashning och SHA-256 är skrivna i Dunder och inbäddade i
-kompilatorn. Generiska map/set återstår. Dynamiska buffertar använder en
-separat 512 MiB processarena utan återvinning av enskilda buffertar; strängar
-har kvar sin 16 MiB arena. Läs [API, borrows och gränser](docs/standard.md).
+kompilatorn. Generiska map/set återstår. Dynamiska buffertar har unikt
+ägarskap och återvinns vid tilldelning och scope-slut. Oföränderliga strängar
+delas med referensräkning. Läs [minnesmodellen](docs/memory.md) och
+[API, borrows och gränser](docs/standard.md).
 
 ## Enums och match
 
@@ -321,11 +322,11 @@ Kör `cargo run --release -- run dogfood/utf8.ddr` för textstatistik och
 [Textfunktionerna](dogfood/text/scan.ddr), inklusive `find`, `replace` och
 ordräkning, är skrivna i Dunder och har egna taggade tester.
 
-Första implementationen lagrar dynamiskt byggda strängar i en separat
-**16 MiB processarena**, som mappas vid första behov. Strängarna lever tills
-processen avslutas. Ingen GC används, och minnet återvinns ännu inte under
-körningen. En full arena ger ett definierat runtimefel. Detta är en första
-körmodell för dogfooding, inte den färdiga ägar-/lånemodellen.
+Dynamiska strängar återvinns när sista ägaren försvinner, med icke-atomär
+referensräkning för dessa oföränderliga värden. Literaler ligger kvar i
+programbilden. Den återanvändbara strängpoolen är begränsad till **16 MiB**
+plus en sida bokföring; en full pool ger ett definierat runtimefel.
+Ingen spårande GC används. Läs [ägarskap, kostnader och gränser](docs/memory.md).
 
 ## Flyttal
 

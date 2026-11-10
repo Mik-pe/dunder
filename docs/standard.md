@@ -77,8 +77,9 @@ samma rotvariabel; även olika fält i samma struct räknas konservativt som
 samma rot. Ändringar som kan flytta en arraybuffert måste beräknas före
 en elementtilldelning eller ett anrop som lånar elementet.
 
-Det är en prövad, begränsad lånemodell. Generella livstider, ägare som kan
-flyttas och återvinning av enskilda allokeringar återstår.
+Det är en prövad, begränsad lånemodell. Generella livstider och explicita
+flyttar återstår. Ägda allokeringar återvinns automatiskt; se
+[minnesmodellen](memory.md).
 
 ## Moduler
 
@@ -127,12 +128,17 @@ Bytekodning och SHA-256 dogfoodar dessa operationer.
 
 ## Lagring och verifiering
 
-Dynamiska buffertar använder en separat **512 MiB processarena**, mappad vid första behov.
-Geometrisk tillväxt och kopiering allokerar nya buffertar. Gamla buffertar
-återvinns vid processlut; `clear` återanvänder den aktuella bufferten.
-Full arena, misslyckad mappning eller för stor/negativ arrayreserv ger
+Dynamiska buffertar använder en separat **512 MiB pool** plus en sida
+bokföring, mappad vid första behov. Buffertarna har unika ägare; kopior
+är oberoende. Tillväxt frigör den gamla bufferten efter kopieringen.
+Tilldelning, scope-slut och retur frigör övergivna buffertar, även i nästlade
+structar och aktiva enumpayloads. `clear` frigör elementens strängreferenser
+och behåller själva bufferten för nästa användning.
+Full pool, misslyckad mappning eller för stor/negativ arrayreserv ger
 status 109. Detta är ännu inget generellt allokerar- eller deallokerar-API.
-Strängarna har fortsatt sin separata 16 MiB arena.
+Strängar har referensräkning och en separat återanvändbar 16 MiB pool.
+Poolerna använder storleksklasser; fragmentering och levande värden kan
+fortfarande fylla dem. Läs [kostnader och gränser](memory.md).
 
 ```sh
 cargo run --release -- run dogfood/standard.ddr

@@ -156,8 +156,9 @@ lyckat resultat. Växer den utöver den uppmätta storleken under läsningen
 ger EOF-kontrollen fel 35 i stället för tyst trunkering. Läsningen är inte
 en atomisk snapshot gentemot samtidiga skribenter.
 
-Lästa strängar använder den befintliga **16 MiB processarenan** tillsammans
-med övriga dynamiska strängar. Enskilda strängar återvinns inte under körning.
+Lästa strängar använder den befintliga **16 MiB strängpoolen** tillsammans
+med övriga dynamiska strängar och återvinns när sista ägaren försvinner.
+Interna bytepackningar och läsbuffertar på felvägar frigörs också.
 Om plats saknas ger `read_text` fel 12, stänger filen och lämnar programmet
 igång. En tidigare lyckad läsning behåller sitt värde. Vanlig strängbyggnad
 har fortsatt sitt befintliga fatala arenafel; sys ändrar inte den regeln.

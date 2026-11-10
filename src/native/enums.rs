@@ -28,6 +28,7 @@ impl Code<'_> {
         self.typed_store(Type::I32, 9);
         for (offset, value) in fields {
             self.expr(value);
+            self.retain_string(value.ty);
             self.local_addr(storage);
             self.imm(11, *offset as u64);
             self.add(9, 9, 11);
@@ -81,11 +82,25 @@ impl Code<'_> {
                 } else {
                     self.typed_load(binding.ty);
                 }
-                self.store(binding.slot, 0);
+                if matches!(binding.ty, Type::String | Type::Bytes | Type::Runes) {
+                    self.store_string(binding.slot);
+                } else {
+                    self.store(binding.slot, 0);
+                }
             }
             self.stmts(&arm.body);
+            for binding in arm.bindings.iter().rev() {
+                if let Some(storage) = binding.storage {
+                    self.release_storage(storage, binding.ty);
+                } else if matches!(binding.ty, Type::String | Type::Bytes | Type::Runes) {
+                    self.release_storage(binding.slot, binding.ty);
+                }
+            }
             self.branch(done, Branch::Jump);
         }
         self.mark(done);
+        if let Some(storage) = storage {
+            self.release_storage(storage, source.ty);
+        }
     }
 }

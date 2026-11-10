@@ -260,7 +260,8 @@ fn reads_cover_short_empty_large_and_oversized_files_and_allocation_failure() {
     let oversized = fs::File::create(work.0.join("oversized")).unwrap();
     oversized.set_len(5 * 1024 * 1024 * 1024).unwrap();
     drop(oversized);
-    let out=work.run(r#"
+    let out = work.run(
+        r#"
 import sys
 fn main(){
     large:=sys.read_text("large");assert(large.ok&&large.value.len==1048576)
@@ -269,11 +270,23 @@ fn main(){
     assert(sys.read_text("oversized").error==27)
     assert(sys.write_text("empty","").ok);assert(sys.read_text("empty").ok)
     assert(sys.read_text("empty").value=="")
+    for i in 0..20{r:=sys.read_text("large");assert(r.ok&&r.value.len==1048576)}
+    var retained:[]string=[]
     var failed:=false
-    for i in 0..20{r:=sys.read_text("large");if !r.ok{assert(r.error==12&&r.value=="");failed=true;break}}
-    assert(failed);print(42)
+    for i in 0..20{
+        r:=sys.read_text("large")
+        if !r.ok{assert(r.error==12&&r.value=="");failed=true;break}
+        retained.push(r.value)
+    }
+    assert(failed)
+    retained.clear()
+    recovered:=sys.read_text("large")
+    assert(recovered.ok&&recovered.value.len==1048576)
+    assert(large.value[0]==120&&large.value[1048575]==120)
+    print(42)
 }
-"#);
+"#,
+    );
     success(&out);
     assert_eq!(out.stdout, b"42\n");
 }
