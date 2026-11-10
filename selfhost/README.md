@@ -47,6 +47,8 @@ Behåll Rust-bootstrapens versionsmärkta källkod även när självhosting finn
 Med Rust-verktygskedjan installerad kan binärerna byggas från en ren checkout:
 
 ```sh
+git clone --branch language/typed-native https://github.com/Mik-pe/dunder.git
+cd dunder
 cargo build --release
 cargo run --release -- build selfhost/main.ddr -o build/dunder-ddr
 cargo test

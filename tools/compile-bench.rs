@@ -111,7 +111,7 @@ fn main() {
         fs::remove_file(out).unwrap();
     }
     times.sort_by(f64::total_cmp);
-    let median = times[times.len() / 2];
+    let median = (times[(times.len() - 1) / 2] + times[times.len() / 2]) / 2.;
     let p95 = times[(times.len() * 95).div_ceil(100) - 1];
     println!("generated stress corpus: {lines} lines, {bytes} bytes, {token_count} tokens, 1001 functions, 21 modules");
     println!("{rounds} fresh processes, no compiler cache, warm OS cache, one worker");

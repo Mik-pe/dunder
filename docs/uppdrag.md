@@ -88,4 +88,4 @@ vanlig Dunder-kompilering använder den egna backendvägen. Kalla inte detta
 självhosting och gör inga prestandaanspråk utan mätkontraktets bevis.
 
 Arbeta på språkgrenen och bevara fröexperimenten och andra checkoutar.
-Ingen push, merge till main eller extern publicering ingår i detta steg.
+Pusha den verifierade språkgrenen enligt användarens senare uttryckliga instruktion.

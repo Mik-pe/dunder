@@ -29,3 +29,32 @@ ingår i fördelningen. Detta prov visar genomströmning för genererad stressko
 Det uppfyller inte ensamt [hela prestandakontraktet](../docs/prestanda.md):
 representativa moduler med samlingar/lån, C/C++-jämförelse, kall OS-cache,
 inkrementella arbetsfall och ett verkligt självhostat kompilatorbygge återstår.
+
+## Resultat 2026-11-10
+
+| Mått | Resultat |
+| --- | --- |
+| Maskin | Apple M5, 24 GiB, arm64, macOS 27.2 (26B123). |
+| Kompilator | `90d232ab810367d235ed3d0c6252770d96adaf54`, Rust-bootstrap byggd med `cargo build --release`. |
+| Indata | 101 024 kodrader, 2 216 254 byte, 508 056 token, 21 moduler, 1 001 funktioner. |
+| Försök | 30 nya processer och utdatafiler; en arbetare, ingen Dunder-cache, varm OS-cache. |
+| Median | 55,166 ms, utifrån de två mittersta observationerna. |
+| p95 | 59,026 ms, nearest rank. |
+| Genomströmning vid p95 | Cirka 1,71 miljoner genererade kodrader/s. |
+| Binärstorlek | 3 201 248 byte. |
+| Körverifiering | Samtliga 30 binärer skrev exakt `595500` och avslutades korrekt. |
+
+[Råvärden för alla försök](2026-11-10-compiler.csv) och
+[metadata, revisioner och checksummor](2026-11-10-compiler.json) följer med.
+Toppminne mättes inte. Den ursprungliga backendens korta hopp kunde inte
+bygga detta korpus; långa hopp/adresser fungerar nu. Optimeringarna omfattar
+kompaktare stackåtkomster, ASCII-parsning utan teckenindextabell och borttagning
+av onåbar kod. Detta prov isolerar inte varje optimerings enskilda bidrag.
+
+Som separat verkligt program byggdes `selfhost/main.ddr` med tolv moduler.
+En enskild observation från kompilatorns interna timer gav 1,867 ms
+läsning/parsning, 1,261 ms typkontroll, 0,870 ms kodgenerering/signering och
+8,818 ms totalt inklusive publicering. Den siffran inkluderar inte
+processstart och är inte en 30-försöksmätning eller ett självhostat bygge.
+Den byggda Dunder-skrivna kompilatorn byggde därefter hello och fibonacci med
+PATH utan externa verktyg; båda körresultaten och macOS-signaturerna godkändes.
