@@ -65,7 +65,6 @@ fn collection_types_and_immutability_are_checked() {
         ("fn main(){for i in 0..5{i=1}}", "E0208"),
         ("fn main(){for i in 0..5{};print(i)}", "E0205"),
         ("fn main(){a:=[0;65537]}", "E0220"),
-        ("fn f()->[i32;2]{return [1,2]} fn main(){}", "E0223"),
         ("fn main(){a:=[]}", "E0220"),
         ("fn main(){a:=[1,2];it:=a.iter();print(it[0])}", "E0221"),
         ("fn main(){a:=[[1,2];2]}", "E0220"),
@@ -137,10 +136,6 @@ fn attached_cases_and_struct_inputs_are_statically_checked() {
         ("struct Point{x:i32,x:i64} @test fn ok(){}", "E0240"),
         ("struct A{x:i32} struct B{a:A} @test fn ok(){}", "E0240"),
         ("fn f(p:Unknown){} @test fn ok(){}", "E0103"),
-        (
-            "struct Point{x:i32} fn f()->Point{Point{x:3}} @test fn ok(){}",
-            "E0223",
-        ),
     ] {
         let error = dunder::check_tests(source)
             .err()
@@ -383,6 +378,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         ("arena/main.ddr", "28\n"),
         ("structs.ddr", "25\n32\n3\n"),
         ("numeric/main.ddr", "5.0\n2.0\ntrue\n"),
+        ("filesystem.ddr", "18\nfilesystem ok\n"),
         ("collections.ddr", "-2\n-1\n0\n1\n13\n3\n"),
         ("utf8.ddr", "bytes=25\nrunes=20\nwords=5\n🌍 Hej världen\n"),
         (
@@ -406,7 +402,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("25 passed, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("28 passed, 0 failed"));
 }
 
 #[test]

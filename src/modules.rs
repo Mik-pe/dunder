@@ -76,8 +76,30 @@ struct Loader {
     modules: Vec<check::Module>,
     types: syntax::Types,
     paths: HashMap<PathBuf, usize>,
+    sys: Option<usize>,
 }
 impl Loader {
+    fn standard_sys(&mut self) -> Result<usize, Error> {
+        if let Some(id) = self.sys {
+            return Ok(id);
+        }
+        let id = self.sources.files.len();
+        self.sys = Some(id);
+        let text = include_str!("../stdlib/sys.ddr").to_owned();
+        let module =
+            syntax::parse_module_at(&text, &mut self.types, id).map_err(|e| e.in_file(id))?;
+        self.sources.files.push(Source {
+            path: PathBuf::from("<stdlib/sys.ddr>"),
+            text,
+        });
+        self.modules.push(check::Module {
+            functions: module.functions,
+            imports: Vec::new(),
+            records: module.records,
+            standard_sys: true,
+        });
+        Ok(id)
+    }
     fn visit(&mut self, path: &Path, origin: Option<(usize, Span)>) -> Result<usize, Error> {
         let io_error = |e: std::io::Error| {
             let (file, span) = origin.unwrap_or((0, Span { start: 0, end: 0 }));
@@ -105,6 +127,7 @@ impl Loader {
             functions: module.functions,
             imports: Vec::new(),
             records: module.records,
+            standard_sys: false,
         });
         for import in module.imports {
             let logical = Path::new(&import.path);
@@ -124,8 +147,12 @@ impl Loader {
                 )
                 .in_file(id));
             }
-            let target_path = path.parent().unwrap().join(logical).with_extension("ddr");
-            let target = self.visit(&target_path, Some((id, import.span)))?;
+            let target = if import.path == "sys" {
+                self.standard_sys()?
+            } else {
+                let target_path = path.parent().unwrap().join(logical).with_extension("ddr");
+                self.visit(&target_path, Some((id, import.span)))?
+            };
             self.modules[id].imports.push(check::Import {
                 name: import.alias,
                 target,

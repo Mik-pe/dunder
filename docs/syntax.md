@@ -197,6 +197,10 @@ import math
 import "geometry/vector" as vector
 ```
 
+`import sys` väljer det inbäddade macOS-systembiblioteket; se [sys](sys.md).
+Det kan aliaseras och dedupliceras precis som andra moduler. En egen lokal
+fil med samma namn importeras uttryckligt som `import "./sys" as local`.
+
 Den första importen läser `math.ddr` bredvid den importerande filen. Den andra
 läser `geometry/vector.ddr` relativt samma fil. Sökningen beror inte på
 processens arbetskatalog. Citerade relativa sökvägar kan innehålla `../`.
@@ -288,9 +292,10 @@ Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får va
 
 En struct kopieras vid bindning, tilldelning och parameteröverföring.
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
-oföränderliga; kopiera till en `var` för att ändra fält. Structar kan ännu
-inte returneras från funktioner. Det undviker pekare till avslutad stacklagring
-innan en ordentlig returkonvention för aggregat finns.
+oföränderliga; kopiera till en `var` för att ändra fält. Structar kan också
+returneras från funktioner. Anroparen äger resultatets lagring, så en
+returnerad lokal lämnar ingen pekare till avslutad stacklagring. Detta
+fungerar även för callbackreturer, rekursion och importerade nominella typer.
 
 I `if`-/`while`-villkor och `for`-huvuden behöver ett direkt struct-uttryck
 parenteser runt sig för att skiljas från kontrollflödets block. I vanliga
@@ -324,7 +329,8 @@ Nästlade arrayer, structelement och slices är ännu inte implementerade.
 Arrayer kopieras som värden, även till parametrar. `var` krävs för att
 tilldela ett element. Index har typen `i32`; negativa index och index vid
 eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
-längden som `i32`. Arrayer kan ännu inte returneras från funktioner.
+längden som `i32`. Fasta arrayer kan returneras från funktioner med samma
+kopiering till anroparens lagring som structar.
 
 `start..end` har typen `range`, inkluderar start och utesluter slut.
 Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
@@ -481,7 +487,7 @@ kompilator, länkare, signerare eller strängruntime.
 
 ## Nästa språkbeslut
 
-Nästlade aggregat, aggregatreturer, arrayslices, allmänt allokerings-API,
+Nästlade aggregat, arrayslices, allmänt allokerings-API,
 ägande/lån och egna iteratorer ska utvecklas genom riktiga program och
 feltester. Dogfood-arenan är tills vidare indexbaserad bump-allokering över
 en fast typad buffert. Självhosting är ett separat senare steg.

@@ -42,6 +42,13 @@ matteoperationer, klassificering, parametrar/returer och samlingar.
 Numeriska dogfood-program och en Dunder-skriven decimalformatterare driver
 stödet. Beskriv återstående matematikbibliotek och strängparser tydligt.
 
+Nästa steg är ett sys-bibliotek med filsystemsfunktioner för macOS.
+`import sys` är nu inbäddat och ger textläsning/-skrivning, append, metadata,
+kataloger, rename och borttagning med inspekterbara resultat. Detta driver
+också säkra struct- och arrayreturer med lagring hos anroparen. Fortsätt
+dogfooda genom riktiga filer i egna testkataloger och dokumentera gränserna:
+UTF-8, vanliga filer, 4 MiB per läsning och den befintliga strängarenan.
+
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera
 körda exempel med verifierade resultat. Språkets användare skriver Dunder,

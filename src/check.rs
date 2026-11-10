@@ -10,6 +10,7 @@ pub struct Program {
     pub main: Option<usize>,
     pub tests: Vec<TestCase>,
     pub float_formatter: Option<usize>,
+    pub sys_types: Option<SysTypes>,
 }
 pub struct TestCase {
     pub name: String,
@@ -25,6 +26,7 @@ pub struct Module {
     pub functions: Vec<ast::Function>,
     pub imports: Vec<Import>,
     pub records: Vec<ast::Record>,
+    pub standard_sys: bool,
 }
 pub struct Import {
     pub name: String,
@@ -41,6 +43,7 @@ struct Symbols {
     functions: HashMap<String, Global>,
     imports: HashMap<String, usize>,
     records: HashMap<String, (Type, bool)>,
+    standard_sys: bool,
 }
 pub struct Function {
     pub name: String,
@@ -49,6 +52,7 @@ pub struct Function {
     pub body: Vec<Stmt>,
     pub param_slots: Vec<usize>,
     pub param_storage: Vec<Option<usize>>,
+    pub return_slot: Option<usize>,
 }
 pub enum Stmt {
     Store(usize, Expr),
@@ -86,7 +90,8 @@ pub enum ExprKind {
     StringOp(StringOp, Vec<Expr>),
     Local(usize),
     Function(usize),
-    Call(Box<Expr>, Vec<Expr>),
+    Call(Box<Expr>, Vec<Expr>, Option<usize>),
+    SysCall(SysOp, Vec<Expr>, Option<usize>),
     Print(Box<Expr>),
     Cast(Box<Expr>),
     Unary(&'static str, Box<Expr>),
@@ -100,6 +105,24 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     Record(Vec<(usize, Expr)>, usize),
     Field(Box<Expr>, usize),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SysOp {
+    ReadText,
+    WriteText,
+    AppendText,
+    Mkdir,
+    Rename,
+    RemoveFile,
+    RemoveDir,
+    Metadata,
+    Pid,
+}
+#[derive(Clone, Copy)]
+pub struct SysTypes {
+    pub status: Type,
+    pub text: Type,
+    pub metadata: Type,
 }
 #[derive(Clone, Copy)]
 pub enum FloatOp {
@@ -499,9 +522,50 @@ impl Checker<'_> {
         self.hint(expr)
             .or_else(|| Self::float_literal(expr).then_some(Type::F64))
     }
+    fn sys_signature(&self, name: &str) -> Option<(SysOp, usize, Type)> {
+        let symbols = &self.symbols[self.module];
+        if !symbols.standard_sys {
+            return None;
+        }
+        let (op, count, result) = match name {
+            "__sys_read_text" => (SysOp::ReadText, 1, "TextResult"),
+            "__sys_write_text" => (SysOp::WriteText, 2, "Status"),
+            "__sys_append_text" => (SysOp::AppendText, 2, "Status"),
+            "__sys_mkdir" => (SysOp::Mkdir, 1, "Status"),
+            "__sys_rename" => (SysOp::Rename, 2, "Status"),
+            "__sys_remove_file" => (SysOp::RemoveFile, 1, "Status"),
+            "__sys_remove_dir" => (SysOp::RemoveDir, 1, "Status"),
+            "__sys_metadata" => (SysOp::Metadata, 1, "Metadata"),
+            "__sys_pid" => return Some((SysOp::Pid, 0, Type::I32)),
+            _ => return None,
+        };
+        Some((op, count, symbols.records[result].0))
+    }
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
+            A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.sys_signature(n).is_some()) =>
+            {
+                let A::Name(name) = &callee.kind else {
+                    unreachable!()
+                };
+                let (op, count, ty) = self.sys_signature(name).unwrap();
+                if args.len() != count {
+                    return Err(Error::new(
+                        "E0207",
+                        e.span,
+                        "invalid sys intrinsic argument count",
+                    ));
+                }
+                let values = args
+                    .iter()
+                    .map(|a| self.expr(a, Some(Type::String)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Expr {
+                    ty,
+                    kind: ExprKind::SysCall(op, values, self.storage(ty)),
+                }
+            }
             A::Float(n) => self.float(n, expected.unwrap_or(Type::F64), e.span)?,
             A::String(s) => Expr {
                 ty: Type::String,
@@ -1054,7 +1118,7 @@ impl Checker<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 Expr {
                     ty: ret,
-                    kind: ExprKind::Call(Box::new(target), values),
+                    kind: ExprKind::Call(Box::new(target), values, self.storage(ret)),
                 }
             }
         };
@@ -1328,6 +1392,7 @@ pub fn check_mode(program: ast::Program, mode: Mode) -> Result<Program, Error> {
             functions: program.functions,
             imports: Vec::new(),
             records: program.records,
+            standard_sys: false,
         }],
         program.types,
         mode,
@@ -1348,6 +1413,7 @@ pub(crate) fn check_modules(
     let mut symbols: Vec<Symbols> = (0..modules.len()).map(|_| Symbols::default()).collect();
     // Reserve nominal types and all file namespaces before resolving signatures.
     for (module, input) in modules.iter().enumerate() {
+        symbols[module].standard_sys = input.standard_sys;
         let mut names = std::collections::HashSet::new();
         for record in &input.records {
             if reserved(&record.name) {
@@ -1490,9 +1556,6 @@ pub(crate) fn check_modules(
                     function: index,
                 });
             }
-            if types.storage_bytes(f.ret).is_some() {
-                return Err(Error::new("E0223",f.span,"returning aggregate values is not supported yet; return scalar results from aggregate parameters").in_file(module));
-            }
             let ty = types.function(f.params.iter().map(|p| p.ty).collect(), f.ret);
             symbols[module].functions.insert(
                 f.name.clone(),
@@ -1525,6 +1588,11 @@ pub(crate) fn check_modules(
         }
     }
     let main = entry.map(|e| e.index);
+    let sys_types = symbols.iter().find(|s| s.standard_sys).map(|s| SysTypes {
+        status: s.records["Status"].0,
+        text: s.records["TextResult"].0,
+        metadata: s.records["Metadata"].0,
+    });
     let mut checked = Vec::new();
     let mut needs_float_format = false;
     for (module, input) in modules.into_iter().enumerate() {
@@ -1543,6 +1611,7 @@ pub(crate) fn check_modules(
                 };
                 let mut param_slots = Vec::new();
                 let mut param_storage = Vec::new();
+                let return_slot = c.types.storage_bytes(f.ret).map(|_| c.slot());
                 for p in &f.params {
                     param_slots.push(c.bind(&p.name, p.ty, false, p.span)?);
                     param_storage.push(c.lookup(&p.name).unwrap().storage);
@@ -1567,6 +1636,7 @@ pub(crate) fn check_modules(
                     body,
                     param_slots,
                     param_storage,
+                    return_slot,
                 })
             })()
             .map_err(|e: Error| e.in_file(module))?;
@@ -1586,6 +1656,7 @@ pub(crate) fn check_modules(
         main,
         tests,
         float_formatter,
+        sys_types,
     })
 }
 
@@ -1640,6 +1711,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             body,
             param_slots,
             param_storage: vec![None, None],
+            return_slot: None,
         })
     };
     build().map_err(|e| {

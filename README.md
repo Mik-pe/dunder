@@ -283,6 +283,32 @@ Kör `cargo run --release -- test dogfood/numeric/main.ddr` för sju numeriska
 testgrupper med vektorer, stabil summering, rotberäkning och numerisk
 integration. Läs [flyttalsreglerna och begränsningarna](docs/floating.md).
 
+## Systembibliotek på macOS
+
+`sys` följer med kompilatorn och kräver ingen lokal biblioteksfil:
+
+```dunder
+import sys
+
+fn main() {
+    saved := sys.write_text("hello.txt", "Hej från Dunder 🌍\n")
+    if !saved.ok { print(sys.error_message(saved.error)); return }
+    content := sys.read_text("hello.txt")
+    if content.ok { print(content.value) }
+    else { print(sys.error_message(content.error)) }
+}
+```
+
+API:t omfattar läsning, skrivning, append, metadata, mkdir, rename och
+borttagning av filer/tomma kataloger. Resultaten har `.ok` och `.error`;
+lästa strängar finns i `.value`. Vanliga I/O-fel avbryter inte processen.
+`read_text` validerar UTF-8 och läser högst 4 MiB per fil till strängarenan.
+Läs [sys-reglerna](docs/sys.md) för beteende och begränsningar och kör
+`cargo run --release -- test dogfood/filesystem.ddr` för filsystemets dogfood.
+
+Structar och fasta arrayer kan nu returneras som värden. Resultatet kopieras
+till lagring hos anroparen och fungerar även genom callbacks och rekursion.
+
 ## Implementerat och återstående
 
 Implementerat: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,
@@ -300,7 +326,7 @@ infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
 och körbar kod; optimering och byggprestanda är inte uppmätta.
 Bootstrapkompilatorn är skriven i Rust och är ännu inte självhostad.
 Structfält och arrayelement stöder i dag `i32`, `i64`, `f32`, `f64`, `bool`, `string` och `rune`.
-Arrayer/structar/iteratorer kan ännu inte returneras från funktioner.
+Arrayer och structar kan returneras från funktioner med värdesemantik.
 Nästlade aggregat, arrayslices, allmänt allokerings-API, ägande/lån och
 användardefinierade iteratorer återstår. Stränginterpolering, normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.

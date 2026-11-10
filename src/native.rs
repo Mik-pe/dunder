@@ -6,6 +6,7 @@ use crate::{
 };
 mod floats;
 mod strings;
+mod sys;
 
 type Label = usize;
 enum Branch {
@@ -34,6 +35,9 @@ struct Code<'a> {
     strings: strings::Runtime,
     float_formatter: Option<Label>,
     float_conversion: Label,
+    return_slot: Option<usize>,
+    sys: sys::Runtime,
+    sys_types: Option<crate::check::SysTypes>,
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -55,6 +59,9 @@ impl<'a> Code<'a> {
             strings: strings::Runtime::default(),
             float_formatter: None,
             float_conversion: 0,
+            return_slot: None,
+            sys: sys::Runtime::default(),
+            sys_types: None,
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -67,6 +74,7 @@ impl<'a> Code<'a> {
         c.assertion = c.label();
         c.strings = strings::Runtime::new(&mut c);
         c.float_conversion = c.label();
+        c.sys = sys::Runtime::new(&mut c);
         c
     }
     fn label(&mut self) -> Label {
@@ -164,12 +172,16 @@ impl<'a> Code<'a> {
         });
     }
     fn typed_store(&mut self, ty: Type, base: u32) {
+        self.typed_store_reg(ty, base, 0);
+    }
+    fn typed_store_reg(&mut self, ty: Type, base: u32, reg: u32) {
         self.emit(
             (match ty {
                 Type::I32 | Type::Rune | Type::F32 => 0xb9000000,
                 Type::Bool => 0x39000000,
                 _ => 0xf9000000,
-            }) | base << 5,
+            }) | base << 5
+                | reg,
         );
     }
     fn copy_value(&mut self, storage: usize, ty: Type) {
@@ -207,6 +219,7 @@ impl<'a> Code<'a> {
         match &e.kind {
             ExprKind::Float(bits) => self.imm(0, *bits),
             ExprKind::FloatOp(op, value) => self.float_expr(*op, value, e.ty),
+            ExprKind::SysCall(op, args, storage) => self.sys_expr(*op, args, *storage),
             ExprKind::String(s) => {
                 let label = self.string_literal(s);
                 self.branch(label, Branch::Address(0));
@@ -293,7 +306,7 @@ impl<'a> Code<'a> {
             ExprKind::Bool(b) => self.imm(0, u64::from(*b)),
             ExprKind::Local(s) => self.load(*s),
             ExprKind::Function(f) => self.branch(self.functions[*f], Branch::Address(0)),
-            ExprKind::Call(target, args) => {
+            ExprKind::Call(target, args, storage) => {
                 let direct = if let ExprKind::Function(f) = &target.kind {
                     Some(*f)
                 } else {
@@ -329,15 +342,23 @@ impl<'a> Code<'a> {
                         }
                     }
                 }
+                if let Some(storage) = storage {
+                    self.local_addr(*storage);
+                    self.mov(8, 9);
+                }
                 if let Some(f) = direct {
                     self.branch(self.functions[f], Branch::Call);
                 } else {
                     self.sp_addr(outgoing + args.len() * 16);
-                    self.emit(0xf9400128);
-                    self.emit(0xd63f0100); // blr x8
+                    self.emit(0xf9400131);
+                    self.emit(0xd63f0220); // blr x17; x8 is the aggregate result address
                 }
                 if e.ty.float() {
                     self.fp_to_bits(0, 0, e.ty);
+                }
+                if let Some(storage) = storage {
+                    self.local_addr(*storage);
+                    self.mov(0, 9);
                 }
                 self.stack_adjust(
                     outgoing + args.len() * 16 + if direct.is_none() { 16 } else { 0 },
@@ -541,6 +562,14 @@ impl<'a> Code<'a> {
                         if e.ty.float() {
                             self.bits_to_fp(0, 0, e.ty);
                         }
+                        if let Some(bytes) = self.types.storage_bytes(e.ty) {
+                            self.mov(10, 0);
+                            self.load(self.return_slot.expect("aggregate return destination"));
+                            self.mov(11, 0);
+                            self.imm(12, bytes as u64);
+                            self.copy_bytes(11, 10, 12, 13);
+                            self.load(self.return_slot.unwrap());
+                        }
                     } else {
                         self.imm(0, 0);
                     }
@@ -665,6 +694,7 @@ impl<'a> Code<'a> {
     }
     fn runtime(&mut self) {
         self.string_runtime();
+        self.sys_runtime();
         self.mark(self.print_int);
         self.prologue(64);
         self.emit(0x9100ffe1); // add x1,sp,#63
@@ -793,6 +823,7 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
     }
     let mut code = Code::new(program.functions.len(), &program.types);
     code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
+    code.sys_types = program.sys_types;
     code.emit(0xd51b441f); // msr fpcr,xzr: IEEE rounding and gradual underflow
                            // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
     code.imm(19, 0); // lazily mapped string arena cursor
@@ -802,8 +833,12 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
     code.emit(0xd4001001);
     code.emit(0xd4200000);
     for (i, f) in program.functions.iter().enumerate() {
+        code.return_slot = f.return_slot;
         code.mark(code.functions[i]);
         code.prologue(f.slots * 8);
+        if let Some(slot) = f.return_slot {
+            code.store(slot, 8);
+        }
         let (locations, _) = arguments(&f.params);
         for (param, location) in locations.iter().enumerate() {
             if let Argument::General(reg) = location {

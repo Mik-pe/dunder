@@ -47,6 +47,14 @@ i `/Users/mikpe/dev/dunder-language`.
   flyttalsfält/-arrayer, callbacks, returer och oberoende FP-/heltalsregister
   med stackspill. Decimalutskriften är skriven i `runtime/float.ddr`, bäddas
   in vid behov och använder exakta intervall för korta roundtrip-värden.
+- Medföljande `import sys` för ARM64/macOS: textläsning/-skrivning, append,
+  metadata, kataloger, rename, borttagning, process-ID och felmeddelanden.
+  Nominella resultatstructar har `.ok`/`.error`, läst text finns i `.value`.
+  Vanliga I/O-fel avbryter inte processen. UTF-8 valideras före exponering.
+  Biblioteket är inbäddat; det kräver inga lokala biblioteksfiler.
+- Structar och fasta arrayer kan returneras med kopiering till anroparens
+  lagring, även genom callbacks och rekursion. Ingen pekare till avslutad
+  stacklagring returneras.
 - `dunder check`, `dunder build`, `dunder run`, `dunder test`, enkelt dunder.toml
   med valfri `test_root`, atomisk
   publicering av utdata och `--timings`. `main` ger exitkod 0 eller en explicit
@@ -57,8 +65,8 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Verifiering
 
-`cargo test`: 53 testfunktioner passerar (en hashreferens, sexton dogfood-,
-elva språk-, nio modul-, åtta sträng- och åtta flyttalstester).
+`cargo test`: 61 testfunktioner passerar (en hashreferens, sexton dogfood-,
+elva språk-, nio modul-, åtta sträng-, åtta flyttals- och åtta systemtester).
 `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
 och `cargo build --release` är genomförda.
 
@@ -67,9 +75,10 @@ till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
 förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.ddr
 -o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
 
-`dunder test` kör nu 25 Dunder-testgrupper i dogfood-trädet: rekursion,
+`dunder test` kör nu 28 Dunder-testgrupper i dogfood-trädet: rekursion,
 moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
-arena, tabellfall, structargument, UTF-8, en liten tokenizer och numeriska program.
+arena, tabellfall, structargument, UTF-8, en liten tokenizer, numeriska program
+och filsystem. sys-bibliotekets felmeddelanden har också ett kopplat testblock.
 Varje grupp kompileras till en riktig
 nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
 ett misslyckat eller fastnat test hindrar inte nästa grupp. Tester kräver
@@ -102,13 +111,24 @@ Det numeriska Dunder-trädet provar omskalad hypotenusa, kompenserad summering,
 rotberäkning med bisektion och fjärde ordningens Runge–Kutta-integration.
 Alla exempel, importer och testfixturer använder nu `.ddr`.
 
+Systemtesterna kör verklig fil-I/O i isolerade temporära kataloger och
+kontrollerar innehåll med Rusts oberoende fil-API. Verifierat: Unicode och NUL
+i text, 64-bitars filstorlek, append, trunkering, rename, metadata, borttagning,
+symboliska länkar, saknade filer, icke-tomma kataloger, NUL/längd i sökvägar,
+ogiltig UTF-8, för stora filer och full strängarena. Hundratals lyckade och
+misslyckade läsningar lämnar oförändrat antal öppna handtag.
+Binärens signatur verifieras oberoende. En byte-reproducerbar binär fungerar
+med tom miljö efter att källfilerna tagits bort. Returproven omfattar structar, fasta/tomma arrayer,
+callbacks, rekursion, blandade parametrar och upprepade anrop.
+
 `cargo test` kör typkontroll och negativa felprov samt verkliga ARM64-binärer
 på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
 `codesign --verify` och körs med tom processmiljö, utan källfil och utan
 kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
 verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
-och structprogrammet. UTF-8-programmet, tokenizern, numerikprogrammet och
-alla 25 Dunder-testgrupper är också körda med releasekompilatorn utan verktyg i PATH.
+och structprogrammet. UTF-8-programmet, tokenizern, numerikprogrammet,
+filsystemsprogrammet och alla 28 Dunder-testgrupper är också körda med
+releasekompilatorn utan verktyg i PATH.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
 Modulprogrammet i examples/modules/main.ddr laddar tre filer och skriver
@@ -138,7 +158,7 @@ binär och utdata får inte skriva över källan.
 
 Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
 Structfält och arrayelement är än så länge begränsade till i32/i64/f32/f64/bool/string/rune.
-Arrayer får vara högst 64 KiB. Aggregatreturer, nästlade aggregat,
+Arrayer får vara högst 64 KiB. Nästlade aggregat,
 arrayslices, allmänt allokerings-API och ägande/lån återstår.
 Strängliteraler bor i programbilden. Dynamiska strängar bor i en separat
 16 MiB arena, som mappas vid första behov och återlämnas vid processlut.
@@ -151,6 +171,9 @@ handtag; den är ännu inget allmänt allokerings- eller låne-API.
 Iteratorer är inbyggda arraykopior, inte ett användardefinierat protokoll.
 Globala konstanter, paketregister och dynamiska bibliotek återstår.
 Ingen inkrementell cache.
+sys riktar sig bara till macOS/ARM64. Textläsning kräver vanliga UTF-8-filer,
+högst 4 MiB per fil, och delar strängarenans 16 MiB. Binär-I/O, kataloglistning,
+rekursiva katalogverktyg och filströmmar återstår. Se [sys-kontraktet](sys.md).
 Flyttal saknar än så länge fullständigt matematikbibliotek, trigonometriska
 funktioner, exp/log, strängparser och valbar utskriftsprecision. Den Dunder-skrivna
 formatteraren prioriterar korrekthet; prestanda är inte uppmätt.

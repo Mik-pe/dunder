@@ -12,6 +12,7 @@ const ARENA_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Default)]
 pub(super) struct Runtime {
     pub alloc: Label,
+    pub try_alloc: Label,
     pub compare: Label,
     pub concat: Label,
     pub slice: Label,
@@ -31,6 +32,7 @@ impl Runtime {
     pub fn new(c: &mut Code<'_>) -> Self {
         Self {
             alloc: c.label(),
+            try_alloc: c.label(),
             compare: c.label(),
             concat: c.label(),
             slice: c.label(),
@@ -50,43 +52,43 @@ impl Runtime {
 }
 
 impl Code<'_> {
-    fn add(&mut self, dst: u32, a: u32, b: u32) {
+    pub(super) fn add(&mut self, dst: u32, a: u32, b: u32) {
         self.emit(0x8b000000 | b << 16 | a << 5 | dst);
     }
-    fn sub(&mut self, dst: u32, a: u32, b: u32) {
+    pub(super) fn sub(&mut self, dst: u32, a: u32, b: u32) {
         self.emit(0xcb000000 | b << 16 | a << 5 | dst);
     }
-    fn add_imm(&mut self, dst: u32, src: u32, n: u32) {
+    pub(super) fn add_imm(&mut self, dst: u32, src: u32, n: u32) {
         self.emit(0x91000000 | n << 10 | src << 5 | dst);
     }
-    fn sub_imm(&mut self, dst: u32, src: u32, n: u32) {
+    pub(super) fn sub_imm(&mut self, dst: u32, src: u32, n: u32) {
         self.emit(0xd1000000 | n << 10 | src << 5 | dst);
     }
-    fn ldr(&mut self, dst: u32, src: u32) {
+    pub(super) fn ldr(&mut self, dst: u32, src: u32) {
         self.emit(0xf9400000 | src << 5 | dst);
     }
-    fn str(&mut self, src: u32, dst: u32) {
+    pub(super) fn str(&mut self, src: u32, dst: u32) {
         self.emit(0xf9000000 | dst << 5 | src);
     }
-    fn ldrb(&mut self, dst: u32, src: u32) {
+    pub(super) fn ldrb(&mut self, dst: u32, src: u32) {
         self.emit(0x39400000 | src << 5 | dst);
     }
-    fn strb(&mut self, src: u32, dst: u32) {
+    pub(super) fn strb(&mut self, src: u32, dst: u32) {
         self.emit(0x39000000 | dst << 5 | src);
     }
-    fn and(&mut self, dst: u32, a: u32, b: u32) {
+    pub(super) fn and(&mut self, dst: u32, a: u32, b: u32) {
         self.emit(0x8a000000 | b << 16 | a << 5 | dst);
     }
-    fn or(&mut self, dst: u32, a: u32, b: u32) {
+    pub(super) fn or(&mut self, dst: u32, a: u32, b: u32) {
         self.emit(0xaa000000 | b << 16 | a << 5 | dst);
     }
-    fn lsr(&mut self, dst: u32, src: u32, n: u32) {
+    pub(super) fn lsr(&mut self, dst: u32, src: u32, n: u32) {
         self.emit(0xd340fc00 | n << 16 | src << 5 | dst);
     }
-    fn lsl(&mut self, dst: u32, src: u32, n: u32) {
+    pub(super) fn lsl(&mut self, dst: u32, src: u32, n: u32) {
         self.emit(0xd3400000 | (64 - n) << 16 | (63 - n) << 10 | src << 5 | dst);
     }
-    fn ret(&mut self) {
+    pub(super) fn ret(&mut self) {
         self.emit(0xd65f03c0);
     }
 
@@ -157,7 +159,7 @@ impl Code<'_> {
     }
 
     // Clobbers byte, source, destination, count. Copies exactly count bytes.
-    fn copy_bytes(&mut self, dst: u32, src: u32, count: u32, byte: u32) {
+    pub(super) fn copy_bytes(&mut self, dst: u32, src: u32, count: u32, byte: u32) {
         let end = self.label();
         let again = self.label();
         self.branch(end, Branch::Zero(count));
@@ -172,7 +174,14 @@ impl Code<'_> {
     }
     pub(super) fn string_runtime(&mut self) {
         self.mark(self.strings.alloc);
+        self.prologue(0);
+        self.branch(self.strings.try_alloc, Branch::Call);
+        self.branch(self.strings.exhausted, Branch::Zero(0));
+        self.epilogue();
+        self.mark(self.strings.try_alloc);
         let mapped = self.label();
+        let map_failed = self.label();
+        let exhausted = self.label();
         self.branch(mapped, Branch::Nonzero(19));
         self.push(0);
         self.imm(0, 0);
@@ -183,7 +192,7 @@ impl Code<'_> {
         self.imm(5, 0); // MAP_ANON | MAP_PRIVATE
         self.imm(16, 0x20000c5);
         self.emit(0xd4001001); // Darwin mmap
-        self.branch(self.strings.exhausted, Branch::Cond(2));
+        self.branch(map_failed, Branch::Cond(2));
         self.mov(19, 0);
         self.imm(1, ARENA_BYTES);
         self.add(20, 19, 1);
@@ -194,11 +203,16 @@ impl Code<'_> {
         self.lsl(2, 2, 3);
         self.add(3, 19, 2);
         self.cmp(3, 20);
-        self.branch(self.strings.exhausted, Branch::Cond(8));
+        self.branch(exhausted, Branch::Cond(8));
         self.mov(2, 19);
         self.mov(19, 3);
         self.str(0, 2);
         self.mov(0, 2);
+        self.ret();
+        self.mark(map_failed);
+        self.pop(0);
+        self.mark(exhausted);
+        self.imm(0, 0);
         self.ret();
 
         self.mark(self.strings.compare); // left x1, right x0; result -1/0/1
