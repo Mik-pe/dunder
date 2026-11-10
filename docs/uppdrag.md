@@ -6,6 +6,11 @@ syntax, statiska typer och program som kompileras och körs. Användaren valde
 `:=` för deklaration med härledd typ, `: i32 =` för explicit typ och
 oföränderlighet som standard.
 
+Nästa implementerade steg är filmoduler. Användaren kräver importer utan
+filändelse: `import math` läser math.dn. Lägg till explicita exporter och
+typkontroll över modulgränser. Dunder-kod ska fortsätta kompileras med egen
+backend och bildskrivare utan GCC eller LLVM.
+
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera
 körda exempel med verifierade resultat. Språkets användare skriver Dunder,

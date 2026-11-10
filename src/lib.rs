@@ -1,4 +1,5 @@
 pub mod check;
+pub mod modules;
 pub mod native;
 pub mod syntax;
 
@@ -10,6 +11,7 @@ pub struct Span {
 
 #[derive(Debug)]
 pub struct Error {
+    pub file: usize,
     pub code: &'static str,
     pub span: Span,
     pub message: String,
@@ -18,10 +20,15 @@ pub struct Error {
 impl Error {
     pub fn new(code: &'static str, span: Span, message: impl Into<String>) -> Self {
         Self {
+            file: 0,
             code,
             span,
             message: message.into(),
         }
+    }
+    pub fn in_file(mut self, file: usize) -> Self {
+        self.file = file;
+        self
     }
     pub fn render(&self, path: &str, source: &str) -> String {
         let start = self.span.start.min(source.len());

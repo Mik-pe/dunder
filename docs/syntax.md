@@ -158,9 +158,79 @@ anrop och uttryck; en rad får fortsätta efter en binär operator.
 Kommentarer skrivs `// ...` eller `/* ... */`. Källan är UTF-8 och namn
 får innehålla bokstäver som `å`, `ä` och `ö`; nyckelorden är engelska.
 
+## Moduler och importer
+
+En fil är en modul. Namnen i modulen är lokala för den filen. Skriv en
+import på toppnivå **utan suffix**:
+
+```dunder
+import math
+import "geometry/vector" as vector
+```
+
+Den första importen läser `math.dn` bredvid den importerande filen. Den andra
+läser `geometry/vector.dn` relativt samma fil. Sökningen beror inte på
+processens arbetskatalog. Citerade relativa sökvägar kan innehålla `../`.
+Absoluta sökvägar och suffix i importer avvisas. Utan `as` kommer aliaset
+från det sista sökvägssegmentet; `import "geometry/vector"` får alias `vector`.
+Ett alias måste vara ett giltigt, icke reserverat namn. Till exempel kräver
+`import "foo-bar" as foo` ett explicit alias eftersom bindestreck inte ingår i namn.
+
+```dunder
+// math.dn
+pub fn double(value: i32) -> i32 {
+    return scale(value, 2)
+}
+
+fn scale(value: i32, factor: i32) -> i32 {
+    return value * factor
+}
+```
+
+```dunder
+// main.dn
+import math
+
+fn main() {
+    transform: fn(i32) -> i32 = math.double
+    print(transform(21))
+}
+```
+
+`fn` är privat; `pub fn` exporterar en namngiven funktion. Samma fil kan
+anropa sina privata funktioner. Andra moduler får bara använda dess publika
+funktioner via sitt importalias. Funktionsvärden och deras strukturella typer
+fungerar likadant över modulgränser som inom en fil.
+
+En import kopierar inga namn till aktuell namnrymd. `math.double` fungerar;
+`double` kräver en egen lokal bindning, exempelvis `double := math.double`.
+Alias får inte krocka med ett annat importalias eller en toppnivåfunktion i
+samma fil. Lokala värden får skugga ett alias; det skuggade namnet ger då
+inte längre tillgång till modulen i det scopet. En moduls egna importer
+exporteras inte vidare. Varje fil importerar sina egna beroenden uttryckligt.
+
+Moduler har i denna version bara funktioner, inga globala värden eller
+initialiseringskod. Signaturer från hela grafen fastställs före kropparna.
+Cirkulära importer är därför tillåtna och kan innehålla ömsesidig rekursion.
+Den kanoniska filsökvägen identifierar en modul: flera alias, gemensamma
+beroenden och symboliska länkar laddar samma fil en gång. Filernas och
+funktionernas ordning bestäms av källans import-/deklarationsordning.
+
+Rotfilen är filen som ges till kommandot eller manifestets `root`. Bara dess
+`main` är startpunkt; en importerad `main` ersätter aldrig en saknad rot-main.
+Fel i importerade filer anger deras egen fil, rad och kolumn. Ett missat eller
+oläsbart beroende anger importplatsen. `dunder check`, `build` och `run` läser
+hela det uttryckligt importerade trädet och ignorerar andra filer i katalogen.
+Ett nytt bygge läser om beroenden; inkrementell cache är inte implementerad.
+
+Hela programmet länkas av Dunders egen backend. Moduler är källnamnrymder,
+inte dynamiska bibliotek. Ingen GCC/LLVM-, assembler- eller länkprocess startas
+under Dunder-kompileringen. Bibliotekets strängbaserade `check`/`compile`
+använder en fil; filimporter kräver `modules::check_path` för en verklig rotfil.
+
 ## Nästa språkbeslut
 
-Poster och fältåtkomst, strängar, moduler/importer, arrayer/slices, ägande och
+Poster och fältåtkomst, strängar, arrayer/slices, ägande och
 lån ska utformas genom riktiga program och feltester. Inga syntaxer för dem
 utlovas av denna version. Självhosting och den minimala frökedjan är separata
 senare projektsteg och blockerar inte användningen av källspråket här.

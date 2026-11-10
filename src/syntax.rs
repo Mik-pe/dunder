@@ -72,12 +72,25 @@ impl Types {
 pub struct Program {
     pub functions: Vec<Function>,
     pub types: Types,
+    pub imports: Vec<Import>,
+}
+
+pub struct Module {
+    pub functions: Vec<Function>,
+    pub imports: Vec<Import>,
+}
+#[derive(Debug)]
+pub struct Import {
+    pub path: String,
+    pub alias: String,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Name(String),
     Number(i128),
+    String(String),
     Left,
     Right,
     Open,
@@ -86,6 +99,7 @@ enum Token {
     Define,
     Equal,
     Comma,
+    Dot,
     Semi,
     Newline,
     Arrow,
@@ -119,6 +133,54 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
         }
         if c.is_whitespace() {
             i += 1;
+            continue;
+        }
+        if c == '"' {
+            i += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while i < chars.len() {
+                let ch = chars[i].1;
+                if ch == '"' {
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                if ch == '\n' || ch == '\r' {
+                    break;
+                }
+                if ch == '\\' {
+                    i += 1;
+                    match chars.get(i).map(|x| x.1) {
+                        Some(c @ ('\\' | '"')) => value.push(c),
+                        _ => {
+                            return Err(Error::new(
+                                "E0004",
+                                Span {
+                                    start,
+                                    end: chars.get(i).map_or(source.len(), |x| x.0),
+                                },
+                                "only \\\\ and \\\" escapes are allowed in an import path",
+                            ))
+                        }
+                    }
+                } else {
+                    value.push(ch);
+                }
+                i += 1;
+            }
+            let end = chars.get(i).map_or(source.len(), |x| x.0);
+            if !closed {
+                return Err(Error::new(
+                    "E0004",
+                    Span { start, end },
+                    "unterminated import path",
+                ));
+            }
+            out.push(Lexeme {
+                token: Token::String(value),
+                span: Span { start, end },
+            });
             continue;
         }
         if c == '/' && next == Some('/') {
@@ -219,6 +281,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                     ':' => Token::Colon,
                     '=' => Token::Equal,
                     ',' => Token::Comma,
+                    '.' => Token::Dot,
                     ';' => Token::Semi,
                     '+' => Token::Op("+"),
                     '-' => Token::Op("-"),
@@ -261,6 +324,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
 
 #[derive(Debug)]
 pub struct Function {
+    pub public: bool,
     pub name: String,
     pub params: Vec<Param>,
     pub ret: Type,
@@ -305,18 +369,19 @@ pub enum ExprKind {
     Number(i128),
     Bool(bool),
     Name(String),
+    Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>),
     Unary(&'static str, Box<Expr>),
     Binary(&'static str, Box<Expr>, Box<Expr>),
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Lexeme>,
     pos: usize,
     depth: usize,
-    types: Types,
+    types: &'a mut Types,
 }
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> &Token {
         &self.tokens[self.pos].token
     }
@@ -455,7 +520,35 @@ impl Parser {
         self.depth -= 1;
         Ok(stmts)
     }
-    fn function(&mut self) -> Result<Function, Error> {
+    fn import(&mut self) -> Result<Import, Error> {
+        let span = self.take().span;
+        let token = self.take();
+        let path = match token.token {
+            Token::Name(path) | Token::String(path) => path,
+            _ => {
+                return Err(Error::new(
+                    "E0107",
+                    token.span,
+                    "expected a module name or relative path, for example import math",
+                ))
+            }
+        };
+        let alias = if self.is_word("as") {
+            self.take();
+            self.name()?.0
+        } else {
+            std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .into()
+        };
+        if *self.peek() != Token::Eof {
+            self.end_stmt()?;
+        }
+        Ok(Import { path, alias, span })
+    }
+    fn function(&mut self, public: bool) -> Result<Function, Error> {
         let (keyword, span) = self.name()?;
         if keyword != "fn" {
             return Err(Error::new(
@@ -486,6 +579,7 @@ impl Parser {
             Type::Unit
         };
         Ok(Function {
+            public,
             name,
             params,
             ret,
@@ -624,6 +718,17 @@ impl Parser {
             _ => return Err(Error::new("E0106", span, "expected an expression")),
         };
         loop {
+            if self.accept(Token::Dot) {
+                let (member, span) = self.name()?;
+                left = Expr {
+                    span: Span {
+                        start: left.span.start,
+                        end: span.end,
+                    },
+                    kind: ExprKind::Member(Box::new(left), member),
+                };
+                continue;
+            }
             if self.accept(Token::Left) {
                 let mut args = Vec::new();
                 while *self.peek() != Token::Right {
@@ -673,20 +778,36 @@ impl Parser {
 }
 
 pub fn parse(source: &str) -> Result<Program, Error> {
+    let mut types = Types::default();
+    let module = parse_module(source, &mut types)?;
+    Ok(Program {
+        functions: module.functions,
+        imports: module.imports,
+        types,
+    })
+}
+
+pub fn parse_module(source: &str, types: &mut Types) -> Result<Module, Error> {
     let mut parser = Parser {
         tokens: lex(source)?,
         pos: 0,
         depth: 0,
-        types: Types::default(),
+        types,
     };
     let mut functions = Vec::new();
+    let mut imports = Vec::new();
     parser.separators();
     while *parser.peek() != Token::Eof {
-        functions.push(parser.function()?);
+        if parser.is_word("import") {
+            imports.push(parser.import()?);
+        } else {
+            let public = parser.is_word("pub");
+            if public {
+                parser.take();
+            }
+            functions.push(parser.function(public)?);
+        }
         parser.separators();
     }
-    Ok(Program {
-        functions,
-        types: parser.types,
-    })
+    Ok(Module { functions, imports })
 }

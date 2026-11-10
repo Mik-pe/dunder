@@ -6,6 +6,11 @@ i `/Users/mikpe/dev/dunder-language`.
 ## Implementerat
 
 - `.dn` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
+- En fil per modul: `import math` eller `import "util/math" as math`, utan
+  suffix. Privata `fn` och exporterade `pub fn`, alias och kvalificerade namn.
+  Samlade signaturer stödjer cykliska importer och ömsesidig rekursion.
+  Kanoniska filsökvägar deduplicerar delade beroenden och symboliska länkar.
+  Importerade funktioner är vanliga typade funktionsvärden.
 
 - Användarens syntax: `x := 42`, `x: i32 = 42`, oföränderlighet som standard.
   `var x := 0` väljer muterbarhet och `x = ...` tilldelar.
@@ -25,8 +30,8 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Verifiering
 
-`cargo test`: tolv testfunktioner passerar (en hashreferens och elva
-integrationstester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
+`cargo test`: 21 testfunktioner passerar (en hashreferens, elva språk-
+och nio modultester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
 och `cargo build --release` är genomförda.
 
 Releasekompilatorn har dessutom byggt hello och fibonacci med `PATH` satt
@@ -40,6 +45,14 @@ på denna Mac. Varje native-test verifierar signaturen oberoende med
 utan kompilator i sin körväg.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
+Modulprogrammet i examples/modules/main.dn laddar tre filer och skriver
+`42`, `true`, `42`. Det är byggt/kört även med PATH utan externa verktyg.
+Modultesterna kontrollerar privat åtkomst, namn-/aliaskrockar, saknade filer,
+otillåtna importsuffix, syntax-/typfel i beroenden, rot-main, callbacktyper
+över modulgränser, cykler, diamanter och symlinkdeduplicering. Identiska
+projekt i olika kataloger ger identiska binärer; ändrade beroenden ändrar
+körresultatet. Typfel lämnar tidigare utdata orörd, och utdata får inte
+skriva över någon importerad källfil.
 Funktionsexemplet skriver `42`, `42` och `-42`. Funktionstesternas negativa
 fall kontrollerar felaktig/saknad main, felaktiga returvärden, saknade returer,
 och oförenliga callbacksignaturer med läsbara funktionstyper i diagnostiken.
@@ -58,7 +71,9 @@ binär och utdata får inte skriva över källan.
 ## Begränsningar och nästa steg
 
 Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
-Inga poster, strängar, moduler, arrayer/slices eller ägande/lån ännu.
+Inga poster, strängvärden, arrayer/slices eller ägande/lån ännu.
+Moduler exporterar funktioner; typer, globala konstanter, paketregister och
+dynamiska bibliotek ingår inte i första modulversionen. Ingen inkrementell cache.
 Anonyma funktioner och closures med infångade lokaler återstår.
 Overflow/division med noll ger definierad exitstatus;
 källpositioner i runtimefel återstår. Backend använder stackplatser och

@@ -83,10 +83,56 @@ Utdata hamnar då i `build/arm64-macos/hello`. Manifestets första delmängd
 består av dessa två strängfält. Kompileringsfel har fil, rad, kolumn och
 felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
 
+## Moduler
+
+En `.dn`-fil är en modul. Importen skrivs **utan filändelse** och söks
+relativt filen som importerar:
+
+```dunder
+// math.dn
+pub fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+```
+
+```dunder
+// main.dn
+import math
+
+fn main() {
+    print(math.add(40, 2))
+}
+```
+
+`fn` är privat inom modulen; `pub fn` exporterar funktionen. `import math`
+läser `math.dn`. Undermappar och alias skrivs exempelvis
+`import "util/predicates" as predicates`. `import "math"` stöds också.
+Ingen importform innehåller `.dn`.
+
+Kör [exemplet med tre moduler](examples/modules/main.dn):
+
+```sh
+cargo run --release -- run examples/modules/main.dn
+# 42
+# true
+# 42
+```
+
+Importer är explicita och läses bara en gång per verklig fil. Funktioner
+med samma namn i olika moduler hålls åtskilda. Alla signaturer samlas före
+typkontroll av kropparna, så ömsesidig rekursion fungerar även över
+cirkulära importer. Endast rotmodulens `main` är programstart.
+
+Hela modulträdet byggs till samma körbara fil med Dunders egen kodgenerering,
+symbolupplösning, Mach-O-skrivning och signering. Dunder-kompileringen anropar
+varken GCC, LLVM, extern assembler, extern länkare eller extern signerare.
+Rust används fortfarande för att bygga själva bootstrapkompilatorn.
+
 ## Implementerat och återstående
 
 Implementerat: `i32`, `i64`, `bool`, typade funktioner och funktionsvärden,
 callbacks, funktioner som returvärden, framåtanrop och rekursion,
+filmoduler med explicita importer, alias, namnrymder och privata/exporterade funktioner,
 härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/else`,
 `while`, `break/continue`, kortslutande booleska operatorer, heltalsaritmetik,
 kontrollerade heltalskonverteringar och `print`. Läs [syntaxen](docs/syntax.md).
@@ -96,7 +142,7 @@ Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
 infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
 och körbar kod; optimering och byggprestanda är inte uppmätta.
 Bootstrapkompilatorn är skriven i Rust och är ännu inte självhostad. Strängar,
-poster, moduler, arrayer/slices och ägande/lån är kommande språksteg.
+poster, arrayer/slices och ägande/lån är kommande språksteg.
 
 [Aktuellt arbete](docs/status.md) · [Arkitektur](docs/arkitektur.md) ·
 [Prestandamål och mätkontrakt](docs/prestanda.md)

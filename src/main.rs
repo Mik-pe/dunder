@@ -130,21 +130,20 @@ fn run() -> Result<i32, String> {
     } else {
         manifest()?
     };
-    let source =
-        fs::read_to_string(&source_path).map_err(|e| format!("{}: {e}", source_path.display()))?;
-    let read_time = start.elapsed();
-    let checked = dunder::check(&source)
-        .map_err(|e| e.render(&source_path.display().to_string(), &source))?;
-    let check_time = start.elapsed() - read_time;
+    let loaded = dunder::modules::load(&source_path).map_err(|e| e.render())?;
+    let module_count = loaded.sources.files.len();
+    let load_time = start.elapsed();
+    let checked = loaded.check().map_err(|e| e.render())?;
+    let check_time = start.elapsed() - load_time;
     if command == "check" {
-        println!("checked {}", source_path.display());
+        println!("checked {} ({module_count} modules)", source_path.display());
         return Ok(0);
     }
-    let image = dunder::native::compile(&checked)?;
-    let native_time = start.elapsed() - read_time - check_time;
+    let image = checked.compile().map_err(|e| checked.render(&e))?;
+    let native_time = start.elapsed() - load_time - check_time;
     let output = output.unwrap_or_else(|| PathBuf::from("build/arm64-macos").join(name));
     if let Ok(existing) = fs::canonicalize(&output) {
-        if existing == fs::canonicalize(&source_path).map_err(|e| e.to_string())? {
+        if checked.sources.files.iter().any(|s| s.path == existing) {
             return Err("output must not overwrite the source file".into());
         }
     }
@@ -156,8 +155,8 @@ fn run() -> Result<i32, String> {
     }
     if timings {
         eprintln!(
-            "read={:.3}ms parse+check={:.3}ms native+sign={:.3}ms total={:.3}ms",
-            read_time.as_secs_f64() * 1000.,
+            "modules={module_count} load+parse={:.3}ms check={:.3}ms native+sign={:.3}ms total={:.3}ms",
+            load_time.as_secs_f64() * 1000.,
             check_time.as_secs_f64() * 1000.,
             native_time.as_secs_f64() * 1000.,
             start.elapsed().as_secs_f64() * 1000.

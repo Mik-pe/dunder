@@ -9,6 +9,25 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub main: usize,
 }
+pub struct Module {
+    pub functions: Vec<ast::Function>,
+    pub imports: Vec<Import>,
+}
+pub struct Import {
+    pub name: String,
+    pub target: usize,
+    pub span: Span,
+}
+struct Global {
+    index: usize,
+    ty: Type,
+    public: bool,
+}
+#[derive(Default)]
+struct Symbols {
+    functions: HashMap<String, Global>,
+    imports: HashMap<String, usize>,
+}
 pub struct Function {
     pub name: String,
     pub params: Vec<Type>,
@@ -47,7 +66,8 @@ struct Binding {
     mutable: bool,
 }
 struct Checker<'a> {
-    signatures: &'a HashMap<String, (usize, Type)>,
+    module: usize,
+    symbols: &'a [Symbols],
     types: &'a Types,
     scopes: Vec<HashMap<String, Binding>>,
     slots: usize,
@@ -71,6 +91,9 @@ fn reserved(name: &str) -> bool {
             | "i64"
             | "bool"
             | "print"
+            | "import"
+            | "pub"
+            | "as"
     )
 }
 fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
@@ -86,6 +109,53 @@ fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
 }
 
 impl Checker<'_> {
+    fn global(&self, name: &str) -> Option<(usize, Type)> {
+        self.symbols[self.module]
+            .functions
+            .get(name)
+            .map(|g| (g.index, g.ty))
+    }
+    fn member(&self, base: &ast::Expr, name: &str, span: Span) -> Result<(usize, Type), Error> {
+        let ast::ExprKind::Name(alias) = &base.kind else {
+            return Err(Error::new(
+                "E0405",
+                span,
+                "module access must use an imported alias, such as math.add",
+            ));
+        };
+        if self.lookup(alias).is_some() {
+            return Err(Error::new(
+                "E0405",
+                span,
+                format!("'{alias}' is a local value, not a module"),
+            ));
+        }
+        let target = self.symbols[self.module]
+            .imports
+            .get(alias)
+            .ok_or_else(|| {
+                Error::new(
+                    "E0404",
+                    base.span,
+                    format!("unknown module alias '{alias}'"),
+                )
+            })?;
+        let function = self.symbols[*target].functions.get(name).ok_or_else(|| {
+            Error::new(
+                "E0404",
+                span,
+                format!("module '{alias}' has no function '{name}'"),
+            )
+        })?;
+        if !function.public {
+            return Err(Error::new(
+                "E0403",
+                span,
+                format!("'{alias}.{name}' is private; export it with 'pub fn'"),
+            ));
+        }
+        Ok((function.index, function.ty))
+    }
     fn lookup(&self, name: &str) -> Option<Binding> {
         self.scopes.iter().rev().find_map(|s| s.get(name)).cloned()
     }
@@ -120,7 +190,10 @@ impl Checker<'_> {
             ast::ExprKind::Name(n) => self
                 .lookup(n)
                 .map(|b| b.ty)
-                .or_else(|| self.signatures.get(n).map(|(_, ty)| *ty)),
+                .or_else(|| self.global(n).map(|(_, ty)| ty)),
+            ast::ExprKind::Member(base, name) => {
+                self.member(base, name, expr.span).ok().map(|(_, ty)| ty)
+            }
             ast::ExprKind::Call(callee, _) => {
                 if let ast::ExprKind::Name(n) = &callee.kind {
                     if n == "i32" {
@@ -172,13 +245,20 @@ impl Checker<'_> {
                         ty: b.ty,
                         kind: ExprKind::Local(b.slot),
                     }
-                } else if let Some((index, ty)) = self.signatures.get(n) {
+                } else if let Some((index, ty)) = self.global(n) {
                     Expr {
-                        ty: *ty,
-                        kind: ExprKind::Function(*index),
+                        ty,
+                        kind: ExprKind::Function(index),
                     }
                 } else {
                     return Err(Error::new("E0205", e.span, format!("unknown name '{n}'")));
+                }
+            }
+            A::Member(base, name) => {
+                let (index, ty) = self.member(base, name, e.span)?;
+                Expr {
+                    ty,
+                    kind: ExprKind::Function(index),
                 }
             }
             A::Unary("-", inner) if matches!(inner.kind, A::Number(_)) => {
@@ -426,88 +506,149 @@ impl Checker<'_> {
 }
 
 pub fn check(program: ast::Program) -> Result<Program, Error> {
-    let ast::Program {
-        functions,
-        mut types,
-    } = program;
-    let mut signatures = HashMap::new();
-    for (i, f) in functions.iter().enumerate() {
-        if reserved(&f.name) {
-            return Err(Error::new(
-                "E0200",
-                f.span,
-                format!("'{}' is reserved", f.name),
-            ));
+    if let Some(import) = program.imports.first() {
+        return Err(Error::new(
+            "E0400",
+            import.span,
+            "imports require a source path; use the file-based module loader",
+        ));
+    }
+    check_modules(
+        vec![Module {
+            functions: program.functions,
+            imports: Vec::new(),
+        }],
+        program.types,
+    )
+}
+
+pub(crate) fn check_modules(modules: Vec<Module>, mut types: Types) -> Result<Program, Error> {
+    let mut symbols: Vec<Symbols> = (0..modules.len()).map(|_| Symbols::default()).collect();
+    let mut index = 0;
+    // Collect every signature before checking any body: forward calls and
+    // mutual recursion work even across a cycle in the import graph.
+    for (module, input) in modules.iter().enumerate() {
+        for f in &input.functions {
+            if reserved(&f.name) {
+                return Err(
+                    Error::new("E0200", f.span, format!("'{}' is reserved", f.name))
+                        .in_file(module),
+                );
+            }
+            let ty = types.function(f.params.iter().map(|p| p.ty).collect(), f.ret);
+            if symbols[module]
+                .functions
+                .insert(
+                    f.name.clone(),
+                    Global {
+                        index,
+                        ty,
+                        public: f.public,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::new(
+                    "E0203",
+                    f.span,
+                    format!("duplicate function '{}'", f.name),
+                )
+                .in_file(module));
+            }
+            index += 1;
         }
-        if signatures
-            .insert(
-                f.name.clone(),
-                (
-                    i,
-                    types.function(f.params.iter().map(|p| p.ty).collect(), f.ret),
-                ),
-            )
-            .is_some()
-        {
-            return Err(Error::new(
-                "E0203",
-                f.span,
-                format!("duplicate function '{}'", f.name),
-            ));
+        for import in &input.imports {
+            if reserved(&import.name) || !identifier(&import.name) {
+                return Err(Error::new(
+                    "E0401",
+                    import.span,
+                    "invalid or reserved module alias; choose a name with 'as'",
+                )
+                .in_file(module));
+            }
+            if symbols[module].functions.contains_key(&import.name)
+                || symbols[module]
+                    .imports
+                    .insert(import.name.clone(), import.target)
+                    .is_some()
+            {
+                return Err(Error::new(
+                    "E0402",
+                    import.span,
+                    format!("duplicate module or function name '{}'", import.name),
+                )
+                .in_file(module));
+            }
         }
     }
     let span = Span { start: 0, end: 0 };
-    let (main, main_type) = signatures.get("main").ok_or_else(|| {
-        Error::new(
-            "E0212",
-            span,
-            "program needs 'fn main()' or 'fn main() -> i32'",
-        )
-    })?;
-    let sig = types.signature(*main_type).unwrap();
+    let entry = symbols
+        .first()
+        .and_then(|s| s.functions.get("main"))
+        .ok_or_else(|| {
+            Error::new(
+                "E0212",
+                span,
+                "root module needs 'fn main()' or 'fn main() -> i32'",
+            )
+        })?;
+    let sig = types.signature(entry.ty).unwrap();
     if !sig.params.is_empty() || !matches!(sig.ret, Type::I32 | Type::Unit) {
         return Err(Error::new(
             "E0212",
-            functions[*main].span,
+            modules[0].functions[entry.index].span,
             "main must take no arguments and return i32 or ()",
         ));
     }
-    let main = *main;
+    let main = entry.index;
     let mut checked = Vec::new();
-    for f in functions {
-        let mut c = Checker {
-            signatures: &signatures,
-            types: &types,
-            scopes: vec![HashMap::new()],
-            slots: 0,
-            ret: f.ret,
-            loops: 0,
-        };
-        for p in &f.params {
-            c.bind(&p.name, p.ty, false, p.span)?;
+    for (module, input) in modules.into_iter().enumerate() {
+        for f in input.functions {
+            let function = (|| {
+                let mut c = Checker {
+                    module,
+                    symbols: &symbols,
+                    types: &types,
+                    scopes: vec![HashMap::new()],
+                    slots: 0,
+                    ret: f.ret,
+                    loops: 0,
+                };
+                for p in &f.params {
+                    c.bind(&p.name, p.ty, false, p.span)?;
+                }
+                let (body, returns) = c.statements(&f.body)?;
+                if f.ret != Type::Unit && !returns {
+                    return Err(Error::new(
+                        "E0213",
+                        f.span,
+                        format!(
+                            "function '{}' must return {} on every path",
+                            f.name,
+                            types.name(f.ret)
+                        ),
+                    ));
+                }
+                Ok(Function {
+                    name: format!("m{module}.{}", f.name),
+                    params: f.params.iter().map(|p| p.ty).collect(),
+                    slots: c.slots,
+                    body,
+                })
+            })()
+            .map_err(|e: Error| e.in_file(module))?;
+            checked.push(function);
         }
-        let (body, returns) = c.statements(&f.body)?;
-        if f.ret != Type::Unit && !returns {
-            return Err(Error::new(
-                "E0213",
-                f.span,
-                format!(
-                    "function '{}' must return {} on every path",
-                    f.name,
-                    f.ret.name()
-                ),
-            ));
-        }
-        checked.push(Function {
-            name: f.name,
-            params: f.params.iter().map(|p| p.ty).collect(),
-            slots: c.slots,
-            body,
-        });
     }
     Ok(Program {
         types,
         functions: checked,
         main,
     })
+}
+
+fn identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
