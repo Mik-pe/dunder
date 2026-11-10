@@ -32,6 +32,13 @@ i `/Users/mikpe/dev/dunder-language`.
   Testkortformen pekar alltid på den annoterade funktionen även vid lokal skuggning.
 - Typfel med fil/rad/kolumn och felkod. Kontrollerad heltalsaritmetik och
   konvertering, samt kortslutande booleska uttryck.
+- Giltig, oföränderlig UTF-8 med typen `string`, rune-literaler och typen
+  `rune`, escapes, NUL, utskrift, sammanslagning, innehållsjämförelse,
+  kontrollerade byteindex och strängsnitt. `.len` räknar byte; `.bytes()`
+  och `.runes()` är återanvändbara vyer med indexering och `for`.
+  Heltal, bool och runes har `.str()`. Strängar kan returneras, gå genom
+  callbacks och lagras i structfält och arrayer. Dynamiska strängar använder
+  en begränsad processarena utan GC; se begränsningarna nedan.
 - `dunder check`, `dunder build`, `dunder run`, `dunder test`, enkelt dunder.toml
   med valfri `test_root`, atomisk
   publicering av utdata och `--timings`. `main` ger exitkod 0 eller en explicit
@@ -42,8 +49,8 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Verifiering
 
-`cargo test`: 37 testfunktioner passerar (en hashreferens, sexton dogfood-,
-elva språk- och nio modultester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
+`cargo test`: 45 testfunktioner passerar (en hashreferens, sexton dogfood-,
+elva språk-, nio modul- och åtta strängtester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
 och `cargo build --release` är genomförda.
 
 Releasekompilatorn har dessutom byggt hello och fibonacci med `PATH` satt
@@ -51,9 +58,10 @@ till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
 förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.dn
 -o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
 
-`dunder test` kör nu tolv Dunder-testgrupper i dogfood-trädet: rekursion,
+`dunder test` kör nu arton Dunder-testgrupper i dogfood-trädet: rekursion,
 moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
-arena, tabellfall och structargument. Varje grupp kompileras till en riktig
+arena, tabellfall, structargument, UTF-8 och en liten tokenizer.
+Varje grupp kompileras till en riktig
 nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
 ett misslyckat eller fastnat test hindrar inte nästa grupp. Tester kräver
 ingen main, kör inte befintlig main och dedupliceras över importer.
@@ -66,12 +74,23 @@ kontrollerar kopior och iterationskopior, blandade elementtyper, fler än
 åtta parametrar, gränsfel och intervall vid i32-gränserna. Kortformen provas
 mot felaktiga resultat och lokal skuggning så att testfallen verkligen kan fallera.
 
+Strängtesten kör svenska, grekiska, japanska, arabiska, emoji, kombinerande
+tecken, NUL och Unicode-gränsvärden. Bytevärden, kodpunkter, längder och
+snitt jämförs mot oberoende Rust-resultat. Körda fall omfattar returnerade
+strängar, callbacks, structar, arrayer, stackparametrar, iterationsvyer,
+heltalsformattering inklusive i64-minimum och avsiktligt felaktiga testresultat.
+Felaktig UTF-8, surrogates och feltyper avvisas vid kompilering; negativa
+index, fel snittgränser, ogiltiga rune-konverteringar och full strängarena
+ger verifierade felstatusar. Textstatistik och tokenizern använder `find`,
+`replace`, ordräkning och UTF-8-hjälpare skrivna i Dunder.
+
 `cargo test` kör typkontroll och negativa felprov samt verkliga ARM64-binärer
 på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
 `codesign --verify` och körs med tom processmiljö, utan källfil och utan
 kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
 verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
-och structprogrammet.
+och structprogrammet. UTF-8-programmet, tokenizern och alla arton
+Dunder-testgrupper är också körda med releasekompilatorn utan verktyg i PATH.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
 Modulprogrammet i examples/modules/main.dn laddar tre filer och skriver
@@ -100,16 +119,23 @@ binär och utdata får inte skriva över källan.
 ## Begränsningar och nästa steg
 
 Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
-Structfält och arrayelement är än så länge begränsade till i32/i64/bool.
+Structfält och arrayelement är än så länge begränsade till i32/i64/bool/string/rune.
 Arrayer får vara högst 64 KiB. Aggregatreturer, nästlade aggregat,
-strängvärden, slices, heapallokering och ägande/lån återstår.
+arrayslices, allmänt allokerings-API och ägande/lån återstår.
+Strängliteraler bor i programbilden. Dynamiska strängar bor i en separat
+16 MiB arena, som mappas vid första behov och återlämnas vid processlut.
+Enskilda strängar återvinns ännu inte under körning; upprepade operationer
+kan fylla arenan. Detta är en första dogfood-körmodell utan GC, inte färdig
+ägande-/lånekontroll. Normalisering, grapheme-kluster, interpolation och
+fullständig Unicode-klassificering återstår.
 Dogfood-arenan är bump-allokering över en fast stackbuffert med index som
 handtag; den är ännu inget allmänt allokerings- eller låne-API.
 Iteratorer är inbyggda arraykopior, inte ett användardefinierat protokoll.
 Globala konstanter, paketregister och dynamiska bibliotek återstår.
 Ingen inkrementell cache.
 Anonyma funktioner och closures med infångade lokaler återstår.
-Overflow/division med noll, gränsfel och assertions ger definierad exitstatus;
+Overflow/division med noll, gränsfel, assertions, full strängarena och ogiltiga
+Unicode-operationer ger definierad exitstatus;
 källpositioner och värden i runtimefel återstår. Backend använder stackplatser och
 saknar ännu optimeringar. Inga anspråk på 100k rader/s eller C-paritet.
 

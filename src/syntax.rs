@@ -5,6 +5,10 @@ pub enum Type {
     I32,
     I64,
     Bool,
+    String,
+    Rune,
+    Bytes,
+    Runes,
     Unit,
     Function(usize),
     Array(usize),
@@ -22,6 +26,10 @@ impl Type {
             Self::I32 => "i32",
             Self::I64 => "i64",
             Self::Bool => "bool",
+            Self::String => "string",
+            Self::Rune => "rune",
+            Self::Bytes => "string.bytes",
+            Self::Runes => "string.runes",
             Self::Unit => "()",
             Self::Function(_) => "fn",
             Self::Array(_) => "array",
@@ -73,7 +81,7 @@ impl ArrayType {
     pub fn elem_size(self) -> usize {
         match self.elem {
             Type::Bool => 1,
-            Type::I32 => 4,
+            Type::I32 | Type::Rune => 4,
             _ => 8,
         }
     }
@@ -130,11 +138,14 @@ impl Types {
             .or_else(|| self.record(ty).map(|r| r.bytes))
     }
     pub fn array_type(&mut self, elem: Type, len: usize, span: Span) -> Result<Type, Error> {
-        if !matches!(elem, Type::I32 | Type::I64 | Type::Bool) {
+        if !matches!(
+            elem,
+            Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune
+        ) {
             return Err(Error::new(
                 "E0220",
                 span,
-                "array elements must be i32, i64 or bool in this version",
+                "array elements must be i32, i64, bool, string or rune in this version",
             ));
         }
         let array = ArrayType { elem, len };
@@ -247,6 +258,7 @@ enum Token {
     Name(String),
     Number(i128),
     String(String),
+    Rune(char),
     Left,
     Right,
     Square,
@@ -295,13 +307,13 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             i += 1;
             continue;
         }
-        if c == '"' {
+        if matches!(c, '"' | '\'' | '`') {
             i += 1;
-            let mut value = String::new();
+            let mut bytes = Vec::new();
             let mut closed = false;
             while i < chars.len() {
                 let ch = chars[i].1;
-                if ch == '"' {
+                if ch == c {
                     i += 1;
                     closed = true;
                     break;
@@ -312,7 +324,80 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                 if ch == '\\' {
                     i += 1;
                     match chars.get(i).map(|x| x.1) {
-                        Some(c @ ('\\' | '"')) => value.push(c),
+                        Some(ch @ ('\\' | '"' | '\'' | '`')) => bytes.push(ch as u8),
+                        Some('n') => bytes.push(b'\n'),
+                        Some('r') => bytes.push(b'\r'),
+                        Some('t') => bytes.push(b'\t'),
+                        Some('0') => bytes.push(0),
+                        Some('x') => {
+                            let mut byte = 0;
+                            for _ in 0..2 {
+                                i += 1;
+                                let digit = chars
+                                    .get(i)
+                                    .and_then(|(_, ch)| ch.to_digit(16))
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            "E0005",
+                                            Span {
+                                                start,
+                                                end: chars.get(i).map_or(source.len(), |x| x.0),
+                                            },
+                                            "\\x requires exactly two hex digits",
+                                        )
+                                    })?;
+                                byte = byte * 16 + digit;
+                            }
+                            bytes.push(byte as u8);
+                        }
+                        Some('u') => {
+                            let braced = chars.get(i + 1).is_some_and(|x| x.1 == '{');
+                            if braced {
+                                i += 1;
+                            }
+                            let mut scalar = 0u32;
+                            let mut count = 0;
+                            loop {
+                                if braced && chars.get(i + 1).is_some_and(|x| x.1 == '}') {
+                                    i += 1;
+                                    break;
+                                }
+                                if !braced && count == 4 {
+                                    break;
+                                }
+                                i += 1;
+                                let digit = chars
+                                    .get(i)
+                                    .and_then(|(_, ch)| ch.to_digit(16))
+                                    .filter(|_| count < 6)
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            "E0005",
+                                            Span {
+                                                start,
+                                                end: chars.get(i).map_or(source.len(), |x| x.0),
+                                            },
+                                            "expected a Unicode escape: \\uXXXX or \\u{X...}",
+                                        )
+                                    })?;
+                                scalar = scalar * 16 + digit;
+                                count += 1;
+                            }
+                            let scalar =
+                                char::from_u32(scalar)
+                                    .filter(|_| count > 0)
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            "E0005",
+                                            Span {
+                                                start,
+                                                end: chars.get(i).map_or(source.len(), |x| x.0),
+                                            },
+                                            "escape must name a Unicode scalar value",
+                                        )
+                                    })?;
+                            bytes.extend_from_slice(scalar.encode_utf8(&mut [0; 4]).as_bytes());
+                        }
                         _ => {
                             return Err(Error::new(
                                 "E0004",
@@ -320,12 +405,12 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                                     start,
                                     end: chars.get(i).map_or(source.len(), |x| x.0),
                                 },
-                                "only \\\\ and \\\" escapes are allowed in a quoted string",
+                                "unknown string escape",
                             ))
                         }
                     }
                 } else {
-                    value.push(ch);
+                    bytes.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
                 }
                 i += 1;
             }
@@ -337,8 +422,31 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                     "unterminated quoted string",
                 ));
             }
+            let value = String::from_utf8(bytes).map_err(|_| {
+                Error::new(
+                    "E0005",
+                    Span { start, end },
+                    "string literal must contain valid UTF-8",
+                )
+            })?;
+            let token = if c == '`' {
+                let mut runes = value.chars();
+                let rune = runes
+                    .next()
+                    .filter(|_| runes.next().is_none())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "E0005",
+                            Span { start, end },
+                            "a rune literal must contain exactly one Unicode scalar value",
+                        )
+                    })?;
+                Token::Rune(rune)
+            } else {
+                Token::String(value)
+            };
             out.push(Lexeme {
-                token: Token::String(value),
+                token,
                 span: Span { start, end },
             });
             continue;
@@ -543,6 +651,8 @@ pub struct Expr {
 pub enum ExprKind {
     Number(i128),
     Bool(bool),
+    String(String),
+    Rune(char),
     Name(String),
     TestTarget(String),
     Member(Box<Expr>, String),
@@ -685,6 +795,8 @@ impl Parser<'_> {
             "i32" => Ok(Type::I32),
             "i64" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
+            "string" => Ok(Type::String),
+            "rune" => Ok(Type::Rune),
             "range" => Ok(Type::Range),
             _ => {
                 let mut name = n;
@@ -1012,6 +1124,14 @@ impl Parser<'_> {
         let mut left = match t.token {
             Token::Number(n) => Expr {
                 kind: ExprKind::Number(n),
+                span,
+            },
+            Token::String(s) => Expr {
+                kind: ExprKind::String(s),
+                span,
+            },
+            Token::Rune(r) => Expr {
+                kind: ExprKind::Rune(r),
                 span,
             },
             Token::Name(n) if n == "true" || n == "false" => Expr {

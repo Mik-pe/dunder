@@ -4,6 +4,7 @@ use crate::{
     check::{Expr, ExprKind, Program, Stmt},
     syntax::{Type, Types},
 };
+mod strings;
 
 type Label = usize;
 enum Branch {
@@ -29,6 +30,7 @@ struct Code<'a> {
     bounds: Label,
     assertion: Label,
     loops: Vec<(Label, Label)>,
+    strings: strings::Runtime,
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -47,6 +49,7 @@ impl<'a> Code<'a> {
             bounds: 0,
             assertion: 0,
             loops: Vec::new(),
+            strings: strings::Runtime::default(),
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -57,6 +60,7 @@ impl<'a> Code<'a> {
         c.io_error = c.label();
         c.bounds = c.label();
         c.assertion = c.label();
+        c.strings = strings::Runtime::new(&mut c);
         c
     }
     fn label(&mut self) -> Label {
@@ -129,7 +133,7 @@ impl<'a> Code<'a> {
         self.imm(9, (offset + 16) as u64);
         self.emit(0x8b0903a9); // add x9,x29,x9, past saved FP/LR
         self.emit(match ty {
-            Type::I32 => 0xb9800120,
+            Type::I32 | Type::Rune => 0xb9800120,
             Type::Bool => 0x39400120,
             _ => 0xf9400120,
         });
@@ -146,7 +150,7 @@ impl<'a> Code<'a> {
     }
     fn typed_load(&mut self, ty: Type) {
         self.emit(match ty {
-            Type::I32 => 0xb9800000,
+            Type::I32 | Type::Rune => 0xb9800000,
             Type::Bool => 0x39400000,
             _ => 0xf9400000,
         });
@@ -154,7 +158,7 @@ impl<'a> Code<'a> {
     fn typed_store(&mut self, ty: Type, base: u32) {
         self.emit(
             (match ty {
-                Type::I32 => 0xb9000000,
+                Type::I32 | Type::Rune => 0xb9000000,
                 Type::Bool => 0x39000000,
                 _ => 0xf9000000,
             }) | base << 5,
@@ -193,6 +197,12 @@ impl<'a> Code<'a> {
     }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::String(s) => {
+                let label = self.string_literal(s);
+                self.branch(label, Branch::Address(0));
+            }
+            ExprKind::StringView(base) => self.expr(base),
+            ExprKind::StringOp(op, args) => self.string_expr(*op, args),
             ExprKind::Record(fields, storage) => {
                 self.local_addr(*storage);
                 self.imm(11, self.types.storage_bytes(e.ty).unwrap() as u64);
@@ -296,7 +306,7 @@ impl<'a> Code<'a> {
                     self.emit(0xf940012a); // ldr x10,[x9] from evaluation temporary
                     self.sp_addr(offset);
                     self.emit(match args[arg].ty {
-                        Type::I32 => 0xb900012a,
+                        Type::I32 | Type::Rune => 0xb900012a,
                         Type::Bool => 0x3900012a,
                         _ => 0xf900012a,
                     });
@@ -320,10 +330,11 @@ impl<'a> Code<'a> {
             ExprKind::Print(x) => {
                 self.expr(x);
                 self.branch(
-                    if x.ty == Type::Bool {
-                        self.print_bool
-                    } else {
-                        self.print_int
+                    match x.ty {
+                        Type::Bool => self.print_bool,
+                        Type::String => self.strings.print,
+                        Type::Rune => self.strings.print_rune,
+                        _ => self.print_int,
                     },
                     Branch::Call,
                 );
@@ -371,6 +382,30 @@ impl<'a> Code<'a> {
                 self.push(0);
                 self.expr(b);
                 self.pop(1);
+                if a.ty == Type::String {
+                    self.branch(
+                        if *op == "+" {
+                            self.strings.concat
+                        } else {
+                            self.strings.compare
+                        },
+                        Branch::Call,
+                    );
+                    if *op != "+" {
+                        self.cmp(0, 31);
+                        let condition = match *op {
+                            "==" => 0,
+                            "!=" => 1,
+                            "<" => 11,
+                            "<=" => 13,
+                            ">" => 12,
+                            ">=" => 10,
+                            _ => unreachable!(),
+                        };
+                        self.emit(0x9a9f07e0 | (condition ^ 1) << 12);
+                    }
+                    return;
+                }
                 match *op {
                     "+" | "-" => {
                         let word = match (*op, e.ty) {
@@ -523,7 +558,12 @@ impl<'a> Code<'a> {
                     } else {
                         self.imm(0, 0);
                         self.store(*cursor, 0);
-                        self.imm(0, self.types.array(source.ty).unwrap().len as u64);
+                        if matches!(source.ty, Type::Bytes | Type::Runes) {
+                            self.load(*source_slot);
+                            self.emit(0xf9400000);
+                        } else {
+                            self.imm(0, self.types.array(source.ty).unwrap().len as u64);
+                        }
                         self.store(*end, 0);
                     }
                     let head = self.label();
@@ -537,7 +577,28 @@ impl<'a> Code<'a> {
                     self.pop(1);
                     self.cmp(1, 0);
                     self.branch(done, Branch::Cond(10));
-                    if let Some(a) = self.types.array(source.ty) {
+                    if matches!(source.ty, Type::Bytes | Type::Runes) {
+                        self.load(*source_slot);
+                        self.emit(0x91002000); // inline bytes after length
+                        self.push(0);
+                        self.load(*cursor);
+                        self.pop(1);
+                        self.emit(0x8b000020); // data + byte cursor
+                        if source.ty == Type::Runes {
+                            self.branch(self.strings.decode, Branch::Call); // rune x0, width x1
+                        } else {
+                            self.emit(0x39400000);
+                            self.imm(1, 1);
+                        }
+                        // Advance before the body, so continue uses the decoded width.
+                        self.push(0);
+                        self.push(1);
+                        self.load(*cursor);
+                        self.pop(1);
+                        self.emit(0x8b010000);
+                        self.store(*cursor, 0);
+                        self.pop(0);
+                    } else if let Some(a) = self.types.array(source.ty) {
                         self.load(*source_slot);
                         self.push(0);
                         self.load(*cursor);
@@ -552,9 +613,11 @@ impl<'a> Code<'a> {
                     self.store(*binding, 0);
                     self.stmts(body);
                     self.mark(next);
-                    self.load(*cursor);
-                    self.emit(0x91000400);
-                    self.store(*cursor, 0);
+                    if !matches!(source.ty, Type::Bytes | Type::Runes) {
+                        self.load(*cursor);
+                        self.emit(0x91000400);
+                        self.store(*cursor, 0);
+                    }
                     self.branch(head, Branch::Jump);
                     self.mark(done);
                     self.loops.pop();
@@ -565,6 +628,7 @@ impl<'a> Code<'a> {
         }
     }
     fn runtime(&mut self) {
+        self.string_runtime();
         self.mark(self.print_int);
         self.prologue(64);
         self.emit(0x9100ffe1); // add x1,sp,#63
@@ -650,7 +714,9 @@ impl<'a> Code<'a> {
             if let Branch::Address(reg) = kind {
                 let bytes = delta * 4;
                 if !(-(1 << 20)..(1 << 20)).contains(&bytes) {
-                    return Err("function address exceeds the first backend's ADR range".into());
+                    return Err(
+                        "function or literal address exceeds the first backend's ADR range".into(),
+                    );
                 }
                 let bits = bytes as u32 & 0x1fffff;
                 self.words[at] = 0x10000000 | (bits & 3) << 29 | (bits >> 2) << 5 | reg;
@@ -689,6 +755,9 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         return Err("entrypoint must be a function with no parameters".into());
     }
     let mut code = Code::new(program.functions.len(), &program.types);
+    // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
+    code.imm(19, 0); // lazily mapped string arena cursor
+    code.imm(20, 0); // string arena end
     code.branch(code.functions[entry], Branch::Call);
     code.imm(16, 0x2000001);
     code.emit(0xd4001001);
@@ -717,6 +786,7 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         code.epilogue();
     }
     code.runtime();
+    code.string_literals();
     Ok(macho(&code.finish()?))
 }
 
@@ -728,7 +798,7 @@ fn stack_arguments(types: &[Type]) -> (Vec<usize>, usize) {
     for ty in types.iter().skip(8) {
         let size = match ty {
             Type::Bool => 1,
-            Type::I32 => 4,
+            Type::I32 | Type::Rune => 4,
             _ => 8,
         };
         next = align(next, size);

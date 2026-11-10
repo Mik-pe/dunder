@@ -383,6 +383,11 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         ("arena/main.dn", "28\n"),
         ("structs.dn", "25\n32\n3\n"),
         ("collections.dn", "-2\n-1\n0\n1\n13\n3\n"),
+        ("utf8.dn", "bytes=25\nrunes=20\nwords=5\n🌍 Hej världen\n"),
+        (
+            "tokenizer.dn",
+            "fn|hälsa|(|namn|)|{|print|(|\"Hej 🌍\"|)|}\n",
+        ),
     ] {
         let path = root.join(file);
         let out = work.cli(&["run", path.to_str().unwrap()]);
@@ -400,7 +405,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("12 passed, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("18 passed, 0 failed"));
 }
 
 #[test]

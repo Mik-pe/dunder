@@ -78,6 +78,9 @@ pub struct Expr {
 pub enum ExprKind {
     Number(i64),
     Bool(bool),
+    String(String),
+    StringView(Box<Expr>),
+    StringOp(StringOp, Vec<Expr>),
     Local(usize),
     Function(usize),
     Call(Box<Expr>, Vec<Expr>),
@@ -94,6 +97,16 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     Record(Vec<(usize, Expr)>, usize),
     Field(Box<Expr>, usize),
+}
+#[derive(Clone, Copy)]
+pub enum StringOp {
+    Len,
+    RuneLen,
+    ByteAt,
+    RuneAt,
+    Slice,
+    ToString,
+    ToRune,
 }
 #[derive(Clone)]
 struct Binding {
@@ -138,6 +151,8 @@ fn reserved(name: &str) -> bool {
             | "range"
             | "assert"
             | "struct"
+            | "string"
+            | "rune"
     )
 }
 fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
@@ -281,11 +296,22 @@ impl Checker<'_> {
     }
     fn hint(&self, expr: &ast::Expr) -> Option<Type> {
         match &expr.kind {
+            ast::ExprKind::String(_) => Some(Type::String),
+            ast::ExprKind::Rune(_) => Some(Type::Rune),
             ast::ExprKind::TestTarget(n) => self.global(n).map(|(_, ty)| ty),
             ast::ExprKind::Name(n) => self
                 .lookup(n)
                 .map(|b| b.ty)
                 .or_else(|| self.global(n).map(|(_, ty)| ty)),
+            ast::ExprKind::Member(base, name)
+                if name == "len"
+                    && self.hint(base).is_some_and(|ty| {
+                        matches!(ty, Type::String | Type::Bytes | Type::Runes)
+                            || self.types.array(ty).is_some()
+                    }) =>
+            {
+                Some(Type::I32)
+            }
             ast::ExprKind::Member(base, name) => self
                 .hint(base)
                 .and_then(|ty| self.types.record(ty))
@@ -304,9 +330,23 @@ impl Checker<'_> {
                     if n == "len" {
                         return Some(Type::I32);
                     }
+                    if n == "rune" {
+                        return Some(Type::Rune);
+                    }
                 }
                 if let ast::ExprKind::Member(base, name) = &callee.kind {
                     if let Some(ty) = self.hint(base) {
+                        if name == "str" {
+                            return Some(Type::String);
+                        }
+                        if matches!(ty, Type::String | Type::Bytes | Type::Runes) {
+                            match name.as_str() {
+                                "len" => return Some(Type::I32),
+                                "bytes" if ty == Type::String => return Some(Type::Bytes),
+                                "runes" if ty == Type::String => return Some(Type::Runes),
+                                _ => {}
+                            }
+                        }
                         if self.types.array(ty).is_some() {
                             if name == "len" {
                                 return Some(Type::I32);
@@ -323,10 +363,17 @@ impl Checker<'_> {
                     .and_then(|ty| self.types.signature(ty).map(|f| f.ret))
             }
             ast::ExprKind::Unary("-", e) => self.hint(e),
-            ast::ExprKind::Index(base, _) => self
-                .hint(base)
-                .and_then(|t| self.types.array(t))
-                .map(|a| a.elem),
+            ast::ExprKind::Index(base, index) => self.hint(base).and_then(|t| {
+                if t == Type::String && self.hint(index) == Some(Type::Range) {
+                    Some(Type::String)
+                } else {
+                    match t {
+                        Type::String | Type::Bytes => Some(Type::I32),
+                        Type::Runes => Some(Type::Rune),
+                        _ => self.types.array(t).map(|a| a.elem),
+                    }
+                }
+            }),
             ast::ExprKind::Range(_, _) => Some(Type::Range),
             ast::ExprKind::Binary(op, a, b) if matches!(*op, "+" | "-" | "*" | "/" | "%") => {
                 self.hint(a).or_else(|| self.hint(b))
@@ -351,6 +398,14 @@ impl Checker<'_> {
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
+            A::String(s) => Expr {
+                ty: Type::String,
+                kind: ExprKind::String(s.clone()),
+            },
+            A::Rune(r) => Expr {
+                ty: Type::Rune,
+                kind: ExprKind::Number(*r as i64),
+            },
             A::Record(name, fields) => {
                 let ty = self.constructor_type(name)?;
                 let record = self.types.record(ty).unwrap().clone();
@@ -441,6 +496,37 @@ impl Checker<'_> {
             }
             A::Index(base, index) => {
                 let base = self.expr(base, None)?;
+                if matches!(base.ty, Type::String | Type::Bytes | Type::Runes) {
+                    let arg = self.expr(index, None)?;
+                    let (op, ty, arg) = if base.ty == Type::String && arg.ty == Type::Range {
+                        (StringOp::Slice, Type::String, arg)
+                    } else {
+                        let op = if base.ty == Type::Runes {
+                            StringOp::RuneAt
+                        } else {
+                            StringOp::ByteAt
+                        };
+                        let ty = if base.ty == Type::Runes {
+                            Type::Rune
+                        } else {
+                            Type::I32
+                        };
+                        if arg.ty != Type::I32 {
+                            return Err(mismatch(self.types, index.span, Type::I32, arg.ty));
+                        }
+                        (op, ty, arg)
+                    };
+                    let typed = Expr {
+                        ty,
+                        kind: ExprKind::StringOp(op, vec![base, arg]),
+                    };
+                    if let Some(t) = expected {
+                        if t != ty {
+                            return Err(mismatch(self.types, e.span, t, ty));
+                        }
+                    }
+                    return Ok(typed);
+                }
                 if !matches!(base.ty, Type::Array(_)) {
                     return Err(Error::new(
                         "E0221",
@@ -489,7 +575,15 @@ impl Checker<'_> {
                 }
             }
             A::Member(base, name) => {
-                if let Some(record) = self.hint(base).and_then(|ty| self.types.record(ty)) {
+                if name == "len"
+                    && self.hint(base).is_some_and(|ty| {
+                        matches!(ty, Type::String | Type::Bytes | Type::Runes)
+                            || self.types.array(ty).is_some()
+                    })
+                {
+                    let base = self.expr(base, None)?;
+                    self.length(base, e.span)?
+                } else if let Some(record) = self.hint(base).and_then(|ty| self.types.record(ty)) {
                     let field =
                         record
                             .fields
@@ -563,7 +657,14 @@ impl Checker<'_> {
                     };
                     let a = self.expr(left, hint)?;
                     let b = self.expr(right, Some(a.ty))?;
-                    if !a.ty.integer() && !(matches!(*op, "==" | "!=") && a.ty == Type::Bool) {
+                    let string_op = a.ty == Type::String
+                        && matches!(*op, "+" | "==" | "!=" | "<" | "<=" | ">" | ">=");
+                    let rune_op = a.ty == Type::Rune && !arithmetic;
+                    if !a.ty.integer()
+                        && !string_op
+                        && !rune_op
+                        && !(matches!(*op, "==" | "!=") && a.ty == Type::Bool)
+                    {
                         return Err(Error::new(
                             "E0206",
                             e.span,
@@ -581,52 +682,62 @@ impl Checker<'_> {
                     return Err(Error::new(
                         "E0207",
                         e.span,
-                        "len expects one array or array iterator",
+                        "len expects one string, array or iterator",
                     ));
                 }
                 let base = self.expr(&args[0], None)?;
-                let len = self
-                    .types
-                    .array(base.ty)
-                    .ok_or_else(|| {
-                        Error::new("E0221", e.span, "len requires an array or array iterator")
-                    })?
-                    .len;
-                Expr {
-                    ty: Type::I32,
-                    kind: ExprKind::Len(Box::new(base), len),
-                }
+                self.length(base, e.span)?
             }
-            A::Call(callee, args) if matches!(&callee.kind,A::Member(base,name) if matches!(name.as_str(),"iter"|"len") && !self.module_alias(base)) =>
+            A::Call(callee, args) if matches!(&callee.kind,A::Member(base,name) if matches!(name.as_str(),"iter"|"len"|"str"|"bytes"|"runes") && !self.module_alias(base)) =>
             {
                 if !args.is_empty() {
-                    return Err(Error::new("E0207", e.span, "iter/len takes no arguments"));
+                    return Err(Error::new(
+                        "E0207",
+                        e.span,
+                        "this built-in method takes no arguments",
+                    ));
                 }
                 let A::Member(base, name) = &callee.kind else {
                     unreachable!()
                 };
                 let base = self.expr(base, None)?;
-                let array = self.types.array(base.ty).ok_or_else(|| {
-                    Error::new(
-                        "E0221",
-                        e.span,
-                        "iter/len requires an array or array iterator",
-                    )
-                })?;
                 if name == "len" {
-                    let len = array.len;
+                    self.length(base, e.span)?
+                } else if name == "str"
+                    && matches!(
+                        base.ty,
+                        Type::I32 | Type::I64 | Type::Bool | Type::Rune | Type::String
+                    )
+                {
                     Expr {
-                        ty: Type::I32,
-                        kind: ExprKind::Len(Box::new(base), len),
+                        ty: Type::String,
+                        kind: ExprKind::StringOp(StringOp::ToString, vec![base]),
+                    }
+                } else if base.ty == Type::String && matches!(name.as_str(), "bytes" | "runes") {
+                    Expr {
+                        ty: if name == "bytes" {
+                            Type::Bytes
+                        } else {
+                            Type::Runes
+                        },
+                        kind: ExprKind::StringView(Box::new(base)),
                     }
                 } else {
-                    let id = match base.ty {
-                        Type::Array(i) | Type::Iterator(i) => i,
-                        _ => unreachable!(),
-                    };
-                    Expr {
-                        ty: Type::Iterator(id),
-                        kind: ExprKind::Iterator(Box::new(base)),
+                    if name == "iter" && self.types.array(base.ty).is_some() {
+                        let id = match base.ty {
+                            Type::Array(i) | Type::Iterator(i) => i,
+                            _ => unreachable!(),
+                        };
+                        Expr {
+                            ty: Type::Iterator(id),
+                            kind: ExprKind::Iterator(Box::new(base)),
+                        }
+                    } else {
+                        return Err(Error::new(
+                            "E0250",
+                            e.span,
+                            "method is not supported by this value",
+                        ));
                     }
                 }
             }
@@ -645,11 +756,14 @@ impl Checker<'_> {
                     return Err(Error::new("E0207", e.span, "print expects one argument"));
                 }
                 let value = self.expr(&args[0], None)?;
-                if !matches!(value.ty, Type::I32 | Type::I64 | Type::Bool) {
+                if !matches!(
+                    value.ty,
+                    Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune
+                ) {
                     return Err(Error::new(
                         "E0206",
                         e.span,
-                        "print requires i32, i64 or bool",
+                        "print requires i32, i64, bool, string or rune",
                     ));
                 }
                 Expr {
@@ -657,7 +771,7 @@ impl Checker<'_> {
                     kind: ExprKind::Print(Box::new(value)),
                 }
             }
-            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "i32" || n == "i64") =>
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "i32" || n == "i64" || n == "rune") =>
             {
                 if args.len() != 1 {
                     return Err(Error::new(
@@ -666,22 +780,35 @@ impl Checker<'_> {
                         "an integer conversion expects one argument",
                     ));
                 }
-                let ty = if matches!(&callee.kind, A::Name(n) if n == "i32") {
+                let ty = if matches!(&callee.kind, A::Name(n) if n == "rune") {
+                    Type::Rune
+                } else if matches!(&callee.kind, A::Name(n) if n == "i32") {
                     Type::I32
                 } else {
                     Type::I64
                 };
-                let inner = self.expr(&args[0], self.hint(&args[0]).or(Some(ty)))?;
-                if !inner.ty.integer() {
+                let inner = self.expr(
+                    &args[0],
+                    self.hint(&args[0])
+                        .or(Some(if ty == Type::Rune { Type::I32 } else { ty })),
+                )?;
+                if !inner.ty.integer() && inner.ty != Type::Rune {
                     return Err(Error::new(
                         "E0206",
                         e.span,
                         "integer conversion requires an integer; bool is a separate type",
                     ));
                 }
-                Expr {
-                    ty,
-                    kind: ExprKind::Cast(Box::new(inner)),
+                if ty == Type::Rune {
+                    Expr {
+                        ty,
+                        kind: ExprKind::StringOp(StringOp::ToRune, vec![inner]),
+                    }
+                } else {
+                    Expr {
+                        ty,
+                        kind: ExprKind::Cast(Box::new(inner)),
+                    }
                 }
             }
             A::Call(callee, args) => {
@@ -726,6 +853,26 @@ impl Checker<'_> {
             }
         }
         Ok(typed)
+    }
+    fn length(&self, base: Expr, span: Span) -> Result<Expr, Error> {
+        let kind = match base.ty {
+            Type::String | Type::Bytes => ExprKind::StringOp(StringOp::Len, vec![base]),
+            Type::Runes => ExprKind::StringOp(StringOp::RuneLen, vec![base]),
+            ty => {
+                let len = self
+                    .types
+                    .array(ty)
+                    .ok_or_else(|| {
+                        Error::new("E0221", span, "len requires a string, array or iterator")
+                    })?
+                    .len;
+                ExprKind::Len(Box::new(base), len)
+            }
+        };
+        Ok(Expr {
+            ty: Type::I32,
+            kind,
+        })
     }
     fn block(&mut self, stmts: &[ast::Stmt]) -> Result<(Vec<Stmt>, bool), Error> {
         self.scopes.push(HashMap::new());
@@ -886,6 +1033,10 @@ impl Checker<'_> {
                     let source = self.expr(source, None)?;
                     let item = if source.ty == Type::Range {
                         Type::I32
+                    } else if source.ty == Type::Runes {
+                        Type::Rune
+                    } else if source.ty == Type::Bytes {
+                        Type::I32
                     } else {
                         self.types
                             .array(source.ty)
@@ -893,7 +1044,7 @@ impl Checker<'_> {
                                 Error::new(
                                     "E0222",
                                     s.span,
-                                    "for requires a range, array or array iterator",
+                                    "for requires a range, array, array iterator, string.bytes() or string.runes()",
                                 )
                             })?
                             .elem
@@ -1063,13 +1214,13 @@ pub(crate) fn check_modules(
                     .map_err(|e| e.in_file(module))?;
                 let size = match ty {
                     Type::Bool => 1,
-                    Type::I32 => 4,
-                    Type::I64 => 8,
+                    Type::I32 | Type::Rune => 4,
+                    Type::I64 | Type::String => 8,
                     _ => {
                         return Err(Error::new(
                             "E0240",
                             field.span,
-                            "struct fields currently support i32, i64 and bool",
+                            "struct fields currently support i32, i64, bool, string and rune",
                         )
                         .in_file(module))
                     }

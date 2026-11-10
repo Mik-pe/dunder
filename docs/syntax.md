@@ -35,6 +35,8 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `i32` | Signerat 32-bitars heltal; standard för okontextualiserade heltalsliteraler. |
 | `i64` | Signerat 64-bitars heltal. |
 | `bool` | `true` eller `false`; ingen implicit konvertering till/från heltal. |
+| `string` | Oföränderlig, giltig UTF-8. |
+| `rune` | En Unicode-kodpunkt; skild från heltal och sträng. |
 | `()` | Inget returvärde; implicit returtyp för funktioner utan `->`. |
 | `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
 | `[i32; 8]` | En array med åtta element; längden ingår i typen. |
@@ -172,7 +174,8 @@ aldrig en tidigare binär från samma utdataplats.
 `if` och `while` kräver `bool`, aldrig ett heltal. `else if`, `else`, `break`
 och `continue` stöds. Block ger lexikala scope. `print` är den första inbyggda
 I/O-operationen: ett `i32`, `i64` eller `bool`, följt av radbrytning.
-`assert(condition)` kräver `bool` och avslutar processen vid `false`.
+`print` tar också en UTF-8-sträng eller rune. `assert(condition)` kräver
+`bool` och avslutar processen vid `false`.
 
 Vanliga enkla satser avslutas med radbrytning eller valfritt semikolon.
 `}` får avsluta den sista satsen i ett block. Parenteser tillåter flerradiga
@@ -277,7 +280,7 @@ Structar är nominella: olika deklarationer ger olika typer även med samma
 fält. Importerade typer behåller sin identitet över moduler och i callbacks.
 Alla fält måste anges exakt en gång; deras ordning i uttrycket är valfri.
 Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får vara
-`i32`, `i64` eller `bool`; nästlade structar och arrayfält återstår.
+`i32`, `i64`, `bool`, `string` eller `rune`; nästlade structar och arrayfält återstår.
 
 En struct kopieras vid bindning, tilldelning och parameteröverföring.
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
@@ -310,7 +313,7 @@ fn main() {
 
 `[a, b, c]` bygger en array. `[value; N]` utvärderar `value` en gång och
 upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
-`i32`, `i64` eller `bool`; den härleds eller hämtas från förväntad arraytyp.
+`i32`, `i64`, `bool`, `string` eller `rune`; den härleds eller hämtas från förväntad arraytyp.
 En array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
 Nästlade arrayer, structelement och slices är ännu inte implementerade.
 
@@ -394,9 +397,87 @@ Utan fil väljer `dunder test` manifestets valfria `test_root`, annars `root`.
 `build`, `run` och `check` använder alltid `root`. Manifestet kräver `name`
 och `root`; alla tre fält är enkla citerade strängar.
 
+## UTF-8-strängar och runes
+
+```dunder
+fn greet(name: string) -> string { "Hej, " + name + "!" }
+
+fn main() {
+    text := 'åäö 🌍'
+    print(greet(text))
+    assert(text.len == 11)
+    assert(text.runes().len == 5)
+    assert(text[7..11] == "🌍")
+    for r in text.runes() { print(r) }
+    for byte in text.bytes() { print(byte) }
+}
+```
+
+Strängar är alltid giltig UTF-8 och deras byte är oföränderliga.
+`var text := "a"; text = "b"` byter hela värdet; direkt ändring av ett byte
+är förbjuden. Strängar kan skickas och returneras, även genom callbacks,
+och lagras i arrayer och structfält. Kopior kan dela oföränderliga data.
+
+`"..."` och `'...'` ger samma typ `string`. Backticks ger typen `rune`,
+exempelvis `` `å` `` eller `` `🌍` ``. En sådan literal måste innehålla exakt
+en Unicode-skalär. `rune` är en egen typ som stödjer jämförelse, `print`,
+`.str()` och explicit heltalskonvertering med `i32(r)`/`i64(r)`.
+`rune(number)` kontrollerar att talet är 0–0x10FFFF och inte en surrogate.
+Ingen implicit konvertering mellan rune, heltal och string sker.
+
+Escape-sekvenser: `\\`, `\"`, `\'`, `` \` ``, `\n`, `\r`, `\t`, `\0`,
+`\xHH`, `\uHHHH` och `\u{H...}` med en till sex hexsiffror.
+Byte-escapes valideras tillsammans: `"\xC3\xA5"` är `"å"`, men `"\xFF"`
+är ett kompileringsfel. Surrogates och värden över Unicode-intervallet
+avvisas. Oescapade radbrytningar, råsträngar och interpolation stöds ännu inte.
+NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering används.
+
+| Operation | Betydelse |
+| --- | --- |
+| `text.len`, `text.len()`, `len(text)` | Antal byte, `i32`, konstant tid. |
+| `text[i]`, `text.bytes()[i]` | Ett byte som `i32` i intervallet 0–255. |
+| `text[start..end]` | Ny sträng från halvöppna bytegränser. Båda måste vara UTF-8-gränser. |
+| `text.runes()[i]` | En rune efter avkodning från början; linjär tid. |
+| `text.runes().len` | Antal kodpunkter; linjär tid. `.len()` och `len(...)` fungerar också. |
+| `for r in text.runes()` | Avkodar kodpunkter i ett linjärt pass. |
+| `for byte in text.bytes()` | Itererar byte i ett linjärt pass. |
+| `a + b` | Bygger en ny sträng av två strängar. |
+| `a == b`, `a != b` | Jämför innehåll, inklusive eventuella NUL. |
+| `<`, `<=`, `>`, `>=` | Lexikografisk ordning efter UTF-8-byte, utan språklig sortering. |
+| `value.str()` | Sträng av i32/i64 i decimalform, bool eller rune. På string ges samma värde. |
+
+`.bytes()` och `.runes()` är återanvändbara vyer över ett oföränderligt
+strängvärde. De allokerar ingen array. Deras typer härleds med `:=` och har
+ännu ingen egen typstavning. Om originalbindningen får en ny sträng behåller
+en befintlig vy sitt gamla värde. `for` direkt över en string avvisas:
+välj `.bytes()` eller `.runes()` uttryckligt. `break` och `continue` fungerar
+för båda. Arrayiteratorernas befintliga kopieringsregler gäller fortfarande.
+Strängsnitt kan också ta ett lagrat eller returnerat `range`-värde,
+exempelvis `span := 7..11; part := text[span]`.
+
+En rune är en Unicode-kodpunkt, inte ett grapheme-kluster. Exempelvis har
+`"é"` en rune och `"e\u{301}"` två; strängarna jämförs som olika.
+Normalisering, case folding, fullständig Unicode-klassificering och synliga
+teckenkluster stöds ännu inte. Dogfood-ordräknaren känner bara igen de
+blanktecken som uttryckligen listas i dess Dunder-källa.
+
+Första minnesmodellen använder statiska literaler i programbilden och en
+separat 16 MiB arena för dynamiska strängar. Arenan mappas först vid behov
+och lever till processlut, även för returnerade strängar och vyer.
+Kopior av string delar data säkert genom oföränderligheten. Sammanslagning,
+snitt och konvertering av heltal/rune kopierar data till arenan. Ingen GC
+eller återvinning av enskilda strängar under körning finns ännu; många
+upprepade operationer kan därför fylla arenan även när gamla värden inte
+längre används. Gränsen räknar också metadata och justering.
+
+Runtimefel: 103 för ogiltiga index eller intervall, 105 för full arena eller
+misslyckad mappning, 106 för snitt mitt i en UTF-8-sekvens eller ogiltigt
+`rune(number)`. Kompilering och körning använder fortfarande ingen extern
+kompilator, länkare, signerare eller strängruntime.
+
 ## Nästa språkbeslut
 
-Strängvärden, nästlade aggregat, aggregatreturer, slices, heapallokering,
+Nästlade aggregat, aggregatreturer, arrayslices, allmänt allokerings-API,
 ägande/lån och egna iteratorer ska utvecklas genom riktiga program och
 feltester. Dogfood-arenan är tills vidare indexbaserad bump-allokering över
 en fast typad buffert. Självhosting är ett separat senare steg.

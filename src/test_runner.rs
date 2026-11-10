@@ -97,6 +97,8 @@ pub fn run(project: &Checked, output: &Path, timeout: Duration) -> Result<i32, S
                     Some(102) => "division by zero".into(),
                     Some(103) => "index out of bounds".into(),
                     Some(104) => "assertion failed".into(),
+                    Some(105) => "string arena exhausted".into(),
+                    Some(106) => "invalid Unicode boundary or scalar".into(),
                     Some(n) => format!("exit {n}"),
                     None => "terminated by signal".into(),
                 }

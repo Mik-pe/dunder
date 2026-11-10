@@ -25,6 +25,13 @@ struct-uttryck som input, exempelvis `(Point { x: 3, y: 4 }) -> 25`.
 Detta är implementerat tillsammans med grundläggande typade structar,
 värdekopiering, fältåtkomst och retur med sista uttrycket.
 
+Nästa dogfooding är UTF-8-strängar med inspiration från V. Implementerat:
+oföränderlig `string`, `rune`, bytebaserad `.len` och indexering, separata
+byte-/rune-vyer, snitt, sammanslagning, jämförelser och strängreturer.
+Textfunktioner, textstatistik och en liten UTF-8-tokenizer är skrivna i
+Dunder och ingår i testträdet. Beskriv den första strängarenans 16 MiB-gräns
+och processlivstid tydligt; kalla den inte färdig ägande-/lånekontroll.
+
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera
 körda exempel med verifierade resultat. Språkets användare skriver Dunder,

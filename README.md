@@ -204,11 +204,54 @@ Index kontrolleras vid körning.
 [Dogfood-programmen](dogfood/README.md) provar rekursion, moduler, sortering,
 callbacks, iteratorer, structar och en indexbaserad arena över en fast typad
 buffert. Arenan är ett fungerande bump-allokeringsprogram; språket har ännu
-ingen heapallokering eller låne-API.
+inget allmänt allokerings- eller låne-API.
+
+## UTF-8-strängar
+
+```dunder
+@test {
+    ("världen") -> "Hej, världen!"
+}
+fn greet(name: string) -> string {
+    "Hej, " + name + "!"
+}
+
+fn main() {
+    text := "åäö 🌍"
+    print(greet(text))
+    print(text.len)          // 11 byte
+    print(text.runes().len)  // 5 Unicode-kodpunkter
+    print(text[7..11])       // 🌍; bytegränser måste vara UTF-8-gränser
+    for r in text.runes() { print(r) }
+}
+```
+
+Modellen är inspirerad av [V:s strängar](https://docs.vlang.io/v-types.html#strings):
+oföränderlig UTF-8, längd i byte och en separat `rune` för Unicode-kodpunkter.
+`"..."` och `'...'` är strängar; en rune skrivs med backticks, exempelvis
+`` `🌍` ``. `text[i]` och `text.bytes()[i]` ger ett byte som `i32` (0–255);
+`text.runes()[i]` ger en `rune`. `for` stöder båda vyerna.
+En kodpunkt är inte alltid ett helt synligt tecken.
+
+Strängar stöder `+`, innehållsjämförelse, typade parametrar och returvärden,
+callbacks, arrayelement och structfält. `value.str()` konverterar heltal,
+bool och runes. Unicode-escapes och NUL fungerar; alla strängvärden är giltig
+UTF-8. Index, snittgränser och `rune(number)` kontrolleras vid körning.
+
+Kör `cargo run --release -- run dogfood/utf8.dn` för textstatistik och
+`cargo run --release -- run dogfood/tokenizer.dn` för en liten UTF-8-tokenizer.
+[Textfunktionerna](dogfood/text/scan.dn), inklusive `find`, `replace` och
+ordräkning, är skrivna i Dunder och har egna taggade tester.
+
+Första implementationen lagrar dynamiskt byggda strängar i en separat
+**16 MiB processarena**, som mappas vid första behov. Strängarna lever tills
+processen avslutas. Ingen GC används, och minnet återvinns ännu inte under
+körningen. En full arena ger ett definierat runtimefel. Detta är en första
+körmodell för dogfooding, inte den färdiga ägar-/lånemodellen.
 
 ## Implementerat och återstående
 
-Implementerat: `i32`, `i64`, `bool`, typade funktioner och funktionsvärden,
+Implementerat: `i32`, `i64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,
 callbacks, funktioner som returvärden, framåtanrop och rekursion,
 filmoduler med explicita importer, alias, namnrymder och privata/exporterade funktioner och structar,
 härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/else`,
@@ -222,10 +265,11 @@ Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
 infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
 och körbar kod; optimering och byggprestanda är inte uppmätta.
 Bootstrapkompilatorn är skriven i Rust och är ännu inte självhostad.
-Structfält och arrayelement stöder i dag `i32`, `i64` och `bool`.
+Structfält och arrayelement stöder i dag `i32`, `i64`, `bool`, `string` och `rune`.
 Arrayer/structar/iteratorer kan ännu inte returneras från funktioner.
-Strängvärden, nästlade aggregat, slices, heapallokering, ägande/lån och
-användardefinierade iteratorer återstår.
+Nästlade aggregat, arrayslices, allmänt allokerings-API, ägande/lån och
+användardefinierade iteratorer återstår. Stränginterpolering, normalisering,
+grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
 
 [Aktuellt arbete](docs/status.md) · [Arkitektur](docs/arkitektur.md) ·
 [Prestandamål och mätkontrakt](docs/prestanda.md)
