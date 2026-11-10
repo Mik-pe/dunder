@@ -75,7 +75,7 @@ Structar, fasta arrayer och data-enums kan returneras med värdesemantik.
 Användardefinierade iteratorer återstår.
 
 [Standardbiblioteket](../docs/standard.md) är Dunder-kod, inbäddad i
-kompilatorn och importerad som `std/map`, `std/set` och så vidare.
+kompilatorn och importerad som `std.map`, `std.set` och så vidare.
 `standard.ddr` kopplar ihop samlingarna i en UTF-8-ordräknare. Dess två
 testgrupper och bibliotekens nio grupper ingår i huvudträdet.
 Även den [Dunder-skrivna kompilatorns](../selfhost/README.md) lexer och

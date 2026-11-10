@@ -187,8 +187,8 @@ fn import_names_paths_and_diagnostics_are_checked() {
 }
 
 #[test]
-fn bare_import_paths_preserve_spelling_aliases_and_statement_boundaries() {
-    let source = "import std/map\r\nimport ../shared/value as common; import ./sys as local\nimport å-dir/value-name as value // trailing comment\nimport /* leading comment */ util/math /* trailing comment */\nimport 'legacy/path' as legacy\nimport std/text";
+fn dotted_imports_normalize_paths_preserving_aliases_and_statement_boundaries() {
+    let source = "import std.map\r\nimport ..shared.value as common; import .sys as local\nimport å-dir.value-name as value // trailing comment\nimport /* leading comment */ util.math /* trailing comment */\nimport 'legacy/path' as legacy\nimport std.text\nimport ...shared.value as grandparent";
     let parsed = dunder::syntax::parse(source).unwrap();
     let paths: Vec<_> = parsed
         .imports
@@ -205,13 +205,17 @@ fn bare_import_paths_preserve_spelling_aliases_and_statement_boundaries() {
             ("util/math", "math"),
             ("legacy/path", "legacy"),
             ("std/text", "text"),
+            ("../../shared/value", "grandparent"),
         ]
     );
     for import in &parsed.imports {
         assert_eq!(&source[import.span.start..import.span.end], "import");
     }
-    // Path lexing is contextual; '/' and '-' retain their expression meaning.
-    dunder::check("fn main(){print(12 / 3 - 1);print(12/3-1)}").unwrap();
+    // Import lexing must not affect field access, floating literals, or operators.
+    dunder::check(
+        "struct Point{x:f64} fn main(){p:=Point{x:1.5};print(p.x);print(12 / 3 - 1);print(12/3-1)}",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -220,6 +224,13 @@ fn malformed_bare_import_paths_fail_before_loading_a_different_module() {
     project.write("math.ddr", "pub fn value()->i32{42}");
     project.write("foo-bar.ddr", "pub fn value()->i32{42}");
     for (path, code) in [
+        ("std..map", "E0401"),
+        ("std.map.", "E0401"),
+        ("..shared..value", "E0401"),
+        ("...", "E0401"),
+        ("std.map.ddr", "E0401"),
+        ("std . map", "E0107"),
+        ("std. map", "E0401"),
         ("math/", "E0401"),
         ("math//hidden", "E0401"),
         ("math/*hidden*/", "E0401"),
@@ -248,16 +259,16 @@ fn malformed_bare_import_paths_fail_before_loading_a_different_module() {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
-fn bare_imports_load_relative_paths_bundled_modules_and_aliases_natively() {
+fn dotted_imports_load_relative_paths_bundled_modules_and_aliases_natively() {
     let project = Project::new();
     project.write(
         "main.ddr",
-        r#"import std/text
-import std/map as counts
-import sys
-import ./sys as local
-import util/predicates
-import å-dir/value-name as value
+        r#"import std.text
+import std.map as counts
+import std.sys as sys
+import .sys as local
+import util.predicates
+import å-dir.value-name as value
 fn main(){
     var m := counts.new()
     counts.put(&mut m, "answer", i64(predicates.answer()))
@@ -271,12 +282,88 @@ fn main(){
     project.write("sys.ddr", "pub fn value()->i32{20}");
     project.write(
         "util/predicates.ddr",
-        "import ../shared/value as common\npub fn answer()->i32{common.answer()}",
+        "import ..shared.value as common\npub fn answer()->i32{common.answer()}",
     );
     project.write("shared/value.ddr", "pub fn answer()->i32{42}");
     project.write("å-dir/value-name.ddr", "pub fn answer()->i32{22}");
     let checked = project.check();
     assert_eq!(project.execute(&compile(&checked)), "42\nå 🌍\n42\ntrue\n");
+}
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn dotted_and_legacy_imports_share_types_and_resolve_multiple_parent_levels() {
+    let project = Project::new();
+    project.write(
+        "main.ddr",
+        r#"
+import util.nested.entry
+import std.map
+import "std/map" as legacy
+import .std.map as local
+import legacy.v1/value as old_path
+import "legacy.v1/value" as quoted
+fn length(table: &legacy.Map) -> i32 { map.length(&table) }
+fn main() {
+    table := map.new()
+    print(entry.answer())
+    print(local.answer())
+    print(length(&table))
+    print(old_path.answer() + quoted.answer())
+}
+"#,
+    );
+    project.write(
+        "util/nested/entry.ddr",
+        r#"
+import ...shared.value as dotted
+import "../../shared/value" as quoted
+import ../../shared/value as path
+fn take(item: quoted.Item) -> i32 { path.read(item) }
+pub fn answer() -> i32 { take(dotted.make()) }
+"#,
+    );
+    project.write("shared/value.ddr", "pub struct Item{value:i32} pub fn make()->Item{Item{value:42}} pub fn read(item:Item)->i32{item.value}");
+    project.write("std/map.ddr", "pub fn answer()->i32{7}");
+    project.write("legacy.v1/value.ddr", "pub fn answer()->i32{3}");
+    let checked = project.check();
+    assert_eq!(
+        checked
+            .sources
+            .files
+            .iter()
+            .filter(|file| file.path.ends_with("shared/value.ddr"))
+            .count(),
+        1
+    );
+    assert_eq!(project.execute(&compile(&checked)), "42\n7\n0\n6\n");
+}
+
+#[test]
+fn dotted_and_slash_import_spellings_produce_identical_images() {
+    let project = Project::new();
+    project.write("util/math.ddr", "pub fn answer()->i32{42}");
+    let mut images = Vec::new();
+    for name in ["util.math", "util/math", "\"util/math\""] {
+        project.write(
+            "main.ddr",
+            &format!("import {name}\nfn main(){{print(math.answer())}}"),
+        );
+        let checked = project.check();
+        images.push(
+            checked
+                .compile_for(dunder::target::Target::Arm64Macos)
+                .unwrap(),
+        );
+    }
+    assert_eq!(images[0], images[1]);
+    assert_eq!(images[0], images[2]);
 }
 
 #[test]

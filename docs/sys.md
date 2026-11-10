@@ -191,9 +191,9 @@ inte hela systemets lokaliserade felkatalog.
 
 Det exakta importnamnet `sys` väljer det medföljande biblioteket och kan
 aliaseras med `import sys as os`. Flera importer laddar det en gång och
-delar samma typidentitet, också genom `import std/sys as os`.
+delar samma typidentitet, också genom `import std.sys as os`.
 För en egen lokal fil med samma namn används
-exempelvis `import ./sys as local`. Vanliga moduler söks fortsatt relativt
+exempelvis `import .sys as local`. Vanliga moduler söks fortsatt relativt
 den importerande filen. De privata `__sys_*`-intrinsics är endast tillgängliga
 inne i det medföljande biblioteket.
 

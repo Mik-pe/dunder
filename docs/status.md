@@ -12,8 +12,8 @@ heltalskolumn. Projektet har eget manifest och provar citerade fält,
 Unicode, radbrytningar, sorterade grupper och kontrollerat heltalsspill.
 Det drev tre tillägg:
 
-- Importer utan citattecken för sökvägar: `import std/map`,
-  `import ../shared/value` och `import ./sys as local`. Äldre citerade
+- Importer med punktnotation utan citattecken: `import std.map`,
+  `import ..shared.value` och `import .sys as local`. Äldre slash- och citerade
   importer stöds fortfarande. Projektets källor och dokumentation använder
   den nya formen.
 - `array.sort_strings(&mut values)`: heapsort över UTF-8-byte, O(n log n)
@@ -21,7 +21,7 @@ Det drev tre tillägg:
 - `sys.write_stderr` och `sys.eprint`: diagnostik separat från stdout,
   med resultat för skrivfel och hantering av korta skrivningar och avbrott.
 
-Verifierat på Linux/x86-64: 95 Rust-tester, 45 testgrupper i huvudträdet och
+Verifierat på Linux/x86-64: 97 Rust-tester, 45 testgrupper i huvudträdet och
 14 i Tabell; formatering, Clippy och releasebygge passerar. Tabells fem
 integrationstester omfattar en oberoende referens för 512 genererade CSV-rader,
 felaktiga indata och byggen för alla tre mål. ARM64/Linux under QEMU klarar
@@ -34,8 +34,8 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
 
 ## Implementerat
 
-- Standardbibliotek i Dunder: `std/map`, `std/set`, `std/array`, `std/text`,
-  `std/hash`, `std/bytes`, `std/sha256`, `std/parse` och sys. Map har strängnycklar
+- Standardbibliotek i Dunder: `std.map`, `std.set`, `std.array`, `std.text`,
+  `std.hash`, `std.bytes`, `std.sha256`, `std.parse` och sys. Map har strängnycklar
   och i64-värden, set innehåller strängar. Modulerna är inbäddade och importeras
   utan suffix. Hashning, sondering, omhashning och algoritmer är Dunder-kod.
 - Dynamiska `[]T`, geometrisk tillväxt, reserve/push/pop/clear, kontrollerade
@@ -48,7 +48,7 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   wrapping-aritmetik. SHA-256 och bytekodning använder dem som dogfood.
 - `.ddr` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
   Användarens val ersätter den tidigare tvåbokstavsändelsen. Importer saknar fortsatt suffix.
-- En fil per modul: `import math` eller `import util/math as math`, utan
+- En fil per modul: `import math` eller `import util.math as math`, utan
   suffix. Privata `fn` och exporterade `pub fn`, alias och kvalificerade namn.
   Samlade signaturer stödjer cykliska importer och ömsesidig rekursion.
   Kanoniska filsökvägar deduplicerar delade beroenden och symboliska länkar.

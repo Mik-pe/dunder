@@ -56,7 +56,7 @@ fn string_sort_matches_rust_order_for_generated_utf8_keys() {
         let right = pieces[(state >> 16) as usize % pieces.len()];
         values.push(format!("{left}{}{right}", i % 97));
     }
-    let mut source = String::from("import std/array\nfn main(){var keys:[]string=[]\n");
+    let mut source = String::from("import std.array\nfn main(){var keys:[]string=[]\n");
     for value in &values {
         source.push_str(&format!("keys.push({value:?})\n"));
     }

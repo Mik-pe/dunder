@@ -1,15 +1,15 @@
 # Standardbiblioteket
 
 Biblioteket är skrivet i Dunder och följer med kompilatorn. Importer som
-`import std/map as map` laddar inbäddad källkod utan installerade `.ddr`-filer
+`import std.map as map` laddar inbäddad källkod utan installerade `.ddr`-filer
 eller suffix i importen. Endast explicita beroenden läses. Delade importer
 och alias har samma typidentitet. En lokal fil väljs med en uttrycklig
-relativ sökväg, till exempel `import ./std/map as local`.
+relativ sökväg, till exempel `import .std.map as local`.
 
 ```dunder
-import std/map as map
-import std/set as set
-import std/array as array
+import std.map as map
+import std.set as set
+import std.array as array
 
 fn main() {
     var counts := map.new()
@@ -84,15 +84,15 @@ flyttas och återvinning av enskilda allokeringar återstår.
 
 | Import | Innehåll |
 | --- | --- |
-| `std/array` | `ints`, `strings`; `sum`, `sort`, `reverse`, `append` för `[]i64`; `sort_strings` för `[]string`. Heltal använder insertion sort; strängar använder heapsort, O(n log n), på plats och utan extra array. Strängordningen är lexikografisk över UTF-8-byte, inte lokalanpassad. |
-| `std/map` | `Map` från `string` till `i64`; `new`, `length`, `reserve`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `keys`. |
-| `std/set` | `Set` av strängar; `new`, `length`, `reserve`, `insert`, `contains`, `remove`, `clear`, `items`. |
-| `std/hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
-| `std/text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
-| `std/bytes` | Växande bytebuffertar som `[]i32`, textappend, nollfyllning, little-/big-endian-kodning, `hex`, kontrollerad UTF-8-avkodning. |
-| `std/sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
-| `std/parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
-| `sys` / `std/sys` | macOS-filer, argument, byteutdata, UTF-8-avkodning och process-ID; se [sys](sys.md). |
+| `std.array` | `ints`, `strings`; `sum`, `sort`, `reverse`, `append` för `[]i64`; `sort_strings` för `[]string`. Heltal använder insertion sort; strängar använder heapsort, O(n log n), på plats och utan extra array. Strängordningen är lexikografisk över UTF-8-byte, inte lokalanpassad. |
+| `std.map` | `Map` från `string` till `i64`; `new`, `length`, `reserve`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `keys`. |
+| `std.set` | `Set` av strängar; `new`, `length`, `reserve`, `insert`, `contains`, `remove`, `clear`, `items`. |
+| `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
+| `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
+| `std.bytes` | Växande bytebuffertar som `[]i32`, textappend, nollfyllning, little-/big-endian-kodning, `hex`, kontrollerad UTF-8-avkodning. |
+| `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
+| `std.parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
+| `sys` / `std.sys` | macOS-filer, argument, byteutdata, UTF-8-avkodning och process-ID; se [sys](sys.md). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel

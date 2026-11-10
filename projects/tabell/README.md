@@ -59,7 +59,7 @@ från den inlästa texten. Dunders nuvarande processarenor återvinner inte
 enskilda strängar eller dynamiska buffertar; många små fält kan därför nå
 minnesgränsen innan filgränsen. Tabell är ännu inget verktyg för stora dataflöden.
 
-Projektet provar moduler utan citerade importsökvägar, mutable borrows,
+Projektet provar punktseparerade modulnamn utan citattecken, mutable borrows,
 structreturer med dynamiska fält, UTF-8-bytebuffertar, map, strängsortering,
 programargument, fil-I/O och separata stdout/stderr. Parserns och rapportens
 taggade tester finns nära funktionerna. Kompilatorns integrationstest

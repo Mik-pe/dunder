@@ -688,10 +688,9 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             }
             continue;
         }
-        // Import paths are lexical names, not arithmetic expressions. Keep the
-        // full spelling (including malformed repeated/trailing slashes) so a
-        // typo cannot silently turn into a different module plus a comment.
-        // Whitespace separates an unquoted path from `as` and comments.
+        // Import names are lexical names, not field expressions or numbers.
+        // Keep their full spelling for dotted-name validation and legacy path
+        // compatibility. Whitespace separates the name from `as` and comments.
         if matches!(out.last().map(|t: &Lexeme| &t.token), Some(Token::Name(n)) if n == "import")
             && (c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
         {
@@ -1228,27 +1227,59 @@ impl Parser<'_> {
         let token = self.take();
         let path = match token.token {
             Token::ImportPath(path) => {
-                if path.split('/').any(|part| {
-                    part.is_empty()
-                        || !part
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                }) || matches!(path.rsplit('/').next(), Some("." | ".."))
-                {
-                    return Err(Error::new(
-                        "E0401",
-                        token.span,
-                        "expected a relative module path without empty components; write import std/map or import ../shared/value",
-                    ));
+                if path.contains('/') {
+                    // Existing slash paths remain literal; dots in directory
+                    // names must not become extra path separators.
+                    if path.split('/').any(|part| {
+                        part.is_empty()
+                            || !part
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    }) || matches!(path.rsplit('/').next(), Some("." | ".."))
+                    {
+                        return Err(Error::new(
+                            "E0401",
+                            token.span,
+                            "expected a module name without empty components; write import std.map or import ..shared.value",
+                        ));
+                    }
+                    path
+                } else {
+                    if path.ends_with(".ddr") {
+                        return Err(Error::new(
+                            "E0401",
+                            token.span,
+                            "omit the file suffix in imports; write import math or import utils.math",
+                        ));
+                    }
+                    let relative = path.bytes().take_while(|byte| *byte == b'.').count();
+                    let name = &path[relative..];
+                    if name.split('.').any(|part| {
+                        part.is_empty()
+                            || !part
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
+                    }) {
+                        return Err(Error::new(
+                            "E0401",
+                            token.span,
+                            "expected a module name without empty components; write import std.map or import ..shared.value",
+                        ));
+                    }
+                    let prefix = match relative {
+                        0 => String::new(),
+                        1 => "./".into(),
+                        n => "../".repeat(n - 1),
+                    };
+                    prefix + &name.replace('.', "/")
                 }
-                path
             }
             Token::String(path) => path,
             _ => {
                 return Err(Error::new(
                     "E0107",
                     token.span,
-                    "expected a module name or relative path, for example import math or import std/map",
+                    "expected a module name, for example import math or import std.map",
                 ))
             }
         };

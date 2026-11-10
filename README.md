@@ -125,8 +125,8 @@ fn main() {
 
 `fn` är privat inom modulen; `pub fn` exporterar funktionen. `import math`
 läser `math.ddr`. Undermappar och alias skrivs exempelvis
-`import util/predicates as predicates`. Sökvägar behöver inga citattecken;
-även `import ../shared/math` och `import ./sys as local` fungerar.
+`import util.predicates as predicates`. Modulnamn använder punkter utan citattecken;
+även `import ..shared.math` och `import .sys as local` fungerar.
 Importerna skrivs utan `.ddr`.
 
 Typer följer samma regel: `struct Point` och `enum Command` är privata;
@@ -228,9 +228,9 @@ och begränsade funktionsborrows finns nu i standardbibliotekets första steg.
 ## Standardbibliotek och dynamiska arrayer
 
 ```dunder
-import std/map as map
-import std/set as set
-import std/array as array
+import std.map as map
+import std.set as set
+import std.array as array
 
 fn main() {
     var counts := map.new()
