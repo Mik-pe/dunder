@@ -1,13 +1,12 @@
 # Dunder i Dunder
 
-**Dunder-kompilatorn kan nu bygga sig själv för ARM64/Linux.** Stage 1
+**Dunder-kompilatorn kan bygga sig själv för ARM64/macOS och ARM64/Linux.** Stage 1
 bygger stage 2 från dessa källfiler; stage 2 bygger en byteidentisk stage 3.
 Stage 3 bygger dessutom fristående program som körs och jämförs med
-oberoende förväntade resultat. Hela kedjan är verifierad på Linux/x86-64
-med QEMU för ARM64-körning.
+oberoende förväntade resultat. Fixpunkten har körts direkt på ARM64 för båda systemen och för Linux med QEMU på x86-64.
 
 Lexer, modulladdare, parser, typkontroll, kodgenerering, runtime och
-ELF-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
+ELF- och Mach-O-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
 assembler eller länkare. QEMU används bara för att köra ARM64-binärer
 på en annan processor.
 
@@ -44,9 +43,9 @@ qemu-aarch64 build/hello-selfhost
 ```
 
 `selfhost/linux.ddr` skriver alltid ARM64/Linux, oberoende av stage 1:s
-värdplattform. Den äldre ingången `selfhost/main.ddr` finns kvar för den
-skalära ARM64/macOS-byggvägen. Självbyggd macOS- och x86-64-kodgenerering
-återstår; Rust-bootstrapen stöder redan alla tre målen.
+värdplattform. `selfhost/main.ddr` skriver signerade Mach-O-binärer för ARM64/macOS.
+På en Mac går samma byggkedja att köra med `main.ddr` och utan QEMU.
+Båda ingångarna använder samma modulladdare och parser.
 
 ## Vad kompilatorn klarar
 
@@ -71,7 +70,8 @@ och rename efter ett lyckat bygge.
 
 Detta är ännu en mindre implementation än Rust-bootstrapen. Bara nåbara
 funktionskroppar kompileras och kontrolleras; `@test`-block tas bort vid
-modulladdning. Fullt stöd för fasta arrayer, payload-enums/`match`, flyttal,
+modulladdning. Fasta arrayer med skalära element stöder deklaration, repetition,
+indexering, kopiering och iteration. Stöd för payload-enums/`match`, flyttal,
 funktionsvärden, generell lånekontroll och alla standardbiblioteksoperationer
 återstår. Självhosting betyder att kompilatorn bygger sin egen källkod;
 det betyder ännu inte full språkparitet.
@@ -88,9 +88,10 @@ i Rust-bootstrapens byggväg. Metal-exemplen byggs med den vanliga `dunder`.
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
 | `compile.ddr` | Typer, uttryck, kontrollflöde, värdesemantik och kodgenerering. |
 | `arm64.ddr` | Maskinord, register, stack, etiketter och hoppfixering. |
-| `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Linux-systemanrop. |
+| `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Darwin- och Linux-systemanrop. |
+| `driver.ddr` | Gemensam modulladdning, felrapportering och publicering av filer. |
 | `elf.ddr`, `linux.ddr` | ELF-format och kompilatorns Linux-ingång. |
-| `macho.ddr`, `main.ddr` | Den äldre signerade Mach-O-byggvägen. |
+| `macho.ddr`, `main.ddr` | Signerad Mach-O och kompilatorns macOS-ingång. |
 
 ## Verifiering
 
@@ -99,7 +100,8 @@ cargo test --test selfhost -- --test-threads=1
 target/release/dunder test
 ```
 
-Linux-testet bygger stage 1 och stage 2. Med `qemu-aarch64` tillgängligt
+Det gemensamma testet bygger stage 1 och stage 2 på macOS och Linux. På
+ARM64/macOS verifierar det fixpunkten och kör Tabell direkt. Med `qemu-aarch64` tillgängligt
 kör det även stage 2 → stage 3, jämför samtliga byte och kör program byggda
 av stage 3. Ange vid behov `DUNDER_QEMU_AARCH64=/sökväg/till/qemu-aarch64`.
 Testet rapporterar när QEMU-delen hoppas över. På ARM64/Linux körs binärerna

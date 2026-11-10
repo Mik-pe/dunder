@@ -198,7 +198,8 @@ fn main(){
             "fn main(){print(\"unterminated)}",
             "fn main(x:i32){}",
             "fn main()->i64{0}",
-            "import sys\nfn main(){}",
+            "fn main(){var a:[i32;3]=[1,2]}",
+            "fn main(){var a:[i32;3]=[1;3];a.push(4)}",
             "struct S{x:i32} fn main(){value:=S{x:true}}",
             "fn main(){var a:[]i32=[true]}",
         ] {
@@ -210,7 +211,7 @@ fn main(){
                 String::from_utf8_lossy(&result.stdout),
                 String::from_utf8_lossy(&result.stderr)
             );
-            assert!(String::from_utf8_lossy(&result.stdout).contains("E1000"));
+            assert!(String::from_utf8_lossy(&result.stderr).contains("E1000"));
             assert_eq!(previous, fs::read(w.0.join("program")).unwrap());
         }
         let original = b"fn main(){print(1)}";
@@ -230,14 +231,6 @@ fn main(){
                 fs::read(w.0.join("input.ddr")).unwrap().as_slice()
             );
         }
-        // The legacy macOS entry still takes one source file without a loader.
-        // The Linux entry's real self-build is checked separately below.
-        let own =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("selfhost/main.ddr"))
-                .unwrap();
-        let result = w.build(&compiler, &own);
-        assert_eq!(result.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&result.stdout).contains("imports"));
     }
     #[test]
     fn dunder_written_runtime_traps_agree_with_bootstrap() {
@@ -267,11 +260,14 @@ fn main(){
     }
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
 ))]
-mod linux {
+mod native {
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -284,7 +280,7 @@ mod linux {
     impl Work {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "dunder-linux-selfhost-{}-{}",
+                "dunder-native-selfhost-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -324,7 +320,12 @@ mod linux {
         fn build(&self, command: Command, source: &Path, output: &Path) {
             let result = self.invoke_build(command, source, output);
             success(&format!("building {}", source.display()), &result);
-            assert_arm64_elf(&fs::read(output).unwrap());
+            let image = fs::read(output).unwrap();
+            if cfg!(target_os = "macos") {
+                assert_eq!(image.get(..4), Some(&[0xcf, 0xfa, 0xed, 0xfe][..]));
+            } else {
+                assert_arm64_elf(&image);
+            }
         }
     }
     impl Drop for Work {
@@ -334,7 +335,12 @@ mod linux {
     }
 
     fn compiler_source() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("selfhost/linux.ddr")
+        let entry = if cfg!(target_os = "macos") {
+            "main"
+        } else {
+            "linux"
+        };
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("selfhost/{entry}.ddr"))
     }
 
     fn success(context: &str, result: &Output) {
@@ -449,6 +455,11 @@ mod linux {
 
     const PROGRAMS: &[(&str, &str, &str)] = &[
         (
+            "fixed_arrays",
+            "fn main(){var a:[i32;3]=[7;3];var b:=a;b[1]=1;for i in a{print(i)};print(b[1]);zeros:[i64;0]=[0;0];print(zeros.len)}",
+            "7\n7\n7\n1\n0\n",
+        ),
+        (
             "bits",
             r#"fn main(){value:i64=1193046;for i in 0..8{print(value.shr(i*8).bit_and(255))};one:i64=1;shift:=40;print(one.shl(shift));negative:i64=-256;print(negative.shr(8));print(one.bit_or(6).bit_xor(3));print(one.bit_not());small:=-1;large:i64=-1;print(small.shr(1));print(large.shr(1));max:=2147483647;print(max.wrapping_add(1))}"#,
             "86\n52\n18\n0\n0\n0\n0\n0\n1099511627776\n72057594037927935\n4\n-2\n2147483647\n9223372036854775807\n-2147483648\n",
@@ -550,7 +561,7 @@ fn main(){var a:=Values{items:[]};a.items.reserve(8);append(&mut a,3);append(&mu
     }
 
     #[test]
-    fn dunder_compiler_emits_standalone_linux_programs() {
+    fn dunder_compiler_emits_standalone_native_programs() {
         let work = Work::new();
         let stage1 = work.bootstrap();
         let runner = Runner::available();
