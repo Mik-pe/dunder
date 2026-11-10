@@ -2,7 +2,7 @@
 
 Ett statiskt typat, kompilerat språk med filändelsen **`.ddr`**.
 Kompilatorn läser vanlig Dunder-källkod och skriver körbara filer för
-ARM64/macOS, ARM64/Linux och x86-64/Linux. Kodgenerering, ELF-/Mach-O-skrivning
+ARM64/macOS, ARM64/Linux, x86-64/Linux och WebAssembly (wasm32). Kodgenerering, ELF-/Mach-O-skrivning
 och macOS ad hoc-signering görs i kompilatorn.
 Den aktuella utvecklings- och återställningsgrenen är `main`.
 
@@ -45,7 +45,7 @@ cargo run --release -- build examples/hello.ddr -o build/hello --timings
 Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer,
 assembler, länkare eller signeringsverktyg för att bygga Dunder-källkod.
 Den färdiga binären körs som en vanlig process på målplattformen. Linuxbinärer
-är fristående och behöver varken libc eller en dynamisk laddare. Systemets
+är fristående när programmet enbart använder Dunders runtime. Nåbara C-importer länkas mot de angivna delade biblioteken. Systemets
 verktyg får användas för oberoende verifiering; `cargo test` kör riktiga binärer
 på värdplattformen och verifierar även signaturer med `codesign` på macOS.
 
@@ -102,6 +102,10 @@ Utdata hamnar då i `build/<target>/hello`, exempelvis `build/x86_64-linux/hello
 `test_root` är valfri och väljer rotfil för `dunder test`. Utan den används
 `root` även för tester. Kompileringsfel har fil, rad, kolumn och
 felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
+
+Läs om [FFI, C-layout och modulkapabiliteter](docs/ffi.md),
+[funktionscachen, `check --agent` och `test --affected`](docs/incremental.md)
+samt [en delad triangel på WebGPU, Metal och Vulkan](dogfood/webgpu/README.md).
 
 ## Moduler
 
@@ -412,8 +416,8 @@ genererade CSV-data med en oberoende referens och bygger alla tre mål.
 ## Nativefönster och Metal
 
 `import std.macos as macos` ger typade fönsterhandtag, händelser och en
-Metal-triangelista. Runtimegränsen anropar AppKit, CAMetalLayer och Metal
-direkt från genererad ARM64-kod. Ingen C-, Objective-C- eller Swift-källkod
+Metal-triangelista. AppKit-delegaten och Metal-renderaren ligger i
+`stdlib/macos/` och använder Dunders typade C-anrop och callbacks. Ingen C-, Objective-C- eller Swift-källkod
 kompileras. Fönsterloopen, scenens tillstånd, geometrin och matematiken i
 exemplen är Dunder-kod. Apples Metal-runtime kompilerar den fasta MSL-pipelinen
 när ett fönster öppnas.

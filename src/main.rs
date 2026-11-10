@@ -2,6 +2,7 @@ use std::os::unix::{
     fs::{MetadataExt, PermissionsExt},
     process::ExitStatusExt,
 };
+mod agent_output;
 mod test_runner;
 use std::{
     env, fs,
@@ -329,7 +330,7 @@ fn run() -> Result<i32, String> {
     use dunder::target::Target;
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native executables\n\n  dunder build [file.ddr] [-o output] [--target target] [--app] [--timings]\n  dunder run [file.ddr] [-o output] [--target target] [--app] [--timings] [-- program-args...]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--target target] [--timeout-ms 5000]\n  dunder --list-targets\n\nWithout a file, finds the nearest dunder.toml. Default target: current host.\nCross-compilation needs no external toolchain or target SDK.\nrun and test require a target matching the current host.\n--app writes a macOS .app bundle and requires target arm64-macos; -o must name a .app directory.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        println!("Dunder — typed source to native executables\n\n  dunder build [file.ddr] [-o output] [--incremental] [--target target] [--app] [--timings]\n  dunder run [file.ddr] [-o output] [--incremental] [--target target] [--app] [--timings] [-- program-args...]\n  dunder check [file.ddr] [--agent]\n  dunder test [file.ddr] [-o directory] [--target target] [--timeout-ms 5000] [--affected]\n  dunder --list-targets\n\nWithout a file, finds the nearest dunder.toml. Default target: current host.\nCross-compilation needs no external toolchain or target SDK.\nrun and test require a target matching the current host.\n--app writes a macOS .app bundle and requires target arm64-macos; -o must name a .app directory.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
         return Ok(0);
     }
     if args[0] == "--list-targets" && args.len() == 1 {
@@ -348,6 +349,9 @@ fn run() -> Result<i32, String> {
     let mut output = None;
     let mut timings = false;
     let mut app = false;
+    let mut agent = false;
+    let mut affected = false;
+    let mut incremental = false;
     let mut timeout = 5000;
     let mut program_args = Vec::new();
     let mut target = None;
@@ -362,6 +366,9 @@ fn run() -> Result<i32, String> {
                 i += 1;
                 output = Some(PathBuf::from(args.get(i).ok_or("-o requires a path")?));
             }
+            "--agent" if command == "check" => agent = true,
+            "--affected" if command == "test" => affected = true,
+            "--incremental" if matches!(command.as_str(), "build" | "run") => incremental = true,
             "--timings" => timings = true,
             "--target" => {
                 i += 1;
@@ -427,7 +434,13 @@ fn run() -> Result<i32, String> {
         manifest(command == "test")?
     };
     let output = output.unwrap_or_else(|| {
-        let name = if app { format!("{name}.app") } else { name };
+        let name = if app {
+            format!("{name}.app")
+        } else if target == Some(Target::Wasm32) {
+            format!("{name}.wasm")
+        } else {
+            name
+        };
         let directory = PathBuf::from("build").join(target.map_or("", Target::name));
         let directory = if command == "test" {
             directory.join("tests")
@@ -441,19 +454,51 @@ fn run() -> Result<i32, String> {
     } else {
         None
     };
-    let loaded = dunder::modules::load(&source_path).map_err(|e| e.render())?;
+    let report = |error: dunder::modules::Diagnostic| {
+        if agent {
+            agent_output::diagnostic(&error, &source_path);
+        }
+        error.render()
+    };
+    let loaded = match dunder::modules::load(&source_path) {
+        Ok(loaded) => loaded,
+        Err(e) if agent => {
+            report(e);
+            return Ok(1);
+        }
+        Err(e) => return Err(report(e)),
+    };
     let module_count = loaded.sources.files.len();
     let load_time = start.elapsed();
-    let checked = if command == "test" {
-        loaded.check_tests()
+    let mut bindings = Vec::new();
+    let checked = if agent {
+        loaded.check_with_bindings(&mut bindings, target)
+    } else if command == "test" {
+        loaded.check_tests_for(target.unwrap())
     } else {
-        loaded.check()
-    }
-    .map_err(|e| e.render())?;
+        match target {
+            Some(target) => loaded.check_for(target),
+            None => loaded.check(),
+        }
+    };
+    let checked = match checked {
+        Ok(checked) => checked,
+        Err(e) if agent => {
+            report(e);
+            return Ok(1);
+        }
+        Err(e) => return Err(report(e)),
+    };
     let check_time = start.elapsed() - load_time;
     if command == "test" {
         let target = target.unwrap();
-        let result = test_runner::run(&checked, &output, Duration::from_millis(timeout), target)?;
+        let result = test_runner::run(
+            &checked,
+            &output,
+            Duration::from_millis(timeout),
+            target,
+            affected,
+        )?;
         if timings {
             eprintln!(
                 "modules={module_count} load+parse={:.3}ms check={:.3}ms test-total={:.3}ms",
@@ -465,13 +510,33 @@ fn run() -> Result<i32, String> {
         return Ok(result);
     }
     if command == "check" {
-        println!("checked {} ({module_count} modules)", source_path.display());
+        if agent {
+            agent_output::success(&checked, &bindings);
+        } else {
+            println!("checked {} ({module_count} modules)", source_path.display());
+        }
         return Ok(0);
     }
     let target = target.unwrap();
-    let mut image = checked
-        .compile_for(target)
-        .map_err(|e| checked.render(&e))?;
+    let mut image = if incremental {
+        let mut cache = dunder::native::Incremental::new(
+            Path::new("build/.dunder-cache/functions"),
+            &checked.program,
+            target,
+        )?;
+        let image = cache.compile(checked.program.main.unwrap())?;
+        if timings {
+            eprintln!(
+                "functions-reused={} functions-compiled={}",
+                cache.stats.hits, cache.stats.misses
+            );
+        }
+        image
+    } else {
+        checked
+            .compile_for(target)
+            .map_err(|e| checked.render(&e))?
+    };
     let native_time = start.elapsed() - load_time - check_time;
     let mut resources = None;
     let executable = if let Some(bundle) = &bundle {

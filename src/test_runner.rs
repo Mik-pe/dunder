@@ -65,7 +65,13 @@ fn execute(
             let status = child.wait().map_err(|e| e.to_string())?;
             return Ok((status, true));
         }
-        thread::sleep(Duration::from_millis(5));
+        let elapsed = start.elapsed();
+        let poll = if elapsed < Duration::from_millis(10) {
+            Duration::from_micros(250)
+        } else {
+            Duration::from_millis(5)
+        };
+        thread::sleep(poll.min(timeout.saturating_sub(elapsed)));
     }
 }
 
@@ -74,14 +80,46 @@ pub fn run(
     output: &Path,
     timeout: Duration,
     target: dunder::target::Target,
+    affected: bool,
 ) -> Result<i32, String> {
     let scratch = Scratch::create(output)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut cache = affected
+        .then(|| {
+            dunder::native::Incremental::new(&output.join(".functions"), &project.program, target)
+        })
+        .transpose()?;
+    let mut skipped = 0;
     let mut passed = 0;
     let mut failed = 0;
     for (index, test) in project.program.tests.iter().enumerate() {
+        let receipt = output.join(".affected").join(format!("test-{index}"));
+        let key = cache
+            .as_ref()
+            .and_then(|cache| cache.test_key(test.function))
+            .map(|digest| {
+                // A stricter timeout must exercise even a previously passing test.
+                let mut input = digest.to_vec();
+                input.extend_from_slice(&timeout.as_nanos().to_le_bytes());
+                dunder::native::sha256(&input)
+            });
+        if let Some(key) = &key {
+            if fs::read(&receipt).is_ok_and(|saved| saved == key.as_slice()) {
+                skipped += 1;
+                continue;
+            }
+            match fs::remove_file(&receipt) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         let path = scratch.0.join(format!("test-{index}"));
-        let image = dunder::native::compile_entry_for(&project.program, test.function, target)?;
+        let image = if let Some(cache) = &mut cache {
+            cache.compile(test.function)?
+        } else {
+            dunder::native::compile_entry_for(&project.program, test.function, target)?
+        };
         super::publish(&path, &image).map_err(|e| e.to_string())?;
         let executable = fs::canonicalize(&path).map_err(|e| e.to_string())?;
         let stdout = scratch.0.join(format!("stdout-{index}"));
@@ -90,6 +128,9 @@ pub fn run(
         let source = &project.sources.files[test.file].path;
         let source = source.strip_prefix(&cwd).unwrap_or(source);
         if status.success() && !timed_out {
+            if let Some(key) = key {
+                super::publish_file(&receipt, &key, 0o600).map_err(|e| e.to_string())?;
+            }
             passed += 1;
             println!("PASS {}::{}", source.display(), test.name);
         } else {
@@ -119,6 +160,9 @@ pub fn run(
                 }
             }
         }
+    }
+    if affected {
+        println!("{skipped} unaffected");
     }
     println!("{passed} passed, {failed} failed");
     Ok(if failed == 0 { 0 } else { 1 })

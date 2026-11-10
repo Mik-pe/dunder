@@ -1,5 +1,6 @@
 // Module loading and namespace resolution for the Dunder compiler.
 // Parallel arrays deliberately keep the bootstrap data model small.
+import test_suite
 import lexer
 import bundled
 import std.map as map
@@ -15,9 +16,11 @@ pub struct Loaded {
 struct Loader {
     result: Loaded, standard: []string, first: []i32, last: []i32,
     kinds: []lexer.Kind, texts: []string, starts: []i32, ends: []i32,
-    omit: []bool, declared: []i32,
+    omit: []bool, declared: []i32, any_unsafe: bool,
     symbols: map.Map, imports: map.Map, names: []string, owners: []i32,
     public: []bool, renamed: []string,
+    testing: bool, test_tags: []i32, test_targets: []i32, test_ends: []i32, next_test: i32,
+    groups: []string, calls: []string,
 }
 fn key(owner: i32, name: string) -> string { owner.str() + ":" + name }
 fn begins(text: string, prefix: string) -> bool {
@@ -195,27 +198,63 @@ fn scan(loader: &mut Loader, owner: i32) {
     }
     last := loader.texts.len
     loader.last[owner] = last
-    i = first
+    i = skip_lines(&loader, first)
+    var capable := false
+    if is(&loader, i, "capability") {
+        start := i; i = i + 1
+        var filesystem := false
+        while i < last {
+            if is(&loader, i, "unsafe") && !capable { capable = true; loader.any_unsafe = true }
+            else if is(&loader, i, "filesystem") && !filesystem { filesystem = true }
+            else { fail(&mut loader, owner, loader.starts[i], "unknown or duplicate module capability"); return }
+            i = i + 1
+            if !is(&loader, i, ",") { break }
+            i = i + 1
+        }
+        if i < last && loader.kinds[i] != .Newline && loader.kinds[i] != .End && !is(&loader,i,";") {
+            fail(&mut loader, owner, loader.starts[i], "expected end of capability declaration"); return
+        }
+        hide(&mut loader, start, i)
+    }
     var depth := 0
     var public := false
     var parens := 0
     while i < last && loader.result.ok {
+        if is(&loader, i, "capability") { fail(&mut loader, owner, loader.starts[i], "declare capabilities at the beginning of the module"); return }
+        if is(&loader, i, "unsafe") && !capable { fail(&mut loader, owner, loader.starts[i], "module requires capability unsafe"); return }
         if depth == 0 && is(&loader, i, "import") { i = import_module(&mut loader, owner, i); public = false; continue }
         if depth == 0 && is(&loader, i, "@") && is(&loader, i + 1, "test") {
-            start := i
-            i = skip_lines(&loader, i + 2)
-            if is(&loader, i, "{") { i = close_block(&loader, i) }
-            else {
-                if is(&loader, i, "pub") { i = i + 1 }
-                if !is(&loader, i, "fn") { fail(&mut loader, owner, loader.starts[start], "expected test function or test cases"); return }
-                while i < last && !is(&loader, i, "{") { i = i + 1 }
-                i = close_block(&loader, i)
+            tag := i
+            body := skip_lines(&loader, i + 2)
+            attached := is(&loader, body, "{")
+            var after := body
+            if attached { after = close_block(&loader, body) }
+            if after < 0 { fail(&mut loader, owner, loader.starts[tag], "unterminated test block"); return }
+            var function := skip_lines(&loader, after)
+            if is(&loader, function, "pub") { function = skip_lines(&loader, function + 1) }
+            if !is(&loader, function, "fn") {
+                fail(&mut loader, owner, loader.starts[tag], "expected function after @test"); return
             }
-            if i < 0 { fail(&mut loader, owner, loader.starts[start], "unterminated test block"); return }
-            hide(&mut loader, start, i); continue
+            name := function + 1
+            if name >= last || loader.kinds[name] != .Name { fail(&mut loader, owner, loader.starts[tag], "expected test function name"); return }
+            if loader.testing {
+                loader.test_tags.push(tag); loader.test_targets.push(name)
+                if attached { loader.test_ends.push(after) } else { loader.test_ends.push(-1) }
+                loader.groups.push(loader.result.paths[owner] + "::" + loader.texts[name])
+                // Declarations in the attached body are local to its generated function.
+                if attached { i = after } else { i = body }
+            } else {
+                if !attached {
+                    while after < last && !is(&loader, after, "{") { after = after + 1 }
+                    after = close_block(&loader, after)
+                    if after < 0 { fail(&mut loader, owner, loader.starts[tag], "unterminated test function"); return }
+                }
+                hide(&mut loader, tag, after); i = after
+            }
+            continue
         }
         if depth == 0 && is(&loader, i, "pub") { public = true }
-        if depth == 0 && parens == 0 && (is(&loader, i, "fn") || is(&loader, i, "struct") || is(&loader, i, "enum")) {
+        if depth == 0 && parens == 0 && !is(&loader, i - 1, "extern") && (is(&loader, i, "fn") || is(&loader, i, "struct") || is(&loader, i, "enum")) {
             name_at := i + 1
             if name_at >= last || loader.kinds[name_at] != .Name { fail(&mut loader, owner, loader.starts[i], "expected declaration name"); return }
             name := loader.texts[name_at]
@@ -227,7 +266,7 @@ fn scan(loader: &mut Loader, owner: i32) {
             map.put(&mut loader.symbols, entry, i64(id))
             loader.names.push(name); loader.owners.push(owner); loader.public.push(public)
             var renamed := "__dunder_module_" + id.str()
-            if owner == 0 && name == "main" && is(&loader, i, "fn") { renamed = "main" }
+            if !loader.testing && owner == 0 && name == "main" && is(&loader, i, "fn") { renamed = "main" }
             loader.renamed.push(renamed); loader.declared[name_at] = id
             public = false
         }
@@ -261,6 +300,18 @@ fn emit(loader: &mut Loader, output: &mut []i32, owner: i32, token: i32, value: 
     loader.result.map_files.push(owner); loader.result.map_offsets.push(loader.starts[token])
     output.push(32)
 }
+fn argument_case_arrow(loader: &Loader, first: i32, end: i32) -> i32 {
+    var depth := 0
+    for i in first..end {
+        if is(&loader, i, "(") { depth = depth + 1 }
+        if is(&loader, i, ")") {
+            depth = depth - 1
+            if depth == 0 { if is(&loader, i + 1, "->") { return i + 1 }; return -1 }
+        }
+    }
+    -1
+}
+
 fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32) {
     var i := loader.first[owner]
     last := loader.last[owner]
@@ -271,8 +322,32 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32) {
     var levels: []i32 = []
     var active: []i32 = []
     var previous := -1
+    var case_target := ""
+    var case_end := -1
+    var case_arrow := -1
     while i < last && loader.result.ok {
         if loader.omit[i] { i = i + 1; continue }
+        group := loader.next_test
+        if group < loader.test_tags.len && i == loader.test_tags[group] {
+            loader.next_test = group + 1
+            target := loader.renamed[loader.declared[loader.test_targets[group]]]
+            case_end = loader.test_ends[group]
+            if case_end >= 0 {
+                wrapper := "__dunder_module_test_" + group.str()
+                loader.calls.push(wrapper); case_target = target
+                emit(&mut loader, &mut output, owner, i, "@test fn " + wrapper + "()")
+                mode = 2
+            } else {
+                loader.calls.push(target)
+                emit(&mut loader, &mut output, owner, i, "@test")
+            }
+            i = i + 2; continue
+        }
+        if i < case_end && is(&loader, i, "(") && (is(&loader, previous, ";") || is(&loader, previous, "{") || (previous >= 0 && loader.kinds[previous] == .Newline)) {
+            arrow := argument_case_arrow(&loader, i, case_end)
+            if arrow >= 0 { case_arrow = arrow; emit(&mut loader, &mut output, owner, i, case_target) }
+        }
+        if i == case_arrow { emit(&mut loader, &mut output, owner, i, "=="); previous = i; i = i + 1; continue }
         kind := loader.kinds[i]
         if kind == .End { i = i + 1; continue }
         if kind == .Newline { output.push(10); previous = i; i = i + 1; continue }
@@ -351,20 +426,24 @@ pub fn location(loaded: &Loaded, offset: i32) -> Location {
     owner := loaded.map_files[index]
     Location { path: loaded.paths[owner], source: loaded.sources[owner], offset: loaded.map_offsets[index] }
 }
-pub fn load(path: string) -> Loaded {
+pub fn load(path: string) -> Loaded { load_mode(path, false) }
+pub fn load_mode(path: string, testing: bool) -> Loaded {
     var loader := Loader {
         result: Loaded { ok: true, error: "", path: path, source: "", offset: 0,
             paths: [], sources: [], map_starts: [], map_ends: [], map_files: [], map_offsets: [] },
-        standard: [], first: [], last: [], kinds: [], texts: [], starts: [], ends: [], omit: [], declared: [],
+        standard: [], first: [], last: [], kinds: [], texts: [], starts: [], ends: [], omit: [], declared: [], any_unsafe: false,
         symbols: map.new(), imports: map.new(), names: [], owners: [], public: [], renamed: [],
+        testing: testing, test_tags: [], test_targets: [], test_ends: [], next_test: 0, groups: [], calls: [],
     }
     root := add(&mut loader, path, "", -1, 0)
     var owner := 0
     while owner < loader.result.paths.len && loader.result.ok { scan(&mut loader, owner); owner = owner + 1 }
     var output: []i32 = []
+    if loader.any_unsafe { text(&mut output, "capability unsafe\n") }
     owner = 0
     while owner < loader.result.paths.len && loader.result.ok { flatten(&mut loader, owner, &mut output); owner = owner + 1 }
     if loader.result.ok {
+        if testing { test_suite.entry(&mut output, &loader.groups, &loader.calls) }
         decoded := bytes.utf8(&output)
         loader.result.source = decoded.value
     }

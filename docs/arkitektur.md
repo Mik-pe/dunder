@@ -11,8 +11,8 @@ GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
 begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
 Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
 är implementerade i bootstrapens kodgenerering. Generella livstider,
-explicita flyttar, full registerallokering och den inkrementella cachen
-nedan är fortsatt designmål.
+explicita flyttar och full registerallokering är fortsatt designmål. Nativebyggen
+kan använda [funktionscachen](incremental.md).
 
 ## Språkets kostnadsmodell
 
@@ -96,7 +96,11 @@ publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsn
 
 `dunder build` hittar närmaste `dunder.toml` från arbetskatalogen uppåt. Första manifestet behöver bara programnamn och rotmodul. Rotmodulens uttryckliga importer bestämmer vad som byggs. Lokala beroenden räcker för första versionen. Standardkommandot bygger optimerat för värddatorns stödda mål och skriver till `build/<mål>/<program>`. Det kräver varken nätverk, bakgrundsprocess eller användarskrivna byggskript. `--target arm64-macos` väljer målet uttryckligen. `--timings` redovisar faser och återanvändning. Ett fel ger källposition, felkod från kommandot och inget halvskrivet resultat.
 
-En första implementation får bygga om allt. Nästa version lagrar maskinkodsfragment och deras symboliska korrigeringsposter. Nyckeln omfattar kompilatorversion, mål och ABI, bygginställningar, eget källinnehåll och relevanta beroendens fingeravtryck. En intern ändring i en anropad funktion kräver normalt bara omkompilering av den funktionen och omlänkning. Ändrad typ-layout, signatur, inlinad kropp eller använd exporterad konstant ogiltigförklarar också konsumenterna. Ändringar i modulers namnutbud måste fångas vid namnupplösningen. En ren och en inkrementell byggning av samma källträd ska ge exakt samma binär, även med olika antal byggarbetare.
+Med `--incremental` lagras maskinkodsfragment och symboliska korrigeringsposter.
+En ändrad inlinad funktionskropp ogiltigförklarar anroparens fragment.
+Kompilatorn kontrollerar hela källträdet inför varje bygge. Tester jämför
+varma och rena bilder byte för byte på alla tre native-mål.
+[Användning och cachekontrakt](incremental.md).
 
 ## Vägen till en självhostad kompilator
 

@@ -140,6 +140,7 @@ impl Checker<'_> {
                 let b = self
                     .lookup(name)
                     .ok_or_else(|| Error::new("E0205", e.span, format!("unknown name '{name}'")))?;
+                self.check_scratch_value(&b, e.span)?;
                 if let Some((ty, mutable)) = self.types.referenced(b.ty) {
                     if write && !mutable {
                         return Err(Error::new(
@@ -172,6 +173,7 @@ impl Checker<'_> {
             }
             ast::ExprKind::Member(base, name) => {
                 let (ty, address) = self.place(base, write)?;
+                self.check_record_access(ty, e.span)?;
                 let field = self
                     .types
                     .record(ty)
@@ -186,7 +188,24 @@ impl Checker<'_> {
                 ))
             }
             ast::ExprKind::Index(base, index) => {
-                let (ty, address) = self.place(base, write)?;
+                let (ty, address) = if let Some(binding) = self.scratch_slice(base) {
+                    if write && !binding.mutable {
+                        return Err(Error::new(
+                            "E0208",
+                            e.span,
+                            "declare a mutable scratch slice with var",
+                        ));
+                    }
+                    (
+                        binding.ty,
+                        Expr {
+                            ty: binding.ty,
+                            kind: ExprKind::Local(binding.slot),
+                        },
+                    )
+                } else {
+                    self.place(base, write)?
+                };
                 let elem = self
                     .types
                     .dynamic_elem(ty)
@@ -296,7 +315,11 @@ impl Checker<'_> {
         let (ty, receiver) = if mutable {
             self.place(base, true)?
         } else {
-            let value = self.expr(base, None)?;
+            let value = if matches!(op, DynamicOp::Len) {
+                self.index_receiver(base)?
+            } else {
+                self.expr(base, None)?
+            };
             (value.ty, value)
         };
         let elem = self.types.dynamic_elem(ty).unwrap();

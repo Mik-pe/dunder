@@ -51,6 +51,7 @@ fn u64le(image: &[u8], offset: usize) -> u64 {
 
 fn assert_target_image(image: &[u8], target: Target) {
     match target {
+        Target::Wasm32 => assert_eq!(&image[..8], b"\0asm\x01\0\0\0"),
         Target::Arm64Macos => {
             assert_eq!(&image[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
             assert_eq!(u32le(image, 4), 0x0100_000c); // CPU_TYPE_ARM64

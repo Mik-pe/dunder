@@ -1,9 +1,15 @@
 use crate::{Error, Span};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     I32,
     I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
+    Ptr,
     F32,
     F64,
     Bool,
@@ -13,6 +19,8 @@ pub enum Type {
     Runes,
     Unit,
     Function(usize),
+    UnsafeFunction(usize),
+    ExternFunction(usize),
     Array(usize),
     Iterator(usize),
     Range,
@@ -24,7 +32,13 @@ pub enum Type {
 }
 impl Type {
     pub fn integer(self) -> bool {
-        matches!(self, Self::I32 | Self::I64)
+        matches!(self, Self::I32 | Self::I64) || self.unsigned()
+    }
+    pub fn unsigned(self) -> bool {
+        matches!(
+            self,
+            Self::U8 | Self::U16 | Self::U32 | Self::U64 | Self::Usize
+        )
     }
     pub fn float(self) -> bool {
         matches!(self, Self::F32 | Self::F64)
@@ -36,6 +50,14 @@ impl Type {
         match self {
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::Usize => "usize",
+            Self::Ptr => "ptr",
+            Self::UnsafeFunction(_) => "unsafe fn",
+            Self::ExternFunction(_) => "extern fn",
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::Bool => "bool",
@@ -57,14 +79,15 @@ impl Type {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionType {
     pub params: Vec<Type>,
     pub ret: Type,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Hash)]
 pub struct Types {
+    wasm32: bool,
     functions: Vec<FunctionType>,
     arrays: Vec<ArrayType>,
     names: Vec<NamedType>,
@@ -73,7 +96,7 @@ pub struct Types {
     dynamics: Vec<Type>,
     references: Vec<(Type, bool)>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct EnumType {
     pub name: String,
     pub module: usize,
@@ -81,48 +104,68 @@ pub struct EnumType {
     pub variants: Vec<Variant>,
     pub bytes: usize,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct Variant {
     pub name: String,
     pub tag: i32,
     pub fields: Vec<RecordField>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NamedType {
     pub module: usize,
     pub name: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct RecordField {
     pub name: String,
     pub ty: Type,
     pub offset: usize,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct RecordType {
+    pub opaque: bool,
+    pub c_layout: bool,
+    pub alignment: usize,
     pub name: String,
     pub module: usize,
     pub fields: Vec<RecordField>,
     pub bytes: usize,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ArrayType {
+    elem_bytes: usize,
     pub elem: Type,
     pub len: usize,
 }
 impl ArrayType {
     pub fn elem_size(self) -> usize {
-        match self.elem {
-            Type::Bool => 1,
-            Type::I32 | Type::Rune | Type::F32 | Type::Enum(_) => 4,
-            _ => 8,
-        }
+        self.elem_bytes
     }
     pub fn bytes(self) -> usize {
         self.elem_size() * self.len
     }
 }
 impl Types {
+    pub fn set_pointer_bytes(&mut self, bytes: usize) {
+        assert!(matches!(bytes, 4 | 8));
+        self.wasm32 = bytes == 4;
+        for array in &mut self.arrays {
+            if matches!(array.elem, Type::Ptr | Type::Usize) {
+                array.elem_bytes = bytes;
+            }
+        }
+    }
+    pub fn pointer_bytes(&self) -> usize {
+        if self.wasm32 {
+            4
+        } else {
+            8
+        }
+    }
+    pub fn is_extern_fn(&self, ty: Type) -> bool {
+        matches!(ty, Type::ExternFunction(_))
+    }
+
     pub fn dynamic(&mut self, elem: Type, span: Span) -> Result<Type, Error> {
         if !matches!(
             elem,
@@ -134,7 +177,9 @@ impl Types {
                 | Type::String
                 | Type::Rune
                 | Type::Named(_)
-        ) && !self.scalar_enum(elem)
+        ) && !elem.unsigned()
+            && elem != Type::Ptr
+            && !self.scalar_enum(elem)
         {
             return Err(Error::new(
                 "E0280",
@@ -142,6 +187,9 @@ impl Types {
                 "dynamic array elements must be scalar values",
             ));
         }
+        Ok(self.intern_dynamic(elem))
+    }
+    pub(crate) fn intern_dynamic(&mut self, elem: Type) -> Type {
         let index = self
             .dynamics
             .iter()
@@ -150,7 +198,7 @@ impl Types {
                 self.dynamics.push(elem);
                 self.dynamics.len() - 1
             });
-        Ok(Type::Dynamic(index))
+        Type::Dynamic(index)
     }
     pub fn dynamic_elem(&self, ty: Type) -> Option<Type> {
         if let Type::Dynamic(i) = ty {
@@ -182,11 +230,52 @@ impl Types {
     }
     pub fn scalar_size(&self, ty: Type) -> usize {
         match ty {
-            Type::Bool => 1,
+            Type::Bool | Type::U8 => 1,
+            Type::U16 => 2,
+            Type::U32 => 4,
+            Type::Usize | Type::Ptr | Type::ExternFunction(_) => self.pointer_bytes(),
             Type::I32 | Type::Rune | Type::F32 => 4,
             _ if self.scalar_enum(ty) => 4,
             _ => 8,
         }
+    }
+    /// A C aggregate that AAPCS64 classifies as a homogeneous floating aggregate.
+    /// Return the primitive float and member count; plain scalars are excluded.
+    pub fn homogeneous_float(&self, ty: Type) -> Option<(Type, usize)> {
+        fn members(
+            types: &Types,
+            ty: Type,
+            base: &mut Option<Type>,
+            count: &mut usize,
+        ) -> Option<()> {
+            if ty.float() {
+                if base.is_some_and(|b| b != ty) {
+                    return None;
+                }
+                *base = Some(ty);
+                *count += 1;
+                return (*count <= 4).then_some(());
+            }
+            if let Some(array) = types.array(ty) {
+                if !(1..=4).contains(&array.len) {
+                    return None;
+                }
+                for _ in 0..array.len {
+                    members(types, array.elem, base, count)?;
+                }
+                return Some(());
+            }
+            let record = types.record(ty).filter(|r| r.c_layout && r.bytes > 0)?;
+            for field in &record.fields {
+                members(types, field.ty, base, count)?;
+            }
+            Some(())
+        }
+        self.record(ty)?;
+        let mut base = None;
+        let mut count = 0;
+        members(self, ty, &mut base, &mut count)?;
+        Some((base?, count))
     }
     pub fn declare_enum(&mut self, module: usize, name: String, data: bool) -> Type {
         let index = self.enums.len();
@@ -234,9 +323,18 @@ impl Types {
             None
         }
     }
-    pub fn declare_record(&mut self, module: usize, name: String) -> Type {
+    pub fn declare_record(
+        &mut self,
+        module: usize,
+        name: String,
+        c_layout: bool,
+        opaque: bool,
+    ) -> Type {
         let index = self.records.len();
         self.records.push(RecordType {
+            opaque,
+            c_layout,
+            alignment: 1,
             name,
             module,
             fields: Vec::new(),
@@ -249,6 +347,11 @@ impl Types {
             self.records.get(i)
         } else {
             None
+        }
+    }
+    pub fn set_record_alignment(&mut self, ty: Type, alignment: usize) {
+        if let Type::Record(i) = ty {
+            self.records[i].alignment = alignment;
         }
     }
     pub fn define_record(&mut self, ty: Type, fields: Vec<RecordField>, bytes: usize) {
@@ -267,10 +370,21 @@ impl Types {
             .or_else(|| self.enumeration(ty).filter(|e| e.data).map(|e| e.bytes))
     }
     pub fn array_type(&mut self, elem: Type, len: usize, span: Span) -> Result<Type, Error> {
+        self.intern_array(elem, len, span, true)
+    }
+    fn intern_array(
+        &mut self,
+        elem: Type,
+        len: usize,
+        span: Span,
+        resolved: bool,
+    ) -> Result<Type, Error> {
         if !matches!(
             elem,
             Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune | Type::F32 | Type::F64
-        ) && !matches!(elem, Type::Named(_))
+        ) && !elem.unsigned()
+            && elem != Type::Ptr
+            && !matches!(elem, Type::Named(_))
             && !self.scalar_enum(elem)
         {
             return Err(Error::new(
@@ -279,8 +393,12 @@ impl Types {
                 "array elements must be scalar values in this version",
             ));
         }
-        let array = ArrayType { elem, len };
-        if len > 65536 || (!matches!(elem, Type::Named(_)) && array.bytes() > 65536) {
+        let array = ArrayType {
+            elem,
+            len,
+            elem_bytes: self.scalar_size(elem),
+        };
+        if len > 65536 || (resolved && array.bytes() > 65536) {
             return Err(Error::new(
                 "E0220",
                 span,
@@ -316,7 +434,7 @@ impl Types {
         Type::Function(index)
     }
     pub fn signature(&self, ty: Type) -> Option<&FunctionType> {
-        if let Type::Function(i) = ty {
+        if let Type::Function(i) | Type::ExternFunction(i) | Type::UnsafeFunction(i) = ty {
             self.functions.get(i)
         } else {
             None
@@ -348,7 +466,8 @@ impl Types {
         }
         match self.signature(ty) {
             Some(f) => format!(
-                "fn({}) -> {}",
+                "{}({}) -> {}",
+                ty.name(),
                 f.params
                     .iter()
                     .map(|t| self.name(*t))
@@ -362,6 +481,7 @@ impl Types {
 }
 
 pub struct Program {
+    pub filesystem: bool,
     pub functions: Vec<Function>,
     pub types: Types,
     pub imports: Vec<Import>,
@@ -370,6 +490,7 @@ pub struct Program {
 }
 
 pub struct Module {
+    pub filesystem: bool,
     pub functions: Vec<Function>,
     pub imports: Vec<Import>,
     pub records: Vec<Record>,
@@ -391,6 +512,8 @@ pub struct EnumVariant {
 }
 #[derive(Debug)]
 pub struct Record {
+    pub opaque: bool,
+    pub c_layout: bool,
     pub name: String,
     pub public: bool,
     pub fields: Vec<Field>,
@@ -868,6 +991,9 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
 
 #[derive(Debug)]
 pub struct Function {
+    pub requires_filesystem: bool,
+    pub unsafe_fn: bool,
+    pub external: Option<(String, String)>,
     pub public: bool,
     pub test: Option<String>,
     pub name: String,
@@ -905,6 +1031,8 @@ pub enum StmtKind {
     While(Expr, Vec<Stmt>),
     For(String, Expr, Vec<Stmt>),
     Block(Vec<Stmt>),
+    Region(String, Option<Expr>, Vec<Stmt>),
+    Unsafe(Vec<Stmt>),
     Break,
     Continue,
     Match(Expr, Vec<MatchArm>),
@@ -950,6 +1078,7 @@ struct Parser<'a> {
     cases: bool,
     module: usize,
     record_literals: bool,
+    unsafe_capability: bool,
 }
 impl Parser<'_> {
     fn peek(&self) -> &Token {
@@ -1050,7 +1179,14 @@ impl Parser<'_> {
             self.expect(Token::Semi, "';' before array length")?;
             let len = self.array_len()?;
             self.expect(Token::EndSquare, "']'")?;
-            return self.types.array_type(elem, len, span);
+            return self.types.intern_array(elem, len, span, false);
+        }
+        let external = self.is_word("extern");
+        if external {
+            self.take();
+            if !self.is_word("fn") {
+                return Err(Error::new("E0100", self.span(), "expected fn after extern"));
+            }
         }
         if self.is_word("fn") {
             self.take();
@@ -1077,7 +1213,12 @@ impl Parser<'_> {
             } else {
                 Type::Unit
             };
-            return Ok(self.types.function(params, ret));
+            let ty = self.types.function(params, ret);
+            return Ok(if let (true, Type::Function(i)) = (external, ty) {
+                Type::ExternFunction(i)
+            } else {
+                ty
+            });
         }
         if self.accept(Token::Left) {
             self.expect(Token::Right, "')'")?;
@@ -1085,6 +1226,12 @@ impl Parser<'_> {
         }
         let (n, _) = self.name()?;
         match n.as_str() {
+            "u8" => Ok(Type::U8),
+            "u16" => Ok(Type::U16),
+            "u32" => Ok(Type::U32),
+            "u64" => Ok(Type::U64),
+            "usize" => Ok(Type::Usize),
+            "ptr" => Ok(Type::Ptr),
             "i32" => Ok(Type::I32),
             "i64" => Ok(Type::I64),
             "f32" => Ok(Type::F32),
@@ -1103,7 +1250,7 @@ impl Parser<'_> {
             }
         }
     }
-    fn record_decl(&mut self, public: bool) -> Result<Record, Error> {
+    fn record_decl(&mut self, public: bool, c_layout: bool, opaque: bool) -> Result<Record, Error> {
         let span = self.take().span;
         let (name, _) = self.name()?;
         self.newlines();
@@ -1123,6 +1270,8 @@ impl Parser<'_> {
         }
         self.expect(Token::Close, "'}'")?;
         Ok(Record {
+            opaque,
+            c_layout,
             name,
             public,
             fields,
@@ -1303,7 +1452,12 @@ impl Parser<'_> {
         self.separators();
         Ok(Import { path, alias, span })
     }
-    fn function(&mut self, public: bool) -> Result<Function, Error> {
+    fn function(
+        &mut self,
+        public: bool,
+        unsafe_fn: bool,
+        external: Option<(String, String)>,
+    ) -> Result<Function, Error> {
         let (keyword, span) = self.name()?;
         if keyword != "fn" {
             return Err(Error::new(
@@ -1333,11 +1487,25 @@ impl Parser<'_> {
         } else {
             Type::Unit
         };
-        let mut body = self.block()?;
+        let mut body = if external.is_some() {
+            if !matches!(self.peek(), Token::Newline | Token::Semi | Token::Eof) {
+                return Err(Error::new(
+                    "E0290",
+                    self.span(),
+                    "an external declaration ends after its signature",
+                ));
+            }
+            Vec::new()
+        } else {
+            self.block()?
+        };
         if ret != Type::Unit {
             implicit_return(&mut body);
         }
         Ok(Function {
+            requires_filesystem: false,
+            external,
+            unsafe_fn,
             public,
             test: None,
             name,
@@ -1393,6 +1561,32 @@ impl Parser<'_> {
             let expected = self.expr(0)?;
             self.end_stmt()?;
             StmtKind::Case(args, expected)
+        } else if self.is_word("unsafe") {
+            if !self.unsafe_capability {
+                return Err(Error::new(
+                    "E0290",
+                    span,
+                    "unsafe requires capability unsafe at the top of this module",
+                ));
+            }
+            self.take();
+            StmtKind::Unsafe(self.block()?)
+        } else if self.is_word("region")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.token),
+                Some(Token::Name(_))
+            )
+        {
+            self.take();
+            let (name, _) = self.name()?;
+            let capacity = if self.accept(Token::Left) {
+                let capacity = self.expr(0)?;
+                self.expect(Token::Right, "')' after region capacity")?;
+                Some(capacity)
+            } else {
+                None
+            };
+            StmtKind::Region(name, capacity, self.block()?)
         } else if self.is_word("match") {
             self.take();
             let source = self.header_expr()?;
@@ -1766,6 +1960,7 @@ pub fn parse(source: &str) -> Result<Program, Error> {
     let mut types = Types::default();
     let module = parse_module(source, &mut types)?;
     Ok(Program {
+        filesystem: module.filesystem,
         functions: module.functions,
         imports: module.imports,
         records: module.records,
@@ -1786,25 +1981,89 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
         cases: false,
         module,
         record_literals: true,
+        unsafe_capability: false,
     };
     let mut functions = Vec::new();
     let mut imports = Vec::new();
     let mut records = Vec::new();
     let mut enums = Vec::new();
     parser.separators();
+    let mut filesystem = false;
+    if parser.is_word("capability") {
+        parser.take();
+        loop {
+            let (cap, span) = parser.name()?;
+            let enabled = match cap.as_str() {
+                "unsafe" => &mut parser.unsafe_capability,
+                "filesystem" => &mut filesystem,
+                _ => {
+                    return Err(Error::new(
+                        "E0290",
+                        span,
+                        format!("unknown module capability '{cap}'"),
+                    ))
+                }
+            };
+            if *enabled {
+                return Err(Error::new(
+                    "E0290",
+                    span,
+                    format!("duplicate capability '{cap}'"),
+                ));
+            }
+            *enabled = true;
+            if !parser.accept(Token::Comma) {
+                break;
+            }
+        }
+        parser.end_stmt()?;
+    }
     while *parser.peek() != Token::Eof {
         if parser.is_word("import") {
             imports.push(parser.import()?);
         } else {
-            let tagged = parser.accept(Token::At);
-            if tagged {
+            let mut tagged = false;
+            let mut c_layout = false;
+            let mut requires_filesystem = false;
+            let mut external = None;
+            if parser.accept(Token::At) {
                 let (tag, span) = parser.name()?;
-                if tag != "test" {
-                    return Err(Error::new(
-                        "E0108",
-                        span,
-                        format!("unknown tag '@{tag}'; available tag: @test"),
-                    ));
+                match tag.as_str() {
+                    "test" => tagged = true,
+                    "c_layout" => c_layout = true,
+                    "requires" => {
+                        parser.expect(Token::Left, "'(' after @requires")?;
+                        let (cap, span) = parser.name()?;
+                        if cap != "filesystem" {
+                            return Err(Error::new(
+                                "E0290",
+                                span,
+                                "expected filesystem in @requires",
+                            ));
+                        }
+                        parser.expect(Token::Right, "')'")?;
+                        requires_filesystem = true;
+                    }
+                    "extern" => {
+                        parser.expect(Token::Left, "'(' after @extern")?;
+                        let string = |parser: &mut Parser<'_>| {
+                            let token = parser.take();
+                            match token.token {
+                                Token::String(s) if !s.is_empty() && !s.contains('\0') => Ok(s),
+                                _ => Err(Error::new(
+                                    "E0290",
+                                    token.span,
+                                    "expected a nonempty library or symbol string without NUL",
+                                )),
+                            }
+                        };
+                        let library = string(&mut parser)?;
+                        parser.expect(Token::Comma, "','")?;
+                        let symbol = string(&mut parser)?;
+                        parser.expect(Token::Right, "')'")?;
+                        external = Some((library, symbol));
+                    }
+                    _ => return Err(Error::new("E0108", span, format!("unknown tag '@{tag}'"))),
                 }
                 parser.newlines();
             }
@@ -1820,6 +2079,56 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
             let public = parser.is_word("pub");
             if public {
                 parser.take();
+            }
+            let unsafe_fn = parser.is_word("unsafe");
+            if unsafe_fn {
+                if !parser.unsafe_capability {
+                    return Err(Error::new(
+                        "E0290",
+                        parser.span(),
+                        "unsafe requires capability unsafe at the top of this module",
+                    ));
+                }
+                parser.take();
+            }
+            if external.is_some() && !unsafe_fn {
+                return Err(Error::new(
+                    "E0290",
+                    parser.span(),
+                    "@extern requires unsafe fn",
+                ));
+            }
+            if c_layout && !parser.is_word("struct") {
+                return Err(Error::new(
+                    "E0290",
+                    parser.span(),
+                    "@c_layout applies to a struct",
+                ));
+            }
+            if unsafe_fn && (!parser.is_word("fn") || tagged) {
+                return Err(Error::new(
+                    "E0290",
+                    parser.span(),
+                    "expected an unsafe function declaration",
+                ));
+            }
+            let opaque = parser.is_word("opaque");
+            if opaque {
+                parser.take();
+                if !parser.is_word("struct") {
+                    return Err(Error::new(
+                        "E0290",
+                        parser.span(),
+                        "expected struct after opaque",
+                    ));
+                }
+            }
+            if requires_filesystem && !parser.is_word("fn") {
+                return Err(Error::new(
+                    "E0290",
+                    parser.span(),
+                    "@requires applies to a function",
+                ));
             }
             if parser.is_word("enum") {
                 if tagged {
@@ -1841,17 +2150,21 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
                         "@test applies to a function",
                     ));
                 }
-                records.push(parser.record_decl(public)?);
+                records.push(parser.record_decl(public, c_layout, opaque)?);
                 parser.separators();
                 continue;
             }
-            let mut function = parser.function(public)?;
+            let mut function = parser.function(public, unsafe_fn, external)?;
+            function.requires_filesystem = requires_filesystem;
             if tagged && cases.is_none() {
                 function.test = Some(function.name.clone());
             }
             if let Some(body) = &mut cases {
                 lower_cases(body, &function.name);
                 let tests = Function {
+                    requires_filesystem: false,
+                    external: None,
+                    unsafe_fn: false,
                     public: false,
                     test: Some(function.name.clone()),
                     name: format!("$cases{}", functions.len()),
@@ -1869,6 +2182,7 @@ pub fn parse_module_at(source: &str, types: &mut Types, module: usize) -> Result
         parser.separators();
     }
     Ok(Module {
+        filesystem,
         functions,
         imports,
         records,
@@ -1892,6 +2206,14 @@ fn implicit_return(body: &mut [Stmt]) {
                 }
                 StmtKind::Match(source, arms)
             }
+            StmtKind::Unsafe(mut b) => {
+                implicit_return(&mut b);
+                StmtKind::Unsafe(b)
+            }
+            StmtKind::Region(name, capacity, mut b) => {
+                implicit_return(&mut b);
+                StmtKind::Region(name, capacity, b)
+            }
             StmtKind::Block(mut b) => {
                 implicit_return(&mut b);
                 StmtKind::Block(b)
@@ -1913,9 +2235,11 @@ fn lower_cases(body: &mut [Stmt], target: &str) {
                 lower_cases(a, target);
                 lower_cases(b, target);
             }
-            StmtKind::While(_, b) | StmtKind::For(_, _, b) | StmtKind::Block(b) => {
-                lower_cases(b, target)
-            }
+            StmtKind::Region(_, _, b)
+            | StmtKind::While(_, b)
+            | StmtKind::For(_, _, b)
+            | StmtKind::Block(b)
+            | StmtKind::Unsafe(b) => lower_cases(b, target),
             StmtKind::Case(_, _) => {
                 let StmtKind::Case(args, expected) =
                     std::mem::replace(&mut stmt.kind, StmtKind::Block(Vec::new()))

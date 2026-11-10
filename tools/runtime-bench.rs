@@ -122,10 +122,14 @@ fn quantile(samples: &[f64], percentile: f64) -> f64 {
     sorted[(percentile * sorted.len() as f64).ceil() as usize - 1]
 }
 fn main() {
-    let args: Vec<_> = env::args().collect();
+    let mut args: Vec<_> = env::args().collect();
+    let c_reference = args.get(1).is_some_and(|arg| arg == "--compare-c");
+    if c_reference {
+        args.remove(1);
+    }
     assert!(
         (4..=5).contains(&args.len()),
-        "runtime-bench BASELINE CANDIDATE REPORT_DIR [ROUNDS]"
+        "runtime-bench [--compare-c] BASELINE_COMPILER CANDIDATE REPORT_DIR [ROUNDS]"
     );
     let compilers = [
         fs::canonicalize(&args[1]).unwrap(),
@@ -139,8 +143,23 @@ fn main() {
     let root = env::current_dir().unwrap();
     let work = root.join("build/runtime-bench");
     fs::create_dir_all(&work).unwrap();
-    let labels = ["baseline", "candidate"];
+    let labels = if c_reference {
+        ["c", "dunder"]
+    } else {
+        ["baseline", "candidate"]
+    };
     let mut metadata = format!("rounds={rounds}\ntarget=host\nprofile=default\norder=round-even baseline,candidate; round-odd candidate,baseline\ncache=no Dunder cache; warm OS file cache\nclock=wall clock including process startup, args and result output\nchecksums=FNV-1a 64-bit (reproducibility, not cryptographic)\n");
+    if c_reference {
+        let version = Command::new(&compilers[0])
+            .arg("--version")
+            .output()
+            .unwrap();
+        metadata += &format!(
+            "baseline=C\nc_flags=-std=c11 -O3 -ftrapv\nc_version={}\nc_source_fnv={:016x}\n",
+            String::from_utf8_lossy(&version.stdout).trim(),
+            hash(&fs::read(root.join("benchmarks/runtime/reference.c")).unwrap())
+        );
+    }
     for (i, compiler) in compilers.iter().enumerate() {
         metadata += &format!(
             "{}_compiler={}\n{}_compiler_fnv={:016x}\n",
@@ -188,15 +207,20 @@ fn main() {
         let mut sizes = [0; 2];
         for i in 0..2 {
             let start = Instant::now();
-            let output = Command::new(&compilers[i])
-                .arg("build")
-                .arg(&source)
-                .arg("-o")
-                .arg(&binaries[i])
-                .env_clear()
-                .env("PATH", "/no-external-tools")
-                .output()
-                .unwrap();
+            let mut compiler = Command::new(&compilers[i]);
+            if c_reference && i == 0 {
+                compiler
+                    .args(["-std=c11", "-O3", "-ftrapv"])
+                    .arg(format!("-DCASE_{}", case.name))
+                    .arg(root.join("benchmarks/runtime/reference.c"));
+            } else {
+                compiler
+                    .arg("build")
+                    .arg(&source)
+                    .env_clear()
+                    .env("PATH", "/no-external-tools");
+            }
+            let output = compiler.arg("-o").arg(&binaries[i]).output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",

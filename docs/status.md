@@ -1,7 +1,7 @@
 # Dunder-status
 
-2026-11-10: bootstrapkompilatorn på `main` stöder ARM64/macOS, ARM64/Linux och
-x86-64/Linux. `--target` väljer utdata oberoende av värdplattform; inga externa
+Bootstrapkompilatorn på `main` stöder ARM64/macOS, ARM64/Linux,
+x86-64/Linux och wasm32. `--target` väljer utdata oberoende av värdplattform; inga externa
 kompileringsverktyg eller mål-SDK:er behövs för Dunderbygget.
 Se [målplattformar och korskompilering](targets.md).
 
@@ -40,8 +40,8 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   utan suffix. Hashning, sondering, omhashning och algoritmer är Dunder-kod.
 - `std.macos`: ett native AppKit-fönster med CAMetalLayer, färgad
   Metal-triangelista, händelsepollning, logiska pekarkoordinater och backing
-  scale. Publika fönsterhandtag är validerade generations-ID:n. Nativegränsen
-  emitteras direkt som ARM64; inga C-/Objective-C-/Swift-bryggor kompileras.
+  scale. Publika fönsterhandtag är validerade generations-ID:n. AppKit-delegaten och Metal-kommandona
+  är Dunder-kod med typade C-anrop och callbacks.
   Apple Metal-runtime kompilerar en fast MSL-pipeline vid öppning.
   [Två Metal-program](macos-metal.md) dogfoodar geometri, animation och inmatning
   i Dunder. `build/run --app` skriver en vanlig [macOS-appbundle](app-bundles.md).
@@ -158,7 +158,9 @@ Lokalt på Linux/x86-64, 2026-11-10:
   alpha, readback, livscykler, felvägar, dynamisk ELF och processavslut med
   aktiva drivertrådar. Atlas och triangeln ger PPM-bilder; fönstret har
   verifierats med paus, palettbyte, dragning, återställning och resize.
-  ARM64/Linux-bilder korskompileras men Vulkan-körning där är ännu inte provad.
+  Den Dunder-skrivna Vulkan-modulen har också körts i en ARM64/Linux-container
+  med lavapipe och valideringslagret. Ett åttonde test läser den presenterade
+  SDL-ytan och skickar tangent- och stängningshändelser genom SDL-kön.
 - Vid den första Linuxporten var 17 ARM64/macOS-bilder, inklusive den dåvarande
   selfhost-kompilatorn, byteidentiska med originalets utdata.
   macOS-processkörning och `codesign` har inte körts

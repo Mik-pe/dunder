@@ -1,3 +1,13 @@
+capability unsafe
+
+import sys
+import std.dl as dl
+import std.vulkan.api as api
+import std.vulkan.device as device
+import std.vulkan.pipeline as pipeline
+import std.vulkan.sdl as sdl
+import std.vulkan.state as state
+
 // Native Linux Vulkan triangle-list rendering, with optional window presentation.
 // Window is a validated resource ID. Copies refer to the same native window.
 pub struct Window { id: i64 }
@@ -18,22 +28,186 @@ pub struct Frame {
 }
 pub struct DrawResult { ok: bool, error: string, frames: i64 }
 
+// The image owns these two writable words for the lifetime of the process.
+// Public Window values only ever contain a generation, never a raw pointer.
+@c_layout
+struct Registry { active: ptr, generation: i64 }
+
+unsafe fn registry_address() -> ptr { static_bytes("linux", 16) }
+
+@extern("c", "calloc")
+unsafe fn allocate(count: usize, bytes: usize) -> ptr
+@extern("c", "free")
+unsafe fn release(address: ptr)
+@extern("c", "memcpy")
+unsafe fn copy_bytes(destination: ptr, source: ptr, bytes: usize) -> ptr
+@extern("c", "clock_gettime")
+unsafe fn clock_gettime(clock: i32, output: ptr) -> i32
+
+unsafe fn millis() -> i64 {
+    var t: [i64; 2] = [0, 0]
+    if clock_gettime(1, addr(&mut t[0])) != 0 { return 0 }
+    t[0] * 1000 + t[1] / 1000000
+}
+
+fn open_error(message: string) -> OpenResult {
+    OpenResult { ok: false, window: Window {id: 0}, error: message }
+}
+
+unsafe fn initialize(r: &mut state.Renderer, title: string, width: i32, height: i32, headless: bool) -> bool {
+    r.width = width
+    r.height = height
+    r.firstPoll = 1
+    r.window.key = -1
+    r.window.width = width
+    r.window.height = height
+    if !device.setup(&mut r) || !pipeline.setup(&mut r) { return false }
+    if !headless && !sdl.open(&mut r.window, title, width, height) { return false }
+    r.startMillis = millis()
+    true
+}
+
+unsafe fn dispose(address: ptr, r: &mut state.Renderer) {
+    device.destroy(&mut r)
+    sdl.close(&mut r.window)
+    if r.loader != ptr(0) { closed := dl.close(r.loader) }
+    release(address)
+}
+
+unsafe fn open_renderer(registry: &mut Registry, title: string, width: i32, height: i32, headless: bool) -> OpenResult {
+    if width < 1 || width > 4096 || height < 1 || height > 4096 {
+        return open_error("Vulkan dimensions must be between 1 and 4096")
+    }
+    if registry.active != ptr(0) { return open_error("a Vulkan renderer is already open") }
+    address := allocate(1, size_of(state.Renderer))
+    if address == ptr(0) { return open_error("could not allocate Vulkan state") }
+    loader := dl.open(cstr("libvulkan.so.1"), 2)
+    if loader == ptr(0) {
+        release(address)
+        return open_error("Vulkan loader is unavailable")
+    }
+    if !load_api(ref_at(address), loader) {
+        closed := dl.close(loader)
+        release(address)
+        return open_error("Vulkan loader is missing required entry points")
+    }
+    if !initialize(ref_at(address), title, width, height, headless) {
+        dispose(address, ref_at(address))
+        return open_error("Vulkan or SDL initialization failed")
+    }
+    registry.generation = registry.generation + 1
+    registry.active = address
+    OpenResult {ok: true, window: Window {id: registry.generation}, error: ""}
+}
+
+unsafe fn load_api(r: &mut state.Renderer, library: ptr) -> bool {
+    r.loader = library
+    api.load(&mut r.api, library)
+}
+
 pub fn open(title: string, width: i32, height: i32) -> OpenResult {
-    __vulkan_open(title, width, height)
+    unsafe { return open_renderer(ref_at(registry_address()), title, width, height, false) }
 }
-// Headless rendering uses the same Vulkan pipeline and supports pixel readback.
 pub fn open_headless(width: i32, height: i32) -> OpenResult {
-    __vulkan_open_headless(width, height)
+    unsafe { return open_renderer(ref_at(registry_address()), "", width, height, true) }
 }
-pub fn device_name(window: Window) -> string { __vulkan_device_name(window) }
-// Independent RGBA byte snapshot, top row first; an invalid handle returns [].
-pub fn pixels(window: Window) -> []i32 { __vulkan_pixels(window) }
-// key is ASCII for controls: Escape=27, Space=32, C=99, R=114; -1 means none.
-pub fn poll(window: Window) -> Frame { __vulkan_poll(window) }
+
+unsafe fn active(registry: &Registry, window: Window) -> ptr {
+    if registry.generation != window.id { return ptr(0) }
+    registry.active
+}
+
+unsafe fn name(r: &state.Renderer) -> string {
+    var bytes: []i32 = []
+    for i in 0..256 {
+        byte := r.properties.deviceName[i]
+        if byte == 0 { break }
+        bytes.push(i32(byte))
+    }
+    sys.decode_utf8(&bytes).value
+}
+pub fn device_name(window: Window) -> string {
+    unsafe {
+        address := active(ref_at(registry_address()), window)
+        if address == ptr(0) { return "" }
+        return name(ref_at(address))
+    }
+}
+
+unsafe fn snapshot(r: &state.Renderer) -> []i32 {
+    var result: []i32 = []
+    if r.frames > 0 {
+        count := r.width * r.height * 4
+        result.reserve(count)
+        for i in 0..count { result.push(i32(load_u8(ptr(usize(r.readback.mapped) + usize(i))))) }
+    }
+    result
+}
+pub fn pixels(window: Window) -> []i32 {
+    unsafe {
+        address := active(ref_at(registry_address()), window)
+        if address == ptr(0) { return [] }
+        return snapshot(ref_at(address))
+    }
+}
+
+unsafe fn next_frame(r: &mut state.Renderer) -> Frame {
+    if r.window.handle != ptr(0) { sdl.poll(&mut r.window) }
+    resized := r.firstPoll != 0 || r.window.resized != 0
+    r.firstPoll = 0
+    Frame {closed: r.window.closed != 0, width: r.window.width, height: r.window.height,
+        pixel_width: r.width, pixel_height: r.height, scale: 1.0, time: f64(millis() - r.startMillis) / 1000.0,
+        pointer_x: f64(r.window.x), pointer_y: f64(r.window.y), pointer_down: r.window.down != 0,
+        key: r.window.key, resized: resized}
+}
+pub fn poll(window: Window) -> Frame {
+    unsafe {
+        address := active(ref_at(registry_address()), window)
+        if address == ptr(0) {
+            return Frame {closed: true, width: 0, height: 0, pixel_width: 0, pixel_height: 0, scale: 0.0,
+                time: 0.0, pointer_x: 0.0, pointer_y: 0.0, pointer_down: false, key: -1, resized: false}
+        }
+        return next_frame(ref_at(address))
+    }
+}
+
+fn draw_error(frames: i64, message: string) -> DrawResult {
+    DrawResult {ok: false, error: message, frames: frames}
+}
+unsafe fn submit(r: &mut state.Renderer, vertices: &[]f32, red: f64, green: f64, blue: f64) -> DrawResult {
+    if r.window.closed != 0 { return draw_error(r.frames, "Vulkan window is closed") }
+    if vertices.len > 800000 || vertices.len % 24 != 0 || !red.is_finite() || !green.is_finite() || !blue.is_finite() {
+        return draw_error(r.frames, "expected a finite triangle list (max 100000 vertices) and finite clear colors")
+    }
+    for i in 0..vertices.len {
+        if !vertices[i].is_finite() { return draw_error(r.frames, "non-finite Vulkan vertex") }
+    }
+    if vertices.len > 0 { copied := copy_bytes(r.vertex.mapped, addr(&vertices[0]), usize(vertices.len * 4)) }
+    if !pipeline.render(&r, u32(vertices.len / 8), f32(red), f32(green), f32(blue)) {
+        return draw_error(r.frames, "Vulkan rendering failed")
+    }
+    if r.window.handle != ptr(0) && !sdl.present(&r.window, r.readback.mapped, r.width, r.height) {
+        return draw_error(r.frames, "window presentation failed")
+    }
+    r.frames = r.frames + 1
+    DrawResult {ok: true, error: "", frames: r.frames}
+}
 pub fn draw(window: Window, vertices: &[]f32, red: f64, green: f64, blue: f64) -> DrawResult {
-    __vulkan_draw(window, &vertices, red, green, blue)
+    unsafe {
+        address := active(ref_at(registry_address()), window)
+        if address == ptr(0) { return draw_error(0, "invalid or expired Vulkan handle") }
+        return submit(ref_at(address), &vertices, red, green, blue)
+    }
 }
-pub fn close(window: Window) { __vulkan_close(window) }
+
+unsafe fn close_window(registry: &mut Registry, window: Window) {
+    address := active(&registry, window)
+    if address != ptr(0) {
+        registry.active = ptr(0)
+        dispose(address, ref_at(address))
+    }
+}
+pub fn close(window: Window) { unsafe { close_window(ref_at(registry_address()), window) } }
 
 // Geometry is ordinary Dunder. Positions are clip coordinates: +Y up.
 // Each vertex is [x, y, 0, 1, red, green, blue, alpha]. Colors use straight alpha.

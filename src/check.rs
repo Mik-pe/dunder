@@ -5,6 +5,8 @@ use crate::{
 use std::collections::HashMap;
 mod collections;
 mod enums;
+mod ffi;
+mod regions;
 
 pub struct Program {
     pub types: Types,
@@ -13,8 +15,6 @@ pub struct Program {
     pub tests: Vec<TestCase>,
     pub float_formatter: Option<usize>,
     pub sys_types: Option<SysTypes>,
-    pub macos_types: Option<MacTypes>,
-    pub vulkan_types: Option<VulkanTypes>,
 }
 pub struct TestCase {
     pub name: String,
@@ -27,13 +27,12 @@ pub enum Mode {
     Test,
 }
 pub struct Module {
+    pub filesystem: bool,
     pub functions: Vec<ast::Function>,
     pub imports: Vec<Import>,
     pub records: Vec<ast::Record>,
     pub enums: Vec<ast::Enumeration>,
     pub standard_sys: bool,
-    pub standard_macos: bool,
-    pub standard_vulkan: bool,
 }
 pub struct Import {
     pub name: String,
@@ -41,20 +40,23 @@ pub struct Import {
     pub span: Span,
 }
 struct Global {
+    requires_filesystem: bool,
     index: usize,
     ty: Type,
     public: bool,
 }
 #[derive(Default)]
 struct Symbols {
+    filesystem: bool,
     functions: HashMap<String, Global>,
     imports: HashMap<String, usize>,
     records: HashMap<String, (Type, bool)>,
     standard_sys: bool,
-    standard_macos: bool,
-    standard_vulkan: bool,
 }
+#[derive(Hash)]
 pub struct Function {
+    pub ret: Type,
+    pub external: Option<(String, String)>,
     pub name: String,
     pub params: Vec<Type>,
     pub slots: usize,
@@ -65,9 +67,8 @@ pub struct Function {
     /// Owned aggregate storage and immutable string handles, including temporaries.
     pub owned_storage: Vec<(usize, Type)>,
     pub uses_float_format: bool,
-    pub uses_macos: bool,
-    pub uses_vulkan: bool,
 }
+#[derive(Hash)]
 pub enum Stmt {
     StorePlace(Expr, Expr),
     Match {
@@ -96,21 +97,25 @@ pub enum Stmt {
     Break,
     Continue,
 }
+#[derive(Hash)]
 pub struct EnumArm {
     pub tag: Option<i32>,
     pub bindings: Vec<EnumBinding>,
     pub body: Vec<Stmt>,
 }
+#[derive(Hash)]
 pub struct EnumBinding {
     pub ty: Type,
     pub offset: usize,
     pub slot: usize,
     pub storage: Option<usize>,
 }
+#[derive(Hash)]
 pub struct Expr {
     pub ty: Type,
     pub kind: ExprKind,
 }
+#[derive(Hash)]
 pub enum ExprKind {
     ManagedString(Box<Expr>, usize, bool),
     ReferenceAddress(usize),
@@ -120,6 +125,13 @@ pub enum ExprKind {
     ElementAddress(Box<Expr>, Box<Expr>),
     Clone(Box<Expr>, usize),
     Dynamic(Vec<Expr>, usize),
+    ScratchAlloc {
+        area: usize,
+        cursor: usize,
+        limit: usize,
+        count: Box<Expr>,
+        storage: usize,
+    },
     DynamicOp(DynamicOp, Box<Expr>, Option<Box<Expr>>),
     IntOp(IntOp, Box<Expr>, Option<Box<Expr>>),
     Enum {
@@ -137,10 +149,10 @@ pub enum ExprKind {
     StringOp(StringOp, Vec<Expr>),
     Local(usize),
     Function(usize),
+    Callback(usize),
     Call(Box<Expr>, Vec<Expr>, Option<usize>),
     SysCall(SysOp, Vec<Expr>, Option<usize>),
-    MacCall(MacOp, Vec<Expr>, Option<usize>),
-    Vulkan(VulkanOp, Vec<Expr>, Option<usize>),
+    StaticBytes { module: usize, site: usize, bytes: usize, platform: String },
     Print(Box<Expr>),
     Cast(Box<Expr>),
     Unary(&'static str, Box<Expr>),
@@ -155,7 +167,7 @@ pub enum ExprKind {
     Record(Vec<(usize, Expr)>, usize),
     Field(Box<Expr>, usize),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SysOp {
     ReadText,
     WriteText,
@@ -174,39 +186,7 @@ pub enum SysOp {
     DecodeUtf8,
     SameFile,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MacOp {
-    Open,
-    Poll,
-    Draw,
-    Close,
-}
-#[derive(Clone, Copy)]
-pub struct MacTypes {
-    pub window: Type,
-    pub open: Type,
-    pub frame: Type,
-    pub draw: Type,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VulkanOp {
-    Open,
-    OpenHeadless,
-    Poll,
-    Draw,
-    Close,
-    DeviceName,
-    Pixels,
-}
-#[derive(Clone, Copy)]
-pub struct VulkanTypes {
-    pub window: Type,
-    pub open: Type,
-    pub frame: Type,
-    pub draw: Type,
-    pub pixels: Type,
-}
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub enum DynamicOp {
     Len,
     Capacity,
@@ -215,7 +195,7 @@ pub enum DynamicOp {
     Reserve,
     Clear,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub enum IntOp {
     And,
     Or,
@@ -233,7 +213,7 @@ pub struct SysTypes {
     pub text: Type,
     pub metadata: Type,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub enum FloatOp {
     Abs,
     Sqrt,
@@ -249,7 +229,7 @@ pub enum FloatOp {
     ToBits,
     FromBits,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub enum StringOp {
     Len,
     RuneLen,
@@ -266,11 +246,21 @@ struct Binding {
     mutable: bool,
     storage: Option<usize>,
 }
+pub struct BindingInfo {
+    pub file: usize,
+    pub span: Span,
+    pub name: String,
+    pub ty: Type,
+}
+
 struct Checker<'a> {
+    in_unsafe: bool,
+    reports: Option<&'a mut Vec<BindingInfo>>,
     module: usize,
     symbols: &'a [Symbols],
     types: &'a mut Types,
     scopes: Vec<HashMap<String, Binding>>,
+    regions: regions::Regions,
     slots: usize,
     owned_storage: Vec<(usize, Type)>,
     ret: Type,
@@ -278,43 +268,48 @@ struct Checker<'a> {
     loop_owned_starts: Vec<usize>,
     testing: bool,
     needs_float_format: bool,
-    uses_macos: bool,
-    uses_vulkan: bool,
 }
 
 fn reserved(name: &str) -> bool {
-    matches!(
-        name,
-        "fn" | "var"
-            | "return"
-            | "if"
-            | "else"
-            | "while"
-            | "true"
-            | "false"
-            | "break"
-            | "continue"
-            | "i32"
-            | "i64"
-            | "bool"
-            | "print"
-            | "import"
-            | "pub"
-            | "as"
-            | "for"
-            | "in"
-            | "len"
-            | "range"
-            | "assert"
-            | "struct"
-            | "string"
-            | "rune"
-            | "f32"
-            | "f64"
-            | "enum"
-            | "match"
-            | "mut"
-    )
+    ffi::scalar(name).is_some()
+        || matches!(
+            name,
+            "unsafe"
+                | "extern"
+                | "capability"
+        )
+        || matches!(
+            name,
+            "fn" | "var"
+                | "return"
+                | "if"
+                | "else"
+                | "while"
+                | "true"
+                | "false"
+                | "break"
+                | "continue"
+                | "i32"
+                | "i64"
+                | "bool"
+                | "print"
+                | "import"
+                | "pub"
+                | "as"
+                | "for"
+                | "in"
+                | "len"
+                | "range"
+                | "assert"
+                | "struct"
+                | "string"
+                | "rune"
+                | "f32"
+                | "f64"
+                | "enum"
+                | "match"
+                | "mut"
+        )
 }
 fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
     Error::new(
@@ -373,6 +368,9 @@ impl Checker<'_> {
             Stmt::Store(binding.slot, value)
         }
     }
+    fn bound_name(&self, name: &str) -> bool {
+        self.lookup(name).is_some() || self.symbols[self.module].functions.contains_key(name)
+    }
     fn global(&self, name: &str) -> Option<(usize, Type)> {
         self.symbols[self.module]
             .functions
@@ -421,12 +419,49 @@ impl Checker<'_> {
                 format!("'{alias}.{name}' is private; export it with 'pub fn'"),
             ));
         }
+        self.check_capability(function, span)?;
         Ok((function.index, function.ty))
     }
+    fn check_capability(&self, function: &Global, span: Span) -> Result<(), Error> {
+        if function.requires_filesystem && !self.symbols[self.module].filesystem {
+            return Err(Error::new(
+                "E0292",
+                span,
+                "this function requires capability filesystem at the top of this module",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_record_access(&self, ty: Type, span: Span) -> Result<(), Error> {
+        if self
+            .types
+            .record(ty)
+            .is_some_and(|r| r.opaque && r.module != self.module)
+        {
+            return Err(Error::new(
+                "E0292",
+                span,
+                "an opaque struct can only be constructed or opened by its defining module",
+            ));
+        }
+        Ok(())
+    }
+
     fn lookup(&self, name: &str) -> Option<Binding> {
         self.scopes.iter().rev().find_map(|s| s.get(name)).cloned()
     }
     fn bind(&mut self, name: &str, ty: Type, mutable: bool, span: Span) -> Result<usize, Error> {
+        self.bind_local(name, ty, mutable, span, true)
+    }
+    fn bind_local(
+        &mut self,
+        name: &str,
+        ty: Type,
+        mutable: bool,
+        span: Span,
+        owner: bool,
+    ) -> Result<usize, Error> {
         if reserved(name) {
             return Err(Error::new("E0200", span, format!("'{name}' is reserved")));
         }
@@ -444,9 +479,17 @@ impl Checker<'_> {
                 format!("'{name}' is already declared in this scope"),
             ));
         }
+        if let Some(reports) = &mut self.reports {
+            reports.push(BindingInfo {
+                file: self.module,
+                span,
+                name: name.into(),
+                ty,
+            });
+        }
         let slot = self.slot();
-        let storage = self.storage(ty);
-        if matches!(ty, Type::String | Type::Bytes | Type::Runes) {
+        let storage = if owner { self.storage(ty) } else { None };
+        if owner && matches!(ty, Type::String | Type::Bytes | Type::Runes) {
             self.owned_storage.push((slot, ty));
         }
         self.scopes.last_mut().unwrap().insert(
@@ -519,6 +562,20 @@ impl Checker<'_> {
                     return Some(ty);
                 }
                 if let ast::ExprKind::Name(n) = &callee.kind {
+                    if self.bound_name(n) {
+                        return self.hint(callee).and_then(|t| self.types.signature(t)).map(|s| s.ret);
+                    }
+                    if let Some(ty) =
+                        ffi::scalar(n).or_else(|| n.strip_prefix("load_").and_then(ffi::scalar))
+                    {
+                        return Some(ty);
+                    }
+                    if matches!(n.as_str(), "addr" | "cstr") {
+                        return Some(Type::Ptr);
+                    }
+                    if matches!(n.as_str(), "size_of" | "align_of") {
+                        return Some(Type::Usize);
+                    }
                     if n == "i32" {
                         return Some(Type::I32);
                     }
@@ -619,6 +676,11 @@ impl Checker<'_> {
             return self.float(&value.to_string(), ty, span);
         }
         let valid = match ty {
+            Type::U8 => u8::try_from(value).is_ok(),
+            Type::U16 => u16::try_from(value).is_ok(),
+            Type::U32 => u32::try_from(value).is_ok(),
+            Type::Usize if self.types.pointer_bytes() == 4 => u32::try_from(value).is_ok(),
+            Type::U64 | Type::Usize => u64::try_from(value).is_ok(),
             Type::I32 => i32::try_from(value).is_ok(),
             Type::I64 => i64::try_from(value).is_ok(),
             _ => false,
@@ -678,33 +740,6 @@ impl Checker<'_> {
         self.hint(expr)
             .or_else(|| Self::float_literal(expr).then_some(Type::F64))
     }
-    fn mac_op(&self, name: &str) -> Option<MacOp> {
-        if !self.symbols[self.module].standard_macos {
-            return None;
-        }
-        Some(match name {
-            "__macos_open" => MacOp::Open,
-            "__macos_poll" => MacOp::Poll,
-            "__macos_draw" => MacOp::Draw,
-            "__macos_close" => MacOp::Close,
-            _ => return None,
-        })
-    }
-    fn vulkan_op(&self, name: &str) -> Option<VulkanOp> {
-        if !self.symbols[self.module].standard_vulkan {
-            return None;
-        }
-        Some(match name {
-            "__vulkan_open" => VulkanOp::Open,
-            "__vulkan_poll" => VulkanOp::Poll,
-            "__vulkan_draw" => VulkanOp::Draw,
-            "__vulkan_close" => VulkanOp::Close,
-            "__vulkan_open_headless" => VulkanOp::OpenHeadless,
-            "__vulkan_device_name" => VulkanOp::DeviceName,
-            "__vulkan_pixels" => VulkanOp::Pixels,
-            _ => return None,
-        })
-    }
     fn sys_signature(&self, name: &str) -> Option<(SysOp, usize, Type)> {
         let symbols = &self.symbols[self.module];
         if !symbols.standard_sys {
@@ -723,9 +758,9 @@ impl Checker<'_> {
             "__sys_pid" => return Some((SysOp::Pid, 0, Type::I32)),
             "__sys_arg_count" => return Some((SysOp::ArgCount, 0, Type::I32)),
             "__sys_arg" => return Some((SysOp::Arg, 1, Type::String)),
-            "__sys_write_bytes" => (SysOp::WriteBytes, 2, "Status"),
+            "__sys_write_bytes" | "__sys_write_u8" => (SysOp::WriteBytes, 2, "Status"),
             "__sys_make_executable" => (SysOp::MakeExecutable, 1, "Status"),
-            "__sys_decode_utf8" => (SysOp::DecodeUtf8, 1, "TextResult"),
+            "__sys_decode_utf8" | "__sys_decode_u8" => (SysOp::DecodeUtf8, 1, "TextResult"),
             "__sys_same_file" => return Some((SysOp::SameFile, 2, Type::Bool)),
             _ => return None,
         };
@@ -742,7 +777,6 @@ impl Checker<'_> {
             ExprKind::Binary("+", _, _)
             | ExprKind::Call(_, _, _)
             | ExprKind::SysCall(_, _, _)
-            | ExprKind::Vulkan(_, _, _)
             | ExprKind::DynamicOp(DynamicOp::Pop, _, _)
             | ExprKind::StringOp(StringOp::Slice, _) => true,
             ExprKind::StringOp(StringOp::ToString, args) => {
@@ -761,92 +795,28 @@ impl Checker<'_> {
     fn unmanaged_expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
-            A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.mac_op(n).is_some()) =>
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if !self.bound_name(n) && (matches!(n.as_str(), "ptr"|"addr"|"ref_at"|"ffi_fn"|"size_of"|"align_of"|"cstr"|"zeroed"|"callback") || n.strip_prefix("load_").and_then(ffi::scalar).is_some())) =>
             {
                 let A::Name(name) = &callee.kind else {
                     unreachable!()
                 };
-                let op = self.mac_op(name).unwrap();
-                let types = &self.symbols[self.module].records;
-                let window = types["Window"].0;
-                let (params, ty) = match op {
-                    MacOp::Open => (
-                        vec![Type::String, Type::I32, Type::I32],
-                        types["OpenResult"].0,
-                    ),
-                    MacOp::Poll => (vec![window], types["Frame"].0),
-                    MacOp::Close => (vec![window], Type::Unit),
-                    MacOp::Draw => {
-                        let array = self.types.dynamic(Type::F32, e.span)?;
-                        let reference = self.types.reference(array, false);
-                        (
-                            vec![window, reference, Type::F64, Type::F64, Type::F64],
-                            types["DrawResult"].0,
-                        )
-                    }
-                };
-                if args.len() != params.len() {
-                    return Err(Error::new(
-                        "E0207",
-                        e.span,
-                        "invalid macOS intrinsic argument count",
-                    ));
-                }
-                let values = args
-                    .iter()
-                    .zip(params)
-                    .map(|(arg, ty)| self.expr(arg, Some(ty)))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.uses_macos = true;
-                Expr {
-                    ty,
-                    kind: ExprKind::MacCall(op, values, self.storage(ty)),
-                }
+                self.raw_call(name, args, expected, e.span)?
             }
-            A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.vulkan_op(n).is_some()) =>
-            {
-                let A::Name(name) = &callee.kind else {
-                    unreachable!()
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "static_bytes") => {
+                self.require_unsafe(e.span)?;
+                let [platform, length] = args.as_slice() else {
+                    return Err(Error::new("E0291", e.span, "static_bytes expects a native platform string and a constant byte count"));
                 };
-                let op = self.vulkan_op(name).unwrap();
-                let types = &self.symbols[self.module].records;
-                let window = types["Window"].0;
-                let (params, ty) = match op {
-                    VulkanOp::Open => (
-                        vec![Type::String, Type::I32, Type::I32],
-                        types["OpenResult"].0,
-                    ),
-                    VulkanOp::OpenHeadless => (vec![Type::I32, Type::I32], types["OpenResult"].0),
-                    VulkanOp::DeviceName => (vec![window], Type::String),
-                    VulkanOp::Pixels => (vec![window], self.types.dynamic(Type::I32, e.span)?),
-                    VulkanOp::Poll => (vec![window], types["Frame"].0),
-                    VulkanOp::Close => (vec![window], Type::Unit),
-                    VulkanOp::Draw => {
-                        let array = self.types.dynamic(Type::F32, e.span)?;
-                        let reference = self.types.reference(array, false);
-                        (
-                            vec![window, reference, Type::F64, Type::F64, Type::F64],
-                            types["DrawResult"].0,
-                        )
-                    }
+                let A::String(platform) = &platform.kind else {
+                    return Err(Error::new("E0291", platform.span, "expected a platform string"));
                 };
-                if args.len() != params.len() {
-                    return Err(Error::new(
-                        "E0207",
-                        e.span,
-                        "invalid Vulkan intrinsic argument count",
-                    ));
+                if !matches!(platform.as_str(), "linux" | "macos" | "native") {
+                    return Err(Error::new("E0291", e.span, "static storage platform must be linux, macos or native"));
                 }
-                let values = args
-                    .iter()
-                    .zip(params)
-                    .map(|(arg, ty)| self.expr(arg, Some(ty)))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.uses_vulkan = true;
-                Expr {
-                    ty,
-                    kind: ExprKind::Vulkan(op, values, self.storage(ty)),
-                }
+                let A::Number(bytes @ 1..=16777216) = length.kind else {
+                    return Err(Error::new("E0291", length.span, "static byte count must be a constant between 1 and 16777216"));
+                };
+                Expr { ty: Type::Ptr, kind: ExprKind::StaticBytes { module: self.module, site: e.span.start, bytes: bytes as usize, platform: platform.clone() } }
             }
             A::Borrow(base, mutable) => {
                 let Some((inner, allowed_mut)) = expected.and_then(|t| self.types.referenced(t))
@@ -864,7 +834,18 @@ impl Checker<'_> {
                         "use & for a shared argument or &mut for a mutable argument",
                     ));
                 }
-                let (ty, mut address) = self.place(base, *mutable)?;
+                let (ty, mut address) =
+                    if let Some(view) = self.scratch_slice(base).filter(|_| !mutable) {
+                        (
+                            view.ty,
+                            Expr {
+                                ty: view.ty,
+                                kind: ExprKind::Local(view.slot),
+                            },
+                        )
+                    } else {
+                        self.place(base, *mutable)?
+                    };
                 if ty != inner {
                     return Err(mismatch(self.types, e.span, inner, ty));
                 }
@@ -930,7 +911,12 @@ impl Checker<'_> {
                     let expected = if op == SysOp::Arg {
                         Type::I32
                     } else if (op == SysOp::WriteBytes && i == 1) || op == SysOp::DecodeUtf8 {
-                        let array = self.types.dynamic(Type::I32, arg.span)?;
+                        let elem = if name.ends_with("_u8") {
+                            Type::U8
+                        } else {
+                            Type::I32
+                        };
+                        let array = self.types.dynamic(elem, arg.span)?;
                         self.types.reference(array, false)
                     } else {
                         Type::String
@@ -953,6 +939,7 @@ impl Checker<'_> {
             },
             A::Record(name, fields) => {
                 let ty = self.constructor_type(name)?;
+                self.check_record_access(ty, e.span)?;
                 let record = self.types.record(ty).ok_or_else(||Error::new("E0240",e.span,"a struct literal requires a struct type; construct enum variants with Type.Variant"))?.clone();
                 let mut seen = std::collections::HashSet::new();
                 let mut values = Vec::new();
@@ -1049,7 +1036,7 @@ impl Checker<'_> {
                 }
             }
             A::Index(base, index) => {
-                let base = self.expr(base, None)?;
+                let base = self.index_receiver(base)?;
                 if matches!(base.ty, Type::String | Type::Bytes | Type::Runes) {
                     let arg = self.expr(index, None)?;
                     let (op, ty, arg) = if base.ty == Type::String && arg.ty == Type::Range {
@@ -1110,6 +1097,7 @@ impl Checker<'_> {
             },
             A::Name(n) => {
                 if let Some(b) = self.lookup(n) {
+                    self.check_scratch_value(&b, e.span)?;
                     if let Some((ty, _)) = self.types.referenced(b.ty) {
                         Expr {
                             ty,
@@ -1125,6 +1113,7 @@ impl Checker<'_> {
                         }
                     }
                 } else if let Some((index, ty)) = self.global(n) {
+                    self.check_capability(&self.symbols[self.module].functions[n], e.span)?;
                     Expr {
                         ty,
                         kind: ExprKind::Function(index),
@@ -1150,9 +1139,14 @@ impl Checker<'_> {
                             || self.types.dynamic_elem(ty).is_some()
                     })
                 {
-                    let base = self.expr(base, None)?;
+                    let base = self.index_receiver(base)?;
                     self.length(base, e.span)?
-                } else if let Some(record) = self.hint(base).and_then(|ty| self.types.record(ty)) {
+                } else if let Some(ty) = self
+                    .hint(base)
+                    .filter(|ty| self.types.record(*ty).is_some())
+                {
+                    self.check_record_access(ty, e.span)?;
+                    let record = self.types.record(ty).unwrap();
                     let field =
                         record
                             .fields
@@ -1198,11 +1192,11 @@ impl Checker<'_> {
                         expected
                     },
                 )?;
-                if *op == "-" && !x.ty.numeric() {
+                if *op == "-" && (!x.ty.numeric() || x.ty.unsigned()) {
                     return Err(Error::new(
                         "E0206",
                         e.span,
-                        "unary '-' requires a numeric value",
+                        "unary '-' requires a signed integer or floating value",
                     ));
                 }
                 Expr {
@@ -1244,7 +1238,7 @@ impl Checker<'_> {
                         || enum_op
                         || string_op
                         || rune_op
-                        || matches!(*op, "==" | "!=") && a.ty == Type::Bool)
+                        || matches!(*op, "==" | "!=") && matches!(a.ty, Type::Bool | Type::Ptr))
                     {
                         return Err(Error::new(
                             "E0206",
@@ -1339,7 +1333,7 @@ impl Checker<'_> {
                         "len expects one string, array or iterator",
                     ));
                 }
-                let base = self.expr(&args[0], None)?;
+                let base = self.index_receiver(&args[0])?;
                 self.length(base, e.span)?
             }
             A::Call(callee, args) if matches!(&callee.kind,A::Member(base,name) if matches!(name.as_str(),"iter"|"len"|"str"|"bytes"|"runes") && !self.module_alias(base)) =>
@@ -1358,16 +1352,17 @@ impl Checker<'_> {
                 if name == "len" {
                     self.length(base, e.span)?
                 } else if name == "str"
-                    && matches!(
-                        base.ty,
-                        Type::I32
-                            | Type::I64
-                            | Type::Bool
-                            | Type::Rune
-                            | Type::String
-                            | Type::F32
-                            | Type::F64
-                    )
+                    && (base.ty.unsigned()
+                        || matches!(
+                            base.ty,
+                            Type::I32
+                                | Type::I64
+                                | Type::Bool
+                                | Type::Rune
+                                | Type::String
+                                | Type::F32
+                                | Type::F64
+                        ))
                 {
                     self.needs_float_format |= base.ty.float();
                     Expr {
@@ -1415,16 +1410,18 @@ impl Checker<'_> {
                     return Err(Error::new("E0207", e.span, "print expects one argument"));
                 }
                 let value = self.expr(&args[0], None)?;
-                if !matches!(
-                    value.ty,
-                    Type::I32
-                        | Type::I64
-                        | Type::Bool
-                        | Type::String
-                        | Type::Rune
-                        | Type::F32
-                        | Type::F64
-                ) {
+                if !value.ty.unsigned()
+                    && !matches!(
+                        value.ty,
+                        Type::I32
+                            | Type::I64
+                            | Type::Bool
+                            | Type::String
+                            | Type::Rune
+                            | Type::F32
+                            | Type::F64
+                    )
+                {
                     return Err(Error::new("E0206", e.span, "print requires a scalar value"));
                 }
                 self.needs_float_format |= value.ty.float();
@@ -1433,7 +1430,7 @@ impl Checker<'_> {
                     kind: ExprKind::Print(Box::new(value)),
                 }
             }
-            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if matches!(n.as_str(), "i32"|"i64"|"rune"|"f32"|"f64")) =>
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if (n == "rune" || ffi::scalar(n).is_some())) =>
             {
                 if args.len() != 1 {
                     return Err(Error::new(
@@ -1442,17 +1439,10 @@ impl Checker<'_> {
                         "a numeric conversion expects one argument",
                     ));
                 }
-                let ty = if matches!(&callee.kind, A::Name(n) if n == "f32") {
-                    Type::F32
-                } else if matches!(&callee.kind, A::Name(n) if n == "f64") {
-                    Type::F64
-                } else if matches!(&callee.kind, A::Name(n) if n == "rune") {
-                    Type::Rune
-                } else if matches!(&callee.kind, A::Name(n) if n == "i32") {
-                    Type::I32
-                } else {
-                    Type::I64
+                let A::Name(name) = &callee.kind else {
+                    unreachable!()
                 };
+                let ty = ffi::scalar(name).unwrap_or(Type::Rune);
                 let inner = self.expr(
                     &args[0],
                     self.hint(&args[0])
@@ -1464,7 +1454,13 @@ impl Checker<'_> {
                             ty
                         })),
                 )?;
-                if !(inner.ty.numeric()
+                let address_bits = ty == Type::Usize
+                    && (inner.ty == Type::Ptr || self.types.is_extern_fn(inner.ty));
+                if address_bits {
+                    self.require_unsafe(e.span)?;
+                }
+                if !(address_bits
+                    || inner.ty.numeric()
                     || inner.ty == Type::Rune
                     || (ty.integer() && self.types.scalar_enum(inner.ty)))
                     || (ty.float() && inner.ty == Type::Rune)
@@ -1490,6 +1486,9 @@ impl Checker<'_> {
             }
             A::Call(callee, args) => {
                 let target = self.expr(callee, None)?;
+                if matches!(target.ty, Type::UnsafeFunction(_) | Type::ExternFunction(_)) {
+                    self.require_unsafe(callee.span)?;
+                }
                 let sig = self.types.signature(target.ty).ok_or_else(|| {
                     Error::new(
                         "E0206",
@@ -1580,6 +1579,9 @@ impl Checker<'_> {
         let mut returns = false;
         for s in stmts {
             let (stmt, ends) = match &s.kind {
+                ast::StmtKind::Region(name, capacity, body) => {
+                    self.check_region(name, capacity.as_ref(), body, s.span)?
+                }
                 ast::StmtKind::Match(source, arms) => self.check_match(source, arms, s.span)?,
                 ast::StmtKind::Decl {
                     name,
@@ -1587,6 +1589,12 @@ impl Checker<'_> {
                     mutable,
                     init,
                 } => {
+                    if let Some(allocation) =
+                        self.scratch_declaration(name, *ty, *mutable, init, s.span)?
+                    {
+                        result.push(allocation);
+                        continue;
+                    }
                     let ty = ty
                         .map(|ty| resolve_type(self.types, self.symbols, ty, s.span))
                         .transpose()?;
@@ -1610,6 +1618,7 @@ impl Checker<'_> {
                             format!("unknown variable '{n}'; use ':=' to declare it"),
                         )
                     })?;
+                    self.check_scratch_value(&b, s.span)?;
                     if let Some((ty, mutable)) = self.types.referenced(b.ty) {
                         if !mutable {
                             return Err(Error::new(
@@ -1651,6 +1660,14 @@ impl Checker<'_> {
                     (Stmt::Return(v), true)
                 }
                 ast::StmtKind::Expr(e) | ast::StmtKind::Tail(e) => {
+                    if let ast::ExprKind::Call(callee, args) = &e.kind {
+                        if let ast::ExprKind::Name(name) = &callee.kind {
+                            if !self.bound_name(name) && name.strip_prefix("store_").and_then(ffi::scalar).is_some() {
+                                result.push(self.raw_store(name, args, s.span)?);
+                                continue;
+                            }
+                        }
+                    }
                     let mut x = self.expr(e, None)?;
                     if self.testing && x.ty == Type::Bool {
                         x = Expr {
@@ -1736,6 +1753,13 @@ impl Checker<'_> {
                         false,
                     )
                 }
+                ast::StmtKind::Unsafe(b) => {
+                    let was_unsafe = self.in_unsafe;
+                    self.in_unsafe = true;
+                    let (b, r) = self.block(b)?;
+                    self.in_unsafe = was_unsafe;
+                    (Stmt::Block(b), r)
+                }
                 ast::StmtKind::Block(b) => {
                     let (b, r) = self.block(b)?;
                     (Stmt::Block(b), r)
@@ -1782,13 +1806,12 @@ pub fn check_mode(program: ast::Program, mode: Mode) -> Result<Program, Error> {
     }
     check_modules(
         vec![Module {
+            filesystem: program.filesystem,
             functions: program.functions,
             imports: Vec::new(),
             records: program.records,
             enums: program.enums,
             standard_sys: false,
-            standard_macos: false,
-            standard_vulkan: false,
         }],
         program.types,
         mode,
@@ -1796,9 +1819,18 @@ pub fn check_mode(program: ast::Program, mode: Mode) -> Result<Program, Error> {
 }
 
 pub(crate) fn check_modules(
+    modules: Vec<Module>,
+    types: Types,
+    mode: Mode,
+) -> Result<Program, Error> {
+    check_reporting(modules, types, mode, None)
+}
+
+pub(crate) fn check_reporting(
     mut modules: Vec<Module>,
     mut types: Types,
     mode: Mode,
+    mut reports: Option<&mut Vec<BindingInfo>>,
 ) -> Result<Program, Error> {
     if mode == Mode::Program {
         for module in &mut modules {
@@ -1809,9 +1841,8 @@ pub(crate) fn check_modules(
     let mut symbols: Vec<Symbols> = (0..modules.len()).map(|_| Symbols::default()).collect();
     // Reserve nominal types and all file namespaces before resolving signatures.
     for (module, input) in modules.iter().enumerate() {
+        symbols[module].filesystem = input.filesystem;
         symbols[module].standard_sys = input.standard_sys;
-        symbols[module].standard_macos = input.standard_macos;
-        symbols[module].standard_vulkan = input.standard_vulkan;
         let mut names = std::collections::HashSet::new();
         for e in &input.enums {
             if reserved(&e.name) {
@@ -1843,7 +1874,8 @@ pub(crate) fn check_modules(
                     Error::new("E0203", record.span, "duplicate struct name").in_file(module)
                 );
             }
-            let ty = types.declare_record(module, record.name.clone());
+            let ty =
+                types.declare_record(module, record.name.clone(), record.c_layout, record.opaque);
             symbols[module]
                 .records
                 .insert(record.name.clone(), (ty, record.public));
@@ -1899,7 +1931,7 @@ pub(crate) fn check_modules(
                         Error::new("E0240", field.span, "duplicate struct field").in_file(module)
                     );
                 }
-                let ty = resolve_type(&mut types, &symbols, field.ty, field.span)
+                let ty = resolve_unvalidated(&mut types, &symbols, field.ty, field.span)
                     .map_err(|e| e.in_file(module))?;
                 fields.push(ast::RecordField {
                     name: field.name.clone(),
@@ -1912,6 +1944,31 @@ pub(crate) fn check_modules(
     }
     let mut index = 0;
     enums::define_enums(&modules, &symbols, &mut types)?;
+    // A callback signature in an earlier record can use a C aggregate declared
+    // later. Its ABI class is known once every field has been laid out.
+    for (module, input) in modules.iter().enumerate() {
+        for record in &input.records {
+            let ty = symbols[module].records[&record.name].0;
+            for (field, parsed) in types.record(ty).unwrap().fields.iter().zip(&record.fields) {
+                ffi::validate_type(&types, field.ty, parsed.span).map_err(|e| e.in_file(module))?;
+            }
+        }
+        for e in &input.enums {
+            let ty = symbols[module].records[&e.name].0;
+            for (variant, parsed) in types
+                .enumeration(ty)
+                .unwrap()
+                .variants
+                .iter()
+                .zip(&e.variants)
+            {
+                for field in &variant.fields {
+                    ffi::validate_type(&types, field.ty, parsed.span)
+                        .map_err(|e| e.in_file(module))?;
+                }
+            }
+        }
+    }
     for (module, input) in modules.iter_mut().enumerate() {
         let mut test_names = std::collections::HashSet::new();
         for f in &mut input.functions {
@@ -1950,10 +2007,24 @@ pub(crate) fn check_modules(
                     function: index,
                 });
             }
-            let ty = types.function(f.params.iter().map(|p| p.ty).collect(), f.ret);
+            let params: Vec<Type> = f.params.iter().map(|p| p.ty).collect();
+            if f.external.is_some() {
+                ffi::signature(&types, &params, f.ret, f.span).map_err(|e| e.in_file(module))?;
+            }
+            let Type::Function(index_ty) = types.function(params, f.ret) else {
+                unreachable!()
+            };
+            let ty = if f.external.is_some() {
+                Type::ExternFunction(index_ty)
+            } else if f.unsafe_fn {
+                Type::UnsafeFunction(index_ty)
+            } else {
+                Type::Function(index_ty)
+            };
             symbols[module].functions.insert(
                 f.name.clone(),
                 Global {
+                    requires_filesystem: f.requires_filesystem,
                     index,
                     ty,
                     public: f.public,
@@ -1973,7 +2044,11 @@ pub(crate) fn check_modules(
     }
     if let Some(entry) = entry {
         let sig = types.signature(entry.ty).unwrap();
-        if !sig.params.is_empty() || !matches!(sig.ret, Type::I32 | Type::Unit) {
+        if entry.requires_filesystem
+            || !matches!(entry.ty, Type::Function(_))
+            || !sig.params.is_empty()
+            || !matches!(sig.ret, Type::I32 | Type::Unit)
+        {
             return Err(Error::new(
                 "E0212",
                 modules[0].functions[entry.index].span,
@@ -1987,42 +2062,26 @@ pub(crate) fn check_modules(
         text: s.records["TextResult"].0,
         metadata: s.records["Metadata"].0,
     });
-    let macos_types = symbols.iter().find(|s| s.standard_macos).map(|s| MacTypes {
-        window: s.records["Window"].0,
-        open: s.records["OpenResult"].0,
-        frame: s.records["Frame"].0,
-        draw: s.records["DrawResult"].0,
-    });
-    let vulkan_types = if let Some(s) = symbols.iter().find(|s| s.standard_vulkan) {
-        Some(VulkanTypes {
-            window: s.records["Window"].0,
-            open: s.records["OpenResult"].0,
-            frame: s.records["Frame"].0,
-            draw: s.records["DrawResult"].0,
-            pixels: types.dynamic(Type::I32, Span { start: 0, end: 0 })?,
-        })
-    } else {
-        None
-    };
     let mut checked = Vec::new();
     let mut needs_float_format = false;
     for (module, input) in modules.into_iter().enumerate() {
         for f in input.functions {
             let function = (|| {
                 let mut c = Checker {
+                    reports: reports.as_deref_mut(),
                     module,
                     symbols: &symbols,
                     types: &mut types,
                     scopes: vec![HashMap::new()],
+                    regions: Default::default(),
                     slots: 0,
                     owned_storage: Vec::new(),
                     ret: f.ret,
                     loops: 0,
                     loop_owned_starts: Vec::new(),
                     testing: f.test.is_some(),
+                    in_unsafe: f.unsafe_fn,
                     needs_float_format: false,
-                    uses_macos: false,
-                    uses_vulkan: false,
                 };
                 let mut param_slots = Vec::new();
                 let mut param_storage = Vec::new();
@@ -2033,7 +2092,7 @@ pub(crate) fn check_modules(
                 }
                 let (body, returns) = c.statements(&f.body)?;
                 needs_float_format |= c.needs_float_format;
-                if f.ret != Type::Unit && !returns {
+                if f.external.is_none() && f.ret != Type::Unit && !returns {
                     return Err(Error::new(
                         "E0213",
                         f.span,
@@ -2045,6 +2104,8 @@ pub(crate) fn check_modules(
                     ));
                 }
                 Ok(Function {
+                    ret: f.ret,
+                    external: f.external,
                     name: format!("m{module}.{}", f.name),
                     params: f.params.iter().map(|p| p.ty).collect(),
                     slots: c.slots,
@@ -2054,8 +2115,6 @@ pub(crate) fn check_modules(
                     return_slot,
                     owned_storage: c.owned_storage,
                     uses_float_format: c.needs_float_format,
-                    uses_macos: c.uses_macos,
-                    uses_vulkan: c.uses_vulkan,
                 })
             })()
             .map_err(|e: Error| e.in_file(module))?;
@@ -2076,8 +2135,6 @@ pub(crate) fn check_modules(
         tests,
         float_formatter,
         sys_types,
-        macos_types,
-        vulkan_types,
     })
 }
 
@@ -2103,19 +2160,20 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
         }
         let symbols = [Symbols::default()];
         let mut c = Checker {
+            reports: None,
             module: 0,
             symbols: &symbols,
             types,
             scopes: vec![HashMap::new()],
+            regions: Default::default(),
             slots: 0,
             owned_storage: Vec::new(),
             ret: Type::String,
             loops: 0,
             loop_owned_starts: Vec::new(),
             testing: false,
+            in_unsafe: false,
             needs_float_format: false,
-            uses_macos: false,
-            uses_vulkan: false,
         };
         let mut param_slots = Vec::new();
         for p in &f.params {
@@ -2130,6 +2188,8 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             ));
         }
         Ok(Function {
+            ret: Type::String,
+            external: None,
             name: "<dunder:float-format>".into(),
             params: vec![Type::I64, Type::Bool],
             slots: c.slots,
@@ -2139,8 +2199,6 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             return_slot: None,
             owned_storage: c.owned_storage,
             uses_float_format: false,
-            uses_macos: false,
-            uses_vulkan: false,
         })
     };
     build().map_err(|e| {
@@ -2195,12 +2253,23 @@ fn resolve_type(
     ty: Type,
     span: Span,
 ) -> Result<Type, Error> {
+    let ty = resolve_unvalidated(types, symbols, ty, span)?;
+    ffi::validate_type(types, ty, span)?;
+    Ok(ty)
+}
+
+fn resolve_unvalidated(
+    types: &mut Types,
+    symbols: &[Symbols],
+    ty: Type,
+    span: Span,
+) -> Result<Type, Error> {
     if let Some(elem) = types.dynamic_elem(ty) {
-        let elem = resolve_type(types, symbols, elem, span)?;
+        let elem = resolve_unvalidated(types, symbols, elem, span)?;
         return types.dynamic(elem, span);
     }
     if let Some((inner, mutable)) = types.referenced(ty) {
-        let inner = resolve_type(types, symbols, inner, span)?;
+        let inner = resolve_unvalidated(types, symbols, inner, span)?;
         if matches!(inner, Type::Unit | Type::Reference(_)) {
             return Err(Error::new("E0281", span, "reference a value type"));
         }
@@ -2211,16 +2280,22 @@ fn resolve_type(
     }
     if matches!(ty, Type::Array(_)) {
         let array = types.array(ty).unwrap();
-        let elem = resolve_type(types, symbols, array.elem, span)?;
+        let elem = resolve_unvalidated(types, symbols, array.elem, span)?;
         return types.array_type(elem, array.len, span);
     }
     if let Some(signature) = types.signature(ty).cloned() {
         let params = signature
             .params
             .into_iter()
-            .map(|t| resolve_type(types, symbols, t, span))
+            .map(|t| resolve_unvalidated(types, symbols, t, span))
             .collect::<Result<Vec<_>, _>>()?;
-        let ret = resolve_type(types, symbols, signature.ret, span)?;
+        let ret = resolve_unvalidated(types, symbols, signature.ret, span)?;
+        if types.is_extern_fn(ty) {
+            let Type::Function(i) = types.function(params, ret) else {
+                unreachable!()
+            };
+            return Ok(Type::ExternFunction(i));
+        }
         return Ok(types.function(params, ret));
     }
     Ok(ty)

@@ -40,8 +40,40 @@ pub struct Checked {
     pub program: check::Program,
 }
 impl Loaded {
+    pub fn check_with_bindings(
+        mut self,
+        reports: &mut Vec<check::BindingInfo>,
+        target: Option<crate::target::Target>,
+    ) -> Result<Checked, Diagnostic> {
+        if let Some(target) = target {
+            self.types.set_pointer_bytes(target.pointer_bytes());
+        }
+        match check::check_reporting(
+            self.modules,
+            self.types,
+            check::Mode::Program,
+            Some(reports),
+        ) {
+            Ok(program) => Ok(Checked {
+                sources: self.sources,
+                program,
+            }),
+            Err(error) => Err(Diagnostic {
+                error,
+                sources: self.sources,
+            }),
+        }
+    }
     pub fn check(self) -> Result<Checked, Diagnostic> {
         self.check_mode(check::Mode::Program)
+    }
+    pub fn check_for(mut self, target: crate::target::Target) -> Result<Checked, Diagnostic> {
+        self.types.set_pointer_bytes(target.pointer_bytes());
+        self.check()
+    }
+    pub fn check_tests_for(mut self, target: crate::target::Target) -> Result<Checked, Diagnostic> {
+        self.types.set_pointer_bytes(target.pointer_bytes());
+        self.check_tests()
     }
     pub fn check_tests(self) -> Result<Checked, Diagnostic> {
         self.check_mode(check::Mode::Test)
@@ -65,6 +97,10 @@ impl Checked {
             .map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
     }
     pub fn compile_for(&self, target: crate::target::Target) -> Result<Vec<u8>, Error> {
+        if self.program.types.pointer_bytes() != target.pointer_bytes() {
+            return Err(Error::new("E0300", Span { start: 0, end: 0 },
+                "checked pointer width differs from output target; check this module with Loaded::check_for(target)"));
+        }
         crate::native::compile_for(&self.program, target)
             .map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
     }
@@ -100,13 +136,12 @@ impl Loader {
             text,
         });
         self.modules.push(check::Module {
+            filesystem: module.filesystem,
             functions: module.functions,
             imports: Vec::new(),
             records: module.records,
             enums: module.enums,
             standard_sys: name == "sys",
-            standard_macos: name == "std/macos",
-            standard_vulkan: name == "std/vulkan",
         });
         self.imports(id, module.imports, None)?;
         Ok(id)
@@ -135,13 +170,12 @@ impl Loader {
         let module = syntax::parse_module_at(&self.sources.files[id].text, &mut self.types, id)
             .map_err(|e| e.in_file(id))?;
         self.modules.push(check::Module {
+            filesystem: module.filesystem,
             functions: module.functions,
             imports: Vec::new(),
             records: module.records,
             enums: module.enums,
             standard_sys: false,
-            standard_macos: false,
-            standard_vulkan: false,
         });
         self.imports(id, module.imports, path.parent())?;
         Ok(id)
@@ -223,6 +257,7 @@ fn logical_name(name: &str) -> &str {
 fn standard_source(name: &str) -> Option<&'static str> {
     Some(match name {
         "sys" => include_str!("../stdlib/sys.ddr"),
+        "std/dl" => include_str!("../stdlib/dl.ddr"),
         "std/array" => include_str!("../stdlib/array.ddr"),
         "std/map" => include_str!("../stdlib/map.ddr"),
         "std/set" => include_str!("../stdlib/set.ddr"),
@@ -231,7 +266,18 @@ fn standard_source(name: &str) -> Option<&'static str> {
         "std/bytes" => include_str!("../stdlib/bytes.ddr"),
         "std/sha256" => include_str!("../stdlib/sha256.ddr"),
         "std/parse" => include_str!("../stdlib/parse.ddr"),
+        "std/fs" => include_str!("../stdlib/fs.ddr"),
+        "std/macos/objc" => include_str!("../stdlib/macos/objc.ddr"),
+        "std/macos/renderer" => include_str!("../stdlib/macos/renderer.ddr"),
+        "std/macos/appkit" => include_str!("../stdlib/macos/appkit.ddr"),
         "std/macos" => include_str!("../stdlib/macos.ddr"),
+        "std/vulkan/api" => include_str!("../stdlib/vulkan/api.ddr"),
+        "std/vulkan/layout" => include_str!("../stdlib/vulkan/layout.ddr"),
+        "std/vulkan/state" => include_str!("../stdlib/vulkan/state.ddr"),
+        "std/vulkan/device" => include_str!("../stdlib/vulkan/device.ddr"),
+        "std/vulkan/sdl" => include_str!("../stdlib/vulkan/sdl.ddr"),
+        "std/vulkan/pipeline" => include_str!("../stdlib/vulkan/pipeline.ddr"),
+        "std/vulkan/shader" => include_str!("../stdlib/vulkan/shader.ddr"),
         "std/vulkan" => include_str!("../stdlib/vulkan.ddr"),
         _ => return None,
     })

@@ -37,15 +37,15 @@ impl Code<'_> {
         arg: Option<&Expr>,
     ) {
         use crate::check::IntOp;
-        self.expr(base);
-        self.push(0);
         if let Some(arg) = arg {
-            self.expr(arg);
+            self.operands(base, arg);
+        } else {
+            self.expr_into(base, 1);
         }
-        self.pop(1);
-        let wide = base.ty == Type::I64;
+        let bits = self.types.scalar_size(base.ty) * 8;
+        let wide = bits == 64;
         if matches!(op, IntOp::Shl | IntOp::Shr) {
-            self.imm(2, if wide { 64 } else { 32 });
+            self.imm(2, bits as u64);
             self.cmp(0, 2);
             self.branch(self.bounds, Branch::Cond(2));
         }
@@ -61,7 +61,9 @@ impl Code<'_> {
             IntOp::WrappingMul => 0x9b007c20,
         };
         self.emit(if wide { word } else { word & 0x7fffffff });
-        if !wide {
+        if base.ty.unsigned() {
+            self.zero_extend(0, bits as u32);
+        } else if !wide {
             self.emit(0x93407c00);
         }
     }
@@ -304,6 +306,10 @@ impl Code<'_> {
     ) {
         let elem = self.types.dynamic_elem(base.ty).unwrap();
         let size = self.types.scalar_size(elem);
+        if matches!(op, DynamicOp::Len) && self.locals.fixed_array(base) {
+            self.mov(0, 15);
+            return;
+        }
         self.expr(base);
         match op {
             DynamicOp::Len | DynamicOp::Capacity => {

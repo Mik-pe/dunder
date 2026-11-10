@@ -112,7 +112,7 @@ fn bind_stream(image: &[u8]) -> Option<&[u8]> {
 }
 
 #[test]
-fn macos_is_a_trusted_typed_module_and_explicit_local_modules_stay_unprivileged() {
+fn macos_public_api_keeps_type_and_module_boundaries() {
     let project = Project::new();
     project.write("macos.ddr", "pub fn answer()->i32{42}");
     let checked = project.checked(
@@ -127,8 +127,7 @@ fn main(){
 }
 "#,
     );
-    assert_eq!(checked.sources.files.len(), 3);
-    assert!(checked.program.macos_types.is_some());
+    assert!(checked.program.main.is_some());
 
     for (source, code) in [
         (
@@ -236,9 +235,9 @@ fn main(){print(poll())}"#,
 fn main(){f:fn(macos.Window)=macos.close;f(macos.Window{id:0})}"#,
     ] {
         let image = project.compile(source);
-        assert_eq!(dynamic_libraries(&image), ["/usr/lib/libSystem.B.dylib"]);
+        assert_eq!(dynamic_libraries(&image), ["/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib"]);
         let binds = bind_stream(&image).expect("reachable native API needs dynamic bindings");
-        for symbol in [b"_dlopen\0".as_slice(), b"_dlsym\0".as_slice()] {
+        for symbol in [b"_objc_msgSend\0".as_slice(), b"_sel_registerName\0".as_slice()] {
             assert!(binds.windows(symbol.len()).any(|window| window == symbol));
         }
     }
@@ -347,7 +346,7 @@ fn main(){close:fn(macos.Window)=macos.close;close(macos.Window{id:0})}"#,
             assert_eq!(
                 error.message,
                 format!(
-                    "native macOS APIs require target arm64-macos; selected target is {target}"
+                    "native module requires macOS; selected target is {target}"
                 )
             );
         }

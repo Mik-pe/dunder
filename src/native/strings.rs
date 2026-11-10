@@ -34,7 +34,7 @@ pub(super) struct Runtime {
     pub print_rune: Label,
     pub exhausted: Label,
     pub unicode_error: Label,
-    literals: Vec<(String, Label)>,
+    pub(super) literals: Vec<(String, Label)>,
 }
 impl Runtime {
     pub fn new(c: &mut Code<'_>) -> Self {
@@ -104,9 +104,11 @@ impl Code<'_> {
 
     pub(super) fn string_literal(&mut self, s: &str) -> Label {
         if let Some((_, label)) = self.strings.literals.iter().find(|(text, _)| text == s) {
+            if let Some(trace) = &mut self.literal_trace { trace.push(*label); }
             return *label;
         }
         let label = self.label();
+        if let Some(trace) = &mut self.literal_trace { trace.push(label); }
         self.strings.literals.push((s.into(), label));
         label
     }
@@ -122,7 +124,7 @@ impl Code<'_> {
             self.emit(len as u32);
             self.emit((len >> 32) as u32);
             let mut bytes = text.into_bytes();
-            bytes.resize(super::align(bytes.len(), 8), 0);
+            bytes.resize(super::align(bytes.len() + 1, 8), 0); // immutable C literal terminator
             for word in bytes.as_chunks::<4>().0 {
                 self.emit(u32::from_le_bytes(*word));
             }
@@ -165,7 +167,10 @@ impl Code<'_> {
                     self.branch(no, Branch::Address(0));
                     self.mark(end);
                 }
-                _ => self.branch(self.strings.from_int, Branch::Call),
+                _ => {
+                    self.imm(8, u64::from(args[0].ty.unsigned()));
+                    self.branch(self.strings.from_int, Branch::Call);
+                }
             },
         }
     }
@@ -616,6 +621,7 @@ impl Code<'_> {
         self.imm(4, 10);
         self.imm(7, 0);
         let magnitude = self.label();
+        self.branch(magnitude, Branch::Nonzero(8));
         self.cmp(3, 31);
         self.branch(magnitude, Branch::Cond(10));
         self.imm(7, 1);

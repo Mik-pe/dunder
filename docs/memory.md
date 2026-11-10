@@ -110,3 +110,33 @@ Nästa arkitektursteg är att porta samma ägarkontrakt till selfhost-backenden,
 förbättra blandade storleksklasser och minska onödiga retain/release samt
 aggregatkopior. Generella livstider, explicita flyttar och användarvalda
 allokatorer behöver egna språkregler innan de kan exponeras säkert.
+
+## Lexikala scratch-regioner
+
+Rust-bootstrapen kan skapa en tidsbegränsad arena med `region namn(antal_byte)`.
+Kapaciteten är ett `i32` som utvärderas en gång vid inträdet. Utan parenteser
+är kapaciteten 64 KiB. Regionen lånar en buffert från arraypoolen. Varje
+`alloc` flyttar en markör i bufferten, justerar adressen för elementtypen och
+nollställer de nya elementen. Underblock och loopar kan allokera från samma
+region. Den lämnar tillbaka sin buffert vid blockslut, retur och loopavbrott.
+
+```dunder
+struct Node { left: i32, right: i32, weight: i64 }
+
+fn frame()->i64 {
+    region scratch(4096) {
+        var nodes: []Node = scratch.alloc(32)
+        nodes[3].weight = 12
+        return nodes[3].weight
+    }
+}
+```
+
+En vy har fast längd. Den tillåter indexering och `len` och dess element
+kan lånas under ett funktionsanrop. Element kan vara tal, `bool`, `rune`
+eller structar med motsvarande värdefält. En kopia av en nod är ett vanligt
+värde. En hel vy kan delas med en funktion som tar ett delat arraylån för
+en tillåten arraytyp. Kompilatorn avvisar tilldelning, retur, råadresser och
+storleksändringar av själva vyn. En för liten region, negativt elementantal
+eller index utanför vyn ger status 103. Negativ eller omöjlig begäran om
+regionkapacitet ger arrayallokerarens status 109.

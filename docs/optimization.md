@@ -36,6 +36,28 @@ semantik eller kräva en separat generell mellanrepresentation.
 - x86-64 väljer kortare MOV-instruktioner för små konstanter. MOV bevarar
   flaggorna, till skillnad från att nollställa ett register med XOR.
 
+## Lokaler, anrop och ägarskap
+
+Kodgeneratorn räknar läsningar av skalära lokaler i loopar och utesluter
+lokaler vars adress tas någonstans i funktionen. På ARM64 kan upp till fyra
+lokaler bo i `x25`–`x28`. På x86-64 får den mest lästa lokalen `rbx`.
+Funktionen sparar sina använda register vid inträde och återställer dem på
+varje retur, även vid rekursion.
+
+Små rena funktioner som består av ett skalärt returuttryck eller konstruerar
+en struct av skalärfält kan inlinas vid direkta anrop. En sådan konstruktor
+kan skriva resultatet direkt till den tilldelade variabelns lagring. Budgeten är tio uttrycksnoder och fyra skalära parametrar.
+Argument med möjliga sidoeffekter eller fel utvärderas en gång från vänster
+till höger, även när hjälpfunktionen bara använder ett av argumenten.
+Vanliga anrop med enkla argument som ryms i register skriver direkt i
+argumentregistren.
+
+En ägd lokal sträng eller dynamisk array kan flyttas vid retur. Vid
+tilldelning kan en tillfällig allokering eller en lokal med en enda läsning
+utanför loopar lämna över sitt ägarskap till destinationen. En överlämnad
+strängreferens eller arraydeskriptor nollställs på källplatsen innan den
+vanliga städningen körs.
+
 ## x86-64-register
 
 | Gemensamt arbetsregister | Fast x86-64-register |
@@ -43,13 +65,14 @@ semantik eller kräva en separat generell mellanrepresentation.
 | `x0`, resultat och första argument | `r12` |
 | `x1`, vänster operand och andra argument | `r13` |
 | `x2`, aritmetik/adressarbete och tredje argument | `r14` |
+| `x25`, mest lästa skalära looplokal | `rbx` |
 | Privat värdestackpekare | `rbp` |
 
 Dessa register överlever Linux-systemanrop och är callee-saved i systemets
 C-ABI. Samma mappning gäller på alla kontrollflödesvägar; inga cacheflushar
 eller olika registerval behöver förenas vid grenar. Övriga arbetsregister
-har tills vidare platser i den privata registerbanken. `rbx` reserveras för
-värdstackens justering runt externa anrop. Kontrollerna för Dunders separata
+har tills vidare platser i den privata registerbanken. Det externa
+anropets adapter sparar och återställer `rbx` vid stackjustering. Kontrollerna för Dunders separata
 värdestack och dess skyddssida finns kvar.
 
 ## Självhosting
@@ -77,10 +100,12 @@ registerbevarande och anrop till riktiga systembibliotek.
 
 [Runtime-sviten](../benchmarks/runtime/README.md) innehåller mätverktyg,
 frysta program och råvärden från före/efter-körning. Resultaten gäller
-de uppmätta arbetsfallen och maskinen. Native ARM64-prestanda och
-C/C++-paritet är ännu inte uppmätta.
+de uppmätta arbetsfallen och maskinen.
 
-Nästa steg att pröva är registerallokering för lokaler över hela loopar,
-kostnadsstyrd inlining och borttagning av bevisat överflödiga gränskontroller.
-Varje steg behöver både semantiska regressionstester och mätningar innan
-det kan motiveras som en prestandavinst.
+På ARM64 macOS mättes denna optimeringsändring isolerat mot commit
+`a87e419` över 30 alternerande körningar per variant och program. Medianerna
+i millisekunder var 6,985 → 6,030 för numerik, 6,510 → 5,920 för arrayläsning,
+3,322 → 3,294 för text och 5,682 → 5,534 för sortering. p95 ökade för numerik,
+text och sortering. Alla körningar kontrollerades mot oberoende facit.
+[Råvärden och maskinmetadata](../benchmarks/runtime/2026-11-10-macos-arm64/)
+finns för alla fyra arbetsfall. En jämförelse med C/C++ återstår.

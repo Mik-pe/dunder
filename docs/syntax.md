@@ -519,3 +519,13 @@ allokerings-API, generell ägar-/lånekontroll och egna iteratorer återstår.
 Den äldre dogfood-arenan använder fortfarande indexhandtag över en fast
 typad buffert. [Självhosting](../selfhost/README.md) fungerar för ARM64/Linux;
 full språk- och minnesmodellparitet återstår.
+
+## Råtyper, privilegier och C-layout
+
+`u8`, `u16`, `u32`, `u64`, `usize` och `ptr` kan användas i variabler,
+fält och samlingar. `@c_layout struct` anger C-fältlayout. En modul med
+`capability unsafe` kan använda `unsafe fn`, `unsafe { ... }`, `@extern`
+och typade C-funktionspekare. `capability filesystem` ger tillgång till att
+skapa filhandtag. En `pub opaque struct` exponerar typen och låter den
+definierande modulen äga konstruktion och fältåtkomst.
+[Språkkontrakt och exempel](ffi.md)

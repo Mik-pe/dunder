@@ -52,12 +52,13 @@ impl Lower {
     }
     // The arithmetic lowerer uses rax/rcx/rdx and r8..r11 as scratch registers.
     // These fixed homes are callee-saved in SysV and preserved by Linux syscalls.
-    // rbx is reserved for aligning the host stack across native library calls.
+    // Native calls preserve rbx while temporarily using it to align the host stack.
     fn register_home(offset: i32) -> Option<u8> {
         match offset {
             0 => Some(12),  // x0: expression results and first argument
             8 => Some(13),  // x1: left operand and second argument
             16 => Some(14), // x2: arithmetic/address scratch and third argument
+            200 => Some(3), // x25: hottest address-free scalar in a loop
             248 => Some(5), // virtual SP, distinct from the host call stack
             _ => None,
         }
@@ -260,25 +261,34 @@ impl Lower {
         self.disp32(offset);
     }
     /// Private emitter operation, not an instruction placed in an ARM image.
-    /// Integer arguments occupy virtual x0..x15 and floating arguments d0..d7.
-    fn external_call(&mut self, function: u32, argc: usize, floats: usize) -> Result<(), String> {
-        if argc > 16 || floats > 8 || function == 31 {
+    /// Register arguments occupy virtual x0..x5 and v0..v7. Spills are packed on the value stack.
+    fn external_call(
+        &mut self,
+        function: u32,
+        argc: usize,
+        floats: usize,
+        callbacks: bool,
+    ) -> Result<(), String> {
+        if argc > 6 || floats > 8 || function == 31 {
             return Err("invalid native C call shape".into());
         }
         // Dunder's call stack has no host-ABI alignment contract. Remember it
         // in a callee-saved register, then build a properly aligned SysV frame.
         self.emit(&[0x53, 0x48, 0x89, 0xe3]); // push rbx; mov rbx,rsp
-        self.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp,-16
-        let stack = argc.saturating_sub(6) * 8;
-        if stack != 0 {
-            self.emit(&[0x48, 0x81, 0xec]);
-            self.disp32(stack.next_multiple_of(16) as i32);
-            for arg in 6..argc {
-                self.load(0, arg as u32);
-                self.emit(&[0x48, 0x89, 0x84, 0x24]);
-                self.disp32(((arg - 6) * 8) as i32);
-            }
+        if callbacks {
+            // Preserve the previous suspended context for nested C -> Dunder
+            // -> C calls. rbx holds our private host frame across C.
+            self.load(10, 15);
+            self.emit(&[0x41, 0x52, 0x41, 0xff, 0x32, 0x41, 0xff, 0x72, 8]); // push r10,[r10],[r10+8]
+            self.emit(&[0x4d, 0x89, 0x3a, 0x49, 0x89, 0x6a, 8]); // [r10]=r15, [r10+8]=rbp
         }
+        self.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp,-16
+                                              // Copy the ABI-classified outgoing arguments to the aligned C stack.
+        self.load(1, 16);
+        self.emit(&[0x48, 0x29, 0xcc]); // sub rsp,rcx
+        self.mov_reg(6, 5);
+        self.mov_reg(7, 4);
+        self.emit(&[0xf3, 0xa4]); // rep movsb
         self.load(11, function);
         for (arg, reg) in [7, 6, 2, 1, 8, 9].into_iter().enumerate().take(argc) {
             self.load(reg, arg as u32);
@@ -291,6 +301,13 @@ impl Lower {
         self.emit(&[0x41, 0xff, 0xd3]); // call r11
         self.store(0, 0);
         self.fp_store(0, 0, true);
+        self.fp_store(1, 1, true); // second SysV aggregate return eightbyte
+        if callbacks {
+            self.emit(&[
+                0x4c, 0x8b, 0x53, 0xf8, 0x48, 0x8b, 0x43, 0xf0, 0x49, 0x89, 0x02,
+            ]);
+            self.emit(&[0x48, 0x8b, 0x43, 0xe8, 0x49, 0x89, 0x42, 8]);
+        }
         self.emit(&[0x48, 0x89, 0xdc, 0x5b]); // mov rsp,rbx; pop rbx
         Ok(())
     }
@@ -299,11 +316,37 @@ impl Lower {
         let rn = (w >> 5) & 31;
         let rm = (w >> 16) & 31;
         let wide = w >> 31 != 0;
-        if w & 0xfff0_e0e0 == 0xff00_0000 {
+        if w >> 24 == 0xfd {
+            self.emit(&[0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);
+            self.emit(&[0x48, 0x8d, 0x05]); // lea rax,[rip+callback context]
+            self.globals
+                .push((self.code.len(), (w & 0xffffff) as usize));
+            self.disp32(0);
+            self.emit(&[0x4c, 0x8b, 0x38, 0x48, 0x8b, 0x68, 8]); // r15,rbp = suspended Dunder state
+            for (arg, reg) in [7, 6, 2, 1, 8, 9].into_iter().enumerate() {
+                self.store(arg as u32, reg);
+            }
+            for fp in 0..8 {
+                self.fp_store(fp, fp as u8, true);
+            }
+            self.emit(&[0x48, 0x8d, 0x44, 0x24, 56]); // address of first on-stack C argument
+            self.store(14, 0);
+            return Ok(());
+        }
+        if w == 0xfb000000 {
+            self.load(0, 0);
+            self.fp_load(0, 0, true);
+            self.emit(&[
+                0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5d, 0x5b, 0xc3,
+            ]);
+            return Ok(());
+        }
+        if matches!(w & 0xfff0_e0e0, 0xfe00_0000 | 0xfc00_0000) {
             return self.external_call(
                 w & 31,
                 ((w >> 8) & 255) as usize,
                 ((w >> 16) & 255) as usize,
+                w >> 24 == 0xfc,
             );
         }
         if self.lower_float(w) {
@@ -460,9 +503,10 @@ impl Lower {
             let ra = w >> 10 & 31;
             self.load(0, rn);
             self.load(1, rm);
-            if w & 0x00e00000 == 0x00400000 {
-                // signed high multiply
-                self.emit(&[0x48, 0xf7, 0xe9]);
+            if matches!(w & 0x00e00000, 0x00400000 | 0x00c00000) {
+                // IMUL/MUL r/m64: the high half is placed in RDX.
+                let unsigned = w & 0x00800000 != 0;
+                self.emit(&[0x48, 0xf7, if unsigned { 0xe1 } else { 0xe9 }]);
                 self.store(rd, 2);
             } else if w & 0x00e00000 == 0 {
                 self.rex(wide, 0, 0, 1);
@@ -813,7 +857,13 @@ mod tests {
             immediate(&mut words, arg, u64::from(arg - 2));
         }
         words.push(0xaa0203f7); // x23 = x2, retained format pointer.
-        words.push(0xff000c11); // Twelve integer arguments, six on the host stack.
+        words.push(0xd100c3ff); // sub sp,sp,#48
+        for arg in 6..12 {
+            words.push(0xf90003e0 | (arg - 6) << 10 | arg);
+        }
+        immediate(&mut words, 16, 48);
+        words.push(0xfe000611); // Six register arguments plus the outgoing stack block.
+        words.push(0x9100c3ff);
         check_preserved_arguments(&mut words, &mut fixups);
         write_buffer(&mut words, &mut globals);
 
@@ -828,7 +878,8 @@ mod tests {
         fixups.push((words.len(), 1, Branch::Address(2)));
         words.extend([0, 0xd503201f]);
         words.push(0xaa0203f7); // x23 = x2.
-        words.push(0xff020311); // Three integer and two floating arguments.
+        immediate(&mut words, 16, 0);
+        words.push(0xfe020311); // Three integer and two floating arguments.
         check_preserved_arguments(&mut words, &mut fixups);
         write_buffer(&mut words, &mut globals);
         words.push(0xaa1603e0); // exit with the preserved x22.
@@ -853,7 +904,11 @@ mod tests {
         }
         labels.push(Some(corrupted));
         let text = lower_dynamic(&words, &labels, &fixups, data_start, &globals).unwrap();
-        let image = crate::native::elf::dynamic_executable(&text, 62, &["snprintf"], 4096);
+        let imports = crate::native::ffi::Imports {
+            libraries: vec!["libc.so.6".into()],
+            symbols: vec![(0, "snprintf".into())],
+        };
+        let image = crate::native::elf::dynamic_executable(&text, 62, &imports, 4096);
         let path = std::env::temp_dir().join(format!("dunder-native-call-{}", std::process::id()));
         fs::write(&path, image).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();

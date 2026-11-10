@@ -83,12 +83,13 @@ fn csv_field(value: &str) -> String {
 }
 
 #[test]
-fn standalone_project_manifest_builds_for_every_target_without_external_tools() {
+fn standalone_project_manifest_builds_for_every_native_target_without_external_tools() {
     let work = Workspace::new();
-    for target in Target::ALL {
+    for target in Target::NATIVE {
         let binary = work.build(target);
         let image = fs::read(binary).unwrap();
         match target {
+            Target::Wasm32 => unreachable!("tabell uses native filesystem services"),
             Target::Arm64Macos => {
                 assert_eq!(&image[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
                 assert_eq!(

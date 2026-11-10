@@ -6,16 +6,21 @@ use crate::{
     target::Target,
 };
 mod collections;
+mod cache;
+pub use cache::{CacheStats, Incremental};
+mod regions;
 pub(crate) mod elf;
 mod enums;
 mod floats;
+pub(crate) mod ffi;
+mod fingerprint;
+use fingerprint::Fingerprints;
 mod image;
-mod macos;
-mod optimize;
+pub(crate) mod optimize;
 mod reachable;
 mod strings;
+mod unsigned;
 mod sys;
-mod vulkan;
 
 pub(crate) type Label = usize;
 pub(crate) enum Branch {
@@ -30,6 +35,8 @@ struct Code<'a> {
     target: Target,
     data_start: usize,
     types: &'a Types,
+    locals: optimize::LocalPlan,
+    leaves: Vec<Option<&'a Expr>>,
     words: Vec<u32>,
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label, Branch)>,
@@ -44,6 +51,7 @@ struct Code<'a> {
     assertion: Label,
     loops: Vec<(Label, Label)>,
     strings: strings::Runtime,
+    literal_trace: Option<Vec<Label>>,
     float_formatter: Option<Label>,
     float_conversion: Label,
     return_slot: Option<usize>,
@@ -52,13 +60,13 @@ struct Code<'a> {
     sys_types: Option<crate::check::SysTypes>,
     invalid_enum: Label,
     collections: collections::Runtime,
-    macos: macos::Runtime,
-    mac_types: Option<crate::check::MacTypes>,
-    vulkan: vulkan::Runtime,
-    vulkan_types: Option<crate::check::VulkanTypes>,
     text_offset: usize,
     data_fixups: Vec<(usize, usize, u32)>,
-    import_labels: [Label; 2],
+    static_slots: std::collections::BTreeMap<(usize, usize), usize>,
+    foreign_slots: Vec<Option<usize>>,
+    callbacks: Vec<Option<Label>>,
+    has_callbacks: bool,
+    import_count: usize,
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -66,6 +74,8 @@ impl<'a> Code<'a> {
             target: Target::Arm64Macos,
             data_start: 0,
             types,
+            locals: optimize::LocalPlan::default(),
+            leaves: Vec::new(),
             words: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
@@ -80,6 +90,7 @@ impl<'a> Code<'a> {
             assertion: 0,
             loops: Vec::new(),
             strings: strings::Runtime::default(),
+            literal_trace: None,
             float_formatter: None,
             float_conversion: 0,
             return_slot: None,
@@ -88,13 +99,13 @@ impl<'a> Code<'a> {
             sys_types: None,
             invalid_enum: 0,
             collections: collections::Runtime::default(),
-            macos: macos::Runtime::default(),
-            mac_types: None,
-            vulkan: vulkan::Runtime::default(),
-            vulkan_types: None,
             text_offset: 432,
             data_fixups: Vec::new(),
-            import_labels: [0; 2],
+            static_slots: Default::default(),
+            foreign_slots: vec![None; functions],
+            callbacks: Vec::new(),
+            has_callbacks: false,
+            import_count: 0,
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -110,57 +121,16 @@ impl<'a> Code<'a> {
         c.sys = sys::Runtime::new(&mut c);
         c.invalid_enum = c.label();
         c.collections = collections::Runtime::new(&mut c);
-        c.macos = macos::Runtime::new(&mut c);
-        c.vulkan = vulkan::Runtime::new(&mut c);
-        c.import_labels = std::array::from_fn(|_| c.label());
         c
     }
     fn label(&mut self) -> Label {
         self.labels.push(None);
         self.labels.len() - 1
     }
-    fn global_addr(&mut self, slot: usize, reg: u32) {
+    fn data_slot(&mut self, slot: usize, reg: u32) {
         self.data_fixups.push((self.words.len(), slot, reg));
         self.emit(0);
         self.emit(0);
-    }
-    fn import_call(&mut self, index: usize) {
-        self.branch(self.import_labels[index], Branch::Call);
-    }
-    fn import_thunks(&mut self) {
-        for i in 0..2 {
-            self.mark(self.import_labels[i]);
-            if self.target != Target::Arm64Macos {
-                self.prologue(0);
-            }
-            self.global_addr(i, 16);
-            self.ldr(16, 16);
-            if self.target == Target::Arm64Macos {
-                self.emit(0xd61f0200);
-            } else {
-                self.native_call(16, 2, 0);
-                self.epilogue();
-            }
-        }
-    }
-    // Call a system-library function, separate from Dunder's private ABI.
-    fn native_call(&mut self, function: u32, argc: u32, floats: u32) {
-        assert!(argc <= 16 && floats <= 8 && function < 31);
-        if self.target == Target::X86_64Linux {
-            self.emit(0xff000000 | (floats << 16) | (argc << 8) | function);
-        } else {
-            let stack = argc.saturating_sub(8).div_ceil(2) * 16;
-            if stack > 0 {
-                self.emit(0xd10003ff | (stack << 10));
-                for arg in 8..argc {
-                    self.emit(0xf90003e0 | ((arg - 8) << 10) | arg);
-                }
-            }
-            self.emit(0xd63f0000 | (function << 5));
-            if stack > 0 {
-                self.emit(0x910003ff | (stack << 10));
-            }
-        }
     }
     fn mark(&mut self, l: Label) {
         assert!(self.labels[l].is_none());
@@ -181,7 +151,9 @@ impl<'a> Code<'a> {
         }
     }
     fn mov(&mut self, dst: u32, src: u32) {
-        self.emit(0xaa0003e0 | src << 16 | dst);
+        if dst != src {
+            self.emit(0xaa0003e0 | src << 16 | dst);
+        }
     }
     fn imm(&mut self, reg: u32, value: u64) {
         self.emit(0xd2800000 | ((value as u32 & 0xffff) << 5) | reg);
@@ -211,6 +183,10 @@ impl<'a> Code<'a> {
         self.emit(0xcb0903a9);
     } // sub x9,x29,x9
     fn store(&mut self, slot: usize, reg: u32) {
+        if let Some(home) = self.locals.register(slot) {
+            self.mov(home, reg);
+            return;
+        }
         if slot < 32 {
             self.emit(0xf80003a0 | ((-(slot as i32 + 1) * 8) as u32 & 511) << 12 | reg);
             return;
@@ -222,6 +198,10 @@ impl<'a> Code<'a> {
         self.load_reg(slot, 0);
     }
     fn load_reg(&mut self, slot: usize, reg: u32) {
+        if let Some(home) = self.locals.register(slot) {
+            self.mov(reg, home);
+            return;
+        }
         if slot < 32 {
             self.emit(0xf84003a0 | ((-(slot as i32 + 1) * 8) as u32 & 511) << 12 | reg);
             return;
@@ -250,13 +230,7 @@ impl<'a> Code<'a> {
     fn load_stack_param(&mut self, offset: usize, ty: Type) {
         self.imm(9, (offset + 16) as u64);
         self.emit(0x8b0903a9); // add x9,x29,x9, past saved FP/LR
-        self.emit(match ty {
-            Type::I32 | Type::Rune => 0xb9800120,
-            _ if self.types.scalar_enum(ty) => 0xb9800120,
-            Type::F32 => 0xb9400120,
-            Type::Bool => 0x39400120,
-            _ => 0xf9400120,
-        });
+        self.typed_load_from(ty, 9, 0);
     }
     fn epilogue(&mut self) {
         self.emit(0x910003bf);
@@ -269,13 +243,18 @@ impl<'a> Code<'a> {
         self.branch(self.overflow, Branch::Cond(1));
     }
     fn typed_load(&mut self, ty: Type) {
-        self.emit(match ty {
+        self.typed_load_from(ty, 0, 0);
+    }
+    fn typed_load_from(&mut self, ty: Type, base: u32, reg: u32) {
+        let opcode = match ty {
             Type::I32 | Type::Rune => 0xb9800000,
             _ if self.types.scalar_enum(ty) => 0xb9800000,
-            Type::F32 => 0xb9400000,
-            Type::Bool => 0x39400000,
+            Type::U32 | Type::F32 => 0xb9400000,
+            Type::U16 => 0x79400000,
+            Type::Bool | Type::U8 => 0x39400000,
             _ => 0xf9400000,
-        });
+        };
+        self.emit(opcode | (base << 5) | reg);
     }
     fn typed_store(&mut self, ty: Type, base: u32) {
         self.typed_store_reg(ty, base, 0);
@@ -283,9 +262,10 @@ impl<'a> Code<'a> {
     fn typed_store_reg(&mut self, ty: Type, base: u32, reg: u32) {
         self.emit(
             (match ty {
-                Type::I32 | Type::Rune | Type::F32 => 0xb9000000,
+                Type::I32 | Type::U32 | Type::Rune | Type::F32 => 0xb9000000,
                 _ if self.types.scalar_enum(ty) => 0xb9000000,
-                Type::Bool => 0x39000000,
+                Type::Bool | Type::U8 => 0x39000000,
+                Type::U16 => 0x79000000,
                 _ => 0xf9000000,
             }) | base << 5
                 | reg,
@@ -382,32 +362,70 @@ impl<'a> Code<'a> {
     fn index_addr(&mut self, base: &Expr, index: &Expr) {
         let a = self.types.array(base.ty);
         let dynamic = self.types.dynamic_elem(base.ty);
-        self.expr(base);
-        self.push(0);
-        self.expr(index);
-        self.pop(1);
-        if dynamic.is_some() {
-            self.add_imm(2, 1, 8);
-            self.ldr(2, 2);
+        let fixed = self.locals.fixed_array(base);
+        if fixed {
+            self.expr(index);
+            self.cmp(0, 15);
         } else {
-            self.imm(2, a.unwrap().len as u64);
+            self.operands(base, index);
+            if dynamic.is_some() {
+                self.emit(0xf9400422); // ldr x2,[x1,#8]
+            } else {
+                self.imm(2, a.unwrap().len as u64);
+            }
+            self.cmp(0, 2);
         }
-        self.cmp(0, 2);
         self.branch(self.bounds, Branch::Cond(2));
-        if let Some(elem) = dynamic {
-            self.ldr(1, 1);
-            self.imm(2, self.types.scalar_size(elem) as u64);
+        let data = if fixed { 14 } else { 1 };
+        let stride = if let Some(elem) = dynamic {
+            if !fixed { self.ldr(1, 1); }
+            self.types.storage_bytes(elem).unwrap_or_else(|| self.types.scalar_size(elem)).max(1)
         } else {
-            self.imm(2, a.unwrap().elem_size() as u64);
+            a.unwrap().elem_size()
+        };
+        if stride.is_power_of_two() {
+            self.emit(0x8b000000 | (data << 5) | (stride.trailing_zeros() << 10)); // add x0,x1,x0,lsl #log2(stride)
+        } else {
+            self.imm(2, stride as u64);
+            self.emit(0x9b027c00);
+            self.add(0, data, 0);
         }
-        self.emit(0x9b027c00);
-        self.emit(0x8b000020);
+    }
+    fn record_value(&mut self, ty: Type, fields: &[(usize, Expr)], storage: usize) {
+        self.release_storage(storage, ty);
+                self.local_addr(storage);
+                self.imm(11, self.types.storage_bytes(ty).unwrap() as u64);
+                let zero = self.label();
+                self.mark(zero);
+                self.emit(0x3900013f);
+                self.emit(0x91000529);
+                self.emit(0xf100056b);
+                self.branch(zero, Branch::Cond(1));
+                for (offset, value) in fields {
+                    self.expr(value);
+                    self.retain_string(value.ty);
+                    self.local_addr(storage);
+                    self.imm(11, *offset as u64);
+                    self.emit(0x8b0b0129);
+                    if self.types.storage_bytes(value.ty).is_some() {
+                        self.mov(1, 9);
+                        self.clone_into(value.ty);
+                    } else {
+                        self.typed_store(value.ty, 9);
+                    }
+                }
+                self.local_addr(storage);
+                self.mov(0, 9);
     }
     fn expr(&mut self, e: &Expr) {
         if self.optimized_expr(e) {
             return;
         }
         match &e.kind {
+            ExprKind::ScratchAlloc { area, cursor, limit, count, storage } => {
+                let elem = self.types.dynamic_elem(e.ty).unwrap();
+                self.scratch_alloc(*area, *cursor, *limit, count, *storage, elem);
+            }
             ExprKind::ManagedString(value, slot, fresh) => {
                 self.expr(value);
                 if !fresh {
@@ -476,17 +494,8 @@ impl<'a> Code<'a> {
                 }
                 self.sys_expr(*op, args, *storage);
             }
-            ExprKind::MacCall(op, args, storage) => {
-                if let Some(storage) = storage {
-                    self.release_storage(*storage, e.ty);
-                }
-                self.mac_expr(*op, args, *storage);
-            }
-            ExprKind::Vulkan(op, args, storage) => {
-                if let Some(storage) = storage {
-                    self.release_storage(*storage, e.ty);
-                }
-                self.vulkan_expr(*op, args, *storage);
+            ExprKind::StaticBytes { module, site, .. } => {
+                self.data_slot(self.static_slots[&(*module, *site)], 0);
             }
             ExprKind::String(s) => {
                 let label = self.string_literal(s);
@@ -494,32 +503,7 @@ impl<'a> Code<'a> {
             }
             ExprKind::StringView(base) => self.expr(base),
             ExprKind::StringOp(op, args) => self.string_expr(*op, args),
-            ExprKind::Record(fields, storage) => {
-                self.release_storage(*storage, e.ty);
-                self.local_addr(*storage);
-                self.imm(11, self.types.storage_bytes(e.ty).unwrap() as u64);
-                let zero = self.label();
-                self.mark(zero);
-                self.emit(0x3900013f);
-                self.emit(0x91000529);
-                self.emit(0xf100056b);
-                self.branch(zero, Branch::Cond(1));
-                for (offset, value) in fields {
-                    self.expr(value);
-                    self.retain_string(value.ty);
-                    self.local_addr(*storage);
-                    self.imm(11, *offset as u64);
-                    self.emit(0x8b0b0129);
-                    if self.types.storage_bytes(value.ty).is_some() {
-                        self.mov(1, 9);
-                        self.clone_into(value.ty);
-                    } else {
-                        self.typed_store(value.ty, 9);
-                    }
-                }
-                self.local_addr(*storage);
-                self.mov(0, 9);
-            }
+            ExprKind::Record(fields, storage) => self.record_value(e.ty, fields, *storage),
             ExprKind::Field(base, offset) => {
                 self.expr(base);
                 self.imm(2, *offset as u64);
@@ -580,18 +564,29 @@ impl<'a> Code<'a> {
             }
             ExprKind::Index(base, index) => {
                 self.index_addr(base, index);
-                self.typed_load(e.ty);
+                if self.types.storage_bytes(e.ty).is_none() {
+                    self.typed_load(e.ty);
+                }
             }
             ExprKind::Number(n) => self.imm(0, *n as u64),
             ExprKind::Bool(b) => self.imm(0, u64::from(*b)),
-            ExprKind::Local(s) => {
-                self.load(*s);
-                if e.ty == Type::I32 || e.ty == Type::Rune || self.types.scalar_enum(e.ty) {
-                    self.emit(0x93407c00);
-                }
+            ExprKind::Local(_) => self.simple_into(e, 0),
+            ExprKind::Function(f) if self.foreign_slots[*f].is_some() => {
+                self.data_slot(self.foreign_slots[*f].unwrap(), 0);
+                self.ldr(0, 0);
+            }
+            ExprKind::Callback(f) => self.branch(self.callbacks[*f].unwrap(), Branch::Address(0)),
+            ExprKind::Call(target, args, storage) if self.types.is_extern_fn(target.ty) => {
+                self.foreign_call(target, args, e.ty, *storage);
             }
             ExprKind::Function(f) => self.branch(self.functions[*f], Branch::Address(0)),
             ExprKind::Call(target, args, storage) => {
+                if let ExprKind::Function(f) = target.kind {
+                    if let Some(body) = self.leaves[f] {
+                        self.inline_call(body, args, *storage);
+                        return;
+                    }
+                }
                 if let Some(storage) = storage {
                     self.release_storage(*storage, e.ty);
                 }
@@ -604,12 +599,25 @@ impl<'a> Code<'a> {
                     self.expr(target);
                     self.push(0);
                 }
-                for arg in args {
-                    self.expr(arg);
-                    self.push(0);
-                }
                 let (locations, outgoing) =
                     arguments(&args.iter().map(|a| a.ty).collect::<Vec<_>>(), self.types);
+                let argument_bytes = if outgoing == 0 && args.iter().all(Self::simple) {
+                    for (arg, location) in args.iter().zip(locations) {
+                        match location {
+                            Argument::General(reg) => self.simple_into(arg, reg),
+                            Argument::Float(reg) => {
+                                self.simple_into(arg, 10);
+                                self.bits_to_fp(reg, 10, arg.ty);
+                            }
+                            Argument::Stack(_) => unreachable!(),
+                        }
+                    }
+                    0
+                } else {
+                    for arg in args {
+                        self.expr(arg);
+                        self.push(0);
+                    }
                 self.stack_adjust(outgoing, true);
                 for (arg, location) in locations.into_iter().enumerate() {
                     self.sp_addr(outgoing + (args.len() - 1 - arg) * 16);
@@ -622,15 +630,12 @@ impl<'a> Code<'a> {
                         Argument::Stack(offset) => {
                             self.emit(0xf940012a);
                             self.sp_addr(offset);
-                            self.emit(match args[arg].ty {
-                                Type::I32 | Type::Rune | Type::F32 => 0xb900012a,
-                                _ if self.types.scalar_enum(args[arg].ty) => 0xb900012a,
-                                Type::Bool => 0x3900012a,
-                                _ => 0xf900012a,
-                            });
+                            self.typed_store_reg(args[arg].ty, 9, 10);
                         }
                     }
                 }
+                    outgoing + args.len() * 16
+                };
                 if let Some(storage) = storage {
                     self.local_addr(*storage);
                     self.mov(8, 9);
@@ -638,7 +643,7 @@ impl<'a> Code<'a> {
                 if let Some(f) = direct {
                     self.branch(self.functions[f], Branch::Call);
                 } else {
-                    self.sp_addr(outgoing + args.len() * 16);
+                    self.sp_addr(argument_bytes);
                     self.emit(0xf9400131);
                     self.emit(0xd63f0220); // blr x17; x8 is the aggregate result address
                 }
@@ -650,7 +655,7 @@ impl<'a> Code<'a> {
                     self.mov(0, 9);
                 }
                 self.stack_adjust(
-                    outgoing + args.len() * 16 + if direct.is_none() { 16 } else { 0 },
+                    argument_bytes + if direct.is_none() { 16 } else { 0 },
                     false,
                 );
             }
@@ -659,6 +664,9 @@ impl<'a> Code<'a> {
                 if x.ty.float() {
                     self.float_to_string(x.ty);
                     self.push(0);
+                }
+                if x.ty.integer() {
+                    self.imm(8, u64::from(x.ty.unsigned()));
                 }
                 self.branch(
                     match x.ty {
@@ -680,8 +688,8 @@ impl<'a> Code<'a> {
                 self.expr(x);
                 if e.ty.float() || x.ty.float() {
                     self.float_cast(x.ty, e.ty);
-                } else if e.ty == Type::I32 && x.ty == Type::I64 {
-                    self.narrow();
+                } else {
+                    self.checked_integer_cast(x.ty, e.ty);
                 }
             }
             ExprKind::Unary(op, x) => {
@@ -695,6 +703,8 @@ impl<'a> Code<'a> {
                 if *op == "!" {
                     self.imm(1, 1);
                     self.emit(0xca010000);
+                } else if e.ty.unsigned() {
+                    self.branch(self.overflow, Branch::Nonzero(0));
                 } else {
                     self.emit(if e.ty == Type::I32 {
                         0x6b0003e0
@@ -725,6 +735,10 @@ impl<'a> Code<'a> {
                 self.operands(a, b);
                 if a.ty.float() {
                     self.float_binary(op, a.ty);
+                    return;
+                }
+                if a.ty.unsigned() {
+                    self.unsigned_binary(op, a.ty);
                     return;
                 }
                 if a.ty == Type::String {
@@ -823,10 +837,7 @@ impl<'a> Code<'a> {
         for stmt in body {
             match stmt {
                 Stmt::StorePlace(address, value) => {
-                    self.expr(address);
-                    self.push(0);
-                    self.expr(value);
-                    self.pop(1);
+                    self.operands(address, value);
                     if self.types.storage_bytes(value.ty).is_some() {
                         self.replace_into(value.ty);
                     } else if matches!(value.ty, Type::String | Type::Bytes | Type::Runes) {
@@ -842,6 +853,17 @@ impl<'a> Code<'a> {
                     arms,
                 } => self.enum_match(source, *slot, *storage, arms),
                 Stmt::Store(slot, e) => {
+                    if let Some(home) = self.locals.register(*slot) {
+                        self.expr_into(e, home);
+                        continue;
+                    }
+                    if self.take_string(e, *slot) {
+                        self.push(0);
+                        self.release_storage(*slot, e.ty);
+                        self.pop(0);
+                        self.store(*slot, 0);
+                        continue;
+                    }
                     self.expr(e);
                     if matches!(e.ty, Type::String | Type::Bytes | Type::Runes) {
                         self.store_string(*slot);
@@ -850,20 +872,46 @@ impl<'a> Code<'a> {
                     }
                 }
                 Stmt::StoreAggregate(slot, storage, e) => {
+                    // A small constructor consumes only scalar parameters. Its
+                    // arguments are captured before it writes this destination,
+                    // including assignments such as p = point(p.y, p.x).
+                    if self.record_into(e, *storage) {
+                        self.store(*slot, 0);
+                        continue;
+                    }
                     self.expr(e);
-                    self.copy_value(*storage, e.ty);
+                    if self.can_move_buffer(e, *slot) {
+                        self.push(0);
+                        self.release_storage(*storage, e.ty);
+                        self.local_addr(*storage);
+                        self.mov(1, 9);
+                        self.pop(0);
+                        self.move_buffer();
+                    } else {
+                        self.copy_value(*storage, e.ty);
+                    }
                     self.store(*slot, 0);
                 }
                 Stmt::Return(e) => {
                     if let Some(e) = e {
-                        self.expr(e);
-                        self.retain_string(e.ty);
+                        self.return_expr(e);
                         if self.types.storage_bytes(e.ty).is_some() {
                             self.push(0);
                             self.load(self.return_slot.expect("aggregate return destination"));
                             self.mov(1, 0);
                             self.pop(0);
-                            self.clone_into(e.ty);
+                            if matches!(e.ty, Type::Dynamic(_))
+                                && matches!(
+                                    e.kind,
+                                    ExprKind::Local(_)
+                                        | ExprKind::Dynamic(_, _)
+                                        | ExprKind::Call(_, _, Some(_))
+                                )
+                            {
+                                self.move_buffer();
+                            } else {
+                                self.clone_into(e.ty);
+                            }
                         }
                     } else {
                         self.imm(0, 0);
@@ -882,7 +930,7 @@ impl<'a> Code<'a> {
                             self.bits_to_fp(0, 0, e.ty);
                         }
                     }
-                    self.epilogue();
+                    self.function_epilogue();
                 }
                 Stmt::Expr(e) => self.expr(e),
                 Stmt::Block(b) => self.stmts(b),
@@ -1050,6 +1098,7 @@ impl<'a> Code<'a> {
         self.imm(7, 0);
         self.cmp(3, 31);
         let magnitude = self.label();
+        self.branch(magnitude, Branch::Nonzero(8));
         self.branch(magnitude, Branch::Cond(10));
         self.imm(7, 1);
         self.emit(0xcb0303e3); // unsigned magnitude, including i64::MIN
@@ -1172,7 +1221,7 @@ impl<'a> Code<'a> {
             self.words[at] = base | if bits == 26 { imm } else { imm << 5 };
         }
         let data = if self.target == Target::Arm64Macos {
-            image::dynamic_data_offset(self.words.len() * 4)
+            image::dynamic_data_offset(self.text_offset, self.words.len() * 4)
         } else {
             elf::dynamic_data_offset(self.words.len() * 4)
         };
@@ -1189,6 +1238,37 @@ impl<'a> Code<'a> {
         }
         Ok(self.words.iter().flat_map(|w| w.to_le_bytes()).collect())
     }
+}
+
+// Assign writable image storage before emitting functions so warm cache hits and
+// inlined calls resolve every syntactic allocation to the same address.
+fn plan_static_storage(code: &mut Code<'_>, program: &Program, reachable: &[bool]) -> Result<usize, String> {
+    let imports = code.import_count;
+    // Reserve image cells used by native runtime bookkeeping and callback entry.
+    let mut offset = (imports + if code.has_callbacks { 8 } else { 2 }) * 8;
+    for (index, function) in program.functions.iter().enumerate() {
+        if !reachable[index] { continue; }
+        let mut mismatch = None;
+        reachable::visit_body(&function.body, false, &mut |expr, _| {
+            if matches!(expr.kind, ExprKind::SysCall(..)) { code.sys_types = program.sys_types; }
+            if let ExprKind::StaticBytes { module, site, bytes, platform } = &expr.kind {
+                if (platform == "macos" && code.target != Target::Arm64Macos)
+                        || (platform == "linux" && code.target == Target::Arm64Macos) {
+                    mismatch = Some(if platform == "linux" { "Linux" } else { "macOS" });
+                }
+                code.static_slots.entry((*module, *site)).or_insert_with(|| {
+                    offset = align(offset, 16);
+                    let slot = offset / 8;
+                    offset += *bytes;
+                    slot
+                });
+            }
+        });
+        if let Some(required) = mismatch {
+            return Err(format!("native module requires {required}; selected target is {}", code.target));
+        }
+    }
+    Ok(offset - imports * 8)
 }
 
 pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
@@ -1209,6 +1289,10 @@ pub fn compile_entry_for(
     entry: usize,
     target: Target,
 ) -> Result<Vec<u8>, String> {
+    compile_cached(program, entry, target, None)
+}
+
+fn compile_cached(program: &Program, entry: usize, target: Target, mut cache: Option<&mut Incremental>) -> Result<Vec<u8>, String> {
     if program
         .functions
         .get(entry)
@@ -1216,33 +1300,24 @@ pub fn compile_entry_for(
     {
         return Err("entrypoint must be a function with no parameters".into());
     }
+    if target == Target::Wasm32 {
+        return crate::wasm::compile(program, entry, &reachable::functions(program, entry));
+    }
     let mut code = Code::new(program.functions.len(), &program.types);
     code.target = target;
+    code.leaves = program
+        .functions
+        .iter()
+        .map(optimize::inline_body)
+        .collect();
     let reachable = reachable::functions(program, entry);
     code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
-    code.sys_types = program.sys_types;
-    code.mac_types = program.macos_types;
-    code.vulkan_types = program.vulkan_types;
-    let uses_vulkan = reachable
-        .iter()
-        .enumerate()
-        .any(|(i, used)| *used && program.functions[i].uses_vulkan);
-    if uses_vulkan && target == Target::Arm64Macos {
-        return Err(format!(
-            "native Vulkan APIs require a Linux target; selected target is {target}"
-        ));
-    }
-    let uses_macos = reachable
-        .iter()
-        .enumerate()
-        .any(|(i, used)| *used && program.functions[i].uses_macos);
-    if uses_macos && target != Target::Arm64Macos {
-        return Err(format!(
-            "native macOS APIs require target arm64-macos; selected target is {target}"
-        ));
-    }
+    let imports = ffi::Imports::collect(&mut code, program, &reachable)?;
+    code.prepare_callbacks(program, &reachable);
+    let global_bytes = plan_static_storage(&mut code, program, &reachable)?;
+    let dynamic = !imports.symbols.is_empty() || code.has_callbacks || !code.static_slots.is_empty();
     code.text_offset = match target {
-        Target::Arm64Macos if uses_macos => image::DYNAMIC_TEXT_OFFSET,
+        Target::Arm64Macos if dynamic => image::text_offset(&imports),
         Target::Arm64Macos => 432,
         _ => elf::TEXT_OFFSET,
     };
@@ -1262,14 +1337,29 @@ pub fn compile_entry_for(
     code.branch(code.functions[entry], Branch::Call);
     code.syscall(1);
     code.emit(0xd4200000);
+    let global_labels = code.labels.len();
+    let import_key = cache.as_ref().map(|_| fingerprint::digest((&code.foreign_slots, code.import_count, &code.callbacks, &code.static_slots)));
     for (i, f) in program.functions.iter().enumerate() {
-        if !reachable[i] {
+        if !reachable[i] || f.external.is_some() {
             continue;
         }
         code.return_slot = f.return_slot;
         code.owned_storage = f.owned_storage.clone();
         code.mark(code.functions[i]);
-        code.prologue(f.slots * 8);
+        let recording = if let Some(cache) = &mut cache {
+            let path = cache.path(i, program, import_key.as_ref().unwrap());
+            if cache::restore(&mut code, &path, global_labels).is_some() {
+                cache.stats.hits += 1;
+                continue;
+            }
+            cache.stats.misses += 1;
+            Some((path, cache::Mark::new(&mut code)))
+        } else { None };
+        code.locals = optimize::LocalPlan::new(f, &code.leaves, target, &program.types);
+        code.prologue((f.slots + code.locals.inline_slots) * 8);
+        for reg in code.locals.registers() {
+            code.push(reg);
+        }
         if let Some(slot) = f.return_slot {
             code.store(slot, 8);
         }
@@ -1306,33 +1396,34 @@ pub fn compile_entry_for(
                 code.store(f.param_slots[param], 0);
             }
         }
+        if let Some(slot) = code.locals.array_parameter {
+            code.load(slot);
+            code.ldr(14, 0); // immutable descriptor data pointer
+            code.emit(0xf940040f); // ldr x15,[x0,#8] -- its live element count
+        }
         code.stmts(&f.body);
         code.release_owned_storage();
         code.imm(0, 0);
-        code.epilogue();
+        code.function_epilogue();
+        code.locals = optimize::LocalPlan::default();
+        if let Some((path, start)) = recording { cache::save(&mut code, start, &path, global_labels).map_err(|e| format!("saving function cache: {e}"))?; }
     }
+    code.callback_entries(program);
     code.runtime();
     code.collections_runtime();
-    if uses_macos {
-        code.mac_runtime();
-        code.import_thunks();
-    }
-    if uses_vulkan {
-        code.vulkan_runtime();
-        code.import_thunks();
-    }
     code.data_start = code.words.len();
     code.string_literals();
     let text = code.finish()?;
     Ok(match target {
-        Target::Arm64Macos if uses_macos => image::macho_dynamic(&text, &["_dlopen", "_dlsym"]),
+        Target::Arm64Macos if dynamic => image::macho_imports_with_storage(&text, &imports, global_bytes),
         Target::Arm64Macos => macho(&text),
-        Target::Arm64Linux if uses_vulkan => {
-            elf::dynamic_executable(&text, 183, &["dlopen", "dlsym"], 4096)
+        Target::Arm64Linux if dynamic => {
+            elf::dynamic_executable(&text, 183, &imports, global_bytes.max(4096))
         }
-        Target::X86_64Linux if uses_vulkan => {
-            elf::dynamic_executable(&text, 62, &["dlopen", "dlsym"], 4096)
+        Target::X86_64Linux if dynamic => {
+            elf::dynamic_executable(&text, 62, &imports, global_bytes.max(4096))
         }
+        Target::Wasm32 => unreachable!("wasm32 uses its structured backend"),
         Target::Arm64Linux => elf::executable(&text, 183),
         Target::X86_64Linux => elf::executable(&text, 62),
     })
@@ -1361,12 +1452,7 @@ fn arguments(types: &[Type], layouts: &Types) -> (Vec<Argument>, usize) {
             general += 1;
             continue;
         }
-        let size = match ty {
-            Type::Bool => 1,
-            Type::I32 | Type::Rune | Type::F32 => 4,
-            _ if layouts.scalar_enum(*ty) => 4,
-            _ => 8,
-        };
+        let size = layouts.scalar_size(*ty);
         next = align(next, size);
         locations.push(Argument::Stack(next));
         next += size;

@@ -262,7 +262,7 @@ pub(super) fn define_enums(
                 next = i128::from(tag) + 1;
                 let mut fields = Vec::new();
                 for field in &variant.fields {
-                    let ty = resolve_type(types, symbols, *field, variant.span)
+                    let ty = resolve_unvalidated(types, symbols, *field, variant.span)
                         .map_err(|e| e.in_file(module))?;
                     fields.push(ast::RecordField {
                         name: String::new(),
@@ -312,10 +312,19 @@ fn layout(ty: Type, types: &mut Types, active: &mut Vec<Type>, span: Span) -> Re
         let mut offset = 0;
         let mut alignment = 1;
         let mut fields = record.fields;
+        if record.c_layout && fields.is_empty() {
+            return Err(Error::new(
+                "E0291",
+                span,
+                "a C-layout struct needs at least one field",
+            ));
+        }
         for field in &mut fields {
             let size = layout(field.ty, types, active, span)
                 .map_err(|e| Error::new("E0240", span, e.message))?;
-            let align = if types.storage_bytes(field.ty).is_some() {
+            let align = if record.c_layout {
+                c_alignment(field.ty, types, span)?
+            } else if types.storage_bytes(field.ty).is_some() {
                 8
             } else {
                 size
@@ -334,6 +343,7 @@ fn layout(ty: Type, types: &mut Types, active: &mut Vec<Type>, span: Span) -> Re
         }
         active.pop();
         let bytes = (offset.max(1) + alignment - 1) & !(alignment - 1);
+        types.set_record_alignment(ty, alignment);
         types.define_record(ty, fields, bytes);
         return Ok(bytes);
     }
@@ -388,9 +398,27 @@ fn layout(ty: Type, types: &mut Types, active: &mut Vec<Type>, span: Span) -> Re
         return Ok(bytes.max(1));
     }
     match ty {
+        _ if ty.unsigned() || matches!(ty, Type::Ptr | Type::ExternFunction(_)) => {
+            Ok(types.scalar_size(ty))
+        }
         Type::Bool => Ok(1),
         Type::I32 | Type::F32 | Type::Rune => Ok(4),
         Type::I64 | Type::F64 | Type::String | Type::Function(_) => Ok(8),
         _ => Err(Error::new("E0270", span, "unsupported enum payload type")),
     }
+}
+
+fn c_alignment(ty: Type, types: &Types, span: Span) -> Result<usize, Error> {
+    if ty.numeric() || matches!(ty, Type::Ptr | Type::ExternFunction(_)) {
+        return Ok(types.scalar_size(ty));
+    }
+    if let Some(a) = types.array(ty) {
+        if a.len > 0 {
+            return c_alignment(a.elem, types, span);
+        }
+    }
+    if let Some(record) = types.record(ty).filter(|r| r.c_layout) {
+        return Ok(record.alignment);
+    }
+    Err(Error::new("E0291", span, "C-layout fields must be numeric, ptr, extern fn, a nonempty fixed array of C scalars, or a C-layout struct"))
 }

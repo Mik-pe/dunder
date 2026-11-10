@@ -193,6 +193,7 @@ impl Code<'_> {
     fn sys_pack_runtime(&mut self) {
         self.mark(self.sys.pack);
         self.prologue(64);
+        self.store(0, 2); // packed []u8 or validated []i32
         self.ldr(1, 0);
         self.store(1, 1);
         self.add_imm(0, 0, 8);
@@ -214,6 +215,10 @@ impl Code<'_> {
         self.mov(12, 0);
         let copy = self.label();
         let copied = self.label();
+        self.load(0);
+        self.branch(copy, Branch::Zero(0));
+        self.copy_bytes(11, 10, 12, 13);
+        self.branch(copied, Branch::Jump);
         self.mark(copy);
         self.branch(copied, Branch::Zero(12));
         self.mov(0, 10);
@@ -249,6 +254,10 @@ impl Code<'_> {
         if let Some(storage) = storage {
             self.local_addr(storage);
             self.mov(8, 9);
+        }
+        if matches!(op, SysOp::DecodeUtf8 | SysOp::WriteBytes) {
+            let array = self.types.value_type(args.last().unwrap().ty);
+            self.imm(2, u64::from(self.types.dynamic_elem(array) == Some(Type::U8)));
         }
         self.branch(self.sys.calls[index(op)], Branch::Call);
         if let Some(storage) = storage {
@@ -378,6 +387,7 @@ impl Code<'_> {
         self.emit(match self.target {
             Target::Arm64Macos => 0x79400920,  // ldrh w0,[x9,#4]
             Target::Arm64Linux => 0xb9401120,  // ldr w0,[x9,#16]
+            Target::Wasm32 => unreachable!("native syscall lowering"),
             Target::X86_64Linux => 0xb9401920, // ldr w0,[x9,#24]
         });
     }

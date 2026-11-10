@@ -154,7 +154,7 @@ fn elf_segments(image: &[u8]) -> Vec<(u32, u32, &[u8])> {
 }
 
 #[test]
-fn vulkan_types_are_nominal_and_intrinsics_require_the_bundled_module() {
+fn vulkan_types_are_nominal_and_legacy_intrinsics_are_unavailable() {
     let project = Project::new();
     fs::write(project.0.join("vulkan.ddr"), "pub fn answer()->i32{42}").unwrap();
     let checked = project.checked(r#"
@@ -163,8 +163,7 @@ import std.vulkan as other
 import .vulkan as local
 fn main(){color:other.Color=vk.rgb(1.0,0.0,0.0);window:other.Window=vk.Window{id:0};print(color.alpha==1.0);print(window.id);print(local.answer())}
 "#);
-    assert_eq!(checked.sources.files.len(), 3);
-    assert!(checked.program.vulkan_types.is_some());
+    assert_eq!(checked.sources.files.iter().filter(|s| s.path.to_string_lossy() == "<stdlib/vulkan.ddr>").count(), 1);
     for (source, code) in [
         ("import std.vulkan as vk\nfn main(){r:=vk.open_headless(1,true)}", "E0201"),
         ("import std.vulkan as vk\nfn main(){r:=vk.open_headless(1)}", "E0207"),
@@ -187,7 +186,7 @@ fn geometry_and_unreachable_vulkan_calls_remain_portable_and_static() {
     let project = Project::new();
     let geometry = r#"import std.vulkan as vk
 fn main(){var v:[]f32=[];vk.quad(&mut v,-1.0,-1.0,2.0,2.0,vk.rgb(1.0,0.0,0.0));print(v.len)}"#;
-    for target in Target::ALL {
+    for target in Target::NATIVE {
         let geometry_image = project.compile(geometry, target);
         let plain = project.compile("fn main(){print(42)}", target);
         let unused = project.compile("import std.vulkan as vk\nfn unused(){r:=vk.open_headless(16,16)}\nfn main(){print(42)}", target);
@@ -406,4 +405,73 @@ fn main()->i32 {{
         let output = Project::new().execute_status(&source, &[], status, 5);
         assert_eq!(output.stdout, b"opened\n");
     }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn sdl_surface_and_events_round_trip_through_the_public_window_api() {
+    if !std::env::var_os("DUNDER_SDL_TEST").is_some_and(|value| value == "1") {
+        return;
+    }
+    let result = Project::new().execute_with(
+        r#"capability unsafe
+import std.vulkan as vk
+
+@extern("libSDL2-2.0.so.0", "SDL_GetWindowFromID")
+unsafe fn find_window(id: u32) -> ptr
+@extern("libSDL2-2.0.so.0", "SDL_GetWindowSurface")
+unsafe fn surface(window: ptr) -> ptr
+@extern("libSDL2-2.0.so.0", "SDL_ConvertSurfaceFormat")
+unsafe fn convert(surface: ptr, format: u32, flags: u32) -> ptr
+@extern("libSDL2-2.0.so.0", "SDL_FreeSurface")
+unsafe fn free_surface(surface: ptr)
+@extern("libSDL2-2.0.so.0", "SDL_PushEvent")
+unsafe fn push(event: ptr) -> i32
+
+@c_layout
+struct Surface { flags: u32, format: ptr, width: i32, height: i32, pitch: i32, pixels: ptr }
+unsafe fn first_pixel(s: &Surface) -> u32 {
+    assert(s.width == 64 && s.height == 48 && s.pitch >= s.width * 4)
+    load_u32(s.pixels)
+}
+
+fn main() {
+    r := vk.open("SDL pixel test", 64, 48)
+    if !r.ok { print(r.error); assert(false) }
+    w := r.window
+    var vertices: []f32 = []
+    assert(vk.draw(w, &vertices, 1.0, 0.0, 0.0).ok)
+    unsafe {
+        var id: u32 = 1
+        while find_window(id) == ptr(0) && id < 256 { id = id + 1 }
+        native := find_window(id)
+        assert(native != ptr(0))
+        // Convert the SDL window surface to ABGR8888 (RGBA bytes on Linux).
+        pixels := convert(surface(native), 376840196, 0)
+        assert(pixels != ptr(0))
+        assert(first_pixel(ref_at(pixels)) == 4278190335)
+        free_surface(pixels)
+
+        var event: [u32; 14] = [0; 14]
+        event[0] = 768
+        event[2] = id
+        event[5] = 99
+        assert(push(addr(&event[0])) == 1)
+        var seen := false
+        for i in 0..16 {
+            frame := vk.poll(w)
+            if frame.key == 99 { seen = true; break }
+        }
+        assert(seen)
+        event[0] = 256
+        assert(push(addr(&event[0])) == 1)
+        for i in 0..16 { if vk.poll(w).closed { break } }
+        assert(vk.poll(w).closed)
+        assert(!vk.draw(w, &vertices, 0.0, 0.0, 0.0).ok)
+    }
+    vk.close(w)
+    print("SDL surface and events ok")
+}
+"#, &[("SDL_VIDEODRIVER", "dummy")]);
+    assert_eq!(result.stdout, b"SDL surface and events ok\n");
 }

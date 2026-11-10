@@ -1,25 +1,40 @@
 import lexer
 import arm64 as arm
+import ffi_arm64 as abi
+import x86
 import std.map as map
 import std.parse as parse
 import runtime
+import unsigned
+import scratch
+import decimal
+import floats
+import bundled
+import wasm_emit as wasm
 
 // Native Dunder compiler. Values use eight-byte cells; aggregates have value semantics.
 // Primitive IDs: ()=0, i32=1, i64=2, bool=3, string=4, rune=5.
-pub struct Result { ok: bool, error: string, offset: i32, text: []i32 }
+pub struct Imports { libraries: []string, symbols: []string, sites: []i32, slots: []i32 }
+fn imports() -> Imports { Imports { libraries: [], symbols: [], sites: [], slots: [] } }
+pub struct Result { ok: bool, error: string, offset: i32, text: []u8, imports: Imports }
 struct Compiler {
     tokens: lexer.Tokens, closes: []i32, block_end: i32, tail: bool, block_depth: i32, cursor: i32, ok: bool, error: string, error_at: i32,
+    test_functions: []bool, testing: bool,
     functions: map.Map, names: []string, starts: []i32, ends: []i32, returns: []i32,
     param_starts: []i32, param_counts: []i32, param_names: []string, param_types: []i32,
-    code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
-    type_names: []string, type_kinds: []i32, type_bases: []i32, type_starts: []i32, type_counts: []i32, type_clones: []i32,
-    field_names: []string, field_types: []i32, field_values: []i64, address: i32, writable: bool,
+    wasm: wasm.Code, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
+    imports: Imports, libraries: []string, symbols: []string, unsafe_functions: []bool,
+    unsafe_capable: bool, unsafe_scope: bool, inline_place: bool, c_record: []bool, c_sizes: []i32, c_aligns: []i32,
+    ffi_types: []i32, ffi_params: []i32,
+    type_names: []string, type_kinds: []i32, type_bases: []i32, type_starts: []i32, type_counts: []i32, type_clones: []i32, type_drops: []i32,
+    field_names: []string, field_types: []i32, field_values: []i64, payload_starts: []i32, payload_counts: []i32, payload_types: []i32, address: i32, writable: bool, scratch_place: i32,
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
+    cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool, loop_owners: []i32,
     scope: i32, slots: i32, ret_type: i32, depth: i32,
     loop_heads: []i32, loop_ends: []i32,
     strings: []string, string_labels: []i32,
     print_int: i32, print_bool: i32, print_text: i32, write: i32,
-    overflow: i32, zero: i32, assertion: i32, io: i32, bounds: i32,
+    float_source: bool, float_trap: i32, overflow: i32, zero: i32, assertion: i32, io: i32, bounds: i32,
 }
 fn peek(c: &Compiler) -> string { c.tokens.texts[c.cursor] }
 fn is(c: &Compiler, word: string) -> bool { c.tokens.kinds[c.cursor] != .String && c.tokens.kinds[c.cursor] != .Rune && peek(&c) == word }
@@ -29,7 +44,7 @@ fn eat(c: &mut Compiler, word: string) -> bool { if is(&c, word) { consumed := a
 fn expect(c: &mut Compiler, word: string) { if !eat(&mut c, word) { fail(&mut c, "expected '" + word + "'") } }
 fn separators(c: &mut Compiler) { while c.ok && (is(&c, "\n") || is(&c, ";")) { skipped := advance(&mut c) } }
 fn newlines(c: &mut Compiler) { while c.ok && is(&c, "\n") { skipped := advance(&mut c) } }
-fn reserved(name: string) -> bool { name == "print" || name == "assert" || name == "i32" || name == "i64" || name == "bool" || name == "string" || name == "len" || name == "f32" || name == "f64" || name == "rune" || name == "range" }
+fn reserved(name: string) -> bool { name == "print" || name == "assert" || name == "i32" || name == "i64" || name == "bool" || name == "string" || name == "len" || name == "f32" || name == "f64" || name == "rune" || name == "range" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "usize" }
 fn identifier(name: string) -> bool {
     if name.len == 0 { return false }
     for i in 0..name.len {
@@ -41,16 +56,17 @@ fn identifier(name: string) -> bool {
 }
 fn add_type(c: &mut Compiler, name: string, kind: i32, base: i32) -> i32 {
     id := c.type_names.len
+    c.c_record.push(false); c.c_sizes.push(0); c.c_aligns.push(0)
     c.type_names.push(name); c.type_kinds.push(kind); c.type_bases.push(base)
-    c.type_starts.push(0); c.type_counts.push(0); c.type_clones.push(arm.label(&mut c.code))
+    c.type_starts.push(0); c.type_counts.push(0); c.type_clones.push(arm.label(&mut c.code)); c.type_drops.push(arm.label(&mut c.code))
     id
 }
 fn compound(c: &mut Compiler, kind: i32, base: i32) -> i32 {
-    if kind == 1 && (collection(&c, base) || c.type_kinds[base] == 2) { fail(&mut c, "arrays of aggregate elements are not supported by this compiler") }
+    if kind == 1 && (collection(&c, base) || c.type_kinds[base] == 2 || c.type_kinds[base] == 4 || c.type_kinds[base] == 5) { fail(&mut c, "arrays of aggregate elements are not supported by this compiler") }
     for i in 0..c.type_names.len { if c.type_kinds[i] == kind && c.type_bases[i] == base { return i } }
     add_type(&mut c, "", kind, base)
 }
-fn collection(c: &Compiler, ty: i32) -> bool { c.type_kinds[ty] == 1 || c.type_kinds[ty] == 6 }
+fn collection(c: &Compiler, ty: i32) -> bool { c.type_kinds[ty] == 1 || c.type_kinds[ty] == 6 || c.type_kinds[ty] == 10 }
 fn length_literal(c: &mut Compiler) -> i32 {
     if c.tokens.kinds[c.cursor] != .Integer { fail(&mut c, "expected nonnegative array length"); return 0 }
     length := parse.integer(advance(&mut c))
@@ -58,7 +74,7 @@ fn length_literal(c: &mut Compiler) -> i32 {
     i32(length.value)
 }
 fn fixed(c: &mut Compiler, base: i32, length: i32) -> i32 {
-    if collection(&c, base) || c.type_kinds[base] == 2 { fail(&mut c, "arrays of aggregate elements are not supported by this compiler") }
+    if collection(&c, base) || c.type_kinds[base] == 2 || c.type_kinds[base] == 4 || c.type_kinds[base] == 5 { fail(&mut c, "arrays of aggregate elements are not supported by this compiler") }
     for i in 0..c.type_names.len {
         if c.type_kinds[i] == 6 && c.type_bases[i] == base && c.type_counts[i] == length { return i }
     }
@@ -68,7 +84,32 @@ fn type_id(c: &Compiler, name: string) -> i32 {
     for i in 0..c.type_names.len { if c.type_names[i] == name { return i } }
     -1
 }
+// Function pointers are structural: declarations and annotations share IDs.
+fn foreign_type(c: &mut Compiler, args: &[]i32, result: i32) -> i32 { callable_type(&mut c, &args, result, 8) }
+fn callable_type(c: &mut Compiler, args: &[]i32, result: i32, kind: i32) -> i32 {
+    for ty in args { if kind == 8 && !foreign_scalar(&c, ty) && !c.c_record[ty] { fail(&mut c, "C calls require scalar parameters or a record pointer"); return 0 } }
+    if kind == 8 && result != 0 && !foreign_scalar(&c, result) && !c.c_record[result] { fail(&mut c, "C calls require scalar return types"); return 0 }
+    for t in 0..c.type_names.len {
+        if c.type_kinds[t] == kind && c.type_bases[t] == result && c.type_counts[t] == args.len {
+            var equal := true
+            for i in 0..args.len { if c.ffi_params[c.type_starts[t] + i] != args[i] { equal = false } }
+            if equal { return t }
+        }
+    }
+    t := add_type(&mut c, "", kind, result)
+    c.type_starts[t] = c.ffi_params.len; c.type_counts[t] = args.len
+    for arg in args { c.ffi_params.push(arg) }
+    t
+}
 fn type_name(c: &mut Compiler) -> i32 {
+    if is(&c, "fn") || is(&c, "extern") {
+        var kind := 9; if eat(&mut c, "extern") { kind = 8 }; expect(&mut c, "fn"); expect(&mut c, "(")
+        var args: []i32 = []
+        while c.ok && !is(&c, ")") { v := type_name(&mut c); args.push(v); if !eat(&mut c, ",") { break } }
+        expect(&mut c, ")"); var ret := 0
+        if eat(&mut c, "->") { ret = type_name(&mut c) }
+        return callable_type(&mut c, &args, ret, kind)
+    }
     if eat(&mut c, "&") { var kind := 4; if eat(&mut c, "mut") { kind = 5 }; base := type_name(&mut c); return compound(&mut c, kind, base) }
     if eat(&mut c, "[") {
         if eat(&mut c, "]") { base := type_name(&mut c); return compound(&mut c, 1, base) }
@@ -98,12 +139,46 @@ fn address_slot(c: &mut Compiler, index: i32) {
     }
     arm.imm(&mut c.code, 0, i64(index + 1) * 8); arm.emit(&mut c.code, 3405775776)
 }
-fn save_address(c: &mut Compiler) { c.address = slot(&mut c); arm.store(&mut c.code, c.address, 0) }
+fn save_address(c: &mut Compiler) { c.inline_place = false; c.address = slot(&mut c); arm.store(&mut c.code, c.address, 0) }
+fn owned(c: &Compiler, ty: i32) -> bool { ty == 4 || collection(&c, ty) || c.type_kinds[ty] == 2 || c.type_kinds[ty] == 7 }
 fn copy_value(c: &mut Compiler, ty: i32) {
-    if collection(&c, ty) { arm.branch(&mut c.code, c.runtime.array_clone, 1) }
-    else if c.type_kinds[ty] == 2 { arm.branch(&mut c.code, c.type_clones[ty], 1) }
+    if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch values cannot escape the region");return}
+    if ty == 4 || c.type_kinds[ty] == 7 { arm.branch(&mut c.code, c.runtime.retain, 1) }
+    else if owned(&c, ty) { arm.branch(&mut c.code, c.type_clones[ty], 1) }
+}
+fn drop_value(c: &mut Compiler, ty: i32) {
+    if ty == 4 { arm.branch(&mut c.code, c.runtime.release, 1) }
+    else if owned(&c, ty) { arm.branch(&mut c.code, c.type_drops[ty], 1) }
+}
+fn remember_owner(c: &mut Compiler, index: i32, ty: i32, temporary: bool) {
+    c.owned_slots.push(index); c.owned_types.push(ty); c.owner_temps.push(temporary)
+}
+fn clear_owner(c: &mut Compiler, index: i32, ty: i32) {
+    arm.load(&mut c.code, index); drop_value(&mut c, ty); arm.store(&mut c.code, index, 31)
+}
+// Transfer an owned expression into a frame slot, including on loop re-entry.
+fn save_owner(c: &mut Compiler, index: i32, ty: i32, temporary: bool) {
+    remember_owner(&mut c, index, ty, temporary)
+    arm.push(&mut c.code, 0); clear_owner(&mut c, index, ty); arm.pop(&mut c.code, 0); arm.store(&mut c.code, index, 0)
+}
+fn temporary(c: &mut Compiler, ty: i32) -> i32 {
+    if owned(&c, ty) { index := slot(&mut c); save_owner(&mut c, index, ty, true) }
+    ty
+}
+fn cleanup_from(c: &mut Compiler, first: i32, only_temps: bool) {
+    var i := c.owned_slots.len - 1
+    while i >= first {
+        if !only_temps || c.owner_temps[i] { clear_owner(&mut c, c.owned_slots[i], c.owned_types[i]) }
+        i = i - 1
+    }
 }
 fn skip_body(c: &mut Compiler) { expect(&mut c, "{"); c.cursor = c.closes[c.cursor - 1] + 1 }
+fn foreign_scalar(c: &Compiler, ty: i32) -> bool { ty == 1 || ty == 2 || (ty >= 6 && ty <= 13) || c.type_kinds[ty] == 8 }
+fn valid_foreign_name(value: string) -> bool {
+    if value.len == 0 { return false }
+    for i in 0..value.len { if value[i] == 0 { return false } }
+    true
+}
 fn headers(c: &mut Compiler) {
     var stack: []i32 = []
     for i in 0..c.tokens.kinds.len {
@@ -116,26 +191,54 @@ fn headers(c: &mut Compiler) {
     // Register every nominal type before parsing fields or function signatures.
     var declarations: []i32 = []; var declaration_types: []i32 = []
     separators(&mut c)
+    if eat(&mut c, "capability") {
+        expect(&mut c, "unsafe"); c.unsafe_capable = true; separators(&mut c)
+    }
     while c.ok && c.tokens.kinds[c.cursor] != .End {
+        var library := ""; var symbol := ""; var layout := false; var test := false
         if eat(&mut c, "@") {
             annotation := advance(&mut c)
+            if annotation == "extern" {
+                expect(&mut c, "(")
+                if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "expected an extern library") }
+                library = advance(&mut c); expect(&mut c, ",")
+                if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "expected an extern symbol") }
+                symbol = advance(&mut c); expect(&mut c, ")")
+                if !valid_foreign_name(library) || !valid_foreign_name(symbol) { fail(&mut c, "invalid external library or symbol") }
+            } else if annotation == "c_layout" { layout = true }
+            else if annotation == "test" { test = true }
+            else { fail(&mut c, "unknown declaration attribute"); break }
+            newlines(&mut c)
             if is(&c, "{") { skip_body(&mut c); separators(&mut c); continue }
         }
         public := eat(&mut c, "pub")
+        unchecked := eat(&mut c, "unsafe")
+        if unchecked && !c.unsafe_capable { fail(&mut c, "module requires capability unsafe"); break }
+        if library != "" && !unchecked { fail(&mut c, "@extern requires unsafe fn"); break }
         what := advance(&mut c)
         if what != "fn" && what != "struct" && what != "enum" { fail(&mut c, "expected fn, struct or enum (imports must be loaded first)"); break }
         name := advance(&mut c)
+        if (layout && what != "struct") || (unchecked && what != "fn") { fail(&mut c, "invalid declaration attribute"); break }
         declarations.push(c.cursor)
         var ty := -1
         if what != "fn" {
             if type_id(&c, name) >= 0 { fail(&mut c, "duplicate type") }
             var kind := 2; if what == "enum" { kind = 3 }
-            ty = add_type(&mut c, name, kind, 0)
+            ty = add_type(&mut c, name, kind, 0); c.c_record[ty] = layout
         } else {
             if map.contains(&c.functions, name) || reserved(name) { fail(&mut c, "duplicate or reserved function name") }
+            c.test_functions.push(test)
+            c.libraries.push(library); c.symbols.push(symbol); c.unsafe_functions.push(unchecked)
             map.put(&mut c.functions, name, i64(c.names.len)); c.names.push(name); c.fn_labels.push(arm.label(&mut c.code)); c.needed.push(false)
         }
         declaration_types.push(ty)
+        if library != "" {
+            while c.ok && !is(&c, "\n") && !is(&c, ";") && c.tokens.kinds[c.cursor] != .End {
+                if is(&c, "{") { fail(&mut c, "external declaration cannot have a body"); break }
+                skipped := advance(&mut c)
+            }
+            separators(&mut c); continue
+        }
         while c.ok && !is(&c, "{") { if c.tokens.kinds[c.cursor] == .End { fail(&mut c, "missing declaration body"); break }; skipped := advance(&mut c) }
         if c.ok { skip_body(&mut c); separators(&mut c) }
     }
@@ -146,12 +249,30 @@ fn headers(c: &mut Compiler) {
             expect(&mut c, "{"); c.type_starts[ty] = c.field_names.len; separators(&mut c)
             var tag: i64 = 0
             while c.ok && !is(&c, "}") {
-                name := advance(&mut c); var ft := 0
-                if c.type_kinds[ty] == 2 { expect(&mut c, ":"); ft = type_name(&mut c) }
+                name := advance(&mut c); var ft := 0; payload := c.payload_types.len
+                if c.type_kinds[ty] == 2 { expect(&mut c, ":"); ft = type_name(&mut c); if c.type_kinds[ft] == 4 || c.type_kinds[ft] == 5 { fail(&mut c, "a field cannot store a borrow") } }
                 else {
-                    if eat(&mut c, "(") { while c.ok && !eat(&mut c, ")") { skipped := advance(&mut c) } }
-                    if eat(&mut c, "=") { value := parse.integer(advance(&mut c)); tag = value.value }
+                    if eat(&mut c, "(") {
+                        c.type_kinds[ty] = 7
+                        while c.ok {
+                            pt := type_name(&mut c)
+                            if pt == 0 || c.type_kinds[pt] == 4 || c.type_kinds[pt] == 5 { fail(&mut c, "invalid payload type") }
+                            c.payload_types.push(pt)
+                            if !eat(&mut c, ",") { break }
+                        }
+                        expect(&mut c, ")")
+                    }
+                    if eat(&mut c, "=") {
+                        var sign := ""; if eat(&mut c, "-") { sign = "-" }
+                        value := parse.integer(sign + advance(&mut c)); tag = value.value
+                        if !value.ok { fail(&mut c, "invalid enum tag") }
+                    }
+                    if tag < -2147483648 || tag > 2147483647 { fail(&mut c, "enum tag out of range") }
+                    for prior in c.type_starts[ty]..c.field_names.len {
+                        if c.field_names[prior] == name || c.field_values[prior] == tag { fail(&mut c, "duplicate enum variant or tag") }
+                    }
                 }
+                c.payload_starts.push(payload); c.payload_counts.push(c.payload_types.len - payload)
                 c.field_names.push(name); c.field_types.push(ft); c.field_values.push(tag); tag = tag + 1
                 if !eat(&mut c, ",") { separators(&mut c); if !is(&c, "}") { fail(&mut c, "expected field comma") } }; separators(&mut c)
             }
@@ -164,7 +285,19 @@ fn headers(c: &mut Compiler) {
                 if !eat(&mut c, ",") { break }
             }
             expect(&mut c, ")"); c.param_starts.push(first); c.param_counts.push(c.param_names.len - first)
-            var ret := 0; if eat(&mut c, "->") { ret = type_name(&mut c) }; c.returns.push(ret)
+            var ret := 0; if eat(&mut c, "->") { ret = type_name(&mut c); if c.type_kinds[ret] == 4 || c.type_kinds[ret] == 5 { fail(&mut c, "a function cannot return a borrow") } }; c.returns.push(ret)
+            f := c.returns.len - 1
+            if c.test_functions[f] && (c.param_counts[f] != 0 || ret != 0) { fail(&mut c, "@test function must take no parameters and return ()") }
+            if c.libraries[f] != "" {
+                var args: []i32 = []
+                for p in first..c.param_names.len { args.push(c.param_types[p]) }
+                ft := foreign_type(&mut c, &args, ret); c.ffi_types.push(ft)
+                if !is(&c,"\n") && !is(&c,";") && c.tokens.kinds[c.cursor] != .End { fail(&mut c,"unexpected token after external declaration") }
+                c.starts.push(0); c.ends.push(0); continue
+            }
+            var ordinary_args: []i32 = []
+            for p in first..c.param_names.len { ordinary_args.push(c.param_types[p]) }
+            signature := callable_type(&mut c, &ordinary_args, ret, 9); c.ffi_types.push(signature)
             newlines(&mut c); expect(&mut c, "{"); c.starts.push(c.cursor); c.ends.push(c.closes[c.cursor - 1])
             if ret != 0 { newlines(&mut c); if is(&c, "}") { fail(&mut c, "function can finish without returning a value") } }
         }
@@ -190,17 +323,43 @@ fn enter(c: &mut Compiler) { c.scope = c.scope + 1 }
 fn leave(c: &mut Compiler) {
     while c.local_names.len > 0 && c.local_scopes[c.local_scopes.len - 1] == c.scope {
         name := c.local_names.pop(); ty := c.local_types.pop(); mutable := c.local_mutable.pop(); index := c.local_slots.pop(); scope := c.local_scopes.pop()
+        if owned(&c, ty) { clear_owner(&mut c, index, ty) }
     }
     c.scope = c.scope - 1
 }
 fn narrow(c: &mut Compiler) {
     arm.emit(&mut c.code, 2470476802); arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.overflow, 3)
 }
+fn float_literal(c: &mut Compiler, spelling: string, expected: i32) -> i32 {
+    var ty := 7; if expected == 6 { ty = 6 }
+    value := decimal.decode(spelling, ty == 6)
+    if !value.ok { fail(&mut c, "floating literal is outside the finite range") }
+    if c.code.platform == 3 { wasm.constant(&mut c.wasm, value.bits) }
+    arm.imm(&mut c.code, 0, value.bits); ty
+}
+fn format_float(c: &mut Compiler, ty: i32) {
+    if ty == 6 { arm.imm(&mut c.code, 1, 1) } else { arm.imm(&mut c.code, 1, 0) }
+    id := i32(map.get_or(&c.functions, "__dunder_module_format_float_bits", -1))
+    if id < 0 { fail(&mut c, "missing floating formatter"); return }
+    c.needed[id] = true
+    arm.branch(&mut c.code, c.fn_labels[id], 1)
+}
 fn literal(c: &mut Compiler, spelling: string, expected: i32) -> i32 {
+    if floats.has(expected) { return float_literal(&mut c, spelling, expected) }
+    if unsigned.has(expected) {
+        number := unsigned.literal(spelling, expected)
+        if !number.ok { fail(&mut c, "unsigned integer literal out of range"); return expected }
+        if c.code.platform == 3 {
+            if expected == 12 && (number.value < 0 || number.value > 4294967295) { fail(&mut c, "usize literal exceeds wasm32 pointer width") }; wasm.constant(&mut c.wasm, number.value)
+        }
+        arm.imm(&mut c.code, 0, number.value)
+        return expected
+    }
     value := parse.integer(spelling)
     var ty := 1
     if expected == 2 { ty = 2 }
     if !value.ok || (ty == 1 && (value.value < -2147483648 || value.value > 2147483647)) { fail(&mut c, "integer literal out of range"); return ty }
+    if c.code.platform == 3 { wasm.constant(&mut c.wasm, value.value) }
     arm.imm(&mut c.code, 0, value.value)
     ty
 }
@@ -212,12 +371,16 @@ fn intrinsic(c: &mut Compiler, name: string, expected: i32) -> i32 {
     else if name == "__sys_read_text" { target = c.runtime.sys_read_text }
     else if name == "__sys_metadata" { target = c.runtime.sys_metadata }
     else if name == "__sys_same_file" { target = c.runtime.sys_same_file; ret = 3 }
-    else if name == "__sys_write_bytes" { target = c.runtime.sys_write_bytes }
+    else if name == "__sys_write_bytes" || name == "__sys_write_u8" { target = c.runtime.sys_write_bytes }
     else if name == "__sys_make_executable" { target = c.runtime.sys_make_executable }
     else if name == "__sys_rename" { target = c.runtime.sys_rename }
     else if name == "__sys_remove_file" { target = c.runtime.sys_remove_file }
-    else if name == "__sys_decode_utf8" { target = c.runtime.sys_decode_utf8 }
+    else if name == "__sys_decode_utf8" || name == "__sys_decode_u8" { target = c.runtime.sys_decode_utf8 }
     else if name == "__sys_write_stderr" { target = c.runtime.sys_stderr }
+    else if name == "__sys_write_text" { target = c.runtime.sys_write_text }
+    else if name == "__sys_append_text" { target = c.runtime.sys_append_text }
+    else if name == "__sys_mkdir" { target = c.runtime.sys_mkdir }
+    else if name == "__sys_remove_dir" { target = c.runtime.sys_remove_dir }
     if target < 0 { fail(&mut c, "unsupported intrinsic '" + name + "'"); return 0 }
     var count := 0
     while c.ok && !is(&c, ")") {
@@ -230,34 +393,334 @@ fn intrinsic(c: &mut Compiler, name: string, expected: i32) -> i32 {
     var i := count - 1; while i >= 0 { arm.pop(&mut c.code, i); i = i - 1 }
     arm.branch(&mut c.code, target, 1); ret
 }
+fn length_value(c: &mut Compiler, ty: i32) -> i32 {
+    if collection(&c, ty) || c.type_kinds[ty]==21 { load_mem(&mut c, 0, 0, 8) }
+    else if ty == 4 { load_mem(&mut c, 0, 0, 0) }
+    else { fail(&mut c, "len expects an array or string") }
+    1
+}
+// Record only referenced imports and leave one page-relative GOT load for the image writer.
+fn import_address(c: &mut Compiler, f: i32) {
+    library := c.libraries[f]; symbol := c.symbols[f]
+    var index := 0
+    while index < c.imports.symbols.len {
+        if c.imports.symbols[index] == symbol && c.imports.libraries[index] == library { break }
+        index = index + 1
+    }
+    if index == c.imports.symbols.len { c.imports.libraries.push(library); c.imports.symbols.push(symbol) }
+    c.imports.sites.push(c.code.words.len * 4); c.imports.slots.push(index)
+    arm.emit(&mut c.code, 0); arm.emit(&mut c.code, 0); arm.mov(&mut c.code, 0, 16)
+}
+// Positive counts denote homogeneous f32 members, negative counts homogeneous f64.
+fn hfa(c: &Compiler, ty: i32, depth: i32) -> i32 {
+    if depth > 64 { return 0 }
+    if ty == 6 { return 1 }; if ty == 7 { return -1 }
+    if c.type_kinds[ty] == 6 {
+        count := c.type_counts[ty]; if count > 4 { return 0 }
+        return count * hfa(&c, c.type_bases[ty], depth + 1)
+    }
+    if !c.c_record[ty] { return 0 }
+    var shape := 0
+    for index in c.type_starts[ty]..c.type_starts[ty] + c.type_counts[ty] {
+        part := hfa(&c, c.field_types[index], depth + 1)
+        if part == 0 || (shape > 0 && part < 0) || (shape < 0 && part > 0) { return 0 }
+        shape = shape + part
+        if shape < -4 || shape > 4 { return 0 }
+    }
+    shape
+}
+fn foreign_width(ty: i32) -> i32 { abi.width(ty) }
+fn transfer_c(c: &mut Compiler, ty: i32, reg: i32, base: i32, load: bool) {
+    if load && ty == 1 { arm.emit(&mut c.code, 3112173568 + i64(base) * 32 + i64(reg)); return }
+    var packed := 11; width := foreign_width(ty)
+    if width == 1 { packed = 8 }; if width == 2 { packed = 9 }; if width == 4 { packed = 10 }
+    unsigned.transfer(&mut c.code, packed, reg, base, load)
+}
+// The callee address is in x0. Stage arguments in frame slots before populating
+// the independent scalar and float register banks, then the aligned stack.
+fn foreign_call(c: &mut Compiler, sig: i32, direct: i32) -> i32 {
+    if !c.unsafe_scope { fail(&mut c, "foreign call requires unsafe"); return 0 }
+    callee := slot(&mut c); if c.code.platform == 3 && direct < 0 { wasm.indexed(&mut c.wasm, 33, callee) }; arm.store(&mut c.code, callee, 0)
+    first := c.type_starts[sig]; count := c.type_counts[sig]
+    var values: []i32 = []; var locations: []i32 = []
+    var gp_limit := 8; if c.code.platform == 2 { gp_limit = 6 }
+    ret := c.type_bases[sig]
+    var result_slot := -1; var indirect_result := false
+    if c.c_record[ret] {
+        if c.code.platform == 3 || hfa(&c, ret, 0) == 0 { fail(&mut c, "unsupported foreign aggregate result"); return 0 }
+        arm.imm(&mut c.code, 0, i64(c.c_sizes[ret])); arm.branch(&mut c.code, c.runtime.alloc, 1)
+        result_slot = slot(&mut c); arm.store(&mut c.code, result_slot, 0)
+        indirect_result = c.code.platform == 2 && c.c_sizes[ret] > 16
+    }
+    var gp := 0; if indirect_result { gp = 1 }; var fp := 0; var outgoing := 0
+    while c.ok && !is(&c, ")") {
+        if values.len == count { fail(&mut c, "too many C call arguments"); return 0 }
+        want := c.ffi_params[first + values.len]
+        actual := expression(&mut c, 0, want); same(&mut c, want, actual)
+        if c.code.platform == 3 { wasm.host_arg(&mut c.wasm, want) }
+        aggregate := c.c_record[want]
+        if aggregate {
+            if c.code.platform == 3 || hfa(&c, want, 0) == 0 { fail(&mut c, "unsupported foreign aggregate parameter"); return 0 }
+            copy_value(&mut c, want); temp := temporary(&mut c, want)
+        }
+        value := slot(&mut c); arm.store(&mut c.code, value, 0); values.push(value)
+        shape := hfa(&c, want, 0); var need := shape; if shape < 0 { need = -shape }
+        if aggregate && c.code.platform == 2 {
+            need = (c.c_sizes[want] + 7) / 8
+            if need > 2 { need = 9 }
+        }
+        if need > 0 && fp + need <= 8 { locations.push(8 + fp); fp = fp + need }
+        else if need == 0 && gp < gp_limit { locations.push(gp); gp = gp + 1 }
+        else {
+            if need > 0 && c.code.platform != 2 { fp = 8 }
+            var alignment := 8; var width := 8
+            if c.code.platform == 0 { alignment = foreign_width(want); width = alignment }
+            if aggregate {
+                width = c.c_sizes[want]
+                if c.code.platform == 0 { alignment = c.c_aligns[want] } else { width = (width + 7) / 8 * 8 }
+            }
+            outgoing = (outgoing + alignment - 1) / alignment * alignment
+            locations.push(16 + outgoing); outgoing = outgoing + width
+        }
+        if !eat(&mut c, ",") { break }
+    }
+    expect(&mut c, ")"); if count != values.len { fail(&mut c, "wrong C argument count"); return 0 }
+    if c.code.platform == 3 {
+        if direct >= 0 { wasm.host_call(&mut c.wasm, direct, ret) }
+        else {
+            var types: []i32 = []
+            for i in 0..count { types.push(c.ffi_params[first + i]) }
+            wasm.indirect(&mut c.wasm, callee, &types, 0, count, ret)
+        }; return ret
+    }
+    outgoing = (outgoing + 15) / 16 * 16
+    if outgoing > 4080 { fail(&mut c, "C argument frame exceeds direct stack offset"); return 0 }
+    if outgoing > 0 { arm.emit(&mut c.code, 3506439167 + i64(outgoing) * 1024) }
+    arm.load(&mut c.code, callee); arm.mov(&mut c.code, 17, 0)
+    var i := values.len - 1
+    while i >= 0 {
+        where := locations[i]; ty := c.ffi_params[first + i]
+        arm.load(&mut c.code, values[i])
+        if c.c_record[ty] {
+            if where < 16 { abi.hfa(&mut c.code, 0, where - 8, hfa(&c, ty, 0), true) }
+            else {
+                arm.emit(&mut c.code, 2432697321 + i64(where - 16) * 1024)
+                abi.copy(&mut c.code, 9, 0, c.c_sizes[ty])
+            }
+        } else if where < 8 { arm.mov(&mut c.code, where, 0) }
+        else if where < 16 {
+            var opcode: i64 = 2657550336; if ty == 6 { opcode = 505872384 }
+            arm.emit(&mut c.code, opcode + i64(where - 8))
+        } else { arm.emit(&mut c.code, 2432697321 + i64(where - 16) * 1024); transfer_c(&mut c, ty, 0, 9, false) }
+        i = i - 1
+    }
+    if indirect_result { arm.load(&mut c.code, result_slot) }
+    if c.code.platform == 2 { arm.emit(&mut c.code, 4261412864 + i64(gp) * 65536 + i64(fp) * 256 + i64(outgoing / 16)) }
+    else { arm.emit(&mut c.code, 3594453536) } // blr x17
+    if outgoing > 0 { arm.emit(&mut c.code, 2432697343 + i64(outgoing) * 1024) }
+    if c.c_record[ret] {
+        arm.load(&mut c.code, result_slot)
+        if !indirect_result { abi.hfa(&mut c.code, 0, 0, hfa(&c, ret, 0), false) }
+    } else if ret == 1 { arm.emit(&mut c.code, 2470476800) }
+    else if ret == 6 { arm.emit(&mut c.code, 505806848) }
+    else if ret == 7 { arm.emit(&mut c.code, 2657484800) }
+    else if unsigned.has(ret) { unsigned.mask(&mut c.code, ret) }
+    ret
+}
+// Inline C values have platform field alignment. Ordinary records keep their
+// boxed eight-byte fields and the existing ownership representation.
+fn c_layout(c: &mut Compiler, ty: i32) {
+    if !c.ok || c.c_aligns[ty] > 0 { return }
+    if c.c_aligns[ty] < 0 { fail(&mut c, "recursive C layout"); return }
+    c.c_aligns[ty] = -1
+    var size := 0; var alignment := 1
+    if c.c_record[ty] {
+        first := c.type_starts[ty]
+        for field_index in first..first + c.type_counts[ty] {
+            ft := c.field_types[field_index]; c_layout(&mut c, ft)
+            if !c.ok { return }
+            child := c.c_aligns[ft]
+            size = (size + child - 1) / child * child
+            c.field_values[field_index] = i64(size)
+            if child > alignment { alignment = child }
+            size = size + c.c_sizes[ft]
+        }
+        if size == 0 { fail(&mut c, "empty C record"); return }
+        size = (size + alignment - 1) / alignment * alignment
+    } else if c.type_kinds[ty] == 6 {
+        child := c.type_bases[ty]; c_layout(&mut c, child)
+        if !c.ok { return }
+        alignment = c.c_aligns[child]; size = c.type_counts[ty] * c.c_sizes[child]
+    } else if foreign_scalar(&c, ty) || ty == 3 {
+        alignment = foreign_width(ty); size = alignment
+        if c.code.platform == 3 && (ty == 12 || ty == 13 || c.type_kinds[ty] == 8) { size = 4; alignment = 4 }
+    } else { fail(&mut c, "C layouts can contain only unmanaged C fields"); return }
+    c.c_aligns[ty] = alignment; c.c_sizes[ty] = size
+}
+// x0 points at source, x1 at destination. Returns destination in x0.
+fn copy_inline(c: &mut Compiler, bytes: i32) {
+    arm.mov(&mut c.code, 2, 0); arm.mov(&mut c.code, 0, 1)
+    arm.imm(&mut c.code, 3, i64(bytes)); head := arm.label(&mut c.code); done := arm.label(&mut c.code)
+    arm.mark(&mut c.code, head); arm.emit(&mut c.code, 4043309183); arm.branch(&mut c.code, done, 2)
+    arm.emit(&mut c.code, 960495684); arm.emit(&mut c.code, 956301348)
+    arm.emit(&mut c.code, 2432697377); arm.emit(&mut c.code, 2432697410); arm.emit(&mut c.code, 3506439267)
+    arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
+}
+fn zero_record(c: &mut Compiler, ty: i32) {
+    arm.imm(&mut c.code, 0, i64(c.c_sizes[ty])); arm.branch(&mut c.code, c.runtime.alloc, 1)
+    arm.mov(&mut c.code, 1, 0); arm.imm(&mut c.code, 2, i64(c.c_sizes[ty]))
+    head := arm.label(&mut c.code); done := arm.label(&mut c.code); arm.mark(&mut c.code, head)
+    arm.emit(&mut c.code, 4043309151); arm.branch(&mut c.code, done, 2)
+    arm.emit(&mut c.code, 956301375); arm.emit(&mut c.code, 2432697377); arm.emit(&mut c.code, 3506439234)
+    arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
+}
+fn c_offset(c: &mut Compiler, offset: i64) {
+    if offset < 4096 { arm.emit(&mut c.code, 2432696320 + offset * 1024) }
+    else { arm.imm(&mut c.code, 2, offset); arm.emit(&mut c.code, 2332164096) }
+}
+// An inline array gets a stack descriptor for indexing, length and borrows.
+// The surrounding record owns the byte range.
+fn inline_value(c: &mut Compiler, ty: i32) {
+    if c.c_record[ty] { return }
+    if c.type_kinds[ty] != 6 { transfer_c(&mut c, ty, 0, 0, true); return }
+    last := slot(&mut c); cap := slot(&mut c); length := slot(&mut c); data := slot(&mut c)
+    arm.store(&mut c.code, data, 0); arm.imm(&mut c.code, 0, i64(c.type_counts[ty]))
+    arm.store(&mut c.code, length, 0); arm.store(&mut c.code, cap, 0)
+    size := c.c_sizes[c.type_bases[ty]]; var shift := 0
+    while i32(1).shl(shift) < size { shift = shift + 1 }
+    arm.imm(&mut c.code, 0, i64(shift)); arm.store(&mut c.code, last, 0); address_slot(&mut c, data)
+}
+// x0 is an expression value, x1 is a field address. Fixed array values
+// carry a descriptor, which may have an eight-byte legacy element stride.
+fn store_inline(c: &mut Compiler, ty: i32) {
+    if c.c_record[ty] { copy_inline(&mut c, c.c_sizes[ty]); return }
+    if c.type_kinds[ty] == 6 {
+        elem := c.type_bases[ty]; load_mem(&mut c, 2, 0, 24); load_mem(&mut c, 0, 0, 0)
+        arm.imm(&mut c.code, 3, 1); arm.emit(&mut c.code, 2596413539) // lsl x3,x3,x2
+        arm.imm(&mut c.code, 4, i64(c.type_counts[ty])); head := arm.label(&mut c.code); done := arm.label(&mut c.code)
+        arm.mark(&mut c.code, head); arm.emit(&mut c.code, 4043309215); arm.branch(&mut c.code, done, 2)
+        transfer_c(&mut c, elem, 5, 0, true); transfer_c(&mut c, elem, 5, 1, false)
+        arm.emit(&mut c.code, 2332229632); arm.emit(&mut c.code, 2432696353 + i64(c.c_sizes[elem]) * 1024)
+        arm.emit(&mut c.code, 3506439300); arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
+        return
+    }
+    transfer_c(&mut c, ty, 0, 1, false)
+}
+fn require_unsafe(c: &mut Compiler) {
+    if !c.unsafe_scope { fail(&mut c, "operation requires unsafe function or block") }
+}
+fn raw_memory_type(c: &Compiler, name: string, start: i32) -> i32 {
+    if name.len <= start { return -1 }
+    ty := type_id(&c, name[start..name.len])
+    if ty < 0 || !foreign_scalar(&c, ty) { return -1 }; ty
+}
 fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     expect(&mut c, "(")
+    if c.code.platform == 3 && name.len >= 6 && name[0..6] == "__sys_" { fail(&mut c, "native system calls need a native target"); return 0 }
+    if name == "size_of" || name == "align_of" {
+        ty := type_name(&mut c); c_layout(&mut c, ty); expect(&mut c, ")")
+        if name == "size_of" { arm.imm(&mut c.code, 0, i64(c.c_sizes[ty])) } else { arm.imm(&mut c.code, 0, i64(c.c_aligns[ty])) }
+        return 12
+    }
+    if name == "zeroed" {
+        require_unsafe(&mut c); expect(&mut c, ")")
+        if !c.c_record[expected] { fail(&mut c, "zeroed requires a C record"); return 0 }
+        zero_record(&mut c, expected); return expected
+    }
+    if name == "cstr" {
+        require_unsafe(&mut c)
+        if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "cstr needs a string literal"); return 0 }
+        value := peek(&c); for i in 0..value.len { if value[i] == 0 { fail(&mut c, "cstr contains an embedded NUL") } }
+        if c.code.platform == 3 { wasm.c_string(&mut c.wasm, value) }
+        arg := primary_inner(&mut c, 4); expect(&mut c, ")")
+        arm.emit(&mut c.code, 2432704512); return 13
+    }
+    if name == "addr" {
+        if c.code.platform == 3 { fail(&mut c, "selfhost wasm32 cannot take a local address"); return 0 }
+        require_unsafe(&mut c); expect(&mut c, "&"); write := eat(&mut c, "mut")
+        ty := primary(&mut c, 0)
+        if c.scratch_place!=0 {fail(&mut c,"scratch storage cannot become a raw address");return 0}
+        if c.address < 0 || (write && !c.writable) { fail(&mut c, "addr requires a matching stored place"); return 0 }
+        if c.c_record[ty] { expect(&mut c, ")"); return 13 }
+        if c.type_kinds[ty] == 6 { load_mem(&mut c, 0, 0, 0) }
+        else { arm.load(&mut c.code, c.address) }
+        expect(&mut c, ")"); return 13
+    }
+    if name == "ptr" || name == "ffi_fn" || name == "ref_at" {
+        require_unsafe(&mut c); var want := 13; if name == "ptr" { want = 12 }
+        ty := expression(&mut c, 0, want); same(&mut c, want, ty); expect(&mut c, ")")
+        if name == "ptr" { return 13 }
+        if name == "ffi_fn" { if c.type_kinds[expected] != 8 { fail(&mut c,"ffi_fn needs an extern fn type") }; return expected }
+        if c.type_kinds[expected] != 4 && c.type_kinds[expected] != 5 { fail(&mut c,"ref_at needs a reference parameter type"); return 0 }
+        if c.c_record[c.type_bases[expected]] { index := slot(&mut c); arm.store(&mut c.code, index, 0); address_slot(&mut c, index) }
+        return expected
+    }
+    if name.len > 5 && name[0..5] == "load_" && raw_memory_type(&c, name, 5) >= 0 {
+        require_unsafe(&mut c); ty := raw_memory_type(&c, name, 5)
+        a := expression(&mut c, 0, 13); same(&mut c, 13, a); expect(&mut c, ")"); if c.code.platform == 3 { wasm.load_value(&mut c.wasm, ty) }; transfer_c(&mut c, ty, 0, 0, true); return ty
+    }
+    if name.len > 6 && name[0..6] == "store_" && raw_memory_type(&c, name, 6) >= 0 {
+        require_unsafe(&mut c); ty := raw_memory_type(&c, name, 6)
+        a := expression(&mut c, 0, 13); same(&mut c, 13, a); expect(&mut c, ","); arm.push(&mut c.code, 0)
+        if c.code.platform == 3 { wasm.op(&mut c.wasm, 167) }
+        b := expression(&mut c, 0, ty); same(&mut c, ty, b); expect(&mut c, ")")
+        if c.code.platform == 3 { wasm.store_value(&mut c.wasm, ty) }
+        arm.pop(&mut c.code, 1); transfer_c(&mut c, ty, 0, 1, false); return 0
+    }
     if name.len >= 6 && name[0..6] == "__sys_" { return intrinsic(&mut c, name, expected) }
+    if name == "len" {
+        ty := expression(&mut c, 0, 0)
+        expect(&mut c, ")")
+        return length_value(&mut c, ty)
+    }
     if name == "print" {
         ty := expression(&mut c, 0, 0); expect(&mut c, ")")
+        if c.code.platform == 3 && c.ok { if (ty < 1 || ty > 3) && !unsigned.has(ty) && !floats.has(ty) { fail(&mut c, "unsupported selfhost wasm32 print type"); return 0 }; wasm.print_value(&mut c.wasm, ty); return 0 }
         var target := c.print_int
         if ty == 3 { target = c.print_bool } else if ty == 4 { target = c.print_text }
-        else if ty == 5 { arm.branch(&mut c.code, c.runtime.string_rune, 1); target = c.print_text }
-        else if ty != 1 && ty != 2 && ty != 5 { fail(&mut c, "print requires a scalar value") }
+        else if floats.has(ty) { format_float(&mut c, ty); saved_float := temporary(&mut c, 4); target = c.print_text }
+        else if ty == 5 { arm.branch(&mut c.code, c.runtime.string_rune, 1); saved_rune := temporary(&mut c, 4); target = c.print_text }
+        else if ty != 1 && ty != 2 && ty != 5 && !unsigned.has(ty) { fail(&mut c, "print requires a scalar value") }
+        if target == c.print_int { if unsigned.has(ty) { arm.imm(&mut c.code, 8, 1) } else { arm.imm(&mut c.code, 8, 0) } }
         arm.branch(&mut c.code, target, 1); return 0
     }
-    if name == "assert" { ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); expect(&mut c, ")"); arm.branch(&mut c.code, c.assertion, 18); return 0 }
-    if name == "i32" || name == "i64" || name == "rune" {
-        var hint := 1; if name == "i64" { hint = 2 }; if name == "rune" { hint = 5 }
+    if name == "assert" { ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); expect(&mut c, ")"); if c.code.platform == 3 { wasm.op(&mut c.wasm, 80); wasm.check(&mut c.wasm) }; arm.branch(&mut c.code, c.assertion, 18); return 0 }
+    if name == "i32" || name == "i64" || name == "rune" || floats.has(type_id(&c, name)) || unsigned.has(type_id(&c, name)) {
+        hint := type_id(&c, name)
         var argument_hint := 0
-        if c.tokens.kinds[c.cursor] == .Integer && c.tokens.texts[c.cursor + 1] == ")" { argument_hint = hint }
+        var literal_at := c.cursor; if is(&c, "-") { literal_at = literal_at + 1 }
+        if (c.tokens.kinds[literal_at] == .Integer || c.tokens.kinds[literal_at] == .Float) && c.tokens.texts[literal_at + 1] == ")" {
+            if floats.has(hint) || c.tokens.kinds[literal_at] == .Integer { argument_hint = hint }
+        }
         ty := expression(&mut c, 0, argument_hint); expect(&mut c, ")")
-        if ty != 1 && ty != 2 && ty != 5 { fail(&mut c, "integer conversion requires an integer") }
-        if hint == 1 { narrow(&mut c) }; return hint
+        if floats.has(ty) || floats.has(hint) {
+            if (!floats.has(ty) && ty != 1 && ty != 2 && !unsigned.has(ty)) || hint == 5 { fail(&mut c, "expected a numeric conversion"); return hint }
+            if c.code.platform == 3 { wasm.float_cast(&mut c.wasm, ty, hint) }
+            floats.cast(&mut c.code, ty, hint, c.float_trap); return hint
+        }
+        if ty == 13 && hint == 12 { require_unsafe(&mut c); return 12 }
+        if ty != 1 && ty != 2 && ty != 5 && !unsigned.has(ty) && c.type_kinds[ty] != 3 { fail(&mut c, "integer conversion requires an integer") }
+        unsigned.cast(&mut c.code, ty, hint, c.overflow)
+        if c.code.platform == 3 { wasm.convert(&mut c.wasm, ty, hint) }; if hint == 1 { narrow(&mut c) }; return hint
     }
-    found := map.get_or(&c.functions, name, -1)
-    if found < 0 { fail(&mut c, "unknown function '" + name + "'"); return 0 }
-    f := i32(found); first := c.param_starts[f]; count := c.param_counts[f]
-    c.needed[f] = true
+    f := i32(map.get_or(&c.functions, name, -1)); callee := local(&c, name)
+    var signature := -1; var address := -1
+    if callee >= 0 {
+        signature = c.local_types[callee]
+        if c.type_kinds[signature] != 9 { fail(&mut c, "local value is not callable"); return 0 }
+        if c.code.platform == 3 { fail(&mut c, "indirect calls need a native target"); return 0 }
+        address = slot(&mut c); arm.load(&mut c.code, c.local_slots[callee]); arm.store(&mut c.code, address, 0)
+    } else {
+        if f < 0 { fail(&mut c, "unknown function '" + name + "'"); return 0 }
+        if c.unsafe_functions[f] && !c.unsafe_scope { fail(&mut c, "call requires unsafe"); return 0 }
+        if c.libraries[f] != "" { if c.code.platform != 3 { import_address(&mut c, f) }; return foreign_call(&mut c, c.ffi_types[f], f) }
+        c.needed[f] = true; signature = c.ffi_types[f]
+    }
+    first := c.type_starts[signature]; count := c.type_counts[signature]
     var provided := 0; var args: []i32 = []
     while c.ok && !is(&c, ")") {
         if provided >= count { fail(&mut c, "too many arguments"); break }
-        want := c.param_types[first + provided]
+        want := c.ffi_params[first + provided]
         ty := expression(&mut c, 0, want); same(&mut c, want, ty); copy_value(&mut c, ty)
         index := slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index); provided = provided + 1
         if !eat(&mut c, ",") { break }
@@ -266,59 +729,99 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     var i := provided - 1
     while i >= 8 { arm.load(&mut c.code, args[i]); arm.push(&mut c.code, 0); i = i - 1 }
     // Load x0 last: the slot helper uses x0/x9 only.
+    if address >= 0 { arm.load(&mut c.code, address); arm.mov(&mut c.code, 16, 0) }
     while i >= 0 { arm.load(&mut c.code, args[i]); arm.mov(&mut c.code, i, 0); i = i - 1 }
-    arm.branch(&mut c.code, c.fn_labels[f], 1)
+    if c.code.platform == 3 { wasm.invoke(&mut c.wasm, f) }
+    if address >= 0 { arm.emit(&mut c.code, 3594453504) } else { arm.branch(&mut c.code, c.fn_labels[f], 1) }
     for unused in 8..provided { arm.pop(&mut c.code, 9) }
-    c.returns[f]
+    c.type_bases[signature]
 }
 fn primary(c: &mut Compiler, expected: i32) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
-    c.address = -1; c.writable = false
+    c.address = -1; c.writable = false; c.scratch_place = 0
     var ty := primary_inner(&mut c, expected)
+    if c.code.platform == 3 && c.ok && ((!wasm.scalar(ty) && c.type_kinds[ty] != 8) || is(&c, "[")) { fail(&mut c, "selfhost wasm32 supports scalar integer, pointer and bool expressions") }
     while c.ok && (is(&c, ".") || is(&c, "[")) {
         if eat(&mut c, "[") {
+            packed := c.inline_place && c.type_kinds[ty] == 6
             writable := c.writable
+            if ty == 4 { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
             arm.push(&mut c.code, 0)
-            index_type := expression(&mut c, 0, 1); same(&mut c, 1, index_type)
+            index_type := expression(&mut c, 1, 1); same(&mut c, 1, index_type)
             if eat(&mut c, "..") {
                 if ty != 4 { fail(&mut c, "slice requires a string") }
                 arm.push(&mut c.code, 0); last := expression(&mut c, 0, 1); same(&mut c, 1, last); expect(&mut c, "]")
-                arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0); arm.branch(&mut c.code, c.runtime.string_slice, 1)
+                arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0); arm.branch(&mut c.code, c.runtime.string_slice, 1); saved_string := temporary(&mut c, 4)
                 c.address = -1; c.writable = false; continue
             }
             expect(&mut c, "]"); arm.pop(&mut c.code, 1)
             if ty == 4 { arm.mov(&mut c.code, 2, 0); arm.mov(&mut c.code, 0, 1); arm.mov(&mut c.code, 1, 2); arm.branch(&mut c.code, c.runtime.string_index, 1); ty = 1; c.address = -1; c.writable = false }
+            else if c.type_kinds[ty]==21 {
+                ty=c.type_bases[ty];scratch.index(&mut c.code,scratch_width(&c,ty),c.bounds)
+                save_address(&mut c);c.scratch_place=1;c.writable=writable
+                if c.type_kinds[ty]!=2 {transfer_c(&mut c,ty,0,0,true)}
+            }
             else if collection(&c, ty) {
                 load_mem(&mut c, 2, 1, 8); arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.bounds, 4)
-                load_mem(&mut c, 1, 1, 0); arm.emit(&mut c.code, 2332036128)
-                save_address(&mut c); load_mem(&mut c, 0, 0, 0); ty = c.type_bases[ty]; c.writable = writable
+                load_mem(&mut c, 2, 1, 24); load_mem(&mut c, 1, 1, 0); ty = c.type_bases[ty]
+                arm.emit(&mut c.code, 2596413440); arm.emit(&mut c.code, 2332033056)
+                save_address(&mut c); c.inline_place = packed
+                if packed { transfer_c(&mut c, ty, 0, 0, true) } else { unsigned.transfer(&mut c.code, ty, 0, 0, true) }
+                c.writable = writable
             } else { fail(&mut c, "index requires an array or string") }
         } else {
             expect(&mut c, "."); name := advance(&mut c)
-            if is(&c, "(") { ty = method(&mut c, ty, name); c.address = -1; c.writable = false }
-            else if name == "len" && (ty == 4 || collection(&c, ty)) {
-                var offset := 0; if ty != 4 { offset = 8 }; load_mem(&mut c, 0, 0, offset); ty = 1; c.address = -1; c.writable = false
+            if is(&c, "(") { result := method(&mut c, ty, name); ty = temporary(&mut c, result); c.address = -1; c.writable = false }
+            else if name == "len" && (ty == 4 || collection(&c, ty) || c.type_kinds[ty]==21) {
+                ty = length_value(&mut c, ty); c.address = -1; c.writable = false
             } else if c.type_kinds[ty] == 2 {
+                if c.scratch_place!=0 {c.scratch_place=2}
                 found := field(&c, ty, name)
                 if found < 0 { fail(&mut c, "unknown field '" + name + "'") }
-                else { offset := (found - c.type_starts[ty]) * 8; arm.emit(&mut c.code, 2432696320 + i64(offset) * 1024); save_address(&mut c); load_mem(&mut c, 0, 0, 0); ty = c.field_types[found] }
+                else if c.c_record[ty] {
+                    c_offset(&mut c, c.field_values[found]); save_address(&mut c); c.inline_place = true
+                    ty = c.field_types[found]; inline_value(&mut c, ty)
+                } else { offset := (found - c.type_starts[ty]) * 8; c_offset(&mut c,i64(offset)); save_address(&mut c); ty = c.field_types[found]; unsigned.transfer(&mut c.code, ty, 0, 0, true) }
             } else { fail(&mut c, "unknown member '" + name + "'") }
         }
     }
     c.depth = c.depth - 1; ty
 }
+fn enum_type(c: &Compiler, ty: i32) -> bool { ty >= 0 && (c.type_kinds[ty] == 3 || c.type_kinds[ty] == 7) }
 fn enumeration(c: &mut Compiler, ty: i32) -> i32 {
     name := advance(&mut c)
-    if ty < 0 || c.type_kinds[ty] != 3 { fail(&mut c, "enum variant needs a type"); return 0 }
+    if !enum_type(&c, ty) { fail(&mut c, "enum variant needs a type"); return 0 }
     found := field(&c, ty, name)
     if found < 0 { fail(&mut c, "unknown enum variant"); return ty }
-    arm.imm(&mut c.code, 0, c.field_values[found]); ty
+    if c.type_kinds[ty] == 3 { arm.imm(&mut c.code, 0, c.field_values[found]); return ty }
+    count := c.payload_counts[found]
+    arm.imm(&mut c.code, 0, i64(count + 1) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1)
+    index := slot(&mut c); arm.store(&mut c.code, index, 0); arm.imm(&mut c.code, 1, c.field_values[found]); store_mem(&mut c, 1, 0, 0)
+    if count > 0 {
+        expect(&mut c, "(")
+        for i in 0..count {
+            if i > 0 { expect(&mut c, ",") }
+            pt := c.payload_types[c.payload_starts[found] + i]
+            actual := expression(&mut c, 0, pt); same(&mut c, pt, actual); copy_value(&mut c, pt)
+            arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, index); store_mem(&mut c, 1, 0, (i + 1) * 8)
+        }
+        expect(&mut c, ")")
+    }
+    arm.load(&mut c.code, index); c.address = -1; c.writable = false; temporary(&mut c, ty)
 }
 fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
     if !c.ok { return 0 }
     if eat(&mut c, "&") {
-        mutable := eat(&mut c, "mut"); ty := primary(&mut c, 0)
+        if c.code.platform == 3 { fail(&mut c, "references require a native selfhost target"); return 0 }
+        mutable := eat(&mut c, "mut"); var ty := primary(&mut c, 0)
+        if c.type_kinds[ty]==21 {
+            elem:=c.type_bases[ty]
+            if mutable || c.type_kinds[expected]!=4 || c.type_kinds[c.type_bases[expected]]!=1 || c.type_bases[c.type_bases[expected]]!=elem || i32(1).shl(unsigned.shift(elem))!=scratch_width(&c,elem) {fail(&mut c,"scratch slice needs a shared, representation-compatible parameter");return 0}
+            ty=c.type_bases[expected]
+        }else if c.scratch_place==1 && (c.type_kinds[ty]==2 || i32(1).shl(unsigned.shift(ty))!=scratch_width(&c,ty)) {
+            fail(&mut c,"borrow a value-compatible scratch element or record field");return 0
+        }
         if c.address < 0 { fail(&mut c, "borrow requires a stored value"); return 0 }
         if mutable && !c.writable { fail(&mut c, "mutable borrow requires var or &mut") }
         arm.load(&mut c.code, c.address); c.address = -1; c.writable = false
@@ -326,20 +829,23 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
     }
     if eat(&mut c, "-") {
         if c.tokens.kinds[c.cursor] == .Integer { spelling := "-" + advance(&mut c); return literal(&mut c, spelling, expected) }
-        ty := primary(&mut c, expected); if ty != 1 && ty != 2 { fail(&mut c, "minus requires an integer") }
+        ty := primary(&mut c, expected)
+        if floats.has(ty) { if c.code.platform == 3 { wasm.float_method(&mut c.wasm, "negate", ty) }; result := floats.method(&mut c.code, ty, "negate"); c.address = -1; c.writable = false; return result }
+        if ty != 1 && ty != 2 { fail(&mut c, "minus requires a signed number") }
+        if c.code.platform == 3 { wasm.negate(&mut c.wasm, ty) }
         arm.emit(&mut c.code, 3942646752); arm.branch(&mut c.code, c.overflow, 8); if ty == 1 { narrow(&mut c) }; c.address = -1; c.writable = false; return ty
     }
-    if eat(&mut c, "!") { ty := primary(&mut c, 3); same(&mut c, 3, ty); arm.emit(&mut c.code, 3944677407); arm.emit(&mut c.code, 2594117600); c.address = -1; c.writable = false; return 3 }
+    if eat(&mut c, "!") { ty := primary(&mut c, 3); same(&mut c, 3, ty); if c.code.platform == 3 { wasm.op(&mut c.wasm, 80); wasm.op(&mut c.wasm, 173) }; arm.emit(&mut c.code, 3944677407); arm.emit(&mut c.code, 2594117600); c.address = -1; c.writable = false; return 3 }
     if eat(&mut c, "(") { ty := expression(&mut c, 0, expected); expect(&mut c, ")"); return ty }
-    if eat(&mut c, "true") { arm.imm(&mut c.code, 0, 1); return 3 }
-    if eat(&mut c, "false") { arm.imm(&mut c.code, 0, 0); return 3 }
+    if eat(&mut c, "true") { if c.code.platform == 3 { wasm.constant(&mut c.wasm, 1) }; arm.imm(&mut c.code, 0, 1); return 3 }
+    if eat(&mut c, "false") { if c.code.platform == 3 { wasm.constant(&mut c.wasm, 0) }; arm.imm(&mut c.code, 0, 0); return 3 }
     if eat(&mut c, ".") { return enumeration(&mut c, expected) }
     if eat(&mut c, "[") {
         var base := 0; if collection(&c, expected) { base = c.type_bases[expected] }
         var count := 0; var repeated := false
-        arm.branch(&mut c.code, c.runtime.array_new, 1); saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
+        stride_word := c.code.words.len; arm.imm(&mut c.code, 2, 3); arm.branch(&mut c.code, c.runtime.array_new, 1); saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
         while c.ok && !is(&c, "]") {
-            ty := expression(&mut c, 0, base); if base == 0 { base = ty } else { same(&mut c, base, ty) }; copy_value(&mut c, ty)
+            ty := expression(&mut c, 0, base); if base == 0 { base = ty } else { same(&mut c, base, ty) }
             if count == 0 && eat(&mut c, ";") {
                 repeated = true; count = length_literal(&mut c)
                 item := slot(&mut c); left := slot(&mut c); arm.store(&mut c.code, item, 0)
@@ -347,30 +853,39 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
                 head := arm.label(&mut c.code); done := arm.label(&mut c.code)
                 arm.mark(&mut c.code, head); arm.load(&mut c.code, left); arm.branch(&mut c.code, done, 18)
                 arm.emit(&mut c.code, 3506439168); arm.store(&mut c.code, left, 0)
-                arm.load(&mut c.code, item); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, saved)
+                arm.load(&mut c.code, item); copy_value(&mut c, ty); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, saved)
                 arm.branch(&mut c.code, c.runtime.array_push, 1); arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
                 break
             }
-            count = count + 1
+            count = count + 1; copy_value(&mut c, ty)
             arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); arm.branch(&mut c.code, c.runtime.array_push, 1)
             if !eat(&mut c, ",") { break }
         }
         expect(&mut c, "]"); arm.load(&mut c.code, saved); c.address = -1; c.writable = false
         if base == 0 { fail(&mut c, "empty array needs an element type") }
-        if repeated || c.type_kinds[expected] == 6 { return fixed(&mut c, base, count) }; return compound(&mut c, 1, base)
+        c.code.words[stride_word] = 3531603970 + i64(unsigned.shift(base)) * 32
+        var ty := compound(&mut c, 1, base); if repeated || c.type_kinds[expected] != 1 { ty = fixed(&mut c, base, count) }; return temporary(&mut c, ty)
     }
     kind := c.tokens.kinds[c.cursor]
+    if kind == .Float { spelling := advance(&mut c); return float_literal(&mut c, spelling, expected) }
     if kind == .Integer { spelling := advance(&mut c); return literal(&mut c, spelling, expected) }
     if kind == .String || kind == .Rune {
         text := advance(&mut c); target := arm.label(&mut c.code)
         c.strings.push(text); c.string_labels.push(target); arm.branch(&mut c.code, target, 20)
-        if kind == .Rune { arm.branch(&mut c.code, c.runtime.string_runes, 1); load_mem(&mut c, 0, 0, 0); load_mem(&mut c, 0, 0, 0); return 5 }; return 4
+        if kind == .Rune { arm.branch(&mut c.code, c.runtime.string_runes, 1); runes_ty := compound(&mut c, 1, 5); saved_runes := temporary(&mut c, runes_ty); load_mem(&mut c, 0, 0, 0); load_mem(&mut c, 0, 0, 0); return 5 }; return 4
     }
     if kind == .Name {
         name := advance(&mut c); nominal := type_id(&c, name)
-        if nominal >= 0 && c.type_kinds[nominal] == 3 && eat(&mut c, ".") { return enumeration(&mut c, nominal) }
+        if floats.has(nominal) && eat(&mut c, ".") {
+            expect(&mut c, "from_bits"); expect(&mut c, "(")
+            var bits := 2; if nominal == 6 { bits = 1 }
+            actual := expression(&mut c, 0, bits); same(&mut c, bits, actual); expect(&mut c, ")")
+            if nominal == 6 { if c.code.platform == 3 { wasm.op(&mut c.wasm,167); wasm.op(&mut c.wasm,173) }; arm.emit(&mut c.code, 704644064) }
+            return nominal
+        }
+        if enum_type(&c, nominal) && eat(&mut c, ".") { return enumeration(&mut c, nominal) }
         if nominal >= 0 && c.type_kinds[nominal] == 2 && eat(&mut c, "{") {
-            arm.imm(&mut c.code, 0, i64(c.type_counts[nominal]) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1)
+            if c.c_record[nominal] { zero_record(&mut c, nominal) } else { arm.imm(&mut c.code, 0, i64(c.type_counts[nominal]) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1) }
             saved := slot(&mut c); arm.store(&mut c.code, saved, 0); var provided: []bool = []
             for i in 0..c.type_counts[nominal] { provided.push(false) }; separators(&mut c)
             while c.ok && !is(&c, "}") {
@@ -378,27 +893,68 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
                 if found < 0 { fail(&mut c, "unknown constructor field"); break }
                 offset := found - c.type_starts[nominal]
                 if provided[offset] { fail(&mut c, "duplicate constructor field") }; provided[offset] = true
-                ty := expression(&mut c, 0, c.field_types[found]); same(&mut c, c.field_types[found], ty); copy_value(&mut c, ty)
-                arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, offset * 8)
+                ty := expression(&mut c, 0, c.field_types[found]); same(&mut c, c.field_types[found], ty)
+                if c.c_record[nominal] {
+                    arm.push(&mut c.code,0); arm.load(&mut c.code,saved); c_offset(&mut c,c.field_values[found])
+                    arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); store_inline(&mut c,ty)
+                } else {
+                    copy_value(&mut c, ty); arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, offset * 8)
+                }
                 if !eat(&mut c, ",") { break }; separators(&mut c)
             }
             separators(&mut c); expect(&mut c, "}")
             for present in provided { if !present { fail(&mut c, "missing constructor field") } }
-            arm.load(&mut c.code, saved); c.address = -1; c.writable = false; return nominal
+            arm.load(&mut c.code, saved); c.address = -1; c.writable = false; return temporary(&mut c, nominal)
         }
-        if is(&c, "(") { if local(&c, name) >= 0 { fail(&mut c, "local value is not callable"); return 0 }; result := call(&mut c, name, expected); c.address = -1; c.writable = false; return result }
+        if is(&c, "(") { found_local := local(&c, name)
+            if found_local >= 0 && c.type_kinds[c.local_types[found_local]] == 8 {
+                sig := c.local_types[found_local]
+                expect(&mut c,"("); if c.code.platform == 3 { wasm.indexed(&mut c.wasm, 32, c.local_slots[found_local]) }; arm.load(&mut c.code,c.local_slots[found_local]); return foreign_call(&mut c,sig,-1)
+            }; result := call(&mut c, name, expected); c.address = -1; c.writable = false; return temporary(&mut c, result) }
         found := local(&c, name)
-        if found < 0 { fail(&mut c, "unknown local '" + name + "'"); return 0 }
+        if found < 0 {
+            f := i32(map.get_or(&c.functions, name, -1))
+            if f >= 0 && c.libraries[f] != "" { if c.code.platform == 3 { wasm.host_address(&mut c.wasm, f) } else { import_address(&mut c, f) }; return c.ffi_types[f] }
+        }
+        if found < 0 {
+            f := i32(map.get_or(&c.functions, name, -1))
+            if f < 0 { fail(&mut c, "unknown local '" + name + "'"); return 0 }
+            if c.unsafe_functions[f] { fail(&mut c, "unsafe function requires a foreign function pointer"); return 0 }
+            c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.ffi_types[f]
+        }
+        if c.code.platform == 3 { wasm.indexed(&mut c.wasm, 32, c.local_slots[found]) }
         var ty := c.local_types[found]; c.writable = c.local_mutable[found]
+        if c.type_kinds[ty]==20 {fail(&mut c,"region is only valid in an allocation");return 0}
+        if c.type_kinds[ty]==21 {c.scratch_place=3}
         if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { arm.load(&mut c.code, c.local_slots[found]); c.writable = c.type_kinds[ty] == 5; ty = c.type_bases[ty] }
         else { address_slot(&mut c, c.local_slots[found]) }
-        save_address(&mut c); load_mem(&mut c, 0, 0, 0); return ty
+        save_address(&mut c); unsigned.transfer(&mut c.code, ty, 0, 0, true); return ty
     }
     fail(&mut c, "expected expression"); 0
 }
 fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
-    writable := c.writable; expect(&mut c, "("); arm.push(&mut c.code, 0)
+    if c.code.platform == 3 && !floats.has(ty) && !(name == "bit_not" || name == "bit_and" || name == "bit_or" || name == "bit_xor" || name == "shl" || name == "shr" || name == "wrapping_add" || name == "wrapping_sub" || name == "wrapping_mul") { fail(&mut c, "unsupported selfhost wasm32 method"); return 0 }
+    writable := c.writable; expect(&mut c, "(")
+    if floats.has(ty) {
+        expect(&mut c, ")")
+        if c.code.platform == 3 {
+            if name == "str" { fail(&mut c, "unsupported selfhost wasm32 float method"); return ty }; wasm.float_method(&mut c.wasm,name,ty)
+        }
+        if name == "str" { format_float(&mut c, ty); return 4 }
+        if name == "negate" { fail(&mut c, "unknown float method"); return ty }
+        actual := floats.method(&mut c.code, ty, name)
+        if actual < 0 { fail(&mut c, "unknown float method"); return ty }
+        return actual
+    }
+    if name == "len" { expect(&mut c, ")"); return length_value(&mut c, ty) }
+    if name == "cap" && c.type_kinds[ty] == 1 { expect(&mut c, ")"); load_mem(&mut c, 0, 0, 16); return 1 }
+    if ty == 4 { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
+    arm.push(&mut c.code, 0)
     var target := -1; var ret := ty; var count := 0
+    if name == "iter" && (c.type_kinds[ty] == 6 || c.type_kinds[ty] == 10) {
+        expect(&mut c, ")"); arm.pop(&mut c.code, 0); copy_value(&mut c, ty)
+        return compound(&mut c, 10, c.type_bases[ty])
+    }
     if c.type_kinds[ty] == 1 {
         if !writable { fail(&mut c, "array mutation requires var or &mut") }
         if name == "push" {
@@ -406,10 +962,10 @@ fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
             value := expression(&mut c, 0, c.type_bases[ty]); same(&mut c, c.type_bases[ty], value); copy_value(&mut c, value); count = 1; target = c.runtime.array_push; ret = 0
         } else if name == "reserve" { value := expression(&mut c, 0, 1); same(&mut c, 1, value); count = 1; target = c.runtime.array_reserve; ret = 0 }
         else if name == "pop" { target = c.runtime.array_pop; ret = c.type_bases[ty] }
-        else if name == "clear" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); arm.imm(&mut c.code, 1, 0); store_mem(&mut c, 1, 0, 8); return 0 }
+        else if name == "clear" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); if c.type_bases[ty] == 4 { arm.branch(&mut c.code, c.runtime.release_elements, 1) }; arm.imm(&mut c.code, 1, 0); store_mem(&mut c, 1, 0, 8); return 0 }
     } else if name == "str" {
-        if ty != 1 && ty != 2 && ty != 3 && ty != 5 { fail(&mut c, "str requires an integer, bool or rune") }
-        ret = 4; target = c.runtime.string_integer
+        if ty != 1 && ty != 2 && ty != 3 && ty != 5 && !unsigned.has(ty) { fail(&mut c, "str requires an integer, bool or rune") }
+        if unsigned.has(ty) { arm.imm(&mut c.code, 2, 1) } else { arm.imm(&mut c.code, 2, 0) }; ret = 4; target = c.runtime.string_integer
         if ty == 3 { target = c.runtime.string_bool }; if ty == 5 { target = c.runtime.string_rune }
     } else if ty == 4 {
         if name == "bytes" { target = c.runtime.string_bytes; ret = compound(&mut c, 1, 1) }
@@ -419,8 +975,8 @@ fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
             last := expression(&mut c, 0, 1); same(&mut c, 1, last); arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0)
             expect(&mut c, ")"); arm.branch(&mut c.code, c.runtime.string_slice, 1); return 4
         }
-    } else if ty == 1 || ty == 2 {
-        if name == "bit_not" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); arm.emit(&mut c.code, 2854224864); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; return ty }
+    } else if ty == 1 || ty == 2 || unsigned.has(ty) {
+        if name == "bit_not" { if c.code.platform == 3 { wasm.method(&mut c.wasm, name, ty) }; expect(&mut c, ")"); arm.pop(&mut c.code, 0); arm.emit(&mut c.code, 2854224864); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; if unsigned.has(ty) { unsigned.mask(&mut c.code, ty) }; return ty }
         var want := ty; if name == "shl" || name == "shr" { want = 1 }
         right := expression(&mut c, 0, want); same(&mut c, want, right); expect(&mut c, ")"); arm.pop(&mut c.code, 1)
         var opcode: i64 = 0
@@ -432,13 +988,14 @@ fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
         else if name == "wrapping_add" { opcode = 2332033056 }
         else if name == "wrapping_sub" { opcode = 3405774880 }
         else if name == "wrapping_mul" { opcode = 2600500256 }
+        if c.code.platform == 3 { wasm.method(&mut c.wasm, name, ty) }
         if opcode == 0 { fail(&mut c, "unknown integer method '" + name + "'") }
         if name == "shl" || name == "shr" {
-            var width: i64 = 32; if ty == 2 { width = 64 }; arm.imm(&mut c.code, 2, width)
+            var width: i64 = 32; if ty == 2 { width = 64 }; if unsigned.has(ty) { width = i64(unsigned.width(ty)) }; arm.imm(&mut c.code, 2, width)
             arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.bounds, 4)
         }
         if ty == 1 { opcode = opcode.bit_and(2147483647) }
-        arm.emit(&mut c.code, opcode); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; return ty
+        arm.emit(&mut c.code, opcode); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; if unsigned.has(ty) { unsigned.mask(&mut c.code, ty) }; return ty
     }
     if target < 0 { fail(&mut c, "unknown method '" + name + "'"); return 0 }
     expect(&mut c, ")")
@@ -454,6 +1011,13 @@ fn precedence(operator: string) -> i32 {
     0
 }
 fn binary(c: &mut Compiler, operator: string, ty: i32) -> i32 {
+    if c.code.platform == 3 { if floats.has(ty) { wasm.float_binary(&mut c.wasm, operator, ty) } else { wasm.binary(&mut c.wasm, operator, ty) } }
+    if ty == 13 && (operator == "==" || operator == "!=") { return unsigned.binary(&mut c.code, operator, 12, c.overflow, c.zero) }
+    if floats.has(ty) {
+        if operator == "%" { fail(&mut c, "remainder requires integers"); return ty }
+        return floats.binary(&mut c.code, operator, ty)
+    }
+    if unsigned.has(ty) { return unsigned.binary(&mut c.code, operator, ty, c.overflow, c.zero) }
     if ty == 4 {
         arm.mov(&mut c.code, 2, 0); arm.mov(&mut c.code, 0, 1); arm.mov(&mut c.code, 1, 2)
         if operator == "+" { arm.branch(&mut c.code, c.runtime.string_concat, 1); return 4 }
@@ -491,10 +1055,49 @@ fn binary(c: &mut Compiler, operator: string, ty: i32) -> i32 {
     arm.emit(&mut c.code, 2594113504 + i64(condition.bit_xor(1)) * 4096)
     3
 }
+// Choose the precision of literal-led arithmetic before emitting its first
+// operand. Names with known types take precedence over a default decimal.
+fn float_context(c: &Compiler, expected: i32) -> i32 {
+    if !c.float_source || expected == 1 || expected == 2 || unsigned.has(expected) || floats.has(expected) { return expected }
+    first := c.tokens.kinds[c.cursor]
+    if first != .Integer && first != .Float && !is(&c, "(") && !is(&c, "-") { return expected }
+    var pos := c.cursor
+    var depth := 0
+    var decimal_seen := false
+    while pos < c.tokens.kinds.len {
+        kind := c.tokens.kinds[pos]; word := c.tokens.texts[pos]
+        if kind == .Float { decimal_seen = true }
+        else if kind == .Name {
+            index := local(&c, word)
+            if index >= 0 {
+                ty := c.local_types[index]
+                if floats.has(ty) { return ty }
+                break
+            }
+            if word == "f32" { return 6 }
+            if word == "f64" { return 7 }
+            found := map.get_or(&c.functions, word, -1)
+            if found >= 0 && floats.has(c.returns[i32(found)]) { return c.returns[i32(found)] }
+            break
+        } else if word == "(" { depth = depth + 1 }
+        else if word == ")" {
+            if depth == 0 { break }; depth = depth - 1
+        } else if word == "." {
+            if pos + 3 >= c.tokens.kinds.len || c.tokens.texts[pos + 2] != "(" || c.tokens.texts[pos + 3] != ")" { break }
+            name := c.tokens.texts[pos + 1]
+            if name == "str" || name == "to_bits" || name == "is_nan" || name == "is_finite" || name == "is_infinite" || name == "is_sign_negative" { break }
+            pos = pos + 3
+        } else if kind != .Integer && word != "+" && word != "-" && word != "*" && word != "/" { break }
+        pos = pos + 1
+    }
+    if decimal_seen { return 7 }
+    expected
+}
 fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
-    var ty := primary(&mut c, expected)
+    context := float_context(&c, expected)
+    var ty := primary(&mut c, context)
     while c.ok {
         operator := peek(&c); priority := precedence(operator)
         if priority == 0 || priority < minimum { break }
@@ -503,13 +1106,22 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
             same(&mut c, 3, ty)
             done := arm.label(&mut c.code)
             if operator == "&&" { arm.branch(&mut c.code, done, 18) } else { arm.branch(&mut c.code, done, 19) }
-            right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
+            if c.code.platform == 3 { wasm.short_begin(&mut c.wasm, operator) }
+            right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); if c.code.platform == 3 { wasm.short_end(&mut c.wasm, operator) }; arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
         } else {
+            if ty == 4 { copy_value(&mut c, ty); saved_left := temporary(&mut c, ty) }
             arm.push(&mut c.code, 0)
             right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
             arm.pop(&mut c.code, 1)
-            ty = binary(&mut c, operator, ty); c.address = -1; c.writable = false
+            result := binary(&mut c, operator, ty); ty = temporary(&mut c, result); c.address = -1; c.writable = false
         }
+    }
+    if minimum == 0 && eat(&mut c, "..") {
+        if c.code.platform == 3 { fail(&mut c, "range values need a native target"); return 0 }
+        same(&mut c, 1, ty); arm.push(&mut c.code, 0)
+        high := expression(&mut c, 1, 1); same(&mut c, 1, high); arm.pop(&mut c.code, 1)
+        arm.emit(&mut c.code, 704709601); arm.emit(&mut c.code, 2852159520)
+        ty = type_id(&c, "range"); c.address = -1; c.writable = false
     }
     c.depth = c.depth - 1
     ty
@@ -524,7 +1136,9 @@ fn block(c: &mut Compiler, tail_allowed: bool) -> bool {
     var returns := false
     while c.ok && !is(&c, "}") {
         if c.tokens.kinds[c.cursor] == .End { fail(&mut c, "unterminated block"); break }
+        first_owner := c.owned_slots.len
         ends := statement(&mut c); returns = returns || ends
+        cleanup_from(&mut c, first_owner, true)
         separators(&mut c)
     }
     expect(&mut c, "}"); leave(&mut c)
@@ -564,43 +1178,174 @@ fn conditional(c: &mut Compiler, tail_allowed: bool) -> bool {
 }
 fn conditional_inner(c: &mut Compiler, tail_allowed: bool) -> bool {
     ty := expression(&mut c, 0, 3); same(&mut c, 3, ty)
+    if c.code.platform == 3 { wasm.to_bool(&mut c.wasm); wasm.begin(&mut c.wasm, 4) }
     otherwise := arm.label(&mut c.code); done := arm.label(&mut c.code)
     arm.branch(&mut c.code, otherwise, 18)
     left := block(&mut c, tail_allowed); arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, otherwise)
     newlines(&mut c)
     var right := false
-    if eat(&mut c, "else") { if eat(&mut c, "if") { right = conditional(&mut c, tail_allowed) } else { right = block(&mut c, tail_allowed) } }
+    if eat(&mut c, "else") { if c.code.platform == 3 { wasm.op(&mut c.wasm, 5) }; if eat(&mut c, "if") { right = conditional(&mut c, tail_allowed) } else { right = block(&mut c, tail_allowed) } }
+    if c.code.platform == 3 { wasm.end(&mut c.wasm) }
     arm.mark(&mut c.code, done)
     left && right
 }
+fn match_statement(c: &mut Compiler) -> bool {
+    ty := expression(&mut c, 0, 0)
+    if !enum_type(&c, ty) { fail(&mut c, "match requires an enum"); return false }
+    saved := slot(&mut c); copy_value(&mut c, ty)
+    if owned(&c, ty) { save_owner(&mut c, saved, ty, true) } else { arm.store(&mut c.code, saved, 0) }
+    if !is(&c, "{") { fail(&mut c, "expected match arms"); return false }
+    tail := c.tail && terminal(&c, c.closes[c.cursor] + 1, true)
+    expect(&mut c, "{"); separators(&mut c)
+    var seen: []bool = []; var fallback := false; var returns := true
+    for i in 0..c.type_counts[ty] { seen.push(false) }
+    done := arm.label(&mut c.code)
+    while !is(&c, "}") && c.ok {
+        if fallback { fail(&mut c, "wildcard must be the final match arm"); return false }
+        next := arm.label(&mut c.code); enter(&mut c)
+        if eat(&mut c, "_") { fallback = true }
+        else {
+            if !is(&c, ".") { named := advance(&mut c); if type_id(&c, named) != ty { fail(&mut c, "wrong enum in match pattern") } }
+            expect(&mut c, "."); name := advance(&mut c); found := field(&c, ty, name)
+            if found < 0 { fail(&mut c, "unknown match variant"); return false }
+            ordinal := found - c.type_starts[ty]
+            if seen[ordinal] { fail(&mut c, "duplicate match variant"); return false }; seen[ordinal] = true
+            arm.load(&mut c.code, saved); if c.type_kinds[ty] == 7 { load_mem(&mut c, 0, 0, 0) }
+            arm.imm(&mut c.code, 1, c.field_values[found]); arm.emit(&mut c.code, 3942711327); arm.branch(&mut c.code, next, 3)
+            count := c.payload_counts[found]
+            if count > 0 {
+                expect(&mut c, "(")
+                for i in 0..count {
+                    if i > 0 { expect(&mut c, ",") }
+                    binding := advance(&mut c)
+                    if binding != "_" {
+                        pt := c.payload_types[c.payload_starts[found] + i]; index := slot(&mut c)
+                        bind(&mut c, binding, pt, false, index); arm.load(&mut c.code, saved); load_mem(&mut c, 0, 0, (i + 1) * 8); copy_value(&mut c, pt)
+                        if owned(&c, pt) { save_owner(&mut c, index, pt, false) } else { arm.store(&mut c.code, index, 0) }
+                    }
+                }
+                expect(&mut c, ")")
+            }
+        }
+        expect(&mut c, "=>"); newlines(&mut c); var ends := false
+        if is(&c, "{") { ends = block(&mut c, tail) }
+        else {
+            var expected := 0; if tail { expected = c.ret_type }
+            value := expression(&mut c, 0, expected)
+            if tail && expected != 0 {
+                same(&mut c, expected, value); copy_value(&mut c, value); arm.branch(&mut c.code, c.cleanup, 0); ends = true
+            } else if value != 0 { fail(&mut c, "unused match arm value") }
+        }
+        returns = returns && ends
+        leave(&mut c); arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, next)
+        separators(&mut c); if !eat(&mut c, ",") && !is(&c, "}") { fail(&mut c, "expected comma between match arms") }; separators(&mut c)
+    }
+    expect(&mut c, "}"); arm.mark(&mut c.code, done)
+    if !fallback { for present in seen { if !present { fail(&mut c, "non-exhaustive match") } } }
+    returns
+}
+fn scratch_width(c:&Compiler, ty:i32)->i32 {
+    if c.type_kinds[ty]==2 {
+        if c.c_record[ty] {return 0}
+        for f in c.type_starts[ty]..c.type_starts[ty]+c.type_counts[ty] {
+            ft:=c.field_types[f]
+            if ft<1 || ft>12 || ft==4 {return 0}
+        }
+        if c.type_counts[ty]==0 {return 1}
+        return c.type_counts[ty]*8
+    }
+    if ty<1 || ty>12 || ty==4 {return 0}
+    foreign_width(ty)
+}
+fn scratch_block(c:&mut Compiler)->bool {
+    name:=advance(&mut c)
+    if c.code.platform==3 {fail(&mut c,"selfhost scratch regions require a native target");return false}
+    if eat(&mut c,"(") { ty:=expression(&mut c,0,1);same(&mut c,1,ty);expect(&mut c,")") }
+    else {arm.imm(&mut c.code,0,65536)}
+    area:=slot(&mut c);cursor:=slot(&mut c);limit:=slot(&mut c)
+    arm.store(&mut c.code,limit,0);arm.store(&mut c.code,cursor,31)
+    valid:=arm.label(&mut c.code);arm.emit(&mut c.code,4043309087);arm.branch(&mut c.code,valid,12)
+    arm.exit(&mut c.code,109);arm.mark(&mut c.code,valid)
+    arm.branch(&mut c.code,c.runtime.alloc,1)
+    // Raw allocator blocks and strings share the runtime's retain/release header.
+    save_owner(&mut c,area,4,false)
+    enter(&mut c);token:=compound(&mut c,20,0);bind(&mut c,name,token,false,area)
+    if !is(&c,"{"){fail(&mut c,"expected region body");return false}
+    after:=c.closes[c.cursor]+1;allowed:=c.tail && terminal(&c,after,true)
+    ends:=block(&mut c,allowed)
+    clear_owner(&mut c,area,4);leave(&mut c)
+    ends
+}
+// Recognize a declaration using the region in scope. A user-defined module
+// with a function called alloc continues through ordinary name resolution.
+fn scratch_declaration(c:&mut Compiler, name:string, mutable:bool)->bool {
+    start:=c.cursor
+    if start+8>=c.tokens.texts.len || c.tokens.texts[start]!=":" || c.tokens.texts[start+1]!="[" || c.tokens.texts[start+2]!="]" || c.tokens.texts[start+4]!="=" {return false}
+    region:=local(&c,c.tokens.texts[start+5])
+    if region<0 || c.type_kinds[c.local_types[region]]!=20 {return false}
+    area:=c.local_slots[region]
+    c.cursor=start+3;elem:=type_name(&mut c);width:=scratch_width(&c,elem)
+    if width==0{fail(&mut c,"scratch elements must be scalars or flat numeric records");return true}
+    expect(&mut c,"=");receiver:=advance(&mut c);expect(&mut c,".");expect(&mut c,"alloc");expect(&mut c,"(")
+    actual:=expression(&mut c,0,1);same(&mut c,1,actual);expect(&mut c,")")
+    var align:=width;if c.type_kinds[elem]==2{align=8}
+    view:=compound(&mut c,21,elem);binding:=slot(&mut c)
+    for unused in 0..3 { slot_for_descriptor:=slot(&mut c) }
+    descriptor:=slot(&mut c)
+    scratch.allocate(&mut c.code,area,descriptor,width,align,c.bounds,unsigned.shift(elem))
+    arm.store(&mut c.code,binding,0);bind(&mut c,name,view,mutable,binding);end_statement(&mut c)
+    true
+}
+
 fn statement(c: &mut Compiler) -> bool {
+    if is(&c,"region") && c.tokens.kinds[c.cursor+1]==.Name {skipped:=advance(&mut c); return scratch_block(&mut c)}
+    if eat(&mut c, "unsafe") {
+        if !c.unsafe_capable { fail(&mut c, "module requires capability unsafe"); return false }
+        previous := c.unsafe_scope; c.unsafe_scope = true
+        after := c.closes[c.cursor] + 1; allowed := c.tail && terminal(&c, after, true)
+        result := block(&mut c, allowed); c.unsafe_scope = previous; return result
+    }
+    if eat(&mut c, "match") { return match_statement(&mut c) }
     if eat(&mut c, "return") {
         if is(&c, "\n") || is(&c, ";") || is(&c, "}") {
             if c.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
         } else { ty := expression(&mut c, 0, c.ret_type); same(&mut c, c.ret_type, ty) }
         end_statement(&mut c)
-        copy_value(&mut c, c.ret_type); arm.ret(&mut c.code)
+        if c.code.platform == 3 { wasm.op(&mut c.wasm, 15) }
+        copy_value(&mut c, c.ret_type); arm.branch(&mut c.code, c.cleanup, 0)
         return true
     }
     if eat(&mut c, "if") { after := conditional_end(&c, c.cursor); allowed := c.tail && terminal(&c, after, true); return conditional(&mut c, allowed) }
     if eat(&mut c, "while") {
+        if c.code.platform == 3 { wasm.loop_start(&mut c.wasm, false) }
         head := arm.label(&mut c.code); done := arm.label(&mut c.code); arm.mark(&mut c.code, head)
         ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); arm.branch(&mut c.code, done, 18)
-        c.loop_heads.push(head); c.loop_ends.push(done)
-        ends := block(&mut c, false); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
+        if c.code.platform == 3 { wasm.op(&mut c.wasm, 80); wasm.loop_jump(&mut c.wasm, false, true) }
+        c.loop_heads.push(head); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len)
+        ends := block(&mut c, false); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
+        if c.code.platform == 3 { wasm.loop_end(&mut c.wasm) }
         arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
         return false
     }
     if eat(&mut c, "for") {
         name := advance(&mut c); expect(&mut c, "in")
-        low := expression(&mut c, 0, 1); cursor := slot(&mut c); limit := slot(&mut c); values := slot(&mut c); binding := slot(&mut c)
+        low := expression(&mut c, 1, 1); cursor := slot(&mut c); limit := slot(&mut c); values := slot(&mut c); binding := slot(&mut c)
         var base := 1; var array := false
         if eat(&mut c, "..") {
+            if c.code.platform == 3 { wasm.indexed(&mut c.wasm, 33, cursor) }
             same(&mut c, 1, low); arm.store(&mut c.code, cursor, 0)
             high := expression(&mut c, 0, 1); same(&mut c, 1, high); arm.store(&mut c.code, limit, 0)
+            if c.code.platform == 3 {
+                wasm.indexed(&mut c.wasm, 33, limit); wasm.loop_start(&mut c.wasm, true)
+                wasm.indexed(&mut c.wasm, 32, cursor); wasm.indexed(&mut c.wasm, 32, limit); wasm.op(&mut c.wasm, 89); wasm.loop_jump(&mut c.wasm, false, true)
+            }
+        } else if low == type_id(&c, "range") {
+            arm.mov(&mut c.code, 1, 0); arm.emit(&mut c.code, 2470476800); arm.store(&mut c.code, cursor, 0)
+            arm.emit(&mut c.code, 2472606752); arm.store(&mut c.code, limit, 0)
         } else {
+            if c.code.platform == 3 { fail(&mut c, "selfhost wasm32 for requires a range"); return false }
             if !collection(&c, low) { fail(&mut c, "for requires a range or array"); return false }
-            array = true; base = c.type_bases[low]; copy_value(&mut c, low); arm.store(&mut c.code, values, 0)
+            array = true; base = c.type_bases[low]; copy_value(&mut c, low); save_owner(&mut c, values, low, true)
             load_mem(&mut c, 0, 0, 8); arm.store(&mut c.code, limit, 0); arm.imm(&mut c.code, 0, 0); arm.store(&mut c.code, cursor, 0)
         }
         head := arm.label(&mut c.code); next := arm.label(&mut c.code); done := arm.label(&mut c.code)
@@ -610,10 +1355,14 @@ fn statement(c: &mut Compiler) -> bool {
         arm.emit(&mut c.code, 3942645823); arm.branch(&mut c.code, done, 12)
         if array {
             arm.load(&mut c.code, values); load_mem(&mut c, 0, 0, 0); arm.push(&mut c.code, 0); arm.load(&mut c.code, cursor); arm.pop(&mut c.code, 1)
-            arm.emit(&mut c.code, 2332036128); load_mem(&mut c, 0, 0, 0); copy_value(&mut c, base); arm.store(&mut c.code, binding, 0)
+            arm.emit(&mut c.code, 2332033056 + i64(unsigned.shift(base)) * 1024); unsigned.transfer(&mut c.code, base, 0, 0, true); copy_value(&mut c, base); if owned(&c, base) { save_owner(&mut c, binding, base, false) } else { arm.store(&mut c.code, binding, 0) }
         }
-        c.loop_heads.push(next); c.loop_ends.push(done)
-        ends := block(&mut c, false); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
+        c.loop_heads.push(next); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len)
+        ends := block(&mut c, false); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
+        if c.code.platform == 3 {
+            wasm.end(&mut c.wasm); wasm.indexed(&mut c.wasm, 32, cursor); wasm.constant(&mut c.wasm, 1)
+            wasm.op(&mut c.wasm, 124); wasm.indexed(&mut c.wasm, 33, cursor); wasm.loop_end(&mut c.wasm)
+        }
         arm.mark(&mut c.code, next); arm.load(&mut c.code, cursor); arm.emit(&mut c.code, 2432697344); arm.store(&mut c.code, cursor, 0)
         arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done); leave(&mut c); return false
     }
@@ -621,8 +1370,9 @@ fn statement(c: &mut Compiler) -> bool {
         name := advance(&mut c)
         if c.loop_heads.len == 0 { fail(&mut c, "break or continue requires a loop"); return false }
         var target := c.loop_ends[c.loop_ends.len - 1]
+        if c.code.platform == 3 { wasm.loop_jump(&mut c.wasm, name == "continue", false) }
         if name == "continue" { target = c.loop_heads[c.loop_heads.len - 1] }
-        arm.branch(&mut c.code, target, 0)
+        cleanup_from(&mut c, c.loop_owners[c.loop_owners.len - 1], false); arm.branch(&mut c.code, target, 0)
         end_statement(&mut c)
         return false
     }
@@ -631,31 +1381,52 @@ fn statement(c: &mut Compiler) -> bool {
     if eat(&mut c, "var") { mutable = true }
     if c.tokens.kinds[c.cursor] == .Name && (c.tokens.texts[c.cursor + 1] == ":=" || c.tokens.texts[c.cursor + 1] == ":") {
         name := advance(&mut c); var expected := 0
+        if scratch_declaration(&mut c,name,mutable) {return false}
         if eat(&mut c, ":") { expected = type_name(&mut c); expect(&mut c, "=") } else { expect(&mut c, ":=") }
         ty := expression(&mut c, 0, expected)
         if expected != 0 { same(&mut c, expected, ty) }
         if ty == 0 { fail(&mut c, "local requires a value") }
-        copy_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index); arm.store(&mut c.code, index, 0)
+        if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { fail(&mut c, "borrows are limited to function parameters") }
+        copy_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index)
+        if c.code.platform == 3 { wasm.indexed(&mut c.wasm, 33, index) }
+        if owned(&c, ty) { save_owner(&mut c, index, ty, false) } else { arm.store(&mut c.code, index, 0) }
         end_statement(&mut c)
         return false
     }
     if mutable { fail(&mut c, "expected declaration after var"); return false }
+    first_token := c.cursor
     ty := expression(&mut c, 0, c.ret_type)
     if eat(&mut c, "=") {
-        destination := c.address; writable := c.writable
+        destination := c.address; writable := c.writable; packed := c.inline_place
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
-        value := expression(&mut c, 0, ty); same(&mut c, ty, value); copy_value(&mut c, ty)
-        arm.push(&mut c.code, 0); arm.load(&mut c.code, destination); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, 0)
+        if c.code.platform == 3 { wasm.op(&mut c.wasm, 26) }
+        value := expression(&mut c, 0, ty); same(&mut c, ty, value)
+        if packed {
+            arm.push(&mut c.code,0); arm.load(&mut c.code,destination); arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0)
+            store_inline(&mut c,ty); end_statement(&mut c); return false
+        }
+        copy_value(&mut c, ty)
+        if c.code.platform == 3 {
+            target := local(&c, c.tokens.texts[first_token])
+            if target < 0 { fail(&mut c, "selfhost wasm32 assignment requires a local"); return false }; wasm.indexed(&mut c.wasm, 33, c.local_slots[target])
+        }
+        arm.push(&mut c.code, 0)
+        if owned(&c, ty) { arm.load(&mut c.code, destination); load_mem(&mut c, 0, 0, 0); drop_value(&mut c, ty) }
+        arm.load(&mut c.code, destination); arm.pop(&mut c.code, 1); unsigned.transfer(&mut c.code, ty, 1, 0, false)
         end_statement(&mut c); return false
     }
-    if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); copy_value(&mut c, ty); arm.ret(&mut c.code); return true }
-    if ty != 0 { fail(&mut c, "unused value; bind it or return it") }
+    if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); if c.code.platform == 3 { wasm.op(&mut c.wasm, 15) }; copy_value(&mut c, ty); arm.branch(&mut c.code, c.cleanup, 0); return true }
+    if ty == 3 && c.testing {
+        if c.code.platform == 3 { wasm.op(&mut c.wasm, 80); wasm.check(&mut c.wasm) }
+        arm.branch(&mut c.code, c.assertion, 18)
+    } else if ty != 0 { fail(&mut c, "unused value; bind it or return it") }
     end_statement(&mut c)
     false
 }
 fn literals(c: &mut Compiler) {
     for i in 0..c.strings.len {
         if c.code.words.len % 2 != 0 { arm.emit(&mut c.code, 0) }
+        arm.emit(&mut c.code, 0); arm.emit(&mut c.code, 0) // immortal literal reference count
         arm.mark(&mut c.code, c.string_labels[i])
         text := c.strings[i]
         arm.emit(&mut c.code, i64(text.len)); arm.emit(&mut c.code, 0)
@@ -668,47 +1439,101 @@ fn literals(c: &mut Compiler) {
             }
             arm.emit(&mut c.code, word)
         }
+        if text.len % 4 == 0 { arm.emit(&mut c.code, 0) }
     }
 }
 fn clones(c: &mut Compiler) {
     for ty in 0..c.type_names.len {
-        if c.type_kinds[ty] == 2 {
-            arm.mark(&mut c.code, c.type_clones[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+        if !owned(&c, ty) || ty == 4 { continue }
+        arm.mark(&mut c.code, c.type_clones[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+        if c.c_record[ty] {
+            arm.push(&mut c.code,0); arm.imm(&mut c.code,0,i64(c.c_sizes[ty])); arm.branch(&mut c.code,c.runtime.alloc,1)
+            arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); copy_inline(&mut c,c.c_sizes[ty])
+        } else if c.type_kinds[ty] == 7 { arm.branch(&mut c.code, c.runtime.retain, 1) }
+        else if collection(&c, ty) {
+            arm.branch(&mut c.code, c.runtime.array_clone, 1)
+            if c.type_bases[ty] == 4 { arm.branch(&mut c.code, c.runtime.retain_elements, 1) }
+        } else {
             arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.type_counts[ty]) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1); arm.store(&mut c.code, 1, 0)
             first := c.type_starts[ty]
             for i in 0..c.type_counts[ty] {
                 arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); copy_value(&mut c, c.field_types[first + i])
                 arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
             }
-            arm.load(&mut c.code, 1); arm.ret(&mut c.code)
+            arm.load(&mut c.code, 1)
         }
+        arm.ret(&mut c.code)
+        arm.mark(&mut c.code, c.type_drops[ty]); drop_frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, drop_frame, 1)
+        done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18); arm.store(&mut c.code, 0, 0)
+        if c.type_kinds[ty] == 7 {
+            shared := arm.label(&mut c.code)
+            arm.emit(&mut c.code, 4167008257); arm.imm(&mut c.code, 2, 1); arm.emit(&mut c.code, 3942776895); arm.branch(&mut c.code, shared, 3)
+            for v in c.type_starts[ty]..c.type_starts[ty] + c.type_counts[ty] {
+                next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
+                arm.imm(&mut c.code, 1, c.field_values[v]); arm.emit(&mut c.code, 3942711327); arm.branch(&mut c.code, next, 3)
+                for i in 0..c.payload_counts[v] {
+                    pt := c.payload_types[c.payload_starts[v] + i]
+                    if owned(&c, pt) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8); drop_value(&mut c, pt) }
+                }
+                arm.branch(&mut c.code, shared, 0); arm.mark(&mut c.code, next)
+            }
+            arm.mark(&mut c.code, shared)
+        } else if collection(&c, ty) {
+            if c.type_bases[ty] == 4 { arm.branch(&mut c.code, c.runtime.release_elements, 1) }
+            load_mem(&mut c, 0, 0, 0); arm.branch(&mut c.code, c.runtime.release, 1)
+        } else if !c.c_record[ty] {
+            first := c.type_starts[ty]
+            for i in 0..c.type_counts[ty] {
+                field_ty := c.field_types[first + i]
+                if owned(&c, field_ty) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); drop_value(&mut c, field_ty) }
+            }
+        }
+        arm.load(&mut c.code, 0); arm.branch(&mut c.code, c.runtime.release, 1); arm.mark(&mut c.code, done); arm.ret(&mut c.code)
     }
 }
 pub fn compile(source: string) -> Result { compile_for(source, 0) }
 pub fn compile_for(source: string, platform: i32) -> Result {
-    tokens := lexer.lex(source)
-    if !tokens.ok { return Result { ok: false, error: tokens.error, offset: tokens.error_at, text: [] } }
+    var tokens := lexer.lex(source)
+    // Tokenize the formatter only for programs that mention floating values.
+    var uses_float := false
+    for i in 0..tokens.kinds.len {
+        if tokens.kinds[i] == .Float || (tokens.kinds[i] == .Name && (tokens.texts[i] == "f32" || tokens.texts[i] == "f64")) { uses_float = true; break }
+    }
+    if uses_float && tokens.ok && platform != 3 {
+        start := tokens.kinds.len - 1
+        tokens = lexer.lex(source + "\n" + bundled.float_formatter())
+        // The module loader reserves this prefix in user inputs. Keep the
+        // formatter private even when another module defines format_float_bits.
+        for i in start..tokens.kinds.len {
+            if tokens.texts[i] == "format_float_bits" { tokens.texts[i] = "__dunder_module_format_float_bits"; break }
+        }
+    }
+    if !tokens.ok { return Result { ok: false, error: tokens.error, offset: tokens.error_at, text: [], imports: imports() } }
     var code := arm.new_for(platform); rt := runtime.new(&mut code)
     var c := Compiler {
         tokens: tokens, closes: [], block_end: 0, tail: false, block_depth: 0, cursor: 0, ok: true, error: "", error_at: 0,
+        test_functions: [], testing: false,
         functions: map.new(), names: [], starts: [], ends: [], returns: [], param_starts: [], param_counts: [], param_names: [], param_types: [],
-        code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], field_names: [], field_types: [], field_values: [], address: -1, writable: false,
-        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
-        loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
+        wasm: wasm.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [],
+        code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], type_drops: [], field_names: [], field_types: [], field_values: [], payload_starts: [], payload_counts: [], payload_types: [], address: -1, writable: false, scratch_place: 0,
+        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
+        loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
-    for name in ["()", "i32", "i64", "bool", "string", "rune", "f32", "f64"] { added := add_type(&mut c, name, 0, 0) }
+    for name in ["()", "i32", "i64", "bool", "string", "rune", "f32", "f64", "u8", "u16", "u32", "u64", "usize", "ptr", "range"] { added := add_type(&mut c, name, 0, 0) }
     for i in 0..c.tokens.kinds.len { c.closes.push(-1) }
     headers(&mut c)
+    for t in 0..c.type_names.len { if c.c_record[t] { c_layout(&mut c, t) } }
     entry := map.get_or(&c.functions, "main", -1)
     if entry < 0 { fail(&mut c, "program needs main") }
-    if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [] } }
+    if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
     main_id := i32(entry)
     if c.param_counts[main_id] != 0 || (c.returns[main_id] != 0 && c.returns[main_id] != 1) { fail(&mut c, "main must take no arguments and return i32 or ()") }
     c.print_int = arm.label(&mut c.code); c.print_bool = arm.label(&mut c.code); c.print_text = arm.label(&mut c.code); c.write = arm.label(&mut c.code)
+    c.float_trap = arm.label(&mut c.code)
     c.overflow = arm.label(&mut c.code); c.zero = arm.label(&mut c.code); c.assertion = arm.label(&mut c.code); c.io = arm.label(&mut c.code); c.bounds = arm.label(&mut c.code)
     // The runtime owns x19/x20 (arena), x23/x24 (process arguments).
     arm.imm(&mut c.code, 19, 0); arm.imm(&mut c.code, 20, 0)
-    if platform == 1 { arm.emit(&mut c.code, 4181722103); arm.emit(&mut c.code, 2432705528) }
+    if platform != 0 { arm.emit(&mut c.code, 4181722103); arm.emit(&mut c.code, 2432705528) }
     else { arm.mov(&mut c.code, 23, 0); arm.mov(&mut c.code, 24, 1) }
     arm.branch(&mut c.code, c.fn_labels[main_id], 1)
     arm.syscall(&mut c.code, 33554433, 94); arm.emit(&mut c.code, 3558866944)
@@ -721,29 +1546,54 @@ pub fn compile_for(source: string, platform: i32) -> Result {
             if !c.ok { break }; if !c.needed[f] || compiled[f] { continue }
             compiled[f] = true; more = true
             c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
+            c.owned_slots.clear(); c.owned_types.clear(); c.owner_temps.clear()
+            c.testing = c.test_functions[f]
+            c.unsafe_scope = c.unsafe_functions[f]
+            c.cleanup = arm.label(&mut c.code)
             c.slots = 0; c.scope = 0; c.ret_type = c.returns[f]; c.cursor = c.starts[f] - 1
             arm.mark(&mut c.code, c.fn_labels[f]); frame := arm.prologue(&mut c.code)
             first := c.param_starts[f]
             for p in 0..c.param_counts[f] {
                 index := slot(&mut c); bind(&mut c, c.param_names[first + p], c.param_types[first + p], false, index)
+                if owned(&c, c.param_types[first + p]) { remember_owner(&mut c, index, c.param_types[first + p], false) }
                 if p < 8 { arm.store(&mut c.code, index, p) }
                 else { load_mem(&mut c, 0, 29, 16 + (p - 8) * 16); arm.store(&mut c.code, index, 0) }
             }
+            if platform == 3 {
+                if !wasm.scalar(c.ret_type) && c.type_kinds[c.ret_type] != 8 { fail(&mut c, "unsupported selfhost wasm32 return type") }
+                wasm.start(&mut c.wasm, f, c.param_counts[f], c.ret_type); c.slots = c.slots + 3
+            }
+            param_owners := c.owned_slots.len
+            initialize := arm.label(&mut c.code); body := arm.label(&mut c.code)
+            arm.branch(&mut c.code, initialize, 0); arm.mark(&mut c.code, body)
             c.scope = -1
             returns := block(&mut c, true)
             if c.ret_type != 0 && !returns { fail(&mut c, "function can finish without returning a value") }
-            arm.imm(&mut c.code, 0, 0); arm.ret(&mut c.code)
+            arm.imm(&mut c.code, 0, 0); arm.mark(&mut c.code, c.cleanup); arm.push(&mut c.code, 0)
+            cleanup_from(&mut c, 0, false); arm.pop(&mut c.code, 0); arm.ret(&mut c.code)
+            arm.mark(&mut c.code, initialize)
+            for o in param_owners..c.owned_slots.len { arm.store(&mut c.code, c.owned_slots[o], 31) }
+            arm.branch(&mut c.code, body, 0)
+            if platform == 3 { wasm.finish_fn(&mut c.wasm, c.slots, c.ret_type) }
             if c.ok { arm.frame(&mut c.code, frame, c.slots) }
         }
     }
-    if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [] } }
+    if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
+    if platform == 3 { return Result { ok: true, error: "", offset: 0, text: wasm.image(&c.wasm, main_id, &c.libraries, &c.symbols, &c.param_starts, &c.param_counts, &c.param_types, &c.returns), imports: imports() } }
+    arm.mark(&mut c.code, c.float_trap); arm.exit(&mut c.code, 107)
     arm.mark(&mut c.code, c.bounds); arm.exit(&mut c.code, 103)
     clones(&mut c)
     arm.runtime(&mut c.code, c.print_int, c.print_bool, c.print_text, c.write, c.overflow, c.zero, c.assertion, c.io)
     runtime.emit_runtime(&mut c.code, &rt)
+    data_start := c.code.words.len
     literals(&mut c)
-    text := arm.finish(&mut c.code)
-    Result { ok: true, error: "", offset: 0, text: text }
+    if platform == 2 {
+        native := x86.finish(&c.code, data_start, &c.imports.sites)
+        c.imports.sites = native.imports
+        return Result { ok: native.ok, error: native.error, offset: 0, text: native.text, imports: c.imports }
+    }
+    text := arm.finish_for(&mut c.code, c.imports.symbols.len > 0)
+    Result { ok: true, error: "", offset: 0, text: text, imports: c.imports }
 }
 @test fn compiler_checks_types_before_emitting_an_image() {
     compile("fn add(x:i32,y:i32)->i32{x+y} fn main(){print(add(20,22))}").ok

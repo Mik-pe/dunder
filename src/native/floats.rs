@@ -67,7 +67,8 @@ impl Code<'_> {
             return;
         }
         if from.integer() && to.float() {
-            self.emit(0x9e220000 | Self::fp_width(to)); // scvtf s0/d0,x0
+            let opcode = if from.unsigned() { 0x9e230000 } else { 0x9e220000 };
+            self.emit(opcode | Self::fp_width(to)); // ucvtf/scvtf s0/d0,x0
             self.fp_to_bits(0, 0, to);
         } else if from.float() && to.float() {
             self.bits_to_fp(0, 0, from);
@@ -80,12 +81,10 @@ impl Code<'_> {
         } else {
             self.bits_to_fp(0, 0, from);
             self.emit(0x1e25c000 | Self::fp_width(from)); // frintz
-            let limit: f64 = if to == Type::I32 {
-                2147483648.0
-            } else {
-                9223372036854775808.0
-            };
-            for (bound, condition) in [(-limit, 4), (limit, 10)] {
+            let bits = self.types.scalar_size(to) as i32 * 8;
+            let limit = 2.0_f64.powi(if to.unsigned() { bits } else { bits - 1 });
+            let lower = if to.unsigned() { 0.0 } else { -limit };
+            for (bound, condition) in [(lower, 4), (limit, 10)] {
                 let bits = if from == Type::F32 {
                     u64::from((bound as f32).to_bits())
                 } else {
@@ -97,7 +96,8 @@ impl Code<'_> {
                 self.branch(self.float_conversion, Branch::Cond(6)); // NaN
                 self.branch(self.float_conversion, Branch::Cond(condition));
             }
-            self.emit(0x9e380000 | Self::fp_width(from)); // fcvtzs x0,s0/d0
+            let opcode = if to.unsigned() { 0x9e390000 } else { 0x9e380000 };
+            self.emit(opcode | Self::fp_width(from)); // fcvtzu/fcvtzs x0,s0/d0
         }
     }
     pub(super) fn float_expr(&mut self, op: FloatOp, value: &Expr, result: Type) {

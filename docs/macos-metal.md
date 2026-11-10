@@ -5,12 +5,12 @@ en triangelista med Metal. Programmet kompileras direkt till en ARM64 Mach-O.
 Fönsterloopen, tillståndet, inmatningslogiken, geometrin och animationsmatematiken
 i exemplen är Dunder-kod.
 
-Den lilla nativegränsen anropar AppKit, QuartzCore och Metal genom systemets
-Objective-C-runtime. Ingen C-, Objective-C- eller Swift-källkod kompileras,
-och ingen extern länkare eller signeringsprocess krävs. Den fasta MSL-shadern
-kompileras av Apples Metal-runtime när fönstret öppnas. Det är en GPU-pipeline,
-inte en alternativ kompilator för Dunders CPU-kod. API:t tar inte emot egen
-shaderkod.
+AppKit-delegaten, händelsepollningen och Metal-kommandona ligger i
+`stdlib/macos/{appkit,objc,renderer}.ddr`. Objective-C-anrop har typade
+C-signaturer, inklusive CoreGraphics-värden som passerar i flyttalsregister.
+Delegaten registrerar vanliga Dunder-funktioner som callbacks. Ett giltigt
+`open` laddar AppKit, QuartzCore och Metal genom `std.dl`. Apples
+Metal-runtime kompilerar då den fasta MSL-shadern.
 
 Kör från en inloggad grafisk macOS-session på Apple Silicon:
 
@@ -56,6 +56,14 @@ arbeta ostört; framgång skriver `lifecycle cycles=3`:
 
 ```sh
 ./target/release/dunder run dogfood/metal/lifecycle.ddr
+```
+
+Händelsetestet ändrar storleken på sitt eget NSWindow och köar tangenttryck
+och press-, drag- och släpphändelser i programmets egen AppKit-kö. Det provar
+Retina-geometri, händelseordning, pekarkoordinater och stängningscallbacken.
+
+```sh
+./target/release/dunder run dogfood/metal/events.ddr
 ```
 
 En vanlig `.app` kan byggas utan projektgenerator:

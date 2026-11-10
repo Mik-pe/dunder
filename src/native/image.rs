@@ -13,11 +13,30 @@ const VM: u64 = 0x100000000;
 const COMMANDS: usize = 648;
 const RUNTIME_GLOBAL_BYTES: usize = 256;
 
-pub(super) const DYNAMIC_TEXT_OFFSET: usize = 688;
+pub(super) const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";
+#[cfg(test)]
+const DYNAMIC_TEXT_OFFSET: usize = 688;
 
-pub(super) fn dynamic_data_offset(text_len: usize) -> usize {
+fn dylib_command_size(name: &str) -> usize {
+    align(24 + name.len() + 1, 8)
+}
+
+fn commands_size(imports: &super::ffi::Imports) -> usize {
+    COMMANDS - 56
+        + imports
+            .libraries
+            .iter()
+            .map(|lib| dylib_command_size(lib))
+            .sum::<usize>()
+}
+
+pub(super) fn text_offset(imports: &super::ffi::Imports) -> usize {
+    align(32 + commands_size(imports), 16)
+}
+
+pub(super) fn dynamic_data_offset(text_offset: usize, text_len: usize) -> usize {
     align(
-        DYNAMIC_TEXT_OFFSET
+        text_offset
             .checked_add(text_len)
             .expect("dynamic executable text is too large"),
         PAGE,
@@ -235,14 +254,22 @@ pub(super) fn sign_bundle(
     Ok(())
 }
 
-pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
-    let data_off = dynamic_data_offset(text.len());
+#[cfg(test)]
+fn macho_imports(text: &[u8], imports: &super::ffi::Imports) -> Vec<u8> {
+    macho_imports_with_storage(text, imports, RUNTIME_GLOBAL_BYTES)
+}
+
+pub(super) fn macho_imports_with_storage(text: &[u8], imports: &super::ffi::Imports, global_bytes: usize) -> Vec<u8> {
+    let symbols = &imports.symbols;
+    let text_offset = text_offset(imports);
+    let commands = commands_size(imports);
+    let data_off = dynamic_data_offset(text_offset, text.len());
     let import_bytes = symbols
         .len()
         .checked_mul(8)
         .expect("too many dynamic imports");
     let data_len = import_bytes
-        .checked_add(RUNTIME_GLOBAL_BYTES)
+        .checked_add(global_bytes.max(RUNTIME_GLOBAL_BYTES))
         .expect("dynamic executable data is too large");
     let data_size = align(data_len, PAGE);
     let linkedit_off = data_off
@@ -253,12 +280,29 @@ pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
     if !symbols.is_empty() {
         // libSystem ordinal 1, pointer type, segment index 2 (__DATA), offset 0.
         binds.extend([0x11, 0x51, 0x72, 0x00]);
-        for symbol in symbols {
+        let mut previous = 0;
+        for (library, symbol) in symbols {
+            if *library != previous {
+                let ordinal = library + 1;
+                if ordinal < 16 {
+                    binds.push(0x10 | ordinal as u8);
+                } else {
+                    binds.push(0x20); // SET_DYLIB_ORDINAL_ULEB
+                    let mut value = ordinal;
+                    while value >= 128 {
+                        binds.push(value as u8 | 0x80);
+                        value >>= 7;
+                    }
+                    binds.push(value as u8);
+                }
+                previous = *library;
+            }
             assert!(
                 !symbol.is_empty() && !symbol.as_bytes().contains(&0),
                 "dynamic import names must be nonempty and contain no NUL"
             );
             binds.push(0x40); // SET_SYMBOL_TRAILING_FLAGS_IMM, no weak-import flag
+            binds.push(b'_');
             binds.extend(symbol.as_bytes());
             binds.push(0);
             binds.push(0x90); // DO_BIND also advances the slot address by 8
@@ -288,8 +332,8 @@ pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
         0x0100000c,
         0,
         2,
-        10,
-        COMMANDS as u32,
+        (9 + imports.libraries.len()) as u32,
+        commands as u32,
         0x00200085, // MH_PIE | MH_TWOLEVEL | MH_DYLDLINK | MH_NOUNDEFS
         0,
     ] {
@@ -305,9 +349,9 @@ pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
     );
     name(&mut image, "__text");
     name(&mut image, "__TEXT");
-    u64le(&mut image, VM + DYNAMIC_TEXT_OFFSET as u64);
+    u64le(&mut image, VM + text_offset as u64);
     u64le(&mut image, text.len() as u64);
-    for n in [DYNAMIC_TEXT_OFFSET as u32, 4, 0, 0, 0x80000400, 0, 0, 0] {
+    for n in [text_offset as u32, 4, 0, 0, 0x80000400, 0, 0, 0] {
         u32le(&mut image, n);
     }
     segment(
@@ -353,15 +397,17 @@ pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
     for n in [0x80000028, 24] {
         u32le(&mut image, n);
     }
-    u64le(&mut image, DYNAMIC_TEXT_OFFSET as u64);
+    u64le(&mut image, text_offset as u64);
     u64le(&mut image, 0);
-    // LC_LOAD_DYLIB: its position among dylib commands gives library ordinal 1.
-    for n in [0xc, 56, 24, 0, 0x10000, 0x10000] {
-        u32le(&mut image, n);
+    for library in &imports.libraries {
+        let size = dylib_command_size(library);
+        let start = image.len();
+        for n in [0xc, size as u32, 24, 0, 0x10000, 0x10000] {
+            u32le(&mut image, n);
+        }
+        image.extend(library.as_bytes());
+        image.resize(start + size, 0);
     }
-    let mut dylib = [0u8; 32];
-    dylib[..26].copy_from_slice(b"/usr/lib/libSystem.B.dylib");
-    image.extend(dylib);
     for n in [
         0x80000022,
         48,
@@ -381,9 +427,9 @@ pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
     for n in [0x1d, 16, sig_off as u32, sig_size as u32] {
         u32le(&mut image, n);
     }
-    assert_eq!(image.len(), 32 + COMMANDS);
-    assert_eq!(DYNAMIC_TEXT_OFFSET, align(image.len(), 16));
-    image.resize(DYNAMIC_TEXT_OFFSET, 0);
+    assert_eq!(image.len(), 32 + commands);
+    assert_eq!(text_offset, align(image.len(), 16));
+    image.resize(text_offset, 0);
     image.extend(text);
     image.resize(linkedit_off, 0); // text padding, import slots, and runtime globals
     image.extend(binds);
@@ -427,6 +473,18 @@ pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
     sig.resize(sig_size, 0);
     image.extend(sig);
     image
+}
+
+#[cfg(test)]
+fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
+    let imports = super::ffi::Imports {
+        libraries: vec![LIBSYSTEM.into()],
+        symbols: symbols
+            .iter()
+            .map(|name| (0, name.strip_prefix('_').unwrap().to_owned()))
+            .collect(),
+    };
+    macho_imports(text, &imports)
 }
 
 #[cfg(test)]
@@ -504,7 +562,7 @@ mod tests {
         assert_eq!(big32(cd, 28), sig_off / PAGE);
         assert_eq!(
             u64::from_be_bytes(cd[72..80].try_into().unwrap()),
-            dynamic_data_offset(2 * PAGE) as u64
+            dynamic_data_offset(DYNAMIC_TEXT_OFFSET, 2 * PAGE) as u64
         );
         let hash_off = big32(cd, 16);
         for i in 0..sig_off / PAGE {

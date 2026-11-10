@@ -187,6 +187,45 @@ impl Lower {
                 self.fp_store(dst, 0, wide);
                 return true;
             }
+            0x9e230000 | 0x9e630000 => {
+                let prefix = if wide { 0xf2 } else { 0xf3 };
+                self.load(0, src);
+                self.emit(&[0x48, 0x85, 0xc0]); // test rax,rax
+                let small = self.float_jump(Some(9)); // jns
+                // Fold the low bit into the half before rounding. This preserves
+                // ties-to-even for the subsequent exact multiplication by two.
+                self.emit(&[0x48, 0x89, 0xc1, 0x83, 0xe1, 1]);
+                self.emit(&[0x48, 0xd1, 0xe8, 0x48, 0x09, 0xc8]);
+                self.emit(&[prefix, 0x48, 0x0f, 0x2a, 0xc0]);
+                self.emit(&[prefix, 0x0f, 0x58, 0xc0]); // addss/addsd xmm0,xmm0
+                let done = self.float_jump(None);
+                self.float_patch(small);
+                self.emit(&[prefix, 0x48, 0x0f, 0x2a, 0xc0]);
+                self.float_patch(done);
+                self.fp_store(dst, 0, wide);
+                return true;
+            }
+            0x9e390000 | 0x9e790000 => {
+                // The caller has proved 0 <= value < 2^64. SSE2 converts
+                // signed 64-bit values, so subtract 2^63 in the upper half.
+                self.fp_load(0, src, wide);
+                let prefix = if wide { 0xf2 } else { 0xf3 };
+                let limit = if wide { 0x43e0000000000000 } else { 0x5f000000 };
+                self.imm64(0, limit);
+                self.emit(&[0x66, 0x48, 0x0f, 0x6e, 0xc8]); // movq xmm1,rax
+                if wide { self.emit(&[0x66]); }
+                self.emit(&[0x0f, 0x2e, 0xc1]); // ucomiss/ucomisd xmm0,xmm1
+                let small = self.float_jump(Some(2)); // jb
+                self.emit(&[prefix, 0x0f, 0x5c, 0xc1]); // subss/subsd xmm0,xmm1
+                self.emit(&[prefix, 0x48, 0x0f, 0x2c, 0xc0]);
+                self.emit(&[0x48, 0x0f, 0xba, 0xe8, 63]); // bts rax,63
+                let done = self.float_jump(None);
+                self.float_patch(small);
+                self.emit(&[prefix, 0x48, 0x0f, 0x2c, 0xc0]);
+                self.float_patch(done);
+                self.store(dst, 0);
+                return true;
+            }
             0x9e380000 | 0x9e780000 => {
                 self.fp_load(0, src, wide);
                 self.emit(&[if wide { 0xf2 } else { 0xf3 }, 0x48, 0x0f, 0x2c, 0xc0]);

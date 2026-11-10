@@ -14,24 +14,27 @@ pub(crate) fn dynamic_data_offset(text_len: usize) -> usize {
 pub(crate) fn dynamic_executable(
     text: &[u8],
     machine: u16,
-    symbols: &[&str],
+    imports: &super::ffi::Imports,
     global_bytes: usize,
 ) -> Vec<u8> {
+    let symbols = &imports.symbols;
     let interpreter = match machine {
         62 => b"/lib64/ld-linux-x86-64.so.2\0".as_slice(),
         183 => b"/lib/ld-linux-aarch64.so.1\0".as_slice(),
         _ => panic!("unsupported dynamic ELF machine"),
     };
     let data = dynamic_data_offset(text.len());
-    let mut image = vec![0; data + global_bytes.max(symbols.len() * 8).next_multiple_of(8)];
+    let mut image = vec![0; data + (global_bytes + symbols.len() * 8).next_multiple_of(8)];
     image[TEXT_OFFSET..TEXT_OFFSET + text.len()].copy_from_slice(text);
     let mut strings = vec![0];
-    let libc = strings.len();
-    strings.extend_from_slice(b"libc.so.6\0");
-    let libdl = strings.len();
-    strings.extend_from_slice(b"libdl.so.2\0");
+    let mut needed = Vec::new();
+    for library in &imports.libraries {
+        needed.push(strings.len());
+        strings.extend_from_slice(library.as_bytes());
+        strings.push(0);
+    }
     let mut names = Vec::new();
-    for name in symbols {
+    for (_, name) in symbols {
         assert!(!name.is_empty() && !name.as_bytes().contains(&0));
         names.push(strings.len());
         strings.extend_from_slice(name.as_bytes());
@@ -75,8 +78,6 @@ pub(crate) fn dynamic_executable(
     }
     let dynamic = image.len();
     let entries = [
-        (1, libc as u64),
-        (1, libdl as u64),
         (4, BASE + hash_table as u64),
         (5, BASE + string_table as u64),
         (10, strings.len() as u64),
@@ -88,7 +89,12 @@ pub(crate) fn dynamic_executable(
         (24, 0), // DT_BIND_NOW: no lazy resolution or PLT trampoline.
         (0, 0),
     ];
-    for (tag, value) in entries {
+    let dynamic_size = (needed.len() + entries.len()) * 16;
+    for (tag, value) in needed
+        .into_iter()
+        .map(|offset| (1, offset as u64))
+        .chain(entries)
+    {
         image.extend_from_slice(&u64::to_le_bytes(tag));
         image.extend_from_slice(&u64::to_le_bytes(value));
     }
@@ -109,7 +115,7 @@ pub(crate) fn dynamic_executable(
         (3, 4, INTERPRETER, interpreter.len(), 1),
         (1, 5, 0, data, 4096), // Read/execute image headers and text.
         (1, 6, data, length - data, 4096),
-        (2, 6, dynamic, entries.len() * 16, 8),
+        (2, 6, dynamic, dynamic_size, 8),
         (0x6474e551, 6, 0, 0, 16), // PT_GNU_STACK, not executable.
     ]
     .into_iter()

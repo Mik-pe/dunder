@@ -53,9 +53,9 @@ Läs [maskinkodsoptimeringen](optimization.md) och dess mätunderlag.
 
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
 dynamisk laddare eller libc. Nåbara Vulkan-anrop väljer en egen dynamisk ELF
-med eager imports för `dlopen`/`dlsym`, separata RX/RW-segment och ett native
-C-ABI. Den kompileras för både ARM64/Linux och x86-64/Linux; Vulkan-körning
-är verifierad på x86-64 med lavapipe. Stacken är inte körbar och kodsegmentet
+med eager imports av libc- och loaderfunktioner, separata RX/RW-segment och
+ett native C-ABI. Vulkan-körning med lavapipe är verifierad på både
+ARM64/Linux och x86-64/Linux. Stacken är inte körbar och kodsegmentet
 är inte skrivbart. Linux-retur och runtimefel använder `exit_group` så att
 även grafikdrivrutinens arbetstrådar avslutas.
 Systembiblioteket anpassar anropsnummer, argument, metadata-layout och felkoder

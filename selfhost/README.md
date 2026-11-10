@@ -1,6 +1,6 @@
 # Dunder i Dunder
 
-**Dunder-kompilatorn kan bygga sig själv för ARM64/macOS och ARM64/Linux.** Stage 1
+**Dunder-kompilatorn kan bygga sig själv för ARM64/macOS, ARM64/Linux och x86-64/Linux.** Stage 1
 bygger stage 2 från dessa källfiler; stage 2 bygger en byteidentisk stage 3.
 Stage 3 bygger dessutom fristående program som körs och jämförs med
 oberoende förväntade resultat. Fixpunkten har körts direkt på ARM64 för båda systemen och för Linux med QEMU på x86-64.
@@ -10,11 +10,18 @@ ELF- och Mach-O-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompil
 assembler eller länkare. QEMU används bara för att köra ARM64-binärer
 på en annan processor.
 
-Rust-bootstrapens genererade program har nu deterministisk bufferfrigöring
-och referensräknade strängar. Den Dunder-skrivna backendens egen runtime
-använder fortfarande bump-allokering. Stage 1 får den nya minnesmodellen;
-stage 2 och senare behöver ännu samma portning. En byteidentisk fixpunkt
-verifierar självbygget, inte minnesmodellparitet. Se [minnesarkitekturen](../docs/memory.md).
+ARM64-backendens runtime återanvänder minnesblock per storleksklass i en
+512 MiB-pool och räknar referenser till dynamiska strängar. Kompilatorn
+frigör lokaler, temporära uttryck, arraybuffertar och structfält vid
+tilldelning och scope-slut, inklusive retur och loopavbrott. Statiska
+strängar har räknare noll. Rust-bootstrapens pooler och ABI beskrivs i
+[minnesarkitekturen](../docs/memory.md).
+
+ARM64-vägen kompilerar `f32` och `f64` med IEEE-aritmetik, konverteringar,
+jämförelser, bitoperationerna `from_bits`/`to_bits`, avrundning och
+klassificering. Decimalliteraler avrundas direkt till begärd precision.
+`print` och `.str()` använder samma [decimalformatterare](../runtime/float.ddr)
+som Rust-bootstrapen.
 
 ## Byggkedjan
 
@@ -45,15 +52,30 @@ qemu-aarch64 build/hello-selfhost
 `selfhost/linux.ddr` skriver alltid ARM64/Linux, oberoende av stage 1:s
 värdplattform. `selfhost/main.ddr` skriver signerade Mach-O-binärer för ARM64/macOS.
 På en Mac går samma byggkedja att köra med `main.ddr` och utan QEMU.
-Båda ingångarna använder samma modulladdare och parser.
+`selfhost/x86_linux.ddr` skriver x86-64/Linux. Alla tre använder samma
+modulladdare, typkontroll och native-runtime. Dunder-backenden för x86-64
+översätter den gemensamma kompilatorns instruktioner och symboliska hopp före
+ELF-skrivningen. Linux-entry, registerbank, stackgränser och syscall-ABI är
+specifika för x86-64. Så här verifieras fixpunkten på en x86-64/Linux-värd:
+
+```sh
+dunder build selfhost/x86_linux.ddr -o build/x86-stage1
+build/x86-stage1 build selfhost/x86_linux.ddr -o build/x86-stage2
+build/x86-stage2 build selfhost/x86_linux.ddr -o build/x86-stage3
+cmp build/x86-stage2 build/x86-stage3
+```
 
 ## Vad kompilatorn klarar
 
 Självbygget använder punktimporter, alias, privata/exporterade symboler,
 cykliska modulgrafer, structar med djup värdekopiering, fält och lån,
-dynamiska arrayer, enkla enums, UTF-8-strängar, strängsnitt och iteration.
+fasta och dynamiska arrayer, taggade enums med payload, UTF-8-strängar
+och strängsnitt. Ett `match` kontrollerar uttömmande fall, binder egna
+kopior av payloadvärden och kan returnera funktionens värde.
 Funktioner stöder framåtanrop, rekursion, aggregatreturer och fler än åtta
-parametrar. Heltalsaritmetik, bitoperationer, kontrollflöde, `print`,
+parametrar. Funktionsvärden med signaturen `fn(...) -> T` kan skickas som
+argument och anropas indirekt. `range` bevarar tecknet hos båda gränserna
+och en iterator från `.iter()` kan användas i flera loopar. Heltalsaritmetik, bitoperationer, kontrollflöde, `print`,
 `assert` och de systemanrop som behövs för kompilatorns filhantering ingår.
 
 Standardbibliotekets källor är inbäddade i `bundled.ddr`. Efter ändringar
@@ -68,16 +90,12 @@ och rad. Den skyddar indata och importerade filer från överskrivning,
 även via symboliska och hårda länkar. Utdata publiceras med temporär fil
 och rename efter ett lyckat bygge.
 
-Detta är ännu en mindre implementation än Rust-bootstrapen. Bara nåbara
-funktionskroppar kompileras och kontrolleras; `@test`-block tas bort vid
-modulladdning. Fasta arrayer med skalära element stöder deklaration, repetition,
-indexering, kopiering och iteration. Stöd för payload-enums/`match`, flyttal,
-funktionsvärden, generell lånekontroll och alla standardbiblioteksoperationer
-återstår. Självhosting betyder att kompilatorn bygger sin egen källkod;
-det betyder ännu inte full språkparitet.
-
-macOS-/Metal-intrinsics och `.app`-paketering finns tills vidare bara
-i Rust-bootstrapens byggväg. Metal-exemplen byggs med den vanliga `dunder`.
+Vid vanliga byggen kontrollerar självhosten nåbara funktionskroppar. Den
+stöder skalära arrayelement och enkla enumvarianter i arrayer. Den generella
+lånekontrollen, alla typer av nästlade arrayelement och en fullständig
+paritetskontroll av ogiltiga program återstår. Syntax- och typfel från
+självhosten rapporteras fortfarande med den gemensamma koden E1000.
+Rust-bootstrapen behövs för hela CLI:t och paketeringen av en macOS-app.
 
 ## Filer
 
@@ -87,6 +105,7 @@ i Rust-bootstrapens byggväg. Metal-exemplen byggs med den vanliga `dunder`.
 | `modules.ddr` | Modulgraph, namn, synlighet, deduplicering och källmappning. |
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
 | `compile.ddr` | Typer, uttryck, kontrollflöde, värdesemantik och kodgenerering. |
+| `x86.ddr`, `x86_linux.ddr` | x86-64-kodgenerering och Linux-ingång. |
 | `arm64.ddr` | Maskinord, register, stack, etiketter och hoppfixering. |
 | `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Darwin- och Linux-systemanrop. |
 | `driver.ddr` | Gemensam modulladdning, felrapportering och publicering av filer. |
@@ -110,7 +129,9 @@ direkt. Kompilatorprocesserna körs med tom miljö och utan externa verktyg i
 
 Regressionerna täcker variabla bitförskjutningar, heltal, nästlade structar,
 oberoende arraykopior, UTF-8, moduler, diagnostik och skydd av källfiler.
-Stage 3 bygger även det fristående CSV-projektet Tabell och dess rapport
+Stage 3 bygger och kör de tolv icke-grafiska dogfood-programmens
+`main` på ARM64/macOS och ARM64/Linux. Testet jämför stdout, stderr och
+returkod med Rust-bootstrapen. Stage 3 bygger även det fristående CSV-projektet Tabell och dess rapport
 jämförs med förväntad CSV. En lokal körning på inventeringen av Blixts
 källfiler gav också samma gruppsummor som den oberoende referensen.
 Ett separat test ser till att det inbäddade standardbiblioteket är aktuellt.

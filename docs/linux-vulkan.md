@@ -5,10 +5,12 @@ Scen, geometri, animation, programargument och inmatningslogik är Dunder-kod.
 Exemplen motsvarar Metal-dogfoodens triangel och Kinetic Atlas.
 
 Dunder skriver själv nativekod och en dynamisk ELF-fil för Linux. Den
-anropar systemets Vulkan-loader genom ett typat nativegränssnitt; ingen
-C-brygga, extern assembler eller länkare ingår i bygget. Den fasta
-SPIR-V-pipelinen är inbäddad. GLSL-källorna finns i `src/native/vulkan/`,
-men shaderkompilator behövs inte för att bygga eller köra Dunder-program.
+laddar systemets Vulkan-bibliotek genom `std.dl`. Implementationen i
+`stdlib/vulkan/` beskriver driverstrukturerna med `@c_layout` och anropar
+Vulkan och SDL genom typade `extern fn`-fält. Modulen äger allokering,
+livscykel, rasteriseringens konfiguration och händelsehantering.
+SPIR-V-orden finns i `shader.ddr` tillsammans med GLSL-källorna i samma
+katalog. En shaderkompilator behövs endast när shaderkoden ändras.
 
 Vulkan renderar till en bild som kan läsas tillbaka som RGBA. Fönsterläget
 visar samma bild via SDL2:s mjukvaruyta. SDL hanterar fönster och händelser;
@@ -108,7 +110,7 @@ Kör Vulkan-testerna uttryckligen med lavapipe och valideringslagret:
 
 ```sh
 sudo apt install vulkan-validationlayers
-VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation DUNDER_VULKAN_TEST=1 \
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation DUNDER_VULKAN_TEST=1 DUNDER_SDL_TEST=1 \
   cargo test --test vulkan -- --test-threads=1
 ```
 
@@ -116,10 +118,10 @@ När Vulkan-tester begärs är saknad loader eller drivrutin ett testfel.
 Pixeltester kontrollerar bakgrund, rasteriserad geometri, Y-riktning,
 färginterpolering, alpha och oberoende snapshots. Livscykeltesterna
 provar flera öppningar, stängningar, gamla handtag och felaktiga indata.
+`DUNDER_SDL_TEST=1` läser även tillbaka en pixel från SDL-fönstrets egna yta
+och kör två händelser genom den riktiga SDL-kön med dess dummy-videodrivrutin.
 
 Detta är en första synkron renderingsväg. Vulkan-swapchain, flera samtidiga
 fönster, texturer, egen shaderkod och textlayout återstår. Readback och
 mjukvarupresentation gör den olämplig som prestandareferens för en framtida
-GPU-driven swapchain. Vulkan-intrinsics och flyttalsstödet finns ännu bara
-i Rust-bootstrapens byggväg; den självbyggda Dunder-kompilatorn har inte
-full språkparitet.
+GPU-driven swapchain. Grafikmodulen byggs med bootstrapkompilatorns FFI-stöd.

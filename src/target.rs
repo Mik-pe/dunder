@@ -6,13 +6,29 @@ pub enum Target {
     Arm64Macos,
     Arm64Linux,
     X86_64Linux,
+    Wasm32,
 }
 
 impl Target {
-    pub const ALL: [Self; 3] = [Self::Arm64Macos, Self::Arm64Linux, Self::X86_64Linux];
+    pub const NATIVE: [Self; 3] = [Self::Arm64Macos, Self::Arm64Linux, Self::X86_64Linux];
+
+    pub const ALL: [Self; 4] = [
+        Self::Arm64Macos,
+        Self::Arm64Linux,
+        Self::X86_64Linux,
+        Self::Wasm32,
+    ];
+
+    pub const fn pointer_bytes(self) -> usize {
+        match self {
+            Self::Wasm32 => 4,
+            _ => 8,
+        }
+    }
 
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Wasm32 => "wasm32",
             Self::Arm64Macos => "arm64-macos",
             Self::Arm64Linux => "arm64-linux",
             Self::X86_64Linux => "x86_64-linux",
@@ -46,11 +62,12 @@ impl FromStr for Target {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "wasm32" | "wasm32-unknown-unknown" => Ok(Self::Wasm32),
             "arm64-macos" | "aarch64-apple-darwin" => Ok(Self::Arm64Macos),
             "arm64-linux" | "aarch64-unknown-linux-gnu" => Ok(Self::Arm64Linux),
             "x86_64-linux" | "x86_64-unknown-linux-gnu" => Ok(Self::X86_64Linux),
             _ => Err(format!(
-                "unsupported target '{value}'; supported targets: arm64-macos, arm64-linux, x86_64-linux"
+                "unsupported target '{value}'; supported targets: arm64-macos, arm64-linux, x86_64-linux, wasm32"
             )),
         }
     }

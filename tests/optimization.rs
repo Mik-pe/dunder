@@ -279,3 +279,129 @@ fn main(){
         "42\n",
     );
 }
+
+#[test]
+fn inline_parameters_are_eager_and_loop_homes_survive_calls_and_borrows() {
+    Program::new().check(
+        r#"
+struct Point { x:f32, y:f32 }
+fn point(x:f32,y:f32)->Point{Point{x:x,y:y}}
+fn bump(state:&mut i32)->i32{state=state+1;state}
+fn pair(left:i32,right:i32)->i32{left*10+right}
+fn twice(a:i32)->i32{a+a}
+fn nested(n:i32)->i32{
+    if n==0{return 0}
+    var acc:=0
+    var i:=0
+    while i<n{acc=acc+i;i=i+1}
+    return acc+nested(n-1)
+}
+fn main(){
+    var p:=point(3.0,8.0)
+    p=point(p.y,p.x)
+    assert(p.x==8.0 && p.y==3.0)
+    var count:=1
+    assert(pair(count,bump(&mut count))==12)
+    assert(pair(bump(&mut count),twice(bump(&mut count)))==38)
+    assert(count==4)
+    var sum:=0
+    while count<10 {
+        sum=sum+nested(4)
+        next:=bump(&mut count)
+    }
+    assert(count==10 && sum==60)
+    print(42)
+}
+"#,
+        0,
+        "42\n",
+    );
+    Program::new().check(
+        "fn first(a:i32,b:i32)->i32{a} fn main(){print(17);print(first(42,1/0))}",
+        102,
+        "17\n",
+    );
+}
+
+#[test]
+fn transferred_buffers_and_strings_keep_independent_owners() {
+    Program::new().check(
+        r#"
+fn words(input:string)->[]string{
+    var data:[]string=[input+"1",input+"2"]
+    if input=="early"{return data}
+    data.push(input+"3")
+    data
+}
+fn identity(input:string)->string{input}
+fn main(){
+    var i:=0
+    while i<200{
+        var original:=words("early")
+        var copy:=original
+        original[0]="new"
+        assert(copy[0]=="early1" && original[0]=="new")
+        var moved:=words("late")
+        assert(moved.pop()=="late3")
+        var transient:=identity("heap"+i.str())
+        assert(transient.len>=5)
+        i=i+1
+    }
+    print(42)
+}
+"#,
+        0,
+        "42\n",
+    );
+}
+
+#[test]
+fn packed_unsigned_scalars_keep_width_across_native_operations() {
+    Program::new().check(
+        r#"
+        fn set_byte(value:&mut u8) { value = 250 }
+        fn lots(a:u8,b:u8,c:u8,d:u8,e:u8,f:u8,g:u8,h:u8,i:u8,j:u16,k:u32)->u32 {
+            u32(i) + u32(j) + k
+        }
+        fn main(){
+            var bytes:[]u8 = [1,2,3]
+            set_byte(&mut bytes[1])
+            var clone := bytes
+            clone[1] = 7
+            assert(bytes[1] == 250 && bytes[2] == 3)
+            var halves:[u16;3] = [65000,17,50000]
+            halves[1] = 54321
+            assert(halves[0] == 65000 && halves[1] == 54321 && halves[2] == 50000)
+            assert(lots(0,1,2,3,4,5,6,7,8,60000,4000000000) == 4000060008)
+            max:u64 = 18446744073709551615
+            assert(max > 9223372036854775808 && max / 3 == 6148914691236517205)
+            assert(max % 7 == 1 && max.wrapping_add(1) == 0)
+            assert(u8(130).shl(1) == 4 && u16(0).bit_not() == 65535)
+            high:u64 = 9223372036854775808
+            assert(u64(f64(high)) == high && u64(f32(high)) == high)
+            assert(u64(4611686018427387904) * 3 == 13835058055282163712)
+            print(max)
+            print(max.str())
+        }
+        "#,
+        0,
+        "18446744073709551615\n18446744073709551615\n",
+    );
+}
+
+#[test]
+fn unsigned_arithmetic_and_conversions_trap_before_wraparound() {
+    let program = Program::new();
+    for expr in [
+        "u8(255) + 1",
+        "u16(0) - 1",
+        "u32(65536) * 65536",
+        "u64(9223372036854775808) * 2",
+        "u64(18446744073709551615) + 1",
+        "u8(u16(256))",
+        "u64(i32(-1))",
+        "i64(u64(9223372036854775808))",
+    ] {
+        program.check(&format!("fn main(){{print({expr})}}"), 101, "");
+    }
+}

@@ -1,0 +1,397 @@
+// Lower the shared compiler's integer instruction vocabulary before serialization.
+// Values live in a private register bank under r15. Native calls use the host stack.
+import arm64 as arm
+
+pub struct Result { ok:bool, error:string, text:[]u8, imports:[]i32 }
+struct Emitter {
+    text:[]u8, at:[]i32, targets:[]i32, stack_traps:[]i32,
+}
+
+// Constant instruction bytes are written in instruction order, immediates in
+// little-endian order. None of the instruction bytes are interpreted at runtime.
+fn byte(c:&mut Emitter, n:i32) { c.text.push(u8(n)) }
+fn op(c:&mut Emitter, bytes:i64) {
+    if bytes > 255 { op(&mut c, bytes.shr(8)) }
+    byte(&mut c,i32(bytes.bit_and(255)))
+}
+fn little(c:&mut Emitter, n:i64, count:i32) {
+    for i in 0..count { byte(&mut c,i32(n.shr(8*i).bit_and(255))) }
+}
+fn displacement(c:&mut Emitter, at:i32, target:i32) {
+    delta := target - (at+4)
+    for i in 0..4 { c.text[at+i]=u8(delta.shr(8*i).bit_and(255)) }
+}
+fn placeholder(c:&mut Emitter)->i32 { at:=c.text.len;little(&mut c,0,4);at }
+fn jump(c:&mut Emitter, condition:i32)->i32 {
+    if condition<0 { op(&mut c,233) }
+    else { op(&mut c,15);byte(&mut c,128+condition) }
+    placeholder(&mut c)
+}
+fn patch(c:&mut Emitter,at:i32){ to:=c.text.len;displacement(&mut c,at,to) }
+fn imm(c:&mut Emitter,reg:i32,n:i64) {
+    if n>=0 && n<=4294967295 {
+        if reg>=8 {op(&mut c,65)}
+        byte(&mut c,184+reg%8);little(&mut c,n,4)
+    } else {
+        byte(&mut c,72+reg/8);byte(&mut c,184+reg%8);little(&mut c,n,8)
+    }
+}
+fn bank(c:&mut Emitter, reg:i32, slot:i32, read:bool) {
+    byte(&mut c,73+4*(reg/8))
+    if read {byte(&mut c,139)} else {byte(&mut c,137)}
+    byte(&mut c,135+(reg%8)*8);little(&mut c,i64(slot)*8,4)
+}
+fn load(c:&mut Emitter,reg:i32,slot:i32) {
+    if slot==31 { imm(&mut c,reg,0) }
+    else { bank(&mut c,reg,slot,true) }
+}
+fn store(c:&mut Emitter,slot:i32,reg:i32){if slot!=31{bank(&mut c,reg,slot,false)}}
+// Before any write to the virtual SP, ensure even a large frame stays in
+// the allocated stack and cannot jump over the register bank.
+fn store_base(c:&mut Emitter,slot:i32) {
+    if slot==31 {
+        op(&mut c,4819395);op(&mut c,5057019) // r11=rax-r15
+        op(&mut c,4817403);little(&mut c,8192,4)
+        below:=jump(&mut c,2);c.stack_traps.push(below)
+        op(&mut c,4817403);little(&mut c,67108864,4)
+        above:=jump(&mut c,7);c.stack_traps.push(above)
+    }
+    bank(&mut c,0,slot,false)
+}
+fn flags(c:&mut Emitter,subtract:bool) {
+    if subtract {op(&mut c,245)}
+    op(&mut c,2621542279);little(&mut c,256,4) // pushfq; pop [r15+256]
+}
+fn cc(c:&mut Emitter,cond:i32)->i32 {
+    op(&mut c,4325303);little(&mut c,256,4);op(&mut c,157)
+    if cond==8 || cond==9 {op(&mut c,245)}
+    table:[i32;16]=[4,5,2,3,8,9,0,1,7,6,13,12,15,14,0,0]
+    table[cond]
+}
+fn prelude(c:&mut Emitter){
+    op(&mut c,4819430) // r14 = Linux entry stack
+    imm(&mut c,0,9);imm(&mut c,7,0);imm(&mut c,6,67108864);imm(&mut c,2,3)
+    imm(&mut c,10,34);imm(&mut c,8,-1);imm(&mut c,9,0);op(&mut c,3845)
+    op(&mut c,4752832);good:=jump(&mut c,9)
+    imm(&mut c,0,231);imm(&mut c,7,74);op(&mut c,251989771)
+    patch(&mut c,good);op(&mut c,4819399)
+    // Copy argc, argv and its terminator to the top of the value stack.
+    op(&mut c,4819726);op(&mut c,1216594178);op(&mut c,4753866);op(&mut c,1220665859)
+    op(&mut c,1216594447);op(&mut c,1216602864);op(&mut c,4820415);little(&mut c,67108864,4)
+    op(&mut c,4729303);op(&mut c,4753912);store_base(&mut c,31)
+    op(&mut c,5016054);op(&mut c,4243802277)
+}
+fn syscall(c:&mut Emitter,number:i32)->bool {
+    var native: i64 = -1
+    arm_ids:[i32;15]=[93,94,63,64,222,56,57,35,53,34,172,38,79,80,46]
+    x86_ids:[i32;15]=[60,231,0,1,9,257,3,263,268,258,39,264,262,5,77]
+    for i in 0..15 { if arm_ids[i]==number {native=i64(x86_ids[i]);break} }
+    if native<0{return false}
+    imm(&mut c,0,native)
+    load(&mut c,7,0);load(&mut c,6,1);load(&mut c,2,2)
+    load(&mut c,10,3);load(&mut c,8,4);load(&mut c,9,5)
+    op(&mut c,3845);store(&mut c,0,0);true
+}
+fn relocation(c:&mut Emitter,kind:i32,target:i32){
+    if kind==0 {op(&mut c,233)}
+    else if kind==1 {op(&mut c,232)}
+    else if kind==20 {op(&mut c,4754693)}
+    else if kind==18 || kind==19 {
+        load(&mut c,0,0);op(&mut c,4752832)
+        if kind==18 {op(&mut c,3972)}else{op(&mut c,3973)}
+    }else{
+        condition:=cc(&mut c,kind-2);op(&mut c,15);byte(&mut c,128+condition)
+    }
+    at:=placeholder(&mut c);c.at.push(at);c.targets.push(target)
+    if kind==20 {store(&mut c,0,0)}
+}
+fn bits(w:i64,shift:i32,mask:i64)->i32 {i32(w.shr(shift).bit_and(mask))}
+fn prefix(c:&mut Emitter,wide:bool){if wide{op(&mut c,72)}}
+fn shift(c:&mut Emitter,wide:bool,reg:i32,kind:i32,amount:i32) {
+    if amount>0 {prefix(&mut c,wide);op(&mut c,193);byte(&mut c,192+kind*8+reg);byte(&mut c,amount)}
+}
+fn memory(c:&mut Emitter,read:bool,size:i32,signed:bool,offset:i32) {
+    if read {
+        if size==0 {op(&mut c,1029768)}
+        else if size==1 {op(&mut c,1030024)}
+        else if size==2 && signed {op(&mut c,4744072)}
+        else if size==2 {op(&mut c,35720)}
+        else {op(&mut c,4754312)}
+    }else{
+        if size==0 {op(&mut c,34952)}
+        else if size==1 {op(&mut c,6719880)}
+        else if size==2 {op(&mut c,35208)}
+        else {op(&mut c,4753800)}
+    }
+    little(&mut c,i64(offset),4)
+}
+fn transfer(c:&mut Emitter,reg:i32,kind:i32,size:i32,offset:i32) {
+    if kind==0 {load(&mut c,1,reg)}
+    memory(&mut c,kind!=0,size,kind==2,offset)
+    if kind!=0 {store(&mut c,reg,1)}
+}
+fn divide(c:&mut Emitter,wide:bool,signed:bool) {
+    prefix(&mut c,wide);op(&mut c,34249);zero:=jump(&mut c,4)
+    var overflow: i32 = -1
+    if signed {
+        var minimum:i64=2147483648
+        if wide {minimum=i64(1).shl(63)}
+        imm(&mut c,2,minimum);prefix(&mut c,wide);op(&mut c,14800)
+        normal:=jump(&mut c,5);prefix(&mut c,wide);op(&mut c,8649215)
+        overflow=jump(&mut c,4);patch(&mut c,normal)
+        prefix(&mut c,wide);op(&mut c,153)
+    }else{op(&mut c,12754)}
+    prefix(&mut c,wide)
+    if signed{op(&mut c,63481)}else{op(&mut c,63473)}
+    done:=jump(&mut c,-1);patch(&mut c,zero);op(&mut c,12736);patch(&mut c,done)
+    if overflow>=0 {patch(&mut c,overflow)}
+}
+// SSE values share the register bank with the native integer lowering. Slot
+// 32 holds condition flags, and the 32 floating registers follow it.
+fn xmm(c:&mut Emitter, reg:i32, slot:i32, read:bool, wide:bool) {
+    if wide { op(&mut c,242) } else { op(&mut c,243) }
+    op(&mut c,16655)
+    if read {byte(&mut c,16)} else {byte(&mut c,17)}
+    byte(&mut c,135+reg*8)
+    little(&mut c,i64(33+slot)*8,4)
+}
+fn foreign(c:&mut Emitter, gp:i32, fp:i32, stack:i32) {
+    op(&mut c,4753891) // mov rbx,rsp (callee-saved across SysV call)
+    op(&mut c,1216603376) // and rsp,-16
+    if stack>0 {
+        op(&mut c,4751852); little(&mut c,i64(stack),4)
+        bank(&mut c,6,31,true);op(&mut c,4753895);imm(&mut c,1,i64(stack/8))
+        op(&mut c,4243802277) // rep movsq
+    }
+    homes:[i32;6]=[7,6,2,1,8,9]
+    for i in 0..gp { load(&mut c,homes[i],i) }
+    for i in 0..fp { xmm(&mut c,i,i,true,true) }
+    load(&mut c,11,17)
+    imm(&mut c,0,i64(fp));op(&mut c,4325331) // call r11
+    op(&mut c,4753884) // mov rsp,rbx
+    store(&mut c,0,0);xmm(&mut c,0,0,false,true)
+}
+fn float_op(c:&mut Emitter,w:i64)->bool {
+    dst:=bits(w,0,31);src:=bits(w,5,31);right:=bits(w,16,31)
+    wide:=bits(w,22,1)!=0
+    var prefix_value:=243; if wide {prefix_value=242}
+    kind:=w.bit_and(4294966272)
+    if kind==505872384 || kind==2657550336 {
+        load(&mut c,0,src);if !wide{op(&mut c,35264)}
+        bank(&mut c,0,33+dst,false); return true
+    }
+    if kind==505806848 || kind==2657484800 {
+        bank(&mut c,0,33+src,true);if !wide{op(&mut c,35264)}
+        store(&mut c,dst,0);return true
+    }
+    key:=w.bit_and(4280351744)
+    var operation:=0
+    if key==505423872 {operation=88}
+    if key==505427968 {operation=92}
+    if key==505415680 {operation=89}
+    if key==505419776 {operation=94}
+    if operation!=0 {
+        xmm(&mut c,0,src,true,wide);xmm(&mut c,1,right,true,wide)
+        byte(&mut c,prefix_value);op(&mut c,15);byte(&mut c,operation);op(&mut c,193)
+        xmm(&mut c,0,dst,false,wide);return true
+    }
+    if w.bit_and(4280351775)==505421824 {
+        xmm(&mut c,0,src,true,wide);xmm(&mut c,1,right,true,wide)
+        if wide{op(&mut c,102)};op(&mut c,995009)
+        unordered:=jump(&mut c,10);less:=jump(&mut c,2);equal:=jump(&mut c,4)
+        imm(&mut c,0,1);greater_done:=jump(&mut c,-1)
+        patch(&mut c,less);imm(&mut c,0,128);less_done:=jump(&mut c,-1)
+        patch(&mut c,equal);imm(&mut c,0,65);equal_done:=jump(&mut c,-1)
+        patch(&mut c,unordered);imm(&mut c,0,2049)
+        patch(&mut c,greater_done);patch(&mut c,less_done);patch(&mut c,equal_done)
+        bank(&mut c,0,32,false);return true
+    }
+    unary:=w.bit_and(4290771968)
+    if unary==505462784 || unary==505495552 {
+        var sign:=i64(1).shl(31);if wide {sign=i64(1).shl(63)}
+        bank(&mut c,0,33+src,true)
+        if unary==505462784 {imm(&mut c,1,sign.wrapping_sub(1));op(&mut c,4727240)}
+        else{imm(&mut c,1,sign);op(&mut c,4731336)}
+        bank(&mut c,0,33+dst,false);return true
+    }
+    if unary==505528320 {
+        xmm(&mut c,0,src,true,wide);byte(&mut c,prefix_value);op(&mut c,1003968)
+        xmm(&mut c,0,dst,false,wide);return true
+    }
+    if kind==509755392 || kind==505593856 {
+        xmm(&mut c,0,src,true,wide);byte(&mut c,prefix_value);op(&mut c,1006272)
+        xmm(&mut c,0,dst,false,!wide);return true
+    }
+    if unary==2653028352 || unary==2653093888 {
+        load(&mut c,0,src)
+        var fast: i32 = -1
+        if unary==2653093888{
+            op(&mut c,4752832);small:=jump(&mut c,9)
+            op(&mut c,4753857);op(&mut c,8642817);op(&mut c,4772328);op(&mut c,4721096)
+            byte(&mut c,prefix_value);op(&mut c,1208953536);byte(&mut c,prefix_value);op(&mut c,1005760)
+            fast=jump(&mut c,-1);patch(&mut c,small)
+        }
+        byte(&mut c,prefix_value);op(&mut c,1208953536);if fast>=0{patch(&mut c,fast)}
+        xmm(&mut c,0,dst,false,wide);return true
+    }
+    if unary==2654470144 || unary==2654535680{
+        xmm(&mut c,0,src,true,wide)
+        var done:i32=-1
+        if unary==2654535680{
+            var limit:i64=1593835520;if wide{limit=4890909195324358656}
+            imm(&mut c,0,limit);op(&mut c,439295635144)
+            if wide{op(&mut c,102)};op(&mut c,995009);small:=jump(&mut c,2)
+            byte(&mut c,prefix_value);op(&mut c,1006785);byte(&mut c,prefix_value);op(&mut c,1208954048)
+            op(&mut c,309501552703);done=jump(&mut c,-1);patch(&mut c,small)
+        }
+        byte(&mut c,prefix_value);op(&mut c,1208954048);if done>=0{patch(&mut c,done)}
+        store(&mut c,dst,0);return true
+    }
+    false
+}
+
+fn word(c:&mut Emitter,w:i64,previous:i64)->bool {
+    rd:=bits(w,0,31);rn:=bits(w,5,31);rm:=bits(w,16,31);wide:=w>=2147483648
+    if bits(w,24,255)==254 { foreign(&mut c,bits(w,16,255),bits(w,8,255),bits(w,0,255)*16);return true }
+    if w.bit_and(503316480)==503316480 && float_op(&mut c,w) {return true}
+    if w==3573751839 {return true}
+    if w==3596551104 {op(&mut c,195);return true}
+    if w==3558866944 {op(&mut c,3851);return true}
+    if w==3556769793 {
+        if previous.bit_and(4292870175)!=3531603976 {return false}
+        return syscall(&mut c,bits(previous,5,65535))
+    }
+    if w.bit_and(4294966303)==3594452992 {load(&mut c,0,rn);op(&mut c,65488);return true}
+    family:=w.bit_and(2139095040)
+    if family==1384120320 || family==1920991232 {
+        amount:=16*bits(w,21,3);n:=i64(bits(w,5,65535)).shl(amount)
+        if family==1384120320 {imm(&mut c,0,n)}
+        else {
+            load(&mut c,0,rd);imm(&mut c,1,i64(65535).shl(amount).bit_not())
+            op(&mut c,4727240);imm(&mut c,1,n);op(&mut c,4721096)
+            if !wide {op(&mut c,35264)}
+        }
+        store(&mut c,rd,0);return true
+    }
+    subtract:=bits(w,30,1)!=0;set_flags:=bits(w,29,1)!=0
+    if w.bit_and(520093696)==285212672 {
+        n:=bits(w,10,4095).shl(bits(w,22,1)*12)
+        bank(&mut c,0,rn,true);prefix(&mut c,wide)
+        if subtract {op(&mut c,45)}else{op(&mut c,5)}
+        little(&mut c,i64(n),4)
+        if set_flags{flags(&mut c,subtract);store(&mut c,rd,0)}else{store_base(&mut c,rd)}
+        return true
+    }
+    arithmetic:=w.bit_and(522190848)==184549376
+    if arithmetic || w.bit_and(520093696)==167772160 {
+        shift_kind:[i32;4]=[4,5,7,1];which:=bits(w,22,3)
+        if arithmetic && which==3{return false}
+        load(&mut c,0,rn);load(&mut c,1,rm)
+        shift(&mut c,wide,1,shift_kind[which],bits(w,10,63))
+        if arithmetic{
+            prefix(&mut c,wide)
+            if subtract {op(&mut c,10696)}else{op(&mut c,456)}
+            if set_flags {flags(&mut c,subtract)}
+        }else{
+            if bits(w,21,1)!=0 {prefix(&mut c,wide);op(&mut c,63441)}
+            operation:=bits(w,29,3);prefix(&mut c,wide)
+            if operation==1{op(&mut c,2504)}else if operation==2{op(&mut c,12744)}else{op(&mut c,8648)}
+            if operation==3 {flags(&mut c,false)}
+        }
+        store(&mut c,rd,0);return true
+    }
+    if family==318767104 || family==1392508928 {
+        var width:=32;if wide{width=64}
+        r:=bits(w,16,63);s:=bits(w,10,63);signed:=family==318767104
+        load(&mut c,0,rn)
+        if s>=r {
+            shift(&mut c,wide,0,4,width-1-s)
+            var kind:=5;if signed{kind=7};shift(&mut c,wide,0,kind,width-1-s+r)
+        } else {
+            if signed{return false}
+            imm(&mut c,1,i64(1).shl(s+1).wrapping_sub(1))
+            op(&mut c,4727240);shift(&mut c,wide,0,4,width-r)
+        }
+        if !wide{op(&mut c,35264)};store(&mut c,rd,0);return true
+    }
+    if w.bit_and(520093696)==452984832 {
+        ra:=bits(w,10,31);kind:=bits(w,21,7)
+        load(&mut c,0,rn);load(&mut c,1,rm)
+        if kind==2 || kind==6{
+            if kind==2{op(&mut c,4782057)}else{op(&mut c,4782049)}
+            store(&mut c,rd,2)
+        }else if kind==0{
+            prefix(&mut c,wide);op(&mut c,1028033);load(&mut c,1,ra);prefix(&mut c,wide)
+            if bits(w,15,1)!=0 {op(&mut c,10689);store(&mut c,rd,1)}else{op(&mut c,456);store(&mut c,rd,0)}
+        }else{return false}
+        return true
+    }
+    if w.bit_and(534773760)==448790528 {
+        operation:=bits(w,10,63);load(&mut c,0,rn);load(&mut c,1,rm)
+        if operation>=8 && operation<=10 {
+            prefix(&mut c,wide)
+            if operation==8{op(&mut c,54240)}else if operation==9{op(&mut c,54248)}else{op(&mut c,54264)}
+        }else if operation==2 || operation==3 {divide(&mut c,wide,operation==3)}
+        else{return false}
+        store(&mut c,rd,0);return true
+    }
+    if w.bit_and(4294905824)==2594113504 {
+        condition:=cc(&mut c,bits(w,12,15).bit_xor(1));op(&mut c,15)
+        byte(&mut c,144+condition);op(&mut c,3222255296);store(&mut c,rd,0);return true
+    }
+    scaled:=w.bit_and(989855744)==956301312
+    if scaled || w.bit_and(991955968)==939524096 {
+        size:=bits(w,30,3);kind:=bits(w,22,3)
+        if kind>2 || (kind==2 && size!=2){return false}
+        var offset:=bits(w,12,511);if offset>=256{offset=offset-512}
+        if scaled {offset=bits(w,10,4095).shl(size)}
+        bank(&mut c,0,rn,true);transfer(&mut c,rd,kind,size,offset);return true
+    }
+    if w.bit_and(973078528)==671088640 {
+        kind:=bits(w,22,1);var size:=2;if wide{size=3}
+        var offset:=bits(w,15,127);if offset>=64{offset=offset-128};offset=offset.shl(size)
+        mode:=bits(w,23,3);rt2:=bits(w,10,31);bank(&mut c,0,rn,true)
+        if mode==3{op(&mut c,18437);little(&mut c,i64(offset),4);store_base(&mut c,rn)}
+        var disp:=0;if mode==2{disp=offset}
+        transfer(&mut c,rd,kind,size,disp);transfer(&mut c,rt2,kind,size,disp+i32(1).shl(size))
+        if mode==1{op(&mut c,18437);little(&mut c,i64(offset),4);store_base(&mut c,rn)}
+        return true
+    }
+    false
+}
+
+pub fn finish(code:&arm.Code,data_start:i32, imports:&[]i32)->Result {
+    var c:=Emitter{text:[],at:[],targets:[],stack_traps:[]}
+    var offsets:[]i32=[]
+    var reloc:=0;var next_import:=0;var import_sites:[]i32=[];var skip:i32=-1
+    c.text.reserve(data_start*24);offsets.reserve(code.words.len+1)
+    prelude(&mut c)
+    for i in 0..data_start{
+        offsets.push(c.text.len)
+        if i==skip {continue}
+        if next_import<imports.len && i==imports[next_import]/4 {
+            op(&mut c,4754181) // mov rax,[rip+GOT]
+            import_sites.push(c.text.len);little(&mut c,0,4);store(&mut c,16,0)
+            next_import=next_import+1;skip=i+1
+        }else if reloc<code.at.len && code.at[reloc]==i {
+            relocation(&mut c,code.kinds[reloc],code.labels[code.target[reloc]])
+            reloc=reloc+1
+        }else{
+            var previous:i64=0;if i>0{previous=code.words[i-1]}
+            if !word(&mut c,code.words[i],previous){
+                return Result{ok:false,error:"unsupported x86 lowering for word "+code.words[i].str()+" at "+i.str(),text:[],imports:[]}
+            }
+        }
+    }
+    for i in 0..c.stack_traps.len {at:=c.stack_traps[i];patch(&mut c,at)}
+    imm(&mut c,0,231);imm(&mut c,7,110);op(&mut c,251989771)
+    while c.text.len%8!=(data_start%2)*4 {byte(&mut c,0)}
+    for i in data_start..code.words.len {offsets.push(c.text.len);little(&mut c,code.words[i],4)}
+    offsets.push(c.text.len)
+    for i in 0..c.at.len {
+        destination:=c.targets[i]
+        if destination<0 || destination>=offsets.len {return Result{ok:false,error:"invalid native relocation",text:[],imports:[]}}
+        at:=c.at[i];displacement(&mut c,at,offsets[destination])
+    }
+    Result{ok:true,error:"",text:c.text,imports:import_sites}
+}

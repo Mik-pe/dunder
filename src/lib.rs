@@ -3,6 +3,7 @@ pub mod modules;
 pub mod native;
 pub mod syntax;
 pub mod target;
+pub(crate) mod wasm;
 pub(crate) mod x86_64;
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +51,11 @@ impl Error {
 pub fn check(source: &str) -> Result<check::Program, Error> {
     check::check(syntax::parse(source)?)
 }
+pub fn check_for(source: &str, target: target::Target) -> Result<check::Program, Error> {
+    let mut parsed = syntax::parse(source)?;
+    parsed.types.set_pointer_bytes(target.pointer_bytes());
+    check::check(parsed)
+}
 pub fn check_tests(source: &str) -> Result<check::Program, Error> {
     check::check_mode(syntax::parse(source)?, check::Mode::Test)
 }
@@ -60,7 +66,7 @@ pub fn compile(source: &str) -> Result<Vec<u8>, Error> {
 }
 
 pub fn compile_for(source: &str, target: target::Target) -> Result<Vec<u8>, Error> {
-    let program = check(source)?;
+    let program = check_for(source, target)?;
     native::compile_for(&program, target)
         .map_err(|e| Error::new("E0300", Span { start: 0, end: 0 }, e))
 }

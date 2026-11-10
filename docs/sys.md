@@ -221,3 +221,7 @@ arkitekturs stat-layout. Se [målplattformarnas verifiering](targets.md).
 Systemanropen är en plattformsdetalj som anpassas per mål.
 Binärläsning, kataloglistning, rekursiva katalogverktyg,
 strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.
+
+För kod som ska få åtkomst till en vald fil via en parameter finns
+`std.fs.ReadFile` och `std.fs.WriteFile`. Handtagen skapas i en modul
+med `capability filesystem`. [Filhandtag och deras sökvägssemantik](ffi.md#filåtkomst-genom-delegerade-handtag)

@@ -41,6 +41,7 @@ Med kompilatorn kopierad till `build/dunder` används samma kommandon som
 | [standard.ddr](standard.ddr) | Word counter med map/set, dynamiska arrayer, text, byte, SHA-256 och decimalparser. | `4`, `6`, `stdlib ok` |
 | [utf8.ddr](utf8.ddr) | UTF-8, byte/kodpunkter, ordräkning, strängretur och text i structar. | `bytes=25`, `runes=20`, `words=5`, `🌍 Hej världen` |
 | [tokenizer.ddr](tokenizer.ddr) | UTF-8-ord, ASCII-skiljetecken och citerade strängar med escapes. | `fn\|hälsa\|(\|namn\|)\|{\|print\|(\|"Hej 🌍"\|)\|}` |
+| [webgpu/main.ddr](webgpu/README.md) | Wasm och WebGPU med samma Dunder-vertexdata som Metal och Vulkan. | Renderad triangel i webbläsarens canvas. |
 | [metal/triangle.ddr](metal/triangle.ddr) | Nativefönster, en gradienttriangel och en Dunder-skriven händelseloop. | `triangle frames=N` med `--frames N`; kräver grafisk session. |
 | [metal/main.ddr](metal/main.ddr) | Metal-scen med moduler, enumtillstånd, animation, dragning och tangentkommandon. | `atlas frames=N` med `--frames N`; kräver grafisk session. |
 
@@ -81,8 +82,7 @@ kompilatorn och importerad som `std.map`, `std.set` och så vidare.
 `standard.ddr` kopplar ihop samlingarna i en UTF-8-ordräknare. Dess två
 testgrupper och bibliotekens nio grupper ingår i huvudträdet.
 Även den [Dunder-skrivna kompilatorns](../selfhost/README.md) lexer och
-typkontroll har egna taggade grupper här. Den bygger skalära nativeprogram
-men kan ännu inte kompilera hela sin egen källkod.
+typkontroll har egna taggade grupper här. Den bygger sin egen källkod och verifieras med byteidentiska självbyggen.
 
 [filesystem.ddr](filesystem.ddr) använder `import sys`, som är inbäddat i
 kompilatorn. Programmet skapar en egen katalog med process-ID, provar
