@@ -5,7 +5,8 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Implementerat
 
-- `.dn` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
+- `.ddr` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
+  Användarens val ersätter den tidigare tvåbokstavsändelsen. Importer saknar fortsatt suffix.
 - En fil per modul: `import math` eller `import "util/math" as math`, utan
   suffix. Privata `fn` och exporterade `pub fn`, alias och kvalificerade namn.
   Samlade signaturer stödjer cykliska importer och ömsesidig rekursion.
@@ -39,6 +40,13 @@ i `/Users/mikpe/dev/dunder-language`.
   Heltal, bool och runes har `.str()`. Strängar kan returneras, gå genom
   callbacks och lagras i structfält och arrayer. Dynamiska strängar använder
   en begränsad processarena utan GC; se begränsningarna nedan.
+- `f32`/`f64`, kontexttypade decimal- och exponentliteraler, IEEE-aritmetik
+  och jämförelser, NaN, oändlighet, signerad noll och subnormala tal.
+  Explicita numeriska konverteringar; till heltal trunkeras och kontrolleras
+  intervallet. Grundläggande matematik och klassificering, råbitkonvertering,
+  flyttalsfält/-arrayer, callbacks, returer och oberoende FP-/heltalsregister
+  med stackspill. Decimalutskriften är skriven i `runtime/float.ddr`, bäddas
+  in vid behov och använder exakta intervall för korta roundtrip-värden.
 - `dunder check`, `dunder build`, `dunder run`, `dunder test`, enkelt dunder.toml
   med valfri `test_root`, atomisk
   publicering av utdata och `--timings`. `main` ger exitkod 0 eller en explicit
@@ -49,18 +57,19 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Verifiering
 
-`cargo test`: 45 testfunktioner passerar (en hashreferens, sexton dogfood-,
-elva språk-, nio modul- och åtta strängtester). `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
+`cargo test`: 53 testfunktioner passerar (en hashreferens, sexton dogfood-,
+elva språk-, nio modul-, åtta sträng- och åtta flyttalstester).
+`cargo clippy --all-targets -- -D warnings`, `cargo fmt`
 och `cargo build --release` är genomförda.
 
 Releasekompilatorn har dessutom byggt hello och fibonacci med `PATH` satt
 till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
-förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.dn
+förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.ddr
 -o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
 
-`dunder test` kör nu arton Dunder-testgrupper i dogfood-trädet: rekursion,
+`dunder test` kör nu 25 Dunder-testgrupper i dogfood-trädet: rekursion,
 moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
-arena, tabellfall, structargument, UTF-8 och en liten tokenizer.
+arena, tabellfall, structargument, UTF-8, en liten tokenizer och numeriska program.
 Varje grupp kompileras till en riktig
 nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
 ett misslyckat eller fastnat test hindrar inte nästa grupp. Tester kräver
@@ -84,16 +93,25 @@ index, fel snittgränser, ogiltiga rune-konverteringar och full strängarena
 ger verifierade felstatusar. Textstatistik och tokenizern använder `find`,
 `replace`, ordräkning och UTF-8-hjälpare skrivna i Dunder.
 
+Flyttalstesten jämför 648 native-aritmetikresultat med oberoende Rust-resultat
+och återläser hundratals utskrivna f32/f64-bitmönster med Rusts parser.
+De täcker även direkt decimalavrundning till f32, båda registerbankerna,
+spill till stack, callbacks, rekursion, array-/structlayout, klassificering,
+NaN-jämförelser, signerad noll, gradvis underflöde och felaktiga konverteringar.
+Det numeriska Dunder-trädet provar omskalad hypotenusa, kompenserad summering,
+rotberäkning med bisektion och fjärde ordningens Runge–Kutta-integration.
+Alla exempel, importer och testfixturer använder nu `.ddr`.
+
 `cargo test` kör typkontroll och negativa felprov samt verkliga ARM64-binärer
 på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
 `codesign --verify` och körs med tom processmiljö, utan källfil och utan
 kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
 verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
-och structprogrammet. UTF-8-programmet, tokenizern och alla arton
-Dunder-testgrupper är också körda med releasekompilatorn utan verktyg i PATH.
+och structprogrammet. UTF-8-programmet, tokenizern, numerikprogrammet och
+alla 25 Dunder-testgrupper är också körda med releasekompilatorn utan verktyg i PATH.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
-Modulprogrammet i examples/modules/main.dn laddar tre filer och skriver
+Modulprogrammet i examples/modules/main.ddr laddar tre filer och skriver
 `42`, `true`, `42`. Det är byggt/kört även med PATH utan externa verktyg.
 Modultesterna kontrollerar privat åtkomst, namn-/aliaskrockar, saknade filer,
 otillåtna importsuffix, syntax-/typfel i beroenden, rot-main, callbacktyper
@@ -119,7 +137,7 @@ binär och utdata får inte skriva över källan.
 ## Begränsningar och nästa steg
 
 Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
-Structfält och arrayelement är än så länge begränsade till i32/i64/bool/string/rune.
+Structfält och arrayelement är än så länge begränsade till i32/i64/f32/f64/bool/string/rune.
 Arrayer får vara högst 64 KiB. Aggregatreturer, nästlade aggregat,
 arrayslices, allmänt allokerings-API och ägande/lån återstår.
 Strängliteraler bor i programbilden. Dynamiska strängar bor i en separat
@@ -133,6 +151,9 @@ handtag; den är ännu inget allmänt allokerings- eller låne-API.
 Iteratorer är inbyggda arraykopior, inte ett användardefinierat protokoll.
 Globala konstanter, paketregister och dynamiska bibliotek återstår.
 Ingen inkrementell cache.
+Flyttal saknar än så länge fullständigt matematikbibliotek, trigonometriska
+funktioner, exp/log, strängparser och valbar utskriftsprecision. Den Dunder-skrivna
+formatteraren prioriterar korrekthet; prestanda är inte uppmätt.
 Anonyma funktioner och closures med infångade lokaler återstår.
 Overflow/division med noll, gränsfel, assertions, full strängarena och ogiltiga
 Unicode-operationer ger definierad exitstatus;

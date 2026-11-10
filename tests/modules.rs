@@ -23,11 +23,11 @@ impl Project {
         fs::write(path, text).unwrap();
     }
     fn check(&self) -> dunder::modules::Checked {
-        dunder::modules::check_path(self.0.join("main.dn"))
+        dunder::modules::check_path(self.0.join("main.ddr"))
             .unwrap_or_else(|e| panic!("{}", e.render()))
     }
     fn error(&self, code: &str) -> dunder::modules::Diagnostic {
-        let error = match dunder::modules::check_path(self.0.join("main.dn")) {
+        let error = match dunder::modules::check_path(self.0.join("main.ddr")) {
             Err(e) => e,
             Ok(_) => panic!("expected {code}"),
         };
@@ -82,7 +82,7 @@ fn compile(project: &dunder::modules::Checked) -> Vec<u8> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn actual_module_example_builds_without_external_tools() {
     let project = Project::new();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/modules/main.dn");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/modules/main.ddr");
     let checked = dunder::modules::check_path(&root).unwrap_or_else(|e| panic!("{}", e.render()));
     assert_eq!(checked.sources.files.len(), 3);
     assert_eq!(project.execute(&compile(&checked)), "42\ntrue\n42\n");
@@ -100,7 +100,7 @@ fn actual_module_example_builds_without_external_tools() {
 fn privacy_and_explicit_namespaces_are_enforced() {
     let project = Project::new();
     project.write(
-        "math.dn",
+        "math.ddr",
         "fn hidden()->i32{return 7}\npub fn value()->i32{return hidden()}\n",
     );
     for (source, code, message) in [
@@ -127,43 +127,43 @@ fn privacy_and_explicit_namespaces_are_enforced() {
             "other",
         ),
     ] {
-        project.write("main.dn", source);
+        project.write("main.ddr", source);
         let error = project.error(code);
         let rendered = error.render();
         assert!(rendered.contains(message), "{rendered}");
-        assert!(rendered.contains("main.dn:2:"), "{rendered}");
+        assert!(rendered.contains("main.ddr:2:"), "{rendered}");
     }
 }
 
 #[test]
 fn import_names_paths_and_diagnostics_are_checked() {
     let project = Project::new();
-    project.write("math.dn", "pub fn value()->i32{return 42}");
-    project.write("foo-bar.dn", "pub fn value()->i32{return 42}");
+    project.write("math.ddr", "pub fn value()->i32{return 42}");
+    project.write("foo-bar.ddr", "pub fn value()->i32{return 42}");
     for (source, code) in [
         ("import math\nimport math\nfn main(){}", "E0402"),
         ("import math\nfn math(){}\nfn main(){}", "E0402"),
         ("import math as fn\nfn main(){}", "E0401"),
         ("import \"foo-bar\"\nfn main(){}", "E0401"),
-        ("import \"math.dn\"\nfn main(){}", "E0401"),
+        ("import \"math.ddr\"\nfn main(){}", "E0401"),
         ("import \"/absolute/math\"\nfn main(){}", "E0401"),
         ("import \"\"\nfn main(){}", "E0401"),
         ("import \"math\nfn main(){}", "E0004"),
     ] {
-        project.write("main.dn", source);
+        project.write("main.ddr", source);
         project.error(code);
     }
-    project.write("main.dn", "\nimport absent\nfn main(){}");
+    project.write("main.ddr", "\nimport absent\nfn main(){}");
     let missing = project.error("E0400").render();
-    assert!(missing.contains("main.dn:2:1:"), "{missing}");
-    assert!(missing.contains("absent.dn"));
-    project.write("main.dn", "import math\nfn main(){}");
-    project.write("math.dn", "pub fn broken()->bool{\n    return 42\n}\n");
+    assert!(missing.contains("main.ddr:2:1:"), "{missing}");
+    assert!(missing.contains("absent.ddr"));
+    project.write("main.ddr", "import math\nfn main(){}");
+    project.write("math.ddr", "pub fn broken()->bool{\n    return 42\n}\n");
     let error = project.error("E0201").render();
-    assert!(error.contains("math.dn:2:12:"), "{error}");
-    project.write("math.dn", "pub fn broken(\n");
+    assert!(error.contains("math.ddr:2:12:"), "{error}");
+    project.write("math.ddr", "pub fn broken(\n");
     let error = project.error("E0101").render();
-    assert!(error.contains("math.dn:"), "{error}");
+    assert!(error.contains("math.ddr:"), "{error}");
     assert!(dunder::check("import math\nfn main(){}")
         .err()
         .unwrap()
@@ -175,16 +175,16 @@ fn import_names_paths_and_diagnostics_are_checked() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn aliases_private_helpers_and_same_named_functions_stay_separate() {
     let project = Project::new();
-    project.write("main.dn","import a\nimport b\nimport \"foo-bar\" as more\nfn main(){print(a.value());print(b.value());print(more.value())}");
+    project.write("main.ddr","import a\nimport b\nimport \"foo-bar\" as more\nfn main(){print(a.value());print(b.value());print(more.value())}");
     project.write(
-        "a.dn",
+        "a.ddr",
         "fn helper()->i32{return 1} pub fn value()->i32{return helper()}",
     );
     project.write(
-        "b.dn",
+        "b.ddr",
         "fn helper()->i32{return 2} pub fn value()->i32{return helper()}",
     );
-    project.write("foo-bar.dn", "pub fn value()->i32{return 3}");
+    project.write("foo-bar.ddr", "pub fn value()->i32{return 3}");
     assert_eq!(project.execute(&compile(&project.check())), "1\n2\n3\n");
 }
 
@@ -193,17 +193,17 @@ fn aliases_private_helpers_and_same_named_functions_stay_separate() {
 fn diamonds_relative_paths_and_symlinks_load_each_file_once() {
     use std::os::unix::fs::symlink;
     let project = Project::new();
-    project.write("main.dn","import \"parts/left\"\nimport \"parts/right\"\nfn main(){print(left.value()+right.value())}");
+    project.write("main.ddr","import \"parts/left\"\nimport \"parts/right\"\nfn main(){print(left.value()+right.value())}");
     project.write(
-        "parts/left.dn",
+        "parts/left.ddr",
         "import \"../shared/value\" as common\npub fn value()->i32{return common.answer()}",
     );
     project.write(
-        "parts/right.dn",
+        "parts/right.ddr",
         "import \"../shared/link\" as common\npub fn value()->i32{return common.answer()}",
     );
-    project.write("shared/value.dn", "pub fn answer()->i32{return 42}");
-    symlink("value.dn", project.0.join("shared/link.dn")).unwrap();
+    project.write("shared/value.ddr", "pub fn answer()->i32{return 42}");
+    symlink("value.ddr", project.0.join("shared/link.ddr")).unwrap();
     let checked = project.check();
     assert_eq!(checked.sources.files.len(), 4);
     assert_eq!(checked.program.functions.len(), 4);
@@ -215,15 +215,15 @@ fn diamonds_relative_paths_and_symlinks_load_each_file_once() {
 fn import_cycles_support_cross_module_mutual_recursion() {
     let project = Project::new();
     project.write(
-        "main.dn",
+        "main.ddr",
         "import even\nfn main(){print(even.test(100));print(even.test(101))}",
     );
     project.write(
-        "even.dn",
+        "even.ddr",
         "import odd\npub fn test(n:i32)->bool{if n==0{return true};return odd.test(n-1)}",
     );
     project.write(
-        "odd.dn",
+        "odd.ddr",
         "import even\npub fn test(n:i32)->bool{if n==0{return false};return even.test(n-1)}",
     );
     let checked = project.check();
@@ -236,17 +236,17 @@ fn import_cycles_support_cross_module_mutual_recursion() {
 fn function_types_are_shared_across_module_boundaries() {
     let project = Project::new();
     project.write(
-        "wide.dn",
+        "wide.ddr",
         "fn double(x:i64)->i64{return x*2} pub fn factory()->fn(i64)->i64{return double}",
     );
     project.write(
-        "apply.dn",
+        "apply.ddr",
         "pub fn run(f:fn(i64)->i64,value:i64)->i64{return f(value)}",
     );
-    project.write("main.dn","import wide\nimport apply\nfn main(){f:fn(i64)->i64=wide.factory();print(apply.run(f,5000000000))}");
+    project.write("main.ddr","import wide\nimport apply\nfn main(){f:fn(i64)->i64=wide.factory();print(apply.run(f,5000000000))}");
     assert_eq!(project.execute(&compile(&project.check())), "10000000000\n");
     project.write(
-        "main.dn",
+        "main.ddr",
         "import wide\nfn main(){f:fn(i32)->i32=wide.factory()}",
     );
     let error = project.error("E0201");
@@ -263,18 +263,18 @@ fn builds_are_reproducible_relocatable_and_see_dependency_edits() {
     let b = Project::new();
     for project in [&a, &b] {
         project.write(
-            "main.dn",
+            "main.ddr",
             "import math\nimport math as other\nfn main(){print(math.value()+other.value())}",
         );
-        project.write("math.dn", "pub fn value()->i32{return 21}");
-        project.write("unused.dn", "this file must never be parsed");
+        project.write("math.ddr", "pub fn value()->i32{return 21}");
+        project.write("unused.ddr", "this file must never be parsed");
     }
     let first = a.check();
     assert_eq!(first.sources.files.len(), 2);
     let image = compile(&first);
     assert_eq!(image, compile(&b.check()));
     assert_eq!(a.execute(&image), "42\n");
-    a.write("math.dn", "pub fn value()->i32{return 20}");
+    a.write("math.ddr", "pub fn value()->i32{return 20}");
     let changed = compile(&a.check());
     assert_ne!(image, changed);
     assert_eq!(a.execute(&changed), "40\n");
@@ -283,10 +283,10 @@ fn builds_are_reproducible_relocatable_and_see_dependency_edits() {
 #[test]
 fn only_root_main_is_an_entrypoint_and_failed_builds_preserve_all_sources() {
     let project = Project::new();
-    project.write("main.dn", "import math\nfn main(){print(math.value())}");
+    project.write("main.ddr", "import math\nfn main(){print(math.value())}");
     let dependency = "fn main()->i32{return 7} pub fn value()->i32{return 42}";
-    project.write("math.dn", dependency);
-    project.write("dunder.toml", "name = \"demo\"\nroot = \"main.dn\"\n");
+    project.write("math.ddr", dependency);
+    project.write("dunder.toml", "name = \"demo\"\nroot = \"main.ddr\"\n");
     let build = project.cli(&["build"]);
     assert!(
         build.status.success(),
@@ -294,13 +294,13 @@ fn only_root_main_is_an_entrypoint_and_failed_builds_preserve_all_sources() {
         String::from_utf8_lossy(&build.stderr)
     );
     let before = fs::read(project.0.join("build/arm64-macos/demo")).unwrap();
-    let overwrite = project.cli(&["build", "-o", "math.dn"]);
+    let overwrite = project.cli(&["build", "-o", "math.ddr"]);
     assert!(!overwrite.status.success());
     assert_eq!(
-        fs::read_to_string(project.0.join("math.dn")).unwrap(),
+        fs::read_to_string(project.0.join("math.ddr")).unwrap(),
         dependency
     );
-    project.write("math.dn", "pub fn value()->i32{return true}");
+    project.write("math.ddr", "pub fn value()->i32{return true}");
     let bad = project.cli(&["run"]);
     assert!(!bad.status.success());
     assert!(bad.stdout.is_empty());
@@ -308,7 +308,7 @@ fn only_root_main_is_an_entrypoint_and_failed_builds_preserve_all_sources() {
         fs::read(project.0.join("build/arm64-macos/demo")).unwrap(),
         before
     );
-    project.write("math.dn", dependency);
-    project.write("main.dn", "import math\nfn helper(){}");
+    project.write("math.ddr", dependency);
+    project.write("main.ddr", "import math\nfn helper(){}");
     project.error("E0212");
 }

@@ -6,8 +6,12 @@ syntax, statiska typer och program som kompileras och körs. Användaren valde
 `:=` för deklaration med härledd typ, `: i32 =` för explicit typ och
 oföränderlighet som standard.
 
+Användarens senaste filändelseval är `.ddr`. Källfiler, importerarnas
+filuppslagning, CLI, manifest, exempel och tester ska använda den; själva
+importuttrycken ska fortsatt sakna filändelse.
+
 Filmoduler är implementerade. Användaren kräver importer utan
-filändelse: `import math` läser math.dn. Lägg till explicita exporter och
+filändelse: `import math` läser math.ddr. Lägg till explicita exporter och
 typkontroll över modulgränser. Dunder-kod ska fortsätta kompileras med egen
 backend och bildskrivare utan GCC eller LLVM.
 
@@ -31,6 +35,12 @@ byte-/rune-vyer, snitt, sammanslagning, jämförelser och strängreturer.
 Textfunktioner, textstatistik och en liten UTF-8-tokenizer är skrivna i
 Dunder och ingår i testträdet. Beskriv den första strängarenans 16 MiB-gräns
 och processlivstid tydligt; kalla den inte färdig ägande-/lånekontroll.
+
+Nästa språksteg är bra stöd för flyttal. `f32` och `f64` är nu implementerade
+med IEEE-aritmetik, kontexttypade literaler, explicita konverteringar,
+matteoperationer, klassificering, parametrar/returer och samlingar.
+Numeriska dogfood-program och en Dunder-skriven decimalformatterare driver
+stödet. Beskriv återstående matematikbibliotek och strängparser tydligt.
 
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera

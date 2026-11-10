@@ -124,7 +124,7 @@ impl Loader {
                 )
                 .in_file(id));
             }
-            let target_path = path.parent().unwrap().join(logical).with_extension("dn");
+            let target_path = path.parent().unwrap().join(logical).with_extension("ddr");
             let target = self.visit(&target_path, Some((id, import.span)))?;
             self.modules[id].imports.push(check::Import {
                 name: import.alias,

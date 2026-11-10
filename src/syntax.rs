@@ -4,6 +4,8 @@ use crate::{Error, Span};
 pub enum Type {
     I32,
     I64,
+    F32,
+    F64,
     Bool,
     String,
     Rune,
@@ -21,10 +23,18 @@ impl Type {
     pub fn integer(self) -> bool {
         matches!(self, Self::I32 | Self::I64)
     }
+    pub fn float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+    pub fn numeric(self) -> bool {
+        self.integer() || self.float()
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
             Self::Bool => "bool",
             Self::String => "string",
             Self::Rune => "rune",
@@ -81,7 +91,7 @@ impl ArrayType {
     pub fn elem_size(self) -> usize {
         match self.elem {
             Type::Bool => 1,
-            Type::I32 | Type::Rune => 4,
+            Type::I32 | Type::Rune | Type::F32 => 4,
             _ => 8,
         }
     }
@@ -140,12 +150,12 @@ impl Types {
     pub fn array_type(&mut self, elem: Type, len: usize, span: Span) -> Result<Type, Error> {
         if !matches!(
             elem,
-            Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune
+            Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune | Type::F32 | Type::F64
         ) {
             return Err(Error::new(
                 "E0220",
                 span,
-                "array elements must be i32, i64, bool, string or rune in this version",
+                "array elements must be scalar values in this version",
             ));
         }
         let array = ArrayType { elem, len };
@@ -257,6 +267,7 @@ pub struct Import {
 enum Token {
     Name(String),
     Number(i128),
+    Float(String),
     String(String),
     Rune(char),
     Left,
@@ -510,7 +521,59 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             while i < chars.len() && (chars[i].1.is_ascii_digit() || chars[i].1 == '_') {
                 i += 1;
             }
+            let mut floating = false;
+            if chars.get(i).is_some_and(|x| x.1 == '.')
+                && chars.get(i + 1).is_some_and(|x| x.1.is_ascii_digit())
+            {
+                floating = true;
+                i += 1;
+                while i < chars.len() && (chars[i].1.is_ascii_digit() || chars[i].1 == '_') {
+                    i += 1;
+                }
+            }
+            if chars.get(i).is_some_and(|x| matches!(x.1, 'e' | 'E')) {
+                floating = true;
+                i += 1;
+                if chars.get(i).is_some_and(|x| matches!(x.1, '+' | '-')) {
+                    i += 1;
+                }
+                let first = i;
+                while i < chars.len() && (chars[i].1.is_ascii_digit() || chars[i].1 == '_') {
+                    i += 1;
+                }
+                if i == first {
+                    return Err(Error::new(
+                        "E0006",
+                        Span {
+                            start,
+                            end: chars.get(i).map_or(source.len(), |x| x.0),
+                        },
+                        "an exponent needs decimal digits",
+                    ));
+                }
+            }
             let end = chars.get(i).map_or(source.len(), |x| x.0);
+            if floating {
+                let spelling = &source[start..end];
+                let parts: Vec<char> = spelling.chars().collect();
+                if parts.iter().enumerate().any(|(j, c)| {
+                    *c == '_'
+                        && (j == 0
+                            || !parts[j - 1].is_ascii_digit()
+                            || !parts.get(j + 1).is_some_and(char::is_ascii_digit))
+                }) {
+                    return Err(Error::new(
+                        "E0006",
+                        Span { start, end },
+                        "numeric separators must be between digits",
+                    ));
+                }
+                out.push(Lexeme {
+                    token: Token::Float(spelling.replace('_', "")),
+                    span: Span { start, end },
+                });
+                continue;
+            }
             let n = source[start..end].replace('_', "").parse().map_err(|_| {
                 Error::new("E0002", Span { start, end }, "integer literal is too large")
             })?;
@@ -650,6 +713,7 @@ pub struct Expr {
 #[derive(Debug)]
 pub enum ExprKind {
     Number(i128),
+    Float(String),
     Bool(bool),
     String(String),
     Rune(char),
@@ -794,6 +858,8 @@ impl Parser<'_> {
         match n.as_str() {
             "i32" => Ok(Type::I32),
             "i64" => Ok(Type::I64),
+            "f32" => Ok(Type::F32),
+            "f64" => Ok(Type::F64),
             "bool" => Ok(Type::Bool),
             "string" => Ok(Type::String),
             "rune" => Ok(Type::Rune),
@@ -1124,6 +1190,10 @@ impl Parser<'_> {
         let mut left = match t.token {
             Token::Number(n) => Expr {
                 kind: ExprKind::Number(n),
+                span,
+            },
+            Token::Float(n) => Expr {
+                kind: ExprKind::Float(n),
                 span,
             },
             Token::String(s) => Expr {

@@ -99,6 +99,7 @@ pub fn run(project: &Checked, output: &Path, timeout: Duration) -> Result<i32, S
                     Some(104) => "assertion failed".into(),
                     Some(105) => "string arena exhausted".into(),
                     Some(106) => "invalid Unicode boundary or scalar".into(),
+                    Some(107) => "floating conversion out of range".into(),
                     Some(n) => format!("exit {n}"),
                     None => "terminated by signal".into(),
                 }

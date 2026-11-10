@@ -33,7 +33,7 @@ impl Workspace {
         use std::os::unix::fs::PermissionsExt;
         let work = Self::new();
         let image =
-            dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.dn", source)));
+            dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.ddr", source)));
         let path = work.0.join("program");
         fs::write(&path, image).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -199,7 +199,7 @@ fn main(){
 fn tagged_case_failures_test_the_actual_function_and_boolean_expressions() {
     let work = Workspace::new();
     work.write(
-        "suite.dn",
+        "suite.ddr",
         r#"
 @test{(20)->5}
 fn div_by_five(x:i32)->i32{x/5}
@@ -209,14 +209,14 @@ fn answer()->i32{42}
 fn main(){print(div_by_five(20))}
 "#,
     );
-    let out = work.cli(&["test", "suite.dn"]);
+    let out = work.cli(&["test", "suite.ddr"]);
     assert_eq!(out.status.code(), Some(1));
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("FAIL suite.dn::div_by_five (assertion failed)"));
-    assert!(text.contains("FAIL suite.dn::a_boolean_expression_can_fail"));
-    assert!(text.contains("PASS suite.dn::answer"));
+    assert!(text.contains("FAIL suite.ddr::div_by_five (assertion failed)"));
+    assert!(text.contains("FAIL suite.ddr::a_boolean_expression_can_fail"));
+    assert!(text.contains("PASS suite.ddr::answer"));
     assert!(text.contains("1 passed, 2 failed"));
-    let run = work.cli(&["run", "suite.dn"]);
+    let run = work.cli(&["run", "suite.ddr"]);
     assert!(run.status.success());
     assert_eq!(run.stdout, b"4\n");
 }
@@ -226,7 +226,7 @@ fn main(){print(div_by_five(20))}
 fn shorthand_cases_cannot_be_redirected_by_a_local_name() {
     let work = Workspace::new();
     work.write(
-        "suite.dn",
+        "suite.ddr",
         r#"
 fn other(x:i32)->i32{999}
 @test{
@@ -237,7 +237,7 @@ fn other(x:i32)->i32{999}
 fn div_by_five(x:i32)->i32{x/5}
 "#,
     );
-    let out = work.cli(&["test", "suite.dn"]);
+    let out = work.cli(&["test", "suite.ddr"]);
     assert!(
         out.status.success(),
         "{}",
@@ -250,9 +250,9 @@ fn div_by_five(x:i32)->i32{x/5}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn exported_structs_have_nominal_types_across_modules_and_callbacks() {
     let work = Workspace::new();
-    work.write("geometry.dn","pub struct Point{x:i32,y:i32}\nstruct Secret{x:i32}\npub fn squared(p:Point)->i32{p.x*p.x+p.y*p.y}");
+    work.write("geometry.ddr","pub struct Point{x:i32,y:i32}\nstruct Secret{x:i32}\npub fn squared(p:Point)->i32{p.x*p.x+p.y*p.y}");
     work.write(
-        "suite.dn",
+        "suite.ddr",
         r#"
 import geometry
 fn apply(f:fn(geometry.Point)->i32,p:geometry.Point)->i32{f(p)}
@@ -264,7 +264,7 @@ fn apply(f:fn(geometry.Point)->i32,p:geometry.Point)->i32{f(p)}
 fn squared(p:geometry.Point)->i32{geometry.squared(p)}
 "#,
     );
-    let out = work.cli(&["test", "suite.dn"]);
+    let out = work.cli(&["test", "suite.ddr"]);
     assert!(
         out.status.success(),
         "{}",
@@ -272,14 +272,14 @@ fn squared(p:geometry.Point)->i32{geometry.squared(p)}
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed, 0 failed"));
     work.write(
-        "suite.dn",
+        "suite.ddr",
         "import geometry\n@test fn denied(){p:=geometry.Secret{x:1}}",
     );
-    let denied = work.cli(&["test", "suite.dn"]);
+    let denied = work.cli(&["test", "suite.ddr"]);
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("error[E0403]"));
-    work.write("suite.dn","import geometry\nstruct Other{x:i32,y:i32}\n@test fn wrong(){geometry.squared(Other{x:3,y:4})==25}");
-    let nominal = work.cli(&["test", "suite.dn"]);
+    work.write("suite.ddr","import geometry\nstruct Other{x:i32,y:i32}\n@test fn wrong(){geometry.squared(Other{x:3,y:4})==25}");
+    let nominal = work.cli(&["test", "suite.ddr"]);
     assert!(!nominal.status.success());
     assert!(String::from_utf8_lossy(&nominal.stderr).contains("error[E0201]"));
 }
@@ -377,15 +377,16 @@ fn real_dogfood_programs_compile_run_and_self_check() {
     let work = Workspace::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("dogfood");
     for (file, expected) in [
-        ("recursion.dn", "6765\n21\n"),
-        ("sorting.dn", "45\n9\n"),
-        ("iterators.dn", "36\n20\n0\n"),
-        ("arena/main.dn", "28\n"),
-        ("structs.dn", "25\n32\n3\n"),
-        ("collections.dn", "-2\n-1\n0\n1\n13\n3\n"),
-        ("utf8.dn", "bytes=25\nrunes=20\nwords=5\n🌍 Hej världen\n"),
+        ("recursion.ddr", "6765\n21\n"),
+        ("sorting.ddr", "45\n9\n"),
+        ("iterators.ddr", "36\n20\n0\n"),
+        ("arena/main.ddr", "28\n"),
+        ("structs.ddr", "25\n32\n3\n"),
+        ("numeric/main.ddr", "5.0\n2.0\ntrue\n"),
+        ("collections.ddr", "-2\n-1\n0\n1\n13\n3\n"),
+        ("utf8.ddr", "bytes=25\nrunes=20\nwords=5\n🌍 Hej världen\n"),
         (
-            "tokenizer.dn",
+            "tokenizer.ddr",
             "fn|hälsa|(|namn|)|{|print|(|\"Hej 🌍\"|)|}\n",
         ),
     ] {
@@ -398,14 +399,14 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{file}");
     }
-    let path = root.join("tests.dn");
+    let path = root.join("tests.ddr");
     let out = work.cli(&["test", path.to_str().unwrap()]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("18 passed, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("25 passed, 0 failed"));
 }
 
 #[test]
@@ -413,7 +414,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
 fn test_command_isolates_failures_skips_main_and_reports_captured_output() {
     let work = Workspace::new();
     work.write(
-        "suite.dn",
+        "suite.ddr",
         r#"
 fn main(){assert(false)}
 @test fn first(){print(999);assert(true)}
@@ -421,13 +422,13 @@ fn main(){assert(false)}
 @test fn after_failure(){assert(true)}
 "#,
     );
-    let out = work.cli(&["test", "suite.dn"]);
+    let out = work.cli(&["test", "suite.ddr"]);
     assert_eq!(out.status.code(), Some(1));
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("PASS suite.dn::first"));
-    assert!(text.contains("FAIL suite.dn::failing (assertion failed)"));
+    assert!(text.contains("PASS suite.ddr::first"));
+    assert!(text.contains("FAIL suite.ddr::failing (assertion failed)"));
     assert!(text.contains("stdout: 123"));
-    assert!(text.contains("PASS suite.dn::after_failure"));
+    assert!(text.contains("PASS suite.ddr::after_failure"));
     assert!(text.contains("2 passed, 1 failed"));
     assert!(!text.contains("999"));
 }
@@ -437,14 +438,14 @@ fn main(){assert(false)}
 fn test_command_times_out_and_continues_to_the_next_test() {
     let work = Workspace::new();
     work.write(
-        "suite.dn",
+        "suite.ddr",
         "@test fn hangs(){while true{}}\n@test fn after_timeout(){assert(true)}",
     );
-    let out = work.cli(&["test", "suite.dn", "--timeout-ms", "250"]);
+    let out = work.cli(&["test", "suite.ddr", "--timeout-ms", "250"]);
     assert_eq!(out.status.code(), Some(1));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("hangs (timeout)"));
-    assert!(text.contains("PASS suite.dn::after_timeout"));
+    assert!(text.contains("PASS suite.ddr::after_timeout"));
     assert!(text.contains("1 passed, 1 failed"));
 }
 
@@ -452,10 +453,10 @@ fn test_command_times_out_and_continues_to_the_next_test() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn test_mode_needs_no_main_deduplicates_imports_and_honors_the_manifest() {
     let work = Workspace::new();
-    work.write("dunder.toml", "name = \"suite\"\nroot = \"suite.dn\"\n");
-    work.write("suite.dn","import helper\nimport helper as other\n@test fn root(){assert(helper.answer()==other.answer())}");
+    work.write("dunder.toml", "name = \"suite\"\nroot = \"suite.ddr\"\n");
+    work.write("suite.ddr","import helper\nimport helper as other\n@test fn root(){assert(helper.answer()==other.answer())}");
     work.write(
-        "helper.dn",
+        "helper.ddr",
         "pub fn answer()->i32{return 42}\n@test fn dependency(){assert(answer()==42)}",
     );
     let out = work.cli(&["test"]);
@@ -465,16 +466,16 @@ fn test_mode_needs_no_main_deduplicates_imports_and_honors_the_manifest() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("2 passed, 0 failed"));
-    work.write("suite.dn", "fn main(){assert(true)}");
+    work.write("suite.ddr", "fn main(){assert(true)}");
     let empty = work.cli(&["test"]);
     assert!(empty.status.success());
     assert!(String::from_utf8_lossy(&empty.stdout).contains("0 passed, 0 failed"));
     work.write(
         "dunder.toml",
-        "name = \"suite\"\nroot = \"main.dn\"\ntest_root = \"suite.dn\"\n",
+        "name = \"suite\"\nroot = \"main.ddr\"\ntest_root = \"suite.ddr\"\n",
     );
-    work.write("main.dn", "fn main(){print(42)}");
-    work.write("suite.dn", "@test fn selected_by_manifest(){true}");
+    work.write("main.ddr", "fn main(){print(42)}");
+    work.write("suite.ddr", "@test fn selected_by_manifest(){true}");
     let selected = work.cli(&["test"]);
     assert!(selected.status.success());
     assert!(String::from_utf8_lossy(&selected.stdout).contains("1 passed, 0 failed"));

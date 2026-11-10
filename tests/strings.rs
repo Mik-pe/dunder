@@ -22,7 +22,7 @@ impl Workspace {
         use std::os::unix::fs::PermissionsExt;
         let work = Self::new();
         let image =
-            dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.dn", source)));
+            dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.ddr", source)));
         let path = work.0.join("program");
         fs::write(&path, image).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -299,7 +299,7 @@ fn native_unicode_matches_independent_rust_byte_and_scalar_reference() {
 fn string_module_tests_use_real_runtime_values_and_report_unicode_failures() {
     let work = Workspace::new();
     fs::write(
-        work.0.join("text.dn"),
+        work.0.join("text.ddr"),
         r#"
 pub struct Label{text:string}
 @test{("åäö")->"[åäö]";("🌍")->"[🌍]"}
@@ -308,7 +308,7 @@ pub fn decorate(s:string)->string {"["+s+"]"}
     )
     .unwrap();
     fs::write(
-        work.0.join("main.dn"),
+        work.0.join("main.ddr"),
         r#"
 import text
 @test{(text.Label{text:"värld"})->"[värld]"}
@@ -320,7 +320,7 @@ fn intentionally_wrong(s:string)->string{s+"!"}
 "#,
     )
     .unwrap();
-    let out = work.cli(&["test", "main.dn"]);
+    let out = work.cli(&["test", "main.ddr"]);
     assert_eq!(out.status.code(), Some(1));
     let report = String::from_utf8_lossy(&out.stdout);
     assert!(

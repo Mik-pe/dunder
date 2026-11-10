@@ -9,6 +9,7 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub main: Option<usize>,
     pub tests: Vec<TestCase>,
+    pub float_formatter: Option<usize>,
 }
 pub struct TestCase {
     pub name: String,
@@ -77,6 +78,8 @@ pub struct Expr {
 }
 pub enum ExprKind {
     Number(i64),
+    Float(u64),
+    FloatOp(FloatOp, Box<Expr>),
     Bool(bool),
     String(String),
     StringView(Box<Expr>),
@@ -97,6 +100,22 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     Record(Vec<(usize, Expr)>, usize),
     Field(Box<Expr>, usize),
+}
+#[derive(Clone, Copy)]
+pub enum FloatOp {
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
+    Round,
+    RoundEven,
+    Trunc,
+    IsNan,
+    IsFinite,
+    IsInfinite,
+    SignNegative,
+    ToBits,
+    FromBits,
 }
 #[derive(Clone, Copy)]
 pub enum StringOp {
@@ -124,6 +143,7 @@ struct Checker<'a> {
     ret: Type,
     loops: usize,
     testing: bool,
+    needs_float_format: bool,
 }
 
 fn reserved(name: &str) -> bool {
@@ -153,6 +173,8 @@ fn reserved(name: &str) -> bool {
             | "struct"
             | "string"
             | "rune"
+            | "f32"
+            | "f64"
     )
 }
 fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
@@ -333,9 +355,41 @@ impl Checker<'_> {
                     if n == "rune" {
                         return Some(Type::Rune);
                     }
+                    if n == "f32" {
+                        return Some(Type::F32);
+                    }
+                    if n == "f64" {
+                        return Some(Type::F64);
+                    }
                 }
                 if let ast::ExprKind::Member(base, name) = &callee.kind {
-                    if let Some(ty) = self.hint(base) {
+                    if name == "from_bits" {
+                        if matches!(&base.kind,ast::ExprKind::Name(n) if n=="f32") {
+                            return Some(Type::F32);
+                        }
+                        if matches!(&base.kind,ast::ExprKind::Name(n) if n=="f64") {
+                            return Some(Type::F64);
+                        }
+                    }
+                    if let Some(ty) = self.receiver_type(base) {
+                        if ty.float() {
+                            if matches!(
+                                name.as_str(),
+                                "is_nan" | "is_finite" | "is_infinite" | "is_sign_negative"
+                            ) {
+                                return Some(Type::Bool);
+                            }
+                            if name == "to_bits" {
+                                return Some(if ty == Type::F32 {
+                                    Type::I32
+                                } else {
+                                    Type::I64
+                                });
+                            }
+                            if name != "str" {
+                                return self.hint(base);
+                            }
+                        }
                         if name == "str" {
                             return Some(Type::String);
                         }
@@ -382,6 +436,9 @@ impl Checker<'_> {
         }
     }
     fn number(&self, value: i128, ty: Type, span: Span) -> Result<Expr, Error> {
+        if ty.float() {
+            return self.float(&value.to_string(), ty, span);
+        }
         let valid = match ty {
             Type::I32 => i32::try_from(value).is_ok(),
             Type::I64 => i64::try_from(value).is_ok(),
@@ -395,9 +452,57 @@ impl Checker<'_> {
             kind: ExprKind::Number(value as i64),
         })
     }
+    fn float(&self, spelling: &str, ty: Type, span: Span) -> Result<Expr, Error> {
+        let bits = match ty {
+            Type::F32 => spelling
+                .parse::<f32>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .map(|n| u64::from(n.to_bits())),
+            Type::F64 => spelling
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .map(f64::to_bits),
+            _ => return Err(mismatch(self.types, span, ty, Type::F64)),
+        }
+        .ok_or_else(|| {
+            Error::new(
+                "E0260",
+                span,
+                format!(
+                    "floating literal '{spelling}' is not finite in {}",
+                    ty.name()
+                ),
+            )
+        })?;
+        Ok(Expr {
+            ty,
+            kind: ExprKind::Float(bits),
+        })
+    }
+    fn float_literal(expr: &ast::Expr) -> bool {
+        match &expr.kind {
+            ast::ExprKind::Float(_) => true,
+            ast::ExprKind::Unary("-", value) => Self::float_literal(value),
+            ast::ExprKind::Binary(op, a, b) if matches!(*op, "+" | "-" | "*" | "/" | "%") => {
+                Self::float_literal(a) || Self::float_literal(b)
+            }
+            ast::ExprKind::Call(callee, args) if args.is_empty() => {
+                matches!(&callee.kind, ast::ExprKind::Member(base, name)
+                    if matches!(name.as_str(), "abs"|"sqrt"|"floor"|"ceil"|"round"|"round_ties_even"|"trunc") && Self::float_literal(base))
+            }
+            _ => false,
+        }
+    }
+    fn receiver_type(&self, expr: &ast::Expr) -> Option<Type> {
+        self.hint(expr)
+            .or_else(|| Self::float_literal(expr).then_some(Type::F64))
+    }
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
+            A::Float(n) => self.float(n, expected.unwrap_or(Type::F64), e.span)?,
             A::String(s) => Expr {
                 ty: Type::String,
                 kind: ExprKind::String(s.clone()),
@@ -543,7 +648,7 @@ impl Checker<'_> {
             }
             A::Number(n) => self.number(
                 *n,
-                expected.filter(|t| t.integer()).unwrap_or(Type::I32),
+                expected.filter(|t| t.numeric()).unwrap_or(Type::I32),
                 e.span,
             )?,
             A::Bool(b) => Expr {
@@ -616,7 +721,7 @@ impl Checker<'_> {
                 };
                 self.number(
                     -n,
-                    expected.filter(|t| t.integer()).unwrap_or(Type::I32),
+                    expected.filter(|t| t.numeric()).unwrap_or(Type::I32),
                     e.span,
                 )?
             }
@@ -629,8 +734,12 @@ impl Checker<'_> {
                         expected
                     },
                 )?;
-                if *op == "-" && !x.ty.integer() {
-                    return Err(Error::new("E0206", e.span, "unary '-' requires an integer"));
+                if *op == "-" && !x.ty.numeric() {
+                    return Err(Error::new(
+                        "E0206",
+                        e.span,
+                        "unary '-' requires a numeric value",
+                    ));
                 }
                 Expr {
                     ty: x.ty,
@@ -649,18 +758,24 @@ impl Checker<'_> {
                     let arithmetic = matches!(*op, "+" | "-" | "*" | "/" | "%");
                     let hint = if arithmetic {
                         expected
-                            .filter(|t| t.integer())
+                            .filter(|t| t.numeric())
                             .or_else(|| self.hint(left))
                             .or_else(|| self.hint(right))
                     } else {
                         self.hint(left).or_else(|| self.hint(right))
-                    };
+                    }
+                    .or_else(|| {
+                        (Self::float_literal(left) || Self::float_literal(right))
+                            .then_some(Type::F64)
+                    });
                     let a = self.expr(left, hint)?;
                     let b = self.expr(right, Some(a.ty))?;
                     let string_op = a.ty == Type::String
                         && matches!(*op, "+" | "==" | "!=" | "<" | "<=" | ">" | ">=");
                     let rune_op = a.ty == Type::Rune && !arithmetic;
+                    let float_op = a.ty.float() && *op != "%";
                     if !a.ty.integer()
+                        && !float_op
                         && !string_op
                         && !rune_op
                         && !(matches!(*op, "==" | "!=") && a.ty == Type::Bool)
@@ -675,6 +790,79 @@ impl Checker<'_> {
                         ty: if arithmetic { a.ty } else { Type::Bool },
                         kind: ExprKind::Binary(op, Box::new(a), Box::new(b)),
                     }
+                }
+            }
+            A::Call(callee, args) if matches!(&callee.kind, A::Member(base,name) if name == "from_bits" && matches!(&base.kind,A::Name(n) if n=="f32"||n=="f64")) =>
+            {
+                if args.len() != 1 {
+                    return Err(Error::new("E0207", e.span, "from_bits expects one integer"));
+                }
+                let A::Member(base, _) = &callee.kind else {
+                    unreachable!()
+                };
+                let ty = if matches!(&base.kind,A::Name(n) if n=="f32") {
+                    Type::F32
+                } else {
+                    Type::F64
+                };
+                let bits = self.expr(
+                    &args[0],
+                    Some(if ty == Type::F32 {
+                        Type::I32
+                    } else {
+                        Type::I64
+                    }),
+                )?;
+                Expr {
+                    ty,
+                    kind: ExprKind::FloatOp(FloatOp::FromBits, Box::new(bits)),
+                }
+            }
+            A::Call(callee, args) if matches!(&callee.kind, A::Member(base,name) if self.receiver_type(base).is_some_and(Type::float) && name != "str") =>
+            {
+                if !args.is_empty() {
+                    return Err(Error::new(
+                        "E0207",
+                        e.span,
+                        "this floating method takes no arguments",
+                    ));
+                }
+                let A::Member(base, name) = &callee.kind else {
+                    unreachable!()
+                };
+                let base = self.expr(base, expected.filter(|ty| ty.float()))?;
+                let op = match name.as_str() {
+                    "abs" => FloatOp::Abs,
+                    "sqrt" => FloatOp::Sqrt,
+                    "floor" => FloatOp::Floor,
+                    "ceil" => FloatOp::Ceil,
+                    "round" => FloatOp::Round,
+                    "round_ties_even" => FloatOp::RoundEven,
+                    "trunc" => FloatOp::Trunc,
+                    "is_nan" => FloatOp::IsNan,
+                    "is_finite" => FloatOp::IsFinite,
+                    "is_infinite" => FloatOp::IsInfinite,
+                    "is_sign_negative" => FloatOp::SignNegative,
+                    "to_bits" => FloatOp::ToBits,
+                    _ => return Err(Error::new("E0261", e.span, "unknown floating method")),
+                };
+                let ty = match op {
+                    FloatOp::IsNan
+                    | FloatOp::IsFinite
+                    | FloatOp::IsInfinite
+                    | FloatOp::SignNegative => Type::Bool,
+                    FloatOp::ToBits => {
+                        if base.ty == Type::F32 {
+                            Type::I32
+                        } else {
+                            Type::I64
+                        }
+                    }
+                    _ => base.ty,
+                };
+                Expr {
+                    ty,
+                    kind: ExprKind::FloatOp(op, Box::new(base)),
                 }
             }
             A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if n=="len") => {
@@ -706,9 +894,16 @@ impl Checker<'_> {
                 } else if name == "str"
                     && matches!(
                         base.ty,
-                        Type::I32 | Type::I64 | Type::Bool | Type::Rune | Type::String
+                        Type::I32
+                            | Type::I64
+                            | Type::Bool
+                            | Type::Rune
+                            | Type::String
+                            | Type::F32
+                            | Type::F64
                     )
                 {
+                    self.needs_float_format |= base.ty.float();
                     Expr {
                         ty: Type::String,
                         kind: ExprKind::StringOp(StringOp::ToString, vec![base]),
@@ -758,29 +953,36 @@ impl Checker<'_> {
                 let value = self.expr(&args[0], None)?;
                 if !matches!(
                     value.ty,
-                    Type::I32 | Type::I64 | Type::Bool | Type::String | Type::Rune
+                    Type::I32
+                        | Type::I64
+                        | Type::Bool
+                        | Type::String
+                        | Type::Rune
+                        | Type::F32
+                        | Type::F64
                 ) {
-                    return Err(Error::new(
-                        "E0206",
-                        e.span,
-                        "print requires i32, i64, bool, string or rune",
-                    ));
+                    return Err(Error::new("E0206", e.span, "print requires a scalar value"));
                 }
+                self.needs_float_format |= value.ty.float();
                 Expr {
                     ty: Type::Unit,
                     kind: ExprKind::Print(Box::new(value)),
                 }
             }
-            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if n == "i32" || n == "i64" || n == "rune") =>
+            A::Call(callee, args) if matches!(&callee.kind, A::Name(n) if matches!(n.as_str(), "i32"|"i64"|"rune"|"f32"|"f64")) =>
             {
                 if args.len() != 1 {
                     return Err(Error::new(
                         "E0207",
                         e.span,
-                        "an integer conversion expects one argument",
+                        "a numeric conversion expects one argument",
                     ));
                 }
-                let ty = if matches!(&callee.kind, A::Name(n) if n == "rune") {
+                let ty = if matches!(&callee.kind, A::Name(n) if n == "f32") {
+                    Type::F32
+                } else if matches!(&callee.kind, A::Name(n) if n == "f64") {
+                    Type::F64
+                } else if matches!(&callee.kind, A::Name(n) if n == "rune") {
                     Type::Rune
                 } else if matches!(&callee.kind, A::Name(n) if n == "i32") {
                     Type::I32
@@ -790,13 +992,22 @@ impl Checker<'_> {
                 let inner = self.expr(
                     &args[0],
                     self.hint(&args[0])
-                        .or(Some(if ty == Type::Rune { Type::I32 } else { ty })),
+                        .or(Some(if Self::float_literal(&args[0]) && !ty.float() {
+                            Type::F64
+                        } else if ty == Type::Rune {
+                            Type::I32
+                        } else {
+                            ty
+                        })),
                 )?;
-                if !inner.ty.integer() && inner.ty != Type::Rune {
+                if !(inner.ty.numeric() || inner.ty == Type::Rune)
+                    || (ty.float() && inner.ty == Type::Rune)
+                    || (ty == Type::Rune && inner.ty.float())
+                {
                     return Err(Error::new(
                         "E0206",
                         e.span,
-                        "integer conversion requires an integer; bool is a separate type",
+                        "numeric conversion requires a compatible numeric value",
                     ));
                 }
                 if ty == Type::Rune {
@@ -1214,13 +1425,13 @@ pub(crate) fn check_modules(
                     .map_err(|e| e.in_file(module))?;
                 let size = match ty {
                     Type::Bool => 1,
-                    Type::I32 | Type::Rune => 4,
-                    Type::I64 | Type::String => 8,
+                    Type::I32 | Type::Rune | Type::F32 => 4,
+                    Type::I64 | Type::String | Type::F64 => 8,
                     _ => {
                         return Err(Error::new(
                             "E0240",
                             field.span,
-                            "struct fields currently support i32, i64, bool, string and rune",
+                            "struct fields currently support scalar values",
                         )
                         .in_file(module))
                     }
@@ -1315,6 +1526,7 @@ pub(crate) fn check_modules(
     }
     let main = entry.map(|e| e.index);
     let mut checked = Vec::new();
+    let mut needs_float_format = false;
     for (module, input) in modules.into_iter().enumerate() {
         for f in input.functions {
             let function = (|| {
@@ -1327,6 +1539,7 @@ pub(crate) fn check_modules(
                     ret: f.ret,
                     loops: 0,
                     testing: f.test.is_some(),
+                    needs_float_format: false,
                 };
                 let mut param_slots = Vec::new();
                 let mut param_storage = Vec::new();
@@ -1335,6 +1548,7 @@ pub(crate) fn check_modules(
                     param_storage.push(c.lookup(&p.name).unwrap().storage);
                 }
                 let (body, returns) = c.statements(&f.body)?;
+                needs_float_format |= c.needs_float_format;
                 if f.ret != Type::Unit && !returns {
                     return Err(Error::new(
                         "E0213",
@@ -1359,11 +1573,81 @@ pub(crate) fn check_modules(
             checked.push(function);
         }
     }
+    let float_formatter = if needs_float_format {
+        let index = checked.len();
+        checked.push(float_formatter_function(&mut types)?);
+        Some(index)
+    } else {
+        None
+    };
     Ok(Program {
         types,
         functions: checked,
         main,
         tests,
+        float_formatter,
+    })
+}
+
+fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
+    let source = include_str!("../runtime/float.ddr");
+    let mut build = || -> Result<Function, Error> {
+        let ast = ast::parse_module_at(source, types, 0)?;
+        let [f] = ast.functions.as_slice() else {
+            return Err(Error::new(
+                "E0999",
+                Span { start: 0, end: 0 },
+                "float runtime must define one formatter",
+            ));
+        };
+        if f.params.iter().map(|p| p.ty).collect::<Vec<_>>() != [Type::I64, Type::Bool]
+            || f.ret != Type::String
+        {
+            return Err(Error::new(
+                "E0999",
+                f.span,
+                "float formatter must have signature fn(i64, bool) -> string",
+            ));
+        }
+        let symbols = [Symbols::default()];
+        let mut c = Checker {
+            module: 0,
+            symbols: &symbols,
+            types,
+            scopes: vec![HashMap::new()],
+            slots: 0,
+            ret: Type::String,
+            loops: 0,
+            testing: false,
+            needs_float_format: false,
+        };
+        let mut param_slots = Vec::new();
+        for p in &f.params {
+            param_slots.push(c.bind(&p.name, p.ty, false, p.span)?);
+        }
+        let (body, returns) = c.statements(&f.body)?;
+        if !returns {
+            return Err(Error::new(
+                "E0999",
+                f.span,
+                "float formatter must return on every path",
+            ));
+        }
+        Ok(Function {
+            name: "<dunder:float-format>".into(),
+            params: vec![Type::I64, Type::Bool],
+            slots: c.slots,
+            body,
+            param_slots,
+            param_storage: vec![None, None],
+        })
+    };
+    build().map_err(|e| {
+        Error::new(
+            "E0999",
+            Span { start: 0, end: 0 },
+            e.render("<dunder:float-format>", source),
+        )
     })
 }
 

@@ -1,6 +1,6 @@
 # Dunder ⚡
 
-Ett statiskt typat, kompilerat språk med filändelsen **`.dn`**.
+Ett statiskt typat, kompilerat språk med filändelsen **`.ddr`**.
 Den första kompilatorn läser vanlig
 Dunder-källkod och skriver en körbar ARM64/Mach-O-fil för macOS, inklusive
 ad hoc-signatur. Kodgenerering, bildskrivning och signering görs i kompilatorn.
@@ -35,7 +35,7 @@ Bygg bootstrapkompilatorn med systemets Rust, utan externa crates:
 
 ```sh
 cargo build --release
-cargo run --release -- build examples/hello.dn -o build/hello --timings
+cargo run --release -- build examples/hello.ddr -o build/hello --timings
 ./build/hello
 # 42
 # true
@@ -48,8 +48,8 @@ användas för oberoende verifiering; `cargo test` kontrollerar bland annat
 signaturerna med `codesign --verify` och kör riktiga binärer.
 
 ```sh
-cargo run --release -- check examples/fibonacci.dn
-cargo run --release -- build examples/fibonacci.dn -o build/fibonacci
+cargo run --release -- check examples/fibonacci.ddr
+cargo run --release -- build examples/fibonacci.ddr -o build/fibonacci
 ./build/fibonacci
 # 6765
 # true
@@ -57,7 +57,7 @@ cargo run --release -- build examples/fibonacci.dn -o build/fibonacci
 
 `dunder run` bygger och kör programmet direkt. `fn main()` ger exitkod 0;
 `fn main() -> i32` låter programmet välja exitkod med `return`.
-Kör `cargo run --release -- run examples/functions.dn` för att prova
+Kör `cargo run --release -- run examples/functions.ddr` för att prova
 funktioner, callbacks och funktioner som returvärden. Exemplet skriver
 `42`, `42` och `-42`.
 
@@ -69,15 +69,15 @@ fn apply(transform: fn(i32) -> i32, value: i32) -> i32 {
 }
 ```
 
-Se [funktionsexemplet](examples/functions.dn) för en funktion som
+Se [funktionsexemplet](examples/functions.ddr) för en funktion som
 returnerar en annan funktion, lagring i lokala variabler och callbackanrop.
 
 `dunder build` utan fil hittar närmaste `dunder.toml` uppåt från arbetskatalogen:
 
 ```toml
 name = "hello"
-root = "examples/hello.dn"
-test_root = "dogfood/tests.dn"
+root = "examples/hello.ddr"
+test_root = "dogfood/tests.ddr"
 ```
 
 Utdata hamnar då i `build/arm64-macos/hello`. `name` och `root` krävs;
@@ -87,18 +87,18 @@ felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
 
 ## Moduler
 
-En `.dn`-fil är en modul. Importen skrivs **utan filändelse** och söks
+En `.ddr`-fil är en modul. Importen skrivs **utan filändelse** och söks
 relativt filen som importerar:
 
 ```dunder
-// math.dn
+// math.ddr
 pub fn add(a: i32, b: i32) -> i32 {
     return a + b
 }
 ```
 
 ```dunder
-// main.dn
+// main.ddr
 import math
 
 fn main() {
@@ -107,18 +107,18 @@ fn main() {
 ```
 
 `fn` är privat inom modulen; `pub fn` exporterar funktionen. `import math`
-läser `math.dn`. Undermappar och alias skrivs exempelvis
+läser `math.ddr`. Undermappar och alias skrivs exempelvis
 `import "util/predicates" as predicates`. `import "math"` stöds också.
-Ingen importform innehåller `.dn`.
+Ingen importform innehåller `.ddr`.
 
 Typer följer samma regel: `struct Point` är privat och `pub struct Point`
 exporteras. En importerad typ skrivs exempelvis `geometry.Point`, både i
 signaturer och i uttrycket `geometry.Point { x: 3, y: 4 }`.
 
-Kör [exemplet med tre moduler](examples/modules/main.dn):
+Kör [exemplet med tre moduler](examples/modules/main.ddr):
 
 ```sh
-cargo run --release -- run examples/modules/main.dn
+cargo run --release -- run examples/modules/main.ddr
 # 42
 # true
 # 42
@@ -166,8 +166,8 @@ explicit `return` fungerar också.
 
 ```sh
 cargo run --release -- test
-cargo run --release -- test dogfood/geometry.dn
-cargo run --release -- run dogfood/structs.dn
+cargo run --release -- test dogfood/geometry.ddr
+cargo run --release -- run dogfood/structs.ddr
 # 25
 # 32
 # 3
@@ -238,9 +238,9 @@ callbacks, arrayelement och structfält. `value.str()` konverterar heltal,
 bool och runes. Unicode-escapes och NUL fungerar; alla strängvärden är giltig
 UTF-8. Index, snittgränser och `rune(number)` kontrolleras vid körning.
 
-Kör `cargo run --release -- run dogfood/utf8.dn` för textstatistik och
-`cargo run --release -- run dogfood/tokenizer.dn` för en liten UTF-8-tokenizer.
-[Textfunktionerna](dogfood/text/scan.dn), inklusive `find`, `replace` och
+Kör `cargo run --release -- run dogfood/utf8.ddr` för textstatistik och
+`cargo run --release -- run dogfood/tokenizer.ddr` för en liten UTF-8-tokenizer.
+[Textfunktionerna](dogfood/text/scan.ddr), inklusive `find`, `replace` och
 ordräkning, är skrivna i Dunder och har egna taggade tester.
 
 Första implementationen lagrar dynamiskt byggda strängar i en separat
@@ -249,15 +249,49 @@ processen avslutas. Ingen GC används, och minnet återvinns ännu inte under
 körningen. En full arena ger ett definierat runtimefel. Detta är en första
 körmodell för dogfooding, inte den färdiga ägar-/lånemodellen.
 
+## Flyttal
+
+`f32` och `f64` stöder aritmetik, jämförelser, decimal- och exponentliteraler,
+explicita konverteringar samt parametrar, returvärden, callbacks, arrayer
+och structfält:
+
+```dunder
+@test {
+    (3.0, 4.0) -> 5.0
+}
+fn length(x: f64, y: f64) -> f64 {
+    (x * x + y * y).sqrt()
+}
+
+fn main() {
+    narrow: f32 = 0.1
+    wide := 1.25e3        // f64 som standard
+    print(length(3.0, 4.0))
+    print(narrow)
+    print(wide)
+}
+```
+
+IEEE-beteende omfattar NaN, oändlighet, signerad noll och subnormala tal.
+Metoder inkluderar `.abs()`, `.sqrt()`, `.floor()`, `.ceil()`, `.trunc()`,
+`.round()`, `.round_ties_even()` och klassificering. Konvertering till
+heltal trunkerar och kontrollerar intervallet. `.str()` och `print` använder
+en kort decimalrepresentation som avrundas tillbaka till samma flyttal.
+Utskriftsrutinen är [skriven i Dunder](runtime/float.ddr).
+
+Kör `cargo run --release -- test dogfood/numeric/main.ddr` för sju numeriska
+testgrupper med vektorer, stabil summering, rotberäkning och numerisk
+integration. Läs [flyttalsreglerna och begränsningarna](docs/floating.md).
+
 ## Implementerat och återstående
 
-Implementerat: `i32`, `i64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,
+Implementerat: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,
 callbacks, funktioner som returvärden, framåtanrop och rekursion,
 filmoduler med explicita importer, alias, namnrymder och privata/exporterade funktioner och structar,
 härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/else`,
 `while`, `for`, `break/continue`, typade arrayer och arrayiteratorer,
 struct-uttryck och fältåtkomst, `@test`, `assert`, kortslutande booleska operatorer,
-heltalsaritmetik, kontrollerade heltalskonverteringar och `print`.
+heltals- och flyttalsaritmetik, kontrollerade konverteringar och `print`.
 Läs [syntaxen](docs/syntax.md).
 
 Anrop stöder både register- och stackargument; fler än åtta parametrar fungerar.
@@ -265,7 +299,7 @@ Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
 infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
 och körbar kod; optimering och byggprestanda är inte uppmätta.
 Bootstrapkompilatorn är skriven i Rust och är ännu inte självhostad.
-Structfält och arrayelement stöder i dag `i32`, `i64`, `bool`, `string` och `rune`.
+Structfält och arrayelement stöder i dag `i32`, `i64`, `f32`, `f64`, `bool`, `string` och `rune`.
 Arrayer/structar/iteratorer kan ännu inte returneras från funktioner.
 Nästlade aggregat, arrayslices, allmänt allokerings-API, ägande/lån och
 användardefinierade iteratorer återstår. Stränginterpolering, normalisering,

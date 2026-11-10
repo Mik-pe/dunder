@@ -69,7 +69,7 @@ fn manifest(testing: bool) -> Result<(PathBuf, String), String> {
         }
         if !dir.pop() {
             return Err(
-                "no dunder.toml found; run 'dunder build file.dn' or create a manifest".into(),
+                "no dunder.toml found; run 'dunder build file.ddr' or create a manifest".into(),
             );
         }
     }
@@ -102,7 +102,7 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
 fn run() -> Result<i32, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.dn] [-o output] [--timings]\n  dunder run [file.dn] [-o output] [--timings]\n  dunder check [file.dn]\n  dunder test [file.dn] [-o directory] [--timeout-ms 5000]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.ddr] [-o output] [--timings]\n  dunder run [file.ddr] [-o output] [--timings]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--timeout-ms 5000]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
         return Ok(0);
     }
     let command = &args[0];

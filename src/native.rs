@@ -4,6 +4,7 @@ use crate::{
     check::{Expr, ExprKind, Program, Stmt},
     syntax::{Type, Types},
 };
+mod floats;
 mod strings;
 
 type Label = usize;
@@ -31,6 +32,8 @@ struct Code<'a> {
     assertion: Label,
     loops: Vec<(Label, Label)>,
     strings: strings::Runtime,
+    float_formatter: Option<Label>,
+    float_conversion: Label,
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -50,6 +53,8 @@ impl<'a> Code<'a> {
             assertion: 0,
             loops: Vec::new(),
             strings: strings::Runtime::default(),
+            float_formatter: None,
+            float_conversion: 0,
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -61,6 +66,7 @@ impl<'a> Code<'a> {
         c.bounds = c.label();
         c.assertion = c.label();
         c.strings = strings::Runtime::new(&mut c);
+        c.float_conversion = c.label();
         c
     }
     fn label(&mut self) -> Label {
@@ -134,6 +140,7 @@ impl<'a> Code<'a> {
         self.emit(0x8b0903a9); // add x9,x29,x9, past saved FP/LR
         self.emit(match ty {
             Type::I32 | Type::Rune => 0xb9800120,
+            Type::F32 => 0xb9400120,
             Type::Bool => 0x39400120,
             _ => 0xf9400120,
         });
@@ -151,6 +158,7 @@ impl<'a> Code<'a> {
     fn typed_load(&mut self, ty: Type) {
         self.emit(match ty {
             Type::I32 | Type::Rune => 0xb9800000,
+            Type::F32 => 0xb9400000,
             Type::Bool => 0x39400000,
             _ => 0xf9400000,
         });
@@ -158,7 +166,7 @@ impl<'a> Code<'a> {
     fn typed_store(&mut self, ty: Type, base: u32) {
         self.emit(
             (match ty {
-                Type::I32 | Type::Rune => 0xb9000000,
+                Type::I32 | Type::Rune | Type::F32 => 0xb9000000,
                 Type::Bool => 0x39000000,
                 _ => 0xf9000000,
             }) | base << 5,
@@ -197,6 +205,8 @@ impl<'a> Code<'a> {
     }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::Float(bits) => self.imm(0, *bits),
+            ExprKind::FloatOp(op, value) => self.float_expr(*op, value, e.ty),
             ExprKind::String(s) => {
                 let label = self.string_literal(s);
                 self.branch(label, Branch::Address(0));
@@ -297,23 +307,27 @@ impl<'a> Code<'a> {
                     self.expr(arg);
                     self.push(0);
                 }
-                let (offsets, outgoing) =
-                    stack_arguments(&args.iter().map(|a| a.ty).collect::<Vec<_>>());
+                let (locations, outgoing) =
+                    arguments(&args.iter().map(|a| a.ty).collect::<Vec<_>>());
                 self.stack_adjust(outgoing, true);
-                for (i, offset) in offsets.into_iter().enumerate() {
-                    let arg = i + 8;
+                for (arg, location) in locations.into_iter().enumerate() {
                     self.sp_addr(outgoing + (args.len() - 1 - arg) * 16);
-                    self.emit(0xf940012a); // ldr x10,[x9] from evaluation temporary
-                    self.sp_addr(offset);
-                    self.emit(match args[arg].ty {
-                        Type::I32 | Type::Rune => 0xb900012a,
-                        Type::Bool => 0x3900012a,
-                        _ => 0xf900012a,
-                    });
-                }
-                for reg in 0..args.len().min(8) {
-                    self.sp_addr(outgoing + (args.len() - 1 - reg) * 16);
-                    self.emit(0xf9400120 | reg as u32);
+                    match location {
+                        Argument::General(reg) => self.emit(0xf9400120 | reg),
+                        Argument::Float(reg) => {
+                            self.emit(0xf940012a);
+                            self.bits_to_fp(reg, 10, args[arg].ty);
+                        }
+                        Argument::Stack(offset) => {
+                            self.emit(0xf940012a);
+                            self.sp_addr(offset);
+                            self.emit(match args[arg].ty {
+                                Type::I32 | Type::Rune | Type::F32 => 0xb900012a,
+                                Type::Bool => 0x3900012a,
+                                _ => 0xf900012a,
+                            });
+                        }
+                    }
                 }
                 if let Some(f) = direct {
                     self.branch(self.functions[f], Branch::Call);
@@ -322,6 +336,9 @@ impl<'a> Code<'a> {
                     self.emit(0xf9400128);
                     self.emit(0xd63f0100); // blr x8
                 }
+                if e.ty.float() {
+                    self.fp_to_bits(0, 0, e.ty);
+                }
                 self.stack_adjust(
                     outgoing + args.len() * 16 + if direct.is_none() { 16 } else { 0 },
                     false,
@@ -329,11 +346,15 @@ impl<'a> Code<'a> {
             }
             ExprKind::Print(x) => {
                 self.expr(x);
+                if x.ty.float() {
+                    self.float_to_string(x.ty);
+                }
                 self.branch(
                     match x.ty {
                         Type::Bool => self.print_bool,
                         Type::String => self.strings.print,
                         Type::Rune => self.strings.print_rune,
+                        Type::F32 | Type::F64 => self.strings.print,
                         _ => self.print_int,
                     },
                     Branch::Call,
@@ -342,12 +363,20 @@ impl<'a> Code<'a> {
             }
             ExprKind::Cast(x) => {
                 self.expr(x);
-                if e.ty == Type::I32 && x.ty == Type::I64 {
+                if e.ty.float() || x.ty.float() {
+                    self.float_cast(x.ty, e.ty);
+                } else if e.ty == Type::I32 && x.ty == Type::I64 {
                     self.narrow();
                 }
             }
             ExprKind::Unary(op, x) => {
                 self.expr(x);
+                if e.ty.float() {
+                    self.bits_to_fp(0, 0, e.ty);
+                    self.emit(0x1e214000 | Self::fp_width(e.ty));
+                    self.fp_to_bits(0, 0, e.ty);
+                    return;
+                }
                 if *op == "!" {
                     self.imm(1, 1);
                     self.emit(0xca010000);
@@ -382,6 +411,10 @@ impl<'a> Code<'a> {
                 self.push(0);
                 self.expr(b);
                 self.pop(1);
+                if a.ty.float() {
+                    self.float_binary(op, a.ty);
+                    return;
+                }
                 if a.ty == Type::String {
                     self.branch(
                         if *op == "+" {
@@ -505,6 +538,9 @@ impl<'a> Code<'a> {
                 Stmt::Return(e) => {
                     if let Some(e) = e {
                         self.expr(e);
+                        if e.ty.float() {
+                            self.bits_to_fp(0, 0, e.ty);
+                        }
                     } else {
                         self.imm(0, 0);
                     }
@@ -699,6 +735,7 @@ impl<'a> Code<'a> {
             (self.io_error, 74),
             (self.bounds, 103),
             (self.assertion, 104),
+            (self.float_conversion, 107),
         ] {
             self.mark(label);
             self.imm(0, status);
@@ -755,7 +792,9 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         return Err("entrypoint must be a function with no parameters".into());
     }
     let mut code = Code::new(program.functions.len(), &program.types);
-    // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
+    code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
+    code.emit(0xd51b441f); // msr fpcr,xzr: IEEE rounding and gradual underflow
+                           // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
     code.imm(19, 0); // lazily mapped string arena cursor
     code.imm(20, 0); // string arena end
     code.branch(code.functions[entry], Branch::Call);
@@ -765,13 +804,23 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
     for (i, f) in program.functions.iter().enumerate() {
         code.mark(code.functions[i]);
         code.prologue(f.slots * 8);
-        let (offsets, _) = stack_arguments(&f.params);
-        for (param, ty) in f.params.iter().enumerate() {
-            if param < 8 {
-                code.store(f.param_slots[param], param as u32);
-            } else {
-                code.load_stack_param(offsets[param - 8], *ty);
-                code.store(f.param_slots[param], 0);
+        let (locations, _) = arguments(&f.params);
+        for (param, location) in locations.iter().enumerate() {
+            if let Argument::General(reg) = location {
+                code.store(f.param_slots[param], *reg);
+            }
+        }
+        for (param, location) in locations.iter().enumerate() {
+            match location {
+                Argument::Float(reg) => {
+                    code.fp_to_bits(0, *reg, f.params[param]);
+                    code.store(f.param_slots[param], 0);
+                }
+                Argument::Stack(offset) => {
+                    code.load_stack_param(*offset, f.params[param]);
+                    code.store(f.param_slots[param], 0);
+                }
+                Argument::General(_) => {}
             }
         }
         for (param, storage) in f.param_storage.iter().enumerate() {
@@ -792,20 +841,37 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
 
 // Darwin packs stack arguments at their natural size and alignment, then
 // requires the caller's SP to remain 16-byte aligned. No FFI is exposed yet.
-fn stack_arguments(types: &[Type]) -> (Vec<usize>, usize) {
+enum Argument {
+    General(u32),
+    Float(u32),
+    Stack(usize),
+}
+fn arguments(types: &[Type]) -> (Vec<Argument>, usize) {
     let mut next = 0;
-    let mut offsets = Vec::new();
-    for ty in types.iter().skip(8) {
+    let mut locations = Vec::new();
+    let mut general = 0;
+    let mut fp = 0;
+    for ty in types {
+        if ty.float() && fp < 8 {
+            locations.push(Argument::Float(fp));
+            fp += 1;
+            continue;
+        }
+        if !ty.float() && general < 8 {
+            locations.push(Argument::General(general));
+            general += 1;
+            continue;
+        }
         let size = match ty {
             Type::Bool => 1,
-            Type::I32 | Type::Rune => 4,
+            Type::I32 | Type::Rune | Type::F32 => 4,
             _ => 8,
         };
         next = align(next, size);
-        offsets.push(next);
+        locations.push(Argument::Stack(next));
         next += size;
     }
-    (offsets, align(next, 16))
+    (locations, align(next, 16))
 }
 
 fn align(n: usize, to: usize) -> usize {

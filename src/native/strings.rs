@@ -136,6 +136,7 @@ impl Code<'_> {
             }
             StringOp::ToRune => self.branch(self.strings.to_rune, Branch::Call),
             StringOp::ToString => match args[0].ty {
+                Type::F32 | Type::F64 => self.float_to_string(args[0].ty),
                 Type::String => {}
                 Type::Rune => self.branch(self.strings.from_rune, Branch::Call),
                 Type::Bool => {

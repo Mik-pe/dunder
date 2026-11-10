@@ -64,8 +64,8 @@ fn source_positions_and_multiline_calls() {
     let source = "fn main() {\n    ålder := true\n    x: i32 = ålder\n}\n";
     let e = dunder::check(source).err().unwrap();
     assert!(e
-        .render("bad.dn", source)
-        .starts_with("bad.dn:3:14: error[E0201]"));
+        .render("bad.ddr", source)
+        .starts_with("bad.ddr:3:14: error[E0201]"));
     dunder::check(
         "fn plus(a:i32,b:i32)->i32{return a+b}\nfn main(){x:=plus(\n 1,\n 2,\n); print(x)}",
     )
@@ -78,7 +78,7 @@ fn native(source: &str) -> std::process::Output {
     let dir = Dir::new();
     let path = dir.0.join("program");
     let image =
-        dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.dn", source)));
+        dunder::compile(source).unwrap_or_else(|e| panic!("{}", e.render("test.ddr", source)));
     fs::write(&path, &image).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     let signed = Command::new("/usr/bin/codesign")
@@ -98,9 +98,9 @@ fn native(source: &str) -> std::process::Output {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn compiled_examples_and_runtime_control_flow() {
     for (source,expected,status) in [
-        (include_str!("../examples/hello.dn"),"42\ntrue\n",0),
-        (include_str!("../examples/fibonacci.dn"),"6765\ntrue\n",0),
-        (include_str!("../examples/functions.dn"),"42\n42\n-42\n",0),
+        (include_str!("../examples/hello.ddr"),"42\ntrue\n",0),
+        (include_str!("../examples/fibonacci.ddr"),"6765\ntrue\n",0),
+        (include_str!("../examples/functions.ddr"),"42\n42\n-42\n",0),
         ("fn fact(n:i32)->i32{if n<=1{return 1}else{return n*fact(n-1)}} fn main()->i32{print(fact(6));return 7}","720\n",7),
         ("fn main(){var x:=0; var total:=0; while x<10{x=x+1; if x==3{continue}; if x==8{break}; total=total+x}; print(total)}","25\n",0),
         ("fn side()->bool{print(9);return true} fn main(){print(false&&side());print(true||side());print(!true)}","false\ntrue\nfalse\n",0),
@@ -143,10 +143,10 @@ fn cli_manifest_and_failed_build_preserve_previous_binary() {
     let dir = Dir::new();
     fs::write(
         dir.0.join("dunder.toml"),
-        "name = \"demo\"\nroot = \"main.dn\"\n",
+        "name = \"demo\"\nroot = \"main.ddr\"\n",
     )
     .unwrap();
-    let src = dir.0.join("main.dn");
+    let src = dir.0.join("main.ddr");
     fs::write(&src, "fn main(){print(42)}").unwrap();
     let compiler = env!("CARGO_BIN_EXE_dunder");
     let first = Command::new(compiler)
@@ -173,7 +173,7 @@ fn cli_manifest_and_failed_build_preserve_previous_binary() {
     let valid = "fn main(){print(42)}";
     fs::write(&src, valid).unwrap();
     let overwrite = Command::new(compiler)
-        .args(["build", "main.dn", "-o", "main.dn"])
+        .args(["build", "main.ddr", "-o", "main.ddr"])
         .current_dir(&dir.0)
         .output()
         .unwrap();
@@ -313,11 +313,11 @@ fn main(){
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_uses_main_and_propagates_its_exit_status() {
     let dir = Dir::new();
-    let source = dir.0.join("program.dn");
+    let source = dir.0.join("program.ddr");
     fs::write(&source, "fn main()->i32{print(42);return 7}").unwrap();
     let compiler = env!("CARGO_BIN_EXE_dunder");
     let output = Command::new(compiler)
-        .args(["run", "program.dn", "-o", "program"])
+        .args(["run", "program.ddr", "-o", "program"])
         .current_dir(&dir.0)
         .env("PATH", "/no-external-tools")
         .output()
@@ -327,7 +327,7 @@ fn run_uses_main_and_propagates_its_exit_status() {
     let before = fs::read(dir.0.join("program")).unwrap();
     fs::write(&source, "fn main()->bool{return true}").unwrap();
     let bad = Command::new(compiler)
-        .args(["run", "program.dn", "-o", "program"])
+        .args(["run", "program.ddr", "-o", "program"])
         .current_dir(&dir.0)
         .output()
         .unwrap();
@@ -336,7 +336,7 @@ fn run_uses_main_and_propagates_its_exit_status() {
     assert_eq!(fs::read(dir.0.join("program")).unwrap(), before);
     fs::write(&source, "fn main(){print(true);return}").unwrap();
     let unit = Command::new(compiler)
-        .args(["run", "program.dn"])
+        .args(["run", "program.ddr"])
         .current_dir(&dir.0)
         .output()
         .unwrap();

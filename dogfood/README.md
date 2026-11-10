@@ -8,16 +8,16 @@ Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 18 passed, 0 failed
+# 25 passed, 0 failed
 ```
 
-Manifestets `test_root = "dogfood/tests.dn"` väljer testträdet. Enskilda
+Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
 program och deras tester går också att köra direkt:
 
 ```sh
-cargo run --release -- run dogfood/structs.dn
-cargo run --release -- test dogfood/geometry.dn
-cargo run --release -- test dogfood/parameter_cases.dn
+cargo run --release -- run dogfood/structs.ddr
+cargo run --release -- test dogfood/geometry.ddr
+cargo run --release -- test dogfood/parameter_cases.ddr
 ```
 
 Med kompilatorn kopierad till `build/dunder` används samma kommandon som
@@ -25,20 +25,21 @@ Med kompilatorn kopierad till `build/dunder` används samma kommandon som
 
 | Program | Vad det provar | Förväntade stdout-rader med `dunder run` |
 | --- | --- | --- |
-| [collections.dn](collections.dn) | Arrayändring, intervall, iteratorer och längd. | `-2`, `-1`, `0`, `1`, `13`, `3` |
-| [recursion.dn](recursion.dn) | Rekursiv Fibonacci och Euklides algoritm. | `6765`, `21` |
-| [sorting.dn](sorting.dn) | Insertion sort, index, kopierad arrayparameter, for/while och ordningskontroll. | `45`, `9` |
-| [iterators.dn](iterators.dn) | Fold med callback, återanvändbar iterator, continue och returnerat intervall. | `36`, `20`, `0` |
-| [arena/main.dn](arena/main.dn) | Bump-allokering, kapacitetsfel och rekursiv traversering över tre moduler. | `28` |
-| [structs.dn](structs.dn) | Exporterad struct, uttryck som input, värdekopia och fältändring. | `25`, `32`, `3` |
-| [utf8.dn](utf8.dn) | UTF-8, byte/kodpunkter, ordräkning, strängretur och text i structar. | `bytes=25`, `runes=20`, `words=5`, `🌍 Hej världen` |
-| [tokenizer.dn](tokenizer.dn) | UTF-8-ord, ASCII-skiljetecken och citerade strängar med escapes. | `fn\|hälsa\|(\|namn\|)\|{\|print\|(\|"Hej 🌍"\|)\|}` |
+| [collections.ddr](collections.ddr) | Arrayändring, intervall, iteratorer och längd. | `-2`, `-1`, `0`, `1`, `13`, `3` |
+| [recursion.ddr](recursion.ddr) | Rekursiv Fibonacci och Euklides algoritm. | `6765`, `21` |
+| [sorting.ddr](sorting.ddr) | Insertion sort, index, kopierad arrayparameter, for/while och ordningskontroll. | `45`, `9` |
+| [iterators.ddr](iterators.ddr) | Fold med callback, återanvändbar iterator, continue och returnerat intervall. | `36`, `20`, `0` |
+| [arena/main.ddr](arena/main.ddr) | Bump-allokering, kapacitetsfel och rekursiv traversering över tre moduler. | `28` |
+| [structs.ddr](structs.ddr) | Exporterad struct, uttryck som input, värdekopia och fältändring. | `25`, `32`, `3` |
+| [numeric/main.ddr](numeric/main.ddr) | f32-vektor, kompenserad f64-summering och rotberäkning med callback. | `5.0`, `2.0`, `true` |
+| [utf8.ddr](utf8.ddr) | UTF-8, byte/kodpunkter, ordräkning, strängretur och text i structar. | `bytes=25`, `runes=20`, `words=5`, `🌍 Hej världen` |
+| [tokenizer.ddr](tokenizer.ddr) | UTF-8-ord, ASCII-skiljetecken och citerade strängar med escapes. | `fn\|hälsa\|(\|namn\|)\|{\|print\|(\|"Hej 🌍"\|)\|}` |
 
-[parameter_cases.dn](parameter_cases.dn) testar `(20) -> 4`, uttryck på
+[parameter_cases.ddr](parameter_cases.ddr) testar `(20) -> 4`, uttryck på
 båda sidor, flera argument och genererade fall i en loop.
-[geometry.dn](geometry.dn) testar structargument direkt och genom en lokal
+[geometry.ddr](geometry.ddr) testar structargument direkt och genom en lokal
 bindning. De två filerna är bibliotek utan `main` och körs med `dunder test`.
-[tests.dn](tests.dn) samlar importträdet och lägger till två modulsamspelstest.
+[tests.ddr](tests.ddr) samlar importträdet och lägger till två modulsamspelstest.
 
 ```dunder
 @test {
@@ -60,10 +61,18 @@ Standardtidsgränsen är fem sekunder per grupp; `--timeout-ms` ändrar den.
 
 Arrayer, structar och arrayiteratorer har värdesemantik och kopieras vid
 bindning och anrop. Iteratorer tar en kopia av arrayen; de lånar den inte.
-Structfält och arrayelement är ännu begränsade till `i32`, `i64`, `bool`, `string` och `rune`.
+Structfält och arrayelement är ännu begränsade till `i32`, `i64`, `f32`, `f64`, `bool`, `string` och `rune`.
 Aggregatreturer och användardefinierade iteratorer återstår.
 
-[text/scan.dn](text/scan.dn) implementerar `find`, `replace`, ordräkning,
+[numeric/math.ddr](numeric/math.ddr) testar vektorlängd, omskalad hypotenusa,
+toleranser och kompenserad summering. [numeric/ode.ddr](numeric/ode.ddr)
+integrerar en differentialekvation med Runge–Kutta och en typad callback.
+Tillsammans med rotberäkning och precisionsprov i main finns sju numeriska
+testgrupper. Kör `dunder test dogfood/numeric/main.ddr`.
+Även [flyttalsutskriften](../runtime/float.ddr) är skriven i Dunder och
+kompileras in i program som skriver flyttal. Se [reglerna](../docs/floating.md).
+
+[text/scan.ddr](text/scan.ddr) implementerar `find`, `replace`, ordräkning,
 UTF-8-gränser och avkodning i Dunder. Både textprogrammet och tokenizern
 importerar samma modul; dess fyra testgrupper körs en gång i hela trädet.
 Blanktecken är en uttryckligt listad delmängd. Tokenizern bevarar stavning

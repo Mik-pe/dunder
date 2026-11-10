@@ -5,7 +5,7 @@ program. Håll stavning och struktur regelbundna så att både människor och
 kodagenter kan använda vanliga mönster för funktioner, uttryck och block.
 Detta är ett prövbart designval, inte ett påstående om mätt agentpreferens.
 
-Källfiler använder **`.dn`**, till exempel `main.dn` och `functions.dn`.
+Källfiler använder **`.ddr`**, till exempel `main.ddr` och `functions.ddr`.
 
 ## Deklarationer och muterbarhet
 
@@ -34,6 +34,8 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | --- | --- |
 | `i32` | Signerat 32-bitars heltal; standard för okontextualiserade heltalsliteraler. |
 | `i64` | Signerat 64-bitars heltal. |
+| `f32` | IEEE 754 binary32. |
+| `f64` | IEEE 754 binary64; standard för okontextualiserade flyttalsliteraler. |
 | `bool` | `true` eller `false`; ingen implicit konvertering till/från heltal. |
 | `string` | Oföränderlig, giltig UTF-8. |
 | `rune` | En Unicode-kodpunkt; skild från heltal och sträng. |
@@ -47,6 +49,8 @@ Literaler får typ från en annotering, funktionens parameter/returtyp eller
 den andra heltalsoperanden. Befintliga värden konverteras aldrig implicit
 mellan `i32` och `i64`. `i64(value)` breddar explicit; `i32(value)` smalnar
 med en körningskontroll. En literal utanför sitt typintervall är ett typfel.
+Flyttalsliteraler, konverteringar, NaN, avrundning och numeriska metoder
+beskrivs i [flyttalsreglerna](floating.md).
 
 ```dunder
 small := 42
@@ -167,7 +171,7 @@ typkontroll. En vanlig funktion utan `->` returnerar `()`; den får använda
 `return` utan värde eller nå slutet av kroppen. En funktion med returtyp
 måste returnera ett värde av rätt typ på alla vägar enligt kontrollen ovan.
 
-`dunder run [fil.dn]` bygger och kör den nya binären. Byggmeddelanden går
+`dunder run [fil.ddr]` bygger och kör den nya binären. Byggmeddelanden går
 till stderr och programmets stdout bevaras. Ett kompileringsfel startar
 aldrig en tidigare binär från samma utdataplats.
 
@@ -193,8 +197,8 @@ import math
 import "geometry/vector" as vector
 ```
 
-Den första importen läser `math.dn` bredvid den importerande filen. Den andra
-läser `geometry/vector.dn` relativt samma fil. Sökningen beror inte på
+Den första importen läser `math.ddr` bredvid den importerande filen. Den andra
+läser `geometry/vector.ddr` relativt samma fil. Sökningen beror inte på
 processens arbetskatalog. Citerade relativa sökvägar kan innehålla `../`.
 Absoluta sökvägar och suffix i importer avvisas. Utan `as` kommer aliaset
 från det sista sökvägssegmentet; `import "geometry/vector"` får alias `vector`.
@@ -202,7 +206,7 @@ Ett alias måste vara ett giltigt, icke reserverat namn. Till exempel kräver
 `import "foo-bar" as foo` ett explicit alias eftersom bindestreck inte ingår i namn.
 
 ```dunder
-// math.dn
+// math.ddr
 pub fn double(value: i32) -> i32 {
     return scale(value, 2)
 }
@@ -213,7 +217,7 @@ fn scale(value: i32, factor: i32) -> i32 {
 ```
 
 ```dunder
-// main.dn
+// main.ddr
 import math
 
 fn main() {
@@ -280,7 +284,7 @@ Structar är nominella: olika deklarationer ger olika typer även med samma
 fält. Importerade typer behåller sin identitet över moduler och i callbacks.
 Alla fält måste anges exakt en gång; deras ordning i uttrycket är valfri.
 Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får vara
-`i32`, `i64`, `bool`, `string` eller `rune`; nästlade structar och arrayfält återstår.
+`i32`, `i64`, `f32`, `f64`, `bool`, `string` eller `rune`; nästlade structar och arrayfält återstår.
 
 En struct kopieras vid bindning, tilldelning och parameteröverföring.
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
@@ -313,7 +317,7 @@ fn main() {
 
 `[a, b, c]` bygger en array. `[value; N]` utvärderar `value` en gång och
 upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
-`i32`, `i64`, `bool`, `string` eller `rune`; den härleds eller hämtas från förväntad arraytyp.
+`i32`, `i64`, `f32`, `f64`, `bool`, `string` eller `rune`; den härleds eller hämtas från förväntad arraytyp.
 En array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
 Nästlade arrayer, structelement och slices är ännu inte implementerade.
 
@@ -380,7 +384,7 @@ testfunktion ska sakna parametrar och returnera `()`. Den ingår bara i
 testbyggen; den vanliga funktionen efter ett kopplat testblock ingår i
 både testbyggen och vanliga byggen.
 
-`dunder test [file.dn]` samlar tester ur hela det explicit importerade trädet,
+`dunder test [file.ddr]` samlar tester ur hela det explicit importerade trädet,
 en gång per kanonisk fil. Saknad `main` är tillåten och en befintlig `main`
 körs inte. Varje testfunktion eller kopplat block blir en egen nativeprocess.
 Första felaktiga assertionen avbryter det blocket; nästa test körs ändå.
@@ -444,7 +448,7 @@ NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering a
 | `a + b` | Bygger en ny sträng av två strängar. |
 | `a == b`, `a != b` | Jämför innehåll, inklusive eventuella NUL. |
 | `<`, `<=`, `>`, `>=` | Lexikografisk ordning efter UTF-8-byte, utan språklig sortering. |
-| `value.str()` | Sträng av i32/i64 i decimalform, bool eller rune. På string ges samma värde. |
+| `value.str()` | Sträng av heltal, flyttal, bool eller rune. På string ges samma värde. |
 
 `.bytes()` och `.runes()` är återanvändbara vyer över ett oföränderligt
 strängvärde. De allokerar ingen array. Deras typer härleds med `:=` och har
