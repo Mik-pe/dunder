@@ -31,11 +31,9 @@ impl Code<'_> {
             self.local_addr(storage);
             self.imm(11, *offset as u64);
             self.add(9, 9, 11);
-            if let Some(bytes) = self.types.storage_bytes(value.ty) {
-                self.mov(10, 0);
-                self.mov(11, 9);
-                self.imm(12, bytes as u64);
-                self.copy_bytes(11, 10, 12, 13);
+            if self.types.storage_bytes(value.ty).is_some() {
+                self.mov(1, 9);
+                self.clone_into(value.ty);
             } else {
                 self.typed_store(value.ty, 9);
             }

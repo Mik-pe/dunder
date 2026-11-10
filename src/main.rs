@@ -102,7 +102,7 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
 fn run() -> Result<i32, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.ddr] [-o output] [--timings]\n  dunder run [file.ddr] [-o output] [--timings]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--timeout-ms 5000]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        println!("Dunder — typed source to native ARM64\n\n  dunder build [file.ddr] [-o output] [--timings]\n  dunder run [file.ddr] [-o output] [--timings] [-- program-args...]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--timeout-ms 5000]\n\nWithout a file, finds the nearest dunder.toml. Target: arm64-macos.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
         return Ok(0);
     }
     let command = &args[0];
@@ -115,8 +115,13 @@ fn run() -> Result<i32, String> {
     let mut output = None;
     let mut timings = false;
     let mut timeout = 5000;
+    let mut program_args = Vec::new();
     let mut i = 1;
     while i < args.len() {
+        if args[i] == "--" && command == "run" {
+            program_args = args[i + 1..].to_vec();
+            break;
+        }
         match args[i].as_str() {
             "-o" => {
                 i += 1;
@@ -204,6 +209,7 @@ fn run() -> Result<i32, String> {
     if command == "run" {
         let executable = fs::canonicalize(&output).map_err(|e| e.to_string())?;
         let status = process::Command::new(executable)
+            .args(&program_args)
             .status()
             .map_err(|e| format!("could not run {}: {e}", output.display()))?;
         return Ok(status

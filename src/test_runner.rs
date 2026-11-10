@@ -101,6 +101,7 @@ pub fn run(project: &Checked, output: &Path, timeout: Duration) -> Result<i32, S
                     Some(106) => "invalid Unicode boundary or scalar".into(),
                     Some(107) => "floating conversion out of range".into(),
                     Some(108) => "invalid enum value".into(),
+                    Some(109) => "dynamic storage exhausted".into(),
                     Some(n) => format!("exit {n}"),
                     None => "terminated by signal".into(),
                 }

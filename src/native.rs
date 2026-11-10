@@ -4,8 +4,10 @@ use crate::{
     check::{Expr, ExprKind, Program, Stmt},
     syntax::{Type, Types},
 };
+mod collections;
 mod enums;
 mod floats;
+mod reachable;
 mod strings;
 mod sys;
 
@@ -40,6 +42,7 @@ struct Code<'a> {
     sys: sys::Runtime,
     sys_types: Option<crate::check::SysTypes>,
     invalid_enum: Label,
+    collections: collections::Runtime,
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -65,6 +68,7 @@ impl<'a> Code<'a> {
             sys: sys::Runtime::default(),
             sys_types: None,
             invalid_enum: 0,
+            collections: collections::Runtime::default(),
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -79,6 +83,7 @@ impl<'a> Code<'a> {
         c.float_conversion = c.label();
         c.sys = sys::Runtime::new(&mut c);
         c.invalid_enum = c.label();
+        c.collections = collections::Runtime::new(&mut c);
         c
     }
     fn label(&mut self) -> Label {
@@ -93,8 +98,15 @@ impl<'a> Code<'a> {
         self.words.push(word);
     }
     fn branch(&mut self, label: Label, kind: Branch) {
+        let wide = matches!(
+            kind,
+            Branch::Cond(_) | Branch::Zero(_) | Branch::Nonzero(_) | Branch::Address(_)
+        );
         self.fixups.push((self.words.len(), label, kind));
         self.emit(0);
+        if wide {
+            self.emit(0xd503201f);
+        }
     }
     fn mov(&mut self, dst: u32, src: u32) {
         self.emit(0xaa0003e0 | src << 16 | dst);
@@ -118,14 +130,27 @@ impl<'a> Code<'a> {
         self.emit(0xa8c17fe0 | reg);
     }
     fn local_addr(&mut self, slot: usize) {
+        let offset = (slot + 1) * 8;
+        if offset <= 4095 {
+            self.emit(0xd10003a9 | (offset as u32) << 10);
+            return;
+        }
         self.imm(9, (slot as u64 + 1) * 8);
         self.emit(0xcb0903a9);
     } // sub x9,x29,x9
     fn store(&mut self, slot: usize, reg: u32) {
+        if slot < 32 {
+            self.emit(0xf80003a0 | ((-(slot as i32 + 1) * 8) as u32 & 511) << 12 | reg);
+            return;
+        }
         self.local_addr(slot);
         self.emit(0xf9000120 | reg);
     }
     fn load(&mut self, slot: usize) {
+        if slot < 32 {
+            self.emit(0xf84003a0 | ((-(slot as i32 + 1) * 8) as u32 & 511) << 12);
+            return;
+        }
         self.local_addr(slot);
         self.emit(0xf9400120);
     }
@@ -192,38 +217,64 @@ impl<'a> Code<'a> {
         );
     }
     fn copy_value(&mut self, storage: usize, ty: Type) {
-        let bytes = self.types.storage_bytes(ty).unwrap();
-        self.mov(10, 0);
+        self.push(0);
         self.local_addr(storage);
-        if bytes > 0 {
-            self.imm(11, bytes as u64);
-            let again = self.label();
-            self.mark(again);
-            self.emit(0x3940014c);
-            self.emit(0x3900012c);
-            self.emit(0x9100054a);
-            self.emit(0x91000529);
-            self.emit(0xf100056b);
-            self.branch(again, Branch::Cond(1));
-        }
-        self.local_addr(storage);
-        self.mov(0, 9);
+        self.mov(1, 9);
+        self.pop(0);
+        self.clone_into(ty);
     }
     fn index_addr(&mut self, base: &Expr, index: &Expr) {
-        let a = self.types.array(base.ty).unwrap();
+        let a = self.types.array(base.ty);
+        let dynamic = self.types.dynamic_elem(base.ty);
         self.expr(base);
         self.push(0);
         self.expr(index);
         self.pop(1);
-        self.imm(2, a.len as u64);
+        if dynamic.is_some() {
+            self.add_imm(2, 1, 8);
+            self.ldr(2, 2);
+        } else {
+            self.imm(2, a.unwrap().len as u64);
+        }
         self.cmp(0, 2);
         self.branch(self.bounds, Branch::Cond(2));
-        self.imm(2, a.elem_size() as u64);
+        if let Some(elem) = dynamic {
+            self.ldr(1, 1);
+            self.imm(2, self.types.scalar_size(elem) as u64);
+        } else {
+            self.imm(2, a.unwrap().elem_size() as u64);
+        }
         self.emit(0x9b027c00);
         self.emit(0x8b000020);
     }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::IntOp(op, base, arg) => self.integer_expr(*op, base, arg.as_deref()),
+            ExprKind::ReferenceAddress(slot) => self.load(*slot),
+            ExprKind::LocalAddress(slot) => {
+                self.local_addr(*slot);
+                self.mov(0, 9);
+            }
+            ExprKind::Deref(pointer) => {
+                self.expr(pointer);
+                if self.types.storage_bytes(e.ty).is_none() {
+                    self.typed_load(e.ty);
+                }
+            }
+            ExprKind::Offset(base, offset) => {
+                self.expr(base);
+                self.imm(1, *offset as u64);
+                self.add(0, 0, 1);
+            }
+            ExprKind::ElementAddress(base, index) => self.index_addr(base, index),
+            ExprKind::Clone(value, storage) => {
+                self.expr(value);
+                self.copy_value(*storage, e.ty);
+            }
+            ExprKind::Dynamic(values, storage) => self.dynamic_value(e.ty, values, *storage),
+            ExprKind::DynamicOp(op, base, arg) => {
+                self.dynamic_expr(*op, base, arg.as_deref(), e.ty)
+            }
             ExprKind::Enum {
                 tag,
                 fields,
@@ -263,7 +314,12 @@ impl<'a> Code<'a> {
                     self.local_addr(*storage);
                     self.imm(11, *offset as u64);
                     self.emit(0x8b0b0129);
-                    self.typed_store(value.ty, 9);
+                    if self.types.storage_bytes(value.ty).is_some() {
+                        self.mov(1, 9);
+                        self.clone_into(value.ty);
+                    } else {
+                        self.typed_store(value.ty, 9);
+                    }
                 }
                 self.local_addr(*storage);
                 self.mov(0, 9);
@@ -272,7 +328,9 @@ impl<'a> Code<'a> {
                 self.expr(base);
                 self.imm(2, *offset as u64);
                 self.emit(0x8b020000);
-                self.typed_load(e.ty);
+                if self.types.storage_bytes(e.ty).is_none() {
+                    self.typed_load(e.ty);
+                }
             }
             ExprKind::Assert(condition) => {
                 self.expr(condition);
@@ -327,7 +385,12 @@ impl<'a> Code<'a> {
             }
             ExprKind::Number(n) => self.imm(0, *n as u64),
             ExprKind::Bool(b) => self.imm(0, u64::from(*b)),
-            ExprKind::Local(s) => self.load(*s),
+            ExprKind::Local(s) => {
+                self.load(*s);
+                if e.ty == Type::I32 || e.ty == Type::Rune || self.types.scalar_enum(e.ty) {
+                    self.emit(0x93407c00);
+                }
+            }
             ExprKind::Function(f) => self.branch(self.functions[*f], Branch::Address(0)),
             ExprKind::Call(target, args, storage) => {
                 let direct = if let ExprKind::Function(f) = &target.kind {
@@ -555,6 +618,17 @@ impl<'a> Code<'a> {
     fn stmts(&mut self, body: &[Stmt]) {
         for stmt in body {
             match stmt {
+                Stmt::StorePlace(address, value) => {
+                    self.expr(address);
+                    self.push(0);
+                    self.expr(value);
+                    self.pop(1);
+                    if self.types.storage_bytes(value.ty).is_some() {
+                        self.clone_into(value.ty);
+                    } else {
+                        self.typed_store(value.ty, 1);
+                    }
+                }
                 Stmt::Match {
                     source,
                     slot,
@@ -570,35 +644,18 @@ impl<'a> Code<'a> {
                     self.copy_value(*storage, e.ty);
                     self.store(*slot, 0);
                 }
-                Stmt::StoreIndex(base, index, value) => {
-                    self.index_addr(base, index);
-                    self.push(0);
-                    self.expr(value);
-                    self.pop(1);
-                    self.typed_store(value.ty, 1);
-                }
-                Stmt::StoreField(base, offset, value) => {
-                    self.expr(base);
-                    self.imm(2, *offset as u64);
-                    self.emit(0x8b020000);
-                    self.push(0);
-                    self.expr(value);
-                    self.pop(1);
-                    self.typed_store(value.ty, 1);
-                }
                 Stmt::Return(e) => {
                     if let Some(e) = e {
                         self.expr(e);
                         if e.ty.float() {
                             self.bits_to_fp(0, 0, e.ty);
                         }
-                        if let Some(bytes) = self.types.storage_bytes(e.ty) {
-                            self.mov(10, 0);
+                        if self.types.storage_bytes(e.ty).is_some() {
+                            self.push(0);
                             self.load(self.return_slot.expect("aggregate return destination"));
-                            self.mov(11, 0);
-                            self.imm(12, bytes as u64);
-                            self.copy_bytes(11, 10, 12, 13);
-                            self.load(self.return_slot.unwrap());
+                            self.mov(1, 0);
+                            self.pop(0);
+                            self.clone_into(e.ty);
                         }
                     } else {
                         self.imm(0, 0);
@@ -656,6 +713,10 @@ impl<'a> Code<'a> {
                         if matches!(source.ty, Type::Bytes | Type::Runes) {
                             self.load(*source_slot);
                             self.emit(0xf9400000);
+                        } else if self.types.dynamic_elem(source.ty).is_some() {
+                            self.load(*source_slot);
+                            self.add_imm(0, 0, 8);
+                            self.ldr(0, 0);
                         } else {
                             self.imm(0, self.types.array(source.ty).unwrap().len as u64);
                         }
@@ -702,6 +763,16 @@ impl<'a> Code<'a> {
                         self.emit(0x9b027c00);
                         self.emit(0x8b000020);
                         self.typed_load(a.elem);
+                    } else if let Some(elem) = self.types.dynamic_elem(source.ty) {
+                        self.load(*source_slot);
+                        self.ldr(0, 0);
+                        self.push(0);
+                        self.load(*cursor);
+                        self.pop(1);
+                        self.imm(2, self.types.scalar_size(elem) as u64);
+                        self.emit(0x9b027c00);
+                        self.add(0, 1, 0);
+                        self.typed_load(elem);
                     } else {
                         self.load(*cursor);
                     }
@@ -810,14 +881,16 @@ impl<'a> Code<'a> {
             let to = self.labels[label].ok_or("unresolved function or branch")?;
             let delta = to as i64 - at as i64;
             if let Branch::Address(reg) = kind {
-                let bytes = delta * 4;
-                if !(-(1 << 20)..(1 << 20)).contains(&bytes) {
-                    return Err(
-                        "function or literal address exceeds the first backend's ADR range".into(),
-                    );
+                // __text starts at byte 432 in the page-aligned __TEXT mapping.
+                let from = 432 + at * 4;
+                let target = 432 + to * 4;
+                let pages = (target / 4096) as i64 - (from / 4096) as i64;
+                if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+                    return Err("address exceeds ADRP range".into());
                 }
-                let bits = bytes as u32 & 0x1fffff;
-                self.words[at] = 0x10000000 | (bits & 3) << 29 | (bits >> 2) << 5 | reg;
+                let bits = pages as u32 & 0x1fffff;
+                self.words[at] = 0x90000000 | (bits & 3) << 29 | (bits >> 2) << 5 | reg;
+                self.words[at + 1] = 0x91000000 | ((target as u32 & 4095) << 10) | reg << 5 | reg;
                 continue;
             }
             let (base, bits) = match kind {
@@ -829,7 +902,18 @@ impl<'a> Code<'a> {
                 Branch::Address(_) => unreachable!(),
             };
             if delta < -(1i64 << (bits - 1)) || delta >= 1i64 << (bits - 1) {
-                return Err("program exceeds the first backend's branch range".into());
+                if bits == 26 || !(-(1 << 25)..(1 << 25)).contains(&(delta - 1)) {
+                    return Err("program exceeds branch range".into());
+                }
+                self.words[at] = (base
+                    ^ if matches!(kind, Branch::Cond(_)) {
+                        1
+                    } else {
+                        0x01000000
+                    })
+                    | (2 << 5);
+                self.words[at + 1] = 0x14000000 | ((delta - 1) as u32 & 0x3ffffff);
+                continue;
             }
             let imm = (delta as u32) & ((1 << bits) - 1);
             self.words[at] = base | if bits == 26 { imm } else { imm << 5 };
@@ -853,17 +937,25 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         return Err("entrypoint must be a function with no parameters".into());
     }
     let mut code = Code::new(program.functions.len(), &program.types);
+    let reachable = reachable::functions(program, entry);
     code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
     code.sys_types = program.sys_types;
+    code.mov(23, 0); // LC_MAIN argc and argv, retained across Dunder calls
+    code.mov(24, 1);
     code.emit(0xd51b441f); // msr fpcr,xzr: IEEE rounding and gradual underflow
                            // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
     code.imm(19, 0); // lazily mapped string arena cursor
     code.imm(20, 0); // string arena end
+    code.imm(21, 0); // lazily mapped dynamic storage arena
+    code.imm(22, 0);
     code.branch(code.functions[entry], Branch::Call);
     code.imm(16, 0x2000001);
     code.emit(0xd4001001);
     code.emit(0xd4200000);
     for (i, f) in program.functions.iter().enumerate() {
+        if !reachable[i] {
+            continue;
+        }
         code.return_slot = f.return_slot;
         code.mark(code.functions[i]);
         code.prologue(f.slots * 8);
@@ -901,6 +993,7 @@ pub fn compile_entry(program: &Program, entry: usize) -> Result<Vec<u8>, String>
         code.epilogue();
     }
     code.runtime();
+    code.collections_runtime();
     code.string_literals();
     Ok(macho(&code.finish()?))
 }
@@ -1024,7 +1117,7 @@ fn macho(text: &[u8]) -> Vec<u8> {
         "__LINKEDIT",
         [
             VM + sig_off as u64,
-            PAGE as u64,
+            align(sig_size, PAGE) as u64,
             sig_off as u64,
             sig_size as u64,
         ],
@@ -1162,6 +1255,42 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn large_images_map_and_verify_a_signature_spanning_multiple_pages() {
+        use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+        struct Binary(std::path::PathBuf);
+        impl Drop for Binary {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let binary =
+            Binary(std::env::temp_dir().join(format!("dunder-large-image-{}", std::process::id())));
+        let types = Types::default();
+        let mut code = Code::new(0, &types);
+        code.imm(0, 42);
+        code.imm(16, 0x2000001);
+        code.emit(0xd4001001);
+        let mut text = code.finish().unwrap();
+        text.resize(9 * 1024 * 1024, 0);
+        fs::write(&binary.0, macho(&text)).unwrap();
+        fs::set_permissions(&binary.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let verified = Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict"])
+            .arg(&binary.0)
+            .output()
+            .unwrap();
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert_eq!(
+            Command::new(&binary.0).env_clear().status().unwrap().code(),
+            Some(42)
+        );
+    }
     #[test]
     fn signing_hash_matches_published_vectors() {
         let hex = |s: &[u8]| {

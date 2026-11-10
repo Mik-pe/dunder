@@ -71,7 +71,7 @@ Varianter utan data kan skrivas med eller utan tomma parenteser.
 Importerade konstruktorer skrivs exempelvis `sys.ReadResult.Ok("hej")`.
 
 Payloads kan innehålla skalära typer, funktionsvärden, structar, fasta
-arrayer och andra enums. Direkt rekursiva värden som `enum Node { Next(Node) }`
+arrayer, dynamiska arrayer och andra enums. Direkt rekursiva värden som `enum Node { Next(Node) }`
 har ingen ändlig storlek och avvisas. Ett träd kan i dagens arena-dogfood
 i stället använda typade värden med indexhandtag till en separat buffert.
 Enums ger ingen ny allokerare eller ägar-/lånemodell.
@@ -114,8 +114,9 @@ Nästlade fall skrivs med en inre `match`, inte ett nästlat mönster.
 ## Lagring och dispatch
 
 En enum med data innehåller en tagg och plats för den största variantens
-payload direkt i värdet. Konstruktion behöver ingen heapallokering eller
-vtables. Oföränderliga strängar använder fortfarande den befintliga
+payload direkt i värdet. Själva taggningen behöver inget extra heapobjekt
+eller vtables. Payloads följer sina typers kopieringsregler; en dynamisk
+array kopieras till en egen buffert. Oföränderliga strängar använder den befintliga
 stränglagringen; en sträng i en variant kopierar stränghandtaget.
 Funktionsvärden i payloads använder vanliga typade funktionspekare.
 
@@ -147,8 +148,9 @@ cargo test --test enums
 privata typer, egna taggvärden, arrayer/structfält, blandade payloads,
 funktionsvärden, callbacks, rekursiva returer, stackargument och verklig fil-I/O.
 
-Data-enums kan ännu inte vara structfält eller arrayelement. De kan däremot
-innehålla sådana aggregat och andra data-enums. Ett enumvärde får vara högst
+Data-enums kan vara structfält och innehålla andra aggregat, inklusive
+dynamiska arrayer och andra data-enums. Arrayelement är fortfarande begränsade
+till skalärer och enums utan payload. Ett enumvärde får vara högst
 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
 generiska `Result<T>`/`Option<T>`, `?`, mönsterguards, alternativa/nästlade
 mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja

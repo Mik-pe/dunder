@@ -1,6 +1,6 @@
 # Så mäter vi Dunder
 
-Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Alla siffror nedan är föreslagna acceptansgränser. Vi har ännu inga mätresultat.
+Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Alla siffror nedan är föreslagna acceptansgränser. Vi har nu [byggmätningar och råvärden](../benchmarks/README.md) för ett genererat stresskorpus. Det är första mätunderlaget; hela kontraktet nedan är ännu inte uppfyllt.
 
 ## Från kommando till färdig ARM64-binär
 

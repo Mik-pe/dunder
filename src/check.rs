@@ -3,6 +3,7 @@ use crate::{
     Error, Span,
 };
 use std::collections::HashMap;
+mod collections;
 mod enums;
 
 pub struct Program {
@@ -55,8 +56,10 @@ pub struct Function {
     pub param_slots: Vec<usize>,
     pub param_storage: Vec<Option<usize>>,
     pub return_slot: Option<usize>,
+    pub uses_float_format: bool,
 }
 pub enum Stmt {
+    StorePlace(Expr, Expr),
     Match {
         source: Expr,
         slot: usize,
@@ -65,8 +68,6 @@ pub enum Stmt {
     },
     Store(usize, Expr),
     StoreAggregate(usize, usize, Expr),
-    StoreIndex(Expr, Expr, Expr),
-    StoreField(Expr, usize, Expr),
     Return(Option<Expr>),
     Expr(Expr),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
@@ -100,6 +101,15 @@ pub struct Expr {
     pub kind: ExprKind,
 }
 pub enum ExprKind {
+    ReferenceAddress(usize),
+    LocalAddress(usize),
+    Deref(Box<Expr>),
+    Offset(Box<Expr>, usize),
+    ElementAddress(Box<Expr>, Box<Expr>),
+    Clone(Box<Expr>, usize),
+    Dynamic(Vec<Expr>, usize),
+    DynamicOp(DynamicOp, Box<Expr>, Option<Box<Expr>>),
+    IntOp(IntOp, Box<Expr>, Option<Box<Expr>>),
     Enum {
         tag: i32,
         fields: Vec<(usize, Expr)>,
@@ -142,6 +152,33 @@ pub enum SysOp {
     RemoveDir,
     Metadata,
     Pid,
+    ArgCount,
+    Arg,
+    WriteBytes,
+    MakeExecutable,
+    DecodeUtf8,
+    SameFile,
+}
+#[derive(Clone, Copy)]
+pub enum DynamicOp {
+    Len,
+    Capacity,
+    Push,
+    Pop,
+    Reserve,
+    Clear,
+}
+#[derive(Clone, Copy)]
+pub enum IntOp {
+    And,
+    Or,
+    Xor,
+    Not,
+    Shl,
+    Shr,
+    WrappingAdd,
+    WrappingSub,
+    WrappingMul,
 }
 #[derive(Clone, Copy)]
 pub struct SysTypes {
@@ -225,6 +262,7 @@ fn reserved(name: &str) -> bool {
             | "f64"
             | "enum"
             | "match"
+            | "mut"
     )
 }
 fn mismatch(types: &Types, span: Span, expected: Type, actual: Type) -> Error {
@@ -382,13 +420,14 @@ impl Checker<'_> {
             ast::ExprKind::TestTarget(n) => self.global(n).map(|(_, ty)| ty),
             ast::ExprKind::Name(n) => self
                 .lookup(n)
-                .map(|b| b.ty)
+                .map(|b| self.types.value_type(b.ty))
                 .or_else(|| self.global(n).map(|(_, ty)| ty)),
             ast::ExprKind::Member(base, name)
                 if name == "len"
                     && self.hint(base).is_some_and(|ty| {
                         matches!(ty, Type::String | Type::Bytes | Type::Runes)
                             || self.types.array(ty).is_some()
+                            || self.types.dynamic_elem(ty).is_some()
                     }) =>
             {
                 Some(Type::I32)
@@ -401,6 +440,22 @@ impl Checker<'_> {
                 .or_else(|| self.member(base, name, expr.span).ok().map(|(_, ty)| ty)),
             ast::ExprKind::Record(name, _) => self.constructor_type(name).ok(),
             ast::ExprKind::Call(callee, _) => {
+                if self.integer_method(callee).is_some() {
+                    if let ast::ExprKind::Member(base, _) = &callee.kind {
+                        return self.hint(base).or_else(|| {
+                            matches!(base.kind, ast::ExprKind::Number(_)).then_some(Type::I32)
+                        });
+                    }
+                }
+                if let Some(op) = self.dynamic_method(callee) {
+                    if let ast::ExprKind::Member(base, _) = &callee.kind {
+                        return Some(match op {
+                            DynamicOp::Len | DynamicOp::Capacity => Type::I32,
+                            DynamicOp::Pop => self.types.dynamic_elem(self.hint(base)?)?,
+                            _ => Type::Unit,
+                        });
+                    }
+                }
                 if let Some((ty, _)) = self.enum_variant(callee, None).ok().flatten() {
                     return Some(ty);
                 }
@@ -489,7 +544,10 @@ impl Checker<'_> {
                     match t {
                         Type::String | Type::Bytes => Some(Type::I32),
                         Type::Runes => Some(Type::Rune),
-                        _ => self.types.array(t).map(|a| a.elem),
+                        _ => self
+                            .types
+                            .dynamic_elem(t)
+                            .or_else(|| self.types.array(t).map(|a| a.elem)),
                     }
                 }
             }),
@@ -579,6 +637,12 @@ impl Checker<'_> {
             "__sys_remove_dir" => (SysOp::RemoveDir, 1, "Status"),
             "__sys_metadata" => (SysOp::Metadata, 1, "Metadata"),
             "__sys_pid" => return Some((SysOp::Pid, 0, Type::I32)),
+            "__sys_arg_count" => return Some((SysOp::ArgCount, 0, Type::I32)),
+            "__sys_arg" => return Some((SysOp::Arg, 1, Type::String)),
+            "__sys_write_bytes" => (SysOp::WriteBytes, 2, "Status"),
+            "__sys_make_executable" => (SysOp::MakeExecutable, 1, "Status"),
+            "__sys_decode_utf8" => (SysOp::DecodeUtf8, 1, "TextResult"),
+            "__sys_same_file" => return Some((SysOp::SameFile, 2, Type::Bool)),
             _ => return None,
         };
         Some((op, count, symbols.records[result].0))
@@ -586,6 +650,35 @@ impl Checker<'_> {
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
+            A::Borrow(base, mutable) => {
+                let Some((inner, allowed_mut)) = expected.and_then(|t| self.types.referenced(t))
+                else {
+                    return Err(Error::new(
+                        "E0281",
+                        e.span,
+                        "borrows are currently allowed only as function arguments",
+                    ));
+                };
+                if *mutable != allowed_mut {
+                    return Err(Error::new(
+                        "E0281",
+                        e.span,
+                        "use & for a shared argument or &mut for a mutable argument",
+                    ));
+                }
+                let (ty, mut address) = self.place(base, *mutable)?;
+                if ty != inner {
+                    return Err(mismatch(self.types, e.span, inner, ty));
+                }
+                address.ty = expected.unwrap();
+                address
+            }
+            A::Call(callee, args) if self.dynamic_method(callee).is_some() => {
+                self.check_dynamic_method(callee, args, e.span)?
+            }
+            A::Call(callee, args) if self.integer_method(callee).is_some() => {
+                self.check_integer_method(callee, args, e.span)?
+            }
             A::Call(callee, args) if self.enum_variant(callee, expected)?.is_some() => {
                 self.enum_construct(callee, args, expected)?
             }
@@ -634,10 +727,18 @@ impl Checker<'_> {
                         "invalid sys intrinsic argument count",
                     ));
                 }
-                let values = args
-                    .iter()
-                    .map(|a| self.expr(a, Some(Type::String)))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut values = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let expected = if op == SysOp::Arg {
+                        Type::I32
+                    } else if (op == SysOp::WriteBytes && i == 1) || op == SysOp::DecodeUtf8 {
+                        let array = self.types.dynamic(Type::I32, arg.span)?;
+                        self.types.reference(array, false)
+                    } else {
+                        Type::String
+                    };
+                    values.push(self.expr(arg, Some(expected))?);
+                }
                 Expr {
                     ty,
                     kind: ExprKind::SysCall(op, values, self.storage(ty)),
@@ -708,7 +809,9 @@ impl Checker<'_> {
             }
             A::Array(values) => {
                 let context = expected.and_then(|t| self.types.array(t));
-                let hint = context.map(|a| a.elem);
+                let hint = expected
+                    .and_then(|t| self.types.dynamic_elem(t))
+                    .or_else(|| context.map(|a| a.elem));
                 let mut checked = Vec::new();
                 let mut elem = hint;
                 for value in values {
@@ -723,6 +826,13 @@ impl Checker<'_> {
                         "an empty array needs an explicit type, for example [i32; 0]",
                     )
                 })?;
+                if let Some(ty) = expected.filter(|t| self.types.dynamic_elem(*t).is_some()) {
+                    let storage = self.storage(ty).unwrap();
+                    return Ok(Expr {
+                        ty,
+                        kind: ExprKind::Dynamic(checked, storage),
+                    });
+                }
                 let ty = self.types.array_type(elem, values.len(), e.span)?;
                 let storage = self.storage(ty).unwrap();
                 Expr {
@@ -773,14 +883,18 @@ impl Checker<'_> {
                     }
                     return Ok(typed);
                 }
-                if !matches!(base.ty, Type::Array(_)) {
+                if !matches!(base.ty, Type::Array(_) | Type::Dynamic(_)) {
                     return Err(Error::new(
                         "E0221",
                         e.span,
                         "indexing requires a fixed array",
                     ));
                 }
-                let item = self.types.array(base.ty).unwrap().elem;
+                let item = self
+                    .types
+                    .dynamic_elem(base.ty)
+                    .or_else(|| self.types.array(base.ty).map(|a| a.elem))
+                    .unwrap();
                 let index = self.expr(index, Some(Type::I32))?;
                 Expr {
                     ty: item,
@@ -798,9 +912,19 @@ impl Checker<'_> {
             },
             A::Name(n) => {
                 if let Some(b) = self.lookup(n) {
-                    Expr {
-                        ty: b.ty,
-                        kind: ExprKind::Local(b.slot),
+                    if let Some((ty, _)) = self.types.referenced(b.ty) {
+                        Expr {
+                            ty,
+                            kind: ExprKind::Deref(Box::new(Expr {
+                                ty: b.ty,
+                                kind: ExprKind::ReferenceAddress(b.slot),
+                            })),
+                        }
+                    } else {
+                        Expr {
+                            ty: b.ty,
+                            kind: ExprKind::Local(b.slot),
+                        }
                     }
                 } else if let Some((index, ty)) = self.global(n) {
                     Expr {
@@ -825,6 +949,7 @@ impl Checker<'_> {
                     && self.hint(base).is_some_and(|ty| {
                         matches!(ty, Type::String | Type::Bytes | Type::Runes)
                             || self.types.array(ty).is_some()
+                            || self.types.dynamic_elem(ty).is_some()
                     })
                 {
                     let base = self.expr(base, None)?;
@@ -1192,10 +1317,21 @@ impl Checker<'_> {
                 }
                 let ret = sig.ret;
                 let types = sig.params.clone();
+                self.check_borrow_aliases(args)?;
                 let values = args
                     .iter()
                     .zip(types)
-                    .map(|(a, t)| self.expr(a, Some(t)))
+                    .map(|(a, t)| {
+                        let value = self.expr(a, Some(t))?;
+                        if let Some(storage) = self.storage(value.ty) {
+                            Ok(Expr {
+                                ty: value.ty,
+                                kind: ExprKind::Clone(Box::new(value), storage),
+                            })
+                        } else {
+                            Ok(value)
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 Expr {
                     ty: ret,
@@ -1212,6 +1348,7 @@ impl Checker<'_> {
     }
     fn length(&self, base: Expr, span: Span) -> Result<Expr, Error> {
         let kind = match base.ty {
+            Type::Dynamic(_) => ExprKind::DynamicOp(DynamicOp::Len, Box::new(base), None),
             Type::String | Type::Bytes => ExprKind::StringOp(StringOp::Len, vec![base]),
             Type::Runes => ExprKind::StringOp(StringOp::RuneLen, vec![base]),
             ty => {
@@ -1252,6 +1389,13 @@ impl Checker<'_> {
                         .map(|ty| resolve_type(self.types, self.symbols, ty, s.span))
                         .transpose()?;
                     let x = self.expr(init, ty)?;
+                    if self.types.referenced(x.ty).is_some() {
+                        return Err(Error::new(
+                            "E0281",
+                            s.span,
+                            "references are currently restricted to function parameters",
+                        ));
+                    }
                     self.bind(name, x.ty, *mutable, s.span)?;
                     let b = self.lookup(name).unwrap();
                     (self.store_value(&b, x), false)
@@ -1264,6 +1408,24 @@ impl Checker<'_> {
                             format!("unknown variable '{n}'; use ':=' to declare it"),
                         )
                     })?;
+                    if let Some((ty, mutable)) = self.types.referenced(b.ty) {
+                        if !mutable {
+                            return Err(Error::new(
+                                "E0208",
+                                s.span,
+                                "cannot assign through a shared reference",
+                            ));
+                        }
+                        let value = self.expr(value, Some(ty))?;
+                        result.push(Stmt::StorePlace(
+                            Expr {
+                                ty,
+                                kind: ExprKind::ReferenceAddress(b.slot),
+                            },
+                            value,
+                        ));
+                        continue;
+                    }
                     if !b.mutable {
                         return Err(Error::new("E0208", s.span, format!("'{n}' is immutable; declare it with 'var {n} := ...' to allow assignment")));
                     }
@@ -1271,73 +1433,10 @@ impl Checker<'_> {
                     (self.store_value(&b, x), false)
                 }
                 ast::StmtKind::AssignIndex(target, value) => {
-                    if let ast::ExprKind::Member(base, name) = &target.kind {
-                        let ast::ExprKind::Name(local) = &base.kind else {
-                            return Err(Error::new(
-                                "E0241",
-                                target.span,
-                                "assign through a mutable local struct name",
-                            ));
-                        };
-                        let b = self.lookup(local).ok_or_else(|| {
-                            Error::new("E0205", base.span, format!("unknown name '{local}'"))
-                        })?;
-                        if !b.mutable {
-                            return Err(Error::new(
-                                "E0208",
-                                target.span,
-                                format!("'{local}' is immutable; use 'var' to change its fields"),
-                            ));
-                        }
-                        let field = self
-                            .types
-                            .record(b.ty)
-                            .and_then(|r| r.fields.iter().find(|f| f.name == *name))
-                            .ok_or_else(|| {
-                                Error::new("E0241", target.span, format!("no field '{name}'"))
-                            })?;
-                        let (offset, ty) = (field.offset, field.ty);
-                        let base = self.expr(base, Some(b.ty))?;
-                        let value = self.expr(value, Some(ty))?;
-                        result.push(Stmt::StoreField(base, offset, value));
-                        continue;
-                    }
-                    let ast::ExprKind::Index(base, index) = &target.kind else {
-                        return Err(Error::new(
-                            "E0221",
-                            target.span,
-                            "assignment target must be an array element",
-                        ));
-                    };
-                    let ast::ExprKind::Name(name) = &base.kind else {
-                        return Err(Error::new(
-                            "E0221",
-                            target.span,
-                            "assign through a mutable local array name",
-                        ));
-                    };
-                    let b = self.lookup(name).ok_or_else(|| {
-                        Error::new("E0205", base.span, format!("unknown array '{name}'"))
-                    })?;
-                    if !b.mutable {
-                        return Err(Error::new(
-                            "E0208",
-                            target.span,
-                            format!("'{name}' is immutable; use 'var' to change its elements"),
-                        ));
-                    }
-                    if !matches!(b.ty, Type::Array(_)) {
-                        return Err(Error::new(
-                            "E0221",
-                            target.span,
-                            "assignment requires a mutable array",
-                        ));
-                    }
-                    let ty = self.types.array(b.ty).unwrap().elem;
-                    let base = self.expr(base, Some(b.ty))?;
-                    let index = self.expr(index, Some(Type::I32))?;
+                    self.check_index_assignment(target, value)?;
+                    let (ty, address) = self.place(target, true)?;
                     let value = self.expr(value, Some(ty))?;
-                    (Stmt::StoreIndex(base, index, value), false)
+                    (Stmt::StorePlace(address, value), false)
                 }
                 ast::StmtKind::Return(value) => {
                     let v = value
@@ -1394,6 +1493,8 @@ impl Checker<'_> {
                         Type::Rune
                     } else if source.ty == Type::Bytes {
                         Type::I32
+                    } else if let Some(elem) = self.types.dynamic_elem(source.ty) {
+                        elem
                     } else {
                         self.types
                             .array(source.ty)
@@ -1577,8 +1678,6 @@ pub(crate) fn check_modules(
         for record in &input.records {
             let ty = symbols[module].records[&record.name].0;
             let mut fields = Vec::new();
-            let mut offset = 0;
-            let mut alignment = 1;
             let mut seen = std::collections::HashSet::new();
             for field in &record.fields {
                 if !seen.insert(field.name.clone()) {
@@ -1588,39 +1687,13 @@ pub(crate) fn check_modules(
                 }
                 let ty = resolve_type(&mut types, &symbols, field.ty, field.span)
                     .map_err(|e| e.in_file(module))?;
-                let size = match ty {
-                    Type::Bool => 1,
-                    Type::I32 | Type::Rune | Type::F32 => 4,
-                    Type::I64 | Type::String | Type::F64 => 8,
-                    _ if types.scalar_enum(ty) => 4,
-                    _ => {
-                        return Err(Error::new(
-                            "E0240",
-                            field.span,
-                            "struct fields currently support scalar values",
-                        )
-                        .in_file(module))
-                    }
-                };
-                offset = (offset + size - 1) & !(size - 1);
                 fields.push(ast::RecordField {
                     name: field.name.clone(),
                     ty,
-                    offset,
+                    offset: 0,
                 });
-                offset += size;
-                alignment = alignment.max(size);
-                if offset > 65536 {
-                    return Err(Error::new(
-                        "E0240",
-                        record.span,
-                        "a struct may occupy at most 65536 bytes",
-                    )
-                    .in_file(module));
-                }
             }
-            let bytes = (offset.max(1) + alignment - 1) & !(alignment - 1);
-            types.define_record(ty, fields, bytes);
+            types.define_record(ty, fields, 0);
         }
     }
     let mut index = 0;
@@ -1634,6 +1707,12 @@ pub(crate) fn check_modules(
             }
             f.ret =
                 resolve_type(&mut types, &symbols, f.ret, f.span).map_err(|e| e.in_file(module))?;
+            if types.referenced(f.ret).is_some() {
+                return Err(
+                    Error::new("E0281", f.span, "returning references is not supported")
+                        .in_file(module),
+                );
+            }
             if let Some(name) = &f.test {
                 if !f.params.is_empty() || f.ret != Type::Unit {
                     return Err(Error::new(
@@ -1738,6 +1817,7 @@ pub(crate) fn check_modules(
                     param_slots,
                     param_storage,
                     return_slot,
+                    uses_float_format: c.needs_float_format,
                 })
             })()
             .map_err(|e: Error| e.in_file(module))?;
@@ -1813,6 +1893,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             param_slots,
             param_storage: vec![None, None],
             return_slot: None,
+            uses_float_format: false,
         })
     };
     build().map_err(|e| {
@@ -1867,6 +1948,17 @@ fn resolve_type(
     ty: Type,
     span: Span,
 ) -> Result<Type, Error> {
+    if let Some(elem) = types.dynamic_elem(ty) {
+        let elem = resolve_type(types, symbols, elem, span)?;
+        return types.dynamic(elem, span);
+    }
+    if let Some((inner, mutable)) = types.referenced(ty) {
+        let inner = resolve_type(types, symbols, inner, span)?;
+        if matches!(inner, Type::Unit | Type::Reference(_)) {
+            return Err(Error::new("E0281", span, "reference a value type"));
+        }
+        return Ok(types.reference(inner, mutable));
+    }
     if let Some(named) = types.named_ref(ty).cloned() {
         return lookup_type(symbols, named.module, &named.name, span);
     }

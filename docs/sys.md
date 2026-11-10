@@ -50,6 +50,12 @@ implementeras i [native-backenden](../src/native/sys.rs).
 | `sys.error_from_code(code)` | `sys.IoError` | Namngivet fel eller `Other(code)` för en okänd kod. |
 | `sys.error_code(error)` | `i32` | Ursprunglig felkod, även för `Other(code)`. |
 | `sys.io_error_message(error)` | `string` | Feltext för ett typat `IoError`. |
+| `sys.write_bytes(path, &bytes)` | `sys.Status` | Skriver `[]i32` som råa byte; kräver värden 0–255. |
+| `sys.decode_utf8(&bytes)` | `sys.TextResult` | Validerar byteintervallet och avkodar giltig UTF-8. |
+| `sys.arg_count()` | `i32` | Antal programargument, inklusive programnamnet. |
+| `sys.arg(index)` | `string` | Kopierar och UTF-8-validerar ett argument; `arg(0)` är programnamnet. |
+| `sys.same_file(first, second)` | `bool` | Jämför device/inode, följer länkar. Falskt om stat eller sökvägskontroll misslyckas. |
+| `sys.make_executable(path)` | `sys.Status` | Sätter läge 0755; används för färdigbyggda program. |
 
 Samtliga sökvägar och textargument har typen `string`. `read` använder enums:
 
@@ -94,6 +100,17 @@ Ett normalt I/O-fel är ett resultat; det avbryter inte processen.
 Koden väljer själv hur felet hanteras. Det finns ännu ingen `?`-operator
 eller generell Result/Option-typ. Konkreta enums och `match` fungerar redan;
 se [enumreglerna](enums.md).
+
+`write_bytes` följer samma fil-/skrivregler som `write_text`, men UTF-8 krävs
+inte för innehållet. Den validerar byteintervallet före öppning/trunkering;
+ett felaktigt element ger 22. En tillfällig packad bytebuffert använder
+strängarenan och kan ge 12 om utrymmet inte räcker. `decode_utf8` har samma
+intervallkontroll, ger 92 för ogiltig UTF-8 och har tom `.value` vid fel.
+Sökvägar är fortsatt UTF-8 även vid binär utdata.
+
+Argument exponeras som vanliga oföränderliga Dunder-strängar. Felaktigt
+index ger status 103; ett argument med ogiltig UTF-8 ger 106. Vid `dunder run`
+skickas programargument efter `--`, exempelvis `dunder run main.ddr -- hello`.
 
 ## Sökvägar och filer
 
@@ -158,7 +175,8 @@ inte hela systemets lokaliserade felkatalog.
 
 Det exakta importnamnet `sys` väljer det medföljande biblioteket och kan
 aliaseras med `import sys as os`. Flera importer laddar det en gång och
-delar samma typidentitet. För en egen lokal fil med samma namn används
+delar samma typidentitet, också genom `import "std/sys" as os`.
+För en egen lokal fil med samma namn används
 exempelvis `import "./sys" as local`. Vanliga moduler söks fortsatt relativt
 den importerande filen. De privata `__sys_*`-intrinsics är endast tillgängliga
 inne i det medföljande biblioteket.
@@ -183,5 +201,5 @@ Implementationens syscallnummer och stat-layout är verifierade mot
 och [stat-definitioner](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stat.h),
 samt den installerade macOS-SDK:n och verkliga körningar på denna Mac.
 Direkta Darwin-anrop är en plattformsdetalj som kan behöva anpassas för
-andra OS-versioner/mål. Binär-I/O, kataloglistning, rekursiva katalogverktyg,
-strömmar, rättighetsändringar och ett generellt allokerings-API återstår.
+andra OS-versioner/mål. Binärläsning, kataloglistning, rekursiva katalogverktyg,
+strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.

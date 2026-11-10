@@ -283,9 +283,60 @@ pub(super) fn define_enums(
     for (ty, span, module) in definitions {
         layout(ty, types, &mut Vec::new(), span).map_err(|e| e.in_file(module))?;
     }
+    for (module, input) in modules.iter().enumerate() {
+        for record in &input.records {
+            layout(
+                symbols[module].records[&record.name].0,
+                types,
+                &mut Vec::new(),
+                record.span,
+            )
+            .map_err(|e| e.in_file(module))?;
+        }
+    }
     Ok(())
 }
 fn layout(ty: Type, types: &mut Types, active: &mut Vec<Type>, span: Span) -> Result<usize, Error> {
+    if let Some(record) = types.record(ty).cloned() {
+        if record.bytes != 0 {
+            return Ok(record.bytes);
+        }
+        if active.contains(&ty) || active.len() >= 128 {
+            return Err(Error::new(
+                "E0240",
+                span,
+                "recursive or excessively nested inline structs need indirection",
+            ));
+        }
+        active.push(ty);
+        let mut offset = 0;
+        let mut alignment = 1;
+        let mut fields = record.fields;
+        for field in &mut fields {
+            let size = layout(field.ty, types, active, span)
+                .map_err(|e| Error::new("E0240", span, e.message))?;
+            let align = if types.storage_bytes(field.ty).is_some() {
+                8
+            } else {
+                size
+            };
+            alignment = alignment.max(align);
+            offset = (offset + align - 1) & !(align - 1);
+            field.offset = offset;
+            offset += size;
+            if offset > 65536 {
+                return Err(Error::new(
+                    "E0240",
+                    span,
+                    "a struct may occupy at most 65536 bytes",
+                ));
+            }
+        }
+        active.pop();
+        let bytes = (offset.max(1) + alignment - 1) & !(alignment - 1);
+        types.define_record(ty, fields, bytes);
+        return Ok(bytes);
+    }
     if let Some(e) = types.enumeration(ty).cloned() {
         if e.bytes != 0 {
             return Ok(e.bytes);

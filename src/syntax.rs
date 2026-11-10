@@ -19,6 +19,8 @@ pub enum Type {
     Named(usize),
     Record(usize),
     Enum(usize),
+    Dynamic(usize),
+    Reference(usize),
 }
 impl Type {
     pub fn integer(self) -> bool {
@@ -49,6 +51,8 @@ impl Type {
             Self::Named(_) => "type",
             Self::Record(_) => "struct",
             Self::Enum(_) => "enum",
+            Self::Dynamic(_) => "dynamic array",
+            Self::Reference(_) => "reference",
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct Types {
     names: Vec<NamedType>,
     records: Vec<RecordType>,
     enums: Vec<EnumType>,
+    dynamics: Vec<Type>,
+    references: Vec<(Type, bool)>,
 }
 #[derive(Clone, Debug)]
 pub struct EnumType {
@@ -117,6 +123,71 @@ impl ArrayType {
     }
 }
 impl Types {
+    pub fn dynamic(&mut self, elem: Type, span: Span) -> Result<Type, Error> {
+        if !matches!(
+            elem,
+            Type::I32
+                | Type::I64
+                | Type::F32
+                | Type::F64
+                | Type::Bool
+                | Type::String
+                | Type::Rune
+                | Type::Named(_)
+        ) && !self.scalar_enum(elem)
+        {
+            return Err(Error::new(
+                "E0280",
+                span,
+                "dynamic array elements must be scalar values",
+            ));
+        }
+        let index = self
+            .dynamics
+            .iter()
+            .position(|t| *t == elem)
+            .unwrap_or_else(|| {
+                self.dynamics.push(elem);
+                self.dynamics.len() - 1
+            });
+        Ok(Type::Dynamic(index))
+    }
+    pub fn dynamic_elem(&self, ty: Type) -> Option<Type> {
+        if let Type::Dynamic(i) = ty {
+            self.dynamics.get(i).copied()
+        } else {
+            None
+        }
+    }
+    pub fn reference(&mut self, ty: Type, mutable: bool) -> Type {
+        let index = self
+            .references
+            .iter()
+            .position(|r| *r == (ty, mutable))
+            .unwrap_or_else(|| {
+                self.references.push((ty, mutable));
+                self.references.len() - 1
+            });
+        Type::Reference(index)
+    }
+    pub fn referenced(&self, ty: Type) -> Option<(Type, bool)> {
+        if let Type::Reference(i) = ty {
+            self.references.get(i).copied()
+        } else {
+            None
+        }
+    }
+    pub fn value_type(&self, ty: Type) -> Type {
+        self.referenced(ty).map_or(ty, |(t, _)| t)
+    }
+    pub fn scalar_size(&self, ty: Type) -> usize {
+        match ty {
+            Type::Bool => 1,
+            Type::I32 | Type::Rune | Type::F32 => 4,
+            _ if self.scalar_enum(ty) => 4,
+            _ => 8,
+        }
+    }
     pub fn declare_enum(&mut self, module: usize, name: String, data: bool) -> Type {
         let index = self.enums.len();
         self.enums.push(EnumType {
@@ -187,6 +258,9 @@ impl Types {
         }
     }
     pub fn storage_bytes(&self, ty: Type) -> Option<usize> {
+        if matches!(ty, Type::Dynamic(_)) {
+            return Some(24);
+        }
         self.array(ty)
             .map(|a| a.bytes())
             .or_else(|| self.record(ty).map(|r| r.bytes))
@@ -249,6 +323,12 @@ impl Types {
         }
     }
     pub fn name(&self, ty: Type) -> String {
+        if let Some(elem) = self.dynamic_elem(ty) {
+            return format!("[]{}", self.name(elem));
+        }
+        if let Some((inner, mutable)) = self.referenced(ty) {
+            return format!("&{}{}", if mutable { "mut " } else { "" }, self.name(inner));
+        }
         if let Some(n) = self.named_ref(ty) {
             return n.name.clone();
         }
@@ -353,6 +433,7 @@ enum Token {
     Newline,
     Arrow,
     FatArrow,
+    Amp,
     Op(&'static str),
     Eof,
 }
@@ -362,13 +443,48 @@ struct Lexeme {
     span: Span,
 }
 
+// ASCII source needs no per-character index allocation. Unicode files retain
+// byte-accurate offsets and the exact same lexer rules.
+struct Codepoints<'a> {
+    ascii: Option<&'a [u8]>,
+    unicode: Vec<(usize, char)>,
+}
+impl<'a> Codepoints<'a> {
+    fn new(source: &'a str) -> Self {
+        if source.is_ascii() {
+            Self {
+                ascii: Some(source.as_bytes()),
+                unicode: Vec::new(),
+            }
+        } else {
+            Self {
+                ascii: None,
+                unicode: source.char_indices().collect(),
+            }
+        }
+    }
+    fn len(&self) -> usize {
+        self.ascii.map_or(self.unicode.len(), |s| s.len())
+    }
+    fn at(&self, i: usize) -> (usize, char) {
+        if let Some(s) = self.ascii {
+            (i, char::from(s[i]))
+        } else {
+            self.unicode[i]
+        }
+    }
+    fn get(&self, i: usize) -> Option<(usize, char)> {
+        (i < self.len()).then(|| self.at(i))
+    }
+}
+
 fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
     let mut out = Vec::new();
-    let chars: Vec<_> = source.char_indices().collect();
+    let chars = Codepoints::new(source);
     let mut i = 0;
     let mut parens = 0usize;
     while i < chars.len() {
-        let (start, c) = chars[i];
+        let (start, c) = chars.at(i);
         let next = chars.get(i + 1).map(|x| x.1);
         if c == '\n' && parens == 0 {
             out.push(Lexeme {
@@ -390,7 +506,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             let mut bytes = Vec::new();
             let mut closed = false;
             while i < chars.len() {
-                let ch = chars[i].1;
+                let ch = chars.at(i).1;
                 if ch == c {
                     i += 1;
                     closed = true;
@@ -530,7 +646,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             continue;
         }
         if c == '/' && next == Some('/') {
-            while i < chars.len() && chars[i].1 != '\n' {
+            while i < chars.len() && chars.at(i).1 != '\n' {
                 i += 1;
             }
             continue;
@@ -539,7 +655,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             i += 2;
             let mut depth = 1;
             while i < chars.len() && depth > 0 {
-                let pair = (chars[i].1, chars.get(i + 1).map(|x| x.1));
+                let pair = (chars.at(i).1, chars.get(i + 1).map(|x| x.1));
                 if pair == ('/', Some('*')) {
                     depth += 1;
                     i += 2;
@@ -547,12 +663,12 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                     depth -= 1;
                     i += 2;
                 } else {
-                    if chars[i].1 == '\n' && parens == 0 {
+                    if chars.at(i).1 == '\n' && parens == 0 {
                         out.push(Lexeme {
                             token: Token::Newline,
                             span: Span {
-                                start: chars[i].0,
-                                end: chars[i].0 + 1,
+                                start: chars.at(i).0,
+                                end: chars.at(i).0 + 1,
                             },
                         });
                     }
@@ -573,7 +689,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
         }
         if c.is_alphabetic() || c == '_' {
             i += 1;
-            while i < chars.len() && (chars[i].1.is_alphanumeric() || chars[i].1 == '_') {
+            while i < chars.len() && (chars.at(i).1.is_alphanumeric() || chars.at(i).1 == '_') {
                 i += 1;
             }
             let end = chars.get(i).map_or(source.len(), |x| x.0);
@@ -585,7 +701,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
         }
         if c.is_ascii_digit() {
             i += 1;
-            while i < chars.len() && (chars[i].1.is_ascii_digit() || chars[i].1 == '_') {
+            while i < chars.len() && (chars.at(i).1.is_ascii_digit() || chars.at(i).1 == '_') {
                 i += 1;
             }
             let mut floating = false;
@@ -594,7 +710,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
             {
                 floating = true;
                 i += 1;
-                while i < chars.len() && (chars[i].1.is_ascii_digit() || chars[i].1 == '_') {
+                while i < chars.len() && (chars.at(i).1.is_ascii_digit() || chars.at(i).1 == '_') {
                     i += 1;
                 }
             }
@@ -605,7 +721,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                     i += 1;
                 }
                 let first = i;
-                while i < chars.len() && (chars[i].1.is_ascii_digit() || chars[i].1 == '_') {
+                while i < chars.len() && (chars.at(i).1.is_ascii_digit() || chars.at(i).1 == '_') {
                     i += 1;
                 }
                 if i == first {
@@ -668,6 +784,7 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
         } else {
             (
                 match c {
+                    '&' => Token::Amp,
                     '(' => {
                         parens += 1;
                         Token::Left
@@ -787,6 +904,7 @@ pub struct Expr {
 }
 #[derive(Debug)]
 pub enum ExprKind {
+    Borrow(Box<Expr>, bool),
     Number(i128),
     Float(String),
     Bool(bool),
@@ -891,8 +1009,25 @@ impl Parser<'_> {
         result
     }
     fn type_inner(&mut self) -> Result<Type, Error> {
+        if self.accept(Token::Amp) {
+            let mutable = if self.is_word("mut") {
+                self.take();
+                true
+            } else {
+                false
+            };
+            let inner = self.ty()?;
+            if self.types.referenced(inner).is_some() || inner == Type::Unit {
+                return Err(Error::new("E0280", self.span(), "reference a value type"));
+            }
+            return Ok(self.types.reference(inner, mutable));
+        }
         if self.accept(Token::Square) {
             let span = self.span();
+            if self.accept(Token::EndSquare) {
+                let elem = self.ty()?;
+                return self.types.dynamic(elem, span);
+            }
             let elem = self.ty()?;
             self.expect(Token::Semi, "';' before array length")?;
             let len = self.array_len()?;
@@ -1356,6 +1491,18 @@ impl Parser<'_> {
         let t = self.take();
         let span = t.span;
         let mut left = match t.token {
+            Token::Amp => {
+                let mutable = if self.is_word("mut") {
+                    self.take();
+                    true
+                } else {
+                    false
+                };
+                Expr {
+                    kind: ExprKind::Borrow(Box::new(self.expr(7)?), mutable),
+                    span,
+                }
+            }
             Token::Dot => {
                 let (name, end) = self.name()?;
                 Expr {

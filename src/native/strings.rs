@@ -162,6 +162,18 @@ impl Code<'_> {
     pub(super) fn copy_bytes(&mut self, dst: u32, src: u32, count: u32, byte: u32) {
         let end = self.label();
         let again = self.label();
+        let tail = self.label();
+        let wide = self.label();
+        self.mark(wide);
+        self.emit(0xf100201f | count << 5); // cmp count,#8
+        self.branch(tail, Branch::Cond(3));
+        self.ldr(byte, src);
+        self.str(byte, dst);
+        self.add_imm(src, src, 8);
+        self.add_imm(dst, dst, 8);
+        self.sub_imm(count, count, 8);
+        self.branch(wide, Branch::Jump);
+        self.mark(tail);
         self.branch(end, Branch::Zero(count));
         self.mark(again);
         self.ldrb(byte, src);

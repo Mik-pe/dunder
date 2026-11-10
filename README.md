@@ -204,8 +204,42 @@ Index kontrolleras vid körning.
 
 [Dogfood-programmen](dogfood/README.md) provar rekursion, moduler, sortering,
 callbacks, iteratorer, structar och en indexbaserad arena över en fast typad
-buffert. Arenan är ett fungerande bump-allokeringsprogram; språket har ännu
-inget allmänt allokerings- eller låne-API.
+buffert. Arenan är ett fungerande bump-allokeringsprogram. Växande samlingar
+och begränsade funktionsborrows finns nu i standardbibliotekets första steg.
+
+## Standardbibliotek och dynamiska arrayer
+
+```dunder
+import "std/map" as map
+import "std/set" as set
+import "std/array" as array
+
+fn main() {
+    var counts := map.new()
+    map.put(&mut counts, "dunder", 42)
+    print(map.get_or(&counts, "dunder", 0))
+
+    var names := set.new()
+    added := set.insert(&mut names, "å 🌍")
+    assert(added)
+
+    var values: []i64 = [3, 1, 2]
+    values.push(4)
+    array.sort(&mut values)
+    print(array.sum(&values))
+}
+```
+
+`[]T` växer med `push` och `reserve`; `pop`, `clear`, indexering, längd och
+iteration stöds. Kopior är oberoende, även inne i nästlade structar och enums.
+`&values` lånar för läsning och `&mut values` för uppdatering under ett
+funktionsanrop. Referenser kan ännu inte returneras eller lagras.
+
+Map (`string` → `i64`), set av strängar, arrayalgoritmer, text, bytekodning,
+decimalparsning, hashning och SHA-256 är skrivna i Dunder och inbäddade i
+kompilatorn. Generiska map/set återstår. Dynamiska buffertar använder en
+separat 512 MiB processarena utan återvinning av enskilda buffertar; strängar
+har kvar sin 16 MiB arena. Läs [API, borrows och gränser](docs/standard.md).
 
 ## Enums och match
 
@@ -352,13 +386,19 @@ Läs [syntaxen](docs/syntax.md).
 Anrop stöder både register- och stackargument; fler än åtta parametrar fungerar.
 Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
 infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
-och körbar kod; optimering och byggprestanda är inte uppmätta.
-Bootstrapkompilatorn är skriven i Rust och är ännu inte självhostad.
-Structfält och arrayelement stöder i dag `i32`, `i64`, `f32`, `f64`, `bool`,
-`string`, `rune` och enums utan payload. Arrayer, structar och data-enums kan
-returneras från funktioner med värdesemantik. Data-enums kan innehålla
-aggregat; nästlade structar och aggregat som arrayelement återstår.
-Arrayslices, allmänt allokerings-API, ägande/lån och
+och körbar kod. Byggmätningar av ett genererat korpus finns i
+[prestandarapporten](benchmarks/README.md); hela prestandakontraktet är ännu
+inte uppfyllt. Oanvända funktioner och oanvänd flyttalsformatering tas bort
+ur den genererade binären; parsern har en ASCII-väg utan teckenindexallokering.
+
+En [Dunder-skriven kompilator](selfhost/README.md) bygger redan skalära
+Dunder-program till signerad nativekod. Den kan ännu inte bygga sin egen
+fullständiga källkod. Rust-bootstrapen finns kvar som återställningsväg.
+
+Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
+och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva
+skalärer och enums utan payload. Aggregat returneras med värdesemantik.
+Arrayslices, generiskt allokerings-API, generell ägar-/lånekontroll och
 användardefinierade iteratorer återstår. Stränginterpolering, normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
 

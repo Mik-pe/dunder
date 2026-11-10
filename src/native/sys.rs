@@ -14,9 +14,10 @@ const MAX_READ: u64 = 4 * 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct Runtime {
-    calls: [Label; 9],
+    calls: [Label; 15],
     path: Label,
     utf8: Label,
+    pack: Label,
 }
 impl Runtime {
     pub fn new(code: &mut Code<'_>) -> Self {
@@ -24,6 +25,7 @@ impl Runtime {
             calls: std::array::from_fn(|_| code.label()),
             path: code.label(),
             utf8: code.label(),
+            pack: code.label(),
         }
     }
 }
@@ -38,9 +40,180 @@ fn index(op: SysOp) -> usize {
         SysOp::RemoveDir => 6,
         SysOp::Metadata => 7,
         SysOp::Pid => 8,
+        SysOp::ArgCount => 9,
+        SysOp::Arg => 10,
+        SysOp::WriteBytes => 11,
+        SysOp::MakeExecutable => 12,
+        SysOp::DecodeUtf8 => 13,
+        SysOp::SameFile => 14,
     }
 }
 impl Code<'_> {
+    fn sys_same_file(&mut self) {
+        self.mark(self.sys.calls[index(SysOp::SameFile)]);
+        self.prologue(FRAME);
+        self.store(1, 0);
+        self.store(2, 1);
+        let failed = self.label();
+        self.sys_path(1, PATH1, failed);
+        self.sys_path(2, PATH2, failed);
+        self.local_addr(PATH1);
+        self.mov(0, 9);
+        self.local_addr(STAT);
+        self.mov(1, 9);
+        self.syscall(338);
+        self.branch(failed, Branch::Cond(2));
+        self.local_addr(STAT);
+        self.mov(0, 9);
+        self.typed_load(Type::I32);
+        self.store(4, 0);
+        self.local_addr(STAT);
+        self.add_imm(0, 9, 8);
+        self.ldr(0, 0);
+        self.store(5, 0);
+        self.local_addr(PATH2);
+        self.mov(0, 9);
+        self.local_addr(STAT);
+        self.mov(1, 9);
+        self.syscall(338);
+        self.branch(failed, Branch::Cond(2));
+        self.local_addr(STAT);
+        self.mov(0, 9);
+        self.typed_load(Type::I32);
+        self.mov(1, 0);
+        self.load(4);
+        self.cmp(0, 1);
+        self.branch(failed, Branch::Cond(1));
+        self.local_addr(STAT);
+        self.add_imm(0, 9, 8);
+        self.ldr(1, 0);
+        self.load(5);
+        self.cmp(0, 1);
+        self.branch(failed, Branch::Cond(1));
+        self.imm(0, 1);
+        self.epilogue();
+        self.mark(failed);
+        self.imm(0, 0);
+        self.epilogue();
+    }
+    fn sys_arguments(&mut self) {
+        self.mark(self.sys.calls[index(SysOp::ArgCount)]);
+        self.mov(0, 23);
+        self.ret();
+        self.mark(self.sys.calls[index(SysOp::Arg)]);
+        self.prologue(48);
+        self.cmp(0, 23);
+        self.branch(self.bounds, Branch::Cond(2));
+        self.lsl(0, 0, 3);
+        self.add(0, 24, 0);
+        self.ldr(0, 0);
+        self.store(0, 0);
+        self.mov(1, 0);
+        self.imm(2, 0);
+        let head = self.label();
+        let done = self.label();
+        self.mark(head);
+        self.ldrb(3, 1);
+        self.branch(done, Branch::Zero(3));
+        self.add_imm(1, 1, 1);
+        self.add_imm(2, 2, 1);
+        self.branch(head, Branch::Jump);
+        self.mark(done);
+        self.store(1, 2);
+        self.mov(0, 2);
+        self.branch(self.strings.alloc, Branch::Call);
+        self.store(2, 0);
+        self.add_imm(11, 0, 8);
+        self.load(0);
+        self.mov(10, 0);
+        self.load(1);
+        self.mov(12, 0);
+        self.copy_bytes(11, 10, 12, 13);
+        self.load(2);
+        self.branch(self.sys.utf8, Branch::Call);
+        self.branch(self.strings.unicode_error, Branch::Nonzero(0));
+        self.load(2);
+        self.epilogue();
+    }
+    fn sys_binary_write(&mut self) {
+        let ty = self.sys_begin(SysOp::WriteBytes);
+        let failed = self.label();
+        self.load(2);
+        self.branch(self.sys.pack, Branch::Call);
+        self.branch(failed, Branch::Nonzero(1));
+        self.mov(1, 0);
+        self.load(0);
+        self.mov(8, 0);
+        self.load(1);
+        self.branch(self.sys.calls[index(SysOp::WriteText)], Branch::Call);
+        self.epilogue();
+        self.mark(failed);
+        self.mov(0, 1);
+        self.sys_finish(ty);
+        let ty = self.sys_begin(SysOp::DecodeUtf8);
+        let failed = self.label();
+        let done = self.label();
+        self.load(1);
+        self.branch(self.sys.pack, Branch::Call);
+        self.branch(failed, Branch::Nonzero(1));
+        self.store(4, 0);
+        self.branch(self.sys.utf8, Branch::Call);
+        self.branch(done, Branch::Nonzero(0));
+        self.load(4);
+        self.sys_field(ty, "value", 0);
+        self.imm(0, 0);
+        self.branch(done, Branch::Jump);
+        self.mark(failed);
+        self.mov(0, 1);
+        self.mark(done);
+        self.sys_finish(ty);
+    }
+    fn sys_pack_runtime(&mut self) {
+        self.mark(self.sys.pack);
+        self.prologue(64);
+        self.ldr(1, 0);
+        self.store(1, 1);
+        self.add_imm(0, 0, 8);
+        self.ldr(0, 0);
+        self.store(2, 0);
+        self.branch(self.strings.try_alloc, Branch::Call);
+        let allocated = self.label();
+        let done = self.label();
+        let invalid = self.label();
+        self.branch(allocated, Branch::Nonzero(0));
+        self.imm(1, 12);
+        self.branch(done, Branch::Jump);
+        self.mark(allocated);
+        self.store(3, 0);
+        self.add_imm(11, 0, 8);
+        self.load(1);
+        self.mov(10, 0);
+        self.load(2);
+        self.mov(12, 0);
+        let copy = self.label();
+        let copied = self.label();
+        self.mark(copy);
+        self.branch(copied, Branch::Zero(12));
+        self.mov(0, 10);
+        self.typed_load(Type::I32);
+        self.imm(1, 255);
+        self.cmp(0, 1);
+        self.branch(invalid, Branch::Cond(8));
+        self.strb(0, 11);
+        self.add_imm(10, 10, 4);
+        self.add_imm(11, 11, 1);
+        self.sub_imm(12, 12, 1);
+        self.branch(copy, Branch::Jump);
+        self.mark(copied);
+        self.load(3);
+        self.imm(1, 0);
+        self.epilogue();
+        self.mark(invalid);
+        self.imm(1, 22);
+        self.mark(done);
+        self.imm(0, 0);
+        self.epilogue();
+    }
     pub(super) fn sys_expr(&mut self, op: SysOp, args: &[Expr], storage: Option<usize>) {
         for arg in args {
             self.expr(arg);
@@ -66,7 +239,7 @@ impl Code<'_> {
     fn sys_type(&self, op: SysOp) -> Type {
         let types = self.sys_types.unwrap();
         match op {
-            SysOp::ReadText => types.text,
+            SysOp::ReadText | SysOp::DecodeUtf8 => types.text,
             SysOp::Metadata => types.metadata,
             _ => types.status,
         }
@@ -103,7 +276,7 @@ impl Code<'_> {
         self.add_imm(9, 9, 1);
         self.sub_imm(11, 11, 1);
         self.branch(zero, Branch::Nonzero(11));
-        if op == SysOp::ReadText {
+        if matches!(op, SysOp::ReadText | SysOp::DecodeUtf8) {
             let empty = self.string_literal("");
             self.branch(empty, Branch::Address(0));
             self.sys_field(ty, "value", 0);
@@ -137,11 +310,16 @@ impl Code<'_> {
         self.mark(self.sys.calls[index(SysOp::Pid)]);
         self.syscall(20);
         self.ret();
+        self.sys_arguments();
+        self.sys_same_file();
+        self.sys_binary_write();
+        self.sys_pack_runtime();
         for (op, number) in [
             (SysOp::Mkdir, 136),
             (SysOp::Rename, 128),
             (SysOp::RemoveFile, 10),
             (SysOp::RemoveDir, 137),
+            (SysOp::MakeExecutable, 15),
         ] {
             let ty = self.sys_begin(op);
             let done = self.label();
@@ -152,6 +330,8 @@ impl Code<'_> {
                 self.mov(1, 9);
             } else if op == SysOp::Mkdir {
                 self.imm(1, 0o700);
+            } else if op == SysOp::MakeExecutable {
+                self.imm(1, 0o755);
             }
             self.local_addr(PATH1);
             self.mov(0, 9);

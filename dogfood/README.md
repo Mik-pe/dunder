@@ -8,7 +8,7 @@ Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 32 passed, 0 failed
+# 44 passed, 0 failed
 ```
 
 Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
@@ -34,6 +34,7 @@ Med kompilatorn kopierad till `build/dunder` används samma kommandon som
 | [numeric/main.ddr](numeric/main.ddr) | f32-vektor, kompenserad f64-summering och rotberäkning med callback. | `5.0`, `2.0`, `true` |
 | [filesystem.ddr](filesystem.ddr) | Medföljande sys, UTF-8-fil, append, metadata, rename och städning. | `18`, `filesystem ok` |
 | [enums.ddr](enums.ddr) | Namngivna värden, payloads, uttömmande match och nästlade Ok/Err. | `42`, `enums ok` |
+| [standard.ddr](standard.ddr) | Word counter med map/set, dynamiska arrayer, text, byte, SHA-256 och decimalparser. | `4`, `6`, `stdlib ok` |
 | [utf8.ddr](utf8.ddr) | UTF-8, byte/kodpunkter, ordräkning, strängretur och text i structar. | `bytes=25`, `runes=20`, `words=5`, `🌍 Hej världen` |
 | [tokenizer.ddr](tokenizer.ddr) | UTF-8-ord, ASCII-skiljetecken och citerade strängar med escapes. | `fn\|hälsa\|(\|namn\|)\|{\|print\|(\|"Hej 🌍"\|)\|}` |
 
@@ -63,10 +64,19 @@ Standardtidsgränsen är fem sekunder per grupp; `--timeout-ms` ändrar den.
 
 Arrayer, structar och arrayiteratorer har värdesemantik och kopieras vid
 bindning och anrop. Iteratorer tar en kopia av arrayen; de lånar den inte.
-Structfält och arrayelement stöder `i32`, `i64`, `f32`, `f64`, `bool`,
-`string`, `rune` och enums utan payload.
+Arrayelement stöder `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune`
+och enums utan payload. Structfält kan också innehålla nästlade aggregat,
+dynamiska arrayer och funktionsvärden.
 Structar, fasta arrayer och data-enums kan returneras med värdesemantik.
 Användardefinierade iteratorer återstår.
+
+[Standardbiblioteket](../docs/standard.md) är Dunder-kod, inbäddad i
+kompilatorn och importerad som `std/map`, `std/set` och så vidare.
+`standard.ddr` kopplar ihop samlingarna i en UTF-8-ordräknare. Dess två
+testgrupper och bibliotekens åtta grupper ingår i huvudträdet.
+Även den [Dunder-skrivna kompilatorns](../selfhost/README.md) lexer och
+typkontroll har egna taggade grupper här. Den bygger skalära nativeprogram
+men kan ännu inte kompilera hela sin egen källkod.
 
 [filesystem.ddr](filesystem.ddr) använder `import sys`, som är inbäddat i
 kompilatorn. Programmet skapar en egen katalog med process-ID, provar

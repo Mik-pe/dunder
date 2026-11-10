@@ -57,6 +57,25 @@ dogfoodar `ReadResult { Ok(string), Err(IoError) }` och bevarar okända felkoder
 Koppla inte ihop enums med ett krav på en viss allokerare. Generics, allmänt
 allokerings-API och färdig ägar-/lånemodell återstår; se [enumreglerna](enums.md).
 
+Senaste uppdraget är standardbibliotek som dogfood, bättre byggtider och
+arbete mot självhosting. Implementerat: dynamiska typade arrayer, begränsade
+funktionsborrows, nästlade aggregat och Dunder-moduler för map, set, array,
+text, hash, bytekodning, SHA-256 och decimalparsning. Mät från ny process
+till färdig signerad binär och verifiera körresultatet. Märk genererad
+stresskod tydligt; den räcker inte som bevis för hela prestandakontraktet.
+
+Kompilatorns lexer, skalära parser/typkontroll, kodgenerering och Mach-O-/
+signeringsväg finns nu i `selfhost/`. Den Dunder-skrivna binären bygger
+andra program utan externa verktyg, men kan ännu inte bygga sina egna
+importer/aggregat. Beskriv inte detta som färdig självhosting. Behåll
+Rust-bootstrapen och dokumentera återställning från en ren källcheckout;
+självhosting kräver att stage 1 kan bygga stage 2, följt av tester och en
+stage 2/stage 3-jämförelse. Se [bootstrapguiden](../selfhost/README.md).
+
+Användaren kräver uttryckligen att detta projekt aldrig har CI via GitHub.
+Regeln finns i [AGENTS.md](../AGENTS.md). Kör verifiering lokalt; lägg inte
+till GitHub Actions eller CI-integrationer via GitHub.
+
 Första acceptans: typade funktioner och lokaler, tydliga typfel, explicit
 muterbarhet, kontrollflöde, verklig kompilering till native kod och flera
 körda exempel med verifierade resultat. Språkets användare skriver Dunder,

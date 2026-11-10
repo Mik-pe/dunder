@@ -319,3 +319,91 @@ fn sys_is_embedded_reproducible_and_runs_after_sources_are_removed() {
         "från fil 🌍".as_bytes()
     );
 }
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn byte_io_utf8_decoding_and_program_arguments_preserve_their_contracts() {
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+    let work = Workspace::new();
+    work.write("untouched", "previous contents");
+    work.write(
+        "main.ddr",
+        r#"
+import sys
+fn main(){
+ assert(sys.arg_count()==3);assert(sys.arg(1)=="å 🌍");assert(sys.arg(2)=="")
+ data:[]i32=[0,127,128,255,10]
+ assert(sys.write_bytes("binary",&data).ok)
+ assert(sys.make_executable("binary").ok)
+ invalid:[]i32=[0,256]
+ rejected:=sys.write_bytes("untouched",&invalid)
+ assert(!rejected.ok&&rejected.error==22)
+ valid:[]i32=[195,165,0]
+ decoded:=sys.decode_utf8(&valid);assert(decoded.ok);assert(decoded.value=="å\0")
+ bad:[]i32=[255]
+ utf8:=sys.decode_utf8(&bad);assert(!utf8.ok&&utf8.error==92&&utf8.value=="")
+ out_of_range:=sys.decode_utf8(&invalid);assert(!out_of_range.ok&&out_of_range.error==22)
+ print("bytes ok")
+}
+"#,
+    );
+    let out = work.cli(&["run", "main.ddr", "--", "å 🌍", ""]);
+    success(&out);
+    assert_eq!(out.stdout, b"bytes ok\n");
+    assert_eq!(
+        fs::read(work.0.join("binary")).unwrap(),
+        [0, 127, 128, 255, 10]
+    );
+    assert_eq!(
+        fs::read_to_string(work.0.join("untouched")).unwrap(),
+        "previous contents"
+    );
+    assert_eq!(
+        fs::metadata(work.0.join("binary"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    work.write("args.ddr", "import sys\nfn main(){print(sys.arg(1))}");
+    success(&work.cli(&["build", "args.ddr", "-o", "args"]));
+    let invalid_arg = Command::new(work.0.join("args"))
+        .arg(std::ffi::OsStr::from_bytes(&[255]))
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(invalid_arg.status.code(), Some(106));
+    let missing_arg = Command::new(work.0.join("args"))
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(missing_arg.status.code(), Some(103));
+}
+#[test]
+fn bundled_standard_modules_deduplicate_nominal_types_and_allow_explicit_local_paths() {
+    let work = Workspace::new();
+    fs::create_dir(work.0.join("std")).unwrap();
+    work.write("std/map.ddr", "pub fn local()->i32{42}");
+    work.write(
+        "main.ddr",
+        r#"
+import "std/map" as map
+import "std/map" as other
+import "./std/map" as local
+import sys
+import "std/sys" as os
+fn length(value:&other.Map)->i32{map.length(&value)}
+fn main(){var m:=map.new();print(length(&m));print(local.local());print(sys.pid()==os.pid())}
+"#,
+    );
+    let checked = work.checked();
+    assert_eq!(checked.sources.files.len(), 5);
+    for source in [
+        "import sys\nfn main(){var x:[]i64=[];r:=sys.write_bytes(\"a\",&x)}",
+        "fn main(){var x:[]i32=[];r:=__sys_decode_utf8(&x)}",
+    ] {
+        work.write("main.ddr", source);
+        assert!(dunder::modules::check_path(work.0.join("main.ddr")).is_err());
+    }
+}

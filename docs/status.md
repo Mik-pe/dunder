@@ -5,6 +5,18 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Implementerat
 
+- Standardbibliotek i Dunder: `std/map`, `std/set`, `std/array`, `std/text`,
+  `std/hash`, `std/bytes`, `std/sha256`, `std/parse` och sys. Map har strängnycklar
+  och i64-värden, set innehåller strängar. Modulerna är inbäddade och importeras
+  utan suffix. Hashning, sondering, omhashning och algoritmer är Dunder-kod.
+- Dynamiska `[]T`, geometrisk tillväxt, reserve/push/pop/clear, kontrollerade
+  index och iteration. Oberoende djupa värdekopior, också inne i aggregat.
+  `&T` och `&mut T` lånar under funktionsanrop; referenser kan inte lagras
+  eller returneras. Se [standardbibliotekets kontrakt](standard.md).
+- Nästlade structar, fasta/dynamiska arrayfält, enumfält och funktionsfält.
+  Inline-cykler avvisas och returvärden kopieras till anroparägd lagring.
+- Explicita heltalsmetoder för bitoperationer, kontrollerade skiftantal och
+  wrapping-aritmetik. SHA-256 och bytekodning använder dem som dogfood.
 - `.ddr` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
   Användarens val ersätter den tidigare tvåbokstavsändelsen. Importer saknar fortsatt suffix.
 - En fil per modul: `import math` eller `import "util/math" as math`, utan
@@ -60,6 +72,17 @@ i `/Users/mikpe/dev/dunder-language`.
 - `sys.read` ger `ReadResult { Ok(string), Err(IoError) }`. Namngivna fel,
   `Other(i32)` för okända koder, felkonverteringar och `FileKind` är skrivna
   i Dunder ovanpå det första sys-API:t.
+- Byteutdata, kontrollerad UTF-8-avkodning, programargument, identifiering
+  av samma fil genom hårda/symboliska länkar och explicit executable-läge.
+- Kodgenereringen tar bort onåbara funktioner och oanvänd flyttalsformatering.
+  Små lokala stackåtkomster använder färre instruktioner; minneskopiering
+  använder hela ord där det går. ASCII-källfiler behöver ingen separat
+  teckenindextabell. Långa hopp/adresser fungerar över 1 MiB och stora
+  signaturer får tillräcklig virtuell lagring i Mach-O.
+- [En Dunder-skriven kompilator](../selfhost/README.md) bygger den skalära
+  delmängden till signerad ARM64/Mach-O utan extern kompilator. Lexer,
+  parser, typkontroll, kodgenerering, filformat och signering är Dunder-kod.
+  Den bygger ännu inte hela sin egen källkod; självhosting är inte uppnådd.
 - Structar och fasta arrayer kan returneras med kopiering till anroparens
   lagring, även genom callbacks och rekursion. Ingen pekare till avslutad
   stacklagring returneras.
@@ -73,8 +96,9 @@ i `/Users/mikpe/dev/dunder-language`.
 
 ## Verifiering
 
-`cargo test`: 67 testfunktioner passerar (en hashreferens, sexton dogfood-,
-elva språk-, nio modul-, åtta sträng-, åtta flyttals-, åtta system- och sex enumtester).
+`cargo test`: 80 testfunktioner passerar (två signerings-/bildtester, sexton
+dogfood-, elva språk-, nio modul-, åtta sträng-, åtta flyttals-, tio system-,
+sex enum-, sju collection- och tre tester av den Dunder-skrivna kompilatorn).
 `cargo clippy --all-targets -- -D warnings`, `cargo fmt`
 och `cargo build --release` är genomförda.
 
@@ -83,10 +107,11 @@ till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
 förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.ddr
 -o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
 
-`dunder test` kör nu 32 Dunder-testgrupper i dogfood-trädet: rekursion,
+`dunder test` kör nu 44 Dunder-testgrupper i dogfood-trädet: rekursion,
 moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
 arena, tabellfall, structargument, UTF-8, en liten tokenizer, numeriska program
-och filsystem, namngivna enumvärden och nästlade payload-varianter.
+och filsystem, namngivna enumvärden, nästlade payload-varianter, standardbibliotek
+och kompilatorns första Dunder-skrivna delar.
 sys-bibliotekets felmeddelanden och typade felkoder har egna kopplade testblock.
 Varje grupp kompileras till en riktig
 nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
@@ -142,7 +167,7 @@ på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
 kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
 verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
 och structprogrammet. UTF-8-programmet, tokenizern, numerikprogrammet,
-filsystemsprogrammet, enumprogrammet och alla 32 Dunder-testgrupper är också körda med
+filsystemsprogrammet, enumprogrammet, standardbiblioteket och alla 44 Dunder-testgrupper är också körda med
 releasekompilatorn utan verktyg i PATH.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
@@ -172,10 +197,16 @@ binär och utdata får inte skriva över källan.
 ## Begränsningar och nästa steg
 
 Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
-Structfält och arrayelement är än så länge begränsade till i32/i64/f32/f64/bool/string/rune
-och enums utan payload. Arrayer och enumvärden får vara högst 64 KiB.
-Data-enums kan innehålla aggregat; nästlade structar och aggregat som arrayelement,
-arrayslices, allmänt allokerings-API och ägande/lån återstår.
+Stage 1 bygger skalära program men avvisar ännu importer och aggregat i
+sin indata. Nästa steg är funktionerna som krävs för att kompilera dess egen
+källkod och standardbibliotek; därefter stage 2/stage 3-verifiering.
+Rust-bootstrapen behålls som återställningsväg.
+Arrayelement är begränsade till primitiva skalärer och enums utan payload.
+Fasta arrayer och inline-aggregat får vara högst 64 KiB. Nästlade aggregat
+fungerar som structfält och enumpayloads. Arrayslices, generiskt allokerings-API
+och generell ägar-/lånekontroll återstår. Borrows är tills vidare begränsade
+till funktionsparametrar. Dynamiska arraybuffertar använder en separat
+512 MiB processarena och återvinns inte individuellt.
 Strängliteraler bor i programbilden. Dynamiska strängar bor i en separat
 16 MiB arena, som mappas vid första behov och återlämnas vid processlut.
 Enskilda strängar återvinns ännu inte under körning; upprepade operationer
@@ -191,7 +222,7 @@ Enums saknar ännu generics, likhet för data-enums, mönsterguards och generell
 `match` som uttryck. Direkt rekursiva inlinevärden kräver indirection;
 arena-dogfood använder indexhandtag. Se [enumreglerna](enums.md).
 sys riktar sig bara till macOS/ARM64. Textläsning kräver vanliga UTF-8-filer,
-högst 4 MiB per fil, och delar strängarenans 16 MiB. Binär-I/O, kataloglistning,
+högst 4 MiB per fil, och delar strängarenans 16 MiB. Binärläsning, kataloglistning,
 rekursiva katalogverktyg och filströmmar återstår. Se [sys-kontraktet](sys.md).
 Flyttal saknar än så länge fullständigt matematikbibliotek, trigonometriska
 funktioner, exp/log, strängparser och valbar utskriftsprecision. Den Dunder-skrivna
@@ -199,8 +230,18 @@ formatteraren prioriterar korrekthet; prestanda är inte uppmätt.
 Anonyma funktioner och closures med infångade lokaler återstår.
 Overflow/division med noll, gränsfel, assertions, full strängarena och ogiltiga
 Unicode-operationer ger definierad exitstatus;
-källpositioner och värden i runtimefel återstår. Backend använder stackplatser och
-saknar ännu optimeringar. Inga anspråk på 100k rader/s eller C-paritet.
+källpositioner och värden i runtimefel återstår. Backend använder stackplatser
+och saknar ännu registerallokering och avancerade optimeringar.
+[Byggmätningarna](../benchmarks/README.md) avser ett genererat stresskorpus;
+de bevisar inte hela 100k-rader/s-kontraktet eller C-paritet.
+
+Samlingstesterna jämför 6 000 operationer med oberoende Rust-map/set,
+inklusive Unicode/NUL, kollisioner, tombstones och uppdateringar. De provar
+elementbredder, djupa kopior, snapshots vid anrop, inbäddade aggregat och
+begränsade borrows. Nativeprogram över 1 MiB provar långa adresser/hopp;
+en 9 MiB-bild med flersidig signatur verifieras och körs av macOS.
+Den Dunder-skrivna kompilatorn jämförs med bootstrapen för 800 genererade
+uttryck samt kontrollflöde och felstatusar. macOS verifierar dess signaturer.
 
 Den gamla GLM-körningen stoppades efter kvotfelet. Dess ofärdiga fröarbete
 ligger kvar orört i `/Users/mikpe/dev/dunder-dogfood`.

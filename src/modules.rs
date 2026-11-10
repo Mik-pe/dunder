@@ -76,20 +76,23 @@ struct Loader {
     modules: Vec<check::Module>,
     types: syntax::Types,
     paths: HashMap<PathBuf, usize>,
-    sys: Option<usize>,
+    bundled: HashMap<String, usize>,
 }
 impl Loader {
-    fn standard_sys(&mut self) -> Result<usize, Error> {
-        if let Some(id) = self.sys {
-            return Ok(id);
+    fn standard(&mut self, name: &str) -> Result<usize, Error> {
+        if let Some(id) = self.bundled.get(name) {
+            return Ok(*id);
         }
         let id = self.sources.files.len();
-        self.sys = Some(id);
-        let text = include_str!("../stdlib/sys.ddr").to_owned();
+        self.bundled.insert(name.to_owned(), id);
+        let text = standard_source(name).unwrap().to_owned();
         let module =
             syntax::parse_module_at(&text, &mut self.types, id).map_err(|e| e.in_file(id))?;
         self.sources.files.push(Source {
-            path: PathBuf::from("<stdlib/sys.ddr>"),
+            path: PathBuf::from(format!(
+                "<stdlib/{}.ddr>",
+                name.strip_prefix("std/").unwrap_or(name)
+            )),
             text,
         });
         self.modules.push(check::Module {
@@ -97,8 +100,9 @@ impl Loader {
             imports: Vec::new(),
             records: module.records,
             enums: module.enums,
-            standard_sys: true,
+            standard_sys: name == "sys",
         });
+        self.imports(id, module.imports, None)?;
         Ok(id)
     }
     fn visit(&mut self, path: &Path, origin: Option<(usize, Span)>) -> Result<usize, Error> {
@@ -131,7 +135,16 @@ impl Loader {
             enums: module.enums,
             standard_sys: false,
         });
-        for import in module.imports {
+        self.imports(id, module.imports, path.parent())?;
+        Ok(id)
+    }
+    fn imports(
+        &mut self,
+        id: usize,
+        imports: Vec<syntax::Import>,
+        base: Option<&Path>,
+    ) -> Result<(), Error> {
+        for import in imports {
             let logical = Path::new(&import.path);
             if import.path.is_empty() || logical.is_absolute() || logical.file_name().is_none() {
                 return Err(Error::new(
@@ -149,10 +162,18 @@ impl Loader {
                 )
                 .in_file(id));
             }
-            let target = if import.path == "sys" {
-                self.standard_sys()?
+            let target = if standard_source(logical_name(&import.path)).is_some() {
+                self.standard(logical_name(&import.path))?
             } else {
-                let target_path = path.parent().unwrap().join(logical).with_extension("ddr");
+                let base = base.ok_or_else(|| {
+                    Error::new(
+                        "E0401",
+                        import.span,
+                        "bundled libraries may only import bundled modules",
+                    )
+                    .in_file(id)
+                })?;
+                let target_path = base.join(logical).with_extension("ddr");
                 self.visit(&target_path, Some((id, import.span)))?
             };
             self.modules[id].imports.push(check::Import {
@@ -161,7 +182,7 @@ impl Loader {
                 span: import.span,
             });
         }
-        Ok(id)
+        Ok(())
     }
 }
 
@@ -182,4 +203,26 @@ pub fn load(root: impl AsRef<Path>) -> Result<Loaded, Diagnostic> {
 
 pub fn check_path(root: impl AsRef<Path>) -> Result<Checked, Diagnostic> {
     load(root)?.check()
+}
+
+fn logical_name(name: &str) -> &str {
+    if name == "std/sys" {
+        "sys"
+    } else {
+        name
+    }
+}
+fn standard_source(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "sys" => include_str!("../stdlib/sys.ddr"),
+        "std/array" => include_str!("../stdlib/array.ddr"),
+        "std/map" => include_str!("../stdlib/map.ddr"),
+        "std/set" => include_str!("../stdlib/set.ddr"),
+        "std/hash" => include_str!("../stdlib/hash.ddr"),
+        "std/text" => include_str!("../stdlib/text.ddr"),
+        "std/bytes" => include_str!("../stdlib/bytes.ddr"),
+        "std/sha256" => include_str!("../stdlib/sha256.ddr"),
+        "std/parse" => include_str!("../stdlib/parse.ddr"),
+        _ => return None,
+    })
 }

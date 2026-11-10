@@ -134,7 +134,7 @@ fn attached_cases_and_struct_inputs_are_statically_checked() {
             "E0241",
         ),
         ("struct Point{x:i32,x:i64} @test fn ok(){}", "E0240"),
-        ("struct A{x:i32} struct B{a:A} @test fn ok(){}", "E0240"),
+        ("struct A{a:A} @test fn ok(){}", "E0240"),
         ("fn f(p:Unknown){} @test fn ok(){}", "E0103"),
     ] {
         let error = dunder::check_tests(source)
@@ -380,6 +380,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         ("numeric/main.ddr", "5.0\n2.0\ntrue\n"),
         ("filesystem.ddr", "18\nfilesystem ok\n"),
         ("enums.ddr", "42\nenums ok\n"),
+        ("standard.ddr", "4\n6\nstdlib ok\n"),
         ("collections.ddr", "-2\n-1\n0\n1\n13\n3\n"),
         ("utf8.ddr", "bytes=25\nrunes=20\nwords=5\n🌍 Hej världen\n"),
         (
@@ -403,7 +404,7 @@ fn real_dogfood_programs_compile_run_and_self_check() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("32 passed, 0 failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("44 passed, 0 failed"));
 }
 
 #[test]

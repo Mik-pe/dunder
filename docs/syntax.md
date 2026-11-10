@@ -42,6 +42,8 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `()` | Inget returvärde; implicit returtyp för funktioner utan `->`. |
 | `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
 | `[i32; 8]` | En array med åtta element; längden ingår i typen. |
+| `[]i64` | En dynamisk typad array. |
+| `&Point` / `&mut Point` | En läs-/skrivborrow som funktionsparameter; se [standardbiblioteket](standard.md). |
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
 | `Command` / `sys.ReadResult` | En nominell enum med namngivna värden eller payload-varianter. |
 | `range` | Ett halvöppet intervall med `i32`-gränser. |
@@ -291,8 +293,8 @@ Structar är nominella: olika deklarationer ger olika typer även med samma
 fält. Importerade typer behåller sin identitet över moduler och i callbacks.
 Alla fält måste anges exakt en gång; deras ordning i uttrycket är valfri.
 Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får vara
-`i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune` eller en enum utan payload;
-nästlade structar och arrayfält återstår.
+en skalär typ, ett funktionsvärde, en fast/dynamisk array, en struct eller
+en enum. Inline-cykler avvisas; referensfält är ännu inte tillåtna.
 
 En struct kopieras vid bindning, tilldelning och parameteröverföring.
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
@@ -492,7 +494,8 @@ kompilator, länkare, signerare eller strängruntime.
 
 ## Nästa språkbeslut
 
-Nästlade aggregat, arrayslices, allmänt allokerings-API,
-ägande/lån och egna iteratorer ska utvecklas genom riktiga program och
-feltester. Dogfood-arenan är tills vidare indexbaserad bump-allokering över
-en fast typad buffert. Självhosting är ett separat senare steg.
+Nästlade aggregat, dynamiska arrayer och begränsade funktionsborrows fungerar
+nu; se [standardbiblioteket](standard.md). Arrayslices, ett generellt
+allokerings-API, generell ägar-/lånekontroll och egna iteratorer återstår.
+Den äldre dogfood-arenan använder fortfarande indexhandtag över en fast
+typad buffert. [Självhosting](../selfhost/README.md) är påbörjad men inte uppnådd.
