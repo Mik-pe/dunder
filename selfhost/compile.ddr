@@ -32,7 +32,7 @@ struct Compiler {
     wasm_abi: wa.Abi, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports, libraries: []string, symbols: []string, unsafe_functions: []bool,
     current_owner: i32, opaque_owner: []i32, function_owners: []i32,
-    unsafe_capable: bool, unsafe_scope: bool, inline_place: bool, c_record: []bool, c_sizes: []i32, c_aligns: []i32,
+    unsafe_capable: bool, unsafe_scope: bool, inline_place: bool, direct_place: bool, c_record: []bool, c_sizes: []i32, c_aligns: []i32,
     ffi_types: []i32, ffi_params: []i32, callback_labels: []i32, has_callbacks: bool,
     type_names: []string, type_kinds: []i32, type_bases: []i32, type_starts: []i32, type_counts: []i32, type_clones: []i32, type_drops: []i32,
     field_names: []string, field_types: []i32, field_values: []i64, payload_starts: []i32, payload_counts: []i32, payload_types: []i32, address: i32, writable: bool, scratch_place: i32, loans: scratch.Loans, scratch_returns: []i32,
@@ -158,7 +158,25 @@ fn address_slot(c: &mut Compiler, index: i32) {
     }
     arm.imm(&mut c.code, 0, i64(index + 1) * 8); arm.emit(&mut c.code, 3405775776)
 }
-fn save_address(c: &mut Compiler) { c.inline_place = false; c.address = slot(&mut c); arm.store(&mut c.code, c.address, 0) }
+fn save_address(c: &mut Compiler) { c.inline_place = false; c.direct_place = false; c.address = slot(&mut c); arm.store(&mut c.code, c.address, 0) }
+// Locals already have stable frame storage. Materialize its address only when
+// a borrow, raw address or assignment actually needs it.
+fn place_address(c: &mut Compiler, index: i32, direct: bool) {
+    if direct { address_slot(&mut c, index) } else { arm.load(&mut c.code, index) }
+}
+fn load_local(c: &mut Compiler, index: i32, ty: i32) {
+    if index < 32 {
+        packed := storage_type(&c, ty)
+        var opcode: i64 = 4164943872 // LDUR X
+        if packed == 3 || packed == 8 { opcode = 943718400 } // LDURB
+        else if packed == 9 { opcode = 2017460224 } // LDURH
+        else if packed == 1 { opcode = 3095396352 } // LDURSW
+        else if packed == 5 || packed == 6 || packed == 10 { opcode = 3091202048 } // LDUR W
+        arm.emit(&mut c.code, opcode + i64(-(index + 1) * 8).bit_and(511) * 4096 + 928)
+    } else {
+        address_slot(&mut c, index); transfer_value(&mut c, ty, 0, 0, true)
+    }
+}
 fn owned(c: &Compiler, ty: i32) -> bool { ty == 4 || collection(&c, ty) || c.type_kinds[ty] == 2 || c.type_kinds[ty] == 7 }
 fn copy_value(c: &mut Compiler, ty: i32) {
     if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch values cannot escape the region");return}
@@ -919,7 +937,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         if c.address < 0 || (write && !c.writable) { fail(&mut c, "addr requires a matching stored place"); return 0 }
         if c.c_record[ty] { expect(&mut c, ")"); return 13 }
         if c.type_kinds[ty] == 6 { load_mem(&mut c, 0, 0, 0) }
-        else { arm.load(&mut c.code, c.address) }
+        else { place_address(&mut c, c.address, c.direct_place) }
         expect(&mut c, ")"); return 13
     }
     if name == "ptr" || name == "ffi_fn" || name == "ref_at" {
@@ -1247,7 +1265,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
             load_mem(&mut c, 0, 0, 0)
         } else if c.inline_place && c.type_kinds[ty] == 6 {
             backing := slot(&mut c); arm.store(&mut c.code,backing,0); address_slot(&mut c,backing)
-        } else { arm.load(&mut c.code, c.address) }; c.address = -1; c.writable = false
+        } else { place_address(&mut c, c.address, c.direct_place) }; c.address = -1; c.writable = false
         return compound(&mut c, kind, ty)
     }
     if eat(&mut c, "-") {
@@ -1369,7 +1387,10 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
                 save_address(&mut c); c.inline_place = true; inline_value(&mut c, ty); return ty
             }
         }
-        else { address_slot(&mut c, c.local_slots[found]) }
+        else {
+            c.inline_place = false; c.direct_place = true; c.address = c.local_slots[found]
+            load_local(&mut c, c.address, ty); return ty
+        }
         save_address(&mut c); transfer_value(&mut c, ty, 0, 0, true); return ty
     }
     fail(&mut c, "expected expression"); 0
@@ -1550,6 +1571,26 @@ fn float_context(c: &Compiler, expected: i32) -> i32 {
     if decimal_seen { return 7 }
     expected
 }
+// A single scalar operand emits no calls and cannot overwrite x1. Keep the
+// left value there instead of spilling it across the right-hand evaluation.
+// Postfixes and tighter operators take the general path, preserving order.
+fn register_rhs(c: &Compiler, priority: i32) -> bool {
+    var last := c.cursor
+    kind := c.tokens.kinds[last]
+    if kind == .Name {
+        found := local(&c, c.tokens.texts[last])
+        if found < 0 { return false }
+        ty := c.local_types[found]
+        if !scalar_element(&c, ty) || ty == 4 { return false }
+    } else if kind != .Integer && kind != .Float {
+        if !is(&c, "true") && !is(&c, "false") { return false }
+    }
+    last = last + 1
+    if last >= c.tokens.kinds.len { return false }
+    next := c.tokens.texts[last]
+    if next == "." || next == "[" || next == "(" { return false }
+    precedence(next) <= priority
+}
 fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
@@ -1566,9 +1607,10 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
             right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
         } else {
             if ty == 4 { copy_value(&mut c, ty); saved_left := temporary(&mut c, ty) }
-            arm.push(&mut c.code, 0)
+            in_register := ty != 4 && register_rhs(&c, priority)
+            if in_register { arm.mov(&mut c.code, 1, 0) } else { arm.push(&mut c.code, 0) }
             right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
-            arm.pop(&mut c.code, 1)
+            if !in_register { arm.pop(&mut c.code, 1) }
             result := binary(&mut c, operator, ty); ty = temporary(&mut c, result); c.address = -1; c.writable = false
         }
     }
@@ -1814,10 +1856,10 @@ fn statement(c: &mut Compiler) -> bool {
         head := arm.label(&mut c.code); next := arm.label(&mut c.code); done := arm.label(&mut c.code)
         enter(&mut c)
         if array { bind(&mut c, name, base, false, binding, name_at) } else { bind(&mut c, name, 1, false, cursor, name_at) }
-        arm.mark(&mut c.code, head); arm.load(&mut c.code, cursor); arm.push(&mut c.code, 0); arm.load(&mut c.code, limit); arm.pop(&mut c.code, 1)
+        arm.mark(&mut c.code, head); arm.load(&mut c.code, cursor); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, limit)
         arm.emit(&mut c.code, 3942645823); arm.branch(&mut c.code, done, 12)
         if array {
-            arm.load(&mut c.code, values); load_mem(&mut c, 0, 0, 0); arm.push(&mut c.code, 0); arm.load(&mut c.code, cursor); arm.pop(&mut c.code, 1)
+            arm.load(&mut c.code, values); load_mem(&mut c, 0, 0, 0); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, cursor)
             shift := unsigned.shift(storage_type(&c, base))
             arm.emit(&mut c.code, 2332033056 + i64(shift) * 1024); transfer_value(&mut c, base, 0, 0, true); copy_value(&mut c, base); if owned(&c, base) { save_owner(&mut c, binding, base, false) } else { arm.store(&mut c.code, binding, 0) }
         }
@@ -1856,7 +1898,7 @@ fn statement(c: &mut Compiler) -> bool {
     ty := expression(&mut c, 0, c.ret_type)
     assignment := c.cursor
     if eat(&mut c, "=") {
-        var destination := c.address; writable := c.writable; packed := c.inline_place; scratch_target:=c.scratch_place
+        var destination := c.address; var direct := c.direct_place; writable := c.writable; packed := c.inline_place; scratch_target:=c.scratch_place
         if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch bindings cannot be reassigned");return false}
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
         effects := c.mutations.len; value := expression(&mut c, 0, ty); same(&mut c, ty, value)
@@ -1867,7 +1909,7 @@ fn statement(c: &mut Compiler) -> bool {
             // A call on the right can replace a heap-backed record. Resolve the
             // pure field chain again so the write lands in its current storage.
             end := c.cursor; arm.push(&mut c.code, 0); c.cursor = first_token
-            checked := expression(&mut c, 0, ty); destination = c.address
+            checked := expression(&mut c, 0, ty); destination = c.address; direct = c.direct_place
             c.cursor = end; arm.pop(&mut c.code, 0)
         }
         if scratch_target==1 && !c.c_record[ty] {
@@ -1882,9 +1924,14 @@ fn statement(c: &mut Compiler) -> bool {
             store_inline(&mut c,ty); end_statement(&mut c); return false
         }
         copy_value(&mut c, ty)
+        if !owned(&c, ty) {
+            if direct { arm.store(&mut c.code, destination, 0) }
+            else { arm.mov(&mut c.code, 1, 0); place_address(&mut c, destination, false); transfer_value(&mut c, ty, 1, 0, false) }
+            end_statement(&mut c); return false
+        }
         arm.push(&mut c.code, 0)
-        if owned(&c, ty) { arm.load(&mut c.code, destination); load_mem(&mut c, 0, 0, 0); drop_value(&mut c, ty) }
-        arm.load(&mut c.code, destination); arm.pop(&mut c.code, 1); transfer_value(&mut c, ty, 1, 0, false)
+        if owned(&c, ty) { place_address(&mut c, destination, direct); load_mem(&mut c, 0, 0, 0); drop_value(&mut c, ty) }
+        place_address(&mut c, destination, direct); arm.pop(&mut c.code, 1); transfer_value(&mut c, ty, 1, 0, false)
         end_statement(&mut c); return false
     }
     if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); copy_value(&mut c, ty); arm.branch(&mut c.code, c.cleanup, 0); return true }
@@ -2005,7 +2052,7 @@ pub fn compile_cached(tokens: &mut lexer.Tokens, platform: i32, module_starts: &
         test_functions: [], testing: false, mutations: [], postfix_stop: -1,
         validating_dead: false, report: report, source_end: source_end, bindings: bindings(), param_tokens: [],
         functions: map.new(), names: [], starts: [], ends: [], returns: [], param_starts: [], param_counts: [], param_names: [], param_types: [],
-        wasm_abi: wa.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, opaque_owner: [], function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [], callback_labels: [], has_callbacks: false,
+        wasm_abi: wa.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, opaque_owner: [], function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, direct_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [], callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], type_drops: [], field_names: [], field_types: [], field_values: [], payload_starts: [], payload_counts: [], payload_types: [], address: -1, writable: false, scratch_place: 0, loans: scratch.loans(), scratch_returns: [],
         fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
         loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,

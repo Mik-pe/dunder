@@ -1,5 +1,11 @@
 # Runtime före och efter optimering
 
+För den aktuella självhostade kompilatorn används nu
+[`tools/performance.py`](../../tools/performance.py).
+[Aktuella resultat och reproduktion](../2026-11-10-selfhost-performance/README.md)
+omfattar samma fyra arbetsfall, en kontrollerad C-referens och kompletta
+byggen. Rapporterna nedan bevarar tidigare kompilatorrevisioners resultat.
+
 Historisk rapport. Kommandon och verktygssökvägar i rapporten avser [deb48dd](https://github.com/Mik-pe/dunder/tree/deb48dd).
 
 `tools/runtime-bench.rs` jämför två Dunder-kompilatorer med samma frysta

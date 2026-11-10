@@ -1,5 +1,11 @@
 # Så mäter vi Dunder
 
+Den aktuella självhosten har en [gemensam runtime- och byggmätning](../benchmarks/2026-11-10-selfhost-performance/README.md)
+med 30 försök per variant och arbetsfall, råtider, kontrollerade resultat
+och reproducerbart mätverktyg. Den omfattar också ett verkligt självbygge.
+Runtime är fortfarande långsammare än den optimerade C-referensen;
+acceptansgränserna nedan är fortsatt mål.
+
 Den lokala [runtime-sviten](../benchmarks/runtime/README.md) jämför nu
 baseline och optimerad maskinkod med fyra frysta arbetsfall, oberoende
 resultatreferenser och 30 växelvisa körningar. Den är ett avgränsat
