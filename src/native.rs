@@ -1,0 +1,659 @@
+//! Direct typed-tree to AArch64 emission, Mach-O layout and ad hoc signing.
+//! No assembler, linker, interpreter or external signer is invoked.
+use crate::{
+    check::{Expr, ExprKind, Program, Stmt},
+    syntax::Type,
+};
+
+type Label = usize;
+enum Branch {
+    Jump,
+    Call,
+    Cond(u32),
+    Zero(u32),
+    Nonzero(u32),
+}
+struct Code {
+    words: Vec<u32>,
+    labels: Vec<Option<usize>>,
+    fixups: Vec<(usize, Label, Branch)>,
+    functions: Vec<Label>,
+    print_int: Label,
+    print_bool: Label,
+    write: Label,
+    overflow: Label,
+    divide_zero: Label,
+    io_error: Label,
+    loops: Vec<(Label, Label)>,
+}
+impl Code {
+    fn new(functions: usize) -> Self {
+        let mut c = Self {
+            words: Vec::new(),
+            labels: Vec::new(),
+            fixups: Vec::new(),
+            functions: Vec::new(),
+            print_int: 0,
+            print_bool: 0,
+            write: 0,
+            overflow: 0,
+            divide_zero: 0,
+            io_error: 0,
+            loops: Vec::new(),
+        };
+        c.functions = (0..functions).map(|_| c.label()).collect();
+        c.print_int = c.label();
+        c.print_bool = c.label();
+        c.write = c.label();
+        c.overflow = c.label();
+        c.divide_zero = c.label();
+        c.io_error = c.label();
+        c
+    }
+    fn label(&mut self) -> Label {
+        self.labels.push(None);
+        self.labels.len() - 1
+    }
+    fn mark(&mut self, l: Label) {
+        assert!(self.labels[l].is_none());
+        self.labels[l] = Some(self.words.len());
+    }
+    fn emit(&mut self, word: u32) {
+        self.words.push(word);
+    }
+    fn branch(&mut self, label: Label, kind: Branch) {
+        self.fixups.push((self.words.len(), label, kind));
+        self.emit(0);
+    }
+    fn mov(&mut self, dst: u32, src: u32) {
+        self.emit(0xaa0003e0 | src << 16 | dst);
+    }
+    fn imm(&mut self, reg: u32, value: u64) {
+        self.emit(0xd2800000 | ((value as u32 & 0xffff) << 5) | reg);
+        for part in 1..4 {
+            let bits = ((value >> (part * 16)) & 0xffff) as u32;
+            if bits != 0 {
+                self.emit(0xf2800000 | part << 21 | bits << 5 | reg);
+            }
+        }
+    }
+    fn cmp(&mut self, a: u32, b: u32) {
+        self.emit(0xeb00001f | b << 16 | a << 5);
+    }
+    fn push(&mut self, reg: u32) {
+        self.emit(0xa9bf7fe0 | reg);
+    } // stp reg,xzr,[sp,#-16]!
+    fn pop(&mut self, reg: u32) {
+        self.emit(0xa8c17fe0 | reg);
+    }
+    fn local_addr(&mut self, slot: usize) {
+        self.imm(9, (slot as u64 + 1) * 8);
+        self.emit(0xcb0903a9);
+    } // sub x9,x29,x9
+    fn store(&mut self, slot: usize, reg: u32) {
+        self.local_addr(slot);
+        self.emit(0xf9000120 | reg);
+    }
+    fn load(&mut self, slot: usize) {
+        self.local_addr(slot);
+        self.emit(0xf9400120);
+    }
+    fn prologue(&mut self, size: usize) {
+        self.emit(0xa9bf7bfd);
+        self.emit(0x910003fd);
+        let mut left = (size + 15) & !15;
+        while left > 0 {
+            let part = left.min(4080);
+            self.emit(0xd10003ff | (part as u32) << 10);
+            left -= part;
+        }
+    }
+    fn epilogue(&mut self) {
+        self.emit(0x910003bf);
+        self.emit(0xa8c17bfd);
+        self.emit(0xd65f03c0);
+    }
+    fn narrow(&mut self) {
+        self.emit(0x93407c02);
+        self.cmp(0, 2);
+        self.branch(self.overflow, Branch::Cond(1));
+    }
+    fn expr(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::Number(n) => self.imm(0, *n as u64),
+            ExprKind::Bool(b) => self.imm(0, u64::from(*b)),
+            ExprKind::Local(s) => self.load(*s),
+            ExprKind::Call(f, args) => {
+                for arg in args {
+                    self.expr(arg);
+                    self.push(0);
+                }
+                for reg in (0..args.len()).rev() {
+                    self.pop(reg as u32);
+                }
+                self.branch(self.functions[*f], Branch::Call);
+            }
+            ExprKind::Print(x) => {
+                self.expr(x);
+                self.branch(
+                    if x.ty == Type::Bool {
+                        self.print_bool
+                    } else {
+                        self.print_int
+                    },
+                    Branch::Call,
+                );
+                self.imm(0, 0);
+            }
+            ExprKind::Cast(x) => {
+                self.expr(x);
+                if e.ty == Type::I32 && x.ty == Type::I64 {
+                    self.narrow();
+                }
+            }
+            ExprKind::Unary(op, x) => {
+                self.expr(x);
+                if *op == "!" {
+                    self.imm(1, 1);
+                    self.emit(0xca010000);
+                } else {
+                    self.emit(if e.ty == Type::I32 {
+                        0x6b0003e0
+                    } else {
+                        0xeb0003e0
+                    });
+                    self.branch(self.overflow, Branch::Cond(6));
+                    if e.ty == Type::I32 {
+                        self.emit(0x93407c00);
+                    }
+                }
+            }
+            ExprKind::Binary(op, a, b) if matches!(*op, "&&" | "||") => {
+                let end = self.label();
+                self.expr(a);
+                self.branch(
+                    end,
+                    if *op == "&&" {
+                        Branch::Zero(0)
+                    } else {
+                        Branch::Nonzero(0)
+                    },
+                );
+                self.expr(b);
+                self.mark(end);
+            }
+            ExprKind::Binary(op, a, b) => {
+                self.expr(a);
+                self.push(0);
+                self.expr(b);
+                self.pop(1);
+                match *op {
+                    "+" | "-" => {
+                        let word = match (*op, e.ty) {
+                            ("+", Type::I32) => 0x2b000020,
+                            ("-", Type::I32) => 0x6b000020,
+                            ("+", _) => 0xab000020,
+                            _ => 0xeb000020,
+                        };
+                        self.emit(word);
+                        self.branch(self.overflow, Branch::Cond(6));
+                        if e.ty == Type::I32 {
+                            self.emit(0x93407c00);
+                        }
+                    }
+                    "*" => {
+                        if e.ty == Type::I64 {
+                            self.emit(0x9b407c22);
+                        } // smulh x2,x1,x0
+                        self.emit(0x9b007c20);
+                        if e.ty == Type::I32 {
+                            self.narrow();
+                        } else {
+                            self.emit(0x937ffc03);
+                            self.cmp(2, 3);
+                            self.branch(self.overflow, Branch::Cond(1));
+                        }
+                    }
+                    "/" | "%" => {
+                        self.branch(self.divide_zero, Branch::Zero(0));
+                        let valid = self.label();
+                        self.imm(
+                            2,
+                            if e.ty == Type::I32 {
+                                i32::MIN as i64 as u64
+                            } else {
+                                i64::MIN as u64
+                            },
+                        );
+                        self.cmp(1, 2);
+                        self.branch(valid, Branch::Cond(1));
+                        self.imm(2, u64::MAX);
+                        self.cmp(0, 2);
+                        self.branch(self.overflow, Branch::Cond(0));
+                        self.mark(valid);
+                        self.emit(0x9ac00c22); // sdiv x2,x1,x0
+                        if *op == "/" {
+                            self.mov(0, 2);
+                        } else {
+                            self.emit(0x9b008440);
+                        } // msub x0,x2,x0,x1
+                    }
+                    _ => {
+                        self.cmp(1, 0);
+                        let condition = match *op {
+                            "==" => 0,
+                            "!=" => 1,
+                            "<" => 11,
+                            "<=" => 13,
+                            ">" => 12,
+                            ">=" => 10,
+                            _ => unreachable!(),
+                        };
+                        self.emit(0x9a9f07e0 | (condition ^ 1) << 12);
+                    }
+                }
+            }
+        }
+    }
+    fn stmts(&mut self, body: &[Stmt]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Store(slot, e) => {
+                    self.expr(e);
+                    self.store(*slot, 0);
+                }
+                Stmt::Return(e) => {
+                    if let Some(e) = e {
+                        self.expr(e);
+                    } else {
+                        self.imm(0, 0);
+                    }
+                    self.epilogue();
+                }
+                Stmt::Expr(e) => self.expr(e),
+                Stmt::Block(b) => self.stmts(b),
+                Stmt::If(c, yes, no) => {
+                    let other = self.label();
+                    let end = self.label();
+                    self.expr(c);
+                    self.branch(other, Branch::Zero(0));
+                    self.stmts(yes);
+                    self.branch(end, Branch::Jump);
+                    self.mark(other);
+                    self.stmts(no);
+                    self.mark(end);
+                }
+                Stmt::While(c, b) => {
+                    let head = self.label();
+                    let end = self.label();
+                    self.loops.push((head, end));
+                    self.mark(head);
+                    self.expr(c);
+                    self.branch(end, Branch::Zero(0));
+                    self.stmts(b);
+                    self.branch(head, Branch::Jump);
+                    self.mark(end);
+                    self.loops.pop();
+                }
+                Stmt::Break => self.branch(self.loops.last().unwrap().1, Branch::Jump),
+                Stmt::Continue => self.branch(self.loops.last().unwrap().0, Branch::Jump),
+            }
+        }
+    }
+    fn runtime(&mut self) {
+        self.mark(self.print_int);
+        self.prologue(64);
+        self.emit(0x9100ffe1); // add x1,sp,#63
+        self.imm(9, 10);
+        self.emit(0x39000029);
+        self.imm(2, 1);
+        self.mov(3, 0);
+        self.imm(4, 10);
+        self.imm(7, 0);
+        self.cmp(3, 31);
+        let magnitude = self.label();
+        self.branch(magnitude, Branch::Cond(10));
+        self.imm(7, 1);
+        self.emit(0xcb0303e3); // unsigned magnitude, including i64::MIN
+        self.mark(magnitude);
+        let digit = self.label();
+        self.mark(digit);
+        self.emit(0x9ac40865); // udiv x5,x3,x4
+        self.emit(0x9b048ca6); // msub x6,x5,x4,x3
+        self.emit(0x1100c0c6); // add w6,w6,#48
+        self.emit(0xd1000421);
+        self.emit(0x39000026);
+        self.emit(0x91000442);
+        self.mov(3, 5);
+        self.branch(digit, Branch::Nonzero(3));
+        let signed = self.label();
+        self.branch(signed, Branch::Zero(7));
+        self.emit(0xd1000421);
+        self.imm(9, 45);
+        self.emit(0x39000029);
+        self.emit(0x91000442);
+        self.mark(signed);
+        self.branch(self.write, Branch::Call);
+        self.epilogue();
+
+        self.mark(self.print_bool);
+        self.prologue(16);
+        let falsity = self.label();
+        let output = self.label();
+        self.branch(falsity, Branch::Zero(0));
+        self.imm(9, u64::from_le_bytes(*b"true\n\0\0\0"));
+        self.imm(2, 5);
+        self.branch(output, Branch::Jump);
+        self.mark(falsity);
+        self.imm(9, u64::from_le_bytes(*b"false\n\0\0"));
+        self.imm(2, 6);
+        self.mark(output);
+        self.emit(0xf90003e9);
+        self.emit(0x910003e1);
+        self.branch(self.write, Branch::Call);
+        self.epilogue();
+
+        self.mark(self.write);
+        let again = self.label();
+        self.mark(again);
+        self.imm(0, 1);
+        self.imm(16, 0x2000004);
+        self.emit(0xd4001001);
+        self.branch(self.io_error, Branch::Cond(2));
+        self.branch(self.io_error, Branch::Zero(0));
+        self.emit(0xcb000042);
+        self.emit(0x8b000021);
+        self.branch(again, Branch::Nonzero(2));
+        self.emit(0xd65f03c0);
+        for (label, status) in [
+            (self.overflow, 101),
+            (self.divide_zero, 102),
+            (self.io_error, 74),
+        ] {
+            self.mark(label);
+            self.imm(0, status);
+            self.imm(16, 0x2000001);
+            self.emit(0xd4001001);
+            self.emit(0xd4200000);
+        }
+    }
+    fn finish(mut self) -> Result<Vec<u8>, String> {
+        for (at, label, kind) in self.fixups {
+            let to = self.labels[label].ok_or("unresolved function or branch")?;
+            let delta = to as i64 - at as i64;
+            let (base, bits) = match kind {
+                Branch::Jump => (0x14000000, 26),
+                Branch::Call => (0x94000000, 26),
+                Branch::Cond(c) => (0x54000000 | c, 19),
+                Branch::Zero(r) => (0xb4000000 | r, 19),
+                Branch::Nonzero(r) => (0xb5000000 | r, 19),
+            };
+            if delta < -(1i64 << (bits - 1)) || delta >= 1i64 << (bits - 1) {
+                return Err("program exceeds the first backend's branch range".into());
+            }
+            let imm = (delta as u32) & ((1 << bits) - 1);
+            self.words[at] = base | if bits == 26 { imm } else { imm << 5 };
+        }
+        Ok(self.words.iter().flat_map(|w| w.to_le_bytes()).collect())
+    }
+}
+
+pub fn compile(program: &Program) -> Result<Vec<u8>, String> {
+    let mut code = Code::new(program.functions.len());
+    code.branch(code.functions[program.main], Branch::Call);
+    code.imm(16, 0x2000001);
+    code.emit(0xd4001001);
+    code.emit(0xd4200000);
+    for (i, f) in program.functions.iter().enumerate() {
+        code.mark(code.functions[i]);
+        code.prologue(f.slots * 8);
+        for param in 0..f.params {
+            code.store(param, param as u32);
+        }
+        code.stmts(&f.body);
+        code.imm(0, 0);
+        code.epilogue();
+    }
+    code.runtime();
+    Ok(macho(&code.finish()?))
+}
+
+fn align(n: usize, to: usize) -> usize {
+    (n + to - 1) & !(to - 1)
+}
+fn u32le(v: &mut Vec<u8>, n: u32) {
+    v.extend(n.to_le_bytes());
+}
+fn u64le(v: &mut Vec<u8>, n: u64) {
+    v.extend(n.to_le_bytes());
+}
+fn name(v: &mut Vec<u8>, s: &str) {
+    let mut b = [0u8; 16];
+    b[..s.len()].copy_from_slice(s.as_bytes());
+    v.extend(b);
+}
+fn segment(
+    v: &mut Vec<u8>,
+    n: &str,
+    mapping: [u64; 4], // vmaddr, vmsize, fileoff, filesize
+    prot: u32,
+    sections: u32,
+) {
+    u32le(v, 0x19);
+    u32le(v, 72 + 80 * sections);
+    name(v, n);
+    for n in mapping {
+        u64le(v, n);
+    }
+    for n in [prot, prot, sections, 0] {
+        u32le(v, n);
+    }
+}
+fn be32(v: &mut [u8], at: usize, n: u32) {
+    v[at..at + 4].copy_from_slice(&n.to_be_bytes());
+}
+fn be64(v: &mut [u8], at: usize, n: u64) {
+    v[at..at + 8].copy_from_slice(&n.to_be_bytes());
+}
+
+fn macho(text: &[u8]) -> Vec<u8> {
+    const PAGE: usize = 16384;
+    const VM: u64 = 0x100000000;
+    const COMMANDS: usize = 392;
+    let text_off = align(32 + COMMANDS, 16);
+    let text_end = text_off + text.len();
+    let sig_off = align(text_end, PAGE);
+    let slots = sig_off / PAGE;
+    let ident = b"dunder\0";
+    let hash_off = 0x58 + ident.len();
+    let cd_len = hash_off + slots * 32;
+    let sig_size = align(20 + cd_len, 16);
+    let mut image = Vec::new();
+    for n in [
+        0xfeedfacf,
+        0x0100000c,
+        0,
+        2,
+        7,
+        COMMANDS as u32,
+        0x00200005,
+        0,
+    ] {
+        u32le(&mut image, n);
+    }
+    segment(&mut image, "__PAGEZERO", [0, VM, 0, 0], 0, 0);
+    segment(
+        &mut image,
+        "__TEXT",
+        [VM, sig_off as u64, 0, text_end as u64],
+        5,
+        1,
+    );
+    name(&mut image, "__text");
+    name(&mut image, "__TEXT");
+    u64le(&mut image, VM + text_off as u64);
+    u64le(&mut image, text.len() as u64);
+    for n in [text_off as u32, 4, 0, 0, 0x80000400, 0, 0, 0] {
+        u32le(&mut image, n);
+    }
+    segment(
+        &mut image,
+        "__LINKEDIT",
+        [
+            VM + sig_off as u64,
+            PAGE as u64,
+            sig_off as u64,
+            sig_size as u64,
+        ],
+        1,
+        0,
+    );
+    for n in [0x32, 24, 1, 0xb0000, 0xb0000, 0] {
+        u32le(&mut image, n);
+    }
+    for n in [0xe, 32, 12] {
+        u32le(&mut image, n);
+    }
+    let mut dyld = [0u8; 20];
+    dyld[..13].copy_from_slice(b"/usr/lib/dyld");
+    image.extend(dyld);
+    u32le(&mut image, 0x80000028);
+    u32le(&mut image, 24);
+    u64le(&mut image, text_off as u64);
+    u64le(&mut image, 0);
+    for n in [0x1d, 16, sig_off as u32, sig_size as u32] {
+        u32le(&mut image, n);
+    }
+    assert_eq!(image.len(), 32 + COMMANDS);
+    image.resize(text_off, 0);
+    image.extend(text);
+    image.resize(sig_off, 0);
+    let mut cd = vec![0u8; cd_len];
+    for (at, n) in [
+        (0, 0xfade0c02),
+        (4, cd_len as u32),
+        (8, 0x20400),
+        (12, 2),
+        (16, hash_off as u32),
+        (20, 0x58),
+        (28, slots as u32),
+        (32, sig_off as u32),
+    ] {
+        be32(&mut cd, at, n);
+    }
+    cd[36] = 32;
+    cd[37] = 2;
+    cd[39] = 14;
+    be64(&mut cd, 64, 0);
+    be64(&mut cd, 72, sig_off as u64);
+    be64(&mut cd, 80, 1);
+    cd[0x58..hash_off].copy_from_slice(ident);
+    for i in 0..slots {
+        cd[hash_off + i * 32..hash_off + (i + 1) * 32]
+            .copy_from_slice(&sha256(&image[i * PAGE..(i + 1) * PAGE]));
+    }
+    let mut sig = vec![0u8; 20];
+    for (at, n) in [
+        (0, 0xfade0cc0),
+        (4, sig_size as u32),
+        (8, 1),
+        (12, 0),
+        (16, 20),
+    ] {
+        be32(&mut sig, at, n);
+    }
+    sig.extend(cd);
+    sig.resize(sig_size, 0);
+    image.extend(sig);
+    image
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend((data.len() as u64 * 8).to_be_bytes());
+    for block in padded.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let a = w[i - 15];
+            let b = w[i - 2];
+            let s0 = a.rotate_right(7) ^ a.rotate_right(18) ^ (a >> 3);
+            let s1 = b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add((e & f) ^ (!e & g))
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let t2 = s0.wrapping_add((a & b) ^ (a & c) ^ (b & c));
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (s, v) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *s = s.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, s) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn signing_hash_matches_published_vectors() {
+        let hex = |s: &[u8]| {
+            sha256(s)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}

@@ -1,5 +1,12 @@
 # Dunders första arkitektur
 
+**Lägesändring 2026-11-10:** användaren prioriterade det riktiga typade
+källspråket före fortsatt fröarbete. Den första Rust-bootstrapkompilatorn
+och dess native backend är implementerade; se [syntaxen](syntax.md) och
+[aktuell status](status.md). Stegordningen med ett självassemblerande frö
+nedan beskriver den ursprungliga långsiktiga planen. Den blockerar inte
+språkutvecklingen. Den implementerade syntaxen är nu ett första arbetsbeslut.
+
 **Designförslag 0.1.** Grundkraven är ARM64-maskinkod, en egen verktygskedja, minnessäkerhet utan GC, snabb optimerad kompilering och självhosting. Nedan finns de arbetsbeslut vi behöver för att kunna bygga och pröva dem. Syntax och nyckelord får vänta.
 
 ## Språkets kostnadsmodell
