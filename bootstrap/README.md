@@ -18,9 +18,12 @@ byggen blir byteidentiska. Först därefter publiceras kompilatorn med atomiskt
 namnbyte i `build/selfhost/<värdmål>/dunder`.
 
 Fröna för `arm64-macos`, `arm64-linux` och `x86_64-linux` kommer från
-källrevision `3077660`. Rust-bootstrapen byggde först respektive
-`selfhost/main.ddr`, `selfhost/linux.ddr` och `selfhost/x86_linux.ddr`.
-Den kompilatorn byggde stage 2, som byggde stage 3 från samma källor.
+källrevision `1c15f7f`. För varje mål byggde föregående frö från
+`5ba3d4d` den nya kompilatorn från respektive `selfhost/main.ddr`,
+`selfhost/linux.ddr` och `selfhost/x86_linux.ddr`. Resultatet byggde
+samma källor igen. De nya fröna bäddar in standardmodulerna från
+[modullistan](../stdlib/modules.txt). Grafikexemplen läser sina egna
+moduler genom filimporter.
 Stage 2 och stage 3 var byteidentiska per mål. Stage 3 byggde och körde
 alla 59 grupperna i `dogfood/tests.ddr` på varje värdmål. Linux/x86-64
 kördes med QEMU i Docker på ARM64. Filerna är komprimerade med `gzip -9 -n`.
