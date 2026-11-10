@@ -1,114 +1,115 @@
-# Kompilatordelar skrivna i Dunder
+# Dunder i Dunder
 
-**Dunder är ännu inte självhostat.** Här finns en körbar Dunder-skriven
-kompilator för en kontrollerad skalär delmängd. Den bygger riktiga
-ARM64/macOS-program med egen lexer, parser, typkontroll, kodgenerering,
-Mach-O-skrivning och SHA-256-signering. Den delegerar inte till Rust,
-GCC, LLVM, assembler, länkare eller extern signerare.
+**Dunder-kompilatorn kan nu bygga sig själv för ARM64/Linux.** Stage 1
+bygger stage 2 från dessa källfiler; stage 2 bygger en byteidentisk stage 3.
+Stage 3 bygger dessutom fristående program som körs och jämförs med
+oberoende förväntade resultat. Hela kedjan är verifierad på Linux/x86-64
+med QEMU för ARM64-körning.
+
+Lexer, modulladdare, parser, typkontroll, kodgenerering, runtime och
+ELF-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
+assembler eller länkare. QEMU används bara för att köra ARM64-binärer
+på en annan processor.
+
+## Byggkedjan
+
+Kör från repositoryts rot. På ARM64/Linux kan stage 2 och stage 3 köras
+direkt; på andra processorer behövs `qemu-aarch64` för dessa steg.
 
 ```sh
-# Körning av de genererade programmen och codesign kräver ARM64/macOS.
-# Rust-bootstrapen bygger en kompilator vars källkod är Dunder.
-cargo run --release -- build selfhost/main.ddr -o build/dunder-ddr
+# Stage 0: den befintliga Rust-bootstrapen.
+cargo build --release
 
-# Den binären bygger andra Dunder-program på egen hand.
-PATH=/no-external-tools ./build/dunder-ddr build examples/hello.ddr -o build/hello-ddr
-./build/hello-ddr
+# Stage 1: Dunder-källor, kompilerade till värddatorns nativeformat.
+target/release/dunder build selfhost/linux.ddr -o build/stage1
+
+# Stage 2: samma Dunder-källor, kompilerade av stage 1 till ARM64/Linux.
+PATH=/no-external-tools build/stage1 build selfhost/linux.ddr -o build/stage2
+
+# Stage 3: samma källor igen, nu kompilerade av stage 2.
+qemu-aarch64 build/stage2 build selfhost/linux.ddr -o build/stage3
+cmp build/stage2 build/stage3
+
+# Den självbyggda kompilatorn bygger ett annat program.
+qemu-aarch64 build/stage3 build examples/hello.ddr -o build/hello-selfhost
+qemu-aarch64 build/hello-selfhost
 # 42
 # true
-
-PATH=/no-external-tools ./build/dunder-ddr build examples/fibonacci.ddr -o build/fibonacci-ddr
-./build/fibonacci-ddr
-# 6765
-# true
-
-# Oberoende kontroll; codesign används inte i byggvägen.
-codesign --verify --strict build/fibonacci-ddr
 ```
 
-## Hur bootstrap fungerar
+`selfhost/linux.ddr` skriver alltid ARM64/Linux, oberoende av stage 1:s
+värdplattform. Den äldre ingången `selfhost/main.ddr` finns kvar för den
+skalära ARM64/macOS-byggvägen. Självbyggd macOS- och x86-64-kodgenerering
+återstår; Rust-bootstrapen stöder redan alla tre målen.
 
-En körbar kompilator kan läsa sin egen källkod och skriva en ny binär.
-Den första binären måste redan finnas när kedjan startar:
+## Vad kompilatorn klarar
 
-1. Bygg Rust-bootstrapkompilatorn, stage 0.
-2. Låt stage 0 kompilera den Dunder-skrivna kompilatorn till stage 1.
-3. Låt stage 1 kompilera samma kompilatorkällkod till stage 2.
-4. Kör tester och låt stage 2 bygga stage 3. För ett deterministiskt bygge
-   ska stage 2 och stage 3 vara byteidentiska och ge samma resultat i testerna.
+Självbygget använder punktimporter, alias, privata/exporterade symboler,
+cykliska modulgrafer, structar med djup värdekopiering, fält och lån,
+dynamiska arrayer, enkla enums, UTF-8-strängar, strängsnitt och iteration.
+Funktioner stöder framåtanrop, rekursion, aggregatreturer och fler än åtta
+parametrar. Heltalsaritmetik, bitoperationer, kontrollflöde, `print`,
+`assert` och de systemanrop som behövs för kompilatorns filhantering ingår.
 
-Vi har nått steg 2 och verifierat att stage 1 bygger andra program.
-**Steg 3 misslyckas fortfarande vid kompilatorns importer.** Prototypen
-stöder ännu inte alla funktioner som dess egen källkod och standardbibliotek
-använder. Testerna kontrollerar också denna gräns; ingen fallback döljer den.
-
-## Återställning om en kompilatorbinär försvinner
-
-Behåll Rust-bootstrapens versionsmärkta källkod även när självhosting finns.
-Med Rust-verktygskedjan installerad kan binärerna byggas från en ren checkout:
+Standardbibliotekets källor är inbäddade i `bundled.ddr`. Efter ändringar
+i `stdlib/*.ddr`, regenerera med Dunder själv:
 
 ```sh
-git clone --branch main https://github.com/Mik-pe/dunder.git
-cd dunder
-cargo build --release
-cargo run --release -- build selfhost/main.ddr -o build/dunder-ddr
-cargo test
+target/release/dunder run selfhost/embed.ddr
 ```
 
-Det kräver ingen befintlig Dunder-binär. En framtida självhostad release bör
-dessutom behålla en känd fungerande bootstrap-binär per målplattform och
-dess källrevision/checksumma. Endast självhostad källkod räcker inte för att
-återskapa en kompilator när både alla kompilatorbinärer och bootstrap-källan
-är borta; då behövs en ny första implementation eller annan bootstrapväg.
+Modulladdaren bevarar källpositioner så att fel pekar på ursprunglig fil
+och rad. Den skyddar indata och importerade filer från överskrivning,
+även via symboliska och hårda länkar. Utdata publiceras med temporär fil
+och rename efter ett lyckat bygge.
 
-## Ansvar och täckning
+Detta är ännu en mindre implementation än Rust-bootstrapen. Bara nåbara
+funktionskroppar kompileras och kontrolleras; `@test`-block tas bort vid
+modulladdning. Fullt stöd för fasta arrayer, payload-enums/`match`, flyttal,
+funktionsvärden, generell lånekontroll och alla standardbiblioteksoperationer
+återstår. Självhosting betyder att kompilatorn bygger sin egen källkod;
+det betyder ännu inte full språkparitet.
+
+macOS-/Metal-intrinsics och `.app`-paketering finns tills vidare bara
+i Rust-bootstrapens byggväg. Metal-exemplen byggs med den vanliga `dunder`.
+
+## Filer
 
 | Fil | Ansvar |
 | --- | --- |
-| [lexer.ddr](lexer.ddr) | UTF-8-text, escapes, strängar/runes, tal, kommentarer, tokenpositioner och interning med std.map och std.set. |
-| [compile.ddr](compile.ddr) | Signaturpass, scope, muterbarhet, typkontroll, uttryck, kontrollflöde och direkt generering. |
-| [arm64.ddr](arm64.ddr) | Maskinord, etiketter, hoppfixering, register/stack och runtime för skalärer. |
-| [macho.ddr](macho.ddr) | Mach-O-layout, CodeDirectory och sidvis SHA-256 med std.bytes och std.sha256. |
-| [main.ddr](main.ddr) | Argument, läsning, diagnostik och publicering via temporär fil och rename. |
-
-Stage 1 stöder `i32`, `i64`, `bool`, UTF-8-strängliteraler och stränghandtag,
-typade funktioner med högst åtta parametrar, framåtanrop och rekursion,
-`:=`, explicita typer, `var`, blockscope, `return` och slututtryck,
-slutliga if/else-grenar, while, halvöppna i32-for-loopar, break/continue,
-kortslutande booleska operatorer, heltalsaritmetik/jämförelser,
-heltalskonvertering, `print` och `assert`.
-
-Vanlig heltalsaritmetik har overflowkontroller och division med noll ger
-samma definierade statusar som bootstrapen. Namn är begränsade till ASCII
-i denna parserstage; textliteraler har UTF-8 och Unicode-escapes.
-Funktionsramar har en gräns på 510 lokala slotar. För djupa uttryck,
-block och if-kedjor avvisas med diagnostik. Strängkonkatenering,
-strängjämförelser och strängmetoder i indata stöds ännu inte.
-
-Moduler, aggregattyper, referenser/borrows, dynamiska och fasta arrayer,
-enums/match, funktionsvärden, flyttal och `@test` i indata återstår i denna
-kompilator. Dessa funktioner fungerar redan i Rust-bootstrapen och används
-för att skriva stage 1; det är stödet som behöver porteras för självhosting.
-Även macOS-/Metal-intrinsics och `.app`-paketering finns tills vidare bara
-i Rust-bootstrapens byggväg. Metal-exemplen byggs med den vanliga `dunder`.
-Det finns ingen utfästelse om featureparitet eller optimerad körprestanda.
-
-Nästa acceptans är en modulladdare, ett typregister och de samlings-/borrowoperationer
-som behövs för att stage 1 ska kunna bygga standardbiblioteket och dessa
-källfiler. Därefter krävs en verklig stage 2/stage 3-jämförelse.
+| `lexer.ddr` | Tokenisering, UTF-8, escapes, positioner och interning. |
+| `modules.ddr` | Modulgraph, namn, synlighet, deduplicering och källmappning. |
+| `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
+| `compile.ddr` | Typer, uttryck, kontrollflöde, värdesemantik och kodgenerering. |
+| `arm64.ddr` | Maskinord, register, stack, etiketter och hoppfixering. |
+| `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Linux-systemanrop. |
+| `elf.ddr`, `linux.ddr` | ELF-format och kompilatorns Linux-ingång. |
+| `macho.ddr`, `main.ddr` | Den äldre signerade Mach-O-byggvägen. |
 
 ## Verifiering
 
 ```sh
-cargo run --release -- test selfhost/compile.ddr
-# 9 passed, 0 failed
-cargo test --test selfhost
+cargo test --test selfhost -- --test-threads=1
+target/release/dunder test
 ```
 
-Native-resultat för 800 genererade räkne-/jämförelseuttryck, rekursion,
-loopar, Unicode/NUL-utskrift, bool och i64-gränser jämförs med bootstrapens
-binärer. Felaktiga program, oföränderlighet, saknade returvärden och
-argumenttyper kontrolleras före publicering. Tidigare utdata bevaras vid
-kompileringsfel och indata skyddas även genom symlänkar/hårda länkar.
-Genererade binärer körs med tom miljö, signaturerna kontrolleras av macOS,
-och upprepade byggen ger identiska byte.
+Linux-testet bygger stage 1 och stage 2. Med `qemu-aarch64` tillgängligt
+kör det även stage 2 → stage 3, jämför samtliga byte och kör program byggda
+av stage 3. Ange vid behov `DUNDER_QEMU_AARCH64=/sökväg/till/qemu-aarch64`.
+Testet rapporterar när QEMU-delen hoppas över. På ARM64/Linux körs binärerna
+direkt. Kompilatorprocesserna körs med tom miljö och utan externa verktyg i
+`PATH`.
+
+Regressionerna täcker variabla bitförskjutningar, heltal, nästlade structar,
+oberoende arraykopior, UTF-8, moduler, diagnostik och skydd av källfiler.
+Stage 3 bygger även det fristående CSV-projektet Tabell och dess rapport
+jämförs med förväntad CSV. En lokal körning på inventeringen av Blixts
+källfiler gav också samma gruppsummor som den oberoende referensen.
+Ett separat test ser till att det inbäddade standardbiblioteket är aktuellt.
+De tidigare macOS-testerna för 800 genererade uttryck, runtimefel och
+signaturer finns kvar och körs på ARM64/macOS.
+
+Behåll Rust-bootstrapens källkod som återställningsväg. En ren checkout
+kan byggas med Rust utan någon befintlig Dunder-binär. Versionsmärkta
+bootstrap-binärer och deras källrevisioner kan senare göra installationen
+enklare; självhosting ersätter inte behovet av en första fungerande binär.

@@ -453,9 +453,11 @@ och körbar kod. Byggmätningar av ett genererat korpus finns i
 inte uppfyllt. Oanvända funktioner och oanvänd flyttalsformatering tas bort
 ur den genererade binären; parsern har en ASCII-väg utan teckenindexallokering.
 
-En [Dunder-skriven kompilator](selfhost/README.md) bygger redan skalära
-Dunder-program till signerad nativekod. Den kan ännu inte bygga sin egen
-fullständiga källkod. Rust-bootstrapen finns kvar som återställningsväg.
+Den [Dunder-skrivna kompilatorn](selfhost/README.md) bygger nu sin egen
+källkod till ARM64/Linux. Stage 2 och stage 3 är byteidentiska, och stage 3
+bygger körbara program med moduler, structar, arrayer och strängar.
+Full språk- och plattformsparitet återstår; Rust-bootstrapen finns kvar
+som återställningsväg.
 
 Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
 och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva

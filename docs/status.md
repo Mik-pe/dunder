@@ -115,10 +115,12 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   använder hela ord där det går. ASCII-källfiler behöver ingen separat
   teckenindextabell. Långa hopp/adresser fungerar över 1 MiB och stora
   signaturer får tillräcklig virtuell lagring i Mach-O.
-- [En Dunder-skriven kompilator](../selfhost/README.md) bygger den skalära
-  delmängden till signerad ARM64/Mach-O utan extern kompilator. Lexer,
-  parser, typkontroll, kodgenerering, filformat och signering är Dunder-kod.
-  Den bygger ännu inte hela sin egen källkod; självhosting är inte uppnådd.
+- [Den Dunder-skrivna kompilatorn](../selfhost/README.md) bygger sin egen
+  källkod till ARM64/Linux utan extern kompilator eller länkare. Lexer,
+  modulladdare, parser, typkontroll, kodgenerering, runtime och ELF-skrivare
+  är Dunder-kod. Stage 2 och stage 3 är byteidentiska, verifierat under QEMU.
+  Stage 3 bygger och kör fristående program med bitoperationer, structar,
+  arrayer och UTF-8. Full språkparitet och självbyggd macOS/x86-64 återstår.
 - Structar och fasta arrayer kan returneras med kopiering till anroparens
   lagring, även genom callbacks och rekursion. Ingen pekare till avslutad
   stacklagring returneras.
@@ -136,16 +138,19 @@ Lokalt på Linux/x86-64, 2026-11-10:
 
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` och
   `cargo build --release` passerar med Rust 1.90.0.
-- `cargo test --no-fail-fast -- --test-threads=1`: 84 testfunktioner passerar.
-  En parallell körning fick ett tillfälligt Linuxfel `ETXTBSY` vid processstart;
-  det berörda callbacktestet passerade separat och hela sviten passerade seriellt.
-- Releasekompilatorns `dunder test` kör alla 44 Dunder-testgrupper med tom
+- `cargo test -- --test-threads=1`: 119 testfunktioner passerar.
+- Releasekompilatorns `dunder test` kör alla 53 Dunder-testgrupper med tom
   verktygssökväg. Alla passerar.
 - ARM64/Linux under QEMU: 16 exempel/dogfood-program med exakt utdata,
-  samtliga 44 testgrupper och separata prov av systemanrop, argument, felkoder
+  samtliga 53 testgrupper och separata prov av systemanrop, argument, felkoder
   och flyttal. Den valfria verifieraren finns i `tools/verify-arm64.rs`.
-- 17 ARM64/macOS-bilder, inklusive selfhost-kompilatorn, är byteidentiska
-  med originalets utdata. macOS-processkörning och `codesign` har inte körts
+- Självhosting: stage 1 bygger stage 2, som bygger en byteidentisk stage 3.
+  Sex programfall byggda av stage 3 jämförs med Rust-bootstrapens körda
+  resultat. Stage 3 bygger även Tabell, vars rapport matchar förväntad CSV.
+  Modulregressioner och inbäddat standardbibliotek ingår i fyra integrationstester.
+- Vid den första Linuxporten var 17 ARM64/macOS-bilder, inklusive den dåvarande
+  selfhost-kompilatorn, byteidentiska med originalets utdata.
+  macOS-processkörning och `codesign` har inte körts
   i Linuxmiljön; motsvarande tester är fortsatt aktiva på macOS.
 
 ## Verifiering efter integrering på main
@@ -153,7 +158,8 @@ Lokalt på Linux/x86-64, 2026-11-10:
 På Apple Silicon, efter integreringen av Linux-målen och punktimporter:
 `cargo test --quiet` passerar 123 Rust-testfunktioner. `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings` och `cargo build --release`
-passerar också. Rootens dogfood-test kör 49 Dunder-testgrupper.
+passerar också. Rootens dogfood-test körde 49 Dunder-testgrupper före
+självhostingstillägget.
 
 Atlas och triangeln byggdes åter som signerade `.app` med tom verktygssökväg;
 `codesign --verify --strict` godkände båda paket och huvudbinärer. Atlas körde
@@ -284,11 +290,12 @@ binär och utdata får inte skriva över källan.
 
 ## Begränsningar och nästa steg
 
-Bootstrapkompilatorn är skriven i Rust. Självhosting är inte uppnådd.
-Stage 1 bygger skalära program men avvisar ännu importer och aggregat i
-sin indata. Nästa steg är funktionerna som krävs för att kompilera dess egen
-källkod och standardbibliotek; därefter stage 2/stage 3-verifiering.
-Rust-bootstrapen behålls som återställningsväg.
+Bootstrapkompilatorn är skriven i Rust och behålls som återställningsväg.
+Den självbyggda Dunder-kompilatorn riktar sig till ARM64/Linux och har ännu
+en mindre språkdelmängd: endast nåbara funktionskroppar kontrolleras,
+testblock tas bort, och fullständiga payload-enums/match, flyttal,
+funktionsvärden och fasta arrayer återstår. Nästa steg är språkparitet och
+självbyggd kodgenerering för x86-64 och macOS.
 Arrayelement är begränsade till primitiva skalärer och enums utan payload.
 Fasta arrayer och inline-aggregat får vara högst 64 KiB. Nästlade aggregat
 fungerar som structfält och enumpayloads. Arrayslices, generiskt allokerings-API

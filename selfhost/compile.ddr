@@ -2,21 +2,24 @@ import lexer
 import arm64 as arm
 import std.map as map
 import std.parse as parse
+import runtime
 
-// First Dunder-written compiler: a checked scalar subset, no fallback compiler.
-// Type IDs: ()=0, i32=1, i64=2, bool=3, string=4 (literal handles).
+// Native Dunder compiler. Values use eight-byte cells; aggregates have value semantics.
+// Primitive IDs: ()=0, i32=1, i64=2, bool=3, string=4, rune=5.
 pub struct Result { ok: bool, error: string, offset: i32, text: []i32 }
 struct Compiler {
     tokens: lexer.Tokens, closes: []i32, block_end: i32, tail: bool, block_depth: i32, cursor: i32, ok: bool, error: string, error_at: i32,
     functions: map.Map, names: []string, starts: []i32, ends: []i32, returns: []i32,
     param_starts: []i32, param_counts: []i32, param_names: []string, param_types: []i32,
-    code: arm.Code, fn_labels: []i32,
+    code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
+    type_names: []string, type_kinds: []i32, type_bases: []i32, type_starts: []i32, type_counts: []i32, type_clones: []i32,
+    field_names: []string, field_types: []i32, field_values: []i64, address: i32, writable: bool,
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
     scope: i32, slots: i32, ret_type: i32, depth: i32,
     loop_heads: []i32, loop_ends: []i32,
     strings: []string, string_labels: []i32,
     print_int: i32, print_bool: i32, print_text: i32, write: i32,
-    overflow: i32, zero: i32, assertion: i32, io: i32,
+    overflow: i32, zero: i32, assertion: i32, io: i32, bounds: i32,
 }
 fn peek(c: &Compiler) -> string { c.tokens.texts[c.cursor] }
 fn is(c: &Compiler, word: string) -> bool { c.tokens.kinds[c.cursor] != .String && c.tokens.kinds[c.cursor] != .Rune && peek(&c) == word }
@@ -26,16 +29,6 @@ fn eat(c: &mut Compiler, word: string) -> bool { if is(&c, word) { consumed := a
 fn expect(c: &mut Compiler, word: string) { if !eat(&mut c, word) { fail(&mut c, "expected '" + word + "'") } }
 fn separators(c: &mut Compiler) { while c.ok && (is(&c, "\n") || is(&c, ";")) { skipped := advance(&mut c) } }
 fn newlines(c: &mut Compiler) { while c.ok && is(&c, "\n") { skipped := advance(&mut c) } }
-fn type_name(c: &mut Compiler) -> i32 {
-    if eat(&mut c, "i32") { return 1 }
-    if eat(&mut c, "i64") { return 2 }
-    if eat(&mut c, "bool") { return 3 }
-    if eat(&mut c, "string") { return 4 }
-    if eat(&mut c, "(") { expect(&mut c, ")"); return 0 }
-    fail(&mut c, "this compiler stage supports i32, i64, bool and literal strings")
-    0
-}
-fn same(c: &mut Compiler, expected: i32, actual: i32) { if c.ok && expected != actual { fail(&mut c, "type mismatch") } }
 fn reserved(name: string) -> bool { name == "print" || name == "assert" || name == "i32" || name == "i64" || name == "bool" || name == "string" || name == "len" || name == "f32" || name == "f64" || name == "rune" || name == "range" }
 fn identifier(name: string) -> bool {
     if name.len == 0 { return false }
@@ -46,53 +39,122 @@ fn identifier(name: string) -> bool {
     }
     true
 }
+fn add_type(c: &mut Compiler, name: string, kind: i32, base: i32) -> i32 {
+    id := c.type_names.len
+    c.type_names.push(name); c.type_kinds.push(kind); c.type_bases.push(base)
+    c.type_starts.push(0); c.type_counts.push(0); c.type_clones.push(arm.label(&mut c.code))
+    id
+}
+fn compound(c: &mut Compiler, kind: i32, base: i32) -> i32 {
+    if kind == 1 && (c.type_kinds[base] == 1 || c.type_kinds[base] == 2) { fail(&mut c, "arrays of aggregate elements are not supported by this compiler") }
+    for i in 0..c.type_names.len { if c.type_kinds[i] == kind && c.type_bases[i] == base { return i } }
+    add_type(&mut c, "", kind, base)
+}
+fn type_id(c: &Compiler, name: string) -> i32 {
+    for i in 0..c.type_names.len { if c.type_names[i] == name { return i } }
+    -1
+}
+fn type_name(c: &mut Compiler) -> i32 {
+    if eat(&mut c, "&") { var kind := 4; if eat(&mut c, "mut") { kind = 5 }; base := type_name(&mut c); return compound(&mut c, kind, base) }
+    if eat(&mut c, "[") {
+        if eat(&mut c, "]") { base := type_name(&mut c); return compound(&mut c, 1, base) }
+        fail(&mut c, "fixed arrays are not supported by this compiler"); return 0
+    }
+    if eat(&mut c, "(") { expect(&mut c, ")"); return 0 }
+    name := advance(&mut c); found := type_id(&c, name)
+    if found < 0 { fail(&mut c, "unknown type '" + name + "'"); return 0 }
+    found
+}
+fn same(c: &mut Compiler, expected: i32, actual: i32) {
+    if expected == actual { return }
+    if c.type_kinds[expected] == 4 && c.type_kinds[actual] == 5 && c.type_bases[expected] == c.type_bases[actual] { return }
+    if c.ok { fail(&mut c, "type mismatch: " + c.type_names[expected] + " / " + c.type_names[actual]) }
+}
+fn field(c: &Compiler, ty: i32, name: string) -> i32 {
+    first := c.type_starts[ty]
+    for i in first..first + c.type_counts[ty] { if c.field_names[i] == name { return i } }
+    -1
+}
+fn load_mem(c: &mut Compiler, destination: i32, base: i32, offset: i32) { arm.emit(&mut c.code, 4181721088 + i64(offset / 8) * 1024 + i64(base) * 32 + i64(destination)) }
+fn store_mem(c: &mut Compiler, source: i32, base: i32, offset: i32) { arm.emit(&mut c.code, 4177526784 + i64(offset / 8) * 1024 + i64(base) * 32 + i64(source)) }
+fn address_slot(c: &mut Compiler, index: i32) {
+    arm.imm(&mut c.code, 0, i64(index + 1) * 8); arm.emit(&mut c.code, 3405775776)
+}
+fn save_address(c: &mut Compiler) { c.address = slot(&mut c); arm.store(&mut c.code, c.address, 0) }
+fn copy_value(c: &mut Compiler, ty: i32) {
+    if c.type_kinds[ty] == 1 { arm.branch(&mut c.code, c.runtime.array_clone, 1) }
+    else if c.type_kinds[ty] == 2 { arm.branch(&mut c.code, c.type_clones[ty], 1) }
+}
+fn skip_body(c: &mut Compiler) { expect(&mut c, "{"); c.cursor = c.closes[c.cursor - 1] + 1 }
 fn headers(c: &mut Compiler) {
+    var stack: []i32 = []
+    for i in 0..c.tokens.kinds.len {
+        if c.tokens.kinds[i] == .Symbol {
+            if c.tokens.texts[i] == "{" { stack.push(i) }
+            if c.tokens.texts[i] == "}" { if stack.len == 0 { fail(&mut c, "unexpected closing brace"); return }; open := stack.pop(); c.closes[open] = i }
+        }
+    }
+    if stack.len != 0 { fail(&mut c, "unterminated body"); return }
+    // Register every nominal type before parsing fields or function signatures.
+    var declarations: []i32 = []; var declaration_types: []i32 = []
     separators(&mut c)
     while c.ok && c.tokens.kinds[c.cursor] != .End {
+        if eat(&mut c, "@") {
+            annotation := advance(&mut c)
+            if is(&c, "{") { skip_body(&mut c); separators(&mut c); continue }
+        }
         public := eat(&mut c, "pub")
-        if !eat(&mut c, "fn") { fail(&mut c, "expected fn; imports and aggregate declarations are not in this compiler stage"); break }
-        if c.tokens.kinds[c.cursor] != .Name { fail(&mut c, "expected function name"); break }
+        what := advance(&mut c)
+        if what != "fn" && what != "struct" && what != "enum" { fail(&mut c, "expected fn, struct or enum (imports must be loaded first)"); break }
         name := advance(&mut c)
-        if !identifier(name) { fail(&mut c, "this compiler stage supports ASCII identifiers"); break }
-        if map.contains(&c.functions, name) || reserved(name) { fail(&mut c, "duplicate or reserved function name"); break }
-        id := c.names.len
-        map.put(&mut c.functions, name, i64(id)); c.names.push(name)
-        c.fn_labels.push(arm.label(&mut c.code))
-        expect(&mut c, "(")
-        first := c.param_names.len
-        while c.ok && !is(&c, ")") {
-            if c.tokens.kinds[c.cursor] != .Name { fail(&mut c, "expected parameter name"); break }
-            parameter := advance(&mut c); expect(&mut c, ":"); ty := type_name(&mut c)
-            if ty == 0 { fail(&mut c, "parameter requires a value type") }
-            c.param_names.push(parameter); c.param_types.push(ty)
-            if !eat(&mut c, ",") { break }
+        declarations.push(c.cursor)
+        var ty := -1
+        if what != "fn" {
+            if type_id(&c, name) >= 0 { fail(&mut c, "duplicate type") }
+            var kind := 2; if what == "enum" { kind = 3 }
+            ty = add_type(&mut c, name, kind, 0)
+        } else {
+            if map.contains(&c.functions, name) || reserved(name) { fail(&mut c, "duplicate or reserved function name") }
+            map.put(&mut c.functions, name, i64(c.names.len)); c.names.push(name); c.fn_labels.push(arm.label(&mut c.code)); c.needed.push(false)
         }
-        expect(&mut c, ")")
-        count := c.param_names.len - first
-        if count > 8 { fail(&mut c, "this compiler stage supports at most eight parameters") }
-        c.param_starts.push(first); c.param_counts.push(count)
-        var ret := 0
-        if eat(&mut c, "->") { ret = type_name(&mut c) }
-        c.returns.push(ret)
-        newlines(&mut c); expect(&mut c, "{")
-        c.starts.push(c.cursor)
-        var depth := 1
-        var stack: []i32 = [c.cursor - 1]
-        while c.ok && depth > 0 {
-            if c.tokens.kinds[c.cursor] == .End { fail(&mut c, "unterminated function body"); break }
-            if c.tokens.kinds[c.cursor] == .Symbol {
-                if is(&c, "{") { depth = depth + 1; stack.push(c.cursor) }
-                if is(&c, "}") { depth = depth - 1; open := stack.pop(); c.closes[open] = c.cursor }
+        declaration_types.push(ty)
+        while c.ok && !is(&c, "{") { if c.tokens.kinds[c.cursor] == .End { fail(&mut c, "missing declaration body"); break }; skipped := advance(&mut c) }
+        if c.ok { skip_body(&mut c); separators(&mut c) }
+    }
+    for d in 0..declarations.len {
+        if !c.ok { break }
+        c.cursor = declarations[d]; ty := declaration_types[d]
+        if ty >= 0 {
+            expect(&mut c, "{"); c.type_starts[ty] = c.field_names.len; separators(&mut c)
+            var tag: i64 = 0
+            while c.ok && !is(&c, "}") {
+                name := advance(&mut c); var ft := 0
+                if c.type_kinds[ty] == 2 { expect(&mut c, ":"); ft = type_name(&mut c) }
+                else {
+                    if eat(&mut c, "(") { while c.ok && !eat(&mut c, ")") { skipped := advance(&mut c) } }
+                    if eat(&mut c, "=") { value := parse.integer(advance(&mut c)); tag = value.value }
+                }
+                c.field_names.push(name); c.field_types.push(ft); c.field_values.push(tag); tag = tag + 1
+                if !eat(&mut c, ",") { separators(&mut c); if !is(&c, "}") { fail(&mut c, "expected field comma") } }; separators(&mut c)
             }
-            if depth > 0 { skipped := advance(&mut c) }
+            c.type_counts[ty] = c.field_names.len - c.type_starts[ty]
+        } else {
+            expect(&mut c, "("); first := c.param_names.len
+            while c.ok && !is(&c, ")") {
+                parameter := advance(&mut c); expect(&mut c, ":"); pt := type_name(&mut c)
+                c.param_names.push(parameter); c.param_types.push(pt)
+                if !eat(&mut c, ",") { break }
+            }
+            expect(&mut c, ")"); c.param_starts.push(first); c.param_counts.push(c.param_names.len - first)
+            var ret := 0; if eat(&mut c, "->") { ret = type_name(&mut c) }; c.returns.push(ret)
+            newlines(&mut c); expect(&mut c, "{"); c.starts.push(c.cursor); c.ends.push(c.closes[c.cursor - 1])
+            if ret != 0 { newlines(&mut c); if is(&c, "}") { fail(&mut c, "function can finish without returning a value") } }
         }
-        c.ends.push(c.cursor)
-        expect(&mut c, "}"); separators(&mut c)
     }
 }
 fn slot(c: &mut Compiler) -> i32 {
     result := c.slots; c.slots = c.slots + 1
-    if c.slots > 510 { fail(&mut c, "this compiler stage allows at most 510 local slots per function") }
+    if c.slots > 65535 { fail(&mut c, "this compiler stage allows at most 65535 local slots per function") }
     result
 }
 fn local(c: &Compiler, name: string) -> i32 {
@@ -124,90 +186,232 @@ fn literal(c: &mut Compiler, spelling: string, expected: i32) -> i32 {
     arm.imm(&mut c.code, 0, value.value)
     ty
 }
-fn call(c: &mut Compiler, name: string) -> i32 {
+fn intrinsic(c: &mut Compiler, name: string, expected: i32) -> i32 {
+    if c.code.platform != 1 { fail(&mut c, "selfhost filesystem and argument intrinsics currently require arm64-linux"); return 0 }
+    var target := -1; var ret := expected
+    if name == "__sys_arg_count" { target = c.runtime.sys_arg_count; ret = 1 }
+    else if name == "__sys_arg" { target = c.runtime.sys_arg; ret = 4 }
+    else if name == "__sys_pid" { target = c.runtime.sys_pid; ret = 1 }
+    else if name == "__sys_read_text" { target = c.runtime.sys_read_text }
+    else if name == "__sys_metadata" { target = c.runtime.sys_metadata }
+    else if name == "__sys_same_file" { target = c.runtime.sys_same_file; ret = 3 }
+    else if name == "__sys_write_bytes" { target = c.runtime.sys_write_bytes }
+    else if name == "__sys_make_executable" { target = c.runtime.sys_make_executable }
+    else if name == "__sys_rename" { target = c.runtime.sys_rename }
+    else if name == "__sys_remove_file" { target = c.runtime.sys_remove_file }
+    else if name == "__sys_decode_utf8" { target = c.runtime.sys_decode_utf8 }
+    else if name == "__sys_write_stderr" { target = c.runtime.sys_stderr }
+    if target < 0 { fail(&mut c, "unsupported intrinsic '" + name + "'"); return 0 }
+    var count := 0
+    while c.ok && !is(&c, ")") {
+        ty := expression(&mut c, 0, 0)
+        if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { load_mem(&mut c, 0, 0, 0) }
+        arm.push(&mut c.code, 0); count = count + 1
+        if !eat(&mut c, ",") { break }
+    }
+    expect(&mut c, ")")
+    var i := count - 1; while i >= 0 { arm.pop(&mut c.code, i); i = i - 1 }
+    arm.branch(&mut c.code, target, 1); ret
+}
+fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     expect(&mut c, "(")
+    if name.len >= 6 && name[0..6] == "__sys_" { return intrinsic(&mut c, name, expected) }
     if name == "print" {
         ty := expression(&mut c, 0, 0); expect(&mut c, ")")
         var target := c.print_int
-        if ty == 3 { target = c.print_bool }
-        else if ty == 4 { target = c.print_text }
-        else if ty != 1 && ty != 2 { fail(&mut c, "print requires a scalar value") }
-        arm.branch(&mut c.code, target, 1)
-        return 0
+        if ty == 3 { target = c.print_bool } else if ty == 4 { target = c.print_text }
+        else if ty == 5 { arm.branch(&mut c.code, c.runtime.string_rune, 1); target = c.print_text }
+        else if ty != 1 && ty != 2 && ty != 5 { fail(&mut c, "print requires a scalar value") }
+        arm.branch(&mut c.code, target, 1); return 0
     }
-    if name == "assert" {
-        ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); expect(&mut c, ")")
-        arm.branch(&mut c.code, c.assertion, 18)
-        return 0
-    }
-    if name == "i32" || name == "i64" {
-        var hint := 0
-        if name == "i64" { hint = 2 }
-        ty := expression(&mut c, 0, hint); expect(&mut c, ")")
-        if ty != 1 && ty != 2 { fail(&mut c, "integer conversion requires an integer") }
-        if name == "i32" { narrow(&mut c); return 1 }
-        return 2
+    if name == "assert" { ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); expect(&mut c, ")"); arm.branch(&mut c.code, c.assertion, 18); return 0 }
+    if name == "i32" || name == "i64" || name == "rune" {
+        var hint := 1; if name == "i64" { hint = 2 }; if name == "rune" { hint = 5 }
+        var argument_hint := 0
+        if c.tokens.kinds[c.cursor] == .Integer && c.tokens.texts[c.cursor + 1] == ")" { argument_hint = hint }
+        ty := expression(&mut c, 0, argument_hint); expect(&mut c, ")")
+        if ty != 1 && ty != 2 && ty != 5 { fail(&mut c, "integer conversion requires an integer") }
+        if hint == 1 { narrow(&mut c) }; return hint
     }
     found := map.get_or(&c.functions, name, -1)
     if found < 0 { fail(&mut c, "unknown function '" + name + "'"); return 0 }
     f := i32(found); first := c.param_starts[f]; count := c.param_counts[f]
-    var provided := 0
+    c.needed[f] = true
+    var provided := 0; var args: []i32 = []
     while c.ok && !is(&c, ")") {
         if provided >= count { fail(&mut c, "too many arguments"); break }
-        expected := c.param_types[first + provided]
-        ty := expression(&mut c, 0, expected); same(&mut c, expected, ty)
-        arm.push(&mut c.code, 0); provided = provided + 1
+        want := c.param_types[first + provided]
+        ty := expression(&mut c, 0, want); same(&mut c, want, ty); copy_value(&mut c, ty)
+        index := slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index); provided = provided + 1
         if !eat(&mut c, ",") { break }
     }
-    expect(&mut c, ")")
-    if provided != count { fail(&mut c, "wrong argument count") }
-    var index := provided - 1
-    while index >= 0 { arm.pop(&mut c.code, index); index = index - 1 }
+    expect(&mut c, ")"); if provided != count { fail(&mut c, "wrong argument count") }
+    var i := provided - 1
+    while i >= 8 { arm.load(&mut c.code, args[i]); arm.push(&mut c.code, 0); i = i - 1 }
+    // Load x0 last: the slot helper uses x0/x9 only.
+    while i >= 0 { arm.load(&mut c.code, args[i]); arm.mov(&mut c.code, i, 0); i = i - 1 }
     arm.branch(&mut c.code, c.fn_labels[f], 1)
+    for unused in 8..provided { arm.pop(&mut c.code, 9) }
     c.returns[f]
 }
 fn primary(c: &mut Compiler, expected: i32) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
-    ty := primary_inner(&mut c, expected)
-    c.depth = c.depth - 1
-    ty
+    c.address = -1; c.writable = false
+    var ty := primary_inner(&mut c, expected)
+    while c.ok && (is(&c, ".") || is(&c, "[")) {
+        if eat(&mut c, "[") {
+            writable := c.writable
+            arm.push(&mut c.code, 0)
+            index_type := expression(&mut c, 0, 1); same(&mut c, 1, index_type)
+            if eat(&mut c, "..") {
+                if ty != 4 { fail(&mut c, "slice requires a string") }
+                arm.push(&mut c.code, 0); last := expression(&mut c, 0, 1); same(&mut c, 1, last); expect(&mut c, "]")
+                arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0); arm.branch(&mut c.code, c.runtime.string_slice, 1)
+                c.address = -1; c.writable = false; continue
+            }
+            expect(&mut c, "]"); arm.pop(&mut c.code, 1)
+            if ty == 4 { arm.mov(&mut c.code, 2, 0); arm.mov(&mut c.code, 0, 1); arm.mov(&mut c.code, 1, 2); arm.branch(&mut c.code, c.runtime.string_index, 1); ty = 1; c.address = -1; c.writable = false }
+            else if c.type_kinds[ty] == 1 {
+                load_mem(&mut c, 2, 1, 8); arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.bounds, 4)
+                load_mem(&mut c, 1, 1, 0); arm.emit(&mut c.code, 2332036128)
+                save_address(&mut c); load_mem(&mut c, 0, 0, 0); ty = c.type_bases[ty]; c.writable = writable
+            } else { fail(&mut c, "index requires an array or string") }
+        } else {
+            expect(&mut c, "."); name := advance(&mut c)
+            if is(&c, "(") { ty = method(&mut c, ty, name); c.address = -1; c.writable = false }
+            else if name == "len" && (ty == 4 || c.type_kinds[ty] == 1) {
+                var offset := 0; if ty != 4 { offset = 8 }; load_mem(&mut c, 0, 0, offset); ty = 1; c.address = -1; c.writable = false
+            } else if c.type_kinds[ty] == 2 {
+                found := field(&c, ty, name)
+                if found < 0 { fail(&mut c, "unknown field '" + name + "'") }
+                else { offset := (found - c.type_starts[ty]) * 8; arm.emit(&mut c.code, 2432696320 + i64(offset) * 1024); save_address(&mut c); load_mem(&mut c, 0, 0, 0); ty = c.field_types[found] }
+            } else { fail(&mut c, "unknown member '" + name + "'") }
+        }
+    }
+    c.depth = c.depth - 1; ty
+}
+fn enumeration(c: &mut Compiler, ty: i32) -> i32 {
+    name := advance(&mut c)
+    if ty < 0 || c.type_kinds[ty] != 3 { fail(&mut c, "enum variant needs a type"); return 0 }
+    found := field(&c, ty, name)
+    if found < 0 { fail(&mut c, "unknown enum variant"); return ty }
+    arm.imm(&mut c.code, 0, c.field_values[found]); ty
 }
 fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
     if !c.ok { return 0 }
+    if eat(&mut c, "&") {
+        mutable := eat(&mut c, "mut"); ty := primary(&mut c, 0)
+        if c.address < 0 { fail(&mut c, "borrow requires a stored value"); return 0 }
+        if mutable && !c.writable { fail(&mut c, "mutable borrow requires var or &mut") }
+        arm.load(&mut c.code, c.address); c.address = -1; c.writable = false
+        var kind := 4; if mutable { kind = 5 }; return compound(&mut c, kind, ty)
+    }
     if eat(&mut c, "-") {
         if c.tokens.kinds[c.cursor] == .Integer { spelling := "-" + advance(&mut c); return literal(&mut c, spelling, expected) }
-        ty := primary(&mut c, expected)
-        if ty != 1 && ty != 2 { fail(&mut c, "minus requires an integer") }
-        arm.emit(&mut c.code, 3942646752); arm.branch(&mut c.code, c.overflow, 8)
-        if ty == 1 { narrow(&mut c) }
-        return ty
+        ty := primary(&mut c, expected); if ty != 1 && ty != 2 { fail(&mut c, "minus requires an integer") }
+        arm.emit(&mut c.code, 3942646752); arm.branch(&mut c.code, c.overflow, 8); if ty == 1 { narrow(&mut c) }; c.address = -1; c.writable = false; return ty
     }
-    if eat(&mut c, "!") {
-        ty := primary(&mut c, 3); same(&mut c, 3, ty)
-        arm.emit(&mut c.code, 3944677407); arm.emit(&mut c.code, 2594117600)
-        return 3
-    }
+    if eat(&mut c, "!") { ty := primary(&mut c, 3); same(&mut c, 3, ty); arm.emit(&mut c.code, 3944677407); arm.emit(&mut c.code, 2594117600); c.address = -1; c.writable = false; return 3 }
     if eat(&mut c, "(") { ty := expression(&mut c, 0, expected); expect(&mut c, ")"); return ty }
     if eat(&mut c, "true") { arm.imm(&mut c.code, 0, 1); return 3 }
     if eat(&mut c, "false") { arm.imm(&mut c.code, 0, 0); return 3 }
+    if eat(&mut c, ".") { return enumeration(&mut c, expected) }
+    if eat(&mut c, "[") {
+        var base := 0; if c.type_kinds[expected] == 1 { base = c.type_bases[expected] }
+        arm.branch(&mut c.code, c.runtime.array_new, 1); saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
+        while c.ok && !is(&c, "]") {
+            ty := expression(&mut c, 0, base); if base == 0 { base = ty } else { same(&mut c, base, ty) }; copy_value(&mut c, ty)
+            arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); arm.branch(&mut c.code, c.runtime.array_push, 1)
+            if !eat(&mut c, ",") { break }
+        }
+        expect(&mut c, "]"); arm.load(&mut c.code, saved); c.address = -1; c.writable = false
+        if base == 0 { fail(&mut c, "empty array needs an element type") }; return compound(&mut c, 1, base)
+    }
     kind := c.tokens.kinds[c.cursor]
     if kind == .Integer { spelling := advance(&mut c); return literal(&mut c, spelling, expected) }
-    if kind == .String {
+    if kind == .String || kind == .Rune {
         text := advance(&mut c); target := arm.label(&mut c.code)
         c.strings.push(text); c.string_labels.push(target); arm.branch(&mut c.code, target, 20)
-        return 4
+        if kind == .Rune { arm.branch(&mut c.code, c.runtime.string_runes, 1); load_mem(&mut c, 0, 0, 0); load_mem(&mut c, 0, 0, 0); return 5 }; return 4
     }
     if kind == .Name {
-        name := advance(&mut c)
-        if is(&c, "(") { if local(&c, name) >= 0 { fail(&mut c, "local value is not callable in this compiler stage"); return 0 }; return call(&mut c, name) }
+        name := advance(&mut c); nominal := type_id(&c, name)
+        if nominal >= 0 && c.type_kinds[nominal] == 3 && eat(&mut c, ".") { return enumeration(&mut c, nominal) }
+        if nominal >= 0 && c.type_kinds[nominal] == 2 && eat(&mut c, "{") {
+            arm.imm(&mut c.code, 0, i64(c.type_counts[nominal]) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1)
+            saved := slot(&mut c); arm.store(&mut c.code, saved, 0); var provided: []bool = []
+            for i in 0..c.type_counts[nominal] { provided.push(false) }; separators(&mut c)
+            while c.ok && !is(&c, "}") {
+                member := advance(&mut c); expect(&mut c, ":"); found := field(&c, nominal, member)
+                if found < 0 { fail(&mut c, "unknown constructor field"); break }
+                offset := found - c.type_starts[nominal]
+                if provided[offset] { fail(&mut c, "duplicate constructor field") }; provided[offset] = true
+                ty := expression(&mut c, 0, c.field_types[found]); same(&mut c, c.field_types[found], ty); copy_value(&mut c, ty)
+                arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, offset * 8)
+                if !eat(&mut c, ",") { break }; separators(&mut c)
+            }
+            separators(&mut c); expect(&mut c, "}")
+            for present in provided { if !present { fail(&mut c, "missing constructor field") } }
+            arm.load(&mut c.code, saved); c.address = -1; c.writable = false; return nominal
+        }
+        if is(&c, "(") { if local(&c, name) >= 0 { fail(&mut c, "local value is not callable"); return 0 }; result := call(&mut c, name, expected); c.address = -1; c.writable = false; return result }
         found := local(&c, name)
         if found < 0 { fail(&mut c, "unknown local '" + name + "'"); return 0 }
-        arm.load(&mut c.code, c.local_slots[found])
-        return c.local_types[found]
+        var ty := c.local_types[found]; c.writable = c.local_mutable[found]
+        if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { arm.load(&mut c.code, c.local_slots[found]); c.writable = c.type_kinds[ty] == 5; ty = c.type_bases[ty] }
+        else { address_slot(&mut c, c.local_slots[found]) }
+        save_address(&mut c); load_mem(&mut c, 0, 0, 0); return ty
     }
-    fail(&mut c, "expected scalar expression")
-    0
+    fail(&mut c, "expected expression"); 0
+}
+fn method(c: &mut Compiler, ty: i32, name: string) -> i32 {
+    writable := c.writable; expect(&mut c, "("); arm.push(&mut c.code, 0)
+    var target := -1; var ret := ty; var count := 0
+    if c.type_kinds[ty] == 1 {
+        if !writable { fail(&mut c, "array mutation requires var or &mut") }
+        if name == "push" {
+            if !writable { fail(&mut c, "push requires mutable array") }
+            value := expression(&mut c, 0, c.type_bases[ty]); same(&mut c, c.type_bases[ty], value); copy_value(&mut c, value); count = 1; target = c.runtime.array_push; ret = 0
+        } else if name == "reserve" { value := expression(&mut c, 0, 1); same(&mut c, 1, value); count = 1; target = c.runtime.array_reserve; ret = 0 }
+        else if name == "pop" { target = c.runtime.array_pop; ret = c.type_bases[ty] }
+        else if name == "clear" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); arm.imm(&mut c.code, 1, 0); store_mem(&mut c, 1, 0, 8); return 0 }
+    } else if name == "str" {
+        if ty != 1 && ty != 2 && ty != 3 && ty != 5 { fail(&mut c, "str requires an integer, bool or rune") }
+        ret = 4; target = c.runtime.string_integer
+        if ty == 3 { target = c.runtime.string_bool }; if ty == 5 { target = c.runtime.string_rune }
+    } else if ty == 4 {
+        if name == "bytes" { target = c.runtime.string_bytes; ret = compound(&mut c, 1, 1) }
+        else if name == "runes" { target = c.runtime.string_runes; ret = compound(&mut c, 1, 5) }
+        else if name == "slice" {
+            first := expression(&mut c, 0, 1); same(&mut c, 1, first); arm.push(&mut c.code, 0); expect(&mut c, ",")
+            last := expression(&mut c, 0, 1); same(&mut c, 1, last); arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0)
+            expect(&mut c, ")"); arm.branch(&mut c.code, c.runtime.string_slice, 1); return 4
+        }
+    } else if ty == 1 || ty == 2 {
+        if name == "bit_not" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); arm.emit(&mut c.code, 2854224864); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; return ty }
+        var want := ty; if name == "shl" || name == "shr" { want = 1 }
+        right := expression(&mut c, 0, want); same(&mut c, want, right); expect(&mut c, ")"); arm.pop(&mut c.code, 1)
+        var opcode: i64 = 0
+        if name == "bit_and" { opcode = 2315255840 }
+        else if name == "bit_or" { opcode = 2852126752 }
+        else if name == "bit_xor" { opcode = 3388997664 }
+        else if name == "shl" { opcode = 2596282400 }
+        else if name == "shr" { opcode = 2596283424 }
+        else if name == "wrapping_add" { opcode = 2332033056 }
+        else if name == "wrapping_sub" { opcode = 3405774880 }
+        else if name == "wrapping_mul" { opcode = 2600500256 }
+        if opcode == 0 { fail(&mut c, "unknown integer method '" + name + "'") }
+        if name == "shl" || name == "shr" {
+            var width: i64 = 32; if ty == 2 { width = 64 }; arm.imm(&mut c.code, 2, width)
+            arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.bounds, 4)
+        }
+        if ty == 1 { opcode = opcode.bit_and(2147483647) }
+        arm.emit(&mut c.code, opcode); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; return ty
+    }
+    if target < 0 { fail(&mut c, "unknown method '" + name + "'"); return 0 }
+    expect(&mut c, ")")
+    if count == 1 { arm.mov(&mut c.code, 1, 0) }; arm.pop(&mut c.code, 0); arm.branch(&mut c.code, target, 1); ret
 }
 fn precedence(operator: string) -> i32 {
     if operator == "||" { return 1 }
@@ -219,7 +423,12 @@ fn precedence(operator: string) -> i32 {
     0
 }
 fn binary(c: &mut Compiler, operator: string, ty: i32) -> i32 {
-    numeric := ty == 1 || ty == 2
+    if ty == 4 {
+        arm.mov(&mut c.code, 2, 0); arm.mov(&mut c.code, 0, 1); arm.mov(&mut c.code, 1, 2)
+        if operator == "+" { arm.branch(&mut c.code, c.runtime.string_concat, 1); return 4 }
+        arm.branch(&mut c.code, c.runtime.string_compare, 1); arm.mov(&mut c.code, 1, 0); arm.imm(&mut c.code, 0, 0)
+    }
+    numeric := ty == 1 || ty == 2 || ty == 5
     if operator == "+" || operator == "-" || operator == "*" || operator == "/" || operator == "%" {
         if !numeric { fail(&mut c, "arithmetic requires matching integer types"); return ty }
         if operator == "+" { arm.emit(&mut c.code, 2868903968); arm.branch(&mut c.code, c.overflow, 8) }
@@ -240,7 +449,7 @@ fn binary(c: &mut Compiler, operator: string, ty: i32) -> i32 {
         if ty == 1 { narrow(&mut c) }
         return ty
     }
-    if !numeric && !(ty == 3 && (operator == "==" || operator == "!=")) { fail(&mut c, "comparison requires integers or bool equality") }
+    if !numeric && !((ty == 3 || c.type_kinds[ty] == 3) && (operator == "==" || operator == "!=")) && ty != 4 { fail(&mut c, "comparison requires integers or bool equality") }
     var condition := 0
     if operator == "!=" { condition = 1 }
     else if operator == "<" { condition = 11 }
@@ -263,12 +472,12 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
             same(&mut c, 3, ty)
             done := arm.label(&mut c.code)
             if operator == "&&" { arm.branch(&mut c.code, done, 18) } else { arm.branch(&mut c.code, done, 19) }
-            right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3
+            right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
         } else {
             arm.push(&mut c.code, 0)
             right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
             arm.pop(&mut c.code, 1)
-            ty = binary(&mut c, operator, ty)
+            ty = binary(&mut c, operator, ty); c.address = -1; c.writable = false
         }
     }
     c.depth = c.depth - 1
@@ -339,7 +548,7 @@ fn statement(c: &mut Compiler) -> bool {
             if c.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
         } else { ty := expression(&mut c, 0, c.ret_type); same(&mut c, c.ret_type, ty) }
         end_statement(&mut c)
-        arm.ret(&mut c.code)
+        copy_value(&mut c, c.ret_type); arm.ret(&mut c.code)
         return true
     }
     if eat(&mut c, "if") { after := conditional_end(&c, c.cursor); allowed := c.tail && terminal(&c, after, true); return conditional(&mut c, allowed) }
@@ -352,20 +561,30 @@ fn statement(c: &mut Compiler) -> bool {
         return false
     }
     if eat(&mut c, "for") {
-        if c.tokens.kinds[c.cursor] != .Name { fail(&mut c, "expected loop variable"); return false }
         name := advance(&mut c); expect(&mut c, "in")
-        low := expression(&mut c, 0, 1); same(&mut c, 1, low); cursor := slot(&mut c); arm.store(&mut c.code, cursor, 0)
-        expect(&mut c, "..")
-        high := expression(&mut c, 0, 1); same(&mut c, 1, high); limit := slot(&mut c); arm.store(&mut c.code, limit, 0)
+        low := expression(&mut c, 0, 1); cursor := slot(&mut c); limit := slot(&mut c); values := slot(&mut c); binding := slot(&mut c)
+        var base := 1; var array := false
+        if eat(&mut c, "..") {
+            same(&mut c, 1, low); arm.store(&mut c.code, cursor, 0)
+            high := expression(&mut c, 0, 1); same(&mut c, 1, high); arm.store(&mut c.code, limit, 0)
+        } else {
+            if c.type_kinds[low] != 1 { fail(&mut c, "for requires a range or array"); return false }
+            array = true; base = c.type_bases[low]; copy_value(&mut c, low); arm.store(&mut c.code, values, 0)
+            load_mem(&mut c, 0, 0, 8); arm.store(&mut c.code, limit, 0); arm.imm(&mut c.code, 0, 0); arm.store(&mut c.code, cursor, 0)
+        }
         head := arm.label(&mut c.code); next := arm.label(&mut c.code); done := arm.label(&mut c.code)
-        enter(&mut c); bind(&mut c, name, 1, false, cursor)
+        enter(&mut c)
+        if array { bind(&mut c, name, base, false, binding) } else { bind(&mut c, name, 1, false, cursor) }
         arm.mark(&mut c.code, head); arm.load(&mut c.code, cursor); arm.push(&mut c.code, 0); arm.load(&mut c.code, limit); arm.pop(&mut c.code, 1)
         arm.emit(&mut c.code, 3942645823); arm.branch(&mut c.code, done, 12)
+        if array {
+            arm.load(&mut c.code, values); load_mem(&mut c, 0, 0, 0); arm.push(&mut c.code, 0); arm.load(&mut c.code, cursor); arm.pop(&mut c.code, 1)
+            arm.emit(&mut c.code, 2332036128); load_mem(&mut c, 0, 0, 0); copy_value(&mut c, base); arm.store(&mut c.code, binding, 0)
+        }
         c.loop_heads.push(next); c.loop_ends.push(done)
         ends := block(&mut c, false); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
         arm.mark(&mut c.code, next); arm.load(&mut c.code, cursor); arm.emit(&mut c.code, 2432697344); arm.store(&mut c.code, cursor, 0)
-        arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done); leave(&mut c)
-        return false
+        arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done); leave(&mut c); return false
     }
     if is(&c, "break") || is(&c, "continue") {
         name := advance(&mut c)
@@ -385,22 +604,20 @@ fn statement(c: &mut Compiler) -> bool {
         ty := expression(&mut c, 0, expected)
         if expected != 0 { same(&mut c, expected, ty) }
         if ty == 0 { fail(&mut c, "local requires a value") }
-        index := slot(&mut c); bind(&mut c, name, ty, mutable, index); arm.store(&mut c.code, index, 0)
+        copy_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index); arm.store(&mut c.code, index, 0)
         end_statement(&mut c)
         return false
     }
     if mutable { fail(&mut c, "expected declaration after var"); return false }
-    if c.tokens.kinds[c.cursor] == .Name && c.tokens.texts[c.cursor + 1] == "=" {
-        name := advance(&mut c); expect(&mut c, "="); found := local(&c, name)
-        if found < 0 { fail(&mut c, "unknown assignment target"); return false }
-        if !c.local_mutable[found] { fail(&mut c, "assignment requires var"); return false }
-        expected := c.local_types[found]; ty := expression(&mut c, 0, expected); same(&mut c, expected, ty)
-        arm.store(&mut c.code, c.local_slots[found], 0)
-        end_statement(&mut c)
-        return false
-    }
     ty := expression(&mut c, 0, c.ret_type)
-    if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); arm.ret(&mut c.code); return true }
+    if eat(&mut c, "=") {
+        destination := c.address; writable := c.writable
+        if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
+        value := expression(&mut c, 0, ty); same(&mut c, ty, value); copy_value(&mut c, ty)
+        arm.push(&mut c.code, 0); arm.load(&mut c.code, destination); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, 0)
+        end_statement(&mut c); return false
+    }
+    if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); copy_value(&mut c, ty); arm.ret(&mut c.code); return true }
     if ty != 0 { fail(&mut c, "unused value; bind it or return it") }
     end_statement(&mut c)
     false
@@ -422,15 +639,33 @@ fn literals(c: &mut Compiler) {
         }
     }
 }
-pub fn compile(source: string) -> Result {
+fn clones(c: &mut Compiler) {
+    for ty in 0..c.type_names.len {
+        if c.type_kinds[ty] == 2 {
+            arm.mark(&mut c.code, c.type_clones[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+            arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.type_counts[ty]) * 8); arm.branch(&mut c.code, c.runtime.alloc, 1); arm.store(&mut c.code, 1, 0)
+            first := c.type_starts[ty]
+            for i in 0..c.type_counts[ty] {
+                arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); copy_value(&mut c, c.field_types[first + i])
+                arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
+            }
+            arm.load(&mut c.code, 1); arm.ret(&mut c.code)
+        }
+    }
+}
+pub fn compile(source: string) -> Result { compile_for(source, 0) }
+pub fn compile_for(source: string, platform: i32) -> Result {
     tokens := lexer.lex(source)
     if !tokens.ok { return Result { ok: false, error: tokens.error, offset: tokens.error_at, text: [] } }
+    var code := arm.new_for(platform); rt := runtime.new(&mut code)
     var c := Compiler {
         tokens: tokens, closes: [], block_end: 0, tail: false, block_depth: 0, cursor: 0, ok: true, error: "", error_at: 0,
         functions: map.new(), names: [], starts: [], ends: [], returns: [], param_starts: [], param_counts: [], param_names: [], param_types: [],
-        code: arm.new(), fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
-        loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, overflow: 0, zero: 0, assertion: 0, io: 0,
+        code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], field_names: [], field_types: [], field_values: [], address: -1, writable: false,
+        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
+        loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
+    for name in ["()", "i32", "i64", "bool", "string", "rune", "f32", "f64"] { added := add_type(&mut c, name, 0, 0) }
     for i in 0..c.tokens.kinds.len { c.closes.push(-1) }
     headers(&mut c)
     entry := map.get_or(&c.functions, "main", -1)
@@ -439,26 +674,42 @@ pub fn compile(source: string) -> Result {
     main_id := i32(entry)
     if c.param_counts[main_id] != 0 || (c.returns[main_id] != 0 && c.returns[main_id] != 1) { fail(&mut c, "main must take no arguments and return i32 or ()") }
     c.print_int = arm.label(&mut c.code); c.print_bool = arm.label(&mut c.code); c.print_text = arm.label(&mut c.code); c.write = arm.label(&mut c.code)
-    c.overflow = arm.label(&mut c.code); c.zero = arm.label(&mut c.code); c.assertion = arm.label(&mut c.code); c.io = arm.label(&mut c.code)
+    c.overflow = arm.label(&mut c.code); c.zero = arm.label(&mut c.code); c.assertion = arm.label(&mut c.code); c.io = arm.label(&mut c.code); c.bounds = arm.label(&mut c.code)
+    // The runtime owns x19/x20 (arena), x23/x24 (process arguments).
+    arm.imm(&mut c.code, 19, 0); arm.imm(&mut c.code, 20, 0)
+    if platform == 1 { arm.emit(&mut c.code, 4181722103); arm.emit(&mut c.code, 2432705528) }
+    else { arm.mov(&mut c.code, 23, 0); arm.mov(&mut c.code, 24, 1) }
     arm.branch(&mut c.code, c.fn_labels[main_id], 1)
-    arm.imm(&mut c.code, 16, 33554433); arm.emit(&mut c.code, 3556773889); arm.emit(&mut c.code, 3558866944)
-    for f in 0..c.names.len {
-        if !c.ok { break }
-        c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
-        c.slots = 0; c.scope = 0; c.ret_type = c.returns[f]; c.cursor = c.starts[f] - 1
-        arm.mark(&mut c.code, c.fn_labels[f]); frame := arm.prologue(&mut c.code)
-        first := c.param_starts[f]
-        for p in 0..c.param_counts[f] {
-            index := slot(&mut c); bind(&mut c, c.param_names[first + p], c.param_types[first + p], false, index); arm.store(&mut c.code, index, p)
+    arm.syscall(&mut c.code, 33554433, 93); arm.emit(&mut c.code, 3558866944)
+    c.needed[main_id] = true; var compiled: []bool = []
+    for f in 0..c.names.len { compiled.push(false) }
+    var more := true
+    while c.ok && more {
+        more = false
+        for f in 0..c.names.len {
+            if !c.ok { break }; if !c.needed[f] || compiled[f] { continue }
+            compiled[f] = true; more = true
+            c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
+            c.slots = 0; c.scope = 0; c.ret_type = c.returns[f]; c.cursor = c.starts[f] - 1
+            arm.mark(&mut c.code, c.fn_labels[f]); frame := arm.prologue(&mut c.code)
+            first := c.param_starts[f]
+            for p in 0..c.param_counts[f] {
+                index := slot(&mut c); bind(&mut c, c.param_names[first + p], c.param_types[first + p], false, index)
+                if p < 8 { arm.store(&mut c.code, index, p) }
+                else { load_mem(&mut c, 0, 29, 16 + (p - 8) * 16); arm.store(&mut c.code, index, 0) }
+            }
+            c.scope = -1
+            returns := block(&mut c, true)
+            if c.ret_type != 0 && !returns { fail(&mut c, "function can finish without returning a value") }
+            arm.imm(&mut c.code, 0, 0); arm.ret(&mut c.code)
+            if c.ok { arm.frame(&mut c.code, frame, c.slots) }
         }
-        c.scope = -1
-        returns := block(&mut c, true)
-        if c.ret_type != 0 && !returns { fail(&mut c, "function can finish without returning a value") }
-        arm.imm(&mut c.code, 0, 0); arm.ret(&mut c.code)
-        if c.ok { arm.frame(&mut c.code, frame, c.slots) }
     }
     if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [] } }
+    arm.mark(&mut c.code, c.bounds); arm.exit(&mut c.code, 103)
+    clones(&mut c)
     arm.runtime(&mut c.code, c.print_int, c.print_bool, c.print_text, c.write, c.overflow, c.zero, c.assertion, c.io)
+    runtime.emit_runtime(&mut c.code, &rt)
     literals(&mut c)
     text := arm.finish(&mut c.code)
     Result { ok: true, error: "", offset: 0, text: text }
@@ -473,4 +724,17 @@ pub fn compile(source: string) -> Result {
     !compile("fn main(){if 1 {}}").ok
     !compile("fn main(){for i in 0..2{i=3}}").ok
     !compile("import sys\nfn main(){}").ok
+}
+
+@test fn native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation() {
+    !compile_for("fn main(){var a:[i32;2]=[1,2]}", 1).ok
+    !compile_for("struct Box{value:i32} fn main(){var a:[]Box=[]}", 1).ok
+    !compile_for("fn main(){a:[]i32=[1];a.clear()}", 1).ok
+    !compile_for("fn main(){a:[]i32=[1];a.reserve(8)}", 1).ok
+    !compile_for("fn main(){a:[]i32=[1];x:=a.pop()}", 1).ok
+    !compile_for("fn f(x:i32)->i32{x} fn main(){var a:=1;f(a)=2}", 1).ok
+    !compile_for("fn f()->i32{42} fn main(){f:=1;print(f())}", 1).ok
+    !compile_for("fn main(){var a:=true;(!a)=false}", 1).ok
+    !compile_for("fn main(){var a:=1;(-a)=2}", 1).ok
+    compile_for("enum K{A,B} struct Box{values:[]i32,tag:K} fn main(){var b:=Box{values:[1,2],tag:.A};b.values.push(3);b.tag=.B;print(b.values.len)}", 1).ok
 }

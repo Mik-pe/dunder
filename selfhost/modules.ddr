@@ -1,0 +1,395 @@
+// Module loading and namespace resolution for the Dunder compiler.
+// Parallel arrays deliberately keep the bootstrap data model small.
+import lexer
+import bundled
+import std.map as map
+import std.bytes as bytes
+import sys
+
+pub struct Location { path: string, source: string, offset: i32 }
+pub struct Loaded {
+    ok: bool, error: string, path: string, source: string, offset: i32,
+    paths: []string, sources: []string,
+    map_starts: []i32, map_ends: []i32, map_files: []i32, map_offsets: []i32,
+}
+struct Loader {
+    result: Loaded, standard: []string, first: []i32, last: []i32,
+    kinds: []lexer.Kind, texts: []string, starts: []i32, ends: []i32,
+    omit: []bool, declared: []i32,
+    symbols: map.Map, imports: map.Map, names: []string, owners: []i32,
+    public: []bool, renamed: []string,
+}
+fn key(owner: i32, name: string) -> string { owner.str() + ":" + name }
+fn begins(text: string, prefix: string) -> bool {
+    if text.len < prefix.len { return false }
+    var i := 0
+    while i < prefix.len { if text[i] != prefix[i] { return false }; i = i + 1 }
+    true
+}
+fn text(output: &mut []i32, value: string) {
+    output.reserve(output.len + value.len)
+    var i := 0
+    while i < value.len { output.push(value[i]); i = i + 1 }
+}
+pub fn normalize(path: string) -> string {
+    var parts: []string = []
+    absolute := path.len > 0 && path[0] == 47
+    var start := 0
+    var i := 0
+    while i <= path.len {
+        if i == path.len || path[i] == 47 {
+            part := path[start..i]
+            if part == ".." {
+                if parts.len > 0 && parts[parts.len - 1] != ".." { old := parts.pop() }
+                else if !absolute { parts.push(part) }
+            } else if part != "" && part != "." { parts.push(part) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    var output: []i32 = []
+    if absolute { output.push(47) }
+    i = 0
+    while i < parts.len {
+        if i > 0 { output.push(47) }
+        text(&mut output, parts[i]); i = i + 1
+    }
+    if output.len == 0 { return "." }
+    decoded := bytes.utf8(&output)
+    decoded.value
+}
+fn parent(path: string) -> string {
+    var i := path.len
+    while i > 0 { i = i - 1; if path[i] == 47 { if i == 0 { return "/" }; return path[0..i] } }
+    "."
+}
+fn fail(loader: &mut Loader, owner: i32, offset: i32, message: string) {
+    if !loader.result.ok { return }
+    loader.result.ok = false; loader.result.error = message
+    loader.result.path = loader.result.paths[owner]
+    loader.result.source = loader.result.sources[owner]
+    loader.result.offset = offset
+}
+fn is(loader: &Loader, at: i32, value: string) -> bool {
+    if at < 0 || at >= loader.texts.len { return false }
+    kind := loader.kinds[at]
+    if kind != .Name && kind != .Keyword && kind != .Symbol { return false }
+    loader.texts[at] == value
+}
+fn add(loader: &mut Loader, path: string, standard: string, origin: i32, offset: i32) -> i32 {
+    actual := normalize(path)
+    var i := 0
+    while i < loader.result.paths.len {
+        if standard != "" {
+            if loader.standard[i] == standard { return i }
+        } else if loader.standard[i] == "" {
+            if loader.result.paths[i] == actual || sys.same_file(loader.result.paths[i], actual) { return i }
+        }
+        i = i + 1
+    }
+    var source := ""
+    if standard != "" { source = bundled.source(standard) }
+    else {
+        read := sys.read_text(actual)
+        if !read.ok {
+            if origin >= 0 { fail(&mut loader, origin, offset, "cannot load module " + actual + ": " + sys.error_message(read.error)) }
+            else { loader.result.ok = false; loader.result.path = actual; loader.result.error = "cannot load module: " + sys.error_message(read.error) }
+            return -1
+        }
+        source = read.value
+    }
+    id := loader.result.paths.len
+    loader.result.paths.push(actual); loader.result.sources.push(source)
+    loader.standard.push(standard); loader.first.push(0); loader.last.push(0)
+    id
+}
+fn skip_lines(loader: &Loader, at: i32) -> i32 {
+    var i := at
+    while i < loader.texts.len && loader.kinds[i] == .Newline { i = i + 1 }
+    i
+}
+fn close_block(loader: &Loader, at: i32) -> i32 {
+    var i := at
+    var depth := 0
+    while i < loader.texts.len {
+        if is(&loader, i, "{") { depth = depth + 1 }
+        if is(&loader, i, "}") { depth = depth - 1; if depth == 0 { return i + 1 } }
+        i = i + 1
+    }
+    -1
+}
+fn hide(loader: &mut Loader, first: i32, last: i32) {
+    var i := first
+    while i < last { loader.omit[i] = true; i = i + 1 }
+}
+fn import_module(loader: &mut Loader, owner: i32, at: i32) -> i32 {
+    var i := at + 1
+    var path := ""
+    var alias := ""
+    if i < loader.texts.len && loader.kinds[i] == .String {
+        path = loader.texts[i]
+        var start := 0
+        var n := 0
+        while n < path.len { if path[n] == 47 { start = n + 1 }; n = n + 1 }
+        alias = path[start..path.len]; i = i + 1
+    } else {
+        // Leading dots mean current directory (.) or parent directories (.., ...).
+        var dots := 0
+        while is(&loader, i, ".") || is(&loader, i, "..") { dots = dots + loader.texts[i].len; i = i + 1 }
+        if dots == 1 { path = "./" }
+        var n := 1
+        while n < dots { path = path + "../"; n = n + 1 }
+        if i >= loader.texts.len || loader.kinds[i] != .Name {
+            fail(&mut loader, owner, loader.starts[at], "expected a module name after import"); return i
+        }
+        alias = loader.texts[i]; path = path + alias; i = i + 1
+        while is(&loader, i, ".") || is(&loader, i, "/") {
+            i = i + 1
+            if i >= loader.texts.len || loader.kinds[i] != .Name {
+                fail(&mut loader, owner, loader.starts[at], "expected a module name after separator"); return i
+            }
+            alias = loader.texts[i]; path = path + "/" + alias; i = i + 1
+        }
+    }
+    if is(&loader, i, "as") {
+        i = i + 1
+        if i >= loader.texts.len || loader.kinds[i] != .Name { fail(&mut loader, owner, loader.starts[at], "expected an import alias"); return i }
+        alias = loader.texts[i]; i = i + 1
+    }
+    if i < loader.texts.len && loader.kinds[i] != .Newline && loader.kinds[i] != .End && !is(&loader, i, ";") {
+        fail(&mut loader, owner, loader.starts[i], "expected end of import"); return i
+    }
+    if is(&loader, i, ";") { i = i + 1 }
+    if path == "" || path[0] == 47 || begins(alias, "__") {
+        fail(&mut loader, owner, loader.starts[at], "import a relative module name with a non-reserved alias"); return i
+    }
+    if alias == "ddr" { fail(&mut loader, owner, loader.starts[at], "omit the file suffix in imports"); return i }
+    var standard := ""
+    var target := ""
+    var library := ""
+    if path == "sys" { library = "sys" }
+    if begins(path, "std/") { library = path[4..path.len] }
+    if library != "" && bundled.contains(library) { standard = library; target = "<stdlib/" + library + ".ddr>" }
+    else {
+        if loader.standard[owner] != "" { fail(&mut loader, owner, loader.starts[at], "bundled libraries may only import bundled modules"); return i }
+        target = parent(loader.result.paths[owner]) + "/" + path + ".ddr"
+    }
+    entry := key(owner, alias)
+    if map.contains(&loader.imports, entry) || map.contains(&loader.symbols, entry) { fail(&mut loader, owner, loader.starts[at], "duplicate import alias '" + alias + "'"); return i }
+    id := add(&mut loader, target, standard, owner, loader.starts[at])
+    if id >= 0 { map.put(&mut loader.imports, entry, i64(id)) }
+    hide(&mut loader, at, i)
+    i
+}
+fn scan(loader: &mut Loader, owner: i32) {
+    tokens := lexer.lex(loader.result.sources[owner])
+    if !tokens.ok { fail(&mut loader, owner, tokens.error_at, tokens.error); return }
+    first := loader.texts.len
+    loader.first[owner] = first
+    var i := 0
+    while i < tokens.texts.len {
+        loader.kinds.push(tokens.kinds[i]); loader.texts.push(tokens.texts[i])
+        loader.starts.push(tokens.starts[i]); loader.ends.push(tokens.ends[i])
+        loader.omit.push(false); loader.declared.push(-1)
+        i = i + 1
+    }
+    last := loader.texts.len
+    loader.last[owner] = last
+    i = first
+    var depth := 0
+    var public := false
+    var parens := 0
+    while i < last && loader.result.ok {
+        if depth == 0 && is(&loader, i, "import") { i = import_module(&mut loader, owner, i); public = false; continue }
+        if depth == 0 && is(&loader, i, "@") && is(&loader, i + 1, "test") {
+            start := i
+            i = skip_lines(&loader, i + 2)
+            if is(&loader, i, "{") { i = close_block(&loader, i) }
+            else {
+                if is(&loader, i, "pub") { i = i + 1 }
+                if !is(&loader, i, "fn") { fail(&mut loader, owner, loader.starts[start], "expected test function or test cases"); return }
+                while i < last && !is(&loader, i, "{") { i = i + 1 }
+                i = close_block(&loader, i)
+            }
+            if i < 0 { fail(&mut loader, owner, loader.starts[start], "unterminated test block"); return }
+            hide(&mut loader, start, i); continue
+        }
+        if depth == 0 && is(&loader, i, "pub") { public = true }
+        if depth == 0 && parens == 0 && (is(&loader, i, "fn") || is(&loader, i, "struct") || is(&loader, i, "enum")) {
+            name_at := i + 1
+            if name_at >= last || loader.kinds[name_at] != .Name { fail(&mut loader, owner, loader.starts[i], "expected declaration name"); return }
+            name := loader.texts[name_at]
+            entry := key(owner, name)
+            if map.contains(&loader.symbols, entry) || map.contains(&loader.imports, entry) {
+                fail(&mut loader, owner, loader.starts[name_at], "duplicate declaration '" + name + "'"); return
+            }
+            id := loader.names.len
+            map.put(&mut loader.symbols, entry, i64(id))
+            loader.names.push(name); loader.owners.push(owner); loader.public.push(public)
+            var renamed := "__dunder_module_" + id.str()
+            if owner == 0 && name == "main" && is(&loader, i, "fn") { renamed = "main" }
+            loader.renamed.push(renamed); loader.declared[name_at] = id
+            public = false
+        }
+        if is(&loader, i, "{") { depth = depth + 1 }
+        if is(&loader, i, "}") { depth = depth - 1 }
+        if is(&loader, i, "(") || is(&loader, i, "[") { parens = parens + 1 }
+        if is(&loader, i, ")") || is(&loader, i, "]") { parens = parens - 1 }
+        i = i + 1
+    }
+}
+fn local(names: &[]string, active: &[]i32, at: i32, value: string) -> bool {
+    var i := names.len
+    while i > 0 { i = i - 1; if names[i] == value && at >= active[i] { return true } }
+    false
+}
+fn binding_end(loader: &Loader, at: i32, last: i32) -> i32 {
+    var i := at + 1
+    var nested := 0
+    while i < last {
+        if nested == 0 && (loader.kinds[i] == .Newline || is(&loader, i, ";") || is(&loader, i, "}")) { return i }
+        if is(&loader, i, "(") || is(&loader, i, "[") || is(&loader, i, "{") { nested = nested + 1 }
+        if is(&loader, i, ")") || is(&loader, i, "]") || is(&loader, i, "}") { nested = nested - 1 }
+        i = i + 1
+    }
+    i
+}
+fn emit(loader: &mut Loader, output: &mut []i32, owner: i32, token: i32, value: string) {
+    loader.result.map_starts.push(output.len)
+    text(&mut output, value)
+    loader.result.map_ends.push(output.len)
+    loader.result.map_files.push(owner); loader.result.map_offsets.push(loader.starts[token])
+    output.push(32)
+}
+fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32) {
+    var i := loader.first[owner]
+    last := loader.last[owner]
+    var depth := 0
+    // mode: 0 top level, 1 function signature, 2 function body, 3 record, 4 enum.
+    var mode := 0
+    var locals: []string = []
+    var levels: []i32 = []
+    var active: []i32 = []
+    var previous := -1
+    while i < last && loader.result.ok {
+        if loader.omit[i] { i = i + 1; continue }
+        kind := loader.kinds[i]
+        if kind == .End { i = i + 1; continue }
+        if kind == .Newline { output.push(10); previous = i; i = i + 1; continue }
+        value := loader.texts[i]
+        if depth == 0 && is(&loader, i, "fn") && i + 1 < last && loader.declared[i + 1] >= 0 { mode = 1; locals.clear(); levels.clear(); active.clear() }
+        if depth == 0 && is(&loader, i, "struct") { mode = 3 }
+        if depth == 0 && is(&loader, i, "enum") { mode = 4 }
+        var spelling := loader.result.sources[owner][loader.starts[i]..loader.ends[i]]
+        var consumed := 1
+        if kind == .Name {
+            if begins(value, "__dunder_module_") || (begins(value, "__sys_") && loader.standard[owner] != "sys") {
+                fail(&mut loader, owner, loader.starts[i], "reserved compiler identifier '" + value + "'"); return
+            }
+            declaration := loader.declared[i]
+            field := is(&loader, i + 1, ":")
+            var binding := false
+            if mode == 1 && field { binding = true }
+            if mode == 2 {
+                if is(&loader, i + 1, ":=") || (field && (previous < 0 || loader.kinds[previous] == .Newline || is(&loader, previous, "{") || is(&loader, previous, ";") || is(&loader, previous, "var"))) { binding = true }
+                if is(&loader, previous, "for") { binding = true }
+            }
+            if binding {
+                locals.push(value)
+                var level := depth
+                var visible := i
+                if mode == 2 {
+                    visible = binding_end(&loader, i, last)
+                    if is(&loader, previous, "for") {
+                        level = depth + 1; visible = i + 1
+                        while visible < last && !is(&loader, visible, "{") { visible = visible + 1 }
+                    }
+                }
+                levels.push(level); active.push(visible)
+            }
+            after_dot := is(&loader, previous, ".")
+            enum_member := mode == 4 && depth == 1 && (previous < 0 || loader.kinds[previous] == .Newline || is(&loader, previous, "{") || is(&loader, previous, ","))
+            if declaration >= 0 { spelling = loader.renamed[declaration] }
+            else if !after_dot && !field && !binding && !enum_member {
+                alias := i32(map.get_or(&loader.imports, key(owner, value), -1))
+                if alias >= 0 && !local(&locals, &active, i, value) && is(&loader, i + 1, ".") && i + 2 < last && loader.kinds[i + 2] == .Name {
+                    member := loader.texts[i + 2]
+                    found := i32(map.get_or(&loader.symbols, key(alias, member), -1))
+                    if found < 0 { fail(&mut loader, owner, loader.starts[i], "module '" + value + "' has no declaration '" + member + "'"); return }
+                    if !loader.public[found] { fail(&mut loader, owner, loader.starts[i], "'" + value + "." + member + "' is private; export it with pub"); return }
+                    spelling = loader.renamed[found]; consumed = 3
+                } else if !local(&locals, &active, i, value) {
+                    found := i32(map.get_or(&loader.symbols, key(owner, value), -1))
+                    if found >= 0 { spelling = loader.renamed[found] }
+                }
+            }
+        }
+        emit(&mut loader, &mut output, owner, i, spelling)
+        if is(&loader, i, "{") {
+            depth = depth + 1
+            if mode == 1 { mode = 2 }
+        }
+        if is(&loader, i, "}") {
+            while levels.len > 0 && levels[levels.len - 1] >= depth { name := locals.pop(); level := levels.pop(); begin := active.pop() }
+            depth = depth - 1
+            if depth == 0 { mode = 0; locals.clear(); levels.clear(); active.clear() }
+        }
+        previous = i + consumed - 1
+        i = i + consumed
+    }
+    output.push(10)
+}
+pub fn location(loaded: &Loaded, offset: i32) -> Location {
+    var lo := 0
+    var hi := loaded.map_starts.len
+    while lo < hi {
+        mid := lo + (hi - lo) / 2
+        if loaded.map_starts[mid] <= offset { lo = mid + 1 } else { hi = mid }
+    }
+    if lo == 0 { return Location { path: loaded.path, source: loaded.sources[0], offset: 0 } }
+    index := lo - 1
+    owner := loaded.map_files[index]
+    Location { path: loaded.paths[owner], source: loaded.sources[owner], offset: loaded.map_offsets[index] }
+}
+pub fn load(path: string) -> Loaded {
+    var loader := Loader {
+        result: Loaded { ok: true, error: "", path: path, source: "", offset: 0,
+            paths: [], sources: [], map_starts: [], map_ends: [], map_files: [], map_offsets: [] },
+        standard: [], first: [], last: [], kinds: [], texts: [], starts: [], ends: [], omit: [], declared: [],
+        symbols: map.new(), imports: map.new(), names: [], owners: [], public: [], renamed: [],
+    }
+    root := add(&mut loader, path, "", -1, 0)
+    var owner := 0
+    while owner < loader.result.paths.len && loader.result.ok { scan(&mut loader, owner); owner = owner + 1 }
+    var output: []i32 = []
+    owner = 0
+    while owner < loader.result.paths.len && loader.result.ok { flatten(&mut loader, owner, &mut output); owner = owner + 1 }
+    if loader.result.ok {
+        decoded := bytes.utf8(&output)
+        loader.result.source = decoded.value
+    }
+    loader.result
+}
+
+@test fn paths_collapse_components_without_losing_relative_parents() {
+    normalize("./src/../main.ddr") == "main.ddr"
+    normalize("../../lib/./module.ddr") == "../../lib/module.ddr"
+    normalize("/../src//nested/../main.ddr") == "/src/main.ddr"
+    normalize("a/..") == "."
+    normalize("/") == "/"
+}
+
+@test fn diagnostics_select_original_module_and_token_offset() {
+    loaded := Loaded {
+        ok: true, error: "", path: "main.ddr", source: "fn main", offset: 0,
+        paths: ["main.ddr", "lib.ddr"], sources: ["fn main() {}", "\nfn value() {}"],
+        map_starts: [0, 3, 20], map_ends: [2, 7, 25], map_files: [0, 0, 1], map_offsets: [0, 3, 4],
+    }
+    first := location(&loaded, 0)
+    first.path == "main.ddr"
+    first.offset == 0
+    last := location(&loaded, 22)
+    last.path == "lib.ddr"
+    last.source == "\nfn value() {}"
+    last.offset == 4
+}

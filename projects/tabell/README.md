@@ -64,3 +64,8 @@ structreturer med dynamiska fält, UTF-8-bytebuffertar, map, strängsortering,
 programargument, fil-I/O och separata stdout/stderr. Parserns och rapportens
 taggade tester finns nära funktionerna. Kompilatorns integrationstest
 `tests/tabell.rs` jämför dessutom riktiga CLI-körningar med en oberoende referens.
+
+Tabell byggs också av den [självbyggda Dunder-kompilatorn](../../selfhost/README.md).
+Stage 3 kompilerar projektet till ARM64/Linux; binären körs under QEMU och
+dess CSV jämförs med `expected.csv`. Samma byggväg har även summerat
+källradinventeringen av Blixt-projektet med identiskt resultat som referensen.

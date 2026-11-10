@@ -70,10 +70,11 @@ En första implementation får bygga om allt. Nästa version lagrar maskinkodsfr
 ## Vägen till en självhostad kompilator
 
 Rust-bootstrapen bygger den Dunder-skrivna kompilatorn i `selfhost/`.
-Den bygger redan skalära program till ARM64/macOS, men saknar ännu stöd
-för sina egna importer och aggregat. Nästa steg är att implementera dessa
-språkdelar och sedan låta kompilatorn bygga sig själv i två på varandra
-följande steg. Resultaten ska vara byteidentiska och klara språktesterna.
+Ingången `selfhost/linux.ddr` bygger nu samma kompilatorkällor till
+ARM64/Linux. Nästa självbygge ger en byteidentisk binär; den bygger
+fristående program och CSV-projektet Tabell med verifierade resultat.
+Modulladdare, typer, kodgenerering, runtime och ELF-skrivare är Dunder-kod.
+Full språkparitet och självbyggda macOS-/x86-64-mål återstår.
 Återställning från ren källkod och verifieringskraven finns i
 [bootstrapguiden](../selfhost/README.md).
 
