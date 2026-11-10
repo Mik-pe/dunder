@@ -38,6 +38,8 @@ implementeras i [native-backenden](../src/native/sys.rs).
 | `sys.read(path)` | `sys.ReadResult` | UTF-8-läsning med `Ok(string)` / `Err(IoError)`. |
 | `sys.read_text(path)` | `sys.TextResult` | Läser en vanlig fil och validerar UTF-8. |
 | `sys.write_text(path, text)` | `sys.Status` | Skapar filen eller ersätter hela dess innehåll. |
+| `sys.write_stderr(text)` | `sys.Status` | Skriver textens exakta UTF-8-byte till stderr, utan radbrytning. |
+| `sys.eprint(text)` | `sys.Status` | Skriver text till stderr följd av en radbrytning. |
 | `sys.append_text(path, text)` | `sys.Status` | Skapar filen eller lägger till text sist. |
 | `sys.metadata(path)` | `sys.Metadata` | Storlek och fil-/katalogtyp; följer symboliska länkar. |
 | `sys.mkdir(path)` | `sys.Status` | Skapar en katalog, ett steg åt gången. |
@@ -100,6 +102,15 @@ Ett normalt I/O-fel är ett resultat; det avbryter inte processen.
 Koden väljer själv hur felet hanteras. Det finns ännu ingen `?`-operator
 eller generell Result/Option-typ. Konkreta enums och `match` fungerar redan;
 se [enumreglerna](enums.md).
+
+`write_stderr` och `eprint` låter ett CLI-program skilja diagnostik från
+maskinläsbar stdout. Båda returnerar `Status`; bind resultatet och kontrollera
+`.ok` när programmet behöver hantera ett skrivfel. De använder processens
+befintliga filhandtag 2, öppnar eller stänger det inte och bevarar inbäddad NUL.
+Korta skrivningar fortsätter från rätt byte och avbrott försöks igen.
+Ett stängt handtag ger fel 9; ett fullt icke-blockerande handtag ger fel 35.
+Vid ett senare fel kan en del av texten redan ha skrivits. `eprint` använder
+den vanliga strängarenan för att lägga till radbrytningen.
 
 `write_bytes` följer samma fil-/skrivregler som `write_text`, men UTF-8 krävs
 inte för innehållet. Den validerar byteintervallet före öppning/trunkering;
@@ -180,9 +191,9 @@ inte hela systemets lokaliserade felkatalog.
 
 Det exakta importnamnet `sys` väljer det medföljande biblioteket och kan
 aliaseras med `import sys as os`. Flera importer laddar det en gång och
-delar samma typidentitet, också genom `import "std/sys" as os`.
+delar samma typidentitet, också genom `import std/sys as os`.
 För en egen lokal fil med samma namn används
-exempelvis `import "./sys" as local`. Vanliga moduler söks fortsatt relativt
+exempelvis `import ./sys as local`. Vanliga moduler söks fortsatt relativt
 den importerande filen. De privata `__sys_*`-intrinsics är endast tillgängliga
 inne i det medföljande biblioteket.
 

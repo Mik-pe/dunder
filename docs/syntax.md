@@ -195,24 +195,31 @@ får innehålla bokstäver som `å`, `ä` och `ö`; nyckelorden är engelska.
 ## Moduler och importer
 
 En fil är en modul. Namnen i modulen är lokala för den filen. Skriv en
-import på toppnivå **utan suffix**:
+import på toppnivå **utan citattecken eller suffix**:
 
 ```dunder
 import math
-import "geometry/vector" as vector
+import geometry/vector as vector
+import ../shared/config
+import std/map
 ```
 
-`import sys` väljer det inbäddade macOS-systembiblioteket; se [sys](sys.md).
+`import sys` väljer det inbäddade systembiblioteket för macOS/Linux; se [sys](sys.md).
 Det kan aliaseras och dedupliceras precis som andra moduler. En egen lokal
-fil med samma namn importeras uttryckligt som `import "./sys" as local`.
+fil med samma namn importeras uttryckligt som `import ./sys as local`.
 
 Den första importen läser `math.ddr` bredvid den importerande filen. Den andra
 läser `geometry/vector.ddr` relativt samma fil. Sökningen beror inte på
-processens arbetskatalog. Citerade relativa sökvägar kan innehålla `../`.
+processens arbetskatalog. Relativa sökvägar kan innehålla `./` och `../`.
 Absoluta sökvägar och suffix i importer avvisas. Utan `as` kommer aliaset
-från det sista sökvägssegmentet; `import "geometry/vector"` får alias `vector`.
+från det sista sökvägssegmentet; `import geometry/vector` får alias `vector`.
 Ett alias måste vara ett giltigt, icke reserverat namn. Till exempel kräver
-`import "foo-bar" as foo` ett explicit alias eftersom bindestreck inte ingår i namn.
+`import foo-bar as foo` ett explicit alias eftersom bindestreck inte ingår i namn.
+
+Sökvägen skrivs sammanhängande, utan mellanslag runt `/`. Skriv mellanslag
+före `as` eller en efterföljande kommentar: `import std/map // uppslagstabell`.
+Tomma segment som `std//map` och en avslutande `/` avvisas.
+Den äldre citerade formen stöds för kompatibilitet, men behövs inte.
 
 ```dunder
 // math.ddr

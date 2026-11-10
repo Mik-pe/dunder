@@ -162,7 +162,7 @@ impl Loader {
                 return Err(Error::new(
                     "E0401",
                     import.span,
-                    "omit the file suffix in imports; write import math or import \"utils/math\"",
+                    "omit the file suffix in imports; write import math or import utils/math",
                 )
                 .in_file(id));
             }

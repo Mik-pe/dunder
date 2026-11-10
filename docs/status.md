@@ -5,6 +5,33 @@ x86-64/Linux. `--target` väljer utdata oberoende av värdplattform; inga extern
 kompileringsverktyg eller mål-SDK:er behövs för Dunderbygget.
 Se [målplattformar och korskompilering](targets.md).
 
+## Dogfooding med ett fristående projekt
+
+[Tabell](../projects/tabell/README.md) grupperar CSV och summerar en vald
+heltalskolumn. Projektet har eget manifest och provar citerade fält,
+Unicode, radbrytningar, sorterade grupper och kontrollerat heltalsspill.
+Det drev tre tillägg:
+
+- Importer utan citattecken för sökvägar: `import std/map`,
+  `import ../shared/value` och `import ./sys as local`. Äldre citerade
+  importer stöds fortfarande. Projektets källor och dokumentation använder
+  den nya formen.
+- `array.sort_strings(&mut values)`: heapsort över UTF-8-byte, O(n log n)
+  utan extra array. Testat mot Rusts ordning för 2 048 genererade nycklar.
+- `sys.write_stderr` och `sys.eprint`: diagnostik separat från stdout,
+  med resultat för skrivfel och hantering av korta skrivningar och avbrott.
+
+Verifierat på Linux/x86-64: 95 Rust-tester, 45 testgrupper i huvudträdet och
+14 i Tabell; formatering, Clippy och releasebygge passerar. Tabells fem
+integrationstester omfattar en oberoende referens för 512 genererade CSV-rader,
+felaktiga indata och byggen för alla tre mål. ARM64/Linux under QEMU klarar
+huvudträdets 45 grupper samt Tabells exempel och spillfel. Ingen macOS-körning
+har gjorts i Linuxmiljön.
+
+Tabell har även summerat en CSV-inventering av 361 källfiler från den lokala
+Blixt-checkouten; resultatet matchade en oberoende summering. Det testet ändrade
+inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet.
+
 ## Implementerat
 
 - Standardbibliotek i Dunder: `std/map`, `std/set`, `std/array`, `std/text`,
@@ -21,7 +48,7 @@ Se [målplattformar och korskompilering](targets.md).
   wrapping-aritmetik. SHA-256 och bytekodning använder dem som dogfood.
 - `.ddr` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
   Användarens val ersätter den tidigare tvåbokstavsändelsen. Importer saknar fortsatt suffix.
-- En fil per modul: `import math` eller `import "util/math" as math`, utan
+- En fil per modul: `import math` eller `import util/math as math`, utan
   suffix. Privata `fn` och exporterade `pub fn`, alias och kvalificerade namn.
   Samlade signaturer stödjer cykliska importer och ömsesidig rekursion.
   Kanoniska filsökvägar deduplicerar delade beroenden och symboliska länkar.

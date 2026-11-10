@@ -37,6 +37,40 @@ fn success(o: &std::process::Output) {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn string_sort_matches_rust_order_for_generated_utf8_keys() {
+    let pieces = ["", "a", "z", "å", "ä", "🌍", "\0", "\n", "a,b", "\""];
+    let mut state = 1234567_u64;
+    let mut values = Vec::new();
+    for i in 0..2048 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let left = pieces[(state >> 32) as usize % pieces.len()];
+        let right = pieces[(state >> 16) as usize % pieces.len()];
+        values.push(format!("{left}{}{right}", i % 97));
+    }
+    let mut source = String::from("import std/array\nfn main(){var keys:[]string=[]\n");
+    for value in &values {
+        source.push_str(&format!("keys.push({value:?})\n"));
+    }
+    source.push_str("original:=keys\narray.sort_strings(&mut keys)\n");
+    source.push_str(&format!("assert(original[0]=={:?})\n", values[0]));
+    values.sort();
+    for (i, value) in values.iter().enumerate() {
+        source.push_str(&format!("assert(keys[{i}]=={value:?})\n"));
+    }
+    source.push_str("print(\"sorted\")}\n");
+    let result = native(&source);
+    success(&result);
+    assert_eq!(result.stdout, b"sorted\n");
+}
 #[test]
 fn borrows_and_dynamic_mutation_obey_types_and_immutability() {
     for source in [

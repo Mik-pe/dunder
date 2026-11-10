@@ -4,11 +4,15 @@ Det här är Dunder-program som kompileras och körs med Dunders egen backend.
 De används också av kompilatorns integrationstester, med kontrollerad stdout
 och definierade felstatusar. Importer skrivs utan filändelse.
 
+Det fristående [Tabell-projektet](../projects/tabell/README.md) använder också
+Dunder för ett riktigt CSV-CLI med eget manifest, parser, gruppering och
+diagnostik. Det driver importer utan citattecken, strängsortering och stderr.
+
 Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 44 passed, 0 failed
+# 45 passed, 0 failed
 ```
 
 Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
@@ -73,7 +77,7 @@ Användardefinierade iteratorer återstår.
 [Standardbiblioteket](../docs/standard.md) är Dunder-kod, inbäddad i
 kompilatorn och importerad som `std/map`, `std/set` och så vidare.
 `standard.ddr` kopplar ihop samlingarna i en UTF-8-ordräknare. Dess två
-testgrupper och bibliotekens åtta grupper ingår i huvudträdet.
+testgrupper och bibliotekens nio grupper ingår i huvudträdet.
 Även den [Dunder-skrivna kompilatorns](../selfhost/README.md) lexer och
 typkontroll har egna taggade grupper här. Den bygger skalära nativeprogram
 men kan ännu inte kompilera hela sin egen källkod.

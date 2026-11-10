@@ -187,6 +187,99 @@ fn import_names_paths_and_diagnostics_are_checked() {
 }
 
 #[test]
+fn bare_import_paths_preserve_spelling_aliases_and_statement_boundaries() {
+    let source = "import std/map\r\nimport ../shared/value as common; import ./sys as local\nimport å-dir/value-name as value // trailing comment\nimport /* leading comment */ util/math /* trailing comment */\nimport 'legacy/path' as legacy\nimport std/text";
+    let parsed = dunder::syntax::parse(source).unwrap();
+    let paths: Vec<_> = parsed
+        .imports
+        .iter()
+        .map(|import| (import.path.as_str(), import.alias.as_str()))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            ("std/map", "map"),
+            ("../shared/value", "common"),
+            ("./sys", "local"),
+            ("å-dir/value-name", "value"),
+            ("util/math", "math"),
+            ("legacy/path", "legacy"),
+            ("std/text", "text"),
+        ]
+    );
+    for import in &parsed.imports {
+        assert_eq!(&source[import.span.start..import.span.end], "import");
+    }
+    // Path lexing is contextual; '/' and '-' retain their expression meaning.
+    dunder::check("fn main(){print(12 / 3 - 1);print(12/3-1)}").unwrap();
+}
+
+#[test]
+fn malformed_bare_import_paths_fail_before_loading_a_different_module() {
+    let project = Project::new();
+    project.write("math.ddr", "pub fn value()->i32{42}");
+    project.write("foo-bar.ddr", "pub fn value()->i32{42}");
+    for (path, code) in [
+        ("math/", "E0401"),
+        ("math//hidden", "E0401"),
+        ("math/*hidden*/", "E0401"),
+        ("math\\hidden", "E0401"),
+        ("/absolute/math", "E0401"),
+        (".", "E0401"),
+        ("..", "E0401"),
+        ("math/..", "E0401"),
+        ("math.ddr", "E0401"),
+        ("foo-bar", "E0401"),
+        ("math / value", "E0107"),
+        ("math value", "E0107"),
+        ("", "E0107"),
+    ] {
+        project.write("main.ddr", &format!("\nimport {path}\nfn main(){{}}"));
+        let error = project.error(code).render();
+        assert!(error.contains("main.ddr:2:"), "{path}: {error}");
+    }
+}
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn bare_imports_load_relative_paths_bundled_modules_and_aliases_natively() {
+    let project = Project::new();
+    project.write(
+        "main.ddr",
+        r#"import std/text
+import std/map as counts
+import sys
+import ./sys as local
+import util/predicates
+import å-dir/value-name as value
+fn main(){
+    var m := counts.new()
+    counts.put(&mut m, "answer", i64(predicates.answer()))
+    print(counts.get_or(&m, "answer", 0))
+    print(text.trim(" å 🌍 "))
+    print(local.value() + value.answer())
+    print(sys.pid() > 0)
+}
+"#,
+    );
+    project.write("sys.ddr", "pub fn value()->i32{20}");
+    project.write(
+        "util/predicates.ddr",
+        "import ../shared/value as common\npub fn answer()->i32{common.answer()}",
+    );
+    project.write("shared/value.ddr", "pub fn answer()->i32{42}");
+    project.write("å-dir/value-name.ddr", "pub fn answer()->i32{22}");
+    let checked = project.check();
+    assert_eq!(project.execute(&compile(&checked)), "42\nå 🌍\n42\ntrue\n");
+}
+
+#[test]
 #[cfg(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(

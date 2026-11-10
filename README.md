@@ -125,8 +125,9 @@ fn main() {
 
 `fn` är privat inom modulen; `pub fn` exporterar funktionen. `import math`
 läser `math.ddr`. Undermappar och alias skrivs exempelvis
-`import "util/predicates" as predicates`. `import "math"` stöds också.
-Ingen importform innehåller `.ddr`.
+`import util/predicates as predicates`. Sökvägar behöver inga citattecken;
+även `import ../shared/math` och `import ./sys as local` fungerar.
+Importerna skrivs utan `.ddr`.
 
 Typer följer samma regel: `struct Point` och `enum Command` är privata;
 `pub struct Point` och `pub enum Command` exporteras.
@@ -227,9 +228,9 @@ och begränsade funktionsborrows finns nu i standardbibliotekets första steg.
 ## Standardbibliotek och dynamiska arrayer
 
 ```dunder
-import "std/map" as map
-import "std/set" as set
-import "std/array" as array
+import std/map as map
+import std/set as set
+import std/array as array
 
 fn main() {
     var counts := map.new()
@@ -387,6 +388,24 @@ Läs [sys-reglerna](docs/sys.md) för beteende och begränsningar och kör
 
 Structar och fasta arrayer kan nu returneras som värden. Resultatet kopieras
 till lagring hos anroparen och fungerar även genom callbacks och rekursion.
+
+## Fristående projekt: Tabell
+
+[Tabell](projects/tabell/README.md) är ett CSV-verktyg skrivet i Dunder med
+eget manifest. Det grupperar rader och summerar en heltalskolumn, till exempel
+kostnader i ören per team:
+
+```sh
+cargo build --release
+cd projects/tabell
+../../target/release/dunder run -- expenses.csv team cents
+../../target/release/dunder test
+```
+
+Projektet använder importer utan citattecken, `array.sort_strings` och
+`sys.eprint`. CSV-parsning, gruppering, sortering och felhantering körs i
+den färdiga binären utan externa verktyg. Integrationstesterna jämför även
+genererade CSV-data med en oberoende referens och bygger alla tre mål.
 
 ## Implementerat och återstående
 

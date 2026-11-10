@@ -15,7 +15,7 @@ const MAX_READ: u64 = 4 * 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct Runtime {
-    calls: [Label; 15],
+    calls: [Label; 16],
     path: Label,
     utf8: Label,
     pack: Label,
@@ -47,6 +47,7 @@ fn index(op: SysOp) -> usize {
         SysOp::MakeExecutable => 12,
         SysOp::DecodeUtf8 => 13,
         SysOp::SameFile => 14,
+        SysOp::WriteStderr => 15,
     }
 }
 impl Code<'_> {
@@ -444,6 +445,7 @@ impl Code<'_> {
         self.sys_same_file();
         self.sys_binary_write();
         self.sys_pack_runtime();
+        self.sys_stderr();
         for (op, number) in [
             (SysOp::Mkdir, 136),
             (SysOp::Rename, 128),
@@ -498,6 +500,49 @@ impl Code<'_> {
         self.sys_io(SysOp::ReadText);
         self.sys_io(SysOp::WriteText);
         self.sys_io(SysOp::AppendText);
+    }
+    fn sys_stderr(&mut self) {
+        let ty = self.sys_begin(SysOp::WriteStderr);
+        self.load(1);
+        self.ldr(1, 0);
+        self.store(4, 1); // remaining bytes
+        self.add_imm(0, 0, 8);
+        self.store(3, 0); // next byte
+        let attempt = self.label();
+        let advanced = self.label();
+        let complete = self.label();
+        let done = self.label();
+        self.mark(attempt);
+        self.load(4);
+        self.branch(complete, Branch::Zero(0));
+        self.mov(2, 0);
+        self.load(3);
+        self.mov(1, 0);
+        self.imm(0, 2); // inherited stderr, never opened or closed here
+        self.syscall(4);
+        self.branch(advanced, Branch::Cond(3));
+        self.imm(1, 4); // retry EINTR without losing the current byte position
+        self.cmp(0, 1);
+        self.branch(attempt, Branch::Cond(0));
+        self.branch(done, Branch::Jump);
+        self.mark(advanced);
+        let progress = self.label();
+        self.branch(progress, Branch::Nonzero(0));
+        self.imm(0, 5); // a zero-byte write with bytes remaining is an I/O error
+        self.branch(done, Branch::Jump);
+        self.mark(progress);
+        self.mov(1, 0);
+        self.load(3);
+        self.add(0, 0, 1);
+        self.store(3, 0);
+        self.load(4);
+        self.sub(0, 0, 1);
+        self.store(4, 0);
+        self.branch(attempt, Branch::Jump);
+        self.mark(complete);
+        self.imm(0, 0);
+        self.mark(done);
+        self.sys_finish(ty);
     }
     fn sys_io(&mut self, op: SysOp) {
         let reading = op == SysOp::ReadText;

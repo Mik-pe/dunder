@@ -412,6 +412,7 @@ pub struct Import {
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Name(String),
+    ImportPath(String),
     Number(i128),
     Float(String),
     String(String),
@@ -685,6 +686,24 @@ fn lex(source: &str) -> Result<Vec<Lexeme>, Error> {
                     "unterminated block comment",
                 ));
             }
+            continue;
+        }
+        // Import paths are lexical names, not arithmetic expressions. Keep the
+        // full spelling (including malformed repeated/trailing slashes) so a
+        // typo cannot silently turn into a different module plus a comment.
+        // Whitespace separates an unquoted path from `as` and comments.
+        if matches!(out.last().map(|t: &Lexeme| &t.token), Some(Token::Name(n)) if n == "import")
+            && (c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
+        {
+            i += 1;
+            while i < chars.len() && !chars.at(i).1.is_whitespace() && chars.at(i).1 != ';' {
+                i += 1;
+            }
+            let end = chars.get(i).map_or(source.len(), |x| x.0);
+            out.push(Lexeme {
+                token: Token::ImportPath(source[start..end].into()),
+                span: Span { start, end },
+            });
             continue;
         }
         if c.is_alphabetic() || c == '_' {
@@ -1208,12 +1227,28 @@ impl Parser<'_> {
         let span = self.take().span;
         let token = self.take();
         let path = match token.token {
-            Token::Name(path) | Token::String(path) => path,
+            Token::ImportPath(path) => {
+                if path.split('/').any(|part| {
+                    part.is_empty()
+                        || !part
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                }) || matches!(path.rsplit('/').next(), Some("." | ".."))
+                {
+                    return Err(Error::new(
+                        "E0401",
+                        token.span,
+                        "expected a relative module path without empty components; write import std/map or import ../shared/value",
+                    ));
+                }
+                path
+            }
+            Token::String(path) => path,
             _ => {
                 return Err(Error::new(
                     "E0107",
                     token.span,
-                    "expected a module name or relative path, for example import math",
+                    "expected a module name or relative path, for example import math or import std/map",
                 ))
             }
         };
@@ -1227,9 +1262,14 @@ impl Parser<'_> {
                 .unwrap_or("")
                 .into()
         };
-        if *self.peek() != Token::Eof {
-            self.end_stmt()?;
+        if !matches!(self.peek(), Token::Eof | Token::Newline | Token::Semi) {
+            return Err(Error::new(
+                "E0107",
+                self.span(),
+                "expected 'as name', a newline or ';' after the import path; path components must be adjacent",
+            ));
         }
+        self.separators();
         Ok(Import { path, alias, span })
     }
     fn function(&mut self, public: bool) -> Result<Function, Error> {

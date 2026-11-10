@@ -145,6 +145,7 @@ pub enum ExprKind {
 pub enum SysOp {
     ReadText,
     WriteText,
+    WriteStderr,
     AppendText,
     Mkdir,
     Rename,
@@ -630,6 +631,7 @@ impl Checker<'_> {
         let (op, count, result) = match name {
             "__sys_read_text" => (SysOp::ReadText, 1, "TextResult"),
             "__sys_write_text" => (SysOp::WriteText, 2, "Status"),
+            "__sys_write_stderr" => (SysOp::WriteStderr, 1, "Status"),
             "__sys_append_text" => (SysOp::AppendText, 2, "Status"),
             "__sys_mkdir" => (SysOp::Mkdir, 1, "Status"),
             "__sys_rename" => (SysOp::Rename, 2, "Status"),

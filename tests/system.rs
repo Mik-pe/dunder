@@ -67,6 +67,9 @@ fn bundled_sys_is_typed_deduplicated_and_distinct_from_explicit_local_modules() 
     for (source, code) in [
         ("import sys\nfn main(){x:=sys.read_text(42)}", "E0201"),
         ("import sys\nfn main(){x:=sys.write_text(\"a\")}", "E0207"),
+        ("import sys\nfn main(){sys.write_stderr(42)}", "E0201"),
+        ("import sys\nfn main(){sys.eprint()}", "E0207"),
+        ("import sys\nfn main(){__sys_write_stderr(\"a\")}", "E0205"),
         ("import sys\nfn main(){x:i32=sys.metadata(\".\")}", "E0201"),
         ("import sys\nfn main(){__sys_read_text(\"a\")}", "E0205"),
         ("fn main(){__sys_pid()}", "E0205"),
@@ -581,4 +584,126 @@ import sys
     success(&out);
     assert!(String::from_utf8_lossy(&out.stdout).contains("filesystem_edges"));
     assert_eq!(fs::read(work.0.join("regular")).unwrap(), b"contents");
+}
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn stderr_writes_keep_exact_bytes_separate_from_stdout_and_report_closed_handles() {
+    use std::os::unix::process::CommandExt;
+    let work = Workspace::new();
+    work.write(
+        "main.ddr",
+        r#"
+import sys
+fn main() {
+    assert(sys.write_stderr("").ok)
+    assert(sys.write_stderr("å\0🌍").ok)
+    assert(sys.eprint("diagnostic").ok)
+    assert(sys.eprint("").ok)
+    print("csv,result")
+}
+"#,
+    );
+    success(&work.cli(&["build", "main.ddr", "-o", "program"]));
+    let output = Command::new(work.0.join("program"))
+        .env_clear()
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(output.stdout, b"csv,result\n");
+    assert_eq!(output.stderr, "å\0🌍diagnostic\n\n".as_bytes());
+
+    work.write(
+        "main.ddr",
+        r#"
+import sys
+fn main() {
+    result := sys.write_stderr("cannot write")
+    assert(!result.ok && result.error == 9)
+    print("reported bad descriptor")
+}
+"#,
+    );
+    success(&work.cli(&["build", "main.ddr", "-o", "closed"]));
+    let mut command = Command::new(work.0.join("closed"));
+    command.env_clear();
+    unsafe {
+        command.pre_exec(|| {
+            unsafe extern "C" {
+                fn close(fd: i32) -> i32;
+            }
+            if close(2) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let output = command.output().unwrap();
+    success(&output);
+    assert_eq!(output.stdout, b"reported bad descriptor\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn stderr_writes_complete_large_buffers_and_report_nonblocking_backpressure() {
+    use std::{
+        io::Read,
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::Stdio,
+    };
+    let work = Workspace::new();
+    let payload = "å🌍\0!".repeat(160_000);
+    work.write("payload", &payload);
+    work.write(
+        "main.ddr",
+        r#"
+import sys
+fn main() {
+    input := sys.read_text("payload")
+    assert(input.ok)
+    result := sys.write_stderr(input.value)
+    print(result.ok)
+    print(result.error)
+}
+"#,
+    );
+    success(&work.cli(&["build", "main.ddr", "-o", "program"]));
+    let output = Command::new(work.0.join("program"))
+        .current_dir(&work.0)
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(output.stderr, payload.as_bytes());
+    assert_eq!(output.stdout, b"true\n0\n");
+
+    // Do not drain this socket until the child exits: a nonblocking write must
+    // report EAGAIN after the prefix that fits, rather than hang or claim success.
+    let (mut reader, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let output = Command::new(work.0.join("program"))
+        .current_dir(&work.0)
+        .stderr(Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(output.stdout, b"false\n35\n");
+    let mut written = Vec::new();
+    reader.read_to_end(&mut written).unwrap();
+    assert!(!written.is_empty());
+    assert!(written.len() < payload.len());
+    assert_eq!(written, &payload.as_bytes()[..written.len()]);
 }
