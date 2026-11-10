@@ -262,6 +262,3 @@ begränsade borrows. Nativeprogram över 1 MiB provar långa adresser/hopp;
 en 9 MiB-bild med flersidig signatur verifieras och körs av macOS.
 Den Dunder-skrivna kompilatorn jämförs med bootstrapen för 800 genererade
 uttryck samt kontrollflöde och felstatusar. macOS verifierar dess signaturer.
-
-Den gamla GLM-körningen stoppades efter kvotfelet. Dess ofärdiga fröarbete
-ligger kvar orört i `/Users/mikpe/dev/dunder-dogfood`.

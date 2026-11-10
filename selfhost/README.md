@@ -7,6 +7,7 @@ Mach-O-skrivning och SHA-256-signering. Den delegerar inte till Rust,
 GCC, LLVM, assembler, länkare eller extern signerare.
 
 ```sh
+# Körning av de genererade programmen och codesign kräver ARM64/macOS.
 # Rust-bootstrapen bygger en kompilator vars källkod är Dunder.
 cargo run --release -- build selfhost/main.ddr -o build/dunder-ddr
 
@@ -47,7 +48,7 @@ Behåll Rust-bootstrapens versionsmärkta källkod även när självhosting finn
 Med Rust-verktygskedjan installerad kan binärerna byggas från en ren checkout:
 
 ```sh
-git clone --branch language/typed-native https://github.com/Mik-pe/dunder.git
+git clone https://github.com/Mik-pe/dunder.git
 cd dunder
 cargo build --release
 cargo run --release -- build selfhost/main.ddr -o build/dunder-ddr

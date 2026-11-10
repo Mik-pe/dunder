@@ -41,7 +41,7 @@ cargo run --release -- build examples/hello.ddr -o build/hello --timings
 # true
 ```
 
-Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer, Python,
+Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer,
 assembler, länkare eller signeringsverktyg för att bygga Dunder-källkod.
 Den färdiga binären körs som en vanlig process på målplattformen. Linuxbinärer
 är fristående och behöver varken libc eller en dynamisk laddare. Systemets

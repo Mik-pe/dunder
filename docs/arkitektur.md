@@ -1,4 +1,4 @@
-# Dunders första arkitektur
+# Dunders arkitektur
 
 **Plattformsstöd 2026-11-10:** bootstrapen skriver nu ARM64/macOS,
 ARM64/Linux och x86-64/Linux med explicit målval. ELF, Mach-O, systemanrop
@@ -6,14 +6,11 @@ och kodgenerering ingår i kompilatorn. x86-64 sänker den delade interna
 instruktionsvokabulären till nativekod vid kompilering; det finns ingen
 runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
 
-**Lägesändring 2026-11-10:** användaren prioriterade det riktiga typade
-källspråket före fortsatt fröarbete. Den första Rust-bootstrapkompilatorn
-och dess native backend är implementerade; se [syntaxen](syntax.md) och
-[aktuell status](status.md). Stegordningen med ett självassemblerande frö
-nedan beskriver den ursprungliga långsiktiga planen. Den blockerar inte
-språkutvecklingen. Den implementerade syntaxen är nu ett första arbetsbeslut.
-
-**Designförslag 0.1.** Grundkraven är ARM64-maskinkod, en egen verktygskedja, minnessäkerhet utan GC, snabb optimerad kompilering och självhosting. Nedan finns de arbetsbeslut vi behöver för att kunna bygga och pröva dem. Syntax och nyckelord får vänta.
+Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
+GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
+begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
+Ägarmodellen, registeroptimeringarna och den inkrementella cachen nedan är
+fortsatt designmål, inte färdiga funktioner.
 
 ## Språkets kostnadsmodell
 
@@ -50,11 +47,19 @@ Första backendversionen håller tillfälliga värden i register och ger värden
 
 **Optimering i standardbygget.** Börja med laglig konstantvikning, döda konstanta grenar, immediater och ARM64:s adresseringslägen, direkt jämförelse följd av villkorligt hopp och borttagning av överflödiga registerflyttar. Prioritera därefter loopars registeranvändning och bevisat överflödiga gränskontroller utifrån mätningar. En optimering måste bevara evalueringsordning, sidoeffekter, lån och möjliga fällor. Exempelvis får vikning av multiplikation med noll inte kasta bort ett anrop med sidoeffekter. Inlining får en storleksbudget, och konsumenten måste bero på den inlinade kroppen. SIMD, mer aggressiv inlining och specialisering prövas mot uppmätta flaskhalsar. C/C++-paritet är en prövbar ambition, särskilt svår på vektoriserbara loopar.
 
-## Verktygskedjan och första målplattformen
+## Verktygskedjan och målplattformarna
 
-`arm64-macos` är första hela målet. Dunder äger parser, typ- och lånekontroll, AArch64-kodning, relokeringar, länkning, Mach-O-skrivning, lokal ad hoc-signering och byggdrivrutin. Ett vanligt bygge ska fungera på en Mac utan Xcode Command Line Tools. Det kör aldrig LLVM, GCC, en extern assembler, länkare eller signerare. Operativsystemets laddare och libSystem ingår i plattformen. Externa verktyg kan inspektera eller jämföra resultat i tester.
+Målen är `arm64-macos`, `arm64-linux` och `x86_64-linux`. Dunder äger parser,
+typkontroll, kodgenerering, relokeringar, bildskrivning, macOS ad hoc-signering
+och byggdrivrutin. Ett vanligt Dunderbygge kör aldrig LLVM, GCC, en extern
+assembler, länkare eller signerare. Linuxbilderna använder direkta systemanrop
+utan libc. Externa verktyg får inspektera eller jämföra resultat i tester.
 
-Maskindelen äger instruktionskodning och räckvidd för hopp. Darwin-delen äger anropskonvention, stack och registerregler, startpunkt, systemimporter och binärformat. Första provet behöver bara en process som returnerar en vald exitkod. Nästa prov gör ett vanligt anrop och därefter ett importerat libSystem-anrop. Kontrollera bland annat 16-bytejusterad stack, reserverat x18, bevarade register och argument som spills till stacken. Senare mål kan återanvända kodningen och byta ABI- och formatdelarna. [Apples ARM64-ABI](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms) · [Apples laddare](https://github.com/apple-oss-distributions/dyld/blob/main/mach_o/UnsafeHeader.cpp) · [Signering av körbara filer på Apple Silicon](https://developer.apple.com/documentation/xcode/embedding-a-helper-tool-in-a-sandboxed-app)
+Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
+anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen
+delar instruktionskodning; x86-64 sänker samma interna instruktionsvokabulär
+till nativekod vid kompilering. Dunders interna funktions-ABI är inte ett
+publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsningar.
 
 ## Byggkontraktet
 
@@ -64,15 +69,14 @@ En första implementation får bygga om allt. Nästa version lagrar maskinkodsfr
 
 ## Vägen till en självhostad kompilator
 
-Förslag för att slippa lägga en befintlig kompilator i förtroendekedjan är ett litet granskbart ARM64-frö. Fröet är ett separat engångsarbete. Det kostar handkodning men gör det möjligt att börja på en ren Mac och att senare återbygga hela kedjan. Ett litet frö hjälper bara om resten av kedjan kan reproduceras.
+Rust-bootstrapen bygger den Dunder-skrivna kompilatorn i `selfhost/`.
+Den bygger redan skalära program till ARM64/macOS, men saknar ännu stöd
+för sina egna importer och aggregat. Nästa steg är att implementera dessa
+språkdelar och sedan låta kompilatorn bygga sig själv i två på varandra
+följande steg. Resultaten ska vara byteidentiska och klara språktesterna.
+Återställning från ren källkod och verifieringskraven finns i
+[bootstrapguiden](../selfhost/README.md).
 
-| Etapp | Vad vi bygger | Bevis innan nästa etapp |
-| --- | --- | --- |
-| 0. Första binären | En minimal ARM64/Mach-O-bild med förklarade instruktionsord, layout och ad hoc-signatur. En enkel bytebeskrivning får materialiseras med ett hexverktyg. | Binären körs på en fysisk Apple Silicon-Mac och ger förväntad exitkod. Bilden kan återskapas byte för byte. |
-| 1. Fröverktyget | Ett litet ARM64-verktyg som kodar ett begränsat urval instruktioner, löser etiketter och skriver körbara signerade bilder. Dess första binär checkas in tillsammans med läsbar källa, bytebeskrivning, kontrollsumma och återbyggnadsinstruktion. | Fröet bygger sin egen källa identiskt och bygger ett andra program som gör ett funktionsanrop. Inga externa kompilatorverktyg i körvägen. |
-| 2. Första vertikala snittet | Bygg en minimal bootstrapkompilator med fröverktyget. Implementera `dunder build` för en källfil med heltalsretur, därefter lokaler, funktioner och grenar. | En ändring av returvärdet i källan ändrar processens exitkod. Ett felaktigt anrop får ett typfel med källposition. Kör samma prov på en Mac utan utvecklarverktyg. |
-| 3. En användbar delmängd | Lägg till moduler, poster, slices, ägare, lån och explicit allokering. Skriv filinläsning, diagnostik och därefter lexern i Dunder. | Den egenbyggda lexern bearbetar kompilatorns riktiga källkod. Kör positiva och negativa säkerhetsfall för varje operation i minnesmodellen. Börja publicera faktiska byggtider här. |
-| 4. Självhosting | Implementera resten av kompilatorn och byggdrivrutinen i den Dunder-delmängd bootstrapkompilatorn förstår. | Bootstrapkompilatorn bygger D1. D1 bygger D2 från kompilatorns Dunder-källa. D2 bygger D3 från samma källa. D2 och D3 är byteidentiska och klarar språktesterna. |
-| 5. Prestandabevis | Optimera mot de program som ännu missar bygg- eller körmålen. Pröva sedan inkrementella ändringar på kompilatorns egen kodbas. | Publicera korpus, råtider, korrekta körresultat och jämförbara C/C++-byggen enligt mätkontraktet. |
-
-Den första implementationen börjar vid etapp 0. Grammatik utöver den delmängd som behövs, generics, metaprogrammering, pakethantering, ytterligare mål och ett publikt stabilt Dunder-ABI är öppna designfrågor.
+Rust-bootstrapen är den fungerande återställningsvägen. Generics,
+metaprogrammering, pakethantering och ett publikt stabilt Dunder-ABI återstår.
+Prestanda bedöms med [mätkontraktet](prestanda.md).
