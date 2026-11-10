@@ -38,6 +38,13 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   `std.hash`, `std.bytes`, `std.sha256`, `std.parse` och sys. Map har strängnycklar
   och i64-värden, set innehåller strängar. Modulerna är inbäddade och importeras
   utan suffix. Hashning, sondering, omhashning och algoritmer är Dunder-kod.
+- `std.macos`: ett native AppKit-fönster med CAMetalLayer, färgad
+  Metal-triangelista, händelsepollning, logiska pekarkoordinater och backing
+  scale. Publika fönsterhandtag är validerade generations-ID:n. Nativegränsen
+  emitteras direkt som ARM64; inga C-/Objective-C-/Swift-bryggor kompileras.
+  Apple Metal-runtime kompilerar en fast MSL-pipeline vid öppning.
+  [Två Metal-program](macos-metal.md) dogfoodar geometri, animation och inmatning
+  i Dunder. `build/run --app` skriver en vanlig [macOS-appbundle](app-bundles.md).
 - Dynamiska `[]T`, geometrisk tillväxt, reserve/push/pop/clear, kontrollerade
   index och iteration. Oberoende djupa värdekopior, också inne i aggregat.
   `&T` och `&mut T` lånar under funktionsanrop; referenser kan inte lagras
@@ -141,24 +148,58 @@ Lokalt på Linux/x86-64, 2026-11-10:
   med originalets utdata. macOS-processkörning och `codesign` har inte körts
   i Linuxmiljön; motsvarande tester är fortsatt aktiva på macOS.
 
+## Verifiering efter integrering på main
+
+På Apple Silicon, efter integreringen av Linux-målen och punktimporter:
+`cargo test --quiet` passerar 123 Rust-testfunktioner. `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings` och `cargo build --release`
+passerar också. Rootens dogfood-test kör 49 Dunder-testgrupper.
+
+Atlas och triangeln byggdes åter som signerade `.app` med tom verktygssökväg;
+`codesign --verify --strict` godkände båda paket och huvudbinärer. Atlas körde
+120 draw-anrop och livscykelprogrammet klarade tre cykler utan Metal-fel.
+Korskompileringstester verifierar att geometri fungerar för båda Linux-målen,
+medan nåbara fönsteranrop ger ett tydligt fel om kravet på `arm64-macos`.
+`--app` avvisar Linux-mål innan några filer publiceras.
+
 ## Tidigare verifiering på macOS
 
-`cargo test`: 80 testfunktioner passerar (två signerings-/bildtester, sexton
-dogfood-, elva språk-, nio modul-, åtta sträng-, åtta flyttals-, tio system-,
-sex enum-, sju collection- och tre tester av den Dunder-skrivna kompilatorn).
-`cargo clippy --all-targets -- -D warnings`, `cargo fmt`
-och `cargo build --release` är genomförda.
+`cargo test` passerar 100 Rust-testfunktioner: de tidigare 80 samt fem tester
+av dynamisk Mach-O/paketsignering, tio appbundle-tester och fem tester av macOS-API:t.
+`cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
+och `cargo build --release` passerar också. macOS-testernas felvägar körs utan
+grafiskt fönster; dyld-spårning verifierar att de inte laddar grafikramverken.
+Geometri och onåbara fönsteranrop behåller binärformatet utan dylib-importer.
+
+På den inloggade Apple Silicon-datorn kördes triangeln i fem bildrutor och
+Atlas i 120 draw-anrop med Metal-validering utan fel. Ett separat manuellt
+[livscykelprogram](../dogfood/metal/lifecycle.ddr) öppnade och stängde sex
+fönster och verifierade backing scale, gamla handtag, felaktig geometri och
+räknare för slutförda GPU-kommandon. Visuell kontroll och faktisk inmatning
+gjordes i den körande appen; dessa GUI-körningar ingår inte i `cargo test`.
+Verifierat i Atlas: pausindikatorn HOLD, dragning med kvarhållen musknapp,
+återställning med R, palettbyte med C och återupptagen animation. Ett separat
+indatafönster verifierade storleksändring från 800×600 till 700×525 punkter
+och stängning med Cmd-W. Snabba köade mushändelser bevaras över flera
+pollningar så att en komplett dragning inte försvinner mellan två bildrutor.
+Både Atlas och triangeln byggdes som `.app` med `PATH=/no-external-tools`.
+macOS `codesign --verify --strict` godkände paketen och deras huvudbinärer;
+`plutil -lint` godkände plist och resurssigill. Signeringen binds till
+Info.plist och bevarade resurser med Dunders egen SHA-256/signeringskod.
 
 Releasekompilatorn har dessutom byggt hello och fibonacci med `PATH` satt
 till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
 förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.ddr
 -o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
 
-`dunder test` kör nu 44 Dunder-testgrupper i dogfood-trädet: rekursion,
+Före integrationen med Linux-/Tabell-tilläggen passerade
+`cargo run --release -- test dogfood/tests.ddr` 48 Dunder-testgrupper: rekursion,
 moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
 arena, tabellfall, structargument, UTF-8, en liten tokenizer, numeriska program
 och filsystem, namngivna enumvärden, nästlade payload-varianter, standardbibliotek
-och kompilatorns första Dunder-skrivna delar.
+och kompilatorns första Dunder-skrivna delar. Fyra tillagda grupper kontrollerar
+Metal-vertexlayout, ändlig scengeometri och återanvändning av buffertkapacitet,
+paus/palett/dragning samt Dunder-skrivna sinus-/cosinusapproximationer.
 sys-bibliotekets felmeddelanden och typade felkoder har egna kopplade testblock.
 Varje grupp kompileras till en riktig
 nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
@@ -214,7 +255,7 @@ på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
 kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
 verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
 och structprogrammet. UTF-8-programmet, tokenizern, numerikprogrammet,
-filsystemsprogrammet, enumprogrammet, standardbiblioteket och alla 44 Dunder-testgrupper är också körda med
+filsystemsprogrammet, enumprogrammet, standardbiblioteket och de tidigare 44 Dunder-testgrupperna kördes också med
 releasekompilatorn utan verktyg i PATH.
 
 Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
@@ -271,6 +312,10 @@ arena-dogfood använder indexhandtag. Se [enumreglerna](enums.md).
 sys stöder macOS/ARM64 och Linux på ARM64/x86-64. Textläsning kräver vanliga UTF-8-filer,
 högst 4 MiB per fil, och delar strängarenans 16 MiB. Binärläsning, kataloglistning,
 rekursiva katalogverktyg och filströmmar återstår. Se [sys-kontraktet](sys.md).
+macOS-/Metal-API:t stöder tills vidare ett aktivt fönster och den fasta
+färgpipelinen. Textlayout, nativekontroller, egen shaderkod och flerfönsterstöd
+återstår. Det kräver en grafisk macOS-session; `--frames` är ett begränsat
+fönsterprov och inget headless-läge. Se [grafikkontraktet](macos-metal.md).
 Flyttal saknar än så länge fullständigt matematikbibliotek, trigonometriska
 funktioner, exp/log, strängparser och valbar utskriftsprecision. Den Dunder-skrivna
 formatteraren prioriterar korrekthet; prestanda är inte uppmätt.

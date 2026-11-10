@@ -13,6 +13,7 @@ pub struct Program {
     pub tests: Vec<TestCase>,
     pub float_formatter: Option<usize>,
     pub sys_types: Option<SysTypes>,
+    pub macos_types: Option<MacTypes>,
 }
 pub struct TestCase {
     pub name: String,
@@ -30,6 +31,7 @@ pub struct Module {
     pub records: Vec<ast::Record>,
     pub enums: Vec<ast::Enumeration>,
     pub standard_sys: bool,
+    pub standard_macos: bool,
 }
 pub struct Import {
     pub name: String,
@@ -47,6 +49,7 @@ struct Symbols {
     imports: HashMap<String, usize>,
     records: HashMap<String, (Type, bool)>,
     standard_sys: bool,
+    standard_macos: bool,
 }
 pub struct Function {
     pub name: String,
@@ -57,6 +60,7 @@ pub struct Function {
     pub param_storage: Vec<Option<usize>>,
     pub return_slot: Option<usize>,
     pub uses_float_format: bool,
+    pub uses_macos: bool,
 }
 pub enum Stmt {
     StorePlace(Expr, Expr),
@@ -127,6 +131,7 @@ pub enum ExprKind {
     Function(usize),
     Call(Box<Expr>, Vec<Expr>, Option<usize>),
     SysCall(SysOp, Vec<Expr>, Option<usize>),
+    MacCall(MacOp, Vec<Expr>, Option<usize>),
     Print(Box<Expr>),
     Cast(Box<Expr>),
     Unary(&'static str, Box<Expr>),
@@ -159,6 +164,20 @@ pub enum SysOp {
     MakeExecutable,
     DecodeUtf8,
     SameFile,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacOp {
+    Open,
+    Poll,
+    Draw,
+    Close,
+}
+#[derive(Clone, Copy)]
+pub struct MacTypes {
+    pub window: Type,
+    pub open: Type,
+    pub frame: Type,
+    pub draw: Type,
 }
 #[derive(Clone, Copy)]
 pub enum DynamicOp {
@@ -230,6 +249,7 @@ struct Checker<'a> {
     loops: usize,
     testing: bool,
     needs_float_format: bool,
+    uses_macos: bool,
 }
 
 fn reserved(name: &str) -> bool {
@@ -623,6 +643,18 @@ impl Checker<'_> {
         self.hint(expr)
             .or_else(|| Self::float_literal(expr).then_some(Type::F64))
     }
+    fn mac_op(&self, name: &str) -> Option<MacOp> {
+        if !self.symbols[self.module].standard_macos {
+            return None;
+        }
+        Some(match name {
+            "__macos_open" => MacOp::Open,
+            "__macos_poll" => MacOp::Poll,
+            "__macos_draw" => MacOp::Draw,
+            "__macos_close" => MacOp::Close,
+            _ => return None,
+        })
+    }
     fn sys_signature(&self, name: &str) -> Option<(SysOp, usize, Type)> {
         let symbols = &self.symbols[self.module];
         if !symbols.standard_sys {
@@ -652,6 +684,48 @@ impl Checker<'_> {
     fn expr(&mut self, e: &ast::Expr, expected: Option<Type>) -> Result<Expr, Error> {
         use ast::ExprKind as A;
         let typed = match &e.kind {
+            A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.mac_op(n).is_some()) =>
+            {
+                let A::Name(name) = &callee.kind else {
+                    unreachable!()
+                };
+                let op = self.mac_op(name).unwrap();
+                let types = &self.symbols[self.module].records;
+                let window = types["Window"].0;
+                let (params, ty) = match op {
+                    MacOp::Open => (
+                        vec![Type::String, Type::I32, Type::I32],
+                        types["OpenResult"].0,
+                    ),
+                    MacOp::Poll => (vec![window], types["Frame"].0),
+                    MacOp::Close => (vec![window], Type::Unit),
+                    MacOp::Draw => {
+                        let array = self.types.dynamic(Type::F32, e.span)?;
+                        let reference = self.types.reference(array, false);
+                        (
+                            vec![window, reference, Type::F64, Type::F64, Type::F64],
+                            types["DrawResult"].0,
+                        )
+                    }
+                };
+                if args.len() != params.len() {
+                    return Err(Error::new(
+                        "E0207",
+                        e.span,
+                        "invalid macOS intrinsic argument count",
+                    ));
+                }
+                let values = args
+                    .iter()
+                    .zip(params)
+                    .map(|(arg, ty)| self.expr(arg, Some(ty)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.uses_macos = true;
+                Expr {
+                    ty,
+                    kind: ExprKind::MacCall(op, values, self.storage(ty)),
+                }
+            }
             A::Borrow(base, mutable) => {
                 let Some((inner, allowed_mut)) = expected.and_then(|t| self.types.referenced(t))
                 else {
@@ -1577,6 +1651,7 @@ pub fn check_mode(program: ast::Program, mode: Mode) -> Result<Program, Error> {
             records: program.records,
             enums: program.enums,
             standard_sys: false,
+            standard_macos: false,
         }],
         program.types,
         mode,
@@ -1598,6 +1673,7 @@ pub(crate) fn check_modules(
     // Reserve nominal types and all file namespaces before resolving signatures.
     for (module, input) in modules.iter().enumerate() {
         symbols[module].standard_sys = input.standard_sys;
+        symbols[module].standard_macos = input.standard_macos;
         let mut names = std::collections::HashSet::new();
         for e in &input.enums {
             if reserved(&e.name) {
@@ -1773,6 +1849,12 @@ pub(crate) fn check_modules(
         text: s.records["TextResult"].0,
         metadata: s.records["Metadata"].0,
     });
+    let macos_types = symbols.iter().find(|s| s.standard_macos).map(|s| MacTypes {
+        window: s.records["Window"].0,
+        open: s.records["OpenResult"].0,
+        frame: s.records["Frame"].0,
+        draw: s.records["DrawResult"].0,
+    });
     let mut checked = Vec::new();
     let mut needs_float_format = false;
     for (module, input) in modules.into_iter().enumerate() {
@@ -1788,6 +1870,7 @@ pub(crate) fn check_modules(
                     loops: 0,
                     testing: f.test.is_some(),
                     needs_float_format: false,
+                    uses_macos: false,
                 };
                 let mut param_slots = Vec::new();
                 let mut param_storage = Vec::new();
@@ -1818,6 +1901,7 @@ pub(crate) fn check_modules(
                     param_storage,
                     return_slot,
                     uses_float_format: c.needs_float_format,
+                    uses_macos: c.uses_macos,
                 })
             })()
             .map_err(|e: Error| e.in_file(module))?;
@@ -1838,6 +1922,7 @@ pub(crate) fn check_modules(
         tests,
         float_formatter,
         sys_types,
+        macos_types,
     })
 }
 
@@ -1872,6 +1957,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             loops: 0,
             testing: false,
             needs_float_format: false,
+            uses_macos: false,
         };
         let mut param_slots = Vec::new();
         for p in &f.params {
@@ -1894,6 +1980,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             param_storage: vec![None, None],
             return_slot: None,
             uses_float_format: false,
+            uses_macos: false,
         })
     };
     build().map_err(|e| {

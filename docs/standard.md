@@ -92,7 +92,8 @@ flyttas och återvinning av enskilda allokeringar återstår.
 | `std.bytes` | Växande bytebuffertar som `[]i32`, textappend, nollfyllning, little-/big-endian-kodning, `hex`, kontrollerad UTF-8-avkodning. |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
-| `sys` / `std.sys` | macOS-filer, argument, byteutdata, UTF-8-avkodning och process-ID; se [sys](sys.md). |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning och process-ID; se [sys](sys.md). |
+| `macos` / `std.macos` | Ett AppKit-fönster, Metal-triangelista, händelser och Dunder-skrivna geometrihjälpare; se [macOS/Metal](macos-metal.md). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
@@ -138,7 +139,7 @@ cargo run --release -- run dogfood/standard.ddr
 # 6
 # stdlib ok
 cargo run --release -- test
-# 45 passed, 0 failed
+# 49 testgrupper i det sammanslagna trädet
 cargo test --test collections --test system --test selfhost
 ```
 

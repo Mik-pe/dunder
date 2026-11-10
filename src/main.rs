@@ -1,4 +1,7 @@
-use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+use std::os::unix::{
+    fs::{MetadataExt, PermissionsExt},
+    process::ExitStatusExt,
+};
 mod test_runner;
 use std::{
     env, fs,
@@ -76,6 +79,10 @@ fn manifest(testing: bool) -> Result<(PathBuf, String), String> {
 }
 
 fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
+    publish_file(path, image, 0o755)
+}
+
+fn publish_file(path: &Path, image: &[u8], mode: u32) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -89,7 +96,7 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
         .open(&temp)?;
     let result = (|| {
         f.write_all(image)?;
-        f.set_permissions(fs::Permissions::from_mode(0o755))?;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
         f.sync_all()?;
         fs::rename(&temp, path)
     })();
@@ -99,11 +106,230 @@ fn publish(path: &Path, image: &[u8]) -> io::Result<()> {
     result
 }
 
+fn guard_sources(path: &Path, sources: &dunder::modules::Sources) -> Result<(), String> {
+    if let Ok(target) = fs::metadata(path) {
+        for source in &sources.files {
+            if let Ok(input) = fs::metadata(&source.path) {
+                if target.dev() == input.dev() && target.ino() == input.ino() {
+                    return Err(format!(
+                        "output must not overwrite the source file: {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn bundle_identifier(name: &str) -> String {
+    let mut sanitized = String::new();
+    let mut hash = 0x811c9dc5u32;
+    for byte in name.bytes() {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x01000193);
+        if byte.is_ascii_alphanumeric() {
+            sanitized.push(char::from(byte.to_ascii_lowercase()));
+        } else if !sanitized.is_empty() && !sanitized.ends_with('-') {
+            sanitized.push('-');
+        }
+    }
+    let sanitized = sanitized.trim_end_matches('-');
+    let sanitized = if sanitized.is_empty() {
+        "app"
+    } else {
+        sanitized
+    };
+    format!("org.dunder.{sanitized}-{hash:08x}")
+}
+
+struct AppBundle {
+    contents: PathBuf,
+    executable: PathBuf,
+    info_path: PathBuf,
+    resources_path: PathBuf,
+    identifier: String,
+    info: String,
+}
+
+impl AppBundle {
+    fn new(output: &Path) -> Result<Self, String> {
+        let name = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".app"))
+            .filter(|name| {
+                !name.is_empty()
+                    && !matches!(*name, "." | "..")
+                    && !name.chars().any(char::is_control)
+            })
+            .ok_or("--app output must end in a nonempty name followed by '.app'")?;
+        let contents = output.join("Contents");
+        let executable = contents.join("MacOS").join(name);
+        let info_path = contents.join("Info.plist");
+        let resources_path = contents.join("_CodeSignature/CodeResources");
+        let identifier = bundle_identifier(name);
+        let name = xml(name);
+        let version = env!("CARGO_PKG_VERSION");
+        let info = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n\
+             <key>CFBundleExecutable</key><string>{name}</string>\n\
+             <key>CFBundleName</key><string>{name}</string>\n\
+             <key>CFBundleDisplayName</key><string>{name}</string>\n\
+             <key>CFBundleIdentifier</key><string>{identifier}</string>\n\
+             <key>CFBundlePackageType</key><string>APPL</string>\n\
+             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n\
+             <key>CFBundleVersion</key><string>{version}</string>\n\
+             <key>CFBundleShortVersionString</key><string>{version}</string>\n\
+             <key>NSHighResolutionCapable</key><true/>\n\
+             <key>LSMinimumSystemVersion</key><string>11.0</string>\n\
+             <key>NSSupportsAutomaticGraphicsSwitching</key><true/>\n\
+             </dict>\n</plist>\n"
+        );
+        Ok(Self {
+            contents,
+            executable,
+            info_path,
+            resources_path,
+            identifier,
+            info,
+        })
+    }
+
+    fn resources(&self) -> Result<Vec<u8>, String> {
+        let bundle = self.contents.parent().unwrap();
+        match fs::symlink_metadata(bundle) {
+            Ok(metadata) if metadata.is_dir() => {
+                for entry in fs::read_dir(bundle).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    if entry.file_name() != "Contents" {
+                        return Err(format!(
+                            "unsupported bundle entry outside Contents: {}",
+                            entry.path().display()
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(format!("bundle must be a directory: {}", bundle.display())),
+        }
+        let mut files = Vec::new();
+        self.collect_resources(&self.contents, &mut files)?;
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut resources = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n\
+             <key>files</key><dict/>\n<key>files2</key><dict>\n",
+        );
+        for (name, hash) in files {
+            resources.push_str(&format!(
+                "<key>{}</key><dict><key>hash2</key><data>{}</data></dict>\n",
+                xml(&name),
+                base64(&hash)
+            ));
+        }
+        resources.push_str(
+            "</dict>\n<key>rules</key><dict/>\n\
+             <key>rules2</key><dict>\n\
+             <key>^.*</key><true/>\n\
+             <key>^Info\\.plist$</key><dict><key>omit</key><true/><key>weight</key><real>20</real></dict>\n\
+             </dict>\n</dict>\n</plist>\n",
+        );
+        Ok(resources.into_bytes())
+    }
+
+    fn collect_resources(
+        &self,
+        directory: &Path,
+        files: &mut Vec<(String, [u8; 32])>,
+    ) -> Result<(), String> {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            _ => {
+                return Err(format!(
+                    "bundle resource directories must be real directories: {}",
+                    directory.display()
+                ))
+            }
+        }
+        for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path == self.executable || path == self.info_path || path == self.resources_path {
+                continue;
+            }
+            if directory == self.resources_path.parent().unwrap() {
+                return Err(format!(
+                    "unsupported existing bundle signature file: {}",
+                    path.display()
+                ));
+            }
+            let kind = fs::symlink_metadata(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .file_type();
+            if kind.is_dir() {
+                self.collect_resources(&path, files)?;
+            } else if kind.is_file() {
+                let name = path
+                    .strip_prefix(&self.contents)
+                    .unwrap()
+                    .to_str()
+                    .filter(|name| !name.chars().any(char::is_control))
+                    .ok_or_else(|| {
+                        format!("unsupported bundle resource filename: {}", path.display())
+                    })?;
+                let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                files.push((name.to_owned(), dunder::native::sha256(&bytes)));
+            } else {
+                return Err(format!(
+                    "bundle resources must be regular files or directories: {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        for index in [first >> 2, ((first & 3) << 4) | (second >> 4)] {
+            result.push(char::from(ALPHABET[index as usize]));
+        }
+        result.push(if chunk.len() > 1 {
+            char::from(ALPHABET[(((second & 15) << 2) | (third >> 6)) as usize])
+        } else {
+            '='
+        });
+        result.push(if chunk.len() > 2 {
+            char::from(ALPHABET[(third & 63) as usize])
+        } else {
+            '='
+        });
+    }
+    result
+}
+
 fn run() -> Result<i32, String> {
     use dunder::target::Target;
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
-        println!("Dunder — typed source to native executables\n\n  dunder build [file.ddr] [-o output] [--target target] [--timings]\n  dunder run [file.ddr] [-o output] [--target target] [--timings] [-- program-args...]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--target target] [--timeout-ms 5000]\n  dunder --list-targets\n\nWithout a file, finds the nearest dunder.toml. Default target: current host.\nCross-compilation needs no external toolchain or target SDK.\nrun and test require a target matching the current host.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
+        println!("Dunder — typed source to native executables\n\n  dunder build [file.ddr] [-o output] [--target target] [--app] [--timings]\n  dunder run [file.ddr] [-o output] [--target target] [--app] [--timings] [-- program-args...]\n  dunder check [file.ddr]\n  dunder test [file.ddr] [-o directory] [--target target] [--timeout-ms 5000]\n  dunder --list-targets\n\nWithout a file, finds the nearest dunder.toml. Default target: current host.\nCross-compilation needs no external toolchain or target SDK.\nrun and test require a target matching the current host.\n--app writes a macOS .app bundle and requires target arm64-macos; -o must name a .app directory.\nDeclarations: x := 42, x: i32 = 42, var x := 0. Values are immutable by default.");
         return Ok(0);
     }
     if args[0] == "--list-targets" && args.len() == 1 {
@@ -121,6 +347,7 @@ fn run() -> Result<i32, String> {
     let mut source_path = None;
     let mut output = None;
     let mut timings = false;
+    let mut app = false;
     let mut timeout = 5000;
     let mut program_args = Vec::new();
     let mut target = None;
@@ -144,6 +371,15 @@ fn run() -> Result<i32, String> {
                 }
                 target = Some(value.parse::<Target>()?);
             }
+            "--app" => {
+                if !matches!(command.as_str(), "build" | "run") {
+                    return Err("--app is only supported by build and run".into());
+                }
+                if app {
+                    return Err("--app may only be specified once".into());
+                }
+                app = true;
+            }
             "--timeout-ms" if command == "test" => {
                 i += 1;
                 timeout = args
@@ -166,6 +402,11 @@ fn run() -> Result<i32, String> {
         target
     } else {
         let selected = target.map(Ok).unwrap_or_else(Target::host)?;
+        if app && selected != Target::Arm64Macos {
+            return Err(format!(
+                "--app requires target arm64-macos; selected target is {selected}"
+            ));
+        }
         if matches!(command.as_str(), "run" | "test") && !selected.can_run_on_host() {
             return Err(format!(
                 "cannot {command} target {selected} on {}-{}; use 'dunder build --target {selected}' and run the binary on its target system",
@@ -185,6 +426,21 @@ fn run() -> Result<i32, String> {
     } else {
         manifest(command == "test")?
     };
+    let output = output.unwrap_or_else(|| {
+        let name = if app { format!("{name}.app") } else { name };
+        let directory = PathBuf::from("build").join(target.map_or("", Target::name));
+        let directory = if command == "test" {
+            directory.join("tests")
+        } else {
+            directory
+        };
+        directory.join(name)
+    });
+    let bundle = if app {
+        Some(AppBundle::new(&output)?)
+    } else {
+        None
+    };
     let loaded = dunder::modules::load(&source_path).map_err(|e| e.render())?;
     let module_count = loaded.sources.files.len();
     let load_time = start.elapsed();
@@ -197,12 +453,6 @@ fn run() -> Result<i32, String> {
     let check_time = start.elapsed() - load_time;
     if command == "test" {
         let target = target.unwrap();
-        let output = output.unwrap_or_else(|| {
-            PathBuf::from("build")
-                .join(target.name())
-                .join("tests")
-                .join(name)
-        });
         let result = test_runner::run(&checked, &output, Duration::from_millis(timeout), target)?;
         if timings {
             eprintln!(
@@ -219,17 +469,36 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
     let target = target.unwrap();
-    let image = checked
+    let mut image = checked
         .compile_for(target)
         .map_err(|e| checked.render(&e))?;
     let native_time = start.elapsed() - load_time - check_time;
-    let output = output.unwrap_or_else(|| PathBuf::from("build").join(target.name()).join(name));
-    if let Ok(existing) = fs::canonicalize(&output) {
-        if checked.sources.files.iter().any(|s| s.path == existing) {
-            return Err("output must not overwrite the source file".into());
-        }
+    let mut resources = None;
+    let executable = if let Some(bundle) = &bundle {
+        // Validate every owned destination before publishing any file.
+        guard_sources(&bundle.executable, &checked.sources)?;
+        guard_sources(&bundle.info_path, &checked.sources)?;
+        guard_sources(&bundle.resources_path, &checked.sources)?;
+        let envelope = bundle.resources()?;
+        dunder::native::sign_bundle(
+            &mut image,
+            &bundle.identifier,
+            bundle.info.as_bytes(),
+            &envelope,
+        )?;
+        resources = Some(envelope);
+        &bundle.executable
+    } else {
+        guard_sources(&output, &checked.sources)?;
+        &output
+    };
+    publish(executable, &image).map_err(|e| format!("{}: {e}", executable.display()))?;
+    if let Some(bundle) = &bundle {
+        publish_file(&bundle.info_path, bundle.info.as_bytes(), 0o644)
+            .map_err(|e| format!("{}: {e}", bundle.info_path.display()))?;
+        publish_file(&bundle.resources_path, resources.as_ref().unwrap(), 0o644)
+            .map_err(|e| format!("{}: {e}", bundle.resources_path.display()))?;
     }
-    publish(&output, &image).map_err(|e| format!("{}: {e}", output.display()))?;
     if command == "run" {
         eprintln!("built {}", output.display());
     } else {
@@ -245,7 +514,7 @@ fn run() -> Result<i32, String> {
         );
     }
     if command == "run" {
-        let executable = fs::canonicalize(&output).map_err(|e| e.to_string())?;
+        let executable = fs::canonicalize(executable).map_err(|e| e.to_string())?;
         let status = process::Command::new(executable)
             .args(&program_args)
             .status()

@@ -48,7 +48,7 @@ Behåll Rust-bootstrapens versionsmärkta källkod även när självhosting finn
 Med Rust-verktygskedjan installerad kan binärerna byggas från en ren checkout:
 
 ```sh
-git clone https://github.com/Mik-pe/dunder.git
+git clone --branch main https://github.com/Mik-pe/dunder.git
 cd dunder
 cargo build --release
 cargo run --release -- build selfhost/main.ddr -o build/dunder-ddr
@@ -65,10 +65,10 @@ dess källrevision/checksumma. Endast självhostad källkod räcker inte för at
 
 | Fil | Ansvar |
 | --- | --- |
-| [lexer.ddr](lexer.ddr) | UTF-8-text, escapes, strängar/runes, tal, kommentarer, tokenpositioner och interning med std/map och std/set. |
+| [lexer.ddr](lexer.ddr) | UTF-8-text, escapes, strängar/runes, tal, kommentarer, tokenpositioner och interning med std.map och std.set. |
 | [compile.ddr](compile.ddr) | Signaturpass, scope, muterbarhet, typkontroll, uttryck, kontrollflöde och direkt generering. |
 | [arm64.ddr](arm64.ddr) | Maskinord, etiketter, hoppfixering, register/stack och runtime för skalärer. |
-| [macho.ddr](macho.ddr) | Mach-O-layout, CodeDirectory och sidvis SHA-256 med std/bytes och std/sha256. |
+| [macho.ddr](macho.ddr) | Mach-O-layout, CodeDirectory och sidvis SHA-256 med std.bytes och std.sha256. |
 | [main.ddr](main.ddr) | Argument, läsning, diagnostik och publicering via temporär fil och rename. |
 
 Stage 1 stöder `i32`, `i64`, `bool`, UTF-8-strängliteraler och stränghandtag,
@@ -89,6 +89,8 @@ Moduler, aggregattyper, referenser/borrows, dynamiska och fasta arrayer,
 enums/match, funktionsvärden, flyttal och `@test` i indata återstår i denna
 kompilator. Dessa funktioner fungerar redan i Rust-bootstrapen och används
 för att skriva stage 1; det är stödet som behöver porteras för självhosting.
+Även macOS-/Metal-intrinsics och `.app`-paketering finns tills vidare bara
+i Rust-bootstrapens byggväg. Metal-exemplen byggs med den vanliga `dunder`.
 Det finns ingen utfästelse om featureparitet eller optimerad körprestanda.
 
 Nästa acceptans är en modulladdare, ett typregister och de samlings-/borrowoperationer

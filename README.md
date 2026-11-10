@@ -4,6 +4,7 @@ Ett statiskt typat, kompilerat språk med filändelsen **`.ddr`**.
 Kompilatorn läser vanlig Dunder-källkod och skriver körbara filer för
 ARM64/macOS, ARM64/Linux och x86-64/Linux. Kodgenerering, ELF-/Mach-O-skrivning
 och macOS ad hoc-signering görs i kompilatorn.
+Den aktuella utvecklings- och återställningsgrenen är `main`.
 
 ```dunder
 fn add(a: i32, b: i32) -> i32 {
@@ -406,6 +407,31 @@ Projektet använder importer utan citattecken, `array.sort_strings` och
 `sys.eprint`. CSV-parsning, gruppering, sortering och felhantering körs i
 den färdiga binären utan externa verktyg. Integrationstesterna jämför även
 genererade CSV-data med en oberoende referens och bygger alla tre mål.
+
+## Nativefönster och Metal
+
+`import std.macos as macos` ger typade fönsterhandtag, händelser och en
+Metal-triangelista. Runtimegränsen anropar AppKit, CAMetalLayer och Metal
+direkt från genererad ARM64-kod. Ingen C-, Objective-C- eller Swift-källkod
+kompileras. Fönsterloopen, scenens tillstånd, geometrin och matematiken i
+exemplen är Dunder-kod. Apples Metal-runtime kompilerar den fasta MSL-pipelinen
+när ett fönster öppnas.
+
+```sh
+cargo run --release -- run dogfood/metal/triangle.ddr -- --frames 3
+cargo run --release -- run dogfood/metal/main.ddr
+cargo run --release -- build dogfood/metal/main.ddr --app -o build/DunderMetal.app
+open build/DunderMetal.app
+```
+
+Atlas-exemplet har dragning, paus med mellanslag, palettbyte med C och reset
+med R. Escape och fönstrets stängknapp avslutar. Layout och pekarinmatning
+använder logiska punkter; ritmåtten följer Retina-skalan. Första API:t har
+ett aktivt fönster per process och en fast pipeline för färgad geometri.
+Grafik-API:t gäller bara målet `arm64-macos` och kräver en grafisk session.
+Textlayout, nativekontroller, egen shaderkod och flera samtidiga fönster
+återstår. Läs [macOS-/Metal-kontraktet](docs/macos-metal.md) och
+[app-paketeringen](docs/app-bundles.md).
 
 ## Implementerat och återstående
 

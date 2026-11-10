@@ -24,6 +24,217 @@ pub(super) fn dynamic_data_offset(text_len: usize) -> usize {
     )
 }
 
+/// Bind external bundle metadata to an already emitted, directly signed image.
+/// The existing page-aligned signature offset stays fixed, so text and data
+/// fixups do not move. Only the final signature and its load-command extents
+/// change. The bundle publisher owns the exact bytes of both external files.
+pub(super) fn sign_bundle(
+    image: &mut Vec<u8>,
+    identifier: &str,
+    info: &[u8],
+    resources: &[u8],
+) -> Result<(), String> {
+    let malformed = || "cannot sign bundle: malformed generated Mach-O image".to_string();
+    let read32 = |at: usize| -> Result<u32, String> {
+        Ok(u32::from_le_bytes(
+            image
+                .get(at..at.checked_add(4).ok_or_else(malformed)?)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?,
+        ))
+    };
+    let read64 = |at: usize| -> Result<u64, String> {
+        Ok(u64::from_le_bytes(
+            image
+                .get(at..at.checked_add(8).ok_or_else(malformed)?)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?,
+        ))
+    };
+    if identifier.is_empty() || identifier.as_bytes().contains(&0) {
+        return Err("cannot sign bundle: identifier must be nonempty and contain no NUL".into());
+    }
+    if image.len() < 32
+        || read32(0)? != 0xfeedfacf
+        || read32(4)? != 0x0100000c
+        || read32(8)? != 0
+        || read32(12)? != 2
+    {
+        return Err(malformed());
+    }
+    // This is a finalization step for our two image writers, not a general
+    // third-party Mach-O re-signer. Reject other load-command arrangements.
+    let expected: &[u32] = if read32(16)? == 7 && read32(20)? == 392 && read32(24)? == 0x00200005 {
+        &[0x19, 0x19, 0x19, 0x32, 0xe, 0x80000028, 0x1d]
+    } else if read32(16)? == 10 && read32(20)? == COMMANDS as u32 && read32(24)? == 0x00200085 {
+        &[
+            0x19, 0x19, 0x19, 0x19, 0x32, 0xe, 0x80000028, 0xc, 0x80000022, 0x1d,
+        ]
+    } else {
+        return Err("cannot sign bundle: unsupported generated image format".into());
+    };
+    let commands_end = 32usize
+        .checked_add(read32(20)? as usize)
+        .ok_or_else(malformed)?;
+    if commands_end > image.len() {
+        return Err(malformed());
+    }
+    let mut at = 32;
+    let mut signature = None;
+    let mut linkedit = None;
+    let mut text = None;
+    for expected_kind in expected {
+        if at + 8 > commands_end {
+            return Err(malformed());
+        }
+        let kind = read32(at)?;
+        let size = read32(at + 4)? as usize;
+        let end = at.checked_add(size).ok_or_else(malformed)?;
+        if kind != *expected_kind || size < 8 || !size.is_multiple_of(8) || end > commands_end {
+            return Err(malformed());
+        }
+        if kind == 0x1d {
+            if size != 16 || signature.is_some() {
+                return Err(malformed());
+            }
+            signature = Some((at, read32(at + 8)? as usize, read32(at + 12)? as usize));
+        } else if kind == 0x19 {
+            if size < 72 {
+                return Err(malformed());
+            }
+            let name = &image[at + 8..at + 24];
+            if name.starts_with(b"__LINKEDIT\0") {
+                if linkedit.is_some() {
+                    return Err(malformed());
+                }
+                linkedit = Some((at, read64(at + 40)?));
+            } else if name.starts_with(b"__TEXT\0") {
+                if text.is_some() {
+                    return Err(malformed());
+                }
+                text = Some((read64(at + 40)?, read64(at + 48)?));
+            }
+        }
+        at = end;
+    }
+    let (sig_cmd, sig_off, old_sig_size) = signature.ok_or_else(malformed)?;
+    let (linkedit_cmd, linkedit_off) = linkedit.ok_or_else(malformed)?;
+    let (exec_base, exec_size) = text.ok_or_else(malformed)?;
+    if at != commands_end
+        || sig_off < commands_end
+        || sig_off % PAGE != 0
+        || sig_off.checked_add(old_sig_size) != Some(image.len())
+        || linkedit_off > sig_off as u64
+        || exec_base
+            .checked_add(exec_size)
+            .is_none_or(|end| end > sig_off as u64)
+    {
+        return Err(malformed());
+    }
+    let old_signature = &image[sig_off..];
+    let old_be32 = |at: usize| -> Result<usize, String> {
+        Ok(u32::from_be_bytes(
+            old_signature
+                .get(at..at.checked_add(4).ok_or_else(malformed)?)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?,
+        ) as usize)
+    };
+    if old_sig_size < 20 + 0x58
+        || old_be32(0)? != 0xfade0cc0
+        || old_be32(4)? != old_sig_size
+        || old_be32(8)? != 1
+        || old_be32(12)? != 0
+        || old_be32(16)? != 20
+        || old_be32(20)? != 0xfade0c02
+        || old_be32(24)? < 0x58
+        || old_be32(24)? > old_sig_size - 20
+        || old_be32(28)? != 0x20400
+        || old_be32(32)? != 2
+        || old_be32(52)? != sig_off
+        || old_signature[56] != 32
+        || old_signature[57] != 2
+        || old_signature[59] != 14
+    {
+        return Err("cannot sign bundle: unsupported generated signature format".into());
+    }
+
+    let slots = sig_off / PAGE;
+    let ident_end = 0x58usize
+        .checked_add(identifier.len())
+        .and_then(|end| end.checked_add(1))
+        .ok_or_else(malformed)?;
+    let hash_off = ident_end.checked_add(3 * 32).ok_or_else(malformed)?;
+    let cd_len = slots
+        .checked_mul(32)
+        .and_then(|len| len.checked_add(hash_off))
+        .ok_or_else(malformed)?;
+    let sig_size = cd_len
+        .checked_add(20 + 15)
+        .map(|len| len & !15)
+        .filter(|len| *len <= u32::MAX as usize)
+        .ok_or_else(malformed)?;
+    let linkedit_size = (sig_off as u64)
+        .checked_add(sig_size as u64)
+        .and_then(|end| end.checked_sub(linkedit_off))
+        .ok_or_else(malformed)?;
+    let linkedit_vm_size = linkedit_size
+        .checked_add(PAGE as u64 - 1)
+        .map(|size| size & !(PAGE as u64 - 1))
+        .ok_or_else(malformed)?;
+
+    image[sig_cmd + 12..sig_cmd + 16].copy_from_slice(&(sig_size as u32).to_le_bytes());
+    image[linkedit_cmd + 32..linkedit_cmd + 40].copy_from_slice(&linkedit_vm_size.to_le_bytes());
+    image[linkedit_cmd + 48..linkedit_cmd + 56].copy_from_slice(&linkedit_size.to_le_bytes());
+    image.truncate(sig_off);
+    let mut cd = vec![0u8; cd_len];
+    for (offset, value) in [
+        (0, 0xfade0c02),
+        (4, cd_len as u32),
+        (8, 0x20400),
+        (12, 2), // CS_ADHOC
+        (16, hash_off as u32),
+        (20, 0x58),
+        (24, 3), // Info.plist, absent requirements, CodeResources
+        (28, slots as u32),
+        (32, sig_off as u32),
+    ] {
+        be32(&mut cd, offset, value);
+    }
+    cd[36] = 32;
+    cd[37] = 2;
+    cd[39] = 14;
+    be64(&mut cd, 64, exec_base);
+    be64(&mut cd, 72, exec_size);
+    be64(&mut cd, 80, 1);
+    cd[0x58..ident_end - 1].copy_from_slice(identifier.as_bytes());
+    // Special slots count backwards from hashOffset. An all-zero slot denotes
+    // an absent component; requirements (-2) are optional for ad hoc signing.
+    cd[hash_off - 32..hash_off].copy_from_slice(&sha256(info));
+    cd[hash_off - 96..hash_off - 64].copy_from_slice(&sha256(resources));
+    for i in 0..slots {
+        cd[hash_off + i * 32..hash_off + (i + 1) * 32]
+            .copy_from_slice(&sha256(&image[i * PAGE..(i + 1) * PAGE]));
+    }
+    let mut signature = vec![0u8; 20];
+    for (offset, value) in [
+        (0, 0xfade0cc0),
+        (4, sig_size as u32),
+        (8, 1),
+        (12, 0),
+        (16, 20),
+    ] {
+        be32(&mut signature, offset, value);
+    }
+    signature.extend(cd);
+    signature.resize(sig_size, 0);
+    image.extend(signature);
+    Ok(())
+}
+
 pub(super) fn macho_dynamic(text: &[u8], symbols: &[&str]) -> Vec<u8> {
     let data_off = dynamic_data_offset(text.len());
     let import_bytes = symbols
@@ -323,5 +534,55 @@ mod tests {
         let off = le32(&empty, info + 16) as usize;
         assert_eq!(le32(&empty, info + 20), 1);
         assert_eq!(empty[off], 0);
+    }
+
+    #[test]
+    fn bundle_signature_binds_metadata_and_updated_load_commands_deterministically() {
+        let mut image = macho_dynamic(&[0; 32], &["_dlopen", "_dlsym"]);
+        let info = b"exact Info.plist bytes";
+        let resources = b"exact CodeResources bytes";
+        sign_bundle(&mut image, "ai.dunder.probe", info, resources).unwrap();
+        let cs = command(&image, 0x1d);
+        let sig_off = le32(&image, cs + 8) as usize;
+        assert_eq!(image.len(), sig_off + le32(&image, cs + 12) as usize);
+        let cd = &image[sig_off + 20..];
+        assert_eq!(big32(cd, 24), 3);
+        let hash_off = big32(cd, 16);
+        assert_eq!(&cd[hash_off - 32..hash_off], sha256(info));
+        assert_eq!(&cd[hash_off - 64..hash_off - 32], &[0u8; 32]);
+        assert_eq!(&cd[hash_off - 96..hash_off - 64], sha256(resources));
+        assert_eq!(&cd[hash_off..hash_off + 32], sha256(&image[..PAGE]));
+        assert_eq!(
+            u64::from_be_bytes(cd[72..80].try_into().unwrap()),
+            PAGE as u64
+        );
+        let sealed = image.clone();
+        sign_bundle(&mut image, "ai.dunder.probe", info, resources).unwrap();
+        assert_eq!(image, sealed);
+        sign_bundle(&mut image, "ai.dunder.probe", b"changed plist", resources).unwrap();
+        assert_ne!(image, sealed);
+    }
+
+    #[test]
+    fn malformed_bundle_inputs_fail_before_mutating_image() {
+        let source = macho_dynamic(&[], &[]);
+        for len in [0, 4, 31, 32, 200, source.len() - 1] {
+            let mut image = source[..len].to_vec();
+            let before = image.clone();
+            assert!(sign_bundle(&mut image, "ai.dunder.probe", &[], &[]).is_err());
+            assert_eq!(image, before);
+        }
+        let cs = command(&source, 0x1d);
+        for (offset, value) in [(4, 0), (20, u32::MAX), (36, 0), (cs + 8, 16), (cs + 12, 1)] {
+            let mut image = source.clone();
+            image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            let before = image.clone();
+            assert!(sign_bundle(&mut image, "ai.dunder.probe", &[], &[]).is_err());
+            assert_eq!(image, before);
+        }
+        let mut image = source;
+        let before = image.clone();
+        assert!(sign_bundle(&mut image, "", &[], &[]).is_err());
+        assert_eq!(image, before);
     }
 }

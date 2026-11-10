@@ -12,7 +12,7 @@ Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 45 passed, 0 failed
+# 49 testgrupper i det sammanslagna trädet
 ```
 
 Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
@@ -41,6 +41,8 @@ Med kompilatorn kopierad till `build/dunder` används samma kommandon som
 | [standard.ddr](standard.ddr) | Word counter med map/set, dynamiska arrayer, text, byte, SHA-256 och decimalparser. | `4`, `6`, `stdlib ok` |
 | [utf8.ddr](utf8.ddr) | UTF-8, byte/kodpunkter, ordräkning, strängretur och text i structar. | `bytes=25`, `runes=20`, `words=5`, `🌍 Hej världen` |
 | [tokenizer.ddr](tokenizer.ddr) | UTF-8-ord, ASCII-skiljetecken och citerade strängar med escapes. | `fn\|hälsa\|(\|namn\|)\|{\|print\|(\|"Hej 🌍"\|)\|}` |
+| [metal/triangle.ddr](metal/triangle.ddr) | Nativefönster, en gradienttriangel och en Dunder-skriven händelseloop. | `triangle frames=N` med `--frames N`; kräver grafisk session. |
+| [metal/main.ddr](metal/main.ddr) | Metal-scen med moduler, enumtillstånd, animation, dragning och tangentkommandon. | `atlas frames=N` med `--frames N`; kräver grafisk session. |
 
 [parameter_cases.ddr](parameter_cases.ddr) testar `(20) -> 4`, uttryck på
 båda sidor, flera argument och genererade fall i en loop.
@@ -103,6 +105,14 @@ Tillsammans med rotberäkning och precisionsprov i main finns sju numeriska
 testgrupper. Kör `dunder test dogfood/numeric/main.ddr`.
 Även [flyttalsutskriften](../runtime/float.ddr) är skriven i Dunder och
 kompileras in i program som skriver flyttal. Se [reglerna](../docs/floating.md).
+
+[metal/scene.ddr](metal/scene.ddr) och [metal/math.ddr](metal/math.ddr) driver
+nativegrafikstödet. Fyra grupper i huvudträdet testar geometrihjälparnas
+vertexlayout, scenens ändliga triangelista och återanvända lagring,
+paus/palett/dragning samt sinus/cosinus i Dunder. De öppnar inget fönster.
+`dunder test dogfood/metal/main.ddr` kör sju grupper inklusive delade sys-/
+parse-tester. De två körbara exemplen och deras GUI-kontrakt beskrivs i
+[macOS-/Metal-guiden](../docs/macos-metal.md).
 
 [text/scan.ddr](text/scan.ddr) implementerar `find`, `replace`, ordräkning,
 UTF-8-gränser och avkodning i Dunder. Både textprogrammet och tokenizern

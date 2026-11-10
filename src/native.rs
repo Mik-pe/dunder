@@ -9,6 +9,8 @@ mod collections;
 pub(crate) mod elf;
 mod enums;
 mod floats;
+mod image;
+mod macos;
 mod reachable;
 mod strings;
 mod sys;
@@ -47,6 +49,11 @@ struct Code<'a> {
     sys_types: Option<crate::check::SysTypes>,
     invalid_enum: Label,
     collections: collections::Runtime,
+    macos: macos::Runtime,
+    mac_types: Option<crate::check::MacTypes>,
+    text_offset: usize,
+    data_fixups: Vec<(usize, usize, u32)>,
+    import_labels: [Label; 2],
 }
 impl<'a> Code<'a> {
     fn new(functions: usize, types: &'a Types) -> Self {
@@ -75,6 +82,11 @@ impl<'a> Code<'a> {
             sys_types: None,
             invalid_enum: 0,
             collections: collections::Runtime::default(),
+            macos: macos::Runtime::default(),
+            mac_types: None,
+            text_offset: 432,
+            data_fixups: Vec::new(),
+            import_labels: [0; 2],
         };
         c.functions = (0..functions).map(|_| c.label()).collect();
         c.print_int = c.label();
@@ -90,11 +102,29 @@ impl<'a> Code<'a> {
         c.sys = sys::Runtime::new(&mut c);
         c.invalid_enum = c.label();
         c.collections = collections::Runtime::new(&mut c);
+        c.macos = macos::Runtime::new(&mut c);
+        c.import_labels = std::array::from_fn(|_| c.label());
         c
     }
     fn label(&mut self) -> Label {
         self.labels.push(None);
         self.labels.len() - 1
+    }
+    fn global_addr(&mut self, slot: usize, reg: u32) {
+        self.data_fixups.push((self.words.len(), slot, reg));
+        self.emit(0);
+        self.emit(0);
+    }
+    fn import_call(&mut self, index: usize) {
+        self.branch(self.import_labels[index], Branch::Call);
+    }
+    fn import_thunks(&mut self) {
+        for i in 0..2 {
+            self.mark(self.import_labels[i]);
+            self.global_addr(i, 16);
+            self.ldr(16, 16);
+            self.emit(0xd61f0200);
+        }
     }
     fn mark(&mut self, l: Label) {
         assert!(self.labels[l].is_none());
@@ -300,6 +330,7 @@ impl<'a> Code<'a> {
             ExprKind::Float(bits) => self.imm(0, *bits),
             ExprKind::FloatOp(op, value) => self.float_expr(*op, value, e.ty),
             ExprKind::SysCall(op, args, storage) => self.sys_expr(*op, args, *storage),
+            ExprKind::MacCall(op, args, storage) => self.mac_expr(*op, args, *storage),
             ExprKind::String(s) => {
                 let label = self.string_literal(s);
                 self.branch(label, Branch::Address(0));
@@ -888,14 +919,9 @@ impl<'a> Code<'a> {
             let to = self.labels[label].ok_or("unresolved function or branch")?;
             let delta = to as i64 - at as i64;
             if let Branch::Address(reg) = kind {
-                // Address fixups use the selected image layout, never the host OS.
-                let text_offset = if self.target == Target::Arm64Macos {
-                    432
-                } else {
-                    elf::TEXT_OFFSET
-                };
-                let from = text_offset + at * 4;
-                let target = text_offset + to * 4;
+                // Address fixups use the selected output image layout.
+                let from = self.text_offset + at * 4;
+                let target = self.text_offset + to * 4;
                 let pages = (target / 4096) as i64 - (from / 4096) as i64;
                 if !(-(1 << 20)..(1 << 20)).contains(&pages) {
                     return Err("address exceeds ADRP range".into());
@@ -929,6 +955,18 @@ impl<'a> Code<'a> {
             }
             let imm = (delta as u32) & ((1 << bits) - 1);
             self.words[at] = base | if bits == 26 { imm } else { imm << 5 };
+        }
+        let data = image::dynamic_data_offset(self.words.len() * 4);
+        for (at, slot, reg) in self.data_fixups {
+            let from = self.text_offset + at * 4;
+            let target = data + slot * 8;
+            let pages = (target / 4096) as i64 - (from / 4096) as i64;
+            if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+                return Err("runtime global address exceeds ADRP range".into());
+            }
+            let bits = pages as u32 & 0x1fffff;
+            self.words[at] = 0x90000000 | (bits & 3) << 29 | (bits >> 2) << 5 | reg;
+            self.words[at + 1] = 0x91000000 | ((target as u32 & 4095) << 10) | reg << 5 | reg;
         }
         Ok(self.words.iter().flat_map(|w| w.to_le_bytes()).collect())
     }
@@ -964,6 +1002,21 @@ pub fn compile_entry_for(
     let reachable = reachable::functions(program, entry);
     code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
     code.sys_types = program.sys_types;
+    code.mac_types = program.macos_types;
+    let uses_macos = reachable
+        .iter()
+        .enumerate()
+        .any(|(i, used)| *used && program.functions[i].uses_macos);
+    if uses_macos && target != Target::Arm64Macos {
+        return Err(format!(
+            "native macOS APIs require target arm64-macos; selected target is {target}"
+        ));
+    }
+    code.text_offset = match target {
+        Target::Arm64Macos if uses_macos => image::DYNAMIC_TEXT_OFFSET,
+        Target::Arm64Macos => 432,
+        _ => elf::TEXT_OFFSET,
+    };
     if target == Target::Arm64Macos {
         code.mov(23, 0); // LC_MAIN argc and argv, retained across Dunder calls
         code.mov(24, 1);
@@ -972,7 +1025,7 @@ pub fn compile_entry_for(
         code.emit(0x910023f8); // add x24,sp,#8 (argv)
     }
     code.emit(0xd51b441f); // msr fpcr,xzr: IEEE rounding and gradual underflow
-                           // Dedicated runtime registers; Dunder currently exposes no foreign ABI.
+                           // Runtime registers are preserved by the system ABI at native calls.
     code.imm(19, 0); // lazily mapped string arena cursor
     code.imm(20, 0); // string arena end
     code.imm(21, 0); // lazily mapped dynamic storage arena
@@ -1022,10 +1075,15 @@ pub fn compile_entry_for(
     }
     code.runtime();
     code.collections_runtime();
+    if uses_macos {
+        code.mac_runtime();
+        code.import_thunks();
+    }
     code.data_start = code.words.len();
     code.string_literals();
     let text = code.finish()?;
     Ok(match target {
+        Target::Arm64Macos if uses_macos => image::macho_dynamic(&text, &["_dlopen", "_dlsym"]),
         Target::Arm64Macos => macho(&text),
         Target::Arm64Linux => elf::executable(&text, 183),
         Target::X86_64Linux => elf::executable(&text, 62),
@@ -1033,7 +1091,7 @@ pub fn compile_entry_for(
 }
 
 // Darwin packs stack arguments at their natural size and alignment, then
-// requires the caller's SP to remain 16-byte aligned. No FFI is exposed yet.
+// requires the caller's SP to remain 16-byte aligned, including native calls.
 enum Argument {
     General(u32),
     Float(u32),
@@ -1218,7 +1276,18 @@ fn macho(text: &[u8]) -> Vec<u8> {
     image
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+/// Seal the exact bundle metadata bytes using the compiler's native signer.
+pub fn sign_bundle(
+    image: &mut Vec<u8>,
+    identifier: &str,
+    info: &[u8],
+    resources: &[u8],
+) -> Result<(), String> {
+    image::sign_bundle(image, identifier, info, resources)
+}
+
+/// SHA-256 for bundle resource seals; no external signing tool is needed.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,

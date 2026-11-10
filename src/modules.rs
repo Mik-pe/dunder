@@ -105,6 +105,7 @@ impl Loader {
             records: module.records,
             enums: module.enums,
             standard_sys: name == "sys",
+            standard_macos: name == "std/macos",
         });
         self.imports(id, module.imports, None)?;
         Ok(id)
@@ -138,6 +139,7 @@ impl Loader {
             records: module.records,
             enums: module.enums,
             standard_sys: false,
+            standard_macos: false,
         });
         self.imports(id, module.imports, path.parent())?;
         Ok(id)
@@ -227,6 +229,7 @@ fn standard_source(name: &str) -> Option<&'static str> {
         "std/bytes" => include_str!("../stdlib/bytes.ddr"),
         "std/sha256" => include_str!("../stdlib/sha256.ddr"),
         "std/parse" => include_str!("../stdlib/parse.ddr"),
+        "std/macos" => include_str!("../stdlib/macos.ddr"),
         _ => return None,
     })
 }

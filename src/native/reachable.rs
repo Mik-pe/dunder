@@ -50,7 +50,11 @@ fn expr(e: &Expr, pending: &mut Vec<usize>) {
                 expr(v, pending);
             }
         }
-        StringOp(_, args) | SysCall(_, args, _) | Array(args, _) | Dynamic(args, _) => {
+        StringOp(_, args)
+        | SysCall(_, args, _)
+        | MacCall(_, args, _)
+        | Array(args, _)
+        | Dynamic(args, _) => {
             for v in args {
                 expr(v, pending);
             }
