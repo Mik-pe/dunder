@@ -43,12 +43,13 @@ stage 2/stage 3; full språk- och plattformsparitet återstår.
 
 Frontend, typkontroll och standardbibliotek delas mellan målen. ARM64-backenden
 skriver instruktioner direkt. Den första x86-64-backenden sänker samma interna
-instruktionsvokabulär till x86-64 under kompileringen. Virtuella register har
-minneslagring och en privat värdestack använder en 64 MiB virtuell minnesmappning
+instruktionsvokabulär till x86-64 under kompileringen. De vanligaste
+arbetsregistren och värdestackpekaren har fasta CPU-register; övriga virtuella
+register har minneslagring. En privat värdestack använder en 64 MiB virtuell minnesmappning
 med skyddssida och kontrollerade stackgränser (exitkod 110 vid full stack).
-Detta prioriterar gemensam språksemantik framför optimerad
-registerallokering. Den färdiga filen innehåller x86-64-maskinkod, inte en
+Full registerallokering för lokala variabler återstår. Den färdiga filen innehåller x86-64-maskinkod, inte en
 interpreter eller emulator. Dess prestanda ska mätas separat från ARM64.
+Läs [maskinkodsoptimeringen](optimization.md) och dess mätunderlag.
 
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
 dynamisk laddare eller libc. Nåbara Vulkan-anrop väljer en egen dynamisk ELF

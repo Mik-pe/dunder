@@ -11,6 +11,7 @@ mod enums;
 mod floats;
 mod image;
 mod macos;
+mod optimize;
 mod reachable;
 mod strings;
 mod sys;
@@ -218,12 +219,15 @@ impl<'a> Code<'a> {
         self.emit(0xf9000120 | reg);
     }
     fn load(&mut self, slot: usize) {
+        self.load_reg(slot, 0);
+    }
+    fn load_reg(&mut self, slot: usize, reg: u32) {
         if slot < 32 {
-            self.emit(0xf84003a0 | ((-(slot as i32 + 1) * 8) as u32 & 511) << 12);
+            self.emit(0xf84003a0 | ((-(slot as i32 + 1) * 8) as u32 & 511) << 12 | reg);
             return;
         }
         self.local_addr(slot);
-        self.emit(0xf9400120);
+        self.emit(0xf9400120 | reg);
     }
     fn prologue(&mut self, size: usize) {
         self.emit(0xa9bf7bfd);
@@ -400,6 +404,9 @@ impl<'a> Code<'a> {
         self.emit(0x8b000020);
     }
     fn expr(&mut self, e: &Expr) {
+        if self.optimized_expr(e) {
+            return;
+        }
         match &e.kind {
             ExprKind::ManagedString(value, slot, fresh) => {
                 self.expr(value);
@@ -522,8 +529,7 @@ impl<'a> Code<'a> {
                 }
             }
             ExprKind::Assert(condition) => {
-                self.expr(condition);
-                self.branch(self.assertion, Branch::Zero(0));
+                self.condition(condition, self.assertion, false);
                 self.imm(0, 0);
             }
             ExprKind::Range(a, b) => {
@@ -716,10 +722,7 @@ impl<'a> Code<'a> {
                 self.mark(end);
             }
             ExprKind::Binary(op, a, b) => {
-                self.expr(a);
-                self.push(0);
-                self.expr(b);
-                self.pop(1);
+                self.operands(a, b);
                 if a.ty.float() {
                     self.float_binary(op, a.ty);
                     return;
@@ -865,9 +868,15 @@ impl<'a> Code<'a> {
                     } else {
                         self.imm(0, 0);
                     }
-                    self.push(0);
-                    self.release_owned_storage();
-                    self.pop(0);
+                    if self
+                        .owned_storage
+                        .iter()
+                        .any(|(_, ty)| self.needs_drop(*ty))
+                    {
+                        self.push(0);
+                        self.release_owned_storage();
+                        self.pop(0);
+                    }
                     if let Some(e) = e {
                         if e.ty.float() {
                             self.bits_to_fp(0, 0, e.ty);
@@ -883,10 +892,13 @@ impl<'a> Code<'a> {
                     }
                 }
                 Stmt::If(c, yes, no) => {
+                    if let Some(value) = optimize::constant(c) {
+                        self.stmts(if value != 0 { yes } else { no });
+                        continue;
+                    }
                     let other = self.label();
                     let end = self.label();
-                    self.expr(c);
-                    self.branch(other, Branch::Zero(0));
+                    self.condition(c, other, false);
                     self.stmts(yes);
                     self.branch(end, Branch::Jump);
                     self.mark(other);
@@ -898,8 +910,7 @@ impl<'a> Code<'a> {
                     let end = self.label();
                     self.loops.push((head, end));
                     self.mark(head);
-                    self.expr(c);
-                    self.branch(end, Branch::Zero(0));
+                    self.condition(c, end, false);
                     self.stmts(b);
                     self.branch(head, Branch::Jump);
                     self.mark(end);
@@ -945,10 +956,8 @@ impl<'a> Code<'a> {
                     let done = self.label();
                     self.loops.push((next, done));
                     self.mark(head);
-                    self.load(*cursor);
-                    self.push(0);
+                    self.load_reg(*cursor, 1);
                     self.load(*end);
-                    self.pop(1);
                     self.cmp(1, 0);
                     self.branch(done, Branch::Cond(10));
                     if matches!(source.ty, Type::Bytes | Type::Runes) {

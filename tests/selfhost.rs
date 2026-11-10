@@ -495,7 +495,24 @@ fn main(){var a:=Values{items:[]};a.items.reserve(8);append(&mut a,3);append(&mu
         compiler_runner: Option<&Runner>,
         program_runner: Option<&Runner>,
     ) {
-        for (name, source, expected) in PROGRAMS {
+        // Exercise direct signed offsets, immediate-address offsets and the
+        // large-offset fallback in the Dunder-written backend, including borrows.
+        let boundaries = [0, 31, 32, 510, 511, 519];
+        let mut frame_source = String::from("fn bump(v:&mut i32){v=v+10}\nfn main(){\n");
+        for slot in 0..520 {
+            frame_source += &format!("var v{slot}:={slot}\n");
+        }
+        for slot in boundaries {
+            frame_source += &format!("bump(&mut v{slot})\n");
+        }
+        for slot in 0..520 {
+            let expected = slot + if boundaries.contains(&slot) { 10 } else { 0 };
+            frame_source += &format!("assert(v{slot}=={expected})\n");
+        }
+        frame_source += "print(42)\n}";
+        let mut programs = PROGRAMS.to_vec();
+        programs.push(("frame_offsets", &frame_source, "42\n"));
+        for (name, source, expected) in programs {
             let reference_image = dunder::compile(source).unwrap_or_else(|error| {
                 panic!(
                     "invalid {name} test fixture: {}",

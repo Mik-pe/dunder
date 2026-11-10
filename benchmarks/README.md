@@ -1,5 +1,9 @@
 # Lokala byggmätningar
 
+Runtime har en separat [före/efter-svit](runtime/README.md) för numerik,
+arrayläsning, UTF-8-text och sortering. Den mäter optimerad maskinkod med
+samma källor och säkerhetskontroller, med 30 varv per variant.
+
 Mätverktyget är [tools/compile-bench.rs](../tools/compile-bench.rs), ett separat
 Rust/std-program för mätning utanför kompilatorprocessen. Det ingår inte i
 Dunders byggväg. Enligt [agentregeln](../AGENTS.md) körs ingen GitHub-CI.

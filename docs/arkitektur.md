@@ -9,9 +9,10 @@ runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
 Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
 GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
 begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
-Automatisk frigöring för arrayer och strängar är implementerad i bootstrapens
-kodgenerering. Generella livstider, explicita flyttar, registeroptimeringarna
-och den inkrementella cachen nedan är fortsatt designmål.
+Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
+är implementerade i bootstrapens kodgenerering. Generella livstider,
+explicita flyttar, full registerallokering och den inkrementella cachen
+nedan är fortsatt designmål.
 
 ## Språkets kostnadsmodell
 
@@ -59,7 +60,21 @@ Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och os
 
 Första backendversionen håller tillfälliga värden i register och ger värden som lever över en gren en känd hemplats. Vid anrop respekteras register som anroparen måste spara. Nästa steg är att behålla lokala värden i register över strukturerade loopar och grenar där alla inkommande vägar kan enas om placeringen. Kompilatorn får använda begränsad analys per funktion. En permanent andra modell av hela programmet skulle däremot bryta mot designen.
 
-**Optimering i standardbygget.** Börja med laglig konstantvikning, döda konstanta grenar, immediater och ARM64:s adresseringslägen, direkt jämförelse följd av villkorligt hopp och borttagning av överflödiga registerflyttar. Prioritera därefter loopars registeranvändning och bevisat överflödiga gränskontroller utifrån mätningar. En optimering måste bevara evalueringsordning, sidoeffekter, lån och möjliga fällor. Exempelvis får vikning av multiplikation med noll inte kasta bort ett anrop med sidoeffekter. Inlining får en storleksbudget, och konsumenten måste bero på den inlinade kroppen. SIMD, mer aggressiv inlining och specialisering prövas mot uppmätta flaskhalsar. C/C++-paritet är en prövbar ambition, särskilt svår på vektoriserbara loopar.
+**Optimering i standardbygget.** Laglig konstantvikning, bortval av konstanta
+grenar, kontrollerad addition/subtraktion med immediater, enkla operander
+utan stackspill och direkt jämförelse följd av villkorligt hopp är nu
+implementerade. x86-64 har fasta CPU-register för vanliga arbetsvärden;
+selfhost-backenden använder kompakta stackadresser. Se
+[kontraktet och mätningarna](optimization.md).
+
+Nästa steg är loopars registeranvändning och bevisat överflödiga
+gränskontroller utifrån mätningar. En optimering måste bevara
+evalueringsordning, sidoeffekter, lån och möjliga fällor. Exempelvis får
+vikning av multiplikation med noll inte kasta bort ett anrop med sidoeffekter.
+Inlining behöver en storleksbudget, och konsumenten måste bero på den
+inlinade kroppen. SIMD, mer aggressiv inlining och specialisering ska
+prövas mot uppmätta flaskhalsar. C/C++-paritet är en prövbar ambition,
+särskilt svår på vektoriserbara loopar.
 
 ## Verktygskedjan och målplattformarna
 

@@ -342,8 +342,11 @@ formatteraren prioriterar korrekthet; prestanda är inte uppmätt.
 Anonyma funktioner och closures med infångade lokaler återstår.
 Overflow/division med noll, gränsfel, assertions, full strängarena och ogiltiga
 Unicode-operationer ger definierad exitstatus;
-källpositioner och värden i runtimefel återstår. Backend använder stackplatser
-och saknar ännu registerallokering och avancerade optimeringar.
+källpositioner och värden i runtimefel återstår. Backend använder lokala
+stackplatser med optimerad operandkod, konstanta uttryck och direkta
+villkorshopp. x86-64 håller vanliga arbetsvärden och stackpekaren i CPU-register.
+Full registerallokering, inlining och vektorisering återstår. Se
+[maskinkodsoptimeringen](optimization.md).
 [Byggmätningarna](../benchmarks/README.md) avser ett genererat stresskorpus;
 de bevisar inte hela 100k-rader/s-kontraktet eller C-paritet.
 

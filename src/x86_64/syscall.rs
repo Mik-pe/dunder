@@ -2,8 +2,8 @@
 use super::Lower;
 
 impl Lower {
-    /// Keep the backend's private register bank and value stack separate from
-    /// the x86 call stack. This is compile-time register spilling: no opcodes,
+    /// Keep the backend's remaining register spills and value stack separate
+    /// from the x86 call stack. This is compile-time register allocation: no opcodes,
     /// instruction pointer, dispatch loop or emulator are shipped in the image.
     pub(super) fn prelude(&mut self) {
         const STACK_BYTES: u64 = 64 * 1024 * 1024;
@@ -59,6 +59,12 @@ impl Lower {
         self.state_store(520, 0);
         self.emit(&[0x41, 0x0f, 0xae, 0x97]); // ldmxcsr [r15+520]
         self.disp32(520);
+
+        // Match the zero-filled spill bank's initial values. r14 held argv's
+        // original address until the copy above; it is now virtual x2's home.
+        for offset in [0, 8, 16] {
+            self.imm64(Self::register_home(offset).unwrap(), 0);
+        }
     }
 
     /// Translate the emitted Linux AArch64 operation number into the native

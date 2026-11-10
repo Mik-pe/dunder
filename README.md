@@ -464,8 +464,13 @@ Läs [syntaxen](docs/syntax.md).
 
 Anrop stöder både register- och stackargument; fler än åtta parametrar fungerar.
 Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
-infångade lokaler är inte implementerade. Backend prioriterar korrekt typning
-och körbar kod. Byggmätningar av ett genererat korpus finns i
+infångade lokaler är inte implementerade. Standardbygget optimerar konstanta
+uttryck, villkorshopp, immediater och operandernas stacktrafik; x86-64 håller
+vanliga arbetsvärden i CPU-register. [Maskinkodsoptimeringen](docs/optimization.md)
+bevarar overflowkontroller, evalueringsordning och minnesägarskap. Fyra lokala
+[runtime-prov](benchmarks/runtime/README.md) visar 6–17 % kortare mediankörtid
+och cirka 21 % mindre binärer på Linux/x86-64; det är ingen generell
+prestandagaranti. Byggmätningar av ett genererat korpus finns i
 [prestandarapporten](benchmarks/README.md); hela prestandakontraktet är ännu
 inte uppfyllt. Oanvända funktioner och oanvänd flyttalsformatering tas bort
 ur den genererade binären; parsern har en ASCII-väg utan teckenindexallokering.

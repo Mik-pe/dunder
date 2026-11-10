@@ -1,8 +1,9 @@
 //! Native x86-64 lowering for the bootstrap backend's instruction vocabulary.
 //! Lowering happens entirely at compile time; generated programs contain only
-//! x86-64 instructions, data, Linux system calls, and optional native C calls. Virtual registers
-//! initially live in a private allocation, keeping the shared runtime independent
-//! of the host CPU. This deliberately favors correctness over register allocation.
+//! x86-64 instructions, data, Linux system calls, and optional native C calls.
+//! Hot virtual registers have fixed host-register homes; the remaining register
+//! bank lives in a private allocation. Fixed homes work across every control-flow
+//! edge without a runtime dispatcher, cache flush or data-flow analysis.
 use crate::native::{Branch, Label};
 mod floats;
 mod syscall;
@@ -30,11 +31,49 @@ impl Lower {
         self.emit(&n.to_le_bytes());
     }
     fn imm64(&mut self, reg: u8, value: u64) {
+        // MOV preserves flags. A 32-bit write zero-extends, and C7 /0 sign-
+        // extends its immediate; reserve MOVABS for actual 64-bit constants.
+        if let Ok(value) = u32::try_from(value) {
+            self.rex(false, 0, 0, reg);
+            self.code.push(0xb8 | (reg & 7));
+            self.emit(&value.to_le_bytes());
+            return;
+        }
+        if (value as i64) == i64::from(value as i32) {
+            self.rex(true, 0, 0, reg);
+            self.code.push(0xc7);
+            self.modrm_reg(0, reg);
+            self.emit(&(value as u32).to_le_bytes());
+            return;
+        }
         self.rex(true, 0, 0, reg);
         self.code.push(0xb8 | (reg & 7));
         self.emit(&value.to_le_bytes());
     }
+    // The arithmetic lowerer uses rax/rcx/rdx and r8..r11 as scratch registers.
+    // These fixed homes are callee-saved in SysV and preserved by Linux syscalls.
+    // rbx is reserved for aligning the host stack across native library calls.
+    fn register_home(offset: i32) -> Option<u8> {
+        match offset {
+            0 => Some(12),  // x0: expression results and first argument
+            8 => Some(13),  // x1: left operand and second argument
+            16 => Some(14), // x2: arithmetic/address scratch and third argument
+            248 => Some(5), // virtual SP, distinct from the host call stack
+            _ => None,
+        }
+    }
+    fn mov_reg(&mut self, dst: u8, src: u8) {
+        if dst != src {
+            self.rex(true, src, 0, dst);
+            self.code.push(0x89);
+            self.modrm_reg(src, dst);
+        }
+    }
     fn state_load(&mut self, reg: u8, offset: i32) {
+        if let Some(home) = Self::register_home(offset) {
+            self.mov_reg(reg, home);
+            return;
+        }
         self.rex(true, reg, 0, 15);
         self.emit(&[0x8b, 0x87 | ((reg & 7) << 3)]);
         self.disp32(offset);
@@ -55,6 +94,10 @@ impl Lower {
             self.disp32(64 * 1024 * 1024);
             let above = self.local_jump(Some(7));
             self.stack_failures.push(above);
+        }
+        if let Some(home) = Self::register_home(offset) {
+            self.mov_reg(home, reg);
+            return;
         }
         self.rex(true, reg, 0, 15);
         self.emit(&[0x89, 0x87 | ((reg & 7) << 3)]);
@@ -224,7 +267,7 @@ impl Lower {
         }
         // Dunder's call stack has no host-ABI alignment contract. Remember it
         // in a callee-saved register, then build a properly aligned SysV frame.
-        self.emit(&[0x41, 0x54, 0x49, 0x89, 0xe4]); // push r12; mov r12,rsp
+        self.emit(&[0x53, 0x48, 0x89, 0xe3]); // push rbx; mov rbx,rsp
         self.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp,-16
         let stack = argc.saturating_sub(6) * 8;
         if stack != 0 {
@@ -248,7 +291,7 @@ impl Lower {
         self.emit(&[0x41, 0xff, 0xd3]); // call r11
         self.store(0, 0);
         self.fp_store(0, 0, true);
-        self.emit(&[0x4c, 0x89, 0xe4, 0x41, 0x5c]); // mov rsp,r12; pop r12
+        self.emit(&[0x48, 0x89, 0xdc, 0x5b]); // mov rsp,rbx; pop rbx
         Ok(())
     }
     fn word(&mut self, w: u32) -> Result<(), String> {
@@ -744,6 +787,18 @@ mod tests {
             immediate(words, 8, 64);
             words.push(0xd4000001);
         }
+        fn check_preserved_arguments(
+            words: &mut Vec<u32>,
+            fixups: &mut Vec<(usize, usize, Branch)>,
+        ) {
+            immediate(words, 3, 256);
+            for cmp in [0xeb03003f, 0xeb17005f] {
+                // cmp x1,x3; cmp x2,x23
+                words.push(cmp);
+                fixups.push((words.len(), 2, Branch::Cond(1)));
+                words.extend([0, 0xd503201f]);
+            }
+        }
         let mut words = Vec::new();
         let mut globals = Vec::new();
         let mut fixups = Vec::new();
@@ -757,7 +812,9 @@ mod tests {
         for arg in 3..12 {
             immediate(&mut words, arg, u64::from(arg - 2));
         }
+        words.push(0xaa0203f7); // x23 = x2, retained format pointer.
         words.push(0xff000c11); // Twelve integer arguments, six on the host stack.
+        check_preserved_arguments(&mut words, &mut fixups);
         write_buffer(&mut words, &mut globals);
 
         global(&mut words, &mut globals, 0, 17);
@@ -770,9 +827,15 @@ mod tests {
         immediate(&mut words, 1, 256);
         fixups.push((words.len(), 1, Branch::Address(2)));
         words.extend([0, 0xd503201f]);
+        words.push(0xaa0203f7); // x23 = x2.
         words.push(0xff020311); // Three integer and two floating arguments.
+        check_preserved_arguments(&mut words, &mut fixups);
         write_buffer(&mut words, &mut globals);
         words.push(0xaa1603e0); // exit with the preserved x22.
+        immediate(&mut words, 8, 93);
+        words.push(0xd4000001);
+        let corrupted = words.len();
+        immediate(&mut words, 0, 78);
         immediate(&mut words, 8, 93);
         words.push(0xd4000001);
         let data_start = words.len();
@@ -788,6 +851,7 @@ mod tests {
                 words.push(u32::from_le_bytes(bytes));
             }
         }
+        labels.push(Some(corrupted));
         let text = lower_dynamic(&words, &labels, &fixups, data_start, &globals).unwrap();
         let image = crate::native::elf::dynamic_executable(&text, 62, &["snprintf"], 4096);
         let path = std::env::temp_dir().join(format!("dunder-native-call-{}", std::process::id()));

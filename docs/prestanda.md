@@ -1,5 +1,10 @@
 # Så mäter vi Dunder
 
+Den lokala [runtime-sviten](../benchmarks/runtime/README.md) jämför nu
+baseline och optimerad maskinkod med fyra frysta arbetsfall, oberoende
+resultatreferenser och 30 växelvisa körningar. Den är ett avgränsat
+före/efter-prov; C/C++-jämförelsen nedan återstår.
+
 Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Alla siffror nedan är föreslagna acceptansgränser. Vi har nu [byggmätningar och råvärden](../benchmarks/README.md) för ett genererat stresskorpus. Det är första mätunderlaget; hela kontraktet nedan är ännu inte uppfyllt.
 
 ## Från kommando till färdig ARM64-binär
