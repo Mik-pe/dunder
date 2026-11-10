@@ -52,8 +52,10 @@ Första backendversionen håller tillfälliga värden i register och ger värden
 Målen är `arm64-macos`, `arm64-linux` och `x86_64-linux`. Dunder äger parser,
 typkontroll, kodgenerering, relokeringar, bildskrivning, macOS ad hoc-signering
 och byggdrivrutin. Ett vanligt Dunderbygge kör aldrig LLVM, GCC, en extern
-assembler, länkare eller signerare. Linuxbilderna använder direkta systemanrop
-utan libc. Externa verktyg får inspektera eller jämföra resultat i tester.
+assembler, länkare eller signerare. Vanliga Linuxbilder använder direkta
+systemanrop utan libc. Nåbara Vulkan-anrop väljer i stället en egen dynamisk
+ELF med ett avgränsat C-ABI för systemets loader, Vulkan och SDL2.
+Externa verktyg får inspektera eller jämföra resultat i tester.
 
 Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
 anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen

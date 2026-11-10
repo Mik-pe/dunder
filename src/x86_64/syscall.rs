@@ -69,6 +69,7 @@ impl Lower {
         let mut mapped = Vec::new();
         for (arm, native) in [
             (93, 60),  // exit
+            (94, 231), // exit_group
             (63, 0),   // read
             (64, 1),   // write
             (222, 9),  // mmap
@@ -109,9 +110,9 @@ impl Lower {
     }
 
     fn syscall_fatal(&mut self) {
-        self.imm64(0, 60);
+        self.imm64(0, 231);
         self.imm64(7, 74);
-        self.emit(&[0x0f, 0x05, 0x0f, 0x0b]); // exit(74); ud2
+        self.emit(&[0x0f, 0x05, 0x0f, 0x0b]); // exit_group(74); ud2
     }
 
     fn patch_local(&mut self, at: usize, target: usize) {

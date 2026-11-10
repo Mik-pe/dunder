@@ -14,6 +14,7 @@ mod macos;
 mod reachable;
 mod strings;
 mod sys;
+mod vulkan;
 
 pub(crate) type Label = usize;
 pub(crate) enum Branch {
@@ -51,6 +52,8 @@ struct Code<'a> {
     collections: collections::Runtime,
     macos: macos::Runtime,
     mac_types: Option<crate::check::MacTypes>,
+    vulkan: vulkan::Runtime,
+    vulkan_types: Option<crate::check::VulkanTypes>,
     text_offset: usize,
     data_fixups: Vec<(usize, usize, u32)>,
     import_labels: [Label; 2],
@@ -84,6 +87,8 @@ impl<'a> Code<'a> {
             collections: collections::Runtime::default(),
             macos: macos::Runtime::default(),
             mac_types: None,
+            vulkan: vulkan::Runtime::default(),
+            vulkan_types: None,
             text_offset: 432,
             data_fixups: Vec::new(),
             import_labels: [0; 2],
@@ -103,6 +108,7 @@ impl<'a> Code<'a> {
         c.invalid_enum = c.label();
         c.collections = collections::Runtime::new(&mut c);
         c.macos = macos::Runtime::new(&mut c);
+        c.vulkan = vulkan::Runtime::new(&mut c);
         c.import_labels = std::array::from_fn(|_| c.label());
         c
     }
@@ -121,9 +127,36 @@ impl<'a> Code<'a> {
     fn import_thunks(&mut self) {
         for i in 0..2 {
             self.mark(self.import_labels[i]);
+            if self.target != Target::Arm64Macos {
+                self.prologue(0);
+            }
             self.global_addr(i, 16);
             self.ldr(16, 16);
-            self.emit(0xd61f0200);
+            if self.target == Target::Arm64Macos {
+                self.emit(0xd61f0200);
+            } else {
+                self.native_call(16, 2, 0);
+                self.epilogue();
+            }
+        }
+    }
+    // Call a system-library function, separate from Dunder's private ABI.
+    fn native_call(&mut self, function: u32, argc: u32, floats: u32) {
+        assert!(argc <= 16 && floats <= 8 && function < 31);
+        if self.target == Target::X86_64Linux {
+            self.emit(0xff000000 | (floats << 16) | (argc << 8) | function);
+        } else {
+            let stack = argc.saturating_sub(8).div_ceil(2) * 16;
+            if stack > 0 {
+                self.emit(0xd10003ff | (stack << 10));
+                for arg in 8..argc {
+                    self.emit(0xf90003e0 | ((arg - 8) << 10) | arg);
+                }
+            }
+            self.emit(0xd63f0000 | (function << 5));
+            if stack > 0 {
+                self.emit(0x910003ff | (stack << 10));
+            }
         }
     }
     fn mark(&mut self, l: Label) {
@@ -331,6 +364,7 @@ impl<'a> Code<'a> {
             ExprKind::FloatOp(op, value) => self.float_expr(*op, value, e.ty),
             ExprKind::SysCall(op, args, storage) => self.sys_expr(*op, args, *storage),
             ExprKind::MacCall(op, args, storage) => self.mac_expr(*op, args, *storage),
+            ExprKind::Vulkan(op, args, storage) => self.vulkan_expr(*op, args, *storage),
             ExprKind::String(s) => {
                 let label = self.string_literal(s);
                 self.branch(label, Branch::Address(0));
@@ -913,6 +947,15 @@ impl<'a> Code<'a> {
     }
     fn finish(mut self) -> Result<Vec<u8>, String> {
         if self.target == Target::X86_64Linux {
+            if !self.data_fixups.is_empty() {
+                return crate::x86_64::lower_dynamic(
+                    &self.words,
+                    &self.labels,
+                    &self.fixups,
+                    self.data_start,
+                    &self.data_fixups,
+                );
+            }
             return crate::x86_64::lower(&self.words, &self.labels, &self.fixups, self.data_start);
         }
         for (at, label, kind) in self.fixups {
@@ -956,7 +999,11 @@ impl<'a> Code<'a> {
             let imm = (delta as u32) & ((1 << bits) - 1);
             self.words[at] = base | if bits == 26 { imm } else { imm << 5 };
         }
-        let data = image::dynamic_data_offset(self.words.len() * 4);
+        let data = if self.target == Target::Arm64Macos {
+            image::dynamic_data_offset(self.words.len() * 4)
+        } else {
+            elf::dynamic_data_offset(self.words.len() * 4)
+        };
         for (at, slot, reg) in self.data_fixups {
             let from = self.text_offset + at * 4;
             let target = data + slot * 8;
@@ -1003,6 +1050,16 @@ pub fn compile_entry_for(
     code.float_formatter = program.float_formatter.map(|f| code.functions[f]);
     code.sys_types = program.sys_types;
     code.mac_types = program.macos_types;
+    code.vulkan_types = program.vulkan_types;
+    let uses_vulkan = reachable
+        .iter()
+        .enumerate()
+        .any(|(i, used)| *used && program.functions[i].uses_vulkan);
+    if uses_vulkan && target == Target::Arm64Macos {
+        return Err(format!(
+            "native Vulkan APIs require a Linux target; selected target is {target}"
+        ));
+    }
     let uses_macos = reachable
         .iter()
         .enumerate()
@@ -1079,12 +1136,22 @@ pub fn compile_entry_for(
         code.mac_runtime();
         code.import_thunks();
     }
+    if uses_vulkan {
+        code.vulkan_runtime();
+        code.import_thunks();
+    }
     code.data_start = code.words.len();
     code.string_literals();
     let text = code.finish()?;
     Ok(match target {
         Target::Arm64Macos if uses_macos => image::macho_dynamic(&text, &["_dlopen", "_dlsym"]),
         Target::Arm64Macos => macho(&text),
+        Target::Arm64Linux if uses_vulkan => {
+            elf::dynamic_executable(&text, 183, &["dlopen", "dlsym"], 4096)
+        }
+        Target::X86_64Linux if uses_vulkan => {
+            elf::dynamic_executable(&text, 62, &["dlopen", "dlsym"], 4096)
+        }
         Target::Arm64Linux => elf::executable(&text, 183),
         Target::X86_64Linux => elf::executable(&text, 62),
     })

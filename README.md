@@ -433,6 +433,22 @@ Textlayout, nativekontroller, egen shaderkod och flera samtidiga fönster
 återstår. Läs [macOS-/Metal-kontraktet](docs/macos-metal.md) och
 [app-paketeringen](docs/app-bundles.md).
 
+## Vulkan och lavapipe på Linux
+
+`import std.vulkan as vulkan` ger motsvarande triangel- och Atlas-dogfood
+på Linux. Vulkan renderar geometrin; headless-läget kan läsa tillbaka
+RGBA och spara bilder. SDL2 visar samma renderade bild i fönsterläget.
+
+```sh
+cargo run --release -- run dogfood/vulkan/main.ddr -- --headless --frames 3 --capture build/atlas.ppm
+cargo run --release -- run dogfood/vulkan/main.ddr
+```
+
+Välj Mesas lavapipe-ICD för mjukvarurendering. Dunder skriver nativekod och
+dynamisk ELF själv, med inbäddad SPIR-V och utan extern länkare.
+Se [Linux/Vulkan-guiden](docs/linux-vulkan.md) för installation, kontroller
+och pixeltester med valideringslager.
+
 ## Implementerat och återstående
 
 Implementerat: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,

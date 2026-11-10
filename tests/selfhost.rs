@@ -2,7 +2,7 @@
 fn bundled_standard_library_matches_its_sources() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let names = [
-        "array", "bytes", "hash", "macos", "map", "parse", "set", "sha256", "sys", "text",
+        "array", "bytes", "hash", "macos", "map", "parse", "set", "sha256", "sys", "text", "vulkan",
     ];
     let mut actual_names: Vec<_> = std::fs::read_dir(root.join("stdlib"))
         .unwrap()

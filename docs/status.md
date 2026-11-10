@@ -138,16 +138,23 @@ Lokalt på Linux/x86-64, 2026-11-10:
 
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` och
   `cargo build --release` passerar med Rust 1.90.0.
-- `cargo test -- --test-threads=1`: 119 testfunktioner passerar.
-- Releasekompilatorns `dunder test` kör alla 53 Dunder-testgrupper med tom
+- `cargo test -- --test-threads=1`: 127 testfunktioner passerar, med
+  `DUNDER_VULKAN_TEST=1` och Khronos valideringslager för Vulkan-körningarna.
+- Releasekompilatorns `dunder test` kör alla 58 Dunder-testgrupper med tom
   verktygssökväg. Alla passerar.
 - ARM64/Linux under QEMU: 16 exempel/dogfood-program med exakt utdata,
-  samtliga 53 testgrupper och separata prov av systemanrop, argument, felkoder
+  samtliga 58 testgrupper och separata prov av systemanrop, argument, felkoder
   och flyttal. Den valfria verifieraren finns i `tools/verify-arm64.rs`.
 - Självhosting: stage 1 bygger stage 2, som bygger en byteidentisk stage 3.
   Sex programfall byggda av stage 3 jämförs med Rust-bootstrapens körda
   resultat. Stage 3 bygger även Tabell, vars rapport matchar förväntad CSV.
   Modulregressioner och inbäddat standardbibliotek ingår i fyra integrationstester.
+- Vulkan på Linux/x86-64 körs med lavapipe, Mesa 25.0.7, under Khronos
+  valideringslager. Sju integrationstester provar faktisk rasterisering,
+  alpha, readback, livscykler, felvägar, dynamisk ELF och processavslut med
+  aktiva drivertrådar. Atlas och triangeln ger PPM-bilder; fönstret har
+  verifierats med paus, palettbyte, dragning, återställning och resize.
+  ARM64/Linux-bilder korskompileras men Vulkan-körning där är ännu inte provad.
 - Vid den första Linuxporten var 17 ARM64/macOS-bilder, inklusive den dåvarande
   selfhost-kompilatorn, byteidentiska med originalets utdata.
   macOS-processkörning och `codesign` har inte körts

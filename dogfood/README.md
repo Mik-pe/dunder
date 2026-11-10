@@ -12,7 +12,7 @@ Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 49 testgrupper i det sammanslagna trädet
+# 58 testgrupper i det sammanslagna trädet
 ```
 
 Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
@@ -113,6 +113,13 @@ paus/palett/dragning samt sinus/cosinus i Dunder. De öppnar inget fönster.
 `dunder test dogfood/metal/main.ddr` kör sju grupper inklusive delade sys-/
 parse-tester. De två körbara exemplen och deras GUI-kontrakt beskrivs i
 [macOS-/Metal-guiden](../docs/macos-metal.md).
+
+[vulkan/main.ddr](vulkan/main.ddr) kör motsvarande Atlas-scen på Linux med
+Vulkan. Geometri, animation och ASCII-kontroller är Dunder-kod. Headless-läge
+och PPM-capture använder samma pipeline som fönsterläget. Fem nya grupper
+provar geometri, scen, matematik och programargument utan grafikdrivrutin.
+Pixel- och livscykeltester körs separat med lavapipe; se
+[Linux/Vulkan-guiden](../docs/linux-vulkan.md).
 
 [text/scan.ddr](text/scan.ddr) implementerar `find`, `replace`, ordräkning,
 UTF-8-gränser och avkodning i Dunder. Både textprogrammet och tokenizern

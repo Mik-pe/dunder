@@ -53,6 +53,7 @@ fn expr(e: &Expr, pending: &mut Vec<usize>) {
         StringOp(_, args)
         | SysCall(_, args, _)
         | MacCall(_, args, _)
+        | Vulkan(_, args, _)
         | Array(args, _)
         | Dynamic(args, _) => {
             for v in args {

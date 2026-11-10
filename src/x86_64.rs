@@ -1,6 +1,6 @@
 //! Native x86-64 lowering for the bootstrap backend's instruction vocabulary.
 //! Lowering happens entirely at compile time; generated programs contain only
-//! x86-64 instructions, data, and direct Linux system calls. Virtual registers
+//! x86-64 instructions, data, Linux system calls, and optional native C calls. Virtual registers
 //! initially live in a private allocation, keeping the shared runtime independent
 //! of the host CPU. This deliberately favors correctness over register allocation.
 use crate::native::{Branch, Label};
@@ -11,6 +11,7 @@ struct Lower {
     code: Vec<u8>,
     relocations: Vec<(usize, usize)>,
     stack_failures: Vec<usize>,
+    globals: Vec<(usize, usize)>,
 }
 impl Lower {
     fn emit(&mut self, bytes: &[u8]) {
@@ -215,11 +216,53 @@ impl Lower {
         }
         self.disp32(offset);
     }
+    /// Private emitter operation, not an instruction placed in an ARM image.
+    /// Integer arguments occupy virtual x0..x15 and floating arguments d0..d7.
+    fn external_call(&mut self, function: u32, argc: usize, floats: usize) -> Result<(), String> {
+        if argc > 16 || floats > 8 || function == 31 {
+            return Err("invalid native C call shape".into());
+        }
+        // Dunder's call stack has no host-ABI alignment contract. Remember it
+        // in a callee-saved register, then build a properly aligned SysV frame.
+        self.emit(&[0x41, 0x54, 0x49, 0x89, 0xe4]); // push r12; mov r12,rsp
+        self.emit(&[0x48, 0x83, 0xe4, 0xf0]); // and rsp,-16
+        let stack = argc.saturating_sub(6) * 8;
+        if stack != 0 {
+            self.emit(&[0x48, 0x81, 0xec]);
+            self.disp32(stack.next_multiple_of(16) as i32);
+            for arg in 6..argc {
+                self.load(0, arg as u32);
+                self.emit(&[0x48, 0x89, 0x84, 0x24]);
+                self.disp32(((arg - 6) * 8) as i32);
+            }
+        }
+        self.load(11, function);
+        for (arg, reg) in [7, 6, 2, 1, 8, 9].into_iter().enumerate().take(argc) {
+            self.load(reg, arg as u32);
+        }
+        for arg in 0..floats {
+            self.fp_load(arg as u8, arg as u32, true);
+        }
+        self.emit(&[0xb8]); // SysV's vector-argument count, also for variadics.
+        self.disp32(floats as i32);
+        self.emit(&[0x41, 0xff, 0xd3]); // call r11
+        self.store(0, 0);
+        self.fp_store(0, 0, true);
+        self.emit(&[0x4c, 0x89, 0xe4, 0x41, 0x5c]); // mov rsp,r12; pop r12
+        Ok(())
+    }
     fn word(&mut self, w: u32) -> Result<(), String> {
         let rd = w & 31;
         let rn = (w >> 5) & 31;
         let rm = (w >> 16) & 31;
         let wide = w >> 31 != 0;
+        if w & 0xfff0_e0e0 == 0xff00_0000 {
+            return self.external_call(
+                w & 31,
+                ((w >> 8) & 255) as usize,
+                ((w >> 16) & 255) as usize,
+            );
+        }
         if self.lower_float(w) {
             return Ok(());
         }
@@ -550,6 +593,16 @@ pub(crate) fn lower(
     fixups: &[(usize, Label, Branch)],
     data_start: usize,
 ) -> Result<Vec<u8>, String> {
+    lower_dynamic(words, labels, fixups, data_start, &[])
+}
+
+pub(crate) fn lower_dynamic(
+    words: &[u32],
+    labels: &[Option<usize>],
+    fixups: &[(usize, Label, Branch)],
+    data_start: usize,
+    data_fixups: &[(usize, usize, u32)],
+) -> Result<Vec<u8>, String> {
     if data_start > words.len() {
         return Err("invalid native data boundary".into());
     }
@@ -557,10 +610,20 @@ pub(crate) fn lower(
         code: Vec::new(),
         relocations: Vec::new(),
         stack_failures: Vec::new(),
+        globals: Vec::new(),
     };
     lower.prelude();
     let mut offsets = vec![0; words.len() + 1];
     let mut pending: Vec<Option<(usize, &Branch)>> = (0..data_start).map(|_| None).collect();
+    let mut globals = vec![None; data_start];
+    let mut skip = vec![false; data_start];
+    for &(at, slot, reg) in data_fixups {
+        if at + 1 >= data_start || reg >= 31 {
+            return Err("invalid native global relocation".into());
+        }
+        globals[at] = Some((slot, reg));
+        skip[at + 1] = true;
+    }
     for (at, label, branch) in fixups {
         let target = labels
             .get(*label)
@@ -574,7 +637,14 @@ pub(crate) fn lower(
     }
     for (i, word) in words[..data_start].iter().enumerate() {
         offsets[i] = lower.code.len();
-        if let Some((target, branch)) = pending[i] {
+        if let Some((slot, reg)) = globals[i] {
+            lower.emit(&[0x48, 0x8d, 0x05]); // lea rax,[rip+global]
+            lower.globals.push((lower.code.len(), slot));
+            lower.disp32(0);
+            lower.store(reg, 0);
+        } else if skip[i] {
+            continue;
+        } else if let Some((target, branch)) = pending[i] {
             lower.branch(branch, target);
         } else {
             lower
@@ -586,7 +656,7 @@ pub(crate) fn lower(
     for at in std::mem::take(&mut lower.stack_failures) {
         lower.patch_here(at);
     }
-    lower.imm64(0, 60);
+    lower.imm64(0, 231); // terminate library workers on value-stack exhaustion
     lower.imm64(7, 110);
     lower.emit(&[0x0f, 0x05, 0x0f, 0x0b]);
     while lower.code.len() % 8 != (data_start * 4) % 8 {
@@ -601,6 +671,14 @@ pub(crate) fn lower(
         let delta = offsets[*target] as i64 - (*at + 4) as i64;
         let delta =
             i32::try_from(delta).map_err(|_| "x86-64 program exceeds relative branch range")?;
+        lower.code[*at..*at + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    let data = crate::native::elf::dynamic_data_offset(lower.code.len());
+    for (at, slot) in &lower.globals {
+        let target = data + slot * 8;
+        let from = crate::native::elf::TEXT_OFFSET + at + 4;
+        let delta = i32::try_from(target as i64 - from as i64)
+            .map_err(|_| "x86-64 runtime globals exceed relative address range")?;
         lower.code[*at..*at + 4].copy_from_slice(&delta.to_le_bytes());
     }
     Ok(lower.code)
@@ -635,6 +713,91 @@ mod tests {
         assert!(lower(&[0], &[None], &[(0, 0, Branch::Jump)], 1)
             .unwrap_err()
             .contains("unresolved"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn native_library_calls_marshal_stack_arguments_floats_and_preserve_state() {
+        use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+        fn immediate(words: &mut Vec<u32>, reg: u32, value: u64) {
+            words.push(0xd2800000 | ((value as u32 & 65535) << 5) | reg);
+            for shift in 1..4 {
+                let part = (value >> (shift * 16)) as u32 & 65535;
+                if part != 0 {
+                    words.push(0xf2800000 | shift << 21 | part << 5 | reg);
+                }
+            }
+        }
+        fn global(
+            words: &mut Vec<u32>,
+            fixups: &mut Vec<(usize, usize, u32)>,
+            slot: usize,
+            reg: u32,
+        ) {
+            fixups.push((words.len(), slot, reg));
+            words.extend([0, 0]);
+        }
+        fn write_buffer(words: &mut Vec<u32>, globals: &mut Vec<(usize, usize, u32)>) {
+            words.push(0xaa0003e2); // x2 = returned snprintf length.
+            global(words, globals, 16, 1);
+            immediate(words, 0, 1);
+            immediate(words, 8, 64);
+            words.push(0xd4000001);
+        }
+        let mut words = Vec::new();
+        let mut globals = Vec::new();
+        let mut fixups = Vec::new();
+        immediate(&mut words, 22, 77); // Must survive both native calls.
+        global(&mut words, &mut globals, 0, 17);
+        words.push(0xf9400231); // x17 = imported snprintf.
+        global(&mut words, &mut globals, 16, 0);
+        immediate(&mut words, 1, 256);
+        fixups.push((words.len(), 0, Branch::Address(2)));
+        words.extend([0, 0xd503201f]);
+        for arg in 3..12 {
+            immediate(&mut words, arg, u64::from(arg - 2));
+        }
+        words.push(0xff000c11); // Twelve integer arguments, six on the host stack.
+        write_buffer(&mut words, &mut globals);
+
+        global(&mut words, &mut globals, 0, 17);
+        words.push(0xf9400231);
+        immediate(&mut words, 16, 6.25f64.to_bits());
+        words.push(0x9e670200); // fmov d0,x16.
+        immediate(&mut words, 16, (-1.5f64).to_bits());
+        words.push(0x9e670201); // fmov d1,x16.
+        global(&mut words, &mut globals, 16, 0);
+        immediate(&mut words, 1, 256);
+        fixups.push((words.len(), 1, Branch::Address(2)));
+        words.extend([0, 0xd503201f]);
+        words.push(0xff020311); // Three integer and two floating arguments.
+        write_buffer(&mut words, &mut globals);
+        words.push(0xaa1603e0); // exit with the preserved x22.
+        immediate(&mut words, 8, 93);
+        words.push(0xd4000001);
+        let data_start = words.len();
+        let mut labels = Vec::new();
+        for format in [
+            b"%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n\0".as_slice(),
+            b"%.2f %.2f\n\0",
+        ] {
+            labels.push(Some(words.len()));
+            for chunk in format.chunks(4) {
+                let mut bytes = [0; 4];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                words.push(u32::from_le_bytes(bytes));
+            }
+        }
+        let text = lower_dynamic(&words, &labels, &fixups, data_start, &globals).unwrap();
+        let image = crate::native::elf::dynamic_executable(&text, 62, &["snprintf"], 4096);
+        let path = std::env::temp_dir().join(format!("dunder-native-call-{}", std::process::id()));
+        fs::write(&path, image).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(&path).env_clear().output().unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(output.status.code(), Some(77), "{output:?}");
+        assert_eq!(output.stdout, b"1,2,3,4,5,6,7,8,9\n6.25 -1.50\n");
+        assert!(output.stderr.is_empty());
     }
 
     #[test]

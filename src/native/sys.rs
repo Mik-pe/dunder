@@ -252,7 +252,7 @@ impl Code<'_> {
             return;
         }
         let linux_number = match number {
-            1 => 93, // exit
+            1 => 94, // exit_group: libraries may own worker threads
             3 => 63, // read
             4 => 64, // write
             5 => {

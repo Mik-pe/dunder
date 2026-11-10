@@ -14,6 +14,7 @@ pub struct Program {
     pub float_formatter: Option<usize>,
     pub sys_types: Option<SysTypes>,
     pub macos_types: Option<MacTypes>,
+    pub vulkan_types: Option<VulkanTypes>,
 }
 pub struct TestCase {
     pub name: String,
@@ -32,6 +33,7 @@ pub struct Module {
     pub enums: Vec<ast::Enumeration>,
     pub standard_sys: bool,
     pub standard_macos: bool,
+    pub standard_vulkan: bool,
 }
 pub struct Import {
     pub name: String,
@@ -50,6 +52,7 @@ struct Symbols {
     records: HashMap<String, (Type, bool)>,
     standard_sys: bool,
     standard_macos: bool,
+    standard_vulkan: bool,
 }
 pub struct Function {
     pub name: String,
@@ -61,6 +64,7 @@ pub struct Function {
     pub return_slot: Option<usize>,
     pub uses_float_format: bool,
     pub uses_macos: bool,
+    pub uses_vulkan: bool,
 }
 pub enum Stmt {
     StorePlace(Expr, Expr),
@@ -132,6 +136,7 @@ pub enum ExprKind {
     Call(Box<Expr>, Vec<Expr>, Option<usize>),
     SysCall(SysOp, Vec<Expr>, Option<usize>),
     MacCall(MacOp, Vec<Expr>, Option<usize>),
+    Vulkan(VulkanOp, Vec<Expr>, Option<usize>),
     Print(Box<Expr>),
     Cast(Box<Expr>),
     Unary(&'static str, Box<Expr>),
@@ -178,6 +183,24 @@ pub struct MacTypes {
     pub open: Type,
     pub frame: Type,
     pub draw: Type,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanOp {
+    Open,
+    OpenHeadless,
+    Poll,
+    Draw,
+    Close,
+    DeviceName,
+    Pixels,
+}
+#[derive(Clone, Copy)]
+pub struct VulkanTypes {
+    pub window: Type,
+    pub open: Type,
+    pub frame: Type,
+    pub draw: Type,
+    pub pixels: Type,
 }
 #[derive(Clone, Copy)]
 pub enum DynamicOp {
@@ -250,6 +273,7 @@ struct Checker<'a> {
     testing: bool,
     needs_float_format: bool,
     uses_macos: bool,
+    uses_vulkan: bool,
 }
 
 fn reserved(name: &str) -> bool {
@@ -655,6 +679,21 @@ impl Checker<'_> {
             _ => return None,
         })
     }
+    fn vulkan_op(&self, name: &str) -> Option<VulkanOp> {
+        if !self.symbols[self.module].standard_vulkan {
+            return None;
+        }
+        Some(match name {
+            "__vulkan_open" => VulkanOp::Open,
+            "__vulkan_poll" => VulkanOp::Poll,
+            "__vulkan_draw" => VulkanOp::Draw,
+            "__vulkan_close" => VulkanOp::Close,
+            "__vulkan_open_headless" => VulkanOp::OpenHeadless,
+            "__vulkan_device_name" => VulkanOp::DeviceName,
+            "__vulkan_pixels" => VulkanOp::Pixels,
+            _ => return None,
+        })
+    }
     fn sys_signature(&self, name: &str) -> Option<(SysOp, usize, Type)> {
         let symbols = &self.symbols[self.module];
         if !symbols.standard_sys {
@@ -724,6 +763,51 @@ impl Checker<'_> {
                 Expr {
                     ty,
                     kind: ExprKind::MacCall(op, values, self.storage(ty)),
+                }
+            }
+            A::Call(callee, args) if matches!(&callee.kind,A::Name(n) if self.vulkan_op(n).is_some()) =>
+            {
+                let A::Name(name) = &callee.kind else {
+                    unreachable!()
+                };
+                let op = self.vulkan_op(name).unwrap();
+                let types = &self.symbols[self.module].records;
+                let window = types["Window"].0;
+                let (params, ty) = match op {
+                    VulkanOp::Open => (
+                        vec![Type::String, Type::I32, Type::I32],
+                        types["OpenResult"].0,
+                    ),
+                    VulkanOp::OpenHeadless => (vec![Type::I32, Type::I32], types["OpenResult"].0),
+                    VulkanOp::DeviceName => (vec![window], Type::String),
+                    VulkanOp::Pixels => (vec![window], self.types.dynamic(Type::I32, e.span)?),
+                    VulkanOp::Poll => (vec![window], types["Frame"].0),
+                    VulkanOp::Close => (vec![window], Type::Unit),
+                    VulkanOp::Draw => {
+                        let array = self.types.dynamic(Type::F32, e.span)?;
+                        let reference = self.types.reference(array, false);
+                        (
+                            vec![window, reference, Type::F64, Type::F64, Type::F64],
+                            types["DrawResult"].0,
+                        )
+                    }
+                };
+                if args.len() != params.len() {
+                    return Err(Error::new(
+                        "E0207",
+                        e.span,
+                        "invalid Vulkan intrinsic argument count",
+                    ));
+                }
+                let values = args
+                    .iter()
+                    .zip(params)
+                    .map(|(arg, ty)| self.expr(arg, Some(ty)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.uses_vulkan = true;
+                Expr {
+                    ty,
+                    kind: ExprKind::Vulkan(op, values, self.storage(ty)),
                 }
             }
             A::Borrow(base, mutable) => {
@@ -1652,6 +1736,7 @@ pub fn check_mode(program: ast::Program, mode: Mode) -> Result<Program, Error> {
             enums: program.enums,
             standard_sys: false,
             standard_macos: false,
+            standard_vulkan: false,
         }],
         program.types,
         mode,
@@ -1674,6 +1759,7 @@ pub(crate) fn check_modules(
     for (module, input) in modules.iter().enumerate() {
         symbols[module].standard_sys = input.standard_sys;
         symbols[module].standard_macos = input.standard_macos;
+        symbols[module].standard_vulkan = input.standard_vulkan;
         let mut names = std::collections::HashSet::new();
         for e in &input.enums {
             if reserved(&e.name) {
@@ -1855,6 +1941,17 @@ pub(crate) fn check_modules(
         frame: s.records["Frame"].0,
         draw: s.records["DrawResult"].0,
     });
+    let vulkan_types = if let Some(s) = symbols.iter().find(|s| s.standard_vulkan) {
+        Some(VulkanTypes {
+            window: s.records["Window"].0,
+            open: s.records["OpenResult"].0,
+            frame: s.records["Frame"].0,
+            draw: s.records["DrawResult"].0,
+            pixels: types.dynamic(Type::I32, Span { start: 0, end: 0 })?,
+        })
+    } else {
+        None
+    };
     let mut checked = Vec::new();
     let mut needs_float_format = false;
     for (module, input) in modules.into_iter().enumerate() {
@@ -1871,6 +1968,7 @@ pub(crate) fn check_modules(
                     testing: f.test.is_some(),
                     needs_float_format: false,
                     uses_macos: false,
+                    uses_vulkan: false,
                 };
                 let mut param_slots = Vec::new();
                 let mut param_storage = Vec::new();
@@ -1902,6 +2000,7 @@ pub(crate) fn check_modules(
                     return_slot,
                     uses_float_format: c.needs_float_format,
                     uses_macos: c.uses_macos,
+                    uses_vulkan: c.uses_vulkan,
                 })
             })()
             .map_err(|e: Error| e.in_file(module))?;
@@ -1923,6 +2022,7 @@ pub(crate) fn check_modules(
         float_formatter,
         sys_types,
         macos_types,
+        vulkan_types,
     })
 }
 
@@ -1958,6 +2058,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             testing: false,
             needs_float_format: false,
             uses_macos: false,
+            uses_vulkan: false,
         };
         let mut param_slots = Vec::new();
         for p in &f.params {
@@ -1981,6 +2082,7 @@ fn float_formatter_function(types: &mut Types) -> Result<Function, Error> {
             return_slot: None,
             uses_float_format: false,
             uses_macos: false,
+            uses_vulkan: false,
         })
     };
     build().map_err(|e| {
