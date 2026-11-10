@@ -7,6 +7,14 @@ Routine work does not need a feature branch, pull request, or another
 permission round. Keep local verification proportional to the change.
 Preserve existing work in other checkouts.
 
+## Develop with the Dunder compiler
+
+Use `tools/bootstrap.sh` to build the compiler from its frozen seed. Verify
+changes with self-built executables, expected outputs, compile-time diagnostics
+and target runtimes. Run `tools/verify-selfhost.sh` for full correctness verification. Keep the
+build and test path independent of Cargo and use target runtimes and expected
+results for verification. Run benchmarks only when specifically requested.
+
 ## Graphics dogfood
 
 Keep graphics API bindings, shaders and window logic with the examples under

@@ -32,31 +32,27 @@ den behöver inte vara en kompileringstidskonstant.
 
 ## Bygg och kör
 
-En fryst Dunder-kompilator kan bygga verktygskedjan på nytt från Dunder-källkod:
+Bygg självhosten från det frysta fröet för din värdplattform och lägg
+kompilatorn i sökvägen för den aktuella terminalen.
 
 ```sh
-./tools/bootstrap.sh
-```
-
-Kommandot skriver ut sökvägen till den färdiga kompilatorn.
-[Fröbinärer och återbyggnad](bootstrap/README.md) beskriver hur varje mål verifieras.
-
-Bygg den optimerande Rust-kompilatorn med systemets Rust, utan externa crates:
-
-```sh
-cargo build --release
-cargo run --release -- build examples/hello.ddr -o build/hello --timings
-./build/hello
+dunder_bin="$(./tools/bootstrap.sh)"
+export PATH="$(dirname "$dunder_bin"):$PATH"
+dunder run examples/hello.ddr
 # 42
 # true
+dunder test
 ```
+
+Skriptet verifierar två byteidentiska självbyggen. [Fröbinärer och återbyggnad](bootstrap/README.md)
+beskriver värdmålen och kontrollerna.
 
 Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer,
 assembler, länkare eller signeringsverktyg för att bygga Dunder-källkod.
 Den färdiga binären körs som en vanlig process på målplattformen. Linuxbinärer
 är fristående när programmet enbart använder Dunders runtime. Nåbara C-importer länkas mot de angivna delade biblioteken. Systemets
-verktyg får användas för oberoende verifiering; `cargo test` kör riktiga binärer
-på värdplattformen och verifierar även signaturer med `codesign` på macOS.
+verktyg används för oberoende verifiering. Testgrupper körs i egna processer.
+På macOS kan en apps signatur verifieras med `codesign --verify --strict`.
 
 Målet väljs automatiskt för den egna plattformen. Korskompilering fungerar med
 samma kompilator, utan extra SDK, targetpaket, assembler eller länkare:
@@ -74,8 +70,8 @@ dunder --list-targets
 Läs [målplattformar och korskompilering](docs/targets.md) för detaljer.
 
 ```sh
-cargo run --release -- check examples/fibonacci.ddr
-cargo run --release -- build examples/fibonacci.ddr -o build/fibonacci
+dunder check examples/fibonacci.ddr
+dunder build examples/fibonacci.ddr -o build/fibonacci
 ./build/fibonacci
 # 6765
 # true
@@ -83,7 +79,7 @@ cargo run --release -- build examples/fibonacci.ddr -o build/fibonacci
 
 `dunder run` bygger och kör programmet direkt. `fn main()` ger exitkod 0;
 `fn main() -> i32` låter programmet välja exitkod med `return`.
-Kör `cargo run --release -- run examples/functions.ddr` för att prova
+Kör `dunder run examples/functions.ddr` för att prova
 funktioner, callbacks och funktioner som returvärden. Exemplet skriver
 `42`, `42` och `-42`.
 
@@ -116,27 +112,25 @@ Läs om [FFI, C-layout och modulkapabiliteter](docs/ffi.md),
 [funktionscachen, `check --agent` och `test --affected`](docs/incremental.md)
 samt [en delad triangel på WebGPU, Metal och Vulkan](dogfood/webgpu/README.md).
 
-## Verifierad täckning och återstående arbete
+## Självhostad kompilator
 
-Native-självbyggen för macOS/ARM64, Linux/ARM64 och Linux/x86-64 når
-byteidentiska fixpunkter och kör dogfood-sviten. Grafikexemplen använder lokala
-Dunder-moduler för Metal och AppKit på macOS och Vulkan och SDL på Linux.
-Egna projekt kan ta med modulerna från `dogfood/graphics/` och importera dem
-relativt sin källkod. Kompilatorn hanterar anropen genom sitt generella FFI-stöd
-och målets kodgenerering. Rust-bootstrapens Wasm-backend
-kör de portabla dogfood-grupperna och WebGPU-exemplet använder samma
-triangeldata som nativeexemplen.
+Dunders kompilator är skriven i Dunder. Samma typkontroll, lånekontroll och
+ägarskapsregler används för samtliga fyra mål. WebAssembly-backenden skriver
+körbara moduler med linjärt minne, typade värdimporter och callbacks.
+De tre nativevärdarna har frysta kompilatorer för offlineåterbyggnad.
 
-Rust-bootstrapen finns kvar som optimerande kompilator och återställningsväg.
-Självhostens Wasm-backend omfattar skalärer, flyttal och typade importer.
-Fullständigt stöd för hanterade samlingar i den backenden återstår, liksom
-full diagnostik- och lånekontrollsparitet. Modulkapabiliteter och delegerade
-filhandtag finns, medan legacy-API:erna i `sys` fortfarande ger direkt OS-åtkomst.
+Kör verifieringen från reporoten med Python 3.9+, Node och en C-kompilator. C-kompilatorn bygger
+ett separat provbibliotek för ABI-kontrollen:
 
-[Bygg- och agentmätningar](benchmarks/compiler/2026-11-10-macos-arm64/README.md)
-och [runtimejämförelser](benchmarks/runtime/README.md) redovisar mätbara
-framsteg och kvarvarande avstånd till målen för självhostens genomströmning,
-C-prestanda och ändrade tester under 15 ms.
+```sh
+./tools/verify-selfhost.sh
+```
+
+Sviten bygger kompilatorn från fröet, kör program och testgrupper på värden
+och i Wasm, kontrollerar förväntade typfel och provar Tabell som fristående
+projekt. WebGPU-provet läser tillbaka triangelns vertexdata vid värdanropet.
+Metal-, Vulkan- och WebGPU-bindningarna ligger i grafikexemplen.
+[Arkitektur](docs/arkitektur.md) · [Lånekontroll och mål](selfhost/README.md)
 
 ## Moduler
 
@@ -173,7 +167,7 @@ signaturer och i uttrycket `geometry.Point { x: 3, y: 4 }`.
 Kör [exemplet med tre moduler](examples/modules/main.ddr):
 
 ```sh
-cargo run --release -- run examples/modules/main.ddr
+dunder run examples/modules/main.ddr
 # 42
 # true
 # 42
@@ -187,7 +181,7 @@ cirkulära importer. Endast rotmodulens `main` är programstart.
 Hela modulträdet byggs till samma körbara fil med Dunders egen kodgenerering,
 symbolupplösning, ELF-/Mach-O-skrivning och eventuell signering. Dunder-kompileringen anropar
 varken GCC, LLVM, extern assembler, extern länkare eller extern signerare.
-Rust används fortfarande för att bygga själva bootstrapkompilatorn.
+Självbygget använder samma kompilator och samma byggkommando som andra projekt.
 
 ## Tester och struct-uttryck
 
@@ -220,9 +214,9 @@ tester. Funktionens sista uttryck utan semikolon är dess returvärde;
 explicit `return` fungerar också.
 
 ```sh
-cargo run --release -- test
-cargo run --release -- test dogfood/geometry.ddr
-cargo run --release -- run dogfood/structs.ddr
+dunder test
+dunder test dogfood/geometry.ddr
+dunder run dogfood/structs.ddr
 # 25
 # 32
 # 3
@@ -318,7 +312,7 @@ kontexten. `match` kontrolleras för saknade och dubbla fall. Payloads ligger
 direkt i värdet, kopieras med värdesemantik och kan innehålla structar,
 arrayer, andra enums och funktionsvärden. Matchningen använder taggar och
 direkta grenar utan vtables. Läs [enumreglerna](docs/enums.md) och prova
-`cargo run --release -- run dogfood/enums.ddr`.
+`dunder run dogfood/enums.ddr`.
 
 ## UTF-8-strängar
 
@@ -352,16 +346,15 @@ callbacks, arrayelement och structfält. `value.str()` konverterar heltal,
 bool och runes. Unicode-escapes och NUL fungerar; alla strängvärden är giltig
 UTF-8. Index, snittgränser och `rune(number)` kontrolleras vid körning.
 
-Kör `cargo run --release -- run dogfood/utf8.ddr` för textstatistik och
-`cargo run --release -- run dogfood/tokenizer.ddr` för en liten UTF-8-tokenizer.
+Kör `dunder run dogfood/utf8.ddr` för textstatistik och
+`dunder run dogfood/tokenizer.ddr` för en liten UTF-8-tokenizer.
 [Textfunktionerna](dogfood/text/scan.ddr), inklusive `find`, `replace` och
 ordräkning, är skrivna i Dunder och har egna taggade tester.
 
 Dynamiska strängar återvinns när sista ägaren försvinner, med icke-atomär
 referensräkning för dessa oföränderliga värden. Literaler ligger kvar i
-programbilden. Den återanvändbara strängpoolen är begränsad till **16 MiB**
-plus en sida bokföring; en full pool ger ett definierat runtimefel.
-Ingen spårande GC används. Läs [ägarskap, kostnader och gränser](docs/memory.md).
+programbilden. Strängar och dynamiska arrayer delar en återanvändbar heap.
+Läs [ägarskap, kostnader och gränser](docs/memory.md).
 
 ## Flyttal
 
@@ -393,7 +386,7 @@ heltal trunkerar och kontrollerar intervallet. `.str()` och `print` använder
 en kort decimalrepresentation som avrundas tillbaka till samma flyttal.
 Utskriftsrutinen är [skriven i Dunder](runtime/float.ddr).
 
-Kör `cargo run --release -- test dogfood/numeric/main.ddr` för sju numeriska
+Kör `dunder test dogfood/numeric/main.ddr` för sju numeriska
 testgrupper med vektorer, stabil summering, rotberäkning och numerisk
 integration. Läs [flyttalsreglerna och begränsningarna](docs/floating.md).
 
@@ -421,7 +414,7 @@ har `.ok` och `.error`; lästa strängar finns då i `.value`.
 Vanliga I/O-fel avbryter inte processen.
 `read_text` validerar UTF-8 och läser högst 4 MiB per fil till strängarenan.
 Läs [sys-reglerna](docs/sys.md) för beteende och begränsningar och kör
-`cargo run --release -- test dogfood/filesystem.ddr` för filsystemets dogfood.
+`dunder test dogfood/filesystem.ddr` för filsystemets dogfood.
 
 Structar och fasta arrayer kan nu returneras som värden. Resultatet kopieras
 till lagring hos anroparen och fungerar även genom callbacks och rekursion.
@@ -433,10 +426,9 @@ eget manifest. Det grupperar rader och summerar en heltalskolumn, till exempel
 kostnader i ören per team:
 
 ```sh
-cargo build --release
 cd projects/tabell
-../../target/release/dunder run -- expenses.csv team cents
-../../target/release/dunder test
+dunder run -- expenses.csv team cents
+dunder test
 ```
 
 Projektet använder importer utan citattecken, `array.sort_strings` och
@@ -453,9 +445,9 @@ använder typade C-anrop och callbacks. Apples Metal-runtime kompilerar den
 fasta MSL-pipelinen när ett fönster öppnas.
 
 ```sh
-cargo run --release -- run dogfood/metal/triangle.ddr -- --frames 3
-cargo run --release -- run dogfood/metal/main.ddr
-cargo run --release -- build dogfood/metal/main.ddr --app -o build/DunderMetal.app
+dunder run dogfood/metal/triangle.ddr -- --frames 3
+dunder run dogfood/metal/main.ddr
+dunder build dogfood/metal/main.ddr --app -o build/DunderMetal.app
 open build/DunderMetal.app
 ```
 
@@ -475,8 +467,8 @@ Triangeln och Atlas i `dogfood/vulkan/` använder
 Vulkan och kan läsa tillbaka RGBA eller visa bilden i ett SDL2-fönster.
 
 ```sh
-cargo run --release -- run dogfood/vulkan/main.ddr -- --headless --frames 3 --capture build/atlas.ppm
-cargo run --release -- run dogfood/vulkan/main.ddr
+dunder run dogfood/vulkan/main.ddr -- --headless --frames 3 --capture build/atlas.ppm
+dunder run dogfood/vulkan/main.ddr
 ```
 
 Välj Mesas lavapipe-ICD för mjukvarurendering. Shaderns SPIR-V ingår i
@@ -499,27 +491,14 @@ Läs [syntaxen](docs/syntax.md).
 
 Anrop stöder både register- och stackargument; fler än åtta parametrar fungerar.
 Funktionstyper kontrolleras strukturellt. Anonyma funktioner och closures med
-infångade lokaler är inte implementerade. Standardbygget optimerar konstanta
-uttryck, villkorshopp, immediater och operandernas stacktrafik; x86-64 håller
-vanliga arbetsvärden i CPU-register. [Maskinkodsoptimeringen](docs/optimization.md)
-bevarar overflowkontroller, evalueringsordning och minnesägarskap. Fyra lokala
-[runtime-prov](benchmarks/runtime/README.md) visar 6–17 % kortare mediankörtid
-och cirka 21 % mindre binärer på Linux/x86-64; det är ingen generell
-prestandagaranti. Byggmätningar av ett genererat korpus finns i
-[prestandarapporten](benchmarks/README.md); hela prestandakontraktet är ännu
-inte uppfyllt. Oanvända funktioner och oanvänd flyttalsformatering tas bort
-ur den genererade binären; parsern har en ASCII-väg utan teckenindexallokering.
-
-Den [Dunder-skrivna kompilatorn](selfhost/README.md) bygger nu sin egen
-källkod till ARM64/Linux. Stage 2 och stage 3 är byteidentiska, och stage 3
-bygger körbara program med moduler, structar, arrayer och strängar.
-Full språk- och plattformsparitet återstår; Rust-bootstrapen finns kvar
-som återställningsväg.
+infångade lokaler är inte implementerade. Kodgeneratorn bevarar
+evalueringsordning, overflowkontroller och städning av ägda värden.
+Se [kompilatorns kodgenerering](docs/optimization.md).
 
 Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
 och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva
 skalärer och enums utan payload. Aggregat returneras med värdesemantik.
-Arrayslices, generiskt allokerings-API, generell ägar-/lånekontroll och
+Ett generiskt allokerings-API, lån som kan returneras och
 användardefinierade iteratorer återstår. Stränginterpolering, normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
 

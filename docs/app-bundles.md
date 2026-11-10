@@ -26,7 +26,11 @@ build/DunderMetal.app/
       CodeResources
 ```
 
-The bundle filename determines the executable, bundle name, and display name.
+The filename stem supplies the bundle name and display name. ASCII stems also
+name the executable. With a Unicode stem such as `Ångström.app`, Dunder names
+the executable `dunder-<hash>` using the same eight hex digits as the bundle
+identifier. This keeps the signed executable path stable across Unicode
+filesystem normalizations. Read `CFBundleExecutable` for its exact name.
 `Info.plist` identifies an `APPL` bundle, enables high resolution rendering and
 automatic graphics switching, and declares macOS 11.0 as the minimum system
 version. The bundle and short version strings use the Dunder compiler version.
@@ -47,7 +51,7 @@ invocation. Local verification uses macOS's `codesign --verify --strict` as an
 independent validator. The bundle is ad hoc signed for local development;
 distribution signing and notarization are separate work.
 
-`dunder run --app` executes `Contents/MacOS/<name>` directly, preserves program
+`dunder run --app` executes the binary named by `CFBundleExecutable` under `Contents/MacOS/`, preserves program
 arguments after `--`, and returns the program's exit status. The executable lives
 inside the bundle so native APIs can discover its application bundle. The
 program controls its own application lifecycle and windows. Running a simple
@@ -74,7 +78,7 @@ requires real directories in the bundle rather than directory symlinks. These
 checks finish before publication and preserve unsupported files in place.
 
 The self-hosted compiler accepts the same build form, including cross-builds
-from Linux. For example, `dunder-ddr build dogfood/metal/triangle.ddr --app
+from Linux. For example, `dunder build dogfood/metal/triangle.ddr --app
 --target arm64-macos -o build/Triangle.app` writes and signs the bundle in
 Dunder. Existing resource files are hashed as binary data. The packager uses
 POSIX directory and file operations on the build host.

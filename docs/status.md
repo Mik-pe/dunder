@@ -1,365 +1,91 @@
 # Dunder-status
 
-Bootstrapkompilatorn på `main` stöder ARM64/macOS, ARM64/Linux,
-x86-64/Linux och wasm32. `--target` väljer utdata oberoende av värdplattform; inga externa
-kompileringsverktyg eller mål-SDK:er behövs för Dunderbygget.
-Se [målplattformar och korskompilering](targets.md).
+Kompilatorn på `main` är skriven i Dunder. Den bygger sig själv på ARM64/macOS,
+ARM64/Linux och x86-64/Linux och kan från varje värd skriva kod för alla tre
+nativa målen och wasm32. Återbyggnaden börjar med en fryst Dunder-kompilator
+och verifierar två byteidentiska självbyggen. Byggkedjan för den tidigare
+Rust-kompilatorn har ersatts. [Återbyggnad](../bootstrap/README.md) och
+[målplattformar](targets.md).
 
-## Dogfooding med ett fristående projekt
+## Språk och runtime
 
-[Tabell](../projects/tabell/README.md) grupperar CSV och summerar en vald
-heltalskolumn. Projektet har eget manifest och provar citerade fält,
-Unicode, radbrytningar, sorterade grupper och kontrollerat heltalsspill.
-Det drev tre tillägg:
+- Moduler har privata och exporterade symboler, alias, namngivna typer och
+  stöd för cykliska importer. Typinferens, typade funktionsvärden, indirekta
+  anrop, rekursion och aggregatreturer används i kompilatorns egen källkod.
+  [Syntax](syntax.md)
+- Heltal har kontrollerad aritmetik och konvertering, explicita
+  bitoperationer och wrapping-metoder. `f32` och `f64` har IEEE-aritmetik,
+  bitkonvertering, klassificering och avrundning. UTF-8-strängar stöder
+  byteindex, runes, giltiga strängsnitt och innehållsjämförelse.
+  [Flyttal](floating.md)
+- Structar, fasta och dynamiska arrayer samt enums med payload har
+  värdesemantik. Nästlade structfält och enumpayloads kan äga samlingar.
+  Vanliga arrayelement är primitiva värden, inklusive strängar och pekare,
+  eller enums utan payload. `@c_layout` använder målplattformens fältstorlek
+  och justering. [Enums](enums.md) och [FFI](ffi.md).
+- Ägda arraybuffertar frigörs deterministiskt. Oföränderliga strängar
+  använder referensräkning. Ett lån av en lokal, ett fält eller ett
+  arrayelement gäller under anropet. Kontrollen avvisar motstridiga lån
+  och mutationer under utvärderingen av argument. Regionen äger minnet i
+  ett lexikalt scratch-block och kontrollerar vilka anrop som får låna det.
+  [Minnesmodellen](memory.md)
+- Standardbiblioteket innehåller map, set, array, text, hash, bytes,
+  SHA-256, parse och sys. Sortering, hashning, omhashning och SHA-256 är
+  Dunder-kod. Textläsning kontrollerar UTF-8 och filoperationer returnerar
+  typade felvärden. [Standardbibliotek](standard.md) och [system-API](sys.md).
 
-- Importer med punktnotation utan citattecken: `import std.map`,
-  `import ..shared.value` och `import .sys as local`. Äldre slash- och citerade
-  importer stöds fortfarande. Projektets källor och dokumentation använder
-  den nya formen.
-- `array.sort_strings(&mut values)`: heapsort över UTF-8-byte, O(n log n)
-  utan extra array. Testat mot Rusts ordning för 2 048 genererade nycklar.
-- `sys.write_stderr` och `sys.eprint`: diagnostik separat från stdout,
-  med resultat för skrivfel och hantering av korta skrivningar och avbrott.
+## Byggverktyg och exempel
 
-Verifierat på Linux/x86-64: 97 Rust-tester, 45 testgrupper i huvudträdet och
-14 i Tabell; formatering, Clippy och releasebygge passerar. Tabells fem
-integrationstester omfattar en oberoende referens för 512 genererade CSV-rader,
-felaktiga indata och byggen för alla tre mål. ARM64/Linux under QEMU klarar
-huvudträdets 45 grupper samt Tabells exempel och spillfel. Ingen macOS-körning
-har gjorts i Linuxmiljön.
+`check` och `build` typkontrollerar även oanropade funktioner i importträdet.
+`build` genererar körbar kod för nåbara funktioner. `check --agent` skriver
+strukturerade poster med moduler, bindningar och positioner. Diagnostiken
+anger ursprunglig fil, rad och kolumn. Nativa byggen stöder manifest,
+funktionscache, atomisk publicering och testkörning med tidsgräns.
+[Kompilatorns byggkedja](../selfhost/README.md) och [inkrementella byggen](incremental.md).
 
-Tabell har även summerat en CSV-inventering av 361 källfiler från den lokala
-Blixt-checkouten; resultatet matchade en oberoende summering. Det testet ändrade
-inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet.
+Tabell är ett fristående CSV-projekt med eget manifest, gruppering,
+Unicode, sortering och kontrollerat heltalsspill. Grafikexemplen använder
+samma filimporter och typade värdanrop som externa program. macOS använder
+AppKit och Metal, Linux använder Vulkan och webbläsaren använder WebGPU
+med Dunder-skrivna vertexdata. [Tabell](../projects/tabell/README.md),
+[Metal](macos-metal.md), [Vulkan](linux-vulkan.md), [WebGPU](../dogfood/webgpu/README.md)
+och [macOS-appar](app-bundles.md).
 
-## Implementerat
+## Körda Wasm-kontrakt
 
-- Standardbibliotek i Dunder: `std.map`, `std.set`, `std.array`, `std.text`,
-  `std.hash`, `std.bytes`, `std.sha256`, `std.parse` och sys. Map har strängnycklar
-  och i64-värden, set innehåller strängar. Modulerna är inbäddade och importeras
-  utan suffix. Hashning, sondering, omhashning och algoritmer är Dunder-kod.
-- Exempelmodulen `dogfood/graphics/macos.ddr` öppnar ett AppKit-fönster
-  med CAMetalLayer och ger en färgad
-  Metal-triangelista, händelsepollning, logiska pekarkoordinater och backing
-  scale. Publika fönsterhandtag är validerade generations-ID:n. AppKit-delegaten och Metal-kommandona
-  är Dunder-kod med typade C-anrop och callbacks.
-  Apple Metal-runtime kompilerar en fast MSL-pipeline vid öppning.
-  [Två Metal-program](macos-metal.md) dogfoodar geometri, animation och inmatning
-  i Dunder. `build/run --app` skriver en vanlig [macOS-appbundle](app-bundles.md).
-- Dynamiska `[]T`, geometrisk tillväxt, reserve/push/pop/clear, kontrollerade
-  index och iteration. Oberoende djupa värdekopior, också inne i aggregat.
-  `&T` och `&mut T` lånar under funktionsanrop; referenser kan inte lagras
-  eller returneras. Se [standardbibliotekets kontrakt](standard.md).
-- Nästlade structar, fasta/dynamiska arrayfält, enumfält och funktionsfält.
-  Inline-cykler avvisas och returvärden kopieras till anroparägd lagring.
-- Explicita heltalsmetoder för bitoperationer, kontrollerade skiftantal och
-  wrapping-aritmetik. SHA-256 och bytekodning använder dem som dogfood.
-- `.ddr` som filändelse för källkod; uppdaterade exempel, manifest och CLI-hjälp.
-  Användarens val ersätter den tidigare tvåbokstavsändelsen. Importer saknar fortsatt suffix.
-- En fil per modul: `import math` eller `import util.math as math`, utan
-  suffix. Privata `fn` och exporterade `pub fn`, alias och kvalificerade namn.
-  Samlade signaturer stödjer cykliska importer och ömsesidig rekursion.
-  Kanoniska filsökvägar deduplicerar delade beroenden och symboliska länkar.
-  Importerade funktioner är vanliga typade funktionsvärden.
-- Nominella `struct`/`pub struct`, typade fält, struct-uttryck med vanliga
-  uttryck som fältvärden, kvalificerade typer och konstruktorer över moduler.
-  Structar kopieras vid bindning, tilldelning och anrop; `var` medger fältändring.
-- `enum`/`pub enum` med egna i32-värden, kontextuell `.Variant`, varianter med
-  typade payloads och uttömmande `match`. Enkla enums fungerar i structfält
-  och arrayer. Data-enums kan innehålla structar, arrayer, funktionsvärden
-  och andra enums; de kopieras och returneras med värdesemantik.
-  Taggar och direkta grenar används utan vtables. Se [enumreglerna](enums.md).
-- Användarens syntax: `x := 42`, `x: i32 = 42`, oföränderlighet som standard.
-  `var x := 0` väljer muterbarhet och `x = ...` tilldelar.
-- `i32`, `i64`, `bool`, explicita funktionssignaturer, lokala typinferenser,
-  blockscope, framåtanrop, rekursion, if/else, while, break/continue.
-- Typade funktionsvärden, callbacks och funktioner som returvärden med
-  strukturell signaturkontroll. Indirekta anrop, inklusive `choose()(42)`,
-  och fler än åtta parametrar med typade stackargument.
-- Sista uttrycket utan semikolon ger funktionens returvärde, även i slutliga
-  `if/else`-grenar. Explicit `return` fungerar parallellt.
-- Fasta typade arrayer, literaler och repetition, indexläsning/-skrivning,
-  `len`, värdekopiering, gränskontroller, `for` över halvöppna `i32`-intervall,
-  arrayer och ägda arrayiteratorer. `.iter()` tar en återanvändbar kopia.
-- `@test fn` och kopplade `@test { (args) -> expected }`-block. Argument och
-  förväntade värden är fullständiga uttryck, inklusive structargument.
-  Bool-uttryck i testblock blir assertions; vanliga satser och loopar stöds.
-  Testkortformen pekar alltid på den annoterade funktionen även vid lokal skuggning.
-- Typfel med fil/rad/kolumn och felkod. Kontrollerad heltalsaritmetik och
-  konvertering, samt kortslutande booleska uttryck.
-- Giltig, oföränderlig UTF-8 med typen `string`, rune-literaler och typen
-  `rune`, escapes, NUL, utskrift, sammanslagning, innehållsjämförelse,
-  kontrollerade byteindex och strängsnitt. `.len` räknar byte; `.bytes()`
-  och `.runes()` är återanvändbara vyer med indexering och `for`.
-  Heltal, bool och runes har `.str()`. Strängar kan returneras, gå genom
-  callbacks och lagras i structfält och arrayer. Dynamiska strängar har
-  icke-atomär referensräkning och återanvändbar lagring utan spårande GC.
-- Deterministisk frigöring av unikt ägda arraybuffertar, nästlade värden och
-  strängreferenser vid tilldelning, scope-slut, `break`, `continue` och retur.
-  Strängtemporärer behåller rätt värde över senare sidoeffekter. Se
-  [minnesarkitekturen och regressionstesterna](memory.md).
-- `f32`/`f64`, kontexttypade decimal- och exponentliteraler, IEEE-aritmetik
-  och jämförelser, NaN, oändlighet, signerad noll och subnormala tal.
-  Explicita numeriska konverteringar; till heltal trunkeras och kontrolleras
-  intervallet. Grundläggande matematik och klassificering, råbitkonvertering,
-  flyttalsfält/-arrayer, callbacks, returer och oberoende FP-/heltalsregister
-  med stackspill. Decimalutskriften är skriven i `runtime/float.ddr`, bäddas
-  in vid behov och använder exakta intervall för korta roundtrip-värden.
-- Medföljande `import sys` för macOS och Linux: textläsning/-skrivning, append,
-  metadata, kataloger, rename, borttagning, process-ID och felmeddelanden.
-  Nominella resultatstructar har `.ok`/`.error`, läst text finns i `.value`.
-  Vanliga I/O-fel avbryter inte processen. UTF-8 valideras före exponering.
-  Biblioteket är inbäddat; det kräver inga lokala biblioteksfiler.
-- `sys.read` ger `ReadResult { Ok(string), Err(IoError) }`. Namngivna fel,
-  `Other(i32)` för okända koder, felkonverteringar och `FileKind` är skrivna
-  i Dunder ovanpå det första sys-API:t.
-- Byteutdata, kontrollerad UTF-8-avkodning, programargument, identifiering
-  av samma fil genom hårda/symboliska länkar och explicit executable-läge.
-- Kodgenereringen tar bort onåbara funktioner och oanvänd flyttalsformatering.
-  Små lokala stackåtkomster använder färre instruktioner; minneskopiering
-  använder hela ord där det går. ASCII-källfiler behöver ingen separat
-  teckenindextabell. Långa hopp/adresser fungerar över 1 MiB och stora
-  signaturer får tillräcklig virtuell lagring i Mach-O.
-- [Den Dunder-skrivna kompilatorn](../selfhost/README.md) bygger sin egen
-  källkod till ARM64/Linux utan extern kompilator eller länkare. Lexer,
-  modulladdare, parser, typkontroll, kodgenerering, runtime och ELF-skrivare
-  är Dunder-kod. Stage 2 och stage 3 är byteidentiska, verifierat under QEMU.
-  Stage 3 bygger och kör fristående program med bitoperationer, structar,
-  arrayer och UTF-8. Motsvarande fixpunkter körs även på ARM64/macOS och x86-64/Linux.
-  [Selfhost-dokumentationen](../selfhost/README.md) beskriver aktuell täckning.
-- Structar och fasta arrayer kan returneras med kopiering till anroparens
-  lagring, även genom callbacks och rekursion. Ingen pekare till avslutad
-  stacklagring returneras.
-- `dunder check`, `dunder build`, `dunder run`, `dunder test`, enkelt dunder.toml
-  med valfri `test_root`, atomisk
-  publicering av utdata och `--timings`. `main` ger exitkod 0 eller en explicit
-  i32-retur; `run` för vidare exitkoden och kör aldrig gammal utdata vid typfel.
-- Kodgenerering till ARM64 och x86-64 med egen ELF-/Mach-O-skrivare,
-  SHA-256 och macOS ad hoc-signering. Inga externa crates. Den normala byggvägen
-  startar inga andra verktyg. Körbara filer behöver ingen språkinterpreter.
+Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
+till en separat Wasm-modul. Node körde 54 av de 59 grupperna med godkänt
+resultat. De fem övriga har nåbara anrop till filsystemet.
 
-## Verifiering av Linux och korskompilering
+| Grupp | Nativt beroende |
+| --- | --- |
+| `dogfood/filesystem.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
+| `dogfood/filesystem.ddr::errors_remain_values` | Fel från filåtkomst |
+| `dogfood/enums.ddr::value_enums_work_in_records_and_arrays` | Filmetadata |
+| `selfhost/compile.ddr::compiler_checks_types_before_emitting_an_image` | Kompilatorns filåtkomst |
+| `selfhost/compile.ddr::native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation` | Kompilatorns filåtkomst |
 
-Lokalt på Linux/x86-64, 2026-11-10:
+Wasm-värden kontrollerar dessa gruppnamn och diagnostiken för nativa anrop.
+Bland de körda grupperna finns SHA-256 med referensvektorer och olika
+utfyllnadsgränser, UTF-8, samlingar, Vulkan-scenens geometri och delar av
+kompilatorn. Ett separat värdtest läser WebGPU-exemplets 24 flyttal ur
+exporterat minne och provar typade callbacks och C-layout på 32-bitarsmålet.
+Tio längre program för strängar, arraykopior, nästlade fält och
+scope-städning kördes två gånger vardera i samma instans. Det linjära
+minnet hade samma storlek efter första och andra körningen.
 
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` och
-  `cargo build --release` passerar med Rust 1.90.0.
-- `cargo test -- --test-threads=1`: 127 testfunktioner passerar, med
-  `DUNDER_VULKAN_TEST=1` och Khronos valideringslager för Vulkan-körningarna.
-- Releasekompilatorns `dunder test` kör alla 58 Dunder-testgrupper med tom
-  verktygssökväg. Alla passerar.
-- ARM64/Linux under QEMU: 16 exempel/dogfood-program med exakt utdata,
-  samtliga 58 testgrupper och separata prov av systemanrop, argument, felkoder
-  och flyttal. Den valfria verifieraren finns i `tools/verify-arm64.rs`.
-- Självhosting: stage 1 bygger stage 2, som bygger en byteidentisk stage 3.
-  Sex programfall byggda av stage 3 jämförs med Rust-bootstrapens körda
-  resultat. Stage 3 bygger även Tabell, vars rapport matchar förväntad CSV.
-  Modulregressioner och inbäddat standardbibliotek ingår i fyra integrationstester.
-- Vulkan på Linux/x86-64 körs med lavapipe, Mesa 25.0.7, under Khronos
-  valideringslager. Sju integrationstester provar faktisk rasterisering,
-  alpha, readback, livscykler, felvägar, dynamisk ELF och processavslut med
-  aktiva drivertrådar. Atlas och triangeln ger PPM-bilder; fönstret har
-  verifierats med paus, palettbyte, dragning, återställning och resize.
-  Den Dunder-skrivna Vulkan-modulen har också körts i en ARM64/Linux-container
-  med lavapipe och valideringslagret. Ett åttonde test läser den presenterade
-  SDL-ytan och skickar tangent- och stängningshändelser genom SDL-kön.
-- Vid den första Linuxporten var 17 ARM64/macOS-bilder, inklusive den dåvarande
-  selfhost-kompilatorn, byteidentiska med originalets utdata.
-  macOS-processkörning och `codesign` har inte körts
-  i Linuxmiljön; motsvarande tester är fortsatt aktiva på macOS.
+```sh
+dunder_bin="$(./tools/bootstrap.sh)"
+"$dunder_bin" test dogfood/tests.ddr
+node tools/test-wasm.mjs "$dunder_bin"
+node tools/test-wasm-scalars.mjs "$dunder_bin"
+node tools/test-wasm-abi.mjs "$dunder_bin"
+python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
+python3 tools/test-diagnostics.py "$dunder_bin"
+```
 
-## Verifiering efter integrering på main
-
-På Apple Silicon, efter integreringen av Linux-målen och punktimporter:
-`cargo test --quiet` passerar 123 Rust-testfunktioner. `cargo fmt --check`,
-`cargo clippy --all-targets -- -D warnings` och `cargo build --release`
-passerar också. Rootens dogfood-test körde 49 Dunder-testgrupper före
-självhostingstillägget.
-
-Atlas och triangeln byggdes åter som signerade `.app` med tom verktygssökväg;
-`codesign --verify --strict` godkände båda paket och huvudbinärer. Atlas körde
-120 draw-anrop och livscykelprogrammet klarade tre cykler utan Metal-fel.
-Korskompileringstester verifierar att geometri fungerar för båda Linux-målen,
-medan nåbara fönsteranrop ger ett tydligt fel om kravet på `arm64-macos`.
-`--app` avvisar Linux-mål innan några filer publiceras.
-
-## Tidigare verifiering på macOS
-
-`cargo test` passerar 100 Rust-testfunktioner: de tidigare 80 samt fem tester
-av dynamisk Mach-O/paketsignering, tio appbundle-tester och fem tester av macOS-API:t.
-`cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
-och `cargo build --release` passerar också. macOS-testernas felvägar körs utan
-grafiskt fönster; dyld-spårning verifierar att de inte laddar grafikramverken.
-Geometri och onåbara fönsteranrop behåller binärformatet utan dylib-importer.
-
-På den inloggade Apple Silicon-datorn kördes triangeln i fem bildrutor och
-Atlas i 120 draw-anrop med Metal-validering utan fel. Ett separat manuellt
-[livscykelprogram](../dogfood/metal/lifecycle.ddr) öppnade och stängde sex
-fönster och verifierade backing scale, gamla handtag, felaktig geometri och
-räknare för slutförda GPU-kommandon. Visuell kontroll och faktisk inmatning
-gjordes i den körande appen; dessa GUI-körningar ingår inte i `cargo test`.
-Verifierat i Atlas: pausindikatorn HOLD, dragning med kvarhållen musknapp,
-återställning med R, palettbyte med C och återupptagen animation. Ett separat
-indatafönster verifierade storleksändring från 800×600 till 700×525 punkter
-och stängning med Cmd-W. Snabba köade mushändelser bevaras över flera
-pollningar så att en komplett dragning inte försvinner mellan två bildrutor.
-Både Atlas och triangeln byggdes som `.app` med `PATH=/no-external-tools`.
-macOS `codesign --verify --strict` godkände paketen och deras huvudbinärer;
-`plutil -lint` godkände plist och resurssigill. Signeringen binds till
-Info.plist och bevarade resurser med Dunders egen SHA-256/signeringskod.
-
-Releasekompilatorn har dessutom byggt hello och fibonacci med `PATH` satt
-till en katalog utan verktyg. Båda binärerna kördes med tom miljö och gav
-förväntad utdata. Kör samma väg med `./build/dunder build examples/hello.ddr
--o build/hello` efter att ha byggt/kopierat kompilatorn till build/dunder.
-
-Före integrationen med Linux-/Tabell-tilläggen passerade
-`cargo run --release -- test dogfood/tests.ddr` 48 Dunder-testgrupper: rekursion,
-moduler, insertion sort, intervall, arrayiteratorer, callbacks, indexbaserad
-arena, tabellfall, structargument, UTF-8, en liten tokenizer, numeriska program
-och filsystem, namngivna enumvärden, nästlade payload-varianter, standardbibliotek
-och kompilatorns första Dunder-skrivna delar. Fyra tillagda grupper kontrollerar
-Metal-vertexlayout, ändlig scengeometri och återanvändning av buffertkapacitet,
-paus/palett/dragning samt Dunder-skrivna sinus-/cosinusapproximationer.
-sys-bibliotekets felmeddelanden och typade felkoder har egna kopplade testblock.
-Varje grupp kompileras till en riktig
-nativebinär. Körningarna omfattar även förväntade fel och en tidsgräns:
-ett misslyckat eller fastnat test hindrar inte nästa grupp. Tester kräver
-ingen main, kör inte befintlig main och dedupliceras över importer.
-Manifestets `test_root` och den vanliga programroten provas separat.
-
-Structtesten kontrollerar typidentitet över moduler, felaktiga/saknade/dubbla
-fält, oföränderlighet, kopior, fältens evalueringsordning, tomma structar,
-blandad bool/i64/i32-layout och structargument på stacken. Arraytesten
-kontrollerar kopior och iterationskopior, blandade elementtyper, fler än
-åtta parametrar, gränsfel och intervall vid i32-gränserna. Kortformen provas
-mot felaktiga resultat och lokal skuggning så att testfallen verkligen kan fallera.
-
-Strängtesten kör svenska, grekiska, japanska, arabiska, emoji, kombinerande
-tecken, NUL och Unicode-gränsvärden. Bytevärden, kodpunkter, längder och
-snitt jämförs mot oberoende Rust-resultat. Körda fall omfattar returnerade
-strängar, callbacks, structar, arrayer, stackparametrar, iterationsvyer,
-heltalsformattering inklusive i64-minimum och avsiktligt felaktiga testresultat.
-Felaktig UTF-8, surrogates och feltyper avvisas vid kompilering; negativa
-index, fel snittgränser, ogiltiga rune-konverteringar och full strängarena
-ger verifierade felstatusar. Textstatistik och tokenizern använder `find`,
-`replace`, ordräkning och UTF-8-hjälpare skrivna i Dunder.
-
-Flyttalstesten jämför 648 native-aritmetikresultat med oberoende Rust-resultat
-och återläser hundratals utskrivna f32/f64-bitmönster med Rusts parser.
-De täcker även direkt decimalavrundning till f32, båda registerbankerna,
-spill till stack, callbacks, rekursion, array-/structlayout, klassificering,
-NaN-jämförelser, signerad noll, gradvis underflöde och felaktiga konverteringar.
-Det numeriska Dunder-trädet provar omskalad hypotenusa, kompenserad summering,
-rotberäkning med bisektion och fjärde ordningens Runge–Kutta-integration.
-Alla exempel, importer och testfixturer använder nu `.ddr`.
-
-Systemtesterna kör verklig fil-I/O i isolerade temporära kataloger och
-kontrollerar innehåll med Rusts oberoende fil-API. Verifierat: Unicode och NUL
-i text, 64-bitars filstorlek, append, trunkering, rename, metadata, borttagning,
-symboliska länkar, saknade filer, icke-tomma kataloger, NUL/längd i sökvägar,
-ogiltig UTF-8, för stora filer och full strängarena. Hundratals lyckade och
-misslyckade läsningar lämnar oförändrat antal öppna handtag.
-Binärens signatur verifieras oberoende. En byte-reproducerbar binär fungerar
-med tom miljö efter att källfilerna tagits bort. Returproven omfattar structar, fasta/tomma arrayer,
-callbacks, rekursion, blandade parametrar och upprepade anrop.
-
-Enumtesten kontrollerar nominell identitet och privata typer över moduler,
-taggvärden och kontrollerad heltalskonvertering, saknade/dubbla matchfall,
-payloadtyper, oföränderliga bindningar och kopior av matchvärdet. Nativeprov
-omfattar strängar, f32/f64, structar, arrayer, nästlade enums, funktionsvärden,
-rekursion, callbacks, stackargument och verkliga `Ok`/`Err`-filresultat.
-
-`cargo test` kör typkontroll och negativa felprov samt verkliga ARM64-binärer
-på denna Mac. Fristående nativeprov verifierar signaturen oberoende med
-`codesign --verify` och körs med tom processmiljö, utan källfil och utan
-kompilator i sin körväg. CLI-proven bygger och kör med PATH utan externa
-verktyg; samma väg är verifierad med releasekompilatorn för hela testsamlingen
-och structprogrammet. UTF-8-programmet, tokenizern, numerikprogrammet,
-filsystemsprogrammet, enumprogrammet, standardbiblioteket och de tidigare 44 Dunder-testgrupperna kördes också med
-releasekompilatorn utan verktyg i PATH.
-
-Exempel: hello → `42`, `true`; fibonacci(20) → `6765`, `true`.
-Modulprogrammet i examples/modules/main.ddr laddar tre filer och skriver
-`42`, `true`, `42`. Det är byggt/kört även med PATH utan externa verktyg.
-Modultesterna kontrollerar privat åtkomst, namn-/aliaskrockar, saknade filer,
-otillåtna importsuffix, syntax-/typfel i beroenden, rot-main, callbacktyper
-över modulgränser, cykler, diamanter och symlinkdeduplicering. Identiska
-projekt i olika kataloger ger identiska binärer; ändrade beroenden ändrar
-körresultatet. Typfel lämnar tidigare utdata orörd, och utdata får inte
-skriva över någon importerad källfil.
-Funktionsexemplet skriver `42`, `42` och `-42`. Funktionstesternas negativa
-fall kontrollerar felaktig/saknad main, felaktiga returvärden, saknade returer,
-och oförenliga callbacksignaturer med läsbara funktionstyper i diagnostiken.
-Körda program verifierar ordningen funktion-före-argument och vänster-till-höger,
-returnerade funktioner, void-callbacks, bool-returer, utbytbara funktioner,
-10 000 indirekta anrop och rekursion med stackargument. Blandade stacktyper
-inklusive bool, negativ i32, i64 och funktioner samt ett 40-argumentsanrop är körda.
-
-Testkorpuset omfattar rekursion, register- och stackparametrar, loopstyrning, blockscope,
-kortslutning, signed division/rest, i64-minimum, spill och smalnande
-konverteringar. Ett genererat jämförelseprov kontrollerar native heltals-
-och jämförelseresultat mot oberoende Rust-resultat för i32/i64.
-Upprepade kompileringar ger byteidentiska filer. Ett typfel bevarar föregående
-binär och utdata får inte skriva över källan.
-
-## Begränsningar och nästa steg
-
-Bootstrapkompilatorn är skriven i Rust och behålls som återställningsväg.
-Den självbyggda Dunder-kompilatorn bygger byteidentiska nativefixpunkter på
-alla tre värdmål. Den har flyttal, payload-enums, funktionsvärden,
-referensräkning, deterministisk ägarstädning, testkörning och macOS-appar.
-Dess Wasm-backend behöver fortfarande stöd för hanterade samlingar.
-Full paritet för diagnostik och lånekontroll återstår.
-Arrayelement är begränsade till primitiva skalärer och enums utan payload.
-Fasta arrayer och inline-aggregat får vara högst 64 KiB. Nästlade aggregat
-fungerar som structfält och enumpayloads. Arrayslices, generiskt allokerings-API
-och generell ägar-/lånekontroll återstår. Borrows är tills vidare begränsade
-till funktionsparametrar. Dynamiska arraybuffertar återvinns i en separat
-512 MiB pool; dynamiska strängar återvinns i en 16 MiB pool. Varje pool har
-en extra sida bokföring. Storleksklasserna delar eller sammanfogar ännu inte
-fria block, så blandade storlekar kan fragmentera lagringen. Poolernas
-mappningar behålls till processlut. Strängliteraler bor i programbilden.
-Generell ägande-/lånekontroll och trådsäker delning återstår.
-Bootstrapen flyttar samlingar vid verifierad sista användning.
-Normalisering, grapheme-kluster, interpolation och
-fullständig Unicode-klassificering återstår.
-Dogfood-arenan använder en fast stackbuffert med indexhandtag. Språket har
-också lexikala `region`-block med kontrollerade lån, beskrivet i
-[minnesarkitekturen](memory.md).
-Iteratorer är inbyggda arraykopior, inte ett användardefinierat protokoll.
-Globala konstanter, paketregister och produktion av egna delade bibliotek återstår.
-Nativebyggen har en [funktionscache](incremental.md) och typade importer från
-delade bibliotek.
-Enums saknar ännu generics, likhet för data-enums, mönsterguards och generell
-`match` som uttryck. Direkt rekursiva inlinevärden kräver indirection;
-arena-dogfood använder indexhandtag. Se [enumreglerna](enums.md).
-sys stöder macOS/ARM64 och Linux på ARM64/x86-64. Textläsning kräver vanliga UTF-8-filer,
-högst 4 MiB per fil, och delar strängarenans 16 MiB. Binärläsning, kataloglistning,
-rekursiva katalogverktyg och filströmmar återstår. Se [sys-kontraktet](sys.md).
-Metal-exempelmodulen stöder tills vidare ett aktivt fönster och den fasta
-färgpipelinen. Textlayout, nativekontroller, egen shaderkod och flerfönsterstöd
-återstår. Det kräver en grafisk macOS-session; `--frames` är ett begränsat
-fönsterprov och inget headless-läge. Se [grafikkontraktet](macos-metal.md).
-Flyttal saknar än så länge fullständigt matematikbibliotek, trigonometriska
-funktioner, exp/log, strängparser och valbar utskriftsprecision. Den Dunder-skrivna
-formatteraren prioriterar korrekthet; prestanda är inte uppmätt.
-Anonyma funktioner och closures med infångade lokaler återstår.
-Overflow/division med noll, gränsfel, assertions, full strängarena och ogiltiga
-Unicode-operationer ger definierad exitstatus;
-källpositioner och värden i runtimefel återstår. Backend använder lokala
-stackplatser med optimerad operandkod, konstanta uttryck och direkta
-villkorshopp. x86-64 håller vanliga arbetsvärden och stackpekaren i CPU-register.
-Looplokaler kan hållas i register och små rena funktioner inlinas inom en budget.
-Full registerallokering och vektorisering återstår. Se
-[maskinkodsoptimeringen](optimization.md).
-[Byggmätningarna](../benchmarks/README.md) avser ett genererat stresskorpus;
-de bevisar inte hela 100k-rader/s-kontraktet eller C-paritet.
-
-Samlingstesterna jämför 6 000 operationer med oberoende Rust-map/set,
-inklusive Unicode/NUL, kollisioner, tombstones och uppdateringar. De provar
-elementbredder, djupa kopior, snapshots vid anrop, inbäddade aggregat och
-begränsade borrows. Nativeprogram över 1 MiB provar långa adresser/hopp;
-en 9 MiB-bild med flersidig signatur verifieras och körs av macOS.
-Den Dunder-skrivna kompilatorn jämförs med bootstrapen för 800 genererade
-uttryck samt kontrollflöde och felstatusar. macOS verifierar dess signaturer.
+Wasm-program som behöver filer, processer eller grafik måste deklarera
+motsvarande värdimporter. Det publika ABI:t använder fyra byte för
+pekare och `usize`. Internt använder kompilatorn 64-bitars registerceller.
+Tokens, lånekontroll och logiken för kopiering och frigöring delas med
+nativmålen. [Wasm-ABI och utskrifter](targets.md#webassembly)

@@ -1,7 +1,6 @@
 # Dunders arkitektur
 
-**Plattformsstöd 2026-11-10:** bootstrapen skriver nu ARM64/macOS,
-ARM64/Linux och x86-64/Linux med explicit målval. ELF, Mach-O, systemanrop
+**Plattformsstöd 2026-11-10:** Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux och wasm32 med explicit målval. ELF, Mach-O, systemanrop
 och kodgenerering ingår i kompilatorn. x86-64 sänker den delade interna
 instruktionsvokabulären till nativekod vid kompilering; det finns ingen
 runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
@@ -10,7 +9,7 @@ Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
 GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
 begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
 Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
-är implementerade i bootstrapens kodgenerering. Generella livstider,
+är implementerade i kompilatorns kodgenerering. Generella livstider,
 explicita flyttar och full registerallokering är fortsatt designmål. Nativebyggen
 kan använda [funktionscachen](incremental.md).
 
@@ -60,21 +59,10 @@ Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och os
 
 Första backendversionen håller tillfälliga värden i register och ger värden som lever över en gren en känd hemplats. Vid anrop respekteras register som anroparen måste spara. Nästa steg är att behålla lokala värden i register över strukturerade loopar och grenar där alla inkommande vägar kan enas om placeringen. Kompilatorn får använda begränsad analys per funktion. En permanent andra modell av hela programmet skulle däremot bryta mot designen.
 
-**Optimering i standardbygget.** Laglig konstantvikning, bortval av konstanta
-grenar, kontrollerad addition/subtraktion med immediater, enkla operander
-utan stackspill och direkt jämförelse följd av villkorligt hopp är nu
-implementerade. x86-64 har fasta CPU-register för vanliga arbetsvärden;
-selfhost-backenden använder kompakta stackadresser. Se
-[kontraktet och mätningarna](optimization.md).
-
-Nästa steg är loopars registeranvändning och bevisat överflödiga
-gränskontroller utifrån mätningar. En optimering måste bevara
-evalueringsordning, sidoeffekter, lån och möjliga fällor. Exempelvis får
-vikning av multiplikation med noll inte kasta bort ett anrop med sidoeffekter.
-Inlining behöver en storleksbudget, och konsumenten måste bero på den
-inlinade kroppen. SIMD, mer aggressiv inlining och specialisering ska
-prövas mot uppmätta flaskhalsar. C/C++-paritet är en prövbar ambition,
-särskilt svår på vektoriserbara loopar.
+Kompilatorn kontrollerar även kroppar som saknar anropare. Endast nåbara
+funktioner, datasegment och importplatser länkas in i programmet. Frigöring
+av ägda lokaler och tillfälliga värden genereras vid respektive utgång ur
+ett scope. [Kodgenerering och kontroller](optimization.md).
 
 ## Verktygskedjan och målplattformarna
 
@@ -87,7 +75,7 @@ systemanrop utan libc. Ett program med nåbara `@extern`-deklarationer får
 en dynamisk ELF med de bibliotek och symboler som deklarationerna anger.
 På Wasm blir deklarationerna typade värdimporter.
 
-Båda kompilatorerna bäddar in standardmodulerna som räknas upp i
+Kompilatorn bäddar in standardmodulerna som räknas upp i
 [stdlib/modules.txt](../stdlib/modules.txt). När självhostens inbäddade
 källtext regenereras läser [selfhost/embed.ddr](../selfhost/embed.ddr)
 samma lista. Vanliga filimporter löses på disk relativt den importerande filen.
@@ -111,22 +99,21 @@ publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsn
 `dunder build` hittar närmaste `dunder.toml` från arbetskatalogen uppåt. Första manifestet behöver bara programnamn och rotmodul. Rotmodulens uttryckliga importer bestämmer vad som byggs. Lokala beroenden räcker för första versionen. Standardkommandot bygger optimerat för värddatorns stödda mål och skriver till `build/<mål>/<program>`. Det kräver varken nätverk, bakgrundsprocess eller användarskrivna byggskript. `--target arm64-macos` väljer målet uttryckligen. `--timings` redovisar faser och återanvändning. Ett fel ger källposition, felkod från kommandot och inget halvskrivet resultat.
 
 Med `--incremental` lagras maskinkodsfragment och symboliska korrigeringsposter.
-En ändrad inlinad funktionskropp ogiltigförklarar anroparens fragment.
+Cacheidentiteten omfattar den körande kompilatorn.
 Kompilatorn kontrollerar hela källträdet inför varje bygge. Tester jämför
 varma och rena bilder byte för byte på alla tre native-mål.
 [Användning och cachekontrakt](incremental.md).
 
-## Vägen till en självhostad kompilator
+## Återbyggnad
 
-Rust-bootstrapen bygger den Dunder-skrivna kompilatorn i `selfhost/`.
-Ingången `selfhost/linux.ddr` bygger nu samma kompilatorkällor till
-ARM64/Linux. Nästa självbygge ger en byteidentisk binär; den bygger
-fristående program och CSV-projektet Tabell med verifierade resultat.
-Modulladdare, typer, kodgenerering, runtime och ELF-skrivare är Dunder-kod.
-Full språkparitet och självbyggda macOS-/x86-64-mål återstår.
-Återställning från ren källkod och verifieringskraven finns i
-[bootstrapguiden](../selfhost/README.md).
+Ett verifierat Dunder-frö för värdplattformen bygger först kompilatorns
+källträd under `selfhost/`. Den nya binären bygger samma träd igen.
+Två efterföljande byggen måste bli byteidentiska innan skriptet publicerar
+kompilatorn. Den kan därefter bygga program för alla fyra mål.
+[Frön och återbyggnad](../bootstrap/README.md).
 
-Rust-bootstrapen är den fungerande återställningsvägen. Generics,
-metaprogrammering, pakethantering och ett publikt stabilt Dunder-ABI återstår.
-Prestanda bedöms med [mätkontraktet](prestanda.md).
+Wasm-backenden använder samma typade funktioner och symboliska instruktioner
+som native. Den omvandlar hopp till Wasm-block, anrop till Wasm-funktioner
+och minnesåtkomster till operationer på modulens linjära minne. Nåbara
+externa deklarationer blir typade importer. Filer och processer hör till
+nativevärdens API.

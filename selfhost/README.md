@@ -1,9 +1,8 @@
 # Dunder i Dunder
 
-**Dunder-kompilatorn kan bygga sig själv för ARM64/macOS, ARM64/Linux och x86-64/Linux.** Stage 1
-bygger stage 2 från dessa källfiler; stage 2 bygger en byteidentisk stage 3.
-Stage 3 bygger dessutom fristående program som körs och jämförs med
-oberoende förväntade resultat. Fixpunkten har körts direkt på ARM64 för båda systemen och för Linux med QEMU på x86-64.
+Kompilatorn är skriven i Dunder och bygger sig själv på ARM64/macOS,
+ARM64/Linux och x86-64/Linux. Varje självbyggd kompilator kan skriva
+program för alla tre nativa målen och wasm32.
 
 Lexer, modulladdare, parser, typkontroll, kodgenerering, runtime och
 ELF- och Mach-O-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
@@ -13,59 +12,35 @@ ARM64-backendens runtime återanvänder minnesblock per storleksklass i en
 512 MiB-pool och räknar referenser till dynamiska strängar. Kompilatorn
 frigör lokaler, temporära uttryck, arraybuffertar och structfält vid
 tilldelning och scope-slut, inklusive retur och loopavbrott. Statiska
-strängar har räknare noll. Rust-bootstrapens pooler och ABI beskrivs i
+strängar har räknare noll. Allokering och ägande beskrivs i
 [minnesarkitekturen](../docs/memory.md).
 
 ARM64-vägen kompilerar `f32` och `f64` med IEEE-aritmetik, konverteringar,
 jämförelser, bitoperationerna `from_bits`/`to_bits`, avrundning och
 klassificering. Decimalliteraler avrundas direkt till begärd precision.
-`print` och `.str()` använder samma [decimalformatterare](../runtime/float.ddr)
-som Rust-bootstrapen.
+Nativa utskrifter och `.str()` använder [decimalformatteraren](../runtime/float.ddr).
 
 ## Byggkedjan
 
-Kör från repositoryts rot. På ARM64/Linux kan stage 2 och stage 3 köras
-direkt. På andra processorer behövs `qemu-aarch64` och ett ARM64-Linux-
-användarland med glibc för att köra kompilatorn. Processdrivrutinen använder
-libc när den startar en körbar fil. Ange sysroot med QEMU:s `-L` eller
-`DUNDER_QEMU_LD_PREFIX` i integrationstestet.
+Kör från projektets rot.
 
 ```sh
-# Stage 0: den befintliga Rust-bootstrapen.
-cargo build --release
-
-# Stage 1: Dunder-källor, kompilerade till värddatorns nativeformat.
-target/release/dunder build selfhost/linux.ddr -o build/stage1
-
-# Stage 2: samma Dunder-källor, kompilerade av stage 1 till ARM64/Linux.
-PATH=/no-external-tools build/stage1 build selfhost/linux.ddr -o build/stage2
-
-# Stage 3: samma källor igen, nu kompilerade av stage 2.
-qemu-aarch64 build/stage2 build selfhost/linux.ddr -o build/stage3
-cmp build/stage2 build/stage3
-
-# Den självbyggda kompilatorn bygger ett annat program.
-qemu-aarch64 build/stage3 build examples/hello.ddr -o build/hello-selfhost
-qemu-aarch64 build/hello-selfhost
+dunder_bin="$(./tools/bootstrap.sh)"
+"$dunder_bin" run examples/hello.ddr
 # 42
 # true
 ```
 
-`selfhost/linux.ddr` skriver alltid ARM64/Linux, oberoende av stage 1:s
-värdplattform. `selfhost/main.ddr` skriver signerade Mach-O-binärer för ARM64/macOS.
-På en Mac går samma byggkedja att köra med `main.ddr` och utan QEMU.
-`selfhost/x86_linux.ddr` skriver x86-64/Linux. Alla tre använder samma
-modulladdare, typkontroll och native-runtime. Dunder-backenden för x86-64
-översätter den gemensamma kompilatorns instruktioner och symboliska hopp före
-ELF-skrivningen. Linux-entry, registerbank, stackgränser och syscall-ABI är
-specifika för x86-64. Så här verifieras fixpunkten på en x86-64/Linux-värd:
+Skriptet väljer den frysta kompilatorn för värden ur `bootstrap/`, verifierar
+SHA-256 och bygger dagens källfiler. Det kräver byteidentiska efterföljande
+självbyggen innan det publicerar kompilatorn i `build/selfhost/<värdmål>/`.
+Rust-kompilatorn har tagits ur byggkedjan. De frysta startkompilatorerna och
+Dunder-källorna är återställningsvägen. [Fröbinärer och återbyggnad](../bootstrap/README.md)
 
-```sh
-dunder build selfhost/x86_linux.ddr -o build/x86-stage1
-build/x86-stage1 build selfhost/x86_linux.ddr -o build/x86-stage2
-build/x86-stage2 build selfhost/x86_linux.ddr -o build/x86-stage3
-cmp build/x86-stage2 build/x86-stage3
-```
+`selfhost/main.ddr`, `linux.ddr` och `x86_linux.ddr` väljer värdens
+standardmål. `--target` väljer vilket mål som helst för det byggda programmet.
+Kör korsbyggd Linux-kod på motsvarande Linux-system eller med QEMU och
+målarkitekturens användarland.
 
 ## Vad kompilatorn klarar
 
@@ -84,7 +59,7 @@ Standardbibliotekets källor är inbäddade i `bundled.ddr`. Efter ändringar
 i de moduler som listas i `stdlib/modules.txt`, regenerera med Dunder själv:
 
 ```sh
-target/release/dunder run selfhost/embed.ddr
+"$dunder_bin" run selfhost/embed.ddr
 ```
 
 Modulladdaren bevarar källpositioner så att fel pekar på ursprunglig fil
@@ -97,19 +72,21 @@ kompilatorn. Varje källfil lexas en gång, och tokenpositionerna mappas
 till ursprunglig modul. Testbyggen använder fortfarande den sammansatta
 källtexten för att lägga till testfunktioner och teststart.
 
-`build` genererar kod för nåbara funktionskroppar. `check` kontrollerar
-även oanropade funktioner i hela importträdet och skriver ingen körbar fil.
-`check --agent` skriver JSONL med modulens sökväg, ursprungliga UTF-8-
-byteoffsetar och lokala bindningars härledda typer. `build-tests` hanterar
-testkroppar separat. Den
-stöder skalära arrayelement och enkla enumvarianter i arrayer. Den generella
-lånekontrollen, alla typer av nästlade arrayelement och en fullständig
-paritetskontroll av ogiltiga program återstår. Syntax- och typfel från
-självhosten rapporteras fortfarande med den gemensamma koden E1000.
+`build` genererar kod för nåbara funktioner och typkontrollerar också
+oanropade kroppar i importträdet. `check --agent` skriver JSONL med
+modulsökväg, UTF-8-byteoffsetar och härledda typer för lokala bindningar.
+Diagnostiken innehåller fil, rad, kolumn och felkod.
+
+Lån är funktionsparametrar. Kontrollen spårar variabler, fält,
+arrayelement och mutationer under argumentutvärderingen. Två delade lån
+är tillåtna. Ett muterbart lån kräver exklusiv åtkomst till sin rot.
+Ett lexikalt regionlån får heller inte flyttas till ett resultat, lagras i
+ett längre levande värde eller lämnas vidare till ett anrop som kan göra en
+rå pekare av lånet. Se [minnesarkitekturen](../docs/memory.md).
+
 CLI:t stöder även `run`, `test --affected`, tidsgränser för tester, manifest,
 målval och macOS-appar med resurssignering. Nativebyggen kan återanvända
-funktionsfragment med `--incremental`. Rust-bootstrapens optimeringar och
-Wasm-stöd har fortfarande bredare täckning.
+funktionsfragment med `--incremental`.
 
 ### Modulprivilegier och filhandtag
 
@@ -118,22 +95,33 @@ varje fil, även i onåbara funktioner. Ett uppslag av en funktion med
 `@requires(filesystem)` kräver filens eget `capability filesystem`. Det
 gäller även funktionsvärden. Endast den deklarerande modulen får konstruera
 en `opaque struct` eller öppna ett fält i säker kod. Den kontrollen sker vid
-typkontroll av funktionskroppen, så en typberoende överträdelse i en helt
-onåbar kropp upptäcks först när kroppen kompileras.
+typkontroll av funktionskroppen, även om programmet aldrig anropar den.
 [Filhandtag och legacy-API:er](../docs/ffi.md#filåtkomst-genom-delegerade-handtag)
 
 ### Wasm32 från den självbyggda kompilatorn
 
-Bygg `selfhost/wasm.ddr` med den inbyggda kompilatorn för värdplattformen.
-Den färdiga kompilatorn skriver Wasm-moduler med en exporterad `main` och
-ett linjärt minne. Den stöder typade värdimporter, C-strängar, råa
-skalärläsningar och skrivningar, typade indirekta importanrop, heltal,
-booleska värden, f32/f64 och strukturerat kontrollflöde. Skalärutskrifter
-går till funktioner i värdmodulen `dunder`, exempelvis `print_f64`.
-`tests/selfhost_wasm.rs` bygger denna kompilator med stage 2, kontrollerar
-ett blandat C-anrop i Node och kontrollerar diagnostiken för en array utanför
-denna backends delmängd. Rust-bootstrapens Wasm-backend beskrivs i
-[måldokumentationen](../docs/targets.md).
+Den självbyggda kompilatorn kan skriva en modul för Node eller webbläsaren.
+
+```sh
+./tools/bootstrap.sh
+build/selfhost/arm64-macos/dunder build examples/hello.ddr --target wasm32 -o hello.wasm
+node tools/test-wasm.mjs build/selfhost/arm64-macos/dunder
+```
+
+Välj värdens katalog under `build/selfhost/`. Kompilatorn använder samma
+typkontroll, kopiering, ägarskap och kod för regioner som de nativa målen.
+Backenden omvandlar den gemensamma instruktionsföljden till Wasm-funktioner.
+Vanliga anrop och rekursion använder Wasms anropsstack. En kontrollerad
+värdestack på 1 MiB i linjärt minne gör lokaler och lånade fält adresserbara.
+Runtimen återanvänder frigjorda block och utökar minnet med `memory.grow`
+när den behöver mer utrymme.
+
+Modulen exporterar `main`, `memory` och `__indirect_function_table`. Vid
+värdgränsen upptar pekare och `usize` fyra byte. Skalära importer och
+callbacks har deklarerade Wasm-signaturer. Värden tar emot C-layoutposter
+via pekare. Systemanrop för filer och processer kräver ett nativt mål eller
+en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md)
+och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 
 ## Filer
 
@@ -144,6 +132,8 @@ denna backends delmängd. Rust-bootstrapens Wasm-backend beskrivs i
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
 | `compile.ddr` | Typer, uttryck, kontrollflöde, värdesemantik och kodgenerering. |
 | `x86.ddr`, `x86_linux.ddr` | x86-64-kodgenerering och Linux-ingång. |
+| `wasm_native.ddr`, `wasm_flow.ddr` | Modulformat, funktionsanrop, grundblock och relokeringar för Wasm. |
+| `wasm_abi.ddr`, `wasm_alu.ddr`, `wasm_memory.ddr` | Typade värdanrop, aritmetik och linjärt minne för Wasm. |
 | `arm64.ddr` | Maskinord, register, stack, etiketter och hoppfixering. |
 | `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Darwin- och Linux-systemanrop. |
 | `driver.ddr` | Gemensam modulladdning, felrapportering och publicering av filer. |
@@ -153,46 +143,23 @@ denna backends delmängd. Rust-bootstrapens Wasm-backend beskrivs i
 ## Verifiering
 
 ```sh
-cargo test --test selfhost -- --test-threads=1
-target/release/dunder test
+dunder_bin="$(./tools/bootstrap.sh)"
+"$dunder_bin" test dogfood/tests.ddr
+python3 tools/test-diagnostics.py "$dunder_bin"
+python3 tools/runtime-contracts.py "$dunder_bin"
+node tools/test-wasm.mjs "$dunder_bin"
+node tools/test-wasm-abi.mjs "$dunder_bin"
+node tools/test-wasm-scalars.mjs "$dunder_bin"
+python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
 ```
 
-Det gemensamma testet bygger stage 1 och stage 2 på macOS och Linux. På
-ARM64/macOS verifierar det fixpunkten och kör Tabell direkt. Med `qemu-aarch64` tillgängligt
-kör det även stage 2 → stage 3, jämför samtliga byte och kör program byggda
-av stage 3. Ange vid behov `DUNDER_QEMU_AARCH64=/sökväg/till/qemu-aarch64`.
-Testet rapporterar när QEMU-delen hoppas över. På ARM64/Linux körs binärerna
-direkt. Kompilatorprocesserna körs med tom miljö och utan externa verktyg i
-`PATH`.
-
-Regressionerna täcker variabla bitförskjutningar, heltal, nästlade structar,
-oberoende arraykopior, UTF-8, moduler, diagnostik och skydd av källfiler.
-Stage 3 bygger och kör de tolv icke-grafiska dogfood-programmens
-`main` på ARM64/macOS och ARM64/Linux. Testet jämför stdout, stderr och
-returkod med Rust-bootstrapen. Stage 3 bygger även det fristående CSV-projektet Tabell och dess rapport
-jämförs med förväntad CSV. En lokal körning på inventeringen av Blixts
-källfiler gav också samma gruppsummor som den oberoende referensen.
-Ett separat test ser till att det inbäddade standardbiblioteket är aktuellt.
-De tidigare macOS-testerna för 800 genererade uttryck, runtimefel och
-signaturer finns kvar och körs på ARM64/macOS.
-
-Behåll Rust-bootstrapens källkod som återställningsväg. En ren checkout
-kan byggas med Rust utan någon befintlig Dunder-binär. Frysta
-[startkompilatorer](../bootstrap/README.md) finns för alla tre nativevärdar.
-`tools/bootstrap.sh` bygger och jämför två efterföljande självbyggen utan Rust.
-
-
-## Testgrupper med den självbyggda kompilatorn
-
-På programmets målplattform kan stage 3 bygga och köra alla testgrupper
-från rotfilens importträd. Varje grupp får en egen process och en tidsgräns.
+De körda programmen har förväntade värden, utskrifter och felutfall.
+Diagnostikfallen använder både giltiga exempel och källor som ska avvisas.
+Testgrupperna får varsin process. För en enskild grupp kan kompilatorn
+skriva en egen startpunkt med `build-tests`.
 
 ```sh
-build/stage3 build-tests dogfood/tests.ddr -o build/dogfood-tests
-python3 tools/selfhost-tests.py build/dogfood-tests
+"$dunder_bin" build-tests dogfood/tests.ddr --list
+"$dunder_bin" build-tests dogfood/tests.ddr --group 0 --target wasm32 -o group.wasm
+node tools/test-wasm.mjs --execute group.wasm
 ```
-
-Binären listar gruppnummer och ursprungliga namn med `--list`. Kör ett
-enskilt gruppnummer för att återupprepa ett fel. Kopplade `@test { (args)
--> resultat }` och fristående `@test fn` använder samma urval.
-`--timeout 15` på Python-kommandot ger varje grupp 15 sekunder.

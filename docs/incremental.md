@@ -20,21 +20,18 @@ vid typkontrollen.
 
 `--incremental` aktiverar funktionscachen för nativebyggen och `run`.
 `--timings` rapporterar hur många nåbara funktioner som återanvändes och hur
-många som emitterades. Cachen finns i `build/.dunder-cache/functions` under
+många som emitterades. Cachen finns i `build/.dunder-cache/selfhost` under
 aktuell arbetskatalog. Man kan radera hela katalogen mellan två byggen.
 
-Parser och typkontroll läser hela importträdet. Kompilatorn hashar varje
-typad funktionskropp och inkluderar typ- och signaturtabeller, mål, de
-inlinade beroendena och bildens import- och datalayout i nyckeln.
-Ändringar i kompilatorn, dess runtime eller inbäddade bibliotek ogiltigförklarar
-äldre fragment. En ändring i delad layout kan därför bygga om flera funktioner.
-
-Ett fragment lagrar instruktioner före slutlig placering, hopp med symboliska
-mål, strängliteraler och datareferenser. Länkningen placerar om dem i den
-aktuella bilden och signerar Mach-O på nytt. En kontrollsumma identifierar
-ofullständiga cachefiler och publicering sker med ett atomiskt namnbyte.
-x86-64-backenden återanvänder den gemensamma instruktionsströmmen och sänker
-den till x86 vid länkning.
+Nyckeln innehåller kompilatorns kryptografiska identitet, målet, deklarationernas
+layout och funktionens tokenström. På macOS används SHA-256 av den laddade
+bildens kodsignatur och på Linux SHA-256 av den körande ELF-filen genom
+`/proc/self/exe`. Identiteten följer därmed processen även om ett nytt bygge
+ersätter dess sökväg. Symboliska hopp placeras om vid varje
+bygge. Funktioner som skapar nya typer, strängliteraler, importplatser eller
+statisk lagring emitteras på nytt. Program med C-callbacks emitteras på nytt.
+Det håller återanvändningen konservativ tills dessa resurser kan spelas upp
+från cacheformatet. `--timings` visar återanvända och emitterade funktioner.
 
 ## Kör berörda tester
 
@@ -49,22 +46,3 @@ alltid hela sviten.
 Resultatkvitton och kodfragment finns i den valda testutdatakatalogen
 (`-o`). Sammanfattningen anger hur många grupper som hoppades över och hur
 många som gick igenom eller misslyckades.
-
-## Den självhostade kompilatorn
-
-Samma flaggor finns i `selfhost/`. Dess nativecache ligger i
-`build/.dunder-cache/selfhost` och aktiveras uttryckligen med `--incremental`.
-Nyckeln innehåller kompilatorns kryptografiska identitet, målet, deklarationernas
-layout och funktionens tokenström. På macOS används SHA-256 av den laddade
-bildens kodsignatur och på Linux SHA-256 av den körande ELF-filen genom
-`/proc/self/exe`. Identiteten följer därmed processen även om ett nytt bygge
-ersätter dess sökväg. Symboliska hopp placeras om vid varje
-bygge. Funktioner som skapar nya typer, strängliteraler, importplatser eller
-statisk lagring emitteras på nytt. Program med C-callbacks emitteras på nytt.
-Det håller återanvändningen konservativ tills dessa resurser kan spelas upp
-från cacheformatet. `--timings` visar återanvända och emitterade funktioner.
-
-`test --affected` använder transitiva beroenden och kompilatoridentitet även
-här. Godkända resultat kan återanvändas för rena grupper. Processdrivrutinen
-startar varje grupp separat, bevarar argument exakt och dödar samt väntar in
-en grupp som överskrider `--timeout-ms`. Standardgränsen är 5 000 ms.

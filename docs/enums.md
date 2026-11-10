@@ -135,12 +135,12 @@ med statiskt kontrollerad `match` behöver ingen dynamisk metodtabell.
 ## Verifiering och nuvarande gränser
 
 ```sh
-cargo run --release -- run dogfood/enums.ddr
+dunder run dogfood/enums.ddr
 # 42
 # enums ok
-cargo run --release -- test dogfood/enums.ddr
+dunder test dogfood/enums.ddr
 # 5 passed, 0 failed
-cargo test --test enums
+python3 tools/test-diagnostics.py "$(command -v dunder)"
 ```
 
 [Dogfood-programmet](../dogfood/enums.ddr) provar båda formerna och nästlade

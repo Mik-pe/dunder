@@ -15,11 +15,15 @@ def check_fixture(compiler, source, work):
         raise ValueError(f"{source} needs one // error: expectation")
     previous = b"previous successful output"
     output = work / "image"
+    suite = work / "suite"
+    suite.mkdir(exist_ok=True)
+    receipt = suite / "keep"
+    receipt.write_bytes(previous)
     for target in ([], ["--target", "wasm32"]):
         modes = ["check", "build", "build-tests"] if target else ["check", "build", "build-tests", "test"]
         for command in modes:
             output.write_bytes(previous)
-            options = ["--agent"] if command == "check" else ["-o", str(work / "suite" if command == "test" else output)]
+            options = ["--agent"] if command == "check" else ["-o", str(suite if command == "test" else output)]
             result = subprocess.run([compiler, command, source, *target, *options], cwd=work,
                                     capture_output=True, text=True, timeout=30)
             message = result.stderr
@@ -31,7 +35,7 @@ def check_fixture(compiler, source, work):
                 message = error["message"]
             if result.returncode != 1 or expectations[0] not in message:
                 raise AssertionError(f"{command} {' '.join(target)} exited {result.returncode}: {message}\n{result.stdout}")
-            if output.read_bytes() != previous:
+            if output.read_bytes() != previous or receipt.read_bytes() != previous or list(suite.iterdir()) != [receipt]:
                 raise AssertionError(f"{command} modified existing output")
 
 def main():

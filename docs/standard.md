@@ -129,31 +129,28 @@ Bytekodning och SHA-256 dogfoodar dessa operationer.
 
 ## Lagring och verifiering
 
-Dynamiska buffertar använder en separat **512 MiB pool** plus en sida
-bokföring, mappad vid första behov. Buffertarna har unika ägare; kopior
+Dynamiska buffertar använder en gemensam **512 MiB heap** på native, mappad vid första behov. Buffertarna har unika ägare; kopior
 är oberoende. Tillväxt frigör den gamla bufferten efter kopieringen.
 Tilldelning, scope-slut och retur frigör övergivna buffertar, även i nästlade
 structar och aktiva enumpayloads. `clear` frigör elementens strängreferenser
 och behåller själva bufferten för nästa användning.
 Full pool, misslyckad mappning eller för stor/negativ arrayreserv ger
 status 109. Detta är ännu inget generellt allokerar- eller deallokerar-API.
-Strängar har referensräkning och en separat återanvändbar 16 MiB pool.
-Poolerna använder storleksklasser; fragmentering och levande värden kan
-fortfarande fylla dem. Läs [kostnader och gränser](memory.md).
+Strängar har referensräkning och delar heap med arrayer.
+Allokatorn återanvänder block per storleksklass. Läs [kostnader och gränser](memory.md).
 
 ```sh
-cargo run --release -- run dogfood/standard.ddr
+dunder run dogfood/standard.ddr
 # 4
 # 6
 # stdlib ok
-cargo run --release -- test
-# 49 testgrupper i det sammanslagna trädet
-cargo test --test collections --test system --test selfhost
+dunder test
+# Alla grupper i projektet
+python3 tools/runtime-contracts.py "$(command -v dunder)"
 ```
 
-Tester omfattar 6 000 map-/setoperationer jämförda med Rusts oberoende
-samlingar, kollisioner, borttagning, tombstones, Unicode/NUL, växande arrayer,
-olika elementbredder, djupa värdekopior, callbacks och aliasfel. Ett verkligt
-program över 1 MiB verifierar långa adresser och hopp till runtimefel.
+Tester jämför map, set och sortering mot Pythons referensresultat. De
+provar även Unicode och NUL, olika elementbredder, djupa värdekopior,
+callbacks och aliasfel.
 SHA-256 kontrolleras mot referensvektorer och används av den
 [Dunder-skrivna kompilatorns](../selfhost/README.md) Mach-O-signering.

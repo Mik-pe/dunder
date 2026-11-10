@@ -29,7 +29,7 @@ Biblioteket är inbäddat i kompilatorn. Projektet behöver ingen lokal
 `sys.ddr`, installerad standardbibliotekskatalog eller nätverksåtkomst.
 Programmet behöver inte kompilatorn eller bibliotekets källfiler vid körning.
 API:t finns i [stdlib/sys.ddr](../stdlib/sys.ddr); den lilla OS-gränsen
-implementeras i [native-backenden](../src/native/sys.rs).
+implementeras i [native-backenden](../selfhost/runtime_sys.ddr).
 
 ## Funktioner och resultat
 
@@ -156,12 +156,8 @@ lyckat resultat. Växer den utöver den uppmätta storleken under läsningen
 ger EOF-kontrollen fel 35 i stället för tyst trunkering. Läsningen är inte
 en atomisk snapshot gentemot samtidiga skribenter.
 
-Lästa strängar använder den befintliga **16 MiB strängpoolen** tillsammans
-med övriga dynamiska strängar och återvinns när sista ägaren försvinner.
-Interna bytepackningar och läsbuffertar på felvägar frigörs också.
-Om plats saknas ger `read_text` fel 12, stänger filen och lämnar programmet
-igång. En tidigare lyckad läsning behåller sitt värde. Vanlig strängbyggnad
-har fortsatt sitt befintliga fatala arenafel; sys ändrar inte den regeln.
+Lästa strängar använder samma återanvändbara heap som andra strängar och arrayer.
+[Allokering och ägarskap](memory.md).
 
 `.error` använder Dunders ursprungliga Darwin-kompatibla felkoder. På Linux
 översätts kända errno-värden till samma koder, så exempelvis `NotFound`,
@@ -199,19 +195,16 @@ den importerande filen. De privata `__sys_*`-intrinsics är endast tillgängliga
 inne i det medföljande biblioteket.
 
 ```sh
-cargo run --release -- run dogfood/filesystem.ddr
+dunder run dogfood/filesystem.ddr
 # 18
 # filesystem ok
-cargo run --release -- test dogfood/filesystem.ddr
+dunder test dogfood/filesystem.ddr
 # 4 passed, 0 failed
 ```
 
 Dogfood-programmet skapar en egen katalog med process-ID i namnet, provar
-filflödet och städar bara de objekt det själv skapade. Integrationstesterna
-använder isolerade temporära kataloger och kontrollerar innehåll oberoende
-med Rusts fil-API. Testerna täcker UTF-8, NUL, metadata med 64-bitars storlek,
-felvägar, symboliska länkar, långa sökvägar, stora filer, full arena och
-stängda filhandtag. En signerad binär körs även utan källfiler och med tom miljö.
+filflödet och städar bara de objekt det själv skapade. Tabell och filhandtagsproven kör i temporära kataloger och kontrollerar
+filinnehåll och felkoder. [Filhandtagsprov](../tools/test-files.py).
 
 Implementationens syscallnummer och stat-layout är verifierade mot
 [Apples XNU-anrop](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master)

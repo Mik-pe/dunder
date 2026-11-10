@@ -1,121 +1,78 @@
 # Minne och ägarskap
 
-Rust-bootstrapens kodgenerering frigör nu dynamiska arraybuffertar och
-strängar under körning. Det gäller dess tre mål: ARM64/macOS, ARM64/Linux
-och x86-64/Linux. Modellen behöver ingen extern runtime eller spårande GC.
-Den Dunder-skrivna backendens egen runtime har ännu bump-allokering;
-självbyggets fixpunkt är inte ett bevis på minnesmodellparitet.
+Dunder frigör strängar, arraybuffertar och sammansatta värden under körning.
+Kompilatorn lägger in städning vid tilldelning, blockslut, retur, `break`
+och `continue`. Den genererade koden och minnespoolen följer med varje program
+på ARM64/macOS, ARM64/Linux, x86-64/Linux och Wasm32.
 
 ## Värden och ansvar
 
 | Värde | Kopiering | Frigöring |
 | --- | --- | --- |
-| Dynamisk array | Ny oberoende buffert; strängelement behåller sina strängar. | Elementen släpps, sedan bufferten. |
-| Struct, fast array, payload-enum | Fält/element kopieras rekursivt; bara aktiv variant räknas. | Ägda fält/element släpps rekursivt. |
-| `string`, `.bytes()`, `.runes()` | Delar oföränderliga data och ökar referensräknaren. | Sista ägaren återlämnar blocket till poolen. |
-| Strängliteral | Handtag till programbilden. | Lever hela processen; räknare noll betyder statisk lagring. |
-| `&T`, `&mut T` | Lånar anroparens värde enligt den begränsade borrow-kontrollen. | Låntagaren frigör inte anroparens lagring. |
+| Dynamisk array | Ny oberoende buffert. Strängelement kan dela oföränderliga data. | Elementen släpps, sedan bufferten och dess deskriptor. |
+| Struct, fast array och payload-enum | Fält och element kopieras enligt sin typ. Enumens aktiva variant bestämmer payloaden. | Ägda fält och element släpps rekursivt. |
+| `string` | En dynamisk sträng får en referens till. Literaler ligger i programbilden. | Sista ägaren återlämnar ett dynamiskt block till poolen. |
+| `.bytes()` och `.runes()` | Skapar ett ögonblicksvärde med bytes respektive Unicode-kodpunkter. | Den genererade koden städar värdet när dess scope lämnas. |
+| `&T` och `&mut T` | Lånar anroparens värde. | Ägaren ansvarar för lagringen. |
 
-Tilldelning färdigställer det nya värdet innan det gamla släpps. Därför
-fungerar självtilldelning och kopior från egna fält. Ett arrayargument som
-skickas som värde får en oberoende kopia; använd en borrow för att undvika
-kopieringen. `pop` överför strängelementets ägande, medan `clear` släpper
-alla element men behåller buffertens kapacitet.
+Tilldelning säkrar det nya värdet innan det gamla släpps. En array som skickas
+som värde får en egen kopia. `pop` överför elementets ägande. `clear` släpper
+elementen och behåller arrayens kapacitet.
 
-Kompilatorn registrerar ägda stackplatser, nollställer dem före användning
-och lägger in städning vid scope-slut, `break`, `continue` och retur.
-Återanvända temporärplatser släpper sitt föregående värde. En retur säkrar
-resultatets ägande innan funktionens lokala värden städas. Städade platser
-nollställs, så gemensam returstädning kan hantera även tidigare avslutade
-block. Ett fatalt runtimefel avslutar processen; det kör inte användarkod
-eller någon separat destruktoravveckling.
+I `text + change(&mut text)` behåller vänsterledet strängen som lästes före
+funktionsanropet. Samma utvärderingsordning gäller för argument, index och
+snittgränser. En retur bevarar sitt resultat medan funktionen städar sina
+lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
 
-Strängläsningar får också ägda temporärer. I `text + change(&mut text)`
-måste vänsterledet överleva ändringen i högerledet. Samma regel gäller
-argument, index, snittgränser och iteratorer. Temporärer kan leva till
-sitt lexikala scope-slut; detta är ännu ingen analys av sista användningen.
+## Pool och kostnader
 
-## Varför referensräkning för strängar?
+Nativ kod mappar 512 MiB virtuellt adressutrymme vid första allokeringen.
+Resident minne beror på vilka sidor programmet använder. Wasm utökar sitt
+linjära minne vid behov. På alla mål delar strängar och arrayer samma pool.
+Frigjorda block läggs på en lista för sin storleksklass. Klasserna börjar vid
+16 byte och växer i tvåpotenser. En ny begäran kan återanvända ett block i rätt
+klass. Blandade storlekar kan lämna lediga block i andra klasser när poolen blir full.
 
-Oföränderliga strängar är löv: de innehåller inga andra ägare och kan inte
-bilda cykler. Icke-atomär referensräkning ger säker, billig delning utan
-full datakopiering och utan att behålla allt till processlut. Arraybuffertar
-har i stället unika ägare. Det ersätter det tidigare, ännu inte genomförda
-designmålet att undvika referensräkning helt.
+Innanför ett dynamiskt stränghandtag ligger en 64-bitars bytelängd följd av
+UTF-8-data. Referensräknaren ligger åtta byte före handtaget. Statiska strängar
+har räknare noll. Strängar kan dela data utan cykler eftersom deras innehåll
+saknar referenser till andra objekt. Referensräkningen är icke-atomär.
 
-Stränghandtaget pekar fortsatt på `[u64 byte_length, UTF-8 bytes]`.
-Referensräknaren ligger åtta byte före handtaget. Nya dynamiska värden
-startar med en ägare; null accepteras i intern städning och statiska
-literaler har räknare noll. Ett frigjort block markeras för att fånga
-dubbel frigöring innan återanvändning. Markeringen ersätter inte korrekt
-ägarkontroll. Språket har ännu inget API för delat minne mellan trådar;
-räknarna får inte användas som om de vore atomära.
-
-## Pooler och kostnader
-
-Arraypoolen är 512 MiB och strängpoolen 16 MiB, vardera med en extra
-4 KiB sida för bokföring. De mappas först vid behov. Det är virtuellt
-adressutrymme; resident minne beror på vilka sidor som används.
-Frigjorda block återanvänds i storleksklasser med kapaciteter som är
-tvåpotenser, från 16 byte. Arrayblock har 16 byte metadata; strängblock
-har 32 byte inklusive referensräknare och längd. Poolernas mappningar
-återlämnas till operativsystemet vid processlut.
-
-En ledig lista per storleksklass ger konstant arbete vid återanvändning.
-Block delas eller sammanfogas ännu inte. En blandning av storlekar kan
-därför tömma en pool även om andra klasser har lediga block. Levande data,
-avrundning, metadata och fragmentering räknas alla mot tillgängligt utrymme.
-Det finns ännu inget obegränsat heap- eller användarallokerings-API.
-
-Arraykopior kostar tid och minne proportionellt mot innehållet. Kopia-före-
-frigöring kan tillfälligt behöva plats för både gammalt och nytt värde.
-Strängkopior kostar en retain/release, medan sammanslagning och snitt
-allokerar och kopierar byte. Tillväxt återlämnar gamla arraybuffertar efter
-kopieringen. Runtimefel 109 betyder misslyckad arrayallokering; 105 gäller
-strängallokering. Återhämtningsbara sys-operationer kan i stället ge fel 12.
+Dynamisk sammanslagning och snitt tillåter högst 16 MiB per strängblock
+inklusive längdordet. En misslyckad strängallokering i dessa operatorer ger
+status 105. En ogiltig UTF-8-gräns eller Unicode-kodpunkt ger 106.
+En ogiltig arraykapacitet eller otillräckligt utrymme för en array eller region ger 109.
+Wasm avbryter den aktuella körningen med en trap.
 
 ## Verifiering
 
-`tests/memory.rs` testar återvinning genom att allokera långt mer totalt än
-poolernas gränser medan bara lite data behöver leva samtidigt. Testerna
-kontrollerar resultat och begränsar även samplad Linux-RSS för att fånga en
-implementation som bara höjer allokeringsgränsen.
-
-Sviten täcker kopior, tilldelning, retur, callbacks, rekursion, nästlade
-structar/enums, strängarrayer, `pop`, borrows, loopavbrott, separata block,
-sidverkningar mellan operander och upprepade sys-resultat/felvägar.
-ARM64 körs direkt eller med QEMU när tillgängligt. Vulkanprovet kräver
-`DUNDER_VULKAN_TEST=1` och återvinner tusentals riktiga readback-snapshots.
-
 ```sh
-cargo test --test memory -- --test-threads=1
-# Med loader och lavapipe konfigurerade enligt linux-vulkan.md:
-DUNDER_VULKAN_TEST=1 cargo test --test memory -- --test-threads=1
+dunder_bin="$(./tools/bootstrap.sh)"
+python3 tools/runtime-contracts.py "$dunder_bin"
+python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
 ```
 
-Lokala före/efter-prover på Linux/x86-64 visar varför ändringen behövdes:
-100 000 kopior av 1024 `i64` fyllde tidigare 512 MiB-poolen efter omkring
-65 000 varv. Med återvinning går hela provet klart med cirka 88 KiB samplad
-RSS. 10 000 Vulkan-snapshots på 64×48 pixlar går klart kring 43 MiB inklusive
-lavapipe; tidigare tog poolen slut kring 2700 snapshots. RSS-värdena är
-sampling från `/proc`, inte exakta kernelrapporterade toppvärden eller
-portabla prestandalöften.
+Testverktyget använder Python 3:s standardbibliotek och Node för Wasm. Det
+bygger varje program med den angivna Dunder-kompilatorn. Tio minnesprov håller
+bland annat arraykopior, nästlade enumvärden, lånade parametrar, snitt och
+strängreturer levande medan andra värden ersätts eller frigörs. Exempelvis
+kopierar ett prov en array med 1 024 `i64` i 200 000 varv. Ett annat tar emot
+en miljon dynamiska strängreturer. Alla tio kontrollerar resultatet och
+kräver under 96 MiB maximal RSS på det nativa värdmålet. På Wasm kräver de
+under 96 MiB linjärt minne och samma minnesstorlek efter en andra körning
+i samma instans. [Dunder-programmen](../tests/contracts/).
 
-En miljon upprepade strängbyggen (`"frame " + i.str()`) respektive snitt
-på 60 byte går klart med cirka 64 KiB samplad RSS vardera. Före ändringen
-gav samma prover status 105 efter omkring 410 000 respektive 230 000 varv
-och hade nått cirka 16 MiB RSS.
-
-Nästa arkitektursteg är att porta samma ägarkontrakt till selfhost-backenden,
-förbättra blandade storleksklasser och minska onödiga retain/release samt
-aggregatkopior. Generella livstider, explicita flyttar och användarvalda
-allokatorer behöver egna språkregler innan de kan exponeras säkert.
+Testverktyget jämför även heltal, flyttalsbitar, decimalformatering, UTF-8,
+mappar, mängder och sortering med oberoende Python-beräkningar. Felproven
+kontrollerar status och exakt utskrift före felet. Med `--case string_returns`
+körs ett enskilt prov. Vid körning med en emulator kan `--runner` ange
+programmet som startar målbinären. RSS-gränsen gäller när målbinären körs direkt.
 
 ## Lexikala scratch-regioner
 
-Rust-bootstrapen kan skapa en tidsbegränsad arena med `region namn(antal_byte)`.
+En tidsbegränsad arena skapas med `region namn(antal_byte)`.
 Kapaciteten är ett `i32` som utvärderas en gång vid inträdet. Utan parenteser
-är kapaciteten 64 KiB. Regionen lånar en buffert från arraypoolen. Varje
+är kapaciteten 64 KiB. Regionen lånar en buffert från minnespoolen. Varje
 `alloc` flyttar en markör i bufferten, justerar adressen för elementtypen och
 nollställer de nya elementen. Underblock och loopar kan allokera från samma
 region. Den lämnar tillbaka sin buffert vid blockslut, retur och loopavbrott.
@@ -142,12 +99,19 @@ eller index utanför vyn ger status 103. Negativ eller omöjlig begäran om
 regionkapacitet ger arrayallokerarens status 109.
 
 
-Selfhost-kompilatorns native-mål stöder samma syntax och markörallokering
-för skalärer och vanliga, flata structar med skalära värdefält. För ett lån
+Självkompilatorn stöder markörallokering för skalärer, vanliga flata
+structar med skalära fält och `@c_layout`-structar med värdefält som kan
+vara nästlade eller fasta arrayer. För ett lån
 till ett skalärt element eller en hel vy kräver selfhost att elementens
-representation matchar funktionsparameterns lagring. Enskilda structfält
-kan lånas under ett anrop. `tests/fixtures/regions.ddr` används av båda
-kompilatorernas regressionstester.
+representation matchar funktionsparameterns lagring. Ett lån av ett enskilt
+fält eller en C-layout-struct använder regionens lagring. Ett muterbart lån
+av en hel vanlig struct använder en ägd tillfällig kopia och skriver tillbaka
+fältvärdena efter anropet. Självkompilatorn följer lån genom funktionsanrop,
+återlån och funktionspekare och avvisar lån som når `addr`. En kopia av ett
+element eller en array som kopierats genom en delad parameter har egen lagring.
+En inre region kan skugga en yttre. Namnet på regionen och dess direkta
+deklarationer tillhör samma scope. Se `tests/contracts/region_borrows.ddr`
+och de ogiltiga exemplen under `tests/fixtures/region_errors/`.
 
 
 ### Packade bytebuffertar
@@ -158,14 +122,10 @@ och selfhost-kompilatorns kodbild och signatur använder samma representation.
 `sys.write_u8` och `sys.decode_u8` tar `&[]u8`. Befintlig kod med
 `&[]i32` kan använda `sys.write_bytes` och `sys.decode_utf8`.
 
-På Apple M5 med macOS 27.2 fyllde ett prov 8 388 608 element och skrev ut
-sista värdet 255. Tabellen visar medianen av fem separata processer per
-cell med `/usr/bin/time -l` den 10 november 2026.
-
-| Kompilator som byggde provet | Maximal RSS med `[]u8` | Maximal RSS med `[]i32` |
-| --- | ---: | ---: |
-| Rust-bootstrap för arm64-macos | 9 912 320 byte | 35 078 144 byte |
-| Selfhost, steg 3 för arm64-macos | 9 912 320 byte | 35 078 144 byte |
+Ett prov med 8 388 608 element rapporterade 9 912 320 byte maximal RSS med
+`[]u8` och 35 078 144 byte med `[]i32` på Apple M5 och macOS 27.2.
+Värdena är medianer av fem processer per variant byggda med den självhostade
+Stage 3-kompilatorn den 10 november 2026.
 
 Bygg provet igen med `i32` på båda ställen för fyrabytesvarianten.
 

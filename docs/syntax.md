@@ -497,19 +497,15 @@ Normalisering, case folding, fullständig Unicode-klassificering och synliga
 teckenkluster stöds ännu inte. Dogfood-ordräknaren känner bara igen de
 blanktecken som uttryckligen listas i dess Dunder-källa.
 
-Minnesmodellen använder statiska literaler i programbilden och en separat
-återanvändbar 16 MiB pool för dynamiska strängar. Kopior av `string`,
-`.bytes()` och `.runes()` delar data med icke-atomär referensräkning;
-strängen frigörs när sista ägaren försvinner. Sammanslagning, snitt och
-konvertering av heltal/rune skapar nya strängar. Även temporärer behåller
-sina värden över senare sidoeffekter i samma uttryck. Ingen spårande GC
-används. Poolen kan fyllas av levande värden, metadata och fragmentering;
-se [minneskontraktet](memory.md).
+Literalerna ligger i programbilden. Dynamiska strängar delar minnespool med
+arrayer och frigörs när sista ägaren försvinner. Sammanslagning, snitt och
+konvertering av heltal eller runor skapar nya strängar. Temporärer behåller
+sina värden över senare sidoeffekter i samma uttryck. `.bytes()` och `.runes()`
+behåller sina ursprungliga element om källsträngen ersätts under iterationen.
 
-Runtimefel: 103 för ogiltiga index eller intervall, 105 för full arena eller
-misslyckad mappning, 106 för snitt mitt i en UTF-8-sekvens eller ogiltigt
-`rune(number)`. Kompilering och körning använder fortfarande ingen extern
-kompilator, länkare, signerare eller strängruntime.
+Ogiltiga index och intervall ger status 103. Strängoperatorerna ger 105 vid
+misslyckad allokering och 106 för ett snitt mitt i en UTF-8-sekvens eller
+ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
 
 ## Nästa språkbeslut
 

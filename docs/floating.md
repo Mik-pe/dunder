@@ -107,22 +107,22 @@ samma flyttal. `0.1` skrivs som `0.1` för båda typerna. Fast notation får
 16 använder exponentform, exempelvis `1e-5` och `1e+20`. Specialvärden
 skrivs `nan`, `inf`, `-inf`, `0.0` och `-0.0`.
 
-Återläsningen verifieras mot Rusts oberoende flyttalsparser; Dunder har
+Återläsningen verifieras med Pythons flyttalsparser och binärrepresentation; Dunder har
 ännu ingen sträng-till-flyttal-parser. Formatbredd och valbar precision är
 inte implementerade. Formatteraren prioriterar korrekthet och använder
 exakt heltalsarbete; den har ännu inget uppmätt prestandamål.
-Utskriftssträngar använder den återanvändbara 16 MiB strängpoolen.
+Utskriftssträngar använder den delade heapen.
 Direkt utskrift frigör sin formatteringssträng efter skrivningen;
 `.str()` returnerar ett referensräknat värde. Se [minnesmodellen](memory.md).
 
 ## Körda program och gränser
 
 ```sh
-cargo run --release -- run dogfood/numeric/main.ddr
+dunder run dogfood/numeric/main.ddr
 # 5.0
 # 2.0
 # true
-cargo run --release -- test dogfood/numeric/main.ddr
+dunder test dogfood/numeric/main.ddr
 # 7 passed, 0 failed
 ```
 

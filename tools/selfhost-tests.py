@@ -10,7 +10,7 @@ import tempfile
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", help="executable produced by dunder-ddr build-tests")
+    parser.add_argument("suite", help="executable produced by dunder build-tests")
     parser.add_argument("--timeout", type=float, default=5.0, help="seconds per group")
     args = parser.parse_args()
     if args.timeout <= 0:

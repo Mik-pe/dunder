@@ -7,11 +7,12 @@ per team. Projektet har eget manifest, parser, rapportmodul och tester.
 Bygg Dunder i reporoten och kör sedan projektet:
 
 ```sh
-cargo build --release
+dunder_bin="$(./tools/bootstrap.sh)"
+export PATH="$(dirname "$dunder_bin"):$PATH"
 cd projects/tabell
-../../target/release/dunder run -- expenses.csv team cents
-../../target/release/dunder test
-../../target/release/dunder build
+dunder run -- expenses.csv team cents
+dunder test
+dunder build
 ```
 
 Exemplet skriver samma CSV som [expected.csv](expected.csv):
@@ -27,7 +28,7 @@ Den byggda binären kan flyttas och köras utan Dunder eller projektets källfil
 
 ```sh
 ./build/x86_64-linux/tabell expenses.csv team cents
-../../target/release/dunder build --target arm64-linux -o build/tabell-arm64
+dunder build --target arm64-linux -o build/tabell-arm64
 ```
 
 På macOS är standardkatalogen `build/arm64-macos`; på ARM64/Linux är den
@@ -55,15 +56,13 @@ På macOS är standardkatalogen `build/arm64-macos`; på ARM64/Linux är den
 ## Gränser och dogfooding
 
 `sys.read_text` begränsar indata till 4 MiB UTF-8. CSV läses en post åt gången
-från den inlästa texten. Dunders nuvarande processarenor återvinner inte
-enskilda strängar eller dynamiska buffertar; många små fält kan därför nå
-minnesgränsen innan filgränsen. Tabell är ännu inget verktyg för stora dataflöden.
+från den inlästa texten. Grupper och ackumulerade summor lever tills rapporten skrivits. Tabell är ännu inget verktyg för stora dataflöden.
 
 Projektet provar punktseparerade modulnamn utan citattecken, mutable borrows,
 structreturer med dynamiska fält, UTF-8-bytebuffertar, map, strängsortering,
 programargument, fil-I/O och separata stdout/stderr. Parserns och rapportens
 taggade tester finns nära funktionerna. Kompilatorns integrationstest
-`tests/tabell.rs` jämför dessutom riktiga CLI-körningar med en oberoende referens.
+[`tools/test-tabell.py`](../../tools/test-tabell.py) jämför dessutom riktiga CLI-körningar med en oberoende referens.
 
 Tabell byggs också av den [självbyggda Dunder-kompilatorn](../../selfhost/README.md).
 Stage 3 kompilerar projektet till ARM64/Linux; binären körs under QEMU och

@@ -1,5 +1,7 @@
 # Runtime före och efter optimering
 
+Historisk rapport. Kommandon och verktygssökvägar i rapporten avser [deb48dd](https://github.com/Mik-pe/dunder/tree/deb48dd).
+
 `tools/runtime-bench.rs` jämför två Dunder-kompilatorer med samma frysta
 källor, körningsindata och säkerhetsregler. Mätverktyget är Rust/std och
 ingår inte i Dunders byggväg. Dunderbyggen och de färdiga programmen körs

@@ -1,5 +1,7 @@
 # Compiler and agent measurements, 2026-11-10
 
+Historical report. Reproduction commands and tool paths below refer to [deb48dd](https://github.com/Mik-pe/dunder/tree/deb48dd).
+
 Measured on an Apple M5 with 24 GiB RAM, macOS 27.2 (26B123), ARM64. Each series has 30 measured rounds. Benchmark series ran sequentially while other team compilation and VM test workloads were idle. Ordinary desktop background activity remained present.
 
 ## Full compilation

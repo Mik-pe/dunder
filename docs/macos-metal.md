@@ -13,15 +13,15 @@ Delegaten registrerar vanliga Dunder-funktioner som callbacks. Ett giltigt
 `open` laddar AppKit, QuartzCore och Metal genom `std.dl`. Apples
 Metal-runtime kompilerar då den fasta MSL-shadern.
 
-Kör från en inloggad grafisk macOS-session på Apple Silicon:
+Kör från repositoryts rot i en inloggad grafisk macOS-session på Apple Silicon.
 
 Fönsteranrop kräver målet `arm64-macos`. Geometrihjälparna kan användas även
 vid kompilering för Linux; ett nåbart fönsteranrop ger då ett målrelaterat fel.
 
 ```sh
-cargo build --release
-./target/release/dunder run dogfood/metal/triangle.ddr
-./target/release/dunder run dogfood/metal/main.ddr
+dunder="$(tools/bootstrap.sh)"
+"$dunder" run dogfood/metal/triangle.ddr
+"$dunder" run dogfood/metal/main.ddr
 ```
 
 Atlas-exemplet har följande kontroller:
@@ -41,9 +41,9 @@ det här API:t innehåller ännu ingen textlayout eller uppsättning UI-kontroll
 För ett begränsat röktest skickas programmets argument efter `--`:
 
 ```sh
-./target/release/dunder run dogfood/metal/triangle.ddr -- --frames 3
-./target/release/dunder run dogfood/metal/main.ddr -- --frames 120
-./target/release/dunder test dogfood/metal/main.ddr
+"$dunder" run dogfood/metal/triangle.ddr -- --frames 3
+"$dunder" run dogfood/metal/main.ddr -- --frames 120
+"$dunder" test dogfood/metal/main.ddr
 ```
 
 `--frames N` är Dunder-kod i `dogfood/metal/options.ddr`. Det avslutar efter N
@@ -56,7 +56,7 @@ Retina-mått, gamla handtag, felaktig geometri och GPU-räknare. Låt fönstren
 arbeta ostört; framgång skriver `lifecycle cycles=3`:
 
 ```sh
-./target/release/dunder run dogfood/metal/lifecycle.ddr
+"$dunder" run dogfood/metal/lifecycle.ddr
 ```
 
 Händelsetestet ändrar storleken på sitt eget NSWindow och köar tangenttryck
@@ -64,15 +64,25 @@ och press-, drag- och släpphändelser i programmets egen AppKit-kö. Det provar
 Retina-geometri, händelseordning, pekarkoordinater och stängningscallbacken.
 
 ```sh
-./target/release/dunder run dogfood/metal/events.ddr
+"$dunder" run dogfood/metal/events.ddr
 ```
 
 En vanlig `.app` kan byggas utan projektgenerator:
 
 ```sh
-./target/release/dunder build dogfood/metal/main.ddr --app -o build/DunderMetal.app
+"$dunder" build dogfood/metal/main.ddr --app -o build/DunderMetal.app
 open build/DunderMetal.app
 ```
+
+Kör hela kontrollen med den byggda kompilatorn i samma terminal.
+
+```sh
+python3 tools/test-native.py "$dunder" --graphics
+```
+
+Kontrollen ritar tre bildrutor vardera med triangeln och Atlas, öppnar och
+stänger fönster och kör AppKit-händelser genom programmets kö. Den verifierar
+också apppaketets signatur med macOS `codesign`.
 
 ## Fönster och resultat
 

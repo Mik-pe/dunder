@@ -11,7 +11,7 @@ diagnostik. Det driver importer utan citattecken, strängsortering och stderr.
 Kör hela testsamlingen från reporoten:
 
 ```sh
-cargo run --release -- test
+dunder test
 # 59 testgrupper i det sammanslagna trädet
 ```
 
@@ -19,9 +19,9 @@ Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
 program och deras tester går också att köra direkt:
 
 ```sh
-cargo run --release -- run dogfood/structs.ddr
-cargo run --release -- test dogfood/geometry.ddr
-cargo run --release -- test dogfood/parameter_cases.ddr
+dunder run dogfood/structs.ddr
+dunder test dogfood/geometry.ddr
+dunder test dogfood/parameter_cases.ddr
 ```
 
 Med kompilatorn kopierad till `build/dunder` används samma kommandon som

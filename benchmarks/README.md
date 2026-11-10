@@ -1,10 +1,12 @@
 # Lokala byggmätningar
 
+Historisk rapport. Kommandon och verktygssökvägar i rapporten avser [deb48dd](https://github.com/Mik-pe/dunder/tree/deb48dd).
+
 Runtime har en separat [före/efter-svit](runtime/README.md) för numerik,
 arrayläsning, UTF-8-text och sortering. Den mäter optimerad maskinkod med
 samma källor och säkerhetskontroller, med 30 varv per variant.
 
-Mätverktyget är [tools/compile-bench.rs](../tools/compile-bench.rs), ett separat
+Mätverktyget är [tools/compile-bench.rs](https://github.com/Mik-pe/dunder/blob/deb48dd/tools/compile-bench.rs), ett separat
 Rust/std-program för mätning utanför kompilatorprocessen. Det ingår inte i
 Dunders byggväg. Enligt [agentregeln](../AGENTS.md) körs ingen GitHub-CI.
 
