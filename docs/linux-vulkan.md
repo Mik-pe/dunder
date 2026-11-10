@@ -1,12 +1,14 @@
 # Vulkan på Linux
 
-`import std.vulkan as vulkan` ritar färgade triangelistor med Vulkan.
-Scen, geometri, animation, programargument och inmatningslogik är Dunder-kod.
-Exemplen motsvarar Metal-dogfoodens triangel och Kinetic Atlas.
+Programmen i `dogfood/vulkan/` importerar grafikbiblioteket med
+`import ..graphics.vulkan as vulkan`. Ingången är
+[dogfood/graphics/vulkan.ddr](../dogfood/graphics/vulkan.ddr). Ett eget
+projekt kan kopiera `vulkan.ddr` och dess syskonkatalog `vulkan/` till
+`graphics/` bredvid sin `main.ddr` och använda `import graphics.vulkan as vulkan`.
 
-Dunder skriver själv nativekod och en dynamisk ELF-fil för Linux. Den
-laddar systemets Vulkan-bibliotek genom `std.dl`. Implementationen i
-`stdlib/vulkan/` beskriver driverstrukturerna med `@c_layout` och anropar
+Biblioteket laddar systemets Vulkan-bibliotek genom `std.dl`.
+[Implementationen](../dogfood/graphics/vulkan/) beskriver
+driverstrukturerna med `@c_layout` och anropar
 Vulkan och SDL genom typade `extern fn`-fält. Modulen äger allokering,
 livscykel, rasteriseringens konfiguration och händelsehantering.
 SPIR-V-orden finns i `shader.ddr` tillsammans med GLSL-källorna i samma
@@ -61,7 +63,7 @@ följer fönstret och `pixel_width/pixel_height` anger Vulkan-bildens storlek.
 Capture använder en bestämd animationstid och skriver en binär PPM-bild
 (P6); den fungerar utan externa bildverktyg.
 
-## API
+## Exempelmodulens API
 
 `Window`, `OpenResult`, `Frame` och `DrawResult` följer Metal-API:ts form.
 Vulkan-modulens typer är egna nominella typer.

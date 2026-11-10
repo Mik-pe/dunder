@@ -38,7 +38,8 @@ inga Blixt-filer. Inga ytterligare compiler-/runtimefel reproducerades i arbetet
   `std.hash`, `std.bytes`, `std.sha256`, `std.parse` och sys. Map har strängnycklar
   och i64-värden, set innehåller strängar. Modulerna är inbäddade och importeras
   utan suffix. Hashning, sondering, omhashning och algoritmer är Dunder-kod.
-- `std.macos`: ett native AppKit-fönster med CAMetalLayer, färgad
+- Exempelmodulen `dogfood/graphics/macos.ddr` öppnar ett AppKit-fönster
+  med CAMetalLayer och ger en färgad
   Metal-triangelista, händelsepollning, logiska pekarkoordinater och backing
   scale. Publika fönsterhandtag är validerade generations-ID:n. AppKit-delegaten och Metal-kommandona
   är Dunder-kod med typade C-anrop och callbacks.
@@ -336,7 +337,7 @@ arena-dogfood använder indexhandtag. Se [enumreglerna](enums.md).
 sys stöder macOS/ARM64 och Linux på ARM64/x86-64. Textläsning kräver vanliga UTF-8-filer,
 högst 4 MiB per fil, och delar strängarenans 16 MiB. Binärläsning, kataloglistning,
 rekursiva katalogverktyg och filströmmar återstår. Se [sys-kontraktet](sys.md).
-macOS-/Metal-API:t stöder tills vidare ett aktivt fönster och den fasta
+Metal-exempelmodulen stöder tills vidare ett aktivt fönster och den fasta
 färgpipelinen. Textlayout, nativekontroller, egen shaderkod och flerfönsterstöd
 återstår. Det kräver en grafisk macOS-session; `--frames` är ett begränsat
 fönsterprov och inget headless-läge. Se [grafikkontraktet](macos-metal.md).

@@ -5,6 +5,9 @@ use crate::check::{Expr, Program};
 use crate::syntax::Type;
 use crate::target::Target;
 
+// Six suspended runtime registers followed by the originating thread token.
+pub(super) const CALLBACK_CONTEXT_BYTES: usize = 7 * 8;
+
 #[derive(Default)]
 pub(crate) struct Imports {
     pub libraries: Vec<String>,
@@ -340,8 +343,6 @@ impl Code<'_> {
             .collect();
     }
 
-    // First two private globals belong to the graphics libraries. The callback
-    // context starts two words later and is valid on the originating thread.
     fn thread_token(&mut self) {
         // Darwin keeps its pthread address in TPIDRRO_EL0, with low bits
         // reserved. Linux uses TPIDR_EL0 (FS:0 for the SysV lowerer).
@@ -353,7 +354,7 @@ impl Code<'_> {
         }
     }
     fn callback_context(&mut self, reg: u32) {
-        self.data_slot(self.import_count + 2, reg);
+        self.data_slot(self.import_count, reg);
     }
     pub(super) fn callback_entries(&mut self, program: &Program) {
         for (i, function) in program.functions.iter().enumerate() {
@@ -365,7 +366,7 @@ impl Code<'_> {
             if x86 {
                 // Enter SysV with native registers, reacquire Dunder's virtual
                 // register bank and suspended value stack, capture caller SP in x14.
-                self.emit(0xfd000000 | (self.import_count + 2) as u32);
+                self.emit(0xfd000000 | self.import_count as u32);
             } else {
                 self.emit(0x910003ee); // mov x14,sp (incoming stack arguments)
             }

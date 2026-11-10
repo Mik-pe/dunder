@@ -1,3 +1,13 @@
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/graphics.rs"]
+mod graphics;
+
 #[test]
 fn bundled_standard_library_matches_its_sources() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -529,6 +539,34 @@ mod native {
     impl Drop for Work {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn graphics_bindings_are_project_modules_in_both_compilers() {
+        let work = Work::new();
+        let selfhost = work.bootstrap();
+        super::graphics::install(&work.0);
+        fs::rename(work.0.join("graphics"), work.0.join("drivers")).unwrap();
+        let source = work.0.join("main.ddr");
+        let output = work.0.join("app");
+        for compiler in [Path::new(env!("CARGO_BIN_EXE_dunder")), selfhost.as_path()] {
+            for name in ["vulkan", "macos"] {
+                fs::write(&source, format!("import std.{name}\nfn main(){{}}\n")).unwrap();
+                let result = work.invoke_build(Command::new(compiler), &source, &output);
+                assert!(!result.status.success(), "unexpected built-in std.{name}");
+                assert!(String::from_utf8_lossy(&result.stderr).contains(&format!("{name}.ddr")));
+            }
+            fs::write(
+                &source,
+                r#"import drivers.macos as metal
+import drivers.vulkan as vk
+fn main(){ assert(metal.rgb(1.0,0.0,0.0).alpha == vk.rgb(1.0,0.0,0.0).alpha) }
+"#,
+            )
+            .unwrap();
+            let result = work.invoke_build(Command::new(compiler), &source, &output);
+            success("building with project-local graphics modules", &result);
         }
     }
 

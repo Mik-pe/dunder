@@ -1,12 +1,13 @@
 # macOS och Metal från Dunder
 
-`import std.macos as macos` öppnar ett vanligt AppKit-fönster och ritar
-en triangelista med Metal. Programmet kompileras direkt till en ARM64 Mach-O.
-Fönsterloopen, tillståndet, inmatningslogiken, geometrin och animationsmatematiken
-i exemplen är Dunder-kod.
+Programmen i `dogfood/metal/` använder `import ..graphics.macos as macos`
+för att öppna ett AppKit-fönster och rita en triangelista med Metal.
+Ingången är [dogfood/graphics/macos.ddr](../dogfood/graphics/macos.ddr).
+Ett eget projekt kan kopiera `macos.ddr` och dess syskonkatalog `macos/`
+till `graphics/` bredvid sin `main.ddr` och använda `import graphics.macos as macos`.
 
 AppKit-delegaten, händelsepollningen och Metal-kommandona ligger i
-`stdlib/macos/{appkit,objc,renderer}.ddr`. Objective-C-anrop har typade
+[exempelmodulens källfiler](../dogfood/graphics/macos/). Objective-C-anrop har typade
 C-signaturer, inklusive CoreGraphics-värden som passerar i flyttalsregister.
 Delegaten registrerar vanliga Dunder-funktioner som callbacks. Ett giltigt
 `open` laddar AppKit, QuartzCore och Metal genom `std.dl`. Apples

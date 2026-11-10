@@ -1305,8 +1305,10 @@ fn plan_static_storage(
     reachable: &[bool],
 ) -> Result<usize, String> {
     let imports = code.import_count;
-    // Reserve image cells used by native runtime bookkeeping and callback entry.
-    let mut offset = (imports + if code.has_callbacks { 9 } else { 2 }) * 8;
+    let mut offset = imports * 8;
+    if code.has_callbacks {
+        offset += ffi::CALLBACK_CONTEXT_BYTES;
+    }
     for (index, function) in program.functions.iter().enumerate() {
         if !reachable[index] {
             continue;
@@ -1519,10 +1521,10 @@ fn compile_cached(
         }
         Target::Arm64Macos => macho(&text),
         Target::Arm64Linux if dynamic => {
-            elf::dynamic_executable(&text, 183, &imports, global_bytes.max(4096))
+            elf::dynamic_executable(&text, 183, &imports, global_bytes)
         }
         Target::X86_64Linux if dynamic => {
-            elf::dynamic_executable(&text, 62, &imports, global_bytes.max(4096))
+            elf::dynamic_executable(&text, 62, &imports, global_bytes)
         }
         Target::Wasm32 => unreachable!("wasm32 uses its structured backend"),
         Target::Arm64Linux => elf::executable(&text, 183),

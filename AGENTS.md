@@ -7,6 +7,13 @@ Routine work does not need a feature branch, pull request, or another
 permission round. Keep local verification proportional to the change.
 Preserve existing work in other checkouts.
 
+## Graphics dogfood
+
+Keep graphics API bindings, shaders and window logic with the examples under
+`dogfood/`. Exercise the same file imports and FFI available to external
+projects. When an example exposes a missing language or compiler feature,
+implement and test the general mechanism in the toolchain.
+
 ## Use subagents
 
 Use subagents for independent research, implementation, and verification

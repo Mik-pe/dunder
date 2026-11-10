@@ -1,3 +1,6 @@
+#[path = "support/graphics.rs"]
+mod graphics;
+
 use std::{
     fs,
     path::PathBuf,
@@ -16,6 +19,7 @@ impl Project {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        graphics::install(&path);
         Self(path)
     }
     fn checked(&self, source: &str) -> dunder::modules::Checked {
@@ -158,8 +162,8 @@ fn vulkan_types_are_nominal_and_legacy_intrinsics_are_unavailable() {
     let project = Project::new();
     fs::write(project.0.join("vulkan.ddr"), "pub fn answer()->i32{42}").unwrap();
     let checked = project.checked(r#"
-import std.vulkan as vk
-import std.vulkan as other
+import graphics.vulkan as vk
+import graphics.vulkan as other
 import .vulkan as local
 fn main(){color:other.Color=vk.rgb(1.0,0.0,0.0);window:other.Window=vk.Window{id:0};print(color.alpha==1.0);print(window.id);print(local.answer())}
 "#);
@@ -168,18 +172,23 @@ fn main(){color:other.Color=vk.rgb(1.0,0.0,0.0);window:other.Window=vk.Window{id
             .sources
             .files
             .iter()
-            .filter(|s| s.path.to_string_lossy() == "<stdlib/vulkan.ddr>")
+            .filter(|s| s.path
+                == project
+                    .0
+                    .join("graphics/vulkan.ddr")
+                    .canonicalize()
+                    .unwrap())
             .count(),
         1
     );
     for (source, code) in [
-        ("import std.vulkan as vk\nfn main(){r:=vk.open_headless(1,true)}", "E0201"),
-        ("import std.vulkan as vk\nfn main(){r:=vk.open_headless(1)}", "E0207"),
-        ("import std.vulkan as vk\nfn main(){r:=vk.poll(0)}", "E0201"),
-        ("import std.vulkan as vk\nfn main(){w:=vk.Window{id:0};var v:[]f64=[];r:=vk.draw(w,&v,0.0,0.0,0.0)}", "E0201"),
-        ("import std.vulkan as vk\nfn main(){r:i32=vk.close(vk.Window{id:0})}", "E0201"),
+        ("import graphics.vulkan as vk\nfn main(){r:=vk.open_headless(1,true)}", "E0201"),
+        ("import graphics.vulkan as vk\nfn main(){r:=vk.open_headless(1)}", "E0207"),
+        ("import graphics.vulkan as vk\nfn main(){r:=vk.poll(0)}", "E0201"),
+        ("import graphics.vulkan as vk\nfn main(){w:=vk.Window{id:0};var v:[]f64=[];r:=vk.draw(w,&v,0.0,0.0,0.0)}", "E0201"),
+        ("import graphics.vulkan as vk\nfn main(){r:i32=vk.close(vk.Window{id:0})}", "E0201"),
         ("fn main(){__vulkan_open_headless(16,16)}", "E0205"),
-        ("import std.vulkan as vk\nfn main(){__vulkan_pixels(vk.Window{id:0})}", "E0205"),
+        ("import graphics.vulkan as vk\nfn main(){__vulkan_pixels(vk.Window{id:0})}", "E0205"),
     ] { project.rejects(source, code); }
     fs::write(
         project.0.join("vulkan.ddr"),
@@ -192,12 +201,12 @@ fn main(){color:other.Color=vk.rgb(1.0,0.0,0.0);window:other.Window=vk.Window{id
 #[test]
 fn geometry_and_unreachable_vulkan_calls_remain_portable_and_static() {
     let project = Project::new();
-    let geometry = r#"import std.vulkan as vk
+    let geometry = r#"import graphics.vulkan as vk
 fn main(){var v:[]f32=[];vk.quad(&mut v,-1.0,-1.0,2.0,2.0,vk.rgb(1.0,0.0,0.0));print(v.len)}"#;
     for target in Target::NATIVE {
         let geometry_image = project.compile(geometry, target);
         let plain = project.compile("fn main(){print(42)}", target);
-        let unused = project.compile("import std.vulkan as vk\nfn unused(){r:=vk.open_headless(16,16)}\nfn main(){print(42)}", target);
+        let unused = project.compile("import graphics.vulkan as vk\nfn unused(){r:=vk.open_headless(16,16)}\nfn main(){print(42)}", target);
         assert_eq!(unused, plain, "unreachable Vulkan changed {target}");
         if target != Target::Arm64Macos {
             assert!(!elf_segments(&geometry_image)
@@ -211,7 +220,7 @@ fn main(){var v:[]f32=[];vk.quad(&mut v,-1.0,-1.0,2.0,2.0,vk.rgb(1.0,0.0,0.0));p
 fn linux_vulkan_images_resolve_native_imports_without_a_build_toolchain() {
     let project = Project::new();
     let source =
-        "import std.vulkan as vk\nfn main(){r:=vk.open_headless(16,16);vk.close(r.window)}";
+        "import graphics.vulkan as vk\nfn main(){r:=vk.open_headless(16,16);vk.close(r.window)}";
     for (target, machine, interpreter) in [
         (Target::X86_64Linux, 62, "/lib64/ld-linux-x86-64.so.2"),
         (Target::Arm64Linux, 183, "/lib/ld-linux-aarch64.so.1"),
@@ -279,7 +288,7 @@ fn native_requested() -> bool {
 ))]
 fn missing_vulkan_driver_is_a_recoverable_error_without_publishing_a_handle() {
     let output = Project::new().execute_with(
-        r#"import std.vulkan as vk
+        r#"import graphics.vulkan as vk
 fn main(){
     for i in 0..2 {
         result:=vk.open_headless(16,16)
@@ -309,7 +318,7 @@ fn lavapipe_pixels_prove_clear_geometry_orientation_interpolation_and_alpha() {
         return;
     }
     let output = Project::new().execute(r#"
-import std.vulkan as vk
+import graphics.vulkan as vk
 fn main(){
     opened:=vk.open_headless(64,48)
     if !opened.ok {print(opened.error);assert(false)}
@@ -351,7 +360,7 @@ fn lavapipe_lifecycle_rejects_invalid_handles_sizes_geometry_and_nonfinite_value
         return;
     }
     let output = Project::new().execute(r#"
-import std.vulkan as vk
+import graphics.vulkan as vk
 fn main(){
     invalid0:=vk.open_headless(0,16);assert(!invalid0.ok&&invalid0.error.len>0)
     invalid1:=vk.open_headless(16,-1);assert(!invalid1.ok)
@@ -400,7 +409,7 @@ fn active_lavapipe_threads_exit_with_main_and_with_runtime_traps() {
     }
     for (ending, status) in [("return 7", 7), ("assert(false); 0", 104)] {
         let source = format!(
-            r#"import std.vulkan as vk
+            r#"import graphics.vulkan as vk
 fn main()->i32 {{
     opened:=vk.open_headless(32,24)
     if !opened.ok {{print(opened.error);return 1}}
@@ -426,7 +435,7 @@ fn sdl_surface_and_events_round_trip_through_the_public_window_api() {
     }
     let result = Project::new().execute_with(
         r#"capability unsafe
-import std.vulkan as vk
+import graphics.vulkan as vk
 
 @extern("libSDL2-2.0.so.0", "SDL_GetWindowFromID")
 unsafe fn find_window(id: u32) -> ptr

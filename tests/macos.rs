@@ -1,3 +1,6 @@
+#[path = "support/graphics.rs"]
+mod graphics;
+
 use std::{
     fs,
     path::PathBuf,
@@ -16,6 +19,7 @@ impl Project {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        graphics::install(&path);
         Self(path)
     }
 
@@ -117,8 +121,8 @@ fn macos_public_api_keeps_type_and_module_boundaries() {
     project.write("macos.ddr", "pub fn answer()->i32{42}");
     let checked = project.checked(
         r#"
-import std.macos as macos
-import std.macos as other
+import graphics.macos as macos
+import graphics.macos as other
 import .macos as local
 fn main(){
     color:other.Color=macos.rgb(1.0,0.0,0.0)
@@ -131,48 +135,48 @@ fn main(){
 
     for (source, code) in [
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){macos.open("title",100,true)}"#,
             "E0201",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){macos.open("title",100)}"#,
             "E0207",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){macos.poll(0)}"#,
             "E0201",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){w:=macos.Window{id:0};var vertices:[]f64=[];macos.draw(w,&vertices,0.0,0.0,0.0)}"#,
             "E0201",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){w:=macos.Window{id:0};x:i32=macos.close(w)}"#,
             "E0201",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){__macos_open("title",100,100)}"#,
             "E0205",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){__macos_poll(macos.Window{id:0})}"#,
             "E0205",
         ),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){var vertices:[]f32=[];__macos_draw(macos.Window{id:0},&vertices,0.0,0.0,0.0)}"#,
             "E0205",
         ),
         ("fn main(){__macos_close(0)}", "E0205"),
         (
-            r#"import std.macos as macos
+            r#"import graphics.macos as macos
 fn main(){macos.__macos_open("title",100,100)}"#,
             "E0404",
         ),
@@ -191,10 +195,10 @@ fn main(){macos.__macos_open("title",100,100)}"#,
 fn geometry_and_unreachable_window_calls_keep_the_existing_no_import_image() {
     let project = Project::new();
     let baseline = project.compile("fn main(){print(42)}");
-    let unused_import = project.compile("import std.macos as macos\nfn main(){print(42)}");
+    let unused_import = project.compile("import graphics.macos as macos\nfn main(){print(42)}");
     let unused_window = project.compile(
         r#"
-import std.macos as macos
+import graphics.macos as macos
 fn unused(){result:=macos.open("unused",100,100);macos.close(result.window)}
 fn main(){print(42)}
 "#,
@@ -204,7 +208,7 @@ fn main(){print(42)}
 
     let geometry = project.compile(
         r#"
-import std.macos as macos
+import graphics.macos as macos
 fn main(){
     var vertices:[]f32=[]
     macos.quad(&mut vertices,-1.0,-1.0,2.0,2.0,macos.rgba(0.2,0.3,0.4,0.5))
@@ -226,12 +230,12 @@ fn main(){
 fn reachable_window_calls_add_only_the_required_dynamic_imports() {
     let project = Project::new();
     for source in [
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn main(){result:=macos.open("invalid size",0,0);print(result.ok)}"#,
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn poll()->bool{macos.poll(macos.Window{id:0}).closed}
 fn main(){print(poll())}"#,
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn main(){f:fn(macos.Window)=macos.close;f(macos.Window{id:0})}"#,
     ] {
         let image = project.compile(source);
@@ -276,7 +280,7 @@ fn invalid_handles_report_closed_and_no_key_and_close_is_idempotent_without_appk
     let project = Project::new();
     let output = project.execute(
         r#"
-import std.macos as macos
+import graphics.macos as macos
 fn main(){
     handles:[i64;5]=[0,-1,1,65536,9223372036854775807]
     var vertices:[]f32=[]
@@ -309,7 +313,7 @@ fn invalid_dimensions_are_rejected_before_loading_appkit() {
     let project = Project::new();
     let output = project.execute(
         r#"
-import std.macos as macos
+import graphics.macos as macos
 fn reject(width:i32,height:i32){
     result:=macos.open("must not initialize AppKit",width,height)
     assert(!result.ok&&result.window.id==0)
@@ -335,14 +339,14 @@ fn reachable_native_window_apis_reject_both_linux_targets_with_a_clear_error() {
     use dunder::target::Target;
     let project = Project::new();
     for source in [
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn main(){result:=macos.open("unavailable",0,0);print(result.ok)}"#,
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn poll()->bool{macos.poll(macos.Window{id:0}).closed}
 fn main(){print(poll())}"#,
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn main(){var vertices:[]f32=[];drawn:=macos.draw(macos.Window{id:0},&vertices,0.0,0.0,0.0);print(drawn.ok)}"#,
-        r#"import std.macos as macos
+        r#"import graphics.macos as macos
 fn main(){close:fn(macos.Window)=macos.close;close(macos.Window{id:0})}"#,
     ] {
         let checked = project.checked(source);
@@ -363,7 +367,7 @@ fn pure_geometry_with_unreachable_window_apis_compiles_for_both_linux_targets() 
     let project = Project::new();
     let checked = project.checked(
         r#"
-import std.macos as macos
+import graphics.macos as macos
 fn unused_window(){
     opened:=macos.open("unreachable",100,100)
     frame:=macos.poll(opened.window)

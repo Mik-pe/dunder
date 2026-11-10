@@ -1,9 +1,11 @@
 // Rebuild cache keys whenever compiler or bundled runtime inputs change.
 use std::{
     collections::hash_map::DefaultHasher,
+    env,
+    fmt::Write,
     fs,
     hash::{Hash, Hasher},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 fn fingerprint(path: &Path, hash: &mut DefaultHasher) {
@@ -23,6 +25,19 @@ fn fingerprint(path: &Path, hash: &mut DefaultHasher) {
 }
 
 fn main() {
+    // The selfhost embedder reads the same list of shipped modules.
+    let mut table = String::from("&[\n");
+    for name in include_str!("stdlib/modules.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        writeln!(table, r#"    ("{name}", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/stdlib/{name}.ddr"))),"#).unwrap();
+    }
+    table.push_str("]\n");
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    fs::write(output.join("standard_modules.rs"), table).unwrap();
+
     let mut hash = DefaultHasher::new();
     for input in [
         "Cargo.toml",

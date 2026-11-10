@@ -12,7 +12,7 @@ Kör hela testsamlingen från reporoten:
 
 ```sh
 cargo run --release -- test
-# 58 testgrupper i det sammanslagna trädet
+# 59 testgrupper i det sammanslagna trädet
 ```
 
 Manifestets `test_root = "dogfood/tests.ddr"` väljer testträdet. Enskilda
@@ -106,8 +106,18 @@ testgrupper. Kör `dunder test dogfood/numeric/main.ddr`.
 Även [flyttalsutskriften](../runtime/float.ddr) är skriven i Dunder och
 kompileras in i program som skriver flyttal. Se [reglerna](../docs/floating.md).
 
-[metal/scene.ddr](metal/scene.ddr) och [metal/math.ddr](metal/math.ddr) driver
-nativegrafikstödet. Fyra grupper i huvudträdet testar geometrihjälparnas
+Grafikexemplen importerar vanliga källfiler relativt den importerande
+filen. Från `metal/` leder `import ..graphics.macos as macos` till
+[graphics/macos.ddr](graphics/macos.ddr). Från `vulkan/` leder
+`import ..graphics.vulkan as vulkan` till [graphics/vulkan.ddr](graphics/vulkan.ddr).
+Ett eget projekt kan lägga samma modulfiler och deras underkataloger i
+`graphics/` bredvid sin `main.ddr` och använda `import graphics.macos as macos`
+eller `import graphics.vulkan as vulkan`. Webbläsarexemplet använder en
+separat [WebGPU-värd](webgpu/README.md) och delar triangeldatan med
+nativeexemplen.
+
+[metal/scene.ddr](metal/scene.ddr) och [metal/math.ddr](metal/math.ddr)
+bygger Atlas-scenens geometri och animation. Fyra grupper i huvudträdet testar geometrihjälparnas
 vertexlayout, scenens ändliga triangelista och återanvända lagring,
 paus/palett/dragning samt sinus/cosinus i Dunder. De öppnar inget fönster.
 `dunder test dogfood/metal/main.ddr` kör sju grupper inklusive delade sys-/

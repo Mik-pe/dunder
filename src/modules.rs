@@ -119,13 +119,13 @@ struct Loader {
     bundled: HashMap<String, usize>,
 }
 impl Loader {
-    fn standard(&mut self, name: &str) -> Result<usize, Error> {
+    fn standard(&mut self, name: &str, source: &str) -> Result<usize, Error> {
         if let Some(id) = self.bundled.get(name) {
             return Ok(*id);
         }
         let id = self.sources.files.len();
         self.bundled.insert(name.to_owned(), id);
-        let text = standard_source(name).unwrap().to_owned();
+        let text = source.to_owned();
         let module =
             syntax::parse_module_at(&text, &mut self.types, id).map_err(|e| e.in_file(id))?;
         self.sources.files.push(Source {
@@ -204,8 +204,9 @@ impl Loader {
                 )
                 .in_file(id));
             }
-            let target = if standard_source(logical_name(&import.path)).is_some() {
-                self.standard(logical_name(&import.path))?
+            let name = logical_name(&import.path);
+            let target = if let Some(source) = standard_source(name) {
+                self.standard(name, source)?
             } else {
                 let base = base.ok_or_else(|| {
                     Error::new(
@@ -254,31 +255,16 @@ fn logical_name(name: &str) -> &str {
         name
     }
 }
+const STANDARD_MODULES: &[(&str, &str)] =
+    include!(concat!(env!("OUT_DIR"), "/standard_modules.rs"));
+
 fn standard_source(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "sys" => include_str!("../stdlib/sys.ddr"),
-        "std/dl" => include_str!("../stdlib/dl.ddr"),
-        "std/array" => include_str!("../stdlib/array.ddr"),
-        "std/map" => include_str!("../stdlib/map.ddr"),
-        "std/set" => include_str!("../stdlib/set.ddr"),
-        "std/hash" => include_str!("../stdlib/hash.ddr"),
-        "std/text" => include_str!("../stdlib/text.ddr"),
-        "std/bytes" => include_str!("../stdlib/bytes.ddr"),
-        "std/sha256" => include_str!("../stdlib/sha256.ddr"),
-        "std/parse" => include_str!("../stdlib/parse.ddr"),
-        "std/fs" => include_str!("../stdlib/fs.ddr"),
-        "std/macos/objc" => include_str!("../stdlib/macos/objc.ddr"),
-        "std/macos/renderer" => include_str!("../stdlib/macos/renderer.ddr"),
-        "std/macos/appkit" => include_str!("../stdlib/macos/appkit.ddr"),
-        "std/macos" => include_str!("../stdlib/macos.ddr"),
-        "std/vulkan/api" => include_str!("../stdlib/vulkan/api.ddr"),
-        "std/vulkan/layout" => include_str!("../stdlib/vulkan/layout.ddr"),
-        "std/vulkan/state" => include_str!("../stdlib/vulkan/state.ddr"),
-        "std/vulkan/device" => include_str!("../stdlib/vulkan/device.ddr"),
-        "std/vulkan/sdl" => include_str!("../stdlib/vulkan/sdl.ddr"),
-        "std/vulkan/pipeline" => include_str!("../stdlib/vulkan/pipeline.ddr"),
-        "std/vulkan/shader" => include_str!("../stdlib/vulkan/shader.ddr"),
-        "std/vulkan" => include_str!("../stdlib/vulkan.ddr"),
-        _ => return None,
-    })
+    let name = if name == "sys" {
+        name
+    } else {
+        name.strip_prefix("std/")?
+    };
+    STANDARD_MODULES
+        .iter()
+        .find_map(|&(module, source)| (module == name).then_some(source))
 }

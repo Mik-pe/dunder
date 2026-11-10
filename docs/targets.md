@@ -22,8 +22,9 @@ target/release/dunder build examples/hello.ddr --target wasm32
 Utdata går till `build/<target>/<name>` om `-o` saknas. Wasm-filer får ändelsen `.wasm`. Samma regler gäller
 projekt med `dunder.toml`. Rusts vanliga tripplar `aarch64-apple-darwin`,
 `aarch64-unknown-linux-gnu` och `x86_64-unknown-linux-gnu` accepteras också som
-alias. Vanliga Linuxbinärer behöver inte glibc; Vulkan-program använder
-systemets dynamiska loader och grafikbibliotek.
+alias. Vanliga Linuxbinärer använder direkta systemanrop. Program med
+nåbara externa anrop använder systemets dynamiska loader och de bibliotek
+som programmet deklarerar.
 
 Alla fyra mål ingår i samma kompilator. Dunderbyggen behöver inga installerade
 målpaket, headers, sysroot, C-kompilatorer, LLVM, assemblers, länkare eller
@@ -93,9 +94,10 @@ interpreter eller emulator. Dess prestanda ska mätas separat från ARM64.
 Läs [maskinkodsoptimeringen](optimization.md) och dess mätunderlag.
 
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
-dynamisk laddare eller libc. Nåbara Vulkan-anrop väljer en egen dynamisk ELF
-med eager imports av libc- och loaderfunktioner, separata RX/RW-segment och
-ett native C-ABI. Vulkan-körning med lavapipe är verifierad på både
+dynamisk laddare eller libc. Nåbara `@extern`-deklarationer ger en dynamisk
+ELF med deklarerade bibliotek och symboler, separata RX/RW-segment och
+målets C-ABI. Vulkanexemplet använder dessa importer för att ladda och
+anropa grafiken. Vulkan-körning med lavapipe är verifierad på både
 ARM64/Linux och x86-64/Linux. Stacken är inte körbar och kodsegmentet
 är inte skrivbart. Linux-retur och runtimefel använder `exit_group` så att
 även grafikdrivrutinens arbetstrådar avslutas.

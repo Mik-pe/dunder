@@ -1,6 +1,7 @@
 # Standardbiblioteket
 
-Biblioteket är skrivet i Dunder och följer med kompilatorn. Importer som
+Biblioteket är skrivet i Dunder. [stdlib/modules.txt](../stdlib/modules.txt)
+anger vilka moduler som följer med kompilatorn. Importer som
 `import std.map as map` laddar inbäddad källkod utan installerade `.ddr`-filer
 eller suffix i importen. Endast explicita beroenden läses. Delade importer
 och alias har samma typidentitet. En lokal fil väljs med en uttrycklig
@@ -94,8 +95,8 @@ flyttar återstår. Ägda allokeringar återvinns automatiskt; se
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning och process-ID; se [sys](sys.md). |
-| `macos` / `std.macos` | Ett AppKit-fönster, Metal-triangelista, händelser och Dunder-skrivna geometrihjälpare; se [macOS/Metal](macos-metal.md). |
-| `std.vulkan` | Vulkan-triangelista på Linux, headless-rendering, RGBA-readback och SDL-fönster; se [Linux/Vulkan](linux-vulkan.md). |
+| `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
+| `std.fs` | Delegerade läs- och skrivhandtag till en fil. Se [filsystemets kapabiliteter](ffi.md). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel

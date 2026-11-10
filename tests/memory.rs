@@ -6,6 +6,10 @@
     )
 ))]
 
+#[cfg(target_os = "linux")]
+#[path = "support/graphics.rs"]
+mod graphics;
+
 use dunder::target::Target;
 use std::{
     fs,
@@ -378,9 +382,10 @@ fn repeated_vulkan_readback_snapshots_reclaim_owned_arrays() {
         return;
     }
     let project = Project::new();
+    graphics::install(&project.0);
     let binary = project.build(
         r#"
-import std.vulkan as vk
+import graphics.vulkan as vk
 fn main(){
  opened:=vk.open_headless(64,48)
  assert(opened.ok)

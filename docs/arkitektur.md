@@ -78,13 +78,27 @@ särskilt svår på vektoriserbara loopar.
 
 ## Verktygskedjan och målplattformarna
 
-Målen är `arm64-macos`, `arm64-linux` och `x86_64-linux`. Dunder äger parser,
+Native-målen är `arm64-macos`, `arm64-linux` och `x86_64-linux`.
+Det fjärde målet är `wasm32`. Dunder äger parser,
 typkontroll, kodgenerering, relokeringar, bildskrivning, macOS ad hoc-signering
 och byggdrivrutin. Ett vanligt Dunderbygge kör aldrig LLVM, GCC, en extern
 assembler, länkare eller signerare. Vanliga Linuxbilder använder direkta
-systemanrop utan libc. Nåbara Vulkan-anrop väljer i stället en egen dynamisk
-ELF med ett avgränsat C-ABI för systemets loader, Vulkan och SDL2.
-Externa verktyg får inspektera eller jämföra resultat i tester.
+systemanrop utan libc. Ett program med nåbara `@extern`-deklarationer får
+en dynamisk ELF med de bibliotek och symboler som deklarationerna anger.
+På Wasm blir deklarationerna typade värdimporter.
+
+Båda kompilatorerna bäddar in standardmodulerna som räknas upp i
+[stdlib/modules.txt](../stdlib/modules.txt). När självhostens inbäddade
+källtext regenereras läser [selfhost/embed.ddr](../selfhost/embed.ddr)
+samma lista. Vanliga filimporter löses på disk relativt den importerande filen.
+
+Grafikbindningarna följer med exempelprogrammens källkod. Dunder-modulerna
+i `dogfood/graphics/` beskriver bibliotekens C-layout, slår upp
+funktionspekare och äger fönster-, renderings- och händelselogiken. WebGPU-exemplet
+i `dogfood/webgpu/` anropar sin JavaScript-värd via en vanlig Wasm-import.
+Kompilatorns del av grafikanropen är det generella FFI-stödet och
+kodgenereringen för målet. Se [FFI](ffi.md), [Metal-exemplet](macos-metal.md)
+och [Vulkan-exemplet](linux-vulkan.md).
 
 Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
 anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen

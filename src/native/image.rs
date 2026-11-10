@@ -1,8 +1,7 @@
 //! Mach-O image layout for eager libSystem imports and writable runtime globals.
 //!
 //! Import slots occupy the first `symbols.len() * 8` bytes of `__DATA.__data`.
-//! Another 256 zero bytes follow those slots for private runtime state. With the
-//! usual `_dlopen`, `_dlsym` imports, slot 2 (byte offset 16) is the context pointer.
+//! The requested writable static storage and callback context follow the slots.
 //! This uses ordinary data rather than an indirect-symbol section: the bind
 //! opcodes carry the complete symbol names and dylib ordinal.
 
@@ -11,7 +10,8 @@ use super::{align, be32, be64, name, segment, sha256, u32le, u64le};
 const PAGE: usize = 16384;
 const VM: u64 = 0x100000000;
 const COMMANDS: usize = 648;
-const RUNTIME_GLOBAL_BYTES: usize = 256;
+#[cfg(test)]
+const TEST_GLOBAL_BYTES: usize = 256;
 
 pub(super) const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";
 #[cfg(test)]
@@ -83,16 +83,19 @@ pub(super) fn sign_bundle(
     {
         return Err(malformed());
     }
-    // This is a finalization step for our two image writers, not a general
-    // third-party Mach-O re-signer. Reject other load-command arrangements.
-    let expected: &[u32] = if read32(16)? == 7 && read32(20)? == 392 && read32(24)? == 0x00200005 {
-        &[0x19, 0x19, 0x19, 0x32, 0xe, 0x80000028, 0x1d]
-    } else if read32(16)? == 10 && read32(20)? == COMMANDS as u32 && read32(24)? == 0x00200085 {
-        &[
-            0x19, 0x19, 0x19, 0x19, 0x32, 0xe, 0x80000028, 0xc, 0x80000022, 0x1d,
-        ]
-    } else {
-        return Err("cannot sign bundle: unsupported generated image format".into());
+    // Match the two layouts emitted by our writers. The dynamic writer emits
+    // one LC_LOAD_DYLIB for each library imported by the program.
+    let count = read32(16)? as usize;
+    let (prefix, dylibs, suffix): (&[u32], usize, &[u32]) = match read32(24)? {
+        0x00200005 if count == 7 && read32(20)? == 392 => {
+            (&[0x19, 0x19, 0x19, 0x32, 0xe, 0x80000028], 0, &[0x1d])
+        }
+        0x00200085 if count >= 10 => (
+            &[0x19, 0x19, 0x19, 0x19, 0x32, 0xe, 0x80000028],
+            count - 9,
+            &[0x80000022, 0x1d],
+        ),
+        _ => return Err("cannot sign bundle: unsupported generated image format".into()),
     };
     let commands_end = 32usize
         .checked_add(read32(20)? as usize)
@@ -104,6 +107,11 @@ pub(super) fn sign_bundle(
     let mut signature = None;
     let mut linkedit = None;
     let mut text = None;
+    let expected = prefix
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0xc, dylibs))
+        .chain(suffix.iter().copied());
     for expected_kind in expected {
         if at + 8 > commands_end {
             return Err(malformed());
@@ -111,10 +119,14 @@ pub(super) fn sign_bundle(
         let kind = read32(at)?;
         let size = read32(at + 4)? as usize;
         let end = at.checked_add(size).ok_or_else(malformed)?;
-        if kind != *expected_kind || size < 8 || !size.is_multiple_of(8) || end > commands_end {
+        if kind != expected_kind || size < 8 || !size.is_multiple_of(8) || end > commands_end {
             return Err(malformed());
         }
-        if kind == 0x1d {
+        if kind == 0xc {
+            if size < 32 || read32(at + 8)? != 24 || !image[at + 24..end].contains(&0) {
+                return Err(malformed());
+            }
+        } else if kind == 0x1d {
             if size != 16 || signature.is_some() {
                 return Err(malformed());
             }
@@ -256,7 +268,7 @@ pub(super) fn sign_bundle(
 
 #[cfg(test)]
 fn macho_imports(text: &[u8], imports: &super::ffi::Imports) -> Vec<u8> {
-    macho_imports_with_storage(text, imports, RUNTIME_GLOBAL_BYTES)
+    macho_imports_with_storage(text, imports, TEST_GLOBAL_BYTES)
 }
 
 pub(super) fn macho_imports_with_storage(
@@ -273,7 +285,7 @@ pub(super) fn macho_imports_with_storage(
         .checked_mul(8)
         .expect("too many dynamic imports");
     let data_len = import_bytes
-        .checked_add(global_bytes.max(RUNTIME_GLOBAL_BYTES))
+        .checked_add(global_bytes)
         .expect("dynamic executable data is too large");
     let data_size = align(data_len, PAGE);
     let linkedit_off = data_off
@@ -539,7 +551,7 @@ mod tests {
         assert_eq!(le64(&image, data + 48), PAGE as u64);
         assert_eq!(le32(&image, data + 56), 3);
         assert_eq!(le32(&image, data + 60), 3);
-        assert_eq!(le64(&image, data + 112), 16 + RUNTIME_GLOBAL_BYTES as u64);
+        assert_eq!(le64(&image, data + 112), 16 + TEST_GLOBAL_BYTES as u64);
         assert_eq!(le32(&image, data + 136), 0); // S_REGULAR
         assert!(image[PAGE..2 * PAGE].iter().all(|b| *b == 0));
         let info = command(&image, 0x80000022);
@@ -604,15 +616,12 @@ mod tests {
         let image = macho_dynamic(&[], &symbols);
         let data = data_segment(&image);
         assert_eq!(le64(&image, data + 48), (2 * PAGE) as u64);
-        assert_eq!(
-            le64(&image, data + 112),
-            (PAGE + RUNTIME_GLOBAL_BYTES) as u64
-        );
+        assert_eq!(le64(&image, data + 112), (PAGE + TEST_GLOBAL_BYTES) as u64);
         let info = command(&image, 0x80000022);
         assert_eq!(le32(&image, info + 16), (3 * PAGE) as u32);
         let empty = macho_dynamic(&[], &[]);
         let data = data_segment(&empty);
-        assert_eq!(le64(&empty, data + 112), RUNTIME_GLOBAL_BYTES as u64);
+        assert_eq!(le64(&empty, data + 112), TEST_GLOBAL_BYTES as u64);
         let info = command(&empty, 0x80000022);
         let off = le32(&empty, info + 16) as usize;
         assert_eq!(le32(&empty, info + 20), 1);

@@ -159,6 +159,33 @@ fn app_bundle_contains_native_executable_and_escaped_plist_without_external_tool
 }
 
 #[test]
+fn app_bundle_seals_libraries_imported_by_a_project_module() {
+    let project = Project::new();
+    project.write(
+        "driver.ddr",
+        r#"capability unsafe
+@extern("/usr/lib/libobjc.A.dylib","sel_registerName") unsafe fn selector(name:ptr)->ptr
+pub fn ready()->bool { unsafe { return usize(selector(cstr("description"))) != 0 } }
+"#,
+    );
+    project.write(
+        "main.ddr",
+        "import driver\nfn main(){assert(driver.ready())}",
+    );
+    let bundle = "out/Probe.app";
+    success(&project.cli(&["build", "main.ddr", "--app", "-o", bundle]));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        success(&verify(&project, bundle));
+        success(
+            &Command::new(project.0.join(bundle).join("Contents/MacOS/Probe"))
+                .output()
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
 fn default_app_output_uses_source_or_manifest_name() {
     let project = Project::new();
     project.write("Hello World.ddr", "fn main(){print(42)}");

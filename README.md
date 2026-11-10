@@ -119,8 +119,11 @@ samt [en delad triangel på WebGPU, Metal och Vulkan](dogfood/webgpu/README.md).
 ## Verifierad täckning och återstående arbete
 
 Native-självbyggen för macOS/ARM64, Linux/ARM64 och Linux/x86-64 når
-byteidentiska fixpunkter och kör dogfood-sviten. Grafikbiblioteken för Metal
-med AppKit och Vulkan med SDL är Dunder-kod. Rust-bootstrapens Wasm-backend
+byteidentiska fixpunkter och kör dogfood-sviten. Grafikexemplen använder lokala
+Dunder-moduler för Metal och AppKit på macOS och Vulkan och SDL på Linux.
+Egna projekt kan ta med modulerna från `dogfood/graphics/` och importera dem
+relativt sin källkod. Kompilatorn hanterar anropen genom sitt generella FFI-stöd
+och målets kodgenerering. Rust-bootstrapens Wasm-backend
 kör de portabla dogfood-grupperna och WebGPU-exemplet använder samma
 triangeldata som nativeexemplen.
 
@@ -443,12 +446,11 @@ genererade CSV-data med en oberoende referens och bygger alla tre mål.
 
 ## Nativefönster och Metal
 
-`import std.macos as macos` ger typade fönsterhandtag, händelser och en
-Metal-triangelista. AppKit-delegaten och Metal-renderaren ligger i
-`stdlib/macos/` och använder Dunders typade C-anrop och callbacks. Ingen C-, Objective-C- eller Swift-källkod
-kompileras. Fönsterloopen, scenens tillstånd, geometrin och matematiken i
-exemplen är Dunder-kod. Apples Metal-runtime kompilerar den fasta MSL-pipelinen
-när ett fönster öppnas.
+Från `dogfood/metal/` läser `import ..graphics.macos as macos` den lokala
+modulen `dogfood/graphics/macos.ddr`. Den ger typade fönsterhandtag och
+händelser. AppKit-delegaten och Metal-renderaren i `dogfood/graphics/macos/`
+använder typade C-anrop och callbacks. Apples Metal-runtime kompilerar den
+fasta MSL-pipelinen när ett fönster öppnas.
 
 ```sh
 cargo run --release -- run dogfood/metal/triangle.ddr -- --frames 3
@@ -468,17 +470,18 @@ Textlayout, nativekontroller, egen shaderkod och flera samtidiga fönster
 
 ## Vulkan och lavapipe på Linux
 
-`import std.vulkan as vulkan` ger motsvarande triangel- och Atlas-dogfood
-på Linux. Vulkan renderar geometrin; headless-läget kan läsa tillbaka
-RGBA och spara bilder. SDL2 visar samma renderade bild i fönsterläget.
+Triangeln och Atlas i `dogfood/vulkan/` använder
+`import ..graphics.vulkan as vulkan`. Exempelmodulen i `dogfood/graphics/vulkan.ddr` renderar med
+Vulkan och kan läsa tillbaka RGBA eller visa bilden i ett SDL2-fönster.
 
 ```sh
 cargo run --release -- run dogfood/vulkan/main.ddr -- --headless --frames 3 --capture build/atlas.ppm
 cargo run --release -- run dogfood/vulkan/main.ddr
 ```
 
-Välj Mesas lavapipe-ICD för mjukvarurendering. Dunder skriver nativekod och
-dynamisk ELF själv, med inbäddad SPIR-V och utan extern länkare.
+Välj Mesas lavapipe-ICD för mjukvarurendering. Shaderns SPIR-V ingår i
+exempelmodulen. Kompilatorn genererar nativekod och en dynamisk ELF för
+modulens vanliga FFI-anrop.
 Se [Linux/Vulkan-guiden](docs/linux-vulkan.md) för installation, kontroller
 och pixeltester med valideringslager.
 

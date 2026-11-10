@@ -81,7 +81,7 @@ och en iterator från `.iter()` kan användas i flera loopar. Heltalsaritmetik, 
 `assert` och de systemanrop som behövs för kompilatorns filhantering ingår.
 
 Standardbibliotekets källor är inbäddade i `bundled.ddr`. Efter ändringar
-i `stdlib/*.ddr`, regenerera med Dunder själv:
+i de moduler som listas i `stdlib/modules.txt`, regenerera med Dunder själv:
 
 ```sh
 target/release/dunder run selfhost/embed.ddr

@@ -135,7 +135,7 @@ delegera det vidare.
 
 Modulhuvudet styr direkta unsafe-operationer och tillgången till deklarationer
 märkta `@requires(filesystem)`. Importer av äldre `sys` ger fortfarande
-processens fil- och argumentåtkomst. Grafikbibliotekens publika funktioner
+processens fil- och argumentåtkomst. Grafikexemplens publika funktioner
 kan skapa fönster och `print` kan skriva till stdout. En importerad funktion
 kan själv använda ett privilegium som dess egen modul valt. Bedöm hela
 importkedjan för kod som ska köra obetrodda program.
