@@ -27,6 +27,8 @@ Detta är en lokal IR per funktion; någon helprograms-IR eller SSA byggs inte.
 [Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
 operatorprioritet och kontextuell bredd på signerade heltalsliteraler.
+Breddkontrollen validerar decimalparserns befintliga resultat utan att
+skapa en extra resultatpost per literal.
 En accepterad modell har kontrollerats av modellparsern; en avvisad modell
 går vidare till den fulla parsern för stöd och diagnostik.
 
@@ -39,6 +41,10 @@ Ett internt invariantfel ger ett kompilatorfel före emission. Det räknas
 inte som en vanlig modellbegränsning och döljs inte genom återfall.
 Verifieraren kontrollerar var bevis får användas; själva bevisregelns
 sundhet provas separat och följer inte automatiskt av formkontrollen.
+Verifierarens flaggor och scopestack återanvänds mellan funktioner och
+passfaser i ett separat arbetsminne per kompilatoranrop. Varje anrop
+initierar modellens aktuella del även efter ett tidigare verifieringsfel.
+Form-, typ- och säkerhetskontrollerna körs fortfarande varje gång.
 
 [Passet](../selfhost/opt_pass.ddr) förenklar konstanter, lokala värden och
 konstanta grenar inom en fast arbetsbudget på 65 536 steg. Det räknar
