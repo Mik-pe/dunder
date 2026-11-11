@@ -20,6 +20,12 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Gemensam helfunktions-IR, 2026-11-11](2026-11-11-whole-function-mir/README.md)
+flyttar hela källspråket genom verifierad IR och sänkning. Första kandidaten
+ger identiska bilder men ökar byggmedianerna 55–86 procent; det genererade
+provets p95 ger fortfarande 178 000 rader/s. Ett generellt registerpass är
+testat separat och ännu inte aktiverat i denna mätning.
+
 [i32-bevis och registerjämförelser, 2026-11-11](2026-11-11-i32-comparisons/README.md)
 förbättrar sorteringen ytterligare cirka 23 procent. C-geomedlet är 1,415×;
 rapporten redovisar byggkostnad och separat kontroll av varje nytt bevis.
