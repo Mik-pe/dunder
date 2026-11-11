@@ -17,8 +17,8 @@ INVALID = (
     'fn main(){print("a"==missing)}',
 )
 TRAPS = (
-    ('fn main(){a:=["a"];print("a"==a[2])}', 103),
-    ('fn main(){a:=["a"];zero:=0;print("a"==a[1/zero])}', 102),
+    ('fn main(){a:=["a"];assert("a"==a[2])}', 103),
+    ('fn main(){a:=["a"];zero:=0;assert("a"==a[1/zero])}', 102),
 )
 
 
