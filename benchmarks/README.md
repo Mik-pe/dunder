@@ -20,6 +20,10 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Framefria ARM64-funktioner, 2026-11-11](2026-11-11-frame-free/README.md)
+ger ytterligare numerikvinst med verifierade registerflyttar. Högre p95
+i vissa fall redovisas tillsammans med median, råtider och av/på-serie.
+
 [Signerad konstantdivision, 2026-11-11](2026-11-11-constant-division/README.md)
 förbättrar numerikkärnan med ungefär tolv procent och mäter byggkostnaden
 separat. C-målet för hela sviten är fortfarande inte uppnått.

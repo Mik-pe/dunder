@@ -139,6 +139,34 @@ nästlad aritmetik, kortslutning, exakt nativ fällkod och fällordning.
 Alla fyra mål byggs; host och Wasm körs. Wasm exponerar `unreachable`
 snarare än nativa fällkoder, vilket rapporteras separat.
 
+### Framefria registerfunktioner på ARM64
+
+En anropsfri skalärfunktion kan behålla anroparens FP/LR när samtliga
+använda lokaler och syntetiska loopgränser har registerplatser. Arrayer,
+adresserbara värden, verkliga spill och okända operationer behåller frame.
+Första målpolicyn gäller ARM64/macOS och ARM64/Linux; x86-64 och Wasm
+använder sin befintliga frameöversättning.
+
+Parameterplaceringen är en begränsad parallellflytt av högst åtta register.
+Kedjor och cykler bryts med reserverat `x8`, och `i32` normaliseras först
+efter samtliga kopior. Registerplanen och varje flytt valideras före
+emission. En separat effektobservation kontrollerar också den faktiskt
+emitterade kroppen: ett framtida anrop kan inte smyga in före en rå `RET`.
+Expressionernas balanserade stacktemporärer finns kvar och trapputgångar
+avslutar fortfarande processen. Callee-saved register och runtimeglobala
+register bevaras.
+
+`--frame-free=off` återställer den tidigare framevägen separat från andra
+pass. Cachefragment och testkvitton skiljer lägena åt. Emitter-API:t lånar
+en återanvänd `Options`-post; äldre wrappers behåller sina standarder utan
+en ny postallokering per funktion.
+
+`tools/test-frame-free.py` bygger 88 riktiga bilder över fyra mål och båda
+lägena. Host/Wasm provar register- och stackbevarande, argumentcykler,
+normalisering, loopar, tidig retur och fällordning. Den symboliska
+flyttkontrollen tolkar faktiskt emitterade instruktioner över 40 320
+permutationer. Fallbackbilder och bilder för övriga mål är byteidentiska.
+
 ## Ägarlivslängder och verifierade funktionsomskrivningar
 
 Den fulla frontendens strängoperatorer skapar normalt en extra temporär
@@ -195,6 +223,7 @@ bakom snabbare genererad stresskod.
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Begränsad specialisering och inlining | Små heta hjälpfunktioner kan slippa anropskostnad och ge lokala bevis över anropsgränsen. | Fast budget per funktion och anropsställe, begränsad kodtillväxt och cacheidentitet för samtliga påverkande sammanfattningar. |
+| POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
 | Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
 | Kortare bygglatens | Återanvänd typade resultat och beroendesammanfattningar, och bearbeta oberoende funktioner parallellt. | Stabil diagnosordning, byteidentisk utdata, en arena per arbetare och mätning av privat kroppsändring respektive delad layoutändring. |
 
@@ -276,8 +305,9 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-constant-division/README.md)
+Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-frame-free/README.md)
 omfattar både runtime, kompletta byggen och `check`.
-Konstantdivision förbättrar numerikkärnan utan märkbar byggkostnad i serien.
+Konstantdivision och framefria funktioner förbättrar numerikkärnan.
 Profilerna ger underlag för [ägartillstånd och CFG](ownership-ir-plan.md),
-medan framekostnad och starkare intervallbevis är nästa numeriska frågor.
+medan starkare intervallbevis är nästa numeriska fråga. Högre p95 i vissa
+arbetsfall redovisas separat från medianvinster.
