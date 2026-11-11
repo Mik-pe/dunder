@@ -32,10 +32,10 @@ import std.parse as decimal
 fn same(f:&ir.Function,before:&ir.Function){
     assert(f.root==before.root && f.ret==before.ret && f.params==before.params)
     assert(f.supported==before.supported && f.visits==before.visits && f.rewrites==before.rewrites && f.budget_exhausted==before.budget_exhausted)
-    assert(f.kinds.len==before.kinds.len && f.local_types.len==before.local_types.len)
-    for i in 0..f.kinds.len{
-        assert(f.kinds[i]==before.kinds[i] && f.types[i]==before.types[i] && f.left[i]==before.left[i] && f.right[i]==before.right[i] && f.third[i]==before.third[i] && f.next[i]==before.next[i])
-        assert(f.values[i]==before.values[i] && f.locals[i]==before.locals[i] && f.proofs[i]==before.proofs[i] && f.effects[i]==before.effects[i] && f.starts[i]==before.starts[i])
+    assert(f.nodes.kinds.len==before.nodes.kinds.len && f.local_types.len==before.local_types.len)
+    for i in 0..f.nodes.kinds.len{
+        assert(f.nodes.kinds[i]==before.nodes.kinds[i] && f.nodes.types[i]==before.nodes.types[i] && f.nodes.left[i]==before.nodes.left[i] && f.nodes.right[i]==before.nodes.right[i] && f.nodes.third[i]==before.nodes.third[i] && f.nodes.next[i]==before.nodes.next[i])
+        assert(f.nodes.values[i]==before.nodes.values[i] && f.nodes.locals[i]==before.nodes.locals[i] && f.nodes.proofs[i]==before.nodes.proofs[i] && f.nodes.effects[i]==before.nodes.effects[i] && f.nodes.starts[i]==before.nodes.starts[i])
     }
     for i in 0..f.local_types.len{
         assert(f.local_types[i]==before.local_types[i] && f.local_param[i]==before.local_param[i] && f.local_mutable[i]==before.local_mutable[i] && f.local_at[i]==before.local_at[i] && f.local_names[i]==before.local_names[i])
@@ -59,11 +59,11 @@ fn main(){
     ready:=ranges.analyze_into(&mut w,&f);same(&f,&before)
     if ready{assert(ranges.status(&w)==1);ranges.apply(&mut w,&mut f);assert(ranges.status(&w)==2);assert(verify.validate(&f,true))}
     else{assert(ranges.status(&w)==3||ranges.status(&w)==4)}
-    print(1);print(f.root);print(f.ret);print(f.params);print(f.kinds.len);print(f.local_types.len)
+    print(1);print(f.root);print(f.ret);print(f.params);print(f.nodes.kinds.len);print(f.local_types.len)
     print(ranges.status(&w));print(ranges.units(&w));print(ranges.read_count(&w));print(ranges.store_count(&w));print(f.visits);print(f.rewrites)
-    for i in 0..f.kinds.len{
-        if ranges.produced(&w,i){assert(f.proofs[i]==before.proofs[i].bit_or(2))}else{assert(f.proofs[i]==before.proofs[i])}
-        print(f.kinds[i]);print(f.types[i]);print(f.left[i]);print(f.right[i]);print(f.third[i]);print(f.next[i]);print(f.values[i]);print(f.locals[i]);print(f.proofs[i]);print(f.effects[i]);print(f.starts[i])
+    for i in 0..f.nodes.kinds.len{
+        if ranges.produced(&w,i){assert(f.nodes.proofs[i]==before.nodes.proofs[i].bit_or(2))}else{assert(f.nodes.proofs[i]==before.nodes.proofs[i])}
+        print(f.nodes.kinds[i]);print(f.nodes.types[i]);print(f.nodes.left[i]);print(f.nodes.right[i]);print(f.nodes.third[i]);print(f.nodes.next[i]);print(f.nodes.values[i]);print(f.nodes.locals[i]);print(f.nodes.proofs[i]);print(f.nodes.effects[i]);print(f.nodes.starts[i])
         if ranges.produced(&w,i){print(1)}else{print(0)}
     }
     for i in 0..f.local_types.len{
