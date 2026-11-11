@@ -175,6 +175,36 @@ def scalar_optimizer_controls(p):
     p.call('check', 'scalar.ddr', '--scalar-opt=unknown', status=2)
 
 
+def ownership_optimizer_controls(p):
+    p.write('leases.ddr', 'fn same(a:string,b:string)->bool{a==b}\n'
+            'fn main(){a:="same";print(same(a,"same"))}\n')
+    def build(mode, name, cached=False):
+        result = p.call('build', 'leases.ddr', '--ownership-opt=' + mode,
+                        '--timings=json', '-o', name, *(['--incremental'] if cached else []))
+        return json.loads(result.stderr)['functions']['reused']
+    build('on', 'leases-on')
+    build('off', 'leases-off')
+    assert (p.root/'leases-on').stat().st_size <= (p.root/'leases-off').stat().st_size
+    for name in ('leases-on', 'leases-off'):
+        result = subprocess.run([p.root/name],capture_output=True,text=True,timeout=10)
+        assert result.returncode == 0 and result.stdout == 'true\n' and not result.stderr, result
+    enabled = p.call('check', 'leases.ddr', '--agent', '--ownership-opt=on')
+    disabled = p.call('check', 'leases.ddr', '--agent', '--ownership-opt=off')
+    assert enabled.stdout == disabled.stdout and enabled.stderr == disabled.stderr == ''
+    assert build('on', 'cached-on', True) == 0
+    assert build('on', 'cached-on', True) > 0
+    assert build('off', 'cached-off', True) == 0
+    assert build('off', 'cached-off', True) > 0
+    assert build('on', 'cached-on', True) > 0
+    p.write('lease-tests.ddr', 'fn same(a:string,b:string)->bool{a==b}\n'
+            '@test fn works(){same("a","a")}\n')
+    for mode, expected in [('on','1 passed'),('on','1 unaffected'),
+                           ('off','1 passed'),('off','1 unaffected'),('on','1 passed')]:
+        result = p.call('test', 'lease-tests.ddr', '--affected', '--ownership-opt=' + mode, '-o', 'lease-results')
+        assert expected in result.stdout, result
+    p.call('check', 'leases.ddr', '--ownership-opt=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -355,7 +385,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, runtime_profile_controls, isolated_tests, filesystem]
+             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
