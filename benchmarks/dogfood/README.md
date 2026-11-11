@@ -34,8 +34,11 @@ run with `PATH=/no-external-tools` and no inherited environment variables.
 ## Calibrate once and freeze counts
 
 The checked-in inputs and work counts are frozen. `workloads.json` records the
-designated baseline and the [raw calibration](../2026-11-11-compiler-dogfood/calibration/).
-The reviewed counts are POD 16,135; decimal 550; lexer 20; symbols 30. The
+designated baseline and the [raw calibration](../2026-11-11-ownership-leases/calibration-revision2/).
+Revision 2 counts are POD 593,041; decimal 14,479; lexer 284; symbols 445.
+Revision 1 sized the first launch of a newly built image while comparison
+used a warmup. Its short-work results are preserved; revision 2 sizes after
+the same checked warmup used by comparison. The
 comparison rejects any manifest with `frozen: false`.
 
 For a future version of the workload, only the controlling parent should run
@@ -47,7 +50,8 @@ python3 tools/profile-dogfood.py calibrate /path/to/baseline \
   build/dogfood-calibration --target-ms 150
 ```
 
-Calibration runs each current count once and writes proposals to
+Calibration verifies one unrecorded warmup, then times each current count once
+and writes proposals to
 `recommended-workloads.json`. This single observation is sizing evidence, not
 a performance distribution. Review that file, set `frozen` to `true`, and retain
 it as the versioned workload manifest. Do not adapt counts per compiler or

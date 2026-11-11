@@ -267,6 +267,8 @@ def main():
     if args.mode == 'compare':
         metadata.update({'rounds':args.rounds,'order':'even baseline,candidate; odd candidate,baseline',
                          'warmup':'one unrecorded checked execution per binary'})
+    if args.mode == 'calibrate':
+        metadata['warmup'] = 'one unrecorded checked execution before the single sizing observation'
     report = None
     if args.mode != 'check':
         report = args.report.resolve(); report.mkdir(parents=True,exist_ok=True)
@@ -304,6 +306,9 @@ def main():
                 metadata['workloads'][name]['runtime_profile'] = record
                 print(f'ATTRIBUTED {name}: {record["counters"]["allocation_count"]} allocations, {record["counters"]["requested_bytes"]} requested bytes',flush=True)
             elif args.mode == 'calibrate':
+                # Match comparison: assess/launch each freshly built image in
+                # an unrecorded checked warmup before sizing its steady work.
+                run('compiler')
                 _,elapsed = run('compiler',True)
                 proposed = max(1,min(10_000_000,math.ceil(count*args.target_ms/elapsed)))
                 recommendations['cases'][name]['count'] = proposed

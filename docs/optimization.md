@@ -103,6 +103,47 @@ resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
 använder modellen. `tools/test-opt-emitter.py` provar emission och spill
 separat. Båda ingår i `tools/verify-selfhost.sh`.
 
+## Ägarlivslängder och verifierade funktionsomskrivningar
+
+Den fulla frontendens strängoperatorer skapar normalt en extra temporär
+ägare för vänsteroperanden. Den behövs om högerledet kan ersätta eller
+frigöra den ursprungliga ägaren. Om hela högerledet saknar anrop,
+källskrivningar och adress-/låneexponering kan operatorn i stället låna
+det redan levande värdet. Regeln gäller samma språkstruktur i alla moduler.
+
+Effektobservationen börjar efter vänsteroperandens extra setup och slutar
+före själva operatorn och dess resultatägare. Nästlade observationer
+behåller yttre bevisets barriärer. Direkta och indirekta anrop,
+systemanrop, målens värdanrop samt explicita skrivningar eller exponeringar
+bryter beviset. Instruktionsklassificeringen körs bara när ett sådant bevis
+är aktivt. Kontrolläge och oanropade kroppars kontroll bygger inga editplaner.
+
+Endast den extra ägarplatsen markeras borttagen; ursprungliga lokaler,
+parametrar och fulluttryckets andra temporärer behåller sina livslängder.
+Samtliga framtida cleanup-vägar och prologens nollställning hoppar över
+den markerade platsen. Platsnummer och frame-layout är stabila.
+
+[`machine_ir`](../selfhost/machine_ir.ddr) beskriver validerade redigeringar
+i en funktions ofärdiga instruktionsström. Det är ett begränsat maskin-IR,
+med befintliga etiketter och symboliska relokeringar, inte en ny semantisk
+parser. Först valideras hela editplanen och en karta för alla ordgränser.
+Hela instruktioner och relokeringspar tas sedan bort på riktigt; överlevande
+etiketter, relokeringar och importernas byteadresser korrigeras. Delade par,
+överlapp och borttagna importposter avvisas. Omarkerade data- och
+callbacketiketter bevaras för bildfinaliseringen.
+
+Valideringen är atomisk och begränsad till den aktuella funktionens suffix;
+tidigare funktioner skannas inte om. Arbetsminnet återanvänds. Ett brutet
+internt bevis ger kompilatorfel före cachelagring eller publicering. Ett
+halvt återfall med borttagen cleanup och kvarvarande setup är inte tillåtet.
+
+`--ownership-opt=off` stänger av denna ägaroptimering oberoende av
+`--scalar-opt=off`. Både kodfragment och berörda testkvitton skiljer lägena åt.
+`tools/test-ownership-leases.py` jämför resultat, diagnostik och bindningar
+för båda lägena på alla mål; native och Wasm provar också mutation under
+högerledet, fällordning och upprepad körning med samma linjära minne.
+`tools/test-machine-ir.py` provar kompakteringen separat.
+
 ## Nästa etapper mot C-nivå
 
 Målet prövas över hela den publicerade sviten enligt

@@ -51,6 +51,13 @@ Modellen verifieras före och efter passet. Ägda värden, storleksändring av
 arrayer, flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
 [Omfattning och gränser](optimization.md).
 
+Den fulla kodgeneratorn kan utelämna extra strängoperandägare när hela
+högerledet saknar relevanta effekter. En validerad funktionsrepresentation
+korrigerar instruktioner, etiketter och relokeringar atomiskt.
+`--ownership-opt=off` gör mekanismen jämförbar separat från skalärpasset.
+Fasur och allokeringstrafik kan profileras separat utan att vanlig emission
+instrumenteras. [Profilering](incremental.md#mät-byggkedjans-faser).
+
 Tabell är ett fristående CSV-projekt med eget manifest, gruppering,
 Unicode, sortering och kontrollerat heltalsspill. Grafikexemplen använder
 samma filimporter och typade värdanrop som externa program. macOS använder
@@ -62,14 +69,16 @@ och [macOS-appar](app-bundles.md).
 ## Körda Wasm-kontrakt
 
 Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 78 av de 84 grupperna med godkänt
-resultat. De sex övriga har nåbara anrop till filsystemet.
+till en separat Wasm-modul. Node körde 89 av de 97 grupperna med godkänt
+resultat. De åtta övriga har nåbara nativa systemanrop.
 
 | Grupp | Nativt beroende |
 | --- | --- |
 | `dogfood/filesystem.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
 | `dogfood/filesystem.ddr::errors_remain_values` | Fel från filåtkomst |
 | `dogfood/enums.ddr::value_enums_work_in_records_and_arrays` | Filmetadata |
+| `selfhost/compile.ddr::string_operand_leases_are_removed_only_across_effect_free_rhs` | Kompilatorns filåtkomst |
+| `selfhost/compile.ddr::ownership_proofs_do_not_change_validation_or_binding_records` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::compiler_checks_types_before_emitting_an_image` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation` | Kompilatorns filåtkomst |
