@@ -1,0 +1,461 @@
+// Bounded range/length relations over the closed, call-free scalar model.
+// Analysis never mutates the function. Loop invariants are solved first, then
+// replayed to collect pending bounds proofs. No arithmetic proof is produced.
+import opt_ir as ir
+import opt_verify as verify
+
+pub opaque struct Workspace {
+    validation: verify.Workspace,
+    value_low: []i64, value_high: []i64, value_root: []i32, value_offset: []i64, value_top: i32, enabled: bool,
+    variables: []i32, limits: []i32, headers: []i32, owners: []i32, pending: []bool,
+    low: []i64, high: []i64, roots: []i32, offsets: []i64, reached: []bool,
+    width: i32, top: i32, persistent: i32, replay: bool,
+    state: i32, allowance: i32, units: i32, reads: i32, stores: i32,
+    count: i32, locals: i32, root: i32,
+}
+// Status: 0 idle, 1 ready, 2 consumed, 3 exhausted, 4 invalid model/invariant.
+pub fn new() -> Workspace {
+    Workspace { validation: verify.new(), value_low: [], value_high: [], value_root: [], value_offset: [], value_top: 0, enabled: false, variables: [], limits: [], headers: [], owners: [], pending: [],
+        low: [], high: [], roots: [], offsets: [], reached: [], width: 0, top: 0, persistent: 0,
+        replay: false, state: 0, allowance: 131072, units: 0, reads: 0, stores: 0,
+        count: 0, locals: 0, root: -1 }
+}
+pub fn status(work: &Workspace) -> i32 { work.state }
+pub fn units(work: &Workspace) -> i32 { work.units }
+pub fn read_count(work: &Workspace) -> i32 { if work.state == 1 || work.state == 2 { work.reads } else { 0 } }
+pub fn store_count(work: &Workspace) -> i32 { if work.state == 1 || work.state == 2 { work.stores } else { 0 } }
+pub fn produced(work: &Workspace, node: i32) -> bool {
+    work.enabled && (work.state == 1 || work.state == 2) && node >= 0 && node < work.count && work.pending[node]
+}
+// A lower budget is useful for deterministic exhaustion tests. It cannot
+// weaken validation or increase the production cap.
+pub fn set_budget(work: &mut Workspace, allowance: i32) {
+    assert(allowance >= 0 && allowance <= 131072)
+    work.allowance = allowance; work.state = 0
+}
+fn spend(w: &mut Workspace, amount: i32) -> bool {
+    if w.state >= 3 { return false }
+    if amount > w.allowance - w.units { w.state = 3; return false }
+    w.units = w.units + amount; true
+}
+// Scalar results and affine terms occupy one LIFO pool. Their slot IDs never
+// escape the current helper frame. High-water storage is reused across models.
+// Terms use root=variable, offset=affine offset and high=valid (0/1).
+fn value(w: &mut Workspace, low: i64, high: i64, root: i32, offset: i64) -> i32 {
+    if w.state >= 3 { return 0 }
+    if w.value_top >= 512 || !spend(&mut w, 1) { w.state = 3; return 0 }
+    slot := w.value_top; w.value_top = slot + 1
+    while w.value_low.len <= slot {
+        w.value_low.push(0); w.value_high.push(0); w.value_root.push(-1); w.value_offset.push(0)
+    }
+    w.value_low[slot] = low; w.value_high[slot] = high; w.value_root[slot] = root; w.value_offset[slot] = offset
+    slot
+}
+fn top_value(w: &mut Workspace) -> i32 { value(&mut w, -2147483648, 2147483647, -1, 0) }
+fn number(w: &mut Workspace, n: i64) -> i32 { value(&mut w, n, n, -1, 0) }
+fn result_copy(w: &mut Workspace, destination: i32, source: i32) {
+    w.value_low[destination] = w.value_low[source]; w.value_high[destination] = w.value_high[source]
+    w.value_root[destination] = w.value_root[source]; w.value_offset[destination] = w.value_offset[source]
+}
+fn fresh(w: &mut Workspace) -> i32 {
+    if w.width < 1 || w.top >= 32768 / w.width || !spend(&mut w, w.width) { w.state = 3; return -1 }
+    result := w.top; w.top = w.top + 1
+    while w.reached.len < w.top { w.reached.push(false) }
+    while w.low.len < w.top * w.width {
+        w.low.push(-2147483648); w.high.push(2147483647); w.roots.push(-1); w.offsets.push(0)
+    }
+    w.reached[result] = false; result
+}
+fn copy(w: &mut Workspace, destination: i32, source: i32) {
+    if destination < 0 || source < 0 || !spend(&mut w, w.width) { return }
+    w.reached[destination] = w.reached[source]
+    if !w.reached[source] { return }
+    a := destination * w.width; b := source * w.width
+    for i in 0..w.width {
+        w.low[a + i] = w.low[b + i]; w.high[a + i] = w.high[b + i]
+        w.roots[a + i] = w.roots[b + i]; w.offsets[a + i] = w.offsets[b + i]
+    }
+}
+fn join(w: &mut Workspace, destination: i32, source: i32) {
+    if w.state >= 3 || destination < 0 || source < 0 || !w.reached[source] { return }
+    if !w.reached[destination] { copy(&mut w, destination, source); return }
+    if !spend(&mut w, w.width) { return }
+    a := destination * w.width; b := source * w.width
+    for i in 0..w.width {
+        if w.low[b + i] < w.low[a + i] { w.low[a + i] = w.low[b + i] }
+        if w.high[b + i] > w.high[a + i] { w.high[a + i] = w.high[b + i] }
+        if w.roots[a + i] != w.roots[b + i] { w.roots[a + i] = -1; w.offsets[a + i] = 0 }
+        else if w.offsets[b + i] > w.offsets[a + i] { w.offsets[a + i] = w.offsets[b + i] }
+    }
+}
+fn subset(w: &mut Workspace, source: i32, container: i32) -> bool {
+    if w.state >= 3 || source < 0 || container < 0 { return false }
+    if !w.reached[source] { return true }
+    if !w.reached[container] || !spend(&mut w, w.width) { return false }
+    a := source * w.width; b := container * w.width
+    for i in 0..w.width {
+        if w.low[a + i] < w.low[b + i] || w.high[a + i] > w.high[b + i] { return false }
+        if w.roots[b + i] >= 0 && (w.roots[a + i] != w.roots[b + i] || w.offsets[a + i] > w.offsets[b + i]) { return false }
+    }
+    true
+}
+fn widen(w: &mut Workspace, header: i32, candidate: i32, broad: bool) {
+    if w.state >= 3 || !w.reached[candidate] { return }
+    if !w.reached[header] { copy(&mut w, header, candidate); return }
+    if !spend(&mut w, w.width) { return }
+    a := header * w.width; b := candidate * w.width
+    for i in 0..w.width {
+        if w.low[b + i] < w.low[a + i] {
+            w.low[a + i] = w.low[b + i]; if broad { w.low[a + i] = -2147483648 }
+        }
+        if w.high[b + i] > w.high[a + i] {
+            w.high[a + i] = w.high[b + i]; if broad { w.high[a + i] = 2147483647 }
+        }
+        if w.roots[a + i] != w.roots[b + i] { w.roots[a + i] = -1; w.offsets[a + i] = 0 }
+        else if w.offsets[b + i] > w.offsets[a + i] {
+            w.offsets[a + i] = w.offsets[b + i]
+            if broad { w.roots[a + i] = -1; w.offsets[a + i] = 0 }
+        }
+    }
+}
+fn get(w: &mut Workspace, state: i32, variable: i32) -> i32 {
+    if variable < 0 || !spend(&mut w, 1) { return top_value(&mut w) }
+    at := state * w.width + variable
+    value(&mut w, w.low[at], w.high[at], w.roots[at], w.offsets[at])
+}
+fn put(w: &mut Workspace, state: i32, variable: i32, item: i32) {
+    if w.state >= 3 || variable < 0 || !w.reached[state] || !spend(&mut w, 1) { return }
+    var low := w.value_low[item]; var high := w.value_high[item]
+    if low < -2147483648 { low = -2147483648 }; if high > 2147483647 { high = 2147483647 }
+    if low > high { w.reached[state] = false; return }
+    at := state * w.width + variable
+    w.low[at] = low; w.high[at] = high; w.roots[at] = w.value_root[item]; w.offsets[at] = w.value_offset[item]
+}
+fn shifted(w: &mut Workspace, item: i32, amount: i64) -> i32 {
+    var root := w.value_root[item]; var offset := w.value_offset[item] + amount
+    if offset < -4294967296 || offset > 4294967296 { root = -1; offset = 0 }
+    value(&mut w, w.value_low[item] + amount, w.value_high[item] + amount, root, offset)
+}
+fn term(w: &mut Workspace, f: &ir.Function, node: i32, depth: i32) -> i32 {
+    saved := w.value_top; result := value(&mut w, 0, 0, -1, 0)
+    term_into(&mut w, &f, node, result, depth)
+    w.value_top = saved + 1; result
+}
+fn term_into(w: &mut Workspace, f: &ir.Function, node: i32, result: i32, depth: i32) {
+    if depth > 64 || !spend(&mut w, 1) || f.types[node] != 1 { return }
+    kind := f.kinds[node]
+    if kind == 1 { w.value_offset[result] = f.values[node]; w.value_high[result] = 1; return }
+    if kind == 2 || kind == 5 { w.value_root[result] = w.variables[f.locals[node]]; w.value_high[result] = 1; return }
+    if kind == 3 && (f.values[node] == 1 || f.values[node] == 2) {
+        a := term(&mut w, &f, f.left[node], depth + 1); b := term(&mut w, &f, f.right[node], depth + 1)
+        if w.value_high[a] != 0 && w.value_high[b] != 0 {
+            if w.value_root[b] < 0 {
+                var delta := w.value_offset[b]; if f.values[node] == 2 { delta = -delta }
+                offset := w.value_offset[a] + delta
+                if offset >= -4294967296 && offset <= 4294967296 {
+                    w.value_root[result] = w.value_root[a]; w.value_offset[result] = offset; w.value_high[result] = 1
+                }
+            } else if w.value_root[a] < 0 && f.values[node] == 1 {
+                offset := w.value_offset[a] + w.value_offset[b]
+                if offset >= -4294967296 && offset <= 4294967296 {
+                    w.value_root[result] = w.value_root[b]; w.value_offset[result] = offset; w.value_high[result] = 1
+                }
+            }
+        }
+    }
+}
+fn upper(w: &mut Workspace, state: i32, variable: i32, bound: i32) {
+    if variable < 0 || w.state >= 3 || !w.reached[state] { return }
+    saved := w.value_top; item := get(&mut w, state, variable)
+    if w.value_high[bound] < w.value_high[item] { w.value_high[item] = w.value_high[bound] }
+    // Length roots retain their identity when compared to another array.
+    if w.owners[variable] < 0 && w.value_root[bound] >= 0 {
+        if w.value_root[item] < 0 { w.value_root[item] = w.value_root[bound]; w.value_offset[item] = w.value_offset[bound] }
+        else if w.value_root[item] == w.value_root[bound] && w.value_offset[bound] < w.value_offset[item] { w.value_offset[item] = w.value_offset[bound] }
+    }
+    put(&mut w, state, variable, item); w.value_top = saved
+}
+fn lower(w: &mut Workspace, state: i32, variable: i32, bound: i64) {
+    if variable < 0 || w.state >= 3 || !w.reached[state] { return }
+    saved := w.value_top; item := get(&mut w, state, variable)
+    if bound > w.value_low[item] { w.value_low[item] = bound }
+    put(&mut w, state, variable, item); w.value_top = saved
+}
+// a <= b + adjustment, on the expression's normal checked continuation.
+fn constrain(w: &mut Workspace, state: i32, a: i32, b: i32, adjustment: i64) {
+    if w.state >= 3 || !w.reached[state] || w.value_high[a] == 0 || w.value_high[b] == 0 { return }
+    delta := w.value_offset[b] - w.value_offset[a] + adjustment
+    av := w.value_root[a]; bv := w.value_root[b]
+    if av == bv { if delta < 0 { w.reached[state] = false }; return }
+    saved := w.value_top
+    var x := number(&mut w, 0); var y := number(&mut w, 0)
+    if av >= 0 { x = get(&mut w, state, av) }; if bv >= 0 { y = get(&mut w, state, bv) }
+    bound := shifted(&mut w, y, delta)
+    upper(&mut w, state, av, bound); lower(&mut w, state, bv, w.value_low[x] - delta)
+    w.value_top = saved
+}
+fn refine(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, truth: bool, depth: i32) {
+    if w.state >= 3 || !w.reached[state] || f.kinds[node] != 3 || f.types[f.left[node]] != 1 { return }
+    var op := i32(f.values[node])
+    if op < 6 || op > 11 { return }
+    if !truth {
+        if op == 6 { op = 7 } else if op == 7 { op = 6 }
+        else if op == 8 { op = 11 } else if op == 9 { op = 10 }
+        else if op == 10 { op = 9 } else { op = 8 }
+    }
+    saved := w.value_top
+    a := term(&mut w, &f, f.left[node], depth + 1); b := term(&mut w, &f, f.right[node], depth + 1)
+    if op == 6 { constrain(&mut w, state, a, b, 0); constrain(&mut w, state, b, a, 0) }
+    else if op == 8 { constrain(&mut w, state, a, b, -1) }
+    else if op == 9 { constrain(&mut w, state, a, b, 0) }
+    else if op == 10 { constrain(&mut w, state, b, a, -1) }
+    else if op == 11 { constrain(&mut w, state, b, a, 0) }
+    w.value_top = saved
+}
+fn candidate(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, index: i32) {
+    if !w.replay || w.state >= 3 || !w.reached[state] || f.proofs[node].bit_and(2) != 0 || w.value_low[index] < 0 { return }
+    saved := w.value_top; array := f.locals[node]; length := get(&mut w, state, w.variables[array])
+    if w.state < 3 && ((w.value_root[index] == array && w.value_offset[index] <= -1) || w.value_high[index] < w.value_low[length]) {
+        if !w.pending[node] {
+            w.pending[node] = true
+            if f.kinds[node] == 6 { w.reads = w.reads + 1 } else { w.stores = w.stores + 1 }
+        }
+    }
+    w.value_top = saved
+}
+fn arithmetic(w: &mut Workspace, state: i32, op: i64, a: i32, b: i32) -> i32 {
+    result := top_value(&mut w)
+    if w.state >= 3 { return result }
+    if op == 1 || op == 2 {
+        if op == 1 { w.value_low[result] = w.value_low[a] + w.value_low[b]; w.value_high[result] = w.value_high[a] + w.value_high[b] }
+        else { w.value_low[result] = w.value_low[a] - w.value_high[b]; w.value_high[result] = w.value_high[a] - w.value_low[b] }
+        var source := -1; var amount: i64 = 0
+        if w.value_low[b] == w.value_high[b] { source = a; amount = w.value_low[b]; if op == 2 { amount = -amount } }
+        else if op == 1 && w.value_low[a] == w.value_high[a] { source = b; amount = w.value_low[a] }
+        if source >= 0 {
+            offset := w.value_offset[source] + amount
+            if offset >= -4294967296 && offset <= 4294967296 { w.value_root[result] = w.value_root[source]; w.value_offset[result] = offset }
+        }
+        if w.value_low[result] < -2147483648 { w.value_low[result] = -2147483648 }
+        if w.value_high[result] > 2147483647 { w.value_high[result] = 2147483647 }
+        if w.value_low[result] > w.value_high[result] { w.reached[state] = false }
+    }
+    result
+}
+fn expression(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, depth: i32) -> i32 {
+    saved := w.value_top; result := top_value(&mut w)
+    expression_into(&mut w, &f, node, state, result, depth)
+    w.value_top = saved + 1; result
+}
+fn expression_into(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, result: i32, depth: i32) {
+    if w.state >= 3 || !w.reached[state] { return }
+    if depth > 64 { w.state = 3; return }
+    if !spend(&mut w, 1) { return }
+    kind := f.kinds[node]
+    if kind == 1 { if f.types[node] == 1 { w.value_low[result] = f.values[node]; w.value_high[result] = f.values[node] }; return }
+    if kind == 2 || kind == 5 {
+        if f.types[node] == 1 { item := get(&mut w, state, w.variables[f.locals[node]]); result_copy(&mut w, result, item) }
+        return
+    }
+    if kind == 6 {
+        index := expression(&mut w, &f, f.left[node], state, depth + 1)
+        candidate(&mut w, &f, node, state, index); return
+    }
+    if (kind == 3 && f.values[node] >= 12) || (kind == 4 && f.values[node] == 2) {
+        saved := w.top; yes := fresh(&mut w); no := fresh(&mut w)
+        if w.state < 3 { split(&mut w, &f, node, state, yes, no, depth + 1); copy(&mut w, state, yes); join(&mut w, state, no) }
+        w.top = saved; return
+    }
+    a := expression(&mut w, &f, f.left[node], state, depth + 1)
+    if kind == 4 {
+        if f.types[node] == 1 { zero := number(&mut w, 0); item := arithmetic(&mut w, state, 2, zero, a); result_copy(&mut w, result, item) }
+        return
+    }
+    b := expression(&mut w, &f, f.right[node], state, depth + 1)
+    if f.types[node] == 1 { item := arithmetic(&mut w, state, f.values[node], a, b); result_copy(&mut w, result, item) }
+}
+fn split(w: &mut Workspace, f: &ir.Function, node: i32, input: i32, yes: i32, no: i32, depth: i32) {
+    if w.state >= 3 { return }
+    if depth > 64 { w.state = 3; return }
+    if !spend(&mut w, 1) { return }
+    w.reached[yes] = false; w.reached[no] = false
+    if !w.reached[input] { return }
+    kind := f.kinds[node]; op := f.values[node]
+    if kind == 1 {
+        if op != 0 { copy(&mut w, yes, input) } else { copy(&mut w, no, input) }; return
+    }
+    if kind == 4 && op == 2 { split(&mut w, &f, f.left[node], input, no, yes, depth + 1); return }
+    if kind == 3 && (op == 12 || op == 13) {
+        saved := w.top; a := fresh(&mut w); b := fresh(&mut w)
+        if w.state < 3 {
+            split(&mut w, &f, f.left[node], input, a, b, depth + 1)
+            if op == 12 { split(&mut w, &f, f.right[node], a, yes, no, depth + 1); join(&mut w, no, b) }
+            else { split(&mut w, &f, f.right[node], b, yes, no, depth + 1); join(&mut w, yes, a) }
+        }
+        w.top = saved; return
+    }
+    saved_values := w.value_top
+    copy(&mut w, yes, input)
+    ignored := expression(&mut w, &f, node, yes, depth + 1)
+    copy(&mut w, no, yes)
+    refine(&mut w, &f, node, yes, true, depth + 1); refine(&mut w, &f, node, no, false, depth + 1)
+    w.value_top = saved_values
+}
+fn loop_condition(w: &mut Workspace, f: &ir.Function, node: i32, header: i32, yes: i32, no: i32, depth: i32) {
+    if f.kinds[node] == 14 { split(&mut w, &f, f.left[node], header, yes, no, depth + 1); return }
+    copy(&mut w, yes, header); copy(&mut w, no, header)
+    saved := w.value_top
+    a := value(&mut w, 0, 1, w.variables[f.locals[node]], 0)
+    b := value(&mut w, 0, 1, w.limits[node], 0)
+    constrain(&mut w, yes, a, b, -1); constrain(&mut w, no, b, a, 0)
+    w.value_top = saved
+}
+fn loop_body(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, depth: i32) {
+    saved := w.top
+    yes := fresh(&mut w); no := fresh(&mut w); breaks := fresh(&mut w); continues := fresh(&mut w); back := fresh(&mut w); proposal := fresh(&mut w)
+    if w.state >= 3 { w.top = saved; return }
+    header := w.headers[node]
+    if !w.replay { copy(&mut w, header, state) }
+    else if !subset(&mut w, state, header) { if w.state < 3 { w.state = 4 }; w.top = saved; return }
+    var finished := false; var iteration := 0
+    while w.state < 3 && iteration < 8 {
+        loop_condition(&mut w, &f, node, header, yes, no, depth + 1)
+        w.reached[breaks] = false; w.reached[continues] = false
+        var body := f.right[node]; if f.kinds[node] == 19 { body = f.third[node] }
+        statement(&mut w, &f, body, yes, breaks, continues, depth + 1)
+        copy(&mut w, back, yes); join(&mut w, back, continues)
+        if f.kinds[node] == 19 && w.state < 3 && w.reached[back] {
+            local := w.variables[f.locals[node]]
+            saved_values := w.value_top
+            prior := get(&mut w, back, local); one := number(&mut w, 1); next := arithmetic(&mut w, back, 1, prior, one)
+            put(&mut w, back, local, next); w.value_top = saved_values
+        }
+        copy(&mut w, proposal, state); join(&mut w, proposal, back)
+        if subset(&mut w, proposal, header) {
+            copy(&mut w, state, no); join(&mut w, state, breaks); finished = true; break
+        }
+        if w.replay { if w.state < 3 { w.state = 4 }; break }
+        widen(&mut w, header, proposal, iteration >= 2); iteration = iteration + 1
+    }
+    if !finished && w.state < 3 { w.state = 3 }
+    w.top = saved
+}
+fn statement(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, breaks: i32, continues: i32, depth: i32) {
+    saved := w.value_top
+    statement_into(&mut w, &f, node, state, breaks, continues, depth)
+    w.value_top = saved
+}
+fn statement_into(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, breaks: i32, continues: i32, depth: i32) {
+    if w.state >= 3 || !w.reached[state] { return }
+    if depth > 64 { w.state = 3; return }
+    if !spend(&mut w, 1) { return }
+    kind := f.kinds[node]
+    if kind == 10 {
+        var at := f.left[node]
+        while at >= 0 && w.state < 3 && w.reached[state] { statement(&mut w, &f, at, state, breaks, continues, depth + 1); at = f.next[at] }
+    } else if kind == 11 || kind == 12 {
+        value := expression(&mut w, &f, f.left[node], state, depth + 1)
+        if f.local_types[f.locals[node]] == 1 { put(&mut w, state, w.variables[f.locals[node]], value) }
+    } else if kind == 13 {
+        saved := w.top; yes := fresh(&mut w); no := fresh(&mut w)
+        if w.state < 3 {
+            split(&mut w, &f, f.left[node], state, yes, no, depth + 1)
+            statement(&mut w, &f, f.right[node], yes, breaks, continues, depth + 1)
+            if f.third[node] >= 0 { statement(&mut w, &f, f.third[node], no, breaks, continues, depth + 1) }
+            copy(&mut w, state, yes); join(&mut w, state, no)
+        }
+        w.top = saved
+    } else if kind == 14 || kind == 19 {
+        if kind == 19 {
+            low := expression(&mut w, &f, f.left[node], state, depth + 1)
+            high := expression(&mut w, &f, f.right[node], state, depth + 1)
+            put(&mut w, state, w.variables[f.locals[node]], low); put(&mut w, state, w.limits[node], high)
+            w.value_top = low
+        }
+        if w.state < 3 && w.reached[state] { loop_body(&mut w, &f, node, state, depth + 1) }
+    } else if kind == 15 {
+        if f.left[node] >= 0 { value := expression(&mut w, &f, f.left[node], state, depth + 1) }
+        w.reached[state] = false
+    } else if kind == 16 || kind == 17 {
+        if kind == 16 { join(&mut w, breaks, state) } else { join(&mut w, continues, state) }
+        w.reached[state] = false
+    } else if kind == 18 {
+        index := expression(&mut w, &f, f.left[node], state, depth + 1)
+        candidate(&mut w, &f, node, state, index)
+        value := expression(&mut w, &f, f.right[node], state, depth + 1)
+        // No element-value fact exists. Aliasing stores preserve scalar locals
+        // and array shapes in this closed model, but never propagate memory.
+    } else { w.state = 4 }
+}
+fn initialize(w: &mut Workspace, f: &ir.Function, state: i32) {
+    if w.state >= 3 { return }
+    w.reached[state] = true
+    for i in 0..w.width {
+        saved := w.value_top; item := top_value(&mut w); owner := w.owners[i]
+        // Managed length roots fit i32: the current allocator's entire pool
+        // is 512 MiB and every element occupies at least one byte. Enlarging
+        // that pool must preserve the language's i32 length invariant.
+        if owner >= 0 { w.value_low[item] = 0; w.value_root[item] = owner }
+        put(&mut w, state, i, item); w.value_top = saved
+    }
+}
+pub fn analyze_into(w: &mut Workspace, f: &ir.Function) -> bool {
+    w.state = 0; w.units = 0; w.reads = 0; w.stores = 0; w.width = 0; w.top = 0; w.value_top = 0; w.enabled = false; w.replay = false
+    w.count = f.kinds.len; w.locals = f.local_types.len; w.root = f.root
+    // The verifier checks the closed opcode/effect set and graph before any
+    // range traversal. Future calls/shape writes/escapes are not accepted.
+    if !verify.validate_into(&mut w.validation, &f, true) { w.state = 4; return false }
+    var arrays := false
+    for i in 0..f.params { if ir.array_type(f.local_types[i]) { arrays = true } }
+    if !arrays { w.state = 1; return true }
+    w.enabled = true
+    while w.value_low.len < 1 { w.value_low.push(0); w.value_high.push(0); w.value_root.push(-1); w.value_offset.push(0) }
+    while w.pending.len < w.count { w.pending.push(false); w.headers.push(-1); w.limits.push(-1) }
+    for i in 0..w.count { w.pending[i] = false; w.headers[i] = -1; w.limits[i] = -1 }
+    while w.variables.len < w.locals { w.variables.push(-1) }
+    w.owners.clear()
+    for i in 0..w.locals {
+        w.variables[i] = -1
+        if f.local_types[i] == 1 || ir.array_type(f.local_types[i]) {
+            w.variables[i] = w.width; w.width = w.width + 1
+            var owner := -1; if ir.array_type(f.local_types[i]) { owner = i }; w.owners.push(owner)
+        }
+    }
+    for i in 0..w.count {
+        if f.kinds[i] == 19 { w.limits[i] = w.width; w.width = w.width + 1; w.owners.push(-1) }
+    }
+    for i in 0..w.count {
+        if f.kinds[i] == 14 || f.kinds[i] == 19 { header := fresh(&mut w); w.headers[i] = header }
+    }
+    w.persistent = w.top
+    input := fresh(&mut w)
+    if w.state >= 3 { return false }
+    initialize(&mut w, &f, input)
+    statement(&mut w, &f, f.root, input, -1, -1, 0)
+    if w.state >= 3 { return false }
+    // Recompute every program point under final, checked loop invariants.
+    // No speculative early-iteration proof can leak into this second phase.
+    w.replay = true; initialize(&mut w, &f, input)
+    statement(&mut w, &f, f.root, input, -1, -1, 0)
+    if w.state >= 3 { return false }
+    w.state = 1; true
+}
+// No model mutation may occur between analyze_into and apply. Shape/placement
+// assertions precede all writes. The plan is consumed exactly once.
+pub fn apply(w: &mut Workspace, f: &mut ir.Function) {
+    assert(w.state == 1 && f.kinds.len == w.count && f.local_types.len == w.locals && f.root == w.root)
+    if !w.enabled { w.state = 2; return }
+    assert(f.supported && f.types.len == w.count && f.left.len == w.count && f.right.len == w.count && f.third.len == w.count)
+    assert(f.next.len == w.count && f.values.len == w.count && f.locals.len == w.count && f.starts.len == w.count)
+    assert(f.effects.len == w.count && f.proofs.len == w.count)
+    for i in 0..w.count {
+        if w.pending[i] {
+            local := f.locals[i]
+            assert(local >= 0 && local < f.params)
+            assert((f.kinds[i] == 6 && f.types[i] == 2 && ir.array_type(f.local_types[local])) ||
+                (f.kinds[i] == 18 && f.types[i] == 0 && ir.writable_array(f.local_types[local])))
+        }
+    }
+    for i in 0..w.count { if w.pending[i] { f.proofs[i] = f.proofs[i].bit_or(2) } }
+    f.rewrites = f.rewrites + w.reads + w.stores; w.state = 2
+}
