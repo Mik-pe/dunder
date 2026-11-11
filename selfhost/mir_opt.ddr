@@ -4,6 +4,7 @@
 import mir
 import mir_abi as abi
 import mir_liveness as live
+import mir_memory as memory_policy
 
 pub opaque struct Workspace {
     liveness: live.Workspace, scores: []i32, allowed: []bool, shortlist: []i32,
@@ -13,12 +14,13 @@ pub opaque struct Workspace {
     status: i32, work: i32, limit: i32, source_ops: i32, source_places: i32,
     source_blocks: i32, source_labels: i32, frame_high: i32, frame_low: i32,
     old_frame: i32, new_frame: i32, loads: i32, stores: i32, loops: i32, calls: i32,
+    private_memory: bool, private_ops: i32,
 }
 pub fn new() -> Workspace { Workspace { liveness: live.new(), scores: [], allowed: [], shortlist: [],
     picked: [], homes: [], home_for_place: [], barriers: [], epilogues: [], entries: [], order: [], assembled: [], positions: [],
     init_in: [], init_gen: [], queue: [], queued: [], status: 0, work: 0, limit: 0,
     source_ops: 0, source_places: 0, source_blocks: 0, source_labels: 0,
-    frame_high: -1, frame_low: -1, old_frame: 0, new_frame: 0, loads: 0, stores: 0, loops: 0, calls: 0 } }
+    frame_high: -1, frame_low: -1, old_frame: 0, new_frame: 0, loads: 0, stores: 0, loops: 0, calls: 0, private_memory: false, private_ops: 0 } }
 pub fn status(w: &Workspace) -> i32 { w.status }
 pub fn units(w: &Workspace) -> i32 { w.work }
 pub fn promoted(w: &Workspace) -> i32 { if w.status > 0 { w.picked.len } else { 0 } }
@@ -26,6 +28,7 @@ pub fn removed_loads(w: &Workspace) -> i32 { if w.status > 0 { w.loads } else { 
 pub fn removed_stores(w: &Workspace) -> i32 { if w.status > 0 { w.stores } else { 0 } }
 pub fn loop_blocks(w: &Workspace) -> i32 { if w.status > 0 { w.loops } else { 0 } }
 pub fn barrier_count(w: &Workspace) -> i32 { if w.status > 0 { w.calls } else { 0 } }
+pub fn private_memory_ops(w: &Workspace) -> i32 { if w.status > 0 { w.private_ops } else { 0 } }
 fn charge(w: &mut Workspace, n: i32) -> bool {
     if n < 0 || n > w.limit - w.work { w.status = -3; return false }; w.work = w.work + n; true
 }
@@ -35,7 +38,7 @@ fn reset(w: &mut Workspace, limit: i32) {
     w.barriers.clear(); w.epilogues.clear(); w.entries.clear(); w.order.clear(); w.assembled.clear(); w.positions.clear()
     w.init_in.clear(); w.init_gen.clear(); w.queue.clear(); w.queued.clear()
     w.status = 0; w.work = 0; w.limit = limit; w.frame_high = -1; w.frame_low = -1
-    w.loads = 0; w.stores = 0; w.loops = 0; w.calls = 0
+    w.loads = 0; w.stores = 0; w.loops = 0; w.calls = 0; w.private_memory = false; w.private_ops = 0
 }
 fn frame_operation(f: &mir.Function, op: i32, destination: i32, source: i32, opcode: i32) -> bool {
     f.modes[op] != 2 && f.kinds[op] == 16 && f.types[op] == 2 && f.dst[op] == destination &&
@@ -137,11 +140,15 @@ fn select(w: &mut Workspace, f: &mir.Function) -> bool {
     for p in w.shortlist {
         if w.picked.len == 4 { break }
         if !charge(&mut w, places + 4) { return false }
-        var aliases := false
-        for other in 0..places {
-            if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
+        if w.private_memory {
+            if !memory_policy.private_cell(&f, p) { continue }
+        } else {
+            var aliases := false
+            for other in 0..places {
+                if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
+            }
+            if aliases { continue }
         }
-        if aliases { continue }
         var home := -1
         for reg in 25..29 { if used.bit_and(mir.variable_bit(reg)) == 0 && home < 0 { home = reg } }
         if home < 0 { break }
@@ -213,13 +220,24 @@ fn scratch(w: &mut Workspace, f: &mir.Function) -> bool {
 }
 // Status:1 prepared,2 consumed,-1 invalid/stale input,-2 unsupported or no
 // profitable candidates,-3 budget. Failure leaves every Function field intact.
-pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool {
+fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_objects: bool) -> bool {
     reset(&mut w, limit)
     if !f.valid || !f.verified { w.status = -1; return false }
     if !f.optimizable || f.unknown_control { return refuse(&mut w) }
     if limit < 0 || f.kinds.len > 65536 || f.place_kinds.len > 16384 { w.status = -3; return false }
     if f.place_kinds.len == 0 { return refuse(&mut w) }
     if !frame(&mut w, &f) { return false }
+    if source_objects {
+        if !charge(&mut w, f.order.len * 3 + 8) { return false }
+        if !memory_policy.source_frame_eligible(&f) { return refuse(&mut w) }
+        w.private_memory = true
+        for position in 0..f.order.len {
+            op := f.order[position]
+            if f.modes[op] != 2 && (f.kinds[op] == 7 || f.kinds[op] == 8) && f.place_kinds[f.place[op]] == 0 {
+                w.barriers[position] = false; w.private_ops = w.private_ops + 1
+            }
+        }
+    }
     if !live.analyze_into(&mut w.liveness, &f, w.limit - w.work) {
         w.status = live.status(&w.liveness); w.work = w.work + live.units(&w.liveness); return false
     }
@@ -235,7 +253,18 @@ pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool {
     w.source_ops = f.kinds.len; w.source_places = f.place_kinds.len; w.source_blocks = f.block_starts.len; w.source_labels = f.label_ops.len
     w.status = 1; true
 }
-pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_budget(&mut w, &f, 4194304) }
+// Raw MIR APIs retain their conservative policy without constructing records.
+pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool { analyze_policy(&mut w, &f, limit, false) }
+pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_policy(&mut w, &f, 4194304, false) }
+// Construct/reuse Context at the complete source-producer boundary. The
+// policy skips only proven-private indirect-memory synchronization; every
+// call still flushes/reloads because its ABI preservation is not established.
+pub fn analyze_with_context_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context, limit: i32) -> bool {
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context))
+}
+pub fn analyze_with_context(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context) -> bool {
+    analyze_policy(&mut w, &f, 4194304, memory_policy.source_objects(&context))
+}
 fn memory(f: &mut mir.Function, kind: i32, home: i32, place: i32, block: i32) -> i32 {
     op := mir.add(&mut f, kind); f.types[op] = 2; f.place[op] = place; f.aux[op] = 8
     f.imm[op] = i64(f.place_offsets[place])
