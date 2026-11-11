@@ -1,0 +1,657 @@
+// Bounded whole-function MUST value facts, then separate rewrite replay.
+// Each point owns equivalence partitions for full64 and low32 bits, constants
+// (TOP / exact / unknown), and a zero-extension fact. Unknowns never compare
+// equal. Writes remove their register from EVERY class before assigning a new
+// value, so re-executing a loop definition cannot alias its previous result.
+// Joins intersect all reachable predecessors; no rewrite occurs before the
+// descending fixpoint. No source names, encoded words, memory values or motion.
+import mir
+import mir_contract as core
+import mir_scalar_contract as scalar
+import mir_liveness as live
+import mir_verify as verify
+
+pub opaque struct Workspace {
+    plan: mir.Function, candidate: mir.Function, verifier: verify.Workspace, liveness: live.Workspace,
+    source: []i64, current: []i64, definitions: []i32,
+    reached: []bool, queued: []bool, queue: []i32, pred_starts: []i32, pred_fill: []i32, predecessors: []i32,
+    in_x: []i64, in_w: []i64, in_kx: []i32, in_vx: []i64, in_kw: []i32, in_vw: []i64, in_zero: []i64,
+    out_x: []i64, out_w: []i64, out_kx: []i32, out_vx: []i64, out_kw: []i32, out_vw: []i64, out_zero: []i64,
+    x: []i64, low: []i64, kx: []i32, vx: []i64, kw: []i32, vw: []i64, zero: i64,
+    state: i32, work: i32, limit: i32, rewrites: i32, deleted: i32, immediates: i32, iterations: i32,
+}
+fn candidate() -> mir.Function { var f := mir.new(); op := mir.add(&mut f, 1); f }
+pub fn new() -> Workspace {
+    Workspace { plan: mir.new(), candidate: candidate(), verifier: verify.new_work(), liveness: live.new(),
+        source: [], current: [], definitions: [], reached: [], queued: [], queue: [], pred_starts: [], pred_fill: [], predecessors: [],
+        in_x: [], in_w: [], in_kx: [], in_vx: [], in_kw: [], in_vw: [], in_zero: [],
+        out_x: [], out_w: [], out_kx: [], out_vx: [], out_kw: [], out_vw: [], out_zero: [],
+        x: [], low: [], kx: [], vx: [], kw: [], vw: [], zero: 0,
+        state: 0, work: 0, limit: 0, rewrites: 0, deleted: 0, immediates: 0, iterations: 0 }
+}
+pub fn status(w: &Workspace) -> i32 { w.state }
+pub fn units(w: &Workspace) -> i32 { w.work }
+pub fn rewritten(w: &Workspace) -> i32 { if w.state > 0 { w.rewrites } else { 0 } }
+pub fn deleted(w: &Workspace) -> i32 { if w.state > 0 { w.deleted } else { 0 } }
+pub fn constant_immediates(w: &Workspace) -> i32 { if w.state > 0 { w.immediates } else { 0 } }
+pub fn fixpoint_visits(w: &Workspace) -> i32 { w.iterations }
+fn charge(w: &mut Workspace, n: i32) -> bool {
+    if n < 0 || n > w.limit - w.work { w.state = -3; return false }; w.work = w.work + n; true
+}
+fn reset(w: &mut Workspace, limit: i32) {
+    w.source.clear(); w.current.clear(); w.definitions.clear(); w.reached.clear(); w.queued.clear(); w.queue.clear()
+    w.pred_starts.clear(); w.pred_fill.clear(); w.predecessors.clear()
+    w.in_x.clear(); w.in_w.clear(); w.in_kx.clear(); w.in_vx.clear(); w.in_kw.clear(); w.in_vw.clear(); w.in_zero.clear()
+    w.out_x.clear(); w.out_w.clear(); w.out_kx.clear(); w.out_vx.clear(); w.out_kw.clear(); w.out_vw.clear(); w.out_zero.clear()
+    w.x.clear(); w.low.clear(); w.kx.clear(); w.vx.clear(); w.kw.clear(); w.vw.clear()
+    w.state = 0; w.work = 0; w.limit = limit; w.rewrites = 0; w.deleted = 0; w.immediates = 0; w.iterations = 0
+}
+fn bit(reg: i32) -> i64 { i64(1).shl(reg) }
+fn index(reg: i32) -> i32 { if reg == -1 { 31 } else { reg } }
+fn top(w: &mut Workspace) {
+    w.zero = 4294967295
+    for r in 0..32 {
+        w.x[r] = 4294967295; w.low[r] = 4294967295; w.kx[r] = 2; w.vx[r] = 0; w.kw[r] = 2; w.vw[r] = 0
+    }
+}
+fn entry(w: &mut Workspace) {
+    w.zero = bit(31)
+    for r in 0..32 { w.x[r] = bit(r); w.low[r] = bit(r); w.kx[r] = 0; w.vx[r] = 0; w.kw[r] = 0; w.vw[r] = 0 }
+    w.kx[31] = 1; w.kw[31] = 1
+}
+fn kill(w: &mut Workspace, mask: i64) {
+    killed := mask.bit_and(2147483647); w.zero = w.zero.bit_and(killed.bit_not())
+    for r in 0..32 {
+        if killed.bit_and(bit(r)) != 0 {
+            w.x[r] = bit(r); w.low[r] = bit(r); w.kx[r] = 0; w.vx[r] = 0; w.kw[r] = 0; w.vw[r] = 0
+        } else { w.x[r] = w.x[r].bit_and(killed.bit_not()); w.low[r] = w.low[r].bit_and(killed.bit_not()) }
+    }
+}
+fn assign(w: &mut Workspace, dst: i32, eqx: i64, eqw: i64, kx: i32, vx: i64, kw: i32, vw: i64, zero: bool) {
+    kill(&mut w, bit(dst)); flag := bit(dst)
+    var full := eqx.bit_or(flag); var low := eqw.bit_or(flag)
+    for r in 0..32 {
+        if kx == 1 && w.kx[r] == 1 && w.vx[r] == vx { full = full.bit_or(bit(r)) }
+        if kw == 1 && w.kw[r] == 1 && w.vw[r] == vw { low = low.bit_or(bit(r)) }
+        if full.bit_and(bit(r)) != 0 { w.x[r] = w.x[r].bit_or(flag) }
+        if low.bit_and(bit(r)) != 0 { w.low[r] = w.low[r].bit_or(flag) }
+    }
+    w.x[dst] = full; w.low[dst] = low; w.kx[dst] = kx; w.vx[dst] = vx; w.kw[dst] = kw; w.vw[dst] = vw
+    if zero { w.zero = w.zero.bit_or(flag) }
+}
+fn transfer(w: &mut Workspace, f: &mir.Function, op: i32) {
+    if f.modes[op] == 2 { return }
+    dst := f.dst[op]; kind := f.kinds[op]; ty := f.types[op]
+    if dst >= 0 && dst <= 30 && (kind == 1 || kind == 2) && (ty == 1 || ty == 2) {
+        if kind == 1 {
+            var value := f.imm[op]; if ty == 1 { value = value.bit_and(4294967295) }
+            assign(&mut w, dst, 0, 0, 1, value, 1, value.bit_and(4294967295), value >= 0 && value <= 4294967295)
+        } else {
+            source := index(f.a[op]); var eqx := w.x[source]; eqw := w.low[source]
+            var kx := w.kx[source]; var vx := w.vx[source]; kw := w.kw[source]; vw := w.vw[source]
+            var zero := w.zero.bit_and(bit(source)) != 0
+            if ty == 1 { eqx = eqw.bit_and(w.zero); kx = kw; vx = vw; zero = true }
+            assign(&mut w, dst, eqx, eqw, kx, vx, kw, vw, zero)
+        }
+        return
+    }
+    // A constant's shared MOVZ/MOVK construction is an explicit bit insertion,
+    // not an opaque arithmetic value number. Interpret only these known bits.
+    if dst >= 0 && dst <= 30 && kind == 3 && f.opcodes[op] == 3 && (ty == 1 || ty == 2) &&
+        f.a[op] >= -1 && f.a[op] <= 30 && f.aux[op] >= 0 && f.aux[op] < 64 {
+        source := index(f.a[op]); shift := f.aux[op]; mask := i64(65535).shl(shift)
+        var kx := w.kx[source]; var vx := w.vx[source]; var kw := w.kw[source]; var vw := w.vw[source]
+        if kx == 1 { vx = vx.bit_and(mask.bit_not()).bit_or(f.imm[op]) }
+        if shift < 32 && kw == 1 { vw = vw.bit_and(mask.bit_not()).bit_or(f.imm[op]).bit_and(4294967295) }
+        if ty == 1 { kx = kw; vx = vw }
+        var zero := ty == 1
+        if kx == 1 { zero = vx >= 0 && vx <= 4294967295 }
+        var eqw: i64 = 0; if shift >= 32 { eqw = w.low[source] }
+        assign(&mut w, dst, 0, eqw, kx, vx, kw, vw, zero); return
+    }
+    kill(&mut w, f.writes[op].bit_or(f.clobbers[op]))
+    // Only known GP W-writing operation contracts establish zero-extension.
+    if dst >= 0 && dst <= 30 && (ty == 1 || kind == 6) &&
+        (kind == 3 || kind == 4 || kind == 6 || kind == 7) { w.zero = w.zero.bit_or(bit(dst)) }
+}
+fn load_in(w: &mut Workspace, block: i32) {
+    w.zero = w.in_zero[block]; base := block * 32
+    for r in 0..32 {
+        w.x[r] = w.in_x[base + r]; w.low[r] = w.in_w[base + r]
+        w.kx[r] = w.in_kx[base + r]; w.vx[r] = w.in_vx[base + r]; w.kw[r] = w.in_kw[base + r]; w.vw[r] = w.in_vw[base + r]
+    }
+}
+fn meet(w: &mut Workspace, block: i32) {
+    if block == 0 { entry(&mut w); return }; top(&mut w)
+    for p in w.pred_starts[block]..w.pred_starts[block + 1] {
+        pred := w.predecessors[p]; base := pred * 32; w.zero = w.zero.bit_and(w.out_zero[pred])
+        for r in 0..32 {
+            w.x[r] = w.x[r].bit_and(w.out_x[base + r]); w.low[r] = w.low[r].bit_and(w.out_w[base + r])
+            pk := w.out_kx[base + r]; pv := w.out_vx[base + r]
+            if w.kx[r] == 2 { w.kx[r] = pk; w.vx[r] = pv }
+            else if pk != 2 && (pk != w.kx[r] || (pk == 1 && pv != w.vx[r])) { w.kx[r] = 0; w.vx[r] = 0 }
+            lk := w.out_kw[base + r]; lv := w.out_vw[base + r]
+            if w.kw[r] == 2 { w.kw[r] = lk; w.vw[r] = lv }
+            else if lk != 2 && (lk != w.kw[r] || (lk == 1 && lv != w.vw[r])) { w.kw[r] = 0; w.vw[r] = 0 }
+        }
+    }
+}
+fn save_in(w: &mut Workspace, block: i32) {
+    w.in_zero[block] = w.zero; base := block * 32
+    for r in 0..32 {
+        w.in_x[base + r] = w.x[r]; w.in_w[base + r] = w.low[r]
+        w.in_kx[base + r] = w.kx[r]; w.in_vx[base + r] = w.vx[r]; w.in_kw[base + r] = w.kw[r]; w.in_vw[base + r] = w.vw[r]
+    }
+}
+fn save_out(w: &mut Workspace, block: i32) -> bool {
+    var changed := w.out_zero[block] != w.zero; w.out_zero[block] = w.zero; base := block * 32
+    for r in 0..32 {
+        at := base + r
+        if w.out_x[at] != w.x[r] || w.out_w[at] != w.low[r] || w.out_kx[at] != w.kx[r] || w.out_vx[at] != w.vx[r] ||
+            w.out_kw[at] != w.kw[r] || w.out_vw[at] != w.vw[r] { changed = true }
+        w.out_x[at] = w.x[r]; w.out_w[at] = w.low[r]; w.out_kx[at] = w.kx[r]; w.out_vx[at] = w.vx[r]
+        w.out_kw[at] = w.kw[r]; w.out_vw[at] = w.vw[r]
+    }
+    changed
+}
+fn graph(w: &mut Workspace, f: &mir.Function) -> bool {
+    blocks := f.block_starts.len
+    if !charge(&mut w, blocks * 386 + f.edge_to.len * 4 + f.kinds.len * 32) { return false }
+    for r in 0..32 {
+        w.definitions.push(0); w.x.push(0); w.low.push(0); w.kx.push(0); w.vx.push(0); w.kw.push(0); w.vw.push(0)
+    }
+    for op in 0..f.kinds.len { if f.modes[op] != 2 {
+        defs := f.writes[op].bit_or(f.clobbers[op])
+        for r in 0..31 { if defs.bit_and(bit(r)) != 0 { w.definitions[r] = w.definitions[r] + 1 } }
+    } }
+    for b in 0..blocks {
+        w.reached.push(false); w.queued.push(false); w.pred_fill.push(0); w.in_zero.push(4294967295); w.out_zero.push(4294967295)
+        for r in 0..32 {
+            w.in_x.push(4294967295); w.in_w.push(4294967295); w.in_kx.push(2); w.in_vx.push(0); w.in_kw.push(2); w.in_vw.push(0)
+            w.out_x.push(4294967295); w.out_w.push(4294967295); w.out_kx.push(2); w.out_vx.push(0); w.out_kw.push(2); w.out_vw.push(0)
+        }
+    }
+    w.reached[0] = true; w.queue.push(0); var next := 0
+    while next < w.queue.len {
+        b := w.queue[next]; next = next + 1
+        for e in f.edge_starts[b]..f.edge_starts[b + 1] {
+            to := f.edge_to[e]
+            if to >= 0 && !w.reached[to] { w.reached[to] = true; w.queue.push(to) }
+        }
+    }
+    for e in 0..f.edge_to.len { to := f.edge_to[e]; if to >= 0 && w.reached[f.edge_from[e]] { w.pred_fill[to] = w.pred_fill[to] + 1 } }
+    w.pred_starts.push(0)
+    for b in 0..blocks { w.pred_starts.push(w.pred_starts[b] + w.pred_fill[b]); w.pred_fill[b] = w.pred_starts[b] }
+    for p in 0..w.pred_starts[blocks] { w.predecessors.push(0) }
+    for e in 0..f.edge_to.len {
+        to := f.edge_to[e]; if to < 0 || !w.reached[f.edge_from[e]] { continue }
+        w.predecessors[w.pred_fill[to]] = f.edge_from[e]; w.pred_fill[to] = w.pred_fill[to] + 1
+    }
+    true
+}
+fn solve(w: &mut Workspace, f: &mir.Function) -> bool {
+    blocks := f.block_starts.len; w.queue.clear(); var pending := 0
+    for b in 0..blocks { w.queue.push(0); if w.reached[b] { w.queue[pending] = b; w.queued[b] = true; pending = pending + 1 } }
+    var head := 0; var tail := pending % blocks
+    while pending > 0 {
+        b := w.queue[head]; head = (head + 1) % blocks; pending = pending - 1; w.queued[b] = false
+        cost := 800 + (w.pred_starts[b + 1] - w.pred_starts[b]) * 194 + (f.block_ends[b] - f.block_starts[b]) * 256
+        if !charge(&mut w, cost) { return false }; w.iterations = w.iterations + 1
+        meet(&mut w, b); save_in(&mut w, b)
+        for position in f.block_starts[b]..f.block_ends[b] { transfer(&mut w, &f, f.order[position]) }
+        if !save_out(&mut w, b) { continue }
+        for e in f.edge_starts[b]..f.edge_starts[b + 1] {
+            to := f.edge_to[e]
+            if to >= 0 && !w.queued[to] { w.queue[tail] = to; tail = (tail + 1) % blocks; pending = pending + 1; w.queued[to] = true }
+        }
+    }
+    true
+}
+
+fn copy_i32(dst: &mut []i32, src: &[]i32) { dst.clear(); for value in src { dst.push(value) } }
+fn copy_i64(dst: &mut []i64, src: &[]i64) { dst.clear(); for value in src { dst.push(value) } }
+fn copy_bool(dst: &mut []bool, src: &[]bool) { dst.clear(); for value in src { dst.push(value) } }
+fn copy_function(dst: &mut mir.Function, src: &mir.Function) {
+    dst.valid = src.valid
+    dst.verified = src.verified
+    dst.optimizable = src.optimizable
+    dst.unknown_control = src.unknown_control
+    dst.platform = src.platform
+    dst.first_word = src.first_word
+    dst.first_label = src.first_label
+    dst.first_reloc = src.first_reloc
+    dst.first_import = src.first_import
+    dst.source_words = src.source_words
+    dst.source_labels = src.source_labels
+    dst.source_relocs = src.source_relocs
+    dst.source_imports = src.source_imports
+    copy_i32(&mut dst.kinds, &src.kinds)
+    copy_i32(&mut dst.opcodes, &src.opcodes)
+    copy_i32(&mut dst.dst, &src.dst)
+    copy_i32(&mut dst.a, &src.a)
+    copy_i32(&mut dst.b, &src.b)
+    copy_i32(&mut dst.c, &src.c)
+    copy_i64(&mut dst.imm, &src.imm)
+    copy_i32(&mut dst.aux, &src.aux)
+    copy_i64(&mut dst.variant, &src.variant)
+    copy_i32(&mut dst.types, &src.types)
+    copy_i32(&mut dst.place, &src.place)
+    copy_i32(&mut dst.extensions, &src.extensions)
+    copy_i32(&mut dst.effects, &src.effects)
+    copy_i32(&mut dst.flags, &src.flags)
+    copy_i32(&mut dst.abi, &src.abi)
+    copy_i64(&mut dst.reads, &src.reads)
+    copy_i64(&mut dst.writes, &src.writes)
+    copy_i64(&mut dst.clobbers, &src.clobbers)
+    copy_i32(&mut dst.origins, &src.origins)
+    copy_i32(&mut dst.raw_starts, &src.raw_starts)
+    copy_i32(&mut dst.widths, &src.widths)
+    copy_i32(&mut dst.modes, &src.modes)
+    copy_i32(&mut dst.recipes, &src.recipes)
+    copy_i32(&mut dst.targets, &src.targets)
+    copy_i32(&mut dst.reloc_kinds, &src.reloc_kinds)
+    copy_i32(&mut dst.import_ids, &src.import_ids)
+    copy_i32(&mut dst.order, &src.order)
+    copy_i64(&mut dst.raw, &src.raw)
+    copy_i32(&mut dst.place_kinds, &src.place_kinds)
+    copy_i32(&mut dst.place_offsets, &src.place_offsets)
+    copy_i32(&mut dst.place_widths, &src.place_widths)
+    copy_i32(&mut dst.place_extensions, &src.place_extensions)
+    copy_bool(&mut dst.place_escaped, &src.place_escaped)
+    copy_i32(&mut dst.place_table, &src.place_table)
+    dst.place_probes = src.place_probes
+    copy_i32(&mut dst.block_starts, &src.block_starts)
+    copy_i32(&mut dst.block_ends, &src.block_ends)
+    copy_i32(&mut dst.op_blocks, &src.op_blocks)
+    copy_i32(&mut dst.edge_from, &src.edge_from)
+    copy_i32(&mut dst.edge_to, &src.edge_to)
+    copy_i32(&mut dst.edge_kinds, &src.edge_kinds)
+    copy_i32(&mut dst.edge_starts, &src.edge_starts)
+    copy_i32(&mut dst.label_ids, &src.label_ids)
+    copy_i32(&mut dst.label_ops, &src.label_ops)
+    copy_i32(&mut dst.boundaries, &src.boundaries)
+    copy_bool(&mut dst.leaders, &src.leaders)
+    dst.visits = src.visits
+    dst.budget_exhausted = src.budget_exhausted
+}
+// An exact serialized source snapshot guards apply against stale analysis.
+// This is equality, never a hash-based correctness assumption.
+fn snapshot(dst: &mut []i64, f: &mir.Function) {
+    dst.clear()
+    if f.valid { dst.push(1) } else { dst.push(0) }
+    if f.verified { dst.push(1) } else { dst.push(0) }
+    if f.optimizable { dst.push(1) } else { dst.push(0) }
+    if f.unknown_control { dst.push(1) } else { dst.push(0) }
+    dst.push(i64(f.platform))
+    dst.push(i64(f.first_word))
+    dst.push(i64(f.first_label))
+    dst.push(i64(f.first_reloc))
+    dst.push(i64(f.first_import))
+    dst.push(i64(f.source_words))
+    dst.push(i64(f.source_labels))
+    dst.push(i64(f.source_relocs))
+    dst.push(i64(f.source_imports))
+    dst.push(i64(f.kinds.len))
+    for value in f.kinds { dst.push(i64(value)) }
+    dst.push(i64(f.opcodes.len))
+    for value in f.opcodes { dst.push(i64(value)) }
+    dst.push(i64(f.dst.len))
+    for value in f.dst { dst.push(i64(value)) }
+    dst.push(i64(f.a.len))
+    for value in f.a { dst.push(i64(value)) }
+    dst.push(i64(f.b.len))
+    for value in f.b { dst.push(i64(value)) }
+    dst.push(i64(f.c.len))
+    for value in f.c { dst.push(i64(value)) }
+    dst.push(i64(f.imm.len))
+    for value in f.imm { dst.push(i64(value)) }
+    dst.push(i64(f.aux.len))
+    for value in f.aux { dst.push(i64(value)) }
+    dst.push(i64(f.variant.len))
+    for value in f.variant { dst.push(i64(value)) }
+    dst.push(i64(f.types.len))
+    for value in f.types { dst.push(i64(value)) }
+    dst.push(i64(f.place.len))
+    for value in f.place { dst.push(i64(value)) }
+    dst.push(i64(f.extensions.len))
+    for value in f.extensions { dst.push(i64(value)) }
+    dst.push(i64(f.effects.len))
+    for value in f.effects { dst.push(i64(value)) }
+    dst.push(i64(f.flags.len))
+    for value in f.flags { dst.push(i64(value)) }
+    dst.push(i64(f.abi.len))
+    for value in f.abi { dst.push(i64(value)) }
+    dst.push(i64(f.reads.len))
+    for value in f.reads { dst.push(i64(value)) }
+    dst.push(i64(f.writes.len))
+    for value in f.writes { dst.push(i64(value)) }
+    dst.push(i64(f.clobbers.len))
+    for value in f.clobbers { dst.push(i64(value)) }
+    dst.push(i64(f.origins.len))
+    for value in f.origins { dst.push(i64(value)) }
+    dst.push(i64(f.raw_starts.len))
+    for value in f.raw_starts { dst.push(i64(value)) }
+    dst.push(i64(f.widths.len))
+    for value in f.widths { dst.push(i64(value)) }
+    dst.push(i64(f.modes.len))
+    for value in f.modes { dst.push(i64(value)) }
+    dst.push(i64(f.recipes.len))
+    for value in f.recipes { dst.push(i64(value)) }
+    dst.push(i64(f.targets.len))
+    for value in f.targets { dst.push(i64(value)) }
+    dst.push(i64(f.reloc_kinds.len))
+    for value in f.reloc_kinds { dst.push(i64(value)) }
+    dst.push(i64(f.import_ids.len))
+    for value in f.import_ids { dst.push(i64(value)) }
+    dst.push(i64(f.order.len))
+    for value in f.order { dst.push(i64(value)) }
+    dst.push(i64(f.raw.len))
+    for value in f.raw { dst.push(i64(value)) }
+    dst.push(i64(f.place_kinds.len))
+    for value in f.place_kinds { dst.push(i64(value)) }
+    dst.push(i64(f.place_offsets.len))
+    for value in f.place_offsets { dst.push(i64(value)) }
+    dst.push(i64(f.place_widths.len))
+    for value in f.place_widths { dst.push(i64(value)) }
+    dst.push(i64(f.place_extensions.len))
+    for value in f.place_extensions { dst.push(i64(value)) }
+    dst.push(i64(f.place_escaped.len))
+    for value in f.place_escaped { if value { dst.push(1) } else { dst.push(0) } }
+    dst.push(i64(f.place_table.len))
+    for value in f.place_table { dst.push(i64(value)) }
+    dst.push(i64(f.place_probes))
+    dst.push(i64(f.block_starts.len))
+    for value in f.block_starts { dst.push(i64(value)) }
+    dst.push(i64(f.block_ends.len))
+    for value in f.block_ends { dst.push(i64(value)) }
+    dst.push(i64(f.op_blocks.len))
+    for value in f.op_blocks { dst.push(i64(value)) }
+    dst.push(i64(f.edge_from.len))
+    for value in f.edge_from { dst.push(i64(value)) }
+    dst.push(i64(f.edge_to.len))
+    for value in f.edge_to { dst.push(i64(value)) }
+    dst.push(i64(f.edge_kinds.len))
+    for value in f.edge_kinds { dst.push(i64(value)) }
+    dst.push(i64(f.edge_starts.len))
+    for value in f.edge_starts { dst.push(i64(value)) }
+    dst.push(i64(f.label_ids.len))
+    for value in f.label_ids { dst.push(i64(value)) }
+    dst.push(i64(f.label_ops.len))
+    for value in f.label_ops { dst.push(i64(value)) }
+    dst.push(i64(f.boundaries.len))
+    for value in f.boundaries { dst.push(i64(value)) }
+    dst.push(i64(f.leaders.len))
+    for value in f.leaders { if value { dst.push(1) } else { dst.push(0) } }
+    dst.push(i64(f.visits))
+    if f.budget_exhausted { dst.push(1) } else { dst.push(0) }
+}
+
+fn source_size(f: &mir.Function) -> i32 {
+    var size := 61
+    size = size + f.kinds.len
+    size = size + f.opcodes.len
+    size = size + f.dst.len
+    size = size + f.a.len
+    size = size + f.b.len
+    size = size + f.c.len
+    size = size + f.imm.len
+    size = size + f.aux.len
+    size = size + f.variant.len
+    size = size + f.types.len
+    size = size + f.place.len
+    size = size + f.extensions.len
+    size = size + f.effects.len
+    size = size + f.flags.len
+    size = size + f.abi.len
+    size = size + f.reads.len
+    size = size + f.writes.len
+    size = size + f.clobbers.len
+    size = size + f.origins.len
+    size = size + f.raw_starts.len
+    size = size + f.widths.len
+    size = size + f.modes.len
+    size = size + f.recipes.len
+    size = size + f.targets.len
+    size = size + f.reloc_kinds.len
+    size = size + f.import_ids.len
+    size = size + f.order.len
+    size = size + f.raw.len
+    size = size + f.place_kinds.len
+    size = size + f.place_offsets.len
+    size = size + f.place_widths.len
+    size = size + f.place_extensions.len
+    size = size + f.place_escaped.len
+    size = size + f.place_table.len
+    size = size + f.block_starts.len
+    size = size + f.block_ends.len
+    size = size + f.op_blocks.len
+    size = size + f.edge_from.len
+    size = size + f.edge_to.len
+    size = size + f.edge_kinds.len
+    size = size + f.edge_starts.len
+    size = size + f.label_ids.len
+    size = size + f.label_ops.len
+    size = size + f.boundaries.len
+    size = size + f.leaders.len
+    size
+}
+fn ensure_plan(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function) -> bool {
+    if plan.valid { return true }
+    if !charge(&mut w, source_size(&f) * 2) { return false }
+    copy_function(&mut plan, &f); snapshot(&mut w.source, &f); true
+}
+fn candidate_from(w: &mut Workspace, f: &mir.Function, op: i32) {
+    w.candidate.kinds[0] = f.kinds[op]
+    w.candidate.opcodes[0] = f.opcodes[op]
+    w.candidate.dst[0] = f.dst[op]
+    w.candidate.a[0] = f.a[op]
+    w.candidate.b[0] = f.b[op]
+    w.candidate.c[0] = f.c[op]
+    w.candidate.imm[0] = f.imm[op]
+    w.candidate.aux[0] = f.aux[op]
+    w.candidate.types[0] = f.types[op]
+    w.candidate.place[0] = f.place[op]
+    w.candidate.extensions[0] = f.extensions[op]
+    w.candidate.effects[0] = f.effects[op]
+    w.candidate.flags[0] = f.flags[op]
+    w.candidate.abi[0] = f.abi[op]
+    w.candidate.reads[0] = f.reads[op]
+    w.candidate.writes[0] = f.writes[op]
+    w.candidate.clobbers[0] = f.clobbers[op]
+    w.candidate.modes[0] = f.modes[op]
+    w.candidate.targets[0] = f.targets[op]
+    w.candidate.reloc_kinds[0] = f.reloc_kinds[op]
+    w.candidate.import_ids[0] = f.import_ids[op]
+}
+fn commit_candidate(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, op: i32) {
+    if !ensure_plan(&mut w, &mut plan, &f) { return }
+    plan.kinds[op] = w.candidate.kinds[0]
+    plan.opcodes[op] = w.candidate.opcodes[0]
+    plan.dst[op] = w.candidate.dst[0]
+    plan.a[op] = w.candidate.a[0]
+    plan.b[op] = w.candidate.b[0]
+    plan.c[op] = w.candidate.c[0]
+    plan.imm[op] = w.candidate.imm[0]
+    plan.aux[op] = w.candidate.aux[0]
+    plan.types[op] = w.candidate.types[0]
+    plan.place[op] = w.candidate.place[0]
+    plan.extensions[op] = w.candidate.extensions[0]
+    plan.effects[op] = w.candidate.effects[0]
+    plan.flags[op] = w.candidate.flags[0]
+    plan.abi[op] = w.candidate.abi[0]
+    plan.reads[op] = w.candidate.reads[0]
+    plan.writes[op] = w.candidate.writes[0]
+    plan.clobbers[op] = w.candidate.clobbers[0]
+    plan.modes[op] = w.candidate.modes[0]
+    plan.targets[op] = w.candidate.targets[0]
+    plan.reloc_kinds[op] = w.candidate.reloc_kinds[0]
+    plan.import_ids[op] = w.candidate.import_ids[0]
+    plan.modes[op] = 1; w.rewrites = w.rewrites + 1
+}
+fn alias(w: &Workspace, operand: i32, ty: i32) -> i32 {
+    if operand < 0 || operand > 30 { return operand }
+    var eq := w.x[operand]; if ty == 1 { eq = w.low[operand] }
+    if eq.bit_and(bit(31)) != 0 { return -1 }
+    var best := operand
+    for r in 0..31 {
+        if eq.bit_and(bit(r)) != 0 && (w.definitions[r] < w.definitions[best] ||
+            (w.definitions[r] == w.definitions[best] && r < best)) { best = r }
+    }
+    best
+}
+fn known_constant(w: &Workspace, operand: i32, ty: i32) -> bool {
+    if operand < -1 || operand > 30 { return false }; r := index(operand)
+    if ty == 1 { w.kw[r] == 1 } else { w.kx[r] == 1 }
+}
+fn constant(w: &Workspace, operand: i32, ty: i32) -> i64 {
+    r := index(operand); if ty == 1 { w.vw[r] } else { w.vx[r] }
+}
+fn masks(w: &mut Workspace) {
+    w.candidate.reads[0] = mir.variable_bit(w.candidate.a[0]).bit_or(mir.variable_bit(w.candidate.b[0])).bit_or(mir.variable_bit(w.candidate.c[0]))
+    w.candidate.writes[0] = mir.variable_bit(w.candidate.dst[0])
+}
+fn rewrite_copy(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, op: i32) {
+    dst := f.dst[op]; source := f.a[op]; ty := f.types[op]
+    if dst < 0 || dst > 30 || source < -1 || source > 30 || (ty != 1 && ty != 2) { return }
+    var same := w.x[dst].bit_and(bit(index(source))) != 0
+    if ty == 1 { same = w.low[dst].bit_and(bit(index(source))) != 0 && w.zero.bit_and(bit(dst)) != 0 }
+    if same { if !ensure_plan(&mut w, &mut plan, &f) { return }; plan.modes[op] = 2; w.deleted = w.deleted + 1; return }
+    selected := alias(&w, source, ty); if selected == source { return }
+    candidate_from(&mut w, &f, op); w.candidate.a[0] = selected; masks(&mut w)
+    if core.canonical(&w.candidate, 0) { commit_candidate(&mut w, &mut plan, &f, op) }
+}
+fn rewrite_constant(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, op: i32) {
+    dst := f.dst[op]; ty := f.types[op]; if dst < 0 || dst > 30 || (ty != 1 && ty != 2) { return }
+    var value := f.imm[op]; if ty == 1 { value = value.bit_and(4294967295) }
+    if w.kx[dst] == 1 && w.vx[dst] == value { if !ensure_plan(&mut w, &mut plan, &f) { return }; plan.modes[op] = 2; w.deleted = w.deleted + 1; return }
+    var best := -2
+    for source in -1..31 {
+        if source == dst || !known_constant(&w, source, ty) || constant(&w, source, ty) != value { continue }
+        if source == -1 { best = -1; break }
+        if best == -2 { best = source }
+        else if w.definitions[source] < w.definitions[best] { best = source }
+    }
+    if best == -2 { return }
+    candidate_from(&mut w, &f, op)
+    w.candidate.kinds[0] = 2; w.candidate.opcodes[0] = 0; w.candidate.a[0] = best
+    w.candidate.b[0] = -1; w.candidate.c[0] = -1; w.candidate.imm[0] = 0; w.candidate.aux[0] = 0
+    masks(&mut w); if core.canonical(&w.candidate, 0) { commit_candidate(&mut w, &mut plan, &f, op) }
+}
+fn rewrite_scalar(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, op: i32) {
+    candidate_from(&mut w, &f, op)
+    if !scalar.can_emit(&w.candidate, 0) { return }
+    ty := f.types[op]
+    w.candidate.a[0] = alias(&w, f.a[op], ty); w.candidate.b[0] = alias(&w, f.b[op], ty); w.candidate.c[0] = alias(&w, f.c[op], ty)
+    masks(&mut w); var immediate := false
+    opcode := f.opcodes[op]
+    if (opcode == 1 || opcode == 2) && f.imm[op] == 0 && f.aux[op] == 0 && known_constant(&w, f.b[op], ty) {
+        value := constant(&w, f.b[op], ty)
+        if value > 0 {
+            saved := w.candidate.b[0]; w.candidate.b[0] = -1; w.candidate.imm[0] = value; masks(&mut w)
+            if scalar.can_emit(&w.candidate, 0) { immediate = true }
+            else { w.candidate.b[0] = saved; w.candidate.imm[0] = f.imm[op]; masks(&mut w) }
+        }
+    }
+    if w.candidate.a[0] == f.a[op] && w.candidate.b[0] == f.b[op] && w.candidate.c[0] == f.c[op] &&
+        w.candidate.imm[0] == f.imm[op] { return }
+    if !scalar.can_emit(&w.candidate, 0) { return }
+    commit_candidate(&mut w, &mut plan, &f, op); if immediate { w.immediates = w.immediates + 1 }
+}
+fn replay(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function) -> bool {
+    if !charge(&mut w, f.kinds.len * 512 + f.block_starts.len * 194) { return false }
+    for b in 0..f.block_starts.len {
+        if !w.reached[b] { continue }; load_in(&mut w, b)
+        for position in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[position]; if f.modes[op] == 2 { continue }
+            if f.kinds[op] == 1 { rewrite_constant(&mut w, &mut plan, &f, op) }
+            else if f.kinds[op] == 2 { rewrite_copy(&mut w, &mut plan, &f, op) }
+            else if scalar.handles(f.kinds[op]) { rewrite_scalar(&mut w, &mut plan, &f, op) }
+            if w.state < 0 { return false }; transfer(&mut w, &f, op)
+        }
+    }
+    true
+}
+fn pure_materialization(f: &mir.Function, op: i32) -> bool {
+    (f.kinds[op] == 1 || f.kinds[op] == 2 || (f.kinds[op] == 3 && f.opcodes[op] == 3 && scalar.can_emit(&f, op))) &&
+        f.effects[op] == 0 && f.flags[op] == 0 && f.abi[op] == 0 &&
+        f.clobbers[op] == 0 && f.dst[op] >= -1 && f.dst[op] <= 30 &&
+        f.writes[op] == mir.variable_bit(f.dst[op]) && f.place[op] == -1 && f.reloc_kinds[op] == -1 && f.import_ids[op] == -1
+}
+fn check_plan(w: &mut Workspace, plan: &mut mir.Function) -> bool {
+    if !plan.valid { return true }
+    if !charge(&mut w, plan.kinds.len * 100 + plan.raw.len) { return false }
+    if !verify.verify_into(&mut plan, &mut w.verifier) { w.state = -1; return false }; true
+}
+fn dead(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function) -> bool {
+    var again := true
+    while again {
+        again = false; var analyzed := false
+        if plan.valid { analyzed = live.analyze_into(&mut w.liveness, &plan, w.limit - w.work) }
+        else { analyzed = live.analyze_into(&mut w.liveness, &f, w.limit - w.work) }
+        if !analyzed { w.work = w.work + live.units(&w.liveness); w.state = live.status(&w.liveness); return false }
+        if !charge(&mut w, live.units(&w.liveness) + f.kinds.len * 4) { return false }
+        for b in 0..f.block_starts.len {
+            if !live.reachable(&w.liveness, b) { continue }
+            var needed := live.live_out(&w.liveness, b); var position := f.block_ends[b]
+            while position > f.block_starts[b] {
+                position = position - 1; op := f.order[position]
+                var mode := f.modes[op]; var reads := f.reads[op]; var writes := f.writes[op]; var clobbers := f.clobbers[op]
+                var pure := pure_materialization(&f, op)
+                if plan.valid { mode = plan.modes[op]; reads = plan.reads[op]; writes = plan.writes[op]; clobbers = plan.clobbers[op]; pure = pure_materialization(&plan, op) }
+                if mode == 2 { continue }
+                if pure && writes.bit_and(needed) == 0 {
+                    if !ensure_plan(&mut w, &mut plan, &f) { return false }
+                    plan.modes[op] = 2; w.deleted = w.deleted + 1; again = true; continue
+                }
+                needed = reads.bit_or(needed.bit_and(writes.bit_or(clobbers).bit_not()))
+            }
+        }
+    }
+    true
+}
+fn analyze_detached(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, limit: i32) -> bool {
+    reset(&mut w, limit); plan.valid = false
+    if !f.valid || !f.verified { w.state = -1; return false }
+    if !f.optimizable || f.unknown_control { w.state = -2; return false }
+    n := f.kinds.len; blocks := f.block_starts.len
+    if limit < 0 || n > 65536 || blocks > 16384 || f.edge_to.len > 32768 { w.state = -3; return false }
+    if blocks == 0 { return false }
+    if !charge(&mut w, n) { return false }; var candidates := false
+    for op in 0..n { if f.modes[op] != 2 && (f.kinds[op] == 1 || f.kinds[op] == 2 || (f.kinds[op] == 3 && f.opcodes[op] == 3)) { candidates = true } }
+    if !candidates { return false }
+    if !graph(&mut w, &f) || !solve(&mut w, &f) || !replay(&mut w, &mut plan, &f) { return false }
+    if !check_plan(&mut w, &mut plan) || !dead(&mut w, &mut plan, &f) || !check_plan(&mut w, &mut plan) { return false }
+    if !plan.valid || (w.rewrites == 0 && w.deleted == 0) { w.state = 0; return false }
+    // Reserve exact source equality, final field commit and post-verification.
+    if !charge(&mut w, w.source.len * 2 + n * 128 + plan.raw.len) { return false }
+    w.state = 1; true
+}
+// status:1 prepared,2 consumed,0 no change,-1 invalid/stale,-2 opaque control,
+// -3 work/resource budget. Refusal exposes no partial plan and never edits f.
+pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool {
+    // Detach the owned reusable arena once to provide independent borrow roots.
+    // No per-operation object, cloning, or allocation is involved in this swap.
+    var plan := w.plan; w.plan = mir.new()
+    prepared := analyze_detached(&mut w, &mut plan, &f, limit); w.plan = plan; prepared
+}
+pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_budget(&mut w, &f, 4194304) }
+pub fn apply(w: &mut Workspace, f: &mut mir.Function) -> bool {
+    if w.state != 1 { return false }
+    if source_size(&f) != w.source.len { w.state = -1; return false }
+    snapshot(&mut w.current, &f)
+    if w.current.len != w.source.len { w.state = -1; return false }
+    for at in 0..w.source.len { if w.current[at] != w.source[at] { w.state = -1; return false } }
+    f.verified = false
+    for op in 0..f.kinds.len {
+        f.kinds[op] = w.plan.kinds[op]; f.opcodes[op] = w.plan.opcodes[op]
+        f.dst[op] = w.plan.dst[op]; f.a[op] = w.plan.a[op]; f.b[op] = w.plan.b[op]; f.c[op] = w.plan.c[op]
+        f.imm[op] = w.plan.imm[op]; f.aux[op] = w.plan.aux[op]; f.types[op] = w.plan.types[op]
+        f.place[op] = w.plan.place[op]; f.extensions[op] = w.plan.extensions[op]
+        f.effects[op] = w.plan.effects[op]; f.flags[op] = w.plan.flags[op]; f.abi[op] = w.plan.abi[op]
+        f.reads[op] = w.plan.reads[op]; f.writes[op] = w.plan.writes[op]; f.clobbers[op] = w.plan.clobbers[op]
+        f.modes[op] = w.plan.modes[op]
+    }
+    // Exact source equality plus an already-verified complete plan makes this
+    // commit atomic. Recheck the final object before publishing success.
+    assert(verify.verify_into(&mut f, &mut w.verifier)); w.state = 2; true
+}
