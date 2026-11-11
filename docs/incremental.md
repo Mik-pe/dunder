@@ -73,6 +73,13 @@ inklusive kroppar med anrop och ägda värden. Cacheträffar och kontroll utan
 emission ger inga nya IR-operationer. `--mir=off` stänger av kedjan för
 jämförelse och felsökning.
 
+`--mir-opt=off` behåller kedjan men stänger av dess generella registerpass.
+`mir.optimization_enabled` anger effektiv policy; `optimized`, `promoted`,
+`removed_loads`, `removed_stores`, `analysis_units` och `budget_refusals`
+räknar faktiskt arbete. Full cacheåterställning kan därför ha aktiv policy
+och noll nytt arbete. Även detta läge och passversionen ingår i
+funktionscache och berörda testkvitton.
+
 Klockan väljs efter kompilatorns värdplattform, även vid korsbyggen. Ett
 klockfel ger `clock_ok: false` och otillgängliga intervall som `null`.
 Lyckade byggen och kontroller ger rapporter; misslyckade eller enbart

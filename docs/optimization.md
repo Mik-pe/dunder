@@ -38,8 +38,46 @@ importplatser och kod atomiskt före commit.
 `--mir=off` stänger av den nya gränsen för jämförelse. Läget och kedjans
 version skiljer cachefragment och testkvitton åt. `--timings=json` visar
 antal nyemitterade IR-funktioner, operationer och opaka barriärer.
-Denna första integration sänker fortfarande byteidentisk kod; representationen
-ensam innebär ingen runtimevinst eller ett uppnått C-mål.
+Med `--mir-opt=off` ger gränsen byteidentisk kod mot den tidigare
+kodgeneratorn. Representationen ensam innebär ingen runtimevinst eller ett
+uppnått C-mål.
+
+### Registerhem över hela funktioner
+
+[`mir_liveness`](../selfhost/mir_liveness.ddr) beskriver fysisk register- och
+flaggliveness på verkliga CFG-kanter. Iterativ SCC-analys identifierar
+cykliska block; ägarinitieringens bakåthopp skapar ingen falsk loop.
+Returen läser både X0-resultatet och caller-observerbart ABI-tillstånd.
+Möjlig registerförstörelse vid anrop är skild från definierade resultat.
+
+[`mir_opt`](../selfhost/mir_opt.ddr) kan ge upp till fyra oexponerade,
+disjunkta åttabytesplatser registerhem i x25–x28. Det använder vanlig
+funktionssemantik, liveness och minnesintervall. Byte-, halvords- och
+ordåtkomster, överlapp, exponerade adresser och otillräckliga stack-/frame-
+kontrakt undantas. Passet ändrar varken språkets typning eller dess
+utvärderings-, fäll- och cleanupordning.
+
+Inkommande registervärden sparas i färska frameceller och återställs före
+varje normal epilog. Den kompletta framereservationen utökas atomiskt.
+Stora offset kräver explicit scratchregister och bevisad liveness.
+Anrop och okänd minnesåtkomst synkroniserar hemmen mot de ursprungliga
+platserna; inget antagande görs att äldre callees bevarar de nya hemmen.
+En separat may-uninitialized-analys kräver att varje ersatt läsning har
+en föregående skrivning på alla nåbara vägar.
+
+Arbetsminnena återanvänds och verkligt arbete debiteras inom 4 194 304
+enheter per funktion. Budget eller saknat bevis lämnar den verifierade
+funktionen orörd. Ett framgångsrikt pass verifieras alltid på nytt före
+sänkning; trasigt tillstånd är ett internt fel. Hela källfunktionen går
+genom IR även när den frivilliga omskrivningen avstår.
+
+`--mir-opt=off` stänger bara av passet och behåller helfunktionskedjan.
+Cachefragment och testkvitton skiljer läget och pipelineversionen åt.
+Tidsrapportens `mir` visar effektiv `optimization_enabled`-policy samt
+`optimized`, `promoted`, `removed_loads`, `removed_stores`, `analysis_units`
+och `budget_refusals`. Faktiska arbetsräknare är noll vid check, avstängt
+pass och full cacheåterställning. Policyflaggan kan fortfarande vara på
+vid cacheträff. Full GP-SSA, coalescing och konstantplacering återstår.
 
 ## Typad funktionsmodell och lokalt optimeringspass
 
