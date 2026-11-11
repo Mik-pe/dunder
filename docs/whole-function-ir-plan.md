@@ -114,3 +114,34 @@ och fortfarande klarar kompileringstidsmålet. En ny arkitektur får kosta
 arbete; den måste också förklara och mäta vart arbetet går. Cacheformat och
 processdiagnostik fortsätter som separata uppgifter och styr inte denna
 leverans.
+
+
+## Nästa transaktionsgräns: exklusivt ägande och glesa ändringar
+
+Det aktiva värdepasset har separata, återanvändbara plan- och arbetsarenor.
+Det kopierar fortfarande hela modellen först vid en verklig ändring och
+använder exakta snapshots för sitt publika analyze/apply-kontrakt. Den
+kostnaden är avsiktlig och ska mätas med den sammanhängande milstolpen.
+Följande omläggning är planerad, ännu inte implementerad:
+
+- En publik `optimize_into(work, edits, &mut function, context, budget)`
+  behåller det exklusiva lånet genom analys, förberedelse och commit.
+  Delstegen är privata; ingen extern mutation kan ske mellan analyze/apply.
+- En opak, återanvändbar editlista innehåller bara stabila op-ID:n och
+  ändrade semantiska kolumner. En indexkarta ger konstant uppslagstid.
+  Kodord, etiketter, minnesplatser och CFG delas läsande med originalet.
+- Liveness och verifiering läser samma projekterade vy av original plus
+  ändringar och använder samma kanoniska kontrakt som vanlig MIR. Flytta
+  verifierarens scratch från `Function.leaders` till dess eget arbetsminne,
+  så att förhandsverifieringen inte muterar modellen.
+- Alla normala avslag och hela arbetsreservationen sker före mutation.
+  Commit kräver ingen allokering eller nya val. Glesa ursprungliga rader
+  räcker för återställning om den obligatoriska slutverifieringen upptäcker
+  ett internt fel; inga delvis ändrade funktioner publiceras.
+
+Detta ersätter fulla modellkopior och två snapshots med arbete och lagring
+proportionellt mot antalet ändrade operationer, utöver den befintliga
+analysen. Det ändrar inte typregler, fällor, observationer vid externa
+utgångar eller obligatorisk slutverifiering. Nästa mätning ska särskilt
+särredovisa funktioner utan ändring, många små funktioner efter en stor,
+rena byggen och samma standardprofils runtime mot C.
