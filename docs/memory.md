@@ -19,6 +19,14 @@ Tilldelning säkrar det nya värdet innan det gamla släpps. En array som skicka
 som värde får en egen kopia. `pop` överför elementets ägande. `clear` släpper
 elementen och behåller arrayens kapacitet.
 
+Direkt iteration med `for byte in text.bytes()` eller
+`for scalar in text.runes()` kan strömma från en behållen strängsnapshot
+utan att skapa konverteringens mellanbuffert. Källan utvärderas en gång;
+att ersätta strängen under loopen ändrar inte värdena som återstår.
+En lagrad konvertering är fortfarande en självständig array. Dolda
+mellanbuffertars allokering och resursåtgång är implementationsdetaljer;
+uttryckliga kapacitetskontroller och fel för index eller UTF-8 behålls.
+
 I `text + change(&mut text)` behåller vänsterledet strängen som lästes före
 funktionsanropet. Samma utvärderingsordning gäller för argument, index och
 snittgränser. En retur bevarar sitt resultat medan funktionen städar sina
