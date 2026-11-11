@@ -299,6 +299,28 @@ def range_optimizer_controls(p):
         result = p.call('test', 'range-tests.ddr', '--affected', '--range-opt=' + mode, '-o', 'range-results')
         assert expected in result.stdout, result
     p.call('check', 'range.ddr', '--range-opt=unknown', status=2)
+    # Arithmetic eligibility must not depend on a dummy array parameter.
+    p.write('range-scalar.ddr', 'fn bounded(x:i32)->i32{if x>=-10&&x<=10{return x*x+1};0}\n'
+            'fn main(){print(bounded(3))}\n')
+    scalar_records = {}
+    for mode in ('off', 'on'):
+        name = 'range-scalar-' + mode
+        result = p.call('build', 'range-scalar.ddr', '--range-opt=' + mode,
+                        '--profile-compiler', '--timings=json', '-o', name)
+        scalar_records[mode] = json.loads(result.stderr)
+        run = subprocess.run([p.root/name], capture_output=True, text=True, timeout=10)
+        assert run.returncode == 0 and run.stdout == '10\n' and not run.stderr, run
+    assert scalar_records['on']['compiler_detail']['calls']['range_analysis'] > 0
+    assert scalar_records['off']['compiler_detail']['calls']['range_analysis'] == 0
+    assert (p.root/'range-scalar-off').read_bytes() != (p.root/'range-scalar-on').read_bytes()
+    # A child overflow leaves no normal continuation for parent interval math.
+    p.write('range-bottom.ddr', 'fn bad()->i32{(2147483647*2147483647)*0}\n'
+            'fn main(){print(bad())}\n')
+    for mode in ('off', 'on'):
+        name = 'range-bottom-' + mode
+        p.call('build', 'range-bottom.ddr', '--range-opt=' + mode, '-o', name)
+        run = subprocess.run([p.root/name], capture_output=True, text=True, timeout=10)
+        assert run.returncode == 101 and run.stdout == '' and run.stderr == '', run
 
 
 def compiler_profile_controls(p):

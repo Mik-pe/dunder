@@ -12,7 +12,9 @@ python3 tools/test-diagnostics.py "$compiler"
 python3 tools/test-check.py "$compiler"
 python3 tools/test-optimizer.py "$compiler" --verify-selection
 python3 tools/test-opt-emitter.py "$compiler"
+python3 tools/test-register-comparisons.py "$compiler"
 python3 tools/test-expression-emitter.py "$compiler"
+python3 tools/test-inline-catalog.py "$compiler"
 python3 tools/test-const-div.py "$compiler" --verify-selection
 python3 tools/test-frame-free.py "$compiler"
 python3 tools/test-range-emitter.py "$compiler"

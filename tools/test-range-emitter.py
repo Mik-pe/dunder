@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify actual bounds removal and trap order for the range proof emitter."""
+"""Verify exact bounds/i32 check removal and trap order for range proofs."""
 import argparse
 from pathlib import Path
 import platform
@@ -31,7 +31,16 @@ cases = [
     ('break_exit', '{for cursor in 0..p0.len{var target:=cursor;while target>0{target=target-1;if p1>0{target=-1;break};p0[target]=0};p0[target]=0};0}', 21, [5, 1, *params[2:]], 0, 103, 8, 0, 1),
     ('empty', '{for cursor in 0..p0.len{p0[cursor]=p0[cursor]+1};0}', 21, params, 0, 0, 0, 1, 1),
     ('negative_backedge', '{var cursor:=0;while cursor<p0.len{p0[cursor]=0;cursor=-1};0}', 21, params, 0, 103, 8, 0, 0),
+    ('guarded_arithmetic', '{if p1>=-10&&p1<=10{small:=p1+3;squared:=small*small;negative:=-small;difference:=squared-negative;if difference==12{return 42}};0}', 20, params, 42, 0, 8, 0, 0),
+    ('guarded_negate', '{if p1<=-2147483648{return 0};small:=-p1;if small == -5{return 42};0}', 20, [5, 5, *params[2:]], 42, 0, 8, 0, 0),
+    ('parent_after_child', '{if p1>=0{small:=(p1+1)*0;if small==0{return 42}};0}', 20, [5, 2147483647, *params[2:]], 0, 101, 8, 0, 0),
+    ('bottom_product', '{small:=(2147483647*2147483647)*0;0}', 20, params, 0, 101, 8, 0, 0),
+    ('bottom_add', '{small:=(2147483647+1)*0;0}', 20, params, 0, 101, 8, 0, 0),
 ]
+arithmetic_proofs = {'sum': 1, 'insertion': 3, 'reverse': 3,
+                     'unsafe_offset': 1, 'break_exit': 1,
+                     'guarded_arithmetic': 4, 'guarded_negate': 1,
+                     'parent_after_child': 1}
 
 with tempfile.TemporaryDirectory(prefix='dunder-range-analysis-') as directory:
     work = Path(directory)
@@ -45,12 +54,13 @@ with tempfile.TemporaryDirectory(prefix='dunder-range-analysis-') as directory:
             images, counters = {}, {}
             for mode in ('none', 'range', 'budget'):
                 image = work / f'{name}-{target}-{mode}'
-                proof_counts = (reads, stores) if mode == 'range' else (0, 0)
+                arithmetic = arithmetic_proofs.get(name, 0)
+                proof_counts = (reads, stores, arithmetic) if mode == 'range' else (0, 0, 0)
                 command = [harness, source, image, str(target), str(expected), '2', str(first), *map(str, arguments), str(length), mode, *map(str, proof_counts)]
                 result = subprocess.run(command, capture_output=True, timeout=10)
                 assert result.returncode == 0, (name, target, mode, result.returncode, result.stdout, result.stderr)
                 counters[mode] = tuple(map(int, result.stdout.splitlines()))
-                assert len(counters[mode]) == 3
+                assert len(counters[mode]) == 4
                 images[mode] = image.read_bytes()
                 if target == host:
                     run = subprocess.run([image], capture_output=True, timeout=10)
@@ -59,14 +69,16 @@ with tempfile.TemporaryDirectory(prefix='dunder-range-analysis-') as directory:
                     run = subprocess.run(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], capture_output=True, timeout=10)
                     assert run.returncode == (125 if status else 0), (name, mode, run.returncode, status, run.stderr)
             assert counters['none'][0] - counters['range'][0] == reads + stores, (name, target, counters)
-            assert counters['none'][1:] == counters['range'][1:], (name, target, 'arithmetic/zero checks changed', counters)
+            assert counters['none'][1] - counters['range'][1] == 2 * arithmetic, (name, target, 'i32 checks removed', counters)
+            assert counters['none'][2] == counters['range'][2], (name, target, 'zero checks changed', counters)
+            assert counters['range'][3] == arithmetic, (name, target, 'arithmetic proof count', counters)
             assert images['none'] == images['budget'], (name, target, 'budget fallback changed code')
-            assert (images['none'] != images['range']) == (reads + stores > 0), (name, target, 'proofs did not change emitted code')
-        print('PASS', name, 'all four targets; native/Wasm executed; exact bounds removal; arithmetic unchanged', flush=True)
+            assert (images['none'] != images['range']) == (reads + stores + arithmetic > 0), (name, target, 'proofs did not change emitted code')
+        print('PASS', name, 'all four targets; native/Wasm executed; exact bounds/i32 removal; zero checks unchanged', flush=True)
     for mode in ('idle', 'twice', 'shape', 'budget-apply'):
         source = work / 'guard.ddr'
         source.write_text('p0 p1 p2 p3 p4 p5 p6 p7 {for cursor in 0..p0.len{p0[cursor]=0};0}')
-        command = [harness, source, work / 'unused', str(host), '0', '2', '21', *map(str, params), '8', mode, '0', '0']
+        command = [harness, source, work / 'unused', str(host), '0', '2', '21', *map(str, params), '8', mode, '0', '0', '0']
         result = subprocess.run(command, capture_output=True, timeout=10)
         assert result.returncode == 104, (mode, result.returncode, result.stdout, result.stderr)
         print('PASS', mode, 'rejected', flush=True)
