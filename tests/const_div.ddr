@@ -1,0 +1,130 @@
+import ..selfhost.const_div as division
+import ..selfhost.arm64 as arm
+import ..selfhost.lexer
+import ..selfhost.opt_ir as ir
+import ..selfhost.opt_parse as parse
+import ..selfhost.opt_alloc as alloc
+import ..selfhost.opt_emit as emitter
+
+fn floor_shift(value: i64, amount: i32) -> i64 {
+    scale := i64(1).shl(amount)
+    var quotient := value / scale
+    if value < 0 && value % scale != 0 { quotient = quotient - 1 }
+    quotient
+}
+// Small-width interpretation uses exact fitting i64 arithmetic and the
+// mathematical signed high product, independently of machine instructions.
+fn small_quotient(p: &division.Plan, numerator: i64) -> i64 {
+    if p.kind == 2 { if p.negative { return -numerator }; return numerator }
+    if p.kind == 4 { if numerator == p.divisor { return 1 }; return 0 }
+    var quotient: i64 = 0
+    if p.kind == 3 {
+        var biased := numerator
+        if numerator < 0 { biased = biased + i64(1).shl(p.shift) - 1 }
+        quotient = floor_shift(biased, p.shift)
+    } else {
+        assert(p.kind == 5)
+        var high := floor_shift(numerator * p.magic, p.width)
+        if p.add { high = high + numerator }
+        quotient = floor_shift(high, p.shift)
+        if numerator < 0 { quotient = quotient + 1 }
+    }
+    if p.negative { quotient = -quotient }
+    quotient
+}
+@test fn small_signed_widths_exhaustively_match_quotient_and_remainder() {
+    var p := division.new()
+    for width in 3..9 {
+        low := -i64(1).shl(width - 1); limit := -low
+        var divisor := low
+        while divisor < limit {
+            assert(division.prepare_into(&mut p, divisor, width))
+            assert(p.supported && p.iterations <= 128)
+            var numerator := low
+            while numerator < limit {
+                if divisor != 0 && !(numerator == low && divisor == -1) {
+                    expected := numerator / divisor
+                    actual := small_quotient(&p, numerator)
+                    assert(actual == expected)
+                    assert(numerator - actual * divisor == numerator % divisor)
+                }
+                numerator = numerator + 1
+            }
+            divisor = divisor + 1
+        }
+    }
+}
+@test fn plans_reuse_storage_and_keep_all_special_cases_explicit() {
+    var p := division.new()
+    assert(!division.prepare_into(&mut p, 3, 2))
+    assert(!p.supported && p.kind == 0)
+    assert(!division.prepare_into(&mut p, 3, 65))
+    assert(!division.prepare_into(&mut p, 128, 8))
+    assert(!division.prepare_into(&mut p, -129, 8))
+    assert(division.prepare_into(&mut p, 3, 32))
+    assert(p.kind == 5 && p.magic == 1431655766 && p.shift == 0 && !p.add && !p.negative)
+    assert(division.prepare_into(&mut p, -7, 32))
+    assert(p.kind == 5 && p.magic == -1840700269 && p.shift == 2 && p.add && p.negative)
+    assert(division.prepare_into(&mut p, 3, 64))
+    assert(p.kind == 5 && p.magic == 6148914691236517206 && p.shift == 0 && !p.add)
+    assert(division.prepare_into(&mut p, -9223372036854775808, 64))
+    assert(p.kind == 4 && p.negative && p.iterations == 0)
+    assert(division.prepare_into(&mut p, -4611686018427387904, 64))
+    assert(p.kind == 3 && p.shift == 62 && p.negative)
+    assert(division.prepare_into(&mut p, -1, 64))
+    assert(p.kind == 2 && p.negative && p.magic == 0 && p.shift == 0 && !p.add)
+    assert(division.prepare_into(&mut p, 0, 32))
+    assert(p.kind == 1 && !p.negative && p.iterations == 0)
+    assert(!division.prepare_into(&mut p, 2147483648, 32))
+    assert(!p.supported && p.kind == 0 && p.magic == 0 && p.shift == 0 && !p.add)
+    assert(division.prepare_into(&mut p, 9223372036854775807, 64))
+    assert(p.kind == 5 && p.iterations <= 63)
+}
+@test fn constant_sequences_only_write_scratch_registers() {
+    divisors: []i64 = [0, 1, -1, 2, -2, 3, -3, 7, -7, 10, -10, -2147483648, 2147483647,
+        4611686018427387904, -4611686018427387904, -9223372036854775808, 9223372036854775807]
+    var p := division.new()
+    for width in [32, 64] {
+        for divisor in divisors {
+            if !division.prepare_into(&mut p, divisor, width) { continue }
+            for remainder in [false, true] {
+                var code := arm.new(); overflow := arm.label(&mut code); zero := arm.label(&mut code)
+                division.emit(&mut code, &p, remainder, overflow, zero)
+                for word in code.words {
+                    destination := i32(word.bit_and(31))
+                    assert(destination <= 3 || destination == 31)
+                }
+                for kind in code.kinds { assert(kind != 1) }
+            }
+        }
+    }
+}
+fn source_model(f: &mut ir.Function) {
+    input := lexer.scan("x{x/7}", false)
+    names: []string = ["x"]; types: []i32 = [2]; positions: []i32 = [0]
+    assert(parse.parse(&mut f, &input, 1, input.kinds.len - 2, &names, &types, &positions, 2))
+}
+fn contains_divide(code: &arm.Code) -> bool {
+    for word in code.words { if word == 2596277282 { return true } }
+    false
+}
+@test fn emitter_switch_and_default_wrappers_preserve_native_and_wasm_policy() {
+    var f := ir.new(); source_model(&mut f)
+    var allocation := alloc.new(); alloc.allocate_into(&mut allocation, &f)
+    for platform in 0..4 {
+        var off := arm.new_for(platform); off_entry := arm.label(&mut off); off_overflow := arm.label(&mut off); off_zero := arm.label(&mut off); off_bounds := arm.label(&mut off)
+        emitter.emit_prepared_options(&mut off, &f, &allocation, off_entry, off_overflow, off_zero, off_bounds, false)
+        var on := arm.new_for(platform); on_entry := arm.label(&mut on); on_overflow := arm.label(&mut on); on_zero := arm.label(&mut on); on_bounds := arm.label(&mut on)
+        emitter.emit_prepared_options(&mut on, &f, &allocation, on_entry, on_overflow, on_zero, on_bounds, true)
+        assert(contains_divide(&off))
+        assert(contains_divide(&on) == (platform == 3))
+        if platform == 3 {
+            assert(off.words.len == on.words.len)
+            for word in 0..off.words.len { assert(off.words[word] == on.words[word]) }
+        }
+        var normal := arm.new_for(platform); normal_entry := arm.label(&mut normal); normal_overflow := arm.label(&mut normal); normal_zero := arm.label(&mut normal); normal_bounds := arm.label(&mut normal)
+        emitter.emit_prepared(&mut normal, &f, &allocation, normal_entry, normal_overflow, normal_zero, normal_bounds)
+        assert(normal.words.len == on.words.len)
+        for word in 0..on.words.len { assert(normal.words[word] == on.words[word]) }
+    }
+}

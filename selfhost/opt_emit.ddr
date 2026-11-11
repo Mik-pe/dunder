@@ -2,8 +2,10 @@
 import arm64 as arm
 import opt_ir as ir
 import opt_alloc as alloc
+import const_div
 
-struct State { overflow: i32, zero: i32, bounds: i32, exit: i32, heads: []i32, ends: []i32 }
+struct State { overflow: i32, zero: i32, bounds: i32, exit: i32, heads: []i32, ends: []i32,
+    const_div_enabled: bool, division: const_div.Plan }
 fn load_frame(code: &mut arm.Code, slot: i32, reg: i32) {
     if slot < 32 { arm.emit(&mut code, 4164944800 + i64(-(slot + 1) * 8).bit_and(511) * 4096 + i64(reg)); return }
     if slot < 511 { arm.emit(&mut code, 3506439081 + i64(slot + 1) * 8192) }
@@ -67,6 +69,21 @@ fn condition(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Funct
     expression(&mut code, &mut s, &plan, &f, node)
     if truth { arm.branch(&mut code, target, 19) } else { arm.branch(&mut code, target, 18) }
 }
+// Existing dynamic division, also used if bounded constant planning refuses.
+// The numerator is in x1 and the denominator in x0.
+fn division(code: &mut arm.Code, s: &State, ty: i32, op: i32, proven: bool) {
+    arm.branch(&mut code, s.zero, 18)
+    var minimum: i64 = -9223372036854775808
+    if ty == 1 { minimum = -2147483648 }
+    if !proven {
+        safe := arm.label(&mut code)
+        arm.imm(&mut code, 2, minimum); compare(&mut code, 1, 2); arm.branch(&mut code, safe, 3)
+        arm.imm(&mut code, 2, -1); compare(&mut code, 0, 2); arm.branch(&mut code, s.overflow, 2)
+        arm.mark(&mut code, safe)
+    }
+    arm.emit(&mut code, 2596277282)
+    if op == 4 { arm.mov(&mut code, 0, 2) } else { arm.emit(&mut code, 2600502336) }
+}
 fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Function, node: i32) {
     kind := f.kinds[node]; ty := f.types[node]; proven := f.proofs[node].bit_and(1) != 0
     var op := 0; if kind == 3 || kind == 4 { op = i32(f.values[node]) }
@@ -97,6 +114,27 @@ fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Func
         arm.imm(&mut code, 0, 0); arm.branch(&mut code, done, 0)
         arm.mark(&mut code, yes); arm.imm(&mut code, 0, 1); arm.mark(&mut code, done); return
     }
+    if s.const_div_enabled && (op == 4 || op == 5) && f.kinds[f.right[node]] == 1 {
+        divisor := f.values[f.right[node]]
+        var width := 64; if ty == 1 { width = 32 }
+        // Code.platform is the full target: Darwin ARM, Linux ARM, x86, Wasm.
+        // General high-product magic remains native-only until Wasm benefits
+        // from it. Small special cases need no high-product emulation.
+        if code.platform != 3 || const_div.cheap(divisor, width) {
+            expression(&mut code, &mut s, &plan, &f, f.left[node])
+            // Prepare AFTER numerator emission: nested divisions reuse the
+            // same plan and must not overwrite the outer operation's plan.
+            if const_div.prepare_into(&mut s.division, divisor, width) {
+                const_div.emit(&mut code, &s.division, op == 5, s.overflow, s.zero)
+            } else {
+                // Never reevaluate a numerator, which may already have trapped.
+                arm.mov(&mut code, 1, 0); arm.imm(&mut code, 0, divisor)
+                division(&mut code, &s, ty, op, proven)
+                if ty == 1 && !proven { narrow(&mut code, s.overflow) }
+            }
+            return
+        }
+    }
     operands(&mut code, &mut s, &plan, &f, node)
     if op >= 6 {
         compare(&mut code, 1, 0); arm.emit(&mut code, 2594113504 + i64(relation(op).bit_xor(1)) * 4096); return
@@ -111,17 +149,7 @@ fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Func
         if !proven { arm.emit(&mut code, 2474638339); compare(&mut code, 2, 3); arm.branch(&mut code, s.overflow, 3) }
     } else {
         assert(op == 4 || op == 5)
-        arm.branch(&mut code, s.zero, 18)
-        var minimum: i64 = -9223372036854775808
-        if f.types[f.left[node]] == 1 { minimum = -2147483648 }
-        if !proven {
-            safe := arm.label(&mut code)
-            arm.imm(&mut code, 2, minimum); compare(&mut code, 1, 2); arm.branch(&mut code, safe, 3)
-            arm.imm(&mut code, 2, -1); compare(&mut code, 0, 2); arm.branch(&mut code, s.overflow, 2)
-            arm.mark(&mut code, safe)
-        }
-        arm.emit(&mut code, 2596277282)
-        if op == 4 { arm.mov(&mut code, 0, 2) } else { arm.emit(&mut code, 2600502336) }
+        division(&mut code, &s, ty, op, proven)
     }
     if ty == 1 && !proven { narrow(&mut code, s.overflow) }
 }
@@ -180,20 +208,28 @@ fn statement(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Funct
     } else { assert(false) }
 }
 pub fn emit(code: &mut arm.Code, f: &ir.Function, entry: i32, overflow: i32, zero: i32, bounds: i32) {
+    emit_options(&mut code, &f, entry, overflow, zero, bounds, true)
+}
+pub fn emit_options(code: &mut arm.Code, f: &ir.Function, entry: i32, overflow: i32, zero: i32, bounds: i32, const_div_enabled: bool) {
     assert(f.supported && f.root >= 0 && f.params <= 8)
     var plan := alloc.new()
     alloc.allocate_into(&mut plan, &f)
-    emit_prepared(&mut code, &f, &plan, entry, overflow, zero, bounds)
+    emit_prepared_options(&mut code, &f, &plan, entry, overflow, zero, bounds, const_div_enabled)
 }
 // The caller may retain and rebuild one allocation workspace across functions.
 // Emission only borrows the completed plan; no array or Plan value is copied.
 // Timing/profiling belongs to the caller, keeping this module portable.
 pub fn emit_prepared(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan,
     entry: i32, overflow: i32, zero: i32, bounds: i32) {
+    emit_prepared_options(&mut code, &f, &plan, entry, overflow, zero, bounds, true)
+}
+pub fn emit_prepared_options(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan,
+    entry: i32, overflow: i32, zero: i32, bounds: i32, const_div_enabled: bool) {
     assert(f.supported && f.root >= 0 && f.params <= 8)
     assert(plan.homes.len >= f.local_types.len && plan.data.len == f.local_types.len && plan.length.len == f.local_types.len)
     assert(plan.limits.len == f.kinds.len && plan.loop_end.len == f.kinds.len)
-    var s := State { overflow: overflow, zero: zero, bounds: bounds, exit: arm.label(&mut code), heads: [], ends: [] }
+    var s := State { overflow: overflow, zero: zero, bounds: bounds, exit: arm.label(&mut code), heads: [], ends: [],
+        const_div_enabled: const_div_enabled, division: const_div.new() }
     arm.mark(&mut code, entry); frame := arm.prologue(&mut code); arm.frame(&mut code, frame, plan.homes.len)
     // Stage every argument before writing x4..7 local homes. This handles the
     // full parallel-copy problem, including eight overlapping incoming args.

@@ -1,0 +1,129 @@
+// Signed constant division, independently derived from Granlund/Montgomery,
+// "Division by Invariant Integers using Multiplication", PLDI 1994,
+// Theorem 5.1 and Figure 5.2: https://gmplib.org/~tege/divcnst-pldi94.pdf
+// LLVM's DivisionByConstantInfo.cpp was reviewed as a separate reference;
+// this implementation uses the theorem's error bound, not its ANC recurrence.
+// https://github.com/llvm/llvm-project/blob/main/llvm/lib/Support/DivisionByConstantInfo.cpp
+import arm64 as arm
+
+// 0=unsupported, 1=zero, 2=unit, 3=power of two, 4=signed MIN, 5=magic.
+// Magic represents a positive multiplier as a signed width-bit pattern.
+// high_signed(n*magic), plus n if add, is shifted arithmetically by shift.
+// Subtract the ORIGINAL numerator's sign mask, then negate for negative d.
+pub struct Plan {
+    supported: bool, kind: i32, width: i32, divisor: i64, magic: i64,
+    shift: i32, add: bool, negative: bool, iterations: i32,
+}
+pub fn new() -> Plan { Plan { supported: false, kind: 0, width: 0, divisor: 0, magic: 0,
+    shift: 0, add: false, negative: false, iterations: 0 } }
+fn minimum(width: i32) -> i64 {
+    if width == 64 { return -9223372036854775808 }
+    i64(0).wrapping_sub(i64(1).shl(width - 1))
+}
+// The Wasm backend has no single-instruction high product. Keep general
+// division there, while eliminating guards/division for these simple cases.
+pub fn cheap(divisor: i64, width: i32) -> bool {
+    if width < 3 || width > 64 { return false }
+    low := minimum(width); high := i64(0).wrapping_sub(low).wrapping_sub(1)
+    if divisor < low || divisor > high { return false }
+    if divisor == 0 || divisor == 1 || divisor == -1 || divisor == low { return true }
+    var magnitude := divisor
+    if magnitude < 0 { magnitude = i64(0).wrapping_sub(magnitude) }
+    magnitude > 0 && magnitude.bit_and(magnitude.wrapping_sub(1)) == 0
+}
+// Reuse one plan; no per-node record or bigint allocation. Small widths are
+// supported for exhaustive independent testing; emission uses only 32/64.
+pub fn prepare_into(p: &mut Plan, divisor: i64, width: i32) -> bool {
+    p.supported = false; p.kind = 0; p.width = width; p.divisor = divisor; p.magic = 0
+    p.shift = 0; p.add = false; p.negative = divisor < 0; p.iterations = 0
+    if width < 3 || width > 64 { return false }
+    low := minimum(width); high := i64(0).wrapping_sub(low).wrapping_sub(1)
+    if divisor < low || divisor > high { return false }
+    if divisor == 0 { p.kind = 1; p.supported = true; return true }
+    if divisor == 1 || divisor == -1 { p.kind = 2; p.supported = true; return true }
+    if divisor == low { p.kind = 4; p.supported = true; return true }
+    var magnitude := divisor
+    if magnitude < 0 { magnitude = i64(0).wrapping_sub(magnitude) }
+    if magnitude.bit_and(magnitude.wrapping_sub(1)) == 0 {
+        var reduced := magnitude
+        while reduced > 1 { reduced = reduced.shr(1); p.shift = p.shift + 1 }
+        p.kind = 3; p.supported = true; return true
+    }
+    // Start q,r at 2^(width-1) / magnitude without representing positive
+    // 2^63. Doubling preserves that exact quotient/remainder identity.
+    var q := high / magnitude
+    var r := (high % magnitude).wrapping_add(1)
+    if r == magnitude { q = q.wrapping_add(1); r = 0 }
+    var tolerance: i64 = 2
+    var shift := 0
+    while p.iterations < 128 {
+        p.iterations = p.iterations + 1
+        q = q.wrapping_mul(2)
+        // Compare before doubling: 2*r may not fit a positive i64.
+        complement := magnitude.wrapping_sub(r)
+        if r >= complement { r = r.wrapping_sub(complement); q = q.wrapping_add(1) }
+        else { r = r.wrapping_mul(2) }
+        // P=width+shift, m=floor(2^P/|d|)+1. Theorem 5.1 with
+        // ell=shift+1 requires 0 < m*|d|-2^P <= 2^(shift+1).
+        // Its left side is |d|-r. At shift62 every positive i64 fits.
+        if shift == 62 || magnitude.wrapping_sub(r) <= tolerance {
+            var magic := q.wrapping_add(1)
+            if width < 64 {
+                half := i64(1).shl(width - 1)
+                if magic >= half { magic = magic.wrapping_sub(half.wrapping_mul(2)) }
+            }
+            p.magic = magic; p.shift = shift; p.add = magic < 0
+            p.kind = 5; p.supported = true; return true
+        }
+        shift = shift + 1; tolerance = tolerance.wrapping_mul(2)
+    }
+    // Exhausting the bound requests the original divide, never a new trap.
+    false
+}
+fn compare(code: &mut arm.Code, left: i32, right: i32) { arm.emit(&mut code, 3942645791 + i64(right) * 65536 + i64(left) * 32) }
+fn asr(code: &mut arm.Code, destination: i32, source: i32, amount: i32) {
+    arm.emit(&mut code, 2470445056 + i64(amount) * 65536 + 63 * 1024 + i64(source) * 32 + i64(destination))
+}
+fn lsr(code: &mut arm.Code, destination: i32, source: i32, amount: i32) {
+    arm.emit(&mut code, 3544186880 + i64(amount) * 65536 + 63 * 1024 + i64(source) * 32 + i64(destination))
+}
+// Numerator is already evaluated exactly once in x0. Only x0..3 are scratch;
+// local homes (including x10) and all runtime-global registers are preserved.
+pub fn emit(code: &mut arm.Code, p: &Plan, remainder: bool, overflow: i32, zero: i32) {
+    assert(p.supported && (p.width == 32 || p.width == 64))
+    if p.kind == 1 { arm.branch(&mut code, zero, 0); return }
+    if p.kind == 2 {
+        if p.negative {
+            arm.imm(&mut code, 2, minimum(p.width)); compare(&mut code, 0, 2); arm.branch(&mut code, overflow, 2)
+            if !remainder { arm.emit(&mut code, 3405775840) } // NEG x0,x0 without overflow flags.
+        }
+        if remainder { arm.imm(&mut code, 0, 0) }
+        return
+    }
+    arm.mov(&mut code, 1, 0) // Preserve the original numerator/sign, also for rem.
+    if p.kind == 4 {
+        arm.imm(&mut code, 2, p.divisor); compare(&mut code, 0, 2)
+        arm.emit(&mut code, 2594117600) // CSET x0,EQ: MIN/MIN=1, otherwise zero.
+    } else if p.kind == 3 {
+        asr(&mut code, 2, 0, 63); lsr(&mut code, 2, 2, 64 - p.shift)
+        arm.emit(&mut code, 2332033024 + 2 * 65536) // ADD x0,x0,x2, a negative-numerator bias.
+        asr(&mut code, 0, 0, p.shift)
+        if p.negative { arm.emit(&mut code, 3405775840) }
+    } else {
+        assert(p.kind == 5)
+        arm.imm(&mut code, 2, p.magic)
+        if p.width == 64 { arm.emit(&mut code, 2604694528 + 2 * 65536 + 3) } // SMULH x3,x0,x2.
+        else {
+            arm.emit(&mut code, 2600500224 + 2 * 65536 + 3) // MUL x3,x0,x2: full signed32 product.
+            asr(&mut code, 3, 3, 32)
+        }
+        if p.add { arm.emit(&mut code, 2332033024 + 1 * 65536 + 3 * 32 + 3) } // ADD x3,x3,x1.
+        asr(&mut code, 3, 3, p.shift); asr(&mut code, 2, 1, 63)
+        arm.emit(&mut code, 3405774848 + 2 * 65536 + 3 * 32) // SUB x0,x3,x2: round towards zero.
+        if p.negative { arm.emit(&mut code, 3405775840) }
+    }
+    if remainder {
+        arm.imm(&mut code, 2, p.divisor)
+        arm.emit(&mut code, 2600501248 + 2 * 65536 + 1 * 1024) // MSUB x0,x0,x2,x1, wrapping internally.
+    }
+}
