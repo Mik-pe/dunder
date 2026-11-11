@@ -15,6 +15,7 @@ const nativeGroups = new Set([
     'dogfood/filesystem.ddr::files_round_trip_through_the_os',
     'dogfood/filesystem.ddr::errors_remain_values',
     'dogfood/enums.ddr::value_enums_work_in_records_and_arrays',
+    'selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants',
     'selfhost/compile.ddr::compiler_checks_types_before_emitting_an_image',
     'selfhost/compile.ddr::native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation',
 ]);
