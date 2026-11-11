@@ -17,6 +17,14 @@ mäter även `check` på samtliga tre byggkällor. C-referensen
 körs med tom miljö och en PATH utan externa verktyg. Kör mätningarna utan
 andra avsiktligt tunga arbeten på värddatorn.
 
+`--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
+kandidat jämför optimeringslägen utan att byta kompilatorbinär.
+
+[Lokalt skalärpass, 2026-11-11](2026-11-11-scalar-optimizer/README.md)
+är senaste etappen: typad funktionsmodell, begränsad förenkling,
+loopbevis och registerallokering. Rapporten innehåller både jämförelse mot
+föregående kompilator och en separat av/på-serie.
+
 [Resultat för självhosten, 2026-11-10](2026-11-10-selfhost-performance/README.md)
 innehåller de aktuella mätvillkoren och kvarvarande prestandagap.
 

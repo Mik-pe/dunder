@@ -1,8 +1,9 @@
 # Så mäter vi Dunder
 
-Den aktuella självhosten har en [gemensam runtime- och byggmätning](../benchmarks/2026-11-10-selfhost-performance/README.md)
+Den aktuella självhosten har en [gemensam runtime- och byggmätning](../benchmarks/2026-11-11-scalar-optimizer/README.md)
 med 30 försök per variant och arbetsfall, råtider, kontrollerade resultat
-och reproducerbart mätverktyg. Den omfattar också ett verkligt självbygge.
+och reproducerbart mätverktyg. Den omfattar också ett verkligt självbygge
+och en separat av/på-mätning av det lokala skalärpasset.
 Runtime är fortfarande långsammare än den optimerade C-referensen;
 acceptansgränserna nedan är fortsatt mål.
 

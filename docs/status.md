@@ -43,6 +43,12 @@ anger ursprunglig fil, rad och kolumn. Nativa byggen stöder manifest,
 funktionscache, atomisk publicering och testkörning med tidsgräns.
 [Kompilatorns byggkedja](../selfhost/README.md) och [inkrementella byggen](incremental.md).
 
+Standardprofilen optimerar anropsfria skalära funktioner genom en typad lokal
+modell med konstantförenkling, konservativa loopbevis och registerallokering.
+Delade `&[]i64`-parametrar stöds för läsning. Ägda värden, muterbara arrayer,
+flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
+[Omfattning och gränser](optimization.md).
+
 Tabell är ett fristående CSV-projekt med eget manifest, gruppering,
 Unicode, sortering och kontrollerat heltalsspill. Grafikexemplen använder
 samma filimporter och typade värdanrop som externa program. macOS använder
@@ -54,14 +60,15 @@ och [macOS-appar](app-bundles.md).
 ## Körda Wasm-kontrakt
 
 Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 54 av de 59 grupperna med godkänt
-resultat. De fem övriga har nåbara anrop till filsystemet.
+till en separat Wasm-modul. Node körde 66 av de 72 grupperna med godkänt
+resultat. De sex övriga har nåbara anrop till filsystemet.
 
 | Grupp | Nativt beroende |
 | --- | --- |
 | `dogfood/filesystem.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
 | `dogfood/filesystem.ddr::errors_remain_values` | Fel från filåtkomst |
 | `dogfood/enums.ddr::value_enums_work_in_records_and_arrays` | Filmetadata |
+| `selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::compiler_checks_types_before_emitting_an_image` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation` | Kompilatorns filåtkomst |
 

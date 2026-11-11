@@ -25,7 +25,9 @@ många som emitterades. Cachen finns i `build/.dunder-cache/selfhost` under
 aktuell arbetskatalog. Man kan radera hela katalogen mellan två byggen.
 
 Nyckeln innehåller kompilatorns kryptografiska identitet, målet, deklarationernas
-layout och funktionens tokenström. På macOS används SHA-256 av den laddade
+layout, skaläroptimeringens läge och funktionens tokenström. CLI:t behåller
+separata cachekataloger för `--scalar-opt=on` och `--scalar-opt=off`.
+På macOS används SHA-256 av den laddade
 bildens kodsignatur och på Linux SHA-256 av den körande ELF-filen genom
 `/proc/self/exe`. Identiteten följer därmed processen även om ett nytt bygge
 ersätter dess sökväg. Symboliska hopp placeras om vid varje
@@ -54,6 +56,14 @@ och publicering som överhoppade. `functions.emitted` är då noll: kontrollen
 behåller inga maskinord eller relokeringar. Typ-, låne- och layoutkontroller
 körs fortfarande, även för oanropade funktioner.
 
+Fältet `optimizer` visar `enabled`, `modeled`, `emitted`, `rewrites`,
+`proven_bounds` och `fallbacks` för det lokala skalärpasset.
+`modeled` omfattar också validerade oanropade kroppar; `emitted` räknar
+bara modellens kodgenerering. `fallbacks` räknar försök som parsern
+avvisar, medan signaturer utanför delmängden hoppas över före försöket.
+Cacheträffar modelleras inte på nytt. `proven_bounds` räknar
+indexläsningar där passet bevisat att kontrollen kan tas bort.
+
 Klockan väljs efter kompilatorns värdplattform, även vid korsbyggen. Ett
 klockfel ger `clock_ok: false` och otillgängliga intervall som `null`.
 Lyckade byggen och kontroller ger rapporter; misslyckade eller enbart
@@ -65,7 +75,8 @@ listande kommandon ger ingen avslutad tidsrapport. Vanlig stdout och
 `test --affected` kör alla grupper första gången. Därefter återanvänder den
 godkända resultat för grupper vars transitivt nåbara funktionskroppar och
 typkontext matchar. Även funktioner som används som värden ingår. En ändrad
-tidsgräns ger en ny körning. Tester med nåbara systemanrop, råpekare eller
+tidsgräns eller ett ändrat skaläroptimeringsläge ger en ny körning.
+Tester med nåbara systemanrop, råpekare eller
 externa anrop körs varje gång eftersom omvärlden kan ha ändrats.
 Misslyckade grupper behöver en ny godkänd körning. Vanlig `dunder test` kör
 alltid hela sviten.

@@ -58,6 +58,31 @@ resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
 använder modellen. `tools/test-opt-emitter.py` provar emission och spill
 separat. Båda ingår i `tools/verify-selfhost.sh`.
 
+## Nästa etapper mot C-nivå
+
+Målet prövas över hela den publicerade sviten enligt
+[prestandakontraktet](prestanda.md). En snabb summeringsloop räcker inte.
+Varje etapp behöver jämförelse med avstängt pass, kontrollerade resultat
+och 30 försök för runtime, genererat bygge, självbygge och Tabell.
+Median, p95 och binärstorlek ska redovisas; en högre p95 får inte döljas
+bakom snabbare genererad stresskod.
+
+| Etapp | Mekanism och förväntad nytta | Krav före aktivering |
+| --- | --- | --- |
+| Bredare lokal modell | `for`, skalära anrop och mutation genom exklusiva arraylån öppnar fler verkliga loopar och sortering. | Anropseffekter, register som förstörs vid anrop, bevarade adresser och låneursprung måste vara explicita. Samma frontend ska successivt ersätta dubblerad semantik. |
+| Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
+| Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
+| Begränsad specialisering och inlining | Små heta hjälpfunktioner kan slippa anropskostnad och ge lokala bevis över anropsgränsen. | Fast budget per funktion och anropsställe, begränsad kodtillväxt och cacheidentitet för samtliga påverkande sammanfattningar. |
+| Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
+| Kortare bygglatens | Återanvänd typade resultat och beroendesammanfattningar, och bearbeta oberoende funktioner parallellt. | Stabil diagnosordning, byteidentisk utdata, en arena per arbetare och mätning av privat kroppsändring respektive delad layoutändring. |
+
+Prioritera nästa mekanism efter profiler och maskinkod för arbetsfallen
+som fortfarande missar målet. Mät allokering och kopiering i lexer, parser
+och bibliotek separat när de dominerar; fler maskinkodspass löser inte
+automatiskt dessa kostnader. Separata valbara fastider för modellbygge,
+förenkling, registerallokering och emission blir användbara när den lokala
+vägen får större täckning.
+
 ## Övrig kodgenerering och runtime
 
 Lokala värden läses direkt från sin frameplats med rätt bredd och
@@ -125,5 +150,5 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter-mätning](../benchmarks/2026-11-10-selfhost-performance/README.md)
-omfattar både runtime och kompletta byggen.
+Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-scalar-optimizer/README.md)
+omfattar både runtime, kompletta byggen och `check`.
