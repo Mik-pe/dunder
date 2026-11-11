@@ -151,8 +151,8 @@ inte att två heapåtkomster är oberoende.
 ## Parallell kompilering och språkets trådar: nästa etapp
 
 Status: språk/runtime-delen nedan är en genomförandeplan, inte ett befintligt
-thread-API. Första kodgränsen under arbete är en ägd, relokerbar
-`FunctionObject`; den inför inte trådar i sig.
+thread-API. En ägd, relokerbar `FunctionObject` är implementerad och verifierad med
+samma sänkare i den seriella kedjan; den inför inte trådar i sig.
 
 Den första kompilatorkonsumenten ska vara bearbetning av hela funktions-IR:er.
 Frontend behåller sin ordning för symboler, nåbarhet, diagnostik och
@@ -236,3 +236,23 @@ resultatlivstid; identiska bilder, bindings, diagnostik och cacheutfall med
 1/2/N workers och varierad färdigordning. Mät en worker och standardantal
 separat, inklusive kopiering, kö, merge, signering och toppminne. Trådantal
 får inte ändra optimeringsbudgetar eller programmets semantik.
+
+
+Implementerad första grund (fortfarande utan källsyntax): `task_data.ddr`
+kontrollerar den rekursiva klondomänen mot semantisk typmetadata och
+`task_effects.ddr` beräknar transitiveffekter över en förseglad anropsgraf.
+Okänd/inaktuell metadata får inte återanvändas som bevis. Primitiv-ID:n
+översätts uttryckligen; kompletta tag-enums kräver icke-tomma unit-varianter.
+`task_native.ddr` genererar en separat C-ABI-entry för ARM64/macOS med egen
+barnpool, pthread create/join och föräldraklonat resultat före poolreklamering.
+Fel ger explicita ägartillstånd; join-fel får aldrig följas av läsning eller
+frigöring av barnets lagring. Riktiga OS-jobb, ABI och felvägar provas lokalt.
+Syntax, lexikal scope-scheduler och parallell kompilering är ännu inte aktiverade.
+Den valda språkytan under implementation är `task scope jobs(4)`,
+`spawn jobs worker(input)` och `await jobs(id)`, med strukturellt typad
+`TaskID<Result>`. Kapaciteten begränsar aktiva jobb. En enda utfärdare i
+föräldraruntimen ger nycklar med generation i höga 32 bitar och ordinal i
+låga 32 bitar. Gränserna kontrolleras före overflow; generationer återanvänds
+aldrig. Scope, generation, ordinal och exakt resultattyp kontrolleras innan
+kontrollblocket får läsas. Opaque-typer avvisas i första källvertikalen tills
+en uttrycklig definitionsägd klassificering finns.
