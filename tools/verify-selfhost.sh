@@ -12,8 +12,11 @@ trap 'exit 1' HUP INT TERM
 "$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
 "$compiler" test tests/mir_retained.ddr -o "$work/mir-retained"
 "$compiler" test tests/mir_dataflow.ddr -o "$work/mir-dataflow"
+"$compiler" test tests/mir_preserve.ddr -o "$work/mir-preserve"
+"$compiler" test tests/mir_scalar.ddr -o "$work/mir-scalar"
 python3 tools/test-mir.py "$compiler"
 python3 tools/test-mir-promotion.py "$compiler"
+python3 tools/test-mir-scalar.py "$compiler"
 python3 tools/test-diagnostics.py "$compiler"
 python3 tools/test-check.py "$compiler"
 python3 tools/test-optimizer.py "$compiler" --verify-selection

@@ -113,8 +113,8 @@ spill i anroparens slot. Hela funktioner kräver identitetsplacering.
 Anroparen ansvarar för verifierad modell, färdigutvärderade argument,
 typnormaliserade registervärden och initialiserade arraycacher. Den vägen
 skapar ingen funktionsframe eller retur och kontrollerar att emissionen
-saknar anrop. Detta är en byggsten för inlining; deklarationskatalog och
-aktivering av inlining är ännu inte del av standardbygget.
+saknar anrop. Standardbygget använder denna väg för begränsad inlining
+efter att vanliga anropsargument redan är utvärderade och kontrollerade.
 
 Den separata [`opt_inline`](../selfhost/opt_inline.ddr)-katalogen är nu en
 testad byggsten: den lagrar högst 32 uttrycksnoder per redan verifierad
@@ -126,6 +126,25 @@ Källfingerprint är tomt tills alla kroppsdigester är färdiga och cachas
 vid frysningen. Felaktig signatur, mål, skuggad funktionspekare, frameplats
 eller ordbudget lämnar kodströmmen orörd. Argument måste redan vara
 utvärderade i källordning, även om kroppen inte använder dem.
+
+Producenten prövar deklarationssignaturer och högst 128 kroppstoken, inom
+en gemensam budget på 32 768 skannade/parsade token. Endast slutna,
+anropsfria retur-uttryck med `i32`, `i64` och `bool` godtas. Den vanliga
+valideringen och funktionens nåbarhet behålls. Säkerhetskontroller och bindningsposter
+försvinner inte när själva BL-instruktionen ersätts.
+
+Kodtillväxten begränsas till 4 096 uppskattade ord per caller och 65 536
+totalt. Strömmande rune-iteration kan inom samma budget använda den
+gemensamma UTF-8-dekodern direkt; dess staging debiteras uttryckligen.
+`--inline-opt=off` stänger av både uttrycksinlining och denna expansion.
+`--scalar-opt=off` stänger också av katalogens produktion. Check skapar
+ingen katalog eller kodexpansion.
+
+Funktionscachen binder läget till fryst katalogidentitet, kroppsdigester,
+deklarationsberoenden och återstående global budget. Varma fragment
+återställer samma budgetdebitering och behövda deklarationer som ett rent
+bygge. Inlining sker före helfunktions-IR; registerpasset kan därmed arbeta
+över de inlagda uttrycken med samma verifiering som resten av kroppen.
 
 [Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
@@ -379,10 +398,10 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Bredare lokal modell | Skalära anrop, fler typer och ägda iterationer öppnar fler verkliga funktioner. Räknade loopar och exklusiv elementmutation är implementerade. | Anropseffekter, register som förstörs vid anrop, bevarade adresser och låneursprung måste vara explicita. Samma frontend ska successivt ersätta återstående dubblerad semantik. |
+| Helfunktionsvärden, SSA och minnesmodell | Den gemensamma IR-gränsen är införd. Nästa steg är värdeidentitet, coalescing och tydliga privata/externa minnesobjekt över anrop och loopar. | Bevarande av register och NoModRef för privata celler är skilda kontrakt. Fulla ABI- och ägareffekter, låneursprung och verifierade producentpremisser måste vara explicita. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
-| Begränsad specialisering och inlining | Små heta hjälpfunktioner kan slippa anropskostnad och ge lokala bevis över anropsgränsen. | Fast budget per funktion och anropsställe, begränsad kodtillväxt och cacheidentitet för samtliga påverkande sammanfattningar. |
+| Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
 | POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
 | Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
 | Kortare bygglatens | Återanvänd typade resultat och beroendesammanfattningar, och bearbeta oberoende funktioner parallellt. | Stabil diagnosordning, byteidentisk utdata, en arena per arbetare och mätning av privat kroppsändring respektive delad layoutändring. |
@@ -465,10 +484,9 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-i32-comparisons/README.md)
-omfattar både runtime, kompletta byggen och `check`.
+Helfunktionskedjans [första byggmätning](../benchmarks/2026-11-11-whole-function-mir/README.md)
+redovisar dess kostnad med identiska bilder och separat `check`.
 Konstantdivision och framefria funktioner förbättrar numerikkärnan;
 intervallbevis och registerjämförelser minskar sorteringens kontrollkostnad.
-Profilerna ger underlag för [ägartillstånd och CFG](ownership-ir-plan.md),
-medan en gemensam nodarena och begränsad inlining är nästa grundsteg. Högre p95 i vissa
-arbetsfall redovisas separat från medianvinster.
+Den [gemensamma arkitekturplanen](whole-function-ir-plan.md) är huvudspåret.
+Högre p95 i vissa arbetsfall redovisas separat från medianvinster.
