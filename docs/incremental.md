@@ -62,7 +62,7 @@ Fältet `optimizer` visar `enabled`, `modeled`, `emitted`, `rewrites`,
 bara modellens kodgenerering. `fallbacks` räknar försök som parsern
 avvisar, medan signaturer utanför delmängden hoppas över före försöket.
 Cacheträffar modelleras inte på nytt. `proven_bounds` räknar
-indexläsningar där passet bevisat att kontrollen kan tas bort.
+indexläsningar och elementskrivningar med bevisad gränskontroll.
 
 Klockan väljs efter kompilatorns värdplattform, även vid korsbyggen. Ett
 klockfel ger `clock_ok: false` och otillgängliga intervall som `null`.
@@ -77,16 +77,19 @@ dunder build selfhost/main.ddr --profile-compiler --timings=json -o build/measur
 ```
 
 `--profile-compiler` aktiverar tidsrapporten och lägger till `compiler_detail`.
-Fältet delar kompilatorintervallet i tio icke överlappande faser:
+Fältet delar kompilatorintervallet i elva icke överlappande faser:
 `declarations`, `model_parse`, `verify_pre`, `simplify`, `verify_post`,
-`allocation`, `scalar_emit`, `legacy_body`, `fragment_cache` och `finalize`.
+`allocation`, `scalar_emit`, `legacy_body`, `fragment_cache`, `finalize`
+och `range_analysis`. Den sista omfattar analysens preflight, fixpunkt,
+replay och applicering; arbetsenheten är abstrakta operationer inklusive
+kopiering och sammanfogning av tillstånd.
 `covered` summerar dessa intervall; `other` är återstoden av `compiler`.
 `calls` och `work` anger antal besök och arbetsenhet för varje fas. Samtliga
 klockor använder värdplattformen även när målet är ett annat.
 
 Klockfel ger `null` för tidsfördelningen. En fas som inte körs har noll besök;
 den är inte ett uppmätt snabbt arbete. Kontroll utan emission besöker inte
-registerallokering eller skaläremission. Profilering ändrar inte den byggda
+intervallanalys, registerallokering eller skaläremission. Profilering ändrar inte den byggda
 bilden. Utan flaggan tas inga inre tidsstämplar eller arbetsräknaruppdateringar.
 Profileringen har själv en kostnad, så vanliga byggen används i jämförande
 prestandaserier.

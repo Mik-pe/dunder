@@ -20,6 +20,10 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Intervallbevis och arrayinvarianter, 2026-11-11](2026-11-11-range-proofs/README.md)
+förbättrar generell sortering med cirka elva procent. Rapporten visar även
+byggkostnad, sämre p95, oberoende modellprov och separata fasobservationer.
+
 [Framefria ARM64-funktioner, 2026-11-11](2026-11-11-frame-free/README.md)
 ger ytterligare numerikvinst med verifierade registerflyttar. Högre p95
 i vissa fall redovisas tillsammans med median, råtider och av/på-serie.

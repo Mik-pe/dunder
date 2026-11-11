@@ -167,6 +167,50 @@ normalisering, loopar, tidig retur och fällordning. Den symboliska
 flyttkontrollen tolkar faktiskt emitterade instruktioner över 40 320
 permutationer. Fallbackbilder och bilder för övriga mål är byteidentiska.
 
+### Budgeterade intervall och stabila arraylängder
+
+[`opt_range`](../selfhost/opt_range.ddr) kör efter konstantförenklingen och
+före den avslutande modellverifieringen. Den spårar i32-intervall samt
+relationer till en bestämd arrayrots längd, exempelvis `j <= values.len-1`.
+Elementvärden cachas inte. Både delade och exklusiva arrayparametrar har
+stabil dataadress/längd i modellens slutna operationsmängd; elementskrivning
+ändrar ingen descriptor. Anrop, storleksändring och escape stöds inte där.
+
+Första fasen löser loopinvarianter med joins och widening. Första iterationens
+fakta får aldrig användas som ett bevis för alla iterationer. Slutliga
+headers måste täcka både inträde och samtliga backedges. Andra fasen gör
+replay under dessa invarianter och samlar pending-bevis. Först efter en
+hel lyckad replay skrivs proof-bitarna. Aritmetikens kontroller behålls.
+
+Kortslutning modellerar båda orsakerna till falskt `A && B`; en looputgång
+får inte anta att bara vänstervillkoret blev falskt. For-gränser har egna
+snapshots. Break, continue, return och nästlade loopar följer sina respektive
+kanter. Varje bounds-bevis gäller exakt sin arrayrot, även när andra
+arrayer har andra längder.
+
+Budgetarna är 131 072 abstrakta arbetsenheter, åtta headeröverföringar per
+loop, djup 64, 32 768 faktaceller och 512 återanvändbara uttrycksslotar.
+Även tillståndskopiering och joins debiteras. Vid resursstopp lämnas
+funktionens befintliga proof-bitar orörda. Trasig modell eller invariant
+ger internt kompilatorfel före emission. Funktionsarenor och alla buffertar
+återanvänds; inga Value/Term-records allokeras per uttryck. Funktioner utan
+arrayparametrar hoppar över denna analys.
+
+Emissionen tar bara bort bevisade indexkontroller. En store beräknar och
+bevarar destinationen före högerledet, även när kontrollen utelämnas.
+`--range-opt=off` stänger av passet oberoende av övriga val. Cache och
+testkvitton skiljer lägena åt; `--profile-compiler` har en separat
+`range_analysis`-fas. Längdbeviset använder den uttryckliga
+[i32-invarianten i runtime](memory.md).
+
+`tools/test-range-emitter.py` provar verklig kontrollborttagning och
+budgetfallback på fyra mål. `tools/test-range-analysis.py` exporterar
+faktiska modeller/bevis och följer dem i en oberoende interpreter med
+checkad aritmetik, kortslutning, snapshots och muterbara arrayer. Den
+kontrollerar varje dynamiskt nådd bevisad åtkomst mot rätt lagring.
+Det är ett fryst ändligt testdomänprov, inte ett formellt bevis för alla
+program. Bränslestopp ger ofullständig täckning och icke godkänd körning.
+
 ## Ägarlivslängder och verifierade funktionsomskrivningar
 
 Den fulla frontendens strängoperatorer skapar normalt en extra temporär
@@ -305,9 +349,10 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-frame-free/README.md)
+Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-range-proofs/README.md)
 omfattar både runtime, kompletta byggen och `check`.
-Konstantdivision och framefria funktioner förbättrar numerikkärnan.
+Konstantdivision och framefria funktioner förbättrar numerikkärnan;
+intervallbevis minskar sorteringens gränskontroller.
 Profilerna ger underlag för [ägartillstånd och CFG](ownership-ir-plan.md),
-medan starkare intervallbevis är nästa numeriska fråga. Högre p95 i vissa
+medan en gemensam nodarena och begränsad inlining är nästa grundsteg. Högre p95 i vissa
 arbetsfall redovisas separat från medianvinster.

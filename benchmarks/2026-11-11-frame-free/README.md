@@ -73,7 +73,7 @@ symboltabellens stiger 99,68 till 100,47 ms. Lexerns separata av/på-vinst
 åtta explicit nativa grupper, 50 diagnostikfall, 46 runtimekontrakt per
 native/Wasm och tolv CLI-grupper på macOS. Bootstrap nådde identisk fixpunkt.
 Frameprovet bygger 88 bilder på fyra mål och två lägen; 44 host/Wasm-körningar
-provar FP/SP, callee-saved register, åtta argument, cykler, okononiska i32-bitar,
+provar FP/SP, callee-saved register, åtta argument, cykler, i32-normalisering,
 spill, loopar och fällordning. Symbolisk tolkning verifierar emitterade MOV-ord
 över 40 320 permutationer. Fallback- och övriga målens bilder är byteidentiska.
 Linuxbilder har byggts men inte körts här.

@@ -19,6 +19,12 @@ Tilldelning säkrar det nya värdet innan det gamla släpps. En array som skicka
 som värde får en egen kopia. `pop` överför elementets ägande. `clear` släpper
 elementen och behåller arrayens kapacitet.
 
+Giltiga dynamiska arrayer har `0 <= len <= cap <= i32::MAX`, oberoende av
+minnespoolens storlek. Runtime kontrollerar önskat antal före växande
+allokering och begränsar dubblerad kapacitet till denna gräns. När en
+giltig befintlig kapacitet räcker bevisar den också att antalet ryms.
+Negativa eller för stora antal når samma kapacitetsfälla, kod 109.
+
 Direkt iteration med `for byte in text.bytes()` eller
 `for scalar in text.runes()` kan strömma från en behållen strängsnapshot
 utan att skapa konverteringens mellanbuffert. Källan utvärderas en gång;
