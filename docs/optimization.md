@@ -101,6 +101,16 @@ möts över samtliga nåbara föregångare och löses till fixpunkt innan någon
 omskrivning planeras. Skrivningar och anropsförstörelse dödar äldre fakta;
 ett återkommande operations-ID i en loop är aldrig en värdeidentitet.
 
+Faktadomänen är kompakt per funktion: bara fysiska GP-register som kan
+delta i kandidatoperationernas värdefakta får slots, plus ett separat XZR.
+Const/Copy/MOVK:s samtliga faktaproducerande roller ingår, även om själva
+operationen inte kan omskrivas. Alla operationers kompletta skriv- och
+clobbermasker projiceras, inklusive implicita scratchregister. W-värdenas
+32-bitarsmasker är oförändrade; domänmasker beskriver endast analysens slots.
+Full fysisk liveness, NZCV och ABI-observationer behålls separat. Aliasval
+följer samma fysiska registerordning och definitionspoäng. Nya
+faktaproducenter måste uttryckligen utvidga domänen eller välja full domän.
+
 Passet ersätter bevisade registerkopior, väljer kanoniska immediate-former
 och tar bort döda rena materialiseringar. Minnesvärden cachas inte och
 flaggor, fällor och ägaroperationer flyttas inte. Oklassificerade externa
