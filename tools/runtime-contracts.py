@@ -17,6 +17,7 @@ FIXTURES = ROOT / 'tests/contracts'
 BOUNDED = {
     'array_ownership', 'array_returns', 'array_snapshots', 'block_cleanup', 'lexical_cleanup',
     'nested_arrays', 'nested_ownership', 'string_elements', 'string_returns', 'string_snapshots',
+    'temporary_transfers',
 }
 # The program emits a marker before the invalid operation. A compiler error,
 # early trap, later assertion or crash cannot satisfy the contract.

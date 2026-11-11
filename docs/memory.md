@@ -27,6 +27,14 @@ En lagrad konvertering är fortfarande en självständig array. Dolda
 mellanbuffertars allokering och resursåtgång är implementationsdetaljer;
 uttryckliga kapacitetskontroller och fel för index eller UTF-8 behålls.
 
+När ett helt uttryck äger ett temporärt värde kan kompilatorn överföra dess
+ägarskap till mottagaren och städa den tidigare ägarplatsen utan att kopiera
+bufferten. Detta gäller inte en befintlig lokal eller ett lånat fält eller
+element. Värdesemantik och observerbar arraykapacitet behålls. Extra
+allokeringar för sådana temporära kopior är inte garanterade; resursbrist
+beror på de allokeringar som faktiskt utförs. Uttryckliga kapacitetsfel,
+storleksgränser, indexfel och aritmetikfel behåller sina kontroller.
+
 I `text + change(&mut text)` behåller vänsterledet strängen som lästes före
 funktionsanropet. Samma utvärderingsordning gäller för argument, index och
 snittgränser. En retur bevarar sitt resultat medan funktionen städar sina
