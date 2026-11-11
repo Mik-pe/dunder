@@ -133,6 +133,8 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 | `compile.ddr` | Typer, uttryck, kontrollflöde, värdesemantik och kodgenerering. |
 | `opt_ir.ddr`, `opt_parse.ddr` | Återanvändbar typad funktionsmodell och konservativ skalär parser. |
 | `opt_pass.ddr` | Begränsad förenkling och bevis för säkra index och ökningar. |
+| `opt_verify.ddr` | Typ-, scope-, kontrollflödes-, effekt- och strukturinvariants före och efter passet. |
+| `scalar_rules.ddr` | Gemensamma namn-, operator- och heltalsliteralregler för källparsrarna. |
 | `opt_alloc.ddr`, `opt_emit.ddr` | Livstidsintervall, registerplacering, spill och emission för modellen. |
 | `x86.ddr`, `x86_linux.ddr` | x86-64-kodgenerering och Linux-ingång. |
 | `wasm_native.ddr`, `wasm_flow.ddr` | Modulformat, funktionsanrop, grundblock och relokeringar för Wasm. |

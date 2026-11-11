@@ -45,8 +45,10 @@ funktionscache, atomisk publicering och testkörning med tidsgräns.
 
 Standardprofilen optimerar anropsfria skalära funktioner genom en typad lokal
 modell med konstantförenkling, konservativa loopbevis och registerallokering.
-Delade `&[]i64`-parametrar stöds för läsning. Ägda värden, muterbara arrayer,
-flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
+Delade `&[]i64`-parametrar stöds för läsning och exklusiva `&mut []i64`
+för elementskrivning. Räknade `for`-loopar fångar sina gränser en gång.
+Modellen verifieras före och efter passet. Ägda värden, storleksändring av
+arrayer, flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
 [Omfattning och gränser](optimization.md).
 
 Tabell är ett fristående CSV-projekt med eget manifest, gruppering,
@@ -60,7 +62,7 @@ och [macOS-appar](app-bundles.md).
 ## Körda Wasm-kontrakt
 
 Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 66 av de 72 grupperna med godkänt
+till en separat Wasm-modul. Node körde 76 av de 82 grupperna med godkänt
 resultat. De sex övriga har nåbara anrop till filsystemet.
 
 | Grupp | Nativt beroende |

@@ -23,6 +23,12 @@ total = total + 1      // tilldelning till befintlig muterbar bindning
 `: Typ =` gör samma sak med en explicit typ. Ett nytt `:=` med samma namn i
 samma scope är ett fel. Ett inre block får skugga ett yttre namn.
 
+I värdeuttryck väljs en aktiv lokal bindning före ett namngivet typnamn.
+En arrayparameter `Values` kan därför använda `Values.len` även om det
+finns en enum som heter `Values`. Typannotationer använder typnamnens
+eget uppslag. Regeln gäller både filbaserade byggen och kompilatorns
+direkta käll- och token-API, oberoende av optimeringsläge.
+
 Bindningar och funktionsparametrar är oföränderliga som standard. `var` är
 det explicita valet av muterbarhet. Typen ändras aldrig efter deklarationen.
 All deklaration kräver initiering. Det finns inga oinitierade lokaler i denna

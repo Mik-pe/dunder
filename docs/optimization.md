@@ -10,17 +10,35 @@ index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen
 Standardbygget provar först en kompakt, typad och strukturerad
 [funktionsmodell](../selfhost/opt_ir.ddr). Den återanvänder samma arena mellan
 funktioner. [Parsern](../selfhost/opt_parse.ddr) godtar i första etappen
-anropsfria funktioner med `i32`, `i64`, `bool` och delade `&[]i64`-parametrar:
+anropsfria funktioner med `i32`, `i64`, `bool`, delade `&[]i64`-parametrar
+och exklusiva `&mut []i64`-parametrar:
 lokaler, tilldelningar, aritmetik, kortslutning, `if`, `while`, retur,
-`break`, `continue`, arraylängd och indexläsning. Högst åtta parametrar
-och en skalär eller tom retur stöds. Ägda värden, mutation av arrayer,
-flyttal, osäker kod och anrop använder den befintliga vägen.
+`break`, `continue`, räknade `for`-loopar, arraylängd, indexläsning och
+elementskrivning. Högst åtta parametrar och en skalär eller tom retur
+stöds. Ägda värden, storleksändring eller byte av arraylagring, flyttal,
+osäker kod och anrop använder den befintliga vägen.
 
 Alla grenar kontrolleras innan optimeringen börjar, även om ett villkor
 är konstant. Om modellen inte stöder kroppen eller når sin resursgräns
 tar den befintliga kompilatorn över, inklusive feldiagnostik. Gränserna
 är 4 096 token, 2 048 noder, 256 lokaler och konservativt djup 64.
 Detta är en lokal IR per funktion; någon helprograms-IR eller SSA byggs inte.
+
+[Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
+den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
+operatorprioritet och kontextuell bredd på signerade heltalsliteraler.
+En accepterad modell har kontrollerats av modellparsern; en avvisad modell
+går vidare till den fulla parsern för stöd och diagnostik.
+
+[IR-verifieraren](../selfhost/opt_verify.ddr) kontrollerar modellen före
+och efter passet: parallella vektorer, index, typer, nodroller,
+räckvidd för lokaler, initiering, parameterordning, returer, looputgångar,
+trädägarskap och konservativa effekter. Cykler och delade exekverbara
+noder avvisas; bortkopplade arbetsnoder efter förenkling är tillåtna.
+Ett internt invariantfel ger ett kompilatorfel före emission. Det räknas
+inte som en vanlig modellbegränsning och döljs inte genom återfall.
+Verifieraren kontrollerar var bevis får användas; själva bevisregelns
+sundhet provas separat och följer inte automatiskt av formkontrollen.
 
 [Passet](../selfhost/opt_pass.ddr) förenklar konstanter, lokala värden och
 konstanta grenar inom en fast arbetsbudget på 65 536 steg. Det räknar
@@ -34,6 +52,23 @@ själva ökningen säkra. Arrayen måste vara en oföränderlig inparameter.
 Andra skrivningar till indexet, `continue` eller nästlade loopar hindrar
 beviset. Summeringens overflow-kontroll finns kvar. Regeln bygger på
 kroppens struktur och gäller oberoende av funktionsnamn eller modul.
+
+En räknad `for i in low..high` har en egen strukturerad nod. Båda
+gränserna är `i32` och utvärderas en gång, nedre först, innan iteratorn
+kommer i scope. Iteratorn är oföränderlig i källkoden och kroppen har ett
+inre scope. `continue` når ökningen; `break` når utgången. En dold
+övre gräns behålls över hela loopen även om källans lokaler ändras.
+En loop garanterar aldrig att funktionen returnerar ett värde.
+
+Elementskrivning är en separat typad nod med uttryckligt minnesskrivningseffekt.
+Den utvärderar och gränskontrollerar destinationen före högerledet och
+bevarar adressen över högerledets indexläsningar. Den exklusiva referentens
+skrivrätt skiljs från själva parameterbindningens oföränderlighet.
+Arrayens dataadress och längd är stabila eftersom modellens slutna
+operationsmängd inte kan byta descriptor, växa, exponera adresser eller
+anropa annan kod. Innehållsvärden cachas inte över skrivningar. Nya
+muterbara index och skrivningar behåller sina gränskontroller.
+Arrayvärdesiteration använder fortsatt den allmänna vägens snapshot.
 
 [Registerallokeringen](../selfhost/opt_alloc.ddr) använder konservativa
 livstidsintervall, förlänger dem över loopars bakåtkanter och placerar
@@ -69,7 +104,7 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Bredare lokal modell | `for`, skalära anrop och mutation genom exklusiva arraylån öppnar fler verkliga loopar och sortering. | Anropseffekter, register som förstörs vid anrop, bevarade adresser och låneursprung måste vara explicita. Samma frontend ska successivt ersätta dubblerad semantik. |
+| Bredare lokal modell | Skalära anrop, fler typer och ägda iterationer öppnar fler verkliga funktioner. Räknade loopar och exklusiv elementmutation är implementerade. | Anropseffekter, register som förstörs vid anrop, bevarade adresser och låneursprung måste vara explicita. Samma frontend ska successivt ersätta återstående dubblerad semantik. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Begränsad specialisering och inlining | Små heta hjälpfunktioner kan slippa anropskostnad och ge lokala bevis över anropsgränsen. | Fast budget per funktion och anropsställe, begränsad kodtillväxt och cacheidentitet för samtliga påverkande sammanfattningar. |
