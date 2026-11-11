@@ -17,6 +17,15 @@ använder den allmänna stackvägen. Utvärderingsordning, operatorprioritet,
 kortslutning och aritmetikkontroller är desamma. Looparnas interna
 jämförelser behöver heller inte spilla operanderna till stacken.
 
+Ett helt ägt temporärt uttryck kan överföra sitt värde till en deklaration,
+ett argument, en retur, en tilldelning eller en loop. Kompilatorn spårar
+uttryckets exakta ägarplats och nollställer den vid överföringen. Befintliga
+lokaler och projektioner av fält eller element kopieras fortsatt. Parenteser
+behåller ursprunget; nya operator- och anropsresultat får egna ägarplatser.
+Arrayer behåller den kapacitet en vanlig värdekopia skulle visa, även om en
+större underliggande buffert återanvänds. Sammansatta värden med nästlade
+ägda samlingar använder tills vidare den rekursiva kopieringsvägen.
+
 [ARM64-backenden](../selfhost/arm64.ddr) använder direkt LDUR/STUR för
 lokala värden nära framepekaren och immediate-adresser där offseten ryms.
 [x86-64](../selfhost/x86.ddr) och [Wasm](../selfhost/wasm_native.ddr)

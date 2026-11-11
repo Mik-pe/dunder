@@ -38,6 +38,7 @@ struct Compiler {
     field_names: []string, field_types: []i32, field_values: []i64, payload_starts: []i32, payload_counts: []i32, payload_types: []i32, address: i32, writable: bool, scratch_place: i32, loans: scratch.Loans, scratch_returns: []i32,
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
     cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool, loop_owners: []i32,
+    expr_owner: i32, expr_type: i32, array_take: i32,
     scope: i32, slots: i32, ret_type: i32, depth: i32,
     loop_heads: []i32, loop_ends: []i32,
     strings: []string, string_labels: []i32,
@@ -183,6 +184,26 @@ fn copy_value(c: &mut Compiler, ty: i32) {
     if ty == 4 || c.type_kinds[ty] == 7 { arm.branch(&mut c.code, c.runtime.retain, 1) }
     else if owned(&c, ty) { arm.branch(&mut c.code, c.type_clones[ty], 1) }
 }
+// The origin belongs to the complete expression in x0, never to an arbitrary
+// nested temporary. Keep recursive aggregate copies until their nested array
+// capacities can be preserved without changing the value's observable shape.
+fn can_take(c: &Compiler, ty: i32) -> bool {
+    if ty == 4 || collection(&c, ty) || c.type_kinds[ty] == 7 || c.c_record[ty] { return true }
+    if c.type_kinds[ty] != 2 { return false }
+    first := c.type_starts[ty]
+    for i in first..first + c.type_counts[ty] {
+        field_ty := c.field_types[i]
+        if owned(&c, field_ty) && field_ty != 4 && c.type_kinds[field_ty] != 7 { return false }
+    }
+    true
+}
+fn take_value(c: &mut Compiler, ty: i32) {
+    if c.expr_owner >= 0 && c.expr_type == ty && can_take(&c, ty) {
+        if collection(&c, ty) { arm.branch(&mut c.code, c.array_take, 1) }
+        arm.store(&mut c.code, c.expr_owner, 31)
+    } else { copy_value(&mut c, ty) }
+    c.expr_owner = -1; c.expr_type = -1
+}
 fn drop_value(c: &mut Compiler, ty: i32) {
     if ty == 4 { arm.branch(&mut c.code, c.runtime.release, 1) }
     else if owned(&c, ty) { arm.branch(&mut c.code, c.type_drops[ty], 1) }
@@ -199,7 +220,8 @@ fn save_owner(c: &mut Compiler, index: i32, ty: i32, temporary: bool) {
     arm.push(&mut c.code, 0); clear_owner(&mut c, index, ty); arm.pop(&mut c.code, 0); arm.store(&mut c.code, index, 0)
 }
 fn temporary(c: &mut Compiler, ty: i32) -> i32 {
-    if owned(&c, ty) { index := slot(&mut c); save_owner(&mut c, index, ty, true) }
+    c.expr_owner = -1; c.expr_type = -1
+    if owned(&c, ty) { index := slot(&mut c); save_owner(&mut c, index, ty, true); c.expr_owner = index; c.expr_type = ty }
     ty
 }
 fn cleanup_from(c: &mut Compiler, first: i32, only_temps: bool) {
@@ -1054,7 +1076,7 @@ fn invoke(c: &mut Compiler, signature: i32, address: i32, f: i32, wasm_sig: i32)
         argument := c.cursor
         arg_starts.push(argument); effects.push(c.mutations.len)
         want := c.ffi_params[first + provided]
-        ty := expression(&mut c, 0, want); same(&mut c, want, ty); copy_value(&mut c, ty)
+        ty := expression(&mut c, 0, want); same(&mut c, want, ty); take_value(&mut c, ty)
         if c.loans.active && (c.type_kinds[want] == 4 || c.type_kinds[want] == 5) {
             origin := loan_origin(&c, argument, c.cursor)
             var callee := f; if address >= 0 { callee = -1 }
@@ -1146,10 +1168,13 @@ fn read_only_index(tokens: &lexer.Tokens, first: i32) -> bool {
 fn primary(c: &mut Compiler, expected: i32) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
-    c.address = -1; c.writable = false; c.scratch_place = 0
+    c.address = -1; c.writable = false; c.scratch_place = 0; c.expr_owner = -1; c.expr_type = -1
     first_token := c.cursor
     var ty := primary_inner(&mut c, expected)
     while c.ok && c.cursor != c.postfix_stop && (is(&c, ".") || is(&c, "[") || is(&c, "(")) {
+        // Projection results borrow their receiver's storage. A call or slice
+        // below may establish a new complete temporary of its own.
+        c.expr_owner = -1; c.expr_type = -1
         if eat(&mut c, "(") {
             if c.type_kinds[ty] == 8 { ty = foreign_call(&mut c, ty) }
             else if c.type_kinds[ty] == 9 {
@@ -1194,6 +1219,7 @@ fn primary(c: &mut Compiler, expected: i32) -> i32 {
                 if packed { transfer_c(&mut c, ty, 0, 0, true) } else { transfer_value(&mut c, ty, 0, 0, true) }
                 c.writable = writable
             } else { fail(&mut c, "index requires an array or string") }
+            c.expr_owner = -1; c.expr_type = -1
         } else {
             expect(&mut c, "."); name := advance(&mut c)
             // Callable fields go through ordinary field access and the postfix
@@ -1213,6 +1239,7 @@ fn primary(c: &mut Compiler, expected: i32) -> i32 {
             } else { fail(&mut c, "unknown member '" + name + "'") }
         }
     }
+    if !owned(&c, ty) { c.expr_owner = -1; c.expr_type = -1 }
     c.depth = c.depth - 1; ty
 }
 fn enum_type(c: &Compiler, ty: i32) -> bool { ty >= 0 && (c.type_kinds[ty] == 3 || c.type_kinds[ty] == 7) }
@@ -1230,7 +1257,7 @@ fn enumeration(c: &mut Compiler, ty: i32) -> i32 {
         for i in 0..count {
             if i > 0 { expect(&mut c, ",") }
             pt := c.payload_types[c.payload_starts[found] + i]
-            actual := expression(&mut c, 0, pt); same(&mut c, pt, actual); copy_value(&mut c, pt)
+            actual := expression(&mut c, 0, pt); same(&mut c, pt, actual); take_value(&mut c, pt)
             arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, index); store_mem(&mut c, 1, 0, (i + 1) * 8)
         }
         expect(&mut c, ")")
@@ -1297,7 +1324,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
                 arm.branch(&mut c.code, c.runtime.array_push, 1); arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
                 break
             }
-            count = count + 1; copy_value(&mut c, ty)
+            count = count + 1; take_value(&mut c, ty)
             arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); arm.branch(&mut c.code, c.runtime.array_push, 1)
             if !eat(&mut c, ",") { break }
         }
@@ -1353,7 +1380,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
                     arm.push(&mut c.code,0); arm.load(&mut c.code,saved); c_offset(&mut c,c.field_values[found])
                     arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); store_inline(&mut c,ty)
                 } else {
-                    copy_value(&mut c, ty); arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, offset * 8)
+                    take_value(&mut c, ty); arm.push(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, offset * 8)
                 }
                 if !eat(&mut c, ",") { break }; separators(&mut c)
             }
@@ -1364,7 +1391,9 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         if is(&c, "(") { found_local := local(&c, name)
             if found_local >= 0 && c.type_kinds[c.local_types[found_local]] == 8 {
                 sig := c.local_types[found_local]
-                expect(&mut c,"("); arm.load(&mut c.code,c.local_slots[found_local]); return foreign_call(&mut c,sig)
+                expect(&mut c,"("); arm.load(&mut c.code,c.local_slots[found_local]); result := foreign_call(&mut c,sig)
+                // C argument temporaries do not own the foreign result.
+                c.expr_owner = -1; c.expr_type = -1; return result
             }; result := call(&mut c, name, expected); c.address = -1; c.writable = false; return temporary(&mut c, result) }
         found := local(&c, name)
         if found < 0 {
@@ -1432,7 +1461,7 @@ fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_en
         if !writable { fail(&mut c, "array mutation requires var or &mut") }
         if name == "push" {
             if !writable { fail(&mut c, "push requires mutable array") }
-            value := expression(&mut c, 0, c.type_bases[ty]); same(&mut c, c.type_bases[ty], value); copy_value(&mut c, value); count = 1; target = c.runtime.array_push; ret = 0
+            value := expression(&mut c, 0, c.type_bases[ty]); same(&mut c, c.type_bases[ty], value); take_value(&mut c, value); count = 1; target = c.runtime.array_push; ret = 0
         } else if name == "reserve" { value := expression(&mut c, 0, 1); same(&mut c, 1, value); count = 1; target = c.runtime.array_reserve; ret = 0 }
         else if name == "pop" { target = c.runtime.array_pop; ret = c.type_bases[ty] }
         else if name == "clear" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); if c.type_bases[ty] == 4 { arm.branch(&mut c.code, c.runtime.release_elements, 1) }; arm.imm(&mut c.code, 1, 0); store_mem(&mut c, 1, 0, 8); return 0 }
@@ -1692,7 +1721,7 @@ fn conditional_inner(c: &mut Compiler, tail_allowed: bool) -> bool {
 fn match_statement(c: &mut Compiler) -> bool {
     ty := expression(&mut c, 0, 0)
     if !enum_type(&c, ty) { fail(&mut c, "match requires an enum"); return false }
-    saved := slot(&mut c); copy_value(&mut c, ty)
+    saved := slot(&mut c); take_value(&mut c, ty)
     if owned(&c, ty) { save_owner(&mut c, saved, ty, true) } else { arm.store(&mut c.code, saved, 0) }
     if !is(&c, "{") { fail(&mut c, "expected match arms"); return false }
     tail := c.tail && terminal(&c, c.closes[c.cursor] + 1, true)
@@ -1733,7 +1762,7 @@ fn match_statement(c: &mut Compiler) -> bool {
             var expected := 0; if tail { expected = c.ret_type }
             value := expression(&mut c, 0, expected)
             if tail && expected != 0 {
-                same(&mut c, expected, value); copy_value(&mut c, value); arm.branch(&mut c.code, c.cleanup, 0); ends = true
+                same(&mut c, expected, value); take_value(&mut c, value); arm.branch(&mut c.code, c.cleanup, 0); ends = true
             } else if value != 0 { fail(&mut c, "unused match arm value") }
         }
         returns = returns && ends
@@ -1826,7 +1855,7 @@ fn statement(c: &mut Compiler) -> bool {
             if c.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
         } else { ty := expression(&mut c, 0, c.ret_type); same(&mut c, c.ret_type, ty) }
         end_statement(&mut c)
-        copy_value(&mut c, c.ret_type); arm.branch(&mut c.code, c.cleanup, 0)
+        take_value(&mut c, c.ret_type); arm.branch(&mut c.code, c.cleanup, 0)
         return true
     }
     if eat(&mut c, "if") { after := conditional_end(&c, c.cursor); allowed := c.tail && terminal(&c, after, true); return conditional(&mut c, allowed) }
@@ -1850,7 +1879,7 @@ fn statement(c: &mut Compiler) -> bool {
             arm.emit(&mut c.code, 2472606752); arm.store(&mut c.code, limit, 0)
         } else {
             if !collection(&c, low) { fail(&mut c, "for requires a range or array"); return false }
-            array = true; base = c.type_bases[low]; copy_value(&mut c, low); save_owner(&mut c, values, low, true)
+            array = true; base = c.type_bases[low]; take_value(&mut c, low); save_owner(&mut c, values, low, true)
             load_mem(&mut c, 0, 0, 8); arm.store(&mut c.code, limit, 0); arm.imm(&mut c.code, 0, 0); arm.store(&mut c.code, cursor, 0)
         }
         head := arm.label(&mut c.code); next := arm.label(&mut c.code); done := arm.label(&mut c.code)
@@ -1888,7 +1917,7 @@ fn statement(c: &mut Compiler) -> bool {
         if expected != 0 { same(&mut c, expected, ty) }
         if ty == 0 { fail(&mut c, "local requires a value") }
         if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { fail(&mut c, "borrows are limited to function parameters") }
-        copy_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index, name_at)
+        take_value(&mut c, ty); index := slot(&mut c); bind(&mut c, name, ty, mutable, index, name_at)
         if owned(&c, ty) { save_owner(&mut c, index, ty, false) } else { arm.store(&mut c.code, index, 0) }
         end_statement(&mut c)
         return false
@@ -1902,6 +1931,7 @@ fn statement(c: &mut Compiler) -> bool {
         if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch bindings cannot be reassigned");return false}
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
         effects := c.mutations.len; value := expression(&mut c, 0, ty); same(&mut c, ty, value)
+        result_owner := c.expr_owner; result_type := c.expr_type
         base := borrows.place(&c.tokens, first_token, assignment)
         if base < 0 { fail(&mut c, "assignment requires a named variable, field or array element"); return false }
         if assignment > base + 1 && borrows.changed(&c.tokens, &c.mutations, effects, c.mutations.len, base) {
@@ -1912,6 +1942,7 @@ fn statement(c: &mut Compiler) -> bool {
             checked := expression(&mut c, 0, ty); destination = c.address; direct = c.direct_place
             c.cursor = end; arm.pop(&mut c.code, 0)
         }
+        c.expr_owner = result_owner; c.expr_type = result_type
         if scratch_target==1 && !c.c_record[ty] {
             arm.mov(&mut c.code,1,0);arm.load(&mut c.code,destination)
             if c.type_kinds[ty]==2 {
@@ -1923,7 +1954,7 @@ fn statement(c: &mut Compiler) -> bool {
             arm.push(&mut c.code,0); arm.load(&mut c.code,destination); arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0)
             store_inline(&mut c,ty); end_statement(&mut c); return false
         }
-        copy_value(&mut c, ty)
+        take_value(&mut c, ty)
         if !owned(&c, ty) {
             if direct { arm.store(&mut c.code, destination, 0) }
             else { arm.mov(&mut c.code, 1, 0); place_address(&mut c, destination, false); transfer_value(&mut c, ty, 1, 0, false) }
@@ -1934,7 +1965,7 @@ fn statement(c: &mut Compiler) -> bool {
         place_address(&mut c, destination, direct); arm.pop(&mut c.code, 1); transfer_value(&mut c, ty, 1, 0, false)
         end_statement(&mut c); return false
     }
-    if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); copy_value(&mut c, ty); arm.branch(&mut c.code, c.cleanup, 0); return true }
+    if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 { same(&mut c, c.ret_type, ty); take_value(&mut c, ty); arm.branch(&mut c.code, c.cleanup, 0); return true }
     if ty == 3 && c.testing {
         arm.branch(&mut c.code, c.assertion, 18)
     } else if ty != 0 { fail(&mut c, "unused value; bind it or return it") }
@@ -2046,7 +2077,7 @@ pub fn compile_cached(tokens: &mut lexer.Tokens, platform: i32, module_starts: &
         }
     }
     if !tokens.ok { return Result { ok: false, error: tokens.error, offset: tokens.error_at, text: [], imports: imports() } }
-    var code := arm.new_for(platform); rt := runtime.new(&mut code)
+    var code := arm.new_for(platform); rt := runtime.new(&mut code); array_take := arm.label(&mut code)
     var c := Compiler {
         tokens: tokens, closes: [], block_end: 0, tail: false, block_depth: 0, cursor: 0, ok: true, error: "", error_at: 0,
         test_functions: [], testing: false, mutations: [], postfix_stop: -1,
@@ -2054,7 +2085,7 @@ pub fn compile_cached(tokens: &mut lexer.Tokens, platform: i32, module_starts: &
         functions: map.new(), names: [], starts: [], ends: [], returns: [], param_starts: [], param_counts: [], param_names: [], param_types: [],
         wasm_abi: wa.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, opaque_owner: [], function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, direct_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [], callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], type_drops: [], field_names: [], field_types: [], field_values: [], payload_starts: [], payload_counts: [], payload_types: [], address: -1, writable: false, scratch_place: 0, loans: scratch.loans(), scratch_returns: [],
-        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
+        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [], expr_owner: -1, expr_type: -1, array_take: array_take, scope: 0, slots: 0, ret_type: 0, depth: 0,
         loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
     for name in ["()", "i32", "i64", "bool", "string", "rune", "f32", "f64", "u8", "u16", "u32", "u64", "usize", "ptr", "range"] { added := add_type(&mut c, name, 0, 0) }
@@ -2200,6 +2231,14 @@ fn finish_image(c: &mut Compiler, platform: i32, main_id: i32, rt: &runtime.Runt
     for id in 0..c.callback_labels.len { if c.callback_labels[id] >= 0 { callback_entry(&mut c, id) } }
     arm.mark(&mut c.code, c.float_trap); arm.exit(&mut c.code, 107)
     arm.mark(&mut c.code, c.bounds); arm.exit(&mut c.code, 103)
+    // array_clone exposes capacity 0 for empty arrays and max(8,len) otherwise.
+    // Reusing a temporary's larger backing allocation must preserve that value.
+    arm.mark(&mut c.code, c.array_take); load_mem(&mut c, 1, 0, 8)
+    ready := arm.label(&mut c.code)
+    arm.emit(&mut c.code, 4043309119); arm.branch(&mut c.code, ready, 2)
+    arm.emit(&mut c.code, 4043317311); arm.branch(&mut c.code, ready, 4)
+    arm.imm(&mut c.code, 1, 8)
+    arm.mark(&mut c.code, ready); store_mem(&mut c, 1, 0, 16); arm.emit(&mut c.code, 3596551104)
     clones(&mut c)
     arm.runtime(&mut c.code, c.print_int, c.print_bool, c.print_text, c.write, c.overflow, c.zero, c.assertion, c.io)
     runtime.emit_runtime(&mut c.code, &rt)
