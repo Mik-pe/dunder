@@ -30,3 +30,49 @@ that initializing a promoted home with zero changed raw frame observations;
 that initialization has since been replaced with a load of the original bits.
 No C-level performance claim follows from these results: the architecture still
 has a substantial compile-time cost and runtime remains above the C reference.
+
+
+## Source-memory and value passes: full-plan candidate
+
+The `memory-values-full-plan` ablation uses the same frozen compiler
+`a6833f5784f29ed944ccabbffdc50d007a611622c230bf832897f5ad2bf747a8`
+on both sides. Baseline disables `--mir-memory` and `--mir-values`; candidate
+uses the complete default profile. Both keep bounded inlining and generic
+frame promotion enabled. This is an intermediate, correctness-verified
+candidate, withheld from publication as the default because build throughput
+fails the target.
+
+| Case | Both new mechanisms off | Both on | On / C |
+| --- | --- | --- | --- |
+| Numeric runtime median | 5.650 ms | 5.048 ms | 1.098 |
+| Scan runtime median | 3.105 ms | 2.584 ms | 1.051 |
+| Text runtime median | 3.725 ms | 3.504 ms | 1.361 |
+| Sort runtime median | 3.171 ms | 3.045 ms | 1.291 |
+| Generated build median | 564.572 ms | 2049.406 ms | — |
+| Self-build median | 502.662 ms | 1488.135 ms | — |
+| Tabell build median | 14.104 ms | 36.553 ms | — |
+
+Runtime/C geometric mean is 1.193, worst case 1.361. Generated build p95
+is 2071.989 ms, only 48,757 source lines/s; self-build p95 is 1500.290 ms.
+Check-only remains unchanged. Runtime p95 has considerable process-latency
+variation in this series and is retained in the raw summary; median gains
+must not be read as a claim that every tail-latency metric improved.
+
+The unchanged-source probe independently checks 18 native outputs with the
+value pass off/on. Numeric has 63 operand/value rewrites and 35 deleted pure
+materializations; text has 68 and 39. These counts and byte sizes describe the
+complete emitted source image, not a precise inner-loop dump. Their original
+Wasm builds require native `sys.arg` and are explicitly BLOCKED; separate
+portable value and memory fixtures execute on Wasm.
+
+Full `tools/verify-selfhost.sh` passed, including the bootstrap fixed point,
+138 native dogfood groups, 124 Wasm groups with 14 explicit native-only groups,
+50 diagnostics, 56 check/build contracts and 46 runtime contracts per runtime.
+The separate value matrix built 256 images and executed 128 host/Wasm cases,
+with 232 independent oracle pairs and 24 declared call/trap coverage gaps.
+
+The principal next correction is structural: replace the full Function plan
+and exact full snapshots with a single exclusive optimization transaction and
+a sparse undo arena. Preserve the same dataflow, canonical contracts, external
+exit observations and mandatory final verification. No reduced safety profile
+or benchmark-specific eligibility rule is used to recover build time.
