@@ -22,7 +22,7 @@ struct Loader {
     kinds: []lexer.Kind, texts: []string, starts: []i32, ends: []i32,
     omit: []bool, declared: []i32, any_unsafe: bool, filesystem: []bool, requires_fs: []bool,
     symbols: map.Map, imports: map.Map, names: []string, owners: []i32,
-    public: []bool, renamed: []string,
+    public: []bool, records: []bool, renamed: []string,
     testing: bool, test_tags: []i32, test_targets: []i32, test_ends: []i32, next_test: i32,
     groups: []string, calls: []string,
 }
@@ -330,6 +330,7 @@ fn scan(loader: &mut Loader, owner: i32) {
             map.put(&mut loader.symbols, entry, i64(id))
             if requires_fs && owner==0 && name=="main" {fail(&mut loader,owner,loader.starts[name_at],"main cannot require a grant");return}
             loader.names.push(name); loader.owners.push(owner); loader.public.push(public)
+            loader.records.push(is(&loader, i, "struct"))
             loader.requires_fs.push(requires_fs);requires_fs=false
             var renamed := "__dunder_module_" + id.str()
             if !loader.testing && owner == 0 && name == "main" && is(&loader, i, "fn") { renamed = "main" }
@@ -347,6 +348,59 @@ fn local(names: &[]string, active: &[]i32, at: i32, value: string) -> bool {
     var i := names.len
     while i > 0 { i = i - 1; if names[i] == value && at >= active[i] { return true } }
     false
+}
+// Balance every delimiter, including record literals nested in calls, indexes
+// and parentheses. The scratch stack is reused across headers in this module.
+fn balanced_end(kinds: &[]lexer.Kind, texts: &[]string, first: i32, last: i32, stack: &mut []i32) -> i32 {
+    stack.clear()
+    if first < 0 || first >= last || last > kinds.len || last > texts.len || kinds[first] != .Symbol { return -1 }
+    if texts[first] != "(" && texts[first] != "[" && texts[first] != "{" { return -1 }
+    var i := first
+    while i < last {
+        if kinds[i] == .Symbol {
+            word := texts[i]
+            var open := 0; var close := 0
+            if word == "(" { open = 1 } else if word == "[" { open = 2 } else if word == "{" { open = 3 }
+            if word == ")" { close = 1 } else if word == "]" { close = 2 } else if word == "}" { close = 3 }
+            if open != 0 { stack.push(open) }
+            if close != 0 {
+                if stack.len == 0 || stack[stack.len - 1] != close { return -1 }
+                previous := stack.pop()
+                if stack.len == 0 { return i + 1 }
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+// The full parser chooses a record constructor only when its leading name
+// resolves to a nominal record, before considering the following brace. Use
+// the same module/local distinction; a local or a field can shadow a type.
+fn constructor_brace(loader: &Loader, owner: i32, at: i32, names: &[]string, active: &[]i32) -> bool {
+    name_at := at - 1
+    if name_at < 0 || loader.kinds[name_at] != .Name { return false }
+    var source := owner
+    if is(&loader, name_at - 1, ".") {
+        alias := name_at - 2
+        if alias < 0 || loader.kinds[alias] != .Name || is(&loader, alias - 1, ".") { return false }
+        if local(&names, &active, alias, loader.texts[alias]) { return false }
+        source = i32(map.get_or(&loader.imports, key(owner, loader.texts[alias]), -1))
+        if source < 0 { return false }
+    } else if local(&names, &active, name_at, loader.texts[name_at]) { return false }
+    id := i32(map.get_or(&loader.symbols, key(source, loader.texts[name_at]), -1))
+    id >= 0 && loader.records[id]
+}
+fn iterator_body(loader: &Loader, owner: i32, name: i32, last: i32, names: &[]string, active: &[]i32, stack: &mut []i32) -> i32 {
+    var i := name + 2 // Skip the iterator name and its `in` token.
+    while i < last {
+        if loader.kinds[i] == .End || is(&loader, i, "}") { return last }
+        if is(&loader, i, "(") || is(&loader, i, "[") || (is(&loader, i, "{") && constructor_brace(&loader, owner, i, &names, &active)) {
+            after := balanced_end(&loader.kinds, &loader.texts, i, last, &mut stack)
+            if after < 0 { return last }; i = after
+        } else if is(&loader, i, "{") { return i }
+        else { i = i + 1 }
+    }
+    last
 }
 fn binding_end(loader: &Loader, at: i32, last: i32) -> i32 {
     var i := at + 1
@@ -393,6 +447,7 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
     var locals: []string = []
     var levels: []i32 = []
     var active: []i32 = []
+    var brace_scopes: []bool = []; var delimiter_stack: []i32 = []
     var previous := -1
     var case_target := ""
     var case_end := -1
@@ -439,6 +494,10 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
         if !loader.result.token_offsets && (kind == .String || kind == .Rune) {
             spelling = loader.result.sources[owner][loader.starts[i]..loader.ends[i]]
         }
+        var lexical_brace := true
+        if mode == 2 && is(&loader, i, "{") { lexical_brace = !constructor_brace(&loader, owner, i, &locals, &active) }
+        var expression_fields := false
+        if brace_scopes.len > 0 { expression_fields = !brace_scopes[brace_scopes.len - 1] }
         var consumed := 1
         if kind == .Name {
             if begins(value, "__dunder_module_") || (begins(value, "__sys_") && loader.standard[owner] != "sys") {
@@ -449,21 +508,20 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
             var binding := false
             if mode == 1 && field { binding = true }
             if mode == 2 {
-                if is(&loader, i + 1, ":=") || (field && (previous < 0 || loader.kinds[previous] == .Newline || is(&loader, previous, "{") || is(&loader, previous, ";") || is(&loader, previous, "var"))) { binding = true }
+                if !expression_fields && (is(&loader, i + 1, ":=") || (field && (previous < 0 || loader.kinds[previous] == .Newline || is(&loader, previous, "{") || is(&loader, previous, ";") || is(&loader, previous, "var")))) { binding = true }
                 if is(&loader, previous, "for") { binding = true }
             }
             if binding {
-                locals.push(value)
                 var level := depth
                 var visible := i
                 if mode == 2 {
                     visible = binding_end(&loader, i, last)
                     if is(&loader, previous, "for") {
-                        level = depth + 1; visible = i + 1
-                        while visible < last && !is(&loader, visible, "{") { visible = visible + 1 }
+                        level = depth + 1
+                        visible = iterator_body(&loader, owner, i, last, &locals, &active, &mut delimiter_stack)
                     }
                 }
-                levels.push(level); active.push(visible)
+                locals.push(value); levels.push(level); active.push(visible)
             }
             after_dot := is(&loader, previous, ".")
             enum_member := mode == 4 && depth == 1 && (previous < 0 || loader.kinds[previous] == .Newline || is(&loader, previous, "{") || is(&loader, previous, ","))
@@ -493,11 +551,16 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
         if loader.result.token_offsets { flat_token(&mut tokens,kind,spelling,start + loader.starts[i]) }
         else { emit(&mut loader, &mut output, owner, i, spelling) }
         if is(&loader, i, "{") {
+            brace_scopes.push(lexical_brace)
             depth = depth + 1
             if mode == 1 { mode = 2 }
         }
         if is(&loader, i, "}") {
-            while levels.len > 0 && levels[levels.len - 1] >= depth { name := locals.pop(); level := levels.pop(); begin := active.pop() }
+            var lexical := true
+            if brace_scopes.len > 0 { lexical = brace_scopes.pop() }
+            if lexical {
+                while levels.len > 0 && levels[levels.len - 1] >= depth { name := locals.pop(); level := levels.pop(); begin := active.pop() }
+            }
             depth = depth - 1
             if depth == 0 { mode = 0; locals.clear(); levels.clear(); active.clear() }
         }
@@ -536,7 +599,7 @@ pub fn load_group(path: string, testing: bool, token_offsets: bool, group: i32, 
         result: Loaded { token_offsets: token_offsets, groups: [], calls: [], ok: true, error: "", path: path, source: "", offset: 0,
             paths: [], sources: [], symbols: [], map_starts: [], map_ends: [], map_files: [], map_offsets: [] },
         standard: [], directories: [], first: [], last: [], kinds: [], texts: [], starts: [], ends: [], omit: [], declared: [], any_unsafe: false, filesystem: [], requires_fs: [],
-        symbols: map.new(), imports: map.new(), names: [], owners: [], public: [], renamed: [],
+        symbols: map.new(), imports: map.new(), names: [], owners: [], public: [], records: [], renamed: [],
         testing: testing, test_tags: [], test_targets: [], test_ends: [], next_test: 0, groups: [], calls: [],
     }
     root := add(&mut loader, path, "", -1, 0)
@@ -608,4 +671,17 @@ pub fn load_group(path: string, testing: bool, token_offsets: bool, group: i32, 
     last.path == "lib.ddr"
     last.source == "\nfn value() {}"
     last.offset == 4
+}
+
+@test fn header_delimiters_balance_nested_calls_indexes_records_and_literals() {
+    tokens := lexer.scan("(read([Bound{value: step(0)}, Bound{value: 1}][0].value, \"}])\")) { body }", false)
+    var stack: []i32 = []
+    after := balanced_end(&tokens.kinds, &tokens.texts, 0, tokens.kinds.len, &mut stack)
+    after > 0
+    tokens.texts[after] == "{"
+    tokens.texts[after - 1] == ")"
+    bad := lexer.scan("([)]", false)
+    balanced_end(&bad.kinds, &bad.texts, 0, bad.kinds.len, &mut stack) == -1
+    missing := lexer.scan("(read(Bound{value: 1})", false)
+    balanced_end(&missing.kinds, &missing.texts, 0, missing.kinds.len, &mut stack) == -1
 }
