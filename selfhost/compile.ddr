@@ -23,6 +23,7 @@ import opt_verify
 import scalar_rules as rules
 import compiler_profile as profile
 import opt_alloc
+import machine_ir
 
 // Native Dunder compiler. Values use eight-byte cells; aggregates have value semantics.
 // Primitive IDs: ()=0, i32=1, i64=2, bool=3, string=4, rune=5.
@@ -39,6 +40,8 @@ pub fn bindings() -> Bindings {
         profile: profile.new(-1) }
 }
 pub struct Result { ok: bool, error: string, offset: i32, text: []u8, imports: Imports }
+pub struct Configuration { scalar_enabled: bool, ownership_enabled: bool, profile_host: i32, instrument_runtime: bool }
+pub fn configuration() -> Configuration { Configuration { scalar_enabled: true, ownership_enabled: true, profile_host: -1, instrument_runtime: false } }
 struct Compiler {
     tokens: lexer.Tokens, closes: []i32, block_end: i32, tail: bool, block_depth: i32, cursor: i32, ok: bool, error: string, error_at: i32,
     test_functions: []bool, testing: bool, mutations: []i32, postfix_stop: i32,
@@ -54,9 +57,9 @@ struct Compiler {
     type_names: []string, type_kinds: []i32, type_bases: []i32, type_starts: []i32, type_counts: []i32, type_clones: []i32, type_drops: []i32,
     field_names: []string, field_types: []i32, field_values: []i64, payload_starts: []i32, payload_counts: []i32, payload_types: []i32, address: i32, writable: bool, scratch_place: i32, loans: scratch.Loans, scratch_returns: []i32,
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
-    cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool, loop_owners: []i32,
+    cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool, owner_elided: []bool, loop_owners: []i32,
     expr_owner: i32, expr_type: i32, array_take: i32,
-    scalar_enabled: bool,
+    scalar_enabled: bool, ownership_enabled: bool, lease_starts: []i32, lease_ends: []i32,
     scalar_names: []string, scalar_types: []i32, scalar_tokens: []i32,
     scope: i32, slots: i32, ret_type: i32, depth: i32,
     loop_heads: []i32, loop_ends: []i32,
@@ -218,7 +221,7 @@ fn drop_value(c: &mut Compiler, ty: i32) {
     else if owned(&c, ty) { arm.branch(&mut c.code, c.type_drops[ty], 1) }
 }
 fn remember_owner(c: &mut Compiler, index: i32, ty: i32, temporary: bool) {
-    c.owned_slots.push(index); c.owned_types.push(ty); c.owner_temps.push(temporary)
+    c.owned_slots.push(index); c.owned_types.push(ty); c.owner_temps.push(temporary); c.owner_elided.push(false)
 }
 fn clear_owner(c: &mut Compiler, index: i32, ty: i32) {
     arm.load(&mut c.code, index); drop_value(&mut c, ty); arm.store(&mut c.code, index, 31)
@@ -236,9 +239,24 @@ fn temporary(c: &mut Compiler, ty: i32) -> i32 {
 fn cleanup_from(c: &mut Compiler, first: i32, only_temps: bool) {
     var i := c.owned_slots.len - 1
     while i >= first {
-        if !only_temps || c.owner_temps[i] { clear_owner(&mut c, c.owned_slots[i], c.owned_types[i]) }
+        if !c.owner_elided[i] && (!only_temps || c.owner_temps[i]) { clear_owner(&mut c, c.owned_slots[i], c.owned_types[i]) }
         i = i - 1
     }
+}
+// Only the extra binary-operand lease is disposable. The source value or its
+// original full-expression temporary remains an owner throughout the RHS.
+// Keep slot numbers stable; remove setup and all cleanup of this exact entry.
+fn elide_string_operand(c: &mut Compiler, start: i32, end: i32, owner: i32, index: i32) {
+    if start < 0 || start >= end || owner < 0 || owner >= c.owned_slots.len {
+        fail(&mut c, "internal ownership lease invariant"); return
+    }
+    if c.owned_slots[owner] != index || c.owned_types[owner] != 4 || !c.owner_temps[owner] || c.owner_elided[owner] {
+        fail(&mut c, "internal ownership lease invariant"); return
+    }
+    if c.lease_ends.len > 0 && start < c.lease_ends[c.lease_ends.len - 1] {
+        fail(&mut c, "internal ownership lease ordering"); return
+    }
+    c.lease_starts.push(start); c.lease_ends.push(end); c.owner_elided[owner] = true
 }
 fn skip_body(c: &mut Compiler) { expect(&mut c, "{"); c.cursor = c.closes[c.cursor - 1] + 1 }
 fn foreign_scalar(c: &Compiler, ty: i32) -> bool { ty == 1 || ty == 2 || (ty >= 6 && ty <= 13) || c.type_kinds[ty] == 8 }
@@ -909,6 +927,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         zero_record(&mut c, expected); return expected
     }
     if name == "callback" {
+        arm.barrier(&mut c.code) // Exposes an executable address to foreign code.
         require_unsafe(&mut c)
         symbol := advance(&mut c); expect(&mut c, ")")
         id := i32(map.get_or(&c.functions, symbol, -1))
@@ -931,6 +950,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         return foreign_type(&mut c, &params, c.returns[id])
     }
     if name == "static_bytes" {
+        arm.barrier(&mut c.code) // Exposes mutable storage without a runtime call.
         require_unsafe(&mut c)
         if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "static storage requires a platform literal"); return 0 }
         platform := advance(&mut c); expect(&mut c, ",")
@@ -947,6 +967,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         static_address(&mut c, offset); arm.mov(&mut c.code, 0, 16); return 13
     }
     if name == "cstr" {
+        arm.barrier(&mut c.code)
         require_unsafe(&mut c)
         if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "cstr needs a string literal"); return 0 }
         value := peek(&c); for i in 0..value.len { if value[i] == 0 { fail(&mut c, "cstr contains an embedded NUL") } }
@@ -954,6 +975,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         arm.emit(&mut c.code, 2432704512); return 13
     }
     if name == "addr" {
+        arm.barrier(&mut c.code)
         require_unsafe(&mut c); expect(&mut c, "&"); write := eat(&mut c, "mut")
         first := c.cursor; ty := primary(&mut c, 0)
         base := borrows.place(&c.tokens, first, c.cursor)
@@ -971,6 +993,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         expect(&mut c, ")"); return 13
     }
     if name == "ptr" || name == "ffi_fn" || name == "ref_at" {
+        arm.barrier(&mut c.code)
         require_unsafe(&mut c); var want := 13; if name == "ptr" { want = 12 }
         ty := expression(&mut c, 0, want); same(&mut c, want, ty); expect(&mut c, ")")
         if name == "ptr" { return 13 }
@@ -983,6 +1006,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         a := expression(&mut c, 0, 13); same(&mut c, 13, a); expect(&mut c, ")"); transfer_c(&mut c, ty, 0, 0, true); return ty
     }
     if name.len > 6 && name[0..6] == "store_" && raw_memory_type(&c, name, 6) >= 0 {
+        arm.barrier(&mut c.code) // Inline source write, including void intrinsics.
         require_unsafe(&mut c); ty := raw_memory_type(&c, name, 6)
         a := expression(&mut c, 0, 13); same(&mut c, 13, a); expect(&mut c, ","); arm.push(&mut c.code, 0)
         b := expression(&mut c, 0, ty); same(&mut c, ty, b); expect(&mut c, ")")
@@ -1275,6 +1299,7 @@ fn enumeration(c: &mut Compiler, ty: i32) -> i32 {
 fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
     if !c.ok { return 0 }
     if eat(&mut c, "&") {
+        arm.barrier(&mut c.code) // Borrowed storage becomes visible to a receiver.
         mutable := eat(&mut c, "mut")
         var kind := 4; if mutable { kind = 5 }
         if c.type_kinds[expected] != kind { fail(&mut c, "use & for a shared parameter or &mut for a mutable parameter"); return 0 }
@@ -1415,14 +1440,14 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
             }; result := call(&mut c, name, expected); c.address = -1; c.writable = false; return temporary(&mut c, result) }
         if found < 0 {
             f := i32(map.get_or(&c.functions, name, -1))
-            if f >= 0 && c.libraries[f] != "" { import_address(&mut c, f); return c.ffi_types[f] }
+            if f >= 0 && c.libraries[f] != "" { arm.barrier(&mut c.code); import_address(&mut c, f); return c.ffi_types[f] }
         }
         if found < 0 {
             f := i32(map.get_or(&c.functions, name, -1))
             if f < 0 { fail(&mut c, "unknown local '" + name + "'"); c.error_at = c.tokens.starts[c.cursor - 1]; return 0 }
             if c.unsafe_functions[f] { fail(&mut c, "unsafe function requires a foreign function pointer"); return 0 }
             if c.loans.active { c.loans.taken[f] = true }
-            c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.ffi_types[f]
+            arm.barrier(&mut c.code); c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.ffi_types[f]
         }
         var ty := c.local_types[found]; c.writable = c.local_mutable[found]
         if c.type_kinds[ty]==20 {fail(&mut c,"region is only valid in an allocation");return 0}
@@ -1480,6 +1505,7 @@ fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_en
         return compound(&mut c, 10, c.type_bases[ty])
     }
     if c.type_kinds[ty] == 1 {
+        arm.barrier(&mut c.code) // Includes inline clear(), not just runtime calls.
         receiver := borrows.place(&c.tokens, first_token, receiver_end)
         if receiver < 0 { fail(&mut c, "array mutation requires a stored place"); return 0 }
         c.mutations.push(receiver); effects = c.mutations.len
@@ -1651,11 +1677,28 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
             if operator == "&&" { arm.branch(&mut c.code, done, 18) } else { arm.branch(&mut c.code, done, 19) }
             right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
         } else {
-            if ty == 4 { copy_value(&mut c, ty); saved_left := temporary(&mut c, ty) }
-            in_register := ty != 4 && register_rhs(&c, priority)
-            if in_register { arm.mov(&mut c.code, 1, 0) } else { arm.push(&mut c.code, 0) }
-            right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
-            if !in_register { arm.pop(&mut c.code, 1) }
+            if ty == 4 {
+                // Only real emission can commit an edit; check sinks need no span.
+                lease_start := c.code.words.len; lease_owner := c.owned_slots.len
+                copy_value(&mut c, ty); saved_left := temporary(&mut c, ty)
+                lease_end := c.code.words.len; lease_slot := c.expr_owner
+                var rhs_epoch: i64 = -1
+                if c.ownership_enabled && !c.code.checking && !c.validating_dead { rhs_epoch = arm.begin_effects(&mut c.code) }
+                // Setup itself retains/releases. Observe only the RHS, ending
+                // before the string operator or result owner invokes runtime.
+                arm.push(&mut c.code, 0)
+                right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
+                if rhs_epoch >= 0 {
+                    pure := arm.end_effects(&mut c.code, rhs_epoch)
+                    if c.ok && pure { elide_string_operand(&mut c, lease_start, lease_end, lease_owner, lease_slot) }
+                }
+                arm.pop(&mut c.code, 1)
+            } else {
+                in_register := register_rhs(&c, priority)
+                if in_register { arm.mov(&mut c.code, 1, 0) } else { arm.push(&mut c.code, 0) }
+                right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
+                if !in_register { arm.pop(&mut c.code, 1) }
+            }
             result := binary(&mut c, operator, ty); ty = temporary(&mut c, result); c.address = -1; c.writable = false
         }
     }
@@ -1956,6 +1999,7 @@ fn statement(c: &mut Compiler) -> bool {
     ty := expression(&mut c, 0, c.ret_type)
     assignment := c.cursor
     if eat(&mut c, "=") {
+        arm.barrier(&mut c.code) // Source assignment is an effect even for scalars.
         var destination := c.address; var direct := c.direct_place; writable := c.writable; packed := c.inline_place; scratch_target:=c.scratch_place
         if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch bindings cannot be reassigned");return false}
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
@@ -2092,6 +2136,12 @@ pub fn compile_configured(tokens: &mut lexer.Tokens, platform: i32, module_start
     compile_profiled(&mut tokens, platform, &module_starts, &module_files, check_all, report, &mut records, directory, identity, scalar_enabled, -1, false)
 }
 pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string, scalar_enabled: bool, profile_host: i32, instrument_runtime: bool) -> Result {
+    var config := configuration()
+    config.scalar_enabled = scalar_enabled; config.profile_host = profile_host; config.instrument_runtime = instrument_runtime
+    compile_options(&mut tokens, platform, &module_starts, &module_files, check_all, report, &mut records, directory, identity, &config)
+}
+pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string, config: &Configuration) -> Result {
+    scalar_enabled := config.scalar_enabled; profile_host := config.profile_host; instrument_runtime := config.instrument_runtime
     if profile_host > 2 { return Result { ok: false, error: "compiler profiling requires a native host", offset: 0, text: [], imports: imports() } }
     if instrument_runtime && platform == 3 && !check_all { return Result { ok: false, error: "runtime profiling requires a native target", offset: 0, text: [], imports: imports() } }
     var declarations_started: i64 = -1
@@ -2129,8 +2179,8 @@ pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts:
         functions: map.new(), names: [], starts: [], ends: [], returns: [], param_starts: [], param_counts: [], param_names: [], param_types: [],
         wasm_abi: wa.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, opaque_owner: [], function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, direct_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [], callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], type_drops: [], field_names: [], field_types: [], field_values: [], payload_starts: [], payload_counts: [], payload_types: [], address: -1, writable: false, scratch_place: 0, loans: scratch.loans(), scratch_returns: [],
-        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [], expr_owner: -1, expr_type: -1, array_take: array_take, scope: 0, slots: 0, ret_type: 0, depth: 0,
-        scalar_enabled: scalar_enabled, scalar_names: [], scalar_types: [], scalar_tokens: [],
+        fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], owner_elided: [], loop_owners: [], expr_owner: -1, expr_type: -1, array_take: array_take, scope: 0, slots: 0, ret_type: 0, depth: 0,
+        scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, lease_starts: [], lease_ends: [], scalar_names: [], scalar_types: [], scalar_tokens: [],
         loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
     if profile_host >= 0 { c.bindings.profile = profile.new(profile_host) }
@@ -2181,6 +2231,7 @@ pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts:
         var policy := identity
         if policy != "" {
             if scalar_enabled { policy = policy + ":scalar:on" } else { policy = policy + ":scalar:off" }
+            if config.ownership_enabled { policy = policy + ":ownership:on" } else { policy = policy + ":ownership:off" }
             if instrument_runtime { policy = policy + ":runtime:profile" } else { policy = policy + ":runtime:plain" }
         }
         var started: i64 = -1
@@ -2191,6 +2242,7 @@ pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts:
     var scalar_model := opt_ir.new()
     var scalar_work := opt_verify.new()
     var scalar_plan := opt_alloc.new()
+    var machine_work := machine_ir.new()
     var more := true
     while c.ok && more {
         more = false
@@ -2224,7 +2276,7 @@ pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts:
                 }
             }
             if !c.code.checking { c.bindings.emitted = c.bindings.emitted + 1 }
-            compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan)
+            compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work)
             if c.ok {
                 if fingerprint != "" && !c.has_callbacks && c.type_names.len == types_before && c.strings.len == strings_before && c.imports.sites.len == sites_before && c.imports.globals == globals_before {
                     var started: i64 = -1
@@ -2251,7 +2303,7 @@ pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts:
     for i in 0..globals { unused := arm.label(&mut c.code) }
     c.imports = imports()
     for f in 0..c.names.len {
-        if !compiled[f] && c.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan) }
+        if !compiled[f] && c.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work) }
         if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
     }
     if c.loans.active {
@@ -2359,12 +2411,15 @@ fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut
     }
     return true
 }
-fn compile_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan) {
+fn compile_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace) {
     if scalar_body(&mut c, f, &mut model, &mut work, &mut plan) { return }
     var started: i64 = -1
     if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
     c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
-    c.owned_slots.clear(); c.owned_types.clear(); c.owner_temps.clear(); c.mutations.clear()
+    c.owned_slots.clear(); c.owned_types.clear(); c.owner_temps.clear(); c.owner_elided.clear(); c.mutations.clear()
+    c.lease_starts.clear(); c.lease_ends.clear()
+    first_word := arm.position(&c.code); first_label := arm.label_count(&c.code)
+    first_reloc := c.code.at.len; first_import := c.imports.sites.len
     c.current_owner = c.function_owners[f]
     c.testing = c.test_functions[f]
     c.unsafe_scope = c.unsafe_functions[f]
@@ -2388,9 +2443,21 @@ fn compile_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mu
     arm.imm(&mut c.code, 0, 0); arm.mark(&mut c.code, c.cleanup); arm.push(&mut c.code, 0)
     cleanup_from(&mut c, 0, false); arm.pop(&mut c.code, 0); arm.ret(&mut c.code)
     arm.mark(&mut c.code, initialize)
-    for o in param_owners..c.owned_slots.len { arm.store(&mut c.code, c.owned_slots[o], 31) }
+    for o in param_owners..c.owned_slots.len { if !c.owner_elided[o] { arm.store(&mut c.code, c.owned_slots[o], 31) } }
     arm.branch(&mut c.code, body, 0)
     if c.ok { arm.frame(&mut c.code, frame, c.slots) }
+    if c.ok && c.lease_starts.len > 0 {
+        machine_ir.reset(&mut machine_work)
+        for i in 0..c.lease_starts.len {
+            if !machine_ir.add_range(&mut machine_work, c.lease_starts[i], c.lease_ends[i]) { fail(&mut c, "internal ownership rewrite range") }
+        }
+        if c.ok && !machine_ir.prepare(&mut machine_work, &c.code, first_word, first_label, first_reloc, &c.imports.sites, first_import) {
+            fail(&mut c, "internal ownership rewrite validation")
+        }
+        // Failure is a compilation error: restoring only setup would leave
+        // elided owner slots without initialization or balanced cleanup.
+        if c.ok { machine_ir.commit_code(&mut machine_work, &mut c.code); machine_ir.commit_imports(&mut machine_work, &mut c.imports.sites) }
+    }
     if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 7, started, i64(c.ends[f] - c.starts[f] + 1)) }
 }
 
@@ -2423,6 +2490,62 @@ fn finish_image(c: &mut Compiler, platform: i32, main_id: i32, rt: &runtime.Runt
     }
     text := arm.finish_for(&mut c.code, c.imports.symbols.len > 0 || c.imports.globals > 0)
     Result { ok: true, error: "", offset: 0, text: text, imports: c.imports }
+}
+fn ownership_test_compile(source: string, platform: i32, enabled: bool, checking: bool) -> Result {
+    none: []i32 = []; var records := bindings(); var config := configuration()
+    config.ownership_enabled = enabled
+    var tokens := lexer.scan(source, false)
+    compile_options(&mut tokens, platform, &none, &none, checking, false, &mut records, "", "", &config)
+}
+@test fn string_operand_leases_are_removed_only_across_effect_free_rhs() {
+    for platform in 0..4 {
+        pure := "fn main(){left:=\"a\";right:=\"b\";print(left==right);print(left+right)}"
+        before := ownership_test_compile(pure, platform, false, false)
+        after := ownership_test_compile(pure, platform, true, false)
+        before.ok
+        after.ok
+        after.text.len < before.text.len
+        calls := "fn rhs()->string{\"b\"} fn main(){print(\"a\"==rhs())}"
+        kept := ownership_test_compile(calls, platform, true, false)
+        original := ownership_test_compile(calls, platform, false, false)
+        kept.ok
+        original.ok
+        kept.text.len == original.text.len
+        for i in 0..kept.text.len { kept.text[i] == original.text[i] }
+    }
+}
+@test fn ownership_proofs_do_not_change_validation_or_binding_records() {
+    none: []i32 = []
+    for platform in 0..4 {
+        for source in ["fn main(){print(\"a\"==true)}", "fn unused()->string{true} fn main(){print(\"a\"==\"b\")}", "fn main(){value:=\"a\";value=\"b\"}"] {
+            off := ownership_test_compile(source, platform, false, false)
+            on := ownership_test_compile(source, platform, true, false)
+            checked := ownership_test_compile(source, platform, true, true)
+            !off.ok
+            !on.ok
+            !checked.ok
+            off.error == on.error
+            off.offset == on.offset
+            on.error == checked.error
+            on.offset == checked.offset
+        }
+        source := "fn main(){left:=\"a\";right:=\"b\";print(left==right)}"
+        var off_tokens := lexer.scan(source, false); var on_tokens := lexer.scan(source, false)
+        var off_records := bindings(); var on_records := bindings()
+        var config := configuration(); config.ownership_enabled = false
+        off := compile_options(&mut off_tokens, platform, &none, &none, true, true, &mut off_records, "", "", &config)
+        config.ownership_enabled = true
+        on := compile_options(&mut on_tokens, platform, &none, &none, true, true, &mut on_records, "", "", &config)
+        off.ok
+        on.ok
+        off.text.len == 0 && on.text.len == 0
+        off_records.offsets.len == on_records.offsets.len
+        for i in 0..off_records.offsets.len {
+            off_records.offsets[i] == on_records.offsets[i]
+            off_records.names[i] == on_records.names[i]
+            off_records.types[i] == on_records.types[i]
+        }
+    }
 }
 @test fn rune_literals_emit_the_same_code_as_scalar_constants() {
     for platform in 0..4 {

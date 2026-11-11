@@ -1,13 +1,13 @@
 pub struct Code {
     words: []i64, labels: []i32, at: []i32, target: []i32, kinds: []i32, platform: i32,
     checking: bool, virtual_words: i32, virtual_labels: i32,
-    profile: bool,
+    profile: bool, effect_epoch: i64, effect_depth: i32,
 }
 pub fn new() -> Code { new_for(0) }
 // Platform 0 is Darwin; platform 1 is Linux. Relocations use the image's text offset.
 pub fn new_for(platform: i32) -> Code {
     Code { words: [], labels: [], at: [], target: [], kinds: [], platform: platform,
-        checking: false, virtual_words: 0, virtual_labels: 0, profile: false }
+        checking: false, virtual_words: 0, virtual_labels: 0, profile: false, effect_epoch: 0, effect_depth: 0 }
 }
 // Semantic validation still walks the lowering helpers, but keeps no machine
 // words, label positions or relocations. Virtual counters keep patch sites
@@ -15,11 +15,35 @@ pub fn new_for(platform: i32) -> Code {
 pub fn new_check(platform: i32) -> Code { var code := new_for(platform); code.checking = true; code }
 pub fn position(code: &Code) -> i32 { if code.checking { code.virtual_words } else { code.words.len } }
 pub fn label_count(code: &Code) -> i32 { if code.checking { code.virtual_labels } else { code.labels.len } }
+// Monotonic semantic evidence for frontend ownership proofs. Calls are barriers
+// even when their implementation is currently pure; inline source writes and
+// pointer exposures use this same hook. Rewriting code never rolls it back.
+pub fn barrier(code: &mut Code) { if code.effect_depth > 0 { code.effect_epoch = code.effect_epoch + 1 } }
+pub fn begin_effects(code: &mut Code) -> i64 { code.effect_depth = code.effect_depth + 1; code.effect_epoch }
+pub fn end_effects(code: &mut Code, epoch: i64) -> bool {
+    assert(code.effect_depth > 0)
+    code.effect_depth = code.effect_depth - 1
+    code.effect_epoch == epoch
+}
 pub fn emit(code: &mut Code, word: i64) {
+    // Keep classification inline in this hot helper, with no per-word call.
+    // Outside a string RHS there is no live ownership proof to invalidate.
+    if code.effect_depth > 0 {
+        family := word.shr(24)
+        if word.bit_and(4227858432) == 2483027968 || // Native BL immediate.
+            word.bit_and(4294966303) == 3594452992 || // BLR, any register.
+            word.bit_and(4292870175) == 3556769793 || // SVC, any immediate.
+            family == 251 || family == 252 || family == 254 { // Target call/host vocabulary.
+            code.effect_epoch = code.effect_epoch + 1
+        }
+    }
     if code.checking { code.virtual_words = code.virtual_words + 1; return }
     assert(word >= 0 && word <= 4294967295); code.words.push(word)
 }
 pub fn patch(code: &mut Code, at: i32, word: i64) {
+    // A patch can introduce an executable effect after its original emission.
+    // Conservatively invalidate proofs instead of inferring the old opcode.
+    barrier(&mut code)
     if code.checking { assert(at >= 0 && at < code.virtual_words); return }
     assert(word >= 0 && word <= 4294967295); code.words[at] = word
 }
@@ -33,6 +57,8 @@ pub fn mark(code: &mut Code, target: i32) {
 }
 // 0=B, 1=BL, 2..17=B.cond (condition+2), 18=CBZ x0, 19=CBNZ x0, 20=address x0.
 pub fn branch(code: &mut Code, target: i32, kind: i32) {
+    // The direct call is symbolic until finish_for patches its placeholder.
+    if kind == 1 { barrier(&mut code) }
     if !code.checking { code.at.push(code.words.len); code.target.push(target); code.kinds.push(kind) }
     emit(&mut code, 0)
     if kind >= 2 { emit(&mut code, 3573751839) }
@@ -190,6 +216,56 @@ pub fn runtime(code: &mut Code, integer: i32, boolean: i32, text_label: i32, wri
     mark(&mut code, io); exit(&mut code, 74)
 }
 
+@test fn effect_epochs_cover_the_shared_call_vocabulary() {
+    var code := new()
+    destination := label(&mut code)
+    initial := begin_effects(&mut code)
+    emit(&mut code, 3573751839); branch(&mut code, destination, 0)
+    branch(&mut code, destination, 18); branch(&mut code, destination, 20)
+    code.effect_epoch == initial
+    branch(&mut code, destination, 1)
+    code.effect_epoch == initial + 1
+    emit(&mut code, 2483027968); emit(&mut code, 2550136831)
+    code.effect_epoch == initial + 3
+    for reg in 0..32 { emit(&mut code, 3594452992 + i64(reg) * 32) }
+    code.effect_epoch == initial + 35
+    emit(&mut code, 3556769793); emit(&mut code, 3556773889); emit(&mut code, 3558866913)
+    code.effect_epoch == initial + 38
+    words: []i64 = [4211081216, 4227858432, 4261412864]
+    for word in words {
+        emit(&mut code, word); emit(&mut code, word + 16777215)
+    }
+    code.effect_epoch == initial + 44
+    barrier(&mut code); code.effect_epoch == initial + 45
+    patch(&mut code, 0, 3573751839); code.effect_epoch == initial + 46
+    !end_effects(&mut code, initial)
+    code.effect_depth == 0
+}
+@test fn checking_calls_keep_effect_evidence_without_words() {
+    var code := new_check(3)
+    initial := begin_effects(&mut code)
+    destination := label(&mut code)
+    branch(&mut code, destination, 1); emit(&mut code, 4211081223); syscall(&mut code, 1, 2)
+    code.effect_epoch == 3
+    code.words.len == 0
+    !end_effects(&mut code, initial)
+}
+@test fn nested_effect_observation_keeps_outer_evidence_and_ignores_unobserved_calls() {
+    var code := new()
+    destination := label(&mut code)
+    branch(&mut code, destination, 1); emit(&mut code, 3594453504)
+    code.effect_epoch == 0
+    outer := begin_effects(&mut code)
+    branch(&mut code, destination, 1) // Inner lease setup invalidates the outer proof.
+    inner := begin_effects(&mut code)
+    emit(&mut code, 3573751839)
+    end_effects(&mut code, inner)
+    !end_effects(&mut code, outer)
+    code.effect_depth == 0
+    after := code.effect_epoch
+    barrier(&mut code); syscall(&mut code, 1, 2); patch(&mut code, 0, 3573751839)
+    code.effect_epoch == after
+}
 @test fn linux_uses_its_syscall_register_and_page_aligned_text() {
     var code := new_for(1)
     destination := label(&mut code)
