@@ -116,32 +116,32 @@ processdiagnostik fortsätter som separata uppgifter och styr inte denna
 leverans.
 
 
-## Nästa transaktionsgräns: exklusivt ägande och glesa ändringar
+## Exklusiv transaktionsgräns
 
-Det aktiva värdepasset har separata, återanvändbara plan- och arbetsarenor.
-Det kopierar fortfarande hela modellen först vid en verklig ändring och
-använder exakta snapshots för sitt publika analyze/apply-kontrakt. Den
-kostnaden är avsiktlig och ska mätas med den sammanhängande milstolpen.
-Följande omläggning är planerad, ännu inte implementerad:
+Den tidigare analyze/apply-vägen med en full funktionsplan och exakta
+snapshots är ersatt i värdepasset. En publik
+`optimize_with_context(work, &mut function, context)` håller det exklusiva
+lånet genom hela transaktionen. Arbetsminnet återanvänds mellan funktioner.
 
-- En publik `optimize_into(work, edits, &mut function, context, budget)`
-  behåller det exklusiva lånet genom analys, förberedelse och commit.
-  Delstegen är privata; ingen extern mutation kan ske mellan analyze/apply.
-- En opak, återanvändbar editlista innehåller bara stabila op-ID:n och
-  ändrade semantiska kolumner. En indexkarta ger konstant uppslagstid.
-  Kodord, etiketter, minnesplatser och CFG delas läsande med originalet.
-- Liveness och verifiering läser samma projekterade vy av original plus
-  ändringar och använder samma kanoniska kontrakt som vanlig MIR. Flytta
-  verifierarens scratch från `Function.leaders` till dess eget arbetsminne,
-  så att förhandsverifieringen inte muterar modellen.
-- Alla normala avslag och hela arbetsreservationen sker före mutation.
-  Commit kräver ingen allokering eller nya val. Glesa ursprungliga rader
-  räcker för återställning om den obligatoriska slutverifieringen upptäcker
-  ett internt fel; inga delvis ändrade funktioner publiceras.
+Analysen läser originalet till fixpunkt. Stagning sparar endast ändrade
+operationsrader i en gles undo-arena; rena raderingar behöver bara sitt
+ursprungliga mode. Stabil ordning, platser, etiketter och CFG kopieras inte.
+Originalraden överför värdefakta innan dess ersättning skrivs. Verifiering
+och liveness läser sedan den faktiska stagade representationen. Normala
+avslag återställer samtliga ändrade rader samt verified/optimizable; ingen
+delvis optimerad funktion lämnar det exklusiva lånet.
 
-Detta ersätter fulla modellkopior och två snapshots med arbete och lagring
-proportionellt mot antalet ändrade operationer, utöver den befintliga
-analysen. Det ändrar inte typregler, fällor, observationer vid externa
-utgångar eller obligatorisk slutverifiering. Nästa mätning ska särskilt
-särredovisa funktioner utan ändring, många små funktioner efter en stor,
-rena byggen och samma standardprofils runtime mot C.
+Verifierarens seen-scratch ligger i dess eget arbetsminne, så modellens
+övriga metadata förblir orörda. En snäv bevisbevarande regel låter DCE
+behålla ett redan giltigt certifikat när enbart mode ändras för rena
+Const/Copy/MOVK. Ingen allmän validering hoppas över: semantiska ersättningar
+verifieras efter replay, och varje ändrat slutresultat fullverifieras
+ovillkorligen. Hela det reserverade verifierings- och rollbackarbetet
+debiteras. Budgetavslag efter stagning ska återställa exakt samtliga fält.
+
+Detta angriper kompileringskostnaden utan att ändra de valda
+målinstruktionerna. Nästa runtimeetapp behöver verklig värde-SSA och
+registerallokering för privata skalärplatser, smala läsvyer och
+uttrycksstackvärden. Återanvändning av heaplaster behöver dessutom
+adressidentitet och explicita minnesversioner; scalar-SSA ensam bevisar
+inte att två heapåtkomster är oberoende.

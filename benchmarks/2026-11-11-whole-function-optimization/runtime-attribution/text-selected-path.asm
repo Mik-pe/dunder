@@ -1,0 +1,44 @@
+100000e2c	mov	x1, x27
+100000e30	ldur	x0, [x29, #-0x38]
+100000e34	cmp	x1, x0
+100000e38	b.ge	0x100000f7c
+100000e3c	nop	
+100000e40	add	x10, x28, x1
+100000e44	add	x10, x10, #0x8
+100000e48	ldrb	w0, [x10]
+100000e4c	add	x10, x10, #0x1
+100000e50	add	x1, x1, #0x1
+100000e54	cmp	x0, #0x80
+100000e58	b.lo	0x100000ec0
+100000ec0	mov	x27, x1
+100000ec4	stur	x0, [x29, #-0x48]
+100000ec8	mov	x0, x26
+100000ecc	stp	x0, xzr, [sp, #-0x10]!
+100000ed0	ldur	w0, [x29, #-0x48]
+100000ed4	ldp	x1, xzr, [sp], #0x10
+100000ed8	adds	x0, x1, x0
+100000edc	b.vs	0x1000018cc
+100000ee0	nop	
+100000ee4	mov	x26, x0
+100000ee8	ldur	w0, [x29, #-0x48]
+100000eec	mov	x1, x0
+100000ef0	cmp	x1, #0x20
+100000ef4	cset	x0, eq
+100000ef8	cbnz	x0, 0x100000f10
+100000efc	nop	
+100000f00	ldur	w0, [x29, #-0x48]
+100000f04	mov	x1, x0
+100000f08	cmp	x1, #0xa
+100000f0c	cset	x0, eq
+100000f10	cbnz	x0, 0x100000f28
+100000f14	nop	
+100000f18	ldur	w0, [x29, #-0x48]
+100000f1c	mov	x1, x0
+100000f20	cmp	x1, #0x9
+100000f24	cset	x0, eq
+100000f28	cbz	x0, 0x100000f40
+100000f40	ldurb	w0, [x29, #-0x20]
+100000f44	cmp	x0, xzr
+100000f48	cset	x0, eq
+100000f4c	cbz	x0, 0x100000f78
+100000f78	b	0x100000e2c

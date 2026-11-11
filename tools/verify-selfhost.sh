@@ -9,6 +9,7 @@ trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 "$compiler" test dogfood/tests.ddr -o "$work/dogfood"
 "$compiler" test tests/mir.ddr -o "$work/mir"
+"$compiler" test tests/mir_verify.ddr -o "$work/mir-verify"
 "$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
 "$compiler" test tests/mir_retained.ddr -o "$work/mir-retained"
 "$compiler" test tests/mir_dataflow.ddr -o "$work/mir-dataflow"

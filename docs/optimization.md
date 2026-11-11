@@ -108,13 +108,22 @@ utgångar avvisas: en utgång som aldrig återvänder kan fortfarande observera
 inkommande register. Endast ett uttryckligt producentkontrakt får undanta
 en terminal utgång utan sådana observationer.
 
-Arbetsminne och omskrivningsplan är separata, återanvändbara ägarrötter.
-Ingen hel funktionspost flyttas genom värdetilldelning, eftersom Dunders
-ägda structfält då djupkopieras. Kolumnkopior och exakta snapshots använder
-indexerad läsning över lån; vanlig arrayiteration har snapshotsemantik.
-Planen skapas först vid en bevisad ändring. Budgetavslag lämnar källan
-orörd, och lyckad commit kontrollerar exakt källa och plan samt verifierar
-slutresultatet. Arbetet är budgetbegränsat, inte garanterat linjärt.
+En exklusiv optimeringstransaktion håller samma muterbara lån genom analys,
+stagning och commit. En återanvänd gles undo-arena sparar endast de rader
+som faktiskt ändras. Det finns ingen hel funktionskopia, full snapshot
+eller publik plan som kan muteras mellan analyze/apply. Alla normala
+avslag återställer raderna och verifierarens två metadatafält exakt.
+Verifierarens interna seen-arena ligger i dess eget arbetsminne.
+
+Replay använder varje originalrad i dataflödesöverföringen innan den
+stagade motsvarigheten skrivs, vilket bevarar fakta och aliasval. Därefter
+verifieras semantiska ändringar med den vanliga verifieraren. Radering av
+en bevisat ren materialisering får behålla ett redan sant certifikat: den
+ändrar endast mode, aldrig CFG, stack, flaggor, minne eller ABI. Den regeln
+får aldrig sätta ett falskt certifikat till sant. Varje ändrat slutresultat
+genomgår ändå ovillkorlig, debiterad fullverifiering före framgång.
+Arbetet, inklusive återställning, är budgetbegränsat; upprepad DCE-liveness
+är inte garanterat linjär.
 
 `--mir-values=off` stänger av värdepasset separat. `--mir-opt=off` stänger
 av båda helfunktionspassen. Cache och testkvitton inkluderar policyn.
