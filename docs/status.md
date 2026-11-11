@@ -49,6 +49,11 @@ Delade `&[]i64`-parametrar stöds för läsning och exklusiva `&mut []i64`
 för elementskrivning. Räknade `for`-loopar fångar sina gränser en gång.
 Modellen verifieras före och efter passet. Ägda värden, storleksändring av
 arrayer, flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
+Alla nyemitterade källfunktioner från båda vägarna går därefter genom den
+gemensamma helfunktions-IR:n med obligatorisk verifiering och atomisk
+sänkning. Standardkedjan är ännu byteidentisk passthrough. Ett generellt
+registerpass med CFG-liveness och framepromovering är implementerat och
+testat separat; det är ännu inte aktiverat i standardbygget.
 [Omfattning och gränser](optimization.md).
 
 Den fulla kodgeneratorn kan utelämna extra strängoperandägare när hela
@@ -69,8 +74,8 @@ och [macOS-appar](app-bundles.md).
 ## Körda Wasm-kontrakt
 
 Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 122 av de 134 grupperna med godkänt
-resultat. De tolv övriga har nåbara nativa systemanrop.
+till en separat Wasm-modul. Node körde 124 av de 137 grupperna med godkänt
+resultat. De tretton övriga har nåbara nativa systemanrop.
 
 | Grupp | Nativt beroende |
 | --- | --- |
@@ -86,6 +91,7 @@ resultat. De tolv övriga har nåbara nativa systemanrop.
 | `selfhost/compile.ddr::inline_producer_does_not_duplicate_source_binding_reports` | Den nativa kompilatorns fil- och cachekod |
 | `selfhost/compile.ddr::inline_fragments_restore_backward_dependencies_charges_and_private_body_identity` | Skrivning och återställning av cachefiler |
 | `selfhost/compile.ddr::inline_fragment_keys_preserve_cold_growth_frontiers_across_partial_cache_hits` | Ändring och återställning av cachefiler |
+| `selfhost/compile.ddr::all_emitted_source_functions_use_mir_without_changing_diagnostics_or_bindings` | Den nativa kompilatorns fil- och cachekod |
 
 Wasm-värden kontrollerar dessa gruppnamn och diagnostiken för nativa anrop.
 Bland de körda grupperna finns SHA-256 med referensvektorer och olika
