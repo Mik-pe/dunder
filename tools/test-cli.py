@@ -181,7 +181,7 @@ def phase_timings(p):
         report(p.call("build", "phases.ddr", "--target", target, "--timings=json", "-o", target), target=target)
     baseline = p.call("check", "phases.ddr", "--agent")
     checked = p.call("check", "phases.ddr", "--agent", "--timings=json")
-    report(checked, checking=True)
+    assert report(checked, checking=True)["functions"] == {"reused": 0, "emitted": 0}
     assert checked.stdout == baseline.stdout and baseline.stderr == ""
     assert json.loads(checked.stdout.splitlines()[-1])["kind"] == "ok"
     ran = p.call("run", "phases.ddr", "--timings=json", "-o", "ran")

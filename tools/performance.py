@@ -101,7 +101,9 @@ def corpus(work):
 def source_hashes():
     paths = sorted(set(ROOT.glob('selfhost/*.ddr')) | set(ROOT.glob('stdlib/*.ddr'))
                    | set(ROOT.glob('runtime/*.ddr')) | set(ROOT.glob('benchmarks/runtime/*.ddr'))
-                   | {ROOT / 'benchmarks/runtime/reference.c'})
+                   | set(ROOT.glob('projects/tabell/**/*.ddr'))
+                   | {ROOT / 'benchmarks/runtime/reference.c',
+                      ROOT / 'projects/tabell/expenses.csv', ROOT / 'projects/tabell/expected.csv'})
     return {str(p.relative_to(ROOT)): digest(p) for p in paths}
 
 
@@ -126,10 +128,14 @@ def main():
     parser.add_argument('report', type=Path)
     parser.add_argument('--rounds', type=int, default=30)
     parser.add_argument('--suite', choices=['all', 'runtime', 'compiler'], default='all')
+    parser.add_argument('--include-check', action='store_true',
+                        help='also measure check on generated and selfhost sources')
     parser.add_argument('--c-compiler', type=Path, help='also measure C with -O3 -ftrapv')
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error('--rounds must be positive')
+    if args.include_check and args.suite == 'runtime':
+        parser.error('--include-check requires the compiler or all suite')
     compilers = {'baseline': args.baseline.resolve(strict=True),
                  'candidate': args.candidate.resolve(strict=True)}
     report = args.report.resolve()
@@ -138,7 +144,8 @@ def main():
         parser.error('report directory must be empty to preserve existing measurements')
     before = source_hashes()
     metadata = {'host': platform.uname()._asdict(), 'rounds': args.rounds,
-                'suite': args.suite, 'checkout': command(['git', 'rev-parse', 'HEAD'], env=None)[1].decode().strip(),
+                'suite': args.suite, 'include_check': args.include_check,
+                'checkout': command(['git', 'rev-parse', 'HEAD'], env=None)[1].decode().strip(),
                 'working_tree': command(['git', 'status', '--short'], env=None)[1].decode(),
                 'tool_sha256': digest(Path(__file__)), 'sources_sha256': before,
                 'compiler_sha256': {v: digest(p) for v, p in compilers.items()},
@@ -166,7 +173,8 @@ def main():
     def sample(suite, case, variant, round_number, position, elapsed, binary):
         rows.append({'suite': suite, 'case': case, 'variant': variant,
                      'round': round_number, 'order': position,
-                     'elapsed_ms': f'{elapsed:.6f}', 'image_bytes': binary.stat().st_size})
+                     'elapsed_ms': f'{elapsed:.6f}',
+                     'image_bytes': binary.stat().st_size if binary else 0})
 
     with tempfile.TemporaryDirectory(prefix='dunder-performance-') as tmp:
         work = Path(tmp)
@@ -196,17 +204,21 @@ def main():
         if args.suite in ('all', 'compiler'):
             stress, metadata['generated_corpus'] = corpus(work)
             entry = {'Darwin': 'main', 'Linux': 'linux' if platform.machine() in ('arm64', 'aarch64') else 'x86_linux'}[platform.system()]
-            for name, source in [('generated', stress), ('selfhost', ROOT / f'selfhost/{entry}.ddr')]:
+            for name, source in [('generated', stress), ('selfhost', ROOT / f'selfhost/{entry}.ddr'),
+                                 ('tabell', ROOT / 'projects/tabell/main.ddr')]:
                 for round_number in range(args.rounds):
                     for position, variant in enumerate(order(list(compilers), round_number)):
                         binary = work / f'{name}-{variant}-{round_number}'
                         elapsed, _ = command([compilers[variant], 'build', source, '-o', binary])
                         if name == 'generated':
                             checked_run(binary, [], b'595500\n')
-                        else:
+                        elif name == 'selfhost':
                             hello = work / 'hello'
                             command([binary, 'build', ROOT / 'examples/hello.ddr', '-o', hello])
                             checked_run(hello, [], b'42\ntrue\n')
+                        else:
+                            checked_run(binary, [ROOT / 'projects/tabell/expenses.csv', 'team', 'cents'],
+                                        (ROOT / 'projects/tabell/expected.csv').read_bytes())
                         sample('compiler', name, variant, round_number, position, elapsed, binary)
                         image = {'sha256': digest(binary), 'bytes': binary.stat().st_size}
                         previous = metadata['binaries'].setdefault(name, {}).setdefault(variant, image)
@@ -214,6 +226,15 @@ def main():
                             raise RuntimeError(f'non-reproducible {name} output from {variant}')
                         binary.unlink()
                 print(f'completed compiler/{name}', flush=True)
+                if args.include_check:
+                    for round_number in range(args.rounds):
+                        for position, variant in enumerate(order(list(compilers), round_number)):
+                            elapsed, output = command([compilers[variant], 'check', source])
+                            expected_prefix = f'checked {source} ('.encode()
+                            if not output.startswith(expected_prefix) or not output.endswith(b' modules)\n'):
+                                raise RuntimeError(f'invalid check result from {variant}: {output!r}')
+                            sample('check', name, variant, round_number, position, elapsed, None)
+                    print(f'completed check/{name}', flush=True)
     if source_hashes() != before:
         raise RuntimeError('benchmark source files changed during measurement')
     if any(digest(p) != metadata['compiler_sha256'][v] for v, p in compilers.items()):

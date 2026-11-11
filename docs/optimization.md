@@ -30,6 +30,23 @@ Lexern klassificerar de fasta nyckelorden utan hashtabell och avkodar
 vanliga literaler direkt från giltig UTF-8. Escape-sekvenser använder den
 separata avkodningsvägen med samma diagnostik och källpositioner.
 
+Direkt `for`-iteration över en typad strängs `.bytes()` eller `.runes()`
+kan strömma från en behållen strängsnapshot. Den vägen bygger eller
+kopierar ingen konverteringsarray. Lagrade konverteringar och uttryck som
+inte matchar den begränsade direkta vägen använder vanliga arrayer.
+Källan utvärderas en gång och behålls genom `continue`, `break` och retur.
+
+`check` och kontroll av oanropade kroppar använder ett emissionsläge utan
+lagrade maskinord, etikettpositioner eller relokeringar. Virtuella räknare
+bevarar deterministiska positioner för de sänkningshjälpare som fortfarande
+körs. Detta skiljer bort utdataallokeringen; en separat typad syntaxmodell
+och en självständig semantisk frontend återstår.
+
+Byggkedjans valbara [fastider i text eller JSON](incremental.md#mät-byggkedjans-faser)
+gör kostnaden synlig. Optimeringar jämförs med samma källor och säkerhetsregler
+genom `tools/performance.py`; `--include-check` lägger till kontrolltider,
+och byggsviten omfattar även Tabell som fristående konsumentprojekt.
+
 Korrektheten provas med referensresultat för signerad division och rest,
 IEEE 754, kortslutning och diagnostik. Minnesproven kör även om samma
 Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.

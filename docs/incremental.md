@@ -3,6 +3,7 @@
 ```sh
 dunder check examples/functions.ddr --agent
 dunder build examples/functions.ddr --incremental --timings
+dunder check examples/functions.ddr --agent --timings=json
 dunder test --affected
 ```
 
@@ -32,6 +33,32 @@ bygge. Funktioner som skapar nya typer, strängliteraler, importplatser eller
 statisk lagring emitteras på nytt. Program med C-callbacks emitteras på nytt.
 Det håller återanvändningen konservativ tills dessa resurser kan spelas upp
 från cacheformatet. `--timings` visar återanvända och emitterade funktioner.
+
+## Mät byggkedjans faser
+
+`--timings` skriver också monotona väggtider på stderr. `--timings=json`
+skriver en JSON-post på stderr med `version: 1`, `unit: "ns"`, målet,
+modul- och funktionsantal samt följande faser:
+
+- `module_load_lex_resolve`: modulladdning, lexning och namnupplösning.
+- `build_setup`: förberedelser, inklusive källskydd och cacheidentitet.
+- `compiler`: det samlade kompilatoranropet med semantisk kontroll,
+  kodgenerering, målsänkning och symboliska korrigeringar.
+- `image_format_sign`: bildformat och eventuell binärsignering.
+- `publication`: skrivning och atomisk publicering; för appar även
+  resursförsegling och appsignering.
+
+`total` är summan av faserna. CLI-parsning, själva tidsrapporten och körning
+av det byggda programmet eller testerna ingår inte. `check` markerar bild
+och publicering som överhoppade. `functions.emitted` är då noll: kontrollen
+behåller inga maskinord eller relokeringar. Typ-, låne- och layoutkontroller
+körs fortfarande, även för oanropade funktioner.
+
+Klockan väljs efter kompilatorns värdplattform, även vid korsbyggen. Ett
+klockfel ger `clock_ok: false` och otillgängliga intervall som `null`.
+Lyckade byggen och kontroller ger rapporter; misslyckade eller enbart
+listande kommandon ger ingen avslutad tidsrapport. Vanlig stdout och
+`check --agent` behåller sina format. Utan flaggan tas inga tidsstämplar.
 
 ## Kör berörda tester
 
