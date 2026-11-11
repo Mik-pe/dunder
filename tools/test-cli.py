@@ -175,6 +175,82 @@ def scalar_optimizer_controls(p):
     p.call('check', 'scalar.ddr', '--scalar-opt=unknown', status=2)
 
 
+def compiler_profile_controls(p):
+    p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
+            'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
+    p.call('build', 'profile.ddr', '-o', 'plain')
+    result = p.call('build', 'profile.ddr', '--profile-compiler', '--timings=json', '-o', 'profile')
+    assert (p.root / 'plain').read_bytes() == (p.root / 'profile').read_bytes()
+    phases = {'declarations','model_parse','verify_pre','simplify','verify_post',
+              'allocation','scalar_emit','legacy_body','fragment_cache','finalize'}
+
+    def detail(result):
+        report = json.loads(result.stderr)
+        d = report['compiler_detail']
+        assert d['enabled'] and d['clock_ok'] and d['unit'] == 'ns', report
+        assert set(d['phases']) == set(d['calls']) == phases, d
+        assert all(type(n) is int and n >= 0 for n in d['phases'].values()), d
+        assert all(type(n) is int and n >= 0 for n in d['calls'].values()), d
+        assert all(type(n) is int and n >= 0 for n in d['work'].values()), d
+        assert d['covered'] == sum(d['phases'].values()), d
+        assert d['covered'] + d['other'] == report['phases']['compiler'], report
+        assert d['calls']['declarations'] == 1 and d['calls']['model_parse'] >= 1, d
+        assert d['calls']['verify_pre'] >= 1 and d['calls']['legacy_body'] >= 1, d
+        return d
+
+    enabled = detail(result)
+    assert enabled['calls']['allocation'] >= 1 and enabled['calls']['scalar_emit'] >= 1
+    assert enabled['calls']['finalize'] == 1
+    normal = p.call('check', 'profile.ddr', '--agent')
+    for target in ('arm64-macos','arm64-linux','x86_64-linux','wasm32'):
+        checked = p.call('check', 'profile.ddr', '--agent', '--target', target,
+                         '--profile-compiler', '--timings=json')
+        assert checked.stdout == normal.stdout
+        d = detail(checked)
+        for skipped in ('simplify','verify_post','allocation','scalar_emit','finalize'):
+            assert d['phases'][skipped] == d['calls'][skipped] == 0, d
+    off = p.call('build', 'profile.ddr', '--scalar-opt=off', '--profile-compiler',
+                 '--timings=json', '-o', 'off')
+    report = json.loads(off.stderr)['compiler_detail']
+    assert report['calls']['model_parse'] == 0 and report['calls']['legacy_body'] > 0
+    human = p.call('build', 'profile.ddr', '--profile-compiler', '-o', 'human')
+    assert 'compiler allocation=' in human.stderr and 'compiler legacy_body=' in human.stderr
+
+
+def runtime_profile_controls(p):
+    p.write('runtime.ddr', 'fn answer(x:i32)->i32{x+42}\nfn main()->i32{print(answer(0));return 17}\n')
+    def build(enabled, name):
+        flags = ['--runtime-profile'] if enabled else []
+        result = p.call('build', 'runtime.ddr', '--incremental', '--timings=json', '-o', name, *flags)
+        return json.loads(result.stderr)['functions']['reused']
+    assert build(False, 'plain') == 0
+    assert build(False, 'plain') > 0
+    assert build(True, 'profile') == 0
+    assert build(True, 'profile') > 0
+    assert build(False, 'plain') > 0
+    for name, enabled in [('plain',False), ('profile',True)]:
+        ran = subprocess.run([p.root/name],capture_output=True,text=True,timeout=10)
+        assert ran.returncode == 17 and ran.stdout == '42\n', ran
+        if enabled:
+            report = json.loads(ran.stderr)
+            assert report['kind'] == 'runtime_profile' and report['version'] == 1, report
+        else:
+            assert ran.stderr == '', ran
+    p.call('build', 'runtime.ddr', '--runtime-profile', '--target', 'wasm32', '-o', 'bad', status=1)
+    assert not (p.root/'bad').exists()
+    p.call('check', 'runtime.ddr', '--runtime-profile', status=2)
+    p.write('cases.ddr','fn answer(x:i32)->i32{x+42}\n@test fn works(){answer(0)==42}\n')
+    for enabled,expected in [(False,'1 passed'),(False,'1 unaffected'),
+                             (True,'1 passed'),(True,'1 unaffected'),(False,'1 passed')]:
+        flags = ['--runtime-profile'] if enabled else []
+        ran = p.call('test','cases.ddr','--affected','-o','results',*flags)
+        assert expected in ran.stdout, ran
+        if enabled and expected == '1 passed':
+            assert json.loads(ran.stderr)['kind'] == 'runtime_profile'
+        else:
+            assert ran.stderr == '', ran
+
+
 def phase_timings(p):
     p.write("phases.ddr", "fn answer()->i32{42}\nfn main(){value:=answer();print(value)}\n")
     normal = p.call("build", "phases.ddr", "-o", "plain")
@@ -232,7 +308,7 @@ def phase_timings(p):
     p.call("build", "phases.ddr", "--timings=xml", status=2)
     # Exercise the reporter's clock-failure path independently of host timing.
     sources = Path(__file__).resolve().parents[1] / "selfhost"
-    for module in ("cli", "timings"):
+    for module in ("cli", "timings", "compiler_profile", "native_clock"):
         p.write(module + ".ddr", (sources / (module + ".ddr")).read_text())
     p.write("clock-failure.ddr", "import timings\nfn main(){timings.report(true,false,0,1,0,1,-1,-1,-1,-1,-1,-1)}\n")
     unavailable = json.loads(p.call("run", "clock-failure.ddr").stderr)
@@ -278,7 +354,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
-    cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls, isolated_tests, filesystem]
+    cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
+             compiler_profile_controls, runtime_profile_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
