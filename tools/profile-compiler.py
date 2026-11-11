@@ -189,6 +189,7 @@ def main():
     parser.add_argument('--case',action='append',type=Path,help='source file; replaces default generated/selfhost/Tabell cases')
     parser.add_argument('--expected-stdout',type=Path,help='exact stdout reference for one custom source')
     parser.add_argument('--program-arg',action='append',default=[],help='runtime argument for that custom program')
+    parser.add_argument('--input-file',action='append',type=Path,default=[],help='additional runtime input to hash and check for changes')
     parser.add_argument('--timeout',type=int,default=120)
     args = parser.parse_args()
     if args.rounds < 1 or args.timeout < 1: parser.error('rounds and timeout must be positive')
@@ -248,6 +249,12 @@ def main():
             path = expected_stdout
             sources[str(path)] = {'sha256':sha(path),'bytes':path.stat().st_size}
             metadata['custom_reference'] = {'path':str(path),'sha256':sha(path),'program_args':args.program_arg}
+        metadata['additional_runtime_inputs'] = []
+        for path in args.input_file:
+            resolved = path.resolve(strict=True)
+            resolutions[str(path.absolute())] = str(resolved)
+            sources[str(resolved)] = {'sha256':sha(resolved),'bytes':resolved.stat().st_size}
+            metadata['additional_runtime_inputs'].append(str(resolved))
         metadata['sources'] = sources
         metadata['source_resolutions'] = resolutions
         recorder.checkpoint()

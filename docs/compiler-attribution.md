@@ -65,6 +65,10 @@ and its semantics are not certified without `--expected-stdout`. Optional
 execution arguments require exactly one custom case and a result reference.
 Such executions use the report's validation directory as their working
 directory; supplied code is responsible for any absolute-path operations.
+For custom data-driven programs, pass input paths as program arguments and
+declare each data file with repeated `--input-file /absolute/path`. Those bytes
+and canonical paths are then checked too. The tool cannot infer arbitrary file
+access performed by a supplied program.
 
 ## Reading the report
 
