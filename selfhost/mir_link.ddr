@@ -1,0 +1,224 @@
+// Ordered coordinator for detached FunctionObjects. It owns a fresh relocatable
+// image, never the frontend's live Code. Prefix copying happens once; each
+// appended object's primitive arenas are copied once after complete validation.
+// Callers buffer completed jobs under separate ownership roots and submit them
+// in source ordinal order. No worker/object references survive append.
+import arm64 as arm
+import mir_lower as lower
+
+pub opaque struct Linker {
+    code: arm.Code, sites: []i32, label_owners: []i32, site_owners: []i32,
+    interiors: []bool, phase: i32, next: i32, next_site: i32, expected: i32,
+    max_words: i32, max_labels: i32, max_sites: i32, code_done: bool, sites_done: bool,
+}
+pub fn new() -> Linker { Linker { code: arm.new(), sites: [], label_owners: [], site_owners: [],
+    interiors: [], phase: 0, next: 0, next_site: 0, expected: 0,
+    max_words: 536870911, max_labels: 1048576, max_sites: 1048576, code_done: false, sites_done: false } }
+fn clear_i32(a: &mut []i32) { while a.len > 0 { removed := a.pop() } }
+fn clear_i64(a: &mut []i64) { while a.len > 0 { removed := a.pop() } }
+fn clear_bool(a: &mut []bool) { while a.len > 0 { removed := a.pop() } }
+pub fn reset(link: &mut Linker) {
+    // Publishing only one table may not be silently abandoned/reused.
+    assert(link.code_done == link.sites_done)
+    clear_i64(&mut link.code.words); clear_i32(&mut link.code.labels)
+    clear_i32(&mut link.code.at); clear_i32(&mut link.code.target); clear_i32(&mut link.code.kinds)
+    clear_i32(&mut link.sites); clear_i32(&mut link.label_owners); clear_i32(&mut link.site_owners)
+    clear_bool(&mut link.interiors)
+    link.code.platform = 0; link.code.profile = false; link.code.effect_epoch = 0
+    link.phase = 0; link.next = 0; link.next_site = 0; link.expected = 0
+    link.code_done = false; link.sites_done = false
+}
+// Phases:0 empty,1 open namespace,2 sealed namespace/awaiting jobs,3 finalized,
+// 4 published. Owners:-1 unclaimed,-2 prefix,>=0 the source function ordinal.
+pub fn state(link: &Linker) -> i32 { link.phase }
+pub fn next_ordinal(link: &Linker) -> i32 { link.next }
+pub fn word_count(link: &Linker) -> i32 { link.code.words.len }
+pub fn word_at(link: &Linker, at: i32) -> i64 { link.code.words[at] }
+pub fn label_count(link: &Linker) -> i32 { link.code.labels.len }
+pub fn label_at(link: &Linker, id: i32) -> i32 { link.code.labels[id] }
+pub fn label_owner(link: &Linker, id: i32) -> i32 { link.label_owners[id] }
+pub fn relocation_count(link: &Linker) -> i32 { link.code.at.len }
+pub fn relocation_at(link: &Linker, at: i32) -> i32 { link.code.at[at] }
+pub fn relocation_target(link: &Linker, at: i32) -> i32 { link.code.target[at] }
+pub fn relocation_kind(link: &Linker, at: i32) -> i32 { link.code.kinds[at] }
+pub fn import_site_count(link: &Linker) -> i32 { link.sites.len }
+pub fn import_site_at(link: &Linker, id: i32) -> i32 { link.sites[id] }
+pub fn import_site_owner(link: &Linker, id: i32) -> i32 { link.site_owners[id] }
+fn pair_width(kind: i32) -> i32 { if kind >= 2 { 2 } else { 1 } }
+fn scratch(link: &mut Linker, words: i32) {
+    clear_bool(&mut link.interiors); for at in 0..words + 1 { link.interiors.push(false) }
+}
+fn prefix_valid(link: &mut Linker, prefix: &arm.Code, sites: &[]i32) -> bool {
+    n := prefix.words.len
+    if prefix.checking || prefix.mir_capture || prefix.effect_depth != 0 || prefix.platform < 0 || prefix.platform > 3 ||
+        prefix.at.len != prefix.target.len || prefix.at.len != prefix.kinds.len { return false }
+    for at in 0..n { if prefix.words[at] < 0 || prefix.words[at] > 4294967295 { return false } }
+    scratch(&mut link, n)
+    var reloc := 0; var imported := 0; var previous_end := 0
+    while reloc < prefix.at.len || imported < sites.len {
+        var symbolic := reloc < prefix.at.len
+        if imported < sites.len {
+            if sites[imported] < 0 || sites[imported] % 4 != 0 { return false }
+            if symbolic { symbolic = prefix.at[reloc] <= sites[imported] / 4 }
+        }
+        var at := 0; var width := 2
+        if symbolic {
+            at = prefix.at[reloc]; kind := prefix.kinds[reloc]
+            if kind < 0 || kind > 20 || prefix.target[reloc] < 0 || prefix.target[reloc] >= prefix.labels.len { return false }
+            width = pair_width(kind)
+        } else { at = sites[imported] / 4 }
+        if at < previous_end || at > n - width { return false }
+        if symbolic {
+            if prefix.words[at] != 0 || (width == 2 && prefix.words[at + 1] != 3573751839) { return false }
+            reloc = reloc + 1
+        } else {
+            if (prefix.words[at] != 0 && prefix.words[at] != 4244635648) || prefix.words[at + 1] != 0 { return false }
+            imported = imported + 1
+        }
+        if width == 2 { link.interiors[at + 1] = true }
+        previous_end = at + width
+    }
+    for id in 0..prefix.labels.len {
+        at := prefix.labels[id]
+        if at < -1 || at > n || (at >= 0 && link.interiors[at]) { return false }
+    }
+    true
+}
+// Caller-selected caps bound resource admission. The absolute word ceiling
+// keeps every eventual import BYTE position representable as a signed i32.
+// Failure leaves existing image, namespace, ownership and ordinal unchanged.
+pub fn begin_limited(link: &mut Linker, prefix: &arm.Code, sites: &[]i32,
+    max_words: i32, max_labels: i32, max_sites: i32) -> bool {
+    if link.phase != 0 || max_words < 0 || max_words > 536870911 || max_labels < 0 || max_sites < 0 ||
+        prefix.words.len > max_words || prefix.labels.len > max_labels || sites.len > max_sites { return false }
+    if !prefix_valid(&mut link, &prefix, &sites) { return false }
+    link.max_words = max_words; link.max_labels = max_labels; link.max_sites = max_sites
+    link.code.platform = prefix.platform; link.code.profile = prefix.profile; link.code.effect_epoch = prefix.effect_epoch
+    for at in 0..prefix.words.len { link.code.words.push(prefix.words[at]) }
+    for id in 0..prefix.labels.len {
+        at := prefix.labels[id]; link.code.labels.push(at)
+        var owner := -1; if at >= 0 { owner = -2 }; link.label_owners.push(owner)
+    }
+    for at in 0..prefix.at.len {
+        link.code.at.push(prefix.at[at]); link.code.target.push(prefix.target[at]); link.code.kinds.push(prefix.kinds[at])
+    }
+    for id in 0..sites.len { link.sites.push(sites[id]); link.site_owners.push(-2) }
+    link.next_site = sites.len; link.phase = 1; true
+}
+pub fn begin(link: &mut Linker, prefix: &arm.Code, sites: &[]i32) -> bool {
+    begin_limited(&mut link, &prefix, &sites, 536870911, 1048576, 1048576)
+}
+// Namespace growth allocates only new IDs. Existing bindings/owners are never
+// rescanned or replaced. These are import SITE IDs, not imported symbol slots.
+pub fn reserve_namespace(link: &mut Linker, labels: i32, import_sites: i32) -> bool {
+    if link.phase != 1 || labels < link.code.labels.len || import_sites < link.sites.len ||
+        labels > link.max_labels || import_sites > link.max_sites { return false }
+    while link.code.labels.len < labels { link.code.labels.push(-1); link.label_owners.push(-1) }
+    while link.sites.len < import_sites { link.sites.push(-1); link.site_owners.push(-1) }
+    true
+}
+fn object_valid(link: &mut Linker, object: &lower.FunctionObject, ordinal: i32) -> bool {
+    if (link.phase != 1 && link.phase != 2) || ordinal != link.next || ordinal < 0 || ordinal == 2147483647 ||
+        (link.phase == 2 && ordinal >= link.expected) || !lower.object_ready(&object) { return false }
+    n := lower.object_word_count(&object)
+    if lower.object_platform(&object) != link.code.platform || n > link.max_words - link.code.words.len ||
+        lower.object_import_count(&object) > link.sites.len - link.next_site { return false }
+    for at in 0..n { value := lower.object_word(&object, at); if value < 0 || value > 4294967295 { return false } }
+    scratch(&mut link, n)
+    var reloc := 0; var imported := 0; var previous_end := 0
+    while reloc < lower.object_reloc_count(&object) || imported < lower.object_import_count(&object) {
+        var symbolic := reloc < lower.object_reloc_count(&object)
+        if imported < lower.object_import_count(&object) {
+            byte_at := lower.object_import_byte_at(&object, imported)
+            if byte_at < 0 || byte_at % 4 != 0 { return false }
+            if symbolic { symbolic = lower.object_reloc_at(&object, reloc) <= byte_at / 4 }
+        }
+        var at := 0; var width := 2
+        if symbolic {
+            at = lower.object_reloc_at(&object, reloc); kind := lower.object_reloc_kind(&object, reloc)
+            target := lower.object_reloc_target(&object, reloc)
+            if kind < 0 || kind > 20 || target < 0 || target >= link.code.labels.len { return false }
+            width = pair_width(kind)
+        } else {
+            at = lower.object_import_byte_at(&object, imported) / 4
+            id := lower.object_import_id(&object, imported)
+            // Image ABI: x86's forward cursor consumes site IDs in physical
+            // order. IDs must continue the prefix, independently of symbol IDs.
+            if id != link.next_site + imported || link.site_owners[id] != -1 { return false }
+        }
+        if at < previous_end || at > n - width { return false }
+        if symbolic {
+            if lower.object_word(&object, at) != 0 || (width == 2 && lower.object_word(&object, at + 1) != 3573751839) { return false }
+            reloc = reloc + 1
+        } else {
+            first := lower.object_word(&object, at)
+            if (first != 0 && first != 4244635648) || lower.object_word(&object, at + 1) != 0 { return false }
+            imported = imported + 1
+        }
+        if width == 2 { link.interiors[at + 1] = true }
+        previous_end = at + width
+    }
+    var previous := -1
+    for i in 0..lower.object_label_count(&object) {
+        id := lower.object_label_id(&object, i); at := lower.object_label_offset(&object, i)
+        if id <= previous || id < 0 || id >= link.code.labels.len || link.label_owners[id] != -1 ||
+            at < -1 || at > n || (at >= 0 && link.interiors[at]) { return false }
+        previous = id
+    }
+    true
+}
+// Invalid/not-ready/wrong-platform/out-of-order/duplicate/over-budget objects
+// change no output or namespace fields. Only reusable validation scratch varies.
+pub fn append(link: &mut Linker, object: &lower.FunctionObject, ordinal: i32) -> bool {
+    if !object_valid(&mut link, &object, ordinal) { return false }
+    base := link.code.words.len
+    for at in 0..lower.object_word_count(&object) { link.code.words.push(lower.object_word(&object, at)) }
+    for i in 0..lower.object_label_count(&object) {
+        id := lower.object_label_id(&object, i); var at := lower.object_label_offset(&object, i)
+        if at >= 0 { at = base + at }; link.code.labels[id] = at; link.label_owners[id] = ordinal
+    }
+    for i in 0..lower.object_reloc_count(&object) {
+        link.code.at.push(base + lower.object_reloc_at(&object, i))
+        link.code.target.push(lower.object_reloc_target(&object, i)); link.code.kinds.push(lower.object_reloc_kind(&object, i))
+    }
+    for i in 0..lower.object_import_count(&object) {
+        id := lower.object_import_id(&object, i)
+        link.sites[id] = base * 4 + lower.object_import_byte_at(&object, i); link.site_owners[id] = ordinal
+    }
+    link.next_site = link.next_site + lower.object_import_count(&object); link.next = link.next + 1; true
+}
+// The frontend knows the complete submitted job count when it seals IDs.
+// Jobs already running may still append in order after sealing the namespace.
+pub fn seal_namespace(link: &mut Linker, expected_functions: i32) -> bool {
+    if link.phase != 1 || expected_functions < link.next { return false }
+    link.expected = expected_functions; link.phase = 2; true
+}
+// This is the RELOCATABLE image boundary. Referenced labels may still be -1
+// for later runtime/data/callback binding, as in the serial adapter. The final
+// image writer must reject unresolved references before publishing bytes.
+// Every reserved import SITE ID, however, must already name one actual pair.
+pub fn finalize(link: &mut Linker) -> bool {
+    if link.phase != 2 || link.next != link.expected || link.next_site != link.sites.len { return false }
+    link.phase = 3; true
+}
+// One final publication copy, not an ownership move. Separate exports support
+// the compiler's whole-root borrow rule. Destinations must be fresh and may
+// not be read/published until BOTH exports complete. No snapshots per append.
+pub fn export_code(link: &mut Linker, code: &mut arm.Code) {
+    assert(link.phase == 3 && !link.code_done && !code.checking && !code.mir_capture && code.effect_depth == 0)
+    assert(code.words.len == 0 && code.labels.len == 0 && code.at.len == 0 && code.target.len == 0 && code.kinds.len == 0)
+    assert(code.virtual_words == 0 && code.virtual_labels == 0 && code.mir_starts.len == 0 && code.mir_ends.len == 0 &&
+        code.mir_kinds.len == 0 && code.mir_a.len == 0 && code.mir_b.len == 0)
+    code.platform = link.code.platform; code.profile = link.code.profile; code.effect_epoch = link.code.effect_epoch
+    for at in 0..link.code.words.len { code.words.push(link.code.words[at]) }
+    for id in 0..link.code.labels.len { code.labels.push(link.code.labels[id]) }
+    for at in 0..link.code.at.len {
+        code.at.push(link.code.at[at]); code.target.push(link.code.target[at]); code.kinds.push(link.code.kinds[at])
+    }
+    link.code_done = true; if link.sites_done { link.phase = 4 }
+}
+pub fn export_import_sites(link: &mut Linker, sites: &mut []i32) {
+    assert(link.phase == 3 && !link.sites_done && sites.len == 0)
+    for id in 0..link.sites.len { sites.push(link.sites[id]) }
+    link.sites_done = true; if link.code_done { link.phase = 4 }
+}
