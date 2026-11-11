@@ -3,32 +3,43 @@
 // responsibility of the bounded analysis that produced them.
 import opt_ir as ir
 
-struct Walk { seen: []bool, active: []bool, declared: []bool, scopes: []i32, visits: i32 }
+// The arrays retain their high-water lengths. Each validation initializes only
+// the entries belonging to its current model, including after an earlier
+// validation stopped with partially populated scopes or metadata.
+pub opaque struct Workspace { seen: []bool, active: []bool, declared: []bool, scopes: []i32, visits: i32, scope_height: i32 }
+pub fn new() -> Workspace { Workspace { seen: [], active: [], declared: [], scopes: [], visits: 0, scope_height: 0 } }
 fn scalar(ty: i32) -> bool { ty >= 1 && ty <= 3 }
 fn numeric(ty: i32) -> bool { ty == 1 || ty == 2 }
 fn index(value: i32, count: i32) -> bool { value >= -1 && value < count }
 fn covers(f: &ir.Function, node: i32, mask: i32) -> bool { f.effects[node].bit_and(mask) == mask }
-fn enter(w: &mut Walk, f: &ir.Function, node: i32, depth: i32) -> bool {
+fn enter(w: &mut Workspace, f: &ir.Function, node: i32, depth: i32) -> bool {
     if node < 0 || node >= f.kinds.len || depth > 256 || w.visits >= 4096 { return false }
     // The reachable model is a tree. This rejects cycles and accidental
     // sharing without imposing parser allocation order on parent/child IDs.
     if w.seen[node] { return false }
     w.seen[node] = true; w.visits = w.visits + 1; true
 }
-fn active(w: &Walk, f: &ir.Function, local: i32) -> bool {
+fn active(w: &Workspace, f: &ir.Function, local: i32) -> bool {
     local >= 0 && local < f.local_types.len && w.active[local]
 }
-fn array(w: &Walk, f: &ir.Function, local: i32) -> bool {
+fn array(w: &Workspace, f: &ir.Function, local: i32) -> bool {
     active(&w, &f, local) && ir.array_type(f.local_types[local]) && f.local_param[local] >= 0
 }
-fn declare(w: &mut Walk, f: &ir.Function, local: i32) -> bool {
+fn declare(w: &mut Workspace, f: &ir.Function, local: i32) -> bool {
     if local < 0 || local >= f.local_types.len || w.declared[local] || f.local_param[local] >= 0 { return false }
-    w.declared[local] = true; w.active[local] = true; w.scopes.push(local); true
+    w.declared[local] = true; w.active[local] = true
+    if w.scope_height == w.scopes.len { w.scopes.push(local) }
+    else { w.scopes[w.scope_height] = local }
+    w.scope_height = w.scope_height + 1
+    true
 }
-fn leave(w: &mut Walk, height: i32) {
-    while w.scopes.len > height { local := w.scopes.pop(); w.active[local] = false }
+fn leave(w: &mut Workspace, height: i32) {
+    while w.scope_height > height {
+        w.scope_height = w.scope_height - 1
+        w.active[w.scopes[w.scope_height]] = false
+    }
 }
-fn expression(w: &mut Walk, f: &ir.Function, node: i32, depth: i32) -> bool {
+fn expression(w: &mut Workspace, f: &ir.Function, node: i32, depth: i32) -> bool {
     if !enter(&mut w, &f, node, depth) { return false }
     kind := f.kinds[node]; ty := f.types[node]; left := f.left[node]; right := f.right[node]
     if kind < 1 || kind > 6 || !scalar(ty) || f.next[node] != -1 || f.third[node] != -1 { return false }
@@ -71,7 +82,7 @@ fn expression(w: &mut Walk, f: &ir.Function, node: i32, depth: i32) -> bool {
 }
 // Flow bits: fallthrough=1, return=2, break=4, continue=8. Validate dead
 // statements too, but do not let them create reachable return coverage.
-fn statement(w: &mut Walk, f: &ir.Function, node: i32, loops: i32, depth: i32) -> i32 {
+fn statement(w: &mut Workspace, f: &ir.Function, node: i32, loops: i32, depth: i32) -> i32 {
     if !enter(&mut w, &f, node, depth) || f.types[node] != 0 { return -1 }
     kind := f.kinds[node]; left := f.left[node]; right := f.right[node]; third := f.third[node]
     local := f.locals[node]
@@ -79,7 +90,7 @@ fn statement(w: &mut Walk, f: &ir.Function, node: i32, loops: i32, depth: i32) -
     var effect := ir.own_effects(kind, 0); var flow := 1
     if kind == 10 {
         if local != -1 || right != -1 || third != -1 { return -1 }
-        height := w.scopes.len; var at := left
+        height := w.scope_height; var at := left
         while at >= 0 {
             child := statement(&mut w, &f, at, loops, depth + 1)
             if child < 0 { return -1 }
@@ -134,7 +145,7 @@ fn statement(w: &mut Walk, f: &ir.Function, node: i32, loops: i32, depth: i32) -
         // Bounds cannot read their iterator; it comes into scope afterward.
         if !expression(&mut w, &f, left, depth + 1) || f.types[left] != 1 { return -1 }
         if !expression(&mut w, &f, right, depth + 1) || f.types[right] != 1 { return -1 }
-        height := w.scopes.len
+        height := w.scope_height
         if !declare(&mut w, &f, local) { return -1 }
         body := statement(&mut w, &f, third, loops + 1, depth + 1)
         if body < 0 { return -1 }
@@ -145,20 +156,24 @@ fn statement(w: &mut Walk, f: &ir.Function, node: i32, loops: i32, depth: i32) -
     if !covers(&f, node, effect) { return -1 }
     flow
 }
-pub fn validate(f: &ir.Function, optimized: bool) -> bool {
+pub fn validate_into(w: &mut Workspace, f: &ir.Function, optimized: bool) -> bool {
+    // Reset before every possible early return. Cached flags are overwritten
+    // below before traversal; stale scope entries are outside scope_height.
+    w.visits = 0; w.scope_height = 0
     count := f.kinds.len; locals := f.local_types.len
     if !f.supported || count < 1 || count > 2048 || locals > 256 || f.params < 0 || f.params > 8 || f.params > locals || f.ret < 0 || f.ret > 3 { return false }
     if f.types.len != count || f.left.len != count || f.right.len != count || f.third.len != count || f.next.len != count || f.values.len != count || f.locals.len != count || f.starts.len != count || f.effects.len != count || f.proofs.len != count { return false }
     if f.local_names.len != locals || f.local_mutable.len != locals || f.local_param.len != locals || f.local_at.len != locals { return false }
     if f.root < 0 || f.root >= count || f.kinds[f.root] != 10 || f.next[f.root] != -1 || f.visits < 0 || f.rewrites < 0 { return false }
-    var w := Walk { seen: [], active: [], declared: [], scopes: [], visits: 0 }
+    while w.active.len < locals { w.active.push(false); w.declared.push(false) }
+    while w.seen.len < count { w.seen.push(false) }
     for i in 0..locals {
         ty := f.local_types[i]
         if (!scalar(ty) && !ir.array_type(ty)) || f.local_names[i] == "" || f.local_at[i] < 0 { return false }
         parameter := i < f.params
         if parameter { if f.local_param[i] != i || f.local_mutable[i] { return false } }
         else if f.local_param[i] != -1 || ir.array_type(ty) { return false }
-        w.active.push(parameter); w.declared.push(parameter)
+        w.active[i] = parameter; w.declared[i] = parameter
     }
     // Check all storage and references, including detached scratch nodes,
     // before any graph traversal can dereference a malformed child/local.
@@ -172,9 +187,13 @@ pub fn validate(f: &ir.Function, optimized: bool) -> bool {
             local := f.locals[i]
             if kind != 6 || f.types[i] != 2 || local < 0 || f.local_types[local] != 20 { return false }
         }
-        w.seen.push(false)
+        w.seen[i] = false
     }
     flow := statement(&mut w, &f, f.root, 0, 0)
     if flow < 0 || flow.bit_and(12) != 0 { return false }
     f.ret == 0 || flow.bit_and(1) == 0
+}
+pub fn validate(f: &ir.Function, optimized: bool) -> bool {
+    var w := new()
+    validate_into(&mut w, &f, optimized)
 }
