@@ -4,8 +4,60 @@ import arm64 as arm
 import cache_io
 import cli
 import lexer
+import native_clock as monotonic
 import std.bytes as bytes
 import sys
+
+// Optional nested attribution. One external meter is reused for the complete
+// compiler call. Disabled meters allocate no stage arrays and read no clocks.
+pub struct Meter { enabled: bool, host: i32, clock_ok: bool, elapsed: []i64, calls: []i64, work: []i64 }
+pub fn new_meter(host: i32) -> Meter {
+    var m := Meter { enabled: host >= 0 && host <= 2, host: host, clock_ok: true, elapsed: [], calls: [], work: [] }
+    if m.enabled { for i in 0..9 { m.elapsed.push(0); m.calls.push(0); m.work.push(0) } }
+    m
+}
+pub fn meter_phase(phase: i32) -> string {
+    if phase == 0 { return "identity_serialize" }; if phase == 1 { return "identity_hash" }
+    if phase == 2 { return "metadata_read" }; if phase == 3 { return "content_hash" }
+    if phase == 4 { return "hex_decode" }; if phase == 5 { return "validation" }
+    if phase == 6 { return "commit" }; if phase == 7 { return "serialization" }; "publication"
+}
+fn meter_unit(phase: i32) -> string { if phase == 5 { return "records" }; if phase == 6 { return "words" }; "bytes" }
+fn meter_begin(m: &Meter) -> i64 { if !m.enabled { return -1 }; monotonic.nanoseconds(m.host) }
+pub fn record_meter(m: &mut Meter, phase: i32, first: i64, last: i64, work: i64) {
+    if !m.enabled { return }
+    if phase < 0 || phase >= 9 || work < 0 { m.clock_ok = false; return }
+    m.calls[phase] = m.calls[phase] + 1; m.work[phase] = m.work[phase] + work
+    if first < 0 || last < first { m.clock_ok = false; return }
+    m.elapsed[phase] = m.elapsed[phase] + last - first
+}
+fn meter_finish(m: &mut Meter, phase: i32, first: i64, work: i64) {
+    if !m.enabled { return }
+    last := monotonic.nanoseconds(m.host); record_meter(&mut m, phase, first, last, work)
+}
+pub fn json_meter(m: &Meter) -> string {
+    if !m.enabled { return "{\"enabled\":false}" }
+    var flag := "false"; var total := "null"; var sum: i64 = 0
+    for elapsed in m.elapsed { sum = sum + elapsed }
+    if m.clock_ok { flag = "true"; total = sum.str() }
+    var out := "{\"enabled\":true,\"clock_ok\":" + flag + ",\"unit\":\"ns\",\"overlaps_parent\":\"fragment_cache\",\"included_in_covered\":false,\"total\":" + total + ",\"phases\":{"
+    for phase in 0..9 {
+        if phase > 0 { out = out + "," }
+        var value := "null"; if m.clock_ok { value = m.elapsed[phase].str() }
+        out = out + "\"" + meter_phase(phase) + "\":" + value
+    }
+    out = out + "},\"calls\":{"
+    for phase in 0..9 {
+        if phase > 0 { out = out + "," }
+        out = out + "\"" + meter_phase(phase) + "\":" + m.calls[phase].str()
+    }
+    out = out + "},\"work\":{"
+    for phase in 0..9 {
+        if phase > 0 { out = out + "," }
+        out = out + "\"" + meter_phase(phase) + "_" + meter_unit(phase) + "\":" + m.work[phase].str()
+    }
+    out + "}}"
+}
 
 pub struct Start { words: i32, labels: i32, relocations: i32 }
 pub fn start(code: &arm.Code) -> Start {
@@ -25,11 +77,9 @@ fn tokens(output: &mut []u8, input: &lexer.Tokens, first: i32, last: i32) {
         bytes.append_utf8(&mut output, spelling)
     }
 }
-pub fn context(input: &lexer.Tokens, starts: &[]i32, ends: &[]i32,
+fn context_payload(raw: &mut []u8, input: &lexer.Tokens, starts: &[]i32, ends: &[]i32,
     owners: &[]i32, type_owners: &[]i32, platform: i32, globals: i32,
-    callbacks: bool, identity: string) -> string {
-    if identity == "" { return "" }
-    var raw: []u8 = []
+    callbacks: bool, identity: string) {
     bytes.append_utf8(&mut raw, identity + ":native3:" + platform.str() + ":" + globals.str())
     if callbacks { raw.push(1) } else { raw.push(0) }
     for owner in owners { bytes.append_le(&mut raw, i64(owner), 4) }
@@ -42,15 +92,43 @@ pub fn context(input: &lexer.Tokens, starts: &[]i32, ends: &[]i32,
         }
     }
     tokens(&mut raw, &input, position, input.kinds.len)
+}
+fn key_payload(raw: &mut []u8, context: string, function: i32, input: &lexer.Tokens, first: i32, last: i32) {
+    bytes.append_utf8(&mut raw, context)
+    bytes.append_le(&mut raw, i64(function), 4)
+    tokens(&mut raw, &input, first, last)
+}
+pub fn context(input: &lexer.Tokens, starts: &[]i32, ends: &[]i32,
+    owners: &[]i32, type_owners: &[]i32, platform: i32, globals: i32,
+    callbacks: bool, identity: string) -> string {
+    if identity == "" { return "" }
+    var raw: []u8 = []; context_payload(&mut raw,&input,&starts,&ends,&owners,&type_owners,platform,globals,callbacks,identity)
     cache_io.binary_hash(&raw)
 }
 pub fn key(context: string, function: i32, input: &lexer.Tokens, first: i32, last: i32) -> string {
     if context == "" { return "" }
-    var raw: []u8 = []
-    bytes.append_utf8(&mut raw, context)
-    bytes.append_le(&mut raw, i64(function), 4)
-    tokens(&mut raw, &input, first, last)
+    var raw: []u8 = []; key_payload(&mut raw,context,function,&input,first,last)
     cache_io.binary_hash(&raw)
+}
+pub fn context_metered(input: &lexer.Tokens, starts: &[]i32, ends: &[]i32,
+    owners: &[]i32, type_owners: &[]i32, platform: i32, globals: i32,
+    callbacks: bool, identity: string, meter: &mut Meter) -> string {
+    if identity == "" { return "" }
+    var started: i64 = -1; if meter.enabled { started = meter_begin(&meter) }
+    var raw: []u8 = []; context_payload(&mut raw,&input,&starts,&ends,&owners,&type_owners,platform,globals,callbacks,identity)
+    if meter.enabled { meter_finish(&mut meter,0,started,i64(raw.len)); started = meter_begin(&meter) }
+    result := cache_io.binary_hash(&raw)
+    if meter.enabled { meter_finish(&mut meter,1,started,i64(raw.len)) }
+    result
+}
+pub fn key_metered(context: string, function: i32, input: &lexer.Tokens, first: i32, last: i32, meter: &mut Meter) -> string {
+    if context == "" { return "" }
+    var started: i64 = -1; if meter.enabled { started = meter_begin(&meter) }
+    var raw: []u8 = []; key_payload(&mut raw,context,function,&input,first,last)
+    if meter.enabled { meter_finish(&mut meter,0,started,i64(raw.len)); started = meter_begin(&meter) }
+    result := cache_io.binary_hash(&raw)
+    if meter.enabled { meter_finish(&mut meter,1,started,i64(raw.len)) }
+    result
 }
 fn put(output: &mut []u8, value: i64) {
     digits := "0123456789abcdef"
@@ -71,91 +149,6 @@ fn values(source: string) -> []i64 {
     }
     result
 }
-pub fn save(code: &arm.Code, begin: Start, globals: i32, path: string, key: string) {
-    if key == "" { return }
-    var output: []u8 = []
-    put(&mut output, i64(code.words.len - begin.words))
-    put(&mut output, i64(code.labels.len - begin.labels))
-    put(&mut output, i64(code.at.len - begin.relocations))
-    for i in begin.words..code.words.len { put(&mut output, code.words[i]) }
-    for i in begin.labels..code.labels.len {
-        offset := code.labels[i]
-        if offset < 0 { put(&mut output, 4294967295) }
-        else {
-            if offset < begin.words { return }
-            put(&mut output, i64(offset - begin.words))
-        }
-    }
-    for i in begin.relocations..code.at.len {
-        target := code.target[i]
-        put(&mut output, i64(code.at[i] - begin.words))
-        if target < globals { put(&mut output, 2147483648 + i64(target)) }
-        else if target >= begin.labels { put(&mut output, i64(target - begin.labels)) }
-        else { return }
-        put(&mut output, i64(code.kinds[i]))
-    }
-    if !cli.prepare_parent(path) { return }
-    payload := sys.decode_u8(&output)
-    temporary := path + "." + sys.pid().str() + ".tmp"
-    signature := cache_io.digest(key + payload.value)
-    written := sys.write_text(temporary, key + signature + payload.value)
-    if written.ok {
-        updated := sys.rename(temporary, path)
-        if updated.ok { return }
-    }
-    removed := sys.remove_file(temporary)
-}
-pub fn restore(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string) -> bool {
-    if key == "" { return false }
-    info := sys.metadata(path)
-    if !info.is_file || info.size < 152 || info.size > 67108864 { return false }
-    read := sys.read_text(path)
-    if !read.ok || read.value.len < 152 || read.value[0..64] != key { return false }
-    payload := read.value[128..read.value.len]
-    if read.value[64..128] != cache_io.digest(key + payload) { return false }
-    data := values(payload)
-    if data.len < 3 { return false }
-    if i64(3) + data[0] + data[1] + i64(3) * data[2] != i64(data.len) || data[0] == 0 { return false }
-    words := i32(data[0])
-    labels := i32(data[1])
-    relocations := i32(data[2])
-    label_start := 3 + words
-    relocation_start := label_start + labels
-    for i in 0..labels {
-        offset := data[label_start + i]
-        if offset != 4294967295 && offset > i64(words) { return false }
-    }
-    for i in 0..relocations {
-        at := data[relocation_start + i * 3]
-        target := data[relocation_start + i * 3 + 1]
-        kind := data[relocation_start + i * 3 + 2]
-        if at >= i64(words) || kind > 20 || (kind >= 2 && at + 1 >= i64(words)) { return false }
-        if target >= 2147483648 {
-            if target - 2147483648 >= i64(globals) { return false }
-        } else if target >= i64(labels) || data[label_start + i32(target)] == 4294967295 { return false }
-    }
-    // Only mutate compiler state after every length and symbolic target is valid.
-    base := code.words.len
-    first := code.labels.len
-    arm.mark(&mut code, entry)
-    for i in 0..words { code.words.push(data[3 + i]) }
-    for i in 0..labels {
-        offset := data[label_start + i]
-        if offset == 4294967295 { code.labels.push(-1) }
-        else { code.labels.push(base + i32(offset)) }
-    }
-    for i in 0..relocations {
-        destination := data[relocation_start + i * 3 + 1]
-        var target := 0
-        if destination >= 2147483648 { target = i32(destination - 2147483648) }
-        else { target = first + i32(destination) }
-        code.at.push(base + i32(data[relocation_start + i * 3]))
-        code.kinds.push(i32(data[relocation_start + i * 3 + 2]))
-        code.target.push(target)
-    }
-    true
-}
-
 // Explicit growth/dependency admission for future generic code transforms.
 // Dependencies are sorted unique declaration IDs; charges count every admitted
 // expansion, including repeated declarations and builtins without a declaration.
@@ -197,134 +190,213 @@ fn valid_key(key: string) -> bool {
     for b in key.bytes() { if !(b >= 48 && b <= 57) && !(b >= 97 && b <= 102) { return false } }
     true
 }
-fn publish_dependencies(path: string, key: string, output: &[]u8) -> bool {
-    if output.len > 67108864 - 128 || !cli.prepare_parent(path) { return false }
-    payload := sys.decode_u8(&output)
-    if !payload.ok { return false }
-    temporary := path + "." + sys.pid().str() + ".tmp"
-    signature := cache_io.digest(key + payload.value)
-    written := sys.write_text(temporary, key + signature + payload.value)
-    if written.ok {
-        updated := sys.rename(temporary, path)
-        if updated.ok { return true }
-    }
-    removed := sys.remove_file(temporary); false
-}
-pub fn save_with_dependencies(code: &arm.Code, begin: Start, globals: i32,
-    path: string, key: string, dependencies: &Dependencies, declaration_limit: i32) -> bool {
-    if !valid_key(key) || !valid_dependencies(&dependencies, declaration_limit) || code.checking { return false }
-    if begin.words < 0 || begin.words >= code.words.len || begin.labels < 0 || begin.labels > code.labels.len || begin.relocations < 0 || begin.relocations > code.at.len { return false }
-    if globals < 0 || globals > begin.labels || code.at.len != code.target.len || code.at.len != code.kinds.len { return false }
-    words := code.words.len - begin.words; labels := code.labels.len - begin.labels; relocations := code.at.len - begin.relocations
-    size := i64(7) + i64(words) + i64(labels) + i64(relocations) * 3 + i64(dependencies.declarations.len)
-    if size * 8 + 128 > 67108864 { return false }
-    var output: []u8 = []
-    // DUFD, version 1. The old API interprets magic as an impossible word count
-    // and declines this payload. New restore requires magic and rejects native3.
-    put(&mut output, 1146439236); put(&mut output, 1)
-    put(&mut output, i64(words)); put(&mut output, i64(labels)); put(&mut output, i64(relocations))
-    put(&mut output, i64(dependencies.declarations.len)); put(&mut output, i64(dependencies.charged_words))
+// All formats share serialization, validation and commit logic. Policy 0 is
+// native3 only, 1 is strict DUFD, and 2 accepts either on a single file read.
+fn serialize_body(code: &arm.Code, begin: &Start, globals: i32, output: &mut []u8, strict: bool) -> bool {
     for i in begin.words..code.words.len {
         word := code.words[i]
-        if word < 0 || word > 4294967295 { return false }
+        if strict && (word < 0 || word > 4294967295) { return false }
         put(&mut output, word)
     }
     for i in begin.labels..code.labels.len {
         offset := code.labels[i]
-        if offset == -1 { put(&mut output, 4294967295) }
-        else {
-            if offset < begin.words || offset > code.words.len { return false }
+        if offset < 0 {
+            if strict && offset != -1 { return false }
+            put(&mut output, 4294967295)
+        } else {
+            if offset < begin.words || (strict && offset > code.words.len) { return false }
             put(&mut output, i64(offset - begin.words))
         }
     }
     for i in begin.relocations..code.at.len {
         at := code.at[i]; target := code.target[i]; kind := code.kinds[i]
-        if at < begin.words || at >= code.words.len || kind < 0 || kind > 20 || (kind >= 2 && at + 1 >= code.words.len) { return false }
-        if target < 0 || target >= code.labels.len { return false }
+        if strict && (at < begin.words || at >= code.words.len || kind < 0 || kind > 20 || (kind >= 2 && at + 1 >= code.words.len) || target < 0 || target >= code.labels.len) { return false }
         put(&mut output, i64(at - begin.words))
         if target < globals { put(&mut output, 2147483648 + i64(target)) }
-        else if target >= begin.labels && code.labels[target] >= begin.words { put(&mut output, i64(target - begin.labels)) }
-        else { return false }
+        else if target >= begin.labels {
+            if strict && code.labels[target] < begin.words { return false }
+            put(&mut output, i64(target - begin.labels))
+        } else { return false }
         put(&mut output, i64(kind))
     }
-    for declaration in dependencies.declarations { put(&mut output, i64(declaration)) }
-    publish_dependencies(path, key, &output)
+    true
 }
-fn restore_dependencies(code: &mut arm.Code, globals: i32, entry: i32,
-    path: string, key: string, declaration_limit: i32, available_global_words: i32,
-    dependencies: &mut Dependencies, allow_native3: bool) -> bool {
-    if !valid_key(key) || declaration_limit < 0 || available_global_words < 0 || code.checking { return false }
-    if globals < 0 || globals > code.labels.len || entry < 0 || entry >= code.labels.len || code.labels[entry] != -1 { return false }
-    if code.at.len != code.target.len || code.at.len != code.kinds.len { return false }
-    var minimum:=184;if allow_native3{minimum=152}
-    info := sys.metadata(path)
-    if !info.is_file || info.size < i64(minimum) || info.size > 67108864 { return false }
-    read := sys.read_text(path)
-    if !read.ok || read.value.len < minimum || read.value.len > 67108864 || read.value[0..64] != key { return false }
-    payload := read.value[128..read.value.len]
-    if read.value[64..128] != cache_io.digest(key + payload) { return false }
-    data := values(payload)
-    if data.len < 3 { return false }
-    var header:=3;var word_count:=data[0];var label_count:=data[1];var relocation_count:=data[2]
-    var dependency_count:i64=0;var charged_words:i64=0
-    if data[0]==1146439236{
-        if data.len<7 || data[1]!=1{return false}
-        header=7;word_count=data[2];label_count=data[3];relocation_count=data[4]
-        dependency_count=data[5];charged_words=data[6]
-    }else if !allow_native3{return false}
-    if word_count==0 || dependency_count>256 || charged_words>4096 || charged_words>i64(available_global_words){return false}
-    size:=i64(header)+word_count+label_count+relocation_count*3+dependency_count
-    if size!=i64(data.len) || word_count>i64(2147483647-code.words.len) || label_count>i64(2147483647-code.labels.len) || relocation_count>i64(2147483647-code.at.len){return false}
-    words:=i32(word_count);labels:=i32(label_count);relocations:=i32(relocation_count);count:=i32(dependency_count)
-    label_start := header + words; relocation_start := label_start + labels
-    declaration_start := relocation_start + relocations * 3
+fn valid_start(code: &arm.Code, begin: &Start, globals: i32) -> bool {
+    !code.checking && begin.words >= 0 && begin.words <= code.words.len &&
+        begin.labels >= 0 && begin.labels <= code.labels.len && begin.relocations >= 0 && begin.relocations <= code.at.len &&
+        globals >= 0 && globals <= begin.labels && code.at.len == code.target.len && code.at.len == code.kinds.len
+}
+fn serialize_legacy(code: &arm.Code, begin: &Start, globals: i32, output: &mut []u8) -> bool {
+    if !valid_start(&code, &begin, globals) { return false }
+    put(&mut output, i64(code.words.len - begin.words)); put(&mut output, i64(code.labels.len - begin.labels)); put(&mut output, i64(code.at.len - begin.relocations))
+    serialize_body(&code, &begin, globals, &mut output, false)
+}
+fn serialize_dependencies(code: &arm.Code, begin: &Start, globals: i32, dependencies: &Dependencies, declaration_limit: i32, output: &mut []u8) -> bool {
+    if !valid_dependencies(&dependencies, declaration_limit) || !valid_start(&code, &begin, globals) || begin.words == code.words.len { return false }
+    size := i64(7) + i64(code.words.len - begin.words) + i64(code.labels.len - begin.labels) + i64(code.at.len - begin.relocations) * 3 + i64(dependencies.declarations.len)
+    if size * 8 + 128 > 67108864 { return false }
+    put(&mut output, 1146439236); put(&mut output, 1)
+    put(&mut output, i64(code.words.len - begin.words)); put(&mut output, i64(code.labels.len - begin.labels)); put(&mut output, i64(code.at.len - begin.relocations))
+    put(&mut output, i64(dependencies.declarations.len)); put(&mut output, i64(dependencies.charged_words))
+    if !serialize_body(&code, &begin, globals, &mut output, true) { return false }
+    for declaration in dependencies.declarations { put(&mut output, i64(declaration)) }
+    true
+}
+fn publish_payload(path: string, key: string, signature: string, payload: string) -> bool {
+    if payload.len > 67108864 - 128 || !cli.prepare_parent(path) { return false }
+    temporary := path + "." + sys.pid().str() + ".tmp"
+    written := sys.write_text(temporary, key + signature + payload)
+    if written.ok { updated := sys.rename(temporary, path); if updated.ok { return true } }
+    removed := sys.remove_file(temporary); false
+}
+fn publish_metered(path: string, key: string, output: &[]u8, started: i64, meter: &mut Meter) -> bool {
+    payload := sys.decode_u8(&output)
+    if meter.enabled { meter_finish(&mut meter,7,started,i64(output.len)) }
+    if !payload.ok { return false }
+    var first: i64 = -1; if meter.enabled { first = meter_begin(&meter) }
+    signature := cache_io.digest(key + payload.value)
+    if meter.enabled { meter_finish(&mut meter,3,first,i64(key.len) + i64(payload.value.len)); first = meter_begin(&meter) }
+    result := publish_payload(path,key,signature,payload.value)
+    if meter.enabled { meter_finish(&mut meter,8,first,i64(key.len) + 64 + i64(payload.value.len)) }
+    result
+}
+pub fn save_metered(code: &arm.Code, begin: Start, globals: i32, path: string, key: string, meter: &mut Meter) -> bool {
+    if key == "" { return false }
+    var first: i64 = -1; if meter.enabled { first = meter_begin(&meter) }
+    var output: []u8 = []
+    if !serialize_legacy(&code,&begin,globals,&mut output) {
+        if meter.enabled { meter_finish(&mut meter,7,first,i64(output.len)) }; return false
+    }
+    publish_metered(path,key,&output,first,&mut meter)
+}
+pub fn save_with_dependencies_metered(code: &arm.Code, begin: Start, globals: i32,
+    path: string, key: string, dependencies: &Dependencies, declaration_limit: i32, meter: &mut Meter) -> bool {
+    if !valid_key(key) { return false }
+    var first: i64 = -1; if meter.enabled { first = meter_begin(&meter) }
+    var output: []u8 = []
+    if !serialize_dependencies(&code,&begin,globals,&dependencies,declaration_limit,&mut output) {
+        if meter.enabled { meter_finish(&mut meter,7,first,i64(output.len)) }; return false
+    }
+    publish_metered(path,key,&output,first,&mut meter)
+}
+fn payload_header(data: &[]i64, policy: i32) -> i32 {
+    if data.len < 3 { return -1 }
+    if data[0] == 1146439236 {
+        if policy == 0 || data.len < 7 || data[1] != 1 { return -1 }
+        return 7
+    }
+    if policy == 1 { return -1 }; 3
+}
+fn validate_payload(data: &[]i64, header: i32, globals: i32, declaration_limit: i32, available_global_words: i32,
+    base: i32, first_label: i32, first_relocation: i32) -> bool {
+    if header < 0 { return false }
+    var word_count := data[0]; var label_count := data[1]; var relocation_count := data[2]
+    var dependency_count: i64 = 0; var charge: i64 = 0
+    if header == 7 { word_count=data[2]; label_count=data[3]; relocation_count=data[4]; dependency_count=data[5]; charge=data[6] }
+    if word_count == 0 || dependency_count > 256 || charge > 4096 || charge > i64(available_global_words) { return false }
+    if i64(header)+word_count+label_count+relocation_count*3+dependency_count != i64(data.len) || word_count>i64(2147483647-base) || label_count>i64(2147483647-first_label) || relocation_count>i64(2147483647-first_relocation) { return false }
+    words:=i32(word_count); labels:=i32(label_count); relocations:=i32(relocation_count); count:=i32(dependency_count)
+    label_start:=header+words; relocation_start:=label_start+labels; declaration_start:=relocation_start+relocations*3
     var previous: i64 = -1
     for i in 0..count {
-        declaration := data[declaration_start + i]
-        if declaration <= previous || declaration >= i64(declaration_limit) { return false }
-        previous = declaration
+        declaration:=data[declaration_start+i]
+        if declaration<=previous || declaration>=i64(declaration_limit) { return false }; previous=declaration
     }
+    for i in 0..labels { offset:=data[label_start+i]; if offset!=4294967295 && offset>i64(words) { return false } }
+    for i in 0..relocations {
+        at:=data[relocation_start+i*3]; target:=data[relocation_start+i*3+1]; kind:=data[relocation_start+i*3+2]
+        if at>=i64(words) || kind>20 || (kind>=2 && at+1>=i64(words)) { return false }
+        if target>=2147483648 { if target-2147483648>=i64(globals) { return false } }
+        else if target>=i64(labels) || data[label_start+i32(target)]==4294967295 { return false }
+    }
+    true
+}
+fn commit_payload(code: &mut arm.Code, entry: i32, data: &[]i64, header: i32,
+    dependencies: &mut Dependencies, replace_dependencies: bool) {
+    var words:=i32(data[0]); var labels:=i32(data[1]); var relocations:=i32(data[2])
+    if header==7 { words=i32(data[2]); labels=i32(data[3]); relocations=i32(data[4]) }
+    label_start:=header+words; relocation_start:=label_start+labels; declaration_start:=relocation_start+relocations*3
+    base:=code.words.len; first:=code.labels.len
+    arm.mark(&mut code,entry)
+    for i in 0..words { code.words.push(data[header+i]) }
     for i in 0..labels {
-        offset := data[label_start + i]
-        if offset != 4294967295 && offset > i64(words) { return false }
+        offset:=data[label_start+i]
+        if offset==4294967295 { code.labels.push(-1) } else { code.labels.push(base+i32(offset)) }
     }
     for i in 0..relocations {
-        at := data[relocation_start + i * 3]; target := data[relocation_start + i * 3 + 1]; kind := data[relocation_start + i * 3 + 2]
-        if at >= i64(words) || kind > 20 || (kind >= 2 && at + 1 >= i64(words)) { return false }
-        if target >= 2147483648 {
-            if target - 2147483648 >= i64(globals) { return false }
-        } else if target >= i64(labels) || data[label_start + i32(target)] == 4294967295 { return false }
+        destination:=data[relocation_start+i*3+1]; var target:=0
+        if destination>=2147483648 { target=i32(destination-2147483648) } else { target=first+i32(destination) }
+        code.at.push(base+i32(data[relocation_start+i*3]));code.kinds.push(i32(data[relocation_start+i*3+2]));code.target.push(target)
     }
-    var accepted := new_dependencies()
-    for i in 0..count { accepted.declarations.push(i32(data[declaration_start + i])) }
-    accepted.charged_words = i32(charged_words)
-    // All metadata and relocations have been checked. Commit code and output
-    // dependencies only now; every false return above leaves both untouched.
-    base := code.words.len; first := code.labels.len
-    arm.mark(&mut code, entry)
-    for i in 0..words { code.words.push(data[header + i]) }
-    for i in 0..labels {
-        offset := data[label_start + i]
-        if offset == 4294967295 { code.labels.push(-1) } else { code.labels.push(base + i32(offset)) }
+    if replace_dependencies {
+        // Validated before either output mutates. Reuse caller-owned capacity;
+        // no per-function observer or temporary Dependencies record is needed.
+        dependencies.declarations.clear(); dependencies.charged_words=0
+        if header==7 {
+            for i in 0..i32(data[5]) { dependencies.declarations.push(i32(data[declaration_start+i])) }
+            dependencies.charged_words=i32(data[6])
+        }
     }
-    for i in 0..relocations {
-        destination := data[relocation_start + i * 3 + 1]
-        var target := 0
-        if destination >= 2147483648 { target = i32(destination - 2147483648) } else { target = first + i32(destination) }
-        code.at.push(base + i32(data[relocation_start + i * 3])); code.kinds.push(i32(data[relocation_start + i * 3 + 2])); code.target.push(target)
-    }
-    dependencies = accepted; true
 }
-pub fn restore_with_dependencies(code: &mut arm.Code, globals: i32, entry: i32,
-    path: string, key: string, declaration_limit: i32, available_global_words: i32,
-    dependencies: &mut Dependencies) -> bool {
-    restore_dependencies(&mut code,globals,entry,path,key,declaration_limit,available_global_words,&mut dependencies,false)
+fn restore_engine(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string,
+    declaration_limit: i32, available_global_words: i32, dependencies: &mut Dependencies, policy: i32, meter: &mut Meter) -> bool {
+    if policy<0 || policy>2 || !valid_key(key) || declaration_limit<0 || available_global_words<0 || code.checking { return false }
+    if globals<0 || globals>code.labels.len || entry<0 || entry>=code.labels.len || code.labels[entry]!=-1 || code.at.len!=code.target.len || code.at.len!=code.kinds.len { return false }
+    var first: i64 = -1; if meter.enabled { first=meter_begin(&meter) }
+    var minimum:=152; if policy==1 { minimum=184 }
+    info:=sys.metadata(path)
+    if !info.is_file || info.size<i64(minimum) || info.size>67108864 {
+        if meter.enabled { meter_finish(&mut meter,2,first,0) }; return false
+    }
+    read:=sys.read_text(path)
+    if meter.enabled { meter_finish(&mut meter,2,first,i64(read.value.len)); first=meter_begin(&meter) }
+    if !read.ok || read.value.len<minimum || read.value.len>67108864 {
+        if meter.enabled { meter_finish(&mut meter,3,first,0) }; return false
+    }
+    if read.value[0..64]!=key { if meter.enabled { meter_finish(&mut meter,3,first,0) }; return false }
+    payload:=read.value[128..read.value.len]
+    signature_ok:=read.value[64..128]==cache_io.digest(key+payload)
+    if meter.enabled { meter_finish(&mut meter,3,first,i64(key.len)+i64(payload.len)) }
+    if !signature_ok { return false }
+    if meter.enabled { first=meter_begin(&meter) }
+    data:=values(payload)
+    if meter.enabled { meter_finish(&mut meter,4,first,i64(payload.len)); first=meter_begin(&meter) }
+    header:=payload_header(&data,policy)
+    valid:=validate_payload(&data,header,globals,declaration_limit,available_global_words,code.words.len,code.labels.len,code.at.len)
+    if meter.enabled { meter_finish(&mut meter,5,first,i64(data.len)) }
+    if !valid { return false }
+    var words:=data[0]; if header==7 { words=data[2] }
+    if meter.enabled { first=meter_begin(&meter) }
+    commit_payload(&mut code,entry,&data,header,&mut dependencies,policy!=0)
+    if meter.enabled { meter_finish(&mut meter,6,first,words) }
+    true
 }
-// One read/decode for the common scalar native3 cache as well as DUFD. A
-// successful native3 restore commits empty dependency metadata and zero charge.
-// Failed restores preserve both outputs; strict DUFD restoration stays separate.
-pub fn restore_cached_with_dependencies(code: &mut arm.Code, globals: i32, entry: i32,
-    path: string, key: string, declaration_limit: i32, available_global_words: i32,
-    dependencies: &mut Dependencies) -> bool {
-    restore_dependencies(&mut code,globals,entry,path,key,declaration_limit,available_global_words,&mut dependencies,true)
+pub fn restore_metered(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string,
+    scratch: &mut Dependencies, meter: &mut Meter) -> bool {
+    restore_engine(&mut code,globals,entry,path,key,2147483647,2147483647,&mut scratch,0,&mut meter)
+}
+pub fn restore_with_dependencies_metered(code: &mut arm.Code, globals: i32, entry: i32,
+    path: string, key: string, declaration_limit: i32, available_global_words: i32, dependencies: &mut Dependencies, meter: &mut Meter) -> bool {
+    restore_engine(&mut code,globals,entry,path,key,declaration_limit,available_global_words,&mut dependencies,1,&mut meter)
+}
+pub fn restore_cached_with_dependencies_metered(code: &mut arm.Code, globals: i32, entry: i32,
+    path: string, key: string, declaration_limit: i32, available_global_words: i32, dependencies: &mut Dependencies, meter: &mut Meter) -> bool {
+    restore_engine(&mut code,globals,entry,path,key,declaration_limit,available_global_words,&mut dependencies,2,&mut meter)
+}
+// Compatibility APIs; production compilation passes one external meter and
+// scratch dependency object through the configured entrypoints above.
+pub fn save(code: &arm.Code, begin: Start, globals: i32, path: string, key: string) {
+    var meter:=new_meter(-1); saved:=save_metered(&code,begin,globals,path,key,&mut meter)
+}
+pub fn save_with_dependencies(code: &arm.Code, begin: Start, globals: i32, path: string, key: string, dependencies: &Dependencies, declaration_limit: i32) -> bool {
+    var meter:=new_meter(-1);save_with_dependencies_metered(&code,begin,globals,path,key,&dependencies,declaration_limit,&mut meter)
+}
+pub fn restore(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string) -> bool {
+    var meter:=new_meter(-1);var scratch:=new_dependencies();restore_metered(&mut code,globals,entry,path,key,&mut scratch,&mut meter)
+}
+pub fn restore_with_dependencies(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string, declaration_limit: i32, available_global_words: i32, dependencies: &mut Dependencies) -> bool {
+    var meter:=new_meter(-1);restore_with_dependencies_metered(&mut code,globals,entry,path,key,declaration_limit,available_global_words,&mut dependencies,&mut meter)
+}
+pub fn restore_cached_with_dependencies(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string, declaration_limit: i32, available_global_words: i32, dependencies: &mut Dependencies) -> bool {
+    var meter:=new_meter(-1);restore_cached_with_dependencies_metered(&mut code,globals,entry,path,key,declaration_limit,available_global_words,&mut dependencies,&mut meter)
 }
