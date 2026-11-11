@@ -19,6 +19,7 @@ import opt_ir
 import opt_parse
 import opt_pass
 import opt_emit
+import opt_inline
 import opt_verify
 import opt_range
 import scalar_rules as rules
@@ -33,16 +34,20 @@ fn imports() -> Imports { Imports { globals: 0, libraries: [], symbols: [], site
 pub struct Bindings {
     reused: i32, emitted: i32, offsets: []i32, names: []string, types: []string,
     modeled: i32, optimized: i32, rewrites: i32, proven_bounds: i32, fallbacks: i32,
+    inline_entries: i32, inline_nodes: i32, inline_tokens: i32, inline_units: i32,
+    inlined_calls: i32, inlined_words: i32, inline_estimated_words: i32,
     profile: profile.Profile,
 }
 pub fn bindings() -> Bindings {
     Bindings { reused: 0, emitted: 0, offsets: [], names: [], types: [],
         modeled: 0, optimized: 0, rewrites: 0, proven_bounds: 0, fallbacks: 0,
+        inline_entries: 0, inline_nodes: 0, inline_tokens: 0, inline_units: 0,
+        inlined_calls: 0, inlined_words: 0, inline_estimated_words: 0,
         profile: profile.new(-1) }
 }
 pub struct Result { ok: bool, error: string, offset: i32, text: []u8, imports: Imports }
-pub struct Configuration { scalar_enabled: bool, ownership_enabled: bool, const_div_enabled: bool, frame_free_enabled: bool, range_enabled: bool, profile_host: i32, instrument_runtime: bool }
-pub fn configuration() -> Configuration { Configuration { scalar_enabled: true, ownership_enabled: true, const_div_enabled: true, frame_free_enabled: true, range_enabled: true, profile_host: -1, instrument_runtime: false } }
+pub struct Configuration { scalar_enabled: bool, ownership_enabled: bool, const_div_enabled: bool, frame_free_enabled: bool, range_enabled: bool, inline_enabled: bool, profile_host: i32, instrument_runtime: bool }
+pub fn configuration() -> Configuration { Configuration { scalar_enabled: true, ownership_enabled: true, const_div_enabled: true, frame_free_enabled: true, range_enabled: true, inline_enabled: false, profile_host: -1, instrument_runtime: false } }
 struct Compiler {
     tokens: lexer.Tokens, closes: []i32, block_end: i32, tail: bool, block_depth: i32, cursor: i32, ok: bool, error: string, error_at: i32,
     test_functions: []bool, testing: bool, mutations: []i32, postfix_stop: i32,
@@ -60,7 +65,7 @@ struct Compiler {
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
     cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool, owner_elided: []bool, loop_owners: []i32,
     expr_owner: i32, expr_type: i32, array_take: i32,
-    scalar_enabled: bool, ownership_enabled: bool, range_enabled: bool, lease_starts: []i32, lease_ends: []i32,
+    scalar_enabled: bool, ownership_enabled: bool, range_enabled: bool, inline_enabled: bool, inline_caller_words: i32, inline_global_words: i32, lease_starts: []i32, lease_ends: []i32,
     scalar_names: []string, scalar_types: []i32, scalar_tokens: []i32,
     scope: i32, slots: i32, ret_type: i32, depth: i32,
     loop_heads: []i32, loop_ends: []i32,
@@ -492,7 +497,7 @@ fn literal(c: &mut Compiler, spelling: string, expected: i32) -> i32 {
     arm.imm(&mut c.code, 0, value.value)
     ty
 }
-fn intrinsic(c: &mut Compiler, name: string, expected: i32) -> i32 {
+fn intrinsic(c: &mut Compiler, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     var target := -1; var ret := expected
     if name == "__sys_arg_count" { target = c.runtime.sys_arg_count; ret = 1 }
     else if name == "__sys_arg" { target = c.runtime.sys_arg; ret = 4 }
@@ -519,7 +524,7 @@ fn intrinsic(c: &mut Compiler, name: string, expected: i32) -> i32 {
             var elem := 1; if name == "__sys_write_u8" || name == "__sys_decode_u8" { elem = 8 }
             array := compound(&mut c, 1, elem); want = compound(&mut c, 4, array)
         }
-        ty := expression(&mut c, 0, want)
+        ty := expression(&mut c, 0, want, &catalog, &mut inline_work)
         if want != 0 { same(&mut c, want, ty); load_mem(&mut c, 0, 0, 0) }
         arm.push(&mut c.code, 0); count = count + 1
         if !eat(&mut c, ",") { break }
@@ -606,12 +611,12 @@ fn wasm_signature(c: &mut Compiler, ty: i32) -> i32 {
 }
 // The callee address is in x0. Stage arguments in frame slots before populating
 // the independent scalar and float register banks, then the aligned stack.
-fn foreign_call(c: &mut Compiler, sig: i32) -> i32 {
+fn foreign_call(c: &mut Compiler, sig: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     if !c.unsafe_scope { fail(&mut c, "foreign call requires unsafe"); return 0 }
     callee := slot(&mut c); arm.store(&mut c.code, callee, 0)
     if c.code.platform == 3 {
         index := wasm_signature(&mut c, sig)
-        return invoke(&mut c, sig, callee, -1, index)
+        return invoke(&mut c, sig, callee, -1, index, &catalog, &mut inline_work)
     }
     first := c.type_starts[sig]; count := c.type_counts[sig]
     var values: []i32 = []; var locations: []i32 = []
@@ -628,7 +633,7 @@ fn foreign_call(c: &mut Compiler, sig: i32) -> i32 {
     while c.ok && !is(&c, ")") {
         if values.len == count { fail(&mut c, "too many C call arguments"); return 0 }
         want := c.ffi_params[first + values.len]
-        actual := expression(&mut c, 0, want); same(&mut c, want, actual)
+        actual := expression(&mut c, 0, want, &catalog, &mut inline_work); same(&mut c, want, actual)
         aggregate := c.c_record[want]
         if aggregate {
             if hfa(&c, want, 0) == 0 { fail(&mut c, "unsupported foreign aggregate parameter"); return 0 }
@@ -914,7 +919,7 @@ fn raw_memory_type(c: &Compiler, name: string, start: i32) -> i32 {
     ty := type_id(&c, name[start..name.len])
     if ty < 0 || !foreign_scalar(&c, ty) { return -1 }; ty
 }
-fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
+fn call(c: &mut Compiler, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     expect(&mut c, "(")
     if c.code.platform == 3 && name.len >= 6 && name[0..6] == "__sys_" && name != "__sys_decode_utf8" && name != "__sys_decode_u8" { fail(&mut c, "native system calls need a native target"); return 0 }
     if name == "size_of" || name == "align_of" {
@@ -972,13 +977,13 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         require_unsafe(&mut c)
         if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "cstr needs a string literal"); return 0 }
         value := peek(&c); for i in 0..value.len { if value[i] == 0 { fail(&mut c, "cstr contains an embedded NUL") } }
-        arg := primary_inner(&mut c, 4); expect(&mut c, ")")
+        arg := primary_inner(&mut c, 4, &catalog, &mut inline_work); expect(&mut c, ")")
         arm.emit(&mut c.code, 2432704512); return 13
     }
     if name == "addr" {
         arm.barrier(&mut c.code)
         require_unsafe(&mut c); expect(&mut c, "&"); write := eat(&mut c, "mut")
-        first := c.cursor; ty := primary(&mut c, 0)
+        first := c.cursor; ty := primary(&mut c, 0, &catalog, &mut inline_work)
         base := borrows.place(&c.tokens, first, c.cursor)
         if base < 0 { fail(&mut c, "addr requires a stored place"); return 0 }
         if write { c.mutations.push(base) }
@@ -996,7 +1001,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     if name == "ptr" || name == "ffi_fn" || name == "ref_at" {
         arm.barrier(&mut c.code)
         require_unsafe(&mut c); var want := 13; if name == "ptr" { want = 12 }
-        ty := expression(&mut c, 0, want); same(&mut c, want, ty); expect(&mut c, ")")
+        ty := expression(&mut c, 0, want, &catalog, &mut inline_work); same(&mut c, want, ty); expect(&mut c, ")")
         if name == "ptr" { return 13 }
         if name == "ffi_fn" { if c.type_kinds[expected] != 8 { fail(&mut c,"ffi_fn needs an extern fn type") }; return expected }
         if c.type_kinds[expected] != 4 && c.type_kinds[expected] != 5 { fail(&mut c,"ref_at needs a reference parameter type"); return 0 }
@@ -1004,23 +1009,23 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     }
     if name.len > 5 && name[0..5] == "load_" && raw_memory_type(&c, name, 5) >= 0 {
         require_unsafe(&mut c); ty := raw_memory_type(&c, name, 5)
-        a := expression(&mut c, 0, 13); same(&mut c, 13, a); expect(&mut c, ")"); transfer_c(&mut c, ty, 0, 0, true); return ty
+        a := expression(&mut c, 0, 13, &catalog, &mut inline_work); same(&mut c, 13, a); expect(&mut c, ")"); transfer_c(&mut c, ty, 0, 0, true); return ty
     }
     if name.len > 6 && name[0..6] == "store_" && raw_memory_type(&c, name, 6) >= 0 {
         arm.barrier(&mut c.code) // Inline source write, including void intrinsics.
         require_unsafe(&mut c); ty := raw_memory_type(&c, name, 6)
-        a := expression(&mut c, 0, 13); same(&mut c, 13, a); expect(&mut c, ","); arm.push(&mut c.code, 0)
-        b := expression(&mut c, 0, ty); same(&mut c, ty, b); expect(&mut c, ")")
+        a := expression(&mut c, 0, 13, &catalog, &mut inline_work); same(&mut c, 13, a); expect(&mut c, ","); arm.push(&mut c.code, 0)
+        b := expression(&mut c, 0, ty, &catalog, &mut inline_work); same(&mut c, ty, b); expect(&mut c, ")")
         arm.pop(&mut c.code, 1); transfer_c(&mut c, ty, 0, 1, false); return 0
     }
-    if name.len >= 6 && name[0..6] == "__sys_" { return intrinsic(&mut c, name, expected) }
+    if name.len >= 6 && name[0..6] == "__sys_" { return intrinsic(&mut c, name, expected, &catalog, &mut inline_work) }
     if name == "len" {
-        ty := expression(&mut c, 0, 0)
+        ty := expression(&mut c, 0, 0, &catalog, &mut inline_work)
         expect(&mut c, ")")
         return length_value(&mut c, ty)
     }
     if name == "print" {
-        ty := expression(&mut c, 0, 0); expect(&mut c, ")")
+        ty := expression(&mut c, 0, 0, &catalog, &mut inline_work); expect(&mut c, ")")
         if c.code.platform == 3 {
             if ty < 1 || ty > 12 { fail(&mut c, "print requires a scalar value"); return 0 }
             arm.emit(&mut c.code, 4227858432 + i64(ty)); return 0
@@ -1033,7 +1038,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         if target == c.print_int { if unsigned.has(ty) { arm.imm(&mut c.code, 8, 1) } else { arm.imm(&mut c.code, 8, 0) } }
         arm.branch(&mut c.code, target, 1); return 0
     }
-    if name == "assert" { ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); expect(&mut c, ")"); arm.branch(&mut c.code, c.assertion, 18); return 0 }
+    if name == "assert" { ty := expression(&mut c, 0, 3, &catalog, &mut inline_work); same(&mut c, 3, ty); expect(&mut c, ")"); arm.branch(&mut c.code, c.assertion, 18); return 0 }
     if name == "i32" || name == "i64" || name == "rune" || floats.has(type_id(&c, name)) || unsigned.has(type_id(&c, name)) {
         hint := type_id(&c, name)
         var argument_hint := 0
@@ -1041,7 +1046,7 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
         if (c.tokens.kinds[literal_at] == .Integer || c.tokens.kinds[literal_at] == .Float) && c.tokens.texts[literal_at + 1] == ")" {
             if floats.has(hint) || c.tokens.kinds[literal_at] == .Integer { argument_hint = hint }
         }
-        ty := expression(&mut c, 0, argument_hint); expect(&mut c, ")")
+        ty := expression(&mut c, 0, argument_hint, &catalog, &mut inline_work); expect(&mut c, ")")
         if floats.has(ty) || floats.has(hint) {
             if (!floats.has(ty) && ty != 1 && ty != 2 && !unsigned.has(ty)) || hint == 5 { fail(&mut c, "expected a numeric conversion"); return hint }
             floats.cast(&mut c.code, ty, hint, c.float_trap); return hint
@@ -1061,10 +1066,10 @@ fn call(c: &mut Compiler, name: string, expected: i32) -> i32 {
     } else {
         if f < 0 { fail(&mut c, "unknown function '" + name + "'"); c.error_at = c.tokens.starts[c.cursor - 2]; return 0 }
         if c.unsafe_functions[f] && !c.unsafe_scope { fail(&mut c, "call requires unsafe"); return 0 }
-        if c.libraries[f] != "" { import_address(&mut c, f); return foreign_call(&mut c, c.ffi_types[f]) }
+        if c.libraries[f] != "" { import_address(&mut c, f); return foreign_call(&mut c, c.ffi_types[f], &catalog, &mut inline_work) }
         c.needed[f] = true; signature = c.ffi_types[f]
     }
-    invoke(&mut c, signature, address, f, -1)
+    invoke(&mut c, signature, address, f, -1, &catalog, &mut inline_work)
 }
 // Fragments omit parameter effects. Recheck only bodies that can create or
 // forward a region borrow when the program uses regions.
@@ -1100,7 +1105,7 @@ fn forward_loan(c: &mut Compiler, origin: i32, f: i32, signature: i32, parameter
         scratch.indirect(&mut c.loans, origin, signature, parameter, at)
     }
 }
-fn invoke(c: &mut Compiler, signature: i32, address: i32, f: i32, wasm_sig: i32) -> i32 {
+fn invoke(c: &mut Compiler, signature: i32, address: i32, f: i32, wasm_sig: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     first := c.type_starts[signature]; count := c.type_counts[signature]
     first_writeback := c.scratch_returns.len
     var provided := 0; var args: []i32 = []; var arg_starts: []i32 = []; var arg_ends: []i32 = []; var effects: []i32 = []
@@ -1109,7 +1114,7 @@ fn invoke(c: &mut Compiler, signature: i32, address: i32, f: i32, wasm_sig: i32)
         argument := c.cursor
         arg_starts.push(argument); effects.push(c.mutations.len)
         want := c.ffi_params[first + provided]
-        ty := expression(&mut c, 0, want); same(&mut c, want, ty); take_value(&mut c, ty)
+        ty := expression(&mut c, 0, want, &catalog, &mut inline_work); same(&mut c, want, ty); take_value(&mut c, ty)
         if c.loans.active && (c.type_kinds[want] == 4 || c.type_kinds[want] == 5) {
             origin := loan_origin(&c, argument, c.cursor)
             var callee := f; if address >= 0 { callee = -1 }
@@ -1156,8 +1161,27 @@ fn invoke(c: &mut Compiler, signature: i32, address: i32, f: i32, wasm_sig: i32)
         // A later argument may have replaced a heap-backed record. Re-resolve
         // the pure field borrow after it, as the source-level place is stable.
         if refresh {
-            refreshed := replay_place(&mut c, arg_starts[arg], arg_ends[arg], want)
+            refreshed := replay_place(&mut c, arg_starts[arg], arg_ends[arg], want, &catalog, &mut inline_work)
             arm.store(&mut c.code, args[arg], 0)
+        }
+    }
+    if c.inline_enabled && !c.validating_dead && !c.code.checking && f >= 0 && address < 0 && wasm_sig < 0 &&
+        c.inline_caller_words > 0 && c.inline_global_words > 0 && opt_inline.find(&catalog, f) >= 0 {
+        var arg_types: []i32 = []
+        for p in 0..provided { arg_types.push(c.ffi_params[first + p]) }
+        var budget := c.inline_caller_words
+        if c.inline_global_words < budget { budget = c.inline_global_words }
+        if opt_inline.prepare(&mut inline_work, &catalog, f, address, &arg_types, c.type_bases[signature], &args, c.slots, c.code.platform, budget) {
+            estimate := opt_inline.word_estimate(&inline_work)
+            first_word := arm.position(&c.code)
+            if opt_inline.emit_prepared_configured(&mut inline_work, &mut c.code, &catalog, c.overflow, c.zero, c.bounds) {
+                c.inline_caller_words = c.inline_caller_words - estimate
+                c.inline_global_words = c.inline_global_words - estimate
+                c.bindings.inlined_calls = c.bindings.inlined_calls + 1
+                c.bindings.inlined_words = c.bindings.inlined_words + arm.position(&c.code) - first_word
+                c.bindings.inline_estimated_words = c.bindings.inline_estimated_words + estimate
+                return c.type_bases[signature]
+            }
         }
     }
     var i := provided - 1
@@ -1198,20 +1222,20 @@ fn read_only_index(tokens: &lexer.Tokens, first: i32) -> bool {
     }
     false
 }
-fn primary(c: &mut Compiler, expected: i32) -> i32 {
+fn primary(c: &mut Compiler, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
     c.address = -1; c.writable = false; c.scratch_place = 0; c.expr_owner = -1; c.expr_type = -1
     first_token := c.cursor
-    var ty := primary_inner(&mut c, expected)
+    var ty := primary_inner(&mut c, expected, &catalog, &mut inline_work)
     while c.ok && c.cursor != c.postfix_stop && (is(&c, ".") || is(&c, "[") || is(&c, "(")) {
         // Projection results borrow their receiver's storage. A call or slice
         // below may establish a new complete temporary of its own.
         c.expr_owner = -1; c.expr_type = -1
         if eat(&mut c, "(") {
-            if c.type_kinds[ty] == 8 { ty = foreign_call(&mut c, ty) }
+            if c.type_kinds[ty] == 8 { ty = foreign_call(&mut c, ty, &catalog, &mut inline_work) }
             else if c.type_kinds[ty] == 9 {
-                callee := slot(&mut c); arm.store(&mut c.code, callee, 0); ty = invoke(&mut c, ty, callee, -1, -1)
+                callee := slot(&mut c); arm.store(&mut c.code, callee, 0); ty = invoke(&mut c, ty, callee, -1, -1, &catalog, &mut inline_work)
             } else { fail(&mut c, "this value is not callable for the selected target"); return 0 }
             ty = temporary(&mut c, ty); c.address = -1; c.writable = false
         } else if eat(&mut c, "[") {
@@ -1220,20 +1244,20 @@ fn primary(c: &mut Compiler, expected: i32) -> i32 {
             if ty == 4 && !read_only_index(&c.tokens, c.cursor) { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
             arm.push(&mut c.code, 0)
             index_start := c.cursor; effects := c.mutations.len
-            index_type := expression(&mut c, 1, 1); same(&mut c, 1, index_type)
+            index_type := expression(&mut c, 1, 1, &catalog, &mut inline_work); same(&mut c, 1, index_type)
             if collection(&c, ty) {
                 base := borrows.place(&c.tokens, first_token, index_start - 1)
                 if borrows.changed(&c.tokens, &c.mutations, effects, c.mutations.len, base) {
                     // The index ran once. Load the current descriptor before
                     // checking its bounds and locating the element.
                     arm.mov(&mut c.code, 1, 0); arm.pop(&mut c.code, 0); arm.push(&mut c.code, 1)
-                    reloaded := replay_place(&mut c, first_token, index_start - 1, ty)
+                    reloaded := replay_place(&mut c, first_token, index_start - 1, ty, &catalog, &mut inline_work)
                     arm.pop(&mut c.code, 1); arm.push(&mut c.code, 0); arm.mov(&mut c.code, 0, 1)
                 }
             }
             if eat(&mut c, "..") {
                 if ty != 4 { fail(&mut c, "slice requires a string") }
-                arm.push(&mut c.code, 0); last := expression(&mut c, 0, 1); same(&mut c, 1, last); expect(&mut c, "]")
+                arm.push(&mut c.code, 0); last := expression(&mut c, 0, 1, &catalog, &mut inline_work); same(&mut c, 1, last); expect(&mut c, "]")
                 arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0); arm.branch(&mut c.code, c.runtime.string_slice, 1); saved_string := temporary(&mut c, 4)
                 c.address = -1; c.writable = false; continue
             }
@@ -1257,7 +1281,7 @@ fn primary(c: &mut Compiler, expected: i32) -> i32 {
             expect(&mut c, "."); name := advance(&mut c)
             // Callable fields go through ordinary field access and the postfix
             // call below, sharing argument and alias checks with local callbacks.
-            if is(&c, "(") && !(c.type_kinds[ty] == 2 && field(&c, ty, name) >= 0) { result := method(&mut c, ty, name, first_token, c.cursor - 2); ty = temporary(&mut c, result); c.address = -1; c.writable = false }
+            if is(&c, "(") && !(c.type_kinds[ty] == 2 && field(&c, ty, name) >= 0) { result := method(&mut c, ty, name, first_token, c.cursor - 2, &catalog, &mut inline_work); ty = temporary(&mut c, result); c.address = -1; c.writable = false }
             else if name == "len" && (ty == 4 || collection(&c, ty) || c.type_kinds[ty]==21) {
                 ty = length_value(&mut c, ty); c.address = -1; c.writable = false
             } else if c.type_kinds[ty] == 2 {
@@ -1276,7 +1300,7 @@ fn primary(c: &mut Compiler, expected: i32) -> i32 {
     c.depth = c.depth - 1; ty
 }
 fn enum_type(c: &Compiler, ty: i32) -> bool { ty >= 0 && (c.type_kinds[ty] == 3 || c.type_kinds[ty] == 7) }
-fn enumeration(c: &mut Compiler, ty: i32) -> i32 {
+fn enumeration(c: &mut Compiler, ty: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     name := advance(&mut c)
     if !enum_type(&c, ty) { fail(&mut c, "enum variant needs a type"); return 0 }
     found := field(&c, ty, name)
@@ -1290,21 +1314,21 @@ fn enumeration(c: &mut Compiler, ty: i32) -> i32 {
         for i in 0..count {
             if i > 0 { expect(&mut c, ",") }
             pt := c.payload_types[c.payload_starts[found] + i]
-            actual := expression(&mut c, 0, pt); same(&mut c, pt, actual); take_value(&mut c, pt)
+            actual := expression(&mut c, 0, pt, &catalog, &mut inline_work); same(&mut c, pt, actual); take_value(&mut c, pt)
             arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, index); store_mem(&mut c, 1, 0, (i + 1) * 8)
         }
         expect(&mut c, ")")
     }
     arm.load(&mut c.code, index); c.address = -1; c.writable = false; temporary(&mut c, ty)
 }
-fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
+fn primary_inner(c: &mut Compiler, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     if !c.ok { return 0 }
     if eat(&mut c, "&") {
         arm.barrier(&mut c.code) // Borrowed storage becomes visible to a receiver.
         mutable := eat(&mut c, "mut")
         var kind := 4; if mutable { kind = 5 }
         if c.type_kinds[expected] != kind { fail(&mut c, "use & for a shared parameter or &mut for a mutable parameter"); return 0 }
-        start := c.cursor; var ty := primary(&mut c, 0)
+        start := c.cursor; var ty := primary(&mut c, 0, &catalog, &mut inline_work)
         base := borrows.place(&c.tokens, start, c.cursor)
         if base < 0 { fail(&mut c, "borrow a named variable, field or array element"); return 0 }
         if mutable { c.mutations.push(base) }
@@ -1331,22 +1355,22 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
     }
     if eat(&mut c, "-") {
         if c.tokens.kinds[c.cursor] == .Integer { spelling := "-" + advance(&mut c); return literal(&mut c, spelling, expected) }
-        ty := primary(&mut c, expected)
+        ty := primary(&mut c, expected, &catalog, &mut inline_work)
         if floats.has(ty) { result := floats.method(&mut c.code, ty, "negate"); c.address = -1; c.writable = false; return result }
         if ty != 1 && ty != 2 { fail(&mut c, "minus requires a signed number") }
         arm.emit(&mut c.code, 3942646752); arm.branch(&mut c.code, c.overflow, 8); if ty == 1 { narrow(&mut c) }; c.address = -1; c.writable = false; return ty
     }
-    if eat(&mut c, "!") { ty := primary(&mut c, 3); same(&mut c, 3, ty); arm.emit(&mut c.code, 3944677407); arm.emit(&mut c.code, 2594117600); c.address = -1; c.writable = false; return 3 }
-    if eat(&mut c, "(") { ty := expression(&mut c, 0, expected); expect(&mut c, ")"); return ty }
+    if eat(&mut c, "!") { ty := primary(&mut c, 3, &catalog, &mut inline_work); same(&mut c, 3, ty); arm.emit(&mut c.code, 3944677407); arm.emit(&mut c.code, 2594117600); c.address = -1; c.writable = false; return 3 }
+    if eat(&mut c, "(") { ty := expression(&mut c, 0, expected, &catalog, &mut inline_work); expect(&mut c, ")"); return ty }
     if eat(&mut c, "true") { arm.imm(&mut c.code, 0, 1); return 3 }
     if eat(&mut c, "false") { arm.imm(&mut c.code, 0, 0); return 3 }
-    if eat(&mut c, ".") { return enumeration(&mut c, expected) }
+    if eat(&mut c, ".") { return enumeration(&mut c, expected, &catalog, &mut inline_work) }
     if eat(&mut c, "[") {
         var base := 0; if collection(&c, expected) { base = c.type_bases[expected] }
         var count := 0; var repeated := false
         stride_word := arm.position(&c.code); arm.imm(&mut c.code, 2, 3); arm.branch(&mut c.code, c.runtime.array_new, 1); saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
         while c.ok && !is(&c, "]") {
-            ty := expression(&mut c, 0, base); if base == 0 { base = ty } else { same(&mut c, base, ty) }
+            ty := expression(&mut c, 0, base, &catalog, &mut inline_work); if base == 0 { base = ty } else { same(&mut c, base, ty) }
             if count == 0 && eat(&mut c, ";") {
                 repeated = true; count = length_literal(&mut c)
                 item := slot(&mut c); left := slot(&mut c); arm.store(&mut c.code, item, 0)
@@ -1390,14 +1414,14 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         if floats.has(nominal) && eat(&mut c, ".") {
             expect(&mut c, "from_bits"); expect(&mut c, "(")
             var bits := 2; if nominal == 6 { bits = 1 }
-            actual := expression(&mut c, 0, bits); same(&mut c, bits, actual); expect(&mut c, ")")
+            actual := expression(&mut c, 0, bits, &catalog, &mut inline_work); same(&mut c, bits, actual); expect(&mut c, ")")
             if nominal == 6 { arm.emit(&mut c.code, 704644064) }
             return nominal
         }
-        if enum_type(&c, nominal) && eat(&mut c, ".") { return enumeration(&mut c, nominal) }
+        if enum_type(&c, nominal) && eat(&mut c, ".") { return enumeration(&mut c, nominal, &catalog, &mut inline_work) }
         if enum_type(&c, nominal) && eat(&mut c, "(") {
             if c.type_kinds[nominal] != 3 { fail(&mut c, "a data enum requires a variant"); return nominal }
-            actual := expression(&mut c, 0, 1); same(&mut c, 1, actual); expect(&mut c, ")")
+            actual := expression(&mut c, 0, 1, &catalog, &mut inline_work); same(&mut c, 1, actual); expect(&mut c, ")")
             valid := arm.label(&mut c.code)
             first := c.type_starts[nominal]
             for field in first..first+c.type_counts[nominal] {
@@ -1419,7 +1443,7 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
                 if found < 0 { fail(&mut c, "unknown constructor field"); break }
                 offset := found - c.type_starts[nominal]
                 if provided[offset] { fail(&mut c, "duplicate constructor field") }; provided[offset] = true
-                ty := expression(&mut c, 0, c.field_types[found]); same(&mut c, c.field_types[found], ty)
+                ty := expression(&mut c, 0, c.field_types[found], &catalog, &mut inline_work); same(&mut c, c.field_types[found], ty)
                 if c.c_record[nominal] {
                     arm.push(&mut c.code,0); arm.load(&mut c.code,saved); c_offset(&mut c,c.field_values[found])
                     arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); store_inline(&mut c,ty)
@@ -1435,10 +1459,10 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
         if is(&c, "(") {
             if found >= 0 && c.type_kinds[c.local_types[found]] == 8 {
                 sig := c.local_types[found]
-                expect(&mut c,"("); arm.load(&mut c.code,c.local_slots[found]); result := foreign_call(&mut c,sig)
+                expect(&mut c,"("); arm.load(&mut c.code,c.local_slots[found]); result := foreign_call(&mut c,sig, &catalog, &mut inline_work)
                 // C argument temporaries do not own the foreign result.
                 c.expr_owner = -1; c.expr_type = -1; return result
-            }; result := call(&mut c, name, expected); c.address = -1; c.writable = false; return temporary(&mut c, result) }
+            }; result := call(&mut c, name, expected, &catalog, &mut inline_work); c.address = -1; c.writable = false; return temporary(&mut c, result) }
         if found < 0 {
             f := i32(map.get_or(&c.functions, name, -1))
             if f >= 0 && c.libraries[f] != "" { arm.barrier(&mut c.code); import_address(&mut c, f); return c.ffi_types[f] }
@@ -1469,15 +1493,15 @@ fn primary_inner(c: &mut Compiler, expected: i32) -> i32 {
 }
 // Only side-effect-free places may be replayed. The stop token prevents the
 // parser consuming a following subscript or method on the receiver itself.
-fn replay_place(c: &mut Compiler, first: i32, last: i32, expected: i32) -> i32 {
+fn replay_place(c: &mut Compiler, first: i32, last: i32, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     saved := c.cursor; limit := c.postfix_stop; effects := c.mutations.len
     c.cursor = first; c.postfix_stop = last
-    ty := primary(&mut c, expected)
+    ty := primary(&mut c, expected, &catalog, &mut inline_work)
     c.cursor = saved; c.postfix_stop = limit
     while c.mutations.len > effects { removed := c.mutations.pop() }
     ty
 }
-fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_end: i32) -> i32 {
+fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_end: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     var effects := c.mutations.len
     writable := c.writable; expect(&mut c, "(")
     if floats.has(ty) {
@@ -1513,8 +1537,8 @@ fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_en
         if !writable { fail(&mut c, "array mutation requires var or &mut") }
         if name == "push" {
             if !writable { fail(&mut c, "push requires mutable array") }
-            value := expression(&mut c, 0, c.type_bases[ty]); same(&mut c, c.type_bases[ty], value); take_value(&mut c, value); count = 1; target = c.runtime.array_push; ret = 0
-        } else if name == "reserve" { value := expression(&mut c, 0, 1); same(&mut c, 1, value); count = 1; target = c.runtime.array_reserve; ret = 0 }
+            value := expression(&mut c, 0, c.type_bases[ty], &catalog, &mut inline_work); same(&mut c, c.type_bases[ty], value); take_value(&mut c, value); count = 1; target = c.runtime.array_push; ret = 0
+        } else if name == "reserve" { value := expression(&mut c, 0, 1, &catalog, &mut inline_work); same(&mut c, 1, value); count = 1; target = c.runtime.array_reserve; ret = 0 }
         else if name == "pop" { target = c.runtime.array_pop; ret = c.type_bases[ty] }
         else if name == "clear" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); if c.type_bases[ty] == 4 { arm.branch(&mut c.code, c.runtime.release_elements, 1) }; arm.imm(&mut c.code, 1, 0); store_mem(&mut c, 1, 0, 8); return 0 }
     } else if name == "str" {
@@ -1525,14 +1549,14 @@ fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_en
         if name == "bytes" { target = c.runtime.string_bytes; ret = compound(&mut c, 1, 1) }
         else if name == "runes" { target = c.runtime.string_runes; ret = compound(&mut c, 1, 5) }
         else if name == "slice" {
-            first := expression(&mut c, 0, 1); same(&mut c, 1, first); arm.push(&mut c.code, 0); expect(&mut c, ",")
-            last := expression(&mut c, 0, 1); same(&mut c, 1, last); arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0)
+            first := expression(&mut c, 0, 1, &catalog, &mut inline_work); same(&mut c, 1, first); arm.push(&mut c.code, 0); expect(&mut c, ",")
+            last := expression(&mut c, 0, 1, &catalog, &mut inline_work); same(&mut c, 1, last); arm.mov(&mut c.code, 2, 0); arm.pop(&mut c.code, 1); arm.pop(&mut c.code, 0)
             expect(&mut c, ")"); arm.branch(&mut c.code, c.runtime.string_slice, 1); return 4
         }
     } else if ty == 1 || ty == 2 || unsigned.has(ty) {
         if name == "bit_not" { expect(&mut c, ")"); arm.pop(&mut c.code, 0); arm.emit(&mut c.code, 2854224864); if ty == 1 { arm.emit(&mut c.code, 2470476800) }; if unsigned.has(ty) { unsigned.mask(&mut c.code, ty) }; return ty }
         var want := ty; if name == "shl" || name == "shr" { want = 1 }
-        right := expression(&mut c, 0, want); same(&mut c, want, right); expect(&mut c, ")"); arm.pop(&mut c.code, 1)
+        right := expression(&mut c, 0, want, &catalog, &mut inline_work); same(&mut c, want, right); expect(&mut c, ")"); arm.pop(&mut c.code, 1)
         var opcode: i64 = 0
         if name == "bit_and" { opcode = 2315255840 }
         else if name == "bit_or" { opcode = 2852126752 }
@@ -1556,7 +1580,7 @@ fn method(c: &mut Compiler, ty: i32, name: string, first_token: i32, receiver_en
     if c.type_kinds[ty] == 1 && count == 1 {
         root := borrows.place(&c.tokens, first_token, receiver_end)
         if borrows.changed(&c.tokens, &c.mutations, effects, c.mutations.len, root) {
-            arm.push(&mut c.code, 1); reloaded := replay_place(&mut c, first_token, receiver_end, ty); arm.pop(&mut c.code, 1)
+            arm.push(&mut c.code, 1); reloaded := replay_place(&mut c, first_token, receiver_end, ty, &catalog, &mut inline_work); arm.pop(&mut c.code, 1)
         }
     }
     arm.branch(&mut c.code, target, 1); if name == "pop" && storage_type(&c, ret) == 1 { arm.emit(&mut c.code,2470476800) }; ret
@@ -1663,11 +1687,11 @@ fn register_rhs(c: &Compiler, priority: i32) -> bool {
     if next == "." || next == "[" || next == "(" { return false }
     rules.precedence(next) <= priority
 }
-fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
+fn expression(c: &mut Compiler, minimum: i32, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
     context := float_context(&c, expected)
-    var ty := primary(&mut c, context)
+    var ty := primary(&mut c, context, &catalog, &mut inline_work)
     while c.ok {
         operator := peek(&c); priority := rules.precedence(operator)
         if priority == 0 || priority < minimum { break }
@@ -1676,7 +1700,7 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
             same(&mut c, 3, ty)
             done := arm.label(&mut c.code)
             if operator == "&&" { arm.branch(&mut c.code, done, 18) } else { arm.branch(&mut c.code, done, 19) }
-            right := expression(&mut c, priority + 1, 3); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
+            right := expression(&mut c, priority + 1, 3, &catalog, &mut inline_work); same(&mut c, 3, right); arm.mark(&mut c.code, done); ty = 3; c.address = -1; c.writable = false
         } else {
             if ty == 4 {
                 // Off/check modes need neither ownership proof nor span captures.
@@ -1689,7 +1713,7 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
                 // Setup itself retains/releases. Observe only the RHS, ending
                 // before the string operator or result owner invokes runtime.
                 arm.push(&mut c.code, 0)
-                right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
+                right := expression(&mut c, priority + 1, ty, &catalog, &mut inline_work); same(&mut c, ty, right)
                 if rhs_epoch >= 0 {
                     pure := arm.end_effects(&mut c.code, rhs_epoch)
                     if c.ok && pure { elide_string_operand(&mut c, lease_start, lease_end, lease_owner, lease_slot) }
@@ -1698,7 +1722,7 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
             } else {
                 in_register := register_rhs(&c, priority)
                 if in_register { arm.mov(&mut c.code, 1, 0) } else { arm.push(&mut c.code, 0) }
-                right := expression(&mut c, priority + 1, ty); same(&mut c, ty, right)
+                right := expression(&mut c, priority + 1, ty, &catalog, &mut inline_work); same(&mut c, ty, right)
                 if !in_register { arm.pop(&mut c.code, 1) }
             }
             result := binary(&mut c, operator, ty); ty = temporary(&mut c, result); c.address = -1; c.writable = false
@@ -1706,19 +1730,19 @@ fn expression(c: &mut Compiler, minimum: i32, expected: i32) -> i32 {
     }
     if minimum == 0 && eat(&mut c, "..") {
         same(&mut c, 1, ty); arm.push(&mut c.code, 0)
-        high := expression(&mut c, 1, 1); same(&mut c, 1, high); arm.pop(&mut c.code, 1)
+        high := expression(&mut c, 1, 1, &catalog, &mut inline_work); same(&mut c, 1, high); arm.pop(&mut c.code, 1)
         arm.emit(&mut c.code, 704709601); arm.emit(&mut c.code, 2852159520)
         ty = type_id(&c, "range"); c.address = -1; c.writable = false
     }
     c.depth = c.depth - 1
     ty
 }
-fn block(c: &mut Compiler, tail_allowed: bool) -> bool {
+fn block(c: &mut Compiler, tail_allowed: bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
     enter(&mut c)
-    block_body(&mut c, tail_allowed)
+    block_body(&mut c, tail_allowed, &catalog, &mut inline_work)
 }
 // The region name and its body declarations share a lexical scope.
-fn block_body(c: &mut Compiler, tail_allowed: bool) -> bool {
+fn block_body(c: &mut Compiler, tail_allowed: bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
     if !c.ok { return false }
     c.block_depth = c.block_depth + 1
     if c.block_depth > 128 { fail(&mut c, "block nesting exceeds 128"); c.block_depth = c.block_depth - 1; return false }
@@ -1729,7 +1753,7 @@ fn block_body(c: &mut Compiler, tail_allowed: bool) -> bool {
     while c.ok && !is(&c, "}") {
         if c.tokens.kinds[c.cursor] == .End { fail(&mut c, "unterminated block"); break }
         first_owner := c.owned_slots.len
-        ends := statement(&mut c); returns = returns || ends
+        ends := statement(&mut c, &catalog, &mut inline_work); returns = returns || ends
         cleanup_from(&mut c, first_owner, true)
         separators(&mut c)
     }
@@ -1808,26 +1832,26 @@ fn conditional_end(c: &Compiler, start: i32) -> i32 {
 fn end_statement(c: &mut Compiler) {
     if c.ok && !is(&c, "\n") && !is(&c, ";") && !is(&c, "}") && c.tokens.kinds[c.cursor] != .End { fail(&mut c, "expected newline or semicolon") }
 }
-fn conditional(c: &mut Compiler, tail_allowed: bool) -> bool {
+fn conditional(c: &mut Compiler, tail_allowed: bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
     c.depth = c.depth + 1
     if c.depth > 128 { fail(&mut c, "conditional nesting exceeds 128"); c.depth = c.depth - 1; return false }
-    result := conditional_inner(&mut c, tail_allowed)
+    result := conditional_inner(&mut c, tail_allowed, &catalog, &mut inline_work)
     c.depth = c.depth - 1
     result
 }
-fn conditional_inner(c: &mut Compiler, tail_allowed: bool) -> bool {
-    ty := expression(&mut c, 0, 3); same(&mut c, 3, ty)
+fn conditional_inner(c: &mut Compiler, tail_allowed: bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
+    ty := expression(&mut c, 0, 3, &catalog, &mut inline_work); same(&mut c, 3, ty)
     otherwise := arm.label(&mut c.code); done := arm.label(&mut c.code)
     arm.branch(&mut c.code, otherwise, 18)
-    left := block(&mut c, tail_allowed); arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, otherwise)
+    left := block(&mut c, tail_allowed, &catalog, &mut inline_work); arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, otherwise)
     newlines(&mut c)
     var right := false
-    if eat(&mut c, "else") { if eat(&mut c, "if") { right = conditional(&mut c, tail_allowed) } else { right = block(&mut c, tail_allowed) } }
+    if eat(&mut c, "else") { if eat(&mut c, "if") { right = conditional(&mut c, tail_allowed, &catalog, &mut inline_work) } else { right = block(&mut c, tail_allowed, &catalog, &mut inline_work) } }
     arm.mark(&mut c.code, done)
     left && right
 }
-fn match_statement(c: &mut Compiler) -> bool {
-    ty := expression(&mut c, 0, 0)
+fn match_statement(c: &mut Compiler, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
+    ty := expression(&mut c, 0, 0, &catalog, &mut inline_work)
     if !enum_type(&c, ty) { fail(&mut c, "match requires an enum"); return false }
     saved := slot(&mut c); take_value(&mut c, ty)
     if owned(&c, ty) { save_owner(&mut c, saved, ty, true) } else { arm.store(&mut c.code, saved, 0) }
@@ -1865,10 +1889,10 @@ fn match_statement(c: &mut Compiler) -> bool {
             }
         }
         expect(&mut c, "=>"); newlines(&mut c); var ends := false
-        if is(&c, "{") { ends = block(&mut c, tail) }
+        if is(&c, "{") { ends = block(&mut c, tail, &catalog, &mut inline_work) }
         else {
             var expected := 0; if tail { expected = c.ret_type }
-            value := expression(&mut c, 0, expected)
+            value := expression(&mut c, 0, expected, &catalog, &mut inline_work)
             if tail && expected != 0 {
                 same(&mut c, expected, value); take_value(&mut c, value); arm.branch(&mut c.code, c.cleanup, 0); ends = true
             } else if value != 0 { fail(&mut c, "unused match arm value") }
@@ -1909,9 +1933,9 @@ fn scratch_width(c:&Compiler, ty:i32)->i32 {
     if ty<1 || ty>12 || ty==4 {return 0}
     foreign_width(storage_type(&c, ty))
 }
-fn scratch_block(c:&mut Compiler)->bool {
+fn scratch_block(c:&mut Compiler, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace)->bool {
     name_at := c.cursor; name:=advance(&mut c)
-    if eat(&mut c,"(") { ty:=expression(&mut c,0,1);same(&mut c,1,ty);expect(&mut c,")") }
+    if eat(&mut c,"(") { ty:=expression(&mut c,0,1, &catalog, &mut inline_work);same(&mut c,1,ty);expect(&mut c,")") }
     else {arm.imm(&mut c.code,0,65536)}
     area:=slot(&mut c);cursor:=slot(&mut c);limit:=slot(&mut c)
     arm.store(&mut c.code,limit,0);arm.store(&mut c.code,cursor,31)
@@ -1923,13 +1947,13 @@ fn scratch_block(c:&mut Compiler)->bool {
     enter(&mut c);token:=compound(&mut c,20,0);bind(&mut c,name,token,false,area, name_at)
     if !is(&c,"{"){fail(&mut c,"expected region body");return false}
     after:=c.closes[c.cursor]+1;allowed:=c.tail && terminal(&c,after,true)
-    ends:=block_body(&mut c,allowed)
+    ends:=block_body(&mut c,allowed, &catalog, &mut inline_work)
     clear_owner(&mut c,area,4)
     ends
 }
 // Recognize a declaration using the region in scope. A user-defined module
 // with a function called alloc continues through ordinary name resolution.
-fn scratch_declaration(c:&mut Compiler, name:string, mutable:bool)->bool {
+fn scratch_declaration(c:&mut Compiler, name:string, mutable:bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace)->bool {
     start:=c.cursor
     if start+8>=c.tokens.texts.len || c.tokens.texts[start]!=":" || c.tokens.texts[start+1]!="[" || c.tokens.texts[start+2]!="]" || c.tokens.texts[start+4]!="=" {return false}
     region:=local(&c,c.tokens.texts[start+5])
@@ -1938,7 +1962,7 @@ fn scratch_declaration(c:&mut Compiler, name:string, mutable:bool)->bool {
     c.cursor=start+3;elem:=type_name(&mut c);width:=scratch_width(&c,elem)
     if width==0{fail(&mut c,"scratch elements must be numeric, bool, rune or plain value records");return true}
     expect(&mut c,"=");receiver:=advance(&mut c);expect(&mut c,".");expect(&mut c,"alloc");expect(&mut c,"(")
-    actual:=expression(&mut c,0,1);same(&mut c,1,actual);expect(&mut c,")")
+    actual:=expression(&mut c,0,1, &catalog, &mut inline_work);same(&mut c,1,actual);expect(&mut c,")")
     var align:=width;if c.c_record[elem] {align=c.c_aligns[elem]} else if c.type_kinds[elem]==2{align=8}
     view:=compound(&mut c,21,elem);binding:=slot(&mut c)
     for unused in 0..3 { slot_for_descriptor:=slot(&mut c) }
@@ -1949,36 +1973,36 @@ fn scratch_declaration(c:&mut Compiler, name:string, mutable:bool)->bool {
     true
 }
 
-fn statement(c: &mut Compiler) -> bool {
-    if is(&c,"region") && c.tokens.kinds[c.cursor+1]==.Name {skipped:=advance(&mut c); return scratch_block(&mut c)}
+fn statement(c: &mut Compiler, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
+    if is(&c,"region") && c.tokens.kinds[c.cursor+1]==.Name {skipped:=advance(&mut c); return scratch_block(&mut c, &catalog, &mut inline_work)}
     if eat(&mut c, "unsafe") {
         if !c.unsafe_capable { fail(&mut c, "module requires capability unsafe"); return false }
         previous := c.unsafe_scope; c.unsafe_scope = true
         after := c.closes[c.cursor] + 1; allowed := c.tail && terminal(&c, after, true)
-        result := block(&mut c, allowed); c.unsafe_scope = previous; return result
+        result := block(&mut c, allowed, &catalog, &mut inline_work); c.unsafe_scope = previous; return result
     }
-    if eat(&mut c, "match") { return match_statement(&mut c) }
+    if eat(&mut c, "match") { return match_statement(&mut c, &catalog, &mut inline_work) }
     if eat(&mut c, "return") {
         if is(&c, "\n") || is(&c, ";") || is(&c, "}") {
             if c.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
-        } else { ty := expression(&mut c, 0, c.ret_type); same(&mut c, c.ret_type, ty) }
+        } else { ty := expression(&mut c, 0, c.ret_type, &catalog, &mut inline_work); same(&mut c, c.ret_type, ty) }
         end_statement(&mut c)
         take_value(&mut c, c.ret_type); arm.branch(&mut c.code, c.cleanup, 0)
         return true
     }
-    if eat(&mut c, "if") { after := conditional_end(&c, c.cursor); allowed := c.tail && terminal(&c, after, true); return conditional(&mut c, allowed) }
+    if eat(&mut c, "if") { after := conditional_end(&c, c.cursor); allowed := c.tail && terminal(&c, after, true); return conditional(&mut c, allowed, &catalog, &mut inline_work) }
     if eat(&mut c, "while") {
         head := arm.label(&mut c.code); done := arm.label(&mut c.code); arm.mark(&mut c.code, head)
-        ty := expression(&mut c, 0, 3); same(&mut c, 3, ty); arm.branch(&mut c.code, done, 18)
+        ty := expression(&mut c, 0, 3, &catalog, &mut inline_work); same(&mut c, 3, ty); arm.branch(&mut c.code, done, 18)
         c.loop_heads.push(head); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len)
-        ends := block(&mut c, false); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
+        ends := block(&mut c, false, &catalog, &mut inline_work); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
         arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
         return false
     }
     if eat(&mut c, "for") {
         name_at := c.cursor; name := advance(&mut c); expect(&mut c, "in")
         previous_stream := c.stream_depth; c.stream_depth = c.depth + 2; c.stream_kind = 0
-        low := expression(&mut c, 1, 1); stream := c.stream_kind; c.stream_depth = previous_stream; c.stream_kind = 0
+        low := expression(&mut c, 1, 1, &catalog, &mut inline_work); stream := c.stream_kind; c.stream_depth = previous_stream; c.stream_kind = 0
         cursor := slot(&mut c); limit := slot(&mut c); values := slot(&mut c); binding := slot(&mut c)
         var base := 1; var array := false
         if stream != 0 {
@@ -1988,7 +2012,7 @@ fn statement(c: &mut Compiler) -> bool {
             arm.imm(&mut c.code, 0, 0); arm.store(&mut c.code, cursor, 0)
         } else if eat(&mut c, "..") {
             same(&mut c, 1, low); arm.store(&mut c.code, cursor, 0)
-            high := expression(&mut c, 0, 1); same(&mut c, 1, high); arm.store(&mut c.code, limit, 0)
+            high := expression(&mut c, 0, 1, &catalog, &mut inline_work); same(&mut c, 1, high); arm.store(&mut c.code, limit, 0)
         } else if low == type_id(&c, "range") {
             arm.mov(&mut c.code, 1, 0); arm.emit(&mut c.code, 2470476800); arm.store(&mut c.code, cursor, 0)
             arm.emit(&mut c.code, 2472606752); arm.store(&mut c.code, limit, 0)
@@ -2013,7 +2037,7 @@ fn statement(c: &mut Compiler) -> bool {
             arm.emit(&mut c.code, 2332033056 + i64(shift) * 1024); transfer_value(&mut c, base, 0, 0, true); copy_value(&mut c, base); if owned(&c, base) { save_owner(&mut c, binding, base, false) } else { arm.store(&mut c.code, binding, 0) }
         }
         c.loop_heads.push(next); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len)
-        ends := block(&mut c, false); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
+        ends := block(&mut c, false, &catalog, &mut inline_work); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop()
         arm.mark(&mut c.code, next)
         if stream != 5 { arm.load(&mut c.code, cursor); arm.emit(&mut c.code, 2432697344); arm.store(&mut c.code, cursor, 0) }
         arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done); leave(&mut c); return false
@@ -2027,14 +2051,14 @@ fn statement(c: &mut Compiler) -> bool {
         end_statement(&mut c)
         return false
     }
-    if is(&c, "{") { after := c.closes[c.cursor] + 1; allowed := c.tail && terminal(&c, after, true); return block(&mut c, allowed) }
+    if is(&c, "{") { after := c.closes[c.cursor] + 1; allowed := c.tail && terminal(&c, after, true); return block(&mut c, allowed, &catalog, &mut inline_work) }
     var mutable := false
     if eat(&mut c, "var") { mutable = true }
     if c.tokens.kinds[c.cursor] == .Name && (c.tokens.texts[c.cursor + 1] == ":=" || c.tokens.texts[c.cursor + 1] == ":") {
         name_at := c.cursor; name := advance(&mut c); var expected := 0
-        if scratch_declaration(&mut c,name,mutable) {return false}
+        if scratch_declaration(&mut c,name,mutable, &catalog, &mut inline_work) {return false}
         if eat(&mut c, ":") { expected = type_name(&mut c); expect(&mut c, "=") } else { expect(&mut c, ":=") }
-        ty := expression(&mut c, 0, expected)
+        ty := expression(&mut c, 0, expected, &catalog, &mut inline_work)
         if expected != 0 { same(&mut c, expected, ty) }
         if ty == 0 { fail(&mut c, "local requires a value") }
         if c.type_kinds[ty] == 4 || c.type_kinds[ty] == 5 { fail(&mut c, "borrows are limited to function parameters") }
@@ -2045,14 +2069,14 @@ fn statement(c: &mut Compiler) -> bool {
     }
     if mutable { fail(&mut c, "expected declaration after var"); return false }
     first_token := c.cursor
-    ty := expression(&mut c, 0, c.ret_type)
+    ty := expression(&mut c, 0, c.ret_type, &catalog, &mut inline_work)
     assignment := c.cursor
     if eat(&mut c, "=") {
         arm.barrier(&mut c.code) // Source assignment is an effect even for scalars.
         var destination := c.address; var direct := c.direct_place; writable := c.writable; packed := c.inline_place; scratch_target:=c.scratch_place
         if c.type_kinds[ty]==21 || c.type_kinds[ty]==20 {fail(&mut c,"scratch bindings cannot be reassigned");return false}
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
-        effects := c.mutations.len; value := expression(&mut c, 0, ty); same(&mut c, ty, value)
+        effects := c.mutations.len; value := expression(&mut c, 0, ty, &catalog, &mut inline_work); same(&mut c, ty, value)
         result_owner := c.expr_owner; result_type := c.expr_type
         base := borrows.place(&c.tokens, first_token, assignment)
         if base < 0 { fail(&mut c, "assignment requires a named variable, field or array element"); return false }
@@ -2061,7 +2085,7 @@ fn statement(c: &mut Compiler) -> bool {
             // A call on the right can replace a heap-backed record. Resolve the
             // pure field chain again so the write lands in its current storage.
             end := c.cursor; arm.push(&mut c.code, 0); c.cursor = first_token
-            checked := expression(&mut c, 0, ty); destination = c.address; direct = c.direct_place
+            checked := expression(&mut c, 0, ty, &catalog, &mut inline_work); destination = c.address; direct = c.direct_place
             c.cursor = end; arm.pop(&mut c.code, 0)
         }
         c.expr_owner = result_owner; c.expr_type = result_type
@@ -2229,7 +2253,7 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
         wasm_abi: wa.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, opaque_owner: [], function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, direct_place: false, c_record: [], c_sizes: [], c_aligns: [], ffi_types: [], ffi_params: [], callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], type_names: [], type_kinds: [], type_bases: [], type_starts: [], type_counts: [], type_clones: [], type_drops: [], field_names: [], field_types: [], field_values: [], payload_starts: [], payload_counts: [], payload_types: [], address: -1, writable: false, scratch_place: 0, loans: scratch.loans(), scratch_returns: [],
         fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], owner_elided: [], loop_owners: [], expr_owner: -1, expr_type: -1, array_take: array_take, scope: 0, slots: 0, ret_type: 0, depth: 0,
-        scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, range_enabled: config.range_enabled, lease_starts: [], lease_ends: [], scalar_names: [], scalar_types: [], scalar_tokens: [],
+        scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, range_enabled: config.range_enabled, inline_enabled: config.inline_enabled && scalar_enabled && !check_all, inline_caller_words: 0, inline_global_words: 65536, lease_starts: [], lease_ends: [], scalar_names: [], scalar_types: [], scalar_tokens: [],
         loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
     if profile_host >= 0 { c.bindings.profile = profile.new(profile_host) }
@@ -2275,22 +2299,6 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
     for f in 0..c.names.len { compiled.push(false); c.callback_labels.push(-1) }
     globals := arm.label_count(&c.code)
     if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 0, declarations_started, i64(c.names.len)) }
-    var cache := ""
-    if !check_all && platform != 3 && directory != "" {
-        var policy := identity
-        if policy != "" {
-            if scalar_enabled { policy = policy + ":scalar:on" } else { policy = policy + ":scalar:off" }
-            if config.ownership_enabled { policy = policy + ":ownership:on" } else { policy = policy + ":ownership:off" }
-            if config.const_div_enabled { policy = policy + ":const-div:on" } else { policy = policy + ":const-div:off" }
-            if config.frame_free_enabled { policy = policy + ":frame-free:on" } else { policy = policy + ":frame-free:off" }
-            if config.range_enabled { policy = policy + ":range:on" } else { policy = policy + ":range:off" }
-            if instrument_runtime { policy = policy + ":runtime:profile" } else { policy = policy + ":runtime:plain" }
-        }
-        var started: i64 = -1
-        if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
-        cache = fragments.context(&c.tokens,&c.starts,&c.ends,&c.function_owners,&c.opaque_owner,platform,globals,c.has_callbacks,policy)
-        if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 8, started, 1) }
-    }
     var scalar_model := opt_ir.new()
     var scalar_work := opt_verify.new()
     var scalar_plan := opt_alloc.new()
@@ -2298,6 +2306,30 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
     var machine_work := machine_ir.new()
     var emit_settings := opt_emit.options()
     emit_settings.const_div_enabled = config.const_div_enabled; emit_settings.frame_free_enabled = config.frame_free_enabled
+    var catalog := opt_inline.new()
+    var inline_work := opt_inline.workspace()
+    if c.inline_enabled {
+        opt_inline.configure(&mut inline_work, config.const_div_enabled, config.frame_free_enabled)
+        inline_catalog(&mut c, &mut catalog, &mut scalar_model, &mut scalar_work, &mut range_work, directory != "" && identity != "" && platform != 3)
+        if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
+    }
+    var cache := ""
+    if !check_all && platform != 3 && directory != "" && (!c.inline_enabled || opt_inline.digest_ready(&catalog)) {
+        var policy := identity
+        if policy != "" {
+            if scalar_enabled { policy = policy + ":scalar:on" } else { policy = policy + ":scalar:off" }
+            if config.ownership_enabled { policy = policy + ":ownership:on" } else { policy = policy + ":ownership:off" }
+            if config.const_div_enabled { policy = policy + ":const-div:on" } else { policy = policy + ":const-div:off" }
+            if config.frame_free_enabled { policy = policy + ":frame-free:on" } else { policy = policy + ":frame-free:off" }
+            if config.range_enabled { policy = policy + ":range:on" } else { policy = policy + ":range:off" }
+            if c.inline_enabled { policy = policy + ":inline-expression-v1:tokens128-32768:caller4096:global65536:" + opt_inline.fingerprint(&catalog) } else { policy = policy + ":inline:off" }
+            if instrument_runtime { policy = policy + ":runtime:profile" } else { policy = policy + ":runtime:plain" }
+        }
+        var started: i64 = -1
+        if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
+        cache = fragments.context(&c.tokens,&c.starts,&c.ends,&c.function_owners,&c.opaque_owner,platform,globals,c.has_callbacks,policy)
+        if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 8, started, 1) }
+    }
     var more := true
     while c.ok && more {
         more = false
@@ -2307,8 +2339,17 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
             begin := fragments.start(&c.code); types_before := c.type_names.len
             strings_before := c.strings.len; sites_before := c.imports.sites.len
             globals_before := c.imports.globals
+            // Restored legacy fragments currently lack inlined-declaration and
+            // growth-charge metadata. Fail closed for those callers; scalar
+            // bodies are call-free and remain eligible for ordinary caching.
+            var scalar_ready := -1
+            if c.inline_enabled && cache != "" {
+                scalar_ready = 0
+                if scalar_prepare(&mut c, f, &mut scalar_model, &mut scalar_work, &mut range_work, true) { scalar_ready = 1 }
+                if !c.ok { break }
+            }
             var fingerprint := ""; var path := ""
-            if cache != "" && !needs_loan_analysis(&c, f) {
+            if cache != "" && scalar_ready != 0 && !needs_loan_analysis(&c, f) {
                 var started: i64 = -1
                 if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
                 fingerprint = fragments.key(cache,f,&c.tokens,c.starts[f],c.ends[f])
@@ -2331,7 +2372,7 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
                 }
             }
             if !c.code.checking { c.bindings.emitted = c.bindings.emitted + 1 }
-            compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work)
+            compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, scalar_ready)
             if c.ok {
                 if fingerprint != "" && !c.has_callbacks && c.type_names.len == types_before && c.strings.len == strings_before && c.imports.sites.len == sites_before && c.imports.globals == globals_before {
                     var started: i64 = -1
@@ -2358,7 +2399,7 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
     for i in 0..globals { unused := arm.label(&mut c.code) }
     c.imports = imports()
     for f in 0..c.names.len {
-        if !compiled[f] && c.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work) }
+        if !compiled[f] && c.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, -1) }
         if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
     }
     if c.loans.active {
@@ -2372,6 +2413,10 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
     records.reused = c.bindings.reused; records.emitted = c.bindings.emitted
     records.modeled = c.bindings.modeled; records.optimized = c.bindings.optimized
     records.rewrites = c.bindings.rewrites; records.proven_bounds = c.bindings.proven_bounds; records.fallbacks = c.bindings.fallbacks
+    records.inline_entries = c.bindings.inline_entries; records.inline_nodes = c.bindings.inline_nodes
+    records.inline_tokens = c.bindings.inline_tokens; records.inline_units = c.bindings.inline_units
+    records.inlined_calls = c.bindings.inlined_calls; records.inlined_words = c.bindings.inlined_words
+    records.inline_estimated_words = c.bindings.inline_estimated_words
     if c.bindings.profile.enabled { records.profile = c.bindings.profile }
     if report { records = c.bindings }
     result
@@ -2389,7 +2434,55 @@ fn scalar_type(c: &Compiler, ty: i32) -> i32 {
     }
     -1
 }
-fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace) -> bool {
+// This is a cheap refusal gate, never a source-language acceptance rule.
+// Closed expression verification below rejects calls, locals and control flow.
+fn inline_signature(c: &Compiler, f: i32) -> bool {
+    if c.libraries[f] != "" || c.test_functions[f] || c.unsafe_functions[f] ||
+        c.param_counts[f] > 8 || c.returns[f] < 1 || c.returns[f] > 3 || c.ends[f] - c.starts[f] + 2 > 128 { return false }
+    first := c.param_starts[f]
+    for p in 0..c.param_counts[f] { if c.param_types[first + p] < 1 || c.param_types[first + p] > 3 { return false } }
+    true
+}
+fn inline_candidate(c: &Compiler, f: i32) -> bool {
+    for token in c.starts[f]..c.ends[f] {
+        kind := c.tokens.kinds[token]
+        if kind == .String || kind == .Rune { return false }
+        word := c.tokens.texts[token]
+        if word == "{" || word == "}" || word == ":=" || word == "=" || word == "var" || word == "if" || word == "else" ||
+            word == "for" || word == "while" || word == "match" || word == "break" || word == "continue" || word == "unsafe" || word == "region" { return false }
+    }
+    true
+}
+fn inline_catalog(c: &mut Compiler, catalog: &mut opt_inline.Catalog, model: &mut opt_ir.Function,
+    work: &mut opt_verify.Workspace, range_work: &mut opt_range.Workspace, source_digests: bool) {
+    var remaining := 32768
+    // Declaration order makes both admission and budget exhaustion reproducible.
+    // The token budget covers the structural refusal walk as well as parsing,
+    // independently of the catalog's verified-node budget. Refused models
+    // produce no source diagnostic and use legacy parsing.
+    for f in 0..c.names.len {
+        if !c.ok || opt_inline.exhausted(&catalog) { break }
+        if !inline_signature(&c, f) { opt_inline.reject(&mut catalog, f); continue }
+        charge := c.ends[f] - c.starts[f] + 2
+        if charge > remaining { break }
+        remaining = remaining - charge
+        if !inline_candidate(&c, f) { opt_inline.reject(&mut catalog, f); continue }
+        supported := scalar_prepare(&mut c, f, &mut model, &mut work, &mut range_work, false)
+        if !c.ok { return }
+        if !supported { opt_inline.reject(&mut catalog, f); continue }
+        // Only accepted entries need source identities. Missing identities
+        // deliberately make the catalog unsuitable for a fragment context.
+        admitted := opt_inline.add_verified(&mut catalog, f, &model, "")
+        if admitted && source_digests {
+            digest := fragments.key("inline-body:v1", f, &c.tokens, c.starts[f] - 1, c.ends[f])
+            if !opt_inline.set_body_digest(&mut catalog, f, digest) { fail(&mut c, "internal inline body identity failure"); return }
+        }
+    }
+    if !opt_inline.seal(&mut catalog) { fail(&mut c, "internal inline catalog invariant failure"); return }
+    c.bindings.inline_entries = opt_inline.count(&catalog); c.bindings.inline_nodes = opt_inline.node_count(&catalog)
+    c.bindings.inline_tokens = 32768 - remaining; c.bindings.inline_units = opt_inline.units(&catalog)
+}
+fn scalar_prepare(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, range_work: &mut opt_range.Workspace, count_fallback: bool) -> bool {
     if !c.scalar_enabled || c.test_functions[f] || c.unsafe_functions[f] || needs_loan_analysis(&c, f) { return false }
     if c.param_counts[f] > 8 || c.returns[f] > 3 || c.ends[f] - c.starts[f] > 8192 { return false }
     c.scalar_names.clear(); c.scalar_types.clear(); c.scalar_tokens.clear()
@@ -2405,7 +2498,7 @@ fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut
         &c.scalar_names, &c.scalar_types, &c.scalar_tokens, c.returns[f])
     if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 1, started, i64(c.ends[f] - c.starts[f] + 1)) }
     if !supported {
-        c.bindings.fallbacks = c.bindings.fallbacks + 1
+        if count_fallback { c.bindings.fallbacks = c.bindings.fallbacks + 1 }
         return false
     }
     if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
@@ -2428,10 +2521,19 @@ fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut
         opt_pass.run(&mut model)
         if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 3, started, i64(model.visits)) }
         if c.range_enabled {
-            // Avoid an extra graph validation for functions without array roots.
-            var arrays := false
-            for local in 0..model.params { if opt_ir.array_type(model.local_types[local]) { arrays = true } }
-            if arrays {
+            // Skip graph analysis unless the model can gain bounds or i32
+            // arithmetic proofs. This gate makes no safety decision: the
+            // analyzer still validates every admitted model independently.
+            var candidate := false
+            for local in 0..model.params { if opt_ir.array_type(model.local_types[local]) { candidate = true } }
+            if !candidate {
+                for node in 0..model.nodes.kinds.len {
+                    if model.nodes.types[node] != 1 || model.nodes.proofs[node].bit_and(1) != 0 { continue }
+                    kind := model.nodes.kinds[node]; op := model.nodes.values[node]
+                    if (kind == 3 && op >= 1 && op <= 3) || (kind == 4 && op == 1) { candidate = true; break }
+                }
+            }
+            if candidate {
                 if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
                 ready := opt_range.analyze_into(&mut range_work, &model)
                 if ready { opt_range.apply(&mut range_work, &mut model) }
@@ -2453,6 +2555,13 @@ fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut
             return true
         }
     }
+    true
+}
+fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, scalar_ready: i32) -> bool {
+    if scalar_ready == 0 { return false }
+    if scalar_ready < 0 && !scalar_prepare(&mut c, f, &mut model, &mut work, &mut range_work, true) { return false }
+    if !c.ok { return true }
+    var started: i64 = -1
     c.bindings.modeled = c.bindings.modeled + 1
     if c.report {
         for local in 0..model.local_names.len {
@@ -2483,8 +2592,9 @@ fn scalar_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut
     }
     return true
 }
-fn compile_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace) {
-    if scalar_body(&mut c, f, &mut model, &mut work, &mut plan, &emit_settings, &mut range_work) { return }
+fn compile_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, scalar_ready: i32) {
+    if scalar_body(&mut c, f, &mut model, &mut work, &mut plan, &emit_settings, &mut range_work, scalar_ready) { return }
+    c.inline_caller_words = 4096
     var started: i64 = -1
     if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
     c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
@@ -2510,7 +2620,7 @@ fn compile_body(c: &mut Compiler, f: i32, model: &mut opt_ir.Function, work: &mu
     initialize := arm.label(&mut c.code); body := arm.label(&mut c.code)
     arm.branch(&mut c.code, initialize, 0); arm.mark(&mut c.code, body)
     c.scope = -1
-    returns := block(&mut c, true)
+    returns := block(&mut c, true, &catalog, &mut inline_work)
     if c.ret_type != 0 && !returns { fail(&mut c, "function can finish without returning a value") }
     arm.imm(&mut c.code, 0, 0); arm.mark(&mut c.code, c.cleanup); arm.push(&mut c.code, 0)
     cleanup_from(&mut c, 0, false); arm.pop(&mut c.code, 0); arm.ret(&mut c.code)
@@ -2683,4 +2793,57 @@ fn ownership_test_compile(source: string, platform: i32, enabled: bool, checking
     !compile_for("fn main(){var a:=true;(!a)=false}", 1).ok
     !compile_for("fn main(){var a:=1;(-a)=2}", 1).ok
     compile_for("enum K{A,B} struct Box{values:[]i32,tag:K} fn main(){var b:=Box{values:[1,2],tag:.A};b.values.push(3);b.tag=.B;print(b.values.len)}", 1).ok
+}
+
+fn inline_test_compile(source: string, platform: i32, enabled: bool, scalar: bool, checking: bool, report: bool, records: &mut Bindings) -> Result {
+    none: []i32 = []; var tokens := lexer.scan(source, false); var settings := configuration()
+    settings.inline_enabled = enabled; settings.scalar_enabled = scalar
+    compile_options(&mut tokens, platform, &none, &none, checking, report, &mut records, "", "", &settings)
+}
+@test fn inline_producer_preserves_authoritative_diagnostics_and_scalar_off_behavior() {
+    for platform in 0..4 {
+        for source in [
+            "fn step(x:i32)->i32{x+1} fn main(){print(step(2))}",
+            "fn step(x:i32)->i32{var y:=x;y=y+1;y} fn main(){print(step(2))}",
+            "fn step(x:i32)->i32{if x>0{return x};-x} fn main(){print(step(2))}",
+            "fn step(x:i32)->i32{x+1} fn main(){step:=1;print(step(2))}",
+            "fn step(x:i32)->i32{x=2;x} fn main(){print(step(2))}",
+            "fn step(x:i32)->i32{x+2147483648} fn main(){print(step(2))}",
+            "fn step(x:i32)->i32{x+missing} fn main(){}",
+            "fn step(x:i32)->i32{if false{return true};x} fn main(){}",
+            "fn step(x:i32)->i32{x+1} fn main(){print(step(true))}",
+            "fn step(x:i32)->i32{x+1} fn main(){print(step(1,2))}",
+            "fn step(x:i32)->i32{x+1} fn main(){print(step())}"
+        ] {
+            for checking in [false, true] {
+                var before := bindings(); var after := bindings()
+                old := inline_test_compile(source, platform, false, true, checking, false, &mut before)
+                current := inline_test_compile(source, platform, true, true, checking, false, &mut after)
+                assert(old.ok == current.ok && old.error == current.error && old.offset == current.offset)
+                assert(before.modeled == after.modeled && before.optimized == after.optimized && before.emitted == after.emitted && before.fallbacks == after.fallbacks)
+            }
+        }
+        var before := bindings(); var after := bindings()
+        source := "fn step(x:i32)->i32{x+1} fn main(){print(step(2))}"
+        old := inline_test_compile(source, platform, false, false, false, false, &mut before)
+        disabled := inline_test_compile(source, platform, true, false, false, false, &mut after)
+        assert(old.ok && disabled.ok && old.text.len == disabled.text.len)
+        for at in 0..old.text.len { assert(old.text[at] == disabled.text[at]) }
+    }
+}
+@test fn inline_producer_does_not_duplicate_source_binding_reports() {
+    source := "fn step(x:i32)->i32{x+1} fn main(){value:=3;print(step(value))}"
+    for platform in 0..4 {
+        var before := bindings(); var after := bindings()
+        old := inline_test_compile(source, platform, false, true, false, true, &mut before)
+        current := inline_test_compile(source, platform, true, true, false, true, &mut after)
+        assert(old.ok && current.ok && before.offsets.len == after.offsets.len && before.modeled == after.modeled)
+        assert(before.optimized == after.optimized && before.emitted == after.emitted)
+        assert(before.inline_entries == 0 && before.inlined_calls == 0 && before.inline_tokens == 0)
+        assert(after.inline_entries == 1 && after.inline_nodes == 3 && after.inline_units > 0 && after.inline_tokens > 0 && after.inline_tokens <= 32768)
+        assert(after.inlined_calls == 1 && after.inlined_words > 0 && after.inlined_words <= after.inline_estimated_words && after.inline_estimated_words <= 65536)
+        for at in 0..before.offsets.len {
+            assert(before.offsets[at] == after.offsets[at] && before.names[at] == after.names[at] && before.types[at] == after.types[at])
+        }
+    }
 }
