@@ -201,6 +201,7 @@ def plan_program(module, directory):
     # An unsupported request must not leave the preceding supported plan active.
     for d, width in ((1, 2), (1, 65), (4, 3), (-5, 3)):
         source += f'assert(!cd.prepare_into(&mut p,{d},{width}));assert(!p.supported);'
+        source += 'assert(p.kind==0 && p.magic==0 && p.shift==0 && !p.add && p.iterations==0);'
         source += 'dump(&mut p,3,32);'
         pairs.append((32, 3))
     return source + '}\n', pairs
