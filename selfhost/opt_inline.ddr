@@ -148,6 +148,152 @@ pub fn find(c: &Catalog, declaration: i32) -> i32 {
     while low < high { mid := low + (high - low) / 2; if c.declarations[mid] < declaration { low = mid + 1 } else { high = mid } }
     if low < c.declarations.len && c.declarations[low] == declaration { low } else { -1 }
 }
+fn catalog_storage(c: &Catalog) -> bool {
+    entries := c.declarations.len; n := c.nodes.kinds.len
+    c.valid && c.sealed && c.stamp.len == 64 && entries <= 256 && n <= 4096 &&
+        c.roots.len == entries && c.firsts.len == entries && c.counts.len == entries &&
+        c.param_starts.len == entries && c.param_counts.len == entries && c.returns.len == entries &&
+        c.body_digests.len == entries && c.costs.len == entries && c.param_types.len <= 2048 &&
+        c.nodes.types.len == n && c.nodes.left.len == n && c.nodes.right.len == n && c.nodes.third.len == n &&
+        c.nodes.next.len == n && c.nodes.values.len == n && c.nodes.locals.len == n && c.nodes.starts.len == n &&
+        c.nodes.effects.len == n && c.nodes.proofs.len == n
+}
+fn template_tree(c: &Catalog, node: i32, first: i32, seen: &mut i64, depth: i32) -> bool {
+    if depth > 32 { return false }
+    bit := i64(1).shl(node - first)
+    if seen.bit_and(bit) != 0 { return false }
+    seen = seen.bit_or(bit)
+    kind := c.nodes.kinds[node]
+    if kind <= 2 { return true }
+    if !template_tree(&c, c.nodes.left[node], first, &mut seen, depth + 1) { return false }
+    kind != 3 || template_tree(&c, c.nodes.right[node], first, &mut seen, depth + 1)
+}
+// A selected entry contains <=32 stored nodes, including detached folding
+// remnants. Check every reference before traversing its reachable tree. The
+// immutable catalog is pooled; this does not copy a Function or node record.
+fn template_entry(c: &Catalog, declaration: i32) -> i32 {
+    if !catalog_storage(&c) { return -1 }
+    entry := find(&c, declaration)
+    if entry < 0 { return -1 }
+    count := c.counts[entry]; first := c.firsts[entry]; params := c.param_counts[entry]; signature := c.param_starts[entry]
+    if count < 1 || count > 32 || first < 0 || first > c.nodes.kinds.len - count ||
+        params < 0 || params > 8 || signature < 0 || signature > c.param_types.len - params ||
+        c.returns[entry] < 1 || c.returns[entry] > 3 { return -1 }
+    end := first + count; root := c.roots[entry]
+    if root < first || root >= end || c.nodes.types[root] != c.returns[entry] { return -1 }
+    for p in 0..params { if c.param_types[signature + p] < 1 || c.param_types[signature + p] > 3 { return -1 } }
+    for node in first..end {
+        kind := c.nodes.kinds[node]; ty := c.nodes.types[node]; left := c.nodes.left[node]; right := c.nodes.right[node]
+        op := c.nodes.values[node]; local := c.nodes.locals[node]; proof := c.nodes.proofs[node]
+        if kind < 1 || kind > 4 || ty < 1 || ty > 3 || c.nodes.third[node] != -1 || c.nodes.next[node] != -1 ||
+            c.nodes.starts[node] < 0 || c.nodes.effects[node] < 0 || c.nodes.effects[node] > 1 || proof < 0 || proof > 1 { return -1 }
+        if kind == 1 || kind == 2 {
+            if left != -1 || right != -1 || proof != 0 { return -1 }
+            if kind == 1 {
+                if local != -1 || (ty == 1 && (op < -2147483648 || op > 2147483647)) || (ty == 3 && op != 0 && op != 1) { return -1 }
+            } else if local < 0 || local >= params || op != 0 || ty != c.param_types[signature + local] { return -1 }
+        } else {
+            if local != -1 || left < first || left >= end { return -1 }
+            actual := c.nodes.types[left]
+            if kind == 4 {
+                if right != -1 || ty != actual || (op != 1 && op != 2) { return -1 }
+                if (op == 1 && ty != 1 && ty != 2) || (op == 2 && ty != 3) || (proof != 0 && op != 1) { return -1 }
+            } else {
+                if right < first || right >= end || op < 1 || op > 13 || c.nodes.types[right] != actual { return -1 }
+                if op <= 5 { if (actual != 1 && actual != 2) || ty != actual { return -1 } }
+                else if op <= 11 { if ty != 3 || ((actual != 1 && actual != 2) && !(actual == 3 && op <= 7)) { return -1 } }
+                else if actual != 3 || ty != 3 { return -1 }
+                if proof != 0 && op > 5 { return -1 }
+            }
+        }
+        var required := ir.own_effects(kind, op)
+        if left >= 0 { required = required.bit_or(c.nodes.effects[left]) }
+        if right >= 0 { required = required.bit_or(c.nodes.effects[right]) }
+        if c.nodes.effects[node].bit_and(required) != required { return -1 }
+    }
+    var seen: i64 = 0
+    if !template_tree(&c, root, first, &mut seen, 0) { return -1 }
+    entry
+}
+// Caller-owned storage is reused; every missing/unsealed/invalid lookup clears
+// the previous signature and returns0. Catalog entries never return void.
+pub fn signature_into(c: &Catalog, declaration: i32, param_types: &mut []i32) -> i32 {
+    param_types.clear()
+    entry := template_entry(&c, declaration)
+    if entry < 0 { return 0 }
+    first := c.param_starts[entry]
+    for p in 0..c.param_counts[entry] { param_types.push(c.param_types[first + p]) }
+    c.returns[entry]
+}
+fn model_index(index: i32, count: i32) -> bool { index >= -1 && index < count }
+// A parser may still be assembling the caller: root=-1/supported=false and
+// detached nodes are permitted. This checks storage and metadata, not graph
+// ownership, scope, initialization or completed return coverage.
+fn caller_storage(f: &ir.Function) -> bool {
+    n := f.nodes.kinds.len; locals := f.local_types.len
+    if n > 2048 || locals > 256 || f.params < 0 || f.params > 8 || f.params > locals ||
+        f.ret < 0 || f.ret > 3 || f.visits < 0 || f.rewrites < 0 || !model_index(f.root, n) ||
+        f.nodes.types.len != n || f.nodes.left.len != n || f.nodes.right.len != n || f.nodes.third.len != n ||
+        f.nodes.next.len != n || f.nodes.values.len != n || f.nodes.locals.len != n || f.nodes.starts.len != n ||
+        f.nodes.effects.len != n || f.nodes.proofs.len != n || f.local_names.len != locals ||
+        f.local_mutable.len != locals || f.local_param.len != locals || f.local_at.len != locals { return false }
+    for local in 0..locals {
+        ty := f.local_types[local]; parameter := local < f.params
+        if ((ty < 1 || ty > 3) && !ir.array_type(ty)) || f.local_names[local] == "" || f.local_at[local] < 0 { return false }
+        if parameter { if f.local_param[local] != local || f.local_mutable[local] { return false } }
+        else if f.local_param[local] != -1 || ir.array_type(ty) { return false }
+    }
+    for node in 0..n {
+        kind := f.nodes.kinds[node]; proof := f.nodes.proofs[node]
+        if ir.own_effects(kind, f.nodes.values[node]) < 0 || f.nodes.types[node] < 0 || f.nodes.types[node] > 3 ||
+            f.nodes.starts[node] < 0 || f.nodes.effects[node] < 0 || f.nodes.effects[node] > 31 || proof < 0 || proof > 3 ||
+            !model_index(f.nodes.left[node], n) || !model_index(f.nodes.right[node], n) || !model_index(f.nodes.third[node], n) ||
+            !model_index(f.nodes.next[node], n) || !model_index(f.nodes.locals[node], locals) { return false }
+        if proof.bit_and(1) != 0 && !((kind == 3 && f.nodes.values[node] >= 1 && f.nodes.values[node] <= 5 &&
+            (f.nodes.types[node] == 1 || f.nodes.types[node] == 2)) || (kind == 4 && f.nodes.values[node] == 1 &&
+            (f.nodes.types[node] == 1 || f.nodes.types[node] == 2))) { return false }
+        if proof.bit_and(2) != 0 {
+            local := f.nodes.locals[node]
+            if local < 0 { return false }
+            if kind == 6 { if f.nodes.types[node] != 2 || !ir.array_type(f.local_types[local]) { return false } }
+            else if kind == 18 { if f.nodes.types[node] != 0 || !ir.writable_array(f.local_types[local]) { return false } }
+            else { return false }
+        }
+    }
+    true
+}
+// This is IR template instantiation, not source-call lowering. arg_local_ids
+// must already name initialized, in-scope, canonical scalar snapshots captured
+// in source argument order. Duplicate IDs are allowed for these existing pure
+// values. No argument expression is evaluated or staged here. call_at must
+// name a token in the actual caller stream; only its nonnegative bound can be
+// checked without that stream. The frontend must perform its position check
+// and full optimized IR verification after attaching the returned expression.
+// Failure mutates no Function field; success only appends nodes. root/support,
+// declaration metadata and rewrite counters remain the caller's responsibility.
+pub fn append_expression_into(c: &Catalog, f: &mut ir.Function, declaration: i32,
+    arg_local_ids: &[]i32, call_at: i32) -> i32 {
+    entry := template_entry(&c, declaration)
+    if entry < 0 || call_at < 0 || !caller_storage(&f) { return -1 }
+    count := c.counts[entry]; base := f.nodes.kinds.len
+    if arg_local_ids.len != c.param_counts[entry] || count > 2048 - base { return -1 }
+    signature := c.param_starts[entry]
+    for p in 0..arg_local_ids.len {
+        local := arg_local_ids[p]
+        if local < 0 || local >= f.local_types.len || f.local_types[local] != c.param_types[signature + p] { return -1 }
+    }
+    first := c.firsts[entry]
+    for node in first..first + count {
+        var left := c.nodes.left[node]; var right := c.nodes.right[node]; var local := c.nodes.locals[node]
+        if left >= 0 { left = base + left - first }; if right >= 0 { right = base + right - first }
+        if c.nodes.kinds[node] == 2 { local = arg_local_ids[local] }
+        f.nodes.kinds.push(c.nodes.kinds[node]); f.nodes.types.push(c.nodes.types[node])
+        f.nodes.left.push(left); f.nodes.right.push(right); f.nodes.third.push(-1); f.nodes.next.push(-1)
+        f.nodes.values.push(c.nodes.values[node]); f.nodes.locals.push(local); f.nodes.starts.push(call_at)
+        f.nodes.effects.push(c.nodes.effects[node]); f.nodes.proofs.push(c.nodes.proofs[node])
+    }
+    base + c.roots[entry] - first
+}
 pub fn set_body_digest(c: &mut Catalog, declaration: i32, digest: string) -> bool {
     entry := find(&c, declaration)
     if entry < 0 || c.sealed || !valid_digest(digest) { return false }
