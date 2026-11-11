@@ -240,8 +240,8 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-verified-mutation/README.md)
+Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-ownership-leases/README.md)
 omfattar både runtime, kompletta byggen och `check`.
-Sortering och självbygge blir snabbare; kostnaden för modellverifiering
-på genererad stresskod redovisas separat. Nästa kostnadsarbete behöver
-profilera modellbygge, analys och verifiering utan att försvaga kontrollerna.
+Självbygge och den verkliga lexern blir snabbare. Profilerna ger underlag
+för [ägartillstånd och CFG](ownership-ir-plan.md), medan konstantdivision
+och starkare intervallbevis är nästa numeriska frågor.

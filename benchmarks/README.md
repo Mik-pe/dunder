@@ -20,6 +20,10 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Verifierade strängägare, 2026-11-11](2026-11-11-ownership-leases/README.md)
+visar snabbare självbygge, självkontroll och lexer med validerade
+funktionsomskrivningar. Samma kompilator med passet av/på mäter dess kostnad.
+
 [Kompilatordogfood och attribuering, 2026-11-11](2026-11-11-compiler-dogfood/README.md)
 är nästa grund: separata fasur och allokeringsräknare, oberoende konsumentfall
 och mätning av infrastrukturen med profileringen avstängd.
