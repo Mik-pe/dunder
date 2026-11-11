@@ -111,7 +111,7 @@ def main():
                     else:
                         assert pre['result'] == post['result'] == result, (case, mode, value, pre, post, result)
                         proofs += 1
-                    rewrites, deleted, immediates, units, slots, rows = map(int, counters.split())
+                    rewrites, deleted, immediates, units, slots, rows, verifications = map(int, counters.split())
                     if mode == 'off': assert (rewrites, deleted, immediates, units) == (0, 0, 0, 0)
                     if mode != 'off' and case in (0, 1, 3, 6, 7, 12, 13):
                         assert rewrites + deleted > 0, (case, rewrites, deleted)
@@ -119,6 +119,7 @@ def main():
                         assert rewrites == deleted == immediates == 0
                     if case == 7 and mode != 'off':
                         assert all(op['mode'] == 2 for op in after['operations'] if op['kind'] in (1, 3)), after
+                    assert verifications == int(rewrites + deleted > 0), (case, mode, verifications)
                     ran = False
                     if target == host:
                         call([image], work, 101 if traps else 0); executed += 1; ran = True
@@ -127,10 +128,10 @@ def main():
                         executed += 1; ran = True
                     image_sha = digest(image)
                     if mode == 'on':
-                        compact = (after, image_sha, (rewrites, deleted, immediates), slots, rows, units)
+                        compact = (after, image_sha, (rewrites, deleted, immediates, verifications), slots, rows, units)
                     elif mode == 'on-full':
                         assert compact is not None
-                        assert (after, image_sha, (rewrites, deleted, immediates)) == compact[:3], (case, value, target)
+                        assert (after, image_sha, (rewrites, deleted, immediates, verifications)) == compact[:3], (case, value, target)
                         assert slots in (0, 32)
                         if slots:
                             assert compact[3] <= slots and compact[4] <= rows
@@ -139,7 +140,7 @@ def main():
                     report['images'].append(dict(case=case, input=value, condition=condition, target=target, mode=mode,
                                                  sha256=image_sha, executed=ran, trap=traps, before=pre, after=post,
                                                  rewrites=rewrites, deleted=deleted, immediates=immediates, units=units,
-                                                 fact_slots=slots, fact_rows=rows))
+                                                 fact_slots=slots, fact_rows=rows, full_verifications=verifications))
             print(f'PASS {index + 1}/{len(corpus)} case{case} input{value} condition{condition}', flush=True)
     report.update(images_built=len(report['images']), executions=executed, oracle_pairs=proofs, oracle_gap_pairs=gaps,
                   compact_full_exact_pairs=domain_pairs)

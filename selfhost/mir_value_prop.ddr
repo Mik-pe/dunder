@@ -42,7 +42,7 @@ pub fn declare_unobserving_terminal(ctx: &mut Context, label: i32) -> bool {
 pub opaque struct Workspace {
     candidate: mir.Function, verifier: verify.Workspace, liveness: live.Workspace,
     undo_slots: []i32, undo_ops: []i32, undo_modes: []i32, undo_starts: []i32, undo_rows: []i64,
-    before_verified: bool, before_optimizable: bool, action: i32, immediate: bool, restored: i32,
+    before_verified: bool, before_optimizable: bool, action: i32, immediate: bool, restored: i32, verifications: i32,
     definitions: []i32, physical: []i32, slots: []i32, physical_bits: []i64,
     all_slots: i64, zr: i32, force_full: bool, fallback: bool,
     reached: []bool, queued: []bool, queue: []i32, pred_starts: []i32, pred_fill: []i32, predecessors: []i32,
@@ -55,7 +55,7 @@ fn candidate() -> mir.Function { var f := mir.new(); op := mir.add(&mut f, 1); f
 fn workspace(full: bool) -> Workspace {
     Workspace { candidate: candidate(), verifier: verify.new_work(), liveness: live.new(),
         undo_slots: [], undo_ops: [], undo_modes: [], undo_starts: [], undo_rows: [],
-        before_verified: false, before_optimizable: false, action: 0, immediate: false, restored: 0,
+        before_verified: false, before_optimizable: false, action: 0, immediate: false, restored: 0, verifications: 0,
         definitions: [], physical: [], slots: [], physical_bits: [], all_slots: 0, zr: 0, force_full: full, fallback: false, reached: [], queued: [], queue: [], pred_starts: [], pred_fill: [], predecessors: [],
         in_x: [], in_w: [], in_kx: [], in_vx: [], in_kw: [], in_vw: [], in_zero: [],
         out_x: [], out_w: [], out_kx: [], out_vx: [], out_kw: [], out_vw: [], out_zero: [],
@@ -77,12 +77,13 @@ pub fn constant_immediates(w: &Workspace) -> i32 { if w.state > 0 { w.immediates
 pub fn fixpoint_visits(w: &Workspace) -> i32 { w.iterations }
 // Diagnostic work count; failed transactions publish no optimization counters.
 pub fn restored_rows(w: &Workspace) -> i32 { w.restored }
+pub fn full_verifications(w: &Workspace) -> i32 { w.verifications }
 fn charge(w: &mut Workspace, n: i32) -> bool {
     if n < 0 || n > w.limit - w.work { w.state = -3; return false }; w.work = w.work + n; true
 }
 fn reset(w: &mut Workspace, limit: i32) {
     w.undo_slots.clear(); w.undo_ops.clear(); w.undo_modes.clear(); w.undo_starts.clear(); w.undo_rows.clear()
-    w.action = 0; w.immediate = false; w.restored = 0; w.definitions.clear();
+    w.action = 0; w.immediate = false; w.restored = 0; w.verifications = 0; w.definitions.clear();
     w.physical.clear(); w.slots.clear(); w.physical_bits.clear(); w.all_slots = 0; w.zr = 0; w.fallback = false
     w.reached.clear(); w.queued.clear(); w.queue.clear()
     w.pred_starts.clear(); w.pred_fill.clear(); w.predecessors.clear()
@@ -437,11 +438,44 @@ fn candidate_from(w: &mut Workspace, f: &mir.Function, op: i32) {
     w.candidate.reloc_kinds[0] = f.reloc_kinds[op]
     w.candidate.import_ids[0] = f.import_ids[op]
 }
+fn frame_role(f: &mir.Function, op: i32) -> bool {
+    mask := mir.variable_bit(29).bit_or(mir.variable_bit(31))
+    f.reads[op].bit_or(f.writes[op]).bit_or(f.clobbers[op]).bit_and(mask) != 0 ||
+        f.dst[op] == 29 || f.dst[op] == 31 || f.a[op] == 29 || f.a[op] == 31 ||
+        f.b[op] == 29 || f.b[op] == 31 || f.c[op] == 29 || f.c[op] == 31
+}
+fn preserves_scalar_certificate(w: &Workspace, f: &mir.Function, op: i32) -> bool {
+    if !f.verified || f.kinds[op] < 1 || f.kinds[op] > 6 || frame_role(&f, op) { return false }
+    if w.action == 1 { return pure_materialization(&f, op) }
+    if w.action != 2 || w.candidate.kinds[0] < 1 || w.candidate.kinds[0] > 6 || frame_role(&w.candidate, 0) { return false }
+    if f.kinds[op] != w.candidate.kinds[0] && !(f.kinds[op] == 1 && w.candidate.kinds[0] == 2) { return false }
+    // The complete new row is checked by shared core.canonical at the sole
+    // commit boundary. Only current MUST-proved alias/immediate rewrites may
+    // arrive here; this predicate is not a general semantic-equivalence API.
+    // Scalar rows cannot change control, stack, frame capacity or label/order
+    // metadata. FP/SP exclusion prevents new frame-escape obligations; flags
+    // and trap behavior remain explicit and unchanged. Untouched retained rows
+    // keep the original certificate. A false certificate is never restored.
+    f.opcodes[op] == w.candidate.opcodes[0] && f.dst[op] == w.candidate.dst[0] &&
+        f.types[op] == w.candidate.types[0] && f.writes[op] == w.candidate.writes[0] &&
+        f.flags[op] == w.candidate.flags[0] && f.effects[op] == w.candidate.effects[0] &&
+        (f.effects[op] == 0 || f.effects[op] == 1) && f.abi[op] == w.candidate.abi[0] &&
+        f.clobbers[op] == w.candidate.clobbers[0] && f.place[op] == w.candidate.place[0] &&
+        f.extensions[op] == w.candidate.extensions[0] && f.targets[op] == w.candidate.targets[0] &&
+        f.reloc_kinds[op] == w.candidate.reloc_kinds[0] && f.import_ids[op] == w.candidate.import_ids[0]
+}
 fn commit_prepared(w: &mut Workspace, f: &mut mir.Function, op: i32) -> bool {
     if w.action == 0 { return true }
+    // Shared row acceptance was previously performed at each rewrite site.
+    // Keep its unchanged replay budget, but centralize acceptance immediately
+    // before mutation. Unsupported candidates retain the original row.
+    if w.action == 2 && !core.canonical(&w.candidate, 0) { return true }
+    if !charge(&mut w, 64) { return false } // Bounded private preservation check.
+    preserve := preserves_scalar_certificate(&w, &f, op)
     if !remember(&mut w, &f, op, w.action == 2) { return false }
+    if !preserve { f.verified = false }
     if w.action == 1 {
-        f.modes[op] = 2; f.verified = false; w.deleted = w.deleted + 1; return true
+        f.modes[op] = 2; w.deleted = w.deleted + 1; return true
     }
     f.kinds[op] = w.candidate.kinds[0]
     f.opcodes[op] = w.candidate.opcodes[0]
@@ -463,7 +497,7 @@ fn commit_prepared(w: &mut Workspace, f: &mut mir.Function, op: i32) -> bool {
     f.targets[op] = w.candidate.targets[0]
     f.reloc_kinds[op] = w.candidate.reloc_kinds[0]
     f.import_ids[op] = w.candidate.import_ids[0]
-    f.modes[op] = 1; f.verified = false; w.rewrites = w.rewrites + 1
+    f.modes[op] = 1; w.rewrites = w.rewrites + 1
     if w.immediate { w.immediates = w.immediates + 1 }; true
 }
 fn alias(w: &Workspace, operand: i32, ty: i32) -> i32 {
@@ -497,7 +531,7 @@ fn rewrite_copy(w: &mut Workspace, f: &mir.Function, op: i32) {
     if same { w.action = 1; return }
     selected := alias(&w, source, ty); if selected == source { return }
     candidate_from(&mut w, &f, op); w.candidate.a[0] = selected; masks(&mut w)
-    if core.canonical(&w.candidate, 0) { w.action = 2 }
+    w.action = 2
 }
 fn rewrite_constant(w: &mut Workspace, f: &mir.Function, op: i32) {
     dst := f.dst[op]; ty := f.types[op]; if dst < 0 || dst > 30 || (ty != 1 && ty != 2) { return }
@@ -516,7 +550,7 @@ fn rewrite_constant(w: &mut Workspace, f: &mir.Function, op: i32) {
     candidate_from(&mut w, &f, op)
     w.candidate.kinds[0] = 2; w.candidate.opcodes[0] = 0; w.candidate.a[0] = best
     w.candidate.b[0] = -1; w.candidate.c[0] = -1; w.candidate.imm[0] = 0; w.candidate.aux[0] = 0
-    masks(&mut w); if core.canonical(&w.candidate, 0) { w.action = 2 }
+    masks(&mut w); w.action = 2
 }
 fn rewrite_scalar(w: &mut Workspace, f: &mir.Function, op: i32) {
     candidate_from(&mut w, &f, op)
@@ -535,7 +569,6 @@ fn rewrite_scalar(w: &mut Workspace, f: &mir.Function, op: i32) {
     }
     if w.candidate.a[0] == f.a[op] && w.candidate.b[0] == f.b[op] && w.candidate.c[0] == f.c[op] &&
         w.candidate.imm[0] == f.imm[op] { return }
-    if !scalar.can_emit(&w.candidate, 0) { return }
     w.action = 2; w.immediate = immediate
 }
 fn replay(w: &mut Workspace, f: &mut mir.Function) -> bool {
@@ -565,6 +598,7 @@ fn pure_materialization(f: &mir.Function, op: i32) -> bool {
 fn check_staged(w: &mut Workspace, f: &mut mir.Function) -> bool {
     if f.verified { return true }
     if !charge(&mut w, f.kinds.len * 100 + f.raw.len) { return false }
+    w.verifications = w.verifications + 1
     if !verify.verify_into(&mut f, &mut w.verifier) { w.state = -1; return false }
     if !f.optimizable { w.state = -2; return false }; true
 }
@@ -627,6 +661,7 @@ fn finish(w: &mut Workspace, f: &mut mir.Function) -> bool {
     if !charge(&mut w, f.kinds.len * 100 + f.raw.len) {
         rollback(&mut w, &mut f); return false
     }
+    w.verifications = w.verifications + 1
     if !verify.verify_into(&mut f, &mut w.verifier) {
         w.state = -1; rollback(&mut w, &mut f); return false
     }
