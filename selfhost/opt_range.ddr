@@ -1,31 +1,38 @@
 // Bounded range/length relations over the closed, call-free scalar model.
 // Analysis never mutates the function. Loop invariants are solved first, then
-// replayed to collect pending bounds proofs. No arithmetic proof is produced.
+// replayed to collect pending bounds and i32 arithmetic proofs. Arithmetic
+// witnesses use the mathematical interval before checked-result clipping.
 import opt_ir as ir
 import opt_verify as verify
 
 pub opaque struct Workspace {
     validation: verify.Workspace,
     value_low: []i64, value_high: []i64, value_root: []i32, value_offset: []i64, value_top: i32, enabled: bool,
-    variables: []i32, limits: []i32, headers: []i32, owners: []i32, pending: []bool,
+    variables: []i32, limits: []i32, headers: []i32, owners: []i32, pending: []i32,
     low: []i64, high: []i64, roots: []i32, offsets: []i64, reached: []bool,
     width: i32, top: i32, persistent: i32, replay: bool,
-    state: i32, allowance: i32, units: i32, reads: i32, stores: i32,
+    state: i32, allowance: i32, units: i32, reads: i32, stores: i32, arithmetic: i32,
     count: i32, locals: i32, root: i32,
 }
 // Status: 0 idle, 1 ready, 2 consumed, 3 exhausted, 4 invalid model/invariant.
 pub fn new() -> Workspace {
     Workspace { validation: verify.new(), value_low: [], value_high: [], value_root: [], value_offset: [], value_top: 0, enabled: false, variables: [], limits: [], headers: [], owners: [], pending: [],
         low: [], high: [], roots: [], offsets: [], reached: [], width: 0, top: 0, persistent: 0,
-        replay: false, state: 0, allowance: 131072, units: 0, reads: 0, stores: 0,
+        replay: false, state: 0, allowance: 131072, units: 0, reads: 0, stores: 0, arithmetic: 0,
         count: 0, locals: 0, root: -1 }
 }
 pub fn status(work: &Workspace) -> i32 { work.state }
 pub fn units(work: &Workspace) -> i32 { work.units }
 pub fn read_count(work: &Workspace) -> i32 { if work.state == 1 || work.state == 2 { work.reads } else { 0 } }
 pub fn store_count(work: &Workspace) -> i32 { if work.state == 1 || work.state == 2 { work.stores } else { 0 } }
+pub fn arithmetic_count(work: &Workspace) -> i32 { if work.state == 1 || work.state == 2 { work.arithmetic } else { 0 } }
+pub fn proof_mask(work: &Workspace, node: i32) -> i32 {
+    if work.enabled && (work.state == 1 || work.state == 2) && node >= 0 && node < work.count { return work.pending[node] }
+    0
+}
+// Preserve the original bounds-only query for independent bounds consumers.
 pub fn produced(work: &Workspace, node: i32) -> bool {
-    work.enabled && (work.state == 1 || work.state == 2) && node >= 0 && node < work.count && work.pending[node]
+    proof_mask(&work, node).bit_and(2) != 0
 }
 // A lower budget is useful for deterministic exhaustion tests. It cannot
 // weaken validation or increase the production cap.
@@ -216,21 +223,50 @@ fn candidate(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, index: i
     if !w.replay || w.state >= 3 || !w.reached[state] || f.nodes.proofs[node].bit_and(2) != 0 || w.value_low[index] < 0 { return }
     saved := w.value_top; array := f.nodes.locals[node]; length := get(&mut w, state, w.variables[array])
     if w.state < 3 && ((w.value_root[index] == array && w.value_offset[index] <= -1) || w.value_high[index] < w.value_low[length]) {
-        if !w.pending[node] {
-            w.pending[node] = true
+        if w.pending[node].bit_and(2) == 0 {
+            w.pending[node] = w.pending[node].bit_or(2)
             if f.nodes.kinds[node] == 6 { w.reads = w.reads + 1 } else { w.stores = w.stores + 1 }
         }
     }
     w.value_top = saved
 }
-fn arithmetic(w: &mut Workspace, state: i32, op: i64, a: i32, b: i32) -> i32 {
+fn arithmetic_candidate(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, low: i64, high: i64) {
+    if !w.replay || w.state >= 3 || !w.reached[state] || node < 0 { return }
+    if f.nodes.types[node] != 1 || f.nodes.proofs[node].bit_and(1) != 0 || w.pending[node].bit_and(1) != 0 { return }
+    kind := f.nodes.kinds[node]; op := f.nodes.values[node]
+    if !((kind == 3 && op >= 1 && op <= 3) || (kind == 4 && op == 1)) { return }
+    if low >= -2147483648 && high <= 2147483647 {
+        w.pending[node] = w.pending[node].bit_or(1); w.arithmetic = w.arithmetic + 1
+    }
+}
+fn arithmetic(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, op: i64, a: i32, b: i32) -> i32 {
     result := top_value(&mut w)
-    if w.state >= 3 { return result }
-    if op == 1 || op == 2 {
-        if op == 1 { w.value_low[result] = w.value_low[a] + w.value_low[b]; w.value_high[result] = w.value_high[a] + w.value_high[b] }
-        else { w.value_low[result] = w.value_low[a] - w.value_high[b]; w.value_high[result] = w.value_high[a] - w.value_low[b] }
+    // An earlier child may have no normal checked continuation. Its clipped
+    // empty interval is not an i32 operand and must never reach raw math.
+    if w.state >= 3 || !w.reached[state] { return result }
+    if op >= 1 && op <= 3 {
+        // Canonical i32 endpoints make every add/sub and all four products
+        // exact in i64. Never use the clipped result to certify this node.
+        var low: i64 = 0; var high: i64 = 0
+        if op == 1 {
+            if !spend(&mut w, 1) { return result }
+            low = w.value_low[a] + w.value_low[b]; high = w.value_high[a] + w.value_high[b]
+        } else if op == 2 {
+            if !spend(&mut w, 1) { return result }
+            low = w.value_low[a] - w.value_high[b]; high = w.value_high[a] - w.value_low[b]
+        } else {
+            if !spend(&mut w, 4) { return result }
+            p0 := w.value_low[a] * w.value_low[b]; p1 := w.value_low[a] * w.value_high[b]
+            p2 := w.value_high[a] * w.value_low[b]; p3 := w.value_high[a] * w.value_high[b]
+            low = p0; high = p0
+            if p1 < low { low = p1 }; if p1 > high { high = p1 }
+            if p2 < low { low = p2 }; if p2 > high { high = p2 }
+            if p3 < low { low = p3 }; if p3 > high { high = p3 }
+        }
+        arithmetic_candidate(&mut w, &f, node, state, low, high)
+        w.value_low[result] = low; w.value_high[result] = high
         var source := -1; var amount: i64 = 0
-        if w.value_low[b] == w.value_high[b] { source = a; amount = w.value_low[b]; if op == 2 { amount = -amount } }
+        if op <= 2 && w.value_low[b] == w.value_high[b] { source = a; amount = w.value_low[b]; if op == 2 { amount = -amount } }
         else if op == 1 && w.value_low[a] == w.value_high[a] { source = b; amount = w.value_low[a] }
         if source >= 0 {
             offset := w.value_offset[source] + amount
@@ -267,12 +303,14 @@ fn expression_into(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, re
         w.top = saved; return
     }
     a := expression(&mut w, &f, f.nodes.left[node], state, depth + 1)
+    if w.state >= 3 || !w.reached[state] { return }
     if kind == 4 {
-        if f.nodes.types[node] == 1 { zero := number(&mut w, 0); item := arithmetic(&mut w, state, 2, zero, a); result_copy(&mut w, result, item) }
+        if f.nodes.types[node] == 1 { zero := number(&mut w, 0); item := arithmetic(&mut w, &f, node, state, 2, zero, a); result_copy(&mut w, result, item) }
         return
     }
     b := expression(&mut w, &f, f.nodes.right[node], state, depth + 1)
-    if f.nodes.types[node] == 1 { item := arithmetic(&mut w, state, f.nodes.values[node], a, b); result_copy(&mut w, result, item) }
+    if w.state >= 3 || !w.reached[state] { return }
+    if f.nodes.types[node] == 1 { item := arithmetic(&mut w, &f, node, state, f.nodes.values[node], a, b); result_copy(&mut w, result, item) }
 }
 fn split(w: &mut Workspace, f: &ir.Function, node: i32, input: i32, yes: i32, no: i32, depth: i32) {
     if w.state >= 3 { return }
@@ -327,7 +365,8 @@ fn loop_body(w: &mut Workspace, f: &ir.Function, node: i32, state: i32, depth: i
         if f.nodes.kinds[node] == 19 && w.state < 3 && w.reached[back] {
             local := w.variables[f.nodes.locals[node]]
             saved_values := w.value_top
-            prior := get(&mut w, back, local); one := number(&mut w, 1); next := arithmetic(&mut w, back, 1, prior, one)
+            // The intrinsic guarded latch has no source arithmetic node.
+            prior := get(&mut w, back, local); one := number(&mut w, 1); next := arithmetic(&mut w, &f, -1, back, 1, prior, one)
             put(&mut w, back, local, next); w.value_top = saved_values
         }
         copy(&mut w, proposal, state); join(&mut w, proposal, back)
@@ -400,18 +439,24 @@ fn initialize(w: &mut Workspace, f: &ir.Function, state: i32) {
     }
 }
 pub fn analyze_into(w: &mut Workspace, f: &ir.Function) -> bool {
-    w.state = 0; w.units = 0; w.reads = 0; w.stores = 0; w.width = 0; w.top = 0; w.value_top = 0; w.enabled = false; w.replay = false
+    w.state = 0; w.units = 0; w.reads = 0; w.stores = 0; w.arithmetic = 0; w.width = 0; w.top = 0; w.value_top = 0; w.enabled = false; w.replay = false
     w.count = f.nodes.kinds.len; w.locals = f.local_types.len; w.root = f.root
     // The verifier checks the closed opcode/effect set and graph before any
     // range traversal. Future calls/shape writes/escapes are not accepted.
     if !verify.validate_into(&mut w.validation, &f, true) { w.state = 4; return false }
-    var arrays := false
-    for i in 0..f.params { if ir.array_type(f.local_types[i]) { arrays = true } }
-    if !arrays { w.state = 1; return true }
+    var eligible := false
+    for i in 0..f.params { if ir.array_type(f.local_types[i]) { eligible = true } }
+    if !eligible {
+        for i in 0..w.count {
+            kind := f.nodes.kinds[i]; op := f.nodes.values[i]
+            if f.nodes.types[i] == 1 && ((kind == 3 && op >= 1 && op <= 3) || (kind == 4 && op == 1)) { eligible = true; break }
+        }
+    }
+    if !eligible { w.state = 1; return true }
     w.enabled = true
     while w.value_low.len < 1 { w.value_low.push(0); w.value_high.push(0); w.value_root.push(-1); w.value_offset.push(0) }
-    while w.pending.len < w.count { w.pending.push(false); w.headers.push(-1); w.limits.push(-1) }
-    for i in 0..w.count { w.pending[i] = false; w.headers[i] = -1; w.limits[i] = -1 }
+    while w.pending.len < w.count { w.pending.push(0); w.headers.push(-1); w.limits.push(-1) }
+    for i in 0..w.count { w.pending[i] = 0; w.headers[i] = -1; w.limits[i] = -1 }
     while w.variables.len < w.locals { w.variables.push(-1) }
     w.owners.clear()
     for i in 0..w.locals {
@@ -424,6 +469,10 @@ pub fn analyze_into(w: &mut Workspace, f: &ir.Function) -> bool {
     for i in 0..w.count {
         if f.nodes.kinds[i] == 19 { w.limits[i] = w.width; w.width = w.width + 1; w.owners.push(-1) }
     }
+    // A constant-only expression can still be a checked overflow candidate.
+    // Give its reachable-state flag one unused fact cell instead of rejecting
+    // the model or inventing a source local.
+    if w.width == 0 { w.width = 1; w.owners.push(-1) }
     for i in 0..w.count {
         if f.nodes.kinds[i] == 14 || f.nodes.kinds[i] == 19 { header := fresh(&mut w); w.headers[i] = header }
     }
@@ -449,13 +498,18 @@ pub fn apply(w: &mut Workspace, f: &mut ir.Function) {
     assert(f.nodes.next.len == w.count && f.nodes.values.len == w.count && f.nodes.locals.len == w.count && f.nodes.starts.len == w.count)
     assert(f.nodes.effects.len == w.count && f.nodes.proofs.len == w.count)
     for i in 0..w.count {
-        if w.pending[i] {
+        if w.pending[i].bit_and(1) != 0 {
+            assert(f.nodes.types[i] == 1)
+            assert((f.nodes.kinds[i] == 3 && f.nodes.values[i] >= 1 && f.nodes.values[i] <= 3) ||
+                (f.nodes.kinds[i] == 4 && f.nodes.values[i] == 1))
+        }
+        if w.pending[i].bit_and(2) != 0 {
             local := f.nodes.locals[i]
             assert(local >= 0 && local < f.params)
             assert((f.nodes.kinds[i] == 6 && f.nodes.types[i] == 2 && ir.array_type(f.local_types[local])) ||
                 (f.nodes.kinds[i] == 18 && f.nodes.types[i] == 0 && ir.writable_array(f.local_types[local])))
         }
     }
-    for i in 0..w.count { if w.pending[i] { f.nodes.proofs[i] = f.nodes.proofs[i].bit_or(2) } }
-    f.rewrites = f.rewrites + w.reads + w.stores; w.state = 2
+    for i in 0..w.count { if w.pending[i] != 0 { f.nodes.proofs[i] = f.nodes.proofs[i].bit_or(w.pending[i]) } }
+    f.rewrites = f.rewrites + w.reads + w.stores + w.arithmetic; w.state = 2
 }
