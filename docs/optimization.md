@@ -17,6 +17,11 @@ använder den allmänna stackvägen. Utvärderingsordning, operatorprioritet,
 kortslutning och aritmetikkontroller är desamma. Looparnas interna
 jämförelser behöver heller inte spilla operanderna till stacken.
 
+Rune-literaler avkodas under kompileringen och emitteras som skalära
+konstanter. Även Unicode och escape-sekvenser behöver därför ingen
+strängkonvertering eller rune-array under körning. En ensam rune-literal
+kan använda samma registerväg som andra skalära konstanter.
+
 Ett helt ägt temporärt uttryck kan överföra sitt värde till en deklaration,
 ett argument, en retur, en tilldelning eller en loop. Kompilatorn spårar
 uttryckets exakta ägarplats och nollställer den vid överföringen. Befintliga

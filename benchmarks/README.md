@@ -3,7 +3,7 @@
 Den aktuella självhostade kompilatorn mäts med
 [`tools/performance.py`](../tools/performance.py), som använder Python-standardbiblioteket.
 Den jämför två Dunder-kompilatorer med fyra runtimeprogram, ett genererat
-byggkorpus och kompilatorns egen källkod. Varje binärs resultat verifieras.
+byggkorpus, kompilatorns egen källkod och Tabell. Varje binärs resultat verifieras.
 Verktyget sparar råtider, median, p95, binärstorlek och SHA-256.
 
 ```sh
@@ -11,13 +11,18 @@ python3 tools/performance.py /path/to/baseline /path/to/candidate \
   /path/to/empty-report-directory --rounds 30 --c-compiler /usr/bin/clang
 ```
 
-`--suite runtime` och `--suite compiler` väljer en delmängd. C-referensen
+`--suite runtime` och `--suite compiler` väljer en delmängd. `--include-check`
+mäter även `check` på samtliga tre byggkällor. C-referensen
 är valfri och byggs med `-O3 -ftrapv`. Kompilatorerna och runtimeprogrammen
 körs med tom miljö och en PATH utan externa verktyg. Kör mätningarna utan
 andra avsiktligt tunga arbeten på värddatorn.
 
 [Resultat för självhosten, 2026-11-10](2026-11-10-selfhost-performance/README.md)
 innehåller de aktuella mätvillkoren och kvarvarande prestandagap.
+
+[Optimeringsgrund, 2026-11-11](2026-11-11-optimizer-foundation/README.md)
+mäter nästa etapp med fasrapportering, kontroll utan lagrad maskinkod,
+överförda temporärer, strömmande iteration och konstanta rune-literaler.
 
 ## Historiska byggmätningar
 
