@@ -482,10 +482,10 @@ NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering a
 | `<`, `<=`, `>`, `>=` | Lexikografisk ordning efter UTF-8-byte, utan språklig sortering. |
 | `value.str()` | Sträng av heltal, flyttal, bool eller rune. På string ges samma värde. |
 
-`.bytes()` och `.runes()` är återanvändbara vyer över ett oföränderligt
-strängvärde. De allokerar ingen array. Deras typer härleds med `:=` och har
-ännu ingen egen typstavning. Om originalbindningen får en ny sträng behåller
-en befintlig vy sitt gamla värde. `for` direkt över en string avvisas:
+`.bytes()` och `.runes()` ger självständiga arrayer av typen `[]i32`
+respektive `[]rune`. Direkt iteration kan strömma från en behållen
+strängsnapshot utan mellanarray. Om originalbindningen får en ny sträng
+behåller konverteringen eller iterationen sina gamla värden. `for` direkt över en string avvisas:
 välj `.bytes()` eller `.runes()` uttryckligt. `break` och `continue` fungerar
 för båda. Arrayiteratorernas befintliga kopieringsregler gäller fortfarande.
 Strängsnitt kan också ta ett lagrat eller returnerat `range`-värde,
