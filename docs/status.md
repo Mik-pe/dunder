@@ -69,8 +69,8 @@ och [macOS-appar](app-bundles.md).
 ## Körda Wasm-kontrakt
 
 Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 121 av de 129 grupperna med godkänt
-resultat. De åtta övriga har nåbara nativa systemanrop.
+till en separat Wasm-modul. Node körde 122 av de 134 grupperna med godkänt
+resultat. De tolv övriga har nåbara nativa systemanrop.
 
 | Grupp | Nativt beroende |
 | --- | --- |
@@ -82,6 +82,10 @@ resultat. De åtta övriga har nåbara nativa systemanrop.
 | `selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::compiler_checks_types_before_emitting_an_image` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation` | Kompilatorns filåtkomst |
+| `selfhost/compile.ddr::inline_producer_preserves_authoritative_diagnostics_and_scalar_off_behavior` | Den nativa kompilatorns fil- och cachekod |
+| `selfhost/compile.ddr::inline_producer_does_not_duplicate_source_binding_reports` | Den nativa kompilatorns fil- och cachekod |
+| `selfhost/compile.ddr::inline_fragments_restore_backward_dependencies_charges_and_private_body_identity` | Skrivning och återställning av cachefiler |
+| `selfhost/compile.ddr::inline_fragment_keys_preserve_cold_growth_frontiers_across_partial_cache_hits` | Ändring och återställning av cachefiler |
 
 Wasm-värden kontrollerar dessa gruppnamn och diagnostiken för nativa anrop.
 Bland de körda grupperna finns SHA-256 med referensvektorer och olika
