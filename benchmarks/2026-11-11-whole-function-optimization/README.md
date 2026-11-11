@@ -122,3 +122,30 @@ source audit found no descriptor retain/release for borrowed field indexing
 and no large value-array iteration snapshots in current MIR modules. Therefore
 these counters do not establish ARC overhead inside the MIR value solver;
 the compact-domain change targets its actual per-block/register state.
+
+
+## Compact fact domain: build-cost gate
+
+`compact-compiler` uses 30 attempts per variant with the exclusive compiler
+as baseline and compact compiler
+`20747ca7918906b7958feacc692a0a6f3f92998533038153e0b73088e76b300d`
+as candidate. Both use the same complete profile and source checkout.
+
+| Build | Exclusive median | Compact median | Compact p95 |
+| --- | --- | --- | --- |
+| Generated | 1590.552 ms | 1052.696 ms | 1068.744 ms |
+| Self-host | 1179.310 ms | 843.187 ms | 864.602 ms |
+| Tabell | 28.876 ms | 20.907 ms | 23.966 ms |
+
+The generated build improves 33.8% but still narrowly misses 100,000 lines/s.
+This remains a build-cost gate, not an acceptance claim. Compact/full-domain
+verification passed 36 native and 36 Wasm groups, 384 images and 192 executions.
+128 pairs have identical semantic MIR, optimization counters and images; all
+256 historical baseline/on hashes are unchanged. In that finite corpus the
+compact domain has 2–6 slots and charges 576,780 aggregate units against
+1,491,644 for full domains. These are structural work counts, not latency.
+
+A following identity-transfer correction skips fact-table access when the
+complete GP write/clobber projection is empty. SP, FP and NZCV remain separate;
+actual GP W writes retain their zero-extension effects. All 384 image,
+counter, unit and oracle records remain exactly unchanged by that correction.
