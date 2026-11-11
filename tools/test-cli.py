@@ -323,6 +323,58 @@ def range_optimizer_controls(p):
         assert run.returncode == 101 and run.stdout == '' and run.stderr == '', run
 
 
+def inline_optimizer_controls(p):
+    source = 'fn step(value:i64)->i64{value*3+1}\nfn main(){print(step(2))}\n'
+    p.write('inline.ddr', source)
+    def build(mode, name, cached=False, scalar='on'):
+        flags = ['--incremental'] if cached else []
+        result = p.call('build', 'inline.ddr', '--inline-opt=' + mode,
+                        '--scalar-opt=' + scalar, '--timings=json', '-o', name, *flags)
+        return json.loads(result.stderr)
+    disabled = build('off', 'inline-off')
+    enabled = build('on', 'inline-on')
+    assert not disabled['inlining']['enabled']
+    assert all(value == 0 for key, value in disabled['inlining'].items() if key != 'enabled')
+    data = enabled['inlining']
+    assert data['enabled'] and 0 < data['entries'] <= 256 and 0 < data['nodes'] <= 4096, data
+    assert 0 < data['tokens'] <= 32768 and 0 < data['units'] <= 65536, data
+    assert data['calls'] == 1 and 0 < data['words'] <= data['estimated_words'] <= 65536, data
+    assert (p.root/'inline-on').read_bytes() != (p.root/'inline-off').read_bytes()
+    for name in ('inline-on', 'inline-off'):
+        run = subprocess.run([p.root/name], capture_output=True, text=True, timeout=10)
+        assert run.returncode == 0 and run.stdout == '7\n' and not run.stderr, run
+    for mode in ('off', 'on'):
+        scalar_off = build(mode, 'inline-scalar-' + mode, scalar='off')['inlining']
+        assert not scalar_off['enabled'] and scalar_off['calls'] == 0 and scalar_off['tokens'] == 0
+    assert (p.root/'inline-scalar-on').read_bytes() == (p.root/'inline-scalar-off').read_bytes()
+    assert build('off', 'inline-cached-off', True)['functions']['reused'] == 0
+    assert build('off', 'inline-cached-off', True)['functions']['reused'] > 0
+    assert build('on', 'inline-cached-on', True)['functions']['reused'] == 0
+    build('on', 'inline-cached-on', True)
+    expected_image = (p.root/'inline-on').read_bytes()
+    assert (p.root/'inline-cached-on').read_bytes() == expected_image
+    # Caller fragments must follow private callee changes even without a BL.
+    p.write('inline.ddr', source.replace('value*3+1', 'value*3+4'))
+    changed = build('on', 'inline-changed', True)
+    assert changed['functions']['reused'] == 0, changed
+    build('on', 'inline-uncached')
+    assert (p.root/'inline-changed').read_bytes() == (p.root/'inline-uncached').read_bytes()
+    run = subprocess.run([p.root/'inline-changed'], capture_output=True, text=True, timeout=10)
+    assert run.returncode == 0 and run.stdout == '10\n' and not run.stderr, run
+    off = p.call('check', 'inline.ddr', '--agent', '--inline-opt=off')
+    on = p.call('check', 'inline.ddr', '--agent', '--inline-opt=on', '--timings=json')
+    assert off.stdout == on.stdout and off.stderr == ''
+    checking = json.loads(on.stderr)['inlining']
+    assert not checking['enabled'] and checking['calls'] == checking['tokens'] == 0
+    p.write('inline-tests.ddr', 'fn step(x:i32)->i32{x*3+1}\n@test fn works(){step(2)==7}\n')
+    for mode, expected in [('off','1 passed'),('off','1 unaffected'),
+                           ('on','1 passed'),('on','1 unaffected'),('off','1 passed')]:
+        result = p.call('test', 'inline-tests.ddr', '--inline-opt=' + mode,
+                        '--affected', '-o', 'inline-results')
+        assert expected in result.stdout, result
+    p.call('check', 'inline.ddr', '--inline-opt=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -362,7 +414,8 @@ def compiler_profile_controls(p):
     report = json.loads(off.stderr)['compiler_detail']
     assert report['calls']['model_parse'] == 0 and report['calls']['legacy_body'] > 0
     human = p.call('build', 'profile.ddr', '--profile-compiler', '-o', 'human')
-    assert 'compiler allocation=' in human.stderr and 'compiler legacy_body=' in human.stderr
+    for phase in phases:
+        assert human.stderr.count('compiler ' + phase + '=') == 1, (phase, human.stderr)
 
 
 def runtime_profile_controls(p):
@@ -503,7 +556,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, isolated_tests, filesystem]
+             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
