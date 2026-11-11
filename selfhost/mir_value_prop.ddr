@@ -11,6 +11,33 @@ import mir_scalar_contract as scalar
 import mir_liveness as live
 import mir_verify as verify
 
+// Trusted producer premises, separate from Function metadata and NoReturn.
+// Declaring a target promises that its terminal behavior has no observable
+// dependence on incoming registers/flags or incoming user-memory contents.
+// It must not return, invoke user code, format a value, or inspect a user
+// pointer. Merely never returning does NOT establish this stronger promise.
+// Epoch1 describes these semantics; labels carry no inferred source meaning.
+pub opaque struct Context { valid: bool, epoch: i32, labels: []i32 }
+pub fn policy_tag() -> string { "mir-value-terminal1" }
+pub fn context(epoch: i32) -> Context { Context { valid: epoch == 1, epoch: epoch, labels: [] } }
+pub fn declare_unobserving_terminal(ctx: &mut Context, label: i32) -> bool {
+    if !ctx.valid || label < 0 { ctx.valid = false; return false }
+    var at := 0
+    while at < ctx.labels.len && ctx.labels[at] < label { at = at + 1 }
+    if at < ctx.labels.len && ctx.labels[at] == label { return true }
+    ctx.labels.push(label); var i := ctx.labels.len - 1
+    while i > at { ctx.labels[i] = ctx.labels[i - 1]; i = i - 1 }
+    ctx.labels[at] = label; true
+}
+// The current source producer may justify this premise for its six owned
+// traps only: arm.runtime's overflow/zero/assertion/io and finish_image's
+// float_trap/bounds enter arm.exit directly. That tail materializes its own
+// constant status and syscall number, then terminates (or executes BRK).
+// Native exit observes only that status; Wasm exit is unreachable. It neither
+// dereferences an incoming pointer nor runs cleanup/callbacks. An allocator
+// exhaustion tail or an I/O helper does not satisfy this proof. The caller
+// must supply the actual owned label IDs; this module grants none implicitly.
+
 pub opaque struct Workspace {
     candidate: mir.Function, verifier: verify.Workspace, liveness: live.Workspace,
     source: []i64, approved: []i64, current: []i64, definitions: []i32,
@@ -190,11 +217,26 @@ fn graph(w: &mut Workspace, f: &mir.Function) -> bool {
     true
 }
 // A boundary without a declared observation contract can inspect any register.
-// The shared liveness API does not yet carry such an exit mask. Refuse the
-// whole optional pass instead of letting DCE erase predecessor definitions
-// that are observed only outside this function. Source labels do not imply a
-// no-return contract. Unreachable exits impose no condition on reachable code.
-fn contracted_exits(w: &mut Workspace, f: &mir.Function) -> bool {
+// Only an explicit unobserving-terminal contract permits an empty live-out
+// set. Otherwise refuse the whole pass before DCE can erase definitions that
+// are observed outside the function. Unreachable exits impose no condition.
+fn declared_exit(w: &mut Workspace, f: &mir.Function, block: i32, labels: &[]i32, epoch: i32) -> bool {
+    if epoch != 1 { return false }
+    var last := -1
+    for position in f.block_starts[block]..f.block_ends[block] {
+        if !charge(&mut w, 1) { return false }
+        op := f.order[position]; if f.modes[op] != 2 { last = op }
+    }
+    if last < 0 || (f.kinds[last] != 12 && f.kinds[last] != 13) { return false }
+    target := f.targets[last]; var first := 0; var end := labels.len
+    while first < end {
+        if !charge(&mut w, 1) { return false }
+        middle := first + (end - first) / 2
+        if labels[middle] < target { first = middle + 1 } else { end = middle }
+    }
+    first < labels.len && labels[first] == target
+}
+fn contracted_exits(w: &mut Workspace, f: &mir.Function, labels: &[]i32, epoch: i32) -> bool {
     if !charge(&mut w, f.block_starts.len + f.edge_to.len * 2) { return false }
     for b in 0..f.block_starts.len { w.reached.push(false) }
     w.reached[0] = true; w.queue.push(0); var next := 0
@@ -203,7 +245,11 @@ fn contracted_exits(w: &mut Workspace, f: &mir.Function) -> bool {
         for e in f.edge_starts[b]..f.edge_starts[b + 1] {
             to := f.edge_to[e]
             if to < 0 {
-                if f.edge_kinds[e] != 3 { w.state = -2; return false }
+                if f.edge_kinds[e] != 3 {
+                    var declared := false
+                    if f.edge_kinds[e] == 2 { declared = declared_exit(&mut w, &f, b, &labels, epoch) }
+                    if !declared { if w.state != -3 { w.state = -2 }; return false }
+                }
             } else if !w.reached[to] { w.reached[to] = true; w.queue.push(to) }
         }
     }
@@ -629,8 +675,9 @@ fn dead(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function) -> bool {
     }
     true
 }
-fn analyze_plan(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, limit: i32) -> bool {
+fn analyze_plan(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, labels: &[]i32, epoch: i32, limit: i32) -> bool {
     reset(&mut w, limit); plan.valid = false
+    if epoch < 0 || epoch > 1 { w.state = -1; return false }
     if !f.valid || !f.verified { w.state = -1; return false }
     if !f.optimizable || f.unknown_control { w.state = -2; return false }
     n := f.kinds.len; blocks := f.block_starts.len
@@ -639,7 +686,7 @@ fn analyze_plan(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, li
     if !charge(&mut w, n) { return false }; var candidates := false
     for op in 0..n { if f.modes[op] != 2 && (f.kinds[op] == 1 || f.kinds[op] == 2 || (f.kinds[op] == 3 && f.opcodes[op] == 3)) { candidates = true } }
     if !candidates { return false }
-    if !contracted_exits(&mut w, &f) { return false }
+    if !contracted_exits(&mut w, &f, &labels, epoch) { return false }
     if !graph(&mut w, &f) || !solve(&mut w, &f) || !replay(&mut w, &mut plan, &f) { return false }
     if !check_plan(&mut w, &mut plan) || !dead(&mut w, &mut plan, &f) || !check_plan(&mut w, &mut plan) { return false }
     if !plan.valid || (w.rewrites == 0 && w.deleted == 0) { w.state = 0; return false }
@@ -655,9 +702,18 @@ fn analyze_plan(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, li
 // the source-function loop. Never copy/swap a Function aggregate: its owned
 // array columns have value semantics. This API only traverses borrowed columns.
 pub fn analyze_budget(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, limit: i32) -> bool {
-    analyze_plan(&mut w, &mut plan, &f, limit)
+    // Epoch0 ignores the borrowed column: raw callers require no Context
+    // allocation and retain the conservative external-boundary policy.
+    analyze_plan(&mut w, &mut plan, &f, &f.label_ids, 0, limit)
 }
 pub fn analyze_into(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function) -> bool { analyze_budget(&mut w, &mut plan, &f, 4194304) }
+pub fn analyze_with_context_budget(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, ctx: &Context, limit: i32) -> bool {
+    var epoch := ctx.epoch; if !ctx.valid { epoch = -1 }
+    analyze_plan(&mut w, &mut plan, &f, &ctx.labels, epoch, limit)
+}
+pub fn analyze_with_context(w: &mut Workspace, plan: &mut mir.Function, f: &mir.Function, ctx: &Context) -> bool {
+    analyze_with_context_budget(&mut w, &mut plan, &f, &ctx, 4194304)
+}
 pub fn apply(w: &mut Workspace, plan: &mir.Function, f: &mut mir.Function) -> bool {
     if w.state != 1 { return false }
     if source_size(&plan) != w.approved.len { w.state = -1; return false }
