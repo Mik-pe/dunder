@@ -20,8 +20,12 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Kompilatordogfood och attribuering, 2026-11-11](2026-11-11-compiler-dogfood/README.md)
+är nästa grund: separata fasur och allokeringsräknare, oberoende konsumentfall
+och mätning av infrastrukturen med profileringen avstängd.
+
 [Verifierade loopar och elementmutation, 2026-11-11](2026-11-11-verified-mutation/README.md)
-är senaste etappen: räknade loopar, exklusiv elementmutation, obligatorisk
+är föregående optimeringsetapp: räknade loopar, exklusiv elementmutation, obligatorisk
 IR-verifiering och gemensamma språkregler. Sortering och självbygge blir
 snabbare; kostnaden på genererad stresskod redovisas uttryckligen.
 

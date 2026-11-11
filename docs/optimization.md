@@ -23,6 +23,10 @@ Alla grenar kontrolleras innan optimeringen börjar, även om ett villkor
 tar den befintliga kompilatorn över, inklusive feldiagnostik. Gränserna
 är 4 096 token, 2 048 noder, 256 lokaler och konservativt djup 64.
 Detta är en lokal IR per funktion; någon helprograms-IR eller SSA byggs inte.
+IR är ett tillåtet verktyg i kompilatorns fortsatta utveckling. Valet mellan
+strukturerad modell, SSA och lägre funktionsrepresentation ska styras av
+bevisbehov och uppmätt total byggtid. Snabb kompilering är kravet; att undvika
+en viss representation är inget eget mål.
 
 [Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
@@ -120,9 +124,13 @@ bakom snabbare genererad stresskod.
 Prioritera nästa mekanism efter profiler och maskinkod för arbetsfallen
 som fortfarande missar målet. Mät allokering och kopiering i lexer, parser
 och bibliotek separat när de dominerar; fler maskinkodspass löser inte
-automatiskt dessa kostnader. Separata valbara fastider för modellbygge,
-förenkling, registerallokering och emission blir användbara när den lokala
-vägen får större täckning.
+automatiskt dessa kostnader. Den valbara flaggan `--profile-compiler` fördelar
+nu kompilatorarbetet mellan modellbygge, verifiering, förenkling,
+registerallokering, emission och den fulla frontendens kroppar.
+`--runtime-profile` räknar utförd allokerings- och kopieringstrafik i ett
+byggt program. Klockor och allokeringsräknare används i separata observationer;
+vanliga binärer används för tidsjämförelser.
+[Profileringskontrakt](incremental.md#mät-byggkedjans-faser).
 
 ## Övrig kodgenerering och runtime
 

@@ -70,6 +70,51 @@ Lyckade byggen och kontroller ger rapporter; misslyckade eller enbart
 listande kommandon ger ingen avslutad tidsrapport. Vanlig stdout och
 `check --agent` behåller sina format. Utan flaggan tas inga tidsstämplar.
 
+### Fördela kompilatorns eget arbete
+
+```sh
+dunder build selfhost/main.ddr --profile-compiler --timings=json -o build/measured
+```
+
+`--profile-compiler` aktiverar tidsrapporten och lägger till `compiler_detail`.
+Fältet delar kompilatorintervallet i tio icke överlappande faser:
+`declarations`, `model_parse`, `verify_pre`, `simplify`, `verify_post`,
+`allocation`, `scalar_emit`, `legacy_body`, `fragment_cache` och `finalize`.
+`covered` summerar dessa intervall; `other` är återstoden av `compiler`.
+`calls` och `work` anger antal besök och arbetsenhet för varje fas. Samtliga
+klockor använder värdplattformen även när målet är ett annat.
+
+Klockfel ger `null` för tidsfördelningen. En fas som inte körs har noll besök;
+den är inte ett uppmätt snabbt arbete. Kontroll utan emission besöker inte
+registerallokering eller skaläremission. Profilering ändrar inte den byggda
+bilden. Utan flaggan tas inga inre tidsstämplar eller arbetsräknaruppdateringar.
+Profileringen har själv en kostnad, så vanliga byggen används i jämförande
+prestandaserier.
+
+### Räkna allokeringar i det byggda programmet
+
+```sh
+dunder build examples/hello.ddr --runtime-profile -o build/profiled-hello
+./build/profiled-hello
+```
+
+Efter en normal retur från `main` skriver programmet en `runtime_profile`
+v1-JSON-post på stderr. Den räknar utförda allokeringar, begärda och
+storleksklassade payloadbyte, nya och återanvända block, retain/release-anrop,
+arraykloner, strängsnitt, postkonstruktion, postkloner och kopierade byte.
+Heltalsräknarna är modulo 2^64. Retain/release räknar även anrop med noll och
+odödliga strängar. Dessa trafikmått mäter inte levande minne eller toppminne.
+Rapportformatet allokerar inget och dess poolinitiering räknas inte som en
+vanlig allokering. Vanlig stdout och programmets exitstatus bevaras, även om
+stderr är stängd. Fällor och explicita processavslut har ingen slutrapport.
+
+Flaggan stöds för de tre nativa målen. `check` accepterar inte flaggan.
+Cachefragment och `test --affected` skiljer profilerade och vanliga
+byggen åt. Kör allokering och kompilatorns fastider i separata observationer:
+klockans egna temporära värden skulle annars ingå i allokeringstrafiken.
+[Oberoende dogfood-fall](../benchmarks/dogfood/README.md) har ett verktyg för
+validerad allokeringsattribuering och en separat vanlig tidsserie.
+
 ## Kör berörda tester
 
 `test --affected` kör alla grupper första gången. Därefter återanvänder den
