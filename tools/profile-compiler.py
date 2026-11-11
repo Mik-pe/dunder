@@ -16,9 +16,9 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 ENV = {'PATH':'/no-external-tools'}
 PHASES = ['declarations','model_parse','verify_pre','simplify','verify_post',
-          'allocation','scalar_emit','legacy_body','fragment_cache','finalize']
+          'allocation','scalar_emit','legacy_body','fragment_cache','finalize','range_analysis']
 UNITS = ['functions','tokens','nodes','visits','nodes','frame_values','words',
-         'tokens','operations','bytes']
+         'tokens','operations','bytes','operations']
 PIPELINE = {'module_load_lex_resolve','build_setup','compiler','image_format_sign','publication'}
 
 

@@ -266,6 +266,41 @@ def frame_free_controls(p):
     p.call('check', 'frames.ddr', '--frame-free=unknown', status=2)
 
 
+def range_optimizer_controls(p):
+    p.write('range.ddr', 'fn fill(values:&mut[]i64){for i in 0..values.len{values[i]=values[i]+1}}\n'
+            'fn main(){var values:[]i64=[41,17];fill(&mut values);print(values[0])}\n')
+    def build(mode, name, cached=False, profiled=False):
+        flags = (['--incremental'] if cached else []) + (['--profile-compiler'] if profiled else [])
+        result = p.call('build', 'range.ddr', '--range-opt=' + mode,
+                        '--timings=json', '-o', name, *flags)
+        return json.loads(result.stderr)
+    enabled = build('on', 'range-on', profiled=True)
+    disabled = build('off', 'range-off', profiled=True)
+    assert enabled['optimizer']['proven_bounds'] >= 2 and disabled['optimizer']['proven_bounds'] == 0
+    assert enabled['compiler_detail']['calls']['range_analysis'] >= 1
+    assert enabled['compiler_detail']['work']['range_analysis_operations'] > 0
+    assert disabled['compiler_detail']['calls']['range_analysis'] == 0
+    assert (p.root/'range-on').read_bytes() != (p.root/'range-off').read_bytes()
+    for name in ('range-on', 'range-off'):
+        result = subprocess.run([p.root/name],capture_output=True,text=True,timeout=10)
+        assert result.returncode == 0 and result.stdout == '42\n' and not result.stderr, result
+    on = p.call('check', 'range.ddr', '--agent', '--range-opt=on')
+    off = p.call('check', 'range.ddr', '--agent', '--range-opt=off')
+    assert on.stdout == off.stdout and on.stderr == off.stderr == ''
+    assert build('on', 'cached-on', True)['functions']['reused'] == 0
+    assert build('on', 'cached-on', True)['functions']['reused'] > 0
+    assert build('off', 'cached-off', True)['functions']['reused'] == 0
+    assert build('off', 'cached-off', True)['functions']['reused'] > 0
+    assert build('on', 'cached-on', True)['functions']['reused'] > 0
+    p.write('range-tests.ddr', 'fn fill(values:&mut[]i64){for i in 0..values.len{values[i]=1}}\n'
+            '@test fn works(){var values:[]i64=[0,0];fill(&mut values);values[0]==1}\n')
+    for mode, expected in [('on','1 passed'),('on','1 unaffected'),
+                           ('off','1 passed'),('off','1 unaffected'),('on','1 passed')]:
+        result = p.call('test', 'range-tests.ddr', '--affected', '--range-opt=' + mode, '-o', 'range-results')
+        assert expected in result.stdout, result
+    p.call('check', 'range.ddr', '--range-opt=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -273,7 +308,7 @@ def compiler_profile_controls(p):
     result = p.call('build', 'profile.ddr', '--profile-compiler', '--timings=json', '-o', 'profile')
     assert (p.root / 'plain').read_bytes() == (p.root / 'profile').read_bytes()
     phases = {'declarations','model_parse','verify_pre','simplify','verify_post',
-              'allocation','scalar_emit','legacy_body','fragment_cache','finalize'}
+              'allocation','scalar_emit','legacy_body','fragment_cache','finalize','range_analysis'}
 
     def detail(result):
         report = json.loads(result.stderr)
@@ -298,7 +333,7 @@ def compiler_profile_controls(p):
                          '--profile-compiler', '--timings=json')
         assert checked.stdout == normal.stdout
         d = detail(checked)
-        for skipped in ('simplify','verify_post','allocation','scalar_emit','finalize'):
+        for skipped in ('simplify','verify_post','allocation','scalar_emit','finalize','range_analysis'):
             assert d['phases'][skipped] == d['calls'][skipped] == 0, d
     off = p.call('build', 'profile.ddr', '--scalar-opt=off', '--profile-compiler',
                  '--timings=json', '-o', 'off')
@@ -446,7 +481,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, isolated_tests, filesystem]
+             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
