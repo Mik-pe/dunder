@@ -33,12 +33,14 @@ run with `PATH=/no-external-tools` and no inherited environment variables.
 
 ## Calibrate once and freeze counts
 
-The checked-in inputs are frozen. Initial work counts are proposals and
-`workloads.json` deliberately has `frozen: false`: **comparison refuses this
-manifest until counts have been reviewed and frozen**.
+The checked-in inputs and work counts are frozen. `workloads.json` records the
+designated baseline and the [raw calibration](../2026-11-11-compiler-dogfood/calibration/).
+The reviewed counts are POD 16,135; decimal 550; lexer 20; symbols 30. The
+comparison rejects any manifest with `frozen: false`.
 
-Only the controlling parent should run calibration and timing series. Calibrate
-one designated baseline, then retain exactly the same counts for every variant:
+For a future version of the workload, only the controlling parent should run
+calibration and timing series. Calibrate one designated baseline, then retain
+exactly the same counts for every variant:
 
 ```sh
 python3 tools/profile-dogfood.py calibrate /path/to/baseline \
