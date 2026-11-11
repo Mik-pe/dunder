@@ -68,6 +68,25 @@ def malformed(numbers):
     yield 'extra-word', numbers + [0]
 
 
+def malformed_native3(numbers):
+    words, labels, relocs = numbers[:3]
+    label_at = 3 + words
+    reloc_at = label_at + labels
+    for name, index, value in (
+            ('zero-words', 0, 0), ('huge-words', 0, 0xffffffff),
+            ('huge-labels', 1, 0xffffffff), ('huge-relocs', 2, 0xffffffff),
+            ('bad-label', label_at, words + 1), ('unset-label', label_at, 0xffffffff),
+            ('bad-at', reloc_at, words), ('negative-at', reloc_at, 0xffffffff),
+            ('kind', reloc_at + 2, 21), ('conditional-width', reloc_at, words - 1),
+            ('private-target', reloc_at + 1, labels),
+            ('unbound-private', reloc_at + 1, labels - 1),
+            ('global-target', reloc_at + 1, 0x80000003)):
+        changed = list(numbers); changed[index] = value
+        yield name, changed
+    yield 'truncated', numbers[:-1]
+    yield 'extra', numbers + [0]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
@@ -110,9 +129,12 @@ def main():
                         direct = work / f'{target}-{selection}-rebased-cold'
                         scratch_cache = work / f'{target}-{selection}-rebased.fn'
                         run([fixture, 'generate', scratch_cache, target, direct, padding, selection], work)
-                    for mode, fragment in (('restore', cache), ('restore-old', legacy)):
-                        hot = work / f'{target}-{selection}-{padding}-{mode}'
-                        run([fixture, mode, fragment, target, hot, padding, limit, budget, 'yes', selection], work)
+                    for mode, fragment, expected_deps in (
+                            ('restore', cache, selection), ('restore-old', legacy, selection),
+                            ('restore-cached', cache, selection), ('restore-cached', legacy, 'empty')):
+                        hot = work / f'{target}-{selection}-{padding}-{mode}-{expected_deps}'
+                        allowed, available = (0, 0) if expected_deps == 'empty' else (limit, budget)
+                        run([fixture, mode, fragment, target, hot, padding, allowed, available, 'yes', expected_deps], work)
                         assert hot.read_bytes() == direct.read_bytes(), (target, selection, padding, mode, 'cold/hot image mismatch')
                         images += 1
                         if target in (host, 3):
@@ -121,6 +143,10 @@ def main():
                             executions += 1
                 if selection == 'normal':
                     run([fixture, 'save-invalid', work / f'invalid-save-{target}', target, work / 'unused', 0], work)
+                    for label, entries in (('native3-minimum', [1, 0, 0, 3596551104]),
+                                           ('dufd-minimum', [0x44554644, 1, 1, 0, 0, 0, 0, 3596551104])):
+                        minimal = work / f'{target}-{label}.fn'; minimal.write_bytes(signed(key, entries))
+                        run([fixture, 'restore-minimum', minimal, target, work / 'unused', 0, 0, 0, 'yes', 'empty'], work)
                     # The old and new readers must both fail closed on the
                     # other's format, preserving Code and output metadata.
                     for mode, fragment in (('restore', legacy), ('restore-old', cache)):
@@ -129,38 +155,53 @@ def main():
                         assert image.read_bytes() == b'previous image'
                         rejections += 1
                     for guard in ('marked', 'checking', 'entry', 'globals', 'reloc-arrays'):
-                        run([fixture, 'restore', cache, target, work / 'unused', 0, limit, budget,
-                             'no', selection, guard], work, b'0\n')
-                        rejections += 1
+                        for mode, fragment in (('restore', cache), ('restore-cached', cache), ('restore-cached', legacy)):
+                            run([fixture, mode, fragment, target, work / 'unused', 0, limit, budget,
+                                 'no', selection, guard], work, b'0\n')
+                            rejections += 1
                     for label, entries in malformed(numbers):
                         bad = work / f'{target}-{label}.fn'; bad.write_bytes(signed(key, entries))
-                        run([fixture, 'restore', bad, target, work / 'unused', 0, limit, 65536, 'no'], work, b'0\n')
-                        rejections += 1
+                        for mode in ('restore', 'restore-cached'):
+                            run([fixture, mode, bad, target, work / 'unused', 0, limit, 65536, 'no'], work, b'0\n')
+                            rejections += 1
+                    for label, entries in malformed_native3(old_numbers):
+                        bad = work / f'{target}-native3-{label}.fn'; bad.write_bytes(signed(key, entries))
+                        for mode in ('restore-old', 'restore-cached'):
+                            run([fixture, mode, bad, target, work / 'unused', 0, 0, 0, 'no'], work, b'0\n')
+                            rejections += 1
                     for label, raw in (('non-hex', b'g' + new_data[129:]),
                                        ('unaligned', new_data[128:] + b'0'),
                                        ('header-only', new_data[128:184])):
                         bad = work / f'{target}-{label}.fn'; bad.write_bytes(signed(key, raw=raw))
-                        run([fixture, 'restore', bad, target, work / 'unused', 0, limit, budget, 'no'], work, b'0\n')
-                        rejections += 1
+                        for mode in ('restore', 'restore-cached'):
+                            run([fixture, mode, bad, target, work / 'unused', 0, limit, budget, 'no'], work, b'0\n')
+                            rejections += 1
                     for label, raw in (('bad-signature', key + b'0'*64 + new_data[128:]),
                                        ('wrong-key', b'0'*64 + new_data[64:]),
                                        ('short-file', new_data[:128]), ('empty-file', b'')):
                         bad = work / f'{target}-{label}.fn'; bad.write_bytes(raw)
-                        run([fixture, 'restore', bad, target, work / 'unused', 0, limit, budget, 'no'], work, b'0\n')
-                        rejections += 1
+                        for mode in ('restore', 'restore-cached'):
+                            run([fixture, mode, bad, target, work / 'unused', 0, limit, budget, 'no'], work, b'0\n')
+                            rejections += 1
                 for bad_limit, bad_budget in ((limit, budget-1), (limit, -1), (-1, 65536)):
-                    run([fixture, 'restore', cache, target, work / 'unused', 0, bad_limit, bad_budget, 'no'], work, b'0\n')
+                    for mode in ('restore', 'restore-cached'):
+                        run([fixture, mode, cache, target, work / 'unused', 0, bad_limit, bad_budget, 'no'], work, b'0\n')
+                        rejections += 1
+                for bad_limit, bad_budget in ((-1, 0), (0, -1)):
+                    run([fixture, 'restore-cached', legacy, target, work / 'unused', 0, bad_limit, bad_budget, 'no'], work, b'0\n')
                     rejections += 1
                 if selection != 'builtin':
                     bad_limit = 9 if selection == 'normal' else 255
-                    run([fixture, 'restore', cache, target, work / 'unused', 0, bad_limit, 65536, 'no'], work, b'0\n')
-                    rejections += 1
+                    for mode in ('restore', 'restore-cached'):
+                        run([fixture, mode, cache, target, work / 'unused', 0, bad_limit, 65536, 'no'], work, b'0\n')
+                        rejections += 1
                 print('PASS', f'target={target}', selection, 'metadata, native3 bytes, cold/hot rebasing', flush=True)
         oversized = work / 'oversized.fn'
         with oversized.open('wb') as file:
             file.truncate(67108865)
-        run([fixture, 'restore', oversized, host, work / 'unused', 0, 16, 65536, 'no'], work, b'0\n')
-        rejections += 1
+        for mode in ('restore', 'restore-cached'):
+            run([fixture, mode, oversized, host, work / 'unused', 0, 16, 65536, 'no'], work, b'0\n')
+            rejections += 1
     assert hashlib.sha256(compiler.read_bytes()).hexdigest() == compiler_hash, 'compiler changed during test'
     print(f'{images} byte-identical cold/hot images; {executions} host/Wasm executions; '
           f'{rejections} atomic restore rejections; record/charge/reset and invalid-save checks passed')
