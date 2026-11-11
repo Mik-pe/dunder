@@ -9,8 +9,10 @@ Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
 GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
 begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
 Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
-är implementerade i kompilatorns kodgenerering. Generella livstider,
-explicita flyttar och full registerallokering är fortsatt designmål. Nativebyggen
+är implementerade i kompilatorns kodgenerering. Anropsfria skalära funktioner
+kan använda en typad lokal modell, begränsat optimeringspass och
+registerallokering. Generella livstider, explicita flyttar och registerallokering
+för hela språket är fortsatt designmål. Nativebyggen
 kan använda [funktionscachen](incremental.md).
 
 ## Språkets kostnadsmodell
@@ -54,10 +56,14 @@ Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och os
 
 1. **Läs moduler och samla deklarationer.** Varje fil läses till en sammanhängande buffer. Namn interneras och källpositioner sparas som offset. Modulernas exporterade typer och funktionssignaturer fastställs före funktionskropparna. Det gör framåtreferenser och ömsesidiga funktionsanrop möjliga.
 2. **Bearbeta en funktion åt gången.** Bygg ett kompakt syntaxträd i tillfälligt minne, lös namn, sätt typer och kontrollera ägarskap. Samma träd bär källpositioner och de fakta som kodgeneratorn behöver. Frigör arbetsminnet när funktionen är klar. Oberoende funktioner kan hanteras av olika arbetare.
-3. **Välj riktiga AArch64-instruktioner direkt.** Gå över det typade trädet, välj register eller stackplatser och skriv instruktionsord i funktionens kodbuffer. Spara lokala etiketter och korrigeringsposter för avstånd som ännu är okända. Vi bygger ingen generell IR, MIR, SSA eller bytekod. Registertabeller, källpositioner och olösta hopp är data med konkreta uppgifter i backend.
+3. **Optimera lokalt och välj AArch64-instruktioner.** Den implementerade skalära delmängden använder en kompakt typad funktions-IR för förenkling, loopbevis och registerallokering. Övriga kroppar använder den befintliga kombinerade kontroll- och emissionsvägen. Skriv instruktionsord i funktionens kodbuffer och spara lokala etiketter och korrigeringsposter för avstånd som ännu är okända. Ingen helprograms-IR, SSA eller bytekod byggs.
 4. **Lägg ut programmet en gång.** Dunders länkare placerar funktioner och konstantdata i deterministisk ordning, löser symboler och fixar hopp och adresser. Ett hopp utanför instruktionsräckvidden får en längre sekvens eller en närliggande hoppstubbe. Bildskrivaren skapar och ad hoc-signerar Mach-O-filen över dess slutliga byte. Publicera resultatet med atomiskt namnbyte när bygget lyckats.
 
-Första backendversionen håller tillfälliga värden i register och ger värden som lever över en gren en känd hemplats. Vid anrop respekteras register som anroparen måste spara. Nästa steg är att behålla lokala värden i register över strukturerade loopar och grenar där alla inkommande vägar kan enas om placeringen. Kompilatorn får använda begränsad analys per funktion. En permanent andra modell av hela programmet skulle däremot bryta mot designen.
+Den skalära vägen behåller lokaler i register över strukturerade loopar och
+grenar med konservativa livstidsintervall och deterministiska spill. Anrop
+och ägda värden återstår för denna väg. Kompilatorn använder begränsad analys
+per funktion och återanvänder arbetsminnet; någon permanent andra modell av
+hela programmet hålls inte. [Omfattning, budget och verifiering](optimization.md).
 
 Kompilatorn kontrollerar även kroppar som saknar anropare. Endast nåbara
 funktioner, datasegment och importplatser länkas in i programmet. Frigöring

@@ -141,6 +141,40 @@ import sys
     assert not (p.root / "escaped").exists()
 
 
+def scalar_optimizer_controls(p):
+    p.write('scalar.ddr', 'fn sum(values:&[]i64)->i64{var result:i64=0;var i:=0;'
+            'while i<values.len{result=result+values[i];i=i+1};result}\n'
+            'fn main(){values:[]i64=[20,22];print(sum(&values))}\n')
+    def build(mode, name, incremental=False):
+        flags = ['--incremental'] if incremental else []
+        result = p.call('build', 'scalar.ddr', '--scalar-opt=' + mode,
+                        '--timings=json', '-o', name, *flags)
+        return json.loads(result.stderr)
+    enabled = build('on', 'scalar-on')['optimizer']
+    disabled = build('off', 'scalar-off')['optimizer']
+    assert enabled['enabled'] and enabled['modeled'] >= 1 and enabled['emitted'] >= 1, enabled
+    assert enabled['proven_bounds'] >= 1, enabled
+    assert not disabled['enabled'] and all(disabled[k] == 0 for k in
+            ('modeled', 'emitted', 'rewrites', 'proven_bounds', 'fallbacks')), disabled
+    for binary in ('scalar-on', 'scalar-off'):
+        result = subprocess.run([p.root / binary], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0 and result.stdout == '42\n', result
+    on = p.call('check', 'scalar.ddr', '--agent', '--scalar-opt=on')
+    off = p.call('check', 'scalar.ddr', '--agent', '--scalar-opt=off')
+    assert on.stdout == off.stdout and on.stderr == off.stderr == ''
+    build('on', 'cached-on', True)
+    assert build('on', 'cached-on', True)['functions']['reused'] > 0
+    assert build('off', 'cached-off', True)['functions']['reused'] == 0
+    assert build('off', 'cached-off', True)['functions']['reused'] > 0
+    assert build('on', 'cached-on', True)['functions']['reused'] > 0
+    p.write('scalar-tests.ddr', 'fn answer()->i32{40+2}\n@test fn works(){assert(answer()==42)}\n')
+    for mode, expected in [('on', '1 passed'), ('on', '1 unaffected'),
+                           ('off', '1 passed'), ('off', '1 unaffected'), ('on', '1 passed')]:
+        result = p.call('test', 'scalar-tests.ddr', '--affected', '--scalar-opt=' + mode, '-o', 'scalar-results')
+        assert expected in result.stdout, result
+    p.call('check', 'scalar.ddr', '--scalar-opt=unknown', status=2)
+
+
 def phase_timings(p):
     p.write("phases.ddr", "fn answer()->i32{42}\nfn main(){value:=answer();print(value)}\n")
     normal = p.call("build", "phases.ddr", "-o", "plain")
@@ -244,7 +278,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
-    cases = [modules_and_manifest, targets_and_cache, phase_timings, isolated_tests, filesystem]
+    cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:

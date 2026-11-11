@@ -5,6 +5,61 @@ Kompilatorn avger instruktioner, lokala etiketter och relokeringar per funktion.
 Den tar med de runtimefunktioner som programmet behöver. Overflow, ogiltiga
 index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen.
 
+## Typad funktionsmodell och lokalt optimeringspass
+
+Standardbygget provar först en kompakt, typad och strukturerad
+[funktionsmodell](../selfhost/opt_ir.ddr). Den återanvänder samma arena mellan
+funktioner. [Parsern](../selfhost/opt_parse.ddr) godtar i första etappen
+anropsfria funktioner med `i32`, `i64`, `bool` och delade `&[]i64`-parametrar:
+lokaler, tilldelningar, aritmetik, kortslutning, `if`, `while`, retur,
+`break`, `continue`, arraylängd och indexläsning. Högst åtta parametrar
+och en skalär eller tom retur stöds. Ägda värden, mutation av arrayer,
+flyttal, osäker kod och anrop använder den befintliga vägen.
+
+Alla grenar kontrolleras innan optimeringen börjar, även om ett villkor
+är konstant. Om modellen inte stöder kroppen eller når sin resursgräns
+tar den befintliga kompilatorn över, inklusive feldiagnostik. Gränserna
+är 4 096 token, 2 048 noder, 256 lokaler och konservativt djup 64.
+Detta är en lokal IR per funktion; någon helprograms-IR eller SSA byggs inte.
+
+[Passet](../selfhost/opt_pass.ddr) förenklar konstanter, lokala värden och
+konstanta grenar inom en fast arbetsbudget på 65 536 steg. Det räknar
+bara ut aritmetik som är giltig med språkets kontrollerade heltalsregler.
+Ett överflödande uttryck måste fortfarande nå samma runtime-fälla.
+Kortslutning och den observerbara ordningen mellan möjliga fel bevaras.
+
+För en loop med `i = 0`, villkoret `i < values.len` och en enda avslutande
+ökning `i = i + 1` kan passet bevisa indexläsningar före ökningen och
+själva ökningen säkra. Arrayen måste vara en oföränderlig inparameter.
+Andra skrivningar till indexet, `continue` eller nästlade loopar hindrar
+beviset. Summeringens overflow-kontroll finns kvar. Regeln bygger på
+kroppens struktur och gäller oberoende av funktionsnamn eller modul.
+
+[Registerallokeringen](../selfhost/opt_alloc.ddr) använder konservativa
+livstidsintervall, förlänger dem över loopars bakåtkanter och placerar
+lokaler i tolv register eller i framen. [Emissionen](../selfhost/opt_emit.ddr)
+behåller arraydata och längd, avger direkta jämförelsegrenar och tar bara
+bort kontroller som modellen har bevisat överflödiga. Inkommande argument
+sparas före registerplaceringen så att överlappande argumentregister är
+säkra. x86-64 och Wasm sänker fortsatt den delade ARM-instruktionsvokabulären;
+detta inför ingen separat direkt backend för dem.
+
+`--scalar-opt=off` stänger av den nya modellen, passet och registervägen
+för jämförelse och felsökning. Tidigare lokala kodgenereringsförbättringar
+är fortfarande aktiva. `--timings=json` visar antal modellerade och
+emitterade funktioner, omskrivningar, bevisade indexläsningar och
+parseråterfall. Avvisade signaturer och cacheträffar ingår inte i
+återfallsräknaren. Funktionscache och `test --affected` skiljer lägena åt;
+CLI-cachen behåller varma fragment separat för båda lägena.
+
+`tools/test-optimizer.py` jämför optimerad kod med avstängt pass och kan
+även jämföra med en äldre kompilator genom `--baseline`. Den provar
+resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
+använder modellen. `tools/test-opt-emitter.py` provar emission och spill
+separat. Båda ingår i `tools/verify-selfhost.sh`.
+
+## Övrig kodgenerering och runtime
+
 Lokala värden läses direkt från sin frameplats med rätt bredd och
 teckenutökning. Deras stabila adress beräknas först när ett lån, en rå
 adress eller en tilldelning behöver den. Fält och arrayelement behåller
@@ -53,13 +108,15 @@ Källan utvärderas en gång och behålls genom `continue`, `break` och retur.
 `check` och kontroll av oanropade kroppar använder ett emissionsläge utan
 lagrade maskinord, etikettpositioner eller relokeringar. Virtuella räknare
 bevarar deterministiska positioner för de sänkningshjälpare som fortfarande
-körs. Detta skiljer bort utdataallokeringen; en separat typad syntaxmodell
-och en självständig semantisk frontend återstår.
+körs. Den nya modellens delmängd valideras utan kodgenerering. En
+självständig semantisk frontend för hela språket återstår.
 
 Byggkedjans valbara [fastider i text eller JSON](incremental.md#mät-byggkedjans-faser)
 gör kostnaden synlig. Optimeringar jämförs med samma källor och säkerhetsregler
 genom `tools/performance.py`; `--include-check` lägger till kontrolltider,
 och byggsviten omfattar även Tabell som fristående konsumentprojekt.
+Med samma binär i båda positionerna och
+`--baseline-flag=--scalar-opt=off` isoleras optimeringslägets effekt.
 
 Korrektheten provas med referensresultat för signerad division och rest,
 IEEE 754, kortslutning och diagnostik. Minnesproven kör även om samma

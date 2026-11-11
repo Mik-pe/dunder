@@ -229,14 +229,18 @@ def build(compiler, source, image, target, work, flags=()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
-    parser.add_argument('--baseline', type=Path, required=True, help='authoritative legacy compiler')
+    parser.add_argument('--baseline', type=Path,
+                        help='older authoritative compiler; default: current compiler with --scalar-opt=off')
     parser.add_argument('--node', default='node')
     parser.add_argument('--verify-selection', action='store_true',
                         help='also compare candidate --scalar-opt=off and assert optimizer timing counters')
     args = parser.parse_args()
-    compilers = {'baseline': args.baseline.resolve(strict=True), 'candidate': args.compiler.resolve(strict=True)}
-    variants = [('baseline', compilers['baseline'], []), ('candidate', compilers['candidate'], [])]
-    if args.verify_selection:
+    candidate = args.compiler.resolve(strict=True)
+    compilers = {'baseline': args.baseline.resolve(strict=True) if args.baseline else candidate,
+                 'candidate': candidate}
+    variants = [('baseline', compilers['baseline'], [] if args.baseline else ['--scalar-opt=off']),
+                ('candidate', compilers['candidate'], [])]
+    if args.verify_selection and args.baseline:
         variants.append(('candidate_off', compilers['candidate'], ['--scalar-opt=off']))
     node = shutil.which(args.node)
     if not node:

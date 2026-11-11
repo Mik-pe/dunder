@@ -131,6 +131,10 @@ def main():
     parser.add_argument('--include-check', action='store_true',
                         help='also measure check on generated and selfhost sources')
     parser.add_argument('--c-compiler', type=Path, help='also measure C with -O3 -ftrapv')
+    parser.add_argument('--baseline-flag', action='append', default=[],
+                        help='extra compiler flag, e.g. --baseline-flag=--scalar-opt=off')
+    parser.add_argument('--candidate-flag', action='append', default=[],
+                        help='extra compiler flag for the candidate variant')
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error('--rounds must be positive')
@@ -138,6 +142,7 @@ def main():
         parser.error('--include-check requires the compiler or all suite')
     compilers = {'baseline': args.baseline.resolve(strict=True),
                  'candidate': args.candidate.resolve(strict=True)}
+    compiler_flags = {'baseline': args.baseline_flag, 'candidate': args.candidate_flag}
     report = args.report.resolve()
     report.mkdir(parents=True, exist_ok=True)
     if any(report.iterdir()):
@@ -150,6 +155,7 @@ def main():
                 'tool_sha256': digest(Path(__file__)), 'sources_sha256': before,
                 'compiler_sha256': {v: digest(p) for v, p in compilers.items()},
                 'compiler_paths': {v: str(p) for v, p in compilers.items()},
+                'compiler_flags': compiler_flags,
                 'clock': 'wall clock including process startup; perf_counter_ns',
                 'cache': 'incremental disabled; warm OS filesystem cache',
                 'order': 'two variants alternate each round; three rotate all six permutations',
@@ -185,7 +191,7 @@ def main():
                 binaries = {}
                 for variant, compiler in compilers.items():
                     binary = work / f'{name}-{variant}'
-                    command([compiler, 'build', ROOT / f'benchmarks/runtime/{name}.ddr', '-o', binary])
+                    command([compiler, 'build', ROOT / f'benchmarks/runtime/{name}.ddr', '-o', binary, *compiler_flags[variant]])
                     binaries[variant] = binary
                 if args.c_compiler:
                     binary = work / f'{name}-c'
@@ -209,7 +215,7 @@ def main():
                 for round_number in range(args.rounds):
                     for position, variant in enumerate(order(list(compilers), round_number)):
                         binary = work / f'{name}-{variant}-{round_number}'
-                        elapsed, _ = command([compilers[variant], 'build', source, '-o', binary])
+                        elapsed, _ = command([compilers[variant], 'build', source, '-o', binary, *compiler_flags[variant]])
                         if name == 'generated':
                             checked_run(binary, [], b'595500\n')
                         elif name == 'selfhost':
@@ -229,7 +235,7 @@ def main():
                 if args.include_check:
                     for round_number in range(args.rounds):
                         for position, variant in enumerate(order(list(compilers), round_number)):
-                            elapsed, output = command([compilers[variant], 'check', source])
+                            elapsed, output = command([compilers[variant], 'check', source, *compiler_flags[variant]])
                             expected_prefix = f'checked {source} ('.encode()
                             if not output.startswith(expected_prefix) or not output.endswith(b' modules)\n'):
                                 raise RuntimeError(f'invalid check result from {variant}: {output!r}')
