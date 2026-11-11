@@ -20,6 +20,10 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Signerad konstantdivision, 2026-11-11](2026-11-11-constant-division/README.md)
+förbättrar numerikkärnan med ungefär tolv procent och mäter byggkostnaden
+separat. C-målet för hela sviten är fortfarande inte uppnått.
+
 [Verifierade strängägare, 2026-11-11](2026-11-11-ownership-leases/README.md)
 visar snabbare självbygge, självkontroll och lexer med validerade
 funktionsomskrivningar. Samma kompilator med passet av/på mäter dess kostnad.

@@ -103,6 +103,42 @@ resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
 använder modellen. `tools/test-opt-emitter.py` provar emission och spill
 separat. Båda ingår i `tools/verify-selfhost.sh`.
 
+### Signerad division och rest med konstant delare
+
+När högeroperanden är en verifierad konstant IR-nod kan emissionen sänka
+`i32`- och `i64`-division till en begränsad plan. Regeln känner inte till
+funktionsnamn, moduler eller särskilda tal. Variabel delare använder den
+befintliga divisionen. Typkontroll och konstantförenkling sker före valet;
+ingen tokenprefixigenkänning inför en parallell språkregel.
+
+[`const_div`](../selfhost/const_div.ddr) hanterar noll, ett, minus ett,
+signerad minimidelare och tvåpotenser separat. Andra delare använder en
+heltalsmultiplikator med multiplikationens höga del, skift och
+teckenkorrigering enligt [Granlund–Montgomery, sats 5.1](https://gmplib.org/~tege/divcnst-pldi94.pdf).
+Implementationens kvot-/restrekurrens är härledd från satsens felgräns och
+använder wrapping internt; den behöver ingen bigint-allokering.
+Planen har en hård budget på 128 steg och återanvänds inom funktionen.
+
+Täljaren utvärderas exakt en gång innan planen förbereds, även vid `% 1`
+eller division med noll. Därmed kan nästlad division inte skriva över en
+yttre aktiv plan. Ett budgetåterfall återanvänder den beräknade täljaren i
+den gamla divisionsvägen. Nollfällor, aritmetikfällor inuti täljaren och
+overflow för både `MIN / -1` och `MIN % -1` behålls i samma ordning.
+
+Emissionen använder bara scratchregistren x0–x3. ARM64 och x86-64 väljer
+den generella multiplikatorvägen. Wasm behåller generell division när
+en hög multiplikation skulle kräva flera delprodukter; bara de enkla
+specialfallen används där. Detta är en målpolicy, inte en ändrad semantik.
+
+`--const-div-opt=off` stänger av sänkningen separat från skalärpasset och
+ägaroptimeringen. Native-fragment och berörda testkvitton skiljer lägena åt.
+`tools/test-const-div.py` använder oberoende Pythonheltal för kvot avrundad
+mot noll och rest. Den provar faktiska Dunder-planers matematiska certifikat,
+uttömmande signerade bitbredder 3–10, breda 32-/64-bitarsfall, spill,
+nästlad aritmetik, kortslutning, exakt nativ fällkod och fällordning.
+Alla fyra mål byggs; host och Wasm körs. Wasm exponerar `unreachable`
+snarare än nativa fällkoder, vilket rapporteras separat.
+
 ## Ägarlivslängder och verifierade funktionsomskrivningar
 
 Den fulla frontendens strängoperatorer skapar normalt en extra temporär
@@ -240,8 +276,8 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-ownership-leases/README.md)
+Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-constant-division/README.md)
 omfattar både runtime, kompletta byggen och `check`.
-Självbygge och den verkliga lexern blir snabbare. Profilerna ger underlag
-för [ägartillstånd och CFG](ownership-ir-plan.md), medan konstantdivision
-och starkare intervallbevis är nästa numeriska frågor.
+Konstantdivision förbättrar numerikkärnan utan märkbar byggkostnad i serien.
+Profilerna ger underlag för [ägartillstånd och CFG](ownership-ir-plan.md),
+medan framekostnad och starkare intervallbevis är nästa numeriska frågor.

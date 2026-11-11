@@ -69,7 +69,7 @@ och [macOS-appar](app-bundles.md).
 ## Körda Wasm-kontrakt
 
 Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 89 av de 97 grupperna med godkänt
+till en separat Wasm-modul. Node körde 93 av de 101 grupperna med godkänt
 resultat. De åtta övriga har nåbara nativa systemanrop.
 
 | Grupp | Nativt beroende |
