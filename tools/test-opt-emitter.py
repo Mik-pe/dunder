@@ -79,9 +79,12 @@ for name,body,ret,first,params,result,status,length in cases:
  source=work/(name+'.ddr');source.write_text('p0 p1 p2 p3 p4 p5 p6 p7 '+body)
  for platform in (0,1,2,3):
   out=work/(name+('.wasm' if platform==3 else f'-{platform}'))
-  args=[harness,source,out,str(platform),str(result),str(ret),str(first),*map(str,params),str(length)]
-  built=subprocess.run(args,capture_output=True,timeout=20)
-  assert built.returncode==0,(name,platform,built.returncode,built.stdout,built.stderr)
+  wrapper=out.with_name(out.name+'.wrapper')
+  for mode,destination in [('wrapper',wrapper),('prepared',out)]:
+   args=[harness,source,destination,str(platform),str(result),str(ret),str(first),*map(str,params),str(length),mode]
+   built=subprocess.run(args,capture_output=True,timeout=20)
+   assert built.returncode==0,(name,platform,mode,built.returncode,built.stdout,built.stderr)
+  assert wrapper.read_bytes()==out.read_bytes(),(name,platform,'prepared/wrapper image mismatch')
   if platform==host:
    run=subprocess.run([out],capture_output=True,timeout=10)
    assert run.returncode==status,(name,platform,run.returncode,status,run.stdout,run.stderr)
@@ -91,6 +94,6 @@ for name,body,ret,first,params,result,status,length in cases:
    expected=125 if status else 0
    assert run.returncode==expected,(name,platform,run.returncode,expected,run.stdout,run.stderr)
  print('PASS',name,flush=True)
-print(len(cases),'cases native+Wasm executed; all four targets built')
+print(len(cases),'cases native+Wasm executed; wrapper/prepared images byte-identical on all four targets')
 
 scratch.cleanup()
