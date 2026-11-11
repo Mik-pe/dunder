@@ -76,3 +76,49 @@ and exact full snapshots with a single exclusive optimization transaction and
 a sparse undo arena. Preserve the same dataflow, canonical contracts, external
 exit observations and mandatory final verification. No reduced safety profile
 or benchmark-specific eligibility rule is used to recover build time.
+
+
+## Exclusive transaction: build-cost gate
+
+`exclusive-compiler` compares the full-plan a683 candidate with the exclusive
+sparse-undo compiler
+`f9c3f38774332306e3dce4755e7898c59c17b4d8e6928a2033032e0cc00485bc`.
+Both use the complete profile and compile the same new source checkout. The
+generated and Tabell images are byte-identical; self-host images differ, and
+both produced compilers successfully build and run the checked hello program.
+The sparse candidate reproduces its own frozen image. This is a 30-round
+compiler-only gate; it is not a new runtime measurement.
+
+| Build | Full-plan median | Exclusive median | Exclusive p95 |
+| --- | --- | --- | --- |
+| Generated | 2038.260 ms | 1572.310 ms | 1584.977 ms |
+| Self-host | 1474.853 ms | 1176.074 ms | 1187.099 ms |
+| Tabell | 35.243 ms | 28.208 ms | 31.197 ms |
+
+The generated build improves 22.9%, but 63,738 lines/s at p95 still fails the
+100,000 target. Check-only remains comparable. This candidate therefore stays
+behind the build-cost gate. Targeted verification passed 30 native and 30 Wasm
+unit groups, 256 image comparisons (all exactly match the previous value
+engine), 128 host/Wasm executions and a bootstrap fixed point. Full correctness
+verification must run again on the candidate that clears the remaining gate.
+
+The next structural correction projects the MUST fact domain onto the GP
+registers that can actually participate in this function's value operations.
+Implicit ABI live-outs still feed full physical liveness, while unknown writes
+and calls kill every affected tracked fact. This reduces per-block analysis
+state without reducing the language or introducing source-name rules.
+
+
+The separate `exclusive-attribution` observation uses one clock/allocation
+pair per case, not a latency series. Observer variants emitted identical
+program images. The generated case attributes 1218.584 ms to the MIR pipeline;
+self-host attributes 897.232 ms and Tabell 21.606 ms. These instrumented phase
+clocks identify where to investigate, not acceptance times.
+
+Allocation/ARC counts cover the entire compiler invocation, unlike the phase
+clock. In particular, the 39.3 million generated-case release calls include
+null/immortal checks: the counter increments before these early returns. A
+source audit found no descriptor retain/release for borrowed field indexing
+and no large value-array iteration snapshots in current MIR modules. Therefore
+these counters do not establish ARC overhead inside the MIR value solver;
+the compact-domain change targets its actual per-block/register state.
