@@ -5,6 +5,12 @@ Kompilatorn avger instruktioner, lokala etiketter och relokeringar per funktion.
 Den tar med de runtimefunktioner som programmet behöver. Overflow, ogiltiga
 index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen.
 
+Den fortsatta huvudarkitekturen är en
+[gemensam IR för hela funktioner](whole-function-ir-plan.md), med samma gräns
+för skalära kroppar, anrop och ägda värden. Planen ersätter lokala
+emitterförbättringar som huvudspår; beskrivningen nedan dokumenterar de
+befintliga mekanismerna under övergången.
+
 ## Typad funktionsmodell och lokalt optimeringspass
 
 Standardbygget provar först en kompakt, typad och strukturerad

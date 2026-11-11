@@ -5,6 +5,11 @@ nästa generella steg; analysen nedan är ännu inte implementerad eller mätt.
 Målet är att minska bevisat tom cleanup utan att ändra livslängder,
 värdesemantik, fällordning eller språkets diagnostik.
 
+Den [gemensamma helfunktions-IR:n](whole-function-ir-plan.md) är nu
+huvudspåret. Ägarhändelserna och dataflödeskraven nedan ska inordnas i den
+modellen; en fristående ägaranalys som bara kompakterar maskinord är inte
+nästa arkitekturleverans.
+
 ## En liten representation för ägarhändelser
 
 Behåll `machine_ir` som den enda komponent som ändrar instruktioner och
