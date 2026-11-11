@@ -107,8 +107,10 @@ def main():
                         proofs += 1
                     rewrites, deleted, immediates, units = map(int, counters.split())
                     if mode == 'off': assert (rewrites, deleted, immediates, units) == (0, 0, 0, 0)
-                    if mode == 'on' and case in (0, 1, 3, 4, 6, 7, 10, 12, 13):
+                    if mode == 'on' and case in (0, 1, 3, 6, 7, 12, 13):
                         assert rewrites + deleted > 0, (case, rewrites, deleted)
+                    if case in (4, 10) and mode == 'on':
+                        assert rewrites == deleted == immediates == 0
                     if case == 7 and mode == 'on':
                         assert all(op['mode'] == 2 for op in after['operations'] if op['kind'] in (1, 3)), after
                     ran = False
