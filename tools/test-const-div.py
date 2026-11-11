@@ -175,7 +175,7 @@ def plan_program(module, directory):
     # Test the real self-hosted generator, never a second Python magic-number
     # generator. The Python evaluator below is only the documented bitvector
     # meaning of its returned plan; the oracle remains exact signed division.
-    relative = os.path.relpath(module.with_suffix(''), directory).replace(os.sep, '/')
+    relative = os.path.relpath(module.resolve().with_suffix(''), directory.resolve()).replace(os.sep, '/')
     source = 'import ' + json.dumps(relative) + ' as cd\n'
     source += '''fn dump(p:&mut cd.Plan,d:i64,width:i32){
         assert(cd.prepare_into(&mut p,d,width))
@@ -300,6 +300,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--baseline', type=Path, help='optional older compiler, receives no const-div flags')
+    parser.add_argument('--legacy-only', action='store_true',
+                        help='validate fixtures with this compiler alone, without new CLI flags')
     parser.add_argument('--node', default='node')
     parser.add_argument('--verify-selection', action='store_true', help='assert helpers still use the typed model via timings counters')
     parser.add_argument('--case', help='run only program names containing this substring')
@@ -309,6 +311,10 @@ def main():
     compiler = args.compiler.resolve(strict=True)
     variants = [('off', compiler, ['--const-div-opt=off']),
                 ('on', compiler, ['--const-div-opt=on'])]
+    if args.legacy_only:
+        if args.baseline:
+            parser.error('--legacy-only and --baseline are mutually exclusive')
+        variants = [('legacy', compiler, [])]
     if args.baseline:
         variants.insert(0, ('baseline', args.baseline.resolve(strict=True), []))
     node = shutil.which(args.node)
@@ -333,7 +339,7 @@ def main():
         if not positives and not traps and not invalids and args.case not in 'plans':
             parser.error('--case did not match any program')
     with tempfile.TemporaryDirectory(prefix='dunder-const-div-') as tmp:
-        work = Path(tmp)
+        work = Path(tmp).resolve()
         plan_hash = None
         if not args.case or args.case in 'plans':
             module = args.plan_module.resolve(strict=True)
@@ -346,7 +352,8 @@ def main():
             # machine code is exercised by the consumer programs below.
             for target in TARGETS:
                 image = work / ('plans-' + target)
-                built = call([compiler, 'build', path, '--target', target, '-o', image, '--const-div-opt=off'], work)
+                flags = [] if args.legacy_only else ['--const-div-opt=off']
+                built = call([compiler, 'build', path, '--target', target, '-o', image, *flags], work)
                 assert built.returncode == 0, ('plan export build', target, built.stderr.decode(errors='replace'))
                 image_header(image, target)
                 if target in (native, 'wasm32'):
