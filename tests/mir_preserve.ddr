@@ -1,0 +1,199 @@
+import ..selfhost.arm64 as arm
+import ..selfhost.mir
+import ..selfhost.mir_lift as lift
+import ..selfhost.mir_verify as verify
+import ..selfhost.mir_preserve as preserve
+
+fn model(code: &arm.Code) -> mir.Function {
+    sites: []i32 = []; var f := mir.new()
+    assert(lift.lift(&mut f, &code, 0, 0, 0, &sites, 0)); assert(verify.verify(&mut f)); f
+}
+fn begin() -> arm.Code { var code := arm.new(); frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 8); code }
+fn save(code: &mut arm.Code) { for reg in 25..29 { arm.store(&mut code, reg - 25, reg) } }
+fn change(code: &mut arm.Code) { for reg in 25..29 { arm.imm(&mut code, reg, i64(reg + 100)) } }
+fn restore(code: &mut arm.Code) { for reg in 25..29 { arm.load_into(&mut code, reg - 25, reg) } }
+fn accepts(f: &mir.Function, ctx: &preserve.Context) -> bool {
+    var w := preserve.new(); preserve.analyze_into(&mut w, &f, &ctx, 100000)
+}
+@test fn no_use_and_declared_recursive_calls_do_not_use_return_liveouts_as_a_promise() {
+    var code := begin(); target := arm.label(&mut code); code.labels[target] = 0
+    done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+    arm.branch(&mut code, target, 1); arm.mark(&mut code, done); arm.ret(&mut code); f := model(&code)
+    var unknown := preserve.context(2); var w := preserve.new()
+    assert(!preserve.analyze_into(&mut w, &f, &unknown, 100000))
+    assert(preserve.status(&w) == .Refused && preserve.preserved_mask(&w) == 0)
+    assert(preserve.declare_call_abi(&mut unknown, 1, preserve.supported_mask()))
+    assert(preserve.analyze_into(&mut w, &f, &unknown, 100000))
+    assert(preserve.no_use(&w) && preserve.epoch(&w) == 2 && preserve.preserved_mask(&w) == preserve.supported_mask())
+}
+@test fn incoming_tokens_require_matching_saves_and_restores() {
+    ctx := preserve.context(1)
+    var code := begin(); save(&mut code); change(&mut code); restore(&mut code); arm.ret(&mut code)
+    f := model(&code); assert(accepts(&f, &ctx))
+    var wrong := begin(); save(&mut wrong); change(&mut wrong); restore(&mut wrong)
+    arm.load_into(&mut wrong, 1, 25); arm.ret(&mut wrong); corrupted := model(&wrong)
+    assert(!accepts(&corrupted, &ctx))
+    var late := begin(); change(&mut late); save(&mut late); restore(&mut late); arm.ret(&mut late)
+    late_model := model(&late); assert(!accepts(&late_model, &ctx))
+}
+@test fn calls_have_separate_register_and_private_memory_premises() {
+    var code := begin(); callee := arm.label(&mut code)
+    save(&mut code); change(&mut code); arm.branch(&mut code, callee, 1); restore(&mut code); arm.ret(&mut code)
+    f := model(&code); var ctx := preserve.context(2)
+    assert(preserve.declare_call_abi(&mut ctx, 1, preserve.supported_mask()))
+    assert(!accepts(&f, &ctx))
+    assert(preserve.declare_private_frame_calls(&mut ctx, 1)); assert(accepts(&f, &ctx))
+    // A callee may destroy every register, provided the separate memory
+    // premise lets this function restore its incoming values afterward.
+    var destroys := preserve.context(2); assert(preserve.declare_call_abi(&mut destroys, 1, 0))
+    assert(preserve.declare_private_frame_calls(&mut destroys, 1)); assert(accepts(&f, &destroys))
+}
+@test fn private_call_premises_cannot_rescue_overlap_escape_or_explicit_unknown_writes() {
+    var ctx := preserve.context(2)
+    assert(preserve.declare_call_abi(&mut ctx, 1, preserve.supported_mask()))
+    assert(preserve.declare_private_frame_calls(&mut ctx, 1))
+    for fault in 0..3 {
+        var code := begin(); callee := arm.label(&mut code)
+        save(&mut code); change(&mut code)
+        if fault == 0 { arm.emit(&mut code, 3093267360) } // ldur w0,[fp,#-8], overlapping accessible shape
+        if fault == 1 { arm.address(&mut code, 0) }
+        if fault == 2 { arm.emit(&mut code, 4177526816) }
+        arm.branch(&mut code, callee, 1); restore(&mut code); arm.ret(&mut code)
+        f := model(&code); assert(!f.unknown_control); assert(!accepts(&f, &ctx))
+    }
+}
+@test fn overwrites_partial_aliases_escape_and_unknown_writes_destroy_saved_facts() {
+    ctx := preserve.context(1)
+    for fault in 0..4 {
+        var code := begin(); save(&mut code); change(&mut code)
+        if fault == 0 { arm.imm(&mut code, 0, 0); arm.store(&mut code, 0, 0) }
+        if fault == 1 { arm.emit(&mut code, 3089073056) } // stur w0,[fp,#-8]
+        if fault == 2 { arm.address(&mut code, 0) }
+        if fault == 3 { arm.emit(&mut code, 4177526816) } // str x0,[x1]
+        restore(&mut code); arm.ret(&mut code); f := model(&code)
+        assert(!f.unknown_control)
+        if fault == 1 {
+            var overlap := false
+            for p in 0..f.place_kinds.len {
+                if f.place_kinds[p] == 1 && f.place_offsets[p] == -8 && f.place_widths[p] == 4 { overlap = true }
+            }
+            assert(overlap)
+        }
+        assert(!accepts(&f, &ctx))
+    }
+}
+@test fn each_path_and_each_return_must_restore_the_same_entry_values() {
+    ctx := preserve.context(1)
+    for corrupt in [false, true] {
+        var code := begin(); early := arm.label(&mut code)
+        save(&mut code); change(&mut code); arm.imm(&mut code, 0, 0); arm.branch(&mut code, early, 18)
+        restore(&mut code); arm.ret(&mut code)
+        arm.mark(&mut code, early)
+        if !corrupt { restore(&mut code) }
+        arm.ret(&mut code); f := model(&code)
+        assert(accepts(&f, &ctx) == !corrupt)
+    }
+}
+@test fn a_missing_save_on_one_join_edge_cannot_be_rescued_by_another_path() {
+    ctx := preserve.context(1)
+    for both in [false, true] {
+        var code := begin(); other := arm.label(&mut code); join := arm.label(&mut code)
+        arm.branch(&mut code, other, 18); save(&mut code); arm.branch(&mut code, join, 0)
+        arm.mark(&mut code, other); if both { save(&mut code) }
+        arm.mark(&mut code, join); change(&mut code); restore(&mut code); arm.ret(&mut code)
+        f := model(&code); assert(accepts(&f, &ctx) == both)
+    }
+    // Visit the good incoming edge first too: certification must wait for the
+    // later bad predecessor, not publish the first optimistic exit state.
+    var reversed := begin(); saved := arm.label(&mut reversed); join := arm.label(&mut reversed)
+    arm.branch(&mut reversed, saved, 18); arm.branch(&mut reversed, join, 0)
+    arm.mark(&mut reversed, saved); save(&mut reversed); arm.mark(&mut reversed, join)
+    change(&mut reversed); restore(&mut reversed); arm.ret(&mut reversed)
+    reversed_model := model(&reversed); assert(!accepts(&reversed_model, &ctx))
+}
+@test fn loop_fixed_point_detects_saved_token_loss_after_a_later_iteration() {
+    ctx := preserve.context(1)
+    for corrupt in [false, true] {
+        var code := begin(); head := arm.label(&mut code); done := arm.label(&mut code)
+        save(&mut code); arm.mark(&mut code, head); arm.branch(&mut code, done, 18)
+        change(&mut code); if corrupt { arm.store(&mut code, 0, 25) }
+        arm.branch(&mut code, head, 0); arm.mark(&mut code, done)
+        restore(&mut code); arm.ret(&mut code); f := model(&code)
+        assert(accepts(&f, &ctx) == !corrupt)
+    }
+}
+@test fn late_initializer_backward_edges_are_followed_without_assuming_a_cycle() {
+    ctx := preserve.context(1)
+    var code := begin(); body := arm.label(&mut code); init := arm.label(&mut code)
+    arm.branch(&mut code, init, 0); arm.mark(&mut code, body)
+    change(&mut code); restore(&mut code); arm.ret(&mut code)
+    arm.mark(&mut code, init); save(&mut code); arm.branch(&mut code, body, 0)
+    f := model(&code); assert(accepts(&f, &ctx))
+}
+@test fn external_noreturn_and_normal_tail_transfers_are_distinct_declarations() {
+    var code := begin(); target := arm.label(&mut code)
+    change(&mut code); arm.branch(&mut code, target, 0); f := model(&code)
+    var unknown := preserve.context(1); assert(!accepts(&f, &unknown))
+    var dead := preserve.context(1); assert(preserve.declare_noreturn(&mut dead, target)); assert(accepts(&f, &dead))
+    var tail := preserve.context(1); assert(preserve.declare_tail(&mut tail, target, preserve.supported_mask())); assert(!accepts(&f, &tail))
+    var good := begin(); exit := arm.label(&mut good)
+    save(&mut good); change(&mut good); restore(&mut good); arm.branch(&mut good, exit, 0); good_model := model(&good)
+    assert(preserve.declare_tail(&mut tail, exit, preserve.supported_mask())); assert(accepts(&good_model, &tail))
+    var partial := preserve.context(1); assert(preserve.declare_tail(&mut partial, exit, mir.variable_bit(25)))
+    assert(!accepts(&good_model, &partial))
+}
+@test fn conditional_noreturn_exits_do_not_hide_a_normal_return_obligation() {
+    var code := begin(); trap := arm.label(&mut code)
+    save(&mut code); change(&mut code); arm.branch(&mut code, trap, 18)
+    restore(&mut code); arm.ret(&mut code); f := model(&code)
+    var dead := preserve.context(1); assert(preserve.declare_noreturn(&mut dead, trap)); assert(accepts(&f, &dead))
+    var tail := preserve.context(1); assert(preserve.declare_tail(&mut tail, trap, preserve.supported_mask()))
+    assert(!accepts(&f, &tail))
+}
+@test fn indirect_token_paths_refuse_instead_of_pretending_to_be_direct_saves() {
+    ctx := preserve.context(1)
+    var code := begin(); arm.mov(&mut code, 0, 25); arm.store(&mut code, 0, 0)
+    arm.imm(&mut code, 25, 7); arm.load_into(&mut code, 0, 25); arm.ret(&mut code)
+    f := model(&code); assert(!accepts(&f, &ctx))
+    var narrowed := begin(); arm.emit(&mut narrowed, 706282489); arm.ret(&mut narrowed) // mov w25,w25
+    narrowed_model := model(&narrowed); assert(!narrowed_model.unknown_control); assert(!accepts(&narrowed_model, &ctx))
+}
+@test fn unreachable_opaque_words_do_not_become_reachable_paths() {
+    ctx := preserve.context(1); var code := begin(); done := arm.label(&mut code)
+    arm.branch(&mut code, done, 0); arm.emit(&mut code, 4294967295)
+    arm.mark(&mut code, done); arm.ret(&mut code); f := model(&code)
+    assert(f.unknown_control); assert(accepts(&f, &ctx))
+}
+@test fn reused_workspace_never_publishes_a_stale_or_partial_certificate() {
+    var code := begin(); save(&mut code); change(&mut code); restore(&mut code); arm.ret(&mut code)
+    var f := model(&code); ctx := preserve.context(9); var w := preserve.new()
+    assert(preserve.analyze_into(&mut w, &f, &ctx, 100000)); used := preserve.units(&w)
+    assert(preserve.analyze_into(&mut w, &f, &ctx, used)); assert(preserve.units(&w) == used)
+    assert(!preserve.analyze_into(&mut w, &f, &ctx, used - 1))
+    assert(preserve.status(&w) == .Budget && preserve.preserved_mask(&w) == 0 && preserve.epoch(&w) == 0 && !preserve.no_use(&w))
+    assert(!preserve.analyze_into(&mut w, &f, &ctx, 0))
+    assert(preserve.status(&w) == .Budget && preserve.units(&w) == 0 && preserve.preserved_mask(&w) == 0)
+    f.verified = false; assert(!preserve.analyze_into(&mut w, &f, &ctx, 100000)); assert(preserve.status(&w) == .Invalid)
+    assert(preserve.preserved_mask(&w) == 0)
+    var opaque := arm.new(); arm.emit(&mut opaque, 4294967295); arm.ret(&mut opaque)
+    unknown := model(&opaque); assert(!preserve.analyze_into(&mut w, &unknown, &ctx, 100000))
+    assert(preserve.status(&w) == .Refused && preserve.reason(&w) == .Opaque && preserve.preserved_mask(&w) == 0)
+    assert(verify.verify(&mut f)); assert(preserve.analyze_into(&mut w, &f, &ctx, 100000))
+    var tiny := begin(); arm.ret(&mut tiny); tiny_model := model(&tiny)
+    assert(preserve.analyze_into(&mut w, &tiny_model, &ctx, 100000)); small_units := preserve.units(&w)
+    var fresh := preserve.new(); assert(preserve.analyze_into(&mut fresh, &tiny_model, &ctx, 100000))
+    assert(preserve.units(&fresh) == small_units && preserve.no_use(&w) && preserve.no_use(&fresh))
+    var malformed := f; removed := malformed.dst.pop()
+    assert(!preserve.analyze_into(&mut w, &malformed, &ctx, 100000))
+    assert(preserve.status(&w) == .Invalid && preserve.preserved_mask(&w) == 0)
+}
+@test fn context_epochs_masks_and_conflicting_exit_declarations_are_validated() {
+    var code := begin(); arm.ret(&mut code); f := model(&code); var w := preserve.new()
+    zero := preserve.context(0); assert(!preserve.analyze_into(&mut w, &f, &zero, 100000)); assert(preserve.reason(&w) == .Context)
+    var wrong := preserve.context(1); assert(!preserve.declare_call_abi(&mut wrong, 1, mir.variable_bit(24)))
+    assert(!preserve.analyze_into(&mut w, &f, &wrong, 100000)); assert(preserve.status(&w) == .Invalid)
+    var conflict := preserve.context(1); assert(preserve.declare_noreturn(&mut conflict, 123))
+    assert(!preserve.declare_tail(&mut conflict, 123, preserve.supported_mask()))
+    assert(!preserve.analyze_into(&mut w, &f, &conflict, 100000)); assert(preserve.preserved_mask(&w) == 0)
+}
+fn main() {}

@@ -1,0 +1,297 @@
+// A certificate relative to declared ABI premises, not an ABI declaration.
+// This module never changes a Function or activates a production convention.
+// Supported token paths are X25..28 -> private 8-byte FP cell -> same register.
+// Other valid paths, opaque control and unknown exits refuse certification and
+// require a future guard/adapter. Failed/budgeted analyses publish no result.
+// The Function must remain the same verified snapshot throughout the call.
+// NoReturn declarations classify external CFG branches; incomplete slices and
+// unknown exits refuse. Normal returns only are certified (traps do not return).
+import mir
+import mir_contract as contract
+
+pub enum Status { Idle, Certified, Invalid, Refused, Budget }
+pub enum Reason { None, Context, Function, Opaque, Exit, Token }
+pub opaque struct Context {
+    valid: bool, epoch: i32, masks: []i64, known: []bool, private_memory: []bool,
+    labels: []i32, exits: []i32, tail_masks: []i64,
+}
+pub fn supported_mask() -> i64 {
+    var mask: i64 = 0
+    for reg in 25..29 { mask = mask.bit_or(mir.variable_bit(reg)) }; mask
+}
+pub fn context(epoch: i32) -> Context {
+    Context { valid: epoch > 0, epoch: epoch, masks: [0, 0, 0, 0, 0],
+        known: [false, false, false, false, false], private_memory: [false, false, false, false, false],
+        labels: [], exits: [], tail_masks: [] }
+}
+fn mask_valid(mask: i64) -> bool { mask.bit_and(supported_mask().bit_not()) == 0 }
+pub fn declare_call_abi(ctx: &mut Context, abi: i32, mask: i64) -> bool {
+    if !ctx.valid || abi < 1 || abi > 4 || !mask_valid(mask) { ctx.valid = false; return false }
+    if ctx.known[abi] && ctx.masks[abi] != mask { ctx.valid = false; return false }
+    ctx.known[abi] = true; ctx.masks[abi] = mask; true
+}
+// A separate trusted memory-domain premise, never implied by the register mask.
+// It applies only to individually proven, unescaped, nonoverlapping FP cells.
+// Unknown ABI4 still lacks a frame-register convention, so its calls cannot
+// retain saved-cell facts even with this memory premise.
+pub fn declare_private_frame_calls(ctx: &mut Context, abi: i32) -> bool {
+    if !ctx.valid || abi < 1 || abi > 4 { ctx.valid = false; return false }
+    ctx.private_memory[abi] = true; true
+}
+fn declaration(ctx: &mut Context, label: i32, exit: i32, mask: i64) -> bool {
+    if !ctx.valid || label < 0 || !mask_valid(mask) { ctx.valid = false; return false }
+    var at := 0
+    while at < ctx.labels.len && ctx.labels[at] < label { at = at + 1 }
+    if at < ctx.labels.len && ctx.labels[at] == label {
+        if ctx.exits[at] != exit || ctx.tail_masks[at] != mask { ctx.valid = false; return false }; return true
+    }
+    ctx.labels.push(label); ctx.exits.push(exit); ctx.tail_masks.push(mask)
+    var i := ctx.labels.len - 1
+    while i > at {
+        ctx.labels[i] = ctx.labels[i - 1]; ctx.exits[i] = ctx.exits[i - 1]; ctx.tail_masks[i] = ctx.tail_masks[i - 1]
+        i = i - 1
+    }
+    ctx.labels[at] = label; ctx.exits[at] = exit; ctx.tail_masks[at] = mask; true
+}
+pub fn declare_noreturn(ctx: &mut Context, label: i32) -> bool { declaration(&mut ctx, label, 1, 0) }
+pub fn declare_tail(ctx: &mut Context, label: i32, mask: i64) -> bool { declaration(&mut ctx, label, 2, mask) }
+
+pub opaque struct Workspace {
+    reached: []bool, queued: []bool, queue: []i32, accessed: []bool,
+    cell_for_place: []i32, cells: []i32, incoming: []i32, state: []i32,
+    status: Status, reason: Reason, units: i32, quota: i32,
+    mask: i64, epoch: i32, no_use: bool, stride: i32, cell_count: i32,
+}
+pub fn new() -> Workspace { Workspace { reached: [], queued: [], queue: [], accessed: [],
+    cell_for_place: [], cells: [], incoming: [], state: [], status: .Idle, reason: .None,
+    units: 0, quota: 0, mask: 0, epoch: 0, no_use: false, stride: 0, cell_count: 0 } }
+pub fn status(work: &Workspace) -> Status { work.status }
+pub fn reason(work: &Workspace) -> Reason { work.reason }
+pub fn units(work: &Workspace) -> i32 { work.units }
+pub fn preserved_mask(work: &Workspace) -> i64 { work.mask }
+pub fn epoch(work: &Workspace) -> i32 { work.epoch }
+pub fn no_use(work: &Workspace) -> bool { work.no_use }
+fn i32_slot(values: &mut []i32, index: i32, value: i32) {
+    if index == values.len { values.push(value) } else { values[index] = value }
+}
+fn bool_slot(values: &mut []bool, index: i32, value: bool) {
+    if index == values.len { values.push(value) } else { values[index] = value }
+}
+fn reset(work: &mut Workspace, quota: i32) {
+    // Retain high-water buffers and initialize only this call's charged range.
+    // Even a zero-quota call after a large analysis has constant reset cost.
+    work.status = .Idle; work.reason = .None; work.units = 0; work.quota = quota
+    work.mask = 0; work.epoch = 0; work.no_use = false; work.stride = 0; work.cell_count = 0
+}
+fn charge(work: &mut Workspace, count: i32) -> bool {
+    if count < 0 || count > work.quota - work.units { work.status = .Budget; return false }
+    work.units = work.units + count; true
+}
+fn invalid(work: &mut Workspace, why: Reason) -> bool { work.status = .Invalid; work.reason = why; false }
+fn refuse(work: &mut Workspace, why: Reason) -> bool { work.status = .Refused; work.reason = why; false }
+fn low_mask(mask: i64) -> i32 { i32(mask.shr(25).bit_and(15)) }
+fn token(reg: i32) -> i32 { if reg < 25 || reg > 28 { return 0 }; i32(1).shl(reg - 25) }
+fn shape(work: &mut Workspace, f: &mir.Function) -> bool {
+    n := f.kinds.len; p := f.place_kinds.len; b := f.block_starts.len
+    if !f.valid || !f.verified || f.modes.len != n || f.dst.len != n || f.a.len != n || f.b.len != n || f.c.len != n ||
+        f.types.len != n || f.extensions.len != n || f.effects.len != n || f.reads.len != n || f.writes.len != n || f.clobbers.len != n ||
+        f.aux.len != n || f.flags.len != n || f.variant.len != n || f.recipes.len != n || f.origins.len != n ||
+        f.raw_starts.len != n || f.widths.len != n || f.reloc_kinds.len != n || f.import_ids.len != n ||
+        f.abi.len != n || f.place.len != n || f.opcodes.len != n || f.imm.len != n || f.targets.len != n ||
+        f.op_blocks.len != n || f.block_ends.len != b || f.edge_starts.len != b + 1 ||
+        f.edge_to.len != f.edge_kinds.len || f.edge_to.len != f.edge_from.len ||
+        f.place_offsets.len != p || f.place_widths.len != p || f.place_extensions.len != p || f.place_escaped.len != p ||
+        f.label_ids.len != f.label_ops.len { return invalid(&mut work, .Function) }
+    if !charge(&mut work, f.order.len) || !charge(&mut work, b) || !charge(&mut work, f.edge_to.len) { return false }
+    var last := 0
+    for block in 0..b {
+        start := f.block_starts[block]; end := f.block_ends[block]
+        if start != last || end <= start || end > f.order.len || f.edge_starts[block] < 0 ||
+            f.edge_starts[block + 1] < f.edge_starts[block] || f.edge_starts[block + 1] > f.edge_to.len { return invalid(&mut work, .Function) }
+        for at in start..end {
+            id := f.order[at]
+            if id < 0 || id >= n || f.op_blocks[id] != block || f.place[id] < -1 || f.place[id] >= p ||
+                f.modes[id] < 0 || f.modes[id] > 2 || f.kinds[id] < 0 || f.kinds[id] > 21 { return invalid(&mut work, .Function) }
+        }
+        for e in f.edge_starts[block]..f.edge_starts[block + 1] {
+            if f.edge_from[e] != block { return invalid(&mut work, .Function) }
+        }
+        last = end
+    }
+    if last != f.order.len || f.edge_starts[0] != 0 || f.edge_starts[b] != f.edge_to.len { return invalid(&mut work, .Function) }
+    for edge in 0..f.edge_to.len {
+        if f.edge_to[edge] < -1 || f.edge_to[edge] >= b || f.edge_from[edge] < 0 || f.edge_from[edge] >= b ||
+            f.edge_kinds[edge] < 0 || f.edge_kinds[edge] > 5 { return invalid(&mut work, .Function) }
+    }
+    true
+}
+fn reachable(work: &mut Workspace, f: &mir.Function) -> bool {
+    blocks := f.block_starts.len
+    if blocks == 0 { return refuse(&mut work, .Exit) }
+    if !charge(&mut work, blocks) || !charge(&mut work, f.place_kinds.len) { return false }
+    for b in 0..blocks { bool_slot(&mut work.reached, b, false); bool_slot(&mut work.queued, b, false); i32_slot(&mut work.queue, b, 0) }
+    for p in 0..f.place_kinds.len { bool_slot(&mut work.accessed, p, false); i32_slot(&mut work.cell_for_place, p, -1) }
+    work.queue[0] = 0; work.reached[0] = true; var head := 0; var tail := 1
+    while head < tail {
+        b := work.queue[head]; head = head + 1
+        if !charge(&mut work, f.block_ends[b] - f.block_starts[b] + f.edge_starts[b + 1] - f.edge_starts[b]) { return false }
+        for at in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[at]; if f.modes[op] == 2 { continue }
+            if f.kinds[op] == 0 { return refuse(&mut work, .Opaque) }
+            p := f.place[op]; if p >= 0 { work.accessed[p] = true }
+        }
+        for e in f.edge_starts[b]..f.edge_starts[b + 1] {
+            to := f.edge_to[e]
+            if to >= 0 && !work.reached[to] { work.reached[to] = true; work.queue[tail] = to; tail = tail + 1 }
+            if f.edge_kinds[e] == 4 { return refuse(&mut work, .Opaque) }
+        }
+    }
+    true
+}
+fn candidates(work: &mut Workspace, f: &mir.Function, ctx: &Context) -> bool {
+    var no_use := true
+    for b in 0..f.block_starts.len {
+        if !work.reached[b] { continue }
+        if !charge(&mut work, f.block_ends[b] - f.block_starts[b]) { return false }
+        for at in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[at]; if f.modes[op] == 2 { continue }
+            if f.kinds[op] == 14 {
+                a := f.abi[op]
+                if a < 1 || a > 4 { return invalid(&mut work, .Function) }
+                if !ctx.known[a] || ctx.masks[a] != supported_mask() || low_mask(f.writes[op]) != 0 { no_use = false }
+            } else if low_mask(f.writes[op].bit_or(f.clobbers[op])) != 0 { no_use = false }
+        }
+    }
+    // NoUse needs no saved-cell arena or memory proof.
+    if no_use { work.no_use = true; work.stride = 1; return true }
+    for b in 0..f.block_starts.len {
+        if !work.reached[b] { continue }
+        for at in f.block_starts[b]..f.block_ends[b] {
+            if !charge(&mut work, 1) { return false }
+            op := f.order[at]; p := f.place[op]
+            if f.modes[op] == 2 || f.kinds[op] != 8 || token(f.a[op]) == 0 || p < 0 || work.cell_for_place[p] >= 0 ||
+                f.types[op] != 2 || f.extensions[op] != 0 || f.b[op] != 29 || f.place_widths[p] != 8 ||
+                !contract.frame_place_proven(&f, p) { continue }
+            if !charge(&mut work, f.place_kinds.len) { return false }
+            var private := true
+            for other in 0..f.place_kinds.len {
+                if other != p && work.accessed[other] && f.place_kinds[other] == 1 && mir.places_alias(&f, p, other) { private = false }
+            }
+            if private {
+                work.cell_for_place[p] = work.cell_count
+                i32_slot(&mut work.cells, work.cell_count, p); work.cell_count = work.cell_count + 1
+            }
+        }
+    }
+    work.stride = work.cell_count + 1; true
+}
+fn clear_cells(work: &mut Workspace) -> bool {
+    if !charge(&mut work, work.cell_count) { return false }
+    for i in 1..work.stride { work.state[i] = 0 }; true
+}
+fn transfer(work: &mut Workspace, f: &mir.Function, ctx: &Context, op: i32, position: i32) -> bool {
+    if !charge(&mut work, 1) { return false }
+    if f.modes[op] == 2 { return true }
+    kind := f.kinds[op]; before := work.state[0]
+    var after := before.bit_and(low_mask(f.writes[op].bit_or(f.clobbers[op])).bit_not())
+    if kind == 14 {
+        a := f.abi[op]; var mask: i64 = 0; if ctx.known[a] { mask = ctx.masks[a] }
+        after = before.bit_and(low_mask(mask)).bit_and(low_mask(f.writes[op]).bit_not())
+        if (f.effects[op].bit_and(4) != 0 && !ctx.private_memory[a]) || a == 4 ||
+            f.writes[op].bit_and(mir.variable_bit(29).bit_or(mir.variable_bit(31))) != 0 {
+            if !clear_cells(&mut work) { return false }
+        }
+    } else if kind == 2 && f.types[op] == 2 && f.dst[op] == f.a[op] {
+        after = after.bit_or(before.bit_and(token(f.dst[op])))
+    }
+    if kind == 8 || kind == 10 {
+        p := f.place[op]
+        if !charge(&mut work, work.cell_count) { return false }
+        for cell in 0..work.cell_count {
+            if p < 0 || mir.places_alias(&f, p, work.cells[cell]) { work.state[cell + 1] = 0 }
+        }
+        if kind == 8 && p >= 0 {
+            cell := work.cell_for_place[p]
+            if cell >= 0 && f.types[op] == 2 && f.extensions[op] == 0 && f.b[op] == 29 {
+                work.state[cell + 1] = before.bit_and(token(f.a[op]))
+            }
+        }
+    } else if kind != 14 && f.effects[op].bit_and(4) != 0 { if !clear_cells(&mut work) { return false } }
+    if kind == 7 && f.place[op] >= 0 && f.types[op] == 2 && f.extensions[op] == 0 && f.a[op] == 29 {
+        cell := work.cell_for_place[f.place[op]]
+        if cell >= 0 { after = after.bit_or(work.state[cell + 1].bit_and(token(f.dst[op]))) }
+    }
+    // Only the verified entry's frame setup/reservation retains cell facts.
+    // Later SP/FP changes are conservatively unsupported for saved cells.
+    if (kind == 16 && position > 3) || (kind == 21 && position != 0) ||
+        (kind != 16 && kind != 21 && kind != 14 && f.writes[op].bit_and(mir.variable_bit(29)) != 0) { if !clear_cells(&mut work) { return false } }
+    work.state[0] = after; true
+}
+fn lookup(work: &mut Workspace, ctx: &Context, label: i32) -> i32 {
+    var low := 0; var high := ctx.labels.len
+    while low < high {
+        if !charge(&mut work, 1) { return -2 }
+        middle := low + (high - low) / 2
+        if ctx.labels[middle] < label { low = middle + 1 } else { high = middle }
+    }
+    if low < ctx.labels.len && ctx.labels[low] == label { return low }; -1
+}
+fn exits(work: &mut Workspace, f: &mir.Function, ctx: &Context, b: i32, last: i32) -> bool {
+    for e in f.edge_starts[b]..f.edge_starts[b + 1] {
+        if f.edge_to[e] >= 0 { continue }
+        if !charge(&mut work, 1) { return false }
+        kind := f.edge_kinds[e]
+        if kind == 3 {
+            if work.state[0] != 15 { return refuse(&mut work, .Token) }
+        } else if kind == 2 && last >= 0 && f.kinds[last] == 20 { continue }
+        else if kind == 2 && last >= 0 && (f.kinds[last] == 12 || f.kinds[last] == 13) {
+            declared := lookup(&mut work, &ctx, f.targets[last])
+            if declared == -2 { return false }
+            if declared < 0 { return refuse(&mut work, .Exit) }
+            if ctx.exits[declared] == 2 && work.state[0].bit_and(low_mask(ctx.tail_masks[declared])) != 15 { return refuse(&mut work, .Token) }
+        } else { return refuse(&mut work, .Exit) }
+    }
+    true
+}
+pub fn analyze_into(work: &mut Workspace, f: &mir.Function, ctx: &Context, quota: i32) -> bool {
+    reset(&mut work, quota)
+    if quota < 0 { return invalid(&mut work, .Function) }
+    if !ctx.valid || ctx.epoch <= 0 { return invalid(&mut work, .Context) }
+    if !shape(&mut work, &f) || !reachable(&mut work, &f) || !candidates(&mut work, &f, &ctx) { work.no_use = false; return false }
+    blocks := f.block_starts.len
+    if work.stride > (quota - work.units) / (blocks + 1) { work.status = .Budget; work.no_use = false; return false }
+    if !charge(&mut work, blocks * work.stride + work.stride) { work.no_use = false; return false }
+    for i in 0..blocks * work.stride { i32_slot(&mut work.incoming, i, 15) }
+    for i in 0..work.stride { i32_slot(&mut work.state, i, 0) }
+    work.incoming[0] = 15
+    for i in 1..work.stride { work.incoming[i] = 0 }
+    for b in 0..blocks { work.queued[b] = false; work.reached[b] = false }
+    work.queue[0] = 0; work.queued[0] = true; work.reached[0] = true
+    var head := 0; var tail := 1 % blocks; var pending := 1
+    while pending > 0 {
+        b := work.queue[head]; head = (head + 1) % blocks; pending = pending - 1; work.queued[b] = false
+        if !charge(&mut work, work.stride + f.edge_starts[b + 1] - f.edge_starts[b]) { work.no_use = false; return false }
+        for i in 0..work.stride { work.state[i] = work.incoming[b * work.stride + i] }
+        var last := -1
+        for position in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[position]
+            if f.modes[op] != 2 { last = op }
+            if !transfer(&mut work, &f, &ctx, op, position) { work.no_use = false; return false }
+        }
+        if !exits(&mut work, &f, &ctx, b, last) { work.no_use = false; return false }
+        for e in f.edge_starts[b]..f.edge_starts[b + 1] {
+            to := f.edge_to[e]; if to < 0 { continue }
+            if !charge(&mut work, work.stride) { work.no_use = false; return false }
+            var changed := !work.reached[to]
+            for i in 0..work.stride {
+                at := to * work.stride + i; incoming := work.incoming[at].bit_and(work.state[i])
+                if incoming != work.incoming[at] { work.incoming[at] = incoming; changed = true }
+            }
+            work.reached[to] = true
+            if changed && !work.queued[to] {
+                work.queue[tail] = to; tail = (tail + 1) % blocks; pending = pending + 1; work.queued[to] = true
+            }
+        }
+    }
+    work.mask = supported_mask(); work.epoch = ctx.epoch; work.status = .Certified; true
+}
