@@ -375,6 +375,46 @@ def inline_optimizer_controls(p):
     p.call('check', 'inline.ddr', '--inline-opt=unknown', status=2)
 
 
+def whole_function_mir_controls(p):
+    p.write('mir.ddr', 'fn step(x:i32)->i32{x*3+1}\n'
+            'fn main(){var value:i32=1;for i in 0..8{value=step(value)};print(value)}\n')
+    for scalar in ('on', 'off'):
+        for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32'):
+            for mode in ('off', 'on'):
+                result = p.call('build', 'mir.ddr', '--target', target, '--mir=' + mode,
+                                '--scalar-opt=' + scalar, '--inline-opt=off',
+                                '--timings=json', '-o', f'mir-{target}-{scalar}-{mode}')
+                report = json.loads(result.stderr)
+                backend = report['mir']
+                assert backend['enabled'] is (mode == 'on'), report
+                if mode == 'on':
+                    assert backend['functions'] == report['functions']['emitted'] == 2, report
+                    assert backend['operations'] > 0, report
+                else:
+                    assert backend['functions'] == backend['operations'] == backend['opaque'] == 0, report
+    for mode in ('off', 'on'):
+        result = p.call('run', 'mir.ddr', '--mir=' + mode, '--inline-opt=off')
+        assert result.stdout == '9841\n', result
+    normal = p.call('check', 'mir.ddr', '--agent', '--mir=off')
+    checked = p.call('check', 'mir.ddr', '--agent', '--mir=on', '--timings=json')
+    assert checked.stdout == normal.stdout and normal.stderr == '', checked
+    backend = json.loads(checked.stderr)['mir']
+    assert not backend['enabled'] and backend['functions'] == backend['operations'] == backend['opaque'] == 0
+    for mode, reused in (('on', 0), ('on', 2), ('off', 0), ('off', 2), ('on', 2)):
+        result = p.call('build', 'mir.ddr', '--incremental', '--timings=json',
+                        '--inline-opt=off', '--mir=' + mode, '-o', 'mir-cached')
+        report = json.loads(result.stderr)
+        assert report['functions'] == {'reused': reused, 'emitted': 2 - reused}, report
+        assert report['mir']['functions'] == (2 - reused if mode == 'on' else 0), report
+    p.write('mir-tests.ddr', '@test fn works(){true}\n')
+    for mode, expected in (('off', '1 passed'), ('off', '1 unaffected'),
+                           ('on', '1 passed'), ('on', '1 unaffected'), ('off', '1 passed')):
+        result = p.call('test', 'mir-tests.ddr', '--mir=' + mode,
+                        '--affected', '-o', 'mir-results')
+        assert expected in result.stdout, result
+    p.call('check', 'mir.ddr', '--mir=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -382,7 +422,8 @@ def compiler_profile_controls(p):
     result = p.call('build', 'profile.ddr', '--profile-compiler', '--timings=json', '-o', 'profile')
     assert (p.root / 'plain').read_bytes() == (p.root / 'profile').read_bytes()
     phases = {'declarations','model_parse','verify_pre','simplify','verify_post',
-              'allocation','scalar_emit','legacy_body','fragment_cache','finalize','range_analysis'}
+              'allocation','scalar_emit','legacy_body','fragment_cache','finalize','range_analysis',
+              'mir_pipeline'}
 
     def detail(result):
         report = json.loads(result.stderr)
@@ -401,18 +442,23 @@ def compiler_profile_controls(p):
     enabled = detail(result)
     assert enabled['calls']['allocation'] >= 1 and enabled['calls']['scalar_emit'] >= 1
     assert enabled['calls']['finalize'] == 1
+    assert enabled['calls']['mir_pipeline'] == 2 and enabled['work']['mir_pipeline_operations'] > 0
     normal = p.call('check', 'profile.ddr', '--agent')
     for target in ('arm64-macos','arm64-linux','x86_64-linux','wasm32'):
         checked = p.call('check', 'profile.ddr', '--agent', '--target', target,
                          '--profile-compiler', '--timings=json')
         assert checked.stdout == normal.stdout
         d = detail(checked)
-        for skipped in ('simplify','verify_post','allocation','scalar_emit','finalize','range_analysis'):
+        for skipped in ('simplify','verify_post','allocation','scalar_emit','finalize','range_analysis','mir_pipeline'):
             assert d['phases'][skipped] == d['calls'][skipped] == 0, d
     off = p.call('build', 'profile.ddr', '--scalar-opt=off', '--profile-compiler',
                  '--timings=json', '-o', 'off')
     report = json.loads(off.stderr)['compiler_detail']
     assert report['calls']['model_parse'] == 0 and report['calls']['legacy_body'] > 0
+    assert report['calls']['mir_pipeline'] == 2
+    disabled = p.call('build', 'profile.ddr', '--mir=off', '--profile-compiler',
+                      '--timings=json', '-o', 'mir-off-profile')
+    assert json.loads(disabled.stderr)['compiler_detail']['calls']['mir_pipeline'] == 0
     human = p.call('build', 'profile.ddr', '--profile-compiler', '-o', 'human')
     for phase in phases:
         assert human.stderr.count('compiler ' + phase + '=') == 1, (phase, human.stderr)
@@ -556,7 +602,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
+             compiler_profile_controls, whole_function_mir_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:

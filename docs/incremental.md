@@ -27,6 +27,9 @@ aktuell arbetskatalog. Man kan radera hela katalogen mellan två byggen.
 Nyckeln innehåller kompilatorns kryptografiska identitet, målet, deklarationernas
 layout, skaläroptimeringens läge och funktionens tokenström. CLI:t behåller
 separata cachekataloger för `--scalar-opt=on` och `--scalar-opt=off`.
+Helfunktionskedjans version och läget `--mir=on/off` ingår också i både
+funktions- och testidentitet. Återställda fragment innehåller slutligt
+sänkt kod och går inte genom IR-kedjan en andra gång.
 På macOS används SHA-256 av den laddade
 bildens kodsignatur och på Linux SHA-256 av den körande ELF-filen genom
 `/proc/self/exe`. Identiteten följer därmed processen även om ett nytt bygge
@@ -64,6 +67,12 @@ avvisar, medan signaturer utanför delmängden hoppas över före försöket.
 Cacheträffar modelleras inte på nytt. `proven_bounds` räknar
 indexläsningar och elementskrivningar med bevisad gränskontroll.
 
+Fältet `mir` visar `enabled`, `functions`, `operations` och `opaque` för
+den gemensamma helfunktionskedjan. Antalen gäller nyemitterade funktioner,
+inklusive kroppar med anrop och ägda värden. Cacheträffar och kontroll utan
+emission ger inga nya IR-operationer. `--mir=off` stänger av kedjan för
+jämförelse och felsökning.
+
 Klockan väljs efter kompilatorns värdplattform, även vid korsbyggen. Ett
 klockfel ger `clock_ok: false` och otillgängliga intervall som `null`.
 Lyckade byggen och kontroller ger rapporter; misslyckade eller enbart
@@ -77,12 +86,15 @@ dunder build selfhost/main.ddr --profile-compiler --timings=json -o build/measur
 ```
 
 `--profile-compiler` aktiverar tidsrapporten och lägger till `compiler_detail`.
-Fältet delar kompilatorintervallet i elva icke överlappande faser:
+Fältet delar kompilatorintervallet i tolv icke överlappande faser:
 `declarations`, `model_parse`, `verify_pre`, `simplify`, `verify_post`,
 `allocation`, `scalar_emit`, `legacy_body`, `fragment_cache`, `finalize`
-och `range_analysis`. Den sista omfattar analysens preflight, fixpunkt,
+`range_analysis` och `mir_pipeline`. Intervallanalysen omfattar preflight, fixpunkt,
 replay och applicering; arbetsenheten är abstrakta operationer inklusive
 kopiering och sammanfogning av tillstånd.
+`mir_pipeline` omfattar lyft av hela funktioner, verifiering och sänkning;
+arbetsenheten är IR-operationer. Den besöks också när skalärmodellen är
+avstängd, men aldrig vid kontroll utan kodgenerering.
 `covered` summerar dessa intervall; `other` är återstoden av `compiler`.
 `calls` och `work` anger antal besök och arbetsenhet för varje fas. Samtliga
 klockor använder värdplattformen även när målet är ett annat.

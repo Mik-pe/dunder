@@ -8,6 +8,10 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/dunder-verify.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 "$compiler" test dogfood/tests.ddr -o "$work/dogfood"
+"$compiler" test tests/mir.ddr -o "$work/mir"
+"$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
+"$compiler" test tests/mir_retained.ddr -o "$work/mir-retained"
+python3 tools/test-mir.py "$compiler"
 python3 tools/test-diagnostics.py "$compiler"
 python3 tools/test-check.py "$compiler"
 python3 tools/test-optimizer.py "$compiler" --verify-selection

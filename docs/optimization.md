@@ -5,11 +5,41 @@ Kompilatorn avger instruktioner, lokala etiketter och relokeringar per funktion.
 Den tar med de runtimefunktioner som programmet behöver. Overflow, ogiltiga
 index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen.
 
-Den fortsatta huvudarkitekturen är en
+Huvudarkitekturen är nu en
 [gemensam IR för hela funktioner](whole-function-ir-plan.md), med samma gräns
-för skalära kroppar, anrop och ägda värden. Planen ersätter lokala
-emitterförbättringar som huvudspår; beskrivningen nedan dokumenterar de
-befintliga mekanismerna under övergången.
+för skalära kroppar, anrop och ägda värden. Planen beskriver fortsatt
+registerplacering, SSA, loopoptimering och direkta målbackends.
+
+## Gemensam helfunktionskedja
+
+Alla nyemitterade källfunktioner passerar [`mir_lift`](../selfhost/mir_lift.ddr),
+[`mir_verify`](../selfhost/mir_verify.ddr) och
+[`mir_lower`](../selfhost/mir_lower.ddr) innan funktionscachen sparas. Hela
+kroppen ingår, även ägarinitiering som ligger efter en retur i kodlayouten.
+Kedjan återanvänder platta arenor och arbetsminnen mellan funktioner.
+Kontroll utan emission skapar inga backendarenor; cacheträffar återställer
+redan sänkt kod.
+
+[`mir.Function`](../selfhost/mir.ddr) beskriver operationer, operander,
+maskinbredder, flaggor, kontrollkanter, byteintervall och anropseffekter.
+Frontend lämnar fullständiga spann för frameåtkomster, inklusive de
+scratchregister som stora offset använder. Okänd instruktionseffekt blir
+en uttrycklig barriär och spärrar analyser som saknar ett tillräckligt
+kontrakt. Funktionen går fortfarande genom IR-gränsen.
+
+Övergångsadaptern behåller ursprungliga kodord för byteidentisk återspelning.
+Verifieraren avkodar dem med samma gemensamma dekoder och kontrollerar exakt
+att de fortfarande motsvarar operationens semantik. Ändrad semantik kräver
+kanonisk sänkning. Syntetiska operationer kontrolleras också mot härledda
+operand-, effekt-, use/def-, frame- och scratchkontrakt. Trasiga metadata
+ger ett internt kompilatorfel. Sänkningen förbereder etiketter, relokeringar,
+importplatser och kod atomiskt före commit.
+
+`--mir=off` stänger av den nya gränsen för jämförelse. Läget och kedjans
+version skiljer cachefragment och testkvitton åt. `--timings=json` visar
+antal nyemitterade IR-funktioner, operationer och opaka barriärer.
+Denna första integration sänker fortfarande byteidentisk kod; representationen
+ensam innebär ingen runtimevinst eller ett uppnått C-mål.
 
 ## Typad funktionsmodell och lokalt optimeringspass
 

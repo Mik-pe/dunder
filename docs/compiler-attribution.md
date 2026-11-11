@@ -83,7 +83,7 @@ the recorded compiler image; rebuild-source hashes are also retained.
 `summary.json` gives per-case phase-duration medians and allocation-counter lower medians as
 navigation aids. Read the raw records for per-round work counts and variation.
 Lower medians keep uint64 counters exact even with an even number of rounds.
-The eleven compiler detail intervals must sum to `covered`; `covered + other`
+The twelve compiler detail intervals must sum to `covered`; `covered + other`
 must equal the driver compiler interval. Driver phases must sum to their total.
 Durations describe the clock-instrumented compiler and include its observer
 overhead; they do not measure the uninstrumented compiler's latency.

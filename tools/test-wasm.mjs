@@ -24,6 +24,7 @@ const nativeGroups = new Set([
     'selfhost/compile.ddr::inline_producer_does_not_duplicate_source_binding_reports',
     'selfhost/compile.ddr::inline_fragments_restore_backward_dependencies_charges_and_private_body_identity',
     'selfhost/compile.ddr::inline_fragment_keys_preserve_cold_growth_frontiers_across_partial_cache_hits',
+    'selfhost/compile.ddr::all_emitted_source_functions_use_mir_without_changing_diagnostics_or_bindings',
 ]);
 
 function invoke(program, args) {
