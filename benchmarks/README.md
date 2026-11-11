@@ -20,6 +20,10 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[i32-bevis och registerjämförelser, 2026-11-11](2026-11-11-i32-comparisons/README.md)
+förbättrar sorteringen ytterligare cirka 23 procent. C-geomedlet är 1,415×;
+rapporten redovisar byggkostnad och separat kontroll av varje nytt bevis.
+
 [Gemensam nodarena, 2026-11-11](2026-11-11-typed-nodes/README.md)
 förbereder delad uttrycksemission och inlining. Byggkostnaden mäts separat;
 utbilderna är byteidentiska och genererat bygges median ökar cirka två procent.

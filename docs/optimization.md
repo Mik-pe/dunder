@@ -42,6 +42,17 @@ skapar ingen funktionsframe eller retur och kontrollerar att emissionen
 saknar anrop. Detta är en byggsten för inlining; deklarationskatalog och
 aktivering av inlining är ännu inte del av standardbygget.
 
+Den separata [`opt_inline`](../selfhost/opt_inline.ddr)-katalogen är nu en
+testad byggsten: den lagrar högst 32 uttrycksnoder per redan verifierad
+skalär retur, 4 096 noder och 256 deklarationer totalt. Bara primitiva
+parametrar/resultat, högst åtta argument och den slutna anropsfria
+uttrycksmängden godtas. Katalogen fryses före användning; generation och
+strukturell identitet hindrar en gammal arbetsyta från att emittera ny kod.
+Källfingerprint är tomt tills alla kroppsdigester är färdiga och cachas
+vid frysningen. Felaktig signatur, mål, skuggad funktionspekare, frameplats
+eller ordbudget lämnar kodströmmen orörd. Argument måste redan vara
+utvärderade i källordning, även om kroppen inte använder dem.
+
 [Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
 operatorprioritet och kontextuell bredd på signerade heltalsliteraler.
@@ -102,6 +113,13 @@ bort kontroller som modellen har bevisat överflödiga. Inkommande argument
 sparas före registerplaceringen så att överlappande argumentregister är
 säkra. x86-64 och Wasm sänker fortsatt den delade ARM-instruktionsvokabulären;
 detta inför ingen separat direkt backend för dem.
+
+Jämförelser kan använda registerhem och cachade längdregister direkt.
+En spilld operand laddas separat; små positiva konstanter använder CMP:s
+immediate-form där den ryms. En konstant till vänster får byta sida med
+korrekt vänd signerad relation. Två sammansatta operander behåller sin
+utvärderingsordning. Samma villkorsval används för grenar och bool-resultat,
+även vid uttrycksemission i en anroparframe. Inga nya relokeringar införs.
 
 `--scalar-opt=off` stänger av den nya modellen, passet och registervägen
 för jämförelse och felsökning. Tidigare lokala kodgenereringsförbättringar
@@ -194,7 +212,15 @@ Första fasen löser loopinvarianter med joins och widening. Första iterationen
 fakta får aldrig användas som ett bevis för alla iterationer. Slutliga
 headers måste täcka både inträde och samtliga backedges. Andra fasen gör
 replay under dessa invarianter och samlar pending-bevis. Först efter en
-hel lyckad replay skrivs proof-bitarna. Aritmetikens kontroller behålls.
+hel lyckad replay skrivs proof-bitarna.
+
+Samma analys kan bevisa i32-addition, subtraktion, multiplikation och
+negation. Den beräknar hela det matematiska resultatintervallet i i64
+innan det klipps till i32 och kräver att båda gränserna ryms. Multiplikation
+använder de fyra hörnprodukterna. Ett barn som säkert trappar saknar normal
+fortsättning; dess tomma intervall får aldrig användas i förälderns matematik.
+Ett bevis för föräldern ändrar inte barnets utvärdering eller kontroller.
+i64-aritmetik, division och rest får inga nya aritmetikbevis från denna domän.
 
 Kortslutning modellerar båda orsakerna till falskt `A && B`; en looputgång
 får inte anta att bara vänstervillkoret blev falskt. For-gränser har egna
@@ -208,9 +234,10 @@ loop, djup 64, 32 768 faktaceller och 512 återanvändbara uttrycksslotar.
 funktionens befintliga proof-bitar orörda. Trasig modell eller invariant
 ger internt kompilatorfel före emission. Funktionsarenor och alla buffertar
 återanvänds; inga Value/Term-records allokeras per uttryck. Funktioner utan
-arrayparametrar hoppar över denna analys.
+arrayparametrar eller obevisade i32-kandidater hoppar över denna analys.
 
-Emissionen tar bara bort bevisade indexkontroller. En store beräknar och
+Emissionen tar bara bort de specifikt bevisade index- och aritmetikkontrollerna.
+Nollkontroller behålls. En store beräknar och
 bevarar destinationen före högerledet, även när kontrollen utelämnas.
 `--range-opt=off` stänger av passet oberoende av övriga val. Cache och
 testkvitton skiljer lägena åt; `--profile-compiler` har en separat
@@ -221,7 +248,8 @@ testkvitton skiljer lägena åt; `--profile-compiler` har en separat
 budgetfallback på fyra mål. `tools/test-range-analysis.py` exporterar
 faktiska modeller/bevis och följer dem i en oberoende interpreter med
 checkad aritmetik, kortslutning, snapshots och muterbara arrayer. Den
-kontrollerar varje dynamiskt nådd bevisad åtkomst mot rätt lagring.
+kontrollerar varje dynamiskt nådd bevisad åtkomst mot rätt lagring och varje
+nytt aritmetikbevis med obegränsad heltalsmatematik före vanlig overflow-hantering.
 Det är ett fryst ändligt testdomänprov, inte ett formellt bevis för alla
 program. Bränslestopp ger ofullständig täckning och icke godkänd körning.
 
@@ -363,10 +391,10 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-range-proofs/README.md)
+Den aktuella självhostens [före/efter- och av/på-mätning](../benchmarks/2026-11-11-i32-comparisons/README.md)
 omfattar både runtime, kompletta byggen och `check`.
 Konstantdivision och framefria funktioner förbättrar numerikkärnan;
-intervallbevis minskar sorteringens gränskontroller.
+intervallbevis och registerjämförelser minskar sorteringens kontrollkostnad.
 Profilerna ger underlag för [ägartillstånd och CFG](ownership-ir-plan.md),
 medan en gemensam nodarena och begränsad inlining är nästa grundsteg. Högre p95 i vissa
 arbetsfall redovisas separat från medianvinster.
