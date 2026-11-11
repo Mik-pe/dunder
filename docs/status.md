@@ -9,6 +9,11 @@ Rust-kompilatorn har ersatts. [Återbyggnad](../bootstrap/README.md) och
 
 ## Språk och runtime
 
+- Isolerade uppgifter använder `task scope`, `spawn` och typad `await` på
+  ARM64/macOS. Scopeägda trådar, separata pooler och kontrollerad kloning
+  håller managed-värden åtskilda. Typ- och effektanalys kontrollerar workerns
+  gräns; scope-exit väntar in jobben före cleanup. Parallell kompilering är
+  ännu inte aktiverad. [Uppgifter och begränsningar](tasks.md).
 - Moduler har privata och exporterade symboler, alias, namngivna typer och
   stöd för cykliska importer. Typinferens, typade funktionsvärden, indirekta
   anrop, rekursion och aggregatreturer används i kompilatorns egen källkod.

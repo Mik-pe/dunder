@@ -53,6 +53,7 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
 | `Command` / `sys.ReadResult` | En nominell enum med namngivna värden eller payload-varianter. |
 | `range` | Ett halvöppet intervall med `i32`-gränser. |
+| `TaskID<R>` | En kopierbar resultatnyckel till en [isolerad uppgift](tasks.md). |
 
 Literaler får typ från en annotering, funktionens parameter/returtyp eller
 den andra heltalsoperanden. Befintliga värden konverteras aldrig implicit

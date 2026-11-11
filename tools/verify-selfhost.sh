@@ -13,15 +13,18 @@ trap 'exit 1' HUP INT TERM
 "$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
 "$compiler" test tests/mir_object.ddr -o "$work/mir-object"
 python3 tools/test-mir-objects.py "$compiler"
-# The task foundations are not source-language threading. The unit modules
-# exercise portable metadata/emission; the final probe executes real host OS jobs.
-for task_module in task_data task_effects task_native; do
+# Metadata/emitter units execute portably; OS probes and source tasks execute
+# only on the implemented native host provider.
+python3 tools/test-mir-link.py "$compiler"
+for task_module in task_data task_effects task_native task_scope_emit; do
     "$compiler" test "tests/$task_module.ddr" -o "$work/$task_module"
     "$compiler" build-tests "tests/$task_module.ddr" --target wasm32 -o "$work/$task_module.wasm"
     node tools/test-wasm.mjs --execute "$work/$task_module.wasm"
 done
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     python3 tools/test-task-native.py "$compiler"
+    python3 tools/test-task-scope.py "$compiler"
+    python3 tools/test-task-source.py "$compiler"
 else
     echo 'BLOCKED native task execution: first provider requires ARM64/macOS'
 fi
