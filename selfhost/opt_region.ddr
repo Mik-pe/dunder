@@ -1,0 +1,188 @@
+// Closed typed scalar loops execute inside a legacy caller's existing frame.
+// The model remains an ordinary Function: immutable hidden parameters feed Let
+// copies with source binding mutability. There are no calls, returns, arrays,
+// owned values, outer-loop exits or frontend activation in this foundation.
+import arm64 as arm
+import lexer
+import opt_ir as ir
+import opt_parse as parse
+import opt_pass as pass
+import opt_verify as verify
+import opt_range as ranges
+import opt_alloc as alloc
+import opt_emit as emit
+import std.bytes as bytes
+import std.sha256 as sha
+
+pub opaque struct Region {
+    model: ir.Function, names: []string, types: []i32, mutable: []bool, positions: []i32,
+    live_out: []i32, generation: i64, state: i32, stamp: string,
+}
+pub opaque struct Workspace {
+    plan: alloc.Plan, verifier: verify.Workspace, ranges: ranges.Workspace,
+    inputs: []i32, outputs: []i32, ready: bool, generation: i64, stamp: string,
+    first_free: i32, required: i32, platform: i32,
+}
+pub fn new() -> Region { Region { model: ir.new(), names: [], types: [], mutable: [], positions: [],
+    live_out: [], generation: 0, state: 0, stamp: "" } }
+pub fn workspace() -> Workspace { Workspace { plan: alloc.new(), verifier: verify.new(), ranges: ranges.new(),
+    inputs: [], outputs: [], ready: false, generation: -1, stamp: "", first_free: -1, required: 0, platform: -1 } }
+pub fn reset(r: &mut Region) {
+    ir.reset(&mut r.model); r.names.clear(); r.types.clear(); r.mutable.clear(); r.positions.clear(); r.live_out.clear()
+    r.generation = r.generation + 1; r.state = 0; r.stamp = ""
+}
+// 0 empty, 1 source/subset refusal, 2 ready, 3 pre-pass invariant failure,
+// 4 range invariant failure, 5 post-pass invariant failure. Resource refusals
+// are ordinary fallback; internal failures must be distinguished by producers.
+pub fn status(r: &Region) -> i32 { r.state }
+pub fn budget_exhausted(r: &Region) -> bool { r.model.budget_exhausted }
+pub fn import_count(r: &Region) -> i32 { if r.state == 2 { r.names.len } else { 0 } }
+pub fn import_name(r: &Region, at: i32) -> string { r.names[at] }
+pub fn import_type(r: &Region, at: i32) -> i32 { r.types[at] }
+pub fn import_mutable(r: &Region, at: i32) -> bool { r.mutable[at] }
+pub fn import_at(r: &Region, at: i32) -> i32 { r.positions[at] }
+// Hidden parameters and their source-name working copies are synthetic prefix
+// bindings. Report only actual declarations inside the original source region.
+pub fn source_local_count(r: &Region) -> i32 { if r.state == 2 { r.model.local_types.len - r.names.len * 2 } else { 0 } }
+pub fn source_local_name(r: &Region, at: i32) -> string { r.model.local_names[r.names.len * 2 + at] }
+pub fn source_local_type(r: &Region, at: i32) -> i32 { r.model.local_types[r.names.len * 2 + at] }
+pub fn source_local_mutable(r: &Region, at: i32) -> bool { r.model.local_mutable[r.names.len * 2 + at] }
+pub fn source_local_at(r: &Region, at: i32) -> i32 { r.model.local_at[r.names.len * 2 + at] }
+pub fn node_count(r: &Region) -> i32 { if r.state == 2 { r.model.nodes.kinds.len } else { 0 } }
+fn put(raw: &mut []u8, value: i32) { bytes.append_le(&mut raw, i64(value), 4) }
+fn seal(r: &Region) -> string {
+    var raw: []u8 = []
+    bytes.append_utf8(&mut raw, "dunder-closed-scalar-region-v1")
+    put(&mut raw, r.model.root); put(&mut raw, r.model.params)
+    for local in 0..r.model.local_types.len {
+        put(&mut raw, r.model.local_types[local]); put(&mut raw, r.model.local_param[local]); put(&mut raw, r.model.local_at[local])
+        if r.model.local_mutable[local] { raw.push(1) } else { raw.push(0) }
+        name := r.model.local_names[local]; put(&mut raw, name.len); bytes.append_utf8(&mut raw, name)
+    }
+    for node in 0..r.model.nodes.kinds.len {
+        put(&mut raw, r.model.nodes.kinds[node]); put(&mut raw, r.model.nodes.types[node]); put(&mut raw, r.model.nodes.left[node])
+        put(&mut raw, r.model.nodes.right[node]); put(&mut raw, r.model.nodes.third[node]); put(&mut raw, r.model.nodes.next[node])
+        bytes.append_le(&mut raw, r.model.nodes.values[node], 8)
+        put(&mut raw, r.model.nodes.locals[node]); put(&mut raw, r.model.nodes.starts[node]); put(&mut raw, r.model.nodes.effects[node]); put(&mut raw, r.model.nodes.proofs[node])
+    }
+    // Capture order, identity and mutability determine both staging and export.
+    for capture in 0..r.names.len {
+        name := r.names[capture]; put(&mut raw, name.len); bytes.append_utf8(&mut raw, name)
+        put(&mut raw, r.types[capture]); put(&mut raw, r.positions[capture])
+        if r.mutable[capture] { raw.push(1) } else { raw.push(0) }
+    }
+    for local in r.live_out { put(&mut raw, local) }
+    digest := sha.digest_bytes(&raw); var wide: []i32 = []
+    for byte in digest { wide.push(i32(byte)) }; bytes.hex(&wide)
+}
+// Verify the ordinary capture declarations remain the defining prefix, even
+// after optimization. Future dead-store passes must honor these explicit
+// exports rather than discard a working definition that has no body read.
+fn closed(r: &Region, optimized: bool) -> bool {
+    count := r.names.len
+    if !r.model.supported || r.model.ret != 0 || r.model.params != count || r.model.local_types.len < count * 2 { return false }
+    root := r.model.root
+    if root < 0 || r.model.nodes.kinds[root] != 10 { return false }
+    var item := r.model.nodes.left[root]
+    for capture in 0..count {
+        local := count + capture
+        if r.model.local_types[capture] != r.types[capture] || r.model.local_mutable[capture] || r.model.local_param[capture] != capture ||
+            r.model.local_types[local] != r.types[capture] || r.model.local_mutable[local] != r.mutable[capture] || r.model.local_param[local] != -1 ||
+            r.model.local_names[local] != r.names[capture] || item < 0 || r.model.nodes.kinds[item] != 11 || r.model.nodes.locals[item] != local { return false }
+        value := r.model.nodes.left[item]
+        if value < 0 || r.model.nodes.kinds[value] != 2 || r.model.nodes.locals[value] != capture { return false }
+        item = r.model.nodes.next[item]
+    }
+    if item < 0 || r.model.nodes.next[item] != -1 { return false }
+    kind := r.model.nodes.kinds[item]
+    // The normal optimizer turns while(false) into an empty ordinary Block.
+    if kind != 14 && kind != 19 && !(optimized && kind == 10 && r.model.nodes.left[item] == -1) { return false }
+    for node in 0..r.model.nodes.kinds.len {
+        kind := r.model.nodes.kinds[node]
+        if !((kind >= 1 && kind <= 4) || (kind >= 10 && kind <= 14) || kind == 16 || kind == 17 || kind == 19) { return false }
+    }
+    true
+}
+pub fn build_into(r: &mut Region, w: &mut Workspace, t: &lexer.Tokens, first: i32, last: i32,
+    names: &[]string, types: &[]i32, mutable: &[]bool, positions: &[]i32, range_enabled: bool) -> bool {
+    reset(&mut r); w.ready = false
+    r.state = 1
+    if !parse.parse_region(&mut r.model, &t, first, last, &names, &types, &mutable, &positions) { return false }
+    for capture in 0..names.len {
+        r.names.push(names[capture]); r.types.push(types[capture]); r.mutable.push(mutable[capture]); r.positions.push(positions[capture])
+        if mutable[capture] { r.live_out.push(names.len + capture) }
+    }
+    var positions_ok := true
+    for local in 0..r.model.local_at.len { at := r.model.local_at[local]; if at < 0 || at >= t.kinds.len { positions_ok = false } }
+    for node in 0..r.model.nodes.starts.len { at := r.model.nodes.starts[node]; if at < 0 || at >= t.kinds.len { positions_ok = false } }
+    if !positions_ok || !verify.validate_into(&mut w.verifier, &r.model, false) || !closed(&r, false) { r.state = 3; return false }
+    pass.run(&mut r.model)
+    if range_enabled {
+        var candidate := false
+        for node in 0..r.model.nodes.kinds.len {
+            if r.model.nodes.types[node] != 1 || r.model.nodes.proofs[node].bit_and(1) != 0 { continue }
+            kind := r.model.nodes.kinds[node]; op := r.model.nodes.values[node]
+            if (kind == 3 && op >= 1 && op <= 3) || (kind == 4 && op == 1) { candidate = true; break }
+        }
+        if candidate {
+            ready := ranges.analyze_into(&mut w.ranges, &r.model)
+            if ready { ranges.apply(&mut w.ranges, &mut r.model) }
+            if !ready && ranges.status(&w.ranges) == 4 { r.state = 4; return false }
+        }
+    }
+    if !verify.validate_into(&mut w.verifier, &r.model, true) || !closed(&r, true) { r.state = 5; return false }
+    r.stamp = seal(&r); r.state = 2; true
+}
+// required_slots is a TOTAL caller-frame end, never a delta. Every virtual
+// value uses a new slot first_free+id; original import slots are read-only
+// during the body and only mutable source bindings are exported on completion.
+pub fn required_slots(w: &Workspace) -> i32 { if w.ready { w.required } else { 0 } }
+pub fn first_slot(w: &Workspace) -> i32 { if w.ready { w.first_free } else { -1 } }
+pub fn prepare(w: &mut Workspace, r: &Region, input_slots: &[]i32, first_free: i32, platform: i32) -> bool {
+    w.ready = false; w.inputs.clear(); w.outputs.clear()
+    if r.state != 2 || r.stamp.len != 64 || first_free < 0 || first_free >= 65535 || platform < 0 || platform > 3 || input_slots.len != r.names.len { return false }
+    for capture in 0..input_slots.len {
+        if input_slots[capture] < 0 || input_slots[capture] >= first_free { return false }
+        for previous in 0..capture { if input_slots[previous] == input_slots[capture] { return false } }
+    }
+    alloc.allocate_live_out_into(&mut w.plan, &r.model, &r.live_out)
+    if w.plan.homes.len > 65535 - first_free { return false }
+    for local in 0..w.plan.homes.len { w.plan.frame_slots.push(first_free + local) }
+    for capture in 0..input_slots.len {
+        w.inputs.push(input_slots[capture]); if r.mutable[capture] { w.outputs.push(input_slots[capture]) }
+    }
+    w.first_free = first_free; w.required = first_free + w.plan.homes.len; w.platform = platform
+    w.generation = r.generation; w.stamp = r.stamp; w.ready = true; true
+}
+fn placement(w: &Workspace, r: &Region, first_free: i32, caller_slots: i32) -> bool {
+    if first_free != w.first_free || first_free < 0 || first_free >= 65535 || caller_slots < w.required || caller_slots > 65535 ||
+        w.required != first_free + w.plan.homes.len || w.plan.frame_slots.len != w.plan.homes.len ||
+        w.inputs.len != r.names.len || w.outputs.len != r.live_out.len { return false }
+    for local in 0..w.plan.frame_slots.len {
+        if w.plan.frame_slots[local] != first_free + local { return false }
+        home := w.plan.homes[local]
+        if home >= 0 && !((home >= 4 && home <= 7) || (home >= 10 && home <= 17)) { return false }
+    }
+    for capture in 0..w.inputs.len {
+        if w.inputs[capture] < 0 || w.inputs[capture] >= first_free { return false }
+        for previous in 0..capture { if w.inputs[previous] == w.inputs[capture] { return false } }
+    }
+    var exported := 0
+    for capture in 0..r.names.len {
+        if !r.mutable[capture] { continue }
+        local := r.names.len + capture
+        if r.live_out[exported] != local || w.outputs[exported] != w.inputs[capture] || w.plan.first[local] < 0 || w.plan.last[local] != w.plan.clock { return false }
+        exported = exported + 1
+    }
+    true
+}
+// A prepared placement is single-use. Every refusal precedes Code mutation;
+// independent same-generation models are distinguished by the content seal.
+pub fn emit_prepared(w: &mut Workspace, code: &mut arm.Code, r: &Region,
+    first_free: i32, caller_slots: i32, overflow: i32, zero: i32, bounds: i32, settings: &emit.Options) -> bool {
+    ready := w.ready; w.ready = false
+    if !ready || r.state != 2 || w.generation != r.generation || w.stamp != r.stamp || code.platform != w.platform || code.checking ||
+        !placement(&w, &r, first_free, caller_slots) || overflow < 0 || overflow >= code.labels.len || zero < 0 || zero >= code.labels.len || bounds < 0 || bounds >= code.labels.len { return false }
+    emit.emit_prepared_region(&mut code, &r.model, &w.plan, &w.inputs, &r.live_out, &w.outputs, overflow, zero, bounds, &settings)
+    true
+}
