@@ -172,3 +172,23 @@ retained rather than hidden behind the later improvements from the expensive
 full-plan candidate. A following inductive row certificate removes a redundant
 whole-function pre-DCE verification only for strictly locally validated edits;
 unconditional final verification and the conservative fallback remain.
+
+
+## Locally checked certificates: serial build gate passed
+
+`certified-before-objects` is the complete-profile 30-round comparison of the
+pre-MIR compiler with
+`e311e94bc42d58d967319be0ae78ffb4b9a8a0c5e5faaa816994c2d13558065d`.
+Generated build median/p95 are 926.366/936.691 ms: **107,852 source lines/s at
+p95**, clearing the generated build target. Self-build is 746.583/753.359 ms;
+Tabell 20.944/28.598 ms. Relative to the original compiler, medians still cost
+2.88x generated and 3.14x self-build. Check-only is comparable.
+
+All four runtime images still exactly match the full-plan candidate. In this
+series candidate/C geometric mean is 1.175 and worst case 1.346 (text).
+The C runtime goal therefore remains unmet. These are the same machine-code
+images as earlier series, with fresh samples rather than selected best C times.
+The private certificate rule retained the same existing rewrites and mandatory
+final verification; targeted coverage passed 40 native and 40 Wasm groups plus
+384 target images and 192 executions. The newly integrated FunctionObject
+adapter is verified and measured separately before final publication.

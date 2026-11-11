@@ -166,38 +166,66 @@ parallella funktionsfronter kräver först en frusen deklarationsvärld och
 separata FunctionContext.
 
 Språkets första vertikal ska vara strukturerade, isolerade uppgifter med
-namngiven workerfunktion, ett explicit ägt indatavärde och ett typat resultat.
-Task<Result> kan vara en härledd generell typkonstruktor utan att först
-införa alla användargenerics. Taskhandtag måste vara affina: vanlig opaque
-struct innebär kopiering och räcker inte. Join konsumerar handtaget, och
-normal scope-exit väntar in återstående jobb före vanlig cleanup, även vid
-return/break/continue. Ingen detached livstid eller cancellation införs först.
-Överföring/flytt behöver verklig kontroll av bindningars tillstånd och
-kontrollflödets joins; nuvarande temporäröverföring är inte sådan kontroll.
+namngiven workerfunktion, ett explicit indatavärde och ett typat resultat.
+Det lexikala scopet äger alla OS-jobb, snapshots, resultat och cleanup.
+Spawn lämnar en kopierbar typad TaskID<Result>: en resultatnyckel, aldrig
+en ägarpekare. Därmed kräver första modellen inte generell move-kontroll
+eller affina taskhandtag. Den generella typkonstruktorn behöver inte vänta
+på fulla användargenerics. Nycklar kan lagras som skalära värden i arrayer,
+så kompilatorn kan hålla en begränsad FIFO utan arrayer av aggregat.
 
-Första runtimekontraktet är isolering. Varje worker får egen runtimekontext,
-heap och separat C-ABI-entry. Gränskopiering måste kopiera hela objektgrafen,
-inklusive dynamiska strängars bytes; vanlig värdekopia delar deras icke-
-atomiska referensräknare. Resultat kopieras tillbaka före frigöring av
-workerheapen. Enbart trådlokala bumpmarkörer räcker inte: blockheaderns
-free-binpekare refererar till ursprungspoolen. Varken referensräknare eller
-free-listor får därmed korsas som vanliga managed-handtag i denna första
-modell. Nollkopierande flytt är en separat senare förbättring som kräver
-remote-free, poollivstid och delade handles med definierad synkronisering.
+Await kräver ett levande matchande scope och kontrollerar ägare, generation,
+ordinal och resultattyp. En utgången eller felaktig nyckel får inte
+dereferera frigjort kontrollminne. Generationer får inte återanvändas vid
+overflow. Scopet joinar varje jobb internt exakt en gång och cachelagrar
+resultatet i föräldraheapen; upprepade await ger vanliga värdekopior av den
+cachen. Normal scope-exit väntar in alla jobb före cleanup, även vid
+return/break/continue. Ingen detach, polling utan atomics eller cancellation
+införs först. Scopets kapabilitet får inte lämna sin region.
 
-Överförbarhet kontrolleras rekursivt. Borrows, scratch-vyer, råpekare, okända
-funktionspekare och trådbundna resurser avvisas först. En worker måste också
-ha en verifierad transitiv effektgräns: inga externa anrop, static_bytes,
-råa escaping-adresser eller callbacks. Ett vanligt fn(T)->R bevisar inte
-detta. Interna lån och allokering i den egna domänen kan vara tillåtna.
-Delade scoped borrows, publika mutexar och atomics kräver senare Sync- och
-lånelivstidsregler; de behövs inte för att börja med isolerade jobb.
+Första datagränsen definieras av den faktiska klonvägen: en tillåten
+värdekopia får aldrig dela managed-handtag. Primitiver och tag-enums utan
+payload fungerar; ägda arrayer och records måste uppfylla samma regel
+rekursivt. Dynamiska strängar och payload-enums avvisas först, även när
+en enum bara innehåller tal: dagens klonväg behåller hela enumblocket med
+retain. Borrows, scratch-vyer, råpekare, okända funktionspekare och task-ID:n
+får inte passera jobbgränsen. Opaque- och resurskontrakt måste granskas
+separat; ett OS-handtag kan döljas i ett heltal. Detta är inte ett generellt
+Send/Sync-anspråk för alla befintliga typer.
+
+Varje worker får en egen runtimekontext, heap och separat C-ABI-entry.
+Föräldern måste först skapa en fristående inputsnapshot som hålls levande
+till join. Child får läsa denna som lånad rå källa och klona till sin egen
+pool; förälderns snapshot får aldrig bli ett ägt workerargument som kan
+frigöras av child. Workeranropet får enbart den färdiga childkopian.
+Resultatroten måste leva efter workerfunktionens cleanup. Efter lyckad join
+klonar föräldern resultatet före återvinning av childpoolen och använder
+aldrig vanlig parent-release på childallokeringar.
+
+All childläst kontrollinformation färdigställs före thread-create; allt
+childskrivet resultat läses först efter join. Create/join måste vara riktiga
+synkroniserande minnesgränser. Nullpool för skalärjobb och initiering av
+profilräknare behöver egna prov. Misslyckad create skapar inget joinbart
+jobb; misslyckad join bevisar inte att child är färdig och får därför inte
+leda till frigöring. Spawnfel måste lämna redan startade jobb registrerade
+för korrekt scope-cleanup.
+
+Workerfunktionens transitiva effekter verifieras: inga externa anrop,
+static_bytes, råa escaping-adresser, callbacks eller okända indirekta
+anropsmål. Interna lån och allokering i den egna domänen är tillåtna. Ett
+vanligt fn(T)->R bevisar inte denna effektgräns. Nested spawn avstår först
+eller måste dela en hierarkisk trådbudget. Dynamiska strängar/payload-enums
+kan följa med verklig gränsdjupkopiering; nollkopierande flytt och delad heap
+kräver sedan egna regler för remote-free, poollivstid, atomisk RC och
+Send/Sync/lånelivstider. De är separata utbyggnader.
 
 Den befintliga callbackbryggan är uttryckligen synkron och trådbunden och
 får inte återanvändas som workerstart. Native-adaptern behöver sätta upp
 heapregister samt x86:s registerbank/värdestack och bevara värdens C-ABI.
-Wasm behöver egen shared-memory-/atomic-grund; nåbar threading ska tills
-dess ge ett tydligt målrelaterat fel. Bootstrap ska fortsatt byggas från
+Wasm behöver en egen worker-/instans- och transportgräns; nåbar threading
+ska tills dess ge ett tydligt målrelaterat fel. Isolerade WebWorkers med
+separata instanser och typat wire-format behöver inte dela linjärt minne
+eller använda atomics; delat minne är ett separat alternativ. Bootstrap ska fortsatt byggas från
 den frysta seriella seedvägen; en compiler som själv använder nya task-
 uttryck måste byggas i ett uttryckligt senare steg, inte kräva att fröet
 redan förstår den nya syntaxen.
