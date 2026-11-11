@@ -1,0 +1,173 @@
+// Compiler-internal isolated-task provider. No source API, scheduler or Send
+// inference lives here. Epoch1 supports ARM64/macOS only, without profiling.
+// The producer must prove that both generated clones recursively duplicate
+// every managed allocation: strings, payload-enums, borrows, raw pointers,
+// function/task/resource handles must not cross this initial boundary.
+import arm64 as arm
+import ffi_arm64 as abi
+import runtime
+
+// Parent-owned, 16-byte aligned, 80-byte writable control. Parent initializes
+// every field before create; the worker writes ONLY child_result/child_pool.
+// Parent reads those two fields only after successful pthread_join. No polling.
+//  0 parent state       8 pthread_t          16 borrowed parent input snapshot
+// 24 child result     32 child pool base    40 owned parent result cache
+// 48 create error     56 join error         64 munmap status     72 reserved
+// State:0 Ready,1 Running,2 Joined,3 Cloned,4 Collected,5 StartFailed,
+// 6 JoinFailed (termination unproven),7 ReclaimFailed (parent cache valid),
+// 8 Discarded (no cache),9 DiscardReclaimFailed (no cache, mapping retained).
+// The scope, not an exposed copied ID, owns this control and the OS resource.
+// It retains the input snapshot until join and drops its parent result cache.
+// create/collect/discard take control in X0 and return signed status in X0:
+// 0 success, -1 protocol/munmap failure, positive pthread error. They preserve
+// ordinary Dunder runtime state (parent cloning may advance its allocator).
+// collect caches R, discard never clones an uncached R. Discarding state4
+// retains its existing parent cache for caller cleanup. Collecting state8 is
+// a protocol error. Repeated terminal/error calls perform no further OS call.
+// State5 owns no OS job. State6 MUST retain control, input and child ownership:
+// termination is unproven, and child fields MUST NOT be read. States7/9 have
+// joined but MUST retain mapping/control ownership after failed reclamation;
+// state7 additionally owns a valid parent cache. No retry/recovery is implicit.
+// This provider never frees control, the parent input, or a parent cached R.
+pub fn policy_tag() -> string { "native-isolated-task1-arm64-macos" }
+pub fn control_bytes() -> i32 { 80 }
+pub fn pool_bytes() -> i64 { 536870912 }
+pub fn supported(platform: i32, profiling: bool) -> bool { platform == 0 && !profiling }
+// Clone label -1 means identity for a proven scalar-only boundary. Label0 is
+// an ordinary valid label, never a sentinel. Worker must always be a label.
+// All three labels use the uniform internal ABI: source/root bits in X0,
+// returned root bits in X0. Clones borrow their source; worker consumes its
+// owned argument and transfers the owned result to control. A fatal worker
+// trap retains the existing process-fatal semantics; it is not a task error.
+pub struct TaskSpec { input_clone: i32, worker: i32, result_clone: i32 }
+// Slots must name the real C prototypes in the caller's image import table:
+// int pthread_create(pthread_t*,NULL,void*(*)(void*),void*),
+// int pthread_join(pthread_t,void**), int munmap(void*,size_t).
+// symbol_count is the producer's actual import-table length, allowing complete
+// index validation before this emitter adds any code or labels.
+pub struct Symbols { symbol_count: i32, pthread_create: i32, pthread_join: i32, munmap: i32 }
+pub struct Provider {
+    ok: bool, error: string, create: i32, collect: i32, discard: i32, worker_entry: i32,
+    import_sites: []i32, import_slots: []i32,
+}
+fn result() -> Provider {
+    Provider { ok: false, error: "", create: -1, collect: -1, discard: -1, worker_entry: -1, import_sites: [], import_slots: [] }
+}
+fn load(c: &mut arm.Code, dst: i32, base: i32, offset: i32) { abi.load(&mut c, dst, base, offset, 8) }
+fn store(c: &mut arm.Code, src: i32, base: i32, offset: i32) { abi.store(&mut c, src, base, offset, 8) }
+fn compare(c: &mut arm.Code, reg: i32, value: i32) { arm.emit(&mut c, 4043309087 + i64(value) * 1024 + i64(reg) * 32) }
+fn begin(c: &mut arm.Code, label: i32, slots: i32) { arm.mark(&mut c, label); at := arm.prologue(&mut c); arm.frame(&mut c, at, slots) }
+fn state(c: &mut arm.Code, value: i32) { arm.imm(&mut c, 10, i64(value)); store(&mut c, 10, 1, 0) }
+fn imported(c: &mut arm.Code, out: &mut Provider, slot: i32) {
+    out.import_sites.push(arm.position(&c) * 4); out.import_slots.push(slot)
+    arm.emit(&mut c, 0); arm.emit(&mut c, 0); arm.emit(&mut c, 3594453504) // BLR X16
+    arm.emit(&mut c, 2470476800) // C int -> signed full-width internal value
+}
+// x0 points to fresh, unexposed control storage; x1 is a parent-owned snapshot
+// root (or scalar bits). Initialization does not take/drop a managed owner.
+// This must not be used to reset an existing live control.
+pub fn emit_initialize(c: &mut arm.Code) {
+    for slot in 0..10 { var src := 31; if slot == 2 { src = 1 }; store(&mut c, src, 0, slot * 8) }
+}
+fn entry(c: &mut arm.Code, spec: &TaskSpec, label: i32) {
+    // Native C ABI, not callback(): preserve all X19..28 and lower D8..15,
+    // plus FP/LR/SP. Control and saves remain in this OS thread's C frame.
+    begin(&mut c, label, 20); arm.store(&mut c, 0, 0)
+    for reg in 19..29 { arm.store(&mut c, 1 + reg - 19, reg) }
+    for reg in 8..16 { abi.fp(&mut c, reg, 10, 8, false); arm.store(&mut c, 11 + reg - 8, 10) }
+    // No suspended process callback state is borrowed. Source worker effects
+    // must not access external/argv state in this first provider epoch.
+    for reg in 19..25 { arm.imm(&mut c, reg, 0) }
+    arm.load(&mut c, 0); load(&mut c, 0, 0, 16)
+    // Clone helper borrows raw source storage; it must not own/drop it. The
+    // ordinary Dunder worker receives ONLY the newly owned child-domain copy.
+    if spec.input_clone >= 0 { arm.branch(&mut c, spec.input_clone, 1) }; arm.branch(&mut c, spec.worker, 1)
+    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 24); store(&mut c, 21, 1, 32)
+    for reg in 8..16 { arm.load_into(&mut c, 11 + reg - 8, 10); abi.fp(&mut c, reg, 10, 8, true) }
+    for reg in 19..29 { arm.load_into(&mut c, 1 + reg - 19, reg) }
+    arm.imm(&mut c, 0, 0); arm.ret(&mut c) // pthread start returns NULL, result is in control
+}
+fn create(c: &mut arm.Code, out: &mut Provider, symbols: &Symbols) {
+    begin(&mut c, out.create, 1); arm.store(&mut c, 0, 0)
+    bad := arm.label(&mut c); success := arm.label(&mut c)
+    load(&mut c, 10, 0, 0); compare(&mut c, 10, 0); arm.branch(&mut c, bad, 3)
+    arm.branch(&mut c, out.worker_entry, 20); arm.mov(&mut c, 2, 0)
+    arm.load(&mut c, 0); arm.mov(&mut c, 3, 0)
+    arm.emit(&mut c, 2432696320 + 8 * 1024); arm.imm(&mut c, 1, 0)
+    imported(&mut c, &mut out, symbols.pthread_create)
+    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 48); arm.branch(&mut c, success, 18)
+    state(&mut c, 5); arm.ret(&mut c)
+    arm.mark(&mut c, success); state(&mut c, 1); arm.ret(&mut c)
+    arm.mark(&mut c, bad); arm.imm(&mut c, 0, -1); arm.ret(&mut c)
+}
+fn collect(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbols) {
+    common := arm.label(&mut c)
+    arm.mark(&mut c, out.collect); arm.imm(&mut c, 1, 0); arm.branch(&mut c, common, 0)
+    arm.mark(&mut c, out.discard); arm.imm(&mut c, 1, 1); arm.branch(&mut c, common, 0)
+    begin(&mut c, common, 2); arm.store(&mut c, 0, 0); arm.store(&mut c, 1, 1)
+    join := arm.label(&mut c); clone := arm.label(&mut c); reclaim := arm.label(&mut c)
+    collected := arm.label(&mut c); success := arm.label(&mut c); bad := arm.label(&mut c)
+    join_failed := arm.label(&mut c); reclaim_failed := arm.label(&mut c)
+    old_join_error := arm.label(&mut c); old_reclaim_error := arm.label(&mut c)
+    discarded := arm.label(&mut c); cached := arm.label(&mut c); cached_reclaim_error := arm.label(&mut c)
+    load(&mut c, 10, 0, 0)
+    compare(&mut c, 10, 1); arm.branch(&mut c, join, 2)
+    compare(&mut c, 10, 2); arm.branch(&mut c, clone, 2)
+    compare(&mut c, 10, 3); arm.branch(&mut c, reclaim, 2)
+    compare(&mut c, 10, 4); arm.branch(&mut c, success, 2)
+    compare(&mut c, 10, 6); arm.branch(&mut c, old_join_error, 2)
+    compare(&mut c, 10, 7); arm.branch(&mut c, old_reclaim_error, 2)
+    compare(&mut c, 10, 8); arm.branch(&mut c, discarded, 2)
+    compare(&mut c, 10, 9); arm.branch(&mut c, old_reclaim_error, 2)
+    arm.branch(&mut c, bad, 0)
+    arm.mark(&mut c, join); load(&mut c, 0, 0, 8); arm.imm(&mut c, 1, 0)
+    imported(&mut c, &mut out, symbols.pthread_join)
+    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 56); arm.branch(&mut c, join_failed, 19)
+    state(&mut c, 2)
+    arm.mark(&mut c, clone); arm.load(&mut c, 1); arm.branch(&mut c, reclaim, 19)
+    arm.load(&mut c, 0); load(&mut c, 0, 0, 24)
+    // Parent runtime is active here. Never release/drop a child block from the
+    // parent. This helper clones to parent storage without modifying its source.
+    if spec.result_clone >= 0 { arm.branch(&mut c, spec.result_clone, 1) }
+    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 40); state(&mut c, 3)
+    arm.mark(&mut c, reclaim); arm.load(&mut c, 0); load(&mut c, 0, 0, 32)
+    arm.branch(&mut c, collected, 18) // scalar jobs may never allocate a pool
+    arm.imm(&mut c, 1, pool_bytes()); imported(&mut c, &mut out, symbols.munmap)
+    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 64); arm.branch(&mut c, reclaim_failed, 19)
+    arm.mark(&mut c, collected); arm.load_into(&mut c, 0, 1)
+    store(&mut c, 31, 1, 24); store(&mut c, 31, 1, 32)
+    load(&mut c, 10, 1, 0); compare(&mut c, 10, 3); arm.branch(&mut c, cached, 2)
+    state(&mut c, 8); arm.branch(&mut c, success, 0)
+    arm.mark(&mut c, cached); state(&mut c, 4)
+    arm.mark(&mut c, success); arm.imm(&mut c, 0, 0); arm.ret(&mut c)
+    arm.mark(&mut c, join_failed); state(&mut c, 6); arm.ret(&mut c)
+    arm.mark(&mut c, reclaim_failed); load(&mut c, 10, 1, 0); compare(&mut c, 10, 3); arm.branch(&mut c, cached_reclaim_error, 2)
+    state(&mut c, 9); arm.ret(&mut c)
+    arm.mark(&mut c, cached_reclaim_error); state(&mut c, 7); arm.ret(&mut c)
+    arm.mark(&mut c, old_join_error); load(&mut c, 0, 0, 56); arm.ret(&mut c)
+    arm.mark(&mut c, old_reclaim_error); load(&mut c, 0, 0, 64); arm.ret(&mut c)
+    arm.mark(&mut c, discarded); arm.load(&mut c, 1); arm.branch(&mut c, success, 19); arm.branch(&mut c, bad, 0)
+    arm.mark(&mut c, bad); arm.imm(&mut c, 0, -1); arm.ret(&mut c)
+}
+// The compiler producer supplies three real system import slots and validated
+// source clone/worker labels. This provider does not resolve symbols itself.
+// All imports are ordinary ADRP/LDR pairs recorded for existing image writers.
+// Returned sites are byte offsets in Code, parallel with the supplied slots.
+// No code or labels are added when the target/policy/spec is unsupported.
+pub fn emit(c: &mut arm.Code, rt: &runtime.Runtime, spec: &TaskSpec, symbols: &Symbols) -> Provider {
+    var out := result()
+    if c.platform != 0 { out.error = "isolated native tasks require ARM64/macOS"; return out }
+    if c.profile { out.error = "isolated native task profiling is not supported"; return out }
+    if c.checking { out.error = "isolated native task emission requires a code sink"; return out }
+    count := arm.label_count(&c)
+    if rt.alloc < 0 || rt.alloc >= count || spec.input_clone < -1 || spec.input_clone >= count ||
+        spec.worker < 0 || spec.worker >= count || spec.result_clone < -1 || spec.result_clone >= count ||
+        symbols.symbol_count < 3 || symbols.pthread_create < 0 || symbols.pthread_join < 0 || symbols.munmap < 0 ||
+        symbols.pthread_create >= symbols.symbol_count || symbols.pthread_join >= symbols.symbol_count || symbols.munmap >= symbols.symbol_count ||
+        symbols.pthread_create == symbols.pthread_join || symbols.pthread_create == symbols.munmap || symbols.pthread_join == symbols.munmap {
+        out.error = "invalid isolated native task specification"; return out
+    }
+    out.worker_entry = arm.label(&mut c); out.create = arm.label(&mut c); out.collect = arm.label(&mut c); out.discard = arm.label(&mut c)
+    entry(&mut c, &spec, out.worker_entry); create(&mut c, &mut out, &symbols); collect(&mut c, &mut out, &spec, &symbols)
+    out.ok = true; out
+}
