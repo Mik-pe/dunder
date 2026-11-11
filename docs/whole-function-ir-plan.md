@@ -101,6 +101,12 @@ Redovisa fördelning och total byggtid; profilerade delklockor är attribution,
 inte vanlig latens. En snabb liten testfunktion ersätter inte det faktiska
 programmet som fortfarande tappar prestanda.
 
+[Prestandakontraktet](prestanda.md) gäller samma standardprofil för båda
+egenskaperna: minst 100 000 källrader/s vid p95 för rent bygge, C-geomedel
+högst 1,10× och inget enskilt runtimefall över 1,25×. De föreslagna
+interaktiva målen är p95 högst 50 ms utan ändring och 100 ms efter en
+privat funktionsändring. De är acceptansmål, inte uppnådda resultat.
+
 Första grinden är korrekt genomförd helfunktionskedja med oberoende
 differentialprov och verifierad självhostfixpunkt. Nästa grind kräver att
 den nya register- och placeringsmodellen förbättrar representativa program
