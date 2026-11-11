@@ -497,6 +497,15 @@ def main():
                                 target=TARGETS[target], mode=mode, sha256=images[mode], steps=interpreter.steps,
                                 coverage=dict(interpreter.coverage), model=model))
                         assert images['plain'] == images['roundtrip'], (name, target, 'retained roundtrip changed bytes')
+                # Canonical metadata must describe the new operation exactly.
+                # In particular, a proved frame load has effects2, not the
+                # retained raw load's conservative memory+trap effects3.
+                for field in ('effects', 'type', 'extension', 'reads', 'writes', 'clobbers'):
+                    for target in range(4):
+                        image = work / f'reject-{field}-{target}'
+                        result = call([runner, image, target, 'reject-' + field, 'signed-load', -1, 0, -1])
+                        assert result.stdout == 'REJECTED\n' and not image.exists(), (field, target, result.stdout)
+                        counts['canonical_metadata_rejections'] += 1
                 # Explicit noncoverage and bounded execution are exercised and
                 # counted separately, never added to completed interpreter runs.
                 for name, exception in (('opaque', CoverageGap), ('external', CoverageGap), ('cycle', Incomplete)):
