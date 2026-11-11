@@ -1,0 +1,309 @@
+// Whole-function frame-place promotion. Original physical operands stay
+// precolored; calls kill cached homes without becoming fabricated SSA defs.
+// The caller must not mutate MIR between analyze_into and the single apply.
+import mir
+import mir_liveness as live
+
+pub opaque struct Workspace {
+    liveness: live.Workspace, scores: []i32, allowed: []bool, shortlist: []i32,
+    picked: []i32, homes: []i32, home_for_place: []i32,
+    barriers: []bool, epilogues: []bool, entries: []bool, order: []i32, assembled: []i32, positions: []i32,
+    init_in: []i32, init_gen: []i32, queue: []i32, queued: []bool,
+    status: i32, work: i32, limit: i32, source_ops: i32, source_places: i32,
+    source_blocks: i32, source_labels: i32, frame_high: i32, frame_low: i32,
+    old_frame: i32, new_frame: i32, loads: i32, stores: i32, loops: i32, calls: i32,
+}
+pub fn new() -> Workspace { Workspace { liveness: live.new(), scores: [], allowed: [], shortlist: [],
+    picked: [], homes: [], home_for_place: [], barriers: [], epilogues: [], entries: [], order: [], assembled: [], positions: [],
+    init_in: [], init_gen: [], queue: [], queued: [], status: 0, work: 0, limit: 0,
+    source_ops: 0, source_places: 0, source_blocks: 0, source_labels: 0,
+    frame_high: -1, frame_low: -1, old_frame: 0, new_frame: 0, loads: 0, stores: 0, loops: 0, calls: 0 } }
+pub fn status(w: &Workspace) -> i32 { w.status }
+pub fn units(w: &Workspace) -> i32 { w.work }
+pub fn promoted(w: &Workspace) -> i32 { if w.status > 0 { w.picked.len } else { 0 } }
+pub fn removed_loads(w: &Workspace) -> i32 { if w.status > 0 { w.loads } else { 0 } }
+pub fn removed_stores(w: &Workspace) -> i32 { if w.status > 0 { w.stores } else { 0 } }
+pub fn loop_blocks(w: &Workspace) -> i32 { if w.status > 0 { w.loops } else { 0 } }
+pub fn barrier_count(w: &Workspace) -> i32 { if w.status > 0 { w.calls } else { 0 } }
+fn charge(w: &mut Workspace, n: i32) -> bool {
+    if n < 0 || n > w.limit - w.work { w.status = -3; return false }; w.work = w.work + n; true
+}
+fn refuse(w: &mut Workspace) -> bool { w.status = -2; false }
+fn reset(w: &mut Workspace, limit: i32) {
+    w.scores.clear(); w.allowed.clear(); w.shortlist.clear(); w.picked.clear(); w.homes.clear(); w.home_for_place.clear()
+    w.barriers.clear(); w.epilogues.clear(); w.entries.clear(); w.order.clear(); w.assembled.clear(); w.positions.clear()
+    w.init_in.clear(); w.init_gen.clear(); w.queue.clear(); w.queued.clear()
+    w.status = 0; w.work = 0; w.limit = limit; w.frame_high = -1; w.frame_low = -1
+    w.loads = 0; w.stores = 0; w.loops = 0; w.calls = 0
+}
+fn frame_operation(f: &mir.Function, op: i32, destination: i32, source: i32, opcode: i32) -> bool {
+    f.modes[op] != 2 && f.kinds[op] == 16 && f.types[op] == 2 && f.dst[op] == destination &&
+        f.a[op] == source && f.b[op] == -1 && f.flags[op] == 0 && f.opcodes[op] == opcode && f.imm[op] >= 0
+}
+fn frame(w: &mut Workspace, f: &mir.Function) -> bool {
+    n := f.order.len
+    if n < 7 { return refuse(&mut w) }
+    push := f.order[0]; setup := f.order[1]; high := f.order[2]; low := f.order[3]
+    if f.kinds[push] != 21 || f.opcodes[push] != 1 ||
+        !frame_operation(&f, setup, 29, 31, 1) || f.imm[setup] != 0 ||
+        !frame_operation(&f, high, 31, 31, 2) || !frame_operation(&f, low, 31, 31, 2) { return refuse(&mut w) }
+    size := f.imm[high] + f.imm[low]
+    if size < 0 || size > 16777168 || size % 16 != 0 { return refuse(&mut w) }
+    w.frame_high = high; w.frame_low = low; w.old_frame = i32(size)
+    if !charge(&mut w, n + f.label_ops.len + f.edge_to.len) { return false }
+    for position in 0..n { w.barriers.push(false); w.epilogues.push(false); w.entries.push(false); w.order.push(f.order[position]) }
+    for block in 0..f.block_starts.len { w.entries[f.block_starts[block]] = true }
+    for label in 0..f.label_ops.len { at := f.label_ops[label]; if at >= 0 && at < n { w.entries[at] = true } }
+    for e in 0..f.edge_to.len { if f.edge_to[e] == 0 { return refuse(&mut w) } }
+    if w.entries[1] || w.entries[2] || w.entries[3] { return refuse(&mut w) }
+    for p in 0..f.place_kinds.len {
+        if f.place_kinds[p] == 1 && i64(f.place_offsets[p]) < -size { return refuse(&mut w) }
+    }
+    var returns := 0
+    for position in 0..n {
+        op := f.order[position]; if f.modes[op] == 2 { continue }
+        kind := f.kinds[op]
+        if kind == 15 {
+            if position < 2 { return refuse(&mut w) }
+            reset := f.order[position - 2]; pop := f.order[position - 1]
+            if !frame_operation(&f, reset, 31, 29, 1) || f.imm[reset] != 0 ||
+                f.kinds[pop] != 21 || f.opcodes[pop] != 2 ||
+                w.entries[position - 1] || w.entries[position] { return refuse(&mut w) }
+            w.epilogues[position - 2] = true; returns = returns + 1
+        }
+        if kind == 7 || kind == 8 {
+            p := f.place[op]
+            // Arbitrary SP-relative memory has no frame/expression-stack
+            // disjointness proof. Explicit push/pop units are separate kinds.
+            if f.place_kinds[p] == 2 { return refuse(&mut w) }
+            if f.place_kinds[p] == 0 { w.barriers[position] = true }
+        }
+        if kind == 14 { w.barriers[position] = true }
+    }
+    if returns == 0 { return refuse(&mut w) }
+    for position in 0..n {
+        op := f.order[position]; if f.modes[op] == 2 { continue }
+        if f.kinds[op] == 16 && position != 1 && position != 2 && position != 3 && !w.epilogues[position] { return refuse(&mut w) }
+        // No nested ABI frame, nonstandard FP write or arbitrary SP address.
+        if f.writes[op].bit_and(mir.variable_bit(29)) != 0 && position != 1 && !(f.kinds[op] == 21 && f.opcodes[op] == 2) { return refuse(&mut w) }
+        if f.kinds[op] == 21 && position != 0 && !(f.kinds[op] == 21 && f.opcodes[op] == 2) { return refuse(&mut w) }
+        if f.kinds[op] != 16 && f.kinds[op] != 21 && f.kinds[op] != 10 && f.kinds[op] != 11 && f.kinds[op] != 14 &&
+            f.reads[op].bit_or(f.writes[op]).bit_and(mir.variable_bit(31)) != 0 { return refuse(&mut w) }
+    }
+    true
+}
+fn overlap(f: &mir.Function, a: i32, b: i32) -> bool {
+    left := i64(f.place_offsets[a]); right := i64(f.place_offsets[b])
+    left < right + i64(f.place_widths[b]) && right < left + i64(f.place_widths[a])
+}
+fn select(w: &mut Workspace, f: &mir.Function) -> bool {
+    places := f.place_kinds.len; var used: i64 = 0; var barrier_cost := 0
+    if !charge(&mut w, places + f.kinds.len) { return false }
+    for p in 0..places {
+        w.scores.push(0); w.home_for_place.push(-1)
+        w.allowed.push(f.place_kinds[p] == 1 && !f.place_escaped[p] && f.place_widths[p] == 8 &&
+            f.place_offsets[p] <= -8 && i64(f.place_offsets[p]) >= -i64(w.old_frame) && f.place_offsets[p] % 8 == 0)
+    }
+    for position in 0..f.order.len {
+        op := f.order[position]; if f.modes[op] == 2 { continue }
+        if f.kinds[op] == 14 {
+            // ABI MAY masks do not mean a call explicitly consumes x25..28.
+            // The indirect call target, however, is an actual operand.
+            used = used.bit_or(mir.variable_bit(f.a[op])).bit_or(mir.variable_bit(f.b[op])).bit_or(mir.variable_bit(f.c[op]))
+        } else { used = used.bit_or(f.reads[op]).bit_or(f.writes[op]).bit_or(f.clobbers[op]) }
+        block := f.op_blocks[op]; var weight := 1
+        if live.loop_block(&w.liveness, block) { weight = 32 }
+        if w.barriers[position] { barrier_cost = barrier_cost + weight * 2; w.calls = w.calls + 1 }
+        p := f.place[op]
+        if p >= 0 && (f.kinds[op] == 7 || f.kinds[op] == 8) {
+            var semantic_writes: i64 = 0; if f.kinds[op] == 7 { semantic_writes = mir.variable_bit(f.dst[op]) }
+            if f.extensions[op] != 0 || f.types[op] != 2 || (f.kinds[op] == 7 && f.dst[op] < 0) ||
+                f.writes[op].bit_and(semantic_writes.bit_not()).bit_and(live.live_after(&w.liveness, op)) != 0 { w.allowed[p] = false }
+            if live.reachable(&w.liveness, block) { w.scores[p] = w.scores[p] + weight }
+        }
+    }
+    // Select a fixed-size shortlist, then compare its byte intervals against
+    // every place. At most16*P comparisons, never quadratic in place count.
+    for rank in 0..16 {
+        if !charge(&mut w, places) { return false }
+        var best := -1; var score := barrier_cost + 4
+        for p in 0..places { if w.allowed[p] && w.scores[p] > score { best = p; score = w.scores[p] } }
+        if best < 0 { break }; w.shortlist.push(best); w.allowed[best] = false
+    }
+    for p in w.shortlist {
+        if w.picked.len == 4 { break }
+        if !charge(&mut w, places + 4) { return false }
+        var aliases := false
+        for other in 0..places {
+            if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
+        }
+        if aliases { continue }
+        var home := -1
+        for reg in 25..29 { if used.bit_and(mir.variable_bit(reg)) == 0 && home < 0 { home = reg } }
+        if home < 0 { break }
+        used = used.bit_or(mir.variable_bit(home)); w.home_for_place[p] = w.picked.len
+        w.picked.push(p); w.homes.push(home)
+    }
+    if w.picked.len == 0 { return refuse(&mut w) }
+    w.new_frame = (w.old_frame + w.picked.len * 8 + 15) / 16 * 16
+    if w.new_frame > 16777200 { return refuse(&mut w) }
+    true
+}
+fn initialized(w: &mut Workspace, f: &mir.Function) -> bool {
+    blocks := f.block_starts.len
+    if !charge(&mut w, blocks + f.order.len) { return false }
+    for b in 0..blocks { w.init_in.push(0); w.init_gen.push(0); w.queue.push(0); w.queued.push(false) }
+    for position in 0..f.order.len {
+        op := f.order[position]; if f.modes[op] == 2 || f.kinds[op] != 8 { continue }
+        p := f.place[op]; if p < 0 { continue }; selected := w.home_for_place[p]
+        if selected >= 0 { b := f.op_blocks[op]; w.init_gen[b] = w.init_gen[b].bit_or(i32(1).shl(selected)) }
+    }
+    // Forward may-uninitialized analysis. A stored value clears its bit;
+    // joins OR incoming bits, so every original read must be definitely set.
+    w.init_in[0] = i32(1).shl(w.picked.len) - 1; w.queue[0] = 0; w.queued[0] = true
+    var head := 0; var tail := 1 % blocks; var pending := 1
+    while pending > 0 {
+        b := w.queue[head]; head = (head + 1) % blocks; pending = pending - 1; w.queued[b] = false
+        if !charge(&mut w, 1 + f.edge_starts[b + 1] - f.edge_starts[b]) { return false }
+        outgoing := w.init_in[b].bit_and(w.init_gen[b].bit_not())
+        for edge in f.edge_starts[b]..f.edge_starts[b + 1] {
+            to := f.edge_to[edge]; if to < 0 { continue }; incoming := w.init_in[to].bit_or(outgoing)
+            if incoming == w.init_in[to] { continue }; w.init_in[to] = incoming
+            if !w.queued[to] { w.queue[tail] = to; tail = (tail + 1) % blocks; pending = pending + 1; w.queued[to] = true }
+        }
+    }
+    if !charge(&mut w, f.order.len) { return false }
+    for b in 0..blocks {
+        if !live.reachable(&w.liveness, b) { continue }; var state := w.init_in[b]
+        for position in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[position]; if f.modes[op] == 2 { continue }; p := f.place[op]
+            if p < 0 { continue }; selected := w.home_for_place[p]; if selected < 0 { continue }
+            bit := i32(1).shl(selected)
+            if f.kinds[op] == 7 { if state.bit_and(bit) != 0 { return refuse(&mut w) }; w.loads = w.loads + 1 }
+            if f.kinds[op] == 8 { state = state.bit_and(bit.bit_not()); w.stores = w.stores + 1 }
+        }
+    }
+    true
+}
+fn before(f: &mir.Function, w: &Workspace, op: i32) -> i64 {
+    f.reads[op].bit_or(live.live_after(&w.liveness, op).bit_and(f.writes[op].bit_or(f.clobbers[op]).bit_not()))
+}
+fn scratch(w: &mut Workspace, f: &mir.Function) -> bool {
+    if !charge(&mut w, f.order.len * w.picked.len) { return false }
+    bit := mir.variable_bit(9)
+    for position in 0..f.order.len {
+        op := f.order[position]
+        for home in 0..w.picked.len {
+            original := f.place_offsets[w.picked[home]]
+            saved := -(w.old_frame + (home + 1) * 8)
+            if (position == 3 || w.epilogues[position]) && saved < -256 {
+                var needed := live.live_after(&w.liveness, op)
+                if w.epilogues[position] { needed = before(&f, &w, op) }
+                if needed.bit_and(bit) != 0 { return refuse(&mut w) }
+            }
+            if w.barriers[position] && original < -256 &&
+                before(&f, &w, op).bit_or(live.live_after(&w.liveness, op)).bit_and(bit) != 0 { return refuse(&mut w) }
+        }
+    }
+    true
+}
+// Status:1 prepared,2 consumed,-1 invalid/stale input,-2 unsupported or no
+// profitable candidates,-3 budget. Failure leaves every Function field intact.
+pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool {
+    reset(&mut w, limit)
+    if !f.valid || !f.verified { w.status = -1; return false }
+    if !f.optimizable || f.unknown_control { return refuse(&mut w) }
+    if limit < 0 || f.kinds.len > 65536 || f.place_kinds.len > 16384 { w.status = -3; return false }
+    if f.place_kinds.len == 0 { return refuse(&mut w) }
+    if !frame(&mut w, &f) { return false }
+    if !live.analyze_into(&mut w.liveness, &f, w.limit - w.work) {
+        w.status = live.status(&w.liveness); w.work = w.work + live.units(&w.liveness); return false
+    }
+    w.work = w.work + live.units(&w.liveness)
+    for b in 0..f.block_starts.len { if live.loop_block(&w.liveness, b) { w.loops = w.loops + 1 } }
+    if !select(&mut w, &f) || !initialized(&mut w, &f) || !scratch(&mut w, &f) { return false }
+    var additions := w.picked.len * 2
+    for position in 0..f.order.len {
+        if w.barriers[position] { additions = additions + w.picked.len * 2 }
+        if w.epilogues[position] { additions = additions + w.picked.len }
+    }
+    if additions > 65536 - f.kinds.len || !charge(&mut w, additions + f.order.len + f.label_ops.len + f.block_starts.len * 2 + f.place_table.len * 8) { w.status = -3; return false }
+    w.source_ops = f.kinds.len; w.source_places = f.place_kinds.len; w.source_blocks = f.block_starts.len; w.source_labels = f.label_ops.len
+    w.status = 1; true
+}
+pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_budget(&mut w, &f, 4194304) }
+fn memory(f: &mut mir.Function, kind: i32, home: i32, place: i32, block: i32) -> i32 {
+    op := mir.add(&mut f, kind); f.types[op] = 2; f.place[op] = place; f.aux[op] = 8
+    f.imm[op] = i64(f.place_offsets[place])
+    if kind == 7 { f.dst[op] = home; f.a[op] = 29; f.reads[op] = mir.variable_bit(29); f.writes[op] = mir.variable_bit(home); f.effects[op] = 2 }
+    else { f.a[op] = home; f.b[op] = 29; f.reads[op] = mir.variable_bit(home).bit_or(mir.variable_bit(29)); f.effects[op] = 4 }
+    // The lowerer can need x9 for arbitrary signed byte displacements.
+    if f.imm[op] < -256 || f.imm[op] > 255 { f.c[op] = 9; f.writes[op] = f.writes[op].bit_or(mir.variable_bit(9)); f.clobbers[op] = mir.variable_bit(9) }
+    f.op_blocks[op] = block; op
+}
+fn copy(f: &mut mir.Function, op: i32, destination: i32, source: i32) {
+    f.kinds[op] = 2; f.opcodes[op] = 0; f.dst[op] = destination; f.a[op] = source; f.b[op] = -1; f.c[op] = -1
+    f.imm[op] = 0; f.aux[op] = 0; f.types[op] = 2; f.place[op] = -1; f.extensions[op] = 0
+    f.effects[op] = 0; f.flags[op] = 0; f.abi[op] = 0; f.reads[op] = mir.variable_bit(source)
+    f.writes[op] = mir.variable_bit(destination); f.clobbers[op] = 0; f.modes[op] = 1
+    f.targets[op] = -1; f.reloc_kinds[op] = -1; f.import_ids[op] = -1
+    f.variant[op] = 0; f.raw_starts[op] = -1; f.widths[op] = 0; f.recipes[op] = 0
+    if source < 0 { f.kinds[op] = 1 }
+}
+// Must be called once on the same verified MIR, with no intervening mutation.
+// Insertion is straight-line only; original CFG edge identities are retained.
+pub fn apply(w: &mut Workspace, f: &mut mir.Function) {
+    assert(w.status == 1 && f.valid && f.verified && f.optimizable && !f.unknown_control)
+    assert(f.kinds.len == w.source_ops && f.place_kinds.len == w.source_places &&
+        f.block_starts.len == w.source_blocks && f.label_ops.len == w.source_labels && f.order.len == w.order.len)
+    for position in 0..w.order.len { assert(f.order[position] == w.order[position]) }
+    f.verified = false
+    // Fresh cells are outside the entire old reservation, including padding
+    // and owned initialization slots, and inside the expanded aligned frame.
+    for home in 0..w.homes.len {
+        p := mir.add_place(&mut f, 1, -(w.old_frame + (home + 1) * 8), 8, 0)
+        assert(p == w.source_places + home)
+    }
+    high := w.frame_high; f.modes[high] = 1; f.recipes[high] = 0; f.variant[high] = 0; f.raw_starts[high] = -1; f.widths[high] = 0; f.imm[high] = i64(w.new_frame); f.effects[high] = 32
+    f.opcodes[high] = 2; f.dst[high] = 31; f.a[high] = 31; f.b[high] = -1; f.c[high] = -1; f.types[high] = 2
+    f.reads[high] = mir.variable_bit(31); f.writes[high] = mir.variable_bit(31); f.flags[high] = 0; f.clobbers[high] = 0
+    f.modes[w.frame_low] = 2
+    // positions is an old-order boundary map; insertions after an operation
+    // precede the next old boundary. Entry saves therefore execute only on
+    // entry even when a loop label is attached immediately after reservation.
+    w.positions.clear(); w.assembled.clear()
+    for position in 0..w.order.len {
+        w.positions.push(w.assembled.len); op := w.order[position]; block := f.op_blocks[op]
+        if w.epilogues[position] {
+            for home in 0..w.homes.len { w.assembled.push(memory(&mut f, 7, w.homes[home], w.source_places + home, block)) }
+        }
+        if w.barriers[position] {
+            for home in 0..w.homes.len { w.assembled.push(memory(&mut f, 8, w.homes[home], w.picked[home], block)) }
+        }
+        if f.modes[op] != 2 && (f.kinds[op] == 7 || f.kinds[op] == 8) {
+            p := f.place[op]; selected := w.home_for_place[p]
+            if selected >= 0 {
+                if f.kinds[op] == 7 { destination := f.dst[op]; copy(&mut f, op, destination, w.homes[selected]) }
+                else { source := f.a[op]; copy(&mut f, op, w.homes[selected], source) }
+            }
+        }
+        w.assembled.push(op)
+        if position == 3 {
+            for home in 0..w.homes.len {
+                w.assembled.push(memory(&mut f, 8, w.homes[home], w.source_places + home, block))
+                zero := mir.add(&mut f, 1); f.dst[zero] = w.homes[home]; f.types[zero] = 2
+                f.writes[zero] = mir.variable_bit(w.homes[home]); f.op_blocks[zero] = block; w.assembled.push(zero)
+            }
+        }
+        if w.barriers[position] {
+            for home in 0..w.homes.len { w.assembled.push(memory(&mut f, 7, w.homes[home], w.picked[home], block)) }
+        }
+    }
+    w.positions.push(w.assembled.len)
+    f.order.clear(); for op in w.assembled { f.order.push(op) }
+    for block in 0..f.block_starts.len {
+        f.block_starts[block] = w.positions[f.block_starts[block]]; f.block_ends[block] = w.positions[f.block_ends[block]]
+    }
+    for label in 0..f.label_ops.len { old := f.label_ops[label]; if old >= 0 { f.label_ops[label] = w.positions[old] } }
+    w.status = 2
+}
