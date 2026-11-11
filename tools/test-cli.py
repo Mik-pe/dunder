@@ -141,6 +141,71 @@ import sys
     assert not (p.root / "escaped").exists()
 
 
+def phase_timings(p):
+    p.write("phases.ddr", "fn answer()->i32{42}\nfn main(){value:=answer();print(value)}\n")
+    normal = p.call("build", "phases.ddr", "-o", "plain")
+    assert normal.stdout == "built plain\n" and normal.stderr == "", normal
+    phases = {"module_load_lex_resolve", "build_setup", "compiler", "image_format_sign", "publication"}
+
+    def report(result, *, checking=False, target=None):
+        # One complete record on stderr, with every measured interval accounted
+        # for. No build/run output or check --agent JSON is mixed into it.
+        assert len(result.stderr.splitlines()) == 1, result
+        record = json.loads(result.stderr)
+        assert record["kind"] == "timings" and record["version"] == 1, record
+        assert record["operation"] == ("check" if checking else "build"), record
+        assert record["scope"] == "compiler_pipeline" and record["clock"] == "monotonic", record
+        assert record["clock_ok"] is True and record["unit"] == "ns", record
+        if target:
+            assert record["target"] == target, record
+        assert record["modules"] == 1, record
+        assert set(record["functions"]) == {"reused", "emitted"}, record
+        assert record["functions"]["reused"] >= 0 and record["functions"]["emitted"] >= 0, record
+        assert set(record["phases"]) == phases, record
+        assert all(type(value) is int and value >= 0 for value in record["phases"].values()), record
+        assert record["total"] == sum(record["phases"].values()) and record["total"] > 0, record
+        assert record["phases"]["compiler"] > 0, record
+        skipped = {"image_format_sign", "publication"} if checking else set()
+        assert set(record["skipped_phases"]) == skipped, record
+        assert all(record["phases"][name] == 0 for name in skipped), record
+        return record
+
+    measured = p.call("build", "phases.ddr", "--timings=json", "-o", "measured")
+    counts = report(measured)["functions"]
+    assert counts == {"reused": 0, "emitted": 2}, counts
+    assert measured.stdout == "built measured\n"
+    assert (p.root / "plain").read_bytes() == (p.root / "measured").read_bytes()
+    human = p.call("build", "phases.ddr", "--timings", "-o", "human")
+    assert "functions 0 reused, 2 emitted\n" in human.stderr and "timings module_load_lex_resolve=" in human.stderr, human
+    for target in ("arm64-macos", "arm64-linux", "x86_64-linux", "wasm32"):
+        report(p.call("build", "phases.ddr", "--target", target, "--timings=json", "-o", target), target=target)
+    baseline = p.call("check", "phases.ddr", "--agent")
+    checked = p.call("check", "phases.ddr", "--agent", "--timings=json")
+    report(checked, checking=True)
+    assert checked.stdout == baseline.stdout and baseline.stderr == ""
+    assert json.loads(checked.stdout.splitlines()[-1])["kind"] == "ok"
+    ran = p.call("run", "phases.ddr", "--timings=json", "-o", "ran")
+    report(ran)
+    assert ran.stdout == "42\n", ran
+    report(p.call("build", "phases.ddr", "--target", "arm64-macos", "--app", "--timings=json", "-o", "Timed.app"), target="arm64-macos")
+    p.write("phase-tests.ddr", "@test fn phase(){true}\n")
+    tested = p.call("test", "phase-tests.ddr", "--timings=json", "-o", "phase-tests")
+    report(tested)
+    assert "1 passed, 0 failed" in tested.stdout, tested
+    for _ in range(2):
+        cached = report(p.call("build", "phases.ddr", "--incremental", "--timings=json", "-o", "cached"))
+    assert cached["functions"]["reused"] > 0 and sum(cached["functions"].values()) == 2, cached
+    p.call("build", "phases.ddr", "--timings=xml", status=2)
+    # Exercise the reporter's clock-failure path independently of host timing.
+    sources = Path(__file__).resolve().parents[1] / "selfhost"
+    for module in ("cli", "timings"):
+        p.write(module + ".ddr", (sources / (module + ".ddr")).read_text())
+    p.write("clock-failure.ddr", "import timings\nfn main(){timings.report(true,false,0,1,0,1,-1,-1,-1,-1,-1,-1)}\n")
+    unavailable = json.loads(p.call("run", "clock-failure.ddr").stderr)
+    assert unavailable["clock_ok"] is False and unavailable["total"] is None, unavailable
+    assert all(value is None for value in unavailable["phases"].values()), unavailable
+
+
 def filesystem(p):
     (p.root / "invalid-utf8").write_bytes(b"\xf0\x80\x80\x80")
     p.write("filesystem.ddr", '''
@@ -179,7 +244,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
-    cases = [modules_and_manifest, targets_and_cache, isolated_tests, filesystem]
+    cases = [modules_and_manifest, targets_and_cache, phase_timings, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
