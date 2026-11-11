@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interpret actual Dunder IR and challenge every reached bounds proof.
+"""Interpret actual Dunder IR and challenge reached bounds/i32 overflow proofs.
 
 This finite consumer safety check is independent of the solver's interval and
 affine representation. Fuel exhaustion is INCOMPLETE (exit 2), never a pass.
@@ -16,7 +16,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_FIELDS = ('kind', 'type', 'left', 'right', 'third', 'next', 'value',
-               'local', 'proof', 'effect', 'start', 'pending')
+               'local', 'proof', 'effect', 'start', 'pending', 'pending_mask')
 LOCAL_FIELDS = ('type', 'param', 'mutable', 'at')
 
 
@@ -59,12 +59,16 @@ fn main(){
     ready:=ranges.analyze_into(&mut w,&f);same(&f,&before)
     if ready{assert(ranges.status(&w)==1);ranges.apply(&mut w,&mut f);assert(ranges.status(&w)==2);assert(verify.validate(&f,true))}
     else{assert(ranges.status(&w)==3||ranges.status(&w)==4)}
-    print(1);print(f.root);print(f.ret);print(f.params);print(f.nodes.kinds.len);print(f.local_types.len)
+    print(2);print(f.root);print(f.ret);print(f.params);print(f.nodes.kinds.len);print(f.local_types.len)
     print(ranges.status(&w));print(ranges.units(&w));print(ranges.read_count(&w));print(ranges.store_count(&w));print(f.visits);print(f.rewrites)
+    print(ranges.arithmetic_count(&w))
     for i in 0..f.nodes.kinds.len{
-        if ranges.produced(&w,i){assert(f.nodes.proofs[i]==before.nodes.proofs[i].bit_or(2))}else{assert(f.nodes.proofs[i]==before.nodes.proofs[i])}
+        mask:=ranges.proof_mask(&w,i)
+        assert(ranges.produced(&w,i)==(mask.bit_and(2)!=0))
+        assert(f.nodes.proofs[i]==before.nodes.proofs[i].bit_or(mask))
         print(f.nodes.kinds[i]);print(f.nodes.types[i]);print(f.nodes.left[i]);print(f.nodes.right[i]);print(f.nodes.third[i]);print(f.nodes.next[i]);print(f.nodes.values[i]);print(f.nodes.locals[i]);print(f.nodes.proofs[i]);print(f.nodes.effects[i]);print(f.nodes.starts[i])
         if ranges.produced(&w,i){print(1)}else{print(0)}
+        print(mask)
     }
     for i in 0..f.local_types.len{
         print(f.local_types[i]);print(f.local_param[i]);if f.local_mutable[i]{print(1)}else{print(0)};print(f.local_at[i])
@@ -75,10 +79,10 @@ fn main(){
 
 def decode(output):
     numbers = list(map(int, output.splitlines()))
-    assert numbers[0] == 1 and len(numbers) >= 12, 'invalid export header'
-    version, root, ret, params, nodes, locals_, status, units, reads, stores, visits, rewrites = numbers[:12]
-    assert len(numbers) == 12 + nodes * len(NODE_FIELDS) + locals_ * len(LOCAL_FIELDS), 'invalid export size'
-    at = 12
+    assert numbers[0] == 2 and len(numbers) >= 13, 'invalid export header'
+    version, root, ret, params, nodes, locals_, status, units, reads, stores, visits, rewrites, arithmetic = numbers[:13]
+    assert len(numbers) == 13 + nodes * len(NODE_FIELDS) + locals_ * len(LOCAL_FIELDS), 'invalid export size'
+    at = 13
     ns = []
     for _ in range(nodes):
         ns.append(dict(zip(NODE_FIELDS, numbers[at:at + len(NODE_FIELDS)])))
@@ -90,13 +94,19 @@ def decode(output):
     assert status in (2, 3, 4) and 0 <= units <= 131072
     assert sum(n['pending'] for n in ns if n['kind'] == 6) == reads
     assert sum(n['pending'] for n in ns if n['kind'] == 18) == stores
+    assert sum(bool(n['pending_mask'] & 1) for n in ns) == arithmetic
     if status != 2:
-        assert reads == stores == 0 and not any(n['pending'] for n in ns), 'failed analysis leaked proofs'
+        assert reads == stores == arithmetic == 0 and not any(n['pending_mask'] for n in ns), 'failed analysis leaked proofs'
     for n in ns:
+        assert 0 <= n['pending_mask'] <= 3
+        assert n['pending'] == bool(n['pending_mask'] & 2)
         if n['pending']:
             assert n['kind'] in (6, 18) and n['proof'] & 2
+        if n['pending_mask'] & 1:
+            assert n['type'] == 1 and n['proof'] & 1
+            assert (n['kind'] == 3 and n['value'] in (1, 2, 3)) or (n['kind'] == 4 and n['value'] == 1)
     return dict(root=root, ret=ret, params=params, nodes=ns, locals=ls,
-                status=status, units=units, reads=reads, stores=stores)
+                status=status, units=units, reads=reads, stores=stores, arithmetic=arithmetic)
 
 
 class Trap(Exception):
@@ -133,6 +143,10 @@ class Machine:
                     value = clones.setdefault(id(value), list(value))
                 self.values[i] = value
         self.marked = set()
+        self.arithmetic_marked = set()
+        self.arithmetic_checks = 0
+        self.new_arithmetic_marked = set()
+        self.new_arithmetic_checks = 0
         self.accesses = 0
 
     def tick(self):
@@ -153,6 +167,20 @@ class Machine:
             raise Trap(103)
         return array
 
+    def arithmetic(self, node, value):
+        # Operands have already completed. Check the unbounded mathematical
+        # result BEFORE the usual source overflow trap can mask a bad proof.
+        # i64 remains checked and receives no range-analysis exemption here.
+        if node['type'] == 1 and node.get('proof', 0) & 1:
+            self.arithmetic_checks += 1
+            assert -(1 << 31) <= value < 1 << 31, (
+                'UNSOUND ARITHMETIC PROOF', node, value, self.values)
+            self.arithmetic_marked.add(id(node))
+            if node.get('pending_mask', 0) & 1:
+                self.new_arithmetic_marked.add(id(node))
+                self.new_arithmetic_checks += 1
+        return checked(value, node['type'])
+
     def expression(self, index):
         self.tick()
         node = self.model['nodes'][index]
@@ -168,7 +196,7 @@ class Machine:
             return self.access(node, i)[i]
         if kind == 4:
             a = self.expression(node['left'])
-            return not a if op == 2 else checked(-a, ty)
+            return not a if op == 2 else self.arithmetic(node, -a)
         assert kind == 3, node
         a = self.expression(node['left'])
         if op == 12:
@@ -177,11 +205,11 @@ class Machine:
             return bool(a or self.expression(node['right']))
         b = self.expression(node['right'])
         if op == 1:
-            return checked(a + b, ty)
+            return self.arithmetic(node, a + b)
         if op == 2:
-            return checked(a - b, ty)
+            return self.arithmetic(node, a - b)
         if op == 3:
-            return checked(a * b, ty)
+            return self.arithmetic(node, a * b)
         if op in (4, 5):
             if b == 0:
                 raise Trap(102)
@@ -324,8 +352,61 @@ def inputs():
         yield [a, a, a, length - 1, 0, 7, True]
 
 
+def arithmetic_cases():
+    # Separate from cases()/inputs(): do not silently enlarge or renumber the
+    # published 55-case, 697400-run bounds cohort.
+    return {
+        'i32_add': '{value:=n+m;return x}',
+        'i32_sub': '{value:=n-m;return x}',
+        'i32_mul': '{value:=n*m;return x}',
+        'i32_neg': '{value:=-n;return x}',
+        'i32_guarded_add': '{if n>=-10&&n<=10&&m>=-10&&m<=10{value:=n+m};return x}',
+        'i32_guarded_sub': '{if n>=-10&&n<=10&&m>=-10&&m<=10{value:=n-m};return x}',
+        'i32_guarded_mul': '{if n>=-46340&&n<=46340&&m>=-46340&&m<=46340{value:=n*m};return x}',
+        'i32_unsafe_mul_guard': '{if n>=-46341&&n<=46341&&m>=-46341&&m<=46341{value:=n*m};return x}',
+        'i32_guarded_neg': '{if n>-2147483648{value:=-n};return x}',
+        'i32_child_add_then_zero': '{value:=(n+1)*0;return x}',
+        'i32_child_sub_then_restore': '{value:=(n-1)+1;return x}',
+        'i32_double_neg': '{value:=-(-n);return x}',
+        'i32_const_child_mul_zero': '{value:=(2147483647*2147483647)*0;return x}',
+        'i32_const_zero_mul_child': '{value:=0*(2147483647*2147483647);return x}',
+        'i32_const_child_mul_neg': '{value:=-(2147483647*2147483647);return x}',
+        'i32_const_child_mul_add': '{value:=(2147483647*2147483647)+1;return x}',
+        'i32_const_child_mul_sub': '{value:=1-(2147483647*2147483647);return x}',
+        'i32_const_min_mul_zero': '{value:=(-2147483648*(-1))*0;return x}',
+        'i32_const_min_neg_zero': '{value:=(-(-2147483648))*0;return x}',
+        'i32_const_child_add_zero': '{value:=(2147483647+1)*0;return x}',
+        'i32_const_child_sub_zero': '{value:=(-2147483648-1)*0;return x}',
+        'i32_const_child_before_divisor': '{value:=(2147483647*2147483647)/(n+1);return x}',
+        'i32_bounds_after_child': '{if n>=0&&n<a.len{value:=(n+m)*0;a[value]=x};return x}',
+        'i32_later_backedge': '{var value:=n;for i in 0..3{value=value+1};return x}',
+        'i32_guarded_backedge': '{if n<=2147483645{var value:=n;for i in 0..3{value=value+1}};return x}',
+        'i32_later_multiply': '{var value:=n;var i:=0;while i<3{value=value*2;i=i+1};return x}',
+        'i32_short_or': '{if flag||n+1>0{if n>=0&&n<a.len{a[n]=x}};return x}',
+        'i32_short_and': '{if !flag&&n*m>=0{if n>=0&&n<a.len{a[n]=x}};return x}',
+        'i32_unreachable': '{if false{value:=n+1};return x}',
+        'i32_budget_prefix': '{if n>=0&&n<100{var value:=n;for i in 0..8{value=value+1};if value<a.len{a[value]=x}};return x}',
+        'i64_checked_add': '{value:=x+1;return value}',
+        'i64_checked_sub': '{value:=x-1;return value}',
+        'i64_checked_mul': '{value:=x*3;return value}',
+        'i64_checked_neg': '{value:=-x;return value}',
+    }
+
+
+def arithmetic_inputs():
+    values = (-(1 << 31), -(1 << 31)+1, -(1 << 31)+2, -1073741824,
+              -65536, -46341, -46340, -2, -1, 0, 1, 2, 46340, 46341,
+              65536, 1073741823, (1 << 31)-3, (1 << 31)-2, (1 << 31)-1)
+    arrays = (([], [], []), ([3, -1, 7], [9], [5, 8]), ([0, -3], [4, 6, 9], []))
+    wide = (-(1 << 63), -(1 << 63)+1, -1, 0, 1, (1 << 63)-1)
+    for i, (n, m, group, flag) in enumerate(itertools.product(values, values, arrays, (False, True))):
+        yield [*group, n, m, wide[i % len(wide)], flag]
+
+
 def reference(name, args):
     a, b, c, n, m, x, flag = args
+    if name.startswith('i32_const_'):
+        return ('trap', 101), list(a)
     if name == 'sum':
         return ('return', sum(a)), list(a)
     if name == 'fill':
@@ -359,6 +440,16 @@ def reference(name, args):
                 return ('trap', 101), after
             after[n] = x + 1 if name == 'wide_overflow' else 0 if name == 'wide_min_rem' else -x
         return ('return', x), after
+    calculations = {'i32_add': (1, n+m), 'i32_sub': (1, n-m),
+                    'i32_mul': (1, n*m), 'i32_neg': (1, -n),
+                    'i64_checked_add': (2, x+1), 'i64_checked_sub': (2, x-1),
+                    'i64_checked_mul': (2, x*3), 'i64_checked_neg': (2, -x)}
+    if name in calculations:
+        ty, result = calculations[name]
+        width = 32 if ty == 1 else 64
+        if not -(1 << (width-1)) <= result < 1 << (width-1):
+            return ('trap', 101), list(a)
+        return ('return', result if ty == 2 else x), list(a)
     return None
 
 
@@ -375,6 +466,29 @@ def interpreter_selfcheck():
         assert error.args[0][0] == 'UNSOUND BOUNDS PROOF', error
     else:
         raise AssertionError('interpreter accepted injected unsafe proof')
+    # Each arithmetic opcode must reject a bad proof BEFORE the ordinary
+    # overflow trap could accidentally make a broken proof look correct.
+    for kind, op, a, b in ((3, 1, (1 << 31)-1, 1), (3, 2, -(1 << 31), 1),
+                           (3, 3, -(1 << 31), -1), (3, 3, 46341, 46341),
+                           (4, 1, -(1 << 31), 0)):
+        expression = dict(kind=kind, type=1, value=op, left=0, right=1, proof=1)
+        nodes = [dict(kind=1, type=1, value=a), dict(kind=1, type=1, value=b),
+                 expression, dict(kind=15, left=2)]
+        model = dict(root=3, nodes=nodes, locals=[])
+        try:
+            Machine(model, [], 100).run()
+        except AssertionError as error:
+            assert error.args[0][0] == 'UNSOUND ARITHMETIC PROOF', error
+        else:
+            raise AssertionError('interpreter accepted injected arithmetic proof')
+    # A parent may be safe on normal continuation even when a child traps.
+    # Proving the parent's (n+1)*0 must never skip the child's source overflow.
+    child = dict(kind=3, type=1, value=1, left=0, right=1, proof=0)
+    nodes = [dict(kind=1, type=1, value=(1 << 31)-1), dict(kind=1, type=1, value=1),
+             child, dict(kind=1, type=1, value=0),
+             dict(kind=3, type=1, value=3, left=2, right=3, proof=1), dict(kind=15, left=4)]
+    machine = Machine(dict(root=5, nodes=nodes, locals=[]), [], 100)
+    assert machine.run() == ('trap', 101) and machine.arithmetic_checks == 0
     # Nontermination must escape as Fuel, never a normal/checked-trap result.
     loop = dict(root=2, nodes=[dict(kind=1, type=3, value=1),
                               dict(kind=10, left=-1), dict(kind=14, left=0, right=1)], locals=[])
@@ -413,20 +527,26 @@ def main():
     interpreter_selfcheck()
     compiler, source_root = args.compiler.resolve(strict=True), args.source_root.resolve(strict=True)
     hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in
-              [compiler, *(source_root / 'selfhost' / (n + '.ddr') for n in
+              [compiler, Path(__file__).resolve(), *(source_root / 'selfhost' / (n + '.ddr') for n in
                 ('opt_ir', 'opt_parse', 'opt_pass', 'opt_range', 'opt_verify', 'lexer'))]}
-    report = dict(complete=False, hashes=hashes, fuel=args.fuel, cases={},
+    report = dict(complete=False, hashes=hashes, fuel=args.fuel, cases={}, cohorts={},
                   limitations=['finite frozen input domain', 'fuel limit', 'interpreter, not target machine code',
                                'same-storage root inputs overapproximate source borrow capabilities'])
     total_runs = total_accesses = marked_reached = incomplete = maximum = 0
-    chosen = {name: body for name, body in cases().items() if not args.case or args.case in name}
+    total_arithmetic = total_new_arithmetic = 0
+    chosen = [(cohort, name, body) for cohort, collection in
+              (('bounds_original', cases()), ('arithmetic_boundaries', arithmetic_cases()))
+              for name, body in collection.items() if not args.case or args.case in name]
     assert chosen, 'no selected cases'
     with tempfile.TemporaryDirectory(prefix='dunder-range-qa-') as tmp:
         work = Path(tmp).resolve()
         fixture = work / 'export.ddr'; fixture.write_text(exporter(source_root, work))
         image = work / 'export'
         run([compiler, 'build', fixture, '-o', image], work)
-        for name, body in chosen.items():
+        for cohort, name, body in chosen:
+            stats = report['cohorts'].setdefault(cohort, dict(cases=0, runs=0, accesses=0,
+                reached_bounds_nodes=0, reached_arithmetic_nodes=0, reached_new_arithmetic_nodes=0,
+                arithmetic_checks=0, new_arithmetic_checks=0, incomplete=0, maximum_completed_fuel=0, outcomes={}))
             source = work / (name + '.ddr'); source.write_text(body)
             models = {}
             for mode in ('raw', 'simplified'):
@@ -437,9 +557,14 @@ def main():
                         assert model['status'] == 2, (name, mode, 'production budget exhausted')
                     models[f'{mode}_{budget}'] = model
             proof_nodes = {key: sum(bool(n['proof'] & 2) for n in model['nodes']) for key, model in models.items()}
+            arithmetic_proof_nodes = {key: sum(n['type'] == 1 and bool(n['proof'] & 1) for n in model['nodes'])
+                                      for key, model in models.items()}
             reached = set()
+            arithmetic_reached, new_arithmetic_reached = set(), set()
             case_incomplete = 0
-            for arguments in inputs():
+            case_arithmetic = case_new_arithmetic = 0
+            case_outcomes = {}
+            for arguments in (inputs() if cohort == 'bounds_original' else arithmetic_inputs()):
                 outcomes = []
                 for mode in ('raw', 'simplified'):
                     model = models[f'{mode}_131072']
@@ -448,6 +573,7 @@ def main():
                         outcome = machine.run()
                     except Fuel:
                         incomplete += 1; case_incomplete += 1
+                        stats['incomplete'] += 1
                         continue
                     except AssertionError as error:
                         report['failure'] = dict(case=name, mode=mode, source=body,
@@ -460,24 +586,51 @@ def main():
                         assert (outcome, machine.values[0]) == expected, (name, arguments, outcome, machine.values[0], expected)
                     outcomes.append((outcome, [machine.values[i] for i in (0, 1, 2)]))
                     reached.update((mode, node) for node in machine.marked)
+                    arithmetic_reached.update((mode, node) for node in machine.arithmetic_marked)
+                    new_arithmetic_reached.update((mode, node) for node in machine.new_arithmetic_marked)
+                    case_arithmetic += machine.arithmetic_checks
+                    case_new_arithmetic += machine.new_arithmetic_checks
                     total_runs += 1; total_accesses += machine.accesses
+                    outcome_key = 'return' if outcome[0] == 'return' else f'trap_{outcome[1]}'
+                    case_outcomes[outcome_key] = case_outcomes.get(outcome_key, 0) + 1
+                    stats['outcomes'][outcome_key] = stats['outcomes'].get(outcome_key, 0) + 1
+                    stats['runs'] += 1; stats['accesses'] += machine.accesses
+                    stats['maximum_completed_fuel'] = max(stats['maximum_completed_fuel'], machine.steps)
                     maximum = max(maximum, machine.steps)
                 if len(outcomes) == 2:
                     assert outcomes[0] == outcomes[1], (name, arguments, 'raw/simplified mismatch', outcomes)
             marked_reached += len(reached)
-            report['cases'][name] = dict(source=body, models=models, proof_nodes=proof_nodes,
-                                         reached_proof_nodes=len(reached), incomplete=case_incomplete)
+            stats['cases'] += 1
+            stats['reached_bounds_nodes'] += len(reached)
+            stats['reached_arithmetic_nodes'] += len(arithmetic_reached)
+            stats['reached_new_arithmetic_nodes'] += len(new_arithmetic_reached)
+            stats['arithmetic_checks'] += case_arithmetic
+            stats['new_arithmetic_checks'] += case_new_arithmetic
+            total_arithmetic += case_arithmetic
+            total_new_arithmetic += case_new_arithmetic
+            report['cases'][name] = dict(cohort=cohort, source=body, models=models, proof_nodes=proof_nodes,
+                                         arithmetic_proof_nodes=arithmetic_proof_nodes,
+                                         reached_proof_nodes=len(reached), reached_arithmetic_nodes=len(arithmetic_reached),
+                                         reached_new_arithmetic_nodes=len(new_arithmetic_reached),
+                                         arithmetic_checks=case_arithmetic, new_arithmetic_checks=case_new_arithmetic,
+                                         outcomes=case_outcomes, incomplete=case_incomplete)
             print('INCOMPLETE' if case_incomplete else 'PASS', name,
                   f'proofs(raw/simplified)={proof_nodes["raw_131072"]}/{proof_nodes["simplified_131072"]}',
-                  f'reached={len(reached)} incomplete={case_incomplete}', flush=True)
+                  f'bounds_reached={len(reached)} arithmetic_reached={len(arithmetic_reached)}',
+                  f'new_arithmetic_checks={case_new_arithmetic} incomplete={case_incomplete}', flush=True)
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in hashes.items()), 'input compiler/module changed'
-    assert args.case or marked_reached > 0, 'no bounds proof was dynamically exercised'
+    assert args.case or incomplete or marked_reached > 0, 'no bounds proof was dynamically exercised'
+    assert args.case or incomplete or total_new_arithmetic > 0, 'no new arithmetic range proof was dynamically exercised'
     report.update(complete=incomplete == 0, runs=total_runs, accesses=total_accesses,
-                  reached_proof_nodes=marked_reached, incomplete=incomplete, maximum_completed_fuel=maximum)
+                  reached_proof_nodes=marked_reached, arithmetic_checks=total_arithmetic,
+                  new_arithmetic_checks=total_new_arithmetic, incomplete=incomplete, maximum_completed_fuel=maximum)
     if args.report:
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
     print(f'{total_runs} completed interpreter runs; {total_accesses} accesses; {marked_reached} reached proof nodes; '
+          f'{total_arithmetic} arithmetic proof checks ({total_new_arithmetic} new range); '
           f'{incomplete} INCOMPLETE; maximum completed fuel {maximum}/{args.fuel}')
+    for name, stats in report['cohorts'].items():
+        print(name, json.dumps(stats, sort_keys=True))
     raise SystemExit(2 if incomplete else 0)
 
 
