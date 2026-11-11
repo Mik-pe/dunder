@@ -20,8 +20,13 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Verifierade loopar och elementmutation, 2026-11-11](2026-11-11-verified-mutation/README.md)
+är senaste etappen: räknade loopar, exklusiv elementmutation, obligatorisk
+IR-verifiering och gemensamma språkregler. Sortering och självbygge blir
+snabbare; kostnaden på genererad stresskod redovisas uttryckligen.
+
 [Lokalt skalärpass, 2026-11-11](2026-11-11-scalar-optimizer/README.md)
-är senaste etappen: typad funktionsmodell, begränsad förenkling,
+är föregående etapp: typad funktionsmodell, begränsad förenkling,
 loopbevis och registerallokering. Rapporten innehåller både jämförelse mot
 föregående kompilator och en separat av/på-serie.
 
