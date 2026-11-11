@@ -1,0 +1,259 @@
+// Lower a verified complete function into the existing target vocabulary.
+// Encodings are staged independently; code and import locations change only
+// after every operation, boundary and symbolic record has been checked.
+import arm64 as arm
+import mir
+
+pub opaque struct Workspace {
+    output: arm.Code, boundaries: []i32, label_ids: []i32, label_at: []i32,
+    import_ids: []i32, import_at: []i32,
+    prepared: bool, code_done: bool, imports_done: bool,
+    first_word: i32, first_reloc: i32, first_import: i32,
+    source_words: i32, source_labels: i32, source_relocs: i32, source_imports: i32,
+}
+pub fn new() -> Workspace {
+    Workspace { output: arm.new(), boundaries: [], label_ids: [], label_at: [],
+        import_ids: [], import_at: [], prepared: false, code_done: false, imports_done: false,
+        first_word: 0, first_reloc: 0, first_import: 0,
+        source_words: 0, source_labels: 0, source_relocs: 0, source_imports: 0 }
+}
+fn clear_i32(values: &mut []i32) { while values.len > 0 { removed := values.pop() } }
+fn clear_i64(values: &mut []i64) { while values.len > 0 { removed := values.pop() } }
+pub fn reset(work: &mut Workspace) {
+    // Abandoning an uncommitted preparation is safe; abandoning half a commit
+    // would separate machine words from their import locations.
+    assert(!work.prepared || work.code_done == work.imports_done)
+    clear_i64(&mut work.output.words); clear_i32(&mut work.output.labels)
+    clear_i32(&mut work.output.at); clear_i32(&mut work.output.target); clear_i32(&mut work.output.kinds)
+    clear_i32(&mut work.boundaries); clear_i32(&mut work.label_ids); clear_i32(&mut work.label_at)
+    clear_i32(&mut work.import_ids); clear_i32(&mut work.import_at)
+    work.prepared = false; work.code_done = false; work.imports_done = false
+}
+
+// These globals have meaning independent of one function's local values.
+// x21 is the pool/free-list base, not an unused callee-saved register.
+pub fn reserved_gpr(reg: i32) -> bool {
+    reg < 0 || reg >= 29 || reg == 18 || (reg >= 19 && reg <= 21) || reg == 23 || reg == 24
+}
+// Existing functions preserve these through non-use. Any allocator using one
+// must add an explicit save/restore in every entry/return path it generates.
+pub fn callee_saved_gpr(reg: i32) -> bool { reg == 22 || (reg >= 25 && reg <= 28) }
+
+fn columns(f: &mir.Function) -> bool {
+    n := f.kinds.len
+    f.opcodes.len == n && f.dst.len == n && f.a.len == n && f.b.len == n && f.c.len == n &&
+        f.imm.len == n && f.aux.len == n && f.variant.len == n && f.types.len == n &&
+        f.place.len == n && f.effects.len == n && f.flags.len == n && f.abi.len == n &&
+        f.reads.len == n && f.writes.len == n && f.clobbers.len == n && f.extensions.len == n && f.origins.len == n &&
+        f.raw_starts.len == n && f.widths.len == n && f.modes.len == n &&
+        f.targets.len == n && f.reloc_kinds.len == n && f.import_ids.len == n &&
+        f.label_ids.len == f.label_ops.len &&
+        f.place_kinds.len == f.place_offsets.len && f.place_kinds.len == f.place_widths.len &&
+        f.place_kinds.len == f.place_extensions.len && f.place_kinds.len == f.place_escaped.len
+}
+fn raw_operation(work: &mut Workspace, f: &mir.Function, id: i32) -> bool {
+    first := f.raw_starts[id]; width := f.widths[id]
+    if first < 0 || width < 1 || first > f.raw.len || width > f.raw.len - first { return false }
+    for at in first..first + width {
+        word := f.raw[at]
+        if word < 0 || word > 4294967295 { return false }
+        arm.emit(&mut work.output, word)
+    }
+    true
+}
+fn immediate_address(code: &mut arm.Code, dst: i32, base: i32, delta: i64) {
+    var magnitude := delta; var opcode: i64 = 2432696320
+    if magnitude < 0 { magnitude = -magnitude; opcode = 3506438144 }
+    var source := base; var emitted := false
+    while magnitude > 4095 {
+        var pages := magnitude / 4096; if pages > 4095 { pages = 4095 }
+        arm.emit(&mut code, opcode + 4194304 + pages * 1024 + i64(source) * 32 + i64(dst))
+        source = dst; emitted = true; magnitude = magnitude - pages * 4096
+    }
+    if magnitude != 0 || !emitted {
+        arm.emit(&mut code, opcode + magnitude * 1024 + i64(source) * 32 + i64(dst))
+    }
+}
+fn memory_operation(work: &mut Workspace, f: &mir.Function, id: i32) -> bool {
+    load := f.kinds[id] == 7
+    var value := f.a[id]; var base := f.b[id]
+    if load { value = f.dst[id]; base = f.a[id] }
+    p := f.place[id]; width := f.aux[id]; offset := f.imm[id]
+    if p < 0 || p >= f.place_kinds.len || value < -1 || value >= 31 || base < 0 || base > 31 ||
+        i64(f.place_offsets[p]) != offset || f.place_widths[p] != width { return false }
+    // A missing memory value is XZR (zero store/discarded load), while base31
+    // denotes SP. These are distinct MIR roles despite one encoding number.
+    if value == -1 { value = 31 }
+    if f.place_kinds[p] == 1 && base != 29 { return false }
+    if f.place_kinds[p] == 2 && base != 31 { return false }
+    extension := f.extensions[id]
+    if extension < 0 || extension > 2 { return false }
+    var size := 0
+    if width == 2 { size = 1 } else if width == 4 { size = 2 }
+    else if width == 8 { size = 3 } else if width != 1 { return false }
+    if load && extension == 2 && width != 4 && width != 8 { return false }
+    var opcode: i64 = 939524096
+    if load { opcode = 943718400 }
+    if load && extension == 2 && width == 4 { opcode = 947912704 }
+    opcode = opcode + i64(size) * 1073741824
+    if offset >= -256 && offset <= 255 {
+        arm.emit(&mut work.output, opcode + offset.bit_and(511) * 4096 + i64(base) * 32 + i64(value))
+        return true
+    }
+    if offset >= 0 && offset % i64(width) == 0 && offset / i64(width) <= 4095 {
+        arm.emit(&mut work.output, opcode + 16777216 + offset / i64(width) * 1024 + i64(base) * 32 + i64(value))
+        return true
+    }
+    // A new large-displacement spill must name its scratch in the MIR write
+    // set. Reserving a register for new values alone cannot protect an old
+    // fixed physical value that was already live across the insertion site.
+    scratch := f.c[id]
+    if scratch < 0 || scratch >= 31 || scratch == base || (!load && scratch == value) ||
+        f.writes[id].bit_and(mir.variable_bit(scratch)) == 0 { return false }
+    var magnitude := offset; var address: i64 = 2332033024
+    if magnitude < 0 { magnitude = -magnitude; address = 3405774848 }
+    if base == 31 {
+        // Register ADD/SUB interprets register31 as ZR, not SP. Immediate
+        // forms retain SP semantics and use only the declared scratch.
+        immediate_address(&mut work.output, scratch, base, offset)
+    } else {
+        arm.imm(&mut work.output, scratch, magnitude)
+        arm.emit(&mut work.output, address + i64(scratch) * 65536 + i64(base) * 32 + i64(scratch))
+    }
+    arm.emit(&mut work.output, opcode + i64(scratch) * 32 + i64(value))
+    true
+}
+fn canonical(work: &mut Workspace, f: &mir.Function, id: i32) -> bool {
+    kind := f.kinds[id]; dst := f.dst[id]; source := f.a[id]; ty := f.types[id]
+    if kind == 1 {
+        if dst < 0 || dst >= 31 || (ty != 1 && ty != 2) { return false }
+        if ty == 1 {
+            if f.imm[id] < -2147483648 || f.imm[id] > 4294967295 { return false }
+            bits := f.imm[id].bit_and(4294967295)
+            arm.emit(&mut work.output, 1384120320 + bits.bit_and(65535) * 32 + i64(dst))
+            high := bits.shr(16)
+            if high != 0 { arm.emit(&mut work.output, 1923088384 + high * 32 + i64(dst)) }
+        } else { arm.imm(&mut work.output, dst, f.imm[id]) }
+        return true
+    }
+    if kind == 2 {
+        if dst < 0 || dst >= 31 || source < -1 || source >= 31 || (ty != 1 && ty != 2) { return false }
+        var reg := source; if reg == -1 { reg = 31 }
+        if ty == 1 { arm.emit(&mut work.output, 704644064 + i64(reg) * 65536 + i64(dst)) }
+        else { arm.mov(&mut work.output, dst, reg) }
+        return true
+    }
+    if kind == 7 || kind == 8 { return memory_operation(&mut work, &f, id) }
+    if kind == 16 {
+        // Frame follows Binary opcode1 add/opcode2 subtract with a nonnegative
+        // magnitude. Register31 means SP, including zero-delta FP/SP copies.
+        op := f.opcodes[id]
+        if ty != 2 || (dst != 29 && dst != 31) || (source != 29 && source != 31) ||
+            (op != 1 && op != 2) || f.imm[id] < 0 || f.imm[id] > 2147483647 || f.flags[id] != 0 { return false }
+        if dst == 31 && f.imm[id] % 16 != 0 { return false }
+        var delta := f.imm[id]; if op == 2 { delta = -delta }
+        immediate_address(&mut work.output, dst, source, delta); return true
+    }
+    false
+}
+fn record(work: &mut Workspace, f: &mir.Function, id: i32, at: i32) -> bool {
+    if at > 2147483647 - f.first_word { return false }
+    kind := f.reloc_kinds[id]
+    imported := f.import_ids[id]
+    if kind >= 0 {
+        if kind > 20 || imported >= 0 || f.targets[id] < 0 || f.targets[id] >= f.source_labels { return false }
+        var width := 1; if kind >= 2 { width = 2 }
+        if work.output.words.len - at != width { return false }
+        if work.output.words[at] != 0 { return false }
+        if width == 2 && work.output.words[at + 1] != 3573751839 { return false }
+        work.output.at.push(f.first_word + at)
+        work.output.target.push(f.targets[id]); work.output.kinds.push(kind)
+    }
+    if imported >= 0 {
+        // Keep original import order and cardinality so the caller's slots
+        // table remains paired with sites, including across later functions.
+        if imported != f.first_import + work.import_ids.len || imported >= f.source_imports ||
+            work.output.words.len - at != 2 || work.output.words[at + 1] != 0 { return false }
+        word := work.output.words[at]
+        if word != 0 && word != 4244635648 { return false }
+        if f.first_word + at > 536870911 { return false }
+        work.import_ids.push(imported); work.import_at.push((f.first_word + at) * 4)
+    }
+    true
+}
+
+pub fn prepare(work: &mut Workspace, f: &mir.Function, code: &arm.Code, import_sites: &[]i32) -> bool {
+    if work.prepared && (!work.code_done || !work.imports_done) { return false }
+    reset(&mut work)
+    if !f.valid || !f.verified || code.checking || !columns(&f) ||
+        f.platform != code.platform || f.first_word < 0 || f.first_word > code.words.len ||
+        f.first_label < 0 || f.first_label > code.labels.len ||
+        f.first_reloc < 0 || f.first_reloc > code.at.len ||
+        f.first_import < 0 || f.first_import > import_sites.len ||
+        f.source_words != code.words.len || f.source_labels != code.labels.len ||
+        f.source_relocs != code.at.len || f.source_imports != import_sites.len ||
+        code.at.len != code.target.len || code.at.len != code.kinds.len { return false }
+    work.output.platform = f.platform
+    if f.first_reloc > 0 {
+        last := f.first_reloc - 1; kind := code.kinds[last]
+        var width := 1; if kind >= 2 { width = 2 }
+        if kind < 0 || kind > 20 || code.at[last] < 0 || code.at[last] > f.first_word - width { return false }
+    }
+    if f.first_import > 0 {
+        site := import_sites[f.first_import - 1]
+        if site < 0 || site % 4 != 0 || site / 4 > f.first_word - 2 { return false }
+    }
+    work.boundaries.push(0)
+    for at in 0..f.order.len {
+        id := f.order[at]
+        if id < 0 || id >= f.kinds.len { return false }
+        start := work.output.words.len; mode := f.modes[id]
+        if mode == 0 { if !raw_operation(&mut work, &f, id) { return false } }
+        else if mode == 1 { if !canonical(&mut work, &f, id) { return false } }
+        else if mode != 2 { return false }
+        if mode == 2 {
+            if f.import_ids[id] >= 0 { return false }
+        } else if !record(&mut work, &f, id, start) { return false }
+        work.boundaries.push(work.output.words.len)
+    }
+    if work.import_ids.len != f.source_imports - f.first_import ||
+        f.first_word > 2147483647 - work.output.words.len { return false }
+    for i in 0..f.label_ids.len {
+        label := f.label_ids[i]; boundary := f.label_ops[i]
+        if label < 0 || label >= f.source_labels || boundary < -1 || boundary >= work.boundaries.len { return false }
+        old := code.labels[label]
+        var position := -1
+        if boundary >= 0 {
+            if old < f.first_word || old > f.source_words { return false }
+            position = f.first_word + work.boundaries[boundary]
+        } else if old != -1 { return false }
+        work.label_ids.push(label); work.label_at.push(position)
+    }
+    work.first_word = f.first_word; work.first_reloc = f.first_reloc; work.first_import = f.first_import
+    work.source_words = f.source_words; work.source_labels = f.source_labels
+    work.source_relocs = f.source_relocs; work.source_imports = f.source_imports
+    work.prepared = true; true
+}
+
+// No external code/import mutation is permitted between prepare and these two
+// commits. They may be called in either order, once each, to fit root borrows.
+pub fn commit_code(work: &mut Workspace, code: &mut arm.Code) {
+    assert(work.prepared && !work.code_done && !code.checking)
+    assert(code.words.len == work.source_words && code.labels.len == work.source_labels)
+    assert(code.at.len == work.source_relocs && code.target.len == work.source_relocs && code.kinds.len == work.source_relocs)
+    work.code_done = true
+    while code.words.len > work.first_word { removed := code.words.pop() }
+    for word in work.output.words { code.words.push(word) }
+    for i in 0..work.label_ids.len { code.labels[work.label_ids[i]] = work.label_at[i] }
+    while code.at.len > work.first_reloc {
+        removed := code.at.pop(); target := code.target.pop(); kind := code.kinds.pop()
+    }
+    for i in 0..work.output.at.len {
+        code.at.push(work.output.at[i]); code.target.push(work.output.target[i]); code.kinds.push(work.output.kinds[i])
+    }
+}
+pub fn commit_imports(work: &mut Workspace, sites: &mut []i32) {
+    assert(work.prepared && !work.imports_done && sites.len == work.source_imports)
+    work.imports_done = true
+    for i in 0..work.import_ids.len { sites[work.import_ids[i]] = work.import_at[i] }
+}
