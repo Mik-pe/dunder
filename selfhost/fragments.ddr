@@ -155,3 +155,155 @@ pub fn restore(code: &mut arm.Code, globals: i32, entry: i32, path: string, key:
     }
     true
 }
+
+// Explicit growth/dependency admission for future generic code transforms.
+// Dependencies are sorted unique declaration IDs; charges count every admitted
+// expansion, including repeated declarations and builtins without a declaration.
+pub struct Dependencies { declarations: []i32, charged_words: i32 }
+pub fn new_dependencies() -> Dependencies { Dependencies { declarations: [], charged_words: 0 } }
+pub fn reset_dependencies(dependencies: &mut Dependencies) {
+    dependencies.declarations.clear(); dependencies.charged_words = 0
+}
+fn valid_dependencies(dependencies: &Dependencies, declaration_limit: i32) -> bool {
+    if declaration_limit < 0 || dependencies.declarations.len > 256 || dependencies.charged_words < 0 || dependencies.charged_words > 4096 { return false }
+    var previous := -1
+    for declaration in dependencies.declarations {
+        if declaration <= previous || declaration >= declaration_limit { return false }
+        previous = declaration
+    }
+    true
+}
+pub fn charge_dependency_words(dependencies: &mut Dependencies, estimate: i32) -> bool {
+    if !valid_dependencies(&dependencies, 2147483647) || estimate < 0 || estimate > 4096 - dependencies.charged_words { return false }
+    dependencies.charged_words = dependencies.charged_words + estimate; true
+}
+pub fn record_dependency(dependencies: &mut Dependencies, declaration: i32, estimate: i32) -> bool {
+    if !valid_dependencies(&dependencies, 2147483647) || declaration < 0 || declaration == 2147483647 || estimate < 0 || estimate > 4096 - dependencies.charged_words { return false }
+    var at := 0
+    while at < dependencies.declarations.len && dependencies.declarations[at] < declaration { at = at + 1 }
+    present := at < dependencies.declarations.len && dependencies.declarations[at] == declaration
+    if !present && dependencies.declarations.len == 256 { return false }
+    // Capacity and charge are both admitted before either public field changes.
+    if !present {
+        dependencies.declarations.push(declaration)
+        var i := dependencies.declarations.len - 1
+        while i > at { dependencies.declarations[i] = dependencies.declarations[i - 1]; i = i - 1 }
+        dependencies.declarations[at] = declaration
+    }
+    dependencies.charged_words = dependencies.charged_words + estimate; true
+}
+fn valid_key(key: string) -> bool {
+    if key.len != 64 { return false }
+    for b in key.bytes() { if !(b >= 48 && b <= 57) && !(b >= 97 && b <= 102) { return false } }
+    true
+}
+fn publish_dependencies(path: string, key: string, output: &[]u8) -> bool {
+    if output.len > 67108864 - 128 || !cli.prepare_parent(path) { return false }
+    payload := sys.decode_u8(&output)
+    if !payload.ok { return false }
+    temporary := path + "." + sys.pid().str() + ".tmp"
+    signature := cache_io.digest(key + payload.value)
+    written := sys.write_text(temporary, key + signature + payload.value)
+    if written.ok {
+        updated := sys.rename(temporary, path)
+        if updated.ok { return true }
+    }
+    removed := sys.remove_file(temporary); false
+}
+pub fn save_with_dependencies(code: &arm.Code, begin: Start, globals: i32,
+    path: string, key: string, dependencies: &Dependencies, declaration_limit: i32) -> bool {
+    if !valid_key(key) || !valid_dependencies(&dependencies, declaration_limit) || code.checking { return false }
+    if begin.words < 0 || begin.words >= code.words.len || begin.labels < 0 || begin.labels > code.labels.len || begin.relocations < 0 || begin.relocations > code.at.len { return false }
+    if globals < 0 || globals > begin.labels || code.at.len != code.target.len || code.at.len != code.kinds.len { return false }
+    words := code.words.len - begin.words; labels := code.labels.len - begin.labels; relocations := code.at.len - begin.relocations
+    size := i64(7) + i64(words) + i64(labels) + i64(relocations) * 3 + i64(dependencies.declarations.len)
+    if size * 8 + 128 > 67108864 { return false }
+    var output: []u8 = []
+    // DUFD, version 1. The old API interprets magic as an impossible word count
+    // and declines this payload. New restore requires magic and rejects native3.
+    put(&mut output, 1146439236); put(&mut output, 1)
+    put(&mut output, i64(words)); put(&mut output, i64(labels)); put(&mut output, i64(relocations))
+    put(&mut output, i64(dependencies.declarations.len)); put(&mut output, i64(dependencies.charged_words))
+    for i in begin.words..code.words.len {
+        word := code.words[i]
+        if word < 0 || word > 4294967295 { return false }
+        put(&mut output, word)
+    }
+    for i in begin.labels..code.labels.len {
+        offset := code.labels[i]
+        if offset == -1 { put(&mut output, 4294967295) }
+        else {
+            if offset < begin.words || offset > code.words.len { return false }
+            put(&mut output, i64(offset - begin.words))
+        }
+    }
+    for i in begin.relocations..code.at.len {
+        at := code.at[i]; target := code.target[i]; kind := code.kinds[i]
+        if at < begin.words || at >= code.words.len || kind < 0 || kind > 20 || (kind >= 2 && at + 1 >= code.words.len) { return false }
+        if target < 0 || target >= code.labels.len { return false }
+        put(&mut output, i64(at - begin.words))
+        if target < globals { put(&mut output, 2147483648 + i64(target)) }
+        else if target >= begin.labels && code.labels[target] >= begin.words { put(&mut output, i64(target - begin.labels)) }
+        else { return false }
+        put(&mut output, i64(kind))
+    }
+    for declaration in dependencies.declarations { put(&mut output, i64(declaration)) }
+    publish_dependencies(path, key, &output)
+}
+pub fn restore_with_dependencies(code: &mut arm.Code, globals: i32, entry: i32,
+    path: string, key: string, declaration_limit: i32, available_global_words: i32,
+    dependencies: &mut Dependencies) -> bool {
+    if !valid_key(key) || declaration_limit < 0 || available_global_words < 0 || code.checking { return false }
+    if globals < 0 || globals > code.labels.len || entry < 0 || entry >= code.labels.len || code.labels[entry] != -1 { return false }
+    if code.at.len != code.target.len || code.at.len != code.kinds.len { return false }
+    info := sys.metadata(path)
+    if !info.is_file || info.size < 184 || info.size > 67108864 { return false }
+    read := sys.read_text(path)
+    if !read.ok || read.value.len < 184 || read.value.len > 67108864 || read.value[0..64] != key { return false }
+    payload := read.value[128..read.value.len]
+    if read.value[64..128] != cache_io.digest(key + payload) { return false }
+    data := values(payload)
+    if data.len < 7 || data[0] != 1146439236 || data[1] != 1 { return false }
+    if data[2] == 0 || data[5] > 256 || data[6] > 4096 || data[6] > i64(available_global_words) { return false }
+    size := i64(7) + data[2] + data[3] + data[4] * 3 + data[5]
+    if size != i64(data.len) || data[2] > i64(2147483647 - code.words.len) || data[3] > i64(2147483647 - code.labels.len) || data[4] > i64(2147483647 - code.at.len) { return false }
+    words := i32(data[2]); labels := i32(data[3]); relocations := i32(data[4]); count := i32(data[5])
+    label_start := 7 + words; relocation_start := label_start + labels
+    declaration_start := relocation_start + relocations * 3
+    var previous: i64 = -1
+    for i in 0..count {
+        declaration := data[declaration_start + i]
+        if declaration <= previous || declaration >= i64(declaration_limit) { return false }
+        previous = declaration
+    }
+    for i in 0..labels {
+        offset := data[label_start + i]
+        if offset != 4294967295 && offset > i64(words) { return false }
+    }
+    for i in 0..relocations {
+        at := data[relocation_start + i * 3]; target := data[relocation_start + i * 3 + 1]; kind := data[relocation_start + i * 3 + 2]
+        if at >= i64(words) || kind > 20 || (kind >= 2 && at + 1 >= i64(words)) { return false }
+        if target >= 2147483648 {
+            if target - 2147483648 >= i64(globals) { return false }
+        } else if target >= i64(labels) || data[label_start + i32(target)] == 4294967295 { return false }
+    }
+    var accepted := new_dependencies()
+    for i in 0..count { accepted.declarations.push(i32(data[declaration_start + i])) }
+    accepted.charged_words = i32(data[6])
+    // All metadata and relocations have been checked. Commit code and output
+    // dependencies only now; every false return above leaves both untouched.
+    base := code.words.len; first := code.labels.len
+    arm.mark(&mut code, entry)
+    for i in 0..words { code.words.push(data[7 + i]) }
+    for i in 0..labels {
+        offset := data[label_start + i]
+        if offset == 4294967295 { code.labels.push(-1) } else { code.labels.push(base + i32(offset)) }
+    }
+    for i in 0..relocations {
+        destination := data[relocation_start + i * 3 + 1]
+        var target := 0
+        if destination >= 2147483648 { target = i32(destination - 2147483648) } else { target = first + i32(destination) }
+        code.at.push(base + i32(data[relocation_start + i * 3])); code.kinds.push(i32(data[relocation_start + i * 3 + 2])); code.target.push(target)
+    }
+    dependencies = accepted; true
+}
