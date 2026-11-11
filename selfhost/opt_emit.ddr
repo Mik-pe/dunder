@@ -150,6 +150,15 @@ fn simple_home(plan: &alloc.Plan, nodes: &ir.Nodes, node: i32) -> i32 {
     if nodes.kinds[node] == 5 { return plan.homes[plan.length[nodes.locals[node]]] }
     -1
 }
+fn read_register(code: &mut arm.Code, plan: &alloc.Plan, id: i32, scratch: i32) -> i32 {
+    if plan.homes[id] >= 0 { return plan.homes[id] }
+    read(&mut code, &plan, id, scratch); scratch
+}
+fn array_address(code: &mut arm.Code, base: i32, index: i32, destination: i32) {
+    // ADD Xd,Xbase,Xindex,LSL #3 followed by an ordinary LDR/STR is shared
+    // vocabulary on every target. No register-offset memory form is required.
+    arm.emit(&mut code, 2332033024 + i64(index) * 65536 + i64(base) * 32 + 3072 + i64(destination))
+}
 fn operands(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.Nodes, local_types: &[]i32, left: i32, right: i32) {
     // Expressions contain no calls or writes. A nontrapping constant/local/
     // cached length is unchanged by the right operand, so load it directly
@@ -233,6 +242,54 @@ fn division(code: &mut arm.Code, s: &State, ty: i32, op: i32, proven: bool) {
     arm.emit(&mut code, 2596277282)
     if op == 4 { arm.mov(&mut code, 0, 2) } else { arm.emit(&mut code, 2600502336) }
 }
+// Keep this policy next to expression lowering. All source homes are preserved;
+// ordinary scratch is x0..3, array addressing uses x8, and frame loads whose
+// physical slot is >=32 use x9. Constant division uses only x0..3. Any new
+// lowering that uses another scratch register must update this contract.
+fn read_clobbers(plan: &alloc.Plan, id: i32) -> i32 {
+    if id < 0 || id >= plan.homes.len { return -1 }
+    if plan.homes[id] >= 0 { return 0 }
+    slot := frame_slot(&plan, id)
+    if slot < 0 { return -1 }
+    if slot >= 32 { return 512 }; 0
+}
+fn clobber_walk(nodes: &ir.Nodes, plan: &alloc.Plan, node: i32, remaining: &mut i32, depth: i32) -> i32 {
+    if node < 0 || node >= nodes.kinds.len || remaining <= 0 || depth > 64 { return -1 }
+    remaining = remaining - 1
+    kind := nodes.kinds[node]
+    if kind == 1 { return 1 }
+    local := nodes.locals[node]
+    if kind == 2 { return i32(1).bit_or(read_clobbers(&plan, local)) }
+    if kind == 5 || kind == 6 {
+        if local < 0 || local >= plan.data.len || local >= plan.length.len { return -1 }
+        if kind == 5 { return i32(1).bit_or(read_clobbers(&plan, plan.length[local])) }
+        child := clobber_walk(&nodes, &plan, nodes.left[node], &mut remaining, depth + 1)
+        var mask := i32(259).bit_or(child).bit_or(read_clobbers(&plan, plan.data[local]))
+        if nodes.proofs[node].bit_and(2) == 0 { mask = mask.bit_or(read_clobbers(&plan, plan.length[local])) }
+        return mask
+    }
+    if kind == 3 {
+        if nodes.values[node] < 1 || nodes.values[node] > 13 { return -1 }
+        left := clobber_walk(&nodes, &plan, nodes.left[node], &mut remaining, depth + 1)
+        right := clobber_walk(&nodes, &plan, nodes.right[node], &mut remaining, depth + 1)
+        return i32(15).bit_or(left).bit_or(right)
+    }
+    if kind == 4 && (nodes.values[node] == 1 || nodes.values[node] == 2) {
+        child := clobber_walk(&nodes, &plan, nodes.left[node], &mut remaining, depth + 1)
+        return i32(15).bit_or(child)
+    }
+    -1
+}
+// Conservative scratch-clobber mask on normal continuation of an already-
+// verified expression, including inline helpers. Source homes are preserved
+// and expression stack operations are balanced. Unknown/deep/large expressions
+// return all bits set, retaining address preservation through the stack path.
+// Store RHS subtrees are disjoint in the verified tree, so these bounded walks
+// add linear work and allocate no per-node records or arrays.
+pub fn expression_clobbers(nodes: &ir.Nodes, plan: &alloc.Plan, root: i32) -> i32 {
+    var remaining := 512
+    clobber_walk(&nodes, &plan, root, &mut remaining, 0)
+}
 fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.Nodes, local_types: &[]i32, node: i32) {
     kind := nodes.kinds[node]; ty := nodes.types[node]; proven := nodes.proofs[node].bit_and(1) != 0
     var op := 0; if kind == 3 || kind == 4 { op = i32(nodes.values[node]) }
@@ -240,12 +297,15 @@ fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.
     if kind == 2 { read(&mut code, &plan, nodes.locals[node], 0); return }
     if kind == 5 { read(&mut code, &plan, plan.length[nodes.locals[node]], 0); return }
     if kind == 6 {
-        expression(&mut code, &mut s, &plan, &nodes, &local_types, nodes.left[node]); local := nodes.locals[node]
+        index := nodes.left[node]; var index_reg := simple_home(&plan, &nodes, index)
+        if index_reg < 0 { expression(&mut code, &mut s, &plan, &nodes, &local_types, index); index_reg = 0 }
+        local := nodes.locals[node]
         if nodes.proofs[node].bit_and(2) == 0 || !ir.array_type(local_types[local]) {
-            read(&mut code, &plan, plan.length[local], 1); compare(&mut code, 0, 1); arm.branch(&mut code, s.bounds, 4)
+            length := read_register(&mut code, &plan, plan.length[local], 1)
+            compare(&mut code, index_reg, length); arm.branch(&mut code, s.bounds, 4)
         }
-        read(&mut code, &plan, plan.data[local], 1)
-        arm.emit(&mut code, 2332036136); arm.emit(&mut code, 4181721344); return // x8=data+index*8; x0=[x8]
+        data := read_register(&mut code, &plan, plan.data[local], 1)
+        array_address(&mut code, data, index_reg, 8); arm.emit(&mut code, 4181721344); return
     }
     if kind == 4 {
         expression(&mut code, &mut s, &plan, &nodes, &local_types, nodes.left[node])
@@ -325,14 +385,28 @@ fn statement(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Funct
         arm.branch(&mut code, head, 0); arm.mark(&mut code, done)
     } else if kind == 18 {
         // Establish and validate the destination before evaluating the RHS.
-        // The RHS can read any array and overwrite x8, so preserve the exact
-        // address rather than recomputing its index or trusting scratch regs.
-        expression(&mut code, &mut s, &plan, &f.nodes, &f.local_types, f.nodes.left[node]); local := f.nodes.locals[node]
+        // Choose a register the selected RHS lowering preserves; otherwise
+        // retain the exact address with the existing ordered push/pop path.
+        index := f.nodes.left[node]; rhs := f.nodes.right[node]
+        var index_reg := simple_home(&plan, &f.nodes, index)
+        if index_reg < 0 { expression(&mut code, &mut s, &plan, &f.nodes, &f.local_types, index); index_reg = 0 }
+        local := f.nodes.locals[node]
         if f.nodes.proofs[node].bit_and(2) == 0 {
-            read(&mut code, &plan, plan.length[local], 1); compare(&mut code, 0, 1); arm.branch(&mut code, s.bounds, 4)
+            length := read_register(&mut code, &plan, plan.length[local], 1)
+            compare(&mut code, index_reg, length); arm.branch(&mut code, s.bounds, 4)
         }
-        read(&mut code, &plan, plan.data[local], 1); arm.emit(&mut code, 2332036136); arm.push(&mut code, 8)
-        expression(&mut code, &mut s, &plan, &f.nodes, &f.local_types, f.nodes.right[node]); arm.pop(&mut code, 1); arm.emit(&mut code, 4177526816)
+        mask := expression_clobbers(&f.nodes, &plan, rhs)
+        var address := 8; var stacked := false
+        if mask.bit_and(256) != 0 {
+            if mask.bit_and(512) == 0 { address = 9 } else { stacked = true }
+        }
+        data := read_register(&mut code, &plan, plan.data[local], 1)
+        array_address(&mut code, data, index_reg, address)
+        if stacked { arm.push(&mut code, 8) }
+        var value := simple_home(&plan, &f.nodes, rhs)
+        if value < 0 { expression(&mut code, &mut s, &plan, &f.nodes, &f.local_types, rhs); value = 0 }
+        if stacked { arm.pop(&mut code, 1); address = 1 }
+        arm.emit(&mut code, 4177526784 + i64(address) * 32 + i64(value))
     } else if kind == 19 {
         // Evaluate low then high once, before introducing the source iterator.
         // Saving low avoids reordering a trap or clobbering an outer binding
