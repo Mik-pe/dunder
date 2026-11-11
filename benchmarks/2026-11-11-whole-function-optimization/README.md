@@ -149,3 +149,26 @@ A following identity-transfer correction skips fact-table access when the
 complete GP write/clobber projection is empty. SP, FP and NZCV remain separate;
 actual GP W writes retain their zero-extension effects. All 384 image,
 counter, unit and oracle records remain exactly unchanged by that correction.
+
+
+## Sparse transfers: complete-profile check before local certificates
+
+`sparse-pre-certification` compares the frozen pre-MIR compiler with
+`8e6c7426dc7115d39ce0e199097196baa14354d81bb046ca78cbcaa2c47d2e1a`.
+This 30-round series includes C and the complete default profile. All four
+candidate runtime images exactly match the full-plan ablation images, so the
+analysis/transaction changes have preserved that generated code.
+
+Runtime medians (baseline → candidate / C) are numeric 6.592 → 5.073 / 4.589 ms,
+scan 3.060 → 2.530 / 2.472 ms, text 3.756 → 3.461 / 2.586 ms and sort
+3.147 → 2.941 / 2.379 ms. Candidate/C geometric mean is 1.170 and worst
+case 1.338. This still fails the C acceptance goal.
+
+Generated build median is 1009.245 ms, p95 1021.580 ms: narrowly below the
+100,000 lines/s requirement. Self-build median/p95 are 822.790/827.235 ms;
+Tabell 23.005/29.734 ms. Relative to the original compiler, build cost remains
+substantial (3.10x generated median, 3.44x self-build). These regressions are
+retained rather than hidden behind the later improvements from the expensive
+full-plan candidate. A following inductive row certificate removes a redundant
+whole-function pre-DCE verification only for strictly locally validated edits;
+unconditional final verification and the conservative fallback remain.

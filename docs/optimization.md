@@ -127,11 +127,14 @@ Verifierarens interna seen-arena ligger i dess eget arbetsminne.
 
 Replay använder varje originalrad i dataflödesöverföringen innan den
 stagade motsvarigheten skrivs, vilket bevarar fakta och aliasval. Därefter
-verifieras semantiska ändringar med den vanliga verifieraren. Radering av
-en bevisat ren materialisering får behålla ett redan sant certifikat: den
-ändrar endast mode, aldrig CFG, stack, flaggor, minne eller ABI. Den regeln
-får aldrig sätta ett falskt certifikat till sant. Varje ändrat slutresultat
-genomgår ändå ovillkorlig, debiterad fullverifiering före framgång.
+kontrolleras varje ny rad av samma kanoniska kontrakt som den fulla
+verifieraren. En snäv privat bevisregel får behålla ett redan sant
+certifikat för de befintliga konst-/kopie- och operandaliasomskrivningarna.
+Destination, bredd, flaggor, effekter och strukturell metadata bevaras.
+FP-/SP-roller eller andra ändringar tar den vanliga verifieringsvägen före
+liveness. Ett falskt certifikat får aldrig återställas manuellt. Radering
+av en bevisat ren materialisering ändrar enbart mode. Varje ändrat
+slutresultat genomgår ovillkorlig, debiterad fullverifiering före framgång.
 Arbetet, inklusive återställning, är budgetbegränsat; upprepad DCE-liveness
 är inte garanterat linjär.
 

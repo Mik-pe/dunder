@@ -134,9 +134,10 @@ delvis optimerad funktion lämnar det exklusiva lånet.
 Verifierarens seen-scratch ligger i dess eget arbetsminne, så modellens
 övriga metadata förblir orörda. En snäv bevisbevarande regel låter DCE
 behålla ett redan giltigt certifikat när enbart mode ändras för rena
-Const/Copy/MOVK. Ingen allmän validering hoppas över: semantiska ersättningar
-verifieras efter replay, och varje ändrat slutresultat fullverifieras
-ovillkorligen. Hela det reserverade verifierings- och rollbackarbetet
+Const/Copy/MOVK. Även de befintliga smala skalära aliasomskrivningarna
+kan behålla ett redan sant certifikat efter samma lokala radkontrakt.
+FP/SP eller annan obevisad ändring tar full verifieringsväg efter replay.
+Varje ändrat slutresultat fullverifieras ovillkorligen. Hela det reserverade verifierings- och rollbackarbetet
 debiteras. Budgetavslag efter stagning ska återställa exakt samtliga fält.
 
 Detta angriper kompileringskostnaden utan att ändra de valda
@@ -145,3 +146,65 @@ registerallokering för privata skalärplatser, smala läsvyer och
 uttrycksstackvärden. Återanvändning av heaplaster behöver dessutom
 adressidentitet och explicita minnesversioner; scalar-SSA ensam bevisar
 inte att två heapåtkomster är oberoende.
+
+
+## Parallell kompilering och språkets trådar: nästa etapp
+
+Status: språk/runtime-delen nedan är en genomförandeplan, inte ett befintligt
+thread-API. Första kodgränsen under arbete är en ägd, relokerbar
+`FunctionObject`; den inför inte trådar i sig.
+
+Den första kompilatorkonsumenten ska vara bearbetning av hela funktions-IR:er.
+Frontend behåller sin ordning för symboler, nåbarhet, diagnostik och
+inlinebudgetar. Varje worker äger en MIR-funktion och egna återanvändbara
+verifierings-/analys-/sänkningsarenor. Den returnerar ord, lokala etikett-
+offsetar, symboliska globala ID:n, importplatser och statistik. En koordinator
+sammanfogar efter jobbens ursprungliga ordningsnummer. Bunden kö begränsar
+antalet levande funktionsarenor. Varken Compiler, global Code eller cache-I/O
+delas muterbart mellan workers. Parallell modulläsning/lexning kan följa;
+parallella funktionsfronter kräver först en frusen deklarationsvärld och
+separata FunctionContext.
+
+Språkets första vertikal ska vara strukturerade, isolerade uppgifter med
+namngiven workerfunktion, ett explicit ägt indatavärde och ett typat resultat.
+Task<Result> kan vara en härledd generell typkonstruktor utan att först
+införa alla användargenerics. Taskhandtag måste vara affina: vanlig opaque
+struct innebär kopiering och räcker inte. Join konsumerar handtaget, och
+normal scope-exit väntar in återstående jobb före vanlig cleanup, även vid
+return/break/continue. Ingen detached livstid eller cancellation införs först.
+Överföring/flytt behöver verklig kontroll av bindningars tillstånd och
+kontrollflödets joins; nuvarande temporäröverföring är inte sådan kontroll.
+
+Första runtimekontraktet är isolering. Varje worker får egen runtimekontext,
+heap och separat C-ABI-entry. Gränskopiering måste kopiera hela objektgrafen,
+inklusive dynamiska strängars bytes; vanlig värdekopia delar deras icke-
+atomiska referensräknare. Resultat kopieras tillbaka före frigöring av
+workerheapen. Enbart trådlokala bumpmarkörer räcker inte: blockheaderns
+free-binpekare refererar till ursprungspoolen. Varken referensräknare eller
+free-listor får därmed korsas som vanliga managed-handtag i denna första
+modell. Nollkopierande flytt är en separat senare förbättring som kräver
+remote-free, poollivstid och delade handles med definierad synkronisering.
+
+Överförbarhet kontrolleras rekursivt. Borrows, scratch-vyer, råpekare, okända
+funktionspekare och trådbundna resurser avvisas först. En worker måste också
+ha en verifierad transitiv effektgräns: inga externa anrop, static_bytes,
+råa escaping-adresser eller callbacks. Ett vanligt fn(T)->R bevisar inte
+detta. Interna lån och allokering i den egna domänen kan vara tillåtna.
+Delade scoped borrows, publika mutexar och atomics kräver senare Sync- och
+lånelivstidsregler; de behövs inte för att börja med isolerade jobb.
+
+Den befintliga callbackbryggan är uttryckligen synkron och trådbunden och
+får inte återanvändas som workerstart. Native-adaptern behöver sätta upp
+heapregister samt x86:s registerbank/värdestack och bevara värdens C-ABI.
+Wasm behöver egen shared-memory-/atomic-grund; nåbar threading ska tills
+dess ge ett tydligt målrelaterat fel. Bootstrap ska fortsatt byggas från
+den frysta seriella seedvägen; en compiler som själv använder nya task-
+uttryck måste byggas i ett uttryckligt senare steg, inte kräva att fröet
+redan förstår den nya syntaxen.
+
+Acceptansgrindar: data-/alias-/resursprov över spawn/join och alla scope-
+utgångar; worker-/start-/joinfel med korrekt cleanup; separata heapar och
+resultatlivstid; identiska bilder, bindings, diagnostik och cacheutfall med
+1/2/N workers och varierad färdigordning. Mät en worker och standardantal
+separat, inklusive kopiering, kö, merge, signering och toppminne. Trådantal
+får inte ändra optimeringsbudgetar eller programmets semantik.
