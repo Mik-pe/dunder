@@ -68,6 +68,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--report', type=Path)
+    parser.add_argument('--compare-report', type=Path,
+                        help='require the same SHA256 for every program image in a prior successful matrix')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
@@ -125,12 +127,23 @@ def main():
             print(f'PASS {index + 1}/{len(corpus)} case{case} input{value} condition{condition}', flush=True)
     report.update(images_built=len(report['images']), executions=executed, oracle_pairs=proofs, oracle_gap_pairs=gaps)
     report['manifest_sha256'] = hashlib.sha256(json.dumps(report['images'], sort_keys=True).encode()).hexdigest()
+    if args.compare_report:
+        previous = json.loads(args.compare_report.read_text())
+        key = lambda row: (row['case'], row['input'], row['condition'], row['target'], row['mode'])
+        reference = {key(row): row['sha256'] for row in previous['images']}
+        assert len(reference) == len(report['images'])
+        for row in report['images']:
+            assert reference[key(row)] == row['sha256'], ('program image changed', key(row), reference[key(row)], row['sha256'])
+        report['reference_manifest_sha256'] = previous['manifest_sha256']
+        report['reference_program_sha256_matches'] = len(report['images'])
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
     print(f'{len(corpus)} programs/inputs; {len(report["images"])} images; {executed} host/Wasm executions; '
           f'{proofs} independent oracle pairs; {gaps} explicitly reported call/trap gaps')
     print('manifest_sha256=' + report['manifest_sha256'])
+    if args.compare_report:
+        print(f'{len(report["images"])} program image SHA256s match the previous implementation')
 
 
 if __name__ == '__main__':
