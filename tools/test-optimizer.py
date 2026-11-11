@@ -205,6 +205,13 @@ def invalid_cases():
     yield 'array_boolean_index', 'fn f(a:&[]i64)->i64{if false{return a[true]};return 0}\nfn main(){a:[]i64=[0];print(f(&a))}\n'
     yield 'legacy_literal_context', 'fn f(x:i64)->bool{if false{return 10/x>0};return true}\nfn main(){print(f(1))}\n'
     yield 'excessive_nesting', 'fn f(x:i32)->i32{' + '('*140 + 'x' + ')'*140 + '}\nfn main(){print(f(1))}\n'
+    # Each level enters both expression() and primary(). Checking only the
+    # parser's primary depth would incorrectly accept this foldable program.
+    nested = '1'
+    for _ in range(43):
+        nested = '1+(' + nested + ')'
+    yield 'combined_expression_depth', f'fn f()->i32{{{nested}}}\nfn main(){{print(f())}}\n'
+    yield 'dead_combined_expression_depth', f'fn unused()->i32{{{nested}}}\nfn main(){{print(42)}}\n'
 
 
 def call(args, *, cwd, env=None):
