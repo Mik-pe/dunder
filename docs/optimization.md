@@ -60,8 +60,19 @@ utvärderings-, fäll- och cleanupordning.
 Inkommande registervärden sparas i färska frameceller och återställs före
 varje normal epilog. Den kompletta framereservationen utökas atomiskt.
 Stora offset kräver explicit scratchregister och bevisad liveness.
-Anrop och okänd minnesåtkomst synkroniserar hemmen mot de ursprungliga
-platserna; inget antagande görs att äldre callees bevarar de nya hemmen.
+Hemmen laddas initialt från de ursprungliga framebitarna, så att även en
+tidig okänd läsning observerar samma lagring. Anrop synkroniserar hemmen
+mot de ursprungliga platserna; inget antagande görs att äldre callees
+bevarar de nya hemmen. Rå MIR synkroniserar också vid okänd minnesåtkomst.
+
+Den kompletta källproducenten kan ge ett uttryckligt, versionsbundet
+[objektminneskontrakt](ffi.md) genom [`mir_memory`](../selfhost/mir_memory.ddr).
+En giltig indirekt åtkomst kan då varken läsa eller skriva oexponerade,
+disjunkta celler i den aktuella framen. Frame-livstid, reserverat intervall,
+exponering och överlappning kontrolleras fortfarande separat. Kontraktet
+gör att heapåtkomster kan passeras utan onödig framesynkronisering. Det
+bevisar varken registerbevarande vid anrop eller minnesfrihet för godtyckliga
+anrop. `--mir-memory=off` väljer det konservativa råläget.
 En separat may-uninitialized-analys kräver att varje ersatt läsning har
 en föregående skrivning på alla nåbara vägar.
 
@@ -71,13 +82,46 @@ funktionen orörd. Ett framgångsrikt pass verifieras alltid på nytt före
 sänkning; trasigt tillstånd är ett internt fel. Hela källfunktionen går
 genom IR även när den frivilliga omskrivningen avstår.
 
-`--mir-opt=off` stänger bara av passet och behåller helfunktionskedjan.
+`--mir-opt=off` stänger av optimeringspassen och behåller helfunktionskedjan.
 Cachefragment och testkvitton skiljer läget och pipelineversionen åt.
 Tidsrapportens `mir` visar effektiv `optimization_enabled`-policy samt
 `optimized`, `promoted`, `removed_loads`, `removed_stores`, `analysis_units`
 och `budget_refusals`. Faktiska arbetsräknare är noll vid check, avstängt
 pass och full cacheåterställning. Policyflaggan kan fortfarande vara på
-vid cacheträff. Full GP-SSA, coalescing och konstantplacering återstår.
+vid cacheträff. `source_objects_enabled` anger den effektiva minnespolicyn
+och `private_memory_ops` räknar faktiskt använda privata minnespositioner.
+Full GP-SSA och fysisk registerallokering återstår.
+
+### Värdeidentitet över kontrollflödet
+
+[`mir_value_prop`](../selfhost/mir_value_prop.ddr) körs efter framepromovering
+och före sänkning. Det håller separata ekvivalensklasser för hela 64-bitars-
+värden och de låga 32 bitarna, exakta konstanter och nollutökning. Fakta
+möts över samtliga nåbara föregångare och löses till fixpunkt innan någon
+omskrivning planeras. Skrivningar och anropsförstörelse dödar äldre fakta;
+ett återkommande operations-ID i en loop är aldrig en värdeidentitet.
+
+Passet ersätter bevisade registerkopior, väljer kanoniska immediate-former
+och tar bort döda rena materialiseringar. Minnesvärden cachas inte och
+flaggor, fällor och ägaroperationer flyttas inte. Oklassificerade externa
+utgångar avvisas: en utgång som aldrig återvänder kan fortfarande observera
+inkommande register. Endast ett uttryckligt producentkontrakt får undanta
+en terminal utgång utan sådana observationer.
+
+Arbetsminne och omskrivningsplan är separata, återanvändbara ägarrötter.
+Ingen hel funktionspost flyttas genom värdetilldelning, eftersom Dunders
+ägda structfält då djupkopieras. Kolumnkopior och exakta snapshots använder
+indexerad läsning över lån; vanlig arrayiteration har snapshotsemantik.
+Planen skapas först vid en bevisad ändring. Budgetavslag lämnar källan
+orörd, och lyckad commit kontrollerar exakt källa och plan samt verifierar
+slutresultatet. Arbetet är budgetbegränsat, inte garanterat linjärt.
+
+`--mir-values=off` stänger av värdepasset separat. `--mir-opt=off` stänger
+av båda helfunktionspassen. Cache och testkvitton inkluderar policyn.
+`--timings=json` visar `values_enabled`, `values_optimized`,
+`value_rewrites`, `value_deleted`, `value_immediates`,
+`value_analysis_units` och `value_budget_refusals`. Dessa är faktisk
+passaktivitet, inte ett bevis på dynamisk runtimevinst.
 
 ## Typad funktionsmodell och lokalt optimeringspass
 
@@ -398,7 +442,7 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Den gemensamma IR-gränsen är införd. Nästa steg är värdeidentitet, coalescing och tydliga privata/externa minnesobjekt över anrop och loopar. | Bevarande av register och NoModRef för privata celler är skilda kontrakt. Fulla ABI- och ägareffekter, låneursprung och verifierade producentpremisser måste vara explicita. |
+| Helfunktionsvärden, SSA och minnesmodell | Den gemensamma IR-gränsen är införd. Värdeekvivalens, privata källobjekt och begränsad framepromovering är införda. Nästa steg är generell SSA och registerallokering över anrop och loopar. | Bevarande av register och NoModRef för privata celler är skilda kontrakt. Fulla ABI- och ägareffekter, låneursprung och verifierade producentpremisser måste vara explicita. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |

@@ -51,8 +51,9 @@ Modellen verifieras före och efter passet. Ägda värden, storleksändring av
 arrayer, flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
 Alla nyemitterade källfunktioner från båda vägarna går därefter genom den
 gemensamma helfunktions-IR:n med obligatorisk verifiering och atomisk
-sänkning. Ett generellt registerpass med CFG-liveness och framepromovering
-är nu aktiverat som standard. `--mir-opt=off` behåller kedjan utan passet;
+sänkning. Generell CFG-liveness, framepromovering, ett uttryckligt kontrakt för
+privata källobjekt och värdepropagering delar samma kedja.
+`--mir-opt=off` behåller kedjan utan optimeringspassen;
 `--mir=off` stänger av hela gränsen för jämförelse.
 [Omfattning och gränser](optimization.md).
 

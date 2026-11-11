@@ -101,6 +101,34 @@ ansvarar för livstid, åtkomst, storlek, justering och aliasregler. Ett främma
 funktionsanrop förutsätter dessutom att bibliotekets faktiska ABI stämmer med
 deklarationen.
 
+### Objektminne och privata stackceller
+
+Rå åtkomst måste avse ett levande, åtkomligt källobjekt eller en uttryckligen
+tillhandahållen extern minnesregion och rymmas inom dess giltiga intervall.
+Pekarens bitar är dess representation. En rundresa genom `usize` bevarar
+åtkomsten till samma region; ett numeriskt värde ger ingen ny rätt att
+läsa eller skriva andra objekt. Utgångna lån, gamla pekare och aritmetik
+utanför regionen ger ingen åtkomst till andra lokala värden.
+
+Kompilatorns spillceller, oexponerade lokaler och FP/LR-länkage är privat
+implementationslagring. Ett vanligt främmande anrop eller en Wasm-värd får
+varken läsa eller skriva dessa genom stackvandring eller tillverkade
+adresser. Ett uttryckligt `addr(&place)` exponerar det angivna objektet
+enligt dess typ, storlek, livstid och lånevillkor. Det exponerar inte andra
+lokaler, dold utfyllnad eller resten av framen. Kompilatorn kan därför
+behålla oexponerade värden i register även när andra objekt ändras.
+
+Rekursion och återanrop skapar separata aktiveringar. En pekare till ett
+äldre exponerat objekt behåller sitt giltiga lån och ger ingen åtkomst
+till en ny aktiverings privata celler. Registerbevarande och denna
+minnesregel är separata ABI-egenskaper.
+
+Vanliga anrop returnerar normalt en gång eller avslutar utan återkomst.
+Stackbyte, icke-lokala hopp, returns-twice och stackinspektion av privata
+lokaler kräver ett separat uttryckligt kontrakt; de följer inte av en
+vanlig `@extern`-deklaration. Dessa regler gäller också när en främmande
+funktion anropar Dunder genom en callback.
+
 ## Filåtkomst genom delegerade handtag
 
 En modul med `capability filesystem` kan välja sökvägar med
