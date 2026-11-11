@@ -235,6 +235,37 @@ def constant_division_controls(p):
     p.call('check', 'division.ddr', '--const-div-opt=unknown', status=2)
 
 
+def frame_free_controls(p):
+    p.write('frames.ddr', 'fn added(a:i64,b:i64)->i64{a+b}\n'
+            'fn main(){print(added(20,22))}\n')
+    def build(mode, name, cached=False):
+        result = p.call('build', 'frames.ddr', '--frame-free=' + mode,
+                        '--timings=json', '-o', name, *(['--incremental'] if cached else []))
+        return json.loads(result.stderr)['functions']['reused']
+    build('on', 'frame-on')
+    build('off', 'frame-off')
+    identical = (p.root/'frame-on').read_bytes() == (p.root/'frame-off').read_bytes()
+    assert identical == (os.uname().machine not in ('arm64','aarch64'))
+    for name in ('frame-on', 'frame-off'):
+        result = subprocess.run([p.root/name],capture_output=True,text=True,timeout=10)
+        assert result.returncode == 0 and result.stdout == '42\n' and not result.stderr, result
+    enabled = p.call('check', 'frames.ddr', '--agent', '--frame-free=on')
+    disabled = p.call('check', 'frames.ddr', '--agent', '--frame-free=off')
+    assert enabled.stdout == disabled.stdout and enabled.stderr == disabled.stderr == ''
+    assert build('on', 'cached-on', True) == 0
+    assert build('on', 'cached-on', True) > 0
+    assert build('off', 'cached-off', True) == 0
+    assert build('off', 'cached-off', True) > 0
+    assert build('on', 'cached-on', True) > 0
+    p.write('frame-tests.ddr', 'fn added(a:i64,b:i64)->i64{a+b}\n'
+            '@test fn works(){added(20,22)==42}\n')
+    for mode, expected in [('on','1 passed'),('on','1 unaffected'),
+                           ('off','1 passed'),('off','1 unaffected'),('on','1 passed')]:
+        result = p.call('test', 'frame-tests.ddr', '--affected', '--frame-free=' + mode, '-o', 'frame-results')
+        assert expected in result.stdout, result
+    p.call('check', 'frames.ddr', '--frame-free=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -415,7 +446,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, isolated_tests, filesystem]
+             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
