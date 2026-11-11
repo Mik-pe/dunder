@@ -1,13 +1,13 @@
 # Så mäter vi Dunder
 
-Den aktuella självhosten har en [gemensam runtime- och byggmätning](../benchmarks/2026-11-11-verified-mutation/README.md)
-med 30 försök per variant och arbetsfall, råtider, kontrollerade resultat
-och reproducerbart mätverktyg. Den omfattar också ett verkligt självbygge
-och en separat av/på-mätning av det lokala skalärpasset.
-Senaste etappen förbättrar sortering och självbygge, men den obligatoriska
-modellverifieringen har en redovisad kostnad på det genererade stressprovet.
-Runtime är fortfarande långsammare än den optimerade C-referensen;
-acceptansgränserna nedan är fortsatt mål.
+Den aktuella självhosten har en [gemensam runtime- och byggmätning](../benchmarks/2026-11-11-whole-function-optimization/README.md#final-serial-profile-with-detached-function-objects)
+med 30 försök per variant, råtider, kontrollerade resultat och full lokal
+verifiering. Standardprofilens genererade bygge når 107 909 källrader/s vid
+p95 med en byggarbetare. Runtime/C-geomedlet är 1,168× och textfallet 1,325×;
+C-målet återstår. Byggmedianen kostar fortfarande 2,89× på det genererade
+korpuset och 3,13× på självbygget jämfört med kompilatorn före helfunktions-IR.
+Kontroll utan kodgenerering har jämförbar tid. Hela acceptanskontraktet nedan
+är ännu inte uppfyllt.
 
 Den lokala [runtime-sviten](../benchmarks/runtime/README.md) jämför nu
 baseline och optimerad maskinkod med fyra frysta arbetsfall, oberoende

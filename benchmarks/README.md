@@ -20,6 +20,12 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Helfunktionsoptimering och fristående funktionsobjekt, 2026-11-11](2026-11-11-whole-function-optimization/README.md)
+är senaste verifierade standardprofilen. Den når 107 909 genererade källrader/s
+vid p95 med en arbetare, men byggmedianerna kostar fortfarande 2,89×/3,13×
+på genererat korpus/självbygge jämfört med före IR. Runtime/C-geomedlet är
+1,168×; C-målet återstår. Rapporten behåller mellanresultat och råvärden.
+
 [Gemensam helfunktions-IR, 2026-11-11](2026-11-11-whole-function-mir/README.md)
 flyttar hela källspråket genom verifierad IR och sänkning. Första kandidaten
 ger identiska bilder men ökar byggmedianerna 55–86 procent; det genererade

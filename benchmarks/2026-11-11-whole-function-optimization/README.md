@@ -1,7 +1,8 @@
 # Whole-function optimization milestones
 
-These measurements preserve three architectural comparisons on the unchanged
-runtime and compiler cohorts. Each directory records exact compiler and source
+These measurements preserve successive architectural comparisons on the unchanged
+runtime and compiler cohorts. The latest verified default profile is
+[final-serial-objects](final-serial-objects/summary.csv), described below. Each directory records exact compiler and source
 hashes, flags, 30 fresh process samples, median, p95 and image size. Incremental
 caching was disabled and normal safety checks remained enabled. C used Clang
 `-O3 -ftrapv`; its programs do not have Dunder array bounds checks.
@@ -192,3 +193,58 @@ The private certificate rule retained the same existing rewrites and mandatory
 final verification; targeted coverage passed 40 native and 40 Wasm groups plus
 384 target images and 192 executions. The newly integrated FunctionObject
 adapter is verified and measured separately before final publication.
+
+
+## Final serial profile with detached function objects
+
+`final-serial-objects` measures source revision `6c7df69` with frozen compiler
+`2a0a78477985a6f7542cd90278743bde96d5591bd8e6f50d0c2b702f55dc6020`
+against the pre-MIR compiler
+`4b73d04b90e252741bc39e926a4c03b775710a6cfdaece1dc29dd413a39cf105`.
+Both use their normal complete profile. There is one build worker, 30 fresh
+processes per case/variant, warm OS cache and no Dunder artifact cache. This is
+still a serial compiler; detached objects prepare independent function jobs.
+
+| Runtime | Baseline median | Candidate median | C median | Candidate / C |
+| --- | --- | --- | --- | --- |
+| Numeric | 6.626 ms | 5.079 ms | 4.644 ms | 1.094 |
+| Scan | 3.064 ms | 2.530 ms | 2.447 ms | 1.034 |
+| Text | 3.734 ms | 3.435 ms | 2.592 ms | 1.325 |
+| Sort | 3.089 ms | 2.916 ms | 2.345 ms | 1.243 |
+
+All four runtime images exactly match the expensive full-plan candidate.
+The runtime/C geometric mean is **1.168**, worst case **1.325** (text): the
+1.10/1.25 C acceptance target remains unmet. Medians improve 23.3%, 17.4%,
+8.0% and 5.6% against the original compiler. C uses `-O3 -ftrapv` but does
+not include Dunder's array bounds checks. Raw p95 values remain in the report;
+process-latency variation does not imply uniform tail improvements.
+
+| Build | Baseline median | Candidate median | Candidate p95 |
+| --- | --- | --- | --- |
+| Generated | 320.242 ms | 925.403 ms | 936.195 ms |
+| Self-host | 238.060 ms | 745.986 ms | 749.256 ms |
+| Tabell | 9.343 ms | 21.176 ms | 28.677 ms |
+
+The generated corpus reaches **107,909 source lines/s at p95**, passing the
+100,000 build-throughput gate. Compared with the original compiler, build
+medians still cost 2.89x generated and 3.13x self-host. Check-only medians are
+comparable: generated 184.841 → 184.146 ms, self-host 157.418 → 157.886 ms
+and Tabell 5.000 → 5.006 ms. These are measured costs, not a claim that all
+incremental, memory or broad workload acceptance criteria are met.
+
+Full `tools/verify-selfhost.sh` passed on this source. The retained log includes
+the bootstrap fixed point, 138 native dogfood groups, 124 Wasm groups with 14
+explicit native-only groups, 50 diagnostics, 56 all-target check/build
+contracts and 46 runtime contracts per native/Wasm runtime. Value coverage
+includes 40 native plus 40 Wasm unit groups, 384 target images, 192 executions,
+348 independent oracle pairs and 36 explicit call/trap gaps. Detached objects
+include 13 unit groups, 16 serial/object image comparisons and 8 native/Wasm
+executions. Cross-target image builds do not claim Linux execution.
+
+Next architecture work separates function verification/optimization/lowering
+from the single-owner frontend and merges relocatable results in stable source
+order. Native task-provider and task-boundary analyses are being developed
+separately; source-language threading and parallel compilation are not enabled
+by this measured milestone. Single-thread runtime still needs better value and
+place representation, allocation and memory-versioned load reuse to close the
+text/sort gap to C.
