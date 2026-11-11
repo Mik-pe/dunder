@@ -205,6 +205,36 @@ def ownership_optimizer_controls(p):
     p.call('check', 'leases.ddr', '--ownership-opt=unknown', status=2)
 
 
+def constant_division_controls(p):
+    p.write('division.ddr', 'fn divided(x:i64)->i64{x/37}\n'
+            'fn main(){print(divided(1554))}\n')
+    def build(mode, name, cached=False):
+        result = p.call('build', 'division.ddr', '--const-div-opt=' + mode,
+                        '--timings=json', '-o', name, *(['--incremental'] if cached else []))
+        return json.loads(result.stderr)['functions']['reused']
+    build('on', 'division-on')
+    build('off', 'division-off')
+    assert (p.root/'division-on').read_bytes() != (p.root/'division-off').read_bytes()
+    for name in ('division-on', 'division-off'):
+        result = subprocess.run([p.root/name],capture_output=True,text=True,timeout=10)
+        assert result.returncode == 0 and result.stdout == '42\n' and not result.stderr, result
+    enabled = p.call('check', 'division.ddr', '--agent', '--const-div-opt=on')
+    disabled = p.call('check', 'division.ddr', '--agent', '--const-div-opt=off')
+    assert enabled.stdout == disabled.stdout and enabled.stderr == disabled.stderr == ''
+    assert build('on', 'cached-on', True) == 0
+    assert build('on', 'cached-on', True) > 0
+    assert build('off', 'cached-off', True) == 0
+    assert build('off', 'cached-off', True) > 0
+    assert build('on', 'cached-on', True) > 0
+    p.write('division-tests.ddr', 'fn divided(x:i64)->i64{x/37}\n'
+            '@test fn works(){divided(1554)==42}\n')
+    for mode, expected in [('on','1 passed'),('on','1 unaffected'),
+                           ('off','1 passed'),('off','1 unaffected'),('on','1 passed')]:
+        result = p.call('test', 'division-tests.ddr', '--affected', '--const-div-opt=' + mode, '-o', 'division-results')
+        assert expected in result.stdout, result
+    p.call('check', 'division.ddr', '--const-div-opt=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -385,7 +415,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, isolated_tests, filesystem]
+             compiler_profile_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:

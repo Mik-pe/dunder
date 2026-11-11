@@ -12,6 +12,7 @@ python3 tools/test-diagnostics.py "$compiler"
 python3 tools/test-check.py "$compiler"
 python3 tools/test-optimizer.py "$compiler" --verify-selection
 python3 tools/test-opt-emitter.py "$compiler"
+python3 tools/test-const-div.py "$compiler" --verify-selection
 python3 tools/test-machine-ir.py "$compiler"
 python3 tools/test-ownership-leases.py "$compiler"
 python3 tools/test-tabell.py "$compiler"
