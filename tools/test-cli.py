@@ -415,6 +415,55 @@ def whole_function_mir_controls(p):
     p.call('check', 'mir.ddr', '--mir=unknown', status=2)
 
 
+def whole_function_optimizer_controls(p):
+    p.write('promotion.ddr', 'fn step(x:i32)->i32{x*3+1}\n'
+            'fn main(){var value:i32=1;for i in 0..8{value=step(value)};print(value)}\n')
+    work = ('optimized', 'promoted', 'removed_loads', 'removed_stores',
+            'analysis_units', 'budget_refusals')
+    for mode in ('off', 'on'):
+        result = p.call('run', 'promotion.ddr', '--inline-opt=off', '--mir-opt=' + mode,
+                        '--timings=json', '-o', 'promotion-' + mode)
+        assert result.stdout == '9841\n', result
+        backend = json.loads(result.stderr)['mir']
+        assert backend['enabled'] and backend['optimization_enabled'] is (mode == 'on'), backend
+        assert all(type(backend[key]) is int and backend[key] >= 0 for key in work), backend
+        if mode == 'off':
+            assert all(backend[key] == 0 for key in work), backend
+        else:
+            assert all(backend[key] > 0 for key in work if key != 'budget_refusals'), backend
+    plain = p.call('check', 'promotion.ddr', '--agent', '--mir-opt=off')
+    checked = p.call('check', 'promotion.ddr', '--agent', '--mir-opt=on', '--timings=json')
+    assert checked.stdout == plain.stdout and plain.stderr == ''
+    backend = json.loads(checked.stderr)['mir']
+    assert not backend['enabled'] and not backend['optimization_enabled']
+    assert all(backend[key] == 0 for key in work), backend
+    disabled = p.call('build', 'promotion.ddr', '--mir=off', '--mir-opt=on',
+                      '--timings=json', '-o', 'promotion-disabled')
+    backend = json.loads(disabled.stderr)['mir']
+    assert not backend['enabled'] and not backend['optimization_enabled']
+    assert all(backend[key] == 0 for key in work), backend
+    for mode, reused in (('on', 0), ('on', 2), ('off', 0), ('off', 2), ('on', 2)):
+        result = p.call('build', 'promotion.ddr', '--mir-opt=' + mode, '--inline-opt=off',
+                        '--incremental', '--timings=json', '-o', 'promotion-cached')
+        report = json.loads(result.stderr)
+        assert report['functions'] == {'reused': reused, 'emitted': 2 - reused}, report
+        backend = report['mir']
+        assert backend['optimization_enabled'] is (mode == 'on'), backend
+        if mode == 'off' or reused == 2:
+            assert all(backend[key] == 0 for key in work), backend
+        else:
+            assert backend['optimized'] > 0 and backend['promoted'] > 0, backend
+        assert p.call('run', 'promotion.ddr', '--mir-opt=' + mode, '--inline-opt=off',
+                      '--incremental', '-o', 'promotion-cached').stdout == '9841\n'
+    p.write('promotion-tests.ddr', '@test fn works(){true}\n')
+    for mode, expected in (('off', '1 passed'), ('off', '1 unaffected'),
+                           ('on', '1 passed'), ('on', '1 unaffected'), ('off', '1 passed')):
+        result = p.call('test', 'promotion-tests.ddr', '--mir-opt=' + mode,
+                        '--affected', '-o', 'promotion-results')
+        assert expected in result.stdout, result
+    p.call('check', 'promotion.ddr', '--mir-opt=unknown', status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -602,7 +651,7 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, whole_function_mir_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
+             compiler_profile_controls, whole_function_mir_controls, whole_function_optimizer_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:

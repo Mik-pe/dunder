@@ -398,12 +398,17 @@ def fixture_source(name, source_root, work):
 
 def decode_consumer(output):
     lines = output.splitlines()
-    assert lines[0] == 'MIR' and lines[4] == 'BINDINGS', output
+    assert lines[0] == 'MIR' and lines[4] == 'OPT' and lines[12] == 'BINDINGS', output
     counters = dict(zip(('functions', 'operations', 'opaque'), map(int, lines[1:4])))
     assert all(value >= 0 for value in counters.values()), counters
-    count = int(lines[5]); assert count >= 0 and len(lines) == 6 + 3 * count, output
-    bindings = [(int(lines[i]), lines[i + 1], lines[i + 2]) for i in range(6, len(lines), 3)]
-    return dict(mir=counters, bindings=bindings)
+    assert lines[5] in ('true', 'false'), output
+    optimization = dict(zip(('optimized', 'promoted', 'removed_loads', 'removed_stores',
+                             'analysis_units', 'budget_refusals'), map(int, lines[6:12])))
+    assert all(value >= 0 for value in optimization.values()), optimization
+    optimization['enabled'] = lines[5] == 'true'
+    count = int(lines[13]); assert count >= 0 and len(lines) == 14 + 3 * count, output
+    bindings = [(int(lines[i]), lines[i + 1], lines[i + 2]) for i in range(14, len(lines), 3)]
+    return dict(mir=counters, optimization=optimization, bindings=bindings)
 
 
 def main():
@@ -556,13 +561,17 @@ def main():
                     else:
                         functions = len(re.findall(r'\bfn\s+\w+', source))
                         assert report['mir']['functions'] == functions and report['mir']['operations'] > 0, (name, target, functions, report)
+                    opt = report['optimization']
+                    assert opt['enabled'] is (mode == 'opt' and not checking), report
+                    if mode != 'opt' or checking: assert not any(opt.values()), report
+                    counts['source_optimized_functions'] += opt['optimized']
                     return image, report
 
                 for name, (source, output, status) in valid.items():
                     for target in range(4):
                         reports = []
                         images = []
-                        for mode in ('off', 'on'):
+                        for mode in ('off', 'on', 'opt'):
                             image, report = build(name, source, target, mode)
                             execute(image, target, output, status)
                             digest = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -570,7 +579,7 @@ def main():
                                 native_status=status, target=TARGETS[target], mode=mode, sha256=digest, **report))
                             reports.append(report); images.append(digest)
                             counts['source_images'] += 1
-                        assert reports[0]['bindings'] == reports[1]['bindings'], (name, target, 'bindings changed')
+                        assert reports[0]['bindings'] == reports[1]['bindings'] == reports[2]['bindings'], (name, target, 'bindings changed')
                         assert images[0] == images[1], (name, target, 'passthrough bytes changed')
                     print('PASS whole source off/on', name, flush=True)
                 for index, source in enumerate(invalid):
@@ -578,11 +587,14 @@ def main():
                         for checking in (False, True):
                             _, before = build(f'invalid-{index}', source, target, 'off', checking, True)
                             _, after = build(f'invalid-{index}', source, target, 'on', checking, True)
-                            assert before == after, (index, target, checking, before, after)
+                            _, optimized = build(f'invalid-{index}', source, target, 'opt', checking, True)
+                            assert before == after == optimized, (index, target, checking, before, after, optimized)
                 for target in range(4):
                     _, before = build('valid-check', valid['mixed-calls-loop'][0], target, 'off', True)
                     _, after = build('valid-check', valid['mixed-calls-loop'][0], target, 'on', True)
-                    assert before['bindings'] == after['bindings']
+                    _, optimized = build('valid-check', valid['mixed-calls-loop'][0], target, 'opt', True)
+                    assert before['bindings'] == after['bindings'] == optimized['bindings']
+                assert counts['source_optimized_functions'] > 0, 'source pass was never activated'
                 counts['valid_source_cases'] = len(valid)
                 counts['invalid_source_cases'] = len(invalid)
                 print('PASS exact source reports, invalid diagnostics and check-only image preservation', flush=True)
