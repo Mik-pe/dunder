@@ -464,6 +464,164 @@ def whole_function_optimizer_controls(p):
     p.call('check', 'promotion.ddr', '--mir-opt=unknown', status=2)
 
 
+
+def mir_integer_output(p, name, target, expected):
+    native = ('arm64-macos' if sys.platform == 'darwin' else
+              'arm64-linux' if os.uname().machine in ('arm64', 'aarch64') else 'x86_64-linux')
+    if target == 'wasm32':
+        script = ("const fs=require('node:fs');const print=x=>console.log(x.toString());"
+                  "const {exports:p}=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),"
+                  "{dunder:{print_i32:print,print_i64:print,print_bool:x=>console.log(Boolean(x))}});"
+                  "process.exitCode=Number(p.main()||0)")
+        command = ['node', '-e', script, p.root/name]
+    elif target == native:
+        command = [p.root/name]
+    else:
+        return
+    run = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert run.returncode == 0 and run.stdout == expected and not run.stderr, run
+
+
+def whole_function_memory_controls(p):
+    # Owned []i64 keeps the real source function in whole-function MIR. The
+    # explicit i32 iterator and disabled inlining/value pass isolate memory.
+    function = ('fn inspect(values:[]i64,n:i32)->i64{var total:i64=0;var i:i32=0;'
+                'while i<n{total=total+values[i];i=i+1};total}\n')
+    p.write('memory.ddr', function + 'fn main(){a:[]i64=[2,4,6];print(inspect(a,3))}\n')
+    flags = ('--inline-opt=off', '--mir-values=off')
+    work = ('private_memory_ops', 'optimized', 'promoted', 'removed_loads',
+            'removed_stores', 'analysis_units', 'budget_refusals')
+    native = 'arm64-macos' if sys.platform == 'darwin' else ('arm64-linux' if os.uname().machine in ('arm64', 'aarch64') else 'x86_64-linux')
+    for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32'):
+        for mode in ('off', 'on'):
+            name = f'memory-{target}-{mode}'
+            result = p.call('build', 'memory.ddr', '--target', target, '--mir-memory=' + mode,
+                            *flags, '--timings=json', '-o', name)
+            backend = json.loads(result.stderr)['mir']
+            assert backend['enabled'] and backend['optimization_enabled']
+            assert backend['source_objects_enabled'] is (mode == 'on') and not backend['values_enabled'], backend
+            assert all(type(backend[key]) is int and backend[key] >= 0 for key in work), backend
+            if mode == 'on':
+                assert all(backend[key] > 0 for key in ('private_memory_ops', 'promoted', 'removed_loads', 'removed_stores')), backend
+            else:
+                assert backend['private_memory_ops'] == 0, backend
+            mir_integer_output(p, name, target, '12\n')
+        assert (p.root/f'memory-{target}-off').read_bytes() != (p.root/f'memory-{target}-on').read_bytes()
+    default = p.call('build', 'memory.ddr', *flags, '--timings=json', '-o', 'memory-default')
+    assert json.loads(default.stderr)['mir']['source_objects_enabled']
+    assert (p.root/'memory-default').read_bytes() == (p.root/f'memory-{native}-on').read_bytes()
+    plain = p.call('check', 'memory.ddr', '--agent', '--mir-memory=off', *flags)
+    checked = p.call('check', 'memory.ddr', '--agent', '--mir-memory=on', *flags, '--timings=json')
+    assert checked.stdout == plain.stdout and plain.stderr == ''
+    backend = json.loads(checked.stderr)['mir']
+    assert not backend['enabled'] and not backend['optimization_enabled'] and not backend['source_objects_enabled']
+    assert all(backend[key] == 0 for key in work), backend
+    for disabled in ('--mir=off', '--mir-opt=off'):
+        result = p.call('build', 'memory.ddr', '--mir-memory=on', disabled, *flags,
+                        '--timings=json', '-o', 'memory-disabled')
+        backend = json.loads(result.stderr)['mir']
+        assert not backend['optimization_enabled'] and not backend['source_objects_enabled']
+        assert all(backend[key] == 0 for key in work), backend
+    # Cold/warm policy namespaces must not consume each other's fragments;
+    # cached work counters describe work now, not work saved in the fragment.
+    for mode, reused in (('off', 0), ('off', 2), ('on', 0), ('on', 2), ('off', 2)):
+        result = p.call('build', 'memory.ddr', '--mir-memory=' + mode, *flags,
+                        '--incremental', '--timings=json', '-o', 'memory-cached')
+        report = json.loads(result.stderr); backend = report['mir']
+        assert report['functions'] == {'reused': reused, 'emitted': 2 - reused}, report
+        assert backend['source_objects_enabled'] is (mode == 'on')
+        if reused == 2:
+            assert backend['functions'] == backend['operations'] == 0
+            assert all(backend[key] == 0 for key in work), backend
+        elif mode == 'on':
+            assert backend['private_memory_ops'] > 0, backend
+        else:
+            assert backend['private_memory_ops'] == 0, backend
+        assert (p.root/'memory-cached').read_bytes() == (p.root/f'memory-{native}-{mode}').read_bytes()
+        mir_integer_output(p, 'memory-cached', native, '12\n')
+    p.write('memory-tests.ddr', function + '@test fn works(){a:[]i64=[2,4,6];inspect(a,3)==12}\n')
+    receipts = {}
+    for mode, expected in (('off', '1 passed'), ('off', '1 unaffected'),
+                           ('on', '1 passed'), ('on', '1 unaffected'), ('off', '1 passed')):
+        result = p.call('test', 'memory-tests.ddr', '--mir-memory=' + mode, *flags,
+                        '--affected', '-o', 'memory-results')
+        assert expected in result.stdout, result
+        saved = list((p.root/'memory-results/.affected').glob('*.pass'))
+        assert len(saved) == 1
+        digest = saved[0].read_bytes()
+        if mode in receipts:
+            assert digest == receipts[mode]
+        receipts[mode] = digest
+    assert receipts['off'] != receipts['on']
+    p.call('check', 'memory.ddr', '--mir-memory=unknown', *flags, status=2)
+
+
+def whole_function_value_controls(p):
+    # Normal returns and copies exercise value propagation without the checked
+    # arithmetic/external-exit refusal paths or private-memory optimization.
+    function = 'fn copies(x:i64)->i64{a:=x;b:=a;b}\n'
+    p.write('values.ddr', function + 'fn main(){print(copies(42))}\n')
+    flags = ('--inline-opt=off', '--mir-memory=off')
+    work = ('values_optimized', 'value_rewrites', 'value_deleted', 'value_immediates',
+            'value_analysis_units', 'value_budget_refusals')
+    native = 'arm64-macos' if sys.platform == 'darwin' else ('arm64-linux' if os.uname().machine in ('arm64', 'aarch64') else 'x86_64-linux')
+    for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32'):
+        for mode in ('off', 'on'):
+            name = f'values-{target}-{mode}'
+            result = p.call('build', 'values.ddr', '--target', target, '--mir-values=' + mode,
+                            *flags, '--timings=json', '-o', name)
+            backend = json.loads(result.stderr)['mir']
+            assert backend['enabled'] and backend['optimization_enabled'] and not backend['source_objects_enabled']
+            assert backend['values_enabled'] is (mode == 'on') and backend['private_memory_ops'] == 0, backend
+            assert all(type(backend[key]) is int and backend[key] >= 0 for key in work), backend
+            if mode == 'on':
+                assert backend['values_optimized'] > 0 and backend['value_rewrites'] > 0, backend
+                assert backend['value_deleted'] + backend['value_immediates'] > 0 and backend['value_analysis_units'] > 0, backend
+            else:
+                assert all(backend[key] == 0 for key in work), backend
+            mir_integer_output(p, name, target, '42\n')
+        assert (p.root/f'values-{target}-off').read_bytes() != (p.root/f'values-{target}-on').read_bytes()
+    plain = p.call('check', 'values.ddr', '--agent', '--mir-values=off', *flags)
+    checked = p.call('check', 'values.ddr', '--agent', '--mir-values=on', *flags, '--timings=json')
+    assert checked.stdout == plain.stdout and plain.stderr == ''
+    backend = json.loads(checked.stderr)['mir']
+    assert not backend['enabled'] and not backend['optimization_enabled'] and not backend['values_enabled']
+    assert all(backend[key] == 0 for key in work), backend
+    for disabled in ('--mir=off', '--mir-opt=off'):
+        result = p.call('build', 'values.ddr', '--mir-values=on', disabled, *flags,
+                        '--timings=json', '-o', 'values-disabled')
+        backend = json.loads(result.stderr)['mir']
+        assert not backend['optimization_enabled'] and not backend['values_enabled']
+        assert all(backend[key] == 0 for key in work), backend
+    for mode, reused in (('off', 0), ('off', 2), ('on', 0), ('on', 2), ('off', 2)):
+        result = p.call('build', 'values.ddr', '--mir-values=' + mode, *flags,
+                        '--incremental', '--timings=json', '-o', 'values-cached')
+        report = json.loads(result.stderr); backend = report['mir']
+        assert report['functions'] == {'reused': reused, 'emitted': 2 - reused}, report
+        assert backend['values_enabled'] is (mode == 'on')
+        if mode == 'off' or reused == 2:
+            assert all(backend[key] == 0 for key in work), backend
+        else:
+            assert backend['values_optimized'] > 0 and backend['value_rewrites'] > 0, backend
+        assert (p.root/'values-cached').read_bytes() == (p.root/f'values-{native}-{mode}').read_bytes()
+        mir_integer_output(p, 'values-cached', native, '42\n')
+    p.write('values-tests.ddr', function + '@test fn works(){copies(42)==42}\n')
+    receipts = {}
+    for mode, expected in (('off', '1 passed'), ('off', '1 unaffected'),
+                           ('on', '1 passed'), ('on', '1 unaffected'), ('off', '1 passed')):
+        result = p.call('test', 'values-tests.ddr', '--mir-values=' + mode, *flags,
+                        '--affected', '-o', 'values-results')
+        assert expected in result.stdout, result
+        saved = list((p.root/'values-results/.affected').glob('*.pass'))
+        assert len(saved) == 1
+        digest = saved[0].read_bytes()
+        if mode in receipts:
+            assert digest == receipts[mode]
+        receipts[mode] = digest
+    assert receipts['off'] != receipts['on']
+    p.call('check', 'values.ddr', '--mir-values=unknown', *flags, status=2)
+
+
 def compiler_profile_controls(p):
     p.write('profile.ddr', 'fn step(x:i64)->i64{x*3+1}\n'
             'fn main(){var sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n')
@@ -651,7 +809,8 @@ def main():
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
     cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
-             compiler_profile_controls, whole_function_mir_controls, whole_function_optimizer_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
+             compiler_profile_controls, whole_function_mir_controls, whole_function_optimizer_controls,
+             whole_function_memory_controls, whole_function_value_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
         cases.append(mac_bundle)
     for case in cases:
