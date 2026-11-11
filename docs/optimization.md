@@ -28,6 +28,20 @@ strukturerad modell, SSA och lägre funktionsrepresentation ska styras av
 bevisbehov och uppmätt total byggtid. Snabb kompilering är kravet; att undvika
 en viss representation är inget eget mål.
 
+Nodkolumnerna ligger i en separat `Nodes`-arena som ägs av `Function`.
+Verifiering, pass och registerallokering använder samma index och metadata.
+Uttrycks- och villkorsemission lånar arenan direkt och kan därför även
+användas i en befintlig anroparframe. `Plan.frame_slots` är tom för den
+vanliga identitetsplaceringen; en explicit karta placerar annars varje
+spill i anroparens slot. Hela funktioner kräver identitetsplacering.
+
+`emit_expression` avger bara uttrycket och lämnar resultatet i x0.
+Anroparen ansvarar för verifierad modell, färdigutvärderade argument,
+typnormaliserade registervärden och initialiserade arraycacher. Den vägen
+skapar ingen funktionsframe eller retur och kontrollerar att emissionen
+saknar anrop. Detta är en byggsten för inlining; deklarationskatalog och
+aktivering av inlining är ännu inte del av standardbygget.
+
 [Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
 operatorprioritet och kontextuell bredd på signerade heltalsliteraler.
@@ -92,7 +106,7 @@ detta inför ingen separat direkt backend för dem.
 `--scalar-opt=off` stänger av den nya modellen, passet och registervägen
 för jämförelse och felsökning. Tidigare lokala kodgenereringsförbättringar
 är fortfarande aktiva. `--timings=json` visar antal modellerade och
-emitterade funktioner, omskrivningar, bevisade indexläsningar och
+emitterade funktioner, omskrivningar, bevisade indexläsningar/skrivningar och
 parseråterfall. Avvisade signaturer och cacheträffar ingår inte i
 återfallsräknaren. Funktionscache och `test --affected` skiljer lägena åt;
 CLI-cachen behåller varma fragment separat för båda lägena.

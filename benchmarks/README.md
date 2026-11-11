@@ -20,6 +20,10 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Gemensam nodarena, 2026-11-11](2026-11-11-typed-nodes/README.md)
+förbereder delad uttrycksemission och inlining. Byggkostnaden mäts separat;
+utbilderna är byteidentiska och genererat bygges median ökar cirka två procent.
+
 [Intervallbevis och arrayinvarianter, 2026-11-11](2026-11-11-range-proofs/README.md)
 förbättrar generell sortering med cirka elva procent. Rapporten visar även
 byggkostnad, sämre p95, oberoende modellprov och separata fasobservationer.
