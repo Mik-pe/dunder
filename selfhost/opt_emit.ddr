@@ -4,8 +4,118 @@ import opt_ir as ir
 import opt_alloc as alloc
 import const_div
 
+pub struct Options { const_div_enabled: bool, frame_free_enabled: bool }
+pub fn options() -> Options { Options { const_div_enabled: true, frame_free_enabled: true } }
 struct State { overflow: i32, zero: i32, bounds: i32, exit: i32, heads: []i32, ends: []i32,
     const_div_enabled: bool, division: const_div.Plan }
+fn register_home(reg: i32) -> bool { (reg >= 4 && reg <= 7) || (reg >= 10 && reg <= 17) }
+fn allocated(plan: &alloc.Plan, local: i32) -> bool {
+    local >= 0 && local < plan.homes.len && plan.first[local] >= 0 && register_home(plan.homes[local])
+}
+fn frame_free(f: &ir.Function, plan: &alloc.Plan, platform: i32) -> bool {
+    // Native ARM leaf functions can keep the caller's FP/LR untouched. The
+    // x86 register-bank and Wasm CFG lowerings retain their existing frames.
+    // AAPCS64 6.4.6 and Apple's ARM64 ABI both permit leaf-frame omission:
+    // https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
+    // https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+    if platform != 0 && platform != 1 { return false }
+    if f.params < 0 || f.params > 8 || f.params > f.local_types.len || plan.first.len != plan.homes.len { return false }
+    var parameter_homes: i32 = 0
+    for local in 0..f.local_types.len {
+        if f.local_types[local] < 1 || f.local_types[local] > 3 { return false }
+        if local < f.params {
+            if f.local_param[local] != local { return false }
+            if plan.first[local] >= 0 {
+                if !allocated(&plan, local) { return false }
+                mask := i32(1).shl(plan.homes[local])
+                if parameter_homes.bit_and(mask) != 0 { return false }
+                parameter_homes = parameter_homes.bit_or(mask)
+            }
+        } else if f.local_param[local] != -1 { return false }
+    }
+    // Include synthetic counted-loop limits as well as source locals. Unused
+    // parameters need no home, but an actual read/write may never use FP.
+    for local in 0..plan.homes.len { if plan.first[local] >= 0 && !register_home(plan.homes[local]) { return false } }
+    for node in 0..f.kinds.len {
+        kind := f.kinds[node]
+        if kind == 2 || kind == 11 || kind == 12 || kind == 19 {
+            if !allocated(&plan, f.locals[node]) { return false }
+        }
+        if kind == 19 { if !allocated(&plan, plan.limits[node]) { return false } }
+        else if kind == 3 { if f.values[node] < 1 || f.values[node] > 13 { return false } }
+        else if kind == 4 { if f.values[node] != 1 && f.values[node] != 2 { return false } }
+        else if kind != 1 && kind != 2 && (kind < 10 || kind > 17) { return false }
+    }
+    true
+}
+fn packed_reg(registers: i64, at: i32) -> i32 { i32(registers.shr(at * 5).bit_and(31)) }
+fn with_packed_reg(registers: i64, at: i32, reg: i32) -> i64 {
+    // Eight architectural register IDs need 8*5 bits, fitting one i64.
+    shift := at * 5; mask := i64(31).shl(shift)
+    registers.bit_and(mask.bit_not()).bit_or(i64(reg).shl(shift))
+}
+// At most eight parallel register copies, encoded without heap arrays. An
+// overwrite is safe once no remaining source needs the old destination.
+// Breaking a cycle saves that old value in reserved x8; replacing every use
+// of it makes at least one copy ready. x8 cannot be a local destination.
+fn parallel_moves(code: &mut arm.Code, sources: i64, destinations: i64, count: i32) {
+    assert(count >= 0 && count <= 8)
+    assert(sources.shr(count * 5) == 0 && destinations.shr(count * 5) == 0)
+    var written: i32 = 0
+    for i in 0..count {
+        source := packed_reg(sources, i); destination := packed_reg(destinations, i)
+        assert(source >= 0 && source <= 7 && register_home(destination))
+        bit := i32(1).shl(destination)
+        assert(written.bit_and(bit) == 0); written = written.bit_or(bit)
+    }
+    var pending := i32(1).shl(count) - 1
+    var reads := sources
+    var budget := count * 2
+    for i in 0..count { if packed_reg(reads, i) == packed_reg(destinations, i) { pending = pending.bit_xor(i32(1).shl(i)) } }
+    while pending != 0 {
+        assert(budget > 0); budget = budget - 1
+        var progress := false
+        for i in 0..count {
+            bit := i32(1).shl(i)
+            if pending.bit_and(bit) == 0 { continue }
+            destination := packed_reg(destinations, i)
+            var needed := false
+            for j in 0..count { if pending.bit_and(i32(1).shl(j)) != 0 && packed_reg(reads, j) == destination { needed = true } }
+            if !needed {
+                arm.mov(&mut code, destination, packed_reg(reads, i))
+                pending = pending.bit_xor(bit); progress = true
+            }
+        }
+        if progress { continue }
+        // If an earlier saved value were still needed, its acyclic component
+        // would have made progress. Never overwrite a live scratch value.
+        for i in 0..count { if pending.bit_and(i32(1).shl(i)) != 0 { assert(packed_reg(reads, i) != 8) } }
+        var first := 0
+        while pending.bit_and(i32(1).shl(first)) == 0 { first = first + 1 }
+        saved := packed_reg(destinations, first); arm.mov(&mut code, 8, saved)
+        for i in 0..count {
+            if pending.bit_and(i32(1).shl(i)) != 0 && packed_reg(reads, i) == saved {
+                reads = with_packed_reg(reads, i, 8)
+            }
+        }
+    }
+}
+fn register_parameters(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan) {
+    var sources: i64 = 0; var destinations: i64 = 0; var count := 0
+    for local in 0..f.params {
+        if plan.first[local] < 0 { continue }
+        sources = with_packed_reg(sources, count, f.local_param[local])
+        destinations = with_packed_reg(destinations, count, plan.homes[local]); count = count + 1
+    }
+    parallel_moves(&mut code, sources, destinations, count)
+    // Normalize only after all incoming values have reached their homes: an
+    // in-place SXTW could otherwise destroy a still-pending 64-bit argument.
+    for local in 0..f.params {
+        if plan.first[local] >= 0 && f.local_types[local] == 1 {
+            reg := plan.homes[local]; arm.emit(&mut code, 2470476800 + i64(reg) * 33)
+        }
+    }
+}
 fn load_frame(code: &mut arm.Code, slot: i32, reg: i32) {
     if slot < 32 { arm.emit(&mut code, 4164944800 + i64(-(slot + 1) * 8).bit_and(511) * 4096 + i64(reg)); return }
     if slot < 511 { arm.emit(&mut code, 3506439081 + i64(slot + 1) * 8192) }
@@ -216,6 +326,11 @@ pub fn emit_options(code: &mut arm.Code, f: &ir.Function, entry: i32, overflow: 
     alloc.allocate_into(&mut plan, &f)
     emit_prepared_options(&mut code, &f, &plan, entry, overflow, zero, bounds, const_div_enabled)
 }
+pub fn emit_configured(code: &mut arm.Code, f: &ir.Function, entry: i32, overflow: i32, zero: i32, bounds: i32, settings: &Options) {
+    assert(f.supported && f.root >= 0 && f.params <= 8)
+    var plan := alloc.new(); alloc.allocate_into(&mut plan, &f)
+    emit_prepared_configured(&mut code, &f, &plan, entry, overflow, zero, bounds, &settings)
+}
 // The caller may retain and rebuild one allocation workspace across functions.
 // Emission only borrows the completed plan; no array or Plan value is copied.
 // Timing/profiling belongs to the caller, keeping this module portable.
@@ -225,20 +340,36 @@ pub fn emit_prepared(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan,
 }
 pub fn emit_prepared_options(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan,
     entry: i32, overflow: i32, zero: i32, bounds: i32, const_div_enabled: bool) {
+    emit_body(&mut code, &f, &plan, entry, overflow, zero, bounds, const_div_enabled, true)
+}
+pub fn emit_prepared_configured(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan,
+    entry: i32, overflow: i32, zero: i32, bounds: i32, settings: &Options) {
+    emit_body(&mut code, &f, &plan, entry, overflow, zero, bounds, settings.const_div_enabled, settings.frame_free_enabled)
+}
+// Keep scalar switches borrowed or primitive: old wrappers introduce no new
+// Options allocation per function, and callers can reuse one Options value.
+fn emit_body(code: &mut arm.Code, f: &ir.Function, plan: &alloc.Plan,
+    entry: i32, overflow: i32, zero: i32, bounds: i32, const_div_enabled: bool, frame_free_enabled: bool) {
     assert(f.supported && f.root >= 0 && f.params <= 8)
     assert(plan.homes.len >= f.local_types.len && plan.data.len == f.local_types.len && plan.length.len == f.local_types.len)
     assert(plan.limits.len == f.kinds.len && plan.loop_end.len == f.kinds.len)
     var s := State { overflow: overflow, zero: zero, bounds: bounds, exit: arm.label(&mut code), heads: [], ends: [],
         const_div_enabled: const_div_enabled, division: const_div.new() }
-    arm.mark(&mut code, entry); frame := arm.prologue(&mut code); arm.frame(&mut code, frame, plan.homes.len)
-    // Stage every argument before writing x4..7 local homes. This handles the
-    // full parallel-copy problem, including eight overlapping incoming args.
-    for local in 0..f.local_types.len { if f.local_param[local] >= 0 { arm.store(&mut code, local, f.local_param[local]) } }
-    for local in 0..f.local_types.len {
-        if f.local_param[local] < 0 { continue }
-        load_frame(&mut code, local, 0)
-        if f.local_types[local] == 1 { arm.emit(&mut code, 2470476800) }
-        write(&mut code, &plan, local, 0)
+    frameless := frame_free_enabled && frame_free(&f, &plan, code.platform)
+    arm.mark(&mut code, entry)
+    var leaf_epoch: i64 = -1
+    if frameless { leaf_epoch = arm.begin_effects(&mut code) }
+    if frameless { register_parameters(&mut code, &f, &plan) }
+    else {
+        frame := arm.prologue(&mut code); arm.frame(&mut code, frame, plan.homes.len)
+        // All other functions retain frame staging, including arrays/spills.
+        for local in 0..f.local_types.len { if f.local_param[local] >= 0 { arm.store(&mut code, local, f.local_param[local]) } }
+        for local in 0..f.local_types.len {
+            if f.local_param[local] < 0 { continue }
+            load_frame(&mut code, local, 0)
+            if f.local_types[local] == 1 { arm.emit(&mut code, 2470476800) }
+            write(&mut code, &plan, local, 0)
+        }
     }
     for local in 0..f.local_types.len {
         if !ir.array_type(f.local_types[local]) { continue }
@@ -250,5 +381,76 @@ pub fn emit_prepared_options(code: &mut arm.Code, f: &ir.Function, plan: &alloc.
         if plan.first[data] >= 0 { arm.emit(&mut code, 4181721089); write(&mut code, &plan, data, 1) }
     }
     statement(&mut code, &mut s, &plan, &f, f.root)
-    arm.imm(&mut code, 0, 0); arm.mark(&mut code, s.exit); arm.ret(&mut code)
+    arm.imm(&mut code, 0, 0); arm.mark(&mut code, s.exit)
+    if frameless {
+        arm.emit(&mut code, 3596551104)
+        // A future lowering that introduces a runtime call must not silently
+        // return through an overwritten LR. Unknown IR nodes already refuse
+        // the optimization; this checks the actual emitted call vocabulary.
+        assert(arm.end_effects(&mut code, leaf_epoch))
+    } else { arm.ret(&mut code) }
+}
+fn move_symbol(reg: i32) -> i64 { i64(reg).wrapping_mul(4294967297).wrapping_add(7) }
+fn verify_moves(code: &mut arm.Code, registers: &mut []i64, sources: &[]i32, destinations: &[]i32) {
+    assert(sources.len == destinations.len)
+    var packed_sources: i64 = 0; var packed_destinations: i64 = 0
+    for i in 0..sources.len {
+        packed_sources = with_packed_reg(packed_sources, i, sources[i])
+        packed_destinations = with_packed_reg(packed_destinations, i, destinations[i])
+    }
+    code.words.clear()
+    parallel_moves(&mut code, packed_sources, packed_destinations, sources.len)
+    for reg in 0..32 { registers[reg] = move_symbol(reg) }
+    // Interpret the actually emitted MOV instructions, independently of the
+    // scheduler. Unique 64-bit symbols expose both overwrite and width bugs.
+    for word in code.words {
+        assert(word.bit_and(4292935648) == 2852127712)
+        destination := i32(word.bit_and(31)); source := i32(word.shr(16).bit_and(31))
+        assert(register_home(destination) || destination == 8)
+        registers[destination] = registers[source]
+    }
+    for i in 0..sources.len { assert(registers[destinations[i]] == move_symbol(sources[i])) }
+    for reg in 0..32 {
+        var destination := false
+        for written in destinations { if written == reg { destination = true } }
+        if !destination && reg != 8 { assert(registers[reg] == move_symbol(reg)) }
+    }
+}
+fn next_permutation(values: &mut []i32) -> bool {
+    var pivot := values.len - 2
+    while pivot >= 0 && values[pivot] >= values[pivot + 1] { pivot = pivot - 1 }
+    if pivot < 0 { return false }
+    var swap := values.len - 1
+    while values[swap] <= values[pivot] { swap = swap - 1 }
+    original := values[pivot]; values[pivot] = values[swap]; values[swap] = original
+    var low := pivot + 1; var high := values.len - 1
+    while low < high {
+        saved := values[low]; values[low] = values[high]; values[high] = saved
+        low = low + 1; high = high - 1
+    }
+    true
+}
+@test fn parameter_moves_symbolically_preserve_all_eight_argument_permutations() {
+    var code := arm.new(); var registers: []i64 = []
+    for reg in 0..32 { registers.push(0) }
+    sources: []i32 = [0, 1, 2, 3, 4, 5, 6, 7]
+    var destinations: []i32 = [4, 5, 6, 7, 10, 11, 12, 13]
+    var count := 0
+    while true {
+        verify_moves(&mut code, &mut registers, &sources, &destinations); count = count + 1
+        if !next_permutation(&mut destinations) { break }
+    }
+    assert(count == 40320)
+    // Sparse arguments, chains, independent cycles, identity and fanout.
+    for size in 0..5 {
+        var src: []i32 = []; var dst: []i32 = []
+        for i in 0..size { src.push(4 + i); dst.push(4 + i) }
+        verify_moves(&mut code, &mut registers, &src, &dst)
+    }
+    sparse_sources: []i32 = [0, 3, 6]; sparse_destinations: []i32 = [6, 4, 10]
+    verify_moves(&mut code, &mut registers, &sparse_sources, &sparse_destinations)
+    chain_sources: []i32 = [0, 4, 5, 6, 7]; chain_destinations: []i32 = [4, 5, 6, 7, 10]
+    verify_moves(&mut code, &mut registers, &chain_sources, &chain_destinations)
+    fanout_sources: []i32 = [4, 4, 5]; fanout_destinations: []i32 = [5, 10, 4]
+    verify_moves(&mut code, &mut registers, &fanout_sources, &fanout_destinations)
 }
