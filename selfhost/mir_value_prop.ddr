@@ -43,7 +43,8 @@ pub opaque struct Workspace {
     candidate: mir.Function, verifier: verify.Workspace, liveness: live.Workspace,
     undo_slots: []i32, undo_ops: []i32, undo_modes: []i32, undo_starts: []i32, undo_rows: []i64,
     before_verified: bool, before_optimizable: bool, action: i32, immediate: bool, restored: i32,
-    definitions: []i32,
+    definitions: []i32, physical: []i32, slots: []i32, physical_bits: []i64,
+    all_slots: i64, zr: i32, force_full: bool, fallback: bool,
     reached: []bool, queued: []bool, queue: []i32, pred_starts: []i32, pred_fill: []i32, predecessors: []i32,
     in_x: []i64, in_w: []i64, in_kx: []i32, in_vx: []i64, in_kw: []i32, in_vw: []i64, in_zero: []i64,
     out_x: []i64, out_w: []i64, out_kx: []i32, out_vx: []i64, out_kw: []i32, out_vw: []i64, out_zero: []i64,
@@ -51,16 +52,23 @@ pub opaque struct Workspace {
     state: i32, work: i32, limit: i32, rewrites: i32, deleted: i32, immediates: i32, iterations: i32,
 }
 fn candidate() -> mir.Function { var f := mir.new(); op := mir.add(&mut f, 1); f }
-pub fn new() -> Workspace {
+fn workspace(full: bool) -> Workspace {
     Workspace { candidate: candidate(), verifier: verify.new_work(), liveness: live.new(),
         undo_slots: [], undo_ops: [], undo_modes: [], undo_starts: [], undo_rows: [],
         before_verified: false, before_optimizable: false, action: 0, immediate: false, restored: 0,
-        definitions: [], reached: [], queued: [], queue: [], pred_starts: [], pred_fill: [], predecessors: [],
+        definitions: [], physical: [], slots: [], physical_bits: [], all_slots: 0, zr: 0, force_full: full, fallback: false, reached: [], queued: [], queue: [], pred_starts: [], pred_fill: [], predecessors: [],
         in_x: [], in_w: [], in_kx: [], in_vx: [], in_kw: [], in_vw: [], in_zero: [],
         out_x: [], out_w: [], out_kx: [], out_vx: [], out_kw: [], out_vw: [], out_zero: [],
         x: [], low: [], kx: [], vx: [], kw: [], vw: [], zero: 0,
         state: 0, work: 0, limit: 0, rewrites: 0, deleted: 0, immediates: 0, iterations: 0 }
 }
+pub fn new() -> Workspace { workspace(false) }
+// Conservative full domain for differential verification and explicit callers.
+// The production constructor always selects the function-local compact domain.
+pub fn new_full_domain() -> Workspace { workspace(true) }
+pub fn fact_slots(w: &Workspace) -> i32 { w.physical.len }
+pub fn fact_rows(w: &Workspace) -> i32 { w.in_x.len }
+pub fn used_full_fallback(w: &Workspace) -> bool { w.fallback }
 pub fn status(w: &Workspace) -> i32 { w.state }
 pub fn units(w: &Workspace) -> i32 { w.work }
 pub fn rewritten(w: &Workspace) -> i32 { if w.state > 0 { w.rewrites } else { 0 } }
@@ -74,7 +82,9 @@ fn charge(w: &mut Workspace, n: i32) -> bool {
 }
 fn reset(w: &mut Workspace, limit: i32) {
     w.undo_slots.clear(); w.undo_ops.clear(); w.undo_modes.clear(); w.undo_starts.clear(); w.undo_rows.clear()
-    w.action = 0; w.immediate = false; w.restored = 0; w.definitions.clear(); w.reached.clear(); w.queued.clear(); w.queue.clear()
+    w.action = 0; w.immediate = false; w.restored = 0; w.definitions.clear();
+    w.physical.clear(); w.slots.clear(); w.physical_bits.clear(); w.all_slots = 0; w.zr = 0; w.fallback = false
+    w.reached.clear(); w.queued.clear(); w.queue.clear()
     w.pred_starts.clear(); w.pred_fill.clear(); w.predecessors.clear()
     w.in_x.clear(); w.in_w.clear(); w.in_kx.clear(); w.in_vx.clear(); w.in_kw.clear(); w.in_vw.clear(); w.in_zero.clear()
     w.out_x.clear(); w.out_w.clear(); w.out_kx.clear(); w.out_vx.clear(); w.out_kw.clear(); w.out_vw.clear(); w.out_zero.clear()
@@ -82,30 +92,71 @@ fn reset(w: &mut Workspace, limit: i32) {
     w.state = 0; w.work = 0; w.limit = limit; w.rewrites = 0; w.deleted = 0; w.immediates = 0; w.iterations = 0
 }
 fn bit(reg: i32) -> i64 { i64(1).shl(reg) }
-fn index(reg: i32) -> i32 { if reg == -1 { 31 } else { reg } }
+// Compact-domain closure: only Const/Copy/MOVK create nontrivial value
+// facts. Include ALL GP roles of every live kind1..6, even unsupported scalar
+// forms, before replay. An omitted GP therefore cannot become a candidate
+// source, destination, or available alias. Implicit ABI masks do not add roles.
+// Physical31 is SP; operand-1 alone names the immutable synthetic ZR slot.
+// MAINTENANCE: this closure depends on transfer's current assign branches.
+// A new call-result/load/float fact producer must discover ALL of its GP
+// inputs/destinations here, or select the full domain BEFORE solve. Invalid-ID
+// fallback alone does not cover a new producer. Missing-slot guards may only
+// discard information conservatively; they must never create equivalence.
+fn include(w: &mut Workspace, reg: i32) {
+    if reg == -1 { return }
+    if reg < 0 || reg > 30 { w.fallback = true; return }
+    w.slots[reg] = -2
+}
+fn domain(w: &mut Workspace, f: &mir.Function) -> bool {
+    if !charge(&mut w, 128 + f.kinds.len * 4) { return false }
+    for reg in 0..31 { w.slots.push(-1) }
+    for op in 0..f.kinds.len {
+        if f.modes[op] == 2 || f.kinds[op] < 1 || f.kinds[op] > 6 { continue }
+        include(&mut w, f.dst[op]); include(&mut w, f.a[op]); include(&mut w, f.b[op]); include(&mut w, f.c[op])
+    }
+    for reg in 0..31 {
+        if w.force_full || w.fallback || w.slots[reg] == -2 {
+            slot := w.physical.len; w.slots[reg] = slot
+            w.physical.push(reg); w.physical_bits.push(mir.variable_bit(reg))
+        }
+    }
+    w.zr = w.physical.len; w.physical.push(-1); w.physical_bits.push(0)
+    w.all_slots = i64(1).shl(w.physical.len) - 1; true
+}
+fn index(w: &Workspace, reg: i32) -> i32 {
+    if reg == -1 { return w.zr }
+    if reg < 0 || reg > 30 { return -1 }; w.slots[reg]
+}
 fn top(w: &mut Workspace) {
-    w.zero = 4294967295
-    for r in 0..32 {
-        w.x[r] = 4294967295; w.low[r] = 4294967295; w.kx[r] = 2; w.vx[r] = 0; w.kw[r] = 2; w.vw[r] = 0
+    w.zero = w.all_slots
+    for r in 0..w.physical.len {
+        w.x[r] = w.all_slots; w.low[r] = w.all_slots; w.kx[r] = 2; w.vx[r] = 0; w.kw[r] = 2; w.vw[r] = 0
     }
 }
 fn entry(w: &mut Workspace) {
-    w.zero = bit(31)
-    for r in 0..32 { w.x[r] = bit(r); w.low[r] = bit(r); w.kx[r] = 0; w.vx[r] = 0; w.kw[r] = 0; w.vw[r] = 0 }
-    w.kx[31] = 1; w.kw[31] = 1
+    w.zero = bit(w.zr)
+    for r in 0..w.physical.len { w.x[r] = bit(r); w.low[r] = bit(r); w.kx[r] = 0; w.vx[r] = 0; w.kw[r] = 0; w.vw[r] = 0 }
+    w.kx[w.zr] = 1; w.kw[w.zr] = 1
 }
-fn kill(w: &mut Workspace, mask: i64) {
-    killed := mask.bit_and(2147483647); w.zero = w.zero.bit_and(killed.bit_not())
-    for r in 0..32 {
+fn invalidate(w: &mut Workspace, killed: i64) {
+    w.zero = w.zero.bit_and(killed.bit_not())
+    for r in 0..w.physical.len {
         if killed.bit_and(bit(r)) != 0 {
             w.x[r] = bit(r); w.low[r] = bit(r); w.kx[r] = 0; w.vx[r] = 0; w.kw[r] = 0; w.vw[r] = 0
         } else { w.x[r] = w.x[r].bit_and(killed.bit_not()); w.low[r] = w.low[r].bit_and(killed.bit_not()) }
     }
 }
+fn kill(w: &mut Workspace, physical_mask: i64) {
+    // Project the FULL physical mask, including implicit helpers/call defs.
+    // Never truncate physical bit positions to the compact slot count.
+    var killed: i64 = 0
+    for slot in 0..w.zr { if physical_mask.bit_and(w.physical_bits[slot]) != 0 { killed = killed.bit_or(bit(slot)) } }
+    invalidate(&mut w, killed)
+}
 fn assign(w: &mut Workspace, dst: i32, eqx: i64, eqw: i64, kx: i32, vx: i64, kw: i32, vw: i64, zero: bool) {
-    kill(&mut w, bit(dst)); flag := bit(dst)
+    invalidate(&mut w, bit(dst)); flag := bit(dst)
     var full := eqx.bit_or(flag); var low := eqw.bit_or(flag)
-    for r in 0..32 {
+    for r in 0..w.physical.len {
         if kx == 1 && w.kx[r] == 1 && w.vx[r] == vx { full = full.bit_or(bit(r)) }
         if kw == 1 && w.kw[r] == 1 && w.vw[r] == vw { low = low.bit_or(bit(r)) }
         if full.bit_and(bit(r)) != 0 { w.x[r] = w.x[r].bit_or(flag) }
@@ -115,14 +166,16 @@ fn assign(w: &mut Workspace, dst: i32, eqx: i64, eqw: i64, kx: i32, vx: i64, kw:
     if zero { w.zero = w.zero.bit_or(flag) }
 }
 fn transfer(w: &mut Workspace, f: &mir.Function, op: i32) {
+    // Every new assign-producing branch must preserve domain()'s closure.
     if f.modes[op] == 2 { return }
-    dst := f.dst[op]; kind := f.kinds[op]; ty := f.types[op]
-    if dst >= 0 && dst <= 30 && (kind == 1 || kind == 2) && (ty == 1 || ty == 2) {
+    physical_dst := f.dst[op]; dst := index(&w, physical_dst); kind := f.kinds[op]; ty := f.types[op]
+    if physical_dst >= 0 && physical_dst <= 30 && dst >= 0 && (kind == 1 || kind == 2) && (ty == 1 || ty == 2) &&
+        (kind != 2 || index(&w, f.a[op]) >= 0) {
         if kind == 1 {
             var value := f.imm[op]; if ty == 1 { value = value.bit_and(4294967295) }
             assign(&mut w, dst, 0, 0, 1, value, 1, value.bit_and(4294967295), value >= 0 && value <= 4294967295)
         } else {
-            source := index(f.a[op]); var eqx := w.x[source]; eqw := w.low[source]
+            source := index(&w, f.a[op]); var eqx := w.x[source]; eqw := w.low[source]
             var kx := w.kx[source]; var vx := w.vx[source]; kw := w.kw[source]; vw := w.vw[source]
             var zero := w.zero.bit_and(bit(source)) != 0
             if ty == 1 { eqx = eqw.bit_and(w.zero); kx = kw; vx = vw; zero = true }
@@ -132,9 +185,9 @@ fn transfer(w: &mut Workspace, f: &mir.Function, op: i32) {
     }
     // A constant's shared MOVZ/MOVK construction is an explicit bit insertion,
     // not an opaque arithmetic value number. Interpret only these known bits.
-    if dst >= 0 && dst <= 30 && kind == 3 && f.opcodes[op] == 3 && (ty == 1 || ty == 2) &&
-        f.a[op] >= -1 && f.a[op] <= 30 && f.aux[op] >= 0 && f.aux[op] < 64 {
-        source := index(f.a[op]); shift := f.aux[op]; mask := i64(65535).shl(shift)
+    if physical_dst >= 0 && physical_dst <= 30 && dst >= 0 && kind == 3 && f.opcodes[op] == 3 && (ty == 1 || ty == 2) &&
+        f.a[op] >= -1 && f.a[op] <= 30 && index(&w, f.a[op]) >= 0 && f.aux[op] >= 0 && f.aux[op] < 64 {
+        source := index(&w, f.a[op]); shift := f.aux[op]; mask := i64(65535).shl(shift)
         var kx := w.kx[source]; var vx := w.vx[source]; var kw := w.kw[source]; var vw := w.vw[source]
         if kx == 1 { vx = vx.bit_and(mask.bit_not()).bit_or(f.imm[op]) }
         if shift < 32 && kw == 1 { vw = vw.bit_and(mask.bit_not()).bit_or(f.imm[op]).bit_and(4294967295) }
@@ -146,12 +199,12 @@ fn transfer(w: &mut Workspace, f: &mir.Function, op: i32) {
     }
     kill(&mut w, f.writes[op].bit_or(f.clobbers[op]))
     // Only known GP W-writing operation contracts establish zero-extension.
-    if dst >= 0 && dst <= 30 && (ty == 1 || kind == 6) &&
+    if physical_dst >= 0 && physical_dst <= 30 && dst >= 0 && (ty == 1 || kind == 6) &&
         (kind == 3 || kind == 4 || kind == 6 || kind == 7) { w.zero = w.zero.bit_or(bit(dst)) }
 }
 fn load_in(w: &mut Workspace, block: i32) {
-    w.zero = w.in_zero[block]; base := block * 32
-    for r in 0..32 {
+    w.zero = w.in_zero[block]; base := block * w.physical.len
+    for r in 0..w.physical.len {
         w.x[r] = w.in_x[base + r]; w.low[r] = w.in_w[base + r]
         w.kx[r] = w.in_kx[base + r]; w.vx[r] = w.in_vx[base + r]; w.kw[r] = w.in_kw[base + r]; w.vw[r] = w.in_vw[base + r]
     }
@@ -159,8 +212,8 @@ fn load_in(w: &mut Workspace, block: i32) {
 fn meet(w: &mut Workspace, block: i32) {
     if block == 0 { entry(&mut w); return }; top(&mut w)
     for p in w.pred_starts[block]..w.pred_starts[block + 1] {
-        pred := w.predecessors[p]; base := pred * 32; w.zero = w.zero.bit_and(w.out_zero[pred])
-        for r in 0..32 {
+        pred := w.predecessors[p]; base := pred * w.physical.len; w.zero = w.zero.bit_and(w.out_zero[pred])
+        for r in 0..w.physical.len {
             w.x[r] = w.x[r].bit_and(w.out_x[base + r]); w.low[r] = w.low[r].bit_and(w.out_w[base + r])
             pk := w.out_kx[base + r]; pv := w.out_vx[base + r]
             if w.kx[r] == 2 { w.kx[r] = pk; w.vx[r] = pv }
@@ -172,15 +225,15 @@ fn meet(w: &mut Workspace, block: i32) {
     }
 }
 fn save_in(w: &mut Workspace, block: i32) {
-    w.in_zero[block] = w.zero; base := block * 32
-    for r in 0..32 {
+    w.in_zero[block] = w.zero; base := block * w.physical.len
+    for r in 0..w.physical.len {
         w.in_x[base + r] = w.x[r]; w.in_w[base + r] = w.low[r]
         w.in_kx[base + r] = w.kx[r]; w.in_vx[base + r] = w.vx[r]; w.in_kw[base + r] = w.kw[r]; w.in_vw[base + r] = w.vw[r]
     }
 }
 fn save_out(w: &mut Workspace, block: i32) -> bool {
-    var changed := w.out_zero[block] != w.zero; w.out_zero[block] = w.zero; base := block * 32
-    for r in 0..32 {
+    var changed := w.out_zero[block] != w.zero; w.out_zero[block] = w.zero; base := block * w.physical.len
+    for r in 0..w.physical.len {
         at := base + r
         if w.out_x[at] != w.x[r] || w.out_w[at] != w.low[r] || w.out_kx[at] != w.kx[r] || w.out_vx[at] != w.vx[r] ||
             w.out_kw[at] != w.kw[r] || w.out_vw[at] != w.vw[r] { changed = true }
@@ -191,19 +244,19 @@ fn save_out(w: &mut Workspace, block: i32) -> bool {
 }
 fn graph(w: &mut Workspace, f: &mir.Function) -> bool {
     blocks := f.block_starts.len
-    if !charge(&mut w, blocks * 386 + f.edge_to.len * 4 + f.kinds.len * 32) { return false }
-    for r in 0..32 {
+    if !charge(&mut w, w.physical.len * 7 + blocks * (w.physical.len * 12 + 2) + f.edge_to.len * 4 + f.kinds.len * w.zr) { return false }
+    for r in 0..w.physical.len {
         w.definitions.push(0); w.x.push(0); w.low.push(0); w.kx.push(0); w.vx.push(0); w.kw.push(0); w.vw.push(0)
     }
     for op in 0..f.kinds.len { if f.modes[op] != 2 {
         defs := f.writes[op].bit_or(f.clobbers[op])
-        for r in 0..31 { if defs.bit_and(bit(r)) != 0 { w.definitions[r] = w.definitions[r] + 1 } }
+        for r in 0..w.zr { if defs.bit_and(w.physical_bits[r]) != 0 { w.definitions[r] = w.definitions[r] + 1 } }
     } }
     for b in 0..blocks {
-        w.reached.push(false); w.queued.push(false); w.pred_fill.push(0); w.in_zero.push(4294967295); w.out_zero.push(4294967295)
-        for r in 0..32 {
-            w.in_x.push(4294967295); w.in_w.push(4294967295); w.in_kx.push(2); w.in_vx.push(0); w.in_kw.push(2); w.in_vw.push(0)
-            w.out_x.push(4294967295); w.out_w.push(4294967295); w.out_kx.push(2); w.out_vx.push(0); w.out_kw.push(2); w.out_vw.push(0)
+        w.reached.push(false); w.queued.push(false); w.pred_fill.push(0); w.in_zero.push(w.all_slots); w.out_zero.push(w.all_slots)
+        for r in 0..w.physical.len {
+            w.in_x.push(w.all_slots); w.in_w.push(w.all_slots); w.in_kx.push(2); w.in_vx.push(0); w.in_kw.push(2); w.in_vw.push(0)
+            w.out_x.push(w.all_slots); w.out_w.push(w.all_slots); w.out_kx.push(2); w.out_vx.push(0); w.out_kw.push(2); w.out_vw.push(0)
         }
     }
     w.reached[0] = true; w.queue.push(0); var next := 0
@@ -269,7 +322,7 @@ fn solve(w: &mut Workspace, f: &mir.Function) -> bool {
     var head := 0; var tail := pending % blocks
     while pending > 0 {
         b := w.queue[head]; head = (head + 1) % blocks; pending = pending - 1; w.queued[b] = false
-        cost := 800 + (w.pred_starts[b + 1] - w.pred_starts[b]) * 194 + (f.block_ends[b] - f.block_starts[b]) * 256
+        cost := w.physical.len * 24 + 32 + (w.pred_starts[b + 1] - w.pred_starts[b]) * (w.physical.len * 6 + 2) + (f.block_ends[b] - f.block_starts[b]) * (w.physical.len * 8)
         if !charge(&mut w, cost) { return false }; w.iterations = w.iterations + 1
         meet(&mut w, b); save_in(&mut w, b)
         for position in f.block_starts[b]..f.block_ends[b] { transfer(&mut w, &f, f.order[position]) }
@@ -407,22 +460,22 @@ fn commit_prepared(w: &mut Workspace, f: &mut mir.Function, op: i32) -> bool {
     if w.immediate { w.immediates = w.immediates + 1 }; true
 }
 fn alias(w: &Workspace, operand: i32, ty: i32) -> i32 {
-    if operand < 0 || operand > 30 { return operand }
-    var eq := w.x[operand]; if ty == 1 { eq = w.low[operand] }
-    if eq.bit_and(bit(31)) != 0 { return -1 }
-    var best := operand
-    for r in 0..31 {
+    source := index(&w, operand); if operand < 0 || source < 0 { return operand }
+    var eq := w.x[source]; if ty == 1 { eq = w.low[source] }
+    if eq.bit_and(bit(w.zr)) != 0 { return -1 }
+    var best := source
+    for r in 0..w.zr {
         if eq.bit_and(bit(r)) != 0 && (w.definitions[r] < w.definitions[best] ||
-            (w.definitions[r] == w.definitions[best] && r < best)) { best = r }
+            (w.definitions[r] == w.definitions[best] && w.physical[r] < w.physical[best])) { best = r }
     }
-    best
+    w.physical[best]
 }
 fn known_constant(w: &Workspace, operand: i32, ty: i32) -> bool {
-    if operand < -1 || operand > 30 { return false }; r := index(operand)
+    r := index(&w, operand); if r < 0 { return false }
     if ty == 1 { w.kw[r] == 1 } else { w.kx[r] == 1 }
 }
 fn constant(w: &Workspace, operand: i32, ty: i32) -> i64 {
-    r := index(operand); if ty == 1 { w.vw[r] } else { w.vx[r] }
+    r := index(&w, operand); assert(r >= 0); if ty == 1 { w.vw[r] } else { w.vx[r] }
 }
 fn masks(w: &mut Workspace) {
     w.candidate.reads[0] = mir.variable_bit(w.candidate.a[0]).bit_or(mir.variable_bit(w.candidate.b[0])).bit_or(mir.variable_bit(w.candidate.c[0]))
@@ -431,8 +484,9 @@ fn masks(w: &mut Workspace) {
 fn rewrite_copy(w: &mut Workspace, f: &mir.Function, op: i32) {
     dst := f.dst[op]; source := f.a[op]; ty := f.types[op]
     if dst < 0 || dst > 30 || source < -1 || source > 30 || (ty != 1 && ty != 2) { return }
-    var same := w.x[dst].bit_and(bit(index(source))) != 0
-    if ty == 1 { same = w.low[dst].bit_and(bit(index(source))) != 0 && w.zero.bit_and(bit(dst)) != 0 }
+    d := index(&w, dst); from := index(&w, source); if d < 0 || from < 0 { return }
+    var same := w.x[d].bit_and(bit(from)) != 0
+    if ty == 1 { same = w.low[d].bit_and(bit(from)) != 0 && w.zero.bit_and(bit(d)) != 0 }
     if same { w.action = 1; return }
     selected := alias(&w, source, ty); if selected == source { return }
     candidate_from(&mut w, &f, op); w.candidate.a[0] = selected; masks(&mut w)
@@ -441,14 +495,16 @@ fn rewrite_copy(w: &mut Workspace, f: &mir.Function, op: i32) {
 fn rewrite_constant(w: &mut Workspace, f: &mir.Function, op: i32) {
     dst := f.dst[op]; ty := f.types[op]; if dst < 0 || dst > 30 || (ty != 1 && ty != 2) { return }
     var value := f.imm[op]; if ty == 1 { value = value.bit_and(4294967295) }
-    if w.kx[dst] == 1 && w.vx[dst] == value { w.action = 1; return }
+    d := index(&w, dst); if d < 0 { return }
+    if w.kx[d] == 1 && w.vx[d] == value { w.action = 1; return }
     var best := -2
-    for source in -1..31 {
+    if known_constant(&w, -1, ty) && constant(&w, -1, ty) == value { best = -1 }
+    if best == -2 { for slot in 0..w.zr {
+        source := w.physical[slot]
         if source == dst || !known_constant(&w, source, ty) || constant(&w, source, ty) != value { continue }
-        if source == -1 { best = -1; break }
         if best == -2 { best = source }
-        else if w.definitions[source] < w.definitions[best] { best = source }
-    }
+        else if w.definitions[slot] < w.definitions[index(&w, best)] { best = source }
+    } }
     if best == -2 { return }
     candidate_from(&mut w, &f, op)
     w.candidate.kinds[0] = 2; w.candidate.opcodes[0] = 0; w.candidate.a[0] = best
@@ -476,7 +532,7 @@ fn rewrite_scalar(w: &mut Workspace, f: &mir.Function, op: i32) {
     w.action = 2; w.immediate = immediate
 }
 fn replay(w: &mut Workspace, f: &mut mir.Function) -> bool {
-    if !charge(&mut w, f.kinds.len * 512 + f.block_starts.len * 194) { return false }
+    if !charge(&mut w, f.kinds.len * (w.physical.len * 10 + 192) + f.block_starts.len * (w.physical.len * 6 + 2)) { return false }
     for b in 0..f.block_starts.len {
         if !w.reached[b] { continue }; load_in(&mut w, b)
         for position in f.block_starts[b]..f.block_ends[b] {
@@ -552,7 +608,7 @@ fn begin(w: &mut Workspace, f: &mir.Function, labels: &[]i32, epoch: i32, limit:
     for op in 0..n { if f.modes[op] != 2 && (f.kinds[op] == 1 || f.kinds[op] == 2 || (f.kinds[op] == 3 && f.opcodes[op] == 3)) { candidates = true } }
     if !candidates { return false }
     if !contracted_exits(&mut w, &f, &labels, epoch) { return false }
-    graph(&mut w, &f) && solve(&mut w, &f)
+    domain(&mut w, &f) && graph(&mut w, &f) && solve(&mut w, &f)
 }
 fn finish(w: &mut Workspace, f: &mut mir.Function) -> bool {
     if !replay(&mut w, &mut f) || !check_staged(&mut w, &mut f) || !dead(&mut w, &mut f) {

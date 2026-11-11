@@ -70,6 +70,8 @@ def main():
     parser.add_argument('--report', type=Path)
     parser.add_argument('--compare-report', type=Path,
                         help='require the same SHA256 for every program image in a prior successful matrix')
+    parser.add_argument('--full-domain', action='store_true',
+                        help='also run the full32 reference and require exact compact/full semantic MIR and images')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
@@ -84,7 +86,7 @@ def main():
     report = {'compiler_sha256': digest(compiler), 'host_target': host,
               'value_module_sha256': digest(ROOT / 'selfhost/mir_value_prop.ddr'),
               'fixture_sha256': digest(ROOT / 'tests/fixtures/mir-value-emitter.ddr'), 'images': []}
-    gaps = 0; proofs = 0; executed = 0
+    gaps = 0; proofs = 0; executed = 0; domain_pairs = 0
     with tempfile.TemporaryDirectory(prefix='dunder-mir-values-') as directory:
         work = Path(directory); emitter = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/mir-value-emitter.ddr', '-o', emitter], work)
@@ -93,7 +95,9 @@ def main():
             result = expected(case, value, condition)
             traps = case == 10 and value == 9223372036854775807
             for target in range(4):
-                for mode in ('off', 'on'):
+                compact = None
+                modes = ('off', 'on', 'on-full') if args.full_domain else ('off', 'on')
+                for mode in modes:
                     image = work / f'value-{index}-{target}-{mode}'
                     output = call([emitter, image, target, case, mode, value, condition, result], work).stdout
                     original, rewritten = output.split('ORIGINAL\n', 1)[1].split('RESULT\n', 1)
@@ -107,13 +111,13 @@ def main():
                     else:
                         assert pre['result'] == post['result'] == result, (case, mode, value, pre, post, result)
                         proofs += 1
-                    rewrites, deleted, immediates, units = map(int, counters.split())
+                    rewrites, deleted, immediates, units, slots, rows = map(int, counters.split())
                     if mode == 'off': assert (rewrites, deleted, immediates, units) == (0, 0, 0, 0)
-                    if mode == 'on' and case in (0, 1, 3, 6, 7, 12, 13):
+                    if mode != 'off' and case in (0, 1, 3, 6, 7, 12, 13):
                         assert rewrites + deleted > 0, (case, rewrites, deleted)
-                    if case in (4, 10) and mode == 'on':
+                    if case in (4, 10) and mode != 'off':
                         assert rewrites == deleted == immediates == 0
-                    if case == 7 and mode == 'on':
+                    if case == 7 and mode != 'off':
                         assert all(op['mode'] == 2 for op in after['operations'] if op['kind'] in (1, 3)), after
                     ran = False
                     if target == host:
@@ -121,29 +125,47 @@ def main():
                     if target == 3:
                         call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], work, 125 if traps else 0)
                         executed += 1; ran = True
+                    image_sha = digest(image)
+                    if mode == 'on':
+                        compact = (after, image_sha, (rewrites, deleted, immediates), slots, rows, units)
+                    elif mode == 'on-full':
+                        assert compact is not None
+                        assert (after, image_sha, (rewrites, deleted, immediates)) == compact[:3], (case, value, target)
+                        assert slots in (0, 32)
+                        if slots:
+                            assert compact[3] <= slots and compact[4] <= rows
+                            if compact[3] < slots: assert compact[5] < units
+                        domain_pairs += 1
                     report['images'].append(dict(case=case, input=value, condition=condition, target=target, mode=mode,
-                                                 sha256=digest(image), executed=ran, trap=traps, before=pre, after=post,
-                                                 rewrites=rewrites, deleted=deleted, immediates=immediates, units=units))
+                                                 sha256=image_sha, executed=ran, trap=traps, before=pre, after=post,
+                                                 rewrites=rewrites, deleted=deleted, immediates=immediates, units=units,
+                                                 fact_slots=slots, fact_rows=rows))
             print(f'PASS {index + 1}/{len(corpus)} case{case} input{value} condition{condition}', flush=True)
-    report.update(images_built=len(report['images']), executions=executed, oracle_pairs=proofs, oracle_gap_pairs=gaps)
+    report.update(images_built=len(report['images']), executions=executed, oracle_pairs=proofs, oracle_gap_pairs=gaps,
+                  compact_full_exact_pairs=domain_pairs)
     report['manifest_sha256'] = hashlib.sha256(json.dumps(report['images'], sort_keys=True).encode()).hexdigest()
     if args.compare_report:
         previous = json.loads(args.compare_report.read_text())
         key = lambda row: (row['case'], row['input'], row['condition'], row['target'], row['mode'])
         reference = {key(row): row['sha256'] for row in previous['images']}
-        assert len(reference) == len(report['images'])
+        compared = 0
         for row in report['images']:
+            if row['mode'] == 'on-full': continue
             assert reference[key(row)] == row['sha256'], ('program image changed', key(row), reference[key(row)], row['sha256'])
+            compared += 1
+        assert len(reference) == compared
         report['reference_manifest_sha256'] = previous['manifest_sha256']
-        report['reference_program_sha256_matches'] = len(report['images'])
+        report['reference_program_sha256_matches'] = compared
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
     print(f'{len(corpus)} programs/inputs; {len(report["images"])} images; {executed} host/Wasm executions; '
           f'{proofs} independent oracle pairs; {gaps} explicitly reported call/trap gaps')
     print('manifest_sha256=' + report['manifest_sha256'])
+    if args.full_domain:
+        print(f'{domain_pairs} compact/full pairs have identical semantic MIR, counters and program image SHA256s')
     if args.compare_report:
-        print(f'{len(report["images"])} program image SHA256s match the previous implementation')
+        print(f'{report["reference_program_sha256_matches"]} program image SHA256s match the previous implementation')
 
 
 if __name__ == '__main__':

@@ -79,6 +79,97 @@ fn run(f: &mut mir.Function) -> values.Workspace {
     var work := values.new(); assert(values.optimize_into(&mut work, &mut f))
     assert(f.verified); work
 }
+fn spans(code: &arm.Code) -> mir.Function {
+    sites: []i32 = []; var f := mir.new()
+    assert(lift.lift_spans(&mut f, &code, 0, 0, 0, &sites, 0,
+        &code.mir_starts, &code.mir_ends, &code.mir_kinds, &code.mir_a, &code.mir_b))
+    assert(verify.verify(&mut f)); f
+}
+// Compare every Function column/metadata field after two independent lifts.
+// The reference uses all31 physical GP slots plus the separate immutable ZR.
+fn compact_match(code: &arm.Code, count: i32, fallback: bool) -> mir.Function {
+    var f := spans(&code); var reference := spans(&code)
+    var work := values.new(); var full := values.new_full_domain()
+    changed := values.optimize_into(&mut work, &mut f)
+    reference_changed := values.optimize_into(&mut full, &mut reference)
+    assert(changed == reference_changed && values.status(&work) == values.status(&full))
+    assert(values.rewritten(&work) == values.rewritten(&full))
+    assert(values.deleted(&work) == values.deleted(&full))
+    assert(values.constant_immediates(&work) == values.constant_immediates(&full))
+    assert(values.fact_slots(&work) == count && values.fact_slots(&full) == 32)
+    assert(values.fact_rows(&work) == f.block_starts.len * count)
+    assert(values.used_full_fallback(&work) == fallback)
+    if count < 32 { assert(values.units(&work) < values.units(&full)) }
+    same(&f, &reference); f
+}
+@test fn compact_domain_preserves_noncontiguous_alias_preference_and_abi_liveness() {
+    var code := arm.new(); arm.imm(&mut code, 9, 7); arm.mov(&mut code, 24, 9)
+    arm.mov(&mut code, 30, 24); add(&mut code, 0, 30, 9, false); arm.emit(&mut code, 3596551104)
+    f := compact_match(&code, 5, false)
+    assert(f.kinds[3] == 4 && f.imm[3] == 7 && f.b[3] == -1)
+    // ABI Return's implicit preserved registers do not inflate the domain,
+    // but remain live in the full physical liveness analysis.
+    assert(f.modes[1] != 2 && f.modes[2] != 2)
+    assert(f.a[3] == 9)
+}
+@test fn compact_domain_projects_implicit_far_frame_scratch_writes_and_definition_scores() {
+    var code := arm.new(); arm.begin_mir(&mut code, true)
+    arm.imm(&mut code, 9, 7); arm.load_into(&mut code, 32, 0)
+    add(&mut code, 0, 4, 9, false); arm.emit(&mut code, 3596551104); arm.end_mir(&mut code)
+    f := compact_match(&code, 4, false)
+    assert(f.kinds[1] == 7 && f.writes[1].bit_and(mir.variable_bit(9)) != 0)
+    assert(f.b[2] == 9 && f.imm[2] == 0)
+    // The scratch write also contributes to physical definition scores.
+    // After establishing a new alias, X24 has fewer definitions than X9.
+    code = arm.new(); arm.begin_mir(&mut code, true)
+    arm.load_into(&mut code, 32, 0); arm.imm(&mut code, 24, 7); arm.mov(&mut code, 9, 24)
+    add(&mut code, 0, 9, 4, false); arm.emit(&mut code, 3596551104); arm.end_mir(&mut code)
+    scored := compact_match(&code, 5, false); assert(scored.a[3] == 24)
+}
+@test fn compact_w_values_and_movk_self_input_keep_actual_32_bit_masks() {
+    var code := arm.new(); arm.emit(&mut code, 704644064 + 24 * 65536 + 9)
+    arm.mov(&mut code, 0, 9); arm.emit(&mut code, 3596551104)
+    high := compact_match(&code, 4, false); assert(high.a[1] == 9)
+    code = arm.new(); arm.emit(&mut code, 704644064 + 24 * 65536 + 9)
+    add(&mut code, 0, 9, 30, true); arm.emit(&mut code, 3596551104)
+    low := compact_match(&code, 5, false); assert(low.a[1] == 24 && low.modes[0] == 2)
+    code = arm.new(); arm.imm(&mut code, 24, 4294967297)
+    arm.emit(&mut code, 704644064 + 24 * 65536 + 9)
+    add(&mut code, 0, 4, 9, false); arm.emit(&mut code, 3596551104)
+    inserted := compact_match(&code, 5, false)
+    assert(inserted.b[3] == -1 && inserted.imm[3] == 1)
+}
+@test fn compact_join_kills_call_clobbers_from_only_one_predecessor() {
+    var code := arm.new(); other := arm.label(&mut code); join := arm.label(&mut code); external := arm.label(&mut code)
+    arm.imm(&mut code, 9, 7); arm.branch(&mut code, other, 18)
+    arm.branch(&mut code, external, 1); arm.branch(&mut code, join, 0)
+    arm.mark(&mut code, other); arm.mark(&mut code, join)
+    add(&mut code, 0, 4, 9, false); arm.emit(&mut code, 3596551104)
+    f := compact_match(&code, 4, false); assert(f.b[4] == 9 && f.imm[4] == 0)
+}
+@test fn compact_loop_fixpoint_does_not_alias_previous_iteration_values() {
+    var code := arm.new(); head := arm.label(&mut code); done := arm.label(&mut code)
+    arm.imm(&mut code, 9, 1); arm.imm(&mut code, 0, 3); arm.mov(&mut code, 24, 4)
+    arm.mark(&mut code, head); arm.mov(&mut code, 30, 24); add(&mut code, 24, 24, 9, false)
+    arm.emit(&mut code, 3942645791 + 30 * 65536 + 24 * 32)
+    arm.emit(&mut code, 3405774848 + 9 * 65536); arm.branch(&mut code, done, 18); arm.branch(&mut code, head, 0)
+    arm.mark(&mut code, done); arm.mov(&mut code, 0, 24); arm.emit(&mut code, 3596551104)
+    f := compact_match(&code, 6, false)
+    assert(f.kinds[5] == 5 && f.a[5] != f.b[5] && f.modes[5] != 2)
+}
+@test fn compact_domain_tracks_explicit_abi_reserved_gp_roles_and_separates_sp_from_zr() {
+    for reg in 18..31 {
+        var code := arm.new(); arm.imm(&mut code, reg, 7); add(&mut code, 0, 4, reg, false)
+        arm.emit(&mut code, 3596551104)
+        f := compact_match(&code, 4, false); assert(f.b[1] == -1 && f.imm[1] == 7)
+        assert(f.modes[0] == 0) // Caller-observable preserved state remains live.
+    }
+    var code := arm.new(); arm.imm(&mut code, 9, 0)
+    // ADD X0,SP,#16 has an actual SP source, not the ZR/discard operand.
+    arm.emit(&mut code, 2432697312 + 16 * 1024); arm.emit(&mut code, 3596551104)
+    f := compact_match(&code, 32, true)
+    assert(f.a[1] == 31 && f.modes[1] == 0 && f.imm[1] == 16)
+}
 @test fn copy_chains_and_known_scalar_immediates_remove_only_dead_materializations() {
     var code := arm.new(); arm.imm(&mut code, 1, 5); arm.mov(&mut code, 2, 1); arm.mov(&mut code, 3, 2)
     add(&mut code, 0, 4, 3, false); arm.emit(&mut code, 3596551104)
