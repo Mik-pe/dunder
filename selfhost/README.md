@@ -32,15 +32,45 @@ dunder_bin="$(./tools/bootstrap.sh)"
 ```
 
 Skriptet väljer den frysta kompilatorn för värden ur `bootstrap/`, verifierar
-SHA-256 och bygger dagens källfiler. Det kräver byteidentiska efterföljande
-självbyggen innan det publicerar kompilatorn i `build/selfhost/<värdmål>/`.
+SHA-256 och bygger dagens seriella ingång till en byteidentisk fixpunkt.
+På ARM64/macOS bygger den därefter taskingången och kräver byteidentiska
+självbyggen med `--jobs=1` och `--jobs=4` innan den publicerar `dunder` med
+fyra workers som standard. Linux behåller seriell `dunder`.
+`./tools/bootstrap.sh --serial` bygger enbart `dunder-serial` på alla värdar
+utan att ersätta standardbinären.
 Rust-kompilatorn har tagits ur byggkedjan. De frysta startkompilatorerna och
 Dunder-källorna är återställningsvägen. [Fröbinärer och återbyggnad](../bootstrap/README.md)
 
-`selfhost/main.ddr`, `linux.ddr` och `x86_linux.ddr` väljer värdens
-standardmål. `--target` väljer vilket mål som helst för det byggda programmet.
+`selfhost/main_parallel.ddr` är standardingång på ARM64/macOS.
+`main.ddr`, `linux.ddr` och `x86_linux.ddr` är de seriella ingångarna och
+väljer värdens standardmål. `--target` väljer vilket mål som helst för det byggda programmet.
 Kör korsbyggd Linux-kod på motsvarande Linux-system eller med QEMU och
 målarkitekturens användarland.
+
+## Tasks i kompilatorn
+
+`--jobs N` och `--jobs=N` väljer 1–256 workers i den taskbaserade ingången.
+Den kör på ARM64/macOS och kan skriva program för alla fyra mål. Den
+seriella ingången stöder bara `--jobs=1`. En worker, `check`, `--mir=off`
+och `--profile-compiler` går genom samma seriella Session-drivrutin utan
+scheduling. Profilens fasintervall förblir seriella väggtider.
+
+En återupptagbar `compile.Session` äger frontend, typning, symboler, nåbarhet,
+inlinebudget, provisorisk kod och cache-I/O. `next_into` lämnar en ägd
+helfunktions-MIR åt gången. Jobbet verifierar och optimerar med egna
+arbetsarenor och returnerar MIR och statistik. Föräldern sänker till
+`FunctionObject` och sammanfogar genom `mir_link` i ursprunglig källordning.
+Ingen worker lånar Session, Code eller globala importtabeller.
+
+Varje taskfönster omfattar högst `workers` källsteg och håller snapshots
+och resultat levande till ordnad acceptans. Varje kallt jobb startar en
+OS-tråd och skapar lokal `pipeline.Workspace`; ingen permanent worker-
+eller arenapool återanvänds. `--jobs=1` återanvänder den seriella kedjans
+arbetsminne. Cacheträffar använder redan slutligt sänkta objekt utan att köra
+MIR-passen igen. Diagnostik, bindningsposter, cacheberoenden, inlinebudgetar
+och kodbilder är deterministiska oberoende av färdigordning och workerantal.
+[Taskkontrakt](../docs/tasks.md) och
+[mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
 
 ## Vad kompilatorn klarar
 
@@ -130,7 +160,12 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 | `lexer.ddr` | Tokenisering, UTF-8, escapes, positioner och interning. |
 | `modules.ddr` | Modulgraph, namn, synlighet, deduplicering och källmappning. |
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
-| `compile.ddr` | Typer, uttryck, kontrollflöde, värdesemantik och kodgenerering. |
+| `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, värdesemantik, källordning och slutlig emission. |
+| `compile_parallel.ddr`, `mir_task.ddr` | Begränsade taskfönster, ägda funktionsjobb och ordnad acceptans. |
+| `mir_pipeline.ddr` | Samma verifierings- och optimeringssteg för seriell körning och workers. |
+| `mir_lower.ddr`, `mir_link.ddr` | Fristående funktionsobjekt och deterministisk sammanfogning. |
+| `record_take.ddr` | Normalisering vid transfer av unika fulluttryckstemporärer; lokaler flyttas inte. |
+| `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
 | `opt_ir.ddr`, `opt_parse.ddr` | Återanvändbar typad funktionsmodell och konservativ skalär parser. |
 | `opt_pass.ddr` | Begränsad förenkling och bevis för säkra index och ökningar. |
 | `opt_verify.ddr` | Typ-, scope-, kontrollflödes-, effekt- och strukturinvariants före och efter passet. |
@@ -143,7 +178,7 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 | `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Darwin- och Linux-systemanrop. |
 | `driver.ddr` | Gemensam modulladdning, felrapportering och publicering av filer. |
 | `elf.ddr`, `linux.ddr` | ELF-format och kompilatorns Linux-ingång. |
-| `macho.ddr`, `main.ddr` | Signerad Mach-O och kompilatorns macOS-ingång. |
+| `macho.ddr`, `main.ddr`, `main_parallel.ddr` | Signerad Mach-O och seriell respektive taskbaserad macOS-ingång. |
 
 ## Verifiering
 

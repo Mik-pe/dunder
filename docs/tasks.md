@@ -88,14 +88,50 @@ Funktionscache avstår för taskprogram tills certifierade effekter och
 beroenden kan lagras och återställas tillsammans med fragmenten.
 Vanliga seriella program gör ingen extra certifieringsgenomgång.
 
-Kompilatorn använder ännu inte tasks för sina egna funktionspass. Nästa
-steg är ägda funktionsjobb och ordnad sammanfogning av relokerbara objekt;
-frontendens symboler, diagnostik och inlinebudget behåller en ägare.
-Trådarnas nytta ska mätas inklusive kopiering, start, join och sammanfogning.
+## Kompilatorn som taskkonsument
 
+Den taskbaserade kompilatorn är implementerad och självhostad på
+ARM64/macOS. Standardingången använder fyra workers; `--jobs N` eller
+`--jobs=N` väljer 1–256. Det är värddatorns kompilatorjobb som använder
+trådar, även vid korskompilering till Linux eller Wasm. Ett kompilerat
+programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
-[Mätningen med 30 rundor](../benchmarks/2026-11-12-isolated-tasks/README.md)
-visar 3,59× och 3,78× parad förbättring med fyra aktiva jobb mot ett i två
-rena arbetsfall. Seriella byggmedianer ökar 0,01–0,67 procent och den
-genererade p95-bygggränsen behålls. Det är ett avgränsat underlag för denna
-implementation, ingen mätning av parallell kompilering.
+En enda `compile.Session` behåller frontend, typ- och lånekontroll,
+symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
+Föräldern lämnar ägda hela MIR-funktioner i ett begränsat taskfönster.
+Workers kör samma `mir_pipeline` som den seriella drivrutinen: verifiering,
+framepromovering och värdepass, följt av nödvändig efterverifiering. Varje
+kallt jobb startar en OS-tråd och skapar lokal `pipeline.Workspace`.
+Fönstret omfattar högst `workers` källsteg; ingen permanent worker- eller
+arenapool används. Resultatet är ägd MIR och status/statistik;
+föräldern sänker till ett fristående `FunctionObject` och sammanfogar i
+källordning. Varken Session eller globala tabeller delas muterbart.
+
+Cacheträffar lämnar redan färdiga objekt utan verifiering eller optimering
+en andra gång. Beroenden och budgetdebitering återspelas i samma ordning
+som vid ett kallt bygge. Tidigare jobb tas emot före senare källfel, så
+färdigordningen ändrar inte första diagnostiken. Workerantalet ingår inte
+i cacheidentiteten och ändrar inga optimeringsbudgetar.
+
+`--jobs=1`, `check`, `--mir=off` och `--profile-compiler` använder den
+identiska seriella Session-drivrutinen. `check` behöver inga backendarenor.
+Kompilatorns funktionscache fungerar också med parallell MIR-bearbetning;
+begränsningen ovan gäller källprogram som själva innehåller tasksyntax.
+
+Fulluttryckets exakt identifierade, unikt ägda recordtemporär kan överföras
+utan en extra djupkopia inom samma runtime. Den generiska normaliseringen
+bevarar nästlade arrayers synliga kopieringskapacitet; strängar, delade
+enums och inline C-layout är stoppunkter. Lokaler och fältprojektioner
+behåller värdesemantiken. Detta inför inga allmänna moves och tar inte bort
+isoleringskopiorna vid spawn/join.
+
+[Den parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+skiljer samma binär med en respektive fyra workers från jämförelsen med
+den tidigare seriella kompilatorn. Genererat bygge med fyra workers når
+p95 619,768 ms, motsvarande 163 003 källrader/s. Runtimebilderna är
+identiska; runtime/C-geomedlet är 1,178× och största kvoten 1,308×.
+Det återstående C-målet löses inte av snabbare kompilering.
+
+Den tidigare [språkmätningen med 30 rundor](../benchmarks/2026-11-12-isolated-tasks/README.md)
+visade 3,59× och 3,78× parad förbättring i två rena taskarbetsfall. Den
+redovisar separat vad själva taskstödet kostade seriella program.

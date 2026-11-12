@@ -3,8 +3,12 @@
 Kompilatorn på `main` är skriven i Dunder. Den bygger sig själv på ARM64/macOS,
 ARM64/Linux och x86-64/Linux och kan från varje värd skriva kod för alla tre
 nativa målen och wasm32. Återbyggnaden börjar med en fryst Dunder-kompilator
-och verifierar två byteidentiska självbyggen. Byggkedjan för den tidigare
-Rust-kompilatorn har ersatts. [Återbyggnad](../bootstrap/README.md) och
+och verifierar en seriell fixpunkt. På ARM64/macOS byggs sedan den
+taskbaserade standardingången till byteidentiska självbyggen med en och fyra
+workers; standarden är fyra. Linux behåller seriell standardkompilering.
+`bootstrap.sh --serial` publicerar `dunder-serial` på alla värdar utan att
+ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
+[Återbyggnad](../bootstrap/README.md) och
 [målplattformar](targets.md).
 
 ## Språk och runtime
@@ -12,8 +16,8 @@ Rust-kompilatorn har ersatts. [Återbyggnad](../bootstrap/README.md) och
 - Isolerade uppgifter använder `task scope`, `spawn` och typad `await` på
   ARM64/macOS. Scopeägda trådar, separata pooler och kontrollerad kloning
   håller managed-värden åtskilda. Typ- och effektanalys kontrollerar workerns
-  gräns; scope-exit väntar in jobben före cleanup. Parallell kompilering är
-  ännu inte aktiverad. [Uppgifter och begränsningar](tasks.md).
+  gräns; scope-exit väntar in jobben före cleanup. Kompilatorn använder samma
+  taskstöd för parallell MIR-verifiering och optimering. [Uppgifter och begränsningar](tasks.md).
 - Moduler har privata och exporterade symboler, alias, namngivna typer och
   stöd för cykliska importer. Typinferens, typade funktionsvärden, indirekta
   anrop, rekursion och aggregatreturer används i kompilatorns egen källkod.
@@ -61,6 +65,24 @@ privata källobjekt och värdepropagering delar samma kedja.
 `--mir-opt=off` behåller kedjan utan optimeringspassen;
 `--mir=off` stänger av hela gränsen för jämförelse.
 [Omfattning och gränser](optimization.md).
+
+Den taskbaserade kompilatorn behåller frontend, typning, nåbarhet,
+diagnostik, cache-I/O och inlinebudget i en enda Session. Workers returnerar
+ägda MIR-funktioner; föräldern sänker och länkar i källordning. `--jobs`
+stöder 1–256 på ARM64/macOS-ingången. En worker, `check`, `--mir=off` och
+`--profile-compiler` använder samma seriella Session-väg. Workerantalet
+ändrar varken passbudgetar, cacheidentitet eller programbilder.
+
+[30-rundorsmätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+med samma binär ger genererad byggmedian 953,718→609,106 ms när workerantalet
+ökar från en till fyra. Standardkandidatens genererade p95 är 619,768 ms,
+163 003 källrader/s. Runtimebilderna är identiska. C-geomedlet 1,178× och
+största kvoten 1,308× ligger över målen 1,10× respektive 1,25×.
+
+Unika fulluttryckstemporärer av vanliga records kan överföras med generisk
+normalisering av nästlade arraykapaciteter. Detta tar bort extra kopior i
+bland annat kompilatorns jobb/resultat utan att flytta lokaler eller fält,
+ändra värdesemantiken eller dela managed-lagring över taskgränsen.
 
 Den fulla kodgeneratorn kan utelämna extra strängoperandägare när hela
 högerledet saknar relevanta effekter. En validerad funktionsrepresentation

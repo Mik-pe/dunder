@@ -8,11 +8,34 @@ dunder_bin="$(./tools/bootstrap.sh)"
 ```
 
 Skriptet väljer ett fryst Dunder-frö för värddatorn, kontrollerar den
-komprimerade filens SHA-256 och bygger källorna i `selfhost/`. Den nya
-kompilatorn bygger samma källor igen. När kodgeneratorn har ändrats kan
-det behövas ytterligare ett bygge för att nå fixpunkten. Två efterföljande
-binärer måste vara byteidentiska innan resultatet publiceras med atomiskt
-namnbyte i `build/selfhost/<värdmål>/dunder`.
+komprimerade filens SHA-256 och bygger den seriella ingången i `selfhost/`.
+Den nya kompilatorn bygger samma källor igen. När kodgeneratorn har ändrats
+kan ytterligare ett bygge behövas; två efterföljande binärer måste vara
+byteidentiska innan den seriella fixpunkten godtas.
+
+På ARM64/macOS bygger denna verifierade kompilator sedan
+`selfhost/main_parallel.ddr`. Den taskbaserade kompilatorn bygger sig själv
+med en respektive fyra workers. Slutbyggena måste vara byteidentiska både
+mellan workerantal och mellan efterföljande självbyggen. Först då publiceras
+standardbinären med atomiskt namnbyte i `build/selfhost/arm64-macos/dunder`.
+Dess standard är fyra workers; `--jobs=1` väljer den delade seriella
+Session-vägen. Fröet behöver aldrig förstå tasksyntax: den ingår bara i det
+senare byggstegets beroendeträd.
+
+Den verifierade seriella macOS-kompilatorn behålls som `dunder-serial`.
+För att enbart bygga den seriella återställningsvägen på någon av de tre
+värdplattformarna:
+
+```sh
+serial_bin="$(./tools/bootstrap.sh --serial)"
+"$serial_bin" run examples/hello.ddr
+```
+
+`--serial` publicerar och returnerar
+`build/selfhost/<värdmål>/dunder-serial` och ersätter aldrig standardbinären
+`dunder`. Utan flaggan fortsätter Linux att publicera den seriella
+fixpunkten som `dunder`; taskruntimen stöder tills vidare ARM64/macOS.
+Båda kompilatoringångarna kan korskompilera till alla fyra mål.
 
 Återbyggnaden kan köras offline med POSIX-shell, gzip, en SHA-256-kontroll
 och vanliga filverktyg. Linuxkompilatorerna använder systemets glibc.

@@ -1,18 +1,30 @@
 # Så mäter vi Dunder
 
-Det senaste [taskstödet och dess seriella byggkostnad](../benchmarks/2026-11-12-isolated-tasks/README.md)
-har 30 försök per variant och full lokal verifiering. Standardprofilen når
-105 975 genererade källrader/s vid p95 med en byggarbetare. Byggmedianerna
-ökar 0,01–0,67 procent mot kompilatorn före taskstödet på samma källträd;
-check-medianerna ökar 1,59–1,92 procent och rapporten behåller sämre p95-värden.
+Den senaste [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+har 30 försök per variant på ARM64/macOS. Den skiljer två jämförelser:
+samma taskbaserade kompilator med en respektive fyra workers, och tidigare
+seriell kompilator mot den nya standarden med fyra workers. Tabellen visar
+medianer i millisekunder; den första jämförelsen isolerar workerantalets effekt.
 
-Språkets två separata taskfall får 3,59× respektive 3,78× parad förbättring
-med fyra aktiva jobb mot ett, inklusive kloning och OS-trådar. Kompilatorns
-egna funktionspass är fortfarande seriella. Alla sju vanliga programbilder
-är byteidentiska. Den senaste [C-mätningen](../benchmarks/2026-11-11-whole-function-optimization/README.md#final-serial-profile-with-detached-function-objects)
-gav runtime/C-geomedlet 1,168× och textfallet 1,325×. C-målet återstår;
-ingen ny C-tidsserie kördes för samma bilder. Hela acceptanskontraktet nedan
-är ännu inte uppfyllt.
+| Arbetsfall | Samma binär: 1→4 workers | Tidigare seriell → ny standard med 4 |
+| --- | --- | --- |
+| Genererat bygge | 953,718 → 609,106 | 953,519 → 615,609 |
+| Självbygge | 874,940 → 709,677 | 862,428 → 712,768 |
+| Tabell | 20,284 → 18,017 | 20,069 → 18,048 |
+
+Den nya standardkandidatens genererade p95 är **619,768 ms**, motsvarande
+**163 003 källrader/s**. Det klarar 100 000-gränsen för det uppmätta
+genererade korpuset. Frontend, sänkning, ordnad sammanfogning och publicering
+ingår; enbart MIR-verifiering och optimering körs parallellt. `check` och
+kompilatorprofilering använder fortsatt den delade seriella vägen.
+
+Runtimebilderna är byteidentiska. Den aktuella jämförelsen mot C ger
+geometriskt medel **1,178×** och största kvoten **1,308×**, över målen
+1,10× och 1,25×. Snabbare kompilering innebär därför inte att hela
+acceptanskontraktet nedan är uppfyllt. Tidigare
+[taskmätningar](../benchmarks/2026-11-12-isolated-tasks/README.md) redovisar
+språkets isolerade arbetsfall och den dåvarande seriella byggkostnaden
+separat från denna kompilatormätning.
 
 Den lokala [runtime-sviten](../benchmarks/runtime/README.md) jämför nu
 baseline och optimerad maskinkod med fyra frysta arbetsfall, oberoende
@@ -20,7 +32,7 @@ resultatreferenser och 30 växelvisa körningar. Den är ett avgränsat
 före/efter-prov. Fyra arbetsfall har också jämförts med clang `-O3` och
 `-O3 -ftrapv` på ARM64/macOS. Acceptansgränserna nedan återstår.
 
-Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Alla siffror nedan är föreslagna acceptansgränser. Vi har nu [byggmätningar och råvärden](../benchmarks/README.md) för ett genererat stresskorpus. Det är första mätunderlaget; hela kontraktet nedan är ännu inte uppfyllt.
+Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Siffrorna nedan är acceptansgränser. [Byggmätningar och råvärden](../benchmarks/README.md) skiljer genererat stresskorpus, självbygge och verkliga konsumenter åt; hela kontraktet är ännu inte uppfyllt.
 
 ## Från kommando till färdig ARM64-binär
 
@@ -38,7 +50,7 @@ Referensmaskinen till att börja med är en Apple M5 med 24 GiB minne. Publicera
 
 Räkna fysiska källrader med minst en språktoken i de moduler som faktiskt ingår. Blankrader och rena kommentarer bidrar aldrig till täljaren. Varje fil räknas en gång. Publicera även antal byte, token och funktioner, slutlig binärstorlek, toppminne samt tid per fas. För inkrementella byggen är millisekunder och faktiskt ombyggda funktioner mer meningsfulla än rader/s.
 
-Lås en korpus med importer, externa och interna anrop, heltalskod, slices, poster, villkor, loopar, flyttar och lån. Låt en körbar testdrivrutin anropa kod från alla delar och kontrollera resultatet. Märk genererad stresskod separat och särredovisa ett bygge av den självhostade kompilatorn så snart den finns. En tokenizer eller 100 000 identiska deklarationer kan hjälpa vid felsökning men kvalificerar inte som bevis för helkompilatorn.
+Lås en korpus med importer, externa och interna anrop, heltalskod, slices, poster, villkor, loopar, temporärer och lån. Låt en körbar testdrivrutin anropa kod från alla delar och kontrollera resultatet. Märk genererad stresskod separat och särredovisa ett bygge av den självhostade kompilatorn så snart den finns. En tokenizer eller 100 000 identiska deklarationer kan hjälpa vid felsökning men kvalificerar inte som bevis för helkompilatorn.
 
 Kör minst 30 försök för vanliga arbetsfall. Publicera råvärden, median och p95 samt arbetsordningen. Återställ ändringar, cache och utdata utifrån arbetsfallet inför varje försök. Använd innehållsändringar som påverkar resultatet. Byggtider med enbart varm Dunder-cache underkänner ett anspråk om ren byggprestanda.
 

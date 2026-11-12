@@ -44,8 +44,13 @@ dunder run examples/hello.ddr
 dunder test
 ```
 
-Skriptet verifierar två byteidentiska självbyggen. [Fröbinärer och återbyggnad](bootstrap/README.md)
-beskriver värdmålen och kontrollerna.
+På ARM64/macOS verifierar skriptet först en seriell fixpunkt från fröet och
+bygger sedan den taskbaserade kompilatorn med byteidentiska självbyggen för
+`--jobs=1` och `--jobs=4`. Den publicerade `dunder` använder fyra workers som
+standard. Linux behåller den seriella standardkompilatorn.
+`./tools/bootstrap.sh --serial` publicerar i stället `dunder-serial` på alla
+värdar och lämnar standardbinären orörd.
+[Fröbinärer och återbyggnad](bootstrap/README.md) beskriver stegen.
 
 Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer,
 assembler, länkare eller signeringsverktyg för att bygga Dunder-källkod.
@@ -118,6 +123,15 @@ Dunders kompilator är skriven i Dunder. Samma typkontroll, lånekontroll och
 ägarskapsregler används för samtliga fyra mål. WebAssembly-backenden skriver
 körbara moduler med linjärt minne, typade värdimporter och callbacks.
 De tre nativevärdarna har frysta kompilatorer för offlineåterbyggnad.
+
+På ARM64/macOS använder kompilatorn språkets egna isolerade tasks för
+verifiering och optimering av hela funktions-IR:er. Frontend, typning,
+sänkning och länkning behåller en ägare; färdiga jobb tas emot i källordning.
+`--jobs N` eller `--jobs=N` väljer 1–256 workers. `--jobs=1`, `check`,
+`--mir=off` och `--profile-compiler` använder samma seriella Session-kedja.
+Antalet workers ändrar varken optimeringsbudgetar, cacheidentitet eller
+programbilder. Läs [taskkontraktet](docs/tasks.md) och
+[kompilatormätningen](benchmarks/2026-11-12-parallel-compiler/README.md).
 
 Kör verifieringen från reporoten med Python 3.9+, Node och en C-kompilator. C-kompilatorn bygger
 ett separat provbibliotek för ABI-kontrollen:
@@ -486,6 +500,7 @@ härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/els
 `while`, `for`, `break/continue`, typade arrayer och arrayiteratorer,
 struct-uttryck och fältåtkomst, värde-enums och varianter med data, uttömmande `match`,
 `@test`, `assert`, kortslutande booleska operatorer,
+isolerade `task scope`/`spawn`/`await` med typade `TaskID<R>` på ARM64/macOS,
 heltals- och flyttalsaritmetik, kontrollerade konverteringar och `print`.
 Läs [syntaxen](docs/syntax.md).
 

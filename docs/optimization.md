@@ -16,8 +16,8 @@ Alla nyemitterade källfunktioner passerar [`mir_lift`](../selfhost/mir_lift.ddr
 [`mir_verify`](../selfhost/mir_verify.ddr) och
 [`mir_lower`](../selfhost/mir_lower.ddr) innan funktionscachen sparas. Hela
 kroppen ingår, även ägarinitiering som ligger efter en retur i kodlayouten.
-Kedjan återanvänder platta arenor och arbetsminnen mellan funktioner.
-Kontroll utan emission skapar inga backendarenor; cacheträffar återställer
+Den seriella kedjan återanvänder platta arenor och arbetsminnen mellan
+funktioner; taskjobb har lokalt arbetsminne. Kontroll utan emission skapar inga backendarenor; cacheträffar återställer
 redan sänkt kod.
 
 [`mir.Function`](../selfhost/mir.ddr) beskriver operationer, operander,
@@ -41,6 +41,34 @@ antal nyemitterade IR-funktioner, operationer och opaka barriärer.
 Med `--mir-opt=off` ger gränsen byteidentisk kod mot den tidigare
 kodgeneratorn. Representationen ensam innebär ingen runtimevinst eller ett
 uppnått C-mål.
+
+### Seriell Session och taskbaserade funktionspass
+
+[`compile.Session`](../selfhost/compile.ddr) är den gemensamma frontendens
+återupptagbara gräns. Föräldern behåller full provisorisk Code och imports genom
+hela källtraverseringen. Ett kallt jobb får en ägd, lyft MIR-funktion;
+[`mir_pipeline`](../selfhost/mir_pipeline.ddr) utför samma obligatoriska
+verifiering, begränsade pass och efterverifiering seriellt eller i en task.
+Varje kallt taskjobb skapar en lokal `pipeline.Workspace` i en ny OS-tråd
+och returnerar ägd MIR och statistik. Det finns ingen permanent worker-
+eller arenapool. Sänkning till `FunctionObject`, ordnad acceptans, cachelagring och länkning
+sker hos föräldern. Först efter färdig sammanfogning ersätts den provisoriska
+bilden. Cacheträffar är redan slutligt sänkta och får inget nytt backendjobb.
+
+[`compile_parallel`](../selfhost/compile_parallel.ddr) äger begränsade
+fönster av språkets isolerade tasks. Antalet workers ändrar inte symbol-
+och nåbarhetsordning, första diagnostik, inlinebudget, passbudget eller
+cacheberoenden. `--jobs N` och `--jobs=N` stöder 1–256 på ARM64/macOS-
+ingången, med fyra som standard. En worker, `check`, `--mir=off` och
+`--profile-compiler` använder samma seriella Session-drivrutin. Vanliga
+passräknare visar faktiskt utfört arbete även för workerresultat; fulla
+cacheträffar och `check` har noll backendaktivitet.
+
+Samma kompilator kan korsbygga alla fyra mål. Begränsningen till ARM64/macOS
+gäller taskruntimen som kör kompilatorjobben, inte programmens målformat.
+[Parallell kompilatormätning](../benchmarks/2026-11-12-parallel-compiler/README.md)
+redovisar en worker separat från standardens fyra. Det ändrar bygglatensen;
+byteidentiska runtimebilder behåller samma kvarvarande C-gap.
 
 ### Registerhem över hela funktioner
 
@@ -453,6 +481,34 @@ för båda lägena på alla mål; native och Wasm provar också mutation under
 högerledet, fällordning och upprepad körning med samma linjära minne.
 `tools/test-machine-ir.py` provar kompakteringen separat.
 
+## Unika recordtemporärer
+
+[`record_take`](../selfhost/record_take.ddr) undviker en extra djupkopia när
+den fulla frontendens x0-värde hör till exakt samma unikt ägda
+fulluttryckstemporär och typ som dess registrerade cleanupägare. Regeln är
+generisk för vanliga records. Den flyttar inga lokaler, parametrar eller
+fältprojektioner och inför inga allmänna moves.
+
+En förseglad typplan klassificerar rekursiva record-/arraybarn innan den
+globala etikettrymden och cachekontexten fryses. Normaliseringen bevarar den
+synliga kapacitet som en vanlig arraykopia skulle ha haft: noll för tomma
+arrayer, annars max(8, längden). Strängar och delade payload-enums är
+stoppunkter; C-layoutfält förblir inlinebytes. Separata lokala snapshots
+fortsätter att vara oberoende värden.
+
+Planen har en egen ägarrot utanför Session. Session behåller bara primitiva
+val per typ, och hela uttryckets vanliga ägargard avgör om transfer får ske.
+Efter ordnad sammanfogning skannas slutliga relokeringar en gång för att
+återställa hjälpardemand för både kalla och cachade funktioner. Endast den
+transitivt begärda hjälparkoden emitteras, utanför källfunktionernas MIR-
+och cachegränser. Cachepolicyn innehåller `record-take1`.
+
+`check` kopierar ingen typmetadata till planen och reserverar inga sådana
+hjälpare. Resursavslag använder den vanliga kopieringsvägen; trasig intern
+metadata ger kompilatorfel. Mekanismen bevarar källans värdesemantik och
+behåller de verkliga isoleringskopiorna vid taskgränsen. Den hjälper också
+kompilatorns vanliga jobb- och resultatrecords utan en särskild MIR-typregel.
+
 ## Nästa etapper mot C-nivå
 
 Målet prövas över hela den publicerade sviten enligt
@@ -470,7 +526,7 @@ bakom snabbare genererad stresskod.
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
 | POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
 | Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
-| Kortare bygglatens | Återanvänd typade resultat och beroendesammanfattningar, och bearbeta oberoende funktioner parallellt. | Stabil diagnosordning, byteidentisk utdata, en arena per arbetare och mätning av privat kroppsändring respektive delad layoutändring. |
+| Kortare bygglatens | MIR-verifiering och optimering körs nu parallellt genom samma Session; frontend, sänkning och länkning har en ägare. Nästa steg kan återanvända fler typade resultat och beroendesammanfattningar. | Behåll stabil diagnostik, byteidentiska bilder och budgetar. Fortsatt arbete måste mäta varm cache, privat kroppsändring och delad layoutändring separat från kalla byggen. |
 
 Prioritera nästa mekanism efter profiler och maskinkod för arbetsfallen
 som fortfarande missar målet. Mät allokering och kopiering i lexer, parser
