@@ -1,6 +1,28 @@
 # Så mäter vi Dunder
 
-Den senaste [glesa SSA-v2-mätningen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+Den aktuella [regionala IR-/workermätningen](../benchmarks/2026-11-12-regional-workers/README.md)
+bevarar 1 260 prover: tidigare mot ny standard med fyra workers samt samma
+nya binär med en, två och fyra workers. SSA är av i samtliga jämförelser.
+
+| Arbetsfall | 1 worker, median/p95 ms | 4 workers, median/p95 ms |
+| --- | ---: | ---: |
+| Genererat bygge | 982,428 / 987,013 | 623,820 / 625,539 |
+| `selfhost/main.ddr` | 1 023,754 / 1 025,300 | 823,461 / 826,993 |
+| `selfhost/main_parallel.ddr` | 1 186,908 / 1 189,227 | 971,125 / 975,632 |
+| Tabell | 20,488 / 21,590 | 18,153 / 19,042 |
+| Hello | 5,343 / 5,875 | 5,390 / 5,656 |
+| Owned | 5,970 / 6,796 | 5,743 / 8,545 |
+
+Fyra workers ger 1,57×, 1,24× och 1,22× i de tre större fallen.
+Det senaste paketet är samtidigt 0,64–1,56 procent långsammare i byggmedian
+än tidigare standard med fyra workers. Dess minnestopp minskar i större
+fall. Alla råsvansar, inklusive owned-fallets sämre p95, finns kvar.
+Genererat bygge når 161 499 rader/s vid p95 med fyra workers; alla tre
+workerantal klarar 100 000-gränsen. Separata `check`-prover är seriella
+kontroller. Kontrollerade runtimebilder är byteidentiska, så ingen ny
+C-runtimevinst påstås. Frontenden är fortsatt seriell och C-målet öppet.
+
+Den tidigare [glesa SSA-v2-mätningen](../benchmarks/2026-11-12-ssa-pruned/README.md)
 har 1 440 prover över tre separata jämförelser på samma frysta källor.
 Med SSA på i båda kompilatorerna minskar byggmedianen 27,65 procent för
 kompilatorkorpuset och 8,48 procent för Tabell mot tidigare SSA; Tabells

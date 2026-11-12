@@ -125,13 +125,17 @@ körbara moduler med linjärt minne, typade värdimporter och callbacks.
 De tre nativevärdarna har frysta kompilatorer för offlineåterbyggnad.
 
 På ARM64/macOS använder kompilatorn språkets egna isolerade tasks för
-verifiering och optimering av hela funktions-IR:er. Frontend, typning,
-sänkning och länkning behåller en ägare; färdiga jobb tas emot i källordning.
+verifiering, optimering och sänkning av hela funktions-IR:er. Frontend och
+typning behåller en Session; färdiga funktionsobjekt valideras och länkas i ordning.
 `--jobs N` eller `--jobs=N` väljer 1–256 workers. `--jobs=1`, `check`,
 `--mir=off` och `--profile-compiler` använder samma seriella Session-kedja.
 Antalet workers ändrar varken optimeringsbudgetar, cacheidentitet eller
 programbilder. Läs [taskkontraktet](docs/tasks.md) och
-[kompilatormätningen](benchmarks/2026-11-12-parallel-compiler/README.md).
+[kompilatormätningen](benchmarks/2026-11-12-regional-workers/README.md).
+Samma nya binär med en respektive fyra workers bygger det genererade
+korpuset på median 982,428 respektive 623,820 ms. Det senaste paketet är
+samtidigt 0,6–1,6 procent långsammare än föregående fyrtrådade standard,
+med lägre minnestopp i större byggen. Runtimebilderna är identiska.
 
 Kör verifieringen från reporoten med Python 3.9+, Node och en C-kompilator. C-kompilatorn bygger
 ett separat provbibliotek för ABI-kontrollen:

@@ -1,5 +1,12 @@
 # Lokala prestandamätningar
 
+[Regional värdeplacering och worker-sänkning, 2026-11-12](2026-11-12-regional-workers/README.md)
+har 1 260 prover över sex fall. Fyra workers ger 1,57× för genererat bygge,
+1,24× för seriell självhostingång och 1,22× för taskingången mot en worker.
+Det nya paketets byggmedianer är 0,64–1,56 procent högre än föregående
+fyrtrådade standard, med lägre minnestopp i större fall. Alla kontrollerade
+runtimebilder är identiska. SSA förblir av; ingen ny runtime/C-vinst påstås.
+
 Den aktuella självhostade kompilatorn mäts med
 [`tools/performance.py`](../tools/performance.py), som använder Python-standardbiblioteket.
 Den jämför två Dunder-kompilatorer med fyra runtimeprogram, ett genererat

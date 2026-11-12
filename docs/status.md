@@ -17,7 +17,7 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
   ARM64/macOS. Scopeägda trådar, separata pooler och kontrollerad kloning
   håller managed-värden åtskilda. Typ- och effektanalys kontrollerar workerns
   gräns; scope-exit väntar in jobben före cleanup. Kompilatorn använder samma
-  taskstöd för parallell MIR-verifiering och optimering. [Uppgifter och begränsningar](tasks.md).
+  taskstöd för parallell MIR-verifiering, optimering och sänkning. [Uppgifter och begränsningar](tasks.md).
 - Moduler har privata och exporterade symboler, alias, namngivna typer och
   stöd för cykliska importer. Typinferens, typade funktionsvärden, indirekta
   anrop, rekursion och aggregatreturer används i kompilatorns egen källkod.
@@ -67,50 +67,35 @@ SSA-steg ligger mellan frame- och värdepassen.
 `--mir=off` stänger av hela gränsen för jämförelse.
 [Omfattning och gränser](optimization.md).
 
-`--mir-ssa=on` aktiverar [`mir_ssa`](../selfhost/mir_ssa.ddr) och
-[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard är fortsatt **off**
-efter [aktuell v2-mätmatris](../benchmarks/2026-11-12-ssa-pruned/README.md).
-V2 bygger glesa block-/tillståndspar
-för verkliga beroenden och transportparametrar, delar verkliga oförändrade
-ingångsvärden och använder aktiva live-mängder/händelser för interferens.
-Egna ValueID:n, GP/NZCV def/use, blockparametrar och kantargument ger en
-SSA-grund över hela CFG:n. Privata åttabytesceller med
-fullbreddsskrivningar och inneslutna 1/2/4/8-bytesvyer kan få placering i
-GP0–GP17 mot fysisk liveness och fulla clobbers, med separat kontrollerad
-`source_inputs`-läsvy. Ursprungliga minnesskrivningar behålls; okända ingångs-/post-call-minnesversioner stannar
-i minnet. Frame, SP och etikett-/importnamespace ändras inte. Budgeten är
-4 194 304 enheter, med gles rollback och obligatorisk slutverifiering.
-Generellt SSA-baserat operationsval, uttrycksstackvärden, heap-CSE, LICM och
-direkt fysisk x86-registerallokering/Wasm-lokalplacering återstår.
+`--mir-ssa=on` aktiverar den valbara regionala Frame/Expr-kedjan;
+standard är fortsatt **off**. Privata åttabytesceller med fullbreddsskrivningar
+och inneslutna 1/2/4/8-bytesvyer delar GP0–GP17 med positivt identifierade
+privata uttryckstemporärer. En fysisk liveness-analys, gemensam interferens
+för båda värdefamiljerna och en exklusiv undo-transaktion används.
+Budgeten är totalt 4 194 304 enheter med obligatorisk slutverifiering.
 
-Källproducentens privata NoModRef, sex exakta utgångar utan observationer
-och anrops-ABI1 är separata versionsbundna premisser. Råa API-fabriker
-tillskriver inte godtycklig MIR dessa egenskaper. Rå-, minnes- och
-terminalkontexter ger ingen rätt att ändra ett okänt anrops synliga SP eller
-inkommande x25–x28. Framepasset avstår vid nåbara okända gränser utan
-tillräckligt kontrakt. Den kompletta källproducenten deklarerar ABI1 enligt
-[befintliga FFI-/privatminnesregler](ffi.md#objektminne-och-privata-stackceller).
-Anropssynkronisering, clobbermasker och giltiga argument bevaras.
-[Oberoende observerarmotexempel](../tools/test-mir-frame-exits.py).
+Regional återläsning efter en barriär kräver full åttabytesinitiering på
+alla inkommande vägar och ett separat kontrakt om aktiv frame-livstid efter
+normal retur. Minnesinnehåll får ändras av anropet. `stack_roles` anger
+ursprung; separat `source_temporaries` tillåter att privat uttryckslagring
+utelämnas. Rå stacktrafik, argument och observerande barriärer behålls.
+Source-object-, terminal-, call-input-, ABI-/frame- och temporärkontrakten
+är skilda premisser; råa fabriker är konservativa. Call läser och kan
+förstöra NZCV (`flags=3`); råmasker och clobbers begränsas inte.
+Cache/kvitton binder fysisk v5 och SSA:s `v3-regional-expression1-work4194304`.
+Generellt SSA-baserat operationsval, heap-CSE, LICM och direkt fysisk
+x86-registerallokering/Wasm-lokalplacering återstår.
 
-[`mir_call_inputs`](../selfhost/mir_call_inputs.ddr) är en separat
-`source_inputs`-premiss för hela källproducenten, false för råa fabriker.
-GP0–GP8, GP16, GP18–GP31, alla FP-register och explicita mål behålls.
-GP9–GP15/GP17 kan undantas som anropsindata endast utan semantisk
-scratchdependency hos callee och fortsättning; fler argument ligger på
-stacken. Råmasker, clobbers, minne och flaggor begränsas inte. FE-target X17
-och Wasm-FB-target X16 är explicita roller. Rå Call läser och kan förstöra
-NZCV (`flags=3`); tidigare `flags=2` var felaktig metadata, utan visad
-felkompilering i dagens värdepass. Cache/kvitton binder fysisk v4 med
-`call-flags1` och SSA:s `v2-pruned-inputs1-work4194304`.
+Den oberoende gemensamma matrisen passerar 725 målbilder, 397 native-/Wasm-
+körningar och 700 exakta bitjämförelser, inklusive återläsning och
+stackomskrivning i samma transaktion samt exakt rollback av alla 62 fält.
+Basmatrisen passerar 670/360/438 med 232 uttryckliga interpreterluckor;
+källacceptansen passerar 48 målbilder och 29 native-/Wasm-körningar med
+workers, cache och kvitton. Linux är endast bildbyggt i dessa matriser.
+Full verifiering inklusive seriell fixpunkt och byteidentiska självbyggen
+med en och fyra workers passerar. [Kontrakt och avgränsning](optimization.md).
 
-Aktuell v2-QA med `flags=3` passerar 670 målbilder, 360 native-/Wasm-
-körningar och 438 exakta bitjämförelser, med 232 separat redovisade luckor
-i den oberoende interpretern. Källacceptansen passerar 24 målbilder och
-17 native-/Wasm-körningar med workers, cache och kvitton. Linux är endast
-bildbyggt i dessa matriser. Full verifiering, inklusive bootstrapens
-byteidentiska självbyggen med en och fyra workers, passerar.
-
+Historiska v2-mätningar gäller föregående SSA, inte regional Frame/Expr.
 Med SSA på i båda kompilatorerna minskar v2 kompilatorkorpusets byggmedian
 27,65 procent mot v1; Tabell förbättras 8,48 procent i median men får
 20,41 procent högre p95. Samma nya kompilator med SSA av/på ger en
@@ -132,10 +117,19 @@ med oförändrad användarpolicy. Dessa siffror gäller v1, före gles v2 och
 
 Den taskbaserade kompilatorn behåller frontend, typning, nåbarhet,
 diagnostik, cache-I/O och inlinebudget i en enda Session. Workers returnerar
-ägda MIR-funktioner; föräldern sänker och länkar i källordning. `--jobs`
+numeriska `ObjectData` från samma pipeline och sänkning; föräldern validerar
+och länkar i ordning. Input är fortfarande en isolerad full MIR-snapshot. `--jobs`
 stöder 1–256 på ARM64/macOS-ingången. En worker, `check`, `--mir=off` och
 `--profile-compiler` använder samma seriella Session-väg. Workerantalet
 ändrar varken passbudgetar, cacheidentitet eller programbilder.
+
+Den [aktuella 1 260-proversmatrisen](../benchmarks/2026-11-12-regional-workers/README.md)
+ger 36,50 procent kortare genererad byggmedian och 19,56 procent kortare
+byggmedian för `selfhost/main.ddr` med samma nya binär och en→fyra workers.
+Mot den tidigare fyrtrådade standarden kostar paketet 0,64–1,56 procent i
+byggmedian; minnestoppen minskar för större byggen. Owned-fallets p95 ökar
+med fyra workers. Kontrollerade runtimebilder är byteidentiska; detta är
+ingen ny runtime/C-vinst. Frontenden är fortfarande seriell, utan workerpool.
 
 Den tidigare [30-rundorsmätningen av parallell kompilering](../benchmarks/2026-11-12-parallel-compiler/README.md),
 före SSA-grunden, ger med samma binär genererad byggmedian
