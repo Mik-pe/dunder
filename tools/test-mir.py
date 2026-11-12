@@ -228,6 +228,7 @@ class Interpreter:
             elif kind == 10:
                 stack = self.read(31) - 16
                 self.store(stack, self.read(op['a']), 8)
+                self.store(stack + 8, 0, 8)
                 self.write(31, stack)
             elif kind == 11:
                 stack = self.read(31)
