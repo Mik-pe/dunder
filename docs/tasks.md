@@ -1,6 +1,7 @@
 # Isolerade uppgifter
 
-`task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar.
+`task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar
+via pthreads på ARM64/macOS.
 Den första implementationen stöder ARM64/macOS utan runtimeprofilering.
 Nåbara taskoperationer på övriga mål avvisas före kodemission.
 
@@ -100,15 +101,27 @@ En enda `compile.Session` behåller frontend, typ- och lånekontroll,
 symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
 Föräldern lämnar ägda hela MIR-funktioner i ett begränsat taskfönster.
 Workers kör samma `mir_pipeline` som den seriella drivrutinen: verifiering,
-framepromovering, valbar SSA och värdepass, följt av nödvändig efterverifiering. Varje
-kallt jobb startar en OS-tråd och skapar lokal `pipeline.Workspace`.
-Fönstret omfattar högst `workers` källsteg; ingen permanent worker- eller
-arenapool används. Resultatet är ägd MIR och status/statistik;
-föräldern sänker till ett fristående `FunctionObject` och sammanfogar i
-källordning. Varken Session eller globala tabeller delas muterbart.
+framepromovering, valbar SSA och värdepass, följt av nödvändig
+efterverifiering. Samma worker sänker sedan funktionen med den gemensamma
+`mir_lower`-gången direkt till ägd numerisk `ObjectData`. Varje kallt jobb
+startar en OS-tråd och skapar lokala pipeline-/sänkningsarenor. Fönstret
+omfattar högst `workers` källsteg; ingen permanent worker- eller arenapool
+används. Resultatet innehåller slutobjekt och status/statistik, inte hela
+MIR-funktionen. Varken Session eller globala tabeller delas muterbart.
 
-Cacheträffar lämnar redan färdiga objekt utan verifiering eller optimering
-en andra gång. Beroenden och budgetdebitering återspelas i samma ordning
+`ObjectData` är en vanlig transparent post med primitiva arenor och går
+genom språkets befintliga snapshot-/klonregler. Den ger inget undantag för
+opaque-typer eller delat managed-minne. Föräldern kontrollerar version,
+ursprungsspann, plattform, lokala ord-/byteoffsetar, gränskarta, etiketter,
+relokeringar och import-site-ID:n före ordnad acceptans. Strukturell
+validering certifierar inte godtyckliga maskinords semantik: resultatet
+måste dessutom höra till exakt det utlämnade jobbet i samma taskscope,
+ordinal och deklaration. Föräldern kör ingen andra sänkning; den äger cache,
+ordnad länkning och slutlig bildpublicering. Frontend och typning är
+fortfarande seriella hos Session-ägaren.
+
+Cacheträffar lämnar redan färdiga objekt utan ny MIR-verifiering eller
+optimering. Cacheformat och objektstruktur valideras fortfarande. Beroenden och budgetdebitering återspelas i samma ordning
 som vid ett kallt bygge. Tidigare jobb tas emot före senare källfel, så
 färdigordningen ändrar inte första diagnostiken. Workerantalet ingår inte
 i cacheidentiteten och ändrar inga optimeringsbudgetar.
@@ -125,12 +138,13 @@ enums och inline C-layout är stoppunkter. Lokaler och fältprojektioner
 behåller värdesemantiken. Detta inför inga allmänna moves och tar inte bort
 isoleringskopiorna vid spawn/join.
 
-[Den parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den historiska [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
 skiljer samma binär med en respektive fyra workers från jämförelsen med
-den tidigare seriella kompilatorn. Genererat bygge med fyra workers når
-p95 619,768 ms, motsvarande 163 003 källrader/s. Runtimebilderna är
+den dåvarande seriella kompilatorn. Rapportens genererade bygge med fyra
+workers nådde p95 619,768 ms, motsvarande 163 003 källrader/s. Runtimebilderna är
 identiska; runtime/C-geomedlet är 1,178× och största kvoten 1,308×.
-Det återstående C-målet löses inte av snabbare kompilering.
+Det återstående C-målet löses inte av snabbare kompilering. Rapporten
+föregår regional SSA och worker-lokal sänkning och mäter inte deras kostnad.
 
 Den tidigare [språkmätningen med 30 rundor](../benchmarks/2026-11-12-isolated-tasks/README.md)
 visade 3,59× och 3,78× parad förbättring i två rena taskarbetsfall. Den

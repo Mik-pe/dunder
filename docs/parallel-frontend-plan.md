@@ -1,19 +1,25 @@
 # Frysta gränssnitt och parallell frontend
 
-Detta är en implementeringsplan från källrevision `f025cb5`, inte en beskrivning
-av redan införd parallell frontend. Nästa sammanhängande steg är att samma
-språkfrontend producerar en ägd, fullspråklig `TypedFunction` mot frysta
-deklarationsgränssnitt. Därefter kan både sänkning och typkontroll bli isolerade
-funktionsjobb. Ingen andra parser eller ny begränsad språkö ska införas.
+Planen började vid källrevision `f025cb5`; baslinjen nedan skiljer dagens
+worker-lokala maskinsänkning från ännu inte införd parallell frontend.
+Nästa sammanhängande steg är att samma språkfrontend producerar en ägd, fullspråklig `TypedFunction` mot frysta
+deklarationsgränssnitt. Då kan även typad kroppssänkning till MIR och
+typkontroll bli isolerade funktionsjobb. Ingen andra parser eller ny
+begränsad språkö ska införas.
 
 ## Vad som redan finns
 
 Standardkompilatorn på ARM64/macOS använder fyra workers. `--jobs=1..256`
 väljer storlek på ett begränsat taskfönster. Föräldern äger en `compile.Session`
 och utför fortfarande modulladdning, deklarationer, typ- och lånekontroll,
-kroppsemission, MIR-lift, sänkning, cache och slutlig sammanfogning. Workers
-tar emot en ägd `mir.Function` och kör verifiering och MIR-pass. Varje kallt
-jobb startar en OS-tråd och skapar en lokal pipeline-workspace; någon permanent
+kroppsemission, MIR-lift, cache och slutlig sammanfogning. Workers tar emot
+en ägd `mir.Function`, kör verifiering och MIR-pass och sänker därefter med
+samma lowerer direkt till slutlig numerisk `mir_lower.ObjectData`. De
+returnerar slutobjekt och statistik i stället för hela MIR-arenan. Föräldern
+strukturellt validerar objektet före ordnad acceptans, cache och länkning;
+den sänker inte en andra gång. Varje kallt jobb startar en riktig OS-tråd
+via språkets befintliga pthread-baserade taskruntime på ARM64/macOS och
+skapar lokala pipeline-/sänkningsarenor; någon permanent
 worker- eller arenapool finns inte. Kontrolläge, en worker, MIR-off och
 kompilatorprofilering använder den delade seriella Session-vägen.
 
@@ -22,13 +28,14 @@ Detta framgår av [compile_parallel](../selfhost/compile_parallel.ddr),
 [Session.next_into](../selfhost/compile.ddr#L2870).
 [Taskkontraktet](tasks.md) beskriver isolering och resultatskopiering.
 
-Den publicerade [parallellmätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den historiska [parallellmätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
 visar redan en vinst av MIR-parallellism: samma binär med en respektive fyra
 workers byggde det genererade programmet på median 953,718 respektive
 609,106 ms och den frysta seriella självhostingången på 874,940 respektive
 709,677 ms. Dessa värden kommer från den rapportens källrevision. De mäter
-varken parallell frontend eller hela bootstrapkedjan och är inte en aktuell
-baslinje för nästa implementation.
+varken parallell frontend eller hela bootstrapkedjan. De föregår också
+worker-lokal maskinsänkning och regional Frame-/Expr-placering och är ingen
+aktuell baslinje för den nya implementationen.
 
 ## Gränsen som saknas
 
@@ -208,9 +215,15 @@ Dagens [task-Data](../selfhost/task_data.ddr) tillåter inte delade RC-strängar
 borrows eller oklassificerade opaque-värden över gränsen.
 [lexer.Tokens](../selfhost/lexer.ddr#L5) är därför inte ett färdigt jobbobjekt.
 Använd primitiva ID-kolumner och packade UTF-8-bytearenor med offset/längd där
-källtext verkligen behöver transporteras. Befintligt `FunctionObject` är
-opaque; om det ska returneras direkt krävs en generell kontrollerad Data- eller
-packningsgräns. Ingen namnregel som specialgodkänner MIR är tillåten.
+källtext verkligen behöver transporteras. Befintligt `FunctionObject` är opaque och korsar inte taskgränsen. Den
+införda transparenta numeriska `mir_lower.ObjectData` använder de vanliga
+Data-/klonreglerna och valideras efter transport. Den bär lokala offsetar,
+globala symbol-ID:n, import-site-ID:n, ursprungsspann och en monoton
+operations-/ordgränskarta. Rätt form ger inget semantiskt certifikat för
+godtyckliga maskinord; exakt taskscope, ordinal och deklaration behåller
+resultatets betrodda ursprung. Ingen namnregel specialgodkänner MIR eller
+opaque-resultat. Denna transport kan återanvändas även efter den framtida
+TypedFunction-gränsen.
 
 För parallell typning blir nästa jobb `FunctionSource + FrozenInterface`.
 Det behöver namnupplösning och mer av världen än loweringjobbet. Börja med ett
@@ -266,15 +279,17 @@ optimeringsbudgetar får inte begränsa vilket giltigt språk som accepteras.
 och sourcebindings, alla mål och flagglägen samt separat mätt kostnad för den
 nya seriella gränsen. Behåll ingen omätt permanent dubbelrepresentation.
 
-### 2. Flytta full funktionssänkning till ägda jobb
+### 2. Flytta typad kroppssänkning till ägda jobb
 
-Session producerar TypedFunction i samma nåbarhetsordning, sammanför facts
-och låser typer/symboler och inlinebeslut. Workers kör sedan samma lowering
-och MIR-pipeline som seriellt. Returnera ägt resultat med ordinal, DeclID och
+Maskinsänkningen MIR→ObjectData kör redan i workers. Det framtida steget
+flyttar också den typade kroppens sänkning till MIR: Session producerar
+TypedFunction i samma nåbarhetsordning, sammanför facts och låser
+typer/symboler och inlinebeslut. Workers kör sedan samma fullspråkliga
+kroppssänkning, MIR-pipeline och slutobjektssänkning som den seriella vägen. Returnera ägt resultat med ordinal, DeclID och
 status; inga lånade slices av provisorisk Code.
 
-Använd befintlig ordered-linker och slutobjektscache. Refaktorera lowerers
-outputtransport generellt om opaque-resultatgränsen kräver det. Cacheträffar
+Använd befintlig ordered-linker, slutobjektscache och strukturellt validerad
+ObjectData-transport. Opaque-resultat ska fortsatt inte få ett typundantag. Cacheträffar
 går direkt till ordnad accept och kör inga backendpass igen. Serial/parallel
 har samma semantiska steg och policy; en worker återanvänder seriella arenor.
 

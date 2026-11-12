@@ -58,8 +58,11 @@ scheduling. Profilens fasintervall förblir seriella väggtider.
 En återupptagbar `compile.Session` äger frontend, typning, symboler, nåbarhet,
 inlinebudget, provisorisk kod och cache-I/O. `next_into` lämnar en ägd
 helfunktions-MIR åt gången. Jobbet verifierar och optimerar med egna
-arbetsarenor och returnerar MIR och statistik. Föräldern sänker till
-`FunctionObject` och sammanfogar genom `mir_link` i ursprunglig källordning.
+arbetsarenor och sänker sedan i samma OS-worker direkt till numerisk
+`mir_lower.ObjectData`. Svaret innehåller slutobjekt och statistik i stället
+för hela MIR-arenan. Föräldern validerar strukturen, gör ordnad acceptans,
+sparar cache och sammanfogar genom `mir_link` i ursprunglig källordning.
+Den kör ingen andra sänkning.
 Ingen worker lånar Session, Code eller globala importtabeller.
 
 Varje taskfönster omfattar högst `workers` källsteg och håller snapshots
@@ -70,7 +73,7 @@ arbetsminne. Cacheträffar använder redan slutligt sänkta objekt utan att kör
 MIR-passen igen. Diagnostik, bindningsposter, cacheberoenden, inlinebudgetar
 och kodbilder är deterministiska oberoende av färdigordning och workerantal.
 [Taskkontrakt](../docs/tasks.md) och
-[mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
+[historisk mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
 
 [Frysta interface och ägda typade frontendjobb](../docs/parallel-frontend-plan.md)
 är nästa planerade gräns. Dagens typning och frontendemission är fortfarande
@@ -84,9 +87,9 @@ framepromovering → valbar SSA → värdepropagering seriellt och i workers.
 Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
 diagnostik använder samma fulla frontend oberoende av passval.
 
-`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är fortsatt **off**
-efter [v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md).
-SSA på kostar 21,26 procent extra byggmedian för kompilatorkorpuset och
+`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är fortsatt **off**.
+I den historiska [v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+kostade SSA på 21,26 procent extra byggmedian för kompilatorkorpuset och
 29,47 procent för Tabell utan belagd samlad runtimevinst. MIR och MIR-opt
 måste också vara på. V2 bygger egna ValueID:n för GP/NZCV def/use,
 blockparametrar och föregångarkanternas argument glest efter verklig
@@ -99,16 +102,21 @@ fullbreddsskrivningar och inneslutna läsvyer på 1/2/4/8 byte. En cells
 phi-värden förenas och placeras i GP0–GP17 mot fysisk liveness och fulla
 clobbers. En separat `source_inputs`-premiss får förfina anropsläsningarna.
 Stores skriver fortsatt igenom till minnet och
-ingångs-/post-call-minnesversioner stannar i minnet. Inga nya frameceller,
+okända ingångsminnesversioner stannar i minnet. Efter en barriär får en
+fullt MUST-initierad åttabytescell fångas på nytt i en separat registerregion
+endast med giltigt frame-livstidskontrakt. Barriären bevisar ingen
+värdelikhet. Inga nya frameceller,
 SP-justeringar, etiketter eller import-ID:n skapas.
 
 Budgetsatt analys, placeringskontroll, gles undo och slutverifiering ryms
 inom 4 194 304 enheter per funktion. Avslag återställer funktionen exakt.
 `--timings=json` redovisar effektiv `ssa_enabled` och faktiska `ssa_*`-räknare
 från accepterade jobb. Förändringsräknarna gäller committade omskrivningar.
-Check och full cacheträff utför inget SSA-arbete. On/off och SSA-markören
-`v2-pruned-inputs1-work4194304` ingår i cache- och testkvittoidentiteten,
-liksom fysisk MIR-policy v4 med `call-flags1`. Workerantalet ingår inte.
+Check och full cacheträff utför inget SSA-arbete. On/off och
+SSA-markören `v3-regional-expression1-work4194304` ingår i cache- och
+testkvittoidentiteten. Fysisk v5 binder `call-flags1`, `stack-origin1`,
+`frame-life1` och källanrops-ABI2. De underliggande livstids-, ursprungs- och
+lagringspremisserna är fortsatt oberoende. Workerantalet ingår inte.
 
 [`mir_memory`](mir_memory.ddr), [`mir_terminals`](mir_terminals.ddr) och
 [`mir_call_abi`](mir_call_abi.ddr) håller privata NoModRef-celler, sex exakt
@@ -143,20 +151,44 @@ för Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller
 ingen meningsfull byggvinst där. Detta gäller v1 och är inga mätningar av
 gles v2 eller `source_inputs`; bootstrapprofilen behålls.
 
-Generellt SSA-baserat operationsval, uttrycksstackvärden, heap-CSE och
+Frame-livstid är en oberoende del av [`mir_call_abi.Context`](mir_call_abi.ddr).
+En normal retur ska återvända med samma FP/SP och giltiga, mappade
+caller-frameintervall; cellvärdena får ändras. Detta ändrar inga råa
+anropsmasker och ger varken NoModRef eller ett initieringsbevis. Ett separat
+full8 MUST-init-bevis krävs före regional återläsning efter barriären.
+
+[`mir.Function.stack_roles`](mir.ddr) markerar positivt ursprung för
+implementationens uttryckstemporärer; råa push/pop har ingen sådan rätt.
+[`mir_expr_stack`](mir_expr_stack.ddr) håller separat `source_temporaries`-
+behörighet för att elidera den privata sextonbyteslagringen och dess egna
+resursfel. Markeringen ensam, source-objects och call-ABI räcker inte.
+Argument, FP/LR, brygglagring och källadresserbara värden undantas. Explicita
+aritmetik-, index-, åtkomst- och kapacitetskontroller i andra operationer
+behåller sin ordning. En persistent LIFO-graf binder Temp-värden genom CFG
+och loopar; det är ingen matchning av intilliggande instruktioner.
+
+Frame- och Expr-värden går genom samma GP0–GP17-allokering med en fysisk
+liveness-beräkning, gemensamma konflikter, SSA-budget på 4 194 304 enheter
+och en gemensam undo-/slutverifiering. Båda delarna ser varandras levande
+värden innan ett register får väljas.
+
+Generellt SSA-baserat operationsval, vidare värdeplacering, heap-CSE och
 loopplacering återstår. Nuvarande registerplacering gäller den gemensamma
 logiska banken; direkt x86-registerallokering och Wasm-lokaler är framtida
 målbackendsteg. De funktionella proven visar korrekthet och minskad
 lasttrafik i vissa fall, men ger inget nytt latens- eller C-prestandaanspråk.
-Aktuell riktad v2-QA med `flags=3` passerar 670 målbilder och 360 native-/
+Historisk riktad v2-QA med `flags=3` passerade 670 målbilder och 360 native-/
 Wasm-körningar, med 438 exakta bitpar och 232 redovisade interpreterluckor.
-Källacceptansen passerar 24 målbilder och 17 körningar. Linux är endast
-bildbyggt i dessa matriser. Full verifiering passerar också, inklusive
-bootstrapens fixpunkt med en och fyra workers. V2 minskar SSA-byggmedianen
-för kompilatorkorpuset 27,65 procent mot v1, men runtime/C-geomedlet 1,1841
-med passet på klarar inte C-gränsen. Analysvinsten och standardvalet är
-separata beslut.
+Den matrisens källacceptans passerade 24 målbilder och 17 körningar. Linux är endast
+bildbyggt i dessa matriser. Den revisionens fulla verifiering passerade
+också, inklusive bootstrapens fixpunkt med en och fyra workers. V2 minskade
+SSA-byggmedianen för kompilatorkorpuset 27,65 procent mot v1, men runtime/C-geomedlet 1,1841
+med passet på klarar inte C-gränsen. Analysvinsten och standardvalet var separata beslut. Dessa resultat
+beskriver den frysta v2-revisionen, före regional återläsning, gemensam
+Frame-/Expr-placering och worker-lokal sänkning.
 [SSA- och rollback-orakel](../tools/test-mir-ssa.py),
+[gemensam placering](../tests/mir_ssa_joint.ddr),
+[ObjectData-livstid](../tools/test-mir-object-data.py),
 [käll-/worker-/cacheprov](../tools/test-ssa-source.py) och
 [detaljerad omfattning](../docs/optimization.md#ssa-för-privata-framevärden).
 
@@ -251,10 +283,10 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 | `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, värdesemantik, källordning och slutlig emission. |
 | `compile_parallel.ddr`, `mir_task.ddr` | Begränsade taskfönster, ägda funktionsjobb och ordnad acceptans. |
 | `mir_pipeline.ddr` | Samma verifiering och frame-/valbara SSA-/värdepass för seriell körning och workers. |
-| `mir_ssa.ddr`, `mir_ssa_cells.ddr` | Budgeterad privat cell-SSA, smala läsvyer, blockparametrar och registerplacering mot fysisk liveness. |
+| `mir_ssa.ddr`, `mir_ssa_cells.ddr`, `mir_expr_stack.ddr` | Regional frame-SSA och positiva Temp-värden i gemensam registerplacering, med separata livstids-/lagringspremisser. |
 | `mir_memory.ddr`, `mir_terminals.ddr`, `mir_call_abi.ddr` | Separata producentpremisser för objektminne, exakta terminalobservationer och källanropens ABI. |
 | `mir_call_inputs.ddr` | Separat semantisk anropsindata-vy för den kompletta källproducenten; råkontraktet bevaras. |
-| `mir_lower.ddr`, `mir_link.ddr` | Fristående funktionsobjekt och deterministisk sammanfogning. |
+| `mir_lower.ddr`, `mir_link.ddr` | Worker-lokal sänkning, numerisk ObjectData-transport, strukturell objektvalidering och ordnad sammanfogning. |
 | `record_take.ddr` | Normalisering vid transfer av unika fulluttryckstemporärer; lokaler flyttas inte. |
 | `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
 | `opt_ir.ddr`, `opt_parse.ddr` | Återanvändbar typad funktionsmodell och konservativ skalär parser. |

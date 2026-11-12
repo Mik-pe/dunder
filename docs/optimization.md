@@ -8,7 +8,8 @@ index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen
 Huvudarkitekturen är nu en
 [gemensam IR för hela funktioner](whole-function-ir-plan.md), med samma gräns
 för skalära kroppar, anrop och ägda värden. En första valbar SSA-grund
-placerar privata framevärden i register. Planen beskriver fortsatt generell
+placerar privata Frame- och positivt identifierade Temp-värden gemensamt
+i register. Planen beskriver fortsatt generell
 SSA-sänkning, loopoptimering och direkta målbackends.
 
 ## Gemensam helfunktionskedja
@@ -50,11 +51,27 @@ uppnått C-mål.
 hela källtraverseringen. Ett kallt jobb får en ägd, lyft MIR-funktion;
 [`mir_pipeline`](../selfhost/mir_pipeline.ddr) utför samma obligatoriska
 verifiering, begränsade pass och efterverifiering seriellt eller i en task.
-Varje kallt taskjobb skapar en lokal `pipeline.Workspace` i en ny OS-tråd
-och returnerar ägd MIR och statistik. Det finns ingen permanent worker-
-eller arenapool. Sänkning till `FunctionObject`, ordnad acceptans, cachelagring och länkning
-sker hos föräldern. Först efter färdig sammanfogning ersätts den provisoriska
+Varje kallt taskjobb skapar lokala pipeline- och sänkningsarbetsminnen i en
+ny OS-tråd. Efter verifiering och pass sänker workern själv till ett slutligt
+funktionsobjekt och returnerar kompakt numerisk `ObjectData` samt statistik.
+Hela MIR-arenan skickas inte tillbaka. Den vanliga task-Data-gränsen används;
+opaque-objekt får inget typundantag. Föräldern validerar objektets fulla
+struktur före ordnad acceptans, cachelagring och länkning. Det finns ingen
+permanent worker- eller arenapool. Först efter färdig sammanfogning ersätts den provisoriska
 bilden. Cacheträffar är redan slutligt sänkta och får inget nytt backendjobb.
+
+`mir_lower.new_data()` skapar transportarenan;
+`lower_data_into(&mut data, &verified_function)` kör samma sänkningsgång
+som den seriella vägen. Förälderns
+`from_data_into(&mut object, &data)` validerar hela objektet före import.
+`ObjectData.boundaries` är en explicit monoton operations-/ordgränskarta
+med tillåtna upprepningar för raderade operationer. `Code.labels` är tom
+och övrig oanvänd Code-metadata har standardvärden; validerarens scratch
+ligger separat. Gränskartan döljs aldrig i en arrays kapacitet eller i
+etikettabellen. Indata är fortfarande en ägd full MIR-snapshot, och
+resultatet klonas enligt de vanliga taskreglerna. Detta är ingen
+nollkopierande eller delad minnesgräns.
+[ObjectData och task-livstid](../tools/test-mir-object-data.py).
 
 [`compile_parallel`](../selfhost/compile_parallel.ddr) äger begränsade
 fönster av språkets isolerade tasks. Antalet workers ändrar inte symbol-
@@ -135,7 +152,7 @@ inkommande x25 från `333` till `13`. De
 framepass vid nåbara okända utgångar och anrop utan tillräckligt ABI. Ett
 terminalkontrakt ensamt tillåter heller inte anrop.
 
-Fyra versionsbundna producentpremisser prövas var för sig:
+Minnes-, terminal-, anrops-ABI- och indatapremisserna prövas var för sig:
 
 - [`mir_memory`](../selfhost/mir_memory.ddr) ger NoModRef för bevisat privata
   celler vid giltiga indirekta objektåtkomster. Det ger inget anrops-ABI.
@@ -187,6 +204,70 @@ främmande anrop får inte inspektera andra privata lokaler genom stackvandring.
 [Frame-/utgångsprov](../tools/test-mir-frame-exits.py) ·
 [FFI-prov](../tools/test-ffi.py).
 
+### Frame-livstid och privat temporärlagring
+
+[`mir_call_abi.Context`](../selfhost/mir_call_abi.ddr) håller frame-livstid
+oberoende av källanropens register-/SP-premiss.
+`trusted_frame_lifetime_v1()` lovar att en normal retur återkommer till
+samma aktivering med samma FP/SP och att dess ursprungliga aktiva
+frameintervall fortfarande är mappade, åtkomliga och vanliga, icke-volatila
+byte. `trusted_source_frame_abi_v2()` kombinerar de två premisserna; den
+konservativa fabriken lovar ingendera. Calleen får fortfarande läsa och
+ändra cellvärden. Råa call-masker, clobbers, NZCV och minnesbarriärer
+behålls. Livstid ger varken NoModRef eller initieringsbevis.
+
+Regional SSA skiljer registerregioner åt vid minnesbarriärer. Ett separat
+MUST-init-bevis kräver att alla åtta byte har skrivits på samtliga nåbara
+föregångarvägar; okänt ingångsminne och delvis initierade celler kvalificerar
+inte. Med giltig frame-livstid kan en ny fullbreddsläsning fånga cellens
+aktuella värde efter barriären och inleda en ny registerregion. Den jämställs
+aldrig med värdet före anropet. Återläsningens plats, bredd, scratchbehov och
+liveness verifieras separat.
+
+[`mir.Function.stack_roles`](../selfhost/mir.ddr) är en parallell
+ursprungskolumn, det 62:a fältet i denna modellversion. Noll betyder rått,
+argument-, brygg- eller ospecificerat stackbruk; ett är ett positivt
+producentvittne för en privat uttryckstemporär. Vanliga push/pop blir inte
+Temp genom sin instruktion eller placering. Den fulla frontendens
+`arm.push_temp`/`pop_temp` lämnar explicita spann och lyftaren kontrollerar
+hela hjälparen. Utgående argument, FP/LR, bryggtillstånd och adresserbara
+källobjekt behåller sina egna roller.
+
+Ursprung ger ännu ingen rätt att ta bort minnesåtkomst eller dess möjliga
+fälla. [`mir_expr_stack.Context`](../selfhost/mir_expr_stack.ddr) ger separat
+lagringsrätt genom `trusted_source_expression_storage_v1()` och
+`source_temporaries`; råa fabriker väljer false. Premissen kräver att hela
+den sexton byte stora Temp-enheten, inklusive utfyllnad, är privat under
+hela sin logiska livstid och inte kan observeras genom alias eller senare
+läsningar. Den tillåter att implementationens egen temporärlagring och
+dess allokerings-/guard-/OOB-resursfel elideras. Andra operationers explicita
+aritmetik-, index-, åtkomst- och kapacitetskontroller behåller sin ordning.
+Varken NoModRef, NoReturn, frame-livstid eller en Temp-markering ensam ger
+denna lagringsrätt.
+
+Explicita `StackPush`/`StackPop`, både råa och Temp, har MayTrap i de
+kanoniska effekterna 37/35. Expr-passet bevarar role0-trafik och dess
+guards; endast den separata lagringsbehörigheten tillåter Temp-elision.
+Det är inget kompilatoromfattande bevis för alla äldre stackresursfel.
+`Abi21`-paren för FP/LR har fortfarande 36/34 utan MayTrap, och den äldre
+framepromoveringens resursantagande är en separat befintlig fråga.
+
+Uttrycksvärden bildar en persistent LIFO-graf med en nod per faktisk push.
+CFG-joins förenar värden på samma djup och länkarna under toppen bär dem
+genom loopar. Det är ingen matchning av intilliggande push/pop. Frame- och
+Expr-regioner går till samma GP0–GP17-allokering, med en fysisk
+liveness-beräkning och gemensamma interferensvillkor. Båda delarna ryms i
+samma SSA-budget på 4 194 304 enheter och samma undo-/slutverifiering.
+Ingen separat efterpassallokerare får låna register utan att se den andra
+delens levande värden. `mir_ssa.optimize_values_with_contracts_budget` får
+separata minnes-, terminal-, call-input-, ABI- och Expr-kontexter samt en
+gemensam arbetsgräns; ingen kontext får härledas ur en annan.
+
+[Regional SSA](../selfhost/mir_ssa.ddr) ·
+[Temp-ursprung](../tests/mir_stack_origin.ddr) ·
+[Uttrycksstackens kontrakt](../tests/mir_expr_stack.ddr) ·
+[Gemensam Frame-/Expr-placering](../tests/mir_ssa_joint.ddr).
+
 ### SSA för privata framevärden
 
 [`mir_ssa`](../selfhost/mir_ssa.ddr) är en verklig, begränsad SSA-grund över
@@ -225,9 +306,13 @@ scratchdefinitioner och full anropsförstörelse. Endast den separata
 `source_inputs`-premissen får förfina anropsläsningar i liveness. Fulla
 clobbers fortsätter att hindra att registervärden överlever anrop. Ursprungliga
 frame-skrivningar finns kvar i samma ordning och skriver igenom till minnet.
-Ingångens och post-call-barriärernas okända minnesversioner stannar i minnet.
-Passet växer inte framen, ändrar inte SP och skapar inga nya etikett- eller
-import-ID:n. CFG bevaras; sänkningen räknar om kodpositionerna.
+Okända minnesversioner förblir minnesvärden; efter en barriär kan ett
+fullständigt MUST-init- och frame-livstidsbevis tillåta en ny fångst i en
+separat region. Ingen värdelikhet antas över barriären.
+Den ordinarie framereservationen och globala ID:n behålls. Godkänd
+Temp-elision tar bort just dess märkta push/pop och SP-aktivitet; inga nya
+frameceller eller SP-justeringar skapas. Argument-/brygglagring och övriga
+ABI-roller består. CFG bevaras; sänkningen räknar om kodpositionerna.
 
 Arbetsminnet består av återanvändbara platta arenor. Budgeten på 4 194 304
 enheter omfattar analys, placeringsvittnen, stagning och slutverifiering.
@@ -236,27 +321,31 @@ exakt vid avslag. En accepterad omskrivning fullverifieras innan den får
 lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
-gemensamma seriella/taskbaserade kedjan. Standard förblir **off** efter
-[v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md):
-byggmedianen ökade 21,26 procent för kompilatorkorpuset och 29,47 procent
+gemensamma seriella/taskbaserade kedjan. Standard förblir **off**. I den
+historiska [v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+ökade byggmedianen 21,26 procent för kompilatorkorpuset och 29,47 procent
 för Tabell utan belagd samlad runtimevinst. Effektiv aktivering
 kräver både MIR och MIR-opt; `check`, avstängt steg och full cacheträff utför
 inget SSA-arbete. Cache och testkvitton skiljer on/off och SSA-markören
-`v2-pruned-inputs1-work4194304` åt. Den fysiska MIR-policyn är version 4 med
-`call-flags1`, så äldre call-metadata hålls åtskilda även när SSA är avstängt.
+`v3-regional-expression1-work4194304` åt. Fysisk MIR-policy v5 binder
+`call-flags1`, `stack-origin1`, `frame-life1` och källanrops-ABI2 även när SSA
+är avstängt. Regional livstid, positivt ursprung och privat lagringsrätt är
+separata premisser trots den gemensamma policyidentiteten.
 `--timings=json` visar `ssa_enabled`, `ssa_optimized`, `ssa_cells`,
 `ssa_values`, `ssa_parameters`, `ssa_registers`, `ssa_removed_loads`,
 `ssa_removed_stores`, `ssa_removed_pushes`, `ssa_removed_pops`, `ssa_copies`,
-`ssa_analysis_units` och `ssa_budget_refusals`. Förändringsräknarna avser
+`ssa_captures`, `ssa_stack_groups`, `ssa_analysis_units` och
+`ssa_budget_refusals`. Förändringsräknarna avser
 committade SSA-resultat i accepterade jobb; arbete och budgetavslag visar
-faktiska försök. Store-, push- och pop-eliminering ingår inte i denna version.
+faktiska försök. Ursprungliga frame-stores bevaras; endast godkänd privat
+Temp-lagring får förlora sina push/pop.
 
-Den aktuella funktionella v2-matrisen med `flags=3` passerar 670 målbilder
+Den historiska funktionella v2-matrisen med `flags=3` passerade 670 målbilder
 över 72 vektorer i 28 grupper, 360 native-/Wasm-körningar och 438 exakta
 bitjämförelser före/efter. Ytterligare 232 par har uttryckligen redovisade
 luckor i den oberoende interpretern, bland annat anrop, flyttal och externa
 utgångar; dessa räknas inte som interpreterbevis. Observerande anropsprov
-körs i riktiga native-/Wasm-bilder. Källacceptansen passerar också 24
+körs i riktiga native-/Wasm-bilder. Den matrisens källacceptans passerade också 24
 målbilder och 17 native-/Wasm-körningar med workers, cache och kvitton.
 Linuxmålen är endast bildbyggda i dessa matriser. De riktade resultaten
 ersätter varken full bootstrapverifiering eller en representativ mätmatris.
@@ -267,7 +356,7 @@ Tidigare strukturella prov med sex→noll laster men 26→30 kodord och
 [SSA-kontrakt](../tests/mir_ssa.ddr) ·
 [Källkod, workers, cache och kvitton](../tools/test-ssa-source.py).
 
-Generellt SSA-baserat val av skalära operationer, uttrycksstackvärden,
+Generellt SSA-baserat val av skalära operationer, vidare värdeplacering,
 heap-CSE, LICM och direkt registerallokering per mål återstår. Den nuvarande
 placeringen använder den gemensamma logiska GP-banken. Den innebär ingen
 fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
@@ -283,16 +372,17 @@ bootstrapprofilen aktiverar SSA på detta historiska underlag. Fortsatt
 värdeanalys och placering behöver dela arbete; den nya mekanismens totala
 kostnad och nytta måste vägas ihop före aktivering.
 
-Den aktuella jämförelsen med samma slutliga källor och SSA på i båda
+Den historiska v2-jämförelsen med samma slutliga källor och SSA på i båda
 kompilatorerna minskade kompilatorkorpusets byggmedian 27,65 procent och
 Tabells 8,48 procent; Tabells p95 ökade samtidigt 20,41 procent. Detta
 mäter hela v2-ändringen, inte en isolerad effekt av en enskild mekanism.
-Nya kompilatorns av/på-serie gav runtime/C-geomedel 1,1883 respektive
+Rapportens v2-kompilator gav i av/på-serien runtime/C-geomedel 1,1883 respektive
 1,1841; text och sort med SSA på låg på 1,3376 och 1,2649. C-gränserna
 1,10 och 1,25 är fortfarande öppna. Genererat bygge med SSA på klarar
-100 000-gränsen vid p95 med 159 866 rader/s. Den minskade analyskostnaden
-motiverar fortsatt arbete med gemensamma skalära värden, operationsval och
-uttrycksstack; den motiverar ingen standardaktivering på egen hand.
+100 000-gränsen vid p95 med 159 866 rader/s i den rapporten. Siffrorna
+föregår regional återläsning, gemensam Frame-/Expr-placering och
+worker-lokal sänkning. De är inga nya mätningar eller aktiveringsbeslut för
+den här etappen.
 
 ### Värdeidentitet över kontrollflödet
 
@@ -695,13 +785,13 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA-v2 minskar byggkostnaden mot v1 men ger ingen belagd samlad runtimevinst; standard förblir off. Anropsbevarande, semantiska indata, NoModRef och terminalobservationer är skilda premisser. |
+| Helfunktionsvärden, SSA och minnesmodell | Regional Frame-SSA och positivt identifierade privata Temp-värden delar GP0–GP17-allokering. Ursprungliga frame-stores bevaras. Generellt operationsval och vidare värdeplacering återstår. | Standard är off tills hela etappens resultat bedömts. Anropsbevarande, frame-livstid, semantiska indata, NoModRef, temporärlagring och terminalobservationer är separata premisser. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
 | POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
 | Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
-| Kortare bygglatens | MIR-verifiering och optimering körs nu parallellt genom samma Session; frontend, sänkning och länkning har en ägare. Nästa steg kan återanvända fler typade resultat och beroendesammanfattningar. | Behåll stabil diagnostik, byteidentiska bilder och budgetar. Fortsatt arbete måste mäta varm cache, privat kroppsändring och delad layoutändring separat från kalla byggen. |
+| Kortare bygglatens | Workers verifierar, optimerar och sänker till numeriska slutobjekt. Frontend, ordnad acceptans, cache och länkning har en ägare. Nästa steg är den typade frontendgränsen. | Behåll stabil diagnostik, byteidentiska bilder och budgetar. Fortsatt arbete måste mäta varm cache, privat kroppsändring och delad layoutändring separat från kalla byggen. |
 
 Prioritera nästa mekanism efter profiler och maskinkod för arbetsfallen
 som fortfarande missar målet. Mät allokering och kopiering i lexer, parser
