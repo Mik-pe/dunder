@@ -69,8 +69,11 @@ Runtimearbetet ska angripa trafik över hela loopar. Det ursprungliga
 underlaget var den numeriska benchmarkens nio frame-läsningar och fyra
 frame-skrivningar per framgångsrikt varv, medan C-referensen höll värdena i
 register. Det styr prioriteringen men är ingen regel passet får känna till.
-De nya strukturella SSA-proven behöver följas av hela mätmatrisen innan
-aktivering som standard eller påståenden om runtimevinst.
+Den nya [SSA-mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+visar att första cellplaceringen kostar för mycket byggtid utan samlad
+runtimevinst. Den är valbar och förblir off som standard. Fortsättningen
+behöver en gemensam värdemodell och explicita anropsargument, inte fler
+oberoende fulla analysgångar.
 
 ## Kontrakt som måste hålla
 
@@ -166,8 +169,11 @@ Den kompletta källproducenten deklarerar de verifierade premisserna;
 Premisserna använder [befintliga FFI-/objektregler](ffi.md#objektminne-och-privata-stackceller),
 utan att försvaga språkets minnes- eller anropsgarantier.
 
-`--mir-ssa=on/off` är valbart och standarden är off tills mätmatrisen är
-bedömd. Cache och testkvitton skiljer policy, SSA-v1 och budget åt.
+`--mir-ssa=on/off` är valbart och standarden förblir off efter
+[den fulla mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md).
+Kompilatorkorpusets byggmedian ökade 70,92 procent och Tabells 42,34 procent;
+runtime/C-geomedlet förbättrades inte. Inte heller SSA-optimerad producentkod
+gav meningsfull byggvinst med oförändrad användarpolicy. Cache och testkvitton skiljer policy, SSA-v1 och budget åt.
 Källrapportens förändringsräknare räknar committade SSA-resultat från
 accepterade jobb; check och full cacheträff kör inga nya pass.
 [Oberoende SSA-/rollback-prov](../tools/test-mir-ssa.py),
@@ -175,8 +181,10 @@ accepterade jobb; check och full cacheträff kör inga nya pass.
 [käll-/worker-/cacheprov](../tools/test-ssa-source.py) beskriver
 funktionsomfattningen. Linuxbilder byggs men körs inte i denna SSA-matris.
 Att ett loopprov har sex→noll laster men 26→30 kodord ger inget
-latenspåstående. Nya runtime- och kompileringstidsresultat måste mätas
-separat före standardaktivering.
+latenspåstående. Nästa värdemodell behöver återanvända analyser och ersätta
+duplicerade pass. Explicita anropsargument och targetoperander behövs också:
+råa call-masker får inte försvagas för att skapa lediga register. Nya runtime-
+och kompileringstidsresultat krävs före standardaktivering.
 
 ## Exklusiv transaktionsgräns
 

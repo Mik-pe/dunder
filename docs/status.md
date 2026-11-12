@@ -68,8 +68,9 @@ SSA-steg ligger mellan frame- och värdepassen.
 [Omfattning och gränser](optimization.md).
 
 `--mir-ssa=on` aktiverar [`mir_ssa`](../selfhost/mir_ssa.ddr) och
-[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard är **off** i väntan
-på hela mätmatrisen. Egna ValueID:n, GP/NZCV def/use, blockparametrar och
+[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard förblir **off** efter
+[mätt byggkostnad utan samlad runtimevinst](../benchmarks/2026-11-12-ssa-foundation/README.md).
+Egna ValueID:n, GP/NZCV def/use, blockparametrar och
 kantargument ger en SSA-grund över hela CFG:n. Privata åttabytesceller med
 fullbreddsskrivningar och inneslutna 1/2/4/8-bytesvyer kan få placering i
 GP0–GP17 mot originalets fulla fysiska liveness och clobbers. Ursprungliga
@@ -93,8 +94,10 @@ SSA:s funktionella matris ger 554 målbilder, 292 native-/Wasm-körningar
 och 438 exakta bitjämförelser före/efter, med 116 separat redovisade
 interpreterluckor. Linux är endast bildbyggt i denna matris. Sex→noll laster
 och 26→30 ord i ett loopprov samt 81→noll laster och 329→249 ord i ett
-80-värdesprov är strukturella resultat. Ingen SSA-runtime- eller
-kompileringstidsvinst är ännu publicerad. Käll-/worker-/cacheprov kontrollerar
+80-värdesprov är strukturella resultat. Med SSA på ökade kompilatorkorpusets
+byggmedian 70,92 procent och Tabells 42,34 procent; runtime/C-geomedlet var
+1,181 mot 1,178 med passet av. En separat SSA-optimerad kompilatorbinär gav
+ingen meningsfull byggvinst med oförändrad användarpolicy. Käll-/worker-/cacheprov kontrollerar
 resultat, diagnostik, effektiva räknare och skilda on/off-kvitton.
 [SSA-orakel](../tools/test-mir-ssa.py) ·
 [Källprov](../tools/test-ssa-source.py) ·

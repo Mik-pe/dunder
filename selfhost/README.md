@@ -80,8 +80,11 @@ framepromovering → valbar SSA → värdepropagering seriellt och i workers.
 Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
 diagnostik använder samma fulla frontend oberoende av passval.
 
-`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är **off** tills
-representativa runtime- och byggmätningar har bedömts. MIR och MIR-opt måste
+`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard förblir **off** efter
+[representativa runtime- och byggmätningar](../benchmarks/2026-11-12-ssa-foundation/README.md).
+Passet ökade kompilatorkorpusets byggmedian 70,92 procent utan samlad
+runtimevinst. En separat SSA-optimerad producentbinär gav ingen meningsfull
+byggvinst; bootstrapprofilen behålls. MIR och MIR-opt måste
 också vara på. Steget bygger egna ValueID:n för GP/NZCV def/use,
 blockparametrar och föregångarkanternas argument.
 [`mir_ssa_cells`](mir_ssa_cells.ddr) grupperar privata åttabytesceller med

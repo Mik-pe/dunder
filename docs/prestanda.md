@@ -1,6 +1,24 @@
 # Så mäter vi Dunder
 
-Den senaste [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den senaste [SSA-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+har 30 försök per variant på ARM64/macOS. Samma kompilator med SSA av/på
+gav följande byggmedianer i millisekunder:
+
+| Arbetsfall | SSA av | SSA på | Förändring |
+| --- | ---: | ---: | ---: |
+| Genererat bygge | 606,871 | 613,026 | +1,01 % |
+| Kompilatorkorpuset | 762,977 | 1 304,080 | +70,92 % |
+| Tabell | 17,564 | 25,001 | +42,34 % |
+
+Alla fyra runtimebilder ändrades, men runtime/C-geomedlet blev 1,181 mot
+1,178 med SSA av. En separat SSA-optimerad kompilatorbinär, med samma
+användarpolicy SSA av, ändrade byggmedianerna mindre än 0,3 procent och gav
+sämre p95 i flera fall. Varken standardprofilen eller bootstrapens
+producentprofil ändras på detta underlag. SSA förblir valbart med
+`--mir-ssa=on`; C-målet är öppet. Kompilatorkorpuset är fortsatt den seriella
+ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
+
+Den tidigare [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
 har 30 försök per variant på ARM64/macOS. Den skiljer två jämförelser:
 samma taskbaserade kompilator med en respektive fyra workers, och tidigare
 seriell kompilator mot den nya standarden med fyra workers. Tabellen visar
@@ -16,13 +34,13 @@ Självbygget avser det fasta kompilatorkorpuset `selfhost/main.ddr`, som
 skriver den seriella kompilatoringången. Tiden för `main_parallel.ddr`
 och hela frö-/fixpunktkedjan i `bootstrap.sh` ingår inte i dessa värden.
 
-Den nya standardkandidatens genererade p95 är **619,768 ms**, motsvarande
+Den dåvarande standardkandidatens genererade p95 var **619,768 ms**, motsvarande
 **163 003 källrader/s**. Det klarar 100 000-gränsen för det uppmätta
 genererade korpuset. Frontend, sänkning, ordnad sammanfogning och publicering
 ingår; enbart MIR-verifiering och optimering körs parallellt. `check` och
 kompilatorprofilering använder fortsatt den delade seriella vägen.
 
-Runtimebilderna är byteidentiska. Den aktuella jämförelsen mot C ger
+Runtimebilderna var byteidentiska i den jämförelsen. Den gav
 geometriskt medel **1,178×** och största kvoten **1,308×**, över målen
 1,10× och 1,25×. Snabbare kompilering innebär därför inte att hela
 acceptanskontraktet nedan är uppfyllt. Tidigare

@@ -190,8 +190,19 @@ These producer builds are acceptance, not a whole-bootstrap latency result.
 ## Correctness reports and coverage limits
 
 [`verification/full-verify-c4fd247.log`](verification/full-verify-c4fd247.log)
-is root's completed exit 0 full verification before the matrices. Separate final
-receipts/native ABI audits may be added by root; they are not fabricated here.
+is the completed exit 0 full verification before the matrices.
+[`final-acceptance.json`](verification/final-acceptance.json) binds its log,
+the measured standard compiler, final SSA module and acceptance counts.
+Compiler/runtime sources and frozen seeds did not change between that
+verification and the measurements or publication.
+
+The integrated
+[`parallel report`](verification/parallel-integrated-c4fd247.json) records
+108 images and 76 actual executions (64 ARM64/macOS, 12 Wasm).
+The [`frame-exit report`](verification/frame-exits-integrated-c4fd247.json)
+retains raw observer regressions and explicit producer-contract checks,
+including 32 terminal/source images. Linux targets are image-only in these
+reports.
 
 Two SSA QA reports are preserved verbatim:
 
@@ -209,6 +220,33 @@ the ARM64/macOS host. The expression-stack case provides semantic coverage
 without promising a stack optimization. This finite cohort is not a universal
 proof of the pass.
 
+### Native ABI probe and bounded runtime audit
+
+The final [`native ABI receipt`](verification/abi/result-5f92b8d8fb99.json)
+passes X19–X28, D8–D15 and FP/SP sentinels through a real source callback,
+promoted internal calls with twelve arguments, text runtime calls, and a
+twelve-argument C call. Its image hash is identical to the preserved
+[`previous standard`](verification/abi/result-bbd35784aff9.json) and
+[`repair-only compiler`](verification/abi/result-f37d0ad2074e.json) results.
+The [`probe driver`](verification/abi/probe.py) reuses the existing independent
+assembly oracle in `tools/test-task-native.py`; source and generated C/assembly
+are preserved alongside the receipts.
+
+The [`runtime inventory`](verification/abi/runtime-inventory.log) covers seven
+target/profile variants. Its bounded instruction audit found no explicit
+X25–X28 use in the examined native runtime helpers; the six Wasm custom memory
+operations were separately checked against their producer. This is evidence
+for the documented source ABI contract, not permission to narrow raw call
+read/clobber masks.
+
+The separate [`call-input survey`](verification/abi/call-input-analysis.json)
+is read-only preparation for a future explicit call-operand model. It is not
+an active compiler policy or proof for arbitrary external code. In particular,
+the x86 foreign-call pseudo-operation reads logical register 17 as its target,
+although the current generic decoder does not expose that operand. The current
+conservative call masks retain it. Any future narrowing must first represent
+this real input and preserve unknown-call behavior.
+
 ## Reproduction and preservation
 
 Metadata, CSV and logs are verbatim copies. Binary outputs and scratch compiler
@@ -216,6 +254,14 @@ executables are omitted; their identities remain in metadata. Original CSV
 CRLF bytes are preserved; Git checks can use `core.whitespace=cr-at-eol`.
 `checksums.sha256` covers every other archived file. Historical absolute scratch
 paths identify the original run and need not exist in the archive.
+
+The archived ABI drivers originally ran from `build/abi-audit`, two directory
+levels below the repository root. To rerun them, copy that archived ABI
+directory to a fresh ignored directory at the same depth before running
+`probe.py <compiler>`. The native probe needs Clang and macOS tools and imports
+the existing repository oracle. It generates a dylib and rewrites its own
+probe source with that dylib's absolute path; a different directory can change
+the consumer image hash. No probe binaries or dylibs are archived.
 
 Restore source c4fd247 and matching frozen hosts, then use empty output paths:
 

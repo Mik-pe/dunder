@@ -20,11 +20,19 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[SSA-grund och ABI-kontrakt, 2026-11-12](2026-11-12-ssa-foundation/README.md)
+prövar den valbara cell-SSA:n och en separat SSA-optimerad producentbinär.
+SSA på ökade kompilatorkorpusets byggmedian 70,92 procent och Tabells
+42,34 procent utan samlad runtimevinst mot C. Producentprofilen gav ingen
+meningsfull byggvinst med oförändrad användarpolicy. Standard behåller fyra
+workers och SSA av. Rapporten innehåller båda 30-rundorsserierna och
+korrekthetsunderlaget för SSA samt separata minnes-/utgångs-/ABI-premisser.
+
 [Parallell kompilering, 2026-11-12](2026-11-12-parallel-compiler/README.md)
-är den aktuella standardprofilen på ARM64/macOS. Samma binär med fyra workers
+motiverar valet av fyra workers på ARM64/macOS. Samma binär med fyra workers
 ger 36,13 procent kortare genererad byggmedian och 18,89 procent kortare
 median för kompilatorkorpuset `selfhost/main.ddr` än med en worker. Den nya
-standarden når 163 003 genererade rader/s vid p95. Hela bootstrapkedjans tid
+standarden i den mätningen når 163 003 genererade rader/s vid p95. Hela bootstrapkedjans tid
 är inte mätt. Runtimebilderna är identiska; C-geomedlet 1,178× lämnar C-målet
 öppet. Rapporten innehåller råserier, allokeringsattribuering och verifiering
 med den parallella kompilatorn som standard.

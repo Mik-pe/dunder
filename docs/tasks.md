@@ -100,7 +100,7 @@ En enda `compile.Session` behåller frontend, typ- och lånekontroll,
 symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
 Föräldern lämnar ägda hela MIR-funktioner i ett begränsat taskfönster.
 Workers kör samma `mir_pipeline` som den seriella drivrutinen: verifiering,
-framepromovering och värdepass, följt av nödvändig efterverifiering. Varje
+framepromovering, valbar SSA och värdepass, följt av nödvändig efterverifiering. Varje
 kallt jobb startar en OS-tråd och skapar lokal `pipeline.Workspace`.
 Fönstret omfattar högst `workers` källsteg; ingen permanent worker- eller
 arenapool används. Resultatet är ägd MIR och status/statistik;

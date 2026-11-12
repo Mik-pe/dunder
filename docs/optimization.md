@@ -192,8 +192,10 @@ exakt vid avslag. En accepterad omskrivning fullverifieras innan den får
 lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
-gemensamma seriella/taskbaserade kedjan. Standard är **off** tills hela
-mätmatrisen har bedömts. Effektiv aktivering kräver både MIR och MIR-opt;
+gemensamma seriella/taskbaserade kedjan. Standard är **off** efter
+[30-rundorsmätningen](../benchmarks/2026-11-12-ssa-foundation/README.md):
+kompilatorkorpusets byggmedian ökade 70,92 procent och Tabells 42,34 procent,
+utan samlad runtimevinst mot C. Effektiv aktivering kräver både MIR och MIR-opt;
 `check`, avstängt steg och full cacheträff utför inget SSA-arbete. Cache och
 testkvitton skiljer on/off, SSA-version 1 och arbetsbudgeten åt.
 `--timings=json` visar `ssa_enabled`, `ssa_optimized`, `ssa_cells`,
@@ -221,6 +223,13 @@ heap-CSE, LICM och direkt registerallokering per mål återstår. Den nuvarande
 placeringen använder den gemensamma logiska GP-banken. Den innebär ingen
 fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
 är fortfarande öppet.
+
+SSA-optimerad producentkod för själva kompilatorn prövades separat med
+oförändrad användarpolicy. Byggmedianerna ändrades mindre än 0,3 procent och
+flera p95-värden försämrades. Varken användarprofilen eller bootstrapens
+producentprofil ändras på detta underlag. Nästa arkitektursteg behöver dela
+värdeanalys och placering i stället för att lägga fler fulla analysgångar
+ovanpå varandra, samt beskriva anropens verkliga argument och targetoperander.
 
 ### Värdeidentitet över kontrollflödet
 
@@ -623,7 +632,7 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA är off som standard i väntan på mätmatrisen. Bevarande av register, NoModRef och terminalobservationer är skilda verifierade producentpremisser. |
+| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA förblir off efter mätt byggregression utan samlad runtimevinst. Gemensam värdeanalys och explicita anropsargument behöver minska duplicerat analysarbete. Bevarande av register, NoModRef och terminalobservationer är skilda premisser. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
