@@ -135,7 +135,7 @@ inkommande x25 från `333` till `13`. De
 framepass vid nåbara okända utgångar och anrop utan tillräckligt ABI. Ett
 terminalkontrakt ensamt tillåter heller inte anrop.
 
-Tre versionsbundna producentpremisser prövas var för sig:
+Fyra versionsbundna producentpremisser prövas var för sig:
 
 - [`mir_memory`](../selfhost/mir_memory.ddr) ger NoModRef för bevisat privata
   celler vid giltiga indirekta objektåtkomster. Det ger inget anrops-ABI.
@@ -146,11 +146,37 @@ Tre versionsbundna producentpremisser prövas var för sig:
   NoReturn räcker inte; varje nådd extern måletikett behöver sitt eget bevis.
 - [`mir_call_abi`](../selfhost/mir_call_abi.ddr) håller ett separat
   käll-ABI-kontrakt. `mir_call_abi.conservative()` gör inget sådant påstående;
-  `mir_pipeline.options().source_abi` är false för råa konsumenter. Den kompletta källproducenten deklarerar ABI1: x25–x28 är bevarat
+  `mir_pipeline.options().source_abi` är false för råa konsumenter. Den
+  kompletta källproducenten deklarerar ABI1: x25–x28 är bevarat
   dolt tillstånd, och privat frameutfyllnad och exakt call-SP är
   implementationsegenskaper. Giltiga register-/stackargument, resultat och
   exponerade källobjekt behåller sitt vanliga ABI. Premissen ger ingen
   NoModRef för anrop och ändrar inga call-clobbermasker.
+- [`mir_call_inputs`](../selfhost/mir_call_inputs.ddr) ger en separat
+  `source_inputs`-premiss för hela källproducenten och dess callees/bryggor.
+  `mir_pipeline.options().source_inputs` är false och råa API:er behåller
+  alla kanoniska läsningar. Den kompletta källproducenten sätter true;
+  premissen följer inte av anrops-ABI, NoModRef, Return eller MAY-clobbers.
+
+För stödda, färskt verifierade ABI1/2/3-anrop kan denna sista premiss ge en
+effektiv läsvy för SSA och dess fysiska liveness. GP0–GP8, GP16, GP18–GP31,
+hela FP-banken och varje explicit måloperand finns kvar. GP9–GP15 och GP17
+får bara undantas när inkommande scratchbitar saknar semantisk
+indatadependency: resultat, minne, flaggor och kontroll får inte bero på
+dem, och fortsättningen får inte använda lokalt odefinierad post-call-scratch
+som ett källresultat. Fler än åtta argument följer stackkonventionen. Hela
+producenten, inklusive runtime-, clone/drop/take-, callback- och taskentry,
+måste upprätthålla kontraktet. En extern deklaration ensam certifierar inte
+godtycklig maskinkod; nya hjälparargument kräver en explicit konvention.
+
+Läsvyn muterar inga råa call-masker och begränsar varken clobbers, minne,
+flaggor eller andra effekter. Okända anropsformer behåller råkontraktet.
+[`mir_decode`](../selfhost/mir_decode.ddr) anger FE-adapterns mål i logiska
+X17 och Wasm-FB:s mål i X16 som explicita operander. De får aldrig frigöras
+som oanvänd scratch. Rå Call läser inkommande NZCV och kan förstöra dem: det
+kanoniska kontraktet är `flags=3` (read + write). Det tidigare `flags=2`
+saknade läsningen och var felaktig metadata. Någon felkompilering i det
+nuvarande värdepasset har inte visats av detta fynd.
 
 De nativa runtimehjälparna har granskats utan explicita läsningar eller
 skrivningar av x25–x28. C-anrop, återinträde genom callbacks, stackargument
@@ -164,11 +190,27 @@ främmande anrop får inte inspektera andra privata lokaler genom stackvandring.
 ### SSA för privata framevärden
 
 [`mir_ssa`](../selfhost/mir_ssa.ddr) är en verklig, begränsad SSA-grund över
-hela funktionens CFG. Egna ValueID:n beskriver GP-/NZCV-definitioner och
+hela funktionens CFG. Version 2 använder gles, behovsstyrd konstruktion.
+Egna ValueID:n beskriver GP-/NZCV-definitioner och
 användningar, blockparametrar och föregångarkanternas argument. En
 MAY-clobber vid anrop får en egen tillståndsversion och uppfinns aldrig som
 ett semantiskt anropsresultat. De ursprungliga fysiska operationerna och
 deras effekter ligger kvar som fasta begränsningar.
+
+Block-/tillståndspar skapas för verkliga läsningar, definitioner och
+nödvändiga transporter; blockparametrar följer inkommande värdebehov.
+Föregångarkanter löses iterativt med redan skapade platshållare för cykler;
+loopar kräver ingen rekursiv konstruktion. GP-/NZCV-tillstånd utan någon
+definition eller clobber i hela funktionen delar sitt verkliga ingångsvärde.
+Det ersätter tät block×variabel-expansion utan att likställa okända värden.
+Glesa kantargument och deras omvända index kontrolleras i båda riktningarna.
+
+Interferens byggs med aktiva värde-/cellmängder och verkliga in-/utträden.
+Borttagning använder positionsindex och byte med sista elementet. Vid varje
+operation behandlas aktuella live-händelser och överlappande värden, i stället
+för att skanna samtliga statiska SSA-versioner. Placeringsvittnet
+kontrollerar de sparade live-händelserna separat. Arbetet debiteras fortfarande
+under samma budget; detta är ingen garanti om konstant eller linjär total tid.
 
 [`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr) grupperar oexponerade,
 justerade åttabytesceller med en befintlig fullbreddsplats. Alla skrivningar
@@ -178,8 +220,10 @@ skrivningar, korsande eller exponerade intervall undantas. Vyerna antar
 inte att råa bitar redan är en normaliserad bool eller rune.
 
 Det första placeringssteget förenar en cells phi-värden i ett gemensamt
-registernät och väljer bland GP0–GP17 mot originalfunktionens fulla fysiska
-liveness, scratchdefinitioner och anropsförstörelse. Ursprungliga
+registernät och väljer bland GP0–GP17 mot fysisk liveness, samtliga
+scratchdefinitioner och full anropsförstörelse. Endast den separata
+`source_inputs`-premissen får förfina anropsläsningar i liveness. Fulla
+clobbers fortsätter att hindra att registervärden överlever anrop. Ursprungliga
 frame-skrivningar finns kvar i samma ordning och skriver igenom till minnet.
 Ingångens och post-call-barriärernas okända minnesversioner stannar i minnet.
 Passet växer inte framen, ändrar inte SP och skapar inga nya etikett- eller
@@ -192,12 +236,12 @@ exakt vid avslag. En accepterad omskrivning fullverifieras innan den får
 lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
-gemensamma seriella/taskbaserade kedjan. Standard är **off** efter
-[30-rundorsmätningen](../benchmarks/2026-11-12-ssa-foundation/README.md):
-kompilatorkorpusets byggmedian ökade 70,92 procent och Tabells 42,34 procent,
-utan samlad runtimevinst mot C. Effektiv aktivering kräver både MIR och MIR-opt;
-`check`, avstängt steg och full cacheträff utför inget SSA-arbete. Cache och
-testkvitton skiljer on/off, SSA-version 1 och arbetsbudgeten åt.
+gemensamma seriella/taskbaserade kedjan. Standard är **off** i väntan på
+aktuell v2-mätmatris för runtime och kompileringstid. Effektiv aktivering
+kräver både MIR och MIR-opt; `check`, avstängt steg och full cacheträff utför
+inget SSA-arbete. Cache och testkvitton skiljer on/off och SSA-markören
+`v2-pruned-inputs1-work4194304` åt. Den fysiska MIR-policyn är version 4 med
+`call-flags1`, så äldre call-metadata hålls åtskilda även när SSA är avstängt.
 `--timings=json` visar `ssa_enabled`, `ssa_optimized`, `ssa_cells`,
 `ssa_values`, `ssa_parameters`, `ssa_registers`, `ssa_removed_loads`,
 `ssa_removed_stores`, `ssa_removed_pushes`, `ssa_removed_pops`, `ssa_copies`,
@@ -205,14 +249,17 @@ testkvitton skiljer on/off, SSA-version 1 och arbetsbudgeten åt.
 committade SSA-resultat i accepterade jobb; arbete och budgetavslag visar
 faktiska försök. Store-, push- och pop-eliminering ingår inte i denna version.
 
-Den funktionella SSA-matrisen omfattar 554 målbilder, 292 native-/Wasm-
-körningar och 438 exakta bitjämförelser före/efter. Ytterligare 116 par har
-uttryckligen redovisade luckor i den oberoende interpretern, bland annat
-anrop, flyttal och externa utgångar; dessa räknas inte som interpreterbevis.
-Linuxmålen är endast bildbyggda i denna matris. Ett loopprov går från sex
-frame-laster till noll men från 26 till 30 kodord; ett 80-värdesprov från
-81 laster till noll och från 329 till 249 ord. Det är strukturella resultat,
-inte uppmätt bygglatens eller runtimevinst.
+Den aktuella funktionella v2-matrisen med `flags=3` passerar 670 målbilder
+över 72 vektorer i 28 grupper, 360 native-/Wasm-körningar och 438 exakta
+bitjämförelser före/efter. Ytterligare 232 par har uttryckligen redovisade
+luckor i den oberoende interpretern, bland annat anrop, flyttal och externa
+utgångar; dessa räknas inte som interpreterbevis. Observerande anropsprov
+körs i riktiga native-/Wasm-bilder. Källacceptansen passerar också 24
+målbilder och 17 native-/Wasm-körningar med workers, cache och kvitton.
+Linuxmålen är endast bildbyggda i dessa matriser. De riktade resultaten
+ersätter varken full bootstrapverifiering eller en representativ mätmatris.
+Tidigare strukturella prov med sex→noll laster men 26→30 kodord och
+81→noll laster med 329→249 ord är inte latensmått.
 [SSA-/rollback-orakel](../tools/test-mir-ssa.py) ·
 [Cellkontrakt](../tests/mir_ssa_cells.ddr) ·
 [SSA-kontrakt](../tests/mir_ssa.ddr) ·
@@ -224,12 +271,15 @@ placeringen använder den gemensamma logiska GP-banken. Den innebär ingen
 fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
 är fortfarande öppet.
 
-SSA-optimerad producentkod för själva kompilatorn prövades separat med
-oförändrad användarpolicy. Byggmedianerna ändrades mindre än 0,3 procent och
-flera p95-värden försämrades. Varken användarprofilen eller bootstrapens
-producentprofil ändras på detta underlag. Nästa arkitektursteg behöver dela
-värdeanalys och placering i stället för att lägga fler fulla analysgångar
-ovanpå varandra, samt beskriva anropens verkliga argument och targetoperander.
+Den historiska [30-rundorsmätningen av SSA-v1](../benchmarks/2026-11-12-ssa-foundation/README.md)
+visade 70,92 procent högre byggmedian för kompilatorkorpusen och 42,34
+procent för Tabell utan samlad runtimevinst mot C. En separat SSA-optimerad
+producentbinär ändrade byggmedianerna mindre än 0,3 procent och försämrade
+flera p95-värden. Det är v1-resultat, inte mätningar av dagens glesa v2 med
+`source_inputs` och rättat NZCV-kontrakt. Varken standardprofilen eller
+bootstrapprofilen aktiverar SSA på detta historiska underlag. Fortsatt
+värdeanalys och placering behöver dela arbete; den nya mekanismens totala
+kostnad och nytta måste mätas innan aktivering.
 
 ### Värdeidentitet över kontrollflödet
 
@@ -632,7 +682,7 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA förblir off efter mätt byggregression utan samlad runtimevinst. Gemensam värdeanalys och explicita anropsargument behöver minska duplicerat analysarbete. Bevarande av register, NoModRef och terminalobservationer är skilda premisser. |
+| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA-v2 har gles konstruktion och explicita source-inputs; standard är off i väntan på aktuell mätmatris. V1:s byggregression är historisk. Anropsbevarande, semantiska indata, NoModRef och terminalobservationer är skilda premisser. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |

@@ -68,13 +68,15 @@ SSA-steg ligger mellan frame- och värdepassen.
 [Omfattning och gränser](optimization.md).
 
 `--mir-ssa=on` aktiverar [`mir_ssa`](../selfhost/mir_ssa.ddr) och
-[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard förblir **off** efter
-[mätt byggkostnad utan samlad runtimevinst](../benchmarks/2026-11-12-ssa-foundation/README.md).
-Egna ValueID:n, GP/NZCV def/use, blockparametrar och
-kantargument ger en SSA-grund över hela CFG:n. Privata åttabytesceller med
+[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard är fortsatt **off**
+i väntan på aktuell v2-mätmatris. V2 bygger glesa block-/tillståndspar
+för verkliga beroenden och transportparametrar, delar verkliga oförändrade
+ingångsvärden och använder aktiva live-mängder/händelser för interferens.
+Egna ValueID:n, GP/NZCV def/use, blockparametrar och kantargument ger en
+SSA-grund över hela CFG:n. Privata åttabytesceller med
 fullbreddsskrivningar och inneslutna 1/2/4/8-bytesvyer kan få placering i
-GP0–GP17 mot originalets fulla fysiska liveness och clobbers. Ursprungliga
-minnesskrivningar behålls; okända ingångs-/post-call-minnesversioner stannar
+GP0–GP17 mot fysisk liveness och fulla clobbers, med separat kontrollerad
+`source_inputs`-läsvy. Ursprungliga minnesskrivningar behålls; okända ingångs-/post-call-minnesversioner stannar
 i minnet. Frame, SP och etikett-/importnamespace ändras inte. Budgeten är
 4 194 304 enheter, med gles rollback och obligatorisk slutverifiering.
 Generellt SSA-baserat operationsval, uttrycksstackvärden, heap-CSE, LICM och
@@ -90,15 +92,30 @@ tillräckligt kontrakt. Den kompletta källproducenten deklarerar ABI1 enligt
 Anropssynkronisering, clobbermasker och giltiga argument bevaras.
 [Oberoende observerarmotexempel](../tools/test-mir-frame-exits.py).
 
-SSA:s funktionella matris ger 554 målbilder, 292 native-/Wasm-körningar
-och 438 exakta bitjämförelser före/efter, med 116 separat redovisade
-interpreterluckor. Linux är endast bildbyggt i denna matris. Sex→noll laster
-och 26→30 ord i ett loopprov samt 81→noll laster och 329→249 ord i ett
-80-värdesprov är strukturella resultat. Med SSA på ökade kompilatorkorpusets
-byggmedian 70,92 procent och Tabells 42,34 procent; runtime/C-geomedlet var
-1,181 mot 1,178 med passet av. En separat SSA-optimerad kompilatorbinär gav
-ingen meningsfull byggvinst med oförändrad användarpolicy. Käll-/worker-/cacheprov kontrollerar
-resultat, diagnostik, effektiva räknare och skilda on/off-kvitton.
+[`mir_call_inputs`](../selfhost/mir_call_inputs.ddr) är en separat
+`source_inputs`-premiss för hela källproducenten, false för råa fabriker.
+GP0–GP8, GP16, GP18–GP31, alla FP-register och explicita mål behålls.
+GP9–GP15/GP17 kan undantas som anropsindata endast utan semantisk
+scratchdependency hos callee och fortsättning; fler argument ligger på
+stacken. Råmasker, clobbers, minne och flaggor begränsas inte. FE-target X17
+och Wasm-FB-target X16 är explicita roller. Rå Call läser och kan förstöra
+NZCV (`flags=3`); tidigare `flags=2` var felaktig metadata, utan visad
+felkompilering i dagens värdepass. Cache/kvitton binder fysisk v4 med
+`call-flags1` och SSA:s `v2-pruned-inputs1-work4194304`.
+
+Aktuell v2-QA med `flags=3` passerar 670 målbilder, 360 native-/Wasm-
+körningar och 438 exakta bitjämförelser, med 232 separat redovisade luckor
+i den oberoende interpretern. Källacceptansen passerar 24 målbilder och
+17 native-/Wasm-körningar med workers, cache och kvitton. Linux är endast
+bildbyggt i dessa matriser. Full bootstrap och aktuell v2-prestandamatris
+är separata grindar; riktade prov är inte ett standardaktiveringsbeslut.
+
+Den historiska [v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+visade 70,92 procent högre byggmedian för kompilatorkorpusen och 42,34
+procent för Tabell; runtime/C-geomedlet var 1,181 mot 1,178 med passet av.
+En separat SSA-optimerad kompilatorbinär gav ingen meningsfull byggvinst
+med oförändrad användarpolicy. Dessa siffror gäller v1, före gles v2 och
+`source_inputs`, och är inga aktuella v2-resultat.
 [SSA-orakel](../tools/test-mir-ssa.py) ·
 [Källprov](../tools/test-ssa-source.py) ·
 [Omfattning](optimization.md#ssa-för-privata-framevärden).

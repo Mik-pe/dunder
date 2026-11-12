@@ -72,6 +72,10 @@ och kodbilder är deterministiska oberoende av färdigordning och workerantal.
 [Taskkontrakt](../docs/tasks.md) och
 [mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
 
+[Frysta interface och ägda typade frontendjobb](../docs/parallel-frontend-plan.md)
+är nästa planerade gräns. Dagens typning och frontendemission är fortfarande
+Session-ägd; den planen är ännu ingen aktiv parallell frontend.
+
 ## Helfunktionspass och valbar SSA
 
 Varje nyemitterad källfunktion går genom den gemensamma MIR-gränsen med
@@ -80,17 +84,19 @@ framepromovering → valbar SSA → värdepropagering seriellt och i workers.
 Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
 diagnostik använder samma fulla frontend oberoende av passval.
 
-`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard förblir **off** efter
-[representativa runtime- och byggmätningar](../benchmarks/2026-11-12-ssa-foundation/README.md).
-Passet ökade kompilatorkorpusets byggmedian 70,92 procent utan samlad
-runtimevinst. En separat SSA-optimerad producentbinär gav ingen meningsfull
-byggvinst; bootstrapprofilen behålls. MIR och MIR-opt måste
-också vara på. Steget bygger egna ValueID:n för GP/NZCV def/use,
-blockparametrar och föregångarkanternas argument.
+`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är fortsatt **off**
+i väntan på aktuell v2-matris för runtime och kompileringstid. MIR och MIR-opt
+måste också vara på. V2 bygger egna ValueID:n för GP/NZCV def/use,
+blockparametrar och föregångarkanternas argument glest efter verklig
+efterfrågan. Oförändrade GP-/NZCV-ingångar delas och iterativ kantlösning
+undviker tät block×variabel-expansion. Aktiva live-mängder och verkliga
+in-/utträdeshändelser styr interferens och placeringsvittnen, utan att varje
+operation skannar alla statiska SSA-versioner.
 [`mir_ssa_cells`](mir_ssa_cells.ddr) grupperar privata åttabytesceller med
 fullbreddsskrivningar och inneslutna läsvyer på 1/2/4/8 byte. En cells
-phi-värden förenas och placeras i GP0–GP17 mot originalets kompletta fysiska
-liveness och clobbers. Stores skriver fortsatt igenom till minnet och
+phi-värden förenas och placeras i GP0–GP17 mot fysisk liveness och fulla
+clobbers. En separat `source_inputs`-premiss får förfina anropsläsningarna.
+Stores skriver fortsatt igenom till minnet och
 ingångs-/post-call-minnesversioner stannar i minnet. Inga nya frameceller,
 SP-justeringar, etiketter eller import-ID:n skapas.
 
@@ -98,26 +104,53 @@ Budgetsatt analys, placeringskontroll, gles undo och slutverifiering ryms
 inom 4 194 304 enheter per funktion. Avslag återställer funktionen exakt.
 `--timings=json` redovisar effektiv `ssa_enabled` och faktiska `ssa_*`-räknare
 från accepterade jobb. Förändringsräknarna gäller committade omskrivningar.
-Check och full cacheträff utför inget SSA-arbete. On/off, SSA-v1 och budget
-ingår i cache- och testkvittoidentiteten; workerantalet ingår inte.
+Check och full cacheträff utför inget SSA-arbete. On/off och SSA-markören
+`v2-pruned-inputs1-work4194304` ingår i cache- och testkvittoidentiteten,
+liksom fysisk MIR-policy v4 med `call-flags1`. Workerantalet ingår inte.
 
 [`mir_memory`](mir_memory.ddr), [`mir_terminals`](mir_terminals.ddr) och
 [`mir_call_abi`](mir_call_abi.ddr) håller privata NoModRef-celler, sex exakt
 angivna utgångar utan observationer och källanropens ABI1 åtskilda. Vanliga
 råa fabriker ger inga sådana källpremisser. Den kompletta källproducenten
 sätter ABI1 och äger beviset för giltiga anrop och bryggor. Det befintliga
-framepasset med fyra registerhem får därmed fortsätta säkert för källkod; rå MIR med
-nåbara okända utgångar eller anrop avstår utan tillräckligt kontrakt.
+framepasset med fyra registerhem får därmed fortsätta säkert för källkod;
+rå MIR med nåbara okända utgångar eller anrop avstår utan tillräckligt kontrakt.
 Anrop synkroniserar fortfarande originalceller och behåller sina clobbers.
 [Reglerna för privata objekt, stackargument och FFI](../docs/ffi.md#objektminne-och-privata-stackceller)
 är oförändrade.
+
+[`mir_call_inputs`](mir_call_inputs.ddr) ger en separat helproducentpremiss,
+`source_inputs`, som är false i råa fabriker och explicit true hos den
+kompletta källproducenten. GP0–GP8, GP16, GP18–GP31, alla FP-register och
+explicita mål bevaras som indata för stödda ABI1/2/3-anrop. Scratch GP9–GP15
+och GP17 får undantas bara utan källsemantisk dependency på inkommande eller
+lokalt odefinierade post-call-bitar; fler än åtta argument följer
+stackkonventionen. Premissen omfattar runtimehelpers och C-/callback-/
+taskbryggor och följer inte av en extern deklaration, MAY-clobber, NoModRef
+eller anrops-ABI. Råmasker muteras inte, och clobbers, minne och flaggor
+begränsas inte. Okända anropsformer behåller sina konservativa läsningar.
+
+[`mir_decode`](mir_decode.ddr) ger FE:s target explicit X17 och Wasm-FB:s
+X16; targets kan inte räknas som fri scratch. Rå Call läser inkommande NZCV
+och kan förstöra dem, alltså `flags=3`. Det tidigare `flags=2` var felaktig
+metadata. Fyndet har inte visat någon felkompilering i dagens värdepass.
+
+Den historiska [SSA-v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+gav 70,92 procent högre byggmedian för kompilatorkorpusen och 42,34 procent
+för Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller
+ingen meningsfull byggvinst där. Detta gäller v1 och är inga mätningar av
+gles v2 eller `source_inputs`; bootstrapprofilen behålls.
 
 Generellt SSA-baserat operationsval, uttrycksstackvärden, heap-CSE och
 loopplacering återstår. Nuvarande registerplacering gäller den gemensamma
 logiska banken; direkt x86-registerallokering och Wasm-lokaler är framtida
 målbackendsteg. De funktionella proven visar korrekthet och minskad
 lasttrafik i vissa fall, men ger inget nytt latens- eller C-prestandaanspråk.
-Linux är endast bildbyggt i SSA-matrisen.
+Aktuell riktad v2-QA med `flags=3` passerar 670 målbilder och 360 native-/
+Wasm-körningar, med 438 exakta bitpar och 232 redovisade interpreterluckor.
+Källacceptansen passerar 24 målbilder och 17 körningar. Linux är endast
+bildbyggt i dessa matriser. Full bootstrap och v2-prestandamatris är separata
+grindar före standardaktivering.
 [SSA- och rollback-orakel](../tools/test-mir-ssa.py),
 [käll-/worker-/cacheprov](../tools/test-ssa-source.py) och
 [detaljerad omfattning](../docs/optimization.md#ssa-för-privata-framevärden).
@@ -215,6 +248,7 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 | `mir_pipeline.ddr` | Samma verifiering och frame-/valbara SSA-/värdepass för seriell körning och workers. |
 | `mir_ssa.ddr`, `mir_ssa_cells.ddr` | Budgeterad privat cell-SSA, smala läsvyer, blockparametrar och registerplacering mot fysisk liveness. |
 | `mir_memory.ddr`, `mir_terminals.ddr`, `mir_call_abi.ddr` | Separata producentpremisser för objektminne, exakta terminalobservationer och källanropens ABI. |
+| `mir_call_inputs.ddr` | Separat semantisk anropsindata-vy för den kompletta källproducenten; råkontraktet bevaras. |
 | `mir_lower.ddr`, `mir_link.ddr` | Fristående funktionsobjekt och deterministisk sammanfogning. |
 | `record_take.ddr` | Normalisering vid transfer av unika fulluttryckstemporärer; lokaler flyttas inte. |
 | `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |

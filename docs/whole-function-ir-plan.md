@@ -69,11 +69,11 @@ Runtimearbetet ska angripa trafik över hela loopar. Det ursprungliga
 underlaget var den numeriska benchmarkens nio frame-läsningar och fyra
 frame-skrivningar per framgångsrikt varv, medan C-referensen höll värdena i
 register. Det styr prioriteringen men är ingen regel passet får känna till.
-Den nya [SSA-mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md)
-visar att första cellplaceringen kostar för mycket byggtid utan samlad
-runtimevinst. Den är valbar och förblir off som standard. Fortsättningen
-behöver en gemensam värdemodell och explicita anropsargument, inte fler
-oberoende fulla analysgångar.
+Den historiska [SSA-v1-mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+visade att v1:s cellplacering kostade för mycket byggtid utan samlad
+runtimevinst. Dagens glesa v2 förblir off som standard i väntan på aktuell
+mätmatris. Fortsättningen behöver dela värdeanalys och tillföra fullt typade
+anropsargument, i stället för fler oberoende fulla analysgångar.
 
 ## Kontrakt som måste hålla
 
@@ -136,9 +136,19 @@ för GP/NZCV def/use, blockparametrar och föregångarkanternas argument.
 Fysiska registermasker innehåller fortsatt fysiska register-ID:n; ett
 anrops MAY-clobber blir ingen uppfunnen semantisk resultatdefinition.
 
+V2 bygger glesa block-/tillståndspar för verkliga läsningar, definitioner
+och nödvändiga kanttransporter.
+Oförändrat GP-/NZCV-tillstånd delar sitt verkliga ingångsvärde; cykliska
+beroenden löses iterativt med blockparametrar. Aktiva live-mängder och
+in-/utträdeshändelser styr interferens och överlappande par. Varje operation
+behöver därmed inte skanna alla statiska SSA-versioner. Ett separat
+placeringsvittne kontrollerar de verkliga live-händelserna. Budgeten gäller
+fortfarande; denna struktur är inget latens- eller linjäritetsanspråk.
+
 Cellens phi-värden förenas före placering i GP0–GP17. Originalets fulla
-fysiska liveness, explicita och implicita scratchdefinitioner samt
-clobbermasker begränsar valen. Ursprungliga stores skriver igenom till
+fysiska liveness, explicita och implicita scratchdefinitioner samt fulla
+clobbermasker begränsar valen. En separat `source_inputs`-premiss får endast
+förfina anropsläsningarna i denna vy. Ursprungliga stores skriver igenom till
 minnet i samma ordning; ingångens och post-call-barriärernas okända
 minnesversioner stannar i minnet. Inga nya frameceller, SP-justeringar,
 etikett- eller import-ID:n skapas. Uttrycksstackvärden, heap-CSE och
@@ -169,22 +179,44 @@ Den kompletta källproducenten deklarerar de verifierade premisserna;
 Premisserna använder [befintliga FFI-/objektregler](ffi.md#objektminne-och-privata-stackceller),
 utan att försvaga språkets minnes- eller anropsgarantier.
 
-`--mir-ssa=on/off` är valbart och standarden förblir off efter
-[den fulla mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md).
-Kompilatorkorpusets byggmedian ökade 70,92 procent och Tabells 42,34 procent;
-runtime/C-geomedlet förbättrades inte. Inte heller SSA-optimerad producentkod
-gav meningsfull byggvinst med oförändrad användarpolicy. Cache och testkvitton skiljer policy, SSA-v1 och budget åt.
-Källrapportens förändringsräknare räknar committade SSA-resultat från
-accepterade jobb; check och full cacheträff kör inga nya pass.
-[Oberoende SSA-/rollback-prov](../tools/test-mir-ssa.py),
-[cellprov](../tests/mir_ssa_cells.ddr) och
-[käll-/worker-/cacheprov](../tools/test-ssa-source.py) beskriver
-funktionsomfattningen. Linuxbilder byggs men körs inte i denna SSA-matris.
-Att ett loopprov har sex→noll laster men 26→30 kodord ger inget
-latenspåstående. Nästa värdemodell behöver återanvända analyser och ersätta
-duplicerade pass. Explicita anropsargument och targetoperander behövs också:
-råa call-masker får inte försvagas för att skapa lediga register. Nya runtime-
-och kompileringstidsresultat krävs före standardaktivering.
+[`mir_call_inputs`](../selfhost/mir_call_inputs.ddr) är en fjärde, separat
+helproducentpremiss. `mir_pipeline.options().source_inputs` är false för rå
+MIR; den kompletta källproducenten sätter true. Stödda ABI1/2/3-anrop
+behåller GP0–GP8, GP16, GP18–GP31, alla FP-register och explicita targets
+som indata. Scratch GP9–GP15/GP17 får undantas endast när varken callee eller
+fortsättningen har en källsemantisk dependency på deras inkommande eller
+lokalt odefinierade post-call-bitar. Fler än åtta argument ligger på stacken.
+NoModRef, call-clobbers, minne, flaggor och andra effekter begränsas inte.
+Råmaskerna muteras aldrig; runtime-/C-/callback-/taskbryggor måste följa
+samma konvention och okända anropsformer förblir konservativa.
+
+FE:s målroll är explicit X17 och Wasm-FB:s X16 i
+[`mir_decode`](../selfhost/mir_decode.ddr); även en möjlig scratch måste
+behållas när den bär target. Rå Call både läser och kan förstöra NZCV,
+alltså `flags=3`. Tidigare `flags=2` var felaktig metadata; någon
+felkompilering i det nuvarande värdepasset har inte bevisats av detta fynd.
+
+`--mir-ssa=on/off` är valbart och standarden är fortsatt off i väntan på
+aktuell v2-mätmatris. Den historiska
+[v1-rapporten](../benchmarks/2026-11-12-ssa-foundation/README.md) visade
+70,92 procent högre byggmedian för kompilatorkorpusen och 42,34 procent för
+Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller ingen
+meningsfull byggvinst i den rapporten. Detta är inga mätningar av gles v2
+eller `source_inputs`.
+
+Cache och testkvitton skiljer on/off och `v2-pruned-inputs1-work4194304` åt;
+fysisk MIR-policy är version 4 med `call-flags1`. Källrapportens
+förändringsräknare räknar committade SSA-resultat från accepterade jobb;
+check och full cacheträff kör inga nya pass.
+[Oberoende SSA-/rollback-prov](../tools/test-mir-ssa.py) med det aktuella
+`flags=3`-kontraktet passerar 670 målbilder, 360 native-/Wasm-körningar och
+438 exakta bitpar, med 232 separat redovisade interpreterluckor. De utökade
+anropsproven behåller råa indata och prövar den explicita källvyn separat.
+[Käll-/worker-/cacheprov](../tools/test-ssa-source.py) passerar 24 målbilder
+och 17 native-/Wasm-körningar. Linuxbilder byggs men körs inte i dessa
+matriser. [Cellprov](../tests/mir_ssa_cells.ddr), slutverifiering och exakt
+rollback ingår i korrekthetsgränsen. Full bootstrap och aktuella runtime-/
+kompileringstidsmätningar är separata grindar före standardaktivering.
 
 ## Exklusiv transaktionsgräns
 
@@ -311,8 +343,11 @@ Runtimebilderna är identiska. C-geomedlet 1,178× och maxkvoten 1,308×
 överskrider fortfarande acceptansgränserna.
 
 Parallell modulläsning/lexning, typade frontendresultat och separata
-FunctionContext är framtida etapper. Frontend ska inte delas muterbart
-bara för att öka trådantalet. Generellt SSA-baserat operationsval,
+FunctionContext är framtida etapper. Den separata
+[planen för frysta interface och ägda typade frontendjobb](parallel-frontend-plan.md)
+beskriver DeclarationWorld, FunctionContext och TypedFunction. Det är en
+plan; dagens frontend och typning ligger fortsatt hos Session-ägaren.
+Frontend ska inte delas muterbart bara för att öka trådantalet. Generellt SSA-baserat operationsval,
 uttrycksstackvärden, mer registerplacering över anrop och loopar samt direkta
 målbackends återstår som runtimearbete. Workerpool,
 nollkopierande gränstransfer, delad heap och generellt Send/Sync behöver
