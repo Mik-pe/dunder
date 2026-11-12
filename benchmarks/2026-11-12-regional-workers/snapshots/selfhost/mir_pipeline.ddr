@@ -1,0 +1,184 @@
+// Shared whole-function optimization stage for serial callers and isolated
+// workers. This module owns no Compiler/Code, clock, I/O, imports or cache.
+// A worker constructs Workspace locally; only the public numeric records and
+// the public MIR Function may cross its independently cloned Data boundary.
+import mir
+import mir_verify as verify
+import mir_opt as frame
+import mir_ssa as ssa
+import mir_memory as memory
+import mir_terminals as terms
+import mir_call_abi as call_abi
+import mir_call_inputs as call_inputs
+import mir_expr_stack as expression_stack
+import mir_value_prop as values
+
+pub opaque struct Workspace {
+    verifier: verify.Workspace, optimizer: frame.Workspace, ssa: ssa.Workspace, values: values.Workspace,
+}
+pub fn new() -> Workspace {
+    Workspace { verifier: verify.new_work(), optimizer: frame.new(), ssa: ssa.new(), values: values.new() }
+}
+// source_objects is an EXPLICIT trusted source-producer premise, version1:
+// indirect accesses obey object lifetimes/ranges and cannot access unexposed
+// frame cells. Raw decoding alone cannot justify it. False retains raw policy.
+// source_abi is a SEPARATE trusted complete-source/native-ABI premise:
+// X25..28 are preserved hidden state, not semantic call arguments; private
+// frame reservation/padding and exact SP are implementation details. Valid
+// arguments, stack arguments and exposed objects are preserved. This grants
+// NO call NoModRef on old cells and weakens no observation of registers0..24.
+// Complete-source version2 additionally preserves actual caller FP/SP and
+// the active ordinary caller-frame mapping/lifetime on normal return. Cell
+// bytes may change: regional captures read the returned contents.
+// source_temporaries separately permits eliding non-addressable private
+// expression backing storage and its resource cost, only with positive
+// origins. It covers neither raw stack traffic nor outgoing arguments.
+// Raw callers assert neither premise by default. Budgets are per pass and
+// independent of worker count; defaults match compile.
+pub struct Options {
+    optimize: bool, source_objects: bool, source_abi: bool, source_inputs: bool, source_temporaries: bool, ssa: bool, values: bool, frame_budget: i32, ssa_budget: i32, value_budget: i32,
+}
+pub fn options() -> Options {
+    Options { optimize: true, source_objects: false, source_abi: false, source_inputs: false, source_temporaries: false, ssa: false, values: true, frame_budget: 4194304, ssa_budget: 4194304, value_budget: 4194304 }
+}
+// Version0 asserts NOTHING about exits and ignores all six IDs. Version1 is
+// the caller's trusted declaration that each supplied ID is an unobserving
+// terminal: it overwrites its status and terminates without inspecting incoming
+// GP/FP/NZCV or user memory, invoking user code or running cleanup. No source
+// names are inspected, and no ordinary call gains this contract. Duplicate
+// IDs are permitted, as in the existing Context declaration API.
+pub struct Terminals {
+    version: i32, overflow: i32, zero: i32, assertion: i32, io: i32, bounds: i32, float_trap: i32,
+}
+pub fn no_terminals() -> Terminals {
+    Terminals { version: 0, overflow: -1, zero: -1, assertion: -1, io: -1, bounds: -1, float_trap: -1 }
+}
+pub struct Stats {
+    operations: i32, opaque: i32,
+    optimized: i32, promoted: i32, removed_loads: i32, removed_stores: i32, private_memory_ops: i32,
+    analysis_units: i64, budget_refusals: i32,
+    ssa_optimized: i32, ssa_cells: i32, ssa_values: i32, ssa_parameters: i32, ssa_registers: i32, ssa_captures: i32, ssa_stack_groups: i32, ssa_removed_loads: i32, ssa_removed_stores: i32, ssa_removed_pushes: i32, ssa_removed_pops: i32, ssa_copies: i32, ssa_analysis_units: i64, ssa_budget_refusals: i32,
+    values_optimized: i32, value_rewrites: i32, value_deleted: i32, value_immediates: i32,
+    value_analysis_units: i64, value_budget_refusals: i32,
+}
+pub fn stats() -> Stats {
+    Stats { operations: 0, opaque: 0, optimized: 0, promoted: 0, removed_loads: 0, removed_stores: 0, private_memory_ops: 0,
+        analysis_units: 0, budget_refusals: 0, ssa_optimized: 0, ssa_cells: 0, ssa_values: 0, ssa_parameters: 0, ssa_registers: 0, ssa_captures: 0, ssa_stack_groups: 0, ssa_removed_loads: 0, ssa_removed_stores: 0, ssa_removed_pushes: 0, ssa_removed_pops: 0, ssa_copies: 0, ssa_analysis_units: 0, ssa_budget_refusals: 0, values_optimized: 0, value_rewrites: 0,
+        value_deleted: 0, value_immediates: 0, value_analysis_units: 0, value_budget_refusals: 0 }
+}
+// error0=success,1=initial verification,2=post-frame verification,
+// 3=frame analysis,4=value commit certificate,5=value analysis,
+// 6=invalid terminal version/declaration,9=SSA transaction/internal failure.
+// Codes7/8 remain reserved for lowering/ordered-object errors.
+// Parent maps these to its existing source-positioned diagnostics. State0 means a disabled/not-entered pass;
+// otherwise frame/value states are the unchanged underlying pass statuses.
+// Budget/unsupported refusals are successful verified baseline results.
+// On a fatal error the caller must discard the Function, exactly as in the
+// previous compile pipeline; this wrapper adds no full-Function transaction.
+pub struct Status { error: i32, frame_state: i32, value_state: i32, stats: Stats }
+fn status() -> Status { Status { error: 0, frame_state: 0, value_state: 0, stats: stats() } }
+fn complete(f: &mir.Function, result: &mut Status) {
+    if result.error != 0 { return }
+    // These retain compile's existing definition: include deleted rows in
+    // order.len, and count every kind0 row. Parent increments functions only
+    // after accepting this successfully lowered cold result.
+    result.stats.operations = f.order.len
+    for op in 0..f.kinds.len { if f.kinds[op] == 0 { result.stats.opaque = result.stats.opaque + 1 } }
+}
+fn optimize_values(f: &mut mir.Function, w: &mut Workspace, config: &Options, exits: &Terminals) -> i32 {
+    if exits.version == 0 {
+        changed := values.optimize_budget(&mut w.values, &mut f, config.value_budget)
+        if changed && !f.verified { return 4 }; return 0
+    }
+    if exits.version != 1 { return 6 }
+    // This tiny Context is a separate root, never a borrow of Workspace while
+    // one of its stage arenas is borrowed mutably. Its six labels are bounded;
+    // all expensive verifier/analysis arrays remain reused in Workspace.
+    var context := values.context(1)
+    if !values.declare_unobserving_terminal(&mut context, exits.overflow) ||
+        !values.declare_unobserving_terminal(&mut context, exits.zero) ||
+        !values.declare_unobserving_terminal(&mut context, exits.assertion) ||
+        !values.declare_unobserving_terminal(&mut context, exits.io) ||
+        !values.declare_unobserving_terminal(&mut context, exits.bounds) ||
+        !values.declare_unobserving_terminal(&mut context, exits.float_trap) { return 6 }
+    changed := values.optimize_with_context_budget(&mut w.values, &mut f, &context, config.value_budget)
+    if changed && !f.verified { return 4 }; 0
+}
+pub fn run_into(f: &mut mir.Function, w: &mut Workspace, config: &Options, exits: &Terminals) -> Status {
+    var result := status()
+    if !verify.verify_into(&mut f, &mut w.verifier) { result.error = 1; return result }
+    if !config.optimize { complete(&f, &mut result); return result }
+    // This separate numeric root carries only explicit caller-owned exit
+    // declarations. NoReturn or an external edge alone grants no exemption.
+    var terminals := terms.no_terminals()
+    terminals.version = exits.version; terminals.overflow = exits.overflow; terminals.zero = exits.zero
+    terminals.assertion = exits.assertion; terminals.io = exits.io
+    terminals.bounds = exits.bounds; terminals.float_trap = exits.float_trap
+    if !terms.valid(&terminals) { result.error = 6; return result }
+    context := memory.for_source_producer(config.source_objects)
+    calls := call_abi.for_source_producer(config.source_abi)
+    prepared := frame.analyze_with_contracts_budget(&mut w.optimizer, &f, &context, &terminals, &calls, config.frame_budget)
+    result.frame_state = frame.status(&w.optimizer)
+    result.stats.analysis_units = i64(frame.units(&w.optimizer))
+    if prepared {
+        frame.apply(&mut w.optimizer, &mut f)
+        result.frame_state = frame.status(&w.optimizer)
+        if !verify.verify_into(&mut f, &mut w.verifier) { result.error = 2; return result }
+        result.stats.optimized = 1
+        result.stats.promoted = frame.promoted(&w.optimizer)
+        result.stats.removed_loads = frame.removed_loads(&w.optimizer)
+        result.stats.removed_stores = frame.removed_stores(&w.optimizer)
+        result.stats.private_memory_ops = frame.private_memory_ops(&w.optimizer)
+    } else if result.frame_state == -3 { result.stats.budget_refusals = 1 }
+    else if result.frame_state != -2 { result.error = 3; return result }
+    if config.ssa {
+        var inputs := call_inputs.conservative()
+        if config.source_inputs { inputs = call_inputs.trusted_source_inputs_v1() }
+        // Origin alone grants no stack elision. Only the complete producer may
+        // separately authorize private implementation-temporary storage elision.
+        var temporaries := expression_stack.conservative()
+        if config.source_temporaries { temporaries = expression_stack.trusted_source_expression_storage_v1() }
+        changed := ssa.optimize_values_with_contracts_budget(&mut w.ssa, &mut f, &context,
+            &terminals, &inputs, &calls, &temporaries, config.ssa_budget)
+        state := ssa.status(&w.ssa)
+        result.stats.ssa_analysis_units = i64(ssa.units(&w.ssa))
+        if state == 2 {
+            // SSA's exclusive transaction owns mandatory full verification and
+            // exact rollback. A wrapper must not manufacture its certificate
+            // or add a second, unbudgeted full verifier after the transaction.
+            if !changed || !f.verified { result.error = 9; return result }
+            result.stats.ssa_optimized = 1
+            result.stats.ssa_cells = ssa.cells(&w.ssa)
+            result.stats.ssa_values = ssa.values(&w.ssa)
+            result.stats.ssa_parameters = ssa.parameters(&w.ssa)
+            result.stats.ssa_registers = ssa.registers(&w.ssa)
+            result.stats.ssa_captures = ssa.captures(&w.ssa)
+            result.stats.ssa_stack_groups = ssa.stack_groups(&w.ssa)
+            result.stats.ssa_removed_loads = ssa.removed_loads(&w.ssa)
+            result.stats.ssa_removed_stores = ssa.removed_stores(&w.ssa)
+            result.stats.ssa_removed_pushes = ssa.removed_pushes(&w.ssa)
+            result.stats.ssa_removed_pops = ssa.removed_pops(&w.ssa)
+            result.stats.ssa_copies = ssa.copies(&w.ssa)
+        } else {
+            if changed { result.error = 9; return result }
+            if state == -3 { result.stats.ssa_budget_refusals = 1 }
+            else if state != 0 && state != -2 { result.error = 9; return result }
+        }
+    }
+    if !config.values { complete(&f, &mut result); return result }
+    result.error = optimize_values(&mut f, &mut w, &config, &exits)
+    if result.error == 6 { return result }
+    result.value_state = values.status(&w.values)
+    result.stats.value_analysis_units = i64(values.units(&w.values))
+    if result.error != 0 { return result }
+    if result.value_state == 2 {
+        // The value transaction owns its mandatory final full verifier. Do not
+        // substitute a cached certificate or add a second wrapper verifier.
+        result.stats.values_optimized = 1
+        result.stats.value_rewrites = values.rewritten(&w.values)
+        result.stats.value_deleted = values.deleted(&w.values)
+        result.stats.value_immediates = values.constant_immediates(&w.values)
+    } else if result.value_state == -3 { result.stats.value_budget_refusals = 1 }
+    else if result.value_state != 0 && result.value_state != -2 { result.error = 5 }
+    complete(&f, &mut result); result
+}
