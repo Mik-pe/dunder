@@ -34,7 +34,7 @@ pub opaque struct Workspace {
     forbidden: []i64, blocked: []bool, used: []bool, homes: []i32,
     edits: []i32, edit_dst: []i32, edit_src: []i32,
     undo_modes: []i32, undo_recipes: []i32, undo_roles: []i32, undo_rows: []i64,
-    state: i32, work: i32, limit: i32, peak: i32,
+    state: i32, work: i32, limit: i32, peak: i32, physical_next: i32,
     placed: i32, pushes: i32, pops: i32, moves: i32,
 }
 pub fn new() -> Workspace { Workspace {
@@ -43,7 +43,7 @@ pub fn new() -> Workspace { Workspace {
     top: [], depths: [], queue: [], overlap_a: [], overlap_b: [], edge_heads: [], edge_next: [], neighbors: [],
     forbidden: [], blocked: [], used: [], homes: [], edits: [], edit_dst: [], edit_src: [],
     undo_modes: [], undo_recipes: [], undo_roles: [], undo_rows: [],
-    state: 0, work: 0, limit: 0, peak: 0, placed: 0, pushes: 0, pops: 0, moves: 0 } }
+    state: 0, work: 0, limit: 0, peak: 0, physical_next: 0, placed: 0, pushes: 0, pops: 0, moves: 0 } }
 pub fn status(w: &Workspace) -> i32 { w.state }
 pub fn units(w: &Workspace) -> i32 { w.work }
 pub fn peak_depth(w: &Workspace) -> i32 { w.peak }
@@ -104,7 +104,7 @@ fn reset(w: &mut Workspace, limit: i32) {
     w.forbidden.clear(); w.blocked.clear(); w.used.clear(); w.homes.clear()
     w.edits.clear(); w.edit_dst.clear(); w.edit_src.clear()
     w.undo_modes.clear(); w.undo_recipes.clear(); w.undo_roles.clear(); w.undo_rows.clear()
-    w.state = 0; w.work = 0; w.limit = limit; w.peak = 0
+    w.state = 0; w.work = 0; w.limit = limit; w.peak = 0; w.physical_next = 0
     w.placed = 0; w.pushes = 0; w.pops = 0; w.moves = 0
 }
 fn root(w: &mut Workspace, node: i32) -> i32 {
@@ -213,12 +213,11 @@ fn barrier(f: &mir.Function, op: i32, frame_live: bool) -> bool {
     }
     false
 }
-fn masks(w: &mut Workspace, f: &mir.Function, physical: &live.Workspace) -> bool {
+fn masks(w: &mut Workspace, f: &mir.Function) -> bool {
     if !charge(&mut w, f.order.len) { return false }
     frame_live := !contract.frame_lifetime_unproven(&f)
     for block in 0..f.block_starts.len {
         if w.depths[block] < 0 { continue }; var top := w.top[block]
-        var weight := 1; if live.loop_block(&physical, block) { weight = 32 }
         for position in f.block_starts[block]..f.block_ends[block] {
             op := f.order[position]; w.before[op] = top; w.after[op] = top
             if f.modes[op] == 2 { continue }
@@ -228,14 +227,13 @@ fn masks(w: &mut Workspace, f: &mir.Function, physical: &live.Workspace) -> bool
                 if !forbid(&mut w, top, mask, unknown) { return false }
                 node := root(&mut w, w.nodes[op]); if w.state < 0 { return false }
                 if unknown { w.blocked[node] = true }
-                w.forbidden[node] = w.forbidden[node].bit_or(live.live_after(&physical, op))
-                w.scores[node] = w.scores[node] + weight
+                w.scores[node] = w.scores[node] + 1
                 top = node
             } else if f.kinds[op] == 11 {
                 node := root(&mut w, top); if w.state < 0 { return false }
                 unknown := f.stack_roles[op] != 1 || f.dst[op] == 29 || f.dst[op] == 30
                 if unknown && !forbid(&mut w, top, 0, true) { return false }
-                w.used[node] = true; w.scores[node] = w.scores[node] + weight; top = w.below[node]
+                w.used[node] = true; w.scores[node] = w.scores[node] + 1; top = w.below[node]
                 if !forbid(&mut w, top, mask, false) { return false }
             } else {
                 if !forbid(&mut w, top, mask, barrier(&f, op, frame_live)) { return false }
@@ -345,26 +343,66 @@ fn rollback(w: &Workspace, f: &mut mir.Function) {
     }
     f.verified = true; f.optimizable = true
 }
-// READ-ONLY SHARED-FACTS API. Caller holds the exclusive Function transaction and supplies
-// fresh physical liveness for this EXACT verified snapshot, including its own
-// independent call-input premise. No mutation may occur between that analysis
-// and this call. This is a trusted compiler API, not a stale-plan authenticator.
-// Only this pass's bounded work is counted here; caller accounts shared facts.
-// status1 immutable facts,0 no eligible web,-1 internal,-2 unsupported,-3 budget.
-// The workspace owns no Function refs and exposes no externally staged apply.
-// Its caller may combine Frame+Expr interference/physical homes, then use ONE
-// coordinator-owned undo/final-verification transaction for both value families.
-pub fn analyze_with_liveness_budget(w: &mut Workspace, f: &mir.Function,
-    context: &Context, exits: &terminals.TerminalContext, physical: &live.Workspace, limit: i32) -> bool {
+// READ-ONLY STAGED FACTS. Caller holds the exclusive Function transaction and
+// has fresh physical liveness for this SAME verified snapshot, including its
+// independent call-input premise. No Function mutation may occur until these
+// facts have been consumed. This trusted compiler API does not authenticate
+// stale or fabricated physical facts. It owns no Function/liveness references.
+//
+// begin builds structural/LIFO facts only; state3 hides ALL published getters.
+// Feed exactly opID0..N-1, including deleted/unreachable operations, using
+// fresh scalar live-after masks and actual CFG loop membership. Then finish
+// publishes immutable state1, or0 when there is no eligible web. This seam
+// lets a coordinator read its physical field into scalar locals BEFORE
+// mutably borrowing its expression field, without relaxed root borrowing,
+// physical arena clones or an additional liveness analysis.
+//
+// One limit spans begin/feed/finish; only expression work is charged here.
+// Caller accounts the shared physical analysis separately. All failures hide
+// mappings and leave Function unchanged: -1internal,-2unsupported,-3budget.
+pub fn begin_analysis_budget(w: &mut Workspace, f: &mir.Function,
+    context: &Context, exits: &terminals.TerminalContext, limit: i32) -> bool {
     reset(&mut w, limit)
-    if !f.valid || !f.verified || live.status(&physical) != 1 || f.stack_roles.len != f.kinds.len || !terminals.valid(&exits) {
+    if !f.valid || !f.verified || f.stack_roles.len != f.kinds.len || !terminals.valid(&exits) {
         w.state = -1; return false
     }
     if context.version != 1 || !f.optimizable || f.unknown_control { w.state = -2; return false }
     if limit < 0 || f.kinds.len > 65536 || f.block_starts.len > 16384 || f.edge_to.len > 32768 { w.state = -3; return false }
     if !initialize(&mut w, &f) { return false }; if w.roots.len == 0 { return false }
-    if !lifo(&mut w, &f, &exits) || !masks(&mut w, &f, &physical) || !publish(&mut w) { return false }
+    if !lifo(&mut w, &f, &exits) || !masks(&mut w, &f) { return false }
+    w.state = 3; true
+}
+pub fn feed_physical(w: &mut Workspace, op: i32, live_after: i64, loop: bool) -> bool {
+    if w.state < 0 { return false }
+    if w.state != 3 || op != w.physical_next || op < 0 || op >= w.nodes.len { w.state = -1; return false }
+    if !charge(&mut w, 1) { return false }
+    w.physical_next = w.physical_next + 1
+    if w.nodes[op] < 0 { return true }
+    node := root(&mut w, w.nodes[op]); if w.state < 0 { return false }
+    // A registered but unreachable Push has no structural lifetime. Its
+    // physical row must be fed for ordering, but contributes no facts/score.
+    if w.levels[node] == 0 { return true }
+    if w.is_push[op] { w.forbidden[node] = w.forbidden[node].bit_or(live_after) }
+    if loop { w.scores[node] = w.scores[node] + 31 }; true
+}
+pub fn finish_analysis(w: &mut Workspace) -> bool {
+    if w.state < 0 { return false }
+    if w.state != 3 || w.physical_next != w.nodes.len { w.state = -1; return false }
+    if !publish(&mut w) { return false }
     if w.group_roots.len == 0 { w.state = 0; return false }; true
+}
+// Convenience wrapper over exactly the staged contract above. Independent
+// roots may borrow Workspace and physical together; same-root coordinators
+// use begin/feed/finish with scalar locals instead. No second analysis/copy.
+pub fn analyze_with_liveness_budget(w: &mut Workspace, f: &mir.Function,
+    context: &Context, exits: &terminals.TerminalContext, physical: &live.Workspace, limit: i32) -> bool {
+    if live.status(&physical) != 1 { reset(&mut w, limit); w.state = -1; return false }
+    if !begin_analysis_budget(&mut w, &f, &context, &exits, limit) { return false }
+    for op in 0..f.kinds.len {
+        after := live.live_after(&physical, op); loop := live.loop_block(&physical, f.op_blocks[op])
+        if !feed_physical(&mut w, op, after, loop) { return false }
+    }
+    finish_analysis(&mut w)
 }
 // Exclusive standalone allocator/transaction for correctness probes. Production
 // should consume read-only facts above in its shared Frame+Expr allocator.

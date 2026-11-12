@@ -22,11 +22,13 @@ python3 tools/test-compiler-session.py "$compiler"
 "$compiler" build-tests tests/mir_pipeline.ddr --target wasm32 -o "$work/mir-pipeline.wasm"
 node tools/test-wasm.mjs --execute "$work/mir-pipeline.wasm"
 python3 tools/test-mir-pipeline.py "$compiler" --report build/mir-pipeline-integrated.json
-for ssa_module in mir_call_inputs mir_liveness_inputs mir_ssa_cells mir_ssa mir_ssa_sparse; do
+for ssa_module in mir_call_inputs mir_liveness_inputs mir_ssa_cells mir_ssa mir_ssa_sparse mir_frame_exits mir_stack_origin mir_expr_stack mir_ssa_joint; do
     "$compiler" test "tests/$ssa_module.ddr" -o "$work/$ssa_module"
     "$compiler" build-tests "tests/$ssa_module.ddr" --target wasm32 -o "$work/$ssa_module.wasm"
     node tools/test-wasm.mjs --execute "$work/$ssa_module.wasm"
 done
+python3 tools/test-mir-stack-origin.py "$compiler" --output build/mir-stack-origin-integrated
+python3 tools/test-mir-regions.py "$compiler" --output build/mir-regions-integrated --report build/mir-regions-integrated.json
 python3 tools/test-mir-frame-exits.py "$compiler" --output build/mir-frame-exits-integrated
 python3 tools/test-mir-call-flags.py "$compiler" --output build/mir-call-flags-integrated
 python3 tools/test-mir-ssa.py "$compiler" --report build/mir-ssa-integrated.json
