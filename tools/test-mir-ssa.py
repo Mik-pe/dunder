@@ -171,7 +171,7 @@ def main():
     # Refuse a stale rollback witness when the production schema grows.
     declaration = (ROOT / 'selfhost/mir.ddr').read_text().split('pub struct Function {', 1)[1].split('\n}', 1)[0]
     witness = fixture.read_text().split('fn metadata(', 1)[1].split('\nfn main()', 1)[0]
-    fields = set(re.findall(r'\b([a-z][a-z0-9_]*)\s*:', declaration))
+    fields = set(re.findall(r'\b([a-z][a-z0-9_]*)\s*:', re.sub(r'//[^\n]*', '', declaration)))
     observed = set(re.findall(r'\bf\.([a-z][a-z0-9_]*)', witness))
     assert fields == observed, ('incomplete Function rollback witness', fields - observed, observed - fields)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
