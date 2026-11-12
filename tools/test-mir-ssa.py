@@ -34,8 +34,8 @@ NAMES = ('zero_w', 'sign_w', 'byte_view', 'high_w', 'counted_loop', 'expression_
          'critical_edge_flags', 'loop_swap', 'partial_store', 'escaped_cell', 'old_call',
          'fp_transfer', 'many_values', 'entry_flags', 'checked_overflow', 'pressure', 'late_initializer',
          'external_jump', 'external_conditional', 'external_fallthrough', 'half_view', 'combined_views', 'call_local',
-         'unreachable_external')
-POSITIVE = {0, 1, 2, 3, 4, 6, 7, 12, 13, 15, 16, 20, 21, 22, 23}
+         'unreachable_external', 'source_before_call', 'source_after_call', 'source_both_call_sides', 'source_target17')
+POSITIVE = {0, 1, 2, 3, 4, 6, 7, 12, 13, 15, 16, 20, 21, 22, 23, 25}
 
 
 def digest(value):
@@ -61,7 +61,8 @@ def expected(case, value, control):
     elif case == 7: result = 51 + value if control % 2 else value * 3 + 17
     elif case == 8: result = (value & 0xFFFFFFFF00000000) | (control & LOW)
     elif case in (9, 11, 17, 18, 19, 23): result = value
-    elif case in (10, 22): result = value + 99
+    elif case in (10, 22, 24, 25, 27): result = value + 99
+    elif case == 26: result = 2 * value + 106
     elif case == 12: result = value + sum(range(1, 81))
     elif case == 13: result = int(overflow_sub(value, control))
     elif case == 14: result = (value + 1) & LOW
@@ -143,7 +144,7 @@ def interpret(model, case, value, control, trap):
         result = oracle.signed(machine.run())
     except oracle.CoverageGap as gap:
         message = str(gap)
-        if case in (10, 22): assert 'kind=14' in message, message
+        if case in (10, 22, 24, 25, 26, 27): assert 'kind=14' in message, message
         elif case == 11: assert 'kind=19' in message, message
         elif case in (17, 18): assert 'external branch' in message, (case, message)
         elif case == 19: assert 'fell off end' in message, (case, message)
@@ -175,6 +176,7 @@ def main():
     assert fields == observed, ('incomplete Function rollback witness', fields - observed, observed - fields)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
     report = dict(compiler_sha256=digest(compiler.read_bytes()), module_sha256=digest(module.read_bytes()),
+                  call_inputs_sha256=digest((ROOT / 'selfhost/mir_call_inputs.ddr').read_bytes()),
                   fixture_sha256=digest(fixture.read_bytes()),
                   oracle_sha256=digest((ROOT / 'tools/test-mir.py').read_bytes()), host_target=host, images=[])
     with tempfile.TemporaryDirectory(prefix='dunder-mir-ssa-') as temporary:
@@ -194,18 +196,19 @@ def main():
         executed = proved = gaps = 0
         samples = [row for row in corpus() if args.case is None or row[0] == args.case]
 
-        def one(case, value, control, target, mode, limit=DEFAULT_LIMIT, source=0, terminals=0, label=''):
+        def one(case, value, control, target, mode, limit=DEFAULT_LIMIT, source=0, terminals=0, inputs=0, label=''):
             nonlocal executed, proved, gaps
-            image = work / f'{case}-{value}-{control}-{target}-{mode}-{limit}-{source}-{terminals}{label}'
+            image = work / f'{case}-{value}-{control}-{target}-{mode}-{limit}-{source}-{terminals}-{inputs}{label}'
             result = call([emitter, image, target, case, mode, value, control,
-                           expected(case, value, control), limit, source, terminals])
+                           expected(case, value, control), limit, source, terminals, inputs])
             before, after, bm, am, counters = parse_export(result.stdout)
             assert 0 <= counters['units'] <= max(0, limit), counters
             # This pass's published first-version contract is write-through:
             # keep original stores (including timing/order/extra GP effects).
             for index, op in enumerate(before['operations']):
-                if op['kind'] == 8 and op['mode'] != 2:
-                    assert after['operations'][index] == op, ('source store changed', NAMES[case], index)
+                if op['kind'] in (8, 14) and op['mode'] != 2:
+                    assert after['operations'][index] == op, ('pinned store/call changed', NAMES[case], index)
+                    if op['kind'] == 14: assert op['reads'] == op['clobbers'] == -1, op
             trap = case == 14 and value == (1 << 63) - 1
             pre = interpret(before, case, value, control, trap)
             post = interpret(after, case, value, control, trap)
@@ -217,13 +220,20 @@ def main():
                 assert bm == am and before == after, (NAMES[case], counters, 'noncommitted MIR changed')
             if mode == 'off':
                 assert counters['status'] == 0 and counters['units'] == 0
-            elif limit == DEFAULT_LIMIT and (case in POSITIVE or (case == 14 and terminals)):
+            elif limit == DEFAULT_LIMIT and (case in POSITIVE or (case == 14 and terminals) or (case in (24, 26) and inputs)):
                 assert counters['changed'] and counters['status'] == 2, (NAMES[case], counters)
                 assert counters['cells'] > 0 and counters['removed_loads'] > 0, (NAMES[case], counters)
                 assert after_traffic['loads'] < before_traffic['loads'], (NAMES[case], before_traffic, after_traffic, counters)
                 if case == 12: assert counters['values'] > 64, counters
                 if case in (4, 6, 7, 16): assert counters['parameters'] > 0, counters
                 assert counters['registers'] > 0, counters
+                if case == 26 and inputs:
+                    assert counters['cells'] >= 2 and counters['removed_loads'] >= 6, counters
+            if mode == 'on' and limit == DEFAULT_LIMIT and (case == 27 or (case == 24 and not inputs)):
+                assert not counters['changed'] and counters['status'] == 0, (NAMES[case], inputs, counters)
+                if case == 27:
+                    calls = [op for op in before['operations'] if op['kind'] == 14 and op['mode'] != 2]
+                    assert len(calls) == 1 and calls[0]['a'] == 17, calls
             if mode == 'on' and limit in (0, 1):
                 assert not counters['changed'] and counters['status'] == -3, counters
             if mode == 'on' and (case in (17, 18, 19) or (case == 14 and not terminals)):
@@ -237,6 +247,7 @@ def main():
             if args.output: image.with_suffix(image.suffix + '.mir.txt').write_text(result.stdout)
             row = dict(case=case, name=NAMES[case], input=value, control=control, target=target, mode=mode,
                        limit=limit, source_objects=source, terminal_contract=terminals, executed=ran,
+                       source_inputs=inputs,
                        sha256=digest(image.read_bytes()), export_sha256=digest(result.stdout.encode()),
                        counters=counters, before_traffic=before_traffic, after_traffic=after_traffic,
                        before=pre, after=post)
@@ -248,15 +259,17 @@ def main():
                 one(case, value, control, target, 'off')
                 one(case, value, control, target, 'on')
                 if case == 14: one(case, value, control, target, 'on', terminals=1)
+                if case >= 24: one(case, value, control, target, 'on', inputs=1)
             print(f'PASS {index + 1}/{len(samples)} {NAMES[case]} input{value} control{control}', flush=True)
         # Independent policy paths and exact rollback after early/mid/late budget
         # exhaustion. Reusing the production exclusive API is mandatory here.
-        for case, value, control in ((0, 41, 0), (4, 7, 0), (12, -17, 1)):
+        for case, value, control in ((0, 41, 0), (4, 7, 0), (12, -17, 1), (24, 41, 0), (26, -17, 1)):
             if args.case is not None and args.case != case: continue
             for target in (host, 3):
-                full = one(case, value, control, target, 'on', source=1, label='-context')
+                inputs = int(case >= 24)
+                full = one(case, value, control, target, 'on', source=1, inputs=inputs, label='-context')
                 for limit in sorted({0, 1, max(1, full['units'] // 2), max(1, full['units'] - 1)}):
-                    stopped = one(case, value, control, target, 'on', limit=limit, source=1, label='-budget')
+                    stopped = one(case, value, control, target, 'on', limit=limit, source=1, inputs=inputs, label='-budget')
                     assert not stopped['changed'] and stopped['status'] == -3, (case, limit, full, stopped)
         report.update(images_built=len(report['images']), executions=executed,
                       independent_pairs=proved, explicit_gap_pairs=gaps,
