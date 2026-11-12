@@ -34,6 +34,7 @@ for ssa_module in mir_call_inputs mir_liveness_inputs mir_ssa_cells mir_ssa mir_
 done
 python3 tools/test-mir-stack-origin.py "$compiler" --output "$mir_reports/stack-origin"
 python3 tools/test-mir-regions.py "$compiler" --output "$mir_reports/regions" --report "$mir_reports/regions.json"
+python3 tools/test-mir-expr.py "$compiler" --output "$mir_reports/expression" --report "$mir_reports/expression.json"
 python3 tools/test-mir-frame-exits.py "$compiler" --output build/mir-frame-exits-integrated
 python3 tools/test-mir-call-flags.py "$compiler" --output build/mir-call-flags-integrated
 python3 tools/test-mir-ssa.py "$compiler" --report build/mir-ssa-integrated.json
