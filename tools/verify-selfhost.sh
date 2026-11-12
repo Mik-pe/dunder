@@ -13,6 +13,7 @@ trap 'exit 1' HUP INT TERM
 "$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
 "$compiler" test tests/mir_object.ddr -o "$work/mir-object"
 python3 tools/test-mir-objects.py "$compiler"
+python3 tools/test-mir-object-data.py "$compiler" --output build/mir-object-data-integrated
 # Metadata/emitter units execute portably; OS probes and source tasks execute
 # only on the implemented native host provider.
 python3 tools/test-mir-link.py "$compiler"
