@@ -7,6 +7,12 @@ Against the previous compiler, the selected four-worker profile improved those
 build medians 35.44% and 17.35%. This is measured compiler parallelism, separate
 from the earlier source-language task-throughput cohort.
 
+Here selfhost means compiling the frozen serial-entry source
+`selfhost/main.ddr`, producing image `126788e5...`. The A/B latency cases do not
+build `main_parallel.ddr` with source task certification or time the complete
+`bootstrap.sh` chain. The new default bootstrap performs more verification
+stages, and no whole-bootstrap wall-time improvement has been measured.
+
 Runtime kernel images did not change. This archive establishes no runtime code
 improvement or C parity: the candidate/C median geometric mean was 1.178, above
 the 1.10 goal, and text/sort remained above the individual 1.25 limit.
@@ -61,6 +67,10 @@ were `--jobs=1`, candidate flags were empty, selecting the entry's default 4.
 
 Milliseconds, median / p95:
 
+The selfhost row times the frozen `selfhost/main.ddr` serial-entry dependency
+graph. It excludes the parallel entry's source task certification and the
+bootstrap production/fixedpoint chain.
+
 | Operation | Input | jobs=1 | default 4 | Median change |
 | --- | --- | ---: | ---: | ---: |
 | Build | Generated | 953.718 / 962.263 | 609.106 / 616.753 | -36.13% |
@@ -88,6 +98,11 @@ and the same current source checkout. The candidate was the parallel image,
 not the serial executable. This measures the total selected profile change.
 
 Milliseconds, median / p95:
+
+The selfhost row again builds the frozen serial entry `selfhost/main.ddr`.
+The 17.35% reduction does not measure a complete bootstrap or the compilation of
+`main_parallel.ddr`; that entry's selfhosting fixed point is separate functional
+evidence below.
 
 | Operation | Input | Previous 598cf | New default 4 | Median change |
 | --- | --- | ---: | ---: | ---: |
@@ -230,6 +245,8 @@ clean `26a2761` through measurement completion. Binaries, generated corpus copie
 and output executables were omitted from this small archive; metadata retains
 their identities, commands and results. Absolute scratch paths in metadata are
 historical provenance. `checksums.sha256` covers every other archived file.
+Raw CSV files retain their original CRLF bytes; use Git's `cr-at-eol`
+whitespace setting when checking the preserved data rather than rewriting it.
 
 To reproduce, restore source `26a2761` and matching frozen executables first. Use
 new empty report directories; do not rerun into this archive:
