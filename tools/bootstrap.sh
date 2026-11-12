@@ -3,6 +3,13 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+serial_only=0
+if [ "$#" -eq 1 ] && [ "$1" = --serial ]; then
+    serial_only=1
+elif [ "$#" -ne 0 ]; then
+    echo 'usage: tools/bootstrap.sh [--serial]' >&2
+    exit 2
+fi
 case "$(uname -s):$(uname -m)" in
     Darwin:arm64) host=arm64-macos; entry=main ;;
     Linux:aarch64|Linux:arm64) host=arm64-linux; entry=linux ;;
@@ -33,5 +40,19 @@ if ! cmp -s "$work/stage2" "$work/stage3"; then
     "$work/stage3" build "selfhost/$entry.ddr" -o "$work/stage4" >&2
     cmp "$work/stage3" "$work/stage4"
 fi
-mv -f "$work/stage3" "$dir/dunder"
+# The frozen seed only needs the serial entry's syntax and dependencies.
+# Keep that verified compiler as a recovery path and producer for the
+# task-capable entry. Never replace the standard binary on a failed build.
+mv -f "$work/stage3" "$dir/dunder-serial"
+if [ "$serial_only" -eq 1 ]; then
+    printf '%s\n' "$root/$dir/dunder-serial"
+    exit 0
+fi
+if [ "$host" = arm64-macos ]; then
+    parallel_compiler=$(./tools/bootstrap-parallel.sh --compiler "$root/$dir/dunder-serial")
+    cp "$parallel_compiler" "$work/standard"
+else
+    cp "$dir/dunder-serial" "$work/standard"
+fi
+mv -f "$work/standard" "$dir/dunder"
 printf '%s\n' "$root/$dir/dunder"

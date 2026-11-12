@@ -110,6 +110,16 @@ def targets_and_cache(p):
 
 
 def worker_options(p):
+    sources = Path(__file__).resolve().parents[1]
+    import platform
+    host = 0 if sys.platform == "darwin" else (1 if platform.machine() in ("arm64", "aarch64") else 2)
+    driver_module = os.path.relpath(sources / "selfhost/driver", p.root.resolve()).replace(os.sep, "/")
+    # Keep the serial entry's early rejection contract covered even when the
+    # supplied compiler uses the task-capable entry by default.
+    p.write("serial-entry.ddr", "import " + json.dumps(driver_module)
+            + " as driver\nfn main()->i32{driver.build(" + str(host) + ")}\n")
+    p.call("build", "serial-entry.ddr", "-o", "serial-entry")
+    serial = Project(p.root / "serial-entry", p.root)
     source = p.write("workers.ddr", "fn twice(x:i32)->i32{x+x}\nfn main(){print(twice(21))}\n")
     published = p.root / "workers"
     p.call("build", source, "-o", published)
@@ -119,9 +129,10 @@ def worker_options(p):
         assert result.stdout == f"built {published}\n" and result.stderr == ""
         assert published.read_bytes() == original
     for action in ("build", "check", "build-tests", "run", "test"):
-        result = p.call(action, "absent.ddr", "--jobs", "2", status=2)
+        result = serial.call(action, "absent.ddr", "--jobs", "2", status=2)
         assert result.stderr == "this compiler entry supports only --jobs 1\n" and result.stdout == ""
-    p.call("build", "absent.ddr", "--jobs=256", status=2)
+    result = serial.call("build", "absent.ddr", "--jobs=256", status=2)
+    assert result.stderr == "this compiler entry supports only --jobs 1\n" and result.stdout == ""
     missing = p.call("build", source, "--jobs", status=2)
     assert missing.stderr == "--jobs requires a worker count\n"
     for value in ("", "0", "-1", "257", "1.5", "no", "9223372036854775808"):
@@ -134,7 +145,6 @@ def worker_options(p):
     p.write("args.ddr", "import sys\nfn main(){print(sys.arg(1));print(sys.arg(2))}\n")
     assert p.call("run", "args.ddr", "--jobs=1", "--", "--jobs", "4").stdout == "--jobs\n4\n"
 
-    sources = Path(__file__).resolve().parents[1]
     fixture = (sources / "tests/fixtures/driver-workers.ddr").read_text()
     for name, alias in (("driver", "driver"), ("compile", "compiler"), ("lexer", "lexer")):
         old = "import ...selfhost." + name + (" as compiler" if name == "compile" else "")
@@ -142,8 +152,6 @@ def worker_options(p):
         assert fixture.count(old) == 1
         fixture = fixture.replace(old, "import " + json.dumps(module) + " as " + alias)
     # The host entry is explicit; imported modules remain ordinary seed syntax.
-    import platform
-    host = 0 if sys.platform == "darwin" else (1 if platform.machine() in ("arm64", "aarch64") else 2)
     fixture = fixture.replace("driver.build_using(0,4,true,compile)", f"driver.build_using({host},4,true,compile)")
     p.write("callback-entry.ddr", fixture)
     p.call("build", "callback-entry.ddr", "-o", "callback-entry")

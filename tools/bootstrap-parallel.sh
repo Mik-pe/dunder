@@ -10,7 +10,7 @@ case "$(uname -s):$(uname -m)" in
     *) echo 'Parallel compiler bootstrap requires an ARM64/macOS host' >&2; exit 1 ;;
 esac
 if [ "$#" -eq 0 ]; then
-    serial_compiler=$(./tools/bootstrap.sh)
+    serial_compiler=$(./tools/bootstrap.sh --serial)
 elif [ "$#" -eq 2 ] && [ "$1" = --compiler ]; then
     serial_compiler=$2
 else

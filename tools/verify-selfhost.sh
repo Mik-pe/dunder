@@ -33,8 +33,10 @@ if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     python3 tools/test-task-native.py "$compiler"
     python3 tools/test-task-scope.py "$compiler"
     python3 tools/test-task-source.py "$compiler"
-    parallel_compiler=$(./tools/bootstrap-parallel.sh --compiler "$compiler")
-    python3 tools/test-parallel-compiler.py "$parallel_compiler" --baseline "$compiler" --output build/parallel-compiler-qa
+    # bootstrap.sh already proves the standard parallel entry's fixed point.
+    # Compare its 1/2/N paths with the separately bootstrapped serial entry.
+    serial_compiler="$root/build/selfhost/arm64-macos/dunder-serial"
+    python3 tools/test-parallel-compiler.py "$compiler" --baseline "$serial_compiler" --output build/parallel-compiler-qa
 else
     echo 'BLOCKED native task execution: first provider requires ARM64/macOS'
 fi
