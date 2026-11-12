@@ -1,0 +1,312 @@
+// Independent SSA consumer fixture. Export canonical physical MIR before/after
+// the actual pass, then lower real images. No runtime timing is collected.
+import ...selfhost.arm64 as arm
+import ...selfhost.mir
+import ...selfhost.mir_lift as lift
+import ...selfhost.mir_verify as verify
+import ...selfhost.mir_lower as lower
+import ...selfhost.mir_memory as memory_policy
+import ...selfhost.mir_ssa as ssa
+import ...selfhost.macho
+import ...selfhost.elf
+import ...selfhost.x86
+import ...selfhost.wasm_native as wasm
+import ...selfhost.wasm_abi as wa
+import std.parse
+import sys
+
+fn number(at: i32) -> i64 { value := parse.integer(sys.arg(at)); assert(value.ok); value.value }
+fn seed(reg: i32) -> i64 { 123456789012345 + i64(reg) * 1000003 }
+fn binary(code: &mut arm.Code, base: i64, dst: i32, a: i32, b: i32) {
+    arm.emit(&mut code, base + i64(b) * 65536 + i64(a) * 32 + i64(dst))
+}
+fn add(code: &mut arm.Code, dst: i32, a: i32, b: i32) { binary(&mut code, 2332033024, dst, a, b) }
+fn compare(code: &mut arm.Code, a: i32, b: i32) { binary(&mut code, 3942645760, 31, a, b) }
+fn frame_memory(code: &mut arm.Code, load: bool, width: i32, reg: i32, offset: i32, signed: bool) {
+    var size := 0; if width == 2 { size = 1 } else if width == 4 { size = 2 } else if width == 8 { size = 3 }
+    var base: i64 = 939524096; if load { base = 943718400 }; if signed { base = 947912704 }
+    arm.emit(&mut code, base + i64(size) * 1073741824 + i64(offset).bit_and(511) * 4096 + 29 * 32 + i64(reg))
+}
+fn cset(code: &mut arm.Code, dst: i32, condition: i32) {
+    arm.emit(&mut code, 2594113504 + i64(condition.bit_xor(1)) * 4096 + i64(dst))
+}
+fn read_view_three_times(code: &mut arm.Code, width: i32, offset: i32, signed: bool) {
+    frame_memory(&mut code, true, width, 0, offset, signed)
+    frame_memory(&mut code, true, width, 2, offset, signed)
+    binary(&mut code, 3405774848, 0, 0, 2)
+    frame_memory(&mut code, true, width, 2, offset, signed); add(&mut code, 0, 0, 2)
+}
+fn expect(code: &mut arm.Code, actual: i32, value: i64, failed: i32) {
+    arm.imm(&mut code, 1, value); compare(&mut code, actual, 1); arm.branch(&mut code, failed, 3)
+}
+fn observe_expect(code: &mut arm.Code, actual: i32, value: i64, failed: i32) {
+    arm.imm(&mut code, 16, value); compare(&mut code, actual, 16); arm.branch(&mut code, failed, 3)
+}
+fn external_observer(code: &mut arm.Code, failed: i32, selected: i32, input: i64, control: i64) {
+    // A branch outside the function has no Return ABI exemption. Observe every
+    // caller GP, flags, numeric SP and a write-through byte range BEFORE any
+    // ordinary source epilogue; the observer finally executes that epilogue.
+    arm.store(&mut code, 1, 16); arm.store(&mut code, 2, 17)
+    for i in 0..4 { cset(&mut code, 16, i * 2); arm.store(&mut code, 3 + i, 16) }
+    for reg in 0..16 {
+        var wanted := seed(reg)
+        if reg == 0 || reg == 4 || (reg == 2 && selected != 18) { wanted = input }
+        if reg == 5 { wanted = control }
+        observe_expect(&mut code, reg, wanted, failed)
+    }
+    arm.load(&mut code, 1); observe_expect(&mut code, 0, seed(16), failed)
+    arm.load(&mut code, 2); observe_expect(&mut code, 0, seed(17), failed)
+    var a := input; var b := control; if selected == 18 { a = control; b = 0 }
+    difference := a.wrapping_sub(b); var carry := a >= b
+    if a < 0 && b >= 0 { carry = true }; if a >= 0 && b < 0 { carry = false }
+    overflow := (a < 0 && b >= 0 && difference >= 0) || (a >= 0 && b < 0 && difference < 0)
+    flags: []bool = [difference == 0, carry, difference < 0, overflow]
+    for i in 0..4 { arm.load(&mut code, 3 + i); var wanted := 0; if flags[i] { wanted = 1 }; observe_expect(&mut code, 0, i64(wanted), failed) }
+    arm.emit(&mut code, 2432696320 + 31 * 32 + 16)
+    arm.emit(&mut code, 3506438144 + 96 * 1024 + 29 * 32 + 17)
+    compare(&mut code, 16, 17); arm.branch(&mut code, failed, 3)
+    arm.load(&mut code, 0); observe_expect(&mut code, 0, input, failed)
+    arm.imm(&mut code, 0, input); arm.ret(&mut code)
+}
+fn old_helper(code: &mut arm.Code, failed: i32, input: i64, control: i64) {
+    frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 24)
+    for reg in 0..18 { arm.store(&mut code, reg, reg) }
+    // Capture incoming NZCV before any comparisons. The complete prologue,
+    // stores and CSETs preserve those flags on the actual targets.
+    for i in 0..4 { cset(&mut code, 0, i * 2); arm.store(&mut code, 18 + i, 0) }
+    // X0 at the call is the wrapper FP. The source caller's FP is exactly48
+    // bytes below it, independently of any additional private frame reserve.
+    frame_memory(&mut code, true, 8, 0, 0, false)
+    arm.emit(&mut code, 2432696320 + 48 * 1024); arm.load_into(&mut code, 0, 1)
+    compare(&mut code, 1, 0); arm.branch(&mut code, failed, 3)
+    for reg in 1..18 {
+        var wanted := seed(reg); if reg == 4 { wanted = input }; if reg == 5 { wanted = control }
+        arm.load(&mut code, reg); expect(&mut code, 0, wanted, failed)
+    }
+    difference := input.wrapping_sub(control)
+    var carry := input >= control
+    if input < 0 && control >= 0 { carry = true }; if input >= 0 && control < 0 { carry = false }
+    overflow := (input < 0 && control >= 0 && difference >= 0) || (input >= 0 && control < 0 && difference < 0)
+    flags: []bool = [difference == 0, carry, difference < 0, overflow]
+    for i in 0..4 { arm.load(&mut code, 18 + i); var wanted := 0; if flags[i] { wanted = 1 }; expect(&mut code, 0, i64(wanted), failed) }
+    // Raw unknown callees may observe the numeric incoming SP and user frame
+    // bytes. SourceObjects does not supply a different call-observation ABI.
+    frame_memory(&mut code, true, 8, 0, 0, false)
+    arm.emit(&mut code, 3506438144 + 96 * 1024)
+    arm.emit(&mut code, 2432696320 + 16 * 1024 + 29 * 32 + 1)
+    compare(&mut code, 1, 0); arm.branch(&mut code, failed, 3)
+    frame_memory(&mut code, true, 8, 0, 0, false)
+    arm.emit(&mut code, 4164943872 + i64(-8).bit_and(511) * 4096)
+    expect(&mut code, 0, input, failed)
+    for reg in 0..18 { arm.imm(&mut code, reg, 9000007 + i64(reg) * 101) }
+    for reg in 25..29 { arm.imm(&mut code, reg, 7000003 + i64(reg) * 97) }
+    arm.imm(&mut code, 1, 99); arm.ret(&mut code)
+}
+fn initialize(code: &mut arm.Code) {
+    arm.imm(&mut code, 0, 0); arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 0)
+    arm.store(&mut code, 2, 4)
+}
+fn loop_body(code: &mut arm.Code, head: i32, done: i32) {
+    arm.mark(&mut code, head); arm.load_into(&mut code, 0, 1); arm.load(&mut code, 2)
+    compare(&mut code, 1, 0); arm.branch(&mut code, done, 12)
+    arm.load_into(&mut code, 1, 1); arm.load(&mut code, 0); add(&mut code, 0, 1, 0); arm.store(&mut code, 1, 0)
+    arm.load(&mut code, 0); arm.imm(&mut code, 1, 1); add(&mut code, 0, 0, 1); arm.store(&mut code, 0, 0)
+    arm.branch(&mut code, head, 0); arm.mark(&mut code, done); arm.load(&mut code, 1)
+}
+fn dump(f: &mir.Function) {
+    print("MIR1"); print(f.kinds.len)
+    for op in 0..f.kinds.len {
+        print(f.kinds[op]); print(f.opcodes[op]); print(f.dst[op]); print(f.a[op]); print(f.b[op]); print(f.c[op])
+        print(f.imm[op]); print(f.aux[op]); print(f.types[op]); print(f.place[op]); print(f.extensions[op])
+        print(f.effects[op]); print(f.flags[op]); print(f.abi[op]); print(f.reads[op]); print(f.writes[op]); print(f.clobbers[op])
+        print(f.modes[op]); print(f.targets[op])
+    }
+    print("PLACES"); print(f.place_kinds.len)
+    for p in 0..f.place_kinds.len { print(f.place_kinds[p]); print(f.place_offsets[p]); print(f.place_widths[p]) }
+    print("LABELS"); print(f.label_ids.len)
+    for label in 0..f.label_ids.len { print(f.label_ids[label]); print(f.label_ops[label]) }
+    print("ORDER"); print(f.order.len); for op in f.order { print(op) }; print("END")
+}
+fn i32s(a: &[]i32) { print(a.len); for value in a { print(value) } }
+fn i64s(a: &[]i64) { print(a.len); for value in a { print(value) } }
+fn bools(a: &[]bool) { print(a.len); for value in a { print(value) } }
+fn metadata(f: &mir.Function) {
+    // Exact rollback witness: every Function scalar/column, without a digest
+    // as a correctness assumption or a copied Function snapshot.
+    print("META1")
+    print(f.valid); print(f.verified); print(f.optimizable); print(f.unknown_control)
+    print(f.platform); print(f.first_word); print(f.first_label); print(f.first_reloc); print(f.first_import)
+    print(f.source_words); print(f.source_labels); print(f.source_relocs); print(f.source_imports)
+    i32s(&f.kinds); i32s(&f.opcodes); i32s(&f.dst); i32s(&f.a); i32s(&f.b); i32s(&f.c)
+    i64s(&f.imm); i32s(&f.aux); i64s(&f.variant); i32s(&f.types); i32s(&f.place); i32s(&f.extensions)
+    i32s(&f.effects); i32s(&f.flags); i32s(&f.abi); i64s(&f.reads); i64s(&f.writes); i64s(&f.clobbers)
+    i32s(&f.origins); i32s(&f.raw_starts); i32s(&f.widths); i32s(&f.modes); i32s(&f.recipes)
+    i32s(&f.targets); i32s(&f.reloc_kinds); i32s(&f.import_ids); i32s(&f.order); i64s(&f.raw)
+    i32s(&f.place_kinds); i32s(&f.place_offsets); i32s(&f.place_widths); i32s(&f.place_extensions); bools(&f.place_escaped)
+    i32s(&f.place_table); print(f.place_probes)
+    i32s(&f.block_starts); i32s(&f.block_ends); i32s(&f.op_blocks)
+    i32s(&f.edge_from); i32s(&f.edge_to); i32s(&f.edge_kinds); i32s(&f.edge_starts)
+    i32s(&f.label_ids); i32s(&f.label_ops); i32s(&f.boundaries); bools(&f.leaders)
+    print(f.visits); print(f.budget_exhausted); print("ENDMETA")
+}
+fn main() {
+    target := i32(number(2)); selected := i32(number(3)); enabled := sys.arg(4) == "on"
+    input := number(5); control := number(6); expected := number(7)
+    limit := i32(number(8)); source_objects := number(9) != 0; terminal_contract := number(10) != 0
+    var code := arm.new_for(target)
+    wrapper := arm.label(&mut code); entry := arm.label(&mut code)
+    failed := arm.label(&mut code); overflow := arm.label(&mut code); old_callee := arm.label(&mut code)
+    zero := arm.label(&mut code); io := arm.label(&mut code); bounds := arm.label(&mut code); float_trap := arm.label(&mut code)
+    outside := arm.label(&mut code)
+    arm.branch(&mut code, wrapper, 1); arm.exit(&mut code, 0)
+    arm.mark(&mut code, failed); arm.exit(&mut code, 104)
+    arm.mark(&mut code, overflow); arm.exit(&mut code, 101)
+    arm.mark(&mut code, zero); arm.exit(&mut code, 102)
+    arm.mark(&mut code, io); arm.exit(&mut code, 105)
+    arm.mark(&mut code, bounds); arm.exit(&mut code, 103)
+    arm.mark(&mut code, float_trap); arm.exit(&mut code, 107)
+    // Deliberately old/uncertified helper. A caller cannot keep values in its
+    // destroyed GP homes merely because a newer allocator chose them.
+    arm.mark(&mut code, old_callee); old_helper(&mut code, failed, input, control)
+    if selected == 17 || selected == 18 {
+        arm.mark(&mut code, outside); external_observer(&mut code, failed, selected, input, control)
+    }
+    first_word := code.words.len; first_label := code.labels.len; first_reloc := code.at.len
+    arm.begin_mir(&mut code, true); arm.mark(&mut code, entry)
+    frame := arm.prologue(&mut code); var slots := 12; if selected == 15 { slots = 40 }
+    arm.frame(&mut code, frame, slots)
+    if (selected >= 0 && selected <= 3) || selected == 20 {
+        arm.store(&mut code, 0, 4)
+        if selected == 0 { read_view_three_times(&mut code, 4, -8, false) }
+        else if selected == 1 { read_view_three_times(&mut code, 4, -8, true) }
+        else if selected == 2 { read_view_three_times(&mut code, 1, -7, false) }
+        else if selected == 3 { read_view_three_times(&mut code, 4, -4, false) }
+        else { read_view_three_times(&mut code, 2, -5, false) }
+    } else if selected == 4 || selected == 16 {
+        head := arm.label(&mut code); done := arm.label(&mut code); initialize_at := arm.label(&mut code)
+        if selected == 16 { arm.branch(&mut code, initialize_at, 0) } else { initialize(&mut code) }
+        loop_body(&mut code, head, done)
+        if selected == 16 {
+            arm.ret(&mut code); arm.mark(&mut code, initialize_at); initialize(&mut code); arm.branch(&mut code, head, 0)
+        }
+    } else if selected == 5 {
+        arm.mov(&mut code, 0, 4); arm.push(&mut code, 0); arm.imm(&mut code, 0, 3)
+        arm.push(&mut code, 0); arm.imm(&mut code, 0, 7); arm.pop(&mut code, 1); add(&mut code, 0, 1, 0)
+        arm.pop(&mut code, 1); binary(&mut code, 3405774848, 0, 1, 0)
+    } else if selected == 6 {
+        join := arm.label(&mut code); arm.store(&mut code, 0, 4)
+        compare(&mut code, 5, 31); arm.branch(&mut code, join, 2)
+        arm.emit(&mut code, 704644064 + 4 * 65536); arm.store(&mut code, 0, 0)
+        compare(&mut code, 4, 31); arm.mark(&mut code, join)
+        cset(&mut code, 1, 0); read_view_three_times(&mut code, 8, -8, false); add(&mut code, 0, 0, 1)
+    } else if selected == 7 {
+        head := arm.label(&mut code); done := arm.label(&mut code)
+        arm.store(&mut code, 0, 4); arm.imm(&mut code, 0, 17); arm.store(&mut code, 1, 0); arm.store(&mut code, 2, 5)
+        arm.mark(&mut code, head); arm.load(&mut code, 2); compare(&mut code, 0, 31); arm.branch(&mut code, done, 15)
+        arm.load(&mut code, 0); arm.load_into(&mut code, 1, 1)
+        arm.store(&mut code, 0, 1); arm.store(&mut code, 1, 0)
+        arm.load(&mut code, 2); arm.imm(&mut code, 1, 1); binary(&mut code, 3405774848, 0, 0, 1); arm.store(&mut code, 2, 0)
+        arm.branch(&mut code, head, 0); arm.mark(&mut code, done)
+        arm.load(&mut code, 0); arm.imm(&mut code, 1, 3); binary(&mut code, 2600500224, 0, 0, 1)
+        arm.load_into(&mut code, 1, 1); add(&mut code, 0, 0, 1)
+    } else if selected == 8 {
+        arm.store(&mut code, 0, 4); frame_memory(&mut code, false, 4, 5, -8, false); arm.load(&mut code, 0)
+    } else if selected == 9 {
+        arm.store(&mut code, 0, 4); arm.address(&mut code, 0); arm.mov(&mut code, 1, 0)
+        arm.emit(&mut code, 4181721088 + 1 * 32)
+    } else if selected == 10 || selected == 22 {
+        arm.store(&mut code, 0, 4)
+        for reg in 25..29 { arm.store(&mut code, reg - 21, reg) }
+        if selected == 22 {
+            // A genuinely available caller register EXISTS inside this local
+            // interval: X1 is saved before it and restored before the call.
+            // The worker must optimize the interval without leaking its home
+            // into the helper's complete incoming physical-state observation.
+            arm.store(&mut code, 8, 1); arm.store(&mut code, 9, 0); arm.store(&mut code, 10, 2)
+            arm.store(&mut code, 11, 4); read_view_three_times(&mut code, 8, -96, false)
+            arm.load_into(&mut code, 8, 1); arm.load_into(&mut code, 9, 0); arm.load_into(&mut code, 10, 2)
+        }
+        arm.branch(&mut code, old_callee, 1); arm.load(&mut code, 0); add(&mut code, 0, 0, 1)
+        for reg in 25..29 { arm.load_into(&mut code, reg - 21, reg) }
+    } else if selected == 11 {
+        arm.emit(&mut code, 2657550336 + 4 * 32); arm.emit(&mut code, 2657484800)
+    } else if selected == 12 {
+        arm.store(&mut code, 0, 4)
+        for i in 0..80 { arm.load(&mut code, 0); arm.imm(&mut code, 1, i64(i + 1)); add(&mut code, 0, 0, 1); arm.store(&mut code, 0, 0) }
+        arm.load(&mut code, 0)
+    } else if selected == 13 {
+        cset(&mut code, 0, 6); arm.store(&mut code, 0, 0); read_view_three_times(&mut code, 4, -8, false)
+    } else if selected == 14 {
+        arm.imm(&mut code, 1, 1); binary(&mut code, 2868903936, 0, 4, 1); arm.branch(&mut code, overflow, 8)
+        arm.store(&mut code, 0, 0); read_view_three_times(&mut code, 4, -8, false)
+    } else if selected == 15 {
+        for i in 0..40 { arm.imm(&mut code, 1, i64(i)); add(&mut code, 0, 4, 1); arm.store(&mut code, i, 0) }
+        // The annotated large-offset stores/loads ALSO define physical X9.
+        // Keep its last address as ordinary GP data so eliminating the final
+        // load may not silently erase that canonical scratch definition.
+        arm.mov(&mut code, 10, 9)
+        arm.imm(&mut code, 2, 0)
+        for i in 0..40 { arm.load(&mut code, i); add(&mut code, 2, 2, 0); arm.load(&mut code, i); add(&mut code, 2, 2, 0) }
+        binary(&mut code, 3405774848, 0, 9, 10); add(&mut code, 0, 2, 0)
+    } else if selected >= 17 && selected <= 19 {
+        arm.store(&mut code, 0, 4)
+        if selected == 18 {
+            arm.mov(&mut code, 0, 4); compare(&mut code, 5, 31); arm.branch(&mut code, outside, 2)
+            read_view_three_times(&mut code, 8, -8, false)
+        } else {
+            read_view_three_times(&mut code, 8, -8, false)
+            if selected == 17 { arm.branch(&mut code, outside, 0) }
+        }
+    } else if selected == 21 {
+        arm.store(&mut code, 0, 4)
+        frame_memory(&mut code, true, 1, 0, -7, false)
+        frame_memory(&mut code, true, 2, 1, -5, false); add(&mut code, 0, 0, 1)
+        frame_memory(&mut code, true, 4, 1, -8, false); add(&mut code, 0, 0, 1)
+        frame_memory(&mut code, true, 4, 1, -8, true); add(&mut code, 0, 0, 1)
+        frame_memory(&mut code, true, 8, 1, -8, false); add(&mut code, 0, 0, 1)
+    } else { assert(false) }
+    if selected != 19 { arm.ret(&mut code) }; arm.end_mir(&mut code)
+    var sites: []i32 = []; var f := mir.new()
+    assert(lift.lift_spans(&mut f, &code, first_word, first_label, first_reloc, &sites, 0,
+        &code.mir_starts, &code.mir_ends, &code.mir_kinds, &code.mir_a, &code.mir_b))
+    assert(lift.own_entry(&mut f, &code, entry) && verify.verify(&mut f))
+    print("ORIGINAL"); dump(&f); metadata(&f)
+    var work := ssa.new(); var changed := false
+    if enabled {
+        context := memory_policy.for_source_producer(source_objects)
+        var terminals := ssa.no_terminals()
+        if terminal_contract {
+            terminals.version = 1; terminals.overflow = overflow; terminals.zero = zero
+            terminals.assertion = failed; terminals.io = io; terminals.bounds = bounds; terminals.float_trap = float_trap
+        }
+        changed = ssa.optimize_with_terminals_budget(&mut work, &mut f, &context, &terminals, limit)
+        assert(ssa.status(&work) != -1)
+        if changed { assert(ssa.status(&work) == 2 && f.verified) }
+    } else { assert(sys.arg(4) == "off") }
+    print("RESULT"); dump(&f); metadata(&f)
+    print("COUNTERS"); print(changed); print(ssa.status(&work)); print(ssa.units(&work))
+    print(ssa.cells(&work)); print(ssa.removed_loads(&work)); print(ssa.removed_stores(&work))
+    print(ssa.copies(&work)); print(ssa.parameters(&work)); print(ssa.values(&work)); print(ssa.registers(&work))
+    print(ssa.removed_pushes(&work)); print(ssa.removed_pops(&work))
+    assert(f.verified && verify.verify(&mut f))
+    var lowering := lower.new(); assert(lower.prepare(&mut lowering, &f, &code, &sites))
+    lower.commit_code(&mut lowering, &mut code); lower.commit_imports(&mut lowering, &mut sites)
+    print(code.words.len - first_word)
+    if selected == 19 { external_observer(&mut code, failed, selected, input, control) }
+    arm.mark(&mut code, wrapper); wrapper_frame := arm.prologue(&mut code); arm.frame(&mut code, wrapper_frame, 4)
+    for reg in 0..29 { arm.imm(&mut code, reg, seed(reg)) }
+    arm.emit(&mut code, 2432696320 + 31 * 32); arm.store(&mut code, 0, 0)
+    arm.mov(&mut code, 0, 29); arm.store(&mut code, 2, 0)
+    arm.imm(&mut code, 4, input); arm.imm(&mut code, 5, control)
+    compare(&mut code, 4, 5); arm.branch(&mut code, entry, 1); arm.store(&mut code, 1, 0)
+    arm.imm(&mut code, 1, expected); compare(&mut code, 0, 1); arm.branch(&mut code, failed, 3)
+    for reg in 18..29 { arm.imm(&mut code, 0, seed(reg)); compare(&mut code, reg, 0); arm.branch(&mut code, failed, 3) }
+    arm.emit(&mut code, 2432696320 + 31 * 32); arm.load_into(&mut code, 0, 1); compare(&mut code, 0, 1); arm.branch(&mut code, failed, 3)
+    arm.load(&mut code, 2); compare(&mut code, 29, 0); arm.branch(&mut code, failed, 3)
+    arm.imm(&mut code, 0, 0); arm.ret(&mut code)
+    var image: []u8 = []; none: []i32 = []
+    if target == 3 { abi := wa.new(); result := wasm.image(&code, code.words.len, wrapper, 1, &abi); assert(result.ok); image = result.text }
+    else if target == 2 { result := x86.finish(&code, code.words.len, &none, &none); assert(result.ok); image = elf.image_for(&result.text, 62) }
+    else { text := arm.finish(&mut code); if target == 0 { image = macho.image(&text) } else { image = elf.image(&text) } }
+    assert(sys.write_u8(sys.arg(1), &image).ok && sys.make_executable(sys.arg(1)).ok)
+}
