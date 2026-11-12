@@ -6,7 +6,7 @@ the old unsound flags2 model. This is NOT a production value-pass miscompile.
 The separately named liveness-control mode is test-only Compare deletion: it
 demonstrates why falsely dead flag metadata would license an invalid future
 transformation. With canonical flags3, that control must retain Compare too.
-Linux images are built only on this ARM64/macOS probe host. No timing tests.
+All four targets are built; only the native host and Wasm execute. No timing tests.
 """
 import argparse
 import hashlib
@@ -31,13 +31,12 @@ def main():
                         help='2 records the pre-fix contract; normal regression requires3')
     parser.add_argument('--output', type=Path, default=ROOT / 'build/mir-call-flags')
     args = parser.parse_args()
-    if platform.system() != 'Darwin' or platform.machine() != 'arm64':
-        parser.error('native CSET observer probe requires ARM64/macOS; Linux is image-only')
+    host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
     compiler = args.compiler.resolve(strict=True)
     base = args.output.resolve(); base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='run-', dir=base))
     commands, images = [], []
-    executions = {'arm64-macos': 0, 'wasm32': 0}
+    executions = {TARGETS[host]: 0, 'wasm32': 0}
     passed = False
 
     def call(command, stdout=None):
@@ -81,7 +80,7 @@ def main():
                                        'call_flags': flags, 'compare_flags_live': before_live,
                                        'compare_removed': removed, 'value_deleted': deleted,
                                        'expected_observer_result': expected, 'sha256': digest(image)})
-                        if target == 0:
+                        if target == host:
                             call([image], str(expected) + '\n'); executions[name] += 1
                         elif target == 3:
                             call(['node', ROOT / 'tools/test-wasm.mjs', '--execute', image],
@@ -95,7 +94,8 @@ def main():
             'source_sha256': {p: digest(ROOT / p) for p in (
                 'selfhost/mir_decode.ddr', 'selfhost/mir_retained.ddr', 'selfhost/mir_liveness.ddr',
                 'selfhost/mir_value_prop.ddr', 'tests/fixtures/mir-call-flags-emitter.ddr')},
-            'images': images, 'executions': executions, 'linux_execution': 'cross-built only',
+            'images': images, 'executions': executions, 'host_target': TARGETS[host],
+            'cross_built_only': [name for target, name in enumerate(TARGETS) if target not in (host, 3)],
             'production_value_pass': 'productive; Compare retained, observer result preserved before and after fix',
             'liveness_control': 'test-only demonstration; not a production pass or claimed production miscompile',
         }, indent=2) + '\n')
