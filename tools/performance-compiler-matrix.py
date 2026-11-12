@@ -292,7 +292,7 @@ def main():
                     runner.run([image, *inputs], 'validate independent runtime checksum', expected=f'{expected}\n'.encode())
                 metadata['runtime_preflight'][case] = dict(args=inputs, expected_stdout=f'{expected}\n', images=images)
                 if len({i['sha256'] for i in images.values()}) != 1:
-                    raise RuntimeError(f'runtime images changed; stop for a separately authorized runtime/C protocol: {case}')
+                    raise RuntimeError(f'runtime images changed; stop for a separate runtime/C comparison: {case}')
             checkpoint()
             if not args.validate_only:
                 for case in CASES:
