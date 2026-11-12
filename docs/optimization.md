@@ -7,8 +7,9 @@ index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen
 
 Huvudarkitekturen är nu en
 [gemensam IR för hela funktioner](whole-function-ir-plan.md), med samma gräns
-för skalära kroppar, anrop och ägda värden. Planen beskriver fortsatt
-registerplacering, SSA, loopoptimering och direkta målbackends.
+för skalära kroppar, anrop och ägda värden. En första valbar SSA-grund
+placerar privata framevärden i register. Planen beskriver fortsatt generell
+SSA-sänkning, loopoptimering och direkta målbackends.
 
 ## Gemensam helfunktionskedja
 
@@ -67,7 +68,7 @@ cacheträffar och `check` har noll backendaktivitet.
 Samma kompilator kan korsbygga alla fyra mål. Begränsningen till ARM64/macOS
 gäller taskruntimen som kör kompilatorjobben, inte programmens målformat.
 [Parallell kompilatormätning](../benchmarks/2026-11-12-parallel-compiler/README.md)
-redovisar en worker separat från standardens fyra. Det ändrar bygglatensen;
+redovisar en worker separat från standardens fyra. Rapporten föregår SSA-grunden; dess
 byteidentiska runtimebilder behåller samma kvarvarande C-gap.
 
 ### Registerhem över hela funktioner
@@ -88,10 +89,12 @@ utvärderings-, fäll- och cleanupordning.
 Inkommande registervärden sparas i färska frameceller och återställs före
 varje normal epilog. Den kompletta framereservationen utökas atomiskt.
 Stora offset kräver explicit scratchregister och bevisad liveness.
-Hemmen laddas initialt från de ursprungliga framebitarna, så att även en
-tidig okänd läsning observerar samma lagring. Anrop synkroniserar hemmen
-mot de ursprungliga platserna; inget antagande görs att äldre callees
-bevarar de nya hemmen. Rå MIR synkroniserar också vid okänd minnesåtkomst.
+Hemmen laddas initialt från de ursprungliga framebitarna. Anrop synkroniserar
+hemmen mot de ursprungliga platserna och laddar om dem efteråt. Anropsmasker
+och minnesbarriärer behålls. Frameutökningen kräver dessutom ett uttryckligt
+anrops-ABI och tillräckliga kontrakt för alla nåbara utgångar; synkronisering
+av cellinnehåll ensam bevarar inte godtyckliga observationer av SP eller
+inkommande x25–x28.
 
 Den kompletta källproducenten kan ge ett uttryckligt, versionsbundet
 [objektminneskontrakt](ffi.md) genom [`mir_memory`](../selfhost/mir_memory.ddr).
@@ -100,7 +103,8 @@ disjunkta celler i den aktuella framen. Frame-livstid, reserverat intervall,
 exponering och överlappning kontrolleras fortfarande separat. Kontraktet
 gör att heapåtkomster kan passeras utan onödig framesynkronisering. Det
 bevisar varken registerbevarande vid anrop eller minnesfrihet för godtyckliga
-anrop. `--mir-memory=off` väljer det konservativa råläget.
+anrop. `--mir-memory=off` stänger av just denna NoModRef-premiss och behåller
+synkronisering vid indirekt minne. Anrops- och utgångskontrakten är separata.
 En separat may-uninitialized-analys kräver att varje ersatt läsning har
 en föregående skrivning på alla nåbara vägar.
 
@@ -118,13 +122,111 @@ och `budget_refusals`. Faktiska arbetsräknare är noll vid check, avstängt
 pass och full cacheåterställning. Policyflaggan kan fortfarande vara på
 vid cacheträff. `source_objects_enabled` anger den effektiva minnespolicyn
 och `private_memory_ops` räknar faktiskt använda privata minnespositioner.
-Full GP-SSA och fysisk registerallokering återstår.
+
+### Skilda kontrakt för minne, anrop och utgångar
+
+Rå MIR kan uttrycka en callee som läser sitt inkommande SP eller x25, eller
+en extern utgång som inspekterar den aktuella framen. Den tidigare
+frameomskrivningen ändrade ett sådant observationsprov från `333 / 13` till
+`13 / 7`. Ett annat prov ändrade observerat call-SP från `16` till `32`, och
+inkommande x25 från `333` till `13`. De
+[frysta motexemplen och rättningen](../tests/fixtures/mir-frame-exit-receipt.json)
+är funktionella korrekthetsbevis. Nu avstår rå- och minneskontextens
+framepass vid nåbara okända utgångar och anrop utan tillräckligt ABI. Ett
+terminalkontrakt ensamt tillåter heller inte anrop.
+
+Tre versionsbundna producentpremisser prövas var för sig:
+
+- [`mir_memory`](../selfhost/mir_memory.ddr) ger NoModRef för bevisat privata
+  celler vid giltiga indirekta objektåtkomster. Det ger inget anrops-ABI.
+- [`mir_terminals`](../selfhost/mir_terminals.ddr) namnger exakt sex
+  producentägda statusutgångar: overflow, division med noll, assertion, I/O,
+  bounds och flyttalsfälla. De terminerar utan att läsa inkommande register,
+  flaggor eller användarminne, köra cleanup eller anropa användarkod. Enbart
+  NoReturn räcker inte; varje nådd extern måletikett behöver sitt eget bevis.
+- [`mir_call_abi`](../selfhost/mir_call_abi.ddr) håller ett separat
+  käll-ABI-kontrakt. `mir_call_abi.conservative()` gör inget sådant påstående;
+  `mir_pipeline.options().source_abi` är false för råa konsumenter. Den kompletta källproducenten deklarerar ABI1: x25–x28 är bevarat
+  dolt tillstånd, och privat frameutfyllnad och exakt call-SP är
+  implementationsegenskaper. Giltiga register-/stackargument, resultat och
+  exponerade källobjekt behåller sitt vanliga ABI. Premissen ger ingen
+  NoModRef för anrop och ändrar inga call-clobbermasker.
+
+De nativa runtimehjälparna har granskats utan explicita läsningar eller
+skrivningar av x25–x28. C-anrop, återinträde genom callbacks, stackargument
+och bevarade register provas också vid källgränsen. Detta använder de
+[befintliga reglerna för privata celler och främmande anrop](ffi.md#objektminne-och-privata-stackceller);
+språkets åtkomst- eller ABI-garantier har inte försvagats. Ett vanligt
+främmande anrop får inte inspektera andra privata lokaler genom stackvandring.
+[Frame-/utgångsprov](../tools/test-mir-frame-exits.py) ·
+[FFI-prov](../tools/test-ffi.py).
+
+### SSA för privata framevärden
+
+[`mir_ssa`](../selfhost/mir_ssa.ddr) är en verklig, begränsad SSA-grund över
+hela funktionens CFG. Egna ValueID:n beskriver GP-/NZCV-definitioner och
+användningar, blockparametrar och föregångarkanternas argument. En
+MAY-clobber vid anrop får en egen tillståndsversion och uppfinns aldrig som
+ett semantiskt anropsresultat. De ursprungliga fysiska operationerna och
+deras effekter ligger kvar som fasta begränsningar.
+
+[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr) grupperar oexponerade,
+justerade åttabytesceller med en befintlig fullbreddsplats. Alla skrivningar
+måste omfatta hela cellen. Inneslutna läsvyer på 1, 2, 4 eller 8 byte kan
+ersättas med korrekt bituttag och explicit noll-/teckenutökning. Delvisa
+skrivningar, korsande eller exponerade intervall undantas. Vyerna antar
+inte att råa bitar redan är en normaliserad bool eller rune.
+
+Det första placeringssteget förenar en cells phi-värden i ett gemensamt
+registernät och väljer bland GP0–GP17 mot originalfunktionens fulla fysiska
+liveness, scratchdefinitioner och anropsförstörelse. Ursprungliga
+frame-skrivningar finns kvar i samma ordning och skriver igenom till minnet.
+Ingångens och post-call-barriärernas okända minnesversioner stannar i minnet.
+Passet växer inte framen, ändrar inte SP och skapar inga nya etikett- eller
+import-ID:n. CFG bevaras; sänkningen räknar om kodpositionerna.
+
+Arbetsminnet består av återanvändbara platta arenor. Budgeten på 4 194 304
+enheter omfattar analys, placeringsvittnen, stagning och slutverifiering.
+En gles undo-logg återställer varje ändrad rad och övrig ändrad metadata
+exakt vid avslag. En accepterad omskrivning fullverifieras innan den får
+lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
+
+`--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
+gemensamma seriella/taskbaserade kedjan. Standard är **off** tills hela
+mätmatrisen har bedömts. Effektiv aktivering kräver både MIR och MIR-opt;
+`check`, avstängt steg och full cacheträff utför inget SSA-arbete. Cache och
+testkvitton skiljer on/off, SSA-version 1 och arbetsbudgeten åt.
+`--timings=json` visar `ssa_enabled`, `ssa_optimized`, `ssa_cells`,
+`ssa_values`, `ssa_parameters`, `ssa_registers`, `ssa_removed_loads`,
+`ssa_removed_stores`, `ssa_removed_pushes`, `ssa_removed_pops`, `ssa_copies`,
+`ssa_analysis_units` och `ssa_budget_refusals`. Förändringsräknarna avser
+committade SSA-resultat i accepterade jobb; arbete och budgetavslag visar
+faktiska försök. Store-, push- och pop-eliminering ingår inte i denna version.
+
+Den funktionella SSA-matrisen omfattar 554 målbilder, 292 native-/Wasm-
+körningar och 438 exakta bitjämförelser före/efter. Ytterligare 116 par har
+uttryckligen redovisade luckor i den oberoende interpretern, bland annat
+anrop, flyttal och externa utgångar; dessa räknas inte som interpreterbevis.
+Linuxmålen är endast bildbyggda i denna matris. Ett loopprov går från sex
+frame-laster till noll men från 26 till 30 kodord; ett 80-värdesprov från
+81 laster till noll och från 329 till 249 ord. Det är strukturella resultat,
+inte uppmätt bygglatens eller runtimevinst.
+[SSA-/rollback-orakel](../tools/test-mir-ssa.py) ·
+[Cellkontrakt](../tests/mir_ssa_cells.ddr) ·
+[SSA-kontrakt](../tests/mir_ssa.ddr) ·
+[Källkod, workers, cache och kvitton](../tools/test-ssa-source.py).
+
+Generellt SSA-baserat val av skalära operationer, uttrycksstackvärden,
+heap-CSE, LICM och direkt registerallokering per mål återstår. Den nuvarande
+placeringen använder den gemensamma logiska GP-banken. Den innebär ingen
+fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
+är fortfarande öppet.
 
 ### Värdeidentitet över kontrollflödet
 
 [`mir_value_prop`](../selfhost/mir_value_prop.ddr) körs efter framepromovering
-och före sänkning. Det håller separata ekvivalensklasser för hela 64-bitars-
-värden och de låga 32 bitarna, exakta konstanter och nollutökning. Fakta
+och det valbara SSA-steget, före sänkning. Det håller separata
+ekvivalensklasser för hela 64-bitarsvärden och de låga 32 bitarna, exakta konstanter och nollutökning. Fakta
 möts över samtliga nåbara föregångare och löses till fixpunkt innan någon
 omskrivning planeras. Skrivningar och anropsförstörelse dödar äldre fakta;
 ett återkommande operations-ID i en loop är aldrig en värdeidentitet.
@@ -167,7 +269,7 @@ Arbetet, inklusive återställning, är budgetbegränsat; upprepad DCE-liveness
 är inte garanterat linjär.
 
 `--mir-values=off` stänger av värdepasset separat. `--mir-opt=off` stänger
-av båda helfunktionspassen. Cache och testkvitton inkluderar policyn.
+av frame-, SSA- och värdepassen. Cache och testkvitton inkluderar policyn.
 `--timings=json` visar `values_enabled`, `values_optimized`,
 `value_rewrites`, `value_deleted`, `value_immediates`,
 `value_analysis_units` och `value_budget_refusals`. Dessa är faktisk
@@ -190,7 +292,8 @@ Alla grenar kontrolleras innan optimeringen börjar, även om ett villkor
 är konstant. Om modellen inte stöder kroppen eller når sin resursgräns
 tar den befintliga kompilatorn över, inklusive feldiagnostik. Gränserna
 är 4 096 token, 2 048 noder, 256 lokaler och konservativt djup 64.
-Detta är en lokal IR per funktion; någon helprograms-IR eller SSA byggs inte.
+Denna strukturerade lokala modell bygger ingen egen SSA. Dess emission
+går vidare genom den gemensamma helfunktionskedjan och dess valbara SSA-steg.
 IR är ett tillåtet verktyg i kompilatorns fortsatta utveckling. Valet mellan
 strukturerad modell, SSA och lägre funktionsrepresentation ska styras av
 bevisbehov och uppmätt total byggtid. Snabb kompilering är kravet; att undvika
@@ -520,7 +623,7 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Den gemensamma IR-gränsen är införd. Värdeekvivalens, privata källobjekt och begränsad framepromovering är införda. Nästa steg är generell SSA och registerallokering över anrop och loopar. | Bevarande av register och NoModRef för privata celler är skilda kontrakt. Fulla ABI- och ägareffekter, låneursprung och verifierade producentpremisser måste vara explicita. |
+| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA är off som standard i väntan på mätmatrisen. Bevarande av register, NoModRef och terminalobservationer är skilda verifierade producentpremisser. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
@@ -541,8 +644,9 @@ vanliga binärer används för tidsjämförelser.
 
 ## Övrig kodgenerering och runtime
 
-Lokala värden läses direkt från sin frameplats med rätt bredd och
-teckenutökning. Deras stabila adress beräknas först när ett lån, en rå
+Den fulla frontendens ursprungliga emission läser lokala värden direkt
+från sin frameplats med rätt bredd och teckenutökning. Helfunktionspassen
+kan sedan ersätta bevisade åtkomster enligt kontrakten ovan. Deras stabila adress beräknas först när ett lån, en rå
 adress eller en tilldelning behöver den. Fält och arrayelement behåller
 sin separat sparade adress och reglerna för omvärdering efter mutation.
 Skalära tilldelningar till lokaler skriver direkt till frameplatsen.

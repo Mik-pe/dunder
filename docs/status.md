@@ -61,10 +61,44 @@ arrayer, flyttal och anrop använder tills vidare den befintliga kodgeneratorn.
 Alla nyemitterade källfunktioner från båda vägarna går därefter genom den
 gemensamma helfunktions-IR:n med obligatorisk verifiering och atomisk
 sänkning. Generell CFG-liveness, framepromovering, ett uttryckligt kontrakt för
-privata källobjekt och värdepropagering delar samma kedja.
+privata källobjekt och värdepropagering delar samma kedja. Ett nytt valbart
+SSA-steg ligger mellan frame- och värdepassen.
 `--mir-opt=off` behåller kedjan utan optimeringspassen;
 `--mir=off` stänger av hela gränsen för jämförelse.
 [Omfattning och gränser](optimization.md).
+
+`--mir-ssa=on` aktiverar [`mir_ssa`](../selfhost/mir_ssa.ddr) och
+[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard är **off** i väntan
+på hela mätmatrisen. Egna ValueID:n, GP/NZCV def/use, blockparametrar och
+kantargument ger en SSA-grund över hela CFG:n. Privata åttabytesceller med
+fullbreddsskrivningar och inneslutna 1/2/4/8-bytesvyer kan få placering i
+GP0–GP17 mot originalets fulla fysiska liveness och clobbers. Ursprungliga
+minnesskrivningar behålls; okända ingångs-/post-call-minnesversioner stannar
+i minnet. Frame, SP och etikett-/importnamespace ändras inte. Budgeten är
+4 194 304 enheter, med gles rollback och obligatorisk slutverifiering.
+Generellt SSA-baserat operationsval, uttrycksstackvärden, heap-CSE, LICM och
+direkt fysisk x86-registerallokering/Wasm-lokalplacering återstår.
+
+Källproducentens privata NoModRef, sex exakta utgångar utan observationer
+och anrops-ABI1 är separata versionsbundna premisser. Råa API-fabriker
+tillskriver inte godtycklig MIR dessa egenskaper. Rå-, minnes- och
+terminalkontexter ger ingen rätt att ändra ett okänt anrops synliga SP eller
+inkommande x25–x28. Framepasset avstår vid nåbara okända gränser utan
+tillräckligt kontrakt. Den kompletta källproducenten deklarerar ABI1 enligt
+[befintliga FFI-/privatminnesregler](ffi.md#objektminne-och-privata-stackceller).
+Anropssynkronisering, clobbermasker och giltiga argument bevaras.
+[Oberoende observerarmotexempel](../tools/test-mir-frame-exits.py).
+
+SSA:s funktionella matris ger 554 målbilder, 292 native-/Wasm-körningar
+och 438 exakta bitjämförelser före/efter, med 116 separat redovisade
+interpreterluckor. Linux är endast bildbyggt i denna matris. Sex→noll laster
+och 26→30 ord i ett loopprov samt 81→noll laster och 329→249 ord i ett
+80-värdesprov är strukturella resultat. Ingen SSA-runtime- eller
+kompileringstidsvinst är ännu publicerad. Käll-/worker-/cacheprov kontrollerar
+resultat, diagnostik, effektiva räknare och skilda on/off-kvitton.
+[SSA-orakel](../tools/test-mir-ssa.py) ·
+[Källprov](../tools/test-ssa-source.py) ·
+[Omfattning](optimization.md#ssa-för-privata-framevärden).
 
 Den taskbaserade kompilatorn behåller frontend, typning, nåbarhet,
 diagnostik, cache-I/O och inlinebudget i en enda Session. Workers returnerar
@@ -73,11 +107,12 @@ stöder 1–256 på ARM64/macOS-ingången. En worker, `check`, `--mir=off` och
 `--profile-compiler` använder samma seriella Session-väg. Workerantalet
 ändrar varken passbudgetar, cacheidentitet eller programbilder.
 
-[30-rundorsmätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
-med samma binär ger genererad byggmedian 953,718→609,106 ms när workerantalet
-ökar från en till fyra. Standardkandidatens genererade p95 är 619,768 ms,
+Den tidigare [30-rundorsmätningen av parallell kompilering](../benchmarks/2026-11-12-parallel-compiler/README.md),
+före SSA-grunden, ger med samma binär genererad byggmedian
+953,718→609,106 ms när workerantalet ökar från en till fyra. Standardkandidatens genererade p95 är 619,768 ms,
 163 003 källrader/s. Runtimebilderna är identiska. C-geomedlet 1,178× och
-största kvoten 1,308× ligger över målen 1,10× respektive 1,25×.
+största kvoten 1,308× i den rapporten ligger över målen 1,10× respektive
+1,25×. C-målet är fortfarande öppet; rapporten är inget mätresultat för SSA.
 
 Unika fulluttryckstemporärer av vanliga records kan överföras med generisk
 normalisering av nästlade arraykapaciteter. Detta tar bort extra kopior i

@@ -4,8 +4,10 @@ Målet är C-nära körning och snabb kompilering av hela språket. Fortsättnin
 bygger därför på en gemensam funktionsrepresentation. Den tidigare slutna
 skalärmodellen och lokala emitterförbättringar räcker inte som huvudarkitektur.
 Den gemensamma gränsen, verifieringen och de första helfunktionspassen är
-införda i standardkompilatorn. Planen skiljer denna grund från återstående
-SSA, registerallokering och looparbete. C-målet är fortfarande öppet.
+införda i standardkompilatorn. Privat cell-SSA och begränsad registerplacering
+är nu valbara med `--mir-ssa=on`, avstängt som standard. Planen skiljer denna
+grund från generellt SSA-baserat operationsval, vidare registerallokering
+och looparbete. C-målet är fortfarande öppet.
 
 ## Kedjan
 
@@ -15,7 +17,7 @@ flowchart LR
     frontend --> mir[Hel funktions-IR]
     mir --> verify[Verifiering]
     verify --> dataflow[CFG, liveness och minnesplatser]
-    dataflow --> optimize[Promotion och värdepass]
+    dataflow --> optimize[Frame, valbar cell-SSA och värdepass]
     optimize --> verify2[Verifiering]
     verify2 --> lower[Register och målsänkning]
     lower --> image[Maskinkod och funktionscache]
@@ -31,8 +33,8 @@ instruktionsvokabulären. Den gör det möjligt att flytta hela språket genom
 gränsen utan att samtidigt skriva om all diagnostik. Adaptern får behålla
 ursprungliga kodord för exakt återspelning, men en operation som ändras
 måste sänkas från sin kanoniska semantik. Pass får inte avkoda råa ARM-ord
-för att upptäcka sina operander eller effekter. Frontend börjar samtidigt
-avge explicita minnes- och ABI-kontrakt; på sikt ersätter direkt IR-emission
+för att upptäcka sina operander eller effekter. Frontend avger explicita
+frame-, minnes- och ABI-kontrakt; på sikt ersätter direkt IR-emission
 adaptern. Den gamla direkta maskinkodsvägen ska då avvecklas.
 
 ## Milstolpar
@@ -44,9 +46,11 @@ adaptern. Den gamla direkta maskinkodsvägen ska då avvecklas.
    byteidentiska bilder, även för ägarinitiering som ligger efter `RET`.
 2. **Register över hela funktioner.** Liveness och verkliga CFG-cykler,
    promotion av oexponerade frameplatser, explicita spill och bevarande av
-   register vid anrop och returer. Börja med generella, verifierade
-   byteintervall och inför SSA när värdeidentitet och joins behöver det.
-   Inget pass får bero på en viss benchmark eller ett funktionsnamn.
+   register vid anrop och returer. Fysisk liveness, fyra framehem och en
+   första valbar privat cell-SSA är införda. SSA använder egna värde-ID:n,
+   blockparametrar och kantargument, med placering mot originalets fulla
+   fysiska liveness. Generellt operationsval och vidare registerallokering
+   återstår. Inget pass får bero på benchmark eller funktionsnamn.
 3. **Arbete ur looparna.** Dominans, loopstruktur och placeringsanalys för
    konstanter och rena beräkningar. En möjlig fälla, retain, release,
    allokering eller minnesåtkomst får inte flyttas utan ett tillräckligt
@@ -61,11 +65,12 @@ adaptern. Den gamla direkta maskinkodsvägen ska då avvecklas.
    nödvändigt uttrycksmedel saknas implementeras det generellt i språket
    och provas genom samma kedja.
 
-Första runtimeleveransen ska angripa trafik över hela loopar. I den faktiska
-numeriska benchmarkens framgångsrika varv finns nio frame-läsningar och fyra
-frame-skrivningar; C-referensen håller värdena i register. Detta är underlag
-för prioriteringen, inte en regel som passet får känna till. Att ta bort
-enstaka instruktioner lämnar detta huvudproblem kvar.
+Runtimearbetet ska angripa trafik över hela loopar. Det ursprungliga
+underlaget var den numeriska benchmarkens nio frame-läsningar och fyra
+frame-skrivningar per framgångsrikt varv, medan C-referensen höll värdena i
+register. Det styr prioriteringen men är ingen regel passet får känna till.
+De nya strukturella SSA-proven behöver följas av hela mätmatrisen innan
+aktivering som standard eller påståenden om runtimevinst.
 
 ## Kontrakt som måste hålla
 
@@ -77,7 +82,10 @@ enstaka instruktioner lämnar detta huvudproblem kvar.
   är inte automatiskt oberoende av en FP-relativ plats.
 - Anropets resultatdefinitioner är skilda från register som kan förstöras.
   Intern Dunder-ABI, runtimehjälpare, C-ABI och värdanrop behöver egna
-  kontrakt. Nya registerhem kräver uttryckligt bevarande.
+  kontrakt. Privata objekt/NoModRef, bevarat anrops-ABI och exakt angivna
+  utgångar utan observationer är tre separata producentpremisser. Råa
+  fabriker gör inget av dessa påståenden. Nya registerhem kräver uttryckligt
+  bevarande, och frameväxt får inte ändra tillåtna call-SP-observationer.
 - CFG följer exekveringskanter. Ett bakåthopp från ägarinitiering till
   kroppen är ingen loop. Okänd kontrollöverföring ger en okänd kant och
   spärrar analyser som saknar tillräcklig information.
@@ -116,6 +124,59 @@ arbete; den måste också förklara och mäta vart arbetet går. Cacheformat och
 processdiagnostik fortsätter som separata uppgifter och styr inte denna
 leverans.
 
+## Införd SSA-grund och källa–ABI-gräns
+
+[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr) finner privata, justerade
+åttabytesceller med fullbreddsskrivningar och inneslutna läsvyer på
+1/2/4/8 byte. [`mir_ssa`](../selfhost/mir_ssa.ddr) bygger separata ValueID:n
+för GP/NZCV def/use, blockparametrar och föregångarkanternas argument.
+Fysiska registermasker innehåller fortsatt fysiska register-ID:n; ett
+anrops MAY-clobber blir ingen uppfunnen semantisk resultatdefinition.
+
+Cellens phi-värden förenas före placering i GP0–GP17. Originalets fulla
+fysiska liveness, explicita och implicita scratchdefinitioner samt
+clobbermasker begränsar valen. Ursprungliga stores skriver igenom till
+minnet i samma ordning; ingångens och post-call-barriärernas okända
+minnesversioner stannar i minnet. Inga nya frameceller, SP-justeringar,
+etikett- eller import-ID:n skapas. Uttrycksstackvärden, heap-CSE och
+generellt SSA-baserat val av skalära operationer ingår ännu inte. Placeringen
+gäller den gemensamma logiska GP-banken; direkt x86-registerallokering och
+Wasm-lokaler är kvarvarande målbackendsteg.
+
+Samma [`mir_pipeline`](../selfhost/mir_pipeline.ddr) kör frame → valbar SSA
+→ värdepass seriellt och i workers. SSA-budgeten är 4 194 304 enheter per
+funktion och inkluderar verifiering och exakt rollback. Platta arenor
+återanvänds; en gles undo-logg undviker hela funktionskopior. Ett nytt
+placeringsvittne kontrolleras före stagning och varje accepterat slutresultat
+fullverifieras. Budget eller saknat bevis lämnar funktionen exakt orörd.
+
+Rå MIR:s vanliga fabriker ger inga källpremisser. Det gäller även om MIR är
+formellt verifierad: en rå anropad funktion kan läsa sitt inkommande SP eller x25,
+och en extern utgång kan observera aktuell frame. Framepasset avstår därför
+vid sådana nåbara, oklassificerade gränser. De
+[frysta observerarmotexemplen](../tests/fixtures/mir-frame-exit-receipt.json)
+visar varför minnessynkronisering ensam inte räckte.
+[`mir_memory`](../selfhost/mir_memory.ddr),
+[`mir_terminals`](../selfhost/mir_terminals.ddr) och
+[`mir_call_abi`](../selfhost/mir_call_abi.ddr) skiljer NoModRef för privata
+celler, sex exakta utgångar utan observationer och källanropens ABI1 åt.
+Den kompletta källproducenten deklarerar de verifierade premisserna;
+`mir_pipeline.options().source_abi` är false för godtyckliga konsumenter.
+Även ABI1-anrop synkroniserar originalceller och behåller sina clobbers.
+Premisserna använder [befintliga FFI-/objektregler](ffi.md#objektminne-och-privata-stackceller),
+utan att försvaga språkets minnes- eller anropsgarantier.
+
+`--mir-ssa=on/off` är valbart och standarden är off tills mätmatrisen är
+bedömd. Cache och testkvitton skiljer policy, SSA-v1 och budget åt.
+Källrapportens förändringsräknare räknar committade SSA-resultat från
+accepterade jobb; check och full cacheträff kör inga nya pass.
+[Oberoende SSA-/rollback-prov](../tools/test-mir-ssa.py),
+[cellprov](../tests/mir_ssa_cells.ddr) och
+[käll-/worker-/cacheprov](../tools/test-ssa-source.py) beskriver
+funktionsomfattningen. Linuxbilder byggs men körs inte i denna SSA-matris.
+Att ett loopprov har sex→noll laster men 26→30 kodord ger inget
+latenspåstående. Nya runtime- och kompileringstidsresultat måste mätas
+separat före standardaktivering.
 
 ## Exklusiv transaktionsgräns
 
@@ -142,12 +203,11 @@ Varje ändrat slutresultat fullverifieras ovillkorligen. Hela det reserverade ve
 debiteras. Budgetavslag efter stagning ska återställa exakt samtliga fält.
 
 Detta angriper kompileringskostnaden utan att ändra de valda
-målinstruktionerna. Nästa runtimeetapp behöver verklig värde-SSA och
-registerallokering för privata skalärplatser, smala läsvyer och
-uttrycksstackvärden. Återanvändning av heaplaster behöver dessutom
+målinstruktionerna. Den valbara SSA-etappen kompletterar nu detta för
+privata celler och smala läsvyer. Generellt SSA-baserat operationsval,
+vidare registerallokering och uttrycksstackvärden återstår. Återanvändning av heaplaster behöver dessutom
 adressidentitet och explicita minnesversioner; scalar-SSA ensam bevisar
 inte att två heapåtkomster är oberoende.
-
 
 ## Parallell kompilering och språkets trådar
 
@@ -168,10 +228,11 @@ exakt samma källtraversering efter varje suspension och lämnar ett ägt
 MIR-jobb, ett redan färdigt cacheobjekt eller slut/fel. Alla provisoriska
 ord och globala ID:n behålls tills den slutliga bilden kan ersättas.
 
-`mir_task.Job` innehåller ägd `mir.Function`, passpolicy, terminalkontrakt,
+`mir_task.Job` innehåller ägd `mir.Function`, passpolicy, separata minnes-,
+anrops- och terminalkontrakt,
 källordinal och deklarations-ID. `mir_pipeline` kör samma verifiering och
-begränsade frame-/värdepass som den seriella vägen med workerägda
-arbetsarenor. Varje kallt jobb startar en OS-tråd och skapar lokal
+begränsade frame-, valbara SSA- och värdepass som den seriella vägen med
+workerägda arbetsarenor. Varje kallt jobb startar en OS-tråd och skapar lokal
 `pipeline.Workspace`; ingen permanent worker-/arenapool återanvänds.
 `--jobs=1` använder i stället den seriella kedjans återanvända arbetsminne.
 Svaret innehåller ägd MIR och status/statistik. Föräldern sänker till ett ägt `FunctionObject`: lokala ord- och etikettoffsetar,
@@ -234,17 +295,18 @@ varken taskgränsens isoleringskopior eller språkets vanliga värdesemantik.
 
 ### Mätning och återstående arkitektur
 
-[30-rundorsrapporten](../benchmarks/2026-11-12-parallel-compiler/README.md)
-skiljer samma binär med en/fyra workers från tidigare seriell kompilator
-mot ny standard. Genererat bygge går från 953,718 till 609,106 ms i den första
+Den tidigare [30-rundorsrapporten](../benchmarks/2026-11-12-parallel-compiler/README.md)
+föregår SSA-grunden. Den skiljer samma binär med en/fyra workers från
+tidigare seriell kompilator mot dåvarande standard. Genererat bygge går från 953,718 till 609,106 ms i den första
 jämförelsen; standardkandidatens p95 är 619,768 ms, 163 003 källrader/s.
 Runtimebilderna är identiska. C-geomedlet 1,178× och maxkvoten 1,308×
 överskrider fortfarande acceptansgränserna.
 
 Parallell modulläsning/lexning, typade frontendresultat och separata
 FunctionContext är framtida etapper. Frontend ska inte delas muterbart
-bara för att öka trådantalet. Värde-SSA, registerplacering över anrop och
-loopar samt direkta målbackends återstår som runtimearbete. Workerpool,
+bara för att öka trådantalet. Generellt SSA-baserat operationsval,
+uttrycksstackvärden, mer registerplacering över anrop och loopar samt direkta
+målbackends återstår som runtimearbete. Workerpool,
 nollkopierande gränstransfer, delad heap och generellt Send/Sync behöver
 separata kontrakt; den nuvarande isolerade modellen gör inte dessa anspråk.
 Linux och Wasm behöver egna verifierade runtime-/transportgränser innan

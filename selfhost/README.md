@@ -72,6 +72,53 @@ och kodbilder är deterministiska oberoende av färdigordning och workerantal.
 [Taskkontrakt](../docs/tasks.md) och
 [mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
 
+## Helfunktionspass och valbar SSA
+
+Varje nyemitterad källfunktion går genom den gemensamma MIR-gränsen med
+obligatorisk verifiering. Samma [`mir_pipeline`](mir_pipeline.ddr) utför
+framepromovering → valbar SSA → värdepropagering seriellt och i workers.
+Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
+diagnostik använder samma fulla frontend oberoende av passval.
+
+`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är **off** tills
+representativa runtime- och byggmätningar har bedömts. MIR och MIR-opt måste
+också vara på. Steget bygger egna ValueID:n för GP/NZCV def/use,
+blockparametrar och föregångarkanternas argument.
+[`mir_ssa_cells`](mir_ssa_cells.ddr) grupperar privata åttabytesceller med
+fullbreddsskrivningar och inneslutna läsvyer på 1/2/4/8 byte. En cells
+phi-värden förenas och placeras i GP0–GP17 mot originalets kompletta fysiska
+liveness och clobbers. Stores skriver fortsatt igenom till minnet och
+ingångs-/post-call-minnesversioner stannar i minnet. Inga nya frameceller,
+SP-justeringar, etiketter eller import-ID:n skapas.
+
+Budgetsatt analys, placeringskontroll, gles undo och slutverifiering ryms
+inom 4 194 304 enheter per funktion. Avslag återställer funktionen exakt.
+`--timings=json` redovisar effektiv `ssa_enabled` och faktiska `ssa_*`-räknare
+från accepterade jobb. Förändringsräknarna gäller committade omskrivningar.
+Check och full cacheträff utför inget SSA-arbete. On/off, SSA-v1 och budget
+ingår i cache- och testkvittoidentiteten; workerantalet ingår inte.
+
+[`mir_memory`](mir_memory.ddr), [`mir_terminals`](mir_terminals.ddr) och
+[`mir_call_abi`](mir_call_abi.ddr) håller privata NoModRef-celler, sex exakt
+angivna utgångar utan observationer och källanropens ABI1 åtskilda. Vanliga
+råa fabriker ger inga sådana källpremisser. Den kompletta källproducenten
+sätter ABI1 och äger beviset för giltiga anrop och bryggor. Det befintliga
+framepasset med fyra registerhem får därmed fortsätta säkert för källkod; rå MIR med
+nåbara okända utgångar eller anrop avstår utan tillräckligt kontrakt.
+Anrop synkroniserar fortfarande originalceller och behåller sina clobbers.
+[Reglerna för privata objekt, stackargument och FFI](../docs/ffi.md#objektminne-och-privata-stackceller)
+är oförändrade.
+
+Generellt SSA-baserat operationsval, uttrycksstackvärden, heap-CSE och
+loopplacering återstår. Nuvarande registerplacering gäller den gemensamma
+logiska banken; direkt x86-registerallokering och Wasm-lokaler är framtida
+målbackendsteg. De funktionella proven visar korrekthet och minskad
+lasttrafik i vissa fall, men ger inget nytt latens- eller C-prestandaanspråk.
+Linux är endast bildbyggt i SSA-matrisen.
+[SSA- och rollback-orakel](../tools/test-mir-ssa.py),
+[käll-/worker-/cacheprov](../tools/test-ssa-source.py) och
+[detaljerad omfattning](../docs/optimization.md#ssa-för-privata-framevärden).
+
 ## Vad kompilatorn klarar
 
 Självbygget använder punktimporter, alias, privata/exporterade symboler,
@@ -162,7 +209,9 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
 | `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, värdesemantik, källordning och slutlig emission. |
 | `compile_parallel.ddr`, `mir_task.ddr` | Begränsade taskfönster, ägda funktionsjobb och ordnad acceptans. |
-| `mir_pipeline.ddr` | Samma verifierings- och optimeringssteg för seriell körning och workers. |
+| `mir_pipeline.ddr` | Samma verifiering och frame-/valbara SSA-/värdepass för seriell körning och workers. |
+| `mir_ssa.ddr`, `mir_ssa_cells.ddr` | Budgeterad privat cell-SSA, smala läsvyer, blockparametrar och registerplacering mot fysisk liveness. |
+| `mir_memory.ddr`, `mir_terminals.ddr`, `mir_call_abi.ddr` | Separata producentpremisser för objektminne, exakta terminalobservationer och källanropens ABI. |
 | `mir_lower.ddr`, `mir_link.ddr` | Fristående funktionsobjekt och deterministisk sammanfogning. |
 | `record_take.ddr` | Normalisering vid transfer av unika fulluttryckstemporärer; lokaler flyttas inte. |
 | `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
@@ -191,6 +240,10 @@ node tools/test-wasm.mjs "$dunder_bin"
 node tools/test-wasm-abi.mjs "$dunder_bin"
 node tools/test-wasm-scalars.mjs "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
+# Riktade funktionella SSA-/ABI-prov, utan prestandamätning:
+python3 tools/test-mir-ssa.py "$dunder_bin"
+python3 tools/test-mir-frame-exits.py "$dunder_bin"
+python3 tools/test-ssa-source.py "$dunder_bin"
 ```
 
 De körda programmen har förväntade värden, utskrifter och felutfall.
