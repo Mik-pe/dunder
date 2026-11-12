@@ -41,6 +41,16 @@ allokeringar för sådana temporära kopior är inte garanterade; resursbrist
 beror på de allokeringar som faktiskt utförs. Uttryckliga kapacitetsfel,
 storleksgränser, indexfel och aritmetikfel behåller sina kontroller.
 
+Samma regel gäller icke-adresserbara uttryckstemporärers privata
+implementationslagring. Kompilatorn får hålla deras värden i register;
+resursfel för stacklagring som då aldrig skapas är inte garanterade.
+Detta tillåter inte att ta bort adresserbara källobjekt, uttryckliga
+allokeringar eller anropsargument. Deras giltiga adresser,
+utvärderingsordning och uttryckliga kontroller
+behålls. Rå maskinkods stackåtkomster får ingen sådan garanti av sitt
+instruktionsmönster. Okänd stacktrafik, SP-observationer och anrop kräver
+egna bevis innan deras fysiska stackförlopp får ändras.
+
 I `text + change(&mut text)` behåller vänsterledet strängen som lästes före
 funktionsanropet. Samma utvärderingsordning gäller för argument, index och
 snittgränser. En retur bevarar sitt resultat medan funktionen städar sina
