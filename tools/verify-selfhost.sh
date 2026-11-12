@@ -16,6 +16,14 @@ python3 tools/test-mir-objects.py "$compiler"
 # Metadata/emitter units execute portably; OS probes and source tasks execute
 # only on the implemented native host provider.
 python3 tools/test-mir-link.py "$compiler"
+python3 tools/test-mir-fragments.py "$compiler"
+python3 tools/test-compiler-session.py "$compiler"
+"$compiler" test tests/mir_pipeline.ddr -o "$work/mir-pipeline"
+"$compiler" build-tests tests/mir_pipeline.ddr --target wasm32 -o "$work/mir-pipeline.wasm"
+node tools/test-wasm.mjs --execute "$work/mir-pipeline.wasm"
+python3 tools/test-mir-pipeline.py "$compiler" --report build/mir-pipeline-integrated.json
+python3 tools/test-record-take.py "$compiler"
+python3 tools/test-record-take-source.py "$compiler"
 for task_module in task_data task_effects task_native task_scope_emit; do
     "$compiler" test "tests/$task_module.ddr" -o "$work/$task_module"
     "$compiler" build-tests "tests/$task_module.ddr" --target wasm32 -o "$work/$task_module.wasm"
@@ -25,6 +33,8 @@ if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     python3 tools/test-task-native.py "$compiler"
     python3 tools/test-task-scope.py "$compiler"
     python3 tools/test-task-source.py "$compiler"
+    parallel_compiler=$(./tools/bootstrap-parallel.sh --compiler "$compiler")
+    python3 tools/test-parallel-compiler.py "$parallel_compiler" --baseline "$compiler" --output build/parallel-compiler-qa
 else
     echo 'BLOCKED native task execution: first provider requires ARM64/macOS'
 fi

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Activated source ownership/capacity/cache contracts; no latency assertions.
 
-The comparison compiler must predate record_take frontend activation. Runtime
-event counters prove this compiler's source hook removed real aggregate copies;
+An optional historical comparison compiler predates frontend activation. A
+forced local-copy source control and finite event bounds verify activation;
 native/Wasm assertions independently check capacity, snapshots and RC lifetime.
 """
 import argparse
@@ -61,12 +61,13 @@ def run(command, *, cwd=ROOT, status=0, output=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
-    parser.add_argument('--baseline', required=True, type=Path)
+    parser.add_argument('--baseline', type=Path)
     args = parser.parse_args()
-    compiler, baseline = args.compiler.resolve(strict=True), args.baseline.resolve(strict=True)
+    compiler = args.compiler.resolve(strict=True)
+    baseline = args.baseline.resolve(strict=True) if args.baseline else None
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
     report = {'compiler': hashlib.sha256(compiler.read_bytes()).hexdigest(),
-              'baseline': hashlib.sha256(baseline.read_bytes()).hexdigest(),
+              'baseline': hashlib.sha256(baseline.read_bytes()).hexdigest() if baseline else None,
               'images': 0, 'executions': 0, 'profiles': [], 'cache': []}
     with tempfile.TemporaryDirectory(prefix='dunder-record-source-') as temporary:
         work = Path(temporary)
@@ -83,18 +84,31 @@ def main():
                     run(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image, '--repeat'], output='42\n')
                     report['executions'] += 2
             source = work / f'profile-{mode}.ddr'; source.write_text(PROFILE)
-            profiles = []
-            for label, tool in (('old', baseline), ('new', compiler)):
+            control = work / f'profile-{mode}-control.ddr'
+            control.write_text(PROFILE.replace('fn relay() -> Item { make() }',
+                                               'fn relay() -> Item { var value := make(); value }'))
+            profiles = {}
+            variants = [('new', compiler, source), ('local_copy', compiler, control)]
+            if baseline: variants.append(('old', baseline, source))
+            for label, tool, program in variants:
                 image = work / f'profile-{mode}-{label}'
-                run([tool, 'build', source, '--target', TARGETS[host], *flags, '--runtime-profile', '-o', image])
+                run([tool, 'build', program, '--target', TARGETS[host], *flags, '--runtime-profile', '-o', image])
                 result = run([image], output='42\n')
                 profile = json.loads(result.stderr)
                 assert profile['kind'] == 'runtime_profile'
-                profiles.append(profile['counters'])
-            old, new = profiles
-            for field in ('allocation_count', 'array_clone_calls', 'array_clone_bytes', 'record_clone_calls', 'record_clone_bytes'):
-                assert new[field] < old[field], (mode, field, old, new)
-            report['profiles'].append({'mode': mode, 'old': old, 'new': new})
+                profiles[label] = profile['counters']
+            new = profiles['new']
+            # This finite graph needs four ordinary array copies and three
+            # ordinary record copies. Unique temporary forwarding adds none.
+            # Bounds allow future legitimate copy elimination, but fail with
+            # the old unactivated emitter (12 array /14 record clone calls).
+            assert new['array_clone_calls'] <= 4 and new['record_clone_calls'] <= 3, (mode, new)
+            for label in ('local_copy', 'old'):
+                if label not in profiles: continue
+                old = profiles[label]
+                for field in ('allocation_count', 'array_clone_calls', 'array_clone_bytes', 'record_clone_calls', 'record_clone_bytes'):
+                    assert new[field] < old[field], (mode, label, field, old, new)
+            report['profiles'].append({'mode': mode, **profiles})
             # ALL source bodies restore. Their helper targets must recreate the
             # transitive demand closure without frontend source re-emission.
             cache_work = work / f'cache-{mode}'; cache_work.mkdir()
