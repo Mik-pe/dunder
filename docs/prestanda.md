@@ -12,6 +12,10 @@ medianer i millisekunder; den första jämförelsen isolerar workerantalets effe
 | Självbygge | 874,940 → 709,677 | 862,428 → 712,768 |
 | Tabell | 20,284 → 18,017 | 20,069 → 18,048 |
 
+Självbygget avser det fasta kompilatorkorpuset `selfhost/main.ddr`, som
+skriver den seriella kompilatoringången. Tiden för `main_parallel.ddr`
+och hela frö-/fixpunktkedjan i `bootstrap.sh` ingår inte i dessa värden.
+
 Den nya standardkandidatens genererade p95 är **619,768 ms**, motsvarande
 **163 003 källrader/s**. Det klarar 100 000-gränsen för det uppmätta
 genererade korpuset. Frontend, sänkning, ordnad sammanfogning och publicering

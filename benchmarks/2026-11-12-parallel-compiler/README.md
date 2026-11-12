@@ -202,8 +202,28 @@ the existing profiler tool's fixedpoint guard was not weakened.
 [`verification/pre-standard-full-verify.log`](verification/pre-standard-full-verify.log)
 is the completed full verification at `26a2761`, before changing bootstrap/default
 compiler selection. Root confirmed exit 0. This log does not claim full
-verification after selecting the parallel compiler as standard; that requires
-a separate final receipt.
+verification after selecting the parallel compiler as standard.
+
+The subsequent full standard run at script revision `60b9c6b` also passed,
+with the four-worker compiler selected by `bootstrap.sh`:
+
+- [`standard-full-verify.log`](verification/standard-full-verify.log) retains
+  the complete `./tools/verify-selfhost.sh` output, exit 0.
+- [`standard-verification.json`](verification/standard-verification.json)
+  records the command, source revision, binary/log hashes and coverage.
+- [`standard-parallel-qa.json`](verification/standard-parallel-qa.json)
+  records 108 exact image comparisons and 76 actual executions (64 ARM64 macOS,
+  12 Wasm). Linux targets were compared as images; no Linux execution is claimed.
+
+The standard run rebuilt the serial compiler from the checksum-verified seed,
+then required serial-produced, one-worker-produced and four-worker-produced
+parallel compiler images to match. The published standard has exactly the
+measured `bbd35784...` bytes; its serial recovery sidecar has `126788e5...`.
+Both the pre-standard and standard runs passed 138 native dogfood groups,
+124 Wasm groups with 14 native-only groups, and 46 runtime contracts on each
+executed target. Compiler sources and frozen seeds did not change between
+measurement and activation. Latency was not repeated for script/documentation
+changes that left the measured executable unchanged.
 
 ### Bootstrap publication controls, separate revision 60b9c6b
 
@@ -234,7 +254,7 @@ The scope is deliberately split:
   this native case; the three compiler productions and consumer execution
   were real.
 
-These controls are not a new full verification of the final standard compiler.
+These controls are separate from the full standard verification above.
 Scratch compilers/staging directories are omitted; the probe requires the
 matching frozen serial/parallel binary inputs and original repository path to
 be reproduced in a new scratch directory.

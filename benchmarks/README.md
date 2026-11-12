@@ -20,14 +20,23 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Parallell kompilering, 2026-11-12](2026-11-12-parallel-compiler/README.md)
+är den aktuella standardprofilen på ARM64/macOS. Samma binär med fyra workers
+ger 36,13 procent kortare genererad byggmedian och 18,89 procent kortare
+median för kompilatorkorpuset `selfhost/main.ddr` än med en worker. Den nya
+standarden når 163 003 genererade rader/s vid p95. Hela bootstrapkedjans tid
+är inte mätt. Runtimebilderna är identiska; C-geomedlet 1,178× lämnar C-målet
+öppet. Rapporten innehåller råserier, allokeringsattribuering och verifiering
+med den parallella kompilatorn som standard.
+
 [Isolerade uppgifter och seriell byggkostnad, 2026-11-12](2026-11-12-isolated-tasks/README.md)
 mäter språkets taskstöd: fyra aktiva jobb ger 3,59×/3,78× parad förbättring
-i två rena arbetsfall. Den fortfarande seriella kompilatorn behåller
+i två rena arbetsfall. Den då seriella kompilatorn behöll
 105 975 genererade rader/s vid p95; byggmedianerna ökar 0,01–0,67 procent.
-Alla sju vanliga programbilder är identiska. Kompilatorparallellism återstår.
+Alla sju vanliga programbilder är identiska i den jämförelsen.
 
 [Helfunktionsoptimering och fristående funktionsobjekt, 2026-11-11](2026-11-11-whole-function-optimization/README.md)
-är senaste verifierade standardprofilen. Den når 107 909 genererade källrader/s
+är den tidigare seriella standardprofilen. Den når 107 909 genererade källrader/s
 vid p95 med en arbetare, men byggmedianerna kostar fortfarande 2,89×/3,13×
 på genererat korpus/självbygge jämfört med före IR. Runtime/C-geomedlet är
 1,168×; C-målet återstår. Rapporten behåller mellanresultat och råvärden.
