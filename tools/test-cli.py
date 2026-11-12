@@ -109,6 +109,105 @@ def targets_and_cache(p):
     incremental(44)
 
 
+def worker_options(p):
+    source = p.write("workers.ddr", "fn twice(x:i32)->i32{x+x}\nfn main(){print(twice(21))}\n")
+    published = p.root / "workers"
+    p.call("build", source, "-o", published)
+    original = published.read_bytes()
+    for flag in (("--jobs", "1"), ("--jobs=1",)):
+        result = p.call("build", source, *flag, "-o", published)
+        assert result.stdout == f"built {published}\n" and result.stderr == ""
+        assert published.read_bytes() == original
+    for action in ("build", "check", "build-tests", "run", "test"):
+        result = p.call(action, "absent.ddr", "--jobs", "2", status=2)
+        assert result.stderr == "this compiler entry supports only --jobs 1\n" and result.stdout == ""
+    p.call("build", "absent.ddr", "--jobs=256", status=2)
+    missing = p.call("build", source, "--jobs", status=2)
+    assert missing.stderr == "--jobs requires a worker count\n"
+    for value in ("", "0", "-1", "257", "1.5", "no", "9223372036854775808"):
+        for flags in (("--jobs", value), ("--jobs=" + value,)):
+            result = p.call("build", source, *flags, status=2)
+            assert result.stderr == "--jobs must be an integer from 1 to 256\n", result
+    duplicate = p.call("check", source, "--jobs", "1", "--jobs=1", status=2)
+    assert duplicate.stderr == "duplicate --jobs option\n"
+    # Runtime arguments following -- belong to the program, including --jobs.
+    p.write("args.ddr", "import sys\nfn main(){print(sys.arg(1));print(sys.arg(2))}\n")
+    assert p.call("run", "args.ddr", "--jobs=1", "--", "--jobs", "4").stdout == "--jobs\n4\n"
+
+    sources = Path(__file__).resolve().parents[1]
+    fixture = (sources / "tests/fixtures/driver-workers.ddr").read_text()
+    for name, alias in (("driver", "driver"), ("compile", "compiler"), ("lexer", "lexer")):
+        old = "import ...selfhost." + name + (" as compiler" if name == "compile" else "")
+        module = os.path.relpath(sources / "selfhost" / name, p.root.resolve()).replace(os.sep, "/")
+        assert fixture.count(old) == 1
+        fixture = fixture.replace(old, "import " + json.dumps(module) + " as " + alias)
+    # The host entry is explicit; imported modules remain ordinary seed syntax.
+    import platform
+    host = 0 if sys.platform == "darwin" else (1 if platform.machine() in ("arm64", "aarch64") else 2)
+    fixture = fixture.replace("driver.build_using(0,4,true,compile)", f"driver.build_using({host},4,true,compile)")
+    p.write("callback-entry.ddr", fixture)
+    p.call("build", "callback-entry.ddr", "-o", "callback-entry")
+    entry = p.root / "callback-entry"
+    callback = p.root / "callback.txt"
+
+    def invoke(*args, status=0):
+        callback.unlink(missing_ok=True)
+        result = subprocess.run([entry, *map(str, args)], cwd=p.root,
+                                capture_output=True, encoding="utf-8", timeout=60)
+        assert result.returncode == status, result
+        return result
+
+    def observed(workers, checking=False, agent=False):
+        lines = callback.read_text().splitlines()
+        assert len(lines) == 5 and lines[:3] == [str(workers), str(checking).lower(), str(agent).lower()], lines
+        return lines[3:]
+
+    help_result = invoke("--help")
+    assert "default 4" in help_result.stdout and not callback.exists()
+    for workers, flags in ((4, ()), (1, ("--jobs", "1")), (2, ("--jobs=2",)), (256, ("--jobs", "256"))):
+        result = invoke("build", source, *flags, "-o", published)
+        assert result.stdout == f"built {published}\n" and result.stderr == ""
+        assert published.read_bytes() == original
+        assert observed(workers) == ["", ""]
+        result = invoke("check", source, *flags, "--agent")
+        assert json.loads(result.stdout.splitlines()[-1])["kind"] == "ok" and result.stderr == ""
+        assert observed(workers, True, True) == ["", ""]
+    for target in ("arm64-linux", "x86_64-linux", "wasm32"):
+        p.call("build", source, "--target", target, "--jobs=1", "-o", "cross-serial")
+        result = invoke("build", source, "--target", target, "--jobs=4", "-o", "cross-callback")
+        assert result.stderr == ""
+        assert (p.root / "cross-serial").read_bytes() == (p.root / "cross-callback").read_bytes()
+        observed(4)
+    result = invoke("check", source, "--jobs=4", "--profile-compiler", "--timings=json")
+    assert json.loads(result.stderr)["clock_ok"] is True
+    assert observed(4, True) == ["", ""]
+    # Worker count describes orchestration, not fragment identity or policy.
+    directories = []
+    for workers in (1, 4):
+        result = invoke("build", source, "--jobs=" + str(workers), "--incremental", "--timings=json", "-o", published)
+        timing = json.loads(result.stderr)
+        assert "workers" not in timing and "jobs" not in timing
+        if workers == 4:
+            assert timing["functions"]["reused"] > 0, timing
+        assert published.read_bytes() == original
+        directories.append(observed(workers))
+    assert directories[0] == directories[1] and directories[0][0], directories
+    # Agent diagnostics and affected receipts use the same shared driver path.
+    p.write("bad-workers.ddr", "fn main(){missing()}\n")
+    errors = []
+    for workers in (1, 4):
+        result = invoke("check", "bad-workers.ddr", "--agent", "--jobs=" + str(workers), status=1)
+        assert result.stderr == ""
+        observed(workers, True, True)
+        errors.append(json.loads(result.stdout))
+    assert errors[0] == errors[1] and errors[0]["kind"] == "error"
+    p.write("worker-cases.ddr", "@test fn ready(){true}\n")
+    for workers, expected in ((1, "1 passed"), (4, "1 unaffected")):
+        result = invoke("test", "worker-cases.ddr", "--affected", "--jobs=" + str(workers))
+        assert expected in result.stdout, result
+        observed(workers)
+
+
 def isolated_tests(p):
     for val, passed, skipped, code in ((42, 2, 0, 0), (42, 0, 2, 0), (41, 0, 1, 1), (41, 0, 1, 1)):
         p.write("affected.ddr", f"fn value()->i32{{{val}}}\n@test fn changed(){{value()==42}}\n@test fn other(){{true}}\n")
@@ -808,7 +907,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
-    cases = [modules_and_manifest, targets_and_cache, phase_timings, scalar_optimizer_controls,
+    cases = [modules_and_manifest, targets_and_cache, worker_options, phase_timings, scalar_optimizer_controls,
              compiler_profile_controls, whole_function_mir_controls, whole_function_optimizer_controls,
              whole_function_memory_controls, whole_function_value_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
