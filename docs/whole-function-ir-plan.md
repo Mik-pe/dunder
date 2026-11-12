@@ -256,3 +256,21 @@ låga 32 bitar. Gränserna kontrolleras före overflow; generationer återanvän
 aldrig. Scope, generation, ordinal och exakt resultattyp kontrolleras innan
 kontrollblocket får läsas. Opaque-typer avvisas i den första källvertikalen tills
 en uttrycklig definitionsägd klassificering finns.
+
+
+Den ordnade, fristående sammanfogaren finns i `mir_link.ddr`. Den validerar
+hela objektet före infogning, bevarar globala etikett-ID:n, skiljer import-
+site-ID:n från symbolslots och kräver källordning och unika ägare. Namespace
+kan växa monotont och förseglas med förväntat antal jobb. Slutliga runtime-
+och dataetiketter får fortfarande bindas av bildskrivaren. Den är verifierad
+mot seriella bilder på fyra mål men ännu inte inkopplad i frontend.
+
+Nästa kompilatorsteg är en seriell frontend-session som lämnar ägda MIR-jobb
+utan att dela Compiler, inlinebudget eller I/O. Ett separat taskbaserat
+compiler-entry kan då byggas av den redan taskkunniga kompilatorn utan att
+kräva ny syntax av det frysta fröet. Börja med verifiering och optimering av
+MIR-funktioner; opaque objekt kräver definitionsägd Data-klassificering innan
+de får passera taskgränsen. Jämför 1/2/N arbetare med exakt samma kodbilder,
+diagnostik, budgetar, bindings och cacheutfall innan en byggtidsvinst hävdas.
+Språkets [uppmätta taskvinster](../benchmarks/2026-11-12-isolated-tasks/README.md)
+ersätter inte denna kompilatormätning eller det återstående C-runtime-målet.

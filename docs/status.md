@@ -26,7 +26,7 @@ Rust-kompilatorn har ersatts. [Återbyggnad](../bootstrap/README.md) och
 - Structar, fasta och dynamiska arrayer samt enums med payload har
   värdesemantik. Nästlade structfält och enumpayloads kan äga samlingar.
   Vanliga arrayelement är primitiva värden, inklusive strängar och pekare,
-  eller enums utan payload. `@c_layout` använder målplattformens fältstorlek
+  enums utan payload eller typade tasknycklar. `@c_layout` använder målplattformens fältstorlek
   och justering. [Enums](enums.md) och [FFI](ffi.md).
 - Ägda arraybuffertar frigörs deterministiskt. Oföränderliga strängar
   använder referensräkning. Ett lån av en lokal, ett fält eller ett

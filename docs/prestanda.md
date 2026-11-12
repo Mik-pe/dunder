@@ -1,12 +1,17 @@
 # Så mäter vi Dunder
 
-Den aktuella självhosten har en [gemensam runtime- och byggmätning](../benchmarks/2026-11-11-whole-function-optimization/README.md#final-serial-profile-with-detached-function-objects)
-med 30 försök per variant, råtider, kontrollerade resultat och full lokal
-verifiering. Standardprofilens genererade bygge når 107 909 källrader/s vid
-p95 med en byggarbetare. Runtime/C-geomedlet är 1,168× och textfallet 1,325×;
-C-målet återstår. Byggmedianen kostar fortfarande 2,89× på det genererade
-korpuset och 3,13× på självbygget jämfört med kompilatorn före helfunktions-IR.
-Kontroll utan kodgenerering har jämförbar tid. Hela acceptanskontraktet nedan
+Det senaste [taskstödet och dess seriella byggkostnad](../benchmarks/2026-11-12-isolated-tasks/README.md)
+har 30 försök per variant och full lokal verifiering. Standardprofilen når
+105 975 genererade källrader/s vid p95 med en byggarbetare. Byggmedianerna
+ökar 0,01–0,67 procent mot kompilatorn före taskstödet på samma källträd;
+check-medianerna ökar 1,59–1,92 procent och rapporten behåller sämre p95-värden.
+
+Språkets två separata taskfall får 3,59× respektive 3,78× parad förbättring
+med fyra aktiva jobb mot ett, inklusive kloning och OS-trådar. Kompilatorns
+egna funktionspass är fortfarande seriella. Alla sju vanliga programbilder
+är byteidentiska. Den senaste [C-mätningen](../benchmarks/2026-11-11-whole-function-optimization/README.md#final-serial-profile-with-detached-function-objects)
+gav runtime/C-geomedlet 1,168× och textfallet 1,325×. C-målet återstår;
+ingen ny C-tidsserie kördes för samma bilder. Hela acceptanskontraktet nedan
 är ännu inte uppfyllt.
 
 Den lokala [runtime-sviten](../benchmarks/runtime/README.md) jämför nu

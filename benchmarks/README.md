@@ -20,6 +20,12 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Isolerade uppgifter och seriell byggkostnad, 2026-11-12](2026-11-12-isolated-tasks/README.md)
+mäter språkets taskstöd: fyra aktiva jobb ger 3,59×/3,78× parad förbättring
+i två rena arbetsfall. Den fortfarande seriella kompilatorn behåller
+105 975 genererade rader/s vid p95; byggmedianerna ökar 0,01–0,67 procent.
+Alla sju vanliga programbilder är identiska. Kompilatorparallellism återstår.
+
 [Helfunktionsoptimering och fristående funktionsobjekt, 2026-11-11](2026-11-11-whole-function-optimization/README.md)
 är senaste verifierade standardprofilen. Den når 107 909 genererade källrader/s
 vid p95 med en arbetare, men byggmedianerna kostar fortfarande 2,89×/3,13×

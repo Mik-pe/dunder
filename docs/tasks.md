@@ -53,7 +53,7 @@ Spawn kräver en namngiven säker Dunder-funktion med exakt en värdeparameter.
 Indata och returtyp måste tillhöra den kontrollerade klondomänen:
 
 - Primitiva tal, bool, rune, unit och enums utan payload.
-- Ägda skalärarrayer och fasta skalärarrayer.
+- Ägda och fasta arrayer med elementtyperna ovan.
 - Transparenta records vars fält rekursivt uppfyller samma regler.
 
 Strängar, payload-enums, borrows, pekare, funktionsvärden, scratch-vyer,
@@ -92,3 +92,10 @@ Kompilatorn använder ännu inte tasks för sina egna funktionspass. Nästa
 steg är ägda funktionsjobb och ordnad sammanfogning av relokerbara objekt;
 frontendens symboler, diagnostik och inlinebudget behåller en ägare.
 Trådarnas nytta ska mätas inklusive kopiering, start, join och sammanfogning.
+
+
+[Mätningen med 30 rundor](../benchmarks/2026-11-12-isolated-tasks/README.md)
+visar 3,59× och 3,78× parad förbättring med fyra aktiva jobb mot ett i två
+rena arbetsfall. Seriella byggmedianer ökar 0,01–0,67 procent och den
+genererade p95-bygggränsen behålls. Det är ett avgränsat underlag för denna
+implementation, ingen mätning av parallell kompilering.
