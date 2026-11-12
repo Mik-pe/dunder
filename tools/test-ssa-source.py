@@ -25,7 +25,7 @@ FUNCTION = '''fn calculate(n:i32)->i64 {
 }
 '''
 COUNTERS = tuple('ssa_' + name for name in (
-    'optimized', 'cells', 'values', 'parameters', 'registers', 'removed_loads',
+    'optimized', 'cells', 'values', 'parameters', 'registers', 'captures', 'stack_groups', 'removed_loads',
     'removed_stores', 'removed_pushes', 'removed_pops', 'copies',
     'analysis_units', 'budget_refusals'))
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -115,6 +115,32 @@ def main():
                     executions += execute(image, target, host, expected, work)
                 variants[target, mode] = same[0]
             assert variants[target, 'off'] != variants[target, 'on'], target
+
+        # Exercise the real producer annotations and its separate storage
+        # permission, including the same combined allocator in every worker.
+        expression = work/'expression.ddr'
+        expression.write_text('fn calculate(a:i64,b:i64,c:i64)->i64{(a+b)*(b+c)}\n'
+                              'fn main(){print(calculate(2,3,5))}\n')
+        for target in TARGETS:
+            modes = []
+            for mode in ('off', 'on'):
+                same = None
+                for jobs in workers:
+                    image = work/f'expression-{target}-{mode}-{jobs}'
+                    result = call([compiler, 'build', expression, '--target', target,
+                                   '--jobs=' + str(jobs), '--mir-ssa=' + mode, *FLAGS,
+                                   '--timings=json', '-o', image], work)
+                    counts = counters(json.loads(result.stderr), mode == 'on')
+                    if mode == 'on':
+                        for key in ('ssa_stack_groups', 'ssa_removed_pushes', 'ssa_removed_pops'):
+                            assert counts[key] > 0, (key, counts)
+                    observed = (hashlib.sha256(image.read_bytes()).hexdigest(), counts)
+                    assert same is None or same == observed, (target, mode, jobs, same, observed)
+                    same = observed
+                    images += 1
+                    executions += execute(image, target, host, '40\n', work)
+                modes.append(same[0])
+            assert modes[0] != modes[1], target
 
         checks = []
         for mode in ('off', 'on'):
