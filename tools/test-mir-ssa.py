@@ -3,7 +3,8 @@
 
 Physical canonical MIR is interpreted independently of retained words, then
 the actual before/after images execute on the native host and Wasm. Calls/FP
-are explicit interpreter gaps with native/Wasm helper coverage. Positive cell
+and unknown scratch/exit observations are explicit interpreter gaps with
+native/Wasm helper coverage. Positive cell
 cases must actually remove loads; opaque/escape/overlap cases never stand in
 for an optimization success. Failed budgets must restore EVERY Function field.
 """
@@ -32,8 +33,9 @@ COUNTERS = ('changed', 'status', 'units', 'cells', 'removed_loads', 'removed_sto
 NAMES = ('zero_w', 'sign_w', 'byte_view', 'high_w', 'counted_loop', 'expression_stack',
          'critical_edge_flags', 'loop_swap', 'partial_store', 'escaped_cell', 'old_call',
          'fp_transfer', 'many_values', 'entry_flags', 'checked_overflow', 'pressure', 'late_initializer',
-         'external_jump', 'external_conditional', 'external_fallthrough', 'half_view', 'combined_views', 'call_local')
-POSITIVE = {0, 1, 2, 3, 4, 6, 7, 12, 13, 15, 16, 20, 21, 22}
+         'external_jump', 'external_conditional', 'external_fallthrough', 'half_view', 'combined_views', 'call_local',
+         'unreachable_external')
+POSITIVE = {0, 1, 2, 3, 4, 6, 7, 12, 13, 15, 16, 20, 21, 22, 23}
 
 
 def digest(value):
@@ -58,7 +60,7 @@ def expected(case, value, control):
     elif case == 6: result = value + 1 if control == 0 else (value & LOW) + (value == 0)
     elif case == 7: result = 51 + value if control % 2 else value * 3 + 17
     elif case == 8: result = (value & 0xFFFFFFFF00000000) | (control & LOW)
-    elif case in (9, 11, 17, 18, 19): result = value
+    elif case in (9, 11, 17, 18, 19, 23): result = value
     elif case in (10, 22): result = value + 99
     elif case == 12: result = value + sum(range(1, 81))
     elif case == 13: result = int(overflow_sub(value, control))
@@ -265,7 +267,7 @@ def main():
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
     print(f'{report["images_built"]} images; {executed} native/Wasm executions; '
-          f'{proved} independent semantic pairs; {gaps} explicit call/FP/trap gaps; no latency measurements')
+          f'{proved} independent semantic pairs; {gaps} explicit semantic gaps; no latency measurements')
 
 
 if __name__ == '__main__':
