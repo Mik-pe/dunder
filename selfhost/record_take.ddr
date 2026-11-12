@@ -1,0 +1,190 @@
+// Whole-expression ordinary-record ownership transfer, not a general move.
+// The caller must prove the root is a uniquely owned complete temporary. The
+// current value model recursively clones records and collection buffers, so
+// ordinary record children are then unique too. Strings and payload enums are
+// SHARED: stop at them, including any owned fields inside a shared enum.
+// C-layout fields are inline raw bytes: identity, never managed-header walks.
+// Normalizing visible array capacity matches clone+drop without copying data.
+// Allocation success/count/address is not a source value-copy guarantee.
+// Metadata is the frontend's sealed, semantically validated representation:
+// kinds0 primitive,1 array,2 record,3 tag enum,6 fixed array,7 shared payload
+// enum,8/9 callable,10 iterator. A true c_layout already proves inline fields.
+// This plan checks structural references and refuses other/cyclic kinds; it
+// does NOT certify source types, uniqueness, borrows, or FFI ownership itself.
+import arm64 as arm
+import ffi_arm64 as abi
+
+pub fn policy_tag() -> string { "record-take1" }
+pub opaque struct Plan {
+    kinds: []i32, starts: []i32, counts: []i32, fields: []i32,
+    accepted: []bool, normalize: []bool, requested: []bool, labels: []i32,
+    remaining: []i32, reverse_counts: []i32, reverse_starts: []i32,
+    fill: []i32, parents: []i32, queue: []i32, label_types: []i32,
+    state: i32, first_label: i32, work: i32, limit: i32,
+}
+pub fn new() -> Plan { Plan { kinds: [], starts: [], counts: [], fields: [],
+    accepted: [], normalize: [], requested: [], labels: [], remaining: [],
+    reverse_counts: [], reverse_starts: [], fill: [], parents: [], queue: [],
+    label_types: [], state: 0, first_label: -1, work: 0, limit: 0 } }
+// state:0 unprepared,-1 malformed,-2 bounded refusal,1 prepared,2 reserved,
+// 3 bodies emitted. No caller may change the sealed type schema after prepare.
+pub fn status(p: &Plan) -> i32 { p.state }
+pub fn units(p: &Plan) -> i32 { p.work }
+pub fn eligible(p: &Plan, ty: i32) -> bool {
+    p.state > 0 && ty >= 0 && ty < p.accepted.len && p.accepted[ty]
+}
+pub fn needs_helper(p: &Plan, ty: i32) -> bool {
+    eligible(&p, ty) && p.kinds[ty] == 2 && p.normalize[ty]
+}
+pub fn helper_label(p: &Plan, ty: i32) -> i32 {
+    if p.state < 2 || !needs_helper(&p, ty) { return -1 }; p.labels[ty]
+}
+pub fn requested_count(p: &Plan) -> i32 {
+    var count := 0; for ty in 0..p.requested.len { if p.requested[ty] { count = count + 1 } }; count
+}
+fn charge(p: &mut Plan, n: i32) -> bool {
+    if n < 0 || n > p.limit - p.work { p.state = -2; return false }
+    p.work = p.work + n; true
+}
+fn reset(p: &mut Plan, limit: i32) {
+    p.kinds.clear(); p.starts.clear(); p.counts.clear(); p.fields.clear()
+    p.accepted.clear(); p.normalize.clear(); p.requested.clear(); p.labels.clear()
+    p.remaining.clear(); p.reverse_counts.clear(); p.reverse_starts.clear()
+    p.fill.clear(); p.parents.clear(); p.queue.clear(); p.label_types.clear()
+    p.state = 0; p.first_label = -1; p.work = 0; p.limit = limit
+}
+pub fn prepare_budget(p: &mut Plan, kinds: &[]i32, bases: &[]i32, starts: &[]i32,
+    counts: &[]i32, fields: &[]i32, c_layout: &[]bool, limit: i32) -> bool {
+    reset(&mut p, limit); n := kinds.len
+    if limit < 0 || n > 65536 || fields.len > 262144 { p.state = -2; return false }
+    if bases.len != n || starts.len != n || counts.len != n || c_layout.len != n { p.state = -1; return false }
+    if !charge(&mut p, n * 12 + fields.len * 4) { return false }
+    var edges := 0
+    for ty in 0..n {
+        if c_layout[ty] && kinds[ty] != 2 { p.state = -1; return false }
+        if kinds[ty] == 2 && (starts[ty] < 0 || counts[ty] < 0 || counts[ty] > fields.len || starts[ty] > fields.len - counts[ty]) { p.state = -1; return false }
+        if kinds[ty] == 2 && !c_layout[ty] {
+            if counts[ty] > 262144 - edges { p.state = -2; return false }; edges = edges + counts[ty]
+        }
+        if (kinds[ty] == 1 || kinds[ty] == 6 || kinds[ty] == 10) && (bases[ty] < 0 || bases[ty] >= n) { p.state = -1; return false }
+    }
+    for at in 0..fields.len { if fields[at] < 0 || fields[at] >= n { p.state = -1; return false } }
+    // Copy metadata by indexed borrows, never take a snapshot of a borrowed
+    // input array via value iteration. The plan outlives the frontend borrow.
+    for at in 0..fields.len { p.fields.push(fields[at]) }
+    for ty in 0..n {
+        kind := kinds[ty]; p.kinds.push(kind); p.starts.push(starts[ty]); p.counts.push(counts[ty])
+        p.accepted.push(false); p.normalize.push(false); p.requested.push(false)
+        p.labels.push(-1); p.remaining.push(0); p.reverse_counts.push(0)
+        var leaf := kind == 0 || kind == 3 || kind == 7 || kind == 8 || kind == 9 || c_layout[ty]
+        if kind == 1 || kind == 6 || kind == 10 {
+            base := bases[ty]; leaf = kinds[base] == 0 || kinds[base] == 3
+            p.normalize[ty] = leaf
+        }
+        if kind == 2 && !c_layout[ty] { leaf = counts[ty] == 0; p.remaining[ty] = counts[ty] }
+        if leaf { p.accepted[ty] = true; p.queue.push(ty) }
+    }
+    for ty in 0..n {
+        if kinds[ty] != 2 || c_layout[ty] { continue }
+        for at in starts[ty]..starts[ty] + counts[ty] {
+            child := fields[at]; p.reverse_counts[child] = p.reverse_counts[child] + 1
+        }
+    }
+    if !charge(&mut p, n * 4 + edges * 4) { return false }
+    p.reverse_starts.push(0)
+    for ty in 0..n {
+        p.reverse_starts.push(p.reverse_starts[ty] + p.reverse_counts[ty]); p.fill.push(p.reverse_starts[ty])
+    }
+    for at in 0..edges { p.parents.push(0) }
+    for ty in 0..n {
+        if kinds[ty] != 2 || c_layout[ty] { continue }
+        for at in starts[ty]..starts[ty] + counts[ty] {
+            child := fields[at]; p.parents[p.fill[child]] = ty; p.fill[child] = p.fill[child] + 1
+        }
+    }
+    var head := 0
+    while head < p.queue.len {
+        child := p.queue[head]; head = head + 1
+        for at in p.reverse_starts[child]..p.reverse_starts[child + 1] {
+            parent := p.parents[at]; p.remaining[parent] = p.remaining[parent] - 1
+            if p.normalize[child] { p.normalize[parent] = true }
+            if p.remaining[parent] == 0 { p.accepted[parent] = true; p.queue.push(parent) }
+        }
+    }
+    // Unsupported/recursive dependencies never enter the queue. This is an
+    // optimization refusal, not permission to weaken normal source typing.
+    p.queue.clear(); p.state = 1; true
+}
+pub fn prepare(p: &mut Plan, kinds: &[]i32, bases: &[]i32, starts: &[]i32,
+    counts: &[]i32, fields: &[]i32, c_layout: &[]bool) -> bool {
+    prepare_budget(&mut p, &kinds, &bases, &starts, &counts, &fields, &c_layout, 8388608)
+}
+// Reserve before the producer's global-label/cache snapshot. Labels are cheap;
+// bodies are demand-only. Cache restoration must request_label for each global
+// relocation target, otherwise a cached caller could lose its helper body.
+pub fn reserve(c: &mut arm.Code, p: &mut Plan) -> bool {
+    if p.state != 1 || c.mir_capture { return false }
+    p.first_label = arm.label_count(&c)
+    for ty in 0..p.kinds.len {
+        if needs_helper(&p, ty) { p.labels[ty] = arm.label(&mut c); p.label_types.push(ty) }
+    }
+    p.state = 2; true
+}
+pub fn request(p: &mut Plan, ty: i32) -> bool {
+    if p.state != 2 || !eligible(&p, ty) { return false }
+    if !needs_helper(&p, ty) || p.requested[ty] { return true }
+    // Every requested record is visited once over the plan's entire lifetime.
+    // Together with prepare's262144-edge cap this bounds total demand closure
+    // work. request_label adds O(1) per caller-owned relocation; the caller
+    // separately bounds traversal of its own code/cache metadata.
+    p.queue.clear(); p.queue.push(ty); p.requested[ty] = true; var head := 0
+    while head < p.queue.len {
+        parent := p.queue[head]; head = head + 1
+        for at in p.starts[parent]..p.starts[parent] + p.counts[parent] {
+            child := p.fields[at]
+            if needs_helper(&p, child) && !p.requested[child] { p.requested[child] = true; p.queue.push(child) }
+        }
+    }
+    p.queue.clear(); true
+}
+pub fn request_label(p: &mut Plan, label: i32) -> bool {
+    if p.state != 2 || label < p.first_label || label - p.first_label >= p.label_types.len { return false }
+    request(&mut p, p.label_types[label - p.first_label])
+}
+// Exact former frontend array_take emitter, shared by direct oracle tests and
+// every nested normalization. X0 descriptor preserved; X1/NZCV clobbered.
+pub fn emit_array_take(c: &mut arm.Code, label: i32) -> bool {
+    if c.mir_capture || label < 0 || label >= arm.label_count(&c) { return false }
+    if !c.checking { if c.labels[label] != -1 { return false } }
+    arm.mark(&mut c, label); abi.load(&mut c, 1, 0, 8, 8)
+    ready := arm.label(&mut c)
+    arm.emit(&mut c, 4043309119); arm.branch(&mut c, ready, 2)
+    arm.emit(&mut c, 4043317311); arm.branch(&mut c, ready, 4)
+    arm.imm(&mut c, 1, 8)
+    arm.mark(&mut c, ready); abi.store(&mut c, 1, 0, 16, 8); arm.emit(&mut c, 3596551104); true
+}
+pub fn emit_helpers(c: &mut arm.Code, p: &mut Plan, array_take: i32) -> bool {
+    if p.state != 2 || c.mir_capture || array_take < 0 || array_take >= arm.label_count(&c) { return false }
+    if array_take >= p.first_label && array_take - p.first_label < p.label_types.len { return false }
+    for ty in 0..p.kinds.len {
+        if !p.requested[ty] { continue }; label := p.labels[ty]
+        if label < 0 || label >= arm.label_count(&c) { return false }
+        if !c.checking { if c.labels[label] != -1 { return false } }
+    }
+    for ty in 0..p.kinds.len {
+        if !p.requested[ty] { continue }
+        arm.mark(&mut c, p.labels[ty]); frame := arm.prologue(&mut c); arm.frame(&mut c, frame, 1); arm.store(&mut c, 0, 0)
+        for field in 0..p.counts[ty] {
+            child := p.fields[p.starts[ty] + field]; kind := p.kinds[child]; var target: i32 = -1
+            if kind == 1 || kind == 6 || kind == 10 { target = array_take }
+            else if needs_helper(&p, child) { target = p.labels[child] }
+            if target < 0 { continue }
+            arm.load(&mut c, 0)
+            if field <= 4095 { abi.load(&mut c, 0, 0, field * 8, 8) }
+            else { arm.imm(&mut c, 10, i64(field) * 8); arm.emit(&mut c, 2332033024 + 10 * 65536); abi.load(&mut c, 0, 0, 0, 8) }
+            arm.branch(&mut c, target, 1)
+        }
+        arm.load(&mut c, 0); arm.ret(&mut c)
+    }
+    p.state = 3; true
+}
