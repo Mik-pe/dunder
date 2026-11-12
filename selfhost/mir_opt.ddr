@@ -5,12 +5,14 @@ import mir
 import mir_abi as abi
 import mir_liveness as live
 import mir_memory as memory_policy
+import mir_terminals as terminals
+import mir_call_abi as call_policy
 
 pub opaque struct Workspace {
     liveness: live.Workspace, scores: []i32, allowed: []bool, shortlist: []i32,
     picked: []i32, homes: []i32, home_for_place: []i32,
     barriers: []bool, epilogues: []bool, entries: []bool, order: []i32, assembled: []i32, positions: []i32,
-    init_in: []i32, init_gen: []i32, queue: []i32, queued: []bool,
+    init_in: []i32, init_gen: []i32, queue: []i32, queued: []bool, exit_reached: []bool,
     status: i32, work: i32, limit: i32, source_ops: i32, source_places: i32,
     source_blocks: i32, source_labels: i32, frame_high: i32, frame_low: i32,
     old_frame: i32, new_frame: i32, loads: i32, stores: i32, loops: i32, calls: i32,
@@ -18,7 +20,7 @@ pub opaque struct Workspace {
 }
 pub fn new() -> Workspace { Workspace { liveness: live.new(), scores: [], allowed: [], shortlist: [],
     picked: [], homes: [], home_for_place: [], barriers: [], epilogues: [], entries: [], order: [], assembled: [], positions: [],
-    init_in: [], init_gen: [], queue: [], queued: [], status: 0, work: 0, limit: 0,
+    init_in: [], init_gen: [], queue: [], queued: [], exit_reached: [], status: 0, work: 0, limit: 0,
     source_ops: 0, source_places: 0, source_blocks: 0, source_labels: 0,
     frame_high: -1, frame_low: -1, old_frame: 0, new_frame: 0, loads: 0, stores: 0, loops: 0, calls: 0, private_memory: false, private_ops: 0 } }
 pub fn status(w: &Workspace) -> i32 { w.status }
@@ -36,13 +38,57 @@ fn refuse(w: &mut Workspace) -> bool { w.status = -2; false }
 fn reset(w: &mut Workspace, limit: i32) {
     w.scores.clear(); w.allowed.clear(); w.shortlist.clear(); w.picked.clear(); w.homes.clear(); w.home_for_place.clear()
     w.barriers.clear(); w.epilogues.clear(); w.entries.clear(); w.order.clear(); w.assembled.clear(); w.positions.clear()
-    w.init_in.clear(); w.init_gen.clear(); w.queue.clear(); w.queued.clear()
+    w.init_in.clear(); w.init_gen.clear(); w.queue.clear(); w.queued.clear(); w.exit_reached.clear()
     w.status = 0; w.work = 0; w.limit = limit; w.frame_high = -1; w.frame_low = -1
     w.loads = 0; w.stores = 0; w.loops = 0; w.calls = 0; w.private_memory = false; w.private_ops = 0
 }
 fn frame_operation(f: &mir.Function, op: i32, destination: i32, source: i32, opcode: i32) -> bool {
     f.modes[op] != 2 && f.kinds[op] == 16 && f.types[op] == 2 && f.dst[op] == destination &&
         f.a[op] == source && f.b[op] == -1 && f.flags[op] == 0 && f.opcodes[op] == opcode && f.imm[op] >= 0
+}
+// Promotion changes both current-frame contents and preserved physical homes.
+// An external observer may inspect either, regardless of a memory-only source
+// premise or NoReturn annotation. Refuse before planning unless every reachable
+// non-return boundary is an exact declared Jump/CondJump terminal. Fallthrough,
+// Trap/opaque/indirect exits gain no promise from a coincident label number.
+fn contracted_exits(w: &mut Workspace, f: &mir.Function, ctx: &terminals.TerminalContext, source_abi: bool) -> bool {
+    blocks := f.block_starts.len
+    if blocks == 0 { return refuse(&mut w) }
+    if !charge(&mut w, blocks + f.edge_to.len * 2) { return false }
+    for block in 0..blocks { w.exit_reached.push(false) }
+    w.exit_reached[0] = true; w.queue.push(0); var next := 0
+    while next < w.queue.len {
+        block := w.queue[next]; next = next + 1
+        // Even a GP/cell fence cannot preserve an unknown callee's incoming
+        // X25..28 or call-SP observations after frame growth. No memory or
+        // terminal premise implies this separate source/native ABI contract.
+        if !source_abi {
+            for position in f.block_starts[block]..f.block_ends[block] {
+                if !charge(&mut w, 1) { return false }
+                op := f.order[position]
+                if f.modes[op] != 2 && f.kinds[op] == 14 { return refuse(&mut w) }
+            }
+        }
+        for edge in f.edge_starts[block]..f.edge_starts[block + 1] {
+            to := f.edge_to[edge]
+            if to >= 0 {
+                if !w.exit_reached[to] { w.exit_reached[to] = true; w.queue.push(to) }
+                continue
+            }
+            if f.edge_kinds[edge] == 3 { continue }
+            if f.edge_kinds[edge] != 2 || ctx.version != 1 { return refuse(&mut w) }
+            var last := -1
+            for position in f.block_starts[block]..f.block_ends[block] {
+                if !charge(&mut w, 1) { return false }
+                op := f.order[position]; if f.modes[op] != 2 { last = op }
+            }
+            if !charge(&mut w, 8) { return false }
+            if last < 0 || (f.kinds[last] != 12 && f.kinds[last] != 13) ||
+                !terminals.allows(&ctx, f.targets[last]) { return refuse(&mut w) }
+        }
+    }
+    // The later initialization analysis owns this same retained queue arena.
+    w.queue.clear(); true
 }
 fn frame(w: &mut Workspace, f: &mir.Function) -> bool {
     n := f.order.len
@@ -220,12 +266,16 @@ fn scratch(w: &mut Workspace, f: &mir.Function) -> bool {
 }
 // Status:1 prepared,2 consumed,-1 invalid/stale input,-2 unsupported or no
 // profitable candidates,-3 budget. Failure leaves every Function field intact.
-fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_objects: bool) -> bool {
+fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_objects: bool,
+    exits: &terminals.TerminalContext, source_abi: bool) -> bool {
     reset(&mut w, limit)
+    if !terminals.valid(&exits) { w.status = -1; return false }
     if !f.valid || !f.verified { w.status = -1; return false }
     if !f.optimizable || f.unknown_control { return refuse(&mut w) }
-    if limit < 0 || f.kinds.len > 65536 || f.place_kinds.len > 16384 { w.status = -3; return false }
+    if limit < 0 || f.kinds.len > 65536 || f.place_kinds.len > 16384 ||
+        f.block_starts.len > 16384 || f.edge_to.len > 32768 { w.status = -3; return false }
     if f.place_kinds.len == 0 { return refuse(&mut w) }
+    if !contracted_exits(&mut w, &f, &exits, source_abi) { return false }
     if !frame(&mut w, &f) { return false }
     if source_objects {
         if !charge(&mut w, f.order.len * 3 + 8) { return false }
@@ -253,17 +303,41 @@ fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_object
     w.source_ops = f.kinds.len; w.source_places = f.place_kinds.len; w.source_blocks = f.block_starts.len; w.source_labels = f.label_ops.len
     w.status = 1; true
 }
-// Raw MIR APIs retain their conservative policy without constructing records.
-pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool { analyze_policy(&mut w, &f, limit, false) }
-pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_policy(&mut w, &f, 4194304, false) }
-// Construct/reuse Context at the complete source-producer boundary. The
-// policy skips only proven-private indirect-memory synchronization; every
-// call still flushes/reloads because its ABI preservation is not established.
+// Raw and memory-only APIs grant no unobserving-exit promise.
+pub fn no_terminals() -> terminals.TerminalContext { terminals.no_terminals() }
+pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool {
+    exits := terminals.no_terminals(); analyze_policy(&mut w, &f, limit, false, &exits, false)
+}
+pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_budget(&mut w, &f, 4194304) }
+// This policy skips only proven-private indirect-memory synchronization.
+// It establishes no call ABI: reachable calls still refuse this wrapper.
 pub fn analyze_with_context_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context, limit: i32) -> bool {
-    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context))
+    exits := terminals.no_terminals(); analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, false)
 }
 pub fn analyze_with_context(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context) -> bool {
-    analyze_policy(&mut w, &f, 4194304, memory_policy.source_objects(&context))
+    analyze_with_context_budget(&mut w, &f, &context, 4194304)
+}
+// A complete source producer may separately assert memory provenance and the
+// stronger terminal observations contract. Neither implies the other or
+// admits reachable calls without the separate call ABI supplied below.
+pub fn analyze_with_terminals_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
+    exits: &terminals.TerminalContext, limit: i32) -> bool {
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, false)
+}
+pub fn analyze_with_terminals(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
+    exits: &terminals.TerminalContext) -> bool {
+    analyze_with_terminals_budget(&mut w, &f, &context, &exits, 4194304)
+}
+// Three independent producer contracts: object provenance, unobserving exact
+// terminal targets, and the source/native call ABI. Raw wrappers assert none
+// about call layout, even when their memory/terminal premises are enabled.
+pub fn analyze_with_contracts_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
+    exits: &terminals.TerminalContext, calls: &call_policy.Context, limit: i32) -> bool {
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, call_policy.source_abi(&calls))
+}
+pub fn analyze_with_contracts(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
+    exits: &terminals.TerminalContext, calls: &call_policy.Context) -> bool {
+    analyze_with_contracts_budget(&mut w, &f, &context, &exits, &calls, 4194304)
 }
 fn memory(f: &mut mir.Function, kind: i32, home: i32, place: i32, block: i32) -> i32 {
     op := mir.add(&mut f, kind); f.types[op] = 2; f.place[op] = place; f.aux[op] = 8
