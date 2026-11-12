@@ -22,7 +22,7 @@ python3 tools/test-compiler-session.py "$compiler"
 "$compiler" build-tests tests/mir_pipeline.ddr --target wasm32 -o "$work/mir-pipeline.wasm"
 node tools/test-wasm.mjs --execute "$work/mir-pipeline.wasm"
 python3 tools/test-mir-pipeline.py "$compiler" --report build/mir-pipeline-integrated.json
-for ssa_module in mir_ssa_cells mir_ssa; do
+for ssa_module in mir_call_inputs mir_liveness_inputs mir_ssa_cells mir_ssa; do
     "$compiler" test "tests/$ssa_module.ddr" -o "$work/$ssa_module"
     "$compiler" build-tests "tests/$ssa_module.ddr" --target wasm32 -o "$work/$ssa_module.wasm"
     node tools/test-wasm.mjs --execute "$work/$ssa_module.wasm"
