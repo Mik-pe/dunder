@@ -69,7 +69,8 @@ SSA-steg ligger mellan frame- och värdepassen.
 
 `--mir-ssa=on` aktiverar [`mir_ssa`](../selfhost/mir_ssa.ddr) och
 [`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr); standard är fortsatt **off**
-i väntan på aktuell v2-mätmatris. V2 bygger glesa block-/tillståndspar
+efter [aktuell v2-mätmatris](../benchmarks/2026-11-12-ssa-pruned/README.md).
+V2 bygger glesa block-/tillståndspar
 för verkliga beroenden och transportparametrar, delar verkliga oförändrade
 ingångsvärden och använder aktiva live-mängder/händelser för interferens.
 Egna ValueID:n, GP/NZCV def/use, blockparametrar och kantargument ger en
@@ -107,11 +108,20 @@ Aktuell v2-QA med `flags=3` passerar 670 målbilder, 360 native-/Wasm-
 körningar och 438 exakta bitjämförelser, med 232 separat redovisade luckor
 i den oberoende interpretern. Källacceptansen passerar 24 målbilder och
 17 native-/Wasm-körningar med workers, cache och kvitton. Linux är endast
-bildbyggt i dessa matriser. Full bootstrap och aktuell v2-prestandamatris
-är separata grindar; riktade prov är inte ett standardaktiveringsbeslut.
+bildbyggt i dessa matriser. Full verifiering, inklusive bootstrapens
+byteidentiska självbyggen med en och fyra workers, passerar.
+
+Med SSA på i båda kompilatorerna minskar v2 kompilatorkorpusets byggmedian
+27,65 procent mot v1; Tabell förbättras 8,48 procent i median men får
+20,41 procent högre p95. Samma nya kompilator med SSA av/på ger en
+byggpremie på 21,26 procent för kompilatorkorpuset och 29,47 procent för
+Tabell. Runtime/C-geomedlet blir 1,1841 med passet på mot 1,1883 av;
+text/sort ligger på 1,3376/1,2649. Ingen samlad runtimevinst är belagd och
+C-gränserna återstår. Standardlägets byggmedianer ändras 0,28–0,69 procent
+mot förra kompilatorn med samma källor och byteidentiska konsumenter.
 
 Den historiska [v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
-visade 70,92 procent högre byggmedian för kompilatorkorpusen och 42,34
+visade 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34
 procent för Tabell; runtime/C-geomedlet var 1,181 mot 1,178 med passet av.
 En separat SSA-optimerad kompilatorbinär gav ingen meningsfull byggvinst
 med oförändrad användarpolicy. Dessa siffror gäller v1, före gles v2 och

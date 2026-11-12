@@ -236,8 +236,10 @@ exakt vid avslag. En accepterad omskrivning fullverifieras innan den får
 lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
-gemensamma seriella/taskbaserade kedjan. Standard är **off** i väntan på
-aktuell v2-mätmatris för runtime och kompileringstid. Effektiv aktivering
+gemensamma seriella/taskbaserade kedjan. Standard förblir **off** efter
+[v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md):
+byggmedianen ökade 21,26 procent för kompilatorkorpuset och 29,47 procent
+för Tabell utan belagd samlad runtimevinst. Effektiv aktivering
 kräver både MIR och MIR-opt; `check`, avstängt steg och full cacheträff utför
 inget SSA-arbete. Cache och testkvitton skiljer on/off och SSA-markören
 `v2-pruned-inputs1-work4194304` åt. Den fysiska MIR-policyn är version 4 med
@@ -272,14 +274,25 @@ fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
 är fortfarande öppet.
 
 Den historiska [30-rundorsmätningen av SSA-v1](../benchmarks/2026-11-12-ssa-foundation/README.md)
-visade 70,92 procent högre byggmedian för kompilatorkorpusen och 42,34
+visade 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34
 procent för Tabell utan samlad runtimevinst mot C. En separat SSA-optimerad
 producentbinär ändrade byggmedianerna mindre än 0,3 procent och försämrade
 flera p95-värden. Det är v1-resultat, inte mätningar av dagens glesa v2 med
 `source_inputs` och rättat NZCV-kontrakt. Varken standardprofilen eller
 bootstrapprofilen aktiverar SSA på detta historiska underlag. Fortsatt
 värdeanalys och placering behöver dela arbete; den nya mekanismens totala
-kostnad och nytta måste mätas innan aktivering.
+kostnad och nytta måste vägas ihop före aktivering.
+
+Den aktuella jämförelsen med samma slutliga källor och SSA på i båda
+kompilatorerna minskade kompilatorkorpusets byggmedian 27,65 procent och
+Tabells 8,48 procent; Tabells p95 ökade samtidigt 20,41 procent. Detta
+mäter hela v2-ändringen, inte en isolerad effekt av en enskild mekanism.
+Nya kompilatorns av/på-serie gav runtime/C-geomedel 1,1883 respektive
+1,1841; text och sort med SSA på låg på 1,3376 och 1,2649. C-gränserna
+1,10 och 1,25 är fortfarande öppna. Genererat bygge med SSA på klarar
+100 000-gränsen vid p95 med 159 866 rader/s. Den minskade analyskostnaden
+motiverar fortsatt arbete med gemensamma skalära värden, operationsval och
+uttrycksstack; den motiverar ingen standardaktivering på egen hand.
 
 ### Värdeidentitet över kontrollflödet
 
@@ -682,7 +695,7 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA-v2 har gles konstruktion och explicita source-inputs; standard är off i väntan på aktuell mätmatris. V1:s byggregression är historisk. Anropsbevarande, semantiska indata, NoModRef och terminalobservationer är skilda premisser. |
+| Helfunktionsvärden, SSA och minnesmodell | Privat cell-SSA med blockparametrar och placering i GP0–GP17 är valbar, med bevarade minnesskrivningar. Generellt SSA-baserat operationsval, uttrycksstack och vidare registerplacering återstår. | SSA-v2 minskar byggkostnaden mot v1 men ger ingen belagd samlad runtimevinst; standard förblir off. Anropsbevarande, semantiska indata, NoModRef och terminalobservationer är skilda premisser. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
 | Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |

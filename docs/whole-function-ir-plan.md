@@ -71,8 +71,10 @@ frame-skrivningar per framgångsrikt varv, medan C-referensen höll värdena i
 register. Det styr prioriteringen men är ingen regel passet får känna till.
 Den historiska [SSA-v1-mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md)
 visade att v1:s cellplacering kostade för mycket byggtid utan samlad
-runtimevinst. Dagens glesa v2 förblir off som standard i väntan på aktuell
-mätmatris. Fortsättningen behöver dela värdeanalys och tillföra fullt typade
+runtimevinst. [Dagens v2-matris](../benchmarks/2026-11-12-ssa-pruned/README.md)
+minskar SSA-byggmedianen för kompilatorkorpuset 27,65 procent mot v1, men
+visar fortfarande byggpremie utan belagd samlad runtimevinst. Standarden
+förblir off. Fortsättningen behöver dela värdeanalys och tillföra fullt typade
 anropsargument, i stället för fler oberoende fulla analysgångar.
 
 ## Kontrakt som måste hålla
@@ -196,10 +198,13 @@ behållas när den bär target. Rå Call både läser och kan förstöra NZCV,
 alltså `flags=3`. Tidigare `flags=2` var felaktig metadata; någon
 felkompilering i det nuvarande värdepasset har inte bevisats av detta fynd.
 
-`--mir-ssa=on/off` är valbart och standarden är fortsatt off i väntan på
-aktuell v2-mätmatris. Den historiska
+`--mir-ssa=on/off` är valbart och standarden är fortsatt off efter
+[aktuell v2-mätmatris](../benchmarks/2026-11-12-ssa-pruned/README.md):
+kompilatorkorpusets byggmedian ökar 21,26 procent och Tabells 29,47 procent
+med passet på; runtime/C-geomedlet är 1,1841 mot 1,1883 med passet av.
+Den historiska
 [v1-rapporten](../benchmarks/2026-11-12-ssa-foundation/README.md) visade
-70,92 procent högre byggmedian för kompilatorkorpusen och 42,34 procent för
+70,92 procent högre byggmedian för kompilatorkorpuset och 42,34 procent för
 Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller ingen
 meningsfull byggvinst i den rapporten. Detta är inga mätningar av gles v2
 eller `source_inputs`.
@@ -215,8 +220,22 @@ anropsproven behåller råa indata och prövar den explicita källvyn separat.
 [Käll-/worker-/cacheprov](../tools/test-ssa-source.py) passerar 24 målbilder
 och 17 native-/Wasm-körningar. Linuxbilder byggs men körs inte i dessa
 matriser. [Cellprov](../tests/mir_ssa_cells.ddr), slutverifiering och exakt
-rollback ingår i korrekthetsgränsen. Full bootstrap och aktuella runtime-/
-kompileringstidsmätningar är separata grindar före standardaktivering.
+rollback ingår i korrekthetsgränsen. Full verifiering, inklusive
+bootstrapens fixpunkt med en och fyra workers, passerar. Den aktuella
+prestandamatrisen har 1 440 prover med 30 per grupp; förbättrad SSA-byggkostnad
+uppfyller ännu inte runtimekraven för standardaktivering.
+
+Den [statiska text-/sortgranskningen](../benchmarks/2026-11-12-ssa-pruned/runtime-gap/README.md)
+använder exakt matchande mätbilder och avgränsade kontrollvägar. Text har
+kvar uttrycksstack och en bool i frame efter setup-anrop. Sortens skiftloop
+är redan registerbaserad men upprepar adressberäkning och elementläsning.
+Nästa sammanhängande backendsteg är därför allokerbara skalära SSA-värden
+och privata uttrycksstackvärden med regional uppdelning, reload/synkronisering
+och uttryckliga fysiska begränsningar. Ingångs-/anropsbarriärer ska kunna
+återläsas där det är bevisat säkert, utan att ge anrop påhittad NoModRef.
+Heapläsningar behöver en separat modell för objektproveniens, vanlig/volatile
+åtkomst, livstid och minnesversioner innan de får återanvändas. Dessa steg
+ersätter analysarbete i samma värdemodell; de är ännu inte implementerade.
 
 ## Exklusiv transaktionsgräns
 

@@ -1,6 +1,26 @@
 # Så mäter vi Dunder
 
-Den senaste [SSA-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+Den senaste [glesa SSA-v2-mätningen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+har 1 440 prover över tre separata jämförelser på samma frysta källor.
+Med SSA på i båda kompilatorerna minskar byggmedianen 27,65 procent för
+kompilatorkorpuset och 8,48 procent för Tabell mot tidigare SSA; Tabells
+p95 ökar samtidigt 20,41 procent. Samma nya kompilator med SSA av/på ger:
+
+| Arbetsfall | SSA av, median/p95 ms | SSA på, median/p95 ms | Medianförändring |
+| --- | ---: | ---: | ---: |
+| Genererat bygge | 619,219 / 620,729 | 624,279 / 631,928 | +0,82 % |
+| Kompilatorkorpuset | 785,522 / 788,351 | 952,521 / 954,722 | +21,26 % |
+| Tabell | 18,054 / 18,621 | 23,375 / 25,484 | +29,47 % |
+
+SSA på klarar 100 000-gränsen för genererat bygge vid p95 med 159 866
+rader/s. Runtime/C-geomedlet är 1,1841 på mot 1,1883 av; text och sort
+med passet på ligger på 1,3376 respektive 1,2649. C-gränserna är alltså
+öppna. SSA förblir av som standard. En separat av/av-serie ger 0,28–0,69
+procent högre byggmedian med byteidentiska konsumenter; p95-regressioner
+och alla råsvansar finns kvar i rapporten. Kompilatorkorpuset avser den
+seriella ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
+
+Den historiska [SSA-v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
 har 30 försök per variant på ARM64/macOS. Samma kompilator med SSA av/på
 gav följande byggmedianer i millisekunder:
 

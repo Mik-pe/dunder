@@ -1,0 +1,206 @@
+// Structural private-frame cell/view analysis for a separate SSA builder.
+// This never changes Function, proves reaching initialization, or allocates
+// registers. Input must be the SAME verified snapshot throughout analysis.
+// Classification does NOT authorize eliminating an op's other GP defs or
+// clobbers (e.g. large-offset X9 scratch). The SSA caller must preserve them
+// or separately prove them dead, and must prove reaching initialization.
+// An accepted cell is an aligned private8B interval with an existing full8B
+// anchor Place. Every write is a full8B GP Store; contained GP read views may
+// extract1/2/4/8 bytes, then explicitly zero/sign extend. Any escaped, crossing,
+// partial-write or unsupported accessible shape rejects ALL touched cells.
+// Raw indirect memory and calls remain synchronization barriers. Only the
+// producer's explicit source_objects-v1 premise exempts ordinary indirect
+// memory; it never grants call NoModRef or register preservation.
+import mir
+import mir_contract as contract
+import mir_memory as memory
+
+pub fn policy_tag() -> string { "ssa-private-cells1" }
+pub opaque struct Plan {
+    table: []i32, offsets: []i32, anchors: []i32, blocked: []bool, compact: []i32,
+    groups: []i32, places: []i32, operations: []i32, widths: []i32,
+    shifts: []i32, extensions: []i32, barriers: []bool,
+    state: i32, work: i32, limit: i32, table_size: i32, cells: i32,
+    group_count: i32, place_count: i32, operation_count: i32, probes: i32,
+}
+pub fn new() -> Plan { Plan { table: [], offsets: [], anchors: [], blocked: [], compact: [],
+    groups: [], places: [], operations: [], widths: [], shifts: [], extensions: [], barriers: [],
+    state: 0, work: 0, limit: 0, table_size: 0, cells: 0, group_count: 0,
+    place_count: 0, operation_count: 0, probes: 0 } }
+// status1 publishes a complete plan, including a valid zero-group plan.
+// -1 invalid preflight metadata, -2 unsupported structural premise, -3 bounded
+// work/probe/size refusal. Every failure exposes NO mappings from this or a
+// previous invocation. Buffers retain their high-water lengths/capacities.
+pub fn status(p: &Plan) -> i32 { p.state }
+pub fn units(p: &Plan) -> i32 { p.work }
+pub fn probe_count(p: &Plan) -> i32 { p.probes }
+// Every getter below costs O(1); the SSA caller charges its own query loops.
+// IDs are those of the analyzed immutable Function, NOT order positions.
+// Invalid/nonready IDs return -1 (or0 for offsets/widths/counts, true for barriers).
+pub fn group_count(p: &Plan) -> i32 { if p.state != 1 { return 0 }; p.group_count }
+pub fn group_offset(p: &Plan, group: i32) -> i32 {
+    if p.state != 1 || group < 0 || group >= p.group_count { return 0 }; p.offsets[p.groups[group]]
+}
+pub fn group_place(p: &Plan, group: i32) -> i32 {
+    if p.state != 1 || group < 0 || group >= p.group_count { return -1 }; p.anchors[p.groups[group]]
+}
+pub fn place_group(p: &Plan, place: i32) -> i32 {
+    if p.state != 1 || place < 0 || place >= p.place_count { return -1 }; p.places[place]
+}
+pub fn op_group(p: &Plan, op: i32) -> i32 {
+    if p.state != 1 || op < 0 || op >= p.operation_count { return -1 }; p.operations[op]
+}
+pub fn op_width(p: &Plan, op: i32) -> i32 {
+    if op_group(&p, op) < 0 { return 0 }; p.widths[op]
+}
+// Shift is in BITS from the low end of the stored64-bit cell, on all current
+// little-endian targets. extension0=raw8B,1=zero toW(thenX),2=sign4B toX.
+// A Store has width8/shift0/extension0. No boolean/rune value-range is assumed.
+pub fn op_view_shift(p: &Plan, op: i32) -> i32 {
+    if op_group(&p, op) < 0 { return -1 }; p.shifts[op]
+}
+pub fn op_extension(p: &Plan, op: i32) -> i32 {
+    if op_group(&p, op) < 0 { return -1 }; p.extensions[op]
+}
+// This is a memory synchronization flag, not a call-register or exit contract.
+// The SSA caller separately handles actual CFG edges, unobserving terminals,
+// Return live-outs and fixed/implicit register constraints.
+pub fn op_barrier(p: &Plan, op: i32) -> bool {
+    if p.state != 1 || op < 0 || op >= p.operation_count { return true }; p.barriers[op]
+}
+fn set_i(a: &mut []i32, at: i32, value: i32) { if at == a.len { a.push(value) } else { a[at] = value } }
+fn set_b(a: &mut []bool, at: i32, value: bool) { if at == a.len { a.push(value) } else { a[at] = value } }
+fn reset(p: &mut Plan, limit: i32) {
+    p.state = 0; p.work = 0; p.limit = limit; p.table_size = 0; p.cells = 0
+    p.group_count = 0; p.place_count = 0; p.operation_count = 0; p.probes = 0
+}
+fn charge(p: &mut Plan, n: i32) -> bool {
+    if n < 0 || n > p.limit - p.work { p.state = -3; return false }; p.work = p.work + n; true
+}
+fn invalid(p: &mut Plan) -> bool { p.state = -1; false }
+fn refuse(p: &mut Plan) -> bool { p.state = -2; false }
+fn cell(offset: i32) -> i64 { value := i64(offset); value - value.bit_and(7) }
+fn intern(p: &mut Plan, offset: i32) -> i32 {
+    hash := i64(offset).shr(3).bit_xor(i64(offset).shr(19)); var at := i32(hash.bit_and(i64(p.table_size - 1)))
+    // Deterministic linear upper bound: <=32 probes per touched cell, with a
+    // fail-closed refusal on adversarial clusters. No unbounded P² probing.
+    for probe in 0..32 {
+        if !charge(&mut p, 1) { return -1 }; p.probes = p.probes + 1
+        entry := p.table[at]
+        if entry == 0 {
+            g := p.cells; p.cells = g + 1; p.table[at] = g + 1
+            set_i(&mut p.offsets, g, offset); set_i(&mut p.anchors, g, -1)
+            set_b(&mut p.blocked, g, false); set_i(&mut p.compact, g, -1); return g
+        }
+        if p.offsets[entry - 1] == offset { return entry - 1 }; at = (at + 1) % p.table_size
+    }
+    p.state = -3; -1
+}
+fn shape(p: &mut Plan, f: &mir.Function) -> bool {
+    n := f.kinds.len; places := f.place_kinds.len
+    if !f.valid || !f.verified || f.modes.len != n || f.a.len != n || f.b.len != n || f.c.len != n || f.dst.len != n ||
+        f.effects.len != n || f.aux.len != n || f.types.len != n || f.extensions.len != n || f.place.len != n ||
+        f.imm.len != n || f.flags.len != n || f.reads.len != n || f.writes.len != n || f.clobbers.len != n ||
+        f.opcodes.len != n || f.order.len != n || f.op_blocks.len != n || f.block_starts.len != f.block_ends.len ||
+        f.place_offsets.len != places || f.place_widths.len != places || f.place_escaped.len != places { return invalid(&mut p) }
+    if !f.optimizable || f.unknown_control { return refuse(&mut p) }
+    // Current targets are all little endian. A future target requires an
+    // explicit view-byte-order contract, not an inherited interpretation.
+    if f.platform < 0 || f.platform > 3 { return refuse(&mut p) }
+    if p.limit < 0 || n > 65536 || places > 16384 { p.state = -3; return false }
+    if !charge(&mut p, n * 8 + places * 8 + 16) { return false }
+    for op in 0..n {
+        id := f.order[op]
+        if id < 0 || id >= n || f.place[op] < -1 || f.place[op] >= places || f.modes[op] < 0 || f.modes[op] > 2 || f.kinds[op] < 0 || f.kinds[op] > 21 { return invalid(&mut p) }
+        if f.modes[op] != 2 && (f.kinds[op] == 7 || f.kinds[op] == 8) && f.place[op] < 0 { return invalid(&mut p) }
+    }
+    for place in 0..places {
+        if f.place_kinds[place] < 0 || f.place_kinds[place] > 2 || f.place_widths[place] <= 0 { return invalid(&mut p) }
+    }
+    true
+}
+fn readable(f: &mir.Function, op: i32, width: i32) -> bool {
+    if f.a[op] != 29 || f.b[op] != -1 || f.dst[op] < -1 || f.dst[op] > 30 || f.flags[op] != 0 { return false }
+    if width == 8 { return f.types[op] == 2 && f.extensions[op] == 0 }
+    if width == 4 && f.types[op] == 2 && f.extensions[op] == 2 { return true }
+    (width == 1 || width == 2 || width == 4) && f.types[op] == 1 && f.extensions[op] == 1
+}
+fn writable(f: &mir.Function, op: i32, width: i32) -> bool {
+    width == 8 && f.b[op] == 29 && f.a[op] >= -1 && f.a[op] <= 30 &&
+        f.dst[op] == -1 && f.types[op] == 2 && f.extensions[op] == 0 && f.flags[op] == 0
+}
+pub fn analyze_with_context_budget(p: &mut Plan, f: &mir.Function, context: &memory.Context, limit: i32) -> bool {
+    reset(&mut p, limit)
+    if !shape(&mut p, &f) { return false }
+    n := f.kinds.len; places := f.place_kinds.len; source := memory.source_objects(&context)
+    var has_frame := false
+    for place in 0..places { if f.place_kinds[place] == 1 { has_frame = true } }
+    var frame: i64 = 0
+    if has_frame {
+        frame = contract.frame_capacity(&f)
+        if frame < 0 || contract.frame_lifetime_unproven(&f) { return refuse(&mut p) }
+        if source {
+            if !charge(&mut p, n * 2 + places + 8) { return false }
+            if !memory.source_frame_eligible(&f) { return refuse(&mut p) }
+        }
+    }
+    // At most3 cells per place (width<=16); wider unused/raw shapes refuse
+    // this optional analysis rather than scanning a frame-sized byte table.
+    var size := 8; while size < places * 8 { size = size * 2 }
+    if !charge(&mut p, size + places + n * 5) { return false }; p.table_size = size
+    for at in 0..size { set_i(&mut p.table, at, 0) }
+    for place in 0..places {
+        set_i(&mut p.places, place, -1); if f.place_kinds[place] != 1 { continue }
+        width := f.place_widths[place]; if width > 16 { return refuse(&mut p) }
+        end := i64(f.place_offsets[place]) + i64(width) - 1
+        if end > 2147483647 { return refuse(&mut p) }
+        first := cell(f.place_offsets[place]); last := cell(i32(end))
+        var at := first; var first_group := -1
+        while at <= last {
+            g := intern(&mut p, i32(at)); if g < 0 { return false }; if first_group < 0 { first_group = g }
+            if f.place_escaped[place] || first != last || at >= 0 || at < -frame ||
+                (width != 1 && width != 2 && width != 4 && width != 8) { p.blocked[g] = true }
+            at = at + 8
+        }
+        p.places[place] = first_group
+        if first == last && width == 8 && i64(f.place_offsets[place]) == first { p.anchors[first_group] = place }
+    }
+    for op in 0..n {
+        set_i(&mut p.operations, op, -1); set_i(&mut p.widths, op, 0); set_i(&mut p.shifts, op, -1); set_i(&mut p.extensions, op, -1)
+        var barrier := false
+        if f.modes[op] != 2 {
+            kind := f.kinds[op]; place := f.place[op]
+            barrier = kind == 14 || f.effects[op].bit_and(128) != 0
+            if kind == 7 || kind == 8 {
+                if place < 0 { return invalid(&mut p) }
+                if f.place_kinds[place] != 1 { if f.place_kinds[place] == 2 || !source { barrier = true } }
+            } else if kind != 10 && kind != 11 && kind != 21 && f.effects[op].bit_and(6) != 0 { barrier = true }
+            if place >= 0 && f.place_kinds[place] == 1 {
+                g := p.places[place]; width := f.place_widths[place]
+                if g < 0 { return invalid(&mut p) }
+                if kind != 7 && kind != 8 { p.blocked[g] = true; barrier = true; set_b(&mut p.barriers, op, barrier); continue }
+                if f.aux[op] != width || f.imm[op] != i64(f.place_offsets[place]) { return invalid(&mut p) }
+                accepted := (kind == 7 && readable(&f, op, width)) || (kind == 8 && writable(&f, op, width))
+                if !accepted { p.blocked[g] = true }
+                p.operations[op] = g; p.widths[op] = width
+                p.shifts[op] = i32((i64(f.place_offsets[place]) - i64(p.offsets[g])) * 8); p.extensions[op] = f.extensions[op]
+            }
+        }
+        set_b(&mut p.barriers, op, barrier)
+    }
+    if !charge(&mut p, p.cells + places + n) { return false }
+    for g in 0..p.cells {
+        if p.blocked[g] || p.anchors[g] < 0 { continue }
+        p.compact[g] = p.group_count; set_i(&mut p.groups, p.group_count, g); p.group_count = p.group_count + 1
+    }
+    for place in 0..places { raw := p.places[place]; if raw >= 0 { p.places[place] = p.compact[raw] } }
+    for op in 0..n { raw := p.operations[op]; if raw >= 0 { p.operations[op] = p.compact[raw] } }
+    p.place_count = places; p.operation_count = n; p.state = 1; true
+}
+pub fn analyze_with_context(p: &mut Plan, f: &mir.Function, context: &memory.Context) -> bool {
+    analyze_with_context_budget(&mut p, &f, &context, 4194304)
+}
+pub fn analyze_budget(p: &mut Plan, f: &mir.Function, limit: i32) -> bool {
+    context := memory.conservative(); analyze_with_context_budget(&mut p, &f, &context, limit)
+}
+pub fn analyze_into(p: &mut Plan, f: &mir.Function) -> bool { analyze_budget(&mut p, &f, 4194304) }

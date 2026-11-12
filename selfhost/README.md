@@ -85,7 +85,9 @@ Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
 diagnostik använder samma fulla frontend oberoende av passval.
 
 `--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är fortsatt **off**
-i väntan på aktuell v2-matris för runtime och kompileringstid. MIR och MIR-opt
+efter [v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md).
+SSA på kostar 21,26 procent extra byggmedian för kompilatorkorpuset och
+29,47 procent för Tabell utan belagd samlad runtimevinst. MIR och MIR-opt
 måste också vara på. V2 bygger egna ValueID:n för GP/NZCV def/use,
 blockparametrar och föregångarkanternas argument glest efter verklig
 efterfrågan. Oförändrade GP-/NZCV-ingångar delas och iterativ kantlösning
@@ -136,7 +138,7 @@ och kan förstöra dem, alltså `flags=3`. Det tidigare `flags=2` var felaktig
 metadata. Fyndet har inte visat någon felkompilering i dagens värdepass.
 
 Den historiska [SSA-v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
-gav 70,92 procent högre byggmedian för kompilatorkorpusen och 42,34 procent
+gav 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34 procent
 för Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller
 ingen meningsfull byggvinst där. Detta gäller v1 och är inga mätningar av
 gles v2 eller `source_inputs`; bootstrapprofilen behålls.
@@ -149,8 +151,11 @@ lasttrafik i vissa fall, men ger inget nytt latens- eller C-prestandaanspråk.
 Aktuell riktad v2-QA med `flags=3` passerar 670 målbilder och 360 native-/
 Wasm-körningar, med 438 exakta bitpar och 232 redovisade interpreterluckor.
 Källacceptansen passerar 24 målbilder och 17 körningar. Linux är endast
-bildbyggt i dessa matriser. Full bootstrap och v2-prestandamatris är separata
-grindar före standardaktivering.
+bildbyggt i dessa matriser. Full verifiering passerar också, inklusive
+bootstrapens fixpunkt med en och fyra workers. V2 minskar SSA-byggmedianen
+för kompilatorkorpuset 27,65 procent mot v1, men runtime/C-geomedlet 1,1841
+med passet på klarar inte C-gränsen. Analysvinsten och standardvalet är
+separata beslut.
 [SSA- och rollback-orakel](../tools/test-mir-ssa.py),
 [käll-/worker-/cacheprov](../tools/test-ssa-source.py) och
 [detaljerad omfattning](../docs/optimization.md#ssa-för-privata-framevärden).

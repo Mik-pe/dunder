@@ -20,6 +20,14 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+[Gles SSA-v2 och separata anropsindata, 2026-11-12](2026-11-12-ssa-pruned/README.md)
+bevarar 1 440 prover över standard av/av, gamla/nya SSA på/på och nya
+kompilatorns av/på-serie med C. SSA-byggmedianen för kompilatorkorpuset
+minskar 27,65 procent mot v1, men SSA på kostar fortfarande 21,26 procent
+extra för kompilatorkorpuset och 29,47 procent för Tabell. Runtime/C-geomedlet
+1,1841 uppfyller inte C-målet. Standard behåller fyra workers och SSA av;
+alla p95-regressioner och råsvansar ingår i rapporten.
+
 [SSA-grund och ABI-kontrakt, 2026-11-12](2026-11-12-ssa-foundation/README.md)
 prövar den valbara cell-SSA:n och en separat SSA-optimerad producentbinär.
 SSA på ökade kompilatorkorpusets byggmedian 70,92 procent och Tabells

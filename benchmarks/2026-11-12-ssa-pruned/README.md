@@ -60,7 +60,7 @@ this archive; their hashes and sizes are preserved in metadata.
 The original metadata, CSVs, logs, validation JSON, measurement summary and
 preflight controller/raw streams are copied byte-for-byte. CSV CRLF is retained.
 [commands.json](commands.json) records the completed invocations and sessions;
-[archive-manifest.json](archive-manifest.json) maps each copy to its original
+[archive-manifest.json](archive-manifest.json) maps each measurement/preflight copy to its original
 path, size and SHA-256. [checksums.sha256](checksums.sha256) covers the archive
 files. The raw metadata intentionally keeps original absolute paths.
 
@@ -70,9 +70,89 @@ cross-cohort consistency. [tails.csv](tails.csv) is a derived 48-row convenience
 view with min/median/p95/max; it does not replace the raw samples. All generated
 outputs were reproducible within each variant and all consumer checks passed.
 
-Root will append separate full-verification and ABI receipts. They are not
-included or fabricated in this archival commit; [freeze.json](freeze.json)
-records the verification provenance supplied before measurement.
+[freeze.json](freeze.json) records the verification provenance supplied before
+measurement. The completed verification and separate ABI evidence below were
+appended after all measurement processes ended.
+
+## Correctness and independent ABI observations
+
+[`verification/final-acceptance.json`](verification/final-acceptance.json)
+binds the exact compiler/source identities to the exit-0
+[`full verification log`](verification/full-verify-7c3d582.log) at `7c3d582`.
+The verified compiler/runtime/frozen-seed/test Dunder sources did not change
+before measurement or publication. Documentation and the flag-probe's native
+host selection changed afterward; that portable tool was separately rerun
+successfully. The standard remains the measured 9e5b image, with SSA off and
+four workers. Its serial recovery image is recorded separately.
+
+- [`SSA acceptance`](verification/ssa-integrated-7c3d582.json): 670 images,
+  360 native/Wasm executions, 438 independent exact-bit pairs and 232 explicit
+  interpreter gaps. Calls, FP, external exits and consumed unknown scratch
+  have separate actual-image coverage; they are not counted as interpreter
+  proofs. All 61 Function fields are witnessed for budget rollback.
+- [`Raw image comparison`](verification/raw-image-comparison.json): all 530
+  common full-budget/off images match the archived v1 images byte-for-byte.
+  The new flags3 metadata is real; historical exports are not rewritten.
+- [`Parallel compiler acceptance`](verification/parallel-integrated-7c3d582.json):
+  108 images and 76 actual executions (64 ARM64/macOS, 12 Wasm), with unchanged
+  results, diagnostics and code across worker settings. Source SSA acceptance
+  also passes 24 images and 17 native/Wasm executions with cache/receipt checks.
+- [`Frame/exit acceptance`](verification/frame-exits-integrated-7c3d582.json)
+  preserves the independent raw SP/register/frame observers and call fences.
+- [`Raw-call flags`](verification/call-flags-portable.json): 48 images and 24
+  actual macOS/Wasm executions retain incoming NZCV dependencies. The
+  [`historical flags2 receipt`](verification/call-flags-before-v1.json) separates
+  a deliberately invalid test-only deletion from the productive real value
+  pass, which preserved Compare and observer results both before and after.
+  No production miscompile is claimed. Stale flags2 metadata now fails
+  re-verification. The earlier full-suite
+  [`flag receipt`](verification/call-flags-integrated-7c3d582.json) is also retained.
+
+The [wide sparse-state tests](../../tests/mir_ssa_sparse.ddr) pass in native
+and Wasm test drivers (10 groups each, including shared ARM helpers). Their
+129 live values exercise complete live-out words and loop transport. A closed
+independent interpreter executes final `arm.finish` bytes against independent
+arithmetic; these two kernels are not claimed as executed target machine code.
+They use an explicit 33554432-unit stress budget. Production stays at 4194304.
+Linux targets are image-only throughout these host-specific acceptance reports.
+
+[`Native ABI off/on`](verification/abi/summary.json) uses the same independent
+C/assembly sentinel oracle and source, covering X19–X28, D8–D15, FP/SP, a source
+callback, promoted internal calls with twelve arguments, text, and a twelve-
+argument C call. Both profiles pass. SSA on actually optimizes two functions,
+with 11 cells, 14 removed loads and 17 copies. These functional builds are
+outside the latency series. Their raw instrumented compiler JSON is preserved
+only for policy/codegen counters; incidental clock fields are not analyzed.
+
+The archived `verification/abi/probe.py` assumes a work directory three levels
+below the repository root, such as `build/reproduce-ssa/abi`. Copy it and its
+sources there before rerunning; it writes a dylib and embeds its absolute path,
+so a different directory can change image hashes. Binary/dylib payloads are
+omitted. The older `probe-original.py` is preserved as provenance, not the
+current reproduction entrypoint.
+
+## Static evidence for the next value backend
+
+The [`text/sort audit`](runtime-gap/README.md) records six exact measured-image
+identities, raw disassembly, source snapshots and mechanically checked selected
+branch paths. On/C images were reconstructed without executing them, and their
+SHA-256 values had to match the timing metadata exactly. The archived
+[`classifier`](runtime-gap/classify.py) reproduces the path tables. These are
+conditional static counts, not runtime frequencies or instruction-count speedups.
+
+Text still uses the expression stack and a frame bool after the setup calls;
+sort's register-resident shift still repeats addresses and a managed load.
+The next coherent step is allocatable scalar/expression-stack values with
+regional reload/synchronization, plus a distinct ordinary-memory/provenance
+contract for safe load reuse. Current `source_objects` does not grant that heap
+contract, and calls keep their memory fences. The audit is evidence for this
+direction, not a claim that the proposed stage already exists or meets C parity.
+
+To rerun the classifier in a fresh checkout, restore the archived
+`user-profile` data under ignored `build/ssa-pruned/user-profile`; it also reads
+the repository's earlier selected-path inputs under
+`benchmarks/2026-11-11-whole-function-optimization/runtime-attribution`.
+The copied original absolute paths remain historical provenance.
 
 ## Complete median and p95 results
 
