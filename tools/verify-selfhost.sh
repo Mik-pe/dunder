@@ -5,6 +5,10 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 compiler=$(./tools/bootstrap.sh)
 work=$(mktemp -d "${TMPDIR:-/tmp}/dunder-verify.XXXXXX")
+# Keep each new metadata matrix's evidence independently. Its tools require
+# empty outputs so rerunning verification must never reuse an earlier run.
+mir_reports=$(mktemp -d "$root/build/mir-correctness.XXXXXX")
+printf 'MIR verification evidence: %s\n' "$mir_reports"
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 "$compiler" test dogfood/tests.ddr -o "$work/dogfood"
@@ -13,7 +17,7 @@ trap 'exit 1' HUP INT TERM
 "$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
 "$compiler" test tests/mir_object.ddr -o "$work/mir-object"
 python3 tools/test-mir-objects.py "$compiler"
-python3 tools/test-mir-object-data.py "$compiler" --output build/mir-object-data-integrated
+python3 tools/test-mir-object-data.py "$compiler" --output "$mir_reports/object-data"
 # Metadata/emitter units execute portably; OS probes and source tasks execute
 # only on the implemented native host provider.
 python3 tools/test-mir-link.py "$compiler"
@@ -28,8 +32,8 @@ for ssa_module in mir_call_inputs mir_liveness_inputs mir_ssa_cells mir_ssa mir_
     "$compiler" build-tests "tests/$ssa_module.ddr" --target wasm32 -o "$work/$ssa_module.wasm"
     node tools/test-wasm.mjs --execute "$work/$ssa_module.wasm"
 done
-python3 tools/test-mir-stack-origin.py "$compiler" --output build/mir-stack-origin-integrated
-python3 tools/test-mir-regions.py "$compiler" --output build/mir-regions-integrated --report build/mir-regions-integrated.json
+python3 tools/test-mir-stack-origin.py "$compiler" --output "$mir_reports/stack-origin"
+python3 tools/test-mir-regions.py "$compiler" --output "$mir_reports/regions" --report "$mir_reports/regions.json"
 python3 tools/test-mir-frame-exits.py "$compiler" --output build/mir-frame-exits-integrated
 python3 tools/test-mir-call-flags.py "$compiler" --output build/mir-call-flags-integrated
 python3 tools/test-mir-ssa.py "$compiler" --report build/mir-ssa-integrated.json
