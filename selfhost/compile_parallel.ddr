@@ -1,0 +1,128 @@
+// This entry is built by a task-capable serial compiler, outside the frozen
+// seed dependency graph. Frontend traversal and publication have one owner.
+// A bounded task scope owns each window's snapshots/results until ordered
+// acceptance is finished, then releases them before the next window starts.
+import compile as compiler
+import lexer
+import mir
+import mir_lift
+import mir_lower
+import mir_link
+import mir_pipeline as pipeline
+import mir_task
+import fragments
+import record_take
+import opt_ir
+import opt_verify
+import opt_alloc
+import machine_ir
+import opt_emit
+import opt_range
+import opt_inline
+
+fn empty_status() -> pipeline.Status {
+    pipeline.Status { error: 0, frame_state: 0, value_state: 0, stats: pipeline.stats() }
+}
+fn failure(message: string) -> compiler.Result {
+    compiler.Result { ok: false, error: message, offset: 0, text: [],
+        imports: compiler.Imports { globals: 0, libraries: [], symbols: [], sites: [], slots: [] } }
+}
+fn accept_answer(session: &mut compiler.Session, link: &mut mir_link.Linker,
+    object: &mut mir_lower.FunctionObject, ordinal: i32, declaration: i32, answer: &mir_task.Answer) -> bool {
+    var status := answer.status
+    if answer.ordinal != ordinal || answer.declaration != declaration { status.error = 8 }
+    if status.error == 0 && !mir_lower.lower_into(&mut object, &answer.function) { status.error = 7 }
+    compiler.accept_into(&mut session, &mut link, ordinal, &object, &status)
+}
+
+pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32,
+    module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool,
+    records: &mut compiler.Bindings, directory: string, identity: string,
+    config: &compiler.Configuration) -> compiler.Result {
+    if config.workers < 1 || config.workers > 256 { return failure("compiler workers must be 1..256") }
+    // These paths use the identical shared Session driver without scheduling:
+    // check has no backend work; one worker reuses serial arenas; the existing
+    // compiler profile reports partitioned wall intervals, not summed CPU time.
+    if check_all || config.workers == 1 || config.profile_host >= 0 || !config.mir_enabled {
+        return compiler.compile_options(&mut tokens, platform, &module_starts, &module_files,
+            check_all, report, &mut records, directory, identity, &config)
+    }
+    var session := compiler.new_session()
+    var record_takes := record_take.new()
+    var model := opt_ir.new()
+    var verifier := opt_verify.new()
+    var plan := opt_alloc.new()
+    var machine := machine_ir.new()
+    var settings := opt_emit.options()
+    var range_work := opt_range.new()
+    var catalog := opt_inline.new()
+    var inline_work := opt_inline.workspace()
+    if !compiler.begin_into(&mut session, &mut tokens, platform, &module_starts, &module_files,
+        report, directory, identity, &config, &mut model, &mut verifier, &mut range_work,
+        &mut catalog, &mut inline_work, &mut settings, &mut record_takes) { return compiler.session_error(&session) }
+    var link := mir_link.new()
+    if !compiler.begin_linker(&session, &mut link) { return failure("internal compiler prefix linking failure") }
+    var function := mir.new()
+    var final_object := mir_lower.new_object()
+    var lowered := mir_lower.new_object()
+    var lifter := mir_lift.new_work()
+    var restored := fragments.new_dependencies()
+    var options := pipeline.options()
+    var terminals := pipeline.no_terminals()
+    compiler.pipeline_options_into(&session, &mut options)
+    compiler.terminals_into(&session, &mut terminals)
+    ordinary := empty_status()
+    var backend_failed := false
+    var source_failed := false
+    while !compiler.source_done(&session) && !backend_failed && !source_failed {
+        task scope jobs(config.workers) {
+            var keys: []TaskID<mir_task.Answer> = []
+            var ordinals: []i32 = []
+            var declarations: []i32 = []
+            var produced := 0
+            var read := 0
+            var flush := false
+            var cached := false
+            var cached_ordinal := -1
+            while !backend_failed {
+                if (flush || produced == config.workers) && read < keys.len {
+                    answer := await jobs(keys[read])
+                    if !accept_answer(&mut session, &mut link, &mut lowered,
+                        ordinals[read], declarations[read], &answer) { backend_failed = true }
+                    read = read + 1
+                    continue
+                }
+                if flush {
+                    if cached {
+                        if !compiler.accept_into(&mut session, &mut link, cached_ordinal,
+                            &final_object, &ordinary) { backend_failed = true }
+                        cached = false
+                    }
+                    if source_failed || compiler.source_done(&session) || backend_failed { break }
+                    flush = false
+                }
+                if produced == config.workers { break }
+                state := compiler.next_into(&mut session, &mut function, &mut final_object,
+                    &mut lifter, &mut model, &mut verifier, &mut plan, &mut machine, &settings,
+                    &mut range_work, &catalog, &mut inline_work, &mut restored)
+                produced = produced + 1
+                if state == 1 {
+                    ordinal := compiler.current_ordinal(&session)
+                    declaration := compiler.current_declaration(&session)
+                    keys.push(spawn jobs mir_task.execute(mir_task.Job {
+                        ordinal: ordinal, declaration: declaration, function: function,
+                        options: options, terminals: terminals }))
+                    ordinals.push(ordinal); declarations.push(declaration)
+                } else if state == 2 {
+                    cached = true; cached_ordinal = compiler.current_ordinal(&session); flush = true
+                } else {
+                    if state < 0 { source_failed = true }
+                    flush = true
+                }
+            }
+        }
+    }
+    if backend_failed || source_failed { return compiler.session_error(&session) }
+    compiler.finish(&mut session, &mut link, &mut model, &mut verifier, &mut plan, &mut machine,
+        &settings, &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
+}
