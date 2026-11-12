@@ -4,6 +4,7 @@ import arm64 as arm
 import cache_io
 import cli
 import lexer
+import mir_lower as lower
 import std.bytes as bytes
 import sys
 
@@ -56,6 +57,29 @@ fn put(output: &mut []u8, value: i64) {
     digits := "0123456789abcdef"
     for i in 0..8 { output.push(u8(digits[i32(value.shr((7 - i) * 4).bit_and(15))])) }
 }
+// Both live-suffix and detached-object writers use the same wire encoder.
+// Offsets passed here are already function-local, IDs remain global until the
+// relocation encoder tags globals or translates function-private label IDs.
+fn header(output: &mut []u8, words: i32, labels: i32, relocations: i32,
+    extended: bool, dependencies: i32, charged: i32) {
+    if extended { put(&mut output, 1146439236); put(&mut output, 1) }
+    put(&mut output, i64(words)); put(&mut output, i64(labels)); put(&mut output, i64(relocations))
+    if extended { put(&mut output, i64(dependencies)); put(&mut output, i64(charged)) }
+}
+fn label_record(output: &mut []u8, offset: i32, words: i32) -> bool {
+    if offset < -1 || offset > words { return false }
+    if offset == -1 { put(&mut output, 4294967295) } else { put(&mut output, i64(offset)) }
+    true
+}
+fn relocation_record(output: &mut []u8, at: i32, target: i32, kind: i32,
+    words: i32, first_label: i32, label_end: i32, globals: i32) -> bool {
+    if at < 0 || at >= words || kind < 0 || kind > 20 || (kind >= 2 && at >= words - 1) || target < 0 { return false }
+    put(&mut output, i64(at))
+    if target < globals { put(&mut output, 2147483648 + i64(target)) }
+    else if target >= first_label && target < label_end { put(&mut output, i64(target - first_label)) }
+    else { return false }
+    put(&mut output, i64(kind)); true
+}
 fn values(source: string) -> []i64 {
     var result: []i64 = []
     if source.len % 8 != 0 { return result }
@@ -74,36 +98,17 @@ fn values(source: string) -> []i64 {
 pub fn save(code: &arm.Code, begin: Start, globals: i32, path: string, key: string) {
     if key == "" { return }
     var output: []u8 = []
-    put(&mut output, i64(code.words.len - begin.words))
-    put(&mut output, i64(code.labels.len - begin.labels))
-    put(&mut output, i64(code.at.len - begin.relocations))
+    words := code.words.len - begin.words
+    header(&mut output, words, code.labels.len - begin.labels, code.at.len - begin.relocations, false, 0, 0)
     for i in begin.words..code.words.len { put(&mut output, code.words[i]) }
     for i in begin.labels..code.labels.len {
-        offset := code.labels[i]
-        if offset < 0 { put(&mut output, 4294967295) }
-        else {
-            if offset < begin.words { return }
-            put(&mut output, i64(offset - begin.words))
-        }
+        var offset := code.labels[i]; if offset >= 0 { if offset < begin.words { return }; offset = offset - begin.words }
+        if !label_record(&mut output, offset, words) { return }
     }
     for i in begin.relocations..code.at.len {
-        target := code.target[i]
-        put(&mut output, i64(code.at[i] - begin.words))
-        if target < globals { put(&mut output, 2147483648 + i64(target)) }
-        else if target >= begin.labels { put(&mut output, i64(target - begin.labels)) }
-        else { return }
-        put(&mut output, i64(code.kinds[i]))
+        if !relocation_record(&mut output, code.at[i] - begin.words, code.target[i], code.kinds[i], words, begin.labels, code.labels.len, globals) { return }
     }
-    if !cli.prepare_parent(path) { return }
-    payload := sys.decode_u8(&output)
-    temporary := path + "." + sys.pid().str() + ".tmp"
-    signature := cache_io.digest(key + payload.value)
-    written := sys.write_text(temporary, key + signature + payload.value)
-    if written.ok {
-        updated := sys.rename(temporary, path)
-        if updated.ok { return }
-    }
-    removed := sys.remove_file(temporary)
+    published := publish_dependencies(path, key, &output)
 }
 pub fn restore(code: &mut arm.Code, globals: i32, entry: i32, path: string, key: string) -> bool {
     if key == "" { return false }
@@ -221,32 +226,85 @@ pub fn save_with_dependencies(code: &arm.Code, begin: Start, globals: i32,
     var output: []u8 = []
     // DUFD, version 1. The old API interprets magic as an impossible word count
     // and declines this payload. New restore requires magic and rejects native3.
-    put(&mut output, 1146439236); put(&mut output, 1)
-    put(&mut output, i64(words)); put(&mut output, i64(labels)); put(&mut output, i64(relocations))
-    put(&mut output, i64(dependencies.declarations.len)); put(&mut output, i64(dependencies.charged_words))
+    header(&mut output, words, labels, relocations, true, dependencies.declarations.len, dependencies.charged_words)
     for i in begin.words..code.words.len {
         word := code.words[i]
         if word < 0 || word > 4294967295 { return false }
         put(&mut output, word)
     }
     for i in begin.labels..code.labels.len {
-        offset := code.labels[i]
-        if offset == -1 { put(&mut output, 4294967295) }
-        else {
-            if offset < begin.words || offset > code.words.len { return false }
-            put(&mut output, i64(offset - begin.words))
-        }
+        var offset := code.labels[i]; if offset >= 0 { if offset < begin.words { return false }; offset = offset - begin.words }
+        if !label_record(&mut output, offset, words) { return false }
     }
     for i in begin.relocations..code.at.len {
         at := code.at[i]; target := code.target[i]; kind := code.kinds[i]
         if at < begin.words || at >= code.words.len || kind < 0 || kind > 20 || (kind >= 2 && at + 1 >= code.words.len) { return false }
         if target < 0 || target >= code.labels.len { return false }
-        put(&mut output, i64(at - begin.words))
-        if target < globals { put(&mut output, 2147483648 + i64(target)) }
-        else if target >= begin.labels && code.labels[target] >= begin.words { put(&mut output, i64(target - begin.labels)) }
-        else { return false }
-        put(&mut output, i64(kind))
+        if target >= globals && code.labels[target] < begin.words { return false }
+        if !relocation_record(&mut output, at - begin.words, target, kind, words, begin.labels, code.labels.len, globals) { return false }
     }
+    for declaration in dependencies.declarations { put(&mut output, i64(declaration)) }
+    publish_dependencies(path, key, &output)
+}
+fn object_payload(output: &mut []u8, object: &lower.FunctionObject,
+    first_label: i32, label_end: i32, globals: i32, extended: bool, count: i32, charged: i32) -> bool {
+    if !lower.object_ready(&object) || first_label < 0 || label_end < first_label || globals < 0 || globals > first_label { return false }
+    if lower.object_first_label(&object) != first_label || lower.object_label_end(&object) != label_end ||
+        lower.object_import_count(&object) != 0 { return false }
+    // Native3/DUFD never contained import sites or imported symbol slots. An
+    // import-bearing object is ineligible, exactly as the serial producer was.
+    words := lower.object_word_count(&object); labels := label_end - first_label
+    relocations := lower.object_reloc_count(&object)
+    var size := i64(3); if extended { size = 7 }
+    size = size + i64(words) + i64(labels) + i64(relocations) * 3 + i64(count)
+    if words <= 0 || size * 8 + 128 > 67108864 { return false }
+    // A lowered/captured object owns the exact private range plus, optionally,
+    // one predeclared global entry. The latter is NOT serialized as private.
+    n := lower.object_label_count(&object)
+    if i64(n) < i64(labels) || i64(n) > i64(labels) + 1 { return false }
+    var first := 0
+    if n > 0 && lower.object_label_id(&object, 0) < first_label { first = 1 }
+    if labels > n - first { return false }
+    for i in 0..labels { if lower.object_label_id(&object, first + i) != first_label + i { return false } }
+    if first == 1 && lower.object_label_offset(&object, 0) != 0 { return false }
+    if n > first + labels {
+        if first != 0 || lower.object_label_id(&object, n - 1) < label_end || lower.object_label_offset(&object, n - 1) != 0 { return false }
+    }
+    header(&mut output, words, labels, relocations, extended, count, charged)
+    for i in 0..words {
+        word := lower.object_word(&object, i)
+        if word < 0 || word > 4294967295 { return false }; put(&mut output, word)
+    }
+    for i in 0..labels {
+        if !label_record(&mut output, lower.object_label_offset(&object, first + i), words) { return false }
+    }
+    for i in 0..relocations {
+        target := lower.object_reloc_target(&object, i)
+        if target >= globals {
+            if target < first_label || target >= label_end { return false }
+            if lower.object_label_offset(&object, first + target - first_label) < 0 { return false }
+        }
+        if !relocation_record(&mut output, lower.object_reloc_at(&object, i), target,
+            lower.object_reloc_kind(&object, i), words, first_label, label_end, globals) { return false }
+    }
+    true
+}
+// Save final detached bytes, not the provisional frontend suffix. No Code or
+// MIR snapshot is constructed, and future namespace growth is irrelevant.
+// A rejected save leaves the previous cache file intact.
+pub fn save_object(object: &lower.FunctionObject, first_label: i32, label_end: i32,
+    globals: i32, path: string, key: string) -> bool {
+    if !valid_key(key) { return false }
+    var output: []u8 = []
+    if !object_payload(&mut output, &object, first_label, label_end, globals, false, 0, 0) { return false }
+    publish_dependencies(path, key, &output)
+}
+pub fn save_object_with_dependencies(object: &lower.FunctionObject, first_label: i32, label_end: i32,
+    globals: i32, path: string, key: string, dependencies: &Dependencies, declaration_limit: i32) -> bool {
+    if !valid_key(key) || !valid_dependencies(&dependencies, declaration_limit) { return false }
+    var output: []u8 = []
+    if !object_payload(&mut output, &object, first_label, label_end, globals, true,
+        dependencies.declarations.len, dependencies.charged_words) { return false }
     for declaration in dependencies.declarations { put(&mut output, i64(declaration)) }
     publish_dependencies(path, key, &output)
 }
