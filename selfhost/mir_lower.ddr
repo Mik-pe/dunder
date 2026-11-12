@@ -15,7 +15,7 @@ import mir_scalar_lower as scalar_lower
 pub opaque struct FunctionObject {
     output: arm.Code, boundaries: []i32, label_ids: []i32, label_at: []i32,
     import_ids: []i32, import_at: []i32, ready: bool,
-    first_word: i32, first_reloc: i32, first_import: i32,
+    first_word: i32, first_label: i32, first_reloc: i32, first_import: i32,
     source_words: i32, source_labels: i32, source_relocs: i32, source_imports: i32,
 }
 pub opaque struct Workspace {
@@ -24,7 +24,7 @@ pub opaque struct Workspace {
 pub fn new_object() -> FunctionObject {
     FunctionObject { output: arm.new(), boundaries: [], label_ids: [], label_at: [],
         import_ids: [], import_at: [], ready: false,
-        first_word: 0, first_reloc: 0, first_import: 0,
+        first_word: 0, first_label: 0, first_reloc: 0, first_import: 0,
         source_words: 0, source_labels: 0, source_relocs: 0, source_imports: 0 }
 }
 pub fn new() -> Workspace {
@@ -60,6 +60,9 @@ pub fn object_reloc_kind(object: &FunctionObject, at: i32) -> i32 { assert(objec
 pub fn object_import_count(object: &FunctionObject) -> i32 { assert(object.ready); object.import_ids.len }
 pub fn object_import_id(object: &FunctionObject, at: i32) -> i32 { assert(object.ready); object.import_ids[at] }
 pub fn object_import_byte_at(object: &FunctionObject, at: i32) -> i32 { assert(object.ready); object.import_at[at] }
+// Original private-label ID range, distinct from owned global entry labels.
+pub fn object_first_label(object: &FunctionObject) -> i32 { assert(object.ready); object.first_label }
+pub fn object_label_end(object: &FunctionObject) -> i32 { assert(object.ready); object.source_labels }
 
 // These globals have meaning independent of one function's local values.
 // x21 is the pool/free-list base, not an unused callee-saved register.
@@ -241,7 +244,7 @@ fn build_object(work: &mut FunctionObject, f: &mir.Function) -> bool {
         if boundary >= 0 { position = work.boundaries[boundary] }
         work.label_ids.push(label); work.label_at.push(position)
     }
-    work.first_word = f.first_word; work.first_reloc = f.first_reloc; work.first_import = f.first_import
+    work.first_word = f.first_word; work.first_label = f.first_label; work.first_reloc = f.first_reloc; work.first_import = f.first_import
     work.source_words = f.source_words; work.source_labels = f.source_labels
     work.source_relocs = f.source_relocs; work.source_imports = f.source_imports
     work.ready = true; true
@@ -251,6 +254,103 @@ fn build_object(work: &mut FunctionObject, f: &mir.Function) -> bool {
 // On refusal, no object is published; all retained arenas remain reusable.
 pub fn lower_into(object: &mut FunctionObject, f: &mir.Function) -> bool {
     reset_object(&mut object); build_object(&mut object, &f)
+}
+
+// Explicit half-open producer ranges, captured before another function may
+// reserve labels or emit words. Entry is separately owned: it is usually a
+// predeclared global ID outside the private label range. End/unmarked private
+// labels belong to this function even if later namespaces grow.
+pub struct FragmentRange {
+    first_word: i32, word_end: i32, first_label: i32, label_end: i32,
+    first_reloc: i32, reloc_end: i32, first_import: i32, import_end: i32, entry: i32,
+}
+fn fragment_ranges(code: &arm.Code, sites: &[]i32, r: &FragmentRange) -> bool {
+    if code.checking || code.mir_capture || code.effect_depth != 0 || code.platform < 0 || code.platform > 3 ||
+        code.at.len != code.target.len || code.at.len != code.kinds.len ||
+        r.first_word < 0 || r.word_end <= r.first_word || r.word_end > code.words.len || r.word_end > 536870911 ||
+        r.first_label < 0 || r.label_end < r.first_label || r.label_end > code.labels.len ||
+        r.first_reloc < 0 || r.reloc_end < r.first_reloc || r.reloc_end > code.at.len ||
+        r.first_import < 0 || r.import_end < r.first_import || r.import_end > sites.len ||
+        r.entry < 0 || r.entry >= code.labels.len || code.labels[r.entry] != r.first_word { return false }
+    // Adjacent records prove this is a complete slice, not a partial pair or
+    // omitted record. The trusted producer keeps both tables physically sorted;
+    // no scan of previous functions or the future suffix is needed.
+    if r.first_reloc > 0 {
+        i := r.first_reloc - 1; var width := 1; if code.kinds[i] >= 2 { width = 2 }
+        if code.at[i] < 0 || i64(code.at[i]) + i64(width) > i64(r.first_word) { return false }
+    }
+    if r.reloc_end < code.at.len && code.at[r.reloc_end] < r.word_end { return false }
+    if r.first_import > 0 {
+        at := sites[r.first_import - 1]
+        if at < 0 || at % 4 != 0 || i64(at) + 8 > i64(r.first_word) * 4 { return false }
+    }
+    if r.import_end < sites.len && i64(sites[r.import_end]) < i64(r.word_end) * 4 { return false }
+    true
+}
+// Cache restores have already validated their format/signature and the source
+// producer has validated executable semantics. This bridge validates only the
+// complete relocatable slice; it deliberately does not lift, optimize or verify
+// MIR again. Arbitrary executable bytes are not certified by this API.
+// Code/sites are read-only. Failure publishes no object, even after reuse.
+pub fn capture_verified_fragment(object: &mut FunctionObject, code: &arm.Code,
+    sites: &[]i32, r: &FragmentRange) -> bool {
+    reset_object(&mut object)
+    if !fragment_ranges(&code, &sites, &r) { return false }
+    n := r.word_end - r.first_word
+    for at in r.first_word..r.word_end { if code.words[at] < 0 || code.words[at] > 4294967295 { return false } }
+    // Reuse the lowerer's retained boundary arena to mark symbolic pair
+    // interiors. Labels cannot enter the second word of a reloc/import pair.
+    for at in 0..n + 1 { object.boundaries.push(0) }
+    var reloc := r.first_reloc; var imported := r.first_import; var previous_end := r.first_word
+    while reloc < r.reloc_end || imported < r.import_end {
+        var symbolic := reloc < r.reloc_end
+        if imported < r.import_end {
+            if sites[imported] < 0 || sites[imported] % 4 != 0 { return false }
+            if symbolic { symbolic = code.at[reloc] <= sites[imported] / 4 }
+        }
+        var at := 0; var width := 2
+        if symbolic {
+            at = code.at[reloc]; kind := code.kinds[reloc]
+            if kind < 0 || kind > 20 || code.target[reloc] < 0 || code.target[reloc] >= code.labels.len { return false }
+            if kind < 2 { width = 1 }
+        } else { at = sites[imported] / 4 }
+        if at < previous_end || at > r.word_end - width { return false }
+        if symbolic {
+            if code.words[at] != 0 || (width == 2 && code.words[at + 1] != 3573751839) { return false }
+            reloc = reloc + 1
+        } else {
+            if (code.words[at] != 0 && code.words[at] != 4244635648) || code.words[at + 1] != 0 { return false }
+            imported = imported + 1
+        }
+        if width == 2 { object.boundaries[at + 1 - r.first_word] = 1 }
+        previous_end = at + width
+    }
+    for id in r.first_label..r.label_end {
+        at := code.labels[id]
+        if at < -1 || (at >= 0 && (at < r.first_word || at > r.word_end)) { return false }
+        if at >= 0 && object.boundaries[at - r.first_word] != 0 { return false }
+    }
+    // All admission is complete before copying the output arenas. Preserve
+    // sorted global label IDs, including an entry outside the private range.
+    object.output.platform = code.platform
+    for at in r.first_word..r.word_end { object.output.words.push(code.words[at]) }
+    if r.entry < r.first_label { object.label_ids.push(r.entry); object.label_at.push(0) }
+    for id in r.first_label..r.label_end {
+        var at := code.labels[id]; if at >= 0 { at = at - r.first_word }
+        object.label_ids.push(id); object.label_at.push(at)
+    }
+    if r.entry >= r.label_end { object.label_ids.push(r.entry); object.label_at.push(0) }
+    for i in r.first_reloc..r.reloc_end {
+        object.output.at.push(code.at[i] - r.first_word)
+        object.output.target.push(code.target[i]); object.output.kinds.push(code.kinds[i])
+    }
+    for i in r.first_import..r.import_end {
+        object.import_ids.push(i); object.import_at.push(sites[i] - r.first_word * 4)
+    }
+    object.first_word = r.first_word; object.first_label = r.first_label; object.first_reloc = r.first_reloc; object.first_import = r.first_import
+    object.source_words = r.word_end; object.source_labels = r.label_end
+    object.source_relocs = r.reloc_end; object.source_imports = r.import_end
+    object.ready = true; true
 }
 
 // Compatibility adapter: retain the serial suffix snapshot/commit contract.
