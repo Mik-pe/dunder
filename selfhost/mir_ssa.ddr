@@ -7,7 +7,6 @@
 // grows a frame, changes SP, or creates a label/import/control-flow namespace.
 import mir
 import mir_contract as contract
-import mir_scalar_contract as scalar
 import mir_memory as memory
 import mir_liveness as live
 import mir_verify as verify
@@ -63,9 +62,14 @@ fn reset(w: &mut Workspace, limit: i32) {
     w.old_n = 0; w.staging = false; w.changed_cells = 0; w.loads = 0; w.moves = 0; w.registers_used = 0; w.parameter_count = 0
 }
 fn bit(value: i32) -> i64 { i64(1).shl(value) }
+// node_physical is a state-variable ordinal for entry/parameter nodes:
+// GP0..31, NZCV32, frame-cell33+. It is never an SSA ID in a physical mask.
 // kind1 entry,2 block parameter,3 pinned actual GP def,4 clobber-state
-// capture (NOT a semantic call result),5 NZCV def,6 frame-copy def,
+// capture (NOT a semantic call result),5 pinned NZCV state update/capture,
+// 6 frame-copy def,
 // 7 frame-memory version after a fence,8 normalized load view,9 immutable ZR.
+// Kind5 is NOT a Compare/GVN expression: an opaque Call with flags3 captures
+// unknown post-call NZCV here, preserving ordering and dependence only.
 fn node(w: &mut Workspace, kind: i32, group: i32, block: i32, op: i32, physical: i32, source: i32) -> i32 {
     if !charge(&mut w, 10) { return -1 }; id := w.node_kind.len
     w.node_kind.push(kind); w.node_group.push(group); w.node_block.push(block); w.node_op.push(op)
@@ -81,7 +85,7 @@ fn root(w: &mut Workspace, value: i32) -> i32 {
 }
 fn graph(w: &mut Workspace, f: &mir.Function, exits: &terminals.TerminalContext) -> bool {
     blocks := f.block_starts.len; edges := f.edge_to.len
-    if !charge(&mut w, blocks * 3 + edges * 3 + f.kinds.len) { return false }
+    if !charge(&mut w, blocks * 3 + edges * 3 + f.order.len * 3 + f.kinds.len) { return false }
     for b in 0..blocks { w.reached.push(false); w.fill.push(0) }
     for op in 0..f.kinds.len { w.position.push(-1) }
     for pos in 0..f.order.len { w.position[f.order[pos]] = pos }
@@ -178,16 +182,61 @@ fn build(w: &mut Workspace, f: &mir.Function) -> bool {
 // local use is a block parameter or an earlier definition; only predecessor
 // edge arguments transfer values between blocks, including loop backedges.
 fn graph_valid(w: &mut Workspace, f: &mir.Function) -> bool {
-    if !charge(&mut w, w.node_kind.len * 2 + w.op_uses.len + w.op_defs.len + w.edge_args.len) { return false }
+    if !charge(&mut w, f.kinds.len * 8 + w.node_kind.len * 4 + w.op_uses.len * 4 + w.op_defs.len * 4 + w.edge_args.len * 2) { return false }
     for op in 0..f.kinds.len {
         if !w.reached[f.op_blocks[op]] { continue }; block := f.op_blocks[op]
+        var reads: i64 = 0; var writes: i64 = 0; var flags := 0; var frame_uses := 0
+        if f.modes[op] == 2 {
+            if w.op_use_count[op] != 0 || w.op_def_count[op] != 0 || w.frame_def_count[op] != 0 { return invalid(&mut w) }; continue
+        }
         for at in w.op_use_start[op]..w.op_use_start[op] + w.op_use_count[op] {
-            value := w.op_uses[at]
+            value := w.op_uses[at]; role := w.op_use_roles[at]
             if value < 0 || value >= w.node_kind.len || w.node_block[value] != block { return invalid(&mut w) }
             defined := w.node_op[value]; if defined >= 0 && w.position[defined] >= w.position[op] { return invalid(&mut w) }
+            if role >= 0 && role < 32 {
+                if reads.bit_and(bit(role)) != 0 { return invalid(&mut w) }; reads = reads.bit_or(bit(role))
+            } else if role == 32 {
+                if flags.bit_and(1) != 0 { return invalid(&mut w) }; flags = flags.bit_or(1)
+            } else {
+                if role != 33 + grouping.op_group(&w.cells, op) || w.load_value[op] != value || f.kinds[op] != 7 { return invalid(&mut w) }
+                frame_uses = frame_uses + 1
+            }
         }
         for at in w.op_def_start[op]..w.op_def_start[op] + w.op_def_count[op] {
-            value := w.op_defs[at]; if w.node_op[value] != op || w.node_block[value] != block || w.node_physical[value] != w.op_def_roles[at] { return invalid(&mut w) }
+            value := w.op_defs[at]; role := w.op_def_roles[at]
+            if w.node_op[value] != op || w.node_block[value] != block || w.node_physical[value] != role { return invalid(&mut w) }
+            if role >= 0 && role < 32 {
+                if writes.bit_and(bit(role)) != 0 { return invalid(&mut w) }; writes = writes.bit_or(bit(role))
+                var expected := 1; if f.clobbers[op].bit_and(bit(role)) != 0 { expected = 2 }
+                if f.kinds[op] == 7 && w.load_value[op] >= 0 && role == f.dst[op] { expected = 1 }
+                if w.op_def_kinds[at] != expected { return invalid(&mut w) }
+            } else if role == 32 {
+                if flags.bit_and(2) != 0 || w.op_def_kinds[at] != 1 { return invalid(&mut w) }; flags = flags.bit_or(2)
+            } else { return invalid(&mut w) }
+        }
+        if reads != f.reads[op].bit_and(4294967295) || writes != f.writes[op].bit_or(f.clobbers[op]).bit_and(4294967295) || flags != f.flags[op] { return invalid(&mut w) }
+        var expected := 0; if w.load_value[op] >= 0 { expected = 1 }; if frame_uses != expected { return invalid(&mut w) }
+    }
+    for value in 0..w.node_kind.len {
+        source := w.node_source[value]; kind := w.node_kind[value]
+        if kind != 6 && kind != 8 { if source != -1 { return invalid(&mut w) }; continue }
+        if source < 0 || source >= value { return invalid(&mut w) }
+        op := w.node_op[value]
+        if w.node_kind[source] != 9 {
+            if w.node_block[source] != w.node_block[value] { return invalid(&mut w) }
+            defined := w.node_op[source]; if defined >= 0 && w.position[defined] >= w.position[op] { return invalid(&mut w) }
+        }
+        if kind == 8 {
+            if w.node_group[source] != grouping.op_group(&w.cells, op) || source != w.load_value[op] { return invalid(&mut w) }
+        } else if source == w.zero {
+            if f.a[op] != -1 { return invalid(&mut w) }
+        } else {
+            var found := false
+            for at in w.op_use_start[op]..w.op_use_start[op] + w.op_use_count[op] {
+                if !charge(&mut w, 1) { return false }
+                if w.op_use_roles[at] == f.a[op] && w.op_uses[at] == source { found = true }
+            }
+            if !found { return invalid(&mut w) }
         }
     }
     for e in 0..f.edge_to.len {
@@ -254,7 +303,7 @@ fn set_bit(a: &mut []i64, base: i32, q: i32) { at := base + q / 64; a[at] = a[at
 fn has(a: &[]i64, base: i32, q: i32) -> bool { a[base + q / 64].bit_and(bit(q % 64)) != 0 }
 fn liveness(w: &mut Workspace, f: &mir.Function) -> bool {
     blocks := f.block_starts.len
-    if !product(&mut w, blocks, w.words, 4) || !charge(&mut w, w.words) { return false }
+    if !product(&mut w, blocks, w.words, 4) || !charge(&mut w, w.words + w.qnodes.len + f.order.len + w.frame_defs.len + blocks * 3) { return false }
     for i in 0..blocks * w.words { w.use.push(0); w.define.push(0); w.incoming.push(0); w.outgoing.push(0) }
     for i in 0..w.words { w.state_bits.push(0) }
     for q in 0..w.qnodes.len { if w.qop[q] < 0 { set_bit(&mut w.define, w.qblock[q] * w.words, q) } }
@@ -391,6 +440,45 @@ fn interference(w: &mut Workspace, f: &mir.Function) -> bool {
         w.group_home[best] = home; w.changed_cells = w.changed_cells + 1; w.register_cost[home] = 1
     }
     for r in 0..18 { if w.register_cost[r] != 0 { w.registers_used = w.registers_used + 1 } }
+    true
+}
+// Check the placement witness separately from greedy coloring. The two live
+// tables describe SSA values, while all fixed conflicts use the ORIGINAL
+// physical masks, including implicit scratch writes and ABI clobbers. A fresh
+// Store-bound value is materialized after that Store; every other live value
+// must survive its complete physical destruction mask. No spilling/SP change.
+fn allocation_valid(w: &mut Workspace, f: &mir.Function) -> bool {
+    if !product(&mut w, f.kinds.len, w.groups, 4) || !charge(&mut w, w.qnodes.len + f.kinds.len * 4) { return false }
+    for q in 0..w.qnodes.len {
+        g := w.qgroup[q]; kind := w.node_kind[w.qnodes[q]]
+        if w.group_home[g] >= 0 && kind != 2 && kind != 6 { return invalid(&mut w) }
+    }
+    for op in 0..f.kinds.len {
+        if !w.reached[f.op_blocks[op]] { continue }
+        after := live.live_after(&w.physical, op)
+        before := f.reads[op].bit_or(after.bit_and(f.writes[op].bit_or(f.clobbers[op]).bit_not()))
+        var occupied_before: i64 = 0; var occupied_after: i64 = 0
+        for g in 0..w.groups {
+            home := w.group_home[g]; if home < 0 { continue }; if home > 17 { return invalid(&mut w) }
+            mask := bit(home)
+            if w.live_before[op * w.groups + g] != 0 {
+                if before.bit_and(mask) != 0 || occupied_before.bit_and(mask) != 0 { return invalid(&mut w) }
+                occupied_before = occupied_before.bit_or(mask)
+            }
+            if w.live_after[op * w.groups + g] != 0 {
+                var fixed := after; value := w.store_value[op]
+                fresh := value >= 0 && w.node_group[value] == g && w.needed[value]
+                if !fresh { fixed = fixed.bit_or(f.writes[op]).bit_or(f.clobbers[op]) }
+                if fixed.bit_and(mask) != 0 || occupied_after.bit_and(mask) != 0 { return invalid(&mut w) }
+                occupied_after = occupied_after.bit_or(mask)
+            }
+        }
+        g := grouping.op_group(&w.cells, op)
+        if f.modes[op] != 2 && f.kinds[op] == 7 && f.dst[op] >= 0 && g >= 0 && w.group_home[g] >= 0 {
+            extra := f.writes[op].bit_or(f.clobbers[op]).bit_and(mir.variable_bit(f.dst[op]).bit_not())
+            if extra.bit_and(after) != 0 { return invalid(&mut w) }
+        }
+    }
     true
 }
 fn pure(w: &mut Workspace, kind: i32, destination: i32, source: i32, ty: i32) {
@@ -552,6 +640,7 @@ fn append_copy(w: &mut Workspace, f: &mut mir.Function, home: i32, source: i32, 
     w.assembled.push(op); w.moves = w.moves + 1; true
 }
 fn stage(w: &mut Workspace, f: &mut mir.Function) -> bool {
+    if !charge(&mut w, f.order.len * 2 + w.frame_defs.len) { return false }
     if !begin_edit(&mut w, &f) { return false }
     for pos in 0..w.saved_order.len {
         w.boundaries.push(w.assembled.len); op := w.saved_order[pos]
@@ -583,6 +672,18 @@ fn run(w: &mut Workspace, f: &mut mir.Function, context: &memory.Context, exits:
     reset(&mut w, limit); w.before_verified = f.verified; w.before_optimizable = f.optimizable
     if !f.valid || !f.verified || !terminals.valid(&exits) { return invalid(&mut w) }
     if limit < 0 || f.kinds.len > 65536 || f.block_starts.len > 16384 { w.code = -3; return false }
+    // No candidate means no transformation and no new certificate claim.
+    // The pipeline already verifies all functions. Raw callers also receive
+    // the exact unchanged input here; a stale certificate is never elevated.
+    // Avoid paying full SSA/verification work on straight-line scalar code.
+    if f.place_kinds.len == 0 { return false }
+    if f.place.len != f.kinds.len || f.dst.len != f.kinds.len || f.modes.len != f.kinds.len { return invalid(&mut w) }
+    if !charge(&mut w, f.kinds.len) { return false }; var candidate := false
+    for op in 0..f.kinds.len {
+        place := f.place[op]
+        if f.modes[op] != 2 && f.kinds[op] == 7 && f.dst[op] >= 0 && place >= 0 && place < f.place_kinds.len && f.place_kinds[place] == 1 { candidate = true }
+    }
+    if !candidate { return false }
     if !charge(&mut w, f.kinds.len * 100 + f.raw.len) { return false }
     if !verify.verify_into(&mut f, &mut w.verifier) { w.code = -1; rollback(&mut w, &mut f); return false }
     if !f.optimizable || f.unknown_control { w.code = -2; rollback(&mut w, &mut f); return false }
@@ -600,7 +701,7 @@ fn run(w: &mut Workspace, f: &mut mir.Function, context: &memory.Context, exits:
     if !build(&mut w, &f) || !graph_valid(&mut w, &f) || !simplify(&mut w, &f) || !demand(&mut w, &f) ||
         !liveness(&mut w, &f) || !interference(&mut w, &f) { rollback(&mut w, &mut f); return false }
     if w.changed_cells == 0 { return false }
-    if !prepare(&mut w, &f) || !stage(&mut w, &mut f) { rollback(&mut w, &mut f); return false }
+    if !allocation_valid(&mut w, &f) || !prepare(&mut w, &f) || !stage(&mut w, &mut f) { rollback(&mut w, &mut f); return false }
     if w.loads == 0 { w.code = 0; rollback(&mut w, &mut f); return false }
     w.code = 2; true
 }
