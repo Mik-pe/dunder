@@ -2,6 +2,7 @@
 capability unsafe
 import receipts
 import native_clock as monotonic
+import std.dl as dl
 
 @extern("c","fork") unsafe fn child_process() -> i32
 @extern("c","execv") unsafe fn execute(path: ptr, argv: ptr) -> i32
@@ -10,6 +11,97 @@ import native_clock as monotonic
 @extern("c","kill") unsafe fn signal_child(pid: i32, signal: i32) -> i32
 @extern("c","setpgid") unsafe fn process_group(pid: i32, group: i32) -> i32
 @extern("c","usleep") unsafe fn sleep_us(interval: u32) -> i32
+@extern("c","write") unsafe fn write_descriptor(fd: i32, bytes: ptr, count: usize) -> i64
+@extern("c","sigprocmask") unsafe fn block_signals(how: i32, set: ptr, old: ptr) -> i32
+
+// Stages observe failures; they do not retry or change the exit policy. A
+// child's ordinary 126 is still ChildExit, never evidence of a syscall failure.
+pub enum Stage { ChildExit, ArgvPath, ArgvArgument, StartClock, Fork, WaitProbe, Timeout, Signal, Internal }
+// Auxiliary errno fields retain the last observed failure, even if execution
+// later succeeds. Zero means no observed failure or unavailable errno access;
+// only stage/code classify the outcome. raw_wait_status is the actual wait slot,
+// not an invented exit status for failures before waitpid completed.
+pub struct Outcome {
+    code: i32, stage: Stage, os_error: i32, raw_wait_status: i32, pid: i32,
+    wait_error: i32, probe_error: i32, parent_group_error: i32, clock_error: i32,
+    group_kill_error: i32, fallback_kill_error: i32, sleep_error: i32
+}
+
+pub fn stage_name(stage: Stage) -> string {
+    if stage == .ChildExit { return "child_exit" }
+    if stage == .ArgvPath { return "argv_path" }
+    if stage == .ArgvArgument { return "argv_argument" }
+    if stage == .StartClock { return "start_clock" }
+    if stage == .Fork { return "fork" }
+    if stage == .WaitProbe { return "wait_probe" }
+    if stage == .Timeout { return "timeout" }
+    if stage == .Signal { return "signal" }
+    "internal"
+}
+
+// Resolve the calling thread's errno slot before starting the timeout or fork.
+// libc is a permanent dependency of these native executables; only its TLS
+// address survives closing the temporary dlopen(NULL) handle, not a callable.
+unsafe fn error_pointer(platform: i32) -> ptr {
+    var name := cstr("__errno_location")
+    if platform == 0 { name = cstr("__error") }
+    library := dl.open(ptr(0), 2)
+    if library == ptr(0) { return ptr(0) }
+    symbol := dl.symbol(library, name)
+    var answer := ptr(0)
+    if symbol != ptr(0) {
+        location: extern fn() -> ptr = ffi_fn(symbol)
+        answer = location()
+    }
+    closed := dl.close(library)
+    answer
+}
+unsafe fn last_error(location: ptr) -> i32 {
+    if location == ptr(0) { return 0 }
+    load_i32(location)
+}
+
+// These prefixes and the signal set are prepared in the parent. The child
+// failure path touches only raw bytes/scalars and calls async-signal-safe libc
+// sigprocmask/write/_exit: no managed values or loader/allocator operations.
+unsafe fn note_prefix(buffer: ptr, prefix: string) -> i32 {
+    var at := 0
+    for byte in prefix.bytes() {
+        store_u8(ptr(usize(buffer) + usize(at)), u8(byte)); at = at + 1
+    }
+    at
+}
+unsafe fn child_note(buffer: ptr, at: i32, error: i32, mask: ptr, platform: i32) {
+    var how := 0
+    if platform == 0 { how = 1 }
+    // A closed stderr pipe must not replace the original 126/127 with SIGPIPE.
+    // This mask is changed only after a pre-exec failure, immediately before
+    // _exit, and never reaches a successfully executed user program.
+    if block_signals(how, mask, ptr(0)) != 0 { return }
+    // The longest parent prefix is 47 bytes. An i32 needs at most 11 decimal
+    // bytes including its sign, plus a newline: at most 59 of the 128 bytes.
+    var cursor := at
+    var number := i64(error)
+    if number < 0 {
+        store_u8(ptr(usize(buffer) + usize(cursor)), 45); cursor = cursor + 1
+        number = -number
+    }
+    first := cursor
+    while true {
+        store_u8(ptr(usize(buffer) + usize(cursor)), u8(i64(48) + number % 10))
+        cursor = cursor + 1; number = number / 10
+        if number == 0 { break }
+    }
+    var left := first; var right := cursor - 1
+    while left < right {
+        byte := load_u8(ptr(usize(buffer) + usize(left)))
+        store_u8(ptr(usize(buffer) + usize(left)), load_u8(ptr(usize(buffer) + usize(right))))
+        store_u8(ptr(usize(buffer) + usize(right)), byte)
+        left = left + 1; right = right - 1
+    }
+    store_u8(ptr(usize(buffer) + usize(cursor)), 10)
+    written := write_descriptor(2, buffer, usize(cursor + 1))
+}
 
 // The platform is the compiler's host, including when it emits another target.
 // Return -1 on OS failure so instrumentation cannot fabricate a duration.
@@ -32,10 +124,18 @@ fn append_arg(bytes: &mut []u8, offsets: &mut []i32, arg: string) -> bool {
 }
 
 pub fn run(path: string, args: &[]string, timeout_ms: i64, platform: i32) -> i32 {
+    outcome := run_detailed(path, &args, timeout_ms, platform)
+    outcome.code
+}
+
+pub fn run_detailed(path: string, args: &[]string, timeout_ms: i64, platform: i32) -> Outcome {
+    var outcome := Outcome { code: 126, stage: .Internal, os_error: 0, raw_wait_status: 0, pid: 0,
+        wait_error: 0, probe_error: 0, parent_group_error: 0, clock_error: 0,
+        group_kill_error: 0, fallback_kill_error: 0, sleep_error: 0 }
     var bytes: []u8 = []
     var offsets: []i32 = []
-    if !append_arg(&mut bytes, &mut offsets, path) { return 126 }
-    for arg in args { if !append_arg(&mut bytes, &mut offsets, arg) { return 126 } }
+    if !append_arg(&mut bytes, &mut offsets, path) { outcome.stage = .ArgvPath; return outcome }
+    for arg in args { if !append_arg(&mut bytes, &mut offsets, arg) { outcome.stage = .ArgvArgument; return outcome } }
     unsafe {
         var argv: []ptr = []
         for offset in offsets { argv.push(addr(&bytes[offset])) }
@@ -44,20 +144,51 @@ pub fn run(path: string, args: &[]string, timeout_ms: i64, platform: i32) -> i32
         arguments := addr(&argv[0])
         var status := 0
         status_ptr := addr(&mut status)
+        location := error_pointer(platform)
+        var group_note: [u8; 128] = [0; 128]
+        var exec_note: [u8; 128] = [0; 128]
+        group_buffer := addr(&mut group_note[0]); exec_buffer := addr(&mut exec_note[0])
+        group_prefix := note_prefix(group_buffer, "dunder process child stage=child_setpgid errno=")
+        exec_prefix := note_prefix(exec_buffer, "dunder process child stage=execv errno=")
+        // libc sigset_t is 4 bytes on Darwin, 128 on supported Linux ABIs.
+        // SIGPIPE is 13 on all three hosts; all other mask bits remain zero.
+        var signal_set: [u64; 16] = [0; 16]
+        signal_set[0] = 4096
+        signal_mask := addr(&signal_set[0])
         var start: i64 = 0
-        if timeout_ms > 0 { start = milliseconds(platform); if start < 0 { return 126 } }
-        pid := child_process()
-        if pid < 0 { return 126 }
-        if pid == 0 {
-            if timeout_ms > 0 && process_group(0, 0) != 0 { exit_child(126); return 126 }
-            failed := execute(executable, arguments)
-            exit_child(127)
-            return 127
+        if timeout_ms > 0 {
+            start = milliseconds(platform)
+            // The clock wrappers return directly on failure, without another
+            // foreign call or managed cleanup between clock_gettime and here.
+            if start < 0 {
+                error := last_error(location)
+                outcome.os_error = error; outcome.clock_error = error; outcome.stage = .StartClock
+                return outcome
+            }
         }
+        pid := child_process()
+        if pid < 0 {
+            error := last_error(location)
+            outcome.os_error = error; outcome.stage = .Fork; outcome.pid = pid
+            return outcome
+        }
+        if pid == 0 {
+            if timeout_ms > 0 && process_group(0, 0) != 0 {
+                error := last_error(location)
+                child_note(group_buffer, group_prefix, error, signal_mask, platform)
+                exit_child(126)
+            }
+            failed := execute(executable, arguments)
+            error := last_error(location)
+            child_note(exec_buffer, exec_prefix, error, signal_mask, platform)
+            exit_child(127)
+        }
+        outcome.pid = pid
         var wait_flags := 0
         if timeout_ms > 0 {
             // Both sides establish the group, closing the race before exec.
             grouped := process_group(pid, pid)
+            if grouped != 0 { error := last_error(location); outcome.parent_group_error = error }
             wait_flags = 1
         }
         var timed_out := false
@@ -66,24 +197,47 @@ pub fn run(path: string, args: &[]string, timeout_ms: i64, platform: i32) -> i32
             if result == pid { break }
             if result < 0 {
                 // An interrupted wait can be retried while this child exists.
-                if signal_child(pid, 0) != 0 { return 126 }
+                error := last_error(location); outcome.wait_error = error
+                probed := signal_child(pid, 0)
+                if probed != 0 {
+                    probe_error := last_error(location); outcome.probe_error = probe_error
+                    outcome.os_error = outcome.wait_error; outcome.stage = .WaitProbe
+                    outcome.raw_wait_status = status
+                    return outcome
+                }
             }
             if wait_flags != 0 {
                 current := milliseconds(platform)
+                if current < 0 { error := last_error(location); outcome.clock_error = error }
                 if current < 0 || current - start >= timeout_ms {
                     killed := signal_child(-pid, 9)
-                    if killed != 0 { fallback := signal_child(pid, 9) }
+                    if killed != 0 {
+                        error := last_error(location); outcome.group_kill_error = error
+                        fallback := signal_child(pid, 9)
+                        if fallback != 0 { error := last_error(location); outcome.fallback_kill_error = error }
+                    }
                     timed_out = true
                     wait_flags = 0
-                } else { pause := sleep_us(250) }
+                } else { pause := sleep_us(250); if pause != 0 { error := last_error(location); outcome.sleep_error = error } }
             }
         }
-        if timed_out { return 124 }
+        outcome.raw_wait_status = status
+        if timed_out { outcome.code = 124; outcome.stage = .Timeout; outcome.os_error = outcome.clock_error; return outcome }
         signal := status.bit_and(127)
-        if signal != 0 { return 128 + signal }
-        return status.shr(8).bit_and(255)
+        if signal != 0 { outcome.code = 128 + signal; outcome.stage = .Signal; return outcome }
+        outcome.code = status.shr(8).bit_and(255); outcome.stage = .ChildExit
+        return outcome
     }
-    126
+    outcome
+}
+
+fn failure_details(outcome: &Outcome) -> string {
+    "stage=" + stage_name(outcome.stage) + " errno=" + outcome.os_error.str() +
+        " raw_wait_status=" + outcome.raw_wait_status.str() + " pid=" + outcome.pid.str() +
+        " wait_errno=" + outcome.wait_error.str() + " probe_errno=" + outcome.probe_error.str() +
+        " parent_setpgid_errno=" + outcome.parent_group_error.str() + " clock_errno=" + outcome.clock_error.str() +
+        " group_kill_errno=" + outcome.group_kill_error.str() + " fallback_kill_errno=" + outcome.fallback_kill_error.str() +
+        " sleep_errno=" + outcome.sleep_error.str()
 }
 
 pub fn tests(path: string, groups: &[]string, keys: &[]string, affected: bool, timeout_ms: i64, platform: i32) -> i32 {
@@ -95,10 +249,11 @@ pub fn tests(path: string, groups: &[]string, keys: &[]string, affected: bool, t
         if i < keys.len { key = keys[i] }
         if affected && receipts.seen(key) { skipped = skipped + 1; continue }
         args: []string = [i.str()]
-        result := run(path, &args, timeout_ms, platform)
+        outcome := run_detailed(path, &args, timeout_ms, platform)
+        result := outcome.code
         receipts.update(key, result == 0)
         if result == 0 { passed = passed + 1; print("PASS " + groups[i]) }
-        else { failed = failed + 1; print("FAIL " + groups[i] + " (exit " + result.str() + ")") }
+        else { failed = failed + 1; print("FAIL " + groups[i] + " (exit " + result.str() + ") " + failure_details(&outcome)) }
     }
     if affected { print(skipped.str() + " unaffected") }
     print(passed.str() + " passed, " + failed.str() + " failed")
