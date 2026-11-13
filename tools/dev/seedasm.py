@@ -29,7 +29,7 @@ def err(ln, msg):
 
 CONDS = {'eq': 0, 'ne': 1, 'cs': 2, 'cc': 3, 'mi': 4, 'pl': 5, 'vs': 6,
          'vc': 7, 'hi': 8, 'ls': 9, 'ge': 10, 'lt': 11, 'gt': 12, 'le': 13,
-         'al': 14, 'nv': 15}
+         'al': 14, 'nv': 15, 'hs': 2, 'lo': 3}
 SF = {'x': 1, 'w': 0}
 
 
@@ -642,7 +642,13 @@ def assemble(src):
                     text += u32(w)
                     pc += 4
             elif payload[3] == 'br':
-                t = payload[2][0]
+                mnem = payload[1]
+                if mnem in ('cbz', 'cbnz'):
+                    t = payload[2][1]
+                elif mnem in ('tbz', 'tbnz'):
+                    t = payload[2][2]
+                else:
+                    t = payload[2][0]
                 if t not in addrs:
                     err(ln, f'okänd hoppmål {t!r}')
                 text += u32(enc_branch_word(mn, ln, payload[2], addrs[t], pc))
@@ -684,7 +690,8 @@ def build_macho(text, const, data, bss_size, entry_off, ident, bss_off_in_seg):
     const_off = align(text_end, 16) if has_const else 0
     const_end = const_off + len(const) if has_const else text_end
     data_off = align(const_end, PAGE16K)
-    linkedit_off = data_off + len(data)
+    data_vmsize = align(len(data) + bss_off_in_seg + bss_size, PAGE16K)
+    linkedit_off = data_off + data_vmsize
     sig_off = linkedit_off
     nslots = (sig_off + 16383) // 16384
     ident_bytes = ident + b'\x00'

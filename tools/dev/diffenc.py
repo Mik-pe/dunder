@@ -102,6 +102,27 @@ CASES = [
     ('str x0, [sp, 32]', 'str x0, [sp, #32]'),
 ]
 
+BRANCHES = [
+    ('b.eq tgt', 'b.eq tgt'),
+    ('b.ne tgt', 'b.ne tgt'),
+    ('b.lt tgt', 'b.lt tgt'),
+    ('b.ge tgt', 'b.ge tgt'),
+    ('b.hi tgt', 'b.hi tgt'),
+    ('b.ls tgt', 'b.ls tgt'),
+    ('b.hs tgt', 'b.hs tgt'),
+    ('b.lo tgt', 'b.lo tgt'),
+    ('cbz x0, tgt', 'cbz x0, tgt'),
+    ('cbnz x0, tgt', 'cbnz x0, tgt'),
+    ('cbz w3, tgt', 'cbz w3, tgt'),
+    ('cbnz w5, tgt', 'cbnz w5, tgt'),
+    ('tbz x0, 3, tgt', 'tbz x0, 3, tgt'),
+    ('tbnz x0, 31, tgt', 'tbnz x0, 31, tgt'),
+    ('tbz w2, 0, tgt', 'tbz w2, 0, tgt'),
+    ('tbnz w7, 12, tgt', 'tbnz w7, 12, tgt'),
+    ('b tgt', 'b tgt'),
+    ('bl tgt', 'bl tgt'),
+]
+
 MULTI = [
     (['movz x0, #0x5678', 'movk x0, #0x1234, lsl #16'],
      'mov x0, #0x12345678'),
@@ -126,6 +147,15 @@ def main():
         for k, cl in enumerate(clang_lines):
             clang_src.append(f'm{j}_{k}: {cl}\n')
         seed_src.append(f'M{j}: {seed_syntax}')
+    for j, (cb, sb) in enumerate(BRANCHES):
+        clang_src.append(f'b{j}: {cb}\n')
+        clang_src.append('nop\n')
+        clang_src.append('nop\n')
+        seed_src.append(f'BR{j}: {sb}')
+        seed_src.append('nop')
+        seed_src.append('nop')
+    clang_src.append('tgt:\n')
+    seed_src.append('tgt:')
     seed_src.append('_start: mov x0, #0')
     seed_src.append('ret')
     open(f'{tmp}/ref.s', 'w').write('\n'.join(clang_src))
@@ -168,6 +198,19 @@ def main():
                 print(f'SKILLNAD(multi {j}.{k}): ref={ref_words[ri]:08x} seed={seed_words[ri]:08x}')
                 bad += 1
             ri += 1
+    for j, (cb, sb) in enumerate(BRANCHES):
+        if ref_words[ri] != seed_words[ri]:
+            print(f'SKILLNAD(branch {j} {sb!r}): ref={ref_words[ri]:08x} seed={seed_words[ri]:08x}')
+            bad += 1
+        ri += 1
+        if ref_words[ri] != seed_words[ri]:
+            print(f'SKILLNAD(branch filler1 {j}): ref={ref_words[ri]:08x} seed={seed_words[ri]:08x}')
+            bad += 1
+        ri += 1
+        if ref_words[ri] != seed_words[ri]:
+            print(f'SKILLNAD(branch filler2 {j}): ref={ref_words[ri]:08x} seed={seed_words[ri]:08x}')
+            bad += 1
+        ri += 1
     assert ri == len(ref_words), (ri, len(ref_words))
     print(f'{len(ref_words)} instruktionsord jämförda, {bad} skillnader')
     return 1 if bad else 0
