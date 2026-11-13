@@ -1,0 +1,370 @@
+// Conservative semantic parsing for the first function-local optimizer.
+// A refusal is not a diagnostic: the full language parser remains authoritative.
+import opt_ir as ir
+import lexer
+import std.parse as integers
+
+struct Parser {
+    ok: bool, cursor: i32, last: i32, depth: i32, scope: i32, loops: i32,
+    returned: bool, active: []i32, levels: []i32, heights: []i32,
+}
+fn is(t: &lexer.Tokens, at: i32, word: string) -> bool {
+    at >= 0 && at < t.kinds.len && t.kinds[at] != .String && t.kinds[at] != .Rune && t.texts[at] == word
+}
+fn eat(p: &mut Parser, t: &lexer.Tokens, word: string) -> bool {
+    if is(&t, p.cursor, word) { p.cursor = p.cursor + 1; return true }; false
+}
+fn expect(p: &mut Parser, t: &lexer.Tokens, word: string) {
+    if !eat(&mut p, &t, word) { p.ok = false }
+}
+fn lines(p: &mut Parser, t: &lexer.Tokens) {
+    while p.cursor <= p.last && t.kinds[p.cursor] == .Newline { p.cursor = p.cursor + 1 }
+}
+fn separators(p: &mut Parser, t: &lexer.Tokens) {
+    while p.cursor <= p.last && (t.kinds[p.cursor] == .Newline || is(&t, p.cursor, ";")) { p.cursor = p.cursor + 1 }
+}
+fn boundary(p: &Parser, t: &lexer.Tokens) -> bool {
+    p.cursor <= p.last && (t.kinds[p.cursor] == .Newline || is(&t, p.cursor, ";") || is(&t, p.cursor, "}"))
+}
+fn finish(p: &mut Parser, t: &lexer.Tokens) { if !boundary(&p, &t) { p.ok = false } }
+fn scalar(ty: i32) -> bool { ty >= 1 && ty <= 3 }
+fn numeric(ty: i32) -> bool { ty == 1 || ty == 2 }
+fn reserved(name: string) -> bool {
+    name == "print" || name == "assert" || name == "i32" || name == "i64" || name == "bool" || name == "string" || name == "len" || name == "f32" || name == "f64" || name == "rune" || name == "range" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "usize"
+}
+fn identifier(name: string) -> bool {
+    if name == "" || reserved(name) { return false }
+    for i in 0..name.len {
+        b := name[i]
+        letter := (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+        if !letter && !(i > 0 && b >= 48 && b <= 57) { return false }
+    }
+    true
+}
+fn lookup(p: &Parser, f: &ir.Function, name: string) -> i32 {
+    var i := p.active.len
+    while i > 0 { i = i - 1; id := p.active[i]; if f.local_names[id] == name { return id } }
+    -1
+}
+fn local(p: &mut Parser, f: &mut ir.Function, name: string, ty: i32, mutable: bool, parameter: i32, at: i32) -> i32 {
+    if !identifier(name) { p.ok = false; return -1 }
+    if f.local_names.len >= 256 { p.ok = false; f.budget_exhausted = true; return -1 }
+    for i in 0..p.active.len {
+        if p.levels[i] == p.scope && f.local_names[p.active[i]] == name { p.ok = false; return -1 }
+    }
+    id := f.local_names.len
+    f.local_names.push(name); f.local_types.push(ty); f.local_mutable.push(mutable)
+    f.local_param.push(parameter); f.local_at.push(at)
+    p.active.push(id); p.levels.push(p.scope); id
+}
+fn ty(f: &ir.Function, value: i32) -> i32 { if value < 0 { 0 } else { f.types[value] } }
+fn effects(f: &ir.Function, value: i32) -> i32 { if value < 0 { 0 } else { f.effects[value] } }
+fn node(p: &mut Parser, f: &mut ir.Function, kind: i32, value_type: i32, a: i32, b: i32, c: i32, value: i64, binding: i32, start: i32, effect: i32) -> i32 {
+    if !p.ok { return -1 }
+    if f.kinds.len >= 2048 { p.ok = false; f.budget_exhausted = true; return -1 }
+    var height := 1
+    if kind <= 6 {
+        if a >= 0 { height = p.heights[a] + 1 }
+        if b >= 0 && p.heights[b] + 1 > height { height = p.heights[b] + 1 }
+        if height > 64 { p.ok = false; f.budget_exhausted = true; return -1 }
+    }
+    id := f.kinds.len
+    f.kinds.push(kind); f.types.push(value_type); f.left.push(a); f.right.push(b)
+    f.third.push(c); f.next.push(-1); f.values.push(value); f.locals.push(binding)
+    f.starts.push(start); f.effects.push(effect); f.proofs.push(0); p.heights.push(height)
+    id
+}
+fn precedence(word: string) -> i32 {
+    if word == "||" { return 1 }; if word == "&&" { return 2 }
+    if word == "==" || word == "!=" { return 3 }
+    if word == "<" || word == "<=" || word == ">" || word == ">=" { return 4 }
+    if word == "+" || word == "-" { return 5 }
+    if word == "*" || word == "/" || word == "%" { return 6 }; 0
+}
+fn opcode(word: string) -> i32 {
+    if word == "+" { return 1 }; if word == "-" { return 2 }; if word == "*" { return 3 }
+    if word == "/" { return 4 }; if word == "%" { return 5 }; if word == "==" { return 6 }
+    if word == "!=" { return 7 }; if word == "<" { return 8 }; if word == "<=" { return 9 }
+    if word == ">" { return 10 }; if word == ">=" { return 11 }; if word == "&&" { return 12 }; 13
+}
+fn literal(p: &mut Parser, f: &mut ir.Function, text: string, expected: i32, at: i32) -> i32 {
+    value := integers.integer(text)
+    var actual := 1; if expected == 2 { actual = 2 }
+    if !value.ok || (actual == 1 && (value.value < -2147483648 || value.value > 2147483647)) { p.ok = false; return -1 }
+    node(&mut p, &mut f, 1, actual, -1, -1, -1, value.value, -1, at, 0)
+}
+fn primary(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, expected: i32) -> i32 {
+    if !p.ok || p.cursor >= p.last { p.ok = false; return -1 }
+    p.depth = p.depth + 1
+    if p.depth > 64 { p.ok = false; f.budget_exhausted = true; p.depth = p.depth - 1; return -1 }
+    result := primary_inner(&mut p, &mut f, &t, expected)
+    p.depth = p.depth - 1; result
+}
+fn primary_inner(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, expected: i32) -> i32 {
+    at := p.cursor
+    if eat(&mut p, &t, "-") {
+        if p.cursor < p.last && t.kinds[p.cursor] == .Integer {
+            spelling := "-" + t.texts[p.cursor]; p.cursor = p.cursor + 1
+            return literal(&mut p, &mut f, spelling, expected, at)
+        }
+        value := primary(&mut p, &mut f, &t, expected)
+        actual := ty(&f, value)
+        if !numeric(actual) { p.ok = false; return -1 }
+        return node(&mut p, &mut f, 4, actual, value, -1, -1, 1, -1, at, effects(&f, value).bit_or(1))
+    }
+    if eat(&mut p, &t, "!") {
+        value := primary(&mut p, &mut f, &t, 3)
+        if ty(&f, value) != 3 { p.ok = false; return -1 }
+        return node(&mut p, &mut f, 4, 3, value, -1, -1, 2, -1, at, effects(&f, value))
+    }
+    if eat(&mut p, &t, "(") {
+        value := expression(&mut p, &mut f, &t, 0, expected); expect(&mut p, &t, ")"); return value
+    }
+    if eat(&mut p, &t, "true") { return node(&mut p, &mut f, 1, 3, -1, -1, -1, 1, -1, at, 0) }
+    if eat(&mut p, &t, "false") { return node(&mut p, &mut f, 1, 3, -1, -1, -1, 0, -1, at, 0) }
+    if t.kinds[at] == .Integer {
+        p.cursor = p.cursor + 1; return literal(&mut p, &mut f, t.texts[at], expected, at)
+    }
+    if t.kinds[at] != .Name { p.ok = false; return -1 }
+    binding := lookup(&p, &f, t.texts[at]); p.cursor = p.cursor + 1
+    if binding < 0 { p.ok = false; return -1 }
+    actual := f.local_types[binding]
+    if actual == 20 {
+        if eat(&mut p, &t, ".") {
+            expect(&mut p, &t, "len")
+            return node(&mut p, &mut f, 5, 1, -1, -1, -1, 0, binding, at, 2)
+        }
+        if eat(&mut p, &t, "[") {
+            index := expression(&mut p, &mut f, &t, 0, 1); expect(&mut p, &t, "]")
+            if ty(&f, index) != 1 { p.ok = false; return -1 }
+            return node(&mut p, &mut f, 6, 2, index, -1, -1, 0, binding, at, effects(&f, index).bit_or(3))
+        }
+        p.ok = false; return -1
+    }
+    node(&mut p, &mut f, 2, actual, -1, -1, -1, 0, binding, at, 0)
+}
+fn expression(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, minimum: i32, expected: i32) -> i32 {
+    var left := primary(&mut p, &mut f, &t, expected)
+    while p.ok && p.cursor < p.last {
+        word := t.texts[p.cursor]; priority := precedence(word)
+        if priority == 0 || priority < minimum { break }
+        at := p.cursor; p.cursor = p.cursor + 1; lines(&mut p, &t)
+        actual := ty(&f, left)
+        right := expression(&mut p, &mut f, &t, priority + 1, actual)
+        if !p.ok { return -1 }
+        op := opcode(word)
+        if ty(&f, right) != actual { p.ok = false; return -1 }
+        var result := actual; var effect := effects(&f, left).bit_or(effects(&f, right))
+        if op <= 5 {
+            if !numeric(actual) { p.ok = false; return -1 }; effect = effect.bit_or(1)
+        } else if op <= 11 {
+            if !numeric(actual) && !(actual == 3 && op <= 7) { p.ok = false; return -1 }; result = 3
+        } else { if actual != 3 { p.ok = false; return -1 }; result = 3 }
+        left = node(&mut p, &mut f, 3, result, left, right, -1, i64(op), -1, at, effect)
+    }
+    left
+}
+fn type_name(p: &mut Parser, t: &lexer.Tokens) -> i32 {
+    if eat(&mut p, &t, "i32") { return 1 }; if eat(&mut p, &t, "i64") { return 2 }
+    if eat(&mut p, &t, "bool") { return 3 }; p.ok = false; 0
+}
+fn conditional(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, at: i32) -> i32 {
+    p.depth = p.depth + 1
+    if p.depth > 64 { p.ok = false; f.budget_exhausted = true; p.depth = p.depth - 1; return -1 }
+    result := conditional_inner(&mut p, &mut f, &t, at)
+    p.depth = p.depth - 1; result
+}
+fn conditional_inner(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, at: i32) -> i32 {
+    condition := expression(&mut p, &mut f, &t, 0, 3)
+    if ty(&f, condition) != 3 { p.ok = false; return -1 }
+    yes := block(&mut p, &mut f, &t, true, false); yes_returns := p.returned
+    lines(&mut p, &t)
+    var no := -1; var no_returns := false
+    if eat(&mut p, &t, "else") {
+        if eat(&mut p, &t, "if") {
+            nested := conditional(&mut p, &mut f, &t, p.cursor - 1); no_returns = p.returned
+            no = node(&mut p, &mut f, 10, 0, nested, -1, -1, 0, -1, at, effects(&f, nested))
+        } else { no = block(&mut p, &mut f, &t, true, false); no_returns = p.returned }
+    }
+    p.returned = yes_returns && no_returns
+    effect := effects(&f, condition).bit_or(effects(&f, yes)).bit_or(effects(&f, no)).bit_or(8)
+    node(&mut p, &mut f, 13, 0, condition, yes, no, 0, -1, at, effect)
+}
+fn statement(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, tail: bool) -> i32 {
+    p.returned = false
+    at := p.cursor
+    if eat(&mut p, &t, "if") { return conditional(&mut p, &mut f, &t, at) }
+    if eat(&mut p, &t, "while") {
+        condition := expression(&mut p, &mut f, &t, 0, 3)
+        if ty(&f, condition) != 3 { p.ok = false; return -1 }
+        p.loops = p.loops + 1; body := block(&mut p, &mut f, &t, true, false); p.loops = p.loops - 1
+        p.returned = false
+        return node(&mut p, &mut f, 14, 0, condition, body, -1, 0, -1, at, effects(&f, condition).bit_or(effects(&f, body)).bit_or(8))
+    }
+    if eat(&mut p, &t, "return") {
+        var value := -1
+        if !boundary(&p, &t) { value = expression(&mut p, &mut f, &t, 0, f.ret) }
+        if ty(&f, value) != f.ret { p.ok = false; return -1 }
+        finish(&mut p, &t); p.returned = true
+        return node(&mut p, &mut f, 15, 0, value, -1, -1, 0, -1, at, effects(&f, value).bit_or(8))
+    }
+    if is(&t, at, "break") || is(&t, at, "continue") {
+        if p.loops == 0 { p.ok = false; return -1 }
+        var kind := 16; if is(&t, at, "continue") { kind = 17 }
+        p.cursor = p.cursor + 1; finish(&mut p, &t)
+        return node(&mut p, &mut f, kind, 0, -1, -1, -1, 0, -1, at, 8)
+    }
+    if is(&t, at, "{") { return block(&mut p, &mut f, &t, true, false) }
+    mutable := eat(&mut p, &t, "var")
+    name_at := p.cursor
+    if p.cursor < p.last && t.kinds[p.cursor] == .Name && (is(&t, p.cursor + 1, ":=") || is(&t, p.cursor + 1, ":")) {
+        name := t.texts[p.cursor]; p.cursor = p.cursor + 1
+        var expected := 0
+        if eat(&mut p, &t, ":") { expected = type_name(&mut p, &t); expect(&mut p, &t, "=") } else { expect(&mut p, &t, ":=") }
+        value := expression(&mut p, &mut f, &t, 0, expected); actual := ty(&f, value)
+        if !scalar(actual) || (expected != 0 && expected != actual) { p.ok = false; return -1 }
+        binding := local(&mut p, &mut f, name, actual, mutable, -1, name_at)
+        finish(&mut p, &t)
+        return node(&mut p, &mut f, 11, 0, value, -1, -1, 0, binding, at, effects(&f, value).bit_or(4))
+    }
+    if mutable { p.ok = false; return -1 }
+    if p.cursor < p.last && t.kinds[p.cursor] == .Name && is(&t, p.cursor + 1, "=") {
+        binding := lookup(&p, &f, t.texts[p.cursor]); p.cursor = p.cursor + 2
+        if binding < 0 { p.ok = false; return -1 }
+        actual := f.local_types[binding]
+        if !f.local_mutable[binding] || !scalar(actual) { p.ok = false; return -1 }
+        value := expression(&mut p, &mut f, &t, 0, actual)
+        if ty(&f, value) != actual { p.ok = false; return -1 }
+        finish(&mut p, &t)
+        return node(&mut p, &mut f, 12, 0, value, -1, -1, 0, binding, at, effects(&f, value).bit_or(4))
+    }
+    value := expression(&mut p, &mut f, &t, 0, f.ret)
+    var end := p.cursor
+    while end <= p.last && t.kinds[end] == .Newline { end = end + 1 }
+    if !tail || f.ret == 0 || ty(&f, value) != f.ret || !is(&t, end, "}") { p.ok = false; return -1 }
+    p.returned = true
+    node(&mut p, &mut f, 15, 0, value, -1, -1, 0, -1, at, effects(&f, value).bit_or(8))
+}
+fn block(p: &mut Parser, f: &mut ir.Function, t: &lexer.Tokens, nested: bool, tail: bool) -> i32 {
+    if !p.ok { return -1 }
+    p.depth = p.depth + 1
+    if p.depth > 64 { p.ok = false; f.budget_exhausted = true; p.depth = p.depth - 1; return -1 }
+    at := p.cursor; expect(&mut p, &t, "{")
+    id := node(&mut p, &mut f, 10, 0, -1, -1, -1, 0, -1, at, 0)
+    saved := p.active.len
+    if nested { p.scope = p.scope + 1 }
+    separators(&mut p, &t)
+    var previous := -1; var returns := false
+    while p.ok && p.cursor < p.last && !is(&t, p.cursor, "}") {
+        item := statement(&mut p, &mut f, &t, tail)
+        if !p.ok { break }
+        returns = returns || p.returned
+        if previous < 0 { f.left[id] = item } else { f.next[previous] = item }
+        previous = item; f.effects[id] = f.effects[id].bit_or(f.effects[item])
+        separators(&mut p, &t)
+    }
+    expect(&mut p, &t, "}")
+    while p.active.len > saved { removed := p.active.pop(); level := p.levels.pop() }
+    if nested { p.scope = p.scope - 1 }
+    p.returned = returns; p.depth = p.depth - 1; id
+}
+
+pub fn parse(f: &mut ir.Function, t: &lexer.Tokens, first: i32, last: i32,
+    param_names: &[]string, param_types: &[]i32, param_tokens: &[]i32, ret: i32) -> bool {
+    ir.reset(&mut f)
+    if !t.ok || first < 0 || last <= first || last >= t.kinds.len || !is(&t, first, "{") || !is(&t, last, "}") { return false }
+    if last - first > 4096 { f.budget_exhausted = true; return false }
+    if ret != 0 && !scalar(ret) { return false }
+    if param_names.len > 8 || param_names.len != param_types.len || param_names.len != param_tokens.len { return false }
+    var p := Parser { ok: true, cursor: first, last: last, depth: 0, scope: 0, loops: 0,
+        returned: false, active: [], levels: [], heights: [] }
+    f.ret = ret; f.params = param_names.len
+    for i in 0..param_names.len {
+        actual := param_types[i]; token := param_tokens[i]
+        if (!scalar(actual) && actual != 20) || token < 0 || token >= t.kinds.len || t.kinds[token] != .Name || t.texts[token] != param_names[i] { return false }
+        binding := local(&mut p, &mut f, param_names[i], actual, false, i, token)
+        if !p.ok { return false }
+    }
+    root := block(&mut p, &mut f, &t, false, true)
+    if !p.ok || p.cursor != last + 1 || (ret != 0 && !p.returned) { return false }
+    f.root = root; f.supported = true; true
+}
+
+fn body(f: &mut ir.Function, source: string, ret: i32) -> bool {
+    tokens := lexer.scan(source, false)
+    names: []string = []; types: []i32 = []; positions: []i32 = []
+    parse(&mut f, &tokens, 0, tokens.kinds.len - 2, &names, &types, &positions, ret)
+}
+@test fn scalar_parser_checks_semantics_before_building_an_optimizable_model() {
+    var f := ir.new()
+    body(&mut f, "{var n:i64=0;var i:=0;while i<4{n=n+1;i=i+1};n}", 2)
+    f.supported
+    f.kinds[f.root] == 10
+    f.local_names.len == 2
+    f.local_mutable[0]
+    f.local_types[0] == 2
+    body(&mut f, "{var n:=1;if true{n=2}else{n=3};return n}", 1)
+    body(&mut f, "{if true{return 1}else{return 2}}", 1)
+    body(&mut f, "{var n:=1;{n:=2;var other:=n;other=3};n}", 1)
+    body(&mut f, "{var n:=0;while n<4{n=n+1;if n==2{continue};if n==3{break}};n}", 1)
+    body(&mut f, "{return -9223372036854775808}", 2)
+    body(&mut f, "{-2147483648}", 1)
+    body(&mut f, "{!false && (1<2 || false)}", 3)
+    body(&mut f, "{return}", 0)
+    body(&mut f, "{}", 0)
+    f.params == 0
+    f.local_names.len == 0
+    f.kinds.len == 1
+    !f.budget_exhausted
+    f.visits == 0
+    f.rewrites == 0
+}
+@test fn scalar_parser_refuses_invalid_and_unsupported_bodies_including_dead_code() {
+    var f := ir.new()
+    for source in ["{value:=1;value=2;value}", "{var value:=1;var value:=2;value}", "{var i32:=1;i32}", "{var hälsa:=1;hälsa}", "{{value:=1};value}", "{var value:=true;value=2;1}", "{if 1{return 1}else{return 2}}", "{if false{missing=1};1}", "{if false{var x:u8=256};1}", "{if false{value:=1;value=2};1}", "{break;1}", "{continue;1}", "{if true{return 1}}", "{while true{return 1}}", "{return}", "{2147483648}", "{9223372036854775808}", "{true<false}", "{true+false}", "{1&&2}", "{return unknown()}", "{var a:[]i64=[];1}", "{unsafe{var value:=1};1}", "{1;}"] {
+        !body(&mut f, source, 1)
+        !f.supported
+        f.root == -1
+    }
+}
+@test fn scalar_parser_models_shared_array_reads_and_preserves_parameter_scope() {
+    var f := ir.new()
+    source := "values {var result:i64=0;var i:=0;while i<values.len{result=result+values[i];i=i+1};result}"
+    tokens := lexer.scan(source, false)
+    names: []string = ["values"]; types: []i32 = [20]; positions: []i32 = [0]
+    parse(&mut f, &tokens, 1, tokens.kinds.len - 2, &names, &types, &positions, 2)
+    f.params == 1
+    f.local_param[0] == 0
+    f.local_types[0] == 20
+    !f.local_mutable[0]
+    var lengths := 0; var indices := 0
+    for i in 0..f.kinds.len {
+        if f.kinds[i] == 5 { lengths=lengths+1; f.types[i]==1; f.locals[i]==0 }
+        if f.kinds[i] == 6 { indices=indices+1; f.types[i]==2; f.locals[i]==0; f.effects[i].bit_and(3)==3 }
+    }
+    lengths == 1
+    indices == 1
+    for source in ["values {copy:=values;0}", "values {var values:=1;0}", "values {values=1;0}", "values {values[0]=1;0}", "values {values[2147483648]}", "values {values[true]}", "values {if false{copy:=values};0}"] {
+        input := lexer.scan(source, false)
+        !parse(&mut f, &input, 1, input.kinds.len - 2, &names, &types, &positions, 2)
+    }
+    duplicate := lexer.scan("same same {0}", false)
+    duplicate_names: []string = ["same", "same"]; duplicate_types: []i32 = [1, 1]; duplicate_positions: []i32 = [0, 1]
+    !parse(&mut f, &duplicate, 2, duplicate.kinds.len - 2, &duplicate_names, &duplicate_types, &duplicate_positions, 1)
+}
+@test fn scalar_parser_has_deterministic_function_and_expression_budgets() {
+    var f := ir.new()
+    var source := "{"
+    for i in 0..65 { source=source+"1+" }
+    source=source+"1}"
+    !body(&mut f, source, 1)
+    f.budget_exhausted
+    body(&mut f, "{42}", 1)
+    !f.budget_exhausted
+    f.kinds.len == 3
+    var wide := "{"
+    for i in 0..260 { wide=wide+"v"+i.str()+":=0;" }
+    wide=wide+"0}"
+    !body(&mut f, wide, 1)
+    f.budget_exhausted
+}
