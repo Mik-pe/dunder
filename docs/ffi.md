@@ -162,9 +162,13 @@ håller ingen öppen filbeskrivare. Modulen som tar emot ett handtag kan
 delegera det vidare.
 
 Modulhuvudet styr direkta unsafe-operationer samt deklarationer märkta
-`@requires(filesystem)` eller `@requires(network)`. Flera kapabiliteter anges
-kommaseparerat i samma modulhuvud, t.ex. `capability network, filesystem`.
+`@requires(filesystem)`, `@requires(network)` eller `@requires(process)`. Flera
+kapabiliteter anges kommaseparerat i samma modulhuvud, t.ex.
+`capability process, network, filesystem`.
 `std.fs.grant_dir(path)` och `fs.resolve_read(&dir, rel_path)` avgränsar
-relativ läsning till en vald rotkatalog utan `..`-flykt, och `std.net.listen` /
-`std.net.connect` kräver `capability network`. Importer av äldre `sys` ger fortfarande
-processens OS-åtkomst. Bedöm hela importkedjan för kod som ska köra obetrodda program.
+relativ läsning till en vald rotkatalog utan `..`-flykt, `std.net.listen` /
+`std.net.connect` kräver `capability network`, och `std.process.run` /
+`exec` / `spawn` / `grant` kräver `capability process` (där `Executable`
+delegerar rätten att köra ett specifikt program till oprivilegierade moduler).
+Importer av äldre `sys` ger fortfarande processens OS-åtkomst. Bedöm hela
+importkedjan för kod som ska köra obetrodda program.

@@ -307,7 +307,7 @@ en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" test tests/suite.ddr
-python3 tools/test-diagnostics.py "$dunder_bin"
+"$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin"
 node tools/test-wasm.mjs "$dunder_bin"
 node tools/test-wasm-abi.mjs "$dunder_bin"

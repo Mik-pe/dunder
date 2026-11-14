@@ -1,0 +1,172 @@
+capability process, filesystem
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import std.text as text
+import sys
+
+fn escape_ddr_string(s: string) -> string {
+    var out: []u8 = []
+    out.reserve(s.len + 8)
+    for b in s.bytes() {
+        if b == 92 {
+            out.push(b'\\')
+            out.push(b'\\')
+        } else if b == 34 {
+            out.push(b'\\')
+            out.push(b'"')
+        } else {
+            out.push(u8(b))
+        }
+    }
+    bytes.decode(&out).value
+}
+
+fn replace_all(s: string, needle: string, replacement: string) -> string {
+    parts := text.split(s, needle)
+    var out: []u8 = []
+    out.reserve(s.len + 64)
+    for i in 0..parts.len {
+        if i > 0 {
+            bytes.append_utf8(&mut out, replacement)
+        }
+        bytes.append_utf8(&mut out, parts[i])
+    }
+    bytes.decode(&out).value
+}
+
+fn invalid_sources() -> []string {
+    var out: []string = []
+    unsafe_hdr := "capability unsafe\n"
+    external := "@extern(\"c\",\"abs\") unsafe fn external(x:i32)->i32\n"
+    decls: []string = [external, "unsafe fn external(x:i32)->i32{x}\n"]
+    for decl in decls {
+        out.push(unsafe_hdr + decl + "fn main()->i32{f:=external;f(7)}")
+        out.push(unsafe_hdr + decl + "fn main(){f:fn(i32)->i32=external}")
+    }
+    out.push(external + "fn main(){}")
+    out.push("fn main(){unsafe{p:=ptr(0)}}")
+    out.push(unsafe_hdr + "fn main(){p:=ptr(0)}")
+    out.push(unsafe_hdr + "fn main(){unsafe{p:=ptr(0)};q:=ptr(1)}")
+    out.push(unsafe_hdr + "@extern(\"c\",\"f\") fn f()\nfn main(){}")
+
+    fields: []string = ["string", "[]u8", "[u8;0]", "fn(i32)->i32", "Normal"]
+    for field in fields {
+        out.push("struct Normal{v:i32}\n@c_layout struct Bad{f:" + field + "}\nfn main(){}")
+    }
+
+    parameters: []string = ["string", "[]u8", "&i32", "fn(i32)->i32", "Record"]
+    for parameter in parameters {
+        out.push(unsafe_hdr + "@c_layout struct Record{a:i32}\n" +
+                 "@extern(\"c\",\"bad\") unsafe fn foreign(x:" + parameter + ")\nfn main(){}")
+    }
+
+    out.push(unsafe_hdr + "fn main(){unsafe{p:=cstr(\"zero\\0byte\")}}")
+    out.push(unsafe_hdr + "@extern(\"\",\"symbol\") unsafe fn f()\nfn main(){}")
+    out.push(unsafe_hdr + "@extern(\"c\",\"\") unsafe fn f()\nfn main(){}")
+    out.push("fn main(){small:u8=256}")
+    out.push("fn main(){small:u8=-1}")
+    out
+}
+
+fn run_all(cli: &harness.BaseCli, directory: string, out_rejected: &mut i32) -> bool {
+    fixtures := cli.root + "/tests/fixtures/ffi"
+    mac := process.host_os() == "macos"
+    var library := directory + "/probe.so"
+    var shared_flag := "-shared"
+    if mac {
+        library = directory + "/probe.dylib"
+        shared_flag = "-dynamiclib"
+    }
+
+    var res := harness.empty_output()
+    if !harness.run_checked(cli.cc, ["-std=c11", "-Werror", "-pthread", "-fPIC", shared_flag, fixtures + "/oracle.c", "-o", library], directory, 0, false, &mut res) {
+        return false
+    }
+
+    source := directory + "/input.ddr"
+    executable := directory + "/program"
+    tmpl := sys.read_text(fixtures + "/native.ddr.in")
+    if !tmpl.ok {
+        return harness.fail("could not read native.ddr.in")
+    }
+    libname := escape_ddr_string(library)
+    if !sys.write_text(source, replace_all(tmpl.value, "@LIB@", libname)).ok {
+        return harness.fail("write_text failed on " + source)
+    }
+
+    if !harness.run_checked(cli.compiler, ["build", source, "-o", executable], directory, 0, true, &mut res) {
+        return false
+    }
+    if !harness.run_checked(executable, [], directory, 0, true, &mut res) {
+        return false
+    }
+    if process.stdout_text(&res) != "native ABI ok\n" {
+        return harness.fail("native ABI probe did not finish: " + process.stdout_text(&res))
+    }
+
+    worker_src := "capability unsafe\n" +
+                  "@extern(\"" + libname + "\", \"on_worker\") unsafe fn on_worker(f:extern fn())\n" +
+                  "fn noop() {}\n" +
+                  "fn main() { unsafe { on_worker(callback(noop)) } }\n"
+    if !sys.write_text(source, worker_src).ok {
+        return harness.fail("write_text failed on worker probe")
+    }
+    if !harness.run_checked(cli.compiler, ["build", source, "-o", executable], directory, 0, true, &mut res) {
+        return false
+    }
+    if !harness.run_checked(executable, [], directory, 111, true, &mut res) {
+        return false
+    }
+
+    rejected := invalid_sources()
+    for index in 0..rejected.len {
+        if !sys.write_text(source, rejected[index]).ok {
+            return harness.fail("write_text failed on invalid case #" + index.str())
+        }
+        if !harness.run_checked(cli.compiler, ["check", source], directory, 1, true, &mut res) {
+            return false
+        }
+        if text.find(process.stderr_text(&res), "error[") < 0 {
+            return harness.fail("missing source diagnostic #" + index.str() + ": " + process.stderr_text(&res))
+        }
+    }
+
+    if !sys.write_text(source, "fn main(){limit:u64=18446744073709551615;wide:usize=4294967296}").ok {
+        return harness.fail("write_text failed on usize probe")
+    }
+    if !harness.run_checked(cli.compiler, ["check", source], directory, 0, true, &mut res) {
+        return false
+    }
+    if !harness.run_checked(cli.compiler, ["check", source, "--target", "wasm32"], directory, 1, true, &mut res) {
+        return false
+    }
+
+    out_rejected = rejected.len + 1
+    true
+}
+
+pub fn run_suite(cli: &harness.BaseCli) -> bool {
+    if cli.extra_args.len > 0 {
+        return harness.fail("unexpected argument: " + cli.extra_args[0])
+    }
+    tmp := fs.temp_dir("dunder-ffi-")
+    if !tmp.ok {
+        return harness.fail("temp_dir failed")
+    }
+    var count := 0
+    ok := run_all(&cli, tmp.value, &mut count)
+    _ := fs.remove_all(tmp.value)
+    if !ok { return false }
+    print("native layout, mixed C args, HFA, reentrant callbacks and worker rejection passed; " + count.str() + " invalid programs rejected")
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if !run_suite(&cli) { return 1 }
+    0
+}

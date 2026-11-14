@@ -1,0 +1,692 @@
+// Zero-DOM streaming JSON writer and flat span-tape RFC 8259 parser.
+// Parsing records compact parallel arrays of byte spans into the input buffer
+// with zero hashmap allocations and zero string unescaping until a field is read.
+import std.bytes as bytes
+import std.parse as parse
+import sys
+
+pub enum Kind {
+    Invalid = 0,
+    Null = 1,
+    Bool = 2,
+    Number = 3,
+    String = 4,
+    Array = 5,
+    Object = 6,
+}
+
+pub struct Doc {
+    ok: bool,
+    error: string,
+    offset: i32,
+    root: i32,
+    input: []u8,
+    kinds: []u8,
+    starts: []i32,    // byte start in input (for String: after opening quote)
+    ends: []i32,      // byte end in input (for String: before closing quote)
+    escaped: []bool,  // true only when a String span contains '\'
+    first_child: []i32,
+    next_sibling: []i32,
+    key_starts: []i32,
+    key_ends: []i32,
+    key_escaped: []bool,
+    counts: []i32,
+}
+
+pub struct BoolField { ok: bool, value: bool }
+pub struct IntField { ok: bool, value: i64 }
+pub struct UintField { ok: bool, value: u64 }
+pub struct StrField { ok: bool, value: string }
+
+// --- Direct-to-buffer JSON Writer (zero intermediate string concatenations) ---
+
+pub fn write_str(out: &mut []u8, value: string) {
+    hex := "0123456789abcdef"
+    out.reserve(out.len + value.len + 2)
+    out.push(b'"')
+    for b in value.bytes() {
+        if b == 34 { out.push(b'\\'); out.push(b'"') }
+        else if b == 92 { out.push(b'\\'); out.push(b'\\') }
+        else if b == 8 { out.push(b'\\'); out.push(b'b') }
+        else if b == 12 { out.push(b'\\'); out.push(b'f') }
+        else if b == 10 { out.push(b'\\'); out.push(b'n') }
+        else if b == 13 { out.push(b'\\'); out.push(b'r') }
+        else if b == 9 { out.push(b'\\'); out.push(b't') }
+        else if b < 32 {
+            bytes.append_utf8(&mut out, "\\u00")
+            out.push(u8(hex[b / 16]))
+            out.push(u8(hex[b % 16]))
+        } else {
+            out.push(u8(b))
+        }
+    }
+    out.push(b'"')
+}
+
+pub fn quote(value: string) -> string {
+    var out: []u8 = []
+    write_str(&mut out, value)
+    bytes.decode(&out).value
+}
+
+pub fn write_i64(out: &mut []u8, value: i64) { bytes.append_decimal(&mut out, value) }
+
+pub fn write_u64(out: &mut []u8, value: u64) {
+    if value == 0 { out.push(b'0'); return }
+    start := out.len
+    var v := value
+    while v > 0 {
+        d := i32(v % 10)
+        out.push(u8(48 + d))
+        v /= 10
+    }
+    var left := start
+    var right := out.len - 1
+    while left < right {
+        tmp := out[left]; out[left] = out[right]; out[right] = tmp
+        left += 1; right -= 1
+    }
+}
+
+pub fn write_bool(out: &mut []u8, value: bool) {
+    if value { bytes.append_utf8(&mut out, "true") }
+    else { bytes.append_utf8(&mut out, "false") }
+}
+
+pub fn write_null(out: &mut []u8) { bytes.append_utf8(&mut out, "null") }
+
+fn sep_key(out: &mut []u8, first: &mut bool, key: string) {
+    if !first { out.push(b',') }
+    first = false
+    write_str(&mut out, key)
+    out.push(b':')
+}
+
+pub fn sep_elem(out: &mut []u8, first: &mut bool) {
+    if !first { out.push(b',') }
+    first = false
+}
+
+pub fn begin_obj(out: &mut []u8) -> bool { out.push(b'{'); true }
+pub fn end_obj(out: &mut []u8) { out.push(b'}') }
+pub fn begin_arr(out: &mut []u8) -> bool { out.push(b'['); true }
+pub fn end_arr(out: &mut []u8) { out.push(b']') }
+
+pub fn field_str(out: &mut []u8, first: &mut bool, key: string, value: string) {
+    sep_key(&mut out, &mut first, key); write_str(&mut out, value)
+}
+pub fn field_i64(out: &mut []u8, first: &mut bool, key: string, value: i64) {
+    sep_key(&mut out, &mut first, key); write_i64(&mut out, value)
+}
+pub fn field_i32(out: &mut []u8, first: &mut bool, key: string, value: i32) {
+    sep_key(&mut out, &mut first, key); write_i64(&mut out, i64(value))
+}
+pub fn field_u64(out: &mut []u8, first: &mut bool, key: string, value: u64) {
+    sep_key(&mut out, &mut first, key); write_u64(&mut out, value)
+}
+pub fn field_bool(out: &mut []u8, first: &mut bool, key: string, value: bool) {
+    sep_key(&mut out, &mut first, key); write_bool(&mut out, value)
+}
+pub fn field_null(out: &mut []u8, first: &mut bool, key: string) {
+    sep_key(&mut out, &mut first, key); write_null(&mut out)
+}
+pub fn begin_field_obj(out: &mut []u8, first: &mut bool, key: string) -> bool {
+    sep_key(&mut out, &mut first, key); begin_obj(&mut out)
+}
+pub fn begin_field_arr(out: &mut []u8, first: &mut bool, key: string) -> bool {
+    sep_key(&mut out, &mut first, key); begin_arr(&mut out)
+}
+
+pub fn finish_text(out: &[]u8) -> string { bytes.decode(&out).value }
+
+// --- Flat Span-Tape Parser ---
+
+struct Parser {
+    pos: i32,
+    depth: i32,
+}
+
+fn is_ws(b: u8) -> bool {
+    b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
+}
+
+fn skip_ws(input: &[]u8, p: &mut Parser) {
+    while p.pos < input.len && is_ws(input[p.pos]) {
+        p.pos += 1
+    }
+}
+
+fn fail_doc(doc: &mut Doc, at: i32, msg: string) {
+    if doc.ok {
+        doc.ok = false
+        doc.offset = at
+        doc.error = msg
+    }
+}
+
+fn hex_val(b: u8) -> i32 {
+    if b >= b'0' && b <= b'9' { return i32(b - b'0') }
+    if b >= b'a' && b <= b'f' { return i32(b - b'a') + 10 }
+    if b >= b'A' && b <= b'F' { return i32(b - b'A') + 10 }
+    -1
+}
+
+fn alloc_node(doc: &mut Doc, kind: u8, start: i32, end: i32, esc: bool) -> i32 {
+    id := doc.kinds.len
+    doc.kinds.push(kind)
+    doc.starts.push(start)
+    doc.ends.push(end)
+    doc.escaped.push(esc)
+    doc.first_child.push(-1)
+    doc.next_sibling.push(-1)
+    doc.key_starts.push(0)
+    doc.key_ends.push(0)
+    doc.key_escaped.push(false)
+    doc.counts.push(0)
+    id
+}
+
+struct StrSpan { ok: bool, start: i32, end: i32, escaped: bool }
+
+fn scan_string(doc: &mut Doc, p: &mut Parser) -> StrSpan {
+    if p.pos >= doc.input.len || doc.input[p.pos] != b'"' {
+        fail_doc(&mut doc, p.pos, "expected '\"'")
+        return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+    }
+    p.pos += 1
+    start := p.pos
+    var has_esc := false
+    while p.pos < doc.input.len {
+        b := doc.input[p.pos]
+        if b == b'"' {
+            end := p.pos
+            p.pos += 1
+            return StrSpan { ok: true, start: start, end: end, escaped: has_esc }
+        }
+        if b < 32 {
+            fail_doc(&mut doc, p.pos, "unescaped control character in JSON string")
+            return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+        }
+        if b == b'\\' {
+            has_esc = true
+            p.pos += 1
+            if p.pos >= doc.input.len {
+                fail_doc(&mut doc, p.pos, "unterminated escape sequence")
+                return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+            }
+            esc := doc.input[p.pos]
+            if esc == b'"' || esc == b'\\' || esc == b'/' || esc == b'b' ||
+               esc == b'f' || esc == b'n' || esc == b'r' || esc == b't' {
+                p.pos += 1
+            } else if esc == b'u' {
+                if p.pos + 4 >= doc.input.len {
+                    fail_doc(&mut doc, p.pos, "incomplete \\uXXXX escape")
+                    return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+                }
+                var cp := 0
+                for k in 1..5 {
+                    hv := hex_val(doc.input[p.pos + k])
+                    if hv < 0 {
+                        fail_doc(&mut doc, p.pos + k, "invalid hex digit in \\uXXXX escape")
+                        return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+                    }
+                    cp = cp * 16 + hv
+                }
+                p.pos += 5
+                if cp >= 0xD800 && cp <= 0xDBFF {
+                    if p.pos + 5 >= doc.input.len || doc.input[p.pos] != b'\\' || doc.input[p.pos + 1] != b'u' {
+                        fail_doc(&mut doc, p.pos, "missing low surrogate in UTF-16 pair")
+                        return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+                    }
+                    var low := 0
+                    for k in 2..6 {
+                        hv := hex_val(doc.input[p.pos + k])
+                        if hv < 0 {
+                            fail_doc(&mut doc, p.pos + k, "invalid hex digit in low surrogate")
+                            return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+                        }
+                        low = low * 16 + hv
+                    }
+                    if low < 0xDC00 || low > 0xDFFF {
+                        fail_doc(&mut doc, p.pos, "invalid low surrogate range")
+                        return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+                    }
+                    p.pos += 6
+                } else if cp >= 0xDC00 && cp <= 0xDFFF {
+                    fail_doc(&mut doc, p.pos - 5, "lone low surrogate")
+                    return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+                }
+            } else {
+                fail_doc(&mut doc, p.pos, "invalid escape character")
+                return StrSpan { ok: false, start: 0, end: 0, escaped: false }
+            }
+        } else {
+            p.pos += 1
+        }
+    }
+    fail_doc(&mut doc, p.pos, "unterminated JSON string")
+    StrSpan { ok: false, start: 0, end: 0, escaped: false }
+}
+
+fn scan_number(doc: &mut Doc, p: &mut Parser) -> i32 {
+    start := p.pos
+    if p.pos < doc.input.len && doc.input[p.pos] == b'-' { p.pos += 1 }
+    if p.pos >= doc.input.len {
+        fail_doc(&mut doc, start, "invalid number")
+        return -1
+    }
+    if doc.input[p.pos] == b'0' {
+        p.pos += 1
+        if p.pos < doc.input.len && doc.input[p.pos] >= b'0' && doc.input[p.pos] <= b'9' {
+            fail_doc(&mut doc, p.pos, "leading zero in JSON number")
+            return -1
+        }
+    } else if doc.input[p.pos] >= b'1' && doc.input[p.pos] <= b'9' {
+        while p.pos < doc.input.len && doc.input[p.pos] >= b'0' && doc.input[p.pos] <= b'9' {
+            p.pos += 1
+        }
+    } else {
+        fail_doc(&mut doc, p.pos, "expected digit in JSON number")
+        return -1
+    }
+    if p.pos < doc.input.len && doc.input[p.pos] == b'.' {
+        p.pos += 1
+        if p.pos >= doc.input.len || doc.input[p.pos] < b'0' || doc.input[p.pos] > b'9' {
+            fail_doc(&mut doc, p.pos, "expected digit after decimal point")
+            return -1
+        }
+        while p.pos < doc.input.len && doc.input[p.pos] >= b'0' && doc.input[p.pos] <= b'9' {
+            p.pos += 1
+        }
+    }
+    if p.pos < doc.input.len && (doc.input[p.pos] == b'e' || doc.input[p.pos] == b'E') {
+        p.pos += 1
+        if p.pos < doc.input.len && (doc.input[p.pos] == b'+' || doc.input[p.pos] == b'-') {
+            p.pos += 1
+        }
+        if p.pos >= doc.input.len || doc.input[p.pos] < b'0' || doc.input[p.pos] > b'9' {
+            fail_doc(&mut doc, p.pos, "expected exponent digit")
+            return -1
+        }
+        while p.pos < doc.input.len && doc.input[p.pos] >= b'0' && doc.input[p.pos] <= b'9' {
+            p.pos += 1
+        }
+    }
+    alloc_node(&mut doc, 3, start, p.pos, false)
+}
+
+fn scan_value(doc: &mut Doc, p: &mut Parser) -> i32 {
+    skip_ws(&doc.input, &mut p)
+    if p.pos >= doc.input.len {
+        fail_doc(&mut doc, p.pos, "unexpected end of JSON input")
+        return -1
+    }
+    if p.depth >= 256 {
+        fail_doc(&mut doc, p.pos, "JSON nesting depth exceeds 256")
+        return -1
+    }
+    b := doc.input[p.pos]
+    if b == b'"' {
+        sp := scan_string(&mut doc, &mut p)
+        if !sp.ok { return -1 }
+        if !sp.escaped {
+            // Validate UTF-8 once over raw slice.
+            if !bytes.decode_range(&doc.input, sp.start, sp.end).ok {
+                fail_doc(&mut doc, sp.start, "invalid UTF-8 in JSON string")
+                return -1
+            }
+        }
+        return alloc_node(&mut doc, 4, sp.start, sp.end, sp.escaped)
+    }
+    if b == b'{' {
+        start := p.pos
+        p.pos += 1
+        obj := alloc_node(&mut doc, 6, start, start, false)
+        skip_ws(&doc.input, &mut p)
+        if p.pos < doc.input.len && doc.input[p.pos] == b'}' {
+            p.pos += 1
+            doc.ends[obj] = p.pos
+            return obj
+        }
+        p.depth += 1
+        var prev_child := -1
+        var count := 0
+        while doc.ok {
+            skip_ws(&doc.input, &mut p)
+            key := scan_string(&mut doc, &mut p)
+            if !key.ok { p.depth -= 1; return -1 }
+            if !key.escaped && !bytes.decode_range(&doc.input, key.start, key.end).ok {
+                fail_doc(&mut doc, key.start, "invalid UTF-8 in JSON key")
+                p.depth -= 1; return -1
+            }
+            skip_ws(&doc.input, &mut p)
+            if p.pos >= doc.input.len || doc.input[p.pos] != b':' {
+                fail_doc(&mut doc, p.pos, "expected ':' after object key")
+                p.depth -= 1; return -1
+            }
+            p.pos += 1
+            child := scan_value(&mut doc, &mut p)
+            if child < 0 || !doc.ok { p.depth -= 1; return -1 }
+            doc.key_starts[child] = key.start
+            doc.key_ends[child] = key.end
+            doc.key_escaped[child] = key.escaped
+            if prev_child < 0 { doc.first_child[obj] = child }
+            else { doc.next_sibling[prev_child] = child }
+            prev_child = child
+            count += 1
+            skip_ws(&doc.input, &mut p)
+            if p.pos < doc.input.len && doc.input[p.pos] == b',' {
+                p.pos += 1
+                continue
+            }
+            if p.pos < doc.input.len && doc.input[p.pos] == b'}' {
+                p.pos += 1
+                doc.ends[obj] = p.pos
+                doc.counts[obj] = count
+                p.depth -= 1
+                return obj
+            }
+            fail_doc(&mut doc, p.pos, "expected ',' or '}' in JSON object")
+            p.depth -= 1
+            return -1
+        }
+        p.depth -= 1
+        return -1
+    }
+    if b == b'[' {
+        start := p.pos
+        p.pos += 1
+        arr := alloc_node(&mut doc, 5, start, start, false)
+        skip_ws(&doc.input, &mut p)
+        if p.pos < doc.input.len && doc.input[p.pos] == b']' {
+            p.pos += 1
+            doc.ends[arr] = p.pos
+            return arr
+        }
+        p.depth += 1
+        var prev_child := -1
+        var count := 0
+        while doc.ok {
+            child := scan_value(&mut doc, &mut p)
+            if child < 0 || !doc.ok { p.depth -= 1; return -1 }
+            if prev_child < 0 { doc.first_child[arr] = child }
+            else { doc.next_sibling[prev_child] = child }
+            prev_child = child
+            count += 1
+            skip_ws(&doc.input, &mut p)
+            if p.pos < doc.input.len && doc.input[p.pos] == b',' {
+                p.pos += 1
+                continue
+            }
+            if p.pos < doc.input.len && doc.input[p.pos] == b']' {
+                p.pos += 1
+                doc.ends[arr] = p.pos
+                doc.counts[arr] = count
+                p.depth -= 1
+                return arr
+            }
+            fail_doc(&mut doc, p.pos, "expected ',' or ']' in JSON array")
+            p.depth -= 1
+            return -1
+        }
+        p.depth -= 1
+        return -1
+    }
+    if b == b't' {
+        if bytes.equals_text(&doc.input, p.pos, p.pos + 4, "true") {
+            node := alloc_node(&mut doc, 2, p.pos, p.pos + 4, false)
+            p.pos += 4
+            return node
+        }
+        fail_doc(&mut doc, p.pos, "invalid literal")
+        return -1
+    }
+    if b == b'f' {
+        if bytes.equals_text(&doc.input, p.pos, p.pos + 5, "false") {
+            node := alloc_node(&mut doc, 2, p.pos, p.pos + 5, false)
+            p.pos += 5
+            return node
+        }
+        fail_doc(&mut doc, p.pos, "invalid literal")
+        return -1
+    }
+    if b == b'n' {
+        if bytes.equals_text(&doc.input, p.pos, p.pos + 4, "null") {
+            node := alloc_node(&mut doc, 1, p.pos, p.pos + 4, false)
+            p.pos += 4
+            return node
+        }
+        fail_doc(&mut doc, p.pos, "invalid literal")
+        return -1
+    }
+    if b == b'-' || (b >= b'0' && b <= b'9') {
+        return scan_number(&mut doc, &mut p)
+    }
+    fail_doc(&mut doc, p.pos, "unexpected character in JSON")
+    -1
+}
+
+pub fn parse_bytes(input: &[]u8) -> Doc {
+    var copy: []u8 = []
+    bytes.extend(&mut copy, &input)
+    var doc := Doc {
+        ok: true, error: "", offset: 0, root: -1,
+        input: copy, kinds: [], starts: [], ends: [], escaped: [],
+        first_child: [], next_sibling: [], key_starts: [], key_ends: [], key_escaped: [], counts: [],
+    }
+    est := input.len / 8 + 8
+    doc.kinds.reserve(est); doc.starts.reserve(est); doc.ends.reserve(est)
+    var p := Parser { pos: 0, depth: 0 }
+    root := scan_value(&mut doc, &mut p)
+    if !doc.ok { return doc }
+    skip_ws(&doc.input, &mut p)
+    if p.pos != doc.input.len {
+        fail_doc(&mut doc, p.pos, "trailing characters after JSON value")
+        return doc
+    }
+    doc.root = root
+    doc
+}
+
+pub fn parse_text(text: string) -> Doc {
+    var raw: []u8 = []
+    bytes.append_utf8(&mut raw, text)
+    parse_bytes(&raw)
+}
+
+// --- Zero-Allocation Span Queries & Lazy Unescaping ---
+
+pub fn kind(doc: &Doc, node: i32) -> Kind {
+    if !doc.ok || node < 0 || node >= doc.kinds.len { return .Invalid }
+    k := doc.kinds[node]
+    if k == 1 { return .Null }
+    if k == 2 { return .Bool }
+    if k == 3 { return .Number }
+    if k == 4 { return .String }
+    if k == 5 { return .Array }
+    if k == 6 { return .Object }
+    .Invalid
+}
+
+pub fn count(doc: &Doc, node: i32) -> i32 {
+    if !doc.ok || node < 0 || node >= doc.counts.len { return 0 }
+    doc.counts[node]
+}
+
+fn push_codepoint_utf8(out: &mut []u8, cp: i32) {
+    if cp <= 0x7F {
+        out.push(u8(cp))
+    } else if cp <= 0x7FF {
+        out.push(u8(0xC0.bit_or(cp.shr(6))))
+        out.push(u8(0x80.bit_or(cp.bit_and(0x3F))))
+    } else if cp <= 0xFFFF {
+        out.push(u8(0xE0.bit_or(cp.shr(12))))
+        out.push(u8(0x80.bit_or(cp.shr(6).bit_and(0x3F))))
+        out.push(u8(0x80.bit_or(cp.bit_and(0x3F))))
+    } else {
+        out.push(u8(0xF0.bit_or(cp.shr(18))))
+        out.push(u8(0x80.bit_or(cp.shr(12).bit_and(0x3F))))
+        out.push(u8(0x80.bit_or(cp.shr(6).bit_and(0x3F))))
+        out.push(u8(0x80.bit_or(cp.bit_and(0x3F))))
+    }
+}
+
+fn unescape_span(input: &[]u8, start: i32, end: i32, has_esc: bool) -> StrField {
+    if !has_esc {
+        dec := bytes.decode_range(&input, start, end)
+        return StrField { ok: dec.ok, value: dec.value }
+    }
+    var out: []u8 = []
+    out.reserve(end - start)
+    var i := start
+    while i < end {
+        b := input[i]
+        if b != b'\\' {
+            out.push(b)
+            i += 1
+            continue
+        }
+        i += 1
+        esc := input[i]
+        if esc == b'"' { out.push(b'"'); i += 1 }
+        else if esc == b'\\' { out.push(b'\\'); i += 1 }
+        else if esc == b'/' { out.push(b'/'); i += 1 }
+        else if esc == b'b' { out.push(8); i += 1 }
+        else if esc == b'f' { out.push(12); i += 1 }
+        else if esc == b'n' { out.push(10); i += 1 }
+        else if esc == b'r' { out.push(13); i += 1 }
+        else if esc == b't' { out.push(9); i += 1 }
+        else if esc == b'u' {
+            var cp := 0
+            for k in 1..5 { cp = cp * 16 + hex_val(input[i + k]) }
+            i += 5
+            if cp >= 0xD800 && cp <= 0xDBFF {
+                var low := 0
+                for k in 2..6 { low = low * 16 + hex_val(input[i + k]) }
+                i += 6
+                cp = 0x10000 + (cp - 0xD800).shl(10) + (low - 0xDC00)
+            }
+            push_codepoint_utf8(&mut out, cp)
+        } else {
+            return StrField { ok: false, value: "" }
+        }
+    }
+    dec := bytes.decode(&out)
+    StrField { ok: dec.ok, value: dec.value }
+}
+
+fn key_matches(doc: &Doc, child: i32, key: string) -> bool {
+    ks := doc.key_starts[child]
+    ke := doc.key_ends[child]
+    if !doc.key_escaped[child] {
+        return bytes.equals_text(&doc.input, ks, ke, key)
+    }
+    unesc := unescape_span(&doc.input, ks, ke, true)
+    unesc.ok && unesc.value == key
+}
+
+pub fn field(doc: &Doc, obj: i32, key: string) -> i32 {
+    if kind(&doc, obj) != .Object { return -1 }
+    var found := -1
+    var cur := doc.first_child[obj]
+    while cur >= 0 {
+        if key_matches(&doc, cur, key) { found = cur }
+        cur = doc.next_sibling[cur]
+    }
+    found
+}
+
+pub fn at(doc: &Doc, arr: i32, index: i32) -> i32 {
+    if kind(&doc, arr) != .Array || index < 0 || index >= doc.counts[arr] { return -1 }
+    var cur := doc.first_child[arr]
+    for _ in 0..index { cur = doc.next_sibling[cur] }
+    cur
+}
+
+pub fn key_at(doc: &Doc, obj: i32, index: i32) -> StrField {
+    if kind(&doc, obj) != .Object || index < 0 || index >= doc.counts[obj] {
+        return StrField { ok: false, value: "" }
+    }
+    var cur := doc.first_child[obj]
+    for _ in 0..index { cur = doc.next_sibling[cur] }
+    unescape_span(&doc.input, doc.key_starts[cur], doc.key_ends[cur], doc.key_escaped[cur])
+}
+
+pub fn val_at(doc: &Doc, obj: i32, index: i32) -> i32 {
+    if kind(&doc, obj) != .Object || index < 0 || index >= doc.counts[obj] { return -1 }
+    var cur := doc.first_child[obj]
+    for _ in 0..index { cur = doc.next_sibling[cur] }
+    cur
+}
+
+pub fn as_bool(doc: &Doc, node: i32) -> BoolField {
+    if kind(&doc, node) != .Bool { return BoolField { ok: false, value: false } }
+    BoolField { ok: true, value: doc.input[doc.starts[node]] == b't' }
+}
+
+pub fn as_i64(doc: &Doc, node: i32) -> IntField {
+    if kind(&doc, node) != .Number { return IntField { ok: false, value: 0 } }
+    parsed := parse.i64_range(bytes.decode_range(&doc.input, doc.starts[node], doc.ends[node]).value, 0, doc.ends[node] - doc.starts[node])
+    IntField { ok: parsed.ok, value: parsed.value }
+}
+
+pub fn as_u64(doc: &Doc, node: i32) -> UintField {
+    if kind(&doc, node) != .Number { return UintField { ok: false, value: 0 } }
+    s := doc.starts[node]; e := doc.ends[node]
+    if s < e && doc.input[s] == b'-' { return UintField { ok: false, value: 0 } }
+    parsed := parse.u64_range(bytes.decode_range(&doc.input, s, e).value, 0, e - s)
+    UintField { ok: parsed.ok, value: parsed.value }
+}
+
+pub fn as_str(doc: &Doc, node: i32) -> StrField {
+    if kind(&doc, node) != .String { return StrField { ok: false, value: "" } }
+    unescape_span(&doc.input, doc.starts[node], doc.ends[node], doc.escaped[node])
+}
+
+pub fn raw_span(doc: &Doc, node: i32) -> string {
+    if !doc.ok || node < 0 || node >= doc.starts.len { return "" }
+    bytes.decode_range(&doc.input, doc.starts[node], doc.ends[node]).value
+}
+
+pub fn get_bool(doc: &Doc, obj: i32, key: string) -> BoolField { as_bool(&doc, field(&doc, obj, key)) }
+pub fn get_i64(doc: &Doc, obj: i32, key: string) -> IntField { as_i64(&doc, field(&doc, obj, key)) }
+pub fn get_u64(doc: &Doc, obj: i32, key: string) -> UintField { as_u64(&doc, field(&doc, obj, key)) }
+pub fn get_str(doc: &Doc, obj: i32, key: string) -> StrField { as_str(&doc, field(&doc, obj, key)) }
+
+@test
+fn json_writer_and_zero_dom_parser_handle_nesting_unicode_and_errors() {
+    var out: []u8 = []
+    var first := begin_obj(&mut out)
+    field_str(&mut out, &mut first, "kind", "runtime_profile")
+    field_i32(&mut out, &mut first, "version", 1)
+    field_bool(&mut out, &mut first, "ok", true)
+    field_u64(&mut out, &mut first, "max_u64", 18446744073709551615)
+    field_str(&mut out, &mut first, "msg", "rad1\n\"åäö\" 🌍")
+    var af := begin_field_arr(&mut out, &mut first, "items")
+    sep_elem(&mut out, &mut af); write_i64(&mut out, -42)
+    sep_elem(&mut out, &mut af); write_null(&mut out)
+    end_arr(&mut out)
+    end_obj(&mut out)
+
+    doc := parse_bytes(&out)
+    assert(doc.ok)
+    assert(get_str(&doc, doc.root, "kind").value == "runtime_profile")
+    assert(get_i64(&doc, doc.root, "version").value == 1)
+    assert(get_bool(&doc, doc.root, "ok").value)
+    assert(get_u64(&doc, doc.root, "max_u64").value == 18446744073709551615)
+    assert(get_str(&doc, doc.root, "msg").value == "rad1\n\"åäö\" 🌍")
+    items := field(&doc, doc.root, "items")
+    assert(count(&doc, items) == 2)
+    assert(as_i64(&doc, at(&doc, items, 0)).value == -42)
+    assert(kind(&doc, at(&doc, items, 1)) == .Null)
+
+    // Surrogate pair decoding (\uD83C\uDF0D == 🌍) and duplicate key override (last wins).
+    sur := parse_text("{\"a\":1,\"a\":2,\"globe\":\"\\uD83C\\uDF0D\"}")
+    assert(sur.ok)
+    assert(get_i64(&sur, sur.root, "a").value == 2)
+    assert(get_str(&sur, sur.root, "globe").value == "🌍")
+
+    assert(!parse_text("{\"a\":01}").ok)
+    assert(!parse_text("{\"a\":1} trailing").ok)
+    assert(!parse_text("\"\\uD800\"").ok)
+}

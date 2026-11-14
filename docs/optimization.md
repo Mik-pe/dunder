@@ -202,7 +202,7 @@ och bevarade register provas också vid källgränsen. Detta använder de
 språkets åtkomst- eller ABI-garantier har inte försvagats. Ett vanligt
 främmande anrop får inte inspektera andra privata lokaler genom stackvandring.
 [Frame-/utgångsprov](../tools/test-mir-frame-exits.py) ·
-[FFI-prov](../tools/test-ffi.py).
+[FFI-prov](../tools/test_ffi.ddr).
 
 ### Frame-livstid och privat temporärlagring
 
@@ -645,7 +645,7 @@ pass. Cachefragment och testkvitton skiljer lägena åt. Emitter-API:t lånar
 en återanvänd `Options`-post; äldre wrappers behåller sina standarder utan
 en ny postallokering per funktion.
 
-`tools/test-frame-free.py` bygger 88 riktiga bilder över fyra mål och båda
+`tools/test_frame_free.ddr` bygger 88 riktiga bilder över fyra mål och båda
 lägena. Host/Wasm provar register- och stackbevarande, argumentcykler,
 normalisering, loopar, tidig retur och fällordning. Den symboliska
 flyttkontrollen tolkar faktiskt emitterade instruktioner över 40 320
@@ -696,7 +696,7 @@ testkvitton skiljer lägena åt; `--profile-compiler` har en separat
 `range_analysis`-fas. Längdbeviset använder den uttryckliga
 [i32-invarianten i runtime](memory.md).
 
-`tools/test-range-emitter.py` provar verklig kontrollborttagning och
+`tools/test_range_emitter.ddr` provar verklig kontrollborttagning och
 budgetfallback på fyra mål. `tools/test-range-analysis.py` exporterar
 faktiska modeller/bevis och följer dem i en oberoende interpreter med
 checkad aritmetik, kortslutning, snapshots och muterbara arrayer. Den
@@ -744,7 +744,7 @@ halvt återfall med borttagen cleanup och kvarvarande setup är inte tillåtet.
 `tools/test-ownership-leases.py` jämför resultat, diagnostik och bindningar
 för båda lägena på alla mål; native och Wasm provar också mutation under
 högerledet, fällordning och upprepad körning med samma linjära minne.
-`tools/test-machine-ir.py` provar kompakteringen separat.
+`tools/test_machine_ir.ddr` provar kompakteringen separat.
 
 ## Unika recordtemporärer
 

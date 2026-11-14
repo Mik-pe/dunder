@@ -141,7 +141,7 @@ dunder run dogfood/enums.ddr
 # enums ok
 dunder test dogfood/enums.ddr
 # 5 passed, 0 failed
-python3 tools/test-diagnostics.py "$(command -v dunder)"
+dunder run tools/test_diagnostics.ddr -- "$(command -v dunder)"
 ```
 
 Programmet `dogfood/enums.ddr` i `dunder-hundmat` provar båda formerna och nästlade

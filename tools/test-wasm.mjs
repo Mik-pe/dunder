@@ -17,6 +17,11 @@ const nativeGroups = new Set([
     'tests/net_loopback.ddr::stream_set_pool_and_slot_reuse',
     'tests/net_loopback.ddr::files_round_trip_through_the_os',
     'tests/net_loopback.ddr::errors_remain_values',
+    'tests/process_fs.ddr::fs_temp_dir_links_listing_and_safe_remove_all',
+    'tests/process_fs.ddr::process_grant_and_env_cwd_stderr_exit_code',
+    'tests/process_fs.ddr::process_large_simultaneous_stdin_stdout_pipe_without_deadlock',
+    'tests/process_fs.ddr::process_launch_failures_report_portable_errno',
+    'tests/process_fs.ddr::process_timeout_and_background_child_spawn',
     'selfhost/compile.ddr::string_operand_leases_are_removed_only_across_effect_free_rhs',
     'selfhost/compile.ddr::ownership_proofs_do_not_change_validation_or_binding_records',
     'selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants',
@@ -67,7 +72,7 @@ function suite(compiler, source) {
             const name = line.slice(String(id).length + 1);
             const image = join(dir, `${id}.wasm`);
             const build = invoke(compiler, ['build-tests', source, '--target', 'wasm32', '--group', String(id), '-o', image]);
-            if (build.status !== 0 && nativeGroups.has(name) && /native system call|requires a native target|requires native|native target required/i.test(build.stderr)) {
+            if (build.status !== 0 && nativeGroups.has(name) && /native system call|requires a native target|requires the selected native platform|requires native|native target required/i.test(build.stderr)) {
                 console.log(`NATIVE ${name}`); native++;
                 continue;
             }

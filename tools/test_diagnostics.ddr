@@ -1,0 +1,171 @@
+capability process, filesystem
+
+import .harness as harness
+import std.array as array
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn split_lines(s: string) -> []string {
+    var out: []string = []
+    if s.len == 0 { return out }
+    raw := text.split(s, "\n")
+    var limit := raw.len
+    if limit > 0 && raw[limit - 1].len == 0 {
+        limit -= 1
+    }
+    for i in 0..limit {
+        var line := raw[i]
+        if line.len > 0 && line[line.len - 1] == 13 {
+            line = line[0..line.len - 1]
+        }
+        out.push(line)
+    }
+    out
+}
+
+fn check_fixture(compiler: string, source: string, work: string) -> string {
+    src_text := sys.read_text(source)
+    if !src_text.ok { return "could not read " + source }
+    src_meta := sys.metadata(source)
+    if !src_meta.ok || !src_meta.is_file { return "could not stat " + source }
+
+    var expectations: []string = []
+    for line in split_lines(src_text.value) {
+        if text.starts_with(line, "// error: ") {
+            expectations.push(line[10..line.len])
+        }
+    }
+    if expectations.len != 1 || expectations[0].len == 0 {
+        return source + " needs one // error: expectation"
+    }
+    expected := expectations[0]
+
+    var previous: []u8 = []
+    bytes.append_utf8(&mut previous, "previous successful output")
+    output := work + "/image"
+    suite := work + "/suite"
+    if !fs.mkdir_all(suite).ok { return "mkdir_all failed on " + suite }
+    receipt := suite + "/keep"
+    if !sys.write_u8(receipt, &previous).ok { return "write_u8 failed on " + receipt }
+
+    for t_idx in 0..2 {
+        is_wasm := t_idx == 1
+        var modes: []string = ["check", "build", "build-tests", "test"]
+        if is_wasm {
+            modes = ["check", "build", "build-tests"]
+        }
+        for command in modes {
+            if !sys.write_u8(output, &previous).ok { return "write_u8 failed on " + output }
+            var args: []string = [command, source]
+            if is_wasm {
+                args.push("--target")
+                args.push("wasm32")
+            }
+            if command == "check" {
+                args.push("--agent")
+            } else if command == "test" {
+                args.push("-o")
+                args.push(suite)
+            } else {
+                args.push("-o")
+                args.push(output)
+            }
+
+            res := harness.exec_cmd(compiler, args, work, false, 30000)
+            stdout_str := process.stdout_text(&res)
+            stderr_str := process.stderr_text(&res)
+            var message := stderr_str
+
+            if command == "check" && res.ok && !res.timed_out && res.signal == 0 && res.code == 1 {
+                doc := json.parse_bytes(&res.stdout)
+                if !doc.ok || json.kind(&doc, doc.root) != .Object {
+                    return "invalid diagnostic JSON: " + stdout_str
+                }
+                kind_f := json.get_str(&doc, doc.root, "kind")
+                path_f := json.get_str(&doc, doc.root, "path")
+                start_f := json.get_i64(&doc, doc.root, "start")
+                end_f := json.get_i64(&doc, doc.root, "end")
+                msg_f := json.get_str(&doc, doc.root, "message")
+                if !kind_f.ok || kind_f.value != "error" || !path_f.ok || !start_f.ok || !end_f.ok || !msg_f.ok {
+                    return "invalid diagnostic fields: " + stdout_str
+                }
+                rp := fs.realpath(path_f.value)
+                if !rp.ok || rp.value != source {
+                    return "diagnostic path mismatch: " + path_f.value + " vs " + source
+                }
+                if start_f.value < 0 || start_f.value > end_f.value || end_f.value > src_meta.size {
+                    return "invalid diagnostic span: " + stdout_str
+                }
+                message = msg_f.value
+            }
+
+            var target_desc := ""
+            if is_wasm { target_desc = "--target wasm32" }
+            if !res.ok || res.timed_out || res.signal != 0 || res.code != 1 || text.find(message, expected) < 0 {
+                return command + " " + target_desc + " exited " + res.code.str() + ": " + message + "\n" + stdout_str
+            }
+
+            out_now := sys.read_u8(output)
+            rec_now := sys.read_u8(receipt)
+            suite_ls := fs.list_dir(suite)
+            if !out_now.ok || !harness.bytes_equal(&out_now.value, &previous) ||
+               !rec_now.ok || !harness.bytes_equal(&rec_now.value, &previous) ||
+               !suite_ls.ok || suite_ls.entries.len != 1 || suite_ls.entries[0] != "keep" {
+                return command + " modified existing output"
+            }
+        }
+    }
+    ""
+}
+
+pub fn run_suite(cli: &harness.BaseCli) -> bool {
+    var sources: []string = []
+    if cli.extra_args.len > 0 {
+        for raw in cli.extra_args {
+            if text.starts_with(raw, "-") {
+                return harness.fail("unknown option: " + raw)
+            }
+            rp := fs.realpath(raw)
+            if !rp.ok {
+                return harness.fail("compile-fail fixture not found: " + raw)
+            }
+            sources.push(rp.value)
+        }
+        array.sort_strings(&mut sources)
+    } else {
+        sources = harness.collect_error_fixtures(cli.root)
+    }
+    if sources.len == 0 {
+        return harness.fail("no compile-fail fixtures found")
+    }
+
+    tmp := fs.temp_dir("dunder-diagnostics-")
+    if !tmp.ok {
+        return harness.fail("temp_dir failed")
+    }
+    var failed := 0
+    for source in sources {
+        name := harness.basename(source)
+        err := check_fixture(cli.compiler, source, tmp.value)
+        if err.len == 0 {
+            print("PASS " + name)
+        } else {
+            print("FAIL " + name + " " + err)
+            failed += 1
+        }
+    }
+    _ := fs.remove_all(tmp.value)
+    print((sources.len - failed).str() + " passed, " + failed.str() + " failed")
+    failed == 0
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if !run_suite(&cli) { return 1 }
+    0
+}

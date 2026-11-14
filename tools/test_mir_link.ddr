@@ -1,0 +1,274 @@
+capability process, filesystem
+
+import .harness as harness
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct CmdLog {
+    arg_starts: []i32,
+    arg_counts: []i32,
+    args: []string,
+    exits: []i32,
+    stdouts: []string,
+    stderrs: []string,
+}
+
+struct ImageList {
+    targets: []string,
+    optimizations: []string,
+    schedules: []string,
+    modes: []string,
+    sizes: []i32,
+    hashes: []string,
+}
+
+fn call_logged(program: string, args: []string, cwd: string, log: &mut CmdLog, out_stdout: &mut string) -> bool {
+    res := harness.exec_cmd(program, args, cwd, false, 120000)
+    start := log.args.len
+    log.args.push(program)
+    for a in args { log.args.push(a) }
+    log.arg_starts.push(start)
+    log.arg_counts.push(1 + args.len)
+    log.exits.push(res.code)
+    stdout_s := process.stdout_text(&res)
+    stderr_s := process.stderr_text(&res)
+    log.stdouts.push(stdout_s)
+    log.stderrs.push(stderr_s)
+    if !res.ok || res.timed_out || res.signal != 0 || res.code != 0 {
+        return harness.fail(program + " exited " + res.code.str() + " (signal " + res.signal.str() + ")\nstdout: " + stdout_s + "\nstderr: " + stderr_s)
+    }
+    out_stdout = stdout_s
+    true
+}
+
+fn sha256_file_checked(path: string, out_hex: &mut string) -> bool {
+    r := sys.read_u8(path)
+    if !r.ok {
+        return harness.fail("failed to read file for sha256: " + path)
+    }
+    out_hex = harness.sha256_bytes_hex(&r.value)
+    true
+}
+
+fn write_commands_json(path: string, log: &CmdLog) -> bool {
+    var out: []u8 = []
+    var arr_first := json.begin_arr(&mut out)
+    for i in 0..log.exits.len {
+        json.sep_elem(&mut out, &mut arr_first)
+        var obj_first := json.begin_obj(&mut out)
+        var cmd_first := json.begin_field_arr(&mut out, &mut obj_first, "command")
+        start := log.arg_starts[i]
+        end := start + log.arg_counts[i]
+        for j in start..end {
+            json.sep_elem(&mut out, &mut cmd_first)
+            json.write_str(&mut out, log.args[j])
+        }
+        json.end_arr(&mut out)
+        json.field_i32(&mut out, &mut obj_first, "exit", log.exits[i])
+        json.field_str(&mut out, &mut obj_first, "stdout", log.stdouts[i])
+        json.field_str(&mut out, &mut obj_first, "stderr", log.stderrs[i])
+        json.end_obj(&mut out)
+    }
+    json.end_arr(&mut out)
+    out.push(b'\n')
+    if !json.parse_bytes(&out).ok {
+        return harness.fail("generated invalid JSON for commands.json")
+    }
+    if !sys.write_u8(path, &out).ok {
+        return harness.fail("failed to write " + path)
+    }
+    true
+}
+
+fn write_summary_json(path: string, images: &ImageList, executions: i32, compiler_sha: string, src_paths: &[]string, src_shas: &[]string) -> bool {
+    var out: []u8 = []
+    var first := json.begin_obj(&mut out)
+    json.field_str(&mut out, &mut first, "result", "passed")
+    var imgs_first := json.begin_field_arr(&mut out, &mut first, "images")
+    for i in 0..images.targets.len {
+        json.sep_elem(&mut out, &mut imgs_first)
+        var imf := json.begin_obj(&mut out)
+        json.field_str(&mut out, &mut imf, "target", images.targets[i])
+        json.field_str(&mut out, &mut imf, "optimization", images.optimizations[i])
+        json.field_str(&mut out, &mut imf, "schedule", images.schedules[i])
+        json.field_str(&mut out, &mut imf, "mode", images.modes[i])
+        json.field_i32(&mut out, &mut imf, "bytes", images.sizes[i])
+        json.field_str(&mut out, &mut imf, "sha256", images.hashes[i])
+        json.end_obj(&mut out)
+    }
+    json.end_arr(&mut out)
+    json.field_i32(&mut out, &mut first, "executions", executions)
+    json.field_str(&mut out, &mut first, "scope", "inactive ordered relocatable linker; no threads/frontends activated")
+    json.field_str(&mut out, &mut first, "imports", "all-target Code/site contracts; symbol slots remain caller-owned")
+    json.field_str(&mut out, &mut first, "compiler_sha256", compiler_sha)
+    var src_first := json.begin_field_obj(&mut out, &mut first, "source_sha256")
+    for i in 0..src_paths.len {
+        json.field_str(&mut out, &mut src_first, src_paths[i], src_shas[i])
+    }
+    json.end_obj(&mut out)
+    json.end_obj(&mut out)
+    out.push(b'\n')
+    if !json.parse_bytes(&out).ok {
+        return harness.fail("generated invalid JSON for summary.json")
+    }
+    if !sys.write_u8(path, &out).ok {
+        return harness.fail("failed to write " + path)
+    }
+    true
+}
+
+fn run_inner(cli: &harness.BaseCli, root: string, output: string, log: &mut CmdLog) -> bool {
+    host := harness.host_id()
+    targets := harness.targets()
+    var stdout := ""
+
+    if !call_logged(cli.compiler, ["test", "tests/mir_link.ddr", "-o", output + "/unit"], root, &mut log, &mut stdout) {
+        return false
+    }
+    for target in targets {
+        image := output + "/unit-" + target
+        if !call_logged(cli.compiler, ["build-tests", "tests/mir_link.ddr", "--target", target, "-o", image], root, &mut log, &mut stdout) {
+            return false
+        }
+        if target == "wasm32" {
+            if !call_logged("node", ["tools/test-wasm.mjs", "--execute", image], root, &mut log, &mut stdout) {
+                return false
+            }
+        }
+    }
+
+    emitter := output + "/emitter"
+    if !call_logged(cli.compiler, ["build", "tests/fixtures/mir-link-emitter.ddr", "-o", emitter], root, &mut log, &mut stdout) {
+        return false
+    }
+
+    var images := ImageList {
+        targets: [],
+        optimizations: [],
+        schedules: [],
+        modes: [],
+        sizes: [],
+        hashes: [],
+    }
+    var executions := 0
+
+    for target in 0..targets.len {
+        name := targets[target]
+        for optimized in ["off", "on"] {
+            for schedule in ["grow", "sealed"] {
+                var img_serial: []u8 = []
+                var img_link: []u8 = []
+                for mode in ["serial", "link"] {
+                    image := output + "/" + name + "-" + optimized + "-" + schedule + "-" + mode
+                    if !call_logged(emitter, [image, target.str(), mode, optimized, schedule], root, &mut log, &mut stdout) {
+                        return false
+                    }
+                    if text.trim(stdout) != "objects=3" {
+                        return harness.fail("expected objects=3 from mir-link-emitter, got: " + stdout)
+                    }
+                    raw := sys.read_u8(image)
+                    if !raw.ok {
+                        return harness.fail("failed to read image: " + image)
+                    }
+                    sha := harness.sha256_bytes_hex(&raw.value)
+                    sz := raw.value.len
+                    images.targets.push(name)
+                    images.optimizations.push(optimized)
+                    images.schedules.push(schedule)
+                    images.modes.push(mode)
+                    images.sizes.push(sz)
+                    images.hashes.push(sha)
+                    if mode == "serial" {
+                        img_serial = raw.value
+                    } else {
+                        img_link = raw.value
+                    }
+                    if target == host {
+                        if !call_logged(image, [], root, &mut log, &mut stdout) {
+                            return false
+                        }
+                        executions += 1
+                    } else if target == 3 {
+                        if !call_logged("node", ["tools/runtime-contract-wasm.cjs", image], root, &mut log, &mut stdout) {
+                            return false
+                        }
+                        executions += 1
+                    }
+                }
+                if !harness.bytes_equal(&img_serial, &img_link) {
+                    return harness.fail("serial/link mismatch for " + name + " " + optimized + " " + schedule)
+                }
+            }
+        }
+    }
+
+    var compiler_sha := ""
+    if !sha256_file_checked(cli.compiler, &mut compiler_sha) {
+        return false
+    }
+    src_paths: []string = ["selfhost/mir_link.ddr", "tests/mir_link.ddr", "tests/fixtures/mir-link-emitter.ddr"]
+    var src_shas: []string = []
+    for p in src_paths {
+        var h := ""
+        if !sha256_file_checked(root + "/" + p, &mut h) {
+            return false
+        }
+        src_shas.push(h)
+    }
+
+    if !write_summary_json(output + "/summary.json", &images, executions, compiler_sha, &src_paths, &src_shas) {
+        return false
+    }
+    print("PASS ordered linker: " + images.targets.len.str() + " images, " + executions.str() + " native/Wasm executions; serial equality and atomic rejection contracts")
+    true
+}
+
+pub fn run_suite(cli: &harness.BaseCli) -> bool {
+    if cli.extra_args.len > 0 {
+        return harness.fail("unexpected extra argument: " + cli.extra_args[0])
+    }
+    var root := cli.source_root
+    if root.len == 0 { root = cli.root }
+    rp_root := fs.realpath(root)
+    if !rp_root.ok {
+        return harness.fail("source root not found: " + root)
+    }
+    root = rp_root.value
+
+    var output := cli.output_dir
+    if output.len == 0 {
+        output = cli.root + "/build/mir-link-qa"
+    }
+    if !fs.mkdir_all(output).ok {
+        return harness.fail("failed to create output directory: " + output)
+    }
+    rp_out := fs.realpath(output)
+    if rp_out.ok { output = rp_out.value }
+
+    var log := CmdLog {
+        arg_starts: [],
+        arg_counts: [],
+        args: [],
+        exits: [],
+        stdouts: [],
+        stderrs: [],
+    }
+    ok := run_inner(&cli, root, output, &mut log)
+    wrote_cmds := write_commands_json(output + "/commands.json", &log)
+    ok && wrote_cmds
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok {
+        _ := sys.eprint(cli.error)
+        return 2
+    }
+    if !run_suite(&cli) {
+        return 1
+    }
+    0
+}

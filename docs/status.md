@@ -168,6 +168,11 @@ begränsade grupperna har nåbara OS-, fil- eller socketanrop.
 | `tests/net_loopback.ddr::stream_set_pool_and_slot_reuse` | Socketpool (`std.net`) |
 | `tests/net_loopback.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
 | `tests/net_loopback.ddr::errors_remain_values` | Fel från filåtkomst |
+| `tests/process_fs.ddr::fs_temp_dir_links_listing_and_safe_remove_all` | Kataloger, länkar och rekursiv städning (`std.fs`) |
+| `tests/process_fs.ddr::process_grant_and_env_cwd_stderr_exit_code` | Subprocesser, miljö och delegerade `Executable`-handtag (`std.process`) |
+| `tests/process_fs.ddr::process_large_simultaneous_stdin_stdout_pipe_without_deadlock` | Icke-blockerande pipe-strömning (`std.process`) |
+| `tests/process_fs.ddr::process_launch_failures_report_portable_errno` | Startfel över CLOEXEC-rör (`std.process`) |
+| `tests/process_fs.ddr::process_timeout_and_background_child_spawn` | Timeout, processgrupper och bakgrundsprocesser (`std.process`) |
 | `selfhost/compile.ddr::string_operand_leases_are_removed_only_across_effect_free_rhs` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::ownership_proofs_do_not_change_validation_or_binding_records` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants` | Kompilatorns filåtkomst |
@@ -196,7 +201,7 @@ node tools/test-wasm.mjs "$dunder_bin"
 node tools/test-wasm-scalars.mjs "$dunder_bin"
 node tools/test-wasm-abi.mjs "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
-python3 tools/test-diagnostics.py "$dunder_bin"
+"$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
 ```
 
 Wasm-program som behöver filer, processer eller grafik måste deklarera

@@ -1,0 +1,210 @@
+capability process, filesystem
+
+import .harness as harness
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn split_lines(s: string) -> []string {
+    var out: []string = []
+    if s.len == 0 { return out }
+    raw := text.split(s, "\n")
+    var limit := raw.len
+    if limit > 0 && raw[limit - 1].len == 0 {
+        limit -= 1
+    }
+    for i in 0..limit {
+        var line := raw[i]
+        if line.len > 0 && line[line.len - 1] == 13 {
+            line = line[0..line.len - 1]
+        }
+        out.push(line)
+    }
+    out
+}
+
+fn run_wasm_expect(root: string, path: string, expected: string, work: string) -> bool {
+    res := harness.exec_cmd("node", [root + "/tools/runtime-contract-wasm.cjs", path], work, false, 30000)
+    out_txt := process.stdout_text(&res)
+    err_txt := process.stderr_text(&res)
+    if !res.ok || res.timed_out || res.signal != 0 || res.code != 0 || out_txt != expected {
+        return harness.fail("Wasm execution: " + res.code.str() + "\n" + out_txt + err_txt)
+    }
+    true
+}
+
+fn check_ok_records(stdout_str: string) -> bool {
+    lines := split_lines(stdout_str)
+    if lines.len == 0 {
+        return harness.fail("missing successful check: " + stdout_str)
+    }
+    for i in 0..lines.len {
+        doc := json.parse_text(lines[i])
+        if !doc.ok || json.kind(&doc, doc.root) != .Object {
+            return harness.fail("invalid check JSON line: " + lines[i])
+        }
+        if i == lines.len - 1 {
+            kind_f := json.get_str(&doc, doc.root, "kind")
+            if !kind_f.ok || kind_f.value != "ok" {
+                return harness.fail("missing successful check: " + stdout_str)
+            }
+        }
+    }
+    true
+}
+
+fn run_all(cli: &harness.BaseCli, host: string, work: string) -> bool {
+    fixtures := cli.root + "/tests/fixtures/resolver_scopes"
+    if !harness.copy_ddr_files(fixtures, work) { return false }
+
+    expected_out := "0\n1\n2\n3\n3\n3\n3\n3\n3\n5\n6\n3\n99\n"
+    source := work + "/main.ddr"
+    all_targets := harness.targets()
+    opt_modes: []string = ["off", "on"]
+
+    for target in all_targets {
+        var mode_records: []string = []
+        for mode in opt_modes {
+            opt_flag := "--scalar-opt=" + mode
+            var checked := harness.empty_output()
+            if !harness.run_checked(cli.compiler, ["check", source, "--agent", "--target", target, opt_flag], work, 0, true, &mut checked) {
+                return false
+            }
+            checked_txt := process.stdout_text(&checked)
+            if !check_ok_records(checked_txt) { return false }
+            mode_records.push(checked_txt)
+
+            image := work + "/consumer-" + target + "-" + mode
+            var built := harness.empty_output()
+            if !harness.run_checked(cli.compiler, ["build", source, "-o", image, "--target", target, opt_flag], work, 0, true, &mut built) {
+                return false
+            }
+            if target == host {
+                actual := harness.exec_cmd(image, [], work, true, 10000)
+                act_out := process.stdout_text(&actual)
+                if !actual.ok || actual.timed_out || actual.signal != 0 || actual.code != 0 || act_out != expected_out {
+                    return harness.fail("native execution: " + act_out + process.stderr_text(&actual))
+                }
+            } else if target == "wasm32" {
+                if !run_wasm_expect(cli.root, image, expected_out, work) {
+                    return false
+                }
+            }
+        }
+        if mode_records[0] != mode_records[1] {
+            return harness.fail("optimization changed binding records for " + target)
+        }
+    }
+
+    main_src := sys.read_text(source)
+    if !main_src.ok { return harness.fail("failed to read main.ddr") }
+    tests := work + "/cases.ddr"
+    test_body := main_src.value + "\n@test fn iterator_scope(){" +
+                 "for i in (Bound{value:0}.value)..i(){assert(i>=0&&i<3)}}\n"
+    if !sys.write_text(tests, test_body).ok {
+        return harness.fail("failed to write cases.ddr")
+    }
+
+    for mode in opt_modes {
+        opt_flag := "--scalar-opt=" + mode
+        var test_res := harness.empty_output()
+        if !harness.run_checked(cli.compiler, ["test", tests, "--target", host, opt_flag, "-o", work + "/suite-" + mode], work, 0, true, &mut test_res) {
+            return false
+        }
+        if text.find(process.stdout_text(&test_res), "1 passed, 0 failed") < 0 {
+            return harness.fail("unexpected test stdout: " + process.stdout_text(&test_res))
+        }
+        wasm_img := work + "/test-" + mode + ".wasm"
+        var bt_res := harness.empty_output()
+        if !harness.run_checked(cli.compiler, ["build-tests", tests, "--group", "0", "--target", "wasm32", opt_flag, "-o", wasm_img], work, 0, true, &mut bt_res) {
+            return false
+        }
+        if !run_wasm_expect(cli.root, wasm_img, "", work) {
+            return false
+        }
+    }
+
+    inv_texts: []string = [
+        "struct Bound{value:i32}\nfn main(){for index in (Bound{value:0}.value)..1{};print(index)}",
+        "struct Bound{value:i32}\nfn main(){for index in Bound{value:0}.value..1{index=1}}",
+        "fn scope(n:i32)->i32{for index in 0..n{};return index}\nfn main(){}",
+    ]
+    inv_msgs: []string = [
+        "unknown local 'index'",
+        "assignment requires a mutable stored value",
+        "unknown local 'index'",
+    ]
+
+    for number in 0..inv_texts.len {
+        invalid := work + "/invalid-" + number.str() + ".ddr"
+        if !sys.write_text(invalid, inv_texts[number]).ok {
+            return harness.fail("failed to write " + invalid)
+        }
+        for target in all_targets {
+            var outputs: []string = []
+            for mode in opt_modes {
+                options: []string = ["check", invalid, "--agent", "--target", target, "--scalar-opt=" + mode]
+                var res := harness.empty_output()
+                if !harness.run_checked(cli.compiler, options, work, 1, true, &mut res) {
+                    return false
+                }
+                res_out := process.stdout_text(&res)
+                lines := split_lines(res_out)
+                if lines.len != 1 {
+                    return harness.fail("expected 1 error record, got: " + res_out)
+                }
+                doc := json.parse_text(lines[0])
+                if !doc.ok || json.kind(&doc, doc.root) != .Object {
+                    return harness.fail("invalid error JSON: " + lines[0])
+                }
+                kind_f := json.get_str(&doc, doc.root, "kind")
+                msg_f := json.get_str(&doc, doc.root, "message")
+                if !kind_f.ok || kind_f.value != "error" || !msg_f.ok || text.find(msg_f.value, inv_msgs[number]) < 0 {
+                    return harness.fail("unexpected scope error record: " + res_out)
+                }
+                outputs.push(res_out)
+                if cli.baseline.len > 0 {
+                    var prev := harness.empty_output()
+                    if !harness.run_checked(cli.baseline, options, work, 1, true, &mut prev) {
+                        return false
+                    }
+                    if !harness.bytes_equal(&prev.stdout, &res.stdout) || !harness.bytes_equal(&prev.stderr, &res.stderr) {
+                        return harness.fail("scope diagnostic changed: " + process.stdout_text(&prev) + res_out)
+                    }
+                }
+            }
+            if outputs[0] != outputs[1] {
+                return harness.fail("optimization changed scope diagnostic for " + target)
+            }
+        }
+    }
+    true
+}
+
+pub fn run_suite(cli: &harness.BaseCli) -> bool {
+    if cli.extra_args.len > 0 {
+        return harness.fail("unexpected argument: " + cli.extra_args[0])
+    }
+    host := process.host_target()
+    if host != "arm64-macos" && host != "arm64-linux" && host != "x86_64-linux" {
+        return harness.fail("unsupported execution host: " + host)
+    }
+    tmp := fs.temp_dir("dunder-resolver-")
+    if !tmp.ok {
+        return harness.fail("temp_dir failed")
+    }
+    ok := run_all(&cli, host, tmp.value)
+    _ := fs.remove_all(tmp.value)
+    if !ok { return false }
+    print("Resolver scopes passed: all four targets, native/Wasm, both modes and test bodies")
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if !run_suite(&cli) { return 1 }
+    0
+}

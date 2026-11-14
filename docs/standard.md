@@ -91,12 +91,15 @@ flyttar återstår. Ägda allokeringar återvinns automatiskt; se
 | `std.set` | `Set` av strängar; `new`, `length`, `reserve`, `insert`, `contains`, `remove`, `clear`, `items`. |
 | `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
-| `std.bytes` | Växande bytebuffertar som `[]i32`, textappend, nollfyllning, little-/big-endian-kodning, `hex`, kontrollerad UTF-8-avkodning. |
+| `std.bytes` | Växande bytebuffertar (`[]u8` och `[]i32`), textappend, nollfyllning, little-/big-endian-kodning (`u16_le`, `u32_le`, `i64_le`, `u64_le`), `hex` / `hex_u8`, kontrollerad UTF-8-avkodning. |
+| `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader`). |
+| `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`parse_bytes`, `parse_text`, `field`, `at`, `get_str`, `get_i64`, `get_u64`, `get_bool`). |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
-| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning och process-ID; se [sys](sys.md). |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms` och process-ID; se [sys](sys.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
-| `std.fs` | Delegerade läs- och skrivhandtag till en fil. Se [filsystemets kapabiliteter](ffi.md). |
+| `std.fs` | Delegerade läs-/skriv-/kataloghandtag samt katalog- och filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
+| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command`, `run`, `run_in`, `status`, `exec`, `spawn` (`Child` med icke-blockerande pipes, `read_stdout_line`, `terminate`, `kill`, `wait`), delegerade `Executable`-handtag (`grant`, `run_granted`) samt miljö- och värdfrågor (`env`, `host_os`, `host_arch`, `host_target`). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel

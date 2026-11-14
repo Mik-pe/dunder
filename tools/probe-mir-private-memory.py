@@ -3,7 +3,7 @@
 
 Two fresh CLI builds and one small native result check per compiler; no timing
 series. This is aggregate whole-source MIR evidence, not a per-loop dump.
-Standalone test-mir-memory.py supplies exact per-loop alias/sync contracts.
+Standalone test_mir_memory.ddr supplies exact per-loop alias/sync contracts.
 """
 import argparse
 import hashlib

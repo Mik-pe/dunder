@@ -21,7 +21,9 @@ total = total + 1      // tilldelning till befintlig muterbar bindning
 
 `:=` deklarerar ett nytt namn i det aktuella blocket och härleder dess typ.
 `: Typ =` gör samma sak med en explicit typ. Ett nytt `:=` med samma namn i
-samma scope är ett fel. Ett inre block får skugga ett yttre namn.
+samma scope är ett fel. `_ := expr` kastar bort ett returvärde utan att binda
+ett läsbart namn och kan upprepas i samma scope. Ett inre block får skugga ett
+yttre namn.
 
 I värdeuttryck väljs en aktiv lokal bindning före ett namngivet typnamn.
 En arrayparameter `Values` kan därför använda `Values.len` även om det

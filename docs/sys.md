@@ -58,6 +58,8 @@ implementeras i [native-backenden](../selfhost/runtime_sys.ddr).
 | `sys.arg(index)` | `string` | Kopierar och UTF-8-validerar ett argument; `arg(0)` är programnamnet. |
 | `sys.same_file(first, second)` | `bool` | Jämför device/inode, följer länkar. Falskt om stat eller sökvägskontroll misslyckas. |
 | `sys.make_executable(path)` | `sys.Status` | Sätter läge 0755; används för färdigbyggda program. |
+| `sys.now_ms()` | `i64` | Monoton klocka i millisekunder. |
+| `sys.sleep_ms(ms)` | `()` | Pausar aktuell tråd minst `ms` millisekunder. |
 
 Samtliga sökvägar och textargument har typen `string`. `read` använder enums:
 
@@ -200,7 +202,7 @@ dunder test tests/net_loopback.ddr
 
 Testsviten `tests/net_loopback.ddr` provar klocka (`sys.now_ms`), råa
 byte-läsningar (`sys.read_u8_limit`, `fs.ReadDir` + `fs.resolve_read`),
-filflöde, felkoder och icke-blockerande TCP-sockets. [Filhandtagsprov](../tools/test-files.py).
+filflöde, felkoder och icke-blockerande TCP-sockets. [Filhandtagsprov](../tools/test_files.ddr).
 
 Implementationens syscallnummer och stat-layout är verifierade mot
 [Apples XNU-anrop](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master)

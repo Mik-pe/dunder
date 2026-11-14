@@ -1,0 +1,181 @@
+capability process, filesystem
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn repeat_ascii(ch: u8, n: i32) -> string {
+    var buf: []u8 = []
+    buf.reserve(n)
+    for _ in 0..n { buf.push(ch) }
+    bytes.decode(&buf).value
+}
+
+fn first_line(s: string) -> string {
+    parts := text.split(s, "\n")
+    if parts.len == 0 { return "" }
+    var line := parts[0]
+    if line.len > 0 && line[line.len - 1] == 13 {
+        line = line[0..line.len - 1]
+    }
+    line
+}
+
+fn run_all(cli: &harness.BaseCli, work: string) -> bool {
+    host := harness.target_name(harness.host_id())
+    all_targets := harness.targets()
+
+    deep := work + "/deep.ddr"
+    deep_src := "struct Cond{value:bool}\nfn value()->i32{if " +
+                repeat_ascii(b'(', 60) + "Cond{value:[true][0]}.value" + repeat_ascii(b')', 60) +
+                "{42}else{0}}\nfn main(){print(value())}\n"
+    if !sys.write_text(deep, deep_src).ok {
+        return harness.fail("write_text failed on " + deep)
+    }
+
+    contract_rp := fs.realpath(cli.root + "/tests/contracts/conditional_boundaries.ddr")
+    if !contract_rp.ok {
+        return harness.fail("missing tests/contracts/conditional_boundaries.ddr")
+    }
+    pos_sources: []string = [contract_rp.value, deep]
+
+    err_dir := cli.root + "/tests/fixtures/conditional_errors"
+    err_ls := fs.list_dir(err_dir)
+    if !err_ls.ok {
+        return harness.fail("list_dir failed on " + err_dir)
+    }
+    var err_sources: []string = []
+    for name in err_ls.entries {
+        if text.ends_with(name, ".ddr") {
+            rp := fs.realpath(err_dir + "/" + name)
+            if !rp.ok { return harness.fail("realpath failed on " + name) }
+            err_sources.push(rp.value)
+        }
+    }
+
+    var previous: []u8 = []
+    bytes.append_utf8(&mut previous, "previous successful output")
+
+    modes: []string = ["on", "off"]
+    for mode in modes {
+        opt_flag := "--scalar-opt=" + mode
+        for target in all_targets {
+            for src in pos_sources {
+                checked := harness.exec_cmd(cli.compiler, ["check", src, opt_flag, "--target", target, "--agent"], "", false, 30000)
+                if !checked.ok || checked.timed_out || checked.signal != 0 || checked.code != 0 {
+                    return harness.fail("check failed for " + src + " (" + mode + ", " + target + "): " + process.stderr_text(&checked) + process.stdout_text(&checked))
+                }
+
+                out_img := work + "/" + harness.stem(src) + "-" + mode + "-" + target
+                built := harness.exec_cmd(cli.compiler, ["build", src, opt_flag, "--target", target, "-o", out_img], "", false, 30000)
+                if !built.ok || built.timed_out || built.signal != 0 || built.code != 0 {
+                    return harness.fail("build failed for " + src + " (" + mode + ", " + target + "): " + process.stderr_text(&built))
+                }
+
+                if target == host || target == "wasm32" {
+                    var run_res := harness.empty_output()
+                    if target == host {
+                        run_res = harness.exec_cmd(out_img, [], "", false, 10000)
+                    } else {
+                        run_res = harness.exec_cmd("node", [cli.root + "/tools/runtime-contract-wasm.cjs", out_img], "", false, 10000)
+                    }
+                    if !run_res.ok || run_res.timed_out || run_res.signal != 0 || run_res.code != 0 || process.stdout_text(&run_res) != "42\n" {
+                        return harness.fail("run failed for " + src + " (" + mode + ", " + target + "): " + process.stdout_text(&run_res) + process.stderr_text(&run_res))
+                    }
+                }
+            }
+
+            for err_src in err_sources {
+                src_txt := sys.read_text(err_src)
+                src_meta := sys.metadata(err_src)
+                if !src_txt.ok || !src_meta.ok {
+                    return harness.fail("could not read/stat " + err_src)
+                }
+                line0 := first_line(src_txt.value)
+                var expected := line0
+                if text.starts_with(line0, "// error: ") {
+                    expected = line0[10..line0.len]
+                }
+
+                preserved := work + "/preserved-image"
+                if !sys.write_u8(preserved, &previous).ok {
+                    return harness.fail("write_u8 failed on " + preserved)
+                }
+
+                cmds: []string = ["check", "build"]
+                for cmd_name in cmds {
+                    var args: []string = [cmd_name, err_src, opt_flag, "--target", target]
+                    if cmd_name == "check" {
+                        args.push("--agent")
+                    } else {
+                        args.push("-o")
+                        args.push(preserved)
+                    }
+
+                    failed := harness.exec_cmd(cli.compiler, args, "", false, 30000)
+                    var message := process.stderr_text(&failed)
+                    if cmd_name == "check" {
+                        doc := json.parse_bytes(&failed.stdout)
+                        if !doc.ok || json.kind(&doc, doc.root) != .Object {
+                            return harness.fail("invalid JSON diagnostic on " + err_src + ": " + process.stdout_text(&failed))
+                        }
+                        kind_f := json.get_str(&doc, doc.root, "kind")
+                        path_f := json.get_str(&doc, doc.root, "path")
+                        start_f := json.get_i64(&doc, doc.root, "start")
+                        end_f := json.get_i64(&doc, doc.root, "end")
+                        msg_f := json.get_str(&doc, doc.root, "message")
+                        if !kind_f.ok || kind_f.value != "error" || !path_f.ok || !start_f.ok || !end_f.ok || !msg_f.ok {
+                            return harness.fail("missing fields in diagnostic on " + err_src)
+                        }
+                        rp := fs.realpath(path_f.value)
+                        if !rp.ok || rp.value != err_src {
+                            return harness.fail("diagnostic path mismatch on " + err_src)
+                        }
+                        if start_f.value < 0 || start_f.value > end_f.value || end_f.value > src_meta.size {
+                            return harness.fail("invalid span in diagnostic on " + err_src)
+                        }
+                        message = msg_f.value
+                    }
+
+                    if !failed.ok || failed.timed_out || failed.signal != 0 || failed.code != 1 || text.find(message, expected) < 0 {
+                        return harness.fail("expected error '" + expected + "' on " + err_src + " (" + cmd_name + "), got: " + message)
+                    }
+
+                    pres_now := sys.read_u8(preserved)
+                    if !pres_now.ok || !harness.bytes_equal(&pres_now.value, &previous) {
+                        return harness.fail("output not preserved on failed " + cmd_name + " for " + err_src)
+                    }
+                }
+            }
+
+            print("PASS " + target + " scalar-opt=" + mode + " constructors/groups/shadowing/diagnostics")
+        }
+    }
+    true
+}
+
+pub fn run_suite(cli: &harness.BaseCli) -> bool {
+    if cli.extra_args.len > 0 {
+        return harness.fail("unexpected argument: " + cli.extra_args[0])
+    }
+    tmp := fs.temp_dir("dunder-conditionals-")
+    if !tmp.ok {
+        return harness.fail("temp_dir failed")
+    }
+    ok := run_all(&cli, tmp.value)
+    _ := fs.remove_all(tmp.value)
+    if !ok { return false }
+    print("All four targets and both scalar modes checked/built; host+Wasm executed; diagnostic outputs preserved")
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if !run_suite(&cli) { return 1 }
+    0
+}
