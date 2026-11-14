@@ -102,8 +102,7 @@ i `dogfood/graphics/` beskriver bibliotekens C-layout, slår upp
 funktionspekare och äger fönster-, renderings- och händelselogiken. WebGPU-exemplet
 i `dogfood/webgpu/` anropar sin JavaScript-värd via en vanlig Wasm-import.
 Kompilatorns del av grafikanropen är det generella FFI-stödet och
-kodgenereringen för målet. Se [FFI](ffi.md), [Metal-exemplet](macos-metal.md)
-och [Vulkan-exemplet](linux-vulkan.md).
+kodgenereringen för målet. Se [FFI](ffi.md).
 
 Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
 anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen

@@ -153,7 +153,7 @@ instrumenteras. [Profilering](incremental.md#mät-byggkedjans-faser).
 Grafikexemplen (Metal, Vulkan, WebGPU), CSV-verktyget Tabell och
 HTTP/1.1-servern underhålls i syskonrepot
 [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
-Se [Metal](macos-metal.md), [Vulkan](linux-vulkan.md) och [macOS-appar](app-bundles.md).
+Se även [macOS-appar](app-bundles.md).
 
 ## Körda Wasm-kontrakt
 
