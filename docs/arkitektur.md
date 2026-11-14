@@ -70,6 +70,17 @@ funktioner, datasegment och importplatser länkas in i programmet. Frigöring
 av ägda lokaler och tillfälliga värden genereras vid respektive utgång ur
 ett scope. [Kodgenerering och kontroller](optimization.md).
 
+Självhosten i `selfhost/` är uppdelad i avgränsade moduler:
+`frontend_types` (frontendtyper och symboltabeller), `ffi_abi`
+(C-layout och plattforms-ABI), `task_certify` (statisk effekt- och
+kloncertifiering för tasks), `compile_session` (kärntillstånd och
+länksession), `compile` (seriell drivrutin och frontend/check) samt
+`compile_parallel` (workerstyrd backend). Vid parallell kompilering
+strömmar föräldern packade `mir_task.Batch`-enheter genom ett begränsat
+`task scope`-fönster där arbetare kör `mir_pipeline` och `mir_lower` till
+numerisk `ObjectData`, innan föräldern accepterar, cachar och länkar
+resultaten deterministiskt i deklarationsordning.
+
 ## Verktygskedjan och målplattformarna
 
 Native-målen är `arm64-macos`, `arm64-linux` och `x86_64-linux`.

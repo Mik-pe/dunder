@@ -30,10 +30,12 @@ Resultatet sparas tills scopet avslutas.
 
 ## Ägare och resultatnycklar
 
-Scopet äger trådar, inputsnapshots och cachade resultat. Det väntar in alla
-jobb innan det släpper några av dessa föräldraägda värden. Detta gäller
-vanlig blockutgång, `return`, `break` och `continue`. Ett resultat som aldrig
-efterfrågas behöver inte kopieras tillbaka från arbetaren.
+Scopet äger trådar, inputsnapshots, poolade workerarenor och cachade
+resultat. Varje jobbs `input_snapshot` frigörs tidigt så snart jobbet
+samlas in, medan scopet väntar in samtliga jobb innan återstående
+föräldraägda värden släpps och poolade workerarenor avmappas vid utgång.
+Detta gäller vanlig blockutgång, `return`, `break` och `continue`. Ett
+resultat som aldrig efterfrågas behöver inte kopieras tillbaka från arbetaren.
 
 `TaskID<R>` är en typad 64-bitarsnyckel. Den kan kopieras, returneras och
 lagras i arrayer; en kopia skapar ingen ytterligare trådägare. Den är inte
@@ -69,11 +71,14 @@ okända indirekta anrop och nästlad task-scheduling. Även hjälpfunktionernas
 anrop och semantiskt kontrollerad död kod ingår. Enbart en funktionssignatur
 bevisar inte att en worker är tillåten.
 
-Föräldern skapar först en fristående inputsnapshot. Arbetaren klonar denna
-till sin egen pool innan den anropar källfunktionen. Efter lyckad join
-klonas resultatet till förälderns pool innan barnpoolen återvinns. Inga
-vanliga managed-handtag delas över gränsen och vanlig RC behöver därför
-inte göras atomisk för denna modell.
+Föräldern skapar först en fristående `input_snapshot`. Arbetaren klonar denna
+till en workerarena om 512 MiB innan den anropar källfunktionen. Efter lyckad
+join klonas resultatet till förälderns pool, jobbets `input_snapshot`
+frigörs direkt vid insamlingen och barnarenan återställs till en
+scope-lokal pool med upp till 64 återanvändbara workerarenor för
+efterföljande jobb inom samma scope (samtliga avmappas när scopet
+stängs). Inga vanliga managed-handtag delas över gränsen och vanlig RC
+behöver därför inte göras atomisk för denna modell.
 
 ## Fel och kompilering
 
@@ -83,11 +88,14 @@ har avslutats; felvägen får därför inte läsa eller frigöra dess lagring.
 Vanliga runtimefällor i en worker behåller processavslut som felmekanism.
 Cancellation, detach och återhämtning från taskfel ingår inte i första API:t.
 
-Taskprogram får en separat full semantisk certifiering före emission.
-Den riktiga emissionen behåller skaläroptimering, inlining och MIR-passen.
-Funktionscache avstår för taskprogram tills certifierade effekter och
-beroenden kan lagras och återställas tillsammans med fragmenten.
-Vanliga seriella program gör ingen extra certifieringsgenomgång.
+Taskprogram får en full semantisk certifiering före kodemission. Vid
+vanlig `dunder check` (utan separat agentrapport) certifieras
+tasksemantiken direkt i en enda genomgång (`in_place_certify`); vid
+kodbygge körs certifieringen först, varefter den riktiga emissionen
+behåller skaläroptimering, inlining och MIR-passen. Funktionscache avstår
+för taskprogram tills certifierade effekter och beroenden kan lagras och
+återställas tillsammans med fragmenten. Vanliga seriella program gör
+ingen extra certifieringsgenomgång.
 
 ## Kompilatorn som taskkonsument
 
@@ -97,17 +105,21 @@ ARM64/macOS. Standardingången använder fyra workers; `--jobs N` eller
 trådar, även vid korskompilering till Linux eller Wasm. Ett kompilerat
 programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
-En enda `compile.Session` behåller frontend, typ- och lånekontroll,
+En enda `compile_session.Session` behåller frontend, typ- och lånekontroll,
 symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
-Föräldern lämnar ägda hela MIR-funktioner i ett begränsat taskfönster.
-Workers kör samma `mir_pipeline` som den seriella drivrutinen: verifiering,
-framepromovering, valbar SSA och värdepass, följt av nödvändig
-efterverifiering. Samma worker sänker sedan funktionen med den gemensamma
-`mir_lower`-gången direkt till ägd numerisk `ObjectData`. Varje kallt jobb
-startar en OS-tråd och skapar lokala pipeline-/sänkningsarenor. Fönstret
-omfattar högst `workers` källsteg; ingen permanent worker- eller arenapool
-används. Resultatet innehåller slutobjekt och status/statistik, inte hela
-MIR-funktionen. Varken Session eller globala tabeller delas muterbart.
+`compile_parallel` strömmar ägda MIR-funktioner i ett enda `task scope`
+som ett FIFO-glidfönster med plattpackade `mir_task.Batch`-jobb och
+motsvarande `mir_task.BatchAnswer`-svar (adaptiv batchstorlek mellan 2 och 8
+funktioner), vilket håller ned antal `spawn`/`await`-omgångar. Arbetarna
+återanvänder scopets poolade workerarenor och kör samma `mir_pipeline` som
+den seriella drivrutinen — med `mir_pipeline.CoreWorkspace` som hoppar
+över SSA-arbetsminne när `--mir-ssa=off` — följt av verifiering,
+framepromovering, valbar SSA och värdepass samt nödvändig efterverifiering.
+Samma worker sänker sedan varje funktion med den gemensamma `mir_lower`-gången
+direkt till ägd numerisk `ObjectData`. Varje `spawn` skapar en OS-tråd
+som arbetar mot återanvänd sänknings-/pipelinearena ur scopets pool.
+Resultatet innehåller slutobjekt och status/statistik, inte hela
+MIR-funktionen. Varken `Session` eller globala tabeller delas muterbart.
 
 `ObjectData` är en vanlig transparent post med primitiva arenor och går
 genom språkets befintliga snapshot-/klonregler. Den ger inget undantag för
