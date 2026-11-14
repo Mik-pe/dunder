@@ -14,7 +14,11 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -49,6 +53,7 @@ def main():
             raise AssertionError(commands[-1])
         return result.stdout
 
+    js_bin = wasm_host.js_runtime()
     try:
         unit = root / 'tests/mir_object_data.ddr'
         output = call([compiler, 'test', unit, '-o', work / 'unit-native'])
@@ -64,7 +69,7 @@ def main():
                 call([compiler, 'build-tests', unit, '--target', target, '--group', group, '-o', image])
                 units.append({'target': target, 'group': group, 'sha256': digest(image)})
                 if target == 'wasm32':
-                    call(['node', root / 'tools/test-wasm.mjs', '--execute', image], '')
+                    call([js_bin, root / 'tools/test-wasm.mjs', '--execute', image], '')
             if target == 'wasm32': groups[target] = len(listing)
         if host == 0:
             emitter = work / 'task-emitter'
@@ -85,7 +90,7 @@ def main():
                         if target == host:
                             call([image], ''); executed[name] += 1
                         elif target == 3:
-                            call(['node', root / 'tools/runtime-contract-wasm.cjs', image], '')
+                            call([js_bin, root / 'tools/runtime-contract-wasm.cjs', image], '')
                             executed[name] += 1
         passed = True
     finally:

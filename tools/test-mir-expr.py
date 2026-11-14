@@ -18,6 +18,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 spec = importlib.util.spec_from_file_location('expr_region_qa', ROOT/'tools/test-mir-regions.py')
 region = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(region)
@@ -189,7 +191,7 @@ def main():
     assert fields==observed,(fields-observed,observed-fields)
     report=dict(fields=len(fields),host=host,hashes={},images=[])
     for name,path in dict(compiler=compiler,fixture=fixture,adapter=adapter,support=support,ssa=ROOT/'selfhost/mir_ssa.ddr',expr=ROOT/'selfhost/mir_expr_stack.ddr',generic_oracle=ROOT/'tools/test-mir.py',tool=Path(__file__).resolve(),region_tool=ROOT/'tools/test-mir-regions.py').items(): report['hashes'][name]=region.digest(path)
-    with tempfile.TemporaryDirectory(prefix='dunder-expr-qa-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='dunder-expr-qa-') as tmp, wasm_host.WasmWorker() as wasm:
         work=args.output.resolve() if args.output else Path(tmp)
         if args.output: work.mkdir(parents=True,exist_ok=True);assert not any(work.iterdir())
         def call(command,status=0):
@@ -221,7 +223,11 @@ def main():
             resource=case==17 or (case==16 and not c['changed'])
             ran=False
             if target==host and case!=17: call([image],102 if trap else 0);ran=True
-            elif target==3: call(['node',ROOT/'tools/runtime-contract-wasm.cjs',image],125 if trap or resource else (77 if case==16 else 0));ran=True
+            elif target==3:
+                expected_wasm = 125 if trap or resource else (77 if case==16 else 0)
+                wres = wasm.run(image)
+                assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
+                ran=True
             if args.output:image.with_suffix('.mir.txt').write_text(text)
             report['images'].append(dict(case=case,name=NAMES[case],input=value,control=control,target=target,mode=mode,origin=origin,storage=storage,terminal=terminal,limit=limit,executed=ran,sha256=region.digest(image),counters=c,before_traffic=before,after_traffic=after,before=pre,after=post))
             return c

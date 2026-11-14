@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const compiler = process.argv[2];
-if (!compiler) throw new Error('usage: node tools/test-wasm-scalars.mjs <dunder-compiler>');
+if (!compiler) throw new Error('usage: bun tools/test-wasm-scalars.mjs <dunder-compiler>');
 const source = fileURLToPath(new URL('../tests/fixtures/wasm_scalars.ddr', import.meta.url));
 const dir = mkdtempSync(join(tmpdir(), 'dunder-wasm-scalars-'));
 try {

@@ -1,0 +1,484 @@
+capability process, filesystem
+
+import std.array as array
+import std.bytes as bytes
+import std.fs as fs
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+struct Jobs {
+    names: []string,
+    progs: []string,
+    arg_start: []i32,
+    arg_end: []i32,
+    all_args: []string,
+    deps: []i32,
+    is_fast: []bool,
+}
+
+fn new_jobs() -> Jobs {
+    Jobs {
+        names: [], progs: [], arg_start: [], arg_end: [],
+        all_args: [], deps: [], is_fast: [],
+    }
+}
+
+fn add_job(j: &mut Jobs, name: string, prog: string, args: []string, dep: i32, fast: bool) -> i32 {
+    id := j.names.len
+    j.names.push(name)
+    j.progs.push(prog)
+    j.arg_start.push(j.all_args.len)
+    for a in args { j.all_args.push(a) }
+    j.arg_end.push(j.all_args.len)
+    j.deps.push(dep)
+    j.is_fast.push(fast)
+    id
+}
+
+fn js_runtime() -> string {
+    env_rt := process.env_or("DUNDER_JS", "")
+    if env_rt.len > 0 { return env_rt }
+    for dir in text.split(process.env_or("PATH", ""), ":") {
+        if dir.len > 0 && sys.metadata(dir + "/bun").is_file { return dir + "/bun" }
+    }
+    home := process.env_or("HOME", "")
+    if home.len > 0 {
+        for cand in [home + "/.local/share/mise/shims/bun", home + "/.local/bin/bun", home + "/.bun/bin/bun"] {
+            if sys.metadata(cand).is_file { return cand }
+        }
+    }
+    "node"
+}
+
+fn add_wasm_pair(j: &mut Jobs, compiler: string, js_rt: string, root: string, work: string, mod_name: string, fast: bool) {
+    wasm_path := work + "/" + mod_name + ".wasm"
+    src_path := root + "/tests/" + mod_name + ".ddr"
+    b_id := add_job(&mut j, "wasm-build:" + mod_name, compiler,
+        ["build-tests", src_path, "--target", "wasm32", "--jobs", "1", "-o", wasm_path], -1, fast)
+    _ := add_job(&mut j, "wasm-exec:" + mod_name, js_rt,
+        [root + "/tools/test-wasm.mjs", "--execute", wasm_path], b_id, fast)
+}
+
+fn add_ddr_tool(j: &mut Jobs, compiler: string, root: string, work: string, tool_name: string, fast: bool) {
+    bin_path := work + "/tool-" + tool_name
+    src_path := root + "/tools/" + tool_name + ".ddr"
+    _ := add_job(&mut j, tool_name, compiler,
+        ["run", src_path, "--jobs", "1", "-o", bin_path, "--", compiler], -1, fast)
+}
+
+fn add_unit_test(j: &mut Jobs, compiler: string, root: string, work: string, mod_name: string, unit_jobs: string, fast: bool) {
+    out_dir := work + "/unit-" + mod_name
+    src_path := root + "/tests/" + mod_name + ".ddr"
+    _ := add_job(&mut j, "unit:" + mod_name, compiler,
+        ["test", src_path, "--jobs", unit_jobs, "-o", out_dir], -1, fast)
+}
+
+fn format_sec(ms: i64) -> string {
+    sec := ms / 1000
+    tenths := (ms % 1000) / 100
+    sec.str() + "." + tenths.str() + "s"
+}
+
+fn matches_filters(name: string, filters: &[]string) -> bool {
+    if filters.len == 0 { return true }
+    for f in filters {
+        if text.find(name, f) >= 0 { return true }
+    }
+    false
+}
+
+fn main() -> i32 {
+    t_start := sys.now_ms()
+    var compiler_arg := ""
+    var serial_arg := ""
+    var mir_reports_arg := ""
+    var fast_only := false
+    var max_workers := process.host_cpus()
+    var filters: []string = []
+
+    argc := sys.arg_count()
+    var ai := 1
+    while ai < argc {
+        a := sys.arg(ai)
+        if a == "--fast" {
+            fast_only = true
+        } else if a == "--full" {
+            fast_only = false
+        } else if a == "--jobs" {
+            if ai + 1 >= argc { _ := sys.eprint("--jobs requires a value"); return 2 }
+            ai += 1
+            parsed := parse.integer(sys.arg(ai))
+            if !parsed.ok || parsed.value < 1 || parsed.value > 128 {
+                _ := sys.eprint("--jobs must be between 1 and 128")
+                return 2
+            }
+            max_workers = i32(parsed.value)
+        } else if a == "--filter" {
+            if ai + 1 >= argc { _ := sys.eprint("--filter requires a substring"); return 2 }
+            ai += 1
+            filters.push(sys.arg(ai))
+        } else if a == "--serial-compiler" {
+            if ai + 1 >= argc { _ := sys.eprint("--serial-compiler requires a path"); return 2 }
+            ai += 1
+            serial_arg = sys.arg(ai)
+        } else if a == "--mir-reports" {
+            if ai + 1 >= argc { _ := sys.eprint("--mir-reports requires a directory"); return 2 }
+            ai += 1
+            mir_reports_arg = sys.arg(ai)
+        } else if text.starts_with(a, "-") {
+            _ := sys.eprint("unknown option: " + a)
+            return 2
+        } else if compiler_arg.len == 0 {
+            compiler_arg = a
+        } else {
+            _ := sys.eprint("unexpected positional argument: " + a)
+            return 2
+        }
+        ai += 1
+    }
+
+    if compiler_arg.len == 0 {
+        _ := sys.eprint("usage: verify <compiler> [--fast] [--filter substr] [--jobs N] [--serial-compiler path] [--mir-reports dir]")
+        return 2
+    }
+
+    comp_rp := fs.realpath(compiler_arg)
+    if !comp_rp.ok {
+        _ := sys.eprint("compiler not found: " + compiler_arg)
+        return 1
+    }
+    compiler := comp_rp.value
+
+    cwd_rp := fs.cwd()
+    if !cwd_rp.ok { _ := sys.eprint("cwd failed"); return 1 }
+    var root := cwd_rp.value
+    if !sys.metadata(root + "/selfhost/main.ddr").is_file {
+        // Fallback relative to tools/verify.ddr if invoked from another working directory.
+        parent_rp := fs.realpath(root + "/..")
+        if parent_rp.ok && sys.metadata(parent_rp.value + "/selfhost/main.ddr").is_file {
+            root = parent_rp.value
+        }
+    }
+
+    tmp_res := fs.temp_dir("dunder-verify-")
+    if !tmp_res.ok { _ := sys.eprint("temp_dir failed"); return 1 }
+    work := tmp_res.value
+    defer { _ := fs.remove_all(work) }
+
+    var mir_reports := mir_reports_arg
+    if mir_reports.len == 0 {
+        mir_reports = work + "/mir-reports"
+        if !fs.mkdir_all(mir_reports).ok {
+            _ := sys.eprint("failed creating mir_reports dir")
+            return 1
+        }
+    }
+
+    var serial_compiler := ""
+    if serial_arg.len > 0 {
+        srp := fs.realpath(serial_arg)
+        if srp.ok { serial_compiler = srp.value }
+    } else {
+        default_serial := root + "/build/selfhost/arm64-macos/dunder-serial"
+        if sys.metadata(default_serial).is_file { serial_compiler = default_serial }
+    }
+
+    js_rt := js_runtime()
+    var jobs := new_jobs()
+
+    // Schedule heaviest / multi-process suites first (Longest-Processing-Time-First)
+    // using measured durations so long-running jobs never become tail stragglers.
+    _ := add_job(&mut jobs, "test-const-div", "python3", [root + "/tools/test-const-div.py", compiler, "--verify-selection"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-ssa", "python3", [root + "/tools/test-mir-ssa.py", compiler, "--report", root + "/build/mir-ssa-integrated.json"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-scalar", "python3", [root + "/tools/test-mir-scalar.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-mir-expr", "python3", [root + "/tools/test-mir-expr.py", compiler, "--output", mir_reports + "/expression", "--report", mir_reports + "/expression.json"], -1, false)
+    _ := add_job(&mut jobs, "test-optimizer", "python3", [root + "/tools/test-optimizer.py", compiler, "--verify-selection"], -1, false)
+    _ := add_job(&mut jobs, "test-mir:oracle", "python3", [root + "/tools/test-mir.py", compiler, "--only", "oracle"], -1, false)
+    _ := add_job(&mut jobs, "test-mir:source", "python3", [root + "/tools/test-mir.py", compiler, "--only", "source"], -1, false)
+    _ := add_job(&mut jobs, "test-register-comparisons", "python3", [root + "/tools/test-register-comparisons.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "runtime-contracts-wasm", "python3", [root + "/tools/runtime-contracts.py", compiler, "--target", "wasm32"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-regions", "python3", [root + "/tools/test-mir-regions.py", compiler, "--output", mir_reports + "/regions", "--report", mir_reports + "/regions.json"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-pipeline", "python3", [root + "/tools/test-mir-pipeline.py", compiler, "--report", root + "/build/mir-pipeline-integrated.json"], -1, false)
+    _ := add_job(&mut jobs, "test-cli", "python3", [root + "/tools/test-cli.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-range-analysis", "python3", [root + "/tools/test-range-analysis.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-inline-producer", "python3", [root + "/tools/test-inline-producer.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-array-addresses", "python3", [root + "/tools/test-array-addresses.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-wasm", js_rt, [root + "/tools/test-wasm.mjs", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-mir-values", "python3", [root + "/tools/test-mir-values.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-opt-emitter", "python3", [root + "/tools/test-opt-emitter.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "runtime-contracts", "python3", [root + "/tools/runtime-contracts.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-utf8-next", "python3", [root + "/tools/test-utf8-next.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-fragment-dependencies", "python3", [root + "/tools/test-fragment-dependencies.py", compiler], -1, false)
+    if process.host_target() == "arm64-macos" {
+        if serial_compiler.len > 0 {
+            _ := add_job(&mut jobs, "test-parallel-compiler", "python3",
+                [root + "/tools/test-parallel-compiler.py", compiler, "--baseline", serial_compiler, "--output", root + "/build/parallel-compiler-qa"], -1, false)
+        } else {
+            _ := add_job(&mut jobs, "test-parallel-compiler", "python3",
+                [root + "/tools/test-parallel-compiler.py", compiler, "--output", root + "/build/parallel-compiler-qa"], -1, false)
+        }
+    }
+    _ := add_job(&mut jobs, "test-mir-object-data", "python3",
+        [root + "/tools/test-mir-object-data.py", compiler, "--output", mir_reports + "/object-data"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-stack-origin", "python3",
+        [root + "/tools/test-mir-stack-origin.py", compiler, "--output", mir_reports + "/stack-origin"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-frame-exits", "python3",
+        [root + "/tools/test-mir-frame-exits.py", compiler, "--output", root + "/build/mir-frame-exits-integrated"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-call-flags", "python3",
+        [root + "/tools/test-mir-call-flags.py", compiler, "--output", root + "/build/mir-call-flags-integrated"], -1, false)
+    _ := add_job(&mut jobs, "test-mir-fragments", "python3", [root + "/tools/test-mir-fragments.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-compiler-session", "python3", [root + "/tools/test-compiler-session.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-ssa-source", "python3", [root + "/tools/test-ssa-source.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-record-take", "python3", [root + "/tools/test-record-take.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-record-take-source", "python3", [root + "/tools/test-record-take-source.py", compiler], -1, false)
+    if process.host_target() == "arm64-macos" {
+        _ := add_job(&mut jobs, "test-task-native", "python3", [root + "/tools/test-task-native.py", compiler], -1, false)
+        _ := add_job(&mut jobs, "test-task-scope", "python3", [root + "/tools/test-task-scope.py", compiler], -1, false)
+        _ := add_job(&mut jobs, "test-task-source", "python3", [root + "/tools/test-task-source.py", compiler], -1, false)
+    } else if !fast_only {
+        print("BLOCKED native task execution: first provider requires ARM64/macOS")
+    }
+    _ := add_job(&mut jobs, "test-inline-streaming", "python3", [root + "/tools/test-inline-streaming.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-ownership-leases", "python3", [root + "/tools/test-ownership-leases.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "test-runtime-profile", "python3", [root + "/tools/test-runtime-profile.py", compiler], -1, false)
+    _ := add_job(&mut jobs, "profile-dogfood", "python3", [root + "/tools/profile-dogfood.py", "check", compiler], -1, false)
+    if sys.metadata(root + "/tools/test-upgrade.py").is_file {
+        _ := add_job(&mut jobs, "test-upgrade", "python3", [root + "/tools/test-upgrade.py", compiler], -1, false)
+    }
+
+    // Native Dunder tool harnesses (ordered slowest first)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_range_emitter", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_mir_promotion", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_frame_free", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_inline_catalog", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_mir_memory", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_array_capacity", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_expression_emitter", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_mir_link", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_mir_objects", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_machine_ir", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_mir_entry", false)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_native", false)
+
+    var unit_jobs := "2"
+    if filters.len > 0 { unit_jobs = "4" }
+    else if fast_only { unit_jobs = "3" }
+
+    // Core fast dev-loop suites (fast=true)
+    add_unit_test(&mut jobs, compiler, root, work, "suite", unit_jobs, true)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_diagnostics", true)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_check", true)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_conditionals", true)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_resolver", true)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_ffi", true)
+    add_ddr_tool(&mut jobs, compiler, root, work, "test_files", true)
+    _ := add_job(&mut jobs, "test-wasm-scalars", js_rt, [root + "/tools/test-wasm-scalars.mjs", compiler], -1, true)
+    _ := add_job(&mut jobs, "test-wasm-abi", js_rt, [root + "/tools/test-wasm-abi.mjs", compiler], -1, true)
+
+    // Compiler/MIR/SSA/Task @test unit modules
+    add_unit_test(&mut jobs, compiler, root, work, "mir", unit_jobs, true)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_verify", unit_jobs, true)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_lower", unit_jobs, true)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_object", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_pipeline", unit_jobs, true)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_call_inputs", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_liveness_inputs", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_ssa_cells", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_ssa", unit_jobs, true)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_ssa_sparse", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_frame_exits", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_stack_origin", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_expr_stack", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_ssa_joint", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "task_data", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "task_effects", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "task_native", unit_jobs, true)
+    add_unit_test(&mut jobs, compiler, root, work, "task_scope_emit", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_retained", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_dataflow", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_preserve", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_scalar", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_memory", unit_jobs, false)
+    add_unit_test(&mut jobs, compiler, root, work, "mir_value_prop", unit_jobs, false)
+
+    // Wasm build+execute unit pairs
+    for wmod in [
+        "mir_pipeline", "mir_call_inputs", "mir_liveness_inputs", "mir_ssa_cells",
+        "mir_ssa", "mir_ssa_sparse", "mir_frame_exits", "mir_stack_origin",
+        "mir_expr_stack", "mir_ssa_joint", "task_data", "task_effects",
+        "task_native", "task_scope_emit", "mir_verify", "mir_value_prop"
+    ] {
+        add_wasm_pair(&mut jobs, compiler, js_rt, root, work, wmod, false)
+    }
+
+    total_defined := jobs.names.len
+    var selected: []bool = []
+    for j in 0..total_defined {
+        var keep := true
+        if fast_only && !jobs.is_fast[j] { keep = false }
+        if !matches_filters(jobs.names[j], &filters) { keep = false }
+        selected.push(keep)
+    }
+    // Pull in prerequisites for any selected dependent job.
+    for j in 0..total_defined {
+        if selected[j] && jobs.deps[j] >= 0 {
+            selected[jobs.deps[j]] = true
+        }
+    }
+
+    var total_selected := 0
+    var state: []i32 = [] // 0=skip, 1=pending, 2=running, 3=passed, 4=failed
+    var elapsed_ms: []i64 = []
+    for j in 0..total_defined {
+        elapsed_ms.push(0)
+        if selected[j] { state.push(1); total_selected += 1 }
+        else { state.push(0) }
+    }
+
+    if total_selected == 0 {
+        _ := sys.eprint("no suites matched selection")
+        return 2
+    }
+
+    var pool_cap := max_workers
+    if pool_cap > total_selected { pool_cap = total_selected }
+    var pool := process.set_new(pool_cap)
+    defer { process.set_kill_all(&mut pool) }
+
+    var slot_job: []i32 = []
+    var slot_start: []i64 = []
+    var slot_out: []string = []
+    var slot_err: []string = []
+    for _ in 0..pool_cap {
+        slot_job.push(-1)
+        slot_start.push(0)
+        slot_out.push("")
+        slot_err.push("")
+    }
+
+    var raw_out: []u8 = []
+    var raw_err: []u8 = []
+    var completed := 0
+    var failed := 0
+    timeout_limit_ms: i64 = 240000
+
+    while completed < total_selected {
+        // Fail fast on unmet failed dependencies.
+        for j in 0..total_defined {
+            if state[j] == 1 && jobs.deps[j] >= 0 && state[jobs.deps[j]] == 4 {
+                state[j] = 4
+                completed += 1
+                failed += 1
+                print("[" + completed.str() + "/" + total_selected.str() + "] FAIL " + jobs.names[j] + " (prerequisite failed)")
+            }
+        }
+        if completed >= total_selected { break }
+
+        // Launch ready jobs into free slots.
+        for j in 0..total_defined {
+            if process.set_len(&pool) >= pool_cap { break }
+            if state[j] != 1 { continue }
+            if jobs.deps[j] >= 0 && state[jobs.deps[j]] != 3 { continue }
+
+            var cmd_args: []string = []
+            for k in jobs.arg_start[j]..jobs.arg_end[j] {
+                cmd_args.push(jobs.all_args[k])
+            }
+            var cmd := process.command(jobs.progs[j], cmd_args)
+            process.set_cwd(&mut cmd, root)
+            sp := process.spawn(&cmd)
+            if !sp.ok {
+                if (sp.error == 35 || sp.error == 12 || sp.error == 24 || sp.error == 23) && process.set_len(&pool) > 0 {
+                    break
+                }
+                state[j] = 4
+                completed += 1
+                failed += 1
+                print("[" + completed.str() + "/" + total_selected.str() + "] FAIL " + jobs.names[j] + " (spawn error " + sp.error.str() + ")")
+                continue
+            }
+            var child := sp.child
+            slot := process.set_insert(&mut pool, &mut child)
+            assert(slot >= 0)
+            state[j] = 2
+            slot_job[slot] = j
+            slot_start[slot] = sys.now_ms()
+            slot_out[slot] = ""
+            slot_err[slot] = ""
+        }
+
+        if process.set_len(&pool) == 0 { continue }
+
+        _ := process.set_wait_any(&mut pool, 50)
+        now := sys.now_ms()
+
+        for slot in 0..pool_cap {
+            if !process.set_active(&pool, slot) { continue }
+            j := slot_job[slot]
+            raw_out.clear()
+            raw_err.clear()
+            var w := process.set_try_wait(&mut pool, slot, &mut raw_out, &mut raw_err)
+            if !w.exited && now - slot_start[slot] >= timeout_limit_ms {
+                w = process.set_kill_reap(&mut pool, slot, &mut raw_out, &mut raw_err)
+            }
+            if raw_out.len > 0 {
+                dec_o := bytes.decode(&raw_out)
+                if dec_o.ok { slot_out[slot] += dec_o.value }
+            }
+            if raw_err.len > 0 {
+                dec_e := bytes.decode(&raw_err)
+                if dec_e.ok { slot_err[slot] += dec_e.value }
+            }
+            if w.exited {
+                dur := sys.now_ms() - slot_start[slot]
+                elapsed_ms[j] = dur
+                completed += 1
+                if w.ok && !w.timed_out && w.signal == 0 && w.code == 0 {
+                    state[j] = 3
+                    print("[" + completed.str() + "/" + total_selected.str() + "] PASS " + jobs.names[j] + " (" + dur.str() + "ms)")
+                } else {
+                    state[j] = 4
+                    failed += 1
+                    print("[" + completed.str() + "/" + total_selected.str() + "] FAIL " + jobs.names[j] + " (exit " + w.code.str() + ", " + dur.str() + "ms)")
+                    out_trim := text.trim(slot_out[slot])
+                    err_trim := text.trim(slot_err[slot])
+                    if out_trim.len > 0 { print(out_trim) }
+                    if err_trim.len > 0 { print(err_trim) }
+                }
+                slot_job[slot] = -1
+            }
+        }
+    }
+
+    wall_ms := sys.now_ms() - t_start
+
+    // Report top 5 slowest suites so regressions are immediately visible.
+    var ranked: []i64 = []
+    for j in 0..total_defined {
+        if selected[j] {
+            ranked.push(elapsed_ms[j] * 10000 + i64(j))
+        }
+    }
+    array.sort(&mut ranked)
+    array.reverse(&mut ranked)
+    var top_summary := ""
+    var limit := 5
+    if ranked.len < limit { limit = ranked.len }
+    for ti in 0..limit {
+        packed := ranked[ti]
+        jid := i32(packed % 10000)
+        jms := packed / 10000
+        if ti > 0 { top_summary += ", " }
+        top_summary += jobs.names[jid] + "=" + format_sec(jms)
+    }
+
+    passed := total_selected - failed
+    if failed == 0 {
+        print("PASS " + passed.str() + "/" + total_selected.str() + " suites in " + format_sec(wall_ms) + " (" + pool_cap.str() + " workers; slowest: " + top_summary + ")")
+        return 0
+    }
+    print("FAIL " + failed.str() + "/" + total_selected.str() + " suites failed in " + format_sec(wall_ms))
+    1
+}

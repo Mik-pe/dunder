@@ -11,7 +11,11 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -69,7 +73,7 @@ def main():
     report = {'compiler': hashlib.sha256(compiler.read_bytes()).hexdigest(),
               'baseline': hashlib.sha256(baseline.read_bytes()).hexdigest() if baseline else None,
               'images': 0, 'executions': 0, 'profiles': [], 'cache': []}
-    with tempfile.TemporaryDirectory(prefix='dunder-record-source-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='dunder-record-source-') as temporary, wasm_host.WasmWorker() as wasm_worker:
         work = Path(temporary)
         values = ROOT / 'tests' / 'fixtures' / 'record-take-values.ddr'
         for mode, flags in enumerate(MODES):
@@ -81,7 +85,8 @@ def main():
                 if target == host:
                     run([image], output='42\n'); report['executions'] += 1
                 elif target == 3:
-                    run(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image, '--repeat'], output='42\n')
+                    res = wasm_worker.run(image, repeat=True)
+                    assert res.returncode == 0 and res.stdout == '42\n', res
                     report['executions'] += 2
             source = work / f'profile-{mode}.ddr'; source.write_text(PROFILE)
             control = work / f'profile-{mode}-control.ddr'
@@ -148,7 +153,8 @@ fn main(){{unsafe{{assert(invoke(callback(answer),9)==42)}};print(42)}}
                 if target == host:
                     run([image], status=status, output='11\n')
                 else:
-                    run(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], status=125, output='11\n')
+                    res = wasm_worker.run(image)
+                    assert res.returncode == 125 and res.stdout == '11\n', res
     output = ROOT / 'build' / 'record-take-source'; output.mkdir(parents=True, exist_ok=True)
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     print('PASS activated record temporaries: all4 targets, scalar/MIR modes, exact capacities/RC, copy reductions, warm helper demand, native C callback and trap order')

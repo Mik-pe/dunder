@@ -99,7 +99,7 @@ flyttar återstår. Ägda allokeringar återvinns automatiskt; se
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms` och process-ID; se [sys](sys.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag samt katalog- och filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
-| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command`, `run`, `run_in`, `status`, `exec`, `spawn` (`Child` med icke-blockerande pipes, `read_stdout_line`, `terminate`, `kill`, `wait`), delegerade `Executable`-handtag (`grant`, `run_granted`) samt miljö- och värdfrågor (`env`, `host_os`, `host_arch`, `host_target`). |
+| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command`, `run`, `run_in`, `status`, `exec`, `spawn` (`Child` och `ChildSet` för parallella processpooler med icke-blockerande `poll`/pipes, `read_stdout_line`, `terminate`, `kill`, `wait`), delegerade `Executable`-handtag (`grant`, `run_granted`) samt miljö- och värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel

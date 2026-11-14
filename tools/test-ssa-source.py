@@ -10,7 +10,11 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 
 FUNCTION = '''fn calculate(n:i32)->i64 {
@@ -54,18 +58,14 @@ def call(command, cwd, status=0):
     return result
 
 
-def execute(image, target, host, expected, work):
+def execute(image, target, host, expected, work, wasm_worker):
     if target == host:
-        command = [image]
+        result = call([image], work)
     elif target == 'wasm32':
-        script = ("const fs=require('node:fs');const print=x=>console.log(x.toString());"
-                  "const {exports:p}=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),"
-                  "{dunder:{print_i32:print,print_i64:print}});"
-                  "process.exitCode=Number(p.main()||0)")
-        command = ['node', '-e', script, image]
+        result = wasm_worker.run(image)
+        assert result.returncode == 0, result
     else:
         return False
-    result = call(command, work)
     assert result.stdout == expected and result.stderr == '', result
     return True
 
@@ -95,7 +95,7 @@ def main():
     expected = ''.join(str(reference(n)) + '\n' for n in inputs)
     source = FUNCTION + 'fn main(){' + ';'.join(f'print(calculate({n}))' for n in inputs) + '}\n'
     images = executions = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-ssa-source-') as directory:
+    with tempfile.TemporaryDirectory(prefix='dunder-ssa-source-') as directory, wasm_host.WasmWorker() as wasm_worker:
         work = Path(directory)
         path = work/'main.ddr'; path.write_text(source)
         variants = {}
@@ -112,7 +112,7 @@ def main():
                     assert same is None or same == observed, (target, mode, jobs, same, observed)
                     same = observed
                     images += 1
-                    executions += execute(image, target, host, expected, work)
+                    executions += execute(image, target, host, expected, work, wasm_worker)
                 variants[target, mode] = same[0]
             assert variants[target, 'off'] != variants[target, 'on'], target
 
@@ -138,7 +138,7 @@ def main():
                     assert same is None or same == observed, (target, mode, jobs, same, observed)
                     same = observed
                     images += 1
-                    executions += execute(image, target, host, '40\n', work)
+                    executions += execute(image, target, host, '40\n', work, wasm_worker)
                 modes.append(same[0])
             assert modes[0] != modes[1], target
 
@@ -164,7 +164,7 @@ def main():
             if reused == 2:
                 assert all(value == 0 for value in counts.values()), report
             assert hashlib.sha256(image.read_bytes()).hexdigest() == variants[host, mode]
-            executions += execute(image, host, host, expected, work)
+            executions += execute(image, host, host, expected, work, wasm_worker)
 
         tests = work/'cases.ddr'
         tests.write_text(FUNCTION + '@test fn result(){calculate(6)==' + str(reference(6)) + '}\n')

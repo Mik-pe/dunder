@@ -9,9 +9,13 @@ import random
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 ENV = {'PATH': '/no-external-tools'}
 WASM_RUNNER = '''const fs=require('node:fs');
 const print=value=>console.log(value.toString());
@@ -21,7 +25,7 @@ const program=new WebAssembly.Instance(module,{dunder:{
 }}).exports;
 try{const status=program.main();if(status!==undefined)process.exitCode=Number(status)}
 catch(error){
-    if(!(error instanceof WebAssembly.RuntimeError)||error.message!=='unreachable')throw error;
+    if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;
     process.exitCode=125;
 }'''
 
@@ -479,7 +483,7 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--baseline', type=Path,
                         help='older authoritative compiler; default: current compiler with --scalar-opt=off')
-    parser.add_argument('--node', default='node')
+    parser.add_argument('--node', default='bun')
     parser.add_argument('--verify-selection', action='store_true',
                         help='also compare candidate --scalar-opt=off and assert optimizer timing counters')
     args = parser.parse_args()
@@ -490,15 +494,13 @@ def main():
                 ('candidate', compilers['candidate'], [])]
     if args.verify_selection and args.baseline:
         variants.append(('candidate_off', compilers['candidate'], ['--scalar-opt=off']))
-    node = shutil.which(args.node)
-    if not node:
-        parser.error('Node is required for Wasm execution')
+    node = wasm_host.js_runtime(args.node)
     machine = platform.machine()
     native = 'arm64-macos' if platform.system() == 'Darwin' else ('arm64-linux' if machine in ('arm64','aarch64') else 'x86_64-linux')
     targets = list(dict.fromkeys([native, 'wasm32', 'arm64-linux', 'x86_64-linux']))
     hashes = {v: hashlib.sha256(p.read_bytes()).hexdigest() for v,p in compilers.items()}
     executed = crossed = diagnostics = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-optimizer-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='dunder-optimizer-') as tmp, wasm_host.WasmWorker(node) as wasm:
         work = Path(tmp)
         programs = list(positive_cases()) + list(mutation_cases())
         programs.append(('fixture', (ROOT / 'tests/contracts/scalar_optimizer.ddr').read_text(), [42]))
@@ -513,8 +515,7 @@ def main():
                     if args.verify_selection and variant != 'baseline':
                         selected(built,variant,name,target)
                     if target == native or target == 'wasm32':
-                        command = [image] if target == native else [node, '-e', WASM_RUNNER, image]
-                        result = call(command,cwd=work)
+                        result = call([image],cwd=work) if target == native else wasm.run(image, binary_output=True)
                         if result.returncode != 0 or result.stdout != output:
                             raise AssertionError(f'{variant} {name} {target}: exit {result.returncode}, expected {output!r}, got {result.stdout!r}\n{result.stderr.decode(errors="replace")}')
                         executed += 1
@@ -546,8 +547,7 @@ def main():
                     if args.verify_selection and variant != 'baseline':
                         selected(built,variant,name,target)
                     if target == native or target == 'wasm32':
-                        command = [image] if target == native else [node, '-e', WASM_RUNNER, image]
-                        result = call(command,cwd=work)
+                        result = call([image],cwd=work) if target == native else wasm.run(image, binary_output=True)
                         expected_status = status if target == native else 125
                         if result.returncode != expected_status or result.stdout != b'17\n':
                             raise AssertionError(f'{variant} {name} {target}: exit {result.returncode}, expected {expected_status}; stdout {result.stdout!r}; stderr {result.stderr!r}')

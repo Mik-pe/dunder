@@ -11,7 +11,11 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -39,11 +43,12 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
-    with tempfile.TemporaryDirectory(prefix='dunder-record-take-') as directory:
+    js_bin = wasm_host.js_runtime()
+    with tempfile.TemporaryDirectory(prefix='dunder-record-take-') as directory, wasm_host.WasmWorker(js_bin) as wasm_worker:
         work = Path(directory)
         call([compiler, 'test', ROOT / 'tests/record_take.ddr', '-o', work / 'units'])
         call([compiler, 'build-tests', ROOT / 'tests/record_take.ddr', '--target', 'wasm32', '-o', work / 'units.wasm'])
-        call(['node', ROOT / 'tools/test-wasm.mjs', '--execute', work / 'units.wasm'])
+        call([js_bin, ROOT / 'tools/test-wasm.mjs', '--execute', work / 'units.wasm'])
         emitter = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/record-take-emitter.ddr', '-o', emitter])
         for n in (0, 1, 8, 9, 17, 64):
@@ -60,7 +65,7 @@ def main():
                         assert profile['kind'] == 'runtime_profile'
                         profiles[mode] = profile['counters']
                     elif target == 3:
-                        run = call(['node', '-e', REPEAT_WASM, image], output=b'')
+                        run = call([js_bin, '-e', REPEAT_WASM, image], output=b'')
                         assert not run.stderr
             old, new = profiles['clone'], profiles['take']
             assert old['allocation_count'] - new['allocation_count'] == (10 if n == 0 else 11)
@@ -78,7 +83,8 @@ def main():
             if target == host:
                 call([image], output=b'42\n')
             elif target == 3:
-                call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image, '--repeat'], output=b'42\n')
+                res = wasm_worker.run(image, repeat=True, binary_output=True)
+                assert res.returncode == 0 and res.stdout == b'42\n', res
         # Scalar traps in child expressions must happen in source order. The
         # native exit code distinguishes the first trap; Wasm's unreachable
         # maps to125, with the same observable print prefix and no later call.
@@ -101,7 +107,8 @@ fn accept(item: Item, ignored: i32) -> i32 { i32(item.values[0]) + ignored }
                 if target == host:
                     call([image], status=status, output=b'11\n')
                 elif target == 3:
-                    call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], status=125, output=b'11\n')
+                    res = wasm_worker.run(image, binary_output=True)
+                    assert res.returncode == 125 and res.stdout == b'11\n', res
         print('PASS source snapshot/projection/callback/branch/return/reentry contracts '
               '(new frontend hook is tested only when compiler integrates record_take)', flush=True)
         print('PASS source child-trap ordering (native exact status; Wasm exact print prefix)', flush=True)

@@ -42,6 +42,10 @@ unsafe fn c_fclose(file: ptr) -> i32
 unsafe fn c_getenv(name: ptr) -> ptr
 @extern("c", "signal")
 unsafe fn c_signal(sig: i32, handler: ptr) -> ptr
+@extern("c", "sysconf")
+unsafe fn c_sysconf(name: i32) -> i64
+@extern("c", "usleep")
+unsafe fn c_usleep(usec: u32) -> i32
 
 pub enum EnvMode { Inherit = 0, Clear = 1 }
 pub enum Stdio { Inherit = 0, Pipe = 1, Null = 2 }
@@ -259,6 +263,18 @@ pub fn host_target() -> string {
     if os == "linux" && arch == "arm64" { return "arm64-linux" }
     if os == "linux" && arch == "x86_64" { return "x86_64-linux" }
     arch + "-" + os
+}
+
+pub fn host_cpus() -> i32 {
+    unsafe {
+        _ := static_bytes("native", 8)
+        var name := 84
+        if host_os() == "macos" { name = 58 }
+        n := c_sysconf(name)
+        if n >= 1 && n <= 256 { return i32(n) }
+        if n > 256 { return 256 }
+    }
+    4
 }
 
 @requires(process)
@@ -1071,3 +1087,213 @@ pub fn run_granted(exe: &Executable, args: []string) -> Output {
 }
 
 pub fn spawn_granted(exe: &Executable, cmd: &Command) -> SpawnResult { spawn_internal(exe.program, &cmd) }
+
+
+pub opaque struct ChildSet {
+    cap: i32,
+    count: i32,
+    active: []bool,
+    pids: []i32,
+    pgids: []i32,
+    stdin_fds: []i32,
+    stdout_fds: []i32,
+    stderr_fds: []i32,
+    reaped: []bool,
+    codes: []i32,
+    signals: []i32,
+    poll_buf: []u8,
+}
+
+pub fn set_new(capacity: i32) -> ChildSet {
+    assert(capacity > 0 && capacity <= 1024)
+    var s := ChildSet {
+        cap: capacity, count: 0, active: [], pids: [], pgids: [],
+        stdin_fds: [], stdout_fds: [], stderr_fds: [],
+        reaped: [], codes: [], signals: [], poll_buf: [],
+    }
+    for _ in 0..capacity {
+        s.active.push(false)
+        s.pids.push(-1)
+        s.pgids.push(-1)
+        s.stdin_fds.push(-1)
+        s.stdout_fds.push(-1)
+        s.stderr_fds.push(-1)
+        s.reaped.push(false)
+        s.codes.push(0)
+        s.signals.push(0)
+    }
+    s
+}
+
+pub fn set_len(set: &ChildSet) -> i32 { set.count }
+
+pub fn set_active(set: &ChildSet, slot: i32) -> bool {
+    slot >= 0 && slot < set.cap && set.active[slot]
+}
+
+pub fn set_insert(set: &mut ChildSet, child: &mut Child) -> i32 {
+    if child.pid <= 0 { return -1 }
+    for slot in 0..set.cap {
+        if !set.active[slot] {
+            set.active[slot] = true
+            set.pids[slot] = child.pid
+            set.pgids[slot] = child.pgid
+            set.stdin_fds[slot] = child.stdin_fd
+            set.stdout_fds[slot] = child.stdout_fd
+            set.stderr_fds[slot] = child.stderr_fd
+            set.reaped[slot] = child.reaped
+            set.codes[slot] = child.code
+            set.signals[slot] = child.signal
+            set.count += 1
+            child.pid = -1
+            child.pgid = -1
+            child.stdin_fd = -1
+            child.stdout_fd = -1
+            child.stderr_fd = -1
+            child.reaped = true
+            return slot
+        }
+    }
+    -1
+}
+
+fn drain_fd_all(fd: &mut i32, out: &mut []u8) {
+    while fd >= 0 {
+        out.reserve(out.len + 16384)
+        n := sys.net_read(fd, &mut out, 65536)
+        if n > 0 { continue }
+        if n == 0 { _ := sys.net_close(fd); fd = -1 }
+        break
+    }
+}
+
+pub fn set_drain(set: &mut ChildSet, slot: i32, stdout_out: &mut []u8, stderr_out: &mut []u8) {
+    if slot < 0 || slot >= set.cap || !set.active[slot] { return }
+    var out_fd := set.stdout_fds[slot]
+    drain_fd_all(&mut out_fd, &mut stdout_out)
+    set.stdout_fds[slot] = out_fd
+    var err_fd := set.stderr_fds[slot]
+    drain_fd_all(&mut err_fd, &mut stderr_out)
+    set.stderr_fds[slot] = err_fd
+}
+
+fn close_slot_fds(set: &mut ChildSet, slot: i32) {
+    if set.stdin_fds[slot] >= 0 { _ := sys.net_close(set.stdin_fds[slot]); set.stdin_fds[slot] = -1 }
+    if set.stdout_fds[slot] >= 0 { _ := sys.net_close(set.stdout_fds[slot]); set.stdout_fds[slot] = -1 }
+    if set.stderr_fds[slot] >= 0 { _ := sys.net_close(set.stderr_fds[slot]); set.stderr_fds[slot] = -1 }
+}
+
+pub fn set_wait_any(set: &mut ChildSet, timeout_ms: i64) -> i32 {
+    if set.count <= 0 { return 0 }
+    set.poll_buf.clear()
+    var nfds := 0
+    var has_pipeless := false
+    for slot in 0..set.cap {
+        if !set.active[slot] { continue }
+        out_fd := set.stdout_fds[slot]
+        err_fd := set.stderr_fds[slot]
+        if out_fd >= 0 {
+            bytes.append_le(&mut set.poll_buf, i64(out_fd), 4)
+            bytes.append_le(&mut set.poll_buf, 1, 2)
+            bytes.append_le(&mut set.poll_buf, 0, 2)
+            nfds += 1
+        }
+        if err_fd >= 0 {
+            bytes.append_le(&mut set.poll_buf, i64(err_fd), 4)
+            bytes.append_le(&mut set.poll_buf, 1, 2)
+            bytes.append_le(&mut set.poll_buf, 0, 2)
+            nfds += 1
+        }
+        if out_fd < 0 && err_fd < 0 { has_pipeless = true }
+    }
+    var wait_ms := timeout_ms
+    if has_pipeless && (wait_ms < 0 || wait_ms > 1) { wait_ms = 1 }
+    if nfds == 0 {
+        if wait_ms > 0 { sys.sleep_ms(wait_ms) }
+        return 0
+    }
+    i32(sys.net_poll(&mut set.poll_buf, i64(nfds), wait_ms))
+}
+
+pub fn set_try_wait(set: &mut ChildSet, slot: i32, stdout_out: &mut []u8, stderr_out: &mut []u8) -> WaitResult {
+    if slot < 0 || slot >= set.cap || !set.active[slot] {
+        return WaitResult { ok: false, exited: false, timed_out: false, code: -1, signal: 0, error: 22 }
+    }
+    set_drain(&mut set, slot, &mut stdout_out, &mut stderr_out)
+    if set.reaped[slot] {
+        close_slot_fds(&mut set, slot)
+        code := set.codes[slot]
+        sig := set.signals[slot]
+        set.active[slot] = false
+        set.pids[slot] = -1
+        set.count -= 1
+        return WaitResult { ok: true, exited: true, timed_out: false, code: code, signal: sig, error: 0 }
+    }
+    unsafe {
+        _ := static_bytes("native", 8)
+        pid := set.pids[slot]
+        var wstatus := 0
+        var r := c_waitpid(pid, addr(&mut wstatus), 1)
+        if r == 0 && set.stdout_fds[slot] < 0 && set.stderr_fds[slot] < 0 {
+            _ := c_usleep(50)
+            r = c_waitpid(pid, addr(&mut wstatus), 1)
+        }
+        if r == pid {
+            set_drain(&mut set, slot, &mut stdout_out, &mut stderr_out)
+            close_slot_fds(&mut set, slot)
+            sig := wstatus.bit_and(127)
+            var code := wstatus.shr(8).bit_and(255)
+            if sig != 0 { code = 128 + sig }
+            set.active[slot] = false
+            set.pids[slot] = -1
+            set.count -= 1
+            return WaitResult { ok: true, exited: true, timed_out: false, code: code, signal: sig, error: 0 }
+        }
+        if r == 0 {
+            return WaitResult { ok: true, exited: false, timed_out: false, code: 0, signal: 0, error: 0 }
+        }
+    }
+    close_slot_fds(&mut set, slot)
+    set.active[slot] = false
+    set.pids[slot] = -1
+    set.count -= 1
+    WaitResult { ok: false, exited: false, timed_out: false, code: -1, signal: 0, error: 5 }
+}
+
+pub fn set_kill_reap(set: &mut ChildSet, slot: i32, stdout_out: &mut []u8, stderr_out: &mut []u8) -> WaitResult {
+    if slot < 0 || slot >= set.cap || !set.active[slot] {
+        return WaitResult { ok: false, exited: false, timed_out: false, code: -1, signal: 0, error: 22 }
+    }
+    unsafe {
+        _ := static_bytes("native", 8)
+        pid := set.pids[slot]
+        pgid := set.pgids[slot]
+        if pgid > 0 && c_kill(-pgid, 9) == 0 {
+            // Killed process group
+        } else if pid > 0 {
+            _ := c_kill(pid, 9)
+        }
+        var wstatus := 0
+        while c_waitpid(pid, addr(&mut wstatus), 0) < 0 {
+            if c_kill(pid, 0) != 0 { break }
+        }
+    }
+    set_drain(&mut set, slot, &mut stdout_out, &mut stderr_out)
+    close_slot_fds(&mut set, slot)
+    set.active[slot] = false
+    set.pids[slot] = -1
+    set.count -= 1
+    WaitResult { ok: false, exited: true, timed_out: true, code: 124, signal: 9, error: 60 }
+}
+
+pub fn set_kill_all(set: &mut ChildSet) {
+    var sink_out: []u8 = []
+    var sink_err: []u8 = []
+    for slot in 0..set.cap {
+        if set.active[slot] {
+            _ := set_kill_reap(&mut set, slot, &mut sink_out, &mut sink_err)
+            sink_out.clear()
+            sink_err.clear()
+        }
+    }
+}

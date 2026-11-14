@@ -19,6 +19,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 spec = importlib.util.spec_from_file_location('region_existing_qa', ROOT / 'tools/test-mir-ssa.py')
 qa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qa)
@@ -167,7 +169,7 @@ def main():
     for key, path in dict(compiler=compiler, fixture=fixture, support=support,
                           ssa=ROOT/'selfhost/mir_ssa.ddr', frame_abi=ROOT/'selfhost/mir_call_abi.ddr').items():
         report['hashes'][key] = digest(path)
-    with tempfile.TemporaryDirectory(prefix='dunder-regional-qa-') as temp:
+    with tempfile.TemporaryDirectory(prefix='dunder-regional-qa-') as temp, wasm_host.WasmWorker() as wasm:
         work = args.output.resolve() if args.output else Path(temp)
         if args.output:
             work.mkdir(parents=True, exist_ok=True)
@@ -214,7 +216,11 @@ def main():
             trap = case == 13 and control == 0
             ran = False
             if target == host: call([image],102 if trap else 0); ran = True
-            elif target == 3: call(['node',ROOT/'tools/runtime-contract-wasm.cjs',image],125 if trap else 0); ran = True
+            elif target == 3:
+                expected_wasm = 125 if trap else 0
+                wres = wasm.run(image)
+                assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
+                ran = True
             if args.output: image.with_suffix('.mir.txt').write_text(text)
             report['images'].append(dict(case=case,name=NAMES[case],input=value,control=control,target=target,
                 mode=mode,frame=frame,terminal=terminal,limit=limit,executed=ran,sha256=digest(image),counters=counters,

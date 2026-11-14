@@ -4,9 +4,13 @@ import argparse
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('compiler', type=Path)
 args = parser.parse_args()
@@ -63,7 +67,7 @@ probes = [
     ('dead_length_spill', '{if p1>=0&&p1<p0.len{return p0[p1]};return 0}', 'mapped-length', normal, 2, 3, {'off': 768, 'on': 256}, {'off': 10, 'on': 4}),
 ]
 
-with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory:
+with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory, wasm_host.WasmWorker() as wasm:
     work = Path(directory)
     harness = work / 'emitter'
     built = subprocess.run([compiler, 'build', ROOT / 'tests/fixtures/array-address-emitter.ddr', '-o', harness], capture_output=True, timeout=60)
@@ -82,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory:
             run = subprocess.run([image], capture_output=True, timeout=10)
             assert run.returncode == status, (name, target, proof, run.returncode, status, run.stderr)
         if target == 3:
-            run = subprocess.run(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], capture_output=True, timeout=10)
+            run = wasm.run(image)
             assert run.returncode == (125 if status else 0), (name, target, proof, run.returncode, status, run.stderr)
         return fields
 

@@ -6,6 +6,10 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -62,7 +66,7 @@ console.log(JSON.stringify({result,error,printed}));
                 result = call([image]); assert result.stdout == '42\n' and result.stderr == ''
                 row['execution'] = 'host passed:42'
             elif target == 3:
-                result = json.loads(call(['node', js, image]).stdout)
+                result = json.loads(call([wasm_host.js_runtime(), js, image]).stdout)
                 assert result == {'result': 0, 'error': None, 'printed': ['42']}, result
                 row['execution'] = 'Wasm passed:42'
             else:
@@ -74,7 +78,7 @@ console.log(JSON.stringify({result,error,printed}));
         for origin in ('raw', 'temp'):
             image = work / f'{mode}-{origin}.wasm'
             call([emitter, image, 3, origin, mode]); images.append(image)
-            result = json.loads(call(['node', js, image]).stdout)
+            result = json.loads(call([wasm_host.js_runtime(), js, image]).stdout)
             assert result['printed'] == [], result
             if mode.endswith('-fault'):
                 assert result['result'] is None and result['error']['name'] == 'RuntimeError', result

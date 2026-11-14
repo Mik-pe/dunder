@@ -3,10 +3,14 @@
 import argparse
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import platform as host_platform
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('compiler', type=Path)
 args = parser.parse_args()
@@ -75,25 +79,26 @@ cases.extend([
 ])
 for_pressure='{'+''.join(f'a{i}:i64={i+1};' for i in range(40))+'var total:i64=0;for i in 0..3{total=total+'+'+'.join(f'a{i}' for i in range(40))+'};total+'+'+'.join(f'p{i}' for i in range(8))+'}'
 cases.append(('for_pressure',for_pressure,2,2,default,2584,0,8))
-for name,body,ret,first,params,result,status,length in cases:
- source=work/(name+'.ddr');source.write_text('p0 p1 p2 p3 p4 p5 p6 p7 '+body)
- for platform in (0,1,2,3):
-  out=work/(name+('.wasm' if platform==3 else f'-{platform}'))
-  wrapper=out.with_name(out.name+'.wrapper')
-  for mode,destination in [('wrapper',wrapper),('prepared',out)]:
-   args=[harness,source,destination,str(platform),str(result),str(ret),str(first),*map(str,params),str(length),mode]
-   built=subprocess.run(args,capture_output=True,timeout=20)
-   assert built.returncode==0,(name,platform,mode,built.returncode,built.stdout,built.stderr)
-  assert wrapper.read_bytes()==out.read_bytes(),(name,platform,'prepared/wrapper image mismatch')
-  if platform==host:
-   run=subprocess.run([out],capture_output=True,timeout=10)
-   assert run.returncode==status,(name,platform,run.returncode,status,run.stdout,run.stderr)
-  if platform==3:
-   # Existing runner prints thrown Wasm traps as status125.
-   run=subprocess.run(['node',root/'tools/runtime-contract-wasm.cjs',out],capture_output=True,timeout=10)
-   expected=125 if status else 0
-   assert run.returncode==expected,(name,platform,run.returncode,expected,run.stdout,run.stderr)
- print('PASS',name,flush=True)
+with wasm_host.WasmWorker() as wasm:
+ for name,body,ret,first,params,result,status,length in cases:
+  source=work/(name+'.ddr');source.write_text('p0 p1 p2 p3 p4 p5 p6 p7 '+body)
+  for platform in (0,1,2,3):
+   out=work/(name+('.wasm' if platform==3 else f'-{platform}'))
+   wrapper=out.with_name(out.name+'.wrapper')
+   for mode,destination in [('wrapper',wrapper),('prepared',out)]:
+    args=[harness,source,destination,str(platform),str(result),str(ret),str(first),*map(str,params),str(length),mode]
+    built=subprocess.run(args,capture_output=True,timeout=20)
+    assert built.returncode==0,(name,platform,mode,built.returncode,built.stdout,built.stderr)
+   assert wrapper.read_bytes()==out.read_bytes(),(name,platform,'prepared/wrapper image mismatch')
+   if platform==host:
+    run=subprocess.run([out],capture_output=True,timeout=10)
+    assert run.returncode==status,(name,platform,run.returncode,status,run.stdout,run.stderr)
+   if platform==3:
+    # Existing runner prints thrown Wasm traps as status125.
+    run=wasm.run(out)
+    expected=125 if status else 0
+    assert run.returncode==expected,(name,platform,run.returncode,expected,run.stdout,run.stderr)
+  print('PASS',name,flush=True)
 print(len(cases),'cases native+Wasm executed; wrapper/prepared images byte-identical on all four targets')
 
 scratch.cleanup()

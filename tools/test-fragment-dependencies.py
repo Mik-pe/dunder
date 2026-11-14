@@ -12,7 +12,11 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = {'PATH': '/no-external-tools'}
@@ -90,12 +94,11 @@ def malformed_native3(numbers):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
-    parser.add_argument('--node', default='node')
+    parser.add_argument('--node', default=None)
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     compiler_hash = hashlib.sha256(compiler.read_bytes()).hexdigest()
-    node = shutil.which(args.node)
-    assert node, 'Node is required for Wasm execution'
+    node = wasm_host.js_runtime(args.node)
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         host = 0
     elif platform.system() == 'Linux' and platform.machine() in ('arm64', 'aarch64', 'x86_64'):

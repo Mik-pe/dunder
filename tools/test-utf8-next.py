@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
 TEXTS = ('', 'A\0z\x7f\n\t',
          ''.join(map(chr, (0, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000,
@@ -34,7 +38,7 @@ def main():
     compiler = args.compiler.resolve(strict=True)
     baseline = args.baseline.resolve(strict=True) if args.baseline else None
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
-    with tempfile.TemporaryDirectory(prefix='dunder-utf8-next-') as directory:
+    with tempfile.TemporaryDirectory(prefix='dunder-utf8-next-') as directory, wasm_host.WasmWorker() as wasm:
         work = Path(directory)
         harness = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/utf8-next-emitter.ddr', '-o', harness])
@@ -56,7 +60,7 @@ def main():
                         continue
                     profiles = []
                     for mode in ('leaf', 'inline'):
-                        image = work / f'{target}-{source_kind}-{mode}'
+                        image = work / f'{selected}-{target}-{source_kind}-{mode}'
                         profiling = target == host
                         call([harness, image, target, mode, source, oracle,
                               source_kind, 'profile' if profiling else 'plain'])
@@ -73,7 +77,8 @@ def main():
                                     invalid = call([image, bad], status=106, output=b'')
                                     assert not invalid.stderr, 'invalid argv reported after main instead of failing during creation'
                         elif target == 3:
-                            call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], output=b'')
+                            wres = wasm.run(image, binary_output=True)
+                            assert wres.returncode == 0 and wres.stdout == b'', (image, wres.returncode, wres.stdout, wres.stderr)
                     if profiles:
                         assert profiles[0] == profiles[1], (selected, source_kind, 'inline added runtime traffic')
             print(f'PASS text {selected}: widths/boundaries, cursor and GPR contract; leaf/inline traffic identical', flush=True)
@@ -89,7 +94,8 @@ def main():
             if target == host:
                 call([image], output=b'42\n')
             elif target == 3:
-                call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image, '--repeat'], output=b'42\n')
+                wres = wasm.run(image, repeat=True, binary_output=True)
+                assert wres.returncode == 0 and wres.stdout == b'42\n', (image, wres.returncode, wres.stdout, wres.stderr)
         for spelling in ('"\\xff"', '"\\xc0\\xaf"', '"\\xe2"', '"\\xed\\xa0\\x80"', '"\\xf4\\x90\\x80\\x80"'):
             source = work / 'invalid.ddr'
             source.write_text('fn main(){for scalar in ' + spelling + '.runes(){print(42)}}')
@@ -105,7 +111,8 @@ def main():
             if target == host:
                 call([image], status=106, output=b'')
             else:
-                call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], status=125, output=b'')
+                wres = wasm.run(image, binary_output=True)
+                assert wres.returncode == 125 and wres.stdout == b'', (image, wres.returncode, wres.stdout, wres.stderr)
     identity = 'default images byte-identical to baseline' if baseline else 'default image comparison not requested'
     print('UTF-8 next: exact bounded vocabulary/check mode, valid sources and creation failures passed; '
           f'{identity}; all targets built, host/Wasm executed, cross-native not executed')

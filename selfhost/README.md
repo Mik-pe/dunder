@@ -250,12 +250,12 @@ typkontroll av funktionskroppen, även om programmet aldrig anropar den.
 
 ### Wasm32 från den självbyggda kompilatorn
 
-Den självbyggda kompilatorn kan skriva en modul för Node eller webbläsaren.
+Den självbyggda kompilatorn kan skriva en modul för Bun, Node eller webbläsaren.
 
 ```sh
 ./tools/bootstrap.sh
 build/selfhost/arm64-macos/dunder build examples/hello.ddr --target wasm32 -o hello.wasm
-node tools/test-wasm.mjs build/selfhost/arm64-macos/dunder
+bun tools/test-wasm.mjs build/selfhost/arm64-macos/dunder
 ```
 
 Välj värdens katalog under `build/selfhost/`. Kompilatorn använder samma
@@ -305,27 +305,36 @@ en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 ## Verifiering
 
 ```sh
+# Snabb språkutvecklingsloop (1-stegs inkrementellt bygge + parallella kärnsviter):
+./tools/dev.sh
+./tools/dev.sh --filter ssa
+
+# Fullständig självhost-verifiering (frö-bootstrap + hela matrisen parallellt):
+./tools/verify-selfhost.sh
+```
+
+Enskilda sviter kan även köras direkt:
+
+```sh
 dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" test tests/suite.ddr
 "$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin"
-node tools/test-wasm.mjs "$dunder_bin"
-node tools/test-wasm-abi.mjs "$dunder_bin"
-node tools/test-wasm-scalars.mjs "$dunder_bin"
+bun tools/test-wasm.mjs "$dunder_bin"
+bun tools/test-wasm-abi.mjs "$dunder_bin"
+bun tools/test-wasm-scalars.mjs "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
-# Riktade funktionella SSA-/ABI-prov, utan prestandamätning:
-python3 tools/test-mir-ssa.py "$dunder_bin"
-python3 tools/test-mir-frame-exits.py "$dunder_bin"
-python3 tools/test-ssa-source.py "$dunder_bin"
 ```
 
 De körda programmen har förväntade värden, utskrifter och felutfall.
 Diagnostikfallen använder både giltiga exempel och källor som ska avvisas.
-Testgrupperna får varsin process. För en enskild grupp kan kompilatorn
+`dunder test` kör isolerade barnprocesser parallellt över alla värdkärnor som
+standard (`--jobs N` styr parallelliteten uttryckligt, och utskrifterna samlas
+i deterministisk gruppordning). För en enskild grupp kan kompilatorn
 skriva en egen startpunkt med `build-tests`.
 
 ```sh
 "$dunder_bin" build-tests tests/suite.ddr --list
 "$dunder_bin" build-tests tests/suite.ddr --group 0 --target wasm32 -o group.wasm
-node tools/test-wasm.mjs --execute group.wasm
+bun tools/test-wasm.mjs --execute group.wasm
 ```

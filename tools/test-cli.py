@@ -12,6 +12,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+import wasm_host
+
 
 class Project:
     def __init__(self, compiler, root):
@@ -580,7 +583,7 @@ def mir_integer_output(p, name, target, expected):
                   "const {exports:p}=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),"
                   "{dunder:{print_i32:print,print_i64:print,print_bool:x=>console.log(Boolean(x))}});"
                   "process.exitCode=Number(p.main()||0)")
-        command = ['node', '-e', script, p.root/name]
+        command = [wasm_host.js_runtime(), '-e', script, p.root/name]
     elif target == native:
         command = [p.root/name]
     else:

@@ -14,7 +14,11 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -83,7 +87,7 @@ def main():
                         if target == host:
                             call([image], str(expected) + '\n'); executions[name] += 1
                         elif target == 3:
-                            call(['node', ROOT / 'tools/test-wasm.mjs', '--execute', image],
+                            call([wasm_host.js_runtime(), ROOT / 'tools/test-wasm.mjs', '--execute', image],
                                  str(expected) + '\n'); executions[name] += 1
         passed = True
     finally:

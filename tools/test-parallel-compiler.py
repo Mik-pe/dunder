@@ -22,7 +22,11 @@ import platform
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -141,7 +145,7 @@ class Probe:
         if target == 'arm64-macos':
             command = [image]
         elif target == 'wasm32':
-            command = ['node', '-e', WASM_RUNNER, image]
+            command = [wasm_host.js_runtime(), '-e', WASM_RUNNER, image]
         else:
             return  # Linux images are never counted as executed coverage.
         result = self.run(command, image.parent)

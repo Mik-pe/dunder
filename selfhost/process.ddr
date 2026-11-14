@@ -5,11 +5,29 @@ import native_clock as monotonic
 
 @extern("c","fork") unsafe fn child_process() -> i32
 @extern("c","execv") unsafe fn execute(path: ptr, argv: ptr) -> i32
+@extern("c","dup2") unsafe fn duplicate_fd(oldfd: i32, newfd: i32) -> i32
+@extern("c","close") unsafe fn close_fd(fd: i32) -> i32
 @extern("c","_exit") unsafe fn exit_child(code: i32)
 @extern("c","waitpid") unsafe fn wait_child(pid: i32, status: ptr, options: i32) -> i32
 @extern("c","kill") unsafe fn signal_child(pid: i32, signal: i32) -> i32
 @extern("c","setpgid") unsafe fn process_group(pid: i32, group: i32) -> i32
 @extern("c","usleep") unsafe fn sleep_us(interval: u32) -> i32
+@extern("c","pipe") unsafe fn make_pipe(fds: ptr) -> i32
+@extern("c","poll") unsafe fn poll_fds(fds: ptr, nfds: u32, timeout: i32) -> i32
+@extern("c","read") unsafe fn read_fd(fd: i32, buf: ptr, count: usize) -> i64
+@extern("c","write") unsafe fn write_fd(fd: i32, buf: ptr, count: usize) -> i64
+@extern("c","sysconf") unsafe fn sysconf_c(name: i32) -> i64
+
+pub fn host_workers(platform: i32) -> i32 {
+    var name := 84
+    if platform == 0 { name = 58 }
+    unsafe {
+        detected := sysconf_c(name)
+        if detected >= 1 && detected <= 64 { return i32(detected) }
+        if detected > 64 { return 64 }
+    }
+    4
+}
 
 // The platform is the compiler's host, including when it emits another target.
 // Return -1 on OS failure so instrumentation cannot fabricate a duration.
@@ -46,7 +64,13 @@ pub fn run(path: string, args: &[]string, timeout_ms: i64, platform: i32) -> i32
         status_ptr := addr(&mut status)
         var start: i64 = 0
         if timeout_ms > 0 { start = milliseconds(platform); if start < 0 { return 126 } }
-        pid := child_process()
+        var pid := child_process()
+        var fork_tries := 0
+        while pid < 0 && fork_tries < 200 {
+            retry_pause := sleep_us(5000)
+            pid = child_process()
+            fork_tries = fork_tries + 1
+        }
         if pid < 0 { return 126 }
         if pid == 0 {
             if timeout_ms > 0 && process_group(0, 0) != 0 { exit_child(126); return 126 }
@@ -86,20 +110,358 @@ pub fn run(path: string, args: &[]string, timeout_ms: i64, platform: i32) -> i32
     126
 }
 
+fn status_exit_code(status: i32) -> i32 {
+    signal := status.bit_and(127)
+    if signal != 0 { return 128 + signal }
+    status.shr(8).bit_and(255)
+}
+
+fn append_chunk(g: i32, buf: &[u8; 4096], count: i32, chunk_bytes: &mut []u8, chunk_off: &mut []i32, chunk_len: &mut []i32, chunk_next: &mut []i32, group_head: &mut []i32, group_tail: &mut []i32) {
+    cid := chunk_off.len
+    chunk_off.push(chunk_bytes.len)
+    chunk_len.push(count)
+    chunk_next.push(-1)
+    for bi in 0..count { chunk_bytes.push(buf[bi]) }
+    if group_head[g] < 0 { group_head[g] = cid }
+    else { prev := group_tail[g]; chunk_next[prev] = cid }
+    group_tail[g] = cid
+}
+
+unsafe fn drain_pipe_ready(rfd: i32, g: i32, chunk_bytes: &mut []u8, chunk_off: &mut []i32, chunk_len: &mut []i32, chunk_next: &mut []i32, group_head: &mut []i32, group_tail: &mut []i32) {
+    var read_buf: [u8; 4096] = [0; 4096]
+    while true {
+        var one_pfd: [i32; 2] = [0; 2]
+        one_pfd[0] = rfd
+        one_pfd[1] = 1
+        ready := poll_fds(addr(&mut one_pfd[0]), 1, 0)
+        if ready <= 0 || one_pfd[1].shr(16).bit_and(65535) == 0 { break }
+        n := read_fd(rfd, addr(&mut read_buf[0]), 4096)
+        if n <= 0 { break }
+        append_chunk(g, &read_buf, i32(n), &mut chunk_bytes, &mut chunk_off, &mut chunk_len, &mut chunk_next, &mut group_head, &mut group_tail)
+    }
+}
+
+fn flush_group_output(g: i32, chunk_bytes: &[]u8, chunk_off: &[]i32, chunk_len: &[]i32, chunk_next: &[]i32, group_head: &[]i32) {
+    var cid := group_head[g]
+    while cid >= 0 {
+        off := chunk_off[cid]
+        clen := chunk_len[cid]
+        if clen > 0 {
+            unsafe {
+                var written_total := 0
+                while written_total < clen {
+                    p := addr(&chunk_bytes[off + written_total])
+                    w := write_fd(1, p, usize(clen - written_total))
+                    if w <= 0 { break }
+                    written_total = written_total + i32(w)
+                }
+            }
+        }
+        cid = chunk_next[cid]
+    }
+}
+
 pub fn tests(path: string, groups: &[]string, keys: &[]string, affected: bool, timeout_ms: i64, platform: i32) -> i32 {
+    tests_parallel(path, &groups, &keys, affected, timeout_ms, platform, host_workers(platform))
+}
+
+pub fn tests_parallel(path: string, groups: &[]string, keys: &[]string, affected: bool, timeout_ms: i64, platform: i32, max_jobs: i32) -> i32 {
+    total := groups.len
     var skipped := 0
     var passed := 0
     var failed := 0
-    for i in 0..groups.len {
+    var done: []bool = []
+    var skipped_flag: []bool = []
+    var codes: []i32 = []
+    var group_head: []i32 = []
+    var group_tail: []i32 = []
+    var queue: []i32 = []
+    for i in 0..total {
         var key := ""
         if i < keys.len { key = keys[i] }
-        if affected && receipts.seen(key) { skipped = skipped + 1; continue }
-        args: []string = [i.str()]
-        result := run(path, &args, timeout_ms, platform)
-        receipts.update(key, result == 0)
-        if result == 0 { passed = passed + 1; print("PASS " + groups[i]) }
-        else { failed = failed + 1; print("FAIL " + groups[i] + " (exit " + result.str() + ")") }
+        codes.push(0)
+        group_head.push(-1)
+        group_tail.push(-1)
+        if affected && receipts.seen(key) {
+            skipped = skipped + 1
+            done.push(true)
+            skipped_flag.push(true)
+        } else {
+            done.push(false)
+            skipped_flag.push(false)
+            queue.push(i)
+        }
     }
+    if queue.len == 0 {
+        if affected { print(skipped.str() + " unaffected") }
+        print("0 passed, 0 failed")
+        return 0
+    }
+    var max_slots := max_jobs
+    if max_slots < 1 { max_slots = 1 }
+    if max_slots > 64 { max_slots = 64 }
+    if max_slots > queue.len { max_slots = queue.len }
+
+    var slot_pid: [i32; 64] = [0; 64]
+    var slot_rfd: [i32; 64] = [0; 64]
+    var slot_group: [i32; 64] = [0; 64]
+    var slot_start: [i64; 64] = [0; 64]
+    for s in 0..64 {
+        slot_pid[s] = -1
+        slot_rfd[s] = -1
+        slot_group[s] = -1
+    }
+
+    var chunk_bytes: []u8 = []
+    var chunk_off: []i32 = []
+    var chunk_len: []i32 = []
+    var chunk_next: []i32 = []
+    var read_buf: [u8; 4096] = [0; 4096]
+
+    var active := 0
+    var next_q := 0
+    var cursor := 0
+    while cursor < total && skipped_flag[cursor] { cursor = cursor + 1 }
+
+    while active > 0 || next_q < queue.len {
+        var spawn_deferred := false
+        for s in 0..max_slots {
+            if slot_pid[s] >= 0 || next_q >= queue.len { continue }
+            g := queue[next_q]
+            next_q = next_q + 1
+            var arg_bytes: []u8 = []
+            var arg_offsets: []i32 = []
+            if !append_arg(&mut arg_bytes, &mut arg_offsets, path) || !append_arg(&mut arg_bytes, &mut arg_offsets, g.str()) {
+                codes[g] = 126
+                done[g] = true
+                continue
+            }
+            unsafe {
+                var pipe_fds: [i32; 2] = [0; 2]
+                pipe_fds[0] = -1
+                pipe_fds[1] = -1
+                var pipe_rc := make_pipe(addr(&mut pipe_fds[0]))
+                var pipe_tries := 0
+                while pipe_rc != 0 && active == 0 && pipe_tries < 200 {
+                    pipe_pause := sleep_us(5000)
+                    pipe_rc = make_pipe(addr(&mut pipe_fds[0]))
+                    pipe_tries = pipe_tries + 1
+                }
+                if pipe_rc != 0 {
+                    if active > 0 {
+                        spawn_deferred = true
+                        next_q = next_q - 1
+                        break
+                    }
+                    codes[g] = 126
+                    done[g] = true
+                    continue
+                }
+                var start_ms: i64 = 0
+                if timeout_ms > 0 {
+                    start_ms = milliseconds(platform)
+                    if start_ms < 0 {
+                        c0 := close_fd(pipe_fds[0])
+                        c1 := close_fd(pipe_fds[1])
+                        codes[g] = 126
+                        done[g] = true
+                        continue
+                    }
+                }
+                var argv: []ptr = []
+                for offset in arg_offsets { argv.push(addr(&arg_bytes[offset])) }
+                argv.push(ptr(0))
+                executable := argv[0]
+                arguments := addr(&argv[0])
+                var pid := child_process()
+                var spawn_tries := 0
+                while pid < 0 && active == 0 && spawn_tries < 200 {
+                    spawn_pause := sleep_us(5000)
+                    pid = child_process()
+                    spawn_tries = spawn_tries + 1
+                }
+                if pid < 0 {
+                    c0 := close_fd(pipe_fds[0])
+                    c1 := close_fd(pipe_fds[1])
+                    if active > 0 {
+                        spawn_deferred = true
+                        next_q = next_q - 1
+                        break
+                    }
+                    codes[g] = 126
+                    done[g] = true
+                    continue
+                }
+                if pid == 0 {
+                    if timeout_ms > 0 && process_group(0, 0) != 0 { exit_child(126) }
+                    cr := close_fd(pipe_fds[0])
+                    for k in 0..max_slots {
+                        if slot_rfd[k] >= 0 { ck := close_fd(slot_rfd[k]) }
+                    }
+                    var duped := duplicate_fd(pipe_fds[1], 1)
+                    var dup_tries := 0
+                    while duped < 0 && dup_tries < 5 {
+                        duped = duplicate_fd(pipe_fds[1], 1)
+                        dup_tries = dup_tries + 1
+                    }
+                    if pipe_fds[1] > 2 { cw := close_fd(pipe_fds[1]) }
+                    if duped < 0 { exit_child(126) }
+                    failed_exec := execute(executable, arguments)
+                    exit_child(127)
+                }
+                if timeout_ms > 0 { grouped := process_group(pid, pid) }
+                closed_w := close_fd(pipe_fds[1])
+                slot_pid[s] = pid
+                slot_rfd[s] = pipe_fds[0]
+                slot_group[s] = g
+                slot_start[s] = start_ms
+                active = active + 1
+            }
+        }
+
+        while cursor < total && done[cursor] {
+            if !skipped_flag[cursor] {
+                var key := ""
+                if cursor < keys.len { key = keys[cursor] }
+                code := codes[cursor]
+                receipts.update(key, code == 0)
+                flush_group_output(cursor, &chunk_bytes, &chunk_off, &chunk_len, &chunk_next, &group_head)
+                if code == 0 { passed = passed + 1; print("PASS " + groups[cursor]) }
+                else { failed = failed + 1; print("FAIL " + groups[cursor] + " (exit " + code.str() + ")") }
+            }
+            cursor = cursor + 1
+        }
+        if active == 0 && next_q >= queue.len { break }
+
+        unsafe {
+            var pfds: [i32; 128] = [0; 128]
+            var pfd_slot: [i32; 64] = [0; 64]
+            var nfds := 0
+            var has_closed_pipe := false
+            var poll_ms := -1
+            if timeout_ms > 0 {
+                now_poll := milliseconds(platform)
+                if now_poll < 0 { poll_ms = 0 }
+                else {
+                    for s in 0..max_slots {
+                        if slot_pid[s] >= 0 {
+                            rem := timeout_ms - (now_poll - slot_start[s])
+                            var rem32 := 0
+                            if rem > 0 {
+                                if rem > 60000 { rem32 = 60000 } else { rem32 = i32(rem) }
+                            }
+                            if poll_ms < 0 || rem32 < poll_ms { poll_ms = rem32 }
+                        }
+                    }
+                    if poll_ms < 0 { poll_ms = 0 }
+                }
+            }
+            for s in 0..max_slots {
+                if slot_pid[s] >= 0 {
+                    if slot_rfd[s] >= 0 {
+                        pfds[nfds * 2] = slot_rfd[s]
+                        pfds[nfds * 2 + 1] = 1
+                        pfd_slot[nfds] = s
+                        nfds = nfds + 1
+                    } else {
+                        has_closed_pipe = true
+                    }
+                }
+            }
+            if spawn_deferred && (poll_ms < 0 || poll_ms > 5) { poll_ms = 5 }
+            if has_closed_pipe && (poll_ms < 0 || poll_ms > 1) { poll_ms = 1 }
+            if nfds > 0 {
+                polled := poll_fds(addr(&mut pfds[0]), u32(nfds), poll_ms)
+                for pi in 0..nfds {
+                    rev := pfds[pi * 2 + 1].shr(16).bit_and(65535)
+                    if rev != 0 {
+                        s := pfd_slot[pi]
+                        g := slot_group[s]
+                        n := read_fd(slot_rfd[s], addr(&mut read_buf[0]), 4096)
+                        if n > 0 {
+                            append_chunk(g, &read_buf, i32(n), &mut chunk_bytes, &mut chunk_off, &mut chunk_len, &mut chunk_next, &mut group_head, &mut group_tail)
+                        } else if n == 0 {
+                            closed_eof := close_fd(slot_rfd[s])
+                            slot_rfd[s] = -1
+                        }
+                    }
+                }
+            } else if poll_ms > 0 {
+                slept := sleep_us(u32(poll_ms * 1000))
+            }
+
+            for s in 0..max_slots {
+                if slot_pid[s] < 0 { continue }
+                pid := slot_pid[s]
+                g := slot_group[s]
+                var status := 0
+                var reaped := wait_child(pid, addr(&mut status), 1)
+                if reaped == 0 && slot_rfd[s] < 0 {
+                    tiny_wait := sleep_us(50)
+                    reaped = wait_child(pid, addr(&mut status), 1)
+                }
+                if reaped == pid {
+                    if slot_rfd[s] >= 0 {
+                        drain_pipe_ready(slot_rfd[s], g, &mut chunk_bytes, &mut chunk_off, &mut chunk_len, &mut chunk_next, &mut group_head, &mut group_tail)
+                        closed_done := close_fd(slot_rfd[s])
+                        slot_rfd[s] = -1
+                    }
+                    codes[g] = status_exit_code(status)
+                    done[g] = true
+                    slot_pid[s] = -1
+                    slot_group[s] = -1
+                    active = active - 1
+                } else if reaped < 0 {
+                    if signal_child(pid, 0) != 0 {
+                        if slot_rfd[s] >= 0 {
+                            closed_err := close_fd(slot_rfd[s])
+                            slot_rfd[s] = -1
+                        }
+                        codes[g] = 126
+                        done[g] = true
+                        slot_pid[s] = -1
+                        slot_group[s] = -1
+                        active = active - 1
+                    }
+                } else if timeout_ms > 0 {
+                    now_chk := milliseconds(platform)
+                    if now_chk < 0 || now_chk - slot_start[s] >= timeout_ms {
+                        killed := signal_child(-pid, 9)
+                        if killed != 0 { fallback := signal_child(pid, 9) }
+                        while true {
+                            wr := wait_child(pid, addr(&mut status), 0)
+                            if wr == pid { break }
+                            if wr < 0 && signal_child(pid, 0) != 0 { break }
+                        }
+                        if slot_rfd[s] >= 0 {
+                            drain_pipe_ready(slot_rfd[s], g, &mut chunk_bytes, &mut chunk_off, &mut chunk_len, &mut chunk_next, &mut group_head, &mut group_tail)
+                            closed_to := close_fd(slot_rfd[s])
+                            slot_rfd[s] = -1
+                        }
+                        codes[g] = 124
+                        done[g] = true
+                        slot_pid[s] = -1
+                        slot_group[s] = -1
+                        active = active - 1
+                    }
+                }
+            }
+        }
+    }
+
+    while cursor < total && done[cursor] {
+        if !skipped_flag[cursor] {
+            var key := ""
+            if cursor < keys.len { key = keys[cursor] }
+            code := codes[cursor]
+            receipts.update(key, code == 0)
+            flush_group_output(cursor, &chunk_bytes, &chunk_off, &chunk_len, &chunk_next, &group_head)
+            if code == 0 { passed = passed + 1; print("PASS " + groups[cursor]) }
+            else { failed = failed + 1; print("FAIL " + groups[cursor] + " (exit " + code.str() + ")") }
+        }
+        cursor = cursor + 1
+    }
+
     if affected { print(skipped.str() + " unaffected") }
     print(passed.str() + " passed, " + failed.str() + " failed")
     if failed > 0 { return 1 }

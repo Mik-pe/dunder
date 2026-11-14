@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Check comparison instruction placement and signed/trapping semantics."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 RELATIONS = {'==': (0, lambda a, b: a == b), '!=': (1, lambda a, b: a != b),
              '<': (11, lambda a, b: a < b), '<=': (13, lambda a, b: a <= b),
              '>': (12, lambda a, b: a > b), '>=': (10, lambda a, b: a >= b)}
@@ -62,25 +67,13 @@ def main():
         harness = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/comparison-emitter.ddr', '-o', harness])
         count = 0
+        queued = []
 
         def probe(body, left=3, right=7, zero=1, scalar=2, mode='homes', expected=0,
                   status=0, words=None, ret=3):
             nonlocal count
             count += 1
-            source = work / f'case-{count}.ddr'
-            source.write_text('a b z values ' + body)
-            for target in range(4):
-                image = work / f'image-{target}'
-                generated = call([harness, source, image, target, mode, expected, ret,
-                                  scalar, left, right, zero, 8])
-                emitted = list(map(int, generated.stdout.splitlines()))
-                if words is not None:
-                    assert emitted == words, (body, target, mode, emitted, words)
-                if target == host:
-                    run = call([image], status)
-                    assert run.stdout == '', (body, run.stdout)
-                elif target == 3:
-                    call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], 125 if status else 0)
+            queued.append((count, body, left, right, zero, scalar, mode, expected, status, words, ret))
 
         # Exact words prove direct allocated-register use, one-sided reloads,
         # noncontiguous/high physical slots and the cached array-length home.
@@ -146,6 +139,28 @@ def main():
                       scalar=1, mode='function', ret=2, expected=expected)
         probe('{var sum:=0;for cursor in 0..a{if cursor<b{sum=sum+1}};sum}',
               6, 3, scalar=1, mode='function', ret=1, expected=3)
+        with wasm_host.WasmWorker() as wasm, ThreadPoolExecutor(max_workers=4) as pool:
+            def run_probe(item):
+                cid, body, left, right, zero, scalar, mode, expected, status, words, ret = item
+                source = work / f'case-{cid}.ddr'
+                source.write_text('a b z values ' + body)
+                for target in range(4):
+                    image = work / f'image-{cid}-{target}'
+                    generated = call([harness, source, image, target, mode, expected, ret,
+                                      scalar, left, right, zero, 8])
+                    emitted = list(map(int, generated.stdout.splitlines()))
+                    if words is not None:
+                        assert emitted == words, (body, target, mode, emitted, words)
+                    if target == host:
+                        run = call([image], status)
+                        assert run.stdout == '', (body, run.stdout)
+                    elif target == 3:
+                        expected_wasm = 125 if status else 0
+                        wres = wasm.run(image)
+                        assert wres.returncode == expected_wasm and wres.stdout == '', (
+                            body, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
+                    image.unlink(missing_ok=True)
+            list(pool.map(run_probe, queued))
         print(f'PASS {count} comparison cases: exact words, signed results, branches, traps and shortcuts; '
               'all four targets built, host and Wasm executed; cross-native not executed')
 

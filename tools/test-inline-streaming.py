@@ -5,7 +5,11 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
@@ -26,7 +30,7 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
-    with tempfile.TemporaryDirectory(prefix='dunder-inline-stream-') as directory:
+    with tempfile.TemporaryDirectory(prefix='dunder-inline-stream-') as directory, wasm_host.WasmWorker() as wasm_worker:
         work = Path(directory)
         profiles = []
         for target in range(4):
@@ -44,7 +48,8 @@ def main():
                 if target == host:
                     call([image], output=b'42\n')
                 elif target == 3:
-                    call(['node', ROOT/'tools/runtime-contract-wasm.cjs', image, '--repeat'], output=b'42\n')
+                    res = wasm_worker.run(image, repeat=True, binary_output=True)
+                    assert res.returncode == 0 and res.stdout == b'42\n', res
         for mode in ('off', 'on'):
             image = work / ('profile-' + mode)
             call([compiler, 'build', ROOT/'tests/fixtures/inline-streaming.ddr',
@@ -76,7 +81,8 @@ def main():
                     if target == host:
                         call([image], output=b'42\n')
                     elif target == 3:
-                        call(['node', ROOT/'tools/runtime-contract-wasm.cjs', image], output=b'42\n')
+                        res = wasm_worker.run(image, binary_output=True)
+                        assert res.returncode == 0 and res.stdout == b'42\n', res
         # A cached builtin-only expansion has no declaration IDs, but its
         # budget charge must still be replayed without emitting new inline code.
         cached = work/'cached.ddr'
@@ -106,7 +112,8 @@ def main():
                 if target == host:
                     call([image], status=104, output=b'17\n')
                 elif target == 3:
-                    call(['node', ROOT/'tools/runtime-contract-wasm.cjs', image], status=125, output=b'17\n')
+                    res = wasm_worker.run(image, binary_output=True)
+                    assert res.returncode == 125 and res.stdout == b'17\n', res
     print('inline streaming: all targets, mutation snapshots, nesting, continue/break/return, '
           'NUL and UTF-8 boundaries, large frames, budget fallback, cached builtin charges, '
           'repeated Wasm and unchanged runtime traffic passed')

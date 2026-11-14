@@ -15,9 +15,13 @@ import random
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
 ENV = {'PATH': '/no-external-tools'}
 WASM = '''const fs=require('node:fs');
@@ -26,7 +30,7 @@ const program=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(pr
   {dunder:{print_i32:print,print_i64:print,print_bool:x=>print(Boolean(x))}}).exports;
 try { const status=program.main(); if(status!==undefined)process.exitCode=Number(status); }
 catch(error) {
-  if(!(error instanceof WebAssembly.RuntimeError)||error.message!=='unreachable')throw error;
+  if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;
   process.exitCode=125;
 }'''
 
@@ -302,7 +306,7 @@ def main():
     parser.add_argument('--baseline', type=Path, help='optional older compiler, receives no const-div flags')
     parser.add_argument('--legacy-only', action='store_true',
                         help='validate fixtures with this compiler alone, without new CLI flags')
-    parser.add_argument('--node', default='node')
+    parser.add_argument('--node', default='bun')
     parser.add_argument('--verify-selection', action='store_true', help='assert helpers still use the typed model via timings counters')
     parser.add_argument('--case', help='run only program names containing this substring')
     parser.add_argument('--plan-module', type=Path, default=ROOT / 'selfhost/const_div.ddr',
@@ -317,10 +321,7 @@ def main():
         variants = [('legacy', compiler, [])]
     if args.baseline:
         variants.insert(0, ('baseline', args.baseline.resolve(strict=True), []))
-    node = shutil.which(args.node)
-    if not node:
-        parser.error('Node is required for Wasm execution')
-    node = Path(node).resolve(strict=True)
+    node = Path(wasm_host.js_runtime(args.node))
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         native = 'arm64-macos'
     elif platform.system() == 'Linux' and platform.machine() in ('arm64', 'aarch64', 'x86_64'):
@@ -338,7 +339,7 @@ def main():
         invalids = [p for p in invalids if args.case in p[0]]
         if not positives and not traps and not invalids and args.case not in 'plans':
             parser.error('--case did not match any program')
-    with tempfile.TemporaryDirectory(prefix='dunder-const-div-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='dunder-const-div-') as tmp, wasm_host.WasmWorker(node) as wasm:
         work = Path(tmp).resolve()
         plan_hash = None
         if not args.case or args.case in 'plans':
@@ -357,7 +358,7 @@ def main():
                 assert built.returncode == 0, ('plan export build', target, built.stderr.decode(errors='replace'))
                 image_header(image, target)
                 if target in (native, 'wasm32'):
-                    result = call([image] if target == native else [node, '-e', WASM, image], work)
+                    result = call([image], work) if target == native else wasm.run(image, binary_output=True)
                     assert result.returncode == 0, ('plan export run', target, result.returncode, result.stderr)
                     outputs.append(result.stdout)
                     executed += 1
@@ -382,8 +383,7 @@ def main():
                         data = json.loads(built.stderr)['optimizer']
                         assert data['enabled'] and data['emitted'] >= helpers, (name, variant, target, helpers, data)
                     if target in (native, 'wasm32'):
-                        command = [image] if target == native else [node, '-e', WASM, image]
-                        result = call(command, work)
+                        result = call([image], work) if target == native else wasm.run(image, binary_output=True)
                         wanted_status = 125 if target == 'wasm32' and status else status
                         assert result.returncode == wanted_status and result.stdout == wanted, (
                             name, variant, target, result.returncode, wanted_status, result.stdout[:1000], wanted[:1000], result.stderr)

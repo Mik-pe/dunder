@@ -19,9 +19,13 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
 ENV = {'PATH': '/no-external-tools'}
 MASK64 = (1 << 64) - 1
@@ -33,7 +37,7 @@ const print=x=>console.log(x.toString());
 const program=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),
  {dunder:{print_i32:print,print_i64:print,print_bool:x=>print(Boolean(x))}}).exports;
 try {const result=program.main();if(process.argv[2]!=='ignore-result'&&result!==undefined)process.exitCode=Number(result)}
-catch(error){if(!(error instanceof WebAssembly.RuntimeError)||error.message!=='unreachable')throw error;process.exitCode=125}
+catch(error){if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;process.exitCode=125}
 """
 
 
@@ -417,7 +421,7 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--only', choices=('all', 'oracle', 'source'), default='all')
-    parser.add_argument('--node', default='node')
+    parser.add_argument('--node', default='bun')
     parser.add_argument('--fuel', type=int, default=10000)
     parser.add_argument('--report', type=Path, help='JSON hashes, raw commands, models, counts and coverage limits')
     args = parser.parse_args()
@@ -425,10 +429,7 @@ def main():
         parser.error('--fuel must be at least 100')
     compiler = args.compiler.resolve(strict=True)
     source_root = args.source_root.resolve(strict=True)
-    node = shutil.which(args.node)
-    if not node:
-        parser.error('Node is required for Wasm execution')
-    node = Path(node).resolve(strict=True)
+    node = Path(wasm_host.js_runtime(args.node))
     system, machine = platform.system(), platform.machine()
     if system == 'Darwin' and machine == 'arm64': host = 0
     elif system == 'Linux' and machine in ('aarch64', 'arm64'): host = 1
@@ -449,7 +450,7 @@ def main():
                         'Deterministic finite inputs and fuel do not constitute a universal proof'])
     counts = Counter()
     try:
-        with tempfile.TemporaryDirectory(prefix='dunder-mir-qa-') as directory:
+        with tempfile.TemporaryDirectory(prefix='dunder-mir-qa-') as directory, wasm_host.WasmWorker(node) as wasm:
             work = Path(directory).resolve()
 
             def call(command, expected=0):
@@ -465,8 +466,14 @@ def main():
                 if target not in (host, 3):
                     counts['cross_builds'] += 1
                     return
-                command = [image] if target == host else [node, '-e', WASM, image, 'ignore-result' if ignore_result else 'result']
-                result = call(command, 125 if target == 3 and status else status)
+                expected = 125 if target == 3 and status else status
+                if target == host:
+                    result = call([image], expected)
+                else:
+                    result = wasm.run(image, ignore_result=ignore_result)
+                    evidence['commands'].append(dict(command=result.args, status=result.returncode,
+                                                    expected=expected, stdout=result.stdout, stderr=result.stderr))
+                    assert result.returncode == expected, (result.args, expected, result.returncode, result.stdout, result.stderr)
                 assert result.stdout == output, (image, result.stdout, output)
                 counts['executions'] += 1
 

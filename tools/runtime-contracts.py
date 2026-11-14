@@ -12,7 +12,10 @@ import sys
 import tempfile
 import time
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 FIXTURES = ROOT / 'tests/contracts'
 BOUNDED = {
     'array_ownership', 'array_returns', 'array_snapshots', 'block_cleanup', 'lexical_cleanup',
@@ -215,7 +218,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--target', choices=('arm64-macos','arm64-linux','x86_64-linux','wasm32'))
-    parser.add_argument('--node', default='node', help='WebAssembly host')
+    parser.add_argument('--node', default='bun', help='WebAssembly host')
     parser.add_argument('--runner', help='native emulator executable, e.g. qemu-aarch64')
     parser.add_argument('--case', action='append', help='run only the named case (repeatable)')
     parser.add_argument('--timeout', type=float, default=90, help='seconds per program or compile')
@@ -225,56 +228,61 @@ def main():
     compiler = args.compiler.resolve()
     wasm = args.target == 'wasm32'
     with tempfile.TemporaryDirectory(prefix='dunder-contracts-') as tmp:
-        directory = Path(tmp)
-        cases = {p.stem: (p, 0) for p in sorted(FIXTURES.glob('*.ddr'))}
-        for name, generate in [('integer_and_float',numeric_reference),
-                               ('utf8',unicode_reference), ('map_set_sort',collections_reference)]:
-            source = directory / (name + '.ddr')
-            source.write_text(generate(), encoding='utf-8')
-            cases[name] = source, 0
-        float_source, numbers = float_format_reference(directory)
-        cases['float_format'] = float_source, 0
-        for name, (status, body) in TRAPS.items():
-            source = directory / (name + '.ddr')
-            source.write_text('enum Kind{A=1,B=9}\nfn main(){print(17);' + body + ';print(99)}', encoding='utf-8')
-            cases[name] = source, status
-        selected = args.case or list(cases)
-        if unknown := set(selected) - cases.keys():
-            parser.error(f'unknown case(s): {sorted(unknown)}')
-        failures = 0
-        for name in selected:
-            try:
-                source, expected = cases[name]
-                image = directory / (name + ('.wasm' if wasm else '.bin'))
-                command = [compiler, 'build', source, '-o', image]
-                if args.target:
-                    command.extend(['--target', args.target])
-                built = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=args.timeout)
-                if built.returncode:
-                    raise ValueError(built.stderr.decode(errors='replace') or f'build exit {built.returncode}')
-                run = [image]
-                if wasm:
-                    run = [args.node, ROOT / 'tools/runtime-contract-wasm.cjs', image]
-                    if name in BOUNDED:
-                        run.append('--repeat')
-                elif args.runner:
-                    run.insert(0, args.runner)
-                code, output, error, rss = run_binary(run, directory, args.timeout)
-                status = 125 if wasm and expected else expected
-                marker = b'17\n' if expected else b'42\n'
-                if code == 0 and name == 'float_format':
-                    check_formatted(output, numbers)
-                    marker = output
-                if code != status or output != marker:
-                    raise ValueError(f'exit {code}, expected {status}; stdout {output[:500]!r}; stderr {error[:500]!r}')
-                if name in BOUNDED and not wasm and not args.runner and rss >= 96 * 1024:
-                    raise ValueError(f'peak RSS {rss:.0f} KiB exceeds 96 MiB')
-                print('PASS', name, flush=True)
-            except (OSError, ValueError, OverflowError, subprocess.TimeoutExpired) as error:
-                print(f'FAIL {name}: {error}', file=sys.stderr, flush=True)
-                failures += 1
-        print(f'{len(selected) - failures} passed, {failures} failed')
-        return failures != 0
+        wasm_worker = wasm_host.WasmWorker(args.node) if wasm else None
+        try:
+            directory = Path(tmp)
+            cases = {p.stem: (p, 0) for p in sorted(FIXTURES.glob('*.ddr'))}
+            for name, generate in [('integer_and_float',numeric_reference),
+                                   ('utf8',unicode_reference), ('map_set_sort',collections_reference)]:
+                source = directory / (name + '.ddr')
+                source.write_text(generate(), encoding='utf-8')
+                cases[name] = source, 0
+            float_source, numbers = float_format_reference(directory)
+            cases['float_format'] = float_source, 0
+            for name, (status, body) in TRAPS.items():
+                source = directory / (name + '.ddr')
+                source.write_text('enum Kind{A=1,B=9}\nfn main(){print(17);' + body + ';print(99)}', encoding='utf-8')
+                cases[name] = source, status
+            selected = args.case or list(cases)
+            if unknown := set(selected) - cases.keys():
+                parser.error(f'unknown case(s): {sorted(unknown)}')
+            failures = 0
+            for name in selected:
+                try:
+                    source, expected = cases[name]
+                    image = directory / (name + ('.wasm' if wasm else '.bin'))
+                    command = [compiler, 'build', source, '-o', image]
+                    if args.target:
+                        command.extend(['--target', args.target])
+                    built = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=args.timeout)
+                    if built.returncode:
+                        raise ValueError(built.stderr.decode(errors='replace') or f'build exit {built.returncode}')
+                    if wasm:
+                        wres = wasm_worker.run(image, repeat=(name in BOUNDED), binary_output=True)
+                        code, output, error, rss = wres.returncode, wres.stdout, wres.stderr, 0.0
+                    else:
+                        run = [image]
+                        if args.runner:
+                            run.insert(0, args.runner)
+                        code, output, error, rss = run_binary(run, directory, args.timeout)
+                    status = 125 if wasm and expected else expected
+                    marker = b'17\n' if expected else b'42\n'
+                    if code == 0 and name == 'float_format':
+                        check_formatted(output, numbers)
+                        marker = output
+                    if code != status or output != marker:
+                        raise ValueError(f'exit {code}, expected {status}; stdout {output[:500]!r}; stderr {error[:500]!r}')
+                    if name in BOUNDED and not wasm and not args.runner and rss >= 96 * 1024:
+                        raise ValueError(f'peak RSS {rss:.0f} KiB exceeds 96 MiB')
+                    print('PASS', name, flush=True)
+                except (OSError, ValueError, OverflowError, subprocess.TimeoutExpired) as error:
+                    print(f'FAIL {name}: {error}', file=sys.stderr, flush=True)
+                    failures += 1
+            print(f'{len(selected) - failures} passed, {failures} failed')
+            return failures != 0
+        finally:
+            if wasm_worker is not None:
+                wasm_worker.close()
 
 
 if __name__ == '__main__':

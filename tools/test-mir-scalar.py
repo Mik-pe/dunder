@@ -7,6 +7,7 @@ The existing semantic MIR oracle supplies integer arithmetic and NZCV results;
 it reads semantic fields and never knows the new lowering's instruction words.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 from pathlib import Path
 import platform
@@ -17,6 +18,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 spec = importlib.util.spec_from_file_location('semantic_mir_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
@@ -119,18 +122,23 @@ def main():
     with tempfile.TemporaryDirectory(prefix='dunder-mir-scalar-') as temporary:
         work = Path(temporary); emitter = work / 'emitter'
         run([compiler, 'build', ROOT / 'tests/fixtures/mir-scalar-emitter.ddr', '-o', emitter], work)
-        for index, (name, operation, values) in enumerate(corpus):
-            expected, conditions = evaluate(operation, values)
-            semantic = [operation[key] for key in ('kind', 'opcode', 'type', 'dst', 'a', 'b', 'c', 'imm', 'aux', 'flags')]
-            for target in range(4):
-                image = work / 'scalar-image'
-                run([emitter, image, target, *semantic, *(oracle.signed(value) for value in values), expected, conditions], work)
-                if target == host:
-                    run([image], work)
-                if target == 3:
-                    run(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], work)
-            if (index + 1) % 50 == 0:
-                print(f'PASS {index + 1}/{len(corpus)} scalar cases', flush=True)
+        with wasm_host.WasmWorker() as wasm, ThreadPoolExecutor(max_workers=4) as pool:
+            def check_case(entry):
+                index, (_, operation, values) = entry
+                expected, conditions = evaluate(operation, values)
+                semantic = [operation[key] for key in ('kind', 'opcode', 'type', 'dst', 'a', 'b', 'c', 'imm', 'aux', 'flags')]
+                for target in range(4):
+                    image = work / f'scalar-image-{index}-{target}'
+                    run([emitter, image, target, *semantic, *(oracle.signed(value) for value in values), expected, conditions], work)
+                    if target == host:
+                        run([image], work)
+                    if target == 3:
+                        wres = wasm.run(image)
+                        assert wres.returncode == 0, (image, wres.returncode, wres.stdout, wres.stderr)
+                    image.unlink(missing_ok=True)
+            for done_count, _ in enumerate(pool.map(check_case, enumerate(corpus)), 1):
+                if done_count % 50 == 0:
+                    print(f'PASS {done_count}/{len(corpus)} scalar cases', flush=True)
     print(f'{len(corpus)} independent scalar/NZCV cases; {len(corpus) * 4} images built; '
           f'{len(corpus) * 2} native/Wasm executions passed')
 

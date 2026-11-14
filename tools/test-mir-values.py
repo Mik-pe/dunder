@@ -17,6 +17,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 spec = importlib.util.spec_from_file_location('semantic_mir_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
@@ -87,7 +89,7 @@ def main():
               'value_module_sha256': digest(ROOT / 'selfhost/mir_value_prop.ddr'),
               'fixture_sha256': digest(ROOT / 'tests/fixtures/mir-value-emitter.ddr'), 'images': []}
     gaps = 0; proofs = 0; executed = 0; domain_pairs = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-mir-values-') as directory:
+    with tempfile.TemporaryDirectory(prefix='dunder-mir-values-') as directory, wasm_host.WasmWorker() as wasm:
         work = Path(directory); emitter = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/mir-value-emitter.ddr', '-o', emitter], work)
         report['emitter_sha256'] = digest(emitter)
@@ -124,7 +126,9 @@ def main():
                     if target == host:
                         call([image], work, 101 if traps else 0); executed += 1; ran = True
                     if target == 3:
-                        call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], work, 125 if traps else 0)
+                        expected_wasm = 125 if traps else 0
+                        wres = wasm.run(image)
+                        assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
                         executed += 1; ran = True
                     image_sha = digest(image)
                     if mode == 'on':

@@ -19,7 +19,10 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('ssa_mir_semantic_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
@@ -179,7 +182,7 @@ def main():
                   call_inputs_sha256=digest((ROOT / 'selfhost/mir_call_inputs.ddr').read_bytes()),
                   fixture_sha256=digest(fixture.read_bytes()),
                   oracle_sha256=digest((ROOT / 'tools/test-mir.py').read_bytes()), host_target=host, images=[])
-    with tempfile.TemporaryDirectory(prefix='dunder-mir-ssa-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='dunder-mir-ssa-') as temporary, wasm_host.WasmWorker() as wasm:
         work = args.output.resolve() if args.output else Path(temporary)
         if args.output:
             work.mkdir(parents=True, exist_ok=True)
@@ -242,7 +245,9 @@ def main():
             if target == host:
                 call([image], 101 if trap else 0); executed += 1; ran = True
             elif target == 3:
-                call(['node', ROOT / 'tools/runtime-contract-wasm.cjs', image], 125 if trap else 0)
+                expected_wasm = 125 if trap else 0
+                wres = wasm.run(image)
+                assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
                 executed += 1; ran = True
             if args.output: image.with_suffix(image.suffix + '.mir.txt').write_text(result.stdout)
             row = dict(case=case, name=NAMES[case], input=value, control=control, target=target, mode=mode,

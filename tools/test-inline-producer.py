@@ -14,9 +14,13 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import wasm_host
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
 ENV = {'PATH': '/no-external-tools'}
 WASM = """const fs=require('node:fs');
@@ -24,7 +28,7 @@ const print=x=>console.log(x.toString());
 const program=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),
  {dunder:{print_i32:print,print_i64:print,print_bool:x=>print(Boolean(x))}}).exports;
 try {const status=program.main();if(status!==undefined)process.exitCode=Number(status)}
-catch(error){if(!(error instanceof WebAssembly.RuntimeError)||error.message!=='unreachable')throw error;process.exitCode=125}
+catch(error){if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;process.exitCode=125}
 """
 COUNTERS = ('modeled', 'optimized', 'emitted', 'reused', 'fallbacks')
 INLINE = ('entries', 'nodes', 'tokens', 'units', 'calls', 'words', 'estimate')
@@ -107,16 +111,13 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--baseline', type=Path, help='optional older compiler; receives no new inline flag')
     parser.add_argument('--source-root', type=Path, default=ROOT, help='compiler API checkout imported by the fixture')
-    parser.add_argument('--node', default='node')
+    parser.add_argument('--node', default='bun')
     parser.add_argument('--report', type=Path, help='optional JSON with hashes, counters and raw command output')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     baseline = args.baseline.resolve(strict=True) if args.baseline else None
     source_root = args.source_root.resolve(strict=True)
-    node = shutil.which(args.node)
-    if not node:
-        parser.error('Node is required for Wasm execution')
-    node = Path(node).resolve(strict=True)
+    node = Path(wasm_host.js_runtime(args.node))
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         host = 0
     elif platform.system() == 'Linux' and platform.machine() in ('arm64', 'aarch64', 'x86_64'):
@@ -141,7 +142,7 @@ def main():
                                  'cache counters describe performed work; source bindings are compared separately'])
     builds = diagnostics = executions = cross_builds = cli_checks = 0
     try:
-        with tempfile.TemporaryDirectory(prefix='dunder-inline-producer-') as directory:
+        with tempfile.TemporaryDirectory(prefix='dunder-inline-producer-') as directory, wasm_host.WasmWorker(node) as wasm:
             work = Path(directory).resolve()
 
             def call(command, expected=0):
@@ -184,8 +185,15 @@ def main():
             def execute(image, target, output, status):
                 nonlocal executions, cross_builds
                 if target in (host, 3):
-                    command = [image] if target == host else [node, '-e', WASM, image]
-                    result = call(command, 125 if status and target == 3 else status)
+                    expected_status = 125 if status and target == 3 else status
+                    if target == host:
+                        result = call([image], expected_status)
+                    else:
+                        result = wasm.run(image)
+                        if args.report:
+                            evidence['commands'].append(dict(command=result.args, status=result.returncode, expected_status=expected_status,
+                                                             stdout=result.stdout, stderr=result.stderr))
+                        assert result.returncode == expected_status, (result.args, result.returncode, expected_status, result.stdout, result.stderr)
                     assert result.stdout == output, (image.name, target, result.stdout, output)
                     executions += 1
                 else:
