@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Source-level SSA acceptance: results, workers, diagnostics, cache and receipts.
 
-Build all four targets and execute the native host and Wasm. This is a
+Build all three targets and execute the native host. This is a
 functional test, without latency assertions or Linux execution on macOS.
 """
 import argparse
@@ -14,7 +14,6 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 
 FUNCTION = '''fn calculate(n:i32)->i64 {
@@ -32,7 +31,7 @@ COUNTERS = tuple('ssa_' + name for name in (
     'optimized', 'cells', 'values', 'parameters', 'registers', 'captures', 'stack_groups', 'removed_loads',
     'removed_stores', 'removed_pushes', 'removed_pops', 'copies',
     'analysis_units', 'budget_refusals'))
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 # Isolate SSA from the local scalar frontend, inlining and value cleanup;
 # the preceding whole-function frame pass remains enabled.
 FLAGS = ('--scalar-opt=off', '--inline-opt=off', '--mir-values=off')
@@ -58,14 +57,10 @@ def call(command, cwd, status=0):
     return result
 
 
-def execute(image, target, host, expected, work, wasm_worker):
-    if target == host:
-        result = call([image], work)
-    elif target == 'wasm32':
-        result = wasm_worker.run(image)
-        assert result.returncode == 0, result
-    else:
+def execute(image, target, host, expected, work):
+    if target != host:
         return False
+    result = call([image], work)
     assert result.stdout == expected and result.stderr == '', result
     return True
 
@@ -95,7 +90,7 @@ def main():
     expected = ''.join(str(reference(n)) + '\n' for n in inputs)
     source = FUNCTION + 'fn main(){' + ';'.join(f'print(calculate({n}))' for n in inputs) + '}\n'
     images = executions = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-ssa-source-') as directory, wasm_host.WasmWorker() as wasm_worker:
+    with tempfile.TemporaryDirectory(prefix='dunder-ssa-source-') as directory:
         work = Path(directory)
         path = work/'main.ddr'; path.write_text(source)
         variants = {}
@@ -112,7 +107,7 @@ def main():
                     assert same is None or same == observed, (target, mode, jobs, same, observed)
                     same = observed
                     images += 1
-                    executions += execute(image, target, host, expected, work, wasm_worker)
+                    executions += execute(image, target, host, expected, work)
                 variants[target, mode] = same[0]
             assert variants[target, 'off'] != variants[target, 'on'], target
 
@@ -138,7 +133,7 @@ def main():
                     assert same is None or same == observed, (target, mode, jobs, same, observed)
                     same = observed
                     images += 1
-                    executions += execute(image, target, host, '40\n', work, wasm_worker)
+                    executions += execute(image, target, host, '40\n', work)
                 modes.append(same[0])
             assert modes[0] != modes[1], target
 
@@ -164,7 +159,7 @@ def main():
             if reused == 2:
                 assert all(value == 0 for value in counts.values()), report
             assert hashlib.sha256(image.read_bytes()).hexdigest() == variants[host, mode]
-            executions += execute(image, host, host, expected, work, wasm_worker)
+            executions += execute(image, host, host, expected, work)
 
         tests = work/'cases.ddr'
         tests.write_text(FUNCTION + '@test fn result(){calculate(6)==' + str(reference(6)) + '}\n')
@@ -191,7 +186,7 @@ def main():
             assert (work/'cached').read_bytes() == original
         assert errors[0] == errors[1]
         call([compiler, 'check', path, '--mir-ssa=unknown'], work, 2)
-    print(f'PASS SSA source: {images} four-target images, {executions} native/Wasm executions; '
+    print(f'PASS SSA source: {images} three-target images, {executions} native executions; '
           'productive placement, exact workers, diagnostics, cache and receipts; no latency claims')
 
 

@@ -9,10 +9,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 INVALID = (
     'fn main(){print("a"==true)}',
     'fn unused()->string{true} fn main(){print("a"=="b")}',
@@ -46,13 +45,8 @@ def host_target():
     raise RuntimeError(f'unsupported execution host {system} {machine}')
 
 
-def execute(image, target, work, wasm_worker, status=0, expected='42\n', repeat=False):
-    if target == 'wasm32':
-        if status:
-            status = 125  # The portable runner reports Wasm traps uniformly.
-        result = wasm_worker.run(image, repeat=repeat)
-    else:
-        result = subprocess.run([str(image)], cwd=work, capture_output=True, text=True, timeout=30)
+def execute(image, target, work, status=0, expected='42\n'):
+    result = subprocess.run([str(image)], cwd=work, capture_output=True, text=True, timeout=30)
     if result.returncode != status or result.stdout != expected:
         raise AssertionError(f'{target}: {result.returncode}, {result.stdout!r}\n{result.stderr}')
 
@@ -65,7 +59,7 @@ def main():
     compiler = args.compiler.resolve(strict=True)
     baseline = args.baseline.resolve(strict=True) if args.baseline else None
     host = host_target()
-    with tempfile.TemporaryDirectory(prefix='dunder-ownership-') as temporary, wasm_host.WasmWorker() as wasm_worker:
+    with tempfile.TemporaryDirectory(prefix='dunder-ownership-') as temporary:
         work = Path(temporary)
         source = work / 'main.ddr'
         source.write_text((ROOT / 'tests/fixtures/ownership_leases.ddr').read_text())
@@ -82,8 +76,8 @@ def main():
                     records.append(checked.stdout)
                     image = work / f'fixture-{target}-{scalar}-{ownership}'
                     call(compiler, ['build', source, '-o', image, *flags], work)
-                    if target in (host, 'wasm32'):
-                        execute(image, target, work, wasm_worker, repeat=target == 'wasm32')
+                    if target == host:
+                        execute(image, target, work)
             if len(set(records)) != 1:
                 raise AssertionError(f'{target}: ownership or scalar optimization changed bindings')
         for index, text in enumerate(INVALID):
@@ -113,12 +107,12 @@ def main():
                         raise AssertionError(f'{invalid.name}: baseline diagnostic differs')
         for number, (text, status) in enumerate(TRAPS):
             source.write_text(text)
-            for target in (host, 'wasm32'):
+            for target in (host,):
                 for ownership in ('off', 'on'):
                     image = work / f'trap-{number}-{target}-{ownership}'
                     call(compiler, ['build', source, '-o', image, '--target', target,
                                     f'--ownership-opt={ownership}'], work)
-                    execute(image, target, work, wasm_worker, status=status, expected='')
+                    execute(image, target, work, status=status, expected='')
     print('ownership leases: all targets, binding/diagnostic equality, lifetimes and traps passed')
 
 

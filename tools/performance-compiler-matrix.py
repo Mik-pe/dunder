@@ -3,7 +3,7 @@
 
 Six frozen cases, warm OS caches, incremental disabled. Revision mode measures
 build and (with --include-check) serial check. Worker mode measures builds only,
-rotating all six orders of jobs 1/2/4. Validation, image hashing and Wasm execution
+rotating all six orders of jobs 1/2/4. Validation and image hashing
 are outside measured intervals. No automatic repeats, calibration or filtering.
 """
 import argparse
@@ -13,7 +13,6 @@ import math
 import os
 from pathlib import Path
 import platform
-import shutil
 import signal
 import statistics
 import subprocess
@@ -30,16 +29,6 @@ fn owned(n:i64)->Box{Box{a:[n,n+1,n+2],n:n}}
 fn mutate(a:&mut []i64)->i64{var sum:i64=0;for i in 0..a.len{a[i]=a[i]+1;sum=sum+a[i]};sum}
 fn relay(n:i64)->Box{owned(n)}
 fn main(){x:=relay(5);var a:=x.a;print(mutate(&mut a));print(x.a[0]);print(a[2])}
-'''
-WASM = r'''const fs=require('node:fs'),assert=require('node:assert/strict');
-const print=x=>console.log(x.toString());let instance;
-instance=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[2])),{dunder:{
-print_i32:print,print_i64:print,print_f32:print,print_f64:print,
-print_u32:x=>print(x>>>0),print_u64:x=>print(BigInt.asUintN(64,x)),
-print_bool:x=>print(Boolean(x)),print_rune:x=>print(String.fromCodePoint(x)),
-print_string(p){const b=instance.exports.memory.buffer,n=new DataView(b).getUint32(p,true);
-print(new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array(b,p+8,n)));}}});
-const result=instance.exports.main();assert.ok(result===undefined||result===0);
 '''
 CASES = ('generated', 'selfhost', 'selfhost-parallel', 'hello', 'owned')
 
@@ -170,7 +159,6 @@ def main():
     parser.add_argument('--include-check', action='store_true')
     parser.add_argument('--validate-only', action='store_true', help='untimed preflight only; no latency/RSS samples')
     parser.add_argument('--source-root', type=Path, default=ROOT)
-    parser.add_argument('--node', type=Path, default=shutil.which('node'))
     args = parser.parse_args()
     if args.rounds < 1 or (args.mode == 'workers' and args.rounds % 6):
         parser.error('positive rounds required; worker rounds must be divisible by six for balanced order')
@@ -182,9 +170,6 @@ def main():
     baseline, candidate = args.baseline.resolve(strict=True), args.candidate.resolve(strict=True)
     if args.mode == 'workers' and perf.digest(baseline) != perf.digest(candidate):
         parser.error('worker mode requires the identical compiler image for both paths')
-    if args.node is None:
-        parser.error('Node is required for the independent Wasm consumer gates')
-    node = Path(args.node).resolve(strict=True)
     report = args.report.resolve(); report.mkdir(parents=True, exist_ok=True)
     if any(report.iterdir()):
         parser.error('report must be empty; existing measurements are never overwritten')
@@ -197,7 +182,6 @@ def main():
                     working_tree=subprocess.check_output(['git', 'status', '--short'], cwd=root, text=True),
                     host=platform.uname()._asdict(), source_root=str(root), sources_sha256=before,
                     tool_sha256=perf.digest(Path(__file__)), helpers_sha256=perf.digest(Path(perf.__file__)),
-                    node=dict(path=str(node), sha256=perf.digest(node)),
                     compiler_sha256={v: perf.digest(p) for v, (p, _) in drivers.items()},
                     compiler_paths={v: str(p) for v, (p, _) in drivers.items()},
                     compiler_flags={v: flags for v, (_, flags) in drivers.items()},
@@ -207,9 +191,8 @@ def main():
                     cache='incremental disabled; warm OS filesystem cache; fresh output per sample',
                     order='revision alternates; workers cycle all six permutations',
                     policy='unflagged default SSA policy; no profiling/incremental flags',
-                    wasm_scope='generated, hello, owned executed; compiler and file-CLI Wasm hosting not covered',
                     selfhost_scope='main and main_parallel are separate source builds, never whole bootstrap',
-                    cases={}, images={}, wasm_preflight={}, runtime_preflight={}, samples_expected=0 if args.validate_only else
+                    cases={}, images={}, runtime_preflight={}, samples_expected=0 if args.validate_only else
                     args.rounds * 6 * len(drivers) * (2 if args.include_check else 1))
     metadata['hardware'] = subprocess.check_output(
         ['/usr/sbin/sysctl', 'machdep.cpu.brand_string', 'hw.memsize'], text=True)
@@ -222,7 +205,6 @@ def main():
         work = Path(tmp); temporary = work / 'tmp'; temporary.mkdir()
         runner = Runner(report, root, temporary, args.validate_only)
         cases, metadata['generated_corpus'] = make_cases(root, work)
-        wasm_runner = work / 'wasm.cjs'; wasm_runner.write_text(WASM)
         def validate(case, image):
             _, inputs, expected = cases[case]
             if case.startswith('selfhost'):
@@ -257,20 +239,6 @@ def main():
                             raise RuntimeError('invalid check success output')
                 if len({i['sha256'] for i in metadata['images'][case].values()}) != 1:
                     raise RuntimeError(f'cross-variant image mismatch in SSA-off scheduling cohort: {case}')
-            # Separate, untimed Wasm execution; common print ABI handles bool as well as integers.
-            for case in ('generated', 'hello', 'owned'):
-                identities = []
-                metadata['wasm_preflight'][case] = {}
-                for variant, (compiler, flags) in drivers.items():
-                    image = work / 'consumer.wasm'
-                    image.unlink(missing_ok=True)
-                    runner.run([compiler, 'build', cases[case][0], '--target', 'wasm32', '-o', image, *flags],
-                               'untimed Wasm preflight')
-                    identities.append(perf.digest(image))
-                    metadata['wasm_preflight'][case][variant] = dict(sha256=identities[-1], bytes=image.stat().st_size)
-                    runner.run([node, wasm_runner, image], 'validate Wasm consumer', expected=cases[case][2])
-                if len(set(identities)) != 1:
-                    raise RuntimeError(f'cross-variant Wasm image mismatch: {case}')
             # Four established runtime images are built/executed, never benchmarked here.
             for case, inputs, expected in perf.runtime_cases():
                 images = {}
@@ -315,8 +283,6 @@ def main():
                     raise RuntimeError('compiler changed during run')
             if perf.digest(Path(__file__)) != metadata['tool_sha256'] or perf.digest(Path(perf.__file__)) != metadata['helpers_sha256']:
                 raise RuntimeError('measurement tool changed during run')
-            if perf.digest(node) != metadata['node']['sha256']:
-                raise RuntimeError('Node changed during run')
             if len(rows) != metadata['samples_expected']:
                 raise RuntimeError('sample count mismatch')
             for case in CASES:
@@ -331,7 +297,7 @@ def main():
             perf.save_csv(report / 'summary.csv', summaries)
             metadata['complete'] = True
             metadata['samples_actual'] = len(rows)
-            print(f'PASS {len(cases)} native cases, 3 Wasm cases, 4 runtime image cases; {len(rows)} latency samples')
+            print(f'PASS {len(cases)} native cases, 4 runtime image cases; {len(rows)} latency samples')
         finally:
             checkpoint()
 

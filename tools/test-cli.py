@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 
 class Project:
@@ -87,7 +86,6 @@ def targets_and_cache(p):
         ("aarch64-apple-darwin", b"\xcf\xfa\xed\xfe"),
         ("aarch64-unknown-linux-gnu", b"\x7fELF"),
         ("x86_64-unknown-linux-gnu", b"\x7fELF"),
-        ("wasm32-unknown-unknown", b"\x00asm"),
     ):
         for source in ("portable", "with-import"):
             p.call("build", source + ".ddr", "--target", name, "-o", source)
@@ -183,7 +181,7 @@ def worker_options(p):
         result = invoke("check", source, *flags, "--agent")
         assert json.loads(result.stdout.splitlines()[-1])["kind"] == "ok" and result.stderr == ""
         assert observed(workers, True, True) == ["", ""]
-    for target in ("arm64-linux", "x86_64-linux", "wasm32"):
+    for target in ("arm64-macos", "arm64-linux", "x86_64-linux"):
         p.call("build", source, "--target", target, "--jobs=1", "-o", "cross-serial")
         result = invoke("build", source, "--target", target, "--jobs=4", "-o", "cross-callback")
         assert result.stderr == ""
@@ -489,7 +487,7 @@ def whole_function_mir_controls(p):
     p.write('mir.ddr', 'fn step(x:i32)->i32{x*3+1}\n'
             'fn main(){var value:i32=1;for i in 0..8{value=step(value)};print(value)}\n')
     for scalar in ('on', 'off'):
-        for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32'):
+        for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux'):
             for mode in ('off', 'on'):
                 result = p.call('build', 'mir.ddr', '--target', target, '--mir=' + mode,
                                 '--scalar-opt=' + scalar, '--inline-opt=off',
@@ -578,17 +576,9 @@ def whole_function_optimizer_controls(p):
 def mir_integer_output(p, name, target, expected):
     native = ('arm64-macos' if sys.platform == 'darwin' else
               'arm64-linux' if os.uname().machine in ('arm64', 'aarch64') else 'x86_64-linux')
-    if target == 'wasm32':
-        script = ("const fs=require('node:fs');const print=x=>console.log(x.toString());"
-                  "const {exports:p}=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),"
-                  "{dunder:{print_i32:print,print_i64:print,print_bool:x=>console.log(Boolean(x))}});"
-                  "process.exitCode=Number(p.main()||0)")
-        command = [wasm_host.js_runtime(), '-e', script, p.root/name]
-    elif target == native:
-        command = [p.root/name]
-    else:
+    if target != native:
         return
-    run = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    run = subprocess.run([p.root/name], capture_output=True, text=True, timeout=10)
     assert run.returncode == 0 and run.stdout == expected and not run.stderr, run
 
 
@@ -602,7 +592,7 @@ def whole_function_memory_controls(p):
     work = ('private_memory_ops', 'optimized', 'promoted', 'removed_loads',
             'removed_stores', 'analysis_units', 'budget_refusals')
     native = 'arm64-macos' if sys.platform == 'darwin' else ('arm64-linux' if os.uname().machine in ('arm64', 'aarch64') else 'x86_64-linux')
-    for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32'):
+    for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux'):
         for mode in ('off', 'on'):
             name = f'memory-{target}-{mode}'
             result = p.call('build', 'memory.ddr', '--target', target, '--mir-memory=' + mode,
@@ -675,7 +665,7 @@ def whole_function_value_controls(p):
     work = ('values_optimized', 'value_rewrites', 'value_deleted', 'value_immediates',
             'value_analysis_units', 'value_budget_refusals')
     native = 'arm64-macos' if sys.platform == 'darwin' else ('arm64-linux' if os.uname().machine in ('arm64', 'aarch64') else 'x86_64-linux')
-    for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32'):
+    for target in ('arm64-macos', 'arm64-linux', 'x86_64-linux'):
         for mode in ('off', 'on'):
             name = f'values-{target}-{mode}'
             result = p.call('build', 'values.ddr', '--target', target, '--mir-values=' + mode,
@@ -761,7 +751,7 @@ def compiler_profile_controls(p):
     assert enabled['calls']['finalize'] == 1
     assert enabled['calls']['mir_pipeline'] == 2 and enabled['work']['mir_pipeline_operations'] > 0
     normal = p.call('check', 'profile.ddr', '--agent')
-    for target in ('arm64-macos','arm64-linux','x86_64-linux','wasm32'):
+    for target in ('arm64-macos','arm64-linux','x86_64-linux'):
         checked = p.call('check', 'profile.ddr', '--agent', '--target', target,
                          '--profile-compiler', '--timings=json')
         assert checked.stdout == normal.stdout
@@ -800,8 +790,6 @@ def runtime_profile_controls(p):
             assert report['kind'] == 'runtime_profile' and report['version'] == 1, report
         else:
             assert ran.stderr == '', ran
-    p.call('build', 'runtime.ddr', '--runtime-profile', '--target', 'wasm32', '-o', 'bad', status=1)
-    assert not (p.root/'bad').exists()
     p.call('check', 'runtime.ddr', '--runtime-profile', status=2)
     p.write('cases.ddr','fn answer(x:i32)->i32{x+42}\n@test fn works(){answer(0)==42}\n')
     for enabled,expected in [(False,'1 passed'),(False,'1 unaffected'),
@@ -851,7 +839,7 @@ def phase_timings(p):
     assert (p.root / "plain").read_bytes() == (p.root / "measured").read_bytes()
     human = p.call("build", "phases.ddr", "--timings", "-o", "human")
     assert "functions 0 reused, 2 emitted\n" in human.stderr and "timings module_load_lex_resolve=" in human.stderr, human
-    for target in ("arm64-macos", "arm64-linux", "x86_64-linux", "wasm32"):
+    for target in ("arm64-macos", "arm64-linux", "x86_64-linux"):
         report(p.call("build", "phases.ddr", "--target", target, "--timings=json", "-o", target), target=target)
     baseline = p.call("check", "phases.ddr", "--agent")
     checked = p.call("check", "phases.ddr", "--agent", "--timings=json")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Finite off/on value-lattice tests with an independent semantic MIR oracle.
 
-Build all four actual image targets, execute only the native host and Wasm,
+Build all three native image targets, execute only the native host,
 and report interpreter gaps (calls/trap exits) separately from proven results.
 No latency series and no production activation are performed.
 """
@@ -15,10 +15,8 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('semantic_mir_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
@@ -89,14 +87,14 @@ def main():
               'value_module_sha256': digest(ROOT / 'selfhost/mir_value_prop.ddr'),
               'fixture_sha256': digest(ROOT / 'tests/fixtures/mir-value-emitter.ddr'), 'images': []}
     gaps = 0; proofs = 0; executed = 0; domain_pairs = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-mir-values-') as directory, wasm_host.WasmWorker() as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-mir-values-') as directory:
         work = Path(directory); emitter = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/mir-value-emitter.ddr', '-o', emitter], work)
         report['emitter_sha256'] = digest(emitter)
         for index, (case, value, condition) in enumerate(corpus):
             result = expected(case, value, condition)
             traps = case == 10 and value == 9223372036854775807
-            for target in range(4):
+            for target in range(3):
                 compact = None
                 modes = ('off', 'on', 'on-full') if args.full_domain else ('off', 'on')
                 for mode in modes:
@@ -125,11 +123,6 @@ def main():
                     ran = False
                     if target == host:
                         call([image], work, 101 if traps else 0); executed += 1; ran = True
-                    if target == 3:
-                        expected_wasm = 125 if traps else 0
-                        wres = wasm.run(image)
-                        assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
-                        executed += 1; ran = True
                     image_sha = digest(image)
                     if mode == 'on':
                         compact = (after, image_sha, (rewrites, deleted, immediates, verifications), slots, rows, units)
@@ -164,7 +157,7 @@ def main():
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
-    print(f'{len(corpus)} programs/inputs; {len(report["images"])} images; {executed} host/Wasm executions; '
+    print(f'{len(corpus)} programs/inputs; {len(report["images"])} images; {executed} host executions; '
           f'{proofs} independent oracle pairs; {gaps} explicitly reported call/trap gaps')
     print('manifest_sha256=' + report['manifest_sha256'])
     if args.full_domain:

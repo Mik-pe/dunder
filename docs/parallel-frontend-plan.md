@@ -367,10 +367,12 @@ Bygg en fryst referens och jämför varje seriell separationsetapp innan
 parallellisering läggs till. Det behövs både små oberoende API-prov och verkliga
 sourceprogram; en positiv scalarloop bevisar inte den nya gränsen.
 
-- Alla fyra mål: bygg/check, exakta ogiltiga diagnostiker och sourcebindings,
-  oförändrade bytes där endast representation/schemaläggning ändras, native-
-  och Wasm-körning för tillgängliga runtimekontrakt. Målspecifika funktioner
-  behåller sin befintliga support eller diagnostik.
+- Alla tre aktiva nativa mål (`arm64-macos`, `arm64-linux`, `x86_64-linux`):
+  bygg/check, exakta ogiltiga diagnostiker och sourcebindings, oförändrade bytes
+  där endast representation/schemaläggning ändras samt nativ körning för
+  tillgängliga runtimekontrakt. Wasm-verifiering är **senarelagd** under
+  pågående språkutveckling och återupptas som eget spår senare. Målspecifika
+  funktioner behåller sin befintliga support eller diagnostik.
 - Språktäckning: owned setup och init efter RET, nästlade ägare, tidiga returer,
   alla loopformer, match/enum, float, kortslutning, narrow/raw places, C-layout,
   aliases/reborrows, indirekta och många argument, callbacks, FFI, statisk

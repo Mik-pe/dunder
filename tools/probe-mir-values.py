@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """Ablate MIR values on the unchanged numeric/text runtime benchmark sources.
 
-One fresh off/on build per source/target, finite correctness samples, and actual
---timings=json counters. No timing series or per-loop/disassembly claims. Exact
-Wasm frontend rejections are preserved as BLOCKED coverage, never rewritten into
-an adapter program. Exit2 means native checks passed but Wasm remains blocked.
+One fresh off/on build per source on the native host target, finite correctness
+samples, and actual --timings=json counters. No timing series or per-loop/disassembly
+claims.
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
 import platform
-import re
 import struct
 import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 VALUE_KEYS = ('values_optimized', 'value_rewrites', 'value_deleted', 'value_immediates',
               'value_analysis_units', 'value_budget_refusals')
-NATIVE_ONLY = re.compile(r'native system calls need a native target|requires a native target', re.I)
 
 
 def sha(data):
@@ -157,10 +155,7 @@ def build(compiler, source, target, mode, image, work):
     result = invoke(command, work)
     record = {'command': list(map(str, command)), 'returncode': result.returncode,
               'stdout': result.stdout, 'stderr': result.stderr}
-    if result.returncode:
-        assert target == 'wasm32' and NATIVE_ONLY.search(result.stderr), record
-        record.update(status='blocked_native_argv_frontend', executed=False)
-        return record
+    assert result.returncode == 0, record
     reports = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
     assert len(reports) == 1 and reports[0]['kind'] == 'timings', record
     report = reports[0]; backend = report['mir']
@@ -191,7 +186,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path, nargs='?')
     parser.add_argument('--output', type=Path)
-    parser.add_argument('--wasm-runner', type=Path, help='optional argv-capable runner: runner IMAGE ARG...')
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     if args.self_test:
@@ -206,7 +200,7 @@ def main():
         work = Path(directory)
         for name, (source, samples) in sources().items():
             source_hash = file_sha(source); item = {'source': str(source), 'source_sha256': source_hash, 'targets': {}}
-            for target in (host, 'wasm32'):
+            for target in (host,):
                 rows = {}; images = {}
                 for mode in ('off', 'on'):
                     image = work / f'{name}-{target}-{mode}'
@@ -216,13 +210,7 @@ def main():
                         evidence['blocked'].append(f'{name}/{target}/{mode}: {row["status"]}'); continue
                     images[mode] = image.read_bytes(); executions = []
                     for argv, expected in samples:
-                        if target == 'wasm32':
-                            if not args.wasm_runner:
-                                row['status'] = 'blocked_missing_argv_host_runner'
-                                evidence['blocked'].append(f'{name}/{target}/{mode}: {row["status"]}'); break
-                            command = [args.wasm_runner.resolve(strict=True), image, *argv]
-                        else:
-                            command = [image, *argv]
+                        command = [image, *argv]
                         result = checked(command, work)
                         assert result.stdout == expected, (name, target, mode, argv, result.stdout, expected)
                         executions.append({'argv': argv, 'expected': expected, 'stdout': result.stdout, 'returncode': result.returncode})
@@ -246,7 +234,7 @@ def main():
                 item['targets'][target] = {'variants': rows, 'comparison': comparison}
             evidence['benchmarks'][name] = item
     assert file_sha(compiler) == compiler_hash, 'compiler changed during probe'
-    evidence['status'] = 'partial_blocked_wasm' if evidence['blocked'] else 'verified_native_and_wasm'
+    evidence['status'] = 'partial_blocked' if evidence['blocked'] else 'verified_native'
     output = args.output.resolve(); output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + '\n')
     for name, item in evidence['benchmarks'].items():

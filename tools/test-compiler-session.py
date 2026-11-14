@@ -10,10 +10,12 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 
 
 def run(command, *, success=True):
@@ -45,9 +47,7 @@ def main():
             # Real frozen runtime consumers exercise the shared serial adapter,
             # not smaller replacement loops constructed for this refactor.
             for source in sorted((ROOT / 'benchmarks' / 'runtime').glob('*.ddr')):
-                # These sources use native argv/sys operations. The direct
-                # Session consumer above compares portable sources on Wasm.
-                for target in TARGETS[:3]:
+                for target in TARGETS:
                     old = work / (source.stem + '-' + target + '-old')
                     new = work / (source.stem + '-' + target + '-new')
                     run([baseline, 'build', source, '--target', target, '-o', old])

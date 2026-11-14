@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Numeric object transport: malformed inputs, single walker and task lifetime.
 
-Unit contracts execute on the native host and Wasm; all targets are built.
+Unit contracts execute on the native host; all three native targets are built.
 ARM64/macOS additionally runs the actual isolated-task generator, compares
-serial/task-produced images at capacities 1/2/4, and executes native/Wasm
+serial/task-produced images at capacities 1/2/4, and executes native
 kernels after the child pools and scopes have been reclaimed. Other hosts
 explicitly omit this unsupported source-thread path. No timing measurements.
 """
@@ -18,10 +18,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 
 
 def digest(path):
@@ -41,7 +40,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix='run-', dir=args.output.resolve()))
     commands, images, units = [], [], []
     groups = {}
-    executed = {TARGETS[host]: 0, 'wasm32': 0}
+    executed = {TARGETS[host]: 0}
     passed = False
 
     def call(command, expected=None):
@@ -53,7 +52,6 @@ def main():
             raise AssertionError(commands[-1])
         return result.stdout
 
-    js_bin = wasm_host.js_runtime()
     try:
         unit = root / 'tests/mir_object_data.ddr'
         output = call([compiler, 'test', unit, '-o', work / 'unit-native'])
@@ -63,14 +61,9 @@ def main():
         listing = call([compiler, 'build-tests', unit, '--list']).splitlines()
         assert len(listing) == groups[TARGETS[host]], listing
         for target in TARGETS:
-            selected = range(len(listing)) if target == 'wasm32' else (0,)
-            for group in selected:
-                image = work / f'unit-{target}-{group}'
-                call([compiler, 'build-tests', unit, '--target', target, '--group', group, '-o', image])
-                units.append({'target': target, 'group': group, 'sha256': digest(image)})
-                if target == 'wasm32':
-                    call([js_bin, root / 'tools/test-wasm.mjs', '--execute', image], '')
-            if target == 'wasm32': groups[target] = len(listing)
+            image = work / f'unit-{target}-0'
+            call([compiler, 'build-tests', unit, '--target', target, '--group', 0, '-o', image])
+            units.append({'target': target, 'group': 0, 'sha256': digest(image)})
         if host == 0:
             emitter = work / 'task-emitter'
             call([compiler, 'build', root / 'tests/fixtures/mir-object-data-task.ddr', '-o', emitter])
@@ -89,9 +82,6 @@ def main():
                                        'sha256': sha, 'bytes': image.stat().st_size})
                         if target == host:
                             call([image], ''); executed[name] += 1
-                        elif target == 3:
-                            call([js_bin, root / 'tools/runtime-contract-wasm.cjs', image], '')
-                            executed[name] += 1
         passed = True
     finally:
         (work / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')

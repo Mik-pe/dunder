@@ -2,7 +2,7 @@
 """Validate dependency/growth cache payloads, atomic rejection and code identity.
 
 Builds one consumer fixture, creates actual cold/hot native-vocabulary images
-for all four targets, executes the host and Wasm, and signs deliberately
+for all three targets, executes the host, and signs deliberately
 malformed payloads independently so the format checks themselves are exercised.
 No compiler hooks, cache policy or performance measurements are involved.
 """
@@ -10,13 +10,11 @@ import argparse
 import hashlib
 from pathlib import Path
 import platform
-import shutil
 import subprocess
 import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = {'PATH': '/no-external-tools'}
@@ -94,11 +92,9 @@ def malformed_native3(numbers):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
-    parser.add_argument('--node', default=None)
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     compiler_hash = hashlib.sha256(compiler.read_bytes()).hexdigest()
-    node = wasm_host.js_runtime(args.node)
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         host = 0
     elif platform.system() == 'Linux' and platform.machine() in ('arm64', 'aarch64', 'x86_64'):
@@ -111,7 +107,7 @@ def main():
         fixture = work / 'fixture'
         run([compiler, 'build', ROOT / 'tests/fixtures/fragment-dependencies.ddr', '-o', fixture], work, None)
         run([fixture, 'unit'], work)
-        for target in range(4):
+        for target in range(3):
             for selection, limit, budget in (('normal', 16, 23), ('builtin', 0, 23), ('full', 256, 4096)):
                 cache = work / f'{target}-{selection}.fn'
                 cold = work / f'{target}-{selection}-cold'
@@ -140,9 +136,8 @@ def main():
                         run([fixture, mode, fragment, target, hot, padding, allowed, available, 'yes', expected_deps], work)
                         assert hot.read_bytes() == direct.read_bytes(), (target, selection, padding, mode, 'cold/hot image mismatch')
                         images += 1
-                        if target in (host, 3):
-                            command = [hot] if target == host else [node, ROOT / 'tools/runtime-contract-wasm.cjs', hot]
-                            run(command, work, b'')
+                        if target == host:
+                            run([hot], work, b'')
                             executions += 1
                 if selection == 'normal':
                     run([fixture, 'save-invalid', work / f'invalid-save-{target}', target, work / 'unused', 0], work)
@@ -206,7 +201,7 @@ def main():
             run([fixture, mode, oversized, host, work / 'unused', 0, 16, 65536, 'no'], work, b'0\n')
             rejections += 1
     assert hashlib.sha256(compiler.read_bytes()).hexdigest() == compiler_hash, 'compiler changed during test'
-    print(f'{images} byte-identical cold/hot images; {executions} host/Wasm executions; '
+    print(f'{images} byte-identical cold/hot images; {executions} host executions; '
           f'{rejections} atomic restore rejections; record/charge/reset and invalid-save checks passed')
 
 

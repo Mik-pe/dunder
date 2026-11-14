@@ -10,8 +10,6 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
 RELATIONS = {'==': (0, lambda a, b: a == b), '!=': (1, lambda a, b: a != b),
              '<': (11, lambda a, b: a < b), '<=': (13, lambda a, b: a <= b),
              '>': (12, lambda a, b: a > b), '>=': (10, lambda a, b: a >= b)}
@@ -139,12 +137,12 @@ def main():
                       scalar=1, mode='function', ret=2, expected=expected)
         probe('{var sum:=0;for cursor in 0..a{if cursor<b{sum=sum+1}};sum}',
               6, 3, scalar=1, mode='function', ret=1, expected=3)
-        with wasm_host.WasmWorker() as wasm, ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             def run_probe(item):
                 cid, body, left, right, zero, scalar, mode, expected, status, words, ret = item
                 source = work / f'case-{cid}.ddr'
                 source.write_text('a b z values ' + body)
-                for target in range(4):
+                for target in range(3):
                     image = work / f'image-{cid}-{target}'
                     generated = call([harness, source, image, target, mode, expected, ret,
                                       scalar, left, right, zero, 8])
@@ -154,15 +152,10 @@ def main():
                     if target == host:
                         run = call([image], status)
                         assert run.stdout == '', (body, run.stdout)
-                    elif target == 3:
-                        expected_wasm = 125 if status else 0
-                        wres = wasm.run(image)
-                        assert wres.returncode == expected_wasm and wres.stdout == '', (
-                            body, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
                     image.unlink(missing_ok=True)
             list(pool.map(run_probe, queued))
         print(f'PASS {count} comparison cases: exact words, signed results, branches, traps and shortcuts; '
-              'all four targets built, host and Wasm executed; cross-native not executed')
+              'all three targets built, host executed; cross-native not executed')
 
 
 if __name__ == '__main__':

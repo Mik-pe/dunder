@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Untimed four-target origin roundtrip and real Wasm stack-fault witnesses."""
+"""Untimed three-target origin roundtrip and native host execution."""
 import argparse
 import hashlib
 import json
@@ -9,7 +9,6 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,57 +38,28 @@ def main():
         assert result.returncode == 0, receipt['commands'][-1]
         return result
 
+    host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
     emitter = work / 'emitter'
     source = ROOT / 'tests/fixtures/mir-stack-origin-emitter.ddr'
     receipt['emitter_source_sha256'] = digest(source)
     call([compiler, 'build', source, '-o', emitter])
-    js = work / 'execute.mjs'
-    js.write_text('''import fs from 'node:fs';
-const printed=[];
-const instance=(await WebAssembly.instantiate(fs.readFileSync(process.argv[2]),
-  {dunder:{print_i64:x=>printed.push(x.toString())}})).instance;
-let result=null,error=null;
-try{result=instance.exports.main()}catch(e){
-  if(!(e instanceof WebAssembly.RuntimeError))throw e;
-  error={name:e.name,message:e.message};
-}
-console.log(JSON.stringify({result,error,printed}));
-''')
-    for target in range(4):
+    for target in range(3):
         images = []
         for origin in ('raw', 'temp'):
             image = work / f'valid-{target}-{origin}'
             call([emitter, image, target, origin, 'valid'])
             images.append(image)
             row = {'target': target, 'origin': origin, 'path': str(image), 'sha256': digest(image)}
-            if target == 0 and platform.system() == 'Darwin' and platform.machine() in ('arm64', 'aarch64'):
+            if target == host:
                 result = call([image]); assert result.stdout == '42\n' and result.stderr == ''
                 row['execution'] = 'host passed:42'
-            elif target == 3:
-                result = json.loads(call([wasm_host.js_runtime(), js, image]).stdout)
-                assert result == {'result': 0, 'error': None, 'printed': ['42']}, result
-                row['execution'] = 'Wasm passed:42'
             else:
                 row['execution'] = 'cross-built only; no execution claim'
             receipt['images'].append(row); save()
         assert images[0].read_bytes() == images[1].read_bytes(), target
-    for mode in ('push-fault', 'pop-fault', 'push-elided-control', 'pop-elided-control'):
-        images = []
-        for origin in ('raw', 'temp'):
-            image = work / f'{mode}-{origin}.wasm'
-            call([emitter, image, 3, origin, mode]); images.append(image)
-            result = json.loads(call([wasm_host.js_runtime(), js, image]).stdout)
-            assert result['printed'] == [], result
-            if mode.endswith('-fault'):
-                assert result['result'] is None and result['error']['name'] == 'RuntimeError', result
-            else:
-                assert result == {'result': 77, 'error': None, 'printed': []}, result
-            receipt['images'].append({'target': 3, 'origin': origin, 'mode': mode,
-                                      'sha256': digest(image), 'execution': result}); save()
-        assert images[0].read_bytes() == images[1].read_bytes(), mode
     assert digest(compiler) == receipt['compiler_sha256']
     receipt['complete'] = True; save()
-    print('PASS:16 exact raw/temp target images; host+Wasm success, real raw/temp Wasm push/pop faults and nonfaulting elision controls; no timings')
+    print('PASS:6 exact raw/temp target images; native host success; no timings')
 
 
 def digest(path):

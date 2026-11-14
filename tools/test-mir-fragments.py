@@ -2,7 +2,7 @@
 """Detached final-object cache writes and cache-hit capture without MIR replay.
 
 Compare serial native3/DUFD bytes, delayed object bytes, and restored/linked
-images on every target. Execute native/Wasm results; malformed capture/save
+images on every native target. Execute native host results; malformed capture/save
 inputs are rejected atomically. This is a functional test, never a timing run.
 """
 import argparse
@@ -14,10 +14,9 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 SOURCES = ('selfhost/mir_lower.ddr', 'selfhost/fragments.ddr',
            'tests/mir_fragment.ddr', 'tests/fixtures/mir-fragment-emitter.ddr')
 
@@ -66,13 +65,11 @@ def main():
             assert target < labels or 0x80000000 <= target < 0x80000003
         return data
 
-    js_bin = wasm_host.js_runtime()
     try:
         run([compiler, 'test', 'tests/mir_fragment.ddr', '-o', output/'unit'])
         for target in TARGETS:
             unit = output/('unit-'+target)
             run([compiler, 'build-tests', 'tests/mir_fragment.ddr', '--target', target, '-o', unit])
-            if target == 'wasm32': run([js_bin, 'tools/test-wasm.mjs', '--execute', unit])
         emitter = output/'emitter'
         run([compiler, 'build', 'tests/fixtures/mir-fragment-emitter.ddr', '-o', emitter])
         assert run([emitter, 'invalid', output/'invalid.fn', host, 'unused', 'ordinary', 0]).strip() == 'objects=2'
@@ -98,8 +95,6 @@ def main():
                                        'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
                         if target == host:
                             assert run([image]) == ''; executions += 1
-                        elif target == 3:
-                            run([js_bin, 'tools/runtime-contract-wasm.cjs', image]); executions += 1
                     assert pair[0] == pair[1] == pair[2], (name, fmt, padding, 'serial/object/cache image')
                 # Restore the same cache into a different prefix/private-label
                 # base, then compare with the independently compiled reference.
@@ -110,7 +105,6 @@ def main():
                 images.append({'target': name, 'format': fmt, 'padding': 1, 'mode': 'rebased-restore',
                                'bytes': rebased.stat().st_size, 'sha256': hashlib.sha256(rebased.read_bytes()).hexdigest()})
                 if target == host: assert run([rebased]) == ''; executions += 1
-                elif target == 3: run([js_bin, 'tools/runtime-contract-wasm.cjs', rebased]); executions += 1
         assert hashes == {p: hashlib.sha256((root/p).read_bytes()).hexdigest() for p in SOURCES}, 'source changed during run'
         report = {'result': 'passed', 'images': images, 'executions': executions, 'payload_comparisons': payloads,
                   'scope': 'inactive cache-object API; trusted semantic producer, structural capture only; no MIR on hit',

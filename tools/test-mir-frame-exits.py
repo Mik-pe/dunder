@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Frame promotion must preserve external and unknown-call observations.
 
-Linux images are cross-built only on this ARM64/macOS observer host. Wasm
-terminal paths execute separately. Optional frozen before-patch emitters make
-the original register/frame and call-SP counterexamples part of the receipt.
+Linux images are cross-built only on this ARM64/macOS observer host.
+Optional frozen before-patch emitters make the original register/frame and
+call-SP counterexamples part of the receipt.
 No latency measurements or production compilation flags are changed.
 """
 import argparse
@@ -16,10 +16,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 
 
 def digest(path):
@@ -51,14 +50,11 @@ def main():
             raise AssertionError(row)
         return result
 
-    js_bin = wasm_host.js_runtime()
     try:
         call([compiler, 'test', 'tests/mir_frame_exits.ddr', '-o', work / 'units'])
         for target in TARGETS:
             image = work / ('units-' + target)
             call([compiler, 'build-tests', 'tests/mir_frame_exits.ddr', '--target', target, '-o', image])
-            if target == 'wasm32':
-                call([js_bin, 'tools/test-wasm.mjs', '--execute', image])
         for case in ('observer', 'call-sp'):
             emitter = work / (case + '-emitter')
             call([compiler, 'build', 'tests/fixtures/mir-frame-exit-' + case + '.ddr', '-o', emitter])
@@ -96,8 +92,6 @@ def main():
                                    'sha256': digest(image)})
                     if target == 0:
                         call([image])
-                    elif target == 3:
-                        call([js_bin, 'tools/runtime-contract-wasm.cjs', image], 125 if taken else 0)
         sync = work / 'call-sync-emitter'
         call([compiler, 'build', 'tests/fixtures/mir-frame-exit-call-sync.ddr', '-o', sync])
         for target, name in enumerate(TARGETS):
@@ -109,8 +103,6 @@ def main():
                                    'sha256': digest(image)})
                     if target == 0:
                         call([image])
-                    elif target == 3:
-                        call([js_bin, 'tools/runtime-contract-wasm.cjs', image])
         passed = True
     finally:
         (work / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')

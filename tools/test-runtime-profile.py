@@ -7,8 +7,10 @@ from pathlib import Path
 import platform
 import struct
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / 'tests/fixtures'
 TARGETS = {'arm64-macos': 0, 'arm64-linux': 1, 'x86_64-linux': 2}
@@ -174,10 +176,7 @@ def main():
                 else:
                     assert values['record_construct_calls'] == 2 and values['record_construct_bytes'] == 56, values
                 print('PASS consumer', name, flush=True)
-        refused = subprocess.run([compiler, 'build', empty, '--target', 'wasm32', '--runtime-profile',
-                                  '-o', work / 'unsupported.wasm'], capture_output=True, timeout=60)
-        assert refused.returncode != 0 and not (work / 'unsupported.wasm').exists()
-        print('PASS ordinary stdout/exit, classified consumers, native cross-builds and Wasm refusal')
+        print('PASS ordinary stdout/exit, classified consumers and native cross-builds')
 
 
 if __name__ == '__main__':

@@ -9,10 +9,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 
 
 def call(command, status=0, output=None, cwd=None):
@@ -30,10 +29,10 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
-    with tempfile.TemporaryDirectory(prefix='dunder-inline-stream-') as directory, wasm_host.WasmWorker() as wasm_worker:
+    with tempfile.TemporaryDirectory(prefix='dunder-inline-stream-') as directory:
         work = Path(directory)
         profiles = []
-        for target in range(4):
+        for target in range(3):
             for mode in ('off', 'on'):
                 image = work / f'control-{target}-{mode}'
                 record = call([compiler, 'build', ROOT/'tests/fixtures/inline-streaming.ddr',
@@ -47,9 +46,6 @@ def main():
                     assert data['calls'] == data['words'] == data['estimated_words'] == 0, data
                 if target == host:
                     call([image], output=b'42\n')
-                elif target == 3:
-                    res = wasm_worker.run(image, repeat=True, binary_output=True)
-                    assert res.returncode == 0 and res.stdout == b'42\n', res
         for mode in ('off', 'on'):
             image = work / ('profile-' + mode)
             call([compiler, 'build', ROOT/'tests/fixtures/inline-streaming.ddr',
@@ -68,7 +64,7 @@ def main():
                            'for scalar in "A".runes(){sum=sum+i32(scalar)};' * 140 +
                            'assert(sum==9100);print(42)}')
         for source in (large, bounded):
-            for target in range(4):
+            for target in range(3):
                 for mode in ('off', 'on'):
                     image = work/f'{source.stem}-{target}-{mode}'
                     result = call([compiler, 'build', source, '--inline-opt=' + mode,
@@ -80,9 +76,6 @@ def main():
                             assert 0 < data['calls'] < 140, data
                     if target == host:
                         call([image], output=b'42\n')
-                    elif target == 3:
-                        res = wasm_worker.run(image, binary_output=True)
-                        assert res.returncode == 0 and res.stdout == b'42\n', res
         # A cached builtin-only expansion has no declaration IDs, but its
         # budget charge must still be replayed without emitting new inline code.
         cached = work/'cached.ddr'
@@ -104,19 +97,16 @@ def main():
         # A body trap occurs after decoding exactly its current scalar.
         trap = work/'trap.ddr'
         trap.write_text('fn main(){print(17);for scalar in "🌍".runes(){assert(false)};print(42)}')
-        for target in range(4):
+        for target in range(3):
             for mode in ('off', 'on'):
                 image = work/f'trap-{target}-{mode}'
                 call([compiler, 'build', trap, '--inline-opt=' + mode,
                       '--target', TARGETS[target], '-o', image])
                 if target == host:
                     call([image], status=104, output=b'17\n')
-                elif target == 3:
-                    res = wasm_worker.run(image, binary_output=True)
-                    assert res.returncode == 125 and res.stdout == b'17\n', res
     print('inline streaming: all targets, mutation snapshots, nesting, continue/break/return, '
-          'NUL and UTF-8 boundaries, large frames, budget fallback, cached builtin charges, '
-          'repeated Wasm and unchanged runtime traffic passed')
+          'NUL and UTF-8 boundaries, large frames, budget fallback, cached builtin charges '
+          'and unchanged runtime traffic passed')
 
 
 if __name__ == '__main__':

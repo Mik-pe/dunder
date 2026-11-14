@@ -3,7 +3,7 @@
 
 No timings. An independent byte-memory interpreter expands the finite helper's
 specified calls, checks its incoming GP/NZCV/SP and frame bytes, then models its
-partial write and fresh clobbers. Native/Wasm execute the real helper instead.
+partial write and fresh clobbers. The native host executes the real helper instead.
 Only the explicitly consumed large-helper scratch case remains an oracle gap.
 """
 import argparse
@@ -17,10 +17,8 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('region_existing_qa', ROOT / 'tools/test-mir-ssa.py')
 qa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qa)
@@ -129,7 +127,7 @@ def expand_helpers(model, helpers, case, value, control):
 
 def interpret(model, helpers, case, value, control):
     if case in (10, 14):
-        return {'gap': 'consumed retained large-helper scratch; actual native/Wasm observer covers exact address bits'}
+        return {'gap': 'consumed retained large-helper scratch; actual native observer covers exact address bits'}
     machine = oracle.Interpreter(expand_helpers(model, helpers, case, value, control), fuel=250000)
     machine.variables.update({reg: qa.seed(reg) & MASK for reg in range(31)})
     machine.variables.update({0: ENTRY_SP + 32, 4: value & MASK, 5: control & MASK,
@@ -169,7 +167,7 @@ def main():
     for key, path in dict(compiler=compiler, fixture=fixture, support=support,
                           ssa=ROOT/'selfhost/mir_ssa.ddr', frame_abi=ROOT/'selfhost/mir_call_abi.ddr').items():
         report['hashes'][key] = digest(path)
-    with tempfile.TemporaryDirectory(prefix='dunder-regional-qa-') as temp, wasm_host.WasmWorker() as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-regional-qa-') as temp:
         work = args.output.resolve() if args.output else Path(temp)
         if args.output:
             work.mkdir(parents=True, exist_ok=True)
@@ -216,11 +214,6 @@ def main():
             trap = case == 13 and control == 0
             ran = False
             if target == host: call([image],102 if trap else 0); ran = True
-            elif target == 3:
-                expected_wasm = 125 if trap else 0
-                wres = wasm.run(image)
-                assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
-                ran = True
             if args.output: image.with_suffix('.mir.txt').write_text(text)
             report['images'].append(dict(case=case,name=NAMES[case],input=value,control=control,target=target,
                 mode=mode,frame=frame,terminal=terminal,limit=limit,executed=ran,sha256=digest(image),counters=counters,
@@ -229,7 +222,7 @@ def main():
 
         samples = [x for x in corpus() if args.case is None or x[0] == args.case]
         for index,(case,value,control) in enumerate(samples):
-            for target in range(4):
+            for target in range(3):
                 one(case,value,control,target,'off')
                 one(case,value,control,target,'on')
                 one(case,value,control,target,'on',frame=1)
@@ -237,18 +230,18 @@ def main():
             print(f'PASS {index+1}/{len(samples)} {NAMES[case]} input{value} control{control}',flush=True)
         for case,value,control in ((1,41,0x800000FF),(4,41,1),(7,41,4),(14,41,17),(12,41,17)):
             if args.case is not None and case != args.case: continue
-            for target in (host,3):
+            for target in (host,):
                 full = one(case,value,control,target,'on',frame=1,label='-budget-base')
                 for limit in sorted({0,1,max(1,full['units']//2),max(1,full['units']-1)}):
                     one(case,value,control,target,'on',frame=1,limit=limit,label='-budget')
     report.update(images_built=len(report['images']),executions=sum(x['executed'] for x in report['images']),
                   independent_pairs=sum('gap' not in x['before'] for x in report['images']),
-                  coverage_limits=['large retained-helper scratch is checked by actual native/Wasm only',
+                  coverage_limits=['large retained-helper scratch is checked by actual native observer only',
                                    'Linux ARM/x86 images build only on this macOS host'])
     if args.report:
         args.report.parent.mkdir(parents=True,exist_ok=True)
         args.report.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
-    print(f'{report["images_built"]} images; {report["executions"]} native/Wasm executions; {report["independent_pairs"]} independent helper-semantic pairs; no timings')
+    print(f'{report["images_built"]} images; {report["executions"]} native executions; {report["independent_pairs"]} independent helper-semantic pairs; no timings')
 
 
 if __name__ == '__main__': main()

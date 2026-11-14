@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Finite shared/reference MIR stage differential; no latency measurements.
 
-Checks exact semantic rows, pass statuses/counters, all four image targets and
-native-host/Wasm results. Also executes a real isolated source-task worker.
+Checks exact semantic rows, pass statuses/counters, all three native image targets
+and native-host results. Also executes a real isolated source-task worker.
 """
 import argparse
 import hashlib
@@ -14,10 +14,8 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('pipeline_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
@@ -80,7 +78,7 @@ def main():
               'reference_sha256': digest(ROOT / 'tests/fixtures/mir-pipeline-reference.ddr'),
               'fixture_sha256': digest(ROOT / 'tests/fixtures/mir-pipeline-emitter.ddr'), 'images': []}
     pairs = executions = proofs = gaps = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-mir-pipeline-') as directory, wasm_host.WasmWorker() as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-mir-pipeline-') as directory:
         work = Path(directory); emitter = work / 'emitter'
         call([compiler, 'build', ROOT / 'tests/fixtures/mir-pipeline-emitter.ddr', '-o', emitter], work)
         report['emitter_sha256'] = digest(emitter)
@@ -90,7 +88,7 @@ def main():
         for index, (case, value, condition) in enumerate(corpus):
             result = expected(case, value); traps = case == 10 and value == 9223372036854775807
             for policy in range(4):  # Off, conservative raw, source+terminals, exhausted budgets.
-                for target in range(4):
+                for target in range(3):
                     reference = None
                     for mode in ('reference', 'pipeline'):
                         image = work / f'{index}-{policy}-{target}-{mode}'
@@ -128,11 +126,6 @@ def main():
                         ran = False
                         if target == host:
                             call([image], work, 101 if traps else 0); executions += 1; ran = True
-                        if target == 3:
-                            expected_wasm = 125 if traps else 0
-                            wres = wasm.run(image)
-                            assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
-                            executions += 1; ran = True
                         report['images'].append(dict(case=case, input=value, condition=condition, policy=policy,
                                                      target=target, mode=mode, sha256=image_sha, executed=ran,
                                                      counters=counters, before=pre, after=post))
@@ -150,7 +143,7 @@ def main():
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
-    print(f'{pairs} exact reference pairs; {len(report["images"])} images; {executions} host/Wasm executions; '
+    print(f'{pairs} exact reference pairs; {len(report["images"])} images; {executions} host executions; '
           f'{proofs} oracle pairs; {gaps} explicit call/trap gaps; worker={report["worker"]["executed"]}')
     print('manifest_sha256=' + report['manifest_sha256'])
 

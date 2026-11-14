@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import platform
 import random
-import shutil
 import struct
 import subprocess
 import sys
@@ -14,20 +13,7 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
 ENV = {'PATH': '/no-external-tools'}
-WASM_RUNNER = '''const fs=require('node:fs');
-const print=value=>console.log(value.toString());
-const module=new WebAssembly.Module(fs.readFileSync(process.argv[1]));
-const program=new WebAssembly.Instance(module,{dunder:{
-    print_i32:print,print_i64:print,print_bool:value=>print(Boolean(value)),
-}}).exports;
-try{const status=program.main();if(status!==undefined)process.exitCode=Number(status)}
-catch(error){
-    if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;
-    process.exitCode=125;
-}'''
 
 
 def divide(a, b):
@@ -151,8 +137,7 @@ def positive_cases():
 
 
 def trap_cases():
-    # Native exit codes distinguish which checked operation trapped first. Wasm
-    # has a single unreachable trap, so its independent check is the prefix.
+    # Native exit codes distinguish which checked operation trapped first.
     cases = [
         ('add_i32', 101, 'fn f(x:i32)->i32{x+1}', 'f(2147483647)'),
         ('sub_i32', 101, 'fn f(x:i32)->i32{x-1}', 'f(-2147483648)'),
@@ -483,7 +468,6 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--baseline', type=Path,
                         help='older authoritative compiler; default: current compiler with --scalar-opt=off')
-    parser.add_argument('--node', default='bun')
     parser.add_argument('--verify-selection', action='store_true',
                         help='also compare candidate --scalar-opt=off and assert optimizer timing counters')
     args = parser.parse_args()
@@ -494,13 +478,12 @@ def main():
                 ('candidate', compilers['candidate'], [])]
     if args.verify_selection and args.baseline:
         variants.append(('candidate_off', compilers['candidate'], ['--scalar-opt=off']))
-    node = wasm_host.js_runtime(args.node)
     machine = platform.machine()
     native = 'arm64-macos' if platform.system() == 'Darwin' else ('arm64-linux' if machine in ('arm64','aarch64') else 'x86_64-linux')
-    targets = list(dict.fromkeys([native, 'wasm32', 'arm64-linux', 'x86_64-linux']))
+    targets = list(dict.fromkeys([native, 'arm64-macos', 'arm64-linux', 'x86_64-linux']))
     hashes = {v: hashlib.sha256(p.read_bytes()).hexdigest() for v,p in compilers.items()}
     executed = crossed = diagnostics = 0
-    with tempfile.TemporaryDirectory(prefix='dunder-optimizer-') as tmp, wasm_host.WasmWorker(node) as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-optimizer-') as tmp:
         work = Path(tmp)
         programs = list(positive_cases()) + list(mutation_cases())
         programs.append(('fixture', (ROOT / 'tests/contracts/scalar_optimizer.ddr').read_text(), [42]))
@@ -514,15 +497,18 @@ def main():
                     built = build(compiler,path,image,target,work,build_flags)
                     if args.verify_selection and variant != 'baseline':
                         selected(built,variant,name,target)
-                    if target == native or target == 'wasm32':
-                        result = call([image],cwd=work) if target == native else wasm.run(image, binary_output=True)
+                    if target == native:
+                        result = call([image],cwd=work)
                         if result.returncode != 0 or result.stdout != output:
                             raise AssertionError(f'{variant} {name} {target}: exit {result.returncode}, expected {output!r}, got {result.stdout!r}\n{result.stderr.decode(errors="replace")}')
                         executed += 1
                     else:
                         data = image.read_bytes()
-                        assert data[:6] == b'\x7fELF\x02\x01'
-                        assert struct.unpack_from('<H',data,18)[0] == (183 if target == 'arm64-linux' else 62)
+                        if target == 'arm64-macos':
+                            assert data[:4] == b'\xcf\xfa\xed\xfe'
+                        else:
+                            assert data[:6] == b'\x7fELF\x02\x01'
+                            assert struct.unpack_from('<H',data,18)[0] == (183 if target == 'arm64-linux' else 62)
                         crossed += 1
             for target in targets:
                 baseline_records = None
@@ -546,11 +532,10 @@ def main():
                     built = build(compiler,path,image,target,work,build_flags)
                     if args.verify_selection and variant != 'baseline':
                         selected(built,variant,name,target)
-                    if target == native or target == 'wasm32':
-                        result = call([image],cwd=work) if target == native else wasm.run(image, binary_output=True)
-                        expected_status = status if target == native else 125
-                        if result.returncode != expected_status or result.stdout != b'17\n':
-                            raise AssertionError(f'{variant} {name} {target}: exit {result.returncode}, expected {expected_status}; stdout {result.stdout!r}; stderr {result.stderr!r}')
+                    if target == native:
+                        result = call([image],cwd=work)
+                        if result.returncode != status or result.stdout != b'17\n':
+                            raise AssertionError(f'{variant} {name} {target}: exit {result.returncode}, expected {status}; stdout {result.stdout!r}; stderr {result.stderr!r}')
                         executed += 1
                     else:
                         crossed += 1
@@ -579,7 +564,7 @@ def main():
                         raise AssertionError(f'diagnostics changed for {name} {command} {target}:\n{outcomes!r}')
             print('PASS diagnostics',name,flush=True)
     assert all(hashlib.sha256(p.read_bytes()).hexdigest() == hashes[v] for v,p in compilers.items()), 'compiler changed during verification'
-    print(f'{executed} native/Wasm executions; {crossed} Linux cross-builds (not executed); {diagnostics} matching invalid diagnostics')
+    print(f'{executed} native executions; {crossed} cross-builds (not executed); {diagnostics} matching invalid diagnostics')
 
 
 if __name__ == '__main__':

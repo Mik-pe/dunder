@@ -3,7 +3,7 @@
 
 An optional historical comparison compiler predates frontend activation. A
 forced local-copy source control and finite event bounds verify activation;
-native/Wasm assertions independently check capacity, snapshots and RC lifetime.
+native assertions independently check capacity, snapshots and RC lifetime.
 """
 import argparse
 import hashlib
@@ -15,10 +15,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 MODES = ((), ('--scalar-opt=off',), ('--mir=off',), ('--scalar-opt=off', '--mir=off'))
 PROFILE = '''struct Leaf { values: []i64 }
 struct Item { first: Leaf, second: Leaf, name: string }
@@ -73,7 +72,7 @@ def main():
     report = {'compiler': hashlib.sha256(compiler.read_bytes()).hexdigest(),
               'baseline': hashlib.sha256(baseline.read_bytes()).hexdigest() if baseline else None,
               'images': 0, 'executions': 0, 'profiles': [], 'cache': []}
-    with tempfile.TemporaryDirectory(prefix='dunder-record-source-') as temporary, wasm_host.WasmWorker() as wasm_worker:
+    with tempfile.TemporaryDirectory(prefix='dunder-record-source-') as temporary:
         work = Path(temporary)
         values = ROOT / 'tests' / 'fixtures' / 'record-take-values.ddr'
         for mode, flags in enumerate(MODES):
@@ -84,10 +83,6 @@ def main():
                 report['images'] += 1
                 if target == host:
                     run([image], output='42\n'); report['executions'] += 1
-                elif target == 3:
-                    res = wasm_worker.run(image, repeat=True)
-                    assert res.returncode == 0 and res.stdout == '42\n', res
-                    report['executions'] += 2
             source = work / f'profile-{mode}.ddr'; source.write_text(PROFILE)
             control = work / f'profile-{mode}-control.ddr'
             control.write_text(PROFILE.replace('fn relay() -> Item { make() }',
@@ -147,17 +142,13 @@ fn main(){{unsafe{{assert(invoke(callback(answer),9)==42)}};print(42)}}
             run([compiler, 'build', callback, *flags, '-o', image]); run([image], output='42\n')
         for index, (status, body) in enumerate(TRAPS):
             source = work / f'trap-{index}.ddr'; source.write_text(TRAP_PREFIX + body)
-            for target in (host, 3):
+            for target in (host,):
                 image = work / f'trap-{index}-{target}'
                 run([compiler, 'build', source, '--target', TARGETS[target], '-o', image])
-                if target == host:
-                    run([image], status=status, output='11\n')
-                else:
-                    res = wasm_worker.run(image)
-                    assert res.returncode == 125 and res.stdout == '11\n', res
+                run([image], status=status, output='11\n')
     output = ROOT / 'build' / 'record-take-source'; output.mkdir(parents=True, exist_ok=True)
     (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('PASS activated record temporaries: all4 targets, scalar/MIR modes, exact capacities/RC, copy reductions, warm helper demand, native C callback and trap order')
+    print('PASS activated record temporaries: all 3 targets, scalar/MIR modes, exact capacities/RC, copy reductions, warm helper demand, native C callback and trap order')
 
 
 if __name__ == '__main__':

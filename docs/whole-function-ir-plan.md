@@ -56,7 +56,9 @@ adaptern. Den gamla direkta maskinkodsvägen ska då avvecklas.
    allokering eller minnesåtkomst får inte flyttas utan ett tillräckligt
    kontrakt. Noll varv och felordning måste bevaras.
 4. **Direkta målbackends.** Låt samma värden och ABI-beskrivningar styra
-   fysisk registerallokering på ARM64 och x86-64 och lokaler på Wasm.
+   fysisk registerallokering på ARM64 och x86-64. Direkt Wasm-lokalplacering
+   och Wasm-verifiering i testmatrisen är **senarelagda** under pågående
+   språkutveckling så att fokus och verifieringsloop hålls helt nativa.
    Att flytta ARM-register i dagens x86-översättning är inte en färdig
    fysisk x86-allokering. Avveckla övergångsadaptern efter att frontend
    avger hela funktionsmodellen direkt.
@@ -157,8 +159,9 @@ ett separat frame-livstidsbevis. Inga nya frameceller, SP-justeringar,
 etikett- eller import-ID:n skapas. Positivt identifierade privata
 uttryckstemporärer delar placering med Frame-värden. Heap-CSE och generellt
 SSA-baserat val av skalära operationer ingår ännu inte. Placeringen
-gäller den gemensamma logiska GP-banken; direkt x86-registerallokering och
-Wasm-lokaler är kvarvarande målbackendsteg.
+gäller den gemensamma logiska GP-banken; direkt x86-registerallokering
+återstår som målbackendsteg, medan Wasm-lokaler och Wasm-testsviter är
+senarelagda under pågående språkutveckling.
 
 Samma [`mir_pipeline`](../selfhost/mir_pipeline.ddr) kör frame → valbar SSA
 → värdepass seriellt och i workers. Arbetsjobbet sänker därefter till ett
@@ -417,6 +420,7 @@ bredare värdedomäner, mer registerplacering över anrop och loopar samt direkt
 målbackends återstår som runtimearbete. Workerpool,
 nollkopierande gränstransfer, delad heap och generellt Send/Sync behöver
 separata kontrakt; den nuvarande isolerade modellen gör inte dessa anspråk.
-Linux och Wasm behöver egna verifierade runtime-/transportgränser innan
-de kan köra språkets tasks. Alla fortsättningar måste behålla samma
+Linux behöver en egen verifierad runtime-/transportgräns innan det kan köra
+språkets tasks; motsvarande Wasm-arbete och Wasm-verifiering är senarelagda
+under pågående språkutveckling. Alla fortsättningar måste behålla samma
 källregler, determinism och mätta totala byggkostnad.

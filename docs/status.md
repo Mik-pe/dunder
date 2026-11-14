@@ -155,57 +155,17 @@ HTTP/1.1-servern underhålls i syskonrepot
 [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
 Se även [macOS-appar](app-bundles.md).
 
-## Körda Wasm-kontrakt
+## WebAssembly (senarelagt under språkutveckling)
 
-Den självbyggda kompilatorn byggde varje portabel grupp i `tests/suite.ddr`
-till en separat Wasm-modul. Node körde de portabla testgrupperna; de nativt
-begränsade grupperna har nåbara OS-, fil- eller socketanrop.
+Wasm-backenden finns kvar i `selfhost/wasm_*.ddr`, men Wasm-testsviter,
+`wasm32`-byggen i testmatrisen och externa JS-runtimes (Node/Bun) har tagits
+bort ur verifieringskedjan och **senarelagts** under pågående språkutveckling.
+All aktiv språk- och kompilatorverifiering (`./tools/dev.sh` och
+`./tools/verify-selfhost.sh`) fokuserar tills vidare på de tre nativa målen
+(`arm64-macos`, `arm64-linux` och `x86_64-linux`) utan JS-beroenden.
 
-| Grupp | Nativt beroende |
-| --- | --- |
-| `tests/net_loopback.ddr::clock_and_confined_dir_bytes` | Klocka och filåtkomst |
-| `tests/net_loopback.ddr::loopback_nonblocking_poll_roundtrip` | Nätverkssockets (`std.net`) |
-| `tests/net_loopback.ddr::stream_set_pool_and_slot_reuse` | Socketpool (`std.net`) |
-| `tests/net_loopback.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
-| `tests/net_loopback.ddr::errors_remain_values` | Fel från filåtkomst |
-| `tests/process_fs.ddr::fs_temp_dir_links_listing_and_safe_remove_all` | Kataloger, länkar och rekursiv städning (`std.fs`) |
-| `tests/process_fs.ddr::process_grant_and_env_cwd_stderr_exit_code` | Subprocesser, miljö och delegerade `Executable`-handtag (`std.process`) |
-| `tests/process_fs.ddr::process_large_simultaneous_stdin_stdout_pipe_without_deadlock` | Icke-blockerande pipe-strömning (`std.process`) |
-| `tests/process_fs.ddr::process_launch_failures_report_portable_errno` | Startfel över CLOEXEC-rör (`std.process`) |
-| `tests/process_fs.ddr::process_timeout_and_background_child_spawn` | Timeout, processgrupper och bakgrundsprocesser (`std.process`) |
-| `selfhost/compile.ddr::string_operand_leases_are_removed_only_across_effect_free_rhs` | Kompilatorns filåtkomst |
-| `selfhost/compile.ddr::ownership_proofs_do_not_change_validation_or_binding_records` | Kompilatorns filåtkomst |
-| `selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants` | Kompilatorns filåtkomst |
-| `selfhost/compile.ddr::compiler_checks_types_before_emitting_an_image` | Kompilatorns filåtkomst |
-| `selfhost/compile.ddr::native_compiler_rejects_unsupported_aggregate_shapes_and_immutable_mutation` | Kompilatorns filåtkomst |
-| `selfhost/compile.ddr::inline_producer_preserves_authoritative_diagnostics_and_scalar_off_behavior` | Den nativa kompilatorns fil- och cachekod |
-| `selfhost/compile.ddr::inline_producer_does_not_duplicate_source_binding_reports` | Den nativa kompilatorns fil- och cachekod |
-| `selfhost/compile.ddr::inline_fragments_restore_backward_dependencies_charges_and_private_body_identity` | Skrivning och återställning av cachefiler |
-| `selfhost/compile.ddr::inline_fragment_keys_preserve_cold_growth_frontiers_across_partial_cache_hits` | Ändring och återställning av cachefiler |
-| `selfhost/compile.ddr::all_emitted_source_functions_use_mir_without_changing_diagnostics_or_bindings` | Den nativa kompilatorns fil- och cachekod |
-| `selfhost/compile.ddr::whole_function_optimizer_policy_and_actual_counters_follow_pass_execution` | Den nativa kompilatorns fil- och cachekod |
-
-Wasm-värden kontrollerar dessa gruppnamn och diagnostiken för nativa anrop.
-Bland de körda grupperna finns SHA-256 med referensvektorer och olika
-utfyllnadsgränser, UTF-8, samlingar, Vulkan-scenens geometri och delar av
-kompilatorn. Ett separat värdtest läser WebGPU-exemplets 24 flyttal ur
-exporterat minne och provar typade callbacks och C-layout på 32-bitarsmålet.
-Tio längre program för strängar, arraykopior, nästlade fält och
-scope-städning kördes två gånger vardera i samma instans. Det linjära
-minnet hade samma storlek efter första och andra körningen.
-
-```sh
-dunder_bin="$(./tools/bootstrap.sh)"
-"$dunder_bin" test tests/suite.ddr
-node tools/test-wasm.mjs "$dunder_bin"
-node tools/test-wasm-scalars.mjs "$dunder_bin"
-node tools/test-wasm-abi.mjs "$dunder_bin"
-python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
-"$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
-```
-
-Wasm-program som behöver filer, processer eller grafik måste deklarera
+Wasm-moduler som behöver filer, processer eller grafik måste deklarera
 motsvarande värdimporter. Det publika ABI:t använder fyra byte för
-pekare och `usize`. Internt använder kompilatorn 64-bitars registerceller.
+pekare och `usize`, medan kompilatorn internt använder 64-bitars registerceller.
 Tokens, lånekontroll och logiken för kopiering och frigöring delas med
 nativmålen. [Wasm-ABI och utskrifter](targets.md#webassembly)

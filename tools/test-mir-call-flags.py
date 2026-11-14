@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Raw calls may consume incoming NZCV: real CSET observers on native/Wasm.
+"""Raw calls may consume incoming NZCV: real CSET observers on the native host.
 
 The actual value pass is productive but currently retains Compare even with
 the old unsound flags2 model. This is NOT a production value-pass miscompile.
 The separately named liveness-control mode is test-only Compare deletion: it
 demonstrates why falsely dead flag metadata would license an invalid future
 transformation. With canonical flags3, that control must retain Compare too.
-All four targets are built; only the native host and Wasm execute. No timing tests.
+All three native targets are built; only the native host executes. No timing tests.
 """
 import argparse
 import hashlib
@@ -18,10 +18,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 
 
 def digest(path):
@@ -40,7 +39,7 @@ def main():
     base = args.output.resolve(); base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='run-', dir=base))
     commands, images = [], []
-    executions = {TARGETS[host]: 0, 'wasm32': 0}
+    executions = {TARGETS[host]: 0}
     passed = False
 
     def call(command, stdout=None):
@@ -86,9 +85,6 @@ def main():
                                        'expected_observer_result': expected, 'sha256': digest(image)})
                         if target == host:
                             call([image], str(expected) + '\n'); executions[name] += 1
-                        elif target == 3:
-                            call([wasm_host.js_runtime(), ROOT / 'tools/test-wasm.mjs', '--execute', image],
-                                 str(expected) + '\n'); executions[name] += 1
         passed = True
     finally:
         (work / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')
@@ -99,7 +95,7 @@ def main():
                 'selfhost/mir_decode.ddr', 'selfhost/mir_retained.ddr', 'selfhost/mir_liveness.ddr',
                 'selfhost/mir_value_prop.ddr', 'tests/fixtures/mir-call-flags-emitter.ddr')},
             'images': images, 'executions': executions, 'host_target': TARGETS[host],
-            'cross_built_only': [name for target, name in enumerate(TARGETS) if target not in (host, 3)],
+            'cross_built_only': [name for target, name in enumerate(TARGETS) if target != host],
             'production_value_pass': 'productive; Compare retained, observer result preserved before and after fix',
             'liveness_control': 'test-only demonstration; not a production pass or claimed production miscompile',
         }, indent=2) + '\n')

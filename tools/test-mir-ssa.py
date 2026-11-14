@@ -2,9 +2,9 @@
 """Exact-bit SSA differential QA through real target lowerers, without timings.
 
 Physical canonical MIR is interpreted independently of retained words, then
-the actual before/after images execute on the native host and Wasm. Calls/FP
+the actual before/after images execute on the native host. Calls/FP
 and unknown scratch/exit observations are explicit interpreter gaps with
-native/Wasm helper coverage. Positive cell
+native helper coverage. Positive cell
 cases must actually remove loads; opaque/escape/overlap cases never stand in
 for an optimization success. Failed budgets must restore EVERY Function field.
 """
@@ -21,9 +21,6 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
-sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('ssa_mir_semantic_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
@@ -127,7 +124,7 @@ def interpret(model, case, value, control, trap):
         # This case deliberately consumes X9 after a retained helper's unknown
         # clobber. Its actual address bits are not a canonical SSA definition:
         # the generic physical interpreter cannot manufacture that meaning.
-        # Exact native/Wasm execution observes those bits instead.
+        # Exact native execution observes those bits instead.
         return {'coverage_gap': 'consumed retained-helper scratch/clobber result'}
     # Address is an explicit semantic base+byte-offset operation. Extend the
     # existing interpreter's closed vocabulary without decoding retained bits.
@@ -182,7 +179,7 @@ def main():
                   call_inputs_sha256=digest((ROOT / 'selfhost/mir_call_inputs.ddr').read_bytes()),
                   fixture_sha256=digest(fixture.read_bytes()),
                   oracle_sha256=digest((ROOT / 'tools/test-mir.py').read_bytes()), host_target=host, images=[])
-    with tempfile.TemporaryDirectory(prefix='dunder-mir-ssa-') as temporary, wasm_host.WasmWorker() as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-mir-ssa-') as temporary:
         work = args.output.resolve() if args.output else Path(temporary)
         if args.output:
             work.mkdir(parents=True, exist_ok=True)
@@ -244,11 +241,6 @@ def main():
             ran = False
             if target == host:
                 call([image], 101 if trap else 0); executed += 1; ran = True
-            elif target == 3:
-                expected_wasm = 125 if trap else 0
-                wres = wasm.run(image)
-                assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
-                executed += 1; ran = True
             if args.output: image.with_suffix(image.suffix + '.mir.txt').write_text(result.stdout)
             row = dict(case=case, name=NAMES[case], input=value, control=control, target=target, mode=mode,
                        limit=limit, source_objects=source, terminal_contract=terminals, executed=ran,
@@ -260,7 +252,7 @@ def main():
             return counters
 
         for index, (case, value, control) in enumerate(samples):
-            for target in range(4):
+            for target in range(3):
                 one(case, value, control, target, 'off')
                 one(case, value, control, target, 'on')
                 if case == 14: one(case, value, control, target, 'on', terminals=1)
@@ -270,7 +262,7 @@ def main():
         # exhaustion. Reusing the production exclusive API is mandatory here.
         for case, value, control in ((0, 41, 0), (4, 7, 0), (12, -17, 1), (24, 41, 0), (26, -17, 1)):
             if args.case is not None and args.case != case: continue
-            for target in (host, 3):
+            for target in (host,):
                 inputs = int(case >= 24)
                 full = one(case, value, control, target, 'on', source=1, inputs=inputs, label='-context')
                 for limit in sorted({0, 1, max(1, full['units'] // 2), max(1, full['units'] - 1)}):
@@ -284,7 +276,7 @@ def main():
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
-    print(f'{report["images_built"]} images; {executed} native/Wasm executions; '
+    print(f'{report["images_built"]} images; {executed} native executions; '
           f'{proved} independent semantic pairs; {gaps} explicit semantic gaps; no latency measurements')
 
 

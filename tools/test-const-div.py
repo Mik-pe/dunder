@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify constant division through consumer programs and independent integers.
 
-Build every program for all four targets; execute the native host and Wasm.
+Build every program for all three targets; execute the native host.
 --baseline optionally adds an older authoritative compiler, without new flags.
 This is a correctness suite, not a timing or C-performance acceptance suite.
 """
@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import platform
 import random
-import shutil
 import struct
 import subprocess
 import sys
@@ -20,19 +19,8 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 ENV = {'PATH': '/no-external-tools'}
-WASM = '''const fs=require('node:fs');
-const print=x=>console.log(x.toString());
-const program=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),
-  {dunder:{print_i32:print,print_i64:print,print_bool:x=>print(Boolean(x))}}).exports;
-try { const status=program.main(); if(status!==undefined)process.exitCode=Number(status); }
-catch(error) {
-  if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;
-  process.exitCode=125;
-}'''
 
 
 def quotient(n, d):
@@ -286,9 +274,7 @@ def call(command, work):
 
 def image_header(path, target):
     data = path.read_bytes()
-    if target == 'wasm32':
-        assert data[:8] == b'\0asm\1\0\0\0', (target, 'invalid Wasm image')
-    elif target.endswith('linux'):
+    if target.endswith('linux'):
         assert data[:6] == b'\x7fELF\x02\x01', (target, 'invalid ELF image')
         assert struct.unpack_from('<H', data, 18)[0] == (183 if target == 'arm64-linux' else 62), target
     else:
@@ -306,7 +292,6 @@ def main():
     parser.add_argument('--baseline', type=Path, help='optional older compiler, receives no const-div flags')
     parser.add_argument('--legacy-only', action='store_true',
                         help='validate fixtures with this compiler alone, without new CLI flags')
-    parser.add_argument('--node', default='bun')
     parser.add_argument('--verify-selection', action='store_true', help='assert helpers still use the typed model via timings counters')
     parser.add_argument('--case', help='run only program names containing this substring')
     parser.add_argument('--plan-module', type=Path, default=ROOT / 'selfhost/const_div.ddr',
@@ -321,7 +306,6 @@ def main():
         variants = [('legacy', compiler, [])]
     if args.baseline:
         variants.insert(0, ('baseline', args.baseline.resolve(strict=True), []))
-    node = Path(wasm_host.js_runtime(args.node))
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         native = 'arm64-macos'
     elif platform.system() == 'Linux' and platform.machine() in ('arm64', 'aarch64', 'x86_64'):
@@ -339,7 +323,7 @@ def main():
         invalids = [p for p in invalids if args.case in p[0]]
         if not positives and not traps and not invalids and args.case not in 'plans':
             parser.error('--case did not match any program')
-    with tempfile.TemporaryDirectory(prefix='dunder-const-div-') as tmp, wasm_host.WasmWorker(node) as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-const-div-') as tmp:
         work = Path(tmp).resolve()
         plan_hash = None
         if not args.case or args.case in 'plans':
@@ -357,14 +341,14 @@ def main():
                 built = call([compiler, 'build', path, '--target', target, '-o', image, *flags], work)
                 assert built.returncode == 0, ('plan export build', target, built.stderr.decode(errors='replace'))
                 image_header(image, target)
-                if target in (native, 'wasm32'):
-                    result = call([image], work) if target == native else wasm.run(image, binary_output=True)
+                if target == native:
+                    result = call([image], work)
                     assert result.returncode == 0, ('plan export run', target, result.returncode, result.stderr)
                     outputs.append(result.stdout)
                     executed += 1
                 else:
                     crossed += 1
-            assert outputs[0] == outputs[1], 'host/Wasm exported different plans'
+            assert len(outputs) == 1
             checked = verify_plans(outputs[0], pairs)
             print(f'PASS {len(pairs)} real Dunder plans; {checked} exact plan inputs; exhaustive signed widths 3..10', flush=True)
             programs += 1
@@ -382,11 +366,10 @@ def main():
                     if selection:
                         data = json.loads(built.stderr)['optimizer']
                         assert data['enabled'] and data['emitted'] >= helpers, (name, variant, target, helpers, data)
-                    if target in (native, 'wasm32'):
-                        result = call([image], work) if target == native else wasm.run(image, binary_output=True)
-                        wanted_status = 125 if target == 'wasm32' and status else status
-                        assert result.returncode == wanted_status and result.stdout == wanted, (
-                            name, variant, target, result.returncode, wanted_status, result.stdout[:1000], wanted[:1000], result.stderr)
+                    if target == native:
+                        result = call([image], work)
+                        assert result.returncode == status and result.stdout == wanted, (
+                            name, variant, target, result.returncode, status, result.stdout[:1000], wanted[:1000], result.stderr)
                         executed += 1
                         if expected is not None:
                             result_values += len(expected)
@@ -414,9 +397,9 @@ def main():
         if plan_hash:
             assert hashlib.sha256(module.read_bytes()).hexdigest() == plan_hash, 'plan module changed during suite'
     assert all(hashlib.sha256(p.read_bytes()).hexdigest() == value for p, value in hashes.items()), 'compiler changed during suite'
-    print(f'{programs} programs; {executed} native/Wasm executions; {crossed} other-target cross-builds; '
+    print(f'{programs} programs; {executed} native executions; {crossed} other-target cross-builds; '
           f'{result_values} checked result lines; {diagnostics} matching invalid diagnostics')
-    print('Native trap codes are exact; Wasm exposes unreachable only (125), with exact pre-trap stdout.')
+    print('Native trap codes and pre-trap stdout are exact.')
 
 
 if __name__ == '__main__':

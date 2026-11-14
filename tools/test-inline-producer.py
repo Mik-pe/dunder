@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Frozen public compiler-API consumer tests for bounded scalar inlining.
 
-Runs on/off images on the native host and Wasm, builds every target, preserves
+Runs on/off images on the native host, builds every target, preserves
 source binding/diagnostic reports, and checks explicit CLI-off and optional
-older-baseline byte identity. Native trap codes are exact; Wasm exposes only
-unreachable (125), so its pre-trap stdout is checked independently.
+older-baseline byte identity. Native trap codes and pre-trap stdout are exact.
 """
 import argparse
 import hashlib
@@ -12,24 +11,14 @@ import json
 import os
 from pathlib import Path
 import platform
-import shutil
 import subprocess
 import sys
 import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 ENV = {'PATH': '/no-external-tools'}
-WASM = """const fs=require('node:fs');
-const print=x=>console.log(x.toString());
-const program=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),
- {dunder:{print_i32:print,print_i64:print,print_bool:x=>print(Boolean(x))}}).exports;
-try {const status=program.main();if(status!==undefined)process.exitCode=Number(status)}
-catch(error){if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;process.exitCode=125}
-"""
 COUNTERS = ('modeled', 'optimized', 'emitted', 'reused', 'fallbacks')
 INLINE = ('entries', 'nodes', 'tokens', 'units', 'calls', 'words', 'estimate')
 
@@ -111,13 +100,11 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--baseline', type=Path, help='optional older compiler; receives no new inline flag')
     parser.add_argument('--source-root', type=Path, default=ROOT, help='compiler API checkout imported by the fixture')
-    parser.add_argument('--node', default='bun')
     parser.add_argument('--report', type=Path, help='optional JSON with hashes, counters and raw command output')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     baseline = args.baseline.resolve(strict=True) if args.baseline else None
     source_root = args.source_root.resolve(strict=True)
-    node = Path(wasm_host.js_runtime(args.node))
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         host = 0
     elif platform.system() == 'Linux' and platform.machine() in ('arm64', 'aarch64', 'x86_64'):
@@ -138,11 +125,10 @@ def main():
                     expected_results={name: dict(stdout=stdout, native_status=status)
                                       for name, (_, stdout, status) in valid.items()},
                     limitations=['Linux targets are cross-built when not the native host',
-                                 'Wasm traps expose unreachable (125), not native trap codes',
                                  'cache counters describe performed work; source bindings are compared separately'])
     builds = diagnostics = executions = cross_builds = cli_checks = 0
     try:
-        with tempfile.TemporaryDirectory(prefix='dunder-inline-producer-') as directory, wasm_host.WasmWorker(node) as wasm:
+        with tempfile.TemporaryDirectory(prefix='dunder-inline-producer-') as directory:
             work = Path(directory).resolve()
 
             def call(command, expected=0):
@@ -184,16 +170,8 @@ def main():
 
             def execute(image, target, output, status):
                 nonlocal executions, cross_builds
-                if target in (host, 3):
-                    expected_status = 125 if status and target == 3 else status
-                    if target == host:
-                        result = call([image], expected_status)
-                    else:
-                        result = wasm.run(image)
-                        if args.report:
-                            evidence['commands'].append(dict(command=result.args, status=result.returncode, expected_status=expected_status,
-                                                             stdout=result.stdout, stderr=result.stderr))
-                        assert result.returncode == expected_status, (result.args, result.returncode, expected_status, result.stdout, result.stderr)
+                if target == host:
+                    result = call([image], status)
                     assert result.stdout == output, (image.name, target, result.stdout, output)
                     executions += 1
                 else:
@@ -201,7 +179,7 @@ def main():
 
             rows = {}
             for name, (source, output, status) in valid.items():
-                for target in range(4):
+                for target in range(3):
                     pair = []
                     for mode in ('off', 'on'):
                         image, report = build(name, source, target, mode)
@@ -225,13 +203,13 @@ def main():
                         assert older.read_bytes() == explicit_off.read_bytes(), (name, target, 'older baseline differs from explicit off')
                 print('PASS effects/results/bindings', name, flush=True)
             for index, source in enumerate(invalid):
-                for target in range(4):
+                for target in range(3):
                     for checking in (False, True):
                         _, before = build(f'invalid-{index}', source, target, 'off', check=checking, expected=1)
                         _, after = build(f'invalid-{index}', source, target, 'on', check=checking, expected=1)
                         assert before == after, (index, target, checking, 'diagnostic changed', before, after)
             # Scalar-off bypasses producer admission and keeps exact code.
-            for target in range(4):
+            for target in range(3):
                 source = valid['eager-repeated'][0]
                 old, before = build('scalar-off', source, target, 'off', scalar='off')
                 current, after = build('scalar-off', source, target, 'on', scalar='off')
@@ -259,13 +237,13 @@ def main():
             assert 0 < rows['caller-budget', host, 'on']['inline']['calls'] < 160
             assert 0 < rows['global-budget', host, 'on']['inline']['calls'] < 2000
             assert any(rows[name, target, 'on']['sha256'] != rows[name, target, 'off']['sha256']
-                       for name in valid for target in range(4)), 'no actual code changed'
+                       for name in valid for target in range(3)), 'no actual code changed'
         assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest for path, digest in hashes.items()), 'compiler/source changed during suite'
         evidence.update(complete=True, valid_cases=len(valid), valid_builds=len(evidence['images']),
                         api_builds=builds, diagnostics=diagnostics, executions=executions,
                         cross_built_images=cross_builds, explicit_cli_off_checks=cli_checks)
         print(f'{len(evidence["images"])} frozen all-target images; {diagnostics} exact invalid diagnostics; '
-              f'{executions} host/Wasm executions; {cross_builds} other-target images; '
+              f'{executions} host executions; {cross_builds} other-target images; '
               f'{cli_checks} explicit CLI-off byte comparisons; scalar-off/check/cache contracts passed')
     except Exception as error:
         evidence['error'] = repr(error)

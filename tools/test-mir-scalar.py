@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent scalar MIR results/NZCV on native host and Wasm; four image targets.
+"""Independent scalar MIR results/NZCV on native host; three native image targets.
 
 This exercises the inactive canonical-scalar modules directly. It does not enable
 new production dispatch, patch retained words, or claim cross-target execution.
@@ -16,10 +16,8 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('semantic_mir_oracle', ROOT / 'tools/test-mir.py')
 oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
@@ -122,25 +120,22 @@ def main():
     with tempfile.TemporaryDirectory(prefix='dunder-mir-scalar-') as temporary:
         work = Path(temporary); emitter = work / 'emitter'
         run([compiler, 'build', ROOT / 'tests/fixtures/mir-scalar-emitter.ddr', '-o', emitter], work)
-        with wasm_host.WasmWorker() as wasm, ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             def check_case(entry):
                 index, (_, operation, values) = entry
                 expected, conditions = evaluate(operation, values)
                 semantic = [operation[key] for key in ('kind', 'opcode', 'type', 'dst', 'a', 'b', 'c', 'imm', 'aux', 'flags')]
-                for target in range(4):
+                for target in range(3):
                     image = work / f'scalar-image-{index}-{target}'
                     run([emitter, image, target, *semantic, *(oracle.signed(value) for value in values), expected, conditions], work)
                     if target == host:
                         run([image], work)
-                    if target == 3:
-                        wres = wasm.run(image)
-                        assert wres.returncode == 0, (image, wres.returncode, wres.stdout, wres.stderr)
                     image.unlink(missing_ok=True)
             for done_count, _ in enumerate(pool.map(check_case, enumerate(corpus)), 1):
                 if done_count % 50 == 0:
                     print(f'PASS {done_count}/{len(corpus)} scalar cases', flush=True)
-    print(f'{len(corpus)} independent scalar/NZCV cases; {len(corpus) * 4} images built; '
-          f'{len(corpus) * 2} native/Wasm executions passed')
+    print(f'{len(corpus)} independent scalar/NZCV cases; {len(corpus) * 3} images built; '
+          f'{len(corpus)} native executions passed')
 
 
 if __name__ == '__main__':

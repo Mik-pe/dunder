@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Independent semantic MIR oracle and whole-function off/on consumer contracts.
 
-No timing series. All four targets are built; only the native host and Wasm
-execute. The scalar oracle reads semantic MIR columns exported by the actual
+No timing series. All three native targets are built; only the native host
+executes. The scalar oracle reads semantic MIR columns exported by the actual
 lift/verifier, never retained instruction words or the ARM encoding recipe.
 Opaque operations, foreign calls and exhausted fuel are coverage gaps, not
 successful interpreter runs. Whole-source tests separately exercise ownership,
@@ -17,28 +17,18 @@ from pathlib import Path
 import platform
 import random
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 ENV = {'PATH': '/no-external-tools'}
 MASK64 = (1 << 64) - 1
 COLUMNS = ('kind', 'opcode', 'dst', 'a', 'b', 'c', 'imm', 'aux', 'type',
            'place', 'extension', 'effects', 'flags', 'abi', 'reads', 'writes',
            'clobbers', 'mode', 'target')
-WASM = """const fs=require('node:fs');
-const print=x=>console.log(x.toString());
-const program=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),
- {dunder:{print_i32:print,print_i64:print,print_bool:x=>print(Boolean(x))}}).exports;
-try {const result=program.main();if(process.argv[2]!=='ignore-result'&&result!==undefined)process.exitCode=Number(result)}
-catch(error){if(!(error instanceof WebAssembly.RuntimeError)||!/unreachable/i.test(error.message))throw error;process.exitCode=125}
-"""
 
 
 class CoverageGap(Exception):
@@ -421,7 +411,6 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--only', choices=('all', 'oracle', 'source'), default='all')
-    parser.add_argument('--node', default='bun')
     parser.add_argument('--fuel', type=int, default=10000)
     parser.add_argument('--report', type=Path, help='JSON hashes, raw commands, models, counts and coverage limits')
     args = parser.parse_args()
@@ -429,7 +418,6 @@ def main():
         parser.error('--fuel must be at least 100')
     compiler = args.compiler.resolve(strict=True)
     source_root = args.source_root.resolve(strict=True)
-    node = Path(wasm_host.js_runtime(args.node))
     system, machine = platform.system(), platform.machine()
     if system == 'Darwin' and machine == 'arm64': host = 0
     elif system == 'Linux' and machine in ('aarch64', 'arm64'): host = 1
@@ -441,7 +429,6 @@ def main():
     evidence = dict(complete=False, scope=args.only, hashes=hashes, host=platform.uname()._asdict(), commands=[],
                     oracle=[], sources=[], fuel=args.fuel, limitations=[
                         'Nonhost Linux/macOS images are cross-built, not executed',
-                        'Wasm exposes unreachable125, so exact trap reasons are native evidence only',
                         'Interpreter covers scalar/frame/CFG, not arbitrary calls, ARC, FP or external memory',
                         'Interpreted functions are closed generated kernels; owned source functions have runtime differential coverage',
                         'Canonical lowering changes only Constant/Copy/Load/Store in this cohort; other operations retain their encodings',
@@ -450,7 +437,7 @@ def main():
                         'Deterministic finite inputs and fuel do not constitute a universal proof'])
     counts = Counter()
     try:
-        with tempfile.TemporaryDirectory(prefix='dunder-mir-qa-') as directory, wasm_host.WasmWorker(node) as wasm:
+        with tempfile.TemporaryDirectory(prefix='dunder-mir-qa-') as directory:
             work = Path(directory).resolve()
 
             def call(command, expected=0):
@@ -462,18 +449,11 @@ def main():
                 assert result.returncode == expected, (command, expected, result.returncode, result.stdout, result.stderr)
                 return result
 
-            def execute(image, target, output='', status=0, ignore_result=False):
-                if target not in (host, 3):
+            def execute(image, target, output='', status=0):
+                if target != host:
                     counts['cross_builds'] += 1
                     return
-                expected = 125 if target == 3 and status else status
-                if target == host:
-                    result = call([image], expected)
-                else:
-                    result = wasm.run(image, ignore_result=ignore_result)
-                    evidence['commands'].append(dict(command=result.args, status=result.returncode,
-                                                    expected=expected, stdout=result.stdout, stderr=result.stderr))
-                    assert result.returncode == expected, (result.args, expected, result.returncode, result.stdout, result.stderr)
+                result = call([image], status)
                 assert result.stdout == output, (image, result.stdout, output)
                 counts['executions'] += 1
 
@@ -487,7 +467,7 @@ def main():
             if args.only in ('all', 'oracle'):
                 runner = build_fixture('mir-oracle.ddr')
                 for index, (name, a, b, expected) in enumerate(scalar_cases()):
-                    for target in range(4):
+                    for target in range(3):
                         images = {}
                         for mode in ('plain', 'roundtrip', 'canonical'):
                             image = work / f'oracle-{index}-{target}-{mode}'
@@ -503,7 +483,7 @@ def main():
                             assert actual == expected & MASK64, (name, a, b, actual, expected, model)
                             counts['completed_interpreter_runs'] += 1
                             counts['max_steps'] = max(counts['max_steps'], interpreter.steps)
-                            execute(image, target, ignore_result=True)
+                            execute(image, target)
                             images[mode] = hashlib.sha256(image.read_bytes()).hexdigest()
                             counts['oracle_images'] += 1
                             evidence['oracle'].append(dict(case=name, left=a, right=b, expected=expected,
@@ -514,7 +494,7 @@ def main():
                 # In particular, a proved frame load has effects2, not the
                 # retained raw load's conservative memory+trap effects3.
                 for field in ('effects', 'type', 'extension', 'reads', 'writes', 'clobbers'):
-                    for target in range(4):
+                    for target in range(3):
                         image = work / f'reject-{field}-{target}'
                         result = call([runner, image, target, 'reject-' + field, 'signed-load', -1, 0, -1])
                         assert result.stdout == 'REJECTED\n' and not image.exists(), (field, target, result.stdout)
@@ -535,7 +515,7 @@ def main():
                     assert not image.exists()
                 # Negative control: the runtime assertion really compares all
                 # bits, rather than merely returning success unconditionally.
-                for target in range(4):
+                for target in range(3):
                     image = work / f'wrong-result-{target}'
                     result = call([runner, image, target, 'roundtrip', 'add', 1, 2, 4])
                     try:
@@ -544,7 +524,7 @@ def main():
                         assert 'external branch' in str(error), error
                     else:
                         raise AssertionError('bad expected result escaped independent comparison')
-                    execute(image, target, status=104, ignore_result=True)
+                    execute(image, target, status=104)
                     counts['negative_runtime_controls'] += 1
                 print('PASS semantic MIR scalar/frame/CFG oracle; explicit gaps and fuel limit', flush=True)
 
@@ -576,7 +556,7 @@ def main():
                     return image, report
 
                 for name, (source, output, status) in valid.items():
-                    for target in range(4):
+                    for target in range(3):
                         reports = []
                         images = []
                         for mode in ('off', 'on', 'opt'):
@@ -591,13 +571,13 @@ def main():
                         assert images[0] == images[1], (name, target, 'passthrough bytes changed')
                     print('PASS whole source off/on', name, flush=True)
                 for index, source in enumerate(invalid):
-                    for target in range(4):
+                    for target in range(3):
                         for checking in (False, True):
                             _, before = build(f'invalid-{index}', source, target, 'off', checking, True)
                             _, after = build(f'invalid-{index}', source, target, 'on', checking, True)
                             _, optimized = build(f'invalid-{index}', source, target, 'opt', checking, True)
                             assert before == after == optimized, (index, target, checking, before, after, optimized)
-                for target in range(4):
+                for target in range(3):
                     _, before = build('valid-check', valid['mixed-calls-loop'][0], target, 'off', True)
                     _, after = build('valid-check', valid['mixed-calls-loop'][0], target, 'on', True)
                     _, optimized = build('valid-check', valid['mixed-calls-loop'][0], target, 'opt', True)

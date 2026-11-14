@@ -2,7 +2,7 @@
 """Focused functional acceptance of the isolated parallel compiler.
 
 Compare jobs 1/2/4 images, source bindings, integer work counters, diagnostics
-and final-fragment caches. ARM64 macOS images and Wasm are actually executed;
+and final-fragment caches. ARM64 macOS images are actually executed;
 Linux targets are image-only. Timing JSON supplies counters only: durations
 are never compared or reported. This is not a latency or OS-overlap test.
 
@@ -26,29 +26,9 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-import wasm_host
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux', 'wasm32')
-WASM_RUNNER = r'''
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const module = new WebAssembly.Module(fs.readFileSync(process.argv[1]));
-const print = x => console.log(x.toString());
-let instance;
-instance = new WebAssembly.Instance(module, {dunder: {
-    print_i32: print, print_i64: print, print_f32: print, print_f64: print,
-    print_u32: x => print(x >>> 0), print_u64: x => print(BigInt.asUintN(64, x)),
-    print_bool: x => print(Boolean(x)), print_rune: x => print(String.fromCodePoint(x)),
-    print_string(p) {
-        const memory = instance.exports.memory.buffer;
-        const n = new DataView(memory).getUint32(p, true);
-        print(new TextDecoder('utf-8', {fatal: true}).decode(new Uint8Array(memory, p + 8, n)));
-    },
-}});
-const result = instance.exports.main();
-assert.ok(result === undefined || result === 0, 'main must return unit or status0');
-'''
+TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 CORE = {
     'arithmetic': ('''fn earlier(n:i64)->i64{var total:i64=0;for i in 0..8{total=total+n+i64(i)};total}
 fn later(n:i64)->i64{earlier(n)+1}
@@ -96,7 +76,7 @@ class Probe:
         self.log = []
         self.images = []
         self.contracts = []
-        self.executions = {'arm64-macos': 0, 'wasm32': 0}
+        self.executions = {'arm64-macos': 0}
         self.identities = {str(p): digest(p) for p in (compiler, baseline) if p is not None}
 
     def run(self, command, cwd, status=0):
@@ -144,8 +124,6 @@ class Probe:
     def execute(self, image, target, expected):
         if target == 'arm64-macos':
             command = [image]
-        elif target == 'wasm32':
-            command = [wasm_host.js_runtime(), '-e', WASM_RUNNER, image]
         else:
             return  # Linux images are never counted as executed coverage.
         result = self.run(command, image.parent)
@@ -222,7 +200,7 @@ fn step(x:i32)->i32{var s:=x;for i in 0..2{s=s+1};s}
 fn memory(x:i64)->i64{unsafe{p:=static_bytes("native",32);store_i64(p,x);load_i64(p)}}
 fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("literal")}}
 ''')
-        self.matrix(source, '45\n42\nliteral\n', TARGETS[:3])
+        self.matrix(source, '45\n42\nliteral\n', TARGETS)
 
     def saturation(self):
         source = 'fn step(x:i32)->i32{x+1}\n'
@@ -315,7 +293,7 @@ def main():
         (run / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         (run / 'commands.json').write_text(json.dumps(probe.log, indent=2) + '\n')
         print(('PASS' if passed else 'FAIL') + ' parallel compiler: ' + str(len(probe.images)) +
-              ' images, ' + str(sum(probe.executions.values())) + ' native/Wasm executions; ' + str(run))
+              ' images, ' + str(sum(probe.executions.values())) + ' native executions; ' + str(run))
 
 
 if __name__ == '__main__':

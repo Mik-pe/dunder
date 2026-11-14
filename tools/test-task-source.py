@@ -2,7 +2,7 @@
 """Actual source task scopes: typing, effects, lifetime, isolated copies and targets.
 
 No fake OS execution or latency measurements. First task provider supports
-unprofiled ARM64/macOS. Other native/Wasm targets are checked for refusal or
+unprofiled ARM64/macOS. Other native targets are checked for refusal or
 unreachable-feature compatibility, never reported as executed thread coverage.
 """
 import argparse
@@ -10,7 +10,9 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = 'fn work(n:i64)->i64 { n*n }\n'
 SCOPE = 'fn main(){task scope jobs(2){id:=spawn jobs work(7);print(await jobs(id))}}\n'
@@ -128,14 +130,14 @@ def main():
                 warm.write_text(safe.replace('n+1','print(n);n+1',1))
                 text=run([compiler,'build',warm,'-o',out/'stale',*flags],1);assert 'effects outside' in text
         path=out/'scalar_repeat.ddr' 
-        for target in ('arm64-linux','x86_64-linux','wasm32'):
+        for target in ('arm64-linux','x86_64-linux'):
             for command in ('build','check'):
                 cmd=[compiler,command,path,'--target',target]
                 if command=='build':cmd+=['-o',out/'unsupported']
                 text=run(cmd,1)
                 assert 'isolated tasks require ARM64/macOS' in text
         dormant=out/'unreachable.ddr';dormant.write_text('fn unused(){task scope j(1){}}\nfn main(){print(42)}\n')
-        for target in ('arm64-macos','arm64-linux','x86_64-linux','wasm32'):
+        for target in ('arm64-macos','arm64-linux','x86_64-linux'):
             run([compiler,'build',dormant,'--target',target,'-o',out/('unreachable-'+target)])
             run([compiler,'check',dormant,'--target',target])
         text=run([compiler,'build',path,'--runtime-profile','-o',out/'profiled'],1)

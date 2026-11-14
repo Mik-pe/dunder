@@ -2,7 +2,7 @@
 """Actual joint Frame+Expr SSA images and exact 62-column transaction QA.
 
 The independent physical interpreter knows the finite observer helper below,
-not arbitrary calls. Wasm resource guards are exercised by the actual engine.
+not arbitrary calls. All three native targets are built; the native host executes.
 There are no timings and no source/pipeline implementation changes here.
 """
 import argparse
@@ -16,10 +16,8 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('expr_region_qa', ROOT/'tools/test-mir-regions.py')
 region = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(region)
@@ -135,7 +133,7 @@ def transformed_model(model, helpers, case, value, control):
 
 
 def interpret(model, helpers, case, value, control):
-    if case in (16,17): return {'gap':'resource bounds exercised by actual Wasm; no fabricated OS mapping model'}
+    if case in (16,17): return {'gap':'resource bounds have no fabricated OS mapping model'}
     m=oracle.Interpreter(transformed_model(model,helpers,case,value,control),fuel=250000)
     m.variables.update({r:qa.seed(r)&MASK for r in range(31)})
     m.variables.update({0:SP+32,4:value&MASK,5:control&MASK,29:SP+32,31:SP})
@@ -191,7 +189,7 @@ def main():
     assert fields==observed,(fields-observed,observed-fields)
     report=dict(fields=len(fields),host=host,hashes={},images=[])
     for name,path in dict(compiler=compiler,fixture=fixture,adapter=adapter,support=support,ssa=ROOT/'selfhost/mir_ssa.ddr',expr=ROOT/'selfhost/mir_expr_stack.ddr',generic_oracle=ROOT/'tools/test-mir.py',tool=Path(__file__).resolve(),region_tool=ROOT/'tools/test-mir-regions.py').items(): report['hashes'][name]=region.digest(path)
-    with tempfile.TemporaryDirectory(prefix='dunder-expr-qa-') as tmp, wasm_host.WasmWorker() as wasm:
+    with tempfile.TemporaryDirectory(prefix='dunder-expr-qa-') as tmp:
         work=args.output.resolve() if args.output else Path(tmp)
         if args.output: work.mkdir(parents=True,exist_ok=True);assert not any(work.iterdir())
         def call(command,status=0):
@@ -220,33 +218,28 @@ def main():
                 if case==19: assert c['captures']>0,c
             elif case not in (15,18,19): assert not c['changed'] and c['pushes']==c['pops']==0,(NAMES[case],c)
             trap=case==7 or (case==14 and control==0)
-            resource=case==17 or (case==16 and not c['changed'])
             ran=False
             if target==host and case!=17: call([image],102 if trap else 0);ran=True
-            elif target==3:
-                expected_wasm = 125 if trap or resource else (77 if case==16 else 0)
-                wres = wasm.run(image)
-                assert wres.returncode == expected_wasm, (image, wres.returncode, expected_wasm, wres.stdout, wres.stderr)
-                ran=True
             if args.output:image.with_suffix('.mir.txt').write_text(text)
             report['images'].append(dict(case=case,name=NAMES[case],input=value,control=control,target=target,mode=mode,origin=origin,storage=storage,terminal=terminal,limit=limit,executed=ran,sha256=region.digest(image),counters=c,before_traffic=before,after_traffic=after,before=pre,after=post))
             return c
         samples=[x for x in corpus() if args.case is None or x[0]==args.case]
         for index,(case,value,control) in enumerate(samples):
-            for target in ((3,) if case==17 else range(4)):
+            if case==17: continue
+            for target in range(3):
                 one(case,value,control,target,'off')
                 one(case,value,control,target,'on',storage=0)
                 one(case,value,control,target,'on',origin=0)
                 one(case,value,control,target,'on')
             print(f'PASS {index+1}/{len(samples)} {NAMES[case]} input{value} control{control}',flush=True)
-        for case,value,control in ((1,41,9),(5,41,1),(6,41,7),(15,41,9),(18,41,9),(19,41,9),(16,41,0)):
+        for case,value,control in ((1,41,9),(5,41,1),(6,41,7),(15,41,9),(18,41,9),(19,41,9)):
             if args.case is not None and args.case!=case:continue
-            for target in ((3,) if case==16 else (host,3)):
+            for target in (host,):
                 full=one(case,value,control,target,'on',label='-budget-base')
                 for limit in sorted({0,1,max(1,full['units']//2),max(1,full['units']-1)}):one(case,value,control,target,'on',limit=limit,label='-budget')
-    report.update(images_built=len(report['images']),executions=sum(x['executed'] for x in report['images']),independent_pairs=sum('gap' not in x['before'] for x in report['images']),coverage_limits=['Wasm lower/upper resource guards exercised by actual engine, no OS mapping fiction','Linux ARM/x86 build only on macOS host','guard_upper intentionally executed only on Wasm'])
+    report.update(images_built=len(report['images']),executions=sum(x['executed'] for x in report['images']),independent_pairs=sum('gap' not in x['before'] for x in report['images']),coverage_limits=['lower resource guard has no fabricated OS mapping model','Linux ARM/x86 build only on macOS host'])
     if args.report:args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
-    print(f'{report["images_built"]} images; {report["executions"]} native/Wasm executions; {report["independent_pairs"]} independent exact-bit pairs; no timings')
+    print(f'{report["images_built"]} images; {report["executions"]} native executions; {report["independent_pairs"]} independent exact-bit pairs; no timings')
 
 
 if __name__=='__main__':main()

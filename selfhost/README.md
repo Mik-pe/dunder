@@ -248,14 +248,15 @@ en `opaque struct` eller öppna ett fält i säker kod. Den kontrollen sker vid
 typkontroll av funktionskroppen, även om programmet aldrig anropar den.
 [Filhandtag och legacy-API:er](../docs/ffi.md#filåtkomst-genom-delegerade-handtag)
 
-### Wasm32 från den självbyggda kompilatorn
+### Wasm32 från den självbyggda kompilatorn (senarelagt i testmatrisen)
 
-Den självbyggda kompilatorn kan skriva en modul för Bun, Node eller webbläsaren.
+Den självbyggda kompilatorn behåller Wasm-backenden i `selfhost/wasm_*.ddr`, men
+Wasm-testsviter och JS-runtimeberoenden är **senarelagda** under pågående
+språkutveckling så att utvecklings- och verifieringsloopen körs rent nativt.
 
 ```sh
 ./tools/bootstrap.sh
 build/selfhost/arm64-macos/dunder build examples/hello.ddr --target wasm32 -o hello.wasm
-bun tools/test-wasm.mjs build/selfhost/arm64-macos/dunder
 ```
 
 Välj värdens katalog under `build/selfhost/`. Kompilatorn använder samma
@@ -320,10 +321,6 @@ dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" test tests/suite.ddr
 "$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin"
-bun tools/test-wasm.mjs "$dunder_bin"
-bun tools/test-wasm-abi.mjs "$dunder_bin"
-bun tools/test-wasm-scalars.mjs "$dunder_bin"
-python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
 ```
 
 De körda programmen har förväntade värden, utskrifter och felutfall.
@@ -335,6 +332,6 @@ skriva en egen startpunkt med `build-tests`.
 
 ```sh
 "$dunder_bin" build-tests tests/suite.ddr --list
-"$dunder_bin" build-tests tests/suite.ddr --group 0 --target wasm32 -o group.wasm
-bun tools/test-wasm.mjs --execute group.wasm
+"$dunder_bin" build-tests tests/suite.ddr --group 0 -o build/group0
+./build/group0
 ```

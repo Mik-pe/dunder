@@ -9,8 +9,6 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'tools'))
-import wasm_host
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('compiler', type=Path)
 args = parser.parse_args()
@@ -67,7 +65,7 @@ probes = [
     ('dead_length_spill', '{if p1>=0&&p1<p0.len{return p0[p1]};return 0}', 'mapped-length', normal, 2, 3, {'off': 768, 'on': 256}, {'off': 10, 'on': 4}),
 ]
 
-with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory, wasm_host.WasmWorker() as wasm:
+with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory:
     work = Path(directory)
     harness = work / 'emitter'
     built = subprocess.run([compiler, 'build', ROOT / 'tests/fixtures/array-address-emitter.ddr', '-o', harness], capture_output=True, timeout=60)
@@ -85,19 +83,16 @@ with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory,
         if target == host:
             run = subprocess.run([image], capture_output=True, timeout=10)
             assert run.returncode == status, (name, target, proof, run.returncode, status, run.stderr)
-        if target == 3:
-            run = wasm.run(image)
-            assert run.returncode == (125 if status else 0), (name, target, proof, run.returncode, status, run.stderr)
         return fields
 
     for name, body, layout, arguments, expected, status, length, pushes, addr9, direct in stores:
-        for target in range(4):
+        for target in range(3):
             for proof in ('off', 'on'):
                 fields = generate(name, body, target, proof, 'function', layout, arguments, 2, expected, status, length)
                 assert (fields[2], fields[4], fields[5]) == (pushes, addr9, direct), (name, target, proof, fields)
-        print('PASS store', name, 'exact address/preservation words; four targets; native/Wasm executed', flush=True)
+        print('PASS store', name, 'exact address/preservation words; three targets; native executed', flush=True)
     for name, body, layout, arguments, ret, expected, masks, words in probes:
-        for target in range(4):
+        for target in range(3):
             for proof in ('off', 'on'):
                 fields = generate(name, body, target, proof, 'probe', layout, arguments, ret, expected, 0)
                 assert fields[1] & 768 == masks[proof], (name, target, proof, fields)
@@ -107,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory,
                     assert fields[6] == 0, (name, 'unreported x8 write', fields)
                 if not masks[proof] & 512:
                     assert fields[7] == 0, (name, 'unreported x9 write', fields)
-        print('PASS probe', name, 'actual x8/x9 sentinels and write words; four targets', flush=True)
+        print('PASS probe', name, 'actual x8/x9 sentinels and write words; three targets', flush=True)
     source = work / 'unknown.ddr'
     source.write_text('p0 p1 p2 p3 p4 p5 p6 p7 {p2}')
     for mode in ('unknown', 'depth'):
@@ -115,4 +110,4 @@ with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory,
         result = subprocess.run(command, capture_output=True, timeout=10)
         assert result.returncode == 0 and result.stdout == b'-1\n', (mode, result.returncode, result.stdout, result.stderr)
         print('PASS conservative', mode, flush=True)
-print(f'{len(stores)} store cases + {len(probes)} scratch probes; all four target images; native/Wasm executed')
+print(f'{len(stores)} store cases + {len(probes)} scratch probes; all three target images; native executed')
