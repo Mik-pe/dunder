@@ -44,6 +44,14 @@ dunder run examples/hello.ddr
 dunder test
 ```
 
+För att installera kompilatorn lokalt i `~/.dunder/bin/dunder` (välj annan rot med
+`DUNDER_HOME`):
+
+```sh
+./tools/install.sh
+export PATH="$HOME/.dunder/bin:$PATH"
+```
+
 På ARM64/macOS verifierar skriptet först en seriell fixpunkt från fröet och
 bygger sedan den taskbaserade kompilatorn med byteidentiska självbyggen för
 `--jobs=1` och `--jobs=4`. Den publicerade `dunder` använder fyra workers som
