@@ -1,7 +1,7 @@
 // This entry is built by a task-capable serial compiler, outside the frozen
 // seed dependency graph. Frontend traversal and publication have one owner.
-// A bounded task scope owns each window's snapshots/results until ordered
-// acceptance is finished, then releases them before the next window starts.
+// A single bounded task scope reuses worker arenas and streams batches in
+// FIFO order, releasing each snapshot and worker pool on await.
 import compile as compiler
 import lexer
 import mir
@@ -27,15 +27,28 @@ fn failure(message: string) -> compiler.Result {
     compiler.Result { ok: false, error: message, offset: 0, text: [],
         imports: compiler.Imports { globals: 0, libraries: [], symbols: [], sites: [], slots: [] } }
 }
-fn accept_answer(session: &mut compiler.Session, link: &mut mir_link.Linker,
-    object: &mut mir_lower.FunctionObject, ordinal: i32, declaration: i32, answer: &mir_task.Answer) -> bool {
-    var status := answer.status
-    if answer.ordinal != ordinal || answer.declaration != declaration { status.error = 8 }
-    // The task scope and ordinal/declaration sidecars authenticate this result.
-    // Data import validates its complete structure; it is not a second lowering
-    // or a semantic certificate for arbitrary worker-supplied executable words.
-    if status.error == 0 && !mir_lower.from_data_into(&mut object, &answer.object) { status.error = 8 }
-    compiler.accept_into(&mut session, &mut link, ordinal, &object, &status)
+fn accept_batch(session: &mut compiler.Session, link: &mut mir_link.Linker,
+    object: &mut mir_lower.FunctionObject, data: &mut mir_lower.ObjectData,
+    status: &mut pipeline.Status, answer: &mir_task.BatchAnswer,
+    ordinals: &[]i32, declarations: &[]i32, item_offset: i32) -> i32 {
+    count := mir_task.answer_len(&answer)
+    var cursor := item_offset
+    for i in 0..count {
+        if cursor >= ordinals.len { return -1 }
+        expected_ordinal := ordinals[cursor]
+        expected_declaration := declarations[cursor]
+        cursor = cursor + 1
+        mir_task.unpack_answer(&answer, i, &mut data, &mut status)
+        if mir_task.answer_ordinal(&answer, i) != expected_ordinal || mir_task.answer_declaration(&answer, i) != expected_declaration {
+            status.error = 8
+        }
+        // The task scope and ordinal/declaration sidecars authenticate each item.
+        // Data import validates its complete structure; it is not a second lowering
+        // or a semantic certificate for arbitrary worker-supplied executable words.
+        if status.error == 0 && !mir_lower.from_data_into(&mut object, &data) { status.error = 8 }
+        if !compiler.accept_into(&mut session, &mut link, expected_ordinal, &object, &status) { return -1 }
+    }
+    cursor
 }
 
 pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32,
@@ -77,51 +90,74 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32,
     ordinary := empty_status()
     var backend_failed := false
     var source_failed := false
-    while !compiler.source_done(&session) && !backend_failed && !source_failed {
-        task scope jobs(config.workers) {
-            var keys: []TaskID<mir_task.Answer> = []
-            var ordinals: []i32 = []
-            var declarations: []i32 = []
-            var produced := 0
-            var read := 0
-            var flush := false
-            var cached := false
-            var cached_ordinal := -1
-            while !backend_failed {
-                if (flush || produced == config.workers) && read < keys.len {
-                    answer := await jobs(keys[read])
-                    if !accept_answer(&mut session, &mut link, &mut lowered,
-                        ordinals[read], declarations[read], &answer) { backend_failed = true }
-                    read = read + 1
-                    continue
+    var batch := mir_task.new_batch(options, terminals)
+    var data_scratch := mir_lower.new_data()
+    var status_scratch := empty_status()
+    task scope jobs(config.workers) {
+        var keys: []TaskID<mir_task.BatchAnswer> = []
+        var item_ordinals: []i32 = []
+        var item_declarations: []i32 = []
+        var read := 0
+        var item_read := 0
+        var spawned_items := 0
+        var need_spawn := false
+        var flush := false
+        var cached := false
+        var cached_ordinal := -1
+        var done := false
+        while !backend_failed {
+            if need_spawn && keys.len - read < config.workers {
+                keys.push(spawn jobs mir_task.execute_batch(batch))
+                spawned_items = spawned_items + mir_task.batch_len(&batch)
+                mir_task.reset_batch(&mut batch)
+                need_spawn = false
+                continue
+            }
+            if (need_spawn || flush) && read < keys.len {
+                answer := await jobs(keys[read])
+                read = read + 1
+                next_item := accept_batch(&mut session, &mut link, &mut lowered,
+                    &mut data_scratch, &mut status_scratch, &answer,
+                    &item_ordinals, &item_declarations, item_read)
+                if next_item < 0 { backend_failed = true; break }
+                item_read = next_item
+                continue
+            }
+            if flush {
+                if cached {
+                    if !compiler.accept_into(&mut session, &mut link, cached_ordinal,
+                        &final_object, &ordinary) { backend_failed = true; break }
+                    cached = false
                 }
-                if flush {
-                    if cached {
-                        if !compiler.accept_into(&mut session, &mut link, cached_ordinal,
-                            &final_object, &ordinary) { backend_failed = true }
-                        cached = false
-                    }
-                    if source_failed || compiler.source_done(&session) || backend_failed { break }
-                    flush = false
-                }
-                if produced == config.workers { break }
-                state := compiler.next_into(&mut session, &mut function, &mut final_object,
-                    &mut lifter, &mut model, &mut verifier, &mut plan, &mut machine, &settings,
-                    &mut range_work, &catalog, &mut inline_work, &mut restored)
-                produced = produced + 1
-                if state == 1 {
-                    ordinal := compiler.current_ordinal(&session)
-                    declaration := compiler.current_declaration(&session)
-                    keys.push(spawn jobs mir_task.execute(mir_task.Job {
-                        ordinal: ordinal, declaration: declaration, function: function,
-                        options: options, terminals: terminals }))
-                    ordinals.push(ordinal); declarations.push(declaration)
-                } else if state == 2 {
-                    cached = true; cached_ordinal = compiler.current_ordinal(&session); flush = true
-                } else {
+                if source_failed || done || compiler.source_done(&session) { break }
+                flush = false
+            }
+            if compiler.source_done(&session) {
+                if mir_task.batch_len(&batch) > 0 { need_spawn = true }
+                flush = true
+                done = true
+                continue
+            }
+            state := compiler.next_into(&mut session, &mut function, &mut final_object,
+                &mut lifter, &mut model, &mut verifier, &mut plan, &mut machine, &settings,
+                &mut range_work, &catalog, &mut inline_work, &mut restored)
+            if state == 1 {
+                ordinal := compiler.current_ordinal(&session)
+                declaration := compiler.current_declaration(&session)
+                item_ordinals.push(ordinal)
+                item_declarations.push(declaration)
+                mir_task.push_batch(&mut batch, ordinal, declaration, &function)
+                var target := 2
+                if spawned_items >= config.workers * 8 { target = 8 }
+                if mir_task.batch_len(&batch) >= target { need_spawn = true }
+            } else {
+                if state == 2 { cached = true; cached_ordinal = compiler.current_ordinal(&session) }
+                else {
                     if state < 0 { source_failed = true }
-                    flush = true
+                    done = true
                 }
+                if mir_task.batch_len(&batch) > 0 && !source_failed { need_spawn = true }
+                flush = true
             }
         }
     }

@@ -16,8 +16,14 @@ import mir_value_prop as values
 pub opaque struct Workspace {
     verifier: verify.Workspace, optimizer: frame.Workspace, ssa: ssa.Workspace, values: values.Workspace,
 }
+pub opaque struct CoreWorkspace {
+    verifier: verify.Workspace, optimizer: frame.Workspace, values: values.Workspace,
+}
 pub fn new() -> Workspace {
     Workspace { verifier: verify.new_work(), optimizer: frame.new(), ssa: ssa.new(), values: values.new() }
+}
+pub fn new_core() -> CoreWorkspace {
+    CoreWorkspace { verifier: verify.new_work(), optimizer: frame.new(), values: values.new() }
 }
 // source_objects is an EXPLICIT trusted source-producer premise, version1:
 // indirect accesses obey object lifetimes/ranges and cannot access unexposed
@@ -85,15 +91,12 @@ fn complete(f: &mir.Function, result: &mut Status) {
     result.stats.operations = f.order.len
     for op in 0..f.kinds.len { if f.kinds[op] == 0 { result.stats.opaque = result.stats.opaque + 1 } }
 }
-fn optimize_values(f: &mut mir.Function, w: &mut Workspace, config: &Options, exits: &Terminals) -> i32 {
+fn optimize_values_work(f: &mut mir.Function, val_work: &mut values.Workspace, config: &Options, exits: &Terminals) -> i32 {
     if exits.version == 0 {
-        changed := values.optimize_budget(&mut w.values, &mut f, config.value_budget)
+        changed := values.optimize_budget(&mut val_work, &mut f, config.value_budget)
         if changed && !f.verified { return 4 }; return 0
     }
     if exits.version != 1 { return 6 }
-    // This tiny Context is a separate root, never a borrow of Workspace while
-    // one of its stage arenas is borrowed mutably. Its six labels are bounded;
-    // all expensive verifier/analysis arrays remain reused in Workspace.
     var context := values.context(1)
     if !values.declare_unobserving_terminal(&mut context, exits.overflow) ||
         !values.declare_unobserving_terminal(&mut context, exits.zero) ||
@@ -101,37 +104,74 @@ fn optimize_values(f: &mut mir.Function, w: &mut Workspace, config: &Options, ex
         !values.declare_unobserving_terminal(&mut context, exits.io) ||
         !values.declare_unobserving_terminal(&mut context, exits.bounds) ||
         !values.declare_unobserving_terminal(&mut context, exits.float_trap) { return 6 }
-    changed := values.optimize_with_context_budget(&mut w.values, &mut f, &context, config.value_budget)
+    changed := values.optimize_with_context_budget(&mut val_work, &mut f, &context, config.value_budget)
     if changed && !f.verified { return 4 }; 0
+}
+fn run_frame_pass(f: &mut mir.Function, optimizer: &mut frame.Workspace, config: &Options, exits: &Terminals, result: &mut Status) -> bool {
+    var terminals := terms.no_terminals()
+    terminals.version = exits.version; terminals.overflow = exits.overflow; terminals.zero = exits.zero
+    terminals.assertion = exits.assertion; terminals.io = exits.io
+    terminals.bounds = exits.bounds; terminals.float_trap = exits.float_trap
+    if !terms.valid(&terminals) { result.error = 6; return false }
+    context := memory.for_source_producer(config.source_objects)
+    calls := call_abi.for_source_producer(config.source_abi)
+    prepared := frame.analyze_with_contracts_budget(&mut optimizer, &f, &context, &terminals, &calls, config.frame_budget)
+    result.frame_state = frame.status(&optimizer)
+    result.stats.analysis_units = i64(frame.units(&optimizer))
+    if prepared {
+        frame.apply(&mut optimizer, &mut f)
+        result.frame_state = frame.status(&optimizer)
+        result.stats.optimized = 1
+        result.stats.promoted = frame.promoted(&optimizer)
+        result.stats.removed_loads = frame.removed_loads(&optimizer)
+        result.stats.removed_stores = frame.removed_stores(&optimizer)
+        result.stats.private_memory_ops = frame.private_memory_ops(&optimizer)
+        return true
+    } else if result.frame_state == -3 { result.stats.budget_refusals = 1 }
+    else if result.frame_state != -2 { result.error = 3 }
+    false
+}
+fn run_post_ssa(f: &mut mir.Function, val_work: &mut values.Workspace, config: &Options, exits: &Terminals, result: &mut Status) {
+    if !config.values { complete(&f, &mut result); return }
+    result.error = optimize_values_work(&mut f, &mut val_work, &config, &exits)
+    if result.error == 6 { return }
+    result.value_state = values.status(&val_work)
+    result.stats.value_analysis_units = i64(values.units(&val_work))
+    if result.error != 0 { return }
+    if result.value_state == 2 {
+        result.stats.values_optimized = 1
+        result.stats.value_rewrites = values.rewritten(&val_work)
+        result.stats.value_deleted = values.deleted(&val_work)
+        result.stats.value_immediates = values.constant_immediates(&val_work)
+    } else if result.value_state == -3 { result.stats.value_budget_refusals = 1 }
+    else if result.value_state != 0 && result.value_state != -2 { result.error = 5 }
+    complete(&f, &mut result)
+}
+pub fn run_core_into(f: &mut mir.Function, w: &mut CoreWorkspace, config: &Options, exits: &Terminals) -> Status {
+    var result := status()
+    if config.ssa { result.error = 9; return result }
+    if !verify.verify_into(&mut f, &mut w.verifier) { result.error = 1; return result }
+    if !config.optimize { complete(&f, &mut result); return result }
+    applied := run_frame_pass(&mut f, &mut w.optimizer, &config, &exits, &mut result)
+    if result.error != 0 { return result }
+    if applied && !verify.verify_into(&mut f, &mut w.verifier) { result.error = 2; return result }
+    run_post_ssa(&mut f, &mut w.values, &config, &exits, &mut result)
+    result
 }
 pub fn run_into(f: &mut mir.Function, w: &mut Workspace, config: &Options, exits: &Terminals) -> Status {
     var result := status()
     if !verify.verify_into(&mut f, &mut w.verifier) { result.error = 1; return result }
     if !config.optimize { complete(&f, &mut result); return result }
-    // This separate numeric root carries only explicit caller-owned exit
-    // declarations. NoReturn or an external edge alone grants no exemption.
-    var terminals := terms.no_terminals()
-    terminals.version = exits.version; terminals.overflow = exits.overflow; terminals.zero = exits.zero
-    terminals.assertion = exits.assertion; terminals.io = exits.io
-    terminals.bounds = exits.bounds; terminals.float_trap = exits.float_trap
-    if !terms.valid(&terminals) { result.error = 6; return result }
-    context := memory.for_source_producer(config.source_objects)
-    calls := call_abi.for_source_producer(config.source_abi)
-    prepared := frame.analyze_with_contracts_budget(&mut w.optimizer, &f, &context, &terminals, &calls, config.frame_budget)
-    result.frame_state = frame.status(&w.optimizer)
-    result.stats.analysis_units = i64(frame.units(&w.optimizer))
-    if prepared {
-        frame.apply(&mut w.optimizer, &mut f)
-        result.frame_state = frame.status(&w.optimizer)
-        if !verify.verify_into(&mut f, &mut w.verifier) { result.error = 2; return result }
-        result.stats.optimized = 1
-        result.stats.promoted = frame.promoted(&w.optimizer)
-        result.stats.removed_loads = frame.removed_loads(&w.optimizer)
-        result.stats.removed_stores = frame.removed_stores(&w.optimizer)
-        result.stats.private_memory_ops = frame.private_memory_ops(&w.optimizer)
-    } else if result.frame_state == -3 { result.stats.budget_refusals = 1 }
-    else if result.frame_state != -2 { result.error = 3; return result }
+    applied := run_frame_pass(&mut f, &mut w.optimizer, &config, &exits, &mut result)
+    if result.error != 0 { return result }
+    if applied && !verify.verify_into(&mut f, &mut w.verifier) { result.error = 2; return result }
     if config.ssa {
+        context := memory.for_source_producer(config.source_objects)
+        calls := call_abi.for_source_producer(config.source_abi)
+        var terminals := terms.no_terminals()
+        terminals.version = exits.version; terminals.overflow = exits.overflow; terminals.zero = exits.zero
+        terminals.assertion = exits.assertion; terminals.io = exits.io
+        terminals.bounds = exits.bounds; terminals.float_trap = exits.float_trap
         var inputs := call_inputs.conservative()
         if config.source_inputs { inputs = call_inputs.trusted_source_inputs_v1() }
         // Origin alone grants no stack elision. Only the complete producer may
@@ -165,20 +205,6 @@ pub fn run_into(f: &mut mir.Function, w: &mut Workspace, config: &Options, exits
             else if state != 0 && state != -2 { result.error = 9; return result }
         }
     }
-    if !config.values { complete(&f, &mut result); return result }
-    result.error = optimize_values(&mut f, &mut w, &config, &exits)
-    if result.error == 6 { return result }
-    result.value_state = values.status(&w.values)
-    result.stats.value_analysis_units = i64(values.units(&w.values))
-    if result.error != 0 { return result }
-    if result.value_state == 2 {
-        // The value transaction owns its mandatory final full verifier. Do not
-        // substitute a cached certificate or add a second wrapper verifier.
-        result.stats.values_optimized = 1
-        result.stats.value_rewrites = values.rewritten(&w.values)
-        result.stats.value_deleted = values.deleted(&w.values)
-        result.stats.value_immediates = values.constant_immediates(&w.values)
-    } else if result.value_state == -3 { result.stats.value_budget_refusals = 1 }
-    else if result.value_state != 0 && result.value_state != -2 { result.error = 5 }
-    complete(&f, &mut result); result
+    run_post_ssa(&mut f, &mut w.values, &config, &exits, &mut result)
+    result
 }
