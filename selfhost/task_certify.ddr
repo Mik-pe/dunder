@@ -1,0 +1,168 @@
+// Task effect graph, Data isolation certification, and native task prefix
+// emission for structured task scopes. Serial seed-compatible module.
+import arm64 as arm
+import frontend_types as ft
+import runtime
+import task_data
+import task_effects
+import task_native
+import task_scope_emit
+
+pub struct TaskCertificate {
+    safe: []bool, inputs: []bool, outputs: []bool, workers: []bool, runtime: bool, at: i32,
+}
+
+pub fn task_certificate() -> TaskCertificate {
+    TaskCertificate { safe: [], inputs: [], outputs: [], workers: [], runtime: false, at: 0 }
+}
+
+pub struct TaskGraph {
+    program: bool, certifying: bool, current: i32,
+    direct: []i64, complete: []bool, edges_from: []i32, edges_to: []i32,
+    spawn_workers: []i32, spawn_callers: []i32, spawn_ats: []i32,
+    uses: []bool, use_ats: []i32, reachable: []bool, safe: []bool,
+    handles: []i32, loop_locals: []i32, spawners: []i32,
+    open: i32, await_result: i32, close: i32, coordinator: i32, trap: i32,
+}
+
+pub fn new_graph() -> TaskGraph {
+    TaskGraph {
+        program: false, certifying: false, current: -1,
+        direct: [], complete: [], edges_from: [], edges_to: [],
+        spawn_workers: [], spawn_callers: [], spawn_ats: [],
+        uses: [], use_ats: [], reachable: [], safe: [],
+        handles: [], loop_locals: [], spawners: [],
+        open: -1, await_result: -1, close: -1, coordinator: -1, trap: -1,
+    }
+}
+
+pub fn record_effect(g: &mut TaskGraph, bits: i64) {
+    if g.certifying && g.current >= 0 {
+        g.direct[g.current] = g.direct[g.current].bit_or(bits)
+    }
+}
+
+pub fn record_edge(g: &mut TaskGraph, callee: i32) {
+    if g.certifying && g.current >= 0 {
+        g.edges_from.push(g.current); g.edges_to.push(callee)
+    }
+}
+
+pub fn record_use(g: &mut TaskGraph, at: i32) {
+    record_effect(&mut g, 1024)
+    if g.certifying && g.current >= 0 {
+        g.uses[g.current] = true
+        if g.use_ats[g.current] < 0 { g.use_ats[g.current] = at }
+    }
+}
+
+pub fn prepare_functions(g: &mut TaskGraph, libraries: &[]string) {
+    for f in 0..libraries.len {
+        g.direct.push(0); g.complete.push(false); g.uses.push(false)
+        g.use_ats.push(-1); g.spawners.push(-1)
+        if libraries[f] != "" { g.direct[f] = 32; g.complete[f] = true }
+    }
+}
+
+pub fn certify(g: &TaskGraph, reg: &ft.TypeRegistry, token_starts: &[]i32,
+    fn_count: i32, param_starts: &[]i32, param_counts: &[]i32, param_types: &[]i32,
+    returns: &[]i32, certificate: &mut TaskCertificate, error_cursor: &mut i32) -> string {
+    var data := task_data.new(); var effects := task_effects.new()
+    var primitives: []i32 = []; var complete: []bool = []; var classes: []i32 = []
+    primitives.reserve(reg.type_kinds.len); complete.reserve(reg.type_kinds.len); classes.reserve(reg.type_kinds.len)
+    for ty in 0..reg.type_kinds.len {
+        primitives.push(task_data.compiler_primitive_code(reg.type_kinds[ty], ty)); complete.push(true)
+        var classification := 0; if reg.opaque_owner[ty] >= 0 { classification = 1 }; classes.push(classification)
+    }
+    if !task_data.analyze_into(&mut data, &reg.type_kinds, &reg.type_bases, &reg.type_starts, &reg.type_counts,
+        &reg.field_types, &primitives, &complete, &reg.c_record, &reg.opaque_owner, &classes) {
+        return "internal isolated task Data metadata failure"
+    }
+    var counts: []i32 = []; var starts: []i32 = [0]; var fill: []i32 = []; var targets: []i32 = []
+    counts.reserve(fn_count); starts.reserve(fn_count + 1); fill.reserve(fn_count)
+    for f in 0..fn_count { counts.push(0) }
+    for e in 0..g.edges_from.len {
+        from := g.edges_from[e]; counts[from] = counts[from] + 1; targets.push(-1)
+    }
+    for f in 0..fn_count { starts.push(starts[f] + counts[f]); fill.push(starts[f]) }
+    for e in 0..g.edges_from.len {
+        from := g.edges_from[e]; targets[fill[from]] = g.edges_to[e]; fill[from] = fill[from] + 1
+    }
+    if !task_effects.analyze_into(&mut effects, &g.direct, &g.complete, &starts, &targets) {
+        return "isolated task effect analysis exceeded its resource limit"
+    }
+    for f in 0..fn_count {
+        certificate.safe.push(task_effects.worker_safe(&effects, f)); certificate.workers.push(false)
+        var input := false
+        if param_counts[f] == 1 { input = task_data.is_data(&data, param_types[param_starts[f]]) }
+        certificate.inputs.push(input); certificate.outputs.push(task_data.is_data(&data, returns[f]))
+        if g.reachable[f] && g.uses[f] && !certificate.runtime {
+            certificate.runtime = true; certificate.at = token_starts[g.use_ats[f]]
+        }
+    }
+    for s in 0..g.spawn_workers.len {
+        worker := g.spawn_workers[s]; error_cursor = g.spawn_ats[s]
+        if !certificate.inputs[worker] { return "task worker input must be isolated Data" }
+        if !certificate.outputs[worker] { return "task worker result must be isolated Data" }
+        if !certificate.safe[worker] { return "task worker has effects outside its isolated runtime" }
+        if g.reachable[g.spawn_callers[s]] { certificate.workers[worker] = true }
+    }
+    ""
+}
+
+pub struct PrefixPlan {
+    worker_ids: []i32, fn_labels: []i32, results: []i32,
+    input_clones: []i32, input_drops: []i32, result_clones: []i32, result_drops: []i32,
+}
+
+pub struct PrefixOutput {
+    ok: bool, error: string, trap: i32, coordinator: i32, open: i32, await_result: i32, close: i32,
+    spawners: []i32, import_sites: []i32, import_slots: []i32, import_globals: i32,
+}
+
+pub fn build_prefix_plan(certificate: &TaskCertificate, reg: &ft.TypeRegistry,
+    param_starts: &[]i32, param_types: &[]i32, returns: &[]i32, fn_labels: &[]i32) -> PrefixPlan {
+    var plan := PrefixPlan { worker_ids: [], fn_labels: [], results: [],
+        input_clones: [], input_drops: [], result_clones: [], result_drops: [] }
+    for f in 0..certificate.workers.len {
+        if !certificate.workers[f] { continue }
+        input := param_types[param_starts[f]]; result := returns[f]
+        var input_clone := -1; var input_drop := -1; var result_clone := -1; var result_drop := -1
+        if ft.owned(&reg, input) { input_clone = reg.type_clones[input]; input_drop = reg.type_drops[input] }
+        if ft.owned(&reg, result) { result_clone = reg.type_clones[result]; result_drop = reg.type_drops[result] }
+        plan.worker_ids.push(f); plan.fn_labels.push(fn_labels[f]); plan.results.push(result)
+        plan.input_clones.push(input_clone); plan.input_drops.push(input_drop)
+        plan.result_clones.push(result_clone); plan.result_drops.push(result_drop)
+    }
+    plan
+}
+
+pub fn emit_prefix(code: &mut arm.Code, rt: &runtime.Runtime, plan: &PrefixPlan,
+    symbol_count: i32, create: i32, join: i32, unmap: i32, globals: i32) -> PrefixOutput {
+    symbols := task_native.Symbols { symbol_count: symbol_count, pthread_create: create, pthread_join: join, munmap: unmap }
+    var out := PrefixOutput { ok: false, error: "", trap: -1, coordinator: -1, open: -1, await_result: -1, close: -1,
+        spawners: [], import_sites: [], import_slots: [], import_globals: globals }
+    out.trap = arm.label(&mut code); arm.mark(&mut code, out.trap); arm.exit(&mut code, 112)
+    out.coordinator = (out.import_globals + 15) / 16 * 16
+    if out.coordinator < 64 { out.coordinator = 64 }
+    out.import_globals = out.coordinator + task_scope_emit.coordinator_bytes()
+    emitted := task_scope_emit.emit_runtime(&mut code, &rt, out.trap)
+    if !emitted.ok { out.error = emitted.error; return out }
+    out.open = emitted.open; out.await_result = emitted.await_result; out.close = emitted.close
+    for w in 0..plan.worker_ids.len {
+        input_clone := plan.input_clones[w]; input_drop := plan.input_drops[w]
+        result_clone := plan.result_clones[w]; result_drop := plan.result_drops[w]
+        spec := task_native.TaskSpec { input_clone: input_clone, worker: plan.fn_labels[w], result_clone: result_clone }
+        native := task_native.emit(&mut code, &rt, &spec, &symbols)
+        if !native.ok { out.error = native.error; return out }
+        for i in 0..native.import_sites.len { out.import_sites.push(native.import_sites[i]); out.import_slots.push(native.import_slots[i]) }
+        kind_spec := task_scope_emit.KindSpec { result_type: plan.results[w], create: native.create, collect: native.collect, discard: native.discard,
+            input_clone: input_clone, input_drop: input_drop, result_clone: result_clone, result_drop: result_drop }
+        offset := (out.import_globals + 15) / 16 * 16; out.import_globals = offset + task_scope_emit.kind_bytes()
+        kind := task_scope_emit.emit_kind(&mut code, &emitted, &kind_spec, -1 - offset)
+        if !kind.ok { out.error = kind.error; return out }
+        out.spawners.push(kind.spawn)
+        for i in 0..kind.import_sites.len { out.import_sites.push(kind.import_sites[i]); out.import_slots.push(kind.import_slots[i]) }
+    }
+    out.ok = true; out
+}
