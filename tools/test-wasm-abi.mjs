@@ -39,7 +39,7 @@ try {
         },
     } });
     assert.equal(instance.exports.main(), 73); assert.equal(lateCallback(98), 99);
-    const scene = compile('dogfood/webgpu/main.ddr');
+    const scene = compile('tests/fixtures/wasm_webgpu_abi.ddr');
     let draws = 0;
     instance = new WebAssembly.Instance(scene, { webgpu: { draw(surface, p, count) {
         assert.equal(surface, 1); assert.equal(count, 3);

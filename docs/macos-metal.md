@@ -1,13 +1,13 @@
 # macOS och Metal från Dunder
 
-Programmen i `dogfood/metal/` använder `import ..graphics.macos as macos`
+Programmen i `dunder-hundmat` (`dogfood/metal/`) använder `import ..graphics.macos as macos`
 för att öppna ett AppKit-fönster och rita en triangelista med Metal.
-Ingången är [dogfood/graphics/macos.ddr](../dogfood/graphics/macos.ddr).
+Ingången är `dogfood/graphics/macos.ddr` i syskonrepot `dunder-hundmat`.
 Ett eget projekt kan kopiera `macos.ddr` och dess syskonkatalog `macos/`
 till `graphics/` bredvid sin `main.ddr` och använda `import graphics.macos as macos`.
 
 AppKit-delegaten, händelsepollningen och Metal-kommandona ligger i
-[exempelmodulens källfiler](../dogfood/graphics/macos/). Objective-C-anrop har typade
+`dogfood/graphics/macos/` i `dunder-hundmat`. Objective-C-anrop har typade
 C-signaturer, inklusive CoreGraphics-värden som passerar i flyttalsregister.
 Delegaten registrerar vanliga Dunder-funktioner som callbacks. Ett giltigt
 `open` laddar AppKit, QuartzCore och Metal genom `std.dl`. Apples
@@ -74,10 +74,10 @@ En vanlig `.app` kan byggas utan projektgenerator:
 open build/DunderMetal.app
 ```
 
-Kör hela kontrollen med den byggda kompilatorn i samma terminal.
+Kör från `dunder-hundmat`:
 
 ```sh
-python3 tools/test-native.py "$dunder" --graphics
+python3 tools/test-graphics.py /sökväg/till/dunder --graphics
 ```
 
 Kontrollen ritar tre bildrutor vardera med triangeln och Atlas, öppnar och

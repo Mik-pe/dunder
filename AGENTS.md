@@ -17,9 +17,9 @@ results for verification. Run benchmarks only when specifically requested.
 
 ## Graphics dogfood
 
-Keep graphics API bindings, shaders and window logic with the examples under
-`dogfood/`. Exercise the same file imports and FFI available to external
-projects. When an example exposes a missing language or compiler feature,
+Standalone dogfood programs, graphics bindings (Metal, Vulkan, WebGPU), Tabell,
+and the HTTP server live in the sibling repository `dunder-hundmat`. They exercise
+the same file imports, capabilities, and FFI available to external projects. When an example exposes a missing language or compiler feature,
 implement and test the general mechanism in the toolchain.
 
 ## Use subagents

@@ -116,10 +116,13 @@ elementtyp utan vtables.
 
 `text.find` returnerar ett byteindex eller -1. `split` bevarar tomma delar;
 en tom separator ger en del med hela texten. `trim` tar ASCII-mellanslag,
-tabb, CR och LF. `parse.integer` ger fel 1 för stavning och 2 för overflow;
-både i64-minimum och i64-maximum stöds. `bytes.utf8` returnerar ett
-`sys.TextResult`; ogiltig UTF-8 ger 92, ett värde utanför byteintervallet
-ger 22 och otillräcklig strängarena ger 12.
+tabb, CR och LF. `parse.integer`, `parse.hex`, `parse.i64_range`, `parse.u64_range`
+och `parse.hex_u64_range` ger fel 1 för stavning och 2 för overflow; både
+i64- och u64-gränser stöds. `bytes` innehåller även zero-copy-hjälpare
+(`decode_range`, `find_byte`, `find_crlf`, `find_double_crlf`, `equals_text`,
+`equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
+`std.net` ger kapabilitetsstyrd TCP och `PollSet`/`StreamSet` ovanpå
+`capability network` (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
 
 Heltal har explicita `.bit_and`, `.bit_or`, `.bit_xor`, `.bit_not`, `.shl`
 och logisk `.shr`. Skiftantal är `i32` och måste ligga inom typens bitbredd;
@@ -140,12 +143,7 @@ Strängar har referensräkning och delar heap med arrayer.
 Allokatorn återanvänder block per storleksklass. Läs [kostnader och gränser](memory.md).
 
 ```sh
-dunder run dogfood/standard.ddr
-# 4
-# 6
-# stdlib ok
-dunder test
-# Alla grupper i projektet
+dunder test tests/suite.ddr
 python3 tools/runtime-contracts.py "$(command -v dunder)"
 ```
 

@@ -161,9 +161,10 @@ operation, inklusive symboliska länkar och relativa sökvägar. Ett handtag
 håller ingen öppen filbeskrivare. Modulen som tar emot ett handtag kan
 delegera det vidare.
 
-Modulhuvudet styr direkta unsafe-operationer och tillgången till deklarationer
-märkta `@requires(filesystem)`. Importer av äldre `sys` ger fortfarande
-processens fil- och argumentåtkomst. Grafikexemplens publika funktioner
-kan skapa fönster och `print` kan skriva till stdout. En importerad funktion
-kan själv använda ett privilegium som dess egen modul valt. Bedöm hela
-importkedjan för kod som ska köra obetrodda program.
+Modulhuvudet styr direkta unsafe-operationer samt deklarationer märkta
+`@requires(filesystem)` eller `@requires(network)`. Flera kapabiliteter anges
+kommaseparerat i samma modulhuvud, t.ex. `capability network, filesystem`.
+`std.fs.grant_dir(path)` och `fs.resolve_read(&dir, rel_path)` avgränsar
+relativ läsning till en vald rotkatalog utan `..`-flykt, och `std.net.listen` /
+`std.net.connect` kräver `capability network`. Importer av äldre `sys` ger fortfarande
+processens OS-åtkomst. Bedöm hela importkedjan för kod som ska köra obetrodda program.

@@ -195,16 +195,12 @@ den importerande filen. De privata `__sys_*`-intrinsics är endast tillgängliga
 inne i det medföljande biblioteket.
 
 ```sh
-dunder run dogfood/filesystem.ddr
-# 18
-# filesystem ok
-dunder test dogfood/filesystem.ddr
-# 4 passed, 0 failed
+dunder test tests/net_loopback.ddr
 ```
 
-Dogfood-programmet skapar en egen katalog med process-ID i namnet, provar
-filflödet och städar bara de objekt det själv skapade. Tabell och filhandtagsproven kör i temporära kataloger och kontrollerar
-filinnehåll och felkoder. [Filhandtagsprov](../tools/test-files.py).
+Testsviten `tests/net_loopback.ddr` provar klocka (`sys.now_ms`), råa
+byte-läsningar (`sys.read_u8_limit`, `fs.ReadDir` + `fs.resolve_read`),
+filflöde, felkoder och icke-blockerande TCP-sockets. [Filhandtagsprov](../tools/test-files.py).
 
 Implementationens syscallnummer och stat-layout är verifierade mot
 [Apples XNU-anrop](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master)

@@ -201,7 +201,6 @@ def main():
     expected_stdout = args.expected_stdout.resolve(strict=True) if args.expected_stdout else None
     compiler = args.compiler.resolve(strict=True)
     target,entry = host(); selfhost = (ROOT/f'selfhost/{entry}.ddr').resolve()
-    tabell = (ROOT/'projects/tabell/main.ddr').resolve()
     directory = args.report.resolve()
     directory.mkdir(parents=True,exist_ok=True)
     if any(directory.iterdir()): parser.error('report directory must be empty')
@@ -218,14 +217,14 @@ def main():
         if not args.case:
             generated,corpus = PERFORMANCE.corpus(directory)
             metadata['generated_corpus'] = corpus
-            cases = [('generated',generated,'generated'),('selfhost',selfhost,'selfhost'),('tabell',tabell,'tabell')]
+            cases = [('generated',generated,'generated'),('selfhost',selfhost,'selfhost')]
         else:
             for i,path in enumerate(args.case):
                 source = path.resolve(strict=True)
-                validation = 'selfhost' if source == selfhost else 'tabell' if source == tabell else 'custom'
+                validation = 'selfhost' if source == selfhost else 'custom'
                 cases.append((f'{i+1:02d}_'+re.sub(r'[^A-Za-z0-9_-]','_',source.stem),source,validation))
         if args.expected_stdout and cases[0][2] != 'custom':
-            raise ValueError('known selfhost/Tabell cases use their authoritative validation')
+            raise ValueError('known selfhost cases use their authoritative validation')
         resolutions = {}
         sources = source_graph(selfhost,resolutions)
         for name,source,validation in cases:
@@ -243,7 +242,7 @@ def main():
             sources[str(resolved)] = {'sha256':sha(path),'bytes':path.stat().st_size,
                                      'physical_lines_including_comments':len(path.read_bytes().splitlines())}
         for path in [Path(__file__),ROOT/'tools/performance.py',ROOT/'tools/profile-dogfood.py',
-                     ROOT/'examples/hello.ddr',ROOT/'projects/tabell/expenses.csv',ROOT/'projects/tabell/expected.csv']:
+                     ROOT/'examples/hello.ddr']:
             resolutions[str(path.absolute())] = str(path.resolve())
             sources[str(path.resolve())] = {'sha256':sha(path),'bytes':path.stat().st_size}
         if expected_stdout:
@@ -284,10 +283,6 @@ def main():
                 plain(recorder.run(f'build hello with {name}/{suffix}',
                       [image,'build',ROOT/'examples/hello.ddr','--target',target,'-o',hello],directory/'validation'))
                 plain(recorder.run(f'verify hello from {name}/{suffix}',[hello],directory/'validation'),b'42\ntrue\n')
-            elif kind == 'tabell':
-                plain(recorder.run(f'verify {name}/{suffix}',
-                      [image,ROOT/'projects/tabell/expenses.csv','team','cents'],directory/'validation'),
-                      (ROOT/'projects/tabell/expected.csv').read_bytes())
             elif expected_stdout:
                 plain(recorder.run(f'verify {name}/{suffix}',[image,*args.program_arg],directory/'validation'),
                       expected_stdout.read_bytes())

@@ -101,9 +101,7 @@ def corpus(work):
 def source_hashes():
     paths = sorted(set(ROOT.glob('selfhost/*.ddr')) | set(ROOT.glob('stdlib/*.ddr'))
                    | set(ROOT.glob('runtime/*.ddr')) | set(ROOT.glob('benchmarks/runtime/*.ddr'))
-                   | set(ROOT.glob('projects/tabell/**/*.ddr'))
-                   | {ROOT / 'benchmarks/runtime/reference.c',
-                      ROOT / 'projects/tabell/expenses.csv', ROOT / 'projects/tabell/expected.csv'})
+                   | {ROOT / 'benchmarks/runtime/reference.c'})
     return {str(p.relative_to(ROOT)): digest(p) for p in paths}
 
 
@@ -210,21 +208,17 @@ def main():
         if args.suite in ('all', 'compiler'):
             stress, metadata['generated_corpus'] = corpus(work)
             entry = {'Darwin': 'main', 'Linux': 'linux' if platform.machine() in ('arm64', 'aarch64') else 'x86_linux'}[platform.system()]
-            for name, source in [('generated', stress), ('selfhost', ROOT / f'selfhost/{entry}.ddr'),
-                                 ('tabell', ROOT / 'projects/tabell/main.ddr')]:
+            for name, source in [('generated', stress), ('selfhost', ROOT / f'selfhost/{entry}.ddr')]:
                 for round_number in range(args.rounds):
                     for position, variant in enumerate(order(list(compilers), round_number)):
                         binary = work / f'{name}-{variant}-{round_number}'
                         elapsed, _ = command([compilers[variant], 'build', source, '-o', binary, *compiler_flags[variant]])
                         if name == 'generated':
                             checked_run(binary, [], b'595500\n')
-                        elif name == 'selfhost':
+                        else:
                             hello = work / 'hello'
                             command([binary, 'build', ROOT / 'examples/hello.ddr', '-o', hello])
                             checked_run(hello, [], b'42\ntrue\n')
-                        else:
-                            checked_run(binary, [ROOT / 'projects/tabell/expenses.csv', 'team', 'cents'],
-                                        (ROOT / 'projects/tabell/expected.csv').read_bytes())
                         sample('compiler', name, variant, round_number, position, elapsed, binary)
                         image = {'sha256': digest(binary), 'bytes': binary.stat().st_size}
                         previous = metadata['binaries'].setdefault(name, {}).setdefault(variant, image)

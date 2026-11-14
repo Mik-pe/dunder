@@ -11,7 +11,7 @@ mir_reports=$(mktemp -d "$root/build/mir-correctness.XXXXXX")
 printf 'MIR verification evidence: %s\n' "$mir_reports"
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
-"$compiler" test dogfood/tests.ddr -o "$work/dogfood"
+"$compiler" test tests/suite.ddr -o "$work/suite"
 "$compiler" test tests/mir.ddr -o "$work/mir"
 "$compiler" test tests/mir_verify.ddr -o "$work/mir-verify"
 "$compiler" test tests/mir_lower.ddr -o "$work/mir-lower"
@@ -92,7 +92,6 @@ python3 tools/test-range-analysis.py "$compiler"
 python3 tools/test-array-capacity.py "$compiler"
 python3 tools/test-machine-ir.py "$compiler"
 python3 tools/test-ownership-leases.py "$compiler"
-python3 tools/test-tabell.py "$compiler"
 python3 tools/test-cli.py "$compiler"
 python3 tools/test-resolver.py "$compiler"
 python3 tools/test-conditionals.py "$compiler"

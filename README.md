@@ -104,7 +104,7 @@ returnerar en annan funktion, lagring i lokala variabler och callbackanrop.
 ```toml
 name = "hello"
 root = "examples/hello.ddr"
-test_root = "dogfood/tests.ddr"
+test_root = "tests/suite.ddr"
 ```
 
 Utdata hamnar då i `build/<target>/hello`, exempelvis `build/x86_64-linux/hello`.
@@ -113,9 +113,10 @@ Utdata hamnar då i `build/<target>/hello`, exempelvis `build/x86_64-linux/hello
 `root` även för tester. Kompileringsfel har fil, rad, kolumn och
 felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
 
-Läs om [FFI, C-layout och modulkapabiliteter](docs/ffi.md),
-[funktionscachen, `check --agent` och `test --affected`](docs/incremental.md)
-samt [en delad triangel på WebGPU, Metal och Vulkan](dogfood/webgpu/README.md).
+Läs om [FFI, C-layout och modulkapabiliteter](docs/ffi.md) och
+[funktionscachen, `check --agent` och `test --affected`](docs/incremental.md).
+Större dogfood-program (Metal-, Vulkan- och WebGPU-trianglar, Tabell samt en
+händelsestyrd HTTP/1.1-server) finns i syskonrepot [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
 
 ## Självhostad kompilator
 
@@ -145,9 +146,8 @@ ett separat provbibliotek för ABI-kontrollen:
 ```
 
 Sviten bygger kompilatorn från fröet, kör program och testgrupper på värden
-och i Wasm, kontrollerar förväntade typfel och provar Tabell som fristående
-projekt. WebGPU-provet läser tillbaka triangelns vertexdata vid värdanropet.
-Metal-, Vulkan- och WebGPU-bindningarna ligger i grafikexemplen.
+och i Wasm, kontrollerar förväntade typfel och provar nativ paketering och FFI.
+Grafik-, CSV- och HTTP-dogfood testas i syskonrepot `dunder-hundmat`.
 [Arkitektur](docs/arkitektur.md) · [Lånekontroll och mål](selfhost/README.md)
 
 ## Moduler
@@ -233,11 +233,8 @@ explicit `return` fungerar också.
 
 ```sh
 dunder test
-dunder test dogfood/geometry.ddr
-dunder run dogfood/structs.ddr
-# 25
-# 32
-# 3
+dunder test tests/language_extensions.ddr
+dunder run examples/hello.ddr
 ```
 
 `dunder test` hittar tester i hela det explicit importerade modulträdet.
@@ -245,7 +242,7 @@ Varje testblock körs som en egen nativeprocess med fem sekunders tidsgräns;
 nästa test körs även om ett tidigare misslyckas. `main` körs inte och behövs
 inte i en testrot. Testfunktioner ingår bara i testbyggen.
 
-## Arrayer, loopar och dogfooding
+## Arrayer, loopar och kontrollflöde
 
 ```dunder
 fn main() {
@@ -254,8 +251,8 @@ fn main() {
         values[i] = i + 1
     }
     var sum := 0
-    for value in values.iter() {
-        sum = sum + value
+    for value in &values {
+        sum += value
     }
     assert(sum == 36)
     print(sum)
@@ -264,14 +261,13 @@ fn main() {
 
 Arrayer och structar kopieras som värden, även vid funktionsanrop. Fält och
 element är oföränderliga om bindningen saknar `var`. `for` stöder halvöppna
-`i32`-intervall, arrayer och arrayiteratorer. Iteration över arrayer använder
-en kopia av värdena vid loopstart; `.iter()` skapar också en egen kopia.
+`i32`-intervall, arrayer, arrayiteratorer samt lånade element med `for x in &values`.
+Sammansatt tilldelning (`+=`, `-=`, `*=`, `/=`, `%=`), byteliteraler (`b'A'`),
+hex-/binärliteraler (`0xff`, `0b1010`) och lexikal `defer { ... }` stöds.
 Index kontrolleras vid körning.
 
-[Dogfood-programmen](dogfood/README.md) provar rekursion, moduler, sortering,
-callbacks, iteratorer, structar och en indexbaserad arena över en fast typad
-buffert. Arenan är ett fungerande bump-allokeringsprogram. Växande samlingar
-och begränsade funktionsborrows finns nu i standardbibliotekets första steg.
+Större dogfood-program (sortering, tokenizer, arena, Tabell, grafik och HTTP/1.1-server)
+finns samlade i [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
 
 ## Standardbibliotek och dynamiska arrayer
 
@@ -328,9 +324,8 @@ fn evaluate(command: Command) -> i32 {
 Skriv `Command.Move(20, 22)` eller `.Move(20, 22)` när typen framgår av
 kontexten. `match` kontrolleras för saknade och dubbla fall. Payloads ligger
 direkt i värdet, kopieras med värdesemantik och kan innehålla structar,
-arrayer, andra enums och funktionsvärden. Matchningen använder taggar och
-direkta grenar utan vtables. Läs [enumreglerna](docs/enums.md) och prova
-`dunder run dogfood/enums.ddr`.
+arrayer, andra enums och funktionsvärden. Matchningen använder taggar och direkta grenar utan vtables. Läs [enumreglerna](docs/enums.md)
+(se även `dogfood/enums.ddr` i `dunder-hundmat`).
 
 ## UTF-8-strängar
 
@@ -364,10 +359,8 @@ callbacks, arrayelement och structfält. `value.str()` konverterar heltal,
 bool och runes. Unicode-escapes och NUL fungerar; alla strängvärden är giltig
 UTF-8. Index, snittgränser och `rune(number)` kontrolleras vid körning.
 
-Kör `dunder run dogfood/utf8.ddr` för textstatistik och
-`dunder run dogfood/tokenizer.ddr` för en liten UTF-8-tokenizer.
-[Textfunktionerna](dogfood/text/scan.ddr), inklusive `find`, `replace` och
-ordräkning, är skrivna i Dunder och har egna taggade tester.
+Tester för Unicode-text och bytefunktioner körs med `dunder test tests/suite.ddr`
+(se även `utf8.ddr`, `tokenizer.ddr` och `text/scan.ddr` i `dunder-hundmat`).
 
 Dynamiska strängar återvinns när sista ägaren försvinner, med icke-atomär
 referensräkning för dessa oföränderliga värden. Literaler ligger kvar i
@@ -404,9 +397,8 @@ heltal trunkerar och kontrollerar intervallet. `.str()` och `print` använder
 en kort decimalrepresentation som avrundas tillbaka till samma flyttal.
 Utskriftsrutinen är [skriven i Dunder](runtime/float.ddr).
 
-Kör `dunder test dogfood/numeric/main.ddr` för sju numeriska
-testgrupper med vektorer, stabil summering, rotberäkning och numerisk
-integration. Läs [flyttalsreglerna och begränsningarna](docs/floating.md).
+Numeriska dogfood-program (vektorer, bisektion och Runge–Kutta) ligger i
+`dunder-hundmat`. Läs [flyttalsreglerna och begränsningarna](docs/floating.md).
 
 ## Systembibliotek på macOS och Linux
 
@@ -431,79 +423,31 @@ borttagning av filer/tomma kataloger. `read` ger `Ok(string)` eller
 har `.ok` och `.error`; lästa strängar finns då i `.value`.
 Vanliga I/O-fel avbryter inte processen.
 `read_text` validerar UTF-8 och läser högst 4 MiB per fil till strängarenan.
-Läs [sys-reglerna](docs/sys.md) för beteende och begränsningar och kör
-`dunder test dogfood/filesystem.ddr` för filsystemets dogfood.
+Läs [sys-reglerna](docs/sys.md) för beteende, klocka, rå byte-I/O, kapabilitetsavgränsade
+kataloger (`std.fs.ReadDir`) och nätverkssockets (`capability network`, `std.net`).
+Kör `dunder test tests/net_loopback.ddr` för filsystem- och loopbacktester.
 
 Structar och fasta arrayer kan nu returneras som värden. Resultatet kopieras
 till lagring hos anroparen och fungerar även genom callbacks och rekursion.
 
-## Fristående projekt: Tabell
+## Syskonprojekt i dunder-hundmat
 
-[Tabell](projects/tabell/README.md) är ett CSV-verktyg skrivet i Dunder med
-eget manifest. Det grupperar rader och summerar en heltalskolumn, till exempel
-kostnader i ören per team:
-
-```sh
-cd projects/tabell
-dunder run -- expenses.csv team cents
-dunder test
-```
-
-Projektet använder importer utan citattecken, `array.sort_strings` och
-`sys.eprint`. CSV-parsning, gruppering, sortering och felhantering körs i
-den färdiga binären utan externa verktyg. Integrationstesterna jämför även
-genererade CSV-data med en oberoende referens och bygger alla tre mål.
-
-## Nativefönster och Metal
-
-Från `dogfood/metal/` läser `import ..graphics.macos as macos` den lokala
-modulen `dogfood/graphics/macos.ddr`. Den ger typade fönsterhandtag och
-händelser. AppKit-delegaten och Metal-renderaren i `dogfood/graphics/macos/`
-använder typade C-anrop och callbacks. Apples Metal-runtime kompilerar den
-fasta MSL-pipelinen när ett fönster öppnas.
-
-```sh
-dunder run dogfood/metal/triangle.ddr -- --frames 3
-dunder run dogfood/metal/main.ddr
-dunder build dogfood/metal/main.ddr --app -o build/DunderMetal.app
-open build/DunderMetal.app
-```
-
-Atlas-exemplet har dragning, paus med mellanslag, palettbyte med C och reset
-med R. Escape och fönstrets stängknapp avslutar. Layout och pekarinmatning
-använder logiska punkter; ritmåtten följer Retina-skalan. Första API:t har
-ett aktivt fönster per process och en fast pipeline för färgad geometri.
-Grafik-API:t gäller bara målet `arm64-macos` och kräver en grafisk session.
-Textlayout, nativekontroller, egen shaderkod och flera samtidiga fönster
-återstår. Läs [macOS-/Metal-kontraktet](docs/macos-metal.md) och
-[app-paketeringen](docs/app-bundles.md).
-
-## Vulkan och lavapipe på Linux
-
-Triangeln och Atlas i `dogfood/vulkan/` använder
-`import ..graphics.vulkan as vulkan`. Exempelmodulen i `dogfood/graphics/vulkan.ddr` renderar med
-Vulkan och kan läsa tillbaka RGBA eller visa bilden i ett SDL2-fönster.
-
-```sh
-dunder run dogfood/vulkan/main.ddr -- --headless --frames 3 --capture build/atlas.ppm
-dunder run dogfood/vulkan/main.ddr
-```
-
-Välj Mesas lavapipe-ICD för mjukvarurendering. Shaderns SPIR-V ingår i
-exempelmodulen. Kompilatorn genererar nativekod och en dynamisk ELF för
-modulens vanliga FFI-anrop.
-Se [Linux/Vulkan-guiden](docs/linux-vulkan.md) för installation, kontroller
-och pixeltester med valideringslager.
+Större exempel och program byggda i Dunder — inklusive CSV-verktyget Tabell,
+en händelsestyrd HTTP/1.1-server (`http/`), AppKit/Metal-, Vulkan- och
+WebGPU-trianglar samt äldre språkövningar — underhålls i
+[dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
 
 ## Implementerat och återstående
 
-Implementerat: `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune`, typade funktioner och funktionsvärden,
+Implementerat: `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `rune`, byteliteraler `b'..'`,
+hex-/binärliteraler `0x..`/`0b..`, sammansatt tilldelning (`+=`, `-=`, `*=`, `/=`, `%=`),
+lexikal `defer { ... }`, `for x in &..`, typade funktioner och funktionsvärden,
 callbacks, funktioner som returvärden, framåtanrop och rekursion,
-filmoduler med explicita importer, alias, namnrymder och privata/exporterade funktioner och typer,
+filmoduler med explicita importer, modulkapabiliteter (`unsafe`, `filesystem`, `network`), alias, namnrymder och privata/exporterade funktioner och typer,
 härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/else`,
 `while`, `for`, `break/continue`, typade arrayer och arrayiteratorer,
 struct-uttryck och fältåtkomst, värde-enums och varianter med data, uttömmande `match`,
-`@test`, `assert`, kortslutande booleska operatorer,
+`@test`, `assert`, kortslutande booleska operatorer, `std.net` (TCP-sockets och `PollSet`),
 isolerade `task scope`/`spawn`/`await` med typade `TaskID<R>` på ARM64/macOS,
 heltals- och flyttalsaritmetik, kontrollerade konverteringar och `print`.
 Läs [syntaxen](docs/syntax.md).

@@ -84,7 +84,7 @@ The OS filesystem cache is warm. Variants have separate working directories,
 fragment caches and TMPDIRs, and use the same frozen absolute source paths.
 No runtime, cold-build or general C-performance claim follows from this suite.
 
-Generated, selfhost and Tabell inputs remain unchanged. The two small probes
+Generated and selfhost inputs remain unchanged. The two small probes
 change only a private inlineable helper body or a shared record's field layout.
 Names and call graphs stay fixed. After priming state A, edit rounds start with
 B and alternate B/A. Edit summaries combine both transition directions; state
@@ -92,8 +92,7 @@ and image hashes remain available in the raw samples.
 
 Every image must match an untimed nonincremental reference for its compiler,
 flags and source state. Generated output is independently 595500; selfhost
-images build/run hello (42, true); Tabell is checked against both Python CSV
-aggregation and its frozen golden file. Private-body outputs are independently
+images build/run hello (42, true). Private-body outputs are independently
 440/480; layout outputs remain 1107, 11, 7 through named construction.
 
 Two JSON timing builds prime each measured cache (cold then warm), outside
@@ -190,7 +189,7 @@ def main():
             snapshot = metadata['input_snapshot_sha256'] = {}
             # Copy only frozen inputs, never an existing project build/cache.
             for relative in sources_before:
-                if relative.startswith(('selfhost/', 'stdlib/', 'runtime/', 'projects/tabell/')):
+                if relative.startswith(('selfhost/', 'stdlib/', 'runtime/')):
                     destination = inputs / relative; destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(ROOT / relative, destination)
                     snapshot[relative] = perf.digest(destination)
@@ -203,17 +202,9 @@ def main():
             metadata['generated_corpus'] = corpus_info
             for path in stress.parent.glob('*.ddr'):
                 snapshot[str(path.relative_to(inputs))] = perf.digest(path)
-            tabell = inputs / 'projects/tabell'
-            with (tabell / 'expenses.csv').open(newline='') as file:
-                totals = {}
-                for row in csv.DictReader(file):
-                    totals[row['team']] = totals.get(row['team'], 0) + int(row['cents'])
-            tabell_expected = ('group,total\n' + ''.join(f'{name},{totals[name]}\n' for name in sorted(totals))).encode()
-            assert tabell_expected == (tabell / 'expected.csv').read_bytes(), 'Tabell golden differs from independent CSV reference'
             private, layout = probe_sources()
             cases = [dict(name='generated_unchanged', source=stress, kind='generated', states={'A': {}}, expected={'A': b'595500\n'}),
                      dict(name='selfhost_unchanged', source=inputs / f'selfhost/{entry}.ddr', kind='selfhost', states={'A': {}}, expected={'A': b'42\ntrue\n'}),
-                     dict(name='tabell_unchanged', source=tabell / 'main.ddr', kind='tabell', states={'A': {}}, expected={'A': tabell_expected}),
                      dict(name='private_body_edit', source=inputs / 'private/main.ddr', kind='probe', states=private,
                           expected={state: f'{sum((i+d)+(i+1+d) for i in range(20))}\n'.encode() for state, d in (('A', 1), ('B', 2))}),
                      dict(name='shared_layout_edit', source=inputs / 'layout/main.ddr', kind='probe', states=layout,
@@ -241,8 +232,7 @@ def main():
                         run([image, 'build', hello, '-o', program], cwd, purpose=f'{name}/{variant}/{state}/hello-build')
                         result, _ = run([program], cwd, purpose=f'{name}/{variant}/{state}/hello-run')
                     else:
-                        arguments = [tabell / 'expenses.csv', 'team', 'cents'] if case['kind'] == 'tabell' else []
-                        result, _ = run([image, *arguments], cwd, purpose=f'{name}/{variant}/{state}/program-run')
+                        result, _ = run([image], cwd, purpose=f'{name}/{variant}/{state}/program-run')
                     assert result.stdout == case['expected'][state], (name, variant, state, result.stdout, case['expected'][state])
 
                 def build(variant, state, group, incremental, observer=False, measured=False):

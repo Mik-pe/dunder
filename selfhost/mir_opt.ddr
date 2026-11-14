@@ -2,6 +2,7 @@
 // precolored; calls kill cached homes without becoming fabricated SSA defs.
 // The caller must not mutate MIR between analyze_into and the single apply.
 import mir
+import mir_contract as contract
 import mir_abi as abi
 import mir_liveness as live
 import mir_memory as memory_policy
@@ -147,13 +148,92 @@ fn overlap(f: &mir.Function, a: i32, b: i32) -> bool {
     left := i64(f.place_offsets[a]); right := i64(f.place_offsets[b])
     left < right + i64(f.place_widths[b]) && right < left + i64(f.place_widths[a])
 }
+fn cell_floor(offset: i64) -> i64 {
+    if offset >= 0 { return offset / 8 * 8 }
+    ((offset - 7) / 8) * 8
+}
+fn bucket_hash(key: i64, mask: i32) -> i32 {
+    i32(key.wrapping_mul(2654435761).bit_xor(key.shr(3)).bit_and(i64(mask)))
+}
+fn bucket_lookup(keys: &[]i64, buckets: &[]i32, key: i64) -> i32 {
+    mask := buckets.len - 1
+    var at := bucket_hash(key, mask)
+    while buckets[at] != -1 {
+        if keys[at] == key { return buckets[at] }
+        at = (at + 1).bit_and(mask)
+    }
+    -1
+}
+fn bucket_insert(keys: &mut []i64, buckets: &mut []i32, allowed: &mut []bool, key: i64, place: i32) {
+    mask := buckets.len - 1
+    var at := bucket_hash(key, mask)
+    while buckets[at] != -1 {
+        if keys[at] == key {
+            existing := buckets[at]
+            if existing >= 0 { allowed[existing] = false }
+            buckets[at] = -2; allowed[place] = false; return
+        }
+        at = (at + 1).bit_and(mask)
+    }
+    keys[at] = key; buckets[at] = place
+}
+fn narrow_load_ok(w: &Workspace, f: &mir.Function, op: i32) -> bool {
+    if f.kinds[op] != 7 || f.flags[op] != 0 || f.dst[op] < 0 || f.dst[op] >= 31 { return false }
+    if f.writes[op].bit_and(mir.variable_bit(f.dst[op]).bit_not()).bit_and(live.live_after(&w.liveness, op)) != 0 { return false }
+    width := f.aux[op]; ext := f.extensions[op]; ty := f.types[op]
+    if width == 4 { return (ext == 1 && ty == 1) || (ext == 2 && ty == 2) }
+    (width == 1 || width == 2) && ext == 1 && ty == 1
+}
 fn select(w: &mut Workspace, f: &mir.Function) -> bool {
     places := f.place_kinds.len; var used: i64 = 0; var barrier_cost := 0
     if !charge(&mut w, places + f.kinds.len) { return false }
-    for p in 0..places {
-        w.scores.push(0); w.home_for_place.push(-1)
-        w.allowed.push(f.place_kinds[p] == 1 && !f.place_escaped[p] && f.place_widths[p] == 8 &&
-            f.place_offsets[p] <= -8 && i64(f.place_offsets[p]) >= -i64(w.old_frame) && f.place_offsets[p] % 8 == 0)
+    var sibling_canon: []i32 = []
+    var keys: []i64 = []; var buckets: []i32 = []
+    if w.private_memory {
+        var cap := 16
+        while cap < places * 2 + 8 { cap = cap * 2 }
+        if !charge(&mut w, cap + places) { return false }
+        for i in 0..cap { keys.push(0); buckets.push(-1) }
+        for p in 0..places {
+            w.scores.push(0); w.home_for_place.push(-1); sibling_canon.push(-1)
+            ok := f.place_kinds[p] == 1 && !f.place_escaped[p] && f.place_widths[p] == 8 &&
+                f.place_offsets[p] <= -8 && i64(f.place_offsets[p]) >= -i64(w.old_frame) &&
+                f.place_offsets[p] % 8 == 0 && contract.frame_place_proven(&f, p)
+            w.allowed.push(ok)
+            if ok { bucket_insert(&mut keys, &mut buckets, &mut w.allowed, i64(f.place_offsets[p]), p) }
+        }
+        for q in 0..places {
+            if f.place_kinds[q] != 1 || w.allowed[q] { continue }
+            start := i64(f.place_offsets[q]); width := i64(f.place_widths[q])
+            if width <= 0 { continue }
+            if !f.place_escaped[q] && (width == 1 || width == 2 || width == 4) &&
+                start <= -8 && start >= -i64(w.old_frame) && start % 8 == 0 &&
+                contract.frame_place_proven(&f, q) {
+                canon := bucket_lookup(&keys, &buckets, start)
+                if canon >= 0 { sibling_canon[q] = canon }
+                continue
+            }
+            first_cell := cell_floor(start); last_cell := cell_floor(start + width - 1)
+            span := (last_cell - first_cell) / 8 + 1
+            if span <= 64 {
+                if !charge(&mut w, i32(span)) { return false }
+                var cell := first_cell
+                while cell <= last_cell {
+                    canon := bucket_lookup(&keys, &buckets, cell)
+                    if canon >= 0 { w.allowed[canon] = false }
+                    cell = cell + 8
+                }
+            } else {
+                if !charge(&mut w, places) { return false }
+                for c in 0..places { if w.allowed[c] && overlap(&f, c, q) { w.allowed[c] = false } }
+            }
+        }
+    } else {
+        for p in 0..places {
+            w.scores.push(0); w.home_for_place.push(-1)
+            w.allowed.push(f.place_kinds[p] == 1 && !f.place_escaped[p] && f.place_widths[p] == 8 &&
+                f.place_offsets[p] <= -8 && i64(f.place_offsets[p]) >= -i64(w.old_frame) && f.place_offsets[p] % 8 == 0)
+        }
     }
     for position in 0..f.order.len {
         op := f.order[position]; if f.modes[op] == 2 { continue }
@@ -168,11 +248,19 @@ fn select(w: &mut Workspace, f: &mir.Function) -> bool {
         if live.loop_block(&w.liveness, block) { weight = 32 }
         if w.barriers[position] { barrier_cost = barrier_cost + weight * 2; w.calls = w.calls + 1 }
         p := f.place[op]
-        if p >= 0 && (f.kinds[op] == 7 || f.kinds[op] == 8) {
-            var semantic_writes: i64 = 0; if f.kinds[op] == 7 { semantic_writes = mir.variable_bit(f.dst[op]) }
-            if f.extensions[op] != 0 || f.types[op] != 2 || (f.kinds[op] == 7 && f.dst[op] < 0) ||
-                f.writes[op].bit_and(semantic_writes.bit_not()).bit_and(live.live_after(&w.liveness, op)) != 0 { w.allowed[p] = false }
-            if live.reachable(&w.liveness, block) { w.scores[p] = w.scores[p] + weight }
+        if p >= 0 {
+            if w.private_memory && sibling_canon[p] >= 0 {
+                canon := sibling_canon[p]
+                if !narrow_load_ok(&w, &f, op) { w.allowed[canon] = false }
+                else if live.reachable(&w.liveness, block) { w.scores[canon] = w.scores[canon] + weight }
+            } else if f.kinds[op] == 7 || f.kinds[op] == 8 {
+                var semantic_writes: i64 = 0; if f.kinds[op] == 7 { semantic_writes = mir.variable_bit(f.dst[op]) }
+                if f.extensions[op] != 0 || f.types[op] != 2 || (f.kinds[op] == 7 && f.dst[op] < 0) ||
+                    f.writes[op].bit_and(semantic_writes.bit_not()).bit_and(live.live_after(&w.liveness, op)) != 0 { w.allowed[p] = false }
+                if live.reachable(&w.liveness, block) { w.scores[p] = w.scores[p] + weight }
+            } else {
+                w.allowed[p] = false
+            }
         }
     }
     // Select a fixed-size shortlist, then compare its byte intervals against
@@ -186,9 +274,7 @@ fn select(w: &mut Workspace, f: &mir.Function) -> bool {
     for p in w.shortlist {
         if w.picked.len == 4 { break }
         if !charge(&mut w, places + 4) { return false }
-        if w.private_memory {
-            if !memory_policy.private_cell(&f, p) { continue }
-        } else {
+        if !w.private_memory {
             var aliases := false
             for other in 0..places {
                 if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
@@ -202,6 +288,14 @@ fn select(w: &mut Workspace, f: &mir.Function) -> bool {
         w.picked.push(p); w.homes.push(home)
     }
     if w.picked.len == 0 { return refuse(&mut w) }
+    if w.private_memory {
+        for q in 0..places {
+            canon := sibling_canon[q]
+            if canon >= 0 && w.home_for_place[canon] >= 0 {
+                w.home_for_place[q] = w.home_for_place[canon]
+            }
+        }
+    }
     w.new_frame = (w.old_frame + w.picked.len * 8 + 15) / 16 * 16
     if w.new_frame > 16777200 { return refuse(&mut w) }
     true
@@ -357,6 +451,13 @@ fn copy(f: &mut mir.Function, op: i32, destination: i32, source: i32) {
     f.variant[op] = 0; f.raw_starts[op] = -1; f.widths[op] = 0; f.recipes[op] = 0
     if source < 0 { f.kinds[op] = 1 }
 }
+fn copy32(f: &mut mir.Function, op: i32, destination: i32, source: i32) {
+    copy(&mut f, op, destination, source); f.types[op] = 1
+}
+fn bitfield(f: &mut mir.Function, op: i32, opcode: i32, ty: i32, aux: i32, destination: i32, source: i32) {
+    copy(&mut f, op, destination, source)
+    f.kinds[op] = 3; f.opcodes[op] = opcode; f.types[op] = ty; f.aux[op] = aux
+}
 // Must be called once on the same verified MIR, with no intervening mutation.
 // Insertion is straight-line only; original CFG edge identities are retained.
 pub fn apply(w: &mut Workspace, f: &mut mir.Function) {
@@ -390,8 +491,15 @@ pub fn apply(w: &mut Workspace, f: &mut mir.Function) {
         if f.modes[op] != 2 && (f.kinds[op] == 7 || f.kinds[op] == 8) {
             p := f.place[op]; selected := w.home_for_place[p]
             if selected >= 0 {
-                if f.kinds[op] == 7 { destination := f.dst[op]; copy(&mut f, op, destination, w.homes[selected]) }
-                else { source := f.a[op]; copy(&mut f, op, w.homes[selected], source) }
+                home := w.homes[selected]
+                if f.kinds[op] == 7 {
+                    destination := f.dst[op]; width := f.aux[op]
+                    if width == 8 { copy(&mut f, op, destination, home) }
+                    else if width == 4 && f.extensions[op] == 1 { copy32(&mut f, op, destination, home) }
+                    else if width == 4 { bitfield(&mut f, op, 1, 2, 1984, destination, home) }
+                    else if width == 2 { bitfield(&mut f, op, 2, 1, 960, destination, home) }
+                    else { bitfield(&mut f, op, 2, 1, 448, destination, home) }
+                } else { source := f.a[op]; copy(&mut f, op, home, source) }
             }
         }
         w.assembled.push(op)

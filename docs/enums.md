@@ -135,6 +135,7 @@ med statiskt kontrollerad `match` behöver ingen dynamisk metodtabell.
 ## Verifiering och nuvarande gränser
 
 ```sh
+# I syskonrepot dunder-hundmat:
 dunder run dogfood/enums.ddr
 # 42
 # enums ok
@@ -143,7 +144,7 @@ dunder test dogfood/enums.ddr
 python3 tools/test-diagnostics.py "$(command -v dunder)"
 ```
 
-[Dogfood-programmet](../dogfood/enums.ddr) provar båda formerna och nästlade
+Programmet `dogfood/enums.ddr` i `dunder-hundmat` provar båda formerna och nästlade
 `Ok`/`Err`-resultat. Native-integrationstester täcker typfel, modulidentitet,
 privata typer, egna taggvärden, arrayer/structfält, blandade payloads,
 funktionsvärden, callbacks, rekursiva returer, stackargument och verklig fil-I/O.

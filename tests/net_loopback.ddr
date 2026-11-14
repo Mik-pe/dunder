@@ -1,0 +1,232 @@
+capability network, filesystem
+
+import std.bytes as bytes
+import std.fs as fs
+import std.net as net
+import sys
+
+@test
+fn clock_and_confined_dir_bytes() {
+    t0 := sys.now_ms()
+    assert(t0 > 0)
+
+    root := ".dunder-netfs-" + sys.pid().str()
+    sub := root + "/sub"
+    assert(sys.mkdir(root).ok)
+    defer { unused := sys.remove_dir(root) }
+    assert(sys.mkdir(sub).ok)
+    defer { unused := sys.remove_dir(sub) }
+
+    bin_path := sub + "/payload.bin"
+    var raw: []u8 = [0, 1, 2, 13, 10, 128, 255, 65]
+    assert(sys.write_u8(bin_path, &raw).ok)
+    defer { unused := sys.remove_file(bin_path) }
+
+    dir := fs.grant_dir(root)
+    assert(!fs.resolve_read(&dir, "").ok)
+    assert(!fs.resolve_read(&dir, "/etc/passwd").ok)
+    assert(!fs.resolve_read(&dir, "../secret.txt").ok)
+    assert(!fs.resolve_read(&dir, "sub/../secret.txt").ok)
+    assert(!fs.resolve_read(&dir, ".").ok)
+    assert(!fs.resolve_read(&dir, "sub/").ok)
+    assert(!fs.resolve_read(&dir, "sub\\payload.bin").ok)
+    assert(!fs.resolve_read(&dir, "sub//payload.bin").ok)
+
+    opened := fs.resolve_read(&dir, "sub/payload.bin")
+    assert(opened.ok)
+    loaded := fs.read_bytes(&opened.file)
+    assert(loaded.ok && loaded.value.len == 8)
+    assert(loaded.value[0] == 0 && loaded.value[5] == 128 && loaded.value[6] == 255 && loaded.value[7] == 65)
+
+    // Non-UTF-8 binary payload must succeed with read_bytes and fail UTF-8 decoding with 92.
+    bad_utf8 := bytes.decode_range(&loaded.value, 5, 7)
+    assert(!bad_utf8.ok && bad_utf8.error == 92)
+
+    t1 := sys.now_ms()
+    assert(t1 >= t0)
+}
+
+@test
+fn loopback_nonblocking_poll_roundtrip() {
+    lres := net.listen(net.loopback(), 0, 16)
+    assert(lres.ok)
+    var listener := lres.listener
+    defer { unused := net.close_listener(&mut listener) }
+
+    port := net.local_port(&listener)
+    assert(port > 0)
+    assert(net.set_listener_nonblocking(&listener, true).ok)
+
+    empty := net.accept(&listener)
+    assert(!empty.ok && empty.would_block)
+
+    cres := net.connect(net.loopback(), port)
+    assert(cres.ok)
+    var client := cres.stream
+    defer { unused := net.close(&mut client) }
+    assert(net.set_nodelay(&client, true).ok)
+
+    var req: []u8 = []
+    bytes.append_utf8(&mut req, "PING\r\n")
+    assert(net.write_all(&client, &req).ok)
+
+    var ps := net.poll_set()
+    net.poll_add(&mut ps, net.listener_fd(&listener), net.poll_in())
+    pr := net.poll(&mut ps, 2000)
+    assert(pr.ok && pr.count == 1)
+    assert(ps.revents[0].bit_and(net.poll_in()) != 0)
+
+    ares := net.accept(&listener)
+    assert(ares.ok)
+    var accepted := ares.stream
+    defer { unused := net.close(&mut accepted) }
+    assert(net.set_nonblocking(&accepted, true).ok)
+    assert(net.set_nodelay(&accepted, true).ok)
+
+    var srx: []u8 = []
+    net.poll_clear(&mut ps)
+    net.poll_add(&mut ps, net.stream_fd(&accepted), net.poll_in())
+    pr2 := net.poll(&mut ps, 2000)
+    assert(pr2.ok && pr2.count == 1)
+    rr := net.read_append(&accepted, &mut srx, 1024)
+    assert(rr.ok && !rr.eof && rr.count == 6)
+    assert(bytes.equals_text(&srx, 0, srx.len, "PING\r\n"))
+
+    // Non-blocking read when empty returns would_block.
+    rr_again := net.read_append(&accepted, &mut srx, 1024)
+    assert(!rr_again.ok && rr_again.would_block)
+
+    var pong: []u8 = []
+    bytes.append_utf8(&mut pong, "PONG\r\n")
+    wr := net.write_range(&accepted, &pong, 0, pong.len)
+    assert(wr.ok && wr.count == 6)
+    assert(net.shutdown_write(&accepted).ok)
+
+    var crx: []u8 = []
+    for _ in 0..4 {
+        r := net.read_append(&client, &mut crx, 64)
+        assert(r.ok)
+        if r.eof { break }
+    }
+    assert(bytes.equals_text(&crx, 0, crx.len, "PONG\r\n"))
+
+    // Closing twice via idempotent helper must succeed.
+    assert(net.close(&mut client).ok)
+    assert(net.close(&mut client).ok)
+}
+
+@test
+fn stream_set_pool_and_slot_reuse() {
+    lres := net.listen(net.loopback(), 0, 16)
+    assert(lres.ok)
+    var listener := lres.listener
+    defer { unused := net.close_listener(&mut listener) }
+    port := net.local_port(&listener)
+    assert(port > 0)
+
+    c1_res := net.connect(net.loopback(), port)
+    assert(c1_res.ok)
+    var c1 := c1_res.stream
+    defer { unused := net.close(&mut c1) }
+
+    a1_res := net.accept(&listener)
+    assert(a1_res.ok)
+    var a1 := a1_res.stream
+    assert(net.set_nonblocking(&a1, true).ok)
+
+    var pool := net.stream_set()
+    defer { net.set_close_all(&mut pool) }
+    slot0 := net.set_insert(&mut pool, &mut a1)
+    assert(slot0 == 0 && net.set_len(&pool) == 1 && net.set_fd(&pool, slot0) >= 0)
+    // Ownership transferred to pool; closing original TcpStream is now a no-op.
+    assert(net.stream_fd(&a1) == -1 && net.close(&mut a1).ok)
+
+    var msg: []u8 = []
+    bytes.append_utf8(&mut msg, "SLOT\r\n")
+    assert(net.write_all(&c1, &msg).ok)
+
+    var ps := net.poll_set()
+    net.poll_add(&mut ps, net.set_fd(&pool, slot0), net.poll_in())
+    assert(net.poll(&mut ps, 2000).ok)
+
+    var rx: []u8 = []
+    rr := net.set_read_append(&pool, slot0, &mut rx, 64)
+    assert(rr.ok && rr.count == 6 && bytes.equals_text(&rx, 0, rx.len, "SLOT\r\n"))
+
+    var reply: []u8 = []
+    bytes.append_utf8(&mut reply, "ACK\r\n")
+    wr := net.set_write_range(&pool, slot0, &reply, 0, reply.len)
+    assert(wr.ok && wr.count == 5)
+    assert(net.set_shutdown_write(&pool, slot0).ok)
+
+    var crx: []u8 = []
+    for _ in 0..4 {
+        r := net.read_append(&c1, &mut crx, 64)
+        assert(r.ok)
+        if r.eof { break }
+    }
+    assert(bytes.equals_text(&crx, 0, crx.len, "ACK\r\n"))
+
+    assert(net.set_close(&mut pool, slot0).ok)
+    assert(net.set_fd(&pool, slot0) == -1)
+
+    // Next inserted stream reuses slot 0 instead of growing pool.
+    c2_res := net.connect(net.loopback(), port)
+    assert(c2_res.ok)
+    var c2 := c2_res.stream
+    defer { unused := net.close(&mut c2) }
+    a2_res := net.accept(&listener)
+    assert(a2_res.ok)
+    var a2 := a2_res.stream
+    slot_reused := net.set_insert(&mut pool, &mut a2)
+    assert(slot_reused == 0 && net.set_len(&pool) == 1)
+}
+
+@test
+fn files_round_trip_through_the_os() {
+    root := ".dunder-fs-" + sys.pid().str()
+    created := sys.mkdir(root)
+    assert(created.ok)
+    original := root + "/å 🌍.txt"
+    renamed := root + "/renamed.txt"
+    assert(sys.write_text(original, "Dunder 🌍\n").ok)
+    assert(sys.append_text(original, "åäö").ok)
+    content := sys.read_text(original)
+    assert(content.ok)
+    assert(content.value == "Dunder 🌍\nåäö")
+    assert(content.value.runes().len == 12)
+    match sys.read(original) {
+        .Ok(text) => { assert(text == content.value) },
+        .Err(error) => { print(sys.io_error_message(error)); assert(false) },
+    }
+    info := sys.metadata(original)
+    assert(info.ok && info.is_file && !info.is_dir)
+    assert(info.size == i64(content.value.len))
+    assert(sys.metadata(root).is_dir)
+    assert(sys.rename(original, renamed).ok)
+    assert(sys.metadata(original).error == 2)
+    assert(sys.remove_file(renamed).ok)
+    assert(sys.remove_dir(root).ok)
+    assert(content.value.len == 18)
+}
+
+@test
+fn errors_remain_values() {
+    root := ".dunder-fs-errors-" + sys.pid().str()
+    assert(sys.mkdir(root).ok)
+    defer { unused := sys.remove_dir(root) }
+    missing := sys.read_text(root + "/missing")
+    assert(!missing.ok)
+    assert(missing.error == 2)
+    assert(missing.value == "")
+    match sys.read(root + "/missing") {
+        .Ok(_) => { assert(false) },
+        .Err(error) => {
+            match error { .NotFound => {}, _ => { assert(false) } }
+        },
+    }
+    assert(sys.error_message(missing.error) == "no such file or directory")
+    assert(sys.mkdir(root).error == 17)
+    assert(sys.read_text(root).error == 21)
+    assert(sys.write_text(root + "\0/ignored", "bad").error == 22)
+}

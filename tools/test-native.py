@@ -77,57 +77,59 @@ def bundle(build, work):
 
 
 def graphics(build, work, live):
-    sources = ROOT / 'dogfood'
-    shutil.copytree(sources / 'graphics', work / 'graphics')
-    standalone = work / 'external.ddr'
-    standalone.write_text('import graphics.vulkan as vk\nimport graphics.macos as mac\n'
-                          'fn main(){print(vk.rgb(1.0,0.0,0.0).red == mac.rgb(1.0,0.0,0.0).red)}\n')
-    build(standalone, work / 'external')
-    assert command([work / 'external'], cwd=work).stdout == 'true\n'
     for name in ('macos', 'vulkan'):
-        standalone.write_text(f'import std.{name}\nfn main(){{}}\n')
-        assert f'std/{name}.ddr' in build(standalone, work / 'unexpected', status=None).stderr
-    triangle = sources / 'vulkan/triangle.ddr'
-    metal = sources / 'metal/triangle.ddr'
-    for source, target in [(triangle, 'arm64-macos'), (metal, 'arm64-linux')]:
+        probe = work / 'unexpected.ddr'
+        probe.write_text(f'import std.{name}\nfn main(){{}}\n')
+        assert f'std/{name}.ddr' in build(probe, work / 'unexpected', status=None).stderr
+
+    linux_ffi = work / 'linux_ffi.ddr'
+    linux_ffi.write_text(
+        'capability unsafe\n'
+        '@extern("c", "calloc") unsafe fn allocate(count: usize, bytes: usize) -> ptr\n'
+        'fn main() {\n'
+        '    unsafe {\n'
+        '        p := static_bytes("linux", 16)\n'
+        '        _ := allocate\n'
+        '        if p == ptr(0) { return }\n'
+        '    }\n'
+        '}\n'
+    )
+    mac_bundle = work / 'mac_bundle.ddr'
+    mac_bundle.write_text(
+        'capability unsafe\n'
+        'fn main() {\n'
+        '    unsafe {\n'
+        '        p := static_bytes("macos", 16)\n'
+        '        if p == ptr(0) { print(0) }\n'
+        '    }\n'
+        '}\n'
+    )
+    for source, target in [(linux_ffi, 'arm64-macos'), (mac_bundle, 'arm64-linux')]:
         rejection = build(source, work / 'unexpected', '--target', target, status=None)
         assert 'requires the selected native platform' in rejection.stderr
         assert not (work / 'unexpected').exists()
     for target, (machine, interpreter) in LINUX_TARGETS.items():
         path = work / target
-        build(triangle, path, '--target', target)
+        build(linux_ffi, path, '--target', target)
         image = path.read_bytes()
         check_elf(image, machine, interpreter)
-        build(triangle, path, '--target', target)
+        build(linux_ffi, path, '--target', target)
         assert image == path.read_bytes()
-    mac_triangle = work / 'Triangle.app'
-    build(metal, mac_triangle, '--target', 'arm64-macos', '--app')
-    print('PASS external graphics modules and cross-builds: Metal app, ARM64 and x86-64 Vulkan ELF')
-    if not live:
-        print('Graphics execution was not requested. Pass --graphics on a suitable host.')
-        return
+    mac_app = work / 'Triangle.app'
+    mac_resource = mac_app / 'Contents/Resources/shader.bin'
+    mac_resource.parent.mkdir(parents=True)
+    mac_resource.write_bytes(b'metal-shader')
+    build(mac_bundle, mac_app, '--target', 'arm64-macos', '--app')
+    plist = plistlib.loads((mac_app / 'Contents/Info.plist').read_bytes())
+    assert plist['CFBundleExecutable'] == 'Triangle'
+    assert (mac_app / 'Contents/MacOS/Triangle').is_file()
+    assert (mac_app / 'Contents/Resources/shader.bin').read_bytes() == b'metal-shader'
     if MAC:
-        command(['/usr/bin/codesign', '--verify', '--strict', mac_triangle], cwd=work)
-        programs = [(mac_triangle / 'Contents/MacOS/Triangle', ['--frames', '3'], 'triangle frames=3')]
-        for name, args, expected in [('main', ['--frames', '3'], 'atlas frames=3'),
-                                     ('lifecycle', [], 'lifecycle cycles=3'), ('events', [], 'native event sequence ok')]:
-            path = work / name
-            build(sources / f'metal/{name}.ddr', path)
-            programs.append((path, args, expected))
-        for binary, args, expected in programs:
-            assert command([binary, *args], cwd=work, env={'MTL_DEBUG_LAYER': '1'}).stdout.strip() == expected
-        print('PASS live AppKit/Metal: triangle and Atlas frames, window lifecycle and native events')
-    else:
-        for name, args, expected in [('triangle', ['--headless', '--frames', '3'], 'triangle frames=3'),
-                                     ('main', ['--headless', '--frames', '3'], 'atlas frames=3'),
-                                     ('lifecycle', [], 'lifecycle cycles=3'), ('pixels', [], 'pixels ok'),
-                                     ('events', [], 'SDL surface and events ok')]:
-            path = work / name
-            build(sources / f'vulkan/{name}.ddr', path)
-            env = {'SDL_VIDEODRIVER': 'dummy'} if name == 'events' else {}
-            result = command([path, *args], cwd=work, env=env)
-            assert result.stdout.splitlines()[-1] == expected, result.stdout
-        print('PASS live Vulkan: triangle and Atlas frames, RGBA interpolation, alpha, lifecycle and SDL surface/events')
+        command(['/usr/bin/codesign', '--verify', '--strict', mac_app], cwd=work)
+        assert command([mac_app / 'Contents/MacOS/Triangle'], cwd=work).stdout == ''
+    print('PASS platform-gated static_bytes, C-FFI ELF cross-builds, and macOS .app bundle')
+    if live:
+        print('Graphics demos now live in dunder-hundmat; run tools/test-graphics.py --graphics there.')
 
 
 def main():

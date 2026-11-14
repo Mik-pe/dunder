@@ -41,7 +41,7 @@ print_string(p){const b=instance.exports.memory.buffer,n=new DataView(b).getUint
 print(new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array(b,p+8,n)));}}});
 const result=instance.exports.main();assert.ok(result===undefined||result===0);
 '''
-CASES = ('generated', 'selfhost', 'selfhost-parallel', 'tabell', 'hello', 'owned')
+CASES = ('generated', 'selfhost', 'selfhost-parallel', 'hello', 'owned')
 
 
 def quantile95(values):
@@ -148,21 +148,12 @@ def sources(root):
 def make_cases(root, work):
     generated, corpus = perf.corpus(work)
     owned = work / 'owned.ddr'; owned.write_text(OWNED)
-    with (root / 'projects/tabell/expenses.csv').open(newline='') as stream:
-        totals = {}
-        for row in csv.DictReader(stream):
-            totals[row['team']] = totals.get(row['team'], 0) + int(row['cents'])
-    tabell = ('group,total\n' + ''.join(f'{k},{v}\n' for k, v in sorted(totals.items()))).encode()
-    if tabell != (root / 'projects/tabell/expected.csv').read_bytes():
-        raise RuntimeError('Tabell golden differs from independent CSV arithmetic')
     original = [5, 6, 7]; changed = [v + 1 for v in original]
     owned_expected = f'{sum(changed)}\n{original[0]}\n{changed[-1]}\n'.encode()
     cases = {
         'generated': (generated, [], f'{sum(range(1000)) + 1000 * 96}\n'.encode()),
         'selfhost': (root / 'selfhost/main.ddr', [], b'42\ntrue\n'),
         'selfhost-parallel': (root / 'selfhost/main_parallel.ddr', [], b'42\ntrue\n'),
-        'tabell': (root / 'projects/tabell/main.ddr',
-                   [root / 'projects/tabell/expenses.csv', 'team', 'cents'], tabell),
         'hello': (root / 'examples/hello.ddr', [], b'42\ntrue\n'),
         'owned': (owned, [], owned_expected),
     }

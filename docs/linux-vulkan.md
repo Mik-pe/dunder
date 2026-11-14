@@ -1,13 +1,13 @@
 # Vulkan på Linux
 
-Programmen i `dogfood/vulkan/` importerar grafikbiblioteket med
+Programmen i `dunder-hundmat` (`dogfood/vulkan/`) importerar grafikbiblioteket med
 `import ..graphics.vulkan as vulkan`. Ingången är
-[dogfood/graphics/vulkan.ddr](../dogfood/graphics/vulkan.ddr). Ett eget
+`dogfood/graphics/vulkan.ddr` i syskonrepot `dunder-hundmat`. Ett eget
 projekt kan kopiera `vulkan.ddr` och dess syskonkatalog `vulkan/` till
 `graphics/` bredvid sin `main.ddr` och använda `import graphics.vulkan as vulkan`.
 
 Biblioteket laddar systemets Vulkan-bibliotek genom `std.dl`.
-[Implementationen](../dogfood/graphics/vulkan/) beskriver
+Implementationen i `dogfood/graphics/vulkan/` beskriver
 driverstrukturerna med `@c_layout` och anropar
 Vulkan och SDL genom typade `extern fn`-fält. Modulen äger allokering,
 livscykel, rasteriseringens konfiguration och händelsehantering.

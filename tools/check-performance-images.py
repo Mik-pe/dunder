@@ -70,10 +70,7 @@ def main():
             cases = [(name, source_root / 'benchmarks/runtime' / (name + '.ddr'), inputs,
                       (str(expected) + '\n').encode()) for name, inputs, expected in helper.runtime_cases()]
             cases += [('generated', generated, [], b'595500\n'),
-                      ('selfhost', source_root / 'selfhost' / (entry + '.ddr'), [], None),
-                      ('tabell', source_root / 'projects/tabell/main.ddr',
-                       [source_root / 'projects/tabell/expenses.csv', 'team', 'cents'],
-                       (source_root / 'projects/tabell/expected.csv').read_bytes())]
+                      ('selfhost', source_root / 'selfhost' / (entry + '.ddr'), [], None)]
             for name, source, inputs, expected in cases:
                 images = {}
                 for variant, compiler in compilers.items():

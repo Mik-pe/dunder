@@ -97,7 +97,7 @@ Kompilatorn bäddar in standardmodulerna som räknas upp i
 källtext regenereras läser [selfhost/embed.ddr](../selfhost/embed.ddr)
 samma lista. Vanliga filimporter löses på disk relativt den importerande filen.
 
-Grafikbindningarna följer med exempelprogrammens källkod. Dunder-modulerna
+Grafikbindningarna ligger i syskonrepot `dunder-hundmat`: Dunder-modulerna
 i `dogfood/graphics/` beskriver bibliotekens C-layout, slår upp
 funktionspekare och äger fönster-, renderings- och händelselogiken. WebGPU-exemplet
 i `dogfood/webgpu/` anropar sin JavaScript-värd via en vanlig Wasm-import.

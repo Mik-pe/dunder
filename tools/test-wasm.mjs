@@ -9,12 +9,14 @@ import { fileURLToPath } from 'node:url';
 const script = fileURLToPath(import.meta.url);
 const root = fileURLToPath(new URL('../', import.meta.url));
 
-// These dogfood contracts use process or filesystem services. A target that
+// These native contracts use process, socket, or filesystem services. A target that
 // learns to compile them still runs their assertions.
 const nativeGroups = new Set([
-    'dogfood/filesystem.ddr::files_round_trip_through_the_os',
-    'dogfood/filesystem.ddr::errors_remain_values',
-    'dogfood/enums.ddr::value_enums_work_in_records_and_arrays',
+    'tests/net_loopback.ddr::clock_and_confined_dir_bytes',
+    'tests/net_loopback.ddr::loopback_nonblocking_poll_roundtrip',
+    'tests/net_loopback.ddr::stream_set_pool_and_slot_reuse',
+    'tests/net_loopback.ddr::files_round_trip_through_the_os',
+    'tests/net_loopback.ddr::errors_remain_values',
     'selfhost/compile.ddr::string_operand_leases_are_removed_only_across_effect_free_rhs',
     'selfhost/compile.ddr::ownership_proofs_do_not_change_validation_or_binding_records',
     'selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants',
@@ -85,5 +87,5 @@ function suite(compiler, source) {
 
 const [, , compiler, source] = process.argv;
 if (compiler === '--execute' && source) await execute(source);
-else if (compiler && process.argv.length <= 4) suite(resolve(compiler), source || 'dogfood/tests.ddr');
+else if (compiler && process.argv.length <= 4) suite(resolve(compiler), source || 'tests/suite.ddr');
 else throw Error('usage: node tools/test-wasm.mjs /path/to/dunder [suite.ddr]');

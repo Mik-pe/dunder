@@ -150,25 +150,24 @@ korrigerar instruktioner, etiketter och relokeringar atomiskt.
 Fasur och allokeringstrafik kan profileras separat utan att vanlig emission
 instrumenteras. [Profilering](incremental.md#mät-byggkedjans-faser).
 
-Tabell är ett fristående CSV-projekt med eget manifest, gruppering,
-Unicode, sortering och kontrollerat heltalsspill. Grafikexemplen använder
-samma filimporter och typade värdanrop som externa program. macOS använder
-AppKit och Metal, Linux använder Vulkan och webbläsaren använder WebGPU
-med Dunder-skrivna vertexdata. [Tabell](../projects/tabell/README.md),
-[Metal](macos-metal.md), [Vulkan](linux-vulkan.md), [WebGPU](../dogfood/webgpu/README.md)
-och [macOS-appar](app-bundles.md).
+Grafikexemplen (Metal, Vulkan, WebGPU), CSV-verktyget Tabell och
+HTTP/1.1-servern underhålls i syskonrepot
+[dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
+Se [Metal](macos-metal.md), [Vulkan](linux-vulkan.md) och [macOS-appar](app-bundles.md).
 
 ## Körda Wasm-kontrakt
 
-Den självbyggda kompilatorn byggde varje portabel grupp i `dogfood/tests.ddr`
-till en separat Wasm-modul. Node körde 124 av de 138 grupperna med godkänt
-resultat. De fjorton övriga har nåbara nativa systemanrop.
+Den självbyggda kompilatorn byggde varje portabel grupp i `tests/suite.ddr`
+till en separat Wasm-modul. Node körde de portabla testgrupperna; de nativt
+begränsade grupperna har nåbara OS-, fil- eller socketanrop.
 
 | Grupp | Nativt beroende |
 | --- | --- |
-| `dogfood/filesystem.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
-| `dogfood/filesystem.ddr::errors_remain_values` | Fel från filåtkomst |
-| `dogfood/enums.ddr::value_enums_work_in_records_and_arrays` | Filmetadata |
+| `tests/net_loopback.ddr::clock_and_confined_dir_bytes` | Klocka och filåtkomst |
+| `tests/net_loopback.ddr::loopback_nonblocking_poll_roundtrip` | Nätverkssockets (`std.net`) |
+| `tests/net_loopback.ddr::stream_set_pool_and_slot_reuse` | Socketpool (`std.net`) |
+| `tests/net_loopback.ddr::files_round_trip_through_the_os` | Läsning och skrivning av filer |
+| `tests/net_loopback.ddr::errors_remain_values` | Fel från filåtkomst |
 | `selfhost/compile.ddr::string_operand_leases_are_removed_only_across_effect_free_rhs` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::ownership_proofs_do_not_change_validation_or_binding_records` | Kompilatorns filåtkomst |
 | `selfhost/compile.ddr::rune_literals_emit_the_same_code_as_scalar_constants` | Kompilatorns filåtkomst |
@@ -192,7 +191,7 @@ minnet hade samma storlek efter första och andra körningen.
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
-"$dunder_bin" test dogfood/tests.ddr
+"$dunder_bin" test tests/suite.ddr
 node tools/test-wasm.mjs "$dunder_bin"
 node tools/test-wasm-scalars.mjs "$dunder_bin"
 node tools/test-wasm-abi.mjs "$dunder_bin"

@@ -118,6 +118,7 @@ Direkt utskrift frigör sin formatteringssträng efter skrivningen;
 ## Körda program och gränser
 
 ```sh
+# I syskonrepot dunder-hundmat:
 dunder run dogfood/numeric/main.ddr
 # 5.0
 # 2.0

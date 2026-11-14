@@ -76,7 +76,8 @@ inklusive Vulkan-scenens geometri och SHA-256.
 `node tools/test-wasm-abi.mjs /sökväg/till/dunder` kontrollerar värdanrop,
 C-layout, callbacks och WebGPU-exemplets vertexdata. WebGPU-exemplet
 inkluderar en webbläsarvärd och gemensamma
-Dunder-vertexdata. Se [WebGPU-triangeln](../dogfood/webgpu/README.md) och
+Dunder-vertexdata. WebGPU-triangeln ligger i syskonrepot `dunder-hundmat`;
+kompilatorns ABI-kontroll provar motsvarande fixture via
 [den Dunder-skrivna Wasm-kompilatorn](../selfhost/README.md).
 
 ## Bootstrap och kodgenerering
@@ -105,7 +106,7 @@ till målet. Dunders interna funktions-ABI är inte ett publikt C-ABI.
 
 ## Lokal verifiering
 
-Bygg med `./tools/bootstrap.sh`, kör `dunder test dogfood/tests.ddr` på
+Bygg med `./tools/bootstrap.sh`, kör `dunder test tests/suite.ddr` på
 värdplattformen och välj motsvarande testvärd för korsbyggd kod. QEMU kan
 köra korsbyggda Linuxprogram och Node kan instansiera Wasm-moduler.
 På macOS kontrollerar `codesign --verify --strict` signaturen på en

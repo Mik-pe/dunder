@@ -270,8 +270,7 @@ Modulen exporterar `main`, `memory` och `__indirect_function_table`. Vid
 värdgränsen upptar pekare och `usize` fyra byte. Skalära importer och
 callbacks har deklarerade Wasm-signaturer. Värden tar emot C-layoutposter
 via pekare. Systemanrop för filer och processer kräver ett nativt mål eller
-en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md)
-och [WebGPU-exemplet](../dogfood/webgpu/README.md).
+en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 
 ## Filer
 
@@ -307,7 +306,7 @@ och [WebGPU-exemplet](../dogfood/webgpu/README.md).
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
-"$dunder_bin" test dogfood/tests.ddr
+"$dunder_bin" test tests/suite.ddr
 python3 tools/test-diagnostics.py "$dunder_bin"
 python3 tools/runtime-contracts.py "$dunder_bin"
 node tools/test-wasm.mjs "$dunder_bin"
@@ -326,7 +325,7 @@ Testgrupperna får varsin process. För en enskild grupp kan kompilatorn
 skriva en egen startpunkt med `build-tests`.
 
 ```sh
-"$dunder_bin" build-tests dogfood/tests.ddr --list
-"$dunder_bin" build-tests dogfood/tests.ddr --group 0 --target wasm32 -o group.wasm
+"$dunder_bin" build-tests tests/suite.ddr --list
+"$dunder_bin" build-tests tests/suite.ddr --group 0 --target wasm32 -o group.wasm
 node tools/test-wasm.mjs --execute group.wasm
 ```
