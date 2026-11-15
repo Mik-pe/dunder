@@ -7,7 +7,7 @@ Nåbara taskoperationer på övriga mål avvisas före kodemission.
 
 ```dunder
 fn sum(values: []i64) -> i64 {
-    var total: i64 = 0
+    mut total: i64 = 0
     for value in values { total = total + value }
     total
 }
@@ -45,14 +45,19 @@ Det får inte kopieras, lånas eller lämna sitt block.
 `await jobs(id)` kontrollerar scope, generation, ordinal och exakt resultattyp
 innan jobbets kontrollblock läses. Gamla nycklar fungerar därför inte med ett
 nytt scope, även om allokeraren återanvänder samma minnesadress. Generationer
-återanvänds aldrig vid overflow. Varje await lämnar en vanlig värdekopia av
-det cachade resultatet. Ändring av en returnerad array påverkar varken cachen
-eller nästa await.
+återanvänds aldrig vid overflow. Vanlig `await` kan läsas upprepade gånger för kopierbara resultat.
+Resursägande resultat kräver `await!`, som tar över resultatet en gång.
+Kloning av ett övertaget värde begärs därefter uttryckligen med `.clone()`.
 
-`await! jobs(id)` tar över det färdiga resultatets ägarskap. Det går att
-först läsa med vanlig `await` och sedan överta originalet med `await!`.
+`await! jobs(id)` tar över det färdiga resultatets ägarskap. För kopierbara resultat går det att först läsa med vanlig `await`
+och sedan använda `await!`.
 Efter övertagandet ger varje ny läsning av samma nyckel, inklusive kopior
 av nyckeln, taskfelet 112. Resultatvärdet överlever scopet som andra ägda värden.
+
+Vanliga workerparametrar läser lånade snapshots. `move`-parametrar tar över
+sin jobbägda indata. `spawn` och delade taskdata är uttryckliga gränser för
+isolering: runtime kan behöva kopiera data mellan separata workerarenor.
+Dessa isoleringskopior är skilda från vanliga funktionsanrop, som lånar.
 
 ## Återanvändbar arbetsyta
 
@@ -101,8 +106,7 @@ parametern `world: &World`. För ett scope med arbetsyta skrivs
 
 Föräldern kan ändra sitt ursprungliga värde efter öppningen. Den ägda
 snapshoten är åtkomlig genom vanliga delade lån i workerfunktionerna och
-frigörs först när alla jobb avslutats. En worker som kopierar ett fält får
-en vanlig egen värdekopia. Data-kontrollen gäller även för varje nästlat
+frigörs först när alla jobb avslutats. En worker som uttryckligen klonar ett fält får en egen ägare. Data-kontrollen gäller även för varje nästlat
 fält, vilket utesluter delade RC-strängar, råpekare och oklassificerade
 opaque-typer. Numeriska typ-ID:n, arrayer och packad UTF-8 passar i detta
 gränssnitt.
@@ -213,8 +217,8 @@ Fulluttryckets exakt identifierade, unikt ägda recordtemporär kan överföras
 utan en extra djupkopia inom samma runtime. Den generiska normaliseringen
 bevarar nästlade arrayers synliga kopieringskapacitet; strängar, delade
 enums och inline C-layout är stoppunkter. Lokaler och fältprojektioner
-behåller värdesemantiken. Detta inför inga allmänna moves och tar inte bort
-isoleringskopiorna vid spawn/join.
+är skild från språkets allmänna ägarflyttar. Isoleringskopiorna vid
+spawn/join behövs fortfarande mellan workerarenorna.
 
 Den historiska [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
 skiljer samma binär med en respektive fyra workers från jämförelsen med

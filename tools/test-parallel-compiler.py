@@ -30,30 +30,30 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
 CORE = {
-    'arithmetic': ('''fn earlier(n:i64)->i64{var total:i64=0;for i in 0..8{total=total+n+i64(i)};total}
+    'arithmetic': ('''fn earlier(n:i64)->i64{mut total:i64=0;for i in 0..8{total=total+n+i64(i)};total}
 fn later(n:i64)->i64{earlier(n)+1}
 fn main(){print(later(2));print(later(5))}
 ''', '45\n69\n'),
     'owned': ('''struct Box{a:[]i64,n:i64}
 fn owned(n:i64)->Box{Box{a:[n,n+1,n+2],n:n}}
-fn mutate(a:&mut []i64)->i64{var sum:i64=0;for i in 0..a.len{a[i]=a[i]+1;sum=sum+a[i]};sum}
+fn mutate(a:&mut []i64)->i64{mut sum:i64=0;for i in 0..a.len{a[i]=a[i]+1;sum=sum+a[i]};sum}
 fn relay(n:i64)->Box{owned(n)}
-fn main(){x:=relay(5);var a:=x.a;print(mutate(&mut a));print(x.a[0]);print(a[2])}
+fn main(){x:=relay(5);mut a:=x.a.clone();print(mutate(&mut a));print(x.a[0]);print(a[2])}
 ''', '21\n5\n8\n'),
     'strings': ('''fn integer(n:i64)->string{n.str()}
 fn text(n:i64)->string{"h🙂\\0"+integer(n)}
-fn count(t:string)->i64{var sum:i64=0;for r in t.runes(){sum=sum+1};sum}
+fn count(t:string)->i64{mut sum:i64=0;for r in t.runes(){sum=sum+1};sum}
 fn main(){t:=text(42);print(count(t));print(t.bytes().len);print(t=="h🙂\\042")}
 ''', '5\n8\ntrue\n'),
 }
 TASK_SOURCE = '''fn worker(x:i64)->[]i64{[x,x+1]}
-fn answer()->[]i64{task scope s(2){a:=spawn s worker(41);b:=spawn s worker(43);ignored:=await s(b);return await s(a)}}
+fn answer()->[]i64{task scope s(2){a:=spawn s worker(41);b:=spawn s worker(43);ignored:=await! s(b);return await! s(a)}}
 fn main(){a:=answer();print(a[0]);print(a[1])}
 '''
 CACHE_SOURCE = '''fn private(x:i32)->i32{x+INC}
 fn first(x:i32)->i32{private(x)+private(x+1)}
 fn second(x:i32)->i32{private(x)*2}
-fn third(x:i32)->i32{var s:=x;for i in 0..4{s=s+i};s}
+fn third(x:i32)->i32{mut s:=x;for i in 0..4{s=s+i};s}
 fn main(){print(first(1)+second(2)+third(0))}
 '''
 
@@ -152,9 +152,9 @@ class Probe:
 
     def reachable_frontend(self):
         count = 42
-        bodies = [f'fn f{i}(x:i32)->i32{{var n:=x;for j in 0..3{{n=n+j}};n+{i}}}' for i in range(count)]
+        bodies = [f'fn f{i}(x:i32)->i32{{mut n:=x;for j in 0..3{{n=n+j}};n+{i}}}' for i in range(count)]
         calls = [f'n=n+f{i}(1)' for i in range(count)]
-        source = self.case('reachable_frontend', '\n'.join(bodies + ['fn main(){var n:=0;', *calls, 'print(n)}']))
+        source = self.case('reachable_frontend', '\n'.join(bodies + ['fn main(){mut n:=0;', *calls, 'print(n)}']))
         images = []
         for driver in self.drivers:
             name, _, jobs = driver
@@ -178,7 +178,7 @@ class Probe:
         require(len(set(diagnostics)) == 1 and ':8:' in diagnostics[0], diagnostics)
         owned = [f'fn g{i}(s:string)->string{{s+"{i}"}}' for i in range(12)]
         calls = [f's=g{i}(s)' for i in range(12)]
-        source = self.case('reachable_owned', '\n'.join(owned + ['fn main(){var s:="";', *calls, 'print(s)}']))
+        source = self.case('reachable_owned', '\n'.join(owned + ['fn main(){mut s:="";', *calls, 'print(s)}']))
         images = []
         for driver in self.drivers:
             name, _, jobs = driver
@@ -194,7 +194,7 @@ class Probe:
 
     def diagnostics(self):
         sources = {
-            'reachable_error': '''fn first(n:i64)->i64{var s:i64=0;for i in 0..8{s=s+n};s}
+            'reachable_error': '''fn first(n:i64)->i64{mut s:i64=0;for i in 0..8{s=s+n};s}
 fn bad(n:i64)->i64{true}
 fn main(){print(first(1));print(bad(2))}
 ''',
@@ -246,7 +246,7 @@ fn main() { print(0) }
     def worker_expression_depth(self):
         # Force substantial independent typing work so --jobs=2/4 run the
         # boundary cases on real worker stacks. --jobs=1 checks locally.
-        body = ''.join(f'var v{n}:i64={n};' for n in range(160))
+        body = ''.join(f'mut v{n}:i64={n};' for n in range(160))
         ballast = ''.join(f'fn body{n}(){{{body}}}\n' for n in range(100))
         for depth in (42, 43):
             expression = '1+(' * depth + '1' + ')' * depth
@@ -272,7 +272,7 @@ fn main() { print(0) }
                  source.parent)
         quoted = str(library).replace('\\', '\\\\').replace('"', '\\"')
         source.write_text('capability unsafe\n@extern("' + quoted + '''","twice") unsafe fn twice(f:extern fn(i32)->i32,x:i32)->i32
-fn step(x:i32)->i32{var s:=x;for i in 0..2{s=s+1};s}
+fn step(x:i32)->i32{mut s:=x;for i in 0..2{s=s+1};s}
 fn memory(x:i64)->i64{unsafe{p:=static_bytes("native",32);store_i64(p,x);load_i64(p)}}
 fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("literal")}}
 ''')
@@ -281,9 +281,9 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
     def saturation(self):
         source = 'fn step(x:i32)->i32{x+1}\n'
         for function in range(20):
-            source += ('fn consume' + str(function) + '()->i32{var sum:=0;' +
+            source += ('fn consume' + str(function) + '()->i32{mut sum:=0;' +
                        'sum=sum+step(1);' * 100 + 'sum}\n')
-        source += 'fn main(){var total:=0;'
+        source += 'fn main(){mut total:=0;'
         source += ''.join('total=total+consume' + str(f) + '();' for f in range(20))
         path = self.case('inline_caller_budgets', source + 'print(total)}\n')
         self.matrix(path, '4000\n', ('arm64-macos',))

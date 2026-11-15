@@ -102,8 +102,8 @@ fn nested(a:{ty})->{ty}{{(a/(-7))%3}}
 fn shorted(a:{ty})->bool{{a==0 || a/0==1}}
 fn choose(a:{ty})->{ty}{{if a<0{{return a/(-3)}}else{{return a%5}}}}
 fn pressure(n:{ty})->{ty}{{'''
-        source += ''.join(f'var a{i}:=n+{i};' for i in range(18))
-        source += 'var i:=0;while i<4{'
+        source += ''.join(f'mut a{i}:=n+{i};' for i in range(18))
+        source += 'mut i:=0;while i<4{'
         ds = [3, -5, 7, -11, 13, -17] * 3
         source += ''.join(f'a{i}=a{i}/{d};' for i, d in enumerate(ds))
         source += 'i=i+1};' + '+'.join(f'a{i}*{i+1}' for i in range(18)) + '}\n'
@@ -111,7 +111,7 @@ fn pressure(n:{ty})->{ty}{{'''
         source += '{a/3+b/(-5)+c/7+d/(-11)+e/13+f/(-17)+g/19+h/(-23)}\nfn main(){'
         expected = []
         for a, b, c in [(-77777, 31, -7), (-101, -33, 9), (0, 7, 1), (17, -9, 3), (123456, 3, -2)]:
-            source += '{var a:' + ty + f'={a};var b:{ty}={b};var c:{ty}={c};'
+            source += '{mut a:' + ty + f'={a};mut b:{ty}={b};mut c:{ty}={c};'
             source += 'print(complex(a,b,c));print(folded(a));print(compound(a,b));print(nested(a));print(choose(a));print(pressure(a))}'
             values = [a + i for i in range(18)]
             for _ in range(4):
@@ -121,10 +121,10 @@ fn pressure(n:{ty})->{ty}{{'''
                          quotient(a, -7) - quotient(quotient(a, -7), 3)*3,
                          quotient(a, -3) if a < 0 else a - quotient(a, 5)*5,
                          sum(n*(i+1) for i, n in enumerate(values))]
-        source += 'var zero:' + ty + '=0;print(shorted(zero));'
+        source += 'mut zero:' + ty + '=0;print(shorted(zero));'
         expected.append(True)
         values = [91, -72, 53, -34, 25, -16, 7, -8]
-        source += ''.join(f'var p{i}:{ty}={n};' for i, n in enumerate(values))
+        source += ''.join(f'mut p{i}:{ty}={n};' for i, n in enumerate(values))
         source += 'print(eight(' + ','.join(f'p{i}' for i in range(8)) + '))}\n'
         expected.append(sum(quotient(n, d) for n, d in zip(values, [3,-5,7,-11,13,-17,19,-23])))
         yield f'compound_i{width}', source, expected, 8
@@ -143,13 +143,13 @@ def trap_programs():
                     ('numerator_underflow_before_one', f'(n-1){operator}1', low, 101),
                     ('nested_zero_before_one', f'(n/0){operator}1', 1, 102),
                     ('denominator_overflow', f'n{operator}({high}+1)', 0, 101)):
-                source = f'fn f(n:{ty})->{ty}{{{expression}}}\nfn main(){{var n:{ty}={argument};print(17);value:=f(n);print(99)}}\n'
+                source = f'fn f(n:{ty})->{ty}{{{expression}}}\nfn main(){{mut n:{ty}={argument};print(17);value:=f(n);print(99)}}\n'
                 yield f'{ty}_{label}_{suffix}', source, status
     for d in (0, 1, -1, 3):
         for op, label in (('/', 'div'), ('%', 'rem')):
-            source = f'fn f(a:&[]i64,i:i32)->i64{{a[i]{op}({d})}}\nfn main(){{a:[]i64=[5];var i:=-1;print(17);value:=f(&a,i);print(99)}}\n'
+            source = f'fn f(a:&[]i64,i:i32)->i64{{a[i]{op}({d})}}\nfn main(){{a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}}\n'
             yield f'array_{label}_{d}', source, 103
-    yield 'short_circuit_evaluated', 'fn f(n:i64)->bool{n==0||n/0==1}\nfn main(){var n:i64=1;print(17);value:=f(n);print(99)}\n', 102
+    yield 'short_circuit_evaluated', 'fn f(n:i64)->bool{n==0||n/0==1}\nfn main(){mut n:i64=1;print(17);value:=f(n);print(99)}\n', 102
 
 
 def invalid_programs():
@@ -172,18 +172,18 @@ def plan_program(module, directory):
     source += '''fn dump(p:&mut cd.Plan,d:i64,width:i32){
         assert(cd.prepare_into(&mut p,d,width))
         assert(p.supported)
-        var fresh:=cd.new();assert(cd.prepare_into(&mut fresh,d,width))
+        mut fresh:=cd.new();assert(cd.prepare_into(&mut fresh,d,width))
         assert(p.supported==fresh.supported && p.kind==fresh.kind && p.width==fresh.width &&
             p.divisor==fresh.divisor && p.magic==fresh.magic && p.shift==fresh.shift &&
             p.add==fresh.add && p.negative==fresh.negative && p.iterations==fresh.iterations)
         print(p.width);print(p.divisor);print(p.kind);print(p.magic)
         print(p.shift);print(p.add);print(p.negative);print(p.iterations)
     }
-    fn main(){var p:=cd.new();'''
+    fn main(){mut p:=cd.new();'''
     pairs = []
     for width in range(3, 11):
         low, high = bounds(width)
-        source += f'{{var d:i64={low};while d<={high}{{dump(&mut p,d,{width});d=d+1}}}}'
+        source += f'{{mut d:i64={low};while d<={high}{{dump(&mut p,d,{width});d=d+1}}}}'
         pairs += [(width, d) for d in range(low, high + 1)]
     for width in (32, 64):
         ds = sorted(set(divisors(width) + [0]))

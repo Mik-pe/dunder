@@ -5,19 +5,64 @@ Kompilatorn lägger in städning vid tilldelning, blockslut, retur, `break`
 och `continue`. Den genererade koden och minnespoolen följer med varje program
 på ARM64/macOS, ARM64/Linux, x86-64/Linux och Wasm32.
 
-## Värden och ansvar
+## Ägare, lån och kloning
 
-| Värde | Kopiering | Frigöring |
-| --- | --- | --- |
-| Dynamisk array | Ny oberoende buffert. Strängelement kan dela oföränderliga data. | Elementen släpps, sedan bufferten och dess deskriptor. |
-| Struct, fast array och payload-enum | Fält och element kopieras enligt sin typ. Enumens aktiva variant bestämmer payloaden. | Ägda fält och element släpps rekursivt. |
-| `string` | En dynamisk sträng får en referens till. Literaler ligger i programbilden. | Sista ägaren återlämnar ett dynamiskt block till poolen. |
-| `.bytes()` och `.runes()` | Skapar ett ögonblicksvärde med bytes respektive Unicode-kodpunkter. | Den genererade koden städar värdet när dess scope lämnas. |
-| `&T` och `&mut T` | Lånar anroparens värde. | Ägaren ansvarar för lagringen. |
+En bindning är oföränderlig utan `mut`. Muterbarhet anger vilka ändringar
+som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 
-Tilldelning säkrar det nya värdet innan det gamla släpps. En array som skickas
-som värde får en egen kopia. `pop` överför elementets ägande. `clear` släpper
-elementen och behåller arrayens kapacitet.
+| Användning | Regel |
+| --- | --- |
+| `b := a`, tilldelning, retur och konstruktion | Flyttar resursägande värden till mottagaren. |
+| Vanlig funktionsparameter | Lånar strängar och aggregat för läsning under anropet. |
+| `&mut value` | Exklusivt skrivlån; kräver muterbar lagring. |
+| `move`-parameter och `consume(move value)` | Funktionen tar över ägarskapet. |
+| `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
+| Vanlig `for value in values` | Läslån av samlingen under loopen. |
+
+Regeln för flytt gäller `string`, dynamiska och fasta arrayer, iteratorer och
+structar/enums som innehåller sådana värden, inklusive map och set. Tal,
+bool, runes, pekare, funktionsvärden och records med enbart kopierbara fält
+kan kopieras som enkla värden. Typens ägarskap bestämmer regeln, oberoende
+av om kompilatorn lagrar dess representation på stack eller heap.
+
+```dunder
+fn total(values: []i32) -> i32 {
+    mut sum := 0
+    for value in values { sum += value }
+    sum
+}
+
+fn retain(move values: []i32) -> []i32 { values }
+
+fn main() {
+    mut values: []i32 = [1, 2, 3]
+    values.reserve(32)
+    print(total(values))
+    print(total(values))              // samma läslån igen
+    independent := values.clone()    // egen arraybuffert
+    saved := retain(move values)     // ägarbyte, ingen elementkopia
+    print(total(saved))
+    print(total(independent))
+}
+```
+
+Användning efter flytt ger kompileringsfel. En `mut`-lokal kan få ett nytt
+värde efter flytt. Efter grenar måste värdet finnas på varje väg som når
+användningen; en loop måste återställa värden som behövs i nästa varv.
+Ett lånat värde får inte flyttas till en ägd bindning, retur eller container.
+Välj en `move`-parameter när funktionen ska behålla indata, eller klona när
+det ska finnas två oberoende ägare. Lån kan ännu inte returneras eller
+lagras som lokala referenser eller fält.
+
+Flytt av en dynamisk array behåller buffert och kapacitet. `.clone()` ger en
+oberoende buffert och klonar ägda barn rekursivt; klonens reservkapacitet
+behöver inte matcha originalets. Strängar är oföränderliga: deras uttryckliga
+kloner delar UTF-8-data genom referensräkning. Kloning av en sträng behöver
+därför ingen teckenkopia. Literaler ligger i programbilden.
+
+Tilldelning utvärderar det nya värdet innan det gamla släpps. Varje ägd
+resurs frigörs en gång när dess ägare lämnar sitt scope. `pop` tar över det
+borttagna elementet. `clear` släpper elementen och behåller kapaciteten.
 
 Giltiga dynamiska arrayer har `0 <= len <= cap <= i32::MAX`, oberoende av
 minnespoolens storlek. Runtime kontrollerar önskat antal före växande
@@ -33,13 +78,10 @@ En lagrad konvertering är fortfarande en självständig array. Dolda
 mellanbuffertars allokering och resursåtgång är implementationsdetaljer;
 uttryckliga kapacitetskontroller och fel för index eller UTF-8 behålls.
 
-När ett helt uttryck äger ett temporärt värde kan kompilatorn överföra dess
-ägarskap till mottagaren och städa den tidigare ägarplatsen utan att kopiera
-bufferten. Detta gäller inte en befintlig lokal eller ett lånat fält eller
-element. Värdesemantik och observerbar arraykapacitet behålls. Extra
-allokeringar för sådana temporära kopior är inte garanterade; resursbrist
-beror på de allokeringar som faktiskt utförs. Uttryckliga kapacitetsfel,
-storleksgränser, indexfel och aritmetikfel behåller sina kontroller.
+Temporära resursägare överförs direkt till mottagaren. Skriv `move value`
+när ett redan lagrat värde lämnas till en ägande funktionsparameter.
+En ny ägare som skapas av ett anrop eller en literal kan lämnas direkt.
+Optimeringsflaggor ändrar inte reglerna för lån, flytt eller frigöring.
 
 Samma regel gäller icke-adresserbara uttryckstemporärers privata
 implementationslagring. Kompilatorn får hålla deras värden i register;
@@ -55,6 +97,27 @@ I `text + change(&mut text)` behåller vänsterledet strängen som lästes före
 funktionsanropet. Samma utvärderingsordning gäller för argument, index och
 snittgränser. En retur bevarar sitt resultat medan funktionen städar sina
 lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
+
+### Fält, element och begränsningar
+
+Ett ägt managed-fält kan flyttas ut ur en lokal eller ett färskt returvärde
+utan datakopia. Den här versionen behandlar då hela ursprungsobjektet som
+förbrukat; dess övriga fält frigörs fortfarande vid scope-slut. En hel
+muterbar bindning kan återinitieras. Flytt ur ett lån avvisas.
+Arrayelement lämnas över med `pop` eller kopieras uttryckligen med `.clone()`;
+indexering lämnar ingen oinitierad lucka i arrayen. Inline-fält i C-layout
+kan klonas när ett självständigt arrayvärde behövs.
+
+Vanlig `for` och `match` lånar. `for value in move values` respektive
+`match move value` överför ägaren. `for value in values.iter()` lånar också;
+en lagrad ägande iterator skapas från `(move values).iter()` eller
+`values.clone().iter()`. Ägda payloadbindningar överförs först efter att
+matcharmens villkor har lyckats. Ägare som ett aktivt `defer` behöver får
+inte flyttas före den uppskjutna körningen.
+
+Arrayrepetition som `[text; 4]` är en uttrycklig replikering: initialiseraren
+utvärderas och konsumeras en gång, även om antalet är noll. Skriv
+`[text.clone(); 4]` när den befintliga strängägaren ska finnas kvar.
 
 ## Pool och kostnader
 
@@ -114,7 +177,7 @@ struct Node { left: i32, right: i32, weight: i64 }
 
 fn frame()->i64 {
     region scratch(4096) {
-        var nodes: []Node = scratch.alloc(32)
+        mut nodes: []Node = scratch.alloc(32)
         nodes[3].weight = 12
         return nodes[3].weight
     }
@@ -163,7 +226,7 @@ Bygg provet igen med `i32` på båda ställen för fyrabytesvarianten.
 
 ```dunder
 fn main() {
-    var data: []u8 = []
+    mut data: []u8 = []
     data.reserve(8388608)
     for i in 0..8388608 { data.push(u8(i % 256)) }
     print(data[8388607])

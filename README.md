@@ -20,7 +20,7 @@ fn main() {
     print(answer)
     print(answer == expected)
 
-    var count := 0
+    mut count := 0
     while count < 3 {
         print(count)
         count = count + 1
@@ -29,7 +29,7 @@ fn main() {
 ```
 
 `:=` deklarerar med härledd typ. `: i32 =` deklarerar med explicit typ.
-Värden och parametrar är oföränderliga som standard; `var` tillåter senare
+Värden och parametrar är oföränderliga som standard; `mut` tillåter senare
 tilldelning med `=`. En oföränderlig bindning kan få sitt värde vid körning;
 den behöver inte vara en kompileringstidskonstant.
 
@@ -153,7 +153,9 @@ workers producerar byteidentiska kompilatorer. `--jobs N` väljer 1–256
 workers. `check` och `--profile-compiler` använder den seriella vägen.
 [Taskkontrakt och arbetsfördelning](docs/tasks.md)
 
-På Apple M5 byggde den typade funktionskedjan det låsta kompilatorkorpuset
+Följande historiska mätning gäller kompilatorn före övergången till
+läslån och ägarflyttar. På Apple M5 byggde den typade funktionskedjan det
+låsta kompilatorkorpuset
 på **359,79 ms**, jämfört med **468,17 ms** för revision `4585bc4`.
 Medianen omfattar tolv parade byggen med fyra workers, varm filsystemcache
 och avstängd inkrementell cache, inklusive signering och publicering.
@@ -168,8 +170,9 @@ Den bygglokala skalärmodellcachen kan återanvända identiska kroppar.
 Mätserien omfattar även en stor enskild funktion, anrop med varierade typer
 och Tabells bygg- och körtid. [Mätmetod, körtider och rådata](benchmarks/compiler/2026-11-15-shared-frontend/README.md)
 
-Kör verifieringen från reporoten med Python 3.9+ och en C-kompilator.
-C-kompilatorn bygger provbiblioteket för ABI-kontrollen.
+Kör verifieringen från reporoten med Python 3.9+, en C-kompilator,
+`curl` och `gzip`. C-kompilatorn bygger provbiblioteket för ABI-kontrollen;
+uppgraderingsproven använder `curl` även mot en lokal filmirror.
 
 ```sh
 ./tools/verify-selfhost.sh
@@ -277,11 +280,11 @@ inte i en testrot. Testfunktioner ingår bara i testbyggen.
 
 ```dunder
 fn main() {
-    var values: [i32; 8] = [0; 8]
+    mut values: [i32; 8] = [0; 8]
     for i in 0..len(values) {
         values[i] = i + 1
     }
-    var sum := 0
+    mut sum := 0
     for value in &values {
         sum += value
     }
@@ -290,8 +293,9 @@ fn main() {
 }
 ```
 
-Arrayer och structar kopieras som värden, även vid funktionsanrop. Fält och
-element är oföränderliga om bindningen saknar `var`. `for` stöder halvöppna
+Resursägande arrayer och structar flyttas vid tilldelning; vanliga
+funktionsparametrar lånar dem för läsning. Fält och
+element är oföränderliga om bindningen saknar `mut`. `for` stöder halvöppna
 `i32`-intervall, arrayer, arrayiteratorer samt lånade element med `for x in &values`.
 Sammansatt tilldelning (`+=`, `-=`, `*=`, `/=`, `%=`), byteliteraler (`b'A'`),
 hex-/binärliteraler (`0xff`, `0b1010`) och lexikal `defer { ... }` stöds.
@@ -308,15 +312,15 @@ import std.set as set
 import std.array as array
 
 fn main() {
-    var counts := map.new()
+    mut counts := map.new()
     map.put(&mut counts, "dunder", 42)
     print(map.get_or(&counts, "dunder", 0))
 
-    var names := set.new()
+    mut names := set.new()
     added := set.insert(&mut names, "å 🌍")
     assert(added)
 
-    var values: []i64 = [3, 1, 2]
+    mut values: []i64 = [3, 1, 2]
     values.push(4)
     array.sort(&mut values)
     print(array.sum(&values))
@@ -324,9 +328,10 @@ fn main() {
 ```
 
 `[]T` växer med `push` och `reserve`; `pop`, `clear`, indexering, längd och
-iteration stöds. Kopior är oberoende, även inne i nästlade structar och enums.
-`&values` lånar för läsning och `&mut values` för uppdatering under ett
-funktionsanrop. Referenser kan ännu inte returneras eller lagras.
+iteration stöds. `next := values` flyttar ägarskapet. `values.clone()`
+ger en uttrycklig, oberoende kopia, även inne i structar och enums.
+Vanliga funktionsanrop och loopar lånar för läsning; `&mut values` lånar
+för uppdatering. En `move`-parameter tar över ägarskapet. Referenser kan ännu inte returneras eller lagras.
 
 Map (`string` → `i64`), set av strängar, arrayalgoritmer, text, bytekodning,
 decimalparsning, hashning och SHA-256 är skrivna i Dunder och inbäddade i
@@ -356,7 +361,7 @@ fn distance(event: Event) -> i32 {
 ```
 
 Armarna prövas i källordning. Armar utan villkor ska tillsammans täcka alla
-möjliga värden. I exemplet hanterar den andra armen drag där `x != y`. Payloads har värdesemantik.
+möjliga värden. I exemplet hanterar den andra armen drag där `x != y`. Vanlig matchning lånar sitt värde. `match move value` tar över dess ägda payloads.
 [Enumregler och fler mönster](docs/enums.md)
 
 ## UTF-8-strängar
@@ -489,7 +494,7 @@ hex-/binärliteraler `0x..`/`0b..`, sammansatt tilldelning (`+=`, `-=`, `*=`, `/
 lexikal `defer { ... }`, `for x in &..`, typade funktioner och funktionsvärden,
 callbacks, funktioner som returvärden, framåtanrop och rekursion,
 filmoduler med explicita importer, modulkapabiliteter (`unsafe`, `filesystem`, `network`), alias, namnrymder och privata/exporterade funktioner och typer,
-härledda/explicit typade lokaler, oföränderlighet, `var`, blockscope, `if/else`,
+härledda/explicit typade lokaler, oföränderlighet, `mut`, blockscope, `if/else`,
 `while`, `for`, `break/continue`, typade arrayer och arrayiteratorer,
 struct-uttryck och fältåtkomst, värde-enums och varianter med data, uttömmande `match`,
 `@test`, `assert`, kortslutande booleska operatorer, `std.net` (TCP-sockets och `PollSet`),
@@ -505,7 +510,7 @@ Se [kompilatorns kodgenerering](docs/optimization.md).
 
 Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
 och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva
-skalärer och enums utan payload. Aggregat returneras med värdesemantik.
+skalärer och enums utan payload. Resursägande aggregat överförs till returvärdets ägare.
 Ett generiskt allokerings-API, lån som kan returneras och
 användardefinierade iteratorer återstår. Normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.

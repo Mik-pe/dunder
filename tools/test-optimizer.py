@@ -23,7 +23,7 @@ def divide(a, b):
 def positive_cases():
     # Freeze both generated calls and references independently of compiler output.
     rng = random.Random(271828)
-    arithmetic = 'fn calculate(a:i64,b:i64,c:i64)->i64{var v:=a+b*c;v=v-(a-b);v/c+a%c}\n'
+    arithmetic = 'fn calculate(a:i64,b:i64,c:i64)->i64{mut v:=a+b*c;v=v-(a-b);v/c+a%c}\n'
     calls, expected = [], []
     for _ in range(48):
         a, b = rng.randrange(-100, 101), rng.randrange(-100, 101)
@@ -34,25 +34,25 @@ def positive_cases():
     yield 'arithmetic', arithmetic, expected
 
     updates = """fn bump(x:i64)->i64{
-        var v:=x; v=2+v; v=v-(-3); v=v+4; return v
+        mut v:=x; v=2+v; v=v-(-3); v=v+4; return v
     }
     fn down(x:i32)->i32{
-        var v:=x; v=v-2; v=v+(-3); return v
+        mut v:=x; v=v-2; v=v+(-3); return v
     }
     fn observe(x:i32)->i32{
-        var v:=x; v=v+2; saved:=v; v=v+3; return saved+v
+        mut v:=x; v=v+2; saved:=v; v=v+3; return saved+v
     }
     fn branch(x:i32,up:bool)->i32{
-        var v:=x; v=v+2; if up{v=v+3}; v=v+4; return v
+        mut v:=x; v=v+2; if up{v=v+3}; v=v+4; return v
     }
     fn other(x:i32)->i32{
-        var v:=x; var w:=x; v=v+2; w=w+3; return v+w
+        mut v:=x; mut w:=x; v=v+2; w=w+3; return v+w
     }
     fn full(x:i64)->i64{
-        var v:=x; v=v+9223372036854775807; v=v+1; return v
+        mut v:=x; v=v+9223372036854775807; v=v+1; return v
     }
     fn low(x:i64)->i64{
-        var v:=x; v=v-(-9223372036854775808); v=v-1; return v
+        mut v:=x; v=v-(-9223372036854775808); v=v-1; return v
     }
     fn main(){print(bump(9223372036854775798));print(down(-2147483643))
         print(observe(3));print(branch(3,false));print(branch(3,true))
@@ -60,7 +60,7 @@ def positive_cases():
     yield 'checked_updates', updates, [2**63-1,-2**31,13,9,12,11,2**63-1,2**63-2]
 
     control = '''fn calculate(n:i32)->i32{
-        var i:=0; var total:=0
+        mut i:=0; mut total:=0
         while i<n {
             i=i+1
             if i%2==0 {continue}
@@ -70,16 +70,16 @@ def positive_cases():
         if n<0{return -7}else{return total}
     }
     fn earlier(n:i32)->i32{
-        var i:=0;var total:=0
+        mut i:=0;mut total:=0
         while i<n{if i==7{return total};total=total+i;i=i+1}
         return total
     }
-    fn shadow(x:i32)->i32{var total:=x;{x:=x+2;total=total+x};return total+x}
+    fn shadow(x:i32)->i32{mut total:=x;{x:=x+2;total=total+x};return total+x}
     fn both(x:i32)->i32{if x<0{return -1}else{return 1}}
-    fn flip(n:i32)->bool{var i:=0;var value:=false;while i<n{value=!value;i=i+1};return value}
+    fn flip(n:i32)->bool{mut i:=0;mut value:=false;while i<n{value=!value;i=i+1};return value}
     fn nested(n:i32)->i32{
-        var i:=0;var total:=0
-        while i<n{var j:=0;while j<n{j=j+1;if j==2{continue};if j==5{break};total=total+i+j};i=i+1}
+        mut i:=0;mut total:=0
+        while i<n{mut j:=0;while j<n{j=j+1;if j==2{continue};if j==5{break};total=total+i+j};i=i+1}
         return total
     }
     fn main(){'''
@@ -109,8 +109,8 @@ def positive_cases():
     # Eighteen mutable values remain live across every backedge and at exit.
     # Distinct weighted incoming parameters also catch entry-copy overlap.
     spills = 'fn pressure(n:i64,seed:i64)->i64{'
-    spills += ''.join(f'var a{i}:=seed+{i};' for i in range(18))
-    spills += 'var i:i64=0;while i<n{'
+    spills += ''.join(f'mut a{i}:=seed+{i};' for i in range(18))
+    spills += 'mut i:i64=0;while i<n{'
     spills += ''.join(f'a{j}=a{j}+i+{j+1};' for j in range(18))
     spills += 'i=i+1};return ' + '+'.join(f'a{i}*{i+1}' for i in range(18)) + '}\n'
     spills += 'fn eight(a:i64,b:i64,c:i64,d:i64,e:i64,f:i64,g:i64,h:i64)->i64{a+b*2+c*3+d*4+e*5+f*6+g*7+h*8}\nfn main(){'
@@ -129,38 +129,38 @@ def positive_cases():
     yield 'register_pressure', spills + '}\n', expected
 
     arrays = '''fn reduce(values:&[]i64)->i64{
-        var i:=0;var total:i64=0
+        mut i:=0;mut total:i64=0
         while i<values.len{total=total+values[i];i=i+1}
         return total
     }
     fn choose(values:&[]i64,n:i32)->i64{
-        var i:=0;var total:i64=0
+        mut i:=0;mut total:i64=0
         while i<values.len{if i==n{return total};if i%2==0{total=total+values[i]};i=i+1}
         return total
     }
     // This requires legacy fallback: reading a borrowed array into an owned
-    // binding must keep value semantics rather than copying its raw reference.
-    fn copied(values:&[]i64)->i64{var copy:=values;copy[0]=123;return values[0]+copy[0]}
+    // binding must explicitly clone rather than copying its raw reference.
+    fn copied(values:&[]i64)->i64{mut copy:=values.clone();copy[0]=123;return values[0]+copy[0]}
     fn main(){'''
     expected = []
     for values in [[], [0], [-9], [-4,7,0,19,-31], [i*7-31 for i in range(35)]]:
-        arrays += '{var values:[]i64=[' + ','.join(map(str,values)) + '];'
+        arrays += '{mut values:[]i64=[' + ','.join(map(str,values)) + '];'
         arrays += 'print(reduce(&values));'
         expected.append(sum(values))
         for n in [-1,0,1,3,len(values),len(values)+1]:
             arrays += f'print(choose(&values,{n}));'
             expected.append(sum(v for i,v in enumerate(values) if i%2==0 and (n<0 or i<n)))
         if values:
-            arrays += 'saved:=values;values[0]=99;print(reduce(&saved));print(reduce(&values));print(copied(&saved));'
+            arrays += 'saved:=values.clone();values[0]=99;print(reduce(&saved));print(reduce(&values));print(copied(&saved));'
             expected += [sum(values), 99+sum(values[1:]), values[0]+123]
         arrays += '}'
     yield 'readonly_arrays', arrays + '}\n', expected
-    yield 'fallback_owned_copy', '''fn copied(a:&[]i64)->i64{var b:=a;b[0]=123;return a[0]+b[0]}
+    yield 'fallback_owned_copy', '''fn copied(a:&[]i64)->i64{mut b:=a.clone();b[0]=123;return a[0]+b[0]}
         fn main(){a:[]i64=[7,11];print(copied(&a));print(a[0])}\n''', [130,7]
     # Both graph limits can end inside an operator, before its destination or
     # frame are complete. Its checked prefix still feeds subsequent statements.
     statements = 'v=v+1;' * 600
-    yield 'fallback_node_budget', ('fn sum(x:i64)->i64{var v:=x;' + statements +
+    yield 'fallback_node_budget', ('fn sum(x:i64)->i64{mut v:=x;' + statements +
                                    'v}\nfn main(){print(sum(5))}\n'), [605]
     expression = 'x' + '+1' * 70
     yield 'fallback_height_budget', ('fn sum(x:i64)->i64{' + expression +
@@ -170,7 +170,7 @@ def positive_cases():
     yield 'fallback_live_expression_and_edges', """
         fn tap(x:i64)->i64{print(x); x+2}
         fn mixed(x:i64,y:i64)->i64{
-            var total:=x*3-1
+            mut total:=x*3-1
             if y!=0 && total/y>0 {
                 for i in 0..2 { total=total+(x+y)*tap(y) }
             }
@@ -181,7 +181,7 @@ def positive_cases():
     yield 'mixed_checked_prefix', """
         fn endpoint(x:i64)->i64{x+1}
         fn mixed(x:i64,y:i64)->i64{
-            var value:=x/y+x%y; value*=3
+            mut value:=x/y+x%y; value*=3
             return value+endpoint(y)
         }
         fn main(){print(mixed(19,4));print(mixed(-19,4))}
@@ -209,11 +209,11 @@ def positive_cases():
 def trap_cases():
     # Native exit codes distinguish which checked operation trapped first.
     cases = [
-        ('same_direction_i32', 101, 'fn f(x:i32)->i32{var v:=x;v=v+2;v=v+3;v}', 'f(2147483643)'),
-        ('same_direction_i64', 101, 'fn f(x:i64)->i64{var v:=x;v=v-2;v=v-3;v}', 'f(-9223372036854775804)'),
-        ('opposite_updates', 101, 'fn f(x:i64)->i64{var v:=x;v=v+1;v=v-1;v}', 'f(9223372036854775807)'),
-        ('updates_past_i32_limit', 101, 'fn f(x:i32)->i32{var v:=x;v=v+2147483647;v=v+1;v}', 'f(0)'),
-        ('update_trap_order', 102, 'fn f(x:i32,y:i32)->i32{var v:=x;v=v+1;w:=1/y;v=v+1;w+v}', 'f(2147483646,0)'),
+        ('same_direction_i32', 101, 'fn f(x:i32)->i32{mut v:=x;v=v+2;v=v+3;v}', 'f(2147483643)'),
+        ('same_direction_i64', 101, 'fn f(x:i64)->i64{mut v:=x;v=v-2;v=v-3;v}', 'f(-9223372036854775804)'),
+        ('opposite_updates', 101, 'fn f(x:i64)->i64{mut v:=x;v=v+1;v=v-1;v}', 'f(9223372036854775807)'),
+        ('updates_past_i32_limit', 101, 'fn f(x:i32)->i32{mut v:=x;v=v+2147483647;v=v+1;v}', 'f(0)'),
+        ('update_trap_order', 102, 'fn f(x:i32,y:i32)->i32{mut v:=x;v=v+1;w:=1/y;v=v+1;w+v}', 'f(2147483646,0)'),
         ('add_i32', 101, 'fn f(x:i32)->i32{x+1}', 'f(2147483647)'),
         ('sub_i32', 101, 'fn f(x:i32)->i32{x-1}', 'f(-2147483648)'),
         ('neg_i32', 101, 'fn f(x:i32)->i32{-x}', 'f(-2147483648)'),
@@ -235,18 +235,18 @@ def trap_cases():
         ('empty_index', 103, 'fn f(a:&[]i64)->i64{a[0]}', 'f(&empty)'),
         ('negative_index', 103, 'fn f(a:&[]i64,x:i32)->i64{a[x]}', 'f(&values,-1)'),
         ('index_overflow_first', 101, 'fn f(a:&[]i64,x:i32)->i64{a[x+1]}', 'f(&values,2147483647)'),
-        ('modified_induction', 103, 'fn f(a:&[]i64)->i64{var i:=0;while i<a.len{i=i-1;return a[i]};return 0}', 'f(&values)'),
-        ('off_by_one', 103, 'fn f(a:&[]i64)->i64{var i:=0;var total:i64=0;while i<a.len{total=total+a[i+1];i=i+1};return total}', 'f(&values)'),
-        ('checked_reduction', 101, 'fn f(a:&[]i64)->i64{var i:=0;var total:i64=0;while i<a.len{total=total+a[i];i=i+1};return total}', 'f(&large)'),
+        ('modified_induction', 103, 'fn f(a:&[]i64)->i64{mut i:=0;while i<a.len{i=i-1;return a[i]};return 0}', 'f(&values)'),
+        ('off_by_one', 103, 'fn f(a:&[]i64)->i64{mut i:=0;mut total:i64=0;while i<a.len{total=total+a[i+1];i=i+1};return total}', 'f(&values)'),
+        ('checked_reduction', 101, 'fn f(a:&[]i64)->i64{mut i:=0;mut total:i64=0;while i<a.len{total=total+a[i];i=i+1};return total}', 'f(&large)'),
     ]
     for name,status,function,expression in cases:
-        source = function + '\nfn main(){var empty:[]i64=[];var values:[]i64=[3,5];var large:[]i64=[9223372036854775807,1,-1];print(17);value:=' + expression + ';print(99)}\n'
+        source = function + '\nfn main(){mut empty:[]i64=[];mut values:[]i64=[3,5];mut large:[]i64=[9223372036854775807,1,-1];print(17);value:=' + expression + ';print(99)}\n'
         yield name, source, status
 
 
 def mutation_cases():
     ranges = '''fn walk(lo:i32,hi:i32)->i32{
-        var low:=lo;var high:=hi;var total:=0
+        mut low:=lo;mut high:=hi;mut total:=0
         for i in low..high{low=99;high=0;total=total+i}
         return total
     }
@@ -258,7 +258,7 @@ def mutation_cases():
     yield 'range_capture', ranges+'}\n', expected
 
     flow = '''fn walk(lo:i32,hi:i32)->i32{
-        var visits:=0;var total:=0
+        mut visits:=0;mut total:=0
         for i in lo..hi{
             visits=visits+1;if visits>64{return -999}
             if i%2==0{continue};if i>9{break};total=total+i
@@ -279,11 +279,11 @@ def mutation_cases():
     yield 'range_flow', flow+'}\n', expected
 
     nested = '''fn walk(n:i32)->i32{
-        var total:=0
+        mut total:=0
         for i in 0..n{
             for j in 0..n{
                 if j==2{continue};if j==5{break}
-                var k:=0
+                mut k:=0
                 while k<3{k=k+1;if k==2{continue};total=total+i+j+k}
             }
             if i==7{return total}
@@ -299,10 +299,10 @@ def mutation_cases():
     yield 'range_nested', nested+'}\n', expected
 
     shadow = '''fn walk(i:i32)->i32{
-        var total:=i;var visits:=0
+        mut total:=i;mut visits:=0
         for i in i..i+3{
             visits=visits+1;if visits>8{return -999}
-            var i:=7;i=i+1;total=total+i
+            mut i:=7;i=i+1;total=total+i
         }
         return total+i
     }
@@ -310,7 +310,7 @@ def mutation_cases():
     yield 'range_shadow', shadow, [10,24,50]
 
     edges = '''fn walk(lo:i32,hi:i32)->i32{
-        var count:=0
+        mut count:=0
         for i in lo..hi{count=count+1;if count==3{return count};continue}
         return count
     }
@@ -332,7 +332,7 @@ def mutation_cases():
     for i,j,value in [(0,0,9),(0,1,-7),(1,1,3),(2,0,5),(2,2,-3)]:
         values = [-3,5,7]
         before = values[j]; values[i] = value; after = values[j]; values[i] += 1
-        stores += '{var a:[]i64=[-3,5,7];print(patch(&mut a,'+f'{i},{j},{value}));for k in 0..a.len{{print(a[k])}}}}'
+        stores += '{mut a:[]i64=[-3,5,7];print(patch(&mut a,'+f'{i},{j},{value}));for k in 0..a.len{{print(a[k])}}}}'
         expected += [before*1000+after*10+values[i],*values]
     yield 'mutation_dependencies', stores+'}\n', expected
 
@@ -347,12 +347,12 @@ def mutation_cases():
         values = [3,-2,7]
         values[(i+1)%3] = values[(j+k)%3]+values[i]
         values[j] = values[k]+values[j]
-        indices += '{var a:[]i64=[3,-2,7];print(patch(&mut a,'+f'{i},{j},{k}));for p in 0..a.len{{print(a[p])}}}}'
+        indices += '{mut a:[]i64=[3,-2,7];print(patch(&mut a,'+f'{i},{j},{k}));for p in 0..a.len{{print(a[p])}}}}'
         expected += [values[i]+values[j]+values[k],*values]
     yield 'mutation_indices', indices+'}\n', expected
 
     roots = '''fn blend(a:&mut []i64,b:&[]i64)->i64{
-        var total:i64=0
+        mut total:i64=0
         for i in 0..a.len{a[i]=a[i]+b[i];total=total+a[i]}
         return total
     }
@@ -364,7 +364,7 @@ def mutation_cases():
     for values in [[],[0],[1,2,3],[-3,5,-7]]:
         other = [j*3-2 for j in range(len(values)+2)]
         after = [value+other[i] for i,value in enumerate(values)]
-        roots += '{var a:[]i64=['+','.join(map(str,values))+'];var b:[]i64=['+','.join(map(str,other))+'];print(blend(&mut a,&b));for p in 0..a.len{print(a[p])};for p in 0..b.len{print(b[p])};exchange(&mut a,&mut b);for p in 0..a.len{print(a[p])};for p in 0..b.len{print(b[p])}}'
+        roots += '{mut a:[]i64=['+','.join(map(str,values))+'];mut b:[]i64=['+','.join(map(str,other))+'];print(blend(&mut a,&b));for p in 0..a.len{print(a[p])};for p in 0..b.len{print(b[p])};exchange(&mut a,&mut b);for p in 0..a.len{print(a[p])};for p in 0..b.len{print(b[p])}}'
         expected += [sum(after),*after,*other,*other[:len(values)],*after,*other[len(values):]]
     yield 'mutation_multiple_roots', roots+'}\n', expected
 
@@ -375,7 +375,7 @@ def mutation_cases():
     ]:
         source = function+'\nfn main(){'; expected = []
         for values in arrays:
-            source += '{var a:[]i64=['+','.join(map(str,values))+'];saved:=a;patch(&mut a);print(a.len);for i in 0..a.len{print(a[i]);print(saved[i])}}'
+            source += '{mut a:[]i64=['+','.join(map(str,values))+'];saved:=a.clone();patch(&mut a);print(a.len);for i in 0..a.len{print(a[i]);print(saved[i])}}'
             expected.append(len(values))
             for after,before in zip(transform(values),values): expected += [after,before]
         yield name,source+'}\n',expected
@@ -384,13 +384,13 @@ def mutation_cases():
     # than recognizing a standard-library or benchmark symbol.
     sorting = '''fn arrange(a:&mut []i64){
         for i in 1..a.len{
-            value:=a[i];var j:=i
+            value:=a[i];mut j:=i
             while j>0&&a[j-1]>value{a[j]=a[j-1];j=j-1}
             a[j]=value
         }
     }
     fn reflect(a:&mut []i64){
-        var left:=0;var right:=a.len-1
+        mut left:=0;mut right:=a.len-1
         while left<right{value:=a[left];a[left]=a[right];a[right]=value;left=left+1;right=right-1}
     }
     fn main(){'''
@@ -400,14 +400,14 @@ def mutation_cases():
     vectors += [[rng.randrange(-99,100) for _ in range(n)] for n in [2,3,7,16,31]]
     expected = []
     for values in vectors:
-        sorting += '{var a:[]i64=['+','.join(map(str,values))+'];saved:=a;arrange(&mut a);for i in 0..a.len{print(a[i])};arrange(&mut a);for i in 0..a.len{print(a[i])};reflect(&mut a);for i in 0..a.len{print(a[i]);print(saved[i])}}'
+        sorting += '{mut a:[]i64=['+','.join(map(str,values))+'];saved:=a.clone();arrange(&mut a);for i in 0..a.len{print(a[i])};arrange(&mut a);for i in 0..a.len{print(a[i])};reflect(&mut a);for i in 0..a.len{print(a[i]);print(saved[i])}}'
         ordered = sorted(values)
         expected += ordered+ordered
         for after,before in zip(reversed(ordered),values): expected += [after,before]
     yield 'mutation_sort_reverse',sorting+'}\n',expected
 
     pressure = 'fn patch(a:&mut []i64,n:i32,seed:i64)->i64{'
-    pressure += ''.join(f'var v{i}:=seed+{i};' for i in range(18))
+    pressure += ''.join(f'mut v{i}:=seed+{i};' for i in range(18))
     pressure += 'for i in 0..n{'+''.join(f'v{j}=v{j}+{j+1};' for j in range(18))
     pressure += 'a[0]=a[0]+'+'+'.join(f'v{j}' for j in range(18))+'};return a[0]+'+'+'.join(f'v{j}*{j+1}' for j in range(18))+'}\nfn main(){'
     expected = []
@@ -415,24 +415,24 @@ def mutation_cases():
         values = [seed+i for i in range(18)]; first = 1
         for _ in range(max(n,0)):
             values = [value+j+1 for j,value in enumerate(values)]; first += sum(values)
-        pressure += '{var a:[]i64=[1,2];print(patch(&mut a,'+f'{n},{seed}));print(a[0]);}}'
+        pressure += '{mut a:[]i64=[1,2];print(patch(&mut a,'+f'{n},{seed}));print(a[0]);}}'
         expected += [first+sum(value*(j+1) for j,value in enumerate(values)),first]
     yield 'mutation_pressure',pressure+'}\n',expected
 
     yield 'fallback_array_snapshot', '''fn patch(a:&mut []i64)->i64{
-        var total:i64=0;for value in a{a[0]=99;total=total+value};return total
+        mut total:i64=0;for value in a.clone(){a[0]=99;total=total+value};return total
     }
-    fn main(){var a:[]i64=[1,2,3];print(patch(&mut a));print(a[0])}\n''',[6,99]
+    fn main(){mut a:[]i64=[1,2,3];print(patch(&mut a));print(a[0])}\n''',[6,99]
     yield 'fallback_shape_change', '''fn patch(a:&mut []i64){a.push(9);a.reserve(64);last:=a.pop();a.clear();a.push(last)}
-    fn main(){var a:[]i64=[1,2];patch(&mut a);print(a.len);print(a[0])}\n''',[1,9]
+    fn main(){mut a:[]i64=[1,2];patch(&mut a);print(a.len);print(a[0])}\n''',[1,9]
     yield 'fallback_descriptor_replace', '''fn patch(a:&mut []i64){a=[11,22]}
-    fn main(){var a:[]i64=[1];patch(&mut a);print(a.len);print(a[0]);print(a[1])}\n''',[2,11,22]
+    fn main(){mut a:[]i64=[1];patch(&mut a);print(a.len);print(a[0]);print(a[1])}\n''',[2,11,22]
     yield 'fallback_call_body', '''fn patch(a:&mut []i64){for i in 0..a.len{print(i);a[i]=a[i]+1}}
-    fn main(){var a:[]i64=[2,3];patch(&mut a);print(a[0]);print(a[1])}\n''',[0,1,3,4]
+    fn main(){mut a:[]i64=[2,3];patch(&mut a);print(a[0]);print(a[1])}\n''',[0,1,3,4]
     yield 'fallback_nested_index_cast', '''fn patch(a:&mut []i64)->i64{a[i32(a[0])]=a[i32(a[1])];return a[1]}
-    fn main(){var a:[]i64=[1,2,7];print(patch(&mut a));for i in 0..a.len{print(a[i])}}\n''',[7,1,7,7]
+    fn main(){mut a:[]i64=[1,2,7];print(patch(&mut a));for i in 0..a.len{print(a[i])}}\n''',[7,1,7,7]
     yield 'fallback_shape_rhs', '''fn patch(a:&mut []i64,b:&mut []i64){a[0]=b.pop()}
-    fn main(){var a:[]i64=[1];var b:[]i64=[3,7];patch(&mut a,&mut b);print(a[0]);print(b.len);print(b[0])}\n''',[7,1,3]
+    fn main(){mut a:[]i64=[1];mut b:[]i64=[3,7];patch(&mut a,&mut b);print(a[0]);print(b.len);print(b[0])}\n''',[7,1,3]
 
 
 def mutation_traps():
@@ -455,7 +455,7 @@ def mutation_traps():
         ('store_negate_minimum',101,'fn f(a:&mut []i64,x:i64)->i64{a[0]=-x;return 0}','f(&mut values,-9223372036854775808)'),
     ]
     for name,status,function,expression in cases:
-        yield name,function+'\nfn main(){var empty:[]i64=[];var values:[]i64=[3,5];print(17);value:='+expression+';print(99)}\n',status
+        yield name,function+'\nfn main(){mut empty:[]i64=[];mut values:[]i64=[3,5];print(17);value:='+expression+';print(99)}\n',status
 
 
 def invalid_cases():
@@ -467,9 +467,9 @@ def invalid_cases():
         'dead_duplicate': 'if false{value:=1;value:=2};return x',
         'dead_reserved': 'if false{i32:=x};return x',
         'dead_non_ascii': 'if false{å:=x};return x',
-        'dead_syntax': 'if false{var value:=};return x',
-        'dead_else_syntax': 'if true{return x}else{var value:=};return x',
-        'dead_loop_body': 'while false{var value:bool=x};return x',
+        'dead_syntax': 'if false{mut value:=};return x',
+        'dead_else_syntax': 'if true{return x}else{mut value:=};return x',
+        'dead_loop_body': 'while false{mut value:bool=x};return x',
         'after_return_type': 'return x;return true',
         'dead_condition': 'if false{if 1{return x}};return x',
         'dead_break': 'if false{break};return x',
@@ -479,7 +479,7 @@ def invalid_cases():
         'missing_return': 'if x>0{return 1}',
         'escaped_scope': '{value:=x};return value',
         'grouped_min_literal': 'return -(2147483648)',
-        'wrong_local_annotation': 'var value:bool=x;return x',
+        'wrong_local_annotation': 'mut value:bool=x;return x',
         'bool_ordering': 'if true<false{return x};return x',
         'for_iterator_assignment': 'for i in 0..2{i=1};return x',
         'for_iterator_escape': 'for i in 0..2{};return i',
@@ -509,9 +509,9 @@ def invalid_cases():
         'store_shape_rhs':'a[0]=a.pop()',
         'array_iterator_assignment':'for value in a{value=1}',
     }.items():
-        yield name, f'fn f(a:&mut []i64){{{body}}}\nfn main(){{var a:[]i64=[0];f(&mut a)}}\n'
-    yield 'array_mutable_shared_alias', 'fn f(a:&mut []i64,b:&[]i64){a[0]=b[0]}\nfn main(){var a:[]i64=[0];f(&mut a,&a)}\n'
-    yield 'array_two_mutable_alias', 'fn f(a:&mut []i64,b:&mut []i64){a[0]=b[0]}\nfn main(){var a:[]i64=[0];f(&mut a,&mut a)}\n'
+        yield name, f'fn f(a:&mut []i64){{{body}}}\nfn main(){{mut a:[]i64=[0];f(&mut a)}}\n'
+    yield 'array_mutable_shared_alias', 'fn f(a:&mut []i64,b:&[]i64){a[0]=b[0]}\nfn main(){mut a:[]i64=[0];f(&mut a,&a)}\n'
+    yield 'array_two_mutable_alias', 'fn f(a:&mut []i64,b:&mut []i64){a[0]=b[0]}\nfn main(){mut a:[]i64=[0];f(&mut a,&mut a)}\n'
     yield 'excessive_nesting', 'fn f(x:i32)->i32{' + '('*140 + 'x' + ')'*140 + '}\nfn main(){print(f(1))}\n'
     # Each level enters both expression() and primary(). Checking only the
     # parser's primary depth would incorrectly accept this foldable program.
@@ -654,7 +654,7 @@ def main():
 def check_model_reuse(compiler, native, work):
     # Identical bodies live at different byte offsets and in different files.
     # Reversed parameter names change the subtraction even with identical tokens.
-    body = 'var total:=x-y;' + 'total=total+1;' * 24 + 'return total'
+    body = 'mut total:=x-y;' + 'total=total+1;' * 24 + 'return total'
     def definition(name, params='x:i32,y:i32', result='i32', text=body):
         return f'pub fn {name}({params})->{result}{{{text}}}\n'
     left = work / 'left.ddr'

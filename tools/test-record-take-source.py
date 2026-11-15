@@ -2,7 +2,7 @@
 """Activated source ownership/capacity/cache contracts; no latency assertions.
 
 An optional historical comparison compiler predates frontend activation. A
-forced local-copy source control and finite event bounds verify activation;
+forced explicit-clone source control and finite event bounds verify activation;
 native assertions independently check capacity, snapshots and RC lifetime.
 """
 import argparse
@@ -22,15 +22,15 @@ MODES = ((), ('--scalar-opt=off',), ('--mir=off',), ('--scalar-opt=off', '--mir=
 PROFILE = '''struct Leaf { values: []i64 }
 struct Item { first: Leaf, second: Leaf, name: string }
 fn make() -> Item {
-    var values: []i64 = []; values.reserve(64)
+    mut values: []i64 = []; values.reserve(64)
     for i in 0..9 { values.push(i64(i)) }
-    Item { first: Leaf { values: values }, second: Leaf { values: values }, name: "value" }
+    Item { first: Leaf { values: values.clone() }, second: Leaf { values: values }, name: "value" }
 }
 fn relay() -> Item { make() }
 fn main() {
-    var value := relay()
-    assert(value.first.values.cap() == 9 && value.second.values.cap() == 9)
-    snapshot := value; value.first.values[0] = 99
+    mut value := relay()
+    assert(value.first.values.cap() == 9 && value.second.values.cap() == 64)
+    snapshot := value.clone(); value.first.values[0] = 99
     assert(snapshot.first.values[0] == 0 && value.second.values[0] == 0)
     print(42)
 }
@@ -86,7 +86,9 @@ def main():
             source = work / f'profile-{mode}.ddr'; source.write_text(PROFILE)
             control = work / f'profile-{mode}-control.ddr'
             control.write_text(PROFILE.replace('fn relay() -> Item { make() }',
-                                               'fn relay() -> Item { var value := make(); value }'))
+                                               'fn relay() -> Item { mut value := make(); value.clone() }').replace(
+                                                   'value.second.values.cap() == 64',
+                                                   'value.second.values.cap() == 9'))
             profiles = {}
             variants = [('new', compiler, source), ('local_copy', compiler, control)]
             if baseline: variants.append(('old', baseline, source))
@@ -98,8 +100,8 @@ def main():
                 assert profile['kind'] == 'runtime_profile'
                 profiles[label] = profile['counters']
             new = profiles['new']
-            # This finite graph needs four ordinary array copies and three
-            # ordinary record copies. Unique temporary forwarding adds none.
+            # This finite graph needs three explicit array copies and one
+            # explicit record copy. Owner forwarding adds none.
             # Bounds allow future legitimate copy elimination, but fail with
             # the old unactivated emitter (12 array /14 record clone calls).
             assert new['array_clone_calls'] <= 4 and new['record_clone_calls'] <= 3, (mode, new)
@@ -133,8 +135,8 @@ def main():
 @extern("{library}", "invoke") unsafe fn invoke(f: extern fn(i32)->i32, n:i32)->i32
 struct Leaf {{ values: []i64 }}
 struct Item {{ leaf: Leaf }}
-fn make(n:i32)->Item {{ var a:[]i64=[]; a.reserve(64); for i in 0..n{{a.push(i64(i))}}; Item{{leaf:Leaf{{values:a}}}} }}
-fn answer(n:i32)->i32{{value:=make(n); projected:=make(n).leaf; assert(value.leaf.values.cap()==n && projected.values.cap()==n); i32(projected.values[n-1])+34}}
+fn make(n:i32)->Item {{ mut a:[]i64=[]; a.reserve(64); for i in 0..n{{a.push(i64(i))}}; Item{{leaf:Leaf{{values:a}}}} }}
+fn answer(n:i32)->i32{{value:=make(n); projected:=make(n).leaf; assert(value.leaf.values.cap()==64 && projected.values.cap()==64); i32(projected.values[n-1])+34}}
 fn main(){{unsafe{{assert(invoke(callback(answer),9)==42)}};print(42)}}
 ''')
         for mode, flags in enumerate(MODES):

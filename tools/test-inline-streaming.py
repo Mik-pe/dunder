@@ -56,11 +56,11 @@ def main():
         # High physical slots exercise cursor-preserving frame helpers. The
         # separate large caller crosses the shared growth budget into fallback.
         large = work/'large-frame.ddr'
-        large.write_text('fn main(){' + ''.join(f'var v{i}:={i};' for i in range(600)) +
-                         'var sum:=0;for scalar in "A🌍".runes(){sum=sum+i32(scalar)};'
+        large.write_text('fn main(){' + ''.join(f'mut v{i}:={i};' for i in range(600)) +
+                         'mut sum:=0;for scalar in "A🌍".runes(){sum=sum+i32(scalar)};'
                          'assert(sum==127822);print(42)}')
         bounded = work/'caller-budget.ddr'
-        bounded.write_text('fn main(){var sum:=0;' +
+        bounded.write_text('fn main(){mut sum:=0;' +
                            'for scalar in "A".runes(){sum=sum+i32(scalar)};' * 140 +
                            'assert(sum==9100);print(42)}')
         for source in (large, bounded):
@@ -79,7 +79,7 @@ def main():
         # A cached builtin-only expansion has no declaration IDs, but its
         # budget charge must still be replayed without emitting new inline code.
         cached = work/'cached.ddr'
-        cached.write_text('fn sum(text:string)->i32{var n:=0;for scalar in text.runes(){n=n+i32(scalar)};n}'
+        cached.write_text('fn sum(text:string)->i32{mut n:=0;for scalar in text.runes(){n=n+i32(scalar)};n}'
                           'fn main(){print(sum("A🌍"))}')
         for target in range(3):
             images, records = [], []

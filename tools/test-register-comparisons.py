@@ -141,7 +141,7 @@ def main():
                 probe(f'{{0{relation}a}}', value, scalar=1, expected=expected)
                 probe(f'{{if 0{relation}a{{return 1}};0}}', value,
                       scalar=1, mode='function', ret=2, expected=expected)
-        probe('{var sum:=0;for cursor in 0..a{if cursor<b{sum=sum+1}};sum}',
+        probe('{mut sum:=0;for cursor in 0..a{if cursor<b{sum=sum+1}};sum}',
               6, 3, scalar=1, mode='function', ret=1, expected=3)
         with ThreadPoolExecutor(max_workers=4) as pool:
             def run_probe(item):

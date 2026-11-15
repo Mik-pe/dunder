@@ -13,16 +13,16 @@ import std.set as set
 import std.array as array
 
 fn main() {
-    var counts := map.new()
+    mut counts := map.new()
     map.put(&mut counts, "dunder", 42)
     print(map.get_or(&counts, "dunder", 0))
 
-    var names := set.new()
+    mut names := set.new()
     added := set.insert(&mut names, "å 🌍")
     assert(added)
     assert(set.contains(&names, "å 🌍"))
 
-    var values: []i64 = [3, 1, 2]
+    mut values: []i64 = [3, 1, 2]
     values.push(4)
     array.sort(&mut values)
     print(array.sum(&values))
@@ -46,12 +46,13 @@ element är ännu inte implementerade.
 | `a.pop()` | Tar bort och returnerar sista elementet. Tom array ger status 103. |
 | `a.reserve(capacity)` | Säkerställer minst denna kapacitet utan att ändra längden. |
 | `a.clear()` | Nollställer längden och behåller bufferten för återanvändning. |
-| `for item in a` | Itererar över en oberoende kopia av elementen vid loopstart. |
+| `for item in a` | Läslånar samlingen under loopen, utan arraykopia. |
 
-Arrayer har värdesemantik. `copy := values` ger en oberoende buffert, också
-när arrayen ligger i en struct eller enum. Returer och vanliga värdeparametrar
-kopieras. Reservkapacitet ingår inte i värdet och behöver inte bevaras vid
-kopiering. Använd borrows för anrop som ska läsa eller uppdatera samma samling.
+Arrayer har unikt ägarskap. `next := values` flyttar ägaren; `values` kan
+sedan inte läsas före återinitiering. `copy := values.clone()` ger en
+oberoende buffert. Regeln följer arrayer även inne i structar och enums.
+Vanliga parametrar lånar för läsning; `move`-parametrar tar över ägarskapet.
+Flytt bevarar kapaciteten. En klon får egen kapacitet efter sin längd.
 
 ## Begränsade borrows
 
@@ -60,26 +61,24 @@ fn append(values: &mut []i64, value: i64) {
     values.push(value)
 }
 
-fn first(values: &[]i64) -> i64 {
+fn first(values: []i64) -> i64 {
     values[0]
 }
 ```
 
 `append(&mut values, 42)` lånar muterbar lagring under anropet;
-`first(&values)` lånar för läsning. Referensparametrar derefereras automatiskt
+`first(values)` lånar för läsning; explicit `&values` fungerar också. Referensparametrar derefereras automatiskt
 vid läsning, fältåtkomst och indexering. En läsreferens kan inte modifieras.
 Oföränderliga bindningar kan inte lånas med `&mut`.
 
 Detta första stöd begränsar referenser till funktionsparametrar och explicita
 argument. De kan inte returneras, lagras i structar/enums/arrayer eller bindas
-som lokala referenser. `copy := values` inne i en sådan funktion kopierar
-det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
+som lokala referenser. `copy := values.clone()` skapar en ägd kopia av det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
 samma rotvariabel; även olika fält i samma struct räknas konservativt som
 samma rot. Ändringar som kan flytta en arraybuffert måste beräknas före
 en elementtilldelning eller ett anrop som lånar elementet.
 
-Det är en prövad, begränsad lånemodell. Generella livstider och explicita
-flyttar återstår. Ägda allokeringar återvinns automatiskt; se
+Det är en prövad, begränsad lånemodell. Generella livstidsannotationer återstår. Ägda allokeringar återvinns automatiskt; se
 [minnesmodellen](memory.md).
 
 ## Moduler

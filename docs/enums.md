@@ -91,7 +91,7 @@ import sys
 
 fn beskriv(resultat: sys.ReadResult) -> string {
     match resultat {
-        .Ok(text) if text.len > 0 => text,
+        .Ok(text) if text.len > 0 => text.clone(),
         .Ok(_) => "tom fil",
         .Err(.NotFound) => "filen saknas",
         .Err(.Other(kod)) => "systemfel " + kod.str(),
@@ -127,7 +127,9 @@ Dela då upp matchningen i flera `match` så att varje kontroll blir mindre.
 En payload kan bindas till ett namn eller hoppas över med `_` oavsett
 typ. För att fortsätta mönstret med en variant måste payloaden själv ha
 enumtyp. Kompilatorn kontrollerar variantnamn och antal payloadmönster på
-varje nivå. Aggregat och bindningar kopieras med värdesemantik. Komma
+varje nivå. Vanlig matchning lånar resursägande payloads. `match move value` och
+matchning av ett färskt ägt uttryck överför payloadens ägarskap till den
+valda armen efter att dess villkor lyckats. Komma
 skiljer armarna åt.
 
 Som sats kan `match` ha block med flera satser.
@@ -164,14 +166,13 @@ bestämmer den första armen typen för de följande.
 
 En enum med data innehåller en tagg och plats för den största variantens
 payload direkt i värdet. Själva taggningen behöver inget extra heapobjekt
-eller vtables. Payloads följer sina typers kopieringsregler; en dynamisk
-array kopieras till en egen buffert. Oföränderliga strängar använder den befintliga
-stränglagringen; en sträng i en variant kopierar stränghandtaget.
+eller vtables. Payloads följer sina typers ägarskapsregler. Flytt överför befintlig lagring.
+En uttrycklig `.clone()` klonar ägda arraybarn till oberoende buffertar;
+oföränderlig strängtext kan delas med referensräkning.
 Funktionsvärden i payloads använder vanliga typade funktionspekare.
 
-`match` kompileras till taggjämförelser och direkta grenar. Structar, arrayer
-och data-enums kopieras vid bindning, tilldelning, parameteröverföring och
-retur. Anroparen äger returvärdets lagring, även vid callbacks och rekursion.
+`match` kompileras till taggjämförelser och direkta grenar. Resursägande structar, arrayer och data-enums flyttas vid bindning,
+tilldelning och retur. Vanliga parametrar lånar dem för läsning. Anroparen äger returvärdets lagring, även vid callbacks och rekursion.
 Detta är en första implementation utan optimerings- eller prestandalöften;
 minneslayouten är ännu inget stabilt externt ABI.
 

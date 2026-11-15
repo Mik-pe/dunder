@@ -17,8 +17,8 @@ sys.dont_write_bytecode = True
 
 
 FUNCTION = '''fn calculate(n:i32)->i64 {
-    var a:i64=1;var b:i64=2;var c:i64=3;var d:i64=4
-    var e:i64=5;var f:i64=6;var g:i64=7;var i:i32=0
+    mut a:i64=1;mut b:i64=2;mut c:i64=3;mut d:i64=4
+    mut e:i64=5;mut f:i64=6;mut g:i64=7;mut i:i32=0
     while i<n {
         a=a.wrapping_add(i64(i));b=b.wrapping_add(a);c=c.wrapping_add(b)
         d=d.wrapping_add(c);e=e.wrapping_add(d);f=f.wrapping_add(e);g=g.wrapping_add(f)

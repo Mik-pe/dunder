@@ -33,7 +33,7 @@ def probe_sources():
     for state, delta in (('A', 1), ('B', 2)):
         private[state] = {
             'calc.ddr': f'fn inc(x:i32)->i32{{x+{delta}}}\npub fn consume(x:i32)->i32{{inc(x)+inc(x+1)}}\n',
-            'main.ddr': 'import calc\nfn main(){var total:=0;for i in 0..20{total=total+calc.consume(i)};print(total)}\n',
+            'main.ddr': 'import calc\nfn main(){mut total:=0;for i in 0..20{total=total+calc.consume(i)};print(total)}\n',
         }
     layout = {}
     for state, fields in (('A', 'left:i64,right:i64'), ('B', 'right:i64,left:i64')):

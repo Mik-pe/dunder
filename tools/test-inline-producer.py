@@ -34,9 +34,9 @@ def frozen_cases():
     'precedence':('fn calc(x:i32)->i32{(x*7+3)%5} fn main(){print(20+calc(11)*3)}','20\n',0),
     'nested-calls':('fn inner(x:i32)->i32{x*3} fn outer(x:i32,y:i32)->i32{x+y} fn main(){print(outer(inner(3),inner(4)))}','21\n',0),
     'shadowed-pointer':('fn chosen(x:i32)->i32{x+1} fn other(x:i32)->i32{x+10} fn main(){chosen:=other;print(chosen(3))}','13\n',0),
-    'local-fallback':('fn calc(x:i32)->i32{var y:=x;y=y+1;y} fn main(){print(calc(3))}','4\n',0),
+    'local-fallback':('fn calc(x:i32)->i32{mut y:=x;y=y+1;y} fn main(){print(calc(3))}','4\n',0),
     'call-fallback':('fn inc(x:i32)->i32{x+1} fn calc(x:i32)->i32{inc(x)} fn main(){print(calc(3))}','4\n',0),
-    'loop-fallback':('fn calc(x:i32)->i32{var sum:=0;for i in 0..x{sum=sum+i};sum} fn main(){print(calc(4))}','6\n',0),
+    'loop-fallback':('fn calc(x:i32)->i32{mut sum:=0;for i in 0..x{sum=sum+i};sum} fn main(){print(calc(4))}','6\n',0),
     'arg-order-trap':('fn first(a:i32,b:i32)->i32{a} fn marker()->i32{print(71);4} fn zero()->i32{0} fn main(){print(first(marker(),8/zero()))}','71\n',102),
     'unused-trap':('fn first(a:i32,b:i32)->i32{a} fn zero()->i32{0} fn main(){print(first(3,8/zero()))}','',102),
     'body-trap-order':('fn div(a:i32,b:i32)->i32{a/b} fn marker()->i32{print(72);0} fn main(){print(div(4,marker()))}','72\n',102),
@@ -46,14 +46,14 @@ def frozen_cases():
     'dead-branch-short':('fn safe(a:i32,b:i32)->bool{a!=0&&b/a>2} fn main(){assert(!safe(0,9));print(42)}','42\n',0),
     }
     # Each caller has an independent growth budget.
-    valid['caller-budget']=('fn inc(x:i32)->i32{x+1} fn main(){var sum:=0;'+''.join('sum=sum+inc(1);' for _ in range(160))+'print(sum)}','320\n',0)
-    functions='fn inc(x:i32)->i32{x+1} '+''.join('fn f'+str(i)+'()->i32{var sum:=0;'+''.join('sum=sum+inc(1);' for _ in range(100))+'sum} ' for i in range(20))
-    valid['many-callers']=(functions+'fn main(){var sum:=0;'+''.join(f'sum=sum+f{i}();' for i in range(20))+'print(sum)}','4000\n',0)
+    valid['caller-budget']=('fn inc(x:i32)->i32{x+1} fn main(){mut sum:=0;'+''.join('sum=sum+inc(1);' for _ in range(160))+'print(sum)}','320\n',0)
+    functions='fn inc(x:i32)->i32{x+1} '+''.join('fn f'+str(i)+'()->i32{mut sum:=0;'+''.join('sum=sum+inc(1);' for _ in range(100))+'sum} ' for i in range(20))
+    valid['many-callers']=(functions+'fn main(){mut sum:=0;'+''.join(f'sum=sum+f{i}();' for i in range(20))+'print(sum)}','4000\n',0)
     # Producer token scan exhaustion on late structural rejection; a later useful
     # candidate must fall back, while ordinary source diagnostics remain complete.
-    large='fn id(x:i32)->i32{x} '+''.join(f'fn reject{i}(x:i32)->i32{{return '+''.join('x+' for _ in range(50))+'x;var y:=x} ' for i in range(340))
+    large='fn id(x:i32)->i32{x} '+''.join(f'fn reject{i}(x:i32)->i32{{return '+''.join('x+' for _ in range(50))+'x;mut y:=x} ' for i in range(340))
     valid['source-budget']=(large+'fn tail(x:i32)->i32{x+1} fn main(){print(tail(9))}','10\n',0)
-    large_loans='fn area(){region frame{}} '+''.join(f'fn large{i}(x:i32)->i32{{var y:=x;'+''.join('y=y+1;' for _ in range(40))+'y} ' for i in range(180))
+    large_loans='fn area(){region frame{}} '+''.join(f'fn large{i}(x:i32)->i32{{mut y:=x;'+''.join('y=y+1;' for _ in range(40))+'y} ' for i in range(180))
     valid['large-loan-active']=(large_loans+'fn tail(x:i32)->i32{x+1} fn main(){print(tail(9))}','10\n',0)
     invalid=[
     'fn add(x:i32)->i32{x+2147483648} fn main(){print(add(1))}',

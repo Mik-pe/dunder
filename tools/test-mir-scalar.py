@@ -97,6 +97,15 @@ def cases():
                               b=-1 if source != 'left-zero' else 2), (91, 137, 0)))
         for dst in (1, 2, 3):
             result.append((f'alias-dst-{width}-{dst}', op(4, 18, ty, dst=dst), (91, 137, -17)))
+    # W SDIV must clear the complete result's high half even when MIN/-1
+    # bypasses host IDIV to avoid its overflow trap. Dirty source high bits,
+    # zero-divisor exits and input/output aliases share the same contract.
+    for dst in (1, 2, 4):
+        for left, right in ((-2147483648, -1),
+                            (0x1234567880000000, 0x76543210ffffffff),
+                            (-2147483648, 0), (-2147483647, -1)):
+            result.append((f'divide-w32-full-result-dst{dst}',
+                           op(4, 6, 1, dst=dst), (left, right, 0)))
     return result
 
 

@@ -137,7 +137,16 @@ def main():
                 assert result.stdout == result.stderr == '', (image, result.stdout, result.stderr)
                 executed += 1
                 print(f'PASS {mode}: ' + ('dispatch worker pool + independent C ABI/fault probe' if probe else 'direct system imports'), flush=True)
-        print(f'{executed} native images passed; 4-worker isolation, parent/child lifetimes, cached/discarded results, exact-once joins and OS failure states; no timings')
+        borrowed = work / 'borrowed-input-emitter'
+        call([compiler, 'build', ROOT / 'tests/fixtures/task-borrowed-input-emitter.ddr', '-o', borrowed])
+        for mode in ('scalar', 'array', 'c', 'fixed'):
+            image = work / ('borrowed-' + mode)
+            call([borrowed, image, mode])
+            result = call([image])
+            assert result.stdout == result.stderr == '', (mode, result.stdout, result.stderr)
+            executed += 1
+            print(f'PASS borrowed {mode}: actual worker ABI and 12 warm-lane input reclamations', flush=True)
+        print(f'{executed} native images passed; 4-worker isolation, parent/child lifetimes, cached/discarded results, readonly worker inputs, exact-once joins and OS failure states; no timings')
 
 
 if __name__ == '__main__':

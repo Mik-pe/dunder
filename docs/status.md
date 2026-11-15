@@ -27,8 +27,9 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
   bitkonvertering, klassificering och avrundning. UTF-8-strängar stöder
   byteindex, runes, giltiga strängsnitt och innehållsjämförelse.
   [Flyttal](floating.md)
-- Structar, fasta och dynamiska arrayer samt enums med payload har
-  värdesemantik. Nästlade structfält och enumpayloads kan äga samlingar.
+- Resursägande strängar, arrayer, structar och enums flyttas vid
+  bindning och retur. Vanliga parametrar, loopar och match lånar;
+  `move` markerar ägarövertagande och `.clone()` begär kloning uttryckligen. Nästlade structfält och enumpayloads kan äga samlingar.
   Vanliga arrayelement är primitiva värden, inklusive strängar och pekare,
   enums utan payload eller typade tasknycklar. `@c_layout` använder målplattformens fältstorlek
   och justering. [Enums](enums.md) och [FFI](ffi.md).
@@ -121,7 +122,7 @@ typade operationer en pool med 1–256 workers. Källtypningen och MIR-byggaren
 är gemensamma för seriella och parallella byggen. `check` och
 `--profile-compiler` använder den seriella kedjan. [Arbetsfördelning](tasks.md#kompilatorn-som-taskkonsument)
 
-I den senaste parade mätningen byggde den typade kedjan samma låsta
+I den parade mätningen före ägarskapsbytet byggde den typade kedjan samma låsta
 kompilatorkälla på 359,79 ms mot 468,17 ms vid `4585bc4`. Det blandade
 korpuset tog 202,61 ms mot 220,13 ms. [Mätserie för den typade byggkedjan](../benchmarks/compiler/2026-11-15-shared-frontend/README.md)
 
@@ -140,8 +141,8 @@ största kvoten 1,308× i den rapporten ligger över målen 1,10× respektive
 
 Unika fulluttryckstemporärer av vanliga records kan överföras med generisk
 normalisering av nästlade arraykapaciteter. Detta tar bort extra kopior i
-bland annat kompilatorns jobb/resultat utan att flytta lokaler eller fält,
-ändra värdesemantiken eller dela managed-lagring över taskgränsen.
+bland annat kompilatorns jobb/resultat med samma gemensamma regler för lån och flytt. Managed-lagring delas
+fortfarande inte mellan workerarenor.
 
 Den fulla kodgeneratorn kan utelämna extra strängoperandägare när hela
 högerledet saknar relevanta effekter. En validerad funktionsrepresentation

@@ -14,8 +14,8 @@ count := 42            // härledd i32, oföränderlig
 wide: i64 = 42         // explicit i64, oföränderlig
 ready: bool = true     // explicit bool, oföränderlig
 
-var total := 0         // explicit muterbar i32
-var big: i64 = 0       // explicit muterbar i64
+mut total := 0         // explicit muterbar i32
+mut big: i64 = 0       // explicit muterbar i64
 total = total + 1      // tilldelning till befintlig muterbar bindning
 ```
 
@@ -31,10 +31,11 @@ finns en enum som heter `Values`. Typannotationer använder typnamnens
 eget uppslag. Regeln gäller både filbaserade byggen och kompilatorns
 direkta käll- och token-API, oberoende av optimeringsläge.
 
-Bindningar och funktionsparametrar är oföränderliga som standard. `var` är
+Bindningar och funktionsparametrar är oföränderliga som standard. `mut` är
 det explicita valet av muterbarhet. Typen ändras aldrig efter deklarationen.
 All deklaration kräver initiering. Det finns inga oinitierade lokaler i denna
 delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggtid.
+Äldre `var` accepteras som kompatibilitetsalias; ny kod använder `mut`.
 
 ## Typer och uttryck
 
@@ -119,9 +120,9 @@ tolkning, även när den innehåller klamrar.
 
 ```dunder
 fn fibonacci(n: i32) -> i64 {
-    var previous: i64 = 0
-    var current: i64 = 1
-    var i := 0
+    mut previous: i64 = 0
+    mut current: i64 = 1
+    mut i := 0
     while i < n {
         next := previous + current
         previous = current
@@ -142,10 +143,34 @@ fn main() {
 ```
 
 Parameter- och returtyper i funktionssignaturer är explicita. Framåtanrop,
-rekursion och ömsesidig rekursion tillåts. Parametrarna är oföränderliga;
-kopiera till en `var`-lokal om de behöver ändras. De första åtta argumenten
-överförs i register och ytterligare argument på stacken. Blandade `i32`,
-`i64`, `bool` och funktionsargument stöds även på stacken.
+rekursion och ömsesidig rekursion tillåts. Parametrarna är oföränderliga.
+Vanliga sträng- och aggregatparametrar lånar indata för läsning under
+anropet; skalärer kan överföras som billiga värden. Explicit `&T` fungerar
+också för läslån. `&mut T` kräver ett uttryckligt skrivlån vid anropet.
+
+En funktion som ska behålla resursen deklarerar `move`:
+
+```dunder
+fn keep(move values: []i32) -> []i32 { values }
+fn length(values: []i32) -> i32 { values.len }
+
+fn main() {
+    mut a: []i32 = [1, 2, 3]
+    print(length(a))
+    b := a                     // flyttar ägaren; a är nu förbrukad
+    c := keep(move b)          // uttryckligt ägarbyte vid anrop
+    print(length(c))
+}
+```
+
+Litteraler och färska ägda returvärden kan lämnas direkt till en
+`move`-parameter. En `move`-parameter av kopierbar skalär typ fungerar som
+ett vanligt skalärvärde. Funktionstyper följer samma regel:
+`fn([]i32) -> i32` lånar, medan `fn(move []i32) -> []i32` tar över en array.
+Dessa funktionstyper är olika och kan inte bytas mot varandra.
+
+De första åtta argumenten överförs i register och ytterligare argument på
+stacken. Nativ C-FFI följer det deklarerade C-ABI:t.
 
 `main` tar inga argument och returnerar `()` eller `i32`. En `i32`-retur blir
 processens exitstatus enligt operativsystemets vanliga regler. Övriga
@@ -218,7 +243,7 @@ parameternamn; `fn(i32)` betyder `fn(i32) -> ()`.
 
 Parameter- och returtyper måste matcha exakt när en funktion lagras, skickas,
 returneras eller tilldelas. Funktionsvärden är oföränderliga som standard;
-`var transform := double` tillåter byte till en annan funktion med samma typ.
+`mut transform := double` tillåter byte till en annan funktion med samma typ.
 Funktioner kan ta och returnera andra funktionsvärden, även i flera nivåer.
 Anrop utvärderar först funktionen och därefter argumenten från vänster till
 höger. Inbyggda operationer som `print` är ännu inte funktionsvärden; skriv
@@ -359,7 +384,7 @@ fn length_squared(p: Point) -> i32 {
 
 fn main() {
     original := Point { x: 6 / 2, y: 2 + 2 }
-    var moved := original
+    mut moved := original
     moved.x = moved.x + 1
     print(length_squared(Point { x: 3, y: 4 }))
     print(original.x)
@@ -373,9 +398,11 @@ Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får va
 en skalär typ, ett funktionsvärde, en fast/dynamisk array, en struct eller
 en enum. Inline-cykler avvisas; referensfält är ännu inte tillåtna.
 
-En struct kopieras vid bindning, tilldelning och parameteröverföring.
+En struct med enbart kopierbara fält kan kopieras vid bindning och
+tilldelning. Resursägande structar flyttas i stället. Vanliga
+funktionsparametrar lånar structen för läsning.
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
-oföränderliga; kopiera till en `var` för att ändra fält. Structar kan också
+oföränderliga; kopiera till en `mut` för att ändra fält. Structar kan också
 returneras från funktioner. Anroparen äger resultatets lagring, så en
 returnerad lokal lämnar ingen pekare till avslutad stacklagring. Detta
 fungerar även för callbackreturer, rekursion och importerade nominella typer.
@@ -388,15 +415,15 @@ anropsargument, deklarationer och testfall behövs inga extra parenteser.
 
 ```dunder
 fn sum(values: [i32; 4]) -> i32 {
-    var result := 0
+    mut result := 0
     for value in values { result = result + value }
     result
 }
 
 fn main() {
-    var values: [i32; 4] = [0; 4]
+    mut values: [i32; 4] = [0; 4]
     for i in 0..len(values) { values[i] = i + 1 }
-    snapshot := values.iter()
+    snapshot := values.clone().iter()
     values[0] = 99
     for value in snapshot { print(value) }
     print(sum([1, 2, 3, 4]))
@@ -407,14 +434,14 @@ fn main() {
 upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
 `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune` eller en enum utan payload;
 den härleds eller hämtas från förväntad arraytyp.
-En array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
+En fast array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
 Nästlade arrayer, structelement och slices är ännu inte implementerade.
 
-Arrayer kopieras som värden, även till parametrar. `var` krävs för att
-tilldela ett element. Index har typen `i32`; negativa index och index vid
+Arrayer flyttas vid bindning och retur. Vanliga parametrar lånar för
+läsning. `mut` krävs för att tilldela ett element. Index har typen `i32`; negativa index och index vid
 eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
-längden som `i32`. Fasta arrayer kan returneras från funktioner med samma
-kopiering till anroparens lagring som structar.
+längden som `i32`. Fasta arrayer kan returneras genom ägaröverföring på samma sätt som
+andra resursägande värden.
 
 `start..end` har typen `range`, inkluderar start och utesluter slut.
 Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
@@ -423,11 +450,15 @@ lagras, skickas och returneras som vanliga värden.
 
 `for` stöder intervall, arrayer och `.iter()`-värden. Loopvariabeln är
 oföränderlig och lokal till loopen. `break` lämnar närmaste loop; `continue`
-går till nästa element. Arrayiteration tar en kopia vid loopstart. `.iter()`
-skapar en ägd kopia vid anropet, som kan itereras flera gånger och kopieras
-till andra bindningar eller parametrar. Ändringar i ursprungsarrayen påverkar
-inte kopian. Iteratorns typ härleds med `:=`; den saknar ännu egen
-typstavning, `.next()` och användardefinierat iteratorprotokoll.
+går till nästa element. Vanlig iteration lånar samlingen för läsning och
+avvisar mutation eller flytt av samma samling under loopen.
+`for value in move values` konsumerar ägaren.
+
+`for value in values.iter()` lånar också. En lagrad ägande iterator skapas
+med `(move values).iter()` eller från en uttrycklig klon, som i exemplet
+ovan. Iteratorn kan läslånas flera gånger; bindning till en ny ägare flyttar
+den. Iteratorns typ härleds med `:=`; den saknar ännu egen typstavning,
+`.next()` och användardefinierat iteratorprotokoll.
 
 ## Taggade tester
 
@@ -435,7 +466,7 @@ typstavning, `.next()` och användardefinierat iteratorprotokoll.
 @test {
     (20) -> 4
     (10 + 5) -> 2 + 1
-    var x := 0
+    mut x := 0
     for i in 0..4 { x = x + i }
     div_by_five(x + 14) == 4
 }
@@ -508,7 +539,7 @@ fn main() {
 ```
 
 Strängar är alltid giltig UTF-8 och deras byte är oföränderliga.
-`var text := "a"; text = "b"` byter hela värdet; direkt ändring av ett byte
+`mut text := "a"; text = "b"` byter hela värdet; direkt ändring av ett byte
 är förbjuden. Strängar kan skickas och returneras, även genom callbacks,
 och lagras i arrayer och structfält. Kopior kan dela oföränderliga data.
 

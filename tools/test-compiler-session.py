@@ -57,7 +57,7 @@ def main():
                     rows.append({'source': str(source.relative_to(ROOT)), 'target': target,
                                  'sha256': hashlib.sha256(image).hexdigest()})
             portable = (
-                'fn first(n:i64)->i64{n*3} fn last(a:[]i64)->[]i64{var b:=a;b[0]=b[0]+1;b} fn main(){a:[]i64=[41];print(last(a)[0]);print(first(14))}',
+                'fn first(n:i64)->i64{n*3} fn last(move a:[]i64)->[]i64{mut b:=a;b[0]=b[0]+1;b} fn main(){a:[]i64=[41];print(last(move a)[0]);print(first(14))}',
                 'fn main(){value:f64=2.5;print(value.str())}',
             )
             for index, source in enumerate(portable):
@@ -75,7 +75,7 @@ def main():
             invalid = (
                 'fn bad()->i64{false} fn main(){print(bad())}',
                 'fn dead()->i64{false} fn main(){print(42)}',
-                'fn main(){var a:[]i64=[1];print(a[false])}',
+                'fn main(){mut a:[]i64=[1];print(a[false])}',
                 'fn main(){for i in false..3{print(i)}}',
             )
             for index, source in enumerate(invalid):

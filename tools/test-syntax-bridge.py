@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the bootstrap syntax bridge without changing legacy ownership defaults."""
+"""Verify mut/move syntax, parameter offsets and public source/token compiler APIs."""
 import argparse
 import json
 from pathlib import Path

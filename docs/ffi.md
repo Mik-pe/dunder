@@ -16,7 +16,7 @@ unsafe fn strlen(text: ptr) -> usize
 
 fn main() {
     unsafe {
-        var h: Header = zeroed()
+        mut h: Header = zeroed()
         h.tag = 7
         h.data = cstr("dunder")
         h.length = u32(strlen(h.data))

@@ -10,7 +10,7 @@ import runtime
 // States: ready 0, submitted 1, cached 4, submission failed 5, wait failed 6,
 // discarded 8, unmap failed 9, cached owner consumed 10. On wait failure the
 // child may still be using the arena. Keep the group, arena and control alive.
-pub fn policy_tag() -> string { "native-dispatch-task2-arm64-macos" }
+pub fn policy_tag() -> string { "native-dispatch-task3-borrowed-input1-arm64-macos" }
 pub fn control_bytes() -> i32 { 112 }
 pub fn pool_bytes() -> i64 { 536870912 }
 // Keep the existing heap budget. The inaccessible range spans the largest
@@ -21,10 +21,13 @@ pub fn supported(platform: i32, profiling: bool) -> bool { platform == 0 && !pro
 // Clone label -1 means identity for a proven scalar-only boundary. Label0 is
 // an ordinary valid label, never a sentinel. Worker must always be a label.
 // All three labels use the uniform internal ABI: source/root bits in X0,
-// returned root bits in X0. Clones borrow their source; worker consumes its
-// owned argument and transfers the owned result to control. A fatal worker
+// returned root bits in X0. Clones borrow their source; input_mode selects
+// an owning argument (0), a borrowed root slot (1), a borrowed C payload (2)
+// or a borrowed fixed-array payload (3). The provider drops borrowed input
+// clones after the worker returns and transfers the owned result to control.
+// A fatal worker
 // trap retains the existing process-fatal semantics; it is not a task error.
-pub struct TaskSpec { input_clone: i32, worker: i32, result_clone: i32, result_drop: i32 }
+pub struct TaskSpec { input_clone: i32, input_mode: i32, input_drop: i32, worker: i32, result_clone: i32, result_drop: i32 }
 pub struct Symbols {
     symbol_count: i32, global_queue: i32, create_group: i32, submit: i32,
     wait: i32, release_group: i32, munmap: i32,
@@ -52,10 +55,10 @@ fn imported(c: &mut arm.Code, out: &mut Provider, slot: i32) {
 // root (or scalar bits). Initialization does not take/drop a managed owner.
 // This must not be used to reset an existing live control.
 pub fn emit_initialize(c: &mut arm.Code) {
-    for slot in 0..14 { var src := 31; if slot == 2 { src = 1 }; store(&mut c, src, 0, slot * 8) }
+    for slot in 0..14 { mut src := 31; if slot == 2 { src = 1 }; store(&mut c, src, 0, slot * 8) }
 }
 pub fn emit_unmap_pool(c: &mut arm.Code, symbols: &Symbols) -> UnmapHelper {
-    var out := UnmapHelper { ok: false, error: "", label: -1, import_sites: [], import_slots: [] }
+    mut out := UnmapHelper { ok: false, error: "", label: -1, import_sites: [], import_slots: [] }
     if c.platform != 0 { out.error = "isolated native tasks require ARM64/macOS"; return out }
     if c.profile { out.error = "isolated native task profiling is not supported"; return out }
     if c.checking { out.error = "isolated native task emission requires a code sink"; return out }
@@ -146,8 +149,25 @@ fn entry(c: &mut arm.Code, spec: &TaskSpec, label: i32) {
     load(&mut c, 2, 0, 96)
     args_ready := arm.label(&mut c); arm.branch(&mut c, args_ready, 0)
     arm.mark(&mut c, run); load(&mut c, 1, 0, 96)
-    arm.mark(&mut c, args_ready); load(&mut c, 0, 0, 16); arm.branch(&mut c, spec.worker, 1)
-    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 24); store(&mut c, 21, 1, 32); store(&mut c, 19, 1, 48)
+    arm.mark(&mut c, args_ready); load(&mut c, 0, 0, 16)
+    if spec.input_mode == 1 {
+        // The source borrow ABI expects the address of a root cell. Keep
+        // that cell in the dispatch frame while the worker uses its stack.
+        arm.store(&mut c, 19, 0); arm.address(&mut c, 19)
+    } else if spec.input_mode == 3 {
+        // Fixed scalar arrays are cloned as descriptors, but a borrow of
+        // their inline source representation points directly to the data.
+        load(&mut c, 0, 0, 0)
+    }
+    arm.branch(&mut c, spec.worker, 1)
+    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 24)
+    if spec.input_drop >= 0 {
+        // The borrowed callee does not clean its input. Release the separate
+        // child-domain owner before recycling this lane's allocator cursor.
+        load(&mut c, 0, 1, 16); arm.branch(&mut c, spec.input_drop, 1)
+        arm.load_into(&mut c, 0, 1); store(&mut c, 31, 1, 16)
+    }
+    store(&mut c, 21, 1, 32); store(&mut c, 19, 1, 48)
     for reg in 8..16 { arm.load_into(&mut c, 11 + reg - 8, 10); abi.fp(&mut c, reg, 10, 8, true) }
     for reg in 19..29 { arm.load_into(&mut c, 1 + reg - 19, reg) }
     arm.imm(&mut c, 0, 0); arm.ret(&mut c)
@@ -216,13 +236,17 @@ fn valid_symbols(s: &Symbols) -> bool {
     true
 }
 pub fn emit(c: &mut arm.Code, rt: &runtime.Runtime, spec: &TaskSpec, symbols: &Symbols) -> Provider {
-    var out := result()
+    mut out := result()
     if c.platform != 0 { out.error = "isolated native tasks require ARM64/macOS"; return out }
     if c.profile { out.error = "isolated native task profiling is not supported"; return out }
     if c.checking { out.error = "isolated native task emission requires a code sink"; return out }
     if c.mir_capture { out.error = "isolated native task helpers must be outside source MIR"; return out }
     count := arm.label_count(&c)
     if rt.alloc < 0 || rt.alloc >= count || spec.input_clone < -1 || spec.input_clone >= count ||
+        spec.input_mode < 0 || spec.input_mode > 3 || spec.input_drop < -1 || spec.input_drop >= count ||
+        (spec.input_mode == 0 && spec.input_drop >= 0) ||
+        (spec.input_drop >= 0 && spec.input_clone < 0) ||
+        (spec.input_mode >= 2 && (spec.input_clone < 0 || spec.input_drop < 0)) ||
         spec.worker < 0 || spec.worker >= count || spec.result_clone < -1 || spec.result_clone >= count ||
         spec.result_drop < -1 || spec.result_drop >= count || !valid_symbols(&symbols) {
         out.error = "invalid isolated native task specification"; return out

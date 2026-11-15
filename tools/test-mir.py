@@ -335,19 +335,19 @@ def scalar_cases():
 
 def source_cases():
     valid = {
-        'mixed-calls-loop': ('fn bump(x:i32)->i32{x+3} fn run(n:i32)->i32{var a:[]i32=[];var text: string="";var sum:=0;for i in 0..n{a.push(bump(i));text=text+"a";sum=sum+a[i]};print(text.len);sum} fn main(){print(run(6))}', '6\n33\n', 0),
-        'owned-return': ('struct Box{values:[]i32,label:string} fn make(n:i32)->Box{var a:[]i32=[];for i in 0..n{a.push(i*2)};Box{values:a,label:"box"}} fn main(){var a:=make(4);b:=a;a.values[0]=19;a.label=a.label+"!";print(b.values[0]);print(a.values[0]);print(b.label.len);print(a.label.len)}', '0\n19\n3\n4\n', 0),
-        'array-snapshot': ('fn change(a:&mut []i32){for i in 0..a.len{a[i]=a[i]+7}} fn main(){var a:[]i32=[1,2,3];b:=a;change(&mut a);print(a[0]);print(b[0]);print(a[2]);print(b[2])}', '8\n1\n10\n3\n', 0),
-        'owned-break-continue': ('fn run(n:i32)->i32{var sum:=0;for i in 0..n{s:="ab"+"c";a:[]i32=[i,i+1];if i==2{continue};if i==5{break};sum=sum+a[0]+s.len};sum} fn main(){print(run(10))}', '20\n', 0),
+        'mixed-calls-loop': ('fn bump(x:i32)->i32{x+3} fn run(n:i32)->i32{mut a:[]i32=[];mut text: string="";mut sum:=0;for i in 0..n{a.push(bump(i));text=text+"a";sum=sum+a[i]};print(text.len);sum} fn main(){print(run(6))}', '6\n33\n', 0),
+        'owned-return': ('struct Box{values:[]i32,label:string} fn make(n:i32)->Box{mut a:[]i32=[];for i in 0..n{a.push(i*2)};Box{values:a,label:"box"}} fn main(){mut a:=make(4);b:=a.clone();a.values[0]=19;a.label=a.label+"!";print(b.values[0]);print(a.values[0]);print(b.label.len);print(a.label.len)}', '0\n19\n3\n4\n', 0),
+        'array-snapshot': ('fn change(a:&mut []i32){for i in 0..a.len{a[i]=a[i]+7}} fn main(){mut a:[]i32=[1,2,3];b:=a.clone();change(&mut a);print(a[0]);print(b[0]);print(a[2]);print(b[2])}', '8\n1\n10\n3\n', 0),
+        'owned-break-continue': ('fn run(n:i32)->i32{mut sum:=0;for i in 0..n{s:="ab"+"c";a:[]i32=[i,i+1];if i==2{continue};if i==5{break};sum=sum+a[0]+s.len};sum} fn main(){print(run(10))}', '20\n', 0),
         'owned-early-return': ('fn make(n:i32)->string{for i in 0..n{a:[]string=["a","b"];if i==2{return a[1]+"ok"}};"none"} fn main(){print(make(5).len);print(make(1).len)}', '3\n4\n', 0),
-        'nested-owned-alias': ('struct Box{a:[]string} fn main(){var a:=Box{a:["one","two"]};b:=a;a.a[0]="longer";print(a.a[0].len);print(b.a[0].len);print(b.a[1].len)}', '6\n3\n3\n', 0),
+        'nested-owned-alias': ('struct Box{a:[]string} fn main(){mut a:=Box{a:["one","two"]};b:=a.clone();a.a[0]="longer";print(a.a[0].len);print(b.a[0].len);print(b.a[1].len)}', '6\n3\n3\n', 0),
         'float-owned-call': ('fn calc(x:f64)->f64{x*1.5+2.25} fn main(){label:="mixed";a:[]f64=[calc(2.0),calc(-4.0)];assert(a[0]==5.25);assert(a[1]==-3.75);print(label.len)}', '5\n', 0),
         'indirect-owned-call': ('fn suffix(s:string)->string{s+"x"} fn main(){call:=suffix;print(call("ab").len)}', '3\n', 0),
         'eight-args-calls': ('fn mix(a:i32,b:i32,c:i32,d:i32,e:i32,f:i32,g:i32,h:i32)->i32{h+a+d+f+c+b+e+g} fn effect(x:i32)->i32{print(x);x} fn main(){print(mix(effect(1),effect(2),effect(3),effect(4),effect(5),effect(6),effect(7),effect(8)))}', '1\n2\n3\n4\n5\n6\n7\n8\n36\n', 0),
         'short-circuit-calls': ('fn effect(x:i32)->bool{print(x);x>0} fn main(){print(false&&effect(1));print(true||effect(2));print(effect(3)&&effect(4));print(effect(0)||effect(5))}', 'false\ntrue\n3\n4\ntrue\n0\n5\ntrue\n', 0),
-        'for-bound-snapshot': ('fn main(){var n:=5;var sum:=0;for i in 0..n{n=1;sum=sum+i};print(sum);print(n)}', '10\n1\n', 0),
-        'while-backedge': ('fn step(x:i32)->i32{x-1} fn main(){var i:=9;var sum:=0;while i>0{i=step(i);if i==4{continue};sum=sum+i};print(sum)}', '32\n', 0),
-        'shadow-locals': ('fn effect(x:i32)->i32{x+1} fn main(){var x:=3;if x>0{x:=effect(6);print(x)};print(x)}', '7\n3\n', 0),
+        'for-bound-snapshot': ('fn main(){mut n:=5;mut sum:=0;for i in 0..n{n=1;sum=sum+i};print(sum);print(n)}', '10\n1\n', 0),
+        'while-backedge': ('fn step(x:i32)->i32{x-1} fn main(){mut i:=9;mut sum:=0;while i>0{i=step(i);if i==4{continue};sum=sum+i};print(sum)}', '32\n', 0),
+        'shadow-locals': ('fn effect(x:i32)->i32{x+1} fn main(){mut x:=3;if x>0{x:=effect(6);print(x)};print(x)}', '7\n3\n', 0),
         'division-rem': ('fn calc(a:i64,b:i64)->i64{a/b*17+a%b} fn main(){print(calc(-9234567890123,37));print(calc(9234567890123,-37))}', None, 0),
         'arg-trap-order': ('fn first(a:i32,b:i32)->i32{a} fn mark()->i32{print(71);7} fn zero()->i32{0} fn main(){print(first(mark(),9/zero()))}', '71\n', 102),
         'owned-arg-trap-order': ('fn use(a:string,b:i32)->i32{a.len+b} fn mark()->string{print(72);"abc"} fn zero()->i32{0} fn main(){print(use(mark(),9/zero()))}', '72\n', 102),
@@ -356,8 +356,8 @@ def source_cases():
         'child-overflow-parent-zero': ('fn max()->i32{print(74);2147483647} fn main(){print((max()*2147483647)*0)}', '74\n', 101),
         'min-div': ('fn value()->i64{print(75);-9223372036854775808} fn main(){print(value()/(-1))}', '75\n', 101),
         'min-rem': ('fn value()->i32{print(76);-2147483648} fn main(){print(value()%(-1))}', '76\n', 101),
-        'loop-late-overflow': ('fn main(){var i:=2147483646;while i>0{print(i);i=i+1}}', '2147483646\n2147483647\n', 101),
-        'assert-order': ('fn effect()->bool{print(77);false} fn main(){var a:[]string=["owned"];assert(effect());print(a.len)}', '77\n', 104),
+        'loop-late-overflow': ('fn main(){mut i:=2147483646;while i>0{print(i);i=i+1}}', '2147483646\n2147483647\n', 101),
+        'assert-order': ('fn effect()->bool{print(77);false} fn main(){mut a:[]string=["owned"];assert(effect());print(a.len)}', '77\n', 104),
     }
     source, _, status = valid['division-rem']
     output = ''.join(str(quotient(a, b) * 17 + a - quotient(a, b) * b) + '\n'
@@ -369,7 +369,7 @@ def source_cases():
     valid['spill-call'] = ('fn effect(x:i32)->i32{x+2} fn main(){' + declarations + f'print({total})' + '}', str(sum(i + 2 for i in range(36))) + '\n', 0)
     invalid = [
         'fn main(){if false{missing()}}',
-        'fn main(){if false{var a:[]i32=[true]}}',
+        'fn main(){if false{mut a:[]i32=[true]}}',
         'fn main(){x:=1;if false{x=2}}',
         'fn bad()->i32{if false{return true};3} fn main(){}',
         'fn bad(x:i32)->i32{if x>0{return 3}} fn main(){}',
@@ -377,7 +377,7 @@ def source_cases():
         'fn main(){a:[]i32=[1];a[0]=2}',
         'fn bad(x:i32,x:i32)->i32{x} fn main(){}',
         'fn main(){if false{print(2147483648)}}',
-        'fn main(){if false{var a:=;}}',
+        'fn main(){if false{mut a:=;}}',
     ]
     return valid, invalid
 

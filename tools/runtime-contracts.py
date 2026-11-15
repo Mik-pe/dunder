@@ -29,11 +29,11 @@ TRAPS = {
     'unsigned_overflow': (101, 'x: u64 = 18446744073709551615; unused := x + 1'),
     'unsigned_narrow': (101, 'x: u16 = 256; unused := u8(x)'),
     'zero_divisor': (102, 'x := 0; unused := 1 / x'),
-    'empty_pop': (103, 'var values: []i32 = []; unused := values.pop()'),
+    'empty_pop': (103, 'mut values: []i32 = []; unused := values.pop()'),
     'bad_index': (103, 'values := [1, 2]; unused := values[-1]'),
     'string_bounds': (103, 'unused := "å"[0..3]'),
     'assertion': (104, 'assert(false)'),
-    'string_capacity': (105, 'var text := "x"; for i in 0..25 { text = text + text }'),
+    'string_capacity': (105, 'mut text := "x"; for i in 0..25 { text = text + text }'),
     'utf8_boundary': (106, 'unused := "å"[1..2]'),
     'empty_slice_boundary': (106, 'unused := "å"[1..1]'),
     'negative_rune': (106, 'unused := rune(-1)'),
@@ -41,8 +41,8 @@ TRAPS = {
     'rune_out_of_range': (106, 'unused := rune(1114112)'),
     'invalid_float_cast': (107, 'unused := i64(0.0 / 0.0)'),
     'invalid_enum_tag': (108, 'unused := Kind(2)'),
-    'negative_capacity': (109, 'var values: []i32 = []; values.reserve(-1)'),
-    'excess_capacity': (109, 'var values: []i64 = []; values.reserve(2147483647)'),
+    'negative_capacity': (109, 'mut values: []i32 = []; values.reserve(-1)'),
+    'excess_capacity': (109, 'mut values: []i64 = []; values.reserve(2147483647)'),
 }
 
 
@@ -105,11 +105,11 @@ def unicode_reference():
         bytes := {list(data)}
         scalars := {[ord(c) for c in text]}
         assert(text.len == bytes.len)
-        var i := 0
+        mut i := 0
         for b in text.bytes() {{ assert(b == bytes[i]); i = i + 1 }}
         assert(i == bytes.len)
-        var j := 0
-        var offset := 0
+        mut j := 0
+        mut offset := 0
         for r in text.runes() {{
             assert(i32(r) == scalars[j]); assert(rune(scalars[j]) == r)
             end := offset + r.str().len
@@ -159,7 +159,7 @@ def collections_reference():
     keys += [f'key-{n}' for n in range(200)]
     values, present = {}, set()
     lines = ['import std.map', 'import std.set', 'import std.array',
-             'fn main(){', 'var m:=map.new(); var s:=set.new(); var all:[]string=[]']
+             'fn main(){', 'mut m:=map.new(); mut s:=set.new(); mut all:[]string=[]']
     for step in range(900):
         key = rng.choice(keys)
         lit = json.dumps(key, ensure_ascii=False).replace('\\u0000', '\\0')
@@ -180,7 +180,7 @@ def collections_reference():
                          f'assert(set.contains(&s,{lit})=={str(key in present).lower()})')
         if step % 97 == 0:
             lines.append(f'assert(map.length(&m)=={len(values)}); assert(set.length(&s)=={len(present)})')
-    lines += ['var sum:i64=0', 'for key in map.keys(&m){all.push(key);sum=sum+map.get_or(&m,key,0)}',
+    lines += ['mut sum:i64=0', 'for key in move map.keys(&m){sum=sum+map.get_or(&m,key,0);all.push(move key)}',
               f'assert(sum=={sum(values.values())}); assert(all.len=={len(values)})',
               'array.sort_strings(&mut all)']
     for i, key in enumerate(sorted(values, key=lambda k: k.encode())):

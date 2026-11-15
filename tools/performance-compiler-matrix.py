@@ -26,9 +26,9 @@ import performance as perf
 ROOT = Path(__file__).resolve().parents[1]
 OWNED = '''struct Box{a:[]i64,n:i64}
 fn owned(n:i64)->Box{Box{a:[n,n+1,n+2],n:n}}
-fn mutate(a:&mut []i64)->i64{var sum:i64=0;for i in 0..a.len{a[i]=a[i]+1;sum=sum+a[i]};sum}
+fn mutate(a:&mut []i64)->i64{mut sum:i64=0;for i in 0..a.len{a[i]=a[i]+1;sum=sum+a[i]};sum}
 fn relay(n:i64)->Box{owned(n)}
-fn main(){x:=relay(5);var a:=x.a;print(mutate(&mut a));print(x.a[0]);print(a[2])}
+fn main(){x:=relay(5);mut a:=x.a;print(mutate(&mut a));print(x.a[0]);print(a[2])}
 '''
 CASES = ('generated', 'selfhost', 'selfhost-parallel', 'hello', 'owned')
 

@@ -100,11 +100,11 @@ def corpus(work):
     root.mkdir()
     main = ''.join(f'import m{i}\n' for i in range(20))
     for module in range(20):
-        source = ''.join(f'pub fn item{f}(x: i64) -> i64 {{\n    var value := x\n'
+        source = ''.join(f'pub fn item{f}(x: i64) -> i64 {{\n    mut value := x\n'
                          + '    value = value + 1\n' * 96
                          + '    return value\n}\n' for f in range(50))
         (root / f'm{module}.ddr').write_text(source)
-    main += 'fn main() {\n    var total: i64 = 0\n'
+    main += 'fn main() {\n    mut total: i64 = 0\n'
     for module in range(20):
         for f in range(50):
             main += f'    total = total + m{module}.item{f}({module * 50 + f})\n'

@@ -277,14 +277,14 @@ en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 | `lexer.ddr` | Tokenisering, UTF-8, escapes, positioner och interning. |
 | `modules.ddr` | Modulgraph, namn, synlighet, deduplicering och källmappning. |
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
-| `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, värdesemantik, källordning och slutlig emission. |
+| `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, lån och ägarflyttar, källordning och slutlig emission. |
 | `compile_parallel.ddr`, `mir_task.ddr` | Begränsade taskfönster, ägda funktionsjobb och ordnad acceptans. |
 | `mir_pipeline.ddr` | Samma verifiering och frame-/valbara SSA-/värdepass för seriell körning och workers. |
 | `mir_ssa.ddr`, `mir_ssa_cells.ddr`, `mir_expr_stack.ddr` | Regional frame-SSA och positiva Temp-värden i gemensam registerplacering, med separata livstids-/lagringspremisser. |
 | `mir_memory.ddr`, `mir_terminals.ddr`, `mir_call_abi.ddr` | Separata producentpremisser för objektminne, exakta terminalobservationer och källanropens ABI. |
 | `mir_call_inputs.ddr` | Separat semantisk anropsindata-vy för den kompletta källproducenten; råkontraktet bevaras. |
 | `mir_lower.ddr`, `mir_link.ddr` | Worker-lokal sänkning, numerisk ObjectData-transport, strukturell objektvalidering och ordnad sammanfogning. |
-| `record_take.ddr` | Normalisering vid transfer av unika fulluttryckstemporärer; lokaler flyttas inte. |
+| `record_take.ddr` | Kapacitetsnormalisering för äldre temporäröverföring; källflyttar hanteras av `compile.ddr` och `ownership_state.ddr`. |
 | `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
 | `opt_ir.ddr`, `typed_body.ddr` | Funktionslokala skalärnoder från språkets typkontroll. |
 | `opt_pass.ddr` | Begränsad förenkling och bevis för säkra index och ökningar. |

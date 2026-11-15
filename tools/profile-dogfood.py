@@ -21,7 +21,7 @@ COUNTERS = ('allocation_count requested_bytes size_class_payload_bytes fresh_all
             'reused_allocations retain_calls release_calls array_clone_calls array_clone_bytes '
             'string_slice_calls string_slice_bytes record_construct_calls record_construct_bytes '
             'record_clone_calls record_clone_bytes copy_bytes').split()
-KEYWORDS = set('fn pub var mut if else while for in return break continue struct enum match import as true false'.split())
+KEYWORDS = set('fn pub var mut move if else while for in return break continue struct enum match import as true false defer'.split())
 TOKEN = re.compile(r'''(?P<space>[ \t\r]+)|(?P<newline>\n)|(?P<line>//[^\n]*)|
     (?P<quote>"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|`(?:\\.|[^`\\\r\n])*`)|
     (?P<number>[0-9][0-9_]*(?:\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9][0-9_]*)?)|
@@ -259,7 +259,14 @@ def main():
                 'scope':'whole process including input, setup, workload and checksum output; warm OS file cache',
                 'c_acceptance':'separate cohorts; does not change the four-kernel C acceptance suite'}
     for key,git_args in [('checkout',['rev-parse','HEAD']),('working_tree',['status','--short'])]:
-        metadata[key] = subprocess.run(['git',*git_args],cwd=ROOT,capture_output=True,text=True,check=True).stdout.strip()
+        try:
+            metadata[key] = subprocess.run(['git',*git_args],cwd=ROOT,capture_output=True,text=True,check=True).stdout.strip()
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            if args.mode != 'check':
+                raise
+            # Correctness checks also run from a verified source archive.
+            # Source/input/compiler hashes above still identify the snapshot.
+            metadata[key] = None
     if platform.system() == 'Darwin':
         metadata['hardware'] = subprocess.run(['/usr/sbin/sysctl','machdep.cpu.brand_string','hw.memsize'],capture_output=True,text=True,check=True).stdout.strip()
     elif Path('/proc/cpuinfo').exists():

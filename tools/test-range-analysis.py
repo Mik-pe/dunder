@@ -46,14 +46,14 @@ fn main(){
     tokens:=lexer.scan("a b c n m x flag "+file.value,false)
     names:[]string=["a","b","c","n","m","x","flag"]
     types:[]i32=[21,20,21,1,1,2,3];positions:[]i32=[0,1,2,3,4,5,6]
-    var f:=ir.new();assert(fixture.body(&mut f,&tokens,7,tokens.kinds.len-2,&names,&types,&positions,2))
+    mut f:=ir.new();assert(fixture.body(&mut f,&tokens,7,tokens.kinds.len-2,&names,&types,&positions,2))
     assert(verify.validate(&f,false))
     if sys.arg(3)=="simplified"{pass.run(&mut f);assert(!f.budget_exhausted)}
     assert(verify.validate(&f,true))
-    before:=f
-    var w:=ranges.new()
+    before:=f.clone()
+    mut w:=ranges.new()
     // Reuse a consumed workspace before the budget-constrained observation.
-    var warm:=f
+    mut warm:=f.clone()
     if ranges.analyze_into(&mut w,&warm){ranges.apply(&mut w,&mut warm)}
     allowance:=i32(decimal.integer(sys.arg(2)).value);ranges.set_budget(&mut w,allowance)
     ready:=ranges.analyze_into(&mut w,&f);same(&f,&before)
@@ -284,18 +284,18 @@ class Machine:
 
 def cases():
     bodies = {
-        'sum': '{var total:i64=0;for i in 0..a.len{total=total+a[i]};return total}',
+        'sum': '{mut total:i64=0;for i in 0..a.len{total=total+a[i]};return total}',
         'fill': '{for i in 0..a.len{a[i]=x};return x}',
-        'sort': '{for i in 1..a.len{value:=a[i];var j:=i;while j>0&&a[j-1]>value{a[j]=a[j-1];j=j-1};a[j]=value};return x}',
-        'reverse': '{var l:=0;var r:=a.len-1;while l<r{value:=a[l];a[l]=a[r];a[r]=value;l=l+1;r=r-1};return x}',
-        'while_mutation': '{var i:=0;while i<a.len{a[i]=a[i]+1;i=i+1};return x}',
-        'snapshot_grows': '{var high:=a.len;for i in 0..high{high=high+1;a[i]=x};return x}',
-        'snapshot_shrinks': '{var high:=a.len;for i in 0..high{high=0;a[i]=x};return x}',
-        'snapshot_low_shadow': '{var i:=n;for i in i..a.len{if i<0{break};a[i]=x};return x}',
+        'sort': '{for i in 1..a.len{value:=a[i];mut j:=i;while j>0&&a[j-1]>value{a[j]=a[j-1];j=j-1};a[j]=value};return x}',
+        'reverse': '{mut l:=0;mut r:=a.len-1;while l<r{value:=a[l];a[l]=a[r];a[r]=value;l=l+1;r=r-1};return x}',
+        'while_mutation': '{mut i:=0;while i<a.len{a[i]=a[i]+1;i=i+1};return x}',
+        'snapshot_grows': '{mut high:=a.len;for i in 0..high{high=high+1;a[i]=x};return x}',
+        'snapshot_shrinks': '{mut high:=a.len;for i in 0..high{high=0;a[i]=x};return x}',
+        'snapshot_low_shadow': '{mut i:=n;for i in i..a.len{if i<0{break};a[i]=x};return x}',
         'nested': '{for i in 0..a.len{for j in 0..c.len{if j==1{continue};if j==3{break};c[j]=a[i]}};return x}',
-        'continue_break': '{var i:=0;while i<a.len{if i==1{i=i+1;continue};a[i]=x;if i==3{break};i=i+1};return x}',
+        'continue_break': '{mut i:=0;while i<a.len{if i==1{i=i+1;continue};a[i]=x;if i==3{break};i=i+1};return x}',
         'early_return': '{for i in 0..a.len{if i==n{return a[i]};a[i]=x};return x}',
-        'if_else': '{var i:=n;if flag{if i>=0&&i<a.len{a[i]=x}}else{if i>=0&&i<c.len{c[i]=x}};return x}',
+        'if_else': '{mut i:=n;if flag{if i>=0&&i<a.len{a[i]=x}}else{if i>=0&&i<c.len{c[i]=x}};return x}',
         'negation_guard': '{if !(n<0||n>=a.len){a[n]=x};return x}',
         'or_join': '{if (n>=0&&n<a.len)||(m>=0&&m<a.len){a[n]=x};return x}',
         'cross_root': '{for i in 0..a.len{c[i]=a[i]+b[i]};return x}',
@@ -304,10 +304,10 @@ def cases():
         'offsets': '{for i in 1..a.len{a[i]=a[i-1]};return x}',
         'offset_upper': '{for i in 0..a.len{a[i]=a[i+1]};return x}',
         'negative': '{for i in -1..a.len{a[i]=x};return x}',
-        'mutated_induction': '{var i:=0;while i<a.len{i=i-1;return a[i]};return x}',
-        'mutated_before_read': '{var i:=n;if i>=0&&i<a.len{i=m;a[i]=x};return x}',
-        'killed_relation': '{var i:=0;var guard:=0;while i<a.len&&guard<4{guard=guard+1;if flag{i=m};if i<0||i>=a.len{break};a[i]=x;i=i+1};return x}',
-        'backedge': '{var i:=0;while i<a.len{a[i]=x;i=i+2};return x}',
+        'mutated_induction': '{mut i:=0;while i<a.len{i=i-1;return a[i]};return x}',
+        'mutated_before_read': '{mut i:=n;if i>=0&&i<a.len{i=m;a[i]=x};return x}',
+        'killed_relation': '{mut i:=0;mut guard:=0;while i<a.len&&guard<4{guard=guard+1;if flag{i=m};if i<0||i>=a.len{break};a[i]=x;i=i+1};return x}',
+        'backedge': '{mut i:=0;while i<a.len{a[i]=x;i=i+2};return x}',
         'empty_high_traps': '{for i in 1..n/0{a[i]=x};return x}',
         'low_trap_first': '{for i in n/0..m+1{a[i]=x};return x}',
         'high_overflow': '{for i in n..m+1{if i<0||i>=a.len{break};a[i]=x};return x}',
@@ -379,13 +379,13 @@ def arithmetic_cases():
         'i32_const_child_sub_zero': '{value:=(-2147483648-1)*0;return x}',
         'i32_const_child_before_divisor': '{value:=(2147483647*2147483647)/(n+1);return x}',
         'i32_bounds_after_child': '{if n>=0&&n<a.len{value:=(n+m)*0;a[value]=x};return x}',
-        'i32_later_backedge': '{var value:=n;for i in 0..3{value=value+1};return x}',
-        'i32_guarded_backedge': '{if n<=2147483645{var value:=n;for i in 0..3{value=value+1}};return x}',
-        'i32_later_multiply': '{var value:=n;var i:=0;while i<3{value=value*2;i=i+1};return x}',
+        'i32_later_backedge': '{mut value:=n;for i in 0..3{value=value+1};return x}',
+        'i32_guarded_backedge': '{if n<=2147483645{mut value:=n;for i in 0..3{value=value+1}};return x}',
+        'i32_later_multiply': '{mut value:=n;mut i:=0;while i<3{value=value*2;i=i+1};return x}',
         'i32_short_or': '{if flag||n+1>0{if n>=0&&n<a.len{a[n]=x}};return x}',
         'i32_short_and': '{if !flag&&n*m>=0{if n>=0&&n<a.len{a[n]=x}};return x}',
         'i32_unreachable': '{if false{value:=n+1};return x}',
-        'i32_budget_prefix': '{if n>=0&&n<100{var value:=n;for i in 0..8{value=value+1};if value<a.len{a[value]=x}};return x}',
+        'i32_budget_prefix': '{if n>=0&&n<100{mut value:=n;for i in 0..8{value=value+1};if value<a.len{a[value]=x}};return x}',
         'i64_checked_add': '{value:=x+1;return value}',
         'i64_checked_sub': '{value:=x-1;return value}',
         'i64_checked_mul': '{value:=x*3;return value}',
