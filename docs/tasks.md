@@ -1,7 +1,7 @@
 # Isolerade uppgifter
 
 `task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar
-via pthreads på ARM64/macOS.
+i libdispatchs återanvända trådpool på ARM64/macOS.
 Den första implementationen stöder ARM64/macOS utan runtimeprofilering.
 Nåbara taskoperationer på övriga mål avvisas före kodemission.
 
@@ -25,15 +25,14 @@ fn main() {
 
 Programmet skriver `6`, `30`, `6`. Kapaciteten är ett positivt `i32`-värde
 som begränsar antalet aktiva jobb i scopet. När gränsen är nådd samlar nästa
-spawn in det äldsta aktiva jobbet innan ytterligare en tråd startas.
+spawn in det äldsta aktiva jobbet innan nästa jobb lämnas till poolen.
 Resultatet sparas tills scopet avslutas.
 
 ## Ägare och resultatnycklar
 
-Scopet äger trådar, inputsnapshots, poolade workerarenor och cachade
-resultat. Varje jobbs `input_snapshot` frigörs tidigt så snart jobbet
-samlas in, medan scopet väntar in samtliga jobb innan återstående
-föräldraägda värden släpps och poolade workerarenor avmappas vid utgång.
+Scopet äger jobbens dispatchgrupper, workerarenor och cachade resultat.
+Det väntar in alla aktiva jobb innan de återstående föräldraägda värdena
+släpps och arenorna avmappas.
 Detta gäller vanlig blockutgång, `return`, `break` och `continue`. Ett
 resultat som aldrig efterfrågas behöver inte kopieras tillbaka från arbetaren.
 
@@ -49,6 +48,11 @@ nytt scope, även om allokeraren återanvänder samma minnesadress. Generationer
 återanvänds aldrig vid overflow. Varje await lämnar en vanlig värdekopia av
 det cachade resultatet. Ändring av en returnerad array påverkar varken cachen
 eller nästa await.
+
+`await! jobs(id)` tar över det färdiga resultatets ägarskap. Det går att
+först läsa med vanlig `await` och sedan överta originalet med `await!`.
+Efter övertagandet ger varje ny läsning av samma nyckel, inklusive kopior
+av nyckeln, taskfelet 112. Resultatvärdet överlever scopet som andra ägda värden.
 
 ## Vad en worker får använda
 
@@ -71,19 +75,20 @@ okända indirekta anrop och nästlad task-scheduling. Även hjälpfunktionernas
 anrop och semantiskt kontrollerad död kod ingår. Enbart en funktionssignatur
 bevisar inte att en worker är tillåten.
 
-Föräldern skapar först en fristående `input_snapshot`. Arbetaren klonar denna
-till en workerarena om 512 MiB innan den anropar källfunktionen. Efter lyckad
-join klonas resultatet till förälderns pool, jobbets `input_snapshot`
-frigörs direkt vid insamlingen och barnarenan återställs till en
-scope-lokal pool med upp till 64 återanvändbara workerarenor för
-efterföljande jobb inom samma scope (samtliga avmappas när scopet
-stängs). Inga vanliga managed-handtag delas över gränsen och vanlig RC
-behöver därför inte göras atomisk för denna modell.
+Vid `spawn` klonas den typgodkända indatan direkt till en exklusiv
+workerarena medan källvärdet fortfarande är lånat på föräldratråden.
+Runtimen lämnar över arenans allokerartillstånd och den ägda kopian till
+ett jobb i libdispatchs globala trådpool. Skalarer skickas som värdebitar.
+En dispatchgrupp per jobb synkroniserar resultatet. Efter avslutat jobb
+kopieras det efterfrågade resultatet till förälderns arena. En vanlig
+`await` klonar förälderns cache medan `await!` tar över den.
+Scopet återanvänder upp till 64 workerarenor om 512 MiB och avmappar
+dem vid utgång.
 
 ## Fel och kompilering
 
-Felaktig kapacitet eller resultatnyckel samt fel vid create/join/reclaim
-avslutar processen med status 112. Ett join-fel bevisar inte att arbetaren
+Felaktig kapacitet eller resultatnyckel samt fel vid skapande, inväntan eller avmappning
+avslutar processen med status 112. En misslyckad inväntan bevisar inte att arbetaren
 har avslutats; felvägen får därför inte läsa eller frigöra dess lagring.
 Vanliga runtimefällor i en worker behåller processavslut som felmekanism.
 Cancellation, detach och återhämtning från taskfel ingår inte i första API:t.
@@ -105,11 +110,11 @@ programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
 En enda `compile_session.Session` behåller frontend, typ- och lånekontroll,
 symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
-`compile_parallel` skickar funktionslokala maskinord och metadata i separata
+`compile_parallel` skickar funktionslokala operationer och metadata i separata
 kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
 optimerar och sänker funktionerna i batchen med återanvända arbetsarenor.
 Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
-Föräldern tar emot svaren i källordning. [Batchformat och worker](../selfhost/mir_task.ddr)
+Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/mir_task.ddr)
 
 `ObjectData` är en vanlig transparent post med primitiva arenor och går
 genom språkets befintliga snapshot-/klonregler. Den ger inget undantag för
@@ -128,7 +133,7 @@ som vid ett kallt bygge. Tidigare jobb tas emot före senare källfel, så
 färdigordningen ändrar inte första diagnostiken. Workerantalet ingår inte
 i cacheidentiteten och ändrar inga optimeringsbudgetar.
 
-`--jobs=1`, `check`, `--mir=off` och `--profile-compiler` använder den
+`check`, `--mir=off` och `--profile-compiler` använder den
 identiska seriella Session-drivrutinen. `check` behöver inga backendarenor.
 Kompilatorns funktionscache fungerar också med parallell MIR-bearbetning;
 begränsningen ovan gäller källprogram som själva innehåller tasksyntax.

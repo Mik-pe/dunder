@@ -38,6 +38,8 @@ VALID = {
  'float_results': ('fn work(n:f64)->f64{n+0.5}\nfn main(){task scope j(2){a:=spawn j work(2.0);b:=spawn j work(6.5);assert(await j(a)==2.5);assert(await j(b)==7.0);print(42)}}','42\n'),
  'empty_scope': ('fn main(){task scope jobs(1){var x:=0;x=x+1;print(x)}}','1\n'),
  'scope_shadowing': ('fn work(n:i64)->i64{n}\nfn main(){var jobs:i32=2;task scope jobs(jobs){id:=spawn jobs work(42);{var jobs:=7;print(jobs)};print(await jobs(id))};print(jobs)}','7\n42\n2\n'),
+ 'consume_cached': ('fn work(n:i64)->[]i64{[n]}\nfn result()->[]i64{task scope j(1){a:=spawn j work(40);b:=spawn j work(41);var c:=await j(a);c[0]=9;var x:=await! j(a);x[0]=x[0]+2;return x}}\nfn main(){print(result()[0])}','42\n'),
+ 'consume_active_unit': ('fn work(x:i32){assert(x==1)}\nfn main(){task scope j(1){k:=spawn j work(1);await! j(k)};print(42)}','42\n'),
  'arena_pool_stress': ('struct WorkItem{values:[]i32,seed:i32}\nstruct WorkOut{items:[]i32,total:i64}\nfn work(item:WorkItem)->WorkOut{s:=item.seed.str();var out:[]i32=[];var total:i64=i64(s.len);for v in item.values{w:=v+item.seed;out.push(w);total=total+i64(w)};WorkOut{items:out,total:total}}\nfn main(){var sum:i64=0;for wave in 0..2{task scope jobs(4){var keys:[]TaskID<WorkOut> = [];var read:=0;for j in 0..120{i:=wave*120+j;keys.push(spawn jobs work(WorkItem{values:[i,i+1,i+2],seed:i+10}));if keys.len-read>=4{ans:=await jobs(keys[read]);read=read+1;sum=sum+ans.total+i64(ans.items[0]+ans.items[2])}};while read<keys.len{ans:=await jobs(keys[read]);read=read+1;sum=sum+ans.total+i64(ans.items[0]+ans.items[2])}}};print(sum)}','300630\n'),
 }
 INVALID = {
@@ -68,6 +70,8 @@ INVALID = {
  'named_worker_shadow': (WORKER+'fn main(){f:=work;task scope j(1){id:=spawn j f(1)}}','named Dunder'),
 }
 TRAPS = {
+ 'read_consumed_alias': (WORKER+'fn main(){task scope j(2){k:=spawn j work(7);alias:=k;print(await! j(k));print(await j(alias))}}',112),
+ 'consume_twice': (WORKER+'fn main(){task scope j(1){k:=spawn j work(7);print(await! j(k));print(await! j(k))}}',112),
  'zero_limit': ('fn main(){task scope j(0){}}',112),
  'negative_limit': ('fn main(){task scope j(-1){}}',112),
  'wrong_scope': (WORKER+'fn main(){task scope outer(1){id:=spawn outer work(1);task scope inner(1){value:=await inner(id)}}}',112),

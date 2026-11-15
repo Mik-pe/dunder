@@ -18,12 +18,15 @@ spec.loader.exec_module(provider)
 
 def c_probe():
     source = provider.C_PROBE.replace('struct packet {', '''
-static _Atomic unsigned active, peak, drops, bad_drop;
+static _Atomic unsigned active, peak, drops, bad_drop, threads;
+static _Thread_local int seen_work;
+
 static pthread_mutex_t gate_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cond = PTHREAD_COND_INITIALIZER;
 static unsigned arrived;
 static int gate_open;
 static void begin_active(void) {
+    if (!seen_work) { seen_work = 1; atomic_fetch_add(&threads, 1); }
     unsigned now = atomic_fetch_add(&active, 1) + 1;
     unsigned old = atomic_load(&peak);
     while (old < now && !atomic_compare_exchange_weak(&peak, &old, now)) {}
@@ -39,9 +42,10 @@ static void begin_active(void) {
 }
 struct packet {''')
     source = source.replace('atomic_fetch_add(&starts, 1);', 'atomic_fetch_add(&starts, 1); begin_active();')
-    source = source.replace('free(p);\n    return NULL;', 'atomic_fetch_sub(&active, 1); free(p);\n    return NULL;')
-    source = source.replace('if (fault() == 1) return EAGAIN;', 'if (fault() == 1 && atomic_load(&creates) == 2) return EAGAIN;')
+    source = source.replace('free(p);', 'atomic_fetch_sub(&active, 1); free(p);')
+    source = source.replace('if (fault() == 1) return NULL;', 'if (fault() == 1 && atomic_load(&creates) == 2) return NULL;')
     return source + r'''
+#include <stdio.h>
 void scope_drop(void) {
     atomic_fetch_add(&drops, 1);
     if (atomic_load(&active)) atomic_fetch_add(&bad_drop, 1);
@@ -51,19 +55,20 @@ int scope_check(int mode, int jobs, int array, int cap, int expected_drops) {
     unsigned d = atomic_load(&drops), p = atomic_load(&peak), a = atomic_load(&active);
     if (atomic_load(&bad_drop)) return 1;
     if (mode == 0) {
-        if (c != (unsigned)jobs || j != c || u != (array ? c : 0) || a ||
+        if (c != (unsigned)jobs || j != c || u != (array ? (unsigned)cap : 0) || a ||
             atomic_load(&starts) != c || atomic_load(&preserved) != c ||
             d != (unsigned)expected_drops || !p || p > (unsigned)cap) return 2;
         if (cap == 1 ? p != 1 : p < 2) return 3;
+        if (getenv("TASK_THREAD_REPORT")) { printf("%u\n", atomic_load(&threads)); fflush(stdout); }
         return 0;
     }
     // Fatal errors do not unwind. Previously opened scopes may have completed
     // normally, but the failing scope must retain every parent-owned root.
     if (mode == 1) return c != 2 || j || u || d;
     if (mode == 2) return c != 2 || j != 1 || u || d;
-    if (mode == 3) return c != 2 || j != 1 || u != 1 || d;
+    if (mode == 3) return c != (unsigned)jobs || j != c - cap + 1 || u != 1 || d;
     if (mode == 4) return c != 1 || j || u || d;
-    if (mode == 5) return c != 2 || j != 1 || u != (unsigned)array || d != (array ? 2u : 0u);
+    if (mode == 5) return c != 2 || j != 1 || u != (unsigned)array || d != (unsigned)array;
     if (mode == 6) return c || j || u || d;
     return 4;
 }
@@ -102,8 +107,16 @@ def main():
             env = os.environ.copy()
             env['TASK_SCOPE_CAP'] = str(cap)
             env['TASK_NATIVE_FAULT'] = str({'create-fail': 1, 'join-fail': 2, 'unmap-fail': 3}.get(mode, 0))
+            measure_threads = mode == 'array' and cap == 1
+            if measure_threads:
+                env['TASK_THREAD_REPORT'] = '1'
             run = call([image], expected, env)
-            assert run.stdout == '', (image, run.stdout)
+            if measure_threads:
+                workers = int(run.stdout)
+                assert 1 <= workers <= 12, workers
+                print(f'Observed {workers} distinct OS worker threads for 12 sequential jobs', flush=True)
+            else:
+                assert run.stdout == '', (image, run.stdout)
             print(f'PASS {mode} cap{cap}: real OS workers, status{expected}', flush=True)
         print(f'{len(tests)} scheduler images passed; barrier proves actual overlap, peak stays bounded, no elapsed-time claims')
 

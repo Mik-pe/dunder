@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the internal provider on real ARM64/macOS pthreads, without timings.
+"""Exercise the internal provider on the ARM64/macOS dispatch worker pool, without timings.
 
 Production emission has no C shim. The test-only dylib below wraps actual OS
 calls, injects finite failure outcomes, and calls the emitted start routine
@@ -14,13 +14,14 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 C_PROBE = r'''
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
-typedef void *(*start_fn)(void *);
+typedef dispatch_function_t start_fn;
 extern int abi_probe(start_fn, void *);
 static _Atomic unsigned creates, joins, unmaps, starts, preserved;
 struct packet { start_fn start; void *control; };
@@ -28,30 +29,27 @@ static int fault(void) {
     const char *value = getenv("TASK_NATIVE_FAULT");
     return value ? atoi(value) : 0;
 }
-static void *probe_start(void *raw) {
+static void probe_start(void *raw) {
     struct packet *p = raw;
     atomic_fetch_add(&starts, 1);
     int good = abi_probe(p->start, p->control);
-    ((uint64_t *)p->control)[9] = good;
     if (good) atomic_fetch_add(&preserved, 1);
     free(p);
-    return NULL;
 }
-int probe_create(pthread_t *thread, const pthread_attr_t *attr, start_fn fn, void *arg) {
+dispatch_group_t probe_create(void) {
     atomic_fetch_add(&creates, 1);
-    if (fault() == 1) return EAGAIN;
-    struct packet *p = malloc(sizeof(*p));
-    if (!p) return ENOMEM;
-    *p = (struct packet){ fn, arg };
-    int result = pthread_create(thread, attr, probe_start, p);
-    if (result) free(p);
-    return result;
+    if (fault() == 1) return NULL;
+    return dispatch_group_create();
 }
-int probe_join(pthread_t thread, void **result) {
+void probe_submit(dispatch_group_t group, dispatch_queue_t queue, void *arg, start_fn fn) {
+    struct packet *p = malloc(sizeof(*p));
+    if (!p) abort();
+    *p = (struct packet){ fn, arg };
+    dispatch_group_async_f(group, queue, p, probe_start);
+}
+long probe_wait(dispatch_group_t group, dispatch_time_t timeout) {
     atomic_fetch_add(&joins, 1);
-    int error = pthread_join(thread, result);
-    // The real join completes so this test process can finish cleanly. The
-    // provider receives a failure and must not inspect/reclaim child storage.
+    long error = dispatch_group_wait(group, timeout);
     if (!error && fault() == 2) return EINVAL;
     return error;
 }
@@ -138,7 +136,7 @@ def main():
                 result = call([image], env=env)
                 assert result.stdout == result.stderr == '', (image, result.stdout, result.stderr)
                 executed += 1
-                print(f'PASS {mode}: ' + ('real pthreads + independent C ABI/fault probe' if probe else 'direct system imports'), flush=True)
+                print(f'PASS {mode}: ' + ('dispatch worker pool + independent C ABI/fault probe' if probe else 'direct system imports'), flush=True)
         print(f'{executed} native images passed; 4-worker isolation, parent/child lifetimes, cached/discarded results, exact-once joins and OS failure states; no timings')
 
 

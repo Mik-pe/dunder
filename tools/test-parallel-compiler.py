@@ -259,7 +259,7 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT / 'build/parallel-compiler-qa')
     args = parser.parse_args()
     if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'aarch64'):
-        parser.error('this native pthread/callback acceptance requires ARM64 macOS')
+        parser.error('this native dispatch/callback acceptance requires ARM64 macOS')
     compiler = args.compiler.resolve(strict=True)
     baseline = args.baseline.resolve(strict=True) if args.baseline else None
     output = args.output.resolve()
