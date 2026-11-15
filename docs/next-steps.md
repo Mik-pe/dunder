@@ -5,7 +5,19 @@ funktionerna nedan är inte implementerade. Nuvarande kontrakt finns i
 [minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
 [status](status.md).
 
-## 1. Lokala lån och lånade vyer
+## 1. Partiella flyttar och kontrollerad take/replace
+
+Spåra initiering per structfält, så att flera oberoende fält kan flyttas ur
+samma ägare och återstående fält städas exakt en gång. Dagens regel
+förbrukar hela föräldern vid första fältflytten. Kompilatorns workerresultat
+innehåller fortfarande fältkopior på grund av den begränsningen.
+
+Lägg till en kontrollerad operation som byter ut ett värde bakom `&mut`
+och returnerar den tidigare ägaren. Därmed kan kompilatorn lämna vidare en
+färdig kodbuffert utan att klona den eller lämna en oinitierad lucka.
+Grenar, loopar och uppskjuten cleanup måste följa varje berört fält.
+
+## 2. Lokala lån och lånade vyer
 
 Gör det möjligt att namnge ett läslån till ett fält eller arrayelement och
 använda ett array-/textintervall som vy utan ny buffert. Börja med lån som
@@ -19,15 +31,9 @@ Verifiera både avvisade livstidsfel och att vyerna behåller originalets
 adress utan allokering. Begränsade lån är redan möjliga under anrop;
 den här etappen utvidgar samma regel.
 
-## 2. Partiella flyttar och bättre ägda samlingar
+## 3. Bättre ägda samlingar
 
-Spåra initiering per structfält, så att flera oberoende fält kan flyttas ur
-samma ägare och återstående fält städas exakt en gång. Dagens regel
-förbrukar hela föräldern vid första fältflytten. Kompilatorns frysta
-metadata och workerresultat innehåller fortfarande fältkopior på grund av
-den begränsningen.
-
-Utöka sedan arrayelement till structar, payload-enums och andra arrayer,
+Utöka arrayelement till structar, payload-enums och andra arrayer,
 med samma flytt-, klonings- och cleanupregler som fristående värden.
 Det ersätter parallella fältarrayer i bland annat HTTP-servern och
 kompilatorn. Lägg till ägd borttagning som flyttar ut ett element utan en
@@ -38,7 +44,7 @@ Bygg generiska `Map<K, V>` och `Set<T>` ovanpå denna grund. Välj en enkel
 modell med statisk specialisering och synliga ägarskapskrav. Nuvarande
 `Map` är `string → i64` och `Set` innehåller strängar.
 
-## 3. Automatisk cleanup för externa resurser och typade fel
+## 4. Automatisk cleanup för externa resurser och typade fel
 
 Låt `@resource`-typer ange cleanup som kompilatorn kör vid scope-slut,
 retur, `break`, `continue` och felvägar. Flytt lämnar över ansvaret; lån

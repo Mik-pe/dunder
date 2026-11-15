@@ -21,7 +21,7 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 
 Regeln för flytt gäller `string`, dynamiska och fasta arrayer, iteratorer och
 structar/enums som innehåller sådana värden, inklusive map och set. Tal,
-bool, runes, pekare, funktionsvärden och records med enbart kopierbara fält
+bool, runes, pekare, funktionsvärden och records utan resursfält eller `@resource`
 kan kopieras som enkla värden. Typens ägarskap bestämmer regeln, oberoende
 av om kompilatorn lagrar dess representation på stack eller heap.
 
@@ -176,6 +176,10 @@ Wasm avbryter den aktuella körningen med en trap.
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
 python3 tools/runtime-contracts.py "$dunder_bin"
+python3 tools/test-array-moves.py "$dunder_bin"
+python3 tools/test-resource-moves.py "$dunder_bin"
+python3 tools/test-resource-ownership.py "$dunder_bin"
+python3 tools/test-stdlib-ownership.py "$dunder_bin"
 ```
 
 Testverktyget använder Python 3:s standardbibliotek. Det
