@@ -506,17 +506,15 @@ anropsfria retur-uttryck med `i32`, `i64` och `bool` godtas. Den vanliga
 valideringen och funktionens nåbarhet behålls. Säkerhetskontroller och bindningsposter
 försvinner inte när själva BL-instruktionen ersätts.
 
-Kodtillväxten begränsas till 4 096 uppskattade ord per caller och 65 536
-totalt. Strömmande rune-iteration kan inom samma budget använda den
+Kodtillväxten begränsas till 4 096 uppskattade ord per anropande funktion. Strömmande rune-iteration kan inom samma budget använda den
 gemensamma UTF-8-dekodern direkt; dess staging debiteras uttryckligen.
 `--inline-opt=off` stänger av både uttrycksinlining och denna expansion.
 `--scalar-opt=off` stänger också av katalogens produktion. Check skapar
 ingen katalog eller kodexpansion.
 
 Funktionscachen binder läget till fryst katalogidentitet, kroppsdigester,
-deklarationsberoenden och återstående global budget. Varma fragment
-återställer samma budgetdebitering och behövda deklarationer som ett rent
-bygge. Inlining sker före helfunktions-IR; registerpasset kan därmed arbeta
+deklarationsberoenden och funktionens ordbudget. Varma fragment
+återställer funktionens uppskattade kodtillväxt och de deklarationer den behöver. Inlining sker före helfunktions-IR; registerpasset kan därmed arbeta
 över de inlagda uttrycken med samma verifiering som resten av kroppen.
 
 [Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
