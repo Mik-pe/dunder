@@ -8,22 +8,30 @@ import mir_liveness as live
 import mir_memory as memory_policy
 import mir_terminals as terminals
 import mir_call_abi as call_policy
+import mir_call_inputs as call_inputs
 
 pub opaque struct Workspace {
     liveness: live.Workspace, scores: []i32, allowed: []bool, shortlist: []i32,
     picked: []i32, homes: []i32, home_for_place: []i32,
     barriers: []bool, epilogues: []bool, entries: []bool, order: []i32, assembled: []i32, positions: []i32,
     init_in: []i32, init_gen: []i32, queue: []i32, queued: []bool, exit_reached: []bool,
+    cand_in: []i32, cand_out: []i32, cand_gen: []i32, cand_kill: []i32,
+    cand_forbidden: []i64, cand_conflicts: []i32, spill_index: []i32,
     status: i32, work: i32, limit: i32, source_ops: i32, source_places: i32,
     source_blocks: i32, source_labels: i32, frame_high: i32, frame_low: i32,
     old_frame: i32, new_frame: i32, loads: i32, stores: i32, loops: i32, calls: i32,
+    callee_spills: i32, caller_saved_enabled: bool,
     private_memory: bool, private_ops: i32, has_address_exposure: bool,
 }
 pub fn new() -> Workspace { Workspace { liveness: live.new(), scores: [], allowed: [], shortlist: [],
     picked: [], homes: [], home_for_place: [], barriers: [], epilogues: [], entries: [], order: [], assembled: [], positions: [],
-    init_in: [], init_gen: [], queue: [], queued: [], exit_reached: [], status: 0, work: 0, limit: 0,
+    init_in: [], init_gen: [], queue: [], queued: [], exit_reached: [],
+    cand_in: [], cand_out: [], cand_gen: [], cand_kill: [],
+    cand_forbidden: [], cand_conflicts: [], spill_index: [],
+    status: 0, work: 0, limit: 0,
     source_ops: 0, source_places: 0, source_blocks: 0, source_labels: 0,
     frame_high: -1, frame_low: -1, old_frame: 0, new_frame: 0, loads: 0, stores: 0, loops: 0, calls: 0,
+    callee_spills: 0, caller_saved_enabled: false,
     private_memory: false, private_ops: 0, has_address_exposure: false } }
 pub fn status(w: &Workspace) -> i32 { w.status }
 pub fn units(w: &Workspace) -> i32 { w.work }
@@ -41,8 +49,11 @@ fn reset(w: &mut Workspace, limit: i32) {
     w.scores.clear(); w.allowed.clear(); w.shortlist.clear(); w.picked.clear(); w.homes.clear(); w.home_for_place.clear()
     w.barriers.clear(); w.epilogues.clear(); w.entries.clear(); w.order.clear(); w.assembled.clear(); w.positions.clear()
     w.init_in.clear(); w.init_gen.clear(); w.queue.clear(); w.queued.clear(); w.exit_reached.clear()
+    w.cand_in.clear(); w.cand_out.clear(); w.cand_gen.clear(); w.cand_kill.clear()
+    w.cand_forbidden.clear(); w.cand_conflicts.clear(); w.spill_index.clear()
     w.status = 0; w.work = 0; w.limit = limit; w.frame_high = -1; w.frame_low = -1
-    w.loads = 0; w.stores = 0; w.loops = 0; w.calls = 0; w.private_memory = false; w.private_ops = 0; w.has_address_exposure = false
+    w.loads = 0; w.stores = 0; w.loops = 0; w.calls = 0; w.callee_spills = 0
+    w.private_memory = false; w.private_ops = 0; w.has_address_exposure = false
 }
 fn frame_operation(f: &mir.Function, op: i32, destination: i32, source: i32, opcode: i32) -> bool {
     f.modes[op] != 2 && f.kinds[op] == 16 && f.types[op] == 2 && f.dst[op] == destination &&
@@ -186,6 +197,119 @@ fn narrow_load_ok(w: &Workspace, f: &mir.Function, op: i32) -> bool {
     if width == 4 { return (ext == 1 && ty == 1) || (ext == 2 && ty == 2) }
     (width == 1 || width == 2) && ext == 1 && ty == 1
 }
+fn cand_bit(index: i32) -> i32 { i32(1).shl(index) }
+fn caller_reg_at(index: i32) -> i32 {
+    if index == 0 { return 13 } else if index == 1 { return 14 } else if index == 2 { return 15 }
+    else if index == 3 { return 4 } else if index == 4 { return 5 } else if index == 5 { return 6 }
+    else if index == 6 { return 7 } else if index == 7 { return 10 } else if index == 8 { return 11 }
+    12
+}
+fn shortlist_slot(f: &mir.Function, op: i32, cand_index: &[]i32, sibling_canon: &[]i32) -> i32 {
+    p := f.place[op]
+    if p < 0 { return -1 }
+    slot := cand_index[p]
+    if slot >= 0 { return slot }
+    if sibling_canon.len > p && sibling_canon[p] >= 0 { return cand_index[sibling_canon[p]] }
+    -1
+}
+fn analyze_caller_candidates(w: &mut Workspace, f: &mir.Function, cand_index: &[]i32, sibling_canon: &[]i32,
+    bad_init: &mut i32, bad_caller: &mut i32) -> bool {
+    blocks := f.block_starts.len; k_count := w.shortlist.len
+    if blocks == 0 || k_count == 0 { return true }
+    if !charge(&mut w, blocks * 6 + f.order.len * 4 + k_count * 4) { return false }
+    for b in 0..blocks { w.cand_in.push(0); w.cand_out.push(0); w.cand_gen.push(0); w.cand_kill.push(0); w.queue.push(0); w.queued.push(false) }
+    for c in 0..k_count { w.cand_forbidden.push(0); w.cand_conflicts.push(0) }
+    for pos in 0..f.order.len {
+        op := f.order[pos]; if f.modes[op] == 2 || f.kinds[op] != 8 { continue }
+        slot := shortlist_slot(&f, op, &cand_index, &sibling_canon)
+        if slot >= 0 { b := f.op_blocks[op]; w.cand_gen[b] = w.cand_gen[b].bit_or(cand_bit(slot)) }
+    }
+    w.cand_in[0] = i32(1).shl(k_count) - 1; w.queue[0] = 0; w.queued[0] = true
+    mut head := 0; mut tail := 1 % blocks; mut pending := 1
+    while pending > 0 {
+        b := w.queue[head]; head = (head + 1) % blocks; pending = pending - 1; w.queued[b] = false
+        if !charge(&mut w, 1 + f.edge_starts[b + 1] - f.edge_starts[b]) { return false }
+        outgoing := w.cand_in[b].bit_and(w.cand_gen[b].bit_not())
+        for edge in f.edge_starts[b]..f.edge_starts[b + 1] {
+            to := f.edge_to[edge]; if to < 0 { continue }; incoming := w.cand_in[to].bit_or(outgoing)
+            if incoming == w.cand_in[to] { continue }; w.cand_in[to] = incoming
+            if !w.queued[to] { w.queue[tail] = to; tail = (tail + 1) % blocks; pending = pending + 1; w.queued[to] = true }
+        }
+    }
+    mut uninit_bad := 0
+    for b in 0..blocks {
+        if !live.reachable(&w.liveness, b) { continue }; mut state := w.cand_in[b]
+        for pos in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[pos]; if f.modes[op] == 2 { continue }
+            slot := shortlist_slot(&f, op, &cand_index, &sibling_canon); if slot < 0 { continue }
+            bit := cand_bit(slot)
+            if f.kinds[op] == 7 { uninit_bad = uninit_bad.bit_or(state.bit_and(bit)) }
+            else if f.kinds[op] == 8 { state = state.bit_and(bit.bit_not()) }
+        }
+    }
+    bad_init = uninit_bad; mut barrier_bad := uninit_bad
+    for b in 0..blocks { w.cand_in[b] = 0; w.cand_gen[b] = 0 }
+    for b in 0..blocks {
+        mut gen := 0; mut kill := 0; mut pos := f.block_ends[b]
+        while pos > f.block_starts[b] {
+            pos = pos - 1; op := f.order[pos]; if f.modes[op] == 2 { continue }
+            slot := shortlist_slot(&f, op, &cand_index, &sibling_canon); if slot < 0 { continue }
+            bit := cand_bit(slot)
+            if f.kinds[op] == 8 { gen = gen.bit_and(bit.bit_not()); kill = kill.bit_or(bit) }
+            else if f.kinds[op] == 7 { gen = gen.bit_or(bit) }
+        }
+        w.cand_gen[b] = gen; w.cand_kill[b] = kill; w.cand_in[b] = gen
+    }
+    mut changed := true
+    while changed {
+        changed = false
+        if !charge(&mut w, blocks + f.edge_to.len) { return false }
+        mut b := blocks
+        while b > 0 {
+            b = b - 1
+            mut out := 0
+            for edge in f.edge_starts[b]..f.edge_starts[b + 1] {
+                to := f.edge_to[edge]; if to >= 0 { out = out.bit_or(w.cand_in[to]) }
+            }
+            w.cand_out[b] = out
+            in_val := w.cand_gen[b].bit_or(out.bit_and(w.cand_kill[b].bit_not()))
+            if in_val != w.cand_in[b] { w.cand_in[b] = in_val; changed = true }
+        }
+    }
+    for b in 0..blocks {
+        if !live.reachable(&w.liveness, b) { continue }
+        mut live_mask := w.cand_out[b]; mut pos := f.block_ends[b]
+        while pos > f.block_starts[b] {
+            pos = pos - 1; op := f.order[pos]; if f.modes[op] == 2 { continue }
+            after := live_mask
+            slot := shortlist_slot(&f, op, &cand_index, &sibling_canon)
+            if slot >= 0 {
+                bit := cand_bit(slot)
+                if f.kinds[op] == 8 { live_mask = live_mask.bit_and(bit.bit_not()) }
+                else if f.kinds[op] == 7 { live_mask = live_mask.bit_or(bit) }
+            }
+            before := live_mask
+            if w.barriers[pos] { barrier_bad = barrier_bad.bit_or(before).bit_or(after) }
+            live_after := live.live_after(&w.liveness, op)
+            touch := f.reads[op].bit_or(f.writes[op]).bit_or(f.clobbers[op]).bit_or(live_after)
+            for c in 0..k_count {
+                cbit := cand_bit(c)
+                if after.bit_and(cbit) != 0 {
+                    w.cand_forbidden[c] = w.cand_forbidden[c].bit_or(touch)
+                    w.cand_conflicts[c] = w.cand_conflicts[c].bit_or(after)
+                }
+                if slot == c && f.kinds[op] == 8 {
+                    w.cand_forbidden[c] = w.cand_forbidden[c].bit_or(live_after).bit_or(f.writes[op]).bit_or(f.clobbers[op])
+                    w.cand_conflicts[c] = w.cand_conflicts[c].bit_or(after)
+                    for j in 0..k_count {
+                        if after.bit_and(cand_bit(j)) != 0 { w.cand_conflicts[j] = w.cand_conflicts[j].bit_or(cbit) }
+                    }
+                }
+            }
+        }
+    }
+    bad_caller = barrier_bad; w.queue.clear(); w.queued.clear(); true
+}
 fn select(w: &mut Workspace, f: &mir.Function) -> bool {
     places := f.place_kinds.len; mut used: i64 = 0; mut barrier_cost := 0
     if !charge(&mut w, places + f.kinds.len) { return false }
@@ -267,28 +391,77 @@ fn select(w: &mut Workspace, f: &mir.Function) -> bool {
     }
     // Select a fixed-size shortlist, then compare its byte intervals against
     // every place. At most16*P comparisons, never quadratic in place count.
+    mut min_score := barrier_cost + 4
+    if w.caller_saved_enabled { min_score = 1 }
     for rank in 0..16 {
         if !charge(&mut w, places) { return false }
-        mut best := -1; mut score := barrier_cost + 4
+        mut best := -1; mut score := min_score
         for p in 0..places { if w.allowed[p] && w.scores[p] > score { best = p; score = w.scores[p] } }
         if best < 0 { break }; w.shortlist.push(best); w.allowed[best] = false
     }
-    for index in 0..w.shortlist.len {
-        p := w.shortlist[index]
-        if w.picked.len == 4 { break }
-        if !charge(&mut w, places + 4) { return false }
-        if !w.private_memory {
-            mut aliases := false
-            for other in 0..places {
-                if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
+    if !w.caller_saved_enabled {
+        for index in 0..w.shortlist.len {
+            p := w.shortlist[index]
+            if w.picked.len == 4 { break }
+            if !charge(&mut w, places + 4) { return false }
+            if !w.private_memory {
+                mut aliases := false
+                for other in 0..places {
+                    if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
+                }
+                if aliases { continue }
             }
-            if aliases { continue }
+            mut home := -1
+            for reg in 25..29 { if used.bit_and(mir.variable_bit(reg)) == 0 && home < 0 { home = reg } }
+            if home < 0 { break }
+            used = used.bit_or(mir.variable_bit(home)); w.home_for_place[p] = w.picked.len
+            w.picked.push(p); w.homes.push(home); w.spill_index.push(w.callee_spills); w.callee_spills = w.callee_spills + 1
         }
-        mut home := -1
-        for reg in 25..29 { if used.bit_and(mir.variable_bit(reg)) == 0 && home < 0 { home = reg } }
-        if home < 0 { break }
-        used = used.bit_or(mir.variable_bit(home)); w.home_for_place[p] = w.picked.len
-        w.picked.push(p); w.homes.push(home)
+    } else if w.shortlist.len > 0 {
+        mut cand_index: []i32 = []; mut assigned_reg: []i32 = []; mut aliases_ok: []bool = []
+        for p in 0..places { cand_index.push(-1) }
+        for k in 0..w.shortlist.len {
+            p := w.shortlist[k]; cand_index[p] = k; assigned_reg.push(-1)
+            mut aliases := false
+            if !w.private_memory {
+                if !charge(&mut w, places) { return false }
+                for other in 0..places {
+                    if other != p && f.place_kinds[other] == 1 && overlap(&f, p, other) { aliases = true }
+                }
+            }
+            aliases_ok.push(!aliases)
+        }
+        mut bad_init := 0; mut bad_caller := 0
+        if !analyze_caller_candidates(&mut w, &f, &cand_index, &sibling_canon, &mut bad_init, &mut bad_caller) { return false }
+        for k in 0..w.shortlist.len {
+            if !aliases_ok[k] || bad_caller.bit_and(cand_bit(k)) != 0 { continue }
+            mut home := -1
+            for slot in 0..10 {
+                reg := caller_reg_at(slot)
+                if w.cand_forbidden[k].bit_and(mir.variable_bit(reg)) != 0 { continue }
+                mut busy := false
+                for j in 0..w.shortlist.len {
+                    if w.cand_conflicts[k].bit_and(cand_bit(j)) != 0 && assigned_reg[j] == reg { busy = true; break }
+                }
+                if !busy { home = reg; break }
+            }
+            if home >= 0 {
+                p := w.shortlist[k]; assigned_reg[k] = home; w.home_for_place[p] = w.picked.len
+                w.picked.push(p); w.homes.push(home); w.spill_index.push(-1)
+            }
+        }
+        for k in 0..w.shortlist.len {
+            if w.callee_spills == 4 { break }
+            p := w.shortlist[k]
+            if !aliases_ok[k] || assigned_reg[k] >= 0 || bad_init.bit_and(cand_bit(k)) != 0 { continue }
+            if w.scores[p] <= barrier_cost + 4 { continue }
+            if !charge(&mut w, 4) { return false }
+            mut home := -1
+            for reg in 25..29 { if used.bit_and(mir.variable_bit(reg)) == 0 && home < 0 { home = reg } }
+            if home < 0 { break }
+            used = used.bit_or(mir.variable_bit(home)); w.home_for_place[p] = w.picked.len
+            w.picked.push(p); w.homes.push(home); w.spill_index.push(w.callee_spills); w.callee_spills = w.callee_spills + 1
+        }
     }
     if w.picked.len == 0 { return refuse(&mut w) }
     if w.private_memory {
@@ -299,7 +472,8 @@ fn select(w: &mut Workspace, f: &mir.Function) -> bool {
             }
         }
     }
-    w.new_frame = (w.old_frame + w.picked.len * 8 + 15) / 16 * 16
+    if w.callee_spills > 0 { w.new_frame = (w.old_frame + w.callee_spills * 8 + 15) / 16 * 16 }
+    else { w.new_frame = w.old_frame }
     if w.new_frame > 16777200 { return refuse(&mut w) }
     true
 }
@@ -348,8 +522,9 @@ fn scratch(w: &mut Workspace, f: &mir.Function) -> bool {
     for position in 0..f.order.len {
         op := f.order[position]
         for home in 0..w.picked.len {
+            if w.spill_index[home] < 0 { continue }
             original := f.place_offsets[w.picked[home]]
-            saved := -(w.old_frame + (home + 1) * 8)
+            saved := -(w.old_frame + (w.spill_index[home] + 1) * 8)
             if (position == 3 || w.epilogues[position]) && saved < -256 {
                 mut needed := live.live_after(&w.liveness, op)
                 if w.epilogues[position] { needed = before(&f, &w, op) }
@@ -364,8 +539,9 @@ fn scratch(w: &mut Workspace, f: &mir.Function) -> bool {
 // Status:1 prepared,2 consumed,-1 invalid/stale input,-2 unsupported or no
 // profitable candidates,-3 budget. Failure leaves every Function field intact.
 fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_objects: bool,
-    exits: &terminals.TerminalContext, source_abi: bool) -> bool {
+    exits: &terminals.TerminalContext, inputs: &call_inputs.Context, source_abi: bool, allow_caller_saved: bool) -> bool {
     reset(&mut w, limit)
+    w.caller_saved_enabled = allow_caller_saved
     if !terminals.valid(&exits) { w.status = -1; return false }
     if !f.valid || !f.verified { w.status = -1; return false }
     if !f.optimizable || f.unknown_control { return refuse(&mut w) }
@@ -385,16 +561,16 @@ fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_object
             }
         }
     } else if w.has_address_exposure { return refuse(&mut w) }
-    if !live.analyze_into(&mut w.liveness, &f, w.limit - w.work) {
+    if !live.analyze_with_inputs_into(&mut w.liveness, &f, &inputs, w.limit - w.work) {
         w.status = live.status(&w.liveness); w.work = w.work + live.units(&w.liveness); return false
     }
     w.work = w.work + live.units(&w.liveness)
     for b in 0..f.block_starts.len { if live.loop_block(&w.liveness, b) { w.loops = w.loops + 1 } }
     if !select(&mut w, &f) || !initialized(&mut w, &f) || !scratch(&mut w, &f) { return false }
-    mut additions := w.picked.len * 2
+    mut additions := w.callee_spills * 2
     for position in 0..f.order.len {
-        if w.barriers[position] { additions = additions + w.picked.len * 2 }
-        if w.epilogues[position] { additions = additions + w.picked.len }
+        if w.barriers[position] { additions = additions + w.callee_spills * 2 }
+        if w.epilogues[position] { additions = additions + w.callee_spills }
     }
     if additions > 65536 - f.kinds.len || !charge(&mut w, additions + f.order.len + f.label_ops.len + f.block_starts.len * 2 + f.place_table.len * 8) { w.status = -3; return false }
     w.source_ops = f.kinds.len; w.source_places = f.place_kinds.len; w.source_blocks = f.block_starts.len; w.source_labels = f.label_ops.len
@@ -403,13 +579,15 @@ fn analyze_policy(w: &mut Workspace, f: &mir.Function, limit: i32, source_object
 // Raw and memory-only APIs grant no unobserving-exit promise.
 pub fn no_terminals() -> terminals.TerminalContext { terminals.no_terminals() }
 pub fn analyze_budget(w: &mut Workspace, f: &mir.Function, limit: i32) -> bool {
-    exits := terminals.no_terminals(); analyze_policy(&mut w, &f, limit, false, &exits, false)
+    exits := terminals.no_terminals(); inputs := call_inputs.conservative()
+    analyze_policy(&mut w, &f, limit, false, &exits, &inputs, false, false)
 }
 pub fn analyze_into(w: &mut Workspace, f: &mir.Function) -> bool { analyze_budget(&mut w, &f, 4194304) }
 // This policy skips only proven-private indirect-memory synchronization.
 // It establishes no call ABI: reachable calls still refuse this wrapper.
 pub fn analyze_with_context_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context, limit: i32) -> bool {
-    exits := terminals.no_terminals(); analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, false)
+    exits := terminals.no_terminals(); inputs := call_inputs.conservative()
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, &inputs, false, false)
 }
 pub fn analyze_with_context(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context) -> bool {
     analyze_with_context_budget(&mut w, &f, &context, 4194304)
@@ -419,7 +597,8 @@ pub fn analyze_with_context(w: &mut Workspace, f: &mir.Function, context: &memor
 // admits reachable calls without the separate call ABI supplied below.
 pub fn analyze_with_terminals_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
     exits: &terminals.TerminalContext, limit: i32) -> bool {
-    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, false)
+    inputs := call_inputs.conservative()
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, &inputs, false, false)
 }
 pub fn analyze_with_terminals(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
     exits: &terminals.TerminalContext) -> bool {
@@ -430,7 +609,12 @@ pub fn analyze_with_terminals(w: &mut Workspace, f: &mir.Function, context: &mem
 // about call layout, even when their memory/terminal premises are enabled.
 pub fn analyze_with_contracts_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
     exits: &terminals.TerminalContext, calls: &call_policy.Context, limit: i32) -> bool {
-    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, call_policy.source_abi(&calls))
+    inputs := call_inputs.conservative()
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, &inputs, call_policy.source_abi(&calls), false)
+}
+pub fn analyze_with_source_contracts_budget(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
+    exits: &terminals.TerminalContext, inputs: &call_inputs.Context, calls: &call_policy.Context, limit: i32) -> bool {
+    analyze_policy(&mut w, &f, limit, memory_policy.source_objects(&context), &exits, &inputs, call_policy.source_abi(&calls), true)
 }
 pub fn analyze_with_contracts(w: &mut Workspace, f: &mir.Function, context: &memory_policy.Context,
     exits: &terminals.TerminalContext, calls: &call_policy.Context) -> bool {
@@ -471,14 +655,18 @@ pub fn apply(w: &mut Workspace, f: &mut mir.Function) {
     f.verified = false
     // Fresh cells are outside the entire old reservation, including padding
     // and owned initialization slots, and inside the expanded aligned frame.
+    mut spill := 0
     for home in 0..w.homes.len {
-        p := mir.add_place(&mut f, 1, -(w.old_frame + (home + 1) * 8), 8, 0)
-        assert(p == w.source_places + home)
+        if w.spill_index[home] < 0 { continue }
+        p := mir.add_place(&mut f, 1, -(w.old_frame + (w.spill_index[home] + 1) * 8), 8, 0)
+        assert(p == w.source_places + spill); spill = spill + 1
     }
-    high := w.frame_high; f.modes[high] = 1; f.recipes[high] = 0; f.variant[high] = 0; f.raw_starts[high] = -1; f.widths[high] = 0; f.imm[high] = i64(w.new_frame); f.effects[high] = 32
-    f.opcodes[high] = 2; f.dst[high] = 31; f.a[high] = 31; f.b[high] = -1; f.c[high] = -1; f.types[high] = 2
-    f.reads[high] = mir.variable_bit(31); f.writes[high] = mir.variable_bit(31); f.flags[high] = 0; f.clobbers[high] = 0
-    f.modes[w.frame_low] = 2
+    if w.callee_spills > 0 {
+        high := w.frame_high; f.modes[high] = 1; f.recipes[high] = 0; f.variant[high] = 0; f.raw_starts[high] = -1; f.widths[high] = 0; f.imm[high] = i64(w.new_frame); f.effects[high] = 32
+        f.opcodes[high] = 2; f.dst[high] = 31; f.a[high] = 31; f.b[high] = -1; f.c[high] = -1; f.types[high] = 2
+        f.reads[high] = mir.variable_bit(31); f.writes[high] = mir.variable_bit(31); f.flags[high] = 0; f.clobbers[high] = 0
+        f.modes[w.frame_low] = 2
+    }
     // positions is an old-order boundary map; insertions after an operation
     // precede the next old boundary. Entry saves therefore execute only on
     // entry even when a loop label is attached immediately after reservation.
@@ -486,10 +674,18 @@ pub fn apply(w: &mut Workspace, f: &mut mir.Function) {
     for position in 0..w.order.len {
         w.positions.push(w.assembled.len); op := w.order[position]; block := f.op_blocks[op]
         if w.epilogues[position] {
-            for home in 0..w.homes.len { w.assembled.push(memory(&mut f, 7, w.homes[home], w.source_places + home, block)) }
+            for home in 0..w.homes.len {
+                if w.spill_index[home] >= 0 {
+                    w.assembled.push(memory(&mut f, 7, w.homes[home], w.source_places + w.spill_index[home], block))
+                }
+            }
         }
         if w.barriers[position] {
-            for home in 0..w.homes.len { w.assembled.push(memory(&mut f, 8, w.homes[home], w.picked[home], block)) }
+            for home in 0..w.homes.len {
+                if w.spill_index[home] >= 0 {
+                    w.assembled.push(memory(&mut f, 8, w.homes[home], w.picked[home], block))
+                }
+            }
         }
         if f.modes[op] != 2 && (f.kinds[op] == 7 || f.kinds[op] == 8) {
             p := f.place[op]; selected := w.home_for_place[p]
@@ -508,15 +704,21 @@ pub fn apply(w: &mut Workspace, f: &mut mir.Function) {
         w.assembled.push(op)
         if position == 3 {
             for home in 0..w.homes.len {
-                w.assembled.push(memory(&mut f, 8, w.homes[home], w.source_places + home, block))
-                // Unknown memory/calls can observe this reserved cell before
-                // its first source Store. Preserve its existing raw bits;
-                // this is no source value read, normalization or ARC action.
-                w.assembled.push(memory(&mut f, 7, w.homes[home], w.picked[home], block))
+                if w.spill_index[home] >= 0 {
+                    w.assembled.push(memory(&mut f, 8, w.homes[home], w.source_places + w.spill_index[home], block))
+                    // Unknown memory/calls can observe this reserved cell before
+                    // its first source Store. Preserve its existing raw bits;
+                    // this is no source value read, normalization or ARC action.
+                    w.assembled.push(memory(&mut f, 7, w.homes[home], w.picked[home], block))
+                }
             }
         }
         if w.barriers[position] {
-            for home in 0..w.homes.len { w.assembled.push(memory(&mut f, 7, w.homes[home], w.picked[home], block)) }
+            for home in 0..w.homes.len {
+                if w.spill_index[home] >= 0 {
+                    w.assembled.push(memory(&mut f, 7, w.homes[home], w.picked[home], block))
+                }
+            }
         }
     }
     w.positions.push(w.assembled.len)
