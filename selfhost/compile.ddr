@@ -969,8 +969,8 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         require_unsafe(&mut c)
         if c.tokens.kinds[c.cursor] != .String { fail(&mut c, "cstr needs a string literal"); return 0 }
         value := peek(&c); for i in 0..value.len { if value[i] == 0 { fail(&mut c, "cstr contains an embedded NUL") } }
-        var place := 0; var at := -1
-        arg := primary_inner(&mut c, 4, &catalog, &mut inline_work, &mut model, &mut place, &mut at); expect(&mut c, ")")
+        var place := 0; var at := -1; var pending := false
+        arg := primary_inner(&mut c, 4, &catalog, &mut inline_work, &mut model, &mut place, &mut at, &mut pending); expect(&mut c, ")")
         arm.emit(&mut c.code, 2432704512); return 13
     }
     if name == "addr" { covered = true;
@@ -1193,7 +1193,7 @@ fn invoke(c: &mut Session, signature: i32, address: i32, f: i32, wasm_sig: i32, 
         // A later argument may have replaced a heap-backed record. Re-resolve
         // the pure field borrow after it, as the source-level place is stable.
         if refresh {
-            load_place(&mut c, place)
+            lower_place(&mut c, place, 0, .ValueAndAddress)
             borrow_address(&mut c, c.types.type_bases[want])
             arm.store(&mut c.code, args[arg], 0)
         }
@@ -1252,14 +1252,16 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_
     if c.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.depth = c.depth - 1; return 0 }
     c.address = -1; c.writable = false; c.scratch_place = 0; c.expr_owner = -1; c.expr_type = -1
     first_token := c.cursor
-    var place := 0; var at := -1
-    var ty := primary_inner(&mut c, expected, &catalog, &mut inline_work, &mut model, &mut place, &mut at)
+    var place := 0; var at := -1; var pending := false
+    var ty := primary_inner(&mut c, expected, &catalog, &mut inline_work, &mut model, &mut place, &mut at, &mut pending)
+    var materialized := 0
     while c.ok && (is(&c, ".") || is(&c, "[") || is(&c, "(")) {
         // Projection results borrow their receiver's storage. A call or slice
         // below may establish a new complete temporary of its own.
         c.expr_owner = -1; c.expr_type = -1
         if eat(&mut c, "(") {
             model.recording = false
+            if pending { lower_place(&mut c, place, materialized, .Value); pending = false }
             if c.types.type_kinds[ty] == 8 { ty = foreign_call(&mut c, ty, &catalog, &mut inline_work, &mut model) }
             else if c.types.type_kinds[ty] == 9 {
                 callee := slot(&mut c); arm.store(&mut c.code, callee, 0); ty = invoke(&mut c, ty, callee, -1, -1, &catalog, &mut inline_work, &mut model)
@@ -1268,6 +1270,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_
         } else if eat(&mut c, "[") {
             array_id := model.array
             if array_id < 0 { model.recording = false }
+            if pending { lower_place(&mut c, place, materialized, .Value); pending = false }
             packed := c.inline_place && c.types.type_kinds[ty] == 6
             writable := c.writable
             if ty == 4 && !read_only_index(&c.tokens, c.cursor) { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
@@ -1281,7 +1284,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_
                     // The index ran once. Load the current descriptor before
                     // checking its bounds and locating the element.
                     arm.mov(&mut c.code, 1, 0); arm.pop_temp(&mut c.code, 0); arm.push_temp(&mut c.code, 1)
-                    load_place(&mut c, place)
+                    lower_place(&mut c, place, 0, .Value)
                     arm.pop_temp(&mut c.code, 1); arm.push_temp(&mut c.code, 0); arm.mov(&mut c.code, 0, 1)
                 }
             }
@@ -1301,7 +1304,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_
                 if kind == 1 || kind == 2 || kind == 6 { index = slot(&mut c); arm.store(&mut c.code, index, 0) }
             }
             place = borrows.project(&mut c.places, place, ty, -1, index)
-            ty = load_index(&mut c, ty, packed, writable, need_element_address(&c))
+            ty = load_index(&mut c, ty, packed, writable, place_access(&c))
             c.expr_owner = -1; c.expr_type = -1
         } else {
             expect(&mut c, "."); name := advance(&mut c)
@@ -1311,17 +1314,28 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_
             }
             // Callable fields go through ordinary field access and the postfix
             // call below, sharing argument and alias checks with local callbacks.
-            if is(&c, "(") && !(c.types.type_kinds[ty] == 2 && field(&c, ty, name) >= 0) { result := method(&mut c, ty, name, place, &catalog, &mut inline_work, &mut model); place = 0; ty = temporary(&mut c, result); c.address = -1; c.writable = false }
-            else if name == "len" && (ty == 4 || collection(&c, ty) || c.types.type_kinds[ty]==21) {
+            var member := -1
+            if c.types.type_kinds[ty] == 2 { member = field(&c, ty, name) }
+            if is(&c, "(") && member < 0 {
+                if pending { lower_place(&mut c, place, materialized, .Value); pending = false }
+                result := method(&mut c, ty, name, place, &catalog, &mut inline_work, &mut model)
+                place = 0; ty = temporary(&mut c, result); c.address = -1; c.writable = false
+            } else if name == "len" && (ty == 4 || collection(&c, ty) || c.types.type_kinds[ty] == 21) {
+                if pending { lower_place(&mut c, place, materialized, .Value); pending = false }
                 ty = length_value(&mut c, ty); place = 0; c.address = -1; c.writable = false
             } else if c.types.type_kinds[ty] == 2 {
                 opaque_access(&mut c, ty)
-                found := field(&c, ty, name)
-                if found < 0 { fail(&mut c, "unknown field '" + name + "'") }
-                else { place = borrows.project(&mut c.places, place, ty, found, -1); ty = load_field(&mut c, ty, found) }
+                if member < 0 { fail(&mut c, "unknown field '" + name + "'") }
+                else if place == 0 { ty = load_field(&mut c, ty, member, .Value) }
+                else {
+                    if !pending { materialized = place; pending = true }
+                    place = borrows.project(&mut c.places, place, ty, member, -1)
+                    ty = c.types.field_types[member]
+                }
             } else { fail(&mut c, "unknown member '" + name + "'") }
         }
     }
+    if pending && c.ok { lower_place(&mut c, place, materialized, place_access(&c)) }
     if !owned(&c, ty) { c.expr_owner = -1; c.expr_type = -1 }
     c.places.current = place; c.places.source = at
     c.depth = c.depth - 1; ty
@@ -1386,7 +1400,7 @@ fn if_value(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline
     arm.mark(&mut c.code, done)
     return joined_value(&mut c, result)
 }
-fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, place: &mut i32, at: &mut i32) -> i32 {
+fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, place: &mut i32, at: &mut i32, pending: &mut bool) -> i32 {
     if !c.ok { return 0 }
     token := c.cursor
     if model.recording {
@@ -1558,7 +1572,12 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, i
             arm.barrier(&mut c.code); c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.ffi_types[f]
         }
         place = borrows.local_id(found); at = c.cursor - 1
-        return load_binding(&mut c, found)
+        pending = true
+        ty := c.local_types[found]; local_kind := c.types.type_kinds[ty]
+        if local_kind == 23 { fail(&mut c, "task scope capability is only valid with spawn or await"); return 0 }
+        if local_kind == 20 { fail(&mut c, "region is only valid in an allocation"); return 0 }
+        if local_kind == 4 || local_kind == 5 { return c.types.type_bases[ty] }
+        return ty
     }
     fail(&mut c, "expected expression"); 0
 }
@@ -1566,46 +1585,50 @@ fn place_slot(c: &Session, place: i32) -> i32 {
     binding := borrows.root(&c.places, place)
     if binding < 0 { return -1 }; c.local_slots[binding]
 }
-fn load_binding(c: &mut Session, found: i32) -> i32 {
-    var ty := c.local_types[found]; c.writable = c.local_mutable[found]
-    if c.types.type_kinds[ty] == 23 { fail(&mut c, "task scope capability is only valid with spawn or await"); return 0 }
-    if c.types.type_kinds[ty]==20 {fail(&mut c,"region is only valid in an allocation");return 0}
-    if c.types.type_kinds[ty]==21 {c.scratch_place=3}
-    if c.types.type_kinds[ty] == 4 || c.types.type_kinds[ty] == 5 { arm.load(&mut c.code, c.local_slots[found]); c.writable = c.types.type_kinds[ty] == 5; ty = c.types.type_bases[ty]
+fn load_binding(c: &mut Session, found: i32, access: borrows.Access) {
+    local_type := c.local_types[found]; kind := c.types.type_kinds[local_type]
+    home := c.local_slots[found]
+    c.scratch_place = 0; c.inline_place = false
+    if kind == 21 { c.scratch_place = 3 }
+    if kind == 4 || kind == 5 {
+        c.writable = kind == 5
+        ty := c.types.type_bases[local_type]
+        // The parameter home already contains the address of its referent.
+        c.address = home; c.direct_place = false
+        if access != .Address { arm.load(&mut c.code, home) }
         if c.types.c_record[ty] || fixed_pod(&c, ty) {
-            c_layout(&mut c, ty)
-            save_address(&mut c); c.inline_place = true; inline_value(&mut c, ty); return ty
-        }
-    }
-    else {
-        c.inline_place = false; c.direct_place = true; c.address = c.local_slots[found]
-        load_local(&mut c, c.address, ty); return ty
-    }
-    save_address(&mut c); transfer_value(&mut c, ty, 0, 0, true); return ty
-}
-fn load_field(c: &mut Session, receiver: i32, member: i32) -> i32 {
-    if c.scratch_place != 0 { c.scratch_place = 2 }
-    ty := c.types.field_types[member]
-    if c.types.c_record[receiver] {
-        c_offset(&mut c, c.types.field_values[member]); save_address(&mut c); c.inline_place = true
-        inline_value(&mut c, ty)
+            c_layout(&mut c, ty); c.inline_place = true
+            if access != .Address { inline_value(&mut c, ty) }
+        } else if access != .Address { transfer_value(&mut c, ty, 0, 0, true) }
     } else {
-        c_offset(&mut c, i64(member - c.types.type_starts[receiver]) * 8); save_address(&mut c)
-        transfer_value(&mut c, ty, 0, 0, true)
+        c.writable = c.local_mutable[found]; c.direct_place = true; c.address = home
+        if access != .Address { load_local(&mut c, home, local_type) }
+    }
+}
+fn load_field(c: &mut Session, receiver: i32, member: i32, access: borrows.Access) -> i32 {
+    if c.scratch_place != 0 { c.scratch_place = 2 }
+    ty := c.types.field_types[member]; packed := c.types.c_record[receiver]
+    if packed { c_offset(&mut c, c.types.field_values[member]) }
+    else { c_offset(&mut c, i64(member - c.types.type_starts[receiver]) * 8) }
+    if access != .Value { save_address(&mut c) } else { c.address = -1; c.direct_place = false }
+    c.inline_place = packed
+    if access != .Address {
+        if packed { inline_value(&mut c, ty) } else { transfer_value(&mut c, ty, 0, 0, true) }
     }
     ty
 }
-fn load_index(c: &mut Session, receiver: i32, packed: bool, writable: bool, address: bool) -> i32 {
+fn load_index(c: &mut Session, receiver: i32, packed: bool, writable: bool, access: borrows.Access) -> i32 {
     var ty := receiver
     if ty == 4 {
         load_mem(&mut c, 2, 1, 0); arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.bounds, 4)
         arm.emit(&mut c.code, 2332033056); arm.emit(&mut c.code, 2432704512)
         unsigned.transfer(&mut c.code, 8, 0, 0, true); ty = 1; c.address = -1; c.writable = false
     }
-    else if c.types.type_kinds[ty]==21 {
-        ty=c.types.type_bases[ty];scratch.index(&mut c.code,scratch_width(&c,ty),c.bounds)
-        save_address(&mut c);c.scratch_place=1;c.writable=writable;c.inline_place=c.types.c_record[ty]
-        if c.types.type_kinds[ty]!=2 {transfer_c(&mut c,ty,0,0,true)}
+    else if c.types.type_kinds[ty] == 21 {
+        ty = c.types.type_bases[ty]; scratch.index(&mut c.code, scratch_width(&c, ty), c.bounds)
+        if access != .Value { save_address(&mut c) } else { c.address = -1; c.direct_place = false }
+        c.scratch_place = 1; c.writable = writable; c.inline_place = c.types.c_record[ty]
+        if access != .Address && c.types.type_kinds[ty] != 2 { transfer_c(&mut c, ty, 0, 0, true) }
     }
     else if collection(&c, ty) && c.types.type_kinds[ty] != 10 {
         load_mem(&mut c, 2, 1, 8); arm.emit(&mut c.code, 3942776863); arm.branch(&mut c.code, c.bounds, 4)
@@ -1616,9 +1639,11 @@ fn load_index(c: &mut Session, receiver: i32, packed: bool, writable: bool, addr
             while i32(1).shl(elem_shift) < c.types.c_sizes[ty] { elem_shift = elem_shift + 1 }
         }
         arm.emit(&mut c.code, 2332033056 + i64(elem_shift) * 1024)
-        if address { save_address(&mut c) } else { c.address = -1; c.direct_place = false }
+        if access != .Value { save_address(&mut c) } else { c.address = -1; c.direct_place = false }
         c.scratch_place = 0; c.inline_place = packed
-        if packed { transfer_c(&mut c, ty, 0, 0, true) } else { transfer_value(&mut c, ty, 0, 0, true) }
+        if access != .Address {
+            if packed { transfer_c(&mut c, ty, 0, 0, true) } else { transfer_value(&mut c, ty, 0, 0, true) }
+        }
         c.writable = writable
     } else { fail(&mut c, "index requires an array or string") }
     ty
@@ -1635,26 +1660,31 @@ fn borrow_address(c: &mut Session, ty: i32) {
         backing := slot(&mut c); arm.store(&mut c.code,backing,0); address_slot(&mut c,backing)
     } else { place_address(&mut c, c.address, c.direct_place) }
 }
-// Reload a resolved path after a sibling replaced its base storage. Index
-// expressions are evaluated at their source position and only their value
-// can be used here. This walk performs no typing, name lookup or token reads.
-fn load_place(c: &mut Session, place: i32) {
+// The part of a typed path after 'base' is lowered on demand. With a
+// materialized base its value is already in x0 (e.g. a checked index).
+// Each intermediate projection needs just its value. Only a destination
+// needs stable address storage; a plain assignment need not read the leaf.
+fn lower_place(c: &mut Session, place: i32, base: i32, access: borrows.Access) {
+    if place < 0 { load_binding(&mut c, borrows.root(&c.places, place), access); return }
     var p := place
     c.places.path.clear()
-    while p > 0 { c.places.path.push(p - 1); p = c.places.parents[p - 1] }
-    if p == 0 { fail(&mut c, "internal missing place root"); return }
-    c.scratch_place = 0
-    loaded := load_binding(&mut c, borrows.root(&c.places, p))
+    while p > 0 && p != base { c.places.path.push(p - 1); p = c.places.parents[p - 1] }
+    if base == 0 {
+        if p >= 0 { fail(&mut c, "internal missing place root"); return }
+        load_binding(&mut c, borrows.root(&c.places, p), .Value)
+    } else if p != base { fail(&mut c, "internal inconsistent place path"); return }
     while c.places.path.len > 0 {
         node := c.places.path.pop()
         receiver := c.places.receivers[node]; member := c.places.members[node]
-        if member >= 0 { field_type := load_field(&mut c, receiver, member) }
+        var need := borrows.Access.Value
+        if c.places.path.len == 0 { need = access }
+        if member >= 0 { field_type := load_field(&mut c, receiver, member, need) }
         else {
             index := c.places.indices[node]
             if index < 0 { fail(&mut c, "internal missing evaluated index"); return }
             writable := c.writable; packed := c.inline_place && c.types.type_kinds[receiver] == 6
             arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, index)
-            element := load_index(&mut c, receiver, packed, writable, true)
+            element := load_index(&mut c, receiver, packed, writable, need)
         }
     }
 }
@@ -1750,7 +1780,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, catalog: 
     if c.types.type_kinds[ty] == 1 && count == 1 {
         root := place_slot(&c, place)
         if borrows.changed(&c.mutations, effects, c.mutations.len, root) {
-            arm.push_temp(&mut c.code, 1); load_place(&mut c, place); arm.pop_temp(&mut c.code, 1)
+            arm.push_temp(&mut c.code, 1); lower_place(&mut c, place, 0, .Value); arm.pop_temp(&mut c.code, 1)
         }
     }
     arm.branch(&mut c.code, target, 1); if name == "pop" && storage_type(&c, ret) == 1 { arm.emit(&mut c.code,2470476800) }; ret
@@ -1964,13 +1994,17 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
     c.depth = c.depth - 1
     ty
 }
-fn need_element_address(c: &Session) -> bool {
-    if c.taking_address { return true }
+fn place_access(c: &Session) -> borrows.Access {
+    if c.taking_address { return .ValueAndAddress }
+    // Grouping forwards its inner place. Ordinary call arguments ending at
+    // a closing parenthesis still need only their value.
     var at := c.cursor
     while at < c.tokens.kinds.len && c.tokens.kinds[at] == .Symbol && c.tokens.texts[at] == ")" { at = at + 1 }
-    if at >= c.tokens.texts.len { return false }
+    if at >= c.tokens.kinds.len || c.tokens.kinds[at] != .Symbol { return .Value }
     next := c.tokens.texts[at]
-    next == "=" || assign_operator(next) != ""
+    if next == "=" { return .Address }
+    if next.len == 2 && assign_operator(next) != "" { return .ValueAndAddress }
+    .Value
 }
 fn is_for_locked(c: &Session, base: i32) -> bool {
     for i in 0..c.for_locks.len { if c.for_locks[i] == base { return true } }
@@ -2437,7 +2471,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
             c.taking_address = previous_address
             place_base = place_slot(&c, c.places.current)
             if !collection(&c, low) { fail(&mut c, "for borrow requires an array"); return false }
-            if place_base < 0 || (c.address < 0 && !borrows.has_index(&c.places, c.places.current)) { fail(&mut c, "for borrow requires a stored array"); return false }
+            if place_base < 0 { fail(&mut c, "for borrow requires a stored array"); return false }
         } else {
             low = expression(&mut c, 1, 1, &catalog, &mut inline_work, &mut model)
             if c.stream_kind == 0 && !is(&c, "..") && low != 14 && collection(&c, low) && c.expr_owner < 0 && !c.writable {
@@ -2599,7 +2633,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
             if borrows.has_index(&c.places, place) { fail(&mut c, "compute mutations before assigning an array element"); return false }
             // A call on the right can replace a heap-backed record. Resolve the
             // pure field chain again so the write lands in its current storage.
-            arm.push_temp(&mut c.code, 0); load_place(&mut c, place)
+            arm.push_temp(&mut c.code, 0); lower_place(&mut c, place, 0, .Address)
             destination = c.address; direct = c.direct_place; arm.pop_temp(&mut c.code, 0)
         }
         c.expr_owner = result_owner; c.expr_type = result_type
