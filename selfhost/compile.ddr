@@ -1,5 +1,6 @@
 import borrows
 import compile_session as cs
+import deferred_blocks as deferred
 import ffi_abi as fa
 import fragments
 import frontend_types as ft
@@ -88,8 +89,8 @@ pub opaque struct Session {
     address: i32, writable: bool, scratch_place: i32, loans: scratch.Loans, scratch_returns: []i32,
     local_names: []string, local_types: []i32, local_slots: []i32, local_scopes: []i32, local_mutable: []bool,
     cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool, owner_elided: []bool, loop_owners: []i32,
-    defer_tokens: []i32, defer_scopes: []i32, defer_owners: []i32, defer_locals: []i32, defer_emitted: []bool, loop_defers: []i32,
-    in_defer: bool, defer_loop_floor: i32, hide_local_start: i32, hide_local_end: i32,
+    defers: deferred.Blocks, loop_defers: []i32,
+    in_defer: bool, defer_loop_floor: i32,
     expr_owner: i32, expr_type: i32, array_take: i32, record_take_labels: []i32,
     mir_enabled: bool, mir_opt_enabled: bool, mir_memory_enabled: bool, mir_ssa_enabled: bool, mir_values_enabled: bool, scalar_enabled: bool, ownership_enabled: bool, range_enabled: bool, inline_enabled: bool, inline_deps: fragments.Dependencies, scalar_function: bool, lease_starts: []i32, lease_ends: []i32,
     scalar_templates: opt_templates.Cache, scalar_names: []string, scalar_types: []i32, scalar_tokens: []i32,
@@ -570,10 +571,6 @@ fn local(c: &Session, name: string) -> i32 {
     if name == "_" { return -1 }
     var i := c.local_names.len - 1
     while i >= 0 {
-        if c.hide_local_end > c.hide_local_start && i >= c.hide_local_start && i < c.hide_local_end {
-            i = c.hide_local_start - 1
-            continue
-        }
         if c.local_names[i] == name { return i }; i = i - 1
     }
     -1
@@ -587,7 +584,6 @@ fn bind(c: &mut Session, name: string, ty: i32, mutable: bool, index: i32, at: i
     if rules.reserved(name) { fail(&mut c, "reserved local name") }
     if name != "_" {
         for i in 0..c.local_names.len {
-            if c.hide_local_end > c.hide_local_start && i >= c.hide_local_start && i < c.hide_local_end { continue }
             if c.local_names[i] == name && c.local_scopes[i] == c.scope { fail(&mut c, "duplicate local name") }
         }
     }
@@ -1942,32 +1938,52 @@ fn assign_operator(op: string) -> string {
     if op == "%=" { return "%" }
     ""
 }
-fn emit_defer_body(c: &mut Session, defer_cursor: i32, local_limit: i32, hide: bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
-    saved_cursor := c.cursor; saved_in_defer := c.in_defer; saved_floor := c.defer_loop_floor
-    saved_tail := c.tail; saved_end := c.block_end
-    saved_hide_start := c.hide_local_start; saved_hide_end := c.hide_local_end
-    c.cursor = defer_cursor; c.in_defer = true; c.defer_loop_floor = c.loop_heads.len; c.tail = false
-    if hide { c.hide_local_start = local_limit; c.hide_local_end = c.local_names.len }
-    else { c.hide_local_start = 0; c.hide_local_end = 0 }
-    ignored := block(&mut c, false, &catalog, &mut inline_work)
-    c.cursor = saved_cursor; c.in_defer = saved_in_defer; c.defer_loop_floor = saved_floor
-    c.tail = saved_tail; c.block_end = saved_end
-    c.hide_local_start = saved_hide_start; c.hide_local_end = saved_hide_end
-}
-fn unwind_defers(c: &mut Session, floor: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
+fn unwind_defers(c: &mut Session, floor: i32) {
+    if c.code.checking { return }
     var cleaned_to := c.owned_slots.len
-    var d := c.defer_tokens.len - 1
+    var d := c.defers.bodies.len - 1
     while d >= floor {
-        limit := c.defer_owners[d]
+        limit := c.defers.owner_limits[d]
         var i := cleaned_to - 1
         while i >= limit {
             if !c.owner_elided[i] { clear_owner(&mut c, c.owned_slots[i], c.owned_types[i]) }
             i = i - 1
         }
         cleaned_to = limit
-        emit_defer_body(&mut c, c.defer_tokens[d], c.defer_locals[d], true, &catalog, &mut inline_work)
+        if c.defers.selector < 0 { c.defers.selector = slot(&mut c) }
+        if c.defers.entries[d] < 0 { entry := arm.label(&mut c.code); c.defers.entries[d] = entry }
+        resume := arm.label(&mut c.code)
+        edge := deferred.add_exit(&mut c.defers, d, resume)
+        arm.imm(&mut c.code, 0, i64(edge) + 1); arm.store(&mut c.code, c.defers.selector, 0)
+        arm.branch(&mut c.code, c.defers.entries[d], 0); arm.mark(&mut c.code, resume)
         d = d - 1
     }
+}
+fn return_from_body(c: &mut Session) {
+    if !c.code.checking && c.defers.bodies.len > 0 {
+        // All outgoing return edges share storage. The expression owner has
+        // already transferred to the result and the cleanup may clobber X0.
+        if c.ret_type != 0 {
+            if c.defers.return_slot < 0 { c.defers.return_slot = slot(&mut c) }
+            arm.store(&mut c.code, c.defers.return_slot, 0)
+        }
+        unwind_defers(&mut c, 0)
+        if c.ret_type != 0 { arm.load(&mut c.code, c.defers.return_slot) }
+        else { arm.imm(&mut c.code, 0, 0) }
+    }
+    arm.branch(&mut c.code, c.cleanup, 0)
+}
+fn resume_defer_exit(c: &mut Session, head: i32) {
+    if head < 0 { return }
+    arm.load(&mut c.code, c.defers.selector)
+    var edge := head
+    while c.defers.previous[edge] >= 0 {
+        arm.imm(&mut c.code, 2, i64(edge) + 1)
+        arm.emit(&mut c.code, 3942776863) // CMP X0, X2
+        arm.branch(&mut c.code, c.defers.targets[edge], 2)
+        edge = c.defers.previous[edge]
+    }
+    arm.branch(&mut c.code, c.defers.targets[edge], 19)
 }
 fn block(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
     enter(&mut c)
@@ -1989,12 +2005,22 @@ fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.Catalog,
         cleanup_from(&mut c, first_owner, true)
         separators(&mut c)
     }
-    while c.defer_scopes.len > 0 && c.defer_scopes[c.defer_scopes.len - 1] == c.scope {
-        defer_tok := c.defer_tokens.pop(); defer_sc := c.defer_scopes.pop()
-        defer_own := c.defer_owners.pop(); defer_loc := c.defer_locals.pop()
-        defer_em := c.defer_emitted.pop()
-        drop_locals_to(&mut c, defer_loc, c.scope)
-        emit_defer_body(&mut c, defer_tok, defer_loc, false, &catalog, &mut inline_work)
+    while c.ok && c.defers.scopes.len > 0 && c.defers.scopes[c.defers.scopes.len - 1] == c.scope {
+        // Resolve captures in the registration scope. Later locals are gone,
+        // and every runtime predecessor reaches the same typed body.
+        body := c.defers.bodies.pop(); scope := c.defers.scopes.pop()
+        owners := c.defers.owner_limits.pop(); locals := c.defers.local_limits.pop()
+        entry := c.defers.entries.pop(); exits := c.defers.exits.pop()
+        drop_locals_to(&mut c, locals, c.scope)
+        if entry >= 0 {
+            // Normal scope exit selects fallthrough.
+            arm.store(&mut c.code, c.defers.selector, 31); arm.mark(&mut c.code, entry)
+        }
+        saved := c.cursor; c.cursor = body
+        c.in_defer = true; c.defer_loop_floor = c.loop_heads.len
+        ignored := block(&mut c, false, &catalog, &mut inline_work)
+        c.in_defer = false; c.cursor = saved
+        resume_defer_exit(&mut c, exits)
     }
     expect(&mut c, "}"); leave(&mut c)
     c.block_end = previous_end; c.tail = previous_tail; c.block_depth = c.block_depth - 1
@@ -2232,12 +2258,7 @@ fn match_arms(c: &mut Session, context: i32, result_type: &mut i32, catalog: &op
             if tail && expected != 0 {
                 if c.in_defer { fail(&mut c, "return is not allowed inside defer") }
                 same(&mut c, expected, value); take_value(&mut c, value)
-                if c.defer_tokens.len > 0 {
-                    saved_ret := slot(&mut c); arm.store(&mut c.code, saved_ret, 0)
-                    unwind_defers(&mut c, 0, &catalog, &mut inline_work)
-                    arm.load(&mut c.code, saved_ret)
-                }
-                arm.branch(&mut c.code, c.cleanup, 0); ends = true
+                return_from_body(&mut c); ends = true
             } else if value != 0 { fail(&mut c, "unused match arm value") }
         }
         returns = returns && ends
@@ -2316,17 +2337,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
         } else { ty := expression(&mut c, 0, c.ret_type, &catalog, &mut inline_work); same(&mut c, c.ret_type, ty) }
         end_statement(&mut c)
         take_value(&mut c, c.ret_type)
-        if c.defer_tokens.len > 0 {
-            if c.ret_type != 0 {
-                saved_ret := slot(&mut c); arm.store(&mut c.code, saved_ret, 0)
-                unwind_defers(&mut c, 0, &catalog, &mut inline_work)
-                arm.load(&mut c.code, saved_ret)
-            } else {
-                unwind_defers(&mut c, 0, &catalog, &mut inline_work)
-                arm.imm(&mut c.code, 0, 0)
-            }
-        }
-        arm.branch(&mut c.code, c.cleanup, 0)
+        return_from_body(&mut c)
         return true
     }
     if is(&c, "if") {
@@ -2341,7 +2352,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
         head := arm.label(&mut c.code); done := arm.label(&mut c.code); arm.mark(&mut c.code, head)
         ty := expression(&mut c, 0, 3, &catalog, &mut inline_work); same(&mut c, 3, ty); arm.branch(&mut c.code, done, 18)
         if c.tasks.program { c.tasks.loop_locals.push(c.local_names.len) }
-        c.loop_heads.push(head); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len); c.loop_defers.push(c.defer_tokens.len)
+        c.loop_heads.push(head); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len); c.loop_defers.push(c.defers.bodies.len)
         ends := block(&mut c, false, &catalog, &mut inline_work); old_defers := c.loop_defers.pop(); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop(); if c.tasks.program { task_boundary := c.tasks.loop_locals.pop() }
         arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
         return false
@@ -2436,7 +2447,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
         }
         if locked_slot >= 0 { c.for_locks.push(locked_slot) }
         if c.tasks.program { c.tasks.loop_locals.push(c.local_names.len) }
-        c.loop_heads.push(next); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len); c.loop_defers.push(c.defer_tokens.len)
+        c.loop_heads.push(next); c.loop_ends.push(done); c.loop_owners.push(c.owned_slots.len); c.loop_defers.push(c.defers.bodies.len)
         ends := block(&mut c, false, &catalog, &mut inline_work); old_defers := c.loop_defers.pop(); old_owners := c.loop_owners.pop(); old_head := c.loop_heads.pop(); old_end := c.loop_ends.pop(); if c.tasks.program { task_boundary := c.tasks.loop_locals.pop() }
         if locked_slot >= 0 { unlocked := c.for_locks.pop() }
         arm.mark(&mut c.code, next)
@@ -2449,7 +2460,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
         if c.in_defer && c.loop_heads.len <= c.defer_loop_floor { fail(&mut c, "break or continue cannot exit defer"); return false }
         var target := c.loop_ends[c.loop_ends.len - 1]
         if name == "continue" { target = c.loop_heads[c.loop_heads.len - 1] }
-        unwind_defers(&mut c, c.loop_defers[c.loop_defers.len - 1], &catalog, &mut inline_work)
+        unwind_defers(&mut c, c.loop_defers[c.loop_defers.len - 1])
         if c.tasks.program { task_close_locals(&mut c, c.tasks.loop_locals[c.tasks.loop_locals.len - 1]) }
         cleanup_from(&mut c, c.loop_owners[c.loop_owners.len - 1], false); arm.branch(&mut c.code, target, 0)
         end_statement(&mut c)
@@ -2458,11 +2469,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
     if eat(&mut c, "defer") {
         if c.in_defer { fail(&mut c, "cannot nest defer blocks"); return false }
         if !is(&c, "{") { fail(&mut c, "expected block after defer"); return false }
-        c.defer_tokens.push(c.cursor)
-        c.defer_scopes.push(c.scope)
-        c.defer_owners.push(c.owned_slots.len)
-        c.defer_locals.push(c.local_names.len)
-        c.defer_emitted.push(false)
+        deferred.register(&mut c.defers, c.cursor, c.scope, c.owned_slots.len, c.local_names.len)
         skip_body(&mut c)
         end_statement(&mut c)
         return false
@@ -2548,12 +2555,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut op
     if c.tail && terminal(&c, c.cursor, false) && c.ret_type != 0 {
         if c.in_defer { fail(&mut c, "return is not allowed inside defer") }
         same(&mut c, c.ret_type, ty); take_value(&mut c, ty)
-        if c.defer_tokens.len > 0 {
-            saved_ret := slot(&mut c); arm.store(&mut c.code, saved_ret, 0)
-            unwind_defers(&mut c, 0, &catalog, &mut inline_work)
-            arm.load(&mut c.code, saved_ret)
-        }
-        arm.branch(&mut c.code, c.cleanup, 0); return true
+        return_from_body(&mut c); return true
     }
     if ty == 3 && c.testing {
         arm.branch(&mut c.code, c.assertion, 18)
@@ -2675,7 +2677,7 @@ pub fn new_session() -> Session {
         wasm_abi: wa.new(), imports: imports(), libraries: [], symbols: [], unsafe_functions: [], current_owner: 0, function_owners: [], unsafe_capable: false, unsafe_scope: false, inline_place: false, direct_place: false, ffi_types: [], callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], address: -1, writable: false, scratch_place: 0, loans: scratch.loans(), scratch_returns: [],
         fn_labels: [], local_names: [], local_types: [], local_slots: [], local_scopes: [], local_mutable: [], cleanup: 0, owned_slots: [], owned_types: [], owner_temps: [], owner_elided: [], loop_owners: [],
-        defer_tokens: [], defer_scopes: [], defer_owners: [], defer_locals: [], defer_emitted: [], loop_defers: [], in_defer: false, defer_loop_floor: 0, hide_local_start: 0, hide_local_end: 0,
+        defers: deferred.new(), loop_defers: [], in_defer: false, defer_loop_floor: 0,
         expr_owner: -1, expr_type: -1, array_take: array_take, record_take_labels: [], scope: 0, slots: 0, ret_type: 0, depth: 0,
         mir_enabled: config.mir_enabled, mir_opt_enabled: config.mir_opt_enabled, mir_memory_enabled: config.mir_memory_enabled, mir_ssa_enabled: config.mir_ssa_enabled, mir_values_enabled: config.mir_values_enabled, scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, range_enabled: config.range_enabled, inline_enabled: config.inline_enabled && scalar_enabled && !check_all, inline_deps: fragments.new_dependencies(), scalar_function: false, lease_starts: [], lease_ends: [], scalar_templates: opt_templates.new(), scalar_names: [], scalar_types: [], scalar_tokens: [],
         loop_heads: [], loop_ends: [], strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
@@ -3450,9 +3452,10 @@ fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut
     c.tasks.handles.clear(); c.tasks.loop_locals.clear()
     c.local_names.clear(); c.local_types.clear(); c.local_slots.clear(); c.local_scopes.clear(); c.local_mutable.clear()
     c.owned_slots.clear(); c.owned_types.clear(); c.owner_temps.clear(); c.owner_elided.clear(); c.mutations.clear()
-    borrows.clear(&mut c.places); c.for_locks.clear(); c.taking_address = false
-    c.defer_tokens.clear(); c.defer_scopes.clear(); c.defer_owners.clear(); c.defer_locals.clear(); c.defer_emitted.clear(); c.loop_defers.clear()
-    c.in_defer = false; c.defer_loop_floor = 0; c.hide_local_start = 0; c.hide_local_end = 0
+    borrows.clear(&mut c.places)
+    c.for_locks.clear(); c.taking_address = false
+    deferred.reset(&mut c.defers); c.loop_defers.clear()
+    c.in_defer = false; c.defer_loop_floor = 0
     c.lease_starts.clear(); c.lease_ends.clear()
     first_word := arm.position(&c.code); first_label := arm.label_count(&c.code)
     first_reloc := c.code.at.len; first_import := c.imports.sites.len
@@ -3687,6 +3690,18 @@ fn inline_test_compile(source: string, platform: i32, enabled: bool, scalar: boo
         disabled := inline_test_compile(source, platform, true, false, false, false, &mut after)
         assert(old.ok && disabled.ok && old.text.len == disabled.text.len)
         for at in 0..old.text.len { assert(old.text[at] == disabled.text[at]) }
+    }
+}
+@test fn a_deferred_local_has_one_binding_across_all_exit_edges() {
+    source := "fn run(n:i32)->i32{defer {saved:=n;print(saved)};if n==1{return 1};if n==2{return 2};3} fn main(){print(run(2))}"
+    none: []i32 = []
+    for checking in [true, false] {
+        var records := bindings()
+        result := compile_mode(source, 0, &none, &none, checking, true, &mut records)
+        assert(result.ok)
+        var reports := 0
+        for name in records.names { if name == "saved" { reports = reports + 1 } }
+        assert(reports == 1)
     }
 }
 @test fn inline_producer_does_not_duplicate_source_binding_reports() {
