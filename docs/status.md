@@ -115,21 +115,18 @@ med oförändrad användarpolicy. Dessa siffror gäller v1, före gles v2 och
 [Källprov](../tools/test-ssa-source.py) ·
 [Omfattning](optimization.md#ssa-för-privata-framevärden).
 
-Den taskbaserade kompilatorn behåller frontend, typning, nåbarhet,
-diagnostik, cache-I/O och inlinebudget i en enda Session. Workers returnerar
-numeriska `ObjectData` från samma pipeline och sänkning; föräldern validerar
-och länkar i ordning. Input är fortfarande en isolerad full MIR-snapshot. `--jobs`
-stöder 1–256 på ARM64/macOS-ingången. En worker, `check`, `--mir=off` och
-`--profile-compiler` använder samma seriella Session-väg. Workerantalet
-ändrar varken passbudgetar, cacheidentitet eller programbilder.
+Huvudtråden äger frontend, typning, diagnostik, cache och inlinebudget.
+Arbetstrådarna tar emot funktionslokala maskinord och metadata i separata
+kolumner, bygger MIR lokalt och returnerar sänkta funktionsobjekt. Huvudtråden
+validerar och länkar objekten i källordning. På ARM64/macOS väljer `--jobs`
+1–256 workers. En worker, `check`, `--mir=off` och `--profile-compiler`
+använder den seriella kedjan. [Arbetsfördelning](optimization.md#seriell-session-och-taskbaserade-funktionspass)
 
-Den [aktuella 1 260-proversmatrisen](../benchmarks/2026-11-12-regional-workers/README.md)
-ger 36,50 procent kortare genererad byggmedian och 19,56 procent kortare
-byggmedian för `selfhost/main.ddr` med samma nya binär och en→fyra workers.
-Mot den tidigare fyrtrådade standarden kostar paketet 0,64–1,56 procent i
-byggmedian; minnestoppen minskar för större byggen. Owned-fallets p95 ökar
-med fyra workers. Kontrollerade runtimebilder är byteidentiska; detta är
-ingen ny runtime/C-vinst. Frontenden är fortfarande seriell, utan workerpool.
+Med den nativa kodgeneratorn den 15 november 2026 tog bygget av den låsta
+kompilatorkällan 458,91 ms på Apple M5. I runtimemätningen sjönk medianen för
+sortering med 26,3 % och för arraysummering med 5,6 %. Heltalsberäkning och
+UTF-8-text låg inom en procent av sin tidigare median.
+[Mätserie och rådata](../benchmarks/compiler/2026-11-15-native-code/README.md)
 
 Den tidigare [30-rundorsmätningen av parallell kompilering](../benchmarks/2026-11-12-parallel-compiler/README.md),
 före SSA-grunden, ger med samma binär genererad byggmedian

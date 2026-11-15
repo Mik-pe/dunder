@@ -70,15 +70,9 @@ om efter ett sådant fel. Program som behöver filer eller fönster anger
 värdens API via importer. `std.sys.decode_utf8` och `decode_u8` fungerar i
 linjärt minne.
 
-Med Node och en självbyggd kompilator kör
-`node tools/test-wasm.mjs /sökväg/till/dunder` de portabla testgrupperna,
-inklusive Vulkan-scenens geometri och SHA-256.
-`node tools/test-wasm-abi.mjs /sökväg/till/dunder` kontrollerar värdanrop,
-C-layout, callbacks och WebGPU-exemplets vertexdata. WebGPU-exemplet
-inkluderar en webbläsarvärd och gemensamma
-Dunder-vertexdata. WebGPU-triangeln ligger i syskonrepot `dunder-hundmat`;
-kompilatorns ABI-kontroll provar motsvarande fixture via
-[den Dunder-skrivna Wasm-kompilatorn](../selfhost/README.md).
+Wasm-backenden finns kvar för explicit målval. De separata Wasm-testsviterna
+är senarelagda medan utvecklingen prioriterar de nativa målen.
+[Wasm-backendens status](../selfhost/README.md#wasm32-från-den-självbyggda-kompilatorn-senarelagt-i-testmatrisen)
 
 ## Bootstrap och kodgenerering
 

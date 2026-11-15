@@ -1,6 +1,18 @@
 # Så mäter vi Dunder
 
-Den aktuella [regionala IR-/workermätningen](../benchmarks/2026-11-12-regional-workers/README.md)
+## Nativ kodgenerering den 15 november 2026
+
+På Apple M5 gick medianen för ett helt bygge av samma kompilatorkälla från
+547,51 till 458,91 ms. En kontroll med identisk kompilatorkälla i båda
+binärerna isolerar effekten av maskinkoden på självbygget (548,22 till
+477,19 ms). Det syntetiska korpuset med identiska funktionskroppar nådde
+1,25 miljoner källrader/s vid medianen. Varianten med unika kroppar och
+blandade uttryck nådde 455 348 källrader/s. Runtimeserien jämför genererade
+Dunder-program över 30 mätpar. [Byggtider, kontroll och runtimeresultat](../benchmarks/compiler/2026-11-15-native-code/README.md)
+
+## Tidigare mätningar
+
+Den [regionala IR-/workermätningen](../benchmarks/2026-11-12-regional-workers/README.md)
 bevarar 1 260 prover: tidigare mot ny standard med fyra workers samt samma
 nya binär med en, två och fyra workers. SSA är av i samtliga jämförelser.
 
@@ -14,7 +26,7 @@ nya binär med en, två och fyra workers. SSA är av i samtliga jämförelser.
 | Owned | 5,970 / 6,796 | 5,743 / 8,545 |
 
 Fyra workers ger 1,57×, 1,24× och 1,22× i de tre större fallen.
-Det senaste paketet är samtidigt 0,64–1,56 procent långsammare i byggmedian
+Det dåvarande paketet var 0,64–1,56 procent långsammare i byggmedian
 än tidigare standard med fyra workers. Dess minnestopp minskar i större
 fall. Alla råsvansar, inklusive owned-fallets sämre p95, finns kvar.
 Genererat bygge når 161 499 rader/s vid p95 med fyra workers; alla tre

@@ -5,10 +5,9 @@
 </p>
 
 Ett statiskt typat, kompilerat språk med filändelsen **`.ddr`**.
-Kompilatorn läser vanlig Dunder-källkod och skriver körbara filer för
-ARM64/macOS, ARM64/Linux, x86-64/Linux och WebAssembly (wasm32). Kodgenerering, ELF-/Mach-O-skrivning
-och macOS ad hoc-signering görs i kompilatorn.
-Den aktuella utvecklings- och återställningsgrenen är `main`.
+Kompilatorn är själv skriven i Dunder och bygger körbara program för
+ARM64/macOS, ARM64/Linux och x86-64/Linux. Den skriver även wasm32-moduler.
+Nativ kodgenerering, länkning och macOS ad hoc-signering ingår i kompilatorn.
 
 ```dunder
 fn add(a: i32, b: i32) -> i32 {
@@ -132,33 +131,44 @@ händelsestyrd HTTP/1.1-server) finns i syskonrepot [dunder-hundmat](https://git
 
 ## Självhostad kompilator
 
-Dunders kompilator är skriven i Dunder. Samma typkontroll, lånekontroll och
-ägarskapsregler används för samtliga fyra mål. WebAssembly-backenden skriver
-körbara moduler med linjärt minne, typade värdimporter och callbacks.
-De tre nativevärdarna har frysta kompilatorer för offlineåterbyggnad.
+Alla mål använder samma typkontroll, lånekontroll och ägarskapsregler. De tre
+nativa värdplattformarna har frysta kompilatorer för återbyggnad offline.
 
-På ARM64/macOS använder kompilatorn språkets egna isolerade tasks för
-verifiering, optimering och sänkning av hela funktions-IR:er. Frontend och
-typning behåller en Session; färdiga funktionsobjekt valideras och länkas i ordning.
-`--jobs N` eller `--jobs=N` väljer 1–256 workers. `--jobs=1`, `check`,
-`--mir=off` och `--profile-compiler` använder samma seriella Session-kedja.
-Antalet workers ändrar varken optimeringsbudgetar, cacheidentitet eller
-programbilder. Läs [taskkontraktet](docs/tasks.md) och
-[kompilatormätningen](benchmarks/2026-11-12-regional-workers/README.md).
-Samma nya binär med en respektive fyra workers bygger det genererade
-korpuset på median 982,428 respektive 623,820 ms. Det senaste paketet är
-samtidigt 0,6–1,6 procent långsammare än föregående fyrtrådade standard,
-med lägre minnestopp i större byggen. Runtimebilderna är identiska.
+På ARM64/macOS sköter huvudtråden frontend och typning. Med flera workers
+använder kompilatorn språkets isolerade tasks för att bygga en lokal
+mellanrepresentation (MIR) ur varje funktions maskinord och metadata.
+Varje worker verifierar, optimerar och sänker sina funktioner. Huvudtråden
+validerar och länkar resultaten i källordning. En och fyra workers producerar
+byteidentiska kompilatorer. `--jobs N` väljer 1–256 workers. En worker,
+`check`, `--mir=off` och `--profile-compiler` använder den seriella vägen.
+[Taskkontrakt och arbetsfördelning](docs/tasks.md)
 
-Kör verifieringen från reporoten med Python 3.9+, Node och en C-kompilator. C-kompilatorn bygger
-ett separat provbibliotek för ABI-kontrollen:
+På Apple M5 byggde kompilatorn samma låsta kompilatorkälla på **459 ms**
+mot tidigare **548 ms**. Medianen omfattar tolv rena byggen med fyra workers,
+inklusive signering. Tre syntetiska program på 101 024 rader visar hur
+funktionskropparnas innehåll påverkar genomströmningen.
+
+| Funktionskroppar | Byggtid, median | Källrader/s |
+| --- | ---: | ---: |
+| Identiska efter namnupplösning | 80,87 ms | 1 249 269 |
+| En unik konstant per funktion | 148,74 ms | 679 219 |
+| Unika kroppar med blandade uttryck | 221,86 ms | 455 348 |
+
+Kompilatorn kan återanvända en verifierad skalär modell för identiska kroppar.
+I en separat kontroll byggdes den gamla kompilatorkällan med den nya
+kodgeneratorn. Då sjönk självbyggtiden med 13,0 % och de fem kontrollprogrammen
+blev byteidentiska. [Mätmetod, programmens körtider och rådata](benchmarks/compiler/2026-11-15-native-code/README.md)
+
+Kör verifieringen från reporoten med Python 3.9+ och en C-kompilator.
+C-kompilatorn bygger provbiblioteket för ABI-kontrollen.
 
 ```sh
 ./tools/verify-selfhost.sh
 ```
 
-Sviten bygger kompilatorn från fröet, kör program och testgrupper på värden
-och i Wasm, kontrollerar förväntade typfel och provar nativ paketering och FFI.
+Sviten bygger kompilatorn från fröet, kör program och testgrupper på värden,
+kontrollerar förväntade typfel och provar korsbyggen, nativ paketering och FFI.
+Wasm-sviterna är senarelagda under det nativa utvecklingsarbetet.
 Grafik-, CSV- och HTTP-dogfood testas i syskonrepot `dunder-hundmat`.
 [Arkitektur](docs/arkitektur.md) · [Lånekontroll och mål](selfhost/README.md)
 
@@ -318,26 +328,27 @@ delas med referensräkning. Läs [minnesmodellen](docs/memory.md) och
 
 ## Enums och match
 
-Både namngivna värden och varianter med data är typade värden:
+Ett `match`-uttryck kan packa upp nästlade varianter och ge ett typat resultat.
+Ett `if` efter mönstret prövas när mönstret matchar. Variablerna som mönstret
+binder kan användas både i villkoret och i armens uttryck.
 
 ```dunder
-enum FileKind { Other = 0, File = 1, Directory = 2 }
-enum Command { Stop, Print(string), Move(i32, i32) }
+enum Command { Stop, Move(i32, i32) }
+enum Event { Idle, Run(Command) }
 
-fn evaluate(command: Command) -> i32 {
-    match command {
-        .Stop => 0,
-        .Print(text) => text.len,
-        .Move(x, y) => x + y,
+fn distance(event: Event) -> i32 {
+    match event {
+        .Run(.Move(x, y)) if x == y => x,
+        .Run(.Move(x, y)) => x + y,
+        .Run(.Stop) => 0,
+        .Idle => 0,
     }
 }
 ```
 
-Skriv `Command.Move(20, 22)` eller `.Move(20, 22)` när typen framgår av
-kontexten. `match` kontrolleras för saknade och dubbla fall. Payloads ligger
-direkt i värdet, kopieras med värdesemantik och kan innehålla structar,
-arrayer, andra enums och funktionsvärden. Matchningen använder taggar och direkta grenar utan vtables. Läs [enumreglerna](docs/enums.md)
-(se även `dogfood/enums.ddr` i `dunder-hundmat`).
+Armarna prövas i källordning. Armar utan villkor ska tillsammans täcka alla
+möjliga värden. I exemplet hanterar den andra armen drag där `x != y`. Payloads har värdesemantik.
+[Enumregler och fler mönster](docs/enums.md)
 
 ## UTF-8-strängar
 

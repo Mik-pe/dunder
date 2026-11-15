@@ -107,19 +107,11 @@ programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
 En enda `compile_session.Session` behåller frontend, typ- och lånekontroll,
 symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
-`compile_parallel` strömmar ägda MIR-funktioner i ett enda `task scope`
-som ett FIFO-glidfönster med plattpackade `mir_task.Batch`-jobb och
-motsvarande `mir_task.BatchAnswer`-svar (adaptiv batchstorlek mellan 2 och 8
-funktioner), vilket håller ned antal `spawn`/`await`-omgångar. Arbetarna
-återanvänder scopets poolade workerarenor och kör samma `mir_pipeline` som
-den seriella drivrutinen — med `mir_pipeline.CoreWorkspace` som hoppar
-över SSA-arbetsminne när `--mir-ssa=off` — följt av verifiering,
-framepromovering, valbar SSA och värdepass samt nödvändig efterverifiering.
-Samma worker sänker sedan varje funktion med den gemensamma `mir_lower`-gången
-direkt till ägd numerisk `ObjectData`. Varje `spawn` skapar en OS-tråd
-som arbetar mot återanvänd sänknings-/pipelinearena ur scopets pool.
-Resultatet innehåller slutobjekt och status/statistik, inte hela
-MIR-funktionen. Varken `Session` eller globala tabeller delas muterbart.
+`compile_parallel` skickar funktionslokala maskinord och metadata i separata
+kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
+optimerar och sänker funktionerna i batchen med återanvända arbetsarenor.
+Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
+Föräldern tar emot svaren i källordning. [Batchformat och worker](../selfhost/mir_task.ddr)
 
 `ObjectData` är en vanlig transparent post med primitiva arenor och går
 genom språkets befintliga snapshot-/klonregler. Den ger inget undantag för
