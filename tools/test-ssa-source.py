@@ -177,6 +177,32 @@ def main():
             receipts[mode] = receipt
         assert receipts['off'] != receipts['on']
 
+        # Exercise MIR kinds 24..26 (foreign_abi, iteration, region) under --mir-ssa=on
+        features = work/'features.ddr'
+        features.write_text(
+            'capability unsafe\n'
+            '@extern("c", "abs") unsafe fn c_abs(x: i32) -> i32\n'
+            'fn sum_items(xs: &[]i64) -> i64 {\n'
+            '    mut total: i64 = 0\n'
+            '    for x in xs { total += x }\n'
+            '    total\n'
+            '}\n'
+            'fn main() {\n'
+            '    mut v: i32 = 0\n'
+            '    unsafe { v = c_abs(-19) }\n'
+            '    region arena(128) {\n'
+            '        mut items: []i64 = arena.alloc(3)\n'
+            '        items[0] = i64(v)\n'
+            '        items[1] = 20\n'
+            '        items[2] = 3\n'
+            '        print(sum_items(&items))\n'
+            '    }\n'
+            '}\n'
+        )
+        feat_image = work/f'features-{host}'
+        call([compiler, 'build', features, '--mir-ssa=on', '-o', feat_image], work)
+        executions += execute(feat_image, host, host, '42\n', work)
+
         bad = work/'bad.ddr'; bad.write_text('fn main(){unknown()}\n')
         errors = []
         original = (work/'cached').read_bytes()
