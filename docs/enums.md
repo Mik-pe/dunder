@@ -78,35 +78,54 @@ Enums ger ingen ny allokerare eller ägar-/lånemodell.
 
 ## Kontrollflöde med match
 
-`match` kräver en enum och kontrollerar alla varianter vid kompilering.
-Saknade eller dubbla fall, fel enumtyp och fel antal payload-bindningar är
-typfel. `_` täcker återstående varianter och måste stå sist:
+`match` prövar armarna uppifrån och ned. Uttrycket efter `match`
+utvärderas en gång och den första arm vars hela mönster passar körs.
+En variant som innehåller en annan enum kan matchas på båda nivåerna i
+samma mönster.
 
 ```dunder
 import sys
 
-fn read_or_empty(path: string) -> string {
-    match sys.read(path) {
+fn beskriv(resultat: sys.ReadResult) -> string {
+    match resultat {
         .Ok(text) => text,
-        .Err(error) => {
-            match error {
-                .NotFound => "",
-                _ => { print(sys.io_error_message(error)); return "" },
-            }
-        },
+        .Err(.NotFound) => "filen saknas",
+        .Err(.Other(kod)) => "systemfel " + kod.str(),
+        .Err(fel) => sys.io_error_message(fel),
     }
+}
+
+fn main() {
+    print(beskriv(.Ok("hej")))          // hej
+    print(beskriv(.Err(.NotFound)))     // filen saknas
+    print(beskriv(.Err(.Other(123))))   // systemfel 123
 }
 ```
 
-Payload-bindningar är oföränderliga lokala värden som bara finns i armen.
-Använd `_` för ett oanvänt payloadvärde, exempelvis `.Pair(x, _)`.
-Uttrycket efter `match` utvärderas en gång, och bara den valda armen körs.
-Aggregat och bindningar kopieras med värdesemantik. Komma skiljer armarna åt.
+I `.Err(.Other(kod))` bestämmer payloadtypen `sys.IoError` vad
+`.Other` betyder. Namnet `kod` binder ett oföränderligt `i32` i armen.
+`.Err(fel)` binder hela felvärdet för de fel som återstår. `.Err(_)`
+täcker samma fall och kastar bort payloaden. Ett ensamt `_` på yttersta
+nivån täcker alla återstående fall och måste stå sist.
 
-Som sats kan `match` ha block med flera satser, som felhanteringen ovan.
+Kompilatorn kontrollerar att mönstren tillsammans täcker alla möjliga
+kombinationer av varianter. Om en variant har två enumpayloads måste
+även kombinationerna av deras värden täckas. Armar får överlappa när den
+senare armen fortfarande kan träffa ett nytt fall. Flyttas `.Err(fel)`
+före `.Err(.NotFound)` blir den specifika armen onåbar och bygget avvisas.
+För mycket stora mönster kan kompilatorn ge `match pattern coverage limit exceeded`.
+Dela då upp matchningen i flera `match` så att varje kontroll blir mindre.
+
+En payload kan bindas till ett namn eller hoppas över med `_` oavsett
+typ. För att fortsätta mönstret med en variant måste payloaden själv ha
+enumtyp. Kompilatorn kontrollerar variantnamn och antal payloadmönster på
+varje nivå. Aggregat och bindningar kopieras med värdesemantik. Komma
+skiljer armarna åt.
+
+Som sats kan `match` ha block med flera satser.
 En avslutande `match` kan ge funktionens returvärde genom armarnas sista
 uttryck. Explicit `return` fungerar också. `break` och `continue` syftar på
-en omgivande loop. Nästlade fall skrivs med en inre `match`.
+en omgivande loop.
 
 ### Match som uttryck
 
@@ -175,7 +194,7 @@ Data-enums kan vara structfält och innehålla andra aggregat, inklusive
 dynamiska arrayer och andra data-enums. Arrayelement är fortfarande begränsade
 till skalärer och enums utan payload. Ett enumvärde får vara högst
 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
-generiska `Result<T>`/`Option<T>`, `?`, mönsterguards, alternativa/nästlade
+generiska `Result<T>`/`Option<T>`, `?`, mönsterguards, alternativa
 mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja
 payload eller en textrepresentation. [sys](sys.md) använder redan konkreta
 `ReadResult` och `IoError` utan generics.
