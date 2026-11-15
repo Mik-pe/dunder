@@ -1,5 +1,7 @@
 # Lokala prestandamätningar
 
+På Apple M5 tog ett självbygge med den nya kompilatorn 458,91 ms. Kontrollserien med oförändrad kompilatorkälla isolerar vinsten från den genererade maskinkoden. [Nativ maskinkod och självbygge, 2026-11-15](compiler/2026-11-15-native-code/README.md)
+
 På Apple M5 gick självbygget från 677,5 till 625,8 ms efter ändringarna i lexern, parsern och MIR. [Mätserie för tre rena byggen, 2026-11-15](compiler/2026-11-15-build-latency/README.md)
 
 [Regional värdeplacering och worker-sänkning, 2026-11-12](2026-11-12-regional-workers/README.md)

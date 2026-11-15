@@ -31,11 +31,17 @@ def cset(relation):
 
 def materialize(reg, value):
     value &= (1 << 64) - 1
-    words = [0xD2800000 + ((value & 65535) << 5) + reg]
-    for part in range(1, 4):
-        bits = (value >> (part * 16)) & 65535
-        if bits:
-            words.append(0xF2800000 + (part << 21) + (bits << 5) + reg)
+    lanes = [(value >> (part * 16)) & 65535 for part in range(4)]
+    fill = 65535 if lanes.count(65535) > lanes.count(0) else 0
+    words = []
+    for part, bits in enumerate(lanes):
+        if bits == fill:
+            continue
+        opcode = 0xF2800000 if words else (0x92800000 if fill else 0xD2800000)
+        immediate = bits if words else bits ^ fill
+        words.append(opcode + (part << 21) + (immediate << 5) + reg)
+    if not words:
+        words.append((0x92800000 if fill else 0xD2800000) + reg)
     return words
 
 

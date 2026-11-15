@@ -91,6 +91,21 @@ def positive_cases():
         expected += [total, sum(range(min(max(n,0),7))), n*3+2, -1 if n < 0 else 1, nested, max(n,0)%2 == 1]
     yield 'control', control + '}\n', expected
 
+    # The legacy variant selects immediate operands at the completed RHS atom.
+    # Also exercise materialization fallbacks and signed flag comparisons at
+    # the endpoints, where adding the comparison magnitude can itself wrap.
+    imm = """fn delta(x:i32,y:i32)->i32{x- -4096+y-0}
+    fn hex_step(x:i64)->i64{x+0xFFF000-4097}
+    fn tighter(x:i32)->i32{x+4*3-3}
+    fn below(x:i64)->bool{x < -1}
+    fn at_most(x:i64)->bool{x <= -4096}
+    fn above(x:i64)->bool{x > -0}
+    fn main(){print(delta(-5000,-2));print(hex_step(1));print(tighter(10))
+        print(below(-9223372036854775808));print(below(-1))
+        print(at_most(-4096));print(at_most(9223372036854775807))
+        print(above(9223372036854775807));print(above(0))}"""
+    yield 'signed_immediates', imm, [-906,16769024,19,True,False,True,False,True,False]
+
     # Eighteen mutable values remain live across every backedge and at exit.
     # Distinct weighted incoming parameters also catch entry-copy overlap.
     spills = 'fn pressure(n:i64,seed:i64)->i64{'
@@ -173,6 +188,9 @@ def trap_cases():
         ('add_i32', 101, 'fn f(x:i32)->i32{x+1}', 'f(2147483647)'),
         ('sub_i32', 101, 'fn f(x:i32)->i32{x-1}', 'f(-2147483648)'),
         ('neg_i32', 101, 'fn f(x:i32)->i32{-x}', 'f(-2147483648)'),
+        ('shifted_sub_i32', 101, 'fn f(x:i32)->i32{x-4096}', 'f(-2147483648)'),
+        ('negative_sub_i64', 101, 'fn f(x:i64)->i64{x- -4096}', 'f(9223372036854775807)'),
+        ('register_add_i32', 101, 'fn f(x:i32,y:i32)->i32{x+y}', 'f(2147483647,1)'),
         ('add_i64', 101, 'fn f(x:i64)->i64{x+1}', 'f(9223372036854775807)'),
         ('mul_i64', 101, 'fn f(x:i64)->i64{x*x}', 'f(3037000500)'),
         ('neg_i64', 101, 'fn f(x:i64)->i64{-x}', 'f(-9223372036854775808)'),
@@ -182,6 +200,9 @@ def trap_cases():
         ('division_zero', 102, 'fn f(x:i64)->i64{19/x}', 'f(0)'),
         ('overflow_before_zero', 101, 'fn f(x:i64)->i64{(9223372036854775807+x)/(x-x)}', 'f(1)'),
         ('zero_before_overflow', 102, 'fn f(x:i64)->i64{1/(x-x)+(9223372036854775807+x)}', 'f(1)'),
+        ('fallback_shift_past_u8', 103, 'fn f(x:u8)->u8{x.shl(8)}', 'f(u8(1))'),
+        ('fallback_shift_past_i64', 103, 'fn f(x:i64)->i64{x.shr(64)}', 'f(1)'),
+        ('fallback_shift_negative_i32', 103, 'fn f(x:i32)->i32{x.shr(-1)}', 'f(1)'),
         ('empty_index', 103, 'fn f(a:&[]i64)->i64{a[0]}', 'f(&empty)'),
         ('negative_index', 103, 'fn f(a:&[]i64,x:i32)->i64{a[x]}', 'f(&values,-1)'),
         ('index_overflow_first', 101, 'fn f(a:&[]i64,x:i32)->i64{a[x+1]}', 'f(&values,2147483647)'),

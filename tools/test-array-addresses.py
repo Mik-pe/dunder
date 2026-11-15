@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory:
         result = subprocess.run(command, capture_output=True, timeout=15)
         assert result.returncode == 0, (name, target, proof, result.returncode, result.stdout, result.stderr)
         fields = list(map(int, result.stdout.splitlines()))
-        assert len(fields) == 8, (name, fields)
+        assert len(fields) == 10, (name, fields)
         if target == host:
             run = subprocess.run([image], capture_output=True, timeout=10)
             assert run.returncode == status, (name, target, proof, run.returncode, status, run.stderr)
@@ -89,15 +89,22 @@ with tempfile.TemporaryDirectory(prefix='dunder-array-addresses-') as directory:
         for target in range(3):
             for proof in ('off', 'on'):
                 fields = generate(name, body, target, proof, 'function', layout, arguments, 2, expected, status, length)
-                assert (fields[2], fields[4], fields[5]) == (pushes, addr9, direct), (name, target, proof, fields)
+                indexed_store = target in (0, 1) and layout == 'homes' and name != 'index_overflow'
+                expected_loads = body.count('p0[') - 1 if target in (0, 1) else 0
+                expected_address = (0, 0) if indexed_store else (pushes, addr9)
+                assert (fields[2], fields[4]) == expected_address, (name, target, proof, fields)
+                assert (fields[5], fields[8], fields[9]) == (direct, expected_loads, int(indexed_store)), (name, target, proof, fields)
         print('PASS store', name, 'exact address/preservation words; three targets; native executed', flush=True)
     for name, body, layout, arguments, ret, expected, masks, words in probes:
         for target in range(3):
             for proof in ('off', 'on'):
                 fields = generate(name, body, target, proof, 'probe', layout, arguments, ret, expected, 0)
                 assert fields[1] & 768 == masks[proof], (name, target, proof, fields)
+                expected_loads = body.count('p0[') if target in (0, 1) else 0
+                assert (fields[8], fields[9]) == (expected_loads, 0), (name, target, proof, fields)
                 if proof in words:
-                    assert fields[0] == words[proof], (name, target, proof, fields, words[proof])
+                    expected_words = words[proof] - expected_loads
+                    assert fields[0] == expected_words, (name, target, proof, fields, expected_words)
                 if not masks[proof] & 256:
                     assert fields[6] == 0, (name, 'unreported x8 write', fields)
                 if not masks[proof] & 512:

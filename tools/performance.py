@@ -44,15 +44,17 @@ def checked_run(binary, args, expected):
     return elapsed
 
 
-def runtime_cases():
+def runtime_cases(scale=1):
     seed = 1729
+    counts = {'numeric': 1_000_000 * scale, 'scan': 3000 * scale,
+              'text': 2000 * scale, 'sort': 120 * scale}
     value, numeric = seed, 0
-    for _ in range(1_000_000):
+    for _ in range(counts['numeric']):
         value = (value * 1664525 + 1013904223) % 2147483647
         numeric += value
     values = [(i * 17 + seed) % 1009 for i in range(1024)]
     scan = 0
-    for i in range(3000):
+    for i in range(counts['scan']):
         values[i % 1024] = i
         scan += sum(values)
     words, inside = 0, False
@@ -61,15 +63,15 @@ def runtime_cases():
             inside = False
         elif not inside:
             words, inside = words + 1, True
-    text = (words * 1_000_000 + sum(map(ord, TEXT))) * 2000
+    text = (words * 1_000_000 + sum(map(ord, TEXT))) * counts['text']
     sort = 0
-    for repeat in range(120):
+    for repeat in range(counts['sort']):
         values = sorted(((255-i) * 17 + seed + repeat) % 1009 for i in range(256))
         sort += sum(value * (i + 1) for i, value in enumerate(values))
-    return [('numeric', ['1000000', str(seed)], numeric),
-            ('scan', ['3000', str(seed)], scan),
-            ('text', ['2000', TEXT], text),
-            ('sort', ['120', str(seed)], sort)]
+    return [('numeric', [str(counts['numeric']), str(seed)], numeric),
+            ('scan', [str(counts['scan']), str(seed)], scan),
+            ('text', [str(counts['text']), TEXT], text),
+            ('sort', [str(counts['sort']), str(seed)], sort)]
 
 
 def corpus(work):
@@ -126,6 +128,8 @@ def main():
     parser.add_argument('report', type=Path)
     parser.add_argument('--rounds', type=int, default=30)
     parser.add_argument('--suite', choices=['all', 'runtime', 'compiler'], default='all')
+    parser.add_argument('--runtime-scale', type=int, default=1,
+                        help='multiply the iteration count of each runtime workload')
     parser.add_argument('--include-check', action='store_true',
                         help='also measure check on generated and selfhost sources')
     parser.add_argument('--c-compiler', type=Path, help='also measure C with -O3 -ftrapv')
@@ -136,6 +140,8 @@ def main():
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error('--rounds must be positive')
+    if args.runtime_scale < 1:
+        parser.error('--runtime-scale must be positive')
     if args.include_check and args.suite == 'runtime':
         parser.error('--include-check requires the compiler or all suite')
     compilers = {'baseline': args.baseline.resolve(strict=True),
@@ -183,7 +189,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='dunder-performance-') as tmp:
         work = Path(tmp)
         if args.suite in ('all', 'runtime'):
-            for name, inputs, result in runtime_cases():
+            for name, inputs, result in runtime_cases(args.runtime_scale):
                 expected = f'{result}\n'.encode()
                 metadata['runtime_cases'][name] = {'args': inputs, 'expected': expected.decode()}
                 binaries = {}
