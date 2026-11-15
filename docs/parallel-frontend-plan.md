@@ -12,16 +12,13 @@ begränsad språkö ska införas.
 Standardkompilatorn på ARM64/macOS använder fyra workers. `--jobs=1..256`
 väljer storlek på ett begränsat taskfönster. Föräldern äger en `compile.Session`
 och utför fortfarande modulladdning, deklarationer, typ- och lånekontroll,
-kroppsemission, MIR-lift, cache och slutlig sammanfogning. Workers tar emot
-en ägd `mir.Function`, kör verifiering och MIR-pass och sänker därefter med
-samma lowerer direkt till slutlig numerisk `mir_lower.ObjectData`. De
-returnerar slutobjekt och statistik i stället för hela MIR-arenan. Föräldern
-strukturellt validerar objektet före ordnad acceptans, cache och länkning;
-den sänker inte en andra gång. Varje kallt jobb startar en riktig OS-tråd
-via språkets befintliga pthread-baserade taskruntime på ARM64/macOS och
-skapar lokala pipeline-/sänkningsarenor; någon permanent
-worker- eller arenapool finns inte. Kontrolläge, en worker, MIR-off och
-kompilatorprofilering använder den delade seriella Session-vägen.
+kroppsemission, cache och slutlig sammanfogning. Workers tar emot kompakt
+funktionsdata, bygger lokal MIR, verifierar och optimerar den och sänker
+med samma lowerer direkt till numerisk `mir_lower.ObjectData`. Föräldern
+tar över slutobjekt och statistik med `await!`, validerar och länkar i ordning.
+På ARM64/macOS använder språkets taskruntime libdispatchs trådpool och
+scopets återanvändbara arenor. En och flera workers använder samma batchkod.
+Kontrolläge, MIR-off och kompilatorprofilering använder den seriella Session-vägen.
 
 Detta framgår av [compile_parallel](../selfhost/compile_parallel.ddr),
 [dagens jobbobjekt](../selfhost/mir_task.ddr) och
@@ -296,7 +293,7 @@ har samma semantiska steg och policy; en worker återanvänder seriella arenor.
 **Leveransbevis:** workerantal ändrar varken bilder, första diagnostik,
 sourcebindings, inlinefrontier eller cachedebitering. Mät hur mycket av dagens
 seriella kroppsemission/lift/lower som faktiskt flyttats och den totala vinsten,
-inklusive packning, snapshot, child clone och resultatskopiering.
+inklusive packning, direkt snapshotskopiering till workerarenan och resultatets kopiering till föräldern.
 
 ### 3. Parallellisera typning mot frysta interface
 
@@ -430,8 +427,7 @@ beskrivs som förbättrad C-närhet. Den nya frontendarkitekturen har ingen mät
 vinst ännu. Aktivera först efter korrekthet, reproducerbarhet och ett samlat
 byggtids-/minnesresultat; rapportera även förlorande fall och svansar.
 
-En permanent workerpool och fler återanvända batcharenor kan därefter bedömas
-mot observerad trådstart-/klonkostnad. De ersätter inte den frysta semantiska
-gränsen. Generell delning av immutable data, callbacks/closures eller andra
+Mät kostnaden för dispatchkön och återanvändningen av jobbens arenor
+separat från den frysta semantiska gränsen. Generell delning av immutable data, callbacks/closures eller andra
 nya språkfeatures kräver egna ägar- och effektkontrakt innan de används för
 att kringgå dagens tasktransport.

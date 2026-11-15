@@ -51,7 +51,7 @@ målarkitekturens användarland.
 
 `--jobs N` och `--jobs=N` väljer 1–256 workers i den taskbaserade ingången.
 Den kör på ARM64/macOS och kan skriva program för alla fyra mål. Den
-seriella ingången stöder bara `--jobs=1`. En worker, `check`, `--mir=off`
+seriella ingången stöder bara `--jobs=1`. `check`, `--mir=off`
 och `--profile-compiler` går genom samma seriella Session-drivrutin utan
 scheduling. Profilens fasintervall förblir seriella väggtider.
 
@@ -64,6 +64,8 @@ Den sänker varje verifierad funktion till `mir_lower.ObjectData`.
 Föräldern validerar, cachar och länkar resultaten i källordning.
 Cacheträffar ger redan sänkta objekt. [Arbetstrådens indata och svar](mir_task.ddr)
 
+Taskfönstret omfattar högst `workers` samtidiga batcher i den gemensamma
+dispatchkön. Ordnad acceptans hämtar ägarskapet till varje svar med `await!`.
 [Taskkontrakt](../docs/tasks.md) och
 [historisk mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
 
