@@ -388,7 +388,10 @@ def fixture_source(name, source_root, work, fixtures=ROOT):
         module, alias = match.groups()
         relative = os.path.relpath(source_root / 'selfhost' / module, work).replace(os.sep, '/')
         return 'import ' + json.dumps(relative) + ' as ' + (alias or module)
-    return re.sub(r'import \.\.\.selfhost\.(\w+)(?: as (\w+))?', replace, text)
+    text = re.sub(r'import \.\.\.selfhost\.(\w+)(?: as (\w+))?', replace, text)
+    target_fixture = os.path.relpath(source_root / 'tests' / 'fixtures' / 'mir_machine', work)
+    return text.replace('import .mir_machine as', 'import ' + json.dumps(target_fixture) + ' as')
+
 
 
 def decode_consumer(output):

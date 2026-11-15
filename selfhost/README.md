@@ -134,7 +134,7 @@ taskbryggor och följer inte av en extern deklaration, MAY-clobber, NoModRef
 eller anrops-ABI. Råmasker muteras inte, och clobbers, minne och flaggor
 begränsas inte. Okända anropsformer behåller sina konservativa läsningar.
 
-[`mir_decode`](mir_decode.ddr) ger FE:s target explicit X17 och Wasm-FB:s
+[`mir_decode`](../tests/fixtures/mir_machine_decode.ddr) ger FE:s target explicit X17 och Wasm-FB:s
 X16; targets kan inte räknas som fri scratch. Rå Call läser inkommande NZCV
 och kan förstöra dem, alltså `flags=3`. Det tidigare `flags=2` var felaktig
 metadata. Fyndet har inte visat någon felkompilering i dagens värdepass.

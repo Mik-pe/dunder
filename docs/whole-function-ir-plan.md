@@ -199,7 +199,7 @@ Råmaskerna muteras aldrig; runtime-/C-/callback-/taskbryggor måste följa
 samma konvention och okända anropsformer förblir konservativa.
 
 FE:s målroll är explicit X17 och Wasm-FB:s X16 i
-[`mir_decode`](../selfhost/mir_decode.ddr); även en möjlig scratch måste
+[`mir_decode`](../tests/fixtures/mir_machine_decode.ddr); även en möjlig scratch måste
 behållas när den bär target. Rå Call både läser och kan förstöra NZCV,
 alltså `flags=3`. Tidigare `flags=2` var felaktig metadata; någon
 felkompilering i det nuvarande värdepasset har inte bevisats av detta fynd.

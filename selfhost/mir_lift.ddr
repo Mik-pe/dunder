@@ -1,7 +1,6 @@
 import foreign_operation as foreign_abi
-// Transitional adapter from the shared instruction vocabulary. Every word is
-// represented; unknown vocabulary is an ordered opaque function barrier.
-// Canonical operations and operands live in mir, never in this decoder.
+// Builds MIR from ordered typed operations. Standalone machine instructions
+// are invalid at this boundary. Each operation validates its own payload.
 import arm64 as arm
 import backend_row as backend
 import runtime_intrinsic as intrinsic
@@ -9,25 +8,18 @@ import mir
 import mir_source_call
 import place_operation as place_op
 import mir_place
+import typed_places as places
 import iteration
 import region_operation as region
 import mir_iteration
-import typed_places as places
 import mir_float
 import mir_source as source
 import mir_contract as contract
-import mir_decode as decode
+import mir_operation as decode
 
 pub struct Workspace { decoded: decode.Decoded }
 pub fn new_work() -> Workspace { Workspace { decoded: decode.new() } }
 
-fn record(f: &mut mir.Function, words: &[]i64, row: i32, at: i32, width: i32) -> i32 {
-    op := mir.add(&mut f, 0); f.origins[op] = at; f.raw_starts[op] = f.raw.len
-    f.widths[op] = width; f.modes[op] = 0
-    f.boundaries[at - f.first_word] = op
-    for i in 0..width { f.raw.push(words[row + i]) }
-    op
-}
 fn local_target(f: &mir.Function, target: i32) -> i32 {
     aliases := f.label_ids.len - (f.source_labels - f.first_label)
     if target >= f.first_label { return f.label_ops[aliases + (target - f.first_label)] }
@@ -98,7 +90,7 @@ fn frame_effects(f: &mut mir.Function) {
             contract.frame_place_proven_with_capacity(&f, f.place[op], size) { f.effects[op] = f.effects[op] - 1 }
     }
 }
-fn insert_entry(f: &mut mir.Function, entry: i32) -> bool {
+pub fn insert_entry(f: &mut mir.Function, entry: i32) -> bool {
     var position := 0
     while position < f.label_ids.len && f.label_ids[position] < entry { position = position + 1 }
     if position < f.label_ids.len && f.label_ids[position] == entry { return f.label_ops[position] == 0 }
@@ -113,268 +105,239 @@ fn abi_literal(f: &mut mir.Function, at: i32, reg: i32, value: i64) {
     op := mir.add(&mut f, 1); f.origins[op] = at; f.types[op] = 2
     f.dst[op] = reg; f.imm[op] = value; f.writes[op] = mir.variable_bit(reg)
 }
-// Direct and batched input use the same decoder. at/first_*/source_* are
-// positions in the original emitter; *_row positions index the supplied arrays.
-fn lift_rows(f: &mut mir.Function, work: &mut Workspace, item: &source.TypedFunction,
-    words: &[]i64, labels: &[]i32, relocs: &[]i32, targets: &[]i32, reloc_kinds: &[]i32,
-    sites: &[]i32,
-    target_words: &[]i32, batched: bool, arena: &places.Arena, l: i32, le: i32, n: i32, ne: i32) -> bool {
-    if !places.valid(&arena, l, le, n, ne, &f.source_types) { return false }
+pub fn begin(f: &mut mir.Function, item: &source.TypedFunction) {
     first_word := item.first_word; first_label := item.first_label
     f.platform = item.platform; f.first_word = first_word; f.first_label = first_label
     f.first_reloc = item.first_reloc; f.first_import = item.first_import
     f.source_words = first_word + item.word_count; f.source_labels = first_label + item.label_count
     f.source_relocs = f.first_reloc + item.reloc_count; f.source_imports = f.first_import + item.import_count
-    reloc_end := item.reloc_row + item.reloc_count; import_end := item.import_row + item.import_count
-    f.boundaries.reserve(item.word_count + 1); f.raw.reserve(item.word_count)
+    f.boundaries.reserve(item.word_count + 1)
     for i in 0..item.word_count + 1 { f.boundaries.push(-1) }
-    var r := item.reloc_row; var imported := item.import_row; var at := first_word
-    while at < f.source_words {
-        row := item.word_row + (at - first_word)
-        if words[row] < 0 { return false }
-        if r < reloc_end && relocs[r] < at { return false }
-        if imported < import_end && (sites[imported] < 0 || sites[imported] % 4 != 0 || sites[imported] / 4 < at) { return false }
-        symbolic := r < reloc_end && relocs[r] == at
-        foreign := imported < import_end && sites[imported] / 4 == at
-        if symbolic && foreign { return false }
-        if backend.valid_source_call(words[row]) {
-            var target := -1
-            if symbolic {
-                target = targets[r]
-                if reloc_kinds[r] != 1 || target < 0 || target >= f.source_labels { return false }
-                r = r + 1
-            }
-            if foreign || !mir_source_call.append(&mut f, &mut work.decoded, &words, row, at, target) { return false }
-            at = at + backend.call_width(words[row])
-        } else if symbolic {
-            kind := reloc_kinds[r]; target := targets[r]
-            if kind < 0 || kind > 20 || target < 0 || target >= f.source_labels { return false }
-            cell := words[row]; var width := 1; var op := -1
-            if !decode.symbolic(&mut work.decoded, kind) { return false }
-            if cell > 4294967295 {
-                if backend.valid_control(cell, kind) {
-                    work.decoded.variant = cell
-                } else if kind == 1 && backend.call_header(cell) {
-                    width = 2
-                    if at >= f.source_words - 1 || !backend.call_pair(cell, words[row + 1]) { return false }
-                    origin := words[row + 1]; tag := backend.kind(cell)
-                    work.decoded.opcode = tag; work.decoded.aux = i32(backend.operand(cell).bit_and(2147483647))
-                    work.decoded.imm = backend.operand(origin).bit_and(2147483647)
-                    if tag == backend.task_tag(.Spawn) { work.decoded.variant = backend.split_type_or_declaration(cell, origin) + 1 }
-                    if tag == 110 {
-                        work.decoded.variant = backend.operand(cell).shl(32).bit_or(origin.shr(32))
-                        work.decoded.aux = backend.reg(cell)
-                    }
-                    if tag == 96 {
-                        action := backend.reg(cell); layout := backend.intrinsic_layout(cell)
-                        work.decoded.variant = intrinsic.types(work.decoded.aux, i32(backend.split_type_or_declaration(cell, origin)))
-                        work.decoded.aux = action + layout * 32
-                        work.decoded.effects = intrinsic.effects(action)
-                    }
-                } else { return false }
-                f.boundaries[at - first_word] = f.order.len
-                if work.decoded.opcode == 110 { abi_literal(&mut f, at, 0, work.decoded.variant.bit_and(2147483647)) }
-                if work.decoded.opcode == 96 {
-                    action := work.decoded.aux % 32; input := intrinsic.input(work.decoded.variant)
-                    reg := intrinsic.argument_register(action, input)
-                    if reg >= 0 { abi_literal(&mut f, at, reg, intrinsic.argument_value(action, input, work.decoded.aux / 32)) }
-                }
-                if backend.awaiting(work.decoded.opcode) {
-                    // The task result type and await cardinality determine the
-                    // runtime ABI. An incoming edge precedes both arguments.
-                    abi_literal(&mut f, at, 2, i64(work.decoded.aux))
-                    var consume: i64 = 0; if work.decoded.opcode == backend.task_tag(.AwaitOnce) { consume = 1 }
-                    abi_literal(&mut f, at, 3, consume)
-                }
-                op = mir.add(&mut f, 0); f.origins[op] = at
-            } else {
-                if kind >= 2 { width = 2 }
-                if at > f.source_words - width || cell != 0 { return false }
-                if width == 2 && words[row + 1] != 3573751839 { return false }
-                op = record(&mut f, &words, row, at, width); f.recipes[op] = 4
-            }
-            f.targets[op] = target; f.reloc_kinds[op] = kind
-            decode.append_into(&work.decoded, &mut f, op)
-            r = r + 1; at = at + width
-        } else if foreign && backend.valid_native_address(words[row]) {
-            op := mir.add(&mut f, 17); f.origins[op] = at; f.boundaries[at - first_word] = op
-            f.dst[op] = backend.reg(words[row]); f.writes[op] = mir.variable_bit(f.dst[op])
-            f.import_ids[op] = item.first_import + (imported - item.import_row)
-            imported = imported + 1; at = at + 1
-        } else if foreign {
-            if at > f.source_words - 2 || words[row + 1] != 0 || (words[row] != 0 && words[row] != 4244635648) { return false }
-            op := record(&mut f, &words, row, at, 2); f.recipes[op] = 5
-            if !decode.imported(&mut work.decoded, words[row]) { return false }
-            decode.append_into(&work.decoded, &mut f, op); f.import_ids[op] = item.first_import + (imported - item.import_row)
-            imported = imported + 1; at = at + 2
-        } else if foreign_abi.handles(backend.kind(words[row])) {
-            op := mir.add(&mut f, 24); f.origins[op] = at; f.boundaries[at - first_word] = op
-            if !foreign_abi.read(&mut f, op, words[row]) { return false }
-            at = at + 1
-        } else if place_op.bound(words[row]) {
-            h := words[row]; var offset := i32(h.bit_and(2147483647)); var count := 1
-            if place_op.wide(h) {
-                if at >= f.source_words - 1 || !place_op.detail(words[row + 1]) || place_op.parameter(words[row+1]) != 0 { return false }
-                count = 2; offset = i32(words[row+1].bit_and(2147483647))
-            }
-            var operation: i64 = 0; var origin: i64 = 0
-            if !place_op.resolve(h, offset, &arena, l, le, n, ne, &mut operation, &mut origin) { return false }
-            op := mir.add(&mut f, 23); f.origins[op] = at; f.boundaries[at - first_word] = op
-            mir_place.set(&mut f, &mut work.decoded, op, operation, origin); at = at + count
-        } else if place_op.head(words[row]) {
-            if at >= f.source_words - 1 || !place_op.pair(words[row], words[row + 1]) { return false }
-            op := mir.add(&mut f, 23); f.origins[op] = at; f.boundaries[at - first_word] = op
-            mir_place.set(&mut f, &mut work.decoded, op, words[row], words[row + 1])
-            at = at + 2
-        } else if backend.kind(words[row]) == 111 {
-            if at > f.source_words - 3 || !backend.enum_pair(words[row], words[row + 1]) { return false }
-            op := mir.add(&mut f, 1); f.origins[op] = at; f.boundaries[at - first_word] = op
-            f.opcodes[op] = 111; f.aux[op] = i32(backend.operand(words[row])); f.variant[op] = words[row + 1]
-            f.types[op] = 2; f.dst[op] = backend.reg(words[row]); f.imm[op] = words[row + 2]; f.writes[op] = mir.variable_bit(f.dst[op])
-            at = at + 3
-        } else if backend.kind(words[row]) == 101 {
-            if at >= f.source_words - 1 || !region.pair(words[row], words[row + 1]) { return false }
-            op := mir.add(&mut f, 26); f.origins[op] = at; f.boundaries[at - first_word] = op
-            region.set(&mut f, op, words[row], words[row + 1]); at = at + 2
-        } else if backend.kind(words[row]) == 99 {
-            if at >= f.source_words - 1 || !iteration.pair(words[row], words[row + 1]) { return false }
-            op := mir.add(&mut f, 25); f.origins[op] = at; f.boundaries[at - first_word] = op
-            mir_iteration.set(&mut f, op, words[row], words[row + 1]); at = at + 2
-        } else if backend.owner_store_cell(words[row]) {
-            if at >= f.source_words - 1 || !backend.source_cell(words[row + 1]) { return false }
-            tag := backend.kind(words[row]); slot := i32(backend.operand(words[row]).shr(32))
-            var reg := 31; if tag == 20 { reg = 0 }
-            op := mir.add(&mut f, 8); f.origins[op] = at; f.boundaries[at - first_word] = op
-            decode.frame(&mut work.decoded, 2, slot, reg)
-            decode.append_into(&work.decoded, &mut f, op)
-            f.recipes[op] = 2; f.opcodes[op] = tag
-            f.variant[op] = words[row].bit_and(4294967295).shl(32).bit_or(backend.operand(words[row + 1]))
-            if slot >= 32 { f.c[op] = 9 }
-            at = at + 2
-        } else if words[row] > 4294967295 {
-            cell := words[row]
-            if !backend.valid(cell) || backend.kind(cell) == 48 || backend.control_row(cell) { return false }
-            tag := backend.kind(cell); reg := backend.reg(cell); operand := backend.operand(cell)
-            op := mir.add(&mut f, 1); f.origins[op] = at; f.boundaries[at - first_word] = op
-            f.types[op] = 2; f.dst[op] = reg; f.writes[op] = mir.variable_bit(reg)
-            if tag == 100 {
-                f.kinds[op] = 20; f.opcodes[op] = 100; f.aux[op] = reg; f.imm[op] = operand; f.types[op] = 0
-                f.dst[op] = -1; f.abi[op] = 3; f.effects[op] = 95; f.flags[op] = 3
-                f.reads[op] = -1; f.writes[op] = 0; f.clobbers[op] = -1
-            } else if tag == 98 {
-                if f.platform != 3 { return false }
-                f.kinds[op] = 14; f.opcodes[op] = 96; f.aux[op] = i32(intrinsic.Operation.Print)
-                f.variant[op] = intrinsic.types(reg, 0); f.imm[op] = operand
-                f.types[op] = 0; f.dst[op] = -1; f.abi[op] = 2; f.effects[op] = 95; f.flags[op] = 3
-                f.reads[op] = -1; f.writes[op] = 0; f.clobbers[op] = -1
-            } else if tag == 61 { mir_float.set(&mut f, op, i32(operand.shr(32)), reg, i32(operand.bit_and(2147483647))) }
-            else if tag == 1 {
-                var value := operand
-                if value >= 140737488355328 { value = value - 281474976710656 }
-                f.imm[op] = value
-            } else if tag == 2 {
-                if at + 1 >= f.source_words || words[row + 1] < 0 || words[row + 1] > 4294967295 { return false }
-                f.imm[op] = operand.bit_or(words[row + 1].shl(32)); at = at + 1
-            } else if tag >= 104 && tag <= 107 {
-                base := i32(operand.shr(40)); shape := i32(operand.shr(32).bit_and(255))
-                var size := shape; if size == 4 { size = 2 }
-                width := i32(1).shl(size); var offset := i32(backend.binary_right(cell))
-                var value := reg; if value == 31 { value = -1 }
-                var place := 0; if base == 29 { place = 1 }; if base == 31 { place = 2 }
-                var index := -1
-                if tag >= 106 { index = offset; offset = 0; f.opcodes[op] = 1 }
-                f.imm[op] = i64(offset); f.aux[op] = width
-                if size < 3 && shape != 4 { f.types[op] = 1 }
-                f.reads[op] = mir.variable_bit(base).bit_or(mir.variable_bit(index))
-                if tag == 104 || tag == 106 {
-                    f.kinds[op] = 7; f.dst[op] = value; f.a[op] = base; f.b[op] = index
-                    f.writes[op] = mir.variable_bit(value); f.effects[op] = 3
-                    if size < 3 { f.extensions[op] = 1 }; if shape == 4 { f.extensions[op] = 2 }
-                } else {
-                    f.kinds[op] = 8; f.dst[op] = -1; f.a[op] = value; f.b[op] = base; f.c[op] = index
-                    f.writes[op] = 0; f.effects[op] = 5; f.reads[op] = f.reads[op].bit_or(mir.variable_bit(value))
-                }
-                p := mir.add_place(&mut f, place, offset, width, f.extensions[op]); f.place[op] = p
-            } else if tag == 56 || tag == 57 {
-                f.kinds[op] = 5; f.dst[op] = -1; f.writes[op] = 0; f.flags[op] = 2; f.opcodes[op] = 2
-                if reg != 31 { f.a[op] = reg }
-                if tag == 56 { if operand < 31 { f.b[op] = i32(operand) } }
-                else {
-                    f.imm[op] = backend.binary_right(cell)
-                    if operand.shr(32) != 0 { f.opcodes[op] = 1 }
-                }
-                f.reads[op] = mir.variable_bit(f.a[op]).bit_or(mir.variable_bit(f.b[op]))
-            } else if tag == 58 {
-                f.kinds[op] = 6; f.imm[op] = operand; f.flags[op] = 1
-            } else if tag == 59 {
-                f.kinds[op] = 4; f.opcodes[op] = 18; f.a[op] = backend.binary_left(cell)
-                right := backend.binary_right(cell); f.b[op] = i32(right.bit_and(255)); f.c[op] = i32(right.shr(8))
-                f.reads[op] = mir.variable_bit(f.a[op]).bit_or(mir.variable_bit(f.b[op])).bit_or(mir.variable_bit(f.c[op]))
-            } else if tag == 15 {
-                action := i32(operand.bit_and(255)); amount := operand.shr(8)
-                if action == 1 || action == 6 || action == 7 {
-                    decode.reset(&mut work.decoded)
-                    if action == 7 { decode.internal_return(&mut work.decoded) }
-                    else { decode.frame_pair(&mut work.decoded, action == 6) }
-                    decode.append_into(&work.decoded, &mut f, op)
-                } else if action == 8 {
-                    f.kinds[op] = 18; f.dst[op] = -1; f.writes[op] = 0
-                } else {
-                    f.kinds[op] = 16; f.effects[op] = 32; f.opcodes[op] = 1
-                    f.dst[op] = 31; f.a[op] = 31
-                    if action == 2 { f.dst[op] = 29 } else if action == 5 { f.a[op] = 29 }
-                    else { f.opcodes[op] = 2; f.imm[op] = amount; f.variant[op] = i64(action) }
-                    f.reads[op] = mir.variable_bit(f.a[op]); f.writes[op] = mir.variable_bit(f.dst[op])
-                }
-            } else if tag == 14 {
-                f.kinds[op] = 3; f.opcodes[op] = 2; if backend.bitfield_signed(cell) { f.opcodes[op] = 1 }
-                if !backend.binary_wide(cell) { f.types[op] = 1 }
-                f.a[op] = backend.binary_left(cell); f.reads[op] = mir.variable_bit(f.a[op])
-                f.aux[op] = i32(backend.binary_right(cell))
-            } else if tag == 12 || tag == 13 {
-                f.kinds[op] = 4; f.opcodes[op] = backend.binary_op(cell)
-                if !backend.binary_wide(cell) { f.types[op] = 1 }; if backend.binary_flags(cell) { f.flags[op] = 2 }
-                left := backend.binary_left(cell); right := backend.binary_right(cell)
-                if left != 31 { f.a[op] = left }
-                if tag == 12 {
-                    if right.bit_and(255) < 31 { f.b[op] = i32(right.bit_and(255)) }
-                    f.aux[op] = i32(right.shr(8))
-                } else { f.imm[op] = right }
-                if f.opcodes[op] == 6 || f.opcodes[op] == 7 { f.effects[op] = 1 }
-                f.reads[op] = mir.variable_bit(f.a[op]).bit_or(mir.variable_bit(f.b[op]))
-            } else if tag >= 7 && tag <= 10 {
-                decode.reset(&mut work.decoded)
-                decode.stack(&mut work.decoded, reg, tag == 7 || tag == 9, tag <= 8)
-                if tag <= 8 { f.recipes[op] = tag - 1 }
-                decode.append_into(&work.decoded, &mut f, op)
-            } else if tag == 11 {
-                shape := i32(operand.shr(32)); slot := i32(operand.bit_and(4294967295))
-                offset := -(slot + 1) * 8; var width := i32(1).shl(shape); var extension := 1
-                if shape == 3 { extension = 0 } else if shape == 4 { width = 4; extension = 2 }
-                f.kinds[op] = 7; f.a[op] = 29; f.reads[op] = mir.variable_bit(29)
-                f.aux[op] = width; f.extensions[op] = extension; f.imm[op] = i64(offset)
-                if shape < 3 { f.types[op] = 1 }
-                place := mir.add_place(&mut f, 1, offset, width, extension); f.place[op] = place
-                f.recipes[op] = 1; f.effects[op] = 3
-                if slot >= 32 { f.c[op] = 0; f.clobbers[op] = mir.variable_bit(0) }
-            } else if tag >= 4 {
-                slot := i32(operand); recipe := tag - 3
-                f.recipes[op] = recipe
-                decode.frame(&mut work.decoded, recipe, slot, reg)
-                decode.append_into(&work.decoded, &mut f, op)
-                if recipe != 3 && slot >= 32 { f.c[op] = 9 }
-                if recipe != 2 && reg == 29 { f.optimizable = false }
-            } else if operand != 31 {
-                f.kinds[op] = 2; f.a[op] = i32(operand); f.reads[op] = mir.variable_bit(i32(operand))
-            }
-            at = at + 1
-        } else {
-            op := record(&mut f, &words, row, at, 1)
-            decode.word(&mut work.decoded, words[row], item.platform)
-            decode.append_into(&work.decoded, &mut f, op); at = at + 1
+}
+pub fn append_typed(f: &mut mir.Function, work: &mut Workspace, words: &[]i64, row: i32, origin: i32,
+    target: i32, reloc: i32, import_id: i32, arena: &places.Arena, l: i32, le: i32, n: i32, ne: i32) -> i32 {
+    var at := origin; first_word := f.first_word; symbolic := reloc >= 0; foreign := import_id >= 0
+    if words[row] <= 4294967295 || (foreign && symbolic) { return -1 }
+    if backend.valid_source_call(words[row]) {
+        if symbolic {
+            if reloc != 1 || target < 0 || target >= f.source_labels { return -1 }
         }
-    }
-    if r != reloc_end || imported != import_end { return false }
+        if foreign || !mir_source_call.append(&mut f, &mut work.decoded, &words, row, at, target) { return -1 }
+        at = at + backend.call_width(words[row])
+    } else if symbolic {
+        kind := reloc
+        if kind < 0 || kind > 20 || target < 0 || target >= f.source_labels { return -1 }
+        cell := words[row]; var width := 1; var op := -1
+        if !decode.symbolic(&mut work.decoded, kind) { return -1 }
+        if backend.valid_control(cell, kind) {
+            work.decoded.variant = cell
+        } else if kind == 1 && backend.call_header(cell) {
+            width = 2
+            if at >= f.source_words - 1 || !backend.call_pair(cell, words[row + 1]) { return -1 }
+            origin := words[row + 1]; tag := backend.kind(cell)
+            work.decoded.opcode = tag; work.decoded.aux = i32(backend.operand(cell).bit_and(2147483647))
+            work.decoded.imm = backend.operand(origin).bit_and(2147483647)
+            if tag == backend.task_tag(.Spawn) { work.decoded.variant = backend.split_type_or_declaration(cell, origin) + 1 }
+            if tag == 110 {
+                work.decoded.variant = backend.operand(cell).shl(32).bit_or(origin.shr(32))
+                work.decoded.aux = backend.reg(cell)
+            }
+            if tag == 96 {
+                action := backend.reg(cell); layout := backend.intrinsic_layout(cell)
+                work.decoded.variant = intrinsic.types(work.decoded.aux, i32(backend.split_type_or_declaration(cell, origin)))
+                work.decoded.aux = action + layout * 32
+                work.decoded.effects = intrinsic.effects(action)
+            }
+        } else { return -1 }
+        f.boundaries[at - first_word] = f.order.len
+        if work.decoded.opcode == 110 { abi_literal(&mut f, at, 0, work.decoded.variant.bit_and(2147483647)) }
+        if work.decoded.opcode == 96 {
+            action := work.decoded.aux % 32; input := intrinsic.input(work.decoded.variant)
+            reg := intrinsic.argument_register(action, input)
+            if reg >= 0 { abi_literal(&mut f, at, reg, intrinsic.argument_value(action, input, work.decoded.aux / 32)) }
+        }
+        if backend.awaiting(work.decoded.opcode) {
+            // The task result type and await cardinality determine the
+            // runtime ABI. An incoming edge precedes both arguments.
+            abi_literal(&mut f, at, 2, i64(work.decoded.aux))
+            var consume: i64 = 0; if work.decoded.opcode == backend.task_tag(.AwaitOnce) { consume = 1 }
+            abi_literal(&mut f, at, 3, consume)
+        }
+        op = mir.add(&mut f, 0); f.origins[op] = at
+        f.targets[op] = target; f.reloc_kinds[op] = kind
+        decode.append_into(&work.decoded, &mut f, op)
+        at = at + width
+    } else if foreign && backend.valid_native_address(words[row]) {
+        op := mir.add(&mut f, 17); f.origins[op] = at; f.boundaries[at - first_word] = op
+        f.dst[op] = backend.reg(words[row]); f.writes[op] = mir.variable_bit(f.dst[op])
+        f.import_ids[op] = import_id
+        at = at + 1
+    } else if foreign { return -1 } else if foreign_abi.handles(backend.kind(words[row])) {
+        op := mir.add(&mut f, 24); f.origins[op] = at; f.boundaries[at - first_word] = op
+        if !foreign_abi.read(&mut f, op, words[row]) { return -1 }
+        at = at + 1
+    } else if place_op.bound(words[row]) {
+        h := words[row]; var offset := i32(h.bit_and(2147483647)); var count := 1
+        if place_op.wide(h) {
+            if at >= f.source_words - 1 || !place_op.detail(words[row + 1]) || place_op.parameter(words[row+1]) != 0 { return -1 }
+            count = 2; offset = i32(words[row+1].bit_and(2147483647))
+        }
+        var operation: i64 = 0; var source: i64 = 0
+        if !place_op.resolve(h, offset, &arena, l, le, n, ne, &mut operation, &mut source) { return -1 }
+        op := mir.add(&mut f, 23); f.origins[op] = at; f.boundaries[at - first_word] = op
+        mir_place.set(&mut f, &mut work.decoded, op, operation, source); at = at + count
+    } else if place_op.head(words[row]) {
+        if at >= f.source_words - 1 || !place_op.pair(words[row], words[row + 1]) { return -1 }
+        op := mir.add(&mut f, 23); f.origins[op] = at; f.boundaries[at - first_word] = op
+        mir_place.set(&mut f, &mut work.decoded, op, words[row], words[row + 1])
+        at = at + 2
+    } else if backend.kind(words[row]) == 111 {
+        if at > f.source_words - 3 || !backend.enum_pair(words[row], words[row + 1]) { return -1 }
+        op := mir.add(&mut f, 1); f.origins[op] = at; f.boundaries[at - first_word] = op
+        f.opcodes[op] = 111; f.aux[op] = i32(backend.operand(words[row])); f.variant[op] = words[row + 1]
+        f.types[op] = 2; f.dst[op] = backend.reg(words[row]); f.imm[op] = words[row + 2]; f.writes[op] = mir.variable_bit(f.dst[op])
+        at = at + 3
+    } else if backend.kind(words[row]) == 101 {
+        if at >= f.source_words - 1 || !region.pair(words[row], words[row + 1]) { return -1 }
+        op := mir.add(&mut f, 26); f.origins[op] = at; f.boundaries[at - first_word] = op
+        region.set(&mut f, op, words[row], words[row + 1]); at = at + 2
+    } else if backend.kind(words[row]) == 99 {
+        if at >= f.source_words - 1 || !iteration.pair(words[row], words[row + 1]) { return -1 }
+        op := mir.add(&mut f, 25); f.origins[op] = at; f.boundaries[at - first_word] = op
+        mir_iteration.set(&mut f, op, words[row], words[row + 1]); at = at + 2
+    } else if backend.owner_store_cell(words[row]) {
+        if at >= f.source_words - 1 || !backend.source_cell(words[row + 1]) { return -1 }
+        tag := backend.kind(words[row]); slot := i32(backend.operand(words[row]).shr(32))
+        var reg := 31; if tag == 20 { reg = 0 }
+        op := mir.add(&mut f, 8); f.origins[op] = at; f.boundaries[at - first_word] = op
+        decode.frame(&mut work.decoded, 2, slot, reg)
+        decode.append_into(&work.decoded, &mut f, op)
+        f.recipes[op] = 2; f.opcodes[op] = tag
+        f.variant[op] = words[row].bit_and(4294967295).shl(32).bit_or(backend.operand(words[row + 1]))
+        if slot >= 32 { f.c[op] = 9 }
+        at = at + 2
+    } else if words[row] > 4294967295 {
+        cell := words[row]
+        if !backend.valid(cell) || backend.kind(cell) == 48 || backend.control_row(cell) { return -1 }
+        tag := backend.kind(cell); reg := backend.reg(cell); operand := backend.operand(cell)
+        op := mir.add(&mut f, 1); f.origins[op] = at; f.boundaries[at - first_word] = op
+        f.types[op] = 2; f.dst[op] = reg; f.writes[op] = mir.variable_bit(reg)
+        if tag == 100 {
+            f.kinds[op] = 20; f.opcodes[op] = 100; f.aux[op] = reg; f.imm[op] = operand; f.types[op] = 0
+            f.dst[op] = -1; f.abi[op] = 3; f.effects[op] = 95; f.flags[op] = 3
+            f.reads[op] = -1; f.writes[op] = 0; f.clobbers[op] = -1
+        } else if tag == 98 {
+            if f.platform != 3 { return -1 }
+            f.kinds[op] = 14; f.opcodes[op] = 96; f.aux[op] = i32(intrinsic.Operation.Print)
+            f.variant[op] = intrinsic.types(reg, 0); f.imm[op] = operand
+            f.types[op] = 0; f.dst[op] = -1; f.abi[op] = 2; f.effects[op] = 95; f.flags[op] = 3
+            f.reads[op] = -1; f.writes[op] = 0; f.clobbers[op] = -1
+        } else if tag == 61 { mir_float.set(&mut f, op, i32(operand.shr(32)), reg, i32(operand.bit_and(2147483647))) }
+        else if tag == 1 {
+            var value := operand
+            if value >= 140737488355328 { value = value - 281474976710656 }
+            f.imm[op] = value
+        } else if tag == 2 {
+            if at + 1 >= f.source_words || words[row + 1] < 0 || words[row + 1] > 4294967295 { return -1 }
+            f.imm[op] = operand.bit_or(words[row + 1].shl(32)); at = at + 1
+        } else if tag >= 104 && tag <= 107 {
+            base := i32(operand.shr(40)); shape := i32(operand.shr(32).bit_and(255))
+            var size := shape; if size == 4 { size = 2 }
+            width := i32(1).shl(size); var offset := i32(backend.binary_right(cell))
+            var value := reg; if value == 31 { value = -1 }
+            var place := 0; if base == 29 { place = 1 }; if base == 31 { place = 2 }
+            var index := -1
+            if tag >= 106 { index = offset; offset = 0; f.opcodes[op] = 1 }
+            f.imm[op] = i64(offset); f.aux[op] = width
+            if size < 3 && shape != 4 { f.types[op] = 1 }
+            f.reads[op] = mir.variable_bit(base).bit_or(mir.variable_bit(index))
+            if tag == 104 || tag == 106 {
+                f.kinds[op] = 7; f.dst[op] = value; f.a[op] = base; f.b[op] = index
+                f.writes[op] = mir.variable_bit(value); f.effects[op] = 3
+                if size < 3 { f.extensions[op] = 1 }; if shape == 4 { f.extensions[op] = 2 }
+            } else {
+                f.kinds[op] = 8; f.dst[op] = -1; f.a[op] = value; f.b[op] = base; f.c[op] = index
+                f.writes[op] = 0; f.effects[op] = 5; f.reads[op] = f.reads[op].bit_or(mir.variable_bit(value))
+            }
+            p := mir.add_place(&mut f, place, offset, width, f.extensions[op]); f.place[op] = p
+        } else if tag == 56 || tag == 57 {
+            f.kinds[op] = 5; f.dst[op] = -1; f.writes[op] = 0; f.flags[op] = 2; f.opcodes[op] = 2
+            if reg != 31 { f.a[op] = reg }
+            if tag == 56 { if operand < 31 { f.b[op] = i32(operand) } }
+            else {
+                f.imm[op] = backend.binary_right(cell)
+                if operand.shr(32) != 0 { f.opcodes[op] = 1 }
+            }
+            f.reads[op] = mir.variable_bit(f.a[op]).bit_or(mir.variable_bit(f.b[op]))
+        } else if tag == 58 {
+            f.kinds[op] = 6; f.imm[op] = operand; f.flags[op] = 1
+        } else if tag == 59 {
+            f.kinds[op] = 4; f.opcodes[op] = 18; f.a[op] = backend.binary_left(cell)
+            right := backend.binary_right(cell); f.b[op] = i32(right.bit_and(255)); f.c[op] = i32(right.shr(8))
+            f.reads[op] = mir.variable_bit(f.a[op]).bit_or(mir.variable_bit(f.b[op])).bit_or(mir.variable_bit(f.c[op]))
+        } else if tag == 15 {
+            action := i32(operand.bit_and(255)); amount := operand.shr(8)
+            if action == 1 || action == 6 || action == 7 {
+                decode.reset(&mut work.decoded)
+                if action == 7 { decode.internal_return(&mut work.decoded) }
+                else { decode.frame_pair(&mut work.decoded, action == 6) }
+                decode.append_into(&work.decoded, &mut f, op)
+            } else if action == 8 {
+                f.kinds[op] = 18; f.dst[op] = -1; f.writes[op] = 0
+            } else {
+                f.kinds[op] = 16; f.effects[op] = 32; f.opcodes[op] = 1
+                f.dst[op] = 31; f.a[op] = 31
+                if action == 2 { f.dst[op] = 29 } else if action == 5 { f.a[op] = 29 }
+                else { f.opcodes[op] = 2; f.imm[op] = amount; f.variant[op] = i64(action) }
+                f.reads[op] = mir.variable_bit(f.a[op]); f.writes[op] = mir.variable_bit(f.dst[op])
+            }
+        } else if tag == 14 {
+            f.kinds[op] = 3; f.opcodes[op] = 2; if backend.bitfield_signed(cell) { f.opcodes[op] = 1 }
+            if !backend.binary_wide(cell) { f.types[op] = 1 }
+            f.a[op] = backend.binary_left(cell); f.reads[op] = mir.variable_bit(f.a[op])
+            f.aux[op] = i32(backend.binary_right(cell))
+        } else if tag == 12 || tag == 13 {
+            f.kinds[op] = 4; f.opcodes[op] = backend.binary_op(cell)
+            if !backend.binary_wide(cell) { f.types[op] = 1 }; if backend.binary_flags(cell) { f.flags[op] = 2 }
+            left := backend.binary_left(cell); right := backend.binary_right(cell)
+            if left != 31 { f.a[op] = left }
+            if tag == 12 {
+                if right.bit_and(255) < 31 { f.b[op] = i32(right.bit_and(255)) }
+                f.aux[op] = i32(right.shr(8))
+            } else { f.imm[op] = right }
+            if f.opcodes[op] == 6 || f.opcodes[op] == 7 { f.effects[op] = 1 }
+            f.reads[op] = mir.variable_bit(f.a[op]).bit_or(mir.variable_bit(f.b[op]))
+        } else if tag >= 7 && tag <= 10 {
+            decode.reset(&mut work.decoded)
+            decode.stack(&mut work.decoded, reg, tag == 7 || tag == 9, tag <= 8)
+            if tag <= 8 { f.recipes[op] = tag - 1 }
+            decode.append_into(&work.decoded, &mut f, op)
+        } else if tag == 11 {
+            shape := i32(operand.shr(32)); slot := i32(operand.bit_and(4294967295))
+            offset := -(slot + 1) * 8; var width := i32(1).shl(shape); var extension := 1
+            if shape == 3 { extension = 0 } else if shape == 4 { width = 4; extension = 2 }
+            f.kinds[op] = 7; f.a[op] = 29; f.reads[op] = mir.variable_bit(29)
+            f.aux[op] = width; f.extensions[op] = extension; f.imm[op] = i64(offset)
+            if shape < 3 { f.types[op] = 1 }
+            place := mir.add_place(&mut f, 1, offset, width, extension); f.place[op] = place
+            f.recipes[op] = 1; f.effects[op] = 3
+            if slot >= 32 { f.c[op] = 0; f.clobbers[op] = mir.variable_bit(0) }
+        } else if tag >= 4 {
+            slot := i32(operand); recipe := tag - 3
+            f.recipes[op] = recipe
+            decode.frame(&mut work.decoded, recipe, slot, reg)
+            decode.append_into(&work.decoded, &mut f, op)
+            if recipe != 3 && slot >= 32 { f.c[op] = 9 }
+            if recipe != 2 && reg == 29 { f.optimizable = false }
+        } else if operand != 31 {
+            f.kinds[op] = 2; f.a[op] = i32(operand); f.reads[op] = mir.variable_bit(i32(operand))
+        }
+        at = at + 1
+    } else { return -1 }
+    at
+}
+pub fn finish(f: &mut mir.Function, item: &source.TypedFunction, labels: &[]i32, targets: &[]i32, target_words: &[]i32, batched: bool) -> bool {
+    first_word := item.first_word; first_label := item.first_label; reloc_end := item.reloc_row + item.reloc_count
     f.boundaries[f.boundaries.len - 1] = f.order.len
     for i in 0..item.label_count {
         word := labels[item.label_row + i]; var op := -1
@@ -396,6 +359,34 @@ fn lift_rows(f: &mut mir.Function, work: &mut Workspace, item: &source.TypedFunc
     frame_effects(&mut f)
     f.valid = true; true
 }
+fn lift_rows(f: &mut mir.Function, work: &mut Workspace, item: &source.TypedFunction,
+    words: &[]i64, labels: &[]i32, relocs: &[]i32, targets: &[]i32, reloc_kinds: &[]i32,
+    sites: &[]i32,
+    target_words: &[]i32, batched: bool, arena: &places.Arena, l: i32, le: i32, n: i32, ne: i32) -> bool {
+    if !places.valid(&arena, l, le, n, ne, &f.source_types) { return false }
+    begin(&mut f, &item)
+    first_word := item.first_word; reloc_end := item.reloc_row + item.reloc_count; import_end := item.import_row + item.import_count
+    var r := item.reloc_row; var imported := item.import_row; var at := first_word
+    while at < f.source_words {
+        row := item.word_row + (at - first_word)
+        if r < reloc_end && relocs[r] < at { return false }
+        if imported < import_end && (sites[imported] < 0 || sites[imported] % 4 != 0 || sites[imported] / 4 < at) { return false }
+        var kind := -1; var target := -1; var foreign := -1
+        if r < reloc_end && relocs[r] == at {
+            kind = reloc_kinds[r]; target = targets[r]; r = r + 1
+            if kind < 0 || kind > 20 || target < 0 || target >= f.source_labels { return false }
+        }
+        if imported < import_end && sites[imported] / 4 == at {
+            if kind >= 0 { return false }
+            foreign = item.first_import + (imported - item.import_row); imported = imported + 1
+        }
+        at = append_typed(&mut f, &mut work, &words, row, at, target, kind, foreign, &arena, l, le, n, ne)
+        if at < 0 { return false }
+    }
+    if r != reloc_end || imported != import_end { return false }
+    return finish(&mut f, &item, &labels, &targets, &target_words, batched)
+}
+
 pub fn build_into(f: &mut mir.Function, work: &mut Workspace, code: &arm.Code, first_word: i32, first_label: i32,
     first_reloc: i32, sites: &[]i32, first_import: i32) -> bool {
     arena := places.new()
