@@ -55,7 +55,7 @@ int scope_check(int mode, int jobs, int array, int cap, int expected_drops) {
     unsigned d = atomic_load(&drops), p = atomic_load(&peak), a = atomic_load(&active);
     if (atomic_load(&bad_drop)) return 1;
     if (mode == 0) {
-        if (c != (unsigned)jobs || j != c || u != (array ? (unsigned)cap : 0) || a ||
+        if (c != (unsigned)jobs || j != c || u != (unsigned)cap || a ||
             atomic_load(&starts) != c || atomic_load(&preserved) != c ||
             d != (unsigned)expected_drops || !p || p > (unsigned)cap) return 2;
         if (cap == 1 ? p != 1 : p < 2) return 3;
@@ -68,7 +68,7 @@ int scope_check(int mode, int jobs, int array, int cap, int expected_drops) {
     if (mode == 2) return c != 2 || j != 1 || u || d;
     if (mode == 3) return c != (unsigned)jobs || j != c - cap + 1 || u != 1 || d;
     if (mode == 4) return c != 1 || j || u || d;
-    if (mode == 5) return c != 2 || j != 1 || u != (unsigned)array || d != (unsigned)array;
+    if (mode == 5) return c != 2 || j != 1 || u != 1 || d != (unsigned)array;
     if (mode == 6) return c || j || u || d;
     return 4;
 }

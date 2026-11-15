@@ -60,7 +60,7 @@ int probe_unmap(void *base, size_t bytes) {
 }
 int probe_check(int error, int jobs, int array) {
     unsigned expected_starts = error == 1 ? 0 : (unsigned)jobs;
-    unsigned expected_unmaps = error == 1 || error == 2 || !array ? 0 : (unsigned)jobs;
+    unsigned expected_unmaps = error == 1 || error == 2 ? 0 : (unsigned)jobs;
     return atomic_load(&creates) != (unsigned)jobs ||
         atomic_load(&joins) != expected_starts ||
         atomic_load(&unmaps) != expected_unmaps ||

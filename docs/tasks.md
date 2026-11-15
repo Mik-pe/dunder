@@ -135,7 +135,7 @@ ett jobb i libdispatchs globala trådpool. Skalarer skickas som värdebitar.
 En dispatchgrupp per jobb synkroniserar resultatet. Efter avslutat jobb
 kopieras det efterfrågade resultatet till förälderns arena. En vanlig
 `await` klonar förälderns cache medan `await!` tar över den.
-Scopet återanvänder sina workerarenor om 512 MiB och avmappar dem vid utgång. Ett scope utan arbetsyta behåller högst 64 lediga arenor. Med arbetsyta begränsar scopets kapacitet antalet arenor.
+Varje aktiv worker har en återanvänd arena på 512 MiB och en stack på 8 MiB, åtskilda av ett skyddat adressintervall. Scopet avmappar reservationen vid utgång. Ett scope utan arbetsyta behåller högst 64 lediga arenor. Med arbetsyta begränsar scopets kapacitet antalet arenor.
 
 ## Fel och kompilering
 

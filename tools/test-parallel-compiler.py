@@ -201,6 +201,22 @@ fn main() { print(0) }
                     self.log[-1])
         self.contracts.append({'case': 'dead_body_order', 'first_declaration_and_following_offset': True})
 
+    def worker_expression_depth(self):
+        for depth in (42, 43):
+            expression = '1+(' * depth + '1' + ')' * depth
+            path = self.case('dead_depth_' + str(depth),
+                             f'fn unused()->i32{{{expression}}}\nfn main(){{print(42)}}\n')
+            for driver in self.drivers:
+                image = path.parent / driver[0]
+                result = self.run(self.command(driver, 'build', path, ['-o', image]),
+                                  path.parent, int(depth == 43))
+                if depth == 42:
+                    self.execute(image, 'arm64-macos', '42\n')
+                else:
+                    require(result.stderr == f'{path}:1:146: error[E1000]: expression nesting exceeds 128\n',
+                            self.log[-1])
+            self.contracts.append({'case': path.parent.name, 'expression_depth_boundary': depth})
+
     def globals_and_callback(self):
         source = self.case('globals_callback', '')
         oracle = source.parent / 'oracle.c'
@@ -286,6 +302,7 @@ def main():
             probe.matrix(probe.case(name, source), expected, bindings=True)
         probe.diagnostics()
         probe.dead_body_order()
+        probe.worker_expression_depth()
         probe.globals_and_callback()
         probe.saturation()
         probe.cache()
