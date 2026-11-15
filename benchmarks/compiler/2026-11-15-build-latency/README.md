@@ -20,3 +20,5 @@ Båda kompilatorerna byggde samma källor. Självbygget använde
 Binärerna för varje program var byteidentiska i samtliga körningar.
 Självbygget återskapade referenskompilatorn. Det genererade programmet skrev
 `595500` och Tabells resultat för `expenses.csv team cents` matchade `expected.csv`.
+
+[Fasprofil och MIR-trafik för målet en miljon rader/s](throughput.md)
