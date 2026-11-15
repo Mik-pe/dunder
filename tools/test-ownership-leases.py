@@ -122,6 +122,13 @@ def main():
         result = call(image, [], work)
         if result.stdout != '4000\n' or json.loads(result.stderr)['counters']['fresh_allocations'] > 2:
             raise AssertionError('while condition leaked its previous temporary on the backedge')
+        source.write_text('capability unsafe\n@extern("c","abs") unsafe fn c_abs(x:i32)->i32\n'
+                          'fn main(){left:="yes";choices:=["no","yes"];unsafe{'
+                          'assert(left==choices[c_abs(-1)])};print(42)}')
+        for mir in ('off', 'on'):
+            image = work / f'imported-right-{mir}'
+            call(compiler, ['build', source, '-o', image, f'--mir={mir}'], work)
+            execute(image, host, work)
         for number, (text, status) in enumerate(TRAPS):
             source.write_text(text)
             for target in (host,):

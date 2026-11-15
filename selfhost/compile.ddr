@@ -33,7 +33,7 @@ import opt_range
 import scalar_rules as rules
 import compiler_profile as profile
 import opt_alloc
-import machine_ir
+import ownership_lease as lease
 import mir
 import mir_lift
 import mir_source
@@ -101,11 +101,11 @@ struct FunctionContext {
     stream_kind: i32, current_owner: i32, unsafe_scope: bool, inline_place: bool,
     direct_place: bool, address: i32, writable: bool, scratch_place: i32, locals: locals.Table, local_slots: []i32,
     cleanup: i32, owned_slots: []i32, owned_types: []i32, owner_temps: []bool,
-    owner_elided: []bool, loop_owners: []i32, defers: deferred.Blocks, loop_defers: []i32,
+    loop_owners: []i32, defers: deferred.Blocks, loop_defers: []i32,
     in_defer: bool, defer_loop_floor: i32, reenter_owners: bool, expr_owner: i32, expr_type: i32, scope: i32,
     slots: i32, ret_type: i32, depth: i32, loop_heads: []i32, loop_ends: []i32,
-    inline_deps: fragments.Dependencies, scalar_function: bool, lease_starts: []i32,
-    lease_ends: []i32, scalar_names: []string, scalar_types: []i32, scalar_tokens: []i32,
+    inline_deps: fragments.Dependencies, scalar_function: bool, observing_lease: bool,
+    lease_generation: i64, scalar_names: []string, scalar_types: []i32, scalar_tokens: []i32,
 }
 fn new_body() -> FunctionContext {
     FunctionContext {
@@ -114,11 +114,11 @@ fn new_body() -> FunctionContext {
         places: borrows.places(), for_locks: [], taking_address: false, stream_depth: -1,
         stream_kind: 0, current_owner: 0, unsafe_scope: false, inline_place: false,
         direct_place: false, address: -1, writable: false, scratch_place: 0, locals: locals.new(), local_slots: [], cleanup: 0,
-        owned_slots: [], owned_types: [], owner_temps: [], owner_elided: [], loop_owners: [],
+        owned_slots: [], owned_types: [], owner_temps: [], loop_owners: [],
         defers: deferred.new(), loop_defers: [], in_defer: false, defer_loop_floor: 0,
         reenter_owners: false, expr_owner: -1, expr_type: -1, scope: 0, slots: 0, ret_type: 0, depth: 0,
         loop_heads: [], loop_ends: [], inline_deps: fragments.new_dependencies(),
-        scalar_function: false, lease_starts: [], lease_ends: [], scalar_names: [],
+        scalar_function: false, observing_lease: false, lease_generation: 0, scalar_names: [],
         scalar_types: [], scalar_tokens: [],
     }
 }
@@ -236,6 +236,7 @@ fn task_scope_statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_wo
     block_body(&mut c, allowed, &catalog, &mut inline_work, &mut model)
 }
 fn task_spawn(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
     at := c.body.cursor; task_use(&mut c, at); expect(&mut c, "spawn"); cap := task_capability(&mut c)
     worker_at := c.body.cursor; name := advance(&mut c); worker := i32(map.get_or(&c.world.functions, name, -1))
     if cap < 0 { return 0 }
@@ -266,6 +267,7 @@ fn task_spawn(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut o
     compound(&mut c, 22, c.world.returns[worker])
 }
 fn task_await_expression(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
     at := c.body.cursor; task_use(&mut c, at); expect(&mut c, "await")
     consume := eat(&mut c, "!"); cap := task_capability(&mut c); expect(&mut c, "(")
     key := expression(&mut c, 0, 0, &catalog, &mut inline_work, &mut model); expect(&mut c, ")")
@@ -415,6 +417,7 @@ fn owner_store(c: &mut Session, action: row.OwnerStore, ty: i32, index: i32) {
     arm.owner_store(&mut c.code, action, ty, index, source)
 }
 fn ownership_call(c: &mut Session, action: row.Ownership, ty: i32, target: i32) {
+    may_invalidate_operand(&mut c)
     if c.code.checking { return }
     // Runtime helper bodies are outside the current source function.
     var source := 0
@@ -443,27 +446,42 @@ fn take_value(c: &mut Session, ty: i32) {
     } else { copy_value(&mut c, ty) }
     c.body.expr_owner = -1; c.body.expr_type = -1
 }
-fn drop_as(c: &mut Session, action: row.Ownership, ty: i32) {
-    if ty == 4 { ownership_call(&mut c, action, ty, c.runtime.release) }
-    else if owned(&c, ty) { label := type_helper(&mut c, ty, true); ownership_call(&mut c, action, ty, label) }
+fn drop_target(c: &mut Session, ty: i32) -> i32 {
+    if ty == 4 { return c.runtime.release }
+    if owned(&c, ty) { return type_helper(&mut c, ty, true) }
+    -1
 }
-fn drop_value(c: &mut Session, ty: i32) { drop_as(&mut c, .Drop, ty) }
+fn drop_value(c: &mut Session, ty: i32) {
+    target := drop_target(&mut c, ty)
+    if target >= 0 { ownership_call(&mut c, .Drop, ty, target) }
+}
 fn remember_owner(c: &mut Session, index: i32, ty: i32, temporary: bool) {
-    c.body.owned_slots.push(index); c.body.owned_types.push(ty); c.body.owner_temps.push(temporary); c.body.owner_elided.push(false)
+    c.body.owned_slots.push(index); c.body.owned_types.push(ty); c.body.owner_temps.push(temporary)
+}
+fn clear_owner_at(c: &mut Session, index: i32, ty: i32, source: i32) {
+    target := drop_target(&mut c, ty)
+    arm.load(&mut c.code, index)
+    if target >= 0 {
+        may_invalidate_operand(&mut c)
+        arm.ownership_call(&mut c.code, target, .Clear, ty, source)
+    }
+    arm.owner_store(&mut c.code, .Vacate, ty, index, source)
 }
 fn clear_owner(c: &mut Session, index: i32, ty: i32) {
-    if c.code.checking { return }
-    arm.load(&mut c.code, index); drop_as(&mut c, .Clear, ty); owner_store(&mut c, .Vacate, ty, index)
+    if !c.code.checking { clear_owner_at(&mut c, index, ty, c.world.tokens.starts[c.body.cursor]) }
 }
-// Transfer an owned expression into a frame slot, including on loop re-entry.
 fn save_owner(c: &mut Session, index: i32, ty: i32, temporary: bool) {
     if c.code.checking { return }
     remember_owner(&mut c, index, ty, temporary)
-    // A backedge can revisit this installation while the old value is live.
+    install_owner(&mut c, index, ty, c.world.tokens.starts[c.body.cursor])
+}
+fn install_owner(c: &mut Session, index: i32, ty: i32, source: i32) {
+    // Every owner first enters as null in the function prologue. Only a
+    // backedge can revisit this installation before a previous value dies.
     if c.body.reenter_owners {
-        arm.push_temp(&mut c.code, 0); clear_owner(&mut c, index, ty); arm.pop_temp(&mut c.code, 0)
+        arm.push_temp(&mut c.code, 0); clear_owner_at(&mut c, index, ty, source); arm.pop_temp(&mut c.code, 0)
     }
-    owner_store(&mut c, .Install, ty, index)
+    arm.owner_store(&mut c.code, .Install, ty, index, source)
 }
 fn temporary(c: &mut Session, ty: i32) -> i32 {
     c.body.expr_owner = -1; c.body.expr_type = -1
@@ -473,24 +491,15 @@ fn temporary(c: &mut Session, ty: i32) -> i32 {
 fn cleanup_from(c: &mut Session, first: i32, only_temps: bool) {
     var i := c.body.owned_slots.len - 1
     while i >= first {
-        if !c.body.owner_elided[i] && (!only_temps || c.body.owner_temps[i]) { clear_owner(&mut c, c.body.owned_slots[i], c.body.owned_types[i]) }
+        if c.body.owned_slots[i] >= 0 && (!only_temps || c.body.owner_temps[i]) { clear_owner(&mut c, c.body.owned_slots[i], c.body.owned_types[i]) }
         i = i - 1
     }
 }
-// Only the extra binary-operand lease is disposable. The source value or its
-// original full-expression temporary remains an owner throughout the RHS.
-// Keep slot numbers stable; remove setup and all cleanup of this exact entry.
-fn elide_string_operand(c: &mut Session, start: i32, end: i32, owner: i32, index: i32) {
-    if start < 0 || start >= end || owner < 0 || owner >= c.body.owned_slots.len {
-        fail(&mut c, "internal ownership lease invariant"); return
-    }
-    if c.body.owned_slots[owner] != index || c.body.owned_types[owner] != 4 || !c.body.owner_temps[owner] || c.body.owner_elided[owner] {
-        fail(&mut c, "internal ownership lease invariant"); return
-    }
-    if c.body.lease_ends.len > 0 && start < c.body.lease_ends[c.body.lease_ends.len - 1] {
-        fail(&mut c, "internal ownership lease ordering"); return
-    }
-    c.body.lease_starts.push(start); c.body.lease_ends.push(end); c.body.owner_elided[owner] = true
+// The operand's existing owner is safe across local reads and arithmetic.
+// Calls, ownership changes, writes and address exposures are observed while
+// typing the RHS. Nested operands contribute to the same monotonic summary.
+fn may_invalidate_operand(c: &mut Session) {
+    if c.body.observing_lease { c.body.lease_generation = c.body.lease_generation + 1 }
 }
 fn skip_body(c: &mut Session) { expect(&mut c, "{"); c.body.cursor = c.world.closes[c.body.cursor - 1] + 1 }
 fn foreign_scalar(c: &Session, ty: i32) -> bool { ft.foreign_scalar(&c.types, ty) }
@@ -859,6 +868,7 @@ fn wasm_signature(c: &mut Session, ty: i32) -> i32 {
 // The callee address is in x0. Stage arguments in frame slots before populating
 // the independent scalar and float register banks, then the aligned stack.
 fn foreign_call(c: &mut Session, sig: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
     task_effect(&mut c, 32)
     if !c.body.unsafe_scope { fail(&mut c, "foreign call requires unsafe"); return 0 }
     callee := slot(&mut c); arm.store(&mut c.code, callee, 0)
@@ -978,6 +988,7 @@ fn raw_memory_type(c: &Session, name: string, start: i32) -> i32 {
     if ty < 0 || !foreign_scalar(&c, ty) { return -1 }; ty
 }
 fn call(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
     var covered := false
     result := call_dispatch(&mut c, name, expected, &catalog, &mut inline_work, &mut model, &mut covered)
     if c.tasks.program && c.ok && !covered { task_effect(&mut c, 4096) }
@@ -998,7 +1009,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
     }
     if name == "callback" { covered = true;
         task_effect(&mut c, 128)
-        arm.barrier(&mut c.code) // Exposes an executable address to foreign code.
+        may_invalidate_operand(&mut c) // Exposes an executable address to foreign code.
         require_unsafe(&mut c)
         symbol := advance(&mut c); expect(&mut c, ")")
         id := i32(map.get_or(&c.world.functions, symbol, -1))
@@ -1022,7 +1033,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         return foreign_type(&mut c, &params, c.world.returns[id])
     }
     if name == "static_bytes" { covered = true;
-        arm.barrier(&mut c.code) // Exposes mutable storage without a runtime call.
+        may_invalidate_operand(&mut c) // Exposes mutable storage without a runtime call.
         require_unsafe(&mut c)
         if c.world.tokens.kinds[c.body.cursor] != .String { fail(&mut c, "static storage requires a platform literal"); return 0 }
         platform := advance(&mut c); expect(&mut c, ",")
@@ -1039,7 +1050,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         static_address(&mut c, offset); arm.mov(&mut c.code, 0, 16); return 13
     }
     if name == "cstr" { covered = true;
-        arm.barrier(&mut c.code)
+        may_invalidate_operand(&mut c)
         require_unsafe(&mut c)
         if c.world.tokens.kinds[c.body.cursor] != .String { fail(&mut c, "cstr needs a string literal"); return 0 }
         value := peek(&c); for i in 0..value.len { if value[i] == 0 { fail(&mut c, "cstr contains an embedded NUL") } }
@@ -1048,7 +1059,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         arm.emit(&mut c.code, 2432704512); return 13
     }
     if name == "addr" { covered = true;
-        arm.barrier(&mut c.code)
+        may_invalidate_operand(&mut c)
         require_unsafe(&mut c); expect(&mut c, "&"); write := eat(&mut c, "mut")
         previous_address := c.body.taking_address; c.body.taking_address = true
         ty := primary(&mut c, 0, &catalog, &mut inline_work, &mut model)
@@ -1069,7 +1080,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         expect(&mut c, ")"); return 13
     }
     if name == "ptr" || name == "ffi_fn" || name == "ref_at" { covered = true;
-        arm.barrier(&mut c.code)
+        may_invalidate_operand(&mut c)
         require_unsafe(&mut c); var want := 13; if name == "ptr" { want = 12 }
         ty := expression(&mut c, 0, want, &catalog, &mut inline_work, &mut model); same(&mut c, want, ty); expect(&mut c, ")")
         if name == "ptr" { return 13 }
@@ -1082,7 +1093,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         a := expression(&mut c, 0, 13, &catalog, &mut inline_work, &mut model); same(&mut c, 13, a); expect(&mut c, ")"); transfer_c(&mut c, ty, 0, 0, true); return ty
     }
     if name.len > 6 && name[0..6] == "store_" && raw_memory_type(&c, name, 6) >= 0 { covered = true;
-        arm.barrier(&mut c.code) // Inline source write, including void intrinsics.
+        may_invalidate_operand(&mut c) // Inline source write, including void intrinsics.
         require_unsafe(&mut c); ty := raw_memory_type(&c, name, 6)
         a := expression(&mut c, 0, 13, &catalog, &mut inline_work, &mut model); same(&mut c, 13, a); expect(&mut c, ","); arm.push_temp(&mut c.code, 0)
         b := expression(&mut c, 0, ty, &catalog, &mut inline_work, &mut model); same(&mut c, ty, b); expect(&mut c, ")")
@@ -1208,6 +1219,7 @@ fn inline_rune_stream(c: &mut Session, values: i32, cursor: i32) -> bool {
     true
 }
 fn invoke(c: &mut Session, signature: i32, address: i32, f: i32, wasm_sig: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
     source_offset := c.world.tokens.starts[c.body.cursor - 1]
     if address >= 0 || wasm_sig >= 0 { task_edge(&mut c, -1) } else { task_edge(&mut c, f) }
     first := ft.type_start(&c.types, signature); count := ft.type_count(&c.types, signature)
@@ -1600,14 +1612,14 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, i
             }; result := call(&mut c, name, expected, &catalog, &mut inline_work, &mut model); c.body.address = -1; c.body.writable = false; return temporary(&mut c, result) }
         if found < 0 {
             f := i32(map.get_or(&c.world.functions, name, -1))
-            if f >= 0 && c.world.libraries[f] != "" { arm.barrier(&mut c.code); import_address(&mut c, f); return c.world.ffi_types[f] }
+            if f >= 0 && c.world.libraries[f] != "" { may_invalidate_operand(&mut c); import_address(&mut c, f); return c.world.ffi_types[f] }
         }
         if found < 0 {
             f := i32(map.get_or(&c.world.functions, name, -1))
             if f < 0 { fail(&mut c, "unknown local '" + name + "'"); c.error_at = c.world.tokens.starts[c.body.cursor - 1]; return 0 }
             if c.world.unsafe_functions[f] { fail(&mut c, "unsafe function requires a foreign function pointer"); return 0 }
             if c.loans.active { c.loans.taken[f] = true }
-            arm.barrier(&mut c.code); c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.world.ffi_types[f]
+            may_invalidate_operand(&mut c); c.needed[f] = true; arm.branch(&mut c.code, c.fn_labels[f], 20); return c.world.ffi_types[f]
         }
         fail(&mut c, "expected expression"); return 0
     }
@@ -1619,7 +1631,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.Catalog, i
         return joined_value(&mut c, result)
     }
     if eat(&mut c, "&") {
-        arm.barrier(&mut c.code) // Borrowed storage becomes visible to a receiver.
+        may_invalidate_operand(&mut c) // Borrowed storage becomes visible to a receiver.
         mutable := eat(&mut c, "mut")
         var kind := 4; if mutable { kind = 5 }
         if ft.type_kind(&c.types, expected) != kind { fail(&mut c, "use & for a shared parameter or &mut for a mutable parameter"); return 0 }
@@ -1795,6 +1807,7 @@ fn lower_place(c: &mut Session, place: i32, base: i32, access: borrows.Access) {
     }
 }
 fn method(c: &mut Session, ty: i32, name: string, place: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
     var covered := false
     result := method_dispatch(&mut c, ty, name, place, &catalog, &mut inline_work, &mut model, &mut covered)
     if c.tasks.program && c.ok && !covered { task_effect(&mut c, 4096) }
@@ -1853,7 +1866,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, catalog: 
         return compound(&mut c, 10, ft.type_base(&c.types, ty))
     }
     if ft.type_kind(&c.types, ty) == 1 {
-        arm.barrier(&mut c.code) // Includes inline clear(), not just runtime calls.
+        may_invalidate_operand(&mut c) // Includes inline clear(), not just runtime calls.
         receiver := borrows.root(&c.body.places, place)
         if receiver < 0 { fail(&mut c, "array mutation requires a stored place"); return 0 }
         if is_for_locked(&c, receiver) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
@@ -2057,24 +2070,37 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
             right := expression(&mut c, priority + 1, 3, &catalog, &mut inline_work, &mut model); same(&mut c, 3, right); bind_block(&mut c, done); ty = 3; c.body.address = -1; c.body.writable = false
         } else {
             if ty == 4 {
-                // Off/check modes need neither ownership proof nor span captures.
-                observe := c.ownership_enabled && !c.code.checking && !c.validating_dead
-                var lease_start := -1; var lease_owner := -1; var lease_end := -1; var lease_slot := -1
-                // A whole-expression temporary already owns its string through
-                // this statement. No source place can release its private slot.
-                var rhs_epoch: i64 = -1
-                if c.body.expr_owner < 0 || c.body.expr_type != ty {
-                    if observe { lease_start = c.code.words.len; lease_owner = c.body.owned_slots.len }
+                borrowed := c.body.expr_owner < 0 || c.body.expr_type != ty
+                observe := borrowed && c.ownership_enabled && !c.code.checking && !c.validating_dead
+                rhs := c.code.words.len; first_reloc := c.code.at.len; first_label := c.code.labels.len; first_import := c.imports.sites.len
+                var owner := -1; var index := -1
+                previous := c.body.observing_lease; generation := c.body.lease_generation
+                if observe {
+                    // Reserve the slot in source order. Cleanup is enabled if
+                    // this operand really needs a lease, after typing its RHS.
+                    index = slot(&mut c); owner = c.body.owned_slots.len
+                    remember_owner(&mut c, index, 4, true)
+                    c.body.observing_lease = true
+                } else if borrowed {
                     copy_value(&mut c, ty); saved_left := temporary(&mut c, ty)
-                    if observe { lease_end = c.code.words.len; lease_slot = c.body.expr_owner; rhs_epoch = arm.begin_effects(&mut c.code) }
                 }
-                // Setup itself retains/releases. Observe only the RHS, ending
-                // before the string operator or result owner invokes runtime.
                 arm.push_temp(&mut c.code, 0)
                 right := expression(&mut c, priority + 1, ty, &catalog, &mut inline_work, &mut model); same(&mut c, ty, right)
-                if rhs_epoch >= 0 {
-                    pure := arm.end_effects(&mut c.code, rhs_epoch)
-                    if c.ok && pure { elide_string_operand(&mut c, lease_start, lease_end, lease_owner, lease_slot) }
+                if observe {
+                    c.body.observing_lease = previous
+                    if c.body.lease_generation == generation {
+                        if owner == c.body.owned_slots.len - 1 {
+                            unused_slot := c.body.owned_slots.pop(); unused_ty := c.body.owned_types.pop(); unused_temp := c.body.owner_temps.pop()
+                        } else { c.body.owned_slots[owner] = -1 }
+                    }
+                    else if c.ok {
+                        setup := c.code.words.len; reloc := c.code.at.len
+                        source := c.world.tokens.starts[op_at]
+                        arm.ownership_call(&mut c.code, c.runtime.retain, .Copy, ty, source)
+                        install_owner(&mut c, index, ty, source)
+                        width := lease.insert(&mut c.code, rhs, setup, first_label, first_reloc, reloc)
+                        for i in first_import..c.imports.sites.len { c.imports.sites[i] = c.imports.sites[i] + width * 4 }
+                    }
                 }
                 arm.pop_temp(&mut c.code, 1)
             } else {
@@ -2136,7 +2162,7 @@ fn unwind_defers(c: &mut Session, floor: i32) {
         limit := c.body.defers.owner_limits[d]
         var i := cleaned_to - 1
         while i >= limit {
-            if !c.body.owner_elided[i] { clear_owner(&mut c, c.body.owned_slots[i], c.body.owned_types[i]) }
+            if c.body.owned_slots[i] >= 0 { clear_owner(&mut c, c.body.owned_slots[i], c.body.owned_types[i]) }
             i = i - 1
         }
         cleaned_to = limit
@@ -2753,7 +2779,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &
     if eat(&mut c, "=") || compound_op != "" {
         lhs := model.value
         if compound_op != "" { skip_token(&mut c) }
-        arm.barrier(&mut c.code) // Source assignment is an effect even for scalars.
+        may_invalidate_operand(&mut c) // Source assignment is an effect even for scalars.
         var destination := c.body.address; var direct := c.body.direct_place; writable := c.body.writable; packed := c.body.inline_place; scratch_target := c.body.scratch_place
         if ft.type_kind(&c.types, ty) == 21 || ft.type_kind(&c.types, ty) == 20 { fail(&mut c, "scratch bindings cannot be reassigned"); return false }
         if destination < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
@@ -3154,7 +3180,7 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
         var policy := identity
         if policy != "" {
             if scalar_enabled { policy = policy + ":scalar:on" } else { policy = policy + ":scalar:off" }
-            if config.ownership_enabled { policy = policy + ":ownership3:on" } else { policy = policy + ":ownership3:off" }
+            if config.ownership_enabled { policy = policy + ":ownership4:on" } else { policy = policy + ":ownership4:off" }
             policy = policy + ":" + record_take.policy_tag()
             if config.const_div_enabled { policy = policy + ":const-div:on" } else { policy = policy + ":const-div:off" }
             if config.frame_free_enabled { policy = policy + ":frame-free:on" } else { policy = policy + ":frame-free:off" }
@@ -3185,13 +3211,13 @@ pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: 
 }
 pub fn compile_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string, config: &Configuration) -> Result {
     var record_takes := record_take.new(); var scalar_model := opt_ir.new(); var scalar_work := opt_verify.new()
-    var scalar_plan := opt_alloc.new(); var range_work := opt_range.new(); var machine_work := machine_ir.new()
+    var scalar_plan := opt_alloc.new(); var range_work := opt_range.new()
     var emit_settings := opt_emit.options(); var catalog := opt_inline.new(); var inline_work := opt_inline.workspace()
     if !begin_loaded(&mut c, platform, &module_starts, &module_files, check_all, report, directory, identity, &config,
         &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes) { return session_error(&c) }
     if check_all {
-        check_sources(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work)
-        return session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
+        check_sources(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work)
+        return session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
     }
     var function := mir.new(); var object := mir_lower.new_object(); var lifter := mir_lift.new_work(); var link := mir_link.new()
     var restored := fragments.new_dependencies(); var options := mir_pipeline.options(); var exits := mir_pipeline.no_terminals()
@@ -3201,7 +3227,7 @@ pub fn compile_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, mod
         var backend := mir_pipeline.new()
         while c.ok {
             step := next_into(&mut c, &mut function, &mut object, &mut lifter, &mut scalar_model, &mut scalar_work,
-                &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut restored)
+                &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut restored)
             if step <= 0 { break }
             var status := mir_pipeline.Status { error: 0, frame_state: 0, value_state: 0, stats: mir_pipeline.stats() }
             if step == 1 {
@@ -3215,7 +3241,7 @@ pub fn compile_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, mod
         var core := mir_pipeline.new_core()
         while c.ok {
             step := next_into(&mut c, &mut function, &mut object, &mut lifter, &mut scalar_model, &mut scalar_work,
-                &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut restored)
+                &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut restored)
             if step <= 0 { break }
             var status := mir_pipeline.Status { error: 0, frame_state: 0, value_state: 0, stats: mir_pipeline.stats() }
             if step == 1 {
@@ -3226,11 +3252,11 @@ pub fn compile_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, mod
             if !accept_into(&mut c, &mut link, ordinal, &object, &status) { break }
         }
     }
-    finish(&mut c, &mut link, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings,
+    finish(&mut c, &mut link, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings,
         &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
 }
 fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace,
-    scalar_plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options,
+    scalar_plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options,
     range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace,
     records: &mut Bindings, record_takes: &mut record_take.Plan) -> Result {
     // Runtime is a scalar-only ABI record; this bounded copy is not an arena.
@@ -3246,7 +3272,7 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
     c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
     c.imports.globals = 0
     for f in 0..c.world.names.len {
-        if !c.jobs.compiled[f] && c.world.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work) }
+        if !c.jobs.compiled[f] && c.world.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work) }
         if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
     }
     if c.loans.active {
@@ -3312,7 +3338,7 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
 // Check-only preserves the existing reachable-function validation order, but
 // never constructs backend arenas, captures machine spans or enters lowering.
 fn check_sources(c: &mut Session, scalar_model: &mut opt_ir.Function,
-    scalar_work: &mut opt_verify.Workspace, scalar_plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace,
+    scalar_work: &mut opt_verify.Workspace, scalar_plan: &mut opt_alloc.Plan,
     emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
     var more := true
     while c.ok && more {
@@ -3320,7 +3346,7 @@ fn check_sources(c: &mut Session, scalar_model: &mut opt_ir.Function,
         for f in 0..c.world.names.len {
             if !c.ok { break }; if !c.needed[f] || c.jobs.compiled[f] || c.world.libraries[f] != "" { continue }
             c.jobs.compiled[f] = true; more = true
-            compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work)
+            compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work)
         }
     }
 }
@@ -3329,7 +3355,7 @@ fn check_sources(c: &mut Session, scalar_model: &mut opt_ir.Function,
 // objects (2) are already final. Zero is exhaustion and -1 a diagnostic.
 pub fn next_source_into(c: &mut Session, object: &mut mir_lower.FunctionObject,
     scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace,
-    scalar_plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options,
+    scalar_plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options,
     range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace,
     restored_deps: &mut fragments.Dependencies) -> i32 {
     if !c.ok { return -1 }; if c.jobs.phase == 2 { return 0 }
@@ -3383,7 +3409,7 @@ pub fn next_source_into(c: &mut Session, object: &mut mir_lower.FunctionObject,
         }
         c.bindings.emitted = c.bindings.emitted + 1
         arm.begin_mir(&mut c.code, c.mir_enabled)
-        compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work)
+        compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work)
         arm.end_mir(&mut c.code)
         if !c.ok { c.jobs.error_ordinal = c.jobs.declarations.len; c.jobs.phase = -1; return -1 }
         eligible := fingerprint != "" && !c.has_callbacks && c.strings.len == strings_before &&
@@ -3420,11 +3446,11 @@ pub fn capture_current(c: &mut Session, batch: &mut mir_source.Batch) -> bool {
 // Serial callers receive a lifted function from exactly the same emission.
 pub fn next_into(c: &mut Session, function: &mut mir.Function, object: &mut mir_lower.FunctionObject,
     lifter: &mut mir_lift.Workspace, scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace,
-    scalar_plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options,
+    scalar_plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options,
     range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace,
     restored_deps: &mut fragments.Dependencies) -> i32 {
     state := next_source_into(&mut c, &mut object, &mut scalar_model, &mut scalar_work,
-        &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog,
+        &mut scalar_plan, &emit_settings, &mut range_work, &catalog,
         &mut inline_work, &mut restored_deps)
     if state != 1 { return state }
     ordinal := current_ordinal(&c)
@@ -3513,7 +3539,7 @@ pub fn accept_into(c: &mut Session, link: &mut mir_link.Linker, ordinal: i32,
     true
 }
 pub fn finish(c: &mut Session, link: &mut mir_link.Linker, scalar_model: &mut opt_ir.Function,
-    scalar_work: &mut opt_verify.Workspace, scalar_plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace,
+    scalar_work: &mut opt_verify.Workspace, scalar_plan: &mut opt_alloc.Plan,
     emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog,
     inline_work: &mut opt_inline.Workspace, records: &mut Bindings, record_takes: &mut record_take.Plan) -> Result {
     if !c.ok { return session_error(&c) }
@@ -3531,7 +3557,7 @@ pub fn finish(c: &mut Session, link: &mut mir_link.Linker, scalar_model: &mut op
     // source/runtime/clone emitters add no later record-take dependencies.
     for r in 0..c.code.target.len { requested := record_take.request_label(&mut record_takes, c.code.target[r]) }
     c.jobs.phase = 3
-    session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings,
+    session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings,
         &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
 }
 
@@ -3567,7 +3593,7 @@ fn inline_candidate(c: &Session, f: i32) -> bool {
 fn inline_catalog(c: &mut Session, catalog: &mut opt_inline.Catalog, model: &mut opt_ir.Function,
     work: &mut opt_verify.Workspace, range_work: &mut opt_range.Workspace, source_digests: bool) {
     var remaining := 32768
-    var machine_work := machine_ir.new(); var inline_work := opt_inline.workspace()
+    var inline_work := opt_inline.workspace()
     // Declaration order makes both admission and budget exhaustion reproducible.
     // The token budget covers the structural refusal walk as well as parsing,
     // independently of the catalog's verified-node budget. Refused models
@@ -3582,7 +3608,7 @@ fn inline_catalog(c: &mut Session, catalog: &mut opt_inline.Catalog, model: &mut
         // Resolve each prospective expression with the same binder, literal
         // widths, expression parser and return checks as its out-of-line body.
         // The identifier gate above confines this probe to parameter reads.
-        if !typed_body_into(&mut c, f, &mut model, &mut machine_work, &catalog, &mut inline_work) {
+        if !typed_body_into(&mut c, f, &mut model, &catalog, &mut inline_work) {
             // Diagnose the first invalid declaration in normal source traversal order.
             c.ok = true; c.error = ""; c.error_at = 0; opt_inline.reject(&mut catalog, f); continue
         }
@@ -3705,12 +3731,12 @@ fn emit_scalar(c: &mut Session, f: i32, model: &opt_ir.Function, plan: &mut opt_
 fn reset_body(body: &mut FunctionContext) {
     body.task_handles.clear(); body.loop_task_locals.clear()
     locals.clear(&mut body.locals); body.local_slots.clear()
-    body.owned_slots.clear(); body.owned_types.clear(); body.owner_temps.clear(); body.owner_elided.clear(); body.mutations.clear()
+    body.owned_slots.clear(); body.owned_types.clear(); body.owner_temps.clear(); body.mutations.clear()
     borrows.clear(&mut body.places)
     body.for_locks.clear(); body.taking_address = false
     deferred.reset(&mut body.defers); body.loop_defers.clear()
     body.in_defer = false; body.defer_loop_floor = 0
-    body.lease_starts.clear(); body.lease_ends.clear()
+    body.observing_lease = false; body.lease_generation = 0
     body.loop_heads.clear(); body.loop_ends.clear(); body.loop_owners.clear()
     body.scratch_returns.clear()
     body.expr_owner = -1; body.expr_type = -1; body.address = -1
@@ -3721,7 +3747,7 @@ fn reset_body(body: &mut FunctionContext) {
 // Collect the resolved body before optimization. A declined operation leaves
 // the session ready for ordinary lowering. A source diagnostic belongs to
 // session_error. The caller supplies the same arenas used by the scheduler.
-pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function, machine_work: &mut machine_ir.Workspace,
+pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function,
     catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> bool {
     if !c.ok || c.code.checking || f < 0 || f >= c.world.returns.len || c.world.libraries[f] != "" { return false }
     if c.world.test_functions[f] || c.world.unsafe_functions[f] || c.world.returns[f] > 3 || c.world.param_counts[f] > 8 { return false }
@@ -3729,7 +3755,7 @@ pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function, mac
     capture := c.code.mir_capture; reporting := c.report
     c.code.checking = true; c.code.mir_capture = false; c.report = false
     c.code.virtual_words = 0; c.code.virtual_labels = c.code.labels.len
-    walk_body(&mut c, f, &mut model, &mut machine_work, &catalog, &mut inline_work)
+    walk_body(&mut c, f, &mut model, &catalog, &mut inline_work)
     c.code.checking = false; c.code.mir_capture = capture; c.report = reporting
     model.probing = false
     if !model.recording {
@@ -3741,7 +3767,7 @@ pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function, mac
     model.root = model.value; model.supported = true
     true
 }
-fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
+fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
     ft.reset_body(&mut c.types)
     c.tasks.current = f; c.body.reenter_owners = false
     if c.tasks.program && c.world.unsafe_functions[f] { task_effect(&mut c, 16) }
@@ -3765,17 +3791,17 @@ fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut
         opt_templates.observe(&mut c.scalar_templates, c.world.starts[f] - 1, c.world.ends[f])
     }
     if !eligible {
-        walk_body(&mut c, f, &mut model, &mut machine_work, &catalog, &mut inline_work)
+        walk_body(&mut c, f, &mut model, &catalog, &mut inline_work)
         if c.tasks.program && c.ok { c.tasks.complete[f] = true }
         return
     }
 
-    if !typed_body_into(&mut c, f, &mut model, &mut machine_work, &catalog, &mut inline_work) {
+    if !typed_body_into(&mut c, f, &mut model, &catalog, &mut inline_work) {
         if !c.ok { return }
         // An optional pass budget or unsupported operation must never narrow
         // the language. This walk owns no real labels, words, or bindings.
         c.bindings.fallbacks = c.bindings.fallbacks + 1
-        walk_body(&mut c, f, &mut model, &mut machine_work, &catalog, &mut inline_work)
+        walk_body(&mut c, f, &mut model, &catalog, &mut inline_work)
         if c.tasks.program && c.ok { c.tasks.complete[f] = true }
         return
     }
@@ -3786,17 +3812,15 @@ fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut
     c.body.scalar_function = true
     emit_scalar(&mut c, f, &model, &mut plan, &emit_settings)
 }
-fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, machine_work: &mut machine_ir.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
+fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
     if c.inline_enabled { fragments.reset_dependencies(&mut c.body.inline_deps) }
     var started: i64 = -1
     if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
     reset_body(&mut c.body)
-    first_word := arm.position(&c.code); first_label := arm.label_count(&c.code)
-    first_reloc := c.code.at.len; first_import := c.imports.sites.len
     c.body.current_owner = c.world.function_owners[f]
     c.body.testing = c.world.test_functions[f]
     c.body.unsafe_scope = c.world.unsafe_functions[f]
-    c.body.block_base = first_label; c.body.cleanup = new_block(&mut c)
+    c.body.block_base = arm.label_count(&c.code); c.body.cleanup = new_block(&mut c)
     c.body.slots = 0; c.body.scope = 0; c.body.ret_type = c.world.returns[f]; c.body.cursor = c.world.starts[f] - 1
     arm.mark(&mut c.code, c.fn_labels[f]); frame := arm.prologue(&mut c.code)
     first := c.world.param_starts[f]
@@ -3819,21 +3843,9 @@ fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, machine_work:
     cleanup_from(&mut c, 0, false); arm.pop_temp(&mut c.code, 0); arm.ret(&mut c.code)
     arm.mark(&mut c.code, initialize)
     for t in 0..c.body.task_handles.len { arm.store(&mut c.code, c.body.task_handles[t], 31) }
-    for o in param_owners..c.body.owned_slots.len { if !c.body.owner_elided[o] { owner_store(&mut c, .Initialize, c.body.owned_types[o], c.body.owned_slots[o]) } }
+    for o in param_owners..c.body.owned_slots.len { if c.body.owned_slots[o] >= 0 { owner_store(&mut c, .Initialize, c.body.owned_types[o], c.body.owned_slots[o]) } }
     arm.branch(&mut c.code, body, 0)
     if c.ok { arm.frame(&mut c.code, frame, c.body.slots) }
-    if c.ok && c.body.lease_starts.len > 0 {
-        machine_ir.reset(&mut machine_work)
-        for i in 0..c.body.lease_starts.len {
-            if !machine_ir.add_range(&mut machine_work, c.body.lease_starts[i], c.body.lease_ends[i]) { fail(&mut c, "internal ownership rewrite range") }
-        }
-        if c.ok && !machine_ir.prepare(&mut machine_work, &c.code, first_word, first_label, first_reloc, &c.imports.sites, first_import) {
-            fail(&mut c, "internal ownership rewrite validation")
-        }
-        // Failure is a compilation error: restoring only setup would leave
-        // elided owner slots without initialization or balanced cleanup.
-        if c.ok { machine_ir.commit_code(&mut machine_work, &mut c.code); machine_ir.commit_imports(&mut machine_work, &mut c.imports.sites) }
-    }
     if c.bindings.profile.enabled {
         var phase := 7
         if model.probing { phase = 1 }
@@ -4134,22 +4146,6 @@ fn inline_budget_test_source(first_count: i32) -> string {
     }
 }
 
-@test fn ownership_compaction_keeps_direct_frame_operations_and_wide_literals_whole() {
-    var code := arm.new(); arm.begin_mir(&mut code, true); arm.imm(&mut code, 0, 9223372036854775807)
-    first := arm.position(&code)
-    arm.load(&mut code, 620); arm.store(&mut code, 621, 31); arm.address(&mut code, 621)
-    none: []i32 = []; var sites: []i32 = []; var work := machine_ir.new()
-    assert(machine_ir.add_range(&mut work, 0, 1))
-    assert(!machine_ir.prepare(&mut work, &code, 0, 0, 0, &none, 0))
-    assert(code.words.len == 5 && first == 2)
-    machine_ir.reset(&mut work); assert(machine_ir.add_range(&mut work, first, first + 1))
-    assert(machine_ir.prepare(&mut work, &code, 0, 0, 0, &none, 0))
-    machine_ir.commit_code(&mut work, &mut code); machine_ir.commit_imports(&mut work, &mut sites); arm.end_mir(&mut code)
-    var function := mir.new()
-    assert(mir_lift.lift(&mut function, &code, 0, 0, 0, &none, 0) && mir_verify.verify(&mut function))
-    assert(function.raw.len == 0 && function.imm[0] == 9223372036854775807)
-    assert(function.kinds[1] == 8 && function.a[1] == -1 && function.kinds[2] == 9)
-}
 @test fn all_emitted_source_functions_use_mir_without_changing_diagnostics_or_bindings() {
     none: []i32 = []
     for platform in 0..4 {

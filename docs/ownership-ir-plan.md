@@ -1,7 +1,7 @@
 # Nästa steg för ägarlivslängder
 
-Strängoperandpasset och `machine_ir` är implementerade. Detta är planen för
-nästa generella steg; analysen nedan är ännu inte implementerad eller mätt.
+Den typade strängoperandvägen är implementerad. Analysen nedan av
+tom cleanup vid funktionens olika utgångar återstår.
 Målet är att minska bevisat tom cleanup utan att ändra livslängder,
 värdesemantik, fällordning eller språkets diagnostik.
 
@@ -12,8 +12,8 @@ nästa arkitekturleverans.
 
 ## En liten representation för ägarhändelser
 
-Behåll `machine_ir` som den enda komponent som ändrar instruktioner och
-adresser. Lägg ägarhändelser bredvid instruktionsströmmen. En ägaridentitet
+Använd de typade kopierings-, överförings-, installations- och
+städoperationerna som finns i funktionsströmmen. En ägaridentitet
 pekar på typ och frameplats; samma plats återanvänds inte för andra ägare
 inom funktionen. Händelserna har ordgräns och stabil inbördes ordning.
 
@@ -75,11 +75,9 @@ Behåll laddningen och nollskrivningen, så att `x0` fortfarande är noll efter
 cleanup. Verifiera även register-/flaggkontraktet; ta bort resten av
 spannet först när registerliveness finns beskriven.
 
-Sammanfoga nya intervall med leaseintervallen och gör en enda atomisk
-`machine_ir.prepare` följd av commits. Budgetstopp kastar bara det nya
-passets kandidater. Leaseintervallen måste fortfarande färdigställas,
-eftersom deras initiering och cleanup redan har utelämnats av frontend.
-Brutna metadata är ett internt fel, inte ett tyst återfall.
+Verifiera omskrivningen innan den publiceras i MIR. Ett budgetstopp ska
+behålla den verifierade funktionen. Strängoperandernas ägarbeslut har då
+redan tagits av frontend.
 
 Återanvänd block-, kant-, worklist- och tillståndsarrayer mellan funktioner.
 Begränsa antal tillståndsceller och debitera verkligt arbete för händelser,

@@ -734,46 +734,26 @@ nytt aritmetikbevis med obegränsad heltalsmatematik före vanlig overflow-hante
 Det är ett fryst ändligt testdomänprov, inte ett formellt bevis för alla
 program. Bränslestopp ger ofullständig täckning och icke godkänd körning.
 
-## Ägarlivslängder och verifierade funktionsomskrivningar
+## Ägarlivslängder för strängoperander
 
-Den fulla frontendens strängoperatorer skapar normalt en extra temporär
-ägare för vänsteroperanden. Den behövs om högerledet kan ersätta eller
-frigöra den ursprungliga ägaren. Om hela högerledet saknar anrop,
-källskrivningar och adress-/låneexponering kan operatorn i stället låna
-det redan levande värdet. Regeln gäller samma språkstruktur i alla moduler.
+En sträng som redan ägs av vänsterledets fulluttryckstemporär lever tills
+uttrycket är färdigt. För en lånad sträng observerar den gemensamma
+frontendens typning vilka anrop, ägarändringar, skrivningar och
+adressexponeringar högerledet kan utföra. Nästlade uttryck bidrar till samma
+effektsammanfattning.
 
-Effektobservationen börjar efter vänsteroperandens extra setup och slutar
-före själva operatorn och dess resultatägare. Nästlade observationer
-behåller yttre bevisets barriärer. Direkta och indirekta anrop,
-systemanrop, målens värdanrop samt explicita skrivningar eller exponeringar
-bryter beviset. Instruktionsklassificeringen körs bara när ett sådant bevis
-är aktivt. Kontrolläge och oanropade kroppars kontroll bygger inga editplaner.
+När högerledet kan ersätta den ursprungliga ägaren läggs en kopiering och
+installation av en extra ägare före högerledet. En rak kodväg installerar
+ägaren i en nollställd plats. I ett loopvillkor eller en loopkropp kan
+platsen fortfarande innehålla ett värde från förra varvet och städas först.
+När högerledet lämnar ägaren orörd används den befintliga referensen.
+Funktionsbygget förbereder en extra ägare bara när typningen har visat att
+den behövs. [Infogning av ägarhändelser](../selfhost/ownership_lease.ddr)
 
-Endast den extra ägarplatsen markeras borttagen; ursprungliga lokaler,
-parametrar och fulluttryckets andra temporärer behåller sina livslängder.
-Samtliga framtida cleanup-vägar och prologens nollställning hoppar över
-den markerade platsen. Platsnummer och frame-layout är stabila.
-
-[`machine_ir`](../selfhost/machine_ir.ddr) beskriver validerade redigeringar
-i en funktions ofärdiga instruktionsström. Det är ett begränsat maskin-IR,
-med befintliga etiketter och symboliska relokeringar, inte en ny semantisk
-parser. Först valideras hela editplanen och en karta för alla ordgränser.
-Hela instruktioner och relokeringspar tas sedan bort på riktigt; överlevande
-etiketter, relokeringar och importernas byteadresser korrigeras. Delade par,
-överlapp och borttagna importposter avvisas. Omarkerade data- och
-callbacketiketter bevaras för bildfinaliseringen.
-
-Valideringen är atomisk och begränsad till den aktuella funktionens suffix;
-tidigare funktioner skannas inte om. Arbetsminnet återanvänds. Ett brutet
-internt bevis ger kompilatorfel före cachelagring eller publicering. Ett
-halvt återfall med borttagen cleanup och kvarvarande setup är inte tillåtet.
-
-`--ownership-opt=off` stänger av denna ägaroptimering oberoende av
-`--scalar-opt=off`. Både kodfragment och berörda testkvitton skiljer lägena åt.
-`tools/test-ownership-leases.py` jämför resultat, diagnostik och bindningar
-för båda lägena på alla mål; native och Wasm provar också mutation under
-högerledet, fällordning och upprepad körning med samma linjära minne.
-`tools/test_machine_ir.ddr` provar kompakteringen separat.
+`--ownership-opt=off` behåller lånade strängoperander före varje högerled.
+`tools/test-ownership-leases.py` jämför diagnostik och bindningar, mäter
+referensräkningen och kontrollerar mutation, tidiga returer, fällordning och
+återanvändning av ägarplatser i loopar.
 
 ## Unika recordtemporärer
 
