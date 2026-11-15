@@ -160,8 +160,17 @@ ARM64/macOS. Standardingången använder fyra workers; `--jobs N` eller
 trådar, även vid korskompilering till Linux eller Wasm. Ett kompilerat
 programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
-Byggsamordnaren äger symboler, nåbarhetsordning, imports och inlinebudget.
-När nåbarheten är känd uppskattar den återstående typkontrollen från
+Byggsamordnaren äger symboler, nåbarhetsordning och imports. Vid rena byggen
+kan den skicka redan nåbara funktioner till arbetarna medan tidigare
+funktionsobjekt sänks. Varje jobb får bara sin funktions token. Deklarerade
+typer och signaturer delas genom en fryst bild och varje worker återanvänder
+sin egen session. Samordnaren tar emot typade resultat i samma ordning som
+den seriella genomgången och binder deras anrop, effekter och symbolbehov.
+`--timings=json` redovisar hur många skalära och generella kroppar som
+arbetarna typade och hur många frontend-arbetsytor som användes.
+[Frontendarbetare](../selfhost/frontend_tasks.ddr)
+
+När nåbarheten är känd uppskattar samordnaren återstående typkontroll från
 deklarationernas redan kända tokenspann och antalet kroppar. Med en worker
 eller liten återstående arbetsmängd kontrolleras dessa kroppar direkt i
 samordnarens session. Vid tillräckligt oberoende arbete delar arbetarna
@@ -182,8 +191,7 @@ relokeringar och import-site-ID:n före ordnad acceptans. Strukturell
 validering certifierar inte godtyckliga maskinords semantik: resultatet
 måste dessutom höra till exakt det utlämnade jobbet i samma taskscope,
 ordinal och deklaration. Föräldern kör ingen andra sänkning; den äger cache,
-ordnad länkning och slutlig bildpublicering. Frontend och typning är
-fortfarande seriella hos Session-ägaren.
+ordnad länkning och slutlig bildpublicering.
 
 Cacheträffar lämnar redan färdiga objekt utan ny MIR-verifiering eller
 optimering. Cacheformat och objektstruktur valideras fortfarande. Beroenden och budgetdebitering återspelas i samma ordning

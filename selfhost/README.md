@@ -68,7 +68,10 @@ Samordnaren tar över objekten med `await!` och länkar dem i ordning.
 [Funktionsformat](mir_source.ddr) och [arbetarsvar](mir_task.ddr).
 
 Ett task-scope kan dela en fryst numerisk deklarationsbild och ge varje
-worker en egen återanvändbar arbetsyta. Kontrollen av oåtkomliga kroppar
+worker en egen återanvändbar arbetsyta. Den taskbaserade ingången kan typa
+flera nåbara funktioner samtidigt. Den läser arbetarnas resultat i
+deklarationernas ordning inom varje genomgång och uppdaterar nåbarhet
+och symboler innan nästa funktion publiceras. Kontroll av oåtkomliga kroppar
 använder språkets vanliga typkontroll och rapporterar första felet i
 deklarationsordning. [Taskkontrakt](../docs/tasks.md) och
 [byggmätningar](../benchmarks/compiler/2026-11-15-function-pipeline-load/README.md).
