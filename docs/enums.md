@@ -78,8 +78,11 @@ Enums ger ingen ny allokerare eller ägar-/lånemodell.
 
 ## Kontrollflöde med match
 
-`match` prövar armarna uppifrån och ned. Uttrycket efter `match`
-utvärderas en gång och den första arm vars hela mönster passar körs.
+`match` utvärderar sitt argument en gång och prövar armarna uppifrån
+och ned. Ett mönster kan följas av `if` och ett villkor av typen `bool`.
+Villkoret prövas en gång när hela mönstret passar och kan använda armens
+payload-bindningar. Vid `true` körs armen. Vid `false` fortsätter matchningen
+med nästa arm.
 En variant som innehåller en annan enum kan matchas på båda nivåerna i
 samma mönster.
 
@@ -88,7 +91,8 @@ import sys
 
 fn beskriv(resultat: sys.ReadResult) -> string {
     match resultat {
-        .Ok(text) => text,
+        .Ok(text) if text.len > 0 => text,
+        .Ok(_) => "tom fil",
         .Err(.NotFound) => "filen saknas",
         .Err(.Other(kod)) => "systemfel " + kod.str(),
         .Err(fel) => sys.io_error_message(fel),
@@ -97,6 +101,7 @@ fn beskriv(resultat: sys.ReadResult) -> string {
 
 fn main() {
     print(beskriv(.Ok("hej")))          // hej
+    print(beskriv(.Ok("")))             // tom fil
     print(beskriv(.Err(.NotFound)))     // filen saknas
     print(beskriv(.Err(.Other(123))))   // systemfel 123
 }
@@ -105,11 +110,14 @@ fn main() {
 I `.Err(.Other(kod))` bestämmer payloadtypen `sys.IoError` vad
 `.Other` betyder. Namnet `kod` binder ett oföränderligt `i32` i armen.
 `.Err(fel)` binder hela felvärdet för de fel som återstår. `.Err(_)`
-täcker samma fall och kastar bort payloaden. Ett ensamt `_` på yttersta
-nivån täcker alla återstående fall och måste stå sist.
+täcker samma fall och kastar bort payloaden. Även nästlade mönster
+som `.Err(.Other(kod)) if kod > 0`, varianter utan payload och `_`
+kan ha villkor. Ett ensamt `_` utan villkor täcker alla återstående fall
+och måste stå sist.
 
-Kompilatorn kontrollerar att mönstren tillsammans täcker alla möjliga
-kombinationer av varianter. Om en variant har två enumpayloads måste
+Kompilatorn kräver att armarna utan villkor tillsammans täcker alla möjliga
+kombinationer av varianter. Detta gäller även när ett villkor är `if true`.
+Om en variant har två enumpayloads måste
 även kombinationerna av deras värden täckas. Armar får överlappa när den
 senare armen fortfarande kan träffa ett nytt fall. Flyttas `.Err(fel)`
 före `.Err(.NotFound)` blir den specifika armen onåbar och bygget avvisas.
@@ -194,7 +202,7 @@ Data-enums kan vara structfält och innehålla andra aggregat, inklusive
 dynamiska arrayer och andra data-enums. Arrayelement är fortfarande begränsade
 till skalärer och enums utan payload. Ett enumvärde får vara högst
 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
-generiska `Result<T>`/`Option<T>`, `?`, mönsterguards, alternativa
+generiska `Result<T>`/`Option<T>`, `?`, alternativa
 mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja
 payload eller en textrepresentation. [sys](sys.md) använder redan konkreta
 `ReadResult` och `IoError` utan generics.
