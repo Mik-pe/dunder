@@ -60,6 +60,8 @@ implementeras i [native-backenden](../selfhost/runtime_sys.ddr).
 | `sys.make_executable(path)` | `sys.Status` | Sätter läge 0755; används för färdigbyggda program. |
 | `sys.now_ms()` | `i64` | Monoton klocka i millisekunder. |
 | `sys.sleep_ms(ms)` | `()` | Pausar aktuell tråd minst `ms` millisekunder. |
+| `unsafe sys.envp()` | `ptr` | Startpekare till processens `envp`-vektor från startstacken på Linux (`null` på macOS). |
+| `unsafe sys.linux_syscall(nr, a0..a5)` | `i64` | Rått Linux-systemanrop via ARM64-kanoniskt anropsnummer (`nr: i64, a0..a5: i64`; översätts automatiskt på `x86_64-linux`). |
 
 Samtliga sökvägar och textargument har typen `string`. `read` använder enums:
 
@@ -208,7 +210,11 @@ Implementationens syscallnummer och stat-layout är verifierade mot
 [Apples XNU-anrop](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master)
 och [stat-definitioner](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stat.h),
 samt tidigare macOS-körningar. Linux använder direkta systemanrop och respektive
-arkitekturs stat-layout. Se [målplattformarnas verifiering](targets.md).
+arkitekturs stat-layout; `sys.linux_syscall` tar Linux ARM64-kanoniska
+systemanropsnummer (som mappas om till x86-64 i x86-backend och returnerar
+`-38` för okända nummer på Linux samt `-78` på macOS) och `sys.envp` läser den
+`envp`-pekare som startkoden bevarar efter `argv` på Linux-stacken. Se
+[målplattformarnas verifiering](targets.md).
 Systemanropen är en plattformsdetalj som anpassas per mål.
 Binärläsning, kataloglistning, rekursiva katalogverktyg,
 strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.

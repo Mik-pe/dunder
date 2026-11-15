@@ -48,12 +48,13 @@ dunder test
 ```
 
 För att installera kompilatorn lokalt i `~/.dunder/bin/dunder` (välj annan rot med
-`DUNDER_HOME`):
+`DUNDER_HOME`) och senare uppgradera från GitHub Releases:
 
 ```sh
 ./tools/install.sh
 export PATH="$HOME/.dunder/bin:$PATH"
 dunder --version
+dunder upgrade --check
 ```
 
 Efter installationen visar `dunder upgrade --check` om den senaste

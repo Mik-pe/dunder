@@ -88,7 +88,11 @@ På Wasm blir de nåbara funktionerna riktiga Wasm-funktioner, med
 strukturhopp mellan grundblocken och direktanrop mellan funktioner.
 
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
-dynamisk laddare eller libc. Nåbara `@extern`-deklarationer ger en dynamisk
+dynamisk laddare eller libc. Compile-time-predikatet `target_is("...")` i
+`if`/`else if`-grenar utvärderas vid kompilering och hoppar över onåbara
+grenar innan `@extern`-symboler registreras; exempelvis bygger `std.process`
+statiska ELF-binärer på Linux via `sys.linux_syscall` och `sys.envp` utan
+`libc` eller `libdl`. Nåbara `@extern`-deklarationer ger en dynamisk
 ELF med deklarerade bibliotek och symboler, separata RX/RW-segment och
 målets C-ABI. Vulkanexemplet använder dessa importer för att ladda och
 anropa grafiken. Vulkan-körning med lavapipe är verifierad på både

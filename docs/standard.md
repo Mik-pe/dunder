@@ -96,10 +96,10 @@ flyttar återstår. Ägda allokeringar återvinns automatiskt; se
 | `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`parse_bytes`, `parse_text`, `field`, `at`, `get_str`, `get_i64`, `get_u64`, `get_bool`). |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
-| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms` och process-ID; se [sys](sys.md). |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag samt katalog- och filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
-| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command`, `run`, `run_in`, `status`, `exec`, `spawn` (`Child` och `ChildSet` för parallella processpooler med icke-blockerande `poll`/pipes, `read_stdout_line`, `terminate`, `kill`, `wait`), delegerade `Executable`-handtag (`grant`, `run_granted`) samt miljö- och värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). |
+| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command`, `run`, `run_in`, `status`, `exec`, `spawn` (`Child` och `ChildSet` för parallella processpooler med icke-blockerande `poll`/pipes, `read_stdout_line`, `terminate`, `kill`, `wait`), delegerade `Executable`-handtag (`grant`, `run_granted`) samt miljö- och värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel

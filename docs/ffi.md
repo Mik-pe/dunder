@@ -68,6 +68,16 @@ avslutas. Längden är en heltalsliteral mellan en byte och 16 MiB.
 Ett modultillstånd kan läggas bakom en privat funktion som alltid returnerar
 samma områdesadress. Anroparen ansvarar för samtidighet.
 
+För plattformsspecifik kod som väljs statiskt finns compile-time-uttrycket
+`target_is("...")` i `if`/`else if`-villkor (med `!`, `&&`, `||` och
+parenteser), där giltiga namn är `"macos"`, `"arm64-macos"`,
+`"aarch64-apple-darwin"`, `"linux"`, `"arm64-linux"`,
+`"aarch64-unknown-linux-gnu"`, `"x86_64-linux"`,
+`"x86_64-unknown-linux-gnu"`, `"arm64"`, `"x86_64"`, `"native"`, `"wasm32"`
+och `"wasm32-unknown-unknown"`. Onåbara grenar hoppas över före typkontroll
+och importregistrering, så `@extern`-anrop i en `target_is("macos")`-gren
+skapar inga dynamiska beroenden vid Linux-kompilering.
+
 `std.dl.open`, `std.dl.symbol` och `std.dl.close` tar och returnerar C-API:ets
 egna råvärden. Kontrollera laddarens resultat. Behåll bibliotekshandtaget så
 länge någon kan anropa dess funktioner.
