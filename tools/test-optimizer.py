@@ -33,6 +33,32 @@ def positive_cases():
     arithmetic += 'fn main(){' + ';'.join(calls) + '}\n'
     yield 'arithmetic', arithmetic, expected
 
+    updates = """fn bump(x:i64)->i64{
+        var v:=x; v=2+v; v=v-(-3); v=v+4; return v
+    }
+    fn down(x:i32)->i32{
+        var v:=x; v=v-2; v=v+(-3); return v
+    }
+    fn observe(x:i32)->i32{
+        var v:=x; v=v+2; saved:=v; v=v+3; return saved+v
+    }
+    fn branch(x:i32,up:bool)->i32{
+        var v:=x; v=v+2; if up{v=v+3}; v=v+4; return v
+    }
+    fn other(x:i32)->i32{
+        var v:=x; var w:=x; v=v+2; w=w+3; return v+w
+    }
+    fn full(x:i64)->i64{
+        var v:=x; v=v+9223372036854775807; v=v+1; return v
+    }
+    fn low(x:i64)->i64{
+        var v:=x; v=v-(-9223372036854775808); v=v-1; return v
+    }
+    fn main(){print(bump(9223372036854775798));print(down(-2147483643))
+        print(observe(3));print(branch(3,false));print(branch(3,true))
+        print(other(3));print(full(-1));print(low(-1))}"""
+    yield 'checked_updates', updates, [2**63-1,-2**31,13,9,12,11,2**63-1,2**63-2]
+
     control = '''fn calculate(n:i32)->i32{
         var i:=0; var total:=0
         while i<n {
@@ -139,6 +165,11 @@ def positive_cases():
 def trap_cases():
     # Native exit codes distinguish which checked operation trapped first.
     cases = [
+        ('same_direction_i32', 101, 'fn f(x:i32)->i32{var v:=x;v=v+2;v=v+3;v}', 'f(2147483643)'),
+        ('same_direction_i64', 101, 'fn f(x:i64)->i64{var v:=x;v=v-2;v=v-3;v}', 'f(-9223372036854775804)'),
+        ('opposite_updates', 101, 'fn f(x:i64)->i64{var v:=x;v=v+1;v=v-1;v}', 'f(9223372036854775807)'),
+        ('updates_past_i32_limit', 101, 'fn f(x:i32)->i32{var v:=x;v=v+2147483647;v=v+1;v}', 'f(0)'),
+        ('update_trap_order', 102, 'fn f(x:i32,y:i32)->i32{var v:=x;v=v+1;w:=1/y;v=v+1;w+v}', 'f(2147483646,0)'),
         ('add_i32', 101, 'fn f(x:i32)->i32{x+1}', 'f(2147483647)'),
         ('sub_i32', 101, 'fn f(x:i32)->i32{x-1}', 'f(-2147483648)'),
         ('neg_i32', 101, 'fn f(x:i32)->i32{-x}', 'f(-2147483648)'),
@@ -459,6 +490,8 @@ def selected(result, variant, name, target):
     if variant == 'candidate' and not name.startswith('fallback_'):
         minimum = 2 if name in ('register_pressure','mutation_sort_reverse','mutation_multiple_roots') else 1
         assert optimizer['modeled'] >= minimum and optimizer['emitted'] >= minimum, (name,target,optimizer)
+        if name == 'same_direction_i32':
+            assert optimizer['rewrites'] >= 1, optimizer
     else:
         assert optimizer['modeled'] == 0 and optimizer['emitted'] == 0, (name,target,optimizer)
 
@@ -485,6 +518,7 @@ def main():
     executed = crossed = diagnostics = 0
     with tempfile.TemporaryDirectory(prefix='dunder-optimizer-') as tmp:
         work = Path(tmp)
+        check_model_reuse(candidate, native, work)
         programs = list(positive_cases()) + list(mutation_cases())
         programs.append(('fixture', (ROOT / 'tests/contracts/scalar_optimizer.ddr').read_text(), [42]))
         for name,source,expected in programs:
@@ -565,6 +599,55 @@ def main():
             print('PASS diagnostics',name,flush=True)
     assert all(hashlib.sha256(p.read_bytes()).hexdigest() == hashes[v] for v,p in compilers.items()), 'compiler changed during verification'
     print(f'{executed} native executions; {crossed} cross-builds (not executed); {diagnostics} matching invalid diagnostics')
+
+
+def check_model_reuse(compiler, native, work):
+    # Identical bodies live at different byte offsets and in different files.
+    # Reversed parameter names change the subtraction even with identical tokens.
+    body = 'var total:=x-y;' + 'total=total+1;' * 24 + 'return total'
+    def definition(name, params='x:i32,y:i32', result='i32', text=body):
+        return f'pub fn {name}({params})->{result}{{{text}}}\n'
+    left = work / 'left.ddr'
+    left.write_text(''.join(definition(f'f{i}') for i in range(6)))
+    right = work / 'right.ddr'
+    right.write_text('\n\n' + definition('same') + definition('reverse', 'y:i32,x:i32')
+                     + definition('wide', 'x:i64,y:i64', 'i64')
+                     + definition('different', text=body.replace('+1', '+2', 1)))
+    path = work / 'reuse.ddr'
+    calls = ''.join(f'print(left.f{i}(7,3));' for i in range(6))
+    path.write_text('capability unsafe\nimport left\nimport right\nfn main(){' + calls + '''
+        a:fn(i32,i32)->i32=left.f0; b:fn(i32,i32)->i32=right.same
+        unsafe { assert(load_i64(addr(&a)) != load_i64(addr(&b))) }
+        print(a(7,3));print(b(7,3));print(right.reverse(7,3))
+        print(right.wide(4294967300,3));print(right.different(7,3))
+    }''')
+    expected = b'28\n' * 8 + b'20\n4294967321\n29\n'
+    image = work / 'reuse-image'
+    for flags in ([], ['--scalar-opt=off']):
+        build(compiler,path,image,native,work,['--inline-opt=off',*flags])
+        run = call([image],cwd=work)
+        assert (run.returncode,run.stdout) == (0,expected), run
+
+    # A cache hit based only on token text, length or function shape could
+    # silently accept these declarations after the earlier valid bodies.
+    for params,result,text in [('x:i32,y:i32','i32',body.replace('+1', '+"1"', 1)),
+                               ('z:i32,y:i32','i32',body),
+                               ('x:i32,y:i32','bool',body)]:
+        right.write_text(definition('bad',params,result,text))
+        path.write_text('import left\nimport right\nfn main(){'+calls+'print(right.bad(7,3))}')
+        errors = []
+        for flags in ([], ['--scalar-opt=off']):
+            image.write_bytes(b'previous build')
+            failure = call([compiler,'build',path,'--inline-opt=off','-o',image,*flags],cwd=work,env=ENV)
+            assert failure.returncode == 1 and str(right).encode() in failure.stderr, failure
+            assert image.read_bytes() == b'previous build'
+            errors.append(failure.stderr)
+        assert errors[0] == errors[1], errors
+    probe = work / 'model-hits'
+    build(compiler,ROOT/'tests/fixtures/scalar-model-reuse.ddr',probe,native,work)
+    run = call([probe],cwd=work)
+    assert run.returncode == 0, run
+    print('PASS scalar model reuse, declaration identity, near misses and source diagnostics',flush=True)
 
 
 if __name__ == '__main__':

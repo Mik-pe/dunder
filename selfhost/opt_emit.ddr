@@ -165,6 +165,12 @@ fn operands(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.No
     if simple(&nodes, right) { arm.mov(&mut code, 1, 0); expression(&mut code, &mut s, &plan, &nodes, &local_types, right) }
     else { arm.push_temp(&mut code, 0); expression(&mut code, &mut s, &plan, &nodes, &local_types, right); arm.pop_temp(&mut code, 1) }
 }
+// Already shifted into its encoding position in an ADD/SUB immediate word.
+fn immediate_field(value: i64) -> i64 {
+    if value >= 0 && value <= 4095 { return value * 1024 }
+    if value > 0 && value <= 16773120 && value % 4096 == 0 { return value / 4096 * 1024 + 4194304 }
+    -1
+}
 // Emit flags once for both conditional branches and normalized CSET results.
 // Local homes and cached lengths survive all call-free expression lowering.
 fn compare_flags(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.Nodes, local_types: &[]i32, node: i32) -> i32 {
@@ -177,9 +183,7 @@ fn compare_flags(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &
     }
     home := simple_home(&plan, &nodes, left)
     if nodes.kinds[right] == 1 {
-        value := nodes.values[right]; var immediate: i64 = -1
-        if value >= 0 && value <= 4095 { immediate = value * 1024 }
-        else if value > 0 && value <= 16773120 && value % 4096 == 0 { immediate = value / 4096 * 1024 + 4194304 }
+        immediate := immediate_field(nodes.values[right])
         if immediate >= 0 {
             var source := home
             if source < 0 { expression(&mut code, &mut s, &plan, &nodes, &local_types, left); source = 0 }
@@ -285,6 +289,43 @@ pub fn expression_clobbers(nodes: &ir.Nodes, plan: &alloc.Plan, root: i32) -> i3
     var remaining := 512
     clobber_walk(&nodes, &plan, root, &mut remaining, 0)
 }
+// Scalar operands are sign-extended in their homes. Checked i32 arithmetic
+// uses the W overflow flag at its source width, then restores that invariant.
+fn add_sub_into(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.Nodes,
+    local_types: &[]i32, node: i32, dst: i32) {
+    var left := nodes.left[node]; var right := nodes.right[node]
+    var subtract := nodes.values[node] == 2
+    if !subtract && nodes.kinds[left] == 1 { saved := left; left = right; right = saved }
+    var field: i64 = -1
+    if nodes.kinds[right] == 1 {
+        value := nodes.values[right]
+        if value > 0 { field = immediate_field(value) }
+        else if value < 0 && value >= -16773120 {
+            field = immediate_field(-value)
+            if field >= 0 { subtract = !subtract }
+        }
+    }
+    var lhs := simple_home(&plan, &nodes, left); var encoding: i64 = 184549376
+    if field >= 0 {
+        if lhs < 0 { expression(&mut code, &mut s, &plan, &nodes, &local_types, left); lhs = 0 }
+        encoding = 285212672 + field
+    } else {
+        var rhs := simple_home(&plan, &nodes, right)
+        if lhs >= 0 {
+            if rhs < 0 { expression(&mut code, &mut s, &plan, &nodes, &local_types, right); rhs = 0 }
+        } else if rhs >= 0 { expression(&mut code, &mut s, &plan, &nodes, &local_types, left); lhs = 0 }
+        else { operands(&mut code, &mut s, &plan, &nodes, &local_types, left, right); lhs = 1; rhs = 0 }
+        encoding = encoding + i64(rhs) * 65536
+    }
+    checked := nodes.proofs[node].bit_and(1) == 0
+    narrow_result := checked && nodes.types[node] == 1
+    if !narrow_result { encoding = encoding + 2147483648 }
+    if subtract { encoding = encoding + 1073741824 }
+    if checked { encoding = encoding + 536870912 }
+    arm.emit(&mut code, encoding + i64(lhs) * 32 + i64(dst))
+    if checked { arm.branch(&mut code, s.overflow, 8) }
+    if narrow_result { arm.emit(&mut code, 2470476800 + i64(dst) * 33) }
+}
 fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.Nodes, local_types: &[]i32, node: i32) {
     kind := nodes.kinds[node]; ty := nodes.types[node]; proven := nodes.proofs[node].bit_and(1) != 0
     var op := 0; if kind == 3 || kind == 4 { op = i32(nodes.values[node]) }
@@ -343,12 +384,11 @@ fn expression(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, nodes: &ir.
         cond := compare_flags(&mut code, &mut s, &plan, &nodes, &local_types, node)
         arm.emit(&mut code, 2594113504 + i64(cond.bit_xor(1)) * 4096); return
     }
+    if op == 1 || op == 2 {
+        add_sub_into(&mut code, &mut s, &plan, &nodes, &local_types, node, 0); return
+    }
     operands(&mut code, &mut s, &plan, &nodes, &local_types, nodes.left[node], nodes.right[node])
-    if op == 1 {
-        if proven { arm.emit(&mut code, 2332033056) } else { arm.emit(&mut code, 2868903968); arm.branch(&mut code, s.overflow, 8) }
-    } else if op == 2 {
-        if proven { arm.emit(&mut code, 3405774880) } else { arm.emit(&mut code, 3942645792); arm.branch(&mut code, s.overflow, 8) }
-    } else if op == 3 {
+    if op == 3 {
         if !proven { arm.emit(&mut code, 2604694562) }
         arm.emit(&mut code, 2600500256)
         if !proven { arm.emit(&mut code, 2474638339); compare(&mut code, 2, 3); arm.branch(&mut code, s.overflow, 3) }
@@ -364,7 +404,14 @@ fn statement(code: &mut arm.Code, s: &mut State, plan: &alloc.Plan, f: &ir.Funct
         var at := f.nodes.left[node]
         while at >= 0 { statement(&mut code, &mut s, &plan, &f, at); at = f.nodes.next[at] }
     } else if kind == 11 || kind == 12 {
-        expression(&mut code, &mut s, &plan, &f.nodes, &f.local_types, f.nodes.left[node]); write(&mut code, &plan, f.nodes.locals[node], 0)
+        rhs := f.nodes.left[node]; local := f.nodes.locals[node]; home := plan.homes[local]
+        if home >= 0 && f.nodes.kinds[rhs] == 3 && (f.nodes.values[rhs] == 1 || f.nodes.values[rhs] == 2) {
+            add_sub_into(&mut code, &mut s, &plan, &f.nodes, &f.local_types, rhs, home)
+        } else if home >= 0 && simple(&f.nodes, rhs) { simple_into(&mut code, &plan, &f.nodes, rhs, home) }
+        else {
+            expression(&mut code, &mut s, &plan, &f.nodes, &f.local_types, rhs)
+            write(&mut code, &plan, local, 0)
+        }
     } else if kind == 13 {
         other := arm.label(&mut code); done := arm.label(&mut code)
         condition(&mut code, &mut s, &plan, &f.nodes, &f.local_types, f.nodes.left[node], other, false)

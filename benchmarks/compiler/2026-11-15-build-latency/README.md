@@ -22,3 +22,5 @@ Självbygget återskapade referenskompilatorn. Det genererade programmet skrev
 `595500` och Tabells resultat för `expenses.csv team cents` matchade `expected.csv`.
 
 [Fasprofil och MIR-trafik för målet en miljon rader/s](throughput.md)
+
+[Implementerad arbetsfördelning och jämförelse med unika funktionskroppar](../2026-11-15-worker-lift/README.md)

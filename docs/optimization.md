@@ -44,21 +44,36 @@ Med `--mir-opt=off` ger gränsen byteidentisk kod mot den tidigare
 kodgeneratorn. Representationen ensam innebär ingen runtimevinst eller ett
 uppnått C-mål.
 
+### Återanvändning av typade skalärkroppar
+
+En byggsession kan behålla en verifierad, optimerad skalärmodell när samma
+upplösta funktionskropp återkommer. Återanvändning kräver identiska token av
+samma slag samt samma parameternamn, parametertyper och returtyp. Den nya
+funktionen får egna källpositioner, etiketter och maskinkod. Unika kroppar
+kräver endast ett par tokenindex för att pröva återanvändning vid nästa
+funktion. Minnet begränsas till en modell per session. [Modellcache](../selfhost/opt_templates.ddr)
+
+Intilliggande uppdateringar av en skalär lokal kan slås ihop när alla
+ändringar går åt samma håll och den kombinerade konstanten ryms i typen.
+Läsningar mellan uppdateringarna, kontrollflöde och ändrad riktning bryter
+kedjan. Den kombinerade heltalsoperationen behåller överflödeskontrollen.
+[Skalärpass](../selfhost/opt_pass.ddr)
+
 ### Seriell Session och taskbaserade funktionspass
 
-[`compile.Session`](../selfhost/compile.ddr) är den gemensamma frontendens
-återupptagbara gräns. Föräldern behåller full provisorisk Code och imports genom
-hela källtraverseringen. Ett kallt jobb får en ägd, lyft MIR-funktion;
-[`mir_pipeline`](../selfhost/mir_pipeline.ddr) utför samma obligatoriska
-verifiering, begränsade pass och efterverifiering seriellt eller i en task.
-Varje kallt taskjobb skapar lokala pipeline- och sänkningsarbetsminnen i en
-ny OS-tråd. Efter verifiering och pass sänker workern själv till ett slutligt
-funktionsobjekt och returnerar kompakt numerisk `ObjectData` samt statistik.
-Hela MIR-arenan skickas inte tillbaka. Den vanliga task-Data-gränsen används;
-opaque-objekt får inget typundantag. Föräldern validerar objektets fulla
-struktur före ordnad acceptans, cachelagring och länkning. Det finns ingen
-permanent worker- eller arenapool. Först efter färdig sammanfogning ersätts den provisoriska
-bilden. Cacheträffar är redan slutligt sänkta och får inget nytt backendjobb.
+Huvudtråden äger källtraverseringen, de provisoriska maskinorden och
+importerna. För varje ny funktion lägger den funktionslokala maskinord,
+etikettbindningar, relokeringar, importsajter och källannotationer i en batch.
+Maskinord och de olika metadatakolumnerna lagras var för sig. Varje funktion
+har en liten post med index och längder för sina delar av batchen.
+[Session](../selfhost/compile.ddr) · [Batchformat](../selfhost/mir_source.ddr)
+
+Arbetstråden bygger MIR direkt från batchens kolumner med samma avkodare som
+den seriella vägen. Den återanvänder arbetsminnet för lyftning, verifiering,
+optimering och sänkning mellan funktionerna i batchen. Föräldern tar emot de
+slutliga funktionsobjekten i källordning, validerar dem och länkar bilden.
+En träff i fragmentcachen ger ett redan sänkt objekt.
+[Arbetstråd](../selfhost/mir_task.ddr) · [Funktionspass](../selfhost/mir_pipeline.ddr)
 
 `mir_lower.new_data()` skapar transportarenan;
 `lower_data_into(&mut data, &verified_function)` kör samma sänkningsgång
@@ -68,9 +83,8 @@ som den seriella vägen. Förälderns
 med tillåtna upprepningar för raderade operationer. `Code.labels` är tom
 och övrig oanvänd Code-metadata har standardvärden; validerarens scratch
 ligger separat. Gränskartan döljs aldrig i en arrays kapacitet eller i
-etikettabellen. Indata är fortfarande en ägd full MIR-snapshot, och
-resultatet klonas enligt de vanliga taskreglerna. Detta är ingen
-nollkopierande eller delad minnesgräns.
+etikettabellen. Indata och resultat följer språkets vanliga regler för
+ägda värden som passerar en taskgräns.
 [ObjectData och task-livstid](../tools/test-mir-object-data.py).
 
 [`compile_parallel`](../selfhost/compile_parallel.ddr) äger begränsade

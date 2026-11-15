@@ -323,21 +323,19 @@ separat `dunder-serial` på alla värdar utan att ersätta `dunder`.
 ### Den genomförda ägargränsen
 
 `compile.Session` äger frontendens typning, symboler, nåbarhetsordning,
-diagnostik, inlinebudget, Code, imports och cache-I/O. `next_into` fortsätter
-exakt samma källtraversering efter varje suspension och lämnar ett ägt
-MIR-jobb, ett redan färdigt cacheobjekt eller slut/fel. Alla provisoriska
-ord och globala ID:n behålls tills den slutliga bilden kan ersättas.
+diagnostik, inlinebudget, Code, imports och cache-I/O. `next_source_into`
+fortsätter källtraverseringen efter varje suspension. En ny funktion kan
+fångas i en ägd batch innan nästa funktion använder annotationskolumnerna.
+Den seriella konsumenten använder `next_into` för att lyfta samma maskinord
+på plats. Ett färdigt cacheobjekt går direkt till den ordnade mottagaren.
 
-`mir_task.Job` innehåller ägd `mir.Function`, passpolicy, separata minnes-,
-anrops- och terminalkontrakt,
-källordinal och deklarations-ID. `mir_pipeline` kör samma verifiering och
-begränsade frame-, valbara SSA- och värdepass som den seriella vägen med
-workerägda arbetsarenor. Varje kallt jobb startar en OS-tråd och skapar lokal
-`pipeline.Workspace`; ingen permanent worker-/arenapool återanvänds.
-`--jobs=1` använder i stället den seriella kedjans återanvända arbetsminne.
-Samma OS-worker sänker efter verifiering och pass direkt till ägd numerisk
-`mir_lower.ObjectData` och returnerar slutobjekt och status/statistik.
-Hela MIR-funktionen returneras inte. Objektet innehåller lokala ord- och
+`mir_task.Batch` innehåller funktionslokala kolumner, källordinaler och
+deklarations-ID tillsammans med gemensam passpolicy och terminalkontrakt.
+Arbetstråden läser funktionens del av de kompakta kolumnerna och bygger
+sin egen MIR. `mir_pipeline` verifierar och kör frame-, SSA- och värdepassen
+enligt policyn. Arbetsminnet återanvänds i hela batchen. Arbetstråden sänker
+varje verifierad funktion till `mir_lower.ObjectData` och returnerar dess
+slutobjekt och status. Objektet innehåller lokala ord- och
 etikettoffsetar, symboliska globala ID:n, importernas ursprungliga site-ID:n
 och en monoton operations-/ordgränskarta med upprepade tombstonepositioner.
 Föräldern strukturellt validerar version, intervall och samtliga tabeller
@@ -346,7 +344,7 @@ ord: uppgiftens exakta scope, ordinal och deklaration bevarar ursprunget. Inga
 levande referenser till förälderns Session, Code eller imports passerar
 jobbgränsen. Hela källfunktionen ingår, även ägarinitiering efter `RET`.
 
-`compile_parallel` håller ett taskfönster om högst `workers` källsteg och
+`compile_parallel` håller ett taskfönster om högst `workers` batcher och
 tar emot svar i ursprunglig ordinalordning. `mir_link` fångar prefixets
 etikettägare före första jobbet, validerar kompletta objekt före infogning och sammanfogar i
 källordning. Globala ID:n bevaras och namespacet kan växa monotont innan
