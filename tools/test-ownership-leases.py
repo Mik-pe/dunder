@@ -105,6 +105,15 @@ def main():
                     original = call(baseline, ['check', invalid, '--agent', '--target', target], work, 1)
                     if original.stdout != outputs[0]:
                         raise AssertionError(f'{invalid.name}: baseline diagnostic differs')
+        source.write_text('fn lhs()->string{41.str()} fn rhs()->string{42.str()} '
+                          'fn main(){print(lhs()+rhs())}')
+        for ownership in ('off', 'on'):
+            image = work / f'owned-left-{ownership}'
+            call(compiler, ['build', source, '-o', image, '--runtime-profile',
+                            f'--ownership-opt={ownership}'], work)
+            result = call(image, [], work)
+            if result.stdout != '4142\n' or json.loads(result.stderr)['counters']['retain_calls'] != 0:
+                raise AssertionError('effectful RHS retained an already owned left temporary')
         for number, (text, status) in enumerate(TRAPS):
             source.write_text(text)
             for target in (host,):
