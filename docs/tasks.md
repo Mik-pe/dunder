@@ -88,14 +88,12 @@ har avslutats; felvägen får därför inte läsa eller frigöra dess lagring.
 Vanliga runtimefällor i en worker behåller processavslut som felmekanism.
 Cancellation, detach och återhämtning från taskfel ingår inte i första API:t.
 
-Taskprogram får en full semantisk certifiering före kodemission. Vid
-vanlig `dunder check` (utan separat agentrapport) certifieras
-tasksemantiken direkt i en enda genomgång (`in_place_certify`); vid
-kodbygge körs certifieringen först, varefter den riktiga emissionen
-behåller skaläroptimering, inlining och MIR-passen. Funktionscache avstår
-för taskprogram tills certifierade effekter och beroenden kan lagras och
-återställas tillsammans med fragmenten. Vanliga seriella program gör
-ingen extra certifieringsgenomgång.
+Typkontrollen registrerar direkta effekter, anrop och spawnplatser under
+den vanliga kroppsvandringen. Både build och check certifierar grafen när
+även onåbara kroppar har kontrollerats. Ett bygge binder taskruntimens
+symboler efter godkänd certifiering, före publicering. Funktionscachen
+avstår för taskprogram tills certifierade effekter och beroenden kan
+återställas tillsammans med fragmenten.
 
 ## Kompilatorn som taskkonsument
 

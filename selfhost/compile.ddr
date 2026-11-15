@@ -111,26 +111,24 @@ fn task_certify(c: &mut Session, certificate: &mut tc.TaskCertificate) -> bool {
     if err != "" { c.cursor = at; fail(&mut c, err); return false }
     true
 }
-// Every helper is emitted after startup's exit, before the global-label
-// snapshot and any source function's MIR/cache boundary. Only calls are emitted
-// by source expressions; no native C entry is ever folded into source MIR.
 fn import_c(c: &mut Session, symbol: string) -> i32 {
     for i in 0..c.imports.symbols.len {
         if c.imports.libraries[i] == "c" && c.imports.symbols[i] == symbol { return i }
     }
     index := c.imports.symbols.len; c.imports.libraries.push("c"); c.imports.symbols.push(symbol); index
 }
-fn task_prefix(c: &mut Session, rt: &runtime.Runtime, certificate: &tc.TaskCertificate) {
+fn bind_task_runtime(c: &mut Session, rt: &runtime.Runtime, certificate: &tc.TaskCertificate) {
     plan := tc.build_prefix_plan(&certificate, &c.types, &c.helper_labels, &c.param_starts, &c.param_types, &c.returns, &c.fn_labels)
     create := import_c(&mut c, "pthread_create")
     join := import_c(&mut c, "pthread_join")
     unmap := import_c(&mut c, "munmap")
     out := tc.emit_prefix(&mut c.code, &rt, &plan, c.imports.symbols.len, create, join, unmap, c.imports.globals)
     if !out.ok { fail(&mut c, out.error); return }
-    c.tasks.trap = out.trap; c.tasks.coordinator = out.coordinator
-    c.tasks.open = out.open; c.tasks.await_result = out.await_result; c.tasks.close = out.close
+    c.code.labels[c.tasks.open] = c.code.labels[out.open]
+    c.code.labels[c.tasks.await_result] = c.code.labels[out.await_result]
+    c.code.labels[c.tasks.close] = c.code.labels[out.close]
     c.imports.globals = out.import_globals
-    for w in 0..plan.worker_ids.len { c.tasks.spawners[plan.worker_ids[w]] = out.spawners[w] }
+    for w in 0..plan.worker_ids.len { c.code.labels[c.tasks.spawners[plan.worker_ids[w]]] = c.code.labels[out.spawners[w]] }
     for i in 0..out.import_sites.len { c.imports.sites.push(out.import_sites[i]); c.imports.slots.push(out.import_slots[i]) }
 }
 
@@ -159,6 +157,10 @@ fn task_scope_statement(c: &mut Session, catalog: &opt_inline.Catalog, inline_wo
     handle := slot(&mut c); c.tasks.handles.push(handle)
     if c.code.checking { arm.imm(&mut c.code, 0, 0) }
     else {
+        if c.tasks.coordinator < 0 {
+            c.tasks.coordinator = tc.coordinator_offset(c.imports.globals)
+            c.imports.globals = tc.after_coordinator(c.tasks.coordinator)
+        }
         arm.push_temp(&mut c.code, 0); static_address(&mut c, c.tasks.coordinator); arm.mov(&mut c.code, 1, 16); arm.pop_temp(&mut c.code, 0)
         arm.branch(&mut c.code, c.tasks.open, 1)
     }
@@ -178,12 +180,11 @@ fn task_spawn(c: &mut Session, catalog: &opt_inline.Catalog, inline_work: &mut o
     input := c.param_types[c.param_starts[worker]]; expect(&mut c, "(")
     actual := expression(&mut c, 0, input, &catalog, &mut inline_work); same(&mut c, input, actual); expect(&mut c, ")")
     c.needed[worker] = true
-    if c.tasks.certifying {
+    if c.tasks.program {
         c.tasks.spawn_workers.push(worker); c.tasks.spawn_callers.push(c.tasks.current); c.tasks.spawn_ats.push(worker_at)
     }
     if c.code.checking { arm.imm(&mut c.code, 0, 0) }
     else {
-        if worker >= c.tasks.safe.len || !c.tasks.safe[worker] || c.tasks.spawners[worker] < 0 { fail(&mut c, "internal uncertified task worker"); return 0 }
         arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, c.local_slots[cap]); arm.branch(&mut c.code, c.tasks.spawners[worker], 1)
     }
     c.address = -1; c.writable = false
@@ -651,7 +652,7 @@ fn literal(c: &mut Session, spelling: string, expected: i32) -> i32 {
 fn intrinsic(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     var covered := false
     result := intrinsic_dispatch(&mut c, name, expected, &catalog, &mut inline_work, &mut covered)
-    if c.tasks.certifying && c.ok && !covered { task_effect(&mut c, 4096) }
+    if c.tasks.program && c.ok && !covered { task_effect(&mut c, 4096) }
     result
 }
 fn intrinsic_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, covered: &mut bool) -> i32 {
@@ -722,6 +723,7 @@ fn length_value(c: &mut Session, ty: i32) -> i32 {
 // Record only referenced imports and leave one page-relative GOT load for the image writer.
 fn import_address(c: &mut Session, f: i32) {
     task_effect(&mut c, 32)
+    if c.validating_dead { return }
     if c.code.platform == 3 {
         sig := wasm_signature(&mut c, c.ffi_types[f]); if !c.ok { return }
         entry := wa.host(&mut c.wasm_abi, c.libraries[f], c.symbols[f], sig)
@@ -825,6 +827,7 @@ fn foreign_call(c: &mut Session, sig: i32, catalog: &opt_inline.Catalog, inline_
     expect(&mut c, ")"); if count != values.len { fail(&mut c, "wrong C argument count"); return 0 }
     outgoing = (outgoing + 15) / 16 * 16
     if outgoing > 4080 { fail(&mut c, "C argument frame exceeds direct stack offset"); return 0 }
+    if c.code.checking { return ret }
     var patches := fa.new_patches(c.imports.globals)
     fa.emit_foreign_call(&mut c.code, &spec, callee, &values, &locations,
         result_slot, indirect_result, gp, fp, outgoing, c.has_callbacks,
@@ -888,7 +891,7 @@ fn raw_memory_type(c: &Session, name: string, start: i32) -> i32 {
 fn call(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     var covered := false
     result := call_dispatch(&mut c, name, expected, &catalog, &mut inline_work, &mut covered)
-    if c.tasks.certifying && c.ok && !covered { task_effect(&mut c, 4096) }
+    if c.tasks.program && c.ok && !covered { task_effect(&mut c, 4096) }
     result
 }
 fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, covered: &mut bool) -> i32 {
@@ -923,6 +926,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
             entry := wa.callback(&mut c.wasm_abi, c.fn_labels[id], sig); c.needed[id] = true
             arm.imm(&mut c.code, 0, i64(entry)); return ty
         }
+        if c.validating_dead { return foreign_type(&mut c, &params, c.returns[id]) }
         if c.callback_labels[id] < 0 { label := arm.label(&mut c.code); c.callback_labels[id] = label }
         c.needed[id] = true
         arm.branch(&mut c.code, c.callback_labels[id], 20)
@@ -1580,7 +1584,7 @@ fn replay_place(c: &mut Session, first: i32, last: i32, expected: i32, catalog: 
 fn method(c: &mut Session, ty: i32, name: string, first_token: i32, receiver_end: i32, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) -> i32 {
     var covered := false
     result := method_dispatch(&mut c, ty, name, first_token, receiver_end, &catalog, &mut inline_work, &mut covered)
-    if c.tasks.certifying && c.ok && !covered { task_effect(&mut c, 4096) }
+    if c.tasks.program && c.ok && !covered { task_effect(&mut c, 4096) }
     result
 }
 fn integer_method(c: &mut Session, ty: i32, name: string, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, covered: &mut bool) -> i32 {
@@ -2534,8 +2538,7 @@ fn literals(c: &mut Session) {
     }
 }
 fn clones(c: &mut Session) {
-    bind_type_helpers(&mut c)
-    for ty in 0..c.types.type_names.len {
+    for ty in 0..c.helper_labels.len {
         if !owned(&c, ty) || ty == 4 { continue }
         arm.mark(&mut c.code, c.helper_labels[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
         if c.types.c_record[ty] {
@@ -2610,10 +2613,6 @@ pub fn compile_profiled(tokens: &mut lexer.Tokens, platform: i32, module_starts:
     config.scalar_enabled = scalar_enabled; config.profile_host = profile_host; config.instrument_runtime = instrument_runtime
     compile_options(&mut tokens, platform, &module_starts, &module_files, check_all, report, &mut records, directory, identity, &config)
 }
-pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string, config: &Configuration) -> Result {
-    var certificate := tc.task_certificate()
-    compile_stage(&mut tokens, platform, &module_starts, &module_files, check_all, report, &mut records, directory, identity, &config, false, &mut certificate)
-}
 // Empty construction copies no populated compiler/source/function arena.
 // Existing typed-parser arenas remain explicit independent roots in this API.
 pub fn new_session() -> Session {
@@ -2646,9 +2645,8 @@ pub fn begin_into(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32,
     config: &Configuration, scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace,
     range_work: &mut opt_range.Workspace, catalog: &mut opt_inline.Catalog,
     inline_work: &mut opt_inline.Workspace, emit_settings: &mut opt_emit.Options, record_takes: &mut record_take.Plan) -> bool {
-    var certificate := tc.task_certificate()
     begin_stage(&mut c, &mut tokens, platform, &module_starts, &module_files, false, report, directory, identity,
-        &config, false, &mut certificate, &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes)
+        &config, &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes)
 }
 pub fn begin_linker(c: &Session, link: &mut mir_link.Linker) -> bool {
     if !c.ok || c.jobs.phase != 1 || c.jobs.checking || c.jobs.declarations.len != 0 { return false }
@@ -2681,7 +2679,7 @@ pub fn terminals_into(c: &Session, terminals: &mut mir_pipeline.Terminals) {
 }
 fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32,
     check_all: bool, report: bool, directory: string, identity: string, config: &Configuration,
-    certifying: bool, certificate: &mut tc.TaskCertificate, scalar_model: &mut opt_ir.Function,
+    scalar_model: &mut opt_ir.Function,
     scalar_work: &mut opt_verify.Workspace, range_work: &mut opt_range.Workspace,
     catalog: &mut opt_inline.Catalog, inline_work: &mut opt_inline.Workspace, emit_settings: &mut opt_emit.Options, record_takes: &mut record_take.Plan) -> bool {
     if c.jobs.phase != 0 { return false }
@@ -2696,7 +2694,7 @@ fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module
     for i in 0..tokens.kinds.len {
         if tokens.kinds[i] == .Float || (tokens.kinds[i] == .Name && (tokens.texts[i] == "f32" || tokens.texts[i] == "f64")) { uses_float = true; break }
     }
-    if uses_float && tokens.ok && !certifying {
+    if uses_float && tokens.ok {
         fragment := lexer.scan("\n" + bundled.float_formatter(), false)
         // Replace EOF with a separator and append tokens without lexing the
         // user's original modules again. The loader reserves the runtime name.
@@ -2716,7 +2714,7 @@ fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module
     rt := runtime.new(&mut code)
     array_take := arm.label(&mut code)
     c.tokens = tokens; c.code = code; c.runtime = rt; c.array_take = array_take
-    c.tasks.certifying = certifying; c.report = report; c.source_end = source_end; c.float_source = uses_float
+    c.report = report; c.source_end = source_end; c.float_source = uses_float
     c.scalar_enabled = scalar_enabled; c.ownership_enabled = config.ownership_enabled
     c.range_enabled = config.range_enabled; c.inline_enabled = config.inline_enabled && scalar_enabled && !check_all
     c.mir_enabled = config.mir_enabled; c.mir_opt_enabled = config.mir_opt_enabled
@@ -2734,15 +2732,12 @@ fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module
         if c.tokens.kinds[i] == .Name && c.tokens.texts[i] == "region" && c.tokens.kinds[i + 1] == .Name { c.loans.active = true }
         if c.tokens.kinds[i] == .Name && c.tokens.texts[i] == "callback" { c.has_callbacks = true }
     }
-    in_place_certify := check_all && !report && !certifying
-    if c.tasks.program && in_place_certify { c.tasks.certifying = true }
     headers(&mut c, &module_starts, &module_files)
-    if c.tasks.program && c.tasks.certifying { c.scalar_enabled = false; c.inline_enabled = false }
     if c.tasks.program {
-        for f in 0..c.names.len {
-            c.tasks.direct.push(0); c.tasks.complete.push(false); c.tasks.uses.push(false); c.tasks.use_ats.push(-1); c.tasks.spawners.push(-1)
-            if c.libraries[f] != "" { c.tasks.direct[f] = 32; c.tasks.complete[f] = true }
-        }
+        for f in 0..c.names.len { tc.add_function(&mut c.tasks, c.libraries[f] != "") }
+        // Every source operation in the task graph must supply its effects.
+        // Until scalar bodies are produced by this walk, type them here too.
+        c.scalar_enabled = false
     }
     for t in 0..c.types.type_names.len { if c.types.c_record[t] { c_layout(&mut c, t) } }
     validate_layouts(&mut c)
@@ -2764,15 +2759,6 @@ fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module
     if !c.ok { return session_fail_at(&mut c, c.error, c.error_at) }
     main_id := i32(entry)
     if c.param_counts[main_id] != 0 || (c.returns[main_id] != 0 && c.returns[main_id] != 1) { fail(&mut c, "main must take no arguments and return i32 or ()") }
-    if c.tasks.program && !certifying && !in_place_certify && c.ok {
-        var proof_records := bindings()
-        checked := compile_stage(&mut c.tokens, platform, &module_starts, &module_files, true, false, &mut proof_records, "", "", &config, true, &mut certificate)
-        if !checked.ok { return session_fail_at(&mut c, checked.error, checked.offset) }
-        for f in 0..certificate.safe.len { c.tasks.safe.push(certificate.safe[f]) }
-        if certificate.runtime && (platform != 0 || instrument_runtime) {
-            return session_fail_at(&mut c, "isolated tasks require ARM64/macOS without runtime profiling", certificate.at)
-        }
-    }
     for f in 0..c.names.len {
         label := arm.label(&mut c.code)
         c.fn_labels.push(label); c.needed.push(false)
@@ -2791,7 +2777,16 @@ fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module
     arm.syscall(&mut c.code, 33554433, 94); arm.emit(&mut c.code, 3558866944)
     c.needed[main_id] = true
     for f in 0..c.names.len { c.jobs.compiled.push(false); c.callback_labels.push(-1) }
-    if c.tasks.program && !check_all && certificate.runtime { task_prefix(&mut c, &rt, &certificate) }
+    if c.tasks.program && !check_all {
+        c.tasks.open = arm.label(&mut c.code)
+        c.tasks.await_result = arm.label(&mut c.code)
+        c.tasks.close = arm.label(&mut c.code)
+        for f in 0..c.names.len {
+            if c.param_counts[f] == 1 && c.libraries[f] == "" && !c.unsafe_functions[f] {
+                spawner := arm.label(&mut c.code); c.tasks.spawners[f] = spawner
+            }
+        }
+    }
     if !c.ok { return session_fail_at(&mut c, c.error, c.error_at) }
     // Nominal record fields are sealed now. Later compound/callable type rows
     // cannot change these layouts. Reserve helper IDs in the global namespace;
@@ -2855,15 +2850,15 @@ fn begin_stage(c: &mut Session, tokens: &mut lexer.Tokens, platform: i32, module
     c.jobs.phase = 1
     true
 }
-fn compile_stage(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string, config: &Configuration, certifying: bool, certificate: &mut tc.TaskCertificate) -> Result {
+pub fn compile_options(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings, directory: string, identity: string, config: &Configuration) -> Result {
     var c := new_session(); var record_takes := record_take.new(); var scalar_model := opt_ir.new(); var scalar_work := opt_verify.new()
     var scalar_plan := opt_alloc.new(); var range_work := opt_range.new(); var machine_work := machine_ir.new()
     var emit_settings := opt_emit.options(); var catalog := opt_inline.new(); var inline_work := opt_inline.workspace()
     if !begin_stage(&mut c, &mut tokens, platform, &module_starts, &module_files, check_all, report, directory, identity, &config,
-        certifying, &mut certificate, &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes) { return session_error(&c) }
+        &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes) { return session_error(&c) }
     if check_all {
         check_sources(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work)
-        return session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut records, &mut certificate, &mut record_takes)
+        return session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
     }
     var function := mir.new(); var object := mir_lower.new_object(); var lifter := mir_lift.new_work(); var link := mir_link.new()
     var restored := fragments.new_dependencies(); var options := mir_pipeline.options(); var exits := mir_pipeline.no_terminals()
@@ -2904,25 +2899,21 @@ fn compile_stage(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32
 fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace,
     scalar_plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options,
     range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace,
-    records: &mut Bindings, certificate: &mut tc.TaskCertificate, record_takes: &mut record_take.Plan) -> Result {
+    records: &mut Bindings, record_takes: &mut record_take.Plan) -> Result {
     // Runtime is a scalar-only ABI record; this bounded copy is not an arena.
     rt := c.runtime
     if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
     // The image owns only reachable code and data. Check the remaining
     // bodies against the same language rules without retaining machine output.
-    var result := Result { ok: true, error: "", offset: 0, text: [], imports: imports() }
-    if !c.jobs.checking {
-        var started: i64 = -1
-        if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
-        result = finish_image(&mut c, c.jobs.platform, c.jobs.main_id, &rt, &mut record_takes)
-        if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 9, started, i64(result.text.len)) }
-        if !result.ok { return result }
-    }
-    if c.tasks.certifying { for f in 0..c.names.len { c.tasks.reachable.push(c.jobs.compiled[f]) } }
+    // Freeze helper demand while code still contains only reachable bodies.
+    bind_type_helpers(&mut c)
+    live_platform := c.code.platform
+    globals := c.imports.globals
+    if c.tasks.program { for f in 0..c.names.len { c.tasks.reachable.push(c.jobs.compiled[f]) } }
     c.validating_dead = true
-    c.code = arm.new_check(0)
-    for i in 0..c.jobs.globals { unused := arm.label(&mut c.code) }
-    c.imports = imports()
+    c.code.checking = true; c.code.platform = 0
+    c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
+    c.imports.globals = 0
     for f in 0..c.names.len {
         if !c.jobs.compiled[f] && c.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings, &mut range_work, &catalog, &mut inline_work) }
         if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
@@ -2934,6 +2925,23 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
         }
         offset := scratch.escaping_offset(&mut c.loans)
         if offset >= 0 { return Result { ok: false, error: "scratch borrow reaches a raw address", offset: offset, text: [], imports: imports() } }
+    }
+    c.validating_dead = false
+    c.code.checking = c.jobs.checking; c.code.platform = live_platform
+    c.imports.globals = globals
+    var certificate := tc.task_certificate()
+    if c.tasks.program && !task_certify(&mut c, &mut certificate) { return session_error(&c) }
+    if certificate.runtime && (c.jobs.platform != 0 || c.jobs.instrument_runtime) {
+        return Result { ok: false, error: "isolated tasks require ARM64/macOS without runtime profiling", offset: certificate.at, text: [], imports: imports() }
+    }
+    var result := Result { ok: true, error: "", offset: 0, text: [], imports: imports() }
+    if !c.jobs.checking {
+        var started: i64 = -1
+        if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
+        if certificate.runtime { bind_task_runtime(&mut c, &rt, &certificate); if !c.ok { return session_error(&c) } }
+        result = finish_image(&mut c, c.jobs.platform, c.jobs.main_id, &rt, &mut record_takes)
+        if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 9, started, i64(result.text.len)) }
+        if !result.ok { return result }
     }
     records.reused = c.bindings.reused; records.emitted = c.bindings.emitted
     records.scalar_model_hits = c.bindings.scalar_model_hits; records.modeled = c.bindings.modeled; records.optimized = c.bindings.optimized
@@ -2968,10 +2976,6 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
     records.mir_value_analysis_units = c.bindings.mir_value_analysis_units; records.mir_value_budget_refusals = c.bindings.mir_value_budget_refusals
     if c.bindings.profile.enabled { records.profile = c.bindings.profile }
     if c.report { records = c.bindings }
-    if c.tasks.certifying && !task_certify(&mut c, &mut certificate) { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
-    if c.jobs.checking && c.tasks.certifying && certificate.runtime && (c.jobs.platform != 0 || c.jobs.instrument_runtime) {
-        return Result { ok: false, error: "isolated tasks require ARM64/macOS without runtime profiling", offset: certificate.at, text: [], imports: imports() }
-    }
     result
 }
 // Check-only preserves the existing reachable-function validation order, but
@@ -3196,9 +3200,9 @@ pub fn finish(c: &mut Session, link: &mut mir_link.Linker, scalar_model: &mut op
     // restored objects. Normalization's own nested calls use Plan's closure;
     // source/runtime/clone emitters add no later record-take dependencies.
     for r in 0..c.code.target.len { requested := record_take.request_label(&mut record_takes, c.code.target[r]) }
-    c.jobs.phase = 3; var certificate := tc.task_certificate()
+    c.jobs.phase = 3
     session_tail(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &mut machine_work, &emit_settings,
-        &mut range_work, &catalog, &mut inline_work, &mut records, &mut certificate, &mut record_takes)
+        &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
 }
 
 // The model handles unowned scalars and stable-shape i64-array borrows.
@@ -3394,7 +3398,7 @@ fn remap_mir_spans(code: &mut arm.Code, work: &machine_ir.Workspace) -> bool {
 }
 fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, machine_work: &mut machine_ir.Workspace, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
     c.tasks.current = f
-    if c.tasks.certifying && c.unsafe_functions[f] { task_effect(&mut c, 16) }
+    if c.tasks.program && c.unsafe_functions[f] { task_effect(&mut c, 16) }
     c.scalar_function = !c.code.checking && scalar_body(&mut c, f, &mut model, &mut work, &mut plan, &emit_settings, &mut range_work)
     if c.scalar_function { return }
     if c.inline_enabled { fragments.reset_dependencies(&mut c.inline_deps) }
@@ -3451,7 +3455,7 @@ fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut
         if c.ok && !remap_mir_spans(&mut c.code, &machine_work) { fail(&mut c, "internal MIR frame span rewrite failure") }
         if c.ok { machine_ir.commit_code(&mut machine_work, &mut c.code); machine_ir.commit_imports(&mut machine_work, &mut c.imports.sites) }
     }
-    if c.tasks.certifying && c.ok { c.tasks.complete[f] = true }
+    if c.tasks.program && c.ok { c.tasks.complete[f] = true }
     if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 7, started, i64(c.ends[f] - c.starts[f] + 1)) }
 }
 
