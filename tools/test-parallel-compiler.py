@@ -163,6 +163,13 @@ class Probe:
             frontend = json.loads(result.stderr)['frontend']
             if jobs is not None:
                 require(frontend['scalar_bodies'] == count and 1 <= frontend['workers_used'] <= frontend['peak_total_jobs'] <= jobs, frontend)
+                bodies = frontend['scalar_bodies'] + frontend['general_bodies']
+                require(0 < frontend['windows'] <= bodies <= jobs * frontend['windows'], frontend)
+                if jobs == 4:
+                    # The independent bodies must keep running together after
+                    # backend results begin returning. A single early wide
+                    # window followed by synchronous checks fails this bound.
+                    require(2 * frontend['windows'] <= bodies, frontend)
             images.append(digest(image))
             self.execute(image, 'arm64-macos', '1029\n')
         require(len(set(images)) == 1, images)
