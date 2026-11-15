@@ -16,7 +16,14 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = 'fn work(n:i64)->i64 { n*n }\n'
 SCOPE = 'fn main(){task scope jobs(2){id:=spawn jobs work(7);print(await jobs(id))}}\n'
+STATE = ('struct Workspace{values:[]i32,label:string}\n'
+         'fn initialize()->Workspace{Workspace{values:[],label:"workers"}}\n'
+         'fn collect(x:i32, ws:&mut Workspace)->[]i32{ws.values.push(x);ws.values}\n'
+         'fn count(x:i32, ws:&mut Workspace)->i32{ws.values.len+x+ws.label.len}\n')
 VALID = {
+ 'persistent_workspace': (STATE+'fn main(){task scope j(1,initialize){first:=spawn j collect(11);second:=spawn j collect(22);var a:=await! j(first);a[0]=99;out:=await! j(second);print(out[0]);print(out[1]);n:=spawn j count(3);print(await j(n))};task scope j(1,initialize){n:=spawn j count(0);print(await! j(n))}}','11\n22\n12\n7\n'),
+ 'isolated_workspaces': (STATE+'fn main(){task scope j(2,initialize){a:=spawn j collect(41);b:=spawn j collect(43);left:=await! j(a);right:=await! j(b);assert(left.len==1&&right.len==1);print(left[0]);print(right[0]);c:=spawn j count(0);d:=spawn j count(0);print(await j(c));print(await j(d))}}','41\n43\n8\n8\n'),
+
  'scalar_repeat': (WORKER + 'fn main(){task scope jobs(2){id:=spawn jobs work(7);copy:=id;print(await jobs(id));print(await jobs(copy))}}', '49\n49\n'),
  'key_fifo': (WORKER + 'fn main(){var ids:[]TaskID<i64> = [];task scope jobs(1){for i in 0..20{ids.push(spawn jobs work(i64(i)))};var sum:i64=0;for id in ids{sum=sum+await jobs(id)};print(sum)}}', '2470\n'),
  'snapshot_copies': ('fn work(a:[]i64)->[]i64{var b:=a;b[0]=b[0]+1;b}\nfn main(){var a:[]i64=[41];task scope j(2){id:=spawn j work(a);a[0]=0;var first:=await j(id);first[0]=99;print((await j(id))[0]);print(first[0]);print(a[0])}}', '42\n99\n0\n'),
@@ -43,6 +50,12 @@ VALID = {
  'arena_pool_stress': ('struct WorkItem{values:[]i32,seed:i32}\nstruct WorkOut{items:[]i32,total:i64}\nfn work(item:WorkItem)->WorkOut{s:=item.seed.str();var out:[]i32=[];var total:i64=i64(s.len);for v in item.values{w:=v+item.seed;out.push(w);total=total+i64(w)};WorkOut{items:out,total:total}}\nfn main(){var sum:i64=0;for wave in 0..2{task scope jobs(4){var keys:[]TaskID<WorkOut> = [];var read:=0;for j in 0..120{i:=wave*120+j;keys.push(spawn jobs work(WorkItem{values:[i,i+1,i+2],seed:i+10}));if keys.len-read>=4{ans:=await jobs(keys[read]);read=read+1;sum=sum+ans.total+i64(ans.items[0]+ans.items[2])}};while read<keys.len{ans:=await jobs(keys[read]);read=read+1;sum=sum+ans.total+i64(ans.items[0]+ans.items[2])}}};print(sum)}','300630\n'),
 }
 INVALID = {
+ 'effectful_initializer': (STATE.replace('Workspace{values:[],label:', 'print(1);Workspace{values:[],label:')+'fn main(){task scope j(1,initialize){}}','initializer has effects outside'),
+ 'workspace_shape': (STATE+'fn main(){task scope j(1,initialize){id:=spawn j invalid(1)}}\nfn invalid(x:i32,s:&mut []i64)->i32{x}','mutable parameter for this workspace'),
+ 'missing_workspace_parameter': (STATE+'fn main(){task scope j(1,initialize){id:=spawn j invalid(1)}}\nfn invalid(x:i32)->i32{x}','mutable parameter for this workspace'),
+ 'workspace_resource': ('struct State{address:ptr}\nfn factory()->State{factory()}\nfn main(){task scope j(2,factory){}}','workspace contains a value outside isolated storage'),
+ 'workspace_initializer_args': (STATE+'fn main(){task scope j(1,count){}}','initializer without parameters'),
+ 'workspace_initializer_scalar': ('fn factory()->i32{42}\nfn main(){task scope j(1,factory){}}','initializer must return an owned record'),
  'input_string': ('fn work(n:string)->i64{1}\nfn main(){task scope j(1){id:=spawn j work("x")}}','input must be isolated Data'),
  'result_string': ('fn work(n:i64)->string{n.str()}\nfn main(){task scope j(1){id:=spawn j work(1)}}','result must be isolated Data'),
  'payload_enum': ('enum E{A(i64)}\nfn work(n:E)->E{n}\nfn main(){task scope j(1){id:=spawn j work(E.A(1))}}','input must be isolated Data'),

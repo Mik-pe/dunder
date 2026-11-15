@@ -54,9 +54,45 @@ först läsa med vanlig `await` och sedan överta originalet med `await!`.
 Efter övertagandet ger varje ny läsning av samma nyckel, inklusive kopior
 av nyckeln, taskfelet 112. Resultatvärdet överlever scopet som andra ägda värden.
 
+## Återanvändbar arbetsyta
+
+```dunder
+struct Workspace { values: []i32 }
+fn initialize() -> Workspace { Workspace { values: [] } }
+
+fn work(n: i32, ws: &mut Workspace) -> i32 {
+    ws.values.clear()
+    for i in 0..n { ws.values.push(i) }
+    ws.values.len
+}
+
+fn main() {
+    task scope jobs(2, initialize) {
+        a := spawn jobs work(20)
+        b := spawn jobs work(30)
+        print(await! jobs(a) + await! jobs(b))
+    }
+}
+```
+
+Det andra argumentet till scopet är en namngiven säker funktion utan
+parametrar som returnerar ett ägt record. Runtimen anropar den en gång per
+skapad workerarena. När ett jobb i samma scope får en ledig arena får det
+också exklusiv tillgång till dess arbetsyta genom sin andra parameter.
+Fältens värden och arraykapacitet finns kvar när nästa jobb börjar. Vilken
+arena ett jobb får beror på kapacitet och insamlingsordning. Beräkningar som
+ska ge samma svar vid olika workerantal behöver återställa sitt lokala
+analystillstånd inför jobbet.
+
+Arbetsytan skapas och stannar i workerarenan. Kompilatorn kontrollerar
+initialiserarens transitiva effekter och alla lagrade typer, även i opaque
+records. Tal, lokala strängar, taggenums, tillåtna arrayer och recordfält
+stöds. Adresser, lån, callbacks och tasknycklar avvisas. Separata scope
+äger separata arbetsytor.
+
 ## Vad en worker får använda
 
-Spawn kräver en namngiven säker Dunder-funktion med exakt en värdeparameter.
+Spawn kräver en namngiven säker Dunder-funktion med en värdeparameter för indata. Ett scope med arbetsyta kräver också en andra parameter av typen `&mut Workspace` för den deklarerade arbetsytan.
 Indata och returtyp måste tillhöra den kontrollerade klondomänen:
 
 - Primitiva tal, bool, rune, unit och enums utan payload.
@@ -82,8 +118,7 @@ ett jobb i libdispatchs globala trådpool. Skalarer skickas som värdebitar.
 En dispatchgrupp per jobb synkroniserar resultatet. Efter avslutat jobb
 kopieras det efterfrågade resultatet till förälderns arena. En vanlig
 `await` klonar förälderns cache medan `await!` tar över den.
-Scopet återanvänder upp till 64 workerarenor om 512 MiB och avmappar
-dem vid utgång.
+Scopet återanvänder sina workerarenor om 512 MiB och avmappar dem vid utgång. Ett scope utan arbetsyta behåller högst 64 lediga arenor. Med arbetsyta begränsar scopets kapacitet antalet arenor.
 
 ## Fel och kompilering
 
@@ -112,7 +147,7 @@ En enda `compile_session.Session` behåller frontend, typ- och lånekontroll,
 symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
 `compile_parallel` skickar funktionslokala operationer och metadata i separata
 kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
-optimerar och sänker funktionerna i batchen med återanvända arbetsarenor.
+optimerar och sänker funktionerna i batchen med arbetsytor som återanvänds över batchgränserna.
 Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
 Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/mir_task.ddr)
 
