@@ -341,7 +341,7 @@ def mutation_cases():
 
     arrays = [[],[0],[-9],[3,-4,7,7,1]]
     for name,function,transform in [
-        ('mutation_counted', 'fn patch(a:&mut []i64){for i in 0..a.len{a[i]=a[i]+3}}', lambda a:[v+3 for v in a]),
+        ('mutation_counted', 'fn patch(a:&mut []i64){for i in 0..a.len{((a[i]))=a[i]+3}}', lambda a:[v+3 for v in a]),
         ('mutation_prefix', 'fn patch(a:&mut []i64){for i in 1..a.len{a[i]=a[i-1]}}', lambda a:[a[0]]*len(a) if a else []),
     ]:
         source = function+'\nfn main(){'; expected = []
