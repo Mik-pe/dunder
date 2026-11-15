@@ -187,6 +187,20 @@ fn main(){print(first(41))}
             require(all(x == reports[0] for x in reports), reports)
             self.contracts.append({'case': name, 'exact_source_diagnostic_equal': True})
 
+    def dead_body_order(self):
+        source = '''fn first(v: i32) -> i32 { if v > 0 { return v } }
+fn second() -> bool { 1 }
+fn main() { print(0) }
+'''
+        path = self.case('dead_body_order', source)
+        for driver in self.drivers:
+            image = path.parent / driver[0]
+            result = self.run(self.command(driver, 'build', path, ['-o', image]), path.parent, 1)
+            require(not image.exists(), self.log[-1])
+            require(result.stderr == f'{path}:1:50: error[E1000]: function can finish without returning a value\n',
+                    self.log[-1])
+        self.contracts.append({'case': 'dead_body_order', 'first_declaration_and_following_offset': True})
+
     def globals_and_callback(self):
         source = self.case('globals_callback', '')
         oracle = source.parent / 'oracle.c'
@@ -271,6 +285,7 @@ def main():
         for name, (source, expected) in CORE.items():
             probe.matrix(probe.case(name, source), expected, bindings=True)
         probe.diagnostics()
+        probe.dead_body_order()
         probe.globals_and_callback()
         probe.saturation()
         probe.cache()
