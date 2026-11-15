@@ -65,3 +65,7 @@ en lånad array och matchar en enum med två typer av nyttolast. Verktyget
 räknar ut förväntad standardutdata för båda och kontrollerar även att en och
 fyra workers producerar byteidentiska bilder för varje kompilator i alla sju
 byggfallen. Dessa kontroller ligger utanför mätintervallen.
+
+På macOS samlar `--rss-rounds N` dessutom N provpar för maximalt resident
+minne i byte. Dessa byggen körs separat under `/usr/bin/time -l` och deras
+bilder jämförs med uppvärmningsbyggets SHA-256.

@@ -101,13 +101,17 @@ def main():
     parser.add_argument('--rounds', type=int, default=12)
     parser.add_argument('--frontend-stress', action='store_true',
                         help='also build one large function and a many-function typed call graph')
+    parser.add_argument('--rss-rounds', type=int, default=0,
+                        help='run separate paired builds under macOS time -l for peak RSS')
     args = parser.parse_args()
     if args.rounds < 1 or args.report.exists():
         parser.error('use a positive number of rounds and a new report path')
+    if args.rss_rounds < 0 or (args.rss_rounds and platform.system() != 'Darwin'):
+        parser.error('--rss-rounds requires a nonnegative count and macOS for measured RSS')
     compilers = {v: getattr(args, v).resolve(strict=True) for v in ('baseline', 'candidate')}
     root = args.source_root.resolve(strict=True)
     tabell = args.tabell.resolve(strict=True)
-    rows, images, corpus_ids = [], {}, {}
+    rows, rss_samples, images, corpus_ids = [], [], {}, {}
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         generated, corpus = performance.corpus(work)
@@ -159,6 +163,19 @@ def main():
                     rows.append(dict(case=case, variant=variant, round=i+1, wall_ms=round(ms, 3),
                                      pre_image_ms=before_image / 1e6, mir_operations=timings['mir']['operations'],
                                      image_bytes=binary.stat().st_size))
+            for i in range(args.rss_rounds):
+                for variant in performance.order(list(compilers), i):
+                    binary = work / 'program'
+                    binary.unlink(missing_ok=True)
+                    result = subprocess.run(['/usr/bin/time', '-l', compilers[variant], 'build', source,
+                                             '--jobs=4', '--timings=json', '-o', binary],
+                                            cwd=root, env=performance.ENV, capture_output=True, check=True,
+                                            timeout=120)
+                    match = re.search(rb'^\s*(\d+)\s+maximum resident set size$', result.stderr, re.M)
+                    if not match or performance.digest(binary) != images[f'{case}-{variant}']:
+                        raise RuntimeError(f'RSS observation or image mismatch for {case}/{variant}')
+                    rss_samples.append(dict(case=case, variant=variant, round=i + 1,
+                                            max_rss_bytes=int(match.group(1))))
             summary = [round(statistics.median(r['wall_ms'] for r in rows if r['case']==case
                         and r['variant']==v), 2) for v in compilers]
             print(case, *summary, flush=True)
@@ -170,6 +187,10 @@ def main():
                       compiler_sha256={v: performance.digest(p) for v,p in compilers.items()},
                       corpus=corpus, corpus_sha256=corpus_ids, tabell_sha256=tabell_hashes,
                       image_sha256=images, samples=rows)
+        if args.rss_rounds:
+            report['rss_clock'] = 'independent fresh builds via macOS /usr/bin/time -l; maximum resident set size in bytes'
+            report['rss_rounds'] = args.rss_rounds
+            report['rss_samples'] = rss_samples
         if args.frontend_stress:
             report['build_jobs'] = 4
             report['checked_identical_jobs'] = [1, 4]
