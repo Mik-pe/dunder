@@ -44,24 +44,25 @@ som fristående ELF-binärer.
 
 ## Frönas ursprung
 
-De tre fröna kommer från Dunder-källrevision `a1e4478f8906c1d70f159051fd603f64b59fb05e`.
-De byggdes från föregående frön från revision `28fd7d7`, med värdens
-ingångsfil och två byteidentiska slutbyggen. Fröna förstår explicit `.clone()`
-och stränginterpolering, så att kompilatorns källkod kan migreras till
-uttryckliga kopior utan att förlora återbyggnadskedjan.
+De tre fröna kommer från Dunder-källrevision `f5ad2ab52b3d58e8a8670df2635a0c80f4145296`.
+De byggdes från föregående frön från revision `a1e4478`, med värdens
+ingångsfil och två byteidentiska slutbyggen. Fröna förstår `mut`, `move`-uttryck, ägande parametrar och funktionstyper,
+explicit `.clone()` och stränginterpolering. Bryggan behåller den tidigare
+semantiken för att kunna bygga kompilatorn som inför de nya ägarskapsreglerna.
 Komprimeringen är `gzip -9 -n`.
 Tabellen anger SHA-256 för den **uppackade** kompilatorn. Syskonfilerna
 `*.sha256` kontrollerar de komprimerade filerna.
 
 | Värd | Ingångsfil | SHA-256 |
 | --- | --- | --- |
-| ARM64/macOS | `selfhost/main.ddr` | `6b5a0782b4b7058084e5d026a7aa890b87d1af4b7360ddb00afc26fc7577b4fa` |
-| ARM64/Linux | `selfhost/linux.ddr` | `9fd6183f8c7e874b7bb90b31732212199352f6584847c1fd626e6d4f42b1770c` |
-| x86-64/Linux | `selfhost/x86_linux.ddr` | `57e2e4e21e24c1f2f4bdc66a14ef23ed23b21802ecb7d5e4763a96fe2159cc54` |
+| ARM64/macOS | `selfhost/main.ddr` | `12232c0b73e66a136c100621f3cc56e2abf72563670314c6763c96d37e6c12be` |
+| ARM64/Linux | `selfhost/linux.ddr` | `90d821a633512e93f0b04866b83de9c8c2c5663ceb113f77f55ddd24fb43ee9e` |
+| x86-64/Linux | `selfhost/x86_linux.ddr` | `8abfdc9016cb1772aff4b8473b8f52b8e604258b9116be46834f3a6bdb9eb104` |
 
-macOS passerade den fullständiga verifieringens 81 sviter och byteidentiska
-självbyggen med en och fyra workers. Båda Linux-värdarna passerade seriell
-fixpunkt, fem interpoleringsgrupper och elva process-/biblioteksgrupper.
+Bryggkällan passerade 55 kompilatorgrupper, 15 lexergrupper, 17 nativa
+målbilder och 12 syntaxfel samt seriell fixpunkt och byteidentiska
+självbyggen med en och fyra workers på macOS. Båda Linux-värdarna
+passerade seriell fixpunkt, syntaxfixturen och fem interpoleringsgrupper.
 Linux/x86-64 kördes under emulering på ARM64. Varje frö kan bygga
 kompilatorn och korskompilera program till alla fyra mål.
 
