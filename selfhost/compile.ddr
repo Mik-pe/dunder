@@ -16,6 +16,7 @@ import arm64 as arm
 import backend_row as row
 import std.map as map
 import std.parse as parse
+import std.bytes as validation_bytes
 import runtime
 import runtime_intrinsic as ri
 import record_take
@@ -137,7 +138,7 @@ pub opaque struct Session {
     tasks: tc.TaskGraph,
     types: ft.TypeRegistry, helper_labels: []i32, array_helpers: i32,
     ok: bool, error: string, error_at: i32,
-    validating_dead: bool, report: bool, bindings: Bindings,
+    validating_dead: bool, validated_through: i32, report: bool, bindings: Bindings,
     wasm_abi: wa.Abi, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports,
     callback_labels: []i32, has_callbacks: bool,
@@ -1241,7 +1242,8 @@ fn forward_loan(c: &mut Session, origin: i32, f: i32, signature: i32, parameter:
     if origin == -1 { return }
     if f >= 0 {
         facts.forward(&mut c.body.facts, origin, c.world.param_starts[f] + parameter, at)
-    } else {
+    } else if signature < c.types.declared.type_kinds.len {
+        // Only canonical declared signatures can match an address-taken declaration.
         facts.indirect(&mut c.body.facts, origin, signature, parameter, at)
     }
 }
@@ -3046,7 +3048,7 @@ pub fn new_session() -> Session {
         tasks: tc.new_graph(),
         types: ft.new_registry(), helper_labels: [], array_helpers: -1,
         ok: true, error: "", error_at: 0,
-        validating_dead: false, report: report, bindings: bindings(),
+        validating_dead: false, validated_through: -1, report: report, bindings: bindings(),
         wasm_abi: wa.new(), imports: imports(), callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], loans: scratch.loans(),
         fn_labels: [],
@@ -3392,6 +3394,87 @@ pub fn compile_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, mod
     finish(&mut c, &mut link, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings,
         &mut range_work, &catalog, &mut inline_work, &mut records, &mut record_takes)
 }
+
+// Only dead declarations enter this path. Reachability has been closed and no
+// machine output is retained. All diagnostic precedence follows declaration order.
+pub struct Validation { declaration: i32, at: i32, error: []u8, effects: i64, first_task: i32, observations: []i32 }
+pub fn validation_plan(c: &Session) -> []i32 {
+    var ids: []i32 = []
+    if !c.ok || c.jobs.phase != 2 || c.report { return ids }
+    for f in (c.validated_through + 1)..c.world.names.len {
+        if !c.jobs.compiled[f] && c.world.libraries[f] == "" { ids.push(f) }
+    }
+    ids
+}
+fn pack_observation(out: &mut []i32, values: &[]i32, column: i32) {
+    if values.len == 0 { return }
+    out.push(column); out.push(values.len)
+    for value in values { out.push(value) }
+}
+pub fn check_isolated(c: &mut Session, f: i32) -> Validation {
+    assert(c.validating_dead && c.code.checking && !c.report)
+    var model := opt_ir.new(); catalog := opt_inline.new(); var inline_work := opt_inline.workspace()
+    ft.reset_body(&mut c.types); facts.reset(&mut c.body.facts, 0)
+    c.ok = true; c.error = ""; c.error_at = 0; c.types.error = ""
+    c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
+    c.body.reenter_owners = false; c.body.scalar_function = false
+    if c.tasks.program && c.world.unsafe_functions[f] { task_effect(&mut c, 16) }
+    type_body(&mut c, f, &mut model, &catalog, &mut inline_work)
+    var result := Validation { declaration: f, at: c.error_at, error: [], effects: c.body.facts.effects,
+        first_task: -1, observations: [] }
+    if !c.ok { validation_bytes.append_utf8(&mut result.error, c.error); return result }
+    if c.body.facts.first_task >= 0 { result.first_task = validation_token(&c, c.body.facts.first_task) }
+    for i in 0..c.body.facts.worker_tokens.len { c.body.facts.worker_tokens[i] = validation_token(&c, c.body.facts.worker_tokens[i]) }
+    for i in 0..c.body.facts.factory_tokens.len { c.body.facts.factory_tokens[i] = validation_token(&c, c.body.facts.factory_tokens[i]) }
+    for i in 0..c.body.facts.shared_tokens.len { c.body.facts.shared_tokens[i] = validation_token(&c, c.body.facts.shared_tokens[i]) }
+    pack_observation(&mut result.observations, &c.body.facts.needed, 0)
+    pack_observation(&mut result.observations, &c.body.facts.taken, 1)
+    pack_observation(&mut result.observations, &c.body.facts.calls, 2)
+    pack_observation(&mut result.observations, &c.body.facts.workers, 3)
+    pack_observation(&mut result.observations, &c.body.facts.worker_tokens, 4)
+    pack_observation(&mut result.observations, &c.body.facts.factories, 5)
+    pack_observation(&mut result.observations, &c.body.facts.factory_tokens, 6)
+    pack_observation(&mut result.observations, &c.body.facts.shared, 7)
+    pack_observation(&mut result.observations, &c.body.facts.shared_tokens, 8)
+    pack_observation(&mut result.observations, &c.body.facts.exposed, 9)
+    pack_observation(&mut result.observations, &c.body.facts.forwards, 10)
+    pack_observation(&mut result.observations, &c.body.facts.indirect, 11)
+    result
+}
+pub fn accept_validation(c: &mut Session, result: &Validation) -> bool {
+    if !c.ok || c.jobs.phase != 2 || c.report { return false }
+    var f := c.validated_through + 1
+    while f < c.world.names.len && (c.jobs.compiled[f] || c.world.libraries[f] != "") { f = f + 1 }
+    if f >= c.world.names.len || result.declaration != f { return false }
+    if result.error.len > 0 {
+        message := validation_bytes.decode(&result.error)
+        c.ok = false; c.error_at = result.at; c.error = message.value; return false
+    }
+    facts.reset(&mut c.body.facts, 0)
+    c.body.facts.effects = result.effects; c.body.facts.first_task = result.first_task
+    var p := 0
+    while p < result.observations.len {
+        column := result.observations[p]; count := result.observations[p + 1]; p = p + 2
+        for i in p..(p + count) {
+            value := result.observations[i]
+            if column == 0 { c.body.facts.needed.push(value) }
+            else if column == 1 { c.body.facts.taken.push(value) }
+            else if column == 2 { c.body.facts.calls.push(value) }
+            else if column == 3 { c.body.facts.workers.push(value) }
+            else if column == 4 { c.body.facts.worker_tokens.push(value) }
+            else if column == 5 { c.body.facts.factories.push(value) }
+            else if column == 6 { c.body.facts.factory_tokens.push(value) }
+            else if column == 7 { c.body.facts.shared.push(value) }
+            else if column == 8 { c.body.facts.shared_tokens.push(value) }
+            else if column == 9 { c.body.facts.exposed.push(value) }
+            else if column == 10 { c.body.facts.forwards.push(value) }
+            else if column == 11 { c.body.facts.indirect.push(value) }
+        }
+        p = p + count
+    }
+    accept_facts(&mut c, f); c.validated_through = f; true
+}
+
 fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace,
     scalar_plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options,
     range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace,
@@ -3408,7 +3491,7 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
     c.code.checking = true; c.code.platform = 0
     c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
     c.imports.globals = 0
-    for f in 0..c.world.names.len {
+    for f in (c.validated_through + 1)..c.world.names.len {
         if !c.jobs.compiled[f] && c.world.libraries[f] == "" { compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work) }
         if !c.ok { return Result { ok: false, error: c.error, offset: c.error_at, text: [], imports: imports() } }
     }
@@ -4033,9 +4116,18 @@ fn produce_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut
     emit_scalar(&mut c, f, &model, &mut plan, &emit_settings)
 }
 fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
-    if c.inline_enabled { fragments.reset_dependencies(&mut c.body.inline_deps) }
     var started: i64 = -1
     if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
+    type_body(&mut c, f, &mut model, &catalog, &mut inline_work)
+    if c.bindings.profile.enabled {
+        var phase := 7
+        if model.probing { phase = 1 }
+        profile.finish(&mut c.bindings.profile, phase, started, i64(c.body.cursor - c.world.starts[f] + 1))
+    }
+}
+
+fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
+    if c.inline_enabled { fragments.reset_dependencies(&mut c.body.inline_deps) }
     reset_body(&mut c.body)
     c.body.current_owner = c.world.function_owners[f]
     c.body.testing = c.world.test_functions[f]
@@ -4066,11 +4158,6 @@ fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
     for o in param_owners..c.body.owned_slots.len { if c.body.owned_slots[o] >= 0 { owner_store(&mut c, .Initialize, c.body.owned_types[o], c.body.owned_slots[o]) } }
     arm.branch(&mut c.code, body, 0)
     if c.ok { arm.frame(&mut c.code, frame, c.body.slots) }
-    if c.bindings.profile.enabled {
-        var phase := 7
-        if model.probing { phase = 1 }
-        profile.finish(&mut c.bindings.profile, phase, started, i64(c.body.cursor - c.world.starts[f] + 1))
-    }
 }
 
 fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runtime, record_takes: &mut record_take.Plan) -> Result {
