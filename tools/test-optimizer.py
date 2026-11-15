@@ -157,6 +157,16 @@ def positive_cases():
     yield 'readonly_arrays', arrays + '}\n', expected
     yield 'fallback_owned_copy', '''fn copied(a:&[]i64)->i64{var b:=a;b[0]=123;return a[0]+b[0]}
         fn main(){a:[]i64=[7,11];print(copied(&a));print(a[0])}\n''', [130,7]
+    # Both graph limits can end inside an operator, before its destination or
+    # frame are complete. Its checked prefix still feeds subsequent statements.
+    statements = 'v=v+1;' * 600
+    yield 'fallback_node_budget', ('fn sum(x:i64)->i64{var v:=x;' + statements +
+                                   'v}\nfn main(){print(sum(5))}\n'), [605]
+    expression = 'x' + '+1' * 70
+    yield 'fallback_height_budget', ('fn sum(x:i64)->i64{' + expression +
+                                     '}\nfn main(){print(sum(5))}\n'), [75]
+    yield 'grouped_array_read', ('fn read(a:&[]i64)->i32{((a)).len}\n'
+                                 'fn main(){a:[]i64=[7,8,9];print(read(&a))}\n'), [3]
     yield 'fallback_live_expression_and_edges', """
         fn tap(x:i64)->i64{print(x); x+2}
         fn mixed(x:i64,y:i64)->i64{
