@@ -28,14 +28,12 @@ samma kedja. En funktions stöd för optimering avgörs av explicita effekter
 och bevis, inte av ett andra språkurval som bara accepterar skalära kroppar.
 Typkontrollen fortsätter att kontrollera all källkod före omskrivning.
 
-Övergången använder en adapter från den befintliga gemensamma
-instruktionsvokabulären. Den gör det möjligt att flytta hela språket genom
-gränsen utan att samtidigt skriva om all diagnostik. Adaptern får behålla
-ursprungliga kodord för exakt återspelning, men en operation som ändras
-måste sänkas från sin kanoniska semantik. Pass får inte avkoda råa ARM-ord
-för att upptäcka sina operander eller effekter. Frontend avger explicita
-frame-, minnes- och ABI-kontrakt; på sikt ersätter direkt IR-emission
-adaptern. Den gamla direkta maskinkodsvägen ska då avvecklas.
+Källkompilatorn producerar nu typade operationer direkt. Den gemensamma
+MIR-byggaren avvisar fristående maskinord och verifierar operationerna
+före målsänkning. Den tidigare instruktionsavkodaren används av tester
+för handskrivna maskinkodsfixturer. Målsänkningen använder fortfarande
+den befintliga registermodellen och målöversättarna för x86-64 och Wasm.
+[Nuvarande byggkedja](../selfhost/README.md#tasks-i-kompilatorn)
 
 ## Milstolpar
 
