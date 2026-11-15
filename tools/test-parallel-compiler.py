@@ -162,7 +162,7 @@ class Probe:
             result = self.run(self.command(driver, 'build', source, ['--timings=json', '-o', image]), source.parent)
             frontend = json.loads(result.stderr)['frontend']
             if jobs is not None:
-                require(frontend['scalar_bodies'] == count and 1 <= frontend['workers_used'] <= min(jobs, count), frontend)
+                require(frontend['scalar_bodies'] == count and 1 <= frontend['workers_used'] <= frontend['peak_total_jobs'] <= jobs, frontend)
             images.append(digest(image))
             self.execute(image, 'arm64-macos', '1029\n')
         require(len(set(images)) == 1, images)
@@ -179,7 +179,7 @@ class Probe:
             result = self.run(self.command(driver, 'build', source, ['--timings=json', '-o', image]), source.parent)
             frontend = json.loads(result.stderr)['frontend']
             if jobs is not None:
-                require(frontend['general_bodies'] >= 12, frontend)
+                require(frontend['general_bodies'] >= 12 and 0 < frontend['peak_total_jobs'] <= jobs, frontend)
             images.append(digest(image))
             self.execute(image, 'arm64-macos', '01234567891011\n')
         require(len(set(images)) == 1, images)
