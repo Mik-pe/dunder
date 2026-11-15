@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
-SOURCES = ('selfhost/mir_lower.ddr', 'selfhost/fragments.ddr',
+SOURCES = ('selfhost/mir/mir_lower.ddr', 'selfhost/driver/fragments.ddr',
            'tests/mir_fragment.ddr', 'tests/fixtures/mir-fragment-emitter.ddr')
 
 

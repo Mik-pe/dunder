@@ -2,7 +2,7 @@
 
 För den aktuella självhostade kompilatorn används nu
 [`tools/performance.py`](../../tools/performance.py).
-[Aktuella resultat och reproduktion](../2026-11-10-selfhost-performance/README.md)
+[Aktuella resultat och reproduktion](../archive/2026-11-10-selfhost-performance/README.md)
 omfattar samma fyra arbetsfall, en kontrollerad C-referens och kompletta
 byggen. Rapporterna nedan bevarar tidigare kompilatorrevisioners resultat.
 

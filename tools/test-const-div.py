@@ -294,8 +294,8 @@ def main():
                         help='validate fixtures with this compiler alone, without new CLI flags')
     parser.add_argument('--verify-selection', action='store_true', help='assert helpers still use the typed model via timings counters')
     parser.add_argument('--case', help='run only program names containing this substring')
-    parser.add_argument('--plan-module', type=Path, default=ROOT / 'selfhost/const_div.ddr',
-                        help='real Dunder plan module to export; default: this checkout selfhost/const_div.ddr')
+    parser.add_argument('--plan-module', type=Path, default=ROOT / 'selfhost/opt/const_div.ddr',
+                        help='real Dunder plan module to export; default: this checkout selfhost/opt/const_div.ddr')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     variants = [('off', compiler, ['--const-div-opt=off']),

@@ -87,10 +87,11 @@ def decode(output):
 
 def fixture_source(source_root, work):
     source = (ROOT / 'tests/fixtures/inline-producer.ddr').read_text()
-    for name, alias in (('compile', 'compiler'), ('lexer', 'lexer'), ('macho', 'macho'), ('elf', 'elf')):
-        original = 'import ...selfhost.' + name + (' as compiler' if name == 'compile' else '')
+    for subpath, alias in (('frontend/compile', 'compiler'), ('frontend/lexer', 'lexer'),
+                           ('backend/macho', 'macho'), ('backend/elf', 'elf')):
+        original = 'import ...selfhost.' + subpath.replace('/', '.') + (' as compiler' if alias == 'compiler' else '')
         assert source.count(original) == 1, ('fixture import changed', original)
-        relative = os.path.relpath(source_root / 'selfhost' / name, work).replace(os.sep, '/')
+        relative = os.path.relpath(source_root / 'selfhost' / subpath, work).replace(os.sep, '/')
         source = source.replace(original, 'import ' + json.dumps(relative) + ' as ' + alias)
     return source
 
@@ -112,7 +113,7 @@ def main():
     else:
         parser.error('execution requires ARM64 macOS or ARM64/x86-64 Linux')
     inputs = {compiler, Path(__file__).resolve(), ROOT / 'tests/fixtures/inline-producer.ddr',
-              *source_root.glob('selfhost/*.ddr')}
+              *(source_root / 'selfhost').rglob('*.ddr')}
     if baseline:
         inputs.add(baseline)
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

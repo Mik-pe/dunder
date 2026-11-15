@@ -183,12 +183,12 @@ def main():
     args=p.parse_args();compiler=args.compiler.resolve(strict=True)
     host=0 if platform.system()=='Darwin' else (1 if platform.machine() in ('arm64','aarch64') else 2)
     fixture=ROOT/'tests/fixtures/mir-expr-oracle.ddr';adapter=ROOT/'tests/fixtures/mir_expr_qa_adapter.ddr';support=ROOT/'tests/fixtures/mir_region_qa_support.ddr'
-    declaration=(ROOT/'selfhost/mir.ddr').read_text().split('pub struct Function {',1)[1].split('\n}',1)[0]
+    declaration=(ROOT/'selfhost/mir/mir.ddr').read_text().split('pub struct Function {',1)[1].split('\n}',1)[0]
     fields=set(re.findall(r'\b([a-z][a-z0-9_]*)\s*:',re.sub(r'//[^\n]*','',declaration)))
     observed=set(re.findall(r'\bf\.([a-z][a-z0-9_]*)',support.read_text().split('pub fn metadata(',1)[1]))
     assert fields==observed,(fields-observed,observed-fields)
     report=dict(fields=len(fields),host=host,hashes={},images=[])
-    for name,path in dict(compiler=compiler,fixture=fixture,adapter=adapter,support=support,ssa=ROOT/'selfhost/mir_ssa.ddr',expr=ROOT/'selfhost/mir_expr_stack.ddr',generic_oracle=ROOT/'tools/test-mir.py',tool=Path(__file__).resolve(),region_tool=ROOT/'tools/test-mir-regions.py').items(): report['hashes'][name]=region.digest(path)
+    for name,path in dict(compiler=compiler,fixture=fixture,adapter=adapter,support=support,ssa=ROOT/'selfhost/mir/mir_ssa.ddr',expr=ROOT/'selfhost/mir/mir_expr_stack.ddr',generic_oracle=ROOT/'tools/test-mir.py',tool=Path(__file__).resolve(),region_tool=ROOT/'tools/test-mir-regions.py').items(): report['hashes'][name]=region.digest(path)
     with tempfile.TemporaryDirectory(prefix='dunder-expr-qa-') as tmp:
         work=args.output.resolve() if args.output else Path(tmp)
         if args.output: work.mkdir(parents=True,exist_ok=True);assert not any(work.iterdir())

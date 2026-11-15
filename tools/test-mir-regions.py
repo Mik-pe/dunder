@@ -158,14 +158,14 @@ def main():
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
     fixture = ROOT / 'tests/fixtures/mir-regions-oracle.ddr'
     support = ROOT / 'tests/fixtures/mir_region_qa_support.ddr'
-    declaration = (ROOT / 'selfhost/mir.ddr').read_text().split('pub struct Function {', 1)[1].split('\n}', 1)[0]
+    declaration = (ROOT / 'selfhost/mir/mir.ddr').read_text().split('pub struct Function {', 1)[1].split('\n}', 1)[0]
     metadata = support.read_text().split('pub fn metadata(', 1)[1]
     fields = set(re.findall(r'\b([a-z][a-z0-9_]*)\s*:', re.sub(r'//[^\n]*', '', declaration)))
     observed = set(re.findall(r'\bf\.([a-z][a-z0-9_]*)', metadata))
     assert fields == observed, (fields - observed, observed - fields)
     report = {'host': host, 'fields': len(fields), 'hashes': {}, 'images': []}
     for key, path in dict(compiler=compiler, fixture=fixture, support=support,
-                          ssa=ROOT/'selfhost/mir_ssa.ddr', frame_abi=ROOT/'selfhost/mir_call_abi.ddr').items():
+                          ssa=ROOT/'selfhost/mir/mir_ssa.ddr', frame_abi=ROOT/'selfhost/mir/mir_call_abi.ddr').items():
         report['hashes'][key] = digest(path)
     with tempfile.TemporaryDirectory(prefix='dunder-regional-qa-') as temp:
         work = args.output.resolve() if args.output else Path(temp)

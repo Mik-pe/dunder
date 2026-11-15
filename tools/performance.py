@@ -122,7 +122,7 @@ def corpus(work):
 
 
 def source_hashes():
-    paths = sorted(set(ROOT.glob('selfhost/*.ddr')) | set(ROOT.glob('stdlib/*.ddr'))
+    paths = sorted(set((ROOT / 'selfhost').rglob('*.ddr')) | set(ROOT.glob('stdlib/*.ddr'))
                    | set(ROOT.glob('runtime/*.ddr')) | set(ROOT.glob('benchmarks/runtime/*.ddr'))
                    | {ROOT / 'benchmarks/runtime/reference.c'})
     return {str(p.relative_to(ROOT)): digest(p) for p in paths}

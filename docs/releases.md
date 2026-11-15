@@ -1,6 +1,6 @@
 # Lokala kompilatorbyggen för GitHub Releases
 
-Ange versionsnumret från `compiler_version()` i `selfhost/cli.ddr`. Med
+Ange versionsnumret från `compiler_version()` i `selfhost/driver/cli.ddr`. Med
 följande kommando hamnar de färdiga filerna i `build/release/v0.1.0/`.
 
 ```sh

@@ -116,7 +116,7 @@ text/sort ligger på 1,3376/1,2649. Ingen samlad runtimevinst är belagd och
 C-gränserna återstår. Standardlägets byggmedianer ändras 0,28–0,69 procent
 mot förra kompilatorn med samma källor och byteidentiska konsumenter.
 
-Den historiska [v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+Den historiska [v1-mätningen](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
 visade 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34
 procent för Tabell; runtime/C-geomedlet var 1,181 mot 1,178 med passet av.
 En separat SSA-optimerad kompilatorbinär gav ingen meningsfull byggvinst
@@ -142,7 +142,7 @@ sortering med 26,3 % och för arraysummering med 5,6 %. Heltalsberäkning och
 UTF-8-text låg inom en procent av sin tidigare median.
 [Mätserie och rådata](../benchmarks/compiler/2026-11-15-native-code/README.md)
 
-Den tidigare [30-rundorsmätningen av parallell kompilering](../benchmarks/2026-11-12-parallel-compiler/README.md),
+Den tidigare [30-rundorsmätningen av parallell kompilering](../benchmarks/archive/2026-11-12-parallel-compiler/README.md),
 före SSA-grunden, ger med samma binär genererad byggmedian
 953,718→609,106 ms när workerantalet ökar från en till fyra. Standardkandidatens genererade p95 är 619,768 ms,
 163 003 källrader/s. Runtimebilderna är identiska. C-geomedlet 1,178× och
@@ -169,7 +169,7 @@ Se även [macOS-appar](app-bundles.md).
 
 ## WebAssembly (senarelagt under språkutveckling)
 
-Wasm-backenden finns kvar i `selfhost/wasm_*.ddr`, men Wasm-testsviter,
+Wasm-backenden finns kvar i `selfhost/backend/wasm_*.ddr`, men Wasm-testsviter,
 `wasm32`-byggen i testmatrisen och externa JS-runtimes (Node/Bun) har tagits
 bort ur verifieringskedjan och **senarelagts** under pågående språkutveckling.
 All aktiv språk- och kompilatorverifiering (`./tools/dev.sh` och

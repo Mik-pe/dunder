@@ -20,12 +20,12 @@ På ARM64/macOS använder språkets taskruntime libdispatchs trådpool och
 scopets återanvändbara arenor. En och flera workers använder samma batchkod.
 Kontrolläge och kompilatorprofilering använder den seriella Session-vägen.
 
-Detta framgår av [compile_parallel](../selfhost/compile_parallel.ddr),
-[dagens jobbobjekt](../selfhost/mir_task.ddr) och
-[Session.next_into](../selfhost/compile.ddr#L2870).
+Detta framgår av [compile_parallel](../selfhost/tasks/compile_parallel.ddr),
+[dagens jobbobjekt](../selfhost/tasks/mir_task.ddr) och
+[Session.next_into](../selfhost/frontend/compile.ddr#L2870).
 [Taskkontraktet](tasks.md) beskriver isolering och resultatskopiering.
 
-Den historiska [parallellmätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den historiska [parallellmätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
 visar redan en vinst av MIR-parallellism: samma binär med en respektive fyra
 workers byggde det genererade programmet på median 953,718 respektive
 609,106 ms och den frysta seriella självhostingången på 874,940 respektive
@@ -44,24 +44,24 @@ aktuell baslinje för den nya implementationen.
 | En funktions semantik och lokala lagring | Cursor, scopes, lokaler, mutabilitet, temporära ägare, places, cleanup och loopar | `FunctionContext` och `TypedFunction` |
 | Hela programmets ordnade samordning | Nåbarhet, globala typ-/symbol-ID:n, imports, inlinebudget, cache, lånegraf, taskeffekter och publicering | `Session` |
 
-Utgångspunkterna finns i [Session-fälten](../selfhost/compile.ddr#L75),
-[headers](../selfhost/compile.ddr#L483) och
-[compile_body](../selfhost/compile.ddr#L3261). Kroppsreseten där visar en stor
+Utgångspunkterna finns i [Session-fälten](../selfhost/frontend/compile.ddr#L75),
+[headers](../selfhost/frontend/compile.ddr#L483) och
+[compile_body](../selfhost/frontend/compile.ddr#L3261). Kroppsreseten där visar en stor
 del av det tillstånd som faktiskt har funktionslivstid.
 
 Att enbart flytta dessa fält till en ny record räcker inte:
 
-- [add_type](../selfhost/compile.ddr#L285) tilldelar direkt clone/drop-etiketter
+- [add_type](../selfhost/frontend/compile.ddr#L285) tilldelar direkt clone/drop-etiketter
   i global Code. `compound`, `fixed` och `callable_type` internerar typer även
   under kroppstypning. Typidentitet och maskinsymboler måste få skilda livscykler.
-- [invoke](../selfhost/compile.ddr#L1369) gör eager argumenttypning, borrow- och
+- [invoke](../selfhost/frontend/compile.ddr#L1369) gör eager argumenttypning, borrow- och
   mutationskontroll, lagrar argumentslots, förbrukar inlinebudget och emitterar
   anrop i samma funktion. Den semantiska ordningen måste kunna uttryckas utan
   global Code.
 - Strängar, imports, callbacks, statisk lagring och typhelpers upptäcks under
   kroppar. De ska bli ordnade symbolbehov, inte worker-mutationer av globala
   räknare.
-- [scratch.Loans](../selfhost/scratch.ddr#L45) innehåller en helprogramsgraf med
+- [scratch.Loans](../selfhost/frontend/scratch.ddr#L45) innehåller en helprogramsgraf med
   parameterkanter och indirekta anrop. Taskcertifieringen har också en
   transitiv effektgraf. Dessa kan inte behandlas som enbart lokal scratch.
 
@@ -88,8 +88,8 @@ alternativ modulflattening.
   mål-/layoutpolicy. Ett enkelt generationsnummer räcker för lokal lifecycle,
   men ersätter inte innehållsidentitet i persistent cache.
 
-Se [modulupplösningen](../selfhost/modules.ddr) och
-[deklarationspassen](../selfhost/compile.ddr#L483). Gränsen måste bevara
+Se [modulupplösningen](../selfhost/driver/modules.ddr) och
+[deklarationspassen](../selfhost/frontend/compile.ddr#L483). Gränsen måste bevara
 opaque-ägare och modulkapabiliteter, inte bara typers storlek och fältnamn.
 
 ### TypeRef och funktionslokala typer
@@ -208,9 +208,9 @@ Parenten behåller källnamn och rapportering där arbetaren bara behöver ID:n.
 Varje worker har lokala återanvändbara arbetsarenor inom sitt jobb eller sin
 framtida batch; de får inte ligga som lånade fält i jobbindata.
 
-Dagens [task-Data](../selfhost/task_data.ddr) tillåter inte delade RC-strängar,
+Dagens [task-Data](../selfhost/tasks/task_data.ddr) tillåter inte delade RC-strängar,
 borrows eller oklassificerade opaque-värden över gränsen.
-[lexer.Tokens](../selfhost/lexer.ddr#L5) är därför inte ett färdigt jobbobjekt.
+[lexer.Tokens](../selfhost/frontend/lexer.ddr#L5) är därför inte ett färdigt jobbobjekt.
 Använd primitiva ID-kolumner och packade UTF-8-bytearenor med offset/längd där
 källtext verkligen behöver transporteras. Befintligt `FunctionObject` är opaque och korsar inte taskgränsen. Den
 införda transparenta numeriska `mir_lower.ObjectData` använder de vanliga
@@ -231,20 +231,20 @@ batchkopian efter separat språk-/livstidsverifiering.
 
 ## Vad som återanvänds
 
-- [mir.Function](../selfhost/mir.ddr) och
-  [mir_pipeline](../selfhost/mir_pipeline.ddr) behåller verifiering, kanoniska
+- [mir.Function](../selfhost/mir/mir.ddr) och
+  [mir_pipeline](../selfhost/mir/mir_pipeline.ddr) behåller verifiering, kanoniska
   maskinoperationer och pass. Dagens MIR är till stor del fysiskt precolored
   med explicita ABI-/minneseffekter; den ersätter inte den nya källtypade
   gränsen. Direkta frontend-operationer ska på sikt ersätta word-liftad semantik.
-- [FunctionObject och lowerer](../selfhost/mir_lower.ddr) och
-  [mir_link](../selfhost/mir_link.ddr) återanvänds för lokala offseter,
+- [FunctionObject och lowerer](../selfhost/mir/mir_lower.ddr) och
+  [mir_link](../selfhost/mir/mir_link.ddr) återanvänds för lokala offseter,
   relokeringar och ordnad sammanfogning. Jobbets ID-bindning måste vara färdig
   innan dess maskinsymboler används.
-- [opt_ir.Nodes](../selfhost/opt_ir.ddr) ger ett återanvändbart mönster för
+- [opt_ir.Nodes](../selfhost/opt/opt_ir.ddr) ger ett återanvändbart mönster för
   kolumner och källpositioner. Dess typdomän och opcode-set är uttryckligen
   begränsade; `opt_parse` får inte bli auktoritet för resten av språket.
   Befintliga skaläroptimeringar kan senare konsumera den fullt typade modellen.
-- Delade regler i [scalar_rules](../selfhost/scalar_rules.ddr), nuvarande
+- Delade regler i [scalar_rules](../selfhost/opt/scalar_rules.ddr), nuvarande
   typ-/layoutregler och borrow-/ägarkontrakt flyttas till gemensamma moduler,
   inte till en andra uppsättning regler i en workerparser.
 - Session, taskfönster, ordinal/decl-sidecars, cacheberoenden och ordnad accept
@@ -318,7 +318,7 @@ typning välja flera workers som standard.
 ## Determinism, budgetar och cache
 
 1. **Källordning betyder dagens faktiska traversal.**
-   [Session-svepet](../selfhost/compile.ddr#L2877) skannar needed/compiled och
+   [Session-svepet](../selfhost/frontend/compile.ddr#L2877) skannar needed/compiled och
    kan upptäcka bakåtriktade callees först på nästa varv. Att sortera alla
    deklarationer en gång ger inte automatiskt samma kod- eller felordning.
    Arbete får köras spekulativt; merge och publicering följer den seriella
@@ -339,8 +339,8 @@ typning välja flera workers som standard.
    de facts som en träff ska återspela. En framtida typcache kräver egen
    versionsatt body/interface/ägare/policy-identitet. Slutkod kräver dessutom
    target, kodpolicy, privata inlinecallee-digests och rätt budgetfrontier.
-   [Dagens context/key](../selfhost/fragments.ddr#L29) och
-   [restore-debitering](../selfhost/compile.ddr#L2888) är utgångspunkter.
+   [Dagens context/key](../selfhost/driver/fragments.ddr#L29) och
+   [restore-debitering](../selfhost/frontend/compile.ddr#L2888) är utgångspunkter.
 5. **Semantikfakta får inte försvinna på en träff.** Needed-ID:n, tagna
    funktionsadresser, inlinekostnader och obligatoriska borrow-/taskeffekter
    återställs före nästa ordnade steg. Taskprogram behåller dagens cacheavstående

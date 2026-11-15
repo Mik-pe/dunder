@@ -22,8 +22,8 @@ LOCAL_FIELDS = ('type', 'param', 'mutable', 'at')
 
 def exporter(source_root, work):
     imports = []
-    for module, alias in (('opt_ir', 'ir'), ('../tests/support/typed_fixture', 'fixture'), ('opt_pass', 'pass'),
-                          ('opt_range', 'ranges'), ('opt_verify', 'verify'), ('lexer', 'lexer')):
+    for module, alias in (('opt/opt_ir', 'ir'), ('../tests/support/typed_fixture', 'fixture'), ('opt/opt_pass', 'pass'),
+                          ('opt/opt_range', 'ranges'), ('opt/opt_verify', 'verify'), ('frontend/lexer', 'lexer')):
         path = os.path.relpath(source_root / 'selfhost' / module, work).replace(os.sep, '/')
         imports.append('import ' + json.dumps(path) + ' as ' + alias)
     return '\n'.join(imports) + '''
@@ -528,7 +528,7 @@ def main():
     compiler, source_root = args.compiler.resolve(strict=True), args.source_root.resolve(strict=True)
     hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in
               [compiler, Path(__file__).resolve(), *(source_root / 'selfhost' / (n + '.ddr') for n in
-                ('opt_ir', '../tests/support/typed_fixture', 'compile', 'opt_pass', 'opt_range', 'opt_verify', 'lexer'))]}
+                ('opt/opt_ir', '../tests/support/typed_fixture', 'frontend/compile', 'opt/opt_pass', 'opt/opt_range', 'opt/opt_verify', 'frontend/lexer'))]}
     report = dict(complete=False, hashes=hashes, fuel=args.fuel, cases={}, cohorts={},
                   limitations=['finite frozen input domain', 'fuel limit', 'interpreter, not target machine code',
                                'same-storage root inputs overapproximate source borrow capabilities'])

@@ -34,7 +34,7 @@ run with `PATH=/no-external-tools` and no inherited environment variables.
 ## Calibrate once and freeze counts
 
 The checked-in inputs and work counts are frozen. `workloads.json` records the
-designated baseline and the [raw calibration](../2026-11-11-ownership-leases/calibration-revision2/).
+designated baseline and the [raw calibration](../archive/2026-11-11-ownership-leases/calibration-revision2/).
 Revision 2 counts are POD 593,041; decimal 14,479; lexer 284; symbols 445.
 Revision 1 sized the first launch of a newly built image while comparison
 used a warmup. Its short-work results are preserved; revision 2 sizes after

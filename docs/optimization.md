@@ -1,6 +1,6 @@
 # Kodgenerering i Dunder
 
-Vanliga byggen går genom [typkontrollen och kodgeneratorn](../selfhost/compile.ddr).
+Vanliga byggen går genom [typkontrollen och kodgeneratorn](../selfhost/frontend/compile.ddr).
 Kompilatorn avger instruktioner, lokala etiketter och relokeringar per funktion.
 Den tar med de runtimefunktioner som programmet behöver. Overflow, ogiltiga
 index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen.
@@ -20,26 +20,26 @@ bestämmer evalueringsordning, register och vilka kontroller som har bevisats
 överflödiga. En kontrollerad `i32`-addition testar overflow vid 32 bitar
 innan resultatet teckenutvidgas. För bitoperationer med ett känt argument
 kan emittern använda ett direkt skift eller en mask och behålla mottagaren
-i registret. [Heltalsemitter](../selfhost/integer_emit.ddr)
+i registret. [Heltalsemitter](../selfhost/backend/integer_emit.ddr)
 
 På ARM64 kan en skalär arrayåtkomst använda basregister och skalat index
 direkt när båda registren är tillgängliga. MIR registrerar vilka register
 instruktionen läser och skriver samt dess minneseffekt. För `array.push`
 väljer den typade anropsplatsen elementbredden. Finns ledig kapacitet skriver
 runtime värdet direkt. En full array går via den gemensamma kontrollerade
-tillväxtvägen. [Skalär kodgenerering](../selfhost/opt_emit.ddr) · [MIR-operationer](../selfhost/mir_operation.ddr) · [Array-runtime](../selfhost/runtime.ddr)
+tillväxtvägen. [Skalär kodgenerering](../selfhost/opt/opt_emit.ddr) · [MIR-operationer](../selfhost/mir/mir_operation.ddr) · [Array-runtime](../selfhost/runtime/runtime.ddr)
 
 ## Gemensam helfunktionskedja
 
-Alla nyemitterade källfunktioner passerar [`mir_lift`](../selfhost/mir_lift.ddr),
-[`mir_verify`](../selfhost/mir_verify.ddr) och
-[`mir_lower`](../selfhost/mir_lower.ddr) innan funktionscachen sparas. Hela
+Alla nyemitterade källfunktioner passerar [`mir_lift`](../selfhost/mir/mir_lift.ddr),
+[`mir_verify`](../selfhost/mir/mir_verify.ddr) och
+[`mir_lower`](../selfhost/mir/mir_lower.ddr) innan funktionscachen sparas. Hela
 kroppen ingår, även ägarinitiering som ligger efter en retur i kodlayouten.
 Den seriella kedjan återanvänder platta arenor och arbetsminnen mellan
 funktioner; taskjobb har lokalt arbetsminne. Kontroll utan emission skapar inga backendarenor; cacheträffar återställer
 redan sänkt kod.
 
-[`mir.Function`](../selfhost/mir.ddr) beskriver operationer, operander,
+[`mir.Function`](../selfhost/mir/mir.ddr) beskriver operationer, operander,
 maskinbredder, flaggor, kontrollkanter, byteintervall och anropseffekter.
 Källformatet beskriver bland annat typade lokaler, platser, argument,
 ägarskapsoperationer och möjliga utgångar. Byggaren läser operationernas
@@ -63,27 +63,27 @@ upplösta funktionskropp återkommer. Återanvändning kräver identiska token a
 samma slag samt samma parameternamn, parametertyper och returtyp. Den nya
 funktionen får egna källpositioner, etiketter och maskinkod. Unika kroppar
 kräver endast ett par tokenindex för att pröva återanvändning vid nästa
-funktion. Minnet begränsas till en modell per session. [Modellcache](../selfhost/opt_templates.ddr)
+funktion. Minnet begränsas till en modell per session. [Modellcache](../selfhost/opt/opt_templates.ddr)
 
 Intilliggande uppdateringar av en skalär lokal kan slås ihop när alla
 ändringar går åt samma håll och den kombinerade konstanten ryms i typen.
 Läsningar mellan uppdateringarna, kontrollflöde och ändrad riktning bryter
 kedjan. Den kombinerade heltalsoperationen behåller överflödeskontrollen.
-[Skalärpass](../selfhost/opt_pass.ddr)
+[Skalärpass](../selfhost/opt/opt_pass.ddr)
 
 ### Seriell Session och taskbaserade funktionspass
 
 Varje färdig funktion har en egen post i batchen med operationer,
 typreferenser, lokala plats-ID:n, källpositioner och symbolbehov.
 Samordnaren binder symboler i en bestämd ordning.
-[Session](../selfhost/compile.ddr) · [Funktionsformat](../selfhost/mir_source.ddr)
+[Session](../selfhost/frontend/compile.ddr) · [Funktionsformat](../selfhost/mir/mir_source.ddr)
 
 Den seriella vägen och arbetstrådarna bygger MIR från samma typade
 operationer. Arbetsminnet för verifiering, optimering och sänkning
 återanvänds mellan funktioner. Föräldern tar emot de slutliga
 funktionsobjekten i källordning, validerar dem och länkar bilden.
 En träff i fragmentcachen ger ett redan sänkt objekt.
-[Arbetstråd](../selfhost/mir_task.ddr) · [Funktionspass](../selfhost/mir_pipeline.ddr)
+[Arbetstråd](../selfhost/tasks/mir_task.ddr) · [Funktionspass](../selfhost/mir/mir_pipeline.ddr)
 
 `mir_lower.new_data()` skapar transportarenan;
 `lower_data_into(&mut data, &verified_function)` kör samma sänkningsgång
@@ -97,7 +97,7 @@ etikettabellen. Indata och resultat följer språkets vanliga regler för
 ägda värden som passerar en taskgräns.
 [ObjectData och task-livstid](../tools/test-mir-object-data.py).
 
-[`compile_parallel`](../selfhost/compile_parallel.ddr) äger begränsade
+[`compile_parallel`](../selfhost/tasks/compile_parallel.ddr) äger begränsade
 fönster av språkets isolerade tasks. Antalet workers ändrar inte symbol-
 och nåbarhetsordning, första diagnostik, inlinebudget, passbudget eller
 cacheberoenden. `--jobs N` och `--jobs=N` stöder 1–256 på ARM64/macOS-
@@ -107,19 +107,19 @@ cacheträffar och `check` har noll backendaktivitet.
 
 Samma kompilator kan korsbygga alla fyra mål. Begränsningen till ARM64/macOS
 gäller taskruntimen som kör kompilatorjobben, inte programmens målformat.
-[Parallell kompilatormätning](../benchmarks/2026-11-12-parallel-compiler/README.md)
+[Parallell kompilatormätning](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
 redovisar en worker separat från standardens fyra. Rapporten föregår SSA-grunden; dess
 byteidentiska runtimebilder behåller samma kvarvarande C-gap.
 
 ### Registerhem över hela funktioner
 
-[`mir_liveness`](../selfhost/mir_liveness.ddr) beskriver fysisk register- och
+[`mir_liveness`](../selfhost/mir/mir_liveness.ddr) beskriver fysisk register- och
 flaggliveness på verkliga CFG-kanter. Iterativ SCC-analys identifierar
 cykliska block; ägarinitieringens bakåthopp skapar ingen falsk loop.
 Returen läser både X0-resultatet och caller-observerbart ABI-tillstånd.
 Möjlig registerförstörelse vid anrop är skild från definierade resultat.
 
-[`mir_opt`](../selfhost/mir_opt.ddr) kan ge upp till fyra oexponerade,
+[`mir_opt`](../selfhost/mir/mir_opt.ddr) kan ge upp till fyra oexponerade,
 disjunkta åttabytesplatser registerhem i x25–x28. Det använder vanlig
 funktionssemantik, liveness och minnesintervall. Byte-, halvords- och
 ordåtkomster, överlapp, exponerade adresser och otillräckliga stack-/frame-
@@ -137,7 +137,7 @@ av cellinnehåll ensam bevarar inte godtyckliga observationer av SP eller
 inkommande x25–x28.
 
 Den kompletta källproducenten kan ge ett uttryckligt, versionsbundet
-[objektminneskontrakt](ffi.md) genom [`mir_memory`](../selfhost/mir_memory.ddr).
+[objektminneskontrakt](ffi.md) genom [`mir_memory`](../selfhost/mir/mir_memory.ddr).
 En giltig indirekt åtkomst kan då varken läsa eller skriva oexponerade,
 disjunkta celler i den aktuella framen. Frame-livstid, reserverat intervall,
 exponering och överlappning kontrolleras fortfarande separat. Kontraktet
@@ -177,14 +177,14 @@ terminalkontrakt ensamt tillåter heller inte anrop.
 
 Minnes-, terminal-, anrops-ABI- och indatapremisserna prövas var för sig:
 
-- [`mir_memory`](../selfhost/mir_memory.ddr) ger NoModRef för bevisat privata
+- [`mir_memory`](../selfhost/mir/mir_memory.ddr) ger NoModRef för bevisat privata
   celler vid giltiga indirekta objektåtkomster. Det ger inget anrops-ABI.
-- [`mir_terminals`](../selfhost/mir_terminals.ddr) namnger exakt sex
+- [`mir_terminals`](../selfhost/mir/mir_terminals.ddr) namnger exakt sex
   producentägda statusutgångar: overflow, division med noll, assertion, I/O,
   bounds och flyttalsfälla. De terminerar utan att läsa inkommande register,
   flaggor eller användarminne, köra cleanup eller anropa användarkod. Enbart
   NoReturn räcker inte; varje nådd extern måletikett behöver sitt eget bevis.
-- [`mir_call_abi`](../selfhost/mir_call_abi.ddr) håller ett separat
+- [`mir_call_abi`](../selfhost/mir/mir_call_abi.ddr) håller ett separat
   käll-ABI-kontrakt. `mir_call_abi.conservative()` gör inget sådant påstående;
   `mir_pipeline.options().source_abi` är false för råa konsumenter. Den
   kompletta källproducenten deklarerar ABI1: x25–x28 är bevarat
@@ -192,7 +192,7 @@ Minnes-, terminal-, anrops-ABI- och indatapremisserna prövas var för sig:
   implementationsegenskaper. Giltiga register-/stackargument, resultat och
   exponerade källobjekt behåller sitt vanliga ABI. Premissen ger ingen
   NoModRef för anrop och ändrar inga call-clobbermasker.
-- [`mir_call_inputs`](../selfhost/mir_call_inputs.ddr) ger en separat
+- [`mir_call_inputs`](../selfhost/mir/mir_call_inputs.ddr) ger en separat
   `source_inputs`-premiss för hela källproducenten och dess callees/bryggor.
   `mir_pipeline.options().source_inputs` är false och råa API:er behåller
   alla kanoniska läsningar. Den kompletta källproducenten sätter true;
@@ -229,7 +229,7 @@ främmande anrop får inte inspektera andra privata lokaler genom stackvandring.
 
 ### Frame-livstid och privat temporärlagring
 
-[`mir_call_abi.Context`](../selfhost/mir_call_abi.ddr) håller frame-livstid
+[`mir_call_abi.Context`](../selfhost/mir/mir_call_abi.ddr) håller frame-livstid
 oberoende av källanropens register-/SP-premiss.
 `trusted_frame_lifetime_v1()` lovar att en normal retur återkommer till
 samma aktivering med samma FP/SP och att dess ursprungliga aktiva
@@ -247,7 +247,7 @@ aktuella värde efter barriären och inleda en ny registerregion. Den jämställ
 aldrig med värdet före anropet. Återläsningens plats, bredd, scratchbehov och
 liveness verifieras separat.
 
-[`mir.Function.stack_roles`](../selfhost/mir.ddr) är en parallell
+[`mir.Function.stack_roles`](../selfhost/mir/mir.ddr) är en parallell
 ursprungskolumn, det 62:a fältet i denna modellversion. Noll betyder rått,
 argument-, brygg- eller ospecificerat stackbruk; ett är ett positivt
 producentvittne för en privat uttryckstemporär. Vanliga push/pop blir inte
@@ -257,7 +257,7 @@ hela hjälparen. Utgående argument, FP/LR, bryggtillstånd och adresserbara
 källobjekt behåller sina egna roller.
 
 Ursprung ger ännu ingen rätt att ta bort minnesåtkomst eller dess möjliga
-fälla. [`mir_expr_stack.Context`](../selfhost/mir_expr_stack.ddr) ger separat
+fälla. [`mir_expr_stack.Context`](../selfhost/mir/mir_expr_stack.ddr) ger separat
 lagringsrätt genom `trusted_source_expression_storage_v1()` och
 `source_temporaries`; råa fabriker väljer false. Premissen kräver att hela
 den sexton byte stora Temp-enheten, inklusive utfyllnad, är privat under
@@ -286,14 +286,14 @@ delens levande värden. `mir_ssa.optimize_values_with_contracts_budget` får
 separata minnes-, terminal-, call-input-, ABI- och Expr-kontexter samt en
 gemensam arbetsgräns; ingen kontext får härledas ur en annan.
 
-[Regional SSA](../selfhost/mir_ssa.ddr) ·
+[Regional SSA](../selfhost/mir/mir_ssa.ddr) ·
 [Temp-ursprung](../tests/mir_stack_origin.ddr) ·
 [Uttrycksstackens kontrakt](../tests/mir_expr_stack.ddr) ·
 [Gemensam Frame-/Expr-placering](../tests/mir_ssa_joint.ddr).
 
 ### SSA för privata framevärden
 
-[`mir_ssa`](../selfhost/mir_ssa.ddr) är en verklig, begränsad SSA-grund över
+[`mir_ssa`](../selfhost/mir/mir_ssa.ddr) är en verklig, begränsad SSA-grund över
 hela funktionens CFG. Version 2 använder gles, behovsstyrd konstruktion.
 Egna ValueID:n beskriver GP-/NZCV-definitioner och
 användningar, blockparametrar och föregångarkanternas argument. En
@@ -316,7 +316,7 @@ för att skanna samtliga statiska SSA-versioner. Placeringsvittnet
 kontrollerar de sparade live-händelserna separat. Arbetet debiteras fortfarande
 under samma budget; detta är ingen garanti om konstant eller linjär total tid.
 
-[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr) grupperar oexponerade,
+[`mir_ssa_cells`](../selfhost/mir/mir_ssa_cells.ddr) grupperar oexponerade,
 justerade åttabytesceller med en befintlig fullbreddsplats. Alla skrivningar
 måste omfatta hela cellen. Inneslutna läsvyer på 1, 2, 4 eller 8 byte kan
 ersättas med korrekt bituttag och explicit noll-/teckenutökning. Delvisa
@@ -345,7 +345,7 @@ lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
 gemensamma seriella/taskbaserade kedjan. Standard förblir **off**. I den
-historiska [v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+historiska [v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 ökade byggmedianen 21,26 procent för kompilatorkorpuset och 29,47 procent
 för Tabell utan belagd samlad runtimevinst. Effektiv aktivering
 kräver både MIR och MIR-opt; `check`, avstängt steg och full cacheträff utför
@@ -385,7 +385,7 @@ placeringen använder den gemensamma logiska GP-banken. Den innebär ingen
 fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
 är fortfarande öppet.
 
-Den historiska [30-rundorsmätningen av SSA-v1](../benchmarks/2026-11-12-ssa-foundation/README.md)
+Den historiska [30-rundorsmätningen av SSA-v1](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
 visade 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34
 procent för Tabell utan samlad runtimevinst mot C. En separat SSA-optimerad
 producentbinär ändrade byggmedianerna mindre än 0,3 procent och försämrade
@@ -409,7 +409,7 @@ den här etappen.
 
 ### Värdeidentitet över kontrollflödet
 
-[`mir_value_prop`](../selfhost/mir_value_prop.ddr) körs efter framepromovering
+[`mir_value_prop`](../selfhost/mir/mir_value_prop.ddr) körs efter framepromovering
 och det valbara SSA-steget, före sänkning. Det håller separata
 ekvivalensklasser för hela 64-bitarsvärden och de låga 32 bitarna, exakta konstanter och nollutökning. Fakta
 möts över samtliga nåbara föregångare och löses till fixpunkt innan någon
@@ -470,7 +470,7 @@ en senare operation behöver den allmänna representationen. I det fallet
 överlämnar den redan kontrollerade operationer och fortsätter från aktuell
 källposition. Alla grenar kontrolleras, även vid konstanta villkor. Båda
 fallen går genom samma obligatoriska funktionssänkning och verifiering.
-[Typade noder](../selfhost/typed_body.ddr) och [funktionsmodellen](../selfhost/opt_ir.ddr).
+[Typade noder](../selfhost/frontend/typed_body.ddr) och [funktionsmodellen](../selfhost/opt/opt_ir.ddr).
 
 IR är ett tillåtet verktyg i kompilatorns fortsatta utveckling. Valet mellan
 strukturerad modell, SSA och lägre funktionsrepresentation ska styras av
@@ -491,7 +491,7 @@ skapar ingen funktionsframe eller retur och kontrollerar att emissionen
 saknar anrop. Standardbygget använder denna väg för begränsad inlining
 efter att vanliga anropsargument redan är utvärderade och kontrollerade.
 
-Den separata [`opt_inline`](../selfhost/opt_inline.ddr)-katalogen är nu en
+Den separata [`opt_inline`](../selfhost/opt/opt_inline.ddr)-katalogen är nu en
 testad byggsten: den lagrar högst 32 uttrycksnoder per redan verifierad
 skalär retur, 4 096 noder och 256 deklarationer totalt. Bara primitiva
 parametrar/resultat, högst åtta argument och den slutna anropsfria
@@ -519,7 +519,7 @@ deklarationsberoenden och funktionens ordbudget. Varma fragment
 återställer funktionens uppskattade kodtillväxt och de deklarationer den behöver. Inlining sker före helfunktions-IR; registerpasset kan därmed arbeta
 över de inlagda uttrycken med samma verifiering som resten av kroppen.
 
-[Gemensamma språkregler](../selfhost/scalar_rules.ddr) används av både
+[Gemensamma språkregler](../selfhost/opt/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
 operatorprioritet och kontextuell bredd på signerade heltalsliteraler.
 Breddkontrollen validerar decimalparserns befintliga resultat utan att
@@ -527,7 +527,7 @@ skapa en extra resultatpost per literal.
 En accepterad modell har kontrollerats av modellparsern; en avvisad modell
 går vidare till den fulla parsern för stöd och diagnostik.
 
-[IR-verifieraren](../selfhost/opt_verify.ddr) kontrollerar modellen före
+[IR-verifieraren](../selfhost/opt/opt_verify.ddr) kontrollerar modellen före
 och efter passet: parallella vektorer, index, typer, nodroller,
 räckvidd för lokaler, initiering, parameterordning, returer, looputgångar,
 trädägarskap och konservativa effekter. Cykler och delade exekverbara
@@ -541,7 +541,7 @@ passfaser i ett separat arbetsminne per kompilatoranrop. Varje anrop
 initierar modellens aktuella del även efter ett tidigare verifieringsfel.
 Form-, typ- och säkerhetskontrollerna körs fortfarande varje gång.
 
-[Passet](../selfhost/opt_pass.ddr) förenklar konstanter, lokala värden och
+[Passet](../selfhost/opt/opt_pass.ddr) förenklar konstanter, lokala värden och
 konstanta grenar inom en fast arbetsbudget på 65 536 steg. Det räknar
 bara ut aritmetik som är giltig med språkets kontrollerade heltalsregler.
 Ett överflödande uttryck måste fortfarande nå samma runtime-fälla.
@@ -571,9 +571,9 @@ anropa annan kod. Innehållsvärden cachas inte över skrivningar. Nya
 muterbara index och skrivningar behåller sina gränskontroller.
 Arrayvärdesiteration använder fortsatt den allmänna vägens snapshot.
 
-[Registerallokeringen](../selfhost/opt_alloc.ddr) använder konservativa
+[Registerallokeringen](../selfhost/opt/opt_alloc.ddr) använder konservativa
 livstidsintervall, förlänger dem över loopars bakåtkanter och placerar
-lokaler i tolv register eller i framen. [Emissionen](../selfhost/opt_emit.ddr)
+lokaler i tolv register eller i framen. [Emissionen](../selfhost/opt/opt_emit.ddr)
 behåller arraydata och längd, avger direkta jämförelsegrenar och tar bara
 bort kontroller som modellen har bevisat överflödiga. Inkommande argument
 sparas före registerplaceringen så att överlappande argumentregister är
@@ -609,7 +609,7 @@ funktionsnamn, moduler eller särskilda tal. Variabel delare använder den
 befintliga divisionen. Typkontroll och konstantförenkling sker före valet;
 ingen tokenprefixigenkänning inför en parallell språkregel.
 
-[`const_div`](../selfhost/const_div.ddr) hanterar noll, ett, minus ett,
+[`const_div`](../selfhost/opt/const_div.ddr) hanterar noll, ett, minus ett,
 signerad minimidelare och tvåpotenser separat. Andra delare använder en
 heltalsmultiplikator med multiplikationens höga del, skift och
 teckenkorrigering enligt [Granlund–Montgomery, sats 5.1](https://gmplib.org/~tege/divcnst-pldi94.pdf).
@@ -667,7 +667,7 @@ permutationer. Fallbackbilder och bilder för övriga mål är byteidentiska.
 
 ### Budgeterade intervall och stabila arraylängder
 
-[`opt_range`](../selfhost/opt_range.ddr) kör efter konstantförenklingen och
+[`opt_range`](../selfhost/opt/opt_range.ddr) kör efter konstantförenklingen och
 före den avslutande modellverifieringen. Den spårar i32-intervall samt
 relationer till en bestämd arrayrots längd, exempelvis `j <= values.len-1`.
 Elementvärden cachas inte. Både delade och exklusiva arrayparametrar har
@@ -733,7 +733,7 @@ installation av en extra ägare före högerledet. En rak kodväg installerar
 platsen fortfarande innehålla ett värde från förra varvet och städas först.
 När högerledet lämnar ägaren orörd används den befintliga referensen.
 Funktionsbygget förbereder en extra ägare bara när typningen har visat att
-den behövs. [Infogning av ägarhändelser](../selfhost/ownership_lease.ddr)
+den behövs. [Infogning av ägarhändelser](../selfhost/frontend/ownership_lease.ddr)
 
 `--ownership-opt=off` behåller lånade strängoperander före varje högerled.
 `tools/test-ownership-leases.py` jämför diagnostik och bindningar, mäter
@@ -747,7 +747,7 @@ Resursägande records flyttas enligt [språkets ägarskapsregel](memory.md),
 behåller arraybuffertar och kapacitet och behöver ingen kloningshjälpare.
 En uttrycklig `.clone()` skapar i stället oberoende ägda barn.
 
-[`record_take`](../selfhost/record_take.ddr) finns kvar som en separat
+[`record_take`](../selfhost/frontend/record_take.ddr) finns kvar som en separat
 generisk hjälpplan för kopierbara recordtemporärer. Den förseglas innan
 etiketter och cachekontext fryses. Session behåller primitiva val per typ;
 slutliga relokeringar bestämmer vilka hjälpare som verkligen emitteras.
@@ -820,9 +820,9 @@ Parenteser behåller ursprunget; nya operator- och anropsresultat får egna
 aggregat. Indexerade element kan tas med `pop`; ett självständigt värde
 från en lånad källa kräver uttrycklig `.clone()`.
 
-[ARM64-backenden](../selfhost/arm64.ddr) använder direkt LDUR/STUR för
+[ARM64-backenden](../selfhost/backend/arm64.ddr) använder direkt LDUR/STUR för
 lokala värden nära framepekaren och immediate-adresser där offseten ryms.
-[x86-64](../selfhost/x86.ddr) och [Wasm](../selfhost/wasm_native.ddr)
+[x86-64](../selfhost/backend/x86.ddr) och [Wasm](../selfhost/backend/wasm_native.ddr)
 sänker den gemensamma instruktionsströmmen till respektive mål. Wasm använder
 bland annat `memory.copy` för kopiering av sammanhängande block.
 Native-runtime kopierar buffertar åtta byte åt gången och avslutar med en
@@ -855,11 +855,11 @@ Med samma binär i båda positionerna och
 Korrektheten provas med referensresultat för signerad division och rest,
 IEEE 754, kortslutning och diagnostik. Minnesproven kör även om samma
 Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
-[Körbara kontrakt](../tools/runtime-contracts.py) · [Funktionscache](incremental.md).
+[Körbara kontrakt](../tools/test-runtime-contracts.py) · [Funktionscache](incremental.md).
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
-Helfunktionskedjans [första byggmätning](../benchmarks/2026-11-11-whole-function-mir/README.md)
+Helfunktionskedjans [första byggmätning](../benchmarks/archive/2026-11-11-whole-function-mir/README.md)
 redovisar dess kostnad med identiska bilder och separat `check`.
 Konstantdivision och framefria funktioner förbättrar numerikkärnan;
 intervallbevis och registerjämförelser minskar sorteringens kontrollkostnad.

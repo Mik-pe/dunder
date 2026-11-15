@@ -109,7 +109,7 @@ def main():
         (work / 'summary.json').write_text(json.dumps({
             'result': 'passed' if passed else 'failed', 'compiler_sha256': digest(compiler),
             'source_sha256': {name: digest(ROOT / name) for name in (
-                'selfhost/mir_opt.ddr', 'selfhost/mir_terminals.ddr', 'selfhost/mir_call_abi.ddr',
+                'selfhost/mir/mir_opt.ddr', 'selfhost/mir/mir_terminals.ddr', 'selfhost/mir/mir_call_abi.ddr',
                 'tests/mir_frame_exits.ddr', 'tests/fixtures/mir-frame-exit-support.ddr',
                 'tests/fixtures/mir-frame-exit-observer.ddr', 'tests/fixtures/mir-frame-exit-call-sp.ddr',
                 'tests/fixtures/mir-frame-exit-terminal.ddr', 'tests/fixtures/mir-frame-exit-call-sync.ddr')},

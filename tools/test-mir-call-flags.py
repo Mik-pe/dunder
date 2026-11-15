@@ -92,8 +92,8 @@ def main():
             'result': 'passed' if passed else 'failed', 'expected_call_flags': args.expected_call_flags,
             'compiler_sha256': digest(compiler),
             'source_sha256': {p: digest(ROOT / p) for p in (
-                'tests/fixtures/mir_machine_decode.ddr', 'selfhost/mir_retained.ddr', 'selfhost/mir_liveness.ddr',
-                'selfhost/mir_value_prop.ddr', 'tests/fixtures/mir-call-flags-emitter.ddr')},
+                'tests/fixtures/mir_machine_decode.ddr', 'selfhost/mir/mir_retained.ddr', 'selfhost/mir/mir_liveness.ddr',
+                'selfhost/mir/mir_value_prop.ddr', 'tests/fixtures/mir-call-flags-emitter.ddr')},
             'images': images, 'executions': executions, 'host_target': TARGETS[host],
             'cross_built_only': [name for target, name in enumerate(TARGETS) if target != host],
             'production_value_pass': 'productive; Compare retained, observer result preserved before and after fix',

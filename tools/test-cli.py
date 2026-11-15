@@ -114,7 +114,7 @@ def worker_options(p):
     sources = Path(__file__).resolve().parents[1]
     import platform
     host = 0 if sys.platform == "darwin" else (1 if platform.machine() in ("arm64", "aarch64") else 2)
-    driver_module = os.path.relpath(sources / "selfhost/driver", p.root.resolve()).replace(os.sep, "/")
+    driver_module = os.path.relpath(sources / "selfhost/driver/driver", p.root.resolve()).replace(os.sep, "/")
     # Keep the serial entry's early rejection contract covered even when the
     # supplied compiler uses the task-capable entry by default.
     p.write("serial-entry.ddr", "import " + json.dumps(driver_module)
@@ -147,9 +147,9 @@ def worker_options(p):
     assert p.call("run", "args.ddr", "--jobs=1", "--", "--jobs", "4").stdout == "--jobs\n4\n"
 
     fixture = (sources / "tests/fixtures/driver-workers.ddr").read_text()
-    for name, alias in (("driver", "driver"), ("compile", "compiler")):
-        old = "import ...selfhost." + name + (" as compiler" if name == "compile" else "")
-        module = os.path.relpath(sources / "selfhost" / name, p.root.resolve()).replace(os.sep, "/")
+    for name, subpath, alias in (("driver", "driver/driver", "driver"), ("compile", "frontend/compile", "compiler")):
+        old = "import ...selfhost." + subpath.replace("/", ".") + (" as compiler" if name == "compile" else "")
+        module = os.path.relpath(sources / "selfhost" / subpath, p.root.resolve()).replace(os.sep, "/")
         assert fixture.count(old) == 1
         fixture = fixture.replace(old, "import " + json.dumps(module) + " as " + alias)
     # The host entry is explicit; imported modules remain ordinary seed syntax.
@@ -879,7 +879,7 @@ def phase_timings(p):
     assert cached["functions"]["reused"] > 0 and sum(cached["functions"].values()) == 2, cached
     p.call("build", "phases.ddr", "--timings=xml", status=2)
     # Exercise the reporter's clock-failure path independently of host timing.
-    sources = Path(__file__).resolve().parents[1] / "selfhost"
+    sources = Path(__file__).resolve().parents[1] / "selfhost/driver"
     for module in ("cli", "timings", "compiler_profile", "native_clock"):
         p.write(module + ".ddr", (sources / (module + ".ddr")).read_text())
     p.write("clock-failure.ddr", "import timings\nfn main(){timings.report(true,false,0,1,0,1,-1,-1,-1,-1,-1,-1)}\n")

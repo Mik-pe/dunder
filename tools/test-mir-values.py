@@ -84,7 +84,7 @@ def main():
         if case == 11: inputs = [(41, 0), (-17, 0)]
         corpus.extend((case, value, condition) for value, condition in inputs)
     report = {'compiler_sha256': digest(compiler), 'host_target': host,
-              'value_module_sha256': digest(ROOT / 'selfhost/mir_value_prop.ddr'),
+              'value_module_sha256': digest(ROOT / 'selfhost/mir/mir_value_prop.ddr'),
               'fixture_sha256': digest(ROOT / 'tests/fixtures/mir-value-emitter.ddr'), 'images': []}
     gaps = 0; proofs = 0; executed = 0; domain_pairs = 0
     with tempfile.TemporaryDirectory(prefix='dunder-mir-values-') as directory:

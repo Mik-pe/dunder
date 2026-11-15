@@ -12,7 +12,7 @@ Dunder-program över 30 mätpar. [Byggtider, kontroll och runtimeresultat](../be
 
 ## Tidigare mätningar
 
-Den [regionala IR-/workermätningen](../benchmarks/2026-11-12-regional-workers/README.md)
+Den [regionala IR-/workermätningen](../benchmarks/archive/2026-11-12-regional-workers/README.md)
 bevarar 1 260 prover: tidigare mot ny standard med fyra workers samt samma
 nya binär med en, två och fyra workers. SSA är av i samtliga jämförelser.
 
@@ -34,7 +34,7 @@ workerantal klarar 100 000-gränsen. Separata `check`-prover är seriella
 kontroller. Kontrollerade runtimebilder är byteidentiska, så ingen ny
 C-runtimevinst påstås. Frontenden är fortsatt seriell och C-målet öppet.
 
-Den tidigare [glesa SSA-v2-mätningen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+Den tidigare [glesa SSA-v2-mätningen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 har 1 440 prover över tre separata jämförelser på samma frysta källor.
 Med SSA på i båda kompilatorerna minskar byggmedianen 27,65 procent för
 kompilatorkorpuset och 8,48 procent för Tabell mot tidigare SSA; Tabells
@@ -54,7 +54,7 @@ procent högre byggmedian med byteidentiska konsumenter; p95-regressioner
 och alla råsvansar finns kvar i rapporten. Kompilatorkorpuset avser den
 seriella ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
 
-Den historiska [SSA-v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+Den historiska [SSA-v1-mätningen](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
 har 30 försök per variant på ARM64/macOS. Samma kompilator med SSA av/på
 gav följande byggmedianer i millisekunder:
 
@@ -72,7 +72,7 @@ producentprofil ändras på detta underlag. SSA förblir valbart med
 `--mir-ssa=on`; C-målet är öppet. Kompilatorkorpuset är fortsatt den seriella
 ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
 
-Den tidigare [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den tidigare [parallella kompilatormätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
 har 30 försök per variant på ARM64/macOS. Den skiljer två jämförelser:
 samma taskbaserade kompilator med en respektive fyra workers, och tidigare
 seriell kompilator mot den nya standarden med fyra workers. Tabellen visar
@@ -98,7 +98,7 @@ Runtimebilderna var byteidentiska i den jämförelsen. Den gav
 geometriskt medel **1,178×** och största kvoten **1,308×**, över målen
 1,10× och 1,25×. Snabbare kompilering innebär därför inte att hela
 acceptanskontraktet nedan är uppfyllt. Tidigare
-[taskmätningar](../benchmarks/2026-11-12-isolated-tasks/README.md) redovisar
+[taskmätningar](../benchmarks/archive/2026-11-12-isolated-tasks/README.md) redovisar
 språkets isolerade arbetsfall och den dåvarande seriella byggkostnaden
 separat från denna kompilatormätning.
 

@@ -1,0 +1,356 @@
+// A bounded declaration catalog of already-verified scalar return expressions.
+// This module neither resolves source calls nor evaluates source arguments.
+// The producer excludes unsafe/foreign/test declarations and supplies models
+// validated before and after optimization. Source activation is opt-in; eager
+// argument evaluation and declaration resolution belong to the frontend.
+import opt_ir as ir
+import opt_alloc as alloc
+import opt_emit as emit
+import ..backend.arm64 as arm
+import std.bytes as bytes
+import std.sha256 as sha
+
+// The declaration builder owns admission, verification and digests. Once
+// sealed, the emitter needs only immutable numeric operands and their identity.
+pub struct View {
+    nodes: ir.Nodes, declarations: []i32, roots: []i32, firsts: []i32, counts: []i32,
+    param_starts: []i32, param_counts: []i32, param_types: []i32, returns: []i32,
+    costs: []i32, block_tokens: []i32, return_tokens: []i32, rewrites: []i32,
+    valid: bool, sealed: bool, generation: i64, stamp: []u8,
+}
+pub opaque struct Catalog {
+    view: View, body_digests: []string, node_limit: i32, work_limit: i32, entry_limit: i32,
+    work: i32, last: i32, exhausted: bool, source_fingerprint: string,
+}
+pub opaque struct Workspace {
+    plan: alloc.Plan, types: []i32, ready: bool, generation: i64, stamp: []u8,
+    entry: i32, declaration: i32, root: i32, cost: i32, platform: i32, settings: emit.Options,
+}
+pub fn empty_view() -> View {
+    View { nodes: ir.new_nodes(), declarations: [], roots: [], firsts: [], counts: [],
+        param_starts: [], param_counts: [], param_types: [], returns: [], costs: [], block_tokens: [], return_tokens: [], rewrites: [],
+        valid: true, sealed: false, generation: 0, stamp: [] }
+}
+pub fn emission_view(move c: Catalog) -> View { c.view }
+pub fn new() -> Catalog {
+    Catalog { view: empty_view(), body_digests: [], node_limit: 4096, work_limit: 65536, entry_limit: 256,
+        work: 0, last: -1, exhausted: false, source_fingerprint: "" }
+}
+pub fn workspace() -> Workspace { Workspace { plan: alloc.new(), types: [], ready: false,
+    generation: -1, stamp: [], entry: -1, declaration: -1, root: -1, cost: 0, platform: -1, settings: emit.options() } }
+// Configure once per compilation. The frontend then threads only the immutable
+// catalog and mutable workspace; expression emission borrows settings shared.
+pub fn configure(w: &mut Workspace, const_div_enabled: bool, frame_free_enabled: bool) {
+    w.settings.const_div_enabled = const_div_enabled; w.settings.frame_free_enabled = frame_free_enabled
+}
+pub fn reset(c: &mut Catalog, nodes: i32, work: i32, entries: i32) {
+    assert(nodes >= 0 && nodes <= 4096 && work >= 0 && work <= 65536 && entries >= 0 && entries <= 256)
+    ir.reset_nodes(&mut c.view.nodes)
+    c.view.declarations.clear(); c.view.roots.clear(); c.view.firsts.clear(); c.view.counts.clear()
+    c.view.param_starts.clear(); c.view.param_counts.clear(); c.view.param_types.clear(); c.view.returns.clear()
+    c.body_digests.clear(); c.view.costs.clear(); c.view.block_tokens.clear(); c.view.return_tokens.clear(); c.view.rewrites.clear()
+    c.node_limit = nodes; c.work_limit = work; c.entry_limit = entries; c.work = 0
+    c.last = -1; c.view.valid = true; c.view.sealed = false; c.exhausted = false
+    c.view.generation = c.view.generation + 1; c.view.stamp.clear(); c.source_fingerprint = ""
+}
+pub fn count(c: &Catalog) -> i32 { c.view.declarations.len }
+pub fn node_count(c: &Catalog) -> i32 { c.view.nodes.kinds.len }
+pub fn units(c: &Catalog) -> i32 { c.work }
+pub fn exhausted(c: &Catalog) -> bool { c.exhausted }
+// Check a conservative bound before asking the source checker for a
+// closed expression. A token for unary minus may fold into its literal node.
+pub fn room_for(c: &Catalog, expressions: i32, params: i32) -> bool {
+    c.view.valid && !c.view.sealed && params >= 0 && params <= 8 &&
+        expressions > 0 && expressions <= 32 && c.view.declarations.len < c.entry_limit &&
+        expressions <= c.node_limit - c.view.nodes.kinds.len && expressions + params + 3 <= c.work_limit - c.work
+}
+fn begin(c: &mut Catalog, declaration: i32) -> bool {
+    if !c.view.valid { return false }
+    if c.view.sealed || declaration < 0 || declaration <= c.last { c.view.valid = false; c.view.stamp.clear(); return false }
+    c.last = declaration
+    if c.work >= c.work_limit { c.exhausted = true; return false }
+    c.work = c.work + 1; true
+}
+pub fn reject(c: &mut Catalog, declaration: i32) { advanced := begin(&mut c, declaration) }
+fn expression_node(nodes: &ir.Nodes, at: i32, block: i32, returned: i32) -> bool {
+    at >= 0 && at < nodes.kinds.len && at != block && at != returned
+}
+fn relocated(at: i32, first: i32, block: i32, returned: i32) -> i32 {
+    if at < 0 { return -1 }
+    mut offset := at
+    if at > block { offset = offset - 1 }
+    if at > returned { offset = offset - 1 }
+    first + offset
+}
+fn valid_digest(digest: string) -> bool {
+    if digest == "" { return true }
+    if digest.len != 64 { return false }
+    for byte in digest.bytes() { if (byte < 48 || byte > 57) && (byte < 97 || byte > 102) { return false } }
+    true
+}
+// A false result appends no nodes or entry. The declaration/order/work decision
+// is still consumed, so a source model is never reparsed by retrying admission.
+// The producer separately budgets source parsing and runs opt_verify before
+// and after optimization; supported=true alone is not a graph certificate.
+pub fn add_verified(c: &mut Catalog, declaration: i32, f: &ir.Function, move body_digest: string) -> bool {
+    if !begin(&mut c, declaration) { return false }
+    if !valid_digest(body_digest) { return false }
+    if !f.supported || f.params < 0 || f.params > 8 || f.local_types.len != f.params || f.ret < 1 || f.ret > 3 { return false }
+    n := f.nodes.kinds.len
+    if n < 3 || n > 34 { return false }
+    charge := n + f.params
+    if charge > c.work_limit - c.work { c.exhausted = true; return false }
+    c.work = c.work + charge
+    if c.view.declarations.len >= c.entry_limit || n - 2 > c.node_limit - c.view.nodes.kinds.len { c.exhausted = true; return false }
+    if f.local_param.len != f.params || f.local_mutable.len != f.params { return false }
+    for p in 0..f.params {
+        if f.local_types[p] < 1 || f.local_types[p] > 3 || f.local_param[p] != p || f.local_mutable[p] { return false }
+    }
+    if f.nodes.types.len != n || f.nodes.left.len != n || f.nodes.right.len != n || f.nodes.third.len != n ||
+        f.nodes.next.len != n || f.nodes.values.len != n || f.nodes.locals.len != n || f.nodes.starts.len != n ||
+        f.nodes.effects.len != n || f.nodes.proofs.len != n { return false }
+    block := f.root
+    if block < 0 || block >= n || f.nodes.kinds[block] != 10 || f.nodes.next[block] != -1 { return false }
+    returned := f.nodes.left[block]
+    if returned < 0 || returned >= n || returned == block || f.nodes.kinds[returned] != 15 || f.nodes.next[returned] != -1 { return false }
+    root := f.nodes.left[returned]
+    if !expression_node(&f.nodes, root, block, returned) || f.nodes.types[root] != f.ret { return false }
+    for node in 0..n {
+        if node == block || node == returned { continue }
+        kind := f.nodes.kinds[node]
+        if kind < 1 || kind > 4 || f.nodes.types[node] < 1 || f.nodes.types[node] > 3 ||
+            f.nodes.third[node] != -1 || f.nodes.next[node] != -1 || f.nodes.effects[node] < 0 || f.nodes.effects[node] > 1 ||
+            f.nodes.proofs[node] < 0 || f.nodes.proofs[node] > 1 { return false }
+        if kind == 3 && (f.nodes.values[node] < 1 || f.nodes.values[node] > 13) { return false }
+        if kind == 4 && f.nodes.values[node] != 1 && f.nodes.values[node] != 2 { return false }
+        if kind == 1 || kind == 2 {
+            if f.nodes.left[node] != -1 || f.nodes.right[node] != -1 { return false }
+        } else {
+            if !expression_node(&f.nodes, f.nodes.left[node], block, returned) { return false }
+            if kind == 3 && !expression_node(&f.nodes, f.nodes.right[node], block, returned) { return false }
+            if kind == 4 && f.nodes.right[node] != -1 { return false }
+        }
+        if kind == 2 {
+            local := f.nodes.locals[node]
+            if local < 0 || local >= f.params || f.nodes.types[node] != f.local_types[local] { return false }
+        } else if f.nodes.locals[node] != -1 { return false }
+    }
+    // The verified source graph is a tree. Count all stored expression nodes,
+    // including detached folding remnants, for a conservative finite bound.
+    first := c.view.nodes.kinds.len
+    for node in 0..n {
+        if node == block || node == returned { continue }
+        c.view.nodes.kinds.push(f.nodes.kinds[node]); c.view.nodes.types.push(f.nodes.types[node])
+        c.view.nodes.left.push(relocated(f.nodes.left[node], first, block, returned))
+        c.view.nodes.right.push(relocated(f.nodes.right[node], first, block, returned))
+        c.view.nodes.third.push(-1); c.view.nodes.next.push(-1); c.view.nodes.values.push(f.nodes.values[node])
+        c.view.nodes.locals.push(f.nodes.locals[node]); c.view.nodes.starts.push(f.nodes.starts[node])
+        c.view.nodes.effects.push(f.nodes.effects[node]); c.view.nodes.proofs.push(f.nodes.proofs[node])
+    }
+    c.view.declarations.push(declaration); c.view.roots.push(relocated(root, first, block, returned))
+    c.view.firsts.push(first); c.view.counts.push(n - 2); c.view.param_starts.push(c.view.param_types.len); c.view.param_counts.push(f.params)
+    for ty in &f.local_types { c.view.param_types.push(ty) }
+    c.view.returns.push(f.ret); c.body_digests.push(move body_digest)
+    c.view.block_tokens.push(f.nodes.starts[block]); c.view.return_tokens.push(f.nodes.starts[returned]); c.view.rewrites.push(f.rewrites)
+    // Each closed scalar node needs at most32 shared ARM-vocabulary words:
+    // checked dynamic division is the longest path (<=24 incl i32 narrow and
+    // operand saves). Constants need<=4; branch/short-circuit overhead fits.
+    // Each eager-slot load+MOV+SXTW needs<=8, including large frame offsets.
+    c.view.costs.push((n - 2) * 32 + f.params * 8)
+    true
+}
+pub fn find(c: &Catalog, declaration: i32) -> i32 { find_view(&c.view, declaration) }
+pub fn find_view(c: &View, declaration: i32) -> i32 {
+    if !c.valid || declaration < 0 { return -1 }
+    mut low := 0; mut high := c.declarations.len
+    while low < high { mid := low + (high - low) / 2; if c.declarations[mid] < declaration { low = mid + 1 } else { high = mid } }
+    if low < c.declarations.len && c.declarations[low] == declaration { low } else { -1 }
+}
+// Inline calls and the declaration's own entry point share the verified
+// expression. Recover the two enclosing statement nodes for whole-body lowering.
+pub fn restore_body(c: &Catalog, declaration: i32, f: &mut ir.Function, names: &[]string, tokens: &[]i32, first_param: i32) -> bool {
+    restore_view_body(&c.view, declaration, &mut f, &names, &tokens, first_param)
+}
+pub fn restore_view_body(c: &View, declaration: i32, f: &mut ir.Function, names: &[]string, tokens: &[]i32, first_param: i32) -> bool {
+    if !c.sealed { return false }
+    entry := find_view(&c, declaration)
+    if entry < 0 { return false }
+    params := c.param_counts[entry]
+    if first_param < 0 || first_param > names.len - params || first_param > tokens.len - params { return false }
+    ir.reset(&mut f)
+    first := c.firsts[entry]; count := c.counts[entry]; f.params = params; f.ret = c.returns[entry]
+    for p in 0..f.params {
+        f.local_names.push(names[first_param + p].clone()); f.local_types.push(c.param_types[c.param_starts[entry] + p])
+        f.local_at.push(tokens[first_param + p]); f.local_param.push(p); f.local_mutable.push(false)
+    }
+    for i in first..first + count {
+        mut left := c.nodes.left[i]; mut right := c.nodes.right[i]
+        if left >= 0 { left = left - first }; if right >= 0 { right = right - first }
+        f.nodes.kinds.push(c.nodes.kinds[i]); f.nodes.types.push(c.nodes.types[i])
+        f.nodes.left.push(left); f.nodes.right.push(right); f.nodes.third.push(-1); f.nodes.next.push(-1)
+        f.nodes.values.push(c.nodes.values[i]); f.nodes.locals.push(c.nodes.locals[i]); f.nodes.starts.push(c.nodes.starts[i])
+        f.nodes.effects.push(c.nodes.effects[i]); f.nodes.proofs.push(c.nodes.proofs[i])
+    }
+    expression := c.roots[entry] - first; effects := f.nodes.effects[expression].bit_or(8)
+    for wrapper in 0..2 {
+        mut child := expression; mut at := c.return_tokens[entry]; mut kind := 15
+        if wrapper == 1 { child = count; at = c.block_tokens[entry]; kind = 10 }
+        f.nodes.kinds.push(kind); f.nodes.types.push(0); f.nodes.left.push(child); f.nodes.right.push(-1)
+        f.nodes.third.push(-1); f.nodes.next.push(-1); f.nodes.values.push(0); f.nodes.locals.push(-1)
+        f.nodes.starts.push(at); f.nodes.effects.push(effects); f.nodes.proofs.push(0)
+    }
+    f.root = count + 1; f.rewrites = c.rewrites[entry]; f.supported = true; true
+}
+pub fn set_body_digest(c: &mut Catalog, declaration: i32, move digest: string) -> bool {
+    entry := find(&c, declaration)
+    if entry < 0 || c.view.sealed || !valid_digest(digest) { return false }
+    c.body_digests[entry] = digest; true
+}
+fn hash(input: &[]u8) -> string {
+    digest := sha.digest_bytes(&input); mut wide: []i32 = []
+    for byte in &digest { wide.push(i32(byte)) }; bytes.hex(&wide)
+}
+fn put(raw: &mut []u8, value: i32) { bytes.append_le(&mut raw, i64(value), 4) }
+fn identity(c: &Catalog, source_digests: bool) -> string {
+    mut raw: []u8 = []
+    raw.reserve(128 + c.view.declarations.len * 36 + c.view.nodes.kinds.len * 40)
+    bytes.append_utf8(&mut raw, "dunder-inline-expression-v1")
+    put(&mut raw, c.node_limit); put(&mut raw, c.work_limit); put(&mut raw, c.entry_limit)
+    for entry in 0..c.view.declarations.len {
+        put(&mut raw, c.view.declarations[entry]); put(&mut raw, c.view.roots[entry]); put(&mut raw, c.view.counts[entry])
+        put(&mut raw, c.view.param_counts[entry]); put(&mut raw, c.view.returns[entry])
+        first := c.view.param_starts[entry]
+        for p in 0..c.view.param_counts[entry] { bytes.append_le(&mut raw, i64(c.view.param_types[first + p]), 4) }
+        if source_digests {
+            bytes.append_le(&mut raw, i64(c.body_digests[entry].len), 4); bytes.append_utf8(&mut raw, c.body_digests[entry])
+        }
+    }
+    // The lifecycle seal also distinguishes independently-created catalogs
+    // with different code, even when their generation counters coincide.
+    for node in 0..c.view.nodes.kinds.len {
+        put(&mut raw, c.view.nodes.kinds[node]); put(&mut raw, c.view.nodes.types[node]); put(&mut raw, c.view.nodes.left[node]); put(&mut raw, c.view.nodes.right[node])
+        put(&mut raw, c.view.nodes.locals[node]); put(&mut raw, c.view.nodes.starts[node]); put(&mut raw, c.view.nodes.effects[node]); put(&mut raw, c.view.nodes.proofs[node])
+        bytes.append_le(&mut raw, c.view.nodes.values[node], 8)
+    }
+    hash(&raw)
+}
+fn mix_i64(h: i64, v: i64) -> i64 { h.bit_xor(v).wrapping_mul(1099511628211) }
+fn fast_stamp(c: &Catalog) -> string {
+    mut h: i64 = -3750763034362895579
+    h = mix_i64(h, i64(c.node_limit))
+    h = mix_i64(h, i64(c.work_limit))
+    h = mix_i64(h, i64(c.entry_limit))
+    h = mix_i64(h, i64(c.view.declarations.len))
+    h = mix_i64(h, i64(c.view.nodes.kinds.len))
+    for entry in 0..c.view.declarations.len {
+        h = mix_i64(h, i64(c.view.declarations[entry]))
+        h = mix_i64(h, i64(c.view.roots[entry]))
+        h = mix_i64(h, i64(c.view.counts[entry]))
+        h = mix_i64(h, i64(c.view.param_counts[entry]))
+        h = mix_i64(h, i64(c.view.returns[entry]))
+        first := c.view.param_starts[entry]
+        for p in 0..c.view.param_counts[entry] { h = mix_i64(h, i64(c.view.param_types[first + p])) }
+    }
+    for node in 0..c.view.nodes.kinds.len {
+        h = mix_i64(h, i64(c.view.nodes.kinds[node]))
+        h = mix_i64(h, i64(c.view.nodes.types[node]))
+        h = mix_i64(h, i64(c.view.nodes.left[node]))
+        h = mix_i64(h, i64(c.view.nodes.right[node]))
+        h = mix_i64(h, i64(c.view.nodes.locals[node]))
+        h = mix_i64(h, i64(c.view.nodes.starts[node]))
+        h = mix_i64(h, i64(c.view.nodes.effects[node]))
+        h = mix_i64(h, i64(c.view.nodes.proofs[node]))
+        h = mix_i64(h, c.view.nodes.values[node])
+    }
+    "fast:" + h.str()
+}
+pub fn seal_mode(c: &mut Catalog, need_digest: bool) -> bool {
+    if !c.view.valid || c.view.sealed { return false }
+    if need_digest {
+        stamp := identity(&c, false); bytes.append_utf8(&mut c.view.stamp, stamp)
+        mut complete := true
+        for digest in &c.body_digests { if digest == "" { complete = false } }
+        if complete { c.source_fingerprint = identity(&c, true) }
+    } else {
+        stamp := fast_stamp(&c); bytes.append_utf8(&mut c.view.stamp, stamp)
+        c.source_fingerprint = ""
+    }
+    c.view.generation = c.view.generation + 1; c.view.sealed = true; true
+}
+pub fn seal(c: &mut Catalog) -> bool { seal_mode(&mut c, true) }
+pub fn digest_ready(c: &Catalog) -> bool {
+    c.view.valid && c.view.sealed && c.source_fingerprint.len == 64
+}
+// Empty is an explicit NOT-READY result. A producer must finalize every body
+// digest before activating fragment-cache context; never reuse an old context.
+pub fn fingerprint(c: &Catalog) -> string { if !digest_ready(&c) { "" } else { c.source_fingerprint.clone() } }
+pub fn word_estimate(w: &Workspace) -> i32 { if w.ready { w.cost } else { 0 } }
+// Caller resolution supplies the actual callee-address slot. A shadowed
+// function pointer is never accepted just because a global declaration shares
+// its spelling/ID. Arguments are already evaluated and stored eagerly.
+// The caller is the legacy frontend: live values reside in its frame/stack.
+// Homes x4..7/x10..13 are call-clobbered. An allocated IR caller would first
+// need its own liveness/save policy; that integration is deliberately absent.
+pub fn prepare(w: &mut Workspace, c: &Catalog, declaration: i32, callee_address: i32,
+    arg_types: &[]i32, result_type: i32, eager_slots: &[]i32, caller_slots: i32,
+    platform: i32, available_words: i32) -> bool {
+    prepare_view(&mut w, &c.view, declaration, callee_address, &arg_types, result_type, &eager_slots, caller_slots, platform, available_words)
+}
+pub fn prepare_view(w: &mut Workspace, c: &View, declaration: i32, callee_address: i32,
+    arg_types: &[]i32, result_type: i32, eager_slots: &[]i32, caller_slots: i32,
+    platform: i32, available_words: i32) -> bool {
+    w.ready = false; w.types.clear(); w.plan.homes.clear(); w.plan.frame_slots.clear(); w.plan.data.clear(); w.plan.length.clear()
+    if !c.valid || !c.sealed || callee_address != -1 || platform < 0 || platform > 3 || caller_slots < 0 || caller_slots > 65535 { return false }
+    entry := find_view(&c, declaration)
+    if entry < 0 || arg_types.len != c.param_counts[entry] || eager_slots.len != arg_types.len || result_type != c.returns[entry] { return false }
+    if available_words < c.costs[entry] { return false }
+    first := c.param_starts[entry]
+    for p in 0..arg_types.len {
+        if arg_types[p] != c.param_types[first + p] || eager_slots[p] < 0 || eager_slots[p] >= caller_slots { return false }
+    }
+    for p in 0..arg_types.len {
+        w.types.push(arg_types[p]); w.plan.frame_slots.push(eager_slots[p]); w.plan.data.push(-1); w.plan.length.push(-1)
+        mut home := 4 + p; if p >= 4 { home = 6 + p }; w.plan.homes.push(home)
+    }
+    w.generation = c.generation; w.stamp = c.stamp.clone(); w.entry = entry; w.declaration = declaration
+    w.root = c.roots[entry]; w.cost = c.costs[entry]; w.platform = platform; w.ready = true; true
+}
+// False means no Code field changed. A successful preparation is single-use;
+// reset, catalog corruption, different catalog contents or target invalidate it.
+pub fn emit_prepared(w: &mut Workspace, code: &mut arm.Code, c: &Catalog,
+    overflow: i32, zero: i32, bounds: i32, settings: &emit.Options) -> bool {
+    ready := w.ready; w.ready = false
+    emit_ready(&w, &mut code, &c.view, overflow, zero, bounds, &settings, ready)
+}
+pub fn emit_prepared_configured(w: &mut Workspace, code: &mut arm.Code, c: &Catalog,
+    overflow: i32, zero: i32, bounds: i32) -> bool {
+    emit_view(&mut w, &mut code, &c.view, overflow, zero, bounds)
+}
+pub fn emit_view(w: &mut Workspace, code: &mut arm.Code, c: &View,
+    overflow: i32, zero: i32, bounds: i32) -> bool {
+    ready := w.ready; w.ready = false
+    emit_ready(&w, &mut code, &c, overflow, zero, bounds, &w.settings, ready)
+}
+fn emit_ready(w: &Workspace, code: &mut arm.Code, c: &View,
+    overflow: i32, zero: i32, bounds: i32, settings: &emit.Options, ready: bool) -> bool {
+    if !ready || !c.valid || !c.sealed || w.generation != c.generation || !same_stamp(&w.stamp, &c.stamp) ||
+        w.entry < 0 || w.entry >= c.declarations.len || c.declarations[w.entry] != w.declaration ||
+        c.roots[w.entry] != w.root || code.platform != w.platform { return false }
+    first := arm.position(&code)
+    for p in 0..w.types.len {
+        arm.load(&mut code, w.plan.frame_slots[p]); reg := w.plan.homes[p]
+        if w.types[p] == 3 {
+            arm.compare_immediate(&mut code, 0, 0, false); arm.set_condition(&mut code, reg, 1) // CMP x0,0; CSET home,NE.
+        } else {
+            arm.mov(&mut code, reg, 0)
+            if w.types[p] == 1 { arm.sign_extend_i32(&mut code, reg, reg) }
+        }
+    }
+    emit.emit_expression(&mut code, &c.nodes, &w.types, &w.plan, w.root, overflow, zero, bounds, &settings)
+    assert(arm.position(&code) - first <= w.cost)
+    true
+}
+
+fn same_stamp(a: &[]u8, b: &[]u8) -> bool {
+    if a.len != b.len { return false }; for i in 0..a.len { if a[i] != b[i] { return false } }; true
+}

@@ -236,7 +236,7 @@ def main():
                 'source_files':list(graph),'source_bytes':sum(p['bytes'] for p in graph.values()),'observations':[]}
         # Bundled standard-library source lives in the compiler image; record
         # both its exact image identity and the current rebuild sources.
-        for path in [*ROOT.glob('selfhost/*.ddr'),*ROOT.glob('stdlib/*.ddr'),*ROOT.glob('runtime/*.ddr')]:
+        for path in [*(ROOT / 'selfhost').rglob('*.ddr'), *ROOT.glob('stdlib/*.ddr'), *ROOT.glob('runtime/*.ddr')]:
             resolved = path.resolve()
             resolutions[str(path.absolute())] = str(resolved)
             sources[str(resolved)] = {'sha256':sha(path),'bytes':path.stat().st_size,

@@ -94,7 +94,7 @@ def main():
         git(repo, 'config', f'url.{remote.as_uri()}.insteadOf', 'https://github.com/Mik-pe/dunder.git')
         script = repo / 'tools/release.sh'
         version = re.search(r'fn\s+compiler_version\s*\(\s*\)\s*->\s*string\s*\{\s*"([^"]+)"',
-                            (repo / 'selfhost/cli.ddr').read_text()).group(1)
+                            (repo / 'selfhost/driver/cli.ddr').read_text()).group(1)
         tag = 'v' + version
         package = work / 'local package'
         def run(publish=False, expected=0, version_tag=tag):
@@ -120,7 +120,7 @@ def main():
         # Pin the tested source before moving local HEAD and dirtying its compiler.
         git(repo, 'tag', '-a', tag, '-m', 'Test release', commit)
         git(repo, 'commit', '--allow-empty', '-qm', 'Later local commit')
-        (repo / 'selfhost/cli.ddr').write_text('this uncommitted file must never be packaged')
+        (repo / 'selfhost/driver/cli.ddr').write_text('this uncommitted file must never be packaged')
         (work / 'interrupt').touch()
         run(publish=True, expected=1)
         assert (work / 'state').read_text() == 'draft'

@@ -69,9 +69,9 @@ Runtimearbetet ska angripa trafik över hela loopar. Det ursprungliga
 underlaget var den numeriska benchmarkens nio frame-läsningar och fyra
 frame-skrivningar per framgångsrikt varv, medan C-referensen höll värdena i
 register. Det styr prioriteringen men är ingen regel passet får känna till.
-Den historiska [SSA-v1-mätmatrisen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+Den historiska [SSA-v1-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
 visade att v1:s cellplacering kostade för mycket byggtid utan samlad
-runtimevinst. [Den historiska v2-matrisen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+runtimevinst. [Den historiska v2-matrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 minskar SSA-byggmedianen för kompilatorkorpuset 27,65 procent mot v1, men
 visar fortfarande byggpremie utan belagd samlad runtimevinst. Standarden
 förblir off. Fortsättningen behöver dela värdeanalys och tillföra fullt typade
@@ -131,9 +131,9 @@ leverans.
 
 ## Införd SSA-grund och källa–ABI-gräns
 
-[`mir_ssa_cells`](../selfhost/mir_ssa_cells.ddr) finner privata, justerade
+[`mir_ssa_cells`](../selfhost/mir/mir_ssa_cells.ddr) finner privata, justerade
 åttabytesceller med fullbreddsskrivningar och inneslutna läsvyer på
-1/2/4/8 byte. [`mir_ssa`](../selfhost/mir_ssa.ddr) bygger separata ValueID:n
+1/2/4/8 byte. [`mir_ssa`](../selfhost/mir/mir_ssa.ddr) bygger separata ValueID:n
 för GP/NZCV def/use, blockparametrar och föregångarkanternas argument.
 Fysiska registermasker innehåller fortsatt fysiska register-ID:n; ett
 anrops MAY-clobber blir ingen uppfunnen semantisk resultatdefinition.
@@ -161,7 +161,7 @@ gäller den gemensamma logiska GP-banken; direkt x86-registerallokering
 återstår som målbackendsteg, medan Wasm-lokaler och Wasm-testsviter är
 senarelagda under pågående språkutveckling.
 
-Samma [`mir_pipeline`](../selfhost/mir_pipeline.ddr) kör frame → valbar SSA
+Samma [`mir_pipeline`](../selfhost/mir/mir_pipeline.ddr) kör frame → valbar SSA
 → värdepass seriellt och i workers. Arbetsjobbet sänker därefter till ett
 slutligt objekt med samma lowerer. SSA-budgeten är 4 194 304 enheter per
 funktion och inkluderar verifiering och exakt rollback. Platta arenor
@@ -175,9 +175,9 @@ och en extern utgång kan observera aktuell frame. Framepasset avstår därför
 vid sådana nåbara, oklassificerade gränser. De
 [frysta observerarmotexemplen](../tests/fixtures/mir-frame-exit-receipt.json)
 visar varför minnessynkronisering ensam inte räckte.
-[`mir_memory`](../selfhost/mir_memory.ddr),
-[`mir_terminals`](../selfhost/mir_terminals.ddr) och
-[`mir_call_abi`](../selfhost/mir_call_abi.ddr) skiljer NoModRef för privata
+[`mir_memory`](../selfhost/mir/mir_memory.ddr),
+[`mir_terminals`](../selfhost/mir/mir_terminals.ddr) och
+[`mir_call_abi`](../selfhost/mir/mir_call_abi.ddr) skiljer NoModRef för privata
 celler, sex exakta utgångar utan observationer och källanropens ABI1 åt.
 Den kompletta källproducenten deklarerar de verifierade premisserna;
 `mir_pipeline.options().source_abi` är false för godtyckliga konsumenter.
@@ -185,7 +185,7 @@ Den kompletta källproducenten deklarerar de verifierade premisserna;
 Premisserna använder [befintliga FFI-/objektregler](ffi.md#objektminne-och-privata-stackceller),
 utan att försvaga språkets minnes- eller anropsgarantier.
 
-[`mir_call_inputs`](../selfhost/mir_call_inputs.ddr) är en fjärde, separat
+[`mir_call_inputs`](../selfhost/mir/mir_call_inputs.ddr) är en fjärde, separat
 helproducentpremiss. `mir_pipeline.options().source_inputs` är false för rå
 MIR; den kompletta källproducenten sätter true. Stödda ABI1/2/3-anrop
 behåller GP0–GP8, GP16, GP18–GP31, alla FP-register och explicita targets
@@ -203,7 +203,7 @@ alltså `flags=3`. Tidigare `flags=2` var felaktig metadata; någon
 felkompilering i det nuvarande värdepasset har inte bevisats av detta fynd.
 
 Frame-livstid är en oberoende förmåga i
-[`mir_call_abi.Context`](../selfhost/mir_call_abi.ddr): normal retur bevarar
+[`mir_call_abi.Context`](../selfhost/mir/mir_call_abi.ddr): normal retur bevarar
 samma aktivering, FP/SP och mappade, åtkomliga vanliga caller-frameintervall.
 Innehållet får ändras. `trusted_frame_lifetime_v1()` ger bara detta;
 `trusted_source_frame_abi_v2()` kombinerar det med käll-ABI. Varken
@@ -214,9 +214,9 @@ kräver ett MUST-init-bevis över alla föregångare och verifierad åtkomst vid
 den faktiska infogningsplatsen; okänt ingångsminne och partiell initiering
 avstår.
 
-[`stack_roles`](../selfhost/mir.ddr) ger ett positivt producentursprung för
+[`stack_roles`](../selfhost/mir/mir.ddr) ger ett positivt producentursprung för
 privata Temp-push/pop, skilt från rå stack, argument och bryggor.
-[`mir_expr_stack`](../selfhost/mir_expr_stack.ddr) kräver dessutom separat
+[`mir_expr_stack`](../selfhost/mir/mir_expr_stack.ddr) kräver dessutom separat
 `source_temporaries`-behörighet för att elidera implementationens privata
 sextonbyteslagring och dess egna resursfel. Explicit aritmetik, index,
 åtkomst och kapacitetsvalidering i andra operationer kvarstår. En persistent
@@ -233,12 +233,12 @@ premisser om frame-livstid eller temporärlagring.
 [Uttrycksstackens kontrakt](../tests/mir_expr_stack.ddr).
 
 `--mir-ssa=on/off` är valbart och standarden är fortsatt off. I den
-[historiska v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+[historiska v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 ökade byggmedianen 21,26 procent för kompilatorkorpuset och 29,47 procent
 för Tabell med passet på; runtime/C-geomedlet var 1,1841 mot 1,1883 med
 passet av. Det är inga mätningar av regional Frame-/Expr-placering.
 Den historiska
-[v1-rapporten](../benchmarks/2026-11-12-ssa-foundation/README.md) visade
+[v1-rapporten](../benchmarks/archive/2026-11-12-ssa-foundation/README.md) visade
 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34 procent för
 Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller ingen
 meningsfull byggvinst i den rapporten. Detta är inga mätningar av gles v2
@@ -262,7 +262,7 @@ verifiering, inklusive bootstrapens fixpunkt med en och fyra workers,
 passerade. Den historiska prestandamatrisen hade 1 440 prover med 30 per grupp; förbättrad SSA-byggkostnad
 uppfyller ännu inte runtimekraven för standardaktivering.
 
-Den historiska [statiska text-/sortgranskningen](../benchmarks/2026-11-12-ssa-pruned/runtime-gap/README.md)
+Den historiska [statiska text-/sortgranskningen](../benchmarks/archive/2026-11-12-ssa-pruned/runtime-gap/README.md)
 använde exakt matchande mätbilder och avgränsade kontrollvägar. Text hade
 kvar uttrycksstack och en bool i frame efter setup-anrop. Sortens skiftloop
 var redan registerbaserad men upprepade adressberäkning och elementläsning.
@@ -399,7 +399,7 @@ varken taskgränsens isoleringskopior eller språkets vanliga värdesemantik.
 
 ### Mätning och återstående arkitektur
 
-Den tidigare [30-rundorsrapporten](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den tidigare [30-rundorsrapporten](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
 föregår SSA-grunden. Den skiljer samma binär med en/fyra workers från
 tidigare seriell kompilator mot dåvarande standard. Genererat bygge går från 953,718 till 609,106 ms i den första
 jämförelsen; standardkandidatens p95 är 619,768 ms, 163 003 källrader/s.

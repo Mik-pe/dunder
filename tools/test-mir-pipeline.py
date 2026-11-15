@@ -74,7 +74,7 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
-    report = {'compiler_sha256': digest(compiler), 'pipeline_sha256': digest(ROOT / 'selfhost/mir_pipeline.ddr'),
+    report = {'compiler_sha256': digest(compiler), 'pipeline_sha256': digest(ROOT / 'selfhost/mir/mir_pipeline.ddr'),
               'reference_sha256': digest(ROOT / 'tests/fixtures/mir-pipeline-reference.ddr'),
               'fixture_sha256': digest(ROOT / 'tests/fixtures/mir-pipeline-emitter.ddr'), 'images': []}
     pairs = executions = proofs = gaps = 0

@@ -1,0 +1,612 @@
+import backend_row as row
+import ..runtime.runtime_intrinsic as intrinsic
+
+pub struct Code {
+    words: []i64, labels: []i32, at: []i32, target: []i32, kinds: []i32, platform: i32,
+    prefixing: bool, prefix: []i64, checking: bool, virtual_words: i32, virtual_labels: i32,
+    profile: bool, effect_epoch: i64, effect_depth: i32,
+    mir_capture: bool,
+}
+pub fn new() -> Code { new_for(0) }
+// Targets: 0=arm64-macos, 1=arm64-linux, 2=x86_64-linux, 3=wasm32.
+// Relocations use the image's text offset.
+pub fn new_for(platform: i32) -> Code {
+    Code { words: [], labels: [], at: [], target: [], kinds: [], platform: platform,
+        prefixing: false, prefix: [], checking: false, virtual_words: 0, virtual_labels: 0, profile: false, effect_epoch: 0, effect_depth: 0, mir_capture: false }
+}
+// Semantic validation still walks the lowering helpers, but keeps no machine
+// words, label positions or relocations. Virtual counters keep patch sites
+// deterministic without allocating output for check-only or unreachable bodies.
+pub fn new_check(platform: i32) -> Code { mut code := new_for(platform); code.checking = true; code }
+pub fn position(code: &Code) -> i32 { if code.checking { code.virtual_words } else { code.words.len } }
+pub fn label_count(code: &Code) -> i32 { if code.checking { code.virtual_labels } else { code.labels.len } }
+pub fn begin_mir(code: &mut Code, enabled: bool) {
+    code.mir_capture = enabled && !code.checking
+}
+pub fn end_mir(code: &mut Code) { code.mir_capture = false }
+// A function may start in the scalar projection. Keep its ordered operations
+// until either the projection covers the body or general lowering takes over.
+// Global labels and output remain untouched while it is pending.
+pub fn begin_prefix(code: &mut Code) {
+    assert(code.mir_capture && !code.checking)
+    code.prefix.clear(); code.prefixing = true
+    code.mir_capture = false; code.checking = true
+    code.virtual_words = code.words.len; code.virtual_labels = code.labels.len
+}
+pub fn end_prefix(code: &mut Code) {
+    code.mir_capture = true; code.prefixing = false; code.checking = false
+}
+pub fn operand(code: &mut Code, cell: i64) {
+    if code.mir_capture { code.words.push(cell); return }
+    code.prefix.push(cell); code.virtual_words = code.virtual_words + 1
+}
+// Serialized function operands are nonnegative. Two private negative headers
+// carry binds and pending arithmetic while the checker still owns the prefix.
+pub fn pending_operator(code: &mut Code, opcode: i32, ty: i32, token: i32) {
+    operand(&mut code, i64(-1).shl(56).bit_or(i64(opcode).shl(48)).bit_or(i64(ty).shl(32)).bit_or(i64(token)))
+}
+pub fn resume_edge(code: &mut Code, cell: i64, target: i32) {
+    kind := row.reg(cell)
+    code.at.push(code.words.len); code.target.push(target); code.kinds.push(kind)
+    code.words.push(cell)
+}
+// Monotonic semantic evidence for frontend ownership proofs. Calls are barriers
+// even when their implementation is currently pure; inline source writes and
+// pointer exposures use this same hook. Rewriting code never rolls it back.
+pub fn barrier(code: &mut Code) { if code.effect_depth > 0 { code.effect_epoch = code.effect_epoch + 1 } }
+pub fn begin_effects(code: &mut Code) -> i64 { code.effect_depth = code.effect_depth + 1; code.effect_epoch }
+pub fn end_effects(code: &mut Code, epoch: i64) -> bool {
+    assert(code.effect_depth > 0)
+    code.effect_depth = code.effect_depth - 1
+    code.effect_epoch == epoch
+}
+pub fn emit(code: &mut Code, word: i64) {
+    // Keep classification inline in this hot helper, with no per-word call.
+    // Outside a string RHS there is no live ownership proof to invalidate.
+    if code.effect_depth > 0 {
+        family := word.shr(24)
+        if word.bit_and(4227858432) == 2483027968 || // Native BL immediate.
+            word.bit_and(4294966303) == 3594452992 || // BLR, any register.
+            word.bit_and(4292870175) == 3556769793 || // SVC, any immediate.
+            family == 251 || family == 252 || family == 254 { // Target call/host vocabulary.
+            code.effect_epoch = code.effect_epoch + 1
+        }
+    }
+    if code.checking { if code.prefixing { code.prefix.push(word) }; code.virtual_words = code.virtual_words + 1; return }
+    assert(word >= 0 && word <= 4294967295); code.words.push(word)
+}
+pub fn patch(code: &mut Code, at: i32, word: i64) {
+    // A patch can introduce an executable effect after its original emission.
+    // Conservatively invalidate proofs instead of inferring the old opcode.
+    barrier(&mut code)
+    if code.checking { assert(at >= 0 && at < code.virtual_words); return }
+    assert(word >= 0 && word <= 4294967295); code.words[at] = word
+}
+pub fn label(code: &mut Code) -> i32 {
+    if code.checking { value := code.virtual_labels; code.virtual_labels = value + 1; return value }
+    value := code.labels.len; code.labels.push(-1); value
+}
+pub fn mark(code: &mut Code, target: i32) {
+    if code.checking {
+        assert(target >= 0 && target < code.virtual_labels)
+        if code.prefixing { code.prefix.push(i64(-2).shl(56).bit_or(i64(target))) }; return
+    }
+    assert(code.labels[target] == -1); code.labels[target] = code.words.len
+}
+// 0=B, 1=BL, 2..17=B.cond (condition+2), 18=CBZ x0, 19=CBNZ x0, 20=address x0.
+pub fn branch(code: &mut Code, target: i32, kind: i32) {
+    symbolic_edge(&mut code, target, kind, .Symbolic, 0)
+}
+// Lower a source control edge through its action; no placeholder instruction
+// is manufactured while collecting operations for the function backend.
+pub fn source_edge(code: &mut Code, target: i32, edge: row.Edge, source: i32) {
+    symbolic_edge(&mut code, target, row.edge_reloc(edge), edge, source)
+}
+fn symbolic_edge(code: &mut Code, target: i32, kind: i32, edge: row.Edge, source: i32) {
+    if kind == 1 { barrier(&mut code) }
+    if code.prefixing { operand(&mut code, row.control(edge, kind, source)); code.prefix.push(i64(target)); return }
+    if !code.checking { code.at.push(code.words.len); code.target.push(target); code.kinds.push(kind) }
+    if code.mir_capture { code.words.push(row.control(edge, kind, source)); return }
+    emit(&mut code, 0)
+    if kind >= 2 { emit(&mut code, 3573751839) }
+}
+pub fn ownership_call(code: &mut Code, target: i32, action: row.Ownership, ty: i32, source: i32) {
+    if code.checking { return }
+    if !code.mir_capture { branch(&mut code, target, 1); return }
+    bound_call(&mut code, target, row.ownership(action, ty), row.source(source))
+}
+fn bound_call(code: &mut Code, target: i32, operation: i64, origin: i64) {
+    barrier(&mut code)
+    code.at.push(code.words.len); code.target.push(target); code.kinds.push(1)
+    code.words.push(operation); code.words.push(origin)
+}
+pub fn await_arguments(code: &mut Code, tag: i32, result: i32) {
+    imm(&mut code, 2, i64(result))
+    mut mode: i64 = 0; if tag == row.task_tag(.AwaitOnce) { mode = 1 }
+    imm(&mut code, 3, mode)
+}
+pub fn task_call(code: &mut Code, target: i32, action: row.Task, ty: i32, worker: i32, source: i32) {
+    if code.checking { return }
+    if !code.mir_capture {
+        tag := row.task_tag(action)
+        if row.awaiting(tag) { await_arguments(&mut code, tag, ty) }
+        branch(&mut code, target, 1); return
+    }
+    bound_call(&mut code, target, row.task(action, ty, worker), row.task_origin(source, worker))
+}
+pub fn intrinsic_call(code: &mut Code, target: i32, op: intrinsic.Operation, input: i32, result: i32, source: i32) {
+    if op == .Print && code.platform == 3 {
+        if code.mir_capture { barrier(&mut code); code.words.push(row.host_print(input, source)) }
+        else { emit(&mut code, 4227858432 + i64(input)) }
+        return
+    }
+    if code.mir_capture {
+        bound_call(&mut code, target, row.intrinsic_call(op, input, result, 0), row.intrinsic_origin(result, source))
+    } else {
+        reg := intrinsic.argument_register(i32(op), input)
+        if reg >= 0 { imm(&mut code, reg, intrinsic.argument_value(i32(op), input, 0)) }
+        branch(&mut code, target, 1)
+    }
+}
+// Array literals allocate before evaluating elements. Complete the original
+// allocation row once element inference and fixed/dynamic shape are known.
+pub fn finish_array_literal(code: &mut Code, at: i32, element: i32, result: i32, layout: i32, source: i32) {
+    if code.mir_capture {
+        barrier(&mut code)
+        code.words[at] = row.intrinsic_call(.ArrayNew, element, result, layout)
+        code.words[at + 1] = row.intrinsic_origin(result, source)
+    } else { patch(&mut code, at, 3531603970 + i64(layout) * 32) }
+}
+pub fn native_address(code: &mut Code, dst: i32) {
+    if code.mir_capture { code.words.push(row.native_address(dst)); return }
+    mut first: i64 = 0; if dst == 0 { first = 4244635648 }
+    emit(&mut code, first); emit(&mut code, 0)
+}
+pub fn source_import_width(code: &Code, at: i32) -> i32 {
+    if at >= 0 && at < code.words.len && row.valid_native_address(code.words[at]) { return 1 }
+    2
+}
+pub fn source_reloc_width(code: &Code, at: i32, kind: i32) -> i32 {
+    if at >= 0 && at < code.words.len {
+        if row.valid_source_call(code.words[at]) { return row.call_width(code.words[at]) }
+        if row.control_row(code.words[at]) { return 1 }
+        if row.call_header(code.words[at]) { return 2 }
+    }
+    if kind >= 2 { return 2 }
+    1
+}
+pub fn enum_value(code: &mut Code, reg: i32, ty: i32, field: i32, value: i64, source: i32) {
+    if code.mir_capture {
+        code.words.push(row.enum_value(reg, field)); code.words.push(row.enum_site(ty, source)); code.words.push(value)
+    } else { imm(&mut code, reg, value) }
+}
+pub fn allocate_value(code: &mut Code, allocator: i32, layout: row.Allocation, ty: i32, bytes: i32, source: i32) {
+    if code.checking { return }
+    if code.mir_capture {
+        barrier(&mut code); code.at.push(code.words.len); code.target.push(allocator); code.kinds.push(1)
+        code.words.push(row.allocate(layout, ty)); code.words.push(row.allocation_site(bytes, source))
+    } else { imm(&mut code, 0, i64(bytes)); branch(&mut code, allocator, 1) }
+}
+pub fn owner_store(code: &mut Code, action: row.OwnerStore, ty: i32, slot: i32, source: i32) {
+    if code.checking { return }
+    if code.mir_capture {
+        code.words.push(row.owner_store(action, ty, slot)); code.words.push(row.source(source)); return
+    }
+    mut reg := 31; if action == .Install { reg = 0 }
+    store(&mut code, slot, reg)
+}
+// Already shifted into its encoding position in an ADD/SUB immediate word.
+pub fn add_sub_field(value: i64) -> i64 {
+    if value >= 0 && value <= 4095 { return value * 1024 }
+    if value > 0 && value <= 16773120 && value % 4096 == 0 { return value / 4096 * 1024 + 4194304 }
+    -1
+}
+// Scalar register and add/sub immediate forms used by checked expressions
+// and wrapping integer methods. A present immediate is the actual magnitude.
+pub fn integer_binary(code: &mut Code, op: i32, wide: bool, flags: bool, dst: i32, lhs: i32, rhs: i32, amount: i64) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.binary(op, wide, flags, dst, lhs, rhs, amount)); return }
+    mut word: i64 = 0
+    if amount >= 0 {
+        word = 285212672 + add_sub_field(amount)
+        if op == 2 { word = word + 1073741824 }
+    } else {
+        if op == 1 { word = 184549376 } else if op == 2 { word = 1258291200 }
+        else if op == 3 { word = 452984832 + 31744 }
+        else if op == 4 { word = 452984832 + 31744 + 4194304 }
+        else if op == 5 { word = 452984832 + 31744 + 12582912 }
+        else if op == 6 { word = 448790528 + 3072 } else if op == 7 { word = 448790528 + 2048 }
+        else if op == 8 { word = 167772160 } else if op == 9 { word = 704643072 }
+        else if op == 10 { word = 1241513984 } else if op == 12 { word = 706740224 }
+        else if op == 14 { word = 448790528 + 8192 }
+        else { assert(op == 15); word = 448790528 + 9216 }
+        word = word + i64(rhs) * 65536
+    }
+    if wide { word = word + 2147483648 }; if flags { word = word + 536870912 }
+    emit(&mut code, word + i64(lhs) * 32 + i64(dst))
+}
+pub fn transfer(code: &mut Code, load: bool, value: i32, base: i32, shape: i32, offset: i32) {
+    if code.mir_capture || code.prefixing {
+        mut tag := 105; if load { tag = 104 }
+        operand(&mut code, row.transfer(tag, value, base, shape, offset)); return
+    }
+    mut size := shape; if size == 4 { size = 2 }
+    mut opcode: i64 = 956301312 + i64(size) * 1073741824
+    if load { opcode = opcode + 4194304; if shape == 4 { opcode = opcode + 4194304 } }
+    emit(&mut code, opcode + i64(offset.shr(size)) * 1024 + i64(base) * 32 + i64(value))
+}
+pub fn transfer_indexed(code: &mut Code, load: bool, value: i32, base: i32, index: i32) {
+    if code.mir_capture || code.prefixing {
+        mut tag := 107; if load { tag = 106 }
+        operand(&mut code, row.transfer(tag, value, base, 3, index)); return
+    }
+    mut opcode: i64 = 4162877440; if load { opcode = opcode + 4194304 }
+    emit(&mut code, opcode + i64(index) * 65536 + i64(base) * 32 + i64(value))
+}
+pub fn add_scaled(code: &mut Code, dst: i32, base: i32, index: i32, shift: i32) {
+    if code.mir_capture || code.prefixing {
+        operand(&mut code, row.binary(1, true, false, dst, base, index, -1).bit_or(i64(shift).shl(8))); return
+    }
+    emit(&mut code, 2332033024 + i64(index) * 65536 + i64(shift) * 1024 + i64(base) * 32 + i64(dst))
+}
+pub fn compare_register(code: &mut Code, lhs: i32, rhs: i32) {
+    if lhs != 31 && rhs == 31 { compare_immediate(&mut code, lhs, 0, false); return }
+    if code.mir_capture || code.prefixing { operand(&mut code, row.compare(lhs, rhs, -1, false)); return }
+    emit(&mut code, 3942645791 + i64(lhs) * 32 + i64(rhs) * 65536)
+}
+pub fn compare_immediate(code: &mut Code, lhs: i32, magnitude: i64, negative: bool) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.compare(lhs, 0, magnitude, negative)); return }
+    mut word: i64 = 4043309087; if negative { word = 2969567263 }
+    emit(&mut code, word + add_sub_field(magnitude) + i64(lhs) * 32)
+}
+pub fn set_condition(code: &mut Code, dst: i32, cc: i32) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.condition(dst, cc)); return }
+    emit(&mut code, 2594113504 + i64(cc.bit_xor(1)) * 4096 + i64(dst))
+}
+pub fn multiply_subtract(code: &mut Code, dst: i32, lhs: i32, rhs: i32, accumulator: i32) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.multiply_subtract(dst, lhs, rhs, accumulator)); return }
+    emit(&mut code, 2600501248 + i64(rhs) * 65536 + i64(accumulator) * 1024 + i64(lhs) * 32 + i64(dst))
+}
+pub fn bitfield(code: &mut Code, signed: bool, wide: bool, dst: i32, src: i32, rotate: i32, top: i32) {
+    if (code.mir_capture || code.prefixing) && dst < 31 && src < 31 {
+        operand(&mut code, row.bitfield(signed, wide, dst, src, rotate, top)); return
+    }
+    mut word: i64 = 1392508928; if signed { word = 318767104 }
+    if wide { word = word + 2151677952 }
+    emit(&mut code, word + i64(rotate) * 65536 + i64(top) * 1024 + i64(src) * 32 + i64(dst))
+}
+pub fn sign_extend_i32(code: &mut Code, dst: i32, src: i32) { bitfield(&mut code, true, true, dst, src, 0, 31) }
+pub fn imm(code: &mut Code, reg: i32, value: i64) {
+    if code.prefixing { row.literal(&mut code.prefix, reg, value); code.virtual_words = code.virtual_words + 1; return }
+    if code.mir_capture && reg < 31 {
+        row.literal(&mut code.words, reg, value); return
+    }
+    machine_immediate(&mut code, reg, value)
+}
+fn machine_immediate(code: &mut Code, reg: i32, value: i64) {
+    if value >= 0 && value <= 65535 { emit(&mut code, 3531603968 + value * 32 + i64(reg)); return }
+    if value < 0 && value >= -65536 { emit(&mut code, 2457862144 + value.bit_not() * 32 + i64(reg)); return }
+    // Up to two occupied halfwords always favor MOVZ or tie. For larger
+    // constants choose the seed whose default lanes need fewer MOVK patches.
+    mut fill: i64 = 0; mut seed: i64 = 3531603968
+    if value < 0 || value > 4294967295 {
+        mut zeros := 0; mut ones := 0
+        for part in 0..4 {
+            bits := value.shr(part * 16).bit_and(65535)
+            if bits == 0 { zeros = zeros + 1 } else if bits == 65535 { ones = ones + 1 }
+        }
+        if ones > zeros { fill = 65535; seed = 2457862144 }
+    }
+    for part in 0..4 {
+        bits := value.shr(part * 16).bit_and(65535)
+        if bits != fill {
+            mut lane := bits
+            if seed == 2457862144 { lane = bits.bit_xor(65535) }
+            emit(&mut code, seed + i64(part) * 2097152 + lane * 32 + i64(reg))
+            seed = 4068474880
+        }
+    }
+}
+pub fn mov(code: &mut Code, destination: i32, source: i32) {
+    if destination == source { return }
+    if (code.mir_capture || code.prefixing) && destination < 31 {
+        operand(&mut code, row.copy(destination, source)); return
+    }
+    emit(&mut code, 2852127712 + i64(source) * 65536 + i64(destination))
+}
+fn stack(code: &mut Code, reg: i32, push: bool, temporary: bool) {
+    assert(reg >= 0 && reg <= 31)
+    if code.mir_capture || code.prefixing { operand(&mut code, row.stack(push, temporary, reg)); return }
+    if push { emit(&mut code, 2847899616 + i64(reg)) }
+    else { emit(&mut code, 2831253472 + i64(reg)) }
+}
+pub fn push(code: &mut Code, reg: i32) { stack(&mut code, reg, true, false) }
+pub fn pop(code: &mut Code, reg: i32) { stack(&mut code, reg, false, false) }
+// Only the expression emitter declares private temporary storage. Both kinds
+// of push/pop retain their memory, stack and possible trap effects.
+pub fn push_temp(code: &mut Code, reg: i32) { stack(&mut code, reg, true, true) }
+pub fn pop_temp(code: &mut Code, reg: i32) { stack(&mut code, reg, false, true) }
+pub fn read_local(code: &mut Code, slot: i32, shape: i32) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.local_read(slot, shape)); return }
+    // A distant slot computes its effective address in the result register.
+    mut base := 29; mut displacement := i64(-(slot + 1) * 8).bit_and(511) * 4096
+    if slot >= 32 { address(&mut code, slot); base = 0; displacement = 0 }
+    mut opcode: i64 = 4164943872
+    if shape == 0 { opcode = 943718400 } else if shape == 1 { opcode = 2017460224 }
+    else if shape == 2 { opcode = 3091202048 } else if shape == 4 { opcode = 3095396352 }
+    emit(&mut code, opcode + displacement + i64(base) * 32)
+}
+pub fn load(code: &mut Code, slot: i32) { load_into(&mut code, slot, 0) }
+pub fn load_into(code: &mut Code, slot: i32, reg: i32) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.frame(4, slot, reg)); return }
+    if slot < 32 { emit(&mut code, 4164944800 + i64(-(slot + 1) * 8).bit_and(511) * 4096 + i64(reg)) }
+    else {
+        if slot < 511 { emit(&mut code, 3506439081 + i64(slot + 1) * 8192) }
+        else { machine_immediate(&mut code, 9, i64(slot + 1) * 8); emit(&mut code, 3406365609) }
+        emit(&mut code, 4181721376 + i64(reg))
+    }
+}
+pub fn store(code: &mut Code, slot: i32, reg: i32) {
+    if (code.mir_capture || code.prefixing) && !(slot >= 32 && reg == 9) { operand(&mut code, row.frame(5, slot, reg)); return }
+    if slot < 32 { emit(&mut code, 4160750496 + i64(-(slot + 1) * 8).bit_and(511) * 4096 + i64(reg)) }
+    else {
+        if slot < 511 { emit(&mut code, 3506439081 + i64(slot + 1) * 8192) }
+        else { machine_immediate(&mut code, 9, i64(slot + 1) * 8); emit(&mut code, 3406365609) }
+        emit(&mut code, 4177527072 + i64(reg))
+    }
+}
+pub fn address(code: &mut Code, slot: i32) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.frame(6, slot, 0)); return }
+    if slot < 511 { emit(&mut code, 3506439072 + i64(slot + 1) * 8192) }
+    else { machine_immediate(&mut code, 0, i64(slot + 1) * 8); emit(&mut code, 3405775776) }
+}
+fn abi_step(code: &mut Code, op: i32, word: i64) {
+    if code.mir_capture || code.prefixing { operand(&mut code, row.frame_abi(op, 0)) } else { emit(&mut code, word) }
+}
+pub fn return_to_caller(code: &mut Code) { abi_step(&mut code, 7, 3596551104) }
+pub fn prologue(code: &mut Code) -> i32 {
+    abi_step(&mut code, 1, 2847898621); abi_step(&mut code, 2, 2432697341)
+    at := position(&code)
+    abi_step(&mut code, 4, 3506439167); abi_step(&mut code, 8, 3573751839)
+    at
+}
+pub fn frame(code: &mut Code, at: i32, slots: i32) {
+    size := (slots * 8 + 15) / 16 * 16
+    assert(slots >= 0 && size <= 16777200)
+    if code.mir_capture {
+        barrier(&mut code); code.words[at] = row.frame_abi(3, size - size % 4096)
+        barrier(&mut code); code.words[at + 1] = row.frame_abi(4, size % 4096)
+        return
+    }
+    patch(&mut code, at, 3510633471 + i64(size / 4096) * 1024)
+    patch(&mut code, at + 1, 3506439167 + i64(size % 4096) * 1024)
+}
+pub fn leave_frame(code: &mut Code) { abi_step(&mut code, 5, 2432697279); abi_step(&mut code, 6, 2831252477) }
+pub fn ret(code: &mut Code) { leave_frame(&mut code); return_to_caller(&mut code) }
+pub fn syscall(code: &mut Code, darwin: i64, linux: i64) {
+    if code.platform != 0 { imm(&mut code, 8, linux); emit(&mut code, 3556769793) }
+    else { imm(&mut code, 16, darwin); emit(&mut code, 3556773889) }
+}
+pub fn fail_source(code: &mut Code, cause: row.Failure, source: i32) {
+    if code.mir_capture { barrier(&mut code); code.words.push(row.failure(cause, source)) }
+    else { exit(&mut code, 108 + i32(cause)) }
+}
+pub fn exit(code: &mut Code, status: i32) {
+    imm(&mut code, 0, i64(status)); syscall(&mut code, 33554433, 94); emit(&mut code, 3558866944)
+}
+pub fn finish(code: &mut Code) -> []u8 { return finish_for(&mut code, false) }
+pub fn finish_for(code: &mut Code, dynamic: bool) -> []u8 {
+    assert(!code.checking)
+    mut text_offset: i32 = 432
+    if code.platform != 0 { text_offset = 4096 } else if dynamic { text_offset = 16384 }
+    for i in 0..code.at.len {
+        at := code.at[i]; target := code.labels[code.target[i]]; kind := code.kinds[i]
+        assert(target >= 0)
+        delta := i64(target - at)
+        if kind == 20 {
+            from := text_offset + at * 4; destination := text_offset + target * 4
+            pages := i64(destination / 4096 - from / 4096).bit_and(2097151)
+            code.words[at] = 2415919104 + pages.bit_and(3) * 536870912 + pages.shr(2) * 32
+            code.words[at + 1] = 2432696320 + i64(destination % 4096) * 1024
+        } else if kind < 2 {
+            assert(delta >= -33554432 && delta < 33554432)
+            mut base: i64 = 335544320
+            if kind == 1 { base = 2483027968 }
+            code.words[at] = base + delta.bit_and(67108863)
+        } else {
+            mut base: i64 = 1409286144
+            mut inverse: i64 = 0
+            if kind == 18 { base = 3019898880; inverse = 16777216 }
+            else if kind == 19 { base = 3036676096; inverse = 16777216 }
+            else { base = base + i64(kind - 2); inverse = 1 }
+            if delta >= -262144 && delta < 262144 { code.words[at] = base + delta.bit_and(524287) * 32 }
+            else {
+                code.words[at] = base.bit_xor(inverse) + 64
+                code.words[at + 1] = 335544320 + (delta - 1).bit_and(67108863)
+            }
+        }
+    }
+    mut output: []u8 = []
+    output.reserve(code.words.len * 4)
+    mut word: i32 = 0
+    while word < code.words.len {
+        value := code.words[word]
+        output.push(u8(value.bit_and(255)))
+        output.push(u8(value.shr(8).bit_and(255)))
+        output.push(u8(value.shr(16).bit_and(255)))
+        output.push(u8(value.shr(24).bit_and(255)))
+        word = word + 1
+    }
+    output
+}
+// Signed decimal formatting, bool/string output, short-write loops and traps.
+pub fn runtime(code: &mut Code, integer: i32, boolean: i32, text_label: i32, write: i32, overflow: i32, zero: i32, assertion: i32, io: i32) {
+    mark(&mut code, integer)
+    frame_at := prologue(&mut code); frame(&mut code, frame_at, 8)
+    emit(&mut code, 2432761825); imm(&mut code, 9, 10); emit(&mut code, 956301353)
+    imm(&mut code, 2, 1); mov(&mut code, 3, 0); imm(&mut code, 4, 10); imm(&mut code, 7, 0)
+    magnitude := label(&mut code); emit(&mut code, 4043309343); branch(&mut code, magnitude, 3) // unsigned formatting
+    emit(&mut code, 3944677407); branch(&mut code, magnitude, 12)
+    imm(&mut code, 7, 1); emit(&mut code, 3405972451)
+    mark(&mut code, magnitude)
+    digit := label(&mut code); mark(&mut code, digit)
+    emit(&mut code, 2596538469); emit(&mut code, 2600766630); emit(&mut code, 285262022)
+    emit(&mut code, 3506439201); emit(&mut code, 956301350); emit(&mut code, 2432697410); mov(&mut code, 3, 5)
+    // CBNZ x3; use a generic comparison to keep branch relocations uniform.
+    emit(&mut code, 4043309183); branch(&mut code, digit, 3)
+    signed := label(&mut code); emit(&mut code, 4043309311); branch(&mut code, signed, 2)
+    emit(&mut code, 3506439201); imm(&mut code, 9, 45); emit(&mut code, 956301353); emit(&mut code, 2432697410)
+    mark(&mut code, signed); branch(&mut code, write, 1); ret(&mut code)
+
+    mark(&mut code, boolean)
+    bool_frame := prologue(&mut code); frame(&mut code, bool_frame, 2)
+    falsity := label(&mut code); output := label(&mut code); branch(&mut code, falsity, 18)
+    imm(&mut code, 9, 44651868788); imm(&mut code, 2, 5); branch(&mut code, output, 0)
+    mark(&mut code, falsity); imm(&mut code, 9, 11430844457318); imm(&mut code, 2, 6)
+    mark(&mut code, output); emit(&mut code, 4177527785); emit(&mut code, 2432697313); branch(&mut code, write, 1); ret(&mut code)
+
+    mark(&mut code, text_label)
+    string_frame := prologue(&mut code); frame(&mut code, string_frame, 2)
+    emit(&mut code, 4181721090); emit(&mut code, 2432704513)
+    empty := label(&mut code); emit(&mut code, 4043309151); branch(&mut code, empty, 2); branch(&mut code, write, 1)
+    mark(&mut code, empty); imm(&mut code, 9, 10); emit(&mut code, 4177527785); emit(&mut code, 2432697313); imm(&mut code, 2, 1); branch(&mut code, write, 1); ret(&mut code)
+
+    mark(&mut code, write)
+    again := label(&mut code); mark(&mut code, again)
+    imm(&mut code, 0, 1); syscall(&mut code, 33554436, 64)
+    if code.platform != 0 {
+        // Linux returns negative errno; Darwin reports an error through carry.
+        emit(&mut code, 4043309087); branch(&mut code, io, 13)
+    } else { branch(&mut code, io, 4) }
+    branch(&mut code, io, 18)
+    emit(&mut code, 3405774914); emit(&mut code, 2332033057); emit(&mut code, 4043309151); branch(&mut code, again, 3); emit(&mut code, 3596551104)
+    mark(&mut code, overflow); exit(&mut code, 101)
+    mark(&mut code, zero); exit(&mut code, 102)
+    mark(&mut code, assertion); exit(&mut code, 104)
+    mark(&mut code, io); exit(&mut code, 74)
+}
+
+@test fn effect_epochs_cover_the_shared_call_vocabulary() {
+    mut code := new()
+    destination := label(&mut code)
+    initial := begin_effects(&mut code)
+    emit(&mut code, 3573751839); branch(&mut code, destination, 0)
+    branch(&mut code, destination, 18); branch(&mut code, destination, 20)
+    code.effect_epoch == initial
+    branch(&mut code, destination, 1)
+    code.effect_epoch == initial + 1
+    emit(&mut code, 2483027968); emit(&mut code, 2550136831)
+    code.effect_epoch == initial + 3
+    for reg in 0..32 { emit(&mut code, 3594452992 + i64(reg) * 32) }
+    code.effect_epoch == initial + 35
+    emit(&mut code, 3556769793); emit(&mut code, 3556773889); emit(&mut code, 3558866913)
+    code.effect_epoch == initial + 38
+    words: []i64 = [4211081216, 4227858432, 4261412864]
+    for word in &words {
+        emit(&mut code, word); emit(&mut code, word + 16777215)
+    }
+    code.effect_epoch == initial + 44
+    barrier(&mut code); code.effect_epoch == initial + 45
+    patch(&mut code, 0, 3573751839); code.effect_epoch == initial + 46
+    !end_effects(&mut code, initial)
+    code.effect_depth == 0
+}
+@test fn checking_calls_keep_effect_evidence_without_words() {
+    mut code := new_check(3)
+    initial := begin_effects(&mut code)
+    destination := label(&mut code)
+    branch(&mut code, destination, 1); emit(&mut code, 4211081223); syscall(&mut code, 1, 2)
+    code.effect_epoch == 3
+    code.words.len == 0
+    !end_effects(&mut code, initial)
+}
+@test fn nested_effect_observation_keeps_outer_evidence_and_ignores_unobserved_calls() {
+    mut code := new()
+    destination := label(&mut code)
+    branch(&mut code, destination, 1); emit(&mut code, 3594453504)
+    code.effect_epoch == 0
+    outer := begin_effects(&mut code)
+    branch(&mut code, destination, 1) // Inner lease setup invalidates the outer proof.
+    inner := begin_effects(&mut code)
+    emit(&mut code, 3573751839)
+    end_effects(&mut code, inner)
+    !end_effects(&mut code, outer)
+    code.effect_depth == 0
+    after := code.effect_epoch
+    barrier(&mut code); syscall(&mut code, 1, 2); patch(&mut code, 0, 3573751839)
+    code.effect_epoch == after
+}
+@test fn linux_uses_its_syscall_register_and_page_aligned_text() {
+    mut code := new_for(1)
+    destination := label(&mut code)
+    branch(&mut code, destination, 20)
+    mark(&mut code, destination)
+    exit(&mut code, 37)
+    text := finish(&mut code)
+    assert(text.len == 24)
+    assert(code.words[0] == 2415919104)
+    assert(code.words[1] == 2432704512)
+    assert(code.words[3] == 3531606984) // mov x8,94: exit_group
+    assert(code.words[4] == 3556769793)
+}
+
+@test fn darwin_retains_its_text_offset_and_syscall_abi() {
+    mut code := new()
+    destination := label(&mut code)
+    branch(&mut code, destination, 20)
+    mark(&mut code, destination)
+    exit(&mut code, 37)
+    text := finish(&mut code)
+    assert(text.len == 28)
+    assert(code.words[0] == 2415919104)
+    assert(code.words[1] == 2433146880)
+    assert(code.words[5] == 3556773889)
+}
+
+@test fn linux_frames_cover_large_compiler_functions() {
+    mut code := new_for(1)
+    at := prologue(&mut code)
+    frame(&mut code, at, 65535)
+    assert(code.words.len == 4)
+    assert(code.words[at] == 3510764543)
+    assert(code.words[at + 1] == 3506439167)
+}
+
+@test fn checking_counts_positions_without_retaining_machine_output() {
+    for platform in 0..4 {
+        mut code := new_check(platform)
+        entry := label(&mut code); done := label(&mut code)
+        mark(&mut code, entry)
+        at := prologue(&mut code)
+        frame(&mut code, at, 65535)
+        for i in 0..4096 { imm(&mut code, 0, i64(i)); branch(&mut code, done, 18) }
+        mark(&mut code, done); ret(&mut code)
+        patch(&mut code, at, 3510633471)
+        position(&code) == 12295
+        label_count(&code) == 2
+        code.words.len == 0
+        code.labels.len == 0
+        code.at.len == 0
+        code.target.len == 0
+        code.kinds.len == 0
+    }
+}
+
+@test fn source_frame_capture_records_complete_helpers_and_check_sink_stays_empty() {
+    mut code := new(); emit(&mut code, 3573751839); begin_mir(&mut code, true)
+    for slot in [0, 31, 32, 510, 511, 8191] {
+        load_into(&mut code, slot, 7); store(&mut code, slot, 31); address(&mut code, slot)
+    }
+    end_mir(&mut code)
+    assert(code.words.len == 19 && !code.mir_capture)
+    for note in 0..18 {
+        cell := code.words[note + 1]
+        assert(row.valid(cell) && row.kind(cell) == 4 + note % 3)
+        if note % 3 == 0 { assert(row.reg(cell) == 7) } else if note % 3 == 1 { assert(row.reg(cell) == 31) } else { assert(row.reg(cell) == 0) }
+    }
+    words := code.words.len; load(&mut code, 0); assert(code.words.len == words + 1)
+    begin_mir(&mut code, false); assert(!code.mir_capture)
+    mut checking := new_check(0); begin_mir(&mut checking, true)
+    load_into(&mut checking, 511, 7); store(&mut checking, 511, 31); address(&mut checking, 511); end_mir(&mut checking)
+    assert(checking.words.len == 0)
+    assert(checking.virtual_words > 0 && !checking.mir_capture)
+}

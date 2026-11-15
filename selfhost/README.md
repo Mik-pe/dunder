@@ -65,7 +65,7 @@ cacheobjekt. Både den seriella ingången och arbetarna läser samma
 Efter överlämningen kan frontenden återanvända minnet för nästa kropp.
 Arbetarna verifierar MIR och sänker varje ny funktion till ett objekt.
 Samordnaren tar över objekten med `await!` och länkar dem i ordning.
-[Funktionsformat](mir_source.ddr) och [arbetarsvar](mir_task.ddr).
+[Funktionsformat](mir/mir_source.ddr) och [arbetarsvar](tasks/mir_task.ddr).
 
 Ett task-scope kan dela en fryst numerisk deklarationsbild och ge varje
 worker en egen återanvändbar arbetsyta. Den taskbaserade ingången kan typa
@@ -79,13 +79,13 @@ deklarationsordning. [Taskkontrakt](../docs/tasks.md) och
 ## Helfunktionspass och valbar SSA
 
 Varje nyemitterad källfunktion går genom den gemensamma MIR-gränsen med
-obligatorisk verifiering. Samma [`mir_pipeline`](mir_pipeline.ddr) utför
+obligatorisk verifiering. Samma [`mir_pipeline`](mir/mir_pipeline.ddr) utför
 framepromovering → valbar SSA → värdepropagering seriellt och i workers.
 Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
 diagnostik använder samma fulla frontend oberoende av passval.
 
-`--mir-ssa=on/off` väljer [`mir_ssa`](mir_ssa.ddr); standard är fortsatt **off**.
-I den historiska [v2-mätmatrisen](../benchmarks/2026-11-12-ssa-pruned/README.md)
+`--mir-ssa=on/off` väljer [`mir_ssa`](mir/mir_ssa.ddr); standard är fortsatt **off**.
+I den historiska [v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 kostade SSA på 21,26 procent extra byggmedian för kompilatorkorpuset och
 29,47 procent för Tabell utan belagd samlad runtimevinst. MIR och MIR-opt
 måste också vara på. V2 bygger egna ValueID:n för GP/NZCV def/use,
@@ -94,7 +94,7 @@ efterfrågan. Oförändrade GP-/NZCV-ingångar delas och iterativ kantlösning
 undviker tät block×variabel-expansion. Aktiva live-mängder och verkliga
 in-/utträdeshändelser styr interferens och placeringsvittnen, utan att varje
 operation skannar alla statiska SSA-versioner.
-[`mir_ssa_cells`](mir_ssa_cells.ddr) grupperar privata åttabytesceller med
+[`mir_ssa_cells`](mir/mir_ssa_cells.ddr) grupperar privata åttabytesceller med
 fullbreddsskrivningar och inneslutna läsvyer på 1/2/4/8 byte. En cells
 phi-värden förenas och placeras i GP0–GP17 mot fysisk liveness och fulla
 clobbers. En separat `source_inputs`-premiss får förfina anropsläsningarna.
@@ -115,8 +115,8 @@ testkvittoidentiteten. Fysisk v5 binder `call-flags1`, `stack-origin1`,
 `frame-life1` och källanrops-ABI2. De underliggande livstids-, ursprungs- och
 lagringspremisserna är fortsatt oberoende. Workerantalet ingår inte.
 
-[`mir_memory`](mir_memory.ddr), [`mir_terminals`](mir_terminals.ddr) och
-[`mir_call_abi`](mir_call_abi.ddr) håller privata NoModRef-celler, sex exakt
+[`mir_memory`](mir/mir_memory.ddr), [`mir_terminals`](mir/mir_terminals.ddr) och
+[`mir_call_abi`](mir/mir_call_abi.ddr) håller privata NoModRef-celler, sex exakt
 angivna utgångar utan observationer och källanropens ABI1 åtskilda. Vanliga
 råa fabriker ger inga sådana källpremisser. Den kompletta källproducenten
 sätter ABI1 och äger beviset för giltiga anrop och bryggor. Det befintliga
@@ -126,7 +126,7 @@ Anrop synkroniserar fortfarande originalceller och behåller sina clobbers.
 [Reglerna för privata objekt, stackargument och FFI](../docs/ffi.md#objektminne-och-privata-stackceller)
 är oförändrade.
 
-[`mir_call_inputs`](mir_call_inputs.ddr) ger en separat helproducentpremiss,
+[`mir_call_inputs`](mir/mir_call_inputs.ddr) ger en separat helproducentpremiss,
 `source_inputs`, som är false i råa fabriker och explicit true hos den
 kompletta källproducenten. GP0–GP8, GP16, GP18–GP31, alla FP-register och
 explicita mål bevaras som indata för stödda ABI1/2/3-anrop. Scratch GP9–GP15
@@ -142,21 +142,21 @@ X16; targets kan inte räknas som fri scratch. Rå Call läser inkommande NZCV
 och kan förstöra dem, alltså `flags=3`. Det tidigare `flags=2` var felaktig
 metadata. Fyndet har inte visat någon felkompilering i dagens värdepass.
 
-Den historiska [SSA-v1-mätningen](../benchmarks/2026-11-12-ssa-foundation/README.md)
+Den historiska [SSA-v1-mätningen](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
 gav 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34 procent
 för Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller
 ingen meningsfull byggvinst där. Detta gäller v1 och är inga mätningar av
 gles v2 eller `source_inputs`; bootstrapprofilen behålls.
 
-Frame-livstid är en oberoende del av [`mir_call_abi.Context`](mir_call_abi.ddr).
+Frame-livstid är en oberoende del av [`mir_call_abi.Context`](mir/mir_call_abi.ddr).
 En normal retur ska återvända med samma FP/SP och giltiga, mappade
 caller-frameintervall; cellvärdena får ändras. Detta ändrar inga råa
 anropsmasker och ger varken NoModRef eller ett initieringsbevis. Ett separat
 full8 MUST-init-bevis krävs före regional återläsning efter barriären.
 
-[`mir.Function.stack_roles`](mir.ddr) markerar positivt ursprung för
+[`mir.Function.stack_roles`](mir/mir.ddr) markerar positivt ursprung för
 implementationens uttryckstemporärer; råa push/pop har ingen sådan rätt.
-[`mir_expr_stack`](mir_expr_stack.ddr) håller separat `source_temporaries`-
+[`mir_expr_stack`](mir/mir_expr_stack.ddr) håller separat `source_temporaries`-
 behörighet för att elidera den privata sextonbyteslagringen och dess egna
 resursfel. Markeringen ensam, source-objects och call-ABI räcker inte.
 Argument, FP/LR, brygglagring och källadresserbara värden undantas. Explicita
@@ -247,7 +247,7 @@ typkontroll av funktionskroppen, även om programmet aldrig anropar den.
 
 ### Wasm32 från den självbyggda kompilatorn (senarelagt i testmatrisen)
 
-Den självbyggda kompilatorn behåller Wasm-backenden i `selfhost/wasm_*.ddr`, men
+Den självbyggda kompilatorn behåller Wasm-backenden i `selfhost/backend/wasm_*.ddr`, men
 Wasm-testsviter och JS-runtimeberoenden är **senarelagda** under pågående
 språkutveckling så att utvecklings- och verifieringsloopen körs rent nativt.
 
@@ -317,7 +317,7 @@ Enskilda sviter kan även köras direkt:
 dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" test tests/suite.ddr
 "$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
-python3 tools/runtime-contracts.py "$dunder_bin"
+python3 tools/test-runtime-contracts.py "$dunder_bin"
 ```
 
 De körda programmen har förväntade värden, utskrifter och felutfall.
@@ -332,3 +332,18 @@ skriva en egen startpunkt med `build-tests`.
 "$dunder_bin" build-tests tests/suite.ddr --group 0 -o build/group0
 ./build/group0
 ```
+
+## Katalogstruktur
+
+Ingångar, inbäddat standardbibliotek och målspecifika startmoduler ligger
+i roten av `selfhost/` (`main.ddr`, `main_parallel.ddr`, `linux.ddr`,
+`x86_linux.ddr`, `wasm.ddr`, `embed.ddr`, `bundled.ddr`). Övriga moduler är
+uppdelade efter ansvarsområde:
+
+- `driver/`: CLI, modulupplösning, byggsession, inkrementell cache/fragment och profilerare.
+- `frontend/`: lexer, parser, typkontroll, borrow-/resursanalys och AST-sänkning.
+- `opt/`: typat optimerings-IR, konstantvikning, intervallbevis, inlining och skalär emission.
+- `mir/`: helfunktions-IR, SSA-konstruktion/promovering, värdepropagering, sänkning och länkning.
+- `tasks/`: isolerade tasktyper, worker-körvägar, certifikat och task-scope-emission.
+- `backend/`: ARM64/x86-64/Wasm-kodemission, FFI/ABI samt Mach-O- och ELF-binärformat.
+- `runtime/`: inlänkade körtidsfunktioner och systemgränssnitt (`runtime_sys`, intrinsics).

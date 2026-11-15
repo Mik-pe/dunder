@@ -88,7 +88,7 @@ def main():
         (work / 'summary.json').write_text(json.dumps({
             'result': 'passed' if passed else 'failed', 'compiler_sha256': digest(compiler),
             'source_sha256': {name: digest(root / name) for name in (
-                'selfhost/mir_lower.ddr', 'selfhost/mir_task.ddr', 'selfhost/compile_parallel.ddr',
+                'selfhost/mir/mir_lower.ddr', 'selfhost/tasks/mir_task.ddr', 'selfhost/tasks/compile_parallel.ddr',
                 'tests/mir_object_data.ddr', 'tests/fixtures/mir-object-data-task.ddr',
                 'tools/test-mir-object-data.py')},
             'unit_groups': groups, 'unit_images': units, 'kernel_images': images,

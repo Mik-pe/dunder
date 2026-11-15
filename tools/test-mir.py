@@ -386,9 +386,14 @@ def fixture_source(name, source_root, work, fixtures=ROOT):
     text = (fixtures / 'tests/fixtures' / name).read_text()
     def replace(match):
         module, alias = match.groups()
-        relative = os.path.relpath(source_root / 'selfhost' / module, work).replace(os.sep, '/')
-        return 'import ' + json.dumps(relative) + ' as ' + (alias or module)
-    text = re.sub(r'import \.\.\.selfhost\.(\w+)(?: as (\w+))?', replace, text)
+        leaf = module.rsplit('.', 1)[-1]
+        target = source_root / 'selfhost' / module.replace('.', '/')
+        if not target.with_suffix('.ddr').is_file():
+            matches = [p.with_suffix('') for p in (source_root / 'selfhost').rglob(leaf + '.ddr')]
+            target = matches[0] if len(matches) == 1 else (source_root / 'selfhost' / leaf)
+        relative = os.path.relpath(target, work).replace(os.sep, '/')
+        return 'import ' + json.dumps(relative) + ' as ' + (alias or leaf)
+    text = re.sub(r'import \.\.\.selfhost\.([\w.]+)(?: as (\w+))?', replace, text)
     target_fixture = os.path.relpath(source_root / 'tests' / 'fixtures' / 'mir_machine', work)
     return text.replace('import .mir_machine as', 'import ' + json.dumps(target_fixture) + ' as')
 
@@ -428,11 +433,11 @@ def main():
     elif system == 'Linux' and machine in ('aarch64', 'arm64'): host = 1
     elif system == 'Linux' and machine == 'x86_64': host = 2
     else: parser.error('native execution requires ARM64 macOS or ARM64/x86-64 Linux')
-    inputs = {compiler, Path(__file__).resolve(), *source_root.glob('selfhost/*.ddr'),
+    inputs = {compiler, Path(__file__).resolve(), *(source_root / 'selfhost').rglob('*.ddr'),
               ROOT / 'tests/fixtures/mir-consumer.ddr', ROOT / 'tests/fixtures/mir-oracle.ddr'}
     reference_root = args.reference_root.resolve(strict=True) if args.reference_root else None
     if reference_root:
-        inputs.update(reference_root.glob('selfhost/*.ddr'))
+        inputs.update((reference_root / 'selfhost').rglob('*.ddr'))
         inputs.add(reference_root / 'tests/fixtures/mir-consumer.ddr')
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
     evidence = dict(complete=False, scope=args.only, hashes=hashes, host=platform.uname()._asdict(), commands=[],

@@ -1,0 +1,224 @@
+// Structural verification is mandatory before lowering. Optional dataflow may
+// fail closed by disabling optimization; it never rejects a valid opaque unit.
+import mir
+import ..frontend.source_types
+import mir_contract as contract
+import mir_operation as decode
+import mir_retained as retained
+
+pub struct Workspace { seen: []bool, depths: []i32, queue: []i32, decoded: decode.Decoded }
+pub fn new_work() -> Workspace { Workspace { seen: [], depths: [], queue: [], decoded: decode.new() } }
+
+fn columns(f: &mir.Function) -> bool {
+    n := f.kinds.len
+    if f.opcodes.len != n || f.dst.len != n || f.a.len != n || f.b.len != n || f.c.len != n || f.imm.len != n ||
+        f.aux.len != n || f.variant.len != n || f.types.len != n || f.place.len != n || f.extensions.len != n ||
+        f.effects.len != n || f.flags.len != n || f.abi.len != n || f.reads.len != n || f.writes.len != n || f.clobbers.len != n ||
+        f.origins.len != n || f.raw_starts.len != n || f.widths.len != n || f.modes.len != n || f.recipes.len != n || f.stack_roles.len != n ||
+        f.targets.len != n || f.reloc_kinds.len != n || f.import_ids.len != n || f.op_blocks.len != n { return false }
+    p := f.place_kinds.len
+    if f.place_offsets.len != p || f.place_widths.len != p || f.place_extensions.len != p || f.place_escaped.len != p { return false }
+    if f.block_starts.len != f.block_ends.len || f.edge_from.len != f.edge_to.len || f.edge_from.len != f.edge_kinds.len ||
+        f.label_ids.len != f.label_ops.len { return false }
+    true
+}
+fn operation(f: &mir.Function, op: i32, frame_size: i64) -> bool {
+    kind := f.kinds[op]; mode := f.modes[op]; size := f.widths[op]; raw := f.raw_starts[op]
+    if kind < 0 || (kind > 21 && (kind < 23 || kind > 26)) || mode < 0 || mode > 2 || f.flags[op] < 0 || f.flags[op] > 3 ||
+        f.effects[op] < 0 || f.effects[op] > 255 || f.abi[op] < 0 || f.abi[op] > 4 ||
+        f.extensions[op] < 0 || f.extensions[op] > 2 || f.recipes[op] < 0 || f.recipes[op] > 7 ||
+        f.stack_roles[op] < 0 || f.stack_roles[op] > 1 { return false }
+    // Origin is separate from the decoded opcode and never a nontrapping or
+    // NoModRef certificate. Only explicitly captured stack rows may carry it.
+    if f.stack_roles[op] == 1 && ((kind != 10 && kind != 11) ||
+        (kind == 10 && f.recipes[op] != 6) || (kind == 11 && f.recipes[op] != 7)) { return false }
+    if (f.recipes[op] == 6 || f.recipes[op] == 7) && f.stack_roles[op] != 1 { return false }
+    if f.dst[op] < -1 || f.a[op] < -1 || f.b[op] < -1 || f.c[op] < -1 ||
+        f.dst[op] > 63 || f.a[op] > 63 || f.b[op] > 63 || f.c[op] > 63 { return false }
+    if mode == 0 {
+        if raw < 0 || size <= 0 || raw > f.raw.len - size || f.origins[op] < f.first_word { return false }
+        // Retained validation checks the range of every raw word after this row.
+    }
+    place := f.place[op]
+    if place < -1 || place >= f.place_kinds.len { return false }
+    if (kind == 7 || kind == 8 || kind == 10 || kind == 11) && place < 0 { return false }
+    if kind == 0 && (f.effects[op] != 255 || f.flags[op] != 3 || f.abi[op] != 4 ||
+        f.reads[op] != -1 || f.writes[op] != -1 || f.clobbers[op] != -1 || f.optimizable || !f.unknown_control) { return false }
+    if kind == 14 && (f.abi[op] == 0 || f.effects[op].bit_and(8) == 0) { return false }
+    reloc := f.reloc_kinds[op]
+    if reloc < -1 || reloc > 20 { return false }
+    if reloc >= 0 {
+        if f.targets[op] < 0 || f.targets[op] >= f.source_labels || f.import_ids[op] != -1 { return false }
+        if kind != 9 && kind != 12 && kind != 13 && kind != 14 { return false }
+        if mode == 0 {
+            mut expected := 1; if reloc >= 2 { expected = 2 }
+            if size != expected || f.raw[raw] != 0 { return false }
+            if size == 2 && f.raw[raw + 1] != 3573751839 { return false }
+        }
+    } else if f.targets[op] != -1 { return false }
+    if f.import_ids[op] >= 0 {
+        if kind != 17 || f.import_ids[op] < f.first_import || f.import_ids[op] >= f.source_imports || reloc != -1 { return false }
+        if mode == 0 && (size != 2 || f.raw[raw + 1] != 0 || (f.raw[raw] != 0 && f.raw[raw] != 4244635648)) { return false }
+    } else if kind == 17 { return false }
+    if mode == 1 && !contract.canonical_with_frame(&f, op, frame_size) { return false }
+    true
+}
+// Expression-stack checks use a worklist over actual CFG edges. Opaque control
+// deliberately has no fabricated successor, so no speculative stack proof is
+// used to optimize it. Frame reservation is independent of expression pushes.
+fn stack(f: &mir.Function, work: &mut Workspace) -> bool {
+    if !f.optimizable || f.block_starts.len == 0 { return true }
+    work.depths.clear(); work.queue.clear()
+    for b in 0..f.block_starts.len { work.depths.push(-1) }
+    work.depths[0] = 0; work.queue.push(0); mut next := 0
+    while next < work.queue.len {
+        block := work.queue[next]; next = next + 1; mut depth := work.depths[block]
+        for position in f.block_starts[block]..f.block_ends[block] {
+            op := f.order[position]
+            if f.modes[op] == 2 { continue }
+            if f.kinds[op] == 10 { depth = depth + 16 }
+            if f.kinds[op] == 11 { depth = depth - 16 }
+            // Return restores SP from FP; any unconsumed expression temporaries
+            // are discarded with that frame, just as in direct lowering.
+            if f.kinds[op] == 16 && f.opcodes[op] == 1 && f.dst[op] == 31 && f.a[op] == 29 && f.imm[op] == 0 { depth = 0 }
+            if depth < 0 || depth % 16 != 0 { return false }
+        }
+        for edge in f.edge_starts[block]..f.edge_starts[block + 1] {
+            target := f.edge_to[edge]; if target < 0 { continue }
+            if work.depths[target] == -1 { work.depths[target] = depth; work.queue.push(target) }
+            else if work.depths[target] != depth { return false }
+        }
+    }
+    true
+}
+fn label_position(f: &mir.Function, label: i32) -> i32 {
+    // IDs are sorted; global forward function/data labels need no entries in
+    // this function. A missing or unmarked target is an explicit external edge.
+    mut low := 0; mut high := f.label_ids.len
+    while low < high {
+        middle := low + (high - low) / 2
+        if f.label_ids[middle] < label { low = middle + 1 } else { high = middle }
+    }
+    if low < f.label_ids.len && f.label_ids[low] == label { return f.label_ops[low] }; -1
+}
+fn edge_matches(f: &mir.Function, edge: i32, end: i32, to: i32, kind: i32) -> bool {
+    edge < end && f.edge_to[edge] == to && f.edge_kinds[edge] == kind
+}
+fn control(f: &mir.Function) -> bool {
+    // Labels are instruction boundaries AND block boundaries. A scheduler may
+    // not leave a target in the middle of a block after moving operations.
+    for l in 0..f.label_ops.len {
+        position := f.label_ops[l]
+        if position < 0 || position == f.order.len { continue }
+        block := f.op_blocks[f.order[position]]
+        if block < 0 || block >= f.block_starts.len || f.block_starts[block] != position { return false }
+    }
+    for block in 0..f.block_starts.len {
+        first := f.block_starts[block]; end := f.block_ends[block]
+        mut last := -1
+        for position in first..end {
+            op := f.order[position]; if f.modes[op] == 2 { continue }
+            if last >= 0 {
+                kind := f.kinds[last]
+                if kind == 0 || kind == 12 || kind == 13 || kind == 15 || kind == 20 { return false }
+            }
+            last = op
+        }
+        edge_end := f.edge_starts[block + 1]; mut edge := f.edge_starts[block]
+        mut kind := 18; if last >= 0 { kind = f.kinds[last] }
+        if kind == 12 || kind == 13 {
+            position := label_position(&f, f.targets[last]); mut destination := -1; mut edge_kind := 2
+            if position >= 0 && position < f.order.len {
+                destination = f.op_blocks[f.order[position]]; edge_kind = 1
+            }
+            if !edge_matches(&f, edge, edge_end, destination, edge_kind) { return false }; edge = edge + 1
+        }
+        if kind == 0 {
+            if !edge_matches(&f, edge, edge_end, -1, 4) { return false }; edge = edge + 1
+        } else if kind == 15 {
+            if !edge_matches(&f, edge, edge_end, -1, 3) { return false }; edge = edge + 1
+        } else if kind == 20 {
+            if !edge_matches(&f, edge, edge_end, -1, 2) { return false }; edge = edge + 1
+        } else if kind != 12 {
+            mut destination := -1; mut edge_kind := 5
+            if block + 1 < f.block_starts.len { destination = block + 1; edge_kind = 0 }
+            if !edge_matches(&f, edge, edge_end, destination, edge_kind) { return false }; edge = edge + 1
+        }
+        if edge != edge_end { return false }
+    }
+    true
+}
+// The lifter appends rows in identity order. Only a scheduled suffix needs
+// scratch to prove that every row appears exactly once.
+fn valid_order(f: &mir.Function, seen: &mut []bool) -> bool {
+    count := f.kinds.len
+    if f.order.len != count { return false }
+    mut first := 0
+    while first < count && f.order[first] == first { first = first + 1 }
+    if first == count { return true }
+    seen.clear(); seen.reserve(count - first)
+    for position in first..count { seen.push(false) }
+    for position in first..count {
+        op := f.order[position]
+        if op < first || op >= count || seen[op - first] { return false }
+        seen[op - first] = true
+    }
+    true
+}
+pub fn verify_into(f: &mut mir.Function, work: &mut Workspace) -> bool {
+    f.verified = false
+    if !f.valid || !source_types.valid(&f.source_types) || !columns(&f) || f.first_word < 0 || f.source_words < f.first_word ||
+        f.first_label < 0 || f.source_labels < f.first_label || f.first_reloc < 0 ||
+        f.source_relocs < f.first_reloc || f.first_import < 0 || f.source_imports < f.first_import { return false }
+    if !valid_order(&f, &mut work.seen) { return false }
+    mut private_frame := false
+    for p in 0..f.place_kinds.len {
+        if f.place_kinds[p] < 0 || f.place_kinds[p] > 2 || f.place_widths[p] <= 0 ||
+            f.place_extensions[p] < 0 || f.place_extensions[p] > 2 { return false }
+        if f.place_kinds[p] == 1 && !f.place_escaped[p] { private_frame = true }
+    }
+    if private_frame && contract.frame_lifetime_unproven(&f) { return false }
+    frame_size := contract.frame_capacity(&f)
+    mut stack_needed := false
+    for position in 0..f.order.len {
+        op := f.order[position]
+        if !operation(&f, op, frame_size) { return false }
+        if private_frame && f.modes[op] != 2 && contract.exposes_frame(&f, op) { return false }
+        if f.modes[op] == 0 && !retained.validate(&mut work.decoded, &f, op) { return false }
+        if f.modes[op] != 2 && (f.kinds[op] == 10 || f.kinds[op] == 11) { stack_needed = true }
+    }
+    for l in 0..f.label_ids.len {
+        if f.label_ids[l] < 0 || f.label_ids[l] >= f.source_labels ||
+            f.label_ops[l] < -1 || f.label_ops[l] > f.order.len { return false }
+        if f.label_ids[l] < f.first_label && f.label_ops[l] != 0 { return false }
+        if l > 0 && f.label_ids[l] <= f.label_ids[l - 1] { return false }
+    }
+    mut last := 0
+    for block in 0..f.block_starts.len {
+        start := f.block_starts[block]; end := f.block_ends[block]
+        if start != last || end <= start || end > f.order.len { return false }
+        for position in start..end { if f.op_blocks[f.order[position]] != block { return false } }
+        last = end
+    }
+    if last != f.order.len { return false }
+    if f.edge_starts.len != f.block_starts.len + 1 || f.edge_starts[0] != 0 ||
+        f.edge_starts[f.edge_starts.len - 1] != f.edge_from.len { return false }
+    for block in 0..f.block_starts.len {
+        start := f.edge_starts[block]; end := f.edge_starts[block + 1]
+        if start < 0 || end < start || end > f.edge_from.len { return false }
+        for e in start..end { if f.edge_from[e] != block { return false } }
+    }
+    for e in 0..f.edge_from.len {
+        if f.edge_from[e] < 0 || f.edge_from[e] >= f.block_starts.len || f.edge_to[e] < -1 ||
+            f.edge_to[e] >= f.block_starts.len || f.edge_kinds[e] < 0 || f.edge_kinds[e] > 5 { return false }
+        if f.edge_kinds[e] == 4 && (f.optimizable || !f.unknown_control) { return false }
+    }
+    if !control(&f) { return false }
+    // Straightline/scalar functions with no expression-stack traffic need no
+    // queue or depth initialization. Verification never computes dominance/SSA.
+    if stack_needed && !stack(&f, &mut work) { f.optimizable = false }
+    f.verified = true; true
+}
+pub fn verify(f: &mut mir.Function) -> bool {
+    mut work := new_work(); verify_into(&mut f, &mut work)
+}

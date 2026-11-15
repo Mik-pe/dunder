@@ -177,7 +177,7 @@ den seriella genomgången och binder deras anrop, effekter och symbolbehov.
 arbetarna typade och hur många frontend-arbetsytor som användes.
 `frontend.windows` räknar grupper av källjobb. `frontend.peak_total_jobs`
 räknar det största sammanlagda antalet utestående käll- och backendjobb.
-[Frontendarbetare](../selfhost/frontend_tasks.ddr)
+[Frontendarbetare](../selfhost/tasks/frontend_tasks.ddr)
 
 När nåbarheten är känd uppskattar samordnaren återstående typkontroll från
 deklarationernas redan kända tokenspann och antalet kroppar. Med en worker
@@ -190,7 +190,7 @@ kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
 optimerar och sänker funktionerna i batchen med arbetsytor som återanvänds över batchgränserna.
 Passinställningar och terminal-ID:n delas som en snapshot för hela scopet.
 Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
-Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/mir_task.ddr)
+Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/tasks/mir_task.ddr)
 
 `ObjectData` är en vanlig transparent post med primitiva arenor och går
 genom språkets befintliga snapshot-/klonregler. Den ger inget undantag för
@@ -220,7 +220,7 @@ enums och inline C-layout är stoppunkter. Lokaler och fältprojektioner
 är skild från språkets allmänna ägarflyttar. Isoleringskopiorna vid
 spawn/join behövs fortfarande mellan workerarenorna.
 
-Den historiska [parallella kompilatormätningen](../benchmarks/2026-11-12-parallel-compiler/README.md)
+Den historiska [parallella kompilatormätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
 skiljer samma binär med en respektive fyra workers från jämförelsen med
 den dåvarande seriella kompilatorn. Rapportens genererade bygge med fyra
 workers nådde p95 619,768 ms, motsvarande 163 003 källrader/s. Runtimebilderna är
@@ -228,6 +228,6 @@ identiska; runtime/C-geomedlet är 1,178× och största kvoten 1,308×.
 Det återstående C-målet löses inte av snabbare kompilering. Rapporten
 föregår regional SSA och worker-lokal sänkning och mäter inte deras kostnad.
 
-Den tidigare [språkmätningen med 30 rundor](../benchmarks/2026-11-12-isolated-tasks/README.md)
+Den tidigare [språkmätningen med 30 rundor](../benchmarks/archive/2026-11-12-isolated-tasks/README.md)
 visade 3,59× och 3,78× parad förbättring i två rena taskarbetsfall. Den
 redovisar separat vad själva taskstödet kostade seriella program.

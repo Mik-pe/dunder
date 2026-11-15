@@ -29,7 +29,7 @@ Biblioteket är inbäddat i kompilatorn. Projektet behöver ingen lokal
 `sys.ddr`, installerad standardbibliotekskatalog eller nätverksåtkomst.
 Programmet behöver inte kompilatorn eller bibliotekets källfiler vid körning.
 API:t finns i [stdlib/sys.ddr](../stdlib/sys.ddr); den lilla OS-gränsen
-implementeras i [native-backenden](../selfhost/runtime_sys.ddr).
+implementeras i [native-backenden](../selfhost/runtime/runtime_sys.ddr).
 
 ## Funktioner och resultat
 

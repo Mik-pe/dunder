@@ -175,7 +175,7 @@ Wasm avbryter den aktuella körningen med en trap.
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
-python3 tools/runtime-contracts.py "$dunder_bin"
+python3 tools/test-runtime-contracts.py "$dunder_bin"
 python3 tools/test-array-moves.py "$dunder_bin"
 python3 tools/test-resource-moves.py "$dunder_bin"
 python3 tools/test-resource-ownership.py "$dunder_bin"

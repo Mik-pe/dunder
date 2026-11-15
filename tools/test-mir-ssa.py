@@ -165,18 +165,18 @@ def main():
     parser.add_argument('--output', type=Path, help='empty directory to keep images and raw exports')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
-    module = ROOT / 'selfhost/mir_ssa.ddr'
+    module = ROOT / 'selfhost/mir/mir_ssa.ddr'
     assert module.is_file(), 'production mir_ssa.ddr must be integrated before building the QA consumer'
     fixture = ROOT / 'tests/fixtures/mir-ssa-oracle.ddr'
     # Refuse a stale rollback witness when the production schema grows.
-    declaration = (ROOT / 'selfhost/mir.ddr').read_text().split('pub struct Function {', 1)[1].split('\n}', 1)[0]
+    declaration = (ROOT / 'selfhost/mir/mir.ddr').read_text().split('pub struct Function {', 1)[1].split('\n}', 1)[0]
     witness = fixture.read_text().split('fn metadata(', 1)[1].split('\nfn main()', 1)[0]
     fields = set(re.findall(r'\b([a-z][a-z0-9_]*)\s*:', re.sub(r'//[^\n]*', '', declaration)))
     observed = set(re.findall(r'\bf\.([a-z][a-z0-9_]*)', witness))
     assert fields == observed, ('incomplete Function rollback witness', fields - observed, observed - fields)
     host = 0 if platform.system() == 'Darwin' else (1 if platform.machine() in ('arm64', 'aarch64') else 2)
     report = dict(compiler_sha256=digest(compiler.read_bytes()), module_sha256=digest(module.read_bytes()),
-                  call_inputs_sha256=digest((ROOT / 'selfhost/mir_call_inputs.ddr').read_bytes()),
+                  call_inputs_sha256=digest((ROOT / 'selfhost/mir/mir_call_inputs.ddr').read_bytes()),
                   fixture_sha256=digest(fixture.read_bytes()),
                   oracle_sha256=digest((ROOT / 'tools/test-mir.py').read_bytes()), host_target=host, images=[])
     with tempfile.TemporaryDirectory(prefix='dunder-mir-ssa-') as temporary:

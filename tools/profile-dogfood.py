@@ -212,7 +212,7 @@ def invoke(args, *, timed=False):
 
 
 def hashes():
-    paths = [*COHORT.rglob('*.ddr'),*COHORT.rglob('*.txt'),*ROOT.glob('selfhost/*.ddr'),
+    paths = [*COHORT.rglob('*.ddr'),*COHORT.rglob('*.txt'),*(ROOT / 'selfhost').rglob('*.ddr'),
              *ROOT.glob('stdlib/*.ddr'),*ROOT.glob('runtime/*.ddr'),Path(__file__)]
     return {str(p.relative_to(ROOT)):sha(p) for p in sorted(paths)}
 
