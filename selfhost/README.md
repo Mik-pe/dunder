@@ -278,6 +278,7 @@ en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 | `modules.ddr` | Modulgraph, namn, synlighet, deduplicering och källmappning. |
 | `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
 | `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, lån och ägarflyttar, källordning och slutlig emission. |
+| `frontend_context.ddr`, `target_cond.ddr`, `token_lookahead.ddr`, `runtime_helpers.ddr` | Utbrutna hjälpmoduler från `compile.ddr`: deklarationsvärld/funktionskontext, `target_is`-evaluering, block/uttrycks-lookahead och strängliteral-/samlingsemission. |
 | `compile_parallel.ddr`, `mir_task.ddr` | Begränsade taskfönster, ägda funktionsjobb och ordnad acceptans. |
 | `mir_pipeline.ddr` | Samma verifiering och frame-/valbara SSA-/värdepass för seriell körning och workers. |
 | `mir_ssa.ddr`, `mir_ssa_cells.ddr`, `mir_expr_stack.ddr` | Regional frame-SSA och positiva Temp-värden i gemensam registerplacering, med separata livstids-/lagringspremisser. |
