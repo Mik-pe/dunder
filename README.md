@@ -399,6 +399,19 @@ referensräkning för dessa oföränderliga värden. Literaler ligger kvar i
 programbilden. Strängar och dynamiska arrayer delar en återanvändbar heap.
 Läs [ägarskap, kostnader och gränser](docs/memory.md).
 
+Prefixet `f` aktiverar stränginterpolering:
+
+```dunder
+name := "världen"
+print(f"Hej, {name}! Svaret är {40 + 2}.")
+print(f"{{{name}}}")  // {världen}
+```
+
+Varje uttryck mellan `{` och `}` utvärderas en gång, från vänster till
+höger. Strängar, heltal, flyttal, bool och runes formateras med sina vanliga
+textrepresentationer. `{{` och `}}` ger bokstavliga klamrar. Vanliga strängar
+tolkar inga uttryck. [Regler och exempel](docs/syntax.md#stränginterpolering)
+
 ## Flyttal
 
 `f32` och `f64` stöder aritmetik, jämförelser, decimal- och exponentliteraler,
@@ -494,7 +507,7 @@ Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
 och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva
 skalärer och enums utan payload. Aggregat returneras med värdesemantik.
 Ett generiskt allokerings-API, lån som kan returneras och
-användardefinierade iteratorer återstår. Stränginterpolering, normalisering,
+användardefinierade iteratorer återstår. Normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
 
 [Aktuellt arbete](docs/status.md) · [Arkitektur](docs/arkitektur.md) ·

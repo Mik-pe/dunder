@@ -84,6 +84,37 @@ Reglerna gäller även optimerade byggen. Wraparound är ännu inte en
 språkoperation. Statuskoderna är den första felmekanismen; källkopplade
 runtime-diagnoser återstår.
 
+### Stränginterpolering
+
+`f"..."` och `f'...'` innehåller vanliga Dunder-uttryck mellan `{` och `}`:
+
+```dunder
+name := "å 🌍"
+count := 3
+message := f"{name}: {count + 1} objekt, redo={true}"
+label := f"status: {if count > 0 { "aktiv" } else { "tom" }}"
+escaped := f"{{{count}}}"  // {3}
+```
+
+Hålen kan innehålla anrop, fältåtkomst, indexering, `if`, `match` och
+nästlade interpolerade strängar. De utvärderas exakt en gång i källordning.
+Tidigare strängvärden hålls levande även om ett senare hål ersätter deras
+ursprungliga variabel. Resultatet är en vanlig ägd `string`.
+
+Tillåtna resultattyper är `string`, signerade och osignerade heltal,
+`usize`, `bool`, `rune`, `f32` och `f64`. Formateringen motsvarar `.str()`;
+för en sträng delar `.str()` dess oföränderliga text. Aggregat, råpekare och
+funktioner kräver att programmet först väljer en textrepresentation.
+Formatkoder som `:02` ingår inte.
+
+`{{` och `}}` ger bokstavliga klamrar. Övriga escapes fungerar som i vanliga
+strängar, inklusive Unicode och NUL. Textsegment får inte innehålla råa
+radbrytningar; uttrycken kan sträcka sig över flera rader. Ett tomt hål,
+en ensam `}`, obalanserade delimiters eller en oavslutad interpolation ger
+ett kompileringsfel på originalpositionen. Nästlade interpolerade strängar
+har en gräns på 64 nivåer. En sträng utan `f` behåller alltid sin vanliga
+tolkning, även när den innehåller klamrar.
+
 ## Funktioner och kontrollflöde
 
 ```dunder
