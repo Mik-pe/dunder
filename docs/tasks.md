@@ -160,8 +160,13 @@ ARM64/macOS. Standardingången använder fyra workers; `--jobs N` eller
 trådar, även vid korskompilering till Linux eller Wasm. Ett kompilerat
 programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
-En enda `compile_session.Session` behåller frontend, typ- och lånekontroll,
-symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
+Byggsamordnaren äger symboler, nåbarhetsordning, imports och inlinebudget.
+När nåbarheten är känd uppskattar den återstående typkontrollen från
+deklarationernas redan kända tokenspann och antalet kroppar. Med en worker
+eller liten återstående arbetsmängd kontrolleras dessa kroppar direkt i
+samordnarens session. Vid tillräckligt oberoende arbete delar arbetarna
+en fryst deklarationsbild och läser varsin funktionskropp. Båda fallen
+använder samma typkontroll och rapporterar fel i deklarationsordning.
 `compile_parallel` skickar funktionslokala operationer och metadata i separata
 kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
 optimerar och sänker funktionerna i batchen med arbetsytor som återanvänds över batchgränserna.

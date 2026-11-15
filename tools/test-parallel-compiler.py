@@ -202,10 +202,14 @@ fn main() { print(0) }
         self.contracts.append({'case': 'dead_body_order', 'first_declaration_and_following_offset': True})
 
     def worker_expression_depth(self):
+        # Force substantial independent typing work so --jobs=2/4 run the
+        # boundary cases on real worker stacks. --jobs=1 checks locally.
+        body = ''.join(f'var v{n}:i64={n};' for n in range(160))
+        ballast = ''.join(f'fn body{n}(){{{body}}}\n' for n in range(100))
         for depth in (42, 43):
             expression = '1+(' * depth + '1' + ')' * depth
             path = self.case('dead_depth_' + str(depth),
-                             f'fn unused()->i32{{{expression}}}\nfn main(){{print(42)}}\n')
+                             f'fn unused()->i32{{{expression}}}\n{ballast}fn main(){{print(42)}}\n')
             for driver in self.drivers:
                 image = path.parent / driver[0]
                 result = self.run(self.command(driver, 'build', path, ['-o', image]),
