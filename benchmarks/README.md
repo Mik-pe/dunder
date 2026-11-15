@@ -1,5 +1,7 @@
 # Lokala prestandamätningar
 
+På Apple M5 gick självbygget från 677,5 till 625,8 ms efter ändringarna i lexern, parsern och MIR. [Mätserie för tre rena byggen, 2026-11-15](compiler/2026-11-15-build-latency/README.md)
+
 [Regional värdeplacering och worker-sänkning, 2026-11-12](2026-11-12-regional-workers/README.md)
 har 1 260 prover över sex fall. Fyra workers ger 1,57× för genererat bygge,
 1,24× för seriell självhostingång och 1,22× för taskingången mot en worker.
