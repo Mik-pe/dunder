@@ -157,6 +157,25 @@ def positive_cases():
     yield 'readonly_arrays', arrays + '}\n', expected
     yield 'fallback_owned_copy', '''fn copied(a:&[]i64)->i64{var b:=a;b[0]=123;return a[0]+b[0]}
         fn main(){a:[]i64=[7,11];print(copied(&a));print(a[0])}\n''', [130,7]
+    yield 'fallback_live_expression_and_edges', """
+        fn tap(x:i64)->i64{print(x); x+2}
+        fn mixed(x:i64,y:i64)->i64{
+            var total:=x*3-1
+            if y!=0 && total/y>0 {
+                for i in 0..2 { total=total+(x+y)*tap(y) }
+            }
+            total
+        }
+        fn main(){print(mixed(7,2));print(mixed(7,0))}
+    """, [2, 2, 92, 20]
+    yield 'mixed_checked_prefix', """
+        fn endpoint(x:i64)->i64{x+1}
+        fn mixed(x:i64,y:i64)->i64{
+            var value:=x/y+x%y; value*=3
+            return value+endpoint(y)
+        }
+        fn main(){print(mixed(19,4));print(mixed(-19,4))}
+    """, [26, -16]
     yield 'fallback_stack_arguments', '''fn nine(a:i64,b:i64,c:i64,d:i64,e:i64,f:i64,g:i64,h:i64,i:i64)->i64{
         a+b*2+c*3+d*4+e*5+f*6+g*7+h*8+i*9}
         fn main(){print(nine(1,2,3,4,5,6,7,8,9))}\n''', [285]
