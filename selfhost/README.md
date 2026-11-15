@@ -55,23 +55,15 @@ seriella ingången stöder bara `--jobs=1`. En worker, `check`, `--mir=off`
 och `--profile-compiler` går genom samma seriella Session-drivrutin utan
 scheduling. Profilens fasintervall förblir seriella väggtider.
 
-En återupptagbar `compile.Session` äger frontend, typning, symboler, nåbarhet,
-inlinebudget, provisorisk kod och cache-I/O. `next_into` lämnar en ägd
-helfunktions-MIR åt gången. Jobbet verifierar och optimerar med egna
-arbetsarenor och sänker sedan i samma OS-worker direkt till numerisk
-`mir_lower.ObjectData`. Svaret innehåller slutobjekt och statistik i stället
-för hela MIR-arenan. Föräldern validerar strukturen, gör ordnad acceptans,
-sparar cache och sammanfogar genom `mir_link` i ursprunglig källordning.
-Den kör ingen andra sänkning.
-Ingen worker lånar Session, Code eller globala importtabeller.
+En återupptagbar `compile.Session` äger frontend, typning, symboler,
+nåbarhet, inlinebudget, provisorisk kod och cache-I/O. `next_source_into`
+samlar maskinord, etiketter, relokeringar och källannotationer per funktion.
+Arbetstråden läser dem ur batchens separata kolumner, bygger MIR och
+återanvänder privata arbetsarenor mellan funktionerna i batchen.
+Den sänker varje verifierad funktion till `mir_lower.ObjectData`.
+Föräldern validerar, cachar och länkar resultaten i källordning.
+Cacheträffar ger redan sänkta objekt. [Arbetstrådens indata och svar](mir_task.ddr)
 
-Varje taskfönster omfattar högst `workers` källsteg och håller snapshots
-och resultat levande till ordnad acceptans. Varje kallt jobb startar en
-OS-tråd och skapar lokal `pipeline.Workspace`; ingen permanent worker-
-eller arenapool återanvänds. `--jobs=1` återanvänder den seriella kedjans
-arbetsminne. Cacheträffar använder redan slutligt sänkta objekt utan att köra
-MIR-passen igen. Diagnostik, bindningsposter, cacheberoenden, inlinebudgetar
-och kodbilder är deterministiska oberoende av färdigordning och workerantal.
 [Taskkontrakt](../docs/tasks.md) och
 [historisk mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
 

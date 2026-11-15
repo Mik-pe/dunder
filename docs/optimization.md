@@ -12,6 +12,23 @@ placerar privata Frame- och positivt identifierade Temp-värden gemensamt
 i register. Planen beskriver fortsatt generell
 SSA-sänkning, loopoptimering och direkta målbackends.
 
+## Instruktionsval för heltal och arrayåtkomst
+
+Den vanliga uttryckskompilatorn och den skalära optimeraren använder samma
+emitter för signerad addition, subtraktion och jämförelsevillkor. Anroparen
+bestämmer evalueringsordning, register och vilka kontroller som har bevisats
+överflödiga. En kontrollerad `i32`-addition testar overflow vid 32 bitar
+innan resultatet teckenutvidgas. För bitoperationer med ett känt argument
+kan emittern använda ett direkt skift eller en mask och behålla mottagaren
+i registret. [Heltalsemitter](../selfhost/integer_emit.ddr)
+
+På ARM64 kan en skalär arrayåtkomst använda basregister och skalat index
+direkt när båda registren är tillgängliga. MIR registrerar vilka register
+instruktionen läser och skriver samt dess minneseffekt. För `array.push`
+väljer den typade anropsplatsen elementbredden. Finns ledig kapacitet skriver
+runtime värdet direkt. En full array går via den gemensamma kontrollerade
+tillväxtvägen. [Skalär kodgenerering](../selfhost/opt_emit.ddr) · [MIR-avkodning](../selfhost/mir_decode.ddr) · [Array-runtime](../selfhost/runtime.ddr)
+
 ## Gemensam helfunktionskedja
 
 Alla nyemitterade källfunktioner passerar [`mir_lift`](../selfhost/mir_lift.ddr),

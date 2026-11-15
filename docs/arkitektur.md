@@ -19,7 +19,7 @@ kan använda [funktionscachen](incremental.md).
 
 Ett värde har en statiskt känd typ och layout. Första kärnan innehåller heltal med bestämd bredd, booleska värden, poster, fasta arrayer, slices, funktioner och strukturerat kontrollflöde. En slice består av en adress och en längd och lånar sin lagring. Anrop är direkta när målet är känt. Allokering, kopiering av ägda resurser och dynamisk dispatch ska gå att se där de väljs. Ett litet standardbibliotek får bero på operativsystemets gränssnitt.
 
-För vanlig heltalsaritmetik föreslår vi kontrollerat spill, med explicit omslagsaritmetik för exempelvis hashning. Felaktiga index och division med noll ska ha definierat beteende. Samma program har samma säkerhetsregler i alla byggprofiler. Bevisar kompilatorn att ett index ryms får den ta bort kontrollen.
+Vanlig heltalsaritmetik kontrollerar overflow. Metoder som `wrapping_add` ger explicit omslagsaritmetik för exempelvis hashning. Felaktiga index och division med noll ska ha definierat beteende. Samma program har samma säkerhetsregler i alla byggprofiler. Bevisar kompilatorn att ett index ryms får den ta bort kontrollen.
 
 ## Minne utan GC
 
@@ -55,8 +55,8 @@ Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och os
 ## Direkt från funktion till ARM64
 
 1. **Läs moduler och samla deklarationer.** Varje fil läses till en sammanhängande buffer. Namn interneras och källpositioner sparas som offset. Modulernas exporterade typer och funktionssignaturer fastställs före funktionskropparna. Det gör framåtreferenser och ömsesidiga funktionsanrop möjliga.
-2. **Bearbeta en funktion åt gången.** Bygg ett kompakt syntaxträd i tillfälligt minne, lös namn, sätt typer och kontrollera ägarskap. Samma träd bär källpositioner och de fakta som kodgeneratorn behöver. Frigör arbetsminnet när funktionen är klar. Oberoende funktioner kan hanteras av olika arbetare.
-3. **Optimera lokalt och välj AArch64-instruktioner.** Den implementerade skalära delmängden använder en kompakt typad funktions-IR för förenkling, loopbevis och registerallokering. Övriga kroppar använder den befintliga kombinerade kontroll- och emissionsvägen. Skriv instruktionsord i funktionens kodbuffer och spara lokala etiketter och korrigeringsposter för avstånd som ännu är okända. Ingen helprograms-IR, SSA eller bytekod byggs.
+2. **Typkontrollera och välj instruktioner per funktion.** Huvudtråden löser namn, kontrollerar typer och ägarskap och håller reda på nåbara funktioner. Den skalära delmängden använder en typad lokal modell för förenkling, loopbevis och registerallokering. Uttryckskompilatorn hanterar även anrop och ägda värden. Båda vägarna använder samma regler för kontrollerad addition och subtraktion. [Heltalsemittern](../selfhost/integer_emit.ddr)
+3. **Verifiera och sänk funktionskoden.** Maskinord, etiketter, relokeringar och källannotationer lagras i separata kolumner. Vid parallella byggen på ARM64/macOS får varje worker spann för sina funktioner och bygger deras MIR i lokalt arbetsminne. Den verifierar, optimerar och sänker varje funktion till ett objekt. Huvudtråden tar emot och validerar objekten i källordning. [Funktionskedjan](optimization.md#gemensam-helfunktionskedja)
 4. **Lägg ut programmet en gång.** Dunders länkare placerar funktioner och konstantdata i deterministisk ordning, löser symboler och fixar hopp och adresser. Ett hopp utanför instruktionsräckvidden får en längre sekvens eller en närliggande hoppstubbe. Bildskrivaren skapar och ad hoc-signerar Mach-O-filen över dess slutliga byte. Publicera resultatet med atomiskt namnbyte när bygget lyckats.
 
 Den skalära vägen behåller lokaler i register över strukturerade loopar och
