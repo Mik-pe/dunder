@@ -3,6 +3,7 @@
 import argparse
 import csv
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -74,6 +75,26 @@ def runtime_cases(scale=1):
             ('sort', [str(counts['sort']), str(seed)], sort)]
 
 
+def tabell_case(work, project):
+    path = work / 'expenses.csv'
+    totals = {}
+    labels = ['Stockholm', 'Örebro', 'Malmö', 'Team, A', 'Team "B"', 'Umeå']
+    with path.open('w', encoding='utf-8', newline='') as output:
+        records = csv.writer(output, lineterminator='\r\n')
+        records.writerow(['team', 'cents', 'memo'])
+        for row in range(32768):
+            group = f'{labels[row % len(labels)]} {row % 67}'
+            amount = (row % 101 - 50) * 1234567
+            records.writerow([group, amount, f'order {row}'])
+            totals[group] = totals.get(group, 0) + amount
+    verified = io.StringIO(newline='')
+    result = csv.writer(verified, lineterminator='\n')
+    result.writerow(['group', 'total'])
+    for group, total in sorted(totals.items()):
+        result.writerow([group, total])
+    return 'tabell', project / 'main.ddr', [str(path), 'team', 'cents'], verified.getvalue().encode()
+
+
 def corpus(work):
     root = work / 'corpus'
     root.mkdir()
@@ -130,6 +151,8 @@ def main():
     parser.add_argument('--suite', choices=['all', 'runtime', 'compiler'], default='all')
     parser.add_argument('--runtime-scale', type=int, default=1,
                         help='multiply the iteration count of each runtime workload')
+    parser.add_argument('--tabell', type=Path,
+                        help='include the external Tabell project in runtime measurements')
     parser.add_argument('--include-check', action='store_true',
                         help='also measure check on generated and selfhost sources')
     parser.add_argument('--c-compiler', type=Path, help='also measure C with -O3 -ftrapv')
@@ -142,6 +165,8 @@ def main():
         parser.error('--rounds must be positive')
     if args.runtime_scale < 1:
         parser.error('--runtime-scale must be positive')
+    if args.tabell and args.suite == 'compiler':
+        parser.error('--tabell requires the runtime or all suite')
     if args.include_check and args.suite == 'runtime':
         parser.error('--include-check requires the compiler or all suite')
     compilers = {'baseline': args.baseline.resolve(strict=True),
@@ -189,15 +214,21 @@ def main():
     with tempfile.TemporaryDirectory(prefix='dunder-performance-') as tmp:
         work = Path(tmp)
         if args.suite in ('all', 'runtime'):
-            for name, inputs, result in runtime_cases(args.runtime_scale):
-                expected = f'{result}\n'.encode()
+            cases = [(name, ROOT / f'benchmarks/runtime/{name}.ddr', inputs, f'{result}\n'.encode())
+                     for name, inputs, result in runtime_cases(args.runtime_scale)]
+            if args.tabell:
+                project = args.tabell.resolve(strict=True)
+                cases.append(tabell_case(work, project))
+                metadata['tabell'] = dict(records=32768, input_sha256=digest(work / 'expenses.csv'),
+                                         sources={p.name: digest(p) for p in sorted(project.glob('*.ddr'))})
+            for name, source, inputs, expected in cases:
                 metadata['runtime_cases'][name] = {'args': inputs, 'expected': expected.decode()}
                 binaries = {}
                 for variant, compiler in compilers.items():
                     binary = work / f'{name}-{variant}'
-                    command([compiler, 'build', ROOT / f'benchmarks/runtime/{name}.ddr', '-o', binary, *compiler_flags[variant]])
+                    command([compiler, 'build', source, '-o', binary, *compiler_flags[variant]])
                     binaries[variant] = binary
-                if args.c_compiler:
+                if args.c_compiler and name != 'tabell':
                     binary = work / f'{name}-c'
                     command([c_compiler, '-std=c11', '-O3', '-ftrapv', f'-DCASE_{name}',
                              ROOT / 'benchmarks/runtime/reference.c', '-o', binary], env=None)
