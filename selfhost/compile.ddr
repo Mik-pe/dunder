@@ -3341,7 +3341,7 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
     runtime.emit_profile_report(&mut c.code, &rt)
     arm.syscall(&mut c.code, 33554433, 94); arm.emit(&mut c.code, 3558866944)
     c.needed[main_id] = true
-    for f in 0..c.world.names.len { c.jobs.compiled.push(false); c.callback_labels.push(-1) }
+    for f in 0..c.world.names.len { c.jobs.compiled.push(false); c.jobs.checked_effects.push(-1); c.callback_labels.push(-1) }
     if c.tasks.program && !check_all {
         c.tasks.open = arm.label(&mut c.code)
         c.tasks.await_result = arm.label(&mut c.code)
@@ -3598,7 +3598,8 @@ pub fn validation_plan(c: &Session, workers: i32) -> []i32 {
     // Session, avoiding UTF-8 packing, worker setup and per-job dispatch.
     var tokens: i64 = 0; var largest: i64 = 0
     for f in (c.validated_through + 1)..c.world.names.len {
-        if !c.jobs.compiled[f] && c.world.libraries[f] == "" {
+        if f == c.jobs.invalid_declaration { break }
+        if !c.jobs.compiled[f] && c.world.libraries[f] == "" && c.jobs.checked_effects[f] < 0 {
             size := i64(c.world.ends[f] - c.world.starts[f] + 2)
             tokens = tokens + size; ids.push(f)
             if size > largest { largest = size }
@@ -3647,7 +3648,13 @@ pub fn check_isolated(c: &mut Session, f: i32) -> Validation {
 pub fn accept_validation(c: &mut Session, result: &Validation) -> bool {
     if !c.ok || c.jobs.phase != 2 || c.report { return false }
     var f := c.validated_through + 1
-    while f < c.world.names.len && (c.jobs.compiled[f] || c.world.libraries[f] != "") { f = f + 1 }
+    while f < c.world.names.len {
+        if !c.jobs.compiled[f] && c.world.libraries[f] == "" {
+            if c.jobs.checked_effects[f] < 0 { break }
+            facts.reset(&mut c.body.facts, 0); c.body.facts.effects = c.jobs.checked_effects[f]; accept_facts(&mut c, f)
+        }
+        f = f + 1
+    }
     if f >= c.world.names.len || result.declaration != f { return false }
     if result.error.len > 0 {
         message := validation_bytes.decode(&result.error)
@@ -3994,22 +4001,29 @@ fn inline_signature(c: &Session, f: i32) -> bool {
     for p in 0..c.world.param_counts[f] { if c.world.param_types[first + p] < 1 || c.world.param_types[first + p] > 3 { return false } }
     true
 }
-fn inline_candidate(c: &Session, f: i32) -> bool {
+fn inline_expression_bound(c: &Session, f: i32) -> i32 {
+    var nodes := 0; var returned := false; var ended := false
     for token in c.world.starts[f]..c.world.ends[f] {
         kind := c.world.tokens.kinds[token]; word := c.world.tokens.texts[token]
+        if kind == .Newline { continue }
+        if kind == .Symbol && word == ";" { ended = true; continue }
+        if ended { return 0 }
         if kind == .Name {
-            if c.world.tokens.texts[token + 1] == "(" { return false }
+            if c.world.tokens.texts[token + 1] == "(" { return 0 }
             var found := false
             first := c.world.param_starts[f]
             for p in first..first + c.world.param_counts[f] { if c.world.param_names[p] == word { found = true; break } }
-            if !found { return false }
+            if !found { return 0 }
         } else if kind == .Symbol {
-            if rules.opcode(word) == 0 && word != "!" && word != "(" && word != ")" && word != ";" { return false }
+            if word == "(" || word == ")" { continue }
+            if rules.opcode(word) == 0 && word != "!" { return 0 }
         } else if kind == .Keyword {
-            if word != "true" && word != "false" && word != "return" { return false }
-        } else if kind != .Integer && kind != .Newline { return false }
+            if word == "return" { if returned || nodes != 0 { return 0 }; returned = true; continue }
+            if word != "true" && word != "false" { return 0 }
+        } else if kind != .Integer { return 0 }
+        nodes = nodes + 1; if nodes > 32 { return 0 }
     }
-    true
+    nodes
 }
 fn inline_catalog(c: &mut Session, catalog: &mut opt_inline.Catalog, model: &mut opt_ir.Function,
     work: &mut opt_verify.Workspace, range_work: &mut opt_range.Workspace, source_digests: bool) {
@@ -4020,23 +4034,32 @@ fn inline_catalog(c: &mut Session, catalog: &mut opt_inline.Catalog, model: &mut
     // independently of the catalog's verified-node budget. Diagnostics are
     // reported in normal declaration traversal order.
     for f in 0..c.world.names.len {
-        if !c.ok || opt_inline.exhausted(&catalog) { break }
+        if !c.ok || !opt_inline.room_for(&catalog, 1, 0) { break }
         if !inline_signature(&c, f) { opt_inline.reject(&mut catalog, f); continue }
         charge := c.world.ends[f] - c.world.starts[f] + 2
         if charge > remaining { break }
         remaining = remaining - charge
-        if !inline_candidate(&c, f) { opt_inline.reject(&mut catalog, f); continue }
+        bound := inline_expression_bound(&c, f)
+        if !opt_inline.room_for(&catalog, bound, c.world.param_counts[f]) { opt_inline.reject(&mut catalog, f); continue }
         // Resolve each prospective expression with the same binder, literal
         // widths, expression parser and return checks as its out-of-line body.
         // The identifier gate above confines this probe to parameter reads.
+        facts.reset(&mut c.body.facts, 0)
         if !typed_body_into(&mut c, f, &mut model, &catalog, &mut inline_work) {
-            // Diagnose the first invalid declaration in normal source traversal order.
-            c.ok = true; c.error = ""; c.error_at = 0; opt_inline.reject(&mut catalog, f); continue
+            opt_inline.reject(&mut catalog, f)
+            if c.error != "" {
+                // A reachable error may precede this one. Publish it when its
+                // declaration's turn arrives, with the original byte offset.
+                c.jobs.invalid_declaration = f; c.jobs.invalid_offset = c.error_at; c.jobs.invalid_message = c.error
+                c.ok = true; c.error = ""; c.error_at = 0; break
+            }
+            continue
         }
         if !optimize_scalar(&mut c, f, &mut model, &mut work, &mut range_work) || !c.ok { return }
         // Only accepted entries need source identities. Missing identities
         // deliberately make the catalog unsuitable for a fragment context.
         admitted := opt_inline.add_verified(&mut catalog, f, &model, "")
+        if admitted { c.jobs.checked_effects[f] = c.body.facts.effects }
         if admitted && source_digests {
             digest := fragments.key("inline-body:v1", f, &c.world.tokens, c.world.starts[f] - 1, c.world.ends[f])
             if !opt_inline.set_body_digest(&mut catalog, f, digest) { fail(&mut c, "internal inline body identity failure"); return }
@@ -4201,7 +4224,7 @@ pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function,
     c.code.checking = false; c.code.mir_capture = capture; c.report = reporting
     model.probing = false
     if !model.recording {
-        c.ok = true; c.error = ""; c.error_at = 0
+        if c.error == "" { c.ok = true; c.error_at = 0 }
         return false
     }
     model.recording = false
@@ -4331,6 +4354,13 @@ fn finish_projection(c: &mut Session, model: &mut opt_ir.Function) -> bool {
     true
 }
 fn produce_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.Catalog, inline_work: &mut opt_inline.Workspace) {
+    if c.jobs.invalid_declaration == f {
+        c.ok = false; c.error = c.jobs.invalid_message; c.error_at = c.jobs.invalid_offset; return
+    }
+    if c.jobs.checked_effects[f] >= 0 {
+        c.body.facts.effects = c.jobs.checked_effects[f]
+        if c.code.checking && !c.report { return }
+    }
     ft.reset_body(&mut c.types)
     c.body.reenter_owners = false
     if c.tasks.program && c.world.unsafe_functions[f] { task_effect(&mut c, 16) }
