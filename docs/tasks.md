@@ -90,6 +90,23 @@ records. Tal, lokala strängar, taggenums, tillåtna arrayer och recordfält
 stöds. Adresser, lån, callbacks och tasknycklar avvisas. Separata scope
 äger separata arbetsytor.
 
+## Gemensam läsbar indata
+
+`task scope jobs(limit, shared world)` tar en egen snapshot av `world`
+när scopet öppnas. Värdet är ett transparent ägt record inom den vanliga
+isolerade Data-domänen. Varje worker får samma snapshot som sista
+parametern `world: &World`. För ett scope med arbetsyta skrivs
+`task scope jobs(limit, initialize, shared world)` och parametrarna blir
+`(input: Job, workspace: &mut Workspace, world: &World)`.
+
+Föräldern kan ändra sitt ursprungliga värde efter öppningen. Den ägda
+snapshoten är åtkomlig genom vanliga delade lån i workerfunktionerna och
+frigörs först när alla jobb avslutats. En worker som kopierar ett fält får
+en vanlig egen värdekopia. Data-kontrollen gäller även för varje nästlat
+fält, vilket utesluter delade RC-strängar, råpekare och oklassificerade
+opaque-typer. Numeriska typ-ID:n, arrayer och packad UTF-8 passar i detta
+gränssnitt.
+
 ## Vad en worker får använda
 
 Spawn kräver en namngiven säker Dunder-funktion med en värdeparameter för indata. Ett scope med arbetsyta kräver också en andra parameter av typen `&mut Workspace` för den deklarerade arbetsytan.
@@ -148,6 +165,7 @@ symboler, nåbarhetsordning, provisorisk Code, imports och inlinebudget.
 `compile_parallel` skickar funktionslokala operationer och metadata i separata
 kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
 optimerar och sänker funktionerna i batchen med arbetsytor som återanvänds över batchgränserna.
+Passinställningar och terminal-ID:n delas som en snapshot för hela scopet.
 Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
 Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/mir_task.ddr)
 

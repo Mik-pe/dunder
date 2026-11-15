@@ -20,7 +20,13 @@ STATE = ('struct Workspace{values:[]i32,label:string}\n'
          'fn initialize()->Workspace{Workspace{values:[],label:"workers"}}\n'
          'fn collect(x:i32, ws:&mut Workspace)->[]i32{ws.values.push(x);ws.values}\n'
          'fn count(x:i32, ws:&mut Workspace)->i32{ws.values.len+x+ws.label.len}\n')
+WORLD = ('struct World{values:[]i32}\n'
+         'fn lookup(i:i32, world:&World)->i32{world.values[i]}\n'
+         'fn update(i:i32, ws:&mut Workspace, world:&World)->i32{ws.values.push(world.values[i]);ws.values.len}\n')
 VALID = {
+ 'shared_snapshot': (STATE+WORLD+'fn main(){var w:=World{values:[40,42]};task scope j(2,shared w){a:=spawn j lookup(1);w.values[0]=9;w.values.clear();b:=spawn j lookup(0);print(await! j(b));print(await! j(a))}}','40\n42\n'),
+ 'owned_and_shared': (STATE+WORLD+'fn main(){task scope j(1,initialize,shared World{values:[11]}){a:=spawn j update(0);b:=spawn j update(0);print(await! j(a));print(await! j(b))}}','1\n2\n'),
+ 'shared_clone': (STATE+WORLD+'fn copy(world:&World)->[]i32{var v:=world.values;v[0]=100;v}\nfn job(i:i32,world:&World)->[]i32{copy(&world)}\nfn main(){var w:=World{values:[41]};task scope j(1,shared w){a:=spawn j job(0);b:=spawn j lookup(0);print((await! j(a))[0]);print(await! j(b))};print(w.values[0])}','100\n41\n41\n'),
  'persistent_workspace': (STATE+'fn main(){task scope j(1,initialize){first:=spawn j collect(11);second:=spawn j collect(22);var a:=await! j(first);a[0]=99;out:=await! j(second);print(out[0]);print(out[1]);n:=spawn j count(3);print(await j(n))};task scope j(1,initialize){n:=spawn j count(0);print(await! j(n))}}','11\n22\n12\n7\n'),
  'isolated_workspaces': (STATE+'fn main(){task scope j(2,initialize){a:=spawn j collect(41);b:=spawn j collect(43);left:=await! j(a);right:=await! j(b);assert(left.len==1&&right.len==1);print(left[0]);print(right[0]);c:=spawn j count(0);d:=spawn j count(0);print(await j(c));print(await j(d))}}','41\n43\n8\n8\n'),
 
@@ -50,6 +56,11 @@ VALID = {
  'arena_pool_stress': ('struct WorkItem{values:[]i32,seed:i32}\nstruct WorkOut{items:[]i32,total:i64}\nfn work(item:WorkItem)->WorkOut{s:=item.seed.str();var out:[]i32=[];var total:i64=i64(s.len);for v in item.values{w:=v+item.seed;out.push(w);total=total+i64(w)};WorkOut{items:out,total:total}}\nfn main(){var sum:i64=0;for wave in 0..2{task scope jobs(4){var keys:[]TaskID<WorkOut> = [];var read:=0;for j in 0..120{i:=wave*120+j;keys.push(spawn jobs work(WorkItem{values:[i,i+1,i+2],seed:i+10}));if keys.len-read>=4{ans:=await jobs(keys[read]);read=read+1;sum=sum+ans.total+i64(ans.items[0]+ans.items[2])}};while read<keys.len{ans:=await jobs(keys[read]);read=read+1;sum=sum+ans.total+i64(ans.items[0]+ans.items[2])}}};print(sum)}','300630\n'),
 }
 INVALID = {
+ 'shared_mut_argument': (STATE+WORLD+'fn bad(i:i32,w:&mut World)->i32{0}\nfn main(){task scope j(1,shared World{values:[1]}){id:=spawn j bad(0)}}','read-only parameter for this shared input'),
+ 'shared_mutation': (STATE+WORLD+'fn bad(i:i32,w:&World)->i32{w.values[0]=9;0}\nfn main(){task scope j(1,shared World{values:[1]}){id:=spawn j bad(0)}}','mutable'),
+ 'shared_string': ('struct World{s:string}\nfn main(){task scope j(1,shared World{s:"hello"}){}}','shared task input requires isolated Data'),
+ 'shared_opaque': ('opaque struct World{a:i64}\nfn main(){task scope j(1,shared World{a:1}){}}','shared task input requires isolated Data'),
+ 'shared_value_argument': (STATE+WORLD+'fn copy(i:i32,w:World)->i32{0}\nfn main(){task scope j(1,shared World{values:[1]}){id:=spawn j copy(0)}}','read-only parameter for this shared input'),
  'effectful_initializer': (STATE.replace('Workspace{values:[],label:', 'print(1);Workspace{values:[],label:')+'fn main(){task scope j(1,initialize){}}','initializer has effects outside'),
  'workspace_shape': (STATE+'fn main(){task scope j(1,initialize){id:=spawn j invalid(1)}}\nfn invalid(x:i32,s:&mut []i64)->i32{x}','mutable parameter for this workspace'),
  'missing_workspace_parameter': (STATE+'fn main(){task scope j(1,initialize){id:=spawn j invalid(1)}}\nfn invalid(x:i32)->i32{x}','mutable parameter for this workspace'),
