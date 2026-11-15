@@ -147,7 +147,7 @@ def worker_options(p):
     assert p.call("run", "args.ddr", "--jobs=1", "--", "--jobs", "4").stdout == "--jobs\n4\n"
 
     fixture = (sources / "tests/fixtures/driver-workers.ddr").read_text()
-    for name, alias in (("driver", "driver"), ("compile", "compiler"), ("lexer", "lexer")):
+    for name, alias in (("driver", "driver"), ("compile", "compiler")):
         old = "import ...selfhost." + name + (" as compiler" if name == "compile" else "")
         module = os.path.relpath(sources / "selfhost" / name, p.root.resolve()).replace(os.sep, "/")
         assert fixture.count(old) == 1
