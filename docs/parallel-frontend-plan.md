@@ -18,7 +18,7 @@ med samma lowerer direkt till numerisk `mir_lower.ObjectData`. Föräldern
 tar över slutobjekt och statistik med `await!`, validerar och länkar i ordning.
 På ARM64/macOS använder språkets taskruntime libdispatchs trådpool och
 scopets återanvändbara arenor. En och flera workers använder samma batchkod.
-Kontrolläge, MIR-off och kompilatorprofilering använder den seriella Session-vägen.
+Kontrolläge och kompilatorprofilering använder den seriella Session-vägen.
 
 Detta framgår av [compile_parallel](../selfhost/compile_parallel.ddr),
 [dagens jobbobjekt](../selfhost/mir_task.ddr) och

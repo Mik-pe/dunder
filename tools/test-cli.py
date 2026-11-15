@@ -494,12 +494,9 @@ def whole_function_mir_controls(p):
                                 '--timings=json', '-o', f'mir-{target}-{scalar}-{mode}')
                 report = json.loads(result.stderr)
                 backend = report['mir']
-                assert backend['enabled'] is (mode == 'on'), report
-                if mode == 'on':
-                    assert backend['functions'] == report['functions']['emitted'] == 2, report
-                    assert backend['operations'] > 0, report
-                else:
-                    assert backend['functions'] == backend['operations'] == backend['opaque'] == 0, report
+                assert backend['enabled'] and backend['optimization_enabled'] is (mode == 'on'), report
+                assert backend['functions'] == report['functions']['emitted'] == 2, report
+                assert backend['operations'] > 0, report
     for mode in ('off', 'on'):
         result = p.call('run', 'mir.ddr', '--mir=' + mode, '--inline-opt=off')
         assert result.stdout == '9841\n', result
@@ -513,7 +510,13 @@ def whole_function_mir_controls(p):
                         '--inline-opt=off', '--mir=' + mode, '-o', 'mir-cached')
         report = json.loads(result.stderr)
         assert report['functions'] == {'reused': reused, 'emitted': 2 - reused}, report
-        assert report['mir']['functions'] == (2 - reused if mode == 'on' else 0), report
+        assert report['mir']['functions'] == 2 - reused, report
+    for flags in (('--mir=off', '--mir-opt=on'), ('--mir=on', '--mir-opt=off')):
+        result = p.call('build', 'mir.ddr', '--incremental', '--timings=json', '--inline-opt=off',
+                        *flags, '-o', 'mir-cached')
+        report = json.loads(result.stderr)
+        assert report['functions'] == {'reused': 2, 'emitted': 0}, report
+        assert report['mir']['enabled'] and not report['mir']['optimization_enabled'], report
     p.write('mir-tests.ddr', '@test fn works(){true}\n')
     for mode, expected in (('off', '1 passed'), ('off', '1 unaffected'),
                            ('on', '1 passed'), ('on', '1 unaffected'), ('off', '1 passed')):
@@ -548,7 +551,7 @@ def whole_function_optimizer_controls(p):
     disabled = p.call('build', 'promotion.ddr', '--mir=off', '--mir-opt=on',
                       '--timings=json', '-o', 'promotion-disabled')
     backend = json.loads(disabled.stderr)['mir']
-    assert not backend['enabled'] and not backend['optimization_enabled']
+    assert backend['enabled'] and not backend['optimization_enabled'] and backend['functions'] == 2
     assert all(backend[key] == 0 for key in work), backend
     for mode, reused in (('on', 0), ('on', 2), ('off', 0), ('off', 2), ('on', 2)):
         result = p.call('build', 'promotion.ddr', '--mir-opt=' + mode, '--inline-opt=off',
@@ -765,7 +768,7 @@ def compiler_profile_controls(p):
     assert report['calls']['mir_pipeline'] == 2
     disabled = p.call('build', 'profile.ddr', '--mir=off', '--profile-compiler',
                       '--timings=json', '-o', 'mir-off-profile')
-    assert json.loads(disabled.stderr)['compiler_detail']['calls']['mir_pipeline'] == 0
+    assert json.loads(disabled.stderr)['compiler_detail']['calls']['mir_pipeline'] == 2
     human = p.call('build', 'profile.ddr', '--profile-compiler', '-o', 'human')
     for phase in phases:
         assert human.stderr.count('compiler ' + phase + '=') == 1, (phase, human.stderr)

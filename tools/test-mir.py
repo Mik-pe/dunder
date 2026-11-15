@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent semantic MIR oracle and whole-function off/on consumer contracts.
+"""Independent semantic MIR oracle and whole-function lowering and optimization contracts.
 
 No timing series. All three native targets are built; only the native host
 executes. The scalar oracle reads semantic MIR columns exported by the actual
@@ -382,8 +382,8 @@ def source_cases():
     return valid, invalid
 
 
-def fixture_source(name, source_root, work):
-    text = (ROOT / 'tests/fixtures' / name).read_text()
+def fixture_source(name, source_root, work, fixtures=ROOT):
+    text = (fixtures / 'tests/fixtures' / name).read_text()
     def replace(match):
         module, alias = match.groups()
         relative = os.path.relpath(source_root / 'selfhost' / module, work).replace(os.sep, '/')
@@ -411,6 +411,8 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--source-root', type=Path, default=ROOT)
     parser.add_argument('--only', choices=('all', 'oracle', 'source'), default='all')
+    parser.add_argument('--reference-root', type=Path,
+                        help='Checkout before mandatory MIR. Compare its direct-emission images, bindings and diagnostics.')
     parser.add_argument('--fuel', type=int, default=10000)
     parser.add_argument('--report', type=Path, help='JSON hashes, raw commands, models, counts and coverage limits')
     args = parser.parse_args()
@@ -425,6 +427,10 @@ def main():
     else: parser.error('native execution requires ARM64 macOS or ARM64/x86-64 Linux')
     inputs = {compiler, Path(__file__).resolve(), *source_root.glob('selfhost/*.ddr'),
               ROOT / 'tests/fixtures/mir-consumer.ddr', ROOT / 'tests/fixtures/mir-oracle.ddr'}
+    reference_root = args.reference_root.resolve(strict=True) if args.reference_root else None
+    if reference_root:
+        inputs.update(reference_root.glob('selfhost/*.ddr'))
+        inputs.add(reference_root / 'tests/fixtures/mir-consumer.ddr')
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
     evidence = dict(complete=False, scope=args.only, hashes=hashes, host=platform.uname()._asdict(), commands=[],
                     oracle=[], sources=[], fuel=args.fuel, limitations=[
@@ -457,9 +463,10 @@ def main():
                 assert result.stdout == output, (image, result.stdout, output)
                 counts['executions'] += 1
 
-            def build_fixture(name):
-                path = work / name
-                path.write_text(fixture_source(name, source_root, work))
+            def build_fixture(name, reference=False):
+                root = reference_root if reference else source_root
+                path = work / ('reference-' + name if reference else name)
+                path.write_text(fixture_source(name, root, work, root if reference else ROOT))
                 runner = path.with_suffix('')
                 call([compiler, 'build', path, '-o', runner])
                 return runner
@@ -530,6 +537,8 @@ def main():
 
             if args.only in ('all', 'source'):
                 runner = build_fixture('mir-consumer.ddr')
+                reference = build_fixture('mir-consumer.ddr', reference=True) if reference_root else None
+                modes = ('plain', 'opt', 'reference') if reference else ('plain', 'opt')
                 valid, invalid = source_cases()
 
                 def build(name, source, target, mode, checking=False, invalid=False):
@@ -537,7 +546,8 @@ def main():
                     image = work / f'{name}-{target}-{mode}'
                     sentinel = b'previous image'
                     if checking or invalid: image.write_bytes(sentinel)
-                    result = call([runner, path, image, target, mode, 'check' if checking else 'build'], int(invalid))
+                    result = call([reference if mode == 'reference' else runner, path, image, target,
+                                   'off' if mode == 'reference' else mode, 'check' if checking else 'build'], int(invalid))
                     assert not result.stderr, result.stderr
                     if checking or invalid: assert image.read_bytes() == sentinel
                     if invalid:
@@ -545,7 +555,7 @@ def main():
                         counts['diagnostics'] += 1
                         return image, result.stdout
                     report = decode_consumer(result.stdout)
-                    if checking or mode == 'off': assert not any(report['mir'].values()), report
+                    if checking or mode == 'reference': assert not any(report['mir'].values()), report
                     else:
                         functions = len(re.findall(r'\bfn\s+\w+', source))
                         assert report['mir']['functions'] == functions and report['mir']['operations'] > 0, (name, target, functions, report)
@@ -557,31 +567,29 @@ def main():
 
                 for name, (source, output, status) in valid.items():
                     for target in range(3):
-                        reports = []
-                        images = []
-                        for mode in ('off', 'on', 'opt'):
+                        reports = {}
+                        images = {}
+                        for mode in modes:
                             image, report = build(name, source, target, mode)
                             execute(image, target, output, status)
                             digest = hashlib.sha256(image.read_bytes()).hexdigest()
                             evidence['sources'].append(dict(case=name, source=source, expected_stdout=output,
                                 native_status=status, target=TARGETS[target], mode=mode, sha256=digest, **report))
-                            reports.append(report); images.append(digest)
+                            reports[mode] = report
+                            images[mode] = digest
                             counts['source_images'] += 1
-                        assert reports[0]['bindings'] == reports[1]['bindings'] == reports[2]['bindings'], (name, target, 'bindings changed')
-                        assert images[0] == images[1], (name, target, 'passthrough bytes changed')
-                    print('PASS whole source off/on', name, flush=True)
+                        assert all(item['bindings'] == reports['plain']['bindings'] for item in reports.values()), (name, target)
+                        if reference:
+                            assert images['plain'] == images['reference'], (name, target, 'reference bytes changed')
+                    print('PASS whole source lowering', name, flush=True)
                 for index, source in enumerate(invalid):
                     for target in range(3):
                         for checking in (False, True):
-                            _, before = build(f'invalid-{index}', source, target, 'off', checking, True)
-                            _, after = build(f'invalid-{index}', source, target, 'on', checking, True)
-                            _, optimized = build(f'invalid-{index}', source, target, 'opt', checking, True)
-                            assert before == after == optimized, (index, target, checking, before, after, optimized)
+                            errors = [build(f'invalid-{index}', source, target, mode, checking, True)[1] for mode in modes]
+                            assert len(set(errors)) == 1, (index, target, checking, errors)
                 for target in range(3):
-                    _, before = build('valid-check', valid['mixed-calls-loop'][0], target, 'off', True)
-                    _, after = build('valid-check', valid['mixed-calls-loop'][0], target, 'on', True)
-                    _, optimized = build('valid-check', valid['mixed-calls-loop'][0], target, 'opt', True)
-                    assert before['bindings'] == after['bindings'] == optimized['bindings']
+                    reports = [build('valid-check', valid['mixed-calls-loop'][0], target, mode, True)[1] for mode in modes]
+                    assert all(item['bindings'] == reports[0]['bindings'] for item in reports)
                 assert counts['source_optimized_functions'] > 0, 'source pass was never activated'
                 counts['valid_source_cases'] = len(valid)
                 counts['invalid_source_cases'] = len(invalid)

@@ -186,7 +186,7 @@ som vid ett kallt bygge. Tidigare jobb tas emot före senare källfel, så
 färdigordningen ändrar inte första diagnostiken. Workerantalet ingår inte
 i cacheidentiteten och ändrar inga optimeringsbudgetar.
 
-`check`, `--mir=off` och `--profile-compiler` använder den
+`check` och `--profile-compiler` använder den
 identiska seriella Session-drivrutinen. `check` behöver inga backendarenor.
 Kompilatorns funktionscache fungerar också med parallell MIR-bearbetning;
 begränsningen ovan gäller källprogram som själva innehåller tasksyntax.

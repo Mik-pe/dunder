@@ -139,7 +139,7 @@ använder kompilatorn språkets isolerade tasks för att bygga en lokal
 mellanrepresentation (MIR) ur varje funktions operationer och metadata.
 Varje worker verifierar, optimerar och sänker sina funktioner. Huvudtråden
 validerar och länkar resultaten i källordning. En och fyra workers producerar
-byteidentiska kompilatorer. `--jobs N` väljer 1–256 workers. `check`, `--mir=off` och `--profile-compiler` använder den seriella vägen.
+byteidentiska kompilatorer. `--jobs N` väljer 1–256 workers. `check` och `--profile-compiler` använder den seriella vägen.
 [Taskkontrakt och arbetsfördelning](docs/tasks.md)
 
 På Apple M5 byggde kompilatorn samma låsta kompilatorkälla på **459 ms**

@@ -70,10 +70,9 @@ indexläsningar och elementskrivningar med bevisad gränskontroll.
 Fältet `mir` visar `enabled`, `functions`, `operations` och `opaque` för
 den gemensamma helfunktionskedjan. Antalen gäller nyemitterade funktioner,
 inklusive kroppar med anrop och ägda värden. Cacheträffar och kontroll utan
-emission ger inga nya IR-operationer. `--mir=off` stänger av kedjan för
-jämförelse och felsökning.
+emission ger inga nya IR-operationer. Byggen med `--mir=off` eller
+`--mir-opt=off` verifierar och sänker samma funktions-IR utan optimeringspass.
 
-`--mir-opt=off` behåller kedjan men stänger av dess generella registerpass.
 `mir.optimization_enabled` anger effektiv policy; `optimized`, `promoted`,
 `removed_loads`, `removed_stores`, `analysis_units` och `budget_refusals`
 räknar faktiskt arbete. Full cacheåterställning kan därför ha aktiv policy

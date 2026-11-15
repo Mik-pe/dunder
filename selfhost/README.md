@@ -51,8 +51,7 @@ målarkitekturens användarland.
 
 `--jobs N` och `--jobs=N` väljer 1–256 workers i den taskbaserade ingången.
 Den kör på ARM64/macOS och kan skriva program för alla fyra mål. Den
-seriella ingången stöder bara `--jobs=1`. `check`, `--mir=off`
-och `--profile-compiler` går genom samma seriella Session-drivrutin utan
+seriella ingången stöder bara `--jobs=1`. `check` och `--profile-compiler` går genom samma seriella Session-drivrutin utan
 scheduling. Profilens fasintervall förblir seriella väggtider.
 
 En återupptagbar `compile.Session` äger frontend, typning, symboler,

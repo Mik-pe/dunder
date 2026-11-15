@@ -54,12 +54,12 @@ operand-, effekt-, use/def-, frame- och scratchkontrakt. Trasiga metadata
 ger ett internt kompilatorfel. Sänkningen förbereder etiketter, relokeringar,
 importplatser och kod atomiskt före commit.
 
-`--mir=off` stänger av den nya gränsen för jämförelse. Läget och kedjans
-version skiljer cachefragment och testkvitton åt. `--timings=json` visar
+`--mir=off` och `--mir-opt=off` stänger av de valfria MIR-passen.
+Alla nybyggda källfunktioner verifieras och sänks också i detta läge.
+Passpolicyn och kedjans version skiljer cachefragment och testkvitton åt. `--timings=json` visar
 antal nyemitterade IR-funktioner, operationer och opaka barriärer.
-Med `--mir-opt=off` ger gränsen byteidentisk kod mot den tidigare
-kodgeneratorn. Representationen ensam innebär ingen runtimevinst eller ett
-uppnått C-mål.
+Källprovet i `tools/test-mir.py --reference-root SÖKVÄG` kan jämföra
+ooptimerade bilder, bindningar och diagnostik mot en tidigare revision.
 
 ### Återanvändning av typade skalärkroppar
 
@@ -108,8 +108,7 @@ etikettabellen. Indata och resultat följer språkets vanliga regler för
 fönster av språkets isolerade tasks. Antalet workers ändrar inte symbol-
 och nåbarhetsordning, första diagnostik, inlinebudget, passbudget eller
 cacheberoenden. `--jobs N` och `--jobs=N` stöder 1–256 på ARM64/macOS-
-ingången, med fyra som standard. En worker, `check`, `--mir=off` och
-`--profile-compiler` använder samma seriella Session-drivrutin. Vanliga
+ingången, med fyra som standard. `check` och `--profile-compiler` använder samma seriella Session-drivrutin. Vanliga
 passräknare visar faktiskt utfört arbete även för workerresultat; fulla
 cacheträffar och `check` har noll backendaktivitet.
 

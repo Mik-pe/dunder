@@ -63,8 +63,8 @@ gemensamma helfunktions-IR:n med obligatorisk verifiering och atomisk
 sänkning. Generell CFG-liveness, framepromovering, ett uttryckligt kontrakt för
 privata källobjekt och värdepropagering delar samma kedja. Ett nytt valbart
 SSA-steg ligger mellan frame- och värdepassen.
-`--mir-opt=off` behåller kedjan utan optimeringspassen;
-`--mir=off` stänger av hela gränsen för jämförelse.
+`--mir-opt=off` och `--mir=off` stänger av de valfria MIR-passen och
+behåller verifiering och sänkning.
 [Omfattning och gränser](optimization.md).
 
 `--mir-ssa=on` aktiverar den valbara regionala Frame/Expr-kedjan;
@@ -119,7 +119,7 @@ Huvudtråden äger frontend, typning, diagnostik, cache och inlinebudget.
 Arbetstrådarna tar emot funktionslokala maskinord och metadata i separata
 kolumner, bygger MIR lokalt och returnerar sänkta funktionsobjekt. Huvudtråden
 validerar och länkar objekten i källordning. På ARM64/macOS väljer `--jobs`
-1–256 workers. En worker, `check`, `--mir=off` och `--profile-compiler`
+1–256 workers. `check` och `--profile-compiler`
 använder den seriella kedjan. [Arbetsfördelning](optimization.md#seriell-session-och-taskbaserade-funktionspass)
 
 Med den nativa kodgeneratorn den 15 november 2026 tog bygget av den låsta

@@ -366,7 +366,7 @@ Sessioner med samma struktur. Den nuvarande koordinatorn har en Session,
 färska lexikala taskscopes och separata ordinal-/deklarationskolumner.
 Ett återanvändbart generellt kö-API kan senare få egna opaka jobbiljetter.
 
-En worker, `check`, `--mir=off` och `--profile-compiler` använder samma
+`check` och `--profile-compiler` använder samma
 seriella Session-drivrutin. Kontrolläget skapar inga backendarenor;
 profilering behåller ett seriellt väggtidskontrakt. Scheduling ändrar inte
 vilka frivilliga passbudgetar som gäller.
