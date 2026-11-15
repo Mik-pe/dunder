@@ -135,8 +135,23 @@ fn maximum(a: i32, b: i32) -> i32 {
 
 Det gäller även slutliga grenar i `if/else` och slutliga nästlade block.
 Ett semikolon gör uttrycket till en vanlig sats och ger inget returvärde.
-`if` är ännu inte ett allmänt uttryck som kan tilldelas en variabel.
 Ett vanligt block i en funktion utan returvärde fortsätter till nästa sats.
+
+### Villkorsuttryck
+
+Ett `if`-uttryck kan ge värdet till en bindning eller ett funktionsargument.
+
+```dunder
+fn biljettpris(alder: i32, medlem: bool) -> i32 {
+    pris := if alder < 18 { 50 } else if medlem { 80 } else { 100 }
+    return pris
+}
+```
+
+Varje villkor har typen `bool`. Villkoren prövas i ordning och bara den valda
+grenens värdeuttryck utvärderas. Ett `if` i uttrycksposition kräver ett
+avslutande `else`. Varje gren innehåller ett enda uttryck inom klamrar och
+alla grenar måste ge värden av samma typ.
 
 ### Funktionsvärden och callbacks
 

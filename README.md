@@ -1,5 +1,9 @@
 # Dunder ⚡
 
+<p align="center">
+  <img src="docs/dunder.jpg" width="320" alt="Dunders logga med ett stentroll och en gyllene blixt">
+</p>
+
 Ett statiskt typat, kompilerat språk med filändelsen **`.ddr`**.
 Kompilatorn läser vanlig Dunder-källkod och skriver körbara filer för
 ARM64/macOS, ARM64/Linux, x86-64/Linux och WebAssembly (wasm32). Kodgenerering, ELF-/Mach-O-skrivning
