@@ -33,6 +33,10 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
   Vanliga arrayelement är primitiva värden, inklusive strängar och pekare,
   enums utan payload eller typade tasknycklar. `@c_layout` använder målplattformens fältstorlek
   och justering. [Enums](enums.md) och [FFI](ffi.md).
+- `@resource` gör externa OS-resurser unika även när deras representation
+  är skalär. Sockets och barnprocesser kan flyttas men inte klonas;
+  rekursiv kloning och isolerade tasktransporter av sådana värden avvisas.
+  Stängning och processhantering är fortfarande explicita operationer.
 - Ägda arraybuffertar frigörs deterministiskt. Oföränderliga strängar
   använder referensräkning. Ett lån av en lokal, ett fält eller ett
   arrayelement gäller under anropet. Kontrollen avvisar motstridiga lån
@@ -43,6 +47,12 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
   SHA-256, parse och sys. Sortering, hashning, omhashning och SHA-256 är
   Dunder-kod. Textläsning kontrollerar UTF-8 och filoperationer returnerar
   typade felvärden. [Standardbibliotek](standard.md) och [system-API](sys.md).
+
+Bibliotekets lagringsoperationer tar över indata: map/set-nycklar,
+processargument och stdinbuffertar samt JSON-dokumentets bytebuffert.
+Läsoperationer lånar. Om anroparen vill behålla en självständig snapshot
+anges `.clone()` där den behövs. Strängsortering och omhashning överför
+befintliga ägare utan kloning. [Rekommenderade nästa steg](next-steps.md).
 
 ## Byggverktyg och exempel
 
@@ -139,10 +149,11 @@ före SSA-grunden, ger med samma binär genererad byggmedian
 största kvoten 1,308× i den rapporten ligger över målen 1,10× respektive
 1,25×. C-målet är fortfarande öppet; rapporten är inget mätresultat för SSA.
 
-Unika fulluttryckstemporärer av vanliga records kan överföras med generisk
-normalisering av nästlade arraykapaciteter. Detta tar bort extra kopior i
-bland annat kompilatorns jobb/resultat med samma gemensamma regler för lån och flytt. Managed-lagring delas
-fortfarande inte mellan workerarenor.
+Resursägande lokaler, resultat och managed-fält överförs utan en extra
+datakopia och behåller sina arraykapaciteter. Kompilatorns jobb- och
+resultatkedjor använder samma regel. Ett vanligt `spawn` av lånade indata
+behöver ingen föregående `.clone()`; taskgränsen skapar själv den nödvändiga
+isolerade snapshoten. Managed-lagring delas fortfarande inte mellan workerarenor.
 
 Den fulla kodgeneratorn kan utelämna extra strängoperandägare när hela
 högerledet saknar relevanta effekter. En validerad funktionsrepresentation

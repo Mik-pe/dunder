@@ -401,6 +401,10 @@ en enum. Inline-cykler avvisas; referensfält är ännu inte tillåtna.
 En struct med enbart kopierbara fält kan kopieras vid bindning och
 tilldelning. Resursägande structar flyttas i stället. Vanliga
 funktionsparametrar lånar structen för läsning.
+`@resource` markerar en unik extern resurs även när dess fält bara är
+skalärer. En sådan struct och aggregat som innehåller den flyttas och
+kan inte klonas. Markeringen innebär ännu ingen automatisk destruktor;
+se [resursreglerna](memory.md#unika-externa-resurser).
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
 oföränderliga; kopiera till en `mut` för att ändra fält. Structar kan också
 returneras från funktioner. Anroparen äger resultatets lagring, så en
@@ -442,6 +446,7 @@ läsning. `mut` krävs för att tilldela ett element. Index har typen `i32`; neg
 eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
 längden som `i32`. Fasta arrayer kan returneras genom ägaröverföring på samma sätt som
 andra resursägande värden.
+`values.swap(i, j)` byter två element utan kloning och kräver muterbar lagring.
 
 `start..end` har typen `range`, inkluderar start och utesluter slut.
 Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
@@ -541,7 +546,8 @@ fn main() {
 Strängar är alltid giltig UTF-8 och deras byte är oföränderliga.
 `mut text := "a"; text = "b"` byter hela värdet; direkt ändring av ett byte
 är förbjuden. Strängar kan skickas och returneras, även genom callbacks,
-och lagras i arrayer och structfält. Kopior kan dela oföränderliga data.
+och lagras i arrayer och structfält. Bindningar och returer flyttar ägandet;
+en uttrycklig `.clone()` delar den oföränderliga texten med en ny ägare.
 
 `"..."` och `'...'` ger samma typ `string`. Backticks ger typen `rune`,
 exempelvis `` `å` `` eller `` `🌍` ``. En sådan literal måste innehålla exakt
@@ -554,8 +560,14 @@ Escape-sekvenser: `\\`, `\"`, `\'`, `` \` ``, `\n`, `\r`, `\t`, `\0`,
 `\xHH`, `\uHHHH` och `\u{H...}` med en till sex hexsiffror.
 Byte-escapes valideras tillsammans: `"\xC3\xA5"` är `"å"`, men `"\xFF"`
 är ett kompileringsfel. Surrogates och värden över Unicode-intervallet
-avvisas. Oescapade radbrytningar, råsträngar och interpolation stöds ännu inte.
+avvisas. Oescapade radbrytningar och råsträngar stöds ännu inte.
 NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering används.
+
+`f"Hej {name}, {count + 1}!"` och `f'Hej {name}!'` interpolerar uttryck
+från vänster till höger med samma konvertering som `.str()`. Uttrycken
+lånar sina operander; att formatera en sträng flyttar inte dess ägare.
+`{{` och `}}` ger bokstavliga klamrar. Vanliga strängliteraler interpolerar
+inte. Fel i uttrycken pekar på deras ursprungliga källpositioner.
 
 | Operation | Betydelse |
 | --- | --- |
@@ -576,7 +588,8 @@ respektive `[]rune`. Direkt iteration kan strömma från en behållen
 strängsnapshot utan mellanarray. Om originalbindningen får en ny sträng
 behåller konverteringen eller iterationen sina gamla värden. `for` direkt över en string avvisas:
 välj `.bytes()` eller `.runes()` uttryckligt. `break` och `continue` fungerar
-för båda. Arrayiteratorernas befintliga kopieringsregler gäller fortfarande.
+för båda. Lagrade arrayiteratorer äger sin samling; skapa dem med
+`(move values).iter()` eller `values.clone().iter()`.
 Strängsnitt kan också ta ett lagrat eller returnerat `range`-värde,
 exempelvis `span := 7..11; part := text[span]`.
 
@@ -598,12 +611,11 @@ ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
 
 ## Nästa språkbeslut
 
-Nästlade aggregat, dynamiska arrayer och begränsade funktionsborrows fungerar
-nu; se [standardbiblioteket](standard.md). Arrayslices, ett generellt
-allokerings-API, generell ägar-/lånekontroll och egna iteratorer återstår.
-Den äldre dogfood-arenan använder fortfarande indexhandtag över en fast
-typad buffert. [Självhosting](../selfhost/README.md) fungerar för ARM64/Linux;
-full språk- och minnesmodellparitet återstår.
+Ägarflyttar, uttrycklig kloning och läslån är den gemensamma modellen;
+se [minnesmodellen](memory.md) och [standardbiblioteket](standard.md).
+Lån som kan returneras eller lagras, arrayslices, aggregat som arrayelement,
+generiska bibliotek och egna iteratorer återstår. Självhosting verifieras
+på de tre nativa målen; [Wasm-verifiering är senarelagd](status.md#webassembly-senarelagt-under-språkutveckling).
 
 ## Råtyper, privilegier och C-layout
 

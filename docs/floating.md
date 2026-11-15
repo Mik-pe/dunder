@@ -137,5 +137,6 @@ Skalära flyttalsargument använder v0–v7, separat från x0–x7 för övriga
 argument. Därefter används stacken med naturlig storlek och justering.
 Flyttalsreturer går i s0/d0. Detta följer registeruppdelningen i
 [AArch64:s anropsstandard](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst).
-Structar och arrayer följer fortfarande Dunders interna kopieringskonvention;
-det finns ännu inget exponerat C-FFI.
+Vanliga struct- och arrayparametrar använder Dunders interna lånekonvention;
+`move`-parametrar och resursägande returer överför ägarskapet.
+C-anrop och C-layout har ett separat [FFI-kontrakt](ffi.md).

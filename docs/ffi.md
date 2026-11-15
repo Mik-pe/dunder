@@ -145,8 +145,10 @@ En modul med `capability filesystem` kan välja sökvägar med
 `std.fs.grant_read(path)` och `std.fs.grant_write(path)`. Därefter kan den
 skicka handtagen till moduler som använder `std.fs.read`, `metadata`, `write`,
 `append` eller `write_bytes`. Ett läshandtag och ett skrivhandtag är skilda
-nominella typer. En `pub opaque struct` kan skickas och kopieras över
-modulgränser. Endast modulen som deklarerar den får i säker kod konstruera
+nominella typer. En `pub opaque struct` kan skickas över modulgränser och
+följer samma ägarskapsregel som andra structar: handtag som innehåller
+strängar flyttas, och en extra ägare kräver `.clone()`.
+Endast modulen som deklarerar den får i säker kod konstruera
 ett värde eller läsa, skriva och låna dess fält. Kontrollen av
 `@requires(filesystem)` gäller också när modulens kod tar funktionsvärdet.
 

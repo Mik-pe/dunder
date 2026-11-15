@@ -42,8 +42,9 @@ element är ännu inte implementerade.
 | `a.len`, `a.len()`, `len(a)` | Antal initierade element som `i32`. |
 | `a.cap()` | Tillgänglig kapacitet i element. |
 | `a[i]`, `a[i] = value` | Typad åtkomst med gränskontroll; skrivning kräver muterbar lagring. |
-| `a.push(value)` | Lägger till ett element; kapaciteten växer geometriskt. |
+| `a.push(value)` | Lägger till ett element; en lagrad strängägare lämnas som `a.push(move value)`. Kapaciteten växer geometriskt. |
 | `a.pop()` | Tar bort och returnerar sista elementet. Tom array ger status 103. |
+| `a.swap(i, j)` | Byter två element på plats utan kloning. Båda index kontrolleras före bytet; fel ger status 103. |
 | `a.reserve(capacity)` | Säkerställer minst denna kapacitet utan att ändra längden. |
 | `a.clear()` | Nollställer längden och behåller bufferten för återanvändning. |
 | `for item in a` | Läslånar samlingen under loopen, utan arraykopia. |
@@ -53,6 +54,40 @@ sedan inte läsas före återinitiering. `copy := values.clone()` ger en
 oberoende buffert. Regeln följer arrayer även inne i structar och enums.
 Vanliga parametrar lånar för läsning; `move`-parametrar tar över ägarskapet.
 Flytt bevarar kapaciteten. En klon får egen kapacitet efter sin längd.
+
+`swap` fungerar på dynamiska och fasta arrayer, inklusive muterbart lånade
+och inline-lagrade arrayer. Indexuttrycken körs en gång från vänster till
+höger; därefter används arrayens aktuella lagring. Buffert, längd och
+kapacitet är oförändrade av själva bytet. Strängsorteringen använder detta
+för att flytta handtag utan extra referensräkning.
+
+## Läsa och lagra resurser
+
+Bibliotekets läsoperationer lånar. Operationer som behåller indata tar över
+ägaren med en `move`-parameter. En anropare som behöver två ägare skriver
+`.clone()` vid anropet; arrayer får då en självständig buffert och strängar
+delar oföränderlig text.
+
+| Operation | Ägarskap |
+| --- | --- |
+| `map.get`, `map.get_or`, `map.contains`, `set.contains` | Lånar nyckeln. |
+| `map.put(&mut table, move key, value)`, `set.insert(&mut set, move key)` | Tar över nyckeln; nyckeln förbrukas även om den redan finns. |
+| `map.keys(table)`, `set.items(set)` | Returnerar en ny array; tabellen behåller sina strängägare. |
+| `process.command(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
+| `process.run(program, args)`, `process.exec(command)` | Lånar under den synkrona körningen. |
+| `json.parse_bytes(move input)` | Dokumentet tar över bytebufferten utan kopia. |
+| `json.parse_bytes(input.clone())` | Begär uttryckligen ett dokument med en självständig snapshot. |
+| `json.parse_text(text)` | Lånar strängen och bygger dokumentets UTF-8-buffert. |
+| `net.set_insert(&mut streams, move stream)` | Flyttar en stream till mängden. |
+
+`process.set_insert(&mut children, &mut child)` är ett fallibelt
+överföringsförsök: framgång lämnar barnet i mängden och tömmer källhandtaget;
+`-1` lämnar det oförändrat hos anroparen. Detta kräver ett skrivlån.
+
+Sockets, socketmängder, barnprocesser och barnprocessmängder är
+[`@resource`-typer](memory.md#unika-externa-resurser). De flyttas och kan
+inte klonas, inte heller genom en omgivande struct eller enum. De använder
+fortfarande explicita stängnings- och processoperationer.
 
 ## Begränsade borrows
 
@@ -134,8 +169,8 @@ Bytekodning och SHA-256 dogfoodar dessa operationer.
 
 ## Lagring och verifiering
 
-Dynamiska buffertar använder en gemensam **512 MiB heap** på native, mappad vid första behov. Buffertarna har unika ägare; kopior
-är oberoende. Tillväxt frigör den gamla bufferten efter kopieringen.
+Dynamiska buffertar använder en gemensam **512 MiB heap** på native, mappad vid första behov. Buffertarna har unika ägare; uttryckliga kloner
+är oberoende. Tillväxt frigör den gamla bufferten efter överföringen.
 Tilldelning, scope-slut och retur frigör övergivna buffertar, även i nästlade
 structar och aktiva enumpayloads. `clear` frigör elementens strängreferenser
 och behåller själva bufferten för nästa användning.

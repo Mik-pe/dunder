@@ -25,6 +25,37 @@ bool, runes, pekare, funktionsvärden och records med enbart kopierbara fält
 kan kopieras som enkla värden. Typens ägarskap bestämmer regeln, oberoende
 av om kompilatorn lagrar dess representation på stack eller heap.
 
+### Unika externa resurser
+
+`@resource` på en struct anger att värdet äger en unik extern resurs,
+även när representationen bara består av heltal eller pekare. Värdet och
+aggregat som innehåller det flyttas; `.clone()` och replikering av en
+sådan resurs avvisas. Vanliga parametrar lånar fortfarande för läsning.
+Markeringen är skild från `opaque`, som styr åtkomst till representationen.
+
+```dunder
+@resource
+struct Handle { id: i32 }
+
+fn forward(move handle: Handle) -> Handle { handle }
+
+fn main() {
+    original := Handle { id: 42 }
+    next := forward(move original)
+    print(next.id)
+}
+```
+
+Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `Child` och
+`ChildSet` är sådana resurser. Fil- och körningskapabiliteter som bara
+innehåller en sökväg kan däremot uttryckligen klonas.
+Markeringen lägger ännu inte till en användardefinierad destruktor:
+socketstängning och processhantering sker med bibliotekets explicita
+`close`-/`wait`-/set-operationer. Ingen implicit OS-hantering har tillkommit.
+Resurser får tills vidare inte transporteras över isolerade taskgränser,
+vars snapshotprotokoll kräver klonbara värden. `@resource` kombineras inte
+med `@c_layout`.
+
 ```dunder
 fn total(values: []i32) -> i32 {
     mut sum := 0
@@ -107,6 +138,7 @@ muterbar bindning kan återinitieras. Flytt ur ett lån avvisas.
 Arrayelement lämnas över med `pop` eller kopieras uttryckligen med `.clone()`;
 indexering lämnar ingen oinitierad lucka i arrayen. Inline-fält i C-layout
 kan klonas när ett självständigt arrayvärde behövs.
+`values.swap(i, j)` byter element på plats utan kloning eller referensräkning.
 
 Vanlig `for` och `match` lånar. `for value in move values` respektive
 `match move value` överför ägaren. `for value in values.iter()` lånar också;
@@ -144,18 +176,17 @@ Wasm avbryter den aktuella körningen med en trap.
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
 python3 tools/runtime-contracts.py "$dunder_bin"
-python3 tools/runtime-contracts.py "$dunder_bin" --target wasm32
 ```
 
-Testverktyget använder Python 3:s standardbibliotek och Node för Wasm. Det
+Testverktyget använder Python 3:s standardbibliotek. Det
 bygger varje program med den angivna Dunder-kompilatorn. Tio minnesprov håller
 bland annat arraykopior, nästlade enumvärden, lånade parametrar, snitt och
 strängreturer levande medan andra värden ersätts eller frigörs. Exempelvis
 kopierar ett prov en array med 1 024 `i64` i 200 000 varv. Ett annat tar emot
 en miljon dynamiska strängreturer. Alla tio kontrollerar resultatet och
-kräver under 96 MiB maximal RSS på det nativa värdmålet. På Wasm kräver de
-under 96 MiB linjärt minne och samma minnesstorlek efter en andra körning
-i samma instans. [Dunder-programmen](../tests/contracts/).
+kräver under 96 MiB maximal RSS på det nativa värdmålet.
+[Dunder-programmen](../tests/contracts/). Wasm-körningar ingår tills vidare
+inte i verifieringskedjan; se [aktuell omfattning](status.md#webassembly-senarelagt-under-språkutveckling).
 
 Testverktyget jämför även heltal, flyttalsbitar, decimalformatering, UTF-8,
 mappar, mängder och sortering med oberoende Python-beräkningar. Felproven
@@ -203,7 +234,7 @@ fält eller en C-layout-struct använder regionens lagring. Ett muterbart lån
 av en hel vanlig struct använder en ägd tillfällig kopia och skriver tillbaka
 fältvärdena efter anropet. Självkompilatorn följer lån genom funktionsanrop,
 återlån och funktionspekare och avvisar lån som når `addr`. En kopia av ett
-element eller en array som kopierats genom en delad parameter har egen lagring.
+element eller en uttrycklig arrayklon har egen lagring.
 En inre region kan skugga en yttre. Namnet på regionen och dess direkta
 deklarationer tillhör samma scope. Se `tests/contracts/region_borrows.ddr`
 och de ogiltiga exemplen under `tests/fixtures/region_errors/`.

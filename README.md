@@ -477,8 +477,9 @@ Läs [sys-reglerna](docs/sys.md) för beteende, klocka, rå byte-I/O, kapabilite
 kataloger (`std.fs.ReadDir`) och nätverkssockets (`capability network`, `std.net`).
 Kör `dunder test tests/net_loopback.ddr` för filsystem- och loopbacktester.
 
-Structar och fasta arrayer kan nu returneras som värden. Resultatet kopieras
-till lagring hos anroparen och fungerar även genom callbacks och rekursion.
+Structar och fasta arrayer kan returneras till lagring hos anroparen.
+Resursägande resultat flyttas utan en extra datakopia, även genom callbacks
+och rekursion.
 
 ## Syskonprojekt i dunder-hundmat
 

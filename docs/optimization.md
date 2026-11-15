@@ -740,33 +740,26 @@ den behövs. [Infogning av ägarhändelser](../selfhost/ownership_lease.ddr)
 referensräkningen och kontrollerar mutation, tidiga returer, fällordning och
 återanvändning av ägarplatser i loopar.
 
-## Unika recordtemporärer
+## Överföring av records
 
-[`record_take`](../selfhost/record_take.ddr) undviker en extra djupkopia när
-den fulla frontendens x0-värde hör till exakt samma unikt ägda
-fulluttryckstemporär och typ som dess registrerade cleanupägare. Regeln är
-generisk för vanliga records. Den flyttar inga lokaler, parametrar eller
-fältprojektioner och inför inga allmänna moves.
+Resursägande records flyttas enligt [språkets ägarskapsregel](memory.md),
+även när källan är en lokal eller ett överförbart managed-fält. Den vägen
+behåller arraybuffertar och kapacitet och behöver ingen kloningshjälpare.
+En uttrycklig `.clone()` skapar i stället oberoende ägda barn.
 
-En förseglad typplan klassificerar rekursiva record-/arraybarn innan den
-globala etikettrymden och cachekontexten fryses. Normaliseringen bevarar den
-synliga kapacitet som en vanlig arraykopia skulle ha haft: noll för tomma
-arrayer, annars max(8, längden). Strängar och delade payload-enums är
-stoppunkter; C-layoutfält förblir inlinebytes. Separata lokala snapshots
-fortsätter att vara oberoende värden.
+[`record_take`](../selfhost/record_take.ddr) finns kvar som en separat
+generisk hjälpplan för kopierbara recordtemporärer. Den förseglas innan
+etiketter och cachekontext fryses. Session behåller primitiva val per typ;
+slutliga relokeringar bestämmer vilka hjälpare som verkligen emitteras.
+`check` kopierar ingen typmetadata till planen. Hjälpplanens äldre
+kapacitetsnormalisering ändrar inte reglerna för resursägarnas flyttar.
 
-Planen har en egen ägarrot utanför Session. Session behåller bara primitiva
-val per typ, och hela uttryckets vanliga ägargard avgör om transfer får ske.
-Efter ordnad sammanfogning skannas slutliga relokeringar en gång för att
-återställa hjälpardemand för både kalla och cachade funktioner. Endast den
-transitivt begärda hjälparkoden emitteras, utanför källfunktionernas MIR-
-och cachegränser. Cachepolicyn innehåller `record-take1`.
-
-`check` kopierar ingen typmetadata till planen och reserverar inga sådana
-hjälpare. Resursavslag använder den vanliga kopieringsvägen; trasig intern
-metadata ger kompilatorfel. Mekanismen bevarar källans värdesemantik och
-behåller de verkliga isoleringskopiorna vid taskgränsen. Den hjälper också
-kompilatorns vanliga jobb- och resultatrecords utan en särskild MIR-typregel.
+Taskgränsen har ett separat isoleringskontrakt. En worker får en snapshot
+i sin egen arena, och ett efterfrågat resultat flyttas till förälderns
+ägarskap genom en isoleringskopia. Att klona ett jobb före ett vanligt
+`spawn` med lånad workerparameter lägger till en onödig lokal kopia;
+skicka det lånade jobbet direkt. Vanliga funktionsanrop lånar utan denna
+arenakopiering. [Taskkontrakt](tasks.md).
 
 ## Nästa etapper mot C-nivå
 
@@ -818,14 +811,14 @@ konstanter. Även Unicode och escape-sekvenser behöver därför ingen
 strängkonvertering eller rune-array under körning. En ensam rune-literal
 kan använda samma registerväg som andra skalära konstanter.
 
-Ett helt ägt temporärt uttryck kan överföra sitt värde till en deklaration,
-ett argument, en retur, en tilldelning eller en loop. Kompilatorn spårar
-uttryckets exakta ägarplats och nollställer den vid överföringen. Befintliga
-lokaler och projektioner av fält eller element kopieras fortsatt. Parenteser
-behåller ursprunget; nya operator- och anropsresultat får egna ägarplatser.
-Arrayer behåller den kapacitet en vanlig värdekopia skulle visa, även om en
-större underliggande buffert återanvänds. Sammansatta värden med nästlade
-ägda samlingar använder tills vidare den rekursiva kopieringsvägen.
+Ett ägt uttryck kan överföra sitt värde till en deklaration, ett ägande
+argument, en retur, en tilldelning eller en konsumerande loop. Kompilatorn
+spårar ägarplatsen och nollställer den vid överföringen. Regeln gäller
+även befintliga resursägande lokaler och överförbara managed-fält.
+Parenteser behåller ursprunget; nya operator- och anropsresultat får egna
+ägarplatser. Arraybuffert och kapacitet bevaras vid flytt, även i nästlade
+aggregat. Indexerade element kan tas med `pop`; ett självständigt värde
+från en lånad källa kräver uttrycklig `.clone()`.
 
 [ARM64-backenden](../selfhost/arm64.ddr) använder direkt LDUR/STUR för
 lokala värden nära framepekaren och immediate-adresser där offseten ryms.
