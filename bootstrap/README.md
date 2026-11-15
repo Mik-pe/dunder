@@ -44,21 +44,26 @@ som fristående ELF-binärer.
 
 ## Frönas ursprung
 
-De tre fröna kommer från Dunder-källrevision `28fd7d768b7e8fbcfdb9746f91e8daffbe96fac9`.
-De byggdes med föregående frön från revision `1c15f7f`, med värdens
-ingångsfil och två byteidentiska slutbyggen. Komprimeringen är `gzip -9 -n`.
+De tre fröna kommer från Dunder-källrevision `a1e4478f8906c1d70f159051fd603f64b59fb05e`.
+De byggdes från föregående frön från revision `28fd7d7`, med värdens
+ingångsfil och två byteidentiska slutbyggen. Fröna förstår explicit `.clone()`
+och stränginterpolering, så att kompilatorns källkod kan migreras till
+uttryckliga kopior utan att förlora återbyggnadskedjan.
+Komprimeringen är `gzip -9 -n`.
 Tabellen anger SHA-256 för den **uppackade** kompilatorn. Syskonfilerna
 `*.sha256` kontrollerar de komprimerade filerna.
 
 | Värd | Ingångsfil | SHA-256 |
 | --- | --- | --- |
-| ARM64/macOS | `selfhost/main.ddr` | `3daff87390f0716657552a6b38d60406724ab31f0e4098c8d9af10aa2bf60314` |
-| ARM64/Linux | `selfhost/linux.ddr` | `ffbed9858c2d286aff7d352c11fed1dc9b4a3433906413363e3b781b4b6d422e` |
-| x86-64/Linux | `selfhost/x86_linux.ddr` | `09ae3e8a9a5b55dc60deb72f4ccccf3a43f0ceede1ea886f0af63796dee8aa1f` |
+| ARM64/macOS | `selfhost/main.ddr` | `6b5a0782b4b7058084e5d026a7aa890b87d1af4b7360ddb00afc26fc7577b4fa` |
+| ARM64/Linux | `selfhost/linux.ddr` | `9fd6183f8c7e874b7bb90b31732212199352f6584847c1fd626e6d4f42b1770c` |
+| x86-64/Linux | `selfhost/x86_linux.ddr` | `57e2e4e21e24c1f2f4bdc66a14ef23ed23b21802ecb7d5e4763a96fe2159cc54` |
 
-Varje värd körde 59 dogfood-grupper och Tabells 14 grupper. Linux/x86-64
-kördes under emulering på ARM64. Varje frö kan bygga kompilatorn och
-korskompilera program till alla fyra mål.
+macOS passerade den fullständiga verifieringens 81 sviter och byteidentiska
+självbyggen med en och fyra workers. Båda Linux-värdarna passerade seriell
+fixpunkt, fem interpoleringsgrupper och elva process-/biblioteksgrupper.
+Linux/x86-64 kördes under emulering på ARM64. Varje frö kan bygga
+kompilatorn och korskompilera program till alla fyra mål.
 
 För att utveckla från en ren utcheckning behövs det incheckade fröet för
 värden. Den äldre Rust-implementationen och dess ursprungliga testsvit finns
