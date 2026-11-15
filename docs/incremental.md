@@ -95,7 +95,8 @@ dunder build selfhost/main.ddr --profile-compiler --timings=json -o build/measur
 Fältet delar kompilatorintervallet i tolv icke överlappande faser:
 `declarations`, `model_parse`, `verify_pre`, `simplify`, `verify_post`,
 `allocation`, `scalar_emit`, `legacy_body`, `fragment_cache`, `finalize`
-`range_analysis` och `mir_pipeline`. Intervallanalysen omfattar preflight, fixpunkt,
+`range_analysis` och `mir_pipeline`. `model_parse` och `legacy_body` är historiska fältnamn
+för arbete i den gemensamma typkontrollen. Intervallanalysen omfattar preflight, fixpunkt,
 replay och applicering; arbetsenheten är abstrakta operationer inklusive
 kopiering och sammanfogning av tillstånd.
 `mir_pipeline` omfattar lyft av hela funktioner, verifiering och sänkning;

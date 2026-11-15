@@ -27,7 +27,7 @@ direkt när båda registren är tillgängliga. MIR registrerar vilka register
 instruktionen läser och skriver samt dess minneseffekt. För `array.push`
 väljer den typade anropsplatsen elementbredden. Finns ledig kapacitet skriver
 runtime värdet direkt. En full array går via den gemensamma kontrollerade
-tillväxtvägen. [Skalär kodgenerering](../selfhost/opt_emit.ddr) · [MIR-avkodning](../selfhost/mir_decode.ddr) · [Array-runtime](../selfhost/runtime.ddr)
+tillväxtvägen. [Skalär kodgenerering](../selfhost/opt_emit.ddr) · [MIR-operationer](../selfhost/mir_operation.ddr) · [Array-runtime](../selfhost/runtime.ddr)
 
 ## Gemensam helfunktionskedja
 
@@ -41,18 +41,13 @@ redan sänkt kod.
 
 [`mir.Function`](../selfhost/mir.ddr) beskriver operationer, operander,
 maskinbredder, flaggor, kontrollkanter, byteintervall och anropseffekter.
-Frontend lämnar fullständiga spann för frameåtkomster, inklusive de
-scratchregister som stora offset använder. Okänd instruktionseffekt blir
-en uttrycklig barriär och spärrar analyser som saknar ett tillräckligt
-kontrakt. Funktionen går fortfarande genom IR-gränsen.
-
-Övergångsadaptern behåller ursprungliga kodord för byteidentisk återspelning.
-Verifieraren avkodar dem med samma gemensamma dekoder och kontrollerar exakt
-att de fortfarande motsvarar operationens semantik. Ändrad semantik kräver
-kanonisk sänkning. Syntetiska operationer kontrolleras också mot härledda
-operand-, effekt-, use/def-, frame- och scratchkontrakt. Trasiga metadata
-ger ett internt kompilatorfel. Sänkningen förbereder etiketter, relokeringar,
-importplatser och kod atomiskt före commit.
+Källformatet beskriver bland annat typade lokaler, platser, argument,
+ägarskapsoperationer och möjliga utgångar. Byggaren läser operationernas
+egna operander och avvisar fristående maskinord. En stor heltalsliteral
+kan ha extra dataceller som bara får läsas som en del av literalen.
+Verifieraren kontrollerar operander, effekter, register, frame och
+scratchkontrakt före målsänkningen. Maskininstruktioner som testindata
+läses i [testfixturen](../tests/fixtures/mir_machine.ddr).
 
 `--mir=off` och `--mir-opt=off` stänger av de valfria MIR-passen.
 Alla nybyggda källfunktioner verifieras och sänks också i detta läge.
@@ -78,17 +73,15 @@ kedjan. Den kombinerade heltalsoperationen behåller överflödeskontrollen.
 
 ### Seriell Session och taskbaserade funktionspass
 
-Huvudtråden äger källtraverseringen, de provisoriska maskinorden och
-importerna. För varje ny funktion lägger den funktionslokala maskinord,
-etikettbindningar, relokeringar, importsajter och källannotationer i en batch.
-Maskinord och de olika metadatakolumnerna lagras var för sig. Varje funktion
-har en liten post med index och längder för sina delar av batchen.
-[Session](../selfhost/compile.ddr) · [Batchformat](../selfhost/mir_source.ddr)
+Varje färdig funktion har en egen post i batchen med operationer,
+typreferenser, lokala plats-ID:n, källpositioner och symbolbehov.
+Samordnaren binder symboler i en bestämd ordning.
+[Session](../selfhost/compile.ddr) · [Funktionsformat](../selfhost/mir_source.ddr)
 
-Arbetstråden bygger MIR direkt från batchens kolumner med samma avkodare som
-den seriella vägen. Den återanvänder arbetsminnet för lyftning, verifiering,
-optimering och sänkning mellan funktionerna i batchen. Föräldern tar emot de
-slutliga funktionsobjekten i källordning, validerar dem och länkar bilden.
+Den seriella vägen och arbetstrådarna bygger MIR från samma typade
+operationer. Arbetsminnet för verifiering, optimering och sänkning
+återanvänds mellan funktioner. Föräldern tar emot de slutliga
+funktionsobjekten i källordning, validerar dem och länkar bilden.
 En träff i fragmentcachen ger ett redan sänkt objekt.
 [Arbetstråd](../selfhost/mir_task.ddr) · [Funktionspass](../selfhost/mir_pipeline.ddr)
 
@@ -218,7 +211,7 @@ godtycklig maskinkod; nya hjälparargument kräver en explicit konvention.
 
 Läsvyn muterar inga råa call-masker och begränsar varken clobbers, minne,
 flaggor eller andra effekter. Okända anropsformer behåller råkontraktet.
-[`mir_decode`](../selfhost/mir_decode.ddr) anger FE-adapterns mål i logiska
+[Testavkodaren](../tests/fixtures/mir_machine_decode.ddr) anger FE-adapterns mål i logiska
 X17 och Wasm-FB:s mål i X16 som explicita operander. De får aldrig frigöras
 som oanvänd scratch. Rå Call läser inkommande NZCV och kan förstöra dem: det
 kanoniska kontraktet är `flags=3` (read + write). Det tidigare `flags=2`
