@@ -153,6 +153,9 @@ grenens värdeuttryck utvärderas. Ett `if` i uttrycksposition kräver ett
 avslutande `else`. Varje gren innehåller ett enda uttryck inom klamrar och
 alla grenar måste ge värden av samma typ.
 
+För en enum kan ett `match`-uttryck välja värde efter variant och binda
+variantens payload i den valda armen. [Match som uttryck](enums.md#match-som-uttryck)
+
 ### Funktionsvärden och callbacks
 
 ```dunder

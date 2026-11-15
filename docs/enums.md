@@ -100,16 +100,38 @@ fn read_or_empty(path: string) -> string {
 
 Payload-bindningar är oföränderliga lokala värden som bara finns i armen.
 Använd `_` för ett oanvänt payloadvärde, exempelvis `.Pair(x, _)`.
-Uttrycket efter `match` utvärderas en gång; aggregat och bindningar kopieras
-med värdesemantik. Att ändra originalets `var` i en arm ändrar inte kopian.
-Nästa fall körs inte automatiskt efter en arm. `break` och `continue`
-syftar fortsatt på en omgivande loop.
+Uttrycket efter `match` utvärderas en gång, och bara den valda armen körs.
+Aggregat och bindningar kopieras med värdesemantik. Komma skiljer armarna åt.
 
-En arm får innehålla ett uttryck eller ett block. Komma eller radbrytning
-skiljer armarna åt. En avslutande `match` kan ge funktionens returvärde
-genom armarnas sista uttryck, som i exemplen. Explicit `return` fungerar
-också. `match` är i denna version en sats; `x := match ...` återstår.
-Nästlade fall skrivs med en inre `match`, inte ett nästlat mönster.
+Som sats kan `match` ha block med flera satser, som felhanteringen ovan.
+En avslutande `match` kan ge funktionens returvärde genom armarnas sista
+uttryck. Explicit `return` fungerar också. `break` och `continue` syftar på
+en omgivande loop. Nästlade fall skrivs med en inre `match`.
+
+### Match som uttryck
+
+```dunder
+enum Leverans { Hamta, Skicka(i32) }
+
+fn totalpris(pris: i32, leverans: Leverans) -> i32 {
+    frakt := match leverans {
+        .Hamta => 0,
+        .Skicka(avgift) => avgift,
+    }
+    return pris + frakt
+}
+
+fn main() {
+    print(totalpris(100, .Skicka(29)))  // 129
+}
+```
+
+Ett `match` i uttrycksposition måste ge ett värde av samma typ i alla
+armar. Varje arm innehåller ett enda uttryck, med valfria klamrar runt
+uttrycket. Typen kan komma från exempelvis en annotering eller en
+funktionsparameter. Om den förväntade typen är en enum kan även värdet
+efter `=>` skrivas med kortformen `.Variant`. När typen härleds med `:=`
+bestämmer den första armen typen för de följande.
 
 ## Lagring och dispatch
 
