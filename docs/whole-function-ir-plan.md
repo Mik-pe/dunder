@@ -320,7 +320,7 @@ seriella ingångens beroendeträd innehåller ingen ny tasksyntax. Linux
 behåller seriell standardkompilering; `bootstrap.sh --serial` publicerar en
 separat `dunder-serial` på alla värdar utan att ersätta `dunder`.
 
-### Den genomförda ägargränsen
+### Ägargränsen vid den första parallella MIR-leveransen
 
 `compile.Session` äger frontendens typning, symboler, nåbarhetsordning,
 diagnostik, inlinebudget, Code, imports och cache-I/O. `next_source_into`

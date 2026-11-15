@@ -469,23 +469,16 @@ passaktivitet, inte ett bevis på dynamisk runtimevinst.
 
 ## Typad funktionsmodell och lokalt optimeringspass
 
-Standardbygget provar först en kompakt, typad och strukturerad
-[funktionsmodell](../selfhost/opt_ir.ddr). Den återanvänder samma arena mellan
-funktioner. [Parsern](../selfhost/opt_parse.ddr) godtar i första etappen
-anropsfria funktioner med `i32`, `i64`, `bool`, delade `&[]i64`-parametrar
-och exklusiva `&mut []i64`-parametrar:
-lokaler, tilldelningar, aritmetik, kortslutning, `if`, `while`, retur,
-`break`, `continue`, räknade `for`-loopar, arraylängd, indexläsning och
-elementskrivning. Högst åtta parametrar och en skalär eller tom retur
-stöds. Ägda värden, storleksändring eller byte av arraylagring, flyttal,
-osäker kod och anrop använder den befintliga vägen.
+Språkets typkontroll kan bygga en kompakt skalärmodell för lokaler,
+heltalsuttryck, kortslutning, villkor, loopar, retur och lån av stabila
+`i64`-arrayer. Modellen använder numeriska värden och lokala ID:n.
+Typkontrollen prövar den även när en tidig del av kroppen är skalär och
+en senare operation behöver den allmänna representationen. I det fallet
+överlämnar den redan kontrollerade operationer och fortsätter från aktuell
+källposition. Alla grenar kontrolleras, även vid konstanta villkor. Båda
+fallen går genom samma obligatoriska funktionssänkning och verifiering.
+[Typade noder](../selfhost/typed_body.ddr) och [funktionsmodellen](../selfhost/opt_ir.ddr).
 
-Alla grenar kontrolleras innan optimeringen börjar, även om ett villkor
-är konstant. Om modellen inte stöder kroppen eller når sin resursgräns
-tar den befintliga kompilatorn över, inklusive feldiagnostik. Gränserna
-är 4 096 token, 2 048 noder, 256 lokaler och konservativt djup 64.
-Denna strukturerade lokala modell bygger ingen egen SSA. Dess emission
-går vidare genom den gemensamma helfunktionskedjan och dess valbara SSA-steg.
 IR är ett tillåtet verktyg i kompilatorns fortsatta utveckling. Valet mellan
 strukturerad modell, SSA och lägre funktionsrepresentation ska styras av
 bevisbehov och uppmätt total byggtid. Snabb kompilering är kravet; att undvika

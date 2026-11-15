@@ -1,13 +1,13 @@
 # Frysta gränssnitt och parallell frontend
 
-Planen började vid källrevision `f025cb5`; baslinjen nedan skiljer dagens
-worker-lokala maskinsänkning från ännu inte införd parallell frontend.
-Nästa sammanhängande steg är att samma språkfrontend producerar en ägd, fullspråklig `TypedFunction` mot frysta
-deklarationsgränssnitt. Då kan även typad kroppssänkning till MIR och
-typkontroll bli isolerade funktionsjobb. Ingen andra parser eller ny
-begränsad språkö ska införas.
+Planen började vid källrevision `f025cb5`. Baslinjen och etappmålen nedan
+dokumenterar utgångsläget. Koden använder nu en fryst deklarationsvärld,
+funktionslokala typer, ordnad publicering av funktionsfakta och samma
+typade funktionsunderlag i seriell och parallell sänkning. Det separata
+skalärparsersteget har tagits bort. Den aktuella implementeringen och dess
+körvägar beskrivs i [kompilatorns översikt](../selfhost/README.md).
 
-## Vad som redan finns
+## Utgångsläge
 
 Standardkompilatorn på ARM64/macOS använder fyra workers. `--jobs=1..256`
 väljer storlek på ett begränsat taskfönster. Föräldern äger en `compile.Session`

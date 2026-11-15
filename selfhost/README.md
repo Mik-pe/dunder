@@ -54,23 +54,24 @@ Den kör på ARM64/macOS och kan skriva program för alla fyra mål. Den
 seriella ingången stöder bara `--jobs=1`. `check` och `--profile-compiler` går genom samma seriella Session-drivrutin utan
 scheduling. Profilens fasintervall förblir seriella väggtider.
 
-En återupptagbar `compile.Session` äger frontend, typning, symboler,
-nåbarhet, inlinebudget, provisorisk kod och cache-I/O. `next_source_into`
-samlar maskinord, etiketter, relokeringar och källannotationer per funktion.
-Arbetstråden läser dem ur batchens separata kolumner, bygger MIR och
-återanvänder privata arbetsarenor mellan funktionerna i batchen.
-Den sänker varje verifierad funktion till `mir_lower.ObjectData`.
-Föräldern validerar, cachar och länkar resultaten i källordning.
-Cacheträffar ger redan sänkta objekt. [Arbetstrådens indata och svar](mir_task.ddr)
+Deklarationsvärlden håller källtoken, namn, deklarerade typer och signaturer.
+Varje kropp har en egen typ- och platsarena. Typkontrollen registrerar bland
+annat anrop, lån, ägarskapsöverföringar, bieffekter och symbolbehov. Samordnaren
+sammanför dessa fakta i deklarationsordning.
 
-Taskfönstret omfattar högst `workers` samtidiga batcher i den gemensamma
-dispatchkön. Ordnad acceptans hämtar ägarskapet till varje svar med `await!`.
-[Taskkontrakt](../docs/tasks.md) och
-[historisk mätning med en och fyra workers](../benchmarks/2026-11-12-parallel-compiler/README.md).
+`next_typed_into` ger ett ägt funktionsunderlag eller ett redan sänkt
+cacheobjekt. Både den seriella ingången och arbetarna läser samma
+`TypedFunction` med lokala operationer, typreferenser och kontrollflöde.
+Efter överlämningen kan frontenden återanvända minnet för nästa kropp.
+Arbetarna verifierar MIR och sänker varje ny funktion till ett objekt.
+Samordnaren tar över objekten med `await!` och länkar dem i ordning.
+[Funktionsformat](mir_source.ddr) och [arbetarsvar](mir_task.ddr).
 
-[Frysta interface och ägda typade frontendjobb](../docs/parallel-frontend-plan.md)
-är nästa planerade gräns. Dagens typning och frontendemission är fortfarande
-Session-ägd; den planen är ännu ingen aktiv parallell frontend.
+Ett task-scope kan dela en fryst numerisk deklarationsbild och ge varje
+worker en egen återanvändbar arbetsyta. Kontrollen av oåtkomliga kroppar
+använder språkets vanliga typkontroll och rapporterar första felet i
+deklarationsordning. [Taskkontrakt](../docs/tasks.md) och
+[byggmätningar](../benchmarks/compiler/2026-11-15-function-pipeline-load/README.md).
 
 ## Helfunktionspass och valbar SSA
 
@@ -282,7 +283,7 @@ en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 | `mir_lower.ddr`, `mir_link.ddr` | Worker-lokal sänkning, numerisk ObjectData-transport, strukturell objektvalidering och ordnad sammanfogning. |
 | `record_take.ddr` | Normalisering vid transfer av unika fulluttryckstemporärer; lokaler flyttas inte. |
 | `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
-| `opt_ir.ddr`, `opt_parse.ddr` | Återanvändbar typad funktionsmodell och konservativ skalär parser. |
+| `opt_ir.ddr`, `typed_body.ddr` | Funktionslokala skalärnoder från språkets typkontroll. |
 | `opt_pass.ddr` | Begränsad förenkling och bevis för säkra index och ökningar. |
 | `opt_verify.ddr` | Typ-, scope-, kontrollflödes-, effekt- och strukturinvariants före och efter passet. |
 | `scalar_rules.ddr` | Gemensamma namn-, operator- och heltalsliteralregler för källparsrarna. |
