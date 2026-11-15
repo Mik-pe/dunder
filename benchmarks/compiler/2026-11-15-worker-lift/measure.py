@@ -40,11 +40,67 @@ def make_unique(work, generated, mixed):
     return directory / 'main.ddr'
 
 
+def large_function(work):
+    # Keep one value live through 4,096 dependent updates in a single CFG.
+    directory = work / 'large-function'
+    directory.mkdir()
+    source = directory / 'main.ddr'
+    lines = ['fn compute(x: i64) -> i64 {', '    var value := x']
+    x, value = 17, 17
+    for index in range(4096):
+        lines.append(f'    value = (value * 3 + x + {index}) % 1000003')
+        value = (value * 3 + x + index) % 1000003
+    lines.extend(['    value', '}', f'fn main() {{ print(compute({x})) }}'])
+    source.write_text('\n'.join(lines) + '\n')
+    return source, f'{value}\n'.encode()
+
+
+def varied_calls(work):
+    # Every group has distinct call targets, owned aggregates and borrowed
+    # mutation. Select both enum payload variants across the complete corpus.
+    directory = work / 'varied-calls'
+    directory.mkdir()
+    source = directory / 'main.ddr'
+    lines = ['struct Item { label: string, values: []i64 }',
+             'enum Reading { Count(i64), Text(string) }',
+             'fn score(reading: Reading) -> i64 {',
+             '    match reading { .Count(n) => n, .Text(s) => i64(s.len) }',
+             '}']
+    calls = []
+    expected = 0
+    for index in range(256):
+        label = f'item{index}'
+        lines.extend([
+            f'fn item{index}(n: i64) -> Item {{',
+            f'    Item {{ label: "{label}", values: [n, n + {index}] }}',
+            '}',
+            f'fn update{index}(a: &mut []i64, text: string) -> Reading {{',
+            f'    a[0] = a[0] + {index + 1}',
+            '    if a[0] % 3 == 0 { return Reading.Text(text) }',
+            '    Reading.Count(a[1])',
+            '}',
+            f'fn visit{index}(item: Item) -> i64 {{',
+            '    var a := item.values',
+            f'    reading := update{index}(&mut a, item.label)',
+            '    score(reading) + a[0] + item.values[0]',
+            '}'])
+        n = index + 7
+        calls.append(f'    total = total + visit{index}(item{index}({n}))')
+        updated = n + index + 1
+        score = len(label) if updated % 3 == 0 else n + index
+        expected += score + updated + n
+    lines.extend(['fn main() {', '    var total: i64 = 0', *calls, '    print(total)', '}'])
+    source.write_text('\n'.join(lines) + '\n')
+    return source, f'{expected}\n'.encode()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('baseline', 'candidate', 'source_root', 'tabell', 'report'):
         parser.add_argument(key, type=Path)
     parser.add_argument('--rounds', type=int, default=12)
+    parser.add_argument('--frontend-stress', action='store_true',
+                        help='also build one large function and a many-function typed call graph')
     args = parser.parse_args()
     if args.rounds < 1 or args.report.exists():
         parser.error('use a positive number of rounds and a new report path')
@@ -60,8 +116,13 @@ def main():
                  'selfhost': root / 'selfhost/main_parallel.ddr', 'tabell': tabell / 'main.ddr'}
         expected = {'generated': b'595500\n', 'unique': b'1095000\n', 'mixed': b'24000\n',
                     'tabell': (tabell / 'expected.csv').read_bytes()}
+        synthetic = {'generated', 'unique', 'mixed'}
+        if args.frontend_stress:
+            for name, generator in [('large-function', large_function), ('varied-calls', varied_calls)]:
+                cases[name], expected[name] = generator(work)
+                synthetic.add(name)
         for case, source in cases.items():
-            if case in ('generated', 'unique', 'mixed'):
+            if case in synthetic:
                 inputs = sorted(source.parent.glob('*.ddr'))
                 corpus_ids[case] = hashlib.sha256(b''.join(p.read_bytes() for p in inputs)).hexdigest()
             for i in range(-1, args.rounds):
@@ -76,8 +137,15 @@ def main():
                     timings = json.loads(result.stderr)
                     key = f'{case}-{variant}'
                     digest = performance.digest(binary)
-                    assert images.setdefault(key, digest) == digest
+                    if images.setdefault(key, digest) != digest:
+                        raise RuntimeError(f'non-reproducible image for {key}')
                     if i == -1:
+                        if args.frontend_stress:
+                            serial = work / 'one-worker'
+                            performance.command([compilers[variant], 'build', source,
+                                                 '--jobs=1', '-o', serial], cwd=root)
+                            if performance.digest(serial) != digest:
+                                raise RuntimeError(f'worker count changed image for {key}')
                         if case == 'selfhost':
                             hello = work / 'hello'
                             performance.command([binary, 'build', root / 'examples/hello.ddr', '-o', hello], cwd=root)
@@ -102,6 +170,16 @@ def main():
                       compiler_sha256={v: performance.digest(p) for v,p in compilers.items()},
                       corpus=corpus, corpus_sha256=corpus_ids, tabell_sha256=tabell_hashes,
                       image_sha256=images, samples=rows)
+        if args.frontend_stress:
+            report['build_jobs'] = 4
+            report['checked_identical_jobs'] = [1, 4]
+            report['generated_expected_stdout'] = {k: expected[k].decode() for k in sorted(synthetic)}
+            report['selfhost_sources_sha256'] = {
+                str(p.relative_to(root)): performance.digest(p)
+                for section in ('selfhost', 'stdlib') for p in sorted((root / section).glob('*.ddr'))
+            }
+            report['tabell_sha256'].update({p: performance.digest(tabell / p)
+                                            for p in ('expenses.csv', 'expected.csv')})
         args.report.write_text(json.dumps(report, indent=2) + '\n')
 
 

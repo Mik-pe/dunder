@@ -57,3 +57,11 @@ python3 benchmarks/compiler/2026-11-15-worker-lift/measure.py \
   /path/to/baseline/dunder /path/to/candidate/dunder \
   /path/to/source-at-6dffea8 /path/to/dunder-hundmat/tabell /tmp/dunder-report.json
 ```
+
+Flaggan `--frontend-stress` lägger till två korpusar för framtida jämförelser.
+Det första är en funktion med 4 096 beroende heltalsuppdateringar. Det andra
+har 256 grupper av anrop som skapar records med strängar och arrayer, muterar
+en lånad array och matchar en enum med två typer av nyttolast. Verktyget
+räknar ut förväntad standardutdata för båda och kontrollerar även att en och
+fyra workers producerar byteidentiska bilder för varje kompilator i alla sju
+byggfallen. Dessa kontroller ligger utanför mätintervallen.
