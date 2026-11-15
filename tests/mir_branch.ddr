@@ -1,0 +1,177 @@
+import ..selfhost.backend.arm64 as arm
+import ..selfhost.mir.mir
+import .fixtures.mir_machine as lift
+import ..selfhost.mir.mir_branch as branch
+import ..selfhost.mir.mir_lower as lower
+import ..selfhost.mir.mir_terminals as terms
+import ..selfhost.mir.mir_verify as verify
+
+fn model(code: &arm.Code) -> mir.Function {
+    sites: []i32 = []
+    mut f := mir.new()
+    assert(lift.lift(&mut f, &code, 0, 0, 0, &sites, 0))
+    assert(verify.verify(&mut f))
+    f
+}
+
+fn find_branch(f: &mir.Function, reloc: i32) -> i32 {
+    for op in 0..f.kinds.len {
+        if f.modes[op] != 2 && f.kinds[op] == 13 && f.reloc_kinds[op] == reloc { return op }
+    }
+    -1
+}
+
+@test fn threads_trampolines_deletes_fallthrough_jumps_and_lowers() {
+    mut code := arm.new()
+    l1 := arm.label(&mut code); l2 := arm.label(&mut code); done := arm.label(&mut code)
+    arm.begin_mir(&mut code, true)
+    arm.compare_immediate(&mut code, 1, 0, false)
+    arm.branch(&mut code, l1, 2) // b.eq l1
+    arm.imm(&mut code, 0, 1)
+    arm.branch(&mut code, done, 0) // b done (immediate next block over empty/jumped)
+    arm.mark(&mut code, l1); arm.branch(&mut code, l2, 0)
+    arm.mark(&mut code, l2); arm.branch(&mut code, done, 0)
+    arm.mark(&mut code, done); arm.imm(&mut code, 0, 7); arm.ret(&mut code)
+    arm.end_mir(&mut code)
+
+    mut f := model(&code)
+    mut w := branch.new()
+    assert(branch.optimize_into(&mut w, &mut f))
+    assert(f.verified)
+    // b.eq threaded from l1 -> l2 -> done
+    br := find_branch(&f, 2)
+    assert(br >= 0 && f.targets[br] == done)
+    mut obj := lower.new_object()
+    assert(lower.lower_into(&mut obj, &f))
+}
+
+@test fn fuses_short_circuit_or_chain_and_deletes_csets() {
+    mut code := arm.new()
+    done1 := arm.label(&mut code); next1 := arm.label(&mut code)
+    done2 := arm.label(&mut code); next2 := arm.label(&mut code)
+    then_lbl := arm.label(&mut code); else_lbl := arm.label(&mut code); end_lbl := arm.label(&mut code)
+    arm.begin_mir(&mut code, true)
+    // x1 == 32 || x1 == 10
+    arm.compare_immediate(&mut code, 1, 32, false); arm.set_condition(&mut code, 0, 0)
+    arm.branch(&mut code, done1, 19) // cbnz x0, done1
+    arm.mark(&mut code, next1)
+    arm.compare_immediate(&mut code, 1, 10, false); arm.set_condition(&mut code, 0, 0)
+    arm.mark(&mut code, done1)
+    arm.branch(&mut code, done2, 19) // cbnz x0, done2
+    arm.mark(&mut code, next2)
+    arm.compare_immediate(&mut code, 1, 9, false); arm.set_condition(&mut code, 0, 0)
+    arm.mark(&mut code, done2)
+    arm.branch(&mut code, else_lbl, 18) // cbz x0, else_lbl
+    arm.mark(&mut code, then_lbl); arm.imm(&mut code, 0, 1); arm.branch(&mut code, end_lbl, 0)
+    arm.mark(&mut code, else_lbl); arm.imm(&mut code, 0, 2); arm.branch(&mut code, end_lbl, 0)
+    arm.mark(&mut code, end_lbl); arm.ret(&mut code)
+    arm.end_mir(&mut code)
+
+    mut f := model(&code)
+    mut w := branch.new()
+    assert(branch.optimize_into(&mut w, &mut f))
+    assert(f.verified)
+    // All three csets must be deleted and replaced by b.eq -> then_lbl / b.ne -> else_lbl
+    for op in 0..f.kinds.len {
+        if f.modes[op] != 2 { assert(f.kinds[op] != 6) }
+    }
+    mut eq_count := 0; mut ne_count := 0
+    for op in 0..f.kinds.len {
+        if f.modes[op] != 2 && f.kinds[op] == 13 {
+            if f.reloc_kinds[op] == 2 { assert(f.targets[op] == then_lbl); eq_count = eq_count + 1 }
+            if f.reloc_kinds[op] == 3 { assert(f.targets[op] == else_lbl); ne_count = ne_count + 1 }
+        }
+    }
+    assert(eq_count == 2 && ne_count == 1)
+    mut obj := lower.new_object()
+    assert(lower.lower_into(&mut obj, &f))
+}
+
+@test fn keeps_cset_when_x0_is_live_after_branch() {
+    mut code := arm.new()
+    else_lbl := arm.label(&mut code)
+    arm.begin_mir(&mut code, true)
+    arm.compare_immediate(&mut code, 1, 5, false)
+    arm.set_condition(&mut code, 0, 0)
+    arm.branch(&mut code, else_lbl, 18) // cbz x0, else_lbl
+    arm.ret(&mut code) // reads x0!
+    arm.mark(&mut code, else_lbl)
+    arm.imm(&mut code, 0, 9); arm.ret(&mut code)
+    arm.end_mir(&mut code)
+
+    mut f := model(&code)
+    mut w := branch.new()
+    _ := branch.optimize_into(&mut w, &mut f)
+    assert(f.verified)
+    mut saw_cset := false
+    for op in 0..f.kinds.len {
+        if f.modes[op] != 2 && f.kinds[op] == 6 { saw_cset = true }
+    }
+    assert(saw_cset)
+}
+
+@test fn collapses_negated_comparison_and_inverts_branch_over_jump() {
+    mut code := arm.new()
+    skip := arm.label(&mut code); target := arm.label(&mut code); out := arm.label(&mut code)
+    arm.begin_mir(&mut code, true)
+    // if !(x1 < 10) { b target }
+    arm.compare_immediate(&mut code, 1, 10, false)
+    arm.set_condition(&mut code, 0, 11) // lt
+    arm.compare_register(&mut code, 0, 31)
+    arm.set_condition(&mut code, 0, 0) // eq -> !
+    arm.branch(&mut code, skip, 18) // cbz x0, skip
+    arm.branch(&mut code, target, 0) // b target
+    arm.mark(&mut code, skip); arm.imm(&mut code, 0, 0); arm.branch(&mut code, out, 0)
+    arm.mark(&mut code, target); arm.imm(&mut code, 0, 1); arm.branch(&mut code, out, 0)
+    arm.mark(&mut code, out); arm.ret(&mut code)
+    arm.end_mir(&mut code)
+
+    mut f := model(&code)
+    mut w := branch.new()
+    assert(branch.optimize_into(&mut w, &mut f))
+    assert(f.verified)
+    for op in 0..f.kinds.len {
+        if f.modes[op] != 2 { assert(f.kinds[op] != 6) }
+    }
+    // b.lt skip; b target -> b.ge target (reloc 12) + deleted b target
+    ge := find_branch(&f, 12)
+    assert(ge >= 0 && f.targets[ge] == target)
+}
+
+@test fn respects_unobserving_terminal_contract_only_with_version1() {
+    mut code := arm.new()
+    fail_lbl := arm.label(&mut code); ok_lbl := arm.label(&mut code)
+    arm.begin_mir(&mut code, true)
+    arm.compare_immediate(&mut code, 1, 0, false)
+    arm.set_condition(&mut code, 0, 10) // ge
+    arm.branch(&mut code, fail_lbl, 18) // external label
+    arm.mark(&mut code, ok_lbl); arm.imm(&mut code, 0, 0); arm.ret(&mut code)
+    arm.end_mir(&mut code)
+
+    mut f_raw := model(&code)
+    mut w := branch.new()
+    assert(!branch.optimize_into(&mut w, &mut f_raw))
+
+    mut f_term := model(&code)
+    t := terms.TerminalContext { version: 1, overflow: fail_lbl, zero: fail_lbl, assertion: fail_lbl, io: fail_lbl, bounds: fail_lbl, float_trap: fail_lbl }
+    assert(branch.optimize_with_terminals_into(&mut w, &mut f_term, &t))
+    assert(f_term.verified)
+    assert(find_branch(&f_term, 13) >= 0) // lt = ge^1 = 11 -> reloc 13
+}
+
+@test fn cyclic_trampolines_terminate_safely() {
+    mut code := arm.new()
+    l1 := arm.label(&mut code); l2 := arm.label(&mut code)
+    arm.begin_mir(&mut code, true)
+    arm.compare_immediate(&mut code, 1, 0, false)
+    arm.branch(&mut code, l1, 2)
+    arm.imm(&mut code, 0, 0); arm.ret(&mut code)
+    arm.mark(&mut code, l1); arm.branch(&mut code, l2, 0)
+    arm.mark(&mut code, l2); arm.branch(&mut code, l1, 0)
+    arm.end_mir(&mut code)
+
+    mut f := model(&code)
+    mut w := branch.new()
+    _ := branch.optimize_into(&mut w, &mut f)
+    assert(f.verified)
+}
