@@ -150,6 +150,41 @@ class Probe:
                                    'images_and_integer_counters_equal': True,
                                    'bindings_equal': bindings})
 
+    def reachable_frontend(self):
+        count = 42
+        bodies = [f'fn f{i}(x:i32)->i32{{var n:=x;for j in 0..3{{n=n+j}};n+{i}}}' for i in range(count)]
+        calls = [f'n=n+f{i}(1)' for i in range(count)]
+        source = self.case('reachable_frontend', '\n'.join(bodies + ['fn main(){var n:=0;', *calls, 'print(n)}']))
+        images = []
+        for driver in self.drivers:
+            name, _, jobs = driver
+            image = source.parent / name
+            result = self.run(self.command(driver, 'build', source, ['--timings=json', '-o', image]), source.parent)
+            frontend = json.loads(result.stderr)['frontend']
+            if jobs is not None:
+                require(frontend['scalar_bodies'] == count and 1 <= frontend['workers_used'] <= min(jobs, count), frontend)
+            images.append(digest(image))
+            self.execute(image, 'arm64-macos', '1029\n')
+        require(len(set(images)) == 1, images)
+        source.write_text(source.read_text().replace('n+7}', 'n+false}').replace('n+9}', 'n+false}'))
+        diagnostics = [self.run(self.command(d, 'build', source), source.parent, status=1).stderr for d in self.drivers]
+        require(len(set(diagnostics)) == 1 and ':8:' in diagnostics[0], diagnostics)
+        owned = [f'fn g{i}(s:string)->string{{s+"{i}"}}' for i in range(12)]
+        calls = [f's=g{i}(s)' for i in range(12)]
+        source = self.case('reachable_owned', '\n'.join(owned + ['fn main(){var s:="";', *calls, 'print(s)}']))
+        images = []
+        for driver in self.drivers:
+            name, _, jobs = driver
+            image = source.parent / name
+            result = self.run(self.command(driver, 'build', source, ['--timings=json', '-o', image]), source.parent)
+            frontend = json.loads(result.stderr)['frontend']
+            if jobs is not None:
+                require(frontend['general_bodies'] >= 12, frontend)
+            images.append(digest(image))
+            self.execute(image, 'arm64-macos', '01234567891011\n')
+        require(len(set(images)) == 1, images)
+        self.contracts.append({'case': 'reachable_frontend', 'worker_typed_functions': count})
+
     def diagnostics(self):
         sources = {
             'reachable_error': '''fn first(n:i64)->i64{var s:i64=0;for i in 0..8{s=s+n};s}
@@ -304,6 +339,7 @@ def main():
     try:
         for name, (source, expected) in CORE.items():
             probe.matrix(probe.case(name, source), expected, bindings=True)
+        probe.reachable_frontend()
         probe.diagnostics()
         probe.dead_body_order()
         probe.worker_expression_depth()
