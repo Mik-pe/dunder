@@ -162,12 +162,17 @@ programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
 
 Byggsamordnaren äger symboler, nåbarhetsordning och imports. Vid rena byggen
 kan den skicka redan nåbara funktioner till arbetarna medan tidigare
-funktionsobjekt sänks. Varje jobb får bara sin funktions token. Deklarerade
+funktionsobjekt sänks. Typning och MIR delar samma pool. `--jobs=4` tillåter sammanlagt
+fyra utestående workerjobb. Med flera tillgängliga kroppar kan samordnaren
+själv typa den första medan arbetarna typar de följande. Varje källjobb får
+bara sin funktions token. Deklarerade
 typer och signaturer delas genom en fryst bild och varje worker återanvänder
 sin egen session. Samordnaren tar emot typade resultat i samma ordning som
 den seriella genomgången och binder deras anrop, effekter och symbolbehov.
 `--timings=json` redovisar hur många skalära och generella kroppar som
 arbetarna typade och hur många frontend-arbetsytor som användes.
+`frontend.windows` räknar grupper av källjobb. `frontend.peak_total_jobs`
+räknar det största sammanlagda antalet utestående käll- och backendjobb.
 [Frontendarbetare](../selfhost/frontend_tasks.ddr)
 
 När nåbarheten är känd uppskattar samordnaren återstående typkontroll från

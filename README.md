@@ -134,29 +134,29 @@ händelsestyrd HTTP/1.1-server) finns i syskonrepot [dunder-hundmat](https://git
 Alla mål använder samma typkontroll, lånekontroll och ägarskapsregler. De tre
 nativa värdplattformarna har frysta kompilatorer för återbyggnad offline.
 
-På ARM64/macOS sköter huvudtråden frontend och typning. För alla workerantal
-använder kompilatorn språkets isolerade tasks för att bygga en lokal
-mellanrepresentation (MIR) ur varje funktions operationer och metadata.
-Varje worker verifierar, optimerar och sänker sina funktioner. Huvudtråden
-validerar och länkar resultaten i källordning. En och fyra workers producerar
-byteidentiska kompilatorer. `--jobs N` väljer 1–256 workers. `check` och `--profile-compiler` använder den seriella vägen.
+På ARM64/macOS delar typkontrollen och backenden en workerpool.
+Samordnaren kan typa en funktion medan arbetarna typar andra nåbara
+funktioner. Både seriella och parallella byggen läser typade operationer
+direkt för att bygga, verifiera och sänka MIR. Samordnaren binder symboler,
+rapporterar fel och länkar objekten i en bestämd ordning. En och fyra
+workers producerar byteidentiska kompilatorer. `--jobs N` väljer 1–256
+workers. `check` och `--profile-compiler` använder den seriella vägen.
 [Taskkontrakt och arbetsfördelning](docs/tasks.md)
 
-På Apple M5 byggde kompilatorn samma låsta kompilatorkälla på **459 ms**
-mot tidigare **548 ms**. Medianen omfattar tolv rena byggen med fyra workers,
-inklusive signering. Tre syntetiska program på 101 024 rader visar hur
-funktionskropparnas innehåll påverkar genomströmningen.
+På Apple M5 byggde den typade funktionskedjan det låsta kompilatorkorpuset
+på **359,79 ms**, jämfört med **468,17 ms** för revision `4585bc4`.
+Medianen omfattar tolv parade byggen med fyra workers, varm filsystemcache
+och avstängd inkrementell cache, inklusive signering och publicering.
 
-| Funktionskroppar | Byggtid, median | Källrader/s |
+| 101 024 källrader | Före, ms | Efter, ms |
 | --- | ---: | ---: |
-| Identiska efter namnupplösning | 80,87 ms | 1 249 269 |
-| En unik konstant per funktion | 148,74 ms | 679 219 |
-| Unika kroppar med blandade uttryck | 221,86 ms | 455 348 |
+| Identiska funktionskroppar | 82,13 | 76,14 |
+| En unik konstant per funktion | 146,57 | 135,61 |
+| Unika kroppar med blandade uttryck | 220,13 | 202,61 |
 
-Kompilatorn kan återanvända en verifierad skalär modell för identiska kroppar.
-I en separat kontroll byggdes den gamla kompilatorkällan med den nya
-kodgeneratorn. Då sjönk självbyggtiden med 13,0 % och de fem kontrollprogrammen
-blev byteidentiska. [Mätmetod, programmens körtider och rådata](benchmarks/compiler/2026-11-15-native-code/README.md)
+Den bygglokala skalärmodellcachen kan återanvända identiska kroppar.
+Mätserien omfattar även en stor enskild funktion, anrop med varierade typer
+och Tabells bygg- och körtid. [Mätmetod, körtider och rådata](benchmarks/compiler/2026-11-15-shared-frontend/README.md)
 
 Kör verifieringen från reporoten med Python 3.9+ och en C-kompilator.
 C-kompilatorn bygger provbiblioteket för ABI-kontrollen.

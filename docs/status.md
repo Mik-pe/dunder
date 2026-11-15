@@ -115,14 +115,17 @@ med oförändrad användarpolicy. Dessa siffror gäller v1, före gles v2 och
 [Källprov](../tools/test-ssa-source.py) ·
 [Omfattning](optimization.md#ssa-för-privata-framevärden).
 
-Huvudtråden äger frontend, typning, diagnostik, cache och inlinebudget.
-Arbetstrådarna tar emot funktionslokala maskinord och metadata i separata
-kolumner, bygger MIR lokalt och returnerar sänkta funktionsobjekt. Huvudtråden
-validerar och länkar objekten i källordning. På ARM64/macOS väljer `--jobs`
-1–256 workers. `check` och `--profile-compiler`
-använder den seriella kedjan. [Arbetsfördelning](optimization.md#seriell-session-och-taskbaserade-funktionspass)
+Huvudtråden äger diagnostik, symbolbindning, cache och slutlig länkning.
+På ARM64/macOS delar kontrollen av nåbara funktioner och sänkningen av
+typade operationer en pool med 1–256 workers. Källtypningen och MIR-byggaren
+är gemensamma för seriella och parallella byggen. `check` och
+`--profile-compiler` använder den seriella kedjan. [Arbetsfördelning](tasks.md#kompilatorn-som-taskkonsument)
 
-Med den nativa kodgeneratorn den 15 november 2026 tog bygget av den låsta
+I den senaste parade mätningen byggde den typade kedjan samma låsta
+kompilatorkälla på 359,79 ms mot 468,17 ms vid `4585bc4`. Det blandade
+korpuset tog 202,61 ms mot 220,13 ms. [Mätserie för den typade byggkedjan](../benchmarks/compiler/2026-11-15-shared-frontend/README.md)
+
+I den föregående mätningen av den nativa kodgeneratorn tog bygget av den låsta
 kompilatorkällan 458,91 ms på Apple M5. I runtimemätningen sjönk medianen för
 sortering med 26,3 % och för arraysummering med 5,6 %. Heltalsberäkning och
 UTF-8-text låg inom en procent av sin tidigare median.

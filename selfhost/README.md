@@ -74,7 +74,7 @@ deklarationernas ordning inom varje genomgång och uppdaterar nåbarhet
 och symboler innan nästa funktion publiceras. Kontroll av oåtkomliga kroppar
 använder språkets vanliga typkontroll och rapporterar första felet i
 deklarationsordning. [Taskkontrakt](../docs/tasks.md) och
-[byggmätningar](../benchmarks/compiler/2026-11-15-function-pipeline-load/README.md).
+[byggmätningar](../benchmarks/compiler/2026-11-15-shared-frontend/README.md).
 
 ## Helfunktionspass och valbar SSA
 
