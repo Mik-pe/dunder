@@ -209,11 +209,12 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
                        'sum=sum+step(1);' * 100 + 'sum}\n')
         source += 'fn main(){var total:=0;'
         source += ''.join('total=total+consume' + str(f) + '();' for f in range(20))
-        path = self.case('inline_frontier', source + 'print(total)}\n')
+        path = self.case('inline_caller_budgets', source + 'print(total)}\n')
         self.matrix(path, '4000\n', ('arm64-macos',))
         counts = self.images[-1]['counters']['inlining']
-        require(counts['calls'] > 0 and 61440 <= counts['estimated_words'] <= 65536,
-                ('fixture no longer reaches global inline frontier', counts))
+        require(0 < counts['calls'] < 20 * 100 and counts['calls'] % 20 == 0
+                and 65536 < counts['estimated_words'] <= 20 * 4096,
+                ('expected independent bounded growth in all twenty callers', counts))
 
     def cache(self):
         path = self.case('cache', CACHE_SOURCE.replace('INC', '1'))

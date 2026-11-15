@@ -742,11 +742,11 @@ def compiler_profile_controls(p):
         assert all(type(n) is int and n >= 0 for n in d['work'].values()), d
         assert d['covered'] == sum(d['phases'].values()), d
         assert d['covered'] + d['other'] == report['phases']['compiler'], report
-        assert d['calls']['declarations'] == 1 and d['calls']['model_parse'] >= 1, d
-        assert d['calls']['verify_pre'] >= 1 and d['calls']['legacy_body'] >= 1, d
+        assert d['calls']['declarations'] == 1 and d['calls']['legacy_body'] >= 1, d
         return d
 
     enabled = detail(result)
+    assert enabled['calls']['model_parse'] >= 1 and enabled['calls']['verify_pre'] >= 1
     assert enabled['calls']['allocation'] >= 1 and enabled['calls']['scalar_emit'] >= 1
     assert enabled['calls']['finalize'] == 1
     assert enabled['calls']['mir_pipeline'] == 2 and enabled['work']['mir_pipeline_operations'] > 0
@@ -756,7 +756,7 @@ def compiler_profile_controls(p):
                          '--profile-compiler', '--timings=json')
         assert checked.stdout == normal.stdout
         d = detail(checked)
-        for skipped in ('simplify','verify_post','allocation','scalar_emit','finalize','range_analysis','mir_pipeline'):
+        for skipped in ('model_parse','verify_pre','simplify','verify_post','allocation','scalar_emit','finalize','range_analysis','mir_pipeline'):
             assert d['phases'][skipped] == d['calls'][skipped] == 0, d
     off = p.call('build', 'profile.ddr', '--scalar-opt=off', '--profile-compiler',
                  '--timings=json', '-o', 'off')
