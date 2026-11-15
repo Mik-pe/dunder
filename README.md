@@ -53,7 +53,16 @@ För att installera kompilatorn lokalt i `~/.dunder/bin/dunder` (välj annan rot
 ```sh
 ./tools/install.sh
 export PATH="$HOME/.dunder/bin:$PATH"
+dunder --version
 ```
+
+Efter installationen visar `dunder upgrade --check` om den senaste
+publicerade GitHub-releasen har en annan binär för din värdplattform.
+Kör `dunder upgrade` för att installera den, eller välj en bestämd release
+med exempelvis `dunder upgrade --version v0.1.0`. Uppgraderingen hämtar
+arkivet med `curl`, packar upp det med `gzip` och verifierar SHA-256 före
+bytet. Releaser byggs lokalt och publiceras med `gh`.
+[Bygg och publicera en release](docs/releases.md)
 
 På ARM64/macOS verifierar skriptet först en seriell fixpunkt från fröet och
 bygger sedan den taskbaserade kompilatorn med byteidentiska självbyggen för
