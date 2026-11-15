@@ -112,8 +112,16 @@ def main():
             call(compiler, ['build', source, '-o', image, '--runtime-profile',
                             f'--ownership-opt={ownership}'], work)
             result = call(image, [], work)
-            if result.stdout != '4142\n' or json.loads(result.stderr)['counters']['retain_calls'] != 0:
-                raise AssertionError('effectful RHS retained an already owned left temporary')
+            counters = json.loads(result.stderr)['counters']
+            if result.stdout != '4142\n' or counters['retain_calls'] or counters['release_calls'] > 8:
+                raise AssertionError(f'unnecessary straight-line owner traffic: {counters}')
+        source.write_text('fn temp(i:i32)->string{i.str()} fn main(){var i:=0;'
+                          'while temp(i)!="4000"{i=i+1};print(i)}')
+        image = work / 'reentered-condition'
+        call(compiler, ['build', source, '-o', image, '--runtime-profile'], work)
+        result = call(image, [], work)
+        if result.stdout != '4000\n' or json.loads(result.stderr)['counters']['fresh_allocations'] > 2:
+            raise AssertionError('while condition leaked its previous temporary on the backedge')
         for number, (text, status) in enumerate(TRAPS):
             source.write_text(text)
             for target in (host,):
