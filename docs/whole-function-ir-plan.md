@@ -321,7 +321,7 @@ separat `dunder-serial` på alla värdar utan att ersätta `dunder`.
 ### Ägargränsen vid den första parallella MIR-leveransen
 
 `compile.Session` äger frontendens typning, symboler, nåbarhetsordning,
-diagnostik, inlinebudget, Code, imports och cache-I/O. `next_source_into`
+diagnostik, inlinebudget, Code, imports och cache-I/O. `next_typed_into`
 fortsätter källtraverseringen efter varje suspension. En ny funktion kan
 fångas i en ägd batch innan nästa funktion använder annotationskolumnerna.
 Den seriella konsumenten använder `next_into` för att lyfta samma maskinord
