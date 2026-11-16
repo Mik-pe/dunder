@@ -26,10 +26,13 @@ mellan indata och returens livslängd. Ägaren får inte flyttas, ersättas elle
 muteras på ett motstridigt sätt medan lånet används.
 
 Det tar bort behovet av tillfälliga strängägare för rena läsningar och gör
-JSON-, CSV- och HTTP-API:er möjliga utan materialiserade mellanbuffertar.
-Verifiera både avvisade livstidsfel och att vyerna behåller originalets
-adress utan allokering. Begränsade lån är redan möjliga under anrop;
-den här etappen utvidgar samma regel.
+JSON-, CSV-, typsnitts- och HTTP-API:er möjliga utan materialiserade
+mellanbuffertar eller `(data, off, length)`-triplar. Utvidga även lån till att
+omfatta temporära uttryck vid anrop (`&f()`, `&[1, 2]`) så att anropare slipper
+namnge engångsvariabler eller skriva dubbla `*_owned`-metoder. Verifiera både
+avvisade livstidsfel och att vyerna behåller originalets adress utan
+allokering. Begränsade lån är redan möjliga under anrop; den här etappen
+utvidgar samma regel.
 
 ## 3. Bättre ägda samlingar
 
@@ -45,10 +48,9 @@ modell med statisk specialisering och synliga ägarskapskrav. Nuvarande
 `Map` är `string → i64` och `Set` innehåller strängar.
 
 > **Forskningspunkt (`SoA`)**: Utvärdera attributdriven SoA-härledning
-> (t.ex. `@derive(SoA)` / `@soa`) så att logiska structar kan användas som
-> samlingar utan att ge upp kolumnlayout, tillsammans med samlade
-> ergonomi-, test-, grafik- och stdlib-anteckningar från `dunder-skrift` i
-> [soa-research-plan.md](soa-research-plan.md).
+> (t.ex. `@derive(SoA)` / `@soa`) som komplement till vanlig `[]Struct`, så att
+> logiska poster kan hanteras samlat utan att ge upp cachevänlig kolumnlayout.
+> Se [soa-research-plan.md](soa-research-plan.md).
 
 ## 4. Automatisk cleanup för externa resurser och typade fel
 
@@ -62,6 +64,40 @@ Inför sedan generiska `Result<T, E>` och enkel felpropagering. Samla dagens
 blandning av `.ok`/`.error`, enums och statuskoder utan att dölja resursägare
 på felvägen. Ett fallibelt konsumtionsanrop måste kunna lämna tillbaka en
 resurs som inte togs över.
+
+## 5. Språkergonomi, testdiagnostik och standardbibliotek
+
+Konkreta förbättringspunkter som bromsade iterationen vid utveckling och
+integration av `dunder-skrift` och `dunder-hundmat/dogfood/skrift`:
+
+- **Typsystem, inferens och syntax**:
+  - Kontextuell heltalstypning i arrayliteraler (`[1, 2]` med `:=` härleds till
+    `[]i64` och tvingar ofta `: []i32 = [...]`).
+  - Flerradiga `.method()`-kedjor utan krav på yttre parenteser (`unused value`)
+    samt stöd för flersatsiga block i `if ... { ... } else { ... }`-uttryck.
+  - Tydligare `rune`-literaler (i dag är `'A'` en `string`, vilket krävde
+    `rune(65)`), anonyma flervärdesreturer/tupler (för parsningshjälpare utan
+    engångsstructar) och mindre `.clone()`-tvång vid `.push()` av strängar.
+  - Kollisioner med reserverade ord som `var` och `len` i modul- och
+    parameternamn samt enhetligare hantering av relativa importer (`"../..."` vs
+    `..`).
+- **Diagnostik, `check` och format**:
+  - `assert(...)` i `dunder test` bör skriva ut källfil, radnummer, uttryck och
+    faktiska värden i stället för enbart `exit 104`.
+  - `dunder check <modul.ddr>` bör kunna typkontrollera biblioteksmoduler utan
+    `fn main()`.
+  - Formatangivelser i `f`-strängar (bl.a. hexutskrift) samt eventuella
+    `{ path = "..." }` / `examples/`-tillägg i `dunder.toml` (`[dependencies]`
+    och `std.bytes` big-endian-läsare är redan införda).
+- **Standardbibliotek och grafik-dogfood**:
+  - `std.parse`: flyttalsparsning (`float` / `f64`).
+  - `std.math`: gemensam modul (`clamp`, `min`, `max`, trigonometri) så att
+    dogfood-program inte behöver kopiera egna `math.ddr`.
+  - `std.json`: flyttalsfält (`field_f64`) och en bekvämare `Writer`-abstraktion
+    ovanpå lågnivåhjälparna (`write_str`, `field_i64`).
+  - I `dunder-hundmat` (`graphics/macos.ddr`): texturstöd / alfamaskatlas (så att
+    typsnitt inte behöver sändas som en quad per täckt pixel mot
+    vertexgränsen `100000`) samt headless pixel-readback i paritet med Vulkan.
 
 ## Leveransregel
 
