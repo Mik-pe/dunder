@@ -327,7 +327,12 @@ dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" test tests/suite.ddr
 "$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
 python3 tools/test-runtime-contracts.py "$dunder_bin"
+python3 tools/test-partial-moves.py "$dunder_bin" --inline-replace
 ```
+
+Fält-/replace-sviten korsbygger alla tre nativa mål och kör värdens bilder.
+`--runner TARGET=COMMAND` kan upprepas för att dessutom köra andra måls
+bilder i en lokal målmiljö. Sviten mäter inga prestanda.
 
 De körda programmen har förväntade värden, utskrifter och felutfall.
 Diagnostikfallen använder både giltiga exempel och källor som ska avvisas.
