@@ -60,7 +60,7 @@ dunder upgrade --check
 Efter installationen visar `dunder upgrade --check` om den senaste
 publicerade GitHub-releasen har en annan binär för din värdplattform.
 Kör `dunder upgrade` för att installera den, eller välj en bestämd release
-med exempelvis `dunder upgrade --version v0.1.0`. Uppgraderingen hämtar
+med exempelvis `dunder upgrade --version v0.2.0`. Uppgraderingen hämtar
 arkivet med `curl`, packar upp det med `gzip` och verifierar SHA-256 före
 bytet. Releaser byggs lokalt och publiceras med `gh`.
 [Bygg och publicera en release](docs/releases.md)
@@ -335,7 +335,15 @@ fn main() {
 iteration stöds. `next := values` flyttar ägarskapet. `values.clone()`
 ger en uttrycklig, oberoende kopia, även inne i structar och enums.
 Vanliga funktionsanrop och loopar lånar för läsning; `&mut values` lånar
-för uppdatering. En `move`-parameter tar över ägarskapet. Referenser kan ännu inte returneras eller lagras.
+för uppdatering. En `move`-parameter tar över ägarskapet. Oberoende structfält
+kan flyttas separat, och `replace(&mut place, replacement)` lämnar tillbaka
+den tidigare ägaren medan destinationen förblir initierad.
+
+Lokala läslån kan namnges med `r := &owner.field` eller `r := &values[index]`.
+`&values[start..end]` ger en arrayvy och `&text[start..end]` en UTF-8-kontrollerad
+bytevy, utan ny heapbuffert eller retain. Lånen gäller till blockslut.
+Temporärer som `&f()` och `&[1, 2]` kan lånas under ett anrop. Returnerade lån,
+referenser i aggregat och lokala `&mut` återstår.
 
 Map (`string` → `i64`), set av strängar, arrayalgoritmer, text, bytekodning,
 decimalparsning, hashning och SHA-256 är skrivna i Dunder och inbäddade i
@@ -343,6 +351,12 @@ kompilatorn. Generiska map/set återstår. Dynamiska buffertar har unikt
 ägarskap och återvinns vid tilldelning och scope-slut. Oföränderliga strängar
 delas med referensräkning. Läs [minnesmodellen](docs/memory.md) och
 [API, borrows och gränser](docs/standard.md).
+
+Nativa program kan också använda [HTTP-server och TLS-klient](docs/http.md),
+[SQLite med bundna parametrar](docs/sqlite.md) och processersättning i
+`std.process`. Klienten och databasen länkar mot systemets libcurl respektive
+SQLite. [Typade variadiska C-anrop](docs/ffi.md#anrop-och-adresser) följer
+respektive nativt ABI.
 
 ## Enums och match
 
@@ -515,8 +529,9 @@ Se [kompilatorns kodgenerering](docs/optimization.md).
 
 Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
 och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva
-skalärer och enums utan payload. Resursägande aggregat överförs till returvärdets ägare.
-Ett generiskt allokerings-API, lån som kan returneras och
+värden, strängar och enums utan payload. Resursägande aggregat överförs till
+returvärdets ägare. Returnerade lån, lokala skrivlån, generiska samlingar,
+automatisk cleanup av externa resurser, ett generiskt allokerings-API och
 användardefinierade iteratorer återstår. Normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
 

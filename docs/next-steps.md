@@ -44,8 +44,11 @@ lokalt. Lokala `&mut` och lokala lån av scratchlagring ingår inte.
 Lånetabellen använder ägartillståndets kanoniska platsidentiteter och den
 befintliga escapegrafen; den skapar ingen andra initieringsmodell.
 HTTP-servern i `dunder-hundmat` använder namngivna path- och bodyvyer utan
-offsetpar vid API-gränsen. Kompilatorns fragment-cache ska använda samma
-mekanism för rena läsningar efter fröuppdateringen. Riktad verifiering
+offsetpar vid API-gränsen. Kompilatorns fragment-cache lånar tokens och
+nyckel-, signatur- och payloadintervall ur en läst bytebuffert. En uttrycklig
+ägd hashbuffert bevarar cacheformatet utan en separat payloadsträng.
+Cacheproven ger 24 byteidentiska kalla/varma bilder, åtta värdkörningar och
+166 atomiska avvisningar, inklusive ogiltig UTF-8. Riktad verifiering
 kontrollerar adressidentitet, allokeringsräknare, livstidsfel, intervall och
 UTF-8 på de tre nativa målen, utan prestandamätningar.
 [Kontrakt](memory.md#lokala-läslån-och-intervallvyer) ·

@@ -44,30 +44,36 @@ som fristående ELF-binärer.
 
 ## Frönas ursprung
 
-De tre fröna kommer från Dunder-källrevision `7347cd62d081139b7cd0c47a21b86b27e61803fe`
-(Git-träd `55a8361918dd5eff994162c14da0c9a96f70aa18`). macOS-kompilatorn
-återbyggdes med föregående frysta macOS-frö från `f15e9f3` och producerade
-Linux-korsbilderna. Varje mål verifierades sedan med sin ingångsfil och
-byteidentiska självbyggen. Fröna använder ägarflyttar och lånade
-standardparametrar och förstår partiella structfältflyttar och
-`replace(&mut place, replacement)`, utöver `mut`, `move`, `@resource`,
-uttrycklig `.clone()`, `array.swap` och stränginterpolering. Därmed kan den
-tidiga självbyggkedjan överföra färdiga kod- och metadataarenor utan kloning
-och utan att öppna kompilatorns opaque `Session` för andra moduler.
+De tre fröna kommer från Dunder-källrevision `0d40b9c045b4249d84235f95abbd97665433fa2c`
+(Git-träd `226b6c270b092238b72a45a4a5806481d56b37fa`). macOS-kompilatorn
+återbyggdes med föregående frysta macOS-frö från `7347cd6` och producerade
+Linux-korsbilderna. Linuxmålen återbyggdes också direkt från sina föregående
+fröarkiv. Varje mål verifierades med sin ingångsfil och byteidentiska
+självbyggen. Fröna förstår lokala lexikala läslån, lånade array-/textintervall
+och temporära lån vid anrop, utöver partiella structfältflyttar,
+`replace(&mut place, replacement)`, `mut`, `move`, `@resource`, uttrycklig
+`.clone()`, `array.swap` och stränginterpolering. Därmed kan självbyggkedjan
+både överföra färdiga kod- och metadataarenor utan kloning och läsa
+fragmentcachens tokenstavningar och byteintervall genom lån. Den opaque
+`Session` behöver inte öppnas för andra moduler.
 Komprimeringen är `gzip -9 -n`.
 Tabellen anger SHA-256 för den **uppackade** kompilatorn. Syskonfilerna
 `*.sha256` kontrollerar de komprimerade filerna.
 
 | Värd | Ingångsfil | SHA-256 |
 | --- | --- | --- |
-| ARM64/macOS | `selfhost/main.ddr` | `72a911c59318821c7d9b301c5ab429609282e4096356dad9698d6828e87443e3` |
-| ARM64/Linux | `selfhost/linux.ddr` | `bfa1fe3d8cb4eb050974d247fee0bf084adf7cd93609a8449d9671da5ec961e8` |
-| x86-64/Linux | `selfhost/x86_linux.ddr` | `8d2d72139b69879a7248c5aeff0c1bdc77aabdd43b282b2db65c1fdcd289b92f` |
+| ARM64/macOS | `selfhost/main.ddr` | `148950f5ea666eacc3eff94c966a36a346fb53e1877d83517edb15fc1831214a` |
+| ARM64/Linux | `selfhost/linux.ddr` | `ef5005604098e21c6277ba7759dd8f8bf42b00220d7274b5e324f46ef3c2cc7f` |
+| x86-64/Linux | `selfhost/x86_linux.ddr` | `0598b64da6bb2bd1d4927bc958c8cdcd7b0a9b6e23c09ae492fab6d973d526c0` |
 
-Varje frö passerade 13 ägartillståndsgrupper samt 30 målbilder, 10 egna
-nativekörningar och 90 avvisade kontrakt i den riktade ägarskapssviten.
-Den täcker fältflyttar, `replace`, begränsad cleanup, inline C-/POD-lagring
-och index-/utvärderingsordning med optimeringar på och av.
+Varje frö passerade 14 ägartillståndsgrupper, 18 lånegrupper och 14 grupper
+för escapegrafen. Den riktade ägarskapssviten gav per frö 30 målbilder,
+10 egna nativekörningar och 90 avvisade kontrakt. Lånesviten gav 129 bilder,
+45 körningar och 105 avvisningar på macOS; respektive Linuxfrö gav
+126 bilder, 42 körningar och 102 avvisningar. Proven täcker fältflyttar,
+`replace`, cleanup, inline C-/POD-lagring, originaladresser utan extra
+allokering eller retain, intervall/UTF-8 och index-/utvärderingsordning
+med optimeringar på och av.
 Linuxfröna är byteidentiska med macOS-kompilatorns korsproducerade bilder
 och två efterföljande självbyggen på respektive Linux-värd. Linuxmålen
 kördes i lokala Docker-containrar; x86-64 emulerades på ARM64. macOS-fröets

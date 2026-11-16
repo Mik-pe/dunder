@@ -255,8 +255,12 @@ operatorresultat nollställer argumentens lånemetadata, så att ett nytt värde
 inte ärver en inre vys `borrow_home`. Nya uttrycksformer måste förbereda
 escapeanalysen; saknas bevis avvisas de. Källkontrollen körs även när
 funktionscachen återanvänder maskinkod. HTTP-servern i `dunder-hundmat`
-använder path-/bodyvyer; kompilatorns fragment-cache blir konsument efter
-fröuppdateringen. Inga nya prestandaanspråk följer av funktionaliteten.
+använder path-/bodyvyer. Kompilatorns fragment-cache lånar tokenstavningar
+och nyckel-/signatur-/payloadvyer ur en bytebuffert; hashningens ägda
+indatabuffert är uttrycklig och cacheformatet bevaras. Dess prov jämför 24
+kalla/varma bilder byte för byte, kör åtta värdprogram och kontrollerar 166
+atomiska avvisningar inklusive ogiltig UTF-8. Inga nya prestandaanspråk
+följer av funktionaliteten.
 
 CLI:t stöder även `run`, `test --affected`, tidsgränser för tester, manifest,
 målval och macOS-appar med resurssignering. Nativebyggen kan återanvända

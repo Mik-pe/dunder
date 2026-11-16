@@ -134,12 +134,16 @@ def main():
                         run([fixture, 'restore', bad, target, work / 'unused', 0, limit, 65536, 'no'], work, b'0\n')
                         rejections += 1
                     for label, raw in (('non-hex', b'g' + new_data[129:]),
+                                       ('invalid-utf8', b'\xff' + new_data[129:]),
+                                       ('utf8-payload', 'å'.encode() + new_data[130:]),
                                        ('unaligned', new_data[128:] + b'0'),
                                        ('header-only', new_data[128:184])):
                         bad = work / f'{target}-{label}.fn'; bad.write_bytes(signed(key, raw=raw))
                         run([fixture, 'restore', bad, target, work / 'unused', 0, limit, budget, 'no'], work, b'0\n')
                         rejections += 1
                     for label, raw in (('bad-signature', key + b'0'*64 + new_data[128:]),
+                                       ('utf8-signature-boundary', key + b'0'*63 + 'å'.encode() + new_data[129:]),
+                                       ('invalid-utf8-key', b'\xff' + new_data[1:]),
                                        ('wrong-key', b'0'*64 + new_data[64:]),
                                        ('short-file', new_data[:128]), ('empty-file', b'')):
                         bad = work / f'{target}-{label}.fn'; bad.write_bytes(raw)

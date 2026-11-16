@@ -114,10 +114,13 @@ för att verifiera adressidentitet.
 Funktionscachen hoppar inte över dessa kontroller: källkroppar och lån
 kontrolleras även när färdig maskinkod kan återanvändas. HTTP-servern i
 `dunder-hundmat` använder lokala path- och bodyvyer i stället för separata
-offsetpar vid API-gränsen. Kompilatorns fragment-cache är nästa konsument
-efter fröuppdateringen, för läsning av tokens och cacheinnehåll utan
-mellanägare. Detta är korrekthets- och representationskontrakt, utan nya
-prestandaanspråk. [Körbara låneprov](../tools/test-local-borrows.py).
+offsetpar vid API-gränsen. Kompilatorns fragment-cache lånar tokenstavningar
+och läser nyckel, signatur och payload som lokala vyer ur en bytebuffert.
+Hashningen bygger uttryckligen sin ägda indatabuffert; wireformatet är
+oförändrat. Cacheproven verifierar 24 byteidentiska kalla/varma bilder, åtta
+värdkörningar och 166 atomiska avvisningar, inklusive ogiltig UTF-8.
+Detta är korrekthets- och representationskontrakt, utan nya prestandaanspråk.
+[Körbara låneprov](../tools/test-local-borrows.py).
 
 Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och osynkroniserade data races. Första delmängden är enkeltrådad och tillåter varken delat muterbart globalt tillstånd, referenser gömda genom heltalskonvertering eller användardefinierade destruktorer. För trådar behöver vi senare specificera överföring av ägarskap och synkronisering innan ett säkert tråd-API kan släppas. Säkerheten vilar också på att kompilatorn och den lilla osäkra kärnan i allokator, containers och plattformsanrop är korrekta.
 
