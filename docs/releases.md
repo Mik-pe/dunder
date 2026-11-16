@@ -66,3 +66,11 @@ i manifestet. Nyckeln `<mål>.gz.sha256` gäller gzip-arkivet och
 
 `python3 tools/test-release.py` provar paketering, avbruten uppladdning och
 omkörning i en lokal Git-kopia med simulerad GitHub CLI.
+
+`python3 tools/test-upgrade.py KOMPILATOR` provar den nativa uppgraderaren
+mot lokala releasefiler. Både namngivna och senaste releaser måste ersätta
+filen atomiskt, bevara symlänken och lämna den tidigare filens innehåll
+orört för en redan öppen läsare. Även fixturens återställning använder en
+ny tempfil och namnbyte: skrivning över en tidigare körd Mach-O-fil kan
+lämna macOS signaturcache inkonsekvent. Se Apples
+[Updating Mac Software](https://developer.apple.com/documentation/security/updating-mac-software).

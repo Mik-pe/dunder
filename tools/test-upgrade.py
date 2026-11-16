@@ -36,6 +36,19 @@ def release(directory, version, binary, *, archive_bytes=None, archive_sha=None,
     )
 
 
+def install_fixture(source, destination):
+    # Signed executables need a fresh inode even when restoring a test fixture.
+    # An in-place copy can leave stale macOS kernel code-signing state behind.
+    descriptor, name = tempfile.mkstemp(prefix=".fixture-", dir=destination.parent)
+    os.close(descriptor)
+    staging = Path(name)
+    try:
+        shutil.copy2(source, staging)
+        staging.replace(destination)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
@@ -79,7 +92,7 @@ def main():
 
         installed = work / "build/selfhost" / host() / "dunder"
         installed.parent.mkdir(parents=True)
-        shutil.copy2(compiler, installed)
+        install_fixture(compiler, installed)
         symlink = work / "dunder link"
         symlink.symlink_to(installed)
         initial = installed.stat()
@@ -138,16 +151,31 @@ def main():
         env.pop("DUNDER_UPGRADE_URL")
         assert "already up to date" in cmd(symlink, "upgrade", "--check", "--force").stdout
         unchanged()
-        result = cmd(symlink, "upgrade", target_option)
+        with installed.open("rb") as previous:
+            result = cmd(symlink, "upgrade", target_option)
+            assert previous.read() == original, "explicit upgrade modified the previous inode"
         assert f"upgraded {installed} to {target_version} ({host()})" in result.stdout, result
         assert installed.read_bytes() == new and installed.stat().st_ino != initial.st_ino
         assert symlink.is_symlink() and [p.name for p in installed.parent.iterdir()] == ["dunder"]
         assert cmd(symlink, "--version").stdout == f"dunder {target_version} ({host()})\n"
 
-        shutil.copy2(compiler, installed)
+        upgraded = installed.stat()
+        with installed.open("rb") as previous:
+            install_fixture(compiler, installed)
+            assert previous.read() == new, "fixture restore modified the previous inode"
+        restored = installed.stat()
+        assert (restored.st_dev, restored.st_ino) != (upgraded.st_dev, upgraded.st_ino)
+        assert installed.read_bytes() == original
+        assert cmd(symlink, "--version").stdout == version_text
         release(latest, target_version, new)
-        result = cmd(symlink, "upgrade")
+        with installed.open("rb") as previous:
+            result = cmd(symlink, "upgrade")
+            assert previous.read() == original, "latest upgrade modified the previous inode"
         assert f"to {target_version}" in result.stdout and installed.read_bytes() == new
+        published = installed.stat()
+        assert (published.st_dev, published.st_ino) != (restored.st_dev, restored.st_ino)
+        assert cmd(symlink, "--version").stdout == f"dunder {target_version} ({host()})\n"
+        assert symlink.is_symlink() and [p.name for p in installed.parent.iterdir()] == ["dunder"]
         assert not list(scratch.iterdir())
     print("PASS test-upgrade")
 
