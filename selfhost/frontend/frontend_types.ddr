@@ -148,6 +148,16 @@ pub fn scalar_element(reg: &TypeRegistry, ty: i32) -> bool {
     kind := type_kind(&reg, ty); kind == 3 || kind == 22
 }
 
+// Ordinary collections store aggregates as owned boxed slots. This predicate
+// deliberately differs from the flat-element certificate used by task Data.
+// Callable values are static function pointers, with no captured local state.
+pub fn array_element(reg: &TypeRegistry, ty: i32) -> bool {
+    if ty <= 0 || ty >= reg.declared.type_kinds.len + reg.body.type_kinds.len { return false }
+    kind := type_kind(&reg, ty)
+    if kind == 0 { return ty <= 13 }
+    kind == 1 || kind == 2 || kind == 3 || kind == 6 || kind == 7 || kind == 8 || kind == 9 || kind == 22
+}
+
 pub fn foreign_scalar(reg: &TypeRegistry, ty: i32) -> bool {
     ty == 1 || ty == 2 || (ty >= 6 && ty <= 13) || type_kind(&reg, ty) == 8
 }
@@ -210,21 +220,28 @@ fn move_only_at(reg: &TypeRegistry, ty: i32, depth: i32) -> bool {
 
 // Resource markers describe external identities (fd, pid, device handle),
 // which a byte/field clone cannot duplicate. Containers inherit the restriction.
-pub fn cloneable(reg: &TypeRegistry, ty: i32) -> bool { cloneable_at(&reg, ty, 0) }
-fn cloneable_at(reg: &TypeRegistry, ty: i32, depth: i32) -> bool {
-    if ty < reg.resource.len && reg.resource[ty] { return false }
-    if depth >= 128 { return false }
-    kind := type_kind(&reg, ty)
-    if kind == 1 || kind == 6 || kind == 10 { return cloneable_at(&reg, type_base(&reg, ty), depth + 1) }
-    if kind != 2 && kind != 7 { return true }
-    first := type_start(&reg, ty)
-    for member in first..first + type_count(&reg, ty) {
-        if kind == 2 {
-            if !cloneable_at(&reg, reg.field_types[member], depth + 1) { return false }
-        } else {
-            payload := reg.payload_starts[member]
-            for item in 0..reg.payload_counts[member] {
-                if !cloneable_at(&reg, reg.payload_types[payload + item], depth + 1) { return false }
+pub fn cloneable(reg: &TypeRegistry, ty: i32) -> bool {
+    count := reg.declared.type_kinds.len + reg.body.type_kinds.len
+    if ty < 0 || ty >= count { return false }
+    mut visited: []bool = []
+    for i in 0..count { visited.push(false) }
+    mut pending: []i32 = [ty]
+    while pending.len > 0 {
+        current := pending.pop()
+        if current < 0 || current >= count { return false }
+        if visited[current] { continue }
+        visited[current] = true
+        if current < reg.resource.len && reg.resource[current] { return false }
+        kind := type_kind(&reg, current)
+        if collection_kind(kind) { pending.push(type_base(&reg, current)) }
+        else if kind == 2 || kind == 7 {
+            first := type_start(&reg, current)
+            for member in first..first + type_count(&reg, current) {
+                if kind == 2 { pending.push(reg.field_types[member]) }
+                else {
+                    payload := reg.payload_starts[member]
+                    for item in 0..reg.payload_counts[member] { pending.push(reg.payload_types[payload + item]) }
+                }
             }
         }
     }
@@ -345,8 +362,8 @@ pub fn find_or_check_compound(reg: &mut TypeRegistry, kind: i32, base: i32) -> i
     if (kind == 4 || kind == 5) && (base == 0 || type_kind(&reg, base) == 4 || type_kind(&reg, base) == 5) {
         set_error(&mut reg, move "reference a value type"); return -2
     }
-    if kind == 1 && !scalar_element(&reg, base) {
-        set_error(&mut reg, move "arrays of aggregate elements are not supported by this compiler")
+    if kind == 1 && !array_element(&reg, base) {
+        set_error(&mut reg, move "array elements must be storable values (not (), borrows, ranges, iterators, scratch or task scopes)"); return -2
     }
     known := find_compound(&reg.declared, kind, base)
     if known >= 0 || !reg.sealed { return known }
@@ -389,8 +406,11 @@ fn append_compound(reg: &mut Shapes, kind: i32, base: i32) -> i32 {
 }
 
 pub fn find_or_check_fixed(reg: &mut TypeRegistry, platform: i32, base: i32, length: i32) -> i32 {
-    if !scalar_element(&reg, base) {
-        set_error(&mut reg, move "arrays of aggregate elements are not supported by this compiler")
+    if !array_element(&reg, base) {
+        set_error(&mut reg, move "array elements must be storable values (not (), borrows, ranges, iterators, scratch or task scopes)"); return -2
+    }
+    if length < 0 {
+        set_error(&mut reg, move "fixed array length must be nonnegative"); return -2
     }
     if length > 65536 / scalar_bytes(&reg, base, platform) {
         set_error(&mut reg, move "fixed array exceeds 65536 bytes"); return -2
@@ -578,7 +598,11 @@ pub fn c_layout(reg: &mut TypeRegistry, platform: i32, ty: i32) {
     if is_c_record(&reg, ty) {
         first := reg.declared.type_starts[ty]
         for field_index in first..first + type_count(&reg, ty) {
-            ft := reg.field_types[field_index]; c_layout(&mut reg, platform, ft)
+            ft := reg.field_types[field_index]
+            if type_kind(&reg, ft) == 6 && !fixed_pod(&reg, ft) {
+                set_error(&mut reg, move "C record fields require fixed arrays of unmanaged scalar elements"); return
+            }
+            c_layout(&mut reg, platform, ft)
             if reg.error != "" { return }
             child := reg.declared.c_aligns[ft]
             if size > 2147483647 - child || reg.declared.c_sizes[ft] > 2147483647 - child - size {
@@ -620,8 +644,21 @@ pub fn layout_bytes(reg: &mut TypeRegistry, platform: i32, ty: i32, depth: i32, 
     kind := reg.declared.type_kinds[ty]
     if kind == 1 { return 24 }
     if kind == 6 {
-        bytes := reg.declared.type_counts[ty] * scalar_bytes(&reg, reg.declared.type_bases[ty], platform)
-        if bytes == 0 { return 1 }; return bytes
+        count := reg.declared.type_counts[ty]; base := reg.declared.type_bases[ty]
+        width := scalar_bytes(&reg, base, platform)
+        if count < 0 || count > 65536 / width {
+            set_error(&mut reg, move "fixed array exceeds 65536 bytes"); return 1
+        }
+        // Fixed arrays contain a known number of values, so positive lengths
+        // must not hide a recursive inline type behind their boxed slots.
+        sizes[ty] = -1
+        if count > 0 {
+            child := layout_bytes(&mut reg, platform, base, depth + 1, &mut sizes)
+            if reg.error != "" { return 1 }
+        }
+        mut bytes := count * width
+        if bytes == 0 { bytes = 1 }
+        sizes[ty] = bytes; return bytes
     }
     if kind != 2 && kind != 7 {
         if ty == 0 || ty == 14 || kind == 10 { set_error(&mut reg, move "invalid stored field type"); return 1 }
@@ -662,10 +699,10 @@ pub fn validate_layouts(reg: &mut TypeRegistry, platform: i32) {
     for ty in 0..sizes.len {
         if reg.error != "" { return }
         kind := reg.declared.type_kinds[ty]
-        if (kind == 1 || kind == 6) && !scalar_element(&reg, reg.declared.type_bases[ty]) {
-            set_error(&mut reg, move "arrays of aggregate elements are not supported by this compiler"); return
+        if (kind == 1 || kind == 6) && !array_element(&reg, reg.declared.type_bases[ty]) {
+            set_error(&mut reg, move "array elements must be storable values (not (), borrows, ranges, iterators, scratch or task scopes)"); return
         }
-        if kind == 2 || kind == 7 {
+        if kind == 2 || kind == 7 || kind == 6 {
             size := layout_bytes(&mut reg, platform, ty, 0, &mut sizes)
             if size > 65536 { set_error(&mut reg, move "inline value exceeds 65536 bytes") }
         }
@@ -698,6 +735,164 @@ pub fn scratch_width(reg: &TypeRegistry, ty: i32, platform: i32) -> i32 {
     }
     if ty < 1 || ty > 12 || ty == 4 { return 0 }
     foreign_width(storage_type(&reg, ty, platform))
+}
+
+fn array_test_registry() -> TypeRegistry {
+    mut reg := new_registry()
+    for name in ["()", "i32", "i64", "bool", "string", "rune", "f32", "f64", "u8", "u16", "u32", "u64", "usize", "ptr", "range"] {
+        _ := add_type(&mut reg, name, 0, 0)
+    }
+    reg
+}
+fn array_test_fields(reg: &mut TypeRegistry, ty: i32, fields: &[]i32) {
+    reg.declared.type_starts[ty] = reg.field_types.len; reg.declared.type_counts[ty] = fields.len
+    for i in 0..fields.len {
+        reg.field_names.push("field_" + i.str()); reg.field_types.push(fields[i]); reg.field_values.push(0)
+        reg.payload_starts.push(reg.payload_types.len); reg.payload_counts.push(0)
+    }
+}
+
+@test fn aggregate_array_elements_are_storable_without_extending_task_data_or_c_pod() {
+    mut reg := array_test_registry()
+    record := add_type(&mut reg, "Record", 2, 0)
+    array_test_fields(&mut reg, record, &[1])
+    tag := add_type(&mut reg, "Tag", 3, 0)
+    payload := add_type(&mut reg, "Payload", 7, 0)
+    dynamic := insert_compound(&mut reg, 1, record)
+    fixed := insert_fixed(&mut reg, record, 3)
+    nested := insert_fixed(&mut reg, dynamic, 2)
+    args: []i32 = [1]
+    native_fn := insert_callable(&mut reg, &args, record, 9)
+    foreign_fn := insert_callable(&mut reg, &args, 1, 8)
+    task := insert_compound(&mut reg, 22, record)
+    for ty in [1, 3, 4, 13, record, tag, payload, dynamic, fixed, nested, native_fn, foreign_fn, task] {
+        assert(array_element(&reg, ty))
+        assert(find_or_check_compound(&mut reg, 1, ty) != -2 && reg.error == "")
+        assert(find_or_check_fixed(&mut reg, 0, ty, 2) != -2 && reg.error == "")
+    }
+    assert(!scalar_element(&reg, record) && !scalar_element(&reg, payload) && !scalar_element(&reg, dynamic))
+    assert(!scalar_element(&reg, native_fn) && !scalar_element(&reg, foreign_fn) && scalar_element(&reg, task))
+    assert(!fixed_pod(&reg, fixed) && !fixed_pod(&reg, nested))
+    fixed_native_fn := insert_fixed(&mut reg, native_fn, 2)
+    assert(!fixed_pod(&reg, fixed_native_fn))
+    fixed_c_fn := insert_fixed(&mut reg, foreign_fn, 2)
+    fixed_scalar := insert_fixed(&mut reg, 2, 2)
+    assert(fixed_pod(&reg, fixed_c_fn) && fixed_pod(&reg, fixed_scalar))
+}
+
+@test fn array_elements_reject_nonstorable_lifetimes_in_declarations_and_body_arenas() {
+    mut reg := array_test_registry()
+    shared := insert_compound(&mut reg, 4, 1); exclusive := insert_compound(&mut reg, 5, 1)
+    iterator := insert_compound(&mut reg, 10, 1)
+    region := insert_compound(&mut reg, 20, 1); scratch := insert_compound(&mut reg, 21, 1)
+    scope := insert_compound(&mut reg, 23, 1)
+    for ty in [0, 14, shared, exclusive, iterator, region, scratch, scope] {
+        assert(!array_element(&reg, ty))
+        assert(find_or_check_compound(&mut reg, 1, ty) == -2)
+        assert(reg.error == "array elements must be storable values (not (), borrows, ranges, iterators, scratch or task scopes)")
+        reg.error = ""
+        assert(find_or_check_fixed(&mut reg, 0, ty, 0) == -2)
+        reg.error = ""
+    }
+    seal(&mut reg, 0); assert(reg.error == "")
+    local_reference := insert_compound(&mut reg, 4, 4)
+    assert(!array_element(&reg, local_reference))
+    assert(find_or_check_compound(&mut reg, 1, local_reference) == -2)
+    reg.error = ""
+    assert(find_or_check_fixed(&mut reg, 0, 2, -1) == -2 && reg.error == "fixed array length must be nonnegative")
+    reg.error = ""
+    assert(find_or_check_fixed(&mut reg, 0, 2, 8193) == -2 && reg.error == "fixed array exceeds 65536 bytes")
+    // Layout validation also checks metadata restored or inserted without a
+    // parser lookup, so a forbidden element cannot hide in a nested array.
+    mut restored := array_test_registry()
+    borrow := insert_compound(&mut restored, 4, 1)
+    invalid := insert_compound(&mut restored, 1, borrow)
+    outer := insert_compound(&mut restored, 1, invalid)
+    validate_layouts(&mut restored, 0)
+    assert(restored.error == "array elements must be storable values (not (), borrows, ranges, iterators, scratch or task scopes)")
+}
+
+@test fn recursive_collection_cloneability_visits_all_reachable_resources_once() {
+    mut reg := array_test_registry()
+    node := add_type(&mut reg, "Node", 2, 0)
+    children := insert_compound(&mut reg, 1, node)
+    array_test_fields(&mut reg, node, &[children])
+    unused := add_type(&mut reg, "UnusedResource", 2, 0); reg.resource[unused] = true
+    array_test_fields(&mut reg, unused, &[1])
+    assert(cloneable(&reg, node) && cloneable(&reg, children) && move_only(&reg, node))
+    validate_layouts(&mut reg, 0); assert(reg.error == "")
+    resource_first := reg.field_types.len
+    array_test_fields(&mut reg, node, &[unused, children])
+    assert(reg.declared.type_starts[node] == resource_first)
+    assert(!cloneable(&reg, node) && !cloneable(&reg, children))
+    // Borrowed values and callable signatures carry no owned resource edge.
+    reference := insert_compound(&mut reg, 4, node)
+    args: []i32 = [reference]
+    function := insert_callable(&mut reg, &args, node, 9)
+    assert(cloneable(&reg, reference) && cloneable(&reg, function))
+    result := add_type(&mut reg, "Result", 7, 0)
+    reg.declared.type_starts[result] = reg.field_types.len; reg.declared.type_counts[result] = 1
+    reg.field_names.push("Value"); reg.field_types.push(0); reg.field_values.push(0)
+    reg.payload_starts.push(reg.payload_types.len); reg.payload_counts.push(1); reg.payload_types.push(node)
+    assert(!cloneable(&reg, result))
+    // A deep acyclic collection graph has no arbitrary cloneability cutoff.
+    mut deep := 1
+    for i in 0..256 { deep = insert_compound(&mut reg, 1, deep) }
+    assert(cloneable(&reg, deep))
+    mut deep_resource := unused
+    for i in 0..256 { deep_resource = insert_compound(&mut reg, 1, deep_resource) }
+    assert(!cloneable(&reg, deep_resource))
+}
+
+@test fn positive_fixed_array_lengths_cannot_hide_inline_value_cycles() {
+    mut recursive := array_test_registry()
+    node := add_type(&mut recursive, "Node", 2, 0)
+    children := insert_fixed(&mut recursive, node, 1)
+    array_test_fields(&mut recursive, node, &[children])
+    validate_layouts(&mut recursive, 0)
+    assert(recursive.error == "recursive or excessively nested inline value type")
+
+    mut empty := array_test_registry()
+    terminal := add_type(&mut empty, "Terminal", 2, 0)
+    zero_children := insert_fixed(&mut empty, terminal, 0)
+    array_test_fields(&mut empty, terminal, &[zero_children])
+    validate_layouts(&mut empty, 0)
+    assert(empty.error == "" && cloneable(&empty, terminal))
+
+    mut boxed := array_test_registry()
+    record := add_type(&mut boxed, "Record", 2, 0)
+    array_test_fields(&mut boxed, record, &[2, 2])
+    records := insert_fixed(&mut boxed, record, 8192)
+    validate_layouts(&mut boxed, 0); assert(boxed.error == "")
+    mut sizes: []i32 = []; for kind in boxed.declared.type_kinds { sizes.push(0) }
+    assert(layout_bytes(&mut boxed, 0, records, 0, &mut sizes) == 65536)
+}
+
+@test fn c_record_arrays_are_boxed_ordinary_values_but_not_inline_c_record_fields() {
+    mut reg := array_test_registry()
+    record := add_type(&mut reg, "CRecord", 2, 0); reg.c_record[record] = true
+    array_test_fields(&mut reg, record, &[2])
+    records := insert_fixed(&mut reg, record, 3)
+    assert(array_element(&reg, record) && !fixed_pod(&reg, records))
+    seal(&mut reg, 0)
+    assert(reg.error == "" && c_size(&reg, records) == 24 && c_align(&reg, records) == 8)
+    validate_layouts(&mut reg, 0); assert(reg.error == "")
+
+    mut inline_reg := array_test_registry()
+    child := add_type(&mut inline_reg, "Child", 2, 0); inline_reg.c_record[child] = true
+    array_test_fields(&mut inline_reg, child, &[2])
+    elements := insert_fixed(&mut inline_reg, child, 2)
+    parent := add_type(&mut inline_reg, "Parent", 2, 0); inline_reg.c_record[parent] = true
+    array_test_fields(&mut inline_reg, parent, &[elements])
+    seal(&mut inline_reg, 0)
+    assert(inline_reg.error == "C record fields require fixed arrays of unmanaged scalar elements")
+
+    mut scalar_reg := array_test_registry()
+    floats := insert_fixed(&mut scalar_reg, 6, 4)
+    vector := add_type(&mut scalar_reg, "Vector", 2, 0); scalar_reg.c_record[vector] = true
+    array_test_fields(&mut scalar_reg, vector, &[floats])
+    seal(&mut scalar_reg, 0)
+    assert(scalar_reg.error == "" && c_size(&scalar_reg, vector) == 16 && hfa(&scalar_reg, vector, 0) == 4)
 }
 
 @test fn function_type_references_expire_without_extending_declarations() {

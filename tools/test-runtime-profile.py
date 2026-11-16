@@ -168,8 +168,12 @@ def main():
                                               record_clone_bytes=80).items():
                         assert values[key] == expected, (key, values)
                 elif name == 'buffers':
-                    for key, expected in dict(allocation_count=6, requested_bytes=123,
-                                              size_class_payload_bytes=176, array_clone_calls=1,
+                    # Requests: string length word + 2 bytes, two 48-byte
+                    # descriptors, two minimum-8 buffers, and reserve(33).
+                    # Their payload bins are 16,64,16,64,16,64; copying still
+                    # accounts for 2 sliced + 3 cloned + 3 reserved bytes.
+                    for key, expected in dict(allocation_count=6, requested_bytes=155,
+                                              size_class_payload_bytes=240, array_clone_calls=1,
                                               array_clone_bytes=3, string_slice_calls=1,
                                               string_slice_bytes=2, copy_bytes=8,
                                               record_construct_calls=0, record_clone_calls=0).items():

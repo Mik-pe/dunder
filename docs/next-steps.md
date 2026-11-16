@@ -1,7 +1,8 @@
 # Nästa steg för Dunder
 
 Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 och 2a är
-implementerade; etapp 2b och återstående delar av 3–5 är utvecklingsplanen.
+implementerade, liksom stöd för sammansatta arrayelement i etapp 3.
+Etapp 2b och återstående delar av 3–5 är utvecklingsplanen.
 Nuvarande kontrakt finns i
 [minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
 [status](status.md).
@@ -63,12 +64,17 @@ JSON-, CSV-, typsnitts- och HTTP-API:er som kan returnera vyer utan nya
 buffertar eller `(data, off, length)`-tripplar. Lokala skrivlån och lån av
 scratchlagring kräver också uttryckliga kontrakt innan de utvidgas.
 
-## 3. Bättre ägda samlingar — planerat
+## 3. Bättre ägda samlingar — delvis implementerat
 
-Utöka arrayelement till structar, payload-enums och andra arrayer,
-med samma flytt-, klonings- och cleanupregler som fristående värden.
-Det ersätter parallella fältarrayer i bland annat HTTP-servern och
-kompilatorn. Lägg till ägd borttagning som flyttar ut ett element utan en
+Arrayer stöder structar, payload-enums och andra fasta eller dynamiska
+arrayer, med samma flytt-, klonings- och cleanupregler som fristående
+värden. Lånade intervall och iteration bevarar elementens typ och
+ägarskap. Kloning följer ägda barn rekursivt, även genom ändliga
+rekursiva träd; nåbara `@resource`-värden förbjuder kloning.
+`clear` städar levande element och `pop` flyttar ut det sista.
+
+Detta gör det möjligt att ersätta parallella fältarrayer där en samlad
+post passar bättre. Lägg till borttagning som flyttar ut ett element utan en
 oinitierad lucka; `swap` följt av `pop` fungerar redan när ordningen får
 ändras.
 

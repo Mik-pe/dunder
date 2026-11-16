@@ -96,6 +96,16 @@ Tilldelning utvärderar det nya värdet innan det gamla släpps. Varje ägd
 resurs frigörs en gång när dess ägare lämnar sitt scope. `pop` tar över det
 borttagna elementet. `clear` släpper elementen och behåller kapaciteten.
 
+Element kan vara structar, enums med payload eller andra fasta och
+dynamiska arrayer. Dessa värden använder samma klonings- och cleanupregler
+i en samling som utanför den. Ändliga rekursiva värden, exempelvis
+`Node { children: []Node }`, kan klonas. Om ett nåbart barn är en
+`@resource` avvisas kloning och upprepade arrayliteraler statiskt.
+`for element in &values` lånar ägda element; `for element in move values`
+flyttar dem. Referenser och scratchvyer får inte lagras som arrayelement.
+Vanliga arrayer av C-layout-structar stöds, medan fasta inline-arrayer
+inne i en C-layout-struct fortfarande kräver skalära element.
+
 Giltiga dynamiska arrayer har `0 <= len <= cap <= i32::MAX`, oberoende av
 minnespoolens storlek. Runtime kontrollerar önskat antal före växande
 allokering och begränsar dubblerad kapacitet till denna gräns. När en
@@ -307,15 +317,18 @@ En vy har fast längd. Den tillåter indexering och `len` och dess element
 kan lånas under ett funktionsanrop. Element kan vara tal, `bool`, `rune`
 eller structar med motsvarande värdefält. En kopia av en nod är ett vanligt
 värde. En hel vy kan delas med en funktion som tar ett delat arraylån för
-en tillåten arraytyp. Kompilatorn avvisar tilldelning, retur, råadresser och
+en representation som matchar parameterlagringen. Vanliga structelement
+lagras inline i regionen och som pekarplatser i en ägd array, så hela
+scratchvyer av sådana structar kan inte lånas som `&[]Struct`.
+Kompilatorn avvisar tilldelning, retur, råadresser och
 storleksändringar av själva vyn. En för liten region, negativt elementantal
 eller index utanför vyn ger status 103. Negativ eller omöjlig begäran om
 regionkapacitet ger arrayallokerarens status 109.
 
 
 Självkompilatorn stöder markörallokering för skalärer, vanliga flata
-structar med skalära fält och `@c_layout`-structar med värdefält som kan
-vara nästlade eller fasta arrayer. För ett lån
+structar med skalära fält och `@c_layout`-structar med nästlade värdefält
+eller fasta arrayer av skalärer. För ett lån
 till ett skalärt element eller en hel vy kräver selfhost att elementens
 representation matchar funktionsparameterns lagring. Ett lån av ett enskilt
 fält eller en C-layout-struct använder regionens lagring. Ett muterbart lån

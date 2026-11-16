@@ -60,8 +60,10 @@ implementeras i [native-backenden](../selfhost/runtime/runtime_sys.ddr).
 | `sys.make_executable(path)` | `sys.Status` | Sätter läge 0755; används för färdigbyggda program. |
 | `sys.now_ms()` | `i64` | Monoton klocka i millisekunder. |
 | `sys.sleep_ms(ms)` | `()` | Pausar aktuell tråd minst `ms` millisekunder. |
-| `unsafe sys.envp()` | `ptr` | Startpekare till processens `envp`-vektor från startstacken på Linux (`null` på macOS). |
+| `unsafe sys.envp()` | `ptr` | Aktuell miljövektor på Linux: libc:s levande `environ` när programmet importerar libc, annars startstackens `envp`. `null` på macOS. |
 | `unsafe sys.linux_syscall(nr, a0..a5)` | `i64` | Rått Linux-systemanrop via ARM64-kanoniskt anropsnummer (`nr: i64, a0..a5: i64`; översätts automatiskt på `x86_64-linux`). |
+| `unsafe sys.memory_copy(destination, source, count)` | `()` | Kopierar `count: usize` byte mellan giltiga minnesområden; överlappning är tillåten. |
+| `unsafe sys.memory_equal(lhs, rhs, count)` | `bool` | Jämför `count: usize` byte i giltiga minnesområden. |
 
 Samtliga sökvägar och textargument har typen `string`. `read` använder enums:
 
@@ -126,6 +128,24 @@ Sökvägar är fortsatt UTF-8 även vid binär utdata.
 Argument exponeras som vanliga oföränderliga Dunder-strängar. Felaktigt
 index ger status 103; ett argument med ogiltig UTF-8 ger 106. Vid `dunder run`
 skickas programargument efter `--`, exempelvis `dunder run main.ddr -- hello`.
+
+## Bytebuffertar och rått minne
+
+`std.bytes.equal(&lhs, &rhs)` jämför packade bytebuffertar.
+`equal_ranges(&lhs, lstart, lend, &rhs, rstart, rend)` jämför halvöppna
+intervall och ger `false` för ogiltiga gränser eller olika längd. Tomma,
+giltiga intervall är lika. Funktionerna kräver ingen `unsafe`-behörighet.
+`extend`, `extend_range` och `append_utf8` reserverar utrymme en gång och
+kopierar byte i bulk; `extend_range` avbryter vid ogiltiga intervall.
+
+`unsafe sys.memory_copy` och `unsafe sys.memory_equal` tar råa pekare och ett
+antal byte av typen `usize`. Anroparen ansvarar för läsbart källminne och,
+vid kopiering, skrivbart målminne under hela anropet. Överlappande kopiering
+fungerar i båda riktningarna. Noll byte läser eller skriver inget minne och
+tillåter därför nullpekare; jämförelsen ger då `true`. Jämförelsen har inget
+kontrakt om konstant körtid. Samma funktioner finns som
+`std.bytes.copy_memory` och `std.bytes.equal_memory`. De stöds av samtliga
+native-mål och WebAssembly utan en C-biblioteksimport.
 
 ## Sökvägar och filer
 
@@ -212,8 +232,14 @@ och [stat-definitioner](https://github.com/apple-oss-distributions/xnu/blob/main
 samt tidigare macOS-körningar. Linux använder direkta systemanrop och respektive
 arkitekturs stat-layout; `sys.linux_syscall` tar Linux ARM64-kanoniska
 systemanropsnummer (som mappas om till x86-64 i x86-backend och returnerar
-`-38` för okända nummer på Linux samt `-78` på macOS) och `sys.envp` läser den
-`envp`-pekare som startkoden bevarar efter `argv` på Linux-stacken. Se
+`-38` för okända nummer på Linux samt `-78` på macOS). På Linux följer
+`sys.envp` libc:s aktuella `environ` när programmet redan importerar
+libc som `c` eller `libc.so.6`. Därmed ser `std.process.env`, `spawn`, `replace` och PATH-sökning
+också ändringar genom `setenv`, `unsetenv` och `clearenv`. En nullpekare
+betyder tom miljö; tidigare borttagna variabler återinförs inte från
+startstacken. Program som enbart använder systemanrop använder startstackens
+bevarade `envp` och behåller sitt statiska ELF-format. `sys.envp` ger fortsatt null
+på macOS, där `std.process` använder plattformens miljö-API. Se
 [målplattformarnas verifiering](targets.md).
 Systemanropen är en plattformsdetalj som anpassas per mål.
 Binärläsning, kataloglistning, rekursiva katalogverktyg,

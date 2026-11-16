@@ -3,12 +3,14 @@
 Detta är ett forsknings- och designunderlag, inte implementerad funktionalitet.
 Frågan gäller hur Dunder bäst kombinerar ergonomi för samlingar av sammansatta
 poster med hårdvaruvänlig Structure-of-Arrays-lagring (SoA), motiverat av
-[next-steps.md §3](next-steps.md#3-bättre-ägda-samlingar) och erfarenheter från
+[next-steps.md §3](next-steps.md#3-bättre-ägda-samlingar--delvis-implementerat) och erfarenheter från
 `dunder-skrift` och `dunder-hundmat/dogfood/skrift`.
 
-I [frontend_types.ddr](../selfhost/frontend/frontend_types.ddr) avvisas `[]Struct`
-i dag (`arrays of aggregate elements are not supported by this compiler`) eftersom
-arraykörtiden och MIR förutsätter skalära eller pekarstora element.
+Vanliga `[]Struct`, payload-enums och nästlade arrayer stöds nu av
+[frontend_types.ddr](../selfhost/frontend/frontend_types.ddr). Sammansatta
+element ligger i åttabytesplatser som pekar på sina värden; kloning och
+cleanup följer samma typade hjälpare som fristående värden. SoA är därför
+ett möjligt layoutval att utvärdera, inte ett krav för att lagra poster.
 
 ## Var påtvingad SoA redan ger fördelar
 
@@ -19,7 +21,7 @@ arraykörtiden och MIR förutsätter skalära eller pekarstora element.
 - **Förutsägbar livslängd**: Inga dolda destruktorkaskader per element vid
   arraytillväxt.
 
-## Var avsaknaden av struct-samlingar kostar kod och tid
+## Var tidigare begränsningar har lett till extra kod
 
 - **Manuell kolumnsynk**: Tabeller med 4–7 fält (`FvarTable`, `NameTable`,
   `CffTable`, `cli.Options` beroenden) måste hålla flera parallella `[]`-arrayer i

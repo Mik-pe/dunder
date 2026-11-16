@@ -30,8 +30,10 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
 - Resursägande strängar, arrayer, structar och enums flyttas vid
   bindning och retur. Vanliga parametrar, loopar och match lånar;
   `move` markerar ägarövertagande och `.clone()` begär kloning uttryckligen. Nästlade structfält och enumpayloads kan äga samlingar.
-  Vanliga arrayelement är primitiva värden, inklusive strängar och pekare,
-  enums utan payload eller typade tasknycklar. `@c_layout` använder målplattformens fältstorlek
+  Vanliga arrayelement omfattar primitiva värden, strängar, pekare, structar,
+  enums med eller utan payload, nästlade arrayer och typade tasknycklar.
+  Kloning och cleanup följer samma regler som för fristående värden.
+  `@c_layout` använder målplattformens fältstorlek
   och justering. [Enums](enums.md) och [FFI](ffi.md).
 - `@resource` gör externa OS-resurser unika även när deras representation
   är skalär. Sockets och barnprocesser kan flyttas men inte klonas;

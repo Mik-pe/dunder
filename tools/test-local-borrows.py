@@ -265,7 +265,7 @@ INVALID = (
     ('return-borrowed-view', 'fn bad(v:[]i32)->[]i32{r:=&v[0..v.len];r} fn main(){}', 'borrow'),
     ('reference-field', 'struct Bad{value:&i32} fn main(){}', 'borrow'),
     ('reference-payload', 'enum Bad{Value(&i32),Empty} fn main(){}', 'payload'),
-    ('reference-array', 'fn main(){v:=42;items:[]&i32=[&v]}', 'aggregate'),
+    ('reference-array', 'fn main(){v:=42;items:[]&i32=[&v]}', 'array elements must be storable values'),
 )
 
 # A scoped reference may be observed directly inside explicit unsafe code, as

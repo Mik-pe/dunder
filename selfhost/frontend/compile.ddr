@@ -16,6 +16,7 @@ import source_call
 import ..driver.compile_session as cs
 import deferred_blocks as deferred
 import ..backend.ffi_abi as fa
+import ..backend.imports as native_imports
 import ..driver.fragments
 import frontend_types as ft
 import lexer
@@ -63,8 +64,8 @@ import ..tasks.task_native
 
 // Native Dunder compiler. Values use eight-byte cells; aggregates have value semantics.
 // Primitive IDs: ()=0, i32=1, i64=2, bool=3, string=4, rune=5.
-pub struct Imports { globals: i32, libraries: []string, symbols: []string, sites: []i32, slots: []i32 }
-fn imports() -> Imports { Imports { globals: 0, libraries: [], symbols: [], sites: [], slots: [] } }
+pub struct Imports { globals: i32, libraries: []string, symbols: []string, sites: []i32, slots: []i32, env_source_slot: i32 }
+fn imports() -> Imports { Imports { globals: 0, libraries: [], symbols: [], sites: [], slots: [], env_source_slot: -1 } }
 pub struct Bindings {
     reused: i32, emitted: i32, offsets: []i32, names: []string, types: []string,
     worker_scalar: i32, worker_general: i32, frontend_workers: i32, source_windows: i32, peak_jobs: i32,
@@ -511,6 +512,23 @@ fn copy_value(c: &mut Session, ty: i32) {
     if ft.type_kind(&c.types, ty)==21 || ft.type_kind(&c.types, ty)==20 {fail(&mut c,"scratch values cannot escape the region");return}
     if ty == 4 || (ft.type_kind(&c.types, ty) == 7 && !ft.move_only(&c.types, ty)) { ownership_call(&mut c, .Copy, ty, c.runtime.retain) }
     else if owned(&c, ty) { label := type_helper(&mut c, ty, false); ownership_call(&mut c, .Copy, ty, label) }
+}
+// Slots retain their logical element type. The descriptor carries the same
+// clone/drop operations that an independent value of that type uses.
+fn array_element_helpers(c: &mut Session, base: i32) {
+    if c.code.checking || !owned(&c, base) { return }
+    mut clone_label := c.runtime.retain
+    if base != 4 && !(ft.type_kind(&c.types, base) == 7 && !ft.move_only(&c.types, base)) {
+        clone_label = type_helper(&mut c, base, false)
+    }
+    drop_label := drop_target(&mut c, base)
+    arm.push_temp(&mut c.code, 0)
+    arm.branch(&mut c.code, clone_label, 20)
+    arm.pop_temp(&mut c.code, 1); store_mem(&mut c, 0, 1, 32)
+    arm.push_temp(&mut c.code, 1)
+    arm.branch(&mut c.code, drop_label, 20)
+    arm.pop_temp(&mut c.code, 1); store_mem(&mut c, 0, 1, 40)
+    arm.mov(&mut c.code, 0, 1)
 }
 // Only the exact complete expression owner may transfer. Ordinary records
 // recursively own their record/array children; shared enums and C inline bytes
@@ -1112,10 +1130,16 @@ fn intrinsic(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.
     result
 }
 fn intrinsic_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, covered: &mut bool) -> i32 {
-    if name == "__sys_decode_utf8" || name == "__sys_decode_u8" || name == "__sys_decode_u8_range" { covered = true; task_effect(&mut c, 13) }
+    raw_memory := name == "__sys_memory_copy" || name == "__sys_memory_equal"
+    byte_buffer := name == "__sys_bytes_extend" || name == "__sys_bytes_append_text"
+    if byte_buffer || name == "__sys_decode_utf8" || name == "__sys_decode_u8" || name == "__sys_decode_u8_range" { covered = true; task_effect(&mut c, 13) }
     else { task_effect(&mut c, 256) }
     mut target := -1; mut ret := expected
     if name == "__sys_arg_count" { covered = true; target = c.runtime.sys_arg_count; ret = 1 }
+    else if name == "__sys_memory_copy" { covered = true; require_unsafe(&mut c); target = c.runtime.memory_copy; ret = 0 }
+    else if name == "__sys_memory_equal" { covered = true; require_unsafe(&mut c); target = c.runtime.memory_equal; ret = 3 }
+    else if name == "__sys_bytes_extend" { covered = true; target = c.runtime.bytes_extend; ret = 0 }
+    else if name == "__sys_bytes_append_text" { covered = true; target = c.runtime.bytes_append_text; ret = 0 }
     else if name == "__sys_envp" { covered = true; require_unsafe(&mut c); target = c.runtime.sys_envp; ret = 13 }
     else if name == "__sys_linux_syscall" { covered = true; require_unsafe(&mut c); target = c.runtime.sys_linux_syscall; ret = 2 }
     else if name == "__sys_arg" { covered = true; target = c.runtime.sys_arg; ret = 4 }
@@ -1152,7 +1176,14 @@ fn intrinsic_dispatch(c: &mut Session, name: string, expected: i32, catalog: &op
     while c.ok && !is(&c, ")") {
         mut want := 0
         mut elem := 0; mut ref_kind := 4
-        if count == 1 && (name == "__sys_write_bytes" || name == "__sys_write_u8" || name == "__sys_net_write") {
+        if raw_memory {
+            want = 13; if count == 2 { want = 12 }
+        } else if byte_buffer {
+            if count == 0 { elem = 8; ref_kind = 5 }
+            else if count == 1 && name == "__sys_bytes_extend" { elem = 8 }
+            else if count == 1 { want = 4 }
+            else { want = 1 }
+        } else if count == 1 && (name == "__sys_write_bytes" || name == "__sys_write_u8" || name == "__sys_net_write") {
             elem = 1; if name != "__sys_write_bytes" { elem = 8 }
         } else if count == 0 && (name == "__sys_decode_utf8" || name == "__sys_decode_u8" || name == "__sys_decode_u8_range") {
             elem = 1; if name != "__sys_decode_utf8" { elem = 8 }
@@ -1167,13 +1198,16 @@ fn intrinsic_dispatch(c: &mut Session, name: string, expected: i32, catalog: &op
         if name == "__sys_linux_syscall" { arg_want = 2 }
         argument := c.body.cursor; ty := expression(&mut c, 0, arg_want, &catalog, &mut inline_work, &mut model)
         if arg_want != 0 { same(&mut c, arg_want, ty) }
-        if want != 0 { place_step(&mut c, .Read, ft.type_base(&c.types, want), ref_kind - 1, 3, 0, argument) }
+        if elem != 0 { place_step(&mut c, .Read, ft.type_base(&c.types, want), ref_kind - 1, 3, 0, argument) }
         arm.push_temp(&mut c.code, 0); count = count + 1
         if !eat(&mut c, ",") { break }
     }
     expect(&mut c, ")")
     if name == "__sys_envp" && count != 0 { fail(&mut c, "__sys_envp expects no arguments"); return 0 }
     if name == "__sys_linux_syscall" && count != 7 { fail(&mut c, "__sys_linux_syscall expects 7 arguments"); return 0 }
+    if raw_memory && count != 3 { fail(&mut c, name + " expects 3 arguments"); return 0 }
+    if name == "__sys_bytes_extend" && count != 4 { fail(&mut c, name + " expects 4 arguments"); return 0 }
+    if name == "__sys_bytes_append_text" && count != 2 { fail(&mut c, name + " expects 2 arguments"); return 0 }
     mut i := count - 1; while i >= 0 { arm.pop_temp(&mut c.code, i); i = i - 1 }
     arm.branch(&mut c.code, target, 1); ret
 }
@@ -1322,6 +1356,7 @@ fn fixed_pod(c: &Session, ty: i32) -> bool { ft.fixed_pod(&c.types, ty) }
 fn inline_value(c: &mut Session, ty: i32, access: borrows.Access, token: i32) {
     if ft.is_c_record(&c.types, ty) { return }
     if ft.type_kind(&c.types, ty) != 6 { place_transfer(&mut c, ty, 0, 0, true, true, i32(access), token); return }
+    if !fixed_pod(&c, ty) { fail(&mut c, "inline C arrays require scalar elements"); return }
     elem := ft.type_base(&c.types, ty)
     mut local_slots := c.body.slots; mut err := ""
     fa.inline_descriptor(&mut c.code, ft.type_count(&c.types, ty), ft.c_size(&c.types, elem), &mut local_slots, &mut err)
@@ -1331,6 +1366,7 @@ fn inline_value(c: &mut Session, ty: i32, access: borrows.Access, token: i32) {
 fn store_inline(c: &mut Session, ty: i32, token: i32) {
     access := i32(borrows.Access.Address); kind := ft.type_kind(&c.types, ty)
     if !ft.is_c_record(&c.types, ty) && kind != 6 { place_transfer(&mut c, ty, 0, 1, false, true, access, token); return }
+    if kind == 6 && !fixed_pod(&c, ty) { fail(&mut c, "inline C arrays require scalar elements"); return }
     mut fixed := 0; mut count := ft.c_size(&c.types, ty); mut stride := 1; mut part := 0
     if kind == 6 {
         fixed = 1; count = ft.type_count(&c.types, ty); elem := ft.type_base(&c.types, ty)
@@ -1377,7 +1413,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
     if name == "replace" && map.get_or(&c.world.functions, name, -1) < 0 { covered = true;
         return replace_value(&mut c, &catalog, &mut inline_work, &mut model)
     }
-    if c.code.platform == 3 && name.len >= 6 && name[0..6] == "__sys_" && name != "__sys_decode_utf8" && name != "__sys_decode_u8" && name != "__sys_decode_u8_range" { fail(&mut c, "native system calls need a native target"); return 0 }
+    if c.code.platform == 3 && name.len >= 6 && name[0..6] == "__sys_" && name != "__sys_decode_utf8" && name != "__sys_decode_u8" && name != "__sys_decode_u8_range" && name != "__sys_memory_copy" && name != "__sys_memory_equal" && name != "__sys_bytes_extend" && name != "__sys_bytes_append_text" { fail(&mut c, "native system calls need a native target"); return 0 }
     if name == "target_is" { covered = true;
         if c.world.tokens.kinds[c.body.cursor] != .String { fail(&mut c, "target_is requires a target literal"); return 0 }
         target := advance(&mut c); expect(&mut c, ")")
@@ -1876,7 +1912,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     if !text { base = ft.type_base(&c.types, ty) }
                     result := compound(&mut c, 1, base)
                     mut shift := 0; if !text { shift = unsigned.shift(storage_type(&c, base)) }
-                    for field in 0..3 { reserved := slot(&mut c) }
+                    for field in 0..5 { reserved := slot(&mut c) }
                     data_home := slot(&mut c)
                     borrowed_view.emit(&mut c.code, source_home, first_home, last_home, data_home, text, shift, c.bounds, c.unicode_trap, c.world.tokens.starts[subscript_at])
                     holder := slot(&mut c); arm.store(&mut c.code, holder, 0)
@@ -2269,7 +2305,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         if mutable { c.body.mutations.push(base) }
         if ft.type_kind(&c.types, ty)==21 {
             elem:=ft.type_base(&c.types, ty)
-            if mutable || ft.type_kind(&c.types, expected)!=4 || ft.type_kind(&c.types, ft.type_base(&c.types, expected))!=1 || ft.type_base(&c.types, ft.type_base(&c.types, expected))!=elem || i32(1).shl(unsigned.shift(storage_type(&c, elem)))!=scratch_width(&c,elem) {fail(&mut c,"scratch slice needs a shared, representation-compatible parameter");return 0}
+            if mutable || ft.type_kind(&c.types, expected)!=4 || ft.type_kind(&c.types, ft.type_base(&c.types, expected))!=1 || ft.type_base(&c.types, ft.type_base(&c.types, expected))!=elem || !ft.scalar_element(&c.types, elem) || i32(1).shl(unsigned.shift(storage_type(&c, elem)))!=scratch_width(&c,elem) {fail(&mut c,"scratch slice needs a shared, representation-compatible parameter");return 0}
             ty=ft.type_base(&c.types, expected)
         }else if c.body.scratch_place==1 && ft.type_kind(&c.types, ty)!=2 && i32(1).shl(unsigned.shift(storage_type(&c, ty)))!=scratch_width(&c,ty) {
             fail(&mut c,"borrow a value-compatible scratch element or record field");return 0
@@ -2332,6 +2368,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         if base == 0 { fail(&mut c, "empty array needs an element type") }
         mut ty := compound(&mut c, 1, base); if repeated || ft.type_kind(&c.types, expected) != 1 { ty = fixed(&mut c, base, count) }
         arm.finish_array_literal(&mut c.code, allocation, base, ty, unsigned.shift(storage_type(&c, base)), source)
+        array_element_helpers(&mut c, base)
         return temporary(&mut c, ty)
     }
     fail(&mut c, "expected expression"); 0
@@ -2725,7 +2762,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
     if ty == 4 { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
     arm.push_temp(&mut c.code, 0)
     mut target := -1; mut ret := ty; mut count := 0; mut operation: ri.Operation = .Format
-    if name == "iter" && (ft.type_kind(&c.types, ty) == 6 || ft.type_kind(&c.types, ty) == 10) { covered = true;
+    if name == "iter" && collection(&c, ty) { covered = true;
         if place != 0 && c.body.depth == c.body.stream_depth && is(&c, ")") && c.world.tokens.texts[c.body.cursor + 1] == "{" {
             expect(&mut c, ")"); arm.pop_temp(&mut c.code, 0); c.body.stream_kind = 10; return ty
         }
@@ -2754,7 +2791,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
             operation = .ArrayPush; target = c.runtime.typed_push[unsigned.shift(storage_type(&c, base))]; count = 1; ret = 0
         } else if name == "reserve" { covered = true; value := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, value); count = 1; operation = .ArrayReserve; target = c.runtime.array_reserve; ret = 0 }
         else if name == "pop" { covered = true; operation = .ArrayPop; target = c.runtime.array_pop; ret = ft.type_base(&c.types, ty) }
-        else if name == "clear" { covered = true; expect(&mut c, ")"); arm.pop_temp(&mut c.code, 0); if ft.type_base(&c.types, ty) == 4 { arm.intrinsic_call(&mut c.code, c.runtime.release_elements, .ReleaseElements, ty, 0, source) }; arm.imm(&mut c.code, 1, 0); place_step(&mut c, .Member, ty, 4, i32(place_op.Member.ClearLength), 1, c.body.cursor - 3); return 0 }
+        else if name == "clear" { covered = true; expect(&mut c, ")"); arm.pop_temp(&mut c.code, 0); arm.intrinsic_call(&mut c.code, c.runtime.array_clear, .ArrayClear, ty, 0, source); return 0 }
     } else if name == "str" { covered = true;
         if ty != 1 && ty != 2 && ty != 3 && ty != 5 && !unsigned.has(ty) { fail(&mut c, "str requires an integer, bool or rune") }
         ret = 4; target = c.runtime.string_integer
@@ -3466,7 +3503,7 @@ fn scratch_declaration(c:&mut Session, name:string, mutable:bool, catalog: &opt_
     actual:=expression(&mut c,0,1, &catalog, &mut inline_work, &mut model);same(&mut c,1,actual);expect(&mut c,")")
     mut align:=width;if ft.is_c_record(&c.types, elem) {align=ft.c_align(&c.types, elem)} else if ft.type_kind(&c.types, elem)==2{align=8}
     view:=compound(&mut c,21,elem);binding:=slot(&mut c)
-    for unused in 0..3 { slot_for_descriptor:=slot(&mut c) }
+    for unused in 0..5 { slot_for_descriptor:=slot(&mut c) }
     descriptor:=slot(&mut c)
     stride := unsigned.shift(storage_type(&c, elem))
     scratch.allocate(&mut c.code,area,descriptor,elem,width,align,c.bounds,stride,c.world.tokens.starts[start + 7])
@@ -3627,6 +3664,9 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
             mut access := 0; if borrow_elem { access = 3 }; place_step(&mut c, .Element, base, access, 1, shift, name_at)
             if borrow_elem {
                 if ft.is_c_record(&c.types, base) || fixed_pod(&c, base) { place_transfer(&mut c, base, 0, 0, true, false, access, name_at) }
+                // A fixed scalar-array loan points at its inline data, while
+                // the outer slot contains the inner descriptor's address.
+                if fixed_pod(&c, base) { place_transfer(&mut c, base, 0, 0, true, false, access, name_at) }
                 arm.store(&mut c.code, binding, 0)
             } else if borrowed_for {
                 place_transfer(&mut c, base, 0, 0, true, false, access, name_at); arm.store(&mut c.code, binding, 0)
@@ -5383,7 +5423,21 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
     if record_take.status(&record_takes) == 2 { assert(record_take.emit_helpers(&mut c.code, &mut record_takes, c.array_take)) }
     nominal_clones(&mut c, &rt)
     arm.runtime(&mut c.code, c.print_int, c.print_bool, c.print_text, c.write, c.overflow, c.zero, c.assertion, c.io)
-    runtime.emit_runtime(&mut c.code, &rt)
+    // Pure Linux programs keep their startup environment and static image.
+    // An existing libc binding can replace environ after setenv/clearenv, so
+    // those images read the live data symbol through an explicitly typed slot.
+    if platform == 1 || platform == 2 {
+        mut libc := false
+        for library in &c.imports.libraries {
+            if native_imports.library_name(library, false) == "libc.so.6" { libc = true; break }
+        }
+        if libc {
+            c.imports.env_source_slot = c.imports.symbols.len
+            c.imports.libraries.push("c"); c.imports.symbols.push("environ")
+        }
+    }
+    env_site := runtime.emit_runtime_with_env(&mut c.code, &rt, c.imports.env_source_slot)
+    if env_site >= 0 { c.imports.sites.push(env_site); c.imports.slots.push(c.imports.env_source_slot) }
     data_start := c.code.words.len
     for i in 0..c.strings.len { rt_emit.emit_literal(&mut c.code, c.strings[i].clone(), c.string_labels[i]) }
     runtime.emit_profile_data(&mut c.code, &rt)
