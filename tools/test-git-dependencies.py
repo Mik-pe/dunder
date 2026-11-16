@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise pinned Git dependencies with real local repositories and native programs."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -427,6 +428,67 @@ def concurrent_contract(probe, kit, expected, expected_pins):
                 child.wait()
 
 
+def directory_snapshot(root):
+    result = {}
+    for path in [root, *sorted(root.rglob('*'))]:
+        info = path.lstat()
+        value = (os.readlink(path) if path.is_symlink() else
+                 path.read_bytes() if path.is_file() else None)
+        result[str(path.relative_to(root))] = (info.st_mode, info.st_mtime_ns, value)
+    return result
+
+
+def cache_symlink_contracts(probe):
+    repo = Repository(probe, 'cache confinement', {'dunder.toml': 'root = "api.ddr"\n',
+                      'api.ddr': 'pub fn answer() -> i32 { 42 }\n'})
+    digest = hashlib.sha256(repo.url.encode()).hexdigest()
+    sentinel = probe.work / 'cache sentinel'
+    write(sentinel / 'dunder.toml', 'name = "sentinel"\nroot = "main.ddr"\n')
+    write(sentinel / 'main.ddr', 'fn main() { print(7) }\n')
+    image = sentinel / 'image'
+    probe.cli(sentinel, 'build', '--jobs', '1', '-o', image)
+    sentinel_bytes = image.read_bytes()
+    for warm in (False, True):
+        for kind in ('repos', 'checkouts', 'checkout-url-parent'):
+            name = ('warm ' if warm else 'cold ') + kind
+            path = probe.work / 'cache symlinks' / name
+            write(path / 'dunder.toml', 'name = "consumer"\nroot = "main.ddr"\n[dependencies]\nkit = ' +
+                  table(git=repo.url) + '\n')
+            write(path / 'main.ddr', 'import kit\nfn main() { print(kit.answer()) }\n')
+            cache = path / 'build/.dunder/git'
+            image = path / 'image'
+            if warm:
+                probe.cli(path, 'build', '--jobs', '1', '-o', image)
+                probe.execute(image, host_target(), 42)
+                pins(path, {(repo.url, 'head', ''): repo.head()})
+            else:
+                cache.mkdir(parents=True)
+                # A pre-existing valid lock must survive the failed graph.
+                write(path / 'dunder.lock', 'version = 1\n')
+            # A fresh inode also avoids macOS retaining validation state from
+            # the executable used to populate the warm cache above.
+            staged_image = path / 'sentinel-image'
+            staged_image.write_bytes(sentinel_bytes)
+            staged_image.chmod(0o755)
+            staged_image.replace(image)
+            link = cache / (('checkouts/' + digest) if kind == 'checkout-url-parent' else kind)
+            outside = probe.work / 'outside cache' / name
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            if warm:
+                link.rename(outside)
+            else:
+                link.parent.mkdir(parents=True, exist_ok=True)
+                outside.mkdir()
+                write(outside / 'sentinel', 'must stay unchanged\n')
+            link.symlink_to(outside, target_is_directory=True)
+            before = directory_snapshot(outside)
+            flags = ('--offline', '--locked') if warm else ()
+            probe.reject(path, ['build', '--jobs', '1', *flags, '-o', image],
+                         ('cache', 'symlink'), image)
+            assert directory_snapshot(outside) == before, (name, 'wrote outside Git cache')
+            probe.execute(image, host_target(), 7)
+
+
 def prune_contract(probe, path):
     image = path / 'pruned'
     image.write_bytes(b'previous valid image')
@@ -502,6 +564,8 @@ def main():
     parser.add_argument('compiler', type=Path)
     parser.add_argument('--runner', action='append', default=[], metavar='TARGET=COMMAND',
                         help='also execute a native target through an emulator or wrapper')
+    parser.add_argument('--only-cache-symlinks', action='store_true',
+                        help='run the six cold/warm cache-confinement regressions only')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = host_target()
@@ -513,6 +577,11 @@ def main():
         runners[target] = shlex.split(command)
     with tempfile.TemporaryDirectory(prefix='dunder-git dependencies-') as temporary:
         probe = Probe(compiler, Path(temporary).resolve(), runners)
+        if args.only_cache_symlinks:
+            cache_symlink_contracts(probe)
+            print(f'Git cache symlinks: {probe.commands} CLI commands, {probe.images} native images, '
+                  f'{probe.executions} host executions, {probe.rejections} rejections passed')
+            return
         embedded_contracts(probe)
         leaf = Repository(probe, 'leaf library', {'dunder.toml': 'root = "api.ddr"\n',
                           'api.ddr': 'pub fn value() -> i32 { 10 }\n'})
@@ -594,6 +663,7 @@ def main():
         graph_contracts(probe, main_path, leaf)
         local_only_contract(probe)
         concurrent_contract(probe, kit, 49, expected)
+        cache_symlink_contracts(probe)
         prune_contract(probe, selectors[0][0])
         hidden_revision_contract(probe)
         sha256_contract(probe)
@@ -604,7 +674,7 @@ def main():
         print(f'Git dependencies: {probe.commands} CLI commands, {probe.images} native images, '
               f'{probe.executions} target executions ({", ".join(runners)}), {probe.rejections} rejections; '
               'selectors, transitive pins, offline/locked use, update, graph failures, '
-              'detached checkouts and concurrent cold builds passed')
+              'detached checkouts, cache confinement and concurrent cold builds passed')
 
 
 if __name__ == '__main__':
