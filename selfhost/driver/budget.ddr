@@ -1,0 +1,206 @@
+// Centralized host CPU detection, resource limits, and nested job budgeting.
+capability unsafe
+import std.parse as decimal
+import std.text as text
+import sys
+
+@extern("c", "sysconf") unsafe fn c_sysconf(name: i32) -> i64
+@extern("c", "getenv") unsafe fn c_getenv(name: ptr) -> ptr
+
+// Each native task worker lane reserves a 536 MiB virtual address range
+// (512 MiB arena + 16 MiB guard + 8 MiB stack). Capping scheduled jobs at
+// 256 keeps worker virtual reservations below 134 GiB in 48-bit user VA space.
+pub fn max_jobs() -> i32 { 256 }
+
+// Isolated test processes keep per-child pipes and fixed scheduler slots in
+// selfhost/driver/process.ddr, fitting safely within RLIMIT_NOFILE=256.
+pub fn max_test_processes() -> i32 { 64 }
+
+pub fn child_jobs_env() -> string { "DUNDER_CHILD_JOBS" }
+
+pub fn clamp_jobs(value: i64) -> i32 {
+    if value < 1 { return 1 }
+    limit := i64(max_jobs())
+    if value > limit { return max_jobs() }
+    i32(value)
+}
+
+fn ceil_quota(quota: i64, period: i64) -> i32 {
+    if quota <= 0 || period <= 0 { return 0 }
+    mut count := (quota + period - 1) / period
+    if count < 1 { count = 1 }
+    clamp_jobs(count)
+}
+
+fn parse_positive_token(raw: string) -> i64 {
+    parsed := decimal.integer(raw)
+    if !parsed.ok || parsed.value <= 0 { return 0 }
+    parsed.value
+}
+
+pub fn parse_cpu_max(raw: string) -> i32 {
+    trimmed := text.trim(raw)
+    if trimmed == "" { return 0 }
+    lines := text.split(trimmed, "\n")
+    first := text.trim(lines[0])
+    if first == "" { return 0 }
+    parts := text.split(first, " ")
+    if parts.len < 2 || parts[0] == "max" { return 0 }
+    mut tokens: []string = []
+    for part in &parts {
+        item := text.trim(part)
+        if item != "" { tokens.push(move item) }
+    }
+    if tokens.len < 2 || tokens[0] == "max" { return 0 }
+    ceil_quota(parse_positive_token(tokens[0]), parse_positive_token(tokens[1]))
+}
+
+pub fn parse_cfs_quota(quota_raw: string, period_raw: string) -> i32 {
+    quota_parsed := decimal.integer(text.trim(quota_raw))
+    if !quota_parsed.ok || quota_parsed.value <= 0 { return 0 }
+    period := parse_positive_token(text.trim(period_raw))
+    ceil_quota(quota_parsed.value, period)
+}
+
+pub fn read_cgroup_cpu_limit() -> i32 {
+    v2 := sys.read_text("/sys/fs/cgroup/cpu.max")
+    if v2.ok {
+        limit := parse_cpu_max(v2.value)
+        if limit > 0 { return limit }
+    }
+    v1_quota := sys.read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    v1_period := sys.read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if v1_quota.ok && v1_period.ok {
+        return parse_cfs_quota(v1_quota.value, v1_period.value)
+    }
+    0
+}
+
+unsafe fn count_affinity_bits(base: usize, nbytes: i32) -> i32 {
+    mut count := 0
+    for i in 0..nbytes {
+        mut b := i32(load_u8(ptr(base + usize(i))))
+        while b != 0 {
+            if b.bit_and(1) != 0 { count = count + 1 }
+            b = b.shr(1)
+        }
+    }
+    count
+}
+
+pub fn host_cpus(host: i32) -> i32 {
+    if host == 0 {
+        unsafe {
+            n := c_sysconf(58)
+            if n > 0 { return clamp_jobs(n) }
+        }
+        return 1
+    }
+    if host == 1 || host == 2 {
+        mut cpus := 0
+        unsafe {
+            mut mask: [u64; 32] = [0; 32]
+            r := sys.linux_syscall(123, 0, 256, i64(usize(addr(&mut mask[0]))), 0, 0, 0)
+            if r > 0 { cpus = count_affinity_bits(usize(addr(&mask[0])), i32(r)) }
+            if cpus <= 0 {
+                n := c_sysconf(84)
+                if n > 0 { cpus = clamp_jobs(n) }
+            }
+        }
+        cg := read_cgroup_cpu_limit()
+        if cg > 0 && (cpus <= 0 || cg < cpus) { cpus = cg }
+        if cpus <= 0 { return 1 }
+        return clamp_jobs(i64(cpus))
+    }
+    1
+}
+
+pub struct JobsOption { ok: bool, jobs: i32, error: string }
+
+pub fn parse_jobs_flag(raw: string) -> JobsOption {
+    parsed := decimal.integer(raw)
+    if !parsed.ok || parsed.value < 1 || parsed.value > i64(max_jobs()) {
+        return JobsOption { ok: false, jobs: 0, error: "--jobs must be an integer from 1 to " + max_jobs().str() }
+    }
+    JobsOption { ok: true, jobs: i32(parsed.value), error: "" }
+}
+
+pub fn read_child_jobs_limit() -> i32 {
+    unsafe {
+        p := c_getenv(cstr("DUNDER_CHILD_JOBS"))
+        if usize(p) == 0 { return 0 }
+        mut raw: []u8 = []
+        mut i: usize = 0
+        while i < 32 {
+            b := load_u8(ptr(usize(p) + i))
+            if b == 0 { break }
+            raw.push(b)
+            i = i + 1
+        }
+        if i == 32 && load_u8(ptr(usize(p) + i)) != 0 { return 0 }
+        decoded := sys.decode_u8(&raw)
+        if !decoded.ok { return 0 }
+        parsed := decimal.integer(text.trim(decoded.value))
+        if !parsed.ok || parsed.value < 1 { return 0 }
+        return clamp_jobs(parsed.value)
+    }
+    0
+}
+
+pub fn resolve_jobs_for(host: i32, requested: i32, requested_set: bool, default_override: i32, supports_workers: bool, child_limit: i32) -> JobsOption {
+    if default_override < 0 || default_override > max_jobs() {
+        return JobsOption { ok: false, jobs: 0, error: "default worker count must be from 0 to " + max_jobs().str() }
+    }
+    if requested_set {
+        if requested < 1 || requested > max_jobs() {
+            return JobsOption { ok: false, jobs: 0, error: "--jobs must be an integer from 1 to " + max_jobs().str() }
+        }
+        if !supports_workers && requested > 1 {
+            return JobsOption { ok: false, jobs: 0, error: "this compiler entry supports only --jobs 1" }
+        }
+        return JobsOption { ok: true, jobs: requested, error: "" }
+    }
+    if !supports_workers {
+        return JobsOption { ok: true, jobs: 1, error: "" }
+    }
+    if default_override > 0 {
+        return JobsOption { ok: true, jobs: default_override, error: "" }
+    }
+    mut auto_jobs := host_cpus(host)
+    if child_limit > 0 && child_limit < auto_jobs { auto_jobs = child_limit }
+    JobsOption { ok: true, jobs: auto_jobs, error: "" }
+}
+
+pub fn resolve_jobs(host: i32, requested: i32, requested_set: bool, default_override: i32, supports_workers: bool) -> JobsOption {
+    mut child_limit := 0
+    if !requested_set && supports_workers && default_override == 0 {
+        child_limit = read_child_jobs_limit()
+    }
+    resolve_jobs_for(host, requested, requested_set, default_override, supports_workers, child_limit)
+}
+
+// Count the coordinator as one CPU slot whenever it compiles a body directly;
+// pure coordination/draining does not consume an active compilation slot.
+pub fn worker_slots(total_jobs: i32, coordinator_working: bool) -> i32 {
+    if total_jobs <= 1 { return 0 }
+    if coordinator_working { return total_jobs - 1 }
+    total_jobs
+}
+
+pub fn test_process_slots(total_jobs: i32, test_count: i32) -> i32 {
+    if test_count <= 0 { return 0 }
+    mut limit := total_jobs
+    if limit < 1 { limit = 1 }
+    if limit > max_test_processes() { limit = max_test_processes() }
+    if limit > test_count { limit = test_count }
+    limit
+}
+
+pub fn nested_child_jobs(total_jobs: i32, concurrent_children: i32) -> i32 {
+    mut pool := total_jobs
+    if pool < 1 { pool = 1 }
+    if concurrent_children <= 1 { return pool }
+    share := pool / concurrent_children
+    if share < 1 { return 1 }
+    share
+}
