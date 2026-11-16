@@ -125,7 +125,7 @@ Det är en prövad, begränsad lånemodell. Generella livstidsannotationer åter
 | `std.set` | `Set` av strängar med metoder via `impl Set` (`Set::new`, `s.len`, `s.length`, `s.reserve`, `s.insert`, `s.contains`, `s.remove`, `s.clear`, `s.items`) samt modulhjälpare (`set.new`, `set.insert`, ...). |
 | `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
-| `std.bytes` | Växande bytebuffertar (`[]u8` och `[]i32`), textappend, nollfyllning, little-/big-endian-kodning (`u16_le`, `u32_le`, `i64_le`, `u64_le`), `hex` / `hex_u8`, kontrollerad UTF-8-avkodning. |
+| `std.bytes` | Växande bytebuffertar (`[]u8` och `[]i32`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex` / `hex_u8`, kontrollerad UTF-8-avkodning. |
 | `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish` och modulhjälpare). |
 | `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`Doc::parse_bytes`, `Doc::parse_text`, `.field`, `.at`, `.get_str`, `.get_i64`, `.get_u64`, `.get_bool` samt modulhjälpare). |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |

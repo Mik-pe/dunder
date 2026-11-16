@@ -909,6 +909,164 @@ fn main(){
     p.call("run", "filesystem.ddr")
 
 
+def manifest_dependencies(p):
+    # Package with its own dunder.toml (root in src/), plain directory dep, and transitive A -> B + diamond shared dep.
+    p.write("dunder-skrift/dunder.toml", 'name = "dunder-skrift"\nversion = "0.1.0"\nroot = "src/skrift.ddr"\n')
+    p.write("dunder-skrift/src/skrift.ddr",
+            "import helper\n"
+            "pub fn font_version() -> i32 { helper.version() + 10 }\n"
+            "fn main() { print(999) }\n")
+    p.write("dunder-skrift/src/helper.ddr",
+            "import binary as bin\n"
+            "pub fn version() -> i32 { bin.tag() }\n")
+    p.write("dunder-skrift/src/binary.ddr",
+            "import std.bytes as bytes\n"
+            "pub fn tag() -> i32 {\n"
+            "    mut b: []u8 = []\n"
+            "    bytes.append_be(&mut b, 32, 2)\n"
+            "    bytes.u16_be(&b, 0)\n"
+            "}\n")
+
+    p.write("plain_lib/plain.ddr", "pub fn base() -> i32 { 3 }\n")
+    p.write("plain_lib/extra.ddr", "pub fn delta() -> i32 { 4 }\n")
+
+    p.write("shared/dunder.toml", 'name = "shared"\nroot = "lib/common.ddr"\n')
+    p.write("shared/lib/common.ddr", "pub fn offset() -> i32 { 5 }\n")
+
+    p.write("dep_b/dunder.toml", 'name = "dep_b"\nroot = "mod.ddr"\n\n[dependencies]\nshared = "../shared"\n')
+    p.write("dep_b/mod.ddr", "import shared\npub fn b_val() -> i32 { shared.offset() + 1 }\n")
+
+    p.write("dep_a/dunder.toml",
+            'name = "dep_a"\nroot = "src/api.ddr"\n\n[dependencies]\ndep_b = "../dep_b"\nshared = "../shared"\n')
+    p.write("dep_a/src/api.ddr",
+            "import dep_b\nimport shared\n"
+            "pub fn a_val() -> i32 { dep_b.b_val() + shared.offset() }\n")
+
+    p.write("app/dunder.toml",
+            'name = "consumer"\n'
+            'version = "0.1.0"\n'
+            'root = "src/main.ddr"\n'
+            'test_root = "tests/suite.ddr"\n\n'
+            '[dependencies]\n'
+            'skrift = "../dunder-skrift"\n'
+            'plain = "../plain_lib"\n'
+            'dep_a = "../dep_a"\n'
+            'local_shadow = "../plain_lib"\n')
+    # Local file alongside importing module takes priority over dependency of the same name.
+    p.write("app/src/local_shadow.ddr", "pub fn pick() -> i32 { 100 }\n")
+    p.write("app/src/main.ddr",
+            "import skrift\n"
+            "import skrift.helper as h\n"
+            "import plain\n"
+            "import plain.extra\n"
+            "import dep_a\n"
+            "import dep_a.api\n"
+            "import local_shadow\n"
+            "fn main() -> i32 {\n"
+            "    total := skrift.font_version() + h.version() + plain.base() + extra.delta() + dep_a.a_val() + api.a_val() + local_shadow.pick()\n"
+            "    print(total)\n"
+            "    0\n"
+            "}\n")
+    p.write("app/tests/suite.ddr",
+            "import skrift.helper as h\n"
+            "import plain.extra as e\n"
+            "import dep_a.api as a\n"
+            "@test fn deps_work_in_tests() {\n"
+            "    assert(h.version() == 32)\n"
+            "    assert(e.delta() == 4)\n"
+            "    assert(a.a_val() == 11)\n"
+            "}\n")
+
+    app = p.root / "app"
+    # 42 + 32 + 3 + 4 + 11 + 11 + 100 = 203
+    assert p.call("run", cwd=app).stdout == "203\n"
+    assert (app / "build/arm64-macos/consumer" if sys.platform == "darwin" else app / "build").exists()
+    assert p.call("run", "src/main.ddr", cwd=app).stdout == "203\n"
+    p.call("build", cwd=app / "src")
+    checked = p.call("check", "--agent", cwd=app)
+    assert json.loads(checked.stdout.splitlines()[-1])["kind"] == "ok"
+    checked_explicit = p.call("check", "src/main.ddr", "--agent", cwd=app)
+    assert json.loads(checked_explicit.stdout.splitlines()[-1])["kind"] == "ok"
+    tested = p.call("test", cwd=app)
+    assert "PASS tests/suite.ddr::deps_work_in_tests" in tested.stdout and ", 0 failed" in tested.stdout, tested
+    tested_explicit = p.call("test", "tests/suite.ddr", cwd=app)
+    assert "PASS tests/suite.ddr::deps_work_in_tests" in tested_explicit.stdout and ", 0 failed" in tested_explicit.stdout, tested_explicit
+
+    # Incremental rebuild tracks changes inside dependency source files.
+    p.call("build", "--incremental", "-o", "inc-app", cwd=app)
+    p.write("dunder-skrift/src/binary.ddr",
+            "import std.bytes as bytes\n"
+            "pub fn tag() -> i32 {\n"
+            "    mut b: []u8 = []\n"
+            "    bytes.append_be(&mut b, 33, 2)\n"
+            "    bytes.u16_be(&b, 0)\n"
+            "}\n")
+    assert p.call("run", "--incremental", "-o", "inc-app", cwd=app).stdout == "205\n"
+
+    # Missing submodule inside a resolved dependency reports a clean load diagnostic.
+    p.write("app/src/bad_import.ddr", "import skrift.missing\nfn main() {}\n")
+    bad_imp = p.call("check", "src/bad_import.ddr", "--agent", cwd=app, status=1)
+    err_obj = json.loads(bad_imp.stdout)
+    assert err_obj["kind"] == "error" and "cannot load module" in err_obj["message"] and "missing.ddr" in err_obj["message"], err_obj
+    bad_build = p.call("build", "src/bad_import.ddr", cwd=app, status=1)
+    assert "cannot load module" in bad_build.stderr and "missing.ddr" in bad_build.stderr, bad_build
+
+    # Error diagnostics in dunder.toml (<file>:<line>: ...)
+    toml_cases = (
+        ('name = "bad"\nroot = "src/main.ddr"\n[unknown]\nx = "y"\n', "dunder.toml:3:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies\nx = "y"\n', "dunder.toml:3:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\nbad-id = "../plain_lib"\n', "dunder.toml:4:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\n1abc = "../plain_lib"\n', "dunder.toml:4:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\nsys = "../plain_lib"\n', "dunder.toml:4:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\nstd = "../plain_lib"\n', "dunder.toml:4:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\nskrift = "../dunder-skrift"\nskrift = "../plain_lib"\n', "dunder.toml:5:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\nplain = ""\n', "dunder.toml:4:"),
+        ('name = "bad"\nroot = "src/main.ddr"\n[dependencies]\nghost = "../does-not-exist"\n', "dunder.toml:4:"),
+    )
+    for bad_toml, expected_loc in toml_cases:
+        p.write("app/dunder.toml", bad_toml)
+        err = p.call("build", cwd=app, status=2)
+        assert expected_loc in err.stderr, (bad_toml, err.stderr)
+        err_explicit = p.call("check", "src/main.ddr", "--agent", cwd=app, status=2)
+        assert expected_loc in err_explicit.stderr, (bad_toml, err_explicit.stderr)
+
+    # Dependency cycle detection (app -> cyc_a -> cyc_b -> cyc_a)
+    p.write("cyc_a/dunder.toml", 'name = "cyc_a"\nroot = "a.ddr"\n[dependencies]\ncyc_b = "../cyc_b"\n')
+    p.write("cyc_a/a.ddr", "pub fn x() -> i32 { 1 }\n")
+    p.write("cyc_b/dunder.toml", 'name = "cyc_b"\nroot = "b.ddr"\n[dependencies]\ncyc_a = "../cyc_a"\n')
+    p.write("cyc_b/b.ddr", "pub fn y() -> i32 { 2 }\n")
+    p.write("app/dunder.toml", 'name = "consumer"\nroot = "src/main.ddr"\n[dependencies]\ncyc_a = "../cyc_a"\n')
+    cyc_err = p.call("build", cwd=app, status=2)
+    assert "cyc_b/dunder.toml:4:" in cyc_err.stderr and "cycle" in cyc_err.stderr, cyc_err.stderr
+
+    # Dependency alias conflict (app -> shared = shared1, dep_a -> shared = shared)
+    p.write("shared1/dunder.toml", 'name = "shared"\nroot = "lib/common.ddr"\n')
+    p.write("shared1/lib/common.ddr", "pub fn offset() -> i32 { 9 }\n")
+    p.write("app/dunder.toml",
+            'name = "consumer"\nroot = "src/main.ddr"\n[dependencies]\nshared = "../shared1"\ndep_a = "../dep_a"\n')
+    conf_err = p.call("build", cwd=app, status=2)
+    assert "dep_b/dunder.toml:5:" in conf_err.stderr and "conflicting" in conf_err.stderr, conf_err.stderr
+
+
+def bytes_big_endian_guards(p):
+    cases = (
+        ("u16_neg", "mut b: []u8 = [1, 2]; _ := bytes.u16_be(&b, -1)"),
+        ("u16_oob", "mut b: []u8 = [1, 2]; _ := bytes.u16_be(&b, 1)"),
+        ("u16_short", "mut b: []u8 = [1]; _ := bytes.u16_be(&b, 0)"),
+        ("i16_oob", "mut b: []u8 = [1, 2]; _ := bytes.i16_be(&b, 1)"),
+        ("u32_oob", "mut b: []u8 = [1, 2, 3, 4]; _ := bytes.u32_be(&b, 1)"),
+        ("i32_short", "mut b: []u8 = [1, 2, 3]; _ := bytes.i32_be(&b, 0)"),
+        ("i64_oob", "mut b: []u8 = [1, 2, 3, 4, 5, 6, 7, 8]; _ := bytes.i64_be(&b, 1)"),
+        ("u64_short", "mut b: []u8 = [1, 2, 3, 4, 5, 6, 7]; _ := bytes.u64_be(&b, 0)"),
+        ("append_w0", "mut b: []u8 = []; bytes.append_be(&mut b, 1, 0)"),
+        ("append_w9", "mut b: []u8 = []; bytes.append_be(&mut b, 1, 9)"),
+        ("set_oob", "mut b: []u8 = [1, 2]; bytes.set_be(&mut b, 1, 1, 2)"),
+    )
+    for name, body in cases:
+        p.write(f"{name}.ddr", f"import std.bytes as bytes\nfn main() {{\n{body}\n}}\n")
+        p.call("run", f"{name}.ddr", "-o", name, status=104)
+
+
 def mac_bundle(p):
     name = "Å & Tools"
     app = p.root / (name + ".app")
@@ -926,7 +1084,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
-    cases = [modules_and_manifest, targets_and_cache, worker_options, phase_timings, scalar_optimizer_controls,
+    cases = [modules_and_manifest, manifest_dependencies, bytes_big_endian_guards, targets_and_cache, worker_options, phase_timings, scalar_optimizer_controls,
              compiler_profile_controls, whole_function_mir_controls, whole_function_optimizer_controls,
              whole_function_memory_controls, whole_function_value_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
