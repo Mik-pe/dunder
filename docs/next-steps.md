@@ -78,7 +78,7 @@ integration av `dunder-skrift` och `dunder-hundmat/dogfood/skrift`:
   - Tydligare `rune`-literaler (i dag är `'A'` en `string`, vilket krävde
     `rune(65)`), anonyma flervärdesreturer/tupler (för parsningshjälpare utan
     engångsstructar) och mindre `.clone()`-tvång vid `.push()` av strängar.
-  - Kollisioner med reserverade ord som `var` och `len` i modul- och
+  - Kollisioner med reserverade ord som `len` i modul- och
     parameternamn samt enhetligare hantering av relativa importer (`"../..."` vs
     `..`).
 - **Diagnostik, `check` och format**:

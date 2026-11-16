@@ -75,9 +75,9 @@ delar oföränderlig text.
 | `map.keys(table)`, `set.items(set)` | Returnerar en ny array; tabellen behåller sina strängägare. |
 | `process.command(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
 | `process.run(program, args)`, `process.exec(command)` | Lånar under den synkrona körningen. |
-| `json.parse_bytes(move input)` | Dokumentet tar över bytebufferten utan kopia. |
-| `json.parse_bytes(input.clone())` | Begär uttryckligen ett dokument med en självständig snapshot. |
-| `json.parse_text(text)` | Lånar strängen och bygger dokumentets UTF-8-buffert. |
+| `json.Doc::parse_bytes(move input)` | Dokumentet tar över bytebufferten utan kopia. |
+| `json.Doc::parse_bytes(input.clone())` | Begär uttryckligen ett dokument med en självständig snapshot. |
+| `json.Doc::parse_text(text)` | Lånar strängen och bygger dokumentets UTF-8-buffert. |
 | `net.set_insert(&mut streams, move stream)` | Flyttar en stream till mängden. |
 
 `process.set_insert(&mut children, &mut child)` är ett fallibelt
@@ -126,8 +126,8 @@ Det är en prövad, begränsad lånemodell. Generella livstidsannotationer åter
 | `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
 | `std.bytes` | Växande bytebuffertar (`[]u8` och `[]i32`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex` / `hex_u8`, kontrollerad UTF-8-avkodning. |
-| `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish` och modulhjälpare). |
-| `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`Doc::parse_bytes`, `Doc::parse_text`, `.field`, `.at`, `.get_str`, `.get_i64`, `.get_u64`, `.get_bool` samt modulhjälpare). |
+| `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish`). |
+| `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`Doc::parse_bytes`, `Doc::parse_text`, `.field`, `.at`, `.get_str`, `.get_i64`, `.get_u64`, `.get_bool`). |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range` (`integer(string)` ger `{ ok, value: i64, error }`) samt `Unsigned::range`/`Unsigned::hex_range`; strikt ASCII med separatorer mellan siffror. |
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError::from_code`/`.code`/`.message` samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |

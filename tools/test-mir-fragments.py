@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detached final-object cache writes and cache-hit capture without MIR replay.
 
-Compare serial native3/DUFD bytes, delayed object bytes, and restored/linked
+Compare serial DUFD bytes, delayed object bytes, and restored/linked
 images on every native target. Execute native host results; malformed capture/save
 inputs are rejected atomically. This is a functional test, never a timing run.
 """
@@ -45,14 +45,12 @@ def main():
         assert signature == hashlib.sha256(key+raw).hexdigest().encode(), path
         assert len(raw) % 8 == 0
         n = [int(raw[i:i+8], 16) for i in range(0, len(raw), 8)]
+        assert n[:2] == [0x44554644, 1]
+        assert n[5:7] == ([2, 10] if extended else [0, 0])
         if extended:
-            assert n[:2] == [0x44554644, 1] and n[5:7] == [2, 10]
             assert n[-2:] == [2, 8]
-            words, labels, relocs = n[2:5]; header = 7
-            assert len(n) == 7+words+labels+3*relocs+2
-        else:
-            words, labels, relocs = n[:3]; header = 3
-            assert len(n) == 3+words+labels+3*relocs
+        words, labels, relocs = n[2:5]; header = 7
+        assert len(n) == 7+words+labels+3*relocs+n[5]
         # Each body has an actual end label and an unmarked private label;
         # the future function/callback namespace must never leak into a cache.
         expected_labels = 3 if path.name.endswith('.a') else 2

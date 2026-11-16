@@ -21,7 +21,7 @@ INVALID = (
     ('set-key', 'mut s:=set.new();key:="key"+42.str();_:=set.insert(&mut s,move key);print(key)'),
     ('command-args', 'mut c:=process.command("echo",[]);args:[]string=["hello"];process.add_args(&mut c,move args);print(args.len)'),
     ('command-stdin', 'mut c:=process.command("cat",[]);data:[]u8=[1,2];process.set_stdin(&mut c,move data);print(data.len)'),
-    ('json-input', 'data:[]u8=[b\'{\',b\'}\'];doc:=json.parse_bytes(move data);print(data.len)'),
+    ('json-input', 'data:[]u8=[b\'{\',b\'}\'];doc:=json.Doc::parse_bytes(move data);print(data.len)'),
 )
 RESOURCE_INVALID = (
     ('stream-set-copy', 's:=net.stream_set();other:=s;print(net.set_len(&s))', 'use of moved value'),

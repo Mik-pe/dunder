@@ -35,7 +35,7 @@ Bindningar och funktionsparametrar är oföränderliga som standard. `mut` är
 det explicita valet av muterbarhet. Typen ändras aldrig efter deklarationen.
 All deklaration kräver initiering. Det finns inga oinitierade lokaler i denna
 delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggtid.
-Äldre `var` accepteras som kompatibilitetsalias; ny kod använder `mut`.
+`var` är ett vanligt namn och kan användas för lokaler, parametrar och importalias.
 
 ## Typer och uttryck
 

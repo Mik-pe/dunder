@@ -88,6 +88,8 @@ def main():
 
         invalid = (
             'fn main(){mut 42}',
+            'fn main(){var x:=1}',
+            'fn main(){var x:i32=1}',
             'fn main(){value:=move }',
             'fn bad(move :i32){} fn main(){}',
             'fn main(){f:fn(move)->i32=missing}',

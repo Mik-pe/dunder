@@ -66,12 +66,12 @@ def timings(stderr, target):
 
 def cache_info(cwd):
     files = list((cwd / 'build/.dunder-cache').rglob('*.fn'))
-    result = dict(files=len(files), bytes=0, native3=0, dufd=0)
+    result = dict(files=len(files), bytes=0, dufd=0, invalid=0)
     for path in files:
         result['bytes'] += path.stat().st_size
         with path.open('rb') as file:
             prefix = file.read(136)
-        result['dufd' if prefix[128:136] == b'44554644' else 'native3'] += 1
+        result['dufd' if prefix[128:136] == b'44554644' else 'invalid'] += 1
     return result
 
 

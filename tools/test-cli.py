@@ -882,7 +882,17 @@ def phase_timings(p):
     sources = Path(__file__).resolve().parents[1] / "selfhost/driver"
     for module in ("cli", "timings", "compiler_profile", "native_clock"):
         p.write(module + ".ddr", (sources / (module + ".ddr")).read_text())
-    p.write("clock-failure.ddr", "import timings\nfn main(){timings.report(true,false,0,1,0,1,-1,-1,-1,-1,-1,-1)}\n")
+    p.write("clock-failure.ddr", '''
+import timings
+import compiler_profile as profile
+fn main(){
+    details := profile.new(-1)
+    inline_data := timings.inlining()
+    backend_data := timings.backend()
+    timings.report(true,false,0,1,0,1,-1,-1,-1,-1,-1,-1,
+        false,0,0,0,0,0,&details,&inline_data,&backend_data)
+}
+''')
     unavailable = json.loads(p.call("run", "clock-failure.ddr").stderr)
     assert unavailable["clock_ok"] is False and unavailable["total"] is None, unavailable
     assert all(value is None for value in unavailable["phases"].values()), unavailable
