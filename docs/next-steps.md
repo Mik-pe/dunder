@@ -1,21 +1,30 @@
 # Nästa steg för Dunder
 
-Föreslagen ordning efter ägarskapsgranskningen. Detta är en utvecklingsplan;
-funktionerna nedan är inte implementerade. Nuvarande kontrakt finns i
+Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 är implementerad;
+etapperna 2–5 är fortsatt en utvecklingsplan. Nuvarande kontrakt finns i
 [minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
 [status](status.md).
 
-## 1. Partiella flyttar och kontrollerad take/replace
+## 1. Partiella flyttar och kontrollerad replace — implementerat
 
-Spåra initiering per structfält, så att flera oberoende fält kan flyttas ur
-samma ägare och återstående fält städas exakt en gång. Dagens regel
-förbrukar hela föräldern vid första fältflytten. Kompilatorns workerresultat
-innehåller fortfarande fältkopior på grund av den begränsningen.
+Initiering spåras nu per structfält, även för nästlade fältkedjor. Oberoende
+fält kan flyttas separat och återinitieras genom tilldelning. Grenar och
+loopkanter följer samma glesa platsträd; återstående runtimeägare städas
+med befintlig rekursiv cleanup. `defer` behåller ett konservativt rotlås.
 
-Lägg till en kontrollerad operation som byter ut ett värde bakom `&mut`
-och returnerar den tidigare ägaren. Därmed kan kompilatorn lämna vidare en
-färdig kodbuffert utan att klona den eller lämna en oinitierad lucka.
-Grenar, loopar och uppskjuten cleanup måste följa varje berört fält.
+`replace(&mut place, replacement)` returnerar den tidigare ägaren utan att
+lämna en oinitierad lucka. Den återanvänder typade plats- och ägaroperationer;
+inga nya runtimehjälpare eller MIR-opkoder behövs. En generell `take` utan
+uttrycklig ersättare har inte införts eftersom ett giltigt standardvärde
+inte finns för alla typer.
+
+Kompilatorns workerresultat överför modellfält separat och byter ut färdiga
+kod- och metadataarenor mot tomma värden. Tabell i `dunder-hundmat` använder
+separata flyttar för sitt ägda aggregeringsresultat. Verifieringen omfattar
+de tre nativa målens runtimes, optimeringar på/av, felkontrakt och cleanup.
+[Minneskontrakt och gränser](memory.md#fält-element-och-begränsningar) ·
+[Arkitektur](arkitektur.md#initiering-per-lagringsplats) ·
+[Riktad verifiering](../tools/test-partial-moves.py).
 
 ## 2. Lokala lån och lånade vyer
 

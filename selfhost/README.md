@@ -231,6 +231,14 @@ Ett lexikalt regionlån får heller inte flyttas till ett resultat, lagras i
 ett längre levande värde eller lämnas vidare till ett anrop som kan göra en
 rå pekare av lånet. Se [minnesarkitekturen](../docs/memory.md).
 
+`ownership_state` äger ett glest, kanoniskt träd över lokaler och structfält,
+inklusive grenjoins och looparnas checkpoints. Källans initieringsbevis
+är separat från runtimeägarslots och typade åtkomster i `typed_places`.
+Workers lämnar över oberoende modellfält med partiella flyttar. Färdiga
+kod- och metadataarenor lämnar en återanvändbar `Session` genom `replace`
+och tas emot utan kloning. `Session` och ägartillståndet förblir opaque;
+överföringarna sker i modulen som äger respektive representation.
+
 CLI:t stöder även `run`, `test --affected`, tidsgränser för tester, manifest,
 målval och macOS-appar med resurssignering. Nativebyggen kan återanvända
 funktionsfragment med `--incremental`.

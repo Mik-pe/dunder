@@ -44,28 +44,34 @@ som fristående ELF-binärer.
 
 ## Frönas ursprung
 
-De tre fröna kommer från Dunder-källrevision `f15e9f3e47805c952717d311b45a5eeefa8994a9`.
-De byggdes från de frysta syntaxbryggorna från revision
-`f5ad2ab52b3d58e8a8670df2635a0c80f4145296`, med värdens ingångsfil och
-två byteidentiska slutbyggen. De använder ägarflyttar och lånade
-standardparametrar och förstår `mut`, `move`, `@resource`, uttrycklig
-`.clone()`, `array.swap` och stränginterpolering. Uppdateringen låter även
-kompilatorns egen tidiga byggkedja använda klonfria arraybyten.
+De tre fröna kommer från Dunder-källrevision `7347cd62d081139b7cd0c47a21b86b27e61803fe`
+(Git-träd `55a8361918dd5eff994162c14da0c9a96f70aa18`). macOS-kompilatorn
+återbyggdes med föregående frysta macOS-frö från `f15e9f3` och producerade
+Linux-korsbilderna. Varje mål verifierades sedan med sin ingångsfil och
+byteidentiska självbyggen. Fröna använder ägarflyttar och lånade
+standardparametrar och förstår partiella structfältflyttar och
+`replace(&mut place, replacement)`, utöver `mut`, `move`, `@resource`,
+uttrycklig `.clone()`, `array.swap` och stränginterpolering. Därmed kan den
+tidiga självbyggkedjan överföra färdiga kod- och metadataarenor utan kloning
+och utan att öppna kompilatorns opaque `Session` för andra moduler.
 Komprimeringen är `gzip -9 -n`.
 Tabellen anger SHA-256 för den **uppackade** kompilatorn. Syskonfilerna
 `*.sha256` kontrollerar de komprimerade filerna.
 
 | Värd | Ingångsfil | SHA-256 |
 | --- | --- | --- |
-| ARM64/macOS | `selfhost/main.ddr` | `8783408c28c43e79cb306de1b8834ba697da7fe1aea1fef004965b6c46663ec1` |
-| ARM64/Linux | `selfhost/linux.ddr` | `ef87067be99a8691232723e1b8de23c385c2eba6f17fc5a959338cbfcb21d1fa` |
-| x86-64/Linux | `selfhost/x86_linux.ddr` | `a3ebec87f920785fec0b3df9c63e2954c543779d96048ac06b1e0161bb13aab9` |
+| ARM64/macOS | `selfhost/main.ddr` | `72a911c59318821c7d9b301c5ab429609282e4096356dad9698d6828e87443e3` |
+| ARM64/Linux | `selfhost/linux.ddr` | `bfa1fe3d8cb4eb050974d247fee0bf084adf7cd93609a8449d9671da5ec961e8` |
+| x86-64/Linux | `selfhost/x86_linux.ddr` | `8d2d72139b69879a7248c5aeff0c1bdc77aabdd43b282b2db65c1fdcd289b92f` |
 
-Frökällan passerade 86 verifieringssviter samt byteidentiska självbyggen
-med en och fyra workers på macOS. Båda Linux-värdarna passerade seriell
-fixpunkt, 143 testgrupper och de tre nya ägarskapssviterna. Linuxfröna är
-även byteidentiska med macOS-kompilatorns korsproducerade bilder.
-Linux/x86-64 kördes under emulering på ARM64. Varje frö kan bygga
+Varje frö passerade 13 ägartillståndsgrupper samt 30 målbilder, 10 egna
+nativekörningar och 90 avvisade kontrakt i den riktade ägarskapssviten.
+Den täcker fältflyttar, `replace`, begränsad cleanup, inline C-/POD-lagring
+och index-/utvärderingsordning med optimeringar på och av.
+Linuxfröna är byteidentiska med macOS-kompilatorns korsproducerade bilder
+och två efterföljande självbyggen på respektive Linux-värd. Linuxmålen
+kördes i lokala Docker-containrar; x86-64 emulerades på ARM64. macOS-fröets
+fixpunkt verifierades även med ett separat självbygge. Varje frö kan bygga
 kompilatorn och korskompilera program till alla fyra mål.
 
 För att utveckla från en ren utcheckning behövs det incheckade fröet för
