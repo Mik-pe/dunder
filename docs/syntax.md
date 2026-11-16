@@ -52,7 +52,8 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
 | `[i32; 8]` | En array med åtta element; längden ingår i typen. |
 | `[]i64` | En dynamisk typad array. |
-| `&Point` / `&mut Point` | En läs-/skrivborrow som funktionsparameter; se [standardbiblioteket](standard.md). |
+| `&Point` | Ett läslån som parameter eller oföränderlig lokal referens. |
+| `&mut Point` | Ett exklusivt skrivlån som funktionsparameter. |
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
 | `Command` / `sys.ReadResult` | En nominell enum med namngivna värden eller payload-varianter. |
 | `range` | Ett halvöppet intervall med `i32`-gränser. |
@@ -150,6 +151,17 @@ rekursion och ömsesidig rekursion tillåts. Parametrarna är oföränderliga.
 Vanliga sträng- och aggregatparametrar lånar indata för läsning under
 anropet; skalärer kan överföras som billiga värden. Explicit `&T` fungerar
 också för läslån. `&mut T` kräver ett uttryckligt skrivlån vid anropet.
+Lokala läsreferenser kan namnges med `r := &value` eller `r: &T = &value`.
+Fält och arrayelement går också att låna. Referensen är oföränderlig och
+gäller till deklarationsblockets slut, även efter sista användningen.
+Oberoende syskonfält får ändras; ett elementlån låser hela arrayen.
+Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
+
+Temporära uttryck får lånas direkt vid anrop, exempelvis `read(&f())` och
+`sum(&[1, 2])`, och hålls levande tills anropet är klart. De får inte bindas
+som lokala referenser. Lokala `&mut`, referenser i aggregat och returnerade
+lån med livstidssignaturer stöds ännu inte.
+[Låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer).
 
 En funktion som ska behålla resursen deklarerar `move`:
 
@@ -508,7 +520,7 @@ upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
 `i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune` eller en enum utan payload;
 den härleds eller hämtas från förväntad arraytyp.
 En fast array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
-Nästlade arrayer, structelement och slices är ännu inte implementerade.
+Nästlade arrayer och structelement är ännu inte implementerade.
 
 Arrayer flyttas vid bindning och retur. Vanliga parametrar lånar för
 läsning. `mut` krävs för att tilldela ett element. Index har typen `i32`; negativa index och index vid
@@ -516,6 +528,14 @@ eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
 längden som `i32`. Fasta arrayer kan returneras genom ägaröverföring på samma sätt som
 andra resursägande värden.
 `values.swap(i, j)` byter två element utan kloning och kräver muterbar lagring.
+
+`middle := &values[start..end]` skapar en lånad `&[]T` utan heapallokering
+eller retain. En explicit annotering, `middle: &[]i32 = &values[1..3]`, går
+också bra. Vyn använder originalets adress, och dess `len` och `cap()` är
+intervallängden. Fasta arrayer och redan lånade vyer kan skäras på samma sätt.
+Gränserna utvärderas en gång från vänster till höger; ett intervall utanför
+`0 <= start <= end <= values.len` ger status 103. Vyn är oföränderlig och
+lånar hela arrayen till blockslut. `.clone()` ger en egen ägd array.
 
 `start..end` har typen `range`, inkluderar start och utesluter slut.
 Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
@@ -643,6 +663,7 @@ inte. Fel i uttrycken pekar på deras ursprungliga källpositioner.
 | `text.len`, `text.len()`, `len(text)` | Antal byte, `i32`, konstant tid. |
 | `text[i]`, `text.bytes()[i]` | Ett byte som `i32` i intervallet 0–255. |
 | `text[start..end]` | Ny sträng från halvöppna bytegränser. Båda måste vara UTF-8-gränser. |
+| `&text[start..end]` | Lånad bytevy av typen `&[]u8`, utan ny sträng eller retain. |
 | `text.runes()[i]` | En rune efter avkodning från början; linjär tid. |
 | `text.runes().len` | Antal kodpunkter; linjär tid. `.len()` och `len(...)` fungerar också. |
 | `for r in text.runes()` | Avkodar kodpunkter i ett linjärt pass. |
@@ -661,6 +682,10 @@ för båda. Lagrade arrayiteratorer äger sin samling; skapa dem med
 `(move values).iter()` eller `values.clone().iter()`.
 Strängsnitt kan också ta ett lagrat eller returnerat `range`-värde,
 exempelvis `span := 7..11; part := text[span]`.
+En namngiven textvy, exempelvis `utf8 := &text[1..7]` för `"xå🌍y"`,
+behåller originalets adress. Dess `len` och `cap()` är sex byte. Båda
+gränserna måste vara UTF-8-gränser även när vyn är tom. Intervallfel ger
+103 före UTF-8-kontrollen som ger 106. `.clone()` av vyn ger en ägd `[]u8`.
 
 En rune är en Unicode-kodpunkt, inte ett grapheme-kluster. Exempelvis har
 `"é"` en rune och `"e\u{301}"` två; strängarna jämförs som olika.
@@ -682,8 +707,9 @@ ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
 
 Ägarflyttar, uttrycklig kloning och läslån är den gemensamma modellen;
 se [minnesmodellen](memory.md) och [standardbiblioteket](standard.md).
-Lån som kan returneras eller lagras, arrayslices, aggregat som arrayelement,
-generiska bibliotek och egna iteratorer återstår. Självhosting verifieras
+Lån som kan returneras eller lagras i aggregat, lokala skrivlån, aggregat som
+arrayelement, generiska bibliotek och egna iteratorer återstår. Lokala läslån
+och lånade array-/textintervall stöds. Självhosting verifieras
 på de tre nativa målen; [Wasm-verifiering är senarelagd](status.md#webassembly-senarelagt-under-språkutveckling).
 
 ## Råtyper, privilegier och C-layout

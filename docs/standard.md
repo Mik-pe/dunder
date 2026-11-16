@@ -112,15 +112,18 @@ fn first(values: []i64) -> i64 {
 vid läsning, fältåtkomst och indexering. En läsreferens kan inte modifieras.
 Oföränderliga bindningar kan inte lånas med `&mut`.
 
-Detta första stöd begränsar referenser till funktionsparametrar och explicita
-argument. De kan inte returneras, lagras i structar/enums/arrayer eller bindas
-som lokala referenser. `copy := values.clone()` skapar en ägd kopia av det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
+Läslån kan också namnges lokalt med `r := &value` och gäller då till
+deklarationsblockets slut. `&values[start..end]` ger en lånad `&[]T` och
+`&text[start..end]` en UTF-8-kontrollerad bytevy, `&[]u8`, utan ny buffert.
+Referenser kan ännu inte returneras eller lagras i structar/enums/arrayer;
+lokala skrivlån stöds inte. `copy := values.clone()` skapar en ägd kopia av
+det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
 samma rotvariabel; även olika fält i samma struct räknas konservativt som
 samma rot. Ändringar som kan flytta en arraybuffert måste beräknas före
 en elementtilldelning eller ett anrop som lånar elementet.
 
-Det är en prövad, begränsad lånemodell. Generella livstidsannotationer återstår. Ägda allokeringar återvinns automatiskt; se
-[minnesmodellen](memory.md).
+Generella livstidsannotationer återstår. Ägda allokeringar återvinns
+automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 
 ## Moduler
 

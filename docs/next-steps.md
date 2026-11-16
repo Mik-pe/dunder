@@ -1,7 +1,8 @@
 # Nästa steg för Dunder
 
-Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 är implementerad;
-etapperna 2–5 är fortsatt en utvecklingsplan. Nuvarande kontrakt finns i
+Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 och 2a är
+implementerade; etapp 2b och återstående delar av 3–5 är utvecklingsplanen.
+Nuvarande kontrakt finns i
 [minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
 [status](status.md).
 
@@ -26,24 +27,40 @@ de tre nativa målens runtimes, optimeringar på/av, felkontrakt och cleanup.
 [Arkitektur](arkitektur.md#initiering-per-lagringsplats) ·
 [Riktad verifiering](../tools/test-partial-moves.py).
 
-## 2. Lokala lån och lånade vyer
+## 2a. Lokala läslån och lånade vyer — implementerat
 
-Gör det möjligt att namnge ett läslån till ett fält eller arrayelement och
-använda ett array-/textintervall som vy utan ny buffert. Börja med lån som
-stannar i samma scope; utöka sedan till returer med ett tydligt samband
-mellan indata och returens livslängd. Ägaren får inte flyttas, ersättas eller
-muteras på ett motstridigt sätt medan lånet används.
+`r := &owner.field` och `r := &values[index]` namnger oföränderliga läslån.
+Typer kan också annoteras med `&T`. Lånen gäller till deklarationsblockets
+slut, utan NLL. Oberoende syskonfält kan fortfarande flyttas och ändras;
+arrayelement och intervall låser konservativt hela sin array. Motstridig
+mutation, flytt och `replace` avvisas.
 
-Det tar bort behovet av tillfälliga strängägare för rena läsningar och gör
-JSON-, CSV-, typsnitts- och HTTP-API:er möjliga utan materialiserade
-mellanbuffertar eller `(data, off, length)`-triplar. Utvidga även lån till att
-omfatta temporära uttryck vid anrop (`&f()`, `&[1, 2]`) så att anropare slipper
-namnge engångsvariabler eller skriva dubbla `*_owned`-metoder. Verifiera både
-avvisade livstidsfel och att vyerna behåller originalets adress utan
-allokering. Begränsade lån är redan möjliga under anrop; den här etappen
-utvidgar samma regel.
+`&values[start..end]` ger `&[]T`; `&text[start..end]` ger `&[]u8` med
+kontrollerade UTF-8-gränser. Vyerna använder originalets adress utan
+heapallokering eller retain. `.clone()` materialiserar en ägd array.
+Temporärer som `&f()` och `&[1, 2]` får lånas under anropet men inte bindas
+lokalt. Lokala `&mut` och lokala lån av scratchlagring ingår inte.
 
-## 3. Bättre ägda samlingar
+Lånetabellen använder ägartillståndets kanoniska platsidentiteter och den
+befintliga escapegrafen; den skapar ingen andra initieringsmodell.
+HTTP-servern i `dunder-hundmat` använder namngivna path- och bodyvyer utan
+offsetpar vid API-gränsen. Kompilatorns fragment-cache ska använda samma
+mekanism för rena läsningar efter fröuppdateringen. Riktad verifiering
+kontrollerar adressidentitet, allokeringsräknare, livstidsfel, intervall och
+UTF-8 på de tre nativa målen, utan prestandamätningar.
+[Kontrakt](memory.md#lokala-läslån-och-intervallvyer) ·
+[Arkitektur](arkitektur.md#proveniens-och-lexikala-läslån) ·
+[Verifieringsverktyg](../tools/test-local-borrows.py).
+
+## 2b. Returnerade lån — planerat
+
+Definiera ett tydligt samband mellan indata och returens livslängd innan
+lån får lämna funktionen eller lagras i längre levande aggregat. Bygg sedan
+JSON-, CSV-, typsnitts- och HTTP-API:er som kan returnera vyer utan nya
+buffertar eller `(data, off, length)`-tripplar. Lokala skrivlån och lån av
+scratchlagring kräver också uttryckliga kontrakt innan de utvidgas.
+
+## 3. Bättre ägda samlingar — planerat
 
 Utöka arrayelement till structar, payload-enums och andra arrayer,
 med samma flytt-, klonings- och cleanupregler som fristående värden.
@@ -61,7 +78,7 @@ modell med statisk specialisering och synliga ägarskapskrav. Nuvarande
 > logiska poster kan hanteras samlat utan att ge upp cachevänlig kolumnlayout.
 > Se [soa-research-plan.md](soa-research-plan.md).
 
-## 4. Automatisk cleanup för externa resurser och typade fel
+## 4. Automatisk cleanup för externa resurser och typade fel — planerat
 
 Låt `@resource`-typer ange cleanup som kompilatorn kör vid scope-slut,
 retur, `break`, `continue` och felvägar. Flytt lämnar över ansvaret; lån
@@ -74,7 +91,7 @@ blandning av `.ok`/`.error`, enums och statuskoder utan att dölja resursägare
 på felvägen. Ett fallibelt konsumtionsanrop måste kunna lämna tillbaka en
 resurs som inte togs över.
 
-## 5. Språkergonomi, testdiagnostik och standardbibliotek
+## 5. Språkergonomi, testdiagnostik och standardbibliotek — återstående plan
 
 Konkreta förbättringspunkter som bromsade iterationen vid utveckling och
 integration av `dunder-skrift` och `dunder-hundmat/dogfood/skrift`:

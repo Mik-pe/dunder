@@ -42,9 +42,11 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
   `replace(&mut place, replacement)` lämnar tillbaka den tidigare ägaren
   och installerar en giltig ersättare utan oinitierad lucka.
 - Ägda arraybuffertar frigörs deterministiskt. Oföränderliga strängar
-  använder referensräkning. Ett lån av en lokal, ett fält eller ett
-  arrayelement gäller under anropet. Kontrollen avvisar motstridiga lån
-  och mutationer under utvärderingen av argument. Regionen äger minnet i
+  använder referensräkning. Namngivna lokala läslån av fält och arrayelement
+  gäller till deklarationsblockets slut. Array- och textintervall kan lånas
+  som vyer utan heapallokering eller retain. Temporära uttryck kan lånas
+  under anrop. Kontrollen avvisar överlappande flytt, ersättning och mutation.
+  Regionen äger minnet i
   ett lexikalt scratch-block och kontrollerar vilka anrop som får låna det.
   [Minnesmodellen](memory.md)
 - Standardbiblioteket innehåller map, set, array, text, hash, bytes,

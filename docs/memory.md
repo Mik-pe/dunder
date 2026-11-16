@@ -14,7 +14,8 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | --- | --- |
 | `b := a`, tilldelning, retur och konstruktion | Flyttar resursägande värden till mottagaren. |
 | Vanlig funktionsparameter | Lånar strängar och aggregat för läsning under anropet. |
-| `&mut value` | Exklusivt skrivlån; kräver muterbar lagring. |
+| `r := &place` | Namnger ett oföränderligt läslån till blockets slut. |
+| `&mut value` vid anrop | Exklusivt skrivlån; kräver muterbar lagring. |
 | `move`-parameter och `consume(move value)` | Funktionen tar över ägarskapet. |
 | `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
 | Vanlig `for value in values` | Läslån av samlingen under loopen. |
@@ -80,10 +81,10 @@ fn main() {
 Användning efter flytt ger kompileringsfel. En `mut`-lokal kan få ett nytt
 värde efter flytt. Efter grenar måste värdet finnas på varje väg som når
 användningen; en loop måste återställa värden som behövs i nästa varv.
-Ett lånat värde får inte flyttas till en ägd bindning, retur eller container.
+Ett lånat resursvärde får inte flyttas till en ägd bindning, retur eller container.
 Välj en `move`-parameter när funktionen ska behålla indata, eller klona när
-det ska finnas två oberoende ägare. Lån kan ännu inte returneras eller
-lagras som lokala referenser eller fält.
+det ska finnas två oberoende ägare. Läslån kan namnges lokalt enligt reglerna
+nedan. Referenser får ännu inte returneras eller lagras i aggregat.
 
 Flytt av en dynamisk array behåller buffert och kapacitet. `.clone()` ger en
 oberoende buffert och klonar ägda barn rekursivt; klonens reservkapacitet
@@ -128,6 +129,62 @@ I `text + change(&mut text)` behåller vänsterledet strängen som lästes före
 funktionsanropet. Samma utvärderingsordning gäller för argument, index och
 snittgränser. En retur bevarar sitt resultat medan funktionen städar sina
 lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
+
+### Lokala läslån och intervallvyer
+
+`r := &owner.field` och `r := &values[index]` skapar oföränderliga lokala
+referenser. Typen kan härledas eller anges, exempelvis `r: &i32 = &values[0]`.
+Lånet gäller till slutet av blocket som deklarerar referensen, även efter
+dess sista läsning; kompilatorn använder inte NLL. Ett inre block kan därför
+avgränsa lånet före en senare ändring av ägaren.
+
+```dunder
+fn main() {
+    mut values: []i32 = [7, 20, 22, 9]
+    {
+        first := &values[1]
+        middle: &[]i32 = &values[1..3]
+        assert(first == 20 && middle.len == 2 && middle[1] == 22)
+        independent := middle.clone()
+        assert(independent[0] == 20)
+    }
+    values[1] = 21
+    text := "xå🌍y"
+    utf8 := &text[1..7]
+    assert(utf8.len == 6 && utf8[0] == 195)
+}
+```
+
+`&values[start..end]` har typen `&[]T` för arrayens elementtyp. Det fungerar
+för fasta och dynamiska arrayer och för delintervall av en befintlig vy.
+`&text[start..end]` ger `&[]u8`, med bytegränser i originalsträngen.
+Båda gränserna utvärderas en gång i källordning. Intervallet måste uppfylla
+`0 <= start <= end <= len`, annars blir runtime-status 103. För text krävs
+dessutom UTF-8-gränser, även för ett tomt intervall; ett brott ger 106 efter
+att intervallgränserna kontrollerats.
+
+Vyn pekar på originalets element, skapar ingen heapbuffert och behåller
+ingen ägare genom referensräkning. `len` och `cap()` är båda vyns längd.
+Varken skrivning genom vyn eller storleksändring är tillåten. En uttrycklig
+`.clone()` materialiserar en ägd array; en klon av en textvy är alltså
+`[]u8`. Vyns livslängd skyddas i stället av lånet.
+
+Ett aktivt lån av ett structfält tillåter ändring och flytt av oberoende
+syskonfält. Flytt, `replace`, skrivning eller ett skrivlån som överlappar
+den lånade platsen avvisas, inklusive ändring av hela roten. Ett lån av
+ett arrayelement eller delintervall låser konservativt hela arrayen.
+Återlån följer den ursprungliga ägaren, även genom flera lokala alias.
+
+Temporära uttryck kan lånas under ett anrop, exempelvis `read(&f())` eller
+`sum(&[1, 2])`. Ägaren hålls då levande genom argumentutvärderingen och
+anropet. `r := &f()` och `r := &[1, 2]` avvisas: en lokal referens förlänger
+inte en temporärs livslängd. Lokala `&mut`-referenser, returtyper med lån och
+lokala lån av scratchlagring stöds ännu inte.
+
+Nya lokala lån får inte lämnas till en funktion som kan exponera deras
+lagring som råpekare, inte heller genom indirekta anrop. Explicit `unsafe`
+kan observera adressen direkt, exempelvis med `addr(&view[0])` i ett
+identitetsprov; råpekaren följer då kontraktet för `unsafe`.
 
 ### Fält, element och begränsningar
 
@@ -199,7 +256,15 @@ python3 tools/test-array-moves.py "$dunder_bin"
 python3 tools/test-resource-moves.py "$dunder_bin"
 python3 tools/test-resource-ownership.py "$dunder_bin"
 python3 tools/test-stdlib-ownership.py "$dunder_bin"
+python3 tools/test-local-borrows.py "$dunder_bin"
 ```
+
+Lånesviten korsbygger de tre nativa målen och kör värdmålets program.
+`--runner TARGET=COMMAND` kan upprepas för lokala målmiljöer, exempelvis
+`--runner 'arm64-linux=/sökväg/till/lokal-runner arm64'`. Kommandot får
+målbinärens absoluta sökväg som sista argument. Sviten kontrollerar adress,
+allokerings- och retainräknare, livstidsfel, intervall och UTF-8; den gör inga
+prestandamätningar.
 
 Testverktyget använder Python 3:s standardbibliotek. Det
 bygger varje program med den angivna Dunder-kompilatorn. Tio minnesprov håller

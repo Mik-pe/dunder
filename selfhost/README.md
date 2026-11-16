@@ -224,12 +224,21 @@ oanropade kroppar i importträdet. `check --agent` skriver JSONL med
 modulsökväg, UTF-8-byteoffsetar och härledda typer för lokala bindningar.
 Diagnostiken innehåller fil, rad, kolumn och felkod.
 
-Lån är funktionsparametrar. Kontrollen spårar variabler, fält,
-arrayelement och mutationer under argumentutvärderingen. Två delade lån
-är tillåtna. Ett muterbart lån kräver exklusiv åtkomst till sin rot.
-Ett lexikalt regionlån får heller inte flyttas till ett resultat, lagras i
-ett längre levande värde eller lämnas vidare till ett anrop som kan göra en
-rå pekare av lånet. Se [minnesarkitekturen](../docs/memory.md).
+Läslån kan vara funktionsparametrar eller namngivna lokaler, exempelvis
+`r := &owner.field` och `r: &i32 = &values[0]`. Lokala referenser är
+oföränderliga och gäller till blockslut, även efter sista läsningen.
+Syskonfält tillåts; elementlån och intervall låser hela arrayen.
+`&values[start..end]` ger `&[]T` och `&text[start..end]` ger `&[]u8` med
+UTF-8-gränskontroll. Vyerna behåller originalets adress, har vylängden som
+`len` och `cap()` och kräver ingen heapallokering eller retain. `.clone()`
+ger en ägare uttryckligen. Intervallfel ger 103, ogiltiga UTF-8-gränser 106.
+
+Temporärer som `&f()` och `&[1, 2]` kan lånas under anropet men inte bindas
+lokalt. Lokala `&mut`, returnerade referenser och lokala scratchlån stöds
+ännu inte. Den globala escapegrafen avvisar nya lån till funktioner som kan
+exponera råadresser, även genom indirekta anrop. Direkt adressobservation i
+explicit `unsafe` används däremot av identitetsproven.
+[Minneskontrakt och gränser](../docs/memory.md#lokala-läslån-och-intervallvyer).
 
 `ownership_state` äger ett glest, kanoniskt träd över lokaler och structfält,
 inklusive grenjoins och looparnas checkpoints. Källans initieringsbevis
@@ -238,6 +247,16 @@ Workers lämnar över oberoende modellfält med partiella flyttar. Färdiga
 kod- och metadataarenor lämnar en återanvändbar `Session` genom `replace`
 och tas emot utan kloning. `Session` och ägartillståndet förblir opaque;
 överföringarna sker i modulen som äger respektive representation.
+
+`local_borrows.Table` kompletterar detta träd med proveniens och aktiva lån,
+utan en andra initieringsmodell. `borrowed_view` bygger en framebaserad
+deskriptor utan runtimeägare. Färdiga anrops-, konstruktor- och
+operatorresultat nollställer argumentens lånemetadata, så att ett nytt värde
+inte ärver en inre vys `borrow_home`. Nya uttrycksformer måste förbereda
+escapeanalysen; saknas bevis avvisas de. Källkontrollen körs även när
+funktionscachen återanvänder maskinkod. HTTP-servern i `dunder-hundmat`
+använder path-/bodyvyer; kompilatorns fragment-cache blir konsument efter
+fröuppdateringen. Inga nya prestandaanspråk följer av funktionaliteten.
 
 CLI:t stöder även `run`, `test --affected`, tidsgränser för tester, manifest,
 målval och macOS-appar med resurssignering. Nativebyggen kan återanvända
@@ -294,6 +313,7 @@ en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
 | `mir_call_inputs.ddr` | Separat semantisk anropsindata-vy för den kompletta källproducenten; råkontraktet bevaras. |
 | `mir_lower.ddr`, `mir_link.ddr` | Worker-lokal sänkning, numerisk ObjectData-transport, strukturell objektvalidering och ordnad sammanfogning. |
 | `record_take.ddr` | Kapacitetsnormalisering för äldre temporäröverföring; källflyttar hanteras av `compile.ddr` och `ownership_state.ddr`. |
+| `local_borrows.ddr`, `borrowed_view.ddr` | Lexikala läslån med kanonisk proveniens samt intervallkontroller och emission av lånade array-/textvyer. |
 | `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
 | `opt_ir.ddr`, `typed_body.ddr` | Funktionslokala skalärnoder från språkets typkontroll. |
 | `opt_pass.ddr` | Begränsad förenkling och bevis för säkra index och ökningar. |
@@ -328,11 +348,17 @@ dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
 python3 tools/test-runtime-contracts.py "$dunder_bin"
 python3 tools/test-partial-moves.py "$dunder_bin" --inline-replace
+python3 tools/test-local-borrows.py "$dunder_bin"
 ```
 
-Fält-/replace-sviten korsbygger alla tre nativa mål och kör värdens bilder.
+Fält-/replace- och lånesviterna korsbygger alla tre nativa mål och kör värdens bilder.
 `--runner TARGET=COMMAND` kan upprepas för att dessutom köra andra måls
-bilder i en lokal målmiljö. Sviten mäter inga prestanda.
+bilder i en lokal målmiljö, exempelvis
+`--runner 'arm64-linux=/sökväg/till/lokal-runner arm64'`. Runnern får
+målbinärens absoluta sökväg som sista argument. Lånesviten verifierar bland
+annat adressidentitet, allokering, retain, livstidsfel och UTF-8. För en
+seriell kompilator utan parallell ingång används `--serial`. Sviterna mäter
+inga prestanda.
 
 De körda programmen har förväntade värden, utskrifter och felutfall.
 Diagnostikfallen använder både giltiga exempel och källor som ska avvisas.

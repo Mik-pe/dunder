@@ -27,28 +27,36 @@ Den implementerade modellen kombinerar **unika arraybuffertar, värdekopior,
 lexikal städning och referensräknade oföränderliga strängar**. Tilldelning
 ersätter och frigör gamla resurser; scope-slut, `break`, `continue` och retur
 städar ägda värden. Nästlade structar och aktiva enumpayloads städas rekursivt.
-String-, byte- och runevyer behåller strängen tills sista ägaren försvinner.
+Strängkloner och snapshotiteratorer behåller sin strängägare; lokala
+intervallvyer lånar i stället originalets lagring till blockslut.
 Referensräkningen är icke-atomär och omfattar enbart oföränderliga löv utan
 cykler. Det reviderar det tidigare designmålet att helt undvika
 referensräkning: strängkopior behåller nu billig delning och säker livslängd
 utan att hålla kvar alla strängar till processlut. Ingen spårande GC behövs.
 Läs [layout, allokering, tester och gränser](memory.md).
 
-Användarvalda allokatorer och generella livstider är nästa
-designsteg. Tabellen beskriver målen för den fulla lånemodellen; dagens
-referenser är begränsade till funktionsparametrar.
+Den implementerade lånemodellen omfattar funktionsparametrar och lexikala,
+oföränderliga lokala läsreferenser. Användarvalda allokatorer, lokala skrivlån
+och signaturer för returnerade lån återstår.
 
 | Situation | Vad kompilatorn ska tillåta eller upptäcka |
 | --- | --- |
 | Läsa en buffer från två funktioner | Flera samtidiga läslån är giltiga. |
 | Skriva genom en referens | Ett exklusivt lån ger ensam åtkomst till den lånade platsen under lånets giltighetstid. |
 | Flytta, frigöra eller växa en buffer medan en slice lever | Avvisa. Alla tre operationerna kan ogiltigförklara adressen. |
-| Returnera en referens | Signaturen binder resultatet till ett inlån eller statisk lagring. En referens till en lokal variabel avvisas. |
+| Returnera en referens | Avvisas tills ett uttryckligt livstidskontrakt kan binda resultatet till indata eller statisk lagring. |
 | En gren flyttar ett värde och den andra behåller det | Läsning efter grenen kräver att värdet är initierat på båda vägarna. Städningen frigör precis de resurser som respektive väg fortfarande äger. |
 | Nollställa en arena | Kräver exklusiv åtkomst till arenan. Alla lån ur den måste ha upphört. |
 | Gå via en råpekare eller ett externt C-anrop | Kräver en avgränsad `unsafe`-operation med ett dokumenterat kontrakt. Säkra anropare får bara se ett säkert gränssnitt om omslaget upprätthåller kontraktet. |
 
-Typkontrollen för ett funktionsanrop behöver bara den anropade funktionens signatur, inklusive lånens ursprung. Inuti en funktion håller kontrollen reda på initiering, flyttar och aktiva lån. Structfält har separata initieringstillstånd; lån under anrop kontrolleras fortfarande konservativt per rot. Vid en förgrening förenas tillstånden konservativt. Varje bakåtkant i en loop måste återställa de ägar- och lånevillkor som krävs vid loopens början. En tidig retur städar alla fortfarande ägda resurser i omvänd ordning.
+Anropens typer kontrolleras mot signaturen. Lånens ursprung och möjliga
+råpekarexponering följs dessutom genom en gemensam interprocedural analys.
+Inuti funktionen skiljs initiering och flyttar från aktiva lån. Structfält
+har separata initieringstillstånd; lokala fältlån tillåter åtkomst till
+oberoende syskon, medan arrayelement låser hela sin array. Lån under anrop
+kontrolleras fortsatt konservativt per rot. Grenar förenas konservativt och
+varje loopbakåtkant måste återställa de ägarvillkor som krävs vid loopens
+början. En tidig retur städar fortfarande ägda resurser i omvänd ordning.
 
 ### Initiering per lagringsplats
 
@@ -71,8 +79,45 @@ En managed-fältflytt nollställer bara fältets ägarslot; befintlig rekursiv
 cleanup städar resten. Inga per-fältflaggor behövs vid körning. `replace`
 återanvänder samma typade läs-, skriv- och ägaroperationer: båda operanderna
 slutförs före bytet, den tidigare ägaren blir resultat och destinationen
-förblir giltig. Senare lokala lån bör använda dessa platsidentiteter i
-stället för en andra modell av fältens initiering.
+förblir giltig. Lokala lån återanvänder dessa platsidentiteter.
+
+### Proveniens och lexikala läslån
+
+`local_borrows.Table` lagrar proveniens och aktiva lokala lån med kanoniska
+ägar-ID:n från `ownership_state`. Tabellen har ingen egen initieringsmodell.
+Alias härleds till den ursprungliga platsen; ett nytt återlån skapar ett
+eget aktivt lån på samma ägare. Referenserna är oföränderliga och frigör sitt
+lås vid deklarationsblockets slut, inte vid sista användningen. Skrivning,
+skrivlån, flytt och `replace` använder samma överlappningsfråga. Ett lån av
+ett fält blockerar dess förfäder och ättlingar men tillåter syskonfält.
+Arrayindex och intervall följer konservativt arrayens identitet.
+
+`borrowed_view` emitterar intervallkontroller och en framebaserad deskriptor
+för originalets data; den registrerar ingen runtimeägare. Arrayvyer har
+typen `&[]T`, textvyer `&[]u8`. Längd och kapacitet är intervallängden.
+Gränser kontrolleras före textens UTF-8-gränser, med status 103 respektive
+106. Tomma textvyer kräver också giltiga UTF-8-gränser. Konstruktionen
+allokerar ingen heapbuffert och gör ingen retain; `.clone()` begär en ägare
+uttryckligen. Temporära lån vid anrop lever genom hela anropet och kan
+inte bindas lokalt. Scratchlagring kan ännu bara lånas under anrop.
+
+Proveniens tillhör ett färdigt uttrycksresultat. Ett nytt ägt anropsresultat,
+en konstruktor eller ett operatorresultat nollställer argumentens
+lånemetadata, bland annat `borrow_home`, så att det inte ärver en inre vys
+lagringsplats. Projektioner bevarar däremot sitt verkliga ursprung. Den
+befintliga globala escapegrafen för lån återanvänds även för lokala lån och
+indirekta anrop. Nya uttrycksformer måste fånga analysen före emission;
+saknas förberett proveniensbevis avvisas programmet. Nya lån får inte nå en
+råpekarexponerande funktion. Direkt `addr` i explicit `unsafe` kan användas
+för att verifiera adressidentitet.
+
+Funktionscachen hoppar inte över dessa kontroller: källkroppar och lån
+kontrolleras även när färdig maskinkod kan återanvändas. HTTP-servern i
+`dunder-hundmat` använder lokala path- och bodyvyer i stället för separata
+offsetpar vid API-gränsen. Kompilatorns fragment-cache är nästa konsument
+efter fröuppdateringen, för läsning av tokens och cacheinnehåll utan
+mellanägare. Detta är korrekthets- och representationskontrakt, utan nya
+prestandaanspråk. [Körbara låneprov](../tools/test-local-borrows.py).
 
 Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och osynkroniserade data races. Första delmängden är enkeltrådad och tillåter varken delat muterbart globalt tillstånd, referenser gömda genom heltalskonvertering eller användardefinierade destruktorer. För trådar behöver vi senare specificera överföring av ägarskap och synkronisering innan ett säkert tråd-API kan släppas. Säkerheten vilar också på att kompilatorn och den lilla osäkra kärnan i allokator, containers och plattformsanrop är korrekta.
 
