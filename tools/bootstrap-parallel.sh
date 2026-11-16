@@ -6,8 +6,10 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) ;;
-    *) echo 'Parallel compiler bootstrap requires an ARM64/macOS host' >&2; exit 1 ;;
+    Darwin:arm64) host=arm64-macos ;;
+    Linux:aarch64|Linux:arm64) host=arm64-linux ;;
+    Linux:x86_64) host=x86_64-linux ;;
+    *) echo "Unsupported parallel bootstrap host: $(uname -sm)" >&2; exit 1 ;;
 esac
 if [ "$#" -eq 0 ]; then
     serial_compiler=$(./tools/bootstrap.sh --serial)
@@ -17,7 +19,7 @@ else
     echo 'usage: tools/bootstrap-parallel.sh [--compiler SERIAL_COMPILER]' >&2
     exit 2
 fi
-parallel_dir=build/selfhost/arm64-macos
+parallel_dir="build/selfhost/$host"
 mkdir -p "$parallel_dir"
 parallel_work=$(mktemp -d "$parallel_dir/.parallel.XXXXXX")
 parallel_success=0

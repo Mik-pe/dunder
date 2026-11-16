@@ -48,11 +48,7 @@ if [ "$serial_only" -eq 1 ]; then
     printf '%s\n' "$root/$dir/dunder-serial"
     exit 0
 fi
-if [ "$host" = arm64-macos ]; then
-    parallel_compiler=$(./tools/bootstrap-parallel.sh --compiler "$root/$dir/dunder-serial")
-    cp "$parallel_compiler" "$work/standard"
-else
-    cp "$dir/dunder-serial" "$work/standard"
-fi
+parallel_compiler=$(./tools/bootstrap-parallel.sh --compiler "$root/$dir/dunder-serial")
+cp "$parallel_compiler" "$work/standard"
 mv -f "$work/standard" "$dir/dunder"
 printf '%s\n' "$root/$dir/dunder"

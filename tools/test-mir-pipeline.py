@@ -130,13 +130,13 @@ def main():
                                                      target=target, mode=mode, sha256=image_sha, executed=ran,
                                                      counters=counters, before=pre, after=post))
             print(f'PASS {index + 1}/{len(corpus)} case{case} input{value}', flush=True)
-        if host == 0:
+        if host in (0, 1, 2):
             worker = work / 'worker'
             call([compiler, 'build', ROOT / 'tests/fixtures/mir-pipeline-worker.ddr', '-o', worker], work)
             assert call([worker], work).stdout == '42\n'
             report['worker'] = {'executed': True, 'sha256': digest(worker), 'result': 42}
         else:
-            report['worker'] = {'executed': False, 'coverage_gap': 'task provider requires ARM64/macOS'}
+            report['worker'] = {'executed': False, 'coverage_gap': 'task provider requires a native target'}
     report.update(exact_reference_pairs=pairs, images_built=len(report['images']), executions=executions,
                   oracle_pairs=proofs, oracle_gap_pairs=gaps)
     report['manifest_sha256'] = hashlib.sha256(json.dumps(report['images'], sort_keys=True).encode()).hexdigest()

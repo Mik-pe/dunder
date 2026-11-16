@@ -200,7 +200,9 @@ def main():
         parser.error('--program-arg requires --expected-stdout to verify the run')
     expected_stdout = args.expected_stdout.resolve(strict=True) if args.expected_stdout else None
     compiler = args.compiler.resolve(strict=True)
-    target,entry = host(); selfhost = (ROOT/f'selfhost/{entry}.ddr').resolve()
+    target,entry = host()
+    parallel_selfhost = (ROOT/'selfhost/main_parallel.ddr').resolve()
+    serial_selfhost = (ROOT/f'selfhost/{entry}.ddr').resolve()
     directory = args.report.resolve()
     directory.mkdir(parents=True,exist_ok=True)
     if any(directory.iterdir()): parser.error('report directory must be empty')
@@ -208,11 +210,29 @@ def main():
     metadata = {'protocol':'dunder-compiler-attribution-v1','complete':False,
                 'host':platform.uname()._asdict(),'native_target':target,'rounds':args.rounds,
                 'input_compiler':{'path':str(compiler),'sha256':sha(compiler)},
-                'selfhost_source':str(selfhost),'commands':[],'cases':{},
+                'selfhost_source':str(parallel_selfhost),'commands':[],'cases':{},
                 'observer_policy':'compiler clocks and executed allocation traffic collected in separate processes',
                 'scope':'attribution only; profiled durations and counters are not uninstrumented latency or C acceptance measurements'}
     recorder = Recorder(directory,metadata,args.timeout)
     try:
+        resolutions = {}
+        sources = source_graph(parallel_selfhost,resolutions)
+        sources.update(source_graph(serial_selfhost,resolutions))
+        # Require the caller's compiler to match this checkout before building
+        # a different observer from it. Standard parallel builds use
+        # main_parallel.ddr; --serial compilers match the serial host entry.
+        selfhost = None
+        for candidate in (parallel_selfhost, serial_selfhost):
+            identity = directory/f'images/source-identity-{candidate.stem}'
+            plain(recorder.run(f'verify input compiler source identity ({candidate.stem})',
+                  [compiler,'build',candidate.relative_to(ROOT),'--target',target,'-o',identity]))
+            if sha(identity) == metadata['input_compiler']['sha256']:
+                selfhost = candidate
+                metadata['selfhost_source'] = str(candidate)
+                metadata['source_identity_image'] = {'path':str(identity),'sha256':sha(identity)}
+                break
+        if selfhost is None:
+            raise ValueError('input compiler is not the current source fixed point')
         cases = []
         if not args.case:
             generated,corpus = PERFORMANCE.corpus(directory)
@@ -221,12 +241,10 @@ def main():
         else:
             for i,path in enumerate(args.case):
                 source = path.resolve(strict=True)
-                validation = 'selfhost' if source == selfhost else 'custom'
+                validation = 'selfhost' if source in (parallel_selfhost, serial_selfhost) else 'custom'
                 cases.append((f'{i+1:02d}_'+re.sub(r'[^A-Za-z0-9_-]','_',source.stem),source,validation))
         if args.expected_stdout and cases[0][2] != 'custom':
             raise ValueError('known selfhost cases use their authoritative validation')
-        resolutions = {}
-        sources = source_graph(selfhost,resolutions)
         for name,source,validation in cases:
             graph = ({str(p.resolve()):{'sha256':sha(p),'bytes':p.stat().st_size,
                        'physical_lines_including_comments':len(p.read_bytes().splitlines())}
@@ -258,18 +276,9 @@ def main():
         metadata['sources'] = sources
         metadata['source_resolutions'] = resolutions
         recorder.checkpoint()
-        # Require the caller's compiler to match this checkout before building
-        # a different observer from it. Otherwise observations could describe
-        # two distinct compiler revisions despite coincidentally equal outputs.
-        identity = directory/'images/source-identity'
-        plain(recorder.run('verify input compiler source identity',
-              [compiler,'build',selfhost,'--target',target,'-o',identity]))
-        if sha(identity) != metadata['input_compiler']['sha256']:
-            raise ValueError('input compiler is not the current source fixed point')
-        metadata['source_identity_image'] = {'path':str(identity),'sha256':sha(identity)}
         profiled = directory/'images/allocation-compiler'
         plain(recorder.run('build allocation observer once',
-              [compiler,'build',selfhost,'--target',target,'--runtime-profile','-o',profiled]))
+              [compiler,'build',serial_selfhost.relative_to(ROOT),'--target',target,'--runtime-profile','-o',profiled]))
         metadata['allocation_compiler'] = {'path':str(profiled),'sha256':sha(profiled)}
         recorder.checkpoint()
 
@@ -296,8 +305,9 @@ def main():
                     image = directory/f'images/{name}-{round_number:03d}-{observer}'
                     executable = compiler if observer == 'clock' else profiled
                     flags = ['--profile-compiler','--timings=json'] if observer == 'clock' else []
+                    build_source = source.relative_to(ROOT) if source in (parallel_selfhost, serial_selfhost) else source
                     result = recorder.run(f'observe {name}/{round_number}/{observer}',
-                            [executable,'build',source,'--target',target,'-o',image,*flags])
+                            [executable,'build',build_source,'--target',target,'-o',image,*flags])
                     payload = compiler_timing(result.stderr,target) if observer == 'clock' else allocation_profile(result.stderr)
                     digest = sha(image)
                     if expected_image is None: expected_image = digest

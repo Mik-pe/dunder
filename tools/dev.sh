@@ -9,11 +9,12 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
 case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) host=arm64-macos; entry=main_parallel ;;
-    Linux:aarch64|Linux:arm64) host=arm64-linux; entry=linux ;;
-    Linux:x86_64) host=x86_64-linux; entry=x86_linux ;;
+    Darwin:arm64) host=arm64-macos ;;
+    Linux:aarch64|Linux:arm64) host=arm64-linux ;;
+    Linux:x86_64) host=x86_64-linux ;;
     *) echo "Unsupported host: $(uname -sm)" >&2; exit 1 ;;
 esac
+entry=main_parallel
 
 host_compiler="$root/build/selfhost/$host/dunder"
 if [ ! -x "$host_compiler" ]; then

@@ -94,12 +94,7 @@ for target in arm64-macos arm64-linux x86_64-linux; do
     if [ "$host" = "$target" ]; then
         cp "$compiler" "$image"
     else
-        case "$target" in
-            arm64-macos) entry=main_parallel ;;
-            arm64-linux) entry=linux ;;
-            x86_64-linux) entry=x86_linux ;;
-        esac
-        "$compiler" build "selfhost/$entry.ddr" --target "$target" -o "$image"
+        "$compiler" build selfhost/main_parallel.ddr --target "$target" -o "$image"
     fi
     archive="$work/assets/$target.gz"
     gzip -9 -n -c "$image" > "$archive"

@@ -265,8 +265,7 @@ def main():
         if not separator or target not in TARGETS or not shlex.split(command):
             parser.error('--runner requires a native TARGET=COMMAND')
         runners[target] = shlex.split(command)
-    # Only the ARM64/macOS compiler entry currently provides compiler workers.
-    workers = (1, 4) if host == TARGETS[0] else (1,)
+    workers = (1, 4)
     with tempfile.TemporaryDirectory(prefix='dunder-assert-diagnostics-') as temporary:
         work = Path(temporary).resolve()
         library = work / 'support å.ddr'

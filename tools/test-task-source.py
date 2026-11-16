@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """Actual source task scopes: typing, effects, lifetime, isolated copies and targets.
 
-No fake OS execution or latency measurements. First task provider supports
-unprofiled ARM64/macOS. Other native targets are checked for refusal or
-unreachable-feature compatibility, never reported as executed thread coverage.
+No fake OS execution or latency measurements. Supports native targets without
+runtime profiling (ARM64/macOS dispatch and Linux ARM64/x86-64 pthreads). Cross
+targets are built and checked; only images matching the host target execute.
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
+import platform
 import subprocess
 import sys
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+NATIVE_TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
+
+
+def host_target():
+    system, machine = platform.system(), platform.machine()
+    if system == 'Darwin' and machine == 'arm64':
+        return 'arm64-macos'
+    if system == 'Linux' and machine in ('arm64', 'aarch64'):
+        return 'arm64-linux'
+    if system == 'Linux' and machine == 'x86_64':
+        return 'x86_64-linux'
+    raise SystemExit(f'unsupported host: {system}/{machine}')
 WORKER = 'fn work(n:i64)->i64 { n*n }\n'
 SCOPE = 'fn main(){task scope jobs(2){id:=spawn jobs work(7);print(await jobs(id))}}\n'
 STATE = ('struct Workspace{values:[]i32,label:string}\n'
@@ -158,19 +171,25 @@ def main():
                     previous=data
                 warm.write_text(safe.replace('n+1','print(n);n+1',1))
                 text=run([compiler,'build',warm,'-o',out/'stale',*flags],1);assert 'effects outside' in text
-        path=out/'scalar_repeat.ddr' 
-        for target in ('arm64-linux','x86_64-linux'):
-            for command in ('build','check'):
-                cmd=[compiler,command,path,'--target',target]
-                if command=='build':cmd+=['-o',out/'unsupported']
-                text=run(cmd,1)
-                assert 'isolated tasks require ARM64/macOS' in text
+        path=out/'scalar_repeat.ddr'
+        host=host_target()
+        for target in NATIVE_TARGETS:
+            image=out/('scalar_repeat-' + target)
+            run([compiler,'build',path,'--target',target,'-o',image])
+            run([compiler,'check',path,'--target',target])
+            if target==host:
+                assert run([image])=='49\n49\n'
+        for command in ('build','check'):
+            cmd=[compiler,command,path,'--target','wasm32']
+            if command=='build':cmd+=['-o',out/'unsupported-wasm']
+            text=run(cmd,1)
+            assert 'isolated tasks require a native target without runtime profiling' in text
         dormant=out/'unreachable.ddr';dormant.write_text('fn unused(){task scope j(1){}}\nfn main(){print(42)}\n')
-        for target in ('arm64-macos','arm64-linux','x86_64-linux'):
+        for target in ('arm64-macos','arm64-linux','x86_64-linux','wasm32'):
             run([compiler,'build',dormant,'--target',target,'-o',out/('unreachable-'+target)])
             run([compiler,'check',dormant,'--target',target])
         text=run([compiler,'build',path,'--runtime-profile','-o',out/'profiled'],1)
-        assert 'isolated tasks require ARM64/macOS' in text
+        assert 'isolated tasks require a native target without runtime profiling' in text
         summary={'result':'passed','valid':len(VALID),'invalid':len(INVALID),'traps':len(TRAPS),
                  'compiler_sha256':hashlib.sha256(compiler.read_bytes()).hexdigest()}
         (out/'summary.json').write_text(json.dumps(summary,indent=2)+'\n');print(json.dumps(summary))

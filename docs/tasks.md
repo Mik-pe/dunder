@@ -1,9 +1,10 @@
 # Isolerade uppgifter
 
-`task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar
-i libdispatchs återanvända trådpool på ARM64/macOS.
-Den första implementationen stöder ARM64/macOS utan runtimeprofilering.
-Nåbara taskoperationer på övriga mål avvisas före kodemission.
+`task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar:
+via `libdispatch` på ARM64/macOS och POSIX-trådar (`pthread_create`/`pthread_join`)
+på ARM64/Linux och x86-64/Linux.
+Runtimen stöder alla tre nativa målen utan runtimeprofilering.
+Nåbara taskoperationer på `wasm32` och med `--runtime-profile` avvisas före kodemission.
 
 ```dunder
 fn sum(values: []i64) -> i64 {
@@ -158,21 +159,20 @@ avstår för taskprogram tills certifierade effekter och beroenden kan
 
 ## Kompilatorn som taskkonsument
 
-Den taskbaserade kompilatorn är implementerad och självhostad på
-ARM64/macOS. Standardingången använder fyra workers; `--jobs N` eller
-`--jobs=N` väljer 1–256. Det är värddatorns kompilatorjobb som använder
-trådar, även vid korskompilering till Linux eller Wasm. Ett kompilerat
-programs egna nåbara taskoperationer kräver fortfarande ARM64/macOS.
+Den taskbaserade kompilatorn är standardkompilator och självhostad på alla tre
+nativa värdar (ARM64/macOS, ARM64/Linux och x86-64/Linux). Utan `--jobs` väljs
+arbetsbudgeten från värddatorns tillgängliga CPU-kapacitet via `budget.ddr`;
+`--jobs N` eller `--jobs=N` väljer ett explicit tak på 1–256. Värddatorns
+kompilatorjobb kör på trådar även vid korskompilering till andra mål eller Wasm.
 
-Byggsamordnaren äger symboler, nåbarhetsordning och imports. Vid rena byggen
-kan den skicka redan nåbara funktioner till arbetarna medan tidigare
-funktionsobjekt sänks. Typning och MIR delar samma pool. `--jobs=4` tillåter sammanlagt
-fyra utestående workerjobb. Med flera tillgängliga kroppar kan samordnaren
-själv typa den första medan arbetarna typar de följande. Varje källjobb får
-bara sin funktions token. Deklarerade
-typer och signaturer delas genom en fryst bild och varje worker återanvänder
-sin egen session. Samordnaren tar emot typade resultat i samma ordning som
-den seriella genomgången och binder deras anrop, effekter och symbolbehov.
+Byggsamordnaren äger symboler, nåbarhetsordning och imports. Vid rena och
+delvis cachade byggen kan den skicka tillgängliga funktioner till arbetarna
+medan tidigare funktionsobjekt sänks. Typning och MIR delar samma budgetpool;
+samordnaren räknas in i budgeten när den själv kompilerar kroppar, medan ren
+samordning vid dränering inte reserverar en plats. `check` parallelliserar
+semantisk kontroll utan kodemission, och `--jobs 1` samt `--profile-compiler`
+kör samma gemensamma jobbmodell i enkelspår utan arbetartrådar. Varje källjobb
+får bara sin funktions token. Deklarerade typer och signaturer delas genom en fryst bild och varje worker återanvänder sin egen session. Samordnaren tar emot typade resultat i samma ordning som den seriella genomgången och binder deras anrop, effekter och symbolbehov.
 `--timings=json` redovisar hur många skalära och generella kroppar som
 arbetarna typade och hur många frontend-arbetsytor som användes.
 `frontend.windows` räknar grupper av källjobb. `frontend.peak_total_jobs`

@@ -493,7 +493,7 @@ def inline_optimizer_controls(p):
         assert expected in result.stdout, result
     p.write('closed.ddr', 'fn cold(x:i64)->i64{x*7}\nfn leaf(x:i64)->i64{x+1}\n'
             'fn wide(x:i64)->i64{x' + '+1' * 24 + '}\nfn main(){print(wide(leaf(1)))}\n')
-    for jobs in ((1, 4) if sys.platform == 'darwin' else (1,)):
+    for jobs in (1, 4):
         result = p.call('build', 'closed.ddr', '--jobs=' + str(jobs), '--profile-compiler',
                         '--timings=json', '-o', 'closed')
         calls = json.loads(result.stderr)['compiler_detail']['calls']
@@ -505,7 +505,7 @@ def inline_optimizer_controls(p):
         p.write('closed-error.ddr', invalid + 'fn main(){' + main + '}\n')
         expected = p.call('build', 'closed-error.ddr', '--inline-opt=off', '-o', 'invalid', status=1)
         assert error in expected.stderr, expected
-        for jobs in ((1, 4) if sys.platform == 'darwin' else (1,)):
+        for jobs in (1, 4):
             actual = p.call('build', 'closed-error.ddr', '--jobs=' + str(jobs), '-o', 'invalid', status=1)
             assert actual.stderr == expected.stderr, (expected, actual)
     p.call('check', 'inline.ddr', '--inline-opt=unknown', status=2)

@@ -32,27 +32,41 @@ dunder_bin="$(./tools/bootstrap.sh)"
 ```
 
 Skriptet väljer den frysta kompilatorn för värden ur `bootstrap/`, verifierar
-SHA-256 och bygger dagens seriella ingång till en byteidentisk fixpunkt.
-På ARM64/macOS bygger den därefter taskingången och kräver byteidentiska
-självbyggen med `--jobs=1` och `--jobs=4` innan den publicerar `dunder` med
-fyra workers som standard. Linux behåller seriell `dunder`.
+SHA-256 och bygger den seriella bootstrapsingången till en byteidentisk fixpunkt.
+Därefter bygger den `selfhost/main_parallel.ddr` på alla tre nativa värdarna
+(ARM64/macOS, ARM64/Linux och x86-64/Linux) och kräver byteidentiska
+självbyggen med `--jobs=1` och `--jobs=4` innan den publicerar `dunder`.
+Utan `--jobs` läser kompilatorn värdmaskinens tillgängliga CPU-budget genom
+`selfhost/driver/budget.ddr` (inklusive Linux processaffinitet och cgroup-tak).
 `./tools/bootstrap.sh --serial` bygger enbart `dunder-serial` på alla värdar
 utan att ersätta standardbinären.
 Rust-kompilatorn har tagits ur byggkedjan. De frysta startkompilatorerna och
 Dunder-källorna är återställningsvägen. [Fröbinärer och återbyggnad](../bootstrap/README.md)
 
-`selfhost/main_parallel.ddr` är standardingång på ARM64/macOS.
-`main.ddr`, `linux.ddr` och `x86_linux.ddr` är de seriella ingångarna och
-väljer värdens standardmål. `--target` väljer vilket mål som helst för det byggda programmet.
+`selfhost/main_parallel.ddr` är standardingång på alla nativa värdar och väljer
+värdplattform via `target_is`. `main.ddr`, `linux.ddr` och `x86_linux.ddr` är
+små seriella bootstrapsingångar för den frysta seed-kedjan. `--target` väljer
+vilket mål som helst för det byggda programmet.
 Kör korsbyggd Linux-kod på motsvarande Linux-system eller med QEMU och
 målarkitekturens användarland.
 
 ## Tasks i kompilatorn
 
-`--jobs N` och `--jobs=N` väljer 1–256 workers i den taskbaserade ingången.
-Den kör på ARM64/macOS och kan skriva program för alla fyra mål. Den
-seriella ingången stöder bara `--jobs=1`. `check` och `--profile-compiler` går genom samma seriella Session-drivrutin utan
-scheduling. Profilens fasintervall förblir seriella väggtider.
+`--jobs N` och `--jobs=N` väljer ett uttryckligt tak på 1–256 för samtidigt arbete
+i standardkompilatorn; utan `--jobs` används värdmaskinens tillgängliga CPU-kapacitet.
+När samordnaren själv kompilerar kroppar räknas den in i arbetsbudgeten; när
+den bara väntar och samlar in sänkta backendobjekt reserverar den ingen plats.
+Standardkompilatorn kör på ARM64/macOS (`libdispatch`), ARM64/Linux och
+x86-64/Linux (`pthread_create`/`pthread_join`) och kan skriva program för alla
+fyra mål.
+
+`build`, `check`, `check --agent`, `test` och `--incremental` använder samma
+funktionsjobb:
+- `check` parallelliserar oberoende semantisk kontroll utan backendarbete eller kodallokeringar.
+- `--incremental` återanvänder giltiga fragment och parallelliserar kvarvarande missar; nycklarna binder ägare och modulkapabiliteter så att kapabilitetsborttagningar alltid ogiltigförklaras.
+- `--jobs 1` och `--profile-compiler` kör samma pipeline i ett gemensamt enkelspår utan bakgrundstrådar (med deterministiska väggtidsintervall under profilering).
+- `test` delar samma budgetpolicy och sprider anpassad barnbudget via `DUNDER_CHILD_JOBS` för att undvika okontrollerad överprenumeration.
+Den minimala seriella bootstrapsingången stöder bara `--jobs=1`.
 
 Deklarationsvärlden håller källtoken, namn, deklarerade typer och signaturer.
 Varje kropp har en egen typ- och platsarena. Typkontrollen registrerar bland
@@ -252,7 +266,7 @@ och tas emot utan kloning. `Session` och ägartillståndet förblir opaque;
 utan en andra initieringsmodell. `borrowed_view` bygger en framebaserad
 deskriptor utan runtimeägare. Färdiga anrops-, konstruktor- och
 operatorresultat nollställer argumentens lånemetadata, så att ett nytt värde
-inte ärver en inre vys `borrow_home`. Nya uttrycksformer måste förbereda
+inte ärver en inre vys `loan.home`. Nya uttrycksformer måste förbereda
 escapeanalysen; saknas bevis avvisas de. Källkontrollen körs även när
 funktionscachen återanvänder maskinkod. HTTP-servern i `dunder-hundmat`
 använder path-/bodyvyer. Kompilatorns fragment-cache lånar tokenstavningar

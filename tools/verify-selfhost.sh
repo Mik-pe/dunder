@@ -11,6 +11,12 @@ mir_reports=$(mktemp -d "$root/build/mir-correctness.XXXXXX")
 printf 'MIR verification evidence: %s\n' "$mir_reports"
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
-serial_compiler="$root/build/selfhost/arm64-macos/dunder-serial"
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) host=arm64-macos ;;
+    Linux:aarch64|Linux:arm64) host=arm64-linux ;;
+    Linux:x86_64) host=x86_64-linux ;;
+    *) echo "Unsupported verify host: $(uname -sm)" >&2; exit 1 ;;
+esac
+serial_compiler="$root/build/selfhost/$host/dunder-serial"
 "$compiler" build tools/verify.ddr -o "$work/verify" >&2
 "$work/verify" "$compiler" --mir-reports "$mir_reports" --serial-compiler "$serial_compiler" "$@"

@@ -29,6 +29,17 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
+
+
+def detect_host_target():
+    system, machine = platform.system(), platform.machine()
+    if system == 'Darwin' and machine == 'arm64':
+        return 'arm64-macos'
+    if system == 'Linux' and machine in ('arm64', 'aarch64'):
+        return 'arm64-linux'
+    if system == 'Linux' and machine == 'x86_64':
+        return 'x86_64-linux'
+    raise ValueError(f'unsupported native host: {system}/{machine}')
 CORE = {
     'arithmetic': ('''fn earlier(n:i64)->i64{mut total:i64=0;for i in 0..8{total=total+n+i64(i)};total}
 fn later(n:i64)->i64{earlier(n)+1}
@@ -68,15 +79,16 @@ def digest(path):
 
 
 class Probe:
-    def __init__(self, output, compiler, baseline):
+    def __init__(self, output, compiler, baseline, host_target):
         self.output = output
+        self.host_target = host_target
         self.drivers = [('jobs1', compiler, 1), ('jobs2', compiler, 2), ('jobs4', compiler, 4)]
         if baseline is not None:
             self.drivers.append(('baseline', baseline, None))
         self.log = []
         self.images = []
         self.contracts = []
-        self.executions = {'arm64-macos': 0}
+        self.executions = {host_target: 0}
         self.identities = {str(p): digest(p) for p in (compiler, baseline) if p is not None}
 
     def run(self, command, cwd, status=0):
@@ -122,11 +134,9 @@ class Probe:
         return sha, counters
 
     def execute(self, image, target, expected):
-        if target == 'arm64-macos':
-            command = [image]
-        else:
-            return  # Linux images are never counted as executed coverage.
-        result = self.run(command, image.parent)
+        if target != self.host_target:
+            return  # Cross-target images are never counted as executed coverage.
+        result = self.run([image], image.parent)
         require((result.stdout, result.stderr) == (expected, ''), self.log[-1])
         self.executions[target] += 1
 
@@ -174,7 +184,7 @@ class Probe:
                     # window followed by synchronous checks fails this bound.
                     require(2 * frontend['windows'] <= bodies, frontend)
             images.append(digest(image))
-            self.execute(image, 'arm64-macos', '1029\n')
+            self.execute(image, self.host_target, '1029\n')
         require(len(set(images)) == 1, images)
         source.write_text(source.read_text().replace('n+7}', 'n+false}').replace('n+9}', 'n+false}'))
         diagnostics = [self.run(self.command(d, 'build', source), source.parent, status=1).stderr for d in self.drivers]
@@ -194,7 +204,7 @@ class Probe:
             elif jobs is not None:
                 require(frontend['general_bodies'] >= 6 and 0 < frontend['peak_total_jobs'] <= jobs, frontend)
             images.append(digest(image))
-            self.execute(image, 'arm64-macos', '01234567891011\n')
+            self.execute(image, self.host_target, '01234567891011\n')
         require(len(set(images)) == 1, images)
         self.contracts.append({'case': 'reachable_frontend', 'worker_typed_functions': count})
 
@@ -263,7 +273,7 @@ fn main() { print(0) }
                 result = self.run(self.command(driver, 'build', path, ['-o', image]),
                                   path.parent, int(depth == 43))
                 if depth == 42:
-                    self.execute(image, 'arm64-macos', '42\n')
+                    self.execute(image, self.host_target, '42\n')
                 else:
                     require(result.stderr == f'{path}:1:146: error[E1000]: expression nesting exceeds 128\n',
                             self.log[-1])
@@ -273,8 +283,10 @@ fn main() { print(0) }
         source = self.case('globals_callback', '')
         oracle = source.parent / 'oracle.c'
         oracle.write_text('int twice(int (*f)(int),int x){return f(x)+f(x+1);}\n')
-        library = source.parent / 'oracle.dylib'
-        self.run([*shlex.split(os.environ.get('CC', 'cc')), '-dynamiclib', '-fPIC', oracle, '-o', library],
+        is_macos = self.host_target == 'arm64-macos'
+        library = source.parent / ('oracle.dylib' if is_macos else 'oracle.so')
+        link_flag = '-dynamiclib' if is_macos else '-shared'
+        self.run([*shlex.split(os.environ.get('CC', 'cc')), link_flag, '-fPIC', oracle, '-o', library],
                  source.parent)
         quoted = str(library).replace('\\', '\\\\').replace('"', '\\"')
         source.write_text('capability unsafe\n@extern("' + quoted + '''","twice") unsafe fn twice(f:extern fn(i32)->i32,x:i32)->i32
@@ -292,7 +304,7 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
         source += 'fn main(){mut total:=0;'
         source += ''.join('total=total+consume' + str(f) + '();' for f in range(20))
         path = self.case('inline_caller_budgets', source + 'print(total)}\n')
-        self.matrix(path, '4000\n', ('arm64-macos',))
+        self.matrix(path, '4000\n', (self.host_target,))
         counts = self.images[-1]['counters']['inlining']
         require(0 < counts['calls'] < 20 * 100 and counts['calls'] % 20 == 0
                 and 65536 < counts['estimated_words'] <= 20 * 4096,
@@ -317,8 +329,8 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
                 if phase in ('edited', 'restored'):
                     path.write_text(CACHE_SOURCE.replace('INC', '2' if phase == 'edited' else '1'))
                 image = path.parent / (driver[0] + '-' + phase)
-                pair = self.build(driver, path, 'arm64-macos', image, ['--incremental'])
-                self.execute(image, 'arm64-macos', '21\n' if phase == 'edited' else '17\n')
+                pair = self.build(driver, path, self.host_target, image, ['--incremental'])
+                self.execute(image, self.host_target, '21\n' if phase == 'edited' else '17\n')
                 counters = pair[1]
                 if phase == 'cold':
                     require(counters['functions']['reused'] == 0 and counters['mir']['functions'] > 0, counters)
@@ -339,14 +351,14 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
         for d in (self.drivers[0], self.drivers[2]):  # jobs=1, jobs=4
             shutil.rmtree(big.parent / 'build', ignore_errors=True)
             big.write_text('\n'.join(many + [f'fn main(){{print({calls})}}']))
-            cold_res = self.build(d, big, 'arm64-macos', big.parent / (d[0] + '-cold'), ['--incremental'])
-            warm_res = self.build(d, big, 'arm64-macos', big.parent / (d[0] + '-warm'), ['--incremental'])
+            cold_res = self.build(d, big, self.host_target, big.parent / (d[0] + '-cold'), ['--incremental'])
+            warm_res = self.build(d, big, self.host_target, big.parent / (d[0] + '-warm'), ['--incremental'])
             require(warm_res[1]['functions']['reused'] == 17 and warm_res[1]['mir']['functions'] == 0, warm_res)
             for idx in range(2, 10):
                 (next((big.parent / 'build').rglob(f'{idx}.fn'))).unlink()
-            mixed_res = self.build(d, big, 'arm64-macos', big.parent / (d[0] + '-mixed'), ['--incremental'])
+            mixed_res = self.build(d, big, self.host_target, big.parent / (d[0] + '-mixed'), ['--incremental'])
             require(mixed_res[1]['functions']['reused'] == 9 and mixed_res[1]['functions']['emitted'] == 8, mixed_res)
-            self.execute(big.parent / (d[0] + '-mixed'), 'arm64-macos', '272\n')
+            self.execute(big.parent / (d[0] + '-mixed'), self.host_target, '272\n')
             results[d[0]] = (cold_res, warm_res, mixed_res)
         require(results['jobs1'] == results['jobs4'], results)
         self.contracts.append({'case': 'cache', 'cold_warm_mixed_private_edit_equal': True})
@@ -382,14 +394,13 @@ def main():
     parser.add_argument('--baseline', type=Path, help='matching serial compiler; invoked without --jobs')
     parser.add_argument('--output', type=Path, default=ROOT / 'build/parallel-compiler-qa')
     args = parser.parse_args()
-    if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'aarch64'):
-        parser.error('this native dispatch/callback acceptance requires ARM64 macOS')
+    host_target = detect_host_target()
     compiler = args.compiler.resolve(strict=True)
     baseline = args.baseline.resolve(strict=True) if args.baseline else None
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     run = Path(tempfile.mkdtemp(prefix='run-', dir=output))
-    probe = Probe(run, compiler, baseline)
+    probe = Probe(run, compiler, baseline, host_target)
     passed = False
     try:
         for name, (source, expected) in CORE.items():
@@ -407,17 +418,17 @@ def main():
             ('mir_pass_off', ['--mir-opt=off']), ('values_off', ['--mir-values=off']),
             ('scalar_inline_off', ['--scalar-opt=off', '--inline-opt=off']),
         ):
-            probe.matrix(probe.case(name, CORE['owned'][0]), CORE['owned'][1], ('arm64-macos',), flags)
-        probe.matrix(probe.case('source_tasks', TASK_SOURCE), '41\n42\n', ('arm64-macos',))
+            probe.matrix(probe.case(name, CORE['owned'][0]), CORE['owned'][1], (host_target,), flags)
+        probe.matrix(probe.case('source_tasks', TASK_SOURCE), '41\n42\n', TARGETS)
         for path, sha in probe.identities.items():
             require(digest(Path(path)) == sha, ('compiler changed during acceptance', path))
         passed = True
     finally:
-        summary = {'result': 'passed' if passed else 'failed', 'run': str(run),
+        summary = {'result': 'passed' if passed else 'failed', 'run': str(run), 'host_target': host_target,
                    'compilers_sha256': probe.identities, 'tool_sha256': digest(Path(__file__)),
                    'images': probe.images, 'executions': probe.executions, 'contracts': probe.contracts,
-                   'linux_execution': 'not run; cross-target image comparisons only',
-                   'dispatch_proof': 'real source tasks exercised; compiler OS-overlap not measured or asserted',
+                   'cross_target_execution': 'not run; cross-target images verified by equality only',
+                   'dispatch_proof': 'real source tasks exercised on native host OS threads; compiler OS-overlap not measured or asserted',
                    'scope': 'functional equality; no latency assertions or timing results'}
         (run / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         (run / 'commands.json').write_text(json.dumps(probe.log, indent=2) + '\n')

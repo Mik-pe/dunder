@@ -365,12 +365,10 @@ def main():
     parser.add_argument('--serial', action='store_true',
                         help='use jobs 1 only for a compiler without the parallel entry')
     parser.add_argument('--only-tasks', action='store_true',
-                        help='run only the ARM64/macOS task-result borrow regressions')
+                        help='run only the task-result borrow regressions')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     host = host_target()
-    if args.only_tasks and host != TARGETS[0]:
-        parser.error('--only-tasks requires the ARM64/macOS task runtime')
     runners = {host: []}
     for specification in args.runner:
         target, separator, command = specification.partition('=')
@@ -379,7 +377,7 @@ def main():
         runners[target] = shlex.split(command)
 
     def jobs_for(target):
-        return (1, 4) if target == host == TARGETS[0] and not args.serial else (1,)
+        return (1, 4) if target == host and not args.serial else (1,)
 
     builds = executed = errors = 0
     programs = () if args.only_tasks else (('locals', LOCALS, 'local loans ok\n'),
@@ -464,10 +462,9 @@ def main():
                             run([*runners[target], image], work, status=status, output=output)
                             executed += 1
                         builds += 1
-        if host == TARGETS[0]:
-            # The task runtime is ARM64/macOS-only and rejects runtime
-            # profiling. Its fresh-expression producers still need the same
-            # scoped-loan escape analysis as calls and constructors.
+        if host in TARGETS:
+            # Isolated task results still need the same scoped-loan escape
+            # analysis as calls and constructors.
             source = work / 'task-temporary.ddr'
             source.write_text(TASK_VALID)
             for mode in MODES:

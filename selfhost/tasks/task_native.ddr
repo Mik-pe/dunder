@@ -1,23 +1,28 @@
 import ..backend.arm64 as arm
 import ..backend.ffi_arm64 as abi
+import ..backend.foreign_operation as foreign
 import ..runtime.runtime
 
-// Each submitted job exclusively owns its isolated allocator until the group
-// completes. The scope caps outstanding jobs, and libdispatch reuses threads.
-// Control (112 B): state 0, dispatch group 8, input 16, result 24, arena base 32,
-// parent result 40, submitted allocator cursor 48, wait error 56, unmap error
-// 64, recycled arena 72, workspace initializer 80, exclusive workspace root 88, optional borrow of the scope snapshot slot 96. Only the worker writes result/base while running.
+// Each submitted job exclusively owns its isolated allocator until waited.
+// On ARM64/macOS the scope submits to libdispatch; on Linux ARM64 and x86-64
+// it spawns and joins native POSIX threads.
+// Control (112 B): state 0, dispatch group or pthread_t 8, input 16, result 24,
+// arena base 32, parent result 40, submitted allocator cursor 48, wait error 56,
+// unmap error 64, recycled arena 72, workspace initializer 80, exclusive
+// workspace root 88, optional borrow of the scope snapshot slot 96. Only the
+// worker writes result/base while running.
 // States: ready 0, submitted 1, cached 4, submission failed 5, wait failed 6,
 // discarded 8, unmap failed 9, cached owner consumed 10. On wait failure the
-// child may still be using the arena. Keep the group, arena and control alive.
-pub fn policy_tag() -> string { "native-dispatch-task3-borrowed-input1-arm64-macos" }
+// child may still be using the arena. Keep the group, thread, arena and control alive.
+pub fn policy_tag() -> string { "native-task4-borrowed-input1" }
 pub fn control_bytes() -> i32 { 112 }
 pub fn pool_bytes() -> i64 { 536870912 }
 // Keep the existing heap budget. The inaccessible range spans the largest
 // single frame possible in arm.frame(), so a large frame cannot skip it.
 fn guard_bytes() -> i64 { 16777216 }
 fn mapping_bytes() -> i64 { pool_bytes() + guard_bytes() + 8388608 }
-pub fn supported(platform: i32, profiling: bool) -> bool { platform == 0 && !profiling }
+fn native_platform(platform: i32) -> bool { platform == 0 || platform == 1 || platform == 2 }
+pub fn supported(platform: i32, profiling: bool) -> bool { native_platform(platform) && !profiling }
 // Clone label -1 means identity for a proven scalar-only boundary. Label0 is
 // an ordinary valid label, never a sentinel. Worker must always be a label.
 // All three labels use the uniform internal ABI: source/root bits in X0,
@@ -31,6 +36,12 @@ pub struct TaskSpec { input_clone: i32, input_mode: i32, input_drop: i32, worker
 pub struct Symbols {
     symbol_count: i32, global_queue: i32, create_group: i32, submit: i32,
     wait: i32, release_group: i32, munmap: i32,
+}
+pub fn posix_symbols(symbol_count: i32, pthread_create: i32, pthread_join: i32, munmap: i32) -> Symbols {
+    Symbols {
+        symbol_count: symbol_count, global_queue: -1, create_group: -1,
+        submit: pthread_create, wait: pthread_join, release_group: -1, munmap: munmap,
+    }
 }
 pub struct Provider {
     ok: bool, error: string, create: i32, collect: i32, discard: i32, worker_entry: i32,
@@ -47,9 +58,10 @@ fn store(c: &mut arm.Code, src: i32, base: i32, offset: i32) { abi.store(&mut c,
 fn compare(c: &mut arm.Code, reg: i32, value: i32) { arm.emit(&mut c, 4043309087 + i64(value) * 1024 + i64(reg) * 32) }
 fn begin(c: &mut arm.Code, label: i32, slots: i32) { arm.mark(&mut c, label); at := arm.prologue(&mut c); arm.frame(&mut c, at, slots) }
 fn state(c: &mut arm.Code, value: i32) { arm.imm(&mut c, 10, i64(value)); store(&mut c, 10, 1, 0) }
-fn imported(c: &mut arm.Code, out: &mut Provider, slot: i32) {
+fn imported(c: &mut arm.Code, out: &mut Provider, slot: i32, gp_args: i32) {
     out.import_sites.push(arm.position(&c) * 4); out.import_slots.push(slot)
-    arm.emit(&mut c, 0); arm.emit(&mut c, 0); arm.emit(&mut c, 3594453504) // BLR X16
+    arm.emit(&mut c, 0); arm.emit(&mut c, 0); arm.mov(&mut c, 17, 16)
+    foreign.emit(&mut c, .Invoke, gp_args, 0, 0)
 }
 // x0 points to fresh, unexposed control storage; x1 is a synchronously borrowed source
 // root (or scalar bits). Initialization does not take/drop a managed owner.
@@ -59,18 +71,20 @@ pub fn emit_initialize(c: &mut arm.Code) {
 }
 pub fn emit_unmap_pool(c: &mut arm.Code, symbols: &Symbols) -> UnmapHelper {
     mut out := UnmapHelper { ok: false, error: "", label: -1, import_sites: [], import_slots: [] }
-    if c.platform != 0 { out.error = "isolated native tasks require ARM64/macOS"; return out }
+    if !native_platform(c.platform) { out.error = "isolated native tasks require a native target"; return out }
     if c.profile { out.error = "isolated native task profiling is not supported"; return out }
     if c.checking { out.error = "isolated native task emission requires a code sink"; return out }
     if c.mir_capture { out.error = "isolated native task helpers must be outside source MIR"; return out }
-    if symbols.symbol_count < 6 || symbols.munmap < 0 || symbols.munmap >= symbols.symbol_count {
+    mut required := 3; if c.platform == 0 { required = 6 }
+    if symbols.symbol_count < required || symbols.munmap < 0 || symbols.munmap >= symbols.symbol_count {
         out.error = "invalid isolated native task specification"; return out
     }
     out.label = arm.label(&mut c); begin(&mut c, out.label, 1)
     done := arm.label(&mut c); arm.branch(&mut c, done, 18)
     arm.imm(&mut c, 1, mapping_bytes())
     out.import_sites.push(arm.position(&c) * 4); out.import_slots.push(symbols.munmap)
-    arm.emit(&mut c, 0); arm.emit(&mut c, 0); arm.emit(&mut c, 3594453504); arm.emit(&mut c, 2470476800)
+    arm.emit(&mut c, 0); arm.emit(&mut c, 0); arm.mov(&mut c, 17, 16)
+    foreign.emit(&mut c, .Invoke, 2, 0, 0); arm.emit(&mut c, 2470476800)
     arm.mark(&mut c, done); arm.ret(&mut c)
     out.ok = true; out
 }
@@ -81,12 +95,16 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
     begin(&mut c, out.create, 5); arm.store(&mut c, 0, 0)
     bad := arm.label(&mut c); failed := arm.label(&mut c)
     load(&mut c, 10, 0, 0); compare(&mut c, 10, 0); arm.branch(&mut c, bad, 3)
-    arm.imm(&mut c, 0, 0); arm.imm(&mut c, 1, 0)
-    imported(&mut c, &mut out, symbols.global_queue)
-    arm.branch(&mut c, failed, 18); arm.store(&mut c, 1, 0)
-    imported(&mut c, &mut out, symbols.create_group)
-    arm.branch(&mut c, failed, 18)
-    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 8)
+    if c.platform == 0 {
+        arm.imm(&mut c, 0, 0); arm.imm(&mut c, 1, 0)
+        imported(&mut c, &mut out, symbols.global_queue, 2)
+        arm.branch(&mut c, failed, 18); arm.store(&mut c, 1, 0)
+        imported(&mut c, &mut out, symbols.create_group, 0)
+        arm.branch(&mut c, failed, 18)
+        arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 8)
+    } else {
+        arm.load_into(&mut c, 0, 1); store(&mut c, 31, 1, 8)
+    }
     for reg in 19..22 { arm.store(&mut c, reg - 17, reg) }
     load(&mut c, 21, 1, 72); store(&mut c, 31, 1, 72)
     arm.imm(&mut c, 19, 0); arm.imm(&mut c, 20, 0)
@@ -96,12 +114,18 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
     // One lazy VM reservation per active lane: ordinary allocator, guard,
     // then a main-thread-sized Dunder stack. Untouched pages need no backing.
     arm.imm(&mut c, 0, 0); arm.imm(&mut c, 1, mapping_bytes())
-    arm.imm(&mut c, 2, 3); arm.imm(&mut c, 3, 4098); arm.imm(&mut c, 4, -1); arm.imm(&mut c, 5, 0)
-    arm.syscall(&mut c, 33554629, 222); arm.branch(&mut c, exhausted, 4)
+    arm.imm(&mut c, 2, 3)
+    if c.platform != 0 { arm.imm(&mut c, 3, 34) } else { arm.imm(&mut c, 3, 4098) }
+    arm.imm(&mut c, 4, -1); arm.imm(&mut c, 5, 0)
+    arm.syscall(&mut c, 33554629, 222)
+    if c.platform == 0 { arm.branch(&mut c, exhausted, 4) }
+    else { compare(&mut c, 0, 0); arm.branch(&mut c, exhausted, 13) }
     arm.mov(&mut c, 21, 0); arm.imm(&mut c, 11, pool_bytes())
     arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32) // ADD X0,X21,X11
     arm.imm(&mut c, 1, guard_bytes()); arm.imm(&mut c, 2, 0)
-    arm.syscall(&mut c, 33554506, 226); arm.branch(&mut c, exhausted, 4)
+    arm.syscall(&mut c, 33554506, 226)
+    if c.platform == 0 { arm.branch(&mut c, exhausted, 4) }
+    else { compare(&mut c, 0, 0); arm.branch(&mut c, exhausted, 13) }
     arm.load_into(&mut c, 0, 1); arm.branch(&mut c, reset, 0)
     arm.mark(&mut c, exhausted); arm.exit(&mut c, 109)
     arm.mark(&mut c, reused)
@@ -117,28 +141,61 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
     arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 16)
     store(&mut c, 19, 1, 48); store(&mut c, 21, 1, 32)
     for reg in 19..22 { arm.load_into(&mut c, reg - 17, reg) }
-    arm.branch(&mut c, out.worker_entry, 20); arm.mov(&mut c, 3, 0)
-    arm.load_into(&mut c, 0, 2); load(&mut c, 0, 2, 8); arm.load_into(&mut c, 1, 1)
-    imported(&mut c, &mut out, symbols.submit)
-    arm.load_into(&mut c, 0, 1); state(&mut c, 1); arm.imm(&mut c, 0, 0); arm.ret(&mut c)
+    if c.platform == 0 {
+        arm.branch(&mut c, out.worker_entry, 20); arm.mov(&mut c, 3, 0)
+        arm.load_into(&mut c, 0, 2); load(&mut c, 0, 2, 8); arm.load_into(&mut c, 1, 1)
+        imported(&mut c, &mut out, symbols.submit, 4)
+        arm.load_into(&mut c, 0, 1); state(&mut c, 1); arm.imm(&mut c, 0, 0); arm.ret(&mut c)
+    } else {
+        submit_failed := arm.label(&mut c)
+        arm.branch(&mut c, out.worker_entry, 20); arm.mov(&mut c, 2, 0)
+        arm.load_into(&mut c, 0, 3)
+        arm.emit(&mut c, 2432696320 + 8 * 1024 + 3 * 32 + 0) // ADD X0,X3,#8
+        arm.imm(&mut c, 1, 0)
+        imported(&mut c, &mut out, symbols.submit, 4)
+        arm.emit(&mut c, 2470476800)
+        arm.branch(&mut c, submit_failed, 19)
+        arm.load_into(&mut c, 0, 1); state(&mut c, 1); arm.imm(&mut c, 0, 0); arm.ret(&mut c)
+        arm.mark(&mut c, submit_failed)
+        arm.load_into(&mut c, 0, 1)
+        if spec.input_drop >= 0 {
+            for reg in 19..22 { arm.store(&mut c, reg - 17, reg) }
+            load(&mut c, 19, 1, 48); load(&mut c, 21, 1, 32)
+            arm.imm(&mut c, 11, pool_bytes())
+            arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 20)
+            load(&mut c, 0, 1, 16); arm.branch(&mut c, spec.input_drop, 1)
+            arm.load_into(&mut c, 0, 1); store(&mut c, 19, 1, 48)
+            for reg in 19..22 { arm.load_into(&mut c, reg - 17, reg) }
+        }
+        load(&mut c, 10, 1, 32); store(&mut c, 10, 1, 72)
+        store(&mut c, 31, 1, 16); store(&mut c, 31, 1, 32)
+        arm.branch(&mut c, failed, 0)
+    }
     arm.mark(&mut c, failed); arm.load_into(&mut c, 0, 1); state(&mut c, 5)
     arm.mark(&mut c, bad); arm.imm(&mut c, 0, -1); arm.ret(&mut c)
 }
 
-// Dispatch uses the native C ABI. Preserve the thread's complete callee-save
-// set and resume the allocator handed off by create, even on a reused thread.
+// Threads enter via the host C ABI. Preserve host callee-saved registers and
+// run worker callees on the arena's private 8 MiB stack and allocator state.
 fn entry(c: &mut arm.Code, spec: &TaskSpec, label: i32) {
-    begin(&mut c, label, 20); arm.store(&mut c, 0, 0)
-    for reg in 19..29 { arm.store(&mut c, 1 + reg - 19, reg) }
-    for reg in 8..16 { abi.fp(&mut c, reg, 10, 8, false); arm.store(&mut c, 11 + reg - 8, 10) }
+    if c.platform == 2 {
+        arm.mark(&mut c, label); arm.emit(&mut c, 4227858433)
+        at := arm.prologue(&mut c); arm.frame(&mut c, at, 20); arm.store(&mut c, 0, 0)
+    } else {
+        begin(&mut c, label, 20); arm.store(&mut c, 0, 0)
+        for reg in 19..29 { arm.store(&mut c, 1 + reg - 19, reg) }
+        for reg in 8..16 { abi.fp(&mut c, reg, 10, 8, false); arm.store(&mut c, 11 + reg - 8, 10) }
+    }
     for reg in 20..25 { arm.imm(&mut c, reg, 0) }
     load(&mut c, 19, 0, 48); load(&mut c, 21, 0, 32)
     arm.imm(&mut c, 11, pool_bytes()); arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 20)
-    // Keep the dispatch frame in X29. Dunder callees restore it on return;
-    // the ordinary epilogue recovers the native SP before returning to C.
-    arm.imm(&mut c, 11, mapping_bytes())
-    arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 11) // ADD X11,X21,X11
-    arm.emit(&mut c, 2432696320 + 11 * 32 + 31) // ADD SP,X11,#0
+    if c.platform != 2 {
+        // Keep the C thread's frame in X29. Dunder callees restore it on return;
+        // the ordinary epilogue recovers the native SP before returning to C.
+        arm.imm(&mut c, 11, mapping_bytes())
+        arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 11) // ADD X11,X21,X11
+        arm.emit(&mut c, 2432696320 + 11 * 32 + 31) // ADD SP,X11,#0
+    }
     run := arm.label(&mut c); ready := arm.label(&mut c)
     load(&mut c, 17, 0, 80); compare(&mut c, 17, 0); arm.branch(&mut c, run, 2)
     load(&mut c, 10, 0, 88); compare(&mut c, 10, 0); arm.branch(&mut c, ready, 3)
@@ -168,9 +225,13 @@ fn entry(c: &mut arm.Code, spec: &TaskSpec, label: i32) {
         arm.load_into(&mut c, 0, 1); store(&mut c, 31, 1, 16)
     }
     store(&mut c, 21, 1, 32); store(&mut c, 19, 1, 48)
-    for reg in 8..16 { arm.load_into(&mut c, 11 + reg - 8, 10); abi.fp(&mut c, reg, 10, 8, true) }
-    for reg in 19..29 { arm.load_into(&mut c, 1 + reg - 19, reg) }
-    arm.imm(&mut c, 0, 0); arm.ret(&mut c)
+    if c.platform == 2 {
+        arm.leave_frame(&mut c); arm.emit(&mut c, 4211081217)
+    } else {
+        for reg in 8..16 { arm.load_into(&mut c, 11 + reg - 8, 10); abi.fp(&mut c, reg, 10, 8, true) }
+        for reg in 19..29 { arm.load_into(&mut c, 1 + reg - 19, reg) }
+        arm.imm(&mut c, 0, 0); arm.ret(&mut c)
+    }
 }
 fn collect(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbols) {
     common := arm.label(&mut c)
@@ -189,11 +250,19 @@ fn collect(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symb
     compare(&mut c, 10, 8); arm.branch(&mut c, discarded, 2)
     compare(&mut c, 10, 9); arm.branch(&mut c, old_unmap_error, 2)
     arm.branch(&mut c, bad, 0)
-    arm.mark(&mut c, wait); load(&mut c, 0, 0, 8); arm.imm(&mut c, 1, -1)
-    imported(&mut c, &mut out, symbols.wait)
-    arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 56); arm.branch(&mut c, wait_failed, 19)
-    load(&mut c, 0, 1, 8); imported(&mut c, &mut out, symbols.release_group)
-    arm.load_into(&mut c, 0, 1); store(&mut c, 31, 1, 8); store(&mut c, 31, 1, 16)
+    arm.mark(&mut c, wait)
+    if c.platform == 0 {
+        load(&mut c, 0, 0, 8); arm.imm(&mut c, 1, -1)
+        imported(&mut c, &mut out, symbols.wait, 2)
+        arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 56); arm.branch(&mut c, wait_failed, 19)
+        load(&mut c, 0, 1, 8); imported(&mut c, &mut out, symbols.release_group, 1)
+        arm.load_into(&mut c, 0, 1); store(&mut c, 31, 1, 8); store(&mut c, 31, 1, 16)
+    } else {
+        load(&mut c, 0, 0, 8); arm.imm(&mut c, 1, 0)
+        imported(&mut c, &mut out, symbols.wait, 2); arm.emit(&mut c, 2470476800)
+        arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 56); arm.branch(&mut c, wait_failed, 19)
+        store(&mut c, 31, 1, 8); store(&mut c, 31, 1, 16)
+    }
     arm.load(&mut c, 1); arm.branch(&mut c, discard, 19)
     load(&mut c, 0, 1, 24)
     if spec.result_clone >= 0 { arm.branch(&mut c, spec.result_clone, 1) }
@@ -214,7 +283,7 @@ fn collect(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symb
     cleared := arm.label(&mut c); arm.branch(&mut c, cleared, 0)
     arm.mark(&mut c, discard); load(&mut c, 0, 1, 32)
     arm.branch(&mut c, finish_discard, 18)
-    arm.imm(&mut c, 1, mapping_bytes()); imported(&mut c, &mut out, symbols.munmap); arm.emit(&mut c, 2470476800)
+    arm.imm(&mut c, 1, mapping_bytes()); imported(&mut c, &mut out, symbols.munmap, 2); arm.emit(&mut c, 2470476800)
     arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 64); arm.branch(&mut c, unmap_failed, 19)
     arm.mark(&mut c, finish_discard); state(&mut c, 8)
     arm.mark(&mut c, cleared); store(&mut c, 31, 1, 24); store(&mut c, 31, 1, 32)
@@ -227,8 +296,18 @@ fn collect(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symb
     arm.mark(&mut c, bad); arm.imm(&mut c, 0, -1); arm.ret(&mut c)
 }
 
-fn valid_symbols(s: &Symbols) -> bool {
-    slots := [s.global_queue, s.create_group, s.submit, s.wait, s.release_group, s.munmap]
+fn valid_symbols(platform: i32, s: &Symbols) -> bool {
+    if platform == 0 {
+        slots := [s.global_queue, s.create_group, s.submit, s.wait, s.release_group, s.munmap]
+        if s.symbol_count < 6 { return false }
+        for i in 0..slots.len {
+            if slots[i] < 0 || slots[i] >= s.symbol_count { return false }
+            for j in 0..i { if slots[j] == slots[i] { return false } }
+        }
+        return true
+    }
+    if s.global_queue != -1 || s.create_group != -1 || s.release_group != -1 || s.symbol_count < 3 { return false }
+    slots := [s.submit, s.wait, s.munmap]
     for i in 0..slots.len {
         if slots[i] < 0 || slots[i] >= s.symbol_count { return false }
         for j in 0..i { if slots[j] == slots[i] { return false } }
@@ -237,7 +316,7 @@ fn valid_symbols(s: &Symbols) -> bool {
 }
 pub fn emit(c: &mut arm.Code, rt: &runtime.Runtime, spec: &TaskSpec, symbols: &Symbols) -> Provider {
     mut out := result()
-    if c.platform != 0 { out.error = "isolated native tasks require ARM64/macOS"; return out }
+    if !native_platform(c.platform) { out.error = "isolated native tasks require a native target"; return out }
     if c.profile { out.error = "isolated native task profiling is not supported"; return out }
     if c.checking { out.error = "isolated native task emission requires a code sink"; return out }
     if c.mir_capture { out.error = "isolated native task helpers must be outside source MIR"; return out }
@@ -248,7 +327,7 @@ pub fn emit(c: &mut arm.Code, rt: &runtime.Runtime, spec: &TaskSpec, symbols: &S
         (spec.input_drop >= 0 && spec.input_clone < 0) ||
         (spec.input_mode >= 2 && (spec.input_clone < 0 || spec.input_drop < 0)) ||
         spec.worker < 0 || spec.worker >= count || spec.result_clone < -1 || spec.result_clone >= count ||
-        spec.result_drop < -1 || spec.result_drop >= count || !valid_symbols(&symbols) {
+        spec.result_drop < -1 || spec.result_drop >= count || !valid_symbols(c.platform, &symbols) {
         out.error = "invalid isolated native task specification"; return out
     }
     out.worker_entry = arm.label(&mut c); out.create = arm.label(&mut c); out.collect = arm.label(&mut c); out.discard = arm.label(&mut c)
