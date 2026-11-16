@@ -169,6 +169,24 @@ ett vanligt skalärvärde. Funktionstyper följer samma regel:
 `fn([]i32) -> i32` lånar, medan `fn(move []i32) -> []i32` tar över en array.
 Dessa funktionstyper är olika och kan inte bytas mot varandra.
 
+`replace(&mut place, replacement)` returnerar det tidigare värdet och
+installerar ersättaren. Det fungerar även bakom en `&mut`-parameter och för
+fält och arrayelement. Ersättaren följer samma regel som en `move`-parameter:
+
+```dunder
+fn drain(values: &mut []i32) -> []i32 { replace(&mut values, []) }
+
+fn main() {
+    mut values: []i32 = [20, 22]
+    previous := drain(&mut values)    // previous äger bufferten, values är tom
+    next: []i32 = [42]
+    empty := replace(&mut values, move next)
+}
+```
+
+Destinationen måste redan vara initierad. Ersättningsuttrycket får inte
+flytta eller mutera samma rot som destinationen. [Minne och utvärderingsordning](memory.md#fält-element-och-begränsningar).
+
 De första åtta argumenten överförs i register och ytterligare argument på
 stacken. Nativ C-FFI följer det deklarerade C-ABI:t.
 
@@ -401,6 +419,9 @@ en enum. Inline-cykler avvisas; referensfält är ännu inte tillåtna.
 En struct med enbart kopierbara fält kan kopieras vid bindning och
 tilldelning. Resursägande structar flyttas i stället. Vanliga
 funktionsparametrar lånar structen för läsning.
+Oberoende resursfält kan flyttas separat, även i nästlade structar. Ett
+flyttat fält i muterbar lagring kan återinitieras med tilldelning; hela
+structen kan användas igen när alla fält är initierade.
 `@resource` markerar en unik extern resurs även när dess fält bara är
 skalärer. En sådan struct och aggregat som innehåller den flyttas och
 kan inte klonas. Markeringen innebär ännu ingen automatisk destruktor;

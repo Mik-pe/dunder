@@ -11,7 +11,7 @@ begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
 Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
 är implementerade i kompilatorns kodgenerering. Anropsfria skalära funktioner
 kan använda en typad lokal modell, begränsat optimeringspass och
-registerallokering. Generella livstider, explicita flyttar och registerallokering
+registerallokering. Generella livstider och registerallokering
 för hela språket är fortsatt designmål. Nativebyggen
 kan använda [funktionscachen](incremental.md).
 
@@ -34,7 +34,7 @@ referensräkning: strängkopior behåller nu billig delning och säker livsläng
 utan att hålla kvar alla strängar till processlut. Ingen spårande GC behövs.
 Läs [layout, allokering, tester och gränser](memory.md).
 
-Explicita flyttar, användarvalda allokatorer och generella livstider är nästa
+Användarvalda allokatorer och generella livstider är nästa
 designsteg. Tabellen beskriver målen för den fulla lånemodellen; dagens
 referenser är begränsade till funktionsparametrar.
 
@@ -48,7 +48,31 @@ referenser är begränsade till funktionsparametrar.
 | Nollställa en arena | Kräver exklusiv åtkomst till arenan. Alla lån ur den måste ha upphört. |
 | Gå via en råpekare eller ett externt C-anrop | Kräver en avgränsad `unsafe`-operation med ett dokumenterat kontrakt. Säkra anropare får bara se ett säkert gränssnitt om omslaget upprätthåller kontraktet. |
 
-Typkontrollen för ett funktionsanrop behöver bara den anropade funktionens signatur, inklusive lånens ursprung. Inuti en funktion håller kontrollen reda på initiering, flyttar och aktiva lån. Första versionen lånar hela lokala värden och förbjuder partiell flytt. Vid en förgrening förenas tillstånden konservativt. Varje bakåtkant i en loop måste återställa de ägar- och lånevillkor som krävs vid loopens början. En tidig retur ska städa alla fortfarande ägda resurser i omvänd ordning. Detta kan uttryckas på den strukturerade källkoden och vid behov med en lokal initieringsflagga i maskinkoden.
+Typkontrollen för ett funktionsanrop behöver bara den anropade funktionens signatur, inklusive lånens ursprung. Inuti en funktion håller kontrollen reda på initiering, flyttar och aktiva lån. Structfält har separata initieringstillstånd; lån under anrop kontrolleras fortfarande konservativt per rot. Vid en förgrening förenas tillstånden konservativt. Varje bakåtkant i en loop måste återställa de ägar- och lånevillkor som krävs vid loopens början. En tidig retur städar alla fortfarande ägda resurser i omvänd ordning.
+
+### Initiering per lagringsplats
+
+`ownership_state` kanoniserar lokaler och fältkedjor i ett glest träd per
+funktion. Upprepade källåtkomster till samma fält får samma ägaridentitet,
+medan `typed_places` behåller separata rader för varje typad åtkomst och
+dess emission. Typträdet expanderas aldrig rekursivt i förväg. En läsning,
+ett lån eller en flytt av hela platsen kräver initierade förfäder och
+ättlingar; traversering till ett syskon kräver bara giltiga förfäder.
+
+Checkpoints kopierar tillstånd och platsidentiteter utan att kopiera den
+aktiva loopstacken. Schemat växer monotoniskt genom grenar. Fält som
+upptäcks efter ett checkpoint ärver begränsningarna från sina förfäder.
+Samma regel gäller bakåtkanter och `break`, även om roten redan var
+partiellt flyttad vid loopinträdet. Tilldelning återställer exakt sitt
+subträd. `defer` behåller tills vidare ett konservativt lås på hela roten.
+
+Källans initieringsbevis är separat från runtimeägare och MIR-optimering.
+En managed-fältflytt nollställer bara fältets ägarslot; befintlig rekursiv
+cleanup städar resten. Inga per-fältflaggor behövs vid körning. `replace`
+återanvänder samma typade läs-, skriv- och ägaroperationer: båda operanderna
+slutförs före bytet, den tidigare ägaren blir resultat och destinationen
+förblir giltig. Senare lokala lån bör använda dessa platsidentiteter i
+stället för en andra modell av fältens initiering.
 
 Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och osynkroniserade data races. Första delmängden är enkeltrådad och tillåter varken delat muterbart globalt tillstånd, referenser gömda genom heltalskonvertering eller användardefinierade destruktorer. För trådar behöver vi senare specificera överföring av ägarskap och synkronisering innan ett säkert tråd-API kan släppas. Säkerheten vilar också på att kompilatorn och den lilla osäkra kärnan i allokator, containers och plattformsanrop är korrekta.
 

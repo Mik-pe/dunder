@@ -132,13 +132,32 @@ lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
 ### Fält, element och begränsningar
 
 Ett ägt managed-fält kan flyttas ut ur en lokal eller ett färskt returvärde
-utan datakopia. Den här versionen behandlar då hela ursprungsobjektet som
-förbrukat; dess övriga fält frigörs fortfarande vid scope-slut. En hel
-muterbar bindning kan återinitieras. Flytt ur ett lån avvisas.
+utan datakopia. Oberoende fält, även nästlade, kan flyttas separat. Efter en
+fältflytt får syskonfält fortfarande läsas och ändras; läsning, lån eller
+flytt av hela föräldern kräver att alla dess fält är initierade. Tilldelning
+till ett muterbart fält återinitierar det fältets subträd; tilldelning till
+hela bindningen återinitierar allt. Grenar och loopkanter följer samma
+fältplatser. Kvarvarande fält frigörs exakt en gång vid cleanup.
+Flytt ur ett lån avvisas.
 Arrayelement lämnas över med `pop` eller kopieras uttryckligen med `.clone()`;
 indexering lämnar ingen oinitierad lucka i arrayen. Inline-fält i C-layout
 kan klonas när ett självständigt arrayvärde behövs.
 `values.swap(i, j)` byter element på plats utan kloning eller referensräkning.
+
+`replace(&mut place, replacement)` installerar ett nytt värde och returnerar
+den tidigare ägaren. Destinationen måste vara initierad och muterbar och kan
+vara en lokal, ett fält, ett arrayelement eller lagring bakom en `&mut`-parameter.
+Ett redan lagrat resursägande ersättningsvärde kräver `move value`; ett färskt
+uttryck eller en uttrycklig klon kan lämnas direkt. Destinationen och dess
+index utvärderas en gång före ersättningsuttrycket. Det senare får inte
+flytta eller mutera destinationens rot. Båda operanderna är färdigutvärderade
+innan själva bytet, och inget anrop ser en oinitierad lucka.
+
+För managed-värden överförs befintliga buffertar, adresser och kapaciteter.
+Inline C-lagring och fasta POD-arraylån behöver i stället en självständig
+bytekopia av returvärdet. Scratchlagring stöds inte av `replace`.
+Det finns ingen generell `take` med implicit standardvärde: en ersättare
+måste vara ett uttryckligen valt giltigt värde, även för `@resource`.
 
 Vanlig `for` och `match` lånar. `for value in move values` respektive
 `match move value` överför ägaren. `for value in values.iter()` lånar också;

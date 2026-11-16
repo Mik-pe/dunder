@@ -37,6 +37,10 @@ ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
   är skalär. Sockets och barnprocesser kan flyttas men inte klonas;
   rekursiv kloning och isolerade tasktransporter av sådana värden avvisas.
   Stängning och processhantering är fortfarande explicita operationer.
+- Structfält kan flyttas och återinitieras oberoende, även genom nästlade
+  fältkedjor. Hela värdet kan användas när alla fält är initierade.
+  `replace(&mut place, replacement)` lämnar tillbaka den tidigare ägaren
+  och installerar en giltig ersättare utan oinitierad lucka.
 - Ägda arraybuffertar frigörs deterministiskt. Oföränderliga strängar
   använder referensräkning. Ett lån av en lokal, ett fält eller ett
   arrayelement gäller under anropet. Kontrollen avvisar motstridiga lån
