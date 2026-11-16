@@ -7,6 +7,11 @@ eller suffix i importen. Endast explicita beroenden läses. Delade importer
 och alias har samma typidentitet. En lokal fil väljs med en uttrycklig
 relativ sökväg, till exempel `import .std.map as local`.
 
+För applikationer finns även [HTTP-server och TLS-klient](http.md) i
+`std.http`/`std.http_client` samt [SQLite med bundna parametrar](sqlite.md)
+i `std.sqlite`. Dessa moduler använder operativsystemets sockets och de
+angivna systembiblioteken; de kräver ingen C-shim eller extern kompilator.
+
 ```dunder
 import std.map as map
 import std.set as set
@@ -75,6 +80,7 @@ delar oföränderlig text.
 | `map.keys(table)`, `set.items(set)` | Returnerar en ny array; tabellen behåller sina strängägare. |
 | `process.command(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
 | `process.run(program, args)`, `process.exec(command)` | Lånar under den synkrona körningen. |
+| `process.replace(program, &args)`, `process.replace_as(program, argv0, &args)` | Ersätter den aktuella processen utan en ny PID. Vid fel är miljö, arbetskatalog och standardströmmar orörda. `replace_as` väljer uttryckligen `argv[0]` för multicall-program. |
 | `json.Doc::parse_bytes(move input)` | Dokumentet tar över bytebufferten utan kopia. |
 | `json.Doc::parse_bytes(input.clone())` | Begär uttryckligen ett dokument med en självständig snapshot. |
 | `json.Doc::parse_text(text)` | Lånar strängen och bygger dokumentets UTF-8-buffert. |

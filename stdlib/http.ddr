@@ -1,0 +1,561 @@
+capability network, unsafe
+
+import std.bytes as bytes
+import std.net as net
+import std.parse as parse
+import std.text as text
+import sys
+
+// One request per connection. Header names are normalized to ASCII lowercase;
+// body bytes are decoded from Content-Length or chunked framing without UTF-8
+// conversion. Callers retain ownership of the stream and close it afterwards.
+pub struct Request {
+    ok: bool,
+    status: i32,
+    method: string,
+    target: string,
+    header_names: []string,
+    header_values: []string,
+    body: []u8,
+    error: string,
+}
+
+struct Reader {
+    buffer: []u8,
+    offset: i32,
+    deadline: i64,
+    status: i32,
+    error: string,
+}
+
+@c_layout
+struct Timespec { seconds: i64, nanos: i64 }
+
+@extern("c", "clock_gettime")
+unsafe fn clock_gettime(clock: i32, result: ptr) -> i32
+@extern("c", "recv")
+unsafe fn recv(fd: i32, output: ptr, count: usize, flags: i32) -> i64
+@extern("c", "__error")
+unsafe fn macos_errno() -> ptr
+@extern("c", "__errno_location")
+unsafe fn linux_errno() -> ptr
+
+fn now_ms() -> i64 {
+    unsafe {
+        mut value: Timespec = zeroed()
+        mut clock := 1
+        if target_is("macos") { clock = 6 }
+        if clock_gettime(clock, addr(&mut value)) != 0 { return sys.now_ms() }
+        value.seconds * 1000 + value.nanos / 1000000
+    }
+}
+
+fn fail(status: i32, message: string) -> Request {
+    Request {
+        ok: false, status: status, method: "", target: "",
+        header_names: [], header_values: [], body: [], error: message.clone(),
+    }
+}
+
+fn token(value: string) -> bool {
+    if value.len == 0 { return false }
+    for b in value.bytes() {
+        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) { continue }
+        if b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 || b == 45 || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126 { continue }
+        return false
+    }
+    true
+}
+
+fn lower(value: string) -> string {
+    mut out: []u8 = []
+    out.reserve(value.len)
+    for b in value.bytes() {
+        if b >= 65 && b <= 90 { out.push(u8(b + 32)) }
+        else { out.push(u8(b)) }
+    }
+    bytes.decode(&out).value
+}
+
+fn trim_ows(value: string) -> string {
+    mut start := 0
+    mut end := value.len
+    while start < end && (value[start] == 32 || value[start] == 9) { start += 1 }
+    while end > start && (value[end - 1] == 32 || value[end - 1] == 9) { end -= 1 }
+    value[start..end]
+}
+
+fn valid_value(value: string) -> bool {
+    for b in value.bytes() {
+        if (b < 32 && b != 9) || b == 127 { return false }
+    }
+    true
+}
+
+// Duplicate framing, authentication and extension fields are ambiguous at an
+// application boundary. Ordinary list-valued headers remain separate entries.
+fn singleton(name: string) -> bool {
+    name == "host" || name == "authorization" || name == "proxy-authorization" || name == "content-length" || name == "transfer-encoding" || name == "content-type" || name == "expect" || name == "origin" || name == "connection" || text.starts_with(name, "x-")
+}
+
+fn wait_ready(stream: &net.TcpStream, events: i32, deadline: i64) -> bool {
+    mut poll := net.PollSet::new()
+    poll.add(stream.fd(), events)
+    while true {
+        remaining := deadline - now_ms()
+        if remaining <= 0 { return false }
+        mut delay := remaining
+        if delay > 2147483647 { delay = 2147483647 }
+        result := poll.poll(i32(delay))
+        if result.ok { return result.count > 0 }
+        if result.error != 4 { return false }
+    }
+    false
+}
+
+fn fill(stream: &net.TcpStream, reader: &mut Reader, limit: i32) -> bool {
+    if reader.buffer.len >= limit {
+        reader.status = 431
+        reader.error = "HTTP framing exceeds its limit"
+        return false
+    }
+    while true {
+        if now_ms() >= reader.deadline {
+            reader.status = 408
+            reader.error = "request deadline exceeded"
+            return false
+        }
+        mut amount := limit - reader.buffer.len
+        if amount > 8192 { amount = 8192 }
+        result := stream.read_append(&mut reader.buffer, amount)
+        if result.ok && !result.eof { return true }
+        if result.eof {
+            reader.status = 400
+            reader.error = "truncated HTTP request"
+            return false
+        }
+        if !result.would_block && result.error != 4 {
+            reader.status = 400
+            reader.error = "cannot read HTTP request"
+            return false
+        }
+        if result.error == 4 { continue }
+        if !wait_ready(&stream, net.poll_in(), reader.deadline) {
+            reader.status = 408
+            reader.error = "request deadline exceeded"
+            return false
+        }
+    }
+    false
+}
+
+fn read_line(stream: &net.TcpStream, reader: &mut Reader, maximum: i32, limit: i32) -> sys.TextResult {
+    while true {
+        end := bytes.find_crlf(&reader.buffer, reader.offset, reader.buffer.len)
+        newline := bytes.find_byte(&reader.buffer, reader.offset, reader.buffer.len, b'\n')
+        if newline >= 0 && (end < 0 || newline != end + 1) {
+            reader.status = 400
+            reader.error = "HTTP lines require CRLF"
+            return sys.TextResult { ok: false, value: "", error: 22 }
+        }
+        if end >= 0 {
+            if end - reader.offset > maximum || end + 2 > limit {
+                reader.status = 431
+                reader.error = "HTTP line exceeds its limit"
+                return sys.TextResult { ok: false, value: "", error: 22 }
+            }
+            result := bytes.decode_range(&reader.buffer, reader.offset, end)
+            reader.offset = end + 2
+            if !result.ok {
+                reader.status = 400
+                reader.error = "invalid UTF-8 in HTTP head"
+            }
+            return result
+        }
+        if reader.buffer.len - reader.offset > maximum + 1 {
+            reader.status = 431
+            reader.error = "HTTP line exceeds its limit"
+            return sys.TextResult { ok: false, value: "", error: 22 }
+        }
+        if !fill(&stream, &mut reader, limit) {
+            return sys.TextResult { ok: false, value: "", error: 22 }
+        }
+    }
+    sys.TextResult { ok: false, value: "", error: 22 }
+}
+
+struct HeaderPart { ok: bool, name: string, value: string }
+
+fn header_parts(line: string) -> HeaderPart {
+    colon := text.find(line, ":")
+    if colon <= 0 { return HeaderPart { ok: false, name: "", value: "" } }
+    name := lower(line[0..colon])
+    value := trim_ows(line[colon + 1..line.len])
+    if !token(name) || !valid_value(value) { return HeaderPart { ok: false, name: "", value: "" } }
+    HeaderPart { ok: true, name: name, value: value }
+}
+
+fn append_header(req: &mut Request, line: string) -> bool {
+    part := header_parts(line)
+    if !part.ok { return false }
+    if singleton(part.name) {
+        for previous in &req.header_names { if previous == part.name { return false } }
+    }
+    req.header_names.push(move part.name)
+    req.header_values.push(move part.value)
+    true
+}
+
+pub fn header(req: &Request, name: string) -> string {
+    wanted := lower(name)
+    for i in 0..req.header_names.len {
+        if req.header_names[i] == wanted { return req.header_values[i].clone() }
+    }
+    ""
+}
+
+fn has_header(req: &Request, name: string) -> bool {
+    for current in &req.header_names { if current == name { return true } }
+    false
+}
+
+fn decimal(value: string, maximum: i64) -> i64 {
+    if value.len == 0 || value.len > 20 { return -1 }
+    // Validate the complete HTTP unsigned number before applying the body
+    // limit: malformed spelling/u64 overflow is 400, a valid excess is 413.
+    number := parse.u64_range(value, 0, value.len)
+    if !number.ok { return -1 }
+    if number.value > u64(maximum) { return -2 }
+    i64(number.value)
+}
+
+fn chunk_size(value: string, maximum: i64) -> i64 {
+    semicolon := text.find(value, ";")
+    mut end := value.len
+    if semicolon >= 0 { end = semicolon }
+    if end == 0 || end > 16 || !valid_value(value) { return -1 }
+    mut result: i64 = 0
+    for i in 0..end {
+        b := value[i]
+        mut digit := -1
+        if b >= 48 && b <= 57 { digit = b - 48 }
+        else if b >= 65 && b <= 70 { digit = b - 55 }
+        else if b >= 97 && b <= 102 { digit = b - 87 }
+        if digit < 0 { return -1 }
+        if result > (maximum - i64(digit)) / 16 { return -2 }
+        result = result * 16 + i64(digit)
+        if result > maximum { return -2 }
+    }
+    result
+}
+
+fn read_exact(stream: &net.TcpStream, reader: &mut Reader, out: &mut []u8, count: i32) -> bool {
+    mut left := count
+    while left > 0 {
+        if reader.offset == reader.buffer.len {
+            // Discard consumed wire bytes before another read; body storage is
+            // independent and remains bounded by the caller's byte limit.
+            reader.buffer.clear()
+            reader.offset = 0
+            if !fill(&stream, &mut reader, left) { return false }
+        }
+        mut amount := reader.buffer.len - reader.offset
+        if amount > left { amount = left }
+        bytes.extend_range(&mut out, &reader.buffer, reader.offset, reader.offset + amount)
+        reader.offset += amount
+        left -= amount
+    }
+    true
+}
+
+fn parse_head(stream: &net.TcpStream, reader: &mut Reader, max_body: i64) -> Request {
+    first := read_line(&stream, &mut reader, 8192, 32768)
+    if !first.ok { return fail(reader.status, reader.error) }
+    parts := text.split(first.value, " ")
+    if parts.len != 3 { return fail(400, "invalid HTTP request line") }
+    if !token(parts[0]) || (parts[2] != "HTTP/1.0" && parts[2] != "HTTP/1.1") { return fail(400, "invalid HTTP request line") }
+    if !text.starts_with(parts[1], "/") { return fail(400, "HTTP target requires origin form") }
+    for b in parts[1].bytes() {
+        if b <= 32 || b == 127 || b == 35 || b == 92 { return fail(400, "invalid HTTP request target") }
+    }
+    mut req := Request {
+        ok: true, status: 200, method: parts[0].clone(), target: parts[1].clone(),
+        header_names: [], header_values: [], body: [], error: "",
+    }
+    while true {
+        line := read_line(&stream, &mut reader, 8192, 32768)
+        if !line.ok { return fail(reader.status, reader.error) }
+        if line.value.len == 0 { break }
+        if req.header_names.len >= 100 { return fail(431, "too many HTTP headers") }
+        if !append_header(&mut req, line.value) { return fail(400, "invalid or duplicate HTTP header") }
+    }
+    if parts[2] == "HTTP/1.1" && header(&req, "host").len == 0 { return fail(400, "Host required") }
+    transfer := lower(header(&req, "transfer-encoding"))
+    has_transfer := has_header(&req, "transfer-encoding")
+    has_length := has_header(&req, "content-length")
+    if has_transfer && (transfer != "chunked" || has_length) { return fail(400, "ambiguous or unsupported HTTP body framing") }
+    mut size: i64 = 0
+    if has_length {
+        size = decimal(header(&req, "content-length"), max_body)
+        if size == -1 { return fail(400, "invalid Content-Length") }
+        if size == -2 { return fail(413, "request body exceeds its limit") }
+    }
+    if has_header(&req, "expect") {
+        if lower(header(&req, "expect")) != "100-continue" { return fail(417, "unsupported Expect header") }
+    }
+    req
+}
+
+// Consume the body after a successful read_head, under a separate total body
+// deadline. Validate the application limit before sending 100 Continue.
+// Ownership of head is transferred; body bytes require no character encoding.
+pub fn read_body(stream: &net.TcpStream, move head: Request, max_body: i32, timeout_ms: i64) -> Request {
+    if max_body < 0 || max_body > 67108864 || timeout_ms <= 0 || timeout_ms > 3600000 {
+        return fail(500, "invalid HTTP reader limits")
+    }
+    if !head.ok { return head }
+    if head.body.len != 0 || head.header_names.len != head.header_values.len { return fail(500, "read_body requires an unconsumed request head") }
+    if !stream.set_nonblocking(true).ok { return fail(500, "cannot configure HTTP stream") }
+    mut reader := Reader { buffer: [], offset: 0, deadline: now_ms() + timeout_ms, status: 400, error: "invalid HTTP request" }
+    mut req := head
+    has_transfer := has_header(&req, "transfer-encoding")
+    has_length := has_header(&req, "content-length")
+    if has_transfer && (lower(header(&req, "transfer-encoding")) != "chunked" || has_length) { return fail(400, "ambiguous or unsupported HTTP body framing") }
+    mut size: i64 = 0
+    if has_length {
+        size = decimal(header(&req, "content-length"), i64(max_body))
+        if size == -1 { return fail(400, "invalid Content-Length") }
+        if size == -2 { return fail(413, "request body exceeds its limit") }
+    }
+    if has_header(&req, "expect") {
+        if lower(header(&req, "expect")) != "100-continue" { return fail(417, "unsupported Expect header") }
+        mut interim: []u8 = []
+        bytes.append_utf8(&mut interim, "HTTP/1.1 100 Continue\r\n\r\n")
+        remaining := reader.deadline - now_ms()
+        if remaining <= 0 || !write_all(&stream, &interim, remaining) { return fail(408, "cannot send HTTP continue") }
+    }
+    if !has_transfer {
+        if !read_exact(&stream, &mut reader, &mut req.body, i32(size)) { return fail(reader.status, reader.error) }
+        return req
+    }
+    while true {
+        line_limit := reader.offset + 1026
+        line := read_line(&stream, &mut reader, 1024, line_limit)
+        if !line.ok { return fail(reader.status, reader.error) }
+        amount := chunk_size(line.value, i64(max_body - req.body.len))
+        if amount == -1 { return fail(400, "invalid HTTP chunk size") }
+        if amount == -2 { return fail(413, "request body exceeds its limit") }
+        if amount == 0 {
+            mut trailer_bytes := 0
+            mut trailer_count := 0
+            while true {
+                trailer_limit := reader.offset + 8194
+                trailer := read_line(&stream, &mut reader, 8192, trailer_limit)
+                if !trailer.ok { return fail(reader.status, reader.error) }
+                trailer_bytes += trailer.value.len + 2
+                if trailer_bytes > 8192 { return fail(431, "HTTP trailers exceed their limit") }
+                if trailer.value.len == 0 { return req }
+                trailer_count += 1
+                if trailer_count > 20 { return fail(431, "too many HTTP trailers") }
+                part := header_parts(trailer.value)
+                if !part.ok { return fail(400, "invalid HTTP trailer") }
+                if singleton(part.name) { return fail(400, "HTTP control trailer refused") }
+            }
+        }
+        if !read_exact(&stream, &mut reader, &mut req.body, i32(amount)) { return fail(reader.status, reader.error) }
+        mut ending: []u8 = []
+        if !read_exact(&stream, &mut reader, &mut ending, 2) { return fail(reader.status, reader.error) }
+        if ending.len != 2 || ending[0] != b'\r' || ending[1] != b'\n' { return fail(400, "invalid HTTP chunk ending") }
+    }
+    req
+}
+
+// Buffer a complete bounded request under one total deadline. Header strings
+// are UTF-8 and cannot contain controls; body bytes remain binary. Applications
+// selecting a body limit by route should call read_head then read_body instead.
+pub fn read_request(stream: &net.TcpStream, max_body: i32, timeout_ms: i64) -> Request {
+    if max_body < 0 || max_body > 67108864 || timeout_ms <= 0 || timeout_ms > 3600000 { return fail(500, "invalid HTTP reader limits") }
+    deadline := now_ms() + timeout_ms
+    head := read_head(&stream, timeout_ms)
+    if !head.ok { return head }
+    remaining := deadline - now_ms()
+    if remaining <= 0 { return fail(408, "request deadline exceeded") }
+    read_body(&stream, move head, max_body, remaining)
+}
+
+fn socket_errno() -> i32 {
+    unsafe {
+        if target_is("macos") { return load_i32(macos_errno()) }
+        else { return load_i32(linux_errno()) }
+    }
+    0
+}
+
+fn partial_head_status(buffer: &[]u8) -> i32 {
+    mut start := 0
+    for i in 0..buffer.len {
+        if buffer[i] == b'\n' {
+            if i == 0 || buffer[i - 1] != b'\r' { return 400 }
+            if i - 1 - start > 8192 { return 431 }
+            start = i + 1
+        } else if buffer[i] == b'\r' && i + 1 < buffer.len && buffer[i + 1] != b'\n' { return 400 }
+    }
+    remaining := buffer.len - start
+    if remaining > 8192 {
+        if remaining != 8193 || buffer[buffer.len - 1] != b'\r' { return 431 }
+    }
+    0
+}
+
+// Peek in bounded blocks, then consume only bytes through the head terminator.
+// Checking a three-byte suffix handles CRLFCRLF split between recv calls.
+fn read_head_wire(stream: &net.TcpStream, reader: &mut Reader) -> bool {
+    mut peek: []u8 = []
+    bytes.pad(&mut peek, 8192)
+    while true {
+        if now_ms() >= reader.deadline {
+            reader.status = 408
+            reader.error = "request deadline exceeded"
+            return false
+        }
+        mut count: i64 = 0
+        unsafe { count = recv(stream.fd(), addr(&mut peek[0]), usize(peek.len), 2) }
+        if count == 0 {
+            reader.status = 400
+            reader.error = "truncated HTTP request"
+            return false
+        }
+        if count < 0 {
+            error := socket_errno()
+            if error == 4 { continue }
+            if error != 11 && error != 35 {
+                reader.status = 400
+                reader.error = "cannot read HTTP request"
+                return false
+            }
+            if !wait_ready(&stream, net.poll_in(), reader.deadline) {
+                reader.status = 408
+                reader.error = "request deadline exceeded"
+                return false
+            }
+            continue
+        }
+        mut start := reader.buffer.len - 3
+        if start < 0 { start = 0 }
+        suffix := reader.buffer.len - start
+        mut scan: []u8 = []
+        bytes.extend_range(&mut scan, &reader.buffer, start, reader.buffer.len)
+        bytes.extend_range(&mut scan, &peek, 0, i32(count))
+        boundary := bytes.find_double_crlf(&scan, 0, scan.len)
+        mut amount := i32(count)
+        if boundary >= 0 { amount = boundary + 4 - suffix }
+        if reader.buffer.len + amount > 32768 {
+            reader.status = 431
+            reader.error = "HTTP headers exceed their limit"
+            return false
+        }
+        mut left := amount
+        while left > 0 {
+            result := stream.read_append(&mut reader.buffer, left)
+            if !result.ok || result.eof {
+                reader.status = 400
+                reader.error = "cannot consume HTTP head"
+                return false
+            }
+            left -= i32(result.count)
+        }
+        partial_status := partial_head_status(&reader.buffer)
+        if partial_status != 0 {
+            reader.status = partial_status
+            reader.error = "invalid or oversized HTTP head line"
+            return false
+        }
+        if boundary >= 0 { return true }
+        if reader.buffer.len >= 32768 {
+            reader.status = 431
+            reader.error = "HTTP headers exceed their limit"
+            return false
+        }
+    }
+    false
+}
+
+// Parse only the head, leaving every body byte on the socket. This supports a
+// streaming application/proxy that delegates body limits and decoding. No
+// interim 100 response is sent: the streaming consumer owns that exchange.
+// Content-Length is syntax-checked and bounded to signed 64-bit, without any
+// allocation proportional to the declared length. Application-specific limits
+// and authentication must run before accepting a streaming body.
+pub fn read_head(stream: &net.TcpStream, timeout_ms: i64) -> Request {
+    if timeout_ms <= 0 || timeout_ms > 3600000 { return fail(500, "invalid HTTP reader limits") }
+    if !stream.set_nonblocking(true).ok { return fail(500, "cannot configure HTTP stream") }
+    mut reader := Reader { buffer: [], offset: 0, deadline: now_ms() + timeout_ms, status: 400, error: "invalid HTTP request" }
+    if !read_head_wire(&stream, &mut reader) { return fail(reader.status, reader.error) }
+    parse_head(&stream, &mut reader, 9223372036854775807)
+}
+
+// Writes on a nonblocking stream under one total deadline. This is also useful
+// to callers forwarding a response body without materializing it in memory.
+pub fn write_all(stream: &net.TcpStream, data: &[]u8, timeout_ms: i64) -> bool {
+    if timeout_ms <= 0 || timeout_ms > 3600000 { return false }
+    if !stream.set_nonblocking(true).ok { return false }
+    deadline := now_ms() + timeout_ms
+    mut offset := 0
+    while offset < data.len {
+        if now_ms() >= deadline { return false }
+        result := stream.write_range(&data, offset, data.len - offset)
+        if result.ok {
+            if result.count <= 0 { return false }
+            offset += i32(result.count)
+        } else if result.error == 4 {
+            continue
+        } else if result.would_block {
+            if !wait_ready(&stream, net.poll_out(), deadline) { return false }
+        } else { return false }
+    }
+    true
+}
+
+fn reason(status: i32) -> string {
+    if status == 200 { return "OK" }
+    if status == 201 { return "Created" }
+    if status == 204 { return "No Content" }
+    if status == 301 { return "Moved Permanently" }
+    if status == 302 { return "Found" }
+    if status == 304 { return "Not Modified" }
+    if status == 400 { return "Bad Request" }
+    if status == 401 { return "Unauthorized" }
+    if status == 403 { return "Forbidden" }
+    if status == 404 { return "Not Found" }
+    if status == 405 { return "Method Not Allowed" }
+    if status == 408 { return "Request Timeout" }
+    if status == 409 { return "Conflict" }
+    if status == 413 { return "Content Too Large" }
+    if status == 417 { return "Expectation Failed" }
+    if status == 429 { return "Too Many Requests" }
+    if status == 431 { return "Request Header Fields Too Large" }
+    if status == 500 { return "Internal Server Error" }
+    if status == 502 { return "Bad Gateway" }
+    if status == 503 { return "Service Unavailable" }
+    "Response"
+}
+
+pub fn write_response(stream: &net.TcpStream, status: i32, content_type: string, extra_names: &[]string, extra_values: &[]string, body: &[]u8, head: bool) -> bool {
+    if status < 100 || status > 599 || extra_names.len != extra_values.len || !valid_value(content_type) { return false }
+    mut output: []u8 = []
+    bytes.append_utf8(&mut output, "HTTP/1.1 " + status.str() + " " + reason(status) + "\r\nConnection: close\r\n")
+    if content_type.len > 0 { bytes.append_utf8(&mut output, "Content-Type: " + content_type + "\r\n") }
+    mut length := body.len
+    if status < 200 || status == 204 || status == 205 || status == 304 { length = 0 }
+    if status >= 200 && status != 204 && status != 304 {
+        bytes.append_utf8(&mut output, "Content-Length: " + length.str() + "\r\n")
+    }
+    for i in 0..extra_names.len {
+        name := lower(extra_names[i])
+        if !token(name) || !valid_value(extra_values[i]) || name == "content-length" || name == "transfer-encoding" || name == "connection" || name == "content-type" { return false }
+        bytes.append_utf8(&mut output, extra_names[i] + ": " + extra_values[i] + "\r\n")
+    }
+    bytes.append_utf8(&mut output, "\r\n")
+    if !head && length > 0 { bytes.extend(&mut output, &body) }
+    write_all(&stream, &output, 30000)
+}
