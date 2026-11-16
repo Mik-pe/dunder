@@ -108,6 +108,17 @@ def targets_and_cache(p):
     incremental(42)
     p.write("calc.ddr", "fn twice(n:i32)->i32{n+n}\npub fn answer()->i32{twice(22)}\n")
     incremental(44)
+    # Removing a module capability header must invalidate incremental fragments and test receipts.
+    p.write("cap_sec.ddr", "capability filesystem\nimport std.fs as fs\n@test fn ok_read(){true}\nfn main(){if false{_:=fs.ReadFile::grant(\"absent\")};print(7)}\n")
+    first_cap = p.call("build", "cap_sec.ddr", "--incremental", "--timings=json", "-o", "cap-sec")
+    assert json.loads(first_cap.stderr)["functions"]["emitted"] >= 1
+    assert ", 0 failed" in p.call("test", "cap_sec.ddr", "--affected", "-o", "cap-sec-tests").stdout
+    assert "unaffected" in p.call("test", "cap_sec.ddr", "--affected", "-o", "cap-sec-tests").stdout
+    p.write("cap_sec.ddr", "import std.fs as fs\n@test fn ok_read(){true}\nfn main(){if false{_:=fs.ReadFile::grant(\"absent\")};print(7)}\n")
+    bad_inc = p.call("build", "cap_sec.ddr", "--incremental", "-o", "cap-sec", status=1)
+    assert "requires capability filesystem" in bad_inc.stderr, bad_inc
+    bad_test = p.call("test", "cap_sec.ddr", "--affected", "-o", "cap-sec-tests", status=1)
+    assert "requires capability filesystem" in bad_test.stderr, bad_test
 
 
 def worker_options(p):

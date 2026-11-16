@@ -161,7 +161,10 @@ class Probe:
             image = source.parent / name
             result = self.run(self.command(driver, 'build', source, ['--timings=json', '-o', image]), source.parent)
             frontend = json.loads(result.stderr)['frontend']
-            if jobs is not None:
+            if jobs == 1:
+                require(frontend['workers_used'] == 0 and frontend['scalar_bodies'] == 0
+                        and frontend['general_bodies'] == 0 and frontend['peak_total_jobs'] == 0, frontend)
+            elif jobs is not None:
                 require(count // 2 <= frontend['scalar_bodies'] <= count and 1 <= frontend['workers_used'] <= frontend['peak_total_jobs'] <= jobs, frontend)
                 bodies = frontend['scalar_bodies'] + frontend['general_bodies']
                 require(0 < frontend['windows'] <= bodies <= jobs * frontend['windows'], frontend)
@@ -185,7 +188,10 @@ class Probe:
             image = source.parent / name
             result = self.run(self.command(driver, 'build', source, ['--timings=json', '-o', image]), source.parent)
             frontend = json.loads(result.stderr)['frontend']
-            if jobs is not None:
+            if jobs == 1:
+                require(frontend['workers_used'] == 0 and frontend['scalar_bodies'] == 0
+                        and frontend['general_bodies'] == 0 and frontend['peak_total_jobs'] == 0, frontend)
+            elif jobs is not None:
                 require(frontend['general_bodies'] >= 6 and 0 < frontend['peak_total_jobs'] <= jobs, frontend)
             images.append(digest(image))
             self.execute(image, 'arm64-macos', '01234567891011\n')
@@ -325,7 +331,49 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
             require(stages[3][0] != stages[0][0], 'private helper edit did not alter the final image')
             variants.append(stages)
         require(all(x == variants[0] for x in variants), variants)
+        # Verify parallel frontend + backend on a larger mixed incremental build.
+        many = [f'fn m{i}(x:i32)->i32{{v:=x+{i};v*2}}' for i in range(16)]
+        calls = '+'.join(f'm{i}(1)' for i in range(16))
+        big = self.case('cache_parallel', '\n'.join(many + [f'fn main(){{print({calls})}}']))
+        results = {}
+        for d in (self.drivers[0], self.drivers[2]):  # jobs=1, jobs=4
+            shutil.rmtree(big.parent / 'build', ignore_errors=True)
+            big.write_text('\n'.join(many + [f'fn main(){{print({calls})}}']))
+            cold_res = self.build(d, big, 'arm64-macos', big.parent / (d[0] + '-cold'), ['--incremental'])
+            warm_res = self.build(d, big, 'arm64-macos', big.parent / (d[0] + '-warm'), ['--incremental'])
+            require(warm_res[1]['functions']['reused'] == 17 and warm_res[1]['mir']['functions'] == 0, warm_res)
+            for idx in range(2, 10):
+                (next((big.parent / 'build').rglob(f'{idx}.fn'))).unlink()
+            mixed_res = self.build(d, big, 'arm64-macos', big.parent / (d[0] + '-mixed'), ['--incremental'])
+            require(mixed_res[1]['functions']['reused'] == 9 and mixed_res[1]['functions']['emitted'] == 8, mixed_res)
+            self.execute(big.parent / (d[0] + '-mixed'), 'arm64-macos', '272\n')
+            results[d[0]] = (cold_res, warm_res, mixed_res)
+        require(results['jobs1'] == results['jobs4'], results)
         self.contracts.append({'case': 'cache', 'cold_warm_mixed_private_edit_equal': True})
+
+    def parallel_check(self):
+        helper_src = '\n'.join([f'pub fn h{i}(x:i32)->i32{{y:=x+{i};y+1}}' for i in range(8)]
+                               + ['fn dead_h(a:string)->i32{n:=a.len;n}'])
+        prog_lines = ['import helper', 'fn dead_p(k:i64)->i64{m:=k+5;m*2}']
+        prog_lines += [f'fn f{i}(x:i32)->i32{{v:=helper.h{i % 8}(x);w:=v+{i};w}}' for i in range(16)]
+        prog_lines += ['fn main(){mut s:=0;' + ''.join(f's=s+f{i}(1);' for i in range(16)) + 'print(s)}']
+        path = self.case('parallel_check', '\n'.join(prog_lines))
+        (path.parent / 'helper.ddr').write_text(helper_src + '\n')
+        lib = path.parent / 'lib.ddr'
+        lib.write_text('\n'.join([f'pub fn libfn{i}(x:[]i32)->i32{{n:=x.len+{i};n}}' for i in range(12)]) + '\n')
+        for target in TARGETS:
+            for src in (path, lib):
+                reports = []
+                for driver in self.drivers:
+                    res = self.run(self.command(driver, 'check', src, ['--agent', '--target', target]), path.parent)
+                    rows = [json.loads(line) for line in res.stdout.splitlines()]
+                    require(rows and rows[-1]['kind'] == 'ok' and any(r['kind'] == 'binding' for r in rows), rows)
+                    reports.append((res.stdout, res.stderr))
+                require(all(r == reports[0] for r in reports), (src, target, reports))
+        path.write_text(path.read_text().replace('fn dead_p(k:i64)->i64{m:=k+5;m*2}', 'fn dead_p(k:i64)->i64{m:=k+false;m}'))
+        errs = [self.run(self.command(d, 'check', path, ['--agent']), path.parent, status=1).stdout for d in self.drivers]
+        require(all(e == errs[0] for e in errs) and json.loads(errs[0])['kind'] == 'error', errs)
+        self.contracts.append({'case': 'parallel_check', 'bindings_and_diagnostics_equal': True})
 
 
 def main():
@@ -353,6 +401,7 @@ def main():
         probe.globals_and_callback()
         probe.saturation()
         probe.cache()
+        probe.parallel_check()
         for name, flags in (
             ('mir_off', ['--mir=off']), ('profile_serial', ['--profile-compiler']),
             ('mir_pass_off', ['--mir-opt=off']), ('values_off', ['--mir-values=off']),

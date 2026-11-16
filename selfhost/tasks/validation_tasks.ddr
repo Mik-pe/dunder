@@ -1,33 +1,121 @@
 // Each worker owns its Session and decoded spellings across jobs. Ordinals are
 // issued in declaration order and accepted in that order for diagnostics.
+import ..driver.budget
 import ..frontend.compile as compiler
 import ..frontend.frozen_source
+import ..frontend.record_take
+import ..opt.opt_alloc
+import ..opt.opt_emit
+import ..opt.opt_inline
+import ..opt.opt_ir
+import ..opt.opt_range
+import ..opt.opt_verify
 
 struct Workspace { session: compiler.Session, ready: bool }
 fn new_workspace() -> Workspace { Workspace { session: compiler.new_session(), ready: false } }
-fn check_body(declaration: i32, work: &mut Workspace, world: &frozen_source.World) -> compiler.Validation {
+
+fn check_job(job: compiler.ValidationJob, work: &mut Workspace, world: &frozen_source.World) -> compiler.Validation {
     if !work.ready {
         compiler.hydrate_validation_worker(&mut work.session, &world)
         work.ready = true
     }
-    compiler.load_validation_body(&mut work.session, &world, declaration)
-    compiler.check_isolated(&mut work.session, declaration)
+    compiler.load_validation_body(&mut work.session, &world, job.declaration)
+    compiler.check_isolated_job(&mut work.session, job)
 }
+
 pub fn check_remaining(c: &mut compiler.Session, workers: i32) -> bool {
     declarations := compiler.validation_plan(&c, workers)
     if declarations.len == 0 { return true }
+    worker_cap := budget.worker_slots(workers, false)
     mut ok := true
-    task scope jobs(workers, new_workspace, shared compiler.freeze_validation_world(&c, &declarations)) {
+    task scope jobs(worker_cap, new_workspace, shared compiler.freeze_validation_world(&c, &declarations)) {
         mut keys: []TaskID<compiler.Validation> = []; keys.reserve(declarations.len)
         mut read := 0
         while read < declarations.len {
-            while keys.len < declarations.len && keys.len - read < workers {
-                keys.push(spawn jobs check_body(declarations[keys.len]))
+            while keys.len < declarations.len && keys.len - read < worker_cap {
+                keys.push(spawn jobs check_job(compiler.ValidationJob { declaration: declarations[keys.len], platform: 0, dead: true }))
             }
             answer := await! jobs(keys[read])
+            read = read + 1
             if !compiler.accept_validation(&mut c, &answer) { ok = false; break }
+        }
+        while read < keys.len {
+            ignored := await! jobs(keys[read])
             read = read + 1
         }
     }
     ok
+}
+
+pub fn check_all(c: &mut compiler.Session, platform: i32, workers: i32,
+    scalar_model: &mut opt_ir.Function, scalar_work: &mut opt_verify.Workspace, scalar_plan: &mut opt_alloc.Plan,
+    emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, view: &opt_inline.View,
+    inline_work: &mut opt_inline.Workspace, records: &mut compiler.Bindings,
+    record_takes: &mut record_take.Plan) -> compiler.Result {
+    max_siblings := budget.worker_slots(workers, true)
+    max_dead_workers := budget.worker_slots(workers, false)
+    mut failed := false
+    task scope jobs(workers, new_workspace, shared compiler.freeze_check_world(&c)) {
+        mut scan := 0
+        mut more := false
+        mut frontier: []i32 = []
+        mut keys: []TaskID<compiler.Validation> = []
+        mut consumed := 0
+        while !failed {
+            next_f := compiler.next_check_from(&c, scan)
+            if next_f < 0 {
+                if !more { break }
+                while consumed < keys.len {
+                    ignored := await! jobs(keys[consumed])
+                    consumed = consumed + 1
+                }
+                frontier.clear(); keys.clear(); consumed = 0
+                scan = 0; more = false
+                continue
+            }
+            more = true
+            scan = next_f + 1
+            if consumed == frontier.len && max_siblings > 0 {
+                frontier.clear(); keys.clear(); consumed = 0
+                compiler.check_window(&c, next_f, max_siblings, &mut frontier)
+                for cand in &frontier {
+                    keys.push(spawn jobs check_job(compiler.ValidationJob { declaration: cand, platform: platform, dead: false }))
+                }
+            }
+            if consumed < frontier.len && frontier[consumed] == next_f {
+                answer := await! jobs(keys[consumed])
+                consumed = consumed + 1
+                if !compiler.accept_reachable_validation(&mut c, next_f, &answer) { failed = true }
+            } else {
+                if !compiler.check_body_local(&mut c, next_f, platform, false, &mut scalar_model,
+                    &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &view, &mut inline_work) {
+                    failed = true
+                }
+            }
+        }
+        while consumed < keys.len {
+            ignored := await! jobs(keys[consumed])
+            consumed = consumed + 1
+        }
+        if !failed {
+            dead := compiler.snapshot_check_phase2(&mut c)
+            mut dead_keys: []TaskID<compiler.Validation> = []; dead_keys.reserve(dead.len)
+            mut dead_read := 0
+            while dead_read < dead.len && !failed {
+                while dead_keys.len < dead.len && dead_keys.len - dead_read < max_dead_workers {
+                    dead_keys.push(spawn jobs check_job(compiler.ValidationJob { declaration: dead[dead_keys.len], platform: 0, dead: true }))
+                }
+                answer := await! jobs(dead_keys[dead_read])
+                if !compiler.accept_dead_validation(&mut c, dead[dead_read], &answer) { failed = true }
+                dead_read = dead_read + 1
+            }
+            while dead_read < dead_keys.len {
+                ignored := await! jobs(dead_keys[dead_read])
+                dead_read = dead_read + 1
+            }
+        }
+    }
+    if failed { return compiler.session_error(&c) }
+    compiler.complete_checked(&mut c, &mut scalar_model, &mut scalar_work, &mut scalar_plan,
+        &emit_settings, &mut range_work, &view, &mut inline_work, &mut records, &mut record_takes)
 }
