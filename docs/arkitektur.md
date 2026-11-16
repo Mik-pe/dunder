@@ -103,7 +103,7 @@ inte bindas lokalt. Scratchlagring kan ännu bara lånas under anrop.
 
 Proveniens tillhör ett färdigt uttrycksresultat. Ett nytt ägt anropsresultat,
 en konstruktor eller ett operatorresultat nollställer argumentens
-lånemetadata, bland annat `borrow_home`, så att det inte ärver en inre vys
+lånemetadata i `FunctionContext.loan` (`LoanState`), bland annat `loan.home`, så att det inte ärver en inre vys
 lagringsplats. Projektioner bevarar däremot sitt verkliga ursprung. Den
 befintliga globala escapegrafen för lån återanvänds även för lokala lån och
 indirekta anrop. Nya uttrycksformer måste fånga analysen före emission;
