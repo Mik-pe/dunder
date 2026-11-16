@@ -58,13 +58,20 @@ def main():
         assert version_text.startswith("dunder ") and version_text.endswith(f" ({host()})\n"), version_text
         assert cmd(compiler, "-V").stdout == version_text
         version = version_text.split()[1]
+        # The original executable must remain a wrong-version candidate after
+        # every release, rather than eventually matching a fixed fixture tag.
+        next_major = int(version.split(".", 1)[0]) + 1
+        target_version = f"{next_major}.0.0"
+        mismatched_version = f"{next_major + 1}.0.0"
+        target_tag = f"v{target_version}"
+        target_option = f"--version={target_tag}"
         assert "dunder upgrade" in cmd(compiler, "upgrade", "--help").stdout
         for options in (["--bad"], ["--version"], ["--version="], ["--version", "../bad"],
                         ["--version", "one", "--version", "two"]):
             cmd(compiler, "upgrade", *options, expect=2)
         latest = root / "latest/download"
-        exact = root / "download/v0.2.0"
-        missing = cmd(compiler, "upgrade", "--check", "--version=v0.2.0", expect=1)
+        exact = root / "download" / target_tag
+        missing = cmd(compiler, "upgrade", "--check", target_option, expect=1)
         assert exact.as_uri() + "/release.txt" in missing.stderr, missing
         release(latest, version, original)
         # Checking a local, source-built compiler is supported.
@@ -86,7 +93,7 @@ def main():
             assert symlink.is_symlink()
 
         def rejected(message):
-            res = cmd(symlink, "upgrade", "--version=v0.2.0", expect=1)
+            res = cmd(symlink, "upgrade", target_option, expect=1)
             assert message in res.stderr, res
             unchanged()
 
@@ -97,50 +104,50 @@ def main():
             cmd(compiler, "build", source, "-o", output)
             return output.read_bytes()
 
-        new = candidate("0.2.0")
-        release(exact, "0.2.0", new)
+        new = candidate(target_version)
+        release(exact, target_version, new)
         (exact / f"{host()}.gz").unlink()
-        result = cmd(symlink, "upgrade", "--check", "--version", "v0.2.0")
-        assert f"update available: {version} -> 0.2.0" in result.stdout, result
+        result = cmd(symlink, "upgrade", "--check", "--version", target_tag)
+        assert f"update available: {version} -> {target_version}" in result.stdout, result
         unchanged()  # --check fetched only the manifest
         rejected("failed to download release archive")
-        release(exact, "0.3.0", new)
+        release(exact, mismatched_version, new)
         rejected("does not match requested tag")
-        release(exact, "0.2.0", new, archive_sha="0" * 64)
+        release(exact, target_version, new, archive_sha="0" * 64)
         rejected("SHA-256 mismatch")
-        release(exact, "0.2.0", new, archive_bytes=b"not gzip")
+        release(exact, target_version, new, archive_bytes=b"not gzip")
         rejected("failed to decompress")
-        release(exact, "0.2.0", new, binary_sha="0" * 64)
+        release(exact, target_version, new, binary_sha="0" * 64)
         rejected("SHA-256 mismatch")
-        release(exact, "0.2.0", b"not executable")
+        release(exact, target_version, b"not executable")
         rejected("failed self-check")
-        release(exact, "0.2.0", original)
+        release(exact, target_version, original)
         rejected("wrong version")
         # Force the identical, but mislabeled, artifact through verification.
-        result = cmd(symlink, "upgrade", "--version=v0.2.0", "--force", expect=1)
+        result = cmd(symlink, "upgrade", target_option, "--force", expect=1)
         assert "wrong version or host" in result.stderr, result
         unchanged()
 
-        release(exact, "0.2.0", new)
+        release(exact, target_version, new)
         # Older installations use an asset directory, which takes precedence
         # over a release root and still honors an explicit version check.
         env["DUNDER_UPGRADE_URL"] = exact.as_uri() + "/"
         direct = cmd(symlink, "upgrade", "--check")
-        assert f"-> 0.2.0 ({host()})" in direct.stdout, direct
-        cmd(symlink, "upgrade", "--check", "--version=v0.3.0", expect=1)
+        assert f"-> {target_version} ({host()})" in direct.stdout, direct
+        cmd(symlink, "upgrade", "--check", f"--version=v{mismatched_version}", expect=1)
         env.pop("DUNDER_UPGRADE_URL")
         assert "already up to date" in cmd(symlink, "upgrade", "--check", "--force").stdout
         unchanged()
-        result = cmd(symlink, "upgrade", "--version=v0.2.0")
-        assert f"upgraded {installed} to 0.2.0 ({host()})" in result.stdout, result
+        result = cmd(symlink, "upgrade", target_option)
+        assert f"upgraded {installed} to {target_version} ({host()})" in result.stdout, result
         assert installed.read_bytes() == new and installed.stat().st_ino != initial.st_ino
         assert symlink.is_symlink() and [p.name for p in installed.parent.iterdir()] == ["dunder"]
-        assert cmd(symlink, "--version").stdout == f"dunder 0.2.0 ({host()})\n"
+        assert cmd(symlink, "--version").stdout == f"dunder {target_version} ({host()})\n"
 
         shutil.copy2(compiler, installed)
-        release(latest, "0.2.0", new)
+        release(latest, target_version, new)
         result = cmd(symlink, "upgrade")
-        assert "to 0.2.0" in result.stdout and installed.read_bytes() == new
+        assert f"to {target_version}" in result.stdout and installed.read_bytes() == new
         assert not list(scratch.iterdir())
     print("PASS test-upgrade")
 
