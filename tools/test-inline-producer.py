@@ -194,13 +194,18 @@ def main():
                     # original source and must remain exactly the same.
                     assert pair[0]['bindings'] == pair[1]['bindings'], (name, target, 'source bindings changed')
                     explicit_off = work / f'{name}-{target}-cli-off'
-                    call([compiler, 'build', work / (name + '.ddr'), '--target', TARGETS[target],
+                    # The direct token API names its in-memory input <source>.
+                    # Give the CLI the same relative origin so assertion text
+                    # shares that provenance and whole-image identity remains exact.
+                    cli_source = work / '<source>'
+                    cli_source.write_text(source)
+                    call([compiler, 'build', cli_source.name, '--target', TARGETS[target],
                           '--inline-opt=off', '-o', explicit_off])
                     assert hashlib.sha256(explicit_off.read_bytes()).hexdigest() == rows[name, target, 'off']['sha256'], (name, target, 'explicit CLI-off output changed')
                     cli_checks += 1
                     if baseline:
                         older = work / f'{name}-{target}-baseline'
-                        call([baseline, 'build', work / (name + '.ddr'), '--target', TARGETS[target], '-o', older])
+                        call([baseline, 'build', cli_source.name, '--target', TARGETS[target], '-o', older])
                         assert older.read_bytes() == explicit_off.read_bytes(), (name, target, 'older baseline differs from explicit off')
                 print('PASS effects/results/bindings', name, flush=True)
             for index, source in enumerate(invalid):

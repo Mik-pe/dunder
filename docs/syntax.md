@@ -82,8 +82,11 @@ konvertering avslutar processen med status 101. Division/rest med noll ger
 Konvertering från `i32` till en enum utan payload kontrollerar deklarerade
 värden och ger 108 för okända värden; se [enums och match](enums.md).
 Reglerna gäller även optimerade byggen. Wraparound är ännu inte en
-språkoperation. Statuskoderna är den första felmekanismen; källkopplade
-runtime-diagnoser återstår.
+språkoperation. På de nativa målen skriver en misslyckad `assert` källfil,
+radnummer och originaluttryck till stderr före exit 104, till exempel
+`src/main.ddr:7: assertion failed: answer == 42`. Samma diagnostik gäller
+booleska testuttryck i `@test`. Villkoret utvärderas en gång; godkända
+assertioner skriver ingenting. Övriga källkopplade runtime-diagnoser återstår.
 
 ### Stränginterpolering
 

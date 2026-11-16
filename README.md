@@ -103,6 +103,10 @@ dunder build examples/fibonacci.ddr -o build/fibonacci
 # true
 ```
 
+`dunder check` typkontrollerar även biblioteksmoduler utan `fn main()`.
+Alla funktionskroppar i importträdet kontrolleras; `build` och `run` kräver
+fortfarande en giltig startfunktion.
+
 `dunder run` bygger och kör programmet direkt. `fn main()` ger exitkod 0;
 `fn main() -> i32` låter programmet välja exitkod med `return`.
 Kör `dunder run examples/functions.ddr` för att prova

@@ -1,0 +1,208 @@
+// Original source provenance belongs to the coordinator. Function workers
+// retain only normalized byte offsets and symbolic diagnostic literal labels.
+import ..driver.modules
+import std.text as text
+import std.bytes as bytes
+import lexer
+
+pub struct Sources {
+    token_offsets: bool, paths: []string, texts: []string,
+    starts: []i32, files: []i32, offsets: []i32,
+}
+pub fn new() -> Sources {
+    Sources { token_offsets: true, paths: [], texts: [], starts: [], files: [], offsets: [] }
+}
+fn directory(path: string) -> string {
+    mut end := path.len
+    while end > 0 {
+        end = end - 1
+        if path[end] == 47 { if end == 0 { return "/" }; return path[0..end] }
+    }
+    "."
+}
+fn path_parts(path: string) -> []string {
+    mut parts: []string = []
+    for part in text.split(path, "/") { if part != "" && part != "." { parts.push(part.clone()) } }
+    parts
+}
+fn relative_path(base: string, path: string) -> string {
+    from := path_parts(base); to := path_parts(path)
+    mut shared := 0
+    while shared < from.len && shared < to.len && from[shared] == to[shared] { shared = shared + 1 }
+    mut result := ""
+    for i in shared..from.len { result = result + "../" }
+    for i in shared..to.len {
+        if i > shared { result = result + "/" }
+        result = result + to[i]
+    }
+    if result == "" { return "." }
+    result
+}
+pub fn from_loaded(loaded: &modules.Loaded) -> Sources {
+    mut paths := loaded.paths.clone()
+    // Relative builds embed invocation-relative paths. Canonical temporary
+    // checkout roots must not change a compiler's self-hosted image bytes.
+    // An explicitly absolute root keeps absolute diagnostics as requested.
+    if loaded.path != "" && loaded.path[0] != 47 && paths.len > 0 && paths[0] != "" && paths[0][0] == 47 {
+        canonical := directory(paths[0]); requested := directory(loaded.path)
+        for i in 0..paths.len {
+            if paths[i] != "" && paths[i][0] == 47 {
+                paths[i] = modules.normalize(requested + "/" + relative_path(canonical, paths[i]))
+            }
+        }
+    }
+    Sources { token_offsets: loaded.token_offsets, paths: paths, texts: loaded.sources.clone(),
+        starts: loaded.map_starts.clone(), files: loaded.map_files.clone(), offsets: loaded.map_offsets.clone() }
+}
+pub fn from_text(source: string) -> Sources {
+    if source == "" { return new() }
+    Sources { token_offsets: true, paths: ["<source>"], texts: [source.clone()], starts: [0], files: [0], offsets: [] }
+}
+
+struct Point { owner: i32, offset: i32, exact: bool }
+fn locate(sources: &Sources, position: i32) -> Point {
+    unknown := Point { owner: -1, offset: 0, exact: false }
+    if position < 0 || sources.starts.len != sources.files.len { return unknown }
+    mut lo := 0; mut hi := sources.starts.len
+    while lo < hi {
+        mid := lo + (hi - lo) / 2
+        if sources.starts[mid] <= position { lo = mid + 1 } else { hi = mid }
+    }
+    if lo == 0 { return unknown }
+    index := lo - 1; owner := sources.files[index]
+    if owner < 0 || owner >= sources.paths.len || owner >= sources.texts.len { return unknown }
+    mut offset := position - sources.starts[index]
+    if !sources.token_offsets {
+        if index >= sources.offsets.len { return unknown }
+        offset = sources.offsets[index]
+    }
+    if offset < 0 || offset > sources.texts[owner].len { return unknown }
+    Point { owner: owner, offset: offset, exact: sources.token_offsets || position == sources.starts[index] }
+}
+fn source_line(source: string, offset: i32) -> string {
+    mut first := offset; mut end := offset
+    while first > 0 && source[first - 1] != 10 { first = first - 1 }
+    while end < source.len && source[end] != 10 { end = end + 1 }
+    text.trim(source[first..end])
+}
+
+fn quoted(value: string, quote: string) -> string {
+    mut out: []u8 = [u8(quote[0])]; digits := "0123456789abcdef"
+    for byte in value.bytes() {
+        if byte == 92 || byte == quote[0] { out.push(92); out.push(u8(byte)) }
+        else if byte == 10 { bytes.append_utf8(&mut out, "\\n") }
+        else if byte == 13 { bytes.append_utf8(&mut out, "\\r") }
+        else if byte == 9 { bytes.append_utf8(&mut out, "\\t") }
+        else if byte < 32 || byte == 127 {
+            bytes.append_utf8(&mut out, "\\x"); out.push(u8(digits[byte / 16])); out.push(u8(digits[byte % 16]))
+        } else { out.push(u8(byte)) }
+    }
+    out.push(u8(quote[0])); bytes.decode(&out).value
+}
+
+// A readable fallback for token clients that have no original file metadata.
+pub fn expression(tokens: &lexer.Tokens, first: i32, end: i32) -> string {
+    if first < 0 || end < first || end > tokens.kinds.len || end > tokens.texts.len { return "" }
+    mut out := ""; mut previous := ""; mut previous_kind: lexer.Kind = .End
+    for i in first..end {
+        kind := tokens.kinds[i]
+        if kind == .Newline || kind == .End { continue }
+        mut word := tokens.texts[i].clone()
+        if kind == .String { word = quoted(word, "\"") }
+        else if kind == .Rune { word = quoted(word, "`") }
+        else if kind == .Byte { word = "u8(" + word + ")" }
+        separate := out.len > 0 && word != ")" && word != "]" && word != "}" && word != "," && word != ";" && word != "." && word != "::" && word != ":" &&
+            previous != "(" && previous != "[" && previous != "." && previous != "::" &&
+            !(word == "(" && (previous_kind == .Name || previous == ")" || previous == "]")) && !(word == "[" && previous_kind == .Name)
+        if separate { out = out + " " }
+        out = out + word; previous = tokens.texts[i].clone(); previous_kind = kind
+    }
+    out
+}
+
+// begin/end name the first and last tokens in the same coordinate system as
+// site. Scan the original lexical span rather than treating a final synthetic
+// interpolation token as a new string opener. Collapsed positions use its line.
+pub fn render(sources: &Sources, site: i32, begin: i32, end: i32, fallback: string) -> string {
+    at := locate(&sources, site)
+    if at.owner < 0 { return "<source>: assertion failed: " + text.trim(fallback) + "\n" }
+    source := sources.texts[at.owner].clone()
+    mut line := 1
+    for i in 0..at.offset { if source[i] == 10 { line = line + 1 } }
+    first := locate(&sources, begin); last := locate(&sources, end)
+    mut expression := ""
+    if first.owner == at.owner && last.owner == at.owner && first.exact && last.exact && last.offset >= first.offset &&
+        (sources.token_offsets || begin == end || last.offset > first.offset) {
+        finish := lexer.span_end(source, first.offset, last.offset)
+        if finish > first.offset { expression = text.trim(source[first.offset..finish]) }
+    }
+    if expression == "" { expression = source_line(source, at.offset) }
+    if expression == "" { expression = text.trim(fallback) }
+    sources.paths[at.owner] + ":" + line.str() + ": assertion failed: " + expression + "\n"
+}
+
+@test fn assertion_diagnostics_map_module_offsets_to_original_unicode_source() {
+    original := "\n\nfn check() { assert(å == 2) }\n"
+    mut sources := new()
+    sources.paths = ["main.ddr", "helpers/å.ddr"]; sources.texts = ["fn main() {}", original.clone()]
+    sources.starts = [0, 200]; sources.files = [0, 1]
+    site := text.find(original, "assert"); begin := text.find(original, "å =="); end := text.find(original, "2)")
+    assert(render(&sources, 200 + site, 200 + begin, 200 + end, "rewritten") == "helpers/å.ddr:3: assertion failed: å == 2\n")
+    direct := from_text("\nassert(false)\n")
+    assert(render(&direct, 1, 8, 8, "rewritten") == "<source>:2: assertion failed: false\n")
+    unknown := new()
+    assert(render(&unknown, 0, 0, 0, " false ") == "<source>: assertion failed: false\n")
+}
+
+@test fn assertion_diagnostics_use_original_lines_for_generated_or_ambiguous_spans() {
+    original := "\n  assert(source_name == 2)\n"
+    loaded := modules.Loaded { token_offsets: false, groups: [], calls: [], ok: true, error: "", path: "lib.ddr", source: "rewritten", offset: 0,
+        paths: ["lib.ddr"], sources: [original.clone()], symbols: [], module_caps: [],
+        map_starts: [100, 107, 149, 150], map_ends: [106, 148, 150, 151], map_files: [0, 0, 0, 0],
+        map_offsets: [text.find(original, "assert"), text.find(original, "source_name"), text.find(original, "2)"), text.find(original, "source_name")] }
+    sources := from_loaded(&loaded)
+    assert(render(&sources, 100, 107, 149, "__dunder_module_name == 2") == "lib.ddr:2: assertion failed: source_name == 2\n")
+    assert(render(&sources, 100, 107, 150, "rewritten") == "lib.ddr:2: assertion failed: assert(source_name == 2)\n")
+    assert(render(&sources, 100, -1, 10000, "rewritten") == "lib.ddr:2: assertion failed: assert(source_name == 2)\n")
+}
+
+@test fn assertion_token_fallback_preserves_literal_quotes_and_utf8() {
+    spelling := "has(\"å\\n\\\"\\\\\", `🌍`)"
+    tokens := lexer.scan(spelling, false)
+    assert(tokens.ok)
+    assert(expression(&tokens, 0, tokens.kinds.len - 1) == spelling)
+    direct := from_text("\nassert((\n    long_name ==\n    \"å\\n\"\n))\n")
+    original := direct.texts[0].clone()
+    assert(render(&direct, 1, text.find(original, "long_name"), text.find(original, "\"å"), "rewritten") == "<source>:2: assertion failed: long_name ==\n    \"å\\n\"\n")
+}
+
+@test fn assertion_display_paths_are_reproducible_for_relative_builds_and_preserve_explicit_absolute_roots() {
+    mut loaded := modules.Loaded { token_offsets: true, groups: [], calls: [], ok: true, error: "", path: "selfhost/main.ddr", source: "", offset: 0,
+        paths: ["/tmp/first-checkout/selfhost/main.ddr", "/tmp/first-checkout/selfhost/frontend/compile.ddr", "/tmp/first-checkout/stdlib/bytes.ddr", "<stdlib/sys.ddr>"],
+        sources: ["", "\nassert(false)", "", ""], symbols: [], module_caps: [],
+        map_starts: [0, 100], map_ends: [], map_files: [0, 1], map_offsets: [] }
+    first := from_loaded(&loaded)
+    assert(first.paths[0] == "selfhost/main.ddr")
+    assert(first.paths[1] == "selfhost/frontend/compile.ddr")
+    assert(first.paths[2] == "stdlib/bytes.ddr")
+    assert(first.paths[3] == "<stdlib/sys.ddr>")
+    diagnostic := render(&first, 101, 108, 108, "rewritten")
+    assert(diagnostic == "selfhost/frontend/compile.ddr:2: assertion failed: false\n")
+    loaded.paths[0] = "/tmp/second-checkout/selfhost/main.ddr"
+    loaded.paths[1] = "/tmp/second-checkout/selfhost/frontend/compile.ddr"
+    loaded.paths[2] = "/tmp/second-checkout/stdlib/bytes.ddr"
+    second := from_loaded(&loaded)
+    assert(render(&second, 101, 108, 108, "rewritten") == diagnostic)
+    loaded.path = "/tmp/second-checkout/selfhost/main.ddr"
+    absolute := from_loaded(&loaded)
+    assert(render(&absolute, 101, 108, 108, "rewritten") == "/tmp/second-checkout/selfhost/frontend/compile.ddr:2: assertion failed: false\n")
+}
+
+@test fn assertion_diagnostics_preserve_rhs_interpolation_and_exclude_later_string_literals() {
+    original := "assert(\"2\" == f\"{x}\"); print(\"later\")"
+    sources := from_text(original)
+    assert(render(&sources, 0, text.find(original, "\"2\""), text.find(original, "}\"") + 1, "rewritten") == "<source>:1: assertion failed: \"2\" == f\"{x}\"\n")
+    implicit := "\n@test fn works() {\n    \"2\" == f\"{x}\"\n    print(\"later\")\n}\n"
+    tests := from_text(implicit); first := text.find(implicit, "\"2\"")
+    assert(render(&tests, first, first, text.find(implicit, "}\"") + 1, "rewritten") == "<source>:3: assertion failed: \"2\" == f\"{x}\"\n")
+}

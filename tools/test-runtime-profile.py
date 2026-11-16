@@ -151,10 +151,11 @@ def main():
                 result = call([output], cwd=work, status=status)
                 reference = call([plain], cwd=work, status=status)
                 assert result.stdout == reference.stdout
-                assert reference.stderr == b''
                 if name == 'trap':
-                    assert result.stdout == b'17\n' and result.stderr == b''
+                    expected = f'{trap}:1: assertion failed: false\n'.encode()
+                    assert result.stdout == b'17\n' and result.stderr == reference.stderr == expected
                     continue
+                assert reference.stderr == b''
                 values = counters(result.stderr)
                 assert values['allocation_count'] == values['fresh_allocations'] + values['reused_allocations']
                 if name == 'empty':

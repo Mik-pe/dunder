@@ -111,18 +111,25 @@ def main():
                 for field in ('allocation_count', 'array_clone_calls', 'array_clone_bytes', 'record_clone_calls', 'record_clone_bytes'):
                     assert new[field] < old[field], (mode, label, field, old, new)
             report['profiles'].append({'mode': mode, **profiles})
-            # ALL source bodies restore. Their helper targets must recreate the
-            # transitive demand closure without frontend source re-emission.
+            # The record producer restores its fragment and must recreate the
+            # transitive helper demand. The asserting caller emits its current
+            # source diagnostic literal on each build.
             cache_work = work / f'cache-{mode}'; cache_work.mkdir()
             source = cache_work / 'input.ddr'; source.write_text(CACHE)
             cold, warm = cache_work / 'cold', cache_work / 'warm'
             before = run([compiler, 'build', source, *flags, '--inline-opt=off', '--incremental', '--timings=json', '-o', cold], cwd=cache_work)
+            fragments = sorted(cache_work.rglob('*.fn'))
+            assert [fragment.name for fragment in fragments] == ['0.fn'], (mode, fragments)
+            producer_fragment = fragments[0].read_bytes()
             after = run([compiler, 'build', source, *flags, '--inline-opt=off', '--incremental', '--timings=json', '-o', warm], cwd=cache_work)
             a, b = json.loads(before.stderr), json.loads(after.stderr)
-            assert a['functions']['reused'] == 0 and b['functions']['reused'] == 2 and b['functions']['emitted'] == 0, (mode, a, b)
-            assert b['mir']['functions'] == 0 and cold.read_bytes() == warm.read_bytes()
+            assert a['functions'] == {'reused': 0, 'emitted': 2} and b['functions'] == {'reused': 1, 'emitted': 1}, (mode, a, b)
+            assert b['mir']['functions'] == 1 and cold.read_bytes() == warm.read_bytes()
+            assert fragments[0].read_bytes() == producer_fragment, (mode, 'record producer fragment changed')
             run([warm], output='42\n')
             report['cache'].append({'mode': mode, 'reused': b['functions']['reused'],
+                                    'emitted': b['functions']['emitted'],
+                                    'producer_fragment_sha256': hashlib.sha256(producer_fragment).hexdigest(),
                                     'sha256': hashlib.sha256(warm.read_bytes()).hexdigest()})
         # Actual native C callback entry calls a Dunder function that creates,
         # projects and returns nested owned temporaries. No callback body may

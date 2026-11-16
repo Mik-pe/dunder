@@ -91,10 +91,9 @@ integration av `dunder-skrift` och `dunder-hundmat/dogfood/skrift`:
     parameternamn samt enhetligare hantering av relativa importer (`"../..."` vs
     `..`).
 - **Diagnostik, `check` och format**:
-  - `assert(...)` i `dunder test` bör skriva ut källfil, radnummer, uttryck och
-    faktiska värden i stället för enbart `exit 104`.
-  - `dunder check <modul.ddr>` bör kunna typkontrollera biblioteksmoduler utan
-    `fn main()`.
+  - `assert(...)` visar nu källfil, radnummer och uttryck på nativa mål;
+    visning av faktiska jämförelsevärden återstår. `dunder check` stöder
+    biblioteksmoduler utan `fn main()`.
   - Formatangivelser i `f`-strängar (bl.a. hexutskrift) samt eventuella
     `{ path = "..." }` / `examples/`-tillägg i `dunder.toml` (`[dependencies]`
     och `std.bytes` big-endian-läsare är redan införda).
