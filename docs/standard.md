@@ -121,19 +121,19 @@ Det är en prövad, begränsad lånemodell. Generella livstidsannotationer åter
 | Import | Innehåll |
 | --- | --- |
 | `std.array` | `ints`, `strings`; `sum`, `sort`, `reverse`, `append` för `[]i64`; `sort_strings` för `[]string`. Heltal använder insertion sort; strängar använder heapsort, O(n log n), på plats och utan extra array. Strängordningen är lexikografisk över UTF-8-byte, inte lokalanpassad. |
-| `std.map` | `Map` från `string` till `i64`; `new`, `length`, `reserve`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `keys`. |
-| `std.set` | `Set` av strängar; `new`, `length`, `reserve`, `insert`, `contains`, `remove`, `clear`, `items`. |
+| `std.map` | `Map` från `string` till `i64` med metoder via `impl Map` (`Map::new`, `m.len`, `m.length`, `m.reserve`, `m.put`, `m.get`, `m.get_or`, `m.contains`, `m.remove`, `m.clear`, `m.keys`) samt modulhjälpare (`map.new`, `map.put`, ...). |
+| `std.set` | `Set` av strängar med metoder via `impl Set` (`Set::new`, `s.len`, `s.length`, `s.reserve`, `s.insert`, `s.contains`, `s.remove`, `s.clear`, `s.items`) samt modulhjälpare (`set.new`, `set.insert`, ...). |
 | `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
 | `std.bytes` | Växande bytebuffertar (`[]u8` och `[]i32`), textappend, nollfyllning, little-/big-endian-kodning (`u16_le`, `u32_le`, `i64_le`, `u64_le`), `hex` / `hex_u8`, kontrollerad UTF-8-avkodning. |
-| `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader`). |
-| `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`parse_bytes`, `parse_text`, `field`, `at`, `get_str`, `get_i64`, `get_u64`, `get_bool`). |
+| `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish` och modulhjälpare). |
+| `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`Doc::parse_bytes`, `Doc::parse_text`, `.field`, `.at`, `.get_str`, `.get_i64`, `.get_u64`, `.get_bool` samt modulhjälpare). |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
-| `std.parse` | `integer(string)` ger `{ ok, value: i64, error }`; strikt ASCII-decimal med tecken och separatorer mellan siffror. |
-| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
+| `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range` (`integer(string)` ger `{ ok, value: i64, error }`) samt `Unsigned::range`/`Unsigned::hex_range`; strikt ASCII med separatorer mellan siffror. |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError::from_code`/`.code`/`.message` samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
-| `std.fs` | Delegerade läs-/skriv-/kataloghandtag samt katalog- och filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
-| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command`, `run`, `run_in`, `status`, `exec`, `spawn` (`Child` och `ChildSet` för parallella processpooler med icke-blockerande `poll`/pipes, `read_stdout_line`, `terminate`, `kill`, `wait`), delegerade `Executable`-handtag (`grant`, `run_granted`) samt miljö- och värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
+| `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`, `WriteFile::grant`/`.write`, `ReadDir::grant`/`.resolve_read`/`.list`) samt modul- och filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
+| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.terminate`, `.kill`), `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
@@ -159,7 +159,9 @@ i64- och u64-gränser stöds. `bytes` innehåller även zero-copy-hjälpare
 (`decode_range`, `find_byte`, `find_crlf`, `find_double_crlf`, `equals_text`,
 `equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
 `std.net` ger kapabilitetsstyrd TCP och `PollSet`/`StreamSet` ovanpå
-`capability network` (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
+`capability network` med både `impl`-metoder (`TcpListener::listen`/`.accept`/`.close`,
+`TcpStream::connect`/`.read_append`/`.write_all`/`.close`, `PollSet::new`,
+`StreamSet::new`) och modulhjälpare (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
 
 Heltal har explicita `.bit_and`, `.bit_or`, `.bit_xor`, `.bit_not`, `.shl`
 och logisk `.shr`. Skiftantal är `i32` och måste ligga inom typens bitbredd;

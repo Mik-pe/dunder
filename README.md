@@ -312,12 +312,12 @@ import std.set as set
 import std.array as array
 
 fn main() {
-    mut counts := map.new()
-    map.put(&mut counts, "dunder", 42)
-    print(map.get_or(&counts, "dunder", 0))
+    mut counts := map.Map::new()
+    counts.put("dunder", 42)
+    print(counts.get_or("dunder", 0))
 
-    mut names := set.new()
-    added := set.insert(&mut names, "å 🌍")
+    mut names := set.Set::new()
+    added := names.insert("å 🌍")
     assert(added)
 
     mut values: []i64 = [3, 1, 2]
@@ -497,7 +497,7 @@ callbacks, funktioner som returvärden, framåtanrop och rekursion,
 filmoduler med explicita importer, modulkapabiliteter (`unsafe`, `filesystem`, `network`), alias, namnrymder och privata/exporterade funktioner och typer,
 härledda/explicit typade lokaler, oföränderlighet, `mut`, blockscope, `if/else`,
 `while`, `for`, `break/continue`, typade arrayer och arrayiteratorer,
-struct-uttryck och fältåtkomst, värde-enums och varianter med data, uttömmande `match`,
+struct-uttryck och fältåtkomst, `impl`-block med associerade funktioner (`Typ::namn`), metoder (`Self`, `&self`, `&mut self`, `self`/`move self`), värde-enums och varianter med data, uttömmande `match`,
 `@test`, `assert`, kortslutande booleska operatorer, `std.net` (TCP-sockets och `PollSet`),
 isolerade `task scope`/`spawn`/`await` med typade `TaskID<R>` på ARM64/macOS,
 heltals- och flyttalsaritmetik, kontrollerade konverteringar och `print`.

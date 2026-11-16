@@ -415,6 +415,51 @@ I `if`-/`while`-villkor och `for`-huvuden behöver ett direkt struct-uttryck
 parenteser runt sig för att skiljas från kontrollflödets block. I vanliga
 anropsargument, deklarationer och testfall behövs inga extra parenteser.
 
+### `impl`-block och metoder
+
+Structar och enums kan definiera associerade funktioner och metoder i ett eller
+flera `impl`-block i samma modul som deklarerar typen:
+
+```dunder
+pub opaque struct Counter {
+    value: i32,
+}
+
+impl Counter {
+    pub fn new(start: i32) -> Self {
+        Self { value: start }
+    }
+
+    pub fn get(&self) -> i32 {
+        self.value
+    }
+
+    pub fn inc(&mut self) {
+        self.value = self.value + 1
+    }
+
+    pub fn into_value(self) -> i32 {
+        self.value
+    }
+}
+```
+
+- `impl Typ { ... }` får endast förekomma i den modul som deklarerar `Typ`
+  (inte för importerade typer eller inbyggda primitiver). `impl`-blocket
+  kan inte markeras med `pub`; synlighet styrs per metod med `pub fn` (privat
+  `fn` utan `pub` kan endast anropas inom typens modul).
+- Inuti ett `impl`-block refererar `Self` till måltypen i typer, structliteraler
+  (`Self { ... }`), enumvarianter (`Self.Variant`) och associerade anrop
+  (`Self::new(...)`).
+- Första parametern kan vara `&self` (delat lån), `&mut self` (muterbart lån),
+  `self` eller `move self` (värdeöverföring; `mut self` / `move mut self` tillåter
+  även mutering av `self`), eller explicit `self: &Self`, `self: &mut Self` / `self: Self`.
+- Funktioner utan `self` anropas med `Typ::namn(...)` (eller via modulalias
+  `mod.Typ::namn(...)`) och kan tas som funktionsvärden (`Typ::namn`). Metoder
+  med `self` anropas med `val.namn(...)` eller med UFCS `Typ::namn(&val, ...)`.
+- `@requires(...)` och `unsafe fn` stöds på enskilda metoder i `impl`, men
+  `@test` är reserverat för fristående testfunktioner på modulnivå.
+
 ## Arrayer, intervall och iteratorer
 
 ```dunder
