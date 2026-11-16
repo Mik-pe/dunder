@@ -881,7 +881,8 @@ def phase_timings(p):
     # Exercise the reporter's clock-failure path independently of host timing.
     sources = Path(__file__).resolve().parents[1] / "selfhost/driver"
     for module in ("cli", "timings", "compiler_profile", "native_clock"):
-        p.write(module + ".ddr", (sources / (module + ".ddr")).read_text())
+        # Resolve each real module's own imports beside its source file.
+        (p.root / (module + ".ddr")).symlink_to(sources / (module + ".ddr"))
     p.write("clock-failure.ddr", '''
 import timings
 import compiler_profile as profile

@@ -396,7 +396,7 @@ Rotfilen är filen som ges till kommandot eller manifestets `root`. Bara dess
 Fel i importerade filer anger deras egen fil, rad och kolumn. Ett missat eller
 oläsbart beroende anger importplatsen. `dunder check`, `build` och `run` läser
 hela det uttryckligt importerade trädet och ignorerar andra filer i katalogen.
-Ett nytt bygge läser om beroenden; inkrementell cache är inte implementerad.
+Ett nytt bygge läser om beroenden. Manifestet kan ange [lokala kataloger och Git-källor](dependencies.md); Git-källor låses till commits i `dunder.lock`. `--incremental` återanvänder verifierade funktionsfragment.
 
 Hela programmet länkas av Dunders egen backend. Moduler är källnamnrymder,
 inte dynamiska bibliotek. Ingen GCC/LLVM-, assembler- eller länkprocess startas

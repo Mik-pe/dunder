@@ -1,0 +1,450 @@
+// Root-owned Git pins and immutable checkouts. Remote Git never executes a
+// project's scripts or submodules; publication waits for a complete graph.
+capability filesystem, process
+import cache_io
+import process as runner
+import std.bytes as bytes
+import std.fs as fs
+import std.process as subprocess
+import std.text as text
+import sys
+
+pub struct Store {
+    ok: bool, error: string, root: string, cache: string, lock_path: string,
+    offline: bool, locked: bool, update: bool, platform: i32,
+    active: bool, closed: bool, guard: i32, sequence: i32, lock_exists: bool,
+    old_urls: []string, old_kinds: []string, old_references: []string, old_commits: []string,
+    urls: []string, kinds: []string, references: []string, commits: []string, paths: []string,
+    fetched: []string,
+}
+fn empty(root: string, offline: bool, locked: bool, update: bool, platform: i32) -> Store {
+    Store { ok: true, error: "", root: root.clone(), cache: root + "/build/.dunder/git", lock_path: root + "/dunder.lock",
+        offline: offline, locked: locked, update: update, platform: platform,
+        active: false, closed: false, guard: -1, sequence: 0, lock_exists: false,
+        old_urls: [], old_kinds: [], old_references: [], old_commits: [], urls: [], kinds: [], references: [], commits: [], paths: [], fetched: [] }
+}
+fn fail(store: &mut Store, message: string) {
+    if store.ok { store.ok = false; store.error = message.clone() }
+}
+fn plain(value: string) -> bool {
+    for b in value.bytes() { if b < 32 || b == 127 { return false } }
+    true
+}
+fn valid_url(url: string) -> bool {
+    if url == "" || url.len > 8192 || !plain(url) { return false }
+    if text.starts_with(url, "https://") { return url.len > 8 }
+    if text.starts_with(url, "ssh://") { return url.len > 6 }
+    if text.starts_with(url, "file://") { return url.len > 7 }
+    // The scp spelling selects SSH, never a remote helper or a local path.
+    at := text.find(url, "@"); colon := text.find(url, ":")
+    at > 0 && colon > at + 1 && colon < url.len - 1 && text.find(url[0..colon], "/") < 0 && text.find(url, "::") < 0
+}
+fn normalized_kind(kind: string) -> string { if kind == "" { "head" } else { kind.clone() } }
+fn valid_selector(kind: string, reference: string) -> bool {
+    if !plain(reference) || reference.len > 1024 { return false }
+    if kind == "head" { return reference == "" }
+    (kind == "branch" || kind == "tag" || kind == "rev") && reference != "" && reference[0] != 45
+}
+fn hex(byte: i32) -> i32 {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    -1
+}
+fn full_commit(value: string) -> bool {
+    if value.len != 40 && value.len != 64 { return false }
+    for b in value.bytes() { if hex(b) < 0 || (b >= 65 && b <= 70) { return false } }
+    true
+}
+fn old_index(store: &Store, url: string, kind: string, reference: string) -> i32 {
+    for i in 0..store.old_urls.len {
+        if store.old_urls[i] == url && store.old_kinds[i] == kind && store.old_references[i] == reference { return i }
+    }
+    -1
+}
+fn selected_index(store: &Store, url: string, kind: string, reference: string) -> i32 {
+    for i in 0..store.urls.len {
+        if store.urls[i] == url && store.kinds[i] == kind && store.references[i] == reference { return i }
+    }
+    -1
+}
+
+struct Quoted { ok: bool, value: string }
+fn unquote(source: string) -> Quoted {
+    bad := Quoted { ok: false, value: "" }
+    if source.len < 2 || (source[0] != 34 && source[0] != 39) { return bad }
+    quote := source[0]; mut out: []u8 = []; mut i := 1
+    while i < source.len {
+        b := source[i]; i = i + 1
+        if b == quote {
+            if text.trim(source[i..source.len]) != "" { return bad }
+            decoded := bytes.decode(&out)
+            return Quoted { ok: decoded.ok, value: decoded.value }
+        }
+        if b < 32 { return bad }
+        if b != 92 || quote == 39 { out.push(u8(b)); continue }
+        if i >= source.len { return bad }
+        escape := source[i]; i = i + 1
+        if escape == 34 || escape == 92 { out.push(u8(escape)) }
+        else if escape == 98 { out.push(8) } else if escape == 116 { out.push(9) }
+        else if escape == 110 { out.push(10) } else if escape == 102 { out.push(12) } else if escape == 114 { out.push(13) }
+        else if escape == 117 || escape == 85 {
+            mut width := 4; if escape == 85 { width = 8 }
+            if i + width > source.len { return bad }
+            mut scalar: i64 = 0
+            for p in i..i + width { digit := hex(source[p]); if digit < 0 { return bad }; scalar = scalar * 16 + i64(digit) }
+            i = i + width
+            if scalar > 1114111 || (scalar >= 55296 && scalar <= 57343) { return bad }
+            bytes.append_utf8(&mut out, rune(i32(scalar)).str())
+        } else { return bad }
+    }
+    bad
+}
+fn quote(value: string) -> string {
+    mut out: []u8 = [34]
+    for b in value.bytes() { if b == 34 || b == 92 { out.push(92) }; out.push(u8(b)) }
+    out.push(34); bytes.decode(&out).value
+}
+fn without_comment(line: string) -> string {
+    mut quote := 0; mut i := 0
+    while i < line.len {
+        b := line[i]
+        if quote == 0 {
+            if b == 35 { return text.trim(line[0..i]) }
+            if b == 34 || b == 39 { quote = b }
+        } else if b == quote { quote = 0 }
+        else if quote == 34 && b == 92 { i = i + 1 }
+        i = i + 1
+    }
+    text.trim(line)
+}
+fn add_old(store: &mut Store, url: string, kind: string, reference: string, commit: string, fields: i32, line: i32) -> bool {
+    if fields != 15 || !valid_url(url) || !valid_selector(kind, reference) || !full_commit(commit) {
+        fail(&mut store, store.lock_path + ":" + line.str() + ": invalid Git lock record"); return false
+    }
+    if old_index(&store, url, kind, reference) >= 0 { fail(&mut store, store.lock_path + ": duplicate Git lock record"); return false }
+    store.old_urls.push(url.clone()); store.old_kinds.push(kind.clone()); store.old_references.push(reference.clone()); store.old_commits.push(commit.clone())
+    true
+}
+fn parse_lock(store: &mut Store, source: string) -> bool {
+    mut version := false; mut record := false; mut fields := 0; mut number := 0
+    mut url := ""; mut kind := ""; mut reference := ""; mut commit := ""
+    for raw in text.split(source, "\n") {
+        number = number + 1; line := without_comment(raw)
+        if line == "" { continue }
+        if line == "[[git]]" {
+            if !version { fail(&mut store, store.lock_path + ": lock requires version = 1"); return false }
+            if record && !add_old(&mut store, url, kind, reference, commit, fields, number) { return false }
+            record = true; fields = 0; url = ""; kind = ""; reference = ""; commit = ""; continue
+        }
+        split := text.find(line, "=")
+        if split < 1 { fail(&mut store, store.lock_path + ":" + number.str() + ": expected a lock assignment"); return false }
+        key := text.trim(line[0..split]); value := text.trim(line[split + 1..line.len])
+        if !record {
+            if key != "version" || value != "1" || version { fail(&mut store, store.lock_path + ": unsupported or duplicate lock version"); return false }
+            version = true; continue
+        }
+        mut bit := 0
+        if key == "url" { bit = 1 } else if key == "kind" { bit = 2 } else if key == "reference" { bit = 4 } else if key == "commit" { bit = 8 }
+        if bit == 0 || fields.bit_and(bit) != 0 { fail(&mut store, store.lock_path + ":" + number.str() + ": unknown or duplicate Git lock field: " + key); return false }
+        parsed := unquote(value)
+        if !parsed.ok { fail(&mut store, store.lock_path + ":" + number.str() + ": expected a quoted Git lock value"); return false }
+        fields = fields.bit_or(bit)
+        if bit == 1 { url = parsed.value } else if bit == 2 { kind = normalized_kind(parsed.value) }
+        else if bit == 4 { reference = parsed.value } else { commit = parsed.value }
+    }
+    if !version { fail(&mut store, store.lock_path + ": lock requires version = 1"); return false }
+    if record && !add_old(&mut store, url, kind, reference, commit, fields, number) { return false }
+    true
+}
+fn load_lock(store: &mut Store) -> bool {
+    store.old_urls.clear(); store.old_kinds.clear(); store.old_references.clear(); store.old_commits.clear(); store.lock_exists = false
+    if fs.is_symlink(store.lock_path) { fail(&mut store, "Git lock file must not be a symlink: " + store.lock_path); return false }
+    info := sys.metadata(store.lock_path)
+    if !info.ok {
+        if info.error == 2 { return true }
+        fail(&mut store, "cannot read " + store.lock_path + ": " + sys.error_message(info.error)); return false
+    }
+    if fs.is_symlink(store.lock_path) || !info.is_file || info.size > 1048576 { fail(&mut store, "invalid Git lock file: " + store.lock_path); return false }
+    source := sys.read_text(store.lock_path)
+    if !source.ok || source.value.len > 1048576 { fail(&mut store, "cannot read Git lock file: " + store.lock_path); return false }
+    store.lock_exists = true; parse_lock(&mut store, source.value)
+}
+pub fn open(project_root: string, offline: bool, locked: bool, update: bool, platform: i32) -> Store {
+    root := cache_io.root(project_root)
+    mut store := empty(root, offline, locked, update, platform)
+    if root == "" || !sys.metadata(root).is_dir { fail(&mut store, "dependency project root does not exist: " + project_root); return store }
+    if platform < 0 || platform > 2 { fail(&mut store, "Git dependencies require a native compiler host"); return store }
+    loaded := load_lock(&mut store)
+    store
+}
+pub fn abort(store: &mut Store) {
+    if store.active { runner.release_file_lock(store.guard) }
+    store.guard = -1; store.active = false; store.closed = true
+}
+fn initialize(store: &mut Store) -> bool {
+    if !store.ok || store.closed { return false }
+    if store.active { return true }
+    for path in [store.root + "/build", store.root + "/build/.dunder", store.cache.clone()] {
+        if fs.is_symlink(path) { fail(&mut store, "Git cache directory must not be a symlink: " + path); return false }
+    }
+    if !fs.mkdir_all(store.cache).ok { fail(&mut store, "cannot create Git dependency cache: " + store.cache); return false }
+    guard := store.cache + "/.lock"
+    if fs.is_symlink(guard) { fail(&mut store, "invalid Git cache lock: " + guard); return false }
+    if !sys.metadata(guard).ok && !sys.write_text(guard, "").ok { fail(&mut store, "cannot create Git cache lock: " + guard); return false }
+    store.guard = runner.acquire_file_lock(guard, 120000, store.platform)
+    if store.guard < 0 { fail(&mut store, "timed out acquiring Git dependency cache lock: " + guard); return false }
+    store.active = true
+    if !load_lock(&mut store) { abort(&mut store); return false }
+    // A crashed compiler releases flock automatically. Only its private staging
+    // names can remain; no live store can be using them while this lock is held.
+    listing := fs.list_dir(store.cache)
+    if !listing.ok { fail(&mut store, "cannot inspect Git dependency cache"); abort(&mut store); return false }
+    for item in &listing.entries {
+        if text.starts_with(item, ".tmp-repo-") || text.starts_with(item, ".tmp-checkout-") { removed := fs.remove_all(store.cache + "/" + item) }
+    }
+    true
+}
+
+fn git(args: &[]string, local: bool) -> subprocess.Output {
+    mut argv: []string = ["--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=true",
+        "-c", "submodule.recurse=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
+        "-c", "protocol.file.allow=always", "-c", "protocol.ext.allow=never", "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true",
+        "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
+    for arg in &args { argv.push(arg.clone()) }
+    mut cmd := subprocess.command("git", move argv)
+    cmd.timeout_ms = 120000; cmd.max_output_bytes = 1048576
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_TEMPLATE_DIR", "GIT_ATTR_SOURCE", "GIT_EXTERNAL_DIFF", "GIT_NAMESPACE", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE"] { subprocess.unset_env(&mut cmd, key.clone()) }
+    subprocess.set_env(&mut cmd, "GIT_TERMINAL_PROMPT", "0"); subprocess.set_env(&mut cmd, "GIT_OPTIONAL_LOCKS", "0")
+    subprocess.set_env(&mut cmd, "GIT_LFS_SKIP_SMUDGE", "1"); subprocess.set_env(&mut cmd, "LC_ALL", "C")
+    if local {
+        // Local checkouts must not run a globally configured attribute filter.
+        // Remote bare fetches retain credential configuration, but never checkout.
+        subprocess.set_env(&mut cmd, "GIT_CONFIG_NOSYSTEM", "1"); subprocess.set_env(&mut cmd, "GIT_CONFIG_GLOBAL", "/dev/null")
+        subprocess.set_env(&mut cmd, "GIT_ATTR_NOSYSTEM", "1")
+    }
+    subprocess.exec(&cmd)
+}
+fn git_text(store: &mut Store, args: &[]string, local: bool, action: string) -> string {
+    result := git(&args, local)
+    if !subprocess.succeeded(&result) {
+        mut detail := text.trim(subprocess.stderr_text(&result))
+        if result.timed_out { detail = "Git command timed out" }
+        if detail == "" { detail = "Git exited " + result.code.str() }
+        fail(&mut store, action + ": " + detail); return ""
+    }
+    decoded := subprocess.stdout_utf8(&result)
+    if !decoded.ok { fail(&mut store, action + ": Git returned invalid UTF-8"); return "" }
+    text.trim(decoded.value)
+}
+fn contains(values: &[]string, value: string) -> bool {
+    for item in &values { if item == value { return true } }
+    false
+}
+fn stage(store: &mut Store, kind: string) -> string {
+    store.sequence = store.sequence + 1
+    store.cache + "/.tmp-" + kind + "-" + sys.pid().str() + "-" + store.sequence.str()
+}
+fn stamped(path: string, marker: string, identity: string) -> bool {
+    if fs.is_symlink(path) || fs.is_symlink(path + "/config") || fs.is_symlink(path + "/" + marker) { return false }
+    config := sys.read_text(path + "/config"); stamp := sys.read_text(path + "/" + marker)
+    config.ok && stamp.ok && stamp.value == identity + "\n" + cache_io.digest(config.value) + "\n"
+}
+fn stamp(path: string, marker: string, identity: string) -> bool {
+    config := sys.read_text(path + "/config")
+    config.ok && sys.write_text(path + "/" + marker, identity + "\n" + cache_io.digest(config.value) + "\n").ok
+}
+fn bare_repo(store: &mut Store, url: string) -> string {
+    repos := store.cache + "/repos"
+    if !fs.mkdir_all(repos).ok { fail(&mut store, "cannot create Git repository cache"); return "" }
+    path := repos + "/" + cache_io.digest(url) + ".git"
+    info := sys.metadata(path)
+    if info.ok || fs.is_symlink(path) {
+        if !info.is_dir || !stamped(path, "dunder-source", url) { fail(&mut store, "Git repository cache was changed: " + path); return "" }
+        return path
+    }
+    if store.offline { fail(&mut store, "Git dependency is not cached; --offline cannot fetch " + url); return "" }
+    temporary := stage(&mut store, "repo")
+    result := git_text(&mut store, &["clone", "--bare", "--no-hardlinks", "--no-recurse-submodules", "--template=", "--", url.clone(), temporary.clone()], false, "cannot clone Git dependency")
+    if !store.ok { removed := fs.remove_all(temporary); return "" }
+    if !stamp(temporary, "dunder-source", url) || !sys.rename(temporary, path).ok {
+        removed := fs.remove_all(temporary); fail(&mut store, "cannot publish Git repository cache: " + path); return ""
+    }
+    store.fetched.push(url.clone())
+    path
+}
+fn fetch(store: &mut Store, bare: string, url: string) -> bool {
+    if contains(&store.fetched, url) { return true }
+    if store.offline { return true }
+    result := git_text(&mut store, &["--git-dir=" + bare, "fetch", "--no-tags", "--prune", "--force", "origin",
+        "+HEAD:refs/dunder/default-head", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], false, "cannot fetch Git dependency")
+    if !store.ok { return false }
+    store.fetched.push(url.clone()); true
+}
+fn has_commit(bare: string, commit: string) -> bool {
+    result := git(&["--git-dir=" + bare, "cat-file", "-e", commit + "^{commit}"], true)
+    subprocess.succeeded(&result)
+}
+fn resolve_commit(store: &mut Store, bare: string, kind: string, reference: string) -> string {
+    mut revision := reference.clone()
+    if kind == "head" {
+        head := git(&["--git-dir=" + bare, "rev-parse", "--verify", "refs/dunder/default-head^{commit}"], true)
+        if subprocess.succeeded(&head) { revision = "refs/dunder/default-head" } else { revision = "HEAD" }
+    } else if kind == "branch" { revision = "refs/heads/" + reference }
+    else if kind == "tag" { revision = "refs/tags/" + reference }
+    mut commit := ""
+    found := git(&["--git-dir=" + bare, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}"], true)
+    if subprocess.succeeded(&found) { commit = text.trim(subprocess.stdout_text(&found)) }
+    else if kind == "rev" {
+        if store.offline { fail(&mut store, "Git revision is not cached; --offline cannot fetch " + reference); return "" }
+        // A GitHub pull-request ref or an exact commit may not be reachable
+        // from ordinary branch/tag advertisements. Fetch it explicitly, never
+        // interpreting a caller-supplied destination refspec or an option.
+        mut allowed := full_commit(reference)
+        if text.starts_with(reference, "refs/") {
+            valid := git(&["check-ref-format", reference.clone()], true)
+            allowed = subprocess.succeeded(&valid)
+        }
+        if !allowed { fail(&mut store, "cannot resolve Git revision: " + reference); return "" }
+        fetched := git_text(&mut store, &["--git-dir=" + bare, "fetch", "--no-tags", "origin", reference.clone()], false, "cannot fetch Git revision")
+        if !store.ok { return "" }
+        commit = git_text(&mut store, &["--git-dir=" + bare, "rev-parse", "--verify", "FETCH_HEAD^{commit}"], true, "cannot resolve fetched Git revision")
+    } else { fail(&mut store, "cannot resolve Git " + kind + " " + reference + ": " + text.trim(subprocess.stderr_text(&found))); return "" }
+    if !store.ok { return "" }
+    if !full_commit(commit) { fail(&mut store, "Git reference did not resolve to a full commit"); return "" }
+    commit
+}
+fn checkout_valid(store: &mut Store, path: string, commit: string) -> bool {
+    if fs.is_symlink(path) || !sys.metadata(path).is_dir || !stamped(path + "/.git", "dunder-checkout", commit) {
+        fail(&mut store, "Git checkout cache was changed: " + path); return false
+    }
+    actual := git_text(&mut store, &["-C", path.clone(), "rev-parse", "--verify", "HEAD^{commit}"], true, "cannot inspect cached Git checkout")
+    if !store.ok { return false }
+    branch := git(&["-C", path.clone(), "symbolic-ref", "-q", "HEAD"], true)
+    if actual != commit || subprocess.succeeded(&branch) { fail(&mut store, "Git checkout cache is not detached at its pinned commit: " + path); return false }
+    tracked := git_text(&mut store, &["-C", path.clone(), "ls-files", "-v", "--cached"], true, "cannot inspect Git checkout index")
+    if !store.ok { return false }
+    // Neither assume-unchanged nor skip-worktree is part of a full immutable
+    // checkout. Both can hide real file edits from an ordinary Git status.
+    for line in text.split(tracked, "\n") {
+        if line != "" && (line.len < 2 || line[0] != 72 || line[1] != 32) {
+            fail(&mut store, "Git dependency cache has nonstandard index flags: " + path); return false
+        }
+    }
+    changes := git_text(&mut store, &["-C", path.clone(), "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"], true, "cannot inspect Git checkout changes")
+    if !store.ok { return false }
+    if changes != "" { fail(&mut store, "Git dependency cache has local changes: " + path); return false }
+    true
+}
+fn materialize(store: &mut Store, bare: string, url: string, commit: string) -> string {
+    parent := store.cache + "/checkouts/" + cache_io.digest(url)
+    if !fs.mkdir_all(parent).ok { fail(&mut store, "cannot create Git checkout cache"); return "" }
+    path := parent + "/" + commit
+    if sys.metadata(path).ok || fs.is_symlink(path) {
+        if checkout_valid(&mut store, path, commit) { return path }; return ""
+    }
+    temporary := stage(&mut store, "checkout")
+    cloned := git_text(&mut store, &["clone", "--shared", "--no-checkout", "--no-recurse-submodules", "--template=", "--", bare.clone(), temporary.clone()], true, "cannot create Git checkout")
+    if store.ok {
+        checked := git_text(&mut store, &["-C", temporary.clone(), "checkout", "--detach", "--force", commit.clone(), "--"], true, "cannot checkout pinned Git commit")
+    }
+    if !store.ok { removed := fs.remove_all(temporary); return "" }
+    if !stamp(temporary + "/.git", "dunder-checkout", commit) { removed := fs.remove_all(temporary); fail(&mut store, "cannot stamp Git checkout cache"); return "" }
+    if !checkout_valid(&mut store, temporary, commit) { removed := fs.remove_all(temporary); return "" }
+    if !sys.rename(temporary, path).ok { removed := fs.remove_all(temporary); fail(&mut store, "cannot publish Git checkout cache"); return "" }
+    path
+}
+pub fn checkout(store: &mut Store, url: string, requested_kind: string, reference: string) -> string {
+    if !store.ok { return "" }
+    if store.closed { fail(&mut store, "Git dependency store is already closed"); return "" }
+    kind := normalized_kind(requested_kind)
+    if !valid_url(url) || !valid_selector(kind, reference) { fail(&mut store, "invalid Git dependency URL or reference"); return "" }
+    selected := selected_index(&store, url, kind, reference)
+    if selected >= 0 { return store.paths[selected].clone() }
+    if !initialize(&mut store) { return "" }
+    previous := old_index(&store, url, kind, reference)
+    if previous < 0 && store.locked { fail(&mut store, "dunder.lock needs a new Git pin; --locked forbids changes"); return "" }
+    bare := bare_repo(&mut store, url)
+    if !store.ok { return "" }
+    mut commit := ""
+    if previous >= 0 && !store.update { commit = store.old_commits[previous].clone() }
+    else {
+        if kind == "branch" || kind == "tag" {
+            prefix := "refs/heads/"; mut name := prefix + reference
+            if kind == "tag" { name = "refs/tags/" + reference }
+            checked := git_text(&mut store, &["check-ref-format", name], true, "invalid Git reference")
+            if !store.ok { return "" }
+        }
+        if !fetch(&mut store, bare, url) { return "" }
+        commit = resolve_commit(&mut store, bare, kind, reference)
+    }
+    if !store.ok { return "" }
+    if !has_commit(bare, commit) {
+        if store.offline { fail(&mut store, "pinned Git object is not cached; --offline cannot fetch " + commit); return "" }
+        if !fetch(&mut store, bare, url) { return "" }
+        if !has_commit(bare, commit) {
+            fetched := git_text(&mut store, &["--git-dir=" + bare, "fetch", "--no-tags", "origin", commit.clone()], false, "cannot fetch pinned Git commit")
+            if !store.ok { return "" }
+        }
+    }
+    if !has_commit(bare, commit) { fail(&mut store, "pinned Git commit is unavailable: " + commit); return "" }
+    path := materialize(&mut store, bare, url, commit)
+    if !store.ok { return "" }
+    store.urls.push(url.clone()); store.kinds.push(move kind); store.references.push(reference.clone()); store.commits.push(move commit); store.paths.push(path.clone())
+    path
+}
+fn unchanged(store: &Store) -> bool {
+    if store.old_urls.len != store.urls.len { return false }
+    for i in 0..store.urls.len {
+        previous := old_index(&store, store.urls[i], store.kinds[i], store.references[i])
+        if previous < 0 || store.old_commits[previous] != store.commits[i] { return false }
+    }
+    true
+}
+fn lock_text(store: &Store) -> string {
+    mut out := "version = 1\n"
+    for i in 0..store.urls.len {
+        out = out + "\n[[git]]\nurl = " + quote(store.urls[i]) + "\nkind = " + quote(store.kinds[i]) + "\nreference = " + quote(store.references[i]) + "\ncommit = " + quote(store.commits[i]) + "\n"
+    }
+    out
+}
+pub fn finish(store: &mut Store) -> bool {
+    if !store.ok { abort(&mut store); return false }
+    if store.closed { fail(&mut store, "Git dependency store is already closed"); return false }
+    // No Git requirement and no previous lock needs no cache or Git executable.
+    if !store.active {
+        if !sys.metadata(store.lock_path).ok { store.closed = true; return true }
+        if !initialize(&mut store) { abort(&mut store); return false }
+    }
+    if unchanged(&store) { abort(&mut store); return true }
+    if store.locked { fail(&mut store, "dunder.lock needs updating; --locked forbids changes"); abort(&mut store); return false }
+    store.sequence = store.sequence + 1
+    temporary := store.root + "/.dunder.lock." + sys.pid().str() + "." + store.sequence.str() + ".tmp"
+    if fs.is_symlink(temporary) || sys.metadata(temporary).ok { fail(&mut store, "Git lock staging path already exists"); abort(&mut store); return false }
+    written := sys.write_text(temporary, lock_text(&store))
+    if !written.ok || !sys.rename(temporary, store.lock_path).ok {
+        removed := sys.remove_file(temporary); fail(&mut store, "cannot publish dunder.lock"); abort(&mut store); return false
+    }
+    abort(&mut store); true
+}
+
+@test fn git_lock_round_trips_selectors_quoted_urls_and_exact_commits() {
+    mut store := empty("/project", false, false, false, 0)
+    store.urls = ["file:///tmp/a\"b.git", "git@github.com:owner/repo.git"]
+    store.kinds = ["head", "branch"]; store.references = ["", "feature/a#b"]
+    store.commits = ["0123456789012345678901234567890123456789", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+    source := lock_text(&store)
+    assert(parse_lock(&mut store, source))
+    assert(unchanged(&store))
+    assert(valid_url("https://example.test/repo.git") && valid_url("ssh://git@example.test/repo.git"))
+    assert(!valid_url("ext::sh -c bad") && !valid_url("/tmp/unqualified") && !valid_url("https://example.test/\n"))
+}
+@test fn git_lock_rejects_ambiguous_records_without_changing_pins() {
+    for source in ["", "version = 2", "version = 1\n[[git]]\nurl = 'https://example.test/r'", "version = 1\nversion = 1"] {
+        mut store := empty("/project", false, false, false, 0)
+        assert(!parse_lock(&mut store, source) && !store.ok)
+    }
+    assert(!full_commit("HEAD") && !full_commit("abcdef") && !valid_selector("head", "main"))
+    assert(unquote("\"a\\u00e5\\\\b\"").value == "aå\\b")
+}

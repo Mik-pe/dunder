@@ -138,6 +138,21 @@ Utdata hamnar då i `build/<target>/hello`, exempelvis `build/x86_64-linux/hello
 `root` även för tester. Kompileringsfel har fil, rad, kolumn och
 felkod. Ett misslyckat bygge lämnar tidigare utdata orörd.
 
+GitHub- och andra Git-beroenden anges i samma fil:
+
+```toml
+[dependencies]
+matematik = { git = "https://github.com/ditt-team/dunder-matematik.git", branch = "main" }
+lokalt = { path = "../mitt-bibliotek" }
+```
+
+`branch`, `tag` eller `rev` väljer version; utan väljare används repots
+standardgren. Importera med `import matematik`. `dunder.lock` låser direkta och
+transitiva Git-beroenden till exakta commits och bör checkas in.
+`dunder update` uppdaterar låsningen, `--locked` kräver oförändrad låsfil och
+`--offline` använder bara den lokala cachen. Se [beroenden](docs/dependencies.md)
+för syntax, cache och felhantering.
+
 Läs om [FFI, C-layout och modulkapabiliteter](docs/ffi.md) och
 [funktionscachen, `check --agent` och `test --affected`](docs/incremental.md).
 Större dogfood-program (Metal-, Vulkan- och WebGPU-trianglar, Tabell samt en

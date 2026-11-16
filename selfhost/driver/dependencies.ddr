@@ -1,0 +1,191 @@
+// Resolve local and Git packages into the compiler's ordinary import map.
+// Only the root project owns the Git lockfile; dependency manifests describe sources.
+import sys
+import std.text as text
+import cache_io
+import manifest
+import git_dependencies as git
+
+pub struct Graph { ok: bool, error: string, names: []string, dirs: []string, entries: []string }
+struct Walk { active: []string, dirs: []string, boundaries: []string }
+
+pub fn dir_of(path: string) -> string {
+    mut i := path.len
+    while i > 0 {
+        i = i - 1
+        if path[i] == 47 {
+            if i == 0 { return "/" }
+            return path[0..i]
+        }
+    }
+    "."
+}
+
+fn strip_trailing_slashes(path: string) -> string {
+    mut end := path.len
+    while end > 1 && path[end - 1] == 47 { end = end - 1 }
+    if end == path.len { return path.clone() }
+    path[0..end]
+}
+
+pub fn path_in(dir: string, path: string) -> string {
+    mut rel := strip_trailing_slashes(path)
+    if text.starts_with(rel, "/") { return rel }
+    while text.starts_with(rel, "./") && rel.len > 2 {
+        rel = rel[2..rel.len]
+    }
+    base := strip_trailing_slashes(dir)
+    if base == "." || base == "" { return rel }
+    if rel == "." { return base }
+    if base == "/" { return "/" + rel }
+    base + "/" + rel
+}
+
+fn normalize_lexical(path: string) -> string {
+    mut parts: []string = []
+    absolute := path.len > 0 && path[0] == 47
+    mut start := 0
+    mut i := 0
+    while i <= path.len {
+        if i == path.len || path[i] == 47 {
+            part := path[start..i]
+            if part == ".." {
+                if parts.len > 0 && parts[parts.len - 1] != ".." { old := parts.pop() }
+                else if !absolute { parts.push(move part) }
+            } else if part != "" && part != "." { parts.push(move part) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    mut out := ""
+    if absolute { out = "/" }
+    for idx in 0..parts.len {
+        if idx > 0 { out = out + "/" }
+        out = out + parts[idx]
+    }
+    if out == "" { return "." }
+    out
+}
+
+fn clean_existing_path(path: string) -> string {
+    norm := normalize_lexical(path)
+    if norm != path && sys.same_file(norm, path) { return norm }
+    strip_trailing_slashes(path)
+}
+
+pub fn find_manifest_dir(start: string) -> string {
+    if !sys.metadata(start).is_dir { return "" }
+    mut dir := start.clone()
+    while !sys.metadata(dir + "/dunder.toml").is_file {
+        parent := dir + "/.."
+        if !sys.metadata(parent).is_dir || sys.same_file(dir, parent) { return "" }
+        dir = parent
+    }
+    clean_existing_path(dir)
+}
+
+
+fn contained(path: string, boundary: string) -> bool {
+    if boundary == "" { return true }
+    canonical := cache_io.root(path)
+    canonical != "" && (canonical == boundary || text.starts_with(canonical, boundary + "/"))
+}
+
+fn visit(project_dir: string, toml_path: string, parsed: &manifest.Manifest, boundary: string,
+    graph: &mut Graph, store: &mut git.Store, walk: &mut Walk) {
+    for i in 0..parsed.dep_names.len {
+        location := toml_path + ":" + parsed.dep_lines[i].str() + ": "
+        dep_name := parsed.dep_names[i].clone()
+        mut dep_path := ""
+        mut dep_boundary := boundary.clone()
+        if parsed.dep_git[i] != "" {
+            dep_path = git.checkout(&mut store, parsed.dep_git[i], parsed.dep_kinds[i], parsed.dep_refs[i])
+            if !store.ok { graph.error = location + store.error; return }
+            dep_boundary = cache_io.root(dep_path)
+            if dep_boundary == "" { graph.error = location + "Git dependency checkout not found: " + dep_name; return }
+        } else { dep_path = clean_existing_path(path_in(project_dir, parsed.dep_paths[i])) }
+        if !sys.metadata(dep_path).is_dir {
+            graph.error = location + "dependency directory not found: " + dep_path; return
+        }
+        if !contained(dep_path, dep_boundary) {
+            graph.error = location + "dependency path escapes its Git checkout: " + dep_path; return
+        }
+        for k in 0..walk.active.len {
+            if sys.same_file(walk.active[k], dep_path) {
+                graph.error = location + "dependency cycle involving '" + dep_name + "'"; return
+            }
+        }
+        if walk.active.len >= 256 { graph.error = location + "dependency graph exceeds 256 nested packages"; return }
+        mut dep_dir := dep_path.clone()
+        mut dep_entry := ""
+        mut has_sub := false
+        mut sub := manifest.empty()
+        dep_toml := path_in(dep_path, "dunder.toml")
+        if sys.metadata(dep_toml).is_file {
+            if !contained(dep_toml, dep_boundary) {
+                graph.error = location + "dependency manifest escapes its Git checkout: " + dep_toml; return
+            }
+            sub = manifest.parse(dep_toml, false)
+            if !sub.ok { graph.error = sub.error; return }
+            dep_entry = clean_existing_path(path_in(dep_path, sub.root))
+            dep_dir = clean_existing_path(dir_of(dep_entry))
+            if !sys.metadata(dep_dir).is_dir {
+                graph.error = dep_toml + ": dependency root directory not found: " + dep_dir; return
+            }
+            if !contained(dep_dir, dep_boundary) || (sys.metadata(dep_entry).is_file && !contained(dep_entry, dep_boundary)) {
+                graph.error = dep_toml + ": dependency root escapes its Git checkout: " + dep_entry; return
+            }
+            has_sub = true
+        }
+        mut existing := -1
+        for k in 0..graph.names.len { if graph.names[k] == dep_name { existing = k; break } }
+        if existing >= 0 {
+            same_dir := graph.dirs[existing] == dep_dir || sys.same_file(graph.dirs[existing], dep_dir)
+            prev_entry := graph.entries[existing].clone()
+            same_entry := (prev_entry == "" && dep_entry == "") ||
+                (prev_entry != "" && dep_entry != "" && (prev_entry == dep_entry || sys.same_file(prev_entry, dep_entry)))
+            if !same_dir || !same_entry {
+                graph.error = location + "conflicting dependency '" + dep_name + "': " + dep_dir + " conflicts with " + graph.dirs[existing]; return
+            }
+        } else {
+            graph.names.push(move dep_name); graph.dirs.push(move dep_dir); graph.entries.push(move dep_entry)
+        }
+        if has_sub && sub.dep_names.len > 0 {
+            // Alias deduplication cannot skip a stricter Git boundary after the
+            // same checkout was first reached through a local path.
+            mut validated := false
+            for k in 0..walk.dirs.len {
+                if walk.boundaries[k] == dep_boundary && sys.same_file(walk.dirs[k], dep_path) { validated = true; break }
+            }
+            if !validated {
+                walk.dirs.push(dep_path.clone()); walk.boundaries.push(dep_boundary.clone())
+                walk.active.push(dep_path.clone())
+                visit(dep_path, dep_toml, &sub, dep_boundary, &mut graph, &mut store, &mut walk)
+                discarded := walk.active.pop()
+                if graph.error != "" { return }
+            }
+        }
+    }
+}
+
+pub fn resolve(project_dir: string, toml_path: string, parsed: &manifest.Manifest,
+    offline: bool, locked: bool, update: bool, host: i32) -> Graph {
+    mut graph := Graph { ok: false, error: "", names: [], dirs: [], entries: [] }
+    mut store := git.open(project_dir, offline, locked, update, host)
+    if !store.ok { graph.error = store.error.clone(); git.abort(&mut store); return graph }
+    mut walk := Walk { active: [project_dir.clone()], dirs: [], boundaries: [] }
+    visit(project_dir, toml_path, &parsed, "", &mut graph, &mut store, &mut walk)
+    if graph.error != "" { git.abort(&mut store); return graph }
+    if !git.finish(&mut store) { graph.error = store.error.clone(); git.abort(&mut store); return graph }
+    graph.ok = true; graph
+}
+
+@test fn dependency_paths_keep_relative_and_absolute_roots() {
+    assert(dir_of("src/main.ddr") == "src")
+    assert(dir_of("main.ddr") == ".")
+    assert(dir_of("/main.ddr") == "/")
+    assert(path_in(".", "../dunder-skrift/") == "../dunder-skrift")
+    assert(path_in("..", "./src/main.ddr") == "../src/main.ddr")
+    assert(normalize_lexical("../depA/../depB") == "../depB")
+    assert(normalize_lexical("src/..") == ".")
+}

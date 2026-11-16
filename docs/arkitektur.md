@@ -184,7 +184,7 @@ publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsn
 
 ## Byggkontraktet
 
-`dunder build` hittar närmaste `dunder.toml` från arbetskatalogen uppåt. Första manifestet behöver bara programnamn och rotmodul. Rotmodulens uttryckliga importer bestämmer vad som byggs. Lokala beroenden räcker för första versionen. Standardkommandot bygger optimerat för värddatorns stödda mål och skriver till `build/<mål>/<program>`. Det kräver varken nätverk, bakgrundsprocess eller användarskrivna byggskript. `--target arm64-macos` väljer målet uttryckligen. `--timings` redovisar faser och återanvändning. Ett fel ger källposition, felkod från kommandot och inget halvskrivet resultat.
+`dunder build` hittar närmaste `dunder.toml` från arbetskatalogen uppåt. Första manifestet behöver bara programnamn och rotmodul. Rotmodulens uttryckliga importer bestämmer vad som byggs. Beroenden kan vara lokala kataloger eller [Git-källor med låsta commits](dependencies.md). Standardkommandot bygger optimerat för värddatorns stödda mål och skriver till `build/<mål>/<program>`. Lokala och cachade beroenden kan byggas utan nätverk; `--offline` förbjuder hämtning. Git-källor hämtas med Git, utan bakgrundsprocess eller användarskrivna byggskript. `--target arm64-macos` väljer målet uttryckligen. `--timings` redovisar faser och återanvändning. Ett fel ger källposition, felkod från kommandot och inget halvskrivet resultat.
 
 Med `--incremental` lagras maskinkodsfragment och symboliska korrigeringsposter.
 Cacheidentiteten omfattar den körande kompilatorn.
