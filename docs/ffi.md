@@ -50,6 +50,26 @@ variabel. Dunder-funktioner och C-funktionspekare har skilda typer. På native
 betecknar `"c"` systemets C-bibliotek och `"dl"` systemets dynamiska laddare.
 På Wasm anger de två strängarna importmodul och importnamn.
 
+En variadisk C-funktion deklareras med `@c_variadic(antal_fasta_parametrar)`.
+Varje anrop har fortfarande en fullständigt statisk signatur: deklarera separata
+typade alias när samma C-symbol används med olika typer, till exempel libcurl:
+
+```dunder
+@c_variadic(2)
+@extern("/usr/lib/libcurl.dylib", "curl_easy_setopt")
+unsafe fn setopt_ptr(easy: ptr, option: i32, value: ptr) -> i32
+```
+
+Antalet fasta parametrar måste ligga mellan noll och deklarationens antal
+parametrar. De återstående parametrarna måste redan ha C:s promoverade typer:
+`i32`, `u32`, `i64`, `u64`, `usize`, `ptr`, `f64` eller en C-funktionspekare.
+Konvertera `f32` till `f64` och små heltal till `i32` före anropet. Variadiska
+aggregat stöds inte. Attributet kräver `@extern unsafe fn` och ett nativt mål.
+Gränsen mellan fasta och variadiska parametrar ingår i funktionens typ och
+bevaras vid härledd tilldelning (`call := setopt_ptr`); den kan inte tilldelas
+en vanlig `extern fn`-typ. Apple ARM64 använder åttabytes stackplatser för
+variadiska argument; Linuxmålen använder respektive plattforms C-konvention.
+
 Parametrar och returvärden kan vara skalära tal eller pekare. Native-anrop kan
 också överföra en C-struct bestående av en till fyra identiska flyttal (även
 nästlade). Skicka andra structar med pekare. Använd en fast signatur för varje
