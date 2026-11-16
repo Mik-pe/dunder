@@ -1,0 +1,444 @@
+// TOML's table namespaces are separate from its lexical value grammar. Keep
+// stable node IDs and direct sibling links so both lookup and JSON emission
+// remain linear in the document rather than repeatedly scanning the arena.
+import std.bytes
+import std.json
+import std.map
+
+// Kinds: table 0, value array 1, scalar JSON 2, array of tables 3.
+// Definitions: implicit header parent 0, explicit table/value 1, dotted key 2,
+// closed inline value 3. The root is an explicit table at node 0, depth 0.
+pub opaque struct Tree {
+    problem: string,
+    parents: []i32,
+    keys: []string,
+    kinds: []i32,
+    values: []string,
+    definitions: []i32,
+    depths: []i32,
+    first: []i32,
+    last: []i32,
+    next: []i32,
+    fields: map.Map,
+}
+
+pub struct RenderResult { ok: bool, error: string, json: string }
+
+pub fn new() -> Tree {
+    Tree {
+        problem: "", parents: [-1], keys: [""], kinds: [0], values: [""],
+        definitions: [1], depths: [0], first: [-1], last: [-1], next: [-1],
+        fields: map.new(),
+    }
+}
+
+fn fail(tree: &mut Tree, message: string) {
+    if tree.problem == "" { tree.problem = message.clone() }
+}
+
+fn valid(tree: &Tree, node: i32) -> bool { node >= 0 && node < tree.kinds.len }
+
+pub fn error(tree: &Tree) -> string { tree.problem.clone() }
+pub fn kind(tree: &Tree, node: i32) -> i32 {
+    if !valid(&tree, node) { return -1 }
+    tree.kinds[node]
+}
+pub fn definition(tree: &Tree, node: i32) -> i32 {
+    if !valid(&tree, node) { return -1 }
+    tree.definitions[node]
+}
+pub fn get(tree: &Tree, node: i32) -> string {
+    if !valid(&tree, node) { return "" }
+    tree.values[node].clone()
+}
+
+// The first ':' terminates a decimal nonnegative parent ID; the entire
+// remaining string is the key. Dots, colons, empty keys and NUL cannot alias.
+fn indexed(parent: i32, key: string) -> string { parent.str() + ":" + key }
+
+pub fn field(tree: &Tree, parent: i32, key: string) -> i32 {
+    if !valid(&tree, parent) || tree.kinds[parent] != 0 { return -1 }
+    i32(map.get_or(&tree.fields, indexed(parent, key), -1))
+}
+
+pub fn add(tree: &mut Tree, parent: i32, key: string, node_kind: i32, node_definition: i32) -> i32 {
+    if tree.problem != "" { return -1 }
+    if !valid(&tree, parent) || tree.kinds[parent] == 2 {
+        fail(&mut tree, "cannot add a value to a scalar"); return -1
+    }
+    if tree.definitions[parent] == 3 {
+        fail(&mut tree, "cannot extend an inline table"); return -1
+    }
+    if node_kind < 0 || node_kind > 3 || node_definition < 0 || node_definition > 3 {
+        fail(&mut tree, "invalid configuration node"); return -1
+    }
+    if tree.kinds[parent] == 3 && node_kind != 0 {
+        fail(&mut tree, "array table elements must be tables"); return -1
+    }
+    if node_kind == 3 && tree.kinds[parent] != 0 {
+        fail(&mut tree, "array table requires a table parent"); return -1
+    }
+    if tree.kinds[parent] == 0 && field(&tree, parent, key) >= 0 {
+        fail(&mut tree, "duplicate key"); return -1
+    }
+    if tree.kinds.len >= 100000 {
+        fail(&mut tree, "configuration has too many values"); return -1
+    }
+    node_depth := tree.depths[parent] + 1
+    if node_depth > 64 {
+        fail(&mut tree, "maximum nesting depth exceeded"); return -1
+    }
+    result := tree.kinds.len
+    tree.parents.push(parent); tree.keys.push(key.clone()); tree.kinds.push(node_kind)
+    tree.values.push(""); tree.definitions.push(node_definition); tree.depths.push(node_depth)
+    tree.first.push(-1); tree.last.push(-1); tree.next.push(-1)
+    previous := tree.last[parent]
+    if previous < 0 { tree.first[parent] = result }
+    else { tree.next[previous] = result }
+    tree.last[parent] = result
+    if tree.kinds[parent] == 0 { map.put(&mut tree.fields, indexed(parent, key), i64(result)) }
+    result
+}
+
+pub fn set_definition(tree: &mut Tree, node: i32, value: i32) {
+    if tree.problem != "" { return }
+    if !valid(&tree, node) || value < 0 || value > 3 {
+        fail(&mut tree, "invalid table definition"); return
+    }
+    previous := tree.definitions[node]
+    if previous == 3 && value != 3 {
+        fail(&mut tree, "cannot extend an inline table"); return
+    }
+    if previous != 0 && value != previous && value != 3 {
+        fail(&mut tree, "duplicate or conflicting table"); return
+    }
+    if value == 3 { close_inline(&mut tree, node); return }
+    tree.definitions[node] = value
+}
+
+// The lexical layer supplies a complete, validated JSON spelling, including
+// tagged date/time and non-finite float values where ordinary JSON has no type.
+pub fn set_value(tree: &mut Tree, node: i32, value: string) {
+    if tree.problem != "" { return }
+    if !valid(&tree, node) || tree.kinds[node] != 2 || value == "" {
+        fail(&mut tree, "invalid scalar value"); return
+    }
+    if tree.definitions[node] == 3 || tree.values[node] != "" {
+        fail(&mut tree, "duplicate key"); return
+    }
+    tree.values[node] = value.clone()
+}
+
+// Dotted assignment defines each intermediate namespace. An implicitly
+// created header parent becomes dotted on first use. An explicit table
+// header (or array of tables) cannot be reopened with a dotted assignment.
+pub fn assignment_parent(tree: &mut Tree, base: i32, path: &[]string) -> i32 {
+    if tree.problem != "" { return -1 }
+    if path.len == 0 { fail(&mut tree, "expected a key"); return -1 }
+    if !valid(&tree, base) || tree.kinds[base] != 0 || tree.definitions[base] == 3 {
+        fail(&mut tree, "cannot extend a scalar or inline table"); return -1
+    }
+    mut current := base
+    for i in 0..path.len - 1 {
+        mut child := field(&tree, current, path[i])
+        if child < 0 { child = add(&mut tree, current, path[i], 0, 2) }
+        if child < 0 { return -1 }
+        if tree.kinds[child] != 0 || tree.definitions[child] == 3 {
+            fail(&mut tree, "key conflicts with an existing value"); return -1
+        }
+        if tree.definitions[child] == 1 {
+            fail(&mut tree, "cannot redefine an explicitly declared table with a dotted key"); return -1
+        }
+        tree.definitions[child] = 2
+        current = child
+    }
+    current
+}
+
+// A header always starts at the root. Every array-of-tables segment resolves
+// to its latest element before the following segment is looked up, so nested
+// arrays and identically named children in different elements stay distinct.
+pub fn table(tree: &mut Tree, path: &[]string, array_table: bool) -> i32 {
+    if tree.problem != "" { return -1 }
+    if path.len == 0 { fail(&mut tree, "expected a table name"); return -1 }
+    mut current := 0
+    for i in 0..path.len {
+        if tree.definitions[current] == 3 {
+            fail(&mut tree, "cannot extend an inline table"); return -1
+        }
+        last_segment := i + 1 == path.len
+        mut child := field(&tree, current, path[i])
+        if child < 0 {
+            mut child_kind := 0
+            if last_segment && array_table { child_kind = 3 }
+            child = add(&mut tree, current, path[i], child_kind, 0)
+            if child < 0 { return -1 }
+        }
+        if last_segment {
+            if array_table {
+                if tree.kinds[child] != 3 || tree.definitions[child] == 3 {
+                    fail(&mut tree, "array table conflicts with an existing value"); return -1
+                }
+                return add(&mut tree, child, "", 0, 1)
+            }
+            if tree.kinds[child] != 0 || tree.definitions[child] != 0 {
+                fail(&mut tree, "duplicate or conflicting table"); return -1
+            }
+            tree.definitions[child] = 1
+            return child
+        }
+        if tree.kinds[child] == 3 {
+            child = tree.last[child]
+            if child < 0 { fail(&mut tree, "array table has no current element"); return -1 }
+        }
+        if tree.kinds[child] != 0 || tree.definitions[child] == 3 {
+            fail(&mut tree, "table path conflicts with a value"); return -1
+        }
+        current = child
+    }
+    -1
+}
+
+fn seal(tree: &mut Tree, node: i32) {
+    tree.definitions[node] = 3
+    mut child := tree.first[node]
+    while child >= 0 { seal(&mut tree, child); child = tree.next[child] }
+}
+
+pub fn close_inline(tree: &mut Tree, node: i32) {
+    if tree.problem != "" { return }
+    if !valid(&tree, node) || tree.kinds[node] != 0 {
+        fail(&mut tree, "invalid inline table"); return
+    }
+    seal(&mut tree, node)
+}
+
+fn quoted_size(value: string) -> i64 {
+    mut result: i64 = 2
+    for byte in value.bytes() {
+        if byte == 34 || byte == 92 || byte == 8 || byte == 12 || byte == 10 || byte == 13 || byte == 9 { result += 2 }
+        else if byte < 32 { result += 6 }
+        else { result += 1 }
+    }
+    result
+}
+
+// Preflight bounds the allocation before writing escaped keys or payloads.
+// -1 identifies an unfinished scalar, -2 the documented output limit.
+fn rendered_size(tree: &Tree) -> i64 {
+    mut size: i64 = 0
+    for node in 0..tree.kinds.len {
+        if tree.kinds[node] == 2 {
+            if tree.values[node] == "" { return -1 }
+            size += i64(tree.values[node].len)
+        } else { size += 2 }
+        parent := tree.parents[node]
+        if parent >= 0 {
+            if tree.first[parent] != node { size += 1 }
+            if tree.kinds[parent] == 0 { size += quoted_size(tree.keys[node]) + 1 }
+        }
+        if size > 67108864 { return -2 }
+    }
+    size
+}
+
+fn write_node(tree: &Tree, node: i32, output: &mut []u8) {
+    if tree.kinds[node] == 2 { bytes.append_utf8(&mut output, tree.values[node]); return }
+    array := tree.kinds[node] == 1 || tree.kinds[node] == 3
+    if array { output.push(91) } else { output.push(123) }
+    mut child := tree.first[node]
+    while child >= 0 {
+        if child != tree.first[node] { output.push(44) }
+        if !array { json.write_str(&mut output, tree.keys[child]); output.push(58) }
+        write_node(&tree, child, &mut output)
+        child = tree.next[child]
+    }
+    if array { output.push(93) } else { output.push(125) }
+}
+
+pub fn render(tree: &Tree) -> RenderResult {
+    if tree.problem != "" { return RenderResult { ok: false, error: tree.problem.clone(), json: "" } }
+    size := rendered_size(&tree)
+    if size == -1 { return RenderResult { ok: false, error: "configuration contains an unfinished scalar", json: "" } }
+    if size == -2 { return RenderResult { ok: false, error: "configuration JSON exceeds 64 MiB", json: "" } }
+    mut output: []u8 = []
+    output.reserve(i32(size))
+    write_node(&tree, 0, &mut output)
+    RenderResult { ok: true, error: "", json: bytes.decode(&output).value }
+}
+
+fn test_value(tree: &mut Tree, parent: i32, key: string, value: string) -> i32 {
+    node := add(&mut tree, parent, key, 2, 1)
+    set_value(&mut tree, node, value)
+    node
+}
+
+@test fn keys_with_dots_empty_strings_colons_and_nul_stay_distinct() {
+    mut tree := new()
+    dotted := test_value(&mut tree, 0, "a.b", "1")
+    empty := test_value(&mut tree, 0, "", "2")
+    nul := test_value(&mut tree, 0, "\0", "3")
+    prefixed := test_value(&mut tree, 0, "1:key", "4")
+    path: []string = ["a", "b"]
+    parent := assignment_parent(&mut tree, 0, &path)
+    nested := test_value(&mut tree, parent, "b", "5")
+    assert(field(&tree, 0, "a.b") == dotted && field(&tree, 0, "") == empty)
+    assert(field(&tree, 0, "\0") == nul && field(&tree, 0, "1:key") == prefixed)
+    assert(field(&tree, parent, "b") == nested && get(&tree, nested) == "5")
+    out := render(&tree)
+    assert(out.ok && out.json == "{\"a.b\":1,\"\":2,\"\\u0000\":3,\"1:key\":4,\"a\":{\"b\":5}}")
+}
+
+@test fn duplicate_values_preserve_first_error_and_payload() {
+    mut tree := new()
+    first := test_value(&mut tree, 0, "key", "1")
+    assert(add(&mut tree, 0, "key", 2, 1) == -1)
+    assert(error(&tree) == "duplicate key" && get(&tree, first) == "1")
+    assert(table(&mut tree, &["key"], false) == -1)
+    assert(error(&tree) == "duplicate key" && !render(&tree).ok)
+}
+
+@test fn implicit_supertables_can_be_declared_once() {
+    mut tree := new()
+    leaf := table(&mut tree, &["a", "b", "c"], false)
+    _ := test_value(&mut tree, leaf, "value", "1")
+    middle := table(&mut tree, &["a", "b"], false)
+    _ := test_value(&mut tree, middle, "other", "2")
+    top := table(&mut tree, &["a"], false)
+    assert(top > 0 && definition(&tree, top) == 1)
+    out := render(&tree)
+    assert(out.ok && out.json == "{\"a\":{\"b\":{\"c\":{\"value\":1},\"other\":2}}}")
+    assert(table(&mut tree, &["a", "b"], false) == -1)
+}
+
+@test fn dotted_tables_cannot_be_declared_but_their_descendants_can() {
+    mut tree := new()
+    parent := assignment_parent(&mut tree, 0, &["fruit", "apple"])
+    _ := test_value(&mut tree, parent, "apple", "1")
+    descendant := table(&mut tree, &["fruit", "orange"], false)
+    assert(descendant > 0 && error(&tree) == "")
+    assert(table(&mut tree, &["fruit"], false) == -1)
+    assert(error(&tree) == "duplicate or conflicting table")
+}
+
+@test fn dotted_assignment_claims_implicit_header_parents() {
+    mut tree := new()
+    _ := table(&mut tree, &["a", "b", "c"], false)
+    top := table(&mut tree, &["a"], false)
+    parent := assignment_parent(&mut tree, top, &["b", "d"])
+    _ := test_value(&mut tree, parent, "d", "1")
+    assert(definition(&tree, parent) == 2)
+    assert(table(&mut tree, &["a", "b"], false) == -1)
+}
+
+@test fn dotted_assignment_cannot_reopen_explicit_headers() {
+    mut tree := new()
+    _ := table(&mut tree, &["a", "b"], false)
+    top := table(&mut tree, &["a"], false)
+    assert(assignment_parent(&mut tree, top, &["b", "other"]) == -1)
+    assert(error(&tree) == "cannot redefine an explicitly declared table with a dotted key")
+}
+
+@test fn array_table_paths_use_latest_element_at_every_segment() {
+    mut tree := new()
+    first := table(&mut tree, &["fruit"], true)
+    _ := test_value(&mut tree, first, "name", "\"apple\"")
+    variety := table(&mut tree, &["fruit", "variety"], true)
+    detail := table(&mut tree, &["fruit", "variety", "detail"], false)
+    _ := test_value(&mut tree, detail, "code", "1")
+    _ := table(&mut tree, &["fruit", "variety"], true)
+    second_detail := table(&mut tree, &["fruit", "variety", "detail"], false)
+    _ := test_value(&mut tree, second_detail, "code", "2")
+    second := table(&mut tree, &["fruit"], true)
+    _ := test_value(&mut tree, second, "name", "\"banana\"")
+    _ := table(&mut tree, &["fruit", "variety"], true)
+    third_detail := table(&mut tree, &["fruit", "variety", "detail"], false)
+    _ := test_value(&mut tree, third_detail, "code", "3")
+    assert(variety > first && second > variety && third_detail > second_detail)
+    out := render(&tree)
+    assert(out.ok && out.json == "{\"fruit\":[{\"name\":\"apple\",\"variety\":[{\"detail\":{\"code\":1}},{\"detail\":{\"code\":2}}]},{\"name\":\"banana\",\"variety\":[{\"detail\":{\"code\":3}}]}]}")
+    assert(table(&mut tree, &["fruit", "variety", "detail"], false) == -1)
+}
+
+@test fn ordinary_arrays_cannot_become_arrays_of_tables() {
+    mut tree := new()
+    array := add(&mut tree, 0, "fruit", 1, 1)
+    _ := test_value(&mut tree, array, "", "1")
+    assert(table(&mut tree, &["fruit"], true) == -1)
+    assert(error(&tree) == "array table conflicts with an existing value")
+    mut empty := new()
+    _ := add(&mut empty, 0, "fruit", 1, 1)
+    assert(table(&mut empty, &["fruit", "subtable"], false) == -1)
+}
+
+@test fn inline_closure_seals_dotted_descendants_and_array_values() {
+    mut tree := new()
+    inline := add(&mut tree, 0, "inline", 0, 0)
+    parent := assignment_parent(&mut tree, inline, &["nested", "value"])
+    _ := test_value(&mut tree, parent, "value", "1")
+    array := add(&mut tree, inline, "items", 1, 1)
+    element := add(&mut tree, array, "", 0, 0)
+    _ := test_value(&mut tree, element, "value", "2")
+    close_inline(&mut tree, inline)
+    assert(definition(&tree, parent) == 3 && definition(&tree, element) == 3)
+    out := render(&tree)
+    assert(out.ok && out.json == "{\"inline\":{\"nested\":{\"value\":1},\"items\":[{\"value\":2}]}}")
+    assert(add(&mut tree, parent, "other", 2, 1) == -1)
+    mut headers := new()
+    inline2 := add(&mut headers, 0, "inline", 0, 0)
+    close_inline(&mut headers, inline2)
+    assert(table(&mut headers, &["inline", "other"], false) == -1)
+}
+
+@test fn depth_limit_counts_dotted_keys_and_array_table_wrappers() {
+    mut tree := new()
+    mut path: []string = []
+    for _ in 0..63 { path.push("nested") }
+    path.push("value")
+    parent := assignment_parent(&mut tree, 0, &path)
+    _ := test_value(&mut tree, parent, "value", "1")
+    out := render(&tree)
+    assert(out.ok && out.json.len > 64 && error(&tree) == "")
+    assert(add(&mut tree, parent, "too_deep", 1, 1) > 0)
+    array := field(&tree, parent, "too_deep")
+    assert(add(&mut tree, array, "", 2, 1) == -1)
+    mut tables := new()
+    mut header: []string = []
+    for _ in 0..63 { header.push("nested") }
+    assert(table(&mut tables, &header, true) > 0)
+    assert(table(&mut tables, &header, true) > 0)
+    header.push("too_deep")
+    assert(table(&mut tables, &header, false) == -1)
+}
+
+@test fn unfinished_scalars_fail_rendering_explicitly() {
+    mut tree := new()
+    _ := add(&mut tree, 0, "value", 2, 1)
+    out := render(&tree)
+    assert(!out.ok && out.error == "configuration contains an unfinished scalar" && out.json == "")
+    assert(render(&new()).json == "{}")
+}
+
+@test fn field_index_and_sibling_links_survive_growth() {
+    mut tree := new()
+    for i in 0..10000 { _ := test_value(&mut tree, 0, i.str(), i.str()) }
+    for i in 0..10000 {
+        node := field(&tree, 0, i.str())
+        assert(node == i + 1 && get(&tree, node) == i.str())
+    }
+    out := render(&tree)
+    assert(out.ok && json.Doc::parse_text(out.json).ok)
+}
+
+@test fn node_limit_accepts_the_last_node_and_rejects_the_next() {
+    mut tree := new()
+    array := add(&mut tree, 0, "values", 1, 1)
+    mut last := -1
+    for _ in 0..99998 { last = test_value(&mut tree, array, "", "0") }
+    assert(last == 99999 && error(&tree) == "")
+    out := render(&tree)
+    assert(out.ok && out.json.len == 200008)
+    assert(add(&mut tree, array, "", 2, 1) == -1)
+    assert(error(&tree) == "configuration has too many values")
+    assert(!render(&tree).ok)
+}

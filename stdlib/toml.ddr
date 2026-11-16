@@ -1,0 +1,196 @@
+// TOML configuration reader with a lossless JSON projection. Lexical values
+// and table identities have separate implementations; the coordinator only
+// owns source position, statement grammar and the current table context.
+import std.toml.values as scalars
+import std.toml.tree as tables
+import std.json as json
+
+pub struct ParseResult { ok: bool, error: string, json: string }
+struct Parser { input: string, pos: i32, error: string, nodes: tables.Tree }
+
+fn fail(p: &mut Parser, message: string) {
+    if p.error != "" { return }
+    mut line := 1; mut column := 1
+    mut end := p.pos; if end > p.input.len { end = p.input.len }
+    for i in 0..end {
+        if p.input[i] == 10 { line += 1; column = 1 } else { column += 1 }
+    }
+    p.error = "TOML line " + line.str() + ", column " + column.str() + ": " + message
+}
+fn tree_error(p: &mut Parser) {
+    message := tables.error(&p.nodes)
+    if message != "" { fail(&mut p, message) }
+}
+fn peek(p: &Parser) -> i32 { if p.pos >= p.input.len { return -1 }; p.input[p.pos] }
+fn horizontal(p: &mut Parser) {
+    while peek(&p) == 32 || peek(&p) == 9 { p.pos += 1 }
+}
+fn comment(p: &mut Parser) {
+    if peek(&p) == 35 {
+        while peek(&p) >= 0 && peek(&p) != 10 && peek(&p) != 13 { p.pos += 1 }
+    }
+}
+fn whitespace(p: &mut Parser) {
+    while p.pos < p.input.len && p.error == "" {
+        horizontal(&mut p); comment(&mut p)
+        if peek(&p) == 10 { p.pos += 1 }
+        else if peek(&p) == 13 { p.pos += 2 } // parse() validates every CRLF first.
+        else { return }
+    }
+}
+fn add(p: &mut Parser, parent: i32, key: string, kind: i32, definition: i32) -> i32 {
+    if p.error != "" { return -1 }
+    result := tables.add(&mut p.nodes, parent, key, kind, definition)
+    tree_error(&mut p); result
+}
+fn quoted(p: &mut Parser, key: bool) -> string {
+    parsed := scalars.quoted(p.input, p.pos, key)
+    p.pos = parsed.next
+    if !parsed.ok { fail(&mut p, parsed.error); return "" }
+    parsed.value
+}
+fn key_path(p: &mut Parser) -> []string {
+    mut result: []string = []
+    while p.error == "" {
+        horizontal(&mut p)
+        mut key := ""
+        if peek(&p) == 34 || peek(&p) == 39 { key = quoted(&mut p, true) }
+        else {
+            start := p.pos
+            while p.pos < p.input.len {
+                b := peek(&p)
+                if !((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 95) { break }
+                p.pos += 1
+            }
+            if p.pos == start { fail(&mut p, "expected a key"); return result }
+            key = p.input[start..p.pos]
+        }
+        if p.error != "" { return result }
+        if result.len >= 64 { fail(&mut p, "maximum nesting depth exceeded"); return result }
+        result.push(move key)
+        horizontal(&mut p)
+        if peek(&p) != 46 { return result }
+        p.pos += 1
+    }
+    result
+}
+fn assignment_parent(p: &mut Parser, base: i32, path: &[]string) -> i32 {
+    result := tables.assignment_parent(&mut p.nodes, base, &path)
+    tree_error(&mut p); result
+}
+fn value(p: &mut Parser, parent: i32, key: string, depth: i32) -> i32 {
+    if depth > 64 { fail(&mut p, "maximum nesting depth exceeded"); return -1 }
+    if p.error != "" { return -1 }
+    horizontal(&mut p)
+    b := peek(&p)
+    if b == 34 || b == 39 {
+        content := quoted(&mut p, false)
+        if p.error != "" { return -1 }
+        result := add(&mut p, parent, key, 2, 1)
+        if result >= 0 { tables.set_value(&mut p.nodes, result, json.quote(content)) }
+        tree_error(&mut p); return result
+    }
+    if b == 91 {
+        p.pos += 1
+        result := add(&mut p, parent, key, 1, 1)
+        whitespace(&mut p)
+        while peek(&p) != 93 && p.error == "" {
+            _ := value(&mut p, result, "", depth + 1)
+            whitespace(&mut p)
+            if peek(&p) == 93 { break }
+            if peek(&p) != 44 { fail(&mut p, "expected comma in array"); return result }
+            p.pos += 1; whitespace(&mut p)
+        }
+        if p.error != "" { return result }
+        if peek(&p) != 93 { fail(&mut p, "unterminated array"); return result }
+        p.pos += 1; return result
+    }
+    if b == 123 {
+        p.pos += 1
+        result := add(&mut p, parent, key, 0, 0)
+        horizontal(&mut p)
+        while peek(&p) != 125 && p.error == "" {
+            path := key_path(&mut p)
+            if path.len == 0 || p.error != "" { return result }
+            if peek(&p) != 61 { fail(&mut p, "expected '=' in inline table"); return result }
+            p.pos += 1
+            container := assignment_parent(&mut p, result, &path)
+            if p.error != "" { return result }
+            name := path[path.len - 1].clone()
+            if tables.field(&p.nodes, container, name) >= 0 { fail(&mut p, "duplicate key"); return result }
+            _ := value(&mut p, container, name, depth + 1)
+            horizontal(&mut p)
+            if peek(&p) == 125 { break }
+            if peek(&p) != 44 { fail(&mut p, "expected comma in inline table"); return result }
+            p.pos += 1; horizontal(&mut p)
+            if peek(&p) == 125 { fail(&mut p, "trailing comma in inline table"); return result }
+        }
+        if p.error != "" { return result }
+        if peek(&p) != 125 { fail(&mut p, "unterminated inline table"); return result }
+        p.pos += 1
+        tables.close_inline(&mut p.nodes, result); tree_error(&mut p)
+        return result
+    }
+    raw := scalars.scalar(p.input, p.pos)
+    p.pos = raw.next
+    if !raw.ok { fail(&mut p, raw.error); return -1 }
+    result := add(&mut p, parent, key, 2, 1)
+    if result >= 0 { tables.set_value(&mut p.nodes, result, raw.value) }
+    tree_error(&mut p); result
+}
+fn table(p: &mut Parser, array_table: bool) -> i32 {
+    path := key_path(&mut p)
+    if path.len == 0 || p.error != "" { return -1 }
+    if peek(&p) != 93 { fail(&mut p, "expected closing table bracket"); return -1 }
+    p.pos += 1
+    if array_table {
+        if peek(&p) != 93 { fail(&mut p, "expected closing array-table bracket"); return -1 }
+        p.pos += 1
+    }
+    result := tables.table(&mut p.nodes, &path, array_table)
+    tree_error(&mut p); result
+}
+
+pub fn parse(input: string) -> ParseResult {
+    if input.len > 4194304 { return ParseResult { ok: false, error: "TOML exceeds 4 MiB", json: "" } }
+    mut p := Parser { input: input.clone(), pos: 0, error: "", nodes: tables.new() }
+    // Raw TOML permits only tab/LF/CRLF from the ASCII control range. Escaped
+    // controls are decoded later by the string reader and remain valid values.
+    for i in 0..input.len {
+        b := input[i]
+        if (b < 32 && b != 9 && b != 10 && b != 13) || b == 127 {
+            p.pos = i; fail(&mut p, "unescaped control character"); break
+        }
+        if b == 13 && (i + 1 >= input.len || input[i + 1] != 10) {
+            p.pos = i; fail(&mut p, "bare carriage return"); break
+        }
+    }
+    mut current := 0
+    while p.pos < p.input.len && p.error == "" {
+        whitespace(&mut p)
+        if p.pos >= p.input.len { break }
+        if peek(&p) == 91 {
+            p.pos += 1
+            mut array_table := false
+            if peek(&p) == 91 { array_table = true; p.pos += 1 }
+            current = table(&mut p, array_table)
+        } else {
+            path := key_path(&mut p)
+            if path.len == 0 || p.error != "" { break }
+            if peek(&p) != 61 { fail(&mut p, "expected '=' after key"); break }
+            p.pos += 1
+            container := assignment_parent(&mut p, current, &path)
+            if p.error != "" { break }
+            name := path[path.len - 1].clone()
+            if tables.field(&p.nodes, container, name) >= 0 { fail(&mut p, "duplicate key"); break }
+            _ := value(&mut p, container, name, 0)
+        }
+        if p.error != "" { break }
+        horizontal(&mut p); comment(&mut p)
+        if p.pos < p.input.len && peek(&p) != 10 && peek(&p) != 13 { fail(&mut p, "unexpected characters after value") }
+    }
+    if p.error != "" { return ParseResult { ok: false, error: p.error, json: "" } }
+    rendered := tables.render(&p.nodes)
+    if !rendered.ok { fail(&mut p, rendered.error); return ParseResult { ok: false, error: p.error, json: "" } }
+    ParseResult { ok: true, error: "", json: rendered.json }
+}
