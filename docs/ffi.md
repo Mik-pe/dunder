@@ -142,9 +142,9 @@ funktion anropar Dunder genom en callback.
 ## Filåtkomst genom delegerade handtag
 
 En modul med `capability filesystem` kan välja sökvägar med
-`std.fs.grant_read(path)` och `std.fs.grant_write(path)`. Därefter kan den
-skicka handtagen till moduler som använder `std.fs.read`, `metadata`, `write`,
-`append` eller `write_bytes`. Ett läshandtag och ett skrivhandtag är skilda
+`fs.ReadFile::grant(path)` och `fs.WriteFile::grant(path)`. Därefter kan den
+skicka handtagen till moduler som använder metoderna `.read`, `.metadata`, `.write`,
+`.append` eller `.write_bytes`. Ett läshandtag och ett skrivhandtag är skilda
 nominella typer. En `pub opaque struct` kan skickas över modulgränser och
 följer samma ägarskapsregel som andra structar: handtag som innehåller
 strängar flyttas, och en extra ägare kräver `.clone()`.
@@ -157,13 +157,13 @@ capability filesystem
 import std.fs
 
 fn copy(src: &fs.ReadFile, dst: &fs.WriteFile) -> bool {
-    result := fs.read(&src)
-    result.ok && fs.write(&dst, result.value).ok
+    result := src.read()
+    result.ok && dst.write(result.value).ok
 }
 
 fn main() {
-    input := fs.grant_read("source.txt")
-    output := fs.grant_write("copy.txt")
+    input := fs.ReadFile::grant("source.txt")
+    output := fs.WriteFile::grant("copy.txt")
     assert(copy(&input, &output))
 }
 ```
@@ -177,7 +177,7 @@ Modulhuvudet styr direkta unsafe-operationer samt deklarationer märkta
 `@requires(filesystem)`, `@requires(network)` eller `@requires(process)`. Flera
 kapabiliteter anges kommaseparerat i samma modulhuvud, t.ex.
 `capability process, network, filesystem`.
-`std.fs.grant_dir(path)` och `fs.resolve_read(&dir, rel_path)` avgränsar
+`fs.ReadDir::grant(path)` och `dir.resolve_read(rel_path)` avgränsar
 relativ läsning till en vald rotkatalog utan `..`-flykt, `std.net.listen` /
 `std.net.connect` kräver `capability network`, och `std.process.run` /
 `exec` / `spawn` / `grant` kräver `capability process` (där `Executable`

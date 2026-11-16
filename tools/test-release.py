@@ -93,6 +93,9 @@ def main():
         git(repo, 'config', 'user.email', 'fixture@invalid.example')
         git(repo, 'config', f'url.{remote.as_uri()}.insteadOf', 'https://github.com/Mik-pe/dunder.git')
         script = repo / 'tools/release.sh'
+        # Exercise the candidate script before it is committed. The release
+        # itself still builds the pinned committed tree, ignoring dirty files.
+        shutil.copyfile(ROOT / 'tools/release.sh', script)
         version = re.search(r'fn\s+compiler_version\s*\(\s*\)\s*->\s*string\s*\{\s*"([^"]+)"',
                             (repo / 'selfhost/driver/cli.ddr').read_text()).group(1)
         tag = 'v' + version

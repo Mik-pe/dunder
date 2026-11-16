@@ -203,7 +203,7 @@ dunder test tests/net_loopback.ddr
 ```
 
 Testsviten `tests/net_loopback.ddr` provar klocka (`sys.now_ms`), råa
-byte-läsningar (`sys.read_u8_limit`, `fs.ReadDir` + `fs.resolve_read`),
+byte-läsningar (`sys.read_u8_limit`, `fs.ReadDir` + `.resolve_read`),
 filflöde, felkoder och icke-blockerande TCP-sockets. [Filhandtagsprov](../tools/test_files.ddr).
 
 Implementationens syscallnummer och stat-layout är verifierade mot

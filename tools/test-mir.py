@@ -394,8 +394,11 @@ def fixture_source(name, source_root, work, fixtures=ROOT):
         relative = os.path.relpath(target, work).replace(os.sep, '/')
         return 'import ' + json.dumps(relative) + ' as ' + (alias or leaf)
     text = re.sub(r'import \.\.\.selfhost\.([\w.]+)(?: as (\w+))?', replace, text)
-    target_fixture = os.path.relpath(source_root / 'tests' / 'fixtures' / 'mir_machine', work)
-    return text.replace('import .mir_machine as', 'import ' + json.dumps(target_fixture) + ' as')
+    for module, path in (('.mir_machine', 'tests/fixtures/mir_machine'),
+                         ('..support.mir_object_support', 'tests/support/mir_object_support')):
+        relative = os.path.relpath(source_root / path, work).replace(os.sep, '/')
+        text = text.replace('import ' + module + ' as', 'import ' + json.dumps(relative) + ' as')
+    return text
 
 
 
