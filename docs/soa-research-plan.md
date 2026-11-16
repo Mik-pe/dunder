@@ -62,24 +62,43 @@ element (`arrays of aggregate elements are not supported by this compiler`).
 
 ### Typkontroll, ägarskap och syntax
 
-- **Lån av temporärer (`&expr`) och vyer (`&[]u8`)**: Att behöva binda namngivna
-  lokala variabler före varje `&`-anrop (`a := [1, 2]; f(&a)`) eller lägga till
-  `*_owned`-dubbletter bromsar test- och hjälpkod; binärparsning tvingas skicka
+- **Lån av temporärer (`&expr`) och vyer (`&[]u8`)**: `borrow a named variable,
+  field or array element` kräver namngivna lokaler före `&`-anrop (`a := [1, 2];
+  f(&a)`) eller extra `*_owned`-metoder som `TablePack::add_owned` och
+  `BitmapAtlas::add_text`. Binärparsning måste skicka
   `(data: &[]u8, off: i32, length: i32)` i brist på lånade vyer (se
   [next-steps.md §2](next-steps.md#2-lokala-lån-och-lånade-vyer)).
-- **Arrayliteral-inferens**: `[1, 2]` med `:=` härleds till `[]i64`, vilket ofta
-  kräver `: []i32 = [...]` före `&[]i32`-anrop.
-- **Rune-literaler och formatering**: `'A'` tolkas som `string` i stället för
-  `rune` (tvingade `rune(65)` i `dunder-skrift`), flerradiga `.method()`-kedjor
-  kräver yttre parenteser, och `f`-strängar saknar formatangivelser (t.ex. hex
-  för `U+0067`).
+- **Arrayliteral-inferens och `.push()`-ägarskap**: `[1, 2]` med `:=` härleds
+  till `[]i64`, vilket ofta kräver `: []i32 = [...]` före `&[]i32`-anrop. Samtidigt
+  kräver `.push(tag)` på icke-`move`-parametrar uttrycklig `.clone()` (`push requires
+  'move value', .clone(), or a fresh owned expression`), vilket ger extra
+  kloningsbrus i byggare och strängtabeller.
+- **Uttrycksblock och flerradiga metodkedjor**: `if ... { ... } else { ... }` i
+  uttrycksposition accepterar bara ett enda uttryck per gren (flersatsiga block
+  avvisas och tvingar fram `mut`-initiering), och flerradiga `.method()`-kedjor
+  misslyckas med `unused value` utan yttre parenteser.
+- **Rune-literaler, tupler och formatangivelser**: `'A'` tolkas som `string` i
+  stället för `rune` (tvingade `rune(65)` i `dunder-skrift`), flervärdesreturer
+  som `(bool, f64)` stöds inte utan engångsstructar (`ParsedDecimal`), och
+  `f`-strängar saknar formatangivelser som hex (krävde manuell `hex_cp`-loop för
+  `U+XXXX`).
+- **Reserverade identifierare och modulsökvägar**: Nyckelorden `var` och `len`
+  kolliderar med vanliga modul- och parameternamn (krävde `import var as variation`
+  eller `"../src/var"` samt omdöpning till `length`), och relativa citerade
+  importer (`"../src/..."`) skiljer sig syntaktiskt från punktnotation (`..src`).
 
-### Test-, check- och verktygsflöde
+### Test-, check-, paket- och verktygsflöde
 
 - **Rikare `assert`-diagnostik i `dunder test`**: Misslyckade påståenden visar i
   dag bara `FAIL ... (exit 104)` utan källfil, radnummer eller jämförda värden.
 - **`dunder check` för bibliotek**: Biblioteksmoduler utan `fn main()` kan i dag
-  inte typkontrolleras enbart med `dunder check <modul.ddr>`.
+  inte typkontrolleras enbart med `dunder check <modul.ddr>`; snabb
+  typkontroll under biblioteksarbete fick därför gå via `dunder test`.
+- **Paketmanifest (`[dependencies]`)**: Nuvarande `dunder.toml` stöder lokala
+  `namn = "sökväg"`-par (bindestreck i katalognamn hanteras via aliaset, t.ex.
+  `skrift = "../dunder-skrift"`). Eventuellt inline-tabellsstöd
+  (`{ path = "..." }`) och sammanställning av exempel under `examples/`
+  återstår om paketsystemet byggs ut.
 
 ### Standardbibliotek (`stdlib/`)
 
@@ -90,14 +109,15 @@ element (`arrays of aggregate elements are not supported by this compiler`).
   `--axis opsz=14.5`).
 - **`std.math`**: Gemensamma numeriska funktioner (`clamp`, `min`, `max`,
   trigonometri) i stället för lokala kopior per projekt i `dunder-hundmat`.
-- **`std.json`**: Skrivstöd för flyttal (`field_f64`) och eventuell bekvämare
-  streamingskrivare ovanpå buffertfunktionerna.
+- **`std.json`**: Lågnivåfunktioner som `write_str` och `field_i64` saknar
+  motsvarande flyttalsfält (`field_f64`) och en högnivå-`Writer`.
 
 ### Grafik- och Metal-gränssnitt (`dunder-hundmat`)
 
 - **Textur- och atlasstöd i Metal-dogfood**: Nuvarande `macos.ddr` stöder bara
   otexturerade trianglar (`max 100000 vertices`), vilket tvingar fram en 6-vertex
-  quad per täckt typsnittspixel (`81 858 / 100 000` vertex för en skärm text).
-  Texturerade kvadrater (`texture_2d` / alfamaskatlas) är nästa naturliga steg.
+  quad per täckt typsnittspixel (`13 643` kvadrater / `81 858` av `100 000`
+  vertex för en skärm text). Texturerade kvadrater (`texture_2d` /
+  alfamaskatlas) är nästa naturliga steg.
 - **Headless pixel-readback i `macos.ddr`**: Motsvarighet till Vulkan-modulens
   `open_headless` + `pixels()` förenklar automatisk visuell verifiering på macOS.
