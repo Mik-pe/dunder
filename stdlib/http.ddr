@@ -28,6 +28,21 @@ struct Reader {
     error: string,
 }
 
+pub opaque struct BodyReader {
+    reader: Reader,
+    remaining: i64,
+    chunked: bool,
+    chunk_remaining: i64,
+    total: i64,
+    maximum: i64,
+    finished: bool,
+    started: bool,
+    expect_continue: bool,
+    valid: bool,
+}
+
+pub struct BodyResult { ok: bool, eof: bool, count: i64, status: i32, error: string }
+
 @c_layout
 struct Timespec { seconds: i64, nanos: i64 }
 
@@ -96,6 +111,13 @@ fn valid_value(value: string) -> bool {
 // application boundary. Ordinary list-valued headers remain separate entries.
 fn singleton(name: string) -> bool {
     name == "host" || name == "authorization" || name == "proxy-authorization" || name == "content-length" || name == "transfer-encoding" || name == "content-type" || name == "expect" || name == "origin" || name == "connection" || text.starts_with(name, "x-")
+}
+
+// Trailer fields cannot alter framing, authentication, routing or negotiated
+// connection semantics. Harmless extension metadata such as X-Test is valid;
+// duplicate-header policy is intentionally stricter than this trailer policy.
+fn control_trailer(name: string) -> bool {
+    name == "host" || name == "authorization" || name == "proxy-authorization" || name == "content-length" || name == "transfer-encoding" || name == "content-type" || name == "expect" || name == "origin" || name == "connection" || name == "trailer" || name == "te" || name == "upgrade" || name == "keep-alive" || name == "proxy-connection" || text.starts_with(name, "x-snus-")
 }
 
 fn wait_ready(stream: &net.TcpStream, events: i32, deadline: i64) -> bool {
@@ -234,19 +256,10 @@ fn chunk_size(value: string, maximum: i64) -> i64 {
     mut end := value.len
     if semicolon >= 0 { end = semicolon }
     if end == 0 || end > 16 || !valid_value(value) { return -1 }
-    mut result: i64 = 0
-    for i in 0..end {
-        b := value[i]
-        mut digit := -1
-        if b >= 48 && b <= 57 { digit = b - 48 }
-        else if b >= 65 && b <= 70 { digit = b - 55 }
-        else if b >= 97 && b <= 102 { digit = b - 87 }
-        if digit < 0 { return -1 }
-        if result > (maximum - i64(digit)) / 16 { return -2 }
-        result = result * 16 + i64(digit)
-        if result > maximum { return -2 }
-    }
-    result
+    number := parse.hex_u64_range(value, 0, end)
+    if !number.ok { return -1 }
+    if number.value > u64(maximum) { return -2 }
+    i64(number.value)
 }
 
 fn read_exact(stream: &net.TcpStream, reader: &mut Reader, out: &mut []u8, count: i32) -> bool {
@@ -306,66 +319,159 @@ fn parse_head(stream: &net.TcpStream, reader: &mut Reader, max_body: i64) -> Req
     req
 }
 
-// Consume the body after a successful read_head, under a separate total body
-// deadline. Validate the application limit before sending 100 Continue.
-// Ownership of head is transferred; body bytes require no character encoding.
-pub fn read_body(stream: &net.TcpStream, move head: Request, max_body: i32, timeout_ms: i64) -> Request {
-    if max_body < 0 || max_body > 67108864 || timeout_ms <= 0 || timeout_ms > 3600000 {
-        return fail(500, "invalid HTTP reader limits")
+fn compact(reader: &mut Reader) {
+    if reader.offset > 0 {
+        count := reader.offset
+        bytes.consume_prefix(&mut reader.buffer, count)
+        reader.offset = 0
     }
-    if !head.ok { return head }
-    if head.body.len != 0 || head.header_names.len != head.header_values.len { return fail(500, "read_body requires an unconsumed request head") }
-    if !stream.set_nonblocking(true).ok { return fail(500, "cannot configure HTTP stream") }
-    mut reader := Reader { buffer: [], offset: 0, deadline: now_ms() + timeout_ms, status: 400, error: "invalid HTTP request" }
-    mut req := head
-    has_transfer := has_header(&req, "transfer-encoding")
-    has_length := has_header(&req, "content-length")
-    if has_transfer && (lower(header(&req, "transfer-encoding")) != "chunked" || has_length) { return fail(400, "ambiguous or unsupported HTTP body framing") }
-    mut size: i64 = 0
-    if has_length {
-        size = decimal(header(&req, "content-length"), i64(max_body))
-        if size == -1 { return fail(400, "invalid Content-Length") }
-        if size == -2 { return fail(413, "request body exceeds its limit") }
+}
+
+fn body_result(ok: bool, eof: bool, count: i64, status: i32, error: string) -> BodyResult {
+    BodyResult { ok: ok, eof: eof, count: count, status: status, error: error.clone() }
+}
+
+impl BodyReader {
+    // Constructor performs no socket I/O. It validates framing/quota before a
+    // caller creates its stage, and defers 100 Continue until the first read.
+    // max_bytes is signed 64-bit; memory usage does not depend on this limit.
+    pub fn new(head: &Request, max_bytes: i64, timeout_ms: i64) -> Self {
+        mut value := Self {
+            reader: Reader { buffer: [], offset: 0, deadline: 0, status: 200, error: "" },
+            remaining: 0, chunked: false, chunk_remaining: 0, total: 0, maximum: max_bytes,
+            finished: false, started: false, expect_continue: false, valid: true,
+        }
+        if max_bytes < 0 || timeout_ms <= 0 || timeout_ms > 3600000 {
+            value.reject(500, "invalid HTTP reader limits"); return value
+        }
+        value.reader.deadline = now_ms() + timeout_ms
+        if !head.ok { value.reject(head.status, head.error); return value }
+        if head.body.len != 0 || head.header_names.len != head.header_values.len {
+            value.reject(500, "BodyReader requires an unconsumed request head"); return value
+        }
+        value.chunked = has_header(&head, "transfer-encoding")
+        has_length := has_header(&head, "content-length")
+        if value.chunked && (lower(header(&head, "transfer-encoding")) != "chunked" || has_length) {
+            value.reject(400, "ambiguous or unsupported HTTP body framing"); return value
+        }
+        if has_length {
+            size := decimal(header(&head, "content-length"), max_bytes)
+            if size == -1 { value.reject(400, "invalid Content-Length"); return value }
+            if size == -2 { value.reject(413, "request body exceeds its limit"); return value }
+            value.remaining = size
+        }
+        if has_header(&head, "expect") {
+            if lower(header(&head, "expect")) != "100-continue" {
+                value.reject(417, "unsupported Expect header"); return value
+            }
+            value.expect_continue = true
+        }
+        value
     }
-    if has_header(&req, "expect") {
-        if lower(header(&req, "expect")) != "100-continue" { return fail(417, "unsupported Expect header") }
-        mut interim: []u8 = []
-        bytes.append_utf8(&mut interim, "HTTP/1.1 100 Continue\r\n\r\n")
-        remaining := reader.deadline - now_ms()
-        if remaining <= 0 || !write_all(&stream, &interim, remaining) { return fail(408, "cannot send HTTP continue") }
+
+    pub fn ok(&self) -> bool { self.valid }
+    pub fn status(&self) -> i32 { self.reader.status }
+    pub fn error(&self) -> string { self.reader.error.clone() }
+    pub fn count(&self) -> i64 { self.total }
+
+    fn reject(&mut self, status: i32, message: string) {
+        self.valid = false
+        self.reader.status = status
+        self.reader.error = message.clone()
     }
-    if !has_transfer {
-        if !read_exact(&stream, &mut reader, &mut req.body, i32(size)) { return fail(reader.status, reader.error) }
-        return req
+
+    fn failed(&mut self) -> BodyResult {
+        self.valid = false
+        body_result(false, false, 0, self.reader.status, self.reader.error)
     }
-    while true {
-        line_limit := reader.offset + 1026
-        line := read_line(&stream, &mut reader, 1024, line_limit)
-        if !line.ok { return fail(reader.status, reader.error) }
-        amount := chunk_size(line.value, i64(max_body - req.body.len))
-        if amount == -1 { return fail(400, "invalid HTTP chunk size") }
-        if amount == -2 { return fail(413, "request body exceeds its limit") }
-        if amount == 0 {
-            mut trailer_bytes := 0
-            mut trailer_count := 0
-            while true {
-                trailer_limit := reader.offset + 8194
-                trailer := read_line(&stream, &mut reader, 8192, trailer_limit)
-                if !trailer.ok { return fail(reader.status, reader.error) }
-                trailer_bytes += trailer.value.len + 2
-                if trailer_bytes > 8192 { return fail(431, "HTTP trailers exceed their limit") }
-                if trailer.value.len == 0 { return req }
-                trailer_count += 1
-                if trailer_count > 20 { return fail(431, "too many HTTP trailers") }
-                part := header_parts(trailer.value)
-                if !part.ok { return fail(400, "invalid HTTP trailer") }
-                if singleton(part.name) { return fail(400, "HTTP control trailer refused") }
+
+    fn finish_trailers(&mut self, stream: &net.TcpStream) -> bool {
+        mut trailer_bytes := 0; mut trailer_count := 0
+        while true {
+            compact(&mut self.reader)
+            trailer := read_line(&stream, &mut self.reader, 8192, 8194)
+            if !trailer.ok { return false }
+            trailer_bytes += trailer.value.len + 2
+            if trailer_bytes > 8192 { self.reject(431, "HTTP trailers exceed their limit"); return false }
+            if trailer.value.len == 0 { self.finished = true; return true }
+            trailer_count += 1
+            if trailer_count > 20 { self.reject(431, "too many HTTP trailers"); return false }
+            part := header_parts(trailer.value)
+            if !part.ok { self.reject(400, "invalid HTTP trailer"); return false }
+            if control_trailer(part.name) { self.reject(400, "HTTP control trailer refused"); return false }
+        }
+        false
+    }
+
+    // Clears chunk and returns at most max_chunk decoded payload bytes (1..1MiB).
+    // Positive count always has eof=false; a subsequent zero-byte read reports
+    // eof=true. Callers can write each chunk and recheck authority between reads.
+    // One deadline covers the body; reads hold no application/database lock.
+    pub fn read(&mut self, stream: &net.TcpStream, chunk: &mut []u8, max_chunk: i32) -> BodyResult {
+        chunk.clear()
+        if !self.valid { return self.failed() }
+        if max_chunk < 1 || max_chunk > 1048576 { self.reject(500, "invalid HTTP chunk buffer limit"); return self.failed() }
+        if self.finished { return body_result(true, true, 0, 200, "") }
+        if !stream.set_nonblocking(true).ok { self.reject(500, "cannot configure HTTP stream"); return self.failed() }
+        if !self.started {
+            self.started = true
+            if self.expect_continue {
+                mut interim: []u8 = []
+                bytes.append_utf8(&mut interim, "HTTP/1.1 100 Continue\r\n\r\n")
+                remaining := self.reader.deadline - now_ms()
+                if remaining <= 0 || !write_all(&stream, &interim, remaining) {
+                    self.reject(408, "cannot send HTTP continue"); return self.failed()
+                }
             }
         }
-        if !read_exact(&stream, &mut reader, &mut req.body, i32(amount)) { return fail(reader.status, reader.error) }
-        mut ending: []u8 = []
-        if !read_exact(&stream, &mut reader, &mut ending, 2) { return fail(reader.status, reader.error) }
-        if ending.len != 2 || ending[0] != b'\r' || ending[1] != b'\n' { return fail(400, "invalid HTTP chunk ending") }
+        if now_ms() >= self.reader.deadline { self.reject(408, "request deadline exceeded"); return self.failed() }
+        if self.chunked && self.chunk_remaining == 0 {
+            compact(&mut self.reader)
+            line := read_line(&stream, &mut self.reader, 1024, 1026)
+            if !line.ok { return self.failed() }
+            size := chunk_size(line.value, self.maximum - self.total)
+            if size == -1 { self.reject(400, "invalid HTTP chunk size"); return self.failed() }
+            if size == -2 { self.reject(413, "request body exceeds its limit"); return self.failed() }
+            if size == 0 {
+                if !self.finish_trailers(&stream) { return self.failed() }
+                return body_result(true, true, 0, 200, "")
+            }
+            self.chunk_remaining = size
+        }
+        mut amount := self.remaining
+        if self.chunked { amount = self.chunk_remaining }
+        if amount == 0 { self.finished = true; return body_result(true, true, 0, 200, "") }
+        if amount > i64(max_chunk) { amount = i64(max_chunk) }
+        if !read_exact(&stream, &mut self.reader, &mut chunk, i32(amount)) { chunk.clear(); return self.failed() }
+        self.total += amount
+        if self.chunked {
+            self.chunk_remaining -= amount
+            if self.chunk_remaining == 0 {
+                mut ending: []u8 = []
+                if !read_exact(&stream, &mut self.reader, &mut ending, 2) { chunk.clear(); return self.failed() }
+                if ending.len != 2 || ending[0] != b'\r' || ending[1] != b'\n' {
+                    chunk.clear(); self.reject(400, "invalid HTTP chunk ending"); return self.failed()
+                }
+            }
+        } else { self.remaining -= amount }
+        body_result(true, false, amount, 200, "")
+    }
+}
+
+// Consume a bounded in-memory body after read_head under a separate body
+// deadline. The same streaming decoder enforces framing in both APIs.
+pub fn read_body(stream: &net.TcpStream, move head: Request, max_body: i32, timeout_ms: i64) -> Request {
+    if max_body < 0 || max_body > 67108864 { return fail(500, "invalid HTTP reader limits") }
+    if !head.ok { return head }
+    mut reader := BodyReader::new(&head, i64(max_body), timeout_ms)
+    if !reader.ok() { return fail(reader.status(), reader.error()) }
+    mut req := head
+    mut chunk: []u8 = []
+    while true {
+        result := reader.read(&stream, &mut chunk, 65536)
+        if !result.ok { return fail(result.status, result.error) }
+        if result.eof { return req }
+        bytes.extend(&mut req.body, &chunk)
     }
     req
 }

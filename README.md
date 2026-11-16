@@ -369,7 +369,8 @@ delas med referensräkning. Läs [minnesmodellen](docs/memory.md) och
 
 Nativa program kan också använda [HTTP-server och TLS-klient](docs/http.md),
 [SQLite med bundna parametrar](docs/sqlite.md) och processersättning i
-`std.process`. Klienten och databasen länkar mot systemets libcurl respektive
+`std.process`, [TOML med exakta heltal och typkontroll](docs/toml.md) samt
+[kryptografiska primitiver och Argon2id](docs/crypto.md). Klienten och databasen länkar mot systemets libcurl respektive
 SQLite. [Typade variadiska C-anrop](docs/ffi.md#anrop-och-adresser) följer
 respektive nativt ABI.
 

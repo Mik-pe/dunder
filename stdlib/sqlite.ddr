@@ -74,6 +74,16 @@ unsafe fn sql_bind_text(statement: ptr, index: i32, value: ptr, length: i32, des
     -1
 }
 
+@extern("/usr/lib/libsqlite3.dylib", "sqlite3_bind_blob")
+unsafe fn mac_bind_blob(statement: ptr, index: i32, value: ptr, length: i32, destructor: ptr) -> i32
+@extern("libsqlite3.so.0", "sqlite3_bind_blob")
+unsafe fn linux_bind_blob(statement: ptr, index: i32, value: ptr, length: i32, destructor: ptr) -> i32
+unsafe fn sql_bind_blob(statement: ptr, index: i32, value: ptr, length: i32, destructor: ptr) -> i32 {
+    if target_is("macos") { return mac_bind_blob(statement, index, value, length, destructor) }
+    if target_is("linux") { return linux_bind_blob(statement, index, value, length, destructor) }
+    -1
+}
+
 @extern("/usr/lib/libsqlite3.dylib", "sqlite3_step")
 unsafe fn mac_step(statement: ptr) -> i32
 @extern("libsqlite3.so.0", "sqlite3_step")
@@ -321,6 +331,11 @@ unsafe fn single_statement(sql: string) -> bool {
 }
 
 unsafe fn prepare(db: ptr, sql: string, params: &[]string) -> Prepared {
+    empty: []u8 = []
+    prepare_values(db, sql, &params, 0, &empty)
+}
+
+unsafe fn prepare_values(db: ptr, sql: string, params: &[]string, blob_index: i32, data: &[]u8) -> Prepared {
     if db == ptr(0) { return Prepared { ok: false, statement: ptr(0), error: "SQLite connection is closed" } }
     if sql.len > 1048576 || params.len > 1024 {
         return Prepared { ok: false, statement: ptr(0), error: "SQLite statement or parameter count exceeds its limit" }
@@ -354,18 +369,32 @@ unsafe fn prepare(db: ptr, sql: string, params: &[]string) -> Prepared {
     }
     mut expected := 0
     if statement != ptr(0) { expected = sql_bind_parameter_count(statement) }
-    if expected != params.len {
+    mut supplied := params.len
+    if blob_index > 0 { supplied += 1 }
+    if expected != supplied || (blob_index > 0 && (blob_index > expected || data.len > 67108864)) {
         if statement != ptr(0) { _ := sql_finalize(statement) }
         return Prepared { ok: false, statement: ptr(0), error: "SQLite parameter count mismatch" }
     }
-    for i in 0..params.len {
-        if params[i].len > 16777216 {
+    for i in 0..expected {
+        transient := ptr(18446744073709551615)
+        if i + 1 == blob_index {
+            mut pointer := cstr("")
+            if data.len > 0 { pointer = addr(&data[0]) }
+            bound := sql_bind_blob(statement, i + 1, pointer, data.len, transient)
+            if bound != 0 {
+                message := failure(db); _ := sql_finalize(statement)
+                return Prepared { ok: false, statement: ptr(0), error: message }
+            }
+            continue
+        }
+        mut parameter_index := i
+        if blob_index > 0 && i + 1 > blob_index { parameter_index -= 1 }
+        if params[parameter_index].len > 16777216 {
             _ := sql_finalize(statement)
             return Prepared { ok: false, statement: ptr(0), error: "SQLite parameter exceeds its byte limit" }
         }
-        parameter := c_string(params[i])
+        parameter := c_string(params[parameter_index])
         // TRANSIENT copies immediately; even empty text has a non-null pointer.
-        transient := ptr(18446744073709551615)
         bound := sql_bind_text(statement, i + 1, addr(&parameter[0]), parameter.len - 1, transient)
         if bound != 0 {
             message := failure(db)
@@ -443,17 +472,49 @@ impl Database {
         ExecResult { ok: false, changes: 0, last_id: 0, error: "SQLite requires a native target" }
     }
 
+    // Bind one binary value at the one-based placeholder index. params contains
+    // all other text parameters in order; empty data binds an empty BLOB, not NULL.
+    pub fn exec_blob(&self, sql: string, params: &[]string, blob_index: i32, data: &[]u8) -> ExecResult {
+        if blob_index < 1 || blob_index > params.len + 1 || data.len > 67108864 {
+            return ExecResult { ok: false, changes: 0, last_id: 0, error: "invalid SQLite BLOB binding" }
+        }
+        unsafe {
+            prepared := prepare_values(self.handle, sql, &params, blob_index, &data)
+            if !prepared.ok { return ExecResult { ok: false, changes: 0, last_id: 0, error: prepared.error } }
+            statement := prepared.statement
+            if statement != ptr(0) {
+                defer { _ := sql_finalize(statement) }
+                mut step := sql_step(statement)
+                while step == 100 { step = sql_step(statement) }
+                if step != 101 { return ExecResult { ok: false, changes: 0, last_id: 0, error: failure(self.handle) } }
+            }
+            return ExecResult { ok: true, changes: sql_changes64(self.handle), last_id: sql_last_insert_rowid(self.handle), error: "" }
+        }
+        ExecResult { ok: false, changes: 0, last_id: 0, error: "SQLite requires a native target" }
+    }
+
     // Rows are independent JSON objects. Integers retain all 64 bits, finite
     // doubles retain their value, and TEXT is decoded using its actual byte
     // count. BLOB is deliberately rejected; callers must explicitly hex it.
     pub fn query(&self, sql: string, params: &[]string) -> QueryResult {
+        self.read_rows(sql, &params, true)
+    }
+
+    // Explicitly execute a statement returning rows, such as INSERT RETURNING
+    // or PRAGMA wal_checkpoint. Prepared-statement and cleanup rules are the
+    // same as query; the caller deliberately permits the statement's effects.
+    pub fn execute_rows(&self, sql: string, params: &[]string) -> QueryResult {
+        self.read_rows(sql, &params, false)
+    }
+
+    fn read_rows(&self, sql: string, params: &[]string, read_only: bool) -> QueryResult {
         unsafe {
             prepared := prepare(self.handle, sql, &params)
             if !prepared.ok { return QueryResult { ok: false, rows: [], error: prepared.error } }
             statement := prepared.statement
             if statement == ptr(0) { return QueryResult { ok: true, rows: [], error: "" } }
             defer { _ := sql_finalize(statement) }
-            if sql_stmt_readonly(statement) == 0 {
+            if read_only && sql_stmt_readonly(statement) == 0 {
                 return QueryResult { ok: false, rows: [], error: "SQLite query requires a read-only statement; use exec for writes" }
             }
             columns := sql_column_count(statement)

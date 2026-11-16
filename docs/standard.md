@@ -86,6 +86,11 @@ delar oföränderlig text.
 | `json.Doc::parse_text(text)` | Lånar strängen och bygger dokumentets UTF-8-buffert. |
 | `net.set_insert(&mut streams, move stream)` | Flyttar en stream till mängden. |
 
+`Command::spawn` och `Command::exec` nollställer signalmasken i barnprocessen
+före programstart, så blockerad signalpollning i föräldern inte gör kommandon
+immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
+`replace` och `replace_as` ersätter samma process och behåller dess signalmask.
+
 `process.set_insert(&mut children, &mut child)` är ett fallibelt
 överföringsförsök: framgång lämnar barnet i mängden och tömmer källhandtaget;
 `-1` lämnar det oförändrat hos anroparen. Detta kräver ett skrivlån.

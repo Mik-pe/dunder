@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the native HTTP boundary with real fragmented/malformed sockets."""
 import argparse
+import errno
 import pathlib
 import select
 import socket
@@ -13,12 +14,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 def run_case(binary, wire, status, *, limit=16, timeout=2000, fragments=None,
              expected=None, shutdown=True, interim=False, head_only=False,
-             head_wait=False, split=False):
+             head_wait=False, split=False, streaming=False):
     args = [str(binary), str(limit), str(timeout)]
     if head_only:
         args.append("head")
     elif split:
         args.append("split")
+    elif streaming:
+        args.append("stream")
     process = subprocess.Popen(args,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     connection = None
@@ -52,7 +55,13 @@ def run_case(binary, wire, status, *, limit=16, timeout=2000, fragments=None,
         elif wire:
             connection.sendall(wire)
         if shutdown:
-            connection.shutdown(socket.SHUT_WR)
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError as error:
+                # An early framing rejection may already have closed the peer.
+                # Still require its complete response and expected status below.
+                if error.errno != errno.ENOTCONN:
+                    raise
         response = b""
         while True:
             try:
@@ -181,7 +190,26 @@ def exercise(binary):
         run_case(binary, wire, status)
         run_case(binary, wire, status, head_only=True)
         run_case(binary, wire, status, split=True)
-    print("HTTP protocol: 72 native socket cases passed")
+    run_case(binary, b"PUT /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\na\x00\xffbc", 200,
+             streaming=True, expected=b"PUT /stream\n\na\x00\xffbc")
+    run_case(binary, b"PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\na\x00\r\n5\r\nb\xffcde\r\n0\r\nDigest: ok\r\n\r\n", 200,
+             streaming=True, expected=b"PUT /stream\n\na\x00b\xffcde")
+    run_case(binary, b"POST /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nabcde", 200,
+             streaming=True, interim=True, expected=b"POST /stream\n\nabcde")
+    run_case(binary, b"POST /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 17\r\nExpect: 100-continue\r\n\r\n", 413,
+             streaming=True, shutdown=False)
+    run_case(binary, b"POST /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1073741824\r\n\r\nshort", 400,
+             streaming=True, limit=1073741824)
+    run_case(binary, b"PUT /tiny HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" + b"1\r\nx\r\n" * 4096 + b"0\r\n\r\n", 200,
+             streaming=True, limit=4096, expected=b"PUT /tiny\n\n" + b"x" * 4096)
+    run_case(binary, b"PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n11g\r\n", 400, streaming=True)
+    run_case(binary, b"GET /empty HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n", 204,
+             streaming=True, limit=0, expected=b"")
+    run_case(binary, b"PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Test: done\r\nDigest: harmless\r\n\r\n", 200,
+             streaming=True, expected=b"PUT /stream\n\nabc")
+    for trailer in [b"X-Snus-Lease-Token: forged", b"Connection: keep-alive", b"Transfer-Encoding: identity"]:
+        run_case(binary, b"PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" + trailer + b"\r\n\r\n", 400, streaming=True)
+    print("HTTP protocol: 84 native socket cases passed")
 
 
 def main():

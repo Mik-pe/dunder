@@ -37,6 +37,17 @@ values retain their double precision, and TEXT preserves embedded NUL and
 UTF-8. SQL NULL becomes JSON null. BLOB and non-finite REAL values are rejected;
 explicitly select `hex(blob_column)` when a text encoding is wanted.
 
+`execute_rows(sql, &params)` deliberately permits a statement with effects
+that returns rows, such as `INSERT ... RETURNING` or
+`PRAGMA wal_checkpoint(TRUNCATE)`. It retains the same single-statement,
+binding, row-encoding and finalization rules. Use `query` when reads alone
+are intended.
+
+`exec_blob(sql, &params, blob_index, &data)` returns `ExecResult` and binds
+one binary value at a one-based placeholder index. `params` contains the
+other text parameters in order. Binary data is bounded to 64 MiB; an empty
+buffer binds an empty BLOB rather than SQL NULL.
+
 Parameters bind text with explicit byte lengths and `SQLITE_TRANSIENT`.
 SQLite applies the usual column affinity; SQL NULL/numbers can also appear
 directly in trusted SQL expressions. Parameter counts must match exactly.

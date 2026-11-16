@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import platform
 import ssl
+import socket
+from socketserver import StreamRequestHandler, ThreadingTCPServer
 import subprocess
 import tempfile
 import threading
@@ -55,11 +57,21 @@ class Handler(BaseHTTPRequestHandler):
             self.response(302, b'redirect', [('Location', '/must-not-follow')])
         elif self.path == '/large':
             self.response(200, b'x' * 8192)
+        elif self.path == '/chunked-large':
+            self.send_response(200)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            self.wfile.write(b'2000\r\n' + b'x' * 8192 + b'\r\n0\r\n\r\n')
         elif self.path == '/empty':
             self.response(204)
         elif self.path == '/slow':
             time.sleep(0.25)
             self.response(200, b'slow')
+        elif self.path == '/stall':
+            time.sleep(3)
+            self.response(200, b'stalled')
+        elif self.path == '/renew':
+            self.response(200, b'renewed')
         else:
             self.response(500, b'unexpected request')
 
@@ -78,6 +90,11 @@ class Handler(BaseHTTPRequestHandler):
         self.response(201, payload)
 
     do_PUT = do_PATCH = do_DELETE = do_POST
+
+
+class StalledTLS(StreamRequestHandler):
+    def handle(self):
+        time.sleep(3)
 
 
 def host_target():
@@ -122,6 +139,7 @@ def main():
              '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost',
              '-keyout', key, '-out', cert])
         servers = [ThreadingHTTPServer(('127.0.0.1', 0), Handler) for _ in range(2)]
+        servers.append(ThreadingTCPServer(('127.0.0.1', 0), StalledTLS))
         trust = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         trust.load_cert_chain(cert, key)
         servers[1].socket = trust.wrap_socket(servers[1].socket, server_side=True)
@@ -132,6 +150,10 @@ def main():
         try:
             origin = f'http://127.0.0.1:{servers[0].server_port}'
             tls_origin = f'https://localhost:{servers[1].server_port}'
+            stalled_tls = f'https://127.0.0.1:{servers[2].server_address[1]}/'
+            with socket.socket() as unused_port:
+                unused_port.bind(('127.0.0.1', 0))
+                refused = f'http://127.0.0.1:{unused_port.getsockname()[1]}/'
             runnable = []
             if args.binary:
                 runnable.append(args.binary.resolve(strict=True))
@@ -146,7 +168,7 @@ def main():
                             runnable.append(image)
             for image in runnable:
                 start = time.monotonic()
-                observed = run([image, origin, tls_origin, cert], timeout=30, local_network=True)
+                observed = run([image, origin, tls_origin, cert, stalled_tls, refused], timeout=30, local_network=True)
                 assert observed.stdout == 'http client ok\n', observed.stdout
                 assert time.monotonic() - start < 20
                 receipts.append({'sha256': hashlib.sha256(image.read_bytes()).hexdigest(),
@@ -155,7 +177,9 @@ def main():
             assert servers[0].observed == Counter({
                 ('GET', '/ok'): 12 * executions,
                 **{(method, '/echo'): executions for method in ('POST', 'PUT', 'PATCH', 'DELETE')},
-                **{('GET', path): executions for path in ('/status', '/redirect', '/large', '/empty', '/slow')},
+                **{('GET', path): executions for path in ('/status', '/redirect', '/large', '/chunked-large', '/empty', '/slow')},
+                ('GET', '/stall'): executions,
+                ('GET', '/renew'): 2 * executions,
                 ('HEAD', '/head'): executions,
             }), servers[0].observed
             assert servers[1].observed == Counter({('GET', '/ok'): executions}), servers[1].observed
