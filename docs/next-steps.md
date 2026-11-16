@@ -44,6 +44,12 @@ Bygg generiska `Map<K, V>` och `Set<T>` ovanpå denna grund. Välj en enkel
 modell med statisk specialisering och synliga ägarskapskrav. Nuvarande
 `Map` är `string → i64` och `Set` innehåller strängar.
 
+> **Forskningspunkt (`SoA`)**: Utvärdera attributdriven SoA-härledning
+> (t.ex. `@derive(SoA)` / `@soa`) så att logiska structar kan användas som
+> samlingar utan att ge upp kolumnlayout, tillsammans med samlade
+> ergonomi-, test-, grafik- och stdlib-anteckningar från `dunder-skrift` i
+> [soa-research-plan.md](soa-research-plan.md).
+
 ## 4. Automatisk cleanup för externa resurser och typade fel
 
 Låt `@resource`-typer ange cleanup som kompilatorn kör vid scope-slut,
