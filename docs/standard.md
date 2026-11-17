@@ -46,13 +46,18 @@ elementtypen från kontexten.
 | `a.len`, `a.len()`, `len(a)` | Antal initierade element som `i32`. |
 | `a.cap()` | Tillgänglig kapacitet i element. |
 | `a[i]`, `a[i] = value` | Typad åtkomst med gränskontroll; skrivning kräver muterbar lagring. |
-| `a.push(value)` | Lägger till ett element; en lagrad strängägare lämnas som `a.push(move value)`. Kapaciteten växer geometriskt. |
+| `a.push(value)` | Lägger till ett element. Kapaciteten växer geometriskt. |
 | `a.pop()` | Tar bort och returnerar sista elementet. Tom array ger status 103. |
 | `a.remove(index)` | Flyttar ut elementet vid ett `i32`-index och flyttar efterföljande element ett steg åt vänster. Ogiltigt index ger status 103. |
 | `a.swap(i, j)` | Byter två element på plats utan kloning. Båda index kontrolleras före bytet; fel ger status 103. |
 | `a.reserve(capacity)` | Säkerställer minst denna kapacitet utan att ändra längden. |
 | `a.clear()` | Nollställer längden och behåller bufferten för återanvändning. |
 | `for item in a` | Läslånar samlingen under loopen, utan arraykopia. |
+
+En växande strängarray tar ägarskap om elementet. `a.push(move text)`
+flyttar en befintlig strängägare. `a.push(text.clone())` behåller `text`
+och ger arrayen en egen referens till samma oföränderliga text.
+Färska värden som `a.push(f"rad {i}")` lämnas direkt.
 
 Arrayer har unikt ägarskap. `next := values` flyttar ägaren; `values` kan
 sedan inte läsas före återinitiering. `copy := values.clone()` ger en

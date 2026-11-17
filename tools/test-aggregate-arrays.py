@@ -26,6 +26,7 @@ PROGRAMS = {
     'resources': 'resource aggregate arrays ok\n',
     'scratch': 'scratch aggregate compatibility ok\n',
     'remove': 'ordered array removal ok\n',
+    'inference': 'integer array inference, length names and string owners ok\n',
 }
 BOUNDS_TRAPS = ('remove-negative', 'remove-past-end', 'remove-empty')
 WASM_HOST = r'''

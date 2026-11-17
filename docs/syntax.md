@@ -583,11 +583,21 @@ en lagringsbar typ som ett primitivt värde, en struct, en enum eller en
 annan array. Den härleds eller hämtas från förväntad arraytyp.
 En fast array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
 
+När kontexten ger en arraytyp används dess elementtyp för heltalsliteralerna.
+Annars kan det första typade numeriska elementet ge typen även åt tidigare
+heltalsliteraler. `[0, u8(255), 1]` får typen `[u8; 3]`.
+En array med enbart heltalsliteraler får `i32` om alla ryms där, annars
+`i64`. Samma regel gäller `[value; N]` när `value` är en heltalsliteral.
+Literaler måste rymmas i den valda typen och typade element måste ha samma typ.
+
 Arrayer flyttas vid bindning och retur. Vanliga parametrar lånar för
 läsning. `mut` krävs för att tilldela ett element. Index har typen `i32`; negativa index och index vid
 eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
 längden som `i32`. Fasta arrayer kan returneras genom ägaröverföring på samma sätt som
 andra resursägande värden.
+En lokal variabel eller parameter får heta `len`. Den skuggar det
+fristående anropet `len(a)` i sitt block. Medlemsåtkomst som `a.len`
+avgörs av mottagarens typ, så ett eget structfält kan också heta `len`.
 `values.swap(i, j)` byter två element utan kloning och kräver muterbar lagring.
 `values.remove(i)` flyttar ut och returnerar elementet vid index `i` i en
 muterbar dynamisk array. Efterföljande element förskjuts åt vänster med

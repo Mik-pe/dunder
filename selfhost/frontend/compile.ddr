@@ -1221,7 +1221,9 @@ fn bind(c: &mut Session, model: &mut opt_ir.Function, move name: string, ty: i32
         facts.binding(&mut c.body.facts, at, ty)
     }
     if !rules.identifier(name) { fail(&mut c, "this compiler stage supports ASCII identifiers") }
-    if rules.reserved(name) && !(name == "self" && c.body.has_self && c.body.locals.names.len == 0) { fail(&mut c, "reserved local name") }
+    if rules.reserved(name) && name != "len" && !(name == "self" && c.body.has_self && c.body.locals.names.len == 0) {
+        fail(&mut c, "reserved local name")
+    }
     prior := locals.resolve(&c.body.locals, name)
     if prior >= 0 && c.body.locals.scopes[prior] == c.body.scope { fail(&mut c, "duplicate local name") }
     id := locals.add(&mut c.body.locals, move name, ty, mutable, c.body.scope, at)
@@ -2530,6 +2532,110 @@ fn choice_arms(c: &mut Session, expected: i32, home: i32, catalog: &opt_inline.V
     _ := match_arms(&mut c, expected, home, &mut result, &catalog, &mut inline_work, &mut model)
     result
 }
+struct ArrayIntegerPrefix { end: i32, default_type: i32 }
+fn array_integer_prefix(c: &Session, first: i32) -> ArrayIntegerPrefix {
+    mut pos := first; mut default_type := 1
+    mut element := lookahead.IntegerElement { token: -1, end: -1, negative: false }
+    while lookahead.integer_element(&c.world.tokens, pos, &mut element) {
+        if default_type == 1 {
+            mut spelling := c.world.tokens.texts[element.token].clone()
+            if element.negative { spelling = "-" + spelling }
+            mut number := rules.literal_integer(spelling)
+            _ := rules.validate_signed(&mut number, 1)
+            if !number.ok { default_type = 2 }
+        }
+        pos = element.end
+        if c.world.tokens.texts[pos] != "," { break }
+        pos += 1
+    }
+    ArrayIntegerPrefix { end: pos, default_type: default_type }
+}
+fn initialize_array_element(c: &mut Session, array: i32, ty: i32, source: i32) {
+    arm.push_temp(&mut c.code, 0); arm.load(&mut c.code, array); arm.pop_temp(&mut c.code, 1)
+    arm.intrinsic_call(&mut c.code, c.runtime.array_push, .ArrayInitializeElement, ty, 0, source)
+}
+fn initialize_integer_prefix(c: &mut Session, array: i32, first: i32, last: i32, ty: i32,
+    catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    // The anchor is scalar and the prefix contains constants only. Hold the anchor
+    // while filling the leading slots, so every nonliteral expression runs in source order.
+    after := c.body.cursor; c.body.cursor = first
+    arm.push_temp(&mut c.code, 0)
+    mut count := 0
+    while c.ok && c.body.cursor < last {
+        token := c.body.cursor
+        literal_type := expression(&mut c, 0, ty, &catalog, &mut inline_work, &mut model)
+        same(&mut c, ty, literal_type); expect(&mut c, ",")
+        if !c.ok { c.error_at = c.world.tokens.starts[token]; break }
+        initialize_array_element(&mut c, array, ty, c.world.tokens.starts[token]); count += 1
+    }
+    c.body.cursor = after; arm.pop_temp(&mut c.code, 0)
+    count
+}
+fn array_literal(c: &mut Session, token: i32, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    first := c.body.cursor
+    mut base := 0
+    mut default_type := 1
+    if collection(&c, expected) { base = ft.type_base(&c.types, expected) }
+    else {
+        prefix := array_integer_prefix(&c, first)
+        if prefix.end > first {
+            default_type = prefix.default_type
+            end := &c.world.tokens.texts[prefix.end]
+            if end == "]" || end == ";" { base = default_type }
+            else { c.body.cursor = prefix.end }
+        }
+    }
+    anchor := c.body.cursor
+    mut count := 0; mut repeated := false
+    allocation := arm.position(&c.code); source := c.world.tokens.starts[token]
+    arm.intrinsic_call(&mut c.code, c.runtime.array_new, .ArrayNew, base, expected, source)
+    saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
+    pending := c.body.pending.slots.len
+    stage_owner(&mut c, .Array, saved, base, 0)
+    while c.ok && !is(&c, "]") {
+        element := c.body.cursor; element_source := c.world.tokens.starts[element]
+        mut ty := expression(&mut c, 0, base, &catalog, &mut inline_work, &mut model)
+        if !c.ok { return 0 }
+        if element == anchor && anchor > first {
+            if c.body.expr.untyped_exit { ty = default_type }
+            else { ty = read_scalar_result(&mut c, ty, element) }
+            if ty != 1 && ty != 2 && !unsigned.has(ty) && !floats.has(ty) {
+                same(&mut c, default_type, ty)
+                return 0
+            }
+            count = initialize_integer_prefix(&mut c, saved, first, anchor, ty, &catalog, &mut inline_work, &mut model)
+            if !c.ok { return 0 }
+            if c.body.pending.slots.len > pending { c.body.pending.types[pending] = ty }
+        }
+        if base == 0 { base = ty } else { same(&mut c, base, ty) }
+        if count == 0 && c.body.pending.slots.len > pending { c.body.pending.types[pending] = base }
+        if count == 0 && eat(&mut c, ";") {
+            repeated = true; count = length_literal(&mut c)
+            if !ft.cloneable(&c.types, ty) { fail(&mut c, "resource values cannot be repeated or cloned"); return 0 }
+            take_value(&mut c, ty)
+            item := slot(&mut c); left := slot(&mut c)
+            if owned(&c, ty) { save_owner(&mut c, item, ty, true) } else { arm.store(&mut c.code, item, 0) }
+            arm.imm(&mut c.code, 0, i64(count)); arm.store(&mut c.code, left, 0)
+            head := arm.label(&mut c.code); done := arm.label(&mut c.code)
+            arm.mark(&mut c.code, head); arm.load(&mut c.code, left); arm.branch(&mut c.code, done, 18)
+            arm.integer_binary(&mut c.code, 2, true, false, 0, 0, -1, 1); arm.store(&mut c.code, left, 0)
+            arm.load(&mut c.code, item); copy_value(&mut c, ty); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, saved)
+            arm.intrinsic_call(&mut c.code, c.runtime.array_push, .ArrayInitializeElement, ty, 0, element_source)
+            arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
+            break
+        }
+        count += 1; take_value(&mut c, ty)
+        initialize_array_element(&mut c, saved, ty, element_source)
+        if !eat(&mut c, ",") { break }
+    }
+    expect(&mut c, "]"); arm.load(&mut c.code, saved); fc.clear_rvalue_place(&mut c.body.place)
+    if base == 0 { fail(&mut c, "empty array needs an element type") }
+    fc.finish_pending(&mut c.body.pending, pending)
+    mut ty := compound(&mut c, 1, base); if repeated || ft.type_kind(&c.types, expected) != 1 { ty = fixed(&mut c, base, count) }
+    arm.finish_array_literal(&mut c.code, allocation, base, ty, unsigned.shift(storage_type(&c, base)), source)
+    array_element_helpers(&mut c, base)
+    temporary(&mut c, ty)
+}
 fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, place: &mut i32, at: &mut i32, pending: &mut bool) -> i32 {
     if !c.ok { return 0 }
     token := c.body.cursor; kind := c.world.tokens.kinds[token]
@@ -2787,44 +2893,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
     if eat(&mut c, "true") { if model.recording { _ := typed.node(&mut model, 1, 3, -1, -1, -1, 1, -1, token) }; arm.imm(&mut c.code, 0, 1); return 3 }
     if eat(&mut c, "false") { if model.recording { _ := typed.node(&mut model, 1, 3, -1, -1, -1, 0, -1, token) }; arm.imm(&mut c.code, 0, 0); return 3 }
     if eat(&mut c, ".") { return enumeration(&mut c, expected, &catalog, &mut inline_work, &mut model) }
-    if eat(&mut c, "[") {
-        mut base := 0; if collection(&c, expected) { base = ft.type_base(&c.types, expected) }
-        mut count := 0; mut repeated := false
-        allocation := arm.position(&c.code); source := c.world.tokens.starts[token]
-        arm.intrinsic_call(&mut c.code, c.runtime.array_new, .ArrayNew, base, expected, source)
-        saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
-        pending := c.body.pending.slots.len
-        stage_owner(&mut c, .Array, saved, base, 0)
-        while c.ok && !is(&c, "]") {
-            element_source := c.world.tokens.starts[c.body.cursor]
-            ty := expression(&mut c, 0, base, &catalog, &mut inline_work, &mut model); if base == 0 { base = ty } else { same(&mut c, base, ty) }
-            if count == 0 && c.body.pending.slots.len > pending { c.body.pending.types[pending] = base }
-            if count == 0 && eat(&mut c, ";") {
-                repeated = true; count = length_literal(&mut c)
-                if !ft.cloneable(&c.types, ty) { fail(&mut c, "resource values cannot be repeated or cloned"); return 0 }
-                take_value(&mut c, ty)
-                item := slot(&mut c); left := slot(&mut c)
-                if owned(&c, ty) { save_owner(&mut c, item, ty, true) } else { arm.store(&mut c.code, item, 0) }
-                arm.imm(&mut c.code, 0, i64(count)); arm.store(&mut c.code, left, 0)
-                head := arm.label(&mut c.code); done := arm.label(&mut c.code)
-                arm.mark(&mut c.code, head); arm.load(&mut c.code, left); arm.branch(&mut c.code, done, 18)
-                arm.integer_binary(&mut c.code, 2, true, false, 0, 0, -1, 1); arm.store(&mut c.code, left, 0)
-                arm.load(&mut c.code, item); copy_value(&mut c, ty); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, saved)
-                arm.intrinsic_call(&mut c.code, c.runtime.array_push, .ArrayInitializeElement, ty, 0, element_source); arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
-                break
-            }
-            count = count + 1; take_value(&mut c, ty)
-            arm.push_temp(&mut c.code, 0); arm.load(&mut c.code, saved); arm.pop_temp(&mut c.code, 1); arm.intrinsic_call(&mut c.code, c.runtime.array_push, .ArrayInitializeElement, ty, 0, element_source)
-            if !eat(&mut c, ",") { break }
-        }
-        expect(&mut c, "]"); arm.load(&mut c.code, saved); fc.clear_rvalue_place(&mut c.body.place)
-        if base == 0 { fail(&mut c, "empty array needs an element type") }
-        fc.finish_pending(&mut c.body.pending, pending)
-        mut ty := compound(&mut c, 1, base); if repeated || ft.type_kind(&c.types, expected) != 1 { ty = fixed(&mut c, base, count) }
-        arm.finish_array_literal(&mut c.code, allocation, base, ty, unsigned.shift(storage_type(&c, base)), source)
-        array_element_helpers(&mut c, base)
-        return temporary(&mut c, ty)
-    }
+    if eat(&mut c, "[") { return array_literal(&mut c, token, expected, &catalog, &mut inline_work, &mut model) }
     fail(&mut c, "expected expression"); 0
 }
 fn local_value_type(c: &mut Session, found: i32) -> i32 {

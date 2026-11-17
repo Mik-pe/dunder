@@ -30,9 +30,7 @@ lämna tillbaka en resurs och att stängning och `defer` följer returvägen.
 
 Arbetet med Skrift och Hundmat har visat följande behov.
 
-- Förbättra heltalsinferens i arrayliteraler och inför flervärdesreturer.
-  Se över namn som krockar med inbyggda egenskaper och när strängar
-  behöver klonas vid `push`.
+- Inför flervärdesreturer.
 - Samla `clamp`, `min`, `max` och trigonometriska funktioner i en
   matematikmodul.
 
@@ -45,6 +43,11 @@ På nativa mål visar [en misslyckad jämförelse i `assert`](syntax.md#assertio
 båda operandvärdena, även för booleska testuttryck i `@test`.
 [Stränginterpolering](syntax.md#stränginterpolering) formaterar heltal
 decimalt och hexadecimalt med valfri minsta bredd och nollutfyllnad.
+[Arrayliteraler](syntax.md#arrayer-intervall-och-iteratorer) härleder typen
+för heltalsliteraler från övriga element eller från deras värdeintervall.
+`len` kan användas som lokalt namn, fält och metod.
+[Strängägande vid `push`](standard.md#växande-arrayer) är verifierat med
+flytt, delad text via `.clone()` och färska värden.
 
 ### Körbara exempel i manifestet
 
