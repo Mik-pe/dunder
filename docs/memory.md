@@ -206,9 +206,11 @@ till ett muterbart fält återinitierar det fältets subträd; tilldelning till
 hela bindningen återinitierar allt. Grenar och loopkanter följer samma
 fältplatser. Kvarvarande fält frigörs exakt en gång vid cleanup.
 Flytt ur ett lån avvisas.
-Arrayelement lämnas över med `pop` eller kopieras uttryckligen med `.clone()`;
-indexering lämnar ingen oinitierad lucka i arrayen. Inline-fält i C-layout
-kan klonas när ett självständigt arrayvärde behövs.
+Arrayelement kan flyttas ut ur en dynamisk array med `pop` eller
+`remove(index)`. `remove` överför ägarskapet till returvärdet och flyttar
+efterföljande element åt vänster inom samma buffert. Kvarvarande element
+behåller sin ordning och sina ägare. `.clone()` skapar en uttrycklig kopia
+av ett element eller ett inline-fält i C-layout.
 `values.swap(i, j)` byter element på plats utan kloning eller referensräkning.
 
 `replace(&mut place, replacement)` installerar ett nytt värde och returnerar

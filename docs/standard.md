@@ -37,10 +37,9 @@ fn main() {
 ## Växande arrayer
 
 `[]T` är en typad dynamisk array; `[T; N]` är fortsatt en fast array.
-Element kan vara `i32`, `i64`, `f32`, `f64`, `bool`, `rune`, `string` eller
-en enum utan payload. Annoterade literaler, även `[]`, får elementtypen
-från kontexten. Nästlade arrayelement, structelement och data-enums som
-element är ännu inte implementerade.
+Element kan vara primitiva värden, strängar, pekare, funktionsvärden,
+structar, enums och arrayer. Annoterade literaler, även `[]`, får
+elementtypen från kontexten.
 
 | Operation | Beteende |
 | --- | --- |
@@ -49,6 +48,7 @@ element är ännu inte implementerade.
 | `a[i]`, `a[i] = value` | Typad åtkomst med gränskontroll; skrivning kräver muterbar lagring. |
 | `a.push(value)` | Lägger till ett element; en lagrad strängägare lämnas som `a.push(move value)`. Kapaciteten växer geometriskt. |
 | `a.pop()` | Tar bort och returnerar sista elementet. Tom array ger status 103. |
+| `a.remove(index)` | Flyttar ut elementet vid ett `i32`-index och flyttar efterföljande element ett steg åt vänster. Ogiltigt index ger status 103. |
 | `a.swap(i, j)` | Byter två element på plats utan kloning. Båda index kontrolleras före bytet; fel ger status 103. |
 | `a.reserve(capacity)` | Säkerställer minst denna kapacitet utan att ändra längden. |
 | `a.clear()` | Nollställer längden och behåller bufferten för återanvändning. |
@@ -65,6 +65,11 @@ och inline-lagrade arrayer. Indexuttrycken körs en gång från vänster till
 höger; därefter används arrayens aktuella lagring. Buffert, längd och
 kapacitet är oförändrade av själva bytet. Strängsorteringen använder detta
 för att flytta handtag utan extra referensräkning.
+
+`remove` kräver en lagrad dynamisk array som kan ändras via `mut` eller
+`&mut`. Indexet utvärderas en gång. Borttagningen använder arrayens
+aktuella lagring efter indexuttrycket, behåller bufferten och kapaciteten
+och tar tid proportionell mot antalet efterföljande element.
 
 ## Läsa och lagra resurser
 

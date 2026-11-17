@@ -517,10 +517,9 @@ fn main() {
 
 `[a, b, c]` bygger en array. `[value; N]` utvärderar `value` en gång och
 upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
-`i32`, `i64`, `f32`, `f64`, `bool`, `string`, `rune` eller en enum utan payload;
-den härleds eller hämtas från förväntad arraytyp.
+en lagringsbar typ som ett primitivt värde, en struct, en enum eller en
+annan array. Den härleds eller hämtas från förväntad arraytyp.
 En fast array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
-Nästlade arrayer och structelement är ännu inte implementerade.
 
 Arrayer flyttas vid bindning och retur. Vanliga parametrar lånar för
 läsning. `mut` krävs för att tilldela ett element. Index har typen `i32`; negativa index och index vid
@@ -528,6 +527,9 @@ eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
 längden som `i32`. Fasta arrayer kan returneras genom ägaröverföring på samma sätt som
 andra resursägande värden.
 `values.swap(i, j)` byter två element utan kloning och kräver muterbar lagring.
+`values.remove(i)` flyttar ut och returnerar elementet vid index `i` i en
+muterbar dynamisk array. Efterföljande element förskjuts åt vänster med
+bibehållen ordning.
 
 `middle := &values[start..end]` skapar en lånad `&[]T` utan heapallokering
 eller retain. En explicit annotering, `middle: &[]i32 = &values[1..3]`, går

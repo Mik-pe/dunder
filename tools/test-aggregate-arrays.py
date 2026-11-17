@@ -25,7 +25,9 @@ PROGRAMS = {
     'recursive': 'recursive aggregate arrays ok\n',
     'resources': 'resource aggregate arrays ok\n',
     'scratch': 'scratch aggregate compatibility ok\n',
+    'remove': 'ordered array removal ok\n',
 }
+BOUNDS_TRAPS = ('remove-negative', 'remove-past-end', 'remove-empty')
 WASM_HOST = r'''
 'use strict';
 const assert = require('node:assert/strict');
@@ -57,8 +59,12 @@ for (const item of WebAssembly.Module.imports(moduleImage)) {
 }
 instance = new WebAssembly.Instance(moduleImage, {dunder: host});
 assert.equal(typeof instance.exports.main, 'function');
-const result = instance.exports.main();
-assert.ok(result === undefined || result === 0, 'nonzero main result ' + result);
+if (process.argv[3] === 'bounds') {
+    assert.throws(instance.exports.main, WebAssembly.RuntimeError);
+} else {
+    const result = instance.exports.main();
+    assert.ok(result === undefined || result === 0, 'nonzero main result ' + result);
+}
 '''
 
 
@@ -101,7 +107,7 @@ def main():
     parser.add_argument('--node', default='node', help='Node executable used for actual Wasm execution')
     parser.add_argument('--serial', action='store_true', help='use jobs 1 only with a serial compiler entry')
     parser.add_argument('--case', action='append', default=[], metavar='NAME',
-                        help='select a positive or invalid fixture by stem; repeat for focused bring-up')
+                        help='select a fixture by stem; repeat for focused bring-up')
     parser.add_argument('--skip-cache', action='store_true', help='omit incremental cache comparisons during focused bring-up')
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
@@ -113,11 +119,11 @@ def main():
             parser.error('--runner requires native TARGET=COMMAND')
         runners[target] = shlex.split(command)
     invalid = sorted(FIXTURES.glob('invalid-*.ddr'))
-    known = set(PROGRAMS) | {path.stem for path in invalid}
+    known = set(PROGRAMS).union(BOUNDS_TRAPS, (path.stem for path in invalid))
     if set(args.case) - known:
         parser.error('unknown fixture: ' + ', '.join(sorted(set(args.case) - known)))
     selected = set(args.case) or known
-    programs = [(name, output) for name, output in PROGRAMS.items() if name in selected]
+    programs = [name for name in (*PROGRAMS, *BOUNDS_TRAPS) if name in selected]
     invalid = [path for path in invalid if path.stem in selected]
     if programs and shutil.which(args.node) is None:
         parser.error('Node is required for the Wasm runtime matrix; provide --node PATH')
@@ -131,17 +137,17 @@ def main():
         wasm_host = work / 'wasm-host.cjs'
         wasm_host.write_text(WASM_HOST)
 
-        def execute(image, target, output):
+        def execute(image, target, output, *, bounds_trap=False):
             nonlocal native_runs, wasm_runs
             image_header(image, target)
             if target == 'wasm32':
-                run([args.node, wasm_host, image], work, output=output)
+                run([args.node, wasm_host, image, 'bounds' if bounds_trap else 'ok'], work, output=output)
                 wasm_runs += 1
             elif target in runners:
-                run([*runners[target], image], work, output=output)
+                run([*runners[target], image], work, status=103 if bounds_trap else 0, output=output)
                 native_runs += 1
 
-        for name, output in programs:
+        for name in programs:
             source = FIXTURES / (name + '.ddr')
             for target in TARGETS:
                 for mode, flags in MODES:
@@ -150,7 +156,7 @@ def main():
                         run([compiler, 'build', source, '--target', target, '--jobs', jobs,
                              *flags, '-o', image], ROOT)
                         images += 1
-                        execute(image, target, output)
+                        execute(image, target, PROGRAMS.get(name, ''), bounds_trap=name in BOUNDS_TRAPS)
             print('PASS aggregate arrays', name, 'native3 + executed Wasm, default/direct MIR', flush=True)
 
         for source in invalid:

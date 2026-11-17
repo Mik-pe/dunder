@@ -1,7 +1,8 @@
 # Nästa steg för Dunder
 
 Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 och 2a är
-implementerade, liksom stöd för sammansatta arrayelement i etapp 3.
+implementerade, liksom sammansatta arrayelement och ordningsbevarande
+borttagning i etapp 3.
 Etapp 2b och återstående delar av 3–5 är utvecklingsplanen.
 Nuvarande kontrakt finns i
 [minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
@@ -71,12 +72,12 @@ arrayer, med samma flytt-, klonings- och cleanupregler som fristående
 värden. Lånade intervall och iteration bevarar elementens typ och
 ägarskap. Kloning följer ägda barn rekursivt, även genom ändliga
 rekursiva träd; nåbara `@resource`-värden förbjuder kloning.
-`clear` städar levande element och `pop` flyttar ut det sista.
+`clear` städar levande element, `pop` flyttar ut det sista och
+`remove(index)` flyttar ut ett valfritt element med bibehållen ordning och
+kapacitet.
 
 Detta gör det möjligt att ersätta parallella fältarrayer där en samlad
-post passar bättre. Lägg till borttagning som flyttar ut ett element utan en
-oinitierad lucka; `swap` följt av `pop` fungerar redan när ordningen får
-ändras.
+post passar bättre.
 
 Bygg generiska `Map<K, V>` och `Set<T>` ovanpå denna grund. Välj en enkel
 modell med statisk specialisering och synliga ägarskapskrav. Nuvarande
