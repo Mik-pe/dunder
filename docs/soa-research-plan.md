@@ -1,8 +1,7 @@
 # Forskning: SoA-härledning (`@derive(SoA)` / `@soa`) för structar i arrayer
 
-Detta är ett forsknings- och designunderlag, inte implementerad funktionalitet.
-Frågan gäller hur Dunder bäst kombinerar ergonomi för samlingar av sammansatta
-poster med hårdvaruvänlig Structure-of-Arrays-lagring (SoA), motiverat av
+Undersökningen gäller hur Dunder kan kombinera postbaserade samlingar
+med kolumnlagring (Structure of Arrays), motiverat av
 [planen för samlingar](next-steps.md#samlingar) och erfarenheter från
 `dunder-skrift` och `dunder-hundmat/dogfood/skrift`.
 
@@ -34,27 +33,84 @@ ett möjligt layoutval att utvärdera, inte ett krav för att lagra poster.
 - **API-ergonomi**: Publika gränssnitt får exponera indexmetoder
   (`axis_at(i)`) i stället för en typad samling.
 
-## Designspår att undersöka
+## Prototyp med variationstabellen som förebild
 
-1. **Syntetiserad SoA-container via attribut (`@derive(SoA)` / `@soa struct`)**
-   - Kompilatorns frontend genererar en följeslagartyp (t.ex. `AxisSoa` eller
-     `soa[] Axis`) med en typad kolumn per fält samt `new`, `reserve`, `push(T)`,
-     `pop`, `get(i) -> T`, `set(i, T)`, `swap(i, j)`, `clear` och `len`.
-   - **Fördel**: Sänks rakt ned till befintliga `[]skalär` / `[]string`-arrayer
-     utan ändringar i array-ABI eller backend, och tillåter fortfarande direkta
-     kolumnlån (`&axes.min_value`) i heta kärnor.
-   - **Öppna frågor**:
-     - Hur ska nästlade ägda arrayfält (`pixels: []u8`) hanteras — förbjudas i
-       första steget eller plattas automatiskt till CSR-kolumner (`data`,
-       `starts`, `ends`)?
-     - **Referenssemantik**: Eftersom ingen sammanhängande `T`-struct finns i
-       minnet kan `&table[i]` inte ge en vanlig `&T`-referens; en explicit
-       SoA-samlingstyp gör det layoutkontraktet tydligt.
+Skrifts `FvarTable.axis_at` bygger redan en `VariationAxis` från flera
+kolumner. I `CmapTable` läser binärsökningen först en enda kolumn
+(`f4_end_codes`) och hämtar de övriga fälten efter att segmentet hittats.
+De två fallen ger skäl att exponera både poster och kolumnlån.
 
-2. **Förhållande till vanlig AoS `[]Struct` och POD**
-   - Vanlig sammanhängande `[]Struct` (AoS) behövs fortfarande där extern
-     C/GPU-FFI kräver en tät postbuffert (exempelvis `@c_layout struct Vertex`
-     direkt till Metal/Vulkan utan manuell packning till `[]f32`).
-   - En möjlig kombination är `@derive(SoA)` för interna tabeller och
-     domändata, parallellt med vanlig värdestegning för `[]Struct` / POD
-     ([pod-values-plan.md](pod-values-plan.md)).
+Följande test använder tre kolumner bakom ett postbaserat gränssnitt.
+Spara exemplet som `axes.ddr` och kör `dunder run axes.ddr`.
+
+```dunder
+struct Axis { tag: i32, minimum: f32, maximum: f32 }
+struct AxisTable { tags: []i32, minimum: []f32, maximum: []f32 }
+
+impl AxisTable {
+    fn new() -> Self { Self { tags: [], minimum: [], maximum: [] } }
+
+    fn push(&mut self, axis: Axis) {
+        capacity := self.tags.len + 1
+        self.tags.reserve(capacity)
+        self.minimum.reserve(capacity)
+        self.maximum.reserve(capacity)
+        self.tags.push(axis.tag)
+        self.minimum.push(axis.minimum)
+        self.maximum.push(axis.maximum)
+    }
+
+    fn get(&self, index: i32) -> Axis {
+        Axis { tag: self.tags[index], minimum: self.minimum[index], maximum: self.maximum[index] }
+    }
+
+    fn min_values(&self) -> &[]f32 { &self.minimum[0..self.minimum.len] }
+
+    fn remove(&mut self, index: i32) -> Axis {
+        tag := self.tags.remove(index)
+        lo := self.minimum.remove(index)
+        hi := self.maximum.remove(index)
+        Axis { tag: tag, minimum: lo, maximum: hi }
+    }
+}
+
+fn main() {
+    mut axes := AxisTable::new()
+    axes.push(Axis { tag: 11, minimum: 100.0, maximum: 900.0 })
+    axes.push(Axis { tag: 22, minimum: 50.0, maximum: 200.0 })
+    axes.push(Axis { tag: 33, minimum: 0.0, maximum: 90.0 })
+    {
+        minima := axes.min_values()
+        assert(minima.len == 3 && minima[1] == 50.0)
+        assert(axes.get(1).tag == 22 && axes.get(1).maximum == 200.0)
+    }
+    removed := axes.remove(1)
+    assert(removed.tag == 22 && removed.minimum == 50.0 && removed.maximum == 200.0)
+    assert(axes.min_values().len == 2)
+    assert(axes.get(1).tag == 33 && axes.get(1).minimum == 0.0 && axes.get(1).maximum == 90.0)
+}
+```
+
+## Slutsats
+
+Välj en uttrycklig följeslagartyp för den som vill använda kolumnlayout.
+Den kan genereras i frontenden som vanlig Dunder med en typad array per
+fält. `push`, `remove`, `set` och `swap` måste hålla kolumnernas längder
+och index i takt. En operation som behöver mer utrymme reserverar samtliga
+kolumner före den första längdändringen. Ett återlämnat kolumnlån låser
+tabellen för skrivning under lånets livslängd.
+
+`get(i)` materialiserar en post. Ett vanligt `&T` kräver en verklig
+sammanhängande postplats och kan därför inte lånas direkt ur tabellen.
+Låt första versionen hantera skalärfält. Ägda fält kan utökas med
+statiska kloningskrav för `get` och ägaröverföring för `remove`.
+CSR-packning av nästlade listor behöver ett eget kontrakt för index,
+uppdateringar och ägarskap och kan utvärderas separat.
+
+Behåll en separat tät postlayout för C- och GPU-gränssnitt.
+Dagens `[]Struct` lagrar handtag till poster, även med `@c_layout` på
+elementet. En framtida tät postbuffert hör ihop med
+[POD-planen](pod-values-plan.md). Prototypen provar gränssnitt och
+lånesemantik med befintliga arrayer. Kostnaden för helpostläsning,
+kolumnsökning och verkliga arbetslaster får mätas innan en generell
+härledning införs.

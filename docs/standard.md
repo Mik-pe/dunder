@@ -146,9 +146,9 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
 | `std.bytes` | Packade bytebuffertar (`[]u8`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kompilatorns kvarvarande `[]i32`-buffertar. |
 | `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish`). |
-| `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`Doc::parse_bytes`, `Doc::parse_text`, `.field`, `.at`, `.get_str`, `.get_i64`, `.get_u64`, `.get_bool`). |
+| `std.json` | `Writer` för att skriva JSON samt lågnivåskrivare till `[]u8`. Läs dokument med `Doc::parse_bytes` eller `Doc::parse_text` och hämta fält med bland annat `.get_str`, `.get_i64`, `.get_u64`, `.get_f64` och `.get_bool`. |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
-| `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range` och `Unsigned::range`/`Unsigned::hex_range` läser ASCII-tal. `Integer::parse` accepterar understreck mellan siffror. |
+| `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse` och deras `range`-varianter läser ASCII-tal. `parse` accepterar understreck mellan siffror. |
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError::from_code`/`.code`/`.message` samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`, `WriteFile::grant`/`.write`, `ReadDir::grant`/`.resolve_read`/`.list`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
@@ -181,6 +181,37 @@ i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buff
 `capability network` med både `impl`-metoder (`TcpListener::listen`/`.accept`/`.close`,
 `TcpStream::connect`/`.read_append`/`.write_all`/`.close`, `PollSet::new`,
 `StreamSet::new`) och modulhjälpare (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
+
+## Skriva JSON
+
+```dunder
+import std.json as json
+
+fn main() {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("name")
+    writer.string("Skrift")
+    writer.key("samples")
+    writer.array()
+    writer.decimal(1.25)
+    writer.integer(2)
+    writer.end()
+    writer.end()
+    encoded := writer.finish()
+    assert(encoded.ok)
+    print(encoded.value)
+}
+```
+
+`Writer` sköter skiljetecken för objekt och arrayer. Anropa `key` före
+värdet i ett objekt och `end` för varje öppnad behållare. `finish().ok`
+kräver precis ett komplett rotvärde och en giltig följd av anrop.
+`decimal`, `write_f64` och `field_f64` avvisar NaN och oändlighet.
+`Doc.as_f64` och `Doc.get_f64` ger `ok: false` för saknade värden,
+värden av annan JSON-typ och tal utanför det ändliga binary64-området.
+
+## Bitoperationer
 
 Heltal har explicita `.bit_and`, `.bit_or`, `.bit_xor`, `.bit_not`, `.shl`
 och logisk `.shr`. Skiftantal är `i32` och måste ligga inom typens bitbredd;

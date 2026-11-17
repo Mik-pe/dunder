@@ -107,13 +107,22 @@ samma flyttal. `0.1` skrivs som `0.1` för båda typerna. Fast notation får
 16 använder exponentform, exempelvis `1e-5` och `1e+20`. Specialvärden
 skrivs `nan`, `inf`, `-inf`, `0.0` och `-0.0`.
 
-Återläsningen verifieras med Pythons flyttalsparser och binärrepresentation; Dunder har
-ännu ingen sträng-till-flyttal-parser. Formatbredd och valbar precision är
-inte implementerade. Formatteraren prioriterar korrekthet och använder
+Återläsningen verifieras med Pythons flyttalsparser och binärrepresentation.
+Formatbredd och valbar precision återstår. Formatteraren använder
 exakt heltalsarbete; den har ännu inget uppmätt prestandamål.
 Utskriftssträngar använder den delade heapen.
 Direkt utskrift frigör sin formatteringssträng efter skrivningen;
 `.str()` returnerar ett referensräknat värde. Se [minnesmodellen](memory.md).
+
+## Decimalparsning vid körning
+
+`std.parse.Float32::parse(text)` och `std.parse.Float64::parse(text)`
+läser decimaler med valfritt tecken, decimaldel och exponent. Understreck
+får stå mellan siffror i samma taldel. `range(text, start, end)` läser ett
+byteintervall och kräver siffror utan understreck. Resultatet har `ok`,
+`value` och `error` (1 vid ogiltig stavning, 2 vid överspill).
+Båda använder samma direktavrundning som källkodsliteralerna och bevarar
+tecknet vid underflöde till noll.
 
 ## Körda program och gränser
 
