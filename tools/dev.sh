@@ -21,19 +21,9 @@ if [ ! -x "$host_compiler" ]; then
     host_compiler=$(./tools/bootstrap.sh)
 fi
 
-# Auto-refresh bundled stdlib when any stdlib source was edited.
-regen=0
-if [ "stdlib/modules.txt" -nt "selfhost/bundled.ddr" ]; then
-    regen=1
-else
-    for f in stdlib/*.ddr; do
-        if [ "$f" -nt "selfhost/bundled.ddr" ]; then
-            regen=1
-            break
-        fi
-    done
-fi
-if [ "$regen" -eq 1 ]; then
+bundle=selfhost/bundled.ddr
+if [ ! -f "$bundle" ] || [ stdlib/modules.txt -nt "$bundle" ] || [ runtime/float.ddr -nt "$bundle" ] ||
+    [ -n "$(find stdlib -type f -name '*.ddr' -newer "$bundle" -print)" ]; then
     "$host_compiler" run selfhost/embed.ddr -o build/dev/embed
 fi
 

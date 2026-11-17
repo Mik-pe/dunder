@@ -139,16 +139,16 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 
 | Import | Innehåll |
 | --- | --- |
-| `std.array` | `ints`, `strings`; `sum`, `sort`, `reverse`, `append` för `[]i64`; `sort_strings` för `[]string`. Heltal använder insertion sort; strängar använder heapsort, O(n log n), på plats och utan extra array. Strängordningen är lexikografisk över UTF-8-byte, inte lokalanpassad. |
+| `std.array` | `ints`, `strings`, `sum`, `sort`, `reverse`, `append` och `sort_strings`. Båda sorteringarna använder heapsort på plats, O(n log n). Strängar jämförs lexikografiskt över UTF-8-byte. |
 | `std.map` | `Map` från `string` till `i64` med metoder via `impl Map` (`Map::new`, `m.len`, `m.length`, `m.reserve`, `m.put`, `m.get`, `m.get_or`, `m.contains`, `m.remove`, `m.clear`, `m.keys`) samt modulhjälpare (`map.new`, `map.put`, ...). |
 | `std.set` | `Set` av strängar med metoder via `impl Set` (`Set::new`, `s.len`, `s.length`, `s.reserve`, `s.insert`, `s.contains`, `s.remove`, `s.clear`, `s.items`) samt modulhjälpare (`set.new`, `set.insert`, ...). |
 | `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
 | `std.bytes` | Packade bytebuffertar (`[]u8`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kompilatorns kvarvarande `[]i32`-buffertar. |
-| `std.wire` | Allokeringsfri binär serialisering till `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish`). |
+| `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish`). |
 | `std.json` | Strömmande JSON-skrivare direkt till `[]u8` samt platt span-tape RFC 8259-tolkare utan DOM- eller map-allokeringar (`Doc::parse_bytes`, `Doc::parse_text`, `.field`, `.at`, `.get_str`, `.get_i64`, `.get_u64`, `.get_bool`). |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
-| `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range` (`integer(string)` ger `{ ok, value: i64, error }`) samt `Unsigned::range`/`Unsigned::hex_range`; strikt ASCII med separatorer mellan siffror. |
+| `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range` och `Unsigned::range`/`Unsigned::hex_range` läser ASCII-tal. `Integer::parse` accepterar understreck mellan siffror. |
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError::from_code`/`.code`/`.message` samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`, `WriteFile::grant`/`.write`, `ReadDir::grant`/`.resolve_read`/`.list`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
@@ -174,7 +174,7 @@ elementtyp utan vtables.
 en tom separator ger en del med hela texten. `trim` tar ASCII-mellanslag,
 tabb, CR och LF. `parse.integer`, `parse.hex`, `parse.i64_range`, `parse.u64_range`
 och `parse.hex_u64_range` ger fel 1 för stavning och 2 för overflow; både
-i64- och u64-gränser stöds. `bytes` innehåller även zero-copy-hjälpare
+i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buffertar
 (`decode_range`, `find_byte`, `find_crlf`, `find_double_crlf`, `equals_text`,
 `equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
 `std.net` ger kapabilitetsstyrd TCP och `PollSet`/`StreamSet` ovanpå

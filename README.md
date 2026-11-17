@@ -65,13 +65,9 @@ arkivet med `curl`, packar upp det med `gzip` och verifierar SHA-256 före
 bytet. Releaser byggs lokalt och publiceras med `gh`.
 [Bygg och publicera en release](docs/releases.md)
 
-På ARM64/macOS verifierar skriptet först en seriell fixpunkt från fröet och
-bygger sedan den taskbaserade kompilatorn med byteidentiska självbyggen för
-`--jobs=1` och `--jobs=4`. Den publicerade `dunder` använder fyra workers som
-standard. Linux behåller den seriella standardkompilatorn.
-`./tools/bootstrap.sh --serial` publicerar i stället `dunder-serial` på alla
-värdar och lämnar standardbinären orörd.
-[Fröbinärer och återbyggnad](bootstrap/README.md) beskriver stegen.
+På alla tre nativa värdar verifierar bootstrap först en seriell fixpunkt och
+sedan byteidentiska självbyggen av den taskbaserade standardkompilatorn.
+[Fröbinärer och återbyggnad](bootstrap/README.md)
 
 Den byggda `dunder`-kompilatorn behöver inga externa kompilatorer,
 assembler, länkare eller signeringsverktyg för att bygga Dunder-källkod.
@@ -163,14 +159,9 @@ händelsestyrd HTTP/1.1-server) finns i syskonrepot [dunder-hundmat](https://git
 Alla mål använder samma typkontroll, lånekontroll och ägarskapsregler. De tre
 nativa värdplattformarna har frysta kompilatorer för återbyggnad offline.
 
-På ARM64/macOS delar typkontrollen och backenden en workerpool.
-Samordnaren kan typa en funktion medan arbetarna typar andra nåbara
-funktioner. Både seriella och parallella byggen läser typade operationer
-direkt för att bygga, verifiera och sänka MIR. Samordnaren binder symboler,
-rapporterar fel och länkar objekten i en bestämd ordning. En och fyra
-workers producerar byteidentiska kompilatorer. `--jobs N` väljer 1–256
-workers. `check` och `--profile-compiler` använder den seriella vägen.
-[Taskkontrakt och arbetsfördelning](docs/tasks.md)
+Typkontrollen och backenden delar en workerpool på alla tre nativa värdar.
+`--jobs N` väljer 1–256 workers och `--profile-compiler` kör i enkelspår.
+[Taskkontrakt och arbetsfördelning](docs/tasks.md#kompilatorn-som-taskkonsument)
 
 Följande historiska mätning gäller kompilatorn före övergången till
 läslån och ägarflyttar. På Apple M5 byggde den typade funktionskedjan det

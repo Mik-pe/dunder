@@ -100,16 +100,12 @@ etikettabellen. Indata och resultat följer språkets vanliga regler för
 [`compile_parallel`](../selfhost/tasks/compile_parallel.ddr) äger begränsade
 fönster av språkets isolerade tasks. Antalet workers ändrar inte symbol-
 och nåbarhetsordning, första diagnostik, inlinebudget, passbudget eller
-cacheberoenden. `--jobs N` och `--jobs=N` stöder 1–256 på ARM64/macOS-
-ingången, med fyra som standard. `check` och `--profile-compiler` använder samma seriella Session-drivrutin. Vanliga
-passräknare visar faktiskt utfört arbete även för workerresultat; fulla
-cacheträffar och `check` har noll backendaktivitet.
+cacheberoenden. Passräknarna omfattar även workerresultat. Fulla cacheträffar
+och `check` har noll backendaktivitet.
+[Arbetsbudget och kompilatorjobb](tasks.md#kompilatorn-som-taskkonsument)
 
-Samma kompilator kan korsbygga alla fyra mål. Begränsningen till ARM64/macOS
-gäller taskruntimen som kör kompilatorjobben, inte programmens målformat.
 [Parallell kompilatormätning](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
-redovisar en worker separat från standardens fyra. Rapporten föregår SSA-grunden; dess
-byteidentiska runtimebilder behåller samma kvarvarande C-gap.
+jämför en och fyra workers före SSA-grunden. Runtimebilderna är byteidentiska.
 
 ### Registerhem över hela funktioner
 

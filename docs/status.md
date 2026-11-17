@@ -2,19 +2,14 @@
 
 Kompilatorn på `main` är skriven i Dunder. Den bygger sig själv på ARM64/macOS,
 ARM64/Linux och x86-64/Linux och kan från varje värd skriva kod för alla tre
-nativa målen och wasm32. Återbyggnaden börjar med en fryst Dunder-kompilator
-och verifierar en seriell fixpunkt. På ARM64/macOS byggs sedan den
-taskbaserade standardingången till byteidentiska självbyggen med en och fyra
-workers; standarden är fyra. Linux behåller seriell standardkompilering.
-`bootstrap.sh --serial` publicerar `dunder-serial` på alla värdar utan att
-ersätta `dunder`. Byggkedjan för den tidigare Rust-kompilatorn har ersatts.
+nativa målen och wasm32.
 [Återbyggnad](../bootstrap/README.md) och
 [målplattformar](targets.md).
 
 ## Språk och runtime
 
 - Isolerade uppgifter använder `task scope`, `spawn` och typad `await` på
-  ARM64/macOS. Scopeägda trådar, separata pooler och kontrollerad kloning
+  alla tre nativa mål. Scopeägda trådar, separata pooler och kontrollerad kloning
   håller managed-värden åtskilda. Typ- och effektanalys kontrollerar workerns
   gräns; scope-exit väntar in jobben före cleanup. Kompilatorn använder samma
   taskstöd för parallell MIR-verifiering, optimering och sänkning. [Uppgifter och begränsningar](tasks.md).
@@ -133,12 +128,6 @@ med oförändrad användarpolicy. Dessa siffror gäller v1, före gles v2 och
 [SSA-orakel](../tools/test-mir-ssa.py) ·
 [Källprov](../tools/test-ssa-source.py) ·
 [Omfattning](optimization.md#ssa-för-privata-framevärden).
-
-Huvudtråden äger diagnostik, symbolbindning, cache och slutlig länkning.
-På ARM64/macOS delar kontrollen av nåbara funktioner och sänkningen av
-typade operationer en pool med 1–256 workers. Källtypningen och MIR-byggaren
-är gemensamma för seriella och parallella byggen. `check` och
-`--profile-compiler` använder den seriella kedjan. [Arbetsfördelning](tasks.md#kompilatorn-som-taskkonsument)
 
 I den parade mätningen före ägarskapsbytet byggde den typade kedjan samma låsta
 kompilatorkälla på 359,79 ms mot 468,17 ms vid `4585bc4`. Det blandade

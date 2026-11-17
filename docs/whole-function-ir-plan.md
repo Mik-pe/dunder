@@ -309,14 +309,9 @@ inte att två heapåtkomster är oberoende.
 
 ## Parallell kompilering och språkets trådar
 
-Det [isolerade taskstödet](tasks.md) och dess första riktiga
-kompilatorkonsument är implementerade på ARM64/macOS. Den taskbaserade
-ingången använder fyra workers som standard och stöder `--jobs` 1–256.
-Bootstrap verifierar först seriell fixpunkt från fröet och bygger därefter
-taskingångens byteidentiska självbyggen med en och fyra workers. Den frysta
-seriella ingångens beroendeträd innehåller ingen ny tasksyntax. Linux
-behåller seriell standardkompilering; `bootstrap.sh --serial` publicerar en
-separat `dunder-serial` på alla värdar utan att ersätta `dunder`.
+Den första parallella leveransen använde taskruntimen på ARM64/macOS.
+[Aktuell arbetsfördelning](tasks.md#kompilatorn-som-taskkonsument) och
+[återbyggnad från frö](../bootstrap/README.md).
 
 ### Ägargränsen vid den första parallella MIR-leveransen
 

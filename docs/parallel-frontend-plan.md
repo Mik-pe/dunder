@@ -9,21 +9,10 @@ körvägar beskrivs i [kompilatorns översikt](../selfhost/README.md).
 
 ## Utgångsläge
 
-Standardkompilatorn på ARM64/macOS använder fyra workers. `--jobs=1..256`
-väljer storlek på ett begränsat taskfönster. Föräldern äger en `compile.Session`
-och utför fortfarande modulladdning, deklarationer, typ- och lånekontroll,
-kroppsemission, cache och slutlig sammanfogning. Workers tar emot kompakt
-funktionsdata, bygger lokal MIR, verifierar och optimerar den och sänker
-med samma lowerer direkt till numerisk `mir_lower.ObjectData`. Föräldern
-tar över slutobjekt och statistik med `await!`, validerar och länkar i ordning.
-På ARM64/macOS använder språkets taskruntime libdispatchs trådpool och
-scopets återanvändbara arenor. En och flera workers använder samma batchkod.
-Kontrolläge och kompilatorprofilering använder den seriella Session-vägen.
-
-Detta framgår av [compile_parallel](../selfhost/tasks/compile_parallel.ddr),
-[dagens jobbobjekt](../selfhost/tasks/mir_task.ddr) och
-[Session.next_into](../selfhost/frontend/compile.ddr#L2870).
-[Taskkontraktet](tasks.md) beskriver isolering och resultatskopiering.
+Vid `f025cb5` typade föräldern alla funktioner. På ARM64/macOS fick
+arbetarna kompakt funktionsdata för lokal MIR-verifiering, optimering och
+sänkning. Föräldern tog emot `mir_lower.ObjectData` med `await!` och länkade
+i ordning. Standardbudgeten var fyra workers och kontrolläget körde seriellt.
 
 Den historiska [parallellmätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
 visar redan en vinst av MIR-parallellism: samma binär med en respektive fyra
