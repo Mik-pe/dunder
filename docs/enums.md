@@ -166,6 +166,37 @@ Typen kan komma från en annotering eller en funktionsparameter. När en enum
 förväntas fungerar kortformen `.Variant` även sist i ett block. Med `:=`
 härleder kompilatorn typen från den första armen som ger ett värde.
 
+## Typade fel med Result
+
+`Result<T, E>` är en inbyggd enumtyp med `.Ok(T)` och `.Err(E)`.
+Använd `.Ok` eller `.Err` utan parenteser när den variantens typ är `()`.
+Skriv `Result<i32, string>.Ok(42)` för att välja typen utan förväntad
+kontext. Varje par av konkreta typargument får en egen statisk typ.
+
+```dunder
+fn parse_port(text: string) -> Result<i32, string> {
+    if text == "443" { return .Ok(443) }
+    .Err("ogiltig port")
+}
+
+fn label(text: string) -> Result<string, string> {
+    port := parse_port(text)?
+    .Ok("port " + port.str())
+}
+```
+
+Postfixoperatorn `?` utvärderar sitt Result-uttryck en gång. Vid `.Ok`
+ger den variantens värde. Vid `.Err` returnerar den felet från den
+omgivande funktionen genom dess vanliga returstädning. Funktionens
+feltyp måste vara densamma som operandens. Funktionens framgångstyp
+kan väljas oberoende.
+
+`Result` följer samma ägarskapsregler som andra enums. När ett Result
+innehåller en resurs flyttar `?` ut den valda varianten. Ett anrop som
+misslyckas med att ta över en resurs kan returnera både felet och ägaren
+i `.Err`. Använd `match move` för att ta emot dem.
+[Körbart exempel med automatisk resursstängning](../tests/fixtures/results.ddr)
+
 ## Lagring och dispatch
 
 En enum med data innehåller en tagg och plats för den största variantens
@@ -208,7 +239,7 @@ kan i sin tur äga en array, en struct eller en annan enum. Ägarskap och
 kloning följer payloadens typ. [Körbart exempel](../tests/fixtures/aggregate_arrays/enums.ddr)
 
 Ett enumvärde får vara högst 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
-generiska `Result<T>`/`Option<T>`, `?`, alternativa
+generiska `Option<T>`, alternativa
 mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja
 payload eller en textrepresentation. [sys](sys.md) använder redan konkreta
 `ReadResult` och `IoError` utan generics.

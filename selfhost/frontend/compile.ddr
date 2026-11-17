@@ -418,7 +418,23 @@ fn parameter_mode(c: &mut Session, ty: i32, consume: bool, foreign: bool) -> i32
     if !foreign && (ft.owned(&c.types, ty) || kind == 3) { return compound(&mut c, 4, ty) }
     ty
 }
+fn result_arguments(c: &mut Session) -> i32 {
+    if !c.ok { return 0 }
+    if c.body.depth >= 128 { fail(&mut c, "Result type nesting exceeds 128"); return 0 }
+    c.body.depth += 1
+    expect(&mut c, "<"); newlines(&mut c)
+    success := type_name(&mut c); newlines(&mut c)
+    expect(&mut c, ","); newlines(&mut c)
+    failure := type_name(&mut c); newlines(&mut c)
+    expect(&mut c, ">")
+    c.body.depth -= 1
+    if !c.ok { return 0 }
+    ty := ft.result_type(&mut c.types, success, failure)
+    check_type_error(&mut c)
+    ty
+}
 fn type_name(c: &mut Session) -> i32 {
+    if !c.ok { return 0 }
     if is(&c, "&&") { fail(&mut c, "reference a value type: nested borrows are not supported"); return 0 }
     if eat(&mut c, "TaskID") {
         expect(&mut c, "<"); result := type_name(&mut c); expect(&mut c, ">")
@@ -440,13 +456,35 @@ fn type_name(c: &mut Session) -> i32 {
         base := type_name(&mut c); expect(&mut c, ";"); length := length_literal(&mut c); expect(&mut c, "]"); return fixed(&mut c, base, length)
     }
     if eat(&mut c, "(") { expect(&mut c, ")"); return 0 }
-    name := advance(&mut c); found := resolve_type_name(&c, name)
+    name := advance(&mut c)
+    if name == "Result" && is(&c, "<") { return result_arguments(&mut c) }
+    found := resolve_type_name(&c, name)
     if found < 0 {
         if name == "Self" { fail(&mut c, "Self is only valid inside an impl block") }
         else { fail(&mut c, "unknown type '" + name + "'") }
         return 0
     }
     found
+}
+// A worker may parse a local annotation or qualified constructor that did not
+// occur in a signature. Register its concrete type before freezing the world.
+fn prepare_results(c: &mut Session) {
+    for f in 0..c.world.names.len {
+        c.types.self_type = c.world.impl_types[f]
+        for at in c.world.starts[f]..c.world.ends[f] {
+            if c.world.tokens.kinds[at] != .Name || c.world.tokens.texts[at] != "Result" ||
+                c.world.tokens.kinds[at + 1] != .Symbol || c.world.tokens.texts[at + 1] != "<" { continue }
+            c.body.cursor = at + 1
+            _ := result_arguments(&mut c)
+            if !c.ok {
+                // An expression involving a local Result can also start with
+                // '<'. The actual parser owns diagnostics for body syntax.
+                c.ok = true; c.error = ""; c.error_at = 0
+            }
+        }
+    }
+    c.types.self_type = -1
+    ft.finish_results(&mut c.types)
 }
 fn same(c: &mut Session, expected: i32, actual: i32) {
     if expected == actual { return }
@@ -2062,7 +2100,21 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
         postfix := c.world.tokens.texts[c.body.cursor].clone()
         if postfix.len != 1 { break }
         first := postfix[0]
-        if first != 46 && first != 91 && first != 40 { break }
+        if first != 46 && first != 91 && first != 40 && first != 63 { break }
+        if first == 63 {
+            if model.probing && decline_projection(&mut c, &mut model) { break }
+            question := c.body.cursor
+            skip_token(&mut c)
+            if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
+            c.body.places.current = place; c.body.places.source = at
+            c.body.expr.move_projection = projection_address; c.body.expr.move_temporary = temporary_root
+            if place == 0 && temporary_root >= 0 && projection_address < 0 { fc.produce_owner(&mut c.body.expr, temporary_root, ty) }
+            ty = propagate_result(&mut c, ty, question)
+            place = 0; materialized = 0; at = -1
+            temporary_root = c.body.expr.owner; projection_address = -1
+            fc.clear_rvalue_place(&mut c.body.place)
+            continue
+        }
         if ft.type_kind(&c.types, ty) == 4 {
             place = returned_place(&mut c, ty, first_token)
             ty = ft.type_base(&c.types, ty); at = first_token; pending = true; materialized = 0
@@ -2218,6 +2270,65 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
     c.body.depth = c.body.depth - 1; ty
 }
 fn enum_type(c: &Session, ty: i32) -> bool { ft.enum_type(&c.types, ty) }
+fn extract_result(c: &mut Session, ty: i32, value: i32, box: i32, at: i32) {
+    mut payload := -1
+    if value != 0 {
+        payload = slot(&mut c)
+        arm.load(&mut c.code, box)
+        place_step(&mut c, .Member, value, 0, i32(place_op.Member.Payload), 1, at)
+        if owned(&c, value) && !ft.move_only(&c.types, ty) { copy_value(&mut c, value) }
+        arm.store(&mut c.code, payload, 0)
+        if owned(&c, value) && ft.move_only(&c.types, ty) {
+            arm.load(&mut c.code, box)
+            store_mem(&mut c, 31, 0, 8)
+        }
+    }
+    arm.load(&mut c.code, box)
+    drop_value(&mut c, ty)
+    if payload >= 0 { arm.load(&mut c.code, payload) }
+}
+fn propagate_result(c: &mut Session, ty: i32, question: i32) -> i32 {
+    if !c.ok { return 0 }
+    if !ft.is_result(&c.types, ty) || !ft.is_result(&c.types, c.body.ret_type) {
+        fail(&mut c, "'?' requires a Result operand and a function returning Result")
+        c.error_at = c.world.tokens.starts[question]; return 0
+    }
+    failure := c.types.result_failure[ty]
+    if failure != c.types.result_failure[c.body.ret_type] || c.body.in_defer {
+        message := if c.body.in_defer { "'?' is not allowed inside defer" } else { "'?' requires the same error type as the enclosing Result" }
+        fail(&mut c, message)
+        c.error_at = c.world.tokens.starts[question]; return 0
+    }
+    take_value(&mut c, ty)
+    if !c.ok { return 0 }
+    success := c.types.result_success[ty]
+    if c.code.checking { return temporary(&mut c, success) }
+    box := slot(&mut c); arm.store(&mut c.code, box, 0)
+    place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Tag), 0, question)
+    ok := new_block(&mut c)
+    source_edge(&mut c, ok, .WhenFalse, question)
+    continuing := ownership.snapshot(&c.body.ownership)
+    if ty == c.body.ret_type {
+        arm.load(&mut c.code, box)
+    } else {
+        extract_result(&mut c, ty, failure, box, question)
+        if failure != 0 { arm.push_temp(&mut c.code, 0) }
+        size := if failure == 0 { 8 } else { 16 }
+        source := c.world.tokens.starts[question]
+        arm.allocate_value(&mut c.code, c.runtime.alloc, .EnumPayload, c.body.ret_type, size, source)
+        arm.enum_value(&mut c.code, 1, c.body.ret_type, 1, 1, source)
+        place_step(&mut c, .Member, c.body.ret_type, i32(borrows.Access.Address), i32(place_op.Member.TagWrite), 0, question)
+        if failure != 0 {
+            arm.pop_temp(&mut c.code, 1)
+            place_step(&mut c, .Member, failure, i32(borrows.Access.Address), i32(place_op.Member.Initialize), 1, question)
+        }
+    }
+    return_from_body(&mut c, question)
+    ownership.restore(&mut c.body.ownership, &continuing)
+    bind_block(&mut c, ok)
+    extract_result(&mut c, ty, success, box, question)
+    temporary(&mut c, success)
+}
 fn enumeration(c: &mut Session, ty: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     name := advance(&mut c)
     if !enum_type(&c, ty) { fail(&mut c, "enum variant needs a type"); return 0 }
@@ -2414,6 +2525,11 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         name := c.world.tokens.texts[token].clone()
         mut nominal := -1
         if found < 0 || (next == .Symbol && c.world.tokens.texts[token + 1] == "::") { nominal = resolve_type_name(&c, name) }
+        if found < 0 && name == "Result" && is(&c, "<") {
+            nominal = result_arguments(&mut c)
+            expect(&mut c, ".")
+            return enumeration(&mut c, nominal, &catalog, &mut inline_work, &mut model)
+        }
         if eat(&mut c, "::") {
             if nominal < 0 {
                 if name == "Self" { fail(&mut c, "Self is only valid inside an impl block") }
@@ -3204,7 +3320,7 @@ fn register_rhs(c: &Session, priority: i32) -> bool {
 fn rhs_ends_at(c: &Session, next_at: i32, priority: i32) -> bool {
     if next_at >= c.world.tokens.kinds.len { return false }
     next := c.world.tokens.texts[next_at].clone()
-    if next == "." || next == "[" || next == "(" { return false }
+    if next == "." || next == "[" || next == "(" || next == "?" { return false }
     rules.precedence(next) <= priority
 }
 fn signed_immediate_rhs(c: &mut Session, ty: i32, priority: i32, operator: string) -> bool {
@@ -3580,7 +3696,8 @@ struct PatternBindings { tokens: []i32, types: []i32, parents: []i32, offsets: [
 fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &mut PatternBindings, ty: i32, parent: i32, offset: i32, next: i32, depth: i32) -> i32 {
     if depth > 128 { fail(&mut c, "match pattern nesting exceeds 128"); return -1 }
     if eat(&mut c, "_") { return coverage.node(&mut patterns, -1) }
-    if depth > 0 && c.world.tokens.kinds[c.body.cursor] == .Name && c.world.tokens.texts[c.body.cursor + 1] != "." {
+    qualified_result := is(&c, "Result") && c.world.tokens.texts[c.body.cursor + 1] == "<"
+    if depth > 0 && c.world.tokens.kinds[c.body.cursor] == .Name && c.world.tokens.texts[c.body.cursor + 1] != "." && !qualified_result {
         bindings.tokens.push(c.body.cursor); bindings.types.push(ty)
         bindings.parents.push(parent); bindings.offsets.push(offset)
         skip_token(&mut c)
@@ -3588,10 +3705,15 @@ fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &m
     }
     if !enum_type(&c, ty) { fail(&mut c, "match pattern requires an enum"); return -1 }
     if !is(&c, ".") {
-        if c.world.tokens.kinds[c.body.cursor] != .Name || resolve_type_name(&c, peek(&c)) != ty {
+        mut actual := -1
+        if qualified_result { actual = type_name(&mut c) }
+        else if c.world.tokens.kinds[c.body.cursor] == .Name {
+            name := advance(&mut c)
+            actual = resolve_type_name(&c, name)
+        }
+        if !c.ok || actual != ty {
             fail(&mut c, "wrong enum in match pattern"); return -1
         }
-        skip_token(&mut c)
     }
     expect(&mut c, ".")
     if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected enum variant in match pattern"); return -1 }
@@ -4422,6 +4544,7 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
         if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "callback" { c.has_callbacks = true }
     }
     headers(&mut c, &module_starts, &module_files)
+    if c.ok { prepare_results(&mut c) }
     if c.ok { prepare_closures(&mut c) }
     if !c.ok { return session_fail_at(&mut c, c.error.clone(), c.error_at) }
     for f in 0..c.world.names.len {
@@ -4528,7 +4651,8 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
         }
         mut started: i64 = -1
         if c.bindings.profile.enabled { started = profile.begin(&c.bindings.profile) }
-        cache = fragments.context(&c.world.tokens,&c.world.starts,&c.world.ends,&c.world.function_owners,&c.types.opaque_owner,&c.types.type_owners,&c.world.module_caps,platform,globals,c.has_callbacks,policy)
+        cache = fragments.context(&c.world.tokens, &c.world.starts, &c.world.ends, &c.world.function_owners,
+            &c.types, &c.world.module_caps, platform, globals, c.has_callbacks, policy)
         if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 8, started, 1) }
     }
     c.jobs.globals = globals; c.jobs.main_id = main_id; c.jobs.platform = platform

@@ -99,6 +99,9 @@ immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
 `process.set_insert(&mut children, &mut child)` är ett fallibelt
 överföringsförsök: framgång lämnar barnet i mängden och tömmer källhandtaget;
 `-1` lämnar det oförändrat hos anroparen. Detta kräver ett skrivlån.
+`ChildSet.try_insert(move child)` tar emot ägaren och returnerar
+`Result<i32, Child>`. `.Ok` innehåller platsen i mängden. `.Err` ger
+tillbaka barnprocessens handtag till anroparen.
 
 Sockets, socketmängder, barnprocesser och barnprocessmängder är
 [`@resource`-typer](memory.md#unika-externa-resurser). De flyttas och kan

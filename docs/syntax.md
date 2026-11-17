@@ -51,6 +51,7 @@ delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggti
 | `&mut Point` | Ett exklusivt skrivlån som funktionsparameter. |
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
 | `Command` / `sys.ReadResult` | En nominell enum med namngivna värden eller payload-varianter. |
+| `Result<T, E>` | [Typad enum för framgång och fel](enums.md#typade-fel-med-result). |
 | `range` | Ett halvöppet intervall med `i32`-gränser. |
 | `TaskID<R>` | En kopierbar resultatnyckel till en [isolerad uppgift](tasks.md). |
 

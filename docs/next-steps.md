@@ -21,8 +21,10 @@ skrivning under ett aktivt kolumnlån.
 `@resource(dispose)`. Den följer ägaren genom flytt och körs synkront när
 ägaren släpps. TCP-handtagen och `StreamSet` använder den.
 
-Inför `Result<T, E>` och felpropagering. Ett anrop som misslyckas
-med att ta över en resurs behöver kunna lämna tillbaka den till anroparen.
+[`Result<T, E>` och felpropagering med `?`](enums.md#typade-fel-med-result)
+använder statiskt typade varianter. Ett prov verifierar att `.Err` kan
+lämna tillbaka en resurs och att stängning och `defer` följer returvägen.
+`ChildSet.try_insert` använder `Result<i32, Child>` för verkliga barnprocesser.
 
 ## Språk och standardbibliotek
 
