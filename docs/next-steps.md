@@ -33,7 +33,6 @@ Arbetet med Skrift och Hundmat har visat följande behov.
 - Förbättra heltalsinferens i arrayliteraler och inför flervärdesreturer.
   Se över namn som krockar med inbyggda egenskaper och när strängar
   behöver klonas vid `push`.
-- Visa operandvärden när en jämförelse i `assert` misslyckas.
 - Utöka stränginterpolering med format för exempelvis hexadecimala tal.
 - Samla `clamp`, `min`, `max` och trigonometriska funktioner i en
   matematikmodul.
@@ -43,6 +42,8 @@ Arbetet med Skrift och Hundmat har visat följande behov.
 läser decimaler till `f32` och `f64`.
 [`std.json`](standard.md#skriva-json) har flyttalsfält och en skrivare
 som sköter strukturen för objekt och arrayer.
+På nativa mål visar [en misslyckad jämförelse i `assert`](syntax.md#assertioner)
+båda operandvärdena, även för booleska testuttryck i `@test`.
 
 ### Körbara exempel i manifestet
 

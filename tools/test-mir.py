@@ -569,6 +569,8 @@ def main():
                     if checking or mode == 'reference': assert not any(report['mir'].values()), report
                     else:
                         functions = len(re.findall(r'\bfn\s+\w+', source))
+                        if name == 'float-owned-call':
+                            functions += 1  # Native comparison assertions call the float formatter.
                         assert report['mir']['functions'] == functions and report['mir']['operations'] > 0, (name, target, functions, report)
                     opt = report['optimization']
                     assert opt['enabled'] is (mode == 'opt' and not checking), report

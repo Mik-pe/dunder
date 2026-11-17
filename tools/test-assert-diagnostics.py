@@ -35,9 +35,10 @@ def host_target():
     raise RuntimeError(f'unsupported execution host {system}/{machine}')
 
 
-def diagnostic(path, source, expression, marker):
+def diagnostic(path, source, expression, marker, values=None):
     line = source[:source.index(marker)].count('\n') + 1
-    return f'{path}:{line}: assertion failed: {expression}\n'
+    operands = f'  left = {values[0]}\n  right = {values[1]}\n' if values else ''
+    return f'{path}:{line}: assertion failed: {expression}\n{operands}'
 
 
 def image_bytes(image, target):
@@ -137,8 +138,45 @@ fn main() { probe := support.Probe { value: 42 }; probe.fail(); print("unreachab
     interpolated.write_text(source)
     # Interpolation expands into synthetic tokens; its closing anchor must
     # still include the original quote at the end of the asserted expression.
-    error = diagnostic(interpolated, source, '"2" == f"{x}"', 'assert(')
+    error = diagnostic(interpolated, source, '"2" == f"{x}"', 'assert(', ('2', '1'))
     probe.matrix(interpolated, '', error, 104)
+
+
+def comparison_contracts(probe):
+    cases = (
+        ('once', '''
+fn next(count: &mut i32) -> i32 { count += 1; print(count); count }
+fn main() { mut count := 0; assert(((next(&mut count) == next(&mut count)))) }
+''', '((next(&mut count) == next(&mut count)))', '1\n2\n', ('1', '2')),
+        ('string_lease', '''
+fn change(text: &mut string) -> string { text = "ny" + " text"; text.clone() }
+fn main() { mut text := "äldre" + " text"; assert(text == change(&mut text)) }
+''', 'text == change(&mut text)', '', ('äldre text', 'ny text')),
+        ('float', '''
+fn main() { negative_zero := -0.0; assert(negative_zero > 1.5) }
+''', 'negative_zero > 1.5', '', ('-0.0', '1.5')),
+        ('unsigned', '''
+fn main() { maximum: u64 = 18446744073709551615; assert(maximum < 42) }
+''', 'maximum < 42', '', ('18446744073709551615', '42')),
+        ('bool', '''
+fn main() { assert((1 < 2) == false) }
+''', '(1 < 2) == false', '', ('true', 'false')),
+        ('rune', '''
+fn main() { high := `\\u{10ffff}` + `a`; assert(high == `a`) }
+''', 'high == `a`', '', ('1114208', '97')),
+        ('enum_tag', '''
+enum State { First = -42, Second = 42 }
+fn main() { assert(State.First == State.Second) }
+''', 'State.First == State.Second', '', ('-42', '42')),
+        ('pointer', '''
+capability unsafe
+fn main() { unsafe { assert(ptr(0) == ptr(1)) } }
+''', 'ptr(0) == ptr(1)', '', ('0', '1')),
+    )
+    for name, source, expression, stdout, values in cases:
+        path = probe.work / f'{name}.ddr'
+        path.write_text(source)
+        probe.matrix(path, stdout, diagnostic(path, source, expression, 'assert(', values), 104)
 
 
 def cache_contracts(probe, library):
@@ -184,7 +222,7 @@ def worker_contracts(probe):
     marker = 'assert(text.len == 2)'
     begin = text.index('fn worker7(')
     line = text[:text.index(marker, begin)].count('\n') + 1
-    error = f'{source}:{line}: assertion failed: text.len == 2\n'
+    error = f'{source}:{line}: assertion failed: text.len == 2\n  left = 0\n  right = 2\n'
     for target in TARGETS:
         for mode, flags in enumerate(MODES):
             images = []
@@ -202,7 +240,7 @@ def worker_contracts(probe):
 
 def test_contracts(probe, library):
     cases = probe.work / 'cases.ddr'
-    expression = '(value == 42 &&\n        /* å 🌍: implicit assertion */ value == 43)'
+    expression = '((value ==\n        /* å 🌍: implicit assertion */ 43))'
     text = '''import "./support å" as support
 @test fn implicit_failure() {
     value := 42
@@ -216,7 +254,7 @@ def test_contracts(probe, library):
     cases.write_text(text)
     root = probe.work / 'test_root.ddr'
     root.write_text('import cases\n@test fn survivor() { true }\n')
-    implicit = diagnostic(cases, text, expression, expression)
+    implicit = diagnostic(cases, text, expression, expression, ('42', '43'))
     explicit = diagnostic(library, LIBRARY, EXPRESSION, 'assert(')
     for mode, flags in enumerate(MODES):
         for workers in probe.workers:
@@ -248,7 +286,7 @@ def api_contracts(probe):
         probe.images += 1
         # The API receives source text, not a filename. Tokens must retain
         # its real lines and expression without inventing a disk path.
-        probe.execute(image, target, '', '<source>:3: assertion failed: 1==2\n', 104)
+        probe.execute(image, target, '', '<source>:3: assertion failed: 1==2\n  left = 1\n  right = 2\n', 104)
 
 
 def main():
@@ -272,13 +310,14 @@ def main():
         library.write_text(LIBRARY)
         probe = Probe(compiler, work, runners, workers)
         ordinary_contracts(probe, library)
+        comparison_contracts(probe)
         cache_contracts(probe, library)
         worker_contracts(probe)
         test_contracts(probe, library)
         api_contracts(probe)
         print(f'assert diagnostics: {probe.images} native images, {probe.executions} target executions '
               f'({", ".join(runners)}), {probe.cli_runs} CLI runs, {probe.test_suites} test suites; '
-              'exact imported locations/expressions, once-only conditions, silent success, '
+              'exact imported locations/expressions, once-only comparisons, silent success, '
               'workers, cache line shifts and direct API provenance passed')
 
 
