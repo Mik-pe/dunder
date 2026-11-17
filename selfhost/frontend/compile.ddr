@@ -249,9 +249,8 @@ fn task_scope_statement(c: &mut Session, catalog: &opt_inline.View, inline_work:
         arm.task_call(&mut c.code, c.tasks.open, .ScopeOpen, cap, 0, c.world.tokens.starts[at])
     }
     arm.store(&mut c.code, handle, 0)
-    after := c.world.closes[c.body.cursor] + 1; allowed := c.body.tail && terminal(&c, after, true)
     enter(&mut c); bind(&mut c, &mut model, move name, cap, false, handle, name_at)
-    block_body(&mut c, allowed, &catalog, &mut inline_work, &mut model)
+    scoped_body(&mut c, &catalog, &mut inline_work, &mut model)
 }
 fn task_spawn(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     may_invalidate_operand(&mut c)
@@ -337,11 +336,11 @@ fn expect(c: &mut Session, word: string) { if !eat(&mut c, word) { fail(&mut c, 
 fn separators(c: &mut Session) {
     while c.ok {
         kind := c.world.tokens.kinds[c.body.cursor]
-        if kind != .Newline && (kind != .Symbol || c.world.tokens.texts[c.body.cursor] != ";") { break }
+        if !lexer.is_newline(kind) && (kind != .Symbol || c.world.tokens.texts[c.body.cursor] != ";") { break }
         skip_token(&mut c)
     }
 }
-fn newlines(c: &mut Session) { while c.ok && c.world.tokens.kinds[c.body.cursor] == .Newline { skip_token(&mut c) } }
+fn newlines(c: &mut Session) { while c.ok && lexer.is_newline(c.world.tokens.kinds[c.body.cursor]) { skip_token(&mut c) } }
 fn check_type_error(c: &mut Session) {
     if c.types.error != "" { fail(&mut c, c.types.error.clone()); c.types.error = "" }
 }
@@ -694,6 +693,7 @@ fn install_owner(c: &mut Session, index: i32, ty: i32, source: i32) {
 }
 fn temporary(c: &mut Session, ty: i32) -> i32 {
     fc.clear_expr_value(&mut c.body.expr)
+    c.body.expr.untyped_exit = false
     // A fresh value has no provenance from the expressions which produced
     // it. In particular, a call result must not reuse an argument's view home.
     fc.clear_loan_eval(&mut c.body.loan)
@@ -704,6 +704,34 @@ fn cleanup_from(c: &mut Session, first: i32, only_temps: bool) {
     mut i := c.body.owned_slots.len - 1
     while i >= first {
         if c.body.owned_slots[i] >= 0 && (!only_temps || c.body.owner_temps[i]) { clear_owner(&mut c, c.body.owned_slots[i], c.body.owned_types[i]) }
+        i = i - 1
+    }
+}
+fn stage_owner(c: &mut Session, kind: fc.PendingKind, home: i32, ty: i32, member: i32) {
+    if c.code.checking { return }
+    if (kind == .Argument || kind == .Field) && !owned(&c, ty) { return }
+    c.body.pending.slots.push(home); c.body.pending.kinds.push(kind)
+    c.body.pending.types.push(ty); c.body.pending.members.push(member)
+}
+fn cleanup_pending(c: &mut Session, floor: i32) {
+    if !c.ok || c.code.checking { return }
+    mut i := c.body.pending.slots.len - 1
+    while i >= floor {
+        kind := c.body.pending.kinds[i]; ty := c.body.pending.types[i]
+        arm.load(&mut c.code, c.body.pending.slots[i])
+        if kind == .Storage {
+            // Recycled record/enum storage has uninitialized fields. Only
+            // entries for fields actually installed above it are dropped.
+            ownership_call(&mut c, .Drop, ty, c.runtime.release)
+        } else if kind == .Array {
+            // Length tracks initialized elements; callbacks normally go on
+            // the descriptor after element-type inference has finished.
+            if ty != 0 { array_element_helpers(&mut c, ty) }
+            arm.branch(&mut c.code, c.runtime.array_drop, 1)
+        } else {
+            if kind == .Field { place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), c.body.pending.members[i], c.body.cursor) }
+            drop_value(&mut c, ty)
+        }
         i = i - 1
     }
 }
@@ -1283,8 +1311,7 @@ fn foreign_call(c: &mut Session, sig: i32, catalog: &opt_inline.View, inline_wor
     if ret_c_record {
         ret_hfa = hfa(&c, ret, 0)
         if ret_hfa == 0 { fail(&mut c, "unsupported foreign aggregate result"); return 0 }
-        arm.imm(&mut c.code, 0, i64(ft.c_size(&c.types, ret))); arm.branch(&mut c.code, c.runtime.alloc_record, 1)
-        result_slot = slot(&mut c); arm.store(&mut c.code, result_slot, 0)
+        result_slot = slot(&mut c)
         indirect_result = c.code.platform == 2 && ft.c_size(&c.types, ret) > 16
     }
     mut spec := fa.ForeignCallSpec { ret: ret, ret_c_record: ret_c_record, ret_hfa: ret_hfa,
@@ -1334,6 +1361,11 @@ fn foreign_call(c: &mut Session, sig: i32, catalog: &opt_inline.View, inline_wor
     outgoing = (outgoing + 15) / 16 * 16
     if outgoing > 4080 { fail(&mut c, "C argument frame exceeds direct stack offset"); return 0 }
     if c.code.checking { return ret }
+    // An argument can leave the function before the call is reached.
+    if ret_c_record {
+        arm.imm(&mut c.code, 0, i64(ft.c_size(&c.types, ret))); arm.branch(&mut c.code, c.runtime.alloc_record, 1)
+        arm.store(&mut c.code, result_slot, 0)
+    }
     mut patches := fa.new_patches(0)
     fa.emit_foreign_call(&mut c.code, &spec, callee, &values, &locations,
         result_slot, indirect_result, gp, fp, outgoing, c.has_callbacks,
@@ -1601,7 +1633,7 @@ fn scoped_borrow_body(c: &Session, f: i32) -> bool {
         // Existing transient loans of named places need no new lifetime
         // constraint. Storage in a local, a range or a fresh expression does.
         mut before := i - 1
-        while before >= c.world.starts[f] && (c.world.tokens.kinds[before] == .Newline || c.world.tokens.texts[before] == "(") { before -= 1 }
+        while before >= c.world.starts[f] && (lexer.is_newline(c.world.tokens.kinds[before]) || c.world.tokens.texts[before] == "(") { before -= 1 }
         if before >= 0 && (c.world.tokens.texts[before] == ":=" || c.world.tokens.texts[before] == "=") { return true }
         mut at := i + 1
         if c.world.tokens.kinds[at] != .Name { return true }
@@ -1732,6 +1764,8 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
     if address >= 0 || wasm_sig >= 0 { task_edge(&mut c, -1) } else { task_edge(&mut c, f) }
     first := ft.type_start(&c.types, signature); count := ft.type_count(&c.types, signature)
     mut provided := args_in.len
+    pending := c.body.pending.slots.len
+    for arg in 0..provided { stage_owner(&mut c, .Argument, args_in[arg], ft.parameter_type(&c.types, first + arg), 0) }
     mut args: []i32 = []; mut arg_starts: []i32 = []; mut arg_places: []i32 = []; mut arg_sources: []i32 = []; mut effects: []i32 = []
     mut arg_roots: []i32 = []; mut arg_paths: []i32 = []
     for v in &args_in { args.push(v) }
@@ -1775,6 +1809,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
             }
         }
         index := slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index)
+        stage_owner(&mut c, .Argument, index, want, 0)
         mut root := source_root(&c, c.body.places.current); mut path := owner_path(&c, c.body.places.current)
         if c.body.loan.root >= 0 { root = c.body.loan.root; path = c.body.loan.path }
         arg_roots.push(root); arg_paths.push(path)
@@ -1782,6 +1817,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
         if !eat(&mut c, ",") { break }
     }
     expect(&mut c, ")"); if provided != count { fail(&mut c, "wrong argument count") }
+    fc.finish_pending(&mut c.body.pending, pending)
     if !c.ok { return 0 }
     effects.push(c.body.mutations.len)
     for arg in 0..provided {
@@ -1855,7 +1891,15 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
     mut ty := primary_inner(&mut c, expected, &catalog, &mut inline_work, &mut model, &mut place, &mut at, &mut pending)
     mut materialized := 0; mut projection_address := c.body.expr.move_projection
     mut temporary_root := c.body.expr.owner; if temporary_root < 0 { temporary_root = c.body.expr.move_temporary }
-    while c.ok && c.world.tokens.kinds[c.body.cursor] == .Symbol {
+    while c.ok {
+        if c.world.tokens.kinds[c.body.cursor] == .GroupedNewline && ty != 0 {
+            next := c.world.tokens.texts[c.body.cursor + 1].clone()
+            kind := ft.type_kind(&c.types, ty)
+            if next == "(" && kind != 8 && kind != 9 { break }
+            if next == "[" && ty != 4 && !collection(&c, ty) { break }
+            skip_token(&mut c)
+        }
+        if c.world.tokens.kinds[c.body.cursor] != .Symbol { break }
         postfix := c.world.tokens.texts[c.body.cursor].clone()
         if postfix.len != 1 { break }
         first := postfix[0]
@@ -2016,6 +2060,8 @@ fn enumeration(c: &mut Session, ty: i32, catalog: &opt_inline.View, inline_work:
     arm.allocate_value(&mut c.code, c.runtime.alloc, .EnumPayload, ty, (count + 1) * 8, source)
     index := slot(&mut c); arm.store(&mut c.code, index, 0); arm.enum_value(&mut c.code, 1, ty, variant, c.types.field_values[found], source)
     place_step(&mut c, .Member, ty, i32(borrows.Access.Address), i32(place_op.Member.TagWrite), 0, variant_at)
+    pending := c.body.pending.slots.len
+    stage_owner(&mut c, .Storage, index, ty, 0)
     if count > 0 {
         expect(&mut c, "(")
         for i in 0..count {
@@ -2024,9 +2070,11 @@ fn enumeration(c: &mut Session, ty: i32, catalog: &opt_inline.View, inline_work:
             actual := expression(&mut c, 0, pt, &catalog, &mut inline_work, &mut model); same(&mut c, pt, actual); take_value(&mut c, pt)
             arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, index)
             place_step(&mut c, .Member, pt, i32(borrows.Access.Address), i32(place_op.Member.Initialize), i + 1, payload_at)
+            stage_owner(&mut c, .Field, index, pt, i + 1)
         }
         expect(&mut c, ")")
     }
+    fc.finish_pending(&mut c.body.pending, pending)
     arm.load(&mut c.code, index); fc.clear_rvalue_place(&mut c.body.place); temporary(&mut c, ty)
 }
 // Block IDs are local to this function. Binding an edge to the ordered
@@ -2060,28 +2108,48 @@ fn assert_value(c: &mut Session, token: i32, first: i32, last: i32) {
     trap_edge(&mut c, c.assertion, .Jump, token)
     arm.mark(&mut c.code, done)
 }
-fn branch_value(c: &mut Session, expected: i32, braced: bool, arm_name: string, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
-    if braced { expect(&mut c, "{"); newlines(&mut c) }
-    ty := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
-    if !c.ok { return 0 }
-    if ty == 0 { fail(&mut c, arm_name + " must produce a value"); return 0 }
+fn arm_error(c: &mut Session, match_arm: bool, message: string) {
+    if match_arm { fail(&mut c, "match arm " + message) } else { fail(&mut c, "if branch " + message) }
+}
+fn yield_value(c: &mut Session, ty: i32, home: i32, match_arm: bool) {
+    if !c.ok { return }
+    if ty == 0 { arm_error(&mut c, match_arm, "must produce a value"); return }
     kind := ft.type_kind(&c.types, ty)
-    if kind == 4 || kind == 5 { fail(&mut c, arm_name + " cannot return a borrow"); return 0 }
-    if braced { newlines(&mut c); expect(&mut c, "}") }
-    // Move a temporary or copy a stored value on the path that produced it.
+    if kind == 4 || kind == 5 { arm_error(&mut c, match_arm, "cannot return a borrow"); return }
+    // Transfer before statement cleanup, deferred code and pattern bindings
+    // can release the producing local or overwrite the result register.
     take_value(&mut c, ty)
-    ty
+    arm.store(&mut c.code, home, 0)
 }
-fn joined_value(c: &mut Session, result: i32) -> i32 {
-    fc.clear_place_eval(&mut c.body.place)
-    return temporary(&mut c, result)
+// A zero result with c.ok means every path exits before reaching the join.
+fn branch_value(c: &mut Session, expected: i32, home: i32, match_arm: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    if match_arm && !is(&c, "{") {
+        live := ownership.falls_through(&c.body.ownership)
+        ty := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
+        if (ty == 0 && c.body.expr.untyped_exit) || (live && !ownership.falls_through(&c.body.ownership)) { return 0 }
+        yield_value(&mut c, ty, home, match_arm)
+        return ty
+    }
+    if !is(&c, "{") { fail(&mut c, "expected '{'"); return 0 }
+    previous := c.body.value_block; end := c.world.closes[c.body.cursor]
+    c.body.value_block = fc.ValueBlock { end: end, home: home, expected: expected, ty: 0, match_arm: match_arm }
+    ends := block(&mut c, false, &catalog, &mut inline_work, &mut model)
+    ty := c.body.value_block.ty
+    c.body.value_block = previous
+    if ends { return 0 }
+    if c.ok && ty == 0 {
+        arm_error(&mut c, match_arm, "must produce a value")
+        c.error_at = c.world.tokens.starts[end]
+    }
+    return ty
 }
-fn if_value(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+fn if_arms(c: &mut Session, expected: i32, home: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     done := new_block(&mut c)
     mut result := 0
     mut context := expected
     mut outcomes := ownership.new(); ownership.terminate(&mut outcomes)
     mut outcome_seen := false
+    mut falling_through := false
     while c.ok {
         condition_at := c.body.cursor
         condition := expression(&mut c, 0, 3, &catalog, &mut inline_work, &mut model)
@@ -2089,23 +2157,33 @@ fn if_value(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wo
         before_arm := ownership.snapshot(&c.body.ownership)
         otherwise := new_block(&mut c)
         source_edge(&mut c, otherwise, .WhenFalse, condition_at)
-        ty := branch_value(&mut c, context, true, "if branch", &catalog, &mut inline_work, &mut model)
-        if result == 0 { result = ty; context = ty } else { same(&mut c, result, ty) }
+        ty := branch_value(&mut c, context, home, false, &catalog, &mut inline_work, &mut model)
+        if ty != 0 {
+            if result == 0 { result = ty; context = ty } else { same(&mut c, result, ty) }
+        }
         accepted := ownership.snapshot(&c.body.ownership); prior := ownership.snapshot(&outcomes)
-        if outcome_seen { ownership.join(&mut outcomes, &prior, &accepted) }
+        if outcome_seen { join_statement_outcomes(&mut outcomes, &prior, !falling_through, &accepted, ty == 0) }
         else { ownership.restore(&mut outcomes, &accepted); outcome_seen = true }
+        falling_through = falling_through || ty != 0
         ownership.restore(&mut c.body.ownership, &before_arm)
         source_edge(&mut c, done, .Jump, c.body.cursor); bind_block(&mut c, otherwise)
         newlines(&mut c); expect(&mut c, "else")
         if !eat(&mut c, "if") { break }
     }
     if !c.ok { return 0 }
-    last := branch_value(&mut c, result, true, "if branch", &catalog, &mut inline_work, &mut model)
-    same(&mut c, result, last)
+    last := branch_value(&mut c, context, home, false, &catalog, &mut inline_work, &mut model)
+    if result == 0 { result = last } else if last != 0 { same(&mut c, result, last) }
     last_state := ownership.snapshot(&c.body.ownership)
-    ownership.join(&mut c.body.ownership, &outcomes, &last_state)
+    join_statement_outcomes(&mut c.body.ownership, &outcomes, !falling_through, &last_state, last == 0)
     bind_block(&mut c, done)
-    return joined_value(&mut c, result)
+    result
+}
+fn choice_arms(c: &mut Session, expected: i32, home: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    if eat(&mut c, "if") { return if_arms(&mut c, expected, home, &catalog, &mut inline_work, &mut model) }
+    expect(&mut c, "match")
+    mut result := 0
+    _ := match_arms(&mut c, expected, home, &mut result, &catalog, &mut inline_work, &mut model)
+    result
 }
 fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, place: &mut i32, at: &mut i32, pending: &mut bool) -> i32 {
     if !c.ok { return 0 }
@@ -2218,6 +2296,8 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             if ft.is_c_record(&c.types, nominal) { zero_record(&mut c, nominal, token) }
             else { arm.allocate_value(&mut c.code, c.runtime.alloc_record, .Record, nominal, ft.type_count(&c.types, nominal) * 8, c.world.tokens.starts[token]) }
             saved := slot(&mut c); arm.store(&mut c.code, saved, 0); mut provided: []bool = []
+            pending := c.body.pending.slots.len
+            stage_owner(&mut c, .Storage, saved, nominal, 0)
             for i in 0..ft.type_count(&c.types, nominal) { provided.push(false) }; separators(&mut c)
             while c.ok && !is(&c, "}") {
                 member_at := c.body.cursor; member := advance(&mut c); expect(&mut c, ":"); found := field(&c, nominal, member)
@@ -2231,19 +2311,20 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
                     arm.mov(&mut c.code,1,0); arm.pop_temp(&mut c.code,0); store_inline(&mut c, ty, member_at)
                 } else {
                     take_value(&mut c, ty); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, saved); place_step(&mut c, .Member, ty, i32(borrows.Access.Address), i32(place_op.Member.Initialize), offset, member_at)
+                    stage_owner(&mut c, .Field, saved, ty, offset)
                 }
                 if !eat(&mut c, ",") { break }; separators(&mut c)
             }
             separators(&mut c); expect(&mut c, "}")
             for present in provided { if !present { fail(&mut c, "missing constructor field") } }
+            fc.finish_pending(&mut c.body.pending, pending)
             arm.load(&mut c.code, saved); fc.clear_rvalue_place(&mut c.body.place); return temporary(&mut c, nominal)
         }
         if is(&c, "(") {
             if found >= 0 && ft.type_kind(&c.types, c.body.locals.types[found]) == 8 {
                 sig := c.body.locals.types[found]
                 expect(&mut c,"("); arm.load(&mut c.code,places.local_home(c.body.places.arena.locals[found])); result := foreign_call(&mut c,sig, &catalog, &mut inline_work, &mut model)
-                // C argument temporaries do not own the foreign result.
-                fc.clear_expr_value(&mut c.body.expr); return result
+                return temporary(&mut c, result)
             }
             if found >= 0 {
                 sig := c.body.locals.types[found]
@@ -2270,12 +2351,19 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         }
         fail(&mut c, "expected expression"); return 0
     }
-    if eat(&mut c, "if") { return if_value(&mut c, expected, &catalog, &mut inline_work, &mut model) }
-    if eat(&mut c, "match") {
-        mut result := 0
-        ignored := match_arms(&mut c, expected, &mut result, &catalog, &mut inline_work, &mut model)
+    if is(&c, "if") || is(&c, "match") {
+        home := slot(&mut c)
+        result := choice_arms(&mut c, expected, home, &catalog, &mut inline_work, &mut model)
         if !c.ok { return 0 }
-        return joined_value(&mut c, result)
+        fc.clear_place_eval(&mut c.body.place)
+        if result == 0 {
+            // An enclosing arm can still infer its type from a later sibling,
+            // even when parentheses surround this entire terminating choice.
+            ty := temporary(&mut c, expected); c.body.expr.untyped_exit = ty == 0
+            return ty
+        }
+        arm.load(&mut c.code, home)
+        return temporary(&mut c, result)
     }
     if eat(&mut c, "&") {
         may_invalidate_operand(&mut c) // Borrowed storage becomes visible to a receiver.
@@ -2348,9 +2436,12 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         allocation := arm.position(&c.code); source := c.world.tokens.starts[token]
         arm.intrinsic_call(&mut c.code, c.runtime.array_new, .ArrayNew, base, expected, source)
         saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
+        pending := c.body.pending.slots.len
+        stage_owner(&mut c, .Array, saved, base, 0)
         while c.ok && !is(&c, "]") {
             element_source := c.world.tokens.starts[c.body.cursor]
             ty := expression(&mut c, 0, base, &catalog, &mut inline_work, &mut model); if base == 0 { base = ty } else { same(&mut c, base, ty) }
+            if count == 0 && c.body.pending.slots.len > pending { c.body.pending.types[pending] = base }
             if count == 0 && eat(&mut c, ";") {
                 repeated = true; count = length_literal(&mut c)
                 if !ft.cloneable(&c.types, ty) { fail(&mut c, "resource values cannot be repeated or cloned"); return 0 }
@@ -2371,6 +2462,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         }
         expect(&mut c, "]"); arm.load(&mut c.code, saved); fc.clear_rvalue_place(&mut c.body.place)
         if base == 0 { fail(&mut c, "empty array needs an element type") }
+        fc.finish_pending(&mut c.body.pending, pending)
         mut ty := compound(&mut c, 1, base); if repeated || ft.type_kind(&c.types, expected) != 1 { ty = fixed(&mut c, base, count) }
         arm.finish_array_literal(&mut c.code, allocation, base, ty, unsigned.shift(storage_type(&c, base)), source)
         array_element_helpers(&mut c, base)
@@ -3059,7 +3151,7 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
                 if pending_save >= 0 && c.code.prefixing && model.recording && model.value >= 0 {
                     kind := model.nodes.kinds[model.value]
                     if kind == 1 || kind == 2 {
-                        c.code.prefix[pending_save] = row.copy(1, 0); spilled = false
+                        arm.replace_temp_push(&mut c.code, pending_save, 1, 0); spilled = false
                     }
                 }
                 if spilled { arm.pop_temp(&mut c.code, 1) }
@@ -3122,9 +3214,22 @@ fn move_loop_break(c: &mut Session) {
 fn move_loop_end(c: &mut Session, exit: &ownership.State) {
     ownership.loop_end(&mut c.body.ownership, &exit)
 }
-fn unwind_defers(c: &mut Session, floor: i32) {
-    if c.code.checking { return }
+fn begin_loop_scope(c: &mut Session, head: i32, end: i32) {
+    c.body.loop_heads.push(head); c.body.loop_ends.push(end)
+    c.body.loop_owners.push(c.body.owned_slots.len); c.body.loop_defers.push(c.body.defers.bodies.len)
+    c.body.loop_operands.push(c.code.operand_depth); c.body.loop_pending.push(c.body.pending.slots.len)
+    if c.tasks.program { c.body.loop_task_locals.push(c.body.locals.active.len) }
+}
+fn end_loop_scope(c: &mut Session) {
+    _ := c.body.loop_heads.pop(); _ := c.body.loop_ends.pop()
+    _ := c.body.loop_owners.pop(); _ := c.body.loop_defers.pop()
+    _ := c.body.loop_operands.pop(); _ := c.body.loop_pending.pop()
+    if c.tasks.program { _ := c.body.loop_task_locals.pop() }
+}
+fn unwind_exit(c: &mut Session, floor: i32, target_depth: i32) {
+    if !c.ok || c.code.checking { return }
     mut cleaned_to := c.body.owned_slots.len
+    mut depth := c.code.operand_depth
     mut d := c.body.defers.bodies.len - 1
     while d >= floor {
         limit := c.body.defers.owner_limits[d]
@@ -3134,6 +3239,10 @@ fn unwind_defers(c: &mut Session, floor: i32) {
             i = i - 1
         }
         cleaned_to = limit
+        // A defer runs at its registration height, both on fallthrough and
+        // when a nested operand exits through it. Older operands stay live.
+        arm.discard_operands(&mut c.code, depth, c.body.defers.operand_depths[d])
+        depth = c.body.defers.operand_depths[d]
         if c.body.defers.selector < 0 { c.body.defers.selector = slot(&mut c) }
         if c.body.defers.entries[d] < 0 { entry := new_block(&mut c); c.body.defers.entries[d] = entry }
         resume := new_block(&mut c)
@@ -3142,16 +3251,17 @@ fn unwind_defers(c: &mut Session, floor: i32) {
         source_edge(&mut c, c.body.defers.entries[d], .Defer, c.body.defers.bodies[d]); bind_block(&mut c, resume)
         d = d - 1
     }
+    arm.discard_operands(&mut c.code, depth, target_depth)
 }
 fn return_from_body(c: &mut Session, at: i32) {
-    if !c.code.checking && c.body.defers.bodies.len > 0 {
-        // All outgoing return edges share storage. The expression owner has
-        // already transferred to the result and the cleanup may clobber X0.
-        if c.body.ret_type != 0 {
-            if c.body.defers.return_slot < 0 { c.body.defers.return_slot = slot(&mut c) }
-            arm.store(&mut c.code, c.body.defers.return_slot, 0)
-        }
-        unwind_defers(&mut c, 0)
+    preserve := !c.code.checking && (c.body.defers.bodies.len > 0 || c.body.pending.slots.len > 0)
+    if preserve && c.body.ret_type != 0 {
+        if c.body.defers.return_slot < 0 { c.body.defers.return_slot = slot(&mut c) }
+        arm.store(&mut c.code, c.body.defers.return_slot, 0)
+    }
+    unwind_exit(&mut c, 0, 0)
+    if preserve {
+        cleanup_pending(&mut c, 0)
         if c.body.ret_type != 0 { arm.load(&mut c.code, c.body.defers.return_slot) }
         else { arm.imm(&mut c.code, 0, 0) }
     }
@@ -3174,6 +3284,16 @@ fn block(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, inline_
     enter(&mut c)
     block_body(&mut c, tail_allowed, &catalog, &mut inline_work, &mut model)
 }
+// A plain block, region, task scope or unsafe scope can supply the enclosing
+// block's tail. Loops and deferred bodies have their own fallthrough rules.
+fn scoped_body(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
+    end := c.world.closes[c.body.cursor]; enclosing := c.body.value_block.end
+    allowed := c.body.tail && terminal(&c, end + 1, true)
+    if ends_value_block(&c, end + 1) { c.body.value_block.end = end }
+    exits := block_body(&mut c, allowed, &catalog, &mut inline_work, &mut model)
+    c.body.value_block.end = enclosing
+    exits
+}
 // The region name and its body declarations share a lexical scope.
 fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     if !c.ok { return false }
@@ -3185,6 +3305,7 @@ fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, in
     if model.recording { body = typed.node(&mut model, 10, 0, -1, -1, -1, 0, -1, c.body.cursor) }
     expect(&mut c, "{"); separators(&mut c)
     mut returns := false
+    live_entry := ownership.falls_through(&c.body.ownership)
     while c.ok && !is(&c, "}") {
         if c.world.tokens.kinds[c.body.cursor] == .End { fail(&mut c, "unterminated block"); break }
         first_owner := c.body.owned_slots.len
@@ -3200,6 +3321,7 @@ fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, in
         body := c.body.defers.bodies.pop(); scope := c.body.defers.scopes.pop()
         owners := c.body.defers.owner_limits.pop(); locals := c.body.defers.local_limits.pop()
         entry := c.body.defers.entries.pop(); exits := c.body.defers.exits.pop()
+        _ := c.body.defers.operand_depths.pop()
         drop_locals_to(&mut c, locals, c.body.scope)
         if entry >= 0 {
             // Normal scope exit selects fallthrough.
@@ -3216,15 +3338,24 @@ fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, in
     expect(&mut c, "}"); leave(&mut c)
     model.value = body
     c.body.block_end = previous_end; c.body.tail = previous_tail; c.body.block_depth = c.body.block_depth - 1
-    returns
+    returns || (live_entry && !ownership.falls_through(&c.body.ownership))
 }
 fn terminal(c: &Session, after: i32, semicolons: bool) -> bool {
     mut pos := after
-    while pos < c.world.tokens.texts.len && (c.world.tokens.kinds[pos] == .Newline || (semicolons && c.world.tokens.texts[pos] == ";")) { pos = pos + 1 }
+    while pos < c.world.tokens.texts.len && (lexer.is_newline(c.world.tokens.kinds[pos]) || (semicolons && c.world.tokens.texts[pos] == ";")) { pos = pos + 1 }
     pos == c.body.block_end
 }
 fn end_statement(c: &mut Session) {
     if c.ok && !is(&c, "\n") && !is(&c, ";") && !is(&c, "}") && c.world.tokens.kinds[c.body.cursor] != .End { fail(&mut c, "expected newline or semicolon") }
+}
+fn ends_value_block(c: &Session, after: i32) -> bool {
+    c.body.value_block.end == c.body.block_end && terminal(&c, after, false)
+}
+fn nested_choice_tail(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
+    expected := c.body.value_block.expected; home := c.body.value_block.home
+    ty := choice_arms(&mut c, expected, home, &catalog, &mut inline_work, &mut model)
+    c.body.value_block.ty = ty
+    ty == 0
 }
 // A statement can be checked after an earlier terminal edge. Both ownership
 // snapshots are then globally unreachable, but only branches that fall through
@@ -3367,7 +3498,7 @@ fn bind_pattern(c: &mut Session, model: &mut opt_ir.Function, bindings: &mut Pat
 }
 fn match_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     mut unused_type := 0
-    match_arms(&mut c, -1, &mut unused_type, &catalog, &mut inline_work, &mut model)
+    match_arms(&mut c, -1, -1, &mut unused_type, &catalog, &mut inline_work, &mut model)
 }
 fn match_guard(c: &mut Session, first_owner: i32, first_borrow: i32, next: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) {
     newlines(&mut c)
@@ -3388,7 +3519,7 @@ fn match_guard(c: &mut Session, first_owner: i32, first_borrow: i32, next: i32, 
 }
 // A nonnegative context requests an expression. Its first arm sets the type
 // for the remaining arms. Statement matches keep their block and return rules.
-fn match_arms(c: &mut Session, context: i32, result_type: &mut i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
+fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     consuming := eat(&mut c, "move")
     ty := expression(&mut c, 0, 0, &catalog, &mut inline_work, &mut model)
     if !enum_type(&c, ty) { fail(&mut c, "match requires an enum"); return false }
@@ -3402,8 +3533,6 @@ fn match_arms(c: &mut Session, context: i32, result_type: &mut i32, catalog: &op
         if owned(&c, ty) { save_owner(&mut c, saved, ty, true) } else { arm.store(&mut c.code, saved, 0) }
     }
     if !is(&c, "{") { fail(&mut c, "expected match arms"); return false }
-    mut value_slot := -1
-    if context >= 0 { value_slot = slot(&mut c) }
     tail := context < 0 && c.body.tail && terminal(&c, c.world.closes[c.body.cursor] + 1, true)
     expect(&mut c, "{"); separators(&mut c)
     mut patterns := coverage.new(ft.type_count(&c.types, ty))
@@ -3441,12 +3570,12 @@ fn match_arms(c: &mut Session, context: i32, result_type: &mut i32, catalog: &op
         if context >= 0 {
             mut expected := context
             if result_type != 0 { expected = result_type }
-            braced := is(&c, "{")
-            value := branch_value(&mut c, expected, braced, "match arm", &catalog, &mut inline_work, &mut model)
+            value := branch_value(&mut c, expected, home, true, &catalog, &mut inline_work, &mut model)
             if !c.ok { return false }
-            if result_type == 0 { result_type = value } else { same(&mut c, result_type, value) }
-            // Dropping pattern bindings can clobber the result register.
-            arm.store(&mut c.code, value_slot, 0)
+            ends = value == 0
+            if !ends {
+                if result_type == 0 { result_type = value } else { same(&mut c, result_type, value) }
+            }
         } else if is(&c, "{") { ends = block(&mut c, tail, &catalog, &mut inline_work, &mut model) }
         else {
             arm_at := c.body.cursor; mut expected := 0; if tail { expected = c.body.ret_type }
@@ -3474,7 +3603,6 @@ fn match_arms(c: &mut Session, context: i32, result_type: &mut i32, catalog: &op
     }
     ownership.restore(&mut c.body.ownership, &outcomes)
     if borrowed_subject { _ := c.body.for_locks.pop() }
-    if context >= 0 && c.ok { arm.load(&mut c.code, value_slot) }
     returns
 }
 // C layouts are already resolved by the header pass. Only value fields may
@@ -3494,8 +3622,7 @@ fn scratch_block(c:&mut Session, catalog: &opt_inline.View, inline_work: &mut op
     save_owner(&mut c,area,4,false)
     enter(&mut c);bind(&mut c, &mut model,move name,token,false,area, name_at)
     if !is(&c,"{"){fail(&mut c,"expected region body");return false}
-    after:=c.world.closes[c.body.cursor]+1;allowed:=c.body.tail && terminal(&c,after,true)
-    ends:=block_body(&mut c,allowed, &catalog, &mut inline_work, &mut model)
+    ends:=scoped_body(&mut c, &catalog, &mut inline_work, &mut model)
     clear_owner(&mut c,area,4)
     ends
 }
@@ -3536,12 +3663,16 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         task_effect(&mut c, 16)
         if !c.world.unsafe_capable { fail(&mut c, "module requires capability unsafe"); return false }
         previous := c.body.unsafe_scope; c.body.unsafe_scope = true
-        after := c.world.closes[c.body.cursor] + 1; allowed := c.body.tail && terminal(&c, after, true)
-        result := block(&mut c, allowed, &catalog, &mut inline_work, &mut model); c.body.unsafe_scope = previous; return result
+        enter(&mut c)
+        result := scoped_body(&mut c, &catalog, &mut inline_work, &mut model); c.body.unsafe_scope = previous; return result
     }
-    if is(&c, "match") && !lookahead.continues_expression(&c.world.tokens, lookahead.match_end(&c.world.tokens, &c.world.closes, &c.types, &c.body.locals, c.body.cursor + 1, 0)) {
-        c.body.cursor = c.body.cursor + 1
-        return match_statement(&mut c, &catalog, &mut inline_work, &mut model)
+    if is(&c, "match") {
+        after := lookahead.match_end(&c.world.tokens, &c.world.closes, &c.types, &c.body.locals, c.body.cursor + 1, 0)
+        if ends_value_block(&c, after) { return nested_choice_tail(&mut c, &catalog, &mut inline_work, &mut model) }
+        if !lookahead.continues_expression(&c.world.tokens, after) {
+            c.body.cursor = c.body.cursor + 1
+            return match_statement(&mut c, &catalog, &mut inline_work, &mut model)
+        }
     }
     if eat(&mut c, "return") {
         if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
@@ -3556,6 +3687,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
     }
     if is(&c, "if") {
         after := lookahead.conditional_end(&c.world.tokens, &c.world.closes, &c.types, &c.body.locals, c.body.cursor + 1)
+        if ends_value_block(&c, after) { return nested_choice_tail(&mut c, &catalog, &mut inline_work, &mut model) }
         if !lookahead.continues_expression(&c.world.tokens, after) {
             c.body.cursor = c.body.cursor + 1
             allowed := c.body.tail && terminal(&c, after, true)
@@ -3567,12 +3699,12 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         previous_reentry := c.body.reenter_owners; c.body.reenter_owners = true
         condition_at := c.body.cursor
         head := new_block(&mut c); done := new_block(&mut c); bind_block(&mut c, head)
+        begin_loop_scope(&mut c, head, done)
         ty := expression(&mut c, 0, 3, &catalog, &mut inline_work, &mut model); same(&mut c, 3, ty); source_edge(&mut c, done, .WhenFalse, condition_at); body := new_block(&mut c); bind_block(&mut c, body)
         condition := model.value
         loop_exit := ownership.snapshot(&c.body.ownership)
-        if c.tasks.program { c.body.loop_task_locals.push(c.body.locals.active.len) }
-        c.body.loop_heads.push(head); c.body.loop_ends.push(done); c.body.loop_owners.push(c.body.owned_slots.len); c.body.loop_defers.push(c.body.defers.bodies.len)
-        ends := block(&mut c, false, &catalog, &mut inline_work, &mut model); old_defers := c.body.loop_defers.pop(); old_owners := c.body.loop_owners.pop(); old_head := c.body.loop_heads.pop(); old_end := c.body.loop_ends.pop(); if c.tasks.program { task_boundary := c.body.loop_task_locals.pop() }
+        ends := block(&mut c, false, &catalog, &mut inline_work, &mut model)
+        end_loop_scope(&mut c)
         move_loop_backedge(&mut c); move_loop_end(&mut c, &loop_exit)
         source_edge(&mut c, head, .Jump, c.body.cursor); bind_block(&mut c, done)
         c.body.reenter_owners = previous_reentry
@@ -3690,9 +3822,9 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
             }
         }
         if locked_local >= 0 { c.body.for_locks.push(locked_local) }
-        if c.tasks.program { c.body.loop_task_locals.push(c.body.locals.active.len) }
-        c.body.loop_heads.push(next); c.body.loop_ends.push(done); c.body.loop_owners.push(c.body.owned_slots.len); c.body.loop_defers.push(c.body.defers.bodies.len)
-        ends := block(&mut c, false, &catalog, &mut inline_work, &mut model); old_defers := c.body.loop_defers.pop(); old_owners := c.body.loop_owners.pop(); old_head := c.body.loop_heads.pop(); old_end := c.body.loop_ends.pop(); if c.tasks.program { task_boundary := c.body.loop_task_locals.pop() }
+        begin_loop_scope(&mut c, next, done)
+        ends := block(&mut c, false, &catalog, &mut inline_work, &mut model)
+        end_loop_scope(&mut c)
         if model.recording { _ := typed.node(&mut model, 19, 0, low_node, high_node, model.value, 0, iterator, at) }
         if locked_local >= 0 { unlocked := c.body.for_locks.pop() }
         bind_block(&mut c, next)
@@ -3710,7 +3842,9 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         if name == "continue" { action = .Continue; target = c.body.loop_heads[c.body.loop_heads.len - 1] }
         if model.recording { mut kind := 16; if name == "continue" { kind = 17 }; _ := typed.node(&mut model, kind, 0, -1, -1, -1, 0, -1, at) }
         if name == "continue" { move_loop_backedge(&mut c) } else { move_loop_break(&mut c) }
-        unwind_defers(&mut c, c.body.loop_defers[c.body.loop_defers.len - 1])
+        loop := c.body.loop_heads.len - 1
+        unwind_exit(&mut c, c.body.loop_defers[loop], c.body.loop_operands[loop])
+        cleanup_pending(&mut c, c.body.loop_pending[loop])
         if c.tasks.program { task_close_locals(&mut c, c.body.loop_task_locals[c.body.loop_task_locals.len - 1]) }
         cleanup_from(&mut c, c.body.loop_owners[c.body.loop_owners.len - 1], false); source_edge(&mut c, target, action, exit_at)
         ownership.terminate(&mut c.body.ownership)
@@ -3731,12 +3865,14 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
                 }
             }
         }
-        deferred.register(&mut c.body.defers, c.body.cursor, c.body.scope, c.body.owned_slots.len, c.body.locals.active.len)
+        deferred.register(&mut c.body.defers, c.body.cursor, c.body.scope, c.body.owned_slots.len, c.body.locals.active.len, c.code.operand_depth)
         skip_body(&mut c)
         end_statement(&mut c)
         return false
     }
-    if is(&c, "{") { after := c.world.closes[c.body.cursor] + 1; allowed := c.body.tail && terminal(&c, after, true); return block(&mut c, allowed, &catalog, &mut inline_work, &mut model) }
+    if is(&c, "{") {
+        enter(&mut c); return scoped_body(&mut c, &catalog, &mut inline_work, &mut model)
+    }
     value_statement(&mut c, &catalog, &mut inline_work, &mut model)
 }
 fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
@@ -3753,7 +3889,11 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         if eat(&mut c, ":") { expected = type_name(&mut c); expect(&mut c, "=") } else { expect(&mut c, ":=") }
         ty := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
         if expected != 0 { same(&mut c, expected, ty) }
-        if ty == 0 { fail(&mut c, "local requires a value") }
+        if ty == 0 {
+            if c.body.expr.untyped_exit { fail(&mut c, "cannot infer a value type when every branch exits") }
+            else { fail(&mut c, "local requires a value") }
+            return false
+        }
         kind := ft.type_kind(&c.types, ty)
         path := c.body.loan.path; root := c.body.loan.root; origin := c.body.loan.origin
         if kind == 5 { fail(&mut c, "local mutable borrows are not supported"); return false }
@@ -3780,7 +3920,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
     }
     mut ty := 0; mut place := 0
     if binding >= 0 && c.world.tokens.kinds[at + 2] == .Name && c.world.tokens.texts[at + 2] == c.world.tokens.texts[at] &&
-        (c.world.tokens.kinds[at + 3] == .Newline || c.world.tokens.texts[at + 3] == ";" || c.world.tokens.texts[at + 3] == "}") {
+        (lexer.is_newline(c.world.tokens.kinds[at + 3]) || c.world.tokens.texts[at + 3] == ";" || c.world.tokens.texts[at + 3] == "}") {
         if !c.body.locals.mutable[binding] && ft.type_kind(&c.types, c.body.locals.types[binding]) != 5 { fail(&mut c, "assignment requires a mutable stored value"); return false }
         if !ownership.available(&c.body.ownership, ownership.root_id(&c.body.ownership, binding)) { fail(&mut c, "use of moved value '" + c.body.locals.names[binding] + "'"); return false }
         c.body.cursor = at + 3
@@ -3796,7 +3936,9 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         fc.clear_expr_value(&mut c.body.expr)
         if model.recording { typed.read(&mut model, binding, at) }
     } else {
-        ty = expression(&mut c, 0, c.body.ret_type, &catalog, &mut inline_work, &mut model)
+        mut expected := c.body.ret_type
+        if c.body.value_block.end == c.body.block_end { expected = c.body.value_block.expected }
+        ty = expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
         place = c.body.places.current
     }
     mut compound_op := ""
@@ -3869,6 +4011,12 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         if owned(&c, ty) { place_address(&mut c, place, direct, assignment_at); place_transfer(&mut c, ty, 0, 0, true, false, 2, assignment_at); drop_value(&mut c, ty) }
         place_address(&mut c, place, direct, assignment_at); arm.pop_temp(&mut c.code, 1); place_transfer(&mut c, ty, 1, 0, false, false, i32(borrows.Access.Address), assignment_at)
         end_statement(&mut c); return false
+    }
+    if ends_value_block(&c, c.body.cursor) {
+        if ty == 0 { return c.body.expr.untyped_exit }
+        home := c.body.value_block.home; match_arm := c.body.value_block.match_arm
+        yield_value(&mut c, ty, home, match_arm); c.body.value_block.ty = ty
+        return false
     }
     if c.body.tail && terminal(&c, c.body.cursor, false) && c.body.ret_type != 0 {
         if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
@@ -5427,6 +5575,7 @@ fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
 fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace) {
     if c.inline_enabled { fragments.reset_dependencies(&mut c.body.inline_deps) }
     fc.reset_body(&mut c.body)
+    c.code.operand_depth = 0
     c.body.current_owner = c.world.function_owners[f]
     c.body.self_type = c.world.impl_types[f]
     c.types.self_type = c.world.impl_types[f]

@@ -1,7 +1,9 @@
 import std.map as map
 import std.bytes as bytes
 
-pub enum Kind { End, Name, Keyword, Integer, Float, String, Rune, Symbol, Newline, Byte }
+pub enum Kind { End, Name, Keyword, Integer, Float, String, Rune, Symbol, Newline, Byte, GroupedNewline }
+pub fn is_newline(kind: Kind) -> bool { kind == .Newline || kind == .GroupedNewline }
+enum BraceLines { Expression, Statements, Fields, Arms }
 pub struct Tokens {
     intern: bool, store_ends: bool, source: string, kinds: []Kind,
     texts: []string,
@@ -15,6 +17,7 @@ pub struct Tokens {
 }
 struct Scanner {
     source: string, cursor: i32, parens: i32, formats: i32, ok: bool, error: string, error_at: i32,
+    chain_dot: i32, chain_indent: i32, brace_parens: []i32, brace_lines: []BraceLines, closed_record: bool,
 }
 fn ascii_char(byte: i32) -> string {
     if byte < 48 {
@@ -93,6 +96,112 @@ fn fail(scanner: &mut Scanner, move message: string) {
 }
 fn digit(byte: i32) -> bool { byte >= 48 && byte <= 57 }
 fn alpha(byte: i32) -> bool { (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte >= 128 }
+fn indentation(source: string, at: i32) -> i32 {
+    mut start := at
+    while start > 0 && source[start - 1] != 10 { start -= 1 }
+    mut width := 0
+    for i in start..at {
+        if source[i] == 32 { width += 1 }
+        else if source[i] == 9 { width += 8 - width % 8 }
+        else { break }
+    }
+    width
+}
+fn can_end_receiver(tokens: &Tokens, at: i32) -> bool {
+    kind := tokens.kinds[at]
+    if kind == .Keyword { return tokens.texts[at] == "true" || tokens.texts[at] == "false" }
+    if kind == .Symbol { return tokens.texts[at] == ")" || tokens.texts[at] == "]" || tokens.texts[at] == "}" }
+    kind == .Name || kind == .Integer || kind == .Float || kind == .String || kind == .Byte || kind == .Rune
+}
+fn before_newlines(tokens: &Tokens, end: i32) -> i32 {
+    mut at := end
+    while at > 0 && is_newline(tokens.kinds[at - 1]) { at -= 1 }
+    at
+}
+fn discard_trailing_newlines(tokens: &mut Tokens, end: i32) {
+    while tokens.kinds.len > end {
+        _ := tokens.kinds.pop(); _ := tokens.texts.pop(); _ := tokens.starts.pop()
+        if tokens.store_ends { _ := tokens.ends.pop() }
+        if tokens.intern { _ := tokens.ids.pop() }
+    }
+}
+// A more deeply indented leading dot continues the current logical line.
+// Keep the previous joined dot as a checkpoint so long chains scan linearly.
+fn continue_member(scanner: &mut Scanner, tokens: &mut Tokens) {
+    end := before_newlines(&tokens, tokens.kinds.len)
+    if end == tokens.kinds.len { return }
+    if end == 0 || !can_end_receiver(&tokens, end - 1) { return }
+    mut first := end - 1
+    while first > 0 && first > scanner.chain_dot {
+        kind := tokens.kinds[first - 1]
+        if is_newline(kind) || kind == .End || (kind == .Symbol && tokens.texts[first - 1] == ";") { break }
+        first -= 1
+    }
+    mut base := scanner.chain_indent
+    if first != scanner.chain_dot { base = indentation(scanner.source, tokens.starts[first]) }
+    if indentation(scanner.source, scanner.cursor) <= base { return }
+    discard_trailing_newlines(&mut tokens, end)
+    scanner.chain_dot = end; scanner.chain_indent = base
+}
+fn statement_lines(scanner: &Scanner, tokens: &Tokens) -> bool {
+    if scanner.parens != 0 { return false }
+    if scanner.brace_lines.len == 0 { return true }
+    lines := scanner.brace_lines[scanner.brace_lines.len - 1]
+    if lines == .Statements { return true }
+    if lines == .Fields || lines == .Arms || tokens.kinds.len == 0 { return false }
+    last := tokens.kinds.len - 1
+    is_newline(tokens.kinds[last]) || can_end_receiver(&tokens, last)
+}
+fn grouped_brace(scanner: &mut Scanner, tokens: &mut Tokens, symbol: string) {
+    top := scanner.brace_lines.len - 1
+    if top >= 0 && scanner.parens == 0 && scanner.brace_lines[top] == .Expression {
+        // A group can already contain a single expression split before its
+        // operators, call or subscript. Explicit statements have normal line
+        // boundaries. A call can return a value or finish a statement with
+        // no value. Keep that choice for the typed parser when the next token
+        // can both continue the receiver and start a new expression.
+        if symbol != "!" && symbol != "&" && tokens.kinds.len > 0 && tokens.kinds[tokens.kinds.len - 1] == .Newline {
+            end := before_newlines(&tokens, tokens.kinds.len)
+            ambiguous := symbol == "(" || symbol == "[" || symbol == "-" || symbol == "."
+            mut previous := ""
+            if end > 0 && tokens.kinds[end - 1] == .Symbol { previous = tokens.texts[end - 1].clone() }
+            if ambiguous && previous == ")" {
+                discard_trailing_newlines(&mut tokens, end + 1); tokens.kinds[end] = .GroupedNewline
+            } else if symbol != "." || previous != "}" || scanner.closed_record {
+                discard_trailing_newlines(&mut tokens, end)
+            }
+        }
+    }
+    if symbol == "{" {
+        if scanner.parens > 0 || scanner.brace_parens.len > 0 {
+            scanner.brace_parens.push(scanner.parens); scanner.brace_lines.push(.Expression)
+            scanner.parens = 0
+        }
+        return
+    }
+    if scanner.brace_parens.len == 0 { return }
+    if symbol == "}" {
+        scanner.closed_record = scanner.brace_lines[top] == .Fields
+        scanner.parens = scanner.brace_parens.pop(); _ := scanner.brace_lines.pop()
+        return
+    }
+    if scanner.parens != 0 { return }
+    if symbol == "=" || symbol == ":=" || symbol == "+=" || symbol == "-=" || symbol == "*=" || symbol == "/=" || symbol == "%=" || symbol == ";" {
+        // `{ name: Type = ...` starts a block with a typed declaration.
+        scanner.brace_lines[top] = .Statements
+    } else if symbol == "=>" {
+        scanner.brace_lines[top] = .Arms
+    } else if symbol == ":" && scanner.brace_lines[top] == .Expression {
+        // `{ name: expression, ... }` is a record initializer. Preserve the
+        // surrounding group's whitespace in its fields, including before ':'.
+        end := before_newlines(&tokens, tokens.kinds.len)
+        if end == 0 || (tokens.kinds[end - 1] != .Name && tokens.kinds[end - 1] != .Keyword) { return }
+        open := before_newlines(&tokens, end - 1)
+        if open > 0 && tokens.kinds[open - 1] == .Symbol && tokens.texts[open - 1] == "{" {
+            discard_trailing_newlines(&mut tokens, end); scanner.brace_lines[top] = .Fields
+        }
+    }
+}
 fn hex(byte: i32) -> i32 {
     if digit(byte) { return byte - 48 }
     if byte >= 65 && byte <= 70 { return byte - 65 + 10 }
@@ -389,7 +498,7 @@ fn scan_one(scanner: &mut Scanner, tokens: &mut Tokens) {
     if start + 1 < scanner.source.len { next = scanner.source[start + 1] }
     if byte == 10 {
         scanner.cursor = start + 1
-        if scanner.parens == 0 { emit(&mut tokens, .Newline, "\n", start, scanner.cursor) }
+        if statement_lines(&scanner, &tokens) { emit(&mut tokens, .Newline, "\n", start, scanner.cursor) }
     } else if byte == 32 || byte == 9 || byte == 13 {
         scanner.cursor = start + 1
         while scanner.cursor < scanner.source.len && scanner.source[scanner.cursor] == byte { scanner.cursor = scanner.cursor + 1 }
@@ -404,7 +513,7 @@ fn scan_one(scanner: &mut Scanner, tokens: &mut Tokens) {
             else if pos + 1 < scanner.source.len && scanner.source[pos] == 42 && scanner.source[pos + 1] == 47 { depth = depth - 1; scanner.cursor = pos + 2 }
             else {
                 scanner.cursor = pos + 1
-                if scanner.source[pos] == 10 && scanner.parens == 0 { emit(&mut tokens, .Newline, "\n", pos, pos + 1) }
+                if scanner.source[pos] == 10 && statement_lines(&scanner, &tokens) { emit(&mut tokens, .Newline, "\n", pos, pos + 1) }
             }
         }
         if depth != 0 { fail(&mut scanner, "unterminated block comment") }
@@ -415,6 +524,13 @@ fn scan_one(scanner: &mut Scanner, tokens: &mut Tokens) {
         scanner.cursor = start + 1
         while scanner.cursor < scanner.source.len && (alpha(scanner.source[scanner.cursor]) || digit(scanner.source[scanner.cursor])) { scanner.cursor = scanner.cursor + 1 }
         emit(&mut tokens, .Name, scanner.source[start..scanner.cursor], start, scanner.cursor)
+        if scanner.parens == 0 && scanner.brace_lines.len > 0 && scanner.brace_lines[scanner.brace_lines.len - 1] == .Expression {
+            at := tokens.kinds.len - 1; word := tokens.texts[at].clone()
+            if word == "return" || word == "break" || word == "continue" || word == "mut" || word == "defer" || word == "for" || word == "while" ||
+                (at > 0 && tokens.kinds[at - 1] == .Newline && word != "if" && word != "else") {
+                scanner.brace_lines[scanner.brace_lines.len - 1] = .Statements
+            }
+        }
     } else if digit(byte) { number(&mut scanner, &mut tokens) }
     else {
         mut symbol := ""
@@ -430,6 +546,10 @@ fn scan_one(scanner: &mut Scanner, tokens: &mut Tokens) {
         }
         if symbol == "" { symbol = ascii_char(byte) }
         if symbol == "" { fail(&mut scanner, "unexpected character"); return }
+        // A brace opens a new statement/field list even inside a grouped
+        // expression. Its closing brace resumes the surrounding group.
+        if scanner.brace_parens.len > 0 || (byte == 123 && scanner.parens > 0) { grouped_brace(&mut scanner, &mut tokens, symbol) }
+        if byte == 46 && next != 46 && tokens.kinds.len > 0 && tokens.kinds[tokens.kinds.len - 1] == .Newline { continue_member(&mut scanner, &mut tokens) }
         if byte == 40 || byte == 91 { scanner.parens = scanner.parens + 1 }
         if (byte == 41 || byte == 93) && scanner.parens > 0 { scanner.parens = scanner.parens - 1 }
         scanner.cursor = start + symbol.len
@@ -446,12 +566,18 @@ pub fn scan(source: string, intern: bool) -> Tokens {
     scan_into(source, &mut tokens)
     tokens
 }
+fn scanner_at(source: string, offset: i32) -> Scanner {
+    Scanner {
+        source: source.clone(), cursor: offset, parens: 0, formats: 0, ok: true, error: "", error_at: 0,
+        chain_dot: -1, chain_indent: 0, brace_parens: [], brace_lines: [], closed_record: false,
+    }
+}
 // Expanded string interpolation can anchor its last synthetic token inside an
 // original literal. Scan from the expression's first token through that anchor
 // so the literal remains one lexical unit; never consume a following statement.
 pub fn span_end(source: string, first: i32, last: i32) -> i32 {
     if first < 0 || first >= source.len || last < first || last >= source.len || (source[first] >= 128 && source[first] < 192) { return first }
-    mut scanner := Scanner { source: source.clone(), cursor: first, parens: 0, formats: 0, ok: true, error: "", error_at: 0 }
+    mut scanner := scanner_at(source, first)
     mut tokens := empty(false)
     while scanner.cursor <= last && scanner.ok { scan_one(&mut scanner, &mut tokens) }
     if !scanner.ok { return first }
@@ -465,7 +591,7 @@ pub fn scan_into(source: string, tokens: &mut Tokens) {
     // A single scan retains its original spelling for source diagnostics.
     // Appended files have independent offsets and need the loader's source map.
     if tokens.kinds.len == 0 { tokens.source = source.clone() } else { tokens.source = "" }
-    mut scanner := Scanner { source: source.clone(), cursor: 0, parens: 0, formats: 0, ok: true, error: "", error_at: 0 }
+    mut scanner := scanner_at(source, 0)
     if tokens.kinds.len == 0 {
         est := source.len / 4 + 8
         tokens.kinds.reserve(est); tokens.texts.reserve(est)
@@ -507,6 +633,37 @@ pub fn scan_into(source: string, tokens: &mut Tokens) {
     token_end("å", 1) == 1
     token_end("", 0) == 0
     token_end("name", -1) == -1
+}
+@test fn leading_dots_keep_source_spans_and_statement_boundaries() {
+    source := "    input\r\n\t.link() /* left\nright */\n        .value\n    .variant;\n            .separate\n        ..limit"
+    tokens := lex(source)
+    expected := ["input", ".", "link", "(", ")", ".", "value", "\n", ".", "variant", ";", "\n", ".", "separate", "\n", "..", "limit", ""]
+    tokens.ok && tokens.kinds.len == expected.len
+    tokens.starts.len == expected.len && tokens.ends.len == expected.len && tokens.ids.len == expected.len
+    for i in 0..expected.len {
+        tokens.texts[i] == expected[i]
+        source[tokens.starts[i]..tokens.ends[i]] == expected[i]
+    }
+    mut compact := empty(false); compact.store_ends = false
+    scan_into("first\n", &mut compact)
+    scan_into("\n        .new_file", &mut compact)
+    compact.kinds[2] == .End && compact.kinds[3] == .Newline
+    compact.kinds[4] == .Symbol && compact.starts[4] == 9
+    compact.ends.len == 0 && compact.ids.len == 0
+}
+@test fn grouped_braces_keep_statement_lines_and_restore_surrounding_whitespace() {
+    source := "f([if v { a: i32 = 1\na } else { 0 }\n, r { x\n:\ng\n(0)\n+ 1\n, y: if q { b := 2/*\n*/b } else { 0 }\n }\n])\n"
+    tokens := lex(source)
+    tokens.ok
+    mut lines := 0
+    for i in 0..tokens.kinds.len {
+        if tokens.kinds[i] == .Newline {
+            lines += 1
+            if lines == 1 { tokens.texts[i - 1] == "1" && tokens.texts[i + 1] == "a" }
+            if lines == 2 { tokens.texts[i - 1] == "2" && tokens.texts[i + 1] == "b" }
+        }
+    }
+    lines == 3
 }
 @test fn span_end_keeps_interpolated_literals_whole_and_stops_before_later_strings() {
     source := "\"2\" == f\"{x}\"; print(\"later\")"

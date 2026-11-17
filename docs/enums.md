@@ -145,22 +145,26 @@ enum Leverans { Hamta, Skicka(i32) }
 fn totalpris(pris: i32, leverans: Leverans) -> i32 {
     frakt := match leverans {
         .Hamta => 0,
-        .Skicka(avgift) => avgift,
+        .Skicka(avgift) => {
+            emballage := 5
+            avgift + emballage
+        },
     }
     return pris + frakt
 }
 
 fn main() {
-    print(totalpris(100, .Skicka(29)))  // 129
+    print(totalpris(100, .Skicka(29)))  // 134
 }
 ```
 
-Ett `match` i uttrycksposition måste ge ett värde av samma typ i alla
-armar. Varje arm innehåller ett enda uttryck, med valfria klamrar runt
-uttrycket. Typen kan komma från exempelvis en annotering eller en
-funktionsparameter. Om den förväntade typen är en enum kan även värdet
-efter `=>` skrivas med kortformen `.Variant`. När typen härleds med `:=`
-bestämmer den första armen typen för de följande.
+Efter `=>` kan du skriva ett uttryck eller ett block med lokala bindningar
+och satser. Blockets sista uttryck utan semikolon ger värdet. De armar som
+når slutet av matchningen måste ge samma typ. En arm som lämnar funktionen
+med `return` eller hoppar med `break` eller `continue` behöver inget slutvärde.
+Typen kan komma från en annotering eller en funktionsparameter. När en enum
+förväntas fungerar kortformen `.Variant` även sist i ett block. Med `:=`
+härleder kompilatorn typen från den första armen som ger ett värde.
 
 ## Lagring och dispatch
 

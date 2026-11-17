@@ -228,19 +228,30 @@ Ett vanligt block i en funktion utan returvärde fortsätter till nästa sats.
 
 ### Villkorsuttryck
 
-Ett `if`-uttryck kan ge värdet till en bindning eller ett funktionsargument.
+Ett `if`-uttryck kan ge värdet till en bindning, ett funktionsargument eller
+en operand. Varje gren har ett eget block. Dess sista uttryck utan semikolon
+ger grenens värde.
 
 ```dunder
-fn biljettpris(alder: i32, medlem: bool) -> i32 {
-    pris := if alder < 18 { 50 } else if medlem { 80 } else { 100 }
-    return pris
+fn biljettpris(alder: i32, grundpris: i32) -> i32 {
+    pris := if alder < 18 {
+        rabatt := grundpris / 2
+        grundpris - rabatt
+    } else { grundpris }
+    return pris + 5
 }
 ```
 
-Varje villkor har typen `bool`. Villkoren prövas i ordning och bara den valda
-grenens värdeuttryck utvärderas. Ett `if` i uttrycksposition kräver ett
-avslutande `else`. Varje gren innehåller ett enda uttryck inom klamrar och
-alla grenar måste ge värden av samma typ.
+Villkoren har typen `bool` och prövas i ordning. Bara den valda grenen körs.
+Ett `if` i uttrycksposition kräver ett avslutande `else`. Alla vägar som når
+slutet av uttrycket måste ge värden av samma typ. Ett `return` lämnar hela
+funktionen. Inuti en loop kan en gren också lämna varvet med `break` eller
+`continue`. Om samtliga grenar lämnar uttrycket behöver en bindning en
+uttrycklig typ, exempelvis `x: i32 = ...`.
+
+Ett ägt slutvärde flyttas ut innan grenens `defer` körs och dess lokaler
+städas. Grenen får använda lokala lån. Kompilatorn avvisar ett lån som
+grenens slutvärde.
 
 För en enum kan ett `match`-uttryck välja värde efter variant och binda
 variantens payload i den valda armen. [Match som uttryck](enums.md#match-som-uttryck)
@@ -495,6 +506,22 @@ impl Counter {
   med `self` anropas med `val.namn(...)` eller med UFCS `Typ::namn(&val, ...)`.
 - `@requires(...)` och `unsafe fn` stöds på enskilda metoder i `impl`, men
   `@test` är reserverat för fristående testfunktioner på modulnivå.
+
+Ett fält eller metodanrop kan fortsätta på nästa rad. Ge raden med
+punkten större indrag än raden där satsen började. Följande anrop i
+samma kedja kan ha samma indrag.
+
+```dunder
+fn tag(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    u32(a).shl(24)
+        .bit_or(u32(b).shl(16))
+        .bit_or(u32(c).shl(8))
+        .bit_or(u32(d))
+}
+```
+
+En punkt på satsens ursprungliga indrag kan börja ett eget uttryck, till
+exempel en enumvariant som `.Ok(text)`. Ett semikolon avslutar alltid satsen.
 
 ## Arrayer, intervall och iteratorer
 

@@ -106,11 +106,15 @@ resurs som inte togs över.
 Konkreta förbättringspunkter som bromsade iterationen vid utveckling och
 integration av `dunder-skrift` och `dunder-hundmat/dogfood/skrift`:
 
+Flersatsiga värdeblock i `if` och `match` samt flerradiga fält- och
+metodkedjor är implementerade. Den parallella kompilatorn kan ta över
+ett färdigt workerresultat direkt i grenen som hämtar det. Hundmats
+HTTP-server avkodar filnamnet i sin gren och kan returnera HTTP 400 där.
+[Villkorsuttryck](syntax.md#villkorsuttryck) · [Match som uttryck](enums.md#match-som-uttryck).
+
 - **Typsystem, inferens och syntax**:
   - Kontextuell heltalstypning i arrayliteraler (`[1, 2]` med `:=` härleds till
     `[]i64` och tvingar ofta `: []i32 = [...]`).
-  - Flerradiga `.method()`-kedjor utan krav på yttre parenteser (`unused value`)
-    samt stöd för flersatsiga block i `if ... { ... } else { ... }`-uttryck.
   - Tydligare `rune`-literaler (i dag är `'A'` en `string`, vilket krävde
     `rune(65)`), anonyma flervärdesreturer/tupler (för parsningshjälpare utan
     engångsstructar) och mindre `.clone()`-tvång vid `.push()` av strängar.
