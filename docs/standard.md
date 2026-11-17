@@ -171,9 +171,8 @@ inklusive tomma strängar och NUL; ingen Unicode-normalisering görs.
 Representationsfälten är ännu synliga enligt språkets nuvarande structregler;
 ändra samlingarna genom modulernas funktioner.
 
-Map och set har dessa konkreta elementtyper i första versionen. Generiska
-`Map<K, V>`/`Set<T>` återstår. Dynamiska `[]T` typkontrolleras redan per
-elementtyp utan vtables.
+De konkreta typerna och modulhjälparna används också av kompilatorn.
+Använd `Map<K, V>` och `Set<T>` för andra elementtyper.
 
 `text.find` returnerar ett byteindex eller -1. `split` bevarar tomma delar;
 en tom separator ger en del med hela texten. `trim` tar ASCII-mellanslag,
@@ -186,6 +185,47 @@ i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buff
 `capability network` med både `impl`-metoder (`TcpListener::listen`/`.accept`/`.close`,
 `TcpStream::connect`/`.read_append`/`.write_all`/`.close`, `PollSet::new`,
 `StreamSet::new`) och modulhjälpare (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
+
+## Generiska samlingar
+
+`Map<K, V>` och `Set<T>` byggs med konkreta Dunder-typer och direkta
+anrop för varje specialisering. De kan även skrivas `map.Map<K, V>`
+och `set.Set<T>` efter import av standardmodulerna.
+
+```dunder
+fn main() {
+    mut table := Map<string, []i32>::new()
+    samples: []i32 = [21, 42]
+    table.put("values", move samples)
+    assert(table.at("values")[1] == 42)
+    match table.take("values") {
+        .Ok(values) => { assert(values.len == 2) },
+        .Err => { assert(false) },
+    }
+}
+```
+
+Strängar, heltal, `bool` och `rune` kan användas direkt som nycklar.
+Andra nyckeltyper definierar `pub fn key_hash(&self) -> u64` och
+`pub fn key_eq(&self, other: Self) -> bool`. Likvärdiga nycklar måste
+ha samma hash. Hash och likhet ska vara stabila medan nyckeln lagras.
+Nycklar och värden använder samma lagringsregler som arrayelement.
+
+`put` och `insert` tar över sina ägda argument. Vid en dubblett behåller
+`put` den lagrade nyckeln och ersätter värdet. `insert` returnerar
+`false` och släpper den inkommande nyckeln. Omhashning flyttar bara
+index. `take` överför det lagrade värdet eller setelementet i `.Ok`
+och ger `.Err` vid en saknad nyckel. `remove` och `clear` släpper
+borttagna ägare via de vanliga cleanupreglerna. En `.clone()` av hela
+samlingen kräver klonbara nycklar och värden.
+`Set.take_at(index)` tar ut ett ägt element via dess index.
+
+`Map.index_of(key)` ger postens index eller `-1`. `key_at(index)`
+och `value_at(index)` lånar posten. `Map.at(key)` lånar värdet och
+kräver att nyckeln finns. `Set.at(index)` lånar elementet vid indexet.
+Skrivning till samlingen kräver att lånen har upphört. Använd intervallet
+`0..len()` för att läsa poster i aktuell ordning. Borttagning kan byta
+plats på den sista kvarvarande posten och den borttagna posten.
 
 ## Skriva JSON
 

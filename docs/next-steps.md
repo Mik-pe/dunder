@@ -6,9 +6,9 @@ ordning. [Minnesmodellen](memory.md) · [Standardbiblioteket](standard.md)
 
 ## Samlingar
 
-Nästa steg är generiska `Map<K, V>` och `Set<T>` med statisk specialisering
-och uttryckliga krav på vilka värden som får flyttas och klonas. Dagens
-`Map` har strängnycklar och `i64`-värden. Dagens `Set` lagrar strängar.
+[`Map<K, V>` och `Set<T>`](standard.md#generiska-samlingar) stöder
+statiskt specialiserade typer, lånade uppslag och flytt av ägda värden.
+Proven täcker hashkollisioner, omhashning, resurser och kloningsdiagnostik.
 
 [Undersökningen av kolumnlagring](soa-research-plan.md) visar hur en
 följeslagartyp kan ge poståtkomst och kolumnlån med befintliga arrayer.
