@@ -1,13 +1,12 @@
 # Dunders arkitektur
 
-**Plattformsstöd 2026-11-10:** Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux och wasm32 med explicit målval. ELF, Mach-O, systemanrop
+Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux och wasm32 med explicit målval. ELF, Mach-O, systemanrop
 och kodgenerering ingår i kompilatorn. x86-64 sänker den delade interna
 instruktionsvokabulären till nativekod vid kompilering; det finns ingen
 runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
 
 Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
-GC, snabb kompilering och självhosting. Implementerad syntax och aktuella
-begränsningar finns i [syntaxen](syntax.md) och [statusen](status.md).
+GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Planerad språkutveckling](next-steps.md)
 Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
 är implementerade i kompilatorns kodgenerering. Anropsfria skalära funktioner
 kan använda en typad lokal modell, begränsat optimeringspass och
@@ -121,36 +120,27 @@ värdkörningar och 166 atomiska avvisningar, inklusive ogiltig UTF-8.
 Detta är korrekthets- och representationskontrakt, utan nya prestandaanspråk.
 [Körbara låneprov](../tools/test-local-borrows.py).
 
-Säker kod ska även hindra läsning av oinitierat minne, ogiltiga taggar och osynkroniserade data races. Första delmängden är enkeltrådad och tillåter varken delat muterbart globalt tillstånd, referenser gömda genom heltalskonvertering eller användardefinierade destruktorer. För trådar behöver vi senare specificera överföring av ägarskap och synkronisering innan ett säkert tråd-API kan släppas. Säkerheten vilar också på att kompilatorn och den lilla osäkra kärnan i allokator, containers och plattformsanrop är korrekta.
+På alla tre nativa mål kan isolerade uppgifter köras på flera trådar.
+Typkontrollen begränsar vilka data och effekter en uppgift får använda.
+Runtimen kopierar indata och resultat mellan separata allokeringsarenor.
+[Uppgifter och ägarskap](tasks.md)
 
-## Direkt från funktion till ARM64
+## Från funktion till maskinkod
 
-1. **Läs moduler och samla deklarationer.** Varje fil läses till en sammanhängande buffer. Namn interneras och källpositioner sparas som offset. Modulernas exporterade typer och funktionssignaturer fastställs före funktionskropparna. Det gör framåtreferenser och ömsesidiga funktionsanrop möjliga.
-2. **Typkontrollera och välj instruktioner per funktion.** Huvudtråden löser namn, kontrollerar typer och ägarskap och håller reda på nåbara funktioner. Den skalära delmängden använder en typad lokal modell för förenkling, loopbevis och registerallokering. Uttryckskompilatorn hanterar även anrop och ägda värden. Båda vägarna använder samma regler för kontrollerad addition och subtraktion. [Heltalsemittern](../selfhost/backend/integer_emit.ddr)
-3. **Verifiera och sänk funktionskoden.** Maskinord, etiketter, relokeringar och källannotationer lagras i separata kolumner. Vid parallella byggen på ARM64/macOS får varje worker spann för sina funktioner och bygger deras MIR i lokalt arbetsminne. Den verifierar, optimerar och sänker varje funktion till ett objekt. Huvudtråden tar emot och validerar objekten i källordning. [Funktionskedjan](optimization.md#gemensam-helfunktionskedja)
-4. **Lägg ut programmet en gång.** Dunders länkare placerar funktioner och konstantdata i deterministisk ordning, löser symboler och fixar hopp och adresser. Ett hopp utanför instruktionsräckvidden får en längre sekvens eller en närliggande hoppstubbe. Bildskrivaren skapar och ad hoc-signerar Mach-O-filen över dess slutliga byte. Publicera resultatet med atomiskt namnbyte när bygget lyckats.
+[Modulladdaren](../selfhost/driver/modules.ddr) löser importer och bevarar
+ursprungliga källpositioner. Deklarationernas signaturer fastställs före
+kropparna så att funktioner kan anropa varandra rekursivt.
 
-Den skalära vägen behåller lokaler i register över strukturerade loopar och
-grenar med konservativa livstidsintervall och deterministiska spill. Anrop
-och ägda värden återstår för denna väg. Kompilatorn använder begränsad analys
-per funktion och återanvänder arbetsminnet; någon permanent andra modell av
-hela programmet hålls inte. [Omfattning, budget och verifiering](optimization.md).
+Den seriella och den parallella kompilatorn använder samma typkontroll. En
+arbetare kan typkontrollera en kropp med en fryst bild av deklarationerna.
+Samordnaren binder symboler och håller reda på nåbara funktioner i bestämd
+ordning. Oanropade kroppar kontrolleras också. [Kompilatorns moduler](../selfhost/README.md)
+· [Parallell kompilering](tasks.md#kompilatorn-som-taskkonsument)
 
-Kompilatorn kontrollerar även kroppar som saknar anropare. Endast nåbara
-funktioner, datasegment och importplatser länkas in i programmet. Frigöring
-av ägda lokaler och tillfälliga värden genereras vid respektive utgång ur
-ett scope. [Kodgenerering och kontroller](optimization.md).
-
-Självhosten i `selfhost/` är uppdelad i avgränsade moduler:
-`frontend_types` (frontendtyper och symboltabeller), `ffi_abi`
-(C-layout och plattforms-ABI), `task_certify` (statisk effekt- och
-kloncertifiering för tasks), `compile_session` (kärntillstånd och
-länksession), `compile` (seriell drivrutin och frontend/check) samt
-`compile_parallel` (workerstyrd backend). Vid parallell kompilering
-strömmar föräldern packade `mir_task.Batch`-enheter genom ett begränsat
-`task scope`-fönster där arbetare kör `mir_pipeline` och `mir_lower` till
-numerisk `ObjectData`, innan föräldern accepterar, cachar och länkar
-resultaten deterministiskt i deklarationsordning.
+En skalär funktion kan förenklas i en lokal typad modell. Varje nyemitterad
+källfunktion går sedan genom samma MIR-verifiering och sänkning. Länkaren
+placerar nåbara funktioner, datasegment och importer i deterministisk ordning.
+Mach-O-skrivaren signerar den slutliga bilden. [Kodgenerering](optimization.md#gemensam-helfunktionskedja)
 
 ## Verktygskedjan och målplattformarna
 

@@ -5,7 +5,7 @@ tom cleanup vid funktionens olika utgångar återstår.
 Målet är att minska bevisat tom cleanup utan att ändra livslängder,
 värdesemantik, fällordning eller språkets diagnostik.
 
-Den [gemensamma helfunktions-IR:n](whole-function-ir-plan.md) är nu
+Den [gemensamma helfunktions-IR:n](optimization.md#gemensam-helfunktionskedja) är nu
 huvudspåret. Ägarhändelserna och dataflödeskraven nedan ska inordnas i den
 modellen; en fristående ägaranalys som bara kompakterar maskinord är inte
 nästa arkitekturleverans.

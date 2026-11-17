@@ -59,8 +59,8 @@ node -e 'WebAssembly.instantiate(require("fs").readFileSync("hello.wasm"), {
 }).then(({instance}) => instance.exports.main())'
 ```
 
-`print_string` får en pekare till en liten header med UTF-8-byternas längd i
-första 32-bitarsordet och texten på offset 8. Läs `instance.exports.memory.buffer`
+`print_string` får en pekare till strängens 64-bitars bytelängd i
+little-endian-format, följd av UTF-8-texten på offset 8. Läs `instance.exports.memory.buffer`
 i varje värdanrop eftersom `memory.grow` kan ge en ny buffert. Den kompakta
 Dunder-runtimen återanvänder block efter storleksklass till dynamiska arrayer,
 referensräknade strängar och scratch-regioner. Adresserbara lokaler ligger på
@@ -70,9 +70,10 @@ om efter ett sådant fel. Program som behöver filer eller fönster anger
 värdens API via importer. `std.sys.decode_utf8` och `decode_u8` fungerar i
 linjärt minne.
 
-Wasm-backenden finns kvar för explicit målval. De separata Wasm-testsviterna
-är senarelagda medan utvecklingen prioriterar de nativa målen.
-[Wasm-backendens status](../selfhost/README.md#wasm32-från-den-självbyggda-kompilatorn-senarelagt-i-testmatrisen)
+I `tools/verify-selfhost.sh` kör Node bland annat program för sammansatta
+arrayer och byteoperationer. Proven kontrollerar både korrekta resultat och
+Wasm-fällor för ogiltiga index eller intervall.
+[Arrayprov](../tools/test-aggregate-arrays.py) · [Byte- och minnesprov](../tools/test-memory-bytes.py)
 
 ## Bootstrap och kodgenerering
 
@@ -83,9 +84,13 @@ verifierar två byteidentiska självbyggen. [Återbyggnad](../bootstrap/README.m
 
 ARM64-backenden skriver maskininstruktioner direkt. x86-64 och Wasm
 översätter samma symboliska instruktionsföljd under kompileringen.
-x86-64 använder en egen registerbank och en kontrollerad värdestack.
-På Wasm blir de nåbara funktionerna riktiga Wasm-funktioner, med
-strukturhopp mellan grundblocken och direktanrop mellan funktioner.
+På x86-64 pekar R15 på Dunders privata registerbank. Dunder använder en
+kontrollerad värdestack och nativa System V-anrop använder värdstacken.
+På Wasm blir de nåbara funktionerna Wasm-funktioner med strukturhopp
+mellan grundblocken. Callback-bryggan sparar de virtuella registren på
+Wasm-operandsstacken genom nästlade anrop. Allokerarregistren X19–X21
+behåller sina nya värden så att anropets allokeringar finns kvar.
+[x86-64-sänkning](../selfhost/backend/x86.ddr) · [Wasm-ABI](../selfhost/backend/wasm_abi.ddr)
 
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
 dynamisk laddare eller libc. Compile-time-predikatet `target_is("...")` i

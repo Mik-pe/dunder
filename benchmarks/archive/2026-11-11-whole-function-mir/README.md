@@ -21,7 +21,7 @@ effekter ger en barriär; trasiga metadata blir ett internt fel.
 Ett separat testat, budgeterat pass för CFG-liveness, SCC och promotion av
 oexponerade åttabytesplatser finns också på main. Det är ännu inte
 inkopplat i denna kandidat. Den fortsatta
-[arkitekturplanen](../../docs/whole-function-ir-plan.md) beskriver register
+[arkitekturplanen](https://github.com/Mik-pe/dunder/blob/4c432883b898beb70fdf08888af7d6d46ea7e2e7/docs/whole-function-ir-plan.md) beskriver register
 över hela funktioner, SSA, loopplacering och direkta målbackends.
 
 ## Byggkostnad

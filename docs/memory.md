@@ -70,9 +70,9 @@ fn main() {
     mut values: []i32 = [1, 2, 3]
     values.reserve(32)
     print(total(values))
-    print(total(values))              // samma läslån igen
-    independent := values.clone()    // egen arraybuffert
-    saved := retain(move values)     // ägarbyte, ingen elementkopia
+    print(total(values))
+    independent := values.clone()
+    saved := retain(move values)
     print(total(saved))
     print(total(independent))
 }
@@ -278,7 +278,8 @@ Frigjorda block läggs på en lista för sin storleksklass. Klasserna börjar vi
 klass. Blandade storlekar kan lämna lediga block i andra klasser när poolen blir full.
 
 Innanför ett dynamiskt stränghandtag ligger en 64-bitars bytelängd följd av
-UTF-8-data. Referensräknaren ligger åtta byte före handtaget. Statiska strängar
+UTF-8-data. Referensräknaren ligger åtta byte före handtaget. Sexton byte före
+ett dynamiskt handtag ligger en pekare till storleksklassens frilista. Statiska strängar
 har räknare noll. Strängar kan dela data utan cykler eftersom deras innehåll
 saknar referenser till andra objekt. Referensräkningen är icke-atomär.
 
@@ -315,8 +316,8 @@ strängreturer levande medan andra värden ersätts eller frigörs. Exempelvis
 kopierar ett prov en array med 1 024 `i64` i 200 000 varv. Ett annat tar emot
 en miljon dynamiska strängreturer. Alla tio kontrollerar resultatet och
 kräver under 96 MiB maximal RSS på det nativa värdmålet.
-[Dunder-programmen](../tests/contracts/). Wasm-körningar ingår tills vidare
-inte i verifieringskedjan; se [aktuell omfattning](status.md#webassembly-senarelagt-under-språkutveckling).
+[Dunder-programmen](../tests/contracts/). För Wasm kör Node separata prov för
+bland annat minnesoperationer och arrayer. [Wasm-målet](targets.md#webassembly)
 
 Testverktyget jämför även heltal, flyttalsbitar, decimalformatering, UTF-8,
 mappar, mängder och sortering med oberoende Python-beräkningar. Felproven

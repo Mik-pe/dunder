@@ -1,146 +1,43 @@
 # Nästa steg för Dunder
 
-Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 och 2 är
-implementerade, liksom sammansatta arrayelement och ordningsbevarande
-borttagning i etapp 3.
-Återstående delar av 3–5 är utvecklingsplanen.
-Nuvarande kontrakt finns i
-[minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
-[status](status.md).
+Fältflyttar, `replace`, returnerade läslån och lånade intervall är införda.
+Arrayer kan äga sammansatta värden och ta bort ett element med bibehållen
+ordning. [Minnesmodellen](memory.md) · [Standardbiblioteket](standard.md)
 
-## 1. Partiella flyttar och kontrollerad replace — implementerat
+## Samlingar
 
-Initiering spåras nu per structfält, även för nästlade fältkedjor. Oberoende
-fält kan flyttas separat och återinitieras genom tilldelning. Grenar och
-loopkanter följer samma glesa platsträd; återstående runtimeägare städas
-med befintlig rekursiv cleanup. `defer` behåller ett konservativt rotlås.
+Nästa steg är generiska `Map<K, V>` och `Set<T>` med statisk specialisering
+och uttryckliga krav på vilka värden som får flyttas och klonas. Dagens
+`Map` har strängnycklar och `i64`-värden. Dagens `Set` lagrar strängar.
 
-`replace(&mut place, replacement)` returnerar den tidigare ägaren utan att
-lämna en oinitierad lucka. Den återanvänder typade plats- och ägaroperationer;
-inga nya runtimehjälpare eller MIR-opkoder behövs. En generell `take` utan
-uttrycklig ersättare har inte införts eftersom ett giltigt standardvärde
-inte finns för alla typer.
+För stora tabeller är det också värt att undersöka om kompilatorn kan
+lagra fälten i separata arrayer och ändå låta programmet arbeta med poster.
+[Förslag om kolumnlagring](soa-research-plan.md)
 
-Kompilatorns workerresultat överför modellfält separat och byter ut färdiga
-kod- och metadataarenor mot tomma värden. Tabell i `dunder-hundmat` använder
-separata flyttar för sitt ägda aggregeringsresultat. Verifieringen omfattar
-de tre nativa målens runtimes, optimeringar på/av, felkontrakt och cleanup.
-[Minneskontrakt och gränser](memory.md#fält-element-och-begränsningar) ·
-[Arkitektur](arkitektur.md#initiering-per-lagringsplats) ·
-[Riktad verifiering](../tools/test-partial-moves.py).
+## Externa resurser och typade fel
 
-## 2a. Lokala läslån och lånade vyer — implementerat
+Låt en `@resource`-typ ange hur den stängs vid blockslut, retur, `break`,
+`continue` och fel. Definiera hur en explicit stängning samverkar med den
+automatiska och om stängningen får blockera. En flytt överför ansvaret
+till den nya ägaren.
 
-`r := &owner.field` och `r := &values[index]` namnger oföränderliga läslån.
-Typer kan också annoteras med `&T`. Lånen gäller till deklarationsblockets
-slut, utan NLL. Oberoende syskonfält kan fortfarande flyttas och ändras;
-arrayelement och intervall låser konservativt hela sin array. Motstridig
-mutation, flytt och `replace` avvisas.
+Inför därefter `Result<T, E>` och felpropagering. Ett anrop som misslyckas
+med att ta över en resurs behöver kunna lämna tillbaka den till anroparen.
 
-`&values[start..end]` ger `&[]T`; `&text[start..end]` ger `&[]u8` med
-kontrollerade UTF-8-gränser. Vyerna använder originalets adress utan
-heapallokering eller retain. `.clone()` materialiserar en ägd array.
-Temporärer som `&f()` och `&[1, 2]` får lånas under anropet men inte bindas
-lokalt. Lokala `&mut` och lokala lån av scratchlagring ingår inte.
+## Språk och standardbibliotek
 
-Lånetabellen använder ägartillståndets kanoniska platsidentiteter och den
-befintliga escapegrafen; den skapar ingen andra initieringsmodell.
-HTTP-servern i `dunder-hundmat` använder namngivna path- och bodyvyer utan
-offsetpar vid API-gränsen. Kompilatorns fragment-cache lånar tokens och
-nyckel-, signatur- och payloadintervall ur en läst bytebuffert. En uttrycklig
-ägd hashbuffert bevarar cacheformatet utan en separat payloadsträng.
-Cacheproven ger 24 byteidentiska kalla/varma bilder, åtta värdkörningar och
-166 atomiska avvisningar, inklusive ogiltig UTF-8. Riktad verifiering
-kontrollerar adressidentitet, allokeringsräknare, livstidsfel, intervall och
-UTF-8 på de tre nativa målen, utan prestandamätningar.
-[Kontrakt](memory.md#lokala-läslån-och-intervallvyer) ·
-[Arkitektur](arkitektur.md#proveniens-och-lexikala-läslån) ·
-[Verifieringsverktyg](../tools/test-local-borrows.py).
+Arbetet med Skrift och Hundmat har visat följande behov.
 
-## 2b. Returnerade läslån — implementerat
+- Förbättra heltalsinferens i arrayliteraler och stöd för runliteraler,
+  flervärdesreturer och relativa importer. Se över namn som krockar med
+  inbyggda egenskaper och när strängar behöver klonas vid `push`.
+- Visa operandvärden när en jämförelse i `assert` misslyckas.
+- Utöka stränginterpolering med format för exempelvis hexadecimala tal och
+  undersök hur ett projekt kan deklarera körbara exempel i manifestet.
+- Lägg till flyttalsparsning i `std.parse`, flyttalsfält i `std.json` och
+  ett enklare gränssnitt för att skriva JSON. Samla `clamp`, `min`, `max`
+  och trigonometriska funktioner i en matematikmodul.
 
-En funktion kan returnera en delad referens eller intervallvy med en
-livstid knuten till en parameter. Ett ensamt läslån väljs automatiskt.
-Med flera möjliga källor anger deklarationen `from namn`. Hundmats
-HTTP-tolk använder kontraktet för fält i samma mottagningsbuffert.
-[Returkontrakt och exempel](memory.md#returnerade-läslån).
-
-## 3. Bättre ägda samlingar — delvis implementerat
-
-Arrayer stöder structar, payload-enums och andra fasta eller dynamiska
-arrayer, med samma flytt-, klonings- och cleanupregler som fristående
-värden. Lånade intervall och iteration bevarar elementens typ och
-ägarskap. Kloning följer ägda barn rekursivt, även genom ändliga
-rekursiva träd; nåbara `@resource`-värden förbjuder kloning.
-`clear` städar levande element, `pop` flyttar ut det sista och
-`remove(index)` flyttar ut ett valfritt element med bibehållen ordning och
-kapacitet.
-
-Detta gör det möjligt att ersätta parallella fältarrayer där en samlad
-post passar bättre.
-
-Bygg generiska `Map<K, V>` och `Set<T>` ovanpå denna grund. Välj en enkel
-modell med statisk specialisering och synliga ägarskapskrav. Nuvarande
-`Map` är `string → i64` och `Set` innehåller strängar.
-
-> **Forskningspunkt (`SoA`)**: Utvärdera attributdriven SoA-härledning
-> (t.ex. `@derive(SoA)` / `@soa`) som komplement till vanlig `[]Struct`, så att
-> logiska poster kan hanteras samlat utan att ge upp cachevänlig kolumnlayout.
-> Se [soa-research-plan.md](soa-research-plan.md).
-
-## 4. Automatisk cleanup för externa resurser och typade fel — planerat
-
-Låt `@resource`-typer ange cleanup som kompilatorn kör vid scope-slut,
-retur, `break`, `continue` och felvägar. Flytt lämnar över ansvaret; lån
-skapar inget nytt cleanupansvar. Definiera särskilt vad som får blockera
-och hur explicit stängning samverkar med automatisk cleanup. Ett glömt
-`close` eller en tidig retur ska inte läcka en socket.
-
-Inför sedan generiska `Result<T, E>` och enkel felpropagering. Samla dagens
-blandning av `.ok`/`.error`, enums och statuskoder utan att dölja resursägare
-på felvägen. Ett fallibelt konsumtionsanrop måste kunna lämna tillbaka en
-resurs som inte togs över.
-
-## 5. Språkergonomi, testdiagnostik och standardbibliotek — återstående plan
-
-Konkreta förbättringspunkter som bromsade iterationen vid utveckling och
-integration av `dunder-skrift` och `dunder-hundmat/dogfood/skrift`:
-
-Flersatsiga värdeblock i `if` och `match` samt flerradiga fält- och
-metodkedjor är implementerade. Den parallella kompilatorn kan ta över
-ett färdigt workerresultat direkt i grenen som hämtar det. Hundmats
-HTTP-server avkodar filnamnet i sin gren och kan returnera HTTP 400 där.
-[Villkorsuttryck](syntax.md#villkorsuttryck) · [Match som uttryck](enums.md#match-som-uttryck).
-
-- **Typsystem, inferens och syntax**:
-  - Kontextuell heltalstypning i arrayliteraler (`[1, 2]` med `:=` härleds till
-    `[]i64` och tvingar ofta `: []i32 = [...]`).
-  - Tydligare `rune`-literaler (i dag är `'A'` en `string`, vilket krävde
-    `rune(65)`), anonyma flervärdesreturer/tupler (för parsningshjälpare utan
-    engångsstructar) och mindre `.clone()`-tvång vid `.push()` av strängar.
-  - Kollisioner med reserverade ord som `len` i modul- och
-    parameternamn samt enhetligare hantering av relativa importer (`"../..."` vs
-    `..`).
-- **Diagnostik, `check` och format**:
-  - `assert(...)` visar nu källfil, radnummer och uttryck på nativa mål;
-    visning av faktiska jämförelsevärden återstår. `dunder check` stöder
-    biblioteksmoduler utan `fn main()`.
-  - Formatangivelser i `f`-strängar (bl.a. hexutskrift) samt eventuella
-    `{ path = "..." }` / `examples/`-tillägg i `dunder.toml` (`[dependencies]`
-    och `std.bytes` big-endian-läsare är redan införda).
-- **Standardbibliotek och grafik-dogfood**:
-  - `std.parse`: flyttalsparsning (`float` / `f64`).
-  - `std.math`: gemensam modul (`clamp`, `min`, `max`, trigonometri) så att
-    dogfood-program inte behöver kopiera egna `math.ddr`.
-  - `std.json`: flyttalsfält (`field_f64`) och en bekvämare `Writer`-abstraktion
-    ovanpå lågnivåhjälparna (`write_str`, `field_i64`).
-  - I `dunder-hundmat` (`graphics/macos.ddr`): texturstöd / alfamaskatlas (så att
-    typsnitt inte behöver sändas som en quad per täckt pixel mot
-    vertexgränsen `100000`) samt headless pixel-readback i paritet med Vulkan.
-
-## Leveransregel
-
-Behåll en gemensam regel: läsa lånar, lagra flyttar, duplicera begärs
-uttryckligen. Varje etapp ska användas i kompilatorn och ett verkligt
-Hundmat-program och verifieras på de tre nativa målen. Utöka syntaxen först
-när en sådan konsument visar vad som faktiskt behövs.
+I `dunder-hundmat/graphics/macos.ddr` återstår texturstöd för en
+teckenatlas och läsning av pixlar utan fönster. Med en atlas kan text
+ritas utan att varje täckt pixel behöver en egen fyrhörning.

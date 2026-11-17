@@ -3,7 +3,7 @@
 Detta är ett forsknings- och designunderlag, inte implementerad funktionalitet.
 Frågan gäller hur Dunder bäst kombinerar ergonomi för samlingar av sammansatta
 poster med hårdvaruvänlig Structure-of-Arrays-lagring (SoA), motiverat av
-[next-steps.md §3](next-steps.md#3-bättre-ägda-samlingar--delvis-implementerat) och erfarenheter från
+[planen för samlingar](next-steps.md#samlingar) och erfarenheter från
 `dunder-skrift` och `dunder-hundmat/dogfood/skrift`.
 
 Vanliga `[]Struct`, payload-enums och nästlade arrayer stöds nu av

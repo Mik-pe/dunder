@@ -136,8 +136,8 @@ bevisar inte att en worker är tillåten.
 Vid `spawn` klonas den typgodkända indatan direkt till en exklusiv
 workerarena medan källvärdet fortfarande är lånat på föräldratråden.
 Runtimen lämnar över arenans allokerartillstånd och den ägda kopian till
-ett jobb i libdispatchs globala trådpool. Skalarer skickas som värdebitar.
-En dispatchgrupp per jobb synkroniserar resultatet. Efter avslutat jobb
+ett jobb. På macOS används libdispatch och en dispatchgrupp per jobb. På Linux
+startar och inväntar runtimen en POSIX-tråd. Skalarer skickas som värdebitar. Efter avslutat jobb
 kopieras det efterfrågade resultatet till förälderns arena. En vanlig
 `await` klonar förälderns cache medan `await!` tar över den.
 Varje aktiv worker har en återanvänd arena på 512 MiB och en stack på 8 MiB, åtskilda av ett skyddat adressintervall. Scopet avmappar reservationen vid utgång. Ett scope utan arbetsyta behåller högst 64 lediga arenor. Med arbetsyta begränsar scopets kapacitet antalet arenor.
@@ -156,6 +156,27 @@ den vanliga kroppsvandringen. Både build och check certifierar grafen när
 symboler efter godkänd certifiering, före publicering. Funktionscachen
 avstår för taskprogram tills certifierade effekter och beroenden kan
 återställas tillsammans med fragmenten.
+
+### Taskruntimens minneslayout
+
+Varje offset nedan räknas i byte från postens början. Föräldern äger
+samordnaren och indexet. Varje aktivt jobb har ensam tillgång till sin
+allokeringsarena. Scopet inväntar aktiva jobb före frigöring av resultaten.
+[Scopets emitter](../selfhost/tasks/task_scope_emit.ddr) · [Nativa jobb](../selfhost/tasks/task_native.ddr)
+
+| Post | Storlek | Fält vid byteoffset |
+| --- | ---: | --- |
+| Samordnare | 32 | 0 initierad, 8 ägartråd, 16 senast utfärdad generation, 24 reserverat |
+| Scope | 128 | 0 generation, 8 tillstånd (1 öppet, 2 stängt), 16 gräns, 24 aktiva jobb, 32 utfärdade jobb, 40 indexkapacitet, 48 indexpekare, 56/64 köhuvud/-slut, 72 ägartråd, 80/88 ledig lista/antal, 96 arbetsytans initierare, 104 delat värde, 112 dess städfunktion |
+| Indexpost | 16 | 0 lånad jobbpekare, 8 exakt resultattyp |
+| Jobbpost | 160 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer, 24 scope, 32 aktiv, 40 nästa lediga post, 48 nativ kontrollpost |
+| Jobbtyp | 64 | 0 initierad, 8 resultattyp, 16 starta, 24 hämta, 32 kassera, 40 klona resultat, 48 städa resultat, 56 reserverat |
+| Nativ kontrollpost | 112 | 0 tillstånd, 8 dispatchgrupp eller `pthread_t`, 16 indata, 24 resultat, 32 arenabas, 40 förälderns resultat, 48 allokeringsposition, 56 väntfel, 64 avmappningsfel, 72 återvunnen arena, 80 arbetsytans initierare, 88 arbetsyta, 96 lån av scopets delade plats |
+
+Kontrollpostens tillstånd är 0 klar för start, 1 inlämnad, 4 cachad, 5 startfel,
+6 väntfel, 8 kasserad, 9 avmappningsfel och 10 resultat övertaget av `await!`.
+Vid väntfel kan arbetaren fortfarande köra. Kontrollpost, trådresurser och
+arena måste då förbli giltiga.
 
 ## Kompilatorn som taskkonsument
 

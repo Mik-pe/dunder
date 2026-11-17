@@ -1,389 +1,72 @@
-# Dunder i Dunder
+# Dunderkompilatorn
 
-Kompilatorn är skriven i Dunder och bygger sig själv på ARM64/macOS,
-ARM64/Linux och x86-64/Linux. Varje självbyggd kompilator kan skriva
-program för alla tre nativa målen och wasm32.
-
-Lexer, modulladdare, parser, typkontroll, kodgenerering, runtime och
-ELF- och Mach-O-skrivare är Dunder-kod. Kompilatorn anropar ingen extern kompilator,
-assembler eller länkare. QEMU används för Linux-körningar med en annan processorarkitektur än värddatorns.
-
-ARM64-backendens runtime återanvänder minnesblock per storleksklass i en
-512 MiB-pool och räknar referenser till dynamiska strängar. Kompilatorn
-frigör lokaler, temporära uttryck, arraybuffertar och structfält vid
-tilldelning och scope-slut, inklusive retur och loopavbrott. Statiska
-strängar har räknare noll. Allokering och ägande beskrivs i
-[minnesarkitekturen](../docs/memory.md).
-
-ARM64-vägen kompilerar `f32` och `f64` med IEEE-aritmetik, konverteringar,
-jämförelser, bitoperationerna `from_bits`/`to_bits`, avrundning och
-klassificering. Decimalliteraler avrundas direkt till begärd precision.
-Nativa utskrifter och `.str()` använder [decimalformatteraren](../runtime/float.ddr).
-
-## Byggkedjan
-
-Kör från projektets rot.
+Kör från projektets rot för att bygga kompilatorn och köra ett program.
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" run examples/hello.ddr
-# 42
-# true
 ```
 
-Skriptet väljer den frysta kompilatorn för värden ur `bootstrap/`, verifierar
-SHA-256 och bygger den seriella bootstrapsingången till en byteidentisk fixpunkt.
-Därefter bygger den `selfhost/main_parallel.ddr` på alla tre nativa värdarna
-(ARM64/macOS, ARM64/Linux och x86-64/Linux) och kräver byteidentiska
-självbyggen med `--jobs=1` och `--jobs=4` innan den publicerar `dunder`.
-Utan `--jobs` läser kompilatorn värdmaskinens tillgängliga CPU-budget genom
-`selfhost/driver/budget.ddr` (inklusive Linux processaffinitet och cgroup-tak).
-`./tools/bootstrap.sh --serial` bygger enbart `dunder-serial` på alla värdar
-utan att ersätta standardbinären.
-Rust-kompilatorn har tagits ur byggkedjan. De frysta startkompilatorerna och
-Dunder-källorna är återställningsvägen. [Fröbinärer och återbyggnad](../bootstrap/README.md)
+[Bootstrap](../bootstrap/README.md) beskriver de frysta kompilatorerna och hur
+självbyggena jämförs. [Huvudingången](main_parallel.ddr) används på ARM64/macOS,
+ARM64/Linux och x86-64/Linux. De tre seriella ingångarna är [main.ddr](main.ddr),
+[linux.ddr](linux.ddr) och [x86_linux.ddr](x86_linux.ddr).
 
-`selfhost/main_parallel.ddr` är standardingång på alla nativa värdar och väljer
-värdplattform via `target_is`. `main.ddr`, `linux.ddr` och `x86_linux.ddr` är
-små seriella bootstrapsingångar för den frysta seed-kedjan. `--target` väljer
-vilket mål som helst för det byggda programmet.
-Kör korsbyggd Linux-kod på motsvarande Linux-system eller med QEMU och
-målarkitekturens användarland.
+## Från källfil till program
+
+1. [Drivrutinen](driver/driver.ddr) läser manifest och väljer mål.
+   [Modulladdaren](driver/modules.ddr) löser importer och bevarar källpositionerna
+   så att ett fel pekar på rätt fil, rad och kolumn.
+2. [Frontenden](frontend/compile.ddr) samlar deklarationerna och typkontrollerar
+   också funktioner utan anropare. [Funktionskontexten](frontend/frontend_context.ddr)
+   håller det tillstånd som behövs för en kropp. [Ägartillstånd](frontend/ownership_state.ddr)
+   och [lånekontroll](frontend/local_borrows.ddr) avgör vilka platser som får läsas,
+   flyttas eller ändras. [Minnesmodellen](../docs/memory.md) beskriver språkreglerna.
+3. För nåbara funktioner kan [skaläroptimeraren](opt/) förenkla typade uttryck.
+   Varje nyemitterad funktion verifieras och sänks genom
+   [MIR](mir/mir_pipeline.ddr). [Målbackend](backend/) och [runtime](runtime/)
+   tillhandahåller maskinkod, binärformat och körtidsfunktioner.
+4. [Länkaren](mir/mir_link.ddr) sammanfogar funktionsobjekten i ordning.
+   [Funktionscachen](driver/fragments.ddr) sparar färdiga objekt för
+   [inkrementella byggen](../docs/incremental.md). Drivrutinen publicerar
+   programfilen först efter ett lyckat bygge.
 
 ## Tasks i kompilatorn
 
-`--jobs N` och `--jobs=N` väljer ett uttryckligt tak på 1–256 för samtidigt arbete
-i standardkompilatorn; utan `--jobs` används värdmaskinens tillgängliga CPU-kapacitet.
-När samordnaren själv kompilerar kroppar räknas den in i arbetsbudgeten; när
-den bara väntar och samlar in sänkta backendobjekt reserverar den ingen plats.
-Standardkompilatorn kör på ARM64/macOS (`libdispatch`), ARM64/Linux och
-x86-64/Linux (`pthread_create`/`pthread_join`) och kan skriva program för alla
-fyra mål.
+[Samordnaren](tasks/compile_parallel.ddr) kan typkontrollera och sänka flera
+funktioner samtidigt. Arbetarna delar en fryst deklarationsbild och använder
+egna arbetsytor. Samordnaren tar emot resultaten i samma ordning som vid
+seriell kompilering. `--jobs 1` kör kedjan på en tråd. `check` stannar
+efter semantisk kontroll. [Arbetsbudget och funktionsjobb](../docs/tasks.md#kompilatorn-som-taskkonsument)
+· [MIR-pass och verifiering](../docs/optimization.md#gemensam-helfunktionskedja)
 
-`build`, `check`, `check --agent`, `test` och `--incremental` använder samma
-funktionsjobb:
-- `check` parallelliserar oberoende semantisk kontroll utan backendarbete eller kodallokeringar.
-- `--incremental` återanvänder giltiga fragment och parallelliserar kvarvarande missar; nycklarna binder ägare och modulkapabiliteter så att kapabilitetsborttagningar alltid ogiltigförklaras.
-- `--jobs 1` och `--profile-compiler` kör samma pipeline i ett gemensamt enkelspår utan bakgrundstrådar (med deterministiska väggtidsintervall under profilering).
-- `test` delar samma budgetpolicy och sprider anpassad barnbudget via `DUNDER_CHILD_JOBS` för att undvika okontrollerad överprenumeration.
-Den minimala seriella bootstrapsingången stöder bara `--jobs=1`.
+## Inbäddat standardbibliotek
 
-Deklarationsvärlden håller källtoken, namn, deklarerade typer och signaturer.
-Varje kropp har en egen typ- och platsarena. Typkontrollen registrerar bland
-annat anrop, lån, ägarskapsöverföringar, bieffekter och symbolbehov. Samordnaren
-sammanför dessa fakta i deklarationsordning.
-
-`next_typed_into` ger ett ägt funktionsunderlag eller ett redan sänkt
-cacheobjekt. Både den seriella ingången och arbetarna läser samma
-`TypedFunction` med lokala operationer, typreferenser och kontrollflöde.
-Efter överlämningen kan frontenden återanvända minnet för nästa kropp.
-Arbetarna verifierar MIR och sänker varje ny funktion till ett objekt.
-Samordnaren tar över objekten med `await!` och länkar dem i ordning.
-[Funktionsformat](mir/mir_source.ddr) och [arbetarsvar](tasks/mir_task.ddr).
-
-Ett task-scope kan dela en fryst numerisk deklarationsbild och ge varje
-worker en egen återanvändbar arbetsyta. Den taskbaserade ingången kan typa
-flera nåbara funktioner samtidigt. Den läser arbetarnas resultat i
-deklarationernas ordning inom varje genomgång och uppdaterar nåbarhet
-och symboler innan nästa funktion publiceras. Kontroll av oåtkomliga kroppar
-använder språkets vanliga typkontroll och rapporterar första felet i
-deklarationsordning. [Taskkontrakt](../docs/tasks.md) och
-[byggmätningar](../benchmarks/compiler/2026-11-15-shared-frontend/README.md).
-
-## Helfunktionspass och valbar SSA
-
-Varje nyemitterad källfunktion går genom den gemensamma MIR-gränsen med
-obligatorisk verifiering. Samma [`mir_pipeline`](mir/mir_pipeline.ddr) utför
-framepromovering → valbar SSA → värdepropagering seriellt och i workers.
-Cacheträffar är slutligt sänkta och kör inga nya MIR-pass. Typning och
-diagnostik använder samma fulla frontend oberoende av passval.
-
-`--mir-ssa=on/off` väljer [`mir_ssa`](mir/mir_ssa.ddr); standard är fortsatt **off**.
-I den historiska [v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
-kostade SSA på 21,26 procent extra byggmedian för kompilatorkorpuset och
-29,47 procent för Tabell utan belagd samlad runtimevinst. MIR och MIR-opt
-måste också vara på. V2 bygger egna ValueID:n för GP/NZCV def/use,
-blockparametrar och föregångarkanternas argument glest efter verklig
-efterfrågan. Oförändrade GP-/NZCV-ingångar delas och iterativ kantlösning
-undviker tät block×variabel-expansion. Aktiva live-mängder och verkliga
-in-/utträdeshändelser styr interferens och placeringsvittnen, utan att varje
-operation skannar alla statiska SSA-versioner.
-[`mir_ssa_cells`](mir/mir_ssa_cells.ddr) grupperar privata åttabytesceller med
-fullbreddsskrivningar och inneslutna läsvyer på 1/2/4/8 byte. En cells
-phi-värden förenas och placeras i GP0–GP17 mot fysisk liveness och fulla
-clobbers. En separat `source_inputs`-premiss får förfina anropsläsningarna.
-Stores skriver fortsatt igenom till minnet och
-okända ingångsminnesversioner stannar i minnet. Efter en barriär får en
-fullt MUST-initierad åttabytescell fångas på nytt i en separat registerregion
-endast med giltigt frame-livstidskontrakt. Barriären bevisar ingen
-värdelikhet. Inga nya frameceller,
-SP-justeringar, etiketter eller import-ID:n skapas.
-
-Budgetsatt analys, placeringskontroll, gles undo och slutverifiering ryms
-inom 4 194 304 enheter per funktion. Avslag återställer funktionen exakt.
-`--timings=json` redovisar effektiv `ssa_enabled` och faktiska `ssa_*`-räknare
-från accepterade jobb. Förändringsräknarna gäller committade omskrivningar.
-Check och full cacheträff utför inget SSA-arbete. On/off och
-SSA-markören `v3-regional-expression1-work4194304` ingår i cache- och
-testkvittoidentiteten. Fysisk v5 binder `call-flags1`, `stack-origin1`,
-`frame-life1` och källanrops-ABI2. De underliggande livstids-, ursprungs- och
-lagringspremisserna är fortsatt oberoende. Workerantalet ingår inte.
-
-[`mir_memory`](mir/mir_memory.ddr), [`mir_terminals`](mir/mir_terminals.ddr) och
-[`mir_call_abi`](mir/mir_call_abi.ddr) håller privata NoModRef-celler, sex exakt
-angivna utgångar utan observationer och källanropens ABI1 åtskilda. Vanliga
-råa fabriker ger inga sådana källpremisser. Den kompletta källproducenten
-sätter ABI1 och äger beviset för giltiga anrop och bryggor. Det befintliga
-framepasset med fyra registerhem får därmed fortsätta säkert för källkod;
-rå MIR med nåbara okända utgångar eller anrop avstår utan tillräckligt kontrakt.
-Anrop synkroniserar fortfarande originalceller och behåller sina clobbers.
-[Reglerna för privata objekt, stackargument och FFI](../docs/ffi.md#objektminne-och-privata-stackceller)
-är oförändrade.
-
-[`mir_call_inputs`](mir/mir_call_inputs.ddr) ger en separat helproducentpremiss,
-`source_inputs`, som är false i råa fabriker och explicit true hos den
-kompletta källproducenten. GP0–GP8, GP16, GP18–GP31, alla FP-register och
-explicita mål bevaras som indata för stödda ABI1/2/3-anrop. Scratch GP9–GP15
-och GP17 får undantas bara utan källsemantisk dependency på inkommande eller
-lokalt odefinierade post-call-bitar; fler än åtta argument följer
-stackkonventionen. Premissen omfattar runtimehelpers och C-/callback-/
-taskbryggor och följer inte av en extern deklaration, MAY-clobber, NoModRef
-eller anrops-ABI. Råmasker muteras inte, och clobbers, minne och flaggor
-begränsas inte. Okända anropsformer behåller sina konservativa läsningar.
-
-[`mir_decode`](../tests/fixtures/mir_machine_decode.ddr) ger FE:s target explicit X17 och Wasm-FB:s
-X16; targets kan inte räknas som fri scratch. Rå Call läser inkommande NZCV
-och kan förstöra dem, alltså `flags=3`. Det tidigare `flags=2` var felaktig
-metadata. Fyndet har inte visat någon felkompilering i dagens värdepass.
-
-Den historiska [SSA-v1-mätningen](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
-gav 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34 procent
-för Tabell utan samlad runtimevinst. SSA-optimerad producentkod gav heller
-ingen meningsfull byggvinst där. Detta gäller v1 och är inga mätningar av
-gles v2 eller `source_inputs`; bootstrapprofilen behålls.
-
-Frame-livstid är en oberoende del av [`mir_call_abi.Context`](mir/mir_call_abi.ddr).
-En normal retur ska återvända med samma FP/SP och giltiga, mappade
-caller-frameintervall; cellvärdena får ändras. Detta ändrar inga råa
-anropsmasker och ger varken NoModRef eller ett initieringsbevis. Ett separat
-full8 MUST-init-bevis krävs före regional återläsning efter barriären.
-
-[`mir.Function.stack_roles`](mir/mir.ddr) markerar positivt ursprung för
-implementationens uttryckstemporärer; råa push/pop har ingen sådan rätt.
-[`mir_expr_stack`](mir/mir_expr_stack.ddr) håller separat `source_temporaries`-
-behörighet för att elidera den privata sextonbyteslagringen och dess egna
-resursfel. Markeringen ensam, source-objects och call-ABI räcker inte.
-Argument, FP/LR, brygglagring och källadresserbara värden undantas. Explicita
-aritmetik-, index-, åtkomst- och kapacitetskontroller i andra operationer
-behåller sin ordning. En persistent LIFO-graf binder Temp-värden genom CFG
-och loopar; det är ingen matchning av intilliggande instruktioner.
-
-Frame- och Expr-värden går genom samma GP0–GP17-allokering med en fysisk
-liveness-beräkning, gemensamma konflikter, SSA-budget på 4 194 304 enheter
-och en gemensam undo-/slutverifiering. Båda delarna ser varandras levande
-värden innan ett register får väljas.
-
-Generellt SSA-baserat operationsval, vidare värdeplacering, heap-CSE och
-loopplacering återstår. Nuvarande registerplacering gäller den gemensamma
-logiska banken; direkt x86-registerallokering och Wasm-lokaler är framtida
-målbackendsteg. De funktionella proven visar korrekthet och minskad
-lasttrafik i vissa fall, men ger inget nytt latens- eller C-prestandaanspråk.
-Historisk riktad v2-QA med `flags=3` passerade 670 målbilder och 360 native-/
-Wasm-körningar, med 438 exakta bitpar och 232 redovisade interpreterluckor.
-Den matrisens källacceptans passerade 24 målbilder och 17 körningar. Linux är endast
-bildbyggt i dessa matriser. Den revisionens fulla verifiering passerade
-också, inklusive bootstrapens fixpunkt med en och fyra workers. V2 minskade
-SSA-byggmedianen för kompilatorkorpuset 27,65 procent mot v1, men runtime/C-geomedlet 1,1841
-med passet på klarar inte C-gränsen. Analysvinsten och standardvalet var separata beslut. Dessa resultat
-beskriver den frysta v2-revisionen, före regional återläsning, gemensam
-Frame-/Expr-placering och worker-lokal sänkning.
-[SSA- och rollback-orakel](../tools/test-mir-ssa.py),
-[gemensam placering](../tests/mir_ssa_joint.ddr),
-[ObjectData-livstid](../tools/test-mir-object-data.py),
-[käll-/worker-/cacheprov](../tools/test-ssa-source.py) och
-[detaljerad omfattning](../docs/optimization.md#ssa-för-privata-framevärden).
-
-## Vad kompilatorn klarar
-
-Självbygget använder punktimporter, alias, privata/exporterade symboler,
-cykliska modulgrafer, structar med djup värdekopiering, fält och lån,
-fasta och dynamiska arrayer, taggade enums med payload, UTF-8-strängar
-och strängsnitt. Ett `match` kontrollerar uttömmande fall, binder egna
-kopior av payloadvärden och kan returnera funktionens värde.
-Funktioner stöder framåtanrop, rekursion, aggregatreturer och fler än åtta
-parametrar. Funktionsvärden med signaturen `fn(...) -> T` kan skickas som
-argument och anropas indirekt. `range` bevarar tecknet hos båda gränserna
-och en iterator från `.iter()` kan användas i flera loopar. Heltalsaritmetik, bitoperationer, kontrollflöde, `print`,
-`assert` och de systemanrop som behövs för kompilatorns filhantering ingår.
-
-Standardbibliotekets källor är inbäddade i `bundled.ddr`. Efter ändringar
-i de moduler som listas i `stdlib/modules.txt`, regenerera med Dunder själv:
+Ändra källfilerna i [stdlib](../stdlib/) eller [flyttalsformatteraren](../runtime/float.ddr).
+[Modullistan](../stdlib/modules.txt) anger vilka standardmoduler som följer med
+kompilatorn. Regenerera [bundled.ddr](bundled.ddr) innan kompilatorn byggs om.
 
 ```sh
 "$dunder_bin" run selfhost/embed.ddr
 ```
 
-Modulladdaren bevarar källpositioner så att fel pekar på ursprunglig fil
-och rad. Den skyddar indata och importerade filer från överskrivning,
-även via symboliska och hårda länkar. Utdata publiceras med temporär fil
-och rename efter ett lyckat bygge.
-
-Vanliga byggen skickar modulladdarens namnupplösta tokenström direkt till
-kompilatorn. Varje källfil lexas en gång, och tokenpositionerna mappas
-till ursprunglig modul. Testbyggen använder fortfarande den sammansatta
-källtexten för att lägga till testfunktioner och teststart.
-
-`build` genererar kod för nåbara funktioner och typkontrollerar också
-oanropade kroppar i importträdet. `check --agent` skriver JSONL med
-modulsökväg, UTF-8-byteoffsetar och härledda typer för lokala bindningar.
-Diagnostiken innehåller fil, rad, kolumn och felkod.
-
-Läslån kan vara funktionsparametrar eller namngivna lokaler, exempelvis
-`r := &owner.field` och `r: &i32 = &values[0]`. Lokala referenser är
-oföränderliga och gäller till blockslut, även efter sista läsningen.
-Syskonfält tillåts; elementlån och intervall låser hela arrayen.
-`&values[start..end]` ger `&[]T` och `&text[start..end]` ger `&[]u8` med
-UTF-8-gränskontroll. Vyerna behåller originalets adress, har vylängden som
-`len` och `cap()` och kräver ingen heapallokering eller retain. `.clone()`
-ger en ägare uttryckligen. Intervallfel ger 103, ogiltiga UTF-8-gränser 106.
-
-Temporärer som `&f()` och `&[1, 2]` kan lånas under anropet men inte bindas
-lokalt. Lokala `&mut`, returnerade referenser och lokala scratchlån stöds
-ännu inte. Den globala escapegrafen avvisar nya lån till funktioner som kan
-exponera råadresser, även genom indirekta anrop. Direkt adressobservation i
-explicit `unsafe` används däremot av identitetsproven.
-[Minneskontrakt och gränser](../docs/memory.md#lokala-läslån-och-intervallvyer).
-
-`ownership_state` äger ett glest, kanoniskt träd över lokaler och structfält,
-inklusive grenjoins och looparnas checkpoints. Källans initieringsbevis
-är separat från runtimeägarslots och typade åtkomster i `typed_places`.
-Workers lämnar över oberoende modellfält med partiella flyttar. Färdiga
-kod- och metadataarenor lämnar en återanvändbar `Session` genom `replace`
-och tas emot utan kloning. `Session` och ägartillståndet förblir opaque;
-överföringarna sker i modulen som äger respektive representation.
-
-`local_borrows.Table` kompletterar detta träd med proveniens och aktiva lån,
-utan en andra initieringsmodell. `borrowed_view` bygger en framebaserad
-deskriptor utan runtimeägare. Färdiga anrops-, konstruktor- och
-operatorresultat nollställer argumentens lånemetadata, så att ett nytt värde
-inte ärver en inre vys `loan.home`. Nya uttrycksformer måste förbereda
-escapeanalysen; saknas bevis avvisas de. Källkontrollen körs även när
-funktionscachen återanvänder maskinkod. HTTP-servern i `dunder-hundmat`
-använder path-/bodyvyer. Kompilatorns fragment-cache lånar tokenstavningar
-och nyckel-/signatur-/payloadvyer ur en bytebuffert; hashningens ägda
-indatabuffert är uttrycklig och cacheformatet bevaras. Dess prov jämför 24
-kalla/varma bilder byte för byte, kör åtta värdprogram och kontrollerar 166
-atomiska avvisningar inklusive ogiltig UTF-8. Inga nya prestandaanspråk
-följer av funktionaliteten.
-
-CLI:t stöder även `run`, `test --affected`, tidsgränser för tester, manifest,
-målval och macOS-appar med resurssignering. Nativebyggen kan återanvända
-funktionsfragment med `--incremental`.
-
-### Modulprivilegier och filhandtag
-
-Vid filbaserade byggen kontrollerar modulladdaren `capability unsafe` i
-varje fil, även i onåbara funktioner. Ett uppslag av en funktion med
-`@requires(filesystem)` kräver filens eget `capability filesystem`. Det
-gäller även funktionsvärden. Endast den deklarerande modulen får konstruera
-en `opaque struct` eller öppna ett fält i säker kod. Den kontrollen sker vid
-typkontroll av funktionskroppen, även om programmet aldrig anropar den.
-[Filhandtag och legacy-API:er](../docs/ffi.md#filåtkomst-genom-delegerade-handtag)
-
-### Wasm32 från den självbyggda kompilatorn (senarelagt i testmatrisen)
-
-Den självbyggda kompilatorn behåller Wasm-backenden i `selfhost/backend/wasm_*.ddr`, men
-Wasm-testsviter och JS-runtimeberoenden är **senarelagda** under pågående
-språkutveckling så att utvecklings- och verifieringsloopen körs rent nativt.
-
-```sh
-./tools/bootstrap.sh
-build/selfhost/arm64-macos/dunder build examples/hello.ddr --target wasm32 -o hello.wasm
-```
-
-Välj värdens katalog under `build/selfhost/`. Kompilatorn använder samma
-typkontroll, kopiering, ägarskap och kod för regioner som de nativa målen.
-Backenden omvandlar den gemensamma instruktionsföljden till Wasm-funktioner.
-Vanliga anrop och rekursion använder Wasms anropsstack. En kontrollerad
-värdestack på 1 MiB i linjärt minne gör lokaler och lånade fält adresserbara.
-Runtimen återanvänder frigjorda block och utökar minnet med `memory.grow`
-när den behöver mer utrymme.
-
-Modulen exporterar `main`, `memory` och `__indirect_function_table`. Vid
-värdgränsen upptar pekare och `usize` fyra byte. Skalära importer och
-callbacks har deklarerade Wasm-signaturer. Värden tar emot C-layoutposter
-via pekare. Systemanrop för filer och processer kräver ett nativt mål eller
-en uttrycklig värdimport. Se [måldokumentationen](../docs/targets.md).
-
-## Filer
-
-| Fil | Ansvar |
-| --- | --- |
-| `lexer.ddr` | Tokenisering, UTF-8, escapes, positioner och interning. |
-| `modules.ddr` | Modulgraph, namn, synlighet, deduplicering och källmappning. |
-| `bundled.ddr`, `embed.ddr` | Inbäddat standardbibliotek och dess Dunder-generator. |
-| `compile.ddr` | Återupptagbar Session, typer, kontrollflöde, lån och ägarflyttar, källordning och slutlig emission. |
-| `frontend_context.ddr`, `target_cond.ddr`, `token_lookahead.ddr`, `runtime_helpers.ddr` | Utbrutna hjälpmoduler från `compile.ddr`: deklarationsvärld/funktionskontext, `target_is`-evaluering, block/uttrycks-lookahead och strängliteral-/samlingsemission. |
-| `compile_parallel.ddr`, `mir_task.ddr` | Begränsade taskfönster, ägda funktionsjobb och ordnad acceptans. |
-| `mir_pipeline.ddr` | Samma verifiering och frame-/valbara SSA-/värdepass för seriell körning och workers. |
-| `mir_ssa.ddr`, `mir_ssa_cells.ddr`, `mir_expr_stack.ddr` | Regional frame-SSA och positiva Temp-värden i gemensam registerplacering, med separata livstids-/lagringspremisser. |
-| `mir_memory.ddr`, `mir_terminals.ddr`, `mir_call_abi.ddr` | Separata producentpremisser för objektminne, exakta terminalobservationer och källanropens ABI. |
-| `mir_call_inputs.ddr` | Separat semantisk anropsindata-vy för den kompletta källproducenten; råkontraktet bevaras. |
-| `mir_lower.ddr`, `mir_link.ddr` | Worker-lokal sänkning, numerisk ObjectData-transport, strukturell objektvalidering och ordnad sammanfogning. |
-| `record_take.ddr` | Kapacitetsnormalisering för äldre temporäröverföring; källflyttar hanteras av `compile.ddr` och `ownership_state.ddr`. |
-| `local_borrows.ddr`, `borrowed_view.ddr` | Lexikala läslån med kanonisk proveniens samt intervallkontroller och emission av lånade array-/textvyer. |
-| `task_data.ddr`, `task_effects.ddr`, `task_native.ddr`, `task_scope_emit.ddr` | Isolerad datagräns, effektbevis, OS-jobb och lexikal cleanup. |
-| `opt_ir.ddr`, `typed_body.ddr` | Funktionslokala skalärnoder från språkets typkontroll. |
-| `opt_pass.ddr` | Begränsad förenkling och bevis för säkra index och ökningar. |
-| `opt_verify.ddr` | Typ-, scope-, kontrollflödes-, effekt- och strukturinvariants före och efter passet. |
-| `scalar_rules.ddr` | Gemensamma namn-, operator- och heltalsliteralregler för källparsrarna. |
-| `opt_alloc.ddr`, `opt_emit.ddr` | Livstidsintervall, registerplacering, spill och emission för modellen. |
-| `x86.ddr`, `x86_linux.ddr` | x86-64-kodgenerering och Linux-ingång. |
-| `wasm_native.ddr`, `wasm_flow.ddr` | Modulformat, funktionsanrop, grundblock och relokeringar för Wasm. |
-| `wasm_abi.ddr`, `wasm_alu.ddr`, `wasm_memory.ddr` | Typade värdanrop, aritmetik och linjärt minne för Wasm. |
-| `arm64.ddr` | Maskinord, register, stack, etiketter och hoppfixering. |
-| `runtime.ddr`, `runtime_sys.ddr` | Minne, samlingar, strängar och Darwin- och Linux-systemanrop. |
-| `driver.ddr` | Gemensam modulladdning, felrapportering och publicering av filer. |
-| `elf.ddr`, `linux.ddr` | ELF-format och kompilatorns Linux-ingång. |
-| `macho.ddr`, `main.ddr`, `main_parallel.ddr` | Signerad Mach-O och seriell respektive taskbaserad macOS-ingång. |
-
 ## Verifiering
 
-```sh
-# Snabb språkutvecklingsloop (1-stegs inkrementellt bygge + parallella kärnsviter):
-./tools/dev.sh
-./tools/dev.sh --filter ssa
+`./tools/dev.sh` gör ett inkrementellt bygge och kör kärnsviterna.
+För en del av sviten kan du välja testnamn med `--filter`. Den fullständiga
+verifieringen börjar med ett nytt självbygge från värdens frö.
 
-# Fullständig självhost-verifiering (frö-bootstrap + hela matrisen parallellt):
+Testverktygen använder Python 3.11 eller senare, Node.js, en C11-kompilator
+samt Git, curl, gzip och openssl. De nativa biblioteksproven använder även
+libcurl, SQLite, OpenSSL 3 och Argon2. [HTTP](../docs/http.md) · [SQLite](../docs/sqlite.md)
+· [Kryptobibliotek per plattform](../docs/crypto.md)
+
+```sh
+./tools/dev.sh --filter ssa
 ./tools/verify-selfhost.sh
 ```
 
-Enskilda sviter kan även köras direkt:
-
-```sh
-dunder_bin="$(./tools/bootstrap.sh)"
-"$dunder_bin" test tests/suite.ddr
-"$dunder_bin" run tools/test_diagnostics.ddr -- "$dunder_bin"
-python3 tools/test-runtime-contracts.py "$dunder_bin"
-python3 tools/test-partial-moves.py "$dunder_bin" --inline-replace
-python3 tools/test-local-borrows.py "$dunder_bin"
-```
-
-Fält-/replace- och lånesviterna korsbygger alla tre nativa mål och kör värdens bilder.
-`--runner TARGET=COMMAND` kan upprepas för att dessutom köra andra måls
-bilder i en lokal målmiljö, exempelvis
-`--runner 'arm64-linux=/sökväg/till/lokal-runner arm64'`. Runnern får
-målbinärens absoluta sökväg som sista argument. Lånesviten verifierar bland
-annat adressidentitet, allokering, retain, livstidsfel och UTF-8. För en
-seriell kompilator utan parallell ingång används `--serial`. Sviterna mäter
-inga prestanda.
-
-De körda programmen har förväntade värden, utskrifter och felutfall.
-Diagnostikfallen använder både giltiga exempel och källor som ska avvisas.
-`dunder test` kör isolerade barnprocesser parallellt över alla värdkärnor som
-standard (`--jobs N` styr parallelliteten uttryckligt, och utskrifterna samlas
-i deterministisk gruppordning). För en enskild grupp kan kompilatorn
-skriva en egen startpunkt med `build-tests`.
+Enskilda testgrupper kan listas, byggas och köras från projektets rot.
 
 ```sh
 "$dunder_bin" build-tests tests/suite.ddr --list
@@ -391,17 +74,8 @@ skriva en egen startpunkt med `build-tests`.
 ./build/group0
 ```
 
-## Katalogstruktur
-
-Ingångar, inbäddat standardbibliotek och målspecifika startmoduler ligger
-i roten av `selfhost/` (`main.ddr`, `main_parallel.ddr`, `linux.ddr`,
-`x86_linux.ddr`, `wasm.ddr`, `embed.ddr`, `bundled.ddr`). Övriga moduler är
-uppdelade efter ansvarsområde:
-
-- `driver/`: CLI, modulupplösning, byggsession, inkrementell cache/fragment och profilerare.
-- `frontend/`: lexer, parser, typkontroll, borrow-/resursanalys och AST-sänkning.
-- `opt/`: typat optimerings-IR, konstantvikning, intervallbevis, inlining och skalär emission.
-- `mir/`: helfunktions-IR, SSA-konstruktion/promovering, värdepropagering, sänkning och länkning.
-- `tasks/`: isolerade tasktyper, worker-körvägar, certifikat och task-scope-emission.
-- `backend/`: ARM64/x86-64/Wasm-kodemission, FFI/ABI samt Mach-O- och ELF-binärformat.
-- `runtime/`: inlänkade körtidsfunktioner och systemgränssnitt (`runtime_sys`, intrinsics).
+[Låneproven](../tools/test-local-borrows.py) och [fältflyttarna](../tools/test-partial-moves.py)
+korsbygger de tre nativa målen och kör värdens bilder. Med
+`--runner TARGET=COMMAND` kan de även köra en korsbyggd bild i en lokal
+målmiljö. Kommandot får bildens absoluta sökväg som sista argument.
+[Målplattformar och körmiljöer](../docs/targets.md)

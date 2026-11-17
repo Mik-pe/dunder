@@ -5,12 +5,9 @@ Kompilatorn avger instruktioner, lokala etiketter och relokeringar per funktion.
 Den tar med de runtimefunktioner som programmet behöver. Overflow, ogiltiga
 index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen.
 
-Huvudarkitekturen är nu en
-[gemensam IR för hela funktioner](whole-function-ir-plan.md), med samma gräns
-för skalära kroppar, anrop och ägda värden. En första valbar SSA-grund
-placerar privata Frame- och positivt identifierade Temp-värden gemensamt
-i register. Planen beskriver fortsatt generell
-SSA-sänkning, loopoptimering och direkta målbackends.
+Den gemensamma funktionsrepresentationen (MIR) omfattar även kroppar med
+anrop och ägda värden. Med `--mir-ssa=on` kan privata frameceller och
+uttryckstemporärer placeras i register.
 
 ## Instruktionsval för heltal och arrayåtkomst
 
@@ -55,6 +52,54 @@ Passpolicyn och kedjans version skiljer cachefragment och testkvitton åt. `--ti
 antal nyemitterade IR-funktioner, operationer och opaka barriärer.
 Källprovet i `tools/test-mir.py --reference-root SÖKVÄG` kan jämföra
 ooptimerade bilder, bindningar och diagnostik mot en tidigare revision.
+
+### MIR-radens format
+
+`order` innehåller stabila operations-ID:n som indexerar kolumnerna i
+[`mir.Function`](../selfhost/mir/mir.ddr). Registermaskernas bitar 0–31
+betecknar X0–X30 och SP, bitarna 32–63 betecknar V0–V31. NZCV har en egen
+mask. En plats med ID −1 saknas. För register betyder −1 att operanden saknas
+eller använder nollregistret enligt operationen. `writes` anger definierade
+resultat, medan `clobbers` anger register vars tidigare värde kan gå förlorat.
+
+| Kolumn | Kodning |
+| --- | --- |
+| `flags` | 1 läser NZCV, 2 definierar NZCV. Maskerna kan kombineras. |
+| `effects` | 1 möjlig fälla, 2 minnesläsning, 4 minnesskrivning, 8 anrop, 16 kontrollflöde, 32 uttrycksstack, 64 ordnad ägar- eller allokeringsoperation, 128 okänd aliasering. |
+| `abi` | 0 inget, 1 internt Dunder-anrop, 2 C, 3 värdanrop eller systemanrop, 4 okänt. |
+| `modes` | 0 återger oförändrad kodning, 1 sänker en kanonisk operation, 2 utelämnar operationen. |
+| `recipes` | 0 rått ord, 1 läs frameplats, 2 skriv frameplats, 3 beräkna frameadress, 4 relokering, 5 import, 6 lägg temporär på stacken, 7 ta temporär från stacken. |
+| `place_kinds` | 0 indirekt minne, 1 FP-relativt intervall, 2 uttrycksstack. Förskjutning och bredd anges i byte. |
+| `extensions` | 0 råa bitar, 1 nollutvidgning, 2 teckenutvidgning. Aliasering avgörs av byteintervallen. |
+| `edge_kinds` | 0 nästa block, 1 taget hopp, 2 extern utgång eller fälla, 3 retur, 4 okänd kant, 5 fortsatt körning utanför kodspannet. |
+
+För skalära operationer anger `kinds` familjen enligt `mir.Kind`. Följande
+`opcodes` väljer operation inom familjen. [Heltalssänkning](../selfhost/mir/mir_scalar_lower.ddr)
+· [Flyttalskodning i testfixturer](../tests/fixtures/mir_machine_decode.ddr)
+
+| Familj | Opkoder i nummerordning |
+| --- | --- |
+| Unary 1–3 | signerat bitfält, osignerat bitfält, infoga 16-bitarskonstant |
+| Binary 1–7 | add, sub, mul, signed mul high, unsigned mul high, signed div, unsigned div |
+| Binary 8–13 | and, or, xor, and-not, or-not, xor-not |
+| Binary 14–18 | logiskt vänsterskift, logiskt högerskift, aritmetiskt högerskift, multiply-add, multiply-subtract |
+| Float 1–8 | add, sub, mul, div, jämför, absolutvärde, negation, kvadratrot |
+| Float 9–15 | GP-bitar till FP, FP-bitar till GP, precisionsbyte, signerat eller osignerat heltal till FP, FP till signerat eller osignerat heltal |
+| Float 16–20 | närmaste, floor, ceil, trunkering, närmaste med halvor bort från noll |
+
+För en skiftad operand bär de sex lägsta bitarna i `aux` skiftlängden.
+Bitarna 6–7 anger vänster, logiskt höger, aritmetiskt höger eller rotation.
+För bitfält är `aux = rotate | (top_bit << 6)`. Typade flyttalsoperationer
+från frontenden kodas separat med opkod `32 + operation`.
+[Flyttalskontrakt](../selfhost/mir/mir_float.ddr) · [MIR-prov](../tests/mir.ddr)
+
+`StackPush` och `StackPop` använder 16 byte. Deras plats anger de åtta
+värdebytena. Push nollställer den övre halvan och pop läser båda halvorna.
+Ägaranropens opkoder 16–19 bär källtyp i `aux` och källposition i `imm`.
+Ägarskrivningarna 20–23 anger frameplats och packar typ respektive position
+i de höga och låga 32 bitarna av `variant`. Vid en intern retur innehåller
+X0 resultatets råa bitar, LR returadressen och SP det återställda stackläget.
+[Källoperationer](../selfhost/backend/backend_row.ddr) · [Retur-ABI](../selfhost/mir/mir_abi.ddr)
 
 ### Återanvändning av typade skalärkroppar
 
@@ -774,7 +819,8 @@ bakom snabbare genererad stresskod.
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
 | POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
 | Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
-| Kortare bygglatens | Workers verifierar, optimerar och sänker till numeriska slutobjekt. Frontend, ordnad acceptans, cache och länkning har en ägare. Nästa steg är den typade frontendgränsen. | Behåll stabil diagnostik, byteidentiska bilder och budgetar. Fortsatt arbete måste mäta varm cache, privat kroppsändring och delad layoutändring separat från kalla byggen. |
+| Loopoptimering | Flytta konstanter och rena beräkningar när dominans och kontrollflöde tillåter det. | Även när loopen körs noll gånger måste ordningen för fällor, minnesåtkomst och ägarskap bevaras. |
+| Kortare bygglatens | [Arbetarna](tasks.md#kompilatorn-som-taskkonsument) typkontrollerar och sänker funktioner. Samordnaren sköter symbolbindning, cache och länkning i ordning. | Följ kostnaden för källjobb, kopiering och återanvändning av arbetsytor. Mät varm cache, privat kroppsändring och delad layoutändring separat från kalla byggen. |
 
 Prioritera nästa mekanism efter profiler och maskinkod för arbetsfallen
 som fortfarande missar målet. Mät allokering och kopiering i lexer, parser
@@ -859,5 +905,4 @@ Helfunktionskedjans [första byggmätning](../benchmarks/archive/2026-11-11-whol
 redovisar dess kostnad med identiska bilder och separat `check`.
 Konstantdivision och framefria funktioner förbättrar numerikkärnan;
 intervallbevis och registerjämförelser minskar sorteringens kontrollkostnad.
-Den [gemensamma arkitekturplanen](whole-function-ir-plan.md) är huvudspåret.
 Högre p95 i vissa arbetsfall redovisas separat från medianvinster.

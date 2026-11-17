@@ -1,22 +1,17 @@
-# Dunders första implementerade syntax
-
-Beslut 2026-11-10: prioritera det typade källspråket och kompilera riktiga
-program. Håll stavning och struktur regelbundna så att både människor och
-kodagenter kan använda vanliga mönster för funktioner, uttryck och block.
-Detta är ett prövbart designval, inte ett påstående om mätt agentpreferens.
+# Dunders syntax
 
 Källfiler använder **`.ddr`**, till exempel `main.ddr` och `functions.ddr`.
 
 ## Deklarationer och muterbarhet
 
 ```dunder
-count := 42            // härledd i32, oföränderlig
-wide: i64 = 42         // explicit i64, oföränderlig
-ready: bool = true     // explicit bool, oföränderlig
+count := 42
+wide: i64 = 42
+ready: bool = true
 
-mut total := 0         // explicit muterbar i32
-mut big: i64 = 0       // explicit muterbar i64
-total = total + 1      // tilldelning till befintlig muterbar bindning
+mut total := 0
+mut big: i64 = 0
+total += 1
 ```
 
 `:=` deklarerar ett nytt namn i det aktuella blocket och härleder dess typ.
@@ -98,7 +93,7 @@ name := "å 🌍"
 count := 3
 message := f"{name}: {count + 1} objekt, redo={true}"
 label := f"status: {if count > 0 { "aktiv" } else { "tom" }}"
-escaped := f"{{{count}}}"  // {3}
+escaped := f"{{{count}}}"
 ```
 
 Hålen kan innehålla anrop, fältåtkomst, indexering, `if`, `match` och
@@ -112,8 +107,8 @@ för en sträng delar `.str()` dess oföränderliga text. Aggregat, råpekare oc
 funktioner kräver att programmet först väljer en textrepresentation.
 Formatkoder som `:02` ingår inte.
 
-`{{` och `}}` ger bokstavliga klamrar. Övriga escapes fungerar som i vanliga
-strängar, inklusive Unicode och NUL. Textsegment får inte innehålla råa
+`{{` och `}}` ger bokstavliga klamrar. I exemplet blir `escaped` strängen `"{3}"`.
+Övriga escapes fungerar som i vanliga strängar, inklusive Unicode och NUL. Textsegment får inte innehålla råa
 radbrytningar; uttrycken kan sträcka sig över flera rader. Ett tomt hål,
 en ensam `}`, obalanserade delimiters eller en oavslutad interpolation ger
 ett kompileringsfel på originalpositionen. Nästlade interpolerade strängar
@@ -122,29 +117,8 @@ tolkning, även när den innehåller klamrar.
 
 ## Funktioner och kontrollflöde
 
-```dunder
-fn fibonacci(n: i32) -> i64 {
-    mut previous: i64 = 0
-    mut current: i64 = 1
-    mut i := 0
-    while i < n {
-        next := previous + current
-        previous = current
-        current = next
-        i = i + 1
-    }
-    return previous
-}
-
-fn main() {
-    result := fibonacci(20)
-    if result == 6765 {
-        print(result)
-    } else {
-        print(false)
-    }
-}
-```
+[Fibonacci-exemplet](../examples/fibonacci.ddr) visar en funktion med typad
+parameter, returvärde och en loop över ett intervall.
 
 Parameter- och returtyper i funktionssignaturer är explicita. Framåtanrop,
 rekursion och ömsesidig rekursion tillåts. Parametrarna är oföränderliga.
@@ -182,13 +156,14 @@ fn length(values: []i32) -> i32 { values.len }
 fn main() {
     mut a: []i32 = [1, 2, 3]
     print(length(a))
-    b := a                     // flyttar ägaren; a är nu förbrukad
-    c := keep(move b)          // uttryckligt ägarbyte vid anrop
+    b := a
+    c := keep(move b)
     print(length(c))
 }
 ```
 
-Litteraler och färska ägda returvärden kan lämnas direkt till en
+Tilldelningen flyttar arrayen från `a` till `b` och anropet lämnar den vidare
+till `keep`. Litteraler och färska ägda returvärden kan lämnas direkt till en
 `move`-parameter. En `move`-parameter av kopierbar skalär typ fungerar som
 ett vanligt skalärvärde. Funktionstyper följer samma regel:
 `fn([]i32) -> i32` lånar, medan `fn(move []i32) -> []i32` tar över en array.
@@ -203,7 +178,8 @@ fn drain(values: &mut []i32) -> []i32 { replace(&mut values, []) }
 
 fn main() {
     mut values: []i32 = [20, 22]
-    previous := drain(&mut values)    // previous äger bufferten, values är tom
+    previous := drain(&mut values)
+    assert(previous.len == 2 && values.len == 0)
     next: []i32 = [42]
     empty := replace(&mut values, move next)
 }
@@ -370,19 +346,21 @@ Tomma segment inne i namnet, som `std..map`, och en avslutande punkt avvisas.
 Äldre importer med snedstreck eller citattecken stöds för kompatibilitet;
 de behandlas fortfarande som filsökvägar och behövs inte för nya importer.
 
+I `math.ddr` anropar den publika funktionen `double` den privata funktionen `scale`.
+
 ```dunder
-// math.ddr
 pub fn double(value: i32) -> i32 {
-    return scale(value, 2)
+    scale(value, 2)
 }
 
 fn scale(value: i32, factor: i32) -> i32 {
-    return value * factor
+    value * factor
 }
 ```
 
+I `main.ddr` används `math.double` som funktionsvärde.
+
 ```dunder
-// main.ddr
 import math
 
 fn main() {
@@ -741,14 +719,6 @@ behåller sina ursprungliga element om källsträngen ersätts under iterationen
 Ogiltiga index och intervall ger status 103. Strängoperatorerna ger 105 vid
 misslyckad allokering och 106 för ett snitt mitt i en UTF-8-sekvens eller
 ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
-
-## Nästa språkbeslut
-
-Ägarflyttar, uttrycklig kloning och läslån är den gemensamma modellen;
-se [minnesmodellen](memory.md) och [standardbiblioteket](standard.md).
-Lagrade referenser i aggregat, lokala skrivlån, generiska bibliotek och egna
-iteratorer återstår. Självhosting verifieras
-på de tre nativa målen; [Wasm-verifiering är senarelagd](status.md#webassembly-senarelagt-under-språkutveckling).
 
 ## Råtyper, privilegier och C-layout
 

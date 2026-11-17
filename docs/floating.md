@@ -36,8 +36,8 @@ aldrig implicit till en annan numerisk typ.
 
 ```dunder
 x: f32 = 1.25
-y := x + 0.5          // f32
-wide := f64(y)        // explicit f32 -> f64
+y := x + 0.5
+wide := f64(y)
 count := 10
 scaled := f64(count) * 0.25
 ```

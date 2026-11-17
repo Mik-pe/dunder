@@ -16,9 +16,9 @@ are also supported by the language. Workers have no IO, ambient state or nested 
 | cpu | A record supplies a distinct seed and step count. Each worker advances an integer recurrence and returns its full sum and final state. | Python arbitrary-precision multiplication/remainder and sum, checking both fields of all 32 results. |
 | array | A record supplies a primitive array snapshot, job index and pass count. Each worker copies and updates its private array and returns its weighted sum, first and last value. | Python lists and integer arithmetic for every element/pass. All result fields and the parent's unchanged original checksum/endpoints are checked. |
 
-The `*_worker.ddr` modules are ordinary old-syntax Dunder. The correctness tool
-can compile direct-call consumers of them with the frozen serial compiler;
-these are untimed checks, not another throughput baseline.
+The correctness tool can also call the `*_worker.ddr` modules directly using
+the serial compiler built by `tools/bootstrap.sh`. It checks the same expected
+results for each worker.
 
 Whole-process samples include process startup, argument parsing, input setup,
 ordinary value copies, task-boundary clones, OS thread creation, work, joins,
@@ -30,7 +30,7 @@ uncontrolled; the report records host/hardware and paired samples.
 
 ```sh
 python3 tools/performance-tasks.py check /path/to/task-compiler \
-  --reference-compiler /path/to/whole-function-objects-final \
+  --reference-compiler build/selfhost/arm64-macos/dunder-serial \
   --report build/task-throughput-check
 ```
 

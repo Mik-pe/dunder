@@ -18,7 +18,7 @@ fn main() {
     kind := FileKind.File
     expected: FileKind = .File
     assert(kind == expected)
-    print(i32(kind))  // 1
+    assert(i32(kind) == 1)
 }
 ```
 
@@ -30,7 +30,7 @@ läser talvärdet; `FileKind(number)` tar en `i32` och kontrollerar att värdet
 finns i deklarationen. Ett okänt värde avslutar processen med status 108.
 
 En enum utan data lagras som fyra byte och stöder `==` och `!=` mot samma
-typ. Den kan också vara structfält eller element i en fast array.
+typ. Den kan också vara structfält eller element i en fast eller dynamisk array.
 Heltalsaritmetik och ordningsjämförelser kräver en explicit konvertering.
 
 ## Varianter med data
@@ -94,16 +94,16 @@ fn beskriv(resultat: sys.ReadResult) -> string {
         .Ok(text) if text.len > 0 => text.clone(),
         .Ok(_) => "tom fil",
         .Err(.NotFound) => "filen saknas",
-        .Err(.Other(kod)) => "systemfel " + kod.str(),
+        .Err(.Other(kod)) => f"systemfel {kod}",
         .Err(fel) => sys.io_error_message(fel),
     }
 }
 
 fn main() {
-    print(beskriv(.Ok("hej")))          // hej
-    print(beskriv(.Ok("")))             // tom fil
-    print(beskriv(.Err(.NotFound)))     // filen saknas
-    print(beskriv(.Err(.Other(123))))   // systemfel 123
+    assert(beskriv(.Ok("hej")) == "hej")
+    assert(beskriv(.Ok("")) == "tom fil")
+    assert(beskriv(.Err(.NotFound)) == "filen saknas")
+    assert(beskriv(.Err(.Other(123))) == "systemfel 123")
 }
 ```
 
@@ -150,11 +150,11 @@ fn totalpris(pris: i32, leverans: Leverans) -> i32 {
             avgift + emballage
         },
     }
-    return pris + frakt
+    pris + frakt
 }
 
 fn main() {
-    print(totalpris(100, .Skicka(29)))  // 134
+    assert(totalpris(100, .Skicka(29)) == 134)
 }
 ```
 
@@ -203,10 +203,11 @@ Programmet `dogfood/enums.ddr` i `dunder-hundmat` provar båda formerna och näs
 privata typer, egna taggvärden, arrayer/structfält, blandade payloads,
 funktionsvärden, callbacks, rekursiva returer, stackargument och verklig fil-I/O.
 
-Data-enums kan vara structfält och innehålla andra aggregat, inklusive
-dynamiska arrayer och andra data-enums. Arrayelement är fortfarande begränsade
-till skalärer och enums utan payload. Ett enumvärde får vara högst
-64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
+Fasta och dynamiska arrayer kan innehålla enums med payload. Ett element
+kan i sin tur äga en array, en struct eller en annan enum. Ägarskap och
+kloning följer payloadens typ. [Körbart exempel](../tests/fixtures/aggregate_arrays/enums.ddr)
+
+Ett enumvärde får vara högst 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
 generiska `Result<T>`/`Option<T>`, `?`, alternativa
 mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja
 payload eller en textrepresentation. [sys](sys.md) använder redan konkreta
