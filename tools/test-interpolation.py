@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify interpolation through native CLI, caches, diagnostics and source/token APIs."""
+"""Verify interpolation through the CLI, native and Wasm execution, caches and APIs."""
 import argparse
 import json
 from pathlib import Path
@@ -10,8 +10,18 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
+NATIVE = ('arm64-macos', 'arm64-linux', 'x86_64-linux')
+TARGETS = (*NATIVE, 'wasm32')
 FIXTURES = ROOT / 'tests/fixtures/interpolation'
+WASM = """
+const image = new WebAssembly.Module(require('node:fs').readFileSync(process.argv[1]));
+const instance = new WebAssembly.Instance(image, {dunder: {print_string: ptr => {
+    const memory = instance.exports.memory.buffer;
+    const length = Number(new DataView(memory).getBigUint64(ptr, true));
+    console.log(new TextDecoder().decode(new Uint8Array(memory, ptr + 8, length)));
+}}});
+instance.exports.main();
+"""
 
 
 def call(program, args, cwd, status=0, expected=None):
@@ -36,7 +46,9 @@ def host_target():
 
 def assert_image(image, target):
     data = image.read_bytes()
-    if target == 'arm64-macos':
+    if target == 'wasm32':
+        assert data[:8] == b'\x00asm\x01\x00\x00\x00', image
+    elif target == 'arm64-macos':
         assert data[:4] == b'\xcf\xfa\xed\xfe', image
     else:
         assert data[:4] == b'\x7fELF', image
@@ -54,6 +66,12 @@ def diagnostic_contracts(compiler, work):
         ('record', 'struct P{x:i32} fn main(){print(f"{P{x:1}}")}', 'str'),
         ('enum', 'enum P{A,B} fn main(){print(f"{P.A}")}', 'str'),
         ('unit', 'fn nothing(){} fn main(){print(f"{nothing()}")}', 'str'),
+        ('empty-format', 'fn main(){print(f"{42:}")}', 'invalid integer interpolation format'),
+        ('unknown-format', 'fn main(){print(f"{42:b}")}', 'invalid integer interpolation format'),
+        ('wide-format', 'fn main(){print(f"{42:2147483648x}")}', 'invalid integer interpolation format'),
+        ('float-hex', 'fn main(){print(f"{42.0:x}")}', 'integer interpolation format requires an integer'),
+        ('string-hex', 'fn main(){print(f"{\'name\':x}")}', 'integer interpolation format requires an integer'),
+        ('reserved-method', 'fn main(){print(42.__dunder_module_format_integer("x"))}', 'reserved compiler identifier'),
     )
     checked = 0
     for name, text, message in invalid:
@@ -101,10 +119,10 @@ def api_contracts(compiler, work, host):
     api = work / 'api-consumer'
     call(compiler, ['build', FIXTURES / 'api.ddr', '-o', api], ROOT)
     direct = work / 'direct.ddr'
-    direct.write_text('fn main(){value:=40;print(f"å \\n{{{value + 2}}} {f\'nested {true}\'} \\0") }\n')
-    direct_output = 'å \n{42} nested true \0\n'
+    direct.write_text('fn main(){value:=40;print(f"å \\n{{{value + 2:04X}}} {f\'nested {true}\'} \\0") }\n')
+    direct_output = 'å \n{002A} nested true \0\n'
     checked = 0
-    for number, target in enumerate(TARGETS):
+    for number, target in enumerate(NATIVE):
         for mode, source, expected in (
             ('direct', direct, direct_output),
             ('source', FIXTURES / 'main.ddr', 'interpolation ok\n'),
@@ -147,7 +165,11 @@ def main():
                     assert_image(image, target)
                     if target == host:
                         call(image, [], work, expected='interpolation ok\n')
+                    elif target == 'wasm32':
+                        call('node', ['-e', WASM, image], work, expected='interpolation ok\n')
                     builds += 1
+            if target == 'wasm32':
+                continue
             # Cached and fresh compilation must publish exactly the same image.
             cached = work / f'cached-{target}'
             flags = ['--target', target, '--incremental', '--timings=json']
@@ -162,7 +184,7 @@ def main():
         invalid = diagnostic_contracts(compiler, work)
         apis = api_contracts(compiler, work, host)
     print(f'interpolation: {builds} CLI builds, {invalid} diagnostic contracts, '
-          f'{apis} source/token API images; host execution passed')
+          f'{apis} source/token API images; host and Wasm execution passed')
 
 
 if __name__ == '__main__':

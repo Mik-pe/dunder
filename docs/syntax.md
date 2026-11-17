@@ -116,10 +116,22 @@ Tidigare strängvärden hålls levande även om ett senare hål ersätter deras
 ursprungliga variabel. Resultatet är en vanlig ägd `string`.
 
 Tillåtna resultattyper är `string`, signerade och osignerade heltal,
-`usize`, `bool`, `rune`, `f32` och `f64`. Formateringen motsvarar `.str()`;
+`usize`, `bool`, `rune`, `f32` och `f64`. Standardformatet motsvarar `.str()`;
 för en sträng delar `.str()` dess oföränderliga text. Aggregat, råpekare och
 funktioner kräver att programmet först väljer en textrepresentation.
-Formatkoder som `:02` ingår inte.
+
+Heltal kan formateras med `:d` för decimal, `:x` för gemena hexadecimala
+siffror och `:X` för versaler. En bredd före formatkoden fyller ut med
+blanksteg eller, om den börjar med `0`, med nollor. Om bokstaven utelämnas
+används decimalformat. Bredden är ett minimum och räknar med eventuellt
+minustecken. Negativa värden visas med minustecken även i hexadecimal form.
+
+```dunder
+color := 0xaf
+hex := f"#{color:04X}"      // "#00AF"
+position := f"{-7:04d}"    // "-007"
+count := f"{3:02}"         // "03"
+```
 
 `{{` och `}}` ger bokstavliga klamrar. I exemplet blir `escaped` strängen `"{3}"`.
 Övriga escapes fungerar som i vanliga strängar, inklusive Unicode och NUL. Textsegment får inte innehålla råa
@@ -705,7 +717,7 @@ avvisas. Oescapade radbrytningar och råsträngar stöds ännu inte.
 NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering används.
 
 `f"Hej {name}, {count + 1}!"` och `f'Hej {name}!'` interpolerar uttryck
-från vänster till höger med samma konvertering som `.str()`. Uttrycken
+från vänster till höger. Hål utan formatkod använder `.str()`. Uttrycken
 lånar sina operander; att formatera en sträng flyttar inte dess ägare.
 `{{` och `}}` ger bokstavliga klamrar. Vanliga strängliteraler interpolerar
 inte. Fel i uttrycken pekar på deras ursprungliga källpositioner.
