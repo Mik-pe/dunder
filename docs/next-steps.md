@@ -69,6 +69,8 @@ fortsätter vara standardvalen.
 
 ## Grafik
 
-I `dunder-hundmat/graphics/macos.ddr` återstår texturstöd för en
-teckenatlas och läsning av pixlar utan fönster. Med en atlas kan text
-ritas utan att varje täckt pixel behöver en egen fyrhörning.
+[Hundmats macOS-modul](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/graphics/macos.ddr)
+stöder en Metal-texturatlas och BGRA8-läsning utan fönster.
+Skrift ritar varje packat textprov med en fyrhörning. Verifieringen
+körde Skrift i fönster och utan fönster och kontrollerade färgkanaler,
+radorientering och alfablendning i [pixelprovet](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/metal/pixels.ddr).
