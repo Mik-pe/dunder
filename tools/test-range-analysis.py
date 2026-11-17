@@ -52,7 +52,6 @@ fn main(){
     assert(verify.validate(&f,true))
     before:=f.clone()
     mut w:=ranges.new()
-    // Reuse a consumed workspace before the budget-constrained observation.
     mut warm:=f.clone()
     if ranges.analyze_into(&mut w,&warm){ranges.apply(&mut w,&mut warm)}
     allowance:=i32(decimal.integer(sys.arg(2)).value);ranges.set_budget(&mut w,allowance)

@@ -18,5 +18,6 @@ case "$(uname -s):$(uname -m)" in
     *) echo "Unsupported verify host: $(uname -sm)" >&2; exit 1 ;;
 esac
 serial_compiler="$root/build/selfhost/$host/dunder-serial"
+"$compiler" run selfhost/embed.ddr -o "$work/embed" -- --check
 "$compiler" build tools/verify.ddr -o "$work/verify" >&2
 "$work/verify" "$compiler" --mir-reports "$mir_reports" --serial-compiler "$serial_compiler" "$@"

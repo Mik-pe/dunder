@@ -58,7 +58,6 @@ fn main() {
         alias := &left
         number: &i32 = &value.number
         label := &value.text
-        // A loan of one field permits moves and writes to its siblings.
         right := value.right
         assert(right[0] == 7)
         value.right = [8]
@@ -146,8 +145,6 @@ fn main() {
     assert(sum(packed_view) == 42 && packed_element == 22 && tag == 255)
     text := "x" + "å🌍" + "y"
     unsafe {
-        // String bytes are inline after their length word. No temporary
-        // string handle or copied byte buffer may replace this original data.
         original := ptr(usize(load_ptr(addr(&text))) + 9)
         utf8 := &text[1..7]
         assert(utf8.len == 6 && bytes.equals_text(utf8, 0, utf8.len, "å🌍"))
@@ -184,16 +181,12 @@ fn main() {
     assert(read(&42) == 42 && read(&(20 + 22)) == 42)
     assert(text_after_allocation(&42.str()) == 2)
     source: [i32; 1] = [42]
-    // Nested call arguments can carry a view's frame home. A newly owned
-    // result, array constructor or scalar expression must publish its own
-    // provenance rather than reusing that inner argument's borrowed storage.
     assert(first(&owned_after_read(&source[0..1])) == 99)
     assert(length(&[99, first(&source[0..1])]) == 2)
     assert(read(&(first(&source[0..1]) + 57)) == 99)
     assert(read(&(first(&source[0..1]) + offset())) == 99)
     assert(text_after_allocation(&text_after_read(&source[0..1])) == 2)
     for turn in 0..2000 {
-        // Later argument allocation must not invalidate an earlier temporary.
         assert(combine(&fresh(), &disturbance()) == 45)
         assert(after_allocation(&pair().left) == 42)
         assert(read(&[20, 22][1]) == 22)

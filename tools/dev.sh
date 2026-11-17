@@ -22,7 +22,7 @@ if [ ! -x "$host_compiler" ]; then
 fi
 
 bundle=selfhost/bundled.ddr
-if [ ! -f "$bundle" ] || [ stdlib/modules.txt -nt "$bundle" ] || [ runtime/float.ddr -nt "$bundle" ] ||
+if [ ! -f "$bundle" ] || [ selfhost/embed.ddr -nt "$bundle" ] || [ stdlib/modules.txt -nt "$bundle" ] || [ runtime/float.ddr -nt "$bundle" ] ||
     [ -n "$(find stdlib -type f -name '*.ddr' -newer "$bundle" -print)" ]; then
     "$host_compiler" run selfhost/embed.ddr -o build/dev/embed
 fi

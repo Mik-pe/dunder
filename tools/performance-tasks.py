@@ -60,16 +60,43 @@ def serial_source(name, work):
     module = os.path.relpath(COHORT / (name + '_worker'), work).replace(os.sep, '/')
     header = 'import ' + json.dumps(module) + ' as kernel\nimport std.sys as sys\nimport std.parse as parse\n'
     if name == 'cpu':
-        body = '''fn main(){count:=i32(parse.integer(sys.arg(1)).value)
-for job in 0..32{result:=kernel.run(kernel.Request{seed:1729+i64(job)*7919,steps:count});print(result.checksum);print(result.last)}}
-'''
+        body = """fn main() {
+    count := i32(parse.integer(sys.arg(1)).value)
+    for job in 0..32 {
+        result := kernel.run(kernel.Request { seed: 1729 + i64(job) * 7919, steps: count })
+        print(result.checksum)
+        print(result.last)
+    }
+}
+"""
     else:
-        body = '''fn main(){count:=i32(parse.integer(sys.arg(1)).value);length:=i32(parse.integer(sys.arg(2)).value)
-mut values:[]i64=[];for i in 0..length{values.push((i64(i)*17+1729)%1009)}
-for job in 0..32{result:=kernel.run(kernel.Request{values:values,passes:count,job:i64(job)});print(result.checksum);print(result.first);print(result.last)}
-mut checksum:i64=0;for i in 0..values.len{checksum=checksum+values[i]*i64(i+1)};print(checksum)
-if values.len>0{print(values[0]);print(values[values.len-1])}else{print(0);print(0)}}
-'''
+        body = """fn main() {
+    count := i32(parse.integer(sys.arg(1)).value)
+    length := i32(parse.integer(sys.arg(2)).value)
+    mut values: []i64 = []
+    for i in 0..length {
+        values.push((i64(i) * 17 + 1729) % 1009)
+    }
+    for job in 0..32 {
+        result := kernel.run(kernel.Request { values: values.clone(), passes: count, job: i64(job) })
+        print(result.checksum)
+        print(result.first)
+        print(result.last)
+    }
+    mut checksum: i64 = 0
+    for i in 0..values.len {
+        checksum += values[i] * i64(i + 1)
+    }
+    print(checksum)
+    if values.len > 0 {
+        print(values[0])
+        print(values[values.len - 1])
+    } else {
+        print(0)
+        print(0)
+    }
+}
+"""
     return header + body
 
 
@@ -96,7 +123,7 @@ def main():
         sub.add_argument('--compiler-flag', action='append', default=[])
         if mode == 'check':
             sub.add_argument('--reference-compiler', type=Path,
-                             help='also validate the ordinary kernels with an older serial compiler')
+                             help='also validate the kernels through direct calls with a compatible serial compiler')
         elif mode == 'calibrate':
             sub.add_argument('--target-ms', type=float, default=250)
         else:

@@ -1,7 +1,5 @@
 capability filesystem, unsafe
 
-// SQLite connections and prepared statements keep C ownership behind an opaque handle.
-// SQL and parameters are UTF-8; text lengths always use SQLite byte counts, never strlen.
 import std.bytes as bytes
 import std.json as json
 
@@ -237,8 +235,6 @@ unsafe fn copy_text(value: ptr, length: i32) -> string {
     out.reserve(length)
     for i in 0..length { out.push(load_u8(ptr(usize(value) + usize(i)))) }
     decoded := bytes.decode(&out)
-    // SQLite permits arbitrary bytes in TEXT. The JSON interface rejects them
-    // before exposing a row instead of silently replacing invalid UTF-8.
     if !decoded.ok { return "" }
     decoded.value
 }
@@ -255,7 +251,7 @@ unsafe fn copy_c_string(value: ptr) -> string {
 
 unsafe fn failure(db: ptr) -> string {
     if db == ptr(0) { return "SQLite could not allocate a connection" }
-    "SQLite: " + copy_c_string(sql_errmsg(db))
+    f"SQLite: {copy_c_string(sql_errmsg(db))}"
 }
 
 fn tail_empty(sql: string, start: i32) -> bool {
@@ -277,47 +273,44 @@ fn tail_empty(sql: string, start: i32) -> bool {
     true
 }
 
-// sqlite3_complete recognizes trigger bodies without preparing anything. Check
-// each possible terminator before prepare: several PRAGMAs act at prepare time.
-// Thus an invalid multi-statement request cannot change even pragma state.
+enum SqlContext { Statement, Quoted, Bracket, LineComment, BlockComment }
+
 unsafe fn single_statement(sql: string) -> bool {
     mut prefix: []u8 = []
     prefix.reserve(sql.len + 1)
-    mut state := 0 // single/double/backtick/bracket quoting and SQL comments
+    mut context: SqlContext = .Statement
+    mut quote: u8 = 0
     mut i := 0
     mut terminators := 0
     while i < sql.len {
-        byte := sql[i]
-        prefix.push(u8(byte))
-        if state >= 1 && state <= 3 {
-            mut quote := 39
-            if state == 2 { quote = 34 }
-            if state == 3 { quote = 96 }
+        byte := u8(sql[i])
+        prefix.push(byte)
+        if context == .Quoted {
             if byte == quote {
-                if i + 1 < sql.len && sql[i + 1] == quote {
+                if i + 1 < sql.len && u8(sql[i + 1]) == quote {
                     i += 1
-                    prefix.push(u8(quote))
-                } else { state = 0 }
+                    prefix.push(quote)
+                } else { context = .Statement }
             }
-        } else if state == 4 {
-            if byte == 93 { state = 0 }
-        } else if state == 5 {
-            if byte == 10 { state = 0 }
-        } else if state == 6 {
-            if byte == 42 && i + 1 < sql.len && sql[i + 1] == 47 {
+        } else if context == .Bracket {
+            if byte == b']' { context = .Statement }
+        } else if context == .LineComment {
+            if byte == b'\n' { context = .Statement }
+        } else if context == .BlockComment {
+            if byte == b'*' && i + 1 < sql.len && u8(sql[i + 1]) == b'/' {
                 i += 1
-                prefix.push(47)
-                state = 0
+                prefix.push(b'/')
+                context = .Statement
             }
-        } else if byte == 39 { state = 1 }
-        else if byte == 34 { state = 2 }
-        else if byte == 96 { state = 3 }
-        else if byte == 91 { state = 4 }
-        else if byte == 45 && i + 1 < sql.len && sql[i + 1] == 45 {
-            state = 5
-        } else if byte == 47 && i + 1 < sql.len && sql[i + 1] == 42 {
-            state = 6
-        } else if byte == 59 {
+        } else if byte == b'\'' || byte == b'"' || byte == b'`' {
+            context = .Quoted
+            quote = byte
+        } else if byte == b'[' { context = .Bracket }
+        else if byte == b'-' && i + 1 < sql.len && u8(sql[i + 1]) == b'-' {
+            context = .LineComment
+        } else if byte == b'/' && i + 1 < sql.len && u8(sql[i + 1]) == b'*' {
+            context = .BlockComment
+        } else if byte == b';' {
             terminators += 1
             if terminators > 256 { return false }
             prefix.push(0)
@@ -394,7 +387,6 @@ unsafe fn prepare_values(db: ptr, sql: string, params: &[]string, blob_index: i3
             return Prepared { ok: false, statement: ptr(0), error: "SQLite parameter exceeds its byte limit" }
         }
         parameter := c_string(params[parameter_index])
-        // TRANSIENT copies immediately; even empty text has a non-null pointer.
         bound := sql_bind_text(statement, i + 1, addr(&parameter[0]), parameter.len - 1, transient)
         if bound != 0 {
             message := failure(db)
@@ -431,8 +423,12 @@ impl Database {
         raw := c_string(path)
         unsafe {
             mut handle := ptr(0)
-            mut flags := 65542 // READWRITE | CREATE | FULLMUTEX
-            if read_only { flags = 65537 } // READONLY | FULLMUTEX
+            open_readonly := 0x1
+            open_readwrite := 0x2
+            open_create := 0x4
+            open_fullmutex := 0x10000
+            access := if read_only { open_readonly } else { open_readwrite.bit_or(open_create) }
+            flags := open_fullmutex.bit_or(access)
             code := sql_open_v2(addr(&raw[0]), addr(&mut handle), flags, ptr(0))
             if code != 0 {
                 message := failure(handle)
@@ -476,8 +472,6 @@ impl Database {
         ExecResult { ok: false, changes: 0, last_id: 0, error: "SQLite requires a native target" }
     }
 
-    // Bind one binary value at the one-based placeholder index. params contains
-    // all other text parameters in order; empty data binds an empty BLOB, not NULL.
     pub fn exec_blob(&self, sql: string, params: &[]string, blob_index: i32, data: &[]u8) -> ExecResult {
         if blob_index < 1 || blob_index > params.len + 1 || data.len > 67108864 {
             return ExecResult { ok: false, changes: 0, last_id: 0, error: "invalid SQLite BLOB binding" }
@@ -489,16 +483,10 @@ impl Database {
         ExecResult { ok: false, changes: 0, last_id: 0, error: "SQLite requires a native target" }
     }
 
-    // Rows are independent JSON objects. Integers retain all 64 bits, finite
-    // doubles retain their value, and TEXT is decoded using its actual byte
-    // count. BLOB is deliberately rejected; callers must explicitly hex it.
     pub fn query(&self, sql: string, params: &[]string) -> QueryResult {
         self.read_rows(sql, &params, true)
     }
 
-    // Explicitly execute a statement returning rows, such as INSERT RETURNING
-    // or PRAGMA wal_checkpoint. Prepared-statement and cleanup rules are the
-    // same as query; the caller deliberately permits the statement's effects.
     pub fn execute_rows(&self, sql: string, params: &[]string) -> QueryResult {
         self.read_rows(sql, &params, false)
     }

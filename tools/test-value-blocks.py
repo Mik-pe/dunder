@@ -68,11 +68,12 @@ def main():
         runners[target] = shlex.split(command)
 
     validated = built = executed = rejected = 0
+    expected_errors = json.loads((FIXTURES.parent / 'diagnostics.json').read_text())
     invalid = {}
     for source in sorted(FIXTURES.glob('invalid-*.ddr')):
-        header = source.read_text().splitlines()[0]
-        assert header.startswith('// error: '), source
-        invalid[source] = header.removeprefix('// error: ')
+        message = expected_errors[source.relative_to(FIXTURES.parent).as_posix()]
+        assert message, source
+        invalid[source] = message
     with tempfile.TemporaryDirectory(prefix='dunder-value-blocks-') as directory:
         work = Path(directory).resolve()
         image = work / 'value-blocks'

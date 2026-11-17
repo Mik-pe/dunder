@@ -138,8 +138,6 @@ def positive_cases():
         while i<values.len{if i==n{return total};if i%2==0{total=total+values[i]};i=i+1}
         return total
     }
-    // This requires legacy fallback: reading a borrowed array into an owned
-    // binding must explicitly clone rather than copying its raw reference.
     fn copied(values:&[]i64)->i64{mut copy:=values.clone();copy[0]=123;return values[0]+copy[0]}
     fn main(){'''
     expected = []

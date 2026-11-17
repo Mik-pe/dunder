@@ -3,34 +3,12 @@ import ..backend.ffi_arm64 as abi
 import ..backend.foreign_operation as foreign
 import ..runtime.runtime
 
-// Each submitted job exclusively owns its isolated allocator until waited.
-// On ARM64/macOS the scope submits to libdispatch; on Linux ARM64 and x86-64
-// it spawns and joins native POSIX threads.
-// Control (112 B): state 0, dispatch group or pthread_t 8, input 16, result 24,
-// arena base 32, parent result 40, submitted allocator cursor 48, wait error 56,
-// unmap error 64, recycled arena 72, workspace initializer 80, exclusive
-// workspace root 88, optional borrow of the scope snapshot slot 96. Only the
-// worker writes result/base while running.
-// States: ready 0, submitted 1, cached 4, submission failed 5, wait failed 6,
-// discarded 8, unmap failed 9, cached owner consumed 10. On wait failure the
-// child may still be using the arena. Keep the group, thread, arena and control alive.
 pub fn control_bytes() -> i32 { 112 }
 pub fn pool_bytes() -> i64 { 536870912 }
-// Keep the existing heap budget. The inaccessible range spans the largest
-// single frame possible in arm.frame(), so a large frame cannot skip it.
 fn guard_bytes() -> i64 { 16777216 }
 fn mapping_bytes() -> i64 { pool_bytes() + guard_bytes() + 8388608 }
 fn native_platform(platform: i32) -> bool { platform == 0 || platform == 1 || platform == 2 }
 pub fn supported(platform: i32, profiling: bool) -> bool { native_platform(platform) && !profiling }
-// Clone label -1 means identity for a proven scalar-only boundary. Label0 is
-// an ordinary valid label, never a sentinel. Worker must always be a label.
-// All three labels use the uniform internal ABI: source/root bits in X0,
-// returned root bits in X0. Clones borrow their source; input_mode selects
-// an owning argument (0), a borrowed root slot (1), a borrowed C payload (2)
-// or a borrowed fixed-array payload (3). The provider drops borrowed input
-// clones after the worker returns and transfers the owned result to control.
-// A fatal worker
-// trap retains the existing process-fatal semantics; it is not a task error.
 pub struct TaskSpec { input_clone: i32, input_mode: i32, input_drop: i32, worker: i32, result_clone: i32, result_drop: i32 }
 pub struct Symbols {
     symbol_count: i32, global_queue: i32, create_group: i32, submit: i32,
@@ -62,9 +40,6 @@ fn imported(c: &mut arm.Code, out: &mut Provider, slot: i32, gp_args: i32) {
     arm.emit(&mut c, 0); arm.emit(&mut c, 0); arm.mov(&mut c, 17, 16)
     foreign.emit(&mut c, .Invoke, gp_args, 0, 0)
 }
-// x0 points to fresh, unexposed control storage; x1 is a synchronously borrowed source
-// root (or scalar bits). Initialization does not take/drop a managed owner.
-// This must not be used to reset an existing live control.
 pub fn emit_initialize(c: &mut arm.Code) {
     for slot in 0..14 { mut src := 31; if slot == 2 { src = 1 }; store(&mut c, src, 0, slot * 8) }
 }
@@ -88,8 +63,6 @@ pub fn emit_unmap_pool(c: &mut arm.Code, symbols: &Symbols) -> UnmapHelper {
     out.ok = true; out
 }
 
-// Clone synchronously in the destination allocator domain. The caller's
-// borrowed source remains live for this call and is never sent to a worker.
 fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbols) {
     begin(&mut c, out.create, 5); arm.store(&mut c, 0, 0)
     bad := arm.label(&mut c); failed := arm.label(&mut c)
@@ -110,8 +83,6 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
     reused := arm.label(&mut c); exhausted := arm.label(&mut c)
     reset := arm.label(&mut c); resume := arm.label(&mut c)
     compare(&mut c, 21, 0); arm.branch(&mut c, reused, 3)
-    // One lazy VM reservation per active lane: ordinary allocator, guard,
-    // then a main-thread-sized Dunder stack. Untouched pages need no backing.
     arm.imm(&mut c, 0, 0); arm.imm(&mut c, 1, mapping_bytes())
     arm.imm(&mut c, 2, 3)
     if c.platform != 0 { arm.imm(&mut c, 3, 34) } else { arm.imm(&mut c, 3, 4098) }
@@ -120,7 +91,7 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
     if c.platform == 0 { arm.branch(&mut c, exhausted, 4) }
     else { compare(&mut c, 0, 0); arm.branch(&mut c, exhausted, 13) }
     arm.mov(&mut c, 21, 0); arm.imm(&mut c, 11, pool_bytes())
-    arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32) // ADD X0,X21,X11
+    arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32)
     arm.imm(&mut c, 1, guard_bytes()); arm.imm(&mut c, 2, 0)
     arm.syscall(&mut c, 33554506, 226)
     if c.platform == 0 { arm.branch(&mut c, exhausted, 4) }
@@ -149,7 +120,7 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
         submit_failed := arm.label(&mut c)
         arm.branch(&mut c, out.worker_entry, 20); arm.mov(&mut c, 2, 0)
         arm.load_into(&mut c, 0, 3)
-        arm.emit(&mut c, 2432696320 + 8 * 1024 + 3 * 32 + 0) // ADD X0,X3,#8
+        arm.emit(&mut c, 2432696320 + 8 * 1024 + 3 * 32 + 0)
         arm.imm(&mut c, 1, 0)
         imported(&mut c, &mut out, symbols.submit, 4)
         arm.emit(&mut c, 2470476800)
@@ -174,8 +145,6 @@ fn create(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symbo
     arm.mark(&mut c, bad); arm.imm(&mut c, 0, -1); arm.ret(&mut c)
 }
 
-// Threads enter via the host C ABI. Preserve host callee-saved registers and
-// run worker callees on the arena's private 8 MiB stack and allocator state.
 fn entry(c: &mut arm.Code, spec: &TaskSpec, label: i32) {
     if c.platform == 2 {
         arm.mark(&mut c, label); arm.emit(&mut c, 4227858433)
@@ -189,37 +158,29 @@ fn entry(c: &mut arm.Code, spec: &TaskSpec, label: i32) {
     load(&mut c, 19, 0, 48); load(&mut c, 21, 0, 32)
     arm.imm(&mut c, 11, pool_bytes()); arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 20)
     if c.platform != 2 {
-        // Keep the C thread's frame in X29. Dunder callees restore it on return;
-        // the ordinary epilogue recovers the native SP before returning to C.
         arm.imm(&mut c, 11, mapping_bytes())
-        arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 11) // ADD X11,X21,X11
-        arm.emit(&mut c, 2432696320 + 11 * 32 + 31) // ADD SP,X11,#0
+        arm.emit(&mut c, 2332033024 + 11 * 65536 + 21 * 32 + 11)
+        arm.emit(&mut c, 2432696320 + 11 * 32 + 31)
     }
     run := arm.label(&mut c); ready := arm.label(&mut c)
     load(&mut c, 17, 0, 80); compare(&mut c, 17, 0); arm.branch(&mut c, run, 2)
     load(&mut c, 10, 0, 88); compare(&mut c, 10, 0); arm.branch(&mut c, ready, 3)
-    arm.emit(&mut c, 3594453536) // BLR X17: certified nullary workspace initializer
+    arm.emit(&mut c, 3594453536)
     arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 88)
     arm.mark(&mut c, ready); arm.load(&mut c, 0)
-    arm.emit(&mut c, 2432696320 + 88 * 1024 + 1) // X1 = &mut workspace slot
+    arm.emit(&mut c, 2432696320 + 88 * 1024 + 1)
     load(&mut c, 2, 0, 96)
     args_ready := arm.label(&mut c); arm.branch(&mut c, args_ready, 0)
     arm.mark(&mut c, run); load(&mut c, 1, 0, 96)
     arm.mark(&mut c, args_ready); load(&mut c, 0, 0, 16)
     if spec.input_mode == 1 {
-        // The source borrow ABI expects the address of a root cell. Keep
-        // that cell in the dispatch frame while the worker uses its stack.
         arm.store(&mut c, 19, 0); arm.address(&mut c, 19)
     } else if spec.input_mode == 3 {
-        // Fixed scalar arrays are cloned as descriptors, but a borrow of
-        // their inline source representation points directly to the data.
         load(&mut c, 0, 0, 0)
     }
     arm.branch(&mut c, spec.worker, 1)
     arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 24)
     if spec.input_drop >= 0 {
-        // The borrowed callee does not clean its input. Release the separate
-        // child-domain owner before recycling this lane's allocator cursor.
         load(&mut c, 0, 1, 16); arm.branch(&mut c, spec.input_drop, 1)
         arm.load_into(&mut c, 0, 1); store(&mut c, 31, 1, 16)
     }
@@ -267,8 +228,6 @@ fn collect(c: &mut arm.Code, out: &mut Provider, spec: &TaskSpec, symbols: &Symb
     if spec.result_clone >= 0 { arm.branch(&mut c, spec.result_clone, 1) }
     arm.load_into(&mut c, 0, 1); store(&mut c, 0, 1, 40)
     if spec.result_drop >= 0 {
-        // A warm lane keeps its live workspace and free lists. Drop the worker
-        // result in that same domain after the independent parent clone exists.
         no_drop := arm.label(&mut c); load(&mut c, 10, 1, 88); compare(&mut c, 10, 0); arm.branch(&mut c, no_drop, 2)
         for reg in 19..22 { arm.store(&mut c, reg - 17, reg) }
         load(&mut c, 19, 1, 48); load(&mut c, 21, 1, 32)

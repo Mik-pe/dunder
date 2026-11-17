@@ -54,8 +54,6 @@ fn loop_fields() -> i32 {
         assert(second[0] == 22)
         value.second = [22]
     }
-    // The first field is already absent at loop entry. The second field is
-    // first mentioned inside the loop and still needs a backedge proof.
     first := value.first
     for turn in 0..3 {
         second := value.second
@@ -97,7 +95,6 @@ fn main() {
         .Numbers(values) => { assert(values[0] == 42) },
         .Empty => { assert(false) },
     }
-    // Reading or mutating an independent field remains legal after a move.
     mut restored := pair(20, 22)
     old := restored.first
     restored.second[0] = 21
@@ -165,7 +162,6 @@ fn main() {
     assert(trace == 12 && first == "20" && words[0] == "99" && words[1] == "22")
     mut bytes: []u8 = [255, 7]
     assert(replace(&mut bytes[0], 0) == 255 && bytes[0] == 0 && bytes[1] == 7)
-    // Ignoring an old owner still creates one temporary cleanup responsibility.
     _ := replace(&mut words[1], 42.str())
     assert(words[1] == "42")
     print("replace ok")
@@ -242,8 +238,6 @@ fn exit_deferred() -> i32 {
     i32(first[0])
 }
 fn main() {
-    // Each field allocates 64 KiB. A field leaked per call exceeds the runtime
-    // pool; the profile additionally requires a bounded set of fresh blocks.
     for turn in 0..10000 {
         mode := turn % 3
         mut expected := 84; if mode == 0 { expected = 42 }

@@ -118,6 +118,7 @@ def main():
         if not separator or target not in NATIVE or not shlex.split(command):
             parser.error('--runner requires native TARGET=COMMAND')
         runners[target] = shlex.split(command)
+    expected_errors = json.loads((FIXTURES.parent / 'diagnostics.json').read_text())
     invalid = sorted(FIXTURES.glob('invalid-*.ddr'))
     known = set(PROGRAMS).union(BOUNDS_TRAPS, (path.stem for path in invalid))
     if set(args.case) - known:
@@ -160,9 +161,8 @@ def main():
             print('PASS aggregate arrays', name, 'native3 + executed Wasm, default/direct MIR', flush=True)
 
         for source in invalid:
-            text = source.read_text()
-            assert text.startswith('// error: '), source
-            message = text.splitlines()[0][len('// error: '):]
+            message = expected_errors[source.relative_to(FIXTURES.parent).as_posix()]
+            assert message, source
             diagnostics = []
             for target in TARGETS:
                 for mode, flags in MODES:
