@@ -232,6 +232,22 @@ Skrivning till samlingen kräver att lånen har upphört. Använd intervallet
 `0..len()` för att läsa poster i aktuell ordning. Borttagning kan byta
 plats på den sista kvarvarande posten och den borttagna posten.
 
+## Matematik
+
+`import std.math as math` ger `min(a, b)`, `max(a, b)` och
+`clamp(value, low, high)` för `f64`. `min` väljer negativ noll och `max`
+positiv noll när båda tecknen förekommer. `clamp` bevarar tecknet på
+en nolla inom intervallet. NaN i något argument ger NaN. `clamp`
+ger även NaN om den undre gränsen är större än den övre.
+
+`math.sin(angle)`, `math.cos(angle)` och `math.tan(angle)` tar `f64`
+i radianer. De finns på de nativa målen och i WebAssembly. `sin` och
+`tan` bevarar tecknet på noll, medan `cos(0.0)` ger `1.0`.
+Oändliga vinklar och NaN ger NaN.
+
+Stora vinklar reduceras med binär fastpunktsaritmetik enligt
+[Payne–Hanek-metoden](https://perso.ens-lyon.fr/jean-michel.muller/RangeReductionIEEETC0305.pdf).
+
 ## Skriva JSON
 
 ```dunder

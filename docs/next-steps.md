@@ -28,11 +28,6 @@ lämna tillbaka en resurs och att stängning och `defer` följer returvägen.
 
 ## Språk och standardbibliotek
 
-Arbetet med Skrift och Hundmat har visat följande behov.
-
-- Samla `clamp`, `min`, `max` och trigonometriska funktioner i en
-  matematikmodul.
-
 [Runliteraler](syntax.md#utf-8-strängar-och-runes) och
 [relativa importer](syntax.md#moduler-och-importer) stöds. `std.parse`
 läser decimaler till `f32` och `f64`.
@@ -49,6 +44,8 @@ för heltalsliteraler från övriga element eller från deras värdeintervall.
 flytt, delad text via `.clone()` och färska värden.
 [Flervärdesreturer](syntax.md#flervärdesreturer) använder typade tupler som
 kan plockas isär, också när en komponent äger en resurs.
+[`std.math`](standard.md#matematik) samlar `clamp`, `min`, `max`, `sin`,
+`cos` och `tan`. Metal- och Vulkan-exemplen använder samma modul.
 
 ### Körbara exempel i manifestet
 
