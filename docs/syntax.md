@@ -327,6 +327,36 @@ eller dynamisk array flyttas in. Skapa en separat lokal med `.clone()` om
 båda behöver äga värdet. En closure kan fånga andra funktionsvärden.
 Lån får inte lagras i capture-listan.
 
+### Flervärdesreturer
+
+En funktion kan returnera flera värden som en typad tupel. Returtypen
+anger typerna och ordningen. Bind hela resultatet eller plocka isär det
+med ett namn eller `_` för varje komponent.
+
+```dunder
+fn read_tag(offset: i64) -> (i64, string) {
+    (offset + 4, "DATA")
+}
+
+fn main() {
+    (next, tag) := read_tag(12)
+    print(next)  // 16
+    print(tag)   // DATA
+    pair := read_tag(20)
+    print(pair.0)  // 24
+}
+```
+
+Komponenterna nås med nollbaserade fält som `.0` och `.1`. En tupel
+har minst två komponenter, kan nästlas och kan lagras som ett vanligt
+värde. Tupelliteraler får sin typ från exempelvis en returtyp,
+parametertyp eller lokal typannotering.
+
+Varje komponent måste vara lagringsbar. En tupel som äger en sträng,
+array eller resurs flyttas när den binds eller plockas isär. Bindningen
+`(value, _) := read()` släpper den överhoppade komponentens ägare direkt.
+`mut (value, status) := read()` gör båda bindningarna muterbara.
+
 ### Startpunkt och returvärden
 
 `fn main()` körs vid programstart och ger exitkod 0. Med `fn main() -> i32`

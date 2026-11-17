@@ -27,6 +27,7 @@ PROGRAMS = {
     'scratch': 'scratch aggregate compatibility ok\n',
     'remove': 'ordered array removal ok\n',
     'inference': 'integer array inference, length names and string owners ok\n',
+    'tuples': '7\n17\n8\n18\n19\n9\ntuple returns ok\n',
 }
 BOUNDS_TRAPS = ('remove-negative', 'remove-past-end', 'remove-empty')
 WASM_HOST = r'''

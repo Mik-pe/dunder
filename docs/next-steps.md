@@ -30,7 +30,6 @@ lämna tillbaka en resurs och att stängning och `defer` följer returvägen.
 
 Arbetet med Skrift och Hundmat har visat följande behov.
 
-- Inför flervärdesreturer.
 - Samla `clamp`, `min`, `max` och trigonometriska funktioner i en
   matematikmodul.
 
@@ -48,6 +47,8 @@ för heltalsliteraler från övriga element eller från deras värdeintervall.
 `len` kan användas som lokalt namn, fält och metod.
 [Strängägande vid `push`](standard.md#växande-arrayer) är verifierat med
 flytt, delad text via `.clone()` och färska värden.
+[Flervärdesreturer](syntax.md#flervärdesreturer) använder typade tupler som
+kan plockas isär, också när en komponent äger en resurs.
 
 ### Körbara exempel i manifestet
 
