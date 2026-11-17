@@ -277,8 +277,29 @@ returneras eller tilldelas. Funktionsvärden är oföränderliga som standard;
 Funktioner kan ta och returnera andra funktionsvärden, även i flera nivåer.
 Anrop utvärderar först funktionen och därefter argumenten från vänster till
 höger. Inbyggda operationer som `print` är ännu inte funktionsvärden; skriv
-en vanlig `fn` som omslag vid behov. Funktionslikhet och anonyma closures är
-ännu inte språkoperationer.
+en vanlig `fn` som omslag vid behov. Funktionsvärden saknar likhetsoperator.
+
+En anonym funktion skrivs `fn(x: i32) -> i32 { x * 2 }`. Lägg till en
+typad lista i hakparenteser för att fånga lokala värden. En closure har
+samma funktionstyp som en namngiven funktion med samma parametrar och resultat.
+
+```dunder
+fn plus(base: i32) -> fn(i32) -> i32 {
+    fn[base: i32](x: i32) -> i32 { x + base }
+}
+
+fn main() {
+    ten := plus(10)
+    print(ten(32))  // 42
+}
+```
+
+Listan utvärderas när closuren skapas. Infångade värden är skrivskyddade
+i kroppen och lever så länge något funktionsvärde använder dem. Vanliga
+äganderegler gäller vid infångning. Heltal kopieras, medan en ägd sträng
+eller dynamisk array flyttas in. Skapa en separat lokal med `.clone()` om
+båda behöver äga värdet. En closure kan fånga andra funktionsvärden.
+Lån får inte lagras i capture-listan.
 
 ### Startpunkt och returvärden
 

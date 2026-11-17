@@ -173,7 +173,7 @@ payload direkt i värdet. Själva taggningen behöver inget extra heapobjekt
 eller vtables. Payloads följer sina typers ägarskapsregler. Flytt överför befintlig lagring.
 En uttrycklig `.clone()` klonar ägda arraybarn till oberoende buffertar;
 oföränderlig strängtext kan delas med referensräkning.
-Funktionsvärden i payloads använder vanliga typade funktionspekare.
+Funktionsvärden i payloads kan vara namngivna funktioner eller closures.
 
 `match` kompileras till taggjämförelser och direkta grenar. Resursägande structar, arrayer och data-enums flyttas vid bindning,
 tilldelning och retur. Vanliga parametrar lånar dem för läsning. Anroparen äger returvärdets lagring, även vid callbacks och rekursion.
