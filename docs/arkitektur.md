@@ -35,16 +35,15 @@ referensräkning: strängkopior behåller nu billig delning och säker livsläng
 utan att hålla kvar alla strängar till processlut. Ingen spårande GC behövs.
 Läs [layout, allokering, tester och gränser](memory.md).
 
-Den implementerade lånemodellen omfattar funktionsparametrar och lexikala,
-oföränderliga lokala läsreferenser. Användarvalda allokatorer, lokala skrivlån
-och signaturer för returnerade lån återstår.
+Lånemodellen omfattar funktionsparametrar, lokala läslån och delade
+returvärden vars livstid hör till en angiven parameter.
 
 | Situation | Vad kompilatorn ska tillåta eller upptäcka |
 | --- | --- |
 | Läsa en buffer från två funktioner | Flera samtidiga läslån är giltiga. |
 | Skriva genom en referens | Ett exklusivt lån ger ensam åtkomst till den lånade platsen under lånets giltighetstid. |
 | Flytta, frigöra eller växa en buffer medan en slice lever | Avvisa. Alla tre operationerna kan ogiltigförklara adressen. |
-| Returnera en referens | Avvisas tills ett uttryckligt livstidskontrakt kan binda resultatet till indata eller statisk lagring. |
+| Returnera en referens | Kontrollera att alla returvägar leder till signaturens källparameter. Bind anroparens lån till motsvarande argument. |
 | En gren flyttar ett värde och den andra behåller det | Läsning efter grenen kräver att värdet är initierat på båda vägarna. Städningen frigör precis de resurser som respektive väg fortfarande äger. |
 | Nollställa en arena | Kräver exklusiv åtkomst till arenan. Alla lån ur den måste ha upphört. |
 | Gå via en råpekare eller ett externt C-anrop | Kräver en avgränsad `unsafe`-operation med ett dokumenterat kontrakt. Säkra anropare får bara se ett säkert gränssnitt om omslaget upprätthåller kontraktet. |

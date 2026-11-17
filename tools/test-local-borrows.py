@@ -260,7 +260,7 @@ INVALID = (
     ('local-temporary-array', 'fn main(){r:=&[20,22];print(sum(r))}', 'borrow'),
     ('local-temporary-call', 'fn fresh()->[]i32{[20,22]} fn main(){r:=&fresh();print(sum(r))}', 'borrow'),
     ('local-mutable-reference', 'fn main(){mut v:[]i32=[42];r:=&mut v;print(sum(r))}', 'borrow'),
-    ('return-reference', 'fn bad(v:&i32)->&i32{&v} fn main(){}', 'borrow'),
+    ('return-reference-to-local', 'fn bad(v:&i32)->&i32{local:=v+1;&local} fn main(){}', 'returned borrow must come from its declared shared parameter'),
     ('return-borrowed-owner', 'fn bad(v:[]i32)->[]i32{r:=&v;r} fn main(){}', 'borrow'),
     ('return-borrowed-view', 'fn bad(v:[]i32)->[]i32{r:=&v[0..v.len];r} fn main(){}', 'borrow'),
     ('reference-field', 'struct Bad{value:&i32} fn main(){}', 'borrow'),

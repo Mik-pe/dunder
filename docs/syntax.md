@@ -159,8 +159,18 @@ Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
 
 Temporära uttryck får lånas direkt vid anrop, exempelvis `read(&f())` och
 `sum(&[1, 2])`, och hålls levande tills anropet är klart. De får inte bindas
-som lokala referenser. Lokala `&mut`, referenser i aggregat och returnerade
-lån med livstidssignaturer stöds ännu inte.
+som lokala referenser. En funktion kan returnera ett läslån från en av sina
+delade parametrar. Finns det flera anger `from namn` vilken parameter
+returvärdet lånar från.
+
+```dunder
+fn tail(values: &[]i32) -> &[]i32 { &values[1..] }
+fn first(a: &i32, b: &i32) -> &i32 from a { a }
+```
+
+I en funktionstyp anges källan med ett ettbaserat parameternummer, exempelvis
+`fn(&i32, &i32) -> &i32 from 1`. Även anrop via en funktionsvariabel
+kontrollerar sambandet mellan argument och resultat.
 [Låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer).
 
 En funktion som ska behålla resursen deklarerar `move`:
@@ -736,9 +746,8 @@ ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
 
 Ägarflyttar, uttrycklig kloning och läslån är den gemensamma modellen;
 se [minnesmodellen](memory.md) och [standardbiblioteket](standard.md).
-Lån som kan returneras eller lagras i aggregat, lokala skrivlån, aggregat som
-arrayelement, generiska bibliotek och egna iteratorer återstår. Lokala läslån
-och lånade array-/textintervall stöds. Självhosting verifieras
+Lagrade referenser i aggregat, lokala skrivlån, generiska bibliotek och egna
+iteratorer återstår. Självhosting verifieras
 på de tre nativa målen; [Wasm-verifiering är senarelagd](status.md#webassembly-senarelagt-under-språkutveckling).
 
 ## Råtyper, privilegier och C-layout

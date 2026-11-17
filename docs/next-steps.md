@@ -1,9 +1,9 @@
 # Nästa steg för Dunder
 
-Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 och 2a är
+Föreslagen ordning efter ägarskapsgranskningen. Etapp 1 och 2 är
 implementerade, liksom sammansatta arrayelement och ordningsbevarande
 borttagning i etapp 3.
-Etapp 2b och återstående delar av 3–5 är utvecklingsplanen.
+Återstående delar av 3–5 är utvecklingsplanen.
 Nuvarande kontrakt finns i
 [minnesmodellen](memory.md), [standardbiblioteket](standard.md) och
 [status](status.md).
@@ -57,13 +57,13 @@ UTF-8 på de tre nativa målen, utan prestandamätningar.
 [Arkitektur](arkitektur.md#proveniens-och-lexikala-läslån) ·
 [Verifieringsverktyg](../tools/test-local-borrows.py).
 
-## 2b. Returnerade lån — planerat
+## 2b. Returnerade läslån — implementerat
 
-Definiera ett tydligt samband mellan indata och returens livslängd innan
-lån får lämna funktionen eller lagras i längre levande aggregat. Bygg sedan
-JSON-, CSV-, typsnitts- och HTTP-API:er som kan returnera vyer utan nya
-buffertar eller `(data, off, length)`-tripplar. Lokala skrivlån och lån av
-scratchlagring kräver också uttryckliga kontrakt innan de utvidgas.
+En funktion kan returnera en delad referens eller intervallvy med en
+livstid knuten till en parameter. Ett ensamt läslån väljs automatiskt.
+Med flera möjliga källor anger deklarationen `from namn`. Hundmats
+HTTP-tolk använder kontraktet för fält i samma mottagningsbuffert.
+[Returkontrakt och exempel](memory.md#returnerade-läslån).
 
 ## 3. Bättre ägda samlingar — delvis implementerat
 

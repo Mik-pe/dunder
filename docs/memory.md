@@ -84,7 +84,7 @@ användningen; en loop måste återställa värden som behövs i nästa varv.
 Ett lånat resursvärde får inte flyttas till en ägd bindning, retur eller container.
 Välj en `move`-parameter när funktionen ska behålla indata, eller klona när
 det ska finnas två oberoende ägare. Läslån kan namnges lokalt enligt reglerna
-nedan. Referenser får ännu inte returneras eller lagras i aggregat.
+nedan. Funktioner kan även lämna tillbaka ett läslån från en parameter.
 
 Flytt av en dynamisk array behåller buffert och kapacitet. `.clone()` ger en
 oberoende buffert och klonar ägda barn rekursivt; klonens reservkapacitet
@@ -188,8 +188,8 @@ ett arrayelement eller delintervall låser konservativt hela arrayen.
 Temporära uttryck kan lånas under ett anrop, exempelvis `read(&f())` eller
 `sum(&[1, 2])`. Ägaren hålls då levande genom argumentutvärderingen och
 anropet. `r := &f()` och `r := &[1, 2]` avvisas: en lokal referens förlänger
-inte en temporärs livslängd. Lokala `&mut`-referenser, returtyper med lån och
-lokala lån av scratchlagring stöds ännu inte.
+inte en temporärs livslängd. Samma regel gäller för resultatet av ett anrop
+som returnerar ett lån från temporären.
 
 Nya lokala lån får inte lämnas till en funktion som kan exponera deras
 lagring som råpekare, inte heller genom indirekta anrop. Explicit `unsafe`
@@ -239,6 +239,35 @@ Arrayrepetition som `[text; 4]` är en uttrycklig replikering: initialiseraren
 utvärderas och konsumeras en gång, även om antalet är noll. Skriv
 `[text.clone(); 4]` när den befintliga strängägaren ska finnas kvar.
 
+## Returnerade läslån
+
+```dunder
+fn window(data: &[]u8, start: i32, end: i32) -> &[]u8 {
+    &data[start..end]
+}
+```
+
+`window` kan lämna tillbaka en del av anroparens buffert. En funktion med
+flera delade parametrar anger källan med `from namn` efter returtypen.
+Samtliga returvägar måste kunna härledas till samma parameter. Ett fält,
+ett arrayelement, ett lokalt alias till parametern eller ett vidarebefordrat
+anrop kan alla uppfylla det kravet. Lokala ägare, råpekare och
+`move`-parametrar ger ingen sådan livstid.
+
+Om anroparen binder resultatet till en lokal gäller lånet till det blockets
+slut. Det skyddar hela platsen som lämnades som källargument. Den som
+skickar `&record.bytes` kan alltså fortfarande ändra ett oberoende fält
+i `record`. Ett arrayintervall delar elementlagringen med originalet.
+Anroparen håller den returnerade vyns beskrivare i sin egen stackram,
+så att flera anrop kan hålla olika intervall levande samtidigt. I
+`unsafe` observerar `addr(&view[i])` adressen till originalelementet.
+`addr(&view)` observerar vyns egen referenscell, även när funktionen
+vidarebefordrar en hel array. En uttrycklig `.clone()` ger en ägd kopia.
+
+Returkontraktet gäller delade referenser i vanliga Dunder-anrop. C-anrop,
+taskresultat och referenser lagrade i structar eller arrayer kräver egna
+livstidsregler och ingår inte.
+
 ## Pool och kostnader
 
 Nativ kod mappar 512 MiB virtuellt adressutrymme vid första allokeringen.
@@ -269,6 +298,7 @@ python3 tools/test-resource-moves.py "$dunder_bin"
 python3 tools/test-resource-ownership.py "$dunder_bin"
 python3 tools/test-stdlib-ownership.py "$dunder_bin"
 python3 tools/test-local-borrows.py "$dunder_bin"
+python3 tools/test-returned-borrows.py "$dunder_bin"
 ```
 
 Lånesviten korsbygger de tre nativa målen och kör värdmålets program.

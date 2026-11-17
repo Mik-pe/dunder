@@ -348,8 +348,9 @@ den tidigare ägaren medan destinationen förblir initierad.
 Lokala läslån kan namnges med `r := &owner.field` eller `r := &values[index]`.
 `&values[start..end]` ger en arrayvy och `&text[start..end]` en UTF-8-kontrollerad
 bytevy, utan ny heapbuffert eller retain. Lånen gäller till blockslut.
-Temporärer som `&f()` och `&[1, 2]` kan lånas under ett anrop. Returnerade lån,
-referenser i aggregat och lokala `&mut` återstår.
+En funktion kan returnera ett läslån eller en intervallvy från en parameter,
+exempelvis `fn tail(v: &[]i32) -> &[]i32 { &v[1..] }`. Temporärer som
+`&f()` och `&[1, 2]` kan lånas under ett anrop.
 
 Map (`string` → `i64`), set av strängar, arrayalgoritmer, text, bytekodning,
 decimalparsning, hashning och SHA-256 är skrivna i Dunder och inbäddade i
@@ -535,9 +536,9 @@ evalueringsordning, overflowkontroller och städning av ägda värden.
 Se [kompilatorns kodgenerering](docs/optimization.md).
 
 Structfält kan innehålla nästlade structar, enums, fasta/dynamiska arrayer
-och funktionsvärden. Arrayelement är fortsatt begränsade till primitiva
-värden, strängar och enums utan payload. Resursägande aggregat överförs till
-returvärdets ägare. Returnerade lån, lokala skrivlån, generiska samlingar,
+och funktionsvärden. Arrayer kan också innehålla structar, nästlade arrayer
+och enums med payload. Resursägande aggregat överförs till
+returvärdets ägare. Referenser i aggregat, lokala skrivlån, generiska samlingar,
 automatisk cleanup av externa resurser, ett generiskt allokerings-API och
 användardefinierade iteratorer återstår. Normalisering,
 grapheme-kluster och Unicode-baserad skiftlägeskonvertering återstår också.
