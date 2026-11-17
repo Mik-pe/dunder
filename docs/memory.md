@@ -50,12 +50,27 @@ fn main() {
 Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `Child` och
 `ChildSet` är sådana resurser. Fil- och körningskapabiliteter som bara
 innehåller en sökväg kan däremot uttryckligen klonas.
-Markeringen lägger ännu inte till en användardefinierad destruktor:
-socketstängning och processhantering sker med bibliotekets explicita
-`close`-/`wait`-/set-operationer. Ingen implicit OS-hantering har tillkommit.
-Resurser får tills vidare inte transporteras över isolerade taskgränser,
-vars snapshotprotokoll kräver klonbara värden. `@resource` kombineras inte
-med `@c_layout`.
+Lokala resurser i en worker följer taskens effektregler. Transport över en
+isolerad taskgräns kräver klonbara värden. Resurstyper använder Dunders
+vanliga structlayout och lagras som ägda värden.
+
+### Automatisk stängning
+
+Med `@resource(dispose)` anropar kompilatorn den privata instansmetoden
+`fn dispose(&self)` när det sista ägda värdet släpps. Metoden måste vara
+säker och returnera `()`. Den körs synkront före frigöring av structens
+fält och kan därför blockera om stängningsoperationen blockerar. Samma
+regel gäller vid blockslut, `return` (även av ett felvärde), `break`,
+`continue`, ersättning av ett värde och när ägaren finns i ett aggregat.
+En runtimefälla som avslutar hela processen går direkt till processavslut.
+
+Flytt av hela resursen överför stängningsansvaret. Använd `replace` för
+att ta över ett ägt fält och lämna ett giltigt värde åt stängningsmetoden.
+En separat explicit `close(&mut self)` kan rapportera operationens
+resultat. Låt den markera resursen stängd när ansvaret försvinner och låt
+`dispose` kontrollera markeringen. `TcpListener`, `TcpStream` och
+`StreamSet` använder en negativ filbeskrivare som markering.
+`@resource` utan metodnamn ger unikt ägarskap med explicit stängning.
 
 ```dunder
 fn total(values: []i32) -> i32 {

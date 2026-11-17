@@ -508,6 +508,38 @@ fn prepare_closures(c: &mut Session) {
     }
 }
 fn owned(c: &Session, ty: i32) -> bool { ft.owned(&c.types, ty) || boxed_function(&c, ty) }
+fn require_cleanup(c: &mut Session, ty: i32) {
+    if !c.types.has_cleanup || c.validating_dead || !ft.owned(&c.types, ty) || ty == 4 { return }
+    mut pending: []i32 = [ty]
+    mut seen: []i32 = []
+    while pending.len > 0 {
+        current := pending.pop()
+        if current == 4 || !ft.owned(&c.types, current) { continue }
+        mut visited := false
+        for prior in &seen { if prior == current { visited = true; break } }
+        if visited { continue }
+        seen.push(current)
+        hook := ft.cleanup_method(&c.types, current)
+        if hook >= 0 {
+            c.body.facts.needed.push(hook)
+            task_edge(&mut c, hook)
+        }
+        kind := ft.type_kind(&c.types, current)
+        if collection(&c, current) {
+            pending.push(ft.type_base(&c.types, current))
+        } else {
+            first := ft.type_start(&c.types, current)
+            for member in first..first + ft.type_count(&c.types, current) {
+                if kind == 2 {
+                    pending.push(c.types.field_types[member])
+                } else {
+                    start := c.types.payload_starts[member]
+                    for p in start..start + c.types.payload_counts[member] { pending.push(c.types.payload_types[p]) }
+                }
+            }
+        }
+    }
+}
 fn bind_type_helpers(c: &mut Session) {
     if c.code.checking { return }
     c.array_helpers = arm.label(&mut c.code)
@@ -600,6 +632,18 @@ fn constrain_borrow(c: &mut Session) -> bool {
     true
 }
 fn move_place(c: &mut Session, place: i32, at: i32) -> bool {
+    if c.types.has_cleanup {
+        mut projected := place
+        while projected > 0 {
+            row := (projected - 1) * 3
+            receiver := places.receiver(c.body.places.arena.nodes[row + 1])
+            if ft.cleanup_method(&c.types, receiver) >= 0 {
+                fail(&mut c, "cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
+                return false
+            }
+            projected = places.parent(c.body.places.arena.nodes[row])
+        }
+    }
     binding := borrows.root(&c.body.places, place)
     kind := ft.type_kind(&c.types, c.body.locals.types[binding])
     if kind == 4 || kind == 5 { fail(&mut c, "cannot move out of a borrowed value; use .clone()"); return false }
@@ -680,6 +724,7 @@ fn drop_value(c: &mut Session, ty: i32) {
     if target >= 0 { ownership_call(&mut c, .Drop, ty, target) }
 }
 fn remember_owner(c: &mut Session, index: i32, ty: i32, temporary: bool) {
+    if !temporary { require_cleanup(&mut c, ty) }
     c.body.owned_slots.push(index); c.body.owned_types.push(ty); c.body.owner_temps.push(temporary)
 }
 fn clear_owner_at(c: &mut Session, index: i32, ty: i32, source: i32) {
@@ -707,6 +752,7 @@ fn install_owner(c: &mut Session, index: i32, ty: i32, source: i32) {
     arm.owner_store(&mut c.code, .Install, ty, index, source)
 }
 fn temporary(c: &mut Session, ty: i32) -> i32 {
+    require_cleanup(&mut c, ty)
     fc.clear_expr_value(&mut c.body.expr)
     c.body.expr.untyped_exit = false
     fc.clear_loan_eval(&mut c.body.loan)
@@ -792,6 +838,11 @@ fn impl_method(c: &Session, ty: i32, name: string) -> i32 {
     i32(map.get_or(&c.world.methods, ty.str() + ":" + name, -1))
 }
 fn check_impl_access(c: &mut Session, f: i32, token: i32) -> bool {
+    if ft.cleanup_method(&c.types, c.world.impl_types[f]) == f {
+        fail(&mut c, "resource cleanup methods are called automatically")
+        c.error_at = c.world.tokens.starts[token]
+        return false
+    }
     if !c.world.impl_public[f] && c.world.function_owners[f] != c.body.current_owner {
         fail(&mut c, "method '" + c.world.impl_names[f] + "' is private; export it with pub")
         c.error_at = c.world.tokens.starts[token]
@@ -812,6 +863,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     mut declarations: []i32 = []; mut declaration_types: []i32 = []
     mut declaration_fns: []i32 = []; mut declaration_impl_targets: []i32 = []; mut declaration_impl_owners: []i32 = []
     mut declaration_c_variadic: []i32 = []
+    mut resource_types: []i32 = []; mut resource_methods: []i32 = []
     separators(&mut c)
     mut file_caps := 0
     if eat(&mut c, "capability") {
@@ -829,6 +881,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     while c.ok && c.world.tokens.kinds[c.body.cursor] != .End {
         mut library := ""; mut symbol := ""; mut layout := false; mut test := false; mut resource := false; mut req_caps := 0; mut skip_test_block := false
         mut c_variadic := -1
+        mut resource_method := -1
         while c.ok && eat(&mut c, "@") {
             annotation := advance(&mut c)
             if annotation == "extern" {
@@ -846,7 +899,15 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
                 if !parsed.ok || parsed.value < 0 || parsed.value > 65535 { fail(&mut c, "invalid C variadic fixed parameter count"); break }
                 c_variadic = i32(parsed.value); expect(&mut c, ")")
             } else if annotation == "c_layout" { layout = true }
-            else if annotation == "resource" { resource = true }
+            else if annotation == "resource" {
+                if resource { fail(&mut c, "duplicate @resource attribute"); break }
+                resource = true
+                if eat(&mut c, "(") {
+                    if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected a resource cleanup method name"); break }
+                    resource_method = c.body.cursor
+                    skip_token(&mut c); expect(&mut c, ")")
+                }
+            }
             else if annotation == "requires" { req_caps = req_caps.bit_or(parse_requires(&mut c)) }
             else if annotation == "test" { test = true }
             else { fail(&mut c, "unknown declaration attribute"); break }
@@ -916,6 +977,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected declaration name"); break }
         name := advance(&mut c)
         if ((layout || resource) && what != "struct") || (unchecked && what != "fn") || (req_caps != 0 && what != "fn") || (c_variadic >= 0 && what != "fn") { fail(&mut c, "invalid declaration attribute"); break }
+        if layout && resource { fail(&mut c, "@resource cannot be combined with @c_layout"); break }
         declarations.push(c.body.cursor)
         declaration_c_variadic.push(c_variadic)
         declaration_impl_targets.push(-1); declaration_impl_owners.push(owner)
@@ -926,6 +988,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             mut kind := 2; if what == "enum" { kind = 3 }
             ty = add_type(&mut c, name, kind, 0); c.types.type_owners[ty] = owner
             c.types.c_record[ty] = layout; c.types.resource[ty] = resource; if opaque { c.types.opaque_owner[ty] = owner }
+            if resource_method >= 0 { resource_types.push(ty); resource_methods.push(resource_method) }
             declaration_fns.push(-1)
         } else {
             if map.contains(&c.world.functions, name) || rules.reserved(name) { fail(&mut c, "duplicate or reserved function name") }
@@ -1085,6 +1148,19 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             newlines(&mut c); expect(&mut c, "{"); c.world.starts.push(c.body.cursor); c.world.ends.push(c.world.closes[c.body.cursor - 1])
             if ret != 0 { newlines(&mut c); if is(&c, "}") { fail(&mut c, "function can finish without returning a value") } }
         }
+    }
+    for i in 0..resource_types.len {
+        if !c.ok { break }
+        ty := resource_types[i]; c.body.cursor = resource_methods[i]
+        hook := impl_method(&c, ty, c.world.tokens.texts[c.body.cursor])
+        if hook < 0 || c.world.impl_public[hook] || c.world.unsafe_functions[hook] || c.world.requires_caps[hook] != 0 ||
+            !c.world.impl_has_self[hook] || c.world.param_counts[hook] != 1 || c.world.returns[hook] != 0 ||
+            ft.type_kind(&c.types, c.world.param_types[c.world.param_starts[hook]]) != 4 {
+            fail(&mut c, "@resource cleanup requires a private safe method taking only &self and returning ()")
+            break
+        }
+        c.types.cleanup_methods[ty] = hook
+        c.types.has_cleanup = true
     }
 }
 fn slot(c: &mut Session) -> i32 {
@@ -2113,6 +2189,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                 opaque_access(&mut c, ty)
                 if member < 0 { fail(&mut c, "unknown field '" + name + "'") }
                 else if place == 0 {
+                    if ft.cleanup_method(&c.types, ty) >= 0 { temporary_root = -1 }
                     projected := field_place(&mut c, 0, ty, member, c.body.cursor - 1)
                     ty = load_field(&mut c, ty, member, .ValueAndAddress, c.body.cursor - 1, projected)
                     projection_address = c.body.place.address
@@ -5643,6 +5720,11 @@ fn nominal_clones(c: &mut Session, rt: &runtime.Runtime) {
         arm.ret(&mut c.code)
         arm.mark(&mut c.code, c.helper_labels[ty] + 1); drop_frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, drop_frame, 1)
         done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18); arm.store(&mut c.code, 0, 0)
+        cleanup := ft.cleanup_method(&c.types, ty)
+        if cleanup >= 0 && c.needed[cleanup] {
+            arm.address(&mut c.code, 0)
+            arm.branch(&mut c.code, c.fn_labels[cleanup], 1)
+        }
         if c.types.declared.type_kinds[ty] == 7 {
             shared := arm.label(&mut c.code)
             arm.emit(&mut c.code, 4167008257); arm.imm(&mut c.code, 2, 1); arm.compare_register(&mut c.code, 1, 2); arm.branch(&mut c.code, shared, 3)

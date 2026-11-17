@@ -17,12 +17,11 @@ skrivning under ett aktivt kolumnlån.
 
 ## Externa resurser och typade fel
 
-Låt en `@resource`-typ ange hur den stängs vid blockslut, retur, `break`,
-`continue` och fel. Definiera hur en explicit stängning samverkar med den
-automatiska och om stängningen får blockera. En flytt överför ansvaret
-till den nya ägaren.
+[Automatisk stängning](memory.md#automatisk-stängning) kan deklareras med
+`@resource(dispose)`. Den följer ägaren genom flytt och körs synkront när
+ägaren släpps. TCP-handtagen och `StreamSet` använder den.
 
-Inför därefter `Result<T, E>` och felpropagering. Ett anrop som misslyckas
+Inför `Result<T, E>` och felpropagering. Ett anrop som misslyckas
 med att ta över en resurs behöver kunna lämna tillbaka den till anroparen.
 
 ## Språk och standardbibliotek

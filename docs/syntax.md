@@ -459,8 +459,8 @@ flyttat fält i muterbar lagring kan återinitieras med tilldelning; hela
 structen kan användas igen när alla fält är initierade.
 `@resource` markerar en unik extern resurs även när dess fält bara är
 skalärer. En sådan struct och aggregat som innehåller den flyttas och
-kan inte klonas. Markeringen innebär ännu ingen automatisk destruktor;
-se [resursreglerna](memory.md#unika-externa-resurser).
+kan inte klonas. Skriv `@resource(dispose)` för att välja en
+[automatisk stängningsmetod](memory.md#automatisk-stängning).
 Ändringar i `moved` påverkar därför inte `original`. Parametrar är
 oföränderliga; kopiera till en `mut` för att ändra fält. Structar kan också
 returneras från funktioner. Anroparen äger resultatets lagring, så en

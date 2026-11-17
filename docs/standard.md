@@ -102,8 +102,10 @@ immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
 
 Sockets, socketmängder, barnprocesser och barnprocessmängder är
 [`@resource`-typer](memory.md#unika-externa-resurser). De flyttas och kan
-inte klonas, inte heller genom en omgivande struct eller enum. De använder
-fortfarande explicita stängnings- och processoperationer.
+inte klonas, inte heller genom en omgivande struct eller enum.
+Sockets och socketmängder stängs automatiskt när ägaren släpps.
+Explicita `close`-anrop rapporterar stängningens status. Barnprocesser
+hanteras med `wait`, `terminate` och bibliotekets övriga processoperationer.
 
 ## Begränsade borrows
 

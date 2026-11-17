@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import tempfile
 
@@ -35,7 +36,26 @@ INVALID = (
     ('task-result', '@resource struct R{fd:i32} fn work(n:i32)->R{R{fd:n}} fn main(){task scope j(1){id:=spawn j work(42);r:=await! j(id)}}', 'isolated Data'),
     ('task-world', '@resource struct R{fd:i32} struct W{r:R} fn work(n:i32,w:&W)->i32{w.r.fd+n} fn main(){world:=W{r:R{fd:1}};task scope j(1,shared world){id:=spawn j work(41);print(await j(id))}}', 'isolated Data'),
     ('task-workspace', '@resource struct R{fd:i32} fn init()->R{R{fd:42}} fn work(n:i32,w:&mut R)->i32{w.fd+n} fn main(){task scope j(1,init){id:=spawn j work(0);print(await j(id))}}', 'isolated storage'),
+    ('cleanup-missing', '@resource(drop) struct R{x:i32} fn main(){}', 'cleanup requires a private safe method'),
+    ('cleanup-consuming', '@resource(drop) struct R{x:i32} impl R{fn drop(self){}} fn main(){}', 'cleanup requires a private safe method'),
+    ('cleanup-mutable', '@resource(drop) struct R{x:i32} impl R{fn drop(&mut self){}} fn main(){}', 'cleanup requires a private safe method'),
+    ('cleanup-public', '@resource(drop) struct R{x:i32} impl R{pub fn drop(&self){}} fn main(){}', 'cleanup requires a private safe method'),
+    ('cleanup-c-layout', '@resource(drop) @c_layout struct R{x:i32} impl R{fn drop(&self){}} fn main(){}', '@resource cannot be combined with @c_layout'),
+    ('cleanup-direct', '@resource(drop) struct R{x:i32} impl R{fn drop(&self){}} fn main(){r:=R{x:1};r.drop()}', 'cleanup methods are called automatically'),
+    ('cleanup-partial-move', '@resource(drop) struct R{x:[]i32} impl R{fn drop(&self){}} fn main(){r:=R{x:[1]};a:=r.x}', 'cannot move out of a resource with automatic cleanup'),
+    ('cleanup-temporary-move', '@resource(drop) struct R{x:[]i32} impl R{fn drop(&self){}} fn r()->R{R{x:[1]}} fn main(){a:=r().x}', 'cannot move out'),
+    ('cleanup-scratch', '@resource(drop) struct R{x:i32} impl R{fn drop(&self){}} fn main(){region arena(256){mut r:[]R=arena.alloc(1);r[0]=R{x:42}}}', 'scratch elements must be numeric, bool, rune or plain value records'),
+    ('manual-scratch', '@resource struct R{x:i32} fn main(){region arena(256){mut r:[]R=arena.alloc(1);r[0]=R{x:42}}}', 'scratch elements must be numeric, bool, rune or plain value records'),
+    ('cleanup-task-effect', '@resource(drop) struct R{x:i32} impl R{fn drop(&self){print(self.x)}} fn work(n:i32)->i32{r:=R{x:n};n} fn main(){task scope j(1){id:=spawn j work(42);print(await j(id))}}', 'effects outside'),
 )
+
+CLEANUP_ORDER = '10\n11\n12\n13\n14\n15\n16\n17\n18\n0\n19\n26\n21\n22\n25\n23\n24\n20\n'
+WASM = """
+const fs = require('node:fs');
+const image = new WebAssembly.Module(fs.readFileSync(process.argv[1]));
+const runtime = new WebAssembly.Instance(image, {dunder: {print_i32: console.log, print_text: () => {}}});
+runtime.exports.main();
+"""
 
 
 def call(command, cwd, status=0):
@@ -107,6 +127,23 @@ def main():
                         if fixture == 'resource-transfers':
                             assert counters['record_clone_calls'] == 0, counters
                         executed += 1
+        source = ROOT / 'tests/fixtures/resource-cleanup.ddr'
+        for target in TARGETS + ('wasm32',):
+            jobs = str(args.jobs if target == host else 1)
+            for index, mode in enumerate(modes):
+                image = work / f'cleanup-{target}-{index}'
+                call([compiler, 'build', source, '--target', target, '--jobs', jobs, *mode, '-o', image], work)
+                if target == host:
+                    assert call([image], work).stdout == CLEANUP_ORDER
+                    executed += 1
+                elif target == 'wasm32':
+                    assert call(['node', '-e', WASM, image], work).stdout == CLEANUP_ORDER
+                    executed += 1
+        cached_source = work / 'cleanup-cached.ddr'
+        shutil.copyfile(source, cached_source)
+        for _ in range(2):
+            assert call([compiler, 'run', cached_source, '--incremental', '--jobs', str(args.jobs)], work).stdout == CLEANUP_ORDER
+            executed += 1
     print(f'PASS resource ownership: {checked} diagnostic/build pairs, {executed} host executions')
 
 
