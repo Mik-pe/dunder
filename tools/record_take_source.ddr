@@ -1,0 +1,279 @@
+capability filesystem, process
+
+import .harness as harness
+import .test_evidence as evidence
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct CacheRow {
+    reused: i64,
+    emitted: i64,
+    producer_fragment_sha256: string,
+    sha256: string,
+}
+
+fn call(program: string, args: []string, cwd: string, result: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, cwd, 0, false, 60000, &mut result)
+}
+
+fn with_flags(move args: []string, flags: &[]string, tail: []string) -> []string {
+    mut cmd := move args
+    for flag in flags { cmd.push(flag.clone()) }
+    for arg in tail { cmd.push(arg.clone()) }
+    cmd
+}
+
+fn run_values(cli: &harness.BaseCli, work: string, mode: i32, flags: &[]string, host: i32) -> bool {
+    source := cli.root + "/tests/fixtures/record-take-values.ddr"
+    mut result := harness.empty_output()
+    for target in 0..3 {
+        name := harness.target_name(target)
+        image := f"{work}/values-{mode}-{target}"
+        build := with_flags(["build", source.clone(), "--target", name.clone()], &flags, ["-o", image.clone()])
+        check := with_flags(["check", source.clone(), "--target", name.clone()], &flags, [])
+        if !call(cli.compiler, build, cli.root, &mut result) || !call(cli.compiler, check, cli.root, &mut result) {
+            return false
+        }
+        if target == host && (!call(image, [], cli.root, &mut result) || !harness.stdout_is(&result, "42\n", image)) {
+            return false
+        }
+    }
+    true
+}
+
+fn collect_profile(tool: string, root: string, source: string, image: string, target: string,
+                   flags: &[]string, profile: &mut json.Doc) -> bool {
+    args := with_flags(["build", source.clone(), "--target", target.clone()], &flags, ["--runtime-profile", "-o", image.clone()])
+    mut result := harness.empty_output()
+    if !call(tool, args, root, &mut result) ||
+       !call(image, [], root, &mut result) || !harness.stdout_is(&result, "42\n", image) { return false }
+    parsed := json.Doc::parse_text(result.stderr_text())
+    if !parsed.ok || parsed.get_str(parsed.root, "kind").value != "runtime_profile" {
+        return harness.fail(f"{image}: expected runtime profile\n{result.stderr_text()}")
+    }
+    profile = parsed
+    true
+}
+
+fn save_counters(writer: &mut json.Writer, doc: &json.Doc, counters: i32) -> bool {
+    if doc.kind(counters) != .Object { return harness.fail("missing runtime profile counters") }
+    writer.object()
+    for i in 0..doc.count(counters) {
+        key := doc.key_at(counters, i)
+        counter := doc.as_u64(doc.val_at(counters, i))
+        if !key.ok || !counter.ok { return harness.fail(f"invalid runtime profile counter: {key.value}") }
+        writer.key(key.value)
+        writer.unsigned(counter.value)
+    }
+    writer.end()
+    true
+}
+
+fn profile_source(clone_result: bool) -> string {
+    relay := if clone_result { "mut value := make(); value.clone()" } else { "make()" }
+    capacity := if clone_result { "9" } else { "64" }
+    "struct Leaf { values: []i64 }\n" +
+        "struct Item { first: Leaf, second: Leaf, name: string }\n" +
+        "fn make() -> Item {\n" +
+        "    mut values: []i64 = []; values.reserve(64)\n" +
+        "    for i in 0..9 { values.push(i64(i)) }\n" +
+        "    Item { first: Leaf { values: values.clone() }, second: Leaf { values: values }, name: \"value\" }\n" +
+        "}\n" +
+        "fn relay() -> Item { " + relay + " }\n" +
+        "fn main() {\n" +
+        "    mut value := relay()\n" +
+        "    assert(value.first.values.cap() == 9 && value.second.values.cap() == " + capacity + ")\n" +
+        "    snapshot := value.clone(); value.first.values[0] = 99\n" +
+        "    assert(snapshot.first.values[0] == 0 && value.second.values[0] == 0)\n" +
+        "    print(42)\n" +
+        "}\n"
+}
+
+fn check_profile(cli: &harness.BaseCli, work: string, mode: i32, flags: &[]string, host: i32, writer: &mut json.Writer) -> bool {
+    source := f"{work}/profile-{mode}.ddr"
+    control := f"{work}/profile-{mode}-control.ddr"
+    if !sys.write_text(source, profile_source(false)).ok || !sys.write_text(control, profile_source(true)).ok {
+        return harness.fail(f"cannot write record profile for mode {mode}")
+    }
+    target := harness.target_name(host)
+    mut current := json.Doc::parse_text("")
+    if !collect_profile(cli.compiler, cli.root, source, f"{work}/profile-{mode}-new", target, &flags, &mut current) { return false }
+    counts := current.field(current.root, "counters")
+    arrays := current.get_i64(counts, "array_clone_calls")
+    records := current.get_i64(counts, "record_clone_calls")
+    if !arrays.ok || !records.ok || arrays.value > 4 || records.value > 3 {
+        return harness.fail(f"mode {mode}: excessive record forwarding copies\n{current.raw_span(counts)}")
+    }
+    writer.object()
+    writer.key("mode")
+    writer.integer(i64(mode))
+    writer.key("new")
+    if !save_counters(&mut writer, &current, counts) { return false }
+    mut variants: [](string, string, string) = [("local_copy", cli.compiler.clone(), control)]
+    if cli.baseline.len > 0 { variants.push(("old", cli.baseline.clone(), source.clone())) }
+    for variant in move variants {
+        (label, tool, input) := variant
+        mut comparison := json.Doc::parse_text("")
+        if !collect_profile(tool, cli.root, input, f"{work}/profile-{mode}-{label}", target, &flags, &mut comparison) { return false }
+        others := comparison.field(comparison.root, "counters")
+        for key in ["allocation_count", "array_clone_calls", "array_clone_bytes", "record_clone_calls", "record_clone_bytes"] {
+            new := current.get_i64(counts, key)
+            old := comparison.get_i64(others, key)
+            if !new.ok || !old.ok || new.value >= old.value {
+                return harness.fail(f"mode {mode}: {key} did not decrease against {label}\n{current.raw_span(counts)}\n{comparison.raw_span(others)}")
+            }
+        }
+        writer.key(label)
+        if !save_counters(&mut writer, &comparison, others) { return false }
+    }
+    writer.end()
+    true
+}
+
+fn list_fragments(dir: string, paths: &mut []string) -> bool {
+    entries := fs.list_dir(dir)
+    if !entries.ok { return harness.fail(f"cannot list {dir}") }
+    for entry in entries.entries {
+        path := dir + "/" + entry
+        meta := sys.metadata(path)
+        if !meta.ok { return harness.fail(f"cannot stat {path}") }
+        if meta.is_dir {
+            if !list_fragments(path, &mut paths) { return false }
+        } else if text.ends_with(entry, ".fn") {
+            paths.push(move path)
+        }
+    }
+    true
+}
+
+fn function_counts(doc: &json.Doc, reused: i64, emitted: i64) -> bool {
+    functions := doc.field(doc.root, "functions")
+    reuse_count := doc.get_i64(functions, "reused")
+    emit_count := doc.get_i64(functions, "emitted")
+    doc.ok && doc.count(functions) == 2 && reuse_count.ok && emit_count.ok &&
+        reuse_count.value == reused && emit_count.value == emitted
+}
+
+fn check_cache(compiler: string, work: string, mode: i32, flags: &[]string, row: &mut CacheRow) -> bool {
+    cwd := f"{work}/cache-{mode}"
+    source := cwd + "/input.ddr"
+    cold := cwd + "/cold"
+    warm := cwd + "/warm"
+    program := "struct Leaf { values: []i64 }\n" +
+        "struct Item { leaf: Leaf }\n" +
+        "fn make() -> Item { Item { leaf: Leaf { values: [41, 42] } } }\n" +
+        "fn main() { value := make(); assert(value.leaf.values.cap() == 8); print(i32(value.leaf.values[1])) }\n"
+    if !fs.mkdir_all(cwd).ok || !sys.write_text(source, program).ok {
+        return harness.fail(f"cannot prepare {cwd}")
+    }
+    args := with_flags(["build", source], &flags, ["--inline-opt=off", "--incremental", "--timings=json", "-o"])
+    mut result := harness.empty_output()
+    if !call(compiler, with_flags(args.clone(), &[], [cold.clone()]), cwd, &mut result) { return false }
+    first := result.stderr_text()
+    mut fragments: []string = []
+    if !list_fragments(cwd, &mut fragments) { return false }
+    if fragments.len != 1 || harness.basename(fragments[0]) != "0.fn" {
+        return harness.fail(f"{cwd}: expected only the producer fragment, found {fragments.len} fragments")
+    }
+    original := sys.read_u8(fragments[0])
+    if !original.ok { return harness.fail(f"cannot read {fragments[0]}") }
+    if !call(compiler, with_flags(move args, &[], [warm.clone()]), cwd, &mut result) { return false }
+    a := json.Doc::parse_text(first)
+    b := json.Doc::parse_text(result.stderr_text())
+    mir := b.get_i64(b.field(b.root, "mir"), "functions")
+    if !function_counts(&a, 0, 2) || !function_counts(&b, 1, 1) || !mir.ok || mir.value != 1 {
+        return harness.fail(f"mode {mode}: wrong cold/warm function counts\n{first}\n{result.stderr_text()}")
+    }
+    rebuilt := sys.read_u8(fragments[0])
+    cold_image := sys.read_u8(cold)
+    warm_image := sys.read_u8(warm)
+    if !rebuilt.ok || !cold_image.ok || !warm_image.ok ||
+       !bytes.equal(&original.value, &rebuilt.value) || !bytes.equal(&cold_image.value, &warm_image.value) {
+        return harness.fail(f"mode {mode}: cold/warm image or producer fragment changed")
+    }
+    if !call(warm, [], cwd, &mut result) || !harness.stdout_is(&result, "42\n", warm) { return false }
+    row = CacheRow { reused: 1, emitted: 1, producer_fragment_sha256: harness.sha256_file_hex(fragments[0]),
+                     sha256: harness.sha256_file_hex(warm) }
+    true
+}
+
+fn check_callback(cli: &harness.BaseCli, work: string, modes: &[][]string, host: i32) -> bool {
+    c_source := work + "/callback.c"
+    extension := if host == 0 { "/callback.dylib" } else { "/callback.so" }
+    library := work + extension
+    linkage := if host == 0 { "-dynamiclib" } else { "-shared" }
+    if !sys.write_text(c_source, "int invoke(int (*f)(int), int value) { return f(value); }\n").ok {
+        return harness.fail(f"cannot write {c_source}")
+    }
+    mut result := harness.empty_output()
+    if !call("cc", [linkage, "-fPIC", c_source, "-o", library.clone()], cli.root, &mut result) { return false }
+    source := work + "/callback.ddr"
+    program := "capability unsafe\n@extern(" + json.quote(library) + ", \"invoke\") unsafe fn invoke(f: extern fn(i32)->i32, n:i32)->i32\n" +
+        "struct Leaf { values: []i64 }\n" +
+        "struct Item { leaf: Leaf }\n" +
+        "fn make(n:i32)->Item { mut a:[]i64=[]; a.reserve(64); for i in 0..n{a.push(i64(i))}; Item{leaf:Leaf{values:a}} }\n" +
+        "fn answer(n:i32)->i32{value:=make(n); projected:=make(n).leaf; assert(value.leaf.values.cap()==64 && projected.values.cap()==64); i32(projected.values[n-1])+34}\n" +
+        "fn main(){unsafe{assert(invoke(callback(answer),9)==42)};print(42)}\n"
+    if !sys.write_text(source, program).ok { return harness.fail(f"cannot write {source}") }
+    for mode in 0..modes.len {
+        image := f"{work}/callback-{mode}"
+        args := with_flags(["build", source.clone()], &modes[mode], ["-o", image.clone()])
+        if !call(cli.compiler, args, cli.root, &mut result) ||
+           !call(image, [], cli.root, &mut result) || !harness.stdout_is(&result, "42\n", image) { return false }
+    }
+    true
+}
+
+pub fn check(cli: &harness.BaseCli, work: string, host: i32, writer: &mut json.Writer) -> bool {
+    modes: [][]string = [[], ["--scalar-opt=off"], ["--mir=off"], ["--scalar-opt=off", "--mir=off"]]
+    writer.object()
+    writer.key("compiler")
+    writer.string(harness.sha256_file_hex(cli.compiler))
+    writer.key("baseline")
+    if cli.baseline.len == 0 { writer.null() } else { writer.string(harness.sha256_file_hex(cli.baseline)) }
+    writer.key("images")
+    writer.integer(i64(3 * modes.len))
+    writer.key("executions")
+    writer.integer(i64(modes.len))
+    writer.key("profiles")
+    writer.array()
+    mut cache_rows: []CacheRow = []
+    for mode in 0..modes.len {
+        if !run_values(&cli, work, mode, &modes[mode], host) ||
+           !check_profile(&cli, work, mode, &modes[mode], host, &mut writer) { return false }
+        mut row := CacheRow { reused: 0, emitted: 0, producer_fragment_sha256: "", sha256: "" }
+        if !check_cache(cli.compiler, work, mode, &modes[mode], &mut row) { return false }
+        cache_rows.push(move row)
+    }
+    writer.end()
+    writer.key("cache")
+    writer.array()
+    for mode in 0..cache_rows.len {
+        row := &cache_rows[mode]
+        writer.object()
+        writer.key("mode")
+        writer.integer(i64(mode))
+        writer.key("reused")
+        writer.integer(row.reused)
+        writer.key("emitted")
+        writer.integer(row.emitted)
+        writer.key("producer_fragment_sha256")
+        writer.string(row.producer_fragment_sha256)
+        writer.key("sha256")
+        writer.string(row.sha256)
+        writer.end()
+    }
+    writer.end()
+    writer.end()
+    check_callback(&cli, work, &modes, host)
+}
+
+pub fn save(root: string, writer: &json.Writer) -> bool {
+    dir := root + "/build/record-take-source"
+    if !fs.mkdir_all(dir).ok { return harness.fail(f"cannot create {dir}") }
+    evidence.save(dir + "/report.json", &writer)
+}
