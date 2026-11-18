@@ -1,8 +1,19 @@
 # HTTP för verkliga klienter och servrar
 
-`std.http` och `std.http_client` är separata moduler skrivna i Dunder. Snus
-använder dem för sin publika HTTP-server och sin CLI. Nätverksåtkomst kräver
-`capability network` hos anroparen.
+HTTP-server och HTTP-klient levereras som Dunderpaket. Med en lokal kopia
+av paketen kan ett projekt lägga till dem i sitt `dunder.toml`.
+
+```toml
+[dependencies]
+http = { path = "../dunder/packages/http" }
+http_client = { path = "../dunder/packages/http_client" }
+```
+
+Importera dem med `import http` och `import http_client`. Under
+övergången går `std.http` och `std.http_client` till samma källor.
+Använd samma importform i alla moduler i ett program så att de delar typidentitet.
+Nätverksåtkomst kräver `capability network` hos anroparen.
+[HTTP-serverpaketet](../packages/http/) · [HTTP-klientpaketet](../packages/http_client/)
 
 `http.read_request(&stream, max_body, timeout_ms)` läser ett komplett
 HTTP/1.0- eller HTTP/1.1-anrop. Resultatet innehåller `ok`, `status`, `error`,
@@ -31,7 +42,8 @@ läsningar; en gemensam deadline gäller också chunked-data och trailers.
 
 Parsern begränsar headers till 32 KiB och en rad till 8192 byte. Den avvisar
 bland annat tvetydig Content-Length/Transfer-Encoding, dubblerade
-kontrollheaders, ogiltiga CRLF och förbjudna trailers. Content-Length och
+kontrollheaders, ogiltiga CRLF och förbjudna trailers. Även egna tokenfält
+på formen `X-…-Token` avvisas i trailers. Content-Length och
 chunked-kroppar bevarar godtyckliga binära byte. `100 Continue` skickas först
 efter att kroppens deklarerade gränser har kontrollerats. Läsning använder
 icke-blockerande sockets och en monotont uppmätt deadline. `read_request`

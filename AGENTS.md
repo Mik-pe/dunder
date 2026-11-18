@@ -17,3 +17,6 @@ Tabell, en HTTP-server och grafikexempel. Använd programmen för att hitta
 och prova förbättringar i Dunder. Ändringar i Hundmat ska tjäna det syftet.
 Lägg generella förbättringar av språket, kompilatorn och standardbiblioteket
 här.
+
+Använd syntetiska eller publika testfixturer. Utelämna namn och innehåll
+från privata projekt i Dunders kod, dokumentation och commitmeddelanden.

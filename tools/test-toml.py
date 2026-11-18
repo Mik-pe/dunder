@@ -546,7 +546,7 @@ def contract_cases(paths):
                 expected, _ = decode_json(item["expected_json"])
                 compare(expected, parse_oracle(text))
                 cases.append(Case(name, text.encode(), True, expected,
-                                  oracle="actual Snus contract plus Python tomllib"))
+                                  oracle="fixture JSON and Python tomllib"))
             else:
                 try:
                     parse_oracle(text)
@@ -555,7 +555,7 @@ def contract_cases(paths):
                 else:
                     raise AssertionError(f"parser-negative contract accepted by tomllib: {name}")
                 cases.append(Case(name, text.encode(), False,
-                                  oracle="actual Snus parser rejection plus Python tomllib"))
+                                  oracle="fixture rejection and Python tomllib"))
     return cases
 
 
@@ -609,7 +609,7 @@ def main():
     parser.add_argument("--toml-test", type=Path,
                         help="optional pinned toml-lang/toml-test checkout or extracted tests directory")
     parser.add_argument("--contracts", action="append", type=Path, default=[],
-                        help="additional extracted Snus *-parse.json file (repeatable)")
+                        help="additional parser fixture JSON file (repeatable)")
     parser.add_argument("--work", type=Path,
                         help="keep images, source cases and result records in this directory")
     parser.add_argument("--only", help="run names containing this substring")
@@ -623,7 +623,7 @@ def main():
             parser.error("--runner requires native TARGET=COMMAND")
         runners[target] = shlex.split(command)
     cases = grammar_cases()
-    corpus = ROOT / "tests/fixtures/toml-snus-corpus.json"
+    corpus = ROOT / "tests/fixtures/toml-workflow-corpus.json"
     if corpus.exists():
         cases.extend(contract_cases([corpus]))
     cases.extend(contract_cases(args.contracts))

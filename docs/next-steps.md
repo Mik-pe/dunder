@@ -49,10 +49,11 @@ kan plockas isär, också när en komponent äger en resurs.
 
 ### Nätverk
 
-Håll nätverksdelen av standardbiblioteket till transportprimitiver som TCP
-och UDP. Flytta HTTP-serverstödet i `std.http` och klienten i
-`std.http_client` till separata paket med sina protokolltester. Migrera
-Snus server, CLI och workers innan modulerna tas ur standardbiblioteket.
+`std.net` samlar TCP-transporten, inklusive läsning av byte som ligger
+kvar i socketens kö. HTTP-servern och klienten byggs som separata paket
+med protokollprov. Migrera användare till paketberoenden innan
+övergångsimporterna `std.http` och `std.http_client` tas bort.
+[HTTP-paketen](http.md)
 
 ### Körbara exempel i manifestet
 

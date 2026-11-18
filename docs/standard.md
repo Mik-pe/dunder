@@ -7,10 +7,12 @@ eller suffix i importen. Endast explicita beroenden läses. Delade importer
 och alias har samma typidentitet. En lokal fil väljs med en uttrycklig
 relativ sökväg, till exempel `import .std.map as local`.
 
-För applikationer finns även [HTTP-server och TLS-klient](http.md) i
-`std.http`/`std.http_client` samt [SQLite med bundna parametrar](sqlite.md)
-i `std.sqlite`. Dessa moduler använder operativsystemets sockets och de
-angivna systembiblioteken; de kräver ingen C-shim eller extern kompilator.
+`std.sqlite` innehåller stöd för SQLite med bundna parametrar.
+[SQLite](sqlite.md)
+
+HTTP-servern och TLS-klienten finns som egna Dunderpaket som använder
+operativsystemets sockets och angivna systembibliotek.
+[HTTP-paketen](http.md)
 
 ```dunder
 import std.map as map
@@ -184,8 +186,11 @@ i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buff
 `equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
 `std.net` ger kapabilitetsstyrd TCP och `PollSet`/`StreamSet` ovanpå
 `capability network` med både `impl`-metoder (`TcpListener::listen`/`.accept`/`.close`,
-`TcpStream::connect`/`.read_append`/`.write_all`/`.close`, `PollSet::new`,
+`TcpStream::connect`/`.read_append`/`.peek_append`/`.write_all`/`.close`, `PollSet::new`,
 `StreamSet::new`) och modulhjälpare (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
+`peek_append` lägger till upp till det angivna antalet byte i en buffert
+och lämnar dem kvar i socketens kö. Den använder samma resultat för
+läsning, vänteläge och EOF som `read_append`.
 
 ## Generiska samlingar
 

@@ -108,11 +108,11 @@ def host_target():
     raise RuntimeError(f'unsupported native host {host}')
 
 
-def run(command, *, timeout=90, local_network=False):
+def run(command, *, timeout=90, local_network=False, cwd=ROOT):
     environment = os.environ.copy()
     if local_network:
         environment['NO_PROXY'] = environment['no_proxy'] = 'localhost,127.0.0.1'
-    result = subprocess.run(list(map(str, command)), cwd=ROOT, capture_output=True,
+    result = subprocess.run(list(map(str, command)), cwd=cwd, capture_output=True,
                             text=True, timeout=timeout, env=environment)
     assert result.returncode == 0, (command, result.returncode, result.stdout, result.stderr)
     return result
@@ -161,8 +161,8 @@ def main():
                 for target in TARGETS:
                     for mode, flags in enumerate(((), ('--scalar-opt=off', '--ownership-opt=off', '--mir=off'))):
                         image = work / f'client-{target}-{mode}'
-                        run([compiler, 'build', ROOT / 'tests/http_client.ddr', '--target', target,
-                             '--jobs', '1', *flags, '-o', image])
+                        run([compiler, 'build', '--target', target, '--jobs', '1', *flags, '-o', image],
+                            cwd=ROOT / 'packages/http_client/tests')
                         images += 1
                         if target == host:
                             runnable.append(image)
