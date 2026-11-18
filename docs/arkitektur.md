@@ -111,8 +111,8 @@ för att verifiera adressidentitet.
 
 Funktionscachen hoppar inte över dessa kontroller: källkroppar och lån
 kontrolleras även när färdig maskinkod kan återanvändas. HTTP-servern i
-`dunder-hundmat` använder lokala path- och bodyvyer i stället för separata
-offsetpar vid API-gränsen. Kompilatorns fragment-cache lånar tokenstavningar
+testbädden `dunder-hundmat` provar hur lokala sökvägs- och bodyvyer kan ersätta
+separata offsetpar vid en API-gräns. Kompilatorns fragment-cache lånar tokenstavningar
 och läser nyckel, signatur och payload som lokala vyer ur en bytebuffert.
 Hashningen bygger uttryckligen sin ägda indatabuffert; wireformatet är
 oförändrat. Cacheproven verifierar 24 byteidentiska kalla/varma bilder, åtta
@@ -162,12 +162,11 @@ Kompilatorn bäddar in standardmodulerna som räknas upp i
 källtext regenereras läser [selfhost/embed.ddr](../selfhost/embed.ddr)
 samma lista. Vanliga filimporter löses på disk relativt den importerande filen.
 
-Grafikbindningarna ligger i syskonrepot `dunder-hundmat`: Dunder-modulerna
-i `dogfood/graphics/` beskriver bibliotekens C-layout, slår upp
-funktionspekare och äger fönster-, renderings- och händelselogiken. WebGPU-exemplet
+Grafikexemplen i testbädden `dunder-hundmat` provar Dunders FFI och
+kodgenerering. Modulerna i `dogfood/graphics/` beskriver bibliotekens C-layout,
+slår upp funktionspekare och äger fönster-, renderings- och händelselogiken. WebGPU-exemplet
 i `dogfood/webgpu/` anropar sin JavaScript-värd via en vanlig Wasm-import.
-Kompilatorns del av grafikanropen är det generella FFI-stödet och
-kodgenereringen för målet. Se [FFI](ffi.md).
+[Dunders FFI-kontrakt](ffi.md)
 
 Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
 anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen

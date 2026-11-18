@@ -79,8 +79,9 @@ fortsätter vara standardvalen.
 
 ## Grafik
 
-[Hundmats macOS-modul](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/graphics/macos.ddr)
-stöder en Metal-texturatlas och BGRA8-läsning utan fönster.
+Hundmats macOS-prov testar Dunders FFI med en Metal-texturatlas och
+BGRA8-läsning utan fönster. [macOS-modulen i provet](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/graphics/macos.ddr)
+
 Skrift ritar varje packat textprov med en fyrhörning. Verifieringen
 körde Skrift i fönster och utan fönster och kontrollerade färgkanaler,
 radorientering och alfablendning i [pixelprovet](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/metal/pixels.ddr).

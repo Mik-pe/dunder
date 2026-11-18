@@ -127,7 +127,7 @@ tecknet vid underflöde till noll.
 ## Körda program och gränser
 
 ```sh
-# I syskonrepot dunder-hundmat:
+# I Dunders testbädd dunder-hundmat:
 dunder run dogfood/numeric/main.ddr
 # 5.0
 # 2.0
@@ -138,7 +138,7 @@ dunder test dogfood/numeric/main.ddr
 
 Programmen provar typade vektorer, omskalad hypotenusa, toleransjämförelser,
 kompenserad summering, bisektion med callback och Runge–Kutta-integration.
-Hjälparna är Dunder-program och inte ett färdigt standardbibliotek.
+Hjälparna ger exempel på hur flyttalsstödet fungerar i Dunder-program.
 Trigonometriska funktioner, exp/log, decimalflyttal, SIMD och float-fmod
 återstår.
 

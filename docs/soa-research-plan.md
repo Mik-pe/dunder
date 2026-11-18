@@ -3,7 +3,8 @@
 Undersökningen gäller hur Dunder kan kombinera postbaserade samlingar
 med kolumnlagring (Structure of Arrays), motiverat av
 [planen för samlingar](next-steps.md#samlingar) och erfarenheter från
-`dunder-skrift` och `dunder-hundmat/dogfood/skrift`.
+`dunder-skrift` och Skrift-exemplet i Dunders testbädd
+(`dunder-hundmat/dogfood/skrift`).
 
 Vanliga `[]Struct`, payload-enums och nästlade arrayer stöds nu av
 [frontend_types.ddr](../selfhost/frontend/frontend_types.ddr). Sammansatta

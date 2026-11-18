@@ -58,8 +58,9 @@ installerar den. [Releaser](docs/releases.md)
 - [Standardbiblioteket](docs/standard.md) omfattar bland annat samlingar, text och serialisering. [Systembibliotek](docs/sys.md) · [HTTP och TLS](docs/http.md) · [SQLite](docs/sqlite.md) · [TOML](docs/toml.md) · [Kryptografi](docs/crypto.md)
 - [C-FFI](docs/ffi.md) beskriver externa anrop och datalayout. [Parallella uppgifter](docs/tasks.md)
 
-Tabell, HTTP-servern och grafikexemplen för Metal, Vulkan och WebGPU finns i
-[dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat).
+Hundmat är Dunders testbädd. Tabell, HTTP-servern och grafikexemplen för
+Metal, Vulkan och WebGPU låter oss prova språket, kompilatorn och
+standardbiblioteket i riktiga program. [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat)
 
 ## Kompilatorutveckling
 

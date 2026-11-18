@@ -11,9 +11,10 @@ dunder run tools/performance.ddr -- /path/to/baseline /path/to/candidate \
   /path/to/empty-report-directory --rounds 30 --c-compiler /usr/bin/clang
 ```
 
-Med `--tabell /sökväg/till/dunder-hundmat/tabell` mäter runtimesviten även
-den riktiga CSV-binären på 32 768 rader med 402 grupper, UTF-8 och citerade
-fält. Varje körnings utdata jämförs med en separat summering och sortering.
+Med `--tabell /sökväg/till/dunder-hundmat/tabell` använder runtimesviten
+CSV-programmet från Dunders testbädd som arbetslast. Indatan har 32 768 rader,
+402 grupper, UTF-8 och citerade fält. Varje körnings utdata jämförs med en
+separat summering och sortering.
 
 `--suite runtime` och `--suite compiler` väljer en delmängd. `--include-check`
 mäter även `check` för det genererade korpuset och kompilatorkällan. C-referensen
