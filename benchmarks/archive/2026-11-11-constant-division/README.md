@@ -18,7 +18,7 @@ funktionsidentitet känns igen.
 ARM64 och x86-64 använder den generella sänkningen. Wasm behåller vanlig
 division för de generella multiplikatorfallen och använder bara de enkla
 specialfallen. Endast scratchregistren x0–x3 påverkas.
-[Implementation och kontrakt](../../docs/optimization.md#signerad-division-och-rest-med-konstant-delare).
+[Implementation och kontrakt]((../../../docs/optimization.md#signerad-division-och-rest-med-konstant-delare)).
 
 Kompilatorkoden är `6e2331e`, jämförd med föregående `a1b8369`. Kandidatens
 SHA-256 är `87d0070524a5cbe1a095325e0190736695ab267bca4d1ef124158befcf42c496`.

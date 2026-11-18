@@ -39,7 +39,7 @@ python3 tools/performance.py BASELINE CANDIDATE REPORT \
 ## Kompilatorns eget arbete
 
 Fem separata par per arbetsfall med
-[`profile-compiler.py`](../../tools/profile-compiler.py). Varje par använder
+[`profile_compiler.ddr`](../../../tools/profile_compiler.ddr). Varje par använder
 en vanlig kompilator med fasur och en separat allokeringsinstrumenterad
 kompilator utan ur. Bilderna som de producerar är byteidentiska genom hela
 insamlingen. Självbygget är dessutom samma fixpunkt som indatakompilatorn.
@@ -62,11 +62,11 @@ postkloning begär tillsammans 0,33 MB. Retain/release räknar hjälparanrop
 [kommandon, identiteter och alla observationer](compiler-attribution/metadata.json)
 och [rå stdout/stderr](compiler-attribution/raw/) bevaras. Stora genererade
 bilder och korpusfiler återgenereras av verktyget och checkas inte in.
-[Kontrakt och begränsningar](../../docs/compiler-attribution.md).
+[Kontrakt och begränsningar](../../../docs/compiler-attribution.md).
 
 ## Oberoende konsumentfall
 
-Fyra [dogfood-program](../dogfood/README.md) provar POD-poster,
+Fyra [dogfood-program](../../dogfood/README.md) provar POD-poster,
 decimalparsning, den verkliga lexern och symboltabeller. Resultaten jämförs
 med oberoende Pythonreferenser. Arbetsmängderna kalibrerades en gång mot
 `162fb65` och frystes före jämförelser: 16 135, 550, 20 respektive 30.

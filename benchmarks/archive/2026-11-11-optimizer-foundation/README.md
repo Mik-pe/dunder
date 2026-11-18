@@ -26,7 +26,7 @@ för samma arbete. Kandidatens median är 1,42× C-referensens tid. De övriga
 runtimeprovens medianer ändrades mindre än en procent; där visar serien
 ingen tydlig förbättring. Den styrker inte generell C/C++-paritet.
 
-De fyra källorna och [C-referensen](../runtime/reference.c) är oförändrade.
+De fyra källorna och [C-referensen](../../runtime/reference.c) är oförändrade.
 Varvantal, frö och text kommer från programargument. Python beräknar
 oberoende förväntade resultat; varje körning måste ge exakt rätt kontrollsumma.
 C använder Apple Clang 21 med `-std=c11 -O3 -ftrapv` och saknar Dunders

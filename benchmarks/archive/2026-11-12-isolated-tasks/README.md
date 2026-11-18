@@ -7,7 +7,7 @@ the preceding serial compiler is
 All series use the normal complete safety/optimization profile. Source,
 compiler, tool, input and image hashes are retained with raw samples.
 
-This milestone implements [source-language tasks](../../docs/tasks.md).
+This milestone implements [source-language tasks](../../../docs/tasks.md).
 The compiler still runs its own function passes serially. Language-task
 throughput below is a separate observation from serial compiler cost and
 from the four-program C acceptance suite.

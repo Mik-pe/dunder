@@ -33,8 +33,8 @@ Varje operation har 29 obligatoriska kolumnposter för bland annat operander,
 registereffekter och ursprungsposition. Huvudtråden packade funktionerna i
 138 batcher om sammanlagt 80 790 264 byte i nyttolast till arbetstrådarna,
 som packade upp kolumnerna igen. Svaren innehöll 7 407 844 byte.
-[Definition och konstruktion av MIR](../../../selfhost/mir.ddr) ·
-[Packning och uppackning](../../../selfhost/mir_task.ddr)
+[Definition och konstruktion av MIR](../../../selfhost/mir/mir.ddr) ·
+[Packning och uppackning](../../../selfhost/tasks/mir_task.ddr)
 
 Separata klockprober på huvudtråden visade cirka 145 ms för emission av
 funktionskropparna, 109 ms för att bygga MIR och 52 ms för att packa den.

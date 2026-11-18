@@ -105,9 +105,10 @@ pub struct Metadata {
 tom och metadatafält noll/falska. Det skiljer en tom fil som lästes korrekt
 från ett misslyckat anrop. `.size` räknar byte, inte Unicode-kodpunkter.
 Ett normalt I/O-fel är ett resultat; det avbryter inte processen.
-Koden väljer själv hur felet hanteras. Det finns ännu ingen `?`-operator
-eller generell Result/Option-typ. Konkreta enums och `match` fungerar redan;
-se [enumreglerna](enums.md).
+Koden väljer själv hur felet hanteras. För generella typade fel finns
+`Result<T, E>` i det fördefinierade biblioteket tillsammans med
+`?`-operatorn; se [typade fel med Result](enums.md#typade-fel-med-result).
+Konkreta enums och `match` fungerar också; se [enumreglerna](enums.md).
 
 `write_stderr` och `eprint` låter ett CLI-program skilja diagnostik från
 maskinläsbar stdout. Båda returnerar `Status`; bind resultatet och kontrollera
@@ -242,8 +243,9 @@ bevarade `envp` och behåller sitt statiska ELF-format. `sys.envp` ger fortsatt 
 på macOS, där `std.process` använder plattformens miljö-API. Se
 [målplattformarnas verifiering](targets.md).
 Systemanropen är en plattformsdetalj som anpassas per mål.
-Binärläsning, kataloglistning, rekursiva katalogverktyg,
-strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.
+Binärläsning finns som `sys.read_u8`/`read_u8_limit`/`read_u8_into` och
+katalogverktyg i `std.fs` (`list_dir`, `ReadDir::list`, `remove_all`).
+Strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.
 
 För kod som ska få åtkomst till en vald fil via en parameter finns
 `std.fs.ReadFile` och `std.fs.WriteFile`. Handtagen skapas i en modul

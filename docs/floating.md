@@ -139,8 +139,8 @@ dunder test dogfood/numeric/main.ddr
 Programmen provar typade vektorer, omskalad hypotenusa, toleransjämförelser,
 kompenserad summering, bisektion med callback och Runge–Kutta-integration.
 Hjälparna är Dunder-program och inte ett färdigt standardbibliotek.
-Trigonometriska funktioner, exp/log, decimalflyttal, SIMD och float-fmod
-återstår.
+Trigonometriska funktioner finns i `std.math` (`sin`, `cos`, `tan` för `f64`);
+exp/log, decimalflyttal, SIMD och float-fmod återstår.
 
 Skalära flyttalsargument använder v0–v7, separat från x0–x7 för övriga
 argument. Därefter används stacken med naturlig storlek och justering.

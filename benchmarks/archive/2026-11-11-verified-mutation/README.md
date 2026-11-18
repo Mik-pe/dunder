@@ -5,7 +5,7 @@ och elementskrivning genom exklusiva `&mut []i64`-parametrar. Den inför
 också obligatorisk IR-verifiering före och efter passet, gemensamma
 källspråksregler och konsekvent lexikal namnupplösning i kompilatorns
 direkta API. Ingen algoritm väljs genom funktionsnamn eller modul.
-[Mekanismer, gränser och nästa steg](../../docs/optimization.md).
+[Mekanismer, gränser och nästa steg](../../../docs/optimization.md).
 
 Baseline är den självbyggda kompilatorn från `f4a1fac`. Slutkandidatens
 kodrevision är `5360693`, SHA-256

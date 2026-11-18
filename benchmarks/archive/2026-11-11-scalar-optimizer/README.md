@@ -4,7 +4,7 @@ Standardkompilatorn använder nu en begränsad typad funktionsmodell,
 konstantförenkling, konservativa loopbevis och registerallokering.
 Anropsfria skalära funktioner och läsning av delade `[]i64`-parametrar
 omfattas. Anrop, muterbara arrayer, ägda värden och flyttal använder
-fortsatt den allmänna kodgeneratorn. [Implementation och nästa etapper](../../docs/optimization.md).
+fortsatt den allmänna kodgeneratorn. [Implementation och nästa etapper](../../../docs/optimization.md).
 
 Två serier med 30 försök per variant och arbetsfall kördes separat:
 

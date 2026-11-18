@@ -14,7 +14,7 @@ Ett validerat maskin-IR korrigerar instruktioner, etiketter, relokeringar
 och importernas byteadresser atomiskt; det verifierar redigeringsplanens
 form. Effektreglernas semantiska sundhet granskas och provas separat.
 Det finns ingen regel för ett visst funktionsnamn eller en viss benchmark.
-[Omfattning och säkerhetsregler](../../docs/optimization.md).
+[Omfattning och säkerhetsregler](../../../docs/optimization.md).
 
 Samtidigt rättas blockgränser för `if` med struct-konstruktorer i villkoret.
 Det är ett vanligt språkfel som dogfoodingen exponerade. Den ursprungliga
@@ -92,7 +92,7 @@ och [gamla av/på-resultat](dogfood-ablation-revision1/summary.csv) sparas.
 Revision 2 använder en kontrollerad uppvärmning även vid kalibrering.
 De nya mängderna frystes mot en enda tidigare baseline innan de nya serierna:
 593 041, 14 479, 284 och 445. De anpassas aldrig efter variant eller försök.
-[Kalibrering](calibration-revision2/) och [manifest](../dogfood/workloads.json).
+[Kalibrering](calibration-revision2/) och [manifest](../../dogfood/workloads.json).
 
 ## Utförd trafik och nästa grund
 
@@ -121,6 +121,6 @@ den tidigare kompilatorn. Linuxkörning har inte gjorts i denna etapp.
 
 Nästa numeriska mekanism är generell konstantdivision/rest med exakt
 signerad semantik. För större compilerkostnader finns en
-[konkret plan för ägar-IR och CFG](../../docs/ownership-ir-plan.md): först
+[konkret plan för ägar-IR och CFG](../../../docs/ownership-ir-plan.md): först
 verifierad analys, därefter borttagning av bevisat tom cleanup. Båda ska
 bedömas med samma byggbudget och säkerhetsregler.
