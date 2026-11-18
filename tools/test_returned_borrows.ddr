@@ -1,0 +1,200 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .ownership_probe as probe
+import .ownership_probe_cases as cases
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.text as text
+import sys
+
+struct Rejection {
+    source: string,
+    expected: string,
+}
+
+fn prepare_rejections(run: &probe.Run, fixtures: string, negatives: &mut []Rejection) -> bool {
+    views := sys.read_u8(fixtures + "/views.ddr")
+    if !views.ok || !sys.write_u8(run.work + "/views.ddr", &views.value).ok { return harness.fail("cannot stage returned-borrow fixture") }
+    prefix := "capability unsafe\nimport views\n"
+    for entry in move cases.returned_declarations() {
+        (name, body, message) := entry
+        source := f"{run.work}/invalid-{name}.ddr"
+        if !probe.put(source, prefix + body + "\nfn main() {}\n") { return false }
+        negatives.push(Rejection { source: source, expected: message })
+    }
+    client := prefix + cases.returned_helpers() +
+        "fn main() { mut v: []i32 = [20, 22]; mut f := make_fields()\n"
+    for entry in move cases.returned_clients() {
+        (name, body, message) := entry
+        source := f"{run.work}/invalid-{name}.ddr"
+        if !probe.put(source, client + body + "\n}\n") { return false }
+        negatives.push(Rejection { source: source, expected: message })
+    }
+    true
+}
+
+fn observe(run: &mut probe.Run, name: string, target: string, image: string) -> bool {
+    mut output := harness.empty_output()
+    if name == "values" || name == "layouts" {
+        expected := if name == "values" { "43\nreturned borrows ok\n" } else { "returned layouts ok\n" }
+        return run.execute(target, image, [], 0, expected, &mut output) &&
+            (output.stderr.len == 0 || harness.fail(f"unexpected stderr from {image}\n{output.stderr_text()}"))
+    }
+    if name == "faults" {
+        for entry in move cases.returned_faults() {
+            (arg, status, expected) := entry
+            if !run.execute(target, image, [arg.clone()], status, expected, &mut output) { return false }
+        }
+        return true
+    }
+    if !run.execute(target, image, ["0"], 0, "60672\n", &mut output) { return false }
+    first := probe.profile(&output)
+    if !first.ok || !run.execute(target, image, ["1"], 0, "60672\n", &mut output) { return false }
+    second := probe.profile(&output)
+    if !second.ok || !probe.equal_profiles(&first, &second) { return false }
+    allocated := probe.count(&first, "allocation_count")
+    names: []string = ["array_clone_calls", "record_clone_calls", "string_slice_calls"]
+    (allocated.ok && allocated.value > 0 && probe.zero(&first, &names)) ||
+        harness.fail(f"{image}: expected equivalent owning inputs and borrow-only views")
+}
+
+fn check_fixtures(run: &mut probe.Run, fixtures: string, target: string, policy: &[]string, workers: &[]i32) -> bool {
+    work := run.work.clone()
+    mut output := harness.empty_output()
+    for name in ["values", "layouts", "profile", "faults"] {
+        source := f"{fixtures}/{name}.ddr"
+        image := work + "/" + name
+        flags := probe.with_options(["check", source.clone(), "--agent", "--target", target.clone()], &policy)
+        if !run.call(flags, work, 0, &mut output) || !harness.agent_ok(&output) { return false }
+        mut previous: []u8 = []
+        for jobs in workers {
+            mut args := probe.options(target, jobs, &policy)
+            if name == "profile" { args.push("--runtime-profile") }
+            if !run.build(source, image, &args, work) { return false }
+            data := sys.read_u8(image)
+            if !data.ok || !native.image_header(&data.value, target) { return harness.fail(f"{image}: invalid {target} executable") }
+            if previous.len > 0 && !bytes.equal(&previous, &data.value) {
+                return harness.fail(f"{name} {target}: worker build changed image bytes")
+            }
+            if jobs == 1 && run.runners.can_run(target) && !observe(&mut run, name, target, image) { return false }
+            previous = data.value
+        }
+    }
+    true
+}
+
+fn check_rejections(run: &mut probe.Run, negatives: &[]Rejection, target: string, policy: &[]string,
+                    jobs: i32, seen: &mut Map<string, string>) -> bool {
+    flags := probe.options(target, jobs, &policy)
+    for entry in negatives {
+        report := run.reject(entry.source, entry.expected, &flags)
+        if !report.ok { return false }
+        if seen.contains(entry.source) {
+            if report.raw != seen.at(entry.source) {
+                return harness.fail(f"{entry.source}: targets or worker policies changed diagnostics\n{report.raw}")
+            }
+        } else {
+            seen.put(entry.source.clone(), report.raw.clone())
+        }
+        run.rejections += 1
+    }
+    true
+}
+
+fn chooser(from: string) -> string {
+    f"pub fn pick(a: &[]i32, b: &[]i32) -> &[]i32 from {from} {{ {from} }}\n"
+}
+
+fn client(other: string) -> string {
+    "import chooser\nfn main() {\n    mut a: []i32 = [20]\n    mut b: []i32 = [22]\n    view := chooser.pick(a, b)\n" +
+        f"    {other}[0] = 0\n    print(view[0])\n}}\n"
+}
+
+fn unchanged(path: string, before: &[]u8, target: string, operation: string) -> bool {
+    after := sys.read_u8(path)
+    (after.ok && bytes.equal(&before, &after.value)) || harness.fail(f"{target}: {operation} changed executable bytes")
+}
+
+fn incremental(run: &mut probe.Run, target: string, jobs: i32) -> bool {
+    work := run.work.clone()
+    module := work + "/chooser.ddr"
+    source := work + "/edit-source.ddr"
+    image := work + "/edit-source"
+    command: []string = ["build", source.clone(), "--target", target.clone(), "--jobs", jobs.str(), "--incremental", "-o", image.clone()]
+    mut result := harness.empty_output()
+    if !probe.put(module, chooser("a")) || !probe.put(source, client("b")) ||
+       !run.call(command, work, 0, &mut result) { return false }
+    good := sys.read_u8(image)
+    if !good.ok || !run.call(command, work, 0, &mut result) ||
+       !unchanged(image, &good.value, target, "warm borrow build") { return false }
+    if run.runners.can_run(target) && !run.execute(target, image, [], 0, "20\n", &mut result) { return false }
+    if !probe.put(module, chooser("b")) || !run.call(command, work, 1, &mut result) { return false }
+    flags: []string = ["--target", target.clone(), "--jobs", jobs.str()]
+    diagnostic := run.check_error(source, "borrow", &flags)
+    if !diagnostic.ok || text.find(result.stderr_text(), diagnostic.message) < 0 ||
+       !unchanged(image, &good.value, target, "borrow rejection") {
+        return harness.fail(f"{target}: changed return origin was not diagnosed\n{result.stderr_text()}")
+    }
+    if !probe.put(source, client("a")) || !run.call(command, work, 0, &mut result) { return false }
+    updated := sys.read_u8(image)
+    if !updated.ok || !run.call(["build", source.clone(), "--target", target.clone(), "--jobs", "1", "-o", image.clone()], work, 0, &mut result) ||
+       !unchanged(image, &updated.value, target, "updated incremental build") { return false }
+    !run.runners.can_run(target) || run.execute(target, image, [], 0, "22\n", &mut result)
+}
+
+fn large_stack(path: string) -> bool {
+    mut source: []u8 = []
+    bytes.append_utf8(&mut source, "fn window(data: &[]i32")
+    for i in 1..2056 { bytes.append_utf8(&mut source, f", p{i}: i32") }
+    bytes.append_utf8(&mut source, ") -> &[]i32 {\n    assert(p2055 == 2055)\n    &data[1..2]\n}\n" +
+                                  "fn main() {\n    data: []i32 = [7, 42]\n    r := window(data")
+    for i in 1..2056 { bytes.append_utf8(&mut source, f", {i}") }
+    bytes.append_utf8(&mut source, ")\n    assert(r.len == 1)\n    print(r[0])\n}\n")
+    sys.write_u8(path, &source).ok || harness.fail(f"cannot write large-stack test to {path}")
+}
+
+fn run_suite(run: &mut probe.Run, serial: bool) -> bool {
+    fixtures := run.root + "/tests/fixtures/returned_borrows"
+    work := run.work.clone()
+    workers: []i32 = if serial { [1] } else { [1, 4] }
+    policies: [][]string = [[], ["--mir=off", "--scalar-opt=off", "--ownership-opt=off", "--inline-opt=off"]]
+    highest := workers[workers.len - 1]
+    mut negatives: []Rejection = []
+    mut seen := Map<string, string>::new()
+    if !prepare_rejections(&run, fixtures, &mut negatives) { return false }
+    wide := work + "/many-arguments.ddr"
+    if !large_stack(wide) { return false }
+    mut output := harness.empty_output()
+    for target in harness.targets() {
+        for policy in policies {
+            if !check_fixtures(&mut run, fixtures, target, &policy, &workers) ||
+               !check_rejections(&mut run, &negatives, target, &policy, highest, &mut seen) { return false }
+        }
+        if !incremental(&mut run, target, highest) { return false }
+        image := work + "/many-arguments"
+        flags := probe.options(target, highest, &[])
+        if !run.build(wide, image, &flags, work) { return false }
+        if run.runners.can_run(target) && !run.execute(target, image, [], 0, "42\n", &mut output) { return false }
+    }
+    print(f"Returned borrows passed {run.builds} native images, {run.executions} executions ({run.runners.targets()}), {run.rejections} check/build rejections and 3 incremental source changes")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--runner"), cli.flag("--serial")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_returned_borrows COMPILER [--runner TARGET=COMMAND] [--serial]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    temp := fs.temp_dir("dunder-returned-borrows-")
+    if !temp.ok { _ := harness.fail("cannot create returned borrow test directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    work := probe.absolute_work(temp.value)
+    if work.len == 0 { return 1 }
+    mut run := probe.open(compiler, work, &args.all("--runner"))
+    if !run.ready() { return 2 }
+    if run_suite(&mut run, args.has("--serial")) { 0 } else { 1 }
+}

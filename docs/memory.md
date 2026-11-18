@@ -313,8 +313,8 @@ python3 tools/test-runtime-contracts.py "$dunder_bin"
 "$dunder_bin" run tools/test_resource_moves.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_resource_ownership.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_stdlib_ownership.ddr -- "$dunder_bin"
-python3 tools/test-local-borrows.py "$dunder_bin"
-python3 tools/test-returned-borrows.py "$dunder_bin"
+"$dunder_bin" run tools/test_local_borrows.ddr -- "$dunder_bin"
+"$dunder_bin" run tools/test_returned_borrows.ddr -- "$dunder_bin"
 ```
 
 Lånesviten korsbygger de tre nativa målen och kör värdmålets program.

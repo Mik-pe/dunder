@@ -118,7 +118,7 @@ Hashningen bygger uttryckligen sin ägda indatabuffert; wireformatet är
 oförändrat. Cacheproven verifierar 24 byteidentiska kalla/varma bilder, åtta
 värdkörningar och 166 atomiska avvisningar, inklusive ogiltig UTF-8.
 Detta är korrekthets- och representationskontrakt, utan nya prestandaanspråk.
-[Körbara låneprov](../tools/test-local-borrows.py).
+[Körbara låneprov](../tools/test_local_borrows.ddr).
 
 På alla tre nativa mål kan isolerade uppgifter köras på flera trådar.
 Typkontrollen begränsar vilka data och effekter en uppgift får använda.

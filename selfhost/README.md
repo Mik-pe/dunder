@@ -74,7 +74,7 @@ Enskilda testgrupper kan listas, byggas och köras från projektets rot.
 ./build/group0
 ```
 
-[Låneproven](../tools/test-local-borrows.py) och [fältflyttarna](../tools/test-partial-moves.py)
+[Låneproven](../tools/test_local_borrows.ddr) och [fältflyttarna](../tools/test_partial_moves.ddr)
 korsbygger de tre nativa målen och kör värdens bilder. Med
 `--runner TARGET=COMMAND` kan de även köra en korsbyggd bild i en lokal
 målmiljö. Kommandot får bildens absoluta sökväg som sista argument.

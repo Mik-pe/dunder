@@ -1,0 +1,167 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .source_rejections as reject
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+pub struct Run {
+    compiler: string,
+    root: string,
+    work: string,
+    host: string,
+    runners: native.Runners,
+    builds: i32,
+    executions: i32,
+    rejections: i32,
+}
+
+pub struct Report {
+    ok: bool,
+    raw: string,
+    message: string,
+}
+
+pub fn open(compiler: string, work: string, runners: &[]string) -> Run {
+    Run { compiler: compiler.clone(), root: harness.find_root(), work: work.clone(),
+          host: process.host_target(), runners: native.Runners::new(&runners), builds: 0, executions: 0, rejections: 0 }
+}
+
+pub fn absolute_work(path: string) -> string {
+    canonical := fs.realpath(path)
+    if canonical.ok { return canonical.value }
+    _ := harness.fail(f"cannot resolve test directory {path}")
+    ""
+}
+
+pub fn put(path: string, source: string) -> bool {
+    sys.write_text(path, source).ok || harness.fail(f"cannot write {path}")
+}
+
+pub fn options(target: string, jobs: i32, policy: &[]string) -> []string {
+    with_options(["--target", target.clone(), "--jobs", jobs.str()], &policy)
+}
+
+pub fn with_options(move command: []string, options: &[]string) -> []string {
+    mut args := move command
+    for option in options { args.push(option.clone()) }
+    args
+}
+
+impl Run {
+    pub fn ready(&self) -> bool {
+        if self.runners.error.len > 0 { return harness.fail(self.runners.error) }
+        (self.root.len > 0 && self.host.len > 0) || harness.fail("cannot identify repository and execution host")
+    }
+
+    pub fn call(&self, args: []string, cwd: string, status: i32, output: &mut process.Output) -> bool {
+        harness.run_checked(self.compiler, args, cwd, status, false, &mut output)
+    }
+
+    pub fn build(&mut self, path: string, image: string, flags: &[]string, cwd: string) -> bool {
+        mut output := harness.empty_output()
+        args := with_options(["build", path.clone(), "-o", image.clone()], &flags)
+        if !self.call(args, cwd, 0, &mut output) { return false }
+        self.builds += 1
+        true
+    }
+
+    pub fn execute(&mut self, target: string, path: string, args: []string, code: i32, expected: string, output: &mut process.Output) -> bool {
+        if !self.runners.run(target, path, args, self.work, code, &mut output) ||
+           !harness.stdout_is(&output, expected, path) { return false }
+        self.executions += 1
+        true
+    }
+
+    pub fn check_error(&self, path: string, message: string, flags: &[]string) -> Report {
+        mut output := harness.empty_output()
+        args := with_options(["check", path.clone(), "--agent"], &flags)
+        if !self.call(args, self.work, 1, &mut output) { return Report { ok: false, raw: "", message: "" } }
+        raw := output.stdout_text()
+        parsed := reject.inspect(raw, path, message, false)
+        if parsed.ok && parsed.start == parsed.end { _ := harness.fail(f"{path}: diagnostic span is empty\n{raw}") }
+        Report { ok: parsed.ok && parsed.start < parsed.end, raw: raw, message: parsed.message }
+    }
+
+    pub fn reject(&self, path: string, message: string, flags: &[]string) -> Report {
+        mut report := self.check_error(path, message, &flags)
+        if report.ok { report.ok = reject.preserves_output(self.compiler, self.work, path, &flags, report.message) }
+        report
+    }
+}
+
+pub fn checked_rejection(run: &mut Run, source: string, message: string, target: string, workers: &[]i32, policies: &[][]string) -> bool {
+    mut previous := ""
+    for policy in policies {
+        for jobs in workers {
+            flags := options(target, jobs, &policy)
+            report := run.reject(source, message, &flags)
+            if !report.ok { return false }
+            if previous.len > 0 && previous != report.raw {
+                return harness.fail(f"{source}: compiler modes disagreed on the diagnostic\n{previous}\n{report.raw}")
+            }
+            previous = report.raw
+        }
+    }
+    run.rejections += 1
+    true
+}
+
+pub fn profile(result: &process.Output) -> json.Doc {
+    raw := result.stderr_text()
+    record := json.Doc::parse_text(raw)
+    if !record.ok || record.get_str(record.root, "kind").value != "runtime_profile" ||
+       record.get_i64(record.root, "version").value != 1 || record.kind(record.field(record.root, "counters")) != .Object {
+        _ := harness.fail(f"invalid runtime profile\n{raw}")
+        return json.Doc::parse_text("")
+    }
+    record
+}
+
+pub fn count(profile: &json.Doc, name: string) -> json.UintField {
+    profile.get_u64(profile.field(profile.root, "counters"), name)
+}
+
+pub fn zero(profile: &json.Doc, names: &[]string) -> bool {
+    for name in names {
+        event := count(&profile, name)
+        if !event.ok || event.value != 0 {
+            return harness.fail(f"unexpected borrow or ownership traffic in {name}\n{profile.raw_span(profile.root)}")
+        }
+    }
+    true
+}
+
+pub fn equal_counters(a: &json.Doc, b: &json.Doc, names: &[]string) -> bool {
+    for name in names {
+        first := count(&a, name)
+        second := count(&b, name)
+        if !first.ok || !second.ok || first.value != second.value {
+            return harness.fail(f"{name}: compared profiles disagree ({first.value}, {second.value})")
+        }
+    }
+    true
+}
+
+pub fn equal_profiles(a: &json.Doc, b: &json.Doc) -> bool {
+    ac := a.field(a.root, "counters")
+    bc := b.field(b.root, "counters")
+    if a.count(ac) != b.count(bc) { return harness.fail("profile counter sets differ") }
+    mut names: []string = []
+    for i in 0..a.count(ac) {
+        key := a.key_at(ac, i)
+        if !key.ok { return harness.fail("profile counter has no name") }
+        names.push(move key.value)
+    }
+    equal_counters(&a, &b, &names)
+}
+
+pub fn bounded_reuse(record: &json.Doc, minimum_reuse: u64) -> bool {
+    fresh := count(&record, "fresh_allocations")
+    reused := count(&record, "reused_allocations")
+    (fresh.ok && fresh.value < 128 && reused.ok && reused.value > minimum_reuse) ||
+        harness.fail(f"unexpected allocation reuse\n{record.raw_span(record.root)}")
+}

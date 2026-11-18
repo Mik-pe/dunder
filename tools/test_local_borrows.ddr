@@ -1,0 +1,146 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .ownership_probe as probe
+import .ownership_probe_cases as cases
+import .probe_cli as cli
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+fn policies() -> [][]string { [[], native.direct_flags(), ["--mir-ssa=on"]] }
+
+fn workers(run: &probe.Run, target: string, serial: bool) -> []i32 {
+    if target == run.host && !serial { [1, 4] } else { [1] }
+}
+
+fn check_programs(run: &mut probe.Run, fixtures: string, serial: bool, modes: &[][]string) -> bool {
+    programs: [](string, string) = [("locals", "local loans ok\n"), ("views", "borrowed views ok\n"),
+        ("temporaries", "temporary call loans ok\n"), ("profile-control", "view allocation oracle ok\n"),
+        ("profile-views", "view allocation oracle ok\n")]
+    no_traffic: []string = ["retain_calls", "array_clone_calls", "record_clone_calls", "string_slice_calls"]
+    matched: []string = ["allocation_count", "requested_bytes", "size_class_payload_bytes",
+                        "fresh_allocations", "reused_allocations", "record_construct_calls"]
+    mut controls: []json.Doc = []
+    mut result := harness.empty_output()
+    root := run.root.clone()
+    for program in move programs {
+        (name, expected) := program
+        source := f"{fixtures}/{name}.ddr"
+        mut observed := 0
+        for target in harness.targets() {
+            for policy in modes {
+                for jobs in workers(&run, target, serial) {
+                    image := f"{run.work}/{name}-{run.builds}"
+                    mut flags := probe.options(target, jobs, &policy)
+                    flags.push("--runtime-profile")
+                    if !run.build(source, image, &flags, root) { return false }
+                    if !run.runners.can_run(target) { continue }
+                    if !run.execute(target, image, [], 0, expected, &mut result) { return false }
+                    if name == "temporaries" || text.starts_with(name, "profile-") {
+                        record := probe.profile(&result)
+                        if !record.ok { return false }
+                        if name == "temporaries" {
+                            if !probe.bounded_reuse(&record, 2000) { return false }
+                        } else {
+                            if !probe.zero(&record, &no_traffic) { return false }
+                            if name == "profile-control" { controls.push(move record) }
+                            else if observed >= controls.len || !probe.equal_counters(&record, &controls[observed], &matched) { return false }
+                            observed += 1
+                        }
+                    }
+                }
+            }
+        }
+        if name == "profile-views" && observed != controls.len { return harness.fail("view and owner profile matrices differ") }
+    }
+    true
+}
+
+fn check_sources(run: &mut probe.Run, serial: bool, modes: &[][]string) -> bool {
+    types := cases.local_types()
+    for entry in move cases.local_rejections() {
+        (name, source, message) := entry
+        path := f"{run.work}/invalid-{name}.ddr"
+        prefix := if text.starts_with(name, "raw-exposing-") { "capability unsafe\n" } else { "" }
+        if !probe.put(path, prefix + types + source + "\n") { return false }
+        for target in harness.targets() {
+            jobs := workers(&run, target, serial)
+            if !probe.checked_rejection(&mut run, path, message, target, &jobs, &modes) { return false }
+        }
+    }
+    true
+}
+
+fn check_faults(run: &mut probe.Run, serial: bool, modes: &[][]string) -> bool {
+    root := run.root.clone()
+    prefix := cases.local_types() + "fn first()->i32{print(1);-1} fn last()->i32{print(2);1} fn main(){"
+    mut result := harness.empty_output()
+    for entry in move cases.local_faults() {
+        (name, body, status, expected) := entry
+        source := f"{run.work}/fault-{name}.ddr"
+        if !probe.put(source, prefix + body + "}\n") { return false }
+        for target in harness.targets() {
+            for policy in modes {
+                for jobs in workers(&run, target, serial) {
+                    image := f"{run.work}/fault-{run.builds}"
+                    flags := probe.options(target, jobs, &policy)
+                    if !run.build(source, image, &flags, root) { return false }
+                    if run.runners.can_run(target) && !run.execute(target, image, [], status, expected, &mut result) { return false }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn check_tasks(run: &mut probe.Run, fixtures: string, serial: bool, modes: &[][]string) -> bool {
+    source := fixtures + "/task-temporary.ddr"
+    host := run.host.clone()
+    root := run.root.clone()
+    jobs := workers(&run, host, serial)
+    mut result := harness.empty_output()
+    for policy in modes {
+        for count in jobs {
+            image := f"{run.work}/task-temporary-{run.builds}"
+            flags := probe.options(host, count, &policy)
+            if !run.build(source, image, &flags, root) ||
+               !harness.run_checked(image, [], run.work, 0, false, &mut result) ||
+               !harness.stdout_is(&result, "task temporary loans ok\n", image) { return false }
+            run.executions += 1
+        }
+    }
+    for entry in move cases.task_rejections() {
+        (name, program) := entry
+        path := f"{run.work}/invalid-{name}.ddr"
+        if !probe.put(path, program) ||
+           !probe.checked_rejection(&mut run, path, "scoped borrow reaches a raw address", host, &jobs, &modes) { return false }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--runner"), cli.flag("--serial"), cli.flag("--only-tasks")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_local_borrows COMPILER [--runner TARGET=COMMAND] [--serial] [--only-tasks]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    temp := fs.temp_dir("dunder-local-borrows-")
+    if !temp.ok { _ := harness.fail("cannot create local borrow test directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    work := probe.absolute_work(temp.value)
+    if work.len == 0 { return 1 }
+    mut run := probe.open(compiler, work, &args.all("--runner"))
+    if !run.ready() { return 2 }
+    fixtures := run.root + "/tests/fixtures/local_borrows"
+    serial := args.has("--serial")
+    modes := policies()
+    if !args.has("--only-tasks") &&
+       (!check_programs(&mut run, fixtures, serial, &modes) || !check_sources(&mut run, serial, &modes) ||
+        !check_faults(&mut run, serial, &modes)) { return 1 }
+    if !check_tasks(&mut run, fixtures, serial, &modes) { return 1 }
+    print(f"local borrows: {run.builds} native images, {run.executions} target executions, {run.rejections} rejected contracts; lexical loans, view identity/allocation, temporary lifetimes, bounds/UTF-8 and diagnostic/publication parity passed")
+    0
+}
