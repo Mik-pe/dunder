@@ -11,11 +11,14 @@ uttryckstemporärer placeras i register.
 
 ## Instruktionsval för heltal och arrayåtkomst
 
-Den vanliga uttryckskompilatorn och den skalära optimeraren använder samma
-emitter för signerad addition, subtraktion och jämförelsevillkor. Anroparen
-bestämmer evalueringsordning, register och vilka kontroller som har bevisats
-överflödiga. En kontrollerad `i32`-addition testar overflow vid 32 bitar
-innan resultatet teckenutvidgas. För bitoperationer med ett känt argument
+Den vanliga uttryckskompilatorn och den skalära optimeraren delar backendens
+sänkning av signerad aritmetik. Anroparen bestämmer evalueringsordning,
+register och vilka kontroller som har bevisats överflödiga. Kontrollerad
+addition och subtraktion tar en rad var i funktionsindatan till MIR. Där
+blir den explicita overflowkanten synlig för verifieraren. För `i32` testas
+overflow vid 32 bitar innan resultatet teckenutvidgas. Den fulla produkten
+av två `i32` ryms i `i64`, så multiplikationen behöver bara kontrollera att
+resultatet ryms i `i32`. För bitoperationer med ett känt argument
 kan emittern använda ett direkt skift eller en mask och behålla mottagaren
 i registret. [Heltalsemitter](../selfhost/backend/integer_emit.ddr)
 
