@@ -903,7 +903,7 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 [Körbara kontrakt](../tools/test_runtime_contracts.ddr) · [Funktionscache](incremental.md).
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
-[benchmarkarkivet](../benchmarks/README.md).
+[benchmarkarkivet](../benchmarks/results.md).
 Helfunktionskedjans [första byggmätning](../benchmarks/archive/2026-11-11-whole-function-mir/README.md)
 redovisar dess kostnad med identiska bilder och separat `check`.
 Konstantdivision och framefria funktioner förbättrar numerikkärnan;

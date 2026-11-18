@@ -1,0 +1,540 @@
+capability filesystem, process
+
+import .benchmark_commands as bench
+import .benchmark_time as time
+import .compiler_matrix_runner as order
+import .harness as harness
+import .native_probe as native
+import .performance_corpus as corpus
+import .performance_tabell as tabell
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+struct Driver { name: string, program: string, sha256: string, flags: []string }
+
+struct Options {
+    root: string,
+    report: string,
+    suite: string,
+    rounds: i32,
+    scale: i32,
+    checks: bool,
+    tabell: string,
+    c: string,
+    drivers: []Driver,
+}
+
+struct Workload {
+    name: string,
+    source: string,
+    arguments: []string,
+    expected: string,
+}
+
+struct OutputImage {
+    name: string,
+    variant: string,
+    path: string,
+    sha256: string,
+    size: i64,
+}
+
+struct Sample {
+    suite: string,
+    name: string,
+    variant: string,
+    round: i32,
+    position: i32,
+    nanoseconds: i64,
+    size: i64,
+}
+
+struct Summary {
+    suite: string,
+    name: string,
+    variant: string,
+    samples: i32,
+    median: string,
+    p95: string,
+    ratio: string,
+    lines_per_second: string,
+    size: i64,
+}
+
+struct Host {
+    parts: []string,
+    hardware: string,
+    has_hardware: bool,
+    revision: string,
+    status: string,
+    c_version: string,
+    c_sha256: string,
+}
+
+struct Run {
+    runtime: []Workload,
+    images: []OutputImage,
+    rows: []Sample,
+    generated: corpus.Corpus,
+    tabell_input: string,
+}
+
+fn metadata_command(commands: &mut bench.Commands, argv: []string, output: &mut string) -> bool {
+    mut result := harness.empty_output()
+    mut ignored: i64 = 0
+    if !commands.run(argv, true, false, &mut result, &mut ignored) { return false }
+    output = result.stdout_text()
+    true
+}
+
+fn host(options: &Options, result: &mut Host) -> bool {
+    mut commands := bench.commands(options.root, 120000)
+    git := native.find_executable("git")
+    if git.len == 0 { return commands.fail("git is needed for benchmark provenance") }
+    mut revision := ""
+    if !metadata_command(&mut commands, [git.clone(), "rev-parse", "HEAD"], &mut revision) { return false }
+    result.revision = text.trim(revision)
+    mut status := ""
+    if !metadata_command(&mut commands, [git.clone(), "status", "--short"], &mut status) { return false }
+    result.status = move status
+    for flag in ["-s", "-n", "-r", "-v", "-m", "-p"] {
+        mut output := ""
+        if !metadata_command(&mut commands, ["/usr/bin/uname", flag.clone()], &mut output) { return false }
+        part := text.trim(output)
+        result.parts.push(if flag == "-p" && part == "unknown" { "" } else { part.clone() })
+    }
+    if target_is("macos") {
+        mut hardware := ""
+        if !metadata_command(&mut commands, ["/usr/sbin/sysctl", "machdep.cpu.brand_string", "hw.memsize"], &mut hardware) { return false }
+        result.hardware = move hardware
+        result.has_hardware = true
+    }
+    if target_is("linux") {
+        if sys.metadata("/proc/cpuinfo").is_file {
+            file := sys.read_text("/proc/cpuinfo")
+            if !file.ok { return commands.fail("cannot read /proc/cpuinfo") }
+            mut hardware := ""
+            for line in text.split(file.value, "\n") {
+                if text.starts_with(line, "model name") || text.starts_with(line, "Hardware") || text.starts_with(line, "MemTotal") {
+                    if hardware.len > 0 { hardware += "\n" }
+                    hardware += line
+                    if hardware.len >= 4096 { hardware = hardware[0..4096]; break }
+                }
+            }
+            result.hardware = move hardware
+            result.has_hardware = true
+        }
+    }
+    if options.c.len > 0 {
+        mut version := ""
+        if !metadata_command(&mut commands, [options.c.clone(), "--version"], &mut version) { return false }
+        result.c_version = move version
+        result.c_sha256 = harness.sha256_file_hex(options.c)
+        if result.c_sha256.len == 0 { return commands.fail("cannot hash C compiler") }
+    }
+    true
+}
+
+fn c_flags() -> []string { ["-std=c11", "-O3", "-ftrapv"] }
+
+fn command(driver: &Driver, operation: string, source: string, destination: string) -> []string {
+    mut argv: []string = [driver.program.clone(), operation.clone(), source.clone()]
+    if destination.len > 0 { argv.push("-o"); argv.push(destination.clone()) }
+    for flag in driver.flags { argv.push(flag.clone()) }
+    argv
+}
+
+fn identify(name: string, variant: string, path: string) -> OutputImage {
+    OutputImage { name: name.clone(), variant: variant.clone(), path: path.clone(), sha256: harness.sha256_file_hex(path), size: sys.metadata(path).size }
+}
+
+fn checked(commands: &mut bench.Commands, image: string, args: &[]string, expected: string, measured: bool, elapsed: &mut i64) -> bool {
+    mut argv: []string = [image.clone()]
+    for arg in args { argv.push(arg.clone()) }
+    wanted := bench.raw(expected)
+    commands.checked(argv, &wanted, measured, &mut elapsed)
+}
+
+fn runtime(options: &Options, work: string, commands: &mut bench.Commands, run: &mut Run) -> bool {
+    for kernel in move corpus.runtime_cases(options.scale) {
+        source := options.root + "/benchmarks/runtime/" + kernel.name + ".ddr"
+        run.runtime.push(Workload { name: kernel.name, source: source, arguments: kernel.arguments, expected: kernel.expected })
+    }
+    if options.tabell.len > 0 {
+        fixture := tabell.generate(work)
+        if fixture.csv.len == 0 { return commands.fail("cannot generate Tabell input") }
+        run.tabell_input = harness.sha256_file_hex(fixture.csv)
+        run.runtime.push(Workload { name: "tabell", source: options.tabell + "/main.ddr",
+            arguments: [fixture.csv, "team", "cents"], expected: fixture.expected })
+    }
+    mut result := harness.empty_output()
+    mut duration: i64 = 0
+    for at in 0..run.runtime.len {
+        case := run.runtime[at].clone()
+        mut binaries: []OutputImage = []
+        for i in 0..options.drivers.len {
+            driver := &options.drivers[i]
+            destination := work + "/" + case.name + "-" + driver.name
+            if !commands.run(command(&driver, "build", case.source, destination), false, false, &mut result, &mut duration) { return false }
+            binaries.push(identify(case.name, driver.name, destination))
+        }
+        if options.c.len > 0 && case.name != "tabell" {
+            destination := work + "/" + case.name + "-c"
+            mut argv: []string = [options.c.clone()]
+            for flag in move c_flags() { argv.push(move flag) }
+            argv.push("-DCASE_" + case.name)
+            argv.push(options.root + "/benchmarks/runtime/reference.c")
+            argv.push("-o")
+            argv.push(destination.clone())
+            if !commands.run(argv, true, false, &mut result, &mut duration) { return false }
+            binaries.push(identify(case.name, "c", destination))
+        }
+        for binary in binaries {
+            if binary.sha256.len == 0 { return commands.fail(f"cannot fingerprint {binary.path}") }
+            run.images.push(binary.clone())
+            if !checked(&mut commands, binary.path, &case.arguments, case.expected, false, &mut duration) { return false }
+        }
+        for round in 0..options.rounds {
+            sequence := order.order(binaries.len, round)
+            for position in 0..sequence.len {
+                binary := &binaries[sequence[position]]
+                if !checked(&mut commands, binary.path, &case.arguments, case.expected, true, &mut duration) { return false }
+                run.rows.push(Sample { suite: "runtime", name: case.name.clone(), variant: binary.variant.clone(),
+                    round: round, position: position, nanoseconds: duration, size: binary.size })
+            }
+        }
+        print("completed runtime/" + case.name)
+    }
+    true
+}
+
+fn same_output(run: &mut Run, image: &OutputImage) -> bool {
+    for old in run.images {
+        if old.name == image.name && old.variant == image.variant {
+            return old.sha256 == image.sha256 && old.size == image.size
+        }
+    }
+    run.images.push(image.clone())
+    true
+}
+
+fn compiler_suite(options: &Options, work: string, commands: &mut bench.Commands, run: &mut Run) -> bool {
+    generated := corpus.generate(work)
+    if generated.error.len > 0 { return commands.fail(generated.error) }
+    generated_path := generated.path.clone()
+    run.generated = move generated
+    entry := if target_is("macos") { "main" } else if target_is("arm64") { "linux" } else { "x86_linux" }
+    cases: [](string, string) = [("generated", generated_path), ("selfhost", options.root + "/selfhost/" + entry + ".ddr")]
+    mut result := harness.empty_output()
+    mut elapsed: i64 = 0
+    mut ignored: i64 = 0
+    no_args: []string = []
+    for case in cases {
+        name := case.0.clone()
+        source := case.1.clone()
+        for round in 0..options.rounds {
+            sequence := order.order(2, round)
+            for position in 0..sequence.len {
+                driver := &options.drivers[sequence[position]]
+                image := work + "/" + name + "-" + driver.name + "-" + round.str()
+                if !commands.run(command(&driver, "build", source, image), false, true, &mut result, &mut elapsed) { return false }
+                if name == "generated" {
+                    if !checked(&mut commands, image, &no_args, "595500\n", false, &mut ignored) { return false }
+                } else {
+                    hello := work + "/hello"
+                    if !commands.run([image.clone(), "build", options.root + "/examples/hello.ddr", "-o", hello.clone()],
+                                     false, false, &mut result, &mut ignored) ||
+                       !checked(&mut commands, hello, &no_args, "42\ntrue\n", false, &mut ignored) { return false }
+                }
+                fingerprint := identify(name, driver.name, image)
+                if fingerprint.sha256.len == 0 || !same_output(&mut run, &fingerprint) {
+                    return commands.fail(f"non-reproducible {name} output from {driver.name}")
+                }
+                run.rows.push(Sample { suite: "compiler", name: name.clone(), variant: driver.name.clone(),
+                    round: round, position: position, nanoseconds: elapsed, size: fingerprint.size })
+                if !sys.remove_file(image).ok { return commands.fail(f"cannot remove {image}") }
+            }
+        }
+        print("completed compiler/" + name)
+        if options.checks {
+            for round in 0..options.rounds {
+                sequence := order.order(2, round)
+                for position in 0..sequence.len {
+                    driver := &options.drivers[sequence[position]]
+                    if !commands.run(command(&driver, "check", source, ""), false, true, &mut result, &mut elapsed) { return false }
+                    output := result.stdout_text()
+                    if !text.starts_with(output, f"checked {source} (") || !text.ends_with(output, " modules)\n") {
+                        return commands.fail(f"invalid check result from {driver.name}: {output}")
+                    }
+                    run.rows.push(Sample { suite: "check", name: name.clone(), variant: driver.name.clone(),
+                        round: round, position: position, nanoseconds: elapsed, size: 0 })
+                }
+            }
+            print("completed check/" + name)
+        }
+    }
+    true
+}
+
+fn summarize(run: &Run) -> []Summary {
+    mut result: []Summary = []
+    mut start := 0
+    while start < run.rows.len {
+        suite := run.rows[start].suite.clone()
+        name := run.rows[start].name.clone()
+        mut end := start + 1
+        while end < run.rows.len && run.rows[end].suite == suite && run.rows[end].name == name { end += 1 }
+        mut baseline: []i64 = []
+        for i in start..end {
+            if run.rows[i].variant == "baseline" { baseline.push(run.rows[i].nanoseconds) }
+        }
+        reference := time.distribution(move baseline)
+        for variant in ["baseline", "candidate", "c"] {
+            mut elapsed: []i64 = []
+            mut size: i64 = 0
+            for i in start..end {
+                if run.rows[i].variant == variant {
+                    if elapsed.len == 0 { size = run.rows[i].size }
+                    elapsed.push(run.rows[i].nanoseconds)
+                }
+            }
+            n := elapsed.len
+            if n == 0 { continue }
+            stats := time.distribution(move elapsed)
+            speed := if suite == "compiler" && name == "generated" {
+                bench.fixed(f64(run.generated.lines) * 1000.0 / stats.p95, 0)
+            } else { "" }
+            result.push(Summary {
+                suite: suite.clone(), name: name.clone(), variant: variant.clone(), samples: n,
+                median: bench.fixed(stats.median, 6), p95: bench.fixed(stats.p95, 6),
+                ratio: bench.fixed(stats.median / reference.median, 6), lines_per_second: speed, size: size,
+            })
+        }
+        start = end
+    }
+    result
+}
+
+fn write_csv(options: &Options, run: &Run, summaries: &[]Summary) -> bool {
+    if run.rows.len == 0 { return true }
+    mut samples := bench.raw("suite,case,variant,round,order,elapsed_ms,image_bytes\r\n")
+    for row in run.rows {
+        elapsed := time.fixed_ms(row.nanoseconds)
+        bytes.append_utf8(&mut samples, f"{row.suite},{row.name},{row.variant},{row.round},{row.position},{elapsed},{row.size}\r\n")
+    }
+    mut summary := bench.raw("suite,case,variant,samples,median_ms,p95_ms,median_over_baseline,p95_lines_per_second,image_bytes\r\n")
+    for row in summaries {
+        bytes.append_utf8(&mut summary, f"{row.suite},{row.name},{row.variant},{row.samples},{row.median},{row.p95},{row.ratio},{row.lines_per_second},{row.size}\r\n")
+    }
+    (sys.write_u8(options.report + "/samples.csv", &samples).ok &&
+     sys.write_u8(options.report + "/summary.csv", &summary).ok) || harness.fail("cannot write sample tables")
+}
+
+fn strings(writer: &mut json.Writer, values: &[]string) {
+    writer.array()
+    for value in values { writer.string(value) }
+    writer.end()
+}
+
+fn project_metadata(writer: &mut json.Writer, folder: string, input: string) -> bool {
+    writer.object()
+    writer.key("records"); writer.integer(32768)
+    writer.key("input_sha256"); writer.string(input)
+    writer.key("sources"); writer.object()
+    paths := fs.list_dir(folder)
+    if !paths.ok { return harness.fail(f"cannot list {folder}") }
+    for name in paths.entries {
+        if !text.ends_with(name, ".ddr") { continue }
+        hash := harness.sha256_file_hex(folder + "/" + name)
+        if hash.len == 0 { return harness.fail(f"cannot hash {name}") }
+        writer.key(name); writer.string(hash)
+    }
+    writer.end()
+    writer.end()
+    true
+}
+
+fn image_metadata(writer: &mut json.Writer, run: &Run) {
+    writer.object()
+    mut i := 0
+    while i < run.images.len {
+        name := run.images[i].name.clone()
+        writer.key(name)
+        writer.object()
+        while i < run.images.len && run.images[i].name == name {
+            writer.key(run.images[i].variant)
+            writer.object()
+            writer.key("sha256"); writer.string(run.images[i].sha256)
+            writer.key("bytes"); writer.integer(run.images[i].size)
+            writer.end()
+            i += 1
+        }
+        writer.end()
+    }
+    writer.end()
+}
+
+fn metadata(options: &Options, run: &Run, host: &Host, sources: &[]corpus.SourceHash) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("host")
+    writer.object()
+    keys := ["system", "node", "release", "version", "machine", "processor"]
+    for i in 0..keys.len { writer.key(keys[i]); writer.string(host.parts[i]) }
+    writer.end()
+    if host.has_hardware { writer.key("hardware"); writer.string(host.hardware) }
+    writer.key("rounds"); writer.integer(i64(options.rounds))
+    writer.key("suite"); writer.string(options.suite)
+    writer.key("include_check"); writer.boolean(options.checks)
+    writer.key("checkout"); writer.string(host.revision)
+    writer.key("working_tree"); writer.string(host.status)
+    writer.key("tool_sha256"); writer.string(harness.sha256_file_hex(options.root + "/tools/performance.ddr"))
+    writer.key("sources_sha256"); corpus.write_sources(&sources, &mut writer)
+    writer.key("compiler_sha256"); writer.object()
+    for driver in options.drivers { writer.key(driver.name); writer.string(driver.sha256) }
+    writer.end()
+    writer.key("compiler_paths"); writer.object()
+    for driver in options.drivers { writer.key(driver.name); writer.string(driver.program) }
+    writer.end()
+    writer.key("compiler_flags"); writer.object()
+    for driver in options.drivers { writer.key(driver.name); strings(&mut writer, &driver.flags) }
+    writer.end()
+    writer.key("clock"); writer.string("monotonic wall clock around the fresh process, including process startup")
+    writer.key("cache"); writer.string("incremental disabled; warm OS filesystem cache")
+    writer.key("order"); writer.string("two variants alternate each round; three rotate all six permutations")
+    writer.key("warmup"); writer.string("one unrecorded execution per runtime binary; no compile warmup")
+    writer.key("environment"); writer.object()
+    writer.key("PATH"); writer.string("/no-external-tools")
+    writer.end()
+    writer.key("profile"); writer.string("default safety checks enabled")
+    writer.key("target"); writer.string(process.host_target())
+    if options.c.len > 0 {
+        writer.key("c_reference"); writer.object()
+        writer.key("compiler"); writer.string(options.c)
+        writer.key("sha256"); writer.string(host.c_sha256)
+        writer.key("flags")
+        flags := c_flags()
+        strings(&mut writer, &flags)
+        writer.key("version"); writer.string(host.c_version)
+        writer.key("caveat"); writer.string("C has no Dunder array bounds checks; no broad parity claim")
+        writer.end()
+    }
+    if options.tabell.len > 0 {
+        writer.key("tabell")
+        if !project_metadata(&mut writer, options.tabell, run.tabell_input) { return false }
+    }
+    if run.generated.sha256.len > 0 {
+        writer.key("generated_corpus"); run.generated.write(&mut writer)
+    }
+    writer.key("runtime_cases")
+    writer.object()
+    for case in run.runtime {
+        writer.key(case.name)
+        writer.object()
+        writer.key("args"); strings(&mut writer, &case.arguments)
+        writer.key("expected"); writer.string(case.expected)
+        writer.end()
+    }
+    writer.end()
+    writer.key("binaries"); image_metadata(&mut writer, &run)
+    writer.end()
+    document := writer.finish()
+    (document.ok && sys.write_text(options.report + "/metadata.json", document.value + "\n").ok) ||
+        harness.fail("cannot write metadata.json")
+}
+
+fn exercise(options: &Options, before: &corpus.Snapshot) -> i32 {
+    mut host_info := Host { parts: [], hardware: "", has_hardware: false, revision: "", status: "", c_version: "", c_sha256: "" }
+    if !host(&options, &mut host_info) { return 1 }
+    temp := fs.temp_dir("dunder-performance-")
+    if !temp.ok { _ := harness.fail("cannot create benchmark work directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    work := temp.value.clone()
+    mut commands := bench.commands(options.root, 120000)
+    mut run := Run {
+        runtime: [], images: [], rows: [], tabell_input: "",
+        generated: corpus.Corpus { path: "", lines: 0, source_bytes: 0, modules: 0, functions: 0, tokens: 0, sha256: "", error: "" },
+    }
+    if options.suite != "compiler" && !runtime(&options, work, &mut commands, &mut run) { return 1 }
+    if options.suite != "runtime" && !compiler_suite(&options, work, &mut commands, &mut run) { return 1 }
+    after := corpus.snapshot(options.root)
+    if after.error.len > 0 || !corpus.same_sources(&before.files, &after.files) {
+        _ := harness.fail("benchmark source files changed during measurement")
+        return 1
+    }
+    for driver in options.drivers {
+        if harness.sha256_file_hex(driver.program) != driver.sha256 {
+            _ := harness.fail("compiler binary changed during measurement")
+            return 1
+        }
+    }
+    summaries := summarize(&run)
+    if !write_csv(&options, &run, &summaries) || !metadata(&options, &run, &host_info, &before.files) { return 1 }
+    for row in summaries {
+        print(f"{row.suite}/{row.name} {row.variant}: median={row.median}ms p95={row.p95}ms ratio={row.ratio}")
+    }
+    0
+}
+
+fn argument_error(message: string) -> i32 {
+    _ := harness.fail(message)
+    2
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--rounds"), cli.option("--suite"), cli.option("--runtime-scale"),
+        cli.option("--tabell"), cli.flag("--include-check"), cli.option("--c-compiler"),
+        cli.option("--baseline-flag"), cli.option("--candidate-flag")]
+    args := cli.parse(&spec)
+    usage := "usage: performance BASELINE CANDIDATE REPORT [--rounds N] [--suite all|runtime|compiler] [--runtime-scale N] " +
+        "[--tabell PROJECT] [--include-check] [--c-compiler PATH] [--baseline-flag FLAG] [--candidate-flag FLAG]"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 { return argument_error(args.error) }
+    if args.positionals.len != 3 { return argument_error(usage) }
+    rounds := parse.integer(args.last("--rounds", "30"))
+    scale := parse.integer(args.last("--runtime-scale", "1"))
+    if !rounds.ok || rounds.value < 1 || rounds.value > 2147483647 { return argument_error("--rounds must be positive") }
+    if !scale.ok || scale.value < 1 || scale.value > 2147483647 { return argument_error("--runtime-scale must be positive") }
+    suite := args.last("--suite", "all")
+    if suite != "all" && suite != "runtime" && suite != "compiler" { return argument_error(usage) }
+    if suite == "compiler" && args.has("--tabell") { return argument_error("--tabell requires the runtime or all suite") }
+    if suite == "runtime" && args.has("--include-check") { return argument_error("--include-check requires the compiler or all suite") }
+    mut drivers: []Driver = []
+    for i in 0..2 {
+        name := if i == 0 { "baseline" } else { "candidate" }
+        program := fs.realpath(args.positionals[i])
+        if !program.ok { return argument_error(f"cannot resolve {name} compiler") }
+        digest := harness.sha256_file_hex(program.value)
+        if digest.len == 0 { return argument_error(f"cannot hash {name} compiler") }
+        drivers.push(Driver { name: name.clone(), program: program.value, sha256: digest, flags: args.all("--" + name + "-flag") })
+    }
+    mut project := ""
+    mut c := ""
+    if args.has("--tabell") {
+        path := fs.realpath(args.last("--tabell", ""))
+        if !path.ok { return argument_error("cannot resolve Tabell project") }
+        project = path.value
+    }
+    if args.has("--c-compiler") {
+        path := fs.realpath(args.last("--c-compiler", ""))
+        if !path.ok { return argument_error("cannot resolve C compiler") }
+        c = path.value
+    }
+    report := harness.resolve_or_abs(args.positionals[2])
+    if !fs.mkdir_all(report).ok { return argument_error("cannot create report directory") }
+    entries := fs.list_dir(report)
+    if !entries.ok || entries.entries.len > 0 { return argument_error("report directory must be empty to preserve existing measurements") }
+    root := harness.find_root()
+    if root.len == 0 { return argument_error("cannot locate Dunder repository") }
+    before := corpus.snapshot(root)
+    if before.error.len > 0 { return argument_error(before.error) }
+    options := Options { root: root, report: report, suite: suite, rounds: i32(rounds.value), scale: i32(scale.value),
+                          checks: args.has("--include-check"), tabell: project, c: c, drivers: drivers }
+    exercise(&options, &before)
+}

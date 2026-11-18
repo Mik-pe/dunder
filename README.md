@@ -68,4 +68,4 @@ Tabell, HTTP-servern och grafikexemplen för Metal, Vulkan och WebGPU finns i
 kompilatorn, målprogrammen och diagnostiken. Sviten använder Python 3.11 eller
 senare, Node för Wasm, en C-kompilator för ABI-proven samt Git, curl, gzip och OpenSSL.
 
-[Guide till kompilatorkoden](selfhost/README.md) · [Bootstrap från frö](bootstrap/README.md) · [Inkrementell kompilering](docs/incremental.md) · [Prestandamätningar](benchmarks/README.md) · [Aktuellt arbete](docs/next-steps.md)
+[Guide till kompilatorkoden](selfhost/README.md) · [Bootstrap från frö](bootstrap/README.md) · [Inkrementell kompilering](docs/incremental.md) · [Aktuellt arbete](docs/next-steps.md)

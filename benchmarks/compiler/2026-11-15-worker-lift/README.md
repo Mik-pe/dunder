@@ -41,7 +41,7 @@ Mätningen summerar innehållet i batchernas maskinords-, metadata- och
 beskrivningskolumner före sändning. Uppgiftshuvuden och svar ingår inte.
 [Baslinjens transportmätning](../2026-11-15-build-latency/throughput.md)
 
-## Reproducera mätningen
+## Mätupplägg
 
 Mätverktyget startar en ny process för varje bygge och växlar mellan de två
 kompilatorerna. Medianerna bygger på tolv mätpar efter ett uppvärmningsbygge
@@ -49,24 +49,5 @@ per variant. Fyra workers, varm filsystemcache och avstängd inkrementell
 byggcache används i båda fallen. Alla uppmätta bilder jämförs med samma
 kompilators uppvärmningsbild. [Rådata och kontrollsummor](samples.json)
 
-Arkivera eller checka ut basrevisionen och bygg båda kompilatorerna med
-`tools/bootstrap.sh`. Ange basrevisionens källor även för den nya kompilatorn.
-För den här serien kommer Tabell från `978af73` i `dunder-hundmat`.
-
-```sh
-dunder run benchmarks/compiler/2026-11-15-worker-lift/measure.ddr -- \
-  /path/to/baseline/dunder /path/to/candidate/dunder \
-  /path/to/source-at-6dffea8 /path/to/dunder-hundmat/tabell /tmp/dunder-report.json
-```
-
-Flaggan `--frontend-stress` lägger till två korpusar för framtida jämförelser.
-Det första är en funktion med 4 096 beroende heltalsuppdateringar. Det andra
-har 256 grupper av anrop som skapar records med strängar och arrayer, muterar
-en lånad array och matchar en enum med två typer av nyttolast. Verktyget
-räknar ut förväntad standardutdata för båda och kontrollerar även att en och
-fyra workers producerar byteidentiska bilder för varje kompilator i alla sju
-byggfallen. Dessa kontroller ligger utanför mätintervallen.
-
-På macOS samlar `--rss-rounds N` dessutom N provpar för maximalt resident
-minne i byte. Dessa byggen körs separat under `/usr/bin/time -l` och deras
-bilder jämförs med uppvärmningsbyggets SHA-256.
+Serien använde kompilatorkällor från `6dffea8` och Tabell från `978af73`.
+[Körreceptet i Git](https://github.com/Mik-pe/dunder/blob/a771000d9dc813884a1ab3b1b6ca390ed5c0d7ac/benchmarks/compiler/2026-11-15-worker-lift/README.md#reproducera-mätningen)

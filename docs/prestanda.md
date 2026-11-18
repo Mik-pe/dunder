@@ -108,7 +108,7 @@ resultatreferenser och 30 växelvisa körningar. Den är ett avgränsat
 före/efter-prov. Fyra arbetsfall har också jämförts med clang `-O3` och
 `-O3 -ftrapv` på ARM64/macOS. Acceptansgränserna nedan återstår.
 
-Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Siffrorna nedan är acceptansgränser. [Byggmätningar och råvärden](../benchmarks/README.md) skiljer genererat stresskorpus, självbygge och verkliga konsumenter åt; hela kontraktet är ännu inte uppfyllt.
+Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Siffrorna nedan är acceptansgränser. [Byggmätningar och råvärden](../benchmarks/results.md) skiljer genererat stresskorpus, självbygge och verkliga konsumenter åt; hela kontraktet är ännu inte uppfyllt.
 
 ## Från kommando till färdig ARM64-binär
 

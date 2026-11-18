@@ -1,7 +1,7 @@
 # Runtime före och efter optimering
 
 För den aktuella självhostade kompilatorn används nu
-[`tools/performance.py`](../../tools/performance.py).
+[`tools/performance.ddr`](../../tools/performance.ddr).
 [Aktuella resultat och reproduktion](../archive/2026-11-10-selfhost-performance/README.md)
 omfattar samma fyra arbetsfall, en kontrollerad C-referens och kompletta
 byggen. Rapporterna nedan bevarar tidigare kompilatorrevisioners resultat.

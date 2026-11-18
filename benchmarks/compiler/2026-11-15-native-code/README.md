@@ -41,11 +41,10 @@ Kör på ARM64/macOS från den nya källkatalogen. `OLD_SRC` är en separat utch
 
 ```sh
 (cd "$OLD_SRC" && "$NEW" build selfhost/main_parallel.ddr -o "$CONTROL")
-python3 tools/performance.py "$OLD" "$NEW" runtime-results --suite runtime --runtime-scale 10 --rounds 30
-measure=benchmarks/compiler/2026-11-15-worker-lift/measure.ddr
-dunder run "$measure" -- "$OLD" "$CONTROL" "$OLD_SRC" "$TABELL" control-results.json --rounds 12
-dunder run "$measure" -- "$OLD" "$NEW" "$OLD_SRC" "$TABELL" build-results.json --rounds 12
+dunder run tools/performance.ddr -- "$OLD" "$NEW" runtime-results --suite runtime --runtime-scale 10 --rounds 30
 ./tools/verify-selfhost.sh --jobs 4
 ```
+
+Byggseriens gamla körrecept finns i Git. [Byggkommandon](https://github.com/Mik-pe/dunder/blob/a771000d9dc813884a1ab3b1b6ca390ed5c0d7ac/benchmarks/compiler/2026-11-15-native-code/README.md#reproducera)
 
 Den frysta bootstrapkompilatorn byggde verktygskedjan till en byteidentisk fixpunkt. En och fyra workers producerade samma kompilator. Alla 80 verifieringssviter passerade.

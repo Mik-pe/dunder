@@ -61,8 +61,8 @@ De tre kontrollserierna går att upprepa med samma byggkommando som huvudserien 
 Bygg kompilatorerna från de två revisionerna med `tools/bootstrap.sh`. `OLD_SRC` är en ren utcheckning av `4585bc4fc`, `OLD` och `NEW` deras absoluta binärsökvägar och `TABELL` sökvägen till Tabells projektkatalog.
 
 ```sh
-dunder run benchmarks/compiler/2026-11-15-worker-lift/measure.ddr -- \
-  "$OLD" "$NEW" "$OLD_SRC" "$TABELL" builds.json --rounds 12 --frontend-stress --rss-rounds 4
-python3 tools/performance.py "$OLD" "$NEW" runtime-out \
+dunder run tools/performance.ddr -- "$OLD" "$NEW" runtime-out \
   --suite runtime --rounds 30 --runtime-scale 10 --tabell "$TABELL"
 ```
+
+Byggseriens gamla körrecept finns i Git. [Byggkommandon](https://github.com/Mik-pe/dunder/blob/a771000d9dc813884a1ab3b1b6ca390ed5c0d7ac/benchmarks/compiler/2026-11-15-shared-frontend/README.md#reproducera)

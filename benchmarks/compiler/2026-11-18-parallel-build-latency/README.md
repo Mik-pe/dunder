@@ -29,4 +29,4 @@ kontrollerad standardutdata. ELF-bildernas format och arkitektur kontrollerades.
 
 Det genererade programmet bygger på `corpus()` i `tools/performance.py`
 och `make_unique(..., True)` i det tidigare mätverktyget för funktionslokalt MIR.
-[Generator för blandade uttryck](../2026-11-15-worker-lift/corpus.ddr)
+[Generator för blandade uttryck i Git](https://github.com/Mik-pe/dunder/blob/a771000d9dc813884a1ab3b1b6ca390ed5c0d7ac/benchmarks/compiler/2026-11-15-worker-lift/corpus.ddr)
