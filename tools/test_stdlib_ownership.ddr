@@ -1,0 +1,140 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn invalid_cases() -> [](string, string, string) {
+    [
+        ("map-key", "mut m:=map.new();key:=\"key\"+42.str();map.put(&mut m,move key,1);print(key)", "use of moved value"),
+        ("set-key", "mut s:=set.new();key:=\"key\"+42.str();_:=set.insert(&mut s,move key);print(key)", "use of moved value"),
+        ("command-args", "mut c:=process.command(\"echo\",[]);args:[]string=[\"hello\"];process.add_args(&mut c,move args);print(args.len)", "use of moved value"),
+        ("command-stdin", "mut c:=process.command(\"cat\",[]);data:[]u8=[1,2];process.set_stdin(&mut c,move data);print(data.len)", "use of moved value"),
+        ("json-input", "data:[]u8=[b'{',b'}'];doc:=json.Doc::parse_bytes(move data);print(data.len)", "use of moved value"),
+        ("stream-set-copy", "s:=net.stream_set();other:=s;print(net.set_len(&s))", "use of moved value"),
+        ("pool-insert", "fn bad(move s:net.TcpStream){mut pool:=net.stream_set();slot:=net.set_insert(&mut pool,move s);print(net.stream_fd(&s))} fn main(){}", "use of moved value"),
+        ("stream-set-clone", "s:=net.stream_set();other:=s.clone()", "resource"),
+        ("listener-clone", "fn bad(l:net.TcpListener){other:=l.clone()} fn main(){}", "resource"),
+        ("stream-clone", "fn bad(s:net.TcpStream){other:=s.clone()} fn main(){}", "resource"),
+        ("child-clone", "fn bad(c:process.Child){other:=c.clone()} fn main(){}", "resource"),
+        ("child-set-clone", "fn bad(c:process.ChildSet){other:=c.clone()} fn main(){}", "resource"),
+        ("result-clone", "fn bad(r:process.SpawnResult){other:=r.clone()} fn main(){}", "resource"),
+    ]
+}
+
+fn copy_tree(source: string, destination: string) -> bool {
+    if !fs.mkdir_all(destination).ok { return harness.fail(f"cannot create {destination}") }
+    listing := fs.list_dir(source)
+    if !listing.ok { return harness.fail(f"cannot list {source}") }
+    for name in listing.entries {
+        child := source + "/" + name
+        output := destination + "/" + name
+        if sys.metadata(child).is_dir {
+            if !copy_tree(child, output) { return false }
+        } else {
+            data := sys.read_u8(child)
+            if !data.ok || !sys.write_u8(output, &data.value).ok { return harness.fail(f"cannot copy {child} to {output}") }
+        }
+    }
+    true
+}
+
+fn check_counts(result: &process.Output, expected: i32) -> bool {
+    report := result.stderr_text()
+    doc := json.Doc::parse_text(report)
+    counters := doc.field(doc.root, "counters")
+    arrays := doc.get_i64(counters, "array_clone_calls")
+    records := doc.get_i64(counters, "record_clone_calls")
+    (doc.ok && arrays.ok && arrays.value == i64(expected) && records.ok && records.value == 0) ||
+        harness.fail(f"unexpected stdlib ownership counters: {report}")
+}
+
+fn check_valid(compiler: string, root: string, work: string, flags: &[]string, live: bool, images: &mut i32) -> bool {
+    fixtures: [](string, string, i32) = [
+        ("stdlib_ownership.ddr", "stdlib ownership ok\n", 0),
+        ("stdlib_snapshots.ddr", "stdlib snapshots ok\n", 1),
+        ("stdlib_sort_moves.ddr", "stdlib sort moves ok\n", 0),
+    ]
+    mut result := harness.empty_output()
+    for i in 0..fixtures.len {
+        source := root + "/tests/fixtures/" + fixtures[i].0
+        image := f"{work}/image-{images}"
+        mut args: []string = ["build", source, "--runtime-profile", "-o", image.clone()]
+        for flag in flags { args.push(flag.clone()) }
+        if !harness.run_checked(compiler, args, root, 0, false, &mut result) { return false }
+        if live &&
+           (!harness.run_checked(image, [], work, 0, false, &mut result) ||
+            !harness.stdout_is(&result, fixtures[i].1, fixtures[i].0) || !check_counts(&result, fixtures[i].2)) {
+            return false
+        }
+        images += 1
+    }
+    true
+}
+
+fn check_invalid(compiler: string, work: string, flags: &[]string, rejections: &mut i32) -> bool {
+    imports := "import .stdlib.map as map\nimport .stdlib.set as set\nimport .stdlib.process as process\n" +
+               "import .stdlib.json as json\nimport .stdlib.net as net\n"
+    cases := invalid_cases()
+    mut result := harness.empty_output()
+    for i in 0..cases.len {
+        path := f"{work}/{cases[i].0}.ddr"
+        body := if text.starts_with(cases[i].1, "fn ") { cases[i].1.clone() } else { "fn main(){" + cases[i].1 + "}" }
+        if !sys.write_text(path, imports + body + "\n").ok { return harness.fail(f"cannot write {path}") }
+        image := f"{work}/invalid-{rejections}"
+        mut check: []string = ["check", path.clone(), "--agent"]
+        mut build: []string = ["build", path.clone(), "-o", image.clone()]
+        for flag in flags { check.push(flag.clone()); build.push(flag.clone()) }
+        if !harness.run_checked(compiler, check, work, 1, false, &mut result) { return false }
+        report := result.stdout_text()
+        doc := json.Doc::parse_text(report)
+        message := doc.get_str(doc.root, "message")
+        if !doc.ok || !message.ok || text.find(message.value, cases[i].2) < 0 || doc.get_str(doc.root, "path").value != path {
+            return harness.fail(f"{path}: unexpected diagnostic: {report}")
+        }
+        if !sys.write_text(image, "previous image").ok || !harness.run_checked(compiler, build, work, 1, false, &mut result) {
+            return false
+        }
+        previous := sys.read_text(image)
+        if !previous.ok || previous.value != "previous image" || text.find(result.stderr_text(), message.value) < 0 {
+            return harness.fail(f"{path}: failed build altered output or diagnostic:\n{result.stderr_text()}")
+        }
+        rejections += 1
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_stdlib_ownership <compiler>")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    tmp := fs.temp_dir("dunder-stdlib-ownership-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if !copy_tree(root + "/stdlib", work + "/stdlib") { return 1 }
+    mut images := 0
+    mut rejections := 0
+    host := process.host_target()
+    for target in harness.targets() {
+        for optimized in [true, false] {
+            mut flags: []string = ["--target", target.clone(), "--jobs", "1"]
+            if !optimized {
+                for flag in move native.direct_flags() { flags.push(move flag) }
+            }
+            if !check_valid(compiler, root, work, &flags, target == host, &mut images) ||
+               !check_invalid(compiler, work, &flags, &mut rejections) { return 1 }
+        }
+    }
+    print(f"stdlib ownership: {images} images, {rejections} rejected consumed arguments; identity, capacity, explicit snapshots and clone counters passed")
+    0
+}

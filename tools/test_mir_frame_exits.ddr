@@ -1,0 +1,244 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+struct Snapshot {
+    mode: string,
+    stdout: string,
+    digest: string,
+}
+
+struct Observation {
+    case_name: string,
+    view: string,
+    snapshots: []Snapshot,
+    before_mode: string,
+    before_digest: string,
+    before_stdout: string,
+}
+
+struct Image {
+    target: string,
+    policy: string,
+    taken: i32,
+    sync: string,
+    digest: string,
+}
+
+struct Report {
+    journal: evidence.Journal,
+    observations: []Observation,
+    images: []Image,
+}
+
+fn patched_observations(compiler: string, work: string, case_name: string, report: &mut Report) -> bool {
+    emitter := f"{work}/{case_name}-emitter"
+    mut result := harness.empty_output()
+    if !report.journal.run(compiler, ["build", f"tests/fixtures/mir-frame-exit-{case_name}.ddr", "-o", emitter.clone()], &mut result) { return false }
+    views: []string = if case_name == "observer" { [""] } else { ["sp", "gp"] }
+    for view in views {
+        expected := if case_name == "observer" { "333\n13\n" } else if view == "sp" { "16\n" } else { "333\n" }
+        mut snapshots: []Snapshot = []
+        for mode in ["off", "raw", "memory"] {
+            image := f"{work}/{case_name}-{view}-{mode}"
+            if !report.journal.run(emitter, [image.clone(), mode.clone(), view.clone()], &mut result) ||
+               !report.journal.run(image, [], &mut result) || !harness.stdout_is(&result, expected, image) { return false }
+            snapshots.push(Snapshot { mode: mode.clone(), stdout: result.stdout_text(), digest: harness.sha256_file_hex(image) })
+        }
+        report.observations.push(Observation {
+            case_name: case_name.clone(), view: view.clone(), snapshots: snapshots,
+            before_mode: "", before_digest: "", before_stdout: "",
+        })
+    }
+    true
+}
+
+fn before_observations(work: string, before: string, case_name: string, view: string, expected: string, report: &mut Report) -> bool {
+    if before.len == 0 { return true }
+    path := fs.realpath(before)
+    if !path.ok { return harness.fail(f"cannot resolve emitter {before}") }
+    mut result := harness.empty_output()
+    for mode in ["raw", "memory"] {
+        image := f"{work}/before-{case_name}-{view}-{mode}"
+        if !report.journal.run(path.value, [image.clone(), mode.clone(), view.clone()], &mut result) ||
+           !report.journal.run(image, [], &mut result) || !harness.stdout_is(&result, expected, image) { return false }
+        report.observations.push(Observation {
+            case_name: case_name.clone(), view: view.clone(), snapshots: [],
+            before_mode: mode.clone(), before_digest: harness.sha256_file_hex(path.value), before_stdout: result.stdout_text(),
+        })
+    }
+    true
+}
+
+fn terminal_images(emitter: string, work: string, report: &mut Report) -> bool {
+    mut result := harness.empty_output()
+    targets := harness.targets()
+    for target in 0..targets.len {
+        name := targets[target].clone()
+        for taken in 0..2 {
+            for policy in ["raw", "source"] {
+                image := f"{work}/terminal-{name}-{taken}-{policy}"
+                if !report.journal.run(emitter, [image.clone(), target.str(), taken.str(), policy.clone()], &mut result) ||
+                   !harness.stdout_is(&result, "1\n", image) { return false }
+                report.images.push(Image { target: name.clone(), policy: policy.clone(), taken: taken, sync: "",
+                                           digest: harness.sha256_file_hex(image) })
+                if target == 0 && !report.journal.run(image, [], &mut result) { return false }
+            }
+        }
+    }
+    true
+}
+
+fn sync_images(emitter: string, work: string, report: &mut Report) -> bool {
+    mut result := harness.empty_output()
+    targets := harness.targets()
+    for target in 0..targets.len {
+        name := targets[target].clone()
+        for policy in ["raw", "source"] {
+            for mode in ["off", "on"] {
+                image := f"{work}/call-sync-{name}-{policy}-{mode}"
+                expected := if mode == "on" { "1\n" } else { "0\n" }
+                if !report.journal.run(emitter, [image.clone(), target.str(), policy.clone(), mode.clone()], &mut result) ||
+                   !harness.stdout_is(&result, expected, image) { return false }
+                report.images.push(Image { target: name.clone(), policy: policy.clone(), taken: -1, sync: mode.clone(),
+                                           digest: harness.sha256_file_hex(image) })
+                if target == 0 && !report.journal.run(image, [], &mut result) { return false }
+            }
+        }
+    }
+    true
+}
+
+fn run_suite(compiler: string, work: string, before: string, before_call: string, report: &mut Report) -> bool {
+    unit := "tests/mir_frame_exits.ddr"
+    mut result := harness.empty_output()
+    if !report.journal.run(compiler, ["test", unit.clone(), "-o", work + "/units"], &mut result) { return false }
+    for target in harness.targets() {
+        if !report.journal.run(compiler, ["build-tests", unit.clone(), "--target", target.clone(), "-o", work + "/units-" + target],
+                               &mut result) { return false }
+    }
+    if !patched_observations(compiler, work, "observer", &mut report) ||
+       !patched_observations(compiler, work, "call-sp", &mut report) ||
+       !before_observations(work, before, "observer", "", "13\n7\n", &mut report) ||
+       !before_observations(work, before_call, "call-sp", "sp", "32\n", &mut report) ||
+       !before_observations(work, before_call, "call-sp", "gp", "13\n", &mut report) { return false }
+
+    terminal := work + "/terminal-emitter"
+    sync := work + "/call-sync-emitter"
+    report.journal.run(compiler, ["build", "tests/fixtures/mir-frame-exit-terminal.ddr", "-o", terminal.clone()], &mut result) &&
+        terminal_images(terminal, work, &mut report) &&
+        report.journal.run(compiler, ["build", "tests/fixtures/mir-frame-exit-call-sync.ddr", "-o", sync.clone()], &mut result) &&
+        sync_images(sync, work, &mut report)
+}
+
+fn write_observations(writer: &mut json.Writer, observations: &[]Observation) {
+    writer.array()
+    for row in observations {
+        writer.object()
+        writer.key("case")
+        writer.string(row.case_name)
+        writer.key("view")
+        writer.string(row.view)
+        if row.before_mode.len > 0 {
+            writer.key("before_mode")
+            writer.string(row.before_mode)
+            writer.key("emitter_sha256")
+            writer.string(row.before_digest)
+            writer.key("stdout")
+            writer.string(row.before_stdout)
+        } else {
+            writer.key("patched")
+            writer.array()
+            for snapshot in row.snapshots {
+                writer.object()
+                writer.key("mode")
+                writer.string(snapshot.mode)
+                writer.key("stdout")
+                writer.string(snapshot.stdout)
+                writer.key("sha256")
+                writer.string(snapshot.digest)
+                writer.end()
+            }
+            writer.end()
+        }
+        writer.end()
+    }
+    writer.end()
+}
+
+fn save(compiler: string, work: string, root: string, passed: bool, report: &Report) -> bool {
+    mut commands := json.Writer::new()
+    report.journal.write_to(&mut commands, "command")
+    commands_ok := evidence.save(work + "/commands.json", &commands)
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("result")
+    writer.string(if passed { "passed" } else { "failed" })
+    writer.key("compiler_sha256")
+    writer.string(harness.sha256_file_hex(compiler))
+    writer.key("source_sha256")
+    sources: []string = [
+        "selfhost/mir/mir_opt.ddr", "selfhost/mir/mir_terminals.ddr", "selfhost/mir/mir_call_abi.ddr",
+        "tests/mir_frame_exits.ddr", "tests/fixtures/mir-frame-exit-support.ddr", "tests/fixtures/mir-frame-exit-observer.ddr",
+        "tests/fixtures/mir-frame-exit-call-sp.ddr", "tests/fixtures/mir-frame-exit-terminal.ddr", "tests/fixtures/mir-frame-exit-call-sync.ddr",
+    ]
+    evidence.write_source_digests(&mut writer, root, &sources)
+    writer.key("observations")
+    write_observations(&mut writer, &report.observations)
+    writer.key("target_images")
+    writer.array()
+    for image in report.images {
+        writer.object()
+        writer.key("target")
+        writer.string(image.target)
+        if image.taken >= 0 {
+            writer.key("taken")
+            writer.integer(i64(image.taken))
+        } else {
+            writer.key("call_sync")
+            writer.string(image.sync)
+        }
+        writer.key("memory_policy")
+        writer.string(image.policy)
+        writer.key("sha256")
+        writer.string(image.digest)
+        writer.end()
+    }
+    writer.end()
+    writer.key("linux_execution")
+    writer.string("none; cross-built images only")
+    writer.key("scope")
+    writer.string("external-exit and incoming-call-SP correctness; no latency measurements")
+    writer.end()
+    evidence.save(work + "/summary.json", &writer) && commands_ok
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--output"), cli.option("--before-emitter"), cli.option("--before-call-sp-emitter")]
+    args := cli.parse(&spec)
+    usage := "usage: test_mir_frame_exits <compiler> [--output PATH] [--before-emitter PATH] [--before-call-sp-emitter PATH]"
+    compiler := cli.compiler(&args, usage)
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    if process.host_target() != "arm64-macos" {
+        _ := sys.eprint("native observer proof requires ARM64/macOS; Linux is image-only")
+        return 2
+    }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    output := harness.resolve_or_abs(args.last("--output", root + "/build/mir-frame-exits"))
+    work := evidence.create_run(output)
+    if work.len == 0 { return 1 }
+    mut report := Report { journal: evidence.Journal::new(root, 120000), observations: [], images: [] }
+    passed := run_suite(compiler, work, args.last("--before-emitter", ""), args.last("--before-call-sp-emitter", ""), &mut report)
+    saved := save(compiler, work, root, passed, &report)
+    status := if passed && saved { "PASS" } else { "FAIL" }
+    print(f"{status} MIR frame exits: {work}")
+    if passed && saved { 0 } else { 1 }
+}

@@ -1,0 +1,169 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+struct Report {
+    ok: bool,
+    entries: i64,
+    calls: i64,
+    words: i64,
+    estimated: i64,
+    reused: i64,
+}
+
+fn parse_report(text: string) -> Report {
+    doc := json.Doc::parse_text(text)
+    inline := doc.field(doc.root, "inlining")
+    entries := doc.get_i64(inline, "entries")
+    calls := doc.get_i64(inline, "calls")
+    words := doc.get_i64(inline, "words")
+    estimated := doc.get_i64(inline, "estimated_words")
+    reused := doc.get_i64(doc.field(doc.root, "functions"), "reused")
+    Report {
+        ok: doc.ok && entries.ok && calls.ok && words.ok && estimated.ok && reused.ok,
+        entries: entries.value, calls: calls.value, words: words.value, estimated: estimated.value, reused: reused.value,
+    }
+}
+
+fn call(program: string, args: []string, cwd: string, status: i32, result: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, cwd, status, false, 60000, &mut result)
+}
+
+fn build_matrix(compiler: string, source: string, work: string, kind: string, host: string) -> bool {
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        for mode in ["off", "on"] {
+            image := f"{work}/{kind}-{target}-{mode}"
+            if !call(compiler, ["build", source.clone(), "--inline-opt=" + mode, "--target", target.clone(), "--timings=json", "-o", image.clone()],
+                     "", 0, &mut result) { return false }
+            report_text := result.stderr_text()
+            report := parse_report(report_text)
+            good := if kind == "control" {
+                if mode == "on" {
+                    report.entries == 0 && report.calls >= 5 && report.words > 0 &&
+                    report.words <= report.estimated && report.estimated <= 65536
+                } else {
+                    report.calls == 0 && report.words == 0 && report.estimated == 0
+                }
+            } else if mode == "on" {
+                report.words > 0 && report.words <= report.estimated && report.estimated <= 4096 &&
+                (kind != "caller-budget" || (report.calls > 0 && report.calls < 140))
+            } else {
+                true
+            }
+            if !report.ok || !good { return harness.fail(f"{kind} {target} {mode}: unexpected inline report: {report_text}") }
+            if target == host &&
+               (!call(image, [], "", 0, &mut result) || !harness.stdout_is(&result, "42\n", image)) { return false }
+        }
+    }
+    true
+}
+
+fn check_traffic(compiler: string, source: string, work: string) -> bool {
+    mut result := harness.empty_output()
+    mut old := ""
+    for mode in ["off", "on"] {
+        image := work + "/profile-" + mode
+        if !call(compiler, ["build", source.clone(), "--inline-opt=" + mode, "--runtime-profile", "-o", image.clone()], "", 0, &mut result) ||
+           !call(image, [], "", 0, &mut result) || !harness.stdout_is(&result, "42\n", image) { return false }
+        passed := result.stderr_text()
+        profile := json.Doc::parse_text(passed)
+        if !profile.ok { return harness.fail(f"invalid runtime profile: {passed}") }
+        if mode == "off" { old = passed.clone() }
+        else if old != passed { return harness.fail(f"inline iteration changed runtime traffic:\n{old}\n{passed}") }
+    }
+    true
+}
+
+fn check_cache(compiler: string, work: string, host: string) -> bool {
+    cached := work + "/cached.ddr"
+    if !sys.write_text(cached, "fn sum(text:string)->i32{mut n:=0;for scalar in text.runes(){n=n+i32(scalar)};n}fn main(){print(sum(\"A🌍\"))}").ok {
+        return harness.fail(f"cannot write {cached}")
+    }
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        mut cold: []u8 = []
+        mut budget: i64 = 0
+        for round in 0..2 {
+            image := f"{work}/cached-{target}-{round}"
+            if !call(compiler, ["build", cached.clone(), "--inline-opt=on", "--incremental", "--target", target.clone(), "--timings=json",
+                                "-o", image.clone()], work, 0, &mut result) { return false }
+            report_text := result.stderr_text()
+            report := parse_report(report_text)
+            data := sys.read_u8(image)
+            if !data.ok || !report.ok { return harness.fail(f"{image}: invalid image or report") }
+            if round == 0 {
+                if report.calls != 1 || report.estimated <= 0 { return harness.fail(f"missing cold inline charge: {report_text}") }
+                cold = data.value
+                budget = report.estimated
+            } else if !bytes.equal(&cold, &data.value) || report.calls != 0 || report.reused <= 0 || report.estimated != budget {
+                return harness.fail(f"{target}: cached image or inline charge differs: {report_text}")
+            }
+            if target == host &&
+               (!call(image, [], "", 0, &mut result) || !harness.stdout_is(&result, "127822\n", image)) { return false }
+        }
+    }
+    true
+}
+
+fn check_trap(compiler: string, work: string, host: string) -> bool {
+    trap := work + "/trap.ddr"
+    if !sys.write_text(trap, "fn main(){print(17);for scalar in \"🌍\".runes(){assert(false)};print(42)}").ok {
+        return harness.fail(f"cannot write {trap}")
+    }
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        for mode in ["off", "on"] {
+            image := f"{work}/trap-{target}-{mode}"
+            if !call(compiler, ["build", trap.clone(), "--inline-opt=" + mode, "--target", target.clone(), "-o", image.clone()],
+                     "", 0, &mut result) { return false }
+            if target == host &&
+               (!call(image, [], "", 104, &mut result) || !harness.stdout_is(&result, "17\n", image)) { return false }
+        }
+    }
+    true
+}
+
+fn run_suite(compiler: string, root: string, work: string) -> bool {
+    host := process.host_target()
+    control := root + "/tests/fixtures/inline-streaming.ddr"
+    if !build_matrix(compiler, control, work, "control", host) || !check_traffic(compiler, control, work) { return false }
+
+    large := work + "/large-frame.ddr"
+    mut source := "fn main(){"
+    for i in 0..600 { source += f"mut v{i}:={i};" }
+    source += "mut sum:=0;for scalar in \"A🌍\".runes(){sum=sum+i32(scalar)};assert(sum==127822);print(42)}"
+    if !sys.write_text(large, source).ok { return harness.fail(f"cannot write {large}") }
+
+    bounded := work + "/caller-budget.ddr"
+    source = "fn main(){mut sum:=0;"
+    for _ in 0..140 { source += "for scalar in \"A\".runes(){sum=sum+i32(scalar)};" }
+    source += "assert(sum==9100);print(42)}"
+    if !sys.write_text(bounded, source).ok { return harness.fail(f"cannot write {bounded}") }
+
+    build_matrix(compiler, large, work, "large-frame", host) &&
+        build_matrix(compiler, bounded, work, "caller-budget", host) &&
+        check_cache(compiler, work, host) && check_trap(compiler, work, host)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_inline_streaming <compiler>")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    tmp := fs.temp_dir("dunder-inline-stream-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    if !run_suite(compiler, root, tmp.value) { return 1 }
+    print("inline streaming: all targets, mutation snapshots, nesting, continue/break/return, NUL and UTF-8 boundaries, large frames, budget fallback, cached builtin charges and unchanged runtime traffic passed")
+    0
+}

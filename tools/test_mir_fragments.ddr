@@ -1,0 +1,253 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Image {
+    target: string,
+    format: string,
+    padding: i32,
+    mode: string,
+    size: i32,
+    sha256: string,
+}
+
+struct Report {
+    journal: evidence.Journal,
+    images: []Image,
+    executions: i32,
+    payloads: i32,
+}
+
+fn sources() -> []string {
+    ["selfhost/mir/mir_lower.ddr", "selfhost/driver/fragments.ddr",
+     "tests/mir_fragment.ddr", "tests/fixtures/mir-fragment-emitter.ddr"]
+}
+
+fn valid_words(data: &[]i64, extended: bool, suffix: string) -> bool {
+    if data.len < 7 || data[0] != 0x44554644 || data[1] != 1 { return false }
+    entries: i64 = if extended { 2 } else { 0 }
+    estimate: i64 = if extended { 10 } else { 0 }
+    if data[5] != entries || data[6] != estimate { return false }
+    if extended && (data[data.len - 2] != 2 || data[data.len - 1] != 8) { return false }
+    words := data[2]
+    labels := data[3]
+    relocs := data[4]
+    expected_labels: i64 = if suffix == "a" { 3 } else { 2 }
+    length: i64 = 7 + words + labels + 3 * relocs + entries
+    if labels != expected_labels || length != i64(data.len) { return false }
+    base := 7 + i32(words)
+    mut has_end := false
+    mut has_unmarked := false
+    for i in 0..i32(labels) {
+        if data[base + i] == words { has_end = true }
+        if data[base + i] == 0xffffffff { has_unmarked = true }
+    }
+    if !has_end || !has_unmarked { return false }
+    for i in 0..i32(relocs) {
+        at := base + i32(labels) + 3 * i
+        destination := data[at + 1]
+        if data[at] >= words || data[at + 2] > 20 ||
+           (destination >= labels && (destination < 0x80000000 || destination >= 0x80000003)) { return false }
+    }
+    true
+}
+
+fn payload(path: string, extended: bool, suffix: string) -> string {
+    input := sys.read_text(path)
+    if !input.ok || input.value.len < 128 || (input.value.len - 128) % 8 != 0 {
+        _ := harness.fail(f"{path}: invalid fragment length")
+        return ""
+    }
+    value := input.value
+    mut signed: []u8 = []
+    bytes.append_utf8(&mut signed, value[0..64])
+    bytes.append_utf8(&mut signed, value[128..value.len])
+    if harness.sha256_bytes_hex(&signed) != value[64..128] {
+        _ := harness.fail(f"{path}: fragment checksum differs")
+        return ""
+    }
+    mut words: []i64 = []
+    for i in 0..((value.len - 128) / 8) {
+        start := 128 + i * 8
+        word := parse.hex(value[start..start + 8])
+        if !word.ok || word.value < 0 { _ := harness.fail(f"{path}: invalid hexadecimal word"); return "" }
+        words.push(word.value)
+    }
+    if !valid_words(&words, extended, suffix) {
+        _ := harness.fail(f"{path}: invalid DUFD payload, labels or relocations")
+        return ""
+    }
+    value
+}
+
+fn check_payloads(base: string, extended: bool, restored: bool, report: &mut Report) -> bool {
+    for suffix in ["a", "b"] {
+        expected := payload(base + ".serial." + suffix, extended, suffix)
+        detached := payload(base + "." + suffix, extended, suffix)
+        if expected.len == 0 || expected != detached {
+            return harness.fail(f"{base}.{suffix}: serial and detached payloads differ")
+        }
+        if restored && detached != payload(base + ".roundtrip." + suffix, extended, suffix) {
+            return harness.fail(f"{base}.{suffix}: restored and detached payloads differ")
+        }
+        report.payloads += 1
+    }
+    true
+}
+
+fn record_image(path: string, target: string, format: string, mode: string, padding: i32, data: &[]u8, live: bool, report: &mut Report) -> bool {
+    report.images.push(Image { target: target.clone(), format: format.clone(), mode: mode.clone(), padding: padding,
+                               size: data.len, sha256: harness.sha256_bytes_hex(&data) })
+    if live {
+        mut result := harness.empty_output()
+        if !report.journal.run(path, [], &mut result) || !harness.stdout_is(&result, "", path) { return false }
+        report.executions += 1
+    }
+    true
+}
+
+fn check_images(emitter: string, work: string, target: i32, name: string, format: string, live: bool, report: &mut Report) -> bool {
+    prefix := f"{work}/{name}-{format}"
+    extended := format == "inline"
+    mut result := harness.empty_output()
+    for padding in 0..2 {
+        base := f"{prefix}-{padding}"
+        mut serial: []u8 = []
+        for mode in ["serial", "object", "restore"] {
+            image := base + "-" + mode
+            if !report.journal.run(emitter, [mode.clone(), base.clone(), target.str(), image.clone(), format.clone(), padding.str()], &mut result) {
+                return false
+            }
+            if text.trim(result.stdout_text()) != "objects=2" { return harness.fail(f"{image}: expected two captured objects") }
+            if !check_payloads(base, extended, mode == "restore", &mut report) { return false }
+            data := sys.read_u8(image)
+            if !data.ok { return harness.fail(f"cannot read {image}") }
+            if !record_image(image, name, format, mode, padding, &data.value, live, &mut report) { return false }
+            if mode == "serial" { serial = data.value }
+            else if !bytes.equal(&serial, &data.value) { return harness.fail(f"{image}: serial and cache images differ") }
+        }
+    }
+
+    rebased := prefix + "-rebased-restore"
+    if !report.journal.run(emitter, ["restore", prefix + "-0", target.str(), rebased.clone(), format.clone(), "1"], &mut result) { return false }
+    actual := sys.read_u8(rebased)
+    reference := sys.read_u8(prefix + "-1-serial")
+    if !actual.ok || !reference.ok || !bytes.equal(&actual.value, &reference.value) {
+        return harness.fail(f"{rebased}: restoring at a different label base changed the image")
+    }
+    record_image(rebased, name, format, "rebased-restore", 1, &actual.value, live, &mut report)
+}
+
+fn run_suite(compiler: string, work: string, report: &mut Report) -> bool {
+    unit := "tests/mir_fragment.ddr"
+    mut result := harness.empty_output()
+    if !report.journal.run(compiler, ["test", unit.clone(), "-o", work + "/unit"], &mut result) { return false }
+    targets := harness.targets()
+    for target in targets {
+        if !report.journal.run(compiler, ["build-tests", unit.clone(), "--target", target.clone(), "-o", work + "/unit-" + target], &mut result) {
+            return false
+        }
+    }
+    emitter := work + "/emitter"
+    if !report.journal.run(compiler, ["build", "tests/fixtures/mir-fragment-emitter.ddr", "-o", emitter.clone()], &mut result) { return false }
+    host := harness.host_id()
+    if !report.journal.run(emitter, ["invalid", work + "/invalid.fn", host.str(), "unused", "ordinary", "0"], &mut result) {
+        return false
+    }
+    if text.trim(result.stdout_text()) != "objects=2" { return harness.fail(f"{emitter}: invalid cases changed output: {result.stdout_text()}") }
+    for target in 0..targets.len {
+        for format in ["ordinary", "inline"] {
+            if !check_images(emitter, work, target, targets[target], format, target == host, &mut report) { return false }
+        }
+    }
+    true
+}
+
+fn save(compiler: string, work: string, report: &Report, fingerprints: &[](string, string)) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("result")
+    writer.string("passed")
+    writer.key("images")
+    writer.array()
+    for image in report.images {
+        writer.object()
+        writer.key("target")
+        writer.string(image.target)
+        writer.key("format")
+        writer.string(image.format)
+        writer.key("padding")
+        writer.integer(i64(image.padding))
+        writer.key("mode")
+        writer.string(image.mode)
+        writer.key("bytes")
+        writer.integer(i64(image.size))
+        writer.key("sha256")
+        writer.string(image.sha256)
+        writer.end()
+    }
+    writer.end()
+    writer.key("executions")
+    writer.integer(i64(report.executions))
+    writer.key("payload_comparisons")
+    writer.integer(i64(report.payloads))
+    writer.key("scope")
+    writer.string("inactive cache-object API; trusted semantic producer, structural capture only; no MIR on hit")
+    writer.key("compiler_sha256")
+    writer.string(harness.sha256_file_hex(compiler))
+    writer.key("source_sha256")
+    writer.object()
+    for item in fingerprints {
+        writer.key(item.0)
+        writer.string(item.1)
+    }
+    writer.end()
+    writer.end()
+    evidence.save(work + "/summary.json", &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--source-root"), cli.option("--output")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_mir_fragments <compiler> [--source-root PATH] [--output PATH]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    repo := harness.find_root()
+    if repo.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    root := fs.realpath(args.last("--source-root", repo))
+    if !root.ok { _ := harness.fail("invalid source root"); return 2 }
+    destination := args.last("--output", repo + "/build/mir-fragment-qa")
+    if !fs.mkdir_all(destination).ok { _ := harness.fail(f"cannot create {destination}"); return 1 }
+    work := fs.realpath(destination)
+    if !work.ok { return 1 }
+
+    mut fingerprints: [](string, string) = []
+    for relative in move sources() {
+        path := root.value + "/" + relative
+        data := sys.read_u8(path)
+        if !data.ok { _ := harness.fail(f"cannot read {path}"); return 1 }
+        fingerprints.push((relative.clone(), harness.sha256_bytes_hex(&data.value)))
+    }
+    mut report := Report { journal: evidence.Journal::new(root.value, 120000), images: [], executions: 0, payloads: 0 }
+    passed := run_suite(compiler, work.value, &mut report)
+    mut commands := json.Writer::new()
+    report.journal.write_to(&mut commands, "command")
+    if !evidence.save(work.value + "/commands.json", &commands) || !passed { return 1 }
+    for item in &fingerprints {
+        if harness.sha256_file_hex(root.value + "/" + item.0) != item.1 {
+            _ := harness.fail(f"{item.0} changed during the run")
+            return 1
+        }
+    }
+    if !save(compiler, work.value, &report, &fingerprints) { return 1 }
+    print(f"PASS detached cache objects: {report.images.len} images, {report.executions} executions, {report.payloads} exact payload comparisons; atomic slice/save rejection")
+    0
+}

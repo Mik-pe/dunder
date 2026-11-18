@@ -312,7 +312,7 @@ python3 tools/test-runtime-contracts.py "$dunder_bin"
 python3 tools/test-array-moves.py "$dunder_bin"
 "$dunder_bin" run tools/test_resource_moves.ddr -- "$dunder_bin"
 python3 tools/test-resource-ownership.py "$dunder_bin"
-python3 tools/test-stdlib-ownership.py "$dunder_bin"
+"$dunder_bin" run tools/test_stdlib_ownership.ddr -- "$dunder_bin"
 python3 tools/test-local-borrows.py "$dunder_bin"
 python3 tools/test-returned-borrows.py "$dunder_bin"
 ```

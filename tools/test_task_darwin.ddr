@@ -1,0 +1,150 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.fs as fs
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+fn build(compiler: string, root: string, fixture: string, image: string, result: &mut process.Output) -> bool {
+    harness.run_checked_timeout(compiler, ["build", f"{root}/tests/fixtures/{fixture}.ddr", "-o", image.clone()],
+                                root, 0, false, 30000, &mut result)
+}
+
+fn create_dylib(root: string, path: string, scope: bool, result: &mut process.Output) -> bool {
+    fixtures := root + "/tests/fixtures"
+    mut flags: []string = ["-std=c11", "-O2", "-dynamiclib"]
+    if scope { flags.push("-DDUNDER_SCOPE_PROBE") }
+    flags.push(fixtures + "/task-native-probe.c")
+    flags.push(fixtures + "/task-native-probe.S")
+    flags.push("-o")
+    flags.push(path.clone())
+    harness.run_checked_timeout("clang", flags, root, 0, false, 30000, &mut result)
+}
+
+fn fault(mode: string) -> string {
+    if mode == "create-fail" { return "1" }
+    if mode == "join-fail" { return "2" }
+    if mode == "unmap-fail" || mode == "discard-unmap-fail" { return "3" }
+    "0"
+}
+
+fn run_image(image: string, root: string, mode: string, cap: i32, report_threads: bool, expected: i32, output: &mut process.Output) -> bool {
+    mut command := process.command(image.clone(), [])
+    command.set_cwd(root.clone())
+    command.set_timeout(30000)
+    command.set_env("TASK_NATIVE_FAULT", fault(mode))
+    if cap > 0 { command.set_env("TASK_SCOPE_CAP", cap.str()) }
+    if report_threads { command.set_env("TASK_THREAD_REPORT", "1") }
+    result := command.exec()
+    if !result.ok || result.timed_out || result.signal != 0 || result.code != expected || result.stderr.len > 0 {
+        return harness.fail(f"{image}: exited {result.code}, expected {expected}\n{result.stdout_text()}\n{result.stderr_text()}")
+    }
+    output = result
+    true
+}
+
+fn run_native(compiler: string, root: string, work: string) -> bool {
+    emitter := work + "/emitter"
+    dylib := work + "/probe.dylib"
+    mut result := harness.empty_output()
+    if !build(compiler, root, "task-native-emitter", emitter, &mut result) ||
+       !create_dylib(root, dylib, false, &mut result) { return false }
+    modes := ["scalar", "array", "batch", "discard", "discard-cached", "create-fail", "join-fail", "unmap-fail", "discard-unmap-fail"]
+    mut executions := 0
+    for probe in [false, true] {
+        count := if probe { modes.len } else { 5 }
+        suffix := if probe { "-probe" } else { "-real" }
+        library := if probe { dylib.clone() } else { "" }
+        for i in 0..count {
+            image := work + "/" + modes[i] + suffix
+            if !harness.run_checked_timeout(emitter, [image.clone(), modes[i].clone(), library.clone()], root, 0, false, 30000, &mut result) ||
+               !run_image(image, root, modes[i], 0, false, 0, &mut result) ||
+               !harness.stdout_is(&result, "", image) {
+                return false
+            }
+            label := if probe { "dispatch worker pool + independent C ABI/fault probe" } else { "direct system imports" }
+            print(f"PASS {modes[i]}: {label}")
+            executions += 1
+        }
+    }
+
+    borrowed := work + "/borrowed-input-emitter"
+    if !build(compiler, root, "task-borrowed-input-emitter", borrowed, &mut result) { return false }
+    for mode in ["scalar", "array", "c", "fixed"] {
+        image := work + "/borrowed-" + mode
+        if !harness.run_checked_timeout(borrowed, [image.clone(), mode.clone()], root, 0, false, 30000, &mut result) ||
+           !harness.run_checked_timeout(image, [], root, 0, false, 30000, &mut result) ||
+           !harness.stdout_is(&result, "", image) || result.stderr.len > 0 { return false }
+        print(f"PASS borrowed {mode}: actual worker ABI and 12 warm-lane input reclamations")
+        executions += 1
+    }
+    print(f"{executions} native images passed; 4-worker isolation, parent/child lifetimes, cached/discarded results, readonly worker inputs, exact-once joins and OS failure states; no timings")
+    true
+}
+
+fn check_scope(emitter: string, dylib: string, root: string, work: string, mode: string, cap: i32, expected: i32) -> bool {
+    image := f"{work}/{mode}-{cap}"
+    mut result := harness.empty_output()
+    if !harness.run_checked_timeout(emitter, [image.clone(), mode.clone(), cap.str(), dylib.clone()], root, 0, false, 30000, &mut result) ||
+       result.stderr.len != 0 { return harness.fail(result.stderr_text()) }
+    report_threads := mode == "array" && cap == 1
+    if !run_image(image, root, mode, cap, report_threads, expected, &mut result) { return false }
+    if report_threads {
+        workers := parse.integer(text.trim(result.stdout_text()))
+        if !workers.ok || workers.value < 1 || workers.value > 12 {
+            return harness.fail(f"unexpected worker count: {result.stdout_text()}")
+        }
+        print(f"Observed {workers.value} distinct OS worker threads for 12 sequential jobs")
+    } else if !harness.stdout_is(&result, "", image) { return false }
+    print(f"PASS {mode} cap{cap}: real OS workers, status{expected}")
+    true
+}
+
+fn run_scope(compiler: string, root: string, work: string) -> bool {
+    emitter := work + "/emitter"
+    dylib := work + "/scope-probe.dylib"
+    mut result := harness.empty_output()
+    if !build(compiler, root, "task-scope-emitter", emitter, &mut result) || result.stderr.len > 0 ||
+       !create_dylib(root, dylib, true, &mut result) || result.stderr.len > 0 { return harness.fail(result.stderr_text()) }
+    mut executions := 0
+    for cap in [1, 2, 4] {
+        for mode in ["scalar", "array", "unawaited", "discard"] {
+            if !check_scope(emitter, dylib, root, work, mode, cap, 0) { return false }
+            executions += 1
+        }
+    }
+    for mode in ["wrong-gen", "wrong-type", "wrong-index", "stale", "owner", "generation", "limit"] {
+        if !check_scope(emitter, dylib, root, work, mode, 1, 112) { return false }
+        executions += 1
+    }
+    for mode in ["create-fail", "join-fail", "unmap-fail"] {
+        if !check_scope(emitter, dylib, root, work, mode, 2, 112) { return false }
+        executions += 1
+    }
+    print(f"{executions} scheduler images passed; barrier proves actual overlap, peak stays bounded, no elapsed-time claims")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.flag("--scope")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_task_darwin <compiler> [--scope]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    if process.host_target() != "arm64-macos" {
+        _ := harness.fail("native task execution requires ARM64/macOS")
+        return 1
+    }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    scope := args.has("--scope")
+    prefix := if scope { "dunder-task-scope-" } else { "dunder-task-native-" }
+    tmp := fs.temp_dir(prefix)
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    passed := if scope { run_scope(compiler, root, tmp.value) } else { run_native(compiler, root, tmp.value) }
+    if passed { 0 } else { 1 }
+}

@@ -1,0 +1,142 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.array as array
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+struct Image {
+    source: string,
+    target: string,
+    sha256: string,
+}
+
+fn compare_images(compiler: string, baseline: string, root: string, source: string, label: string, work: string, rows: &mut []Image) -> bool {
+    mut result := harness.empty_output()
+    old := work + "/old"
+    new := work + "/new"
+    for target in harness.targets() {
+        if !harness.run_checked(baseline, ["build", source.clone(), "--target", target.clone(), "-o", old.clone()], root, 0, false, &mut result) ||
+           !harness.run_checked(compiler, ["build", source.clone(), "--target", target.clone(), "-o", new.clone()], root, 0, false, &mut result) {
+            return false
+        }
+        before := sys.read_u8(old)
+        after := sys.read_u8(new)
+        if !before.ok || !after.ok || !bytes.equal(&before.value, &after.value) {
+            return harness.fail(f"{source} {target}: frozen and candidate images differ")
+        }
+        rows.push(Image { source: label.clone(), target: target.clone(), sha256: harness.sha256_bytes_hex(&before.value) })
+    }
+    true
+}
+
+fn compare_diagnostics(compiler: string, baseline: string, root: string, work: string) -> bool {
+    invalid := [
+        "fn bad()->i64{false} fn main(){print(bad())}",
+        "fn dead()->i64{false} fn main(){print(42)}",
+        "fn main(){mut a:[]i64=[1];print(a[false])}",
+        "fn main(){for i in false..3{print(i)}}",
+    ]
+    for i in 0..invalid.len {
+        source := f"{work}/invalid-{i}.ddr"
+        if !sys.write_text(source, invalid[i]).ok { return harness.fail(f"cannot write {source}") }
+        for action in ["build", "check"] {
+            args: []string = [action.clone(), source.clone()]
+            old := harness.exec_cmd(baseline, args, root, false, 90000)
+            new := harness.exec_cmd(compiler, args, root, false, 90000)
+            if !old.ok || !new.ok || old.timed_out || new.timed_out || old.succeeded() ||
+               old.code != new.code || old.signal != new.signal ||
+               !bytes.equal(&old.stdout, &new.stdout) || !bytes.equal(&old.stderr, &new.stderr) {
+                return harness.fail(f"{source} {action}: frozen and candidate diagnostics differ:\n{old.stderr_text()}\n{new.stderr_text()}")
+            }
+        }
+    }
+    true
+}
+
+fn compare_baseline(compiler: string, baseline: string, root: string, work: string, rows: &mut []Image) -> bool {
+    runtime := "benchmarks/runtime"
+    listing := fs.list_dir(root + "/" + runtime)
+    if !listing.ok { return harness.fail(f"cannot list {runtime}") }
+    mut names := listing.entries
+    array.sort_strings(&mut names)
+    for name in names {
+        if !text.ends_with(name, ".ddr") { continue }
+        label := runtime + "/" + name
+        if !compare_images(compiler, baseline, root, root + "/" + label, label, work, &mut rows) { return false }
+    }
+    portable := [
+        "fn first(n:i64)->i64{n*3} fn last(move a:[]i64)->[]i64{mut b:=a;b[0]=b[0]+1;b} fn main(){a:[]i64=[41];print(last(move a)[0]);print(first(14))}",
+        "fn main(){value:f64=2.5;print(value.str())}",
+    ]
+    for i in 0..portable.len {
+        path := f"{work}/portable-{i}.ddr"
+        if !sys.write_text(path, portable[i]).ok { return harness.fail(f"cannot write {path}") }
+        if !compare_images(compiler, baseline, root, path, portable[i], work, &mut rows) { return false }
+    }
+    compare_diagnostics(compiler, baseline, root, work)
+}
+
+fn save(path: string, compiler: string, baseline: string, rows: &[]Image) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("consumer")
+    writer.string("passed")
+    writer.key("identity_images")
+    writer.array()
+    for row in rows {
+        writer.object()
+        writer.key("source")
+        writer.string(row.source)
+        writer.key("target")
+        writer.string(row.target)
+        writer.key("sha256")
+        writer.string(row.sha256)
+        writer.end()
+    }
+    writer.end()
+    writer.key("compiler_sha256")
+    writer.string(harness.sha256_file_hex(compiler))
+    if baseline.len != 0 {
+        writer.key("baseline_sha256")
+        writer.string(harness.sha256_file_hex(baseline))
+    }
+    writer.end()
+    evidence.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--baseline")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_compiler_session <compiler> [--baseline path]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    mut baseline := ""
+    if args.has("--baseline") {
+        path := args.last("--baseline", "")
+        found := fs.realpath(path)
+        if !found.ok { _ := harness.fail(f"baseline compiler not found: {path}"); return 2 }
+        baseline = found.value
+    }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    output := root + "/build/session-qa"
+    work := evidence.create_run(output)
+    if work.len == 0 { return 1 }
+    defer { _ := fs.remove_all(work) }
+    consumer := work + "/consumer"
+    mut result := harness.empty_output()
+    if !harness.run_checked(compiler, ["build", root + "/tests/fixtures/compiler-session.ddr", "-o", consumer.clone()], root, 0, false, &mut result) ||
+       !harness.run_checked(consumer, [], root, 0, false, &mut result) ||
+       !harness.stdout_is(&result, "session-passed\n", "compiler session consumer") { return 1 }
+    mut rows: []Image = []
+    if baseline.len > 0 && !compare_baseline(compiler, baseline, root, work, &mut rows) { return 1 }
+    if !save(output + "/contracts.json", compiler, baseline, &rows) { return 1 }
+    print(f"Session contracts passed; {rows.len} frozen image comparisons")
+    0
+}

@@ -268,7 +268,7 @@ och bevarade register provas också vid källgränsen. Detta använder de
 [befintliga reglerna för privata celler och främmande anrop](ffi.md#objektminne-och-privata-stackceller);
 språkets åtkomst- eller ABI-garantier har inte försvagats. Ett vanligt
 främmande anrop får inte inspektera andra privata lokaler genom stackvandring.
-[Frame-/utgångsprov](../tools/test-mir-frame-exits.py) ·
+[Frame-/utgångsprov](../tools/test_mir_frame_exits.ddr) ·
 [FFI-prov](../tools/test_ffi.ddr).
 
 ### Frame-livstid och privat temporärlagring
