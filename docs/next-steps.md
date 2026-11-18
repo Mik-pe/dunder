@@ -47,6 +47,13 @@ kan plockas isär, också när en komponent äger en resurs.
 [`std.math`](standard.md#matematik) samlar `clamp`, `min`, `max`, `sin`,
 `cos` och `tan`. Metal- och Vulkan-exemplen använder samma modul.
 
+### Nätverk
+
+Håll nätverksdelen av standardbiblioteket till transportprimitiver som TCP
+och UDP. Flytta HTTP-serverstödet i `std.http` och klienten i
+`std.http_client` till separata paket med sina protokolltester. Migrera
+Snus server, CLI och workers innan modulerna tas ur standardbiblioteket.
+
 ### Körbara exempel i manifestet
 
 En provkörning från projektets underkatalog `examples` bekräftade att
