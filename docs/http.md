@@ -70,11 +70,11 @@ på HTTP-headers eller TLS-handshake. Ett separat HTTP-anrop för leaseförnyels
 kan göras från callbacken. Svarens deklarerade och faktiskt mottagna längd
 kontrolleras mot samma gräns innan någon större buffert allokeras.
 
-På macOS används systemets libcurl; Linux behöver `libcurl.so.4`.
-Verifieringen använder Python 3 och OpenSSL för lokala TLS-fixturer:
+På macOS används systemets libcurl. Linux behöver `libcurl.so.4`.
+Klientsviten använder Python 3 och OpenSSL för lokala TLS-fixturer.
 
 ```sh
-python3 tools/test-http.py --compiler /absolute/path/to/dunder
+/absolute/path/to/dunder run tools/test_http.ddr -- --compiler /absolute/path/to/dunder
 python3 tools/test-http-client.py /absolute/path/to/dunder
 ```
 

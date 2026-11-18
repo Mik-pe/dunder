@@ -1,0 +1,412 @@
+capability process, filesystem, network
+
+import .harness as harness
+import .native_probe as probe
+import std.bytes as bytes
+import std.fs as fs
+import std.net as net
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+enum Handshake { None, Continue, WaitForBody }
+
+struct Case {
+    name: string,
+    wire: []u8,
+    status: i32,
+    mode: string,
+    expected: []u8,
+    limit: i32,
+    timeout: i32,
+    shutdown: bool,
+    handshake: Handshake,
+    fragments: []i32,
+}
+
+fn case_of(name: string, move wire: []u8, status: i32, mode: string, move expected: []u8) -> Case {
+    Case {
+        name: name.clone(), wire: wire, status: status, mode: mode.clone(), expected: expected,
+        limit: 16, timeout: 2000, shutdown: true, handshake: .None, fragments: [],
+    }
+}
+
+fn fragmented(move test: Case, move fragments: []i32) -> Case {
+    mut result := move test
+    result.fragments = fragments
+    result
+}
+
+fn body_limit(move test: Case, limit: i32) -> Case {
+    mut result := move test
+    result.limit = limit
+    result
+}
+
+fn handshake(move test: Case, kind: Handshake) -> Case {
+    mut result := move test
+    result.handshake = kind
+    result
+}
+
+fn keep_open(move test: Case, timeout: i32) -> Case {
+    mut result := move test
+    result.shutdown = false
+    result.timeout = timeout
+    result
+}
+
+fn raw(value: string) -> []u8 {
+    mut data: []u8 = []
+    bytes.append_utf8(&mut data, value)
+    data
+}
+
+fn with_ff(before: string, after: string) -> []u8 {
+    mut data := raw(before)
+    data.push(u8(255))
+    bytes.append_utf8(&mut data, after)
+    data
+}
+
+fn joined(prefix: string, data: &[]u8) -> []u8 {
+    mut result := raw(prefix)
+    bytes.extend(&mut result, &data)
+    result
+}
+
+fn repeat(value: string, count: i32) -> string {
+    mut data: []u8 = []
+    data.reserve(value.len * count)
+    for _ in 0..count { bytes.append_utf8(&mut data, value) }
+    bytes.decode(&data).value
+}
+
+fn ascending_bytes(count: i32) -> []u8 {
+    mut data: []u8 = []
+    data.reserve(count)
+    for i in 0..count { data.push(u8(i % 256)) }
+    data
+}
+
+fn two_large_chunks(data: &[]u8) -> []u8 {
+    mut wire := raw("PUT /large HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n32c8\r\n")
+    bytes.extend_range(&mut wire, &data, 0, 13000)
+    bytes.append_utf8(&mut wire, "\r\n3138\r\n")
+    bytes.extend_range(&mut wire, &data, 13000, data.len)
+    bytes.append_utf8(&mut wire, "\r\n0\r\n\r\n")
+    wire
+}
+
+fn await_socket(stream: &net.TcpStream, events: i32, timeout: i64) -> net.IoResult {
+    mut poll := net.PollSet::new()
+    poll.add(stream.fd(), events)
+    poll.poll(i32(timeout))
+}
+
+fn send(stream: &net.TcpStream, data: &[]u8, start: i32, end: i32) -> bool {
+    mut offset := start
+    deadline := sys.now_ms() + 5000
+    while offset < end {
+        n := stream.write_range(&data, offset, end - offset)
+        if n.ok && n.count > 0 {
+            offset += i32(n.count)
+        } else {
+            if !n.would_block && n.error != 4 { return harness.fail(f"write failed ({n.error})") }
+            remaining := deadline - sys.now_ms()
+            if remaining <= 0 { return harness.fail("timed out writing request") }
+            ready := await_socket(&stream, net.poll_out(), remaining)
+            if !ready.ok || ready.count == 0 { return harness.fail("socket was not ready for writing") }
+        }
+    }
+    true
+}
+
+fn receive(stream: &net.TcpStream, output: &mut []u8, interim: bool) -> bool {
+    reset := if target_is("macos") { 54 } else { 104 }
+    deadline := sys.now_ms() + 5000
+    while true {
+        remaining := deadline - sys.now_ms()
+        if remaining <= 0 { break }
+        ready := await_socket(&stream, net.poll_in(), remaining)
+        if !ready.ok || ready.count == 0 { return harness.fail("socket was not ready for reading") }
+        n := stream.read_append(&mut output, if interim { 4096 } else { 65536 })
+        if n.eof || n.error == reset { return !interim }
+        if !n.ok && !n.would_block && n.error != 4 { return harness.fail(f"read failed ({n.error})") }
+        if interim && bytes.find_double_crlf(&output, 0, output.len) >= 0 { return true }
+    }
+    harness.fail("timed out reading response")
+}
+
+fn send_request(test: &Case, stream: &net.TcpStream) -> bool {
+    wire := &test.wire
+    if test.handshake != .None {
+        head := bytes.find_double_crlf(&wire, 0, wire.len)
+        if head < 0 { return harness.fail("test request has no header terminator") }
+        start := head + 4
+        if !send(&stream, &wire, 0, start) { return false }
+        if test.handshake == .WaitForBody {
+            ready := await_socket(&stream, net.poll_in(), 100)
+            if !ready.ok || ready.count != 0 { return harness.fail("read_head unexpectedly sent a response before the body") }
+        } else {
+            mut response: []u8 = []
+            if !receive(&stream, &mut response, true) ||
+               !bytes.equals_text(&response, 0, response.len, "HTTP/1.1 100 Continue\r\n\r\n") {
+                return harness.fail("expected exactly one 100 Continue response")
+            }
+        }
+        return send(&stream, &wire, start, wire.len)
+    }
+    mut offset := 0
+    for amount in test.fragments {
+        if !send(&stream, &wire, offset, offset + amount) { return false }
+        offset += amount
+        sys.sleep_ms(5)
+    }
+    send(&stream, &wire, offset, wire.len)
+}
+
+fn check_response(test: &Case, response: &[]u8) -> bool {
+    head := bytes.find_double_crlf(&response, 0, response.len)
+    if head < 0 { return harness.fail("missing HTTP response headers") }
+    status_line := bytes.find_crlf(&response, 0, head + 2)
+    status_start := bytes.find_byte(&response, 0, status_line, b' ') + 1
+    status_end := bytes.find_byte(&response, status_start, status_line, b' ')
+    if status_start == 0 || status_end < 0 { return harness.fail("malformed HTTP status line") }
+    code := parse.integer(bytes.decode_range(&response, status_start, status_end).value)
+    if !code.ok || code.value != i64(test.status) {
+        return harness.fail(f"expected HTTP {test.status}, got {code.value}\n{bytes.decode_range(&response, 0, head).value}")
+    }
+
+    mut connection := false
+    mut marker := false
+    mut length: i64 = -1
+    mut has_length := false
+    mut start := status_line + 2
+    while start < head {
+        end := bytes.find_crlf(&response, start, head + 2)
+        colon := bytes.find_byte(&response, start, end, b':')
+        if colon < 0 || colon + 1 >= end || response[colon + 1] != b' ' { return harness.fail("malformed response header") }
+        value := colon + 2
+        if bytes.equals_text(&response, start, colon, "Connection") {
+            connection = bytes.equals_text(&response, value, end, "close")
+        } else if bytes.equals_text(&response, start, colon, "X-Test") {
+            marker = bytes.equals_text(&response, value, end, "dunder")
+        } else if bytes.equals_text(&response, start, colon, "Content-Length") {
+            has_length = true
+            parsed := parse.integer(bytes.decode_range(&response, value, end).value)
+            length = if parsed.ok { parsed.value } else { -1 }
+        }
+        start = end + 2
+    }
+    if !connection || !marker { return harness.fail("response lacks Connection: close or X-Test: dunder") }
+    body := head + 4
+    size := response.len - body
+    if code.value < 200 || code.value == 204 || code.value == 304 {
+        if has_length || size != 0 { return harness.fail("body or Content-Length on a bodyless response") }
+    } else if bytes.equals_text(&test.wire, 0, 5, "HEAD ") {
+        if size != 0 { return harness.fail("HEAD response contains a body") }
+    } else if !has_length || length != i64(size) {
+        return harness.fail(f"Content-Length {length} does not match {size} body bytes")
+    }
+    if code.value < 300 && !bytes.equal_ranges(&response, body, response.len, &test.expected, 0, test.expected.len) {
+        return harness.fail(f"response body differs from fixture ({size} bytes)")
+    }
+    true
+}
+
+fn run_case(binary: string, test: &Case) -> bool {
+    started := sys.now_ms()
+    mut command := process.Command::new(binary.clone(), [test.limit.str(), test.timeout.str()])
+    if test.mode.len > 0 { command.add_arg(test.mode.clone()) }
+    spawned := command.spawn()
+    if !spawned.ok { return harness.fail(f"cannot start HTTP fixture ({spawned.error})") }
+    mut child := spawned.child
+    defer {
+        _ := child.kill()
+        _ := child.wait(5000)
+    }
+    announcement := child.read_stdout_line(5000)
+    port := parse.integer(text.trim(announcement.value))
+    if !announcement.ok || !port.ok || port.value < 1 || port.value > 65535 {
+        return harness.fail("fixture did not announce a port")
+    }
+    connected := net.TcpStream::connect(net.loopback(), i32(port.value))
+    if !connected.ok { return harness.fail(f"cannot connect to fixture ({connected.error})") }
+    stream := connected.stream
+    nonblocking := stream.set_nonblocking(true)
+    if !nonblocking.ok { return harness.fail(f"cannot set socket nonblocking ({nonblocking.error})") }
+    if !send_request(&test, &stream) { return false }
+    if test.shutdown {
+        shut := stream.shutdown_write()
+        dormant := if target_is("macos") { 57 } else { 107 }
+        if !shut.ok && shut.error != dormant { return harness.fail(f"shutdown of write side failed ({shut.error})") }
+    }
+    mut response: []u8 = []
+    if !receive(&stream, &mut response, false) || !check_response(&test, &response) { return false }
+    mut errors: []u8 = []
+    _ := child.read_stderr(&mut errors, 4096, 5000)
+    exit := child.wait(5000)
+    if !exit.ok || exit.code != 0 || exit.signal != 0 {
+        return harness.fail(f"fixture exited {exit.code} (signal {exit.signal})\n{bytes.decode(&errors).value}")
+    }
+    if test.name == "stalled-header" && sys.now_ms() - started >= 2000 {
+        return harness.fail("slow client exceeded total deadline")
+    }
+    true
+}
+
+fn exercise(binary: string) -> i32 {
+    tests := cases()
+    for index in 0..tests.len {
+        if !run_case(binary, &tests[index]) {
+            _ := harness.fail(tests[index].name)
+            return 1
+        }
+    }
+    print(f"HTTP protocol: {tests.len} native socket cases passed")
+    0
+}
+
+fn main() -> i32 {
+    root := harness.find_root()
+    mut compiler := root + "/build/selfhost/arm64-macos/dunder"
+    mut binary := ""
+    mut index := 1
+    while index < sys.arg_count() {
+        arg := sys.arg(index)
+        if arg == "-h" || arg == "--help" {
+            print("usage: test_http [compiler] [--compiler COMPILER] [--binary FIXTURE]")
+            return 0
+        }
+        equal := text.find(arg, "=")
+        option := if equal < 0 { arg.clone() } else { arg[0..equal] }
+        if option == "--compiler" || option == "--binary" {
+            mut value := ""
+            if equal >= 0 { value = arg[(equal + 1)..arg.len] }
+            else {
+                index += 1
+                if index == sys.arg_count() || text.starts_with(sys.arg(index), "--") {
+                    _ := harness.fail(f"missing argument for {option}")
+                    return 2
+                }
+                value = sys.arg(index)
+            }
+            if option == "--compiler" { compiler = move value }
+            else { binary = move value }
+        } else if index == 1 && !text.starts_with(arg, "-") { compiler = arg.clone() }
+        else {
+            _ := harness.fail(f"unexpected argument: {arg}")
+            return 2
+        }
+        index += 1
+    }
+    if binary.len > 0 { return exercise(harness.resolve_or_abs(binary)) }
+    compiler = probe.find_executable(compiler)
+    if root.len == 0 || compiler.len == 0 {
+        _ := harness.fail("could not locate repository or compiler")
+        return 2
+    }
+    work := fs.temp_dir("dunder-http-")
+    if !work.ok {
+        _ := harness.fail("cannot create temporary HTTP test directory")
+        return 1
+    }
+    defer { _ := fs.remove_all(work.value) }
+    fixture := work.value + "/http-fixture"
+    mut command := process.Command::new(move compiler, ["build", root + "/tests/http.ddr", "-o", fixture.clone()])
+    command.set_cwd(root.clone())
+    command.inherit_stdio()
+    built := command.exec()
+    if !built.succeeded() { return 1 }
+    exercise(fixture)
+}
+
+fn cases() -> []Case {
+    large := ascending_bytes(25600)
+    large_body := joined("PUT /large\n\n", &large)
+    oversized := repeat("a", 8192)
+    full_line := "Accept: " + repeat("a", 7990) + "\r\n"
+    mut tests: []Case = [
+        fragmented(case_of("fragmented-binary-request", with_ff("PATCH /api/tasks/1?view=all HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test\r\nContent-Length: 5\r\n\r\na\0", "bc"), 200, "", with_ff("PATCH /api/tasks/1?view=all\nBearer test\na\0", "bc")), [1, 2, 3, 7, 20, 15, 15]),
+        case_of("http-1.0", raw("DELETE /api/tasks/1 HTTP/1.0\r\n\r\n"), 200, "", raw("DELETE /api/tasks/1\n\n")),
+        case_of("head-response", raw("HEAD /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n"), 200, "", []),
+        case_of("content-length-at-limit", raw("POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\n0123456789abcdef"), 200, "", raw("POST /api\n\n0123456789abcdef")),
+        fragmented(case_of("fragmented-chunks", raw("POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: ChUnKeD\r\n\r\n3;ext=value\r\na\0b\r\n2\r\ncd\r\n0\r\nDigest: test\r\n\r\n"), 200, "", raw("POST /api\n\na\0bcd")), [30, 20, 8, 3, 8, 5]),
+        handshake(case_of("continue", raw("POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\nabc"), 200, "", raw("POST /api\n\nabc")), .Continue),
+        case_of("missing-host", raw("GET / HTTP/1.1\r\n\r\n"), 400, "", []),
+        case_of("lf-only", raw("GET / HTTP/1.1\nHost: localhost\n\n"), 400, "", []),
+        case_of("absolute-target", raw("GET https://example.test/ HTTP/1.1\r\nHost: localhost\r\n\r\n"), 400, "", []),
+        case_of("fragment-in-target", raw("GET /#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"), 400, "", []),
+        case_of("http-2", raw("GET / HTTP/2.0\r\nHost: localhost\r\n\r\n"), 400, "", []),
+        case_of("duplicate-host", raw("GET / HTTP/1.1\r\nHost: one\r\nhOsT: two\r\n\r\n"), 400, "", []),
+        case_of("duplicate-authorization", raw("GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: first\r\nauthorization: second\r\n\r\n"), 400, "", []),
+        case_of("duplicate-lease-token", raw("GET / HTTP/1.1\r\nHost: localhost\r\nX-Snus-Lease-Token: first\r\nx-snus-lease-token: second\r\n\r\n"), 400, "", []),
+        case_of("folded-header", raw("GET / HTTP/1.1\r\nHost: localhost\r\nFolded: first\r\n second\r\n\r\n"), 400, "", []),
+        case_of("header-name-space", raw("GET / HTTP/1.1\r\nHost: localhost\r\nBad : value\r\n\r\n"), 400, "", []),
+        case_of("nul-in-header", raw("GET / HTTP/1.1\r\nHost: localhost\r\nBad: value\0\r\n\r\n"), 400, "", []),
+        case_of("missing-length", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length:\r\n\r\n"), 400, "", []),
+        case_of("signed-length", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: +3\r\n\r\nabc"), 400, "", []),
+        case_of("duplicate-length", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\ncontent-length: 3\r\n\r\nabc"), 400, "", []),
+        case_of("length-over-limit", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 17\r\n\r\n"), 413, "", []),
+        case_of("length-u64-max", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 18446744073709551615\r\n\r\n"), 413, "", []),
+        case_of("truncated-body", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nab"), 400, "", []),
+        case_of("mixed-framing", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\nabc"), 400, "", []),
+        case_of("multiple-transfer-codings", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"), 400, "", []),
+        case_of("missing-transfer-coding", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding:\r\n\r\n"), 400, "", []),
+        case_of("chunk-over-limit", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n"), 413, "", []),
+        case_of("invalid-chunk-size", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\ng\r\n"), 400, "", []),
+        case_of("missing-chunk-crlf", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naXX0\r\n\r\n"), 400, "", []),
+        case_of("forbidden-trailer", raw("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nAuthorization: attacker\r\n\r\n"), 400, "", []),
+        case_of("unknown-expectation", raw("POST / HTTP/1.1\r\nHost: localhost\r\nExpect: unsupported\r\n\r\n"), 417, "", []),
+        case_of("oversized-request-line", raw("GET /" + oversized + " HTTP/1.1\r\nHost: localhost\r\n\r\n"), 431, "", []),
+        case_of("oversized-header", raw("GET / HTTP/1.1\r\nHost: localhost\r\nBig: " + oversized + "\r\n\r\n"), 431, "", []),
+        case_of("excess-header-count", raw("GET / HTTP/1.1\r\nHost: localhost\r\n" + repeat("Accept: x\r\n", 100) + "\r\n"), 431, "", []),
+        case_of("oversized-header-section", raw("GET / HTTP/1.1\r\nHost: localhost\r\n" + repeat(full_line, 5) + "\r\n"), 431, "", []),
+        keep_open(case_of("stalled-header", raw("GET / HTTP/1.1\r\nHost:"), 408, "", []), 100),
+        body_limit(case_of("empty-body", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"), 200, "", raw("POST /\n\n")), 0),
+        body_limit(case_of("zero-limit", raw("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n"), 413, "", []), 0),
+        fragmented(case_of("head-with-large-body", with_ff("PUT /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1073741824\r\n\r\na\0", "bc"), 200, "head", with_ff("PUT /upload\n\na\0", "bc")), [20, 42, 1, 1, 1]),
+        case_of("head-raw-chunks", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\na\0b\r\n0\r\n\r\n"), 200, "head", raw("POST /upload\n\n3\r\na\0b\r\n0\r\n\r\n")),
+        handshake(case_of("head-no-continue", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\nabc"), 200, "head", raw("POST /upload\n\nabc")), .WaitForBody),
+        case_of("head-length-i64-max", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9223372036854775807\r\n\r\nabc"), 200, "head", raw("POST /upload\n\nabc")),
+        case_of("head-length-over-i64", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9223372036854775808\r\n\r\n"), 413, "head", []),
+        case_of("head-mixed-framing", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\nabc"), 400, "head", []),
+        case_of("head-duplicate-authorization", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nAuthorization: a\r\nAUTHORIZATION: b\r\n\r\n"), 400, "head", []),
+        case_of("no-content", raw("GET /empty HTTP/1.1\r\nHost: localhost\r\n\r\n"), 204, "", []),
+        keep_open(case_of("head-oversized-header", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nLong: " + oversized + "a"), 431, "head", []), 2000),
+        keep_open(case_of("head-lf-only", raw("POST /upload HTTP/1.1\nHost: localhost\n"), 400, "head", []), 2000),
+        case_of("split-binary", with_ff("PUT /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\na\0", "bc"), 200, "split", with_ff("PUT /upload\n\na\0", "bc")),
+        case_of("split-chunked", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\na\0b\r\n0\r\n\r\n"), 200, "split", raw("POST /upload\n\na\0b")),
+        handshake(case_of("split-continue", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\nabc"), 200, "split", raw("POST /upload\n\nabc")), .Continue),
+        keep_open(case_of("split-over-limit", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 17\r\nExpect: 100-continue\r\n\r\n"), 413, "split", []), 2000),
+        keep_open(case_of("stalled-body", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\na"), 408, "", []), 100),
+        keep_open(case_of("split-stalled-body", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\na"), 408, "split", []), 100),
+        case_of("split-chunk-budget", raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n123456789\r\n8\r\n"), 413, "split", []),
+        body_limit(case_of("split-large-binary", joined("PUT /large HTTP/1.1\r\nHost: localhost\r\nContent-Length: 25600\r\n\r\n", &large), 200, "split", large_body.clone()), 25600),
+        body_limit(case_of("split-large-chunks", two_large_chunks(&large), 200, "split", large_body.clone()), 25600),
+    ]
+    lengths: [](string, i32) = [("9999999999999999999", 413), ("18446744073709551615", 413),
+                                ("18446744073709551616", 400), ("9999999999999999999x", 400), ("17x", 400)]
+    for entry in lengths {
+        for mode in ["", "head", "split"] {
+            label := if mode == "" { "request" } else { mode.clone() }
+            wire := raw("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + entry.0 + "\r\n\r\n")
+            tests.push(case_of(f"length-{entry.0}-{label}", move wire, entry.1, mode, []))
+        }
+    }
+    tests.push(case_of("stream-binary", with_ff("PUT /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\na\0", "bc"), 200, "stream", with_ff("PUT /stream\n\na\0", "bc")))
+    tests.push(case_of("stream-chunked", with_ff("PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\na\0\r\n5\r\nb", "cde\r\n0\r\nDigest: ok\r\n\r\n"), 200, "stream", with_ff("PUT /stream\n\na\0b", "cde")))
+    tests.push(handshake(case_of("stream-continue", raw("POST /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nabcde"), 200, "stream", raw("POST /stream\n\nabcde")), .Continue))
+    tests.push(keep_open(case_of("stream-over-limit", raw("POST /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 17\r\nExpect: 100-continue\r\n\r\n"), 413, "stream", []), 2000))
+    tests.push(body_limit(case_of("stream-truncated-body", raw("POST /stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1073741824\r\n\r\nshort"), 400, "stream", []), 1073741824))
+    tests.push(body_limit(case_of("stream-many-small-chunks", raw("PUT /tiny HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" + repeat("1\r\nx\r\n", 4096) + "0\r\n\r\n"), 200, "stream", raw("PUT /tiny\n\n" + repeat("x", 4096))), 4096))
+    tests.push(case_of("stream-invalid-chunk-size", raw("PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n11g\r\n"), 400, "stream", []))
+    tests.push(body_limit(case_of("stream-no-content", raw("GET /empty HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"), 204, "stream", []), 0))
+    tests.push(case_of("stream-allowed-trailers", raw("PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Test: done\r\nDigest: harmless\r\n\r\n"), 200, "stream", raw("PUT /stream\n\nabc")))
+    tests.push(case_of("stream-lease-token-trailer", raw("PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Snus-Lease-Token: forged\r\n\r\n"), 400, "stream", []))
+    tests.push(case_of("stream-connection-trailer", raw("PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nConnection: keep-alive\r\n\r\n"), 400, "stream", []))
+    tests.push(case_of("stream-transfer-encoding-trailer", raw("PUT /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nTransfer-Encoding: identity\r\n\r\n"), 400, "stream", []))
+    tests
+}
