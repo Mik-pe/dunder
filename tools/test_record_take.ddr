@@ -1,0 +1,114 @@
+capability process, filesystem
+
+import .harness as harness
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+fn call(program: string, args: []string, cwd: string, out: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, cwd, 0, false, 60000, &mut out)
+}
+
+fn counter_delta(old: &json.Doc, new: &json.Doc, key: string, expected: i64) -> bool {
+    before := old.get_i64(old.field(old.root, "counters"), key)
+    after := new.get_i64(new.field(new.root, "counters"), key)
+    if !before.ok || !after.ok { return harness.fail(f"missing counter {key}") }
+    difference := before.value - after.value
+    difference == expected || harness.fail(f"{key} changed by {difference}, expected {expected}")
+}
+
+fn check_counters(emitter: string, root: string, work: string, host: i32, n: i32) -> bool {
+    mut result := harness.empty_output()
+    mut old_report := ""
+    mut new_report := ""
+    for target in 0..3 {
+        for mode in ["clone", "take"] {
+            image := f"{work}/{target}-{mode}-{n}"
+            if !call(emitter, [image.clone(), target.str(), mode.clone(), n.str()], root, &mut result) ||
+               !harness.stdout_is(&result, "33\n", image) { return false }
+            if target == host {
+                if !call(image, [], root, &mut result) || !harness.stdout_is(&result, "", image) { return false }
+                if mode == "clone" { old_report = result.stderr_text() } else { new_report = result.stderr_text() }
+            }
+        }
+    }
+    old := json.Doc::parse_text(old_report)
+    new := json.Doc::parse_text(new_report)
+    if !old.ok || !new.ok || old.get_str(old.root, "kind").value != "runtime_profile" || new.get_str(new.root, "kind").value != "runtime_profile" {
+        return harness.fail(f"invalid clone or take profile at length {n}")
+    }
+    allocations: i64 = if n == 0 { 10 } else { 11 }
+    copied: i64 = 8 * i64(n) + 38
+    if !counter_delta(&old, &new, "allocation_count", allocations) ||
+       !counter_delta(&old, &new, "array_clone_calls", 4) ||
+       !counter_delta(&old, &new, "array_clone_bytes", copied) ||
+       !counter_delta(&old, &new, "record_clone_calls", 3) ||
+       !counter_delta(&old, &new, "record_clone_bytes", 80) ||
+       !counter_delta(&old, &new, "retain_calls", 4) { return false }
+    print(f"PASS len{n}: three target images, native ownership/capacity oracle; {allocations} allocations and {copied} array-copy bytes removed")
+    true
+}
+
+fn check_traps(cli: &harness.BaseCli, work: string, host: i32, targets: &[]string) -> bool {
+    prefix := "struct Item { values: []i64, title: string }\n" +
+              "fn failure() -> Item { print(11); assert(false); Item { values: [1], title: \"bad\" } }\n" +
+              "fn later() -> i32 { print(22); z := 0; 1 / z }\n" +
+              "fn accept(item: Item, ignored: i32) -> i32 { i32(item.values[0]) + ignored }\n"
+    traps: [](string, i32, string) = [
+        ("arg-order", 104, "fn main() { unused := accept(failure(), later()) }"),
+        ("field-order", 104, "fn main() { unused := Item { values: failure().values, title: later().str() } }"),
+        ("projection-bounds", 103, "fn main() { print(11); unused := Item { values: [1], title: \"x\" }.values[2]; ignored := later() }"),
+    ]
+    mut result := harness.empty_output()
+    for trap in move traps {
+        (case_name, status, body) := trap
+        path := f"{work}/{case_name}.ddr"
+        if !sys.write_text(path, prefix + body + "\n").ok { return harness.fail(f"cannot write {path}") }
+        for target in 0..targets.len {
+            image := f"{work}/{case_name}-{target}"
+            if !call(cli.compiler, ["build", path.clone(), "--target", targets[target].clone(), "-o", image.clone()], cli.root, &mut result) { return false }
+            if target == host &&
+               (!harness.run_checked_timeout(image, [], cli.root, status, false, 60000, &mut result) ||
+                !harness.stdout_is(&result, "11\n", case_name)) { return false }
+        }
+    }
+    true
+}
+
+fn run_suite(cli: &harness.BaseCli, work: string) -> bool {
+    host := harness.host_id()
+    emitter := work + "/emitter"
+    fixtures := cli.root + "/tests/fixtures"
+    mut result := harness.empty_output()
+    if !call(cli.compiler, ["test", cli.root + "/tests/record_take.ddr", "-o", work + "/units"], cli.root, &mut result) ||
+       !call(cli.compiler, ["build", fixtures + "/record-take-emitter.ddr", "-o", emitter.clone()], cli.root, &mut result) {
+        return false
+    }
+    for n in [0, 1, 8, 9, 17, 64] {
+        if !check_counters(emitter, cli.root, work, host, n) { return false }
+    }
+    targets := harness.targets()
+    for target in 0..targets.len {
+        image := f"{work}/source-{target}"
+        if !call(cli.compiler, ["build", fixtures + "/record-take-values.ddr", "--target", targets[target].clone(), "-o", image.clone()], cli.root, &mut result) {
+            return false
+        }
+        if target == host &&
+           (!call(image, [], cli.root, &mut result) || !harness.stdout_is(&result, "42\n", image)) { return false }
+    }
+    if !check_traps(&cli, work, host, &targets) { return false }
+    print("PASS source snapshot/projection/callback/branch/return/reentry contracts")
+    print("PASS source child-trap ordering (exact status and print prefix)")
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    tmp := fs.temp_dir("dunder-record-take-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if run_suite(&cli, work) { 0 } else { 1 }
+}

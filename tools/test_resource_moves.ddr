@@ -1,0 +1,174 @@
+capability process, filesystem
+
+import .harness as harness
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn invalid_cases() -> [](string, string, string) {
+    [
+        ("inline-constructor", "@c_layout struct C{a:[i32;2]} fn main(){a:=[20,22];c:=C{a:a};print(a[0])}", "use of moved value"),
+        ("inline-assignment", "@c_layout struct C{a:[i32;2]} fn main(){a:=[20,22];mut c:=C{a:[1,2]};c.a=a;print(a[0])}", "use of moved value"),
+        ("inline-borrow-constructor", "@c_layout struct C{a:[i32;2]} fn bad(a:[i32;2])->C{C{a:a}} fn main(){}", "cannot move out of a borrowed value"),
+        ("inline-borrow-assignment", "@c_layout struct C{a:[i32;2]} fn bad(a:[i32;2],c:&mut C){c.a=a} fn main(){}", "cannot move out of a borrowed value"),
+        ("resource-move", "@resource struct R{fd:i32} fn main(){a:=R{fd:42};b:=a;print(a.fd)}", "use of moved value"),
+        ("resource-borrow", "@resource struct R{fd:i32} fn bad(r:R)->R{r} fn main(){}", "cannot move out of a borrowed value"),
+        ("resource-clone", "@resource struct R{fd:i32} fn main(){a:=R{fd:42};b:=a.clone()}", "resource values cannot be cloned"),
+        ("nested-clone", "@resource struct R{fd:i32} struct W{r:R} fn main(){a:=W{r:R{fd:42}};b:=a.clone()}", "resource values cannot be cloned"),
+        ("enum-clone", "@resource struct R{fd:i32} enum W{R(R),Empty} fn main(){a:=W.R(R{fd:42});b:=a.clone()}", "resource values cannot be cloned"),
+        ("resource-attribute", "@resource fn f(){} fn main(){}", "invalid declaration attribute"),
+        ("swap-immutable", "fn main(){a:[]i32=[1,2];a.swap(0,1)}", "swap requires mut"),
+        ("swap-readonly", "fn bad(a:[]string){a.swap(0,1)} fn main(){}", "swap requires mut"),
+        ("swap-loop", "fn main(){mut a:[]string=[\"a\",\"b\"];for x in a{a.swap(0,1)}}", "while iterating"),
+        ("swap-moved", "fn main(){mut a:[]string=[\"a\",\"b\"];b:=a;a.swap(0,1)}", "use of moved value"),
+        ("swap-index-type", "fn main(){mut a:[]i32=[1,2];a.swap(true,1)}", "type mismatch"),
+    ]
+}
+
+fn task_cases() -> [](string, string, string) {
+    [
+        ("task-input", "@resource struct R{fd:i32} fn work(r:R)->i32{r.fd} fn main(){r:=R{fd:42};task scope s(1){key:=spawn s work(r)}}", "task worker input must be isolated Data"),
+        ("task-result", "@resource struct R{fd:i32} fn work(n:i32)->R{R{fd:n}} fn main(){task scope s(1){key:=spawn s work(42);r:=await! s(key)}}", "task worker result must be isolated Data"),
+    ]
+}
+
+fn check_live(result: &process.Output, optimized: bool) -> bool {
+    output := result.stderr_text()
+    doc := json.Doc::parse_text(output)
+    counters := doc.field(doc.root, "counters")
+    arrays := doc.get_i64(counters, "array_clone_calls")
+    records := doc.get_i64(counters, "record_clone_calls")
+    retain := doc.get_i64(counters, "retain_calls")
+    if !doc.ok || !arrays.ok || arrays.value != 0 || !records.ok || records.value != 0 ||
+       (optimized && (!retain.ok || retain.value != 0)) {
+        return harness.fail(f"unexpected resource move counters: {output}")
+    }
+    true
+}
+
+fn check_valid(cli: &harness.BaseCli, work: string, path: string, target: string, host: string, images: &mut i32) -> bool {
+    mut result := harness.empty_output()
+    for optimized in [true, false] {
+        for worker in [1, 4] {
+            if worker == 4 && (target != host || host != "arm64-macos") { break }
+            image := f"{work}/valid-{images}"
+            mut args: []string = ["build", path.clone(), "--target", target.clone(), "--jobs", worker.str(), "-o", image.clone()]
+            if target != "wasm32" { args.push("--runtime-profile") }
+            if !optimized {
+                args.push("--scalar-opt=off")
+                args.push("--ownership-opt=off")
+                args.push("--mir=off")
+            }
+            if !harness.run_checked(cli.compiler, args, cli.root, 0, false, &mut result) { return false }
+            if target == host &&
+               (!harness.run_checked(image, [], work, 0, false, &mut result) ||
+                !harness.stdout_is(&result, "resource transfers and swaps ok\n", target) || !check_live(&result, optimized)) { return false }
+            images += 1
+        }
+    }
+    true
+}
+
+fn check_rejection(cli: &harness.BaseCli, work: string, path: string, target: string, expected: string) -> bool {
+    image := work + "/previous"
+    mut primary := ""
+    mut result := harness.empty_output()
+    for optimized in [true, false] {
+        mut check: []string = ["check", path.clone(), "--target", target.clone(), "--agent"]
+        mut build: []string = ["build", path.clone(), "--target", target.clone(), "-o", image.clone()]
+        if !optimized {
+            for flag in ["--scalar-opt=off", "--ownership-opt=off", "--mir=off"] {
+                check.push(flag.clone())
+                build.push(flag.clone())
+            }
+        }
+        if !harness.run_checked(cli.compiler, check, cli.root, 1, false, &mut result) { return false }
+        report := result.stdout_text()
+        doc := json.Doc::parse_text(report)
+        message := doc.get_str(doc.root, "message")
+        if !doc.ok || !message.ok || text.find(message.value, expected) < 0 { return harness.fail(f"{path}: {report}") }
+        if optimized { primary = report.clone() }
+        if report != primary { return harness.fail(f"diagnostic changed with optimization:\n{primary}\n{report}") }
+        if !sys.write_text(image, "previous").ok { return harness.fail(f"cannot write {image}") }
+        if !harness.run_checked(cli.compiler, build, cli.root, 1, false, &mut result) { return false }
+        previous := sys.read_text(image)
+        if !previous.ok || previous.value != "previous" || text.find(result.stderr_text(), message.value) < 0 {
+            return harness.fail(f"{path}: rejected build changed its destination or diagnostic:\n{result.stderr_text()}")
+        }
+    }
+    true
+}
+
+fn check_tasks(cli: &harness.BaseCli, work: string) -> bool {
+    mut result := harness.empty_output()
+    for item in move task_cases() {
+        (name, program, message) := item
+        path := f"{work}/{name}.ddr"
+        if !sys.write_text(path, program + "\n").ok { return harness.fail(f"cannot write {path}") }
+        if !harness.run_checked(cli.compiler, ["check", path.clone()], cli.root, 1, false, &mut result) { return false }
+        if text.find(result.stderr_text(), message) < 0 { return harness.fail(f"{path}: {result.stderr_text()}") }
+    }
+    true
+}
+
+fn check_bounds(cli: &harness.BaseCli, work: string) -> bool {
+    mut result := harness.empty_output()
+    for index in [-1, 2] {
+        path := f"{work}/bounds-{index}.ddr"
+        image := f"{work}/bounds-{index}"
+        code := "fn index(n:i32)->i32{print(n);n} fn main(){mut a:[]string=[\"a\",\"b\"];a.swap(index(0),index(" +
+                index.str() + "));print(\"unreachable\")}\n"
+        if !sys.write_text(path, code).ok { return harness.fail(f"cannot write {path}") }
+        if !harness.run_checked(cli.compiler, ["build", path, "-o", image.clone()], cli.root, 0, false, &mut result) ||
+           !harness.run_checked(image, [], work, 103, false, &mut result) ||
+           !harness.stdout_is(&result, f"0\n{index}\n", "swap bounds") { return false }
+    }
+    true
+}
+
+fn run_suite(cli: &harness.BaseCli, work: string, include_wasm: bool) -> bool {
+    host := process.host_target()
+    source := work + "/valid.ddr"
+    fixture := cli.root + "/tests/fixtures/resource_moves.ddr"
+    body := sys.read_u8(fixture)
+    if !body.ok || !sys.write_u8(source, &body.value).ok { return harness.fail(f"cannot copy {fixture} to {source}") }
+    mut targets := harness.targets()
+    if include_wasm { targets.push("wasm32") }
+    mut images := 0
+    mut errors := 0
+    cases := invalid_cases()
+    for target in targets {
+        if !check_valid(&cli, work, source, target, host, &mut images) { return false }
+        for index in 0..cases.len {
+            name := cases[index].0.clone()
+            path := f"{work}/{name}.ddr"
+            if !sys.write_text(path, cases[index].1 + "\n").ok { return harness.fail(f"cannot write {path}") }
+            if !check_rejection(&cli, work, path, target, cases[index].2) { return false }
+            errors += 1
+        }
+    }
+    if host == "arm64-macos" {
+        if !check_tasks(&cli, work) { return false }
+        errors += task_cases().len
+    }
+    if !check_bounds(&cli, work) { return false }
+    print(f"resource moves: {images} images and {errors} rejected contracts; clone-free swaps, C transfers, task isolation and bounds passed")
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    include_wasm := cli.extra_args.len == 1 && cli.extra_args[0] == "--include-wasm"
+    if cli.extra_args.len > 0 && !include_wasm {
+        _ := sys.eprint("usage: test_resource_moves <compiler> [--include-wasm]")
+        return 2
+    }
+    tmp := fs.temp_dir("dunder-resource-moves-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if run_suite(&cli, work, include_wasm) { 0 } else { 1 }
+}

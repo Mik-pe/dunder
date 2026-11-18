@@ -143,7 +143,7 @@ och övrig oanvänd Code-metadata har standardvärden; validerarens scratch
 ligger separat. Gränskartan döljs aldrig i en arrays kapacitet eller i
 etikettabellen. Indata och resultat följer språkets vanliga regler för
 ägda värden som passerar en taskgräns.
-[ObjectData och task-livstid](../tools/test-mir-object-data.py).
+[ObjectData och task-livstid](../tools/test_mir_object_data.ddr).
 
 [`compile_parallel`](../selfhost/tasks/compile_parallel.ddr) äger begränsade
 fönster av språkets isolerade tasks. Antalet workers ändrar inte symbol-
@@ -642,7 +642,7 @@ CLI-cachen behåller varma fragment separat för båda lägena.
 `tools/test-optimizer.py` jämför optimerad kod med avstängt pass och kan
 även jämföra med en äldre kompilator genom `--baseline`. Den provar
 resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
-använder modellen. `tools/test-opt-emitter.py` provar emission och spill
+använder modellen. `tools/test_opt_emitter.ddr` provar emission och spill
 separat. Båda ingår i `tools/verify-selfhost.sh`.
 
 ### Signerad division och rest med konstant delare

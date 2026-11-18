@@ -1,0 +1,130 @@
+capability process, filesystem
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+fn check_bindings(output: string, helper: string, marked: i64, target: string) -> bool {
+    reports := harness.lines(output)
+    mut kind := ""
+    mut bindings := 0
+    for line in reports {
+        doc := json.Doc::parse_text(line)
+        if !doc.ok { return harness.fail(f"{target}: invalid binding report: {line}") }
+        kind = doc.get_str(doc.root, "kind").value
+        name := doc.get_str(doc.root, "name").value
+        if name == "move" { return harness.fail(f"{target}: move reported as a name: {line}") }
+        if kind == "binding" && name == "number" && doc.get_str(doc.root, "path").value == helper {
+            start := doc.get_i64(doc.root, "start")
+            if !start.ok || start.value != marked { return harness.fail(f"{target}: wrong parameter offset: {line}") }
+            bindings += 1
+        }
+    }
+    (kind == "ok" && bindings == 1) || harness.fail(f"{target}: missing binding or successful check:\n{output}")
+}
+
+fn run_suite(cli: &harness.BaseCli, work: string) -> bool {
+    host := harness.host_id()
+    targets := harness.targets()
+    fixtures := cli.root + "/tests/fixtures"
+    source := fixtures + "/syntax_bridge/main.ddr"
+    helper := fixtures + "/syntax_bridge/helper.ddr"
+    helper_text := sys.read_text(helper)
+    if !helper_text.ok { return harness.fail(f"cannot read {helper}") }
+    offset := text.find(helper_text.value, "move number: i32")
+    if offset < 0 { return harness.fail(f"missing parameter declaration in {helper}") }
+
+    mut result := harness.empty_output()
+    mut builds := 0
+    for target in 0..targets.len {
+        name := targets[target].clone()
+        for optimized in [true, false] {
+            mut reference: []u8 = []
+            for worker in [1, 4] {
+                if worker == 4 && (target != host || host != 0) { break }
+                image := f"{work}/image-{builds}"
+                mut args: []string = ["build", source.clone(), "--target", name.clone(), "--jobs", worker.str(), "-o", image.clone()]
+                if !optimized {
+                    args.push("--scalar-opt=off")
+                    args.push("--inline-opt=off")
+                    args.push("--mir=off")
+                }
+                if !harness.run_checked(cli.compiler, args, cli.root, 0, false, &mut result) { return false }
+                if target == host &&
+                   (!harness.run_checked(image, [], work, 0, false, &mut result) ||
+                    !harness.stdout_is(&result, "syntax bridge ok\n", name)) { return false }
+                data := sys.read_u8(image)
+                if !data.ok { return harness.fail(f"cannot read {image}") }
+                if worker == 1 {
+                    reference = data.value
+                } else if !bytes.equal(&reference, &data.value) {
+                    return harness.fail(f"{name}: serial and parallel images differ")
+                }
+                builds += 1
+            }
+        }
+        if !harness.run_checked(cli.compiler, ["check", source.clone(), "--agent", "--target", name.clone()], cli.root, 0, false, &mut result) ||
+           !check_bindings(result.stdout_text(), helper, i64(offset + 5), name) { return false }
+    }
+
+    api := work + "/api"
+    direct := work + "/direct.ddr"
+    if !harness.run_checked(cli.compiler, ["build", fixtures + "/interpolation/api.ddr", "-o", api.clone()], cli.root, 0, false, &mut result) ||
+       !sys.write_text(direct, "fn add(move x:i32)->i32{move x+1} fn main(){mut x:=40;x+=1;f:fn(move i32)->i32=add;print(f(move x))}\n").ok {
+        return harness.fail("cannot prepare direct compiler API probe")
+    }
+    for target in 0..targets.len {
+        for mode in ["direct", "source", "tokens"] {
+            path := if mode == "direct" { direct.clone() } else { source.clone() }
+            expected := if mode == "direct" { "42\n" } else { "syntax bridge ok\n" }
+            image := f"{work}/api-{target}-{mode}"
+            if !harness.run_checked(api, [path, target.str(), mode.clone(), image.clone()], work, 0, false, &mut result) ||
+               !harness.stdout_is(&result, "api ok\n", mode) { return false }
+            if target == host &&
+               (!harness.run_checked(image, [], work, 0, false, &mut result) ||
+                !harness.stdout_is(&result, expected, mode)) { return false }
+            builds += 1
+        }
+    }
+    invalid := [
+        "fn main(){mut 42}",
+        "fn main(){var x:=1}",
+        "fn main(){var x:i32=1}",
+        "fn main(){value:=move }",
+        "fn bad(move :i32){} fn main(){}",
+        "fn main(){f:fn(move)->i32=missing}",
+    ]
+    mut errors := 0
+    for index in 0..invalid.len {
+        path := f"{work}/invalid-{index}.ddr"
+        code := invalid[index] + "\n"
+        if !sys.write_text(path, code).ok { return harness.fail(f"cannot write {path}") }
+        for target in targets {
+            if !harness.run_checked(cli.compiler, ["check", path.clone(), "--agent", "--target", target.clone()], work, 1, false, &mut result) { return false }
+            report := result.stdout_text()
+            doc := json.Doc::parse_text(report)
+            start := doc.get_i64(doc.root, "start")
+            end := doc.get_i64(doc.root, "end")
+            if !doc.ok || doc.get_str(doc.root, "kind").value != "error" || doc.get_str(doc.root, "path").value != path ||
+               !start.ok || !end.ok || start.value < 0 || end.value < start.value || end.value > i64(code.len) {
+                return harness.fail(f"{target}: unexpected diagnostic for {path}: {report}")
+            }
+            errors += 1
+        }
+    }
+    print(f"syntax bridge: {builds} native images, {errors} rejected syntax contracts; host execution, import shadows, parameter offsets and source/token APIs passed")
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    tmp := fs.temp_dir("dunder-syntax-bridge-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if run_suite(&cli, work) { 0 } else { 1 }
+}

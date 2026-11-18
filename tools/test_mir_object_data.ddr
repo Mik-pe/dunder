@@ -1,0 +1,199 @@
+capability process, filesystem
+
+import .harness as harness
+import .test_evidence as evidence
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import sys
+
+struct UnitImage {
+    target: string,
+    sha256: string,
+}
+
+struct KernelImage {
+    target: string,
+    capacity: i32,
+    mode: string,
+    sha256: string,
+    size: i64,
+}
+
+struct Report {
+    journal: evidence.Journal,
+    unit_groups: i64,
+    units: []UnitImage,
+    kernels: []KernelImage,
+    executions: i32,
+}
+
+fn passing_groups(output: string) -> i64 {
+    for line in harness.lines(output) {
+        words := harness.fields(line)
+        for index in 0..words.len - 3 {
+            if words[index + 1] == "passed," && words[index + 2] == "0" && words[index + 3] == "failed" {
+                count := parse.integer(words[index])
+                if count.ok && count.value >= 0 { return count.value }
+            }
+        }
+    }
+    -1
+}
+
+fn check_unit_images(compiler: string, root: string, work: string, report: &mut Report) -> bool {
+    unit := root + "/tests/mir_object_data.ddr"
+    mut result := harness.empty_output()
+    if !report.journal.run(compiler, ["test", unit.clone(), "-o", work + "/unit-native"], &mut result) { return false }
+    groups := passing_groups(result.stdout_text())
+    if groups < 0 { return harness.fail(f"missing passing unit groups:\n{result.stdout_text()}") }
+    report.unit_groups = groups
+    if !report.journal.run(compiler, ["build-tests", unit.clone(), "--list"], &mut result) { return false }
+    listing := harness.lines(result.stdout_text())
+    if i64(listing.len) != groups { return harness.fail(f"expected {groups} listed unit groups:\n{result.stdout_text()}") }
+    for target in harness.targets() {
+        image := f"{work}/unit-{target}-0"
+        if !report.journal.run(compiler, ["build-tests", unit.clone(), "--target", target.clone(), "--group", "0", "-o", image.clone()], &mut result) {
+            return false
+        }
+        report.units.push(UnitImage { target: target.clone(), sha256: harness.sha256_file_hex(image) })
+    }
+    true
+}
+
+fn check_kernel_images(compiler: string, root: string, work: string, report: &mut Report) -> bool {
+    emitter := work + "/task-emitter"
+    fixture := root + "/tests/fixtures/mir-object-data-task.ddr"
+    mut result := harness.empty_output()
+    if !report.journal.run(compiler, ["build", fixture, "-o", emitter.clone()], &mut result) { return false }
+    targets := harness.targets()
+    for target in 0..targets.len {
+        name := targets[target].clone()
+        mut reference := ""
+        for capacity in [1, 2, 4] {
+            for mode in ["serial", "task"] {
+                path := f"{work}/{name}-{capacity}-{mode}"
+                if !report.journal.run(emitter, [path.clone(), target.str(), mode.clone(), capacity.str()], &mut result) ||
+                   !harness.stdout_is(&result, "objects=1;lowering=worker-or-serial-once;iterations=3\n", path) { return false }
+                digest := harness.sha256_file_hex(path)
+                if reference.len == 0 { reference = digest.clone() }
+                if reference != digest { return harness.fail(f"{name} {capacity} {mode}: serial/task image mismatch") }
+                info := sys.metadata(path)
+                if !info.ok { return harness.fail(f"cannot stat {path}") }
+                report.kernels.push(KernelImage {
+                    target: name.clone(), capacity: capacity, mode: mode.clone(), sha256: digest, size: info.size,
+                })
+                if target == 0 {
+                    if !report.journal.run(path, [], &mut result) || !harness.stdout_is(&result, "", path) { return false }
+                    report.executions += 1
+                }
+            }
+        }
+    }
+    true
+}
+
+fn save(cli: &harness.BaseCli, work: string, root: string, host: string, passed: bool, report: &Report) -> bool {
+    mut commands := json.Writer::new()
+    report.journal.write_to(&mut commands, "command")
+    commands_ok := evidence.save(work + "/commands.json", &commands)
+
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("result")
+    writer.string(if passed { "passed" } else { "failed" })
+    writer.key("compiler_sha256")
+    writer.string(harness.sha256_file_hex(cli.compiler))
+    writer.key("source_sha256")
+    writer.object()
+    sources := [
+        "selfhost/mir/mir_lower.ddr", "selfhost/tasks/mir_task.ddr", "selfhost/tasks/compile_parallel.ddr",
+        "tests/mir_object_data.ddr", "tests/fixtures/mir-object-data-task.ddr",
+    ]
+    for path in sources {
+        writer.key(path)
+        writer.string(harness.sha256_file_hex(root + "/" + path))
+    }
+    writer.key("tools/test_mir_object_data.ddr")
+    writer.string(harness.sha256_file_hex(cli.root + "/tools/test_mir_object_data.ddr"))
+    writer.end()
+    writer.key("unit_groups")
+    writer.object()
+    if report.unit_groups >= 0 {
+        writer.key(host)
+        writer.integer(report.unit_groups)
+    }
+    writer.end()
+    writer.key("unit_images")
+    writer.array()
+    for unit in report.units {
+        writer.object()
+        writer.key("target")
+        writer.string(unit.target)
+        writer.key("group")
+        writer.integer(0)
+        writer.key("sha256")
+        writer.string(unit.sha256)
+        writer.end()
+    }
+    writer.end()
+    writer.key("kernel_images")
+    writer.array()
+    for image in report.kernels {
+        writer.object()
+        writer.key("target")
+        writer.string(image.target)
+        writer.key("capacity")
+        writer.integer(i64(image.capacity))
+        writer.key("mode")
+        writer.string(image.mode)
+        writer.key("sha256")
+        writer.string(image.sha256)
+        writer.key("bytes")
+        writer.integer(image.size)
+        writer.end()
+    }
+    writer.end()
+    writer.key("kernel_executions")
+    writer.object()
+    writer.key(host)
+    writer.integer(i64(report.executions))
+    writer.end()
+    writer.key("host_target")
+    writer.string(host)
+    mac := host == "arm64-macos"
+    writer.key("task_scope_probe")
+    writer.string(if mac { "actual native source tasks" } else { "not supported on this host; omitted" })
+    writer.key("provenance")
+    writer.string("exact task scope, ordinal and declaration remain trusted; structural import is not a semantic byte certificate")
+    writer.key("lifetime")
+    writer.string(if mac { "repeated await mutation/cache isolation, discard, refused job, scope reentry, accepted object survives child-pool and scope cleanup" } else { "not run; source threads unsupported on this host" })
+    writer.key("linux_execution")
+    writer.string(if mac { "cross-built only" } else { "native unit driver only; no source threads" })
+    writer.end()
+    evidence.save(work + "/summary.json", &writer) && commands_ok
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if cli.extra_args.len > 0 {
+        _ := sys.eprint("usage: test_mir_object_data <compiler> [--source-root path] [--output path]")
+        return 2
+    }
+    root := fs.realpath(cli.source_root)
+    if !root.ok { _ := harness.fail(f"source root not found: {cli.source_root}"); return 1 }
+    host := harness.target_name(harness.host_id())
+    base := if cli.output_dir.len > 0 { cli.output_dir.clone() } else { cli.root + "/build/mir-object-data-qa" }
+    work := evidence.create_run(base)
+    if work.len == 0 { return 1 }
+    mut report := Report {
+        journal: evidence.Journal::new(root.value, 180000), unit_groups: -1, units: [], kernels: [], executions: 0,
+    }
+    passed := check_unit_images(cli.compiler, root.value, work, &mut report) &&
+              (host != "arm64-macos" || check_kernel_images(cli.compiler, root.value, work, &mut report))
+    saved := save(&cli, work, root.value, host, passed, &report)
+    status := if passed && saved { "PASS" } else { "FAIL" }
+    print(f"{status} numeric object transport: {work}")
+    if passed && saved { 0 } else { 1 }
+}

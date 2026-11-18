@@ -300,9 +300,15 @@ pub fn exec_cmd(program: string, args: []string, cwd: string, empty_path: bool, 
 }
 
 pub fn run_checked(program: string, args: []string, cwd: string, expected_code: i32, empty_path: bool, out_res: &mut process.Output) -> bool {
-    res := exec_cmd(program, args, cwd, empty_path, 90000)
+    run_checked_timeout(program, args, cwd, expected_code, empty_path, 90000, &mut out_res)
+}
+
+pub fn run_checked_timeout(program: string, args: []string, cwd: string, expected_code: i32, empty_path: bool, timeout_ms: i64, out_res: &mut process.Output) -> bool {
+    res := exec_cmd(program, args, cwd, empty_path, timeout_ms)
     if !res.ok || res.timed_out || res.signal != 0 || res.code != expected_code {
-        return fail(f"{program} exited {res.code} (signal {res.signal}), expected {expected_code}\nstdout: {process.stdout_text(&res)}\nstderr: {process.stderr_text(&res)}")
+        mut command := program.clone()
+        for arg in args { command = command + " " + arg }
+        return fail(f"{command} exited {res.code} (signal {res.signal}, timed out: {res.timed_out}), expected {expected_code}\nstdout: {process.stdout_text(&res)}\nstderr: {process.stderr_text(&res)}")
     }
     out_res = res
     true
@@ -313,18 +319,26 @@ pub fn empty_output() -> process.Output {
 }
 
 pub fn run_target_image(target: string, image: string, cwd: string, out_res: &mut process.Output) -> bool {
+    run_target_image_timeout(target, image, cwd, 90000, &mut out_res)
+}
+
+fn run_target_image_timeout(target: string, image: string, cwd: string, timeout_ms: i64, out_res: &mut process.Output) -> bool {
     if target == "wasm32" {
         loader := "const fs = require('node:fs'); " +
             "const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])), " +
             "{dunder: {print_i32: console.log, print_text: () => {}}}); instance.exports.main();"
-        return run_checked("node", ["-e", loader, image.clone()], cwd, 0, false, &mut out_res)
+        return run_checked_timeout("node", ["-e", loader, image.clone()], cwd, 0, false, timeout_ms, &mut out_res)
     }
-    run_checked(image, [], cwd, 0, false, &mut out_res)
+    run_checked_timeout(image, [], cwd, 0, false, timeout_ms, &mut out_res)
 }
 
 pub fn check_agent_error(compiler: string, path: string, expected: string, cwd: string) -> bool {
+    check_agent_error_timeout(compiler, path, expected, cwd, 90000)
+}
+
+fn check_agent_error_timeout(compiler: string, path: string, expected: string, cwd: string, timeout_ms: i64) -> bool {
     mut checked := empty_output()
-    if !run_checked(compiler, ["check", path.clone(), "--agent", "--jobs", "4"], cwd, 1, false, &mut checked) { return false }
+    if !run_checked_timeout(compiler, ["check", path.clone(), "--agent", "--jobs", "4"], cwd, 1, false, timeout_ms, &mut checked) { return false }
     report := process.stdout_text(&checked)
     doc := json.Doc::parse_text(report)
     kind := doc.get_str(doc.root, "kind")
@@ -337,6 +351,63 @@ pub fn check_agent_error(compiler: string, path: string, expected: string, cwd: 
        !source.ok || source.value != path || !start.ok || !end.ok || start.value < 0 || start.value >= end.value ||
        !file.ok || end.value > file.size {
         return fail(f"expected {expected} with a source span in {path}: {report}")
+    }
+    true
+}
+
+pub fn stdout_is(result: &process.Output, expected: string, context: string) -> bool {
+    actual := process.stdout_text(&result)
+    actual == expected || fail(f"{context}: expected stdout {expected}, got {actual}")
+}
+
+pub fn run_specialization_matrix(compiler: string, source: string, work: string, expected: string) -> bool {
+    host := process.host_target()
+    mut all_targets := targets()
+    all_targets.push("wasm32")
+    mut result := empty_output()
+    for target in all_targets {
+        image := work + "/" + target
+        for optimized in [true, false] {
+            workers := if optimized && target == host { "4" } else { "1" }
+            mut args: []string = ["build", source.clone(), "--target", target.clone(), "--jobs", workers, "-o", image.clone()]
+            if !optimized {
+                args.push("--mir=off")
+                args.push("--scalar-opt=off")
+                args.push("--ownership-opt=off")
+            }
+            if !run_checked_timeout(compiler, args, work, 0, false, 120000, &mut result) { return false }
+            if target == host || target == "wasm32" {
+                if !run_target_image_timeout(target, image, work, 120000, &mut result) || !stdout_is(&result, expected, target) { return false }
+            }
+        }
+    }
+    cached := work + "/incremental.ddr"
+    data := sys.read_u8(source)
+    if !data.ok || !sys.write_u8(cached, &data.value).ok { return fail(f"cannot copy {source} to {cached}") }
+    for _ in 0..2 {
+        if !run_checked_timeout(compiler, ["run", cached.clone(), "--incremental", "--jobs", "4"], work, 0, false, 120000, &mut result) ||
+           !stdout_is(&result, expected, "incremental") { return false }
+    }
+    true
+}
+
+pub fn check_rejected_specializations(compiler: string, work: string, cases: &[](string, string)) -> bool {
+    image := work + "/previous-image"
+    mut result := empty_output()
+    for index in 0..cases.len {
+        code := cases[index].0 + "\n"
+        message := cases[index].1.clone()
+        path := f"{work}/invalid-{index}.ddr"
+        if !sys.write_text(path, code).ok || !sys.write_text(image, "previous image").ok {
+            return fail(f"cannot prepare specialization diagnostic {index}")
+        }
+        if !check_agent_error_timeout(compiler, path, message, work, 120000) ||
+           !run_checked_timeout(compiler, ["build", path.clone(), "-o", image.clone()], work, 1, false, 120000, &mut result) { return false }
+        if text.find(process.stderr_text(&result), message) < 0 {
+            return fail(f"missing {message} in {path}: {process.stderr_text(&result)}")
+        }
+        previous := sys.read_text(image)
+        if !previous.ok || previous.value != "previous image" { return fail(f"rejected build changed {image}") }
     }
     true
 }
