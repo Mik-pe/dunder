@@ -73,7 +73,7 @@ linjärt minne.
 I `tools/verify-selfhost.sh` kör Node bland annat program för sammansatta
 arrayer och byteoperationer. Proven kontrollerar både korrekta resultat och
 Wasm-fällor för ogiltiga index eller intervall.
-[Arrayprov](../tools/test-aggregate-arrays.py) · [Byte- och minnesprov](../tools/test-memory-bytes.py)
+[Arrayprov](../tools/test_aggregate_arrays.ddr) · [Byte- och minnesprov](../tools/test_memory_bytes.ddr)
 
 ## Bootstrap och kodgenerering
 

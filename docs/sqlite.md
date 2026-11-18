@@ -65,6 +65,6 @@ cannot contain NUL. TEXT containing invalid UTF-8 is rejected.
 Native dependencies are `/usr/lib/libsqlite3.dylib` on macOS and
 `libsqlite3.so.0` on Linux. The compiler links those shared libraries directly;
 SQLite queries do not spawn a command-line process. Test with
-`python3 tools/test-sqlite.py /absolute/path/to/dunder`. It builds all three
+`/absolute/path/to/dunder run tools/test_sqlite.ddr -- /absolute/path/to/dunder`. It builds all three
 native targets and executes the host; use `--runner TARGET=COMMAND` for
 additional available runtimes.

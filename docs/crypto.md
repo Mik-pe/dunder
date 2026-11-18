@@ -32,7 +32,7 @@ stable `/opt/homebrew/opt/` library paths. Linux uses `libcrypto.so.3` and
 `libargon2.so.1`. No compiler, subprocess or application shim implements
 the cryptographic operations.
 
-Run `python3 tools/test-crypto.py /absolute/path/to/dunder`. Its native
+Run `/absolute/path/to/dunder run tools/test_crypto.ddr -- /absolute/path/to/dunder`. Its native
 fixture checks published NIST AES-256-GCM and RFC HMAC/HKDF vectors,
 authentication failures, zero-length inputs, bounds, password verification
 and random generation. Additional runtimes can be selected with

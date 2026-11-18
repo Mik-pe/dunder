@@ -1,0 +1,123 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Counts {
+    validated: i32,
+    built: i32,
+    executed: i32,
+    rejected: i32,
+}
+
+fn check_runtime(result: &process.Output, expected: string, profiled: bool) -> bool {
+    if !harness.stdout_is(&result, expected + "\n", "value block") { return false }
+    report := result.stderr_text()
+    if !profiled { return report.len == 0 || harness.fail(report) }
+    doc := json.Doc::parse_text(report)
+    counters := doc.field(doc.root, "counters")
+    fresh := doc.get_i64(counters, "fresh_allocations")
+    reused := doc.get_i64(counters, "reused_allocations")
+    arrays := doc.get_i64(counters, "array_clone_calls")
+    records := doc.get_i64(counters, "record_clone_calls")
+    if !doc.ok || doc.get_str(doc.root, "kind").value != "runtime_profile" ||
+       !fresh.ok || fresh.value >= 64 || !reused.ok || reused.value <= 256 ||
+       !arrays.ok || arrays.value != 0 || !records.ok || records.value != 0 {
+        return harness.fail(f"unexpected counters: {report}")
+    }
+    true
+}
+
+fn check_mode(compiler: string, fixtures: string, work: string, target: string, optimized: bool, runners: &native.Runners,
+              invalid: &[]string, errors: &json.Doc, counts: &mut Counts) -> bool {
+    mut options: []string = ["--target", target.clone()]
+    if !optimized {
+        for flag in move native.direct_flags() { options.push(move flag) }
+        options.push("--inline-opt=off")
+    }
+    programs: [](string, string, bool) = [
+        ("values", "branch values ok", false),
+        ("ownership", "branch ownership ok", true),
+        ("exits", "branch exits ok", false),
+        ("interrupted", "interrupted expressions ok", true),
+    ]
+    image := work + "/value-blocks"
+    mut result := harness.empty_output()
+    for i in 0..programs.len {
+        source := f"{fixtures}/{programs[i].0}.ddr"
+        profiled := programs[i].2
+        mut check: []string = ["check", source.clone(), "--agent"]
+        mut build: []string = ["build", source, "-o", image.clone()]
+        for option in options {
+            check.push(option.clone())
+            build.push(option.clone())
+        }
+        if profiled { build.push("--runtime-profile") }
+        if !harness.run_checked(compiler, check, work, 0, false, &mut result) || !harness.agent_ok(&result) { return false }
+        counts.validated += 1
+        if !harness.run_checked(compiler, build, work, 0, false, &mut result) { return false }
+        counts.built += 1
+        if runners.can_run(target) {
+            if !runners.run(target, image, [], work, 0, &mut result) || !check_runtime(&result, programs[i].1, profiled) { return false }
+            counts.executed += 1
+        }
+    }
+
+    for name in invalid {
+        source := fixtures + "/" + name
+        expected := errors.get_str(errors.root, "value_blocks/" + name)
+        if !expected.ok || expected.value.len == 0 { return harness.fail(f"missing diagnostic for {source}") }
+        mut check: []string = ["check", source.clone(), "--agent"]
+        mut build: []string = ["build", source.clone(), "-o", image.clone()]
+        for option in options {
+            check.push(option.clone())
+            build.push(option.clone())
+        }
+        if !harness.run_checked(compiler, check, work, 1, false, &mut result) { return false }
+        message := harness.agent_error_message(result.stdout_text(), source, expected.value, "")
+        if message.len == 0 || !sys.write_text(image, "previous image").ok { return false }
+        if !harness.run_checked(compiler, build, work, 1, false, &mut result) { return false }
+        previous := sys.read_text(image)
+        if text.find(result.stderr_text(), message) < 0 || !previous.ok || previous.value != "previous image" {
+            return harness.fail(f"{source}: rejected build altered output or diagnostic:\n{result.stderr_text()}")
+        }
+        counts.rejected += 1
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--runner")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_value_blocks <compiler> [--runner TARGET=COMMAND]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    specs := args.all("--runner")
+    runners := native.Runners::new(&specs)
+    if runners.error.len != 0 { _ := sys.eprint(runners.error); return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    fixtures := root + "/tests/fixtures/value_blocks"
+    invalid := harness.invalid_fixture_names(fixtures)
+    errors := harness.fixture_diagnostics(root)
+    if !errors.ok { _ := harness.fail("cannot load fixture diagnostics"); return 1 }
+    tmp := fs.temp_dir("dunder-value-blocks-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    work := fs.realpath(tmp.value)
+    if !work.ok { return 1 }
+    mut counts := Counts { validated: 0, built: 0, executed: 0, rejected: 0 }
+    for target in harness.targets() {
+        for optimized in [true, false] {
+            if !check_mode(compiler, fixtures, work.value, target, optimized, &runners, &invalid, &errors, &mut counts) { return 1 }
+        }
+    }
+    print(f"Value blocks passed {counts.validated} checks, {counts.built} native images, {counts.executed} executions ({runners.targets()}), {counts.rejected} check/build rejections with preserved outputs")
+    0
+}

@@ -1,0 +1,230 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import std.text as text
+import std.wire as wire
+import sys
+
+@extern("c", "access") unsafe fn executable_access(path: ptr, mode: i32) -> i32
+
+struct Words {
+    ok: bool,
+    args: []string,
+}
+
+struct Runner {
+    target: string,
+    args: []string,
+}
+
+pub struct Runners {
+    error: string,
+    entries: []Runner,
+}
+
+fn whitespace(c: i32) -> bool {
+    c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn split_words(command: string) -> Words {
+    mut words: []string = []
+    mut buffer: []u8 = []
+    mut quote := 0
+    mut started := false
+    mut i := 0
+    while i < command.len {
+        c := command[i]
+        i += 1
+        if quote == 0 && whitespace(c) {
+            if started {
+                decoded := bytes.decode(&buffer)
+                words.push(move decoded.value)
+                buffer.clear()
+                started = false
+            }
+            continue
+        }
+        started = true
+        if quote != 39 && c == 92 {
+            if i == command.len { return Words { ok: false, args: [] } }
+            next := command[i]
+            i += 1
+            if quote != 0 && next != quote && next != 92 { buffer.push(u8(c)) }
+            buffer.push(u8(next))
+        } else if quote != 0 && c == quote {
+            quote = 0
+        } else if quote == 0 && (c == 39 || c == 34) {
+            quote = c
+        } else {
+            buffer.push(u8(c))
+        }
+    }
+    if quote != 0 { return Words { ok: false, args: [] } }
+    if started {
+        decoded := bytes.decode(&buffer)
+        words.push(move decoded.value)
+    }
+    Words { ok: true, args: words }
+}
+
+impl Runners {
+    pub fn new(specs: &[]string) -> Self {
+        mut entries: []Runner = [Runner { target: process.host_target(), args: [] }]
+        for specification in specs {
+            equal := text.find(specification, "=")
+            if equal < 0 { return Self { error: "--runner requires a native TARGET=COMMAND", entries: [] } }
+            target := specification[0..equal]
+            command := split_words(specification[(equal + 1)..specification.len])
+            if (target != "arm64-macos" && target != "arm64-linux" && target != "x86_64-linux") ||
+               !command.ok || command.args.len == 0 {
+                return Self { error: "--runner requires a native TARGET=COMMAND", entries: [] }
+            }
+            mut at := 0
+            while at < entries.len && entries[at].target != target { at += 1 }
+            replacement := Runner { target: target, args: command.args }
+            if at == entries.len { entries.push(move replacement) }
+            else { entries[at] = replacement }
+        }
+        Self { error: "", entries: entries }
+    }
+
+    pub fn can_run(&self, target: string) -> bool {
+        for runner in self.entries {
+            if runner.target == target { return true }
+        }
+        false
+    }
+
+    pub fn targets(&self) -> string {
+        mut result := ""
+        for i in 0..self.entries.len {
+            if i > 0 { result = result + ", " }
+            result = result + self.entries[i].target
+        }
+        result
+    }
+
+    pub fn run(&self, target: string, image: string, extra: []string, cwd: string, status: i32, out: &mut process.Output) -> bool {
+        for index in 0..self.entries.len {
+            if self.entries[index].target != target { continue }
+            args := &self.entries[index].args
+            if args.len == 0 {
+                return harness.run_checked(image, extra, cwd, status, false, &mut out)
+            }
+            mut argv: []string = []
+            for i in 1..args.len { argv.push(args[i].clone()) }
+            argv.push(image.clone())
+            for arg in extra { argv.push(arg.clone()) }
+            return harness.run_checked(args[0], argv, cwd, status, false, &mut out)
+        }
+        harness.fail(f"no runner for {target}")
+    }
+}
+
+pub fn direct_flags() -> []string {
+    ["--scalar-opt=off", "--ownership-opt=off", "--mir=off"]
+}
+
+fn executable(path: string) -> bool {
+    if !sys.metadata(path).is_file { return false }
+    mut terminated: []u8 = []
+    bytes.append_utf8(&mut terminated, path)
+    terminated.push(u8(0))
+    unsafe { executable_access(addr(&terminated[0]), 1) == 0 }
+}
+
+fn absolute_executable(path: string) -> string {
+    if !executable(path) { return "" }
+    if text.starts_with(path, "/") { return path.clone() }
+    cwd := fs.cwd()
+    if cwd.ok { return cwd.value + "/" + path }
+    ""
+}
+
+pub fn find_executable(program: string) -> string {
+    if program.len == 0 { return "" }
+    if text.find(program, "/") >= 0 { return absolute_executable(program) }
+    path := process.env("PATH")
+    dirs := text.split(if path.ok { path.value.clone() } else { "/bin:/usr/bin" }, ":")
+    for dir in dirs {
+        candidate := if dir.len == 0 { "./" + program } else { dir + "/" + program }
+        path := absolute_executable(candidate)
+        if path.len > 0 { return path }
+    }
+    ""
+}
+
+pub fn image_header(data: &[]u8, target: string) -> bool {
+    if target == "arm64-macos" {
+        return data.len >= 4 && data[0] == 207 && data[1] == 250 && data[2] == 237 && data[3] == 254
+    }
+    if target == "wasm32" { return data.len >= 8 && bytes.equals_text(&data, 0, 8, "\0asm\x01\0\0\0") }
+    if data.len < 20 || !bytes.equals_text(&data, 0, 6, "\x7fELF\x02\x01") { return false }
+    mut reader := wire.Reader::new()
+    reader.pos = 18
+    machine := reader.read_u16_le(&data)
+    (target == "arm64-linux" && machine == u16(183)) || (target == "x86_64-linux" && machine == u16(62))
+}
+
+pub fn static_elf(data: &[]u8) -> bool {
+    if data.len < 58 || !bytes.equals_text(&data, 0, 6, "\x7fELF\x02\x01") { return false }
+    mut reader := wire.Reader::new()
+    reader.pos = 32
+    offset := reader.read_u64_le(&data)
+    reader.pos = 54
+    size := i32(reader.read_u16_le(&data))
+    count := i32(reader.read_u16_le(&data))
+    if offset > u64(data.len) || (count != 0 && size < 4) ||
+       u64(count) * u64(size) > u64(data.len) - offset { return false }
+    for i in 0..count {
+        reader.pos = i32(offset) + i * size
+        kind := reader.read_u32_le(&data)
+        if kind == u32(2) || kind == u32(3) { return false }
+    }
+    reader.ok
+}
+
+pub struct ImageCounts {
+    ok: bool,
+    builds: i32,
+    executions: i32,
+}
+
+pub fn library_images(compiler: string, root: string, work: string, name: string, runners: &Runners,
+                      runtime: fn(&Runners, string, string, string) -> bool) -> ImageCounts {
+    host := process.host_target()
+    source := f"{root}/tests/{name}.ddr"
+    mut counts := ImageCounts { ok: false, builds: 0, executions: 0 }
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        for mode in 0..2 {
+            mut serial: []u8 = []
+            for jobs in [1, 4] {
+                if jobs == 4 && (host != "arm64-macos" || target != host) { break }
+                image := f"{work}/{name}-{target}-{mode}-{jobs}"
+                mut args: []string = ["build", source.clone(), "--target", target.clone(), "--jobs", jobs.str(), "-o", image.clone()]
+                if mode == 1 {
+                    for flag in move direct_flags() { args.push(move flag) }
+                }
+                if !harness.run_checked(compiler, args, root, 0, false, &mut result) { return counts }
+                counts.builds += 1
+                data := sys.read_u8(image)
+                if !data.ok { _ := harness.fail(f"cannot read {image}"); return counts }
+                if jobs == 1 { serial = data.value }
+                else if !bytes.equal(&serial, &data.value) {
+                    _ := harness.fail(f"{target} mode {mode}: serial and parallel {name} images differ")
+                    return counts
+                }
+                if runners.can_run(target) {
+                    if !runtime(&runners, target, image, root) { return counts }
+                    counts.executions += 1
+                }
+            }
+        }
+    }
+    counts.ok = true
+    counts
+}

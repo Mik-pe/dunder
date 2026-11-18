@@ -1,0 +1,299 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Program {
+    name: string,
+    output: string,
+    trap: bool,
+}
+
+fn program(name: string, output: string, trap: bool) -> Program {
+    Program { name: name.clone(), output: output.clone(), trap: trap }
+}
+
+fn programs() -> []Program {
+    [
+        program("pod", "pod aggregate arrays ok\n", false),
+        program("owned", "owned aggregate arrays ok\n", false),
+        program("enums", "enum aggregate arrays ok\n", false),
+        program("nested", "nested aggregate arrays ok\n", false),
+        program("c_layout", "c layout aggregate arrays ok\n", false),
+        program("recursive", "recursive aggregate arrays ok\n", false),
+        program("resources", "resource aggregate arrays ok\n", false),
+        program("scratch", "scratch aggregate compatibility ok\n", false),
+        program("remove", "ordered array removal ok\n", false),
+        program("inference", "integer array inference, length names and string owners ok\n", false),
+        program("tuples", "7\n17\n8\n18\n19\n9\ntuple returns ok\n", false),
+        program("remove-negative", "", true),
+        program("remove-past-end", "", true),
+        program("remove-empty", "", true),
+    ]
+}
+
+fn wasm_code() -> string {
+    "'use strict';\n" +
+    "const assert = require('node:assert/strict');\n" +
+    "const fs = require('node:fs');\n" +
+    "const moduleImage = new WebAssembly.Module(fs.readFileSync(process.argv[2]));\n" +
+    "let instance;\n" +
+    "const print = value => process.stdout.write(String(value) + '\\n');\n" +
+    "const host = {\n" +
+    "    print_i32: print,\n" +
+    "    print_i64: print,\n" +
+    "    print_u32: value => print(value >>> 0),\n" +
+    "    print_u64: value => print(BigInt.asUintN(64, value)),\n" +
+    "    print_bool: value => print(value === 0 ? 'false' : 'true'),\n" +
+    "    print_rune: value => print(String.fromCodePoint(value)),\n" +
+    "    print_string: pointer => {\n" +
+    "        const memory = instance.exports.memory.buffer;\n" +
+    "        const address = pointer >>> 0;\n" +
+    "        assert.ok(address + 8 <= memory.byteLength, 'invalid string header');\n" +
+    "        const length = new DataView(memory).getBigUint64(address, true);\n" +
+    "        assert.ok(length <= BigInt(memory.byteLength - address - 8), 'invalid string bytes');\n" +
+    "        const bytes = new Uint8Array(memory, address + 8, Number(length));\n" +
+    "        print(new TextDecoder('utf-8', {fatal: true}).decode(bytes));\n" +
+    "    },\n" +
+    "};\n" +
+    "for (const item of WebAssembly.Module.imports(moduleImage)) {\n" +
+    "    assert.equal(item.kind, 'function', JSON.stringify(item));\n" +
+    "    assert.equal(item.module, 'dunder', JSON.stringify(item));\n" +
+    "    assert.equal(typeof host[item.name], 'function', 'unexpected host import ' + item.name);\n" +
+    "}\n" +
+    "instance = new WebAssembly.Instance(moduleImage, {dunder: host});\n" +
+    "assert.equal(typeof instance.exports.main, 'function');\n" +
+    "if (process.argv[3] === 'bounds') {\n" +
+    "    assert.throws(instance.exports.main, WebAssembly.RuntimeError);\n" +
+    "} else {\n" +
+    "    const result = instance.exports.main();\n" +
+    "    assert.ok(result === undefined || result === 0, 'nonzero main result ' + result);\n" +
+    "}\n"
+}
+
+struct Suite {
+    compiler: string,
+    root: string,
+    work: string,
+    fixtures: string,
+    node: string,
+    wasm_host: string,
+    host: string,
+    runners: native.Runners,
+    serial: bool,
+    images: i32,
+    native_runs: i32,
+    wasm_runs: i32,
+    checks: i32,
+    publications: i32,
+    comparisons: i32,
+}
+
+impl Suite {
+    fn execute_image(&mut self, image: string, target: string, expected: string, trap: bool) -> bool {
+        data := sys.read_u8(image)
+        if !data.ok || !native.image_header(&data.value, target) { return harness.fail(f"{image}: invalid {target} image header") }
+        mut result := harness.empty_output()
+        if target == "wasm32" {
+            action := if trap { "bounds" } else { "ok" }
+            if !harness.run_checked(self.node, [self.wasm_host.clone(), image.clone(), action], self.work, 0, false, &mut result) { return false }
+            self.wasm_runs += 1
+        } else if self.runners.can_run(target) {
+            status := if trap { 103 } else { 0 }
+            if !self.runners.run(target, image, [], self.work, status, &mut result) { return false }
+            self.native_runs += 1
+        } else {
+            return true
+        }
+        harness.stdout_is(&result, expected, image) && (result.stderr.len == 0 || harness.fail(result.stderr_text()))
+    }
+
+    fn jobs(&self, target: string) -> i32 {
+        if !self.serial && target == self.host && self.host == "arm64-macos" { return 2 }
+        1
+    }
+}
+
+fn target_options(target: string, mode: string, jobs: i32) -> []string {
+    mut options: []string = ["--target", target.clone(), "--jobs", jobs.str()]
+    if mode == "direct" {
+        for flag in move native.direct_flags() { options.push(move flag) }
+    }
+    options
+}
+
+fn build_valid(suite: &mut Suite, item: &Program, targets: &[]string) -> bool {
+    source := f"{suite.fixtures}/{item.name}.ddr"
+    mut result := harness.empty_output()
+    for target in targets {
+        for mode in ["default", "direct"] {
+            for i in 0..suite.jobs(target) {
+                jobs := if i == 0 { 1 } else { 4 }
+                image := f"{suite.work}/{item.name}-{target}-{mode}-{jobs}"
+                options := target_options(target, mode, jobs)
+                mut args: []string = ["build", source.clone(), "-o", image.clone()]
+                for flag in options { args.push(flag.clone()) }
+                if !harness.run_checked(suite.compiler, args, suite.root, 0, false, &mut result) ||
+                   !suite.execute_image(image, target, item.output, item.trap) { return false }
+                suite.images += 1
+            }
+        }
+    }
+    print(f"PASS aggregate arrays {item.name} native3 + executed Wasm, default/direct MIR")
+    true
+}
+
+fn check_invalid(suite: &mut Suite, name: string, expected: string, targets: &[]string) -> bool {
+    source := suite.fixtures + "/" + name
+    image := suite.work + "/previous-image"
+    mut diagnostic := ""
+    mut result := harness.empty_output()
+    for target in targets {
+        for mode in ["default", "direct"] {
+            for i in 0..suite.jobs(target) {
+                jobs := if i == 0 { 1 } else { 4 }
+                options := target_options(target, mode, jobs)
+                mut check: []string = ["check", source.clone(), "--agent"]
+                mut build: []string = ["build", source.clone(), "-o", image.clone()]
+                for flag in options { check.push(flag.clone()); build.push(flag.clone()) }
+                if !harness.run_checked(suite.compiler, check, suite.root, 1, false, &mut result) { return false }
+                report := result.stdout_text()
+                message := harness.agent_error_message(report, source, expected, "E1000")
+                if message.len == 0 { return false }
+                if diagnostic.len == 0 { diagnostic = report.clone() }
+                if diagnostic != report { return harness.fail(f"{source}: diagnostic changed for {target}, {mode}, jobs {jobs}\n{diagnostic}\n{report}") }
+                if !sys.write_text(image, "previous valid image").ok { return false }
+                if !harness.run_checked(suite.compiler, build, suite.root, 1, false, &mut result) { return false }
+                previous := sys.read_text(image)
+                if text.find(result.stderr_text(), message) < 0 || !previous.ok || previous.value != "previous valid image" {
+                    return harness.fail(f"{source}: failed build changed the output or diagnostic:\n{result.stderr_text()}")
+                }
+                suite.checks += 1
+                suite.publications += 1
+            }
+        }
+    }
+    print(f"PASS aggregate diagnostic {harness.stem(name)}")
+    true
+}
+
+fn check_cache(suite: &mut Suite) -> bool {
+    project := suite.work + "/cached-project"
+    if !fs.mkdir_all(project).ok || !harness.copy_ddr_files(suite.fixtures, project) { return false }
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        for mode in ["default", "direct"] {
+            cold := f"{suite.work}/cold-{target}-{mode}"
+            warm := f"{suite.work}/warm-{target}-{mode}"
+            mut old_emitted: i64 = 0
+            for stage in 0..2 {
+                image := if stage == 0 { cold.clone() } else { warm.clone() }
+                options := target_options(target, mode, 1)
+                mut args: []string = ["build", project + "/owned.ddr", "--incremental", "--timings=json", "-o", image.clone()]
+                for flag in options { args.push(flag.clone()) }
+                if !harness.run_checked(suite.compiler, args, project, 0, false, &mut result) { return false }
+                report := result.stderr_text()
+                doc := json.Doc::parse_text(report)
+                functions := doc.field(doc.root, "functions")
+                reused := doc.get_i64(functions, "reused")
+                emitted := doc.get_i64(functions, "emitted")
+                if !doc.ok || !reused.ok || !emitted.ok ||
+                   (stage == 0 && reused.value != 0) ||
+                   (stage == 1 && (reused.value <= 0 || emitted.value >= old_emitted)) {
+                    return harness.fail(f"{target} {mode}: unexpected incremental counters: {report}")
+                }
+                old_emitted = emitted.value
+            }
+            before := sys.read_u8(cold)
+            after := sys.read_u8(warm)
+            if !before.ok || !after.ok || !bytes.equal(&before.value, &after.value) {
+                return harness.fail(f"{target} {mode}: cold/warm images differ")
+            }
+            suite.images += 2
+            suite.comparisons += 1
+            if !suite.execute_image(cold, target, "owned aggregate arrays ok\n", false) ||
+               !suite.execute_image(warm, target, "owned aggregate arrays ok\n", false) { return false }
+        }
+    }
+    print("PASS aggregate callbacks in cold/warm incremental images")
+    true
+}
+
+fn selected(cases: &[]string, name: string) -> bool {
+    if cases.len == 0 { return true }
+    for item in cases {
+        if item == name { return true }
+    }
+    false
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--runner"), cli.option("--node"), cli.flag("--serial"), cli.option("--case"), cli.flag("--skip-cache")]
+    args := cli.parse(&spec)
+    usage := "usage: test_aggregate_arrays <compiler> [--runner TARGET=COMMAND] [--node PATH] [--serial] [--case NAME] [--skip-cache]"
+    compiler := cli.compiler(&args, usage)
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    specs := args.all("--runner")
+    runners := native.Runners::new(&specs)
+    if runners.error.len != 0 { _ := sys.eprint(runners.error); return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    fixtures := root + "/tests/fixtures/aggregate_arrays"
+    fixtures_ok := harness.fixture_diagnostics(root)
+    if !fixtures_ok.ok { _ := harness.fail("cannot load fixture diagnostics"); return 1 }
+    invalid := harness.invalid_fixture_names(fixtures)
+    positive := programs()
+    picks := args.all("--case")
+    for pick in picks {
+        mut found := false
+        for item in positive {
+            if item.name == pick { found = true }
+        }
+        for name in invalid {
+            if harness.stem(name) == pick { found = true }
+        }
+        if !found { _ := sys.eprint(f"unknown fixture: {pick}"); return 2 }
+    }
+    mut node := ""
+    for item in positive {
+        if selected(&picks, item.name) {
+            node = native.find_executable(args.last("--node", "node"))
+            if node.len == 0 { _ := sys.eprint("Node is required for the Wasm runtime matrix; provide --node PATH"); return 2 }
+            break
+        }
+    }
+    tmp := fs.temp_dir("dunder-aggregate-arrays-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    work := fs.realpath(tmp.value)
+    if !work.ok { return 1 }
+    wasm_host := work.value + "/wasm-host.cjs"
+    if !sys.write_text(wasm_host, wasm_code()).ok { return 1 }
+    mut suite := Suite {
+        compiler: compiler, root: root, work: work.value, fixtures: fixtures, node: node, wasm_host: wasm_host,
+        host: process.host_target(), runners: runners, serial: args.has("--serial"),
+        images: 0, native_runs: 0, wasm_runs: 0, checks: 0, publications: 0, comparisons: 0,
+    }
+    mut targets := harness.targets()
+    targets.push("wasm32")
+    for i in 0..positive.len {
+        if selected(&picks, positive[i].name) && !build_valid(&mut suite, &positive[i], &targets) { return 1 }
+    }
+    for name in invalid {
+        if !selected(&picks, harness.stem(name)) { continue }
+        expected := fixtures_ok.get_str(fixtures_ok.root, "aggregate_arrays/" + name)
+        if !expected.ok || expected.value.len == 0 { _ := harness.fail(f"missing diagnostic for {name}"); return 1 }
+        if !check_invalid(&mut suite, name, expected.value, &targets) { return 1 }
+    }
+    if selected(&picks, "owned") && !args.has("--skip-cache") && !check_cache(&mut suite) { return 1 }
+    print(f"aggregate arrays: {suite.images} native/Wasm images, {suite.native_runs} native executions ({suite.runners.targets()}), {suite.wasm_runs} Wasm executions, {suite.checks} exact diagnostics, {suite.publications} preserved failed outputs, {suite.comparisons} cold/warm comparisons; POD/owning records, payload enums, nested arrays, recursive cloneability and scratch compatibility passed")
+    0
+}

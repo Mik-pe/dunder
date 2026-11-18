@@ -1,0 +1,233 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Binaries {
+    ffi: string,
+    pure: string,
+}
+
+fn probe_command(image: string, args: []string, initial_path: string) -> process.Command {
+    mut command := process.command(image.clone(), args.clone())
+    command.set_env("PATH", initial_path + ":/usr/bin:/bin")
+    command.set_env("DUNDER_ENV_CHANGED", "original")
+    command.set_env("DUNDER_ENV_DELETED", "delete-me")
+    command.unset_env("DUNDER_ENV_ADDED")
+    command.unset_env("DUNDER_ENV_EMPTY")
+    command
+}
+
+fn capture(command: &process.Command, output: &mut process.Output, pid: &mut i32) -> bool {
+    spawned := process.spawn(&command)
+    if !spawned.ok { return harness.fail(f"cannot spawn environment probe: {spawned.error}") }
+    mut child := spawned.child
+    pid = child.pid()
+    child.close_stdin()
+    mut pool := process.ChildSet::new(1)
+    slot := pool.insert(&mut child)
+    if slot < 0 { return harness.fail("cannot track environment probe") }
+    mut stdout: []u8 = []
+    mut stderr: []u8 = []
+    deadline := sys.now_ms() + 10000
+    while true {
+        status := pool.try_wait(slot, &mut stdout, &mut stderr)
+        if !status.ok { return harness.fail(f"wait failed: {status.error}") }
+        if status.exited {
+            output = process.Output { ok: true, error: 0, code: status.code, signal: status.signal, timed_out: false, stdout: stdout, stderr: stderr }
+            return (output.succeeded() && output.stderr.len == 0) ||
+                   harness.fail(f"environment probe exited {status.code}, signal {status.signal}\n{output.stdout_text()}\n{output.stderr_text()}")
+        }
+        remaining := deadline - sys.now_ms()
+        if remaining <= 0 {
+            _ := pool.kill_reap(slot, &mut stdout, &mut stderr)
+            return harness.fail("environment probe timed out")
+        }
+        _ := pool.wait_any(remaining)
+    }
+    false
+}
+
+fn env_is(doc: &json.Doc, name: string, expected: string, found: bool) -> bool {
+    value := doc.get_str(doc.root, name)
+    exists := doc.get_bool(doc.root, name + "_found")
+    value.ok && exists.ok && value.value == expected && exists.value == found
+}
+
+fn check_mode(image: string, mode: string, initial: string, changed: string) -> bool {
+    command := probe_command(image, [mode.clone(), changed.clone()], initial)
+    mut result := harness.empty_output()
+    mut child := 0
+    if !capture(&command, &mut result, &mut child) { return false }
+    output := result.stdout_text()
+    doc := json.Doc::parse_text(output)
+    override := mode == "override"
+    expected_added := if override { "child override" } else { "added å 🌍" }
+    expected_changed := if override { "" } else { "changed" }
+    argv0 := if mode == "replace-as" { "live-environment-alias" } else { "dunder-live-environment" }
+    pid := doc.get_i64(doc.root, "pid")
+    if !doc.ok || !env_is(&doc, "DUNDER_ENV_ADDED", expected_added, true) ||
+       !env_is(&doc, "DUNDER_ENV_CHANGED", expected_changed, !override) ||
+       !env_is(&doc, "DUNDER_ENV_DELETED", "", false) || !env_is(&doc, "DUNDER_ENV_EMPTY", "", true) ||
+       doc.get_str(doc.root, "argv0").value != argv0 ||
+       !pid.ok || (pid.value == i64(child)) != text.starts_with(mode, "replace") {
+        return harness.fail(f"{mode}: unexpected environment or process identity:\n{output}")
+    }
+    true
+}
+
+fn check_clear(image: string, initial: string) -> bool {
+    command := probe_command(image, ["clear"], initial)
+    mut result := harness.empty_output()
+    mut child := 0
+    if !capture(&command, &mut result, &mut child) { return false }
+    output := result.stdout_text()
+    mut reports: []string = []
+    for line in move harness.lines(output) {
+        if text.trim(line).len > 0 { reports.push(move line) }
+    }
+    if reports.len != 2 { return harness.fail(f"clear: expected two reports:\n{output}") }
+    for i in 0..reports.len {
+        doc := json.Doc::parse_text(reports[i])
+        pid := doc.get_i64(doc.root, "pid")
+        if !doc.ok || !pid.ok || (pid.value == i64(child)) != (i == 1) ||
+           (i == 1 && doc.get_str(doc.root, "argv0").value != "cleared-environment") {
+            return harness.fail(f"clear: unexpected process identity:\n{reports[i]}")
+        }
+        for key in ["ADDED", "CHANGED", "DELETED", "EMPTY"] {
+            if !env_is(&doc, "DUNDER_ENV_" + key, "", false) { return harness.fail(f"clear: environment leaked:\n{reports[i]}") }
+        }
+    }
+    true
+}
+
+fn check_static(path: string) -> bool {
+    data := sys.read_u8(path)
+    (data.ok && native.static_elf(&data.value)) || harness.fail(f"{path}: pure process ELF acquired dynamic dependencies")
+}
+
+fn check_pair(pair: &Binaries, work: string, linux: bool) -> bool {
+    initial := work + "/initial path"
+    changed := work + "/changed path"
+    if !fs.mkdir_all(initial).ok || !fs.mkdir_all(changed).ok ||
+       !fs.symlink("/usr/bin/false", initial + "/dunder-live-environment").ok ||
+       !fs.symlink(pair.ffi, changed + "/dunder-live-environment").ok {
+        return harness.fail(f"cannot prepare environment probe under {work}")
+    }
+    for mode in ["spawn", "override", "replace", "replace-as"] {
+        if !check_mode(pair.ffi, mode, initial, changed) { return false }
+    }
+    unset := probe_command(pair.ffi, ["unset-path", changed.clone()], initial)
+    mut result := harness.empty_output()
+    mut pid := 0
+    if !capture(&unset, &mut result, &mut pid) || !harness.stdout_is(&result, "default-path", "unset-path") { return false }
+    if linux && (!check_clear(pair.ffi, initial) || !check_static(pair.pure)) { return false }
+    pure := probe_command(pair.pure, [], initial)
+    capture(&pure, &mut result, &mut pid) && harness.stdout_is(&result, "pure inherited environment\n", "pure environment")
+}
+
+fn build_pair(compiler: string, root: string, work: string, target: string, mode: i32) -> Binaries {
+    mut images: []string = []
+    mut result := harness.empty_output()
+    for source in ["process_environment", "process_environment_pure"] {
+        image := f"{work}/{source}-{target}-{mode}"
+        mut args: []string = ["build", f"{root}/tests/{source}.ddr", "--target", target.clone(), "--jobs", "1", "-o", image.clone()]
+        if mode == 1 {
+            for flag in move native.direct_flags() { args.push(move flag) }
+        }
+        if !harness.run_checked(compiler, args, root, 0, false, &mut result) ||
+           (source == "process_environment_pure" && text.ends_with(target, "-linux") && !check_static(image)) {
+            return Binaries { ffi: "", pure: "" }
+        }
+        images.push(move image)
+    }
+    Binaries { ffi: images[0].clone(), pure: images[1].clone() }
+}
+
+fn write_receipt(path: string, host: string, builds: i32, hashes: &[]Binaries, started: i64) -> bool {
+    parent := harness.parent_dir(path)
+    if parent.len > 0 && !fs.mkdir_all(parent).ok { return harness.fail(f"cannot create {parent}") }
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("schema")
+    writer.string("dunder-process-environment-verification/v1")
+    writer.key("host_target")
+    writer.string(host)
+    writer.key("builds")
+    writer.integer(i64(builds))
+    writer.key("executions")
+    writer.integer(i64(hashes.len))
+    writer.key("binaries")
+    writer.array()
+    for hash in hashes {
+        writer.object()
+        writer.key("ffi")
+        writer.string(hash.ffi)
+        writer.key("pure")
+        writer.string(hash.pure)
+        writer.end()
+    }
+    writer.end()
+    writer.key("seconds")
+    writer.decimal(f64(sys.now_ms() - started) / 1000.0)
+    writer.key("passed")
+    writer.boolean(true)
+    writer.end()
+    evidence.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--binary"), cli.option("--pure-binary"), cli.option("--receipt")]
+    args := cli.parse(&spec)
+    usage := "usage: test_process_environment [compiler | --binary IMAGE --pure-binary IMAGE] [--receipt PATH]"
+    if args.help { print(usage); return 0 }
+    provided := args.has("--binary")
+    if args.error.len > 0 { _ := sys.eprint(args.error + "\n" + usage); return 2 }
+    if (provided && args.positionals.len != 0) || (!provided && args.positionals.len != 1) || provided != args.has("--pure-binary") {
+        _ := sys.eprint("provide a compiler, or both --binary and --pure-binary\n" + usage)
+        return 2
+    }
+    host := process.host_target()
+    started := sys.now_ms()
+    tmp := fs.temp_dir("dunder-process-environment-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    mut builds := 0
+    mut runnable: []Binaries = []
+    if provided {
+        ffi := fs.realpath(args.last("--binary", ""))
+        pure := fs.realpath(args.last("--pure-binary", ""))
+        if !ffi.ok || !pure.ok { _ := harness.fail("cannot locate both binaries"); return 1 }
+        runnable.push(Binaries { ffi: ffi.value, pure: pure.value })
+    } else {
+        compiler := cli.compiler(&args, usage)
+        if compiler.len == 0 { return 2 }
+        root := harness.find_root()
+        if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+        for target in harness.targets() {
+            for mode in 0..2 {
+                pair := build_pair(compiler, root, work, target, mode)
+                if pair.ffi.len == 0 { return 1 }
+                builds += 2
+                if target == host { runnable.push(move pair) }
+            }
+        }
+    }
+    mut hashes: []Binaries = []
+    for i in 0..runnable.len {
+        if !check_pair(&runnable[i], f"{work}/run-{i}", text.ends_with(host, "-linux")) { return 1 }
+        hashes.push(Binaries { ffi: harness.sha256_file_hex(runnable[i].ffi), pure: harness.sha256_file_hex(runnable[i].pure) })
+    }
+    receipt := args.last("--receipt", "")
+    if receipt.len > 0 && !write_receipt(receipt, host, builds, &hashes, started) { return 1 }
+    print(f"Process environment: {builds} builds, {hashes.len} live executions passed")
+    0
+}
