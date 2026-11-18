@@ -309,7 +309,7 @@ Wasm avbryter den aktuella körningen med en trap.
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
 python3 tools/test-runtime-contracts.py "$dunder_bin"
-python3 tools/test-array-moves.py "$dunder_bin"
+"$dunder_bin" run tools/test_array_moves.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_resource_moves.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_resource_ownership.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_stdlib_ownership.ddr -- "$dunder_bin"

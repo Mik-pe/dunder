@@ -1,0 +1,211 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .source_rejections as reject
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Run {
+    compiler: string,
+    root: string,
+    work: string,
+    host: string,
+    builds: i32,
+    diagnostics: i32,
+    api_images: i32,
+}
+
+fn targets() -> []string { ["arm64-macos", "arm64-linux", "x86_64-linux", "wasm32"] }
+
+fn flags(mode: i32) -> []string {
+    if mode == 0 { return [] }
+    if mode == 1 { return native.direct_flags() }
+    if mode == 2 { return ["--scalar-opt=on", "--ownership-opt=off", "--mir=on"] }
+    ["--scalar-opt=off", "--ownership-opt=on", "--mir=on"]
+}
+
+fn put(path: string, program: string) -> bool {
+    sys.write_text(path, program).ok || harness.fail(f"cannot write {path}")
+}
+
+fn expected_output(program: string, args: []string, work: string, expected: string) -> bool {
+    mut result := harness.empty_output()
+    harness.run_checked(program, args, work, 0, false, &mut result) &&
+        harness.stdout_is(&result, expected, program)
+}
+
+fn valid_image(path: string, target: string) -> bool {
+    image := sys.read_u8(path)
+    (image.ok && native.image_header(&image.value, target)) || harness.fail(f"{path}: wrong image format for {target}")
+}
+
+fn test_image(run: &Run, image: string, target: string) -> bool {
+    if target == run.host { return expected_output(image, [], run.work, "interpolation ok\n") }
+    if target != "wasm32" { return true }
+    loader := "const image = new WebAssembly.Module(require('node:fs').readFileSync(process.argv[1]));\n" +
+        "const instance = new WebAssembly.Instance(image, {dunder: {print_string: ptr => {\n" +
+        "    const memory = instance.exports.memory.buffer;\n" +
+        "    const length = Number(new DataView(memory).getBigUint64(ptr, true));\n" +
+        "    console.log(new TextDecoder().decode(new Uint8Array(memory, ptr + 8, length)));\n" +
+        "}}});\ninstance.exports.main();\n"
+    expected_output("node", ["-e", loader, image.clone()], run.work, "interpolation ok\n")
+}
+
+fn compare_cli(run: &mut Run, source: string) -> bool {
+    mut output := harness.empty_output()
+    for target in targets() {
+        workers: []string = if target == "arm64-macos" && target == run.host { ["1", "4"] } else { ["1"] }
+        for mode in 0..4 {
+            for jobs in workers {
+                image := f"{run.work}/fixture-{target}-{mode}-{jobs}"
+                mut args: []string = ["build", source.clone(), "-o", image.clone(), "--target", target.clone(), "--jobs", jobs.clone()]
+                for flag in move flags(mode) { args.push(move flag) }
+                if !harness.run_checked(run.compiler, args, run.root, 0, false, &mut output) ||
+                   !valid_image(image, target) || !test_image(&run, image, target) { return false }
+                run.builds += 1
+            }
+        }
+        if target == "wasm32" { continue }
+        cached := f"{run.work}/cached-{target}"
+        args: []string = ["build", source.clone(), "-o", cached.clone(), "--target", target.clone(), "--incremental", "--timings=json"]
+        if !harness.run_checked(run.compiler, args, run.root, 0, false, &mut output) { return false }
+        first := sys.read_u8(cached)
+        if !first.ok || !harness.run_checked(run.compiler, args, run.root, 0, false, &mut output) { return false }
+        last := sys.read_u8(cached)
+        if !last.ok || !bytes.equal(&first.value, &last.value) || !native.image_header(&last.value, target) ||
+           !test_image(&run, cached, target) {
+            return harness.fail(f"warm compiler image changed for {target}")
+        }
+        run.builds += 2
+    }
+    true
+}
+
+fn check_rejections(run: &mut Run) -> bool {
+    mut result := harness.empty_output()
+    for entry in move rejections() {
+        (name, body, message) := entry
+        source := f"{run.work}/invalid-{name}.ddr"
+        if !put(source, body + "\n") { return false }
+        for target in targets() {
+            check: []string = ["check", source.clone(), "--agent", "--target", target.clone()]
+            if !harness.run_checked(run.compiler, check, run.work, 1, false, &mut result) { return false }
+            diagnostic := reject.inspect(result.stdout_text(), source, message, true)
+            flags: []string = ["--target", target.clone()]
+            if !diagnostic.ok || !reject.preserves_output(run.compiler, run.work, source, &flags, diagnostic.message) { return false }
+            run.diagnostics += 1
+        }
+    }
+    true
+}
+
+fn check_import(run: &mut Run) -> bool {
+    source := run.work + "/broken.ddr"
+    main := run.work + "/diagnostic-main.ddr"
+    program := "pub fn broken() -> string {\n    value := 42\n    return f\"å 🌍 {value} {missing_value}\"\n}\n"
+    if !put(source, program) || !put(main, "import broken\nfn main(){print(broken.broken())}\n") { return false }
+    start := text.find(program, "missing_value")
+    mut line := 1
+    mut column := 1
+    for i in 0..start {
+        byte := program[i]
+        if byte == 10 { line += 1; column = 1 }
+        else if byte < 128 || byte >= 192 { column += 1 }
+    }
+    location := f"{source}:{line}:{column}:"
+    mut result := harness.empty_output()
+    for target in targets() {
+        workers: []string = if target == "arm64-macos" && target == run.host { ["1", "4"] } else { ["1"] }
+        for jobs in workers {
+            if !harness.run_checked(run.compiler, ["check", main.clone(), "--agent", "--target", target.clone(), "--jobs", jobs.clone()],
+                                   run.work, 1, false, &mut result) { return false }
+            doc := json.Doc::parse_text(result.stdout_text())
+            first := doc.get_i64(doc.root, "start")
+            end := doc.get_i64(doc.root, "end")
+            if !doc.ok || doc.get_str(doc.root, "path").value != source || !first.ok || first.value != i64(start) ||
+               !end.ok || end.value != i64(start + "missing_value".len) {
+                return harness.fail(f"{target}: expanded module changed the original byte offsets\n{result.stdout_text()}")
+            }
+            if !harness.run_checked(run.compiler, ["check", main.clone(), "--target", target.clone(), "--jobs", jobs.clone()],
+                                   run.work, 1, false, &mut result) ||
+               text.find(result.stderr_text(), location) < 0 {
+                return harness.fail(f"{target}: expected diagnostic at {location}\n{result.stderr_text()}")
+            }
+            run.diagnostics += 1
+        }
+    }
+    true
+}
+
+fn check_api(run: &mut Run, source: string) -> bool {
+    api := run.work + "/api-consumer"
+    fixture := run.root + "/tests/fixtures/interpolation/api.ddr"
+    mut result := harness.empty_output()
+    if !harness.run_checked(run.compiler, ["build", fixture.clone(), "-o", api.clone()], run.root, 0, false, &mut result) {
+        return false
+    }
+    direct := run.work + "/direct.ddr"
+    if !put(direct, "fn main(){value:=40;print(f\"å \\n{{{value + 2:04X}}} {f'nested {true}'} \\0\") }\n") { return false }
+    for number in 0..3 {
+        target := harness.target_name(number)
+        for mode in ["direct", "source", "tokens"] {
+            input := if mode == "direct" { direct.clone() } else { source.clone() }
+            expected := if mode == "direct" { "å \n{002A} nested true \0\n" } else { "interpolation ok\n" }
+            image := f"{run.work}/api-{target}-{mode}"
+            if !expected_output(api, [input.clone(), number.str(), mode.clone(), image.clone()], run.work, "api ok\n") ||
+               !valid_image(image, target) { return false }
+            if target == run.host && !expected_output(image, [], run.work, expected) { return false }
+            run.api_images += 1
+        }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_interpolation COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    host := process.host_target()
+    if root.len == 0 || host.len == 0 { _ := harness.fail("cannot identify repository or native host"); return 2 }
+    directory := fs.temp_dir("dunder-interpolation-")
+    if !directory.ok { _ := harness.fail("cannot create interpolation test directory"); return 1 }
+    defer { _ := fs.remove_all(directory.value) }
+    canonical := fs.realpath(directory.value)
+    if !canonical.ok { _ := harness.fail("cannot resolve interpolation test directory"); return 1 }
+    source := root + "/tests/fixtures/interpolation/main.ddr"
+    mut run := Run { compiler: compiler, root: root, work: canonical.value, host: host, builds: 0, diagnostics: 0, api_images: 0 }
+    if !compare_cli(&mut run, source) || !check_rejections(&mut run) || !check_import(&mut run) || !check_api(&mut run, source) {
+        return 1
+    }
+    print(f"interpolation: {run.builds} CLI builds, {run.diagnostics} diagnostic contracts, {run.api_images} source/token API images; host and Wasm execution passed")
+    0
+}
+
+fn rejections() -> [](string, string, string) {
+    [
+        ("empty", "fn main(){print(f\"{}\")}", "interpol"),
+        ("comment-empty", "fn main(){print(f\"{/* only a comment */}\")}", "interpol"),
+        ("unclosed-hole", "fn main(){print(f\"{42\")}", ""),
+        ("closing-brace", "fn main(){print(f\"unexpected }\")}", "interpol"),
+        ("bad-delimiter", "fn main(){print(f\"{(42]}\")}", ""),
+        ("array", "fn main(){values:=[1,2];print(f\"{values}\")}", "str"),
+        ("record", "struct P{x:i32} fn main(){print(f\"{P{x:1}}\")}", "str"),
+        ("enum", "enum P{A,B} fn main(){print(f\"{P.A}\")}", "str"),
+        ("unit", "fn nothing(){} fn main(){print(f\"{nothing()}\")}", "str"),
+        ("empty-format", "fn main(){print(f\"{42:}\")}", "invalid integer interpolation format"),
+        ("unknown-format", "fn main(){print(f\"{42:b}\")}", "invalid integer interpolation format"),
+        ("wide-format", "fn main(){print(f\"{42:2147483648x}\")}", "invalid integer interpolation format"),
+        ("float-hex", "fn main(){print(f\"{42.0:x}\")}", "integer interpolation format requires an integer"),
+        ("string-hex", "fn main(){print(f\"{'name':x}\")}", "integer interpolation format requires an integer"),
+        ("reserved-method", "fn main(){print(42.__dunder_module_format_integer(\"x\"))}", "reserved compiler identifier"),
+    ]
+}

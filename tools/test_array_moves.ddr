@@ -1,0 +1,275 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .source_rejections as reject
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Run {
+    compiler: string,
+    root: string,
+    work: string,
+    host: string,
+    fixtures: string,
+    images: i32,
+    errors: i32,
+}
+
+fn flags(target: string, workers: string, mode: i32) -> []string {
+    mut args: []string = ["--target", target.clone(), "--jobs", workers.clone()]
+    if mode == 1 {
+        for arg in move native.direct_flags() { args.push(move arg) }
+    } else if mode == 2 {
+        args.push("--scalar-opt=on")
+        args.push("--ownership-opt=off")
+        args.push("--mir=on")
+    }
+    args
+}
+
+fn append_args(args: &mut []string, extra: &[]string) {
+    for option in extra { args.push(option.clone()) }
+}
+
+fn jobs(run: &Run, target: string) -> []string {
+    if target == "arm64-macos" && target == run.host { ["1", "4"] } else { ["1"] }
+}
+
+fn call(run: &Run, action: []string, cwd: string, status: i32, result: &mut process.Output) -> bool {
+    harness.run_checked(run.compiler, action, cwd, status, false, &mut result)
+}
+
+fn execute(run: &Run, image: string, expected: string, output: &mut process.Output) -> bool {
+    harness.run_checked(image, [], run.work, 0, false, &mut output) && harness.stdout_is(&output, expected, image)
+}
+
+fn build_modes(run: &mut Run, source: string, case_name: string, target: string, expected: string) -> bool {
+    mut result := harness.empty_output()
+    for mode in 0..3 {
+        for workers in jobs(&run, target) {
+            image := f"{run.work}/{case_name}-{run.images}"
+            mut args: []string = ["build", source.clone()]
+            options := flags(target, workers, mode)
+            append_args(&mut args, &options)
+            args.push("-o")
+            args.push(image.clone())
+            if !call(&run, args, run.root, 0, &mut result) { return false }
+            if target == run.host && !execute(&run, image, expected, &mut result) { return false }
+            run.images += 1
+        }
+    }
+    true
+}
+
+fn rejection(run: &Run, name: string, path: string, program: string, message: string, target: string) -> bool {
+    if !sys.write_text(path, program + "\n").ok { return harness.fail(f"cannot write {path}") }
+    check_use := name == "local" || name == "length" || name == "string-local" || name == "field"
+    use_at := i64(text.find(program, "print(a") + "print(".len)
+    mut previous := ""
+    mut result := harness.empty_output()
+    for mode in 0..2 {
+        for workers in jobs(&run, target) {
+            options := flags(target, workers, mode)
+            mut args: []string = ["check", path.clone(), "--agent"]
+            append_args(&mut args, &options)
+            if !call(&run, args, run.work, 1, &mut result) { return false }
+            raw := result.stdout_text()
+            diagnostic := reject.inspect(raw, path, message, false)
+            if !diagnostic.ok { return false }
+            if check_use && (diagnostic.start != use_at || diagnostic.end != use_at + 1) {
+                return harness.fail(f"{path}: diagnostic did not identify the invalid use\n{raw}")
+            }
+            if previous.len != 0 && previous != raw { return harness.fail(f"{path}: diagnostics changed across worker or backend modes\n{previous}\n{raw}") }
+            previous = raw
+            if !reject.preserves_output(run.compiler, run.work, path, &options, diagnostic.message) { return false }
+        }
+    }
+    true
+}
+
+fn check_no_clones(out: &process.Output, transfer: bool) -> bool {
+    doc := json.Doc::parse_text(out.stderr_text())
+    counts := doc.field(doc.root, "counters")
+    array_count := doc.get_i64(counts, "array_clone_calls")
+    record_count := doc.get_i64(counts, "record_clone_calls")
+    retain_count := doc.get_i64(counts, "retain_calls")
+    (doc.ok && array_count.ok && array_count.value == 0 && record_count.ok && record_count.value == 0 &&
+     (!transfer || (retain_count.ok && retain_count.value == 0))) || harness.fail(f"unexpected ownership or copy traffic\n{out.stderr_text()}")
+}
+
+fn check_strings_and_defaults(run: &mut Run) -> bool {
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        image := f"{run.work}/strings-{target}"
+        if !call(&run, ["build", run.fixtures + "/strings.ddr", "--target", target.clone(), "-o", image.clone()], run.root, 0, &mut result) ||
+           (target == run.host && !execute(&run, image, "string moves ok\n", &mut result)) { return false }
+        run.images += 1
+    }
+    for target in harness.targets() {
+        image := f"{run.work}/borrowed-{target}"
+        if !call(&run, ["build", run.fixtures + "/borrow-default.ddr", "--target", target.clone(), "--runtime-profile", "-o", image.clone()],
+                 run.root, 0, &mut result) { return false }
+        if target == run.host && (!execute(&run, image, "borrow defaults ok\n", &mut result) || !check_no_clones(&result, false)) { return false }
+        run.images += 1
+    }
+    true
+}
+
+fn cache_matrix(run: &mut Run) -> bool {
+    project := run.work + "/cached-project"
+    if !fs.mkdir_all(project).ok || !harness.copy_ddr_files(run.fixtures, project) { return false }
+    source := project + "/valid.ddr"
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        cold := f"{run.work}/cold-{target}"
+        warm := f"{run.work}/warm-{target}"
+        if !call(&run, ["build", source.clone(), "--target", target.clone(), "--incremental", "--timings=json", "-o", cold.clone()],
+                 project, 0, &mut result) { return false }
+        first := json.Doc::parse_text(result.stderr_text())
+        if !call(&run, ["build", source.clone(), "--target", target.clone(), "--incremental", "--timings=json", "-o", warm.clone()],
+                 project, 0, &mut result) { return false }
+        last := json.Doc::parse_text(result.stderr_text())
+        old_funcs := first.field(first.root, "functions")
+        new_funcs := last.field(last.root, "functions")
+        cold_reuse := first.get_i64(old_funcs, "reused")
+        cold_emit := first.get_i64(old_funcs, "emitted")
+        warm_reuse := last.get_i64(new_funcs, "reused")
+        warm_emit := last.get_i64(new_funcs, "emitted")
+        old := sys.read_u8(cold)
+        new := sys.read_u8(warm)
+        if !first.ok || !last.ok || !cold_reuse.ok || cold_reuse.value != 0 || !warm_reuse.ok || warm_reuse.value <= 0 ||
+           !cold_emit.ok || !warm_emit.ok || warm_emit.value >= cold_emit.value ||
+           !old.ok || !new.ok || !bytes.equal(&old.value, &new.value) {
+            return harness.fail(f"{target}: cache did not reuse fragments and preserve image bytes\n{result.stderr_text()}")
+        }
+        if target == run.host && !execute(&run, warm, "array moves ok\n", &mut result) { return false }
+        run.images += 2
+    }
+    true
+}
+
+fn check_task_and_transfer(run: &mut Run) -> bool {
+    mut result := harness.empty_output()
+    profile := run.work + "/profile"
+    if !call(&run, ["build", run.fixtures + "/profile.ddr", "--runtime-profile", "-o", profile.clone()], run.root, 0, &mut result) ||
+       !execute(&run, profile, "42\n", &mut result) || !check_no_clones(&result, true) { return false }
+    if run.host != "arm64-macos" { return true }
+    task := run.work + "/task"
+    if !call(&run, ["build", run.fixtures + "/task.ddr", "-o", task.clone()], run.root, 0, &mut result) ||
+       !execute(&run, task, "task moves ok\n", &mut result) { return false }
+    for row in move task_rejections() {
+        (name, program, message) := row
+        if !rejection(&run, name, f"{run.work}/task-invalid-{name}.ddr", program, message, "arm64-macos") { return false }
+        run.errors += 1
+    }
+    true
+}
+
+fn run_suite(run: &mut Run) -> bool {
+    valid := run.fixtures + "/valid.ddr"
+    references := run.fixtures + "/references.ddr"
+    for target in harness.targets() {
+        if !build_modes(&mut run, valid, "valid", target, "array moves ok\n") { return false }
+        for row in move ownership_rejections() {
+            (name, program, message) := row
+            if !rejection(&run, name, f"{run.work}/invalid-{name}.ddr", program, message, target) { return false }
+            run.errors += 1
+        }
+    }
+    for target in harness.targets() {
+        if !build_modes(&mut run, references, "references", target, "reference contexts ok\n") { return false }
+    }
+    if !check_strings_and_defaults(&mut run) || !cache_matrix(&mut run) || !check_task_and_transfer(&mut run) { return false }
+    print(f"array moves: {run.images} native images, {run.errors} rejected ownership contracts; readonly call/loop defaults, move/clone/callback/cache modes and zero implicit array clones passed")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_array_moves COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    host := process.host_target()
+    if root.len == 0 || host.len == 0 { _ := harness.fail("cannot identify repository or native host"); return 2 }
+    temp := fs.temp_dir("dunder-array-moves-")
+    if !temp.ok { _ := harness.fail("cannot create array ownership test directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    canonical := fs.realpath(temp.value)
+    if !canonical.ok { _ := harness.fail("cannot resolve array ownership test directory"); return 1 }
+    fixtures := root + "/tests/fixtures/array_moves"
+    mut run := Run { compiler: compiler, root: root, work: canonical.value, host: host, fixtures: fixtures, images: 0, errors: 0 }
+    if run_suite(&mut run) { 0 } else { 1 }
+}
+
+fn ownership_rejections() -> [](string, string, string) {
+    [
+        ("local", "fn main(){a:[]i32=[42];b:=a;print(a[0])}", "use of moved value"),
+        ("length", "fn main(){a:[]i32=[42];b:=a;print(a.len)}", "use of moved value"),
+        ("clone-moved", "fn main(){a:[]i32=[42];b:=a;c:=a.clone()}", "use of moved value"),
+        ("borrow-moved", "fn read(a:&[]i32){} fn main(){a:[]i32=[42];b:=a;read(&a)}", "use of moved value"),
+        ("argument", "fn take(move a:[]i32){} fn main(){a:[]i32=[42];take(move a);print(a[0])}", "use of moved value"),
+        ("argument-twice", "fn take(move a:[]i32,move b:[]i32){} fn main(){a:[]i32=[42];take(move a,move a)}", "use of moved value"),
+        ("fixed", "fn main(){a:[i32;2]=[20,22];b:=a;print(a[0])}", "use of moved value"),
+        ("fixed-empty", "fn main(){a:[i32;0]=[0;0];b:=a;print(a.len)}", "use of moved value"),
+        ("struct", "struct P{a:[]i32,n:i32} fn main(){a:=P{a:[42],n:7};b:=a;print(a.n)}", "use of moved value"),
+        ("enum", "enum E{A([]i32),B} fn main(){a:=E.A([42]);b:=a;match a{.A(v)=>{},.B=>{}}}", "use of moved value"),
+        ("nested", "struct P{a:[i32;2]} enum E{A(P),B} fn main(){a:=E.A(P{a:[20,22]});b:=a;c:=a}", "use of moved value"),
+        ("field", "struct P{a:[]i32} fn main(){a:=P{a:[42]};b:=a.a;print(a.a[0])}", "use of moved value"),
+        ("conditional-reference", "capability unsafe\nfn read(a:&i32)->i32{a} fn main(){a:=42;unsafe{print(read(if true{ref_at(addr(&a))}else{ref_at(addr(&a))}))}}", "reference"),
+        ("repeat-string-owner", "fn main(){s:=\"owned\"+42.str();values:=[s;4];print(s)}", "use of moved value"),
+        ("repeat-zero-owner", "fn main(){s:=\"owned\"+42.str();values:=[s;0];print(s)}", "use of moved value"),
+        ("default-parameter-return", "fn bad(a:[]i32)->[]i32{a} fn main(){}", "cannot move out of a borrowed value"),
+        ("default-parameter-mutation", "fn bad(a:[]i32){a[0]=99} fn main(){}", "mutable"),
+        ("default-parameter-store", "fn bad(a:[]i32){owned:=a} fn main(){}", "cannot move out of a borrowed value"),
+        ("callback-mode", "fn relay(move a:[]i32)->[]i32{a} fn main(){pass:fn([]i32)->[]i32=relay}", "type mismatch"),
+        ("borrowed", "fn copy(a:&[]i32)->[]i32{a} fn main(){}", "cannot move out of a borrowed value"),
+        ("borrowed-mut", "fn copy(a:&mut []i32)->[]i32{a} fn main(){}", "cannot move out of a borrowed value"),
+        ("borrowed-field", "struct P{a:[]i32} fn copy(a:&P)->[]i32{a.a} fn main(){}", "cannot move out of a"),
+        ("if-one", "fn f(flag:bool){a:[]i32=[42];if flag{b:=a};print(a[0])} fn main(){f(true)}", "use of moved value"),
+        ("if-both", "fn f(flag:bool){a:[]i32=[42];if flag{b:=a}else{c:=a};print(a[0])} fn main(){f(false)}", "use of moved value"),
+        ("if-expression", "fn f(flag:bool){a:[]i32=[42];b:=if flag{a}else{[1]};print(a[0])} fn main(){f(true)}", "use of moved value"),
+        ("short-circuit", "fn take(move a:[]i32)->bool{true} fn f(flag:bool){a:[]i32=[42];b:=flag&&take(move a);print(a[0])} fn main(){f(false)}", "use of moved value"),
+        ("match-join", "enum E{A,B} fn f(k:E){a:[]i32=[42];match k{.A=>{b:=a},.B=>{}};print(a[0])} fn main(){f(.B)}", "use of moved value"),
+        ("for-consumes", "fn main(){a:[]i32=[42];for x in move a{print(x)};print(a[0])}", "use of moved value"),
+        ("for-backedge", "fn main(){a:[]i32=[42];for i in 0..2{b:=a;print(b[0])}}", "moved value"),
+        ("while-backedge", "fn main(){a:[]i32=[42];mut i:=0;while i<2{b:=a;print(b[0]);i+=1}}", "moved value"),
+        ("continue-backedge", "fn main(){a:[]i32=[42];for i in 0..2{b:=a;continue}}", "moved value"),
+        ("defer-use", "fn main(){a:[]i32=[42];defer{print(a[0])};b:=a}", "captured by defer"),
+        ("mutable-moved", "fn main(){mut a:[]i32=[42];b:=a;a.push(1)}", "use of moved value"),
+        ("defer-consume", "fn main(){a:[]i32=[42];defer{b:=a}}", "captured by defer"),
+        ("borrowed-loop-move", "fn take(move a:[]i32){} fn main(){a:[]i32=[42];for x in &a{take(move a)}}", "while iterating"),
+        ("borrowed-argument-move", "fn take(a:&[]i32,move b:[]i32){} fn main(){a:[]i32=[42];take(&a,move a)}", "borrowed by another argument"),
+        ("moved-argument-borrow", "fn take(move a:[]i32,b:&[]i32){} fn main(){a:[]i32=[42];take(move a,&a)}", "use of moved value"),
+        ("ordinary-loop-mutation", "fn main(){mut a:[]i32=[42];for x in a{a[0]=99}}", "while iterating"),
+        ("ordinary-loop-resize", "fn main(){mut a:[]i32=[42];for x in a{a.push(1)}}", "while iterating"),
+        ("ordinary-argument-move", "fn take(a:[]i32,move b:[]i32){} fn main(){a:[]i32=[42];take(a,move a)}", "borrowed by another argument"),
+        ("ordinary-argument-mutation", "fn edit(a:&mut []i32)->i32{a[0]=99;0} fn read(a:[]i32,n:i32)->i32{a[0]} fn main(){mut a:[]i32=[42];print(read(a,edit(&mut a)))}", "borrowed by another argument"),
+        ("guard-consume", "enum E{A([]i32),B} fn take(move a:[]i32)->bool{true} fn main(){a:=E.A([42]);match a{.A(v) if take(move v)=>{},.A(v)=>{},.B=>{}}}", "pattern binding"),
+        ("string-local", "fn main(){a:=\"owned\"+42.str();b:=a;print(a)}", "use of moved value"),
+        ("string-argument", "fn take(move a:string){} fn main(){a:=\"owned\"+42.str();take(move a);print(a)}", "use of moved value"),
+        ("string-borrow", "fn copy(a:&string)->string{a} fn main(){}", "cannot move out of a borrowed value"),
+        ("string-field", "struct P{a:string} fn main(){a:=P{a:\"owned\"+42.str()};b:=a.a;print(a.a)}", "use of moved value"),
+        ("string-struct", "struct P{a:string} fn main(){a:=P{a:\"owned\"+42.str()};b:=a;print(a.a)}", "use of moved value"),
+        ("string-enum", "enum E{A(string),B} fn main(){a:=E.A(\"owned\"+42.str());b:=a;c:=a}", "use of moved value"),
+        ("string-clone-moved", "fn main(){a:=\"owned\"+42.str();b:=a;c:=a.clone()}", "use of moved value"),
+        ("string-branch", "fn f(flag:bool){a:=\"owned\"+42.str();if flag{b:=a};print(a)} fn main(){f(true)}", "use of moved value"),
+        ("string-backedge", "fn main(){a:=\"owned\"+42.str();for i in 0..2{b:=a;print(b)}}", "moved value"),
+        ("string-defer", "fn main(){a:=\"owned\"+42.str();defer{print(a)};b:=a}", "captured by defer"),
+    ]
+}
+
+fn task_rejections() -> [](string, string, string) {
+    [
+        ("plain-await", "fn work(n:i32)->[]i32{[n]} fn main(){task scope j(1){id:=spawn j work(42);a:=await j(id)}}", "move-only task results require await!"),
+        ("fixed-await", "fn work(n:i32)->[i32;1]{[n]} fn main(){task scope j(1){id:=spawn j work(42);a:=await j(id)}}", "move-only task results require await!"),
+        ("spawn-consumes", "fn work(move a:[]i32){} fn main(){a:[]i32=[42];task scope j(1){id:=spawn j work(move a)};print(a[0])}", "use of moved value"),
+    ]
+}

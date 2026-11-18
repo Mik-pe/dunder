@@ -1,0 +1,192 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .source_rejections as reject
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import sys
+
+struct Case {
+    name: string,
+    source: string,
+    macos: string,
+    linux: string,
+}
+
+struct Run {
+    compiler: string,
+    work: string,
+    runners: native.Runners,
+    checks: i32,
+    images: i32,
+    executions: i32,
+    rejections: i32,
+    cache_checks: i32,
+}
+
+fn sample_program(body: string) -> string {
+    "struct Value { ok: bool, value: string }\n" +
+        "fn make() -> Value { Value { ok: true, value: \"owned\" } }\n" +
+        "fn work(flag: bool) -> Value {\n" + body +
+        "\n}\nfn main() { answer := work(false); print(answer.value) }\n"
+}
+
+fn flags(target: string, direct: bool) -> []string {
+    mut options: []string = ["--target", target.clone()]
+    if direct {
+        for option in move native.direct_flags() { options.push(move option) }
+        options.push("--inline-opt=off")
+    }
+    options
+}
+
+fn with_flags(move args: []string, options: &[]string) -> []string {
+    mut result := move args
+    for option in options { result.push(option.clone()) }
+    result
+}
+
+fn put(path: string, source: string) -> bool {
+    sys.write_text(path, source).ok || harness.fail(f"cannot write {path}")
+}
+
+fn call(run: &Run, args: []string, status: i32, output: &mut process.Output) -> bool {
+    harness.run_checked(run.compiler, args, run.work, status, false, &mut output)
+}
+
+fn cache(run: &mut Run, source: string, image: string, target: string, previous: &[]u8) -> bool {
+    mut result := harness.empty_output()
+    for _ in 0..2 {
+        if !call(&run, ["build", source.clone(), "--target", target.clone(), "--jobs", "4", "--incremental", "-o", image.clone()],
+                 0, &mut result) { return false }
+        data := sys.read_u8(image)
+        if !data.ok || !bytes.equal(&previous, &data.value) { return harness.fail(f"{source} target {target}: cache changed image bytes") }
+        run.cache_checks += 1
+    }
+    true
+}
+
+fn validate(run: &mut Run, sample: &Case, source: string, target: string, direct: bool) -> bool {
+    mut out := harness.empty_output()
+    options := flags(target, direct)
+    label := if direct { "direct" } else { "default" }
+    if !call(&run, with_flags(["check", source.clone(), "--agent"], &options), 0, &mut out) || !harness.agent_ok(&out) { return false }
+    run.checks += 1
+    mut previous: []u8 = []
+    for workers in [1, 4] {
+        image := f"{run.work}/{sample.name}-{target}-{label}-{workers}"
+        args := with_flags(["build", source.clone(), "--jobs", workers.str(), "-o", image.clone()], &options)
+        if !call(&run, args, 0, &mut out) { return false }
+        data := sys.read_u8(image)
+        if !data.ok || !native.image_header(&data.value, target) { return harness.fail(f"{image}: invalid executable for {target}") }
+        if workers == 4 && !bytes.equal(&previous, &data.value) { return harness.fail(f"{image}: worker image differs") }
+        previous = data.value
+        run.images += 1
+        if workers == 1 && run.runners.can_run(target) {
+            expected := if target == "arm64-macos" { sample.macos.clone() } else { sample.linux.clone() }
+            if !run.runners.run(target, image, [], run.work, 0, &mut out) ||
+               !harness.stdout_is(&out, expected, image) || out.stderr.len != 0 {
+                return harness.fail(f"{image}: unexpected runtime output\n{out.stdout_text()}\n{out.stderr_text()}")
+            }
+            run.executions += 1
+        }
+    }
+    if !direct && (sample.name == "target-return" || sample.name == "unconditional-return" || sample.name == "dead-match") {
+        image := f"{run.work}/{sample.name}-{target}-cached"
+        return cache(&mut run, source, image, target, &previous)
+    }
+    true
+}
+
+fn reject_sources(run: &mut Run) -> bool {
+    mut result := harness.empty_output()
+    for entry in move invalid_cases() {
+        (name, source, message) := entry
+        path := run.work + "/" + name + ".ddr"
+        if !put(path, source + "\n") { return false }
+        for target in harness.targets() {
+            for mode in 0..2 {
+                mut options := flags(target, mode == 1)
+                if !call(&run, with_flags(["check", path.clone(), "--agent"], &options), 1, &mut result) { return false }
+                rows := harness.lines(result.stdout_text())
+                if rows.len == 0 { return harness.fail(f"{path}: no agent diagnostic") }
+                diagnostic := reject.inspect(rows[rows.len - 1], path, message, true)
+                options.push("--jobs")
+                options.push("4")
+                if !diagnostic.ok || !reject.preserves_output(run.compiler, run.work, path, &options, diagnostic.message) { return false }
+                run.rejections += 1
+            }
+        }
+    }
+    true
+}
+
+fn run_suite(run: &mut Run) -> bool {
+    for sample in valid_cases() {
+        path := f"{run.work}/{sample.name}.ddr"
+        if !put(path, sample.source) { return false }
+        for target in harness.targets() {
+            if !validate(&mut run, &sample, path, target, false) || !validate(&mut run, &sample, path, target, true) { return false }
+        }
+    }
+    if !reject_sources(&mut run) { return false }
+    print(f"Terminal ownership flow: {run.checks} checks, {run.images} native images, {run.executions} executions, {run.cache_checks} cache comparisons, {run.rejections} diagnostic contracts passed")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--runner")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_terminal_flow COMPILER [--runner TARGET=COMMAND]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    if process.host_target().len == 0 { _ := harness.fail("unsupported native host"); return 2 }
+    runners := native.Runners::new(&args.all("--runner"))
+    if runners.error.len > 0 { _ := sys.eprint(runners.error); return 2 }
+    temporary := fs.temp_dir("dunder-terminal-flow-")
+    if !temporary.ok { _ := harness.fail("cannot create terminal flow test directory"); return 1 }
+    defer { _ := fs.remove_all(temporary.value) }
+    work := fs.realpath(temporary.value)
+    if !work.ok { _ := harness.fail("cannot resolve terminal flow test directory"); return 1 }
+    mut run := Run { compiler: compiler, work: work.value, runners: runners, checks: 0, images: 0,
+                     executions: 0, rejections: 0, cache_checks: 0 }
+    if run_suite(&mut run) { 0 } else { 1 }
+}
+
+fn valid_cases() -> []Case {
+    [
+        Case { name: "reachable", source: sample_program("result := make()\nif !result.ok { return result }\nprint(result.value)\nmake()"), macos: "owned\nowned\n", linux: "owned\nowned\n" },
+        Case { name: "target-return", source: sample_program("if !target_is(\"macos\") { return make() }\nresult := make()\nif !result.ok { return result }\nprint(result.value)\nmake()"), macos: "owned\nowned\n", linux: "owned\n" },
+        Case { name: "unconditional-return", source: sample_program("return make()\nresult := make()\nif !result.ok { return result }\nprint(result.value)\nmake()"), macos: "owned\n", linux: "owned\n" },
+        Case { name: "dead-else-return", source: sample_program("return make()\nresult := make()\nif flag { print(result.value) } else { return result }\nprint(result.value)\nmake()"), macos: "owned\n", linux: "owned\n" },
+        Case { name: "dead-nested-branches", source: sample_program("return make()\nresult := make()\nif flag {\n    if !result.ok { return result }\n    print(result.value)\n} else if !result.ok { return result }\nprint(result.value)\nmake()"), macos: "owned\n", linux: "owned\n" },
+        Case { name: "dead-match", source: "enum Choice { A, B, C }\n" + sample_program("return make()\nresult := make()\nmatch Choice.B {\n    .A => { return result },\n    .B => { print(result.value) },\n    .C => { if flag { return result }; print(result.value) }\n}\nprint(result.value)\nmake()"), macos: "owned\n", linux: "owned\n" },
+        Case { name: "dead-break", source: sample_program("result := make()\nfor i in 0..1 {\n    break\n    if flag { moved := result; print(moved.value); break }\n    print(result.value)\n}\nprint(result.value)\nresult"), macos: "owned\nowned\n", linux: "owned\nowned\n" },
+        Case { name: "dead-continue", source: sample_program("result := make()\nfor i in 0..1 {\n    continue\n    if flag { moved := result; print(moved.value); continue }\n    print(result.value)\n}\nprint(result.value)\nresult"), macos: "owned\nowned\n", linux: "owned\nowned\n" },
+        Case { name: "dead-match-loop-exits", source: "enum Choice { A, B, C }\n" + sample_program("result := make()\nfor i in 0..1 {\n    break\n    match Choice.B {\n        .A => { moved := result; print(moved.value); continue },\n        .B => { print(result.value) },\n        .C => { break }\n    }\n    print(result.value)\n}\nresult"), macos: "owned\n", linux: "owned\n" },
+        Case { name: "partial-return", source: "struct Pair { left: string, right: string }\nfn work(flag: bool) -> string {\n    pair := Pair { left: \"left\", right: \"right\" }\n    if flag { return pair.left }\n    print(pair.left)\n    pair.right\n}\nfn main() { print(work(false)) }\n", macos: "left\nright\n", linux: "left\nright\n" },
+        Case { name: "defer-return", source: sample_program("message := \"deferred\"\ndefer { print(message) }\nif flag { return make() }\nresult := make()\nif !result.ok { return result }\nprint(result.value)\nresult"), macos: "owned\ndeferred\nowned\n", linux: "owned\ndeferred\nowned\n" },
+    ]
+}
+
+fn invalid_cases() -> [](string, string, string) {
+    [
+        ("dead-type", sample_program("return make()\nwrong: i32 = true\nmake()"), "type mismatch"),
+        ("dead-name", sample_program("return make()\nmissing_name()\nmake()"), "unknown"),
+        ("dead-straight-move", sample_program("return make()\nresult := make(); moved := result; print(moved.value)\nprint(result.value)\nmake()"), "moved value"),
+        ("dead-branch-move", sample_program("return make()\nresult := make()\nif flag { moved := result; print(moved.value) }\nprint(result.value)\nmake()"), "moved value"),
+        ("dead-value-branch-move", sample_program("return make()\nresult := make()\nselected := if flag { result } else if result.ok { make() } else { make() }\nprint(selected.value); print(result.value)\nmake()"), "moved value"),
+        ("live-branch-move", sample_program("result := make()\nif flag { moved := result; print(moved.value) }\nprint(result.value)\nmake()"), "moved value"),
+        ("live-match-move", "enum Choice { A, B }\n" + sample_program("result := make()\nmatch Choice.B { .A => { moved := result; print(moved.value) }, .B => {} }\nprint(result.value)\nmake()"), "moved value"),
+        ("partial-branch-move", "struct Pair { left: string, right: string }\nfn bad(flag: bool) { pair := Pair { left: \"left\", right: \"right\" }\n    if flag { moved := pair.left; print(moved) }; print(pair.left) }\nfn main() { bad(false) }\n", "moved value"),
+        ("loop-backedge", "fn main() { value := \"x\"; for i in 0..2 { moved := value; print(moved) } }", "reinitialized"),
+        ("loop-continue", "fn main() { value := \"x\"; for i in 0..2 { moved := value; print(moved); continue } }", "reinitialized"),
+        ("loop-break-move", "fn main() { value := \"x\"; for i in 0..2 { moved := value; print(moved); break }; print(value) }", "moved value"),
+        ("active-borrow", sample_program("result := make(); loan := &result\nmoved := result; print(moved.value); print(loan.value)\nmake()"), "borrow"),
+        ("defer-capture", sample_program("result := make()\ndefer { print(result.value) }\nreturn result"), "defer"),
+        ("break-is-not-function-return", "fn bad(flag: bool) -> i32 {\n    while flag { if flag { break } else { continue } }\n}\nfn main() { print(bad(false)) }\n", "without returning"),
+    ]
+}
