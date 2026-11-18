@@ -18,9 +18,9 @@ import std.set as set
 import std.array as array
 
 fn main() {
-    mut counts := map.new()
-    map.put(&mut counts, "dunder", 42)
-    print(map.get_or(&counts, "dunder", 0))
+    mut counts := map.Map<string, i64>::new()
+    counts.put("dunder", 42)
+    print(counts.get_or("dunder", 0))
 
     mut names := set.new()
     added := set.insert(&mut names, "å 🌍")
@@ -85,9 +85,9 @@ delar oföränderlig text.
 
 | Operation | Ägarskap |
 | --- | --- |
-| `map.get`, `map.get_or`, `map.contains`, `set.contains` | Lånar nyckeln. |
-| `map.put(&mut table, move key, value)`, `set.insert(&mut set, move key)` | Tar över nyckeln; nyckeln förbrukas även om den redan finns. |
-| `map.keys(table)`, `set.items(set)` | Returnerar en ny array; tabellen behåller sina strängägare. |
+| `Map.at`, `Map.get_or`, `Map.contains`, `set.contains` | Lånar nyckeln. |
+| `table.put(move key, move value)`, `set.insert(&mut set, move key)` | Tar över nyckeln även vid en dubblett. `put` tar också över värdet. |
+| `table.keys()`, `set.items(set)` | Returnerar en ny array med klonade nycklar. |
 | `process.command(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
 | `process.run(program, args)`, `process.exec(command)` | Lånar under den synkrona körningen. |
 | `process.replace(program, &args)`, `process.replace_as(program, argv0, &args)` | Ersätter den aktuella processen utan en ny PID. Vid fel är miljö, arbetskatalog och standardströmmar orörda. `replace_as` väljer uttryckligen `argv[0]` för multicall-program. |
@@ -150,9 +150,9 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 | Import | Innehåll |
 | --- | --- |
 | `std.array` | `ints`, `strings`, `sum`, `sort`, `reverse`, `append` och `sort_strings`. Båda sorteringarna använder heapsort på plats, O(n log n). Strängar jämförs lexikografiskt över UTF-8-byte. |
-| `std.map` | `Map` från `string` till `i64` med metoder via `impl Map` (`Map::new`, `m.len`, `m.length`, `m.reserve`, `m.put`, `m.get`, `m.get_or`, `m.contains`, `m.remove`, `m.clear`, `m.keys`) samt modulhjälpare (`map.new`, `map.put`, ...). |
+| `std.map` | [`Map<K, V>`](#generiska-samlingar) med typade nycklar och värden. |
 | `std.set` | `Set` av strängar med metoder via `impl Set` (`Set::new`, `s.len`, `s.length`, `s.reserve`, `s.insert`, `s.contains`, `s.remove`, `s.clear`, `s.items`) samt modulhjälpare (`set.new`, `set.insert`, ...). |
-| `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av map/set. |
+| `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av strängmängden. |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
 | `std.bytes` | Packade bytebuffertar (`[]u8`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kompilatorns kvarvarande `[]i32`-buffertar. |
 | `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish`). |
@@ -168,16 +168,12 @@ Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
 ändrar inte antalet poster. `set.insert` returnerar sant för ett nytt värde;
 `remove` returnerar sant när något togs bort. Iterationsordningen hos
-`map.keys` och `set.items` är inte ett sorteringskontrakt.
+`Map.keys` och `set.items` är ospecificerad. Strängnycklar jämförs
+som UTF-8-byte, inklusive tomma strängar och NUL, utan Unicode-normalisering.
 
-`map.get` ger `Lookup { Missing, Found(i64) }`, så noll är ett vanligt värde.
-`get_or` använder ett explicit reservvärde. Nycklar jämförs som UTF-8-byte,
-inklusive tomma strängar och NUL; ingen Unicode-normalisering görs.
-Representationsfälten är ännu synliga enligt språkets nuvarande structregler;
-ändra samlingarna genom modulernas funktioner.
-
-De konkreta typerna och modulhjälparna används också av kompilatorn.
-Använd `Map<K, V>` och `Set<T>` för andra elementtyper.
+Byt från `map.new()` till `Map<string, i64>::new()` och anropa
+metoder på tabellen. Byt `length` till `len`. För uppslag som kan
+saknas ger `index_of` ett index eller `-1`.
 
 `text.find` returnerar ett byteindex eller -1. `split` bevarar tomma delar;
 en tom separator ger en del med hela texten. `trim` tar ASCII-mellanslag,
@@ -231,6 +227,9 @@ samlingen kräver klonbara nycklar och värden.
 `Map.index_of(key)` ger postens index eller `-1`. `key_at(index)`
 och `value_at(index)` lånar posten. `Map.at(key)` lånar värdet och
 kräver att nyckeln finns. `Set.at(index)` lånar elementet vid indexet.
+`Map.get_or(key, move fallback)` returnerar en klon av värdet eller
+det ägda reservvärdet vid en saknad nyckel. `Map.keys()` klonar alla
+lagrade nycklar till en ny array.
 Skrivning till samlingen kräver att lånen har upphört. Använd intervallet
 `0..len()` för att läsa poster i aktuell ordning. Borttagning kan byta
 plats på den sista kvarvarande posten och den borttagna posten.
