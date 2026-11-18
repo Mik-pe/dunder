@@ -1,11 +1,11 @@
 # Attribute the compiler's own work
 
-`tools/profile-compiler.py` collects compiler phase clocks and executed
+`tools/profile_compiler.ddr` collects compiler phase clocks and executed
 allocation traffic as separate observations. It is an attribution tool, not a
 latency benchmark and not part of the four-kernel C acceptance suite.
 
 ```sh
-python3 tools/profile-compiler.py /path/to/current/dunder \
+dunder run tools/profile_compiler.ddr -- /path/to/current/dunder \
   build/compiler-attribution --rounds 5
 ```
 
@@ -31,14 +31,13 @@ replaced by zeros. There is no outer wall-clock timer or p95 latency claim.
 
 ## Inputs and result checks
 
-Defaults are the existing 101,024-line generated compiler corpus, the host
-selfhost entry, and Tabell. The corpus comes from `tools/performance.py`; no
-second stress-corpus definition is introduced.
+The default cases are the 101,024-line generated compiler corpus and the
+host selfhost entry. The attribution and latency tools share the generator
+in [`tools/performance_corpus.ddr`](../tools/performance_corpus.ddr).
 
 - Every generated output must print exactly `595500`.
 - Every selfhost output must equal the input compiler and build a hello image
   that prints `42` and `true`.
-- Every Tabell output must reproduce the project's complete expected CSV.
 - All output images must be byteidentical across both observers and all rounds
   for the same source. Profiling changes observers, not these program images.
 
@@ -52,14 +51,14 @@ timeout outcome rather than inventing an exit status or profiling record.
 Select a known source or provide a custom source with repeated `--case`:
 
 ```sh
-python3 tools/profile-compiler.py /path/to/dunder build/self-attribution \
-  --case selfhost/main.ddr
-python3 tools/profile-compiler.py /path/to/dunder build/pod-attribution \
+dunder run tools/profile_compiler.ddr -- /path/to/dunder build/self-attribution \
+  --case selfhost/main_parallel.ddr
+dunder run tools/profile_compiler.ddr -- /path/to/dunder build/pod-attribution \
   --case benchmarks/dogfood/pod.ddr --expected-stdout /path/to/known-output \
   --program-arg 3 --program-arg 1729
 ```
 
-Known selfhost/Tabell paths retain their authoritative checks. An unknown
+The host selfhost entries retain their authoritative checks. An unknown
 custom program is compiled and compared by image identity; it is not executed
 and its semantics are not certified without `--expected-stdout`. Optional
 execution arguments require exactly one custom case and a result reference.

@@ -1,0 +1,204 @@
+capability filesystem
+
+import .harness as harness
+import .performance_corpus as corpus
+import .profile_source_scan as lexer
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+pub struct Input { path: string, sha256: string, size: i64, lines: i64 }
+pub struct Graph { files: []string, size: i64 }
+
+pub struct Inventory {
+    files: []Input,
+    index: Map<string, i32>,
+    resolutions: Map<string, string>,
+    error: string,
+}
+
+pub fn inventory() -> Inventory {
+    Inventory { files: [], index: Map<string, i32>::new(), resolutions: Map<string, string>::new(), error: "" }
+}
+
+pub fn digest(path: string) -> string {
+    input := sys.read_u8(path)
+    if input.ok { harness.sha256_bytes_hex(&input.value) } else { "" }
+}
+
+pub fn absolute(cwd: string, path: string) -> string {
+    full := if text.starts_with(path, "/") { path.clone() } else { cwd + "/" + path }
+    mut result := ""
+    for part in move text.split(full, "/") {
+        if part.len == 0 || part == "." { continue }
+        result += "/" + part
+    }
+    if result.len == 0 { "/" } else { result }
+}
+
+fn line_count(data: &[]u8) -> i64 {
+    if data.len == 0 { return 0 }
+    mut lines: i64 = 0
+    mut previous: u8 = 0
+    for byte in data {
+        if byte == 13 || (byte == 10 && previous != 13) { lines += 1 }
+        previous = byte
+    }
+    if previous != 13 && previous != 10 { lines += 1 }
+    lines
+}
+
+fn import_path(root: string, parent: string, raw: string) -> string {
+    mut path := ""
+    if text.find(raw, "/") >= 0 {
+        path = raw.clone()
+    } else {
+        mut dots := 0
+        while dots < raw.len && raw[dots] == 46 { dots += 1 }
+        for _ in 1..dots { path += "../" }
+        mut module: []u8 = []
+        for i in dots..raw.len {
+            module.push(if raw[i] == 46 { u8(47) } else { u8(raw[i]) })
+        }
+        path += bytes.decode(&module).value
+    }
+    if path == "sys" { return root + "/stdlib/sys.ddr" }
+    if text.starts_with(path, "std/") {
+        candidate := root + "/stdlib/" + path[4..path.len] + ".ddr"
+        if sys.metadata(candidate).is_file { return candidate }
+    }
+    absolute(parent, path + ".ddr")
+}
+
+impl Inventory {
+    pub fn resolve(&mut self, requested: string) -> string {
+        real := fs.realpath(requested)
+        if !real.ok {
+            self.error = f"cannot resolve source or runtime input: {requested}"
+            return ""
+        }
+        if self.resolutions.contains(requested) && self.resolutions.at(requested) != real.value {
+            self.error = f"source resolution changed: {requested}"
+            return ""
+        }
+        self.resolutions.put(requested.clone(), real.value.clone())
+        real.value
+    }
+
+    fn remember(&mut self, path: string, data: &[]u8, physical: bool) -> bool {
+        hash := harness.sha256_bytes_hex(&data)
+        if self.index.contains(path) {
+            i := self.index.at(path)
+            if self.files[i].sha256 != hash {
+                self.error = f"source/input/helper changed: {path}"
+                return false
+            }
+            if physical && self.files[i].lines < 0 { self.files[i].lines = line_count(&data) }
+            return true
+        }
+        self.index.put(path.clone(), self.files.len)
+        self.files.push(Input { path: path.clone(), sha256: hash, size: i64(data.len),
+            lines: if physical { line_count(&data) } else { -1 } })
+        true
+    }
+
+    pub fn add(&mut self, requested: string, physical: bool) -> bool {
+        path := self.resolve(requested)
+        if path.len == 0 { return false }
+        input := sys.read_u8(path)
+        if !input.ok { self.error = f"cannot read {path}"; return false }
+        self.remember(path, &input.value, physical)
+    }
+
+    pub fn graph(&mut self, root: string, entry: string, output: &mut Graph) -> bool {
+        mut pending: []string = [entry.clone()]
+        mut seen := Map<string, bool>::new()
+        while pending.len > 0 {
+            requested := pending.pop()
+            path := self.resolve(requested)
+            if path.len == 0 { return false }
+            if seen.contains(path) { continue }
+            input := sys.read_u8(path)
+            if !input.ok { self.error = f"cannot read source: {path}"; return false }
+            if !self.remember(path, &input.value, true) { return false }
+            raw := bytes.decode(&input.value)
+            if !raw.ok { self.error = f"invalid UTF-8 in source: {path}"; return false }
+            parsed := lexer.scan(raw.value)
+            if parsed.error.len > 0 { self.error = f"{path}: {parsed.error}"; return false }
+            seen.put(path.clone(), true)
+            output.files.push(path.clone())
+            output.size += i64(input.value.len)
+            parent := harness.parent_dir(path)
+            for i in 0..(parsed.tokens.len - 1) {
+                if parsed.tokens[i].kind != 2 || parsed.tokens[i].spelling != "import" { continue }
+                next := &parsed.tokens[i + 1]
+                if next.kind == 5 {
+                    pending.push(import_path(root, parent, next.spelling))
+                } else {
+                    first := next.start
+                    mut end := first
+                    while end < raw.value.len && raw.value[end] > 32 && raw.value[end] != 59 { end += 1 }
+                    pending.push(import_path(root, parent, raw.value[first..end]))
+                }
+            }
+        }
+        true
+    }
+
+    pub fn add_directory(&mut self, root: string, directory: string, descend: bool, output: &mut Graph) -> bool {
+        mut paths: []string = []
+        if !corpus.collect_ddr_paths(root, directory, descend, &mut paths) {
+            self.error = f"cannot enumerate {directory}"
+            return false
+        }
+        for relative in paths {
+            requested := root + "/" + relative
+            if !self.add(requested, true) { return false }
+            path := self.resolutions.at(requested).clone()
+            output.size += self.files[self.index.at(path)].size
+            output.files.push(move path)
+        }
+        true
+    }
+
+    pub fn verify(&mut self) -> bool {
+        for i in 0..self.files.len {
+            path := self.files[i].path.clone()
+            if digest(path) != self.files[i].sha256 {
+                self.error = f"source/input/helper changed: {path}"
+                return false
+            }
+        }
+        for i in 0..self.resolutions.len() {
+            requested := self.resolutions.key_at(i).clone()
+            current := fs.realpath(requested)
+            if !current.ok || current.value != self.resolutions.value_at(i) {
+                self.error = f"source resolution changed: {requested}"
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn write(&self, writer: &mut json.Writer) {
+        writer.key("sources"); writer.object()
+        for source in self.files {
+            writer.key(source.path); writer.object()
+            writer.key("sha256"); writer.string(source.sha256)
+            writer.key("bytes"); writer.integer(source.size)
+            if source.lines >= 0 {
+                writer.key("physical_lines_including_comments"); writer.integer(source.lines)
+            }
+            writer.end()
+        }
+        writer.end()
+        writer.key("source_resolutions"); writer.object()
+        for i in 0..self.resolutions.len() {
+            writer.key(self.resolutions.key_at(i))
+            writer.string(self.resolutions.value_at(i))
+        }
+        writer.end()
+    }
+}

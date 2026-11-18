@@ -892,7 +892,7 @@ självständig semantisk frontend för hela språket återstår.
 
 Byggkedjans valbara [fastider i text eller JSON](incremental.md#mät-byggkedjans-faser)
 gör kostnaden synlig. Optimeringar jämförs med samma källor och säkerhetsregler
-genom `tools/performance.py`; `--include-check` lägger till kontrolltider,
+genom [`tools/performance.ddr`](../tools/performance.ddr). `--include-check` lägger till kontrolltider,
 och byggsviten omfattar även Tabell som fristående konsumentprojekt.
 Med samma binär i båda positionerna och
 `--baseline-flag=--scalar-opt=off` isoleras optimeringslägets effekt.

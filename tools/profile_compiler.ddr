@@ -1,0 +1,309 @@
+capability filesystem, process
+
+import .benchmark_commands as bench
+import .benchmark_host as provenance
+import .harness as harness
+import .performance_corpus as corpus
+import .probe_cli as cli
+import .profile_compiler_records as records
+import .profile_compiler_report as report
+import .profile_compiler_sources as sources
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import sys
+
+fn relative(root: string, path: string) -> string { path[(root.len + 1)..path.len] }
+
+fn native_entry(target: string) -> string {
+    if target == "arm64-macos" { return "main" }
+    if target == "arm64-linux" { return "linux" }
+    if target == "x86_64-linux" { return "x86_linux" }
+    ""
+}
+
+fn plain(run: &mut report.Run, output: &process.Output) -> bool {
+    output.stderr.len == 0 || run.fail("unexpected stderr from uninstrumented command; see raw logs")
+}
+
+fn known_output(run: &mut report.Run, output: &process.Output, expected: &[]u8) -> bool {
+    if !plain(&mut run, &output) { return false }
+    bytes.equal(&output.stdout, &expected) ||
+        run.fail(f"incorrect program result; see raw logs\nexpected:\n{bytes.decode(&expected).value}\nobserved:\n{output.stdout_text()}")
+}
+
+fn inventory_failure(run: &mut report.Run) -> bool {
+    message := run.files.error.clone()
+    run.fail(message)
+}
+
+fn identify(options: &report.Options, parallel: string, serial: string, run: &mut report.Run) -> bool {
+    for candidate in [parallel.clone(), serial.clone()] {
+        stem := harness.stem(candidate)
+        path := options.directory + "/images/source-identity-" + stem
+        mut out := harness.empty_output()
+        if !run.call(&options, f"verify input compiler source identity ({stem})",
+            [options.compiler.path.clone(), "build", relative(options.root, candidate), "--target", options.native_target.clone(), "-o", path.clone()],
+            options.root, &mut out) || !plain(&mut run, &out) { return false }
+        digest := sources.digest(path)
+        if digest == options.compiler.sha256 {
+            run.selfhost_source = candidate.clone()
+            run.source_identity = report.Binary { path: path, sha256: digest }
+            return true
+        }
+    }
+    run.fail("input compiler is not the current source fixed point")
+}
+
+fn case_name(path: string, index: i32) -> string {
+    stem := harness.stem(path)
+    mut result: []u8 = []
+    for char in stem.runes() {
+        n := i32(char)
+        if (n >= 65 && n <= 90) || (n >= 97 && n <= 122) || (n >= 48 && n <= 57) || n == 95 || n == 45 {
+            result.push(u8(n))
+        } else { result.push(95) }
+    }
+    f"{index + 1:02}_" + bytes.decode(&result).value
+}
+
+fn add_case(options: &report.Options, name: string, source: string, mode: string, run: &mut report.Run) -> bool {
+    mut graph := sources.Graph { files: [], size: 0 }
+    if mode == "generated" {
+        if !run.files.add_directory(options.directory, "corpus", false, &mut graph) { return inventory_failure(&mut run) }
+    } else if !run.files.graph(options.root, source, &mut graph) {
+        return inventory_failure(&mut run)
+    }
+    run.cases.push(report.Case { name: name.clone(), source: source.clone(), validation: mode.clone(),
+        files: graph, observations: [], sha256: "" })
+    true
+}
+
+fn prepare_cases(options: &report.Options, parallel: string, serial: string, run: &mut report.Run) -> bool {
+    if options.cases.len == 0 {
+        run.generated = corpus.generate(options.directory)
+        if run.generated.error.len > 0 {
+            error := run.generated.error.clone()
+            return run.fail(error)
+        }
+        generated := run.generated.path.clone()
+        selfhost := run.selfhost_source.clone()
+        return add_case(&options, "generated", generated, "generated", &mut run) &&
+            add_case(&options, "selfhost", selfhost, "selfhost", &mut run)
+    }
+    for i in 0..options.cases.len {
+        requested := options.cases[i].clone()
+        source := run.files.resolve(requested)
+        if source.len == 0 { return inventory_failure(&mut run) }
+        known := source == parallel || source == serial
+        if known && options.expected_stdout.len > 0 { return run.fail("known selfhost cases use their authoritative validation") }
+        mode := if known { "selfhost" } else if options.expected_stdout.len > 0 { "custom" } else { "image_identity_only" }
+        if !add_case(&options, case_name(source, i), source, mode, &mut run) { return false }
+    }
+    true
+}
+
+fn freeze_provenance(options: &report.Options, run: &mut report.Run) -> bool {
+    mut native := sources.Graph { files: [], size: 0 }
+    for folder in ["selfhost", "stdlib", "runtime"] {
+        if !run.files.add_directory(options.root, folder, true, &mut native) { return inventory_failure(&mut run) }
+    }
+    for relative in ["tools/profile_compiler.ddr", "tools/benchmark_commands.ddr", "tools/benchmark_host.ddr",
+        "tools/benchmark_time.ddr", "tools/harness.ddr", "tools/native_probe.ddr", "tools/performance_corpus.ddr",
+        "tools/probe_cli.ddr", "tools/profile_compiler_records.ddr", "tools/profile_compiler_report.ddr",
+        "tools/profile_compiler_sources.ddr", "tools/profile_format.ddr", "tools/profile_source_scan.ddr", "tools/report_json.ddr", "examples/hello.ddr"] {
+        if !run.files.add(options.root + "/" + relative, false) { return inventory_failure(&mut run) }
+    }
+    if options.expected_stdout.len > 0 {
+        if !run.files.add(options.expected_stdout, false) { return inventory_failure(&mut run) }
+        path := run.files.resolutions.at(options.expected_stdout).clone()
+        digest := run.files.files[run.files.index.at(path)].sha256.clone()
+        run.custom_reference = report.Binary { path: path, sha256: digest }
+    }
+    for requested in options.input_files {
+        if !run.files.add(requested, false) { return inventory_failure(&mut run) }
+        run.runtime_inputs.push(run.files.resolutions.at(requested).clone())
+    }
+    run.has_inventory = true
+    run.checkpoint(&options) || run.fail("cannot checkpoint source inventory")
+}
+
+fn build_allocation_compiler(options: &report.Options, serial: string, run: &mut report.Run) -> bool {
+    path := options.directory + "/images/allocation-compiler"
+    mut output := harness.empty_output()
+    if !run.call(&options, "build allocation observer once",
+        [options.compiler.path.clone(), "build", relative(options.root, serial), "--target", options.native_target.clone(),
+         "--runtime-profile", "-o", path.clone()], options.root, &mut output) ||
+        !plain(&mut run, &output) { return false }
+    digest := sources.digest(path)
+    if digest.len == 0 { return run.fail("cannot fingerprint allocation compiler") }
+    run.allocation_compiler = report.Binary { path: path, sha256: digest }
+    run.checkpoint(&options) || run.fail("cannot checkpoint allocation compiler")
+}
+
+fn validate(options: &report.Options, run: &mut report.Run, index: i32, image: &report.Binary, suffix: string) -> bool {
+    name := run.cases[index].name.clone()
+    kind := run.cases[index].validation.clone()
+    cwd := options.directory + "/validation"
+    mut output := harness.empty_output()
+    if kind == "image_identity_only" { return true }
+    if kind == "generated" {
+        expected := bench.raw("595500\n")
+        return run.call(&options, f"verify {name}/{suffix}", [image.path.clone()], cwd, &mut output) &&
+            known_output(&mut run, &output, &expected)
+    }
+    if kind == "selfhost" {
+        if image.sha256 != options.compiler.sha256 { return run.fail("observed selfhost result differs from source fixed point") }
+        hello := cwd + "/" + name + "-" + suffix + "-hello"
+        expected := bench.raw("42\ntrue\n")
+        return run.call(&options, f"build hello with {name}/{suffix}",
+            [image.path.clone(), "build", options.root + "/examples/hello.ddr", "--target", options.native_target.clone(), "-o", hello.clone()],
+            cwd, &mut output) && plain(&mut run, &output) &&
+            run.call(&options, f"verify hello from {name}/{suffix}", [hello.clone()], cwd, &mut output) &&
+            known_output(&mut run, &output, &expected)
+    }
+    ref := sys.read_u8(run.custom_reference.path)
+    if !ref.ok { return run.fail("cannot read expected standard output") }
+    mut argv: []string = [image.path.clone()]
+    for arg in options.program_args { argv.push(arg.clone()) }
+    run.call(&options, f"verify {name}/{suffix}", move argv, cwd, &mut output) &&
+        known_output(&mut run, &output, &ref.value)
+}
+
+fn observer_record(options: &report.Options, output: &process.Output, observer: string,
+                   purpose: string, run: &mut report.Run, record: &mut json.Doc) -> bool {
+    raw := output.stderr_utf8()
+    if !raw.ok { return run.fail(f"{purpose}: invalid UTF-8 in observation stderr") }
+    if observer == "clock" {
+        clock := records.clock(raw.value, options.native_target)
+        if clock.error.len > 0 { return run.fail(clock.error) }
+        record = clock.record
+    } else {
+        allocation := records.allocation(raw.value)
+        if allocation.error.len > 0 { return run.fail(allocation.error) }
+        record = allocation.record
+    }
+    true
+}
+
+fn observe(options: &report.Options, run: &mut report.Run, index: i32, source: string, round: i32, observer: string) -> bool {
+    name := run.cases[index].name.clone()
+    suffix := f"{round:03}-{observer}"
+    path := options.directory + "/images/" + name + "-" + suffix
+    exe := if observer == "clock" { options.compiler.path.clone() } else { run.allocation_compiler.path.clone() }
+    mut argv: []string = [exe, "build", source.clone(), "--target", options.native_target.clone(), "-o", path.clone()]
+    if observer == "clock" { argv.push("--profile-compiler"); argv.push("--timings=json") }
+    mut output := harness.empty_output()
+    purpose := f"observe {name}/{round}/{observer}"
+    if !run.call(&options, purpose, move argv, options.root, &mut output) { return false }
+    mut record := json.Doc::parse_text("null")
+    if !observer_record(&options, &output, observer, purpose, &mut run, &mut record) { return false }
+    digest := sources.digest(path)
+    info := sys.metadata(path)
+    if digest.len == 0 || !info.is_file { return run.fail(f"{purpose}: cannot fingerprint output image") }
+    if run.cases[index].observations.len > 0 && run.cases[index].observations[0].image.sha256 != digest {
+        return run.fail(f"{name} emitted different images across observers/rounds")
+    }
+    image := report.Binary { path: path, sha256: digest }
+    run.cases[index].observations.push(report.Observation { round: round, observer: observer.clone(),
+        image: image.clone(), size: info.size, record: record })
+    if !run.checkpoint(&options) { return run.fail("cannot checkpoint observation") }
+    validate(&options, &mut run, index, &image, suffix)
+}
+
+fn collect(options: &report.Options, parallel: string, serial: string, run: &mut report.Run) -> bool {
+    mut build_graph := sources.Graph { files: [], size: 0 }
+    if !run.files.graph(options.root, parallel, &mut build_graph) ||
+       !run.files.graph(options.root, serial, &mut build_graph) { return inventory_failure(&mut run) }
+    if !identify(&options, parallel, serial, &mut run) || !prepare_cases(&options, parallel, serial, &mut run) ||
+       !freeze_provenance(&options, &mut run) || !build_allocation_compiler(&options, serial, &mut run) { return false }
+    for index in 0..run.cases.len {
+        path := run.cases[index].source.clone()
+        build_source := if path == parallel || path == serial { relative(options.root, path) } else { path.clone() }
+        for round in 0..options.rounds {
+            first := if round % 2 == 0 { "clock" } else { "allocation" }
+            second := if round % 2 == 0 { "allocation" } else { "clock" }
+            if !observe(&options, &mut run, index, build_source, round, first) ||
+               !observe(&options, &mut run, index, build_source, round, second) { return false }
+        }
+        run.cases[index].sha256 = run.cases[index].observations[0].image.sha256.clone()
+        name := run.cases[index].name.clone()
+        print(f"ATTRIBUTED {name}: {options.rounds} separate clock/allocation pairs; identical output images")
+    }
+    if sources.digest(options.compiler.path) != options.compiler.sha256 ||
+       sources.digest(run.allocation_compiler.path) != run.allocation_compiler.sha256 {
+        return run.fail("compiler image changed during collection")
+    }
+    if !run.files.verify() { return inventory_failure(&mut run) }
+    if !report.summarize(&options, &run.cases) { return run.fail("cannot write summary") }
+    run.complete = true
+    true
+}
+
+fn argument_error(message: string) -> i32 { _ := harness.fail(message); 2 }
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--rounds"), cli.option("--timeout"), cli.option("--case"),
+        cli.option("--expected-stdout"), cli.option("--program-arg"), cli.option("--input-file")]
+    args := cli.parse(&spec)
+    usage := "usage: profile_compiler COMPILER REPORT [--rounds N] [--timeout SECONDS] [--case SOURCE] " +
+        "[--expected-stdout PATH] [--program-arg ARG] [--input-file PATH]"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 { return argument_error(args.error) }
+    if args.positionals.len != 2 { return argument_error(usage) }
+    rounds := parse.integer(args.last("--rounds", "5"))
+    timeout := parse.integer(args.last("--timeout", "120"))
+    if !rounds.ok || rounds.value < 1 || rounds.value > 2147483647 || !timeout.ok || timeout.value < 1 ||
+        timeout.value > 9223372036854775 { return argument_error("rounds and timeout must be positive") }
+    requested_cases := args.all("--case")
+    program_args := args.all("--program-arg")
+    has_ref := args.has("--expected-stdout")
+    if (has_ref || program_args.len > 0) && requested_cases.len != 1 {
+        return argument_error("custom execution options require exactly one --case")
+    }
+    if program_args.len > 0 && !has_ref { return argument_error("--program-arg requires --expected-stdout to verify the run") }
+    cwd := fs.cwd()
+    root := harness.find_root()
+    if !cwd.ok || root.len == 0 { return argument_error("cannot locate Dunder checkout or working directory") }
+    compiler := fs.realpath(args.positionals[0])
+    if !compiler.ok { return argument_error("cannot resolve compiler") }
+    compiler_hash := sources.digest(compiler.value)
+    if compiler_hash.len == 0 { return argument_error("cannot fingerprint compiler") }
+    target := process.host_target()
+    entry := native_entry(target)
+    if entry.len == 0 { return argument_error(f"unsupported native host: {target}") }
+    mut expected := ""
+    if has_ref {
+        expected = sources.absolute(cwd.value, args.last("--expected-stdout", ""))
+        found := fs.realpath(expected)
+        if !found.ok || !sys.metadata(found.value).is_file { return argument_error("cannot resolve expected standard output") }
+    }
+    directory := harness.resolve_or_abs(args.positionals[1])
+    if !fs.mkdir_all(directory).ok { return argument_error("cannot create report directory") }
+    resolved := fs.realpath(directory)
+    entries := fs.list_dir(directory)
+    if !resolved.ok || !entries.ok || entries.entries.len != 0 { return argument_error("report directory must be empty") }
+    for subdir in ["images", "validation", "raw"] {
+        if !sys.mkdir(resolved.value + "/" + subdir).ok { return argument_error(f"cannot create report subdirectory {subdir}") }
+    }
+    parallel := root + "/selfhost/main_parallel.ddr"
+    serial := root + "/selfhost/" + entry + ".ddr"
+    mut cases: []string = []
+    for path in requested_cases { cases.push(sources.absolute(cwd.value, path)) }
+    mut inputs: []string = []
+    for path in move args.all("--input-file") { inputs.push(sources.absolute(cwd.value, path)) }
+    options := report.Options { root: root.clone(), directory: resolved.value, native_target: target,
+        compiler: report.Binary { path: compiler.value, sha256: compiler_hash }, rounds: i32(rounds.value),
+        timeout: timeout.value * 1000, cases: move cases, expected_stdout: expected,
+        program_args: move program_args, input_files: move inputs }
+    mut host := provenance.host()
+    if !provenance.describe(root, &mut host) { return 1 }
+    mut run := report.run(move host, parallel)
+    if !collect(&options, parallel, serial, &mut run) && run.failure.len == 0 {
+        run.failure = "could not collect compiler attribution"
+    }
+    if !run.checkpoint(&options) { return 1 }
+    if run.complete { 0 } else { 1 }
+}
