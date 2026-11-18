@@ -99,7 +99,7 @@ separate observations and must be reported separately.
 The untimed preflight enforces that image gate and validates every consumer:
 
 ```sh
-python3 tools/check-performance-images.py /path/to/whole-function-objects-final \
+dunder run tools/check_performance_images.ddr -- /path/to/whole-function-objects-final \
   /path/to/frozen-task-compiler /path/to/empty/image-report \
   --source-root /path/to/feature-checkout \
   --baseline-sha256 2a0a78477985a6f7542cd90278743bde96d5591bd8e6f50d0c2b702f55dc6020

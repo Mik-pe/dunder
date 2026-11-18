@@ -1,0 +1,268 @@
+capability filesystem, process
+
+import .harness as harness
+import .mir_contracts as contracts
+import .performance_corpus as corpus
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+struct Image {
+    bytes: i64,
+    sha256: string,
+}
+
+struct Comparison {
+    name: string,
+    baseline: Image,
+    candidate: Image,
+}
+
+struct Compiler {
+    path: string,
+    sha256: string,
+}
+
+struct Inputs {
+    root: string,
+    helper_path: string,
+    helper_sha256: string,
+    corpus_path: string,
+    corpus_sha256: string,
+    tool_path: string,
+    tool_sha256: string,
+    compilers: []Compiler,
+    sources: []corpus.SourceHash,
+}
+
+struct Workload {
+    source: string,
+    arguments: []string,
+    name: string,
+    expected: string,
+}
+
+fn fingerprint(path: string) -> Image {
+    data := sys.read_u8(path)
+    if !data.ok { return Image { bytes: 0, sha256: "" } }
+    Image { bytes: i64(data.value.len), sha256: harness.sha256_bytes_hex(&data.value) }
+}
+
+fn execute(runner: &mut contracts.Runner, program: string, arguments: []string, expected: string, use_output: bool) -> bool {
+    mut result := harness.empty_output()
+    if !runner.call(program, arguments, 0, &mut result) { return false }
+    if result.stderr.len > 0 { return runner.fail(f"{program} emitted stderr\n{result.stderr_text()}") }
+    if use_output && !bytes.equals_text(&result.stdout, 0, result.stdout.len, expected) {
+        return runner.fail(f"{program}: independent consumer result changed\nexpected: {expected}\nobserved: {result.stdout_text()}")
+    }
+    true
+}
+
+fn check(runner: &mut contracts.Runner, inputs: &Inputs, task: &Workload, cases: &mut []Comparison) -> bool {
+    mut images: []Image = []
+    variants := ["baseline", "candidate"]
+    for index in 0..variants.len {
+        label := variants[index].clone()
+        path := runner.work + "/" + task.name + "-" + label
+        if !execute(&mut runner, inputs.compilers[index].path, ["build", task.source.clone(), "-o", path.clone()], "", false) {
+            return false
+        }
+        identity := fingerprint(path)
+        if identity.sha256.len == 0 { return runner.fail(f"cannot hash {path}") }
+        images.push(move identity)
+        if task.name == "selfhost" {
+            hello := runner.work + "/hello-" + label
+            if !execute(&mut runner, path, ["build", inputs.root + "/examples/hello.ddr", "-o", hello.clone()], "", false) ||
+               !execute(&mut runner, hello, [], "42\ntrue\n", true) { return false }
+        } else if !execute(&mut runner, path, task.arguments, task.expected, true) { return false }
+    }
+    candidate := images.pop()
+    baseline := images.pop()
+    if baseline.sha256 != candidate.sha256 || baseline.bytes != candidate.bytes {
+        error := f"{task.name}: normal emitted image differs ({baseline.sha256} vs {candidate.sha256})"
+        cases.push(Comparison { name: task.name.clone(), baseline: baseline, candidate: candidate })
+        return runner.fail(error)
+    }
+    print(f"IDENTICAL {task.name} {baseline.sha256}")
+    cases.push(Comparison { name: task.name.clone(), baseline: baseline, candidate: candidate })
+    true
+}
+
+fn check_cases(runner: &mut contracts.Runner, inputs: &Inputs, generated: &corpus.Corpus, cases: &mut []Comparison) -> bool {
+    for kernel in move corpus.runtime_cases(1) {
+        name := kernel.name
+        source := inputs.root + "/benchmarks/runtime/" + name + ".ddr"
+        test := Workload { source: source, arguments: kernel.arguments, name: name, expected: kernel.expected }
+        if !check(&mut runner, &inputs, &test, &mut cases) { return false }
+    }
+    stress := Workload { source: generated.path.clone(), arguments: [], name: "generated", expected: "595500\n" }
+    if !check(&mut runner, &inputs, &stress, &mut cases) { return false }
+    entry := if target_is("macos") { "main" } else if target_is("arm64") { "linux" } else { "x86_linux" }
+    selfhost := Workload { source: inputs.root + "/selfhost/" + entry + ".ddr", arguments: [], name: "selfhost", expected: "" }
+    check(&mut runner, &inputs, &selfhost, &mut cases)
+}
+
+fn verify_inputs(runner: &mut contracts.Runner, inputs: &Inputs) -> bool {
+    after := corpus.snapshot(inputs.root)
+    if after.error.len > 0 { return runner.fail(after.error) }
+    if !corpus.same_sources(&inputs.sources, &after.files) { return runner.fail("benchmark source files changed during preflight") }
+    if harness.sha256_file_hex(inputs.helper_path) != inputs.helper_sha256 ||
+       harness.sha256_file_hex(inputs.corpus_path) != inputs.corpus_sha256 ||
+       harness.sha256_file_hex(inputs.tool_path) != inputs.tool_sha256 {
+        return runner.fail("tool changed during preflight")
+    }
+    for i in 0..inputs.compilers.len {
+        if harness.sha256_file_hex(inputs.compilers[i].path) != inputs.compilers[i].sha256 {
+            return runner.fail("compiler changed during preflight")
+        }
+    }
+    true
+}
+
+fn write_image(writer: &mut json.Writer, image: &Image) {
+    writer.object()
+    writer.key("sha256")
+    writer.string(image.sha256)
+    writer.key("bytes")
+    writer.integer(image.bytes)
+    writer.end()
+}
+
+fn report(directory: string, inputs: &Inputs, generated: &corpus.Corpus, cases: &[]Comparison,
+          runner: &contracts.Runner, complete: bool) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("complete"); writer.boolean(complete)
+    writer.key("source_root"); writer.string(inputs.root)
+    writer.key("source_hashes"); corpus.write_sources(&inputs.sources, &mut writer)
+    writer.key("performance_tool_sha256"); writer.string(inputs.helper_sha256)
+    writer.key("corpus_tool_sha256"); writer.string(inputs.corpus_sha256)
+    writer.key("tool_sha256"); writer.string(inputs.tool_sha256)
+    writer.key("compilers"); writer.object()
+    variants := ["baseline", "candidate"]
+    for i in 0..variants.len {
+        writer.key(variants[i]); writer.object()
+        writer.key("path"); writer.string(inputs.compilers[i].path)
+        writer.key("sha256"); writer.string(inputs.compilers[i].sha256)
+        writer.end()
+    }
+    writer.end()
+    writer.key("environment"); writer.object()
+    writer.key("PATH"); writer.string("/no-external-tools")
+    writer.end()
+    writer.key("cases"); writer.object()
+    for i in 0..cases.len {
+        writer.key(cases[i].name); writer.object()
+        writer.key("baseline"); write_image(&mut writer, &cases[i].baseline)
+        writer.key("candidate"); write_image(&mut writer, &cases[i].candidate)
+        writer.end()
+    }
+    writer.end()
+    writer.key("commands"); writer.array()
+    for command in runner.commands {
+        writer.object()
+        writer.key("command"); writer.array()
+        for arg in command.arguments { writer.string(arg) }
+        writer.end()
+        writer.key("status"); writer.integer(i64(command.status))
+        writer.key("stdout"); writer.string(command.stdout)
+        writer.key("stderr"); writer.string(command.stderr)
+        writer.end()
+    }
+    writer.end()
+    writer.key("scope"); writer.string("untimed image identity and exact consumer results; no C comparison")
+    if generated.sha256.len > 0 {
+        writer.key("generated_corpus"); generated.write(&mut writer)
+    }
+    if !complete { writer.key("error"); writer.string(runner.error) }
+    writer.end()
+    document := writer.finish()
+    path := directory + "/metadata.json"
+    (document.ok && sys.write_text(path, document.value + "\n").ok) || harness.fail(f"cannot write {path}")
+}
+
+fn exercise(directory: string, inputs: &Inputs) -> i32 {
+    work := fs.temp_dir("dunder-performance-images-")
+    if !work.ok {
+        _ := harness.fail("cannot create temporary work directory")
+        return 1
+    }
+    defer { _ := fs.remove_all(work.value) }
+    mut runner := contracts.Runner::new(inputs.compilers[0].path, work.value, true)
+    mut cases: []Comparison = []
+    generated := corpus.generate(work.value)
+    mut complete := false
+    if generated.error.len == 0 {
+        complete = check_cases(&mut runner, &inputs, &generated, &mut cases) && verify_inputs(&mut runner, &inputs)
+    } else {
+        _ := runner.fail(generated.error)
+    }
+    if report(directory, &inputs, &generated, &cases, &runner, complete) && complete { return 0 }
+    1
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--source-root"), cli.option("--baseline-sha256")]
+    args := cli.parse(&spec)
+    usage := "usage: check_performance_images BASELINE CANDIDATE REPORT --source-root PATH [--baseline-sha256 SHA256]"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 || args.positionals.len != 3 || !args.has("--source-root") {
+        if args.error.len > 0 { _ := harness.fail(args.error) }
+        _ := sys.eprint(usage)
+        return 2
+    }
+    mut compilers: []Compiler = []
+    for i in 0..2 {
+        path := fs.realpath(args.positionals[i])
+        if !path.ok {
+            _ := harness.fail(f"cannot resolve {args.positionals[i]}")
+            return 2
+        }
+        hash := harness.sha256_file_hex(path.value)
+        if hash.len == 0 {
+            _ := harness.fail(f"cannot hash {path.value}")
+            return 2
+        }
+        compilers.push(Compiler { path: path.value, sha256: hash })
+    }
+    required := args.last("--baseline-sha256", "")
+    if required.len > 0 && compilers[0].sha256 != required {
+        _ := harness.fail("baseline compiler hash differs from required frozen binary")
+        return 2
+    }
+    root := fs.realpath(args.last("--source-root", ""))
+    tool_root := harness.find_root()
+    if !root.ok || tool_root.len == 0 {
+        _ := harness.fail("cannot resolve source or tool checkout")
+        return 2
+    }
+    directory := harness.resolve_or_abs(args.positionals[2])
+    created := fs.mkdir_all(directory)
+    entries := fs.list_dir(directory)
+    if !created.ok || !entries.ok || entries.entries.len != 0 {
+        _ := harness.fail("report directory must be empty")
+        return 2
+    }
+    corpus_path := tool_root + "/tools/performance_corpus.ddr"
+    tool_path := tool_root + "/tools/check_performance_images.ddr"
+    legacy_path := root.value + "/tools/performance.py"
+    helper_path := if sys.metadata(legacy_path).is_file { legacy_path.clone() } else { corpus_path.clone() }
+    snapshot := corpus.snapshot(root.value)
+    if snapshot.error.len > 0 {
+        _ := harness.fail(snapshot.error)
+        return 2
+    }
+    inputs := Inputs {
+        root: root.value, helper_sha256: harness.sha256_file_hex(helper_path), helper_path: helper_path,
+        corpus_sha256: harness.sha256_file_hex(corpus_path), corpus_path: corpus_path,
+        tool_sha256: harness.sha256_file_hex(tool_path), tool_path: tool_path, compilers: compilers, sources: snapshot.files,
+    }
+    if inputs.helper_sha256.len == 0 || inputs.tool_sha256.len == 0 || inputs.corpus_sha256.len == 0 {
+        _ := harness.fail("cannot fingerprint the tools")
+        return 2
+    }
+    exercise(directory, &inputs)
+}
