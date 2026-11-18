@@ -675,12 +675,11 @@ specialfallen används där. Detta är en målpolicy, inte en ändrad semantik.
 
 `--const-div-opt=off` stänger av sänkningen separat från skalärpasset och
 ägaroptimeringen. Native-fragment och berörda testkvitton skiljer lägena åt.
-`tools/test-const-div.py` använder oberoende Pythonheltal för kvot avrundad
-mot noll och rest. Den provar faktiska Dunder-planers matematiska certifikat,
+`tools/test_const_div.ddr` beräknar kvot avrundad mot noll och rest med
+binär långdivision. Den provar faktiska Dunder-planers matematiska certifikat,
 uttömmande signerade bitbredder 3–10, breda 32-/64-bitarsfall, spill,
 nästlad aritmetik, kortslutning, exakt nativ fällkod och fällordning.
-Alla fyra mål byggs; host och Wasm körs. Wasm exponerar `unreachable`
-snarare än nativa fällkoder, vilket rapporteras separat.
+Alla tre nativa mål byggs och värdmaskinens program körs.
 
 ### Framefria registerfunktioner på ARM64
 

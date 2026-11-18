@@ -1,0 +1,477 @@
+capability process, filesystem
+
+import .const_div_oracle as oracle
+import .harness as harness
+import .mir_contracts as contracts
+import .native_probe as native
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+struct Vector {
+    width: i32,
+    divisor: i64,
+    numerators: []i64,
+}
+
+struct Domain {
+    width: i32,
+    divisor: i64,
+    vector: i32,
+}
+
+struct Program {
+    name: string,
+    source: string,
+    stdout: string,
+    status: i32,
+    helpers: i64,
+    lines: i64,
+}
+
+struct Variant {
+    name: string,
+    compiler: string,
+    flags: []string,
+}
+
+fn load_vectors(path: string, rows: &mut []Vector) -> bool {
+    data := sys.read_text(path)
+    if !data.ok { return harness.fail(f"cannot read {path}") }
+    lines := harness.lines(data.value)
+    if lines.len == 0 || lines[0] != "width\tdivisor\tnumerators" { return harness.fail("invalid division vector header") }
+    for index in 1..lines.len {
+        cells := text.split(lines[index], "\t")
+        if cells.len != 3 { return harness.fail(f"invalid division vector at row {index}") }
+        width_value := parse.integer(cells[0])
+        divisor := parse.integer(cells[1])
+        if !width_value.ok || (width_value.value != 32 && width_value.value != 64) || !divisor.ok {
+            return harness.fail(f"invalid divisor at row {index}")
+        }
+        width := i32(width_value.value)
+        low := oracle.minimum(width)
+        high := oracle.maximum(width)
+        mut values: []i64 = []
+        for field in move text.split(cells[2], ",") {
+            n := parse.integer(field)
+            if !n.ok || n.value < low || n.value > high || (n.value == low && divisor.value == -1) ||
+               (values.len > 0 && n.value <= values[values.len - 1]) {
+                return harness.fail(f"invalid numerator at row {index}")
+            }
+            values.push(n.value)
+        }
+        if divisor.value < low || divisor.value > high || values.len == 0 { return harness.fail(f"incomplete divisor row {index}") }
+        rows.push(Vector { width: width, divisor: divisor.value, numerators: values })
+    }
+    rows.len > 0 || harness.fail("division vectors are empty")
+}
+
+fn number_line(output: &mut []u8, value: i64) {
+    bytes.append_decimal(&mut output, value)
+    output.push(b'\n')
+}
+
+fn write_arithmetic(work: string, width: i32, vectors: &[]Vector, start: i32, count: i32, group: i32) -> Program {
+    type_name := f"i{width}"
+    label := if group < 10 { f"0{group}" } else { group.str() }
+    name := type_name + "_" + label
+    path := work + "/" + name + ".ddr"
+    mut source: []u8 = []
+    mut expected: []u8 = []
+    mut lines: i64 = 0
+    for i in 0..count {
+        divisor := vectors[start + i].divisor
+        bytes.append_utf8(&mut source, f"fn q{i}(n:{type_name})->{type_name}{{n/({divisor})}}\n")
+        bytes.append_utf8(&mut source, f"fn r{i}(n:{type_name})->{type_name}{{n%({divisor})}}\n")
+    }
+    bytes.append_utf8(&mut source, "fn main(){")
+    for i in 0..count {
+        row := &vectors[start + i]
+        bytes.append_utf8(&mut source, "{values:[]" + type_name + "=[")
+        for at in 0..row.numerators.len {
+            value := row.numerators[at]
+            if at > 0 { source.push(b',') }
+            bytes.append_decimal(&mut source, value)
+            quotient := oracle.quotient(value, row.divisor, width)
+            number_line(&mut expected, quotient)
+            number_line(&mut expected, value - quotient * row.divisor)
+            lines += 2
+        }
+        bytes.append_utf8(&mut source, f"];for n in values{{print(q{i}(n));print(r{i}(n))}}}}")
+    }
+    bytes.append_utf8(&mut source, "}\n")
+    if !sys.write_u8(path, &source).ok {
+        return Program { name: name, source: "", stdout: "", status: 0, helpers: 0, lines: 0 }
+    }
+    Program { name: name, source: path, stdout: bytes.decode(&expected).value, status: 0, helpers: i64(2 * count), lines: lines }
+}
+
+fn matches(filter: string, name: string) -> bool { filter.len == 0 || text.find(name, filter) >= 0 }
+
+fn programs(run: &mut contracts.Runner, fixtures: string, filter: string, vectors: &[]Vector, chosen: &mut []Program) -> bool {
+    work := run.work.clone()
+    for width in [32, 64] {
+        mut arithmetic: []Vector = []
+        for row in vectors {
+            if row.width == width && row.divisor != 0 { arithmetic.push(row.clone()) }
+        }
+        mut start := 0
+        mut group := 0
+        while start < arithmetic.len {
+            count := if arithmetic.len - start < 12 { arithmetic.len - start } else { 12 }
+            label := if group < 10 { f"0{group}" } else { group.str() }
+            if matches(filter, f"i{width}_{label}") {
+                program := write_arithmetic(work, width, &arithmetic, start, count, group)
+                if program.source.len == 0 { return run.fail(f"cannot write division group {width}/{group}") }
+                chosen.push(move program)
+            }
+            start += count
+            group += 1
+        }
+    }
+    for program in move compounds(fixtures) {
+        if matches(filter, program.name) { chosen.push(move program) }
+    }
+    for entry in move trap_data() {
+        (name, body, status) := entry
+        if !matches(filter, name) { continue }
+        path := f"{work}/{name}.ddr"
+        if !sys.write_text(path, body).ok { return run.fail(f"cannot prepare {path}") }
+        chosen.push(Program { name: name, source: path, stdout: "17\n", status: status, helpers: 1, lines: 0 })
+    }
+    true
+}
+
+fn plan_source(run: &mut contracts.Runner, module: string, vectors: &[]Vector, path: string, domains: &mut []Domain) -> bool {
+    stem := harness.parent_dir(module) + "/" + harness.stem(module)
+    relative := contracts.relative(run.work, stem)
+    mut source: []u8 = []
+    bytes.append_utf8(&mut source, "import " + json.quote(relative) + " as cd\n")
+    bytes.append_utf8(&mut source, "fn dump(p:&mut cd.Plan,d:i64,width:i32){\n" +
+        "    assert(cd.prepare_into(&mut p,d,width))\n    assert(p.supported)\n" +
+        "    mut fresh:=cd.new();assert(cd.prepare_into(&mut fresh,d,width))\n" +
+        "    assert(p.supported==fresh.supported && p.kind==fresh.kind && p.width==fresh.width &&\n" +
+        "        p.divisor==fresh.divisor && p.magic==fresh.magic && p.shift==fresh.shift &&\n" +
+        "        p.add==fresh.add && p.negative==fresh.negative && p.iterations==fresh.iterations)\n" +
+        "    print(p.width);print(p.divisor);print(p.kind);print(p.magic)\n" +
+        "    print(p.shift);print(p.add);print(p.negative);print(p.iterations)\n}\nfn main(){mut p:=cd.new();")
+    for width in 3..11 {
+        low := oracle.minimum(width)
+        high := oracle.maximum(width)
+        bytes.append_utf8(&mut source, f"{{mut d:i64={low};while d<={high}{{dump(&mut p,d,{width});d=d+1}}}}\n")
+        mut d := low
+        while d <= high {
+            domains.push(Domain { width: width, divisor: d, vector: -1 })
+            d += 1
+        }
+    }
+    mut three := -1
+    for width in [32, 64] {
+        bytes.append_utf8(&mut source, "{values:[]i64=[")
+        mut comma := false
+        for i in 0..vectors.len {
+            row := &vectors[i]
+            if row.width != width { continue }
+            if comma { source.push(b',') }
+            comma = true
+            bytes.append_decimal(&mut source, row.divisor)
+            domains.push(Domain { width: width, divisor: row.divisor, vector: i })
+            if width == 32 && row.divisor == 3 { three = i }
+        }
+        bytes.append_utf8(&mut source, f"];for d in values{{dump(&mut p,d,{width})}}}}\n")
+    }
+    if three < 0 { return run.fail("32-bit divisor 3 is missing") }
+    unsupported: [](i32, i32) = [(1, 2), (1, 65), (4, 3), (-5, 3)]
+    for entry in unsupported {
+        (value, width) := entry
+        bytes.append_utf8(&mut source, f"assert(!cd.prepare_into(&mut p,{value},{width}));assert(!p.supported);\n")
+        bytes.append_utf8(&mut source, "assert(p.kind==0 && p.magic==0 && p.shift==0 && !p.add && p.iterations==0);dump(&mut p,3,32);\n")
+        domains.push(Domain { width: 32, divisor: 3, vector: three })
+    }
+    bytes.append_utf8(&mut source, "}\n")
+    sys.write_u8(path, &source).ok || run.fail(f"cannot generate {path}")
+}
+
+fn native_image(run: &mut contracts.Runner, path: string, target: string) -> bool {
+    data := sys.read_u8(path)
+    (data.ok && native.image_header(&data.value, target) &&
+     (target != "arm64-macos" || bytes.equals_text(&data.value, 4, 8, "\x0c\0\0\x01"))) ||
+        run.fail(f"{target}: invalid native image {path}")
+}
+
+fn check_numerator(run: &mut contracts.Runner, plan: &oracle.Plan, domain: &Domain, value: i64, checked: &mut i64) -> bool {
+    if !oracle.conforms(&plan, value, domain.divisor, domain.width) {
+        return run.fail(f"i{domain.width}: plan for divisor {domain.divisor} disagrees for numerator {value}")
+    }
+    checked += 1
+    true
+}
+
+fn verify_plans(run: &mut contracts.Runner, output: string, domains: &[]Domain, vectors: &[]Vector, checked: &mut i64) -> bool {
+    lines := harness.lines(output)
+    if lines.len != domains.len * 8 { return run.fail(f"plan exporter returned {lines.len} fields; expected {domains.len * 8}") }
+    for index in 0..domains.len {
+        domain := &domains[index]
+        at := index * 8
+        width := parse.integer(lines[at])
+        divisor := parse.integer(lines[at + 1])
+        kind := parse.integer(lines[at + 2])
+        magic := parse.integer(lines[at + 3])
+        shift := parse.integer(lines[at + 4])
+        add := lines[at + 5].clone()
+        negative := lines[at + 6].clone()
+        iterations := parse.integer(lines[at + 7])
+        if !width.ok || width.value != i64(domain.width) || !divisor.ok || divisor.value != domain.divisor ||
+           !kind.ok || !magic.ok || !shift.ok || shift.value < 0 || shift.value >= width.value ||
+           (add != "true" && add != "false") || (negative != "true" && negative != "false") ||
+           !iterations.ok || iterations.value < 0 || iterations.value > 128 {
+            return run.fail(f"invalid plan record at row {index}, i{domain.width} divisor {domain.divisor}")
+        }
+        plan := oracle.Plan { kind: kind.value, magic: magic.value, shift: i32(shift.value), add: add == "true", negative: negative == "true" }
+        if !oracle.certificate(&plan, domain.divisor, domain.width) {
+            return run.fail(f"invalid multiplier certificate for i{domain.width} divisor {domain.divisor}")
+        }
+        if domain.vector < 0 {
+            mut n := oracle.minimum(domain.width)
+            high := oracle.maximum(domain.width)
+            while n <= high {
+                if !check_numerator(&mut run, &plan, &domain, n, &mut checked) { return false }
+                n += 1
+            }
+        } else {
+            if domain.divisor == -1 && !check_numerator(&mut run, &plan, &domain, oracle.minimum(domain.width), &mut checked) { return false }
+            for n in vectors[domain.vector].numerators {
+                if !check_numerator(&mut run, &plan, &domain, n, &mut checked) { return false }
+            }
+        }
+    }
+    true
+}
+
+fn check_plans(run: &mut contracts.Runner, module: string, legacy: bool, vectors: &[]Vector) -> bool {
+    path := run.work + "/plans.ddr"
+    compiler := run.compiler.clone()
+    mut domains: []Domain = []
+    if !plan_source(&mut run, module, &vectors, path, &mut domains) { return false }
+    mut result := harness.empty_output()
+    mut checked: i64 = 0
+    for target in 0..3 {
+        label := harness.target_name(target)
+        image := run.work + "/plans-" + label
+        mut args: []string = ["build", path.clone(), "--target", label.clone(), "-o", image.clone()]
+        if !legacy { args.push("--const-div-opt=off") }
+        if !run.call_timeout(compiler, args, 0, 120000, &mut result) || !native_image(&mut run, image, label) { return false }
+        if target == run.host {
+            if !run.call_timeout(image, [], 0, 120000, &mut result) ||
+               !verify_plans(&mut run, result.stdout_text(), &domains, &vectors, &mut checked) { return false }
+            run.add("executions", 1)
+        } else { run.add("cross_builds", 1) }
+    }
+    run.add("programs", 1)
+    print(f"PASS {domains.len} real Dunder plans; {checked} exact plan inputs; exhaustive signed widths 3..10")
+    true
+}
+
+fn check_programs(run: &mut contracts.Runner, cases: &[]Program, variants: &[]Variant, verify_selection: bool) -> bool {
+    mut result := harness.empty_output()
+    for program in cases {
+        for variant in variants {
+            for target in 0..3 {
+                label := harness.target_name(target)
+                image := f"{run.work}/{program.name}-{variant.name}-{label}"
+                mut args: []string = ["build", program.source.clone(), "--target", label.clone(), "-o", image.clone()]
+                for flag in variant.flags { args.push(flag.clone()) }
+                observed := verify_selection && variant.name != "baseline"
+                if observed { args.push("--timings=json") }
+                if !run.call_timeout(variant.compiler, args, 0, 120000, &mut result) || !native_image(&mut run, image, label) { return false }
+                if observed {
+                    doc := json.Doc::parse_text(result.stderr_text())
+                    optimizer := doc.field(doc.root, "optimizer")
+                    emitted := doc.get_i64(optimizer, "emitted")
+                    if !doc.ok || !doc.get_bool(optimizer, "enabled").value || !emitted.ok || emitted.value < program.helpers {
+                        return run.fail(f"{program.name} {label}: did not select enough typed helpers\n{result.stderr_text()}")
+                    }
+                }
+                if target != run.host { run.add("cross_builds", 1); continue }
+                if !run.call_timeout(image, [], program.status, 120000, &mut result) ||
+                   !harness.stdout_is(&result, program.stdout, program.name) { return false }
+                run.add("executions", 1)
+                run.add("result_lines", program.lines)
+            }
+        }
+        run.add("programs", 1)
+        if program.status != 0 { print(f"PASS {program.name} trap") }
+        else { print(f"PASS {program.name} {program.lines} independent results") }
+    }
+    true
+}
+
+fn check_invalid(run: &mut contracts.Runner, name: string, source: string, variants: &[]Variant) -> bool {
+    path := f"{run.work}/invalid_{name}.ddr"
+    image := run.work + "/previous"
+    if !sys.write_text(path, source).ok { return run.fail(f"cannot write {path}") }
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        for mode in ["check", "check-agent", "build"] {
+            mut prior_out: []u8 = []
+            mut prior_err: []u8 = []
+            mut compared := false
+            for variant in variants {
+                if !sys.write_text(image, "previous output").ok { return run.fail("cannot prepare invalid build sentinel") }
+                action := if mode == "check-agent" { "check" } else { mode.clone() }
+                mut args: []string = [action, path.clone(), "--target", target.clone()]
+                if mode == "check-agent" { args.push("--agent") }
+                if mode == "build" { args.push("-o"); args.push(image.clone()) }
+                for flag in variant.flags { args.push(flag.clone()) }
+                if !run.call_timeout(variant.compiler, args, 1, 120000, &mut result) { return false }
+                marker := sys.read_text(image)
+                if !marker.ok || marker.value != "previous output" ||
+                   (compared && (!bytes.equal(&prior_out, &result.stdout) || !bytes.equal(&prior_err, &result.stderr))) {
+                    return run.fail(f"{name} {target} {mode}: diagnostic or previous image changed")
+                }
+                prior_out = result.stdout.clone()
+                prior_err = result.stderr.clone()
+                compared = true
+                run.add("diagnostics", 1)
+            }
+        }
+    }
+    run.add("programs", 1)
+    print(f"PASS diagnostics {name}")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--baseline"), cli.flag("--legacy-only"), cli.flag("--verify-selection"),
+                          cli.option("--case"), cli.option("--plan-module")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_const_div COMPILER [--baseline COMPILER | --legacy-only] [--verify-selection] [--case NAME] [--plan-module FILE]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    if process.host_target().len == 0 { _ := harness.fail("execution requires a supported native host"); return 2 }
+    legacy := args.has("--legacy-only")
+    if legacy && args.has("--baseline") { _ := harness.fail("--legacy-only and --baseline are mutually exclusive"); return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("cannot locate Dunder repository root"); return 2 }
+    mut variants: []Variant = []
+    if args.has("--baseline") {
+        baseline := fs.realpath(args.last("--baseline", ""))
+        if !baseline.ok { _ := harness.fail("cannot locate baseline compiler"); return 2 }
+        variants.push(Variant { name: "baseline", compiler: baseline.value, flags: [] })
+    }
+    if legacy { variants.push(Variant { name: "legacy", compiler: compiler.clone(), flags: [] }) }
+    else {
+        variants.push(Variant { name: "off", compiler: compiler.clone(), flags: ["--const-div-opt=off"] })
+        variants.push(Variant { name: "on", compiler: compiler.clone(), flags: ["--const-div-opt=on"] })
+    }
+    mut hashes := Map<string, string>::new()
+    for variant in variants {
+        if !contracts.add_hash(&mut hashes, variant.compiler) { return 1 }
+    }
+    tmp := fs.temp_dir("dunder-const-div-")
+    if !tmp.ok { _ := harness.fail("cannot create constant-division workspace"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    work := fs.realpath(tmp.value)
+    if !work.ok { _ := harness.fail("cannot resolve constant-division workspace"); return 1 }
+    mut run := contracts.Runner::new(compiler, work.value, false)
+    fixtures := root + "/tests/fixtures/const_div"
+    mut vectors: []Vector = []
+    if !load_vectors(fixtures + "/vectors.tsv", &mut vectors) { return 1 }
+    filter := args.last("--case", "")
+    mut cases: []Program = []
+    if !programs(&mut run, fixtures, filter, &vectors, &mut cases) { return 1 }
+    plans := matches(filter, "plans")
+    if plans {
+        module := fs.realpath(args.last("--plan-module", root + "/selfhost/opt/const_div.ddr"))
+        if !module.ok { _ := harness.fail("cannot locate plan module"); return 1 }
+        if !contracts.add_hash(&mut hashes, module.value) || !check_plans(&mut run, module.value, legacy, &vectors) { return 1 }
+    }
+    if !check_programs(&mut run, &cases, &variants, args.has("--verify-selection")) { return 1 }
+    mut rejections := 0
+    for entry in move invalid_data() {
+        (name, source) := entry
+        if !matches(filter, name) { continue }
+        if !check_invalid(&mut run, name, source, &variants) { return 1 }
+        rejections += 1
+    }
+    if !plans && cases.len == 0 && rejections == 0 { _ := harness.fail("--case did not match any program"); return 2 }
+    if !contracts.unchanged(&hashes) { _ := harness.fail("compiler or plan module changed during the suite"); return 1 }
+    total := run.count("programs")
+    executions := run.count("executions")
+    cross_builds := run.count("cross_builds")
+    result_lines := run.count("result_lines")
+    diagnostics := run.count("diagnostics")
+    print(f"{total} programs; {executions} native executions; {cross_builds} other-target cross-builds; " +
+          f"{result_lines} checked result lines; {diagnostics} matching invalid diagnostics")
+    print("Native trap codes and pre-trap stdout are exact.")
+    0
+}
+
+fn compounds(fixtures: string) -> []Program {
+    [
+        Program { name: "compound_i32", source: fixtures + "/compound_i32.ddr", stdout: "88852\n-11111\n5184\n2\n25925\n-24216\n-153\n-14\n7\n2\n33\n-21\n0\n0\n0\n0\n0\n0\n2\n2\n0\n-2\n2\n0\n-52911\n17636\n-8231\n-2\n1\n38517\ntrue\n55\n", status: 0, helpers: 8, lines: 32 },
+        Program { name: "compound_i64", source: fixtures + "/compound_i64.ddr", stdout: "88852\n-11111\n5184\n2\n25925\n-24216\n-153\n-14\n7\n2\n33\n-21\n0\n0\n0\n0\n0\n0\n2\n2\n0\n-2\n2\n0\n-52911\n17636\n-8231\n-2\n1\n38517\ntrue\n55\n", status: 0, helpers: 8, lines: 32 },
+    ]
+}
+
+fn trap_data() -> [](string, string, i32) {
+    [
+        ("i32_div_zero", "fn f(n:i32)->i32{n/0}\nfn main(){mut n:i32=7;print(17);value:=f(n);print(99)}\n", 102),
+        ("i32_div_minimum_zero", "fn f(n:i32)->i32{n/0}\nfn main(){mut n:i32=-2147483648;print(17);value:=f(n);print(99)}\n", 102),
+        ("i32_div_minimum_negative_one", "fn f(n:i32)->i32{n/(-1)}\nfn main(){mut n:i32=-2147483648;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_div_numerator_overflow_before_zero", "fn f(n:i32)->i32{(n+1)/0}\nfn main(){mut n:i32=2147483647;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_div_numerator_overflow_before_one", "fn f(n:i32)->i32{(n+1)/1}\nfn main(){mut n:i32=2147483647;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_div_numerator_underflow_before_one", "fn f(n:i32)->i32{(n-1)/1}\nfn main(){mut n:i32=-2147483648;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_div_nested_zero_before_one", "fn f(n:i32)->i32{(n/0)/1}\nfn main(){mut n:i32=1;print(17);value:=f(n);print(99)}\n", 102),
+        ("i32_div_denominator_overflow", "fn f(n:i32)->i32{n/(2147483647+1)}\nfn main(){mut n:i32=0;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_rem_zero", "fn f(n:i32)->i32{n%0}\nfn main(){mut n:i32=7;print(17);value:=f(n);print(99)}\n", 102),
+        ("i32_rem_minimum_zero", "fn f(n:i32)->i32{n%0}\nfn main(){mut n:i32=-2147483648;print(17);value:=f(n);print(99)}\n", 102),
+        ("i32_rem_minimum_negative_one", "fn f(n:i32)->i32{n%(-1)}\nfn main(){mut n:i32=-2147483648;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_rem_numerator_overflow_before_zero", "fn f(n:i32)->i32{(n+1)%0}\nfn main(){mut n:i32=2147483647;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_rem_numerator_overflow_before_one", "fn f(n:i32)->i32{(n+1)%1}\nfn main(){mut n:i32=2147483647;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_rem_numerator_underflow_before_one", "fn f(n:i32)->i32{(n-1)%1}\nfn main(){mut n:i32=-2147483648;print(17);value:=f(n);print(99)}\n", 101),
+        ("i32_rem_nested_zero_before_one", "fn f(n:i32)->i32{(n/0)%1}\nfn main(){mut n:i32=1;print(17);value:=f(n);print(99)}\n", 102),
+        ("i32_rem_denominator_overflow", "fn f(n:i32)->i32{n%(2147483647+1)}\nfn main(){mut n:i32=0;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_div_zero", "fn f(n:i64)->i64{n/0}\nfn main(){mut n:i64=7;print(17);value:=f(n);print(99)}\n", 102),
+        ("i64_div_minimum_zero", "fn f(n:i64)->i64{n/0}\nfn main(){mut n:i64=-9223372036854775808;print(17);value:=f(n);print(99)}\n", 102),
+        ("i64_div_minimum_negative_one", "fn f(n:i64)->i64{n/(-1)}\nfn main(){mut n:i64=-9223372036854775808;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_div_numerator_overflow_before_zero", "fn f(n:i64)->i64{(n+1)/0}\nfn main(){mut n:i64=9223372036854775807;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_div_numerator_overflow_before_one", "fn f(n:i64)->i64{(n+1)/1}\nfn main(){mut n:i64=9223372036854775807;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_div_numerator_underflow_before_one", "fn f(n:i64)->i64{(n-1)/1}\nfn main(){mut n:i64=-9223372036854775808;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_div_nested_zero_before_one", "fn f(n:i64)->i64{(n/0)/1}\nfn main(){mut n:i64=1;print(17);value:=f(n);print(99)}\n", 102),
+        ("i64_div_denominator_overflow", "fn f(n:i64)->i64{n/(9223372036854775807+1)}\nfn main(){mut n:i64=0;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_rem_zero", "fn f(n:i64)->i64{n%0}\nfn main(){mut n:i64=7;print(17);value:=f(n);print(99)}\n", 102),
+        ("i64_rem_minimum_zero", "fn f(n:i64)->i64{n%0}\nfn main(){mut n:i64=-9223372036854775808;print(17);value:=f(n);print(99)}\n", 102),
+        ("i64_rem_minimum_negative_one", "fn f(n:i64)->i64{n%(-1)}\nfn main(){mut n:i64=-9223372036854775808;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_rem_numerator_overflow_before_zero", "fn f(n:i64)->i64{(n+1)%0}\nfn main(){mut n:i64=9223372036854775807;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_rem_numerator_overflow_before_one", "fn f(n:i64)->i64{(n+1)%1}\nfn main(){mut n:i64=9223372036854775807;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_rem_numerator_underflow_before_one", "fn f(n:i64)->i64{(n-1)%1}\nfn main(){mut n:i64=-9223372036854775808;print(17);value:=f(n);print(99)}\n", 101),
+        ("i64_rem_nested_zero_before_one", "fn f(n:i64)->i64{(n/0)%1}\nfn main(){mut n:i64=1;print(17);value:=f(n);print(99)}\n", 102),
+        ("i64_rem_denominator_overflow", "fn f(n:i64)->i64{n%(9223372036854775807+1)}\nfn main(){mut n:i64=0;print(17);value:=f(n);print(99)}\n", 101),
+        ("array_div_0", "fn f(a:&[]i64,i:i32)->i64{a[i]/(0)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_rem_0", "fn f(a:&[]i64,i:i32)->i64{a[i]%(0)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_div_1", "fn f(a:&[]i64,i:i32)->i64{a[i]/(1)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_rem_1", "fn f(a:&[]i64,i:i32)->i64{a[i]%(1)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_div_-1", "fn f(a:&[]i64,i:i32)->i64{a[i]/(-1)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_rem_-1", "fn f(a:&[]i64,i:i32)->i64{a[i]%(-1)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_div_3", "fn f(a:&[]i64,i:i32)->i64{a[i]/(3)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("array_rem_3", "fn f(a:&[]i64,i:i32)->i64{a[i]%(3)}\nfn main(){a:[]i64=[5];mut i:=-1;print(17);value:=f(&a,i);print(99)}\n", 103),
+        ("short_circuit_evaluated", "fn f(n:i64)->bool{n==0||n/0==1}\nfn main(){mut n:i64=1;print(17);value:=f(n);print(99)}\n", 102),
+    ]
+}
+
+fn invalid_data() -> [](string, string) {
+    [
+        ("type", "fn f(n:i64)->i64{n/true}\nfn main(){print(42)}\n"),
+        ("return", "fn f(n:i64)->bool{n/3}\nfn main(){print(42)}\n"),
+        ("immutable", "fn f(n:i64)->i64{n=n/3;n}\nfn main(){print(42)}\n"),
+        ("dead_type", "fn f(n:i64)->i64{if false{return n/true};n/3}\nfn main(){print(42)}\n"),
+        ("dead_literal_width", "fn f(n:i32)->i32{if false{return n/2147483648};n/3}\nfn main(){print(42)}\n"),
+        ("syntax", "fn f(n:i64)->i64{n/}\nfn main(){print(42)}\n"),
+    ]
+}
