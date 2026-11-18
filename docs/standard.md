@@ -299,7 +299,7 @@ Allokatorn återanvänder block per storleksklass. Läs [kostnader och gränser]
 
 ```sh
 dunder test tests/suite.ddr
-python3 tools/test-runtime-contracts.py "$(command -v dunder)"
+dunder run tools/test_runtime_contracts.ddr -- "$(command -v dunder)"
 ```
 
 Tester jämför map, set och sortering mot Pythons referensresultat. De

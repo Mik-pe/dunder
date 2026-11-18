@@ -1,0 +1,568 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_contracts as contracts
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Sample {
+    name: string,
+    source: string,
+    stdout: string,
+    status: i32,
+}
+
+struct Binding {
+    kind: i64,
+    name: string,
+    range: string,
+}
+
+struct Export {
+    ok: bool,
+    bindings: []Binding,
+    counters: []i64,
+    inline: []i64,
+}
+
+struct Options {
+    inline: bool,
+    scalar: bool,
+    check: bool,
+    reject: bool,
+    cache: string,
+}
+
+struct Build {
+    path: string,
+    report: Export,
+    diagnostic: string,
+    ok: bool,
+}
+
+struct Row {
+    sample: string,
+    target: i32,
+    mode: string,
+    bytes: i64,
+    hash: string,
+    report: Export,
+}
+
+struct Receipt {
+    rows: []Row,
+    cache: []Export,
+}
+
+fn append_repeated(output: &mut []u8, part: string, count: i32) {
+    for _ in 0..count { bytes.append_utf8(&mut output, part) }
+}
+
+fn stress_cases() -> []Sample {
+    mut cases := base_cases()
+    mut buffer: []u8 = []
+    bytes.append_utf8(&mut buffer, "fn inc(x:i32)->i32{x+1} fn main(){mut sum:=0;")
+    append_repeated(&mut buffer, "sum=sum+inc(1);", 160)
+    bytes.append_utf8(&mut buffer, "print(sum)}")
+    cases.push(Sample { name: "caller-budget", source: bytes.decode(&buffer).value, stdout: "320\n", status: 0 })
+    buffer.clear()
+    bytes.append_utf8(&mut buffer, "fn inc(x:i32)->i32{x+1} ")
+    for i in 0..20 {
+        bytes.append_utf8(&mut buffer, f"fn f{i}()->i32{{mut sum:=0;")
+        append_repeated(&mut buffer, "sum=sum+inc(1);", 100)
+        bytes.append_utf8(&mut buffer, "sum} ")
+    }
+    bytes.append_utf8(&mut buffer, "fn main(){mut sum:=0;")
+    for i in 0..20 { bytes.append_utf8(&mut buffer, f"sum=sum+f{i}();") }
+    bytes.append_utf8(&mut buffer, "print(sum)}")
+    cases.push(Sample { name: "many-callers", source: bytes.decode(&buffer).value, stdout: "4000\n", status: 0 })
+    buffer.clear()
+    bytes.append_utf8(&mut buffer, "fn id(x:i32)->i32{x} ")
+    for i in 0..340 {
+        bytes.append_utf8(&mut buffer, f"fn reject{i}(x:i32)->i32{{return ")
+        append_repeated(&mut buffer, "x+", 50)
+        bytes.append_utf8(&mut buffer, "x;mut y:=x} ")
+    }
+    tail := "fn tail(x:i32)->i32{x+1} fn main(){print(tail(9))}"
+    bytes.append_utf8(&mut buffer, tail)
+    cases.push(Sample { name: "source-budget", source: bytes.decode(&buffer).value, stdout: "10\n", status: 0 })
+    buffer.clear()
+    bytes.append_utf8(&mut buffer, "fn area(){region frame{}} ")
+    for i in 0..180 {
+        bytes.append_utf8(&mut buffer, f"fn large{i}(x:i32)->i32{{mut y:=x;")
+        append_repeated(&mut buffer, "y=y+1;", 40)
+        bytes.append_utf8(&mut buffer, "y} ")
+    }
+    bytes.append_utf8(&mut buffer, tail)
+    cases.push(Sample { name: "large-loan-active", source: bytes.decode(&buffer).value, stdout: "10\n", status: 0 })
+    cases
+}
+
+fn empty_export() -> Export { Export { ok: false, bindings: [], counters: [], inline: [] } }
+
+fn decode(output: string) -> Export {
+    mut reply := empty_export()
+    lines := harness.lines(output)
+    if lines.len < 16 || lines[0] != "COUNTERS" || lines[6] != "BINDINGS" { return reply }
+    for i in 1..6 {
+        field := parse.integer(lines[i])
+        if !field.ok || field.value < 0 { return reply }
+        reply.counters.push(field.value)
+    }
+    count := parse.integer(lines[7])
+    if !count.ok || count.value < 0 || count.value > i64((lines.len - 16) / 3) { return reply }
+    end := 8 + i32(count.value) * 3
+    if lines.len != end + 8 || lines[end] != "INLINE" { return reply }
+    for i in 0..i32(count.value) {
+        at := 8 + 3 * i
+        kind := parse.integer(lines[at])
+        if !kind.ok { return reply }
+        reply.bindings.push(Binding { kind: kind.value, name: lines[at + 1].clone(), range: lines[at + 2].clone() })
+    }
+    for i in (end + 1)..lines.len {
+        field := parse.integer(lines[i])
+        if !field.ok || field.value < 0 { return reply }
+        reply.inline.push(field.value)
+    }
+    reply.ok = reply.inline[0] <= 256 && reply.inline[1] <= 4096 && reply.inline[2] <= 32768 &&
+        reply.inline[3] <= 65536 && reply.inline[5] <= reply.inline[6]
+    reply
+}
+
+fn equal_bindings(a: &Export, b: &Export) -> bool {
+    if a.bindings.len != b.bindings.len { return false }
+    for i in 0..a.bindings.len {
+        l := &a.bindings[i]
+        r := &b.bindings[i]
+        if l.kind != r.kind || l.name != r.name || l.range != r.range { return false }
+    }
+    true
+}
+
+fn normal(active: bool) -> Options { Options { inline: active, scalar: true, check: false, reject: false, cache: "" } }
+fn toggle(active: bool) -> string { if active { "on" } else { "off" } }
+
+fn build(run: &mut contracts.Runner, emitter: string, name: string, source: string, target: i32, flags: &Options) -> Build {
+    path := f"{run.work}/{name}.ddr"
+    image := f"{run.work}/{name}-{target}-{toggle(flags.inline)}-{toggle(flags.scalar)}"
+    mut response := Build { path: image.clone(), report: empty_export(), diagnostic: "", ok: false }
+    if !sys.write_text(path, source).ok { _ := run.fail(f"cannot write {path}"); return response }
+    sentinel := "previous successful output"
+    if (flags.reject || flags.check) && !sys.write_text(image, sentinel).ok {
+        _ := run.fail(f"cannot prepare sentinel {image}")
+        return response
+    }
+    status := if flags.reject { 1 } else { 0 }
+    action := if flags.check { "check" } else { "build" }
+    args: []string = [path.clone(), image.clone(), target.str(), toggle(flags.inline), toggle(flags.scalar), flags.cache.clone(), action]
+    mut output := harness.empty_output()
+    if !run.call_timeout(emitter, args, status, 120000, &mut output) { return response }
+    if output.stderr.len != 0 { _ := run.fail(f"{name}: unexpected emitter stderr\n{output.stderr_text()}"); return response }
+    if flags.reject || flags.check {
+        previous := sys.read_text(image)
+        if !previous.ok || previous.value != sentinel {
+            _ := run.fail(f"{name} target {target}: rejected or check-only build changed the image")
+            return response
+        }
+    }
+    raw := output.stdout_text()
+    if flags.reject {
+        if !text.starts_with(raw, "ERROR\n") { _ := run.fail(f"missing error from {name}\n{raw}"); return response }
+        run.add("diagnostics", 1)
+        response.ok = true
+        response.diagnostic = raw
+        return response
+    }
+    report := decode(raw)
+    if !report.ok { _ := run.fail(f"{name}: invalid producer evidence\n{raw}"); return response }
+    if !flags.inline || !flags.scalar || flags.check {
+        for count in report.inline {
+            if count != 0 {
+                _ := run.fail(f"{name}: deferred producer recorded inline work\n{raw}")
+                return response
+            }
+        }
+    }
+    if !flags.check { run.add("api_builds", 1) }
+    response.ok = true
+    response.report = report
+    response
+}
+
+fn execute(run: &mut contracts.Runner, image: string, target: i32, stdout: string, status: i32) -> bool {
+    if target != run.host { run.add("cross_built_images", 1); return true }
+    mut output := harness.empty_output()
+    if !run.call_timeout(image, [], status, 120000, &mut output) { return false }
+    if output.stdout.len != stdout.len || output.stdout_text() != stdout {
+        return run.fail(f"{image}: expected {stdout}, got {output.stdout_text()}")
+    }
+    run.add("executions", 1)
+    true
+}
+
+fn equal_images(a: string, b: string) -> bool {
+    left := sys.read_u8(a)
+    right := sys.read_u8(b)
+    left.ok && right.ok && bytes.equal(&left.value, &right.value)
+}
+
+fn cli_comparison(run: &mut contracts.Runner, sample: &Sample, target: i32, disabled: string, baseline: string) -> bool {
+    old := f"{run.work}/{sample.name}-{target}-cli-off"
+    input := run.work + "/<source>"
+    if !sys.write_text(input, sample.source).ok { return run.fail("cannot write <source>") }
+    target_name := harness.target_name(target)
+    compiler := run.compiler.clone()
+    mut output := harness.empty_output()
+    if !run.call_timeout(compiler, ["build", "<source>", "--target", target_name.clone(), "--inline-opt=off", "-o", old.clone()],
+                         0, 120000, &mut output) { return false }
+    if !equal_images(old, disabled) { return run.fail(f"{sample.name} {target_name}: explicit CLI-off image changed") }
+    run.add("explicit_cli_off_checks", 1)
+    if baseline.len == 0 { return true }
+    previous := f"{run.work}/{sample.name}-{target}-baseline"
+    if !run.call_timeout(baseline, ["build", "<source>", "--target", target_name.clone(), "-o", previous.clone()],
+                         0, 120000, &mut output) { return false }
+    equal_images(previous, old) || run.fail(f"{sample.name} {target_name}: older baseline differs from explicit off")
+}
+
+fn record_row(run: &mut contracts.Runner, sample: &Sample, target: i32, active: bool, move built: Build,
+              rows: &mut []Row, hash: string) -> bool {
+    file := sys.metadata(built.path)
+    if !file.ok || hash.len == 0 { return run.fail(f"cannot inspect {built.path}") }
+    rows.push(Row { sample: sample.name.clone(), target: target, mode: toggle(active), bytes: file.size,
+                    hash: hash.clone(), report: built.report })
+    true
+}
+
+fn check_cases(run: &mut contracts.Runner, emitter: string, valid: &[]Sample, baseline: string, rows: &mut []Row) -> bool {
+    mut changed := false
+    mut caller_calls: i64 = 0
+    for sample in valid {
+        for target in 0..3 {
+            before := build(&mut run, emitter, sample.name, sample.source, target, &normal(false))
+            if !before.ok || !execute(&mut run, before.path, target, sample.stdout, sample.status) { return false }
+            after := build(&mut run, emitter, sample.name, sample.source, target, &normal(true))
+            if !after.ok || !execute(&mut run, after.path, target, sample.stdout, sample.status) { return false }
+            if !equal_bindings(&before.report, &after.report) { return run.fail(f"{sample.name} target {target}: bindings changed") }
+            off_hash := harness.sha256_file_hex(before.path)
+            on_hash := harness.sha256_file_hex(after.path)
+            if off_hash != on_hash { changed = true }
+            if target == run.host {
+                calls := after.report.inline[4]
+                if sample.name == "eager-unused" && calls != 1 { return run.fail("eager call did not use one inline entry") }
+                if sample.name == "caller-budget" {
+                    if calls <= 0 || calls >= 160 { return run.fail("caller did not reach its independent growth budget") }
+                    caller_calls = calls
+                }
+                if sample.name == "many-callers" {
+                    expected := i64(20) * if caller_calls < 100 { caller_calls } else { i64(100) }
+                    if calls != expected { return run.fail("callers did not use independent growth budgets") }
+                }
+            }
+            disabled := before.path.clone()
+            if !record_row(&mut run, &sample, target, false, move before, &mut rows, off_hash) ||
+               !record_row(&mut run, &sample, target, true, move after, &mut rows, on_hash) ||
+               !cli_comparison(&mut run, &sample, target, disabled, baseline) { return false }
+        }
+        print(f"PASS effects/results/bindings {sample.name}")
+    }
+    changed || run.fail("producer did not change any native image")
+}
+
+fn check_invalid(run: &mut contracts.Runner, emitter: string, invalid: &[]string) -> bool {
+    for i in 0..invalid.len {
+        name := f"invalid-{i}"
+        for target in 0..3 {
+            for check in [false, true] {
+                mut flags := normal(false)
+                flags.check = check
+                flags.reject = true
+                before := build(&mut run, emitter, name, invalid[i], target, &flags)
+                if !before.ok { return false }
+                flags.inline = true
+                after := build(&mut run, emitter, name, invalid[i], target, &flags)
+                if !after.ok { return false }
+                if before.diagnostic != after.diagnostic { return run.fail(f"{name} target {target}: diagnostic changed") }
+            }
+        }
+    }
+    true
+}
+
+fn check_scalar(run: &mut contracts.Runner, emitter: string, source: string) -> bool {
+    for target in 0..3 {
+        for checking in [false, true] {
+            mut flags := normal(false)
+            flags.scalar = checking
+            flags.check = checking
+            name := if checking { "checking" } else { "scalar-off" }
+            before := build(&mut run, emitter, name, source, target, &flags)
+            if !before.ok { return false }
+            flags.inline = true
+            after := build(&mut run, emitter, name, source, target, &flags)
+            if !after.ok { return false }
+            if !equal_bindings(&before.report, &after.report) || (!checking && !equal_images(before.path, after.path)) {
+                return run.fail(f"{name} target {target}: bypass changed bindings or native image")
+            }
+        }
+    }
+    true
+}
+
+fn check_cache(run: &mut contracts.Runner, emitter: string, cache: &mut []Export) -> bool {
+    mut flags := normal(true)
+    flags.cache = run.work + "/cache"
+    if !fs.mkdir_all(flags.cache).ok { return run.fail("cannot create inline cache") }
+    source := "fn private(x:i32)->i32{x+1} fn main(){print(private(8))}"
+    changed := "fn private(x:i32)->i32{x+2} fn main(){print(private(8))}"
+    host := run.host
+    first := build(&mut run, emitter, "cache-A", source, host, &flags)
+    if !first.ok || !execute(&mut run, first.path, host, "9\n", 0) { return false }
+    warm := build(&mut run, emitter, "cache-A-warm", source, host, &flags)
+    if !warm.ok || !equal_images(first.path, warm.path) || warm.report.counters[3] <= 0 {
+        return run.fail("warm inline image changed or did not reuse a fragment")
+    }
+    edited := build(&mut run, emitter, "cache-B", changed, host, &flags)
+    if !edited.ok || !execute(&mut run, edited.path, host, "10\n", 0) { return false }
+    if equal_images(edited.path, first.path) || edited.report.counters[3] != 0 {
+        return run.fail("private body edit did not invalidate the previous inline image")
+    }
+    edited_warm := build(&mut run, emitter, "cache-B-warm", changed, host, &flags)
+    if !edited_warm.ok || !equal_images(edited.path, edited_warm.path) || edited_warm.report.counters[3] <= 0 {
+        return run.fail("warm edited inline image changed or did not reuse a fragment")
+    }
+    cache.push(first.report.clone())
+    cache.push(warm.report.clone())
+    cache.push(edited.report.clone())
+    cache.push(edited_warm.report.clone())
+    true
+}
+
+fn run_suite(run: &mut contracts.Runner, root: string, source_root: string, baseline: string, valid: &[]Sample,
+             invalid: &[]string, receipt: &mut Receipt) -> bool {
+    path := run.work + "/inline-producer.ddr"
+    fixture := contracts.fixture_source("inline-producer.ddr", source_root, root, run.work)
+    if fixture.len == 0 || !sys.write_text(path, fixture).ok { return run.fail("cannot prepare inline producer API fixture") }
+    emitter := run.work + "/consumer"
+    compiler := run.compiler.clone()
+    mut result := harness.empty_output()
+    run.call_timeout(compiler, ["build", path.clone(), "-o", emitter.clone(), "--inline-opt=off"], 0, 120000, &mut result) &&
+        check_cases(&mut run, emitter, &valid, baseline, &mut receipt.rows) &&
+        check_invalid(&mut run, emitter, &invalid) &&
+        check_scalar(&mut run, emitter, valid[1].source) &&
+        check_cache(&mut run, emitter, &mut receipt.cache)
+}
+
+fn digest(source: string) -> string {
+    mut data: []u8 = []
+    bytes.append_utf8(&mut data, source)
+    harness.sha256_bytes_hex(&data)
+}
+
+fn write_numbers(writer: &mut json.Writer, keys: []string, values: &[]i64) {
+    writer.object()
+    for i in 0..keys.len {
+        writer.key(keys[i])
+        writer.integer(values[i])
+    }
+    writer.end()
+}
+
+fn write_export(writer: &mut json.Writer, report: &Export) {
+    writer.key("bindings")
+    writer.array()
+    for binding in report.bindings {
+        writer.array()
+        writer.integer(binding.kind)
+        writer.string(binding.name)
+        writer.string(binding.range)
+        writer.end()
+    }
+    writer.end()
+    writer.key("counters")
+    write_numbers(&mut writer, ["modeled", "optimized", "emitted", "reused", "fallbacks"], &report.counters)
+    writer.key("inline")
+    write_numbers(&mut writer, ["entries", "nodes", "tokens", "units", "calls", "words", "estimate"], &report.inline)
+}
+
+fn save_report(path: string, hashes: &Map<string, string>, valid: &[]Sample, invalid: &[]string,
+               run: &contracts.Runner, receipt: &Receipt, complete: bool) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("complete")
+    writer.boolean(complete)
+    writer.key("hashes")
+    writer.object()
+    for i in 0..hashes.len() {
+        writer.key(hashes.key_at(i))
+        writer.string(hashes.value_at(i))
+    }
+    writer.end()
+    writer.key("host")
+    contracts.write_host(&mut writer)
+    writer.key("valid_source_hashes")
+    writer.object()
+    for sample in valid {
+        writer.key(sample.name)
+        writer.string(digest(sample.source))
+    }
+    writer.end()
+    writer.key("invalid_source_hashes")
+    writer.array()
+    for source in invalid { writer.string(digest(source)) }
+    writer.end()
+    writer.key("expected_results")
+    writer.object()
+    for sample in valid {
+        writer.key(sample.name)
+        writer.object()
+        writer.key("stdout")
+        writer.string(sample.stdout)
+        writer.key("native_status")
+        writer.integer(i64(sample.status))
+        writer.end()
+    }
+    writer.end()
+    writer.key("limitations")
+    writer.array()
+    writer.string("Linux targets are cross-built when not the native host")
+    writer.string("cache counters describe performed work; source bindings are compared separately")
+    writer.end()
+    writer.key("commands")
+    run.write_commands_with_status_key(&mut writer, "expected_status")
+    writer.key("images")
+    writer.array()
+    for row in receipt.rows {
+        writer.object()
+        writer.key("case")
+        writer.string(row.sample)
+        writer.key("target")
+        writer.string(harness.target_name(row.target))
+        writer.key("mode")
+        writer.string(row.mode)
+        writer.key("sha256")
+        writer.string(row.hash)
+        writer.key("bytes")
+        writer.integer(row.bytes)
+        write_export(&mut writer, &row.report)
+        writer.end()
+    }
+    writer.end()
+    if receipt.cache.len == 4 {
+        keys := ["cold", "warm", "private_edit", "private_edit_warm"]
+        writer.key("cache")
+        writer.object()
+        for i in 0..4 {
+            writer.key(keys[i])
+            writer.object()
+            write_export(&mut writer, &receipt.cache[i])
+            writer.end()
+        }
+        writer.end()
+    }
+    if complete {
+        writer.key("valid_cases")
+        writer.integer(i64(valid.len))
+        writer.key("valid_builds")
+        writer.integer(i64(receipt.rows.len))
+        for key in ["api_builds", "diagnostics", "executions", "cross_built_images", "explicit_cli_off_checks"] {
+            writer.key(key)
+            writer.integer(run.count(key))
+        }
+    } else {
+        writer.key("error")
+        writer.string(run.error)
+    }
+    writer.end()
+    evidence.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--baseline"), cli.option("--source-root"), cli.option("--report")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_inline_producer COMPILER [--baseline COMPILER] [--source-root PATH] [--report FILE]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    source := fs.realpath(args.last("--source-root", root))
+    if root.len == 0 || !source.ok { _ := harness.fail("cannot locate the repository and source root"); return 2 }
+    mut baseline := ""
+    if args.has("--baseline") {
+        path := fs.realpath(args.last("--baseline", ""))
+        if !path.ok { _ := harness.fail("baseline compiler not found"); return 2 }
+        baseline = path.value
+    }
+    valid := stress_cases()
+    invalid := invalid_cases()
+    if valid.len != 23 || invalid.len != 10 { _ := harness.fail("unexpected size of inline corpus"); return 1 }
+    mut hashes := Map<string, string>::new()
+    if !contracts.hash_tree(&mut hashes, source.value + "/selfhost") ||
+       !contracts.add_hash(&mut hashes, compiler) ||
+       !contracts.add_hash(&mut hashes, root + "/tools/test_inline_producer.ddr") ||
+       !contracts.add_hash(&mut hashes, root + "/tests/fixtures/inline-producer.ddr") ||
+       (baseline.len > 0 && !contracts.add_hash(&mut hashes, baseline)) { return 1 }
+    temp := fs.temp_dir("dunder-inline-producer-")
+    if !temp.ok { _ := harness.fail("cannot create inline producer workspace"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    work := fs.realpath(temp.value)
+    if !work.ok { _ := harness.fail("cannot resolve inline producer workspace"); return 1 }
+    report := args.last("--report", "")
+    mut run := contracts.Runner::new(compiler, work.value, args.has("--report"))
+    mut receipt := Receipt { rows: [], cache: [] }
+    mut complete := run_suite(&mut run, root, source.value, baseline, &valid, &invalid, &mut receipt)
+    if complete && !contracts.unchanged(&hashes) { complete = run.fail("compiler or source changed during the suite") }
+    if run.record && !save_report(report, &hashes, &valid, &invalid, &run, &receipt, complete) { return 1 }
+    if !complete { return 1 }
+    diagnostics := run.count("diagnostics")
+    executions := run.count("executions")
+    cross_builds := run.count("cross_built_images")
+    cli_checks := run.count("explicit_cli_off_checks")
+    print(f"{receipt.rows.len} frozen all-target images; {diagnostics} exact invalid diagnostics; " +
+          f"{executions} host executions; {cross_builds} other-target images; " +
+          f"{cli_checks} explicit CLI-off byte comparisons; scalar-off/check/cache contracts passed")
+    0
+}
+
+fn base_cases() -> []Sample {
+    [
+        Sample { name: "eager-unused", source: "fn keep(a:i32,b:i32)->i32{a} fn effect(x:i32)->i32{print(x);x} fn main(){print(keep(effect(11),effect(22)))}", stdout: "11\n22\n11\n", status: 0 },
+        Sample { name: "eager-repeated", source: "fn twice(a:i32,b:i32)->i32{a+a+b} fn effect(x:i32)->i32{print(x);x} fn main(){print(twice(effect(11),effect(22)))}", stdout: "11\n22\n44\n", status: 0 },
+        Sample { name: "short-circuit", source: "fn safe(a:i32,b:i32)->bool{a==0||b/a>2} fn main(){assert(safe(0,9));assert(safe(2,9));print(42)}", stdout: "42\n", status: 0 },
+        Sample { name: "arity-eight", source: "fn mix(a:i32,b:i32,c:i32,d:i32,e:i32,f:i32,g:i32,h:i32)->i32{h+a+d+f+c+b+e+g} fn main(){print(mix(1,2,3,4,5,6,7,8))}", stdout: "36\n", status: 0 },
+        Sample { name: "i64", source: "fn calc(a:i64,b:i64)->i64{(a*7+b)/3} fn main(){value:=calc(1000000000000,17);assert(value==2333333333339);print(42)}", stdout: "42\n", status: 0 },
+        Sample { name: "i32-canonical", source: "fn same(x:i32)->i32{x} fn main(){print(same(-1))}", stdout: "-1\n", status: 0 },
+        Sample { name: "precedence", source: "fn calc(x:i32)->i32{(x*7+3)%5} fn main(){print(20+calc(11)*3)}", stdout: "20\n", status: 0 },
+        Sample { name: "nested-calls", source: "fn inner(x:i32)->i32{x*3} fn outer(x:i32,y:i32)->i32{x+y} fn main(){print(outer(inner(3),inner(4)))}", stdout: "21\n", status: 0 },
+        Sample { name: "shadowed-pointer", source: "fn chosen(x:i32)->i32{x+1} fn other(x:i32)->i32{x+10} fn main(){chosen:=other;print(chosen(3))}", stdout: "13\n", status: 0 },
+        Sample { name: "local-fallback", source: "fn calc(x:i32)->i32{mut y:=x;y=y+1;y} fn main(){print(calc(3))}", stdout: "4\n", status: 0 },
+        Sample { name: "call-fallback", source: "fn inc(x:i32)->i32{x+1} fn calc(x:i32)->i32{inc(x)} fn main(){print(calc(3))}", stdout: "4\n", status: 0 },
+        Sample { name: "loop-fallback", source: "fn calc(x:i32)->i32{mut sum:=0;for i in 0..x{sum=sum+i};sum} fn main(){print(calc(4))}", stdout: "6\n", status: 0 },
+        Sample { name: "arg-order-trap", source: "fn first(a:i32,b:i32)->i32{a} fn marker()->i32{print(71);4} fn zero()->i32{0} fn main(){print(first(marker(),8/zero()))}", stdout: "71\n", status: 102 },
+        Sample { name: "unused-trap", source: "fn first(a:i32,b:i32)->i32{a} fn zero()->i32{0} fn main(){print(first(3,8/zero()))}", stdout: "", status: 102 },
+        Sample { name: "body-trap-order", source: "fn div(a:i32,b:i32)->i32{a/b} fn marker()->i32{print(72);0} fn main(){print(div(4,marker()))}", stdout: "72\n", status: 102 },
+        Sample { name: "overflow-i32", source: "fn add(a:i32,b:i32)->i32{a+b} fn main(){print(add(2147483647,1))}", stdout: "", status: 101 },
+        Sample { name: "overflow-i64", source: "fn add(a:i64,b:i64)->i64{a+b} fn main(){value:=add(9223372036854775807,1);assert(value==0)}", stdout: "", status: 101 },
+        Sample { name: "min-rem", source: "fn rem(a:i64)->i64{a%(-1)} fn main(){value:=rem(-9223372036854775808);assert(value==0)}", stdout: "", status: 101 },
+        Sample { name: "dead-branch-short", source: "fn safe(a:i32,b:i32)->bool{a!=0&&b/a>2} fn main(){assert(!safe(0,9));print(42)}", stdout: "42\n", status: 0 },
+    ]
+}
+
+fn invalid_cases() -> []string {
+    [
+        "fn add(x:i32)->i32{x+2147483648} fn main(){print(add(1))}",
+        "fn add(x:i32)->i32{x=4;x} fn main(){print(add(1))}",
+        "fn add(x:i32)->i32{missing+x} fn main(){}",
+        "fn add(x:i32)->i32{if false{return true};x} fn main(){}",
+        "fn add(x:i32)->i32{x+1} fn main(){print(add(true))}",
+        "fn add(x:i32)->i32{x+1} fn main(){print(add())}",
+        "fn add(x:i32)->i32{x+1} fn main(){print(add(1,2))}",
+        "fn add(x:i32,x:i32)->i32{x} fn main(){}",
+        "fn add(x:i64)->bool{10/x>0} fn main(){}",
+        "fn add(x:i32)->i32{if x>0{return x}} fn main(){}",
+    ]
+}

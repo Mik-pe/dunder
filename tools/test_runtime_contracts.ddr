@@ -1,0 +1,261 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.parse as parse
+import std.text as text
+import sys
+
+@extern("c", "fork")
+unsafe fn c_fork() -> i32
+@extern("c", "execv")
+unsafe fn c_execv(path: ptr, args: ptr) -> i32
+@extern("c", "wait4")
+unsafe fn c_wait4(pid: i32, status: ptr, options: i32, usage: ptr) -> i32
+@extern("c", "_exit")
+unsafe fn c_exit(code: i32)
+@extern("c", "strtod")
+unsafe fn c_strtod(input: ptr, finish: ptr) -> f64
+
+@c_layout struct Rusage {
+    user_seconds: i64,
+    user_microseconds: i64,
+    system_seconds: i64,
+    system_microseconds: i64,
+    peak_rss: i64,
+    counters: [i64; 13],
+}
+
+struct Case {
+    name: string,
+    source: string,
+    status: i32,
+    bounded: bool,
+}
+
+struct Run {
+    compiler: string,
+    root: string,
+    work: string,
+    self_exe: string,
+    runner: string,
+    target: string,
+    timeout: i64,
+}
+
+struct FormatCase {
+    wide: bool,
+    expected: i64,
+}
+
+fn supervise(image: string) -> i32 {
+    mut path: []u8 = []
+    bytes.append_utf8(&mut path, image)
+    path.push(0)
+    mut status := 0
+    mut usage := Rusage { user_seconds: 0, user_microseconds: 0, system_seconds: 0, system_microseconds: 0,
+                          peak_rss: 0, counters: [0; 13] }
+    unsafe {
+        argv := [addr(&path[0]), ptr(0)]
+        pid := c_fork()
+        if pid < 0 { _ := harness.fail("cannot start bounded runtime child"); return 125 }
+        if pid == 0 {
+            _ := c_execv(argv[0], addr(&argv[0]))
+            c_exit(127)
+        }
+        if c_wait4(pid, addr(&mut status), 0, addr(&mut usage)) != pid {
+            _ := harness.fail("cannot reap bounded runtime child")
+            return 125
+        }
+    }
+    signal := status.bit_and(127)
+    if signal != 0 { return 128 + signal }
+    exit := status.shr(8).bit_and(255)
+    if exit != 0 { return exit }
+    rss := if target_is("macos") { usage.peak_rss / 1024 } else { usage.peak_rss }
+    if rss < 0 || rss >= 96 * 1024 { _ := harness.fail(f"peak RSS {rss} KiB outside the 96 MiB bound"); return 125 }
+    0
+}
+
+fn bounded(name: string) -> bool {
+    for fixture in ["array_ownership", "array_returns", "array_snapshots", "block_cleanup", "lexical_cleanup",
+                    "nested_arrays", "nested_ownership", "string_elements", "string_returns", "string_snapshots", "temporary_transfers"] {
+        if fixture == name { return true }
+    }
+    false
+}
+
+fn prepare(run: &Run, specs: &mut []Case) -> bool {
+    contracts := run.root + "/tests/contracts"
+    files := fs.list_dir(contracts)
+    if !files.ok { return harness.fail(f"cannot list {contracts}") }
+    for file in files.entries {
+        if !text.ends_with(file, ".ddr") { continue }
+        name := harness.stem(file)
+        specs.push(Case { name: name.clone(), source: contracts + "/" + file, status: 0, bounded: bounded(name) })
+    }
+    fixtures := run.root + "/tests/fixtures/runtime_contracts"
+    for name in ["integer_and_float", "utf8", "map_set_sort", "float_format"] {
+        source := f"{fixtures}/{name}.ddr"
+        if !sys.metadata(source).is_file { return harness.fail(f"missing oracle fixture {source}") }
+        specs.push(Case { name: name.clone(), source: source, status: 0, bounded: false })
+    }
+    for trap in move traps() {
+        (name, status, body) := trap
+        source := f"{run.work}/{name}.ddr"
+        if !sys.write_text(source, "enum Kind{A=1,B=9}\nfn main(){print(17);" + body + ";print(99)}").ok {
+            return harness.fail(f"cannot create {source}")
+        }
+        specs.push(Case { name: name, source: source, status: status, bounded: false })
+    }
+    true
+}
+
+fn select_cases(specs: &[]Case, requested: &[]string, selected: &mut []i32) -> bool {
+    if requested.len == 0 {
+        for i in 0..specs.len { selected.push(i) }
+        return true
+    }
+    mut valid := true
+    for name in requested {
+        mut index := -1
+        for i in 0..specs.len { if specs[i].name == name { index = i; break } }
+        if index < 0 { _ := harness.fail(f"unknown runtime contract {name}"); valid = false }
+        else { selected.push(index) }
+    }
+    valid
+}
+
+fn decimal_records(path: string, cases: &mut []FormatCase) -> bool {
+    source := sys.read_text(path)
+    if !source.ok { return harness.fail(f"cannot read {path}") }
+    for line in move harness.lines(source.value) {
+        wide := text.starts_with(line, "show(f64.from_bits(")
+        if !wide && !text.starts_with(line, "show(f32.from_bits(") { continue }
+        start := "show(f32.from_bits(".len
+        rest := line[start..line.len]
+        end := text.find(rest, ")")
+        if end < 0 { return harness.fail(f"invalid float oracle row {line}") }
+        known := parse.i64_range(rest, 0, end)
+        if !known.ok { return harness.fail(f"invalid float oracle bits {line}") }
+        cases.push(FormatCase { wide: wide, expected: known.value })
+    }
+    cases.len > 0 || harness.fail("float oracle has no expected bit patterns")
+}
+
+fn formatted(record: string, wide: bool, expected: i64) -> bool {
+    mut input: []u8 = []
+    for piece in move harness.lines(record) {
+        byte := parse.integer(piece)
+        if !byte.ok || byte.value < 1 || byte.value > 255 { return harness.fail(f"invalid emitted byte {piece}") }
+        input.push(u8(byte.value))
+    }
+    if input.len == 0 { return harness.fail("empty float formatter value") }
+    input.push(0)
+    mut value := 0.0
+    unsafe {
+        start := addr(&input[0])
+        mut end := ptr(0)
+        value = c_strtod(start, addr(&mut end))
+        if end == start || end != addr(&input[input.len - 1]) { return harness.fail("could not independently parse formatted float") }
+    }
+    actual := if wide { value.to_bits() } else { i64(f32(value).to_bits()) }
+    actual == expected || harness.fail(f"formatted float expected bits {expected}, independently decoded to {actual}")
+}
+
+fn check_format(output: string, source: string) -> bool {
+    mut cases: []FormatCase = []
+    if !decimal_records(source, &mut cases) { return false }
+    records := text.split(output, "-1\n")
+    if records.len != cases.len + 1 || records[records.len - 1] != "42\n" {
+        return harness.fail("float formatter emitted incomplete values")
+    }
+    for i in 0..cases.len {
+        if !formatted(records[i], cases[i].wide, cases[i].expected) { return false }
+    }
+    true
+}
+
+fn check_case(run: &Run, spec: &Case) -> bool {
+    image := f"{run.work}/{spec.name}.bin"
+    mut args: []string = ["build", spec.source.clone(), "-o", image.clone()]
+    if run.target.len > 0 { args.push("--target"); args.push(run.target.clone()) }
+    mut result := harness.empty_output()
+    if !harness.run_checked_timeout(run.compiler, args, run.root, 0, false, run.timeout, &mut result) { return false }
+    if run.runner.len > 0 {
+        if !harness.run_checked_timeout(run.runner, [image.clone()], run.work, spec.status, false, run.timeout, &mut result) { return false }
+    } else if spec.bounded {
+        if !harness.run_checked_timeout(run.self_exe, ["--supervise", image.clone()], run.work, 0, false, run.timeout, &mut result) { return false }
+    } else if !harness.run_checked_timeout(image, [], run.work, spec.status, false, run.timeout, &mut result) { return false }
+    actual := result.stdout_text()
+    if spec.name == "float_format" { return check_format(actual, spec.source) }
+    expected := if spec.status == 0 { "42\n" } else { "17\n" }
+    result.stdout.len == expected.len && harness.stdout_is(&result, expected, spec.name)
+}
+
+fn main() -> i32 {
+    if sys.arg(1) == "--supervise" { return supervise(sys.arg(2)) }
+    spec: []cli.Option = [cli.option("--target"), cli.option("--runner"), cli.option("--case"), cli.option("--timeout")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_runtime_contracts COMPILER [--target TARGET] [--runner EXECUTABLE] [--case NAME] [--timeout SECONDS]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    target := args.last("--target", "")
+    if args.has("--target") && target != "arm64-macos" && target != "arm64-linux" && target != "x86_64-linux" {
+        _ := harness.fail("expected native --target")
+        return 2
+    }
+    seconds := parse.Float64::parse(args.last("--timeout", "90"))
+    if !seconds.ok || !seconds.value.is_finite() || seconds.value <= 0.0 || seconds.value > 9223372036854774.0 {
+        _ := harness.fail("provide a positive representable timeout")
+        return 2
+    }
+    timeout := i64(seconds.value * 1000.0)
+    root := harness.find_root()
+    launcher := fs.realpath(sys.arg(0))
+    if root.len == 0 || !launcher.ok { _ := harness.fail("cannot locate repository or runtime test launcher"); return 2 }
+    temp := fs.temp_dir("dunder-contracts-")
+    if !temp.ok { _ := harness.fail("cannot create runtime contract directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    run := Run { compiler: compiler, root: root, work: temp.value.clone(), self_exe: launcher.value, target: target,
+                 runner: args.last("--runner", ""), timeout: if timeout > 0 { timeout } else { 1 } }
+    mut specs: []Case = []
+    if !prepare(&run, &mut specs) { return 1 }
+    mut selected: []i32 = []
+    if !select_cases(&specs, &args.all("--case"), &mut selected) { return 2 }
+    mut failed := 0
+    for index in selected {
+        contract := &specs[index]
+        if check_case(&run, &contract) { print(f"PASS {contract.name}") }
+        else { _ := harness.fail(contract.name); failed += 1 }
+    }
+    print(f"{selected.len - failed} passed, {failed} failed")
+    if failed == 0 { 0 } else { 1 }
+}
+
+fn traps() -> [](string, i32, string) {
+    [
+        ("i32_overflow", 101, "x := 2147483647; unused := x + 1"),
+        ("i64_overflow", 101, "x: i64 = 9223372036854775807; unused := x * 2"),
+        ("min_rem", 101, "x: i64 = -9223372036854775808; unused := x % -1"),
+        ("unsigned_overflow", 101, "x: u64 = 18446744073709551615; unused := x + 1"),
+        ("unsigned_narrow", 101, "x: u16 = 256; unused := u8(x)"),
+        ("zero_divisor", 102, "x := 0; unused := 1 / x"),
+        ("empty_pop", 103, "mut values: []i32 = []; unused := values.pop()"),
+        ("bad_index", 103, "values := [1, 2]; unused := values[-1]"),
+        ("string_bounds", 103, "unused := \"å\"[0..3]"),
+        ("assertion", 104, "assert(false)"),
+        ("string_capacity", 105, "mut text := \"x\"; for i in 0..25 { text = text + text }"),
+        ("utf8_boundary", 106, "unused := \"å\"[1..2]"),
+        ("empty_slice_boundary", 106, "unused := \"å\"[1..1]"),
+        ("negative_rune", 106, "unused := rune(-1)"),
+        ("rune_surrogate", 106, "unused := rune(55296)"),
+        ("rune_out_of_range", 106, "unused := rune(1114112)"),
+        ("invalid_float_cast", 107, "unused := i64(0.0 / 0.0)"),
+        ("invalid_enum_tag", 108, "unused := Kind(2)"),
+        ("negative_capacity", 109, "mut values: []i32 = []; values.reserve(-1)"),
+        ("excess_capacity", 109, "mut values: []i64 = []; values.reserve(2147483647)"),
+    ]
+}

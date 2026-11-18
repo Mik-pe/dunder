@@ -901,7 +901,7 @@ Med samma binär i båda positionerna och
 Korrektheten provas med referensresultat för signerad division och rest,
 IEEE 754, kortslutning och diagnostik. Minnesproven kör även om samma
 Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
-[Körbara kontrakt](../tools/test-runtime-contracts.py) · [Funktionscache](incremental.md).
+[Körbara kontrakt](../tools/test_runtime_contracts.ddr) · [Funktionscache](incremental.md).
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/README.md).
