@@ -1,0 +1,189 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import .task_source_cases as cases
+import .test_evidence as evidence
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn put(path: string, program: string) -> bool {
+    sys.write_text(path, program).ok || harness.fail(f"cannot write {path}")
+}
+
+fn execute(journal: &mut evidence.Journal, image: string, expected: string) -> bool {
+    mut output := harness.empty_output()
+    if !journal.run(image, [], &mut output) { return false }
+    got := output.stdout_text() + output.stderr_text()
+    got == expected || harness.fail(f"{image}: expected {expected}, got {got}")
+}
+
+fn invalid_message(result: &process.Output, expected: string, source: string) -> bool {
+    got := result.stdout_text() + result.stderr_text()
+    text.find(got, expected) >= 0 || harness.fail(f"{source}: expected {expected}\n{got}")
+}
+
+fn check_cases(journal: &mut evidence.Journal, compiler: string, out: string) -> bool {
+    mut output := harness.empty_output()
+    for entry in move cases.valid() {
+        (name, program, expected) := entry
+        source := f"{out}/{name}.ddr"
+        image := out + "/" + name
+        if !put(source, program + "\n") ||
+           !journal.run(compiler, ["build", source.clone(), "-o", image.clone()], &mut output) ||
+           !execute(&mut journal, image, expected) ||
+           !journal.run(compiler, ["check", source.clone(), "--agent"], &mut output) { return false }
+    }
+    for entry in move cases.invalid() {
+        (name, program, expected) := entry
+        source := f"{out}/{name}.ddr"
+        image := out + "/" + name
+        if !put(source, program + "\n") { return false }
+        for action in ["build", "check"] {
+            mut command: []string = [action.clone(), source.clone()]
+            if action == "build" { command.push("-o"); command.push(image.clone()) }
+            if !journal.run_expected(compiler, command, 1, &mut output) || !invalid_message(&output, expected, source) { return false }
+        }
+    }
+    for entry in move cases.traps() {
+        (name, program, status) := entry
+        source := f"{out}/{name}.ddr"
+        image := out + "/" + name
+        if !put(source, program + "\n") ||
+           !journal.run(compiler, ["build", source.clone(), "-o", image.clone()], &mut output) ||
+           !journal.run_expected(image, [], status, &mut output) { return false }
+    }
+    true
+}
+
+fn check_namespace(journal: &mut evidence.Journal, compiler: string, out: string) -> bool {
+    source := out + "/namespace.ddr"
+    image := out + "/namespace"
+    mut result := harness.empty_output()
+    put(out + "/jobs.ddr", "pub fn capacity()->i32{2}\n") &&
+        put(out + "/worker.ddr", "pub fn work(n:i64)->i64{n}\n") &&
+        put(source, "import jobs\nimport worker\nfn main(){task scope jobs(jobs.capacity()){id:=spawn jobs worker.work(42);print(await jobs(id))};print(jobs.capacity())}\n") &&
+        journal.run(compiler, ["build", source.clone(), "-o", image.clone()], &mut result) &&
+        execute(&mut journal, image, "42\n2\n")
+}
+
+fn no_fragments(result: &process.Output) -> bool {
+    output := result.stdout_text() + result.stderr_text()
+    mut found := false
+    for line in move harness.lines(output) {
+        if !text.starts_with(line, "{") { continue }
+        record := json.Doc::parse_text(line)
+        reused := record.get_i64(record.field(record.root, "functions"), "reused")
+        if !record.ok || (!found && (!reused.ok || reused.value != 0)) {
+            return harness.fail(f"task program used cached fragments or produced invalid timing evidence\n{output}")
+        }
+        found = true
+    }
+    found || harness.fail(f"expected task compiler timing evidence\n{output}")
+}
+
+fn check_incremental(journal: &mut evidence.Journal, compiler: string, out: string) -> bool {
+    safe := "fn helper(n:i64)->i64{n+1}\nfn work(n:i64)->i64{helper(n)}\nfn main(){task scope j(1){id:=spawn j work(41);print(await j(id))}}\n"
+    effectful := "fn helper(n:i64)->i64{print(n);n+1}\nfn work(n:i64)->i64{helper(n)}\nfn main(){task scope j(1){id:=spawn j work(41);print(await j(id))}}\n"
+    source := out + "/incremental.ddr"
+    mut result := harness.empty_output()
+    for scalar in ["on", "off"] {
+        for inline in ["on", "off"] {
+            if !put(source, safe) { return false }
+            scalar_flag := "--scalar-opt=" + scalar
+            inline_flag := "--inline-opt=" + inline
+            mut previous: []u8 = []
+            for repeat in 0..2 {
+                image := f"{out}/cached-{scalar}-{inline}-{repeat}"
+                if !journal.run(compiler, ["build", source.clone(), "-o", image.clone(), scalar_flag.clone(),
+                                           inline_flag.clone(), "--incremental", "--timings=json"], &mut result) ||
+                   !no_fragments(&result) || !execute(&mut journal, image, "42\n") { return false }
+                data := sys.read_u8(image)
+                if !data.ok || (repeat > 0 && !bytes.equal(&previous, &data.value)) {
+                    return harness.fail(f"{image}: warmed task image changed")
+                }
+                previous = data.value
+            }
+            if !put(source, effectful) ||
+               !journal.run_expected(compiler, ["build", source.clone(), "-o", out + "/stale", scalar_flag.clone(),
+                                               inline_flag.clone(), "--incremental"], 1, &mut result) ||
+               !invalid_message(&result, "effects outside", source) { return false }
+        }
+    }
+    true
+}
+
+fn check_targets(journal: &mut evidence.Journal, compiler: string, out: string, host: string) -> bool {
+    source := out + "/scalar_repeat.ddr"
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        image := f"{out}/scalar_repeat-{target}"
+        if !journal.run(compiler, ["build", source.clone(), "--target", target.clone(), "-o", image.clone()], &mut result) ||
+           !journal.run(compiler, ["check", source.clone(), "--target", target.clone()], &mut result) ||
+           (target == host && !execute(&mut journal, image, "49\n49\n")) { return false }
+    }
+    expected := "isolated tasks require a native target without runtime profiling"
+    for action in ["build", "check"] {
+        mut command: []string = [action.clone(), source.clone(), "--target", "wasm32"]
+        if action == "build" { command.push("-o"); command.push(out + "/unsupported-wasm") }
+        if !journal.run_expected(compiler, command, 1, &mut result) || !invalid_message(&result, expected, source) { return false }
+    }
+    dormant := out + "/unreachable.ddr"
+    if !put(dormant, "fn unused(){task scope j(1){}}\nfn main(){print(42)}\n") { return false }
+    for target in ["arm64-macos", "arm64-linux", "x86_64-linux", "wasm32"] {
+        if !journal.run(compiler, ["build", dormant.clone(), "--target", target.clone(), "-o", out + "/unreachable-" + target], &mut result) ||
+           !journal.run(compiler, ["check", dormant.clone(), "--target", target.clone()], &mut result) { return false }
+    }
+    journal.run_expected(compiler, ["build", source.clone(), "--runtime-profile", "-o", out + "/profiled"], 1, &mut result) &&
+        invalid_message(&result, expected, source)
+}
+
+fn save_summary(compiler: string, out: string) -> bool {
+    mut summary := json.Writer::new()
+    summary.object()
+    summary.key("result")
+    summary.string("passed")
+    summary.key("valid")
+    summary.integer(i64(cases.valid().len))
+    summary.key("invalid")
+    summary.integer(i64(cases.invalid().len))
+    summary.key("traps")
+    summary.integer(i64(cases.traps().len))
+    summary.key("compiler_sha256")
+    summary.string(harness.sha256_file_hex(compiler))
+    summary.end()
+    if !evidence.save(out + "/summary.json", &summary) { return false }
+    print(summary.finish().value)
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--source-root"), cli.option("--output")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_task_source COMPILER [--source-root PATH] [--output PATH]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    default_root := harness.find_root()
+    requested_root := args.last("--source-root", default_root)
+    if requested_root.len == 0 { _ := harness.fail("cannot locate the source root"); return 2 }
+    root := harness.resolve_or_abs(requested_root)
+    base := if default_root.len > 0 { default_root.clone() } else { root.clone() }
+    out := harness.resolve_or_abs(args.last("--output", base + "/build/task-source-qa"))
+    host := process.host_target()
+    if root.len == 0 || host.len == 0 || !fs.mkdir_all(out).ok {
+        _ := harness.fail("cannot locate the source root or prepare task source evidence")
+        return 2
+    }
+    mut journal := evidence.Journal::new(root, 60000)
+    passed := check_cases(&mut journal, compiler, out) && check_namespace(&mut journal, compiler, out) &&
+        check_incremental(&mut journal, compiler, out) && check_targets(&mut journal, compiler, out, host) &&
+        save_summary(compiler, out)
+    mut commands := json.Writer::new()
+    journal.write_to_keys(&mut commands, "command", "status")
+    saved := evidence.save(out + "/commands.json", &commands)
+    if passed && saved { 0 } else { 1 }
+}
