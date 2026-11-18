@@ -1,0 +1,175 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_differential as diff
+import .mir_oracle as oracle
+import .probe_cli as cli
+import std.fs as fs
+import std.json as json
+import sys
+
+fn counter_names() -> []string {
+    ["error", "frame_state", "value_state", "operations", "opaque", "optimized", "promoted", "removed_loads", "removed_stores",
+     "private_memory_ops", "analysis_units", "budget_refusals", "values_optimized", "value_rewrites", "value_deleted",
+     "value_immediates", "value_analysis_units", "value_budget_refusals"]
+}
+
+fn corpus() -> []diff.Input {
+    mut cases: []diff.Input = []
+    for case_id in [0, 4, 8, 9, 10, 13] {
+        cases.push(diff.Input { case_id: case_id, value: 41, condition: 0 })
+        cases.push(diff.Input { case_id: case_id, value: -17, condition: 1 })
+    }
+    cases.push(diff.Input { case_id: 10, value: 9223372036854775807, condition: 0 })
+    cases
+}
+
+fn counters_fit(counters: &[]i64, model: &oracle.Model, policy: i32) -> bool {
+    mut opaque: i64 = 0
+    for op in model.operations {
+        if op.kind == 0 { opaque += 1 }
+    }
+    if counters[0] != 0 || counters[3] != i64(model.order.len) || counters[4] != opaque { return false }
+    frame := counters[1]
+    if policy == 0 { return frame == 0 && counters[2] == 0 }
+    if policy == 3 {
+        refusals: i64 = if frame == -3 { 1 } else { 0 }
+        return (frame == -2 || frame == -3) && counters[11] == refusals &&
+               counters[17] == 1 && counters[5] == 0 && counters[12] == 0
+    }
+    true
+}
+
+struct Report {
+    run: diff.Run,
+    reference_pairs: i32,
+    worker_sha256: string,
+}
+
+fn check_case(emitter: string, work: string, host: i32, index: i32, item: diff.Input, report: &mut Report) -> bool {
+    value := diff.expected(item)
+    trap := diff.traps(item)
+    mut result := harness.empty_output()
+    for policy in 0..4 {
+        for target in 0..3 {
+            mut reference := ""
+            mut reference_sha := ""
+            for mode in ["reference", "pipeline"] {
+                image := f"{work}/{index}-{policy}-{target}-{mode}"
+                if !diff.call(emitter, [image.clone(), target.str(), item.case_id.str(), mode.clone(), item.value.str(), item.condition.str(),
+                                        value.str(), policy.str()], work, 0, 120000, &mut result) { return false }
+                output := result.stdout_text()
+                record := oracle.differential(output, 18)
+                if !record.ok { return harness.fail(f"{image}: invalid pipeline output\n{output}") }
+                before := oracle.decode(record.original)
+                after := oracle.decode(record.rewritten)
+                if !before.ok || !after.ok || !counters_fit(&record.counters, &after, policy) {
+                    return harness.fail(f"{image}: invalid pipeline model or counters\n{output}")
+                }
+                proof := diff.check(&before, &after, item, true)
+                if !proof.ok { return false }
+                sha := harness.sha256_file_hex(image)
+                if mode == "reference" {
+                    reference = output.clone()
+                    reference_sha = sha.clone()
+                } else {
+                    if output != reference || sha != reference_sha {
+                        return harness.fail(f"case {item.case_id}, policy {policy}, target {target}, input {item.value}: shared/reference mismatch")
+                    }
+                    report.reference_pairs += 1
+                }
+                live := target == host
+                status := if trap { 101 } else { 0 }
+                if live && !diff.call(image, [], work, status, 120000, &mut result) { return false }
+                report.run.record(diff.Image {
+                    input: item, policy: policy, target: target, mode: mode.clone(), sha256: sha,
+                    executed: live, trap: trap, proof: proof, counters: record.counters,
+                })
+            }
+        }
+    }
+    true
+}
+
+fn run_suite(compiler: string, root: string, work: string, host: i32, cases: &[]diff.Input, report: &mut Report) -> bool {
+    emitter := work + "/emitter"
+    fixture := root + "/tests/fixtures/mir-pipeline-emitter.ddr"
+    mut result := harness.empty_output()
+    if !diff.call(compiler, ["build", fixture, "-o", emitter.clone()], work, 0, 120000, &mut result) { return false }
+    report.run.emitter_sha256 = harness.sha256_file_hex(emitter)
+    for i in 0..cases.len {
+        item := cases[i]
+        if !check_case(emitter, work, host, i, item, &mut report) { return false }
+        print(f"PASS {i + 1}/{cases.len} case{item.case_id} input{item.value}")
+    }
+    worker := work + "/worker"
+    if !diff.call(compiler, ["build", root + "/tests/fixtures/mir-pipeline-worker.ddr", "-o", worker.clone()], work, 0, 120000, &mut result) ||
+       !diff.call(worker, [], work, 0, 120000, &mut result) || !harness.stdout_is(&result, "42\n", "isolated source-task worker") {
+        return false
+    }
+    report.worker_sha256 = harness.sha256_file_hex(worker)
+    true
+}
+
+fn save(path: string, compiler: string, root: string, manifest: string, report: &Report, names: &[]string) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("compiler_sha256")
+    writer.string(harness.sha256_file_hex(compiler))
+    writer.key("pipeline_sha256")
+    writer.string(harness.sha256_file_hex(root + "/selfhost/mir/mir_pipeline.ddr"))
+    writer.key("reference_sha256")
+    writer.string(harness.sha256_file_hex(root + "/tests/fixtures/mir-pipeline-reference.ddr"))
+    writer.key("fixture_sha256")
+    writer.string(harness.sha256_file_hex(root + "/tests/fixtures/mir-pipeline-emitter.ddr"))
+    writer.key("emitter_sha256")
+    writer.string(report.run.emitter_sha256)
+    writer.key("images")
+    diff.write_images(&mut writer, &report.run.images, &names, true)
+    writer.key("worker")
+    writer.object()
+    writer.key("executed")
+    writer.boolean(true)
+    writer.key("sha256")
+    writer.string(report.worker_sha256)
+    writer.key("result")
+    writer.integer(42)
+    writer.end()
+    writer.key("exact_reference_pairs")
+    writer.integer(i64(report.reference_pairs))
+    writer.key("images_built")
+    writer.integer(i64(report.run.images.len))
+    writer.key("executions")
+    writer.integer(i64(report.run.executions))
+    writer.key("oracle_pairs")
+    writer.integer(i64(report.run.pairs))
+    writer.key("oracle_gap_pairs")
+    writer.integer(i64(report.run.gaps))
+    writer.key("manifest_sha256")
+    writer.string(manifest)
+    writer.end()
+    diff.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--report")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_mir_pipeline <compiler> [--report PATH]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    tmp := fs.temp_dir("dunder-mir-pipeline-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    cases := corpus()
+    mut report := Report { run: diff.Run::new(), reference_pairs: 0, worker_sha256: "" }
+    if !run_suite(compiler, root, tmp.value, harness.host_id(), &cases, &mut report) { return 1 }
+    names := counter_names()
+    manifest := diff.manifest(&report.run.images, &names, true)
+    destination := args.last("--report", "")
+    if destination.len > 0 && !save(destination, compiler, root, manifest, &report, &names) { return 1 }
+    print(f"{report.reference_pairs} exact reference pairs; {report.run.images.len} images; {report.run.executions} host executions; {report.run.pairs} oracle pairs; {report.run.gaps} explicit call/trap gaps; worker=True")
+    print("manifest_sha256=" + manifest)
+    0
+}

@@ -1,0 +1,229 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_differential as diff
+import .mir_oracle as oracle
+import .probe_cli as cli
+import std.fs as fs
+import std.json as json
+import sys
+
+fn counter_names() -> []string {
+    ["rewrites", "deleted", "immediates", "units", "fact_slots", "fact_rows", "full_verifications"]
+}
+
+fn corpus() -> []diff.Input {
+    mut cases: []diff.Input = []
+    for case_id in 0..14 {
+        second: i64 = if case_id == 11 { 0 } else { 1 }
+        cases.push(diff.Input { case_id: case_id, value: 41, condition: 0 })
+        cases.push(diff.Input { case_id: case_id, value: -17, condition: second })
+        if case_id == 4 { cases.push(diff.Input { case_id: case_id, value: 9223372036854775806, condition: 0 }) }
+        if case_id == 5 || case_id == 6 {
+            cases.push(diff.Input { case_id: case_id, value: oracle.signed(u64(0xfedcba98ffffffff), 64), condition: 1 })
+        }
+        if case_id == 10 { cases.push(diff.Input { case_id: case_id, value: 9223372036854775807, condition: 0 }) }
+    }
+    cases
+}
+
+fn counters_fit(c: &[]i64, model: &oracle.Model, case_id: i32, mode: string) -> bool {
+    if mode == "off" && (c[0] != 0 || c[1] != 0 || c[2] != 0 || c[3] != 0) { return false }
+    changed := c[0] + c[1] > 0
+    if mode != "off" {
+        if case_id == 0 || case_id == 1 || case_id == 3 || case_id == 6 || case_id == 7 || case_id == 12 || case_id == 13 {
+            if !changed { return false }
+        }
+        if (case_id == 4 || case_id == 10) && (c[0] != 0 || c[1] != 0 || c[2] != 0) { return false }
+        if case_id == 7 {
+            for op in model.operations {
+                if (op.kind == 1 || op.kind == 3) && op.mode != 2 { return false }
+            }
+        }
+    }
+    c[6] == (if changed { i64(1) } else { i64(0) })
+}
+
+struct Compact {
+    model: string,
+    sha256: string,
+    counters: []i64,
+}
+
+fn matches(compact: &Compact, rewritten: string, sha: string, full: &[]i64) -> bool {
+    if compact.counters.len != 7 || rewritten != compact.model || sha != compact.sha256 ||
+       full[0] != compact.counters[0] || full[1] != compact.counters[1] ||
+       full[2] != compact.counters[2] || full[6] != compact.counters[6] { return false }
+    slots := full[4]
+    old := &compact.counters
+    if slots == 0 { return true }
+    slots == 32 && old[4] <= slots && old[5] <= full[5] && (old[4] == slots || old[3] < full[3])
+}
+
+struct Report {
+    run: diff.Run,
+    domain_pairs: i32,
+    reference_manifest: string,
+    compared: i32,
+}
+
+fn check_case(emitter: string, work: string, host: i32, index: i32, item: diff.Input, full_domain: bool, report: &mut Report) -> bool {
+    value := diff.expected(item)
+    trap := diff.traps(item)
+    mut result := harness.empty_output()
+    for target in 0..3 {
+        mut compact := Compact { model: "", sha256: "", counters: [] }
+        for mode in ["off", "on", "on-full"] {
+            if mode == "on-full" && !full_domain { break }
+            image := f"{work}/value-{index}-{target}-{mode}"
+            if !diff.call(emitter, [image.clone(), target.str(), item.case_id.str(), mode.clone(), item.value.str(),
+                                   item.condition.str(), value.str()], work, 0, 60000, &mut result) { return false }
+            output := result.stdout_text()
+            record := oracle.differential(output, 7)
+            if !record.ok { return harness.fail(f"{image}: invalid value report\n{output}") }
+            before := oracle.decode(record.original)
+            after := oracle.decode(record.rewritten)
+            if !before.ok || !after.ok || !counters_fit(&record.counters, &after, item.case_id, mode) {
+                return harness.fail(f"{image}: invalid value model or counters\n{output}")
+            }
+            proof := diff.check(&before, &after, item, false)
+            if !proof.ok { return false }
+            live := target == host
+            status := if trap { 101 } else { 0 }
+            if live && !diff.call(image, [], work, status, 60000, &mut result) { return false }
+            sha := harness.sha256_file_hex(image)
+            if mode == "on" {
+                compact = Compact { model: record.rewritten.clone(), sha256: sha.clone(), counters: record.counters.clone() }
+            } else if mode == "on-full" {
+                if !matches(&compact, record.rewritten, sha, &record.counters) {
+                    return harness.fail(f"{image}: compact/full semantic MIR, image or counters differ")
+                }
+                report.domain_pairs += 1
+            }
+            report.run.record(diff.Image {
+                input: item, policy: -1, target: target, mode: mode.clone(), sha256: sha,
+                executed: live, trap: trap, proof: proof, counters: record.counters,
+            })
+        }
+    }
+    true
+}
+
+fn run_suite(compiler: string, root: string, work: string, host: i32, cases: &[]diff.Input, full_domain: bool, report: &mut Report) -> bool {
+    emitter := work + "/emitter"
+    fixture := root + "/tests/fixtures/mir-value-emitter.ddr"
+    mut result := harness.empty_output()
+    if !diff.call(compiler, ["build", fixture, "-o", emitter.clone()], work, 0, 60000, &mut result) { return false }
+    report.run.emitter_sha256 = harness.sha256_file_hex(emitter)
+    for i in 0..cases.len {
+        item := cases[i]
+        if !check_case(emitter, work, host, i, item, full_domain, &mut report) { return false }
+        print(f"PASS {i + 1}/{cases.len} case{item.case_id} input{item.value} condition{item.condition}")
+    }
+    true
+}
+
+fn key(case_id: i64, value: i64, control: i64, target: i64, mode: string) -> string {
+    f"{case_id}:{value}:{control}:{target}:{mode}"
+}
+
+fn compare(path: string, report: &mut Report) -> bool {
+    data := sys.read_u8(path)
+    if !data.ok { return harness.fail(f"cannot read {path}") }
+    doc := json.Doc::parse_bytes(move data.value)
+    existing := doc.field(doc.root, "images")
+    manifest := doc.get_str(doc.root, "manifest_sha256")
+    if !doc.ok || doc.kind(existing) != .Array || !manifest.ok { return harness.fail(f"invalid prior matrix in {path}") }
+    mut hashes := Map<string, string>::new()
+    for i in 0..doc.count(existing) {
+        row := doc.at(existing, i)
+        case_id := doc.get_i64(row, "case")
+        value := doc.get_i64(row, "input")
+        control := doc.get_i64(row, "condition")
+        target := doc.get_i64(row, "target")
+        mode := doc.get_str(row, "mode")
+        sha := doc.get_str(row, "sha256")
+        if !case_id.ok || !value.ok || !control.ok || !target.ok || !mode.ok || !sha.ok {
+            return harness.fail(f"{path}: invalid prior matrix row {i}")
+        }
+        hashes.put(key(case_id.value, value.value, control.value, target.value, mode.value), move sha.value)
+    }
+    mut compared := 0
+    for row in report.run.images {
+        if row.mode == "on-full" { continue }
+        name := key(i64(row.input.case_id), row.input.value, row.input.condition, i64(row.target), row.mode)
+        if !hashes.contains(name) || hashes.at(name) != row.sha256 { return harness.fail(f"program image changed for {name}") }
+        compared += 1
+    }
+    if hashes.len() != compared { return harness.fail("prior matrix contains a different set of cases") }
+    report.compared = compared
+    report.reference_manifest = manifest.value
+    true
+}
+
+fn save(path: string, compiler: string, root: string, host: i32, manifest: string, report: &Report, names: &[]string) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("compiler_sha256")
+    writer.string(harness.sha256_file_hex(compiler))
+    writer.key("host_target")
+    writer.integer(i64(host))
+    writer.key("value_module_sha256")
+    writer.string(harness.sha256_file_hex(root + "/selfhost/mir/mir_value_prop.ddr"))
+    writer.key("fixture_sha256")
+    writer.string(harness.sha256_file_hex(root + "/tests/fixtures/mir-value-emitter.ddr"))
+    writer.key("emitter_sha256")
+    writer.string(report.run.emitter_sha256)
+    writer.key("images")
+    diff.write_images(&mut writer, &report.run.images, &names, false)
+    writer.key("images_built")
+    writer.integer(i64(report.run.images.len))
+    writer.key("executions")
+    writer.integer(i64(report.run.executions))
+    writer.key("oracle_pairs")
+    writer.integer(i64(report.run.pairs))
+    writer.key("oracle_gap_pairs")
+    writer.integer(i64(report.run.gaps))
+    writer.key("compact_full_exact_pairs")
+    writer.integer(i64(report.domain_pairs))
+    writer.key("manifest_sha256")
+    writer.string(manifest)
+    if report.reference_manifest.len > 0 {
+        writer.key("reference_manifest_sha256")
+        writer.string(report.reference_manifest)
+        writer.key("reference_program_sha256_matches")
+        writer.integer(i64(report.compared))
+    }
+    writer.end()
+    diff.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--report"), cli.option("--compare-report"), cli.flag("--full-domain")]
+    args := cli.parse(&spec)
+    usage := "usage: test_mir_values <compiler> [--report PATH] [--compare-report PATH] [--full-domain]"
+    compiler := cli.compiler(&args, usage)
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    tmp := fs.temp_dir("dunder-mir-values-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    cases := corpus()
+    host := harness.host_id()
+    mut report := Report { run: diff.Run::new(), domain_pairs: 0, reference_manifest: "", compared: 0 }
+    full := args.has("--full-domain")
+    if !run_suite(compiler, root, tmp.value, host, &cases, full, &mut report) { return 1 }
+    names := counter_names()
+    manifest := diff.manifest(&report.run.images, &names, false)
+    reference := args.last("--compare-report", "")
+    if reference.len > 0 && !compare(reference, &mut report) { return 1 }
+    destination := args.last("--report", "")
+    if destination.len > 0 && !save(destination, compiler, root, host, manifest, &report, &names) { return 1 }
+    print(f"{cases.len} programs/inputs; {report.run.images.len} images; {report.run.executions} host executions; {report.run.pairs} independent oracle pairs; {report.run.gaps} explicitly reported call/trap gaps")
+    print("manifest_sha256=" + manifest)
+    if full { print(f"{report.domain_pairs} compact/full pairs have identical semantic MIR, counters and program image SHA256s") }
+    if reference.len > 0 { print(f"{report.compared} program image SHA256s match the previous implementation") }
+    0
+}
