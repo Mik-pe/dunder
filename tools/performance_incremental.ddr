@@ -1,0 +1,417 @@
+capability filesystem, process
+
+import .benchmark_commands as bench
+import .benchmark_host as provenance
+import .benchmark_time as time
+import .compiler_matrix_runner as matrix
+import .harness as harness
+import .performance_corpus as corpus
+import .performance_incremental_report as receipt
+import .probe_cli as cli
+import .report_json as report
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+fn tool() -> string { "tools/performance_incremental.ddr" }
+
+fn helper_paths() -> []string {
+    ["tools/benchmark_commands.ddr", "tools/benchmark_host.ddr", "tools/benchmark_time.ddr", "tools/compiler_matrix_runner.ddr",
+     "tools/harness.ddr", "tools/native_probe.ddr", "tools/performance_corpus.ddr", "tools/performance_incremental_report.ddr",
+     "tools/probe_cli.ddr", "tools/report_json.ddr"]
+}
+
+fn state(label: string, move sources: []receipt.Source, expected: string) -> receipt.State {
+    receipt.State { label: label.clone(), sources: sources, expected: expected.clone() }
+}
+
+fn private_body(label: string, delta: i32, expected: string) -> receipt.State {
+    state(label, [
+        receipt.Source { name: "calc.ddr", contents: f"fn inc(x:i32)->i32{{x+{delta}}}\npub fn consume(x:i32)->i32{{inc(x)+inc(x+1)}}\n" },
+        receipt.Source { name: "main.ddr", contents: "import calc\nfn main(){mut total:=0;for i in 0..20{total=total+calc.consume(i)};print(total)}\n" },
+    ], expected)
+}
+
+fn layout(label: string, fields: string) -> receipt.State {
+    state(label, [
+        receipt.Source { name: "catalog.ddr", contents: "pub struct Pair{" + fields + "}\n" +
+            "pub fn make()->Pair{Pair{left:11,right:7}}\npub fn weight(value:&Pair)->i64{value.left*100+value.right}\n" },
+        receipt.Source { name: "main.ddr", contents: "import catalog\nfn main(){value:=catalog.make();print(catalog.weight(&value));print(value.left);print(value.right)}\n" },
+    ], "1107\n11\n7\n")
+}
+
+fn workloads(inputs: string, target: string, generated: string) -> []receipt.Case {
+    entry := if target == "arm64-macos" { "main" } else if target == "arm64-linux" { "linux" } else { "x86_linux" }
+    [
+        receipt.Case { name: "generated_unchanged", kind: "generated", entry: generated.clone(), states: [state("A", [], "595500\n")] },
+        receipt.Case { name: "selfhost_unchanged", kind: "selfhost", entry: inputs + "/selfhost/" + entry + ".ddr",
+            states: [state("A", [], "42\ntrue\n")] },
+        receipt.Case { name: "private_body_edit", kind: "probe", entry: inputs + "/private/main.ddr",
+            states: [private_body("A", 1, "440\n"), private_body("B", 2, "480\n")] },
+        receipt.Case { name: "shared_layout_edit", kind: "probe", entry: inputs + "/layout/main.ddr",
+            states: [layout("A", "left:i64,right:i64"), layout("B", "right:i64,left:i64")] },
+    ]
+}
+
+fn freeze(source: string, dest: string, path: string, sha256: string, run: &mut receipt.Run) -> bool {
+    file := sys.read_u8(source)
+    if !file.ok || harness.sha256_bytes_hex(&file.value) != sha256 { return run.fail(f"input changed while copying: {source}") }
+    if !fs.mkdir_all(harness.parent_dir(dest)).ok || !sys.write_u8(dest, &file.value).ok {
+        return run.fail(f"cannot write source snapshot: {dest}")
+    }
+    run.inputs.push(corpus.SourceHash { path: path.clone(), sha256: sha256.clone() })
+    true
+}
+
+fn snapshot(options: &receipt.Options, sources: &[]corpus.SourceHash, inputs: string, run: &mut receipt.Run) -> bool {
+    for source in sources {
+        name := source.path.clone()
+        if text.starts_with(name, "selfhost/") || text.starts_with(name, "stdlib/") || text.starts_with(name, "runtime/") {
+            if !freeze(options.root + "/" + name, inputs + "/" + name, name, source.sha256, &mut run) { return false }
+        }
+    }
+    hello_hash := run.hello_hash.clone()
+    if !freeze(options.root + "/examples/hello.ddr", inputs + "/hello.ddr", "hello.ddr", hello_hash, &mut run) { return false }
+    run.generated = corpus.generate(inputs)
+    if run.generated.error.len > 0 {
+        message := run.generated.error.clone()
+        return run.fail(message)
+    }
+    files := fs.list_dir(inputs + "/corpus")
+    if !files.ok { return run.fail("cannot list generated sources") }
+    for filename in files.entries {
+        relative := "corpus/" + filename
+        sha256 := harness.sha256_file_hex(inputs + "/" + relative)
+        if sha256.len == 0 { return run.fail(f"cannot fingerprint {relative}") }
+        run.inputs.push(corpus.SourceHash { path: relative, sha256: sha256 })
+    }
+    true
+}
+
+fn install(case: &receipt.Case, state: i32, run: &mut receipt.Run) -> bool {
+    folder := harness.parent_dir(case.entry)
+    for source in case.states[state].sources {
+        if !fs.mkdir_all(folder).ok || !sys.write_text(folder + "/" + source.name, source.contents).ok {
+            return run.fail(f"cannot install {case.name}/{case.states[state].label}/{source.name}")
+        }
+    }
+    true
+}
+
+fn run_command(run: &mut receipt.Run, move argv: []string, cwd: string, purpose: string, measured: bool,
+               output: &mut process.Output, elapsed: &mut i64) -> bool {
+    tmp := cwd + "/tmp/"
+    if !fs.mkdir_all(tmp).ok { return run.fail(f"cannot create {tmp}") }
+    mut args: []string = []
+    for i in 1..argv.len { args.push(argv[i].clone()) }
+    mut command := process.command(argv[0].clone(), move args)
+    command.set_cwd(cwd.clone())
+    command.clear_env()
+    command.set_env("PATH", "/no-external-tools")
+    command.set_env("TMPDIR", tmp.clone())
+    command.set_timeout(120000)
+    started := if measured { time.now_ns() } else { 0 }
+    if started < 0 { return run.fail("monotonic clock unavailable") }
+    result := command.exec()
+    finished := if measured { time.now_ns() } else { 0 }
+    elapsed = finished - started
+    status := if result.signal > 0 { -result.signal } else { result.code }
+    stdout := report.text_output(&result.stdout)
+    stderr := report.text_output(&result.stderr)
+    run.commands.push(receipt.Command { argv: move argv, cwd: cwd.clone(), tmp: tmp, purpose: purpose.clone(), measured: measured,
+        status: status, nanoseconds: elapsed, stdout: stdout.clone(), stderr: stderr.clone() })
+    if !result.succeeded() {
+        return run.fail(f"{purpose}: exit {status} (process error {result.error}, timed out {result.timed_out})\n{stdout}\n{stderr}")
+    }
+    if measured && finished <= started { return run.fail("monotonic clock did not advance during the sample") }
+    output = result
+    true
+}
+
+fn clear_image(path: string, run: &mut receipt.Run) -> bool {
+    !sys.metadata(path).ok || sys.remove_file(path).ok || run.fail(f"cannot remove previous output: {path}")
+}
+
+fn validate(image: string, case: &receipt.Case, state: i32, driver: &receipt.Driver, work: string, run: &mut receipt.Run) -> bool {
+    cwd := work + "/validation/" + driver.name + "/" + case.name
+    purpose := case.name + "/" + driver.name + "/" + case.states[state].label
+    mut output := harness.empty_output()
+    mut ignored: i64 = 0
+    if case.kind == "selfhost" {
+        hello := cwd + "/hello"
+        if !clear_image(hello, &mut run) ||
+            !run_command(&mut run, [image.clone(), "build", work + "/inputs/hello.ddr", "-o", hello.clone()], cwd,
+                purpose + "/hello-build", false, &mut output, &mut ignored) ||
+            !run_command(&mut run, [hello.clone()], cwd, purpose + "/hello-run", false, &mut output, &mut ignored) { return false }
+    } else if !run_command(&mut run, [image.clone()], cwd, purpose + "/program-run", false, &mut output, &mut ignored) {
+        return false
+    }
+    expected := case.states[state].expected.clone()
+    wanted := bench.raw(expected)
+    bytes.equal(&output.stdout, &wanted) ||
+        run.fail(f"{purpose}: runtime output differed\nexpected:\n{expected}\nobserved:\n{report.text_output(&output.stdout)}")
+}
+
+struct Build { image: receipt.Image, elapsed: i64, stderr: string }
+
+fn build(options: &receipt.Options, case_index: i32, case: &receipt.Case, state: i32, variant: i32, work: string,
+         group: string, observer: bool, run: &mut receipt.Run, result: &mut Build) -> bool {
+    driver := &options.drivers[variant]
+    cwd := work + "/" + group + "/" + driver.name + "/" + case.name
+    image := cwd + "/image"
+    if !clear_image(image, &mut run) { return false }
+    mut argv: []string = [driver.path.clone(), "build", case.entry.clone(), "--target", options.target.clone(), "-o", image.clone()]
+    for flag in driver.flags { argv.push(flag.clone()) }
+    if group != "references" { argv.push("--incremental") }
+    if observer { argv.push("--timings=json") }
+    purpose := case.name + "/" + driver.name + "/" + case.states[state].label + "/" + group
+    mut output := harness.empty_output()
+    mut elapsed: i64 = 0
+    if !run_command(&mut run, move argv, cwd, purpose, group == "measured" && !observer, &mut output, &mut elapsed) { return false }
+    stderr := report.text_output(&output.stderr)
+    if !observer && output.stderr.len > 0 { return run.fail(f"{purpose}: unexpected instrumentation/diagnostic\n{stderr}") }
+    sha256 := harness.sha256_file_hex(image)
+    info := sys.metadata(image)
+    if sha256.len == 0 || !info.is_file { return run.fail(f"{purpose}: cannot fingerprint output image") }
+    if group != "references" {
+        reference := run.cases[case_index].variants[variant].references[state].clone()
+        if sha256 != reference.sha256 || info.size != reference.size {
+            return run.fail(f"{purpose}: incremental/nonincremental image mismatch")
+        }
+    }
+    if !validate(image, &case, state, &driver, work, &mut run) { return false }
+    result = Build { image: receipt.Image { sha256: sha256, size: info.size }, elapsed: elapsed, stderr: stderr }
+    true
+}
+
+fn empty_build() -> Build { Build { image: receipt.Image { sha256: "", size: 0 }, elapsed: 0, stderr: "" } }
+
+fn nonnegative(field: json.IntField) -> bool { field.ok && field.value >= 0 }
+
+fn valid_timings(doc: &json.Doc, target: string) -> bool {
+    if !doc.ok || doc.get_str(0, "kind").value != "timings" || doc.get_i64(0, "version").value != 1 ||
+        doc.get_str(0, "operation").value != "build" || doc.get_str(0, "scope").value != "compiler_pipeline" ||
+        doc.get_str(0, "clock").value != "monotonic" || !doc.get_bool(0, "clock_ok").value ||
+        doc.get_str(0, "unit").value != "ns" || doc.get_str(0, "target").value != target { return false }
+    skipped := doc.field(0, "skipped_phases")
+    phases := doc.field(0, "phases")
+    if doc.kind(skipped) != .Array || doc.count(skipped) != 0 || doc.kind(phases) != .Object || doc.count(phases) != 5 {
+        return false
+    }
+    mut total: i64 = 0
+    for name in ["module_load_lex_resolve", "build_setup", "compiler", "image_format_sign", "publication"] {
+        value := doc.get_i64(phases, name)
+        if !nonnegative(value) || value.value > 9223372036854775807 - total { return false }
+        total += value.value
+    }
+    functions := doc.field(0, "functions")
+    recorded := doc.get_i64(0, "total")
+    recorded.ok && recorded.value == total && nonnegative(doc.get_i64(functions, "reused")) &&
+        nonnegative(doc.get_i64(functions, "emitted"))
+}
+
+fn cache_info(folder: string, cache: &mut receipt.Cache) -> bool {
+    files := fs.list_dir(folder)
+    if !files.ok { return false }
+    for name in files.entries {
+        path := folder + "/" + name
+        info := sys.metadata(path)
+        if info.is_dir && !fs.is_symlink(path) {
+            if !cache_info(path, &mut cache) { return false }
+        } else if info.is_file && text.ends_with(name, ".fn") {
+            content := sys.read_u8(path)
+            if !content.ok { return false }
+            cache.files += 1
+            cache.size += info.size
+            if content.value.len >= 136 && bytes.equals_text(&content.value, 128, 136, "44554644") { cache.dufd += 1 }
+            else { cache.invalid += 1 }
+        }
+    }
+    true
+}
+
+fn replay(options: &receipt.Options, index: i32, case: &receipt.Case, variant: i32, work: string, priming: bool,
+          run: &mut receipt.Run) -> bool {
+    driver := &options.drivers[variant]
+    group := if priming { "measured" } else { "observers" }
+    mut labels: []string = ["cold_prime", if priming { "warm_prime" } else { "warm_unchanged" }]
+    if !priming && case.states.len == 2 { labels.push("edit_A_to_B"); labels.push("edit_B_to_A") }
+    mut replay := receipt.replay()
+    for step in 0..labels.len {
+        state := if step == 2 { 1 } else { 0 }
+        if !priming && !install(&case, state, &mut run) { return false }
+        mut result := empty_build()
+        if !build(&options, index, &case, state, variant, work, group, true, &mut run, &mut result) { return false }
+        timings := json.Doc::parse_text(result.stderr)
+        context := case.name + "/" + driver.name + "/" + labels[step]
+        if !valid_timings(&timings, options.target) { return run.fail(f"{context}: invalid timing observation\n{result.stderr}") }
+        reused := timings.get_i64(timings.field(0, "functions"), "reused").value
+        if priming && step == 0 && reused != 0 { return run.fail(f"{context}: cache was not empty") }
+        if priming && step == 1 && reused == 0 { return run.fail(f"{context}: no warm fragment reuse") }
+        replay.observations.push(receipt.Observation { label: labels[step].clone(),
+            state: if priming { "" } else { case.states[state].label.clone() }, data: timings })
+    }
+    folder := work + "/" + group + "/" + driver.name + "/" + case.name + "/build/.dunder-cache"
+    if sys.metadata(folder).is_dir && !cache_info(folder, &mut replay.cache) {
+        return run.fail(f"cannot enumerate cache: {folder}")
+    }
+    if priming {
+        if replay.cache.files == 0 { return run.fail(f"{case.name}/{driver.name}: no cache fragments") }
+        run.cases[index].variants[variant].primes = move replay
+    } else { run.cases[index].variants[variant].observer = move replay }
+    true
+}
+
+fn exercise_case(options: &receipt.Options, work: string, sources: &[]corpus.SourceHash, cases: &[]receipt.Case,
+                 index: i32, run: &mut receipt.Run) -> bool {
+    case := &cases[index]
+    run.cases.push(receipt.case_report(case.name))
+    for state in 0..case.states.len {
+        if !install(&case, state, &mut run) { return false }
+        for variant in 0..options.drivers.len {
+            mut result := empty_build()
+            if !build(&options, index, &case, state, variant, work, "references", false, &mut run, &mut result) { return false }
+            run.cases[index].variants[variant].references.push(move result.image)
+        }
+    }
+    if !install(&case, 0, &mut run) { return false }
+    for variant in 0..options.drivers.len {
+        if !replay(&options, index, &case, variant, work, true, &mut run) { return false }
+    }
+    if !receipt.checkpoint(&options, &run, &sources, &cases) { return run.fail("cannot checkpoint cache primes") }
+    for round in 0..options.rounds {
+        state := if round % 2 == 0 && case.states.len == 2 { 1 } else { 0 }
+        if !install(&case, state, &mut run) { return false }
+        order := matrix.order(options.drivers.len, round)
+        for position in 0..order.len {
+            variant := order[position]
+            mut result := empty_build()
+            if !build(&options, index, &case, state, variant, work, "measured", false, &mut run, &mut result) { return false }
+            run.samples.push(receipt.Sample { name: case.name.clone(), variant: options.drivers[variant].name.clone(),
+                round: round, position: position, state: case.states[state].label.clone(), nanoseconds: result.elapsed,
+                image: move result.image })
+        }
+    }
+    if !receipt.checkpoint(&options, &run, &sources, &cases) { return run.fail("cannot checkpoint measured samples") }
+    for variant in 0..options.drivers.len {
+        if !replay(&options, index, &case, variant, work, false, &mut run) { return false }
+    }
+    if !install(&case, 0, &mut run) { return false }
+    if !receipt.checkpoint(&options, &run, &sources, &cases) { return run.fail("cannot checkpoint observer replay") }
+    print("completed incremental/" + case.name)
+    true
+}
+
+fn verify_inputs(options: &receipt.Options, before: &corpus.Snapshot, run: &mut receipt.Run) -> bool {
+    after := corpus.selfhost_snapshot(options.root)
+    if after.error.len > 0 || !corpus.same_sources(&before.files, &after.files) {
+        return run.fail("repository source changed during measurement")
+    }
+    if harness.sha256_file_hex(options.root + "/examples/hello.ddr") != run.hello_hash {
+        return run.fail("hello source changed during measurement")
+    }
+    if harness.sha256_file_hex(options.root + "/" + tool()) != run.tool_hash { return run.fail("measurement tool changed") }
+    for i in 0..run.helpers.len {
+        path := run.helpers[i].path.clone()
+        if harness.sha256_file_hex(options.root + "/" + path) != run.helpers[i].sha256 {
+            return run.fail(f"measurement helper changed: {path}")
+        }
+    }
+    for driver in options.drivers {
+        if harness.sha256_file_hex(driver.path) != driver.sha256 { return run.fail(f"{driver.name} compiler changed during measurement") }
+    }
+    true
+}
+
+fn finish(options: &receipt.Options, before: &corpus.Snapshot, work: string, cases: &mut []receipt.Case,
+          run: &mut receipt.Run) -> bool {
+    if !provenance.collect(options.root, &mut run.host) { return run.fail("cannot collect machine and checkout provenance") }
+    if work.len == 0 { return run.fail("cannot create benchmark work directory") }
+    inputs := work + "/inputs"
+    if !snapshot(&options, &before.files, inputs, &mut run) { return false }
+    cases = workloads(inputs, options.target, run.generated.path)
+    for i in 0..cases.len {
+        if !exercise_case(&options, work, &before.files, &cases, i, &mut run) { return false }
+    }
+    if !verify_inputs(&options, &before, &mut run) { return false }
+    if !receipt.write_protocol(options.report_dir) || !receipt.summarize(&options, &run) {
+        return run.fail("cannot write completed benchmark report")
+    }
+    run.complete = true
+    receipt.checkpoint(&options, &run, &before.files, &cases)
+}
+
+fn argument_error(message: string) -> i32 {
+    _ := harness.fail(message)
+    2
+}
+
+fn allowed(flag: string) -> bool {
+    if !text.starts_with(flag, "--") { return false }
+    equal := text.find(flag, "=")
+    name := if equal >= 0 { flag[0..equal] } else { flag.clone() }
+    for fixed in ["--timings", "--profile-compiler", "--runtime-profile", "--incremental", "--target", "--app", "--agent", "--run", "--output"] {
+        if name == fixed { return false }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--rounds"), cli.option("--baseline-flag"), cli.option("--candidate-flag")]
+    args := cli.parse(&spec)
+    usage := "usage: performance_incremental BASELINE CANDIDATE REPORT [--rounds N] [--baseline-flag FLAG] [--candidate-flag FLAG]"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 { return argument_error(args.error) }
+    if args.positionals.len != 3 { return argument_error(usage) }
+    rounds := parse.integer(args.last("--rounds", "30"))
+    if !rounds.ok || rounds.value < 1 || rounds.value > 2147483647 { return argument_error("--rounds must be positive") }
+    target := process.host_target()
+    if target != "arm64-macos" && target != "arm64-linux" && target != "x86_64-linux" {
+        return argument_error("native execution requires ARM64 macOS or ARM64/x86-64 Linux")
+    }
+    mut drivers: []receipt.Driver = []
+    for i in 0..2 {
+        name := if i == 0 { "baseline" } else { "candidate" }
+        path := fs.realpath(args.positionals[i])
+        if !path.ok { return argument_error(f"cannot resolve {name} compiler") }
+        sha256 := harness.sha256_file_hex(path.value)
+        if sha256.len == 0 { return argument_error(f"cannot hash {name} compiler") }
+        flags := args.all("--" + name + "-flag")
+        for flag in flags {
+            if !allowed(flag) { return argument_error(f"{name} flag conflicts with fixed input/target/instrumentation scope: {flag}") }
+        }
+        drivers.push(receipt.Driver { name: name, path: path.value, sha256: sha256, flags: flags })
+    }
+    report_dir := harness.resolve_or_abs(args.positionals[2])
+    if !fs.mkdir_all(report_dir).ok { return argument_error("cannot create report directory") }
+    contents := fs.list_dir(report_dir)
+    if !contents.ok || contents.entries.len > 0 { return argument_error("report directory must be empty to preserve measurements") }
+    root := harness.find_root()
+    if root.len == 0 { return argument_error("cannot locate Dunder repository") }
+    before := corpus.selfhost_snapshot(root)
+    if before.error.len > 0 { return argument_error(before.error) }
+    tool_hash := harness.sha256_file_hex(root + "/" + tool())
+    hello_hash := harness.sha256_file_hex(root + "/examples/hello.ddr")
+    if tool_hash.len == 0 || hello_hash.len == 0 { return argument_error("cannot fingerprint script or hello source") }
+    mut helpers: []corpus.SourceHash = []
+    for path in move helper_paths() {
+        sha256 := harness.sha256_file_hex(root + "/" + path)
+        if sha256.len == 0 { return argument_error(f"cannot fingerprint helper: {path}") }
+        helpers.push(corpus.SourceHash { path: path, sha256: sha256 })
+    }
+    options := receipt.Options { root: root, report_dir: report_dir, rounds: i32(rounds.value), target: target, drivers: move drivers }
+    mut run := receipt.run(tool_hash, hello_hash, move helpers)
+    mut cases: []receipt.Case = []
+    tmp := fs.temp_dir("dunder-incremental-performance-")
+    defer { if tmp.ok { _ := fs.remove_all(tmp.value) } }
+    work := fs.realpath(tmp.value)
+    if finish(&options, &before, work.value, &mut cases, &mut run) { return 0 }
+    run.complete = false
+    if run.error.len == 0 { run.error = "cannot write final checkpoint" }
+    _ := receipt.checkpoint(&options, &run, &before.files, &cases)
+    1
+}

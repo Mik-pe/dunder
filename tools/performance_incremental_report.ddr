@@ -1,0 +1,332 @@
+capability filesystem
+
+import .benchmark_commands as bench
+import .benchmark_host as provenance
+import .benchmark_time as time
+import .harness as harness
+import .performance_corpus as corpus
+import .report_json as report
+import std.array as array
+import std.bytes as bytes
+import std.json as json
+import sys
+
+pub struct Driver { name: string, path: string, sha256: string, flags: []string }
+pub struct Options { root: string, report_dir: string, rounds: i32, target: string, drivers: []Driver }
+pub struct Source { name: string, contents: string }
+pub struct State { label: string, sources: []Source, expected: string }
+pub struct Case { name: string, kind: string, entry: string, states: []State }
+pub struct Image { sha256: string, size: i64 }
+pub struct Cache { files: i64, size: i64, dufd: i64, invalid: i64 }
+pub struct Observation { label: string, state: string, data: json.Doc }
+pub struct CacheReplay { observations: []Observation, cache: Cache }
+pub struct Evidence { references: []Image, primes: CacheReplay, observer: CacheReplay }
+pub struct CaseReport { name: string, variants: []Evidence }
+
+pub struct Sample {
+    name: string, variant: string, round: i32, position: i32, state: string, nanoseconds: i64, image: Image,
+}
+
+pub struct Command {
+    argv: []string, cwd: string, tmp: string, purpose: string, measured: bool, status: i32,
+    nanoseconds: i64, stdout: string, stderr: string,
+}
+
+pub struct Run {
+    host: provenance.Host,
+    inputs: []corpus.SourceHash,
+    helpers: []corpus.SourceHash,
+    tool_hash: string,
+    hello_hash: string,
+    generated: corpus.Corpus,
+    cases: []CaseReport,
+    commands: []Command,
+    samples: []Sample,
+    error: string,
+    complete: bool,
+}
+
+pub fn run(tool_hash: string, hello_hash: string, move helpers: []corpus.SourceHash) -> Run {
+    Run {
+        host: provenance.host(), inputs: [], helpers: helpers, tool_hash: tool_hash.clone(), hello_hash: hello_hash.clone(),
+        generated: corpus.Corpus {path: "", lines: 0, source_bytes: 0, modules: 0, functions: 0, tokens: 0, sha256: "", error: ""},
+        cases: [], commands: [], samples: [], error: "", complete: false,
+    }
+}
+
+pub fn replay() -> CacheReplay {
+    CacheReplay { observations: [], cache: Cache { files: 0, size: 0, dufd: 0, invalid: 0 } }
+}
+
+pub fn case_report(name: string) -> CaseReport {
+    CaseReport {name: name.clone(), variants: [
+        Evidence {references: [], primes: replay(), observer: replay()},
+        Evidence {references: [], primes: replay(), observer: replay()},
+    ]}
+}
+
+impl Run {
+    pub fn fail(&mut self, message: string) -> bool {
+        if self.error.len == 0 { self.error = message.clone() }
+        harness.fail(message)
+    }
+}
+
+fn source_hash(state: &State) -> string {
+    mut encoded: []u8 = []
+    for source in state.sources {
+        bytes.append_utf8(&mut encoded, source.name)
+        encoded.push(0)
+        bytes.append_utf8(&mut encoded, source.contents)
+        encoded.push(0)
+    }
+    harness.sha256_bytes_hex(&encoded)
+}
+
+fn write_state(state: &State, writer: &mut json.Writer) {
+    writer.object()
+    writer.key("files"); writer.object()
+    for source in state.sources { writer.key(source.name); writer.string(source.contents) }
+    writer.end()
+    writer.key("edited_source_sha256"); writer.string(source_hash(&state))
+    writer.key("expected_stdout"); writer.string(state.expected)
+    writer.end()
+}
+
+fn write_replay(replay: &CacheReplay, writer: &mut json.Writer) -> bool {
+    writer.object()
+    writer.key("observations"); writer.array()
+    for item in replay.observations {
+        writer.object()
+        writer.key("label"); writer.string(item.label)
+        if item.state.len > 0 { writer.key("state"); writer.string(item.state) }
+        writer.key("observation")
+        if !report.write_value(&item.data, 0, &mut writer) { return false }
+        writer.end()
+    }
+    writer.end()
+    writer.key("cache"); writer.object()
+    writer.key("files"); writer.integer(replay.cache.files)
+    writer.key("bytes"); writer.integer(replay.cache.size)
+    writer.key("dufd"); writer.integer(replay.cache.dufd)
+    writer.key("invalid"); writer.integer(replay.cache.invalid)
+    writer.end()
+    writer.end()
+    true
+}
+
+fn write_case(case: &Case, evidence: &CaseReport, options: &Options, writer: &mut json.Writer) -> bool {
+    writer.object()
+    writer.key("kind"); writer.string(case.kind)
+    writer.key("source"); writer.string(case.entry)
+    writer.key("states"); writer.object()
+    for state in case.states {
+        writer.key(state.label)
+        write_state(&state, &mut writer)
+    }
+    writer.end()
+    writer.key("references"); writer.object()
+    for i in 0..options.drivers.len {
+        refs := &evidence.variants[i].references
+        if refs.len == 0 { continue }
+        writer.key(options.drivers[i].name); writer.object()
+        for s in 0..refs.len {
+            writer.key(case.states[s].label); writer.object()
+            writer.key("sha256"); writer.string(refs[s].sha256)
+            writer.key("bytes"); writer.integer(refs[s].size)
+            writer.end()
+        }
+        writer.end()
+    }
+    writer.end()
+    writer.key("primes"); writer.object()
+    for i in 0..options.drivers.len {
+        replay := &evidence.variants[i].primes
+        if replay.observations.len == 0 { continue }
+        writer.key(options.drivers[i].name)
+        if !write_replay(&replay, &mut writer) { return false }
+    }
+    writer.end()
+    writer.key("observers"); writer.object()
+    for i in 0..options.drivers.len {
+        replay := &evidence.variants[i].observer
+        if replay.observations.len == 0 { continue }
+        writer.key(options.drivers[i].name)
+        if !write_replay(&replay, &mut writer) { return false }
+    }
+    writer.end()
+    writer.end()
+    true
+}
+
+fn write_environment(writer: &mut json.Writer, tmp: string) {
+    writer.object()
+    writer.key("PATH"); writer.string("/no-external-tools")
+    writer.key("TMPDIR"); writer.string(tmp)
+    writer.end()
+}
+
+fn write_strings(values: &[]string, writer: &mut json.Writer) {
+    writer.array()
+    for value in values { writer.string(value) }
+    writer.end()
+}
+
+fn write_command(command: &Command, writer: &mut json.Writer) {
+    writer.object()
+    writer.key("command"); write_strings(&command.argv, &mut writer)
+    writer.key("cwd"); writer.string(command.cwd)
+    writer.key("environment"); write_environment(&mut writer, command.tmp)
+    writer.key("purpose"); writer.string(command.purpose)
+    writer.key("measured"); writer.boolean(command.measured)
+    writer.key("status"); writer.integer(i64(command.status))
+    writer.key("elapsed_ms")
+    if command.measured { writer.decimal(time.milliseconds(command.nanoseconds)) }
+    else { writer.null() }
+    writer.key("stdout"); writer.string(command.stdout)
+    writer.key("stderr"); writer.string(command.stderr)
+    writer.end()
+}
+
+fn write_samples(options: &Options, rows: &[]Sample) -> bool {
+    if rows.len == 0 { return true }
+    mut output: []u8 = []
+    bytes.append_utf8(&mut output, "suite,case,variant,round,order,state,elapsed_ms,image_bytes,image_sha256\r\n")
+    for row in rows {
+        bytes.append_utf8(&mut output, f"incremental,{row.name},{row.variant},{row.round},{row.position},{row.state},{time.fixed_ms(row.nanoseconds)},{row.image.size},{row.image.sha256}\r\n")
+    }
+    sys.write_u8(options.report_dir + "/samples.csv", &output).ok || harness.fail("cannot write samples.csv")
+}
+
+pub fn checkpoint(options: &Options, run: &Run, sources: &[]corpus.SourceHash, cases: &[]Case) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("complete"); writer.boolean(run.complete)
+    if run.error.len > 0 { writer.key("error"); writer.string(run.error) }
+    writer.key("rounds"); writer.integer(i64(options.rounds))
+    writer.key("target"); writer.string(options.target)
+    if run.host.parts.len == 6 { writer.key("host"); run.host.write(&mut writer) }
+    if run.host.revision.len > 0 {
+        writer.key("checkout"); writer.string(run.host.revision)
+        writer.key("working_tree"); writer.string(run.host.status)
+    }
+    if run.host.has_hardware { writer.key("hardware"); writer.string(run.host.hardware) }
+    if run.host.memory.len > 0 { writer.key("memory"); writer.string(run.host.memory) }
+    writer.key("tool_sha256"); writer.string(run.tool_hash)
+    mut helper_hashes := ""
+    for helper in run.helpers { helper_hashes += helper.path + ":" + helper.sha256 + "\n" }
+    helper_bytes := bench.raw(helper_hashes)
+    writer.key("helpers_sha256"); writer.string(harness.sha256_bytes_hex(&helper_bytes))
+    writer.key("helper_sources_sha256"); corpus.write_sources(&run.helpers, &mut writer)
+    writer.key("sources_sha256"); corpus.write_sources(&sources, &mut writer)
+    for key in ["compiler_sha256", "compiler_paths", "compiler_flags"] {
+        writer.key(key); writer.object()
+        for driver in options.drivers {
+            writer.key(driver.name)
+            if key == "compiler_sha256" { writer.string(driver.sha256) }
+            else if key == "compiler_paths" { writer.string(driver.path) }
+            else { write_strings(&driver.flags, &mut writer) }
+        }
+        writer.end()
+    }
+    writer.key("clock"); writer.string("monotonic wall clock around the fresh process; milliseconds")
+    writer.key("environment"); write_environment(&mut writer, "isolated directory per cwd, under temporary work root")
+    writer.key("cache"); writer.string("warm OS filesystem; incremental per-variant/per-case cache; two unrecorded JSON primes")
+    writer.key("order"); writer.string("baseline/candidate alternate each round; same frozen input paths")
+    writer.key("counts"); writer.string("out-of-band only; separate post-series representative observer replay")
+    writer.key("embedded_inputs"); writer.string("compiler-embedded runtime/library versions are identified by each compiler hash")
+    if run.inputs.len > 0 { writer.key("input_snapshot_sha256"); corpus.write_sources(&run.inputs, &mut writer) }
+    writer.key("hello_sha256"); writer.string(run.hello_hash)
+    if run.generated.sha256.len > 0 { writer.key("generated_corpus"); run.generated.write(&mut writer) }
+    writer.key("cases"); writer.object()
+    for i in 0..run.cases.len {
+        writer.key(run.cases[i].name)
+        if !write_case(&cases[i], &run.cases[i], &options, &mut writer) { return harness.fail("cannot encode timing observation") }
+    }
+    writer.end()
+    writer.key("commands"); writer.array()
+    for command in run.commands { write_command(&command, &mut writer) }
+    writer.end()
+    writer.end()
+    document := writer.finish()
+    if !document.ok || !sys.write_text(options.report_dir + "/metadata.json", document.value + "\n").ok {
+        return harness.fail("cannot write metadata.json")
+    }
+    write_samples(&options, &run.samples)
+}
+
+pub fn summarize(options: &Options, run: &Run) -> bool {
+    mut output: []u8 = []
+    bytes.append_utf8(&mut output, "suite,case,variant,samples,median_ms,p95_ms,median_over_baseline,image_bytes\r\n")
+    mut lines: []string = []
+    for case in run.cases {
+        mut baseline_median: f64 = 0.0
+        for driver in options.drivers {
+            mut times: []i64 = []
+            mut sizes: []i64 = []
+            for row in run.samples {
+                if row.name == case.name && row.variant == driver.name {
+                    times.push(row.nanoseconds)
+                    sizes.push(row.image.size)
+                }
+            }
+            count := times.len
+            if count != options.rounds { return harness.fail(f"missing samples for {case.name}/{driver.name}") }
+            result := time.distribution(move times)
+            if driver.name == "baseline" { baseline_median = result.median }
+            median := bench.fixed(result.median, 6)
+            p95 := bench.fixed(result.p95, 6)
+            ratio := bench.fixed(result.median / baseline_median, 6)
+            array.sort(&mut sizes)
+            mut distinct := sizes[0].str()
+            for i in 1..sizes.len {
+                if sizes[i] != sizes[i - 1] { distinct += "," + sizes[i].str() }
+            }
+            if distinct != sizes[0].str() { distinct = "\"" + distinct + "\"" }
+            bytes.append_utf8(&mut output, f"incremental,{case.name},{driver.name},{count},{median},{p95},{ratio},{distinct}\r\n")
+            lines.push(f"{case.name} {driver.name}: median={median}ms p95={p95}ms ratio={ratio}")
+        }
+    }
+    if !sys.write_u8(options.report_dir + "/summary.csv", &output).ok { return harness.fail("cannot write summary.csv") }
+    for line in lines { print(line) }
+    true
+}
+
+pub fn write_protocol(directory: string) -> bool {
+    contents := "# Warm and incremental compiler latency\n" +
+        "\n" +
+        "Each recorded sample starts a fresh compiler process and includes source\n" +
+        "loading, incremental cache IO, image formatting/signing and publication.\n" +
+        "The OS filesystem cache is warm. Variants have separate working directories,\n" +
+        "fragment caches and TMPDIRs, and use the same frozen absolute source paths.\n" +
+        "No runtime, cold-build or general C-performance claim follows from this suite.\n" +
+        "\n" +
+        "Generated and selfhost inputs remain unchanged. The two small probes\n" +
+        "change only a private inlineable helper body or a shared record's field layout.\n" +
+        "Names and call graphs stay fixed. After priming state A, edit rounds start with\n" +
+        "B and alternate B/A. Edit summaries combine both transition directions; state\n" +
+        "and image hashes remain available in the raw samples.\n" +
+        "\n" +
+        "Every image must match an untimed nonincremental reference for its compiler,\n" +
+        "flags and source state. Generated output is independently 595500; selfhost\n" +
+        "images build/run hello (42, true). Private-body outputs are independently\n" +
+        "440/480; layout outputs remain 1107, 11, 7 through named construction.\n" +
+        "\n" +
+        "Two JSON timing builds prime each measured cache (cold then warm), outside\n" +
+        "recorded intervals. Reused/emitted counters are out-of-band only. After the\n" +
+        "latency series, separate observer caches replay priming and representative\n" +
+        "A/B/A transitions, so observing an edit never warms a measured transition.\n" +
+        "These observer counts are not per-recorded-round counts or cold latency data.\n" +
+        "Correctness execution and output hashing also occur after each clock stops.\n" +
+        "\n" +
+        "Raw times use a monotonic clock around process execution, including process startup.\n" +
+        "Two variants alternate order each round. No sample is removed. Median uses the\n" +
+        "middle pair for even counts; p95 is nearest rank ceil(0.95*N). Profile/timing\n" +
+        "flags are forbidden in recorded variant flags. All safety settings otherwise\n" +
+        "come from the selected binaries and explicit flags in metadata.json.\n" +
+        "\n" +
+        "The corpus and repeated small probes are finite workloads. Peak memory, cold\n" +
+        "OS caches, editor responsiveness and optimization quality are not measured.\n" +
+        "Nonincremental reference/validation builds have no reported latency here.\n"
+    sys.write_text(directory + "/README.md", contents).ok || harness.fail("cannot write report protocol")
+}

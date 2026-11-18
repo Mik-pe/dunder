@@ -130,6 +130,15 @@ Lås en korpus med importer, externa och interna anrop, heltalskod, slices, post
 
 Kör minst 30 försök för vanliga arbetsfall. Publicera råvärden, median och p95 samt arbetsordningen. Återställ ändringar, cache och utdata utifrån arbetsfallet inför varje försök. Använd innehållsändringar som påverkar resultatet. Byggtider med enbart varm Dunder-cache underkänner ett anspråk om ren byggprestanda.
 
+```sh
+dunder run tools/performance_incremental.ddr -- /sökväg/till/baseline \
+  /sökväg/till/kandidat build/incremental-report --rounds 30
+```
+
+Verktyget jämför varma inkrementella byggen med separata cacher.
+Rapporten sparar råvärden, median, p95, binärernas SHA-256 och cacheutfall
+från en separat körning. Byggresultaten kontrolleras mot rena byggen.
+
 ## Vad det innebär att mäta sig med C och C++
 
 Föreslagen första gräns är ett geometriskt medel på högst **1,10×** referensens körtid och inget enskilt arbetsfall över **1,25×**. En faktor på 1,10 betyder tio procent längre körtid för Dunder. Gränsen gäller den publicerade sviten. Den gör en bred ambition möjlig att pröva utan att en snabb innerloop får representera alla program.
