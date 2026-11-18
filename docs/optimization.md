@@ -256,6 +256,17 @@ godtycklig maskinkod; nya hjälparargument kräver en explicit konvention.
 
 Läsvyn muterar inga råa call-masker och begränsar varken clobbers, minne,
 flaggor eller andra effekter. Okända anropsformer behåller råkontraktet.
+
+Under `source_inputs`-premissen bevarar käll-ABI 1/2/3 även de callee-saved
+registren `x25–x28`. [`mir_call_inputs`](../selfhost/mir/mir_call_inputs.ddr)
+exponerar denna mask separat (`preserved_callee_mask`), så att `mir_liveness`,
+`mir_opt` och `mir_value_prop` kan behålla promoverade hem och kända värden
+över verifierade källanrop utan att ändra rå `f.clobbers`. Före framepasset
+körs också [`mir_owners`](../selfhost/mir/mir_owners.ddr), som spårar
+icke-eskaperande ägarceller framåt och eliminerar bevisat tomma
+`Load + Clear + Vacate`-sekvenser samt döda `.Vacate`-skrivningar i returblock.
+[`mir_expr_stack`](../selfhost/mir/mir_expr_stack.ddr) återanvänder sitt eget
+liveness-arbetsminne över funktioner utan nya per-funktionsallokeringar.
 [Testavkodaren](../tests/fixtures/mir_machine_decode.ddr) anger FE-adapterns mål i logiska
 X17 och Wasm-FB:s mål i X16 som explicita operander. De får aldrig frigöras
 som oanvänd scratch. Rå Call läser inkommande NZCV och kan förstöra dem: det
@@ -495,8 +506,11 @@ FP-/SP-roller eller andra ändringar tar den vanliga verifieringsvägen före
 liveness. Ett falskt certifikat får aldrig återställas manuellt. Radering
 av en bevisat ren materialisering ändrar enbart mode. Varje ändrat
 slutresultat genomgår ovillkorlig, debiterad fullverifiering före framgång.
-Arbetet, inklusive återställning, är budgetbegränsat; upprepad DCE-liveness
-är inte garanterat linjär.
+Arbetet, inklusive återställning, är budgetbegränsat; DCE sveper block i
+omvänd ordning med tidigt stopp när `live_in` är oförändrad, `invalidate_one`
+undviker helbanks-maskning vid enskild skrivning och `hoist_loop_constants`
+lyfter unika flermaskinsords konstanter ur anropsfria loop-SCC:er med entydig
+preheader till lediga scratchregister före full fixpunktsanalys och verifiering.
 
 `--mir-values=off` stänger av värdepasset separat. `--mir-opt=off` stänger
 av frame-, SSA- och värdepassen. Cache och testkvitton inkluderar policyn.
@@ -679,7 +693,10 @@ specialfallen används där. Detta är en målpolicy, inte en ändrad semantik.
 binär långdivision. Den provar faktiska Dunder-planers matematiska certifikat,
 uttömmande signerade bitbredder 3–10, breda 32-/64-bitarsfall, spill,
 nästlad aritmetik, kortslutning, exakt nativ fällkod och fällordning.
-Alla tre nativa mål byggs och värdmaskinens program körs.
+Alla tre nativa mål byggs och värdmaskinens program körs. Under
+`--const-div-opt` sänker också den allmänna frontenden konstanta `/` och `%`
+direkt via `immediate_div_rem_rhs` för signerade `i32`/`i64` (utom `0` och `-1`)
+genom `const_div` samt för osignerade tvåpotenser genom `arm.bitfield`.
 
 ### Framefria registerfunktioner på ARM64
 
@@ -712,7 +729,9 @@ permutationer. Fallbackbilder och bilder för övriga mål är byteidentiska.
 ### Budgeterade intervall och stabila arraylängder
 
 [`opt_range`](../selfhost/opt/opt_range.ddr) kör efter konstantförenklingen och
-före den avslutande modellverifieringen. Den spårar i32-intervall samt
+före den avslutande modellverifieringen. Den omfattar både `&[]i64`/`&mut []i64`
+och `&[]i32`/`&mut []i32` (`opt_ir.array_element` ger 4-byte-steg på skift `2`,
+teckenutökad `ldrsw`-läsning och 32-bitars lagring i `opt_emit`). Den spårar i32-intervall samt
 relationer till en bestämd arrayrots längd, exempelvis `j <= values.len-1`.
 Elementvärden cachas inte. Både delade och exklusiva arrayparametrar har
 stabil dataadress/längd i modellens slutna operationsmängd; elementskrivning
@@ -867,20 +886,33 @@ från en lånad källa kräver uttrycklig `.clone()`.
 
 [ARM64-backenden](../selfhost/backend/arm64.ddr) använder direkt LDUR/STUR för
 lokala värden nära framepekaren och immediate-adresser där offseten ryms.
-[x86-64](../selfhost/backend/x86.ddr) och [Wasm](../selfhost/backend/wasm_native.ddr)
+[x86-64](../selfhost/backend/x86.ddr) använder kompakt ModRM-adressering för
+registerbanken (`[r15]` för slot 0 och 8-bitars displacement för slot 1–15) samt
+tillsammans med [Wasm](../selfhost/backend/wasm_native.ddr)
 sänker den gemensamma instruktionsströmmen till respektive mål. Wasm använder
 bland annat `memory.copy` för kopiering av sammanhängande block.
-Native-runtime kopierar buffertar åtta byte åt gången och avslutar med en
-byte-loop för resten. Varje ordläsning ryms inom den begärda längden,
-även vid ojusterade adresser. Strängars och arrayelements ägarskap behålls.
+Native-runtime använder ARM64 `clz` för $O(1)$-klassuppslag i allokatorn och
+jämför strängar åtta byte åt gången efter pekarsnabbväg; kopiering sker också
+åtta byte åt gången med en byte-loop för resten. I standardbiblioteket använder
+`std.hash` skift/mask-reduktion modulo $2^{31}-1$, `std.map`/`std.set` öppna
+bitmask-tabeller med cachade hashvärden och enpass-insättning, och `std.array`
+använder Introsort med insertion sort och Floyd-heapsort. Strängars och
+arrayelements ägarskap behålls; `compile.ddr` deduplicerar identiska
+strängliteraler i bilddatan och beskär onåbara nominala clone-/drop-hjälpare.
 
 Lexern klassificerar de fasta nyckelorden utan hashtabell och avkodar
-vanliga literaler direkt från giltig UTF-8. Escape-sekvenser använder den
+vanliga literaler direkt från giltig UTF-8. Modulladdaren cachar fysiska sökvägar,
+metoduppslaget i `frontend_context` är öppenadresserat, och kompakta
+bitset-snapshots (`Checkpoint`) ersätter fulla ägarkopior vid kontrollflödesgrenar.
+Parallella `compile_parallel`-batchar begränsas vid `4096` ord och högst `24`
+generella kroppar. Escape-sekvenser använder den
 separata avkodningsvägen med samma diagnostik och källpositioner.
 
 Direkt `for`-iteration över en typad strängs `.bytes()` eller `.runes()`
-kan strömma från en behållen strängsnapshot. Den vägen bygger eller
-kopierar ingen konverteringsarray. Lagrade konverteringar och uttryck som
+kan strömma från en behållen strängsnapshot, och när källan är en oföränderlig
+lokal sträng eller parameter utan `move <namn>` i loopkroppen (`stream_kind`
+`11`/`15`) utelämnas både kloning och tillfällig ägarlagring helt. Den vägen
+bygger eller kopierar ingen konverteringsarray. Lagrade konverteringar och uttryck som
 inte matchar den begränsade direkta vägen använder vanliga arrayer.
 Källan utvärderas en gång och behålls genom `continue`, `break` och retur.
 

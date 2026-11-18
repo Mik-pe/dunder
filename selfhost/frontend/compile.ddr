@@ -55,6 +55,7 @@ import ..opt.opt_range
 import ..opt.scalar_rules as rules
 import ..driver.compiler_profile as profile
 import ..opt.opt_alloc
+import ..opt.const_div
 import ownership_lease as lease
 import ownership_state as ownership
 import ..mir.mir
@@ -113,7 +114,7 @@ pub opaque struct Session {
     callback_labels: []i32, has_callbacks: bool,
     loans: scratch.Loans,
     array_take: i32, record_take_labels: []i32,
-    mir_opt_enabled: bool, mir_memory_enabled: bool, mir_ssa_enabled: bool, mir_values_enabled: bool, scalar_enabled: bool, ownership_enabled: bool, range_enabled: bool, inline_enabled: bool,
+    mir_opt_enabled: bool, mir_memory_enabled: bool, mir_ssa_enabled: bool, mir_values_enabled: bool, scalar_enabled: bool, ownership_enabled: bool, const_div_enabled: bool, range_enabled: bool, inline_enabled: bool,
     scalar_templates: opt_templates.Cache,
     strings: []string, string_labels: []i32,
     print_int: i32, print_bool: i32, print_text: i32, write: i32,
@@ -824,8 +825,7 @@ fn check_function_caps(c: &mut Session, f: i32, token: i32) {
     c.error_at = c.world.tokens.starts[token]
 }
 fn impl_method(c: &Session, ty: i32, name: string) -> i32 {
-    if ty < 0 { return -1 }
-    i32(map.get_or(&c.world.methods, ty.str() + ":" + name, -1))
+    fc.find_method(&c.world, ty, name)
 }
 fn check_impl_access(c: &mut Session, f: i32, token: i32) -> bool {
     if ft.cleanup_method(&c.types, c.world.impl_types[f]) == f {
@@ -1025,13 +1025,11 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             fail(&mut c, "cannot implement methods for an imported type"); break
         }
         m_name := c.world.impl_names[f].clone()
-        method_key := target_ty.str() + ":" + m_name
-        if map.contains(&c.world.methods, method_key) {
+        if !fc.put_method(&mut c.world, target_ty, m_name, f) {
             c.body.cursor = declarations[d] - 1
             fail(&mut c, "duplicate method '" + m_name + "' on type"); break
         }
         c.world.impl_types[f] = target_ty
-        map.put(&mut c.world.methods, move method_key, i64(f))
     }
     for d in 0..declarations.len {
         if !c.ok { break }
@@ -1179,6 +1177,17 @@ fn slot(c: &mut Session) -> i32 {
     result := c.body.slots; c.body.slots = c.body.slots + 1
     if c.body.slots > 65535 { fail(&mut c, "this compiler stage allows at most 65535 local slots per function") }
     result
+}
+fn alloc_arg_slot(c: &mut Session) -> i32 {
+    if c.body.slots >= 16 && c.body.free_arg_slots.len > 0 { return c.body.free_arg_slots.pop() }
+    slot(&mut c)
+}
+fn release_arg_slots(c: &mut Session, slots: &[]i32) {
+    mut i := slots.len - 1
+    while i >= 0 {
+        c.body.free_arg_slots.push(slots[i])
+        i = i - 1
+    }
 }
 fn local(body: &fc.FunctionContext, name: string) -> i32 {
     fc.local(&body, name)
@@ -1925,7 +1934,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
     mut provided := args_in.len
     pending := c.body.pending.slots.len
     for arg in 0..provided { stage_owner(&mut c, .Argument, args_in[arg], ft.parameter_type(&c.types, first + arg), 0) }
-    mut args: []i32 = []; mut arg_starts: []i32 = []; mut arg_sources: []i32 = []; mut effects: []i32 = []
+    mut args: []i32 = []; mut own_args: []i32 = []; mut arg_starts: []i32 = []; mut arg_sources: []i32 = []; mut effects: []i32 = []
     mut arg_roots: []i32 = []; mut arg_paths: []i32 = []
     for v in &args_in { args.push(v) }
     for v in &starts_in { arg_starts.push(v) }
@@ -1973,7 +1982,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
                 place_step(&mut c, .BorrowHome, record, 4, 0, owner, argument)
             }
         }
-        index := slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index)
+        index := alloc_arg_slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index); own_args.push(index)
         stage_owner(&mut c, .Argument, index, want, 0)
         mut root := source_root(&c, c.body.places.current); mut path := owner_path(&c, c.body.places.current)
         if c.body.loan.root >= 0 { root = c.body.loan.root; path = c.body.loan.path }
@@ -2015,6 +2024,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
             estimate := opt_inline.word_estimate(&inline_work)
             first_word := arm.position(&c.code)
             if opt_inline.emit_view(&mut inline_work, &mut c.code, &catalog, c.overflow, c.zero, c.bounds) {
+                release_arg_slots(&mut c, &own_args)
                 if !charge_inline(&mut c, f, estimate, first_word) { return 0 }
                 return ft.type_base(&c.types, signature)
             }
@@ -2037,6 +2047,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
         borrowed_view.pass_result(&mut c.code, holder)
     }
     source_call.lower(&mut c.code, label, entry, wasm_sig, &args, signature, result, source_offset)
+    release_arg_slots(&mut c, &own_args)
     if view { arm.pop(&mut c.code, 9) }
     if boxed { arm.pop(&mut c.code, 9) }
     if c.body.scratch_returns.len > first_writeback {
@@ -2135,7 +2146,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     arm.pop_temp(&mut c.code, 1); arm.push_temp(&mut c.code, 0); arm.mov(&mut c.code, 0, 1)
                 }
             }
-            if model.recording { _ := typed.node(&mut model, 6, 2, model.value, -1, -1, 0, array_id, first_token) }
+            if model.recording { _ := typed.node(&mut model, 6, opt_ir.array_element(model.local_types[array_id]), model.value, -1, -1, 0, array_id, first_token) }
             if eat(&mut c, "..") {
                 if model.probing && decline_projection(&mut c, &mut model) { c.body.place.taking_address = previous_address; break }
                 if view {
@@ -2211,7 +2222,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
                     result = method(&mut c, ty, name, place, at, &catalog, &mut inline_work, &mut model)
                 }
-                if c.body.stream_kind == 10 { ty = result }
+                if c.body.stream_kind >= 10 { ty = result }
                 else { place = 0; ty = call_result(&mut c, result); temporary_root = c.body.expr.owner; projection_address = -1; fc.clear_rvalue_place(&mut c.body.place) }
             } else if name == "len" && (ty == 4 || collection(&c, ty) || ft.type_kind(&c.types, ty) == 21) {
                 if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
@@ -2286,7 +2297,7 @@ fn propagate_result(c: &mut Session, ty: i32, question: i32) -> i32 {
     place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Tag), 0, question)
     ok := new_block(&mut c)
     source_edge(&mut c, ok, .WhenFalse, question)
-    continuing := ownership.snapshot(&c.body.ownership)
+    continuing := ownership.checkpoint(&c.body.ownership)
     if ty == c.body.ret_type {
         arm.load(&mut c.code, box)
     } else {
@@ -2303,7 +2314,7 @@ fn propagate_result(c: &mut Session, ty: i32, question: i32) -> i32 {
         }
     }
     return_from_body(&mut c, question)
-    ownership.restore(&mut c.body.ownership, &continuing)
+    ownership.restore_checkpoint(&mut c.body.ownership, &continuing)
     bind_block(&mut c, ok)
     extract_result(&mut c, ty, success, box, question)
     temporary(&mut c, success)
@@ -2462,25 +2473,25 @@ fn if_arms(c: &mut Session, expected: i32, home: i32, catalog: &opt_inline.View,
     done := new_block(&mut c)
     mut result := 0
     mut context := expected
-    mut outcomes := ownership.new(); ownership.terminate(&mut outcomes)
+    mut outcomes := ownership.empty_checkpoint()
     mut outcome_seen := false
     mut falling_through := false
     while c.ok {
         condition_at := c.body.cursor
         condition := expression(&mut c, 0, 3, &catalog, &mut inline_work, &mut model)
         same(&mut c, 3, condition)
-        before_arm := ownership.snapshot(&c.body.ownership)
+        before_arm := ownership.checkpoint(&c.body.ownership)
         otherwise := new_block(&mut c)
         source_edge(&mut c, otherwise, .WhenFalse, condition_at)
         ty := branch_value(&mut c, context, home, false, &catalog, &mut inline_work, &mut model)
         if ty != 0 {
             if result == 0 { result = ty; context = ty } else { same(&mut c, result, ty) }
         }
-        accepted := ownership.snapshot(&c.body.ownership); prior := ownership.snapshot(&outcomes)
-        if outcome_seen { join_statement_outcomes(&mut outcomes, &prior, !falling_through, &accepted, ty == 0) }
-        else { ownership.restore(&mut outcomes, &accepted); outcome_seen = true }
+        accepted := ownership.checkpoint(&c.body.ownership)
+        if outcome_seen { ownership.combine_checkpoints(&c.body.ownership, &mut outcomes, !falling_through, &accepted, ty == 0) }
+        else { ownership.copy_checkpoint(&mut outcomes, &accepted); outcome_seen = true }
         falling_through = falling_through || ty != 0
-        ownership.restore(&mut c.body.ownership, &before_arm)
+        ownership.restore_checkpoint(&mut c.body.ownership, &before_arm)
         source_edge(&mut c, done, .Jump, c.body.cursor); bind_block(&mut c, otherwise)
         newlines(&mut c); expect(&mut c, "else")
         if !eat(&mut c, "if") { break }
@@ -2488,8 +2499,9 @@ fn if_arms(c: &mut Session, expected: i32, home: i32, catalog: &opt_inline.View,
     if !c.ok { return 0 }
     last := branch_value(&mut c, context, home, false, &catalog, &mut inline_work, &mut model)
     if result == 0 { result = last } else if last != 0 { same(&mut c, result, last) }
-    last_state := ownership.snapshot(&c.body.ownership)
-    join_statement_outcomes(&mut c.body.ownership, &outcomes, !falling_through, &last_state, last == 0)
+    last_state := ownership.checkpoint(&c.body.ownership)
+    ownership.combine_checkpoints(&c.body.ownership, &mut outcomes, !falling_through, &last_state, last == 0)
+    ownership.restore_checkpoint(&mut c.body.ownership, &outcomes)
     bind_block(&mut c, done)
     result
 }
@@ -3227,6 +3239,32 @@ fn swap_array(c: &mut Session, ty: i32, place: i32, receiver_at: i32, writable: 
     arm.load_into(&mut c.code, saved, 1); arm.load(&mut c.code, right); place_transfer(&mut c, base, 1, 0, false, packed, 1, second_at)
     0
 }
+fn safe_borrowed_string_stream(c: &Session, place: i32) -> bool {
+    if place >= 0 || c.body.cursor + 1 >= c.world.tokens.kinds.len { return false }
+    binding := borrows.root(&c.body.places, place)
+    if binding < 0 || binding >= c.body.locals.types.len || binding >= c.body.locals.mutable.len || binding >= c.body.locals.names.len { return false }
+    if c.body.locals.mutable[binding] || c.body.locals.types[binding] != 4 { return false }
+    mut pos := c.body.cursor + 2
+    mut brace_depth := 1
+    while pos < c.world.tokens.kinds.len && brace_depth > 0 {
+        kind := c.world.tokens.kinds[pos]
+        if kind == .Symbol {
+            if c.world.tokens.texts[pos] == "{" { brace_depth = brace_depth + 1 }
+            else if c.world.tokens.texts[pos] == "}" { brace_depth = brace_depth - 1 }
+        } else if (kind == .Keyword || kind == .Name) && c.world.tokens.texts[pos] == "move" {
+            mut next := pos + 1
+            while next < c.world.tokens.kinds.len && c.world.tokens.kinds[next] == .Symbol && c.world.tokens.texts[next] == "(" {
+                next = next + 1
+            }
+            if next < c.world.tokens.kinds.len && c.world.tokens.kinds[next] == .Name &&
+                c.world.tokens.texts[next] == c.body.locals.names[binding] {
+                return false
+            }
+        }
+        pos = pos + 1
+    }
+    brace_depth == 0
+}
 fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_at: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, covered: &mut bool) -> i32 {
     mut effects := c.body.mutations.len
     source := c.world.tokens.starts[c.body.cursor - 1]
@@ -3274,8 +3312,13 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
     }
     if ty == 4 && c.body.depth == c.body.stream_depth && (name == "bytes" || name == "runes") && is(&c, ")") && c.body.cursor + 1 < c.world.tokens.kinds.len && c.world.tokens.kinds[c.body.cursor + 1] == .Symbol && c.world.tokens.texts[c.body.cursor + 1] == "{" {
         covered = true
-        expect(&mut c, ")"); copy_value(&mut c, 4)
-        c.body.stream_kind = 1; if name == "runes" { covered = true; c.body.stream_kind = 5 }
+        if safe_borrowed_string_stream(&c, place) {
+            expect(&mut c, ")")
+            c.body.stream_kind = 11; if name == "runes" { covered = true; c.body.stream_kind = 15 }
+        } else {
+            expect(&mut c, ")"); copy_value(&mut c, 4)
+            c.body.stream_kind = 1; if name == "runes" { covered = true; c.body.stream_kind = 5 }
+        }
         return 4
     }
     if name != "str" && (ty == 1 || ty == 2 || unsigned.has(ty)) { return integer_method(&mut c, ty, name, &catalog, &mut inline_work, &mut model, &mut covered) }
@@ -3475,6 +3518,77 @@ fn signed_immediate_rhs(c: &mut Session, ty: i32, priority: i32, operator: strin
     fc.clear_loan_eval(&mut c.body.loan)
     true
 }
+fn immediate_div_rem_rhs(c: &mut Session, ty: i32, priority: i32, operator: string) -> bool {
+    if !c.const_div_enabled || c.code.prefixing || (operator != "/" && operator != "%") || c.body.depth > 126 { return false }
+    if ty == 1 || ty == 2 {
+        mut at := c.body.cursor
+        mut negative := false
+        if c.world.tokens.kinds[at] != .Integer {
+            if !is(&c, "-") { return false }
+            negative = true; at = at + 1
+            if at >= c.world.tokens.kinds.len || c.world.tokens.kinds[at] != .Integer { return false }
+        }
+        if !rhs_ends_at(&c, at + 1, priority) { return false }
+        n := rules.literal_integer(c.world.tokens.texts[at])
+        if !n.ok { return false }
+        mut divisor: i64 = 0
+        if negative {
+            max_mag: i64 = if ty == 1 { 2147483648 } else { 9223372036854775807 }
+            if n.value < 2 || n.value > max_mag { return false }
+            divisor = i64(0).wrapping_sub(n.value)
+        } else {
+            if n.value < 1 || (ty == 1 && n.value > 2147483647) { return false }
+            divisor = n.value
+        }
+        width := if ty == 1 { 32 } else { 64 }
+        if c.code.platform == 3 && !const_div.cheap(divisor, width) { return false }
+        mut plan := const_div.new()
+        if !const_div.prepare_into(&mut plan, divisor, width) { return false }
+        c.body.cursor = at + 1
+        if !c.code.checking {
+            if divisor == 1 {
+                if operator == "%" { arm.imm(&mut c.code, 0, 0) }
+            } else {
+                const_div.emit(&mut c.code, &plan, operator == "%", c.overflow, c.zero)
+            }
+        }
+        fc.clear_rvalue_place(&mut c.body.place); c.body.place.scratch = 0
+        fc.clear_expr_value(&mut c.body.expr)
+        fc.clear_loan_eval(&mut c.body.loan)
+        return true
+    }
+    if unsigned.has(ty) {
+        at := c.body.cursor
+        if c.world.tokens.kinds[at] != .Integer || !rhs_ends_at(&c, at + 1, priority) { return false }
+        u := unsigned.literal(c.world.tokens.texts[at], ty)
+        if !u.ok || u.value == 0 { return false }
+        width := unsigned.width_for(ty, c.code.platform)
+        mut shift := 0
+        if u.value == -9223372036854775808 {
+            if width != 64 { return false }
+            shift = 63
+        } else if u.value > 0 && u.value.bit_and(u.value - 1) == 0 {
+            mut tmp := u.value
+            while tmp > 1 { tmp = tmp.shr(1); shift = shift + 1 }
+        } else { return false }
+        if shift < 0 || shift >= width { return false }
+        c.body.cursor = at + 1
+        if !c.code.checking {
+            if shift == 0 {
+                if operator == "%" { arm.imm(&mut c.code, 0, 0) }
+            } else if operator == "/" {
+                arm.bitfield(&mut c.code, false, true, 0, 0, shift, width - 1)
+            } else {
+                arm.bitfield(&mut c.code, false, true, 0, 0, 0, shift - 1)
+            }
+        }
+        fc.clear_rvalue_place(&mut c.body.place); c.body.place.scratch = 0
+        fc.clear_expr_value(&mut c.body.expr)
+        fc.clear_loan_eval(&mut c.body.loan)
+        return true
+    }
+    false
+}
 fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     c.body.depth = c.body.depth + 1
     if c.body.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.body.depth = c.body.depth - 1; return 0 }
@@ -3502,14 +3616,17 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
             if priority != 5 { ty = 3 }
             continue
         }
+        if !observe && !model.recording && immediate_div_rem_rhs(&mut c, ty, priority, operator) {
+            continue
+        }
         if opcode == 12 || opcode == 13 {
             same(&mut c, 3, ty)
             done := new_block(&mut c)
             if operator == "&&" { source_edge(&mut c, done, .WhenFalse, op_at) } else { source_edge(&mut c, done, .WhenTrue, op_at) }
             fallthrough := new_block(&mut c); bind_block(&mut c, fallthrough)
-            skipped := ownership.snapshot(&c.body.ownership)
+            skipped := ownership.checkpoint(&c.body.ownership)
             right := expression(&mut c, priority + 1, 3, &catalog, &mut inline_work, &mut model); same(&mut c, 3, right)
-            evaluated := ownership.snapshot(&c.body.ownership); ownership.join(&mut c.body.ownership, &skipped, &evaluated)
+            evaluated := ownership.checkpoint(&c.body.ownership); ownership.join_checkpoints(&mut c.body.ownership, &skipped, &evaluated)
             bind_block(&mut c, done); ty = 3; fc.clear_rvalue_place(&mut c.body.place)
         } else {
             if ty == 4 {
@@ -3613,8 +3730,8 @@ fn move_loop_backedge(c: &mut Session) {
 fn move_loop_break(c: &mut Session) {
     ownership.loop_break(&mut c.body.ownership)
 }
-fn move_loop_end(c: &mut Session, exit: &ownership.State) {
-    ownership.loop_end(&mut c.body.ownership, &exit)
+fn move_loop_end(c: &mut Session, exit: &ownership.Checkpoint) {
+    ownership.loop_end_checkpoint(&mut c.body.ownership, &exit)
 }
 fn begin_loop_scope(c: &mut Session, head: i32, end: i32) {
     c.body.loop_heads.push(head); c.body.loop_ends.push(end)
@@ -3752,11 +3869,11 @@ fn nested_choice_tail(c: &mut Session, catalog: &opt_inline.View, inline_work: &
     c.body.value_block.ty = ty
     ty == 0
 }
-fn join_statement_outcomes(state: &mut ownership.State, left: &ownership.State, left_terminal: bool,
-    right: &ownership.State, right_terminal: bool) {
-    if left_terminal && !right_terminal { ownership.restore(&mut state, &right) }
-    else if !left_terminal && right_terminal { ownership.restore(&mut state, &left) }
-    else { ownership.join(&mut state, &left, &right) }
+fn join_statement_outcomes(state: &mut ownership.State, left: &ownership.Checkpoint, left_terminal: bool,
+    right: &ownership.Checkpoint, right_terminal: bool) {
+    if left_terminal && !right_terminal { ownership.restore_checkpoint(&mut state, &right) }
+    else if !left_terminal && right_terminal { ownership.restore_checkpoint(&mut state, &left) }
+    else { ownership.join_checkpoints(&mut state, &left, &right) }
 }
 fn conditional(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     c.body.depth = c.body.depth + 1
@@ -3791,14 +3908,14 @@ fn conditional_inner(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.V
     }
     condition_at := c.body.cursor; ty := expression(&mut c, 0, 3, &catalog, &mut inline_work, &mut model); same(&mut c, 3, ty)
     condition := model.value
-    before_branch := ownership.snapshot(&c.body.ownership)
+    before_branch := ownership.checkpoint(&c.body.ownership)
     otherwise := new_block(&mut c); done := new_block(&mut c)
     source_edge(&mut c, otherwise, .WhenFalse, condition_at)
     then_block := new_block(&mut c); bind_block(&mut c, then_block)
     left := block(&mut c, tail_allowed, &catalog, &mut inline_work, &mut model); source_edge(&mut c, done, .Jump, c.body.cursor); bind_block(&mut c, otherwise)
     yes := model.value
-    left_state := ownership.snapshot(&c.body.ownership)
-    ownership.restore(&mut c.body.ownership, &before_branch)
+    left_state := ownership.checkpoint(&c.body.ownership)
+    ownership.restore_checkpoint(&mut c.body.ownership, &before_branch)
     newlines(&mut c)
     mut right := false; mut no := -1
     if eat(&mut c, "else") {
@@ -3808,7 +3925,7 @@ fn conditional_inner(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.V
         } else { right = block(&mut c, tail_allowed, &catalog, &mut inline_work, &mut model); no = model.value }
     }
     if model.recording { _ := typed.node(&mut model, 13, 0, condition, yes, no, 0, -1, at) }
-    right_state := ownership.snapshot(&c.body.ownership)
+    right_state := ownership.checkpoint(&c.body.ownership)
     join_statement_outcomes(&mut c.body.ownership, &left_state, left, &right_state, right)
     bind_block(&mut c, done)
     left && right
@@ -3929,11 +4046,11 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
     mut patterns := coverage.new(ft.type_count(&c.types, ty))
     mut fallback := false; mut returns := true
     done := new_block(&mut c)
-    mut continuing := ownership.snapshot(&c.body.ownership)
-    mut outcomes := ownership.new(); ownership.terminate(&mut outcomes)
+    mut continuing := ownership.checkpoint(&c.body.ownership)
+    mut outcomes := ownership.empty_checkpoint()
     mut outcome_seen := false; mut falling_through := false
     while !is(&c, "}") && c.ok {
-        ownership.restore(&mut c.body.ownership, &continuing)
+        ownership.restore_checkpoint(&mut c.body.ownership, &continuing)
         if fallback { fail(&mut c, "wildcard must be the final match arm"); return false }
         next := new_block(&mut c); enter(&mut c)
         wildcard := is(&c, "_")
@@ -3950,8 +4067,8 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         bind_pattern(&mut c, &mut model, &mut bindings, guarded, borrowed_subject)
         if guarded {
             match_guard(&mut c, first_owner, marker_floor, next, &catalog, &mut inline_work, &mut model); newlines(&mut c)
-            guarded_state := ownership.snapshot(&c.body.ownership); skipped := ownership.snapshot(&continuing)
-            ownership.join(&mut continuing, &skipped, &guarded_state)
+            guarded_state := ownership.checkpoint(&c.body.ownership)
+            ownership.join_checkpoint_in_place(&c.body.ownership, &mut continuing, &guarded_state)
             if !borrowed_subject {
                 for i in 0..bindings.tokens.len { if ft.move_only(&c.types, bindings.types[i]) { transfer_pattern(&mut c, &bindings, i) } }
                 while c.body.pattern_borrowed.len > marker_floor { _ := c.body.pattern_borrowed.pop() }
@@ -3980,9 +4097,9 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         returns = returns && ends
         leave(&mut c)
         while c.body.pattern_borrowed.len > marker_floor { _ := c.body.pattern_borrowed.pop() }
-        arm_state := ownership.snapshot(&c.body.ownership); prior := ownership.snapshot(&outcomes)
-        if outcome_seen { join_statement_outcomes(&mut outcomes, &prior, !falling_through, &arm_state, ends) }
-        else { ownership.restore(&mut outcomes, &arm_state); outcome_seen = true }
+        arm_state := ownership.checkpoint(&c.body.ownership)
+        if outcome_seen { ownership.combine_checkpoints(&c.body.ownership, &mut outcomes, !falling_through, &arm_state, ends) }
+        else { ownership.copy_checkpoint(&mut outcomes, &arm_state); outcome_seen = true }
         falling_through = falling_through || !ends
         source_edge(&mut c, done, .Jump, c.body.cursor); bind_block(&mut c, next)
         separators(&mut c); if !eat(&mut c, ",") && !is(&c, "}") { fail(&mut c, "expected comma between match arms") }; separators(&mut c)
@@ -3992,7 +4109,7 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         error := coverage.complete(&mut patterns, &c.types, ty)
         if error != "" { fail(&mut c, error) }
     }
-    ownership.restore(&mut c.body.ownership, &outcomes)
+    ownership.restore_checkpoint(&mut c.body.ownership, &outcomes)
     if borrowed_subject && subject_root >= 0 { _ := c.body.for_locks.pop() }
     returns
 }
@@ -4092,7 +4209,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         begin_loop_scope(&mut c, head, done)
         ty := expression(&mut c, 0, 3, &catalog, &mut inline_work, &mut model); same(&mut c, 3, ty); source_edge(&mut c, done, .WhenFalse, condition_at); body := new_block(&mut c); bind_block(&mut c, body)
         condition := model.value
-        loop_exit := ownership.snapshot(&c.body.ownership)
+        loop_exit := ownership.checkpoint(&c.body.ownership)
         ends := block(&mut c, false, &catalog, &mut inline_work, &mut model)
         end_loop_scope(&mut c)
         move_loop_backedge(&mut c); move_loop_end(&mut c, &loop_exit)
@@ -4139,15 +4256,19 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         if model.probing && !is(&c, "..") && decline_projection(&mut c, &mut model) {
             c.body.stream_depth = previous_stream; c.body.stream_kind = 0; return false
         }
-        stream := c.body.stream_kind; c.body.stream_depth = previous_stream; c.body.stream_kind = 0
+        mut stream := c.body.stream_kind; c.body.stream_depth = previous_stream; c.body.stream_kind = 0
         cursor := slot(&mut c); limit := slot(&mut c); values := slot(&mut c); binding := slot(&mut c)
         mut kind: iteration.Kind = .Range; source := c.world.tokens.starts[at]
         mut base := 1; mut array := false
         mut borrow_elem := false
         if stream != 0 {
-            same(&mut c, 4, low); base = stream
+            same(&mut c, 4, low)
+            borrowed_stream := stream > 10
+            if borrowed_stream { stream = stream - 10 }
+            base = stream
             kind = .Bytes; if stream == 5 { kind = .Runes }
-            take_value(&mut c, 4); save_owner(&mut c, values, 4, true)
+            if borrowed_stream { arm.store(&mut c.code, values, 0) }
+            else { take_value(&mut c, 4); save_owner(&mut c, values, 4, true) }
             _ := length_value(&mut c, low, name_at); arm.store(&mut c.code, limit, 0)
             arm.imm(&mut c.code, 0, 0); arm.store(&mut c.code, cursor, 0)
         } else if !borrowed_for && eat(&mut c, "..") {
@@ -4168,7 +4289,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
             }
             _ := length_value(&mut c, low, name_at); arm.store(&mut c.code, limit, 0); arm.imm(&mut c.code, 0, 0); arm.store(&mut c.code, cursor, 0)
         }
-        move_loop_begin(&mut c); loop_exit := ownership.snapshot(&c.body.ownership)
+        move_loop_begin(&mut c); loop_exit := ownership.checkpoint(&c.body.ownership)
         head := new_block(&mut c); next := new_block(&mut c); done := new_block(&mut c)
         enter(&mut c)
         if array || stream != 0 {
@@ -4512,7 +4633,7 @@ pub fn new_session() -> Session {
         code: code, runtime: rt, needed: [], loans: scratch.loans(),
         fn_labels: [],
         array_take: array_take, record_take_labels: [],
-        mir_opt_enabled: config.mir_opt_enabled, mir_memory_enabled: config.mir_memory_enabled, mir_ssa_enabled: config.mir_ssa_enabled, mir_values_enabled: config.mir_values_enabled, scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, range_enabled: config.range_enabled, inline_enabled: config.inline_enabled && scalar_enabled && !check_all, scalar_templates: opt_templates.new(),
+        mir_opt_enabled: config.mir_opt_enabled, mir_memory_enabled: config.mir_memory_enabled, mir_ssa_enabled: config.mir_ssa_enabled, mir_values_enabled: config.mir_values_enabled, scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, const_div_enabled: config.const_div_enabled, range_enabled: config.range_enabled, inline_enabled: config.inline_enabled && scalar_enabled && !check_all, scalar_templates: opt_templates.new(),
         strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, unicode_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
 }
@@ -4560,10 +4681,12 @@ pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
     frozen.unpack_types(&src.spellings, &mut cache, &src.types, &mut c.types)
     c.validation_spellings = cache
     map.reserve(&mut c.world.functions, src.names.len)
-    map.reserve(&mut c.world.methods, src.names.len)
+    fc.reserve_methods(&mut c.world, src.names.len)
     for f in 0..src.names.len {
         if c.world.impl_types[f] >= 0 {
-            map.put(&mut c.world.methods, c.world.impl_types[f].str() + ":" + c.world.impl_names[f], i64(f))
+            impl_ty := c.world.impl_types[f]
+            impl_name := c.world.impl_names[f].clone()
+            _ := fc.put_method(&mut c.world, impl_ty, impl_name, f)
         } else {
             map.put(&mut c.world.functions, c.world.names[f].clone(), i64(f))
         }
@@ -4801,7 +4924,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     array_take := arm.label(&mut code)
     c.code = code; c.runtime = rt.clone(); c.array_take = array_take
     c.report = report; c.world.source_end = source_end; c.float_source = uses_float
-    c.scalar_enabled = scalar_enabled; c.ownership_enabled = config.ownership_enabled
+    c.scalar_enabled = scalar_enabled; c.ownership_enabled = config.ownership_enabled; c.const_div_enabled = config.const_div_enabled
     c.range_enabled = config.range_enabled; c.inline_enabled = config.inline_enabled && scalar_enabled && !check_all
     c.mir_opt_enabled = config.mir_opt_enabled
     c.mir_memory_enabled = config.mir_memory_enabled; c.mir_ssa_enabled = config.mir_ssa_enabled; c.mir_values_enabled = config.mir_values_enabled
@@ -4986,7 +5109,7 @@ pub struct BackendBindings {
     print_text: i32, write: i32, float_trap: i32, unicode_trap: i32, overflow: i32,
     zero: i32, assertion: i32, io: i32, bounds: i32,
     open: i32, close: i32, await_result: i32,
-    float_source: bool, has_callbacks: bool, ownership_enabled: bool, inline_enabled: bool,
+    float_source: bool, has_callbacks: bool, ownership_enabled: bool, const_div_enabled: bool, inline_enabled: bool,
 }
 pub fn freeze_backend(c: &Session) -> BackendBindings {
     BackendBindings { runtime: c.runtime.clone(), platform: c.jobs.platform, globals: c.jobs.globals, instrumented: c.code.profile,
@@ -4997,7 +5120,7 @@ pub fn freeze_backend(c: &Session) -> BackendBindings {
         assertion: c.assertion, io: c.io, bounds: c.bounds,
         open: c.tasks.open, close: c.tasks.close, await_result: c.tasks.await_result,
         float_source: c.float_source, has_callbacks: c.has_callbacks, ownership_enabled: c.ownership_enabled,
-        inline_enabled: c.inline_enabled,
+        const_div_enabled: c.const_div_enabled, inline_enabled: c.inline_enabled,
     }
 }
 pub fn prepare_emitter(c: &mut Session, bindings: &BackendBindings) {
@@ -5015,7 +5138,7 @@ pub fn prepare_emitter(c: &mut Session, bindings: &BackendBindings) {
     c.tasks.open = bindings.open; c.tasks.close = bindings.close
     c.tasks.await_result = bindings.await_result
     c.float_source = bindings.float_source; c.has_callbacks = bindings.has_callbacks
-    c.ownership_enabled = bindings.ownership_enabled; c.inline_enabled = bindings.inline_enabled
+    c.ownership_enabled = bindings.ownership_enabled; c.const_div_enabled = bindings.const_div_enabled; c.inline_enabled = bindings.inline_enabled
 }
 pub struct EmittedBody {
     declaration: i32, at: i32, error: []u8,
@@ -5751,9 +5874,9 @@ fn emit_scalar(c: &mut Session, f: i32, model: &opt_ir.Function, plan: &mut opt_
             at := model.local_at[local]
             if at >= 0 && c.world.tokens.starts[at] < c.world.source_end {
                 mut ty := model.local_types[local]
-                if ty == 20 || ty == 21 {
-                    array := compound(&mut c, 1, 2)
-                    mut kind := 4; if ty == 21 { kind = 5 }
+                if opt_ir.array_type(ty) {
+                    array := compound(&mut c, 1, opt_ir.array_element(ty))
+                    mut kind := 4; if opt_ir.writable_array(ty) { kind = 5 }
                     ty = compound(&mut c, kind, array)
                 }
                 facts.binding(&mut c.body.facts, at, ty)
@@ -6094,71 +6217,140 @@ fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
     c.types.self_type = -1
 }
 
+fn unwrap_collection_base(c: &Session, ty_in: i32) -> i32 {
+    mut ty := ty_in
+    while collection(&c, ty) { ty = ft.type_base(&c.types, ty) }
+    ty
+}
+fn enqueue_nominal_member(c: &Session, ty_in: i32, for_clone: bool, needed: &mut []bool, work: &mut []i32) {
+    ty := unwrap_collection_base(&c, ty_in)
+    if ty < 0 || ty >= c.helper_labels.len || c.helper_labels[ty] < 0 { return }
+    if !ft.owned(&c.types, ty) || ty == 4 || collection(&c, ty) || boxed_function(&c, ty) { return }
+    if for_clone && ft.type_kind(&c.types, ty) == 7 && !ft.move_only(&c.types, ty) { return }
+    if !needed[ty] { needed[ty] = true; work.push(ty) }
+}
+fn propagate_nominal_helpers(c: &Session, for_clone: bool, needed: &mut []bool, work: &mut []i32) {
+    while work.len > 0 {
+        ty := work.pop()
+        if for_clone && ft.type_kind(&c.types, ty) == 7 && !ft.move_only(&c.types, ty) { continue }
+        if c.types.c_record[ty] { continue }
+        first := c.types.declared.type_starts[ty]
+        count := c.types.declared.type_counts[ty]
+        if ft.type_kind(&c.types, ty) == 7 {
+            for v in first..first + count {
+                ps := c.types.payload_starts[v]; pc := c.types.payload_counts[v]
+                for i in 0..pc { enqueue_nominal_member(&c, c.types.payload_types[ps + i], for_clone, &mut needed, &mut work) }
+            }
+        } else {
+            for i in 0..count { enqueue_nominal_member(&c, c.types.field_types[first + i], for_clone, &mut needed, &mut work) }
+        }
+    }
+}
 fn nominal_clones(c: &mut Session, rt: &runtime.Runtime) {
-    for ty in 0..c.types.type_names.len {
+    mut max_label := -1
+    for ty in 0..c.helper_labels.len {
+        if ft.owned(&c.types, ty) && ty != 4 && !collection(&c, ty) && c.helper_labels[ty] >= 0 {
+            end := c.helper_labels[ty] + 1
+            if end > max_label { max_label = end }
+        }
+    }
+    mut label_kind: []i32 = []
+    if max_label >= 0 {
+        label_kind.reserve(max_label + 1)
+        for _ in 0..max_label + 1 { label_kind.push(-1) }
+        for ty in 0..c.helper_labels.len {
+            if ft.owned(&c.types, ty) && ty != 4 && !collection(&c, ty) && c.helper_labels[ty] >= 0 {
+                h := c.helper_labels[ty]
+                label_kind[h] = ty * 2
+                label_kind[h + 1] = ty * 2 + 1
+            }
+        }
+    }
+    n_types := c.types.type_names.len
+    mut clone_needed: []bool = []; mut drop_needed: []bool = []
+    clone_needed.reserve(n_types); drop_needed.reserve(n_types)
+    for _ in 0..n_types { clone_needed.push(false); drop_needed.push(false) }
+    mut clone_work: []i32 = []; mut drop_work: []i32 = []
+    for target in &c.code.target {
+        if target >= 0 && target < label_kind.len {
+            enc := label_kind[target]
+            if enc >= 0 {
+                ty := enc / 2
+                if enc % 2 == 0 { if !clone_needed[ty] { clone_needed[ty] = true; clone_work.push(ty) } }
+                else { if !drop_needed[ty] { drop_needed[ty] = true; drop_work.push(ty) } }
+            }
+        }
+    }
+    propagate_nominal_helpers(&c, true, &mut clone_needed, &mut clone_work)
+    propagate_nominal_helpers(&c, false, &mut drop_needed, &mut drop_work)
+    for ty in 0..n_types {
         if !ft.owned(&c.types, ty) || ty == 4 || collection(&c, ty) { continue }
-        arm.mark(&mut c.code, c.helper_labels[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
-        if c.types.c_record[ty] {
-            arm.push(&mut c.code,0); arm.imm(&mut c.code,0,i64(c.types.declared.c_sizes[ty])); arm.branch(&mut c.code,rt.alloc_clone,1)
-            arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); copy_inline(&mut c,c.types.declared.c_sizes[ty])
-        } else if c.types.declared.type_kinds[ty] == 7 {
-            if !ft.move_only(&c.types, ty) { arm.branch(&mut c.code, rt.retain, 1) }
-            else {
-                arm.store(&mut c.code, 0, 0); cloned := arm.label(&mut c.code)
-                for variant in c.types.declared.type_starts[ty]..c.types.declared.type_starts[ty] + c.types.declared.type_counts[ty] {
-                    next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
-                    arm.imm(&mut c.code, 1, c.types.field_values[variant]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
-                    arm.imm(&mut c.code, 0, i64(c.types.payload_counts[variant] + 1) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
-                    arm.imm(&mut c.code, 1, c.types.field_values[variant]); store_mem(&mut c, 1, 0, 0)
-                    for i in 0..c.types.payload_counts[variant] {
-                        pt := c.types.payload_types[c.types.payload_starts[variant] + i]
-                        arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i+1)*8); copy_value(&mut c, pt)
-                        arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, 1); store_mem(&mut c, 1, 0, (i+1)*8)
+        if clone_needed[ty] {
+            arm.mark(&mut c.code, c.helper_labels[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+            if c.types.c_record[ty] {
+                arm.push(&mut c.code,0); arm.imm(&mut c.code,0,i64(c.types.declared.c_sizes[ty])); arm.branch(&mut c.code,rt.alloc_clone,1)
+                arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); copy_inline(&mut c,c.types.declared.c_sizes[ty])
+            } else if c.types.declared.type_kinds[ty] == 7 {
+                if !ft.move_only(&c.types, ty) { arm.branch(&mut c.code, rt.retain, 1) }
+                else {
+                    arm.store(&mut c.code, 0, 0); cloned := arm.label(&mut c.code)
+                    for variant in c.types.declared.type_starts[ty]..c.types.declared.type_starts[ty] + c.types.declared.type_counts[ty] {
+                        next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
+                        arm.imm(&mut c.code, 1, c.types.field_values[variant]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
+                        arm.imm(&mut c.code, 0, i64(c.types.payload_counts[variant] + 1) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
+                        arm.imm(&mut c.code, 1, c.types.field_values[variant]); store_mem(&mut c, 1, 0, 0)
+                        for i in 0..c.types.payload_counts[variant] {
+                            pt := c.types.payload_types[c.types.payload_starts[variant] + i]
+                            arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i+1)*8); copy_value(&mut c, pt)
+                            arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, 1); store_mem(&mut c, 1, 0, (i+1)*8)
+                        }
+                        arm.load(&mut c.code, 1); arm.branch(&mut c.code, cloned, 0); arm.mark(&mut c.code, next)
                     }
-                    arm.load(&mut c.code, 1); arm.branch(&mut c.code, cloned, 0); arm.mark(&mut c.code, next)
+                    arm.mark(&mut c.code, cloned)
                 }
-                arm.mark(&mut c.code, cloned)
             }
-        }
-        else {
-            arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.types.declared.type_counts[ty]) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
-            first := c.types.declared.type_starts[ty]
-            for i in 0..c.types.declared.type_counts[ty] {
-                arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); copy_value(&mut c, c.types.field_types[first + i])
-                arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
-            }
-            arm.load(&mut c.code, 1)
-        }
-        arm.ret(&mut c.code)
-        arm.mark(&mut c.code, c.helper_labels[ty] + 1); drop_frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, drop_frame, 1)
-        done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18); arm.store(&mut c.code, 0, 0)
-        cleanup := ft.cleanup_method(&c.types, ty)
-        if cleanup >= 0 && c.needed[cleanup] {
-            arm.address(&mut c.code, 0)
-            arm.branch(&mut c.code, c.fn_labels[cleanup], 1)
-        }
-        if c.types.declared.type_kinds[ty] == 7 {
-            shared := arm.label(&mut c.code)
-            rt_emit.allocation_refcount(&mut c.code)
-            arm.imm(&mut c.code, 2, 1); arm.compare_register(&mut c.code, 1, 2); arm.branch(&mut c.code, shared, 3)
-            for v in c.types.declared.type_starts[ty]..c.types.declared.type_starts[ty] + c.types.declared.type_counts[ty] {
-                next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
-                arm.imm(&mut c.code, 1, c.types.field_values[v]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
-                for i in 0..c.types.payload_counts[v] {
-                    pt := c.types.payload_types[c.types.payload_starts[v] + i]
-                    if owned(&c, pt) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8); drop_value(&mut c, pt) }
+            else {
+                arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.types.declared.type_counts[ty]) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
+                first := c.types.declared.type_starts[ty]
+                for i in 0..c.types.declared.type_counts[ty] {
+                    arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); copy_value(&mut c, c.types.field_types[first + i])
+                    arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
                 }
-                arm.branch(&mut c.code, shared, 0); arm.mark(&mut c.code, next)
+                arm.load(&mut c.code, 1)
             }
-            arm.mark(&mut c.code, shared)
-        } else if !c.types.c_record[ty] {
-            first := c.types.declared.type_starts[ty]
-            for i in 0..c.types.declared.type_counts[ty] {
-                field_ty := c.types.field_types[first + i]
-                if owned(&c, field_ty) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); drop_value(&mut c, field_ty) }
-            }
+            arm.ret(&mut c.code)
         }
-        arm.load(&mut c.code, 0); arm.branch(&mut c.code, rt.release, 1); arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+        if drop_needed[ty] {
+            arm.mark(&mut c.code, c.helper_labels[ty] + 1); drop_frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, drop_frame, 1)
+            done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18); arm.store(&mut c.code, 0, 0)
+            cleanup := ft.cleanup_method(&c.types, ty)
+            if cleanup >= 0 && c.needed[cleanup] {
+                arm.address(&mut c.code, 0)
+                arm.branch(&mut c.code, c.fn_labels[cleanup], 1)
+            }
+            if c.types.declared.type_kinds[ty] == 7 {
+                shared := arm.label(&mut c.code)
+                rt_emit.allocation_refcount(&mut c.code)
+                arm.imm(&mut c.code, 2, 1); arm.compare_register(&mut c.code, 1, 2); arm.branch(&mut c.code, shared, 3)
+                for v in c.types.declared.type_starts[ty]..c.types.declared.type_starts[ty] + c.types.declared.type_counts[ty] {
+                    next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
+                    arm.imm(&mut c.code, 1, c.types.field_values[v]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
+                    for i in 0..c.types.payload_counts[v] {
+                        pt := c.types.payload_types[c.types.payload_starts[v] + i]
+                        if owned(&c, pt) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8); drop_value(&mut c, pt) }
+                    }
+                    arm.branch(&mut c.code, shared, 0); arm.mark(&mut c.code, next)
+                }
+                arm.mark(&mut c.code, shared)
+            } else if !c.types.c_record[ty] {
+                first := c.types.declared.type_starts[ty]
+                for i in 0..c.types.declared.type_counts[ty] {
+                    field_ty := c.types.field_types[first + i]
+                    if owned(&c, field_ty) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); drop_value(&mut c, field_ty) }
+                }
+            }
+            arm.load(&mut c.code, 0); arm.branch(&mut c.code, rt.release, 1); arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+        }
     }
     rt_emit.emit_array_helpers(&mut c.code, &rt, c.array_helpers)
 }
@@ -6186,7 +6378,17 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
     env_site := runtime.emit_runtime_with_env(&mut c.code, &rt, c.imports.env_source_slot)
     if env_site >= 0 { c.imports.sites.push(env_site); c.imports.slots.push(c.imports.env_source_slot) }
     data_start := c.code.words.len
-    for i in 0..c.strings.len { rt_emit.emit_literal(&mut c.code, c.strings[i].clone(), c.string_labels[i]) }
+    mut emitted_strings := map.new()
+    map.reserve(&mut emitted_strings, c.strings.len)
+    for i in 0..c.strings.len {
+        canon := map.get_or(&emitted_strings, c.strings[i], -1)
+        if canon >= 0 {
+            arm.alias_label(&mut c.code, c.string_labels[i], i32(canon))
+        } else {
+            rt_emit.emit_literal(&mut c.code, c.strings[i].clone(), c.string_labels[i])
+            map.put(&mut emitted_strings, c.strings[i].clone(), i64(c.string_labels[i]))
+        }
+    }
     runtime.emit_profile_data(&mut c.code, &rt)
     mut text: []u8 = []
     if platform == 3 {
