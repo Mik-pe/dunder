@@ -1,0 +1,348 @@
+capability process, filesystem
+
+import .harness as harness
+import std.array as array
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+pub struct Driver {
+    name: string,
+    path: string,
+    jobs: i32,
+}
+
+pub struct CompilerIdentity { path: string, sha256: string }
+
+pub struct Command {
+    argv: []string,
+    status: i32,
+    stdout: string,
+    stderr: string,
+}
+
+pub struct Image {
+    case_name: string,
+    target: string,
+    driver: string,
+    path: string,
+    sha256: string,
+    counters: string,
+}
+
+pub struct Contract {
+    name: string,
+    target: string,
+    key: string,
+    bindings: bool,
+    boundary: i32,
+}
+
+pub struct Probe {
+    output: string,
+    host: string,
+    drivers: []Driver,
+    commands: []Command,
+    images: []Image,
+    contracts: []Contract,
+    executions: i32,
+    error: string,
+}
+
+pub fn create(output: string, compiler: string, baseline: string) -> Probe {
+    mut drivers: []Driver = []
+    for jobs in [1, 2, 4] {
+        drivers.push(Driver { name: f"jobs{jobs}", path: compiler.clone(), jobs: jobs })
+    }
+    if baseline.len > 0 { drivers.push(Driver { name: "baseline", path: baseline.clone(), jobs: 0 }) }
+    Probe { output: output.clone(), host: process.host_target(), drivers: drivers,
+            commands: [], images: [], contracts: [], executions: 0, error: "" }
+}
+
+pub fn put(path: string, content: string) -> bool {
+    sys.write_text(path, content).ok || harness.fail(f"cannot write {path}")
+}
+
+pub fn arguments(driver: &Driver, operation: string, source: string, flags: []string) -> []string {
+    mut args: []string = [operation.clone(), source.clone()]
+    if driver.jobs > 0 { args.push(f"--jobs={driver.jobs}") }
+    for flag in flags { args.push(flag.clone()) }
+    args
+}
+
+pub fn same_response(left: &process.Output, right: &process.Output) -> bool {
+    left.stdout_text() == right.stdout_text() && left.stderr_text() == right.stderr_text()
+}
+
+fn write_value(doc: &json.Doc, node: i32, writer: &mut json.Writer) -> bool {
+    kind := doc.kind(node)
+    if kind == .Object {
+        mut keys: []string = []
+        for i in 0..doc.count(node) { keys.push(doc.key_at(node, i).value.clone()) }
+        array.sort_strings(&mut keys)
+        writer.object()
+        for key in keys {
+            writer.key(key)
+            if !write_value(&doc, doc.field(node, key), &mut writer) { return false }
+        }
+        writer.end()
+    } else if kind == .Array {
+        writer.array()
+        for i in 0..doc.count(node) {
+            if !write_value(&doc, doc.at(node, i), &mut writer) { return false }
+        }
+        writer.end()
+    } else if kind == .Bool { writer.boolean(doc.as_bool(node).value) }
+    else if kind == .Number {
+        integer := doc.as_i64(node)
+        if integer.ok { writer.integer(integer.value) }
+        else {
+            positive := doc.as_u64(node)
+            if !positive.ok { return false }
+            writer.unsigned(positive.value)
+        }
+    } else if kind == .String { writer.string(doc.as_str(node).value) }
+    else if kind == .Null { writer.null() }
+    else { return false }
+    true
+}
+
+fn counters(stderr: string) -> string {
+    mut rows := 0
+    mut selected := ""
+    for line in text.split(stderr, "\n") {
+        if text.starts_with(line, "{") && text.find(line, "\"kind\":\"timings\"") >= 0 {
+            rows += 1
+            selected = line.clone()
+        }
+    }
+    if rows != 1 { return "" }
+    doc := json.Doc::parse_text(selected)
+    if !doc.ok { return "" }
+    mut writer := json.Writer::new()
+    writer.object()
+    for key in ["functions", "optimizer", "inlining", "mir"] {
+        node := doc.field(doc.root, key)
+        if doc.kind(node) != .Object { return "" }
+        writer.key(key)
+        if !write_value(&doc, node, &mut writer) { return "" }
+    }
+    detail := doc.field(doc.root, "compiler_detail")
+    if detail >= 0 && doc.kind(detail) != .Null {
+        if !doc.get_bool(detail, "clock_ok").value { return "" }
+        writer.key("profile")
+        writer.object()
+        for key in ["calls", "work"] {
+            writer.key(key)
+            if !write_value(&doc, doc.field(detail, key), &mut writer) { return "" }
+        }
+        writer.end()
+    }
+    writer.end()
+    writer.finish().value
+}
+
+pub fn equal_image(left: &Image, right: &Image) -> bool {
+    left.sha256 == right.sha256 && left.counters == right.counters
+}
+
+pub fn counter(image: &Image, group: string, key: string) -> i64 {
+    doc := json.Doc::parse_text(image.counters)
+    field := doc.get_i64(doc.field(doc.root, group), key)
+    if field.ok { return field.value }
+    -1
+}
+
+fn valid_bindings(report: string) -> bool {
+    rows := text.split(text.trim(report), "\n")
+    if rows.len == 0 { return false }
+    mut found := false
+    mut last := ""
+    for row in rows {
+        doc := json.Doc::parse_text(row)
+        if !doc.ok { return false }
+        kind := doc.get_str(doc.root, "kind")
+        last = kind.value
+        if last == "binding" { found = true }
+    }
+    found && last == "ok"
+}
+
+impl Probe {
+    pub fn fail(&mut self, error: string) -> bool {
+        if self.error.len == 0 { self.error = error.clone() }
+        harness.fail(error)
+    }
+
+    pub fn require(&mut self, condition: bool, error: string) -> bool {
+        if condition { return true }
+        self.fail(error)
+    }
+
+    pub fn run(&mut self, program: string, args: []string, cwd: string, status: i32, result: &mut process.Output) -> bool {
+        output := harness.exec_cmd(program, args, cwd, false, 120000)
+        actual := if output.signal > 0 { -output.signal } else { output.code }
+        mut argv: []string = [program.clone()]
+        for arg in args { argv.push(arg.clone()) }
+        self.commands.push(Command { argv: argv, status: actual, stdout: output.stdout_text(), stderr: output.stderr_text() })
+        if !output.ok || output.timed_out || actual != status {
+            return self.fail(f"{program} exited {actual}, expected {status}\n{output.stdout_text()}\n{output.stderr_text()}")
+        }
+        result = output
+        true
+    }
+
+    pub fn driver_run(&mut self, driver: &Driver, operation: string, source: string, flags: []string, status: i32,
+                      output: &mut process.Output) -> bool {
+        self.run(driver.path, arguments(&driver, operation, source, flags), harness.parent_dir(source), status, &mut output)
+    }
+
+    pub fn fixture(&mut self, name: string, content: string) -> string {
+        directory := self.output + "/" + name
+        file := directory + "/main.ddr"
+        if !sys.mkdir(directory).ok || !put(file, content) {
+            _ := self.fail(f"cannot prepare {file}")
+            return ""
+        }
+        file
+    }
+
+    pub fn build(&mut self, driver: &Driver, source: string, target: string, image: string, flags: []string) -> bool {
+        mut args: []string = ["--target", target.clone(), "--timings=json", "-o", image.clone()]
+        for flag in flags { args.push(flag.clone()) }
+        mut output := harness.empty_output()
+        if !self.driver_run(&driver, "build", source, args, 0, &mut output) { return false }
+        state := counters(output.stderr_text())
+        if state.len == 0 { return self.fail(f"invalid build counters for {image}\n{output.stderr_text()}") }
+        sha := harness.sha256_file_hex(image)
+        if sha.len == 0 { return self.fail(f"cannot read {image}") }
+        self.images.push(Image { case_name: harness.basename(harness.parent_dir(source)), target: target.clone(),
+                                 driver: driver.name.clone(), path: image.clone(), sha256: sha, counters: state })
+        true
+    }
+
+    pub fn execute(&mut self, image: string, target: string, expected: string) -> bool {
+        if target != self.host { return true }
+        mut output := harness.empty_output()
+        if !self.run(image, [], harness.parent_dir(image), 0, &mut output) { return false }
+        if output.stdout_text() != expected || output.stderr.len > 0 {
+            return self.fail(f"unexpected result for {image}\n{output.stdout_text()}\n{output.stderr_text()}")
+        }
+        self.executions += 1
+        true
+    }
+
+    pub fn bindings(&mut self, driver: &Driver, source: string, target: string, flags: []string,
+                    output: &mut process.Output) -> bool {
+        mut args: []string = ["--agent", "--target", target.clone()]
+        for flag in flags { args.push(flag.clone()) }
+        self.driver_run(&driver, "check", source, args, 0, &mut output) &&
+            self.require(valid_bindings(output.stdout_text()), f"invalid source bindings for {source}\n{output.stdout_text()}")
+    }
+
+    pub fn matrix(&mut self, source: string, expected: string, targets: []string, flags: []string, bindings: bool) -> bool {
+        if source.len == 0 { return false }
+        directory := harness.parent_dir(source)
+        for target in targets {
+            start := self.images.len
+            mut report := harness.empty_output()
+            for i in 0..self.drivers.len {
+                driver := self.drivers[i].clone()
+                image := directory + "/" + target + "-" + driver.name
+                if !self.build(&driver, source, target, image, flags) || !self.execute(image, target, expected) { return false }
+                if !equal_image(&self.images[start], &self.images[self.images.len - 1]) {
+                    return self.fail(f"{source} {target}: {driver.name} image or counters differ")
+                }
+                if bindings {
+                    mut output := harness.empty_output()
+                    if !self.bindings(&driver, source, target, flags, &mut output) { return false }
+                    if i == 0 { report = output }
+                    else if !same_response(&report, &output) { return self.fail(f"{source} {target}: binding reports differ") }
+                }
+            }
+            self.contracts.push(Contract { name: harness.basename(directory), target: target.clone(),
+                key: "images_and_integer_counters_equal", bindings: bindings, boundary: -1 })
+        }
+        true
+    }
+
+    pub fn checked(&mut self, name: string, key: string) {
+        self.contracts.push(Contract { name: name.clone(), target: "", key: key.clone(), bindings: false, boundary: -1 })
+    }
+
+    pub fn counted(&mut self, name: string, key: string, value: i32) {
+        self.contracts.push(Contract { name: name.clone(), target: "", key: key.clone(), bindings: false, boundary: value })
+    }
+}
+
+pub fn write_results(probe: &Probe, compilers: &[]CompilerIdentity, digest: string, passed: bool) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("result"); writer.string(if passed { "passed" } else { "failed" })
+    writer.key("run"); writer.string(probe.output)
+    writer.key("host_target"); writer.string(probe.host)
+    writer.key("compilers_sha256"); writer.object()
+    for exe in compilers {
+        writer.key(exe.path); writer.string(exe.sha256)
+    }
+    writer.end()
+    writer.key("tool_sha256"); writer.string(digest)
+    writer.key("images"); writer.array()
+    for image in probe.images {
+        writer.object()
+        writer.key("case"); writer.string(image.case_name)
+        writer.key("target"); writer.string(image.target)
+        writer.key("driver"); writer.string(image.driver)
+        writer.key("path"); writer.string(image.path)
+        writer.key("sha256"); writer.string(image.sha256)
+        writer.key("counters")
+        doc := json.Doc::parse_text(image.counters)
+        if !write_value(&doc, doc.root, &mut writer) { return harness.fail("cannot serialize image counters") }
+        writer.end()
+    }
+    writer.end()
+    writer.key("executions"); writer.object()
+    writer.key(probe.host); writer.integer(i64(probe.executions))
+    writer.end()
+    writer.key("contracts"); writer.array()
+    for row in probe.contracts {
+        writer.object()
+        writer.key("case"); writer.string(row.name)
+        if row.target.len > 0 {
+            writer.key("target"); writer.string(row.target)
+            writer.key("bindings_equal"); writer.boolean(row.bindings)
+        }
+        writer.key(row.key)
+        if row.boundary < 0 { writer.boolean(true) }
+        else { writer.integer(i64(row.boundary)) }
+        writer.end()
+    }
+    writer.end()
+    writer.key("cross_target_execution"); writer.string("not run; cross-target images verified by equality only")
+    writer.key("dispatch_proof")
+    writer.string("real source tasks exercised on native host OS threads; compiler OS-overlap not measured or asserted")
+    writer.key("scope"); writer.string("functional equality; no latency assertions or timing results")
+    if probe.error.len > 0 { writer.key("error"); writer.string(probe.error) }
+    writer.end()
+    summary := writer.finish()
+
+    mut log := json.Writer::new()
+    log.array()
+    for command in probe.commands {
+        log.object()
+        log.key("command"); log.array()
+        for arg in command.argv { log.string(arg) }
+        log.end()
+        log.key("exit"); log.integer(i64(command.status))
+        log.key("stdout"); log.string(command.stdout)
+        log.key("stderr"); log.string(command.stderr)
+        log.end()
+    }
+    log.end()
+    commands := log.finish()
+    summary.ok && commands.ok &&
+        put(probe.output + "/summary.json", summary.value + "\n") &&
+        put(probe.output + "/commands.json", commands.value + "\n")
+}
