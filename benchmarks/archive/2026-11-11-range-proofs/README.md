@@ -18,13 +18,13 @@ Analysen har budget för 131 072 arbetsenheter, åtta överföringar per
 loophuvud, djup 64, 32 768 faktaceller och 512 resultatplatser. En återanvänd
 arbetsyta med plana buffertar undviker en heapallokering per uttryck.
 `--range-opt=off` isolerar passet, med separat cache- och kvittoidentitet.
-[Kontrakt](../../docs/optimization.md#budgeterade-intervall-och-stabila-arraylängder).
+[Kontrakt]((../../../docs/optimization.md#budgeterade-intervall-och-stabila-arraylängder)).
 
 Runtime upprätthåller nu uttryckligen `0 <= len <= cap <= i32::MAX`.
 Tillräcklig befintlig kapacitet är en snabb väg; tillväxt kontrollerar den
 begärda längden före allokering eller publicering och begränsar dubbleringen.
 Detta ersätter ett tidigare beroende av heapens praktiska storlek.
-[Minneskontrakt](../../docs/memory.md).
+[Minneskontrakt](../../../docs/memory.md).
 
 Kompilatorkoden är `90f303d`, jämförd med `e11759f`. Kandidatens SHA-256 är
 `57c860cd4a1f0e56e5e7b99a3f50c15d613bac79adad50e526f20bd266bd975f`.

@@ -50,7 +50,7 @@ baselinekompilator, som byggdes från den ursprungliga källrevisionen.
 | Sortering | 13,808 → 8,145 ms | 41,0 % | 16,095 → 8,742 ms | 2,586 ms | 3,15× |
 
 De fyra frysta källorna och C-referensen ligger i
-[`benchmarks/runtime/`](../runtime/). Varvantal, frö och UTF-8-text kommer
+[`benchmarks/runtime/`](../../runtime/). Varvantal, frö och UTF-8-text kommer
 från programargument. Python beräknar oberoende förväntade resultat för
 hela talföljden, arraysummeringen, Unicode-kodpunkter/ord och sorteringen.
 Samtliga körningar måste ge exakt samma kontrollsumma som referensen.

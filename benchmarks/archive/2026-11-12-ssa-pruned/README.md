@@ -108,7 +108,7 @@ four workers. Its serial recovery image is recorded separately.
   re-verification. The earlier full-suite
   [`flag receipt`](verification/call-flags-integrated-7c3d582.json) is also retained.
 
-The [wide sparse-state tests](../../tests/mir_ssa_sparse.ddr) pass in native
+The [wide sparse-state tests](../../../tests/mir_ssa_sparse.ddr) pass in native
 and Wasm test drivers (10 groups each, including shared ARM helpers). Their
 129 live values exercise complete live-out words and loop transport. A closed
 independent interpreter executes final `arm.finish` bytes against independent

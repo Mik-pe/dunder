@@ -26,7 +26,7 @@ längdregister direkt. Den laddar bara saknade/spillda operander och använder
 små CMP-immediater där de ryms. Konstant till vänster får korrekt vänd
 signerad relation; sammansatta operander behåller fällordningen.
 Villkorsgrenar och bool-resultat delar samma val. Inga nya relokeringar eller
-målberoende källregler införs. [Kontrakt](../../docs/optimization.md).
+målberoende källregler införs. [Kontrakt](../../../docs/optimization.md).
 
 Den tidigare gemensamma nodarenan används för båda mekanismerna. En begränsad
 verifierad inlining-katalog och dess riktiga emitterprov ingår också i denna

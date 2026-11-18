@@ -137,8 +137,11 @@ Oföränderliga bindningar kan inte lånas med `&mut`.
 Läslån kan också namnges lokalt med `r := &value` och gäller då till
 deklarationsblockets slut. `&values[start..end]` ger en lånad `&[]T` och
 `&text[start..end]` en UTF-8-kontrollerad bytevy, `&[]u8`, utan ny buffert.
-Referenser kan ännu inte returneras eller lagras i structar/enums/arrayer;
-lokala skrivlån stöds inte. `copy := values.clone()` skapar en ägd kopia av
+En funktion kan returnera ett låslån från en av sina delade parametrar
+(med `from namn` vid flera); se
+[låne- och escapegränser](memory.md#lokala-låslån-och-intervallvyer).
+Referenser kan fortfarande inte lagras i structar/enums/arrayer och lokala
+skrivlån stöds inte. `copy := values.clone()` skapar en ägd kopia av
 det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
 samma rotvariabel; även olika fält i samma struct räknas konservativt som
 samma rot. Ändringar som kan flytta en arraybuffert måste beräknas före
@@ -151,7 +154,7 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 
 | Import | Innehåll |
 | --- | --- |
-| `std.array` | `ints`, `strings`, `sum`, `sort`, `reverse`, `append` och `sort_strings`. Båda sorteringarna använder heapsort på plats, O(n log n). Strängar jämförs lexikografiskt över UTF-8-byte. |
+| `std.array` | `ints`, `strings`, `sum`, `sort`, `reverse`, `append` och `sort_strings`. Båda sorteringarna använder introsort på plats med heapsort-fallback, O(n log n). Strängar jämförs lexikografiskt över UTF-8-byte. |
 | `std.map` | [`Map<K, V>`](#generiska-samlingar) med typade nycklar och värden. |
 | `std.set` | `Set` av strängar med metoder via `impl Set` (`Set::new`, `s.len`, `s.length`, `s.reserve`, `s.insert`, `s.contains`, `s.remove`, `s.clear`, `s.items`) samt modulhjälpare (`set.new`, `set.insert`, ...). |
 | `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av strängmängden. |
