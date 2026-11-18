@@ -755,11 +755,11 @@ testkvitton skiljer lägena åt; `--profile-compiler` har en separat
 [i32-invarianten i runtime](memory.md).
 
 `tools/test_range_emitter.ddr` provar verklig kontrollborttagning och
-budgetfallback på fyra mål. `tools/test-range-analysis.py` exporterar
+budgetfallback på fyra mål. [`tools/test_range_analysis.ddr`](../tools/test_range_analysis.ddr) exporterar
 faktiska modeller/bevis och följer dem i en oberoende interpreter med
-checkad aritmetik, kortslutning, snapshots och muterbara arrayer. Den
+kontrollerad aritmetik, kortslutning, snapshots och muterbara arrayer. Den
 kontrollerar varje dynamiskt nådd bevisad åtkomst mot rätt lagring och varje
-nytt aritmetikbevis med obegränsad heltalsmatematik före vanlig overflow-hantering.
+nytt i32-bevis med ett breddat heltalsresultat före den vanliga overflow-kontrollen.
 Det är ett fryst ändligt testdomänprov, inte ett formellt bevis för alla
 program. Bränslestopp ger ofullständig täckning och icke godkänd körning.
 

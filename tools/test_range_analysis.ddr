@@ -1,0 +1,212 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_contracts as subprocess
+import .probe_cli as cli
+import .range_analysis_cases as cases
+import .range_analysis_model as export
+import .range_analysis_oracle as oracle
+import .range_analysis_report as report
+import std.fs as fs
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Options { compiler: string, source_root: string, root: string, filter: string, report_path: string, fuel: i64 }
+
+struct Reached { bounds: Map<i32, bool>, arithmetic: Map<i32, bool>, new: Map<i32, bool> }
+
+fn reached() -> Reached {
+    Reached { bounds: Map<i32, bool>::new(), arithmetic: Map<i32, bool>::new(), new: Map<i32, bool>::new() }
+}
+
+fn equal(a: &[]i64, b: &[]i64) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if a[i] != b[i] { return false } }
+    true
+}
+
+fn agree(a: &oracle.Machine, b: &oracle.Machine) -> bool {
+    if !oracle.same(&a.state, &b.state) { return false }
+    for local in 0..3 {
+        if !equal(&a.arrays[i32(a.slots[local])], &b.arrays[i32(b.slots[local])]) { return false }
+    }
+    true
+}
+
+fn observe(machine: &oracle.Machine, expected: &cases.Expected, counts: &mut report.Counts, nodes: &mut Reached) -> string {
+    if machine.state.kind == .Exhausted {
+        counts.incomplete += 1
+        return ""
+    }
+    if machine.state.kind == .Failure { return machine.error.clone() }
+    if expected.present && (!oracle.same(&machine.state, &expected.state) ||
+        !equal(&machine.arrays[i32(machine.slots[0])], &expected.array)) {
+        return "interpreter disagrees with independent reference outcome or final array"
+    }
+    slot := if machine.state.kind == .Return { 0 } else { i32(machine.state.value - 100) }
+    if slot < 0 || slot >= counts.outcomes.len { return "unknown interpreter outcome" }
+    counts.outcomes[slot] += 1
+    counts.runs += 1
+    counts.accesses += machine.accesses
+    counts.checks += i64(machine.arithmetic_nodes.len)
+    counts.new_checks += i64(machine.new_nodes.len)
+    if machine.steps > counts.maximum { counts.maximum = machine.steps }
+    for node in machine.bounds_nodes { nodes.bounds.put(node, true) }
+    for node in machine.arithmetic_nodes { nodes.arithmetic.put(node, true) }
+    for node in machine.new_nodes { nodes.new.put(node, true) }
+    ""
+}
+
+fn failure(options: &Options, run: &mut report.Report, evidence: &report.CaseResult, input: &oracle.Input,
+           model: i32, label: string, message: string) -> bool {
+    run.cohorts[evidence.cohort].add(&evidence.counts)
+    run.failure = report.Failure { name: evidence.name.clone(), mode: label.clone(), source: evidence.source.clone(),
+        model: evidence.models[model].clone(), input: input.clone(), error: message.clone() }
+    _ := report.save(options.report_path, &run, false)
+    harness.fail(f"{evidence.name}/{label}: {message}")
+}
+
+fn export_models(runner: &mut subprocess.Runner, image: string, case: &cases.Case, evidence: &mut report.CaseResult) -> bool {
+    source := runner.work + "/" + case.name + ".ddr"
+    if !sys.write_text(source, case.body).ok { return harness.fail(f"cannot write {source}") }
+    mut output := harness.empty_output()
+    for mode in ["raw", "simplified"] {
+        for budget in [0, 64, 131072] {
+            if !runner.call_timeout(image, [source.clone(), budget.str(), mode.clone()], 0, 120000, &mut output) { return false }
+            model := export.decode(output.stdout_text())
+            context := f"{case.name}/{mode}/{budget}"
+            if model.error.len > 0 { return harness.fail(f"{context}: {model.error}") }
+            if model.status == 4 { return harness.fail(f"{context}: invalid model/invariant") }
+            if budget == 131072 && model.status != 2 { return harness.fail(f"{context}: production budget exhausted") }
+            mut bounds: i64 = 0
+            mut arithmetic: i64 = 0
+            for node in model.nodes {
+                if node.proof.bit_and(2) != 0 { bounds += 1 }
+                if node.kind_type == 1 && node.proof.bit_and(1) != 0 { arithmetic += 1 }
+            }
+            evidence.bounds.push(bounds)
+            evidence.arithmetic.push(arithmetic)
+            evidence.models.push(move model)
+        }
+    }
+    true
+}
+
+fn verify_case(options: &Options, runner: &mut subprocess.Runner, image: string, case: &cases.Case, cohort: i32,
+               inputs: &[]oracle.Input, run: &mut report.Report) -> bool {
+    mut result := report.CaseResult {
+        name: case.name.clone(), cohort: cohort, source: case.body.clone(), models: [], bounds: [], arithmetic: [], counts: report.counts(),
+    }
+    run.selected[cohort] = true
+    if !export_models(&mut runner, image, &case, &mut result) { return false }
+    mut raw_nodes := reached()
+    mut simplified_nodes := reached()
+    for input in inputs {
+        expected := cases.reference(case.name, &input)
+        raw := oracle.run(&result.models[2], &input, options.fuel)
+        raw_error := observe(&raw, &expected, &mut result.counts, &mut raw_nodes)
+        if raw_error.len > 0 { return failure(&options, &mut run, &result, &input, 2, "raw", raw_error) }
+        simplified := oracle.run(&result.models[5], &input, options.fuel)
+        simplified_error := observe(&simplified, &expected, &mut result.counts, &mut simplified_nodes)
+        if simplified_error.len > 0 { return failure(&options, &mut run, &result, &input, 5, "simplified", simplified_error) }
+        if raw.state.kind != .Exhausted && simplified.state.kind != .Exhausted && !agree(&raw, &simplified) {
+            return failure(&options, &mut run, &result, &input, 5, "simplified", "raw/simplified mismatch")
+        }
+    }
+    result.counts.cases = 1
+    result.counts.reached_bounds = i64(raw_nodes.bounds.len() + simplified_nodes.bounds.len())
+    result.counts.reached_arithmetic = i64(raw_nodes.arithmetic.len() + simplified_nodes.arithmetic.len())
+    result.counts.reached_new = i64(raw_nodes.new.len() + simplified_nodes.new.len())
+    run.cohorts[cohort].add(&result.counts)
+    status := if result.counts.incomplete > 0 { "INCOMPLETE" } else { "PASS" }
+    count := result.counts.clone()
+    print(f"{status} {case.name} proofs(raw/simplified)={result.bounds[2]}/{result.bounds[5]} " +
+          f"bounds_reached={count.reached_bounds} arithmetic_reached={count.reached_arithmetic} " +
+          f"new_arithmetic_checks={count.new_checks} incomplete={count.incomplete}")
+    run.cases.push(move result)
+    true
+}
+
+fn freeze_inputs(options: &Options, run: &mut report.Report) -> bool {
+    if !subprocess.add_hash(&mut run.hashes, options.compiler) { return false }
+    for path in ["selfhost/opt/opt_ir.ddr", "selfhost/../tests/support/typed_fixture.ddr", "selfhost/frontend/compile.ddr",
+                 "selfhost/opt/opt_pass.ddr", "selfhost/opt/opt_range.ddr", "selfhost/opt/opt_verify.ddr", "selfhost/frontend/lexer.ddr"] {
+        if !subprocess.add_hash(&mut run.hashes, options.source_root + "/" + path) { return false }
+    }
+    for path in ["tools/test_range_analysis.ddr", "tools/mir_contracts.ddr", "tools/harness.ddr", "tools/probe_cli.ddr",
+                 "tools/range_analysis_cases.ddr",
+                 "tools/range_analysis_model.ddr", "tools/range_analysis_oracle.ddr", "tools/range_analysis_report.ddr",
+                 "tests/fixtures/range-analysis-export.ddr"] {
+        if !subprocess.add_hash(&mut run.hashes, options.root + "/" + path) { return false }
+    }
+    true
+}
+
+fn selected(candidates: &[]cases.Case, filter: string) -> []cases.Case {
+    mut chosen: []cases.Case = []
+    for case in candidates { if filter.len == 0 || text.find(case.name, filter) >= 0 { chosen.push(case.clone()) } }
+    chosen
+}
+
+fn exercise(options: &Options) -> i32 {
+    if !oracle.selfcheck() { _ := harness.fail("range interpreter self-check failed"); return 1 }
+    mut run := report.report(options.fuel)
+    if !freeze_inputs(&options, &mut run) { return 1 }
+    bounds := cases.bounds()
+    arithmetic := cases.arithmetic()
+    chosen := [selected(&bounds, options.filter), selected(&arithmetic, options.filter)]
+    if chosen[0].len == 0 && chosen[1].len == 0 { _ := harness.fail("no selected cases"); return 1 }
+    temporary := fs.temp_dir("dunder-range-qa-")
+    if !temporary.ok { _ := harness.fail("cannot create range work directory"); return 1 }
+    defer { _ := fs.remove_all(temporary.value) }
+    path := fs.realpath(temporary.value)
+    if !path.ok { _ := harness.fail("cannot resolve range work directory"); return 1 }
+    mut runner := subprocess.Runner::new(options.compiler, path.value, false)
+    fixture := path.value + "/export.ddr"
+    image := path.value + "/export"
+    content := subprocess.fixture_source("range-analysis-export.ddr", options.source_root, options.root, path.value)
+    if content.len == 0 || !sys.write_text(fixture, content).ok { _ := harness.fail("cannot prepare exporter"); return 1 }
+    mut output := harness.empty_output()
+    if !runner.call_timeout(options.compiler, ["build", fixture.clone(), "-o", image.clone()], 0, 120000, &mut output) { return 1 }
+    for cohort in 0..2 {
+        if chosen[cohort].len == 0 { continue }
+        inputs := if cohort == 0 { cases.bounds_inputs() } else { cases.arithmetic_inputs() }
+        for case in chosen[cohort] {
+            if !verify_case(&options, &mut runner, image, &case, cohort, &inputs, &mut run) { return 1 }
+        }
+    }
+    if !subprocess.unchanged(&run.hashes) { _ := harness.fail("input compiler/module changed"); return 1 }
+    total := run.totals()
+    if options.filter.len == 0 && total.incomplete == 0 {
+        if total.reached_bounds == 0 { _ := harness.fail("no bounds proof was dynamically exercised"); return 1 }
+        if total.new_checks == 0 { _ := harness.fail("no new arithmetic range proof was dynamically exercised"); return 1 }
+    }
+    if !report.save(options.report_path, &run, true) { return 1 }
+    print(f"{total.runs} completed interpreter runs; {total.accesses} accesses; {total.reached_bounds} reached proof nodes; " +
+          f"{total.checks} arithmetic proof checks ({total.new_checks} new range); " +
+          f"{total.incomplete} INCOMPLETE; maximum completed fuel {total.maximum}/{options.fuel}")
+    for cohort in 0..run.cohorts.len {
+        if run.selected[cohort] { print(report.cohort_name(cohort) + " " + run.cohorts[cohort].text()) }
+    }
+    if total.incomplete == 0 { 0 } else { 2 }
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--source-root"), cli.option("--fuel"), cli.option("--case"), cli.option("--report")]
+    args := cli.parse(&spec)
+    usage := "usage: test_range_analysis COMPILER [--source-root CHECKOUT] [--fuel EVALUATIONS] [--case SUBSTRING] [--report JSON]"
+    compiler := cli.compiler(&args, usage)
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    fuel := parse.integer(args.last("--fuel", "5000"))
+    if !fuel.ok { _ := harness.fail("--fuel requires an integer"); return 2 }
+    if fuel.value <= 0 { _ := harness.fail("--fuel must be positive"); return 1 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("cannot locate Dunder checkout"); return 1 }
+    source := fs.realpath(args.last("--source-root", root))
+    if !source.ok { _ := harness.fail("cannot resolve source checkout"); return 1 }
+    options := Options { compiler: compiler, source_root: source.value, root: root,
+        filter: args.last("--case", ""), report_path: args.last("--report", ""), fuel: fuel.value }
+    exercise(&options)
+}
