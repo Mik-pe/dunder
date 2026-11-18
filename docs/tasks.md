@@ -200,6 +200,11 @@ arbetarna typade och hur många frontend-arbetsytor som användes.
 räknar det största sammanlagda antalet utestående käll- och backendjobb.
 [Frontendarbetare](../selfhost/tasks/frontend_tasks.ddr)
 
+Modulladdaren kan lexa flera redan upptäckta moduler parallellt. Arbetarna
+returnerar källspann och avkodade stavningar för literaler. Samordnaren tar
+emot resultaten i modulordning, löser deklarationer och importer och bevarar
+ordningen på diagnostiken.
+
 När nåbarheten är känd uppskattar samordnaren återstående typkontroll från
 deklarationernas redan kända tokenspann och antalet kroppar. Med en worker
 eller liten återstående arbetsmängd kontrolleras dessa kroppar direkt i
@@ -207,8 +212,14 @@ samordnarens session. Vid tillräckligt oberoende arbete delar arbetarna
 en fryst deklarationsbild och läser varsin funktionskropp. Båda fallen
 använder samma typkontroll och rapporterar fel i deklarationsordning.
 `compile_parallel` skickar funktionslokala operationer och metadata i separata
-kolumner i `mir_task.Batch`. Varje arbetstråd bygger MIR lokalt, verifierar,
-optimerar och sänker funktionerna i batchen med arbetsytor som återanvänds över batchgränserna.
+kolumner i `mir_task.Batch`. Små startbatcher fyller lediga arbetsplatser.
+Därefter avgör både antalet funktioner och mängden maskinord när en batch skickas.
+Vid en tung backendkö använder samordnaren de platser som redan är lediga för
+nya typjobb och kan själv fortsätta typa kroppar medan MIR-jobben kör. När
+flera kroppar i följd har sänkts från den typade skalärmodellen reserverar
+samordnaren platser för typning även med en tung backendkö. Varje
+arbetstråd bygger MIR lokalt, verifierar, optimerar och sänker funktionerna i
+batchen med arbetsytor som återanvänds över batchgränserna.
 Passinställningar och terminal-ID:n delas som en snapshot för hela scopet.
 Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
 Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/tasks/mir_task.ddr)
@@ -222,6 +233,10 @@ validering certifierar inte godtyckliga maskinords semantik: resultatet
 måste dessutom höra till exakt det utlämnade jobbet i samma taskscope,
 ordinal och deklaration. Föräldern kör ingen andra sänkning; den äger cache,
 ordnad länkning och slutlig bildpublicering.
+
+Efter länkning kan kompilatorn också hasha kodsidorna i större Mach-O-bilder
+parallellt. Hashningen använder samma `--jobs`-budget och skriver digesterna
+i sidordning. Det gäller både fristående binärer och `.app`-paket.
 
 Cacheträffar lämnar redan färdiga objekt utan ny MIR-verifiering eller
 optimering. Cacheformat och objektstruktur valideras fortfarande. Beroenden och budgetdebitering återspelas i samma ordning

@@ -1,5 +1,7 @@
 # Lokala prestandamätningar
 
+[Parallell byggtid på Apple M5](compiler/2026-11-18-parallel-build-latency/README.md) mäter modullexning, funktionsschemaläggning och Mach-O-signering mot samma låsta källor.
+
 [Byggtid, körprestanda och schemaläggning med den gemensamma funktionsrepresentationen](compiler/2026-11-15-shared-frontend/README.md) jämför sju byggkorpusar, fem native-program och tre schemaläggningsändringar på Apple M5.
 
 [Funktionspipelinens mätning under samtidig verifieringslast](compiler/2026-11-15-function-pipeline-load/README.md) omfattar sju byggkorpusar, maximalt resident minne och fem native-program med Tabell.

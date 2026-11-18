@@ -36,7 +36,7 @@ fn accept_batch(session: &mut compiler.Session, link: &mut mir_link.Linker,
         if mir_task.answer_ordinal(&answer, i) != expected_ordinal || mir_task.answer_declaration(&answer, i) != expected_declaration {
             status.error = 8
         }
-        if status.error == 0 && !mir_lower.from_data_into(&mut object, &data) { status.error = 8 }
+        if status.error == 0 && !mir_lower.exchange_data_into(&mut object, &mut data) { status.error = 8 }
         if !compiler.accept_into(&mut session, &mut link, expected_ordinal, &object, &status) { return -1 }
     }
     item_offset + count
@@ -89,15 +89,19 @@ pub fn compile_loaded(session: &mut compiler.Session, platform: i32,
     mut data_scratch := mir_lower.new_data()
     mut status_scratch := empty_status()
     max_siblings := budget.worker_slots(config.workers, true)
+    batch_word_limit := 8192
     task scope jobs(config.workers, front.build_workspace, shared policy) {
         mut frontier: []i32 = []; mut source_keys: []TaskID<compiler.FrontendBody> = []
         mut consumed := 0
         mut keys: []TaskID<mir_task.BatchAnswer> = []
+        mut batch_words: []i32 = []
+        mut pending_words: i64 = 0
         mut item_ordinals: []i32 = []
         mut item_declarations: []i32 = []
         mut read := 0
         mut item_read := 0
         mut spawned_items := 0
+        mut scalar_run := 0
         mut need_spawn := false
         mut flush := false
         mut cached := false
@@ -107,7 +111,10 @@ pub fn compile_loaded(session: &mut compiler.Session, platform: i32,
             backend_count := keys.len - read
             frontend_count := source_keys.len - consumed
             if need_spawn && backend_count + frontend_count < config.workers {
+                words := batch.source.words.len
                 keys.push(spawn jobs front.lower_batch(batch))
+                batch_words.push(words)
+                pending_words += i64(words)
                 compiler.observe_jobs(&mut session, backend_count + frontend_count + 1, config.workers, false)
                 spawned_items = spawned_items + mir_task.batch_len(&batch)
                 mir_task.reset_batch(&mut batch)
@@ -124,6 +131,7 @@ pub fn compile_loaded(session: &mut compiler.Session, platform: i32,
             }
             if (need_spawn || flush || backend_count == config.workers || reserve_front || wait_for_local) && read < keys.len {
                 answer := await! jobs(keys[read])
+                pending_words -= i64(batch_words[read])
                 read = read + 1
                 next_item := accept_batch(&mut session, &mut link, &mut lowered,
                     &mut data_scratch, &mut status_scratch, &answer,
@@ -150,8 +158,12 @@ pub fn compile_loaded(session: &mut compiler.Session, platform: i32,
             next_source := compiler.next_frontend(&session)
             if consumed == frontier.len {
                 mut source_target := max_siblings - backend_count
-                if max_siblings >= 2 { if source_target < 2 { source_target = 2 } }
-                else if source_target < 1 && max_siblings >= 1 { source_target = 1 }
+                // Keep body typing wide while batch pressure is low, or when
+                // recent functions show that scalar projection is paying off.
+                if pending_words < i64(batch_word_limit / 2) || scalar_run >= 4 {
+                    front_slots := if max_siblings >= 2 { 2 } else { 1 }
+                    if source_target < front_slots { source_target = front_slots }
+                }
                 compiler.frontend_window(&mut session, &view, next_source, source_target, true, &mut frontier)
                 source_keys.clear(); consumed = 0
             }
@@ -176,8 +188,15 @@ pub fn compile_loaded(session: &mut compiler.Session, platform: i32,
                 item_ordinals.push(ordinal)
                 item_declarations.push(declaration)
                 mir_task.add_item(&mut batch, ordinal, declaration)
-                target := if spawned_items >= config.workers * 8 { 8 } else { 2 }
-                if mir_task.batch_len(&batch) >= target { need_spawn = true }
+                if compiler.current_scalar(&session) { scalar_run += 1 }
+                else { scalar_run = 0 }
+                // Short first batches get workers busy quickly. Bound later batches
+                // by emitted words as well as function count to limit skew.
+                mut target := 2
+                if spawned_items >= config.workers * 8 {
+                    target = if scalar_run >= 4 { 8 } else { 64 }
+                }
+                if mir_task.batch_len(&batch) >= target || batch.source.words.len >= batch_word_limit { need_spawn = true }
             } else {
                 if state == 2 { cached = true; cached_ordinal = compiler.current_ordinal(&session) }
                 else {

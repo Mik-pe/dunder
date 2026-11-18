@@ -296,6 +296,49 @@ fn main(){unsafe{print(twice(callback(step),20));print(memory(42));print("litera
 ''')
         self.matrix(source, '45\n42\nliteral\n', TARGETS)
 
+    def macho_signing(self):
+        # Cover the multi-chunk path for both the initial signature and a bundle reseal.
+        payload = '0123456789abcdef' * (17 * 1024)
+        source = self.case('macho_signing', f'fn main(){{value:="{payload}";print(value.len)}}\n')
+        target = 'arm64-macos'
+        standalone, bundled = [], []
+        for driver in (self.drivers[0], self.drivers[2]):
+            name = driver[0]
+            image = source.parent / name
+            standalone.append(self.build(driver, source, target, image))
+            app = source.parent / (name + '-app') / 'Payload.app'
+            self.run(self.command(driver, 'build', source, ['--target', target, '--app', '-o', app]), source.parent)
+            executable = app / 'Contents/MacOS/Payload'
+            require(executable.stat().st_size > len(payload), executable)
+            bundled.append(digest(executable))
+            if self.host_target == target:
+                for signed in (image, app):
+                    self.run(['/usr/bin/codesign', '--verify', '--strict', signed], source.parent)
+                self.execute(executable, target, f'{len(payload)}\n')
+        require(standalone[0] == standalone[1] and bundled[0] == bundled[1], (standalone, bundled))
+        self.contracts.append({'case': 'macho_signing', 'standalone_and_bundle_images_equal': True})
+
+    def module_lexing(self):
+        root = self.case('module_lexing', 'import alpha\nimport beta\n'
+                         'fn main(){label:=alpha.value();print(label);print(beta.number());print(beta.letter()==`ø`)}\n')
+        alpha = root.with_name('alpha.ddr')
+        beta = root.with_name('beta.ddr')
+        padding = '//' + 'x' * 20000 + '\n'
+        alpha.write_text('pub fn value()->string{f"å\\n{42:04x}"}\n' + padding)
+        beta.write_text("pub fn number()->i32{i32(b'\\x41')}\npub fn letter()->rune{`ø`}\n" + padding)
+        self.matrix(root, 'å\n002a\n65\ntrue\n', (self.host_target,), bindings=True)
+
+        alpha.write_text('import missing\n' + padding)
+        beta.write_text('"unterminated\n' + padding)
+        diagnostics = [self.run(self.command(d, 'build', root), root.parent, status=1).stderr for d in self.drivers]
+        require(len(set(diagnostics)) == 1 and f'{alpha}:1:' in diagnostics[0]
+                and 'cannot load module' in diagnostics[0], diagnostics)
+        alpha.write_text('pub fn value()->string{"valid"}\n' + padding)
+        diagnostics = [self.run(self.command(d, 'build', root), root.parent, status=1).stderr for d in self.drivers]
+        require(len(set(diagnostics)) == 1 and f'{beta}:2:1:' in diagnostics[0]
+                and 'unterminated' in diagnostics[0], diagnostics)
+        self.contracts.append({'case': 'module_lexing', 'first_module_error_preserved': True})
+
     def saturation(self):
         source = 'fn step(x:i32)->i32{x+1}\n'
         for function in range(20):
@@ -410,6 +453,8 @@ def main():
         probe.dead_body_order()
         probe.worker_expression_depth()
         probe.globals_and_callback()
+        probe.macho_signing()
+        probe.module_lexing()
         probe.saturation()
         probe.cache()
         probe.parallel_check()
