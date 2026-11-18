@@ -177,15 +177,65 @@ exempelvis `identity<i32>`. Importerade deklarationer används på samma sätt,
 exempelvis `lib.Box<[]i32>`. [Körbart exempel med två moduler](../tests/fixtures/generics/main.ddr)
 
 Ett `where` efter typens parameterlista anger krav som gäller så fort typen
-används. `storable(T)` kräver att ett värde av typen får lagras som ett
-arrayelement. Ett metodkrav anger namnet och hela funktionstypen inklusive
-mottagaren. Metoden måste vara publik och säker och kunna anropas utan
-ytterligare rättigheter.
+används. Krav kan anges som traitgränser (`T: Trait1 + Trait2`), direkt i
+parameterlistan (`<T: Trait1 + Trait2>`), som `storable(T)` (motsvarar
+`T: Storable`) eller som enskilda metodkrav (`T.size: fn(T) -> i32`).
+Ett metodkrav anger namnet och hela funktionstypen inklusive mottagaren;
+metoden måste vara publik och säker och kunna anropas utan ytterligare
+rättigheter.
 
 På en generisk funktion kan `where` stå efter signaturen. På ett
 `impl`-block står det efter mottagartypen, exempelvis
-`impl Box<T> where T.size: fn(T) -> i32`. Blockets krav kontrolleras när
-en av dess metoder används. Andra block på samma typ har sina egna krav.
+`impl Box<T> where T.size: fn(T) -> i32` eller
+`impl Describe for Box<T> where T: Describe`. För vanliga `impl`-block
+kontrolleras kraven när en av dess metoder används. För villkorliga
+traitimplementationer aktiveras implementationen enbart för de typargument
+som uppfyller kraven.
+
+### Traits och `impl Trait for Type`
+
+En `trait`-deklaration namnger ett statiskt kontrakt med noll eller flera
+säkra metodsignaturer samt valfria supertraits efter `:`. Implementering sker
+explicit med `impl Trait for Type`:
+
+```dunder
+pub trait Describe {
+    fn describe(&self) -> string
+}
+
+pub trait Ordered: Describe {
+    fn rank(&self) -> i32
+}
+
+struct Item { name: string, weight: i32 }
+
+impl Describe for Item {
+    fn describe(&self) -> string { self.name.clone() }
+}
+
+impl Ordered for Item {
+    fn rank(&self) -> i32 { self.weight }
+}
+
+fn label<T: Ordered>(x: T) -> string {
+    x.describe() + "#" + x.rank().str()
+}
+```
+
+Metoder i `impl Trait for Type` ärver synlighet från traiten och skrivs utan
+`pub`. Antingen traiten eller måltypen måste deklareras i samma modul
+(lokala traits kan implementeras för primitiva och importerade typer).
+Kompilatorn tillhandahåller två inbyggda markertraits som kontrolleras
+strukturellt:
+
+- `Sendable` härleds automatiskt för vanliga structar, enums, tupler och arrayer
+  vars delar är `Sendable` (inklusive `string`, `Result<T, E>` och sammansatta
+  arrayer). För en `opaque struct` deklareras den uttryckligen med
+  `impl Sendable for Typ {}` (eller villkorligt som
+  `impl Sendable for Map<K, V> where K: Sendable, V: Sendable {}`), varpå
+  kompilatorn bevisar att alla privata fält uppfyller regeln. `@resource`,
+  råpekare, lån, closures och oklassificerade `opaque struct` är inte `Sendable`.
+- `Storable` anger att typen får lagras som arrayelement eller fält.
 
 ```dunder
 struct Sized<T> where storable(T), T.size: fn(T) -> i32 { item: T }

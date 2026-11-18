@@ -35,16 +35,22 @@ anropskonvention, parameterlägen och returlånets källparameter i identiteten.
 | När en typ används | Reserverar typens identitet, kontrollerar dess deklarerade krav och fastställer fält, varianttyper och metodsignaturer. Därefter gäller typens vanliga regler för layout, lån och städning. |
 | När en funktion eller metod används | Kontrollerar hela den konkreta kroppen med dess faktiska typer. En hänvisning till ett funktionsvärde räknas också som användning. Fel i en konkret kropp pekar på definitionen och visar vilka användningar som begärde instansen. |
 
-Ett typkrav tillhör alla instanser av typen. Exempelvis kräver
-`Map<K, V>` lagringsbara argument och två publika, säkra nyckelmetoder av
-bestämd typ. En användare kan ange samma slags krav med `where`.
-`Set<K>` får nyckelkraven genom sitt fält av typen `Map<K, bool>`.
+Ett typkrav tillhör alla instanser av typen. Krav kan uttryckas med
+namngivna traits (`where T: Trait1 + Trait2` eller `<T: Trait1 + Trait2>`),
+inbyggda markertraits (`Sendable`, `Storable`) eller metodkrav (`T.size: fn(T) -> i32`).
+Exempelvis kräver `Map<K, V>` lagringsbara argument och två publika, säkra
+nyckelmetoder av bestämd typ, och deklarerar villkorligt
+`impl Sendable for Map<K, V> where K: Sendable, V: Sendable {}`.
+Villkorliga traitimplementationer (`impl Trait for Box<T> where T: Trait`)
+löses till fixpunkt under deklarationskontrollen och aktiveras bara när
+villkoren uppfylls, så exempelvis `Map<string, MyResource>` fortsätter fungera
+i enkeltrådad kod utan att bli `Sendable`.
 För en metod som läser `self.value.len` avgör fälttypen vid metodens
 användning om operationen är giltig. Därför kan en annan metod på
 `Box<i32>` användas även om `i32` saknar `len`.
 Ett uttryckligt krav på en funktion eller ett `impl`-block kontrolleras
 också när funktionen eller en metod i blocket väljs.
-[Samlingarnas kontrakt](standard.md#generiska-samlingar) · [Körbart exempel](../tests/fixtures/generics/main.ddr)
+[Samlingarnas kontrakt](standard.md#generiska-samlingar) · [Traits](../tools/test_traits.ddr) · [Körbart exempel](../tests/fixtures/generics/main.ddr)
 
 Standardbibliotekets generiska deklarationer bäddas in från Dunderkällan.
 Operatorn `?` använder identiteten för det exporterade `Result` för att

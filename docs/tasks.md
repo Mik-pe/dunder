@@ -92,39 +92,48 @@ analystillstånd inför jobbet.
 
 Arbetsytan skapas och stannar i workerarenan. Kompilatorn kontrollerar
 initialiserarens transitiva effekter och alla lagrade typer, även i opaque
-records. Tal, lokala strängar, taggenums, tillåtna arrayer och recordfält
-stöds. Adresser, lån, callbacks och tasknycklar avvisas. Separata scope
-äger separata arbetsytor.
+records. Tal, lokala strängar, enums (inklusive payload-enums som `Result`),
+tillåtna arrayer och recordfält stöds. `@resource`, adresser, lån, callbacks
+och tasknycklar avvisas. Separata scope äger separata arbetsytor.
 
 ## Gemensam läsbar indata
 
-`task scope jobs(limit, shared world)` tar en egen snapshot av `world`
-när scopet öppnas. Värdet är ett transparent ägt record inom den vanliga
-isolerade Data-domänen. Varje worker får samma snapshot som sista
-parametern `world: &World`. För ett scope med arbetsyta skrivs
-`task scope jobs(limit, initialize, shared world)` och parametrarna blir
-`(input: Job, workspace: &mut Workspace, world: &World)`.
+`task scope jobs(limit, shared world)` tar en egen isolerad snapshot av `world`
+när scopet öppnas. Värdet är ett ägt `Sendable`-record (transparent eller en
+`opaque struct` som implementerar `Sendable`, till exempel `Map<string, []string>`).
+Varje worker får samma snapshot som sista parametern `world: &World`. För ett
+scope med arbetsyta skrivs `task scope jobs(limit, initialize, shared world)`
+och parametrarna blir `(input: Job, workspace: &mut Workspace, world: &World)`.
 
 Föräldern kan ändra sitt ursprungliga värde efter öppningen. Den ägda
-snapshoten är åtkomlig genom vanliga delade lån i workerfunktionerna och
-frigörs först när alla jobb avslutats. En worker som uttryckligen klonar ett fält får en egen ägare. Data-kontrollen gäller även för varje nästlat
-fält, vilket utesluter delade RC-strängar, råpekare och oklassificerade
-opaque-typer. Numeriska typ-ID:n, arrayer och packad UTF-8 passar i detta
-gränssnitt.
+snapshoten djupklonas isolerat och eventuella strängar och kopierbara
+payload-enums fryses med referensräknare `0` under scopets livstid, så att
+flera workers kan läsa och klona fält parallellt helt utan icke-atomära
+skrivningar till delade objekt. När scopet stängs inväntas alla jobb och alla
+workerarenor avmappas innan snapshoten avfryses och frigörs.
 
 ## Vad en worker får använda
 
-Spawn kräver en namngiven säker Dunder-funktion med en värdeparameter för indata. Ett scope med arbetsyta kräver också en andra parameter av typen `&mut Workspace` för den deklarerade arbetsytan.
-Indata och returtyp måste tillhöra den kontrollerade klondomänen:
+Spawn kräver en namngiven säker Dunder-funktion (inklusive specialiserade
+generiska funktioner som `spawn jobs work<string>(...)`) med en värdeparameter
+för indata. Ett scope med arbetsyta kräver också en andra parameter av typen
+`&mut Workspace` för den deklarerade arbetsytan.
+Indata och returtyp måste uppfylla den inbyggda kompilatorbevisade traiten
+[`Sendable`](syntax.md#traits-och-impl-trait-for-type):
 
-- Primitiva tal, bool, rune, unit och enums utan payload.
-- Ägda och fasta arrayer med elementtyperna ovan.
-- Transparenta records vars fält rekursivt uppfyller samma regler.
+- Primitiva tal, `bool`, `rune`, `unit`, `string` och enums utan payload.
+- Payload-enums (inklusive `Result<T, E>`) vars varianttyper är `Sendable`.
+- Ägda och fasta arrayer (`[]T`, `[T; N]`) vars elementtyp är `Sendable`.
+- Transparenta structar och tupler vars fält rekursivt är `Sendable`.
+- `opaque struct` som uttryckligen deklarerar `impl Sendable for Typ {}`
+  (exempelvis `Map<K, V>` när `K: Sendable, V: Sendable` och `Set<K>` när
+  `K: Sendable`) och vars privata fält bevisas uppfylla `Sendable`.
 
-Strängar, payload-enums, borrows, pekare, funktionsvärden, scratch-vyer,
-TaskID:n och oklassificerade opaque-typer får inte passera jobbgränsen.
-Dagens vanliga kopieringsväg för strängar och payload-enums delar
-referensräknade block, vilket inte uppfyller den första isoleringsregeln.
+`@resource`, borrows, råpekare (`ptr`), funktionsvärden/closures, scratch-vyer,
+`TaskID<R>` och oklassificerade `opaque struct` är inte `Sendable` och avvisas
+statiskt. Strängar, payload-enums och sammansatta arrayer går genom dedikerad
+isolerad djupkloning så att varje tråd får helt egna allokeringar med egen
+referensräkning i sin arena utan delade icke-atomära räknare.
 
 Arbetaren får använda lokala lån, strängar, scratch och allokering i sin
 egen runtime. En separat transitiv effektanalys avvisar unsafe, FFI,

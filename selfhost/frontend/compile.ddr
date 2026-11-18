@@ -22,6 +22,7 @@ import frontend_types as ft
 import lexer
 import closures
 import generics
+import traits
 import type_reader
 import type_syntax as syntax
 import ..driver.modules
@@ -105,8 +106,10 @@ pub opaque struct Session {
     jobs: cs.JobLog,
     tasks: tc.TaskGraph,
     closure_header: i32, closure_drop: i32, boxed_signatures: []bool, types: ft.TypeRegistry, helper_labels: []i32, array_helpers: i32,
+    task_iso_labels: []i32, task_shared_rc_labels: []i32, task_shared_prepare_labels: []i32, task_shared_drop_labels: []i32,
     ok: bool, error: string, error_at: i32,
     specializations: generics.Layout,
+    traits: traits.Table,
     validating_dead: bool, validated_through: i32, report: bool, bindings: Bindings,
     wasm_abi: wa.Abi, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports,
@@ -143,7 +146,19 @@ fn import_c(c: &mut Session, symbol: string) -> i32 {
     index := c.imports.symbols.len; c.imports.libraries.push("c"); c.imports.symbols.push(symbol.clone()); index
 }
 fn bind_task_runtime(c: &mut Session, rt: &runtime.Runtime, certificate: &tc.TaskCertificate) {
-    plan := tc.build_prefix_plan(&certificate, &c.types, &c.helper_labels, &c.world.param_starts, &c.world.param_types, &c.world.returns, &c.fn_labels)
+    mut iso_labels: []i32 = []; mut drop_labels: []i32 = []
+    iso_labels.reserve(c.types.declared.type_kinds.len); drop_labels.reserve(c.types.declared.type_kinds.len)
+    for ty in 0..c.types.declared.type_kinds.len {
+        mut iso := -1; mut drop := -1
+        if ft.owned(&c.types, ty) {
+            if ty < c.task_iso_labels.len && c.task_iso_labels[ty] >= 0 { iso = c.task_iso_labels[ty] }
+            else { iso = type_helper(&mut c, ty, false) }
+            if ty == 4 { drop = rt.release }
+            else { drop = type_helper(&mut c, ty, true) }
+        }
+        iso_labels.push(iso); drop_labels.push(drop)
+    }
+    plan := tc.build_prefix_plan(&certificate, &c.types, &iso_labels, &drop_labels, &c.world.param_starts, &c.world.param_types, &c.world.returns, &c.fn_labels)
     mut symbols := task_native.posix_symbols(0, -1, -1, -1)
     if c.jobs.platform == 0 {
         queue := import_c(&mut c, "dispatch_get_global_queue")
@@ -219,7 +234,10 @@ fn task_scope_statement(c: &mut Session, catalog: &opt_inline.View, inline_work:
                 fail(&mut c, "shared task input requires an owned record of isolated Data"); return false
             }
             c.body.facts.shared.push(tc.shared_data_type(&c.types, shared)); c.body.facts.shared_tokens.push(value_at)
-            if c.body.expr.owner >= 0 { take_value(&mut c, shared) } else { copy_value(&mut c, shared) }
+            if shared < c.task_shared_prepare_labels.len && c.task_shared_prepare_labels[shared] >= 0 {
+                ownership_call(&mut c, .Copy, shared, c.task_shared_prepare_labels[shared])
+                c.body.expr.owner = -1
+            } else if c.body.expr.owner >= 0 { take_value(&mut c, shared) } else { copy_value(&mut c, shared) }
             if !c.code.checking { shared_slot = slot(&mut c); arm.store(&mut c.code, shared_slot, 0) }
             arm.load(&mut c.code, cap_slot)
         }
@@ -236,7 +254,10 @@ fn task_scope_statement(c: &mut Session, catalog: &opt_inline.View, inline_work:
         if factory >= 0 { arm.branch(&mut c.code, c.fn_labels[factory], 20); arm.mov(&mut c.code, 2, 0) }
         else { arm.imm(&mut c.code, 2, 0) }
         if shared >= 0 {
-            drop := type_helper(&mut c, shared, true)
+            mut drop := type_helper(&mut c, shared, true)
+            if shared < c.task_shared_drop_labels.len && c.task_shared_drop_labels[shared] >= 0 {
+                drop = c.task_shared_drop_labels[shared]
+            }
             arm.branch(&mut c.code, drop, 20); arm.mov(&mut c.code, 4, 0)
             arm.load_into(&mut c.code, shared_slot, 3)
         } else { arm.imm(&mut c.code, 3, 0); arm.imm(&mut c.code, 4, 0) }
@@ -844,6 +865,261 @@ fn declaration_owner(c: &Session, offset: i32, starts: &[]i32, owners: &[]i32) -
     if generics.generated(&c.specializations, offset) { return c.world.module_caps.len }
     fc.source_owner(offset, &starts, &owners)
 }
+struct TraitMethodSig { has_self: bool, signature: i32 }
+fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty: i32) -> TraitMethodSig {
+    saved_cursor := c.body.cursor; saved_self := c.types.self_type
+    saved_names := c.world.param_names.len
+    c.body.cursor = sig_start; c.types.self_type = self_ty
+    mut has_self := false
+    mut args: []i32 = []
+    expect(&mut c, "(")
+    while c.ok && !is(&c, ")") && c.body.cursor < sig_end {
+        param_index := args.len
+        consuming := eat(&mut c, "move")
+        if !consuming && eat(&mut c, "&") {
+            is_mut := eat(&mut c, "mut")
+            if !eat(&mut c, "self") { fail(&mut c, "expected 'self' after '&' in trait method receiver"); break }
+            if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
+            has_self = true
+            mut ref_kind := 4; if is_mut { ref_kind = 5 }
+            mode := compound(&mut c, ref_kind, self_ty)
+            c.world.param_names.push("self"); args.push(mode)
+        } else {
+            is_mut := eat(&mut c, "mut")
+            if is_mut && !is(&c, "self") { fail(&mut c, "expected 'self' after 'mut' in trait method receiver"); break }
+            if is(&c, "self") {
+                _ := advance(&mut c)
+                if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
+                has_self = true
+                mut mode := parameter_mode(&mut c, self_ty, true, false)
+                if eat(&mut c, ":") {
+                    if is_mut { fail(&mut c, "cannot combine 'mut self' with an explicit ': Type'"); break }
+                    pt := type_name(&mut c)
+                    if pt == self_ty { mode = parameter_mode(&mut c, pt, true, false) }
+                    else if (ft.type_kind(&c.types, pt) == 4 || ft.type_kind(&c.types, pt) == 5) && ft.type_base(&c.types, pt) == self_ty {
+                        if consuming { fail(&mut c, "move argument requires a consuming parameter"); break }
+                        mode = parameter_mode(&mut c, pt, false, false)
+                    } else { fail(&mut c, "self parameter must have type Self, &Self or &mut Self"); break }
+                }
+                c.world.param_names.push("self"); args.push(mode)
+            } else {
+                if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected parameter name in trait method"); break }
+                pname := advance(&mut c); expect(&mut c, ":"); pt := type_name(&mut c)
+                mode := parameter_mode(&mut c, pt, consuming, false)
+                c.world.param_names.push(move pname); args.push(mode)
+            }
+        }
+        if !eat(&mut c, ",") { break }
+    }
+    if c.ok { expect(&mut c, ")") }
+    mut ret := 0
+    if c.ok && eat(&mut c, "->") { ret = type_name(&mut c) }
+    mut signature := 0
+    if c.ok {
+        source := result_parameter(&mut c, &args, ret, saved_names)
+        if c.ok && c.body.cursor != sig_end { fail(&mut c, "unexpected token in trait method signature") }
+        if c.ok { signature = callable_with_parameter(&mut c, &args, ret, 9, source) }
+    }
+    while c.world.param_names.len > saved_names { _ := c.world.param_names.pop() }
+    c.body.cursor = saved_cursor; c.types.self_type = saved_self
+    TraitMethodSig { has_self: has_self, signature: signature }
+}
+fn valid_trait_target(c: &Session, ty: i32) -> bool {
+    if ty < 1 { return false }
+    if ty < 13 { return true }
+    kind := c.types.declared.type_kinds[ty]
+    kind == 2 || kind == 3 || kind == 7
+}
+fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
+    tid := c.traits.impl_trait_ids[k]
+    target_ty := c.traits.impl_types[k]
+    site := c.traits.impl_sites[k]
+    fn_start := c.traits.impl_fn_starts[k]
+    fn_count := c.traits.impl_fn_counts[k]
+    if tid == traits.sendable_id() {
+        if fn_count != 0 { c.ok = false; c.error = "Sendable is a marker trait and cannot contain methods"; c.error_at = site; return false }
+        if !traits.record_conformance(&mut c.traits, tid, target_ty, k) {
+            c.ok = false; c.error = "duplicate implementation of trait 'Sendable' for '" + ft.type_spelling(&c.types, target_ty) + "'"; c.error_at = site; return false
+        }
+        if target_ty < c.types.opaque_owner.len && c.types.opaque_owner[target_ty] >= 0 {
+            c.types.opaque_sendable[target_ty] = true
+            state := traits.compute_sendable(&c.types)
+            if !traits.apply_sendable(&mut c.traits, move state) { c.ok = false; c.error = "internal Sendable metadata failure"; c.error_at = site; return false }
+        }
+        c.traits.impl_active[k] = true; return true
+    }
+    if tid == traits.storable_id() {
+        if fn_count != 0 { c.ok = false; c.error = "Storable is a marker trait and cannot contain methods"; c.error_at = site; return false }
+        if !ft.array_element(&c.types, target_ty) {
+            c.ok = false; c.error = "type '" + ft.type_spelling(&c.types, target_ty) + "' cannot implement Storable"; c.error_at = site; return false
+        }
+        if !traits.record_conformance(&mut c.traits, tid, target_ty, k) {
+            c.ok = false; c.error = "duplicate implementation of trait 'Storable' for '" + ft.type_spelling(&c.types, target_ty) + "'"; c.error_at = site; return false
+        }
+        c.traits.impl_active[k] = true; return true
+    }
+    if !traits.record_conformance(&mut c.traits, tid, target_ty, k) {
+        c.ok = false; c.error = "duplicate implementation of trait for '" + ft.type_spelling(&c.types, target_ty) + "'"; c.error_at = site; return false
+    }
+    // Check no extra methods
+    for i in fn_start..fn_start + fn_count {
+        f := c.traits.impl_fns[i]
+        m_name := c.world.impl_names[f].clone()
+        if !traits.has_method_name(&c.traits, tid, m_name) {
+            c.ok = false; c.error = "method '" + m_name + "' is not a member of this trait"; c.error_at = site; return false
+        }
+    }
+    // Check all required trait methods are present with exact matching signature
+    m_start := c.traits.method_starts[tid]; m_count := c.traits.method_counts[tid]
+    for m in m_start..m_start + m_count {
+        req_name := c.traits.method_names[m].clone()
+        expected := parse_trait_method_sig(&mut c, c.traits.method_sig_starts[m], c.traits.method_sig_ends[m], target_ty)
+        if !c.ok { return false }
+        mut found := -1
+        for i in fn_start..fn_start + fn_count {
+            f := c.traits.impl_fns[i]
+            if c.world.impl_names[f] == req_name { found = f; break }
+        }
+        if found < 0 {
+            c.ok = false; c.error = "missing trait method '" + req_name + "' in implementation for '" + ft.type_spelling(&c.types, target_ty) + "'"
+            c.error_at = site; return false
+        }
+        if c.world.impl_has_self[found] != expected.has_self || c.world.ffi_types[found] != expected.signature {
+            c.ok = false; c.error = "trait method '" + req_name + "' signature does not match trait requirement " + ft.type_spelling(&c.types, expected.signature)
+            c.error_at = site; return false
+        }
+    }
+    // Register validated methods on target_ty
+    for i in fn_start..fn_start + fn_count {
+        f := c.traits.impl_fns[i]
+        m_name := c.world.impl_names[f].clone()
+        c.world.impl_public[f] = c.traits.public[tid]
+        if !fc.put_method(&mut c.world, target_ty, m_name, f) {
+            c.ok = false; c.error = "duplicate method '" + m_name + "' on type"; c.error_at = site; return false
+        }
+    }
+    c.traits.impl_active[k] = true
+    true
+}
+fn resolve_traits(c: &mut Session) {
+    // 1. Validate user trait definitions: supertraits, cycles, method signatures
+    for tid in 2..c.traits.names.len {
+        if !c.ok { return }
+        s_start := c.traits.super_starts[tid]; s_count := c.traits.super_counts[tid]
+        for s in s_start..s_start + s_count {
+            tok := c.traits.super_tokens[s]
+            sname := c.world.tokens.texts[tok].clone()
+            sid := traits.lookup(&c.traits, sname)
+            if sid < 0 { c.ok = false; c.error = "unknown supertrait '" + sname + "'"; c.error_at = c.world.tokens.starts[tok]; return }
+            c.traits.super_ids[s] = sid
+        }
+    }
+    cycle := traits.has_super_cycle(&c.traits)
+    if cycle >= 0 { c.ok = false; c.error = "cyclic trait supertrait inheritance"; c.error_at = c.traits.sites[cycle]; return }
+    for tid in 2..c.traits.names.len {
+        if !c.ok { return }
+        m_start := c.traits.method_starts[tid]; m_count := c.traits.method_counts[tid]
+        for m in m_start..m_start + m_count {
+            _ := parse_trait_method_sig(&mut c, c.traits.method_sig_starts[m], c.traits.method_sig_ends[m], 1)
+            if !c.ok { return }
+        }
+    }
+    // 2. Resolve trait IDs, targets, coherence, and unconditional Sendable opt-ins
+    for k in 0..c.traits.impl_trait_names.len {
+        if !c.ok { return }
+        tname := c.traits.impl_trait_names[k].clone()
+        tid := traits.lookup(&c.traits, tname)
+        site := c.traits.impl_sites[k]
+        if tid < 0 { c.ok = false; c.error = "unknown trait '" + tname + "'"; c.error_at = site; return }
+        target_tok := c.traits.impl_target_tokens[k]
+        target_name := c.world.tokens.texts[target_tok].clone()
+        target_ty := type_id(&c, target_name)
+        if !valid_trait_target(&c, target_ty) {
+            c.ok = false; c.error = "invalid trait implementation target '" + target_name + "'"; c.error_at = c.world.tokens.starts[target_tok]; return
+        }
+        c.traits.impl_trait_ids[k] = tid; c.traits.impl_types[k] = target_ty
+        prelude_gen := generics.generated(&c.specializations, site)
+        if !prelude_gen {
+            impl_owner := c.traits.impl_owners[k]
+            trait_owner := c.traits.owners[tid]
+            target_owner := if target_ty < c.types.type_owners.len { c.types.type_owners[target_ty] } else { -1 }
+            if traits.is_builtin(tid) {
+                if target_ty < 13 || target_owner != impl_owner {
+                    c.ok = false; c.error = "cannot implement built-in trait '" + c.traits.names[tid] + "' for an imported or primitive type"; c.error_at = site; return
+                }
+            } else if trait_owner != impl_owner && (target_owner < 0 || target_owner != impl_owner) {
+                c.ok = false; c.error = "cannot implement an imported trait for an imported or primitive type"; c.error_at = site; return
+            }
+        }
+        if tid == traits.sendable_id() && !c.traits.impl_conditional[k] {
+            if target_ty < c.types.opaque_owner.len && c.types.opaque_owner[target_ty] >= 0 {
+                c.types.opaque_sendable[target_ty] = true
+            }
+        }
+    }
+    // 3. Initial Sendable analysis & activate unconditional impls
+    initial_sendable := traits.compute_sendable(&c.types)
+    if !traits.apply_sendable(&mut c.traits, move initial_sendable) { c.ok = false; c.error = "internal Sendable metadata failure"; return }
+    for k in 0..c.traits.impl_trait_names.len {
+        if !c.ok { return }
+        if !c.traits.impl_conditional[k] {
+            if !activate_trait_impl(&mut c, k) { return }
+        }
+    }
+    // 4. Fixed-point activation of conditional trait impls
+    mut changed := true
+    while changed && c.ok {
+        changed = false
+        for k in 0..c.traits.impl_trait_names.len {
+            if !c.traits.impl_conditional[k] || c.traits.impl_active[k] { continue }
+            c_start := c.traits.impl_cond_starts[k]; c_count := c.traits.impl_cond_counts[k]
+            mut satisfied := true
+            for ci in c_start..c_start + c_count {
+                arg_ty := c.traits.cond_types[ci]
+                if c.traits.cond_traits[ci] != "" {
+                    cid := traits.lookup(&c.traits, c.traits.cond_traits[ci])
+                    if cid < 0 || !traits.satisfies(&c.traits, &c.types, cid, arg_ty) { satisfied = false; break }
+                } else {
+                    f := impl_method(&c, arg_ty, c.traits.cond_methods[ci])
+                    if f < 0 || !c.world.impl_public[f] || !c.world.impl_has_self[f] || c.world.unsafe_functions[f] ||
+                        c.world.requires_caps[f] != 0 || c.world.ffi_types[f] != c.traits.cond_sigs[ci] {
+                        satisfied = false; break
+                    }
+                }
+            }
+            if satisfied {
+                if !activate_trait_impl(&mut c, k) { return }
+                changed = true
+            }
+        }
+    }
+    // 5. Verify Sendable proofs and supertraits on all activated trait impls
+    final_sendable := traits.compute_sendable(&c.types)
+    if !traits.apply_sendable(&mut c.traits, move final_sendable) { c.ok = false; c.error = "internal Sendable metadata failure"; return }
+    for k in 0..c.traits.impl_trait_names.len {
+        if !c.ok { return }
+        if !c.traits.impl_active[k] { continue }
+        tid := c.traits.impl_trait_ids[k]
+        target_ty := c.traits.impl_types[k]
+        if tid == traits.sendable_id() {
+            if !traits.satisfies(&c.traits, &c.types, 0, target_ty) {
+                c.ok = false
+                c.error = "type '" + ft.type_spelling(&c.types, target_ty) + "' cannot implement Sendable: " + traits.sendable_reason(&c.traits, target_ty)
+                c.error_at = c.traits.impl_sites[k]; return
+            }
+            continue
+        }
+        if tid < 2 { continue }
+        s_start := c.traits.super_starts[tid]; s_count := c.traits.super_counts[tid]
+        for s in s_start..s_start + s_count {
+            sup := c.traits.super_ids[s]
+            if !traits.satisfies(&c.traits, &c.types, sup, target_ty) {
+                c.ok = false; c.error = "trait implementation for '" + ft.type_spelling(&c.types, target_ty) + "' requires supertrait '" + c.traits.names[sup] + "'"
+                c.error_at = c.traits.impl_sites[k]; return
+            }
+        }
+    }
+}
 fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     mut stack: []i32 = []
     for i in 0..c.world.tokens.kinds.len {
@@ -855,8 +1131,11 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     if stack.len != 0 { fail(&mut c, "unterminated body"); return }
     mut declarations: []i32 = []; mut declaration_types: []i32 = []
     mut declaration_fns: []i32 = []; mut declaration_impl_targets: []i32 = []; mut declaration_impl_owners: []i32 = []
+    mut declaration_trait_impls: []i32 = []
     mut declaration_c_variadic: []i32 = []
     mut resource_types: []i32 = []; mut resource_methods: []i32 = []
+    mut matched_cond: []bool = []
+    for _ in 0..c.specializations.conditional_impls.impl_types.len { matched_cond.push(false) }
     separators(&mut c)
     mut file_caps := 0
     if eat(&mut c, "capability") {
@@ -916,15 +1195,101 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         if c_variadic >= 0 && library == "" { fail(&mut c, "@c_variadic requires an @extern unsafe fn declaration"); break }
         opaque := eat(&mut c, "opaque")
         owner := declaration_owner(&c, c.world.tokens.starts[c.body.cursor], &module_starts, &module_files)
+        if is(&c, "trait") {
+            if unchecked || opaque || layout || resource || test || library != "" || req_caps != 0 || c_variadic >= 0 {
+                fail(&mut c, "invalid declaration attribute"); break
+            }
+            skip_token(&mut c)
+            name_tok := c.body.cursor
+            if c.world.tokens.kinds[name_tok] != .Name { fail(&mut c, "expected trait name"); break }
+            t_name := advance(&mut c)
+            if traits.lookup(&c.traits, t_name) >= 0 || type_id(&c, t_name) >= 0 || c.world.functions.contains(t_name) || rules.reserved(t_name) {
+                c.body.cursor = name_tok; fail(&mut c, "duplicate or reserved trait name"); break
+            }
+            tid := traits.add_trait(&mut c.traits, move t_name, owner, public, c.world.tokens.starts[name_tok])
+            if eat(&mut c, ":") {
+                while c.ok {
+                    newlines(&mut c)
+                    sup_tok := c.body.cursor
+                    if c.world.tokens.kinds[sup_tok] != .Name { fail(&mut c, "expected supertrait name"); break }
+                    skip_token(&mut c); traits.add_super_token(&mut c.traits, tid, sup_tok)
+                    newlines(&mut c)
+                    if !eat(&mut c, "+") { break }
+                }
+            }
+            if !c.ok { break }
+            newlines(&mut c); expect(&mut c, "{"); if !c.ok { break }
+            block_end := c.world.closes[c.body.cursor - 1]
+            separators(&mut c)
+            while c.ok && !is(&c, "}") {
+                if is(&c, "@") { fail(&mut c, "attributes are not allowed inside trait declarations"); break }
+                if is(&c, "pub") { fail(&mut c, "trait methods cannot have 'pub'; visibility follows the trait"); break }
+                if is(&c, "unsafe") { fail(&mut c, "trait methods must be safe"); break }
+                expect(&mut c, "fn"); if !c.ok { break }
+                m_tok := c.body.cursor
+                if c.world.tokens.kinds[m_tok] != .Name { fail(&mut c, "expected trait method name"); break }
+                m_name := advance(&mut c)
+                if m_name == "self" || m_name == "Self" || m_name == "TaskID" || m_name == "Sendable" || m_name == "Storable" {
+                    c.body.cursor = m_tok; fail(&mut c, "duplicate or reserved function name"); break
+                }
+                if traits.has_method_name(&c.traits, tid, m_name) {
+                    c.body.cursor = m_tok; fail(&mut c, "duplicate method '" + m_name + "' in trait"); break
+                }
+                sig_start := c.body.cursor
+                if !is(&c, "(") { fail(&mut c, "expected '(' in trait method signature"); break }
+                mut parens := 0; mut brackets := 0
+                while c.ok && c.body.cursor < block_end {
+                    if parens == 0 && brackets == 0 {
+                        if lexer.is_newline(c.world.tokens.kinds[c.body.cursor]) || is(&c, ";") || is(&c, "}") { break }
+                        if is(&c, "{") { fail(&mut c, "trait method declarations cannot have a body"); break }
+                    }
+                    if is(&c, "(") { parens = parens + 1 } else if is(&c, ")") { parens = parens - 1 }
+                    else if is(&c, "[") { brackets = brackets + 1 } else if is(&c, "]") { brackets = brackets - 1 }
+                    skip_token(&mut c)
+                }
+                if !c.ok { break }
+                traits.add_method(&mut c.traits, tid, move m_name, sig_start, c.body.cursor, c.world.tokens.starts[m_tok])
+                separators(&mut c)
+            }
+            if c.ok { expect(&mut c, "}"); separators(&mut c) }
+            continue
+        }
         if is(&c, "impl") {
             if public { fail(&mut c, "impl block cannot be public; mark individual methods with pub"); break }
             if unchecked || opaque || layout || resource || test || library != "" || req_caps != 0 || c_variadic >= 0 {
                 fail(&mut c, "invalid declaration attribute"); break
             }
             skip_token(&mut c)
-            target_tok := c.body.cursor
-            if c.world.tokens.kinds[target_tok] != .Name { fail(&mut c, "expected type name after impl"); break }
-            target_name := advance(&mut c)
+            mut trait_impl_id := -1
+            mut target_tok := c.body.cursor
+            mut target_name := ""
+            if c.world.tokens.kinds[target_tok] != .Name { fail(&mut c, "expected type or trait name after impl"); break }
+            first_name := advance(&mut c)
+            newlines(&mut c)
+            if eat(&mut c, "for") {
+                newlines(&mut c)
+                target_tok = c.body.cursor
+                if c.world.tokens.kinds[target_tok] != .Name { fail(&mut c, "expected target type after 'for'"); break }
+                target_name = advance(&mut c)
+                mut cond_idx := -1
+                ci := &c.specializations.conditional_impls
+                for idx in 0..ci.impl_types.len {
+                    if !matched_cond[idx] && ci.impl_types[idx] == target_name && ci.impl_traits[idx] == first_name {
+                        cond_idx = idx; matched_cond[idx] = true; break
+                    }
+                }
+                site := if cond_idx >= 0 { ci.impl_sites[cond_idx] } else { c.world.tokens.starts[target_tok] }
+                trait_impl_id = traits.add_impl(&mut c.traits, first_name.clone(), target_tok, target_tok, owner, site, cond_idx >= 0)
+                if cond_idx >= 0 {
+                    cstart := ci.cond_starts[cond_idx]
+                    for j in cstart..cstart + ci.cond_counts[cond_idx] {
+                        traits.add_impl_cond(&mut c.traits, trait_impl_id, ci.cond_receivers[j],
+                            ci.cond_traits[j].clone(), ci.cond_methods[j].clone(), ci.cond_signatures[j])
+                    }
+                }
+            } else {
+                target_name = first_name.clone()
+            }
             newlines(&mut c); expect(&mut c, "{"); if !c.ok { break }
             block_end := c.world.closes[c.body.cursor - 1]
             separators(&mut c)
@@ -939,6 +1304,10 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
                 if !c.ok { break }
                 m_pub := eat(&mut c, "pub")
                 m_unsafe := eat(&mut c, "unsafe")
+                if trait_impl_id >= 0 {
+                    if m_pub { fail(&mut c, "trait implementation methods inherit visibility from the trait; omit 'pub'"); break }
+                    if m_unsafe || m_caps != 0 { fail(&mut c, "trait implementation methods must be safe without extra capabilities"); break }
+                }
                 if m_unsafe && !c.world.unsafe_capable { fail(&mut c, "module requires capability unsafe"); break }
                 expect(&mut c, "fn"); if !c.ok { break }
                 m_owner := declaration_owner(&c, c.world.tokens.starts[c.body.cursor], &module_starts, &module_files)
@@ -949,6 +1318,8 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
                 declarations.push(c.body.cursor); declaration_types.push(-1); declaration_fns.push(fn_id)
                 declaration_c_variadic.push(-1)
                 declaration_impl_targets.push(target_tok); declaration_impl_owners.push(m_owner)
+                declaration_trait_impls.push(trait_impl_id)
+                if trait_impl_id >= 0 { traits.add_impl_fn(&mut c.traits, trait_impl_id, fn_id) }
                 c.world.function_owners.push(m_owner); c.world.test_functions.push(false)
                 c.world.libraries.push(""); c.world.symbols.push(""); c.world.unsafe_functions.push(m_unsafe)
                 c.world.impl_types.push(-2); c.world.impl_public.push(m_pub)
@@ -966,7 +1337,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         }
         what := advance(&mut c)
         if opaque && what != "struct" { fail(&mut c, "expected opaque struct"); break }
-        if what != "fn" && what != "struct" && what != "enum" { fail(&mut c, "expected fn, struct, enum or impl (imports must be loaded first)"); break }
+        if what != "fn" && what != "struct" && what != "enum" { fail(&mut c, "expected fn, struct, enum, trait or impl (imports must be loaded first)"); break }
         if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected declaration name"); break }
         name := advance(&mut c)
         if ((layout || resource) && what != "struct") || (unchecked && what != "fn") || (req_caps != 0 && what != "fn") || (c_variadic >= 0 && what != "fn") { fail(&mut c, "invalid declaration attribute"); break }
@@ -974,10 +1345,11 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         declarations.push(c.body.cursor)
         declaration_c_variadic.push(c_variadic)
         declaration_impl_targets.push(-1); declaration_impl_owners.push(owner)
+        declaration_trait_impls.push(-1)
         mut ty := -1
         if what != "fn" {
             reserved := c.specializations.reserved.remove(name)
-            if !reserved && type_id(&c, name) >= 0 { fail(&mut c, "duplicate type") }
+            if (!reserved && type_id(&c, name) >= 0) || traits.lookup(&c.traits, name) >= 0 { fail(&mut c, "duplicate type") }
             else if name == "TaskID" || rules.reserved(name) { fail(&mut c, "reserved type name") }
             mut kind := 2; if what == "enum" { kind = 3 }
             if reserved { ty = type_id(&c, name) } else { ty = add_type(&mut c, name, kind, 0) }
@@ -986,7 +1358,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             if resource_method >= 0 { resource_types.push(ty); resource_methods.push(resource_method) }
             declaration_fns.push(-1)
         } else {
-            if c.world.functions.contains(name) || rules.reserved(name) { fail(&mut c, "duplicate or reserved function name") }
+            if c.world.functions.contains(name) || traits.lookup(&c.traits, name) >= 0 || rules.reserved(name) { fail(&mut c, "duplicate or reserved function name") }
             fn_id := c.world.names.len
             c.world.function_owners.push(owner); c.world.test_functions.push(test)
             c.world.libraries.push(library.clone()); c.world.symbols.push(symbol.clone()); c.world.unsafe_functions.push(unchecked)
@@ -1014,6 +1386,14 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         f := declaration_fns[d]
         target_name := c.world.tokens.texts[target_tok].clone()
         target_ty := type_id(&c, target_name)
+        if declaration_trait_impls[d] >= 0 {
+            if !valid_trait_target(&c, target_ty) {
+                c.body.cursor = target_tok
+                fail(&mut c, "invalid trait implementation target '" + target_name + "'"); break
+            }
+            c.world.impl_types[f] = target_ty
+            continue
+        }
         prelude_scalar := target_ty > 0 && target_ty < 13 && generics.generated(&c.specializations, c.world.tokens.starts[target_tok])
         if !prelude_scalar && (target_ty < 0 || (c.types.declared.type_kinds[target_ty] != 2 && c.types.declared.type_kinds[target_ty] != 3)) {
             c.body.cursor = target_tok
@@ -1158,6 +1538,22 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         }
         c.types.cleanup_methods[ty] = hook
         c.types.has_cleanup = true
+    }
+    if c.ok { resolve_traits(&mut c) }
+    for i in 0..c.specializations.requirements.trait_names.len {
+        if !c.ok { break }
+        name := c.specializations.requirements.trait_names[i].clone()
+        receiver := c.specializations.requirements.trait_receivers[i]
+        tid := traits.lookup(&c.traits, name)
+        if tid < 0 { c.error = "unknown trait '" + name + "' required by generic declaration" }
+        else if !traits.satisfies(&c.traits, &c.types, tid, receiver) {
+            if tid == traits.sendable_id() {
+                c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' does not satisfy Sendable (" + traits.sendable_reason(&c.traits, receiver) + ")"
+            } else {
+                c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' does not implement required trait"
+            }
+        }
+        if c.error != "" { c.ok = false; c.error_at = c.specializations.requirements.trait_sites[i] }
     }
     for i in 0..c.specializations.requirements.methods.len {
         if !c.ok { break }
@@ -4626,7 +5022,8 @@ pub fn new_session() -> Session {
         jobs: cs.new_job_log(),
         tasks: tc.new_graph(),
         closure_header: -1, closure_drop: -1, boxed_signatures: [], types: ft.new_registry(), helper_labels: [], array_helpers: -1,
-        ok: true, error: "", error_at: 0, specializations: generics.layout(),
+        task_iso_labels: [], task_shared_rc_labels: [], task_shared_prepare_labels: [], task_shared_drop_labels: [],
+        ok: true, error: "", error_at: 0, specializations: generics.layout(), traits: traits.new(),
         validating_dead: false, validated_through: -1, report: report, bindings: bindings(),
         wasm_abi: wa.new(), imports: imports(), callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], loans: scratch.loans(),
@@ -4996,6 +5393,21 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
                 spawner := arm.label(&mut c.code); c.tasks.spawners[f] = spawner
             }
         }
+        n_decl := c.types.declared.type_kinds.len
+        c.task_iso_labels.reserve(n_decl); c.task_shared_rc_labels.reserve(n_decl)
+        c.task_shared_prepare_labels.reserve(n_decl); c.task_shared_drop_labels.reserve(n_decl)
+        for ty in 0..n_decl {
+            mut iso := -1; mut rc := -1; mut prep := -1; mut sdrop := -1
+            if ft.owned(&c.types, ty) && ft.has_shared_rc(&c.types, ty) {
+                if ty == 4 { iso = c.runtime.string_isolated_clone } else { iso = arm.label(&mut c.code) }
+                rc = arm.label(&mut c.code)
+                if c.types.declared.type_kinds[ty] == 2 && !c.types.c_record[ty] {
+                    prep = arm.label(&mut c.code); sdrop = arm.label(&mut c.code)
+                }
+            }
+            c.task_iso_labels.push(iso); c.task_shared_rc_labels.push(rc)
+            c.task_shared_prepare_labels.push(prep); c.task_shared_drop_labels.push(sdrop)
+        }
     }
     if !c.ok { return session_fail_at(&mut c, c.error.clone(), c.error_at) }
     if !check_all {
@@ -5104,6 +5516,7 @@ pub struct ValidationJob { declaration: i32, platform: i32, dead: bool }
 
 pub struct BackendBindings {
     runtime: runtime.Runtime, platform: i32, globals: i32, instrumented: bool, helper_labels: []i32, record_take_labels: []i32,
+    task_iso_labels: []i32, task_shared_rc_labels: []i32, task_shared_prepare_labels: []i32, task_shared_drop_labels: []i32,
     closure_drop: i32, array_helpers: i32, array_take: i32, print_int: i32, print_bool: i32,
     print_text: i32, write: i32, float_trap: i32, unicode_trap: i32, overflow: i32,
     zero: i32, assertion: i32, io: i32, bounds: i32,
@@ -5113,6 +5526,8 @@ pub struct BackendBindings {
 pub fn freeze_backend(c: &Session) -> BackendBindings {
     BackendBindings { runtime: c.runtime.clone(), platform: c.jobs.platform, globals: c.jobs.globals, instrumented: c.code.profile,
         helper_labels: c.helper_labels.clone(), record_take_labels: c.record_take_labels.clone(),
+        task_iso_labels: c.task_iso_labels.clone(), task_shared_rc_labels: c.task_shared_rc_labels.clone(),
+        task_shared_prepare_labels: c.task_shared_prepare_labels.clone(), task_shared_drop_labels: c.task_shared_drop_labels.clone(),
         closure_drop: c.closure_drop, array_helpers: c.array_helpers, array_take: c.array_take, print_int: c.print_int,
         print_bool: c.print_bool, print_text: c.print_text, write: c.write,
         float_trap: c.float_trap, unicode_trap: c.unicode_trap, overflow: c.overflow, zero: c.zero,
@@ -5125,7 +5540,10 @@ pub fn freeze_backend(c: &Session) -> BackendBindings {
 pub fn prepare_emitter(c: &mut Session, bindings: &BackendBindings) {
     c.runtime = bindings.runtime.clone(); c.code.platform = bindings.platform; c.code.profile = bindings.instrumented; c.code.checking = false
     c.validating_dead = false; c.helper_labels = bindings.helper_labels.clone()
-    c.record_take_labels = bindings.record_take_labels.clone(); c.code.labels.clear()
+    c.record_take_labels = bindings.record_take_labels.clone()
+    c.task_iso_labels = bindings.task_iso_labels.clone(); c.task_shared_rc_labels = bindings.task_shared_rc_labels.clone()
+    c.task_shared_prepare_labels = bindings.task_shared_prepare_labels.clone(); c.task_shared_drop_labels = bindings.task_shared_drop_labels.clone()
+    c.code.labels.clear()
     for i in 0..bindings.globals { c.code.labels.push(-1) }
     c.closure_drop = bindings.closure_drop; c.array_helpers = bindings.array_helpers; c.array_take = bindings.array_take
     c.print_int = bindings.print_int; c.print_bool = bindings.print_bool
@@ -6354,6 +6772,231 @@ fn nominal_clones(c: &mut Session, rt: &runtime.Runtime) {
     rt_emit.emit_array_helpers(&mut c.code, &rt, c.array_helpers)
 }
 
+fn emit_iso_copy(c: &mut Session, ty: i32) {
+    if ty < c.task_iso_labels.len && c.task_iso_labels[ty] >= 0 {
+        arm.branch(&mut c.code, c.task_iso_labels[ty], 1)
+    } else if ft.owned(&c.types, ty) {
+        helper := type_helper(&mut c, ty, false)
+        arm.branch(&mut c.code, helper, 1)
+    }
+}
+fn mark_iso_work(ty: i32, labels: &[]i32, needed: &mut []bool, work: &mut []i32) {
+    if ty >= 0 && ty < labels.len && labels[ty] >= 0 && !needed[ty] {
+        needed[ty] = true; work.push(ty)
+    }
+}
+fn emit_task_isolated_helpers(c: &mut Session, rt: &runtime.Runtime) {
+    n := c.task_iso_labels.len
+    if n == 0 { return }
+    mut max_label := -1
+    for ty in 0..n {
+        if ty != 4 && c.task_iso_labels[ty] > max_label { max_label = c.task_iso_labels[ty] }
+        if c.task_shared_rc_labels[ty] > max_label { max_label = c.task_shared_rc_labels[ty] }
+        if c.task_shared_prepare_labels[ty] > max_label { max_label = c.task_shared_prepare_labels[ty] }
+        if c.task_shared_drop_labels[ty] > max_label { max_label = c.task_shared_drop_labels[ty] }
+    }
+    if max_label < 0 { return }
+    mut label_info: []i32 = []; label_info.reserve(max_label + 1)
+    for _ in 0..max_label + 1 { label_info.push(-1) }
+    for ty in 0..n {
+        if ty != 4 && c.task_iso_labels[ty] >= 0 { label_info[c.task_iso_labels[ty]] = ty * 4 }
+        if c.task_shared_rc_labels[ty] >= 0 { label_info[c.task_shared_rc_labels[ty]] = ty * 4 + 1 }
+        if c.task_shared_prepare_labels[ty] >= 0 { label_info[c.task_shared_prepare_labels[ty]] = ty * 4 + 2 }
+        if c.task_shared_drop_labels[ty] >= 0 { label_info[c.task_shared_drop_labels[ty]] = ty * 4 + 3 }
+    }
+    mut iso_needed: []bool = []; mut rc_needed: []bool = []; mut prep_needed: []bool = []; mut drop_needed: []bool = []
+    iso_needed.reserve(n); rc_needed.reserve(n); prep_needed.reserve(n); drop_needed.reserve(n)
+    for _ in 0..n { iso_needed.push(false); rc_needed.push(false); prep_needed.push(false); drop_needed.push(false) }
+    mut iso_work: []i32 = []; mut rc_work: []i32 = []
+    for target in &c.code.target {
+        if target >= 0 && target < label_info.len {
+            enc := label_info[target]
+            if enc >= 0 {
+                ty := enc / 4; kind := enc % 4
+                if kind == 0 { mark_iso_work(ty, &c.task_iso_labels, &mut iso_needed, &mut iso_work) }
+                else if kind == 1 { mark_iso_work(ty, &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work) }
+                else if kind == 2 {
+                    prep_needed[ty] = true
+                    mark_iso_work(ty, &c.task_iso_labels, &mut iso_needed, &mut iso_work)
+                    mark_iso_work(ty, &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+                } else {
+                    drop_needed[ty] = true
+                    mark_iso_work(ty, &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+                }
+            }
+        }
+    }
+    while iso_work.len > 0 {
+        ty := iso_work.pop()
+        if ty == 4 { continue }
+        kind := c.types.declared.type_kinds[ty]
+        if kind == 1 || kind == 6 {
+            mark_iso_work(c.types.declared.type_bases[ty], &c.task_iso_labels, &mut iso_needed, &mut iso_work)
+        } else if kind == 2 {
+            first := c.types.declared.type_starts[ty]
+            for i in 0..c.types.declared.type_counts[ty] {
+                mark_iso_work(c.types.field_types[first + i], &c.task_iso_labels, &mut iso_needed, &mut iso_work)
+            }
+        } else if kind == 7 {
+            first := c.types.declared.type_starts[ty]
+            for v in first..first + c.types.declared.type_counts[ty] {
+                ps := c.types.payload_starts[v]
+                for i in 0..c.types.payload_counts[v] {
+                    mark_iso_work(c.types.payload_types[ps + i], &c.task_iso_labels, &mut iso_needed, &mut iso_work)
+                }
+            }
+        }
+    }
+    while rc_work.len > 0 {
+        ty := rc_work.pop()
+        if ty == 4 { continue }
+        kind := c.types.declared.type_kinds[ty]
+        if kind == 1 || kind == 6 {
+            mark_iso_work(c.types.declared.type_bases[ty], &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+        } else if kind == 2 {
+            first := c.types.declared.type_starts[ty]
+            for i in 0..c.types.declared.type_counts[ty] {
+                mark_iso_work(c.types.field_types[first + i], &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+            }
+        } else if kind == 7 {
+            first := c.types.declared.type_starts[ty]
+            for v in first..first + c.types.declared.type_counts[ty] {
+                ps := c.types.payload_starts[v]
+                for i in 0..c.types.payload_counts[v] {
+                    mark_iso_work(c.types.payload_types[ps + i], &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+                }
+            }
+        }
+    }
+    for ty in 0..n {
+        if iso_needed[ty] && ty != 4 {
+            kind := c.types.declared.type_kinds[ty]
+            arm.mark(&mut c.code, c.task_iso_labels[ty])
+            if kind == 1 || kind == 6 {
+                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 1)
+                arm.store(&mut c.code, 0, 0)
+                elem_iso := c.task_iso_labels[c.types.declared.type_bases[ty]]
+                arm.branch(&mut c.code, elem_iso, 20); arm.mov(&mut c.code, 1, 0)
+                arm.load(&mut c.code, 0); arm.branch(&mut c.code, rt.array_isolated_clone, 1)
+                arm.ret(&mut c.code)
+            } else if kind == 7 {
+                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+                done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+                arm.store(&mut c.code, 0, 0)
+                first := c.types.declared.type_starts[ty]
+                for variant in first..first + c.types.declared.type_counts[ty] {
+                    next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
+                    arm.imm(&mut c.code, 1, c.types.field_values[variant]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
+                    arm.imm(&mut c.code, 0, i64(c.types.payload_counts[variant] + 1) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
+                    arm.imm(&mut c.code, 1, c.types.field_values[variant]); store_mem(&mut c, 1, 0, 0)
+                    for i in 0..c.types.payload_counts[variant] {
+                        pt := c.types.payload_types[c.types.payload_starts[variant] + i]
+                        arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8); emit_iso_copy(&mut c, pt)
+                        arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, 1); store_mem(&mut c, 1, 0, (i + 1) * 8)
+                    }
+                    arm.load(&mut c.code, 1); arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, next)
+                }
+                arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+            } else {
+                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+                done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+                arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.types.declared.type_counts[ty]) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
+                first := c.types.declared.type_starts[ty]
+                for i in 0..c.types.declared.type_counts[ty] {
+                    arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); emit_iso_copy(&mut c, c.types.field_types[first + i])
+                    arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
+                }
+                arm.load(&mut c.code, 1); arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+            }
+        }
+        if rc_needed[ty] {
+            arm.mark(&mut c.code, c.task_shared_rc_labels[ty])
+            if ty == 4 {
+                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 0)
+                done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+                arm.emit(&mut c.code, 3506438144 + 8 * 1024 + 0 * 32 + 10)
+                store_mem(&mut c, 1, 10, 0)
+                arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+            } else {
+                kind := c.types.declared.type_kinds[ty]
+                if kind == 1 || kind == 6 {
+                    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 4)
+                    done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+                    arm.store(&mut c.code, 0, 0); arm.store(&mut c.code, 1, 1)
+                    load_mem(&mut c, 10, 0, 8); arm.store(&mut c.code, 3, 10)
+                    arm.store(&mut c.code, 2, 31)
+                    elem_rc := c.task_shared_rc_labels[c.types.declared.type_bases[ty]]
+                    head := arm.label(&mut c.code); arm.mark(&mut c.code, head)
+                    arm.load_into(&mut c.code, 2, 10); arm.load_into(&mut c.code, 3, 11)
+                    arm.compare_register(&mut c.code, 10, 11); arm.branch(&mut c.code, done, 4)
+                    arm.load(&mut c.code, 0); load_mem(&mut c, 11, 0, 0)
+                    arm.emit(&mut c.code, 3544186880 + (64 - 3) * 65536 + (63 - 3) * 1024 + 10 * 32 + 12)
+                    arm.emit(&mut c.code, 2332033024 + 12 * 65536 + 11 * 32 + 11)
+                    load_mem(&mut c, 0, 11, 0); arm.load_into(&mut c.code, 1, 1)
+                    arm.branch(&mut c.code, elem_rc, 1)
+                    arm.load_into(&mut c.code, 2, 10)
+                    arm.emit(&mut c.code, 2432696320 + 1 * 1024 + 10 * 32 + 10)
+                    arm.store(&mut c.code, 2, 10); arm.branch(&mut c.code, head, 0)
+                    arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+                } else if kind == 7 {
+                    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+                    done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+                    arm.store(&mut c.code, 0, 0); arm.store(&mut c.code, 1, 1)
+                    if !ft.move_only(&c.types, ty) {
+                        arm.emit(&mut c.code, 3506438144 + 8 * 1024 + 0 * 32 + 10)
+                        store_mem(&mut c, 1, 10, 0)
+                    }
+                    first := c.types.declared.type_starts[ty]
+                    for v in first..first + c.types.declared.type_counts[ty] {
+                        next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
+                        arm.imm(&mut c.code, 1, c.types.field_values[v]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
+                        for i in 0..c.types.payload_counts[v] {
+                            pt := c.types.payload_types[c.types.payload_starts[v] + i]
+                            if pt < n && c.task_shared_rc_labels[pt] >= 0 {
+                                arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8)
+                                arm.load_into(&mut c.code, 1, 1); arm.branch(&mut c.code, c.task_shared_rc_labels[pt], 1)
+                            }
+                        }
+                        arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, next)
+                    }
+                    arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+                } else {
+                    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
+                    done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+                    arm.store(&mut c.code, 0, 0); arm.store(&mut c.code, 1, 1)
+                    first := c.types.declared.type_starts[ty]
+                    for i in 0..c.types.declared.type_counts[ty] {
+                        ft_ty := c.types.field_types[first + i]
+                        if ft_ty < n && c.task_shared_rc_labels[ft_ty] >= 0 {
+                            arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8)
+                            arm.load_into(&mut c.code, 1, 1); arm.branch(&mut c.code, c.task_shared_rc_labels[ft_ty], 1)
+                        }
+                    }
+                    arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+                }
+            }
+        }
+        if prep_needed[ty] {
+            arm.mark(&mut c.code, c.task_shared_prepare_labels[ty])
+            frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 1)
+            arm.branch(&mut c.code, c.task_iso_labels[ty], 1)
+            arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 1, 0)
+            arm.branch(&mut c.code, c.task_shared_rc_labels[ty], 1)
+            arm.load(&mut c.code, 0); arm.ret(&mut c.code)
+        }
+        if drop_needed[ty] {
+            arm.mark(&mut c.code, c.task_shared_drop_labels[ty])
+            frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 1)
+            done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
+            arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 1, 1)
+            arm.branch(&mut c.code, c.task_shared_rc_labels[ty], 1)
+            drop_label := type_helper(&mut c, ty, true)
+            arm.load(&mut c.code, 0); arm.branch(&mut c.code, drop_label, 1)
+            arm.mark(&mut c.code, done); arm.ret(&mut c.code)
+        }
+    }
+}
+
 fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runtime, record_takes: &mut record_take.Plan) -> Result {
     for id in 0..c.callback_labels.len { if c.callback_labels[id] >= 0 { callback_entry(&mut c, id) } }
     arm.mark(&mut c.code, c.float_trap); arm.exit(&mut c.code, 107)
@@ -6362,6 +7005,7 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
     assert(record_take.emit_array_take(&mut c.code, c.array_take))
     if record_take.status(&record_takes) == 2 { assert(record_take.emit_helpers(&mut c.code, &mut record_takes, c.array_take)) }
     if c.closure_header >= 0 { rt_emit.emit_closure_drop(&mut c.code, c.closure_drop, rt.release) }
+    emit_task_isolated_helpers(&mut c, &rt)
     nominal_clones(&mut c, &rt)
     arm.runtime(&mut c.code, c.print_int, c.print_bool, c.print_text, c.write, c.overflow, c.zero, c.assertion, c.io)
     if platform == 1 || platform == 2 {
