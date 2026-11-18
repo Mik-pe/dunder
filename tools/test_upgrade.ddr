@@ -1,0 +1,269 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import .probe_cli as cli
+import .release_fixture as fixture
+import std.bytes as bytes
+import std.fs as fs
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+@extern("c", "fopen")
+unsafe fn c_fopen(path: ptr, mode: ptr) -> ptr
+@extern("c", "fread")
+unsafe fn c_fread(buffer: ptr, size: usize, count: usize, file: ptr) -> usize
+@extern("c", "fclose")
+unsafe fn c_fclose(file: ptr) -> i32
+
+struct TestUpgrade {
+    work: string,
+    scratch: string,
+    mirror: string,
+    host: string,
+    compiler: string,
+    installed: string,
+    link: string,
+    original: []u8,
+}
+
+struct AssetOverrides {
+    archive_input: []u8,
+    archive_hash: string,
+    binary_hash: string,
+}
+
+fn defaults() -> AssetOverrides { AssetOverrides { archive_input: [], archive_hash: "", binary_hash: "" } }
+
+impl TestUpgrade {
+    fn run(&self, program: string, flags: []string, direct: string, status: i32, result: &mut process.Output) -> bool {
+        mut cmd := process.command(program.clone(), flags.clone())
+        cmd.set_env("DUNDER_RELEASES_URL", fixture.file_url(self.mirror) + "/")
+        cmd.set_env("TMPDIR", self.scratch.clone())
+        if direct.len > 0 { cmd.set_env("DUNDER_UPGRADE_URL", fixture.file_url(direct) + "/") }
+        else { cmd.unset_env("DUNDER_UPGRADE_URL") }
+        cmd.set_timeout(30000)
+        output := cmd.exec()
+        if !output.ok || output.timed_out || output.signal != 0 || output.code != status {
+            return harness.fail(f"expected {program} to exit {status}, got {output.code} (signal {output.signal}, timeout {output.timed_out})\n{output.stdout_text()}\n{output.stderr_text()}")
+        }
+        result = output
+        true
+    }
+
+    fn release(&self, directory: string, version: string, binary: &[]u8, options: &AssetOverrides) -> bool {
+        if !fs.mkdir_all(directory).ok { return harness.fail(f"cannot create mirror directory {directory}") }
+        archive_path := directory + "/" + self.host + ".gz"
+        if options.archive_input.len > 0 {
+            if !sys.write_u8(archive_path, &options.archive_input).ok { return harness.fail(f"cannot write {archive_path}") }
+        } else {
+            input := self.work + "/archive-input"
+            if !sys.write_u8(input, &binary).ok { return harness.fail(f"cannot write {input}") }
+            mut compressed := harness.empty_output()
+            if !harness.run_checked_timeout("gzip", ["-nc", input], self.work, 0, false, 30000, &mut compressed) { return false }
+            if !sys.write_u8(archive_path, &compressed.stdout).ok { return harness.fail(f"cannot write {archive_path}") }
+        }
+        archive_hash := if options.archive_hash.len == 0 { harness.sha256_file_hex(archive_path) } else { options.archive_hash.clone() }
+        binary_hash := if options.binary_hash.len == 0 { harness.sha256_bytes_hex(&binary) } else { options.binary_hash.clone() }
+        manifest := f"version={version}\n{self.host}.gz.sha256={archive_hash}\n{self.host}.sha256={binary_hash}\n"
+        sys.write_text(directory + "/release.txt", manifest).ok || harness.fail(f"cannot write {directory}/release.txt")
+    }
+
+    fn install_fixture(&self) -> bool {
+        stage := self.work + "/.fixture-stage"
+        defer { _ := sys.remove_file(stage) }
+        (sys.write_u8(stage, &self.original).ok && sys.make_executable(stage).ok && sys.rename(stage, self.installed).ok) ||
+            harness.fail(f"cannot install fixture at {self.installed}")
+    }
+
+    fn installed_matches(&self, expected: &[]u8, identity: string, unchanged: bool) -> bool {
+        actual := sys.read_u8(self.installed)
+        current := inode(self.installed)
+        contents := fs.list_dir(harness.parent_dir(self.installed))
+        scratch_files := fs.list_dir(self.scratch)
+        (actual.ok && bytes.equal(&actual.value, &expected) && current.len > 0 && (current == identity) == unchanged &&
+         fs.is_symlink(self.link) && contents.ok && contents.entries.len == 1 && contents.entries[0] == "dunder" &&
+         scratch_files.ok && scratch_files.entries.len == 0) || harness.fail(f"unexpected installation state at {self.installed}")
+    }
+
+    fn reject(&self, option: string, message: string, identity: string) -> bool {
+        mut result := harness.empty_output()
+        self.run(self.link, ["upgrade", option.clone()], "", 1, &mut result) &&
+            contains(result.stderr_text(), message) && self.installed_matches(&self.original, identity, true)
+    }
+
+    fn candidate(&self, version: string) -> sys.BytesResult {
+        source := self.work + "/v2.ddr"
+        destination := self.work + "/candidate"
+        program := f"fn main() {{ print(\"dunder {version} ({self.host})\") }}\n"
+        mut result := harness.empty_output()
+        if !sys.write_text(source, program).ok ||
+           !self.run(self.compiler, ["build", source.clone(), "-o", destination.clone()], "", 0, &mut result) {
+            return sys.BytesResult { ok: false, value: [], error: 1 }
+        }
+        sys.read_u8(destination)
+    }
+}
+
+fn inode(path: string) -> string {
+    mut args: []string = ["-c", "%d %i", path.clone()]
+    if target_is("macos") { args = ["-f", "%d %i", path.clone()] }
+    mut result := harness.empty_output()
+    if !harness.run_checked("stat", args, "", 0, false, &mut result) { return "" }
+    text.trim(result.stdout_text())
+}
+
+fn contains(output: string, expected: string) -> bool {
+    text.find(output, expected) >= 0 || harness.fail(f"expected {expected}\n{output}")
+}
+
+fn open_previous(path: string) -> ptr {
+    mut name: []u8 = []
+    bytes.append_utf8(&mut name, path)
+    name.push(0)
+    unsafe { c_fopen(addr(&name[0]), cstr("rb")) }
+}
+
+fn read_previous(file: ptr, expected: &[]u8) -> bool {
+    mut buffer: [u8; 8192] = [0; 8192]
+    mut offset := 0
+    unsafe {
+        while offset < expected.len {
+            remaining := expected.len - offset
+            count := if remaining < buffer.len { remaining } else { buffer.len }
+            read := c_fread(addr(&mut buffer[0]), 1, usize(count), file)
+            if read != usize(count) || !bytes.equal_memory(addr(&buffer[0]), addr(&expected[offset]), read) { return false }
+            offset += count
+        }
+        c_fread(addr(&mut buffer[0]), 1, 1, file) == 0
+    }
+}
+
+fn upgrade_replacing(suite: &TestUpgrade, flags: []string, old: &[]u8, result: &mut process.Output) -> bool {
+    previous := open_previous(suite.installed)
+    unsafe { if previous == ptr(0) { return harness.fail("cannot hold the original installer file open") } }
+    defer { unsafe { _ := c_fclose(previous) } }
+    suite.run(suite.link, flags, "", 0, &mut result) &&
+        (read_previous(previous, &old) || harness.fail("upgrade changed the previous inode"))
+}
+
+fn restore_fixture(suite: &TestUpgrade, replacement: &[]u8) -> bool {
+    previous := open_previous(suite.installed)
+    unsafe { if previous == ptr(0) { return harness.fail("cannot hold the upgraded file open") } }
+    defer { unsafe { _ := c_fclose(previous) } }
+    suite.install_fixture() && (read_previous(previous, &replacement) || harness.fail("fixture restore changed the previous inode"))
+}
+
+fn corrupt_assets(suite: &TestUpgrade, exact: string, target: string, other: string, option: string,
+                  new: &[]u8, initial: string) -> bool {
+    zeros := "0000000000000000000000000000000000000000000000000000000000000000"
+    if !suite.reject(option, "failed to download release archive", initial) ||
+       !suite.release(exact, other, &new, &defaults()) ||
+       !suite.reject(option, "does not match requested tag", initial) { return false }
+    mut overrides := defaults()
+    overrides.archive_hash = zeros.clone()
+    if !suite.release(exact, target, &new, &overrides) || !suite.reject(option, "SHA-256 mismatch", initial) { return false }
+    overrides = defaults()
+    bytes.append_utf8(&mut overrides.archive_input, "not gzip")
+    if !suite.release(exact, target, &new, &overrides) || !suite.reject(option, "failed to decompress", initial) { return false }
+    overrides = defaults()
+    overrides.binary_hash = zeros
+    if !suite.release(exact, target, &new, &overrides) || !suite.reject(option, "SHA-256 mismatch", initial) { return false }
+    mut invalid: []u8 = []
+    bytes.append_utf8(&mut invalid, "not executable")
+    if !suite.release(exact, target, &invalid, &defaults()) || !suite.reject(option, "failed self-check", initial) ||
+       !suite.release(exact, target, &suite.original, &defaults()) || !suite.reject(option, "wrong version", initial) { return false }
+    mut result := harness.empty_output()
+    suite.run(suite.link, ["upgrade", option.clone(), "--force"], "", 1, &mut result) &&
+        contains(result.stderr_text(), "wrong version or host") && suite.installed_matches(&suite.original, initial, true)
+}
+
+fn run_suite(suite: &TestUpgrade) -> bool {
+    mut result := harness.empty_output()
+    if !suite.run(suite.compiler, ["--version"], "", 0, &mut result) { return false }
+    version_text := result.stdout_text()
+    fields := text.split(version_text, " ")
+    if fields.len != 3 || fields[0] != "dunder" || fields[2] != f"({suite.host})\n" {
+        return harness.fail(f"invalid compiler version: {version_text}")
+    }
+    if !suite.run(suite.compiler, ["-V"], "", 0, &mut result) || !harness.stdout_is(&result, version_text, "-V") { return false }
+    version := fields[1].clone()
+    components := text.split(version, ".")
+    major := parse.integer(components[0])
+    if !major.ok || major.value > 9223372036854775805 { return harness.fail(f"invalid compiler version: {version}") }
+    target := (major.value + 1).str() + ".0.0"
+    other := (major.value + 2).str() + ".0.0"
+    tag := "v" + target
+    option := "--version=" + tag
+    if !suite.run(suite.compiler, ["upgrade", "--help"], "", 0, &mut result) ||
+       !contains(result.stdout_text(), "dunder upgrade") { return false }
+    invalid_flags: [][]string = [["--bad"], ["--version"], ["--version="], ["--version", "../bad"], ["--version", "one", "--version", "two"]]
+    for flags in invalid_flags {
+        mut args: []string = ["upgrade"]
+        for flag in flags { args.push(flag.clone()) }
+        if !suite.run(suite.compiler, args, "", 2, &mut result) { return false }
+    }
+    latest := suite.mirror + "/latest/download"
+    exact := suite.mirror + "/download/" + tag
+    if !suite.run(suite.compiler, ["upgrade", "--check", option.clone()], "", 1, &mut result) ||
+       !contains(result.stderr_text(), fixture.file_url(exact) + "/release.txt") ||
+       !suite.release(latest, version, &suite.original, &defaults()) ||
+       !suite.run(suite.compiler, ["upgrade", "--check"], "", 0, &mut result) ||
+       !contains(result.stdout_text(), "already up to date") { return false }
+    if !fs.mkdir_all(harness.parent_dir(suite.installed)).ok || !suite.install_fixture() ||
+       !fs.symlink(suite.installed, suite.link).ok { return harness.fail("cannot prepare installed compiler and symlink") }
+    initial := inode(suite.installed)
+    if initial.len == 0 { return false }
+    new := suite.candidate(target)
+    if !new.ok || !suite.release(exact, target, &new.value, &defaults()) ||
+       !sys.remove_file(exact + "/" + suite.host + ".gz").ok ||
+       !suite.run(suite.link, ["upgrade", "--check", "--version", tag.clone()], "", 0, &mut result) ||
+       !contains(result.stdout_text(), f"update available: {version} -> {target}") ||
+       !suite.installed_matches(&suite.original, initial, true) ||
+       !corrupt_assets(&suite, exact, target, other, option, &new.value, initial) { return false }
+    if !suite.release(exact, target, &new.value, &defaults()) ||
+       !suite.run(suite.link, ["upgrade", "--check"], exact, 0, &mut result) ||
+       !contains(result.stdout_text(), f"-> {target} ({suite.host})") ||
+       !suite.run(suite.link, ["upgrade", "--check", "--version=v" + other], exact, 1, &mut result) ||
+       !suite.run(suite.link, ["upgrade", "--check", "--force"], "", 0, &mut result) ||
+       !contains(result.stdout_text(), "already up to date") || !suite.installed_matches(&suite.original, initial, true) { return false }
+    next_version_text := f"dunder {target} ({suite.host})\n"
+    if !upgrade_replacing(&suite, ["upgrade", option.clone()], &suite.original, &mut result) ||
+       !contains(result.stdout_text(), f"upgraded {suite.installed} to {target} ({suite.host})") ||
+       !suite.installed_matches(&new.value, initial, false) ||
+       !suite.run(suite.link, ["--version"], "", 0, &mut result) || !harness.stdout_is(&result, next_version_text, suite.link) { return false }
+    upgraded := inode(suite.installed)
+    if upgraded.len == 0 || !restore_fixture(&suite, &new.value) || !suite.installed_matches(&suite.original, upgraded, false) ||
+       !suite.run(suite.link, ["--version"], "", 0, &mut result) || !harness.stdout_is(&result, version_text, suite.link) { return false }
+    restored := inode(suite.installed)
+    if restored.len == 0 || !suite.release(latest, target, &new.value, &defaults()) ||
+       !upgrade_replacing(&suite, ["upgrade"], &suite.original, &mut result) ||
+       !contains(result.stdout_text(), "to " + target) || !suite.installed_matches(&new.value, restored, false) ||
+       !suite.run(suite.link, ["--version"], "", 0, &mut result) || !harness.stdout_is(&result, next_version_text, suite.link) { return false }
+    print("PASS test-upgrade")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_upgrade COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    host := process.host_target()
+    original := sys.read_u8(compiler)
+    if host.len == 0 || !original.ok { _ := harness.fail("unsupported host or unreadable compiler"); return 2 }
+    temp := fs.temp_dir("dunder-upgrade-test-")
+    if !temp.ok { _ := harness.fail("cannot create upgrade test directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    real := fs.realpath(temp.value)
+    if !real.ok { _ := harness.fail("cannot resolve upgrade test directory"); return 1 }
+    work := real.value
+    scratch := work + "/tmp"
+    if !fs.mkdir_all(scratch).ok { _ := harness.fail("cannot create updater scratch directory"); return 1 }
+    suite := TestUpgrade { work: work.clone(), scratch: scratch, mirror: work + "/mirror", host: host.clone(),
+                          compiler: compiler, installed: f"{work}/build/selfhost/{host}/dunder",
+                          link: work + "/dunder link", original: original.value }
+    if run_suite(&suite) { 0 } else { 1 }
+}

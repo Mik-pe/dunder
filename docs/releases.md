@@ -64,10 +64,10 @@ i manifestet. Nyckeln `<mål>.gz.sha256` gäller gzip-arkivet och
 `dunder upgrade` läser manifestet från GitHubs senaste stabila release.
 `dunder upgrade --version v0.3.0` väljer den namngivna releasen.
 
-`python3 tools/test-release.py` provar paketering, avbruten uppladdning och
+`dunder run tools/test_release.ddr` provar paketering, avbruten uppladdning och
 omkörning i en lokal Git-kopia med simulerad GitHub CLI.
 
-`python3 tools/test-upgrade.py KOMPILATOR` provar den nativa uppgraderaren
+`dunder run tools/test_upgrade.ddr -- KOMPILATOR` provar den nativa uppgraderaren
 mot lokala releasefiler. Både namngivna och senaste releaser måste ersätta
 filen atomiskt, bevara symlänken och lämna den tidigare filens innehåll
 orört för en redan öppen läsare. Även fixturens återställning använder en
