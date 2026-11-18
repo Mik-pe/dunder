@@ -1,0 +1,352 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_contract_data as data
+import .mir_contracts as contracts
+import .mir_oracle as oracle
+import .mir_source_contracts as sources
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Row {
+    item: data.ScalarCase,
+    target: string,
+    mode: string,
+    sha256: string,
+    steps: i32,
+    coverage: Map<string, i32>,
+    model: oracle.Model,
+    gap: string,
+}
+
+fn emit(runner: &mut contracts.Runner, executable: string, image: string, target: i32, mode: string,
+        item: &data.ScalarCase, model: &mut oracle.Model) -> bool {
+    mut result := harness.empty_output()
+    if !runner.call(executable, [image.clone(), target.str(), mode.clone(), item.name.clone(),
+                                 item.a.str(), item.b.str(), item.expected.str()], 0, &mut result) { return false }
+    if result.stderr.len != 0 { return runner.fail(f"{item.name}: {result.stderr_text()}") }
+    output := result.stdout_text()
+    decoded := oracle.decode(output)
+    if !decoded.ok { return runner.fail(f"{item.name}: invalid semantic MIR:\n{output}") }
+    model = decoded
+    true
+}
+
+fn check_case(runner: &mut contracts.Runner, executable: string, item: &data.ScalarCase, index: i32, fuel: i32, rows: &mut []Row) -> bool {
+    for target in 0..3 {
+        mut plain := ""
+        for mode in ["plain", "roundtrip", "canonical"] {
+            image := f"{runner.work}/oracle-{index}-{target}-{mode}"
+            mut model := oracle.Model { ok: false, operations: [], places: [], labels: Map<i64, i64>::new(), order: [] }
+            if !emit(&mut runner, executable, image, target, mode, &item, &mut model) { return false }
+            mut machine := oracle.Machine::new()
+            got := machine.run(&model, fuel)
+            if got.state == .Exhausted { runner.add("unexpected_incomplete", 1) }
+            if got.state != .Complete || got.value != oracle.bits(item.expected) {
+                return runner.fail(f"{item.name}: inputs {item.a}, {item.b}, {mode}, target {target}: expected {item.expected}, got {oracle.signed(got.value, 64)} {got.reason}")
+            }
+            runner.add("completed_interpreter_runs", 1)
+            if i64(got.steps) > runner.count("max_steps") { runner.set("max_steps", i64(got.steps)) }
+            if !runner.execute(image, target, "", 0) { return false }
+            digest := harness.sha256_file_hex(image)
+            if mode == "plain" { plain = digest.clone() }
+            else if mode == "roundtrip" && digest != plain {
+                return runner.fail(f"{item.name}: retained roundtrip changed bytes for target {target}")
+            }
+            runner.add("oracle_images", 1)
+            if runner.record {
+                rows.push(Row { item: item.clone(), target: harness.target_name(target), mode: mode.clone(), sha256: digest,
+                                steps: got.steps, coverage: machine.coverage, model: model, gap: "" })
+            }
+        }
+    }
+    true
+}
+
+fn check_rejections(runner: &mut contracts.Runner, executable: string) -> bool {
+    mut result := harness.empty_output()
+    for field in ["effects", "type", "extension", "reads", "writes", "clobbers"] {
+        for target in 0..3 {
+            image := f"{runner.work}/reject-{field}-{target}"
+            if !runner.call(executable, [image.clone(), target.str(), "reject-" + field, "signed-load", "-1", "0", "-1"],
+                            0, &mut result) { return false }
+            if result.stdout_text() != "REJECTED\n" || sys.metadata(image).ok {
+                return runner.fail(f"{field}: metadata rejection did not preserve the destination for target {target}")
+            }
+            runner.add("canonical_metadata_rejections", 1)
+        }
+    }
+    true
+}
+
+fn check_gaps(runner: &mut contracts.Runner, executable: string, fuel: i32, rows: &mut []Row) -> bool {
+    host := runner.host
+    for name in ["opaque", "external", "cycle"] {
+        image := runner.work + "/" + name
+        item := data.ScalarCase { name: name.clone(), a: 1, b: 2, expected: 3 }
+        mut model := oracle.Model { ok: false, operations: [], places: [], labels: Map<i64, i64>::new(), order: [] }
+        if !emit(&mut runner, executable, image, host, "plain", &item, &mut model) { return false }
+        mut machine := oracle.Machine::new()
+        result := machine.run(&model, 100)
+        state := if name == "cycle" { oracle.State.Exhausted } else { oracle.State.Gap }
+        if result.state != state || sys.metadata(image).ok {
+            return runner.fail(f"{name}: unsupported or fuel-limited case falsely completed")
+        }
+        field := if state == .Exhausted { "expected_incomplete" } else { "expected_coverage_gaps" }
+        runner.add(field, 1)
+        if runner.record {
+            rows.push(Row { item: item, target: "", mode: "", sha256: "", steps: 0,
+                            coverage: machine.coverage, model: model, gap: result.reason })
+        }
+    }
+    item := data.ScalarCase { name: "add", a: 1, b: 2, expected: 4 }
+    for target in 0..3 {
+        image := f"{runner.work}/wrong-result-{target}"
+        mut model := oracle.Model { ok: false, operations: [], places: [], labels: Map<i64, i64>::new(), order: [] }
+        if !emit(&mut runner, executable, image, target, "roundtrip", &item, &mut model) { return false }
+        mut machine := oracle.Machine::new()
+        result := machine.run(&model, fuel)
+        if result.state != .Gap || text.find(result.reason, "external branch") < 0 {
+            return runner.fail(f"incorrect expected result escaped the comparison on target {target}: {result.reason}")
+        }
+        if !runner.execute(image, target, "", 104) { return false }
+        runner.add("negative_runtime_controls", 1)
+    }
+    true
+}
+
+fn run_oracle(runner: &mut contracts.Runner, root: string, source_root: string, fuel: i32, rows: &mut []Row) -> bool {
+    executable := runner.compile_fixture("mir-oracle.ddr", source_root, root, "")
+    if executable.len == 0 { return false }
+    cases := data.scalar_cases()
+    for i in 0..cases.len {
+        if !check_case(&mut runner, executable, &cases[i], i, fuel, &mut rows) { return false }
+    }
+    if !check_rejections(&mut runner, executable) || !check_gaps(&mut runner, executable, fuel, &mut rows) { return false }
+    print("PASS semantic MIR scalar/frame/CFG oracle; explicit gaps and fuel limit")
+    true
+}
+
+fn write_model(writer: &mut json.Writer, model: &oracle.Model) {
+    writer.object()
+    writer.key("operations")
+    writer.array()
+    for op in model.operations {
+        writer.object()
+        writer.key("kind")
+        writer.integer(op.kind)
+        writer.key("opcode")
+        writer.integer(op.opcode)
+        writer.key("dst")
+        writer.integer(op.dst)
+        writer.key("a")
+        writer.integer(op.a)
+        writer.key("b")
+        writer.integer(op.b)
+        writer.key("c")
+        writer.integer(op.c)
+        writer.key("imm")
+        writer.integer(op.imm)
+        writer.key("aux")
+        writer.integer(op.aux)
+        writer.key("type")
+        writer.integer(op.type)
+        writer.key("place")
+        writer.integer(op.place)
+        writer.key("extension")
+        writer.integer(op.extension)
+        writer.key("effects")
+        writer.integer(op.effects)
+        writer.key("flags")
+        writer.integer(op.flags)
+        writer.key("abi")
+        writer.integer(op.abi)
+        writer.key("reads")
+        writer.integer(op.reads)
+        writer.key("writes")
+        writer.integer(op.writes)
+        writer.key("clobbers")
+        writer.integer(op.clobbers)
+        writer.key("mode")
+        writer.integer(op.mode)
+        writer.key("target")
+        writer.integer(op.target)
+        writer.end()
+    }
+    writer.end()
+    writer.key("places")
+    writer.array()
+    for place in model.places {
+        writer.object()
+        writer.key("kind")
+        writer.integer(place.kind)
+        writer.key("offset")
+        writer.integer(place.offset)
+        writer.key("width")
+        writer.integer(place.width)
+        writer.end()
+    }
+    writer.end()
+    writer.key("labels")
+    writer.array()
+    for i in 0..model.labels.len() {
+        writer.array()
+        writer.integer(model.labels.key_at(i))
+        writer.integer(model.labels.value_at(i))
+        writer.end()
+    }
+    writer.end()
+    writer.key("order")
+    writer.array()
+    for index in model.order { writer.integer(i64(index)) }
+    writer.end()
+    writer.end()
+}
+
+fn write_rows(writer: &mut json.Writer, rows: &[]Row) {
+    writer.array()
+    for row in rows {
+        writer.object()
+        writer.key("case")
+        writer.string(row.item.name)
+        if row.gap.len > 0 {
+            writer.key("expected_gap")
+            writer.string(row.gap)
+        } else {
+            writer.key("left")
+            writer.integer(row.item.a)
+            writer.key("right")
+            writer.integer(row.item.b)
+            writer.key("expected")
+            writer.integer(row.item.expected)
+            writer.key("target")
+            writer.string(row.target)
+            writer.key("mode")
+            writer.string(row.mode)
+            writer.key("sha256")
+            writer.string(row.sha256)
+            writer.key("steps")
+            writer.integer(i64(row.steps))
+            writer.key("coverage")
+            writer.object()
+            for i in 0..row.coverage.len() {
+                writer.key(row.coverage.key_at(i))
+                writer.integer(i64(row.coverage.value_at(i)))
+            }
+            writer.end()
+        }
+        writer.key("model")
+        write_model(&mut writer, &row.model)
+        writer.end()
+    }
+    writer.end()
+}
+
+fn hash_inputs(root: string, source_root: string, reference: string, compiler: string, paths: &mut Map<string, string>) -> bool {
+    if !contracts.add_hash(&mut paths, compiler) || !contracts.hash_tree(&mut paths, source_root + "/selfhost") { return false }
+    for rel in ["tools/test_mir.ddr", "tools/mir_source_contracts.ddr", "tools/mir_contracts.ddr", "tools/mir_oracle.ddr",
+                "tools/mir_contract_data.ddr", "tests/fixtures/mir-consumer.ddr", "tests/fixtures/mir-oracle.ddr"] {
+        if !contracts.add_hash(&mut paths, root + "/" + rel) { return false }
+    }
+    if reference.len > 0 &&
+       (!contracts.hash_tree(&mut paths, reference + "/selfhost") ||
+        !contracts.add_hash(&mut paths, reference + "/tests/fixtures/mir-consumer.ddr")) { return false }
+    true
+}
+
+fn save(path: string, scope: string, fuel: i64, runner: &contracts.Runner, hashes: &Map<string, string>,
+        semantic_rows: &[]Row, source_rows: &[]sources.Row) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("complete")
+    writer.boolean(runner.error.len == 0)
+    writer.key("scope")
+    writer.string(scope)
+    writer.key("hashes")
+    writer.object()
+    for i in 0..hashes.len() {
+        writer.key(hashes.key_at(i))
+        writer.string(hashes.value_at(i))
+    }
+    writer.end()
+    writer.key("host")
+    contracts.write_host(&mut writer)
+    writer.key("commands")
+    runner.write_commands(&mut writer)
+    writer.key("oracle")
+    write_rows(&mut writer, &semantic_rows)
+    writer.key("sources")
+    sources.write_rows(&mut writer, &source_rows)
+    writer.key("fuel")
+    writer.integer(fuel)
+    writer.key("limitations")
+    writer.array()
+    for line in [
+        "Nonhost Linux/macOS images are cross-built, not executed",
+        "Interpreter covers scalar/frame/CFG, not arbitrary calls, ARC, FP or external memory",
+        "Interpreted functions are closed generated kernels; owned source functions have runtime differential coverage",
+        "Canonical lowering changes only Constant/Copy/Load/Store in this cohort; other operations retain their encodings",
+        "Whole-source executions cover owned/call semantics independently of the closed interpreter subset",
+        "Raw division excludes zero and MIN/-1; checked source cases cover their trap semantics",
+        "Deterministic finite inputs and fuel do not constitute a universal proof",
+    ] { writer.string(line) }
+    writer.end()
+    writer.key("counts")
+    writer.object()
+    for name in move runner.count_keys() { writer.key(name); writer.integer(runner.count(name)) }
+    writer.end()
+    if runner.error.len > 0 { writer.key("error"); writer.string(runner.error) }
+    writer.end()
+    evidence.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--source-root"), cli.option("--only"), cli.option("--reference-root"),
+                           cli.option("--fuel"), cli.option("--report")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_mir <compiler> [--source-root PATH] [--only all|oracle|source] [--reference-root PATH] [--fuel N] [--report PATH]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    scope := args.last("--only", "all")
+    if scope != "all" && scope != "source" && scope != "oracle" {
+        _ := sys.eprint("--only must be all, oracle or source")
+        return 2
+    }
+    fuel := parse.integer(args.last("--fuel", "10000"))
+    if !fuel.ok || fuel.value < 100 { _ := sys.eprint("--fuel must be at least 100"); return 2 }
+    limit := if fuel.value > 2147483647 { 2147483647 } else { i32(fuel.value) }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    source_root := fs.realpath(args.last("--source-root", root))
+    if !source_root.ok { _ := harness.fail("invalid source root"); return 2 }
+    mut reference := ""
+    if args.has("--reference-root") {
+        resolved := fs.realpath(args.last("--reference-root", ""))
+        if !resolved.ok { _ := harness.fail("invalid reference root"); return 2 }
+        reference = resolved.value
+    }
+    mut hashes := Map<string, string>::new()
+    if !hash_inputs(root, source_root.value, reference, compiler, &mut hashes) { return 1 }
+    tmp := fs.temp_dir("dunder-mir-qa-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    work := fs.realpath(tmp.value)
+    if !work.ok { return 1 }
+    destination := args.last("--report", "")
+    mut runner := contracts.Runner::new(compiler, work.value, destination.len > 0)
+    mut rows: []Row = []
+    mut source_rows: []sources.Row = []
+    passed := (scope == "source" || run_oracle(&mut runner, root, source_root.value, limit, &mut rows)) &&
+              (scope == "oracle" || sources.run(&mut runner, root, source_root.value, reference, &mut source_rows))
+    if passed && !contracts.unchanged(&hashes) { _ := runner.fail("compiler/source changed during suite") }
+    if !passed && runner.error.len == 0 { _ := runner.fail("MIR suite failed") }
+    if destination.len > 0 && !save(destination, scope, fuel.value, &runner, &hashes, &rows, &source_rows) { return 1 }
+    if runner.error.len != 0 { return 1 }
+    print(runner.count_summary())
+    0
+}

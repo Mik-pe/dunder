@@ -1,0 +1,174 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+fn call(tool: string, args: []string, work: string, status: i32, output: &mut process.Output) -> bool {
+    harness.run_checked_timeout(tool, args, work, status, false, 60000, &mut output)
+}
+
+fn execute(image: string, work: string, status: i32, expected: string) -> bool {
+    mut output := harness.empty_output()
+    harness.run_checked_timeout(image, [], work, status, false, 30000, &mut output) &&
+        harness.stdout_is(&output, expected, image)
+}
+
+fn check_bindings(compiler: string, work: string, source: string, host: string) -> bool {
+    mut output := harness.empty_output()
+    for target in harness.targets() {
+        mut first := ""
+        for scalar in ["off", "on"] {
+            for ownership in ["off", "on"] {
+                scalar_flag := "--scalar-opt=" + scalar
+                owner_flag := "--ownership-opt=" + ownership
+                if !call(compiler, ["check", source.clone(), "--agent", "--target", target.clone(), scalar_flag.clone(), owner_flag.clone()],
+                         work, 0, &mut output) || !harness.agent_ok(&output) { return false }
+                report := output.stdout_text()
+                for line in move harness.lines(report) {
+                    row := json.Doc::parse_text(line)
+                    if !row.ok { return harness.fail(f"{target}: invalid binding report: {line}") }
+                }
+                if first.len == 0 { first = report.clone() }
+                else if report != first { return harness.fail(f"{target}: ownership or scalar optimization changed bindings") }
+                image := f"{work}/fixture-{target}-{scalar}-{ownership}"
+                if !call(compiler, ["build", source.clone(), "-o", image.clone(), "--target", target.clone(), scalar_flag, owner_flag],
+                         work, 0, &mut output) || (target == host && !execute(image, work, 0, "42\n")) { return false }
+            }
+        }
+    }
+    true
+}
+
+fn check_diagnostics(compiler: string, baseline: string, work: string) -> bool {
+    invalid := [
+        "fn main(){print(\"a\"==true)}",
+        "fn unused()->string{true} fn main(){print(\"a\"==\"b\")}",
+        "fn main(){value:=\"a\";value=\"b\"}",
+        "fn main(){values:=[\"a\"];values[0]=\"b\"}",
+        "fn main(){print(\"a\"==missing)}",
+    ]
+    image := work + "/previous-image"
+    mut result := harness.empty_output()
+    for i in 0..invalid.len {
+        path := f"{work}/invalid-{i}.ddr"
+        if !sys.write_text(path, invalid[i]).ok { return harness.fail(f"cannot write {path}") }
+        for target in harness.targets() {
+            mut expected := ""
+            mut expected_stderr := ""
+            for ownership in ["off", "on"] {
+                flag := "--ownership-opt=" + ownership
+                if !call(compiler, ["check", path.clone(), "--agent", "--target", target.clone(), flag.clone()], work, 1, &mut result) { return false }
+                stdout := result.stdout_text()
+                doc := json.Doc::parse_text(stdout)
+                message := doc.get_str(doc.root, "message")
+                if !doc.ok || !message.ok { return harness.fail(f"{path}: missing diagnostic: {stdout}") }
+                if !sys.write_text(image, "previous image").ok { return harness.fail(f"cannot write {image}") }
+                if !call(compiler, ["build", path.clone(), "-o", image.clone(), "--target", target.clone(), flag],
+                         work, 1, &mut result) { return false }
+                stderr := result.stderr_text()
+                previous := sys.read_text(image)
+                if !previous.ok || previous.value != "previous image" || text.find(stderr, message.value) < 0 {
+                    return harness.fail(f"{path}: build diagnostic or output changed:\n{stderr}")
+                }
+                if ownership == "off" {
+                    expected = stdout.clone()
+                    expected_stderr = stderr.clone()
+                } else if expected != stdout || expected_stderr != stderr {
+                    return harness.fail(f"{path}: diagnostics differ for {target}:\n{expected}\n{stdout}\n{expected_stderr}\n{stderr}")
+                }
+            }
+            if baseline.len > 0 {
+                if !call(baseline, ["check", path.clone(), "--agent", "--target", target.clone()], work, 1, &mut result) { return false }
+                if result.stdout_text() != expected { return harness.fail(f"{path}: baseline diagnostic differs for {target}") }
+            }
+        }
+    }
+    true
+}
+
+fn check_profiles(compiler: string, work: string, source: string) -> bool {
+    code := "fn lhs()->string{41.str()} fn rhs()->string{42.str()} fn main(){print(lhs()+rhs())}"
+    if !sys.write_text(source, code).ok { return harness.fail(f"cannot write {source}") }
+    mut result := harness.empty_output()
+    for ownership in ["off", "on"] {
+        image := f"{work}/owned-left-{ownership}"
+        if !call(compiler, ["build", source.clone(), "-o", image.clone(), "--runtime-profile", "--ownership-opt=" + ownership], work, 0, &mut result) ||
+           !call(image, [], work, 0, &mut result) || !harness.stdout_is(&result, "4142\n", image) { return false }
+        report := result.stderr_text()
+        doc := json.Doc::parse_text(report)
+        counters := doc.field(doc.root, "counters")
+        retains := doc.get_i64(counters, "retain_calls")
+        releases := doc.get_i64(counters, "release_calls")
+        if !retains.ok || !releases.ok || retains.value != 0 || releases.value > 8 {
+            return harness.fail(f"unnecessary straight-line owner traffic: {report}")
+        }
+    }
+
+    loop := "fn temp(i:i32)->string{i.str()} fn main(){mut i:=0;while temp(i)!=\"4000\"{i=i+1};print(i)}"
+    if !sys.write_text(source, loop).ok { return harness.fail(f"cannot write {source}") }
+    image := work + "/reentered-condition"
+    if !call(compiler, ["build", source.clone(), "-o", image.clone(), "--runtime-profile"], work, 0, &mut result) ||
+       !call(image, [], work, 0, &mut result) || !harness.stdout_is(&result, "4000\n", image) { return false }
+    doc := json.Doc::parse_text(result.stderr_text())
+    fresh := doc.get_i64(doc.field(doc.root, "counters"), "fresh_allocations")
+    (fresh.ok && fresh.value <= 2) ||
+        harness.fail(f"while condition leaked its previous temporary on the backedge:\n{result.stderr_text()}")
+}
+
+fn check_imports_and_traps(compiler: string, work: string, source: string, host: string) -> bool {
+    imported := "capability unsafe\n@extern(\"c\",\"abs\") unsafe fn c_abs(x:i32)->i32\n" +
+                "fn main(){left:=\"yes\";choices:=[\"no\",\"yes\"];unsafe{assert(left==choices[c_abs(-1)])};print(42)}"
+    if !sys.write_text(source, imported).ok { return harness.fail(f"cannot write {source}") }
+    mut result := harness.empty_output()
+    for mir in ["off", "on"] {
+        image := f"{work}/imported-right-{mir}"
+        if !call(compiler, ["build", source.clone(), "-o", image.clone(), "--mir=" + mir], work, 0, &mut result) ||
+           !execute(image, work, 0, "42\n") { return false }
+    }
+    traps: [](string, i32) = [
+        ("fn main(){a:=[\"a\"];assert(\"a\"==a[2])}", 103),
+        ("fn main(){a:=[\"a\"];zero:=0;assert(\"a\"==a[1/zero])}", 102),
+    ]
+    for i in 0..traps.len {
+        if !sys.write_text(source, traps[i].0).ok { return harness.fail(f"cannot write {source}") }
+        for ownership in ["off", "on"] {
+            image := f"{work}/trap-{i}-{host}-{ownership}"
+            if !call(compiler, ["build", source.clone(), "-o", image.clone(), "--target", host.clone(), "--ownership-opt=" + ownership],
+                     work, 0, &mut result) || !execute(image, work, traps[i].1, "") { return false }
+        }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--baseline")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_ownership_leases <compiler> [--baseline PATH]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    mut baseline := ""
+    if args.has("--baseline") {
+        path := fs.realpath(args.last("--baseline", ""))
+        if !path.ok { _ := harness.fail("invalid baseline compiler"); return 2 }
+        baseline = path.value
+    }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    tmp := fs.temp_dir("dunder-ownership-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    source := work + "/main.ddr"
+    fixture := sys.read_text(root + "/tests/fixtures/ownership_leases.ddr")
+    if !fixture.ok || !sys.write_text(source, fixture.value).ok { return 1 }
+    host := process.host_target()
+    if !check_bindings(compiler, work, source, host) || !check_diagnostics(compiler, baseline, work) ||
+       !check_profiles(compiler, work, source) || !check_imports_and_traps(compiler, work, source, host) { return 1 }
+    print("ownership leases: all targets, binding/diagnostic equality, lifetimes and traps passed")
+    0
+}

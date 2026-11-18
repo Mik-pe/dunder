@@ -1,0 +1,283 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import .mir_contracts as contracts
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.parse as parse
+import sys
+
+@extern("c", "truncate") unsafe fn resize(path: ptr, size: i64) -> i32
+
+fn sparse(path: string, size: i64) -> bool {
+    mut name: []u8 = []
+    bytes.append_utf8(&mut name, path)
+    name.push(u8(0))
+    empty: []u8 = []
+    if !sys.write_u8(path, &empty).ok { return false }
+    unsafe { resize(addr(&name[0]), size) == 0 }
+}
+
+fn payload(blob: &[]u8) -> []i64 {
+    if blob.len < 184 || (blob.len - 128) % 8 != 0 { return [] }
+    raw := bytes.decode_range(&blob, 128, blob.len)
+    if !raw.ok { return [] }
+    mut result: []i64 = []
+    for i in 0..(raw.value.len / 8) {
+        from := i * 8
+        number := parse.hex(raw.value[from..from + 8])
+        if !number.ok || number.value < 0 { return [] }
+        result.push(number.value)
+    }
+    result
+}
+
+fn signed(key: &[]u8, raw: &[]u8) -> []u8 {
+    mut material: []u8 = []
+    bytes.extend_range(&mut material, &key, 0, key.len)
+    bytes.extend_range(&mut material, &raw, 0, raw.len)
+    mut record: []u8 = []
+    bytes.extend_range(&mut record, &key, 0, key.len)
+    bytes.append_utf8(&mut record, harness.sha256_bytes_hex(&material))
+    bytes.extend_range(&mut record, &raw, 0, raw.len)
+    record
+}
+
+fn packed(key: &[]u8, words: &[]i64) -> []u8 {
+    mut raw: []u8 = []
+    for value in words { bytes.append_utf8(&mut raw, f"{value:08x}") }
+    signed(&key, &raw)
+}
+
+struct Suite {
+    runner: contracts.Runner,
+    fixture: string,
+    images: i32,
+}
+
+impl Suite {
+    fn call(&mut self, args: []string, expected: string) -> bool {
+        mut output := harness.empty_output()
+        path := self.fixture.clone()
+        if !self.runner.call(path, args, 0, &mut output) { return false }
+        if output.stdout_text() != expected { return self.runner.fail(f"{path}: expected {expected}, got {output.stdout_text()}") }
+        true
+    }
+
+    fn reject(&mut self, cache: string, target: i32, limit: i32, budget: i32) -> bool {
+        if !self.call(["restore", cache.clone(), target.str(), self.runner.work + "/unused", "0",
+                       limit.str(), budget.str(), "no"], "0\n") {
+            return false
+        }
+        self.runner.add("rejections", 1)
+        true
+    }
+
+    fn bad(&mut self, label: string, bytes_in: &[]u8, target: i32, limit: i32, budget: i32) -> bool {
+        path := f"{self.runner.work}/{target}-{label}.fn"
+        if !sys.write_u8(path, &bytes_in).ok { return self.runner.fail(f"cannot write {path}") }
+        self.reject(path, target, limit, budget)
+    }
+}
+
+fn malformed(s: &mut Suite, key: &[]u8, words: &[]i64, target: i32, limit: i32) -> bool {
+    if words.len < 7 || words[3] < 3 || words[4] < 3 || words[5] != 3 || words[2] > i64(words.len) ||
+       words[3] > i64(words.len) || words[4] > i64(words.len) { return s.runner.fail("invalid fixture fragment layout") }
+    word_count := i32(words[2])
+    labels := i32(words[3])
+    relocations := i32(words[4])
+    label_at := 7 + word_count
+    reloc_at := label_at + labels
+    deps_at := reloc_at + 3 * relocations
+    if deps_at + 3 > words.len { return s.runner.fail("fixture dependency array is truncated") }
+    changes: [](string, i32, i64) = [
+        ("magic", 0, 0), ("version", 1, 2), ("zero-words", 2, 0),
+        ("huge-words", 2, 0xffffffff), ("huge-labels", 3, 0xffffffff), ("huge-relocs", 4, 0xffffffff),
+        ("too-many-deps", 5, 257), ("bad-dep-count", 5, 2), ("charge-cap", 6, 4097),
+        ("negative-charge", 6, 0xffffffff), ("bad-label", label_at, i64(word_count + 1)),
+        ("reloc-offset", reloc_at, i64(word_count)), ("reloc-kind", reloc_at + 2, 21),
+        ("conditional-width", reloc_at, i64(word_count - 1)), ("private-target", reloc_at + 1, i64(labels)),
+        ("unbound-private-target", reloc_at + 1, i64(labels - 1)), ("global-target", reloc_at + 1, 0x80000003),
+        ("huge-global-target", reloc_at + 1, 0xffffffff), ("duplicate-dep", deps_at + 1, words[deps_at]),
+        ("unsorted-dep", deps_at + 1, 1), ("unknown-dep", deps_at + 2, 16), ("negative-dep", deps_at, 0xffffffff),
+    ]
+    for i in 0..changes.len {
+        mut copy := words.clone()
+        copy[changes[i].1] = changes[i].2
+        record := packed(&key, &copy)
+        if !s.bad(changes[i].0, &record, target, limit, 65536) { return false }
+    }
+    mut copy := words.clone()
+    _ := copy.pop()
+    missing := packed(&key, &copy)
+    copy.push(words[words.len - 1])
+    copy.push(0)
+    extra := packed(&key, &copy)
+    s.bad("truncated-word", &missing, target, limit, 65536) &&
+        s.bad("extra-word", &extra, target, limit, 65536)
+}
+
+fn corrupt_bytes(s: &mut Suite, key: &[]u8, blob: &[]u8, target: i32, limit: i32, budget: i32) -> bool {
+    for name in ["non-hex", "invalid-utf8", "utf8-payload", "unaligned", "header-only"] {
+        mut raw: []u8 = []
+        if name == "non-hex" || name == "invalid-utf8" {
+            byte: u8 = if name == "non-hex" { 103 } else { 255 }
+            raw.push(byte)
+            bytes.extend_range(&mut raw, &blob, 129, blob.len)
+        } else if name == "utf8-payload" {
+            bytes.append_utf8(&mut raw, "å")
+            bytes.extend_range(&mut raw, &blob, 130, blob.len)
+        } else if name == "unaligned" {
+            bytes.extend_range(&mut raw, &blob, 128, blob.len)
+            raw.push(b'0')
+        } else {
+            bytes.extend_range(&mut raw, &blob, 128, 184)
+        }
+        record := signed(&key, &raw)
+        if !s.bad(name, &record, target, limit, budget) { return false }
+    }
+    for name in ["bad-signature", "utf8-signature-boundary", "invalid-utf8-key", "wrong-key", "short-file", "empty-file"] {
+        mut data: []u8 = []
+        if name == "bad-signature" || name == "utf8-signature-boundary" {
+            bytes.extend_range(&mut data, &key, 0, key.len)
+            zeros := if name == "bad-signature" { 64 } else { 63 }
+            for _ in 0..zeros { data.push(b'0') }
+            if name == "utf8-signature-boundary" { bytes.append_utf8(&mut data, "å") }
+            start := if name == "bad-signature" { 128 } else { 129 }
+            bytes.extend_range(&mut data, &blob, start, blob.len)
+        } else if name == "invalid-utf8-key" {
+            data.push(u8(255))
+            bytes.extend_range(&mut data, &blob, 1, blob.len)
+        } else if name == "wrong-key" {
+            for _ in 0..64 { data.push(b'0') }
+            bytes.extend_range(&mut data, &blob, 64, blob.len)
+        } else if name == "short-file" {
+            bytes.extend_range(&mut data, &blob, 0, 128)
+        }
+        if !s.bad(name, &data, target, limit, budget) { return false }
+    }
+    true
+}
+
+fn normal_rejections(s: &mut Suite, cache: string, blob: &[]u8, words: &[]i64, target: i32, limit: i32, budget: i32) -> bool {
+    target_arg := target.str()
+    work := s.runner.work.clone()
+    mut key: []u8 = []
+    bytes.extend_range(&mut key, &blob, 0, 64)
+    if !s.call(["save-invalid", f"{work}/invalid-save-{target}", target_arg.clone(), work + "/unused", "0"], "42\n") { return false }
+    minimum := f"{work}/{target}-minimum.fn"
+    minimal_words: []i64 = [0x44554644, 1, 1, 0, 0, 0, 0, 3596551104]
+    neutral := packed(&key, &minimal_words)
+    if !sys.write_u8(minimum, &neutral).ok ||
+       !s.call(["restore-minimum", minimum, target_arg.clone(), work + "/unused", "0", "0", "0", "yes", "empty"], "42\n") { return false }
+    if words[2] < 0 || words[3] < 0 || words[4] < 0 || words[2] + words[3] + 3 * words[4] > i64(words.len - 7) {
+        return s.runner.fail("invalid size of native3 rejection fixture")
+    }
+    count := i32(words[2] + words[3] + 3 * words[4])
+    mut headerless: []i64 = [words[2], words[3], words[4]]
+    for i in 7..(7 + count) { headerless.push(words[i]) }
+    obsolete: []i64 = [1, 0, 0, 3596551104]
+    for name in ["native3", "native3-minimum"] {
+        path := f"{work}/{target}-{name}.fn"
+        record := if name == "native3" { packed(&key, &headerless) } else { packed(&key, &obsolete) }
+        image := work + "/unchanged-image"
+        if !sys.write_u8(path, &record).ok || !sys.write_text(image, "previous image").ok ||
+           !s.call(["restore", path, target_arg.clone(), image.clone(), "0", limit.str(), budget.str(), "no"], "0\n") { return false }
+        previous := sys.read_text(image)
+        if !previous.ok || previous.value != "previous image" { return s.runner.fail("obsolete cache replaced a previous image") }
+        s.runner.add("rejections", 1)
+    }
+    for guard in ["marked", "checking", "entry", "globals", "reloc-arrays"] {
+        if !s.call(["restore", cache.clone(), target_arg.clone(), work + "/unused", "0", limit.str(), budget.str(), "no",
+                    "normal", guard.clone()], "0\n") { return false }
+        s.runner.add("rejections", 1)
+    }
+    malformed(&mut s, &key, &words, target, limit) && corrupt_bytes(&mut s, &key, &blob, target, limit, budget)
+}
+
+struct Selection {
+    name: string,
+    limit: i32,
+    budget: i32,
+    dependencies: i64,
+}
+
+fn check_selection(s: &mut Suite, target: i32, item: &Selection) -> bool {
+    work := s.runner.work.clone()
+    base := f"{work}/{target}-{item.name}"
+    cache := base + ".fn"
+    cold := base + "-cold"
+    if !s.call(["generate", cache.clone(), target.str(), cold.clone(), "0", item.name.clone()], "42\n") { return false }
+    data := sys.read_u8(cache)
+    if !data.ok { return s.runner.fail(f"cannot read {cache}") }
+    words := payload(&data.value)
+    if words.len < 7 || words[0] != 0x44554644 || words[1] != 1 || words[5] != item.dependencies || words[6] != i64(item.budget) {
+        return s.runner.fail(f"{cache}: unexpected DUFD metadata")
+    }
+
+    for padding in 0..2 {
+        direct := if padding == 0 { cold.clone() } else { base + "-rebased-cold" }
+        if padding != 0 && !s.call(["generate", base + "-rebased.fn", target.str(), direct.clone(), padding.str(), item.name.clone()],
+                                   "42\n") { return false }
+        restored := f"{base}-{padding}-restored"
+        if !s.call(["restore", cache.clone(), target.str(), restored.clone(), padding.str(), item.limit.str(),
+                    item.budget.str(), "yes", item.name.clone()], "42\n") { return false }
+        before := sys.read_u8(direct)
+        after := sys.read_u8(restored)
+        if !before.ok || !after.ok || !bytes.equal(&before.value, &after.value) {
+            return s.runner.fail(f"{base}: cold/restored images differ at padding {padding}")
+        }
+        s.images += 1
+        if target == s.runner.host && !s.runner.execute(restored, target, "", 0) { return false }
+    }
+    if item.name == "normal" && !normal_rejections(&mut s, cache, &data.value, &words, target, item.limit, item.budget) { return false }
+    if !s.reject(cache, target, item.limit, item.budget - 1) ||
+       (item.budget != 0 && !s.reject(cache, target, item.limit, -1)) ||
+       !s.reject(cache, target, -1, 65536) { return false }
+    if (item.name == "normal" || item.name == "full") &&
+       !s.reject(cache, target, if item.name == "normal" { 9 } else { 255 }, 65536) { return false }
+    print(f"PASS target={target} {item.name} metadata, cold/hot rebasing")
+    true
+}
+
+fn run_suite(s: &mut Suite, compiler: string, root: string) -> bool {
+    mut output := harness.empty_output()
+    if !s.runner.call(compiler, ["build", root + "/tests/fixtures/fragment-dependencies.ddr", "-o", s.fixture.clone()], 0, &mut output) ||
+       !s.call(["unit"], "42\n") { return false }
+    selections: []Selection = [
+        Selection { name: "normal", limit: 16, budget: 23, dependencies: 3 },
+        Selection { name: "empty", limit: 0, budget: 0, dependencies: 0 },
+        Selection { name: "builtin", limit: 0, budget: 23, dependencies: 0 },
+        Selection { name: "full", limit: 256, budget: 4096, dependencies: 256 },
+    ]
+    for target in 0..3 {
+        for i in 0..selections.len {
+            if !check_selection(&mut s, target, &selections[i]) { return false }
+        }
+    }
+    oversized := s.runner.work + "/oversized.fn"
+    if !sparse(oversized, 67108865) { return s.runner.fail(f"cannot create {oversized}") }
+    s.reject(oversized, s.runner.host, 16, 65536)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_fragment_dependencies <compiler>")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 1 }
+    digest := harness.sha256_file_hex(compiler)
+    tmp := fs.temp_dir("dunder-fragment-deps-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    work := fs.realpath(tmp.value)
+    if !work.ok { return 1 }
+    mut suite := Suite { runner: contracts.Runner::new(compiler, work.value, false), fixture: work.value + "/fixture", images: 0 }
+    if !run_suite(&mut suite, compiler, root) { return 1 }
+    if harness.sha256_file_hex(compiler) != digest { _ := harness.fail("compiler changed during test"); return 1 }
+    print(f"{suite.images} byte-identical cold/hot images; {suite.runner.count("executions")} host executions; {suite.runner.count("rejections")} atomic restore rejections; record/charge/reset and invalid-save checks passed")
+    0
+}

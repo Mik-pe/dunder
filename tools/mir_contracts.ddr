@@ -1,0 +1,260 @@
+capability process, filesystem
+
+import .harness as harness
+import std.array as array
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+pub struct Command {
+    arguments: []string,
+    status: i32,
+    expected: i32,
+    stdout: string,
+    stderr: string,
+}
+
+pub struct Runner {
+    compiler: string,
+    work: string,
+    host: i32,
+    record: bool,
+    commands: []Command,
+    counts: Map<string, i64>,
+    error: string,
+}
+
+impl Runner {
+    pub fn new(compiler: string, work: string, record: bool) -> Self {
+        Self { compiler: compiler.clone(), work: work.clone(), host: harness.host_id(), record: record,
+               commands: [], counts: Map<string, i64>::new(), error: "" }
+    }
+
+    pub fn fail(&mut self, message: string) -> bool {
+        if self.error.len == 0 { self.error = message.clone() }
+        harness.fail(message)
+    }
+
+    pub fn count(&self, field: string) -> i64 {
+        if self.counts.contains(field) { return self.counts.at(field) }
+        0
+    }
+
+    pub fn add(&mut self, field: string, n: i64) {
+        value := self.count(field) + n
+        self.counts.put(field.clone(), value)
+    }
+
+    pub fn set(&mut self, field: string, n: i64) { self.counts.put(field.clone(), n) }
+
+    pub fn call(&mut self, program: string, args: []string, status: i32, output: &mut process.Output) -> bool {
+        mut command := process.command(program.clone(), args.clone())
+        command.set_cwd(self.work.clone())
+        command.clear_env()
+        command.set_env("PATH", "/no-external-tools")
+        command.set_timeout(180000)
+        result := command.exec()
+        actual := if result.signal != 0 { -result.signal } else { result.code }
+        if self.record {
+            mut argv: []string = [program.clone()]
+            for arg in args { argv.push(arg.clone()) }
+            self.commands.push(Command {
+                arguments: argv, status: actual, expected: status, stdout: result.stdout_text(), stderr: result.stderr_text(),
+            })
+        }
+        if !result.ok || result.timed_out || actual != status {
+            return self.fail(f"{program} exited {actual}, expected {status}\n{result.stdout_text()}\n{result.stderr_text()}")
+        }
+        output = result
+        true
+    }
+
+    pub fn execute(&mut self, image: string, target: i32, expected: string, status: i32) -> bool {
+        if target != self.host { self.add("cross_builds", 1); return true }
+        mut result := harness.empty_output()
+        if !self.call(image, [], status, &mut result) { return false }
+        if result.stdout_text() != expected {
+            return self.fail(f"{image}: expected {expected}, got {result.stdout_text()}")
+        }
+        self.add("executions", 1)
+        true
+    }
+
+    pub fn compile_fixture(&mut self, name: string, source_root: string, fixture_root: string, prefix: string) -> string {
+        path := self.work + "/" + prefix + name
+        content := fixture_source(name, source_root, fixture_root, self.work)
+        if content.len == 0 || !sys.write_text(path, content).ok { _ := self.fail(f"cannot prepare {path}"); return "" }
+        runner := path[0..path.len - 4]
+        mut result := harness.empty_output()
+        compiler := self.compiler.clone()
+        if !self.call(compiler, ["build", path, "-o", runner.clone()], 0, &mut result) { return "" }
+        runner
+    }
+
+    pub fn write_commands(&self, writer: &mut json.Writer) {
+        writer.array()
+        for command in self.commands {
+            writer.object()
+            writer.key("command")
+            writer.array()
+            for arg in command.arguments { writer.string(arg) }
+            writer.end()
+            writer.key("status")
+            writer.integer(i64(command.status))
+            writer.key("expected")
+            writer.integer(i64(command.expected))
+            writer.key("stdout")
+            writer.string(command.stdout)
+            writer.key("stderr")
+            writer.string(command.stderr)
+            writer.end()
+        }
+        writer.end()
+    }
+
+    pub fn count_keys(&self) -> []string {
+        mut keys: []string = []
+        for i in 0..self.counts.len() { keys.push(self.counts.key_at(i).clone()) }
+        array.sort_strings(&mut keys)
+        keys
+    }
+
+    pub fn count_summary(&self) -> string {
+        keys := self.count_keys()
+        mut buf: []u8 = []
+        bytes.append_utf8(&mut buf, "{")
+        for i in 0..keys.len {
+            if i > 0 { bytes.append_utf8(&mut buf, ", ") }
+            json.write_str(&mut buf, keys[i])
+            bytes.append_utf8(&mut buf, ": ")
+            json.write_i64(&mut buf, self.counts.at(keys[i]))
+        }
+        bytes.append_utf8(&mut buf, "}")
+        bytes.decode(&buf).value
+    }
+}
+
+fn relative(work: string, target: string) -> string {
+    from := text.split(work, "/")
+    to := text.split(target, "/")
+    mut common := 0
+    while common < from.len && common < to.len && from[common] == to[common] { common += 1 }
+    mut result := ""
+    for _ in common..from.len { result += "../" }
+    for i in common..to.len {
+        if i > common { result += "/" }
+        result += to[i]
+    }
+    if result.len == 0 { return "." }
+    result
+}
+
+fn dotted_path(module: string) -> string {
+    parts := text.split(module, ".")
+    mut path := parts[0].clone()
+    for i in 1..parts.len { path += "/" + parts[i] }
+    path
+}
+
+fn find_ddr_under(dir: string, leaf: string, matches: &mut []string) {
+    entries := fs.list_dir(dir)
+    if !entries.ok { return }
+    for name in entries.entries {
+        path := dir + "/" + name
+        info := sys.metadata(path)
+        if info.is_dir && !fs.is_symlink(path) {
+            find_ddr_under(path, leaf, &mut matches)
+        } else if info.is_file && name == leaf {
+            matches.push(move path)
+        }
+    }
+}
+
+fn rewrite_line(line: string, root: string, work: string) -> string {
+    words := harness.fields(line)
+    if words.len < 2 || words[0] != "import" { return line.clone() }
+    imported := words[1].clone()
+    mut path := ""
+    mut alias := ""
+    if text.starts_with(imported, "...selfhost.") {
+        prefix := "...selfhost.".len
+        module := imported[prefix..imported.len]
+        resolved := dotted_path(module)
+        alias = harness.basename(resolved)
+        path = root + "/selfhost/" + resolved
+        if !sys.metadata(path + ".ddr").is_file {
+            mut alternatives: []string = []
+            find_ddr_under(root + "/selfhost", alias + ".ddr", &mut alternatives)
+            path = if alternatives.len == 1 { alternatives[0][0..alternatives[0].len - 4] } else { root + "/selfhost/" + alias }
+        }
+    } else if imported == ".mir_machine" {
+        path = root + "/tests/fixtures/mir_machine"
+        alias = "mir_machine"
+    } else if imported == "..support.mir_object_support" {
+        path = root + "/tests/support/mir_object_support"
+        alias = "mir_object_support"
+    } else {
+        return line.clone()
+    }
+    if words.len >= 4 && words[2] == "as" { alias = words[3].clone() }
+    "import " + json.quote(relative(work, path)) + " as " + alias
+}
+
+fn fixture_source(name: string, source_root: string, fixture_root: string, work: string) -> string {
+    input := sys.read_text(fixture_root + "/tests/fixtures/" + name)
+    if !input.ok { return "" }
+    lines := harness.lines(input.value)
+    mut output: []u8 = []
+    for i in 0..lines.len {
+        if i > 0 { bytes.append_utf8(&mut output, "\n") }
+        bytes.append_utf8(&mut output, rewrite_line(lines[i], source_root, work))
+    }
+    if text.ends_with(input.value, "\n") { bytes.append_utf8(&mut output, "\n") }
+    bytes.decode(&output).value
+}
+
+pub fn add_hash(paths: &mut Map<string, string>, path: string) -> bool {
+    input := sys.read_u8(path)
+    if !input.ok { return harness.fail(f"cannot hash {path}") }
+    paths.put(path.clone(), harness.sha256_bytes_hex(&input.value))
+    true
+}
+
+pub fn hash_tree(paths: &mut Map<string, string>, dir: string) -> bool {
+    entries := fs.list_dir(dir)
+    if !entries.ok { return harness.fail(f"cannot list {dir}") }
+    for name in entries.entries {
+        path := dir + "/" + name
+        file := sys.metadata(path)
+        if file.is_dir && !fs.is_symlink(path) {
+            if !hash_tree(&mut paths, path) { return false }
+        } else if file.is_file && text.ends_with(name, ".ddr") && !add_hash(&mut paths, path) { return false }
+    }
+    true
+}
+
+pub fn unchanged(paths: &Map<string, string>) -> bool {
+    for i in 0..paths.len() {
+        path := paths.key_at(i)
+        data := sys.read_u8(path)
+        if !data.ok || harness.sha256_bytes_hex(&data.value) != paths.value_at(i) { return false }
+    }
+    true
+}
+
+pub fn write_host(writer: &mut json.Writer) {
+    fields: [](string, string) = [("system", "-s"), ("node", "-n"), ("release", "-r"),
+                                  ("version", "-v"), ("machine", "-m"), ("processor", "-p")]
+    uname := if sys.metadata("/usr/bin/uname").is_file { "/usr/bin/uname" } else { "/bin/uname" }
+    writer.object()
+    for i in 0..fields.len {
+        writer.key(fields[i].0)
+        result := harness.exec_cmd(uname, [fields[i].1.clone()], "", true, 10000)
+        value := text.trim(result.stdout_text())
+        writer.string(if result.succeeded() && value != "unknown" { value.clone() } else { "" })
+    }
+    writer.end()
+}

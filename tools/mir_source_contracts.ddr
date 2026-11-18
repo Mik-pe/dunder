@@ -1,0 +1,277 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_contract_data as data
+import .mir_contracts as contracts
+import std.json as json
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Consumer {
+    ok: bool,
+    mir: [i64; 3],
+    optimization: [i64; 6],
+    enabled: bool,
+    bindings: [](i64, string, string),
+}
+
+pub struct Row {
+    item: data.SourceCase,
+    target: string,
+    mode: string,
+    sha256: string,
+    consumer: Consumer,
+}
+
+fn empty() -> Consumer {
+    Consumer { ok: false, mir: [0; 3], optimization: [0; 6], enabled: false, bindings: [] }
+}
+
+fn decode(output: string) -> Consumer {
+    mut result := empty()
+    lines := harness.lines(output)
+    if lines.len < 14 || lines[0] != "MIR" || lines[4] != "OPT" || lines[12] != "BINDINGS" { return result }
+    if lines[5] != "true" && lines[5] != "false" { return result }
+    result.enabled = lines[5] == "true"
+    for i in 0..3 {
+        value := parse.integer(lines[i + 1])
+        if !value.ok || value.value < 0 { return result }
+        result.mir[i] = value.value
+    }
+    for i in 0..6 {
+        value := parse.integer(lines[i + 6])
+        if !value.ok || value.value < 0 { return result }
+        result.optimization[i] = value.value
+    }
+    count := parse.integer(lines[13])
+    remaining := lines.len - 14
+    if !count.ok || count.value < 0 || remaining % 3 != 0 || count.value != i64(remaining / 3) { return result }
+    for i in 0..i32(count.value) {
+        at := 14 + 3 * i
+        offset := parse.integer(lines[at])
+        if !offset.ok { return result }
+        result.bindings.push((offset.value, lines[at + 1].clone(), lines[at + 2].clone()))
+    }
+    result.ok = true
+    result
+}
+
+fn equal_bindings(a: &Consumer, b: &Consumer) -> bool {
+    if a.bindings.len != b.bindings.len { return false }
+    for i in 0..a.bindings.len {
+        if a.bindings[i].0 != b.bindings[i].0 || a.bindings[i].1 != b.bindings[i].1 || a.bindings[i].2 != b.bindings[i].2 {
+            return false
+        }
+    }
+    true
+}
+
+struct Build {
+    ok: bool,
+    image: string,
+    diagnostic: string,
+    consumer: Consumer,
+}
+
+fn build(runner: &mut contracts.Runner, item: &data.SourceCase, target: i32, variant: string, executable: string,
+         checking: bool, invalid: bool) -> Build {
+    mut output := Build { ok: false, image: "", diagnostic: "", consumer: empty() }
+    path := f"{runner.work}/{item.name}.ddr"
+    image := f"{runner.work}/{item.name}-{target}-{variant}"
+    output.image = image.clone()
+    if !sys.write_text(path, item.source).ok { _ := runner.fail(f"cannot write {path}"); return output }
+    if (checking || invalid) && !sys.write_text(image, "previous image").ok {
+        _ := runner.fail(f"cannot write {image}")
+        return output
+    }
+    mode := if variant == "reference" { "off" } else { variant.clone() }
+    action := if checking { "check" } else { "build" }
+    status := if invalid { 1 } else { 0 }
+    mut result := harness.empty_output()
+    if !runner.call(executable, [path.clone(), image.clone(), target.str(), mode, action], status, &mut result) { return output }
+    raw := result.stdout_text()
+    if result.stderr.len != 0 { _ := runner.fail(f"{path}: {result.stderr_text()}"); return output }
+    if checking || invalid {
+        previous := sys.read_text(image)
+        if !previous.ok || previous.value != "previous image" {
+            _ := runner.fail(f"{path}: prior output changed during check or failed build")
+            return output
+        }
+    }
+    if invalid {
+        if !text.starts_with(raw, "ERROR\n") { _ := runner.fail(f"{path}: missing source diagnostic: {raw}"); return output }
+        runner.add("diagnostics", 1)
+        output.diagnostic = raw
+        output.ok = true
+        return output
+    }
+
+    report := decode(raw)
+    enabled := variant == "opt" && !checking
+    if !report.ok || report.enabled != enabled {
+        _ := runner.fail(f"{path}: malformed source report or unexpected optimization state:\n{raw}")
+        return output
+    }
+    if checking || variant == "reference" {
+        for counter in report.mir {
+            if counter != 0 { _ := runner.fail(f"{path}: check/reference mode produced MIR:\n{raw}"); return output }
+        }
+    } else if report.mir[0] != item.functions || report.mir[1] <= 0 {
+        _ := runner.fail(f"{path}: incomplete MIR report; expected {item.functions} functions:\n{raw}")
+        return output
+    }
+    if !enabled {
+        for counter in report.optimization {
+            if counter != 0 { _ := runner.fail(f"{path}: unexpected optimization counters:\n{raw}"); return output }
+        }
+    }
+    runner.add("source_optimized_functions", report.optimization[0])
+    output.consumer = report
+    output.ok = true
+    output
+}
+
+fn check_sources(runner: &mut contracts.Runner, cases: &[]data.SourceCase, executable: string, reference: string, modes: &[]string,
+                 rows: &mut []Row) -> bool {
+    for i in 0..cases.len {
+        item := &cases[i]
+        for target in 0..3 {
+            mut plain := empty()
+            mut plain_hash := ""
+            for mode in modes {
+                tool := if mode == "reference" { reference.clone() } else { executable.clone() }
+                result := build(&mut runner, &item, target, mode, tool, false, false)
+                if !result.ok || !runner.execute(result.image, target, item.stdout, item.status) { return false }
+                digest := harness.sha256_file_hex(result.image)
+                if mode != "plain" && !equal_bindings(&plain, &result.consumer) {
+                    return runner.fail(f"{item.name}: source bindings differ for target {target} in {mode}")
+                }
+                if mode == "reference" && digest != plain_hash {
+                    return runner.fail(f"{item.name}: reference bytes differ for target {target}")
+                }
+                if mode == "plain" {
+                    plain = result.consumer.clone()
+                    plain_hash = digest.clone()
+                }
+                if runner.record {
+                    rows.push(Row { item: item.clone(), target: harness.target_name(target), mode: mode.clone(),
+                                    sha256: digest, consumer: result.consumer })
+                }
+                runner.add("source_images", 1)
+            }
+        }
+        print(f"PASS whole source lowering {item.name}")
+    }
+    true
+}
+
+fn check_invalid(runner: &mut contracts.Runner, invalid: &[]string, executable: string, reference: string, modes: &[]string) -> bool {
+    for i in 0..invalid.len {
+        item := data.SourceCase { name: f"invalid-{i}", source: invalid[i].clone(), stdout: "", status: 0, functions: 0 }
+        for target in 0..3 {
+            for checking in [false, true] {
+                mut expected := ""
+                for mode in modes {
+                    tool := if mode == "reference" { reference.clone() } else { executable.clone() }
+                    result := build(&mut runner, &item, target, mode, tool, checking, true)
+                    if !result.ok { return false }
+                    if mode == "plain" { expected = result.diagnostic }
+                    else if result.diagnostic != expected {
+                        return runner.fail(f"{item.name}: source diagnostic differs for target {target} in {mode}\n{expected}\n{result.diagnostic}")
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn check_valid(runner: &mut contracts.Runner, source: string, executable: string, reference: string, modes: &[]string) -> bool {
+    item := data.SourceCase { name: "valid-check", source: source.clone(), stdout: "", status: 0, functions: 0 }
+    for target in 0..3 {
+        mut first := empty()
+        for mode in modes {
+            tool := if mode == "reference" { reference.clone() } else { executable.clone() }
+            result := build(&mut runner, &item, target, mode, tool, true, false)
+            if !result.ok { return false }
+            if mode == "plain" { first = result.consumer }
+            else if !equal_bindings(&first, &result.consumer) {
+                return runner.fail(f"check-only bindings differ for target {target} in {mode}")
+            }
+        }
+    }
+    true
+}
+
+pub fn run(runner: &mut contracts.Runner, root: string, source_root: string, reference_root: string, rows: &mut []Row) -> bool {
+    fixture := "mir-consumer.ddr"
+    executable := runner.compile_fixture(fixture, source_root, root, "")
+    if executable.len == 0 { return false }
+    mut reference := ""
+    mut modes: []string = ["plain", "opt"]
+    if reference_root.len > 0 {
+        reference = runner.compile_fixture(fixture, reference_root, reference_root, "reference-")
+        if reference.len == 0 { return false }
+        modes.push("reference")
+    }
+    cases := data.source_cases()
+    invalid := data.invalid_sources()
+    if !check_sources(&mut runner, &cases, executable, reference, &modes, &mut rows) ||
+       !check_invalid(&mut runner, &invalid, executable, reference, &modes) ||
+       !check_valid(&mut runner, cases[0].source, executable, reference, &modes) { return false }
+    if runner.count("source_optimized_functions") == 0 { return runner.fail("source pass was never activated") }
+    runner.set("valid_source_cases", i64(cases.len))
+    runner.set("invalid_source_cases", i64(invalid.len))
+    print("PASS exact source reports, invalid diagnostics and check-only image preservation")
+    true
+}
+
+fn write_consumer(writer: &mut json.Writer, consumer: &Consumer) {
+    writer.key("mir")
+    writer.object()
+    mir := ["functions", "operations", "opaque"]
+    for i in 0..3 { writer.key(mir[i]); writer.integer(consumer.mir[i]) }
+    writer.end()
+    writer.key("optimization")
+    writer.object()
+    names := ["optimized", "promoted", "removed_loads", "removed_stores", "analysis_units", "budget_refusals"]
+    for i in 0..6 { writer.key(names[i]); writer.integer(consumer.optimization[i]) }
+    writer.key("enabled")
+    writer.boolean(consumer.enabled)
+    writer.end()
+    writer.key("bindings")
+    writer.array()
+    for binding in consumer.bindings {
+        writer.array()
+        writer.integer(binding.0)
+        writer.string(binding.1)
+        writer.string(binding.2)
+        writer.end()
+    }
+    writer.end()
+}
+
+pub fn write_rows(writer: &mut json.Writer, rows: &[]Row) {
+    writer.array()
+    for row in rows {
+        writer.object()
+        writer.key("case")
+        writer.string(row.item.name)
+        writer.key("source")
+        writer.string(row.item.source)
+        writer.key("expected_stdout")
+        writer.string(row.item.stdout)
+        writer.key("native_status")
+        writer.integer(i64(row.item.status))
+        writer.key("target")
+        writer.string(row.target)
+        writer.key("mode")
+        writer.string(row.mode)
+        writer.key("sha256")
+        writer.string(row.sha256)
+        write_consumer(&mut writer, &row.consumer)
+        writer.end()
+    }
+    writer.end()
+}

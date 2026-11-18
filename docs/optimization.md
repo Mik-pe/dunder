@@ -53,8 +53,9 @@ läses i [testfixturen](../tests/fixtures/mir_machine.ddr).
 Alla nybyggda källfunktioner verifieras och sänks också i detta läge.
 Passpolicyn och kedjans version skiljer cachefragment och testkvitton åt. `--timings=json` visar
 antal nyemitterade IR-funktioner, operationer och opaka barriärer.
-Källprovet i `tools/test-mir.py --reference-root SÖKVÄG` kan jämföra
-ooptimerade bilder, bindningar och diagnostik mot en tidigare revision.
+Källprovet kan jämföra ooptimerade bilder, bindningar och diagnostik mot
+en tidigare revision. Kör
+`dunder run tools/test_mir.ddr -- KOMPILATOR --only source --reference-root SÖKVÄG`.
 
 ### MIR-radens format
 
@@ -780,7 +781,7 @@ Funktionsbygget förbereder en extra ägare bara när typningen har visat att
 den behövs. [Infogning av ägarhändelser](../selfhost/frontend/ownership_lease.ddr)
 
 `--ownership-opt=off` behåller lånade strängoperander före varje högerled.
-`tools/test-ownership-leases.py` jämför diagnostik och bindningar, mäter
+`tools/test_ownership_leases.ddr` jämför diagnostik och bindningar, mäter
 referensräkningen och kontrollerar mutation, tidiga returer, fällordning och
 återanvändning av ägarplatser i loopar.
 
