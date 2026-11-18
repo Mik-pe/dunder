@@ -1,0 +1,291 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Run {
+    compiler: string,
+    work: string,
+    host: string,
+    images: i32,
+    executions: i32,
+}
+
+struct Counters {
+    ok: bool,
+    values: []i64,
+}
+
+fn loop_source() -> string {
+    "fn calculate(n:i32)->i64 {\n" +
+    "    mut a:i64=1;mut b:i64=2;mut c:i64=3;mut d:i64=4\n" +
+    "    mut e:i64=5;mut f:i64=6;mut g:i64=7;mut i:i32=0\n" +
+    "    while i<n {\n" +
+    "        a=a.wrapping_add(i64(i));b=b.wrapping_add(a);c=c.wrapping_add(b)\n" +
+    "        d=d.wrapping_add(c);e=e.wrapping_add(d);f=f.wrapping_add(e);g=g.wrapping_add(f)\n" +
+    "        i=i.wrapping_add(1)\n" +
+    "    }\n" +
+    "    a.bit_xor(b).bit_xor(c).bit_xor(d).bit_xor(e).bit_xor(f).bit_xor(g)\n" +
+    "}\n"
+}
+
+fn expected_loop() -> string { "0\n8\n3706\n49051886\n" }
+
+fn counter_names() -> []string {
+    ["ssa_optimized", "ssa_cells", "ssa_values", "ssa_parameters", "ssa_registers", "ssa_captures", "ssa_stack_groups",
+     "ssa_removed_loads", "ssa_removed_stores", "ssa_removed_pushes", "ssa_removed_pops", "ssa_copies",
+     "ssa_analysis_units", "ssa_budget_refusals"]
+}
+
+fn productive(name: string, shape: string) -> bool {
+    if shape == "expression" { return name == "ssa_stack_groups" || name == "ssa_removed_pushes" || name == "ssa_removed_pops" }
+    if shape != "loop" { return false }
+    name == "ssa_optimized" || name == "ssa_cells" || name == "ssa_values" || name == "ssa_parameters" ||
+        name == "ssa_registers" || name == "ssa_removed_loads" || name == "ssa_analysis_units"
+}
+
+fn counters(doc: &json.Doc, active: bool, shape: string, zero: bool) -> Counters {
+    mut result := Counters { ok: false, values: [] }
+    mir := doc.field(doc.root, "mir")
+    enabled := doc.get_bool(mir, "ssa_enabled")
+    if !doc.ok || !enabled.ok || enabled.value != active {
+        _ := harness.fail(f"unexpected SSA enablement\n{doc.raw_span(doc.root)}")
+        return result
+    }
+    for name in counter_names() {
+        value := doc.get_i64(mir, name)
+        if !value.ok || value.value < 0 || ((!active || zero) && value.value != 0) || (active && productive(name, shape) && value.value == 0) {
+            _ := harness.fail(f"unexpected counter {name}\n{doc.raw_span(mir)}")
+            return result
+        }
+        result.values.push(value.value)
+    }
+    result.ok = true
+    result
+}
+
+fn equivalent(a: &[]i64, b: &[]i64) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if a[i] != b[i] { return false } }
+    true
+}
+
+fn write(path: string, data: string) -> bool {
+    sys.write_text(path, data).ok || harness.fail(f"cannot write {path}")
+}
+
+fn invoke(run: &Run, args: []string, status: i32, output: &mut process.Output) -> bool {
+    harness.run_checked_timeout(run.compiler, args, run.work, status, false, 120000, &mut output)
+}
+
+fn flagged(action: string, source: string, mode: string, extra: []string) -> []string {
+    mut args: []string = [action.clone(), source.clone(), "--mir-ssa=" + mode, "--scalar-opt=off", "--inline-opt=off", "--mir-values=off"]
+    for arg in extra { args.push(arg.clone()) }
+    args
+}
+
+fn execute(run: &mut Run, image: string, target: string, expected: string) -> bool {
+    if target != run.host { return true }
+    mut result := harness.empty_output()
+    if !harness.run_checked_timeout(image, [], run.work, 0, false, 120000, &mut result) ||
+       !harness.stdout_is(&result, expected, image) || result.stderr.len != 0 {
+        return harness.fail(f"{image}: unexpected output\n{result.stdout_text()}\n{result.stderr_text()}")
+    }
+    run.executions += 1
+    true
+}
+
+fn worker_matrix(run: &mut Run, source: string, shape: string, expected: string, host_hashes: &mut []string) -> bool {
+    jobs: []string = if run.host == "arm64-macos" { ["1", "2", "4"] } else { ["1"] }
+    mut result := harness.empty_output()
+    for target in harness.targets() {
+        mut disabled_hash := ""
+        for mode in ["off", "on"] {
+            mut previous_hash := ""
+            mut previous_counts: []i64 = []
+            for workers in jobs {
+                image := f"{run.work}/{shape}-{target}-{mode}-{workers}"
+                args := flagged("build", source, mode, ["--target", target.clone(), "--jobs=" + workers, "--timings=json", "-o", image.clone()])
+                if !invoke(&run, args, 0, &mut result) { return false }
+                counts := counters(&json.Doc::parse_text(result.stderr_text()), mode == "on", shape, false)
+                if !counts.ok { return false }
+                digest := harness.sha256_file_hex(image)
+                if digest.len == 0 || (previous_hash.len > 0 && (previous_hash != digest || !equivalent(&previous_counts, &counts.values))) {
+                    return harness.fail(f"{shape} {target} {mode}: worker {workers} changed counters or executable bytes")
+                }
+                previous_hash = digest
+                previous_counts = counts.values
+                run.images += 1
+                if !execute(&mut run, image, target, expected) { return false }
+            }
+            if mode == "off" { disabled_hash = previous_hash.clone() }
+            else if disabled_hash == previous_hash { return harness.fail(f"{shape} {target}: SSA did not change the image") }
+            if shape == "loop" && target == run.host { host_hashes.push(move previous_hash) }
+        }
+    }
+    true
+}
+
+fn check_disabled(run: &Run, source: string) -> bool {
+    mut result := harness.empty_output()
+    mut previous := ""
+    for mode in ["off", "on"] {
+        if !invoke(&run, flagged("check", source, mode, ["--agent", "--timings=json"]), 0, &mut result) ||
+           !counters(&json.Doc::parse_text(result.stderr_text()), false, "", true).ok { return false }
+        if mode == "on" && result.stdout_text() != previous { return harness.fail("SSA changed check-only output") }
+        previous = result.stdout_text()
+    }
+    for disabled in ["--mir=off", "--mir-opt=off"] {
+        if !invoke(&run, flagged("build", source, "on", [disabled.clone(), "--timings=json", "-o", run.work + "/disabled"]), 0, &mut result) ||
+           !counters(&json.Doc::parse_text(result.stderr_text()), false, "", true).ok { return false }
+    }
+    true
+}
+
+fn check_cache(run: &mut Run, source: string, hashes: &[]string) -> bool {
+    mut result := harness.empty_output()
+    image := run.work + "/cached"
+    for i in 0..5 {
+        enabled := i == 2 || i == 3
+        mode := if enabled { "on" } else { "off" }
+        expected: i64 = if i == 0 || i == 2 { 0 } else { 2 }
+        args := flagged("build", source, mode, ["--incremental", "--timings=json", "-o", image.clone()])
+        if !invoke(&run, args, 0, &mut result) { return false }
+        report := json.Doc::parse_text(result.stderr_text())
+        fn_counts := report.field(report.root, "functions")
+        reused := report.get_i64(fn_counts, "reused")
+        emitted := report.get_i64(fn_counts, "emitted")
+        if !report.ok || report.count(fn_counts) != 2 || !reused.ok || reused.value != expected || !emitted.ok || emitted.value != 2 - expected {
+            return harness.fail(f"SSA cache transition {i} has unexpected function counts\n{result.stderr_text()}")
+        }
+        shape := if expected == 0 { "loop" } else { "" }
+        if !counters(&report, enabled, shape, expected == 2).ok { return false }
+        index := if enabled { 1 } else { 0 }
+        if harness.sha256_file_hex(image) != hashes[index] {
+            return harness.fail(f"SSA cache transition {i} changed executable bytes")
+        }
+        host := run.host.clone()
+        if !execute(&mut run, image, host, expected_loop()) { return false }
+    }
+    true
+}
+
+fn receipt(dir: string) -> string {
+    list := fs.list_dir(dir)
+    if !list.ok { return "" }
+    mut path := ""
+    for name in list.entries {
+        if !text.ends_with(name, ".pass") { continue }
+        if path.len != 0 { return "" }
+        path = dir + "/" + name
+    }
+    path
+}
+
+fn check_receipts(run: &Run) -> bool {
+    path := run.work + "/cases.ddr"
+    output := run.work + "/results"
+    if !write(path, loop_source() + "@test fn result(){calculate(6)==3706}\n") { return false }
+    mut saved: [][]u8 = [[], []]
+    mut result := harness.empty_output()
+    for i in 0..5 {
+        active := i == 2 || i == 3
+        mode := if active { "on" } else { "off" }
+        expected := if i == 1 || i == 3 { "1 unaffected" } else { "1 passed" }
+        args := flagged("test", path, mode, ["--affected", "-o", output.clone()])
+        if !invoke(&run, args, 0, &mut result) || text.find(result.stdout_text(), expected) < 0 {
+            return harness.fail(f"SSA {mode}: expected {expected}\n{result.stdout_text()}")
+        }
+        file := receipt(output + "/.affected")
+        if file.len == 0 { return harness.fail("expected exactly one affected-test receipt") }
+        raw := sys.read_u8(file)
+        index := if active { 1 } else { 0 }
+        if !raw.ok || ((i == 1 || i == 3 || i == 4) && !bytes.equal(&saved[index], &raw.value)) {
+            return harness.fail(f"SSA {mode} receipt changed")
+        }
+        saved[index] = raw.value
+    }
+    !bytes.equal(&saved[0], &saved[1]) || harness.fail("SSA receipts did not encode the pass policy")
+}
+
+fn check_features(run: &mut Run) -> bool {
+    path := run.work + "/features.ddr"
+    program := "capability unsafe\n" +
+        "@extern(\"c\", \"abs\") unsafe fn c_abs(x: i32) -> i32\n" +
+        "fn sum_items(xs: &[]i64) -> i64 {\n" +
+        "    mut total: i64 = 0\n" +
+        "    for x in xs { total += x }\n" +
+        "    total\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut v: i32 = 0\n" +
+        "    unsafe { v = c_abs(-19) }\n" +
+        "    region arena(128) {\n" +
+        "        mut items: []i64 = arena.alloc(3)\n" +
+        "        items[0] = i64(v)\n" +
+        "        items[1] = 20\n" +
+        "        items[2] = 3\n" +
+        "        print(sum_items(&items))\n" +
+        "    }\n" +
+        "}\n"
+    host := run.host.clone()
+    image := run.work + "/features-" + host
+    mut result := harness.empty_output()
+    write(path, program) && invoke(&run, ["build", path.clone(), "--mir-ssa=on", "-o", image.clone()], 0, &mut result) &&
+        execute(&mut run, image, host, "42\n")
+}
+
+fn check_errors(run: &Run, source: string) -> bool {
+    bad := run.work + "/bad.ddr"
+    image := run.work + "/cached"
+    if !write(bad, "fn main(){unknown()}\n") { return false }
+    original := sys.read_u8(image)
+    if !original.ok { return harness.fail("expected the previous SSA cached image") }
+    mut diagnostic := ""
+    mut result := harness.empty_output()
+    for mode in ["off", "on"] {
+        if !invoke(&run, ["check", bad.clone(), "--agent", "--mir-ssa=" + mode], 1, &mut result) { return false }
+        if mode == "on" && diagnostic != result.stdout_text() { return harness.fail("SSA changed the negative agent diagnostic") }
+        diagnostic = result.stdout_text()
+        if !invoke(&run, ["build", bad.clone(), "--mir-ssa=" + mode, "-o", image.clone()], 1, &mut result) { return false }
+        current := sys.read_u8(image)
+        if !current.ok || !bytes.equal(&original.value, &current.value) { return harness.fail("rejected SSA build changed the previous image") }
+    }
+    invoke(&run, ["check", source.clone(), "--mir-ssa=unknown"], 2, &mut result)
+}
+
+fn run_suite(run: &mut Run) -> bool {
+    source := run.work + "/main.ddr"
+    expression := run.work + "/expression.ddr"
+    mut loop_hashes: []string = []
+    if !write(source, loop_source() + "fn main(){print(calculate(0));print(calculate(1));print(calculate(6));print(calculate(31))}\n") ||
+       !worker_matrix(&mut run, source, "loop", expected_loop(), &mut loop_hashes) ||
+       !write(expression, "fn calculate(a:i64,b:i64,c:i64)->i64{(a+b)*(b+c)}\nfn main(){print(calculate(2,3,5))}\n") ||
+       !worker_matrix(&mut run, expression, "expression", "40\n", &mut loop_hashes) ||
+       !check_disabled(&run, source) || !check_cache(&mut run, source, &loop_hashes) || !check_receipts(&run) ||
+       !check_features(&mut run) || !check_errors(&run, source) { return false }
+    print(f"PASS SSA source: {run.images} three-target images, {run.executions} native executions; productive placement, exact workers, diagnostics, cache and receipts; no latency claims")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_ssa_source COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    host := process.host_target()
+    if host.len == 0 { _ := harness.fail("unsupported native host"); return 2 }
+    temp := fs.temp_dir("dunder-ssa-source-")
+    if !temp.ok { _ := harness.fail("cannot create source SSA workspace"); return 1 }
+    work := temp.value
+    defer { _ := fs.remove_all(work) }
+    mut run := Run { compiler: compiler, work: work.clone(), host: host, images: 0, executions: 0 }
+    if run_suite(&mut run) { 0 } else { 1 }
+}

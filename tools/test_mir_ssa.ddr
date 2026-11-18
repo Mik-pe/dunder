@@ -1,0 +1,508 @@
+capability process, filesystem
+
+import .harness as harness
+import .mir_ssa_cases as cases
+import .mir_ssa_exports as exports
+import .mir_ssa_semantics as semantics
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import sys
+
+struct Policy {
+    enabled: bool,
+    limit: i64,
+    source_objects: bool,
+    source_inputs: bool,
+    terminal: bool,
+    frame: bool,
+    origin: bool,
+    storage: bool,
+    label: string,
+}
+
+struct Run {
+    suite: exports.Suite,
+    root: string,
+    work: string,
+    emitter: string,
+    host: i32,
+    save_exports: bool,
+    report: string,
+    writer: json.Writer,
+    images: i64,
+    executions: i64,
+    pairs: i64,
+    gaps: i64,
+}
+
+fn budget_limit() -> i64 { 4194304 }
+
+fn policy(suite: exports.Suite, enabled: bool) -> Policy {
+    Policy { enabled: enabled, limit: budget_limit(), source_objects: false, source_inputs: false,
+             terminal: suite != .Ssa, frame: false, origin: true, storage: true, label: "" }
+}
+
+fn flag(value: bool) -> i64 { if value { 1 } else { 0 } }
+
+impl Policy {
+    fn mode(&self) -> string { if self.enabled { "on" } else { "off" } }
+
+    fn target_args(&self, suite: exports.Suite, image: string, target: i32, sample: &cases.Sample) -> []string {
+        mut args: []string = [image.clone(), target.str(), sample.id.str(), self.mode(),
+                              sample.input.str(), sample.control.str(), sample.expected.str(), self.limit.str()]
+        if suite == .Ssa { args.push(flag(self.source_objects).str()); args.push(flag(self.terminal).str()); args.push(flag(self.source_inputs).str()) }
+        else if suite == .Regions { args.push(flag(self.frame).str()); args.push(flag(self.terminal).str()) }
+        else { args.push(flag(self.origin).str()); args.push(flag(self.storage).str()); args.push(flag(self.terminal).str()) }
+        args
+    }
+
+    fn image_suffix(&self, suite: exports.Suite) -> string {
+        terminal := flag(self.terminal)
+        if suite == .Ssa { return f"{self.limit}-{flag(self.source_objects)}-{terminal}-{flag(self.source_inputs)}{self.label}" }
+        if suite == .Regions { return f"{flag(self.frame)}-{terminal}-{self.limit}{self.label}" }
+        f"{flag(self.origin)}-{flag(self.storage)}-{terminal}-{self.limit}{self.label}"
+    }
+
+    fn write(&self, suite: exports.Suite, writer: &mut json.Writer) {
+        writer.key("mode")
+        writer.string(self.mode())
+        writer.key("limit")
+        writer.integer(self.limit)
+        if suite == .Ssa {
+            writer.key("source_objects")
+            writer.integer(flag(self.source_objects))
+            writer.key("terminal_contract")
+            writer.integer(flag(self.terminal))
+            writer.key("source_inputs")
+            writer.integer(flag(self.source_inputs))
+        } else {
+            writer.key("terminal")
+            writer.integer(flag(self.terminal))
+            if suite == .Regions {
+                writer.key("frame")
+                writer.integer(flag(self.frame))
+            } else {
+                writer.key("origin")
+                writer.integer(flag(self.origin))
+                writer.key("storage")
+                writer.integer(flag(self.storage))
+            }
+        }
+    }
+}
+
+fn positive_ssa(id: i32) -> bool {
+    for candidate in [0, 1, 2, 3, 4, 6, 7, 12, 13, 15, 16, 20, 21, 22, 23, 25] {
+        if id == candidate { return true }
+    }
+    false
+}
+
+fn positive_expression(id: i32) -> bool {
+    for candidate in [0, 1, 2, 3, 4, 5, 6, 14, 15, 16, 18, 19] {
+        if id == candidate { return true }
+    }
+    false
+}
+
+fn pinned_stack(id: i32) -> bool {
+    for candidate in [7, 8, 9, 10, 11, 12, 13, 17, 20] {
+        if id == candidate { return true }
+    }
+    false
+}
+
+fn pinned_rows(diff: &exports.Export, id: i32, suite: exports.Suite, policy: &Policy) -> bool {
+    mut call17 := 0
+    for index in 0..diff.before.operations.len {
+        op := &diff.before.operations[index]
+        mut pinned := false
+        if suite == .Expression {
+            pinned = op.kind != 7 && op.kind != 10 && op.kind != 11
+            if (op.kind == 10 || op.kind == 11) && (!policy.origin || !policy.storage || pinned_stack(id)) { pinned = true }
+        } else if op.mode != 2 {
+            pinned = op.kind == 8 || op.kind == 14
+            if suite == .Ssa && op.kind == 14 {
+                if op.reads != -1 || op.clobbers != -1 { return harness.fail(f"call row {index} lost conservative register effects") }
+                if id == 27 && policy.enabled && policy.limit == budget_limit() {
+                    if op.a != 17 { return harness.fail("expected an indirect call through register 17") }
+                    call17 += 1
+                }
+            }
+        }
+        if pinned && (index >= diff.after.operations.len || !exports.equal_ops(&op, &diff.after.operations[index])) {
+            return harness.fail(f"pinned semantic MIR row {index} changed")
+        }
+    }
+    !(suite == .Ssa && id == 27 && policy.enabled && policy.limit == budget_limit() && call17 != 1) ||
+        harness.fail("register-17 case did not export exactly one indirect call")
+}
+
+fn check_ssa(diff: &exports.Export, id: i32, before: &exports.Traffic, after: &exports.Traffic, policy: &Policy) -> bool {
+    status := diff.count("status")
+    if policy.limit == budget_limit() &&
+       (positive_ssa(id) || (id == 14 && policy.terminal) || ((id == 24 || id == 26) && policy.source_inputs)) {
+        if !diff.changed || status != 2 || diff.count("cells") <= 0 || diff.count("removed_loads") <= 0 ||
+           after.loads >= before.loads || diff.count("registers") <= 0 {
+            return harness.fail("SSA positive case did not remove loads and commit register placement")
+        }
+        if id == 12 && diff.count("values") <= 64 { return harness.fail("many-values case never crossed 64 values") }
+        if (id == 4 || id == 6 || id == 7 || id == 16) && diff.count("parameters") <= 0 {
+            return harness.fail("SSA flow case produced no parameters")
+        }
+        if id == 26 && policy.source_inputs && (diff.count("cells") < 2 || diff.count("removed_loads") < 6) {
+            return harness.fail("two-sided call case failed to optimize both cells")
+        }
+    }
+    if policy.limit == budget_limit() && (id == 27 || (id == 24 && !policy.source_inputs)) && (diff.changed || status != 0) {
+        return harness.fail("uncertified source call caused a rewrite")
+    }
+    if (policy.limit == 0 || policy.limit == 1) && (diff.changed || status != -3) {
+        return harness.fail("near-zero budget did not refuse SSA")
+    }
+    if (id == 17 || id == 18 || id == 19 || (id == 14 && !policy.terminal)) && (diff.changed || status != -2) {
+        return harness.fail("unknown exit did not refuse SSA")
+    }
+    true
+}
+
+fn check_regions(diff: &exports.Export, id: i32, before: &exports.Traffic, after: &exports.Traffic, policy: &Policy) -> bool {
+    status := diff.count("status")
+    captures := diff.count("captures")
+    if policy.limit < budget_limit() { return (!diff.changed && status == -3) || harness.fail("regional budget did not roll back") }
+    if id == 13 && !policy.terminal { return (!diff.changed && status == -2) || harness.fail("unknown regional terminal was optimized") }
+    if semantics.negative_region(id) || id == 10 {
+        return (!diff.changed && captures == 0) || harness.fail("regional case captured an unproven value")
+    }
+    if policy.frame {
+        return (diff.changed && status == 2 && captures > 0 && after.loads < before.loads) ||
+            harness.fail("trusted frame case did not capture a value and remove a load")
+    }
+    captures == 0 || harness.fail("regional capture requires a trusted frame")
+}
+
+fn check_expression(diff: &exports.Export, id: i32, before: &exports.Traffic, after: &exports.Traffic, policy: &Policy) -> bool {
+    status := diff.count("status")
+    if policy.limit < budget_limit() { return (!diff.changed && status == -3) || harness.fail("expression budget did not roll back") }
+    pushes := diff.count("pushes")
+    pops := diff.count("pops")
+    mixed := id == 15 || id == 18 || id == 19
+    if positive_expression(id) && policy.origin && policy.storage {
+        if !diff.changed || status != 2 || diff.count("placed") <= 0 || pushes <= 0 || pops <= 0 ||
+           after.pushes >= before.pushes || after.pops >= before.pops {
+            return harness.fail("expression case did not remove matched stack traffic")
+        }
+        if mixed && (diff.count("loads") <= 0 || after.loads >= before.loads) {
+            return harness.fail("joint frame and expression rewrite did not remove a frame load")
+        }
+        return (id != 19 || diff.count("captures") > 0) || harness.fail("joint rewrite did not capture a value")
+    }
+    (mixed || (!diff.changed && pushes == 0 && pops == 0)) || harness.fail("unproven expression stack was rewritten")
+}
+
+fn check_policy(diff: &exports.Export, sample: &cases.Sample, before: &exports.Traffic, after: &exports.Traffic,
+                suite: exports.Suite, policy: &Policy) -> bool {
+    if diff.count("units") < 0 || diff.count("units") > policy.limit { return harness.fail("analysis exceeded its budget") }
+    if !pinned_rows(&diff, sample.id, suite, &policy) { return false }
+    if (!policy.enabled || !diff.changed) && diff.before_text != diff.after_text {
+        return harness.fail("uncommitted transformation changed the Function witness")
+    }
+    if !policy.enabled { return (diff.count("status") == 0 && diff.count("units") == 0) || harness.fail("disabled pass reported activity") }
+    if suite == .Ssa { return check_ssa(&diff, sample.id, &before, &after, &policy) }
+    if suite == .Regions { return check_regions(&diff, sample.id, &before, &after, &policy) }
+    check_expression(&diff, sample.id, &before, &after, &policy)
+}
+
+fn record_image(run: &mut Run, sample: &cases.Sample, target: i32, policy: &Policy, image: string,
+                ran: bool, raw: string, diff: &exports.Export, before: &exports.Traffic, after: &exports.Traffic,
+                pre: &semantics.Proof, post: &semantics.Proof) -> bool {
+    suite := run.suite
+    run.writer.object()
+    run.writer.key("case")
+    run.writer.integer(i64(sample.id))
+    run.writer.key("name")
+    run.writer.string(sample.name)
+    run.writer.key("input")
+    run.writer.integer(sample.input)
+    run.writer.key("control")
+    run.writer.integer(sample.control)
+    run.writer.key("target")
+    run.writer.integer(i64(target))
+    policy.write(suite, &mut run.writer)
+    run.writer.key("executed")
+    run.writer.boolean(ran)
+    digest := harness.sha256_file_hex(image)
+    if digest.len == 0 { return harness.fail(f"cannot hash {image}") }
+    run.writer.key("sha256")
+    run.writer.string(digest)
+    if run.suite == .Ssa {
+        mut encoded: []u8 = []
+        bytes.append_utf8(&mut encoded, raw)
+        run.writer.key("export_sha256")
+        run.writer.string(harness.sha256_bytes_hex(&encoded))
+    }
+    run.writer.key("counters")
+    diff.write_counters(&mut run.writer)
+    run.writer.key("before_traffic")
+    before.write(&mut run.writer)
+    run.writer.key("after_traffic")
+    after.write(&mut run.writer)
+    run.writer.key("before")
+    pre.write(suite, &mut run.writer)
+    run.writer.key("after")
+    post.write(suite, &mut run.writer)
+    run.writer.end()
+    true
+}
+
+fn one(run: &mut Run, sample: &cases.Sample, target: i32, policy: &Policy) -> i64 {
+    image := f"{run.work}/{sample.id}-{sample.input}-{sample.control}-{target}-{policy.mode()}-{policy.image_suffix(run.suite)}"
+    mut result := harness.empty_output()
+    args := policy.target_args(run.suite, image, target, &sample)
+    if !harness.run_checked_timeout(run.emitter, args, run.root, 0, false, 60000, &mut result) { return -1 }
+    raw := result.stdout_text()
+    diff := exports.decode(raw, run.suite)
+    if !diff.ok { _ := harness.fail(f"{image}: malformed MIR, metadata or counters"); return -1 }
+    before := exports.traffic(&diff.before)
+    after := exports.traffic(&diff.after)
+    if !before.ok || !after.ok || !check_policy(&diff, &sample, &before, &after, run.suite, &policy) {
+        _ := harness.fail(f"{image}: transformation violated its policy")
+        return -1
+    }
+    pre := semantics.interpret(&diff.before, &diff.helpers, &sample, run.suite)
+    post := semantics.interpret(&diff.after, &diff.helpers, &sample, run.suite)
+    if !pre.ok || !post.ok || pre.result != post.result || pre.trap != post.trap || (pre.gap.len > 0) != (post.gap.len > 0) {
+        _ := harness.fail(f"{image}: interpreter disagreement (before {pre.result}, {pre.gap}; after {post.result}, {post.gap})")
+        return -1
+    }
+    ran := target == run.host && !(run.suite == .Expression && sample.id == 17)
+    if ran {
+        if !harness.run_checked_timeout(image, [], run.root, semantics.trap_status(run.suite, &sample), false, 60000, &mut result) { return -1 }
+        run.executions += 1
+    }
+    if run.save_exports && !sys.write_text(image + ".mir.txt", raw).ok { _ := harness.fail(f"cannot save export for {image}"); return -1 }
+    if run.report.len > 0 && !record_image(&mut run, &sample, target, &policy, image, ran, raw, &diff, &before, &after, &pre, &post) { return -1 }
+    run.images += 1
+    if pre.gap.len == 0 { run.pairs += 1 } else { run.gaps += 1 }
+    if policy.label == "-budget" && (diff.changed || diff.count("status") != -3) {
+        _ := harness.fail(f"{image}: budget exhaustion did not roll back")
+        return -1
+    }
+    diff.count("units")
+}
+
+fn matrix(run: &mut Run, sample: &cases.Sample, target: i32) -> bool {
+    off := policy(run.suite, false)
+    if one(&mut run, &sample, target, &off) < 0 { return false }
+    mut active := policy(run.suite, true)
+    if run.suite == .Expression {
+        active.storage = false
+        if one(&mut run, &sample, target, &active) < 0 { return false }
+        active.storage = true
+        active.origin = false
+        if one(&mut run, &sample, target, &active) < 0 { return false }
+        active.origin = true
+        return one(&mut run, &sample, target, &active) >= 0
+    }
+    if one(&mut run, &sample, target, &active) < 0 { return false }
+    if run.suite == .Regions {
+        active.frame = true
+        if one(&mut run, &sample, target, &active) < 0 { return false }
+        if sample.id == 13 { active.terminal = false; return one(&mut run, &sample, target, &active) >= 0 }
+    } else if sample.id == 14 {
+        active.terminal = true
+        return one(&mut run, &sample, target, &active) >= 0
+    } else if sample.id >= 24 {
+        active.source_inputs = true
+        return one(&mut run, &sample, target, &active) >= 0
+    }
+    true
+}
+
+fn budgets(run: &mut Run, sample: &cases.Sample) -> bool {
+    host := run.host
+    mut active := policy(run.suite, true)
+    active.label = "-budget-base"
+    if run.suite == .Ssa {
+        active.source_objects = true
+        active.source_inputs = sample.id >= 24
+        active.label = "-context"
+    } else if run.suite == .Regions { active.frame = true }
+    units := one(&mut run, &sample, host, &active)
+    if units < 0 { return false }
+    half := if units / 2 > 1 { units / 2 } else { 1 }
+    almost := if units > 2 { units - 1 } else { 1 }
+    active.label = "-budget"
+    mut previous: i64 = -1
+    for limit in [i64(0), i64(1), half, almost] {
+        if limit == previous { continue }
+        active.limit = limit
+        if one(&mut run, &sample, host, &active) < 0 { return false }
+        previous = limit
+    }
+    true
+}
+
+fn filter(suite: exports.Suite, selected: i32, budget: bool) -> []cases.Sample {
+    group := if suite == .Ssa {
+        if budget { cases.ssa_budgets() } else { cases.ssa() }
+    } else if suite == .Regions {
+        if budget { cases.regions_budgets() } else { cases.regions() }
+    } else {
+        if budget { cases.expression_budgets() } else { cases.expression() }
+    }
+    if selected < 0 { return group }
+    mut filtered: []cases.Sample = []
+    for sample in move group {
+        if sample.id == selected { filtered.push(move sample) }
+    }
+    filtered
+}
+
+fn hash(writer: &mut json.Writer, key: string, path: string) -> bool {
+    digest := harness.sha256_file_hex(path)
+    if digest.len == 0 { return harness.fail(f"cannot hash {path}") }
+    writer.key(key)
+    writer.string(digest)
+    true
+}
+
+fn begin_report(run: &mut Run, compiler: string, fixture: string, support: string, fields: i32) -> bool {
+    root := run.root.clone()
+    emitter := run.emitter.clone()
+    run.writer.object()
+    if run.suite == .Ssa {
+        if !hash(&mut run.writer, "compiler_sha256", compiler) ||
+           !hash(&mut run.writer, "module_sha256", root + "/selfhost/mir/mir_ssa.ddr") ||
+           !hash(&mut run.writer, "call_inputs_sha256", root + "/selfhost/mir/mir_call_inputs.ddr") ||
+           !hash(&mut run.writer, "fixture_sha256", fixture) ||
+           !hash(&mut run.writer, "oracle_sha256", root + "/tools/mir_oracle.ddr") ||
+           !hash(&mut run.writer, "emitter_sha256", emitter) { return false }
+        run.writer.key("host_target")
+        run.writer.integer(i64(run.host))
+    } else {
+        run.writer.key("host")
+        run.writer.integer(i64(run.host))
+        run.writer.key("fields")
+        run.writer.integer(i64(fields))
+        run.writer.key("hashes")
+        run.writer.object()
+        if !hash(&mut run.writer, "compiler", compiler) || !hash(&mut run.writer, "fixture", fixture) ||
+           !hash(&mut run.writer, "support", support) || !hash(&mut run.writer, "ssa", root + "/selfhost/mir/mir_ssa.ddr") ||
+           !hash(&mut run.writer, "emitter", emitter) { return false }
+        if run.suite == .Regions {
+            if !hash(&mut run.writer, "frame_abi", root + "/selfhost/mir/mir_call_abi.ddr") { return false }
+        } else if !hash(&mut run.writer, "adapter", root + "/tests/fixtures/mir_expr_qa_adapter.ddr") ||
+                  !hash(&mut run.writer, "expr", root + "/selfhost/mir/mir_expr_stack.ddr") ||
+                  !hash(&mut run.writer, "generic_oracle", root + "/tools/mir_oracle.ddr") ||
+                  !hash(&mut run.writer, "tool", root + "/tools/test_mir_ssa.ddr") ||
+                  !hash(&mut run.writer, "region_tool", root + "/tools/mir_ssa_semantics.ddr") { return false }
+        run.writer.end()
+    }
+    run.writer.key("images")
+    run.writer.array()
+    true
+}
+
+fn finish_report(run: &mut Run) -> bool {
+    run.writer.end()
+    run.writer.key("images_built")
+    run.writer.integer(run.images)
+    run.writer.key("executions")
+    run.writer.integer(run.executions)
+    run.writer.key("independent_pairs")
+    run.writer.integer(run.pairs)
+    if run.suite == .Ssa {
+        run.writer.key("explicit_gap_pairs")
+        run.writer.integer(run.gaps)
+    }
+    run.writer.key("coverage_limits")
+    run.writer.array()
+    if run.suite == .Ssa {
+        run.writer.string("calls, FP, consumed unknown scratch and external exits are interpreter gaps; actual observing images execute")
+        run.writer.string("Linux images are built but not executed on an ARM64/macOS host")
+        run.writer.string("expression-stack case is semantic coverage without a promised stack optimization")
+    } else if run.suite == .Regions {
+        run.writer.string("large retained-helper scratch is checked by actual native observer only")
+        run.writer.string("Linux ARM/x86 images build only on this macOS host")
+    } else {
+        run.writer.string("lower resource guard has no fabricated OS mapping model")
+        run.writer.string("Linux ARM/x86 build only on macOS host")
+    }
+    run.writer.end()
+    run.writer.end()
+    parent := harness.parent_dir(run.report)
+    if parent.len > 0 && !fs.mkdir_all(parent).ok { return harness.fail(f"cannot create {parent}") }
+    evidence.save(run.report, &run.writer)
+}
+
+fn run_suite(run: &mut Run, compiler: string, selected: i32) -> bool {
+    fixtures := run.root + "/tests/fixtures/"
+    fixture := fixtures + if run.suite == .Ssa { "mir-ssa-oracle.ddr" } else if run.suite == .Regions { "mir-regions-oracle.ddr" } else { "mir-expr-oracle.ddr" }
+    support := if run.suite == .Ssa { fixture.clone() } else { fixtures + "mir_region_qa_support.ddr" }
+    fields := exports.schema_field_count(run.root + "/selfhost/mir/mir.ddr", support, run.suite == .Ssa)
+    if fields < 0 { return false }
+    mut result := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["build", fixture.clone(), "-o", run.emitter.clone()], run.root, 0, false, 60000, &mut result) ||
+       (run.report.len > 0 && !begin_report(&mut run, compiler, fixture, support, fields)) { return false }
+    samples := filter(run.suite, selected, false)
+    for i in 0..samples.len {
+        sample := &samples[i]
+        if run.suite == .Expression && sample.id == 17 { continue }
+        for target in 0..3 {
+            if !matrix(&mut run, &sample, target) { return false }
+        }
+        print(f"PASS {i + 1}/{samples.len} {sample.name} input{sample.input} control{sample.control}")
+    }
+    for sample in filter(run.suite, selected, true) {
+        if !budgets(&mut run, &sample) { return false }
+    }
+    if run.report.len > 0 && !finish_report(&mut run) { return false }
+    start := f"{run.images} images; {run.executions} native executions; {run.pairs} independent"
+    if run.suite == .Ssa { print(f"{start} semantic pairs; {run.gaps} explicit semantic gaps; no latency measurements") }
+    else if run.suite == .Regions { print(f"{start} helper-semantic pairs; no timings") }
+    else { print(f"{start} exact-bit pairs; no timings") }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--suite"), cli.option("--case"), cli.option("--output"), cli.option("--report")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_mir_ssa COMPILER [--suite ssa|regions|expression] [--case ID] [--output DIR] [--report FILE]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    name := args.last("--suite", "ssa")
+    if name != "ssa" && name != "regions" && name != "expression" { _ := harness.fail(f"unknown suite {name}"); return 2 }
+    suite := if name == "ssa" { exports.Suite.Ssa } else if name == "regions" { exports.Suite.Regions } else { exports.Suite.Expression }
+    mut selected := -1
+    if args.has("--case") {
+        number := parse.integer(args.last("--case", ""))
+        size := if suite == .Ssa { cases.ssa_size() } else if suite == .Regions { cases.regions_size() } else { cases.expression_size() }
+        if !number.ok || number.value < 0 || number.value >= i64(size) { _ := harness.fail(f"case must be in 0..{size - 1}"); return 2 }
+        selected = i32(number.value)
+    }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 2 }
+    save_exports := args.has("--output")
+    mut work := ""
+    if save_exports {
+        work = harness.resolve_or_abs(args.last("--output", ""))
+        if !fs.mkdir_all(work).ok { _ := harness.fail(f"cannot create {work}"); return 1 }
+        contents := fs.list_dir(work)
+        if !contents.ok || contents.entries.len != 0 { _ := harness.fail("output directory must be empty"); return 1 }
+    } else {
+        directory := fs.temp_dir("dunder-ssa-qa-")
+        if !directory.ok { _ := harness.fail("cannot create temporary SSA directory"); return 1 }
+        work = directory.value
+    }
+    defer { if !save_exports { _ := fs.remove_all(work) } }
+    report := if args.has("--report") { harness.resolve_or_abs(args.last("--report", "")) } else { "" }
+    mut run := Run { suite: suite, root: root, work: work.clone(), emitter: work + "/emitter", host: harness.host_id(),
+                    save_exports: save_exports, report: report, writer: json.Writer::new(),
+                    images: 0, executions: 0, pairs: 0, gaps: 0 }
+    if run_suite(&mut run, compiler, selected) { 0 } else { 1 }
+}

@@ -1,0 +1,426 @@
+import .mir_oracle as oracle
+import .mir_ssa_cases as cases
+import .mir_ssa_exports as exports
+import std.json as json
+import std.text as text
+
+pub struct Proof {
+    ok: bool,
+    result: i64,
+    trap: i64,
+    steps: i32,
+    coverage: Map<string, i32>,
+    gap: string,
+    generic_zero: bool,
+}
+
+impl Proof {
+    pub fn write(&self, suite: exports.Suite, writer: &mut json.Writer) {
+        writer.object()
+        if self.gap.len != 0 {
+            writer.key(if suite == .Ssa { "coverage_gap" } else { "gap" })
+            writer.string(self.gap)
+            if self.steps > 0 { writer.key("steps"); writer.integer(i64(self.steps)) }
+        } else {
+            writer.key("steps")
+            writer.integer(i64(self.steps))
+            if self.trap != 0 { writer.key("trap"); writer.integer(self.trap) }
+            else {
+                writer.key("result")
+                writer.integer(self.result)
+                writer.key("coverage")
+                writer.object()
+                for i in 0..self.coverage.len() {
+                    writer.key(self.coverage.key_at(i))
+                    writer.integer(i64(self.coverage.value_at(i)))
+                }
+                writer.end()
+                if self.generic_zero { writer.key("generic_result"); writer.integer(0) }
+            }
+        }
+        writer.end()
+    }
+}
+
+fn blank() -> Proof {
+    Proof { ok: false, result: 0, trap: 0, steps: 0, coverage: Map<string, i32>::new(), gap: "", generic_zero: false }
+}
+
+fn gap_proof(reason: string, steps: i32) -> Proof {
+    mut result := blank()
+    result.ok = true
+    result.gap = reason.clone()
+    result.steps = steps
+    result
+}
+
+fn failure(reason: string) -> Proof {
+    mut result := blank()
+    result.gap = reason.clone()
+    result
+}
+
+fn seed(reg: i64) -> i64 { 123456789012345 + reg * 1000003 }
+fn stack() -> i64 { 1048576 }
+fn failure_label() -> i64 { -9999 }
+
+fn overflow_sub(left: i64, right: i64) -> bool {
+    result := left.wrapping_sub(right)
+    (left < 0) != (right < 0) && (left < 0) != (result < 0)
+}
+
+fn initial(sample: &cases.Sample, suite: exports.Suite) -> oracle.Machine {
+    mut machine := oracle.Machine::new()
+    for r in 0..31 { machine.write(i64(r), oracle.bits(seed(i64(r))), 64) }
+    machine.write(4, oracle.bits(sample.input), 64)
+    machine.write(5, oracle.bits(sample.control), 64)
+    machine.write(31, u64(stack()), 64)
+    if suite != .Ssa {
+        machine.write(0, u64(stack() + 32), 64)
+        machine.write(29, u64(stack() + 32), 64)
+    }
+    if suite == .Regions && sample.id == 12 { machine.write(7, u64(stack() - 24), 64) }
+    if suite == .Expression && (sample.id == 9 || sample.id == 10 || sample.id == 20) {
+        offset := if sample.id == 10 { 40 } else { 24 }
+        machine.store(u64(stack() - i64(offset)), oracle.bits(seed(17)), 8)
+    }
+    machine
+}
+
+fn mark_input_flags(machine: &mut oracle.Machine, value: i64, control: i64) {
+    difference := value.wrapping_sub(control)
+    machine.nzcv_ready = true
+    machine.negative = difference < 0
+    machine.zero = difference == 0
+    machine.carry = oracle.bits(value) >= oracle.bits(control)
+    machine.overflow = overflow_sub(value, control)
+}
+
+fn completed(machine: &mut oracle.Machine, outcome: &oracle.Outcome, sample: &cases.Sample, suite: exports.Suite) -> Proof {
+    result := oracle.signed(outcome.value, 64)
+    if result != sample.expected { return failure(f"expected {sample.expected}, interpreted {result}") }
+    finish := if suite == .Ssa { 31 } else { 29 }
+    for reg in 18..finish {
+        if machine.read(i64(reg)) != oracle.bits(seed(i64(reg))) { return failure(f"interpreter changed register {reg}") }
+    }
+    if machine.read(31) != u64(stack()) || (suite != .Ssa && machine.read(29) != u64(stack() + 32)) {
+        return failure("interpreter changed the entry frame or stack pointer")
+    }
+    Proof { ok: true, result: result, trap: 0, steps: outcome.steps,
+            coverage: machine.coverage.clone(), gap: "", generic_zero: false }
+}
+
+pub fn trap_status(suite: exports.Suite, sample: &cases.Sample) -> i32 {
+    if suite == .Ssa && sample.id == 14 && sample.input == 9223372036854775807 { return 101 }
+    if suite == .Regions && sample.id == 13 && sample.control == 0 { return 102 }
+    if suite == .Expression && (sample.id == 7 || (sample.id == 14 && sample.control == 0)) { return 102 }
+    0
+}
+
+fn expected_ssa_gap(id: i32, reason: string, trap: bool) -> bool {
+    if id == 10 || id == 22 || (id >= 24 && id <= 27) { return text.find(reason, "kind=14") >= 0 }
+    if id == 11 { return text.find(reason, "kind=19") >= 0 }
+    if id == 19 { return text.find(reason, "fell off end") >= 0 }
+    (trap || id == 17 || id == 18) && text.find(reason, "external branch") >= 0
+}
+
+fn interpret_ssa(source: &oracle.Model, sample: &cases.Sample) -> Proof {
+    if sample.id == 15 { return gap_proof("consumed retained-helper scratch/clobber result", 0) }
+    mut model := source.clone()
+    for i in 0..model.operations.len {
+        mut op := model.operations[i].clone()
+        if op.kind != 9 || op.mode == 2 { continue }
+        if op.type != 2 || op.a < 0 || op.b != -1 || op.c != -1 || op.flags != 0 || op.clobbers != 0 {
+            return failure("unsupported Address operation in the semantic MIR")
+        }
+        op.kind = 16
+        op.opcode = 1
+        op.aux = 0
+        model.operations[i] = op
+    }
+    mut machine := initial(&sample, .Ssa)
+    mark_input_flags(&mut machine, sample.input, sample.control)
+    outcome := machine.run(&model, 250000)
+    trap := trap_status(.Ssa, &sample) != 0
+    if outcome.state == .Gap && expected_ssa_gap(sample.id, outcome.reason, trap) { return gap_proof(outcome.reason, outcome.steps) }
+    if outcome.state != .Complete { return failure(outcome.reason) }
+    if trap { return failure("interpreter completed the checked overflow case") }
+    completed(&mut machine, &outcome, &sample, .Ssa)
+}
+
+struct Expansion {
+    model: oracle.Model,
+    positions: []i32,
+}
+
+impl Expansion {
+    fn new(model: &oracle.Model) -> Self {
+        Self { model: oracle.Model { ok: true, operations: [], places: model.places.clone(),
+                                     labels: Map<i64, i64>::new(), order: [] }, positions: [] }
+    }
+
+    fn emit(&mut self, move op: oracle.Operation) {
+        self.model.order.push(self.model.operations.len)
+        self.model.operations.push(move op)
+    }
+
+    fn label_position(&mut self) { self.positions.push(self.model.operations.len) }
+
+    fn relocate(&mut self, original: &oracle.Model) -> bool {
+        self.label_position()
+        for i in 0..original.labels.len() {
+            at := original.labels.value_at(i)
+            if at >= i64(self.positions.len) { return false }
+            position: i64 = if at < 0 { -1 } else { i64(self.positions[i32(at)]) }
+            self.model.labels.put(original.labels.key_at(i), position)
+        }
+        true
+    }
+
+    fn place(&mut self, kind: i64, offset: i64, width: i64, distinct: bool) -> i64 {
+        if !distinct {
+            for i in 0..self.model.places.len {
+                place := &self.model.places[i]
+                if place.kind == kind && place.offset == offset && place.width == width { return i64(i) }
+            }
+        }
+        slot := self.model.places.len
+        self.model.places.push(oracle.Place { kind: kind, offset: offset, width: width })
+        i64(slot)
+    }
+
+    fn constant(&mut self, reg: i64, value: i64) {
+        mut op := instruction(1)
+        op.dst = reg
+        op.imm = value
+        self.emit(move op)
+    }
+
+    fn compare(&mut self, a: i64, b: i64) {
+        mut op := instruction(5)
+        op.opcode = 2
+        op.a = a
+        op.b = b
+        op.flags = 2
+        self.emit(move op)
+    }
+
+    fn equality(&mut self, a: i64, b: i64) {
+        self.compare(a, b)
+        mut branch := instruction(13)
+        branch.opcode = 1
+        branch.imm = 1
+        branch.flags = 1
+        branch.target = failure_label()
+        self.emit(move branch)
+    }
+
+    fn check(&mut self, reg: i64, expected: i64) {
+        self.constant(100, expected)
+        self.equality(reg, 100)
+    }
+
+    fn save_flags(&mut self) {
+        for i in 0..4 {
+            mut select := instruction(6)
+            select.dst = 101 + i64(i)
+            select.imm = i64(2 * i)
+            select.flags = 1
+            self.emit(move select)
+        }
+    }
+
+    fn check_flags(&mut self, left: i64, right: i64) {
+        difference := left.wrapping_sub(right)
+        flags := [difference == 0, oracle.bits(left) >= oracle.bits(right), difference < 0, overflow_sub(left, right)]
+        for i in 0..4 { self.check(101 + i64(i), if flags[i] { 1 } else { 0 }) }
+    }
+
+    fn address(&mut self, dst: i64, base: i64, offset: i64) {
+        mut op := instruction(16)
+        op.opcode = 1
+        op.dst = dst
+        op.a = base
+        op.imm = offset
+        self.emit(move op)
+    }
+
+    fn subtract(&mut self, dst: i64, a: i64, b: i64) {
+        mut op := instruction(4)
+        op.opcode = 2
+        op.dst = dst
+        op.a = a
+        op.b = b
+        self.emit(move op)
+    }
+
+    fn load(&mut self, dst: i64, base: i64, offset: i64, width: i64, cell: i64) {
+        mut op := instruction(7)
+        op.dst = dst
+        op.a = base
+        op.imm = offset
+        op.aux = width
+        op.place = cell
+        self.emit(move op)
+    }
+
+    fn store(&mut self, reg: i64, base: i64, offset: i64, width: i64, cell: i64) {
+        mut op := instruction(8)
+        op.a = reg
+        op.b = base
+        op.imm = offset
+        op.aux = width
+        op.place = cell
+        if width == 4 { op.type = 1 }
+        self.emit(move op)
+    }
+
+    fn check_arguments(&mut self, sample: &cases.Sample, control: i64, raw_alias: bool) {
+        self.save_flags()
+        for reg in 0..18 {
+            mut wanted := seed(i64(reg))
+            if reg == 0 { wanted = stack() + 32 }
+            else if reg == 4 { wanted = sample.input }
+            else if reg == 5 { wanted = control }
+            else if reg == 7 && raw_alias { wanted = stack() - 24 }
+            self.check(i64(reg), wanted)
+        }
+    }
+
+    fn clobber_arguments(&mut self) {
+        for reg in 0..18 { self.constant(i64(reg), 9000007 + i64(reg) * 101) }
+    }
+}
+
+fn instruction(kind: i64) -> oracle.Operation {
+    oracle.Operation { kind: kind, opcode: 0, dst: -1, a: -1, b: -1, c: -1, imm: 0, aux: 0,
+                       type: 2, place: -1, extension: 0, effects: 0, flags: 0, abi: 0, reads: 0,
+                       writes: 0, clobbers: 0, mode: 1, target: -1 }
+}
+
+pub fn negative_region(case_id: i32) -> bool { case_id == 5 || case_id == 6 || case_id == 11 }
+
+fn expand_region_helper(out: &mut Expansion, sample: &cases.Sample, another: bool) {
+    control := if another { sample.control.wrapping_add(1) } else { sample.control }
+    out.check_arguments(&sample, control, sample.id == 12)
+    if sample.id == 4 || sample.id == 5 { out.check_flags(sample.control, 0) }
+    else { out.check_flags(sample.input, control) }
+    out.address(105, 29, -96)
+    out.equality(31, 105)
+    if !negative_region(sample.id) {
+        cell := out.place(1, -8, 8, false)
+        out.load(105, 29, -8, 8, cell)
+        out.check(105, sample.input)
+    }
+    cell := out.place(1, -8, 4, false)
+    out.store(5, 29, -8, 4, cell)
+    out.clobber_arguments()
+    out.constant(16, sample.input)
+    out.constant(17, control)
+    out.compare(16, 17)
+    out.constant(0, 99)
+}
+
+fn expression_exit(out: &mut Expansion, input: i64) {
+    out.check(0, input)
+    for reg in 9..18 { out.check(i64(reg), seed(i64(reg))) }
+    out.address(31, 29, 0)
+    mut return_frame := instruction(21)
+    return_frame.opcode = 2
+    return_frame.abi = 1
+    return_frame.effects = 34
+    out.emit(move return_frame)
+    out.emit(instruction(15))
+}
+
+fn expand_expression_helper(out: &mut Expansion, sample: &cases.Sample) {
+    out.check_arguments(&sample, sample.control, false)
+    out.check_flags(sample.input, sample.control)
+    size: i64 = if sample.id == 19 { 96 } else if sample.id == 10 { 32 } else { 16 }
+    out.constant(100, size)
+    out.subtract(105, 29, 100)
+    out.equality(31, 105)
+    if sample.id == 9 || sample.id == 10 {
+        first := out.place(2, 0, 8, false)
+        out.load(105, 31, 0, 8, first)
+        out.check(105, if sample.id == 9 { sample.input } else { sample.control })
+        second := out.place(2, 8, 8, false)
+        out.load(105, 31, 8, 8, second)
+        out.check(105, 0)
+        if sample.id == 9 { out.store(5, 31, 0, 8, first) }
+    }
+    if sample.id == 19 {
+        wide := out.place(1, -8, 8, true)
+        narrow := out.place(1, -8, 4, true)
+        out.load(105, 29, -8, 8, wide)
+        out.check(105, sample.input)
+        out.store(5, 29, -8, 4, narrow)
+    }
+    out.clobber_arguments()
+    out.constant(100, 0)
+    out.compare(100, 100)
+    out.constant(0, 99)
+}
+
+fn expand(source: &oracle.Model, helpers: &[]i64, sample: &cases.Sample, suite: exports.Suite, out: &mut Expansion) -> bool {
+    for id in source.order {
+        out.label_position()
+        op := &source.operations[id]
+        if op.mode == 2 { out.emit(op.clone()); continue }
+        if op.kind == 14 {
+            if suite == .Regions {
+                if op.target != helpers[0] && op.target != helpers[1] { return false }
+                expand_region_helper(&mut out, &sample, op.target == helpers[1])
+            } else {
+                if op.target != helpers[0] || (sample.id != 8 && sample.id != 9 && sample.id != 10 && sample.id != 19) { return false }
+                expand_expression_helper(&mut out, &sample)
+            }
+        } else if suite == .Expression && op.kind == 12 && op.target == helpers[1] {
+            expression_exit(&mut out, sample.input)
+        } else if suite == .Expression && op.kind == 10 {
+            out.emit(op.clone())
+            padding := out.place(2, 8, 8, false)
+            out.store(-1, 31, 8, 8, padding)
+        } else if suite == .Expression && op.kind == 11 {
+            padding := out.place(2, 8, 8, false)
+            out.load(106, 31, 8, 8, padding)
+            out.emit(op.clone())
+        } else { out.emit(op.clone()) }
+    }
+    out.relocate(&source)
+}
+
+pub fn interpret(source: &oracle.Model, helpers: &[]i64, sample: &cases.Sample, suite: exports.Suite) -> Proof {
+    if suite == .Ssa { return interpret_ssa(&source, &sample) }
+    id := sample.id
+    if suite == .Regions && (id == 10 || id == 14) {
+        return gap_proof("consumed retained large-helper scratch; actual native observer covers exact address bits", 0)
+    }
+    if suite == .Expression && (id == 16 || id == 17) {
+        return gap_proof("resource bounds have no fabricated OS mapping model", 0)
+    }
+    mut transformed := Expansion::new(&source)
+    if !expand(&source, &helpers, &sample, suite, &mut transformed) { return failure("unknown native helper or invalid label position") }
+    mut machine := initial(&sample, suite)
+    mark_input_flags(&mut machine, sample.input, sample.control)
+    outcome := machine.run(&transformed.model, 250000)
+    trap := trap_status(suite, &sample)
+    if outcome.state == .Gap && trap != 0 && outcome.reason == f"external branch {helpers[2]}" {
+        mut proof := blank()
+        proof.ok = true
+        proof.trap = i64(trap)
+        proof.steps = outcome.steps
+        return proof
+    }
+    if outcome.state != .Complete { return failure(outcome.reason) }
+    if trap != 0 { return failure("interpreter completed an expected trap") }
+    mut proof := completed(&mut machine, &outcome, &sample, suite)
+    if !proof.ok || suite != .Expression || id != 20 { return proof }
+    mut generic := initial(&sample, suite)
+    raw := generic.run(&source, 250000)
+    if raw.state != .Complete || raw.value != 0 {
+        return failure("generic Push must overwrite prefilled padding with XZR")
+    }
+    proof.generic_zero = true
+    proof
+}

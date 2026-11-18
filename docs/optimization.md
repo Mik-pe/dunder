@@ -419,10 +419,10 @@ Linuxmålen är endast bildbyggda i dessa matriser. De riktade resultaten
 ersätter varken full bootstrapverifiering eller en representativ mätmatris.
 Tidigare strukturella prov med sex→noll laster men 26→30 kodord och
 81→noll laster med 329→249 ord är inte latensmått.
-[SSA-/rollback-orakel](../tools/test-mir-ssa.py) ·
+[SSA-/rollback-orakel](../tools/test_mir_ssa.ddr) ·
 [Cellkontrakt](../tests/mir_ssa_cells.ddr) ·
 [SSA-kontrakt](../tests/mir_ssa.ddr) ·
-[Källkod, workers, cache och kvitton](../tools/test-ssa-source.py).
+[Källkod, workers, cache och kvitton](../tools/test_ssa_source.ddr).
 
 Generellt SSA-baserat val av skalära operationer, vidare värdeplacering,
 heap-CSE, LICM och direkt registerallokering per mål återstår. Den nuvarande
