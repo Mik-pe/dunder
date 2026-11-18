@@ -1,0 +1,371 @@
+capability filesystem, process
+
+import .benchmark_commands as bench
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .report_json as report
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Driver { name: string, path: string, digest: string, flags: []string }
+
+struct Program { name: string, source: string, stdout: string, status: i32 }
+
+struct Cases { programs: []Program, traps: []Program, rejections: []Program }
+
+struct Options { root: string, work: string, host: string, targets: []string, drivers: []Driver, selection: bool }
+
+struct Counts { executed: i32, built: i32, rejected: i32 }
+
+fn run(program: string, move args: []string, cwd: string, clean: bool, expected_status: i32, context: string,
+       output: &mut process.Output) -> bool {
+    mut command := process.command(program.clone(), move args)
+    command.set_cwd(cwd.clone())
+    command.set_timeout(60000)
+    if clean {
+        command.clear_env()
+        command.set_env("PATH", "/no-external-tools")
+    }
+    result := command.exec()
+    if !result.ok || result.code != expected_status || result.signal != 0 || result.timed_out {
+        return harness.fail(f"{context}: exit {result.code}, expected {expected_status} (signal {result.signal}, timed out {result.timed_out})\n{result.stdout_text()}\n{result.stderr_text()}")
+    }
+    output = result
+    true
+}
+
+fn build(driver: &Driver, source: string, image: string, target: string, work: string, timing: bool, output: &mut process.Output) -> bool {
+    mut args: []string = ["build", source.clone(), "--target", target.clone(), "-o", image.clone()]
+    for flag in driver.flags { args.push(flag.clone()) }
+    if timing { args.push("--timings=json") }
+    context := driver.name + " build " + harness.basename(source) + " (" + target + ")"
+    run(driver.path, move args, work, true, 0, context, &mut output)
+}
+
+fn minimum_modeled(name: string) -> i64 {
+    if name == "register_pressure" || name == "mutation_sort_reverse" || name == "mutation_multiple_roots" { 2 } else { 1 }
+}
+
+fn selected(output: &process.Output, variant: string, name: string, target: string) -> bool {
+    data := json.Doc::parse_bytes(output.stderr.clone())
+    optimizer := data.field(data.root, "optimizer")
+    enabled := data.get_bool(optimizer, "enabled")
+    modeled := data.get_i64(optimizer, "modeled")
+    emitted := data.get_i64(optimizer, "emitted")
+    expect_on := variant == "candidate"
+    if !data.ok || !enabled.ok || enabled.value != expect_on || !modeled.ok || !emitted.ok {
+        return harness.fail(f"{variant} {name} {target}: invalid optimizer report\n{output.stderr_text()}")
+    }
+    if expect_on && !text.starts_with(name, "fallback_") {
+        minimum := minimum_modeled(name)
+        if modeled.value < minimum || emitted.value < minimum ||
+           (name == "same_direction_i32" && data.get_i64(optimizer, "rewrites").value < 1) {
+            return harness.fail(f"{variant} {name} {target}: expected modeled and emitted optimizer bodies\n{output.stderr_text()}")
+        }
+    } else if modeled.value != 0 || emitted.value != 0 {
+        return harness.fail(f"{variant} {name} {target}: optimizer unexpectedly selected a body\n{output.stderr_text()}")
+    }
+    true
+}
+
+fn match_stdout(output: &process.Output, expected: string, context: string) -> bool {
+    wanted := bench.raw(expected)
+    bytes.equal(&output.stdout, &wanted) ||
+        harness.fail(f"{context}: unexpected stdout\nexpected:\n{expected}\nobserved:\n{output.stdout_text()}\n{output.stderr_text()}")
+}
+
+fn verify_builds(options: &Options, case: &Program, source: string, headers: bool, counts: &mut Counts) -> bool {
+    mut output := harness.empty_output()
+    for driver in options.drivers {
+        for target in options.targets {
+            image := options.work + "/" + case.name + "-" + driver.name + "-" + target
+            observe := options.selection && driver.name != "baseline"
+            if !build(&driver, source, image, target, options.work, observe, &mut output) ||
+               (observe && !selected(&output, driver.name, case.name, target)) { return false }
+            context := driver.name + " " + case.name + " " + target
+            if target == options.host {
+                if !run(image, [], options.work, false, case.status, context, &mut output) ||
+                   !match_stdout(&output, case.stdout, context) { return false }
+                counts.executed += 1
+            } else {
+                if headers {
+                    data := sys.read_u8(image)
+                    if !data.ok || !native.image_header(&data.value, target) { return harness.fail(f"{context}: wrong image format") }
+                }
+                counts.built += 1
+            }
+        }
+    }
+    true
+}
+
+fn agent_records(output: &process.Output) -> string {
+    if output.stderr.len != 0 { return "" }
+    data := output.stdout_utf8()
+    if !data.ok { return "" }
+    lines := harness.lines(data.value)
+    if lines.len == 0 { return "" }
+    mut writer := json.Writer::new()
+    writer.array()
+    for i in 0..lines.len {
+        doc := json.Doc::parse_text(lines[i])
+        if !doc.ok || !report.write_value(&doc, doc.root, &mut writer) { return "" }
+        if i == lines.len - 1 && doc.get_str(doc.root, "kind").value != "ok" { return "" }
+    }
+    writer.end()
+    writer.finish().value
+}
+
+fn verify_bindings(options: &Options, source: string, name: string) -> bool {
+    mut output := harness.empty_output()
+    for target in options.targets {
+        mut baseline := ""
+        for driver in options.drivers {
+            mut args: []string = ["check", source.clone(), "--target", target.clone(), "--agent"]
+            for flag in driver.flags { args.push(flag.clone()) }
+            context := driver.name + " check --agent " + name + " " + target
+            if !run(driver.path, move args, options.work, true, 0, context, &mut output) { return false }
+            converted := agent_records(&output)
+            if converted.len == 0 { return harness.fail(f"{context}: invalid binding records\n{output.stdout_text()}\n{output.stderr_text()}") }
+            if baseline.len == 0 { baseline = move converted }
+            else if converted != baseline {
+                return harness.fail(f"binding records changed for {driver.name} {name} {target}\n{baseline}\n{converted}")
+            }
+        }
+    }
+    true
+}
+
+fn same_streams(left: &process.Output, right: &process.Output) -> bool {
+    left.code == right.code && bytes.equal(&left.stdout, &right.stdout) && bytes.equal(&left.stderr, &right.stderr)
+}
+
+fn valid_agent_error(output: &process.Output, path: string, size: i64) -> bool {
+    data := json.Doc::parse_bytes(output.stdout.clone())
+    if !data.ok || data.get_str(data.root, "kind").value != "error" { return false }
+    resolved := fs.realpath(data.get_str(data.root, "path").value)
+    start := data.get_i64(data.root, "start")
+    end := data.get_i64(data.root, "end")
+    resolved.ok && resolved.value == path && start.ok && end.ok && start.value >= 0 &&
+        start.value <= end.value && end.value <= size
+}
+
+fn verify_rejections(options: &Options, item: &Program, source: string, counts: &mut Counts) -> bool {
+    previous := options.work + "/previous-output"
+    preserved := "previous successful output"
+    size := i64(item.source.len)
+    for target in options.targets {
+        for mode in ["check", "check-agent", "build"] {
+            mut baseline := harness.empty_output()
+            for i in 0..options.drivers.len {
+                driver := &options.drivers[i]
+                if !sys.write_text(previous, preserved).ok { return harness.fail("cannot seed previous output") }
+                command := if mode == "build" { "build" } else { "check" }
+                mut args: []string = [command, source.clone(), "--target", target.clone()]
+                if mode == "check-agent" { args.push("--agent") }
+                if mode == "build" { args.push("-o"); args.push(previous.clone()) }
+                for flag in driver.flags { args.push(flag.clone()) }
+                mut output := harness.empty_output()
+                context := driver.name + " " + item.name + " " + mode + " " + target
+                if !run(driver.path, move args, options.work, true, 1, context, &mut output) { return false }
+                if mode == "check-agent" && !valid_agent_error(&output, source, size) {
+                    return harness.fail(f"{context}: invalid agent error\n{output.stdout_text()}")
+                }
+                file := sys.read_text(previous)
+                if !file.ok || file.value != preserved { return harness.fail(f"{context}: failed command replaced previous output") }
+                if i == 0 { baseline = move output }
+                else if !same_streams(&baseline, &output) {
+                    return harness.fail(f"diagnostics changed for {item.name} {mode} {target}\n{baseline.stdout_text()}\n{baseline.stderr_text()}\n{output.stdout_text()}\n{output.stderr_text()}")
+                }
+                counts.rejected += 1
+            }
+        }
+    }
+    true
+}
+
+fn write_case(work: string, item: &Program) -> string {
+    path := work + "/" + item.name + ".ddr"
+    if !sys.write_text(path, item.source).ok { _ := harness.fail(f"cannot write {path}"); return "" }
+    path
+}
+
+fn definition(name: string, params: string, result: string, body: string) -> string {
+    f"pub fn {name}({params})->{result}{{{body}}}\n"
+}
+
+fn model_reuse(candidate: &Driver, root: string, work: string, target: string) -> bool {
+    mut body := "mut total:=x-y;"
+    for _ in 0..24 { body += "total=total+1;" }
+    body += "return total"
+    addition := text.find(body, "+1")
+    upgrade := body[0..addition] + "+2" + body[(addition+2)..body.len]
+    invalid := body[0..addition] + "+\"1\"" + body[(addition+2)..body.len]
+    left_path := work + "/left.ddr"
+    right_path := work + "/right.ddr"
+    source := work + "/reuse.ddr"
+    image := work + "/reuse-image"
+    mut left := ""
+    mut calls := ""
+    for i in 0..6 {
+        left += definition(f"f{i}", "x:i32,y:i32", "i32", body)
+        calls += f"print(left.f{i}(7,3));"
+    }
+    right := "\n\n" + definition("same", "x:i32,y:i32", "i32", body) + definition("reverse", "y:i32,x:i32", "i32", body) +
+        definition("wide", "x:i64,y:i64", "i64", body) + definition("different", "x:i32,y:i32", "i32", upgrade)
+    main := "capability unsafe\nimport left\nimport right\nfn main(){" + calls +
+        "\n        a:fn(i32,i32)->i32=left.f0; b:fn(i32,i32)->i32=right.same\n" +
+        "        unsafe { assert(load_i64(addr(&a)) != load_i64(addr(&b))) }\n" +
+        "        print(a(7,3));print(b(7,3));print(right.reverse(7,3))\n" +
+        "        print(right.wide(4294967300,3));print(right.different(7,3))\n    }"
+    if !sys.write_text(left_path, left).ok || !sys.write_text(right_path, right).ok || !sys.write_text(source, main).ok {
+        return harness.fail("cannot write model reuse fixture")
+    }
+    mut output := harness.empty_output()
+    for disabled in [false, true] {
+        mut flags: []string = ["--inline-opt=off"]
+        if disabled { flags.push("--scalar-opt=off") }
+        driver := Driver { name: candidate.name.clone(), path: candidate.path.clone(), digest: candidate.digest.clone(), flags: flags }
+        if !build(&driver, source, image, target, work, false, &mut output) ||
+           !run(image, [], work, false, 0, "scalar model reuse", &mut output) ||
+           !match_stdout(&output, "28\n28\n28\n28\n28\n28\n28\n28\n20\n4294967321\n29\n", "scalar model reuse") { return false }
+    }
+    for mismatch in 0..3 {
+        params := if mismatch == 1 { "z:i32,y:i32" } else { "x:i32,y:i32" }
+        result := if mismatch == 2 { "bool" } else { "i32" }
+        replacement := if mismatch == 0 { invalid.clone() } else { body.clone() }
+        if !sys.write_text(right_path, definition("bad", params, result, replacement)).ok ||
+            !sys.write_text(source, "import left\nimport right\nfn main(){" + calls + "print(right.bad(7,3))}").ok {
+            return harness.fail("cannot write model reuse near miss")
+        }
+        mut first: []u8 = []
+        for disabled in [false, true] {
+            if !sys.write_text(image, "previous build").ok { return harness.fail("cannot seed previous build") }
+            mut args: []string = ["build", source.clone(), "--inline-opt=off", "-o", image.clone()]
+            if disabled { args.push("--scalar-opt=off") }
+            if !run(candidate.path, move args, work, true, 1, "scalar model reuse near miss", &mut output) { return false }
+            if text.find(output.stderr_text(), right_path) < 0 { return harness.fail(output.stderr_text()) }
+            file := sys.read_text(image)
+            if !file.ok || file.value != "previous build" { return harness.fail("failed model build replaced previous output") }
+            if !disabled { first = output.stderr.clone() }
+            else if !bytes.equal(&first, &output.stderr) { return harness.fail("model reuse near miss changed diagnostics") }
+        }
+    }
+    probe := work + "/model-hits"
+    if !build(&candidate, root + "/tests/fixtures/scalar-model-reuse.ddr", probe, target, work, false, &mut output) ||
+       !run(probe, [], work, false, 0, "scalar model reuse internal witness", &mut output) { return false }
+    print("PASS scalar model reuse, declaration identity, near misses and source diagnostics")
+    true
+}
+
+fn parse_cases(doc: &json.Doc, category: string, items: &mut []Program, names: &mut Map<string, bool>) -> bool {
+    node := doc.field(doc.root, category)
+    if doc.kind(node) != .Array || doc.count(node) == 0 { return harness.fail(f"invalid optimizer fixture category {category}") }
+    for i in 0..doc.count(node) {
+        record := doc.at(node, i)
+        name := doc.get_str(record, "name").value
+        source := doc.get_str(record, "source")
+        if !source.ok || name.len == 0 || names.contains(name) { return harness.fail(f"invalid or duplicate optimizer fixture {name}") }
+        for byte in name.bytes() {
+            if (byte < 48 || byte > 57) && (byte < 65 || byte > 90) && (byte < 97 || byte > 122) && byte != 95 && byte != 45 {
+                return harness.fail(f"invalid optimizer fixture name: {name}")
+            }
+        }
+        mut stdout := ""
+        mut status := 0
+        if category == "programs" {
+            stream := doc.get_str(record, "stdout")
+            if !stream.ok { return harness.fail(f"missing expected output for {name}") }
+            stdout = stream.value
+        } else if category == "traps" {
+            exit_code := doc.get_i64(record, "status")
+            if !exit_code.ok || exit_code.value < 1 || exit_code.value > 255 {
+                return harness.fail(f"missing or invalid trap status for {name}")
+            }
+            status = i32(exit_code.value)
+            stdout = "17\n"
+        }
+        names.put(name.clone(), true)
+        items.push(Program { name: name, source: source.value, stdout: stdout, status: status })
+    }
+    true
+}
+
+fn exercise(options: &Options, candidate: &Driver) -> bool {
+    raw := sys.read_u8(options.root + "/tests/fixtures/scalar-optimizer-cases.json")
+    if !raw.ok { return harness.fail("cannot read frozen optimizer cases") }
+    doc := json.Doc::parse_bytes(raw.value.clone())
+    mut cases := Cases { programs: [], traps: [], rejections: [] }
+    mut names := Map<string, bool>::new()
+    if !doc.ok || !parse_cases(&doc, "programs", &mut cases.programs, &mut names) ||
+        !parse_cases(&doc, "traps", &mut cases.traps, &mut names) ||
+        !parse_cases(&doc, "rejections", &mut cases.rejections, &mut names) { return false }
+    fixture := sys.read_text(options.root + "/tests/contracts/scalar_optimizer.ddr")
+    if !fixture.ok { return harness.fail("cannot read scalar optimizer contract") }
+    cases.programs.push(Program { name: "fixture", source: fixture.value, stdout: "42\n", status: 0 })
+    if !model_reuse(&candidate, options.root, options.work, options.host) { return false }
+    mut counts := Counts { executed: 0, built: 0, rejected: 0 }
+    for item in cases.programs {
+        path := write_case(options.work, &item)
+        if path.len == 0 || !verify_builds(&options, &item, path, true, &mut counts) ||
+           !verify_bindings(&options, path, item.name) { return false }
+        print("PASS results " + item.name)
+    }
+    for item in cases.traps {
+        path := write_case(options.work, &item)
+        if path.len == 0 || !verify_builds(&options, &item, path, false, &mut counts) { return false }
+        print("PASS traps " + item.name)
+    }
+    for item in cases.rejections {
+        path := write_case(options.work, &item)
+        if path.len == 0 || !verify_rejections(&options, &item, path, &mut counts) { return false }
+        print("PASS diagnostics " + item.name)
+    }
+    for driver in options.drivers {
+        if harness.sha256_file_hex(driver.path) != driver.digest { return harness.fail("compiler changed during verification") }
+    }
+    print(f"{counts.executed} native executions; {counts.built} cross-builds (not executed); {counts.rejected} matching invalid diagnostics")
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--baseline"), cli.flag("--verify-selection")]
+    args := cli.parse(&spec)
+    path := cli.compiler(&args, "usage: test_optimizer COMPILER [--baseline COMPILER] [--verify-selection]")
+    if args.help { return 0 }
+    if path.len == 0 { return 2 }
+    baseline := fs.realpath(args.last("--baseline", path))
+    if !baseline.ok || !sys.metadata(baseline.value).is_file || !sys.metadata(path).is_file {
+        _ := harness.fail("cannot read baseline or candidate compiler")
+        return 2
+    }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("cannot locate Dunder checkout"); return 1 }
+    work := fs.temp_dir("dunder-optimizer-")
+    if !work.ok { _ := harness.fail("cannot create optimizer work directory"); return 1 }
+    defer { _ := fs.remove_all(work.value) }
+    directory := fs.realpath(work.value)
+    if !directory.ok { _ := harness.fail("cannot resolve optimizer work directory"); return 1 }
+    host := process.host_target()
+    mut targets: []string = [host.clone()]
+    for target in move harness.targets() { if target != host { targets.push(move target) } }
+    candidate := Driver { name: "candidate", path: path.clone(), digest: harness.sha256_file_hex(path), flags: [] }
+    explicit := args.has("--baseline")
+    selection := args.has("--verify-selection")
+    mut drivers: []Driver = [
+        Driver { name: "baseline", path: baseline.value.clone(), digest: harness.sha256_file_hex(baseline.value),
+            flags: if explicit { [] } else { ["--scalar-opt=off"] } },
+        candidate.clone(),
+    ]
+    if explicit && selection {
+        drivers.push(Driver { name: "candidate_off", path: path.clone(), digest: candidate.digest.clone(),
+            flags: ["--scalar-opt=off"] })
+    }
+    options := Options { root: root, work: directory.value, host: host, targets: move targets, drivers: move drivers, selection: selection }
+    if exercise(&options, &candidate) { 0 } else { 1 }
+}

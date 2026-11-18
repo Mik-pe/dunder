@@ -640,7 +640,7 @@ parseråterfall. Avvisade signaturer och cacheträffar ingår inte i
 återfallsräknaren. Funktionscache och `test --affected` skiljer lägena åt;
 CLI-cachen behåller varma fragment separat för båda lägena.
 
-`tools/test-optimizer.py` jämför optimerad kod med avstängt pass och kan
+[`tools/test_optimizer.ddr`](../tools/test_optimizer.ddr) jämför optimerad kod med avstängt pass och kan
 även jämföra med en äldre kompilator genom `--baseline`. Den provar
 resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
 använder modellen. `tools/test_opt_emitter.ddr` provar emission och spill
