@@ -13,8 +13,8 @@ are also supported by the language. Workers have no IO, ambient state or nested 
 
 | Case | Work | Independent reference |
 | --- | --- | --- |
-| cpu | A record supplies a distinct seed and step count. Each worker advances an integer recurrence and returns its full sum and final state. | Python arbitrary-precision multiplication/remainder and sum, checking both fields of all 32 results. |
-| array | A record supplies a primitive array snapshot, job index and pass count. Each worker copies and updates its private array and returns its weighted sum, first and last value. | Python lists and integer arithmetic for every element/pass. All result fields and the parent's unchanged original checksum/endpoints are checked. |
+| cpu | A record supplies a distinct seed and step count. Each worker advances an integer recurrence and returns its full sum and final state. | The Dunder reference reduces each step modulo 2³¹−1 by folding bits. It checks both fields of all 32 results. |
+| array | A record supplies a primitive array snapshot, job index and pass count. Each worker copies and updates its private array and returns its weighted sum, first and last value. | The Dunder reference composes the passes into one affine transform per job. It checks all result fields and the original array's checksum and endpoints. |
 
 The correctness tool can also call the `*_worker.ddr` modules directly using
 the serial compiler built by `tools/bootstrap.sh`. It checks the same expected
@@ -29,7 +29,7 @@ uncontrolled; the report records host/hardware and paired samples.
 ## Correctness without timing
 
 ```sh
-python3 tools/performance-tasks.py check /path/to/task-compiler \
+dunder run tools/performance_tasks.ddr -- check /path/to/task-compiler \
   --reference-compiler build/selfhost/arm64-macos/dunder-serial \
   --report build/task-throughput-check
 ```
@@ -44,7 +44,7 @@ are 500000 steps/job and 192 passes over 1024 elements/job. These are not measur
 calibration results. Stop competing builds and tests before sizing and running a series.
 
 ```sh
-python3 tools/performance-tasks.py calibrate /path/to/task-compiler \
+dunder run tools/performance_tasks.ddr -- calibrate /path/to/task-compiler \
   build/task-throughput-sizing --target-ms 250
 ```
 
@@ -57,7 +57,7 @@ The 250 ms target is proposed to amortize scheduling; whether it does so remains
 an observed sizing result, not an assumption of task speedup.
 
 ```sh
-python3 tools/performance-tasks.py measure /path/to/task-compiler \
+dunder run tools/performance_tasks.ddr -- measure /path/to/task-compiler \
   build/task-throughput-30 --manifest /path/to/frozen-workloads.json --rounds 30
 ```
 
