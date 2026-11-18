@@ -1,143 +1,75 @@
-# Generics som en del av Dunders typsystem
+# Generics i Dunders typsystem
 
-**Designförslag.** Behåll explicita typargument och monomorfisering. Flytta
-beslutet om *vilken instans en användning avser* till namnbindningen och
-typkontrollen. Då får en typ samma betydelse som fält, funktionsparameter och
-typargument. Dagens syntax och exempel finns i [språkbeskrivningen](syntax.md#generiska-deklarationer).
+En generisk deklaration beskriver en familj av funktioner eller typer. En
+instans bestäms av **vilken deklaration** som används och **vilka typer**
+som fyller dess parameterplatser. Samma regel gäller för egna deklarationer
+och standardbibliotekets `Map`, `Set` och `Result`. Typargumenten är
+explicita. [Syntax och exempel](syntax.md#generiska-deklarationer)
 
-## Var dagens modell brister
+## Vad gör två instanser lika?
 
-Den självbyggda kompilatorn vid `243ca53` godtar en funktion som tar
-`(i32, bool,)` och returnerar värdet som `(i32, bool)`. Med samma tupel
-inuti en generisk struct avvisar den returen med `type mismatch`.
+`Box<(i32, bool,)>` och `Box<(i32, bool)>` är samma typ om båda namnen
+syftar på samma `Box`. Två moduler kan samtidigt deklarera varsin
+`Box<T>` med likadana fält. Dessa deklarationer ger olika typer, även om
+båda instansieras med `i32`.
 
-```dunder
-struct Box<T> { value: T }
-fn convert(move x: Box<(i32, bool,)>) -> Box<(i32, bool)> { x }
-fn main() {
-    v := Box<(i32, bool,)> { value: (42, true) }
-    print(convert(move v).value.0)
-}
-```
+Modulladdaren binder importalias, lokala namn och typparametrar i deras
+lexikala omgivning. Därför är `Map < limit` en jämförelse när `Map` är
+en lokal variabel. I en typannotation slås `Map<i32, string>` upp som typ.
+Källtext som skickas direkt till kompilatorn använder samma bindning.
+[Namnbindning](../selfhost/driver/modules.ddr)
 
-En annan följd syns i ett program som bara jämför heltal.
+Den ordinarie typparsern representerar exempelvis `Box<[]T>` som en
+tillämpning av den bundna deklarationen på en array av en typparameter.
+När argumentet för `T` blir känt får arrayen sitt vanliga typ-ID.
+Kompilatorns instanstabell använder deklarationens ID och den ordnade
+följden av argumentens typ-ID:n. För funktionstyper ingår bland annat
+anropskonvention, parameterlägen och returlånets källparameter i identiteten.
+[Typparser](../selfhost/frontend/type_syntax.ddr) · [Typupplösning](../selfhost/frontend/type_reader.ddr) · [Instanstabell](../selfhost/frontend/type_keys.ddr)
 
-```dunder
-fn main() {
-    Map := 1
-    limit := 2
-    print(Map < limit && limit > 0)
-}
-```
+## När kontrolleras koden?
 
-Här rapporterar kompilatorn att `Map` behöver två typargument. Byter man
-variabelnamn till `count` skriver programmet ut `true`. Båda felen uppstår
-i steget som söker efter namn följda av `<`, bygger en instansnyckel av
-argumentens text och skriver om programmet före ordinarie typkontroll.
-[Specialisering](../selfhost/frontend/generics.ddr) · [Tolkning av typargument](../selfhost/frontend/generic_arguments.ddr)
-
-Tidpunkten för kontrollen påverkar också vilka program som godtas. En oanvänd
-generisk funktion kan anropa en obefintlig fri funktion och ändå passera
-`dunder check`. När `Box<i32>` väl används kontrolleras däremot alla dess
-metodkroppar. En oanropad `count` som läser `self.value.len` stoppar till och
-med ett anrop till en annan metod som bara returnerar `42`.
-
-## Namn, typer och identitet
-
-1. **Bind deklarationen en gång.** Varje funktion, struct, enum och metod får
-   ett deklarations-ID med sin ägarmodul. En typparameter identifieras av sin
-   deklaration och sin plats i parameterlistan. Ett `impl` binder sina
-   parametrar till mottagartypens parameterplatser. Importalias leder till
-   den exporterade deklarationen. Samma gränssnitt används för moduler och
-   för källtext som skickas direkt till kompilatorn.
-2. **Tolka typen en gång.** Den ordinarie typparsern får representera även
-   öppna typer, exempelvis `Box<[]T>` som en tillämpning av `Box` på en
-   array av parameter nummer ett. I ett uttryck slår parsern först upp
-   namnet i dess lexikala omgivning. Ett lokalt heltal kan följas av
-   jämförelseoperatorn `<`. En bunden generisk funktion kan följas av
-   typargument både vid anrop och som funktionsvärde, exempelvis `id<i32>`.
-3. **Låt typsystemet bestämma likhet.** Inom ett bygge är nyckeln
-   `(deklarations-ID, ordnad följd av kanoniska typ-ID:n)`. För en metod
-   ingår mottagarens typargument. Därmed ger två importer av samma `Box`
-   och två likvärdiga tupelstavningar samma instans. Två separat deklarerade
-   structar förblir olika trots identiska fält. Strukturella typer jämförs
-   rekursivt med sina vanliga typregler, inklusive arraylängd, låneslag och
-   för funktioner även anropskonvention, effektivt parameterläge och
-   returlånets källparameter. Typregistret har redan strukturell uppslagning
-   för bland annat funktionstyper. [Typregistret](../selfhost/frontend/frontend_types.ddr)
-
-För exemplet ovan binds `T` i `Box` till samma tupel-ID vid parametern och
-returtypen. Kompilatorn reserverar en struct och beräknar dess layout en gång.
-För detta räcker en representation av bundna typuttryck och referenser till
-deklarationer. Kroppens tokenföljd kan ligga kvar oförändrad. När kroppen
-typkontrolleras slås en typparameter upp i instansens tabell över argument.
-Källpositionen för varje användning finns då kvar för felmeddelanden.
-
-## Vad kontrolleras när?
-
-| Tidpunkt | Ansvar |
+| Tidpunkt | Vad kompilatorn gör |
 | --- | --- |
-| Vid deklarationen | Kontrollera syntax, signaturer, namn, synlighet och uttryck som kan avgöras oberoende av typparametrarna. Ett okänt fritt funktionsnamn är ett fel även i en oanvänd mall. Spara den bundna kroppen och markera operationer som behöver en konkret typ. |
-| När en typ används | Sätt in typargumenten i fält och enumvarianter. Kontrollera typens deklarerade krav och beräkna layout, ägarskap och städning med samma regler som för en vanlig deklaration. |
-| När en funktion eller metod används | Kontrollera de typberoende operationerna för just denna kropp. För en metod som läser `self.value.len` måste den konkreta fälttypen stödja `len`. Övriga metoder kan användas oberoende. Ett funktionsvärde räknas också som användning. |
+| Vid deklarationen | Binder namn, typparametrar och generiska tillämpningar i definitionsmodulen. Den ordinarie typkontrollen granskar slutna kroppar och självständiga delar av öppna kroppar. Ett okänt fritt funktionsnamn eller `true + 1` kan därmed fälla en oanvänd mall. |
+| När en typ används | Reserverar typens identitet, kontrollerar dess deklarerade krav och fastställer fält, varianttyper och metodsignaturer. Därefter gäller typens vanliga regler för layout, lån och städning. |
+| När en funktion eller metod används | Kontrollerar hela den konkreta kroppen med dess faktiska typer. En hänvisning till ett funktionsvärde räknas också som användning. Fel i en konkret kropp pekar på definitionen och visar vilka användningar som begärde instansen. |
 
-Den konkreta signaturen går genom Dunders ordinarie regler för implicit lån,
-`move` och returlån. Privata namn och rättigheter hör till definitionsmodulen.
-Ett fel som beror på ett typargument ska visa operationen i definitionen
-och den användning som valde argumentet, med instanskedjan när den behövs.
+Ett typkrav tillhör alla instanser av typen. Exempelvis kräver
+`Map<K, V>` lagringsbara argument och två publika, säkra nyckelmetoder av
+bestämd typ. En användare kan ange samma slags krav med `where`.
+`Set<K>` får nyckelkraven genom sitt fält av typen `Map<K, bool>`.
+För en metod som läser `self.value.len` avgör fälttypen vid metodens
+användning om operationen är giltig. Därför kan en annan metod på
+`Box<i32>` användas även om `i32` saknar `len`.
+Ett uttryckligt krav på en funktion eller ett `impl`-block kontrolleras
+också när funktionen eller en metod i blocket väljs.
+[Samlingarnas kontrakt](standard.md#generiska-samlingar) · [Körbart exempel](../tests/fixtures/generics/main.ddr)
 
-**Samlingarnas kontrakt.** `Map<K, V>` och `Set<K>` lovar att nycklar både
-kan hashas och jämföras. Det kravet gäller redan vid exempelvis
-`Map<K, V>::new()`. Lägg det på typdeklarationen som ett strukturellt
-krav på de två publika metodsignaturerna. Samma deklarationsmöjlighet ska
-vara tillgänglig för användartyper. Kontrollera lagringsbarhet där ett
-värde lagras. En enskild metod kan därutöver kräva exempelvis kloning.
-Detta behåller samlingarnas kontrakt när metodkroppar börjar kontrolleras
-var för sig. För `?` behöver kompilatorn känna igen standardbibliotekets
-exporterade `Result` via dess deklarations-ID. Andra enums med samma namn
-eller varianter följer vanliga enumregler. [Samlingskontrakt](standard.md#generiska-samlingar) · [Dagens kontraktsprov](../tools/test_collections.ddr)
+Standardbibliotekets generiska deklarationer bäddas in från Dunderkällan.
+Operatorn `?` använder identiteten för det exporterade `Result` för att
+hitta dess framgångs- och feltyp. En användardeklarerad enum kan ha
+varianterna `Ok` och `Err` med vanlig enumsemantik.
+[Prelude](../runtime/prelude/result.ddr) · [Inbäddning](../selfhost/embed.ddr)
 
-## Från bunden deklaration till körbar kod
+## Från instans till körbar kod
 
-Dunder känner till de konkreta typerna vid bygge. Monomorfisering ger då
-direkta anrop och ordinarie layout och städning på både native och Wasm.
-Kostnaden är att flera kombinationer av typargument kan ge fler
-maskinkodskroppar. Källspråkets regler för typidentitet är desamma om en
-framtida kodgenerator kan dela maskinkod mellan vissa instanser.
+Samordnaren reserverar varje ny instans innan den följer dess beroenden.
+Rekursion med samma nyckel återanvänder instansen. Ett anrop med nya
+typargument lägger till en instans i arbetskön. Metodkroppar tas in när
+typkontrollen väljer dem. Den bundna källan och dess positioner återanvänds
+mellan upptäcktsvarven. Därefter får arbetarna en fryst deklarationsbild.
+Instanserna får vanlig maskinkod och vanliga städregler på native och Wasm.
+[Specialisering](../selfhost/frontend/generics.ddr) · [Kompilering](../selfhost/frontend/compile.ddr)
 
-Samordnaren håller en arbetskö för typer och funktioner. Vid första begäran
-reserverar den instansens ID och gör signaturen tillgänglig innan kroppen
-kontrolleras. När en kropp typkontrolleras läggs de konkreta typer och
-funktioner som kroppen refererar till i kön. Ett rekursivt anrop med samma
-nyckel återanvänder signaturen.
-En kedja av 70 *olika* funktioner är ändlig och ska godtas. Dagens kompilator
-stoppar den när upptäcktsdjupet passerar 64. En värdetyp med oändlig layout
-ska ge layoutfel. Ett anrop som hela tiden skapar nya typer, som
-`grow<T>()` som anropar `grow<[]T>()`, ska ge ett kontrollerat fel som
-visar hur argumentet växer. En övre resursgräns för antalet upptäckta
-instanser skyddar även fall där tillväxten är svår att känna igen.
+Kompilatorn skiljer mellan rekursion med samma argument och en återkommande
+deklaration som får nya argument för varje steg. En kedja av 70 olika
+deklarationer och en cykel som roterar 67 typargument godtas. Vid upprepad tillväxt som `grow<T>` till
+`grow<[]T>` avbryts specialiseringen med diagnostik. Kompilatorn har
+även en övre gräns på 65 536 instanser per program.
 
-Samordnaren färdigställer de gemensamma identiteterna i bestämd ordning
-och fryser dem före parallell kodgenerering. Arbetarnas lokala typnummer
-kan då stanna inom varje kropp. Beständiga cachenycklar måste kunna
-återskapas från paket, modul, deklaration och typargument. Återanvändning
-av maskinkod beror även på använd mallkropp, valda metoder, ABI, mål och
-kompilatorversion. [Parallell kompilering](tasks.md#kompilatorn-som-taskkonsument) · [Funktionscachen](incremental.md)
-
-## Införande och acceptans
-
-1. Lägg exemplen ovan i den befintliga generics-sviten. Lägg till prov för
-   två importalias till samma typ, två olika modulers publika typer med
-   samma namn och fält samt funktionstyper där bara returlånets källparameter skiljer.
-2. Inför bundna deklarationer och öppna typuttryck i frontenden. Anslut
-   både källtext-API:t och modulladdaren. Byt till typade instansnycklar
-   för egna deklarationer och standardbiblioteket i samma steg.
-3. Flytta typkraven till deklarationerna och inför kontroll per metod och
-   arbetskön. Prova oanvända mallar, fel i anropade metoder, vanlig
-   rekursion, den ändliga kedjan och växande typargument. Fel ska peka
-   tillbaka på användarens ursprungliga källrader.
-4. Ta bort tokenexpansionen, den separata typargumentparsern och
-   namnkontrollerna för samlingarna. Bygg från fröet och kör hela
-   självhostsviten. Bygg generics-proven för alla fyra mål, kör dem på
-   värden och Wasm och jämför seriella, parallella och inkrementella
-   nativebilder byte för byte för samma mål och källkod.
+Generics-sviten bygger för alla fyra mål och kör programmet på värden och
+i Wasm. För vart och ett av de tre native-målen jämför den bilder från
+seriella och parallella byggen samt kalla och varma inkrementella byggen
+byte för byte. Den provar också ändrade mallkroppar med samma cache.
+[Genericsproven](../tools/test_generics.ddr) · [Funktionscachen](incremental.md)

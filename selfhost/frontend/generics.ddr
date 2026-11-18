@@ -1,4 +1,5 @@
 import lexer
+import open_bodies
 import ..bundled
 import type_keys
 import type_reader
@@ -14,11 +15,11 @@ fn token(out: &mut lexer.Tokens, kind: lexer.Kind, spelling: string, position: i
 pub struct Layout {
     first: i32, starts: []i32, positions: []i32, end: i32,
     reserved: map.Map, requirements: Requirements, instance_ids: map.Map, function_instances: []i32,
-    sites: []i32, parents: []i32, error_function: i32, pending: map.Map,
+    sites: []i32, parents: []i32, error_function: i32, pending: map.Map, definition_checks: map.Map,
 }
 pub struct Requirements { receivers: []i32, methods: []string, signatures: []i32, sites: []i32 }
 fn requirements() -> Requirements { Requirements {receivers:[], methods:[], signatures:[], sites:[]} }
-pub fn layout() -> Layout { Layout {first:-1, starts:[], positions:[], end:-1, reserved:map.new(), requirements:requirements(), instance_ids:map.new(), function_instances:[], sites:[], parents:[], error_function:-1, pending:map.new()} }
+pub fn layout() -> Layout { Layout {first:-1, starts:[], positions:[], end:-1, reserved:map.new(), requirements:requirements(), instance_ids:map.new(), function_instances:[], sites:[], parents:[], error_function:-1, pending:map.new(), definition_checks:map.new()} }
 pub fn generated(layout: &Layout, position: i32) -> bool {
     layout.first >= 0 && position >= layout.first && position < layout.end
 }
@@ -31,15 +32,25 @@ pub fn origin(layout: &Layout, position: i32) -> i32 {
 
 struct Catalog {
     definitions: map.Map, names: []string, methods: []bool, next_impl: []i32, builtin: []bool,
-    counts: []i32, kinds: []i32, result: i32,
+    counts: []i32, kinds: []i32, c_layout: []bool, result: i32,
     bodies: lexer.Tokens, slots: []i32, starts: []i32, ends: []i32,
     removed: []i32, resume: []i32, constraints: Constraints, constraint_starts: []i32,
 }
 struct Constraints { parameters: []i32, methods: []string, signatures: lexer.Tokens, starts: []i32, slots: []i32 }
 struct Instances {
     index: type_keys.Index, definitions: []i32, names: []string, sites: []i32, parents: []i32,
+    depths: []i32, type_depths: []i32,
     arguments: []string, types: []i32, starts: []i32, reserved: map.Map, platform: i32,
     requirements: Requirements, pending: map.Map, error: string, at: i32,
+}
+fn argument_depth(plan: &Instances, types: &[]i32) -> i32 {
+    mut depth := 0
+    for ty in &types { if ty >= 0 && ty < plan.type_depths.len && plan.type_depths[ty] > depth { depth = plan.type_depths[ty] } }
+    depth
+}
+fn structural_depth(plan: &mut Instances, ty: i32, depth: i32) {
+    while ty >= plan.type_depths.len { plan.type_depths.push(0) }
+    plan.type_depths[ty] = depth
 }
 
 fn reject(plan: &mut Instances, at: i32, message: string) {
@@ -65,7 +76,7 @@ fn prefix(input: &lexer.Tokens, keyword: i32) -> i32 {
     }
     first
 }
-fn body_open(input: &lexer.Tokens, keyword: i32, after: i32, last: i32) -> i32 {
+fn signature_end(input: &lexer.Tokens, keyword: i32, after: i32, last: i32) -> i32 {
     mut at := after
     if input.texts[keyword] == "fn" {
         if !lexer.symbol(&input, at, "(") { return last }
@@ -76,7 +87,7 @@ fn body_open(input: &lexer.Tokens, keyword: i32, after: i32, last: i32) -> i32 {
         }
     }
     while at < last && lexer.is_newline(input.kinds[at]) { at += 1 }
-    if lexer.symbol(&input, at, "{") { at } else { last }
+    at
 }
 fn parameter_index(params: &[]string, word: string) -> i32 {
     for i in 0..params.len { if params[i] == word { return i } }
@@ -130,8 +141,15 @@ fn capture(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, ke
     if params.error != "" { reject(&mut plan, input.starts[params.after], params.error); return last }
     after := constraints(&mut catalog, &mut plan, &input, &params.names, params.after, last)
     if plan.error != "" { return last }
+    mut open := signature_end(&input, keyword, after, last)
+    mut trailing := last; mut resume := last
+    if open < last && input.texts[open] == "where" {
+        trailing = open; resume = constraints(&mut catalog, &mut plan, &input, &params.names, trailing, last)
+        open = resume
+        while open < last && lexer.is_newline(input.kinds[open]) { open += 1 }
+    }
+    if !lexer.symbol(&input, open, "{") { open = last }
     catalog.constraint_starts.push(catalog.constraints.methods.len)
-    open := body_open(&input, keyword, after, last)
     close := lexer.closing(&input, open, last, "{", "}")
     if close == last { reject(&mut plan, site, "expected a generic declaration body"); return last }
     if !method {
@@ -142,9 +160,12 @@ fn capture(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, ke
     if builtin && !method && name == bundled.prelude_export("result", "Result") { catalog.result = catalog.names.len - 1 }
     kind := if input.texts[keyword] == "struct" { 2 } else if input.texts[keyword] == "enum" { 3 } else { 0 }
     catalog.kinds.push(kind); catalog.counts.push(params.names.len)
+    mut c_layout := false
+    for i in first..keyword { if input.texts[i] == "c_layout" { c_layout = true } }
+    catalog.c_layout.push(c_layout)
     catalog.starts.push(catalog.slots.len)
     for i in first..close + 1 {
-        if i >= keyword + 2 && i < after { continue }
+        if (i >= keyword + 2 && i < after) || (i >= trailing && i < resume) { continue }
         mut slot := -1
         if i == keyword + 1 { slot = -2 }
         else if input.kinds[i] == .Name && !lexer.symbol(&input, i - 1, ".") && !lexer.symbol(&input, i - 1, "::") &&
@@ -185,12 +206,13 @@ fn request(catalog: &Catalog, source: &BoundSource, plan: &mut Instances, reg: &
     known := type_keys.find(&plan.index, def, &types)
     if known >= 0 { return known }
     instance := plan.names.len
-    mut repeats := 0; mut ancestor := parent
+    depth := argument_depth(&plan, &types)
+    mut repeats := 0; mut ancestor := parent; mut previous_depth := depth
     while ancestor >= 0 {
-        if plan.definitions[ancestor] == def {
-            repeats += 1
+        if plan.definitions[ancestor] == def && plan.depths[ancestor] < previous_depth {
+            repeats += 1; previous_depth = plan.depths[ancestor]
             if repeats >= 64 {
-                reject(&mut plan, site, "generic specialization nesting limit: recurring declaration with changing arguments, previous instance " + plan.names[ancestor])
+                reject(&mut plan, site, "generic specialization nesting limit: recurring declaration with growing arguments, previous instance " + plan.names[ancestor])
                 return -1
             }
         }
@@ -205,34 +227,39 @@ fn request(catalog: &Catalog, source: &BoundSource, plan: &mut Instances, reg: &
     }
     name += ">"
     type_keys.insert(&mut plan.index, def, &types, instance)
-    plan.names.push(name.clone()); plan.definitions.push(def); plan.sites.push(site); plan.parents.push(parent)
+    plan.names.push(name.clone()); plan.definitions.push(def); plan.sites.push(site); plan.parents.push(parent); plan.depths.push(depth)
     plan.starts.push(plan.arguments.len)
     for ty in &types { plan.arguments.push(ft.argument_name(&mut reg, ty)) }
     mut nominal := -1
     if catalog.kinds[def] != 0 {
         ty := ft.add_type(&mut reg, name, catalog.kinds[def], 0)
+        structural_depth(&mut plan, ty, depth + 1)
+        reg.c_record[ty] = catalog.c_layout[def]
         nominal = ty
         plan.reserved.put(name.clone(), i64(ty))
         if def == catalog.result {
-            for arg in &types {
-                if arg != 0 && !ft.array_element(&reg, arg) { reject(&mut plan, site, "Result type arguments must be storable values or ()"); return -1 }
-            }
             reg.result_success[ty] = types[0]; reg.result_failure[ty] = types[1]
         }
     }
     plan.types.push(nominal)
+    require_arguments(&catalog, &source, &mut plan, &mut reg, def, instance, site)
+    instance
+}
+fn require_arguments(catalog: &Catalog, source: &BoundSource, plan: &mut Instances, reg: &mut ft.TypeRegistry,
+    def: i32, instance: i32, site: i32) {
     for b in catalog.constraint_starts[def]..catalog.constraint_starts[def + 1] {
-        bounds_table := &catalog.constraints; receiver := types[bounds_table.parameters[b]]
+        bounds_table := &catalog.constraints
+        receiver := plan.index.arguments[plan.index.starts[instance] + bounds_table.parameters[b]]
         if bounds_table.methods[b] == "" {
-            if !ft.array_element(&reg, receiver) { reject(&mut plan, site, "type argument must be a storable value"); return -1 }
+            if !ft.array_element(&reg, receiver) { reject(&mut plan, site, "type argument must be a storable value"); return }
         } else {
+            nominal := plan.types[instance]
             required := evaluate(&catalog, &source, &mut plan, &mut reg, source.requirements[b], instance, nominal, site, false)
-            if plan.error != "" { return -1 }
+            if plan.error != "" { return }
             plan.requirements.receivers.push(receiver); plan.requirements.methods.push(bounds_table.methods[b].clone())
             plan.requirements.signatures.push(required); plan.requirements.sites.push(site)
         }
     }
-    instance
 }
 
 struct BoundSource {
@@ -339,6 +366,7 @@ fn evaluate(catalog: &Catalog, source: &BoundSource, plan: &mut Instances, reg: 
     }
     ty := type_reader.resolve(&mut reg, &tree, id, &types, plan.platform)
     if reg.error != "" { reject(&mut plan, site, reg.error) }
+    else if form != .Consume { depth := argument_depth(&plan, &types); structural_depth(&mut plan, ty, depth + 1) }
     ty
 }
 fn lower(catalog: &Catalog, plan: &mut Instances, reg: &mut ft.TypeRegistry, source: &BoundSource,
@@ -385,13 +413,54 @@ pub fn needed(input: &lexer.Tokens) -> bool {
     }
     false
 }
-pub struct Program { catalog: Catalog, source: BoundSource, root: i32, end: i32, reserved: map.Map }
+pub struct Program { catalog: Catalog, source: BoundSource, root: i32, checks_start: i32, checks: map.Map, end: i32, reserved: map.Map }
+fn definition_checks(catalog: &Catalog, source: &mut BoundSource, plan: &mut Instances) -> map.Map {
+    mut view := open_bodies.view()
+    mut end := 0; mut methods := map.new()
+    for d in 0..catalog.names.len { if !catalog.builtin[d] { end = source.ends[d] } }
+    if end == 0 { return move view.names }
+    analysis := open_bodies.analyze(&source.tokens, &source.expressions, &source.slots, &source.applications, end)
+    for d in 0..catalog.names.len {
+        if catalog.builtin[d] { continue }
+        first := source.starts[d]; end := source.ends[d]
+        if catalog.methods[d] {
+            for at in first..end {
+                if source.method_names[at] >= 0 {
+                    method := source.method_names[at]; key := catalog.names[d] + "::" + source.tokens.texts[method]
+                    if methods.contains(key) {
+                        reject(&mut plan, source.tokens.starts[method], "duplicate method '" + source.tokens.texts[method] + "' on type")
+                        return move view.names
+                    }
+                    methods.put(move key, 1)
+                    open_bodies.function(&mut view, &source.tokens, &analysis,
+                        source.method_names[at], at, source.method_ends[at])
+                }
+            }
+        } else {
+            mut name := first
+            while name < end && source.slots[name] != -2 { name += 1 }
+            if name == end { continue }
+            if catalog.kinds[d] != 0 { open_bodies.aggregate(&mut view, &source.tokens, &analysis, name, end, catalog.c_layout[d]) }
+            else {
+                body := signature_end(&source.tokens, name - 1, name + 1, end)
+                if body < end { open_bodies.function(&mut view, &source.tokens, &analysis, name, body, end - 1) }
+            }
+        }
+        if !view.tokens.ok { reject(&mut plan, view.tokens.error_at, view.tokens.error); return move view.names }
+    }
+    for i in 0..view.origins.len {
+        origin := view.origins[i]
+        app := if origin < 0 { -1 } else { source.applications[origin] }
+        bound_token(&mut source, view.tokens.kinds[i], view.tokens.texts[i], view.tokens.starts[i], -1, app, -1)
+    }
+    move view.names
+}
 fn instances(platform: i32, move reserved: map.Map) -> Instances {
-    Instances { index:type_keys.new(), definitions:[], names:[], sites:[], parents:[], arguments:[], types:[],
+    Instances { index:type_keys.new(), definitions:[], names:[], sites:[], parents:[], depths:[], type_depths:[], arguments:[], types:[],
         starts:[], reserved:move reserved, platform:platform, requirements:requirements(), pending:map.new(), error:"", at:0 }
 }
 pub fn bind_program(input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platform: i32) -> Program {
-    mut catalog := Catalog { definitions:map.new(), names:[], methods:[], next_impl:[], builtin:[], counts:[], kinds:[], result:-1,
+    mut catalog := Catalog { definitions:map.new(), names:[], methods:[], next_impl:[], builtin:[], counts:[], kinds:[], c_layout:[], result:-1,
         bodies:lexer.empty(false), slots:[], starts:[], ends:[], removed:[], resume:[],
         constraints:Constraints {parameters:[], methods:[], signatures:lexer.empty(false), starts:[0], slots:[]}, constraint_starts:[0] }
     mut plan := instances(platform, move map.new())
@@ -438,17 +507,22 @@ pub fn bind_program(input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platfor
     }
     root := source.slots.len
     bind(&catalog, &mut plan, &reg, &mut source, &input, 0, input.kinds.len - 1, true)
+    checks_start := source.slots.len
+    mut checks := map.new()
+    if plan.error == "" { checks = definition_checks(&catalog, &mut source, &mut plan) }
     if plan.error != "" { input.ok = false; input.error = plan.error.clone(); input.error_at = plan.at }
     catalog.bodies = lexer.empty(false); catalog.slots.clear(); catalog.removed.clear(); catalog.resume.clear()
-    Program {catalog:move catalog, source:move source, root:root, end:input.starts[input.kinds.len - 1], reserved:move plan.reserved}
+    Program {catalog:move catalog, source:move source, root:root, checks_start:checks_start, checks:move checks, end:input.starts[input.kinds.len - 1], reserved:move plan.reserved}
 }
-pub fn materialize(program: &Program, input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platform: i32, wanted: &map.Map) -> Layout {
+pub fn materialize(program: &Program, input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platform: i32, wanted: &map.Map, definitions: bool) -> Layout {
     mut layout := layout()
     catalog := &program.catalog; source := &program.source; root := program.root
     mut plan := instances(platform, move program.reserved.clone())
     mut output := lexer.empty(false)
     mut position := program.end + 1
-    if plan.error == "" { lower(&catalog, &mut plan, &mut reg, &source, &mut output, root, source.slots.len, -1, false, &mut position, &wanted) }
+    end := if definitions { source.slots.len } else { program.checks_start }
+    if definitions { layout.definition_checks = program.checks.clone() }
+    lower(&catalog, &mut plan, &mut reg, &source, &mut output, root, end, -1, false, &mut position, &wanted)
     layout.first = position
     mut instance := 0
     while instance < plan.names.len && plan.error == "" {
@@ -456,6 +530,14 @@ pub fn materialize(program: &Program, input: &mut lexer.Tokens, reg: &mut ft.Typ
         mut d := def
         while d >= 0 && plan.error == "" {
             site := origin(&layout, plan.sites[instance])
+            if catalog.methods[d] && catalog.constraint_starts[d] < catalog.constraint_starts[d + 1] {
+                for at in source.starts[d]..source.ends[d] {
+                    method := source.method_names[at]
+                    if method >= 0 && wanted.contains(plan.names[instance] + "::" + source.tokens.texts[method]) {
+                        require_arguments(&catalog, &source, &mut plan, &mut reg, d, instance, site); break
+                    }
+                }
+            }
             if catalog.builtin[d] { layout.starts.push(position); layout.positions.push(site) }
             token(&mut output, .Newline, "\n", site)
             lower(&catalog, &mut plan, &mut reg, &source, &mut output, source.starts[d], source.ends[d], instance, catalog.builtin[d], &mut position, &wanted)

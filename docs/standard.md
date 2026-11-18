@@ -215,6 +215,9 @@ Andra nyckeltyper definierar `pub fn key_hash(&self) -> u64` och
 `pub fn key_eq(&self, other: Self) -> bool`. Likvärdiga nycklar måste
 ha samma hash. Hash och likhet ska vara stabila medan nyckeln lagras.
 Nycklar och värden använder samma lagringsregler som arrayelement.
+Kraven kontrolleras redan när samlingstypen används, även för en tom
+samling. Egna typer kan deklarera motsvarande metod- och lagringskrav.
+[Generiska deklarationer](syntax.md#generiska-deklarationer)
 
 `put` och `insert` tar över sina ägda argument. Vid en dubblett behåller
 `put` den lagrade nyckeln och ersätter värdet. `insert` returnerar

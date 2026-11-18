@@ -176,6 +176,32 @@ En specialiserad funktion kan skickas vidare som funktionsvärde,
 exempelvis `identity<i32>`. Importerade deklarationer används på samma sätt,
 exempelvis `lib.Box<[]i32>`. [Körbart exempel med två moduler](../tests/fixtures/generics/main.ddr)
 
+Ett `where` efter typens parameterlista anger krav som gäller så fort typen
+används. `storable(T)` kräver att ett värde av typen får lagras som ett
+arrayelement. Ett metodkrav anger namnet och hela funktionstypen inklusive
+mottagaren. Metoden måste vara publik och säker och kunna anropas utan
+ytterligare rättigheter.
+
+På en generisk funktion kan `where` stå efter signaturen. På ett
+`impl`-block står det efter mottagartypen, exempelvis
+`impl Box<T> where T.size: fn(T) -> i32`. Blockets krav kontrolleras när
+en av dess metoder används. Andra block på samma typ har sina egna krav.
+
+```dunder
+struct Sized<T> where storable(T), T.size: fn(T) -> i32 { item: T }
+struct Sample { n: i32 }
+impl Sample { pub fn size(&self) -> i32 { self.n } }
+
+fn main() {
+    x := Sized<Sample> { item: Sample { n: 42 } }
+    print(x.item.size())
+}
+```
+
+Två importalias till samma deklaration ger samma instans när argumentens
+typer är lika. En metod som behöver ytterligare operationer på `T`
+kontrolleras för den konkreta mottagaren när metoden används. [Typidentitet och kontrolltidpunkter](generics-design.md)
+
 ## Funktioner och kontrollflöde
 
 [Fibonacci-exemplet](../examples/fibonacci.ddr) visar en funktion med typad

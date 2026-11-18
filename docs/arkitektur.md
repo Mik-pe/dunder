@@ -131,8 +131,9 @@ Runtimen kopierar indata och resultat mellan separata allokeringsarenor.
 ursprungliga källpositioner. Deklarationernas signaturer fastställs före
 kropparna så att funktioner kan anropa varandra rekursivt.
 
-Förslaget för generics beskriver hur typparametrar binds, när en konkret
-instans kontrolleras och hur den får sin identitet. [Design för generics](generics-design.md)
+En generisk instans identifieras av deklarationen och de konkreta
+typargumentens identiteter. Samordnaren upptäcker instanserna före parallell
+kodgenerering. [Design för generics](generics-design.md)
 
 Den seriella och den parallella kompilatorn använder samma typkontroll. En
 arbetare kan typkontrollera en kropp med en fryst bild av deklarationerna.
