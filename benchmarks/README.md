@@ -41,6 +41,18 @@ andra avsiktligt tunga arbeten på värddatorn.
 `--baseline-flag=--scalar-opt=off` med samma nya binär som baseline och
 kandidat jämför optimeringslägen utan att byta kompilatorbinär.
 
+Kompilatormatrisen jämför två revisioner eller kör samma kompilator med
+en, två och fyra workers. På ARM64/macOS kontrollerar `--validate-only`
+binärer och körresultat utan att ta tids- eller minnesprover.
+
+```sh
+dunder run tools/performance_compiler_matrix.ddr -- /path/to/baseline \
+  /path/to/candidate build/compiler-matrix --mode revision --include-check --validate-only
+```
+
+`--mode workers` kräver identiska kompilatorbinärer och ett rundantal
+delbart med sex. Mätlägena sparar råprover, per-process-RSS och parade kvoter.
+
 [Gles SSA-v2 och separata anropsindata, 2026-11-12](archive/2026-11-12-ssa-pruned/README.md)
 bevarar 1 440 prover över standard av/av, gamla/nya SSA på/på och nya
 kompilatorns av/på-serie med C. SSA-byggmedianen för kompilatorkorpuset

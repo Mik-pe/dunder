@@ -1,0 +1,486 @@
+capability filesystem, process
+
+import .benchmark_process as proc
+import .compiler_matrix_runner as matrix
+import .harness as harness
+import .native_probe as native
+import .performance_corpus as corpus
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Driver { name: string, path: string, flags: []string, sha256: string }
+
+struct Options {
+    mode: string,
+    root: string,
+    report: string,
+    dry: bool,
+    checks: bool,
+    rounds: i32,
+    drivers: []Driver,
+}
+
+struct Provenance {
+    git: string,
+    host: []string,
+    revision: string,
+    status: string,
+    hardware: string,
+    refs: []u8,
+    sources: []corpus.SourceHash,
+    tools: []corpus.SourceHash,
+}
+
+struct Case {
+    name: string,
+    source: string,
+    source_sha256: string,
+    arguments: []string,
+    expected: string,
+}
+
+struct Image { variant: string, name: string, sha256: string, size: i64, runtime: bool }
+
+struct Run {
+    cases: []Case,
+    kernels: []corpus.Kernel,
+    images: []Image,
+    rows: []matrix.Row,
+    summaries: []matrix.Summary,
+    generated: corpus.Corpus,
+    samples_expected: i64,
+}
+
+fn write_owned(work: string) -> string {
+    code := "struct Box{a:[]i64,n:i64}\n" +
+        "fn owned(n:i64)->Box{Box{a:[n,n+1,n+2],n:n}}\n" +
+        "fn mutate(a:&mut []i64)->i64{mut sum:i64=0;for i in 0..a.len{a[i]=a[i]+1;sum=sum+a[i]};sum}\n" +
+        "fn relay(n:i64)->Box{owned(n)}\n" +
+        "fn main(){x:=relay(5);mut a:=x.a.clone();print(mutate(&mut a));print(x.a[0]);print(a[2])}\n"
+    path := work + "/owned.ddr"
+    if sys.write_text(path, code).ok { return path }
+    ""
+}
+
+fn make_cases(root: string, generated: string, owned: string) -> []Case {
+    inputs: [](string, string, string) = [
+        ("generated", generated.clone(), "595500\n"),
+        ("selfhost", root + "/selfhost/main.ddr", "42\ntrue\n"),
+        ("selfhost-parallel", root + "/selfhost/main_parallel.ddr", "42\ntrue\n"),
+        ("hello", root + "/examples/hello.ddr", "42\ntrue\n"),
+        ("owned", owned.clone(), "21\n5\n8\n"),
+    ]
+    mut result: []Case = []
+    for entry in inputs {
+        result.push(Case {
+            name: entry.0.clone(), source: entry.1.clone(), source_sha256: harness.sha256_file_hex(entry.1),
+            arguments: [], expected: entry.2.clone(),
+        })
+    }
+    result
+}
+
+fn snapshot(root: string) -> corpus.Snapshot {
+    mut result := corpus.snapshot(root)
+    if result.error.len > 0 { return result }
+    relative := "examples/hello.ddr"
+    digest := harness.sha256_file_hex(root + "/" + relative)
+    if digest.len == 0 { result.error = "cannot hash examples/hello.ddr" }
+    else { result.files.push(corpus.SourceHash { path: relative, sha256: digest }) }
+    result
+}
+
+fn provenance(root: string, tool_root: string, proof: &mut Provenance) -> bool {
+    proof.git = native.find_executable("git")
+    if proof.git.len == 0 { return harness.fail("git is needed for compiler matrix provenance") }
+    mut result := harness.empty_output()
+    git := proof.git.clone()
+    if !harness.run_checked(git, ["show-ref"], root, 0, false, &mut result) { return false }
+    proof.refs = result.stdout.clone()
+    if !harness.run_checked(git, ["rev-parse", "HEAD"], root, 0, false, &mut result) { return false }
+    proof.revision = text.trim(result.stdout_text())
+    if !harness.run_checked(git, ["status", "--short"], root, 0, false, &mut result) { return false }
+    proof.status = result.stdout_text()
+    if !harness.run_checked("/usr/sbin/sysctl", ["machdep.cpu.brand_string", "hw.memsize"], root, 0, false, &mut result) {
+        return false
+    }
+    proof.hardware = result.stdout_text()
+    for flag in ["-s", "-n", "-r", "-v", "-m", "-p"] {
+        if !harness.run_checked("/usr/bin/uname", [flag.clone()], root, 0, false, &mut result) { return false }
+        proof.host.push(text.trim(result.stdout_text()))
+    }
+    files := snapshot(root)
+    if files.error.len > 0 { return harness.fail(files.error) }
+    proof.sources = files.files
+    for name in ["performance_compiler_matrix", "performance_corpus", "compiler_matrix_runner",
+                 "benchmark_process", "benchmark_time", "task_throughput_cases"] {
+        path := tool_root + "/tools/" + name + ".ddr"
+        hash := harness.sha256_file_hex(path)
+        if hash.len == 0 { return harness.fail(f"cannot hash {path}") }
+        proof.tools.push(corpus.SourceHash { path: path, sha256: hash })
+    }
+    true
+}
+
+fn stable(options: &Options, proof: &Provenance, runner: &mut matrix.Runner) -> bool {
+    now := snapshot(options.root)
+    if now.error.len > 0 { return runner.fail(now.error) }
+    if !corpus.same_sources(&proof.sources, &now.files) { return runner.fail("source files changed during run") }
+    mut result := harness.empty_output()
+    if !options.dry {
+        if !harness.run_checked(proof.git, ["show-ref"], options.root, 0, false, &mut result) ||
+           !bytes.equal(&proof.refs, &result.stdout) { return runner.fail("source refs changed during run") }
+    }
+    if !harness.run_checked(proof.git, ["rev-parse", "HEAD"], options.root, 0, false, &mut result) ||
+       text.trim(result.stdout_text()) != proof.revision ||
+       !harness.run_checked(proof.git, ["status", "--short"], options.root, 0, false, &mut result) ||
+       result.stdout_text() != proof.status { return runner.fail("source checkout or working-tree state changed during run") }
+    for variant in options.drivers {
+        if harness.sha256_file_hex(variant.path) != variant.sha256 { return runner.fail("compiler changed during run") }
+    }
+    for tool in proof.tools {
+        if harness.sha256_file_hex(tool.path) != tool.sha256 { return runner.fail("measurement tool changed during run") }
+    }
+    true
+}
+
+fn compiler_command(driver: &Driver, operation: string, source: string, output: string) -> []string {
+    mut args: []string = [driver.path.clone(), operation.clone(), source.clone()]
+    if output.len > 0 { args.push("-o"); args.push(output.clone()) }
+    for flag in driver.flags { args.push(flag.clone()) }
+    args
+}
+
+fn record_image(runner: &mut matrix.Runner, file: string, name: string, variant: string, kernel: bool, run: &mut Run) -> bool {
+    raw := sys.read_u8(file)
+    if !raw.ok { return runner.fail(f"cannot read image: {file}") }
+    digest := harness.sha256_bytes_hex(&raw.value)
+    for old in run.images {
+        if old.runtime == kernel && old.name == name && old.variant == variant {
+            if old.sha256 != digest || old.size != i64(raw.value.len) { return runner.fail(f"nonreproducible image: {name}/{variant}") }
+            return true
+        }
+    }
+    run.images.push(Image { variant: variant.clone(), name: name.clone(), sha256: digest,
+                           size: i64(raw.value.len), runtime: kernel })
+    true
+}
+
+fn lookup_image(run: &Run, name: string, variant: string) -> Image {
+    for image in run.images {
+        if !image.runtime && image.name == name && image.variant == variant { return image.clone() }
+    }
+    assert(false)
+    Image { variant: "", name: "", sha256: "", size: 0, runtime: false }
+}
+
+fn agreed(run: &Run, name: string, runtime: bool) -> bool {
+    mut before := ""
+    for image in run.images {
+        if image.name != name || image.runtime != runtime { continue }
+        if before.len == 0 { before = image.sha256.clone() }
+        else if image.sha256 != before { return false }
+    }
+    before.len > 0
+}
+
+fn validate(runner: &mut matrix.Runner, options: &Options, case: &Case, work: string, image: string) -> bool {
+    mut result := matrix.empty_capture()
+    if text.starts_with(case.name, "selfhost") {
+        hello := work + "/consumer-hello"
+        _ := sys.remove_file(hello)
+        return runner.run([image.clone(), "build", options.root + "/examples/hello.ddr", "-o", hello.clone()],
+                   "validate emitted compiler", false, "", false, &mut result) &&
+               runner.run([hello.clone()], "validate emitted compiler consumer", false, case.expected, true, &mut result)
+    }
+    mut args: []string = [image.clone()]
+    for param in case.arguments { args.push(param.clone()) }
+    runner.run(args, "validate native consumer", false, case.expected, true, &mut result)
+}
+
+fn build(runner: &mut matrix.Runner, options: &Options, variant: &Driver, case: &Case,
+         work: string, measured: bool, result: &mut proc.Capture, run: &mut Run) -> bool {
+    output := work + "/output"
+    _ := sys.remove_file(output)
+    purpose := if measured { "recorded build" } else { "untimed native preflight" }
+    if !runner.run(compiler_command(&variant, "build", case.source, output), purpose, measured, "", false, &mut result) {
+        return false
+    }
+    if !record_image(&mut runner, output, case.name, variant.name, false, &mut run) ||
+       !validate(&mut runner, &options, &case, work, output) { return false }
+    sys.remove_file(output).ok || runner.fail(f"cannot remove {output}")
+}
+
+fn check(runner: &mut matrix.Runner, variant: &Driver, source: string, measured: bool, result: &mut proc.Capture) -> bool {
+    purpose := if measured { "recorded check" } else { "untimed check preflight" }
+    if !runner.run(compiler_command(&variant, "check", source, ""), purpose, measured, "", false, &mut result) { return false }
+    stdout := bytes.decode(&result.stdout)
+    (stdout.ok && text.starts_with(stdout.value, f"checked {source} (") && text.ends_with(stdout.value, " modules)\n")) ||
+        runner.fail("invalid check success output")
+}
+
+fn preflight(runner: &mut matrix.Runner, options: &Options, work: string, cases: &[]Case, run: &mut Run) -> bool {
+    mut result := matrix.empty_capture()
+    for index in 0..cases.len {
+        case := cases[index].clone()
+        if case.source_sha256.len == 0 { return runner.fail(f"cannot hash {case.source}") }
+        run.cases.push(case.clone())
+        for i in 0..options.drivers.len {
+            if !build(&mut runner, &options, &options.drivers[i], &case, work, false, &mut result, &mut run) { return false }
+            if options.checks && !check(&mut runner, &options.drivers[i], case.source, false, &mut result) { return false }
+        }
+        if !agreed(&run, case.name, false) { return runner.fail(f"cross-variant image mismatch in SSA-off scheduling cohort: {case.name}") }
+    }
+    for kernel in move corpus.runtime_cases(1) {
+        name := kernel.name.clone()
+        source := options.root + "/benchmarks/runtime/" + name + ".ddr"
+        output := work + "/runtime-image"
+        for i in 0..options.drivers.len {
+            driver := &options.drivers[i]
+            _ := sys.remove_file(output)
+            args := compiler_command(&driver, "build", source, output)
+            if !runner.run(args, "untimed runtime image preflight", false, "", false, &mut result) ||
+               !record_image(&mut runner, output, name, driver.name, true, &mut run) { return false }
+            mut input: []string = [output.clone()]
+            for arg in kernel.arguments { input.push(arg.clone()) }
+            if !runner.run(input, "validate independent runtime checksum", false, kernel.expected, true, &mut result) { return false }
+        }
+        run.kernels.push(move kernel)
+        if !agreed(&run, name, true) { return runner.fail(f"runtime images changed; stop for a separate runtime/C comparison: {name}") }
+    }
+    true
+}
+
+fn string_array(writer: &mut json.Writer, values: &[]string) {
+    writer.array()
+    for val in values { writer.string(val) }
+    writer.end()
+}
+
+fn write_image_set(writer: &mut json.Writer, images: &[]Image, name: string, runtime: bool) {
+    writer.object()
+    for image in images {
+        if image.name != name || image.runtime != runtime { continue }
+        writer.key(image.variant)
+        writer.object()
+        writer.key("sha256"); writer.string(image.sha256)
+        writer.key("bytes"); writer.integer(image.size)
+        writer.end()
+    }
+    writer.end()
+}
+
+fn checkpoint(options: &Options, proof: &Provenance, run: &Run, complete: bool, error: string) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("complete"); writer.boolean(complete)
+    writer.key("mode"); writer.string(options.mode)
+    writer.key("validate_only"); writer.boolean(options.dry)
+    writer.key("rounds"); writer.integer(i64(options.rounds))
+    writer.key("controller"); writer.object()
+    writer.key("argv"); writer.array()
+    for i in 0..sys.arg_count() { writer.string(sys.arg(i)) }
+    writer.end()
+    writer.key("executable"); writer.string(harness.resolve_or_abs(sys.arg(0)))
+    writer.end()
+    writer.key("checkout"); writer.string(proof.revision)
+    writer.key("working_tree"); writer.string(proof.status)
+    writer.key("host"); writer.object()
+    fields := ["system", "node", "release", "version", "machine", "processor"]
+    for i in 0..fields.len {
+        writer.key(fields[i]); writer.string(proof.host[i])
+    }
+    writer.end()
+    writer.key("source_root"); writer.string(options.root)
+    writer.key("sources_sha256"); corpus.write_sources(&proof.sources, &mut writer)
+    writer.key("tool_sha256"); writer.string(proof.tools[0].sha256)
+    writer.key("helpers_sha256"); writer.string(proof.tools[1].sha256)
+    writer.key("controller_sources_sha256"); corpus.write_sources(&proof.tools, &mut writer)
+
+    writer.key("compiler_sha256"); writer.object()
+    for driver in options.drivers { writer.key(driver.name); writer.string(driver.sha256) }
+    writer.end()
+    writer.key("compiler_paths"); writer.object()
+    for driver in options.drivers { writer.key(driver.name); writer.string(driver.path) }
+    writer.end()
+    writer.key("compiler_flags"); writer.object()
+    for driver in options.drivers { writer.key(driver.name); string_array(&mut writer, &driver.flags) }
+    writer.end()
+    writer.key("scope"); writer.string("whole fresh compiler process; startup/thread clone/start/join/link/publication included")
+    writer.key("clock"); writer.string(if options.dry { "none" } else { "monotonic uptime immediately before fork through wait4 exit" })
+    writer.key("rss"); writer.string(if options.dry { "none" } else { "wait4.ru_maxrss per child, bytes; includes worker threads; not heap/live bytes" })
+    writer.key("cache"); writer.string("incremental disabled; warm OS filesystem cache; fresh output per sample")
+    writer.key("order"); writer.string("revision alternates; workers cycle all six permutations")
+    writer.key("policy"); writer.string("unflagged default SSA policy; no profiling/incremental flags")
+    writer.key("selfhost_scope"); writer.string("main and main_parallel are separate source builds, never whole bootstrap")
+    writer.key("cases"); writer.object()
+    for case in run.cases {
+        writer.key(case.name)
+        writer.object()
+        writer.key("source"); writer.string(case.source)
+        writer.key("source_sha256"); writer.string(case.source_sha256)
+        writer.key("args"); string_array(&mut writer, &case.arguments)
+        writer.key("expected_stdout"); writer.string(case.expected)
+        writer.end()
+    }
+    writer.end()
+    writer.key("images"); writer.object()
+    for case in run.cases {
+        mut recorded := false
+        for image in run.images {
+            if !image.runtime && image.name == case.name { recorded = true; break }
+        }
+        if recorded {
+            writer.key(case.name)
+            write_image_set(&mut writer, &run.images, case.name, false)
+        }
+    }
+    writer.end()
+    writer.key("runtime_preflight"); writer.object()
+    for kernel in run.kernels {
+        writer.key(kernel.name); writer.object()
+        writer.key("args"); string_array(&mut writer, &kernel.arguments)
+        writer.key("expected_stdout"); writer.string(kernel.expected)
+        writer.key("images"); write_image_set(&mut writer, &run.images, kernel.name, true)
+        writer.end()
+    }
+    writer.end()
+    writer.key("samples_expected"); writer.integer(run.samples_expected)
+    if complete { writer.key("samples_actual"); writer.integer(i64(run.rows.len)) }
+    writer.key("hardware"); writer.string(proof.hardware)
+    writer.key("rss_raw_unit"); writer.string("bytes on Darwin; KiB on Linux, normalized to bytes")
+    writer.key("generated_corpus"); run.generated.write(&mut writer)
+    if error.len > 0 { writer.key("error"); writer.string(error) }
+    writer.end()
+    document := writer.finish()
+    if !document.ok || !sys.write_text(options.report + "/metadata.json", document.value + "\n").ok {
+        return harness.fail("cannot write metadata.json")
+    }
+    matrix.samples(options.report + "/samples.csv", &run.rows)
+}
+
+fn collect(runner: &mut matrix.Runner, options: &Options, proof: &Provenance, work: string, cases: &[]Case, run: &mut Run) -> bool {
+    mut names: []string = []
+    for driver in options.drivers { names.push(driver.name.clone()) }
+    for i in 0..cases.len {
+        case := cases[i].clone()
+        operations: []string = if options.checks { ["build", "check"] } else { ["build"] }
+        for operation in operations {
+            start := run.rows.len
+            for round in 0..options.rounds {
+                ordering := matrix.order(names.len, round)
+                for position in 0..ordering.len {
+                    ix := ordering[position]
+                    driver := &options.drivers[ix]
+                    mut sample := matrix.empty_capture()
+                    mut digest := ""
+                    mut size: i64 = 0
+                    if operation == "build" {
+                        if !build(&mut runner, &options, &driver, &case, work, true, &mut sample, &mut run) { return false }
+                        image := lookup_image(&run, case.name, driver.name)
+                        digest = image.sha256
+                        size = image.size
+                    } else if !check(&mut runner, &driver, case.source, true, &mut sample) { return false }
+                    run.rows.push(matrix.Row {
+                        operation: operation.clone(), name: case.name.clone(), variant: driver.name.clone(),
+                        round: round, position: position, elapsed: sample.elapsed, rss: sample.rss, sha256: digest, bytes: size,
+                    })
+                }
+            }
+            if !matrix.end_rounds(&run.rows, start, options.rounds, &names) {
+                return runner.fail("missing or duplicated rounds")
+            }
+            mut summaries: []matrix.Summary = []
+            matrix.append_summaries(&run.rows, start, &names, &mut summaries)
+            for group in move summaries { run.summaries.push(move group) }
+            if !checkpoint(&options, &proof, &run, false, "") { return false }
+            print(f"completed {operation}/{case.name}")
+        }
+    }
+    true
+}
+
+fn exercise(options: &Options, proof: &Provenance) -> i32 {
+    temp := fs.temp_dir("dunder-compiler-matrix-")
+    if !temp.ok { _ := harness.fail("cannot create temporary directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    work := harness.resolve_or_abs(temp.value)
+    temporary := work + "/tmp"
+    if !sys.mkdir(temporary).ok { _ := harness.fail("cannot create command TMPDIR"); return 1 }
+    generated := corpus.generate(work)
+    if generated.error.len > 0 { _ := harness.fail(generated.error); return 1 }
+    owned := write_owned(work)
+    if owned.len == 0 { _ := harness.fail("cannot write owned fixture"); return 1 }
+    cases := make_cases(options.root, generated.path, owned)
+    operations: i64 = if options.checks { 2 } else { 1 }
+    samples := if options.dry { i64(0) } else { i64(cases.len) * i64(options.rounds) * i64(options.drivers.len) * operations }
+    mut run := Run { cases: [], kernels: [], images: [], rows: [], summaries: [], generated: generated, samples_expected: samples }
+    mut runner := matrix.new(options.report, options.root, temporary, options.dry)
+    mut complete := preflight(&mut runner, &options, work, &cases, &mut run)
+    if complete { complete = checkpoint(&options, &proof, &run, false, "") }
+    if complete && !options.dry { complete = collect(&mut runner, &options, &proof, work, &cases, &mut run) }
+    if complete { complete = stable(&options, &proof, &mut runner) }
+    if complete && i64(run.rows.len) != run.samples_expected { complete = runner.fail("sample count mismatch") }
+    if complete { complete = matrix.summary(options.report + "/summary.csv", &run.summaries) }
+    wrote := checkpoint(&options, &proof, &run, complete, runner.error)
+    if !complete || !wrote { return 1 }
+    print(f"PASS {cases.len} native cases, {run.kernels.len} runtime image cases; {run.rows.len} latency samples")
+    0
+}
+
+fn arguments_error(message: string) -> i32 {
+    _ := harness.fail(message)
+    2
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--mode"), cli.option("--rounds"), cli.flag("--include-check"),
+                          cli.flag("--validate-only"), cli.option("--source-root")]
+    args := cli.parse(&spec)
+    usage := "usage: performance_compiler_matrix BASELINE CANDIDATE REPORT --mode revision|workers " +
+             "[--rounds N] [--include-check] [--validate-only] [--source-root PATH]"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 { return arguments_error(args.error) }
+    mode := args.last("--mode", "")
+    if args.positionals.len != 3 || (mode != "revision" && mode != "workers") { return arguments_error(usage) }
+    rounds := parse.integer(args.last("--rounds", "30"))
+    if !rounds.ok || rounds.value < 1 || rounds.value > 2147483647 || (mode == "workers" && rounds.value % 6 != 0) {
+        return arguments_error("positive rounds required; worker rounds must be divisible by six for balanced order")
+    }
+    checks := args.has("--include-check")
+    if mode == "workers" && checks { return arguments_error("worker mode is build-only; revision check is the serial negative control") }
+    if !target_is("arm64-macos") { return arguments_error("this matrix protocol uses ARM64 macOS main/main_parallel entries") }
+    tool_root := harness.find_root()
+    root := fs.realpath(args.last("--source-root", tool_root))
+    if !root.ok || tool_root.len == 0 { return arguments_error("cannot resolve source or tool checkout") }
+    baseline := fs.realpath(args.positionals[0])
+    candidate := fs.realpath(args.positionals[1])
+    if !baseline.ok || !candidate.ok { return arguments_error("cannot resolve both compiler paths") }
+    baseline_hash := harness.sha256_file_hex(baseline.value)
+    candidate_hash := harness.sha256_file_hex(candidate.value)
+    if baseline_hash.len == 0 || candidate_hash.len == 0 { return arguments_error("cannot hash both compilers") }
+    mut drivers: []Driver = []
+    if mode == "revision" {
+        drivers.push(Driver { path: baseline.value.clone(), sha256: baseline_hash.clone(), name: "baseline", flags: [] })
+        drivers.push(Driver { path: candidate.value.clone(), sha256: candidate_hash.clone(), name: "candidate", flags: [] })
+    } else {
+        if baseline_hash != candidate_hash { return arguments_error("worker mode requires the identical compiler image for both paths") }
+        for jobs in [1, 2, 4] {
+            drivers.push(Driver { path: candidate.value.clone(), sha256: candidate_hash.clone(), name: f"jobs{jobs}", flags: [f"--jobs={jobs}"] })
+        }
+    }
+    report := harness.resolve_or_abs(args.positionals[2])
+    if !fs.mkdir_all(report).ok { return arguments_error("cannot create report directory") }
+    contents := fs.list_dir(report)
+    if !contents.ok || contents.entries.len > 0 { return arguments_error("report must be empty; existing measurements are never overwritten") }
+    settings := Options { mode: mode, root: root.value.clone(), report: report, dry: args.has("--validate-only"), checks: checks,
+                          rounds: i32(rounds.value), drivers: drivers }
+    mut proof := Provenance { git: "", host: [], revision: "", status: "", hardware: "", refs: [], sources: [], tools: [] }
+    if !provenance(settings.root, tool_root, &mut proof) { return 1 }
+    exercise(&settings, &proof)
+}

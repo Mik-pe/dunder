@@ -1,0 +1,227 @@
+capability process, filesystem, unsafe
+
+import .benchmark_time as time
+import std.bytes as bytes
+import sys
+
+@extern("c", "fork") unsafe fn fork() -> i32
+@extern("c", "setsid") unsafe fn setsid() -> i32
+@extern("c", "execve") unsafe fn execve(path: ptr, args: ptr, environment: ptr) -> i32
+@extern("c", "chdir") unsafe fn chdir(path: ptr) -> i32
+@extern("c", "dup2") unsafe fn dup2(fd: i32, target: i32) -> i32
+@extern("c", "close") unsafe fn close(fd: i32) -> i32
+@extern("c", "open") @c_variadic(2) unsafe fn open_existing(path: ptr, flags: i32) -> i32
+@extern("c", "pipe") unsafe fn pipe(fds: ptr) -> i32
+@extern("c", "fcntl") @c_variadic(2) unsafe fn descriptor_flags(fd: i32, operation: i32, value: i32) -> i32
+@extern("c", "read") unsafe fn read(fd: i32, data: ptr, length: usize) -> i64
+@extern("c", "write") unsafe fn write(fd: i32, data: ptr, length: usize) -> i64
+@extern("c", "wait4") unsafe fn wait4(pid: i32, status: ptr, flags: i32, usage: ptr) -> i32
+@extern("c", "kill") unsafe fn kill(pid: i32, signal: i32) -> i32
+@extern("c", "_exit") unsafe fn exit_child(status: i32)
+@extern("c", "__error") unsafe fn mac_errno() -> ptr
+@extern("c", "__errno_location") unsafe fn linux_errno() -> ptr
+@extern("c", "kqueue") unsafe fn kqueue() -> i32
+@extern("c", "kevent64") unsafe fn kevent64(queue: i32, changes: ptr, changes_len: i32,
+    events: ptr, events_len: i32, flags: u32, timeout: ptr) -> i32
+
+@c_layout struct Usage { times: [i64; 4], peak: i64, counters: [i64; 13] }
+@c_layout struct Timespec { seconds: i64, nanos: i64 }
+@c_layout struct Event { id: u64, filter_and_flags: u32, fflags: u32, data: i64, userdata: u64, ext: [u64; 2] }
+
+pub struct Capture {
+    observed_exit: bool,
+    status: i32,
+    elapsed: i64,
+    rss: i64,
+    stdout: []u8,
+    stderr: []u8,
+    error: string,
+}
+
+struct ProcessFiles {
+    input: ptr,
+    argv: ptr,
+    envp: ptr,
+    stdout: i32,
+    stderr: i32,
+    launch_error: i32,
+}
+
+unsafe fn errno_value() -> i32 {
+    if target_is("macos") { load_i32(mac_errno()) }
+    else { load_i32(linux_errno()) }
+}
+
+unsafe fn launch(files: &ProcessFiles) {
+    if setsid() >= 0 && chdir(files.input) == 0 && dup2(files.stdout, 1) >= 0 && dup2(files.stderr, 2) >= 0 {
+        if files.stdout > 2 { _ := close(files.stdout) }
+        if files.stderr > 2 { _ := close(files.stderr) }
+        _ := execve(load_ptr(files.argv), files.argv, files.envp)
+    }
+    error := errno_value()
+    while write(files.launch_error, addr(&error), 4) < 0 && errno_value() == 4 {}
+    exit_child(127)
+}
+
+unsafe fn reap(pid: i32, status: &mut i32, usage: &mut Usage, flags: i32) -> i32 {
+    while true {
+        result := wait4(pid, addr(&mut status), flags, addr(&mut usage))
+        if result >= 0 || errno_value() != 4 { return result }
+    }
+    -1
+}
+
+unsafe fn wait_ready(pid: i32, timeout_ms: i64) -> i32 {
+    queue := kqueue()
+    if queue < 0 { return -1 }
+    defer { _ := close(queue) }
+    change := Event { id: u64(pid), filter_and_flags: u32(0x11fffb), fflags: u32(0x80000000),
+                      data: 0, userdata: 0, ext: [0; 2] }
+    mut event := change.clone()
+    deadline := sys.now_ms() + timeout_ms
+    while true {
+        remaining := deadline - sys.now_ms()
+        if remaining <= 0 { return 0 }
+        duration := Timespec { seconds: remaining / 1000, nanos: (remaining % 1000) * 1000000 }
+        ready := kevent64(queue, addr(&change), 1, addr(&mut event), 1, u32(0), addr(&duration))
+        if ready == 0 { return 0 }
+        if ready > 0 {
+            if i64(event.filter_and_flags).bit_and(0x40000000) == 0 || event.data == 3 { return 1 }
+            return -1
+        }
+        error := errno_value()
+        if error == 3 { return 1 }
+        if error != 4 { return -1 }
+    }
+    -1
+}
+
+unsafe fn wait_limited(pid: i32, status: &mut i32, usage: &mut Usage, timeout_ms: i64) -> i32 {
+    result := reap(pid, &mut status, &mut usage, 1)
+    if result != 0 { return result }
+    if target_is("macos") {
+        ready := wait_ready(pid, timeout_ms)
+        if ready > 0 { return reap(pid, &mut status, &mut usage, 0) }
+        if ready < 0 { return -1 }
+        return reap(pid, &mut status, &mut usage, 1)
+    }
+    deadline := sys.now_ms() + timeout_ms
+    while sys.now_ms() < deadline {
+        sys.sleep_ms(1)
+        current := reap(pid, &mut status, &mut usage, 1)
+        if current != 0 { return current }
+    }
+    reap(pid, &mut status, &mut usage, 1)
+}
+
+pub fn rss_bytes(raw: i64) -> i64 {
+    if target_is("macos") { return raw }
+    raw * 1024
+}
+
+fn fail(message: string) -> Capture {
+    Capture { observed_exit: false, status: 0, elapsed: 0, rss: 0, stdout: [], stderr: [], error: message.clone() }
+}
+
+fn append_c_string(out: &mut []u8, word: string) -> i32 {
+    offset := out.len
+    bytes.append_utf8(&mut out, word)
+    out.push(0)
+    offset
+}
+
+fn exit_code(status: i32) -> i32 {
+    signal := status.bit_and(127)
+    if signal != 0 { return -signal }
+    status.shr(8).bit_and(255)
+}
+
+pub fn capture(argv: &[]string, cwd: string, temporary: string, measured: bool, timeout_ms: i64,
+               clock: fn() -> i64) -> Capture {
+    if argv.len == 0 { return fail("no executable") }
+    work := temporary + "/process-stdout"
+    errors := temporary + "/process-stderr"
+    if !sys.write_text(work, "").ok || !sys.write_text(errors, "").ok { return fail("cannot prepare child capture files") }
+    defer {
+        _ := sys.remove_file(work)
+        _ := sys.remove_file(errors)
+    }
+
+    mut encoded: []u8 = []
+    cwd_at := append_c_string(&mut encoded, cwd)
+    out_at := append_c_string(&mut encoded, work)
+    err_at := append_c_string(&mut encoded, errors)
+    search_at := append_c_string(&mut encoded, "PATH=/no-external-tools")
+    tmp_at := append_c_string(&mut encoded, "TMPDIR=" + temporary + "/")
+    mut offsets: []i32 = []
+    for arg in argv { offsets.push(append_c_string(&mut encoded, arg)) }
+
+    mut pid := -1
+    mut status := 0
+    mut peak := Usage { times: [0; 4], peak: 0, counters: [0; 13] }
+    mut elapsed: i64 = 0
+    mut observed := false
+    mut error := ""
+    mut launch_error := 0
+    unsafe {
+        mut args: []ptr = []
+        for offset in offsets { args.push(addr(&encoded[offset])) }
+        args.push(ptr(0))
+        environment := [addr(&encoded[search_at]), addr(&encoded[tmp_at]), ptr(0)]
+
+        output := open_existing(addr(&encoded[out_at]), 1)
+        if output < 0 { return fail("cannot open child stdout") }
+        defer { _ := close(output) }
+        diagnostics := open_existing(addr(&encoded[err_at]), 1)
+        if diagnostics < 0 { return fail("cannot open child stderr") }
+        defer { _ := close(diagnostics) }
+
+        mut fds: [i32; 2] = [-1, -1]
+        if pipe(addr(&mut fds[0])) != 0 { return fail("cannot create launch status pipe") }
+        defer { _ := close(fds[0]) }
+        if descriptor_flags(fds[1], 2, 1) != 0 {
+            _ := close(fds[1])
+            return fail("cannot configure launch status pipe")
+        }
+        files := ProcessFiles { input: addr(&encoded[cwd_at]), argv: addr(&args[0]), envp: addr(&environment[0]),
+                                stdout: output, stderr: diagnostics, launch_error: fds[1] }
+
+        started := if measured { clock() } else { 0 }
+        if started < 0 { _ := close(fds[1]); return fail("invalid process clock") }
+        pid = fork()
+        if pid == 0 {
+            _ := close(fds[0])
+            launch(&files)
+            exit_child(127)
+        }
+        _ := close(fds[1])
+        if pid < 0 { return fail("cannot start process") }
+        waited := wait_limited(pid, &mut status, &mut peak, timeout_ms)
+        if waited == pid {
+            observed = true
+            if measured { elapsed = clock() - started }
+        } else {
+            if kill(-pid, 9) != 0 { _ := kill(pid, 9) }
+            observed = reap(pid, &mut status, &mut peak, 0) == pid
+            error = if waited == 0 { f"TimeoutError: command exceeded {timeout_ms} ms" } else { "wait4 failed" }
+        }
+        if error.len == 0 {
+            mut received := read(fds[0], addr(&mut launch_error), 4)
+            while received < 0 && errno_value() == 4 { received = read(fds[0], addr(&mut launch_error), 4) }
+            if received != 0 {
+                observed = false
+                if launch_error == 2 { error = "FileNotFoundError: " + argv[0] }
+                else { error = f"cannot launch {argv[0]} (errno {launch_error})" }
+            } else if measured && (elapsed <= 0 || peak.peak <= 0) {
+                error = "invalid process clock or RSS observation"
+            }
+        }
+    }
+    stdout := sys.read_u8(work)
+    stderr := sys.read_u8(errors)
+    if !stdout.ok || !stderr.ok { return fail("cannot read child output") }
+    duration := if measured && error.len == 0 { elapsed } else { 0 }
+    rss := if measured && error.len == 0 { rss_bytes(peak.peak) } else { 0 }
+    Capture { observed_exit: observed, status: exit_code(status), elapsed: duration, rss: rss,
+              stdout: stdout.value, stderr: stderr.value, error: error }
+}

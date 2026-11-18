@@ -1,0 +1,258 @@
+capability filesystem, process
+
+import .benchmark_process as proc
+import .benchmark_time as time
+import .harness as harness
+import .task_throughput_cases as tasks
+import std.array as array
+import std.bytes as bytes
+import std.json as json
+import sys
+
+pub struct Runner {
+    report: string,
+    cwd: string,
+    temporary: string,
+    dry: bool,
+    count: i32,
+    error: string,
+    timeout: i64,
+    clock: fn() -> i64,
+}
+
+pub fn empty_capture() -> proc.Capture {
+    proc.Capture { observed_exit: false, status: 0, elapsed: 0, rss: 0, stdout: [], stderr: [], error: "" }
+}
+
+pub fn new(report: string, cwd: string, temporary: string, dry: bool) -> Runner {
+    Runner { report: report.clone(), cwd: cwd.clone(), temporary: temporary.clone(), dry: dry, count: 0,
+             error: "", timeout: 120000, clock: time.now_ns }
+}
+
+fn utf8_width(lead: i32) -> i32 {
+    if lead >= 194 && lead <= 223 { return 2 }
+    if lead >= 224 && lead <= 239 { return 3 }
+    if lead >= 240 && lead <= 244 { return 4 }
+    0
+}
+
+fn text_output(raw: &[]u8) -> string {
+    decoded := bytes.decode(&raw)
+    if decoded.ok { return decoded.value }
+    mut encoded: []u8 = []
+    mut at := 0
+    while at < raw.len {
+        lead := i32(raw[at])
+        if lead < 128 {
+            encoded.push(raw[at])
+            at += 1
+            continue
+        }
+        width := utf8_width(lead)
+        mut length := 1
+        while length < width && at + length < raw.len {
+            next := i32(raw[at + length])
+            if next < 128 || next > 191 { break }
+            if length == 1 && ((lead == 224 && next < 160) || (lead == 237 && next >= 160) ||
+                               (lead == 240 && next < 144) || (lead == 244 && next >= 144)) { break }
+            length += 1
+        }
+        if length == width { bytes.extend_range(&mut encoded, &raw, at, at + length) }
+        else { bytes.append_utf8(&mut encoded, "�") }
+        at += length
+    }
+    bytes.decode(&encoded).value
+}
+
+fn record(runner: &Runner, argv: &[]string, purpose: string, measured: bool, capture: &proc.Capture) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("index"); writer.integer(i64(runner.count))
+    writer.key("purpose"); writer.string(purpose)
+    writer.key("argv"); writer.array()
+    for arg in argv { writer.string(arg) }
+    writer.end()
+    writer.key("cwd"); writer.string(runner.cwd)
+    writer.key("environment"); writer.object()
+    writer.key("PATH"); writer.string("/no-external-tools")
+    writer.key("TMPDIR"); writer.string(runner.temporary + "/")
+    writer.end()
+    writer.key("measured"); writer.boolean(measured)
+    writer.key("exit_code")
+    if capture.observed_exit { writer.integer(i64(capture.status)) }
+    else { writer.null() }
+    writer.key("error")
+    if capture.error.len > 0 { writer.string(capture.error) }
+    else { writer.null() }
+    writer.key("stdout"); writer.string(text_output(&capture.stdout))
+    writer.key("stderr"); writer.string(text_output(&capture.stderr))
+    writer.key("elapsed_ms")
+    if measured && capture.elapsed > 0 { writer.decimal(time.milliseconds(capture.elapsed)) }
+    else { writer.null() }
+    writer.key("max_rss_bytes")
+    if measured && capture.rss > 0 { writer.integer(capture.rss) }
+    else { writer.null() }
+    writer.end()
+    encoded := writer.finish()
+    encoded.ok && sys.append_text(runner.report + "/commands.jsonl", encoded.value + "\n").ok
+}
+
+impl Runner {
+    pub fn fail(&mut self, message: string) -> bool {
+        if self.error.len == 0 { self.error = message.clone() }
+        harness.fail(message)
+    }
+
+    pub fn run(&mut self, argv: []string, purpose: string, measured: bool, expected: string, check_output: bool,
+               out: &mut proc.Capture) -> bool {
+        if measured && self.dry { return self.fail("cannot measure in validate-only mode") }
+        result := proc.capture(&argv, self.cwd, self.temporary, measured, self.timeout, self.clock)
+        if !record(&self, &argv, purpose, measured, &result) { return self.fail("cannot append commands.jsonl") }
+        index := self.count
+        self.count += 1
+        if result.error.len > 0 { return self.fail(result.error) }
+        if !result.observed_exit || result.status != 0 ||
+           (check_output && !bytes.equals_text(&result.stdout, 0, result.stdout.len, expected)) {
+            return self.fail(f"command/output failure; see commands.jsonl entry {index}: {argv[0]}")
+        }
+        out = result
+        true
+    }
+}
+
+pub fn order(variants: i32, round: i32) -> []i32 {
+    if variants == 2 {
+        if round % 2 == 0 { return [0, 1] }
+        return [1, 0]
+    }
+    mut sequence: []i32 = []
+    for capacity in tasks.capacity_order(round) {
+        sequence.push(if capacity == 1 { 0 } else if capacity == 2 { 1 } else { 2 })
+    }
+    sequence
+}
+
+pub struct Row {
+    operation: string,
+    name: string,
+    variant: string,
+    round: i32,
+    position: i32,
+    elapsed: i64,
+    rss: i64,
+    sha256: string,
+    bytes: i64,
+}
+
+pub struct Summary {
+    operation: string,
+    name: string,
+    variant: string,
+    samples: i32,
+    median_ms: f64,
+    p95_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    median_over_reference: f64,
+    paired_ratio_median: f64,
+    paired_ratio_p95: f64,
+    median_max_rss_bytes: f64,
+    p95_max_rss_bytes: i64,
+    max_rss_bytes: i64,
+}
+
+fn p95(length: i32) -> i32 { i32((i64(length) * 95 + 99) / 100) - 1 }
+
+fn median_i64(values: &[]i64) -> f64 {
+    n := values.len
+    (f64(values[(n - 1) / 2]) + f64(values[n / 2])) * 0.5
+}
+
+fn median_f64_bits(values: &[]i64) -> f64 {
+    n := values.len
+    (f64.from_bits(values[(n - 1) / 2]) + f64.from_bits(values[n / 2])) * 0.5
+}
+
+pub fn end_rounds(rows: &[]Row, start: i32, rounds: i32, variants: &[]string) -> bool {
+    mut position := start
+    for round in 0..rounds {
+        expected := order(variants.len, round)
+        for i in 0..expected.len {
+            if position >= rows.len || rows[position].round != round || rows[position].position != i ||
+               rows[position].variant != variants[expected[i]] { return false }
+            position += 1
+        }
+    }
+    position == rows.len
+}
+
+pub fn append_summaries(rows: &[]Row, start: i32, variants: &[]string, summaries: &mut []Summary) {
+    size := variants.len
+    rounds := (rows.len - start) / size
+    assert(rounds > 0)
+    mut reference: []i64 = []
+    for round in 0..rounds {
+        for position in 0..size {
+            index := start + round * size + position
+            if rows[index].variant == variants[0] { reference.push(rows[index].elapsed) }
+        }
+    }
+    sorted_reference := time.distribution(reference.clone())
+    for variant in variants {
+        mut elapsed: []i64 = []
+        mut rss: []i64 = []
+        mut paired: []i64 = []
+        for index in start..rows.len {
+            if rows[index].variant != variant { continue }
+            elapsed.push(rows[index].elapsed)
+            rss.push(rows[index].rss)
+            ratio := time.milliseconds(rows[index].elapsed) / time.milliseconds(reference[rows[index].round])
+            paired.push(ratio.to_bits())
+        }
+        array.sort(&mut elapsed)
+        array.sort(&mut rss)
+        array.sort(&mut paired)
+        middle := (time.milliseconds(elapsed[(rounds - 1) / 2]) + time.milliseconds(elapsed[rounds / 2])) * 0.5
+        tail := p95(rounds)
+        summaries.push(Summary {
+            operation: rows[start].operation.clone(), name: rows[start].name.clone(), variant: variant.clone(),
+            samples: rounds, median_ms: middle, p95_ms: time.milliseconds(elapsed[tail]),
+            min_ms: time.milliseconds(elapsed[0]), max_ms: time.milliseconds(elapsed[rounds - 1]),
+            median_over_reference: middle / sorted_reference.median,
+            paired_ratio_median: median_f64_bits(&paired), paired_ratio_p95: f64.from_bits(paired[tail]),
+            median_max_rss_bytes: median_i64(&rss), p95_max_rss_bytes: rss[tail], max_rss_bytes: rss[rounds - 1],
+        })
+    }
+}
+
+fn decimal(value: f64) -> string {
+    mut out: []u8 = []
+    assert(json.write_f64(&mut out, value))
+    bytes.decode(&out).value
+}
+
+pub fn samples(path: string, rows: &[]Row) -> bool {
+    if rows.len == 0 { return true }
+    mut csv: []u8 = []
+    bytes.append_utf8(&mut csv, "operation,case,variant,round,order,elapsed_ms,max_rss_bytes,image_sha256,image_bytes\r\n")
+    for row in rows {
+        elapsed := time.fixed_ms(row.elapsed)
+        bytes.append_utf8(&mut csv,
+            f"{row.operation},{row.name},{row.variant},{row.round},{row.position},{elapsed},{row.rss},{row.sha256},{row.bytes}\r\n")
+    }
+    sys.write_u8(path, &csv).ok || harness.fail(f"cannot write {path}")
+}
+
+pub fn summary(path: string, rows: &[]Summary) -> bool {
+    if rows.len == 0 { return true }
+    mut csv: []u8 = []
+    bytes.append_utf8(&mut csv, "operation,case,variant,samples,median_ms,p95_ms,min_ms,max_ms,median_over_reference,paired_ratio_median,paired_ratio_p95,median_max_rss_bytes,p95_max_rss_bytes,max_rss_bytes\r\n")
+    for row in rows {
+        prefix := f"{row.operation},{row.name},{row.variant},{row.samples},"
+        elapsed := decimal(row.median_ms) + "," + decimal(row.p95_ms) + "," + decimal(row.min_ms) + "," + decimal(row.max_ms)
+        ratios := decimal(row.median_over_reference) + "," + decimal(row.paired_ratio_median) + "," + decimal(row.paired_ratio_p95)
+        memory := decimal(row.median_max_rss_bytes) + f",{row.p95_max_rss_bytes},{row.max_rss_bytes}\r\n"
+        bytes.append_utf8(&mut csv, prefix + elapsed + "," + ratios + "," + memory)
+    }
+    sys.write_u8(path, &csv).ok || harness.fail(f"cannot write {path}")
+}
