@@ -1,0 +1,277 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+@extern("c", "pipe")
+unsafe fn c_pipe(fds: ptr) -> i32
+@extern("c", "close")
+unsafe fn c_close(fd: i32) -> i32
+@extern("c", "dup2")
+unsafe fn c_dup2(from: i32, to: i32) -> i32
+@extern("c", "signal")
+unsafe fn c_signal(signum: i32, handler: ptr) -> ptr
+@extern("c", "fopen")
+unsafe fn c_fopen(path: ptr, mode: ptr) -> ptr
+@extern("c", "fileno")
+unsafe fn c_fileno(stream: ptr) -> i32
+@extern("c", "fclose")
+unsafe fn c_fclose(stream: ptr) -> i32
+
+struct Profile {
+    ok: bool,
+    counters: Map<string, u64>,
+}
+
+fn counter_names() -> []string {
+    ["allocation_count", "requested_bytes", "size_class_payload_bytes", "fresh_allocations", "reused_allocations",
+     "retain_calls", "release_calls", "array_clone_calls", "array_clone_bytes", "string_slice_calls", "string_slice_bytes",
+     "record_construct_calls", "record_construct_bytes", "record_clone_calls", "record_clone_bytes", "copy_bytes"]
+}
+
+fn read_counters(stderr: string) -> Profile {
+    mut profile := Profile { ok: false, counters: Map<string, u64>::new() }
+    lines := harness.lines(stderr)
+    if lines.len != 1 { _ := harness.fail(f"expected one runtime profile record\n{stderr}"); return profile }
+    doc := json.Doc::parse_text(lines[0])
+    units := doc.field(doc.root, "units")
+    counters := doc.field(doc.root, "counters")
+    keys := counter_names()
+    if !doc.ok || doc.get_str(doc.root, "kind").value != "runtime_profile" || doc.get_i64(doc.root, "version").value != 1 ||
+       doc.count(units) != 2 || doc.get_str(units, "counts").value != "events" || doc.get_str(units, "bytes").value != "bytes" ||
+       doc.get_str(doc.root, "counter_arithmetic").value != "uint64_modulo" ||
+       doc.get_i64(doc.root, "allocation_header_bytes").value != 16 || doc.get_i64(doc.root, "pool_header_bytes").value != 512 ||
+       !doc.get_bool(doc.root, "requested_bytes_exclude_allocator_header").value ||
+       !doc.get_bool(doc.root, "size_class_payload_excludes_header").value || doc.count(counters) != keys.len {
+        _ := harness.fail(f"unexpected runtime profile schema\n{stderr}")
+        return profile
+    }
+    for name in keys {
+        value := doc.get_u64(counters, name)
+        if !value.ok { _ := harness.fail(f"invalid profile counter {name}\n{stderr}"); return profile }
+        profile.counters.put(name.clone(), value.value)
+    }
+    profile.ok = true
+    profile
+}
+
+fn matches(profile: &Profile, move expected: [](string, u64), exact: bool) -> bool {
+    mut count := 0
+    for entry in move expected {
+        (name, value) := entry
+        if profile.counters.at(name) != value {
+            return harness.fail(f"{name}: expected {value}, observed {profile.counters.at(name)}")
+        }
+        if value != 0 { count += 1 }
+    }
+    if exact {
+        mut nonzero := 0
+        for i in 0..profile.counters.len() { if profile.counters.value_at(i) != 0 { nonzero += 1 } }
+        if count != nonzero { return harness.fail("unexpected nonzero runtime profile counters") }
+    }
+    true
+}
+
+fn configure_stderr(mode: string) -> bool {
+    unsafe {
+        if mode == "closed-pipe" {
+            mut fds: [i32; 2] = [0; 2]
+            if c_pipe(addr(&mut fds[0])) != 0 { return false }
+            if c_close(fds[0]) != 0 { return false }
+            if c_dup2(fds[1], 2) != 2 || c_close(fds[1]) != 0 { return false }
+            previous := c_signal(13, ptr(0))
+            return usize(previous) != 18446744073709551615
+        }
+        if mode == "readonly" {
+            input := c_fopen(cstr("/dev/null"), cstr("rb"))
+            if input == ptr(0) { return false }
+            descriptor := c_fileno(input)
+            connected := c_dup2(descriptor, 2) == 2
+            return c_fclose(input) == 0 && connected
+        }
+        if mode == "closed" { return c_close(2) == 0 }
+    }
+    false
+}
+
+fn failed_stderr_launcher() -> i32 {
+    if !configure_stderr(sys.arg(2)) { print("could not configure stderr test descriptor"); return 70 }
+    none: []string = []
+    result := process.replace(sys.arg(3), &none)
+    print(f"cannot execute profile probe: {result.error}")
+    71
+}
+
+fn check_failed_stderr(launcher: string, image: string, work: string) -> bool {
+    mut result := harness.empty_output()
+    for mode in ["closed-pipe", "readonly", "closed"] {
+        if !harness.run_checked_timeout(launcher, ["--failed-stderr-launcher", mode.clone(), image.clone()],
+                                       work, 17, false, 10000, &mut result) { return false }
+    }
+    true
+}
+
+fn check_header(image: string, target: string) -> bool {
+    input := sys.read_u8(image)
+    (input.ok && native.image_header(&input.value, target)) || harness.fail(f"{image}: wrong image format for {target}")
+}
+
+fn has_report_text(image: string) -> bool {
+    data := sys.read_u8(image)
+    if !data.ok { return true }
+    marker := "runtime_profile"
+    for offset in 0..(data.value.len - marker.len + 1) {
+        if data.value[offset] == b'r' && bytes.equals_text(&data.value, offset, offset + marker.len, marker) { return true }
+    }
+    false
+}
+
+fn call(program: string, args: []string, cwd: string, status: i32, result: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, cwd, status, false, 60000, &mut result)
+}
+
+fn check_emitter(compiler: string, root: string, work: string, host: i32, launcher: string) -> bool {
+    emitter := work + "/emitter"
+    mut result := harness.empty_output()
+    if !call(compiler, ["build", root + "/tests/fixtures/runtime-profile-emitter.ddr", "-o", emitter.clone()], root, 0, &mut result) { return false }
+    for target in 0..3 {
+        name := harness.target_name(target)
+        for mode in 0..4 {
+            image := f"{work}/harness-{name}-{mode}"
+            if !call(emitter, [target.str(), mode.str(), image.clone(), "on"], work, 0, &mut result) ||
+               !check_header(image, name) { return false }
+            if target != host { continue }
+            status := if mode == 3 { 104 } else { 17 }
+            if !call(image, [], work, status, &mut result) { return false }
+            if result.stdout.len != 0 || (mode == 3 && result.stderr.len != 0) {
+                return harness.fail(f"unexpected emitted runtime output: {result.stdout_text()}\n{result.stderr_text()}")
+            }
+            if mode == 3 { continue }
+            profile := read_counters(result.stderr_text())
+            if !profile.ok { return false }
+            if mode == 0 {
+                if !matches(&profile, [], true) { return false }
+            } else if mode == 1 {
+                if !matches(&profile, [("allocation_count", 3), ("requested_bytes", 80), ("size_class_payload_bytes", 96),
+                                       ("fresh_allocations", 1), ("reused_allocations", 2), ("retain_calls", 1), ("release_calls", 4),
+                                       ("record_construct_calls", 1), ("record_construct_bytes", 24), ("record_clone_calls", 1),
+                                       ("record_clone_bytes", 24)], true) ||
+                   !check_failed_stderr(launcher, image, work) { return false }
+            } else if !matches(&profile, [("allocation_count", 18446744073709551615)], true) { return false }
+        }
+        plain := f"{work}/harness-{name}-off"
+        if !call(emitter, [target.str(), "1", plain.clone(), "off"], work, 0, &mut result) { return false }
+        if has_report_text(plain) { return harness.fail(f"{plain}: unprofiled image retained profile text") }
+        if target == host {
+            if !call(plain, [], work, 17, &mut result) { return false }
+            if result.stdout.len != 0 || result.stderr.len != 0 { return harness.fail("unprofiled image wrote output") }
+        }
+    }
+    print("PASS emitted runtime: zero traffic, exact event counts, unsigned formatting, traps and failed stderr; all native images build")
+    true
+}
+
+fn consumer_counts(name: string, profile: &Profile) -> bool {
+    total := profile.counters.at("allocation_count")
+    fresh := profile.counters.at("fresh_allocations")
+    reuse := profile.counters.at("reused_allocations")
+    if fresh > total || reuse != total - fresh { return harness.fail("allocation count differs from fresh and reused counts") }
+    if name == "empty" { return matches(&profile, [], true) }
+    if name == "records" {
+        return matches(&profile, [("allocation_count", 10), ("requested_bytes", 160), ("size_class_payload_bytes", 160),
+                                  ("fresh_allocations", 2), ("reused_allocations", 8), ("record_construct_calls", 5),
+                                  ("record_construct_bytes", 80), ("record_clone_calls", 5), ("record_clone_bytes", 80)], false)
+    }
+    if name == "buffers" {
+        return matches(&profile, [("allocation_count", 6), ("requested_bytes", 155), ("size_class_payload_bytes", 240),
+                                  ("array_clone_calls", 1), ("array_clone_bytes", 3), ("string_slice_calls", 1),
+                                  ("string_slice_bytes", 2), ("copy_bytes", 8), ("record_construct_calls", 0),
+                                  ("record_clone_calls", 0)], false)
+    }
+    matches(&profile, [("record_construct_calls", 2), ("record_construct_bytes", 56)], false)
+}
+
+fn compare_consumer(image: string, plain: string, source: string, name: string, work: string) -> bool {
+    status := if name == "trap" { 104 } else { 17 }
+    mut result := harness.empty_output()
+    mut reference := harness.empty_output()
+    if !call(image, [], work, status, &mut result) || !call(plain, [], work, status, &mut reference) { return false }
+    if !bytes.equal(&result.stdout, &reference.stdout) { return harness.fail(f"{name}: profiling changed stdout") }
+    if name == "trap" {
+        return (result.stdout_text() == "17\n" && result.stderr_text() == f"{source}:1: assertion failed: false\n" &&
+                bytes.equal(&result.stderr, &reference.stderr)) || harness.fail("profiled trap changed diagnostic or output")
+    }
+    if reference.stderr.len != 0 { return harness.fail(f"{name}: unprofiled stderr was not empty") }
+    profile := read_counters(result.stderr_text())
+    if !profile.ok || !consumer_counts(name, &profile) { return false }
+    print(f"PASS consumer {name}")
+    true
+}
+
+fn check_consumers(compiler: string, baseline: string, root: string, work: string, host: i32) -> bool {
+    empty := work + "/empty.ddr"
+    trap := work + "/trap.ddr"
+    if !sys.write_text(empty, "fn main()->i32{return 17}\n").ok || !sys.write_text(trap, "fn main(){print(17);assert(false)}\n").ok {
+        return harness.fail("cannot write profile source fixtures")
+    }
+    fixtures := root + "/tests/fixtures/runtime-profile-"
+    cases: [](string, string) = [("empty", empty), ("records", fixtures + "records.ddr"),
+                               ("buffers", fixtures + "buffers.ddr"), ("system", fixtures + "system.ddr"), ("trap", trap)]
+    mut result := harness.empty_output()
+    for sample in move cases {
+        (name, source) := sample
+        for target in 0..3 {
+            target_name := harness.target_name(target)
+            image := f"{work}/{name}-{target_name}"
+            plain := image + "-plain"
+            if !call(compiler, ["build", source.clone(), "--target", target_name.clone(), "--runtime-profile", "-o", image.clone()], work, 0, &mut result) ||
+               !call(compiler, ["build", source.clone(), "--target", target_name.clone(), "-o", plain.clone()], work, 0, &mut result) ||
+               !check_header(image, target_name) { return false }
+            if baseline.len > 0 {
+                previous := image + "-baseline"
+                if !call(baseline, ["build", source.clone(), "--target", target_name.clone(), "-o", previous.clone()], work, 0, &mut result) { return false }
+                old := sys.read_u8(previous)
+                new := sys.read_u8(plain)
+                if !old.ok || !new.ok || !bytes.equal(&old.value, &new.value) { return harness.fail(f"{name} {target_name}: unprofiled image changed") }
+            }
+            if target == host && !compare_consumer(image, plain, source, name, work) { return false }
+        }
+    }
+    print("PASS ordinary stdout/exit, classified consumers and native cross-builds")
+    true
+}
+
+fn main() -> i32 {
+    if sys.arg(1) == "--failed-stderr-launcher" { return failed_stderr_launcher() }
+    spec: []cli.Option = [cli.option("--baseline"), cli.flag("--harness-only")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_runtime_profile COMPILER [--baseline COMPILER] [--harness-only]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    mut baseline := ""
+    if args.has("--baseline") {
+        path := fs.realpath(args.last("--baseline", ""))
+        if !path.ok { _ := harness.fail("baseline compiler not found"); return 2 }
+        baseline = path.value
+    }
+    root := harness.find_root()
+    launcher := fs.realpath(sys.arg(0))
+    if root.len == 0 || !launcher.ok { _ := harness.fail("cannot locate repository or runtime profile launcher"); return 2 }
+    temp := fs.temp_dir("dunder-runtime-profile-")
+    if !temp.ok { _ := harness.fail("cannot create runtime profile test directory"); return 1 }
+    work := temp.value
+    defer { _ := fs.remove_all(work) }
+    host := harness.host_id()
+    if !check_emitter(compiler, root, work, host, launcher.value) { return 1 }
+    if args.has("--harness-only") {
+        print("CLI instrumentation coverage skipped explicitly (--harness-only)")
+        return 0
+    }
+    if check_consumers(compiler, baseline, root, work, host) { 0 } else { 1 }
+}

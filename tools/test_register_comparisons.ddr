@@ -1,0 +1,149 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .register_comparison_cases as corpus
+import std.bytes as bytes
+import std.fs as fs
+import std.parse as parse
+import std.process as process
+import sys
+
+struct Slot {
+    case_index: i32,
+    target: i32,
+    running_image: bool,
+    started: i64,
+    stdout: []u8,
+    stderr: []u8,
+}
+
+struct Run {
+    probes: []corpus.Case,
+    work: string,
+    emitter: string,
+    host: i32,
+}
+
+fn source_path(run: &Run, index: i32) -> string { f"{run.work}/case-{index + 1}.ddr" }
+fn image_path(run: &Run, index: i32, target: i32) -> string { f"{run.work}/image-{index + 1}-{target}" }
+
+fn launch(run: &Run, slots: &mut []Slot, pool: &mut process.ChildSet, index: i32, target: i32, execute: bool) -> bool {
+    image := image_path(&run, index, target)
+    probe := &run.probes[index]
+    mut command := if execute { process.command(image.clone(), []) } else {
+        process.command(run.emitter.clone(), [source_path(&run, index), image.clone(), target.str(), probe.mode.clone(),
+                        probe.expected.str(), probe.returns.str(), probe.scalar.str(), probe.left.str(), probe.right.str(),
+                        probe.divisor.str(), "8"])
+    }
+    command.set_cwd(run.work.clone())
+    spawned := command.spawn()
+    if !spawned.ok { return harness.fail(f"could not start comparison {index + 1}, target {target}: {spawned.error}") }
+    mut child := spawned.child
+    slot := pool.insert(&mut child)
+    if slot < 0 { return harness.fail("cannot track comparison child") }
+    slots[slot] = Slot { case_index: index, target: target, running_image: execute, started: sys.now_ms(), stdout: [], stderr: [] }
+    true
+}
+
+fn validate_words(probe: &corpus.Case, target: i32, data: &[]u8) -> bool {
+    decoded := bytes.decode(&data)
+    if !decoded.ok { return harness.fail("comparison emitter wrote invalid UTF-8") }
+    rows := harness.lines(decoded.value)
+    if probe.words.len != 0 && rows.len != probe.words.len {
+        return harness.fail(f"{probe.body} target {target}: expected {probe.words.len} instruction words, observed {rows.len}")
+    }
+    for i in 0..rows.len {
+        value := parse.integer(rows[i])
+        if !value.ok { return harness.fail(f"invalid instruction word {rows[i]}") }
+        if probe.words.len != 0 && value.value != probe.words[i] {
+            return harness.fail(f"{probe.body} target {target}: word {i}, expected {probe.words[i]}, observed {value.value}")
+        }
+    }
+    true
+}
+
+fn drop_image(path: string) -> bool {
+    sys.remove_file(path).ok || harness.fail(f"cannot remove probe image {path}")
+}
+
+fn run_probes(run: &Run) -> bool {
+    for i in 0..run.probes.len {
+        path := source_path(&run, i)
+        if !sys.write_text(path, "a b z values " + run.probes[i].body).ok { return harness.fail(f"cannot write {path}") }
+    }
+    width := 4
+    mut pool := process.ChildSet::new(width)
+    defer { pool.kill_all() }
+    mut slots: []Slot = []
+    for _ in 0..width { slots.push(Slot { case_index: -1, target: 0, running_image: false, started: 0, stdout: [], stderr: [] }) }
+    mut next := 0
+    total := 3 * run.probes.len
+    while next < total || pool.len() > 0 {
+        while next < total && pool.len() < width {
+            if !launch(&run, &mut slots, &mut pool, next / 3, next % 3, false) { return false }
+            next += 1
+        }
+        _ := pool.wait_any(50)
+        for slot in 0..width {
+            if !pool.is_active(slot) { continue }
+            mut stdout := slots[slot].stdout.clone()
+            mut stderr := slots[slot].stderr.clone()
+            mut status := pool.try_wait(slot, &mut stdout, &mut stderr)
+            if !status.exited && status.ok && sys.now_ms() - slots[slot].started >= 60000 {
+                status = pool.kill_reap(slot, &mut stdout, &mut stderr)
+            }
+            index := slots[slot].case_index
+            target := slots[slot].target
+            execute := slots[slot].running_image
+            probe := &run.probes[index]
+            expected := if execute { probe.status } else { 0 }
+            if !status.ok || status.timed_out || (status.exited && (status.signal != 0 || status.code != expected)) {
+                return harness.fail(f"{probe.body} target {target}: expected status {expected}, observed {status.code}, signal {status.signal}, timeout {status.timed_out}\n{bytes.decode(&stdout).value}\n{bytes.decode(&stderr).value}")
+            }
+            if !status.exited {
+                slots[slot].stdout = stdout
+                slots[slot].stderr = stderr
+                continue
+            }
+            image := image_path(&run, index, target)
+            if execute {
+                if stdout.len != 0 { return harness.fail(f"{probe.body}: native image wrote stdout\n{bytes.decode(&stdout).value}") }
+                if !drop_image(image) { return false }
+            } else {
+                if !validate_words(&probe, target, &stdout) { return false }
+                generated := sys.read_u8(image)
+                if !generated.ok || !native.image_header(&generated.value, harness.target_name(target)) {
+                    return harness.fail(f"{probe.body}: invalid image for target {target}")
+                }
+                if target == run.host {
+                    if !launch(&run, &mut slots, &mut pool, index, target, true) { return false }
+                } else if !drop_image(image) { return false }
+            }
+        }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_register_comparisons COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("could not locate Dunder repository root"); return 2 }
+    temp := fs.temp_dir("dunder-register-compare-")
+    if !temp.ok { _ := harness.fail("cannot create comparison test directory"); return 1 }
+    work := temp.value
+    defer { _ := fs.remove_all(work) }
+    emitter := work + "/emitter"
+    mut result := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["build", root + "/tests/fixtures/comparison-emitter.ddr", "-o", emitter.clone()],
+                                   root, 0, false, 60000, &mut result) { return 1 }
+    run := Run { probes: corpus.cases(), work: work.clone(), emitter: emitter, host: harness.host_id() }
+    if !run_probes(&run) { return 1 }
+    print(f"PASS {run.probes.len} comparison cases: exact words, signed results, branches, traps and shortcuts; all three targets built, host executed; cross-native not executed")
+    0
+}

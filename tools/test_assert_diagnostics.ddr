@@ -1,0 +1,323 @@
+capability process, filesystem
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.process as process
+import std.text as text
+import sys
+
+struct Expectation {
+    stdout: string,
+    stderr: string,
+    status: i32,
+}
+
+struct Comparison {
+    name: string,
+    source: string,
+    expression: string,
+    stdout: string,
+    left: string,
+    right: string,
+}
+
+struct Image {
+    ok: bool,
+    data: []u8,
+    report: json.Doc,
+}
+
+struct Probe {
+    compiler: string,
+    root: string,
+    work: string,
+    library: string,
+    runners: native.Runners,
+    images: i32,
+    executions: i32,
+    cli_runs: i32,
+    test_suites: i32,
+}
+
+fn expression() -> string { "self.value == 42 &&\n            /* å 🌍: original spelling */ self.value == 43" }
+
+fn library_source() -> string {
+    "pub struct Probe { value: i32 }\nimpl Probe {\n    pub fn fail(&self) {\n        assert(" + expression() + ")\n    }\n}\n"
+}
+
+fn flags(mode: i32) -> []string {
+    if mode == 0 { return [] }
+    ["--scalar-opt=off", "--ownership-opt=off", "--const-div-opt=off", "--frame-free=off",
+     "--range-opt=off", "--mir=off", "--inline-opt=off"]
+}
+
+fn put(path: string, source: string) -> bool {
+    sys.write_text(path, source).ok || harness.fail(f"cannot write {path}")
+}
+
+fn diagnostic(path: string, source: string, asserted: string, marker: string, left: string, right: string) -> string {
+    at := text.find(source, marker)
+    assert(at >= 0)
+    mut line := 1
+    for i in 0..at { if source[i] == 10 { line += 1 } }
+    error := f"{path}:{line}: assertion failed: {asserted}\n"
+    if left.len == 0 && right.len == 0 { return error }
+    error + f"  left = {left}\n  right = {right}\n"
+}
+
+fn exactly(result: &process.Output, expected: &Expectation) -> bool {
+    (result.stdout.len == expected.stdout.len && result.stderr.len == expected.stderr.len &&
+     result.stdout_text() == expected.stdout && result.stderr_text() == expected.stderr) ||
+        harness.fail(f"unexpected stdout or stderr\nstdout: {result.stdout_text()}\nstderr: {result.stderr_text()}\nexpected stdout: {expected.stdout}\nexpected stderr: {expected.stderr}")
+}
+
+impl Probe {
+    fn call(&self, program: string, args: []string, status: i32, result: &mut process.Output) -> bool {
+        harness.run_checked(program, args, self.work, status, false, &mut result)
+    }
+
+    fn build(&mut self, source: string, image: string, target: string, mode: i32, workers: i32, incremental: bool) -> Image {
+        mut args: []string = ["build", source.clone(), "--target", target.clone(), "--jobs", workers.str(), "--timings=json"]
+        for flag in move flags(mode) { args.push(move flag) }
+        if incremental { args.push("--incremental") }
+        args.push("-o")
+        args.push(image.clone())
+        mut result := harness.empty_output()
+        if !self.call(self.compiler, args, 0, &mut result) { return Image { ok: false, data: [], report: json.Doc::parse_text("") } }
+        parsed := json.Doc::parse_text(result.stderr_text())
+        data := sys.read_u8(image)
+        if !parsed.ok || !data.ok || !native.image_header(&data.value, target) {
+            _ := harness.fail(f"{image}: invalid native image or timing counters\n{result.stderr_text()}")
+            return Image { ok: false, data: [], report: parsed }
+        }
+        self.images += 1
+        Image { ok: true, data: data.value, report: parsed }
+    }
+
+    fn execute(&mut self, image: string, target: string, expected: &Expectation) -> bool {
+        if !self.runners.can_run(target) { return true }
+        mut result := harness.empty_output()
+        if !self.runners.run(target, image, [], self.work, expected.status, &mut result) || !exactly(&result, &expected) { return false }
+        self.executions += 1
+        true
+    }
+
+    fn matrix(&mut self, source: string, expected: &Expectation, worker_observation: bool) -> bool {
+        stem := harness.stem(source)
+        for target in harness.targets() {
+            for mode in 0..2 {
+                mut first: []u8 = []
+                for workers in [1, 4] {
+                    image := f"{self.work}/{stem}-{target}-{mode}-{workers}"
+                    built := self.build(source, image, target, mode, workers, false)
+                    if !built.ok || !self.execute(image, target, &expected) { return false }
+                    if workers == 1 { first = built.data; continue }
+                    if !bytes.equal(&first, &built.data) { return harness.fail(f"{source}: worker image changed for {target}, mode {mode}") }
+                    if worker_observation {
+                        frontend := built.report.field(built.report.root, "frontend")
+                        if built.report.get_i64(frontend, "general_bodies").value < 8 ||
+                           built.report.get_i64(frontend, "workers_used").value <= 0 ||
+                           built.report.get_i64(frontend, "peak_total_jobs").value < 2 {
+                            return harness.fail(f"{source}: diagnostics did not pass through parallel workers")
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn cli_run(&mut self, source: string, expected: &Expectation) -> bool {
+        stem := harness.stem(source)
+        mut result := harness.empty_output()
+        for mode in 0..2 {
+            for workers in [1, 4] {
+                image := f"{self.work}/cli-{stem}-{mode}-{workers}"
+                mut args: []string = ["run", source.clone(), "--jobs", workers.str()]
+                for flag in move flags(mode) { args.push(move flag) }
+                args.push("-o")
+                args.push(move image)
+                if !self.call(self.compiler, args, expected.status, &mut result) || !exactly(&result, &expected) { return false }
+                self.cli_runs += 1
+            }
+        }
+        true
+    }
+}
+
+fn ordinary(probe: &mut Probe) -> bool {
+    failed := probe.work + "/condition.ddr"
+    source := "fn condition() -> bool { print(\"condition once\"); false }\nfn main() {\n    assert(condition())\n    print(\"unreachable\")\n}\n"
+    expected := Expectation { stdout: "condition once\n", stderr: diagnostic(failed, source, "condition()", "assert(", "", ""), status: 104 }
+    if !put(failed, source) || !probe.matrix(failed, &expected, false) || !probe.cli_run(failed, &expected) { return false }
+
+    passed := probe.work + "/passing.ddr"
+    success := Expectation { stdout: "1\n", stderr: "", status: 0 }
+    if !put(passed, "fn condition(count: &mut i32) -> bool { count = count + 1; true }\nfn main() { mut count := 0; assert(condition(&mut count)); print(count) }\n") ||
+       !probe.matrix(passed, &success, false) || !probe.cli_run(passed, &success) { return false }
+
+    imported := probe.work + "/imported.ddr"
+    imported_error := diagnostic(probe.library, library_source(), expression(), "assert(", "", "")
+    imported_out := Expectation { stdout: "", stderr: imported_error, status: 104 }
+    if !put(imported, "import \"./support å\" as support\nfn main() { probe := support.Probe { value: 42 }; probe.fail(); print(\"unreachable\") }\n") ||
+       !probe.matrix(imported, &imported_out, false) || !probe.cli_run(imported, &imported_out) { return false }
+
+    interpolated := probe.work + "/interpolated.ddr"
+    program := "fn main(){x:=1;assert(\"2\" == f\"{x}\")}\n"
+    error := diagnostic(interpolated, program, "\"2\" == f\"{x}\"", "assert(", "2", "1")
+    interp_out := Expectation { stdout: "", stderr: error, status: 104 }
+    put(interpolated, program) && probe.matrix(interpolated, &interp_out, false)
+}
+
+fn compare(probe: &mut Probe) -> bool {
+    for sample in move comparisons() {
+        path := probe.work + "/" + sample.name + ".ddr"
+        error := diagnostic(path, sample.source, sample.expression, "assert(", sample.left, sample.right)
+        expected := Expectation { stdout: sample.stdout, stderr: error, status: 104 }
+        if !put(path, sample.source) || !probe.matrix(path, &expected, false) { return false }
+    }
+    true
+}
+
+fn cache(probe: &mut Probe) -> bool {
+    source := probe.work + "/cached.ddr"
+    if !put(source, "import \"./support å\" as support\nfn cached() -> i32 { mut n := 0; for i in 0..2 { n = n + i }; n }\nfn main() { print(cached()); probe := support.Probe { value: 42 }; probe.fail() }\n") {
+        return false
+    }
+    for target in harness.targets() {
+        for mode in 0..2 {
+            original := library_source()
+            if !put(probe.library, original) { return false }
+            expected := Expectation { stdout: "1\n", stderr: diagnostic(probe.library, original, expression(), "assert(", "", ""), status: 104 }
+            a := f"{probe.work}/cached-{target}-{mode}-0"
+            b := f"{probe.work}/cached-{target}-{mode}-1"
+            cold := probe.build(source, a, target, mode, 1, true)
+            if !cold.ok || !probe.execute(a, target, &expected) { return false }
+            warm := probe.build(source, b, target, mode, 1, true)
+            if !warm.ok || !probe.execute(b, target, &expected) { return false }
+            funcs := warm.report.field(warm.report.root, "functions")
+            if !bytes.equal(&cold.data, &warm.data) || warm.report.get_i64(funcs, "reused").value <= 0 {
+                return harness.fail(f"{target} mode {mode}: warm image changed or failed to reuse a fragment")
+            }
+            shifted := "\n\n" + original
+            if !put(probe.library, shifted) { return false }
+            image := f"{probe.work}/shifted-{target}-{mode}"
+            got := probe.build(source, image, target, mode, 1, true)
+            shift := Expectation { stdout: "1\n", stderr: diagnostic(probe.library, shifted, expression(), "assert(", "", ""), status: 104 }
+            if !got.ok || !probe.execute(image, target, &shift) { return false }
+        }
+    }
+    put(probe.library, library_source())
+}
+
+fn workers(probe: &mut Probe) -> bool {
+    path := probe.work + "/workers.ddr"
+    mut program := ""
+    mut terms := ""
+    for i in 0..16 {
+        program += f"fn worker{i}(text: string) -> i32 {{ assert(text.len == 2); text.len + {i} }}\n"
+        if i > 0 { terms += " + " }
+        terms += f"worker{i}(\"ok\")"
+    }
+    program += "fn main() {\n    print(" + terms + ");\n    _ := worker7(\"\");\n    print(\"unreachable\")\n}\n"
+    error := diagnostic(path, program, "text.len == 2", "fn worker7(", "0", "2")
+    expected := Expectation { stdout: "152\n", stderr: error, status: 104 }
+    put(path, program) && probe.matrix(path, &expected, true)
+}
+
+fn execution_tests(probe: &mut Probe) -> bool {
+    cases := probe.work + "/cases.ddr"
+    asserted := "((value ==\n        /* å 🌍: implicit assertion */ 43))"
+    program := "import \"./support å\" as support\n@test fn implicit_failure() {\n    value := 42\n    " + asserted +
+        "\n}\n@test fn explicit_method_failure() {\n    probe := support.Probe { value: 42 }\n    probe.fail()\n}\n"
+    root := probe.work + "/test_root.ddr"
+    if !put(cases, program) || !put(root, "import cases\n@test fn survivor() { true }\n") { return false }
+    implicit := diagnostic(cases, program, asserted, asserted, "42", "43")
+    explicit := diagnostic(probe.library, library_source(), expression(), "assert(", "", "")
+    mut result := harness.empty_output()
+    for mode in 0..2 {
+        for workers in [1, 4] {
+            output := f"{probe.work}/tests-{mode}-{workers}"
+            mut args: []string = ["test", root.clone(), "--jobs", workers.str()]
+            for flag in move flags(mode) { args.push(move flag) }
+            args.push("-o")
+            args.push(move output)
+            if !probe.call(probe.compiler, args, 1, &mut result) { return false }
+            report := result.stdout_text()
+            errors := result.stderr_text()
+            if text.find(report, f"FAIL {cases}::implicit_failure (exit 104)") < 0 ||
+               text.find(report, f"FAIL {cases}::explicit_method_failure (exit 104)") < 0 ||
+               text.find(report, f"PASS {root}::survivor") < 0 || !text.ends_with(report, "1 passed, 2 failed\n") ||
+               (errors != implicit + explicit && errors != explicit + implicit) {
+                return harness.fail(f"unexpected parallel test diagnostics\n{report}\n{errors}")
+            }
+            probe.test_suites += 1
+        }
+    }
+    true
+}
+
+fn compiler_api(probe: &mut Probe) -> bool {
+    api := probe.work + "/compiler-api"
+    fixture := probe.root + "/tests/fixtures/interpolation/api.ddr"
+    mut result := harness.empty_output()
+    if !probe.call(probe.compiler, ["build", fixture.clone(), "--jobs", "1", "-o", api.clone()], 0, &mut result) ||
+       result.stderr.len != 0 { return harness.fail(f"cannot build direct API fixture\n{result.stderr_text()}") }
+    source := probe.work + "/api-input.ddr"
+    if !put(source, "\nfn main(){\n assert(1==2)\n}\n") { return false }
+    expected := Expectation { stdout: "", stderr: "<source>:3: assertion failed: 1==2\n  left = 1\n  right = 2\n", status: 104 }
+    for number in 0..3 {
+        target := harness.target_name(number)
+        image := f"{probe.work}/api-{target}"
+        if !probe.call(api, [source.clone(), number.str(), "direct", image.clone()], 0, &mut result) ||
+           result.stdout_text() != "api ok\n" || result.stderr.len != 0 { return harness.fail("direct compiler API failed") }
+        data := sys.read_u8(image)
+        if !data.ok || !native.image_header(&data.value, target) { return harness.fail(f"invalid direct API image for {target}") }
+        probe.images += 1
+        if !probe.execute(image, target, &expected) { return false }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--runner")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_assert_diagnostics COMPILER [--runner TARGET=COMMAND]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    if process.host_target().len == 0 { _ := harness.fail("unsupported native host"); return 2 }
+    runners := native.Runners::new(&args.all("--runner"))
+    if runners.error.len > 0 { _ := sys.eprint(runners.error); return 2 }
+    root := harness.find_root()
+    temp := fs.temp_dir("dunder-assert-diagnostics-")
+    if root.len == 0 || !temp.ok { _ := harness.fail("cannot locate repository or create assertion test directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    real := fs.realpath(temp.value)
+    if !real.ok { _ := harness.fail("cannot resolve assertion test directory"); return 1 }
+    work := real.value
+    library := work + "/support å.ddr"
+    if !put(library, library_source()) { return 1 }
+    mut probe := Probe { compiler: compiler, root: root, work: work, library: library, runners: runners,
+                         images: 0, executions: 0, cli_runs: 0, test_suites: 0 }
+    if !ordinary(&mut probe) || !compare(&mut probe) || !cache(&mut probe) || !workers(&mut probe) ||
+       !execution_tests(&mut probe) || !compiler_api(&mut probe) { return 1 }
+    print(f"assert diagnostics: {probe.images} native images, {probe.executions} target executions ({probe.runners.targets()}), {probe.cli_runs} CLI runs, {probe.test_suites} test suites; exact imported locations/expressions, once-only comparisons, silent success, workers, cache line shifts and direct API provenance passed")
+    0
+}
+
+fn comparisons() -> []Comparison {
+    [
+        Comparison { name: "once", source: "\nfn next(count: &mut i32) -> i32 { count += 1; print(count); count }\nfn main() { mut count := 0; assert(((next(&mut count) == next(&mut count)))) }\n", expression: "((next(&mut count) == next(&mut count)))", stdout: "1\n2\n", left: "1", right: "2" },
+        Comparison { name: "string_lease", source: "\nfn change(text: &mut string) -> string { text = \"ny\" + \" text\"; text.clone() }\nfn main() { mut text := \"äldre\" + \" text\"; assert(text == change(&mut text)) }\n", expression: "text == change(&mut text)", stdout: "", left: "äldre text", right: "ny text" },
+        Comparison { name: "float", source: "\nfn main() { negative_zero := -0.0; assert(negative_zero > 1.5) }\n", expression: "negative_zero > 1.5", stdout: "", left: "-0.0", right: "1.5" },
+        Comparison { name: "unsigned", source: "\nfn main() { maximum: u64 = 18446744073709551615; assert(maximum < 42) }\n", expression: "maximum < 42", stdout: "", left: "18446744073709551615", right: "42" },
+        Comparison { name: "bool", source: "\nfn main() { assert((1 < 2) == false) }\n", expression: "(1 < 2) == false", stdout: "", left: "true", right: "false" },
+        Comparison { name: "rune", source: "\nfn main() { high := `\\u{10ffff}` + `a`; assert(high == `a`) }\n", expression: "high == `a`", stdout: "", left: "1114208", right: "97" },
+        Comparison { name: "enum_tag", source: "\nenum State { First = -42, Second = 42 }\nfn main() { assert(State.First == State.Second) }\n", expression: "State.First == State.Second", stdout: "", left: "-42", right: "42" },
+        Comparison { name: "pointer", source: "\ncapability unsafe\nfn main() { unsafe { assert(ptr(0) == ptr(1)) } }\n", expression: "ptr(0) == ptr(1)", stdout: "", left: "0", right: "1" },
+    ]
+}
