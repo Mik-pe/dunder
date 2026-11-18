@@ -1,0 +1,232 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import sys
+
+@extern("c", "execv")
+unsafe fn c_execv(path: ptr, argv: ptr) -> i32
+
+fn invalid_argv() -> [][]u8 {
+    [[255], [192, 175], [226], [237, 160, 128], [244, 144, 128, 128]]
+}
+
+fn launch_raw_argument() -> i32 {
+    all := invalid_argv()
+    index := parse.integer(sys.arg(3))
+    if !index.ok || index.value < 0 || index.value >= i64(all.len) { return 2 }
+    mut path: []u8 = []
+    bytes.append_utf8(&mut path, sys.arg(2))
+    path.push(0)
+    mut raw := all[i32(index.value)].clone()
+    raw.push(0)
+    unsafe {
+        argv := [addr(&path[0]), addr(&raw[0]), ptr(0)]
+        if target_is("macos") {
+            _ := c_execv(argv[0], addr(&argv[0]))
+        } else if target_is("linux") {
+            env := [ptr(0)]
+            _ := sys.linux_syscall(221, i64(usize(argv[0])), i64(usize(addr(&argv[0]))),
+                                  i64(usize(addr(&env[0]))), 0, 0, 0)
+        }
+    }
+    _ := harness.fail("cannot exec UTF-8 probe with raw argument")
+    70
+}
+
+fn cases() -> [][]i32 {
+    limits: []i32 = [127, 128, 2047, 2048, 55295, 57344, 65535, 65536, 1114111]
+    mut all: []i32 = [0]
+    for limit in limits { all.push(limit) }
+    mut ascii: []i32 = []
+    for _ in 0..4 {
+        for byte in "ASCII boundary ".bytes() { ascii.push(i32(byte)) }
+    }
+    [[], [65, 0, 122, 127, 10, 9], all,
+     [233, 32, 101, 769, 32, 917, 955, 955, 951, 957, 953, 954, 940, 32, 127757], ascii, limits]
+}
+
+fn encode_scalar(scalar: i32, buffer: &mut []u8) {
+    if scalar < 128 {
+        buffer.push(u8(scalar))
+    } else {
+        if scalar < 2048 {
+            buffer.push(u8(192 + scalar / 64))
+        } else if scalar < 65536 {
+            buffer.push(u8(224 + scalar / 4096))
+            buffer.push(u8(128 + scalar / 64 % 64))
+        } else {
+            buffer.push(u8(240 + scalar / 262144))
+            buffer.push(u8(128 + scalar / 4096 % 64))
+            buffer.push(u8(128 + scalar / 64 % 64))
+        }
+        buffer.push(u8(128 + scalar % 64))
+    }
+}
+
+fn run(program: string, args: []string, status: i32, out: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, "", status, false, 60000, &mut out)
+}
+
+fn check_profiles(first: &json.Doc, second: &json.Doc) -> bool {
+    a := first.field(first.root, "counters")
+    b := second.field(second.root, "counters")
+    if first.count(first.root) != second.count(second.root) ||
+       first.kind(a) != .Object || second.kind(b) != .Object ||
+       first.count(a) != second.count(b) { return false }
+    for i in 0..first.count(first.root) {
+        key := first.key_at(first.root, i).value
+        if key != "counters" && first.raw_span(first.val_at(first.root, i)) != second.raw_span(second.field(second.root, key)) {
+            return false
+        }
+    }
+    for i in 0..first.count(a) {
+        key := first.key_at(a, i).value
+        old := first.as_u64(first.val_at(a, i))
+        new := second.get_u64(b, key)
+        if !old.ok || !new.ok || old.value != new.value { return false }
+    }
+    true
+}
+
+fn check_literal(profile: &json.Doc) -> bool {
+    counters := profile.field(profile.root, "counters")
+    if profile.kind(counters) != .Object { return false }
+    for i in 0..profile.count(counters) {
+        value := profile.as_u64(profile.val_at(counters, i))
+        if !value.ok || value.value != 0 { return false }
+    }
+    true
+}
+
+fn check_case(emitter: string, launcher: string, work: string, host: i32, selected: i32, scalars: &[]i32) -> bool {
+    source := work + "/text"
+    oracle := work + "/expected"
+    mut utf8: []u8 = []
+    mut expected: []u8 = []
+    mut has_nul := false
+    for scalar in scalars {
+        if scalar == 0 { has_nul = true }
+        encode_scalar(scalar, &mut utf8)
+        bytes.append_utf8(&mut expected, f"{scalar} {utf8.len}\n")
+    }
+    if !sys.write_u8(source, &utf8).ok || !sys.write_u8(oracle, &expected).ok {
+        return harness.fail(f"cannot write UTF-8 input and expected offsets for text {selected}")
+    }
+    invalid_count := invalid_argv().len
+    mut result := harness.empty_output()
+    for kind in ["literal", "slice", "decoded", "argv"] {
+        if kind == "argv" && has_nul { continue }
+        for target in 0..3 {
+            profile_mode := if host == target { "profile" } else { "plain" }
+            mut leaf := json.Doc::parse_text("")
+            for mode in ["leaf", "inline"] {
+                image := f"{work}/{selected}-{target}-{kind}-{mode}"
+                if !run(emitter, [image.clone(), target.str(), mode.clone(), source.clone(), oracle.clone(),
+                                  kind.clone(), profile_mode.clone()], 0, &mut result) { return false }
+                if target != host { continue }
+                mut args: []string = []
+                if kind == "argv" {
+                    decoded := bytes.decode(&utf8)
+                    if !decoded.ok { return harness.fail(f"cannot pass valid UTF-8 text {selected} to argv") }
+                    args.push(move decoded.value)
+                }
+                if !run(image, args, 0, &mut result) || result.stdout.len != 0 { return harness.fail(f"{image}: expected empty stdout") }
+                parsed := json.Doc::parse_text(result.stderr_text())
+                if !parsed.ok || parsed.get_str(parsed.root, "kind").value != "runtime_profile" {
+                    return harness.fail(f"{image}: expected runtime profile\n{result.stderr_text()}")
+                }
+                if kind == "literal" && !check_literal(&parsed) { return harness.fail(f"{image}: literal added runtime traffic") }
+                if mode == "leaf" { leaf = parsed }
+                else if !check_profiles(&leaf, &parsed) { return harness.fail(f"{image}: inline added runtime traffic") }
+                if kind == "argv" && scalars.len != 0 {
+                    for invalid in 0..invalid_count {
+                        if !run(launcher, ["--launch-raw-argument", image.clone(), invalid.str()], 106, &mut result) ||
+                           result.stdout.len != 0 || result.stderr.len != 0 {
+                            return harness.fail(f"{image}: invalid argv {invalid} was not rejected silently during creation")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    print(f"PASS text {selected}: widths/boundaries, cursor and GPR contract; leaf/inline traffic identical")
+    true
+}
+
+fn check_consumer(compiler: string, baseline: string, root: string, work: string, host: i32) -> bool {
+    consumer := root + "/tests/fixtures/utf8-next-values.ddr"
+    mut result := harness.empty_output()
+    for target in 0..3 {
+        name := harness.target_name(target)
+        image := f"{work}/consumer-{target}"
+        if !run(compiler, ["build", consumer.clone(), "--target", name.clone(), "-o", image.clone()], 0, &mut result) { return false }
+        if baseline.len > 0 {
+            old := f"{work}/baseline-{target}"
+            if !run(baseline, ["build", consumer.clone(), "--target", name.clone(), "-o", old.clone()], 0, &mut result) { return false }
+            a := sys.read_u8(image)
+            b := sys.read_u8(old)
+            if !a.ok || !b.ok || !bytes.equal(&a.value, &b.value) { return harness.fail(f"{name}: default wrapper image changed") }
+        }
+        if target == host && (!run(image, [], 0, &mut result) || !harness.stdout_is(&result, "42\n", image)) { return false }
+    }
+    input := work + "/invalid.ddr"
+    for spelling in ["\"\\xff\"", "\"\\xc0\\xaf\"", "\"\\xe2\"", "\"\\xed\\xa0\\x80\"", "\"\\xf4\\x90\\x80\\x80\""] {
+        program := "fn main(){for scalar in " + spelling + ".runes(){print(42)}}"
+        if !sys.write_text(input, program).ok { return harness.fail(f"cannot write {input}") }
+        if !run(compiler, ["check", input.clone(), "--agent"], 1, &mut result) { return false }
+        if baseline.len > 0 {
+            mut old := harness.empty_output()
+            if !run(baseline, ["check", input.clone(), "--agent"], 1, &mut old) { return false }
+            if !bytes.equal(&result.stdout, &old.stdout) { return harness.fail(f"{spelling}: baseline diagnostics changed") }
+        }
+    }
+    source := work + "/bad-boundary.ddr"
+    image := f"{work}/bad-boundary-{host}"
+    if !sys.write_text(source, "fn main(){for scalar in \"å\"[1..2].runes(){print(42)}}").ok { return harness.fail(f"cannot write {source}") }
+    run(compiler, ["build", source, "--target", harness.target_name(host), "-o", image.clone()], 0, &mut result) &&
+        run(image, [], 106, &mut result) && harness.stdout_is(&result, "", image)
+}
+
+fn run_suite(compiler: string, baseline: string, root: string, launcher: string, work: string) -> bool {
+    host := harness.host_id()
+    emitter := work + "/emitter"
+    mut result := harness.empty_output()
+    if !run(compiler, ["build", root + "/tests/fixtures/utf8-next-emitter.ddr", "-o", emitter.clone()], 0, &mut result) { return false }
+    corpus := cases()
+    for i in 0..corpus.len {
+        if !check_case(emitter, launcher, work, host, i, &corpus[i]) { return false }
+    }
+    if !check_consumer(compiler, baseline, root, work, host) { return false }
+    identity := if baseline.len > 0 { "default images byte-identical to baseline" } else { "default image comparison not requested" }
+    print(f"UTF-8 next: exact bounded vocabulary/check mode, valid sources and creation failures passed; {identity}; all targets built, host executed, cross-native not executed")
+    true
+}
+
+fn main() -> i32 {
+    if sys.arg(1) == "--launch-raw-argument" { return launch_raw_argument() }
+    spec: []cli.Option = [cli.option("--baseline")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_utf8_next COMPILER [--baseline COMPILER]")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    mut baseline := ""
+    if args.has("--baseline") {
+        path := fs.realpath(args.last("--baseline", ""))
+        if !path.ok { _ := harness.fail("baseline compiler not found"); return 2 }
+        baseline = path.value
+    }
+    root := harness.find_root()
+    launcher := fs.realpath(sys.arg(0))
+    if root.len == 0 || !launcher.ok { _ := harness.fail("cannot resolve repository or UTF-8 launcher path"); return 2 }
+    directory := fs.temp_dir("dunder-utf8-next-")
+    if !directory.ok { _ := harness.fail("cannot create UTF-8 test directory"); return 1 }
+    work := directory.value
+    defer { _ := fs.remove_all(work) }
+    if run_suite(compiler, baseline, root, launcher.value, work) { 0 } else { 1 }
+}

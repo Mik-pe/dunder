@@ -1,0 +1,265 @@
+capability process, filesystem, unsafe
+
+import .harness as harness
+import .native_probe as native
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+@extern("c", "kill")
+unsafe fn c_kill(pid: i32, signum: i32) -> i32
+
+fn terminate_pid(pid: i32) -> bool {
+    unsafe {
+        if target_is("macos") { return c_kill(pid, 15) == 0 }
+        if target_is("linux") { return sys.linux_syscall(129, i64(pid), 15, 0, 0, 0, 0) == 0 }
+    }
+    false
+}
+
+fn command(image: string, args: []string, cwd: string, path: string) -> process.Command {
+    mut cmd := process.command(image.clone(), args.clone())
+    cmd.set_cwd(cwd.clone())
+    cmd.set_env("DUNDER_REPLACE_SENTINEL", "kept å 🌍")
+    cmd.set_env("PATH", path.clone())
+    cmd.set_timeout(5000)
+    cmd
+}
+
+fn expect(out: &process.Output, status: i32, stdout: string, stderr: string, name: string) -> bool {
+    (out.ok && !out.timed_out && out.signal == 0 && out.code == status &&
+        out.stdout.len == stdout.len && out.stderr.len == stderr.len &&
+        out.stdout_text() == stdout && out.stderr_text() == stderr) ||
+        harness.fail(f"{name}: expected status {status}, got {out.code} (signal {out.signal}, timeout {out.timed_out})\n{out.stdout_text()}\n{out.stderr_text()}")
+}
+
+fn payload() -> []u8 { [0, 1, 127, 255] }
+
+fn probe_result(cmd: &process.Command, output: &mut process.Output, pid: &mut i32) -> bool {
+    spawned := cmd.spawn()
+    if !spawned.ok { return harness.fail(f"cannot spawn process replacement probe: {spawned.error}") }
+    mut child := spawned.child
+    pid = child.pid()
+    input := payload()
+    if !child.write_stdin(&input).ok { return harness.fail("cannot write process replacement probe stdin") }
+    child.close_stdin()
+    mut pool := process.ChildSet::new(1)
+    slot := pool.insert(&mut child)
+    if slot < 0 { return harness.fail("cannot track process replacement probe") }
+    mut stdout: []u8 = []
+    mut stderr: []u8 = []
+    deadline := sys.now_ms() + 5000
+    while true {
+        status := pool.try_wait(slot, &mut stdout, &mut stderr)
+        if !status.ok { return harness.fail(f"cannot reap process replacement probe: {status.error}") }
+        if status.exited {
+            output = process.Output { ok: true, error: 0, code: status.code, signal: status.signal, timed_out: false,
+                                      stdout: stdout, stderr: stderr }
+            return true
+        }
+        remaining := deadline - sys.now_ms()
+        if remaining <= 0 {
+            _ := pool.kill_reap(slot, &mut stdout, &mut stderr)
+            return harness.fail("process replacement probe timed out")
+        }
+        _ := pool.wait_any(remaining)
+    }
+    false
+}
+
+fn check_identity(image: string, cwd: string, path: string) -> bool {
+    arguments: []string = ["probe", "", "two words", "å 🌍", "$(touch should-not-exist)", "x; exit 99"]
+    variants: [](string, string, string) = [
+        ("replace", image.clone(), image.clone()),
+        ("replace-as", "replacement", "pre-receive"),
+        ("replace-as", image.clone(), "snus-runner"),
+    ]
+    mut out := harness.empty_output()
+    mut pid := 0
+    for variant in move variants {
+        (mode, program, argv0) := variant
+        mut args: []string = [mode.clone(), program.clone()]
+        if mode == "replace-as" { args.push(argv0.clone()) }
+        for arg in arguments { args.push(arg.clone()) }
+        mut cmd := command(image, args, cwd, path)
+        cmd.set_stdio(.Pipe, .Pipe, .Pipe)
+        if !probe_result(&cmd, &mut out, &mut pid) || !expect(&out, 37, out.stdout_text(), "probe stderr\n", argv0) { return false }
+        doc := json.Doc::parse_text(out.stdout_text())
+        result_pid := doc.get_i64(doc.root, "pid")
+        actual_args := doc.field(doc.root, "args")
+        if !doc.ok || doc.count(doc.root) != 6 || !result_pid.ok || result_pid.value != i64(pid) ||
+           doc.get_str(doc.root, "argv0").value != argv0 || doc.get_str(doc.root, "cwd").value != cwd ||
+           doc.get_str(doc.root, "environment").value != "kept å 🌍" || doc.get_str(doc.root, "stdin_hex").value != "00017fff" ||
+           doc.kind(actual_args) != .Array || doc.count(actual_args) != arguments.len {
+            return harness.fail(f"{argv0}: unexpected process replacement identity or ambient state\n{out.stdout_text()}")
+        }
+        for i in 0..arguments.len {
+            arg := doc.as_str(doc.at(actual_args, i))
+            if !arg.ok || arg.value != arguments[i] { return harness.fail(f"{argv0}: argument {i} changed\n{out.stdout_text()}") }
+        }
+        if sys.metadata(cwd + "/should-not-exist").ok { return harness.fail("argument was executed by a shell") }
+    }
+    true
+}
+
+fn check_path(image: string, cwd: string, path: string) -> bool {
+    absolute := command(image, ["replace", "/usr/bin/true"], cwd, path)
+    absolute_result := absolute.exec()
+    if !expect(&absolute_result, 0, "", "", "absolute executable") { return false }
+    if !fs.symlink(image, cwd + "/replacement").ok { return harness.fail("cannot link replacement in working directory") }
+    mut out := harness.empty_output()
+    mut pid := 0
+    for search in ["", ":", "/definitely/missing:"] {
+        mut cmd := command(image, ["replace", "replacement", "probe"], cwd, search)
+        cmd.set_stdio(.Pipe, .Pipe, .Pipe)
+        if !probe_result(&cmd, &mut out, &mut pid) || !expect(&out, 37, out.stdout_text(), "probe stderr\n", search) { return false }
+        doc := json.Doc::parse_text(out.stdout_text())
+        value := doc.get_i64(doc.root, "pid")
+        if !value.ok || value.value != i64(pid) { return harness.fail(f"PATH={search}: replacement PID changed\n{out.stdout_text()}") }
+    }
+    mut missing := command(image, ["replace-as", "sh", "replacement-shell", "-c", "test \"$0\" = replacement-shell && exit 23"], cwd, path)
+    missing.unset_env("PATH")
+    result := missing.exec()
+    (result.ok && !result.timed_out && result.signal == 0 && result.code == 23) ||
+        harness.fail(f"unset PATH: replacement shell exited {result.code}\n{result.stdout_text()}\n{result.stderr_text()}")
+}
+
+fn check_failures(image: string, cwd: string, path: string) -> bool {
+    mut failures := command(image, ["failures"], cwd, path)
+    failures.set_stdin(payload())
+    result := failures.exec()
+    if !expect(&result, 0, "replace failures preserve caller\n", "failure stderr\n", "invalid process arguments") { return false }
+    no_image := path + "/no-image"
+    denied := path + "/denied"
+    if !sys.write_text(no_image, "touch should-not-exist\n").ok || !sys.make_executable(no_image).ok ||
+       !sys.write_text(denied, "not executable\n").ok { return harness.fail("cannot prepare invalid executables") }
+    non_binary := command(image, ["replace", "no-image", "unused"], cwd, path)
+    failed := non_binary.exec()
+    if !failed.ok || failed.timed_out || failed.code != 99 || failed.stdout_text() != "exec failed 8\n" ||
+       sys.metadata(cwd + "/should-not-exist").ok {
+        return harness.fail(f"non-binary was not rejected with ENOEXEC\n{failed.stdout_text()}\n{failed.stderr_text()}")
+    }
+    denied_command := command(image, ["replace", "denied", "unused"], cwd, path + ":/definitely/missing")
+    refused := denied_command.exec()
+    (refused.ok && !refused.timed_out && refused.code == 99 && refused.stdout_text() == "exec failed 13\n") ||
+        harness.fail(f"permission failure did not survive PATH search\n{refused.stdout_text()}\n{refused.stderr_text()}")
+}
+
+fn check_signal(image: string, cwd: string, path: string) -> bool {
+    mut cmd := command(image, ["replace-as", "replacement", "snus-agent", "wait"], cwd, path)
+    cmd.set_stdio(.Null, .Pipe, .Pipe)
+    spawned := cmd.spawn()
+    if !spawned.ok { return harness.fail(f"cannot start signal probe: {spawned.error}") }
+    mut child := spawned.child
+    pid := child.pid()
+    announce := child.read_stdout_line(5000)
+    doc := json.Doc::parse_text(announce.value)
+    announced_pid := doc.get_i64(doc.root, "pid")
+    if !announce.ok || !announced_pid.ok || announced_pid.value != i64(pid) ||
+       doc.get_str(doc.root, "argv0").value != "snus-agent" || !terminate_pid(pid) {
+        _ := child.kill()
+        _ := child.wait(5000)
+        return harness.fail(f"cannot signal replacement PID {pid}\n{announce.value}")
+    }
+    status := child.wait(5000)
+    (status.ok && status.exited && !status.timed_out && status.signal == 15) ||
+        harness.fail(f"replacement PID {pid}: expected SIGTERM, got signal {status.signal} (status {status.code})")
+}
+
+fn check_image(image: string, work: string) -> bool {
+    cwd := work + "/working directory"
+    path := work + "/executables"
+    if !fs.mkdir_all(cwd).ok || !fs.mkdir_all(path).ok || !fs.symlink(image, path + "/replacement").ok {
+        return harness.fail(f"cannot prepare {work}")
+    }
+    real := fs.realpath(cwd)
+    if !real.ok { return harness.fail(f"cannot resolve {cwd}") }
+    check_identity(image, real.value, path) && check_path(image, real.value, path) &&
+        check_failures(image, real.value, path) && check_signal(image, real.value, path)
+}
+
+fn build(compiler: string, root: string, image: string, target: string, mode: i32) -> bool {
+    mut args: []string = ["build", root + "/tests/process_replace.ddr", "--target", target.clone(), "--jobs", "1", "-o", image.clone()]
+    if mode == 1 {
+        for flag in move native.direct_flags() { args.push(move flag) }
+    }
+    mut result := harness.empty_output()
+    harness.run_checked(compiler, args, root, 0, false, &mut result)
+}
+
+fn write_receipt(path: string, host: string, builds: i32, hashes: &[]string, started: i64) -> bool {
+    parent := harness.parent_dir(path)
+    if parent.len > 0 && !fs.mkdir_all(parent).ok { return harness.fail(f"cannot create {parent}") }
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("schema")
+    writer.string("dunder-process-replace-verification/v1")
+    writer.key("host_target")
+    writer.string(host)
+    writer.key("builds")
+    writer.integer(i64(builds))
+    writer.key("executions")
+    writer.integer(i64(hashes.len))
+    writer.key("binaries")
+    writer.array()
+    for hash in hashes { writer.string(hash) }
+    writer.end()
+    writer.key("seconds")
+    writer.decimal(f64(sys.now_ms() - started) / 1000.0)
+    writer.key("passed")
+    writer.boolean(true)
+    writer.end()
+    evidence.save(path, &writer)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--binary"), cli.option("--receipt")]
+    args := cli.parse(&spec)
+    usage := "usage: test_process_replace [COMPILER | --binary IMAGE] [--receipt PATH]"
+    if args.help { print(usage); return 0 }
+    binary := args.has("--binary")
+    if args.error.len > 0 { _ := sys.eprint(args.error + "\n" + usage); return 2 }
+    if (binary && args.positionals.len != 0) || (!binary && args.positionals.len != 1) {
+        _ := sys.eprint("provide either a compiler or --binary\n" + usage)
+        return 2
+    }
+    host := process.host_target()
+    if host.len == 0 { _ := harness.fail("unsupported native host"); return 1 }
+    started := sys.now_ms()
+    tmp := fs.temp_dir("dunder-process-replace-")
+    if !tmp.ok { _ := harness.fail("cannot create process replacement test directory"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    mut builds := 0
+    mut runnable: []string = []
+    if binary {
+        resolved := fs.realpath(args.last("--binary", ""))
+        if !resolved.ok { _ := harness.fail("cannot locate probe binary"); return 1 }
+        runnable.push(move resolved.value)
+    } else {
+        compiler := cli.compiler(&args, usage)
+        if compiler.len == 0 { return 2 }
+        root := harness.find_root()
+        if root.len == 0 { _ := harness.fail("cannot locate Dunder repository root"); return 1 }
+        for target in harness.targets() {
+            for mode in 0..2 {
+                image := f"{work}/replace-{target}-{mode}"
+                if !build(compiler, root, image, target, mode) { return 1 }
+                builds += 1
+                if target == host { runnable.push(move image) }
+            }
+        }
+    }
+    mut hashes: []string = []
+    for i in 0..runnable.len {
+        if !check_image(runnable[i], f"{work}/run-{i}") { return 1 }
+        hashes.push(harness.sha256_file_hex(runnable[i]))
+    }
+    receipt := args.last("--receipt", "")
+    if args.has("--receipt") && !write_receipt(receipt, host, builds, &hashes, started) { return 1 }
+    print(f"Process replace: {builds} native builds, {hashes.len} live executions passed")
+    0
+}
