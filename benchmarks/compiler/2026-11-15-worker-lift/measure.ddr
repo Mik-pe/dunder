@@ -1,0 +1,420 @@
+capability process, filesystem
+
+import .corpus as shaped
+import "../../../tools/benchmark_commands" as bench
+import "../../../tools/benchmark_time" as time
+import "../../../tools/compiler_matrix_runner" as order
+import "../../../tools/harness" as harness
+import "../../../tools/native_probe" as native
+import "../../../tools/performance_corpus" as corpus
+import "../../../tools/probe_cli" as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.text as text
+import sys
+
+struct Driver { name: string, path: string }
+struct Options {
+    root: string,
+    tool_root: string,
+    tabell: string,
+    report: string,
+    rounds: i32,
+    rss_rounds: i32,
+    stress: bool,
+    drivers: []Driver,
+}
+
+struct Image { case_name: string, variant: string, sha256: string }
+struct Sample { case_name: string, variant: string, round: i32, ms: f64, before_image: i64, mir: i64, size: i64 }
+struct Memory { case_name: string, variant: string, round: i32, bytes: i64 }
+struct ResultSet {
+    images: []Image,
+    corpus_ids: []corpus.SourceHash,
+    samples: []Sample,
+    memory: []Memory,
+}
+
+fn digest_group(folder: string) -> string {
+    files := fs.list_dir(folder)
+    if !files.ok { return "" }
+    mut content: []u8 = []
+    for name in files.entries {
+        if !text.ends_with(name, ".ddr") { continue }
+        got := sys.read_u8(folder + "/" + name)
+        if !got.ok { return "" }
+        bytes.extend(&mut content, &got.value)
+    }
+    harness.sha256_bytes_hex(&content)
+}
+
+fn both_accept(options: &Options, work: string, sample: string) -> bool {
+    file := work + "/dialect.ddr"
+    if !sys.write_text(file, sample).ok { return false }
+    for driver in options.drivers {
+        out := harness.exec_cmd(driver.path, ["check", file.clone()], options.root, true, 120000)
+        if !out.succeeded() { return false }
+    }
+    true
+}
+
+fn binding_syntax(options: &Options, work: string) -> string {
+    for binding in ["mut", "var"] {
+        sample := f"fn main() {{ {binding} n := 1; n = n + 1; print(n) }}\n"
+        if both_accept(&options, work, sample) { return binding.clone() }
+    }
+    ""
+}
+
+fn supports_snapshot(options: &Options, work: string, binding: string, array: string) -> bool {
+    sample := "struct Item { values: []i64 }\nfn main() {\n    item := Item { values: [i64(1)] }\n" +
+        f"    {binding} a := {array}\n    a[0] = 2\n    print(item.values[0])\n}}\n"
+    both_accept(&options, work, sample)
+}
+
+fn supports_payload(options: &Options, work: string, value: string) -> bool {
+    sample := "enum Reading { Count(i64), Text(string) }\nfn label(text: string) -> Reading { Reading.Text(" +
+        value + ") }\nfn main() { reading := label(\"ok\"); print(0) }\n"
+    both_accept(&options, work, sample)
+}
+
+fn prepare(options: &Options, work: string, binding: string, generated: &corpus.Corpus, cases: &mut []shaped.Workload) -> bool {
+    cases.push(shaped.workload("generated", generated.path, "595500\n", true))
+    cases.push(shaped.shaped(work, generated.path, false))
+    cases.push(shaped.shaped(work, generated.path, true))
+    cases.push(shaped.workload("selfhost", options.root + "/selfhost/main_parallel.ddr", "42\ntrue\n", false))
+    expected := sys.read_u8(options.tabell + "/expected.csv")
+    if !expected.ok { return harness.fail("cannot read Tabell expected.csv") }
+    cases.push(shaped.Workload { name: "tabell", source: options.tabell + "/main.ddr", expected: expected.value, synthetic: false })
+    if options.stress {
+        old := supports_snapshot(&options, work, binding, "item.values")
+        array := if old { "item.values" } else { "item.values.clone()" }
+        if !old && !supports_snapshot(&options, work, binding, array) {
+            return harness.fail("the compiler pair does not accept a common frontend-stress fixture")
+        }
+        legacy_payload := supports_payload(&options, work, "text")
+        payload := if legacy_payload { "text" } else { "text.clone()" }
+        if !legacy_payload && !supports_payload(&options, work, payload) {
+            return harness.fail("the compiler pair does not accept a common enum payload fixture")
+        }
+        cases.push(shaped.large(work, binding))
+        cases.push(shaped.varied(work, binding, array, payload))
+    }
+    for case in cases {
+        if case.source.len == 0 { return harness.fail(f"cannot prepare {case.name}") }
+    }
+    true
+}
+
+fn command(driver: &Driver, source: string, image: string) -> []string {
+    [driver.path.clone(), "build", source.clone(), "--jobs=4", "--timings=json", "-o", image.clone()]
+}
+
+fn recorded_hash(results: &ResultSet, name: string, variant: string) -> string {
+    for image in results.images {
+        if image.case_name == name && image.variant == variant { return image.sha256.clone() }
+    }
+    ""
+}
+
+fn verify(options: &Options, compiler: &mut bench.Commands, case: &shaped.Workload, driver: &Driver,
+          image: string, work: string, digest: string) -> bool {
+    mut elapsed: i64 = 0
+    mut result := harness.empty_output()
+    if options.stress {
+        serial := work + "/one-worker"
+        _ := sys.remove_file(serial)
+        if !compiler.run([driver.path.clone(), "build", case.source.clone(), "--jobs=1", "-o", serial.clone()],
+                         false, false, &mut result, &mut elapsed) { return false }
+        if harness.sha256_file_hex(serial) != digest {
+            return compiler.fail(f"worker count changed image for {case.name}-{driver.name}")
+        }
+    }
+    mut runners := bench.commands(options.tool_root, 120000)
+    if case.name == "selfhost" {
+        hello := work + "/hello"
+        if !compiler.run([image.clone(), "build", options.root + "/examples/hello.ddr", "-o", hello.clone()],
+                         false, false, &mut result, &mut elapsed) { return false }
+        return runners.checked([hello.clone()], &case.expected, false, &mut elapsed)
+    }
+    args: []string = if case.name == "tabell" { [image.clone(), options.tabell + "/expenses.csv", "team", "cents"] }
+                     else { [image.clone()] }
+    runners.checked(args, &case.expected, false, &mut elapsed)
+}
+
+fn rss(stderr: string) -> i64 {
+    suffix := "maximum resident set size"
+    for line in text.split(stderr, "\n") {
+        if !text.ends_with(line, suffix) { continue }
+        value := parse.integer(text.trim(line[0..(line.len - suffix.len)]))
+        if value.ok && value.value >= 0 { return value.value }
+    }
+    -1
+}
+
+fn report_decimal(value: f64) -> string {
+    encoded := bench.fixed(value, 2)
+    if encoded.len > 0 && encoded[encoded.len - 1] == 48 { return encoded[0..(encoded.len - 1)] }
+    encoded.clone()
+}
+
+fn run_case(options: &Options, case: &shaped.Workload, work: string, records: &mut ResultSet) -> bool {
+    mut compiler := bench.commands(options.root, 120000)
+    if case.synthetic {
+        sum := digest_group(harness.parent_dir(case.source))
+        if sum.len == 0 { return compiler.fail(f"cannot hash generated {case.name} sources") }
+        records.corpus_ids.push(corpus.SourceHash { path: case.name.clone(), sha256: sum })
+    }
+    image := work + "/program"
+    mut result := harness.empty_output()
+    mut elapsed: i64 = 0
+    start := records.samples.len
+    for step in 0..(options.rounds + 1) {
+        round := step - 1
+        ordering := order.order(2, round)
+        for i in ordering {
+            driver := options.drivers[i].clone()
+            _ := sys.remove_file(image)
+            if !compiler.run(command(&driver, case.source, image), false, round >= 0, &mut result, &mut elapsed) { return false }
+            timings := json.Doc::parse_text(result.stderr_text())
+            if !timings.ok { return compiler.fail("invalid compiler timings\n" + result.stderr_text()) }
+            digest := harness.sha256_file_hex(image)
+            if digest.len == 0 { return compiler.fail(f"cannot hash {image}") }
+            if round < 0 {
+                records.images.push(Image { case_name: case.name.clone(), variant: driver.name.clone(), sha256: digest.clone() })
+                if !verify(&options, &mut compiler, &case, &driver, image, work, digest) { return false }
+                continue
+            }
+            if digest != recorded_hash(&records, case.name, driver.name) {
+                return compiler.fail(f"non-reproducible image for {case.name}-{driver.name}")
+            }
+            phases := timings.field(timings.root, "phases")
+            mut before: i64 = 0
+            for key in ["module_load_lex_resolve", "build_setup", "compiler"] {
+                phase := timings.get_i64(phases, key)
+                if !phase.ok { return compiler.fail(f"missing compiler phase {key}") }
+                before += phase.value
+            }
+            ops := timings.get_i64(timings.field(timings.root, "mir"), "operations")
+            if !ops.ok { return compiler.fail("missing MIR operation count") }
+            clock := bench.fixed(time.milliseconds(elapsed), 3)
+            ms := parse.Float64::parse(clock)
+            if !ms.ok { return compiler.fail("invalid observed clock") }
+            records.samples.push(Sample { case_name: case.name.clone(), variant: driver.name.clone(),
+                round: round + 1, ms: ms.value, before_image: before, mir: ops.value, size: sys.metadata(image).size })
+        }
+    }
+    for round in 0..options.rss_rounds {
+        for i in order.order(2, round) {
+            driver := options.drivers[i].clone()
+            _ := sys.remove_file(image)
+            mut args: []string = ["/usr/bin/time", "-l"]
+            for arg in move command(&driver, case.source, image) { args.push(move arg) }
+            if !compiler.run(args, false, false, &mut result, &mut elapsed) { return false }
+            memory := rss(result.stderr_text())
+            if memory < 0 || harness.sha256_file_hex(image) != recorded_hash(&records, case.name, driver.name) {
+                return compiler.fail(f"RSS observation or image mismatch for {case.name}/{driver.name}")
+            }
+            records.memory.push(Memory { case_name: case.name.clone(), variant: driver.name.clone(), round: round + 1, bytes: memory })
+        }
+    }
+    mut description := case.name.clone()
+    for driver in options.drivers {
+        mut values: []i64 = []
+        for i in start..records.samples.len {
+            if records.samples[i].variant == driver.name { values.push(records.samples[i].ms.to_bits()) }
+        }
+        description += " " + report_decimal(time.median_ratio(move values))
+    }
+    print(description)
+    true
+}
+
+fn provenance(options: &Options, field: string) -> string {
+    mut commands := bench.commands(options.root, 120000)
+    mut result := harness.empty_output()
+    mut ignored: i64 = 0
+    args: []string = if field == "release" { ["/usr/bin/uname", "-r"] }
+        else if field == "version" { ["/usr/bin/sw_vers", "-productVersion"] }
+        else if field == "machine" { ["/usr/bin/uname", "-m"] }
+        else if field == "processor" { ["/usr/bin/uname", "-p"] }
+        else { [native.find_executable("git"), "rev-parse", "HEAD"] }
+    if !commands.run(args, true, false, &mut result, &mut ignored) { return "" }
+    text.trim(result.stdout_text())
+}
+
+fn platform(options: &Options) -> string {
+    arch := provenance(&options, "machine")
+    if target_is("macos") {
+        version := provenance(&options, "version")
+        cpu := provenance(&options, "processor")
+        return f"macOS-{version}-{arch}-{cpu}-64bit-Mach-O"
+    }
+    release := provenance(&options, "release")
+    glibc := bench.glibc()
+    f"Linux-{release}-{arch}-with-glibc{glibc}"
+}
+
+fn write_hashes(writer: &mut json.Writer, path: string, prefix: string) -> bool {
+    entries := fs.list_dir(path)
+    if !entries.ok { return harness.fail(f"cannot list {path}") }
+    for file in entries.entries {
+        if !text.ends_with(file, ".ddr") { continue }
+        hash := harness.sha256_file_hex(path + "/" + file)
+        if hash.len == 0 { return harness.fail(f"cannot hash {path}/{file}") }
+        writer.key(prefix + file); writer.string(hash)
+    }
+    true
+}
+
+fn save(options: &Options, generated: &corpus.Corpus, cases: &[]shaped.Workload, results: &ResultSet) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("target"); writer.string(platform(&options))
+    writer.key("rounds"); writer.integer(i64(options.rounds))
+    writer.key("source_revision")
+    if sys.metadata(options.root + "/.git").ok {
+        revision := provenance(&options, "revision")
+        if revision.len == 0 { return false }
+        writer.string(revision)
+    } else { writer.null() }
+    writer.key("compiler_sha256")
+    writer.object()
+    for driver in options.drivers {
+        digest := harness.sha256_file_hex(driver.path)
+        if digest.len == 0 { return harness.fail(f"cannot hash {driver.path}") }
+        writer.key(driver.name); writer.string(digest)
+    }
+    writer.end()
+    writer.key("corpus"); generated.write(&mut writer)
+    writer.key("corpus_sha256"); corpus.write_sources(&results.corpus_ids, &mut writer)
+    writer.key("tabell_sha256")
+    writer.object()
+    if !write_hashes(&mut writer, options.tabell, "") { return false }
+    if options.stress {
+        for csv in ["expenses.csv", "expected.csv"] {
+            digest := harness.sha256_file_hex(options.tabell + "/" + csv)
+            if digest.len == 0 { return harness.fail(f"cannot hash Tabell {csv}") }
+            writer.key(csv); writer.string(digest)
+        }
+    }
+    writer.end()
+    writer.key("image_sha256")
+    writer.object()
+    for image in results.images {
+        writer.key(image.case_name + "-" + image.variant)
+        writer.string(image.sha256)
+    }
+    writer.end()
+    writer.key("samples")
+    writer.array()
+    for sample in results.samples {
+        writer.object()
+        writer.key("case"); writer.string(sample.case_name)
+        writer.key("variant"); writer.string(sample.variant)
+        writer.key("round"); writer.integer(i64(sample.round))
+        writer.key("wall_ms"); writer.decimal(sample.ms)
+        writer.key("pre_image_ms"); writer.decimal(time.milliseconds(sample.before_image))
+        writer.key("mir_operations"); writer.integer(sample.mir)
+        writer.key("image_bytes"); writer.integer(sample.size)
+        writer.end()
+    }
+    writer.end()
+    if options.rss_rounds > 0 {
+        writer.key("rss_clock"); writer.string("independent fresh builds via macOS /usr/bin/time -l; maximum resident set size in bytes")
+        writer.key("rss_rounds"); writer.integer(i64(options.rss_rounds))
+        writer.key("rss_samples")
+        writer.array()
+        for row in results.memory {
+            writer.object()
+            writer.key("case"); writer.string(row.case_name)
+            writer.key("variant"); writer.string(row.variant)
+            writer.key("round"); writer.integer(i64(row.round))
+            writer.key("max_rss_bytes"); writer.integer(row.bytes)
+            writer.end()
+        }
+        writer.end()
+    }
+    if options.stress {
+        writer.key("build_jobs"); writer.integer(4)
+        writer.key("checked_identical_jobs")
+        writer.array(); writer.integer(1); writer.integer(4); writer.end()
+        writer.key("generated_expected_stdout")
+        writer.object()
+        for case in cases {
+            if case.synthetic {
+                writer.key(case.name); writer.string(bytes.decode(&case.expected).value)
+            }
+        }
+        writer.end()
+        writer.key("selfhost_sources_sha256")
+        writer.object()
+        for folder in ["selfhost", "stdlib"] {
+            if !write_hashes(&mut writer, options.root + "/" + folder, folder + "/") { return false }
+        }
+        writer.end()
+    }
+    writer.end()
+    report := writer.finish()
+    (report.ok && sys.write_text(options.report, report.value + "\n").ok) ||
+        harness.fail(f"cannot write {options.report}")
+}
+
+fn exercise(options: &Options) -> i32 {
+    temp := fs.temp_dir("dunder-worker-lift-")
+    if !temp.ok { _ := harness.fail("cannot create work directory"); return 1 }
+    defer { _ := fs.remove_all(temp.value) }
+    work := harness.resolve_or_abs(temp.value)
+    binding := binding_syntax(&options, work)
+    if binding.len == 0 { _ := harness.fail("the compiler pair does not accept common mutable binding syntax"); return 1 }
+    generated := corpus.generate_with_binding(work, binding)
+    if generated.error.len > 0 { _ := harness.fail(generated.error); return 1 }
+    mut cases: []shaped.Workload = []
+    if !prepare(&options, work, binding, &generated, &mut cases) { return 1 }
+    mut results := ResultSet { images: [], corpus_ids: [], samples: [], memory: [] }
+    for index in 0..cases.len {
+        if !run_case(&options, &cases[index], work, &mut results) { return 1 }
+    }
+    if save(&options, &generated, &cases, &results) { return 0 }
+    1
+}
+
+fn bad_argument(message: string) -> i32 {
+    _ := harness.fail(message)
+    2
+}
+
+fn main() -> i32 {
+    specs: []cli.Option = [cli.option("--rounds"), cli.flag("--frontend-stress"), cli.option("--rss-rounds")]
+    args := cli.parse(&specs)
+    usage := "usage: measure BASELINE CANDIDATE SOURCE_ROOT TABELL REPORT [--rounds N] [--frontend-stress] [--rss-rounds N]"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 { return bad_argument(args.error) }
+    if args.positionals.len != 5 { return bad_argument(usage) }
+    rounds := parse.integer(args.last("--rounds", "12"))
+    report := harness.resolve_or_abs(args.positionals[4])
+    if !rounds.ok || rounds.value < 1 || rounds.value >= 2147483647 || sys.metadata(report).ok {
+        return bad_argument("use a positive number of rounds and a new report path")
+    }
+    rss_rounds := parse.integer(args.last("--rss-rounds", "0"))
+    if !rss_rounds.ok || rss_rounds.value < 0 || rss_rounds.value > 2147483647 ||
+       (rss_rounds.value > 0 && !target_is("macos")) {
+        return bad_argument("--rss-rounds requires a nonnegative count and macOS for measured RSS")
+    }
+    base := fs.realpath(args.positionals[0])
+    candidate := fs.realpath(args.positionals[1])
+    root := fs.realpath(args.positionals[2])
+    tabell := fs.realpath(args.positionals[3])
+    tool_root := harness.find_root()
+    if !base.ok || !candidate.ok || !root.ok || !tabell.ok || tool_root.len == 0 {
+        return bad_argument("cannot resolve compiler, source checkout or Tabell paths")
+    }
+    options := Options {
+        root: root.value, tool_root: tool_root, tabell: tabell.value, report: report,
+        rounds: i32(rounds.value), rss_rounds: i32(rss_rounds.value), stress: args.has("--frontend-stress"),
+        drivers: [Driver { name: "baseline", path: base.value }, Driver { name: "candidate", path: candidate.value }],
+    }
+    exercise(&options)
+}

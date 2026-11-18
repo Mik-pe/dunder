@@ -42,9 +42,9 @@ Kör på ARM64/macOS från den nya källkatalogen. `OLD_SRC` är en separat utch
 ```sh
 (cd "$OLD_SRC" && "$NEW" build selfhost/main_parallel.ddr -o "$CONTROL")
 python3 tools/performance.py "$OLD" "$NEW" runtime-results --suite runtime --runtime-scale 10 --rounds 30
-measure=benchmarks/compiler/2026-11-15-worker-lift/measure.py
-python3 "$measure" "$OLD" "$CONTROL" "$OLD_SRC" "$TABELL" control-results.json --rounds 12
-python3 "$measure" "$OLD" "$NEW" "$OLD_SRC" "$TABELL" build-results.json --rounds 12
+measure=benchmarks/compiler/2026-11-15-worker-lift/measure.ddr
+dunder run "$measure" -- "$OLD" "$CONTROL" "$OLD_SRC" "$TABELL" control-results.json --rounds 12
+dunder run "$measure" -- "$OLD" "$NEW" "$OLD_SRC" "$TABELL" build-results.json --rounds 12
 ./tools/verify-selfhost.sh --jobs 4
 ```
 

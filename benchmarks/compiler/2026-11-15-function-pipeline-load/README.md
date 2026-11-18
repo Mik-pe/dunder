@@ -43,7 +43,7 @@ Varje variant kördes en gång för uppvärmning och därefter i 30 alternerande
 Bygg kompilatorerna från de två revisionerna med `tools/bootstrap.sh`. `OLD_SRC` är en ren utcheckning av `4585bc4fc`, `OLD` och `NEW` deras absoluta binärsökvägar och `TABELL` sökvägen till Tabells projektkatalog.
 
 ```sh
-python3 benchmarks/compiler/2026-11-15-worker-lift/measure.py \
+dunder run benchmarks/compiler/2026-11-15-worker-lift/measure.ddr -- \
   "$OLD" "$NEW" "$OLD_SRC" "$TABELL" builds.json --rounds 12 --frontend-stress --rss-rounds 4
 python3 tools/performance.py "$OLD" "$NEW" runtime-out \
   --suite runtime --rounds 30 --runtime-scale 10 --tabell "$TABELL"

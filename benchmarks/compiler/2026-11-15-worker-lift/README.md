@@ -51,9 +51,10 @@ kompilators uppvärmningsbild. [Rådata och kontrollsummor](samples.json)
 
 Arkivera eller checka ut basrevisionen och bygg båda kompilatorerna med
 `tools/bootstrap.sh`. Ange basrevisionens källor även för den nya kompilatorn.
+För den här serien kommer Tabell från `978af73` i `dunder-hundmat`.
 
 ```sh
-python3 benchmarks/compiler/2026-11-15-worker-lift/measure.py \
+dunder run benchmarks/compiler/2026-11-15-worker-lift/measure.ddr -- \
   /path/to/baseline/dunder /path/to/candidate/dunder \
   /path/to/source-at-6dffea8 /path/to/dunder-hundmat/tabell /tmp/dunder-report.json
 ```
