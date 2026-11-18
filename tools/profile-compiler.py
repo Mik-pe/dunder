@@ -22,6 +22,17 @@ UNITS = ['functions','tokens','nodes','visits','nodes','frame_values','words',
          'tokens','operations','bytes','operations','operations']
 PIPELINE = {'module_load_lex_resolve','build_setup','compiler','image_format_sign','publication'}
 
+COUNTERS = ('allocation_count requested_bytes size_class_payload_bytes fresh_allocations '
+            'reused_allocations retain_calls release_calls array_clone_calls array_clone_bytes '
+            'string_slice_calls string_slice_bytes record_construct_calls record_construct_bytes '
+            'record_clone_calls record_clone_bytes copy_bytes').split()
+KEYWORDS = set('fn pub mut move if else while for in return break continue struct enum match import as true false defer'.split())
+TOKEN = re.compile(r'''(?P<space>[ \t\r]+)|(?P<newline>\n)|(?P<line>//[^\n]*)|
+    (?P<quote>"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|`(?:\\.|[^`\\\r\n])*`)|
+    (?P<number>[0-9][0-9_]*(?:\.[0-9][0-9_]*)?(?:[eE][+-]?[0-9][0-9_]*)?)|
+    (?P<name>[A-Za-z_\u0080-\U0010ffff][A-Za-z_0-9\u0080-\U0010ffff]*)|
+    (?P<symbol>:=|->|=>|==|!=|<=|>=|&&|\|\||\.\.|[()\[\]{}:=,.;@+*/%<>!&-])''', re.VERBOSE)
+
 
 def helper(name, filename):
     spec = importlib.util.spec_from_file_location(name,ROOT/'tools'/filename)
@@ -31,7 +42,6 @@ def helper(name, filename):
 
 
 PERFORMANCE = helper('dunder_performance','performance.py')
-DOGFOOD = helper('dunder_dogfood_profiles','profile-dogfood.py')
 
 
 def sha(path):
@@ -51,6 +61,96 @@ def record(stderr, kind):
 def numbers(value, keys, name):
     if type(value) is not dict or set(value) != set(keys) or any(type(n) is not int or n < 0 for n in value.values()):
         raise ValueError(f'invalid {name} counters or keys')
+
+
+def quoted(text):
+    # Decode byte escapes before UTF-8, rather than interpreting \xNN as a
+    # Unicode character. Unicode scalar escapes use Python's independent codec.
+    body = text[1:-1]
+    output = bytearray()
+    i = 0
+    escapes = {'n':'\n','r':'\r','t':'\t','0':'\0','\\':'\\','"':'"',"'":"'",'`':'`'}
+    while i < len(body):
+        char = body[i]; i += 1
+        if char != '\\':
+            output.extend(char.encode()); continue
+        escape = body[i]; i += 1
+        if escape in escapes:
+            output.extend(escapes[escape].encode())
+        elif escape == 'x':
+            output.append(int(body[i:i+2],16)); i += 2
+        elif escape == 'u':
+            if body[i] == '{':
+                end = body.index('}',i); scalar = int(body[i+1:end],16); i = end+1
+            else:
+                scalar = int(body[i:i+4],16); i += 4
+            output.extend(chr(scalar).encode())
+        else:
+            raise ValueError('unsupported escape in frozen lexer input')
+    return output.decode('utf-8')
+
+
+def tokens(source):
+    offsets = [0]
+    for char in source:
+        offsets.append(offsets[-1]+len(char.encode()))
+    result = []
+    cursor = depth = 0
+    while cursor < len(source):
+        # Nested comments are recognized independently of the token regex.
+        if source.startswith('/*',cursor):
+            nesting = 1; cursor += 2
+            while nesting:
+                if cursor >= len(source): raise ValueError('unclosed comment')
+                if source.startswith('/*',cursor): nesting += 1; cursor += 2
+                elif source.startswith('*/',cursor): nesting -= 1; cursor += 2
+                else:
+                    if source[cursor] == '\n' and depth == 0:
+                        result.append((8,'\n',offsets[cursor],offsets[cursor+1]))
+                    cursor += 1
+            continue
+        match = TOKEN.match(source,cursor)
+        if not match:
+            raise ValueError(f'unrecognized frozen lexer input at {cursor}: {source[cursor:cursor+20]!r}')
+        group = match.lastgroup; spelling = match.group(); first = cursor; cursor = match.end()
+        if group in ('space','line'): continue
+        if group == 'newline':
+            if depth: continue
+            kind = 8
+        elif group == 'name': kind = 2 if spelling in KEYWORDS else 1
+        elif group == 'number': kind = 4 if any(c in spelling for c in '.eE') else 3
+        elif group == 'quote':
+            kind = 6 if spelling[0] == '`' else 5
+            spelling = quoted(spelling)
+        else:
+            kind = 7
+            if spelling in ('(','['): depth += 1
+            elif spelling in (')',']') and depth: depth -= 1
+        result.append((kind,spelling,offsets[first],offsets[cursor]))
+    result.append((0,'',offsets[-1],offsets[-1]))
+    return result
+
+
+def profile(stderr):
+    records = []
+    for line in stderr.splitlines():
+        try: record = json.loads(line)
+        except (ValueError,UnicodeDecodeError): continue
+        if type(record) is dict and record.get('kind') == 'runtime_profile': records.append(record)
+    if len(records) != 1:
+        raise ValueError(f'expected exactly one runtime_profile record, got {len(records)}')
+    record = records[0]
+    required = {'version':1,'units':{'counts':'events','bytes':'bytes'},'counter_arithmetic':'uint64_modulo',
+                'allocation_header_bytes':16,'pool_header_bytes':512,
+                'requested_bytes_exclude_allocator_header':True,'size_class_payload_excludes_header':True}
+    if any(type(record.get(key)) is not type(value) or record.get(key) != value for key,value in required.items()):
+        raise ValueError(f'unsupported runtime profile semantics: {record}')
+    counters = record.get('counters',{})
+    if set(counters) != set(COUNTERS) or any(type(v) is not int or not 0 <= v < 2**64 for v in counters.values()):
+        raise ValueError('invalid uint64 runtime counters')
+    if (counters['fresh_allocations']+counters['reused_allocations'])%2**64 != counters['allocation_count']:
+        raise ValueError('allocation classification does not match total')
+    return record
 
 
 def compiler_timing(stderr, target):
@@ -92,7 +192,7 @@ def compiler_timing(stderr, target):
 
 def allocation_profile(stderr):
     record(stderr,'runtime_profile')  # Reject combined observer output first.
-    return DOGFOOD.profile(stderr)
+    return profile(stderr)
 
 
 def host():
@@ -128,7 +228,7 @@ def source_graph(source, resolutions=None):
         data = path.read_bytes(); text = data.decode('utf-8')
         found[str(path)] = {'sha256':sha(path),'bytes':len(data),
                             'physical_lines_including_comments':len(data.splitlines())}
-        scanned = DOGFOOD.tokens(text)
+        scanned = tokens(text)
         for i,(kind,spelling,_,_) in enumerate(scanned[:-1]):
             if kind != 2 or spelling != 'import': continue
             following = scanned[i+1]
@@ -259,7 +359,7 @@ def main():
             resolutions[str(path.absolute())] = str(resolved)
             sources[str(resolved)] = {'sha256':sha(path),'bytes':path.stat().st_size,
                                      'physical_lines_including_comments':len(path.read_bytes().splitlines())}
-        for path in [Path(__file__),ROOT/'tools/performance.py',ROOT/'tools/profile-dogfood.py',
+        for path in [Path(__file__),ROOT/'tools/performance.py',
                      ROOT/'examples/hello.ddr']:
             resolutions[str(path.absolute())] = str(path.resolve())
             sources[str(path.resolve())] = {'sha256':sha(path),'bytes':path.stat().st_size}
@@ -334,7 +434,7 @@ def main():
             summary[name] = {'image_sha256':case['image_sha256'],'rounds':args.rounds,
                 'clock_detail_median_ns':{phase:statistics.median(c['compiler_detail']['phases'][phase] for c in clocks) for phase in PHASES},
                 'clock_other_median_ns':statistics.median(c['compiler_detail']['other'] for c in clocks),
-                'allocation_counter_median_low':{counter:statistics.median_low(a[counter] for a in allocations) for counter in DOGFOOD.COUNTERS},
+                'allocation_counter_median_low':{counter:statistics.median_low(a[counter] for a in allocations) for counter in COUNTERS},
                 'validation':case['validation']}
         (directory/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
         metadata['complete'] = True

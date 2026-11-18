@@ -5,12 +5,12 @@ not cover. They are a separate before/after and attribution suite. They do not
 change the existing C acceptance suite, its geometric mean, or its thresholds.
 There are no C references for these cohorts yet.
 
-| Program | Frozen work per iteration | Independent Python result |
+| Program | Frozen work per iteration | Independent result |
 | --- | --- | --- |
 | `pod.ddr` | Produce a mixed POD record, copy it, change every field in one copy, refine another and consume all four through value arguments. | Tuple calculations, field mutation and four separate result sums. All fields, both boolean states, original and copied values contribute. |
-| `decimal.ddr` | Parse every decimal spelling, rotating its position each round. Inputs include signs, separators, both i64 limits, malformed text and overflow before trailing junk. | Positive arbitrary-precision accumulation, left-to-right error precedence, accepted/invalid/overflow counts, signed residues and position-weighted values/errors. |
-| `lexer.ddr` | Call the actual `selfhost/lexer.scan`, alternating interning on/off, over frozen compiler source. Consume every token kind, decoded spelling, byte span and interned name ID. | A Python regex lexer and independent escape decoder; UTF-8 byte offsets; independently assigned first-use name IDs; full-spelling byte hash. The oracle covers the frozen valid input, not every diagnostic of the language lexer. |
-| `symbols.ddr` | Populate and update a map, copy it, remove and reinsert keys, then query current and saved versions. Keys include empty strings, Unicode, common prefixes and different byte spellings of similar text. | Python dictionaries, weighted current/snapshot values, lengths, deletions and missing-key results. Bucket order is not part of the result. |
+| `decimal.ddr` | Parse every decimal spelling, rotating its position each round. Inputs include signs, separators, both i64 limits, malformed text and overflow before trailing junk. | Positive unsigned accumulation with overflow checks, left-to-right error precedence, accepted/invalid/overflow counts, signed residues and position-weighted values/errors. |
+| `lexer.ddr` | Call the actual `selfhost/lexer.scan`, alternating interning on/off, over frozen compiler source. Consume every token kind, decoded spelling, byte span and interned name ID. | A separate byte-oriented lexer and escape decoder; UTF-8 byte offsets; independently assigned first-use name IDs; full-spelling byte hash. The oracle covers the frozen valid input, not every diagnostic of the language lexer. |
+| `symbols.ddr` | Populate and update a map, copy it, remove and reinsert keys, then query current and saved versions. Keys include empty strings, Unicode, common prefixes and different byte spellings of similar text. | Direct arithmetic for each key, weighted current/snapshot values, lengths, deletions and missing-key results. Bucket order is not part of the result. |
 
 The lexer input contains copies of `opt_ir.ddr`, `opt_alloc.ddr` and
 `scalar_rules.ddr` from revision `162fb65`. Its original file hashes and the
@@ -23,11 +23,11 @@ sizes or algorithms.
 ## Check correctness first
 
 ```sh
-python3 tools/profile-dogfood.py check /path/to/dunder
+dunder run tools/profile_dogfood.ddr -- check /path/to/dunder
 ```
 
 This builds each consumer and runs three iterations, comparing exact stdout
-with the Python reference. It records no time measurements. The same check
+with the independent Dunder oracle. It records no time measurements. The same check
 should pass for baseline and candidate. All compiler and consumer processes
 run with `PATH=/no-external-tools` and no inherited environment variables.
 
@@ -46,7 +46,7 @@ calibration and timing series. Calibrate one designated baseline, then retain
 exactly the same counts for every variant:
 
 ```sh
-python3 tools/profile-dogfood.py calibrate /path/to/baseline \
+dunder run tools/profile_dogfood.ddr -- calibrate /path/to/baseline \
   build/dogfood-calibration --target-ms 150
 ```
 
@@ -58,7 +58,7 @@ it as the versioned workload manifest. Do not adapt counts per compiler or
 per sample. The small correctness check always retains its separate count.
 
 ```sh
-python3 tools/profile-dogfood.py compare /path/to/baseline /path/to/candidate \
+dunder run tools/profile_dogfood.ddr -- compare /path/to/baseline /path/to/candidate \
   build/dogfood-comparison --manifest /path/to/frozen-workloads.json --rounds 30
 ```
 
@@ -80,10 +80,10 @@ compiler ablations. All modes accept repeated `--case pod` / `decimal` / `lexer`
 With a compiler supporting `--runtime-profile`:
 
 ```sh
-python3 tools/profile-dogfood.py attribute /path/to/dunder \
+dunder run tools/profile_dogfood.ddr -- attribute /path/to/dunder \
   build/dogfood-profile --manifest /path/to/frozen-workloads.json
 # Small integration check before a full attribution run:
-python3 tools/profile-dogfood.py attribute /path/to/dunder \
+dunder run tools/profile_dogfood.ddr -- attribute /path/to/dunder \
   build/dogfood-profile-smoke --smoke
 ```
 

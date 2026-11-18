@@ -98,7 +98,6 @@ helper entries, including null and immortal values, not actual reference-count
 changes or frees. Requested/class bytes exclude the allocator header as stated
 in the runtime record. No resident/live/peak-memory interpretation is implied.
 
-The runtime schema is validated by the shared reader in
-`tools/profile-dogfood.py`, including all 16 uint64 counters and fresh/reused
-allocation classification. Results guide the next general language/compiler
+The runtime schema check validates all 16 uint64 counters and verifies that
+fresh and reused allocations sum to the allocation total modulo uint64. Results guide the next general language/compiler
 mechanism; performance acceptance remains a separate uninstrumented measurement.

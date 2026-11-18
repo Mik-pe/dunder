@@ -1,0 +1,511 @@
+capability filesystem, process
+
+import .benchmark_commands as bench
+import .benchmark_host as provenance
+import .benchmark_time as time
+import .compiler_matrix_runner as matrix
+import .dogfood_reference as reference
+import .harness as harness
+import .performance_corpus as corpus
+import .probe_cli as cli
+import .profile_format as format
+import .report_json as report
+import std.array as array
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+struct Driver { name: string, path: string, sha256: string, flags: []string }
+struct Options {
+    root: string, cohort: string, mode: string, report_dir: string, rounds: i32, target_ms: f64,
+    smoke: bool, drivers: []Driver,
+}
+struct Selection { name: string, input: string, count: i32 }
+struct Manifest { path: string, sha256: string, seed: i64, doc: json.Doc, cases: []Selection, error: string }
+struct Image { variant: string, path: string, sha256: string, size: i64, flags: []string }
+struct Workload {
+    name: string, args: []string, count: i32, expected: string, binaries: []Image, profile: json.Doc,
+}
+struct Results {
+    workloads: []Workload, samples: []u8, summary: []u8, recommendations: Map<string, i32>,
+}
+
+fn sha256(path: string) -> string {
+    file := sys.read_u8(path)
+    if !file.ok { return "" }
+    harness.sha256_bytes_hex(&file.value)
+}
+
+
+fn known(name: string) -> bool {
+    name == "pod" || name == "decimal" || name == "lexer" || name == "symbols"
+}
+
+fn invalid_manifest(move manifest: Manifest, error: string) -> Manifest {
+    mut result := manifest
+    result.error = error.clone()
+    result
+}
+
+fn input_path(cohort: string, key: string) -> string {
+    if text.starts_with(key, "/") { key.clone() } else { cohort + "/" + key }
+}
+
+fn changed_input(doc: &json.Doc, frozen: i32, cohort: string) -> string {
+    for i in 0..doc.count(frozen) {
+        key := doc.key_at(frozen, i).value
+        digest := doc.as_str(doc.val_at(frozen, i)).value
+        if digest.len != 64 || sha256(input_path(cohort, key)) != digest { return f"frozen input changed: {key}" }
+    }
+    ""
+}
+
+fn normalize_newlines(raw: string) -> string {
+    if text.find(raw, "\r") < 0 { return raw.clone() }
+    mut encoded: []u8 = []
+    mut at := 0
+    while at < raw.len {
+        c := raw[at]
+        at += 1
+        if c == 13 {
+            encoded.push(10)
+            if at < raw.len && raw[at] == 10 { at += 1 }
+        } else { encoded.push(u8(c)) }
+    }
+    bytes.decode(&encoded).value
+}
+
+fn read_manifest(options: &Options, path: string, selected: &[]string) -> Manifest {
+    mut result := Manifest { path: path.clone(), sha256: "", seed: 0, doc: json.Doc::parse_text("null"), cases: [], error: "" }
+    file := sys.read_u8(path)
+    if !file.ok { return invalid_manifest(move result, f"cannot read workload manifest: {path}") }
+    result.sha256 = harness.sha256_bytes_hex(&file.value)
+    result.doc = json.Doc::parse_bytes(file.value.clone())
+    root := result.doc.root
+    definitions := result.doc.field(root, "cases")
+    frozen := result.doc.field(root, "inputs_sha256")
+    seed := result.doc.get_i64(root, "seed")
+    if !result.doc.ok || result.doc.get_i64(root, "version").value != 1 || !seed.ok ||
+        result.doc.kind(definitions) != .Object || result.doc.count(definitions) != 4 || result.doc.kind(frozen) != .Object {
+        return invalid_manifest(move result, "unsupported workload manifest")
+    }
+    result.seed = seed.value
+    for name in ["pod", "decimal", "lexer", "symbols"] {
+        definition := result.doc.field(definitions, name)
+        if result.doc.kind(definition) != .Object { return invalid_manifest(move result, "unsupported workload manifest") }
+    }
+    difference := changed_input(&result.doc, frozen, options.cohort)
+    if difference.len > 0 { return invalid_manifest(move result, difference) }
+    for name in ["decimal", "lexer", "symbols"] {
+        key := result.doc.get_str(result.doc.field(definitions, name), "input")
+        if !key.ok || result.doc.field(frozen, key.value) < 0 {
+            return invalid_manifest(move result, "every workload input must have a frozen hash")
+        }
+    }
+    if options.mode == "compare" && !result.doc.get_bool(root, "frozen").value {
+        return invalid_manifest(move result, "compare requires a frozen manifest and positive rounds; calibrate/review/freeze first")
+    }
+    mut ordering := selected.clone()
+    if ordering.len == 0 {
+        for i in 0..result.doc.count(definitions) { ordering.push(result.doc.key_at(definitions, i).value.clone()) }
+    }
+    mut seen := Map<string, bool>::new()
+    for name in ordering {
+        if seen.contains(name) { continue }
+        definition := result.doc.field(definitions, name)
+        count := if options.smoke { result.doc.get_i64(root, "smoke_count") }
+                 else { result.doc.get_i64(definition, "count") }
+        if !count.ok || count.value < 1 || count.value > 10000000 {
+            return invalid_manifest(move result, "work count out of range")
+        }
+        input := if name == "pod" { "" } else { input_path(options.cohort, result.doc.get_str(definition, "input").value) }
+        result.cases.push(Selection { name: name.clone(), input: input, count: i32(count.value) })
+        seen.put(name.clone(), true)
+    }
+    result
+}
+
+fn collect(root: string, folder: string, recursive: bool, inputs: bool, paths: &mut []string) -> bool {
+    entries := fs.list_dir(root + "/" + folder)
+    if !entries.ok { return harness.fail(f"cannot enumerate {folder}") }
+    for entry in entries.entries {
+        relative := folder + "/" + entry
+        path := root + "/" + relative
+        info := sys.metadata(path)
+        if recursive && info.is_dir && !fs.is_symlink(path) {
+            if !collect(root, relative, true, inputs, &mut paths) { return false }
+        } else if info.is_file && (text.ends_with(entry, ".ddr") || (inputs && text.ends_with(entry, ".txt"))) {
+            paths.push(move relative)
+        }
+    }
+    true
+}
+
+fn snapshot(root: string, files: &mut []corpus.SourceHash) -> bool {
+    mut paths: []string = ["tools/profile_dogfood.ddr", "tools/dogfood_reference.ddr", "tools/profile_source_scan.ddr",
+        "tools/profile_format.ddr"]
+    if !collect(root, "benchmarks/dogfood", true, true, &mut paths) || !collect(root, "selfhost", true, false, &mut paths) ||
+       !collect(root, "stdlib", true, false, &mut paths) || !collect(root, "runtime", true, false, &mut paths) { return false }
+    array.sort_strings(&mut paths)
+    for path in move paths {
+        digest := sha256(root + "/" + path)
+        if digest.len == 0 { return harness.fail(f"cannot fingerprint {path}") }
+        files.push(corpus.SourceHash { path: path, sha256: digest })
+    }
+    true
+}
+
+fn build(commands: &mut bench.Commands, options: &Options, name: string, target: string, driver: &Driver, images: &mut []Image) -> bool {
+    mut flags := driver.flags.clone()
+    if options.mode == "attribute" { flags.push("--runtime-profile") }
+    mut command: []string = [driver.path.clone(), "build", options.cohort + "/" + name + ".ddr", "-o", target.clone()]
+    for flag in flags { command.push(flag.clone()) }
+    mut result := harness.empty_output()
+    mut ignored: i64 = 0
+    if !commands.run(command, false, false, &mut result, &mut ignored) { return false }
+    digest := sha256(target)
+    if digest.len == 0 { return harness.fail(f"cannot fingerprint {target}") }
+    images.push(Image { variant: driver.name.clone(), path: target.clone(), sha256: digest, size: sys.metadata(target).size, flags: flags })
+    true
+}
+
+fn checked(commands: &mut bench.Commands, workload: &Workload, index: i32, measured: bool, profiling: bool,
+           output: &mut process.Output, elapsed: &mut i64) -> bool {
+    image := &workload.binaries[index]
+    mut command: []string = [image.path.clone()]
+    for arg in workload.args { command.push(arg.clone()) }
+    if !commands.run(command, false, measured, &mut output, &mut elapsed) { return false }
+    expected := bench.raw(workload.expected)
+    if !bytes.equal(&output.stdout, &expected) {
+        return harness.fail(f"{workload.name}/{image.variant}: consumer stdout differed\nexpected:\n{workload.expected}\nobserved:\n{output.stdout_text()}")
+    }
+    profiling || output.stderr.len == 0 || harness.fail(f"unexpected stderr: {output.stderr_text()}")
+}
+
+fn attribute(commands: &mut bench.Commands, options: &Options, workload: &mut Workload) -> bool {
+    mut output := harness.empty_output()
+    mut ignored: i64 = 0
+    if !checked(&mut commands, &workload, 0, false, true, &mut output, &mut ignored) { return false }
+    captured := format.read(report.text_output(&output.stderr))
+    if captured.error.len > 0 { return harness.fail(f"{workload.name}: {captured.error}\n{output.stderr_text()}") }
+    prefix := options.report_dir + "/" + workload.name
+    mut writer := json.Writer::new()
+    if !report.write_value(&captured.record, captured.record.root, &mut writer) { return harness.fail("cannot encode runtime profile") }
+    document := writer.finish()
+    if !document.ok || !sys.write_text(prefix + ".profile.json", document.value + "\n").ok ||
+       !sys.write_u8(prefix + ".stderr.txt", &output.stderr).ok || !sys.write_u8(prefix + ".stdout.txt", &output.stdout).ok {
+        return harness.fail(f"cannot write attribution for {workload.name}")
+    }
+    workload.profile = captured.record
+    allocations := captured.counters.at("allocation_count")
+    requested := captured.counters.at("requested_bytes")
+    print(f"ATTRIBUTED {workload.name}: {allocations} allocations, {requested} requested bytes")
+    true
+}
+
+fn calibrate(commands: &mut bench.Commands, options: &Options, workload: &Workload, results: &mut Results) -> bool {
+    mut output := harness.empty_output()
+    mut elapsed: i64 = 0
+    if !checked(&mut commands, &workload, 0, false, false, &mut output, &mut elapsed) ||
+       !checked(&mut commands, &workload, 0, true, false, &mut output, &mut elapsed) { return false }
+    target := f64(workload.count) * options.target_ms / time.milliseconds(elapsed)
+    bounded := if target < 1.0 { 1.0 } else if target > 10000000.0 { 10000000.0 } else { target }
+    floor := i32(bounded)
+    proposed := if bounded > f64(floor) { floor + 1 } else { floor }
+    if results.samples.len == 0 { bytes.append_utf8(&mut results.samples, "case,count,elapsed_ms,proposed_count\r\n") }
+    bytes.append_utf8(&mut results.samples, f"{workload.name},{workload.count},{time.fixed_ms(elapsed)},{proposed}\r\n")
+    results.recommendations.put(workload.name.clone(), proposed)
+    micros := (elapsed + 500) / 1000
+    print(f"CALIBRATION {workload.name}: count={workload.count}, elapsed={micros / 1000}.{micros % 1000:03}ms, proposed={proposed}")
+    true
+}
+
+fn compare(commands: &mut bench.Commands, options: &Options, workload: &Workload, results: &mut Results) -> bool {
+    mut output := harness.empty_output()
+    mut elapsed: i64 = 0
+    for i in 0..workload.binaries.len {
+        if !checked(&mut commands, &workload, i, false, false, &mut output, &mut elapsed) { return false }
+    }
+    if results.samples.len == 0 {
+        bytes.append_utf8(&mut results.samples, "case,variant,round,order,elapsed_ms\r\n")
+        bytes.append_utf8(&mut results.summary, "case,variant,samples,median_ms,p95_ms,median_over_baseline\r\n")
+    }
+    mut baseline: []i64 = []
+    mut candidate: []i64 = []
+    for round in 0..options.rounds {
+        order := matrix.order(workload.binaries.len, round)
+        for position in 0..order.len {
+            index := order[position]
+            if !checked(&mut commands, &workload, index, true, false, &mut output, &mut elapsed) { return false }
+            if index == 0 { baseline.push(elapsed) } else { candidate.push(elapsed) }
+            variant := workload.binaries[index].variant.clone()
+            bytes.append_utf8(&mut results.samples, f"{workload.name},{variant},{round},{position},{time.fixed_ms(elapsed)}\r\n")
+        }
+    }
+    base := time.distribution(move baseline)
+    changed := time.distribution(move candidate)
+    for variant in ["baseline", "candidate"] {
+        dist := if variant == "baseline" { base } else { changed }
+        median := bench.fixed(dist.median, 6)
+        p95 := bench.fixed(dist.p95, 6)
+        ratio := bench.fixed(dist.median / base.median, 6)
+        bytes.append_utf8(&mut results.summary, f"{workload.name},{variant},{options.rounds},{median},{p95},{ratio}\r\n")
+    }
+    print(f"COMPLETED {workload.name}: {options.rounds} alternating pairs")
+    true
+}
+
+fn execute(options: &Options, manifest: &Manifest, work: string, results: &mut Results) -> bool {
+    mut commands := bench.commands(options.root, 120000)
+    for selection in manifest.cases {
+        mut raw := ""
+        arg := if selection.input.len == 0 { manifest.seed.str() } else { selection.input.clone() }
+        if selection.input.len > 0 {
+            file := sys.read_text(selection.input)
+            if !file.ok { return harness.fail(f"cannot read {selection.input}") }
+            raw = normalize_newlines(file.value)
+        }
+        expected := reference.calculate(selection.name, selection.count, manifest.seed, raw)
+        if expected.error.len > 0 { return harness.fail(f"{selection.name}: {expected.error}") }
+        mut item := Workload { name: selection.name.clone(), args: [selection.count.str(), arg], count: selection.count,
+            expected: expected.stdout, binaries: [], profile: json.Doc::parse_text("null") }
+        for driver in options.drivers {
+            destination := work + "/" + item.name + "-" + driver.name
+            if !build(&mut commands, &options, selection.name, destination, &driver, &mut item.binaries) { return false }
+        }
+        if options.mode == "attribute" {
+            if !attribute(&mut commands, &options, &mut item) { return false }
+        } else if options.mode == "calibrate" {
+            if !calibrate(&mut commands, &options, &item, &mut results) { return false }
+        } else if options.mode == "compare" {
+            if !compare(&mut commands, &options, &item, &mut results) { return false }
+        } else {
+            mut output := harness.empty_output()
+            mut ignored: i64 = 0
+            if !checked(&mut commands, &item, 0, false, false, &mut output, &mut ignored) { return false }
+            print(f"PASS {item.name}: independent reference ({item.count} iterations)")
+        }
+        results.workloads.push(move item)
+    }
+    true
+}
+
+fn strings(writer: &mut json.Writer, values: &[]string) {
+    writer.array()
+    for value in values { writer.string(value) }
+    writer.end()
+}
+
+fn write_metadata(options: &Options, manifest: &Manifest, host: &provenance.Host, sources: &[]corpus.SourceHash, results: &Results) -> bool {
+    mut writer := json.Writer::new()
+    writer.object()
+    writer.key("protocol"); writer.string("dunder-dogfood-v1")
+    writer.key("mode"); writer.string(options.mode)
+    writer.key("host"); host.write(&mut writer)
+    writer.key("manifest")
+    if !report.write_value(&manifest.doc, manifest.doc.root, &mut writer) { return harness.fail("cannot encode workload manifest") }
+    writer.key("manifest_sha256"); writer.string(manifest.sha256)
+    writer.key("sources_sha256"); corpus.write_sources(&sources, &mut writer)
+    for key in ["compiler_sha256", "compiler_paths", "compiler_flags"] {
+        writer.key(key); writer.object()
+        for driver in options.drivers {
+            writer.key(driver.name)
+            if key == "compiler_sha256" { writer.string(driver.sha256) }
+            else if key == "compiler_paths" { writer.string(driver.path) }
+            else { strings(&mut writer, &driver.flags) }
+        }
+        writer.end()
+    }
+    writer.key("environment"); writer.object()
+    writer.key("PATH"); writer.string("/no-external-tools")
+    writer.end()
+    writer.key("checkout"); writer.string(host.revision)
+    writer.key("working_tree"); writer.string(text.trim(host.status))
+    if host.has_hardware {
+        hardware := text.trim(host.hardware)
+        writer.key("hardware")
+        if target_is("linux") {
+            mut model := ""
+            for line in move harness.lines(hardware) {
+                if text.starts_with(line, "model name") { model = line.clone(); break }
+            }
+            writer.string(model)
+        } else { writer.string(hardware) }
+    }
+    writer.key("scope"); writer.string("whole process including input, setup, workload and checksum output; warm OS file cache")
+    writer.key("c_acceptance"); writer.string("separate cohorts; does not change the four-kernel C acceptance suite")
+    if options.mode == "compare" {
+        writer.key("rounds"); writer.integer(i64(options.rounds))
+        writer.key("order"); writer.string("even baseline,candidate; odd candidate,baseline")
+        writer.key("warmup"); writer.string("one unrecorded checked execution per binary")
+    } else if options.mode == "calibrate" {
+        writer.key("warmup"); writer.string("one unrecorded checked execution before the single sizing observation")
+    }
+    writer.key("workloads"); writer.object()
+    for workload in results.workloads {
+        writer.key(workload.name); writer.object()
+        writer.key("args"); strings(&mut writer, &workload.args)
+        writer.key("count"); writer.integer(i64(workload.count))
+        writer.key("expected_stdout"); writer.string(workload.expected)
+        writer.key("binaries"); writer.object()
+        for image in workload.binaries {
+            writer.key(image.variant); writer.object()
+            writer.key("sha256"); writer.string(image.sha256)
+            writer.key("bytes"); writer.integer(image.size)
+            writer.key("build_flags"); strings(&mut writer, &image.flags)
+            writer.end()
+        }
+        writer.end()
+        if options.mode == "attribute" {
+            writer.key("runtime_profile")
+            if !report.write_value(&workload.profile, workload.profile.root, &mut writer) { return harness.fail("cannot encode attribution metadata") }
+        }
+        writer.end()
+    }
+    writer.end()
+    writer.end()
+    document := writer.finish()
+    (document.ok && sys.write_text(options.report_dir + "/metadata.json", document.value + "\n").ok) ||
+        harness.fail("cannot write metadata.json")
+}
+
+fn write_recommendations(options: &Options, manifest: &Manifest, proposed: &Map<string, i32>) -> bool {
+    doc := &manifest.doc
+    mut writer := json.Writer::new()
+    writer.object()
+    for i in 0..doc.count(doc.root) {
+        key := doc.key_at(doc.root, i).value
+        if key == "frozen" || key == "calibration" { continue }
+        node := doc.val_at(doc.root, i)
+        writer.key(key)
+        if key != "cases" {
+            if !report.write_value(&doc, node, &mut writer) { return harness.fail(f"cannot preserve manifest field {key}") }
+            continue
+        }
+        writer.object()
+        for j in 0..doc.count(node) {
+            name := doc.key_at(node, j).value
+            definition := doc.val_at(node, j)
+            writer.key(name)
+            if !proposed.contains(name) {
+                if !report.write_value(&doc, definition, &mut writer) { return harness.fail(f"cannot preserve unselected case {name}") }
+                continue
+            }
+            writer.object()
+            for k in 0..doc.count(definition) {
+                field := doc.key_at(definition, k).value
+                if field == "count" { continue }
+                writer.key(field)
+                if !report.write_value(&doc, doc.val_at(definition, k), &mut writer) {
+                    return harness.fail(f"cannot preserve case field {name}/{field}")
+                }
+            }
+            writer.key("count"); writer.integer(i64(proposed.at(name)))
+            writer.end()
+        }
+        writer.end()
+    }
+    writer.key("frozen"); writer.boolean(false)
+    writer.key("calibration"); writer.string("Review these single-baseline proposals, then explicitly set frozen=true before comparing variants.")
+    writer.end()
+    document := writer.finish()
+    (document.ok && sys.write_text(options.report_dir + "/recommended-workloads.json", document.value + "\n").ok) ||
+        harness.fail("cannot write workload recommendations")
+}
+
+fn exercise(options: &Options, manifest: &Manifest) -> bool {
+    mut host := provenance.host()
+    if options.mode != "check" && !provenance.collect(options.root, &mut host) { return false }
+    mut before: []corpus.SourceHash = []
+    if !snapshot(options.root, &mut before) { return false }
+    tmp := fs.temp_dir("dunder-dogfood-")
+    if !tmp.ok { return harness.fail("cannot create dogfood work directory") }
+    defer { _ := fs.remove_all(tmp.value) }
+    mut results := Results { workloads: [], samples: [], summary: [], recommendations: Map<string, i32>::new() }
+    if !execute(&options, &manifest, tmp.value, &mut results) { return false }
+    mut after: []corpus.SourceHash = []
+    if !snapshot(options.root, &mut after) || !corpus.same_sources(&before, &after) ||
+        sha256(manifest.path) != manifest.sha256 {
+        return harness.fail("workload sources, manifest or compiler changed during execution")
+    }
+    frozen := manifest.doc.field(manifest.doc.root, "inputs_sha256")
+    difference := changed_input(&manifest.doc, frozen, options.cohort)
+    if difference.len > 0 { return harness.fail(difference) }
+    for driver in options.drivers {
+        if sha256(driver.path) != driver.sha256 { return harness.fail("workload sources, manifest or compiler changed during execution") }
+    }
+    if options.mode == "check" { return true }
+    if !write_metadata(&options, &manifest, &host, &before, &results) { return false }
+    if results.samples.len > 0 && !sys.write_u8(options.report_dir + "/samples.csv", &results.samples).ok {
+        return harness.fail("cannot write samples.csv")
+    }
+    if results.summary.len > 0 && !sys.write_u8(options.report_dir + "/summary.csv", &results.summary).ok {
+        return harness.fail("cannot write summary.csv")
+    }
+    options.mode != "calibrate" || write_recommendations(&options, &manifest, &results.recommendations)
+}
+
+fn bad(message: string) -> i32 { _ := harness.fail(message); 2 }
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("--manifest"), cli.option("--case"), cli.option("--compiler-flag"),
+        cli.option("--baseline-flag"), cli.option("--candidate-flag"), cli.option("--rounds"), cli.option("--target-ms"), cli.flag("--smoke")]
+    args := cli.parse(&spec)
+    usage := "usage: profile_dogfood check COMPILER | calibrate COMPILER REPORT | attribute COMPILER REPORT | compare BASELINE CANDIDATE REPORT\n" +
+        "  --manifest FILE --case pod|decimal|lexer|symbols\n" +
+        "  check/calibrate/attribute: --compiler-flag FLAG\n" +
+        "  calibrate: --target-ms MS\n  attribute: --smoke\n  compare: --rounds N --baseline-flag FLAG --candidate-flag FLAG"
+    if args.help { print(usage); return 0 }
+    if args.error.len > 0 { return bad(args.error) }
+    if args.positionals.len == 0 { return bad(usage) }
+    mode := args.positionals[0].clone()
+    pair := mode == "compare"
+    if mode != "check" && mode != "calibrate" && mode != "attribute" && !pair { return bad(usage) }
+    count := if pair { 4 } else if mode == "check" { 2 } else { 3 }
+    if args.positionals.len != count { return bad(usage) }
+    if (pair && args.has("--compiler-flag")) ||
+       (!pair && (args.has("--rounds") || args.has("--baseline-flag") || args.has("--candidate-flag"))) ||
+       (mode != "calibrate" && args.has("--target-ms")) || (mode != "attribute" && args.has("--smoke")) {
+        return bad(f"unsupported option for {mode}\n{usage}")
+    }
+    rounds := parse.integer(args.last("--rounds", "30"))
+    if !rounds.ok || rounds.value < 1 || rounds.value > 2147483647 {
+        return bad("compare requires a frozen manifest and positive rounds; calibrate/review/freeze first")
+    }
+    duration := parse.Float64::parse(args.last("--target-ms", "150"))
+    target_ms := duration.value
+    if !duration.ok || !(target_ms > 0.0) || target_ms.to_bits().shr(52).bit_and(2047) == 2047 { return bad("--target-ms must be finite and positive") }
+    cases := args.all("--case")
+    for name in cases {
+        if !known(name) { return bad(f"unknown workload: {name}") }
+    }
+    mut drivers: []Driver = []
+    for i in 0..(if pair { 2 } else { 1 }) {
+        name := if !pair { "compiler" } else if i == 0 { "baseline" } else { "candidate" }
+        found := fs.realpath(args.positionals[i + 1])
+        if !found.ok { return bad(f"cannot resolve {name}: {args.positionals[i + 1]}") }
+        digest := sha256(found.value)
+        if digest.len == 0 { return bad(f"cannot fingerprint {name}: {found.value}") }
+        drivers.push(Driver { name: name.clone(), path: found.value, sha256: digest, flags: args.all("--" + name + "-flag") })
+    }
+    root := harness.find_root()
+    if root.len == 0 { return bad("cannot locate Dunder repository") }
+    cohort := root + "/benchmarks/dogfood"
+    manifest_path := fs.realpath(args.last("--manifest", cohort + "/workloads.json"))
+    if !manifest_path.ok { return bad("cannot resolve workload manifest") }
+    directory := if mode == "check" { "" } else { harness.resolve_or_abs(args.positionals[count - 1]) }
+    options := Options { root: root, cohort: cohort, mode: mode.clone(), report_dir: directory, rounds: i32(rounds.value), target_ms: target_ms,
+        smoke: mode == "check" || args.has("--smoke"), drivers: move drivers }
+    manifest := read_manifest(&options, manifest_path.value, &cases)
+    if manifest.error.len > 0 { return bad(manifest.error) }
+    if options.report_dir.len > 0 {
+        if !fs.mkdir_all(options.report_dir).ok { return bad("cannot create report directory") }
+        entries := fs.list_dir(options.report_dir)
+        if !entries.ok || entries.entries.len != 0 { return bad("report directory must be empty") }
+    }
+    if exercise(&options, &manifest) { 0 } else { 1 }
+}
