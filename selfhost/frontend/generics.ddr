@@ -1,14 +1,20 @@
 import lexer
 import generic_arguments as args
 import ..bundled
-import ..opt.scalar_rules as rules
+import type_keys
+import type_reader
+import type_syntax as syntax
+import frontend_types as ft
 import std.map as map
 
 pub struct Layout {
     first: i32, starts: []i32, positions: []i32, end: i32,
-    arguments: lexer.Tokens, argument_ends: []i32, result_names: []string, result_arguments: []i32,
+    reserved: map.Map, requirements: Requirements, instance_ids: map.Map, function_instances: []i32,
+    sites: []i32, parents: []i32, error_function: i32,
 }
-pub fn layout() -> Layout { Layout {first:-1, starts:[], positions:[], end:-1, arguments:lexer.empty(false), argument_ends:[], result_names:[], result_arguments:[]} }
+pub struct Requirements { receivers: []i32, methods: []string, signatures: []i32, sites: []i32 }
+fn requirements() -> Requirements { Requirements {receivers:[], methods:[], signatures:[], sites:[]} }
+pub fn layout() -> Layout { Layout {first:-1, starts:[], positions:[], end:-1, reserved:map.new(), requirements:requirements(), instance_ids:map.new(), function_instances:[], sites:[], parents:[], error_function:-1} }
 pub fn generated(layout: &Layout, position: i32) -> bool {
     layout.first >= 0 && position >= layout.first && position < layout.end
 }
@@ -21,14 +27,15 @@ pub fn origin(layout: &Layout, position: i32) -> i32 {
 
 struct Catalog {
     definitions: map.Map, names: []string, methods: []bool, next_impl: []i32, builtin: []bool,
-    counts: []i32,
+    counts: []i32, kinds: []i32, result: i32,
     bodies: lexer.Tokens, slots: []i32, starts: []i32, ends: []i32,
-    removed: []i32, resume: []i32,
+    removed: []i32, resume: []i32, constraints: Constraints, constraint_starts: []i32,
 }
+struct Constraints { parameters: []i32, methods: []string, signatures: lexer.Tokens, starts: []i32, slots: []i32 }
 struct Instances {
-    index: map.Map, definitions: []i32, names: []string, sites: []i32, depths: []i32,
-    arguments: lexer.Tokens, ranges: []i32, starts: []i32,
-    error: string, at: i32,
+    index: type_keys.Index, definitions: []i32, names: []string, sites: []i32, parents: []i32,
+    arguments: []string, types: []i32, starts: []i32, reserved: map.Map, platform: i32,
+    requirements: Requirements, error: string, at: i32,
 }
 
 fn reject(plan: &mut Instances, at: i32, message: string) {
@@ -67,6 +74,48 @@ fn body_open(input: &lexer.Tokens, keyword: i32, after: i32, last: i32) -> i32 {
     while at < last && lexer.is_newline(input.kinds[at]) { at += 1 }
     if args.symbol(&input, at, "{") { at } else { last }
 }
+fn parameter_index(params: &[]string, word: string) -> i32 {
+    for i in 0..params.len { if params[i] == word { return i } }
+    -1
+}
+fn constraints(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, params: &[]string, first: i32, last: i32) -> i32 {
+    mut at := first
+    if input.texts[at] != "where" { return at }
+    at += 1
+    while at < last {
+        while at < last && lexer.is_newline(input.kinds[at]) { at += 1 }
+        if at >= last { reject(&mut plan, input.starts[last], "expected a where requirement"); return last }
+        storage := input.texts[at] == "storable" && args.symbol(&input, at + 1, "(")
+        if storage { at += 2 }
+        if at >= last { reject(&mut plan, input.starts[last], "expected a type parameter in where clause"); return last }
+        parameter := parameter_index(&params, input.texts[at])
+        if parameter < 0 { reject(&mut plan, input.starts[at], "expected a type parameter in where clause"); return last }
+        at += 1
+        mut method := ""
+        if storage {
+            if !args.symbol(&input, at, ")") { reject(&mut plan, input.starts[at], "expected ')' in storable requirement"); return last }
+            at += 1
+        } else {
+            if at + 3 >= last || !args.symbol(&input, at, ".") || input.kinds[at + 1] != .Name ||
+                !args.symbol(&input, at + 2, ":") || input.texts[at + 3] != "fn" {
+                reject(&mut plan, input.starts[at], "expected a method name and function type in where clause"); return last
+            }
+            method = input.texts[at + 1].clone(); at += 3
+            end := args.type_end(&input, at, last, 0)
+            if end <= at { reject(&mut plan, input.starts[at], "invalid required function type"); return last }
+            for i in at..end {
+                args.token(&mut catalog.constraints.signatures, input.kinds[i], input.texts[i], input.starts[i])
+                catalog.constraints.slots.push(parameter_index(&params, input.texts[i]))
+            }
+            at = end
+        }
+        catalog.constraints.methods.push(move method); catalog.constraints.parameters.push(parameter)
+        catalog.constraints.starts.push(catalog.constraints.slots.len)
+        if !args.symbol(&input, at, ",") { break }
+        at += 1
+    }
+    at
+}
 fn capture(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, keyword: i32, builtin: bool) -> i32 {
     last := input.kinds.len - 1
     name := &input.texts[keyword + 1]
@@ -75,7 +124,9 @@ fn capture(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, ke
     first := prefix(&input, keyword)
     params := args.parameters(&input, keyword + 1)
     if params.error != "" { reject(&mut plan, input.starts[params.after], params.error); return last }
-    after := params.after
+    after := constraints(&mut catalog, &mut plan, &input, &params.names, params.after, last)
+    if plan.error != "" { return last }
+    catalog.constraint_starts.push(catalog.constraints.methods.len)
     open := body_open(&input, keyword, after, last)
     close := args.closing(&input, open, last, "{", "}")
     if close == last { reject(&mut plan, site, "expected a generic declaration body"); return last }
@@ -84,7 +135,9 @@ fn capture(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, ke
         catalog.definitions.put(name.clone(), i64(catalog.names.len))
     }
     catalog.names.push(name.clone()); catalog.methods.push(method); catalog.next_impl.push(-1); catalog.builtin.push(builtin)
-    catalog.counts.push(params.names.len)
+    if builtin && !method && name == args.prelude_binding("Result") { catalog.result = catalog.names.len - 1 }
+    kind := if input.texts[keyword] == "struct" { 2 } else if input.texts[keyword] == "enum" { 3 } else { 0 }
+    catalog.kinds.push(kind); catalog.counts.push(params.names.len)
     catalog.starts.push(catalog.slots.len)
     for i in first..close + 1 {
         if i >= keyword + 2 && i < after { continue }
@@ -103,12 +156,19 @@ fn capture(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, ke
     if !builtin { catalog.removed.push(first); catalog.resume.push(close + 1) }
     close + 1
 }
-fn collect(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, builtin: bool) {
+fn collect(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, builtin: bool, reg: &mut ft.TypeRegistry) {
     mut i := 0
     mut level := 0
     while i + 2 < input.kinds.len && plan.error == "" {
         if level == 0 && declaration(input.texts[i]) && input.kinds[i + 1] == .Name && args.symbol(&input, i + 2, "<") {
             i = capture(&mut catalog, &mut plan, &input, i, builtin); continue
+        }
+        if level == 0 && (input.texts[i] == "struct" || input.texts[i] == "enum") && input.kinds[i + 1] == .Name {
+            name := &input.texts[i + 1]
+            if ft.type_id(&reg, name) >= 0 { reject(&mut plan, input.starts[i + 1], "duplicate type"); return }
+            kind := if input.texts[i] == "struct" { 2 } else { 3 }
+            ty := ft.add_type(&mut reg, name, kind, 0); plan.reserved.put(name.clone(), i64(ty))
+            for attr in prefix(&input, i)..i { if input.texts[attr] == "c_layout" { reg.c_record[ty] = true } }
         }
         if args.symbol(&input, i, "{") { level += 1 }
         else if args.symbol(&input, i, "}") { level -= 1 }
@@ -116,128 +176,174 @@ fn collect(catalog: &mut Catalog, plan: &mut Instances, input: &lexer.Tokens, bu
     }
 }
 
-fn intern(catalog: &Catalog, plan: &mut Instances, def: i32, input: &lexer.Tokens, bounds: &[]i32, site: i32, depth: i32) -> string {
+fn request(catalog: &Catalog, plan: &mut Instances, reg: &mut ft.TypeRegistry, def: i32, types: &[]i32, site: i32, parent: i32) -> i32 {
     family := &catalog.names[def]
-    mut name := family + "<"
-    count := bounds.len - 1
-    if count != catalog.counts[def] {
-        mut message := "wrong number of type arguments: expected " + catalog.counts[def].str() + ", got " + count.str()
-        if family == "Map" { message = "Map expects a key and a value type" }
-        if family == "Set" { message = "Set expects one element type" }
-        reject(&mut plan, site, message); return ""
+    known := type_keys.find(&plan.index, def, &types)
+    if known >= 0 { return known }
+    instance := plan.names.len
+    mut repeats := 0; mut ancestor := parent
+    while ancestor >= 0 {
+        if plan.definitions[ancestor] == def {
+            repeats += 1
+            if repeats >= 64 {
+                reject(&mut plan, site, "generic specialization nesting limit: recurring declaration with changing arguments, previous instance " + plan.names[ancestor])
+                return -1
+            }
+        }
+        ancestor = plan.parents[ancestor]
     }
-    for i in 0..count {
-        start := bounds[i]; end := bounds[i + 1]
-        if start == end { reject(&mut plan, site, "expected a type argument"); return "" }
-        if args.type_end(&input, start, end, 0) != end {
-            reject(&mut plan, site, "invalid type argument"); return ""
-        }
-        unit := args.symbol(&input, start, "(") && args.symbol(&input, start + 1, ")")
-        if (family == "Map" || family == "Set") && (unit || args.symbol(&input, start, "&")) {
-            reject(&mut plan, site, "collection keys and values must be storable values"); return ""
-        }
+    if instance >= 65536 { reject(&mut plan, site, "generic instance count exceeds 65536"); return -1 }
+    mut name := family + "<"
+    for i in 0..types.len {
         if i > 0 { name += ", " }
-        name += args.spelling(&input, start, end)
+        name += ft.type_spelling(&reg, types[i])
+        if name.len > 65536 { reject(&mut plan, site, "generic type exceeds compiler resource limit"); return -1 }
     }
     name += ">"
-    if plan.index.contains(name) { return name }
-    if depth > 64 || name.len > 65536 { reject(&mut plan, site, "generic specialization nesting limit exceeded"); return "" }
-    plan.index.put(name.clone(), i64(plan.names.len))
-    plan.names.push(name.clone()); plan.definitions.push(def); plan.sites.push(site); plan.depths.push(depth)
-    plan.starts.push(plan.ranges.len)
-    for bound in bounds { plan.ranges.push(plan.arguments.kinds.len + bound) }
-    for i in 0..input.kinds.len { args.token(&mut plan.arguments, input.kinds[i], input.texts[i], input.starts[i]) }
-    name
+    type_keys.insert(&mut plan.index, def, &types, instance)
+    plan.names.push(name.clone()); plan.definitions.push(def); plan.sites.push(site); plan.parents.push(parent)
+    plan.starts.push(plan.arguments.len)
+    for ty in &types { plan.arguments.push(ft.argument_name(&mut reg, ty)) }
+    for b in catalog.constraint_starts[def]..catalog.constraint_starts[def + 1] {
+        bounds_table := &catalog.constraints; receiver := types[bounds_table.parameters[b]]
+        if bounds_table.methods[b] == "" {
+            if !ft.array_element(&reg, receiver) { reject(&mut plan, site, "type argument must be a storable value"); return -1 }
+        } else {
+            mut signature := lexer.empty(false)
+            for i in bounds_table.starts[b]..bounds_table.starts[b + 1] {
+                slot := bounds_table.slots[i]
+                word := if slot >= 0 { plan.arguments[plan.starts[instance] + slot].clone() } else { bounds_table.signatures.texts[i].clone() }
+                args.token(&mut signature, bounds_table.signatures.kinds[i], word, bounds_table.signatures.starts[i])
+            }
+            mut reader := syntax.cursor(0, signature.kinds.len)
+            required := type_reader.read(&mut reader, &mut reg, &signature, plan.platform)
+            if reader.error != "" { reject(&mut plan, site, reader.error); return -1 }
+            if reg.error != "" { reject(&mut plan, site, reg.error); return -1 }
+            plan.requirements.receivers.push(receiver); plan.requirements.methods.push(bounds_table.methods[b].clone())
+            plan.requirements.signatures.push(required); plan.requirements.sites.push(site)
+        }
+    }
+    mut nominal := -1
+    if catalog.kinds[def] != 0 {
+        ty := ft.add_type(&mut reg, name, catalog.kinds[def], 0)
+        nominal = ty
+        plan.reserved.put(name.clone(), i64(ty))
+        if def == catalog.result {
+            for arg in &types {
+                if arg != 0 && !ft.array_element(&reg, arg) { reject(&mut plan, site, "Result type arguments must be storable values or ()"); return -1 }
+            }
+            reg.result_success[ty] = types[0]; reg.result_failure[ty] = types[1]
+        }
+    }
+    plan.types.push(nominal)
+    instance
 }
 
-fn application(catalog: &Catalog, plan: &mut Instances, input: &lexer.Tokens, output: &mut lexer.Tokens,
-    at: i32, last: i32, self_type: string, depth: i32) -> i32 {
-    site := input.starts[at]
-    if depth > 64 { reject(&mut plan, site, "generic specialization nesting limit exceeded"); return last }
-    def := i32(catalog.definitions.get_or(input.texts[at], -1))
-    if def < 0 { return at }
-    mut types := lexer.empty(false)
-    mut bounds: []i32 = [0]
-    mut parens := 0
-    mut brackets := 0
-    mut angles := 0
-    mut i := at + 2
-    while i < last && plan.error == "" {
-        kind := input.kinds[i]
-        word := &input.texts[i]
-        if kind == .Symbol {
-            if parens == 0 && brackets == 0 && angles == 0 {
-                if word == ">" || word == ">=" {
-                    bounds.push(types.kinds.len)
-                    name := intern(&catalog, &mut plan, def, &types, &bounds, site, depth)
-                    args.token(&mut output, .Name, name, site)
-                    if word == ">=" { args.token(&mut output, .Symbol, "=", input.starts[i] + 1) }
-                    return i + 1
+struct BoundSource {
+    tokens: lexer.Tokens, slots: []i32, applications: []i32, receivers: []i32,
+    starts: []i32, ends: []i32, expressions: syntax.Tree,
+}
+fn bound_token(source: &mut BoundSource, kind: lexer.Kind, word: string, at: i32, slot: i32, application: i32, receiver: i32) {
+    args.token(&mut source.tokens, kind, word, at); source.slots.push(slot)
+    source.applications.push(application); source.receivers.push(receiver)
+}
+fn bind(catalog: &Catalog, plan: &mut Instances, reg: &ft.TypeRegistry, source: &mut BoundSource,
+    input: &lexer.Tokens, first: i32, end: i32, root: bool) {
+    mut at := first; mut removed := 0; mut depth := 0; mut receiver := -1
+    while at < end && plan.error == "" {
+        if root && removed < catalog.removed.len && at == catalog.removed[removed] {
+            at = catalog.resume[removed]; removed += 1; continue
+        }
+        word := &input.texts[at]; kind := input.kinds[at]; site := input.starts[at]
+        if root && depth == 0 && word == "impl" && at + 1 < end { receiver = ft.type_id(&reg, input.texts[at + 1]) }
+        if args.symbol(&input, at, "{") { depth += 1 }
+        else if args.symbol(&input, at, "}") { depth -= 1; if depth == 0 { receiver = -1 } }
+        slot := if root { -1 } else { catalog.slots[at] }
+        if kind != .Name || slot != -1 || !args.symbol(&input, at + 1, "<") || !catalog.definitions.contains(word) {
+            bound_token(&mut source, kind, word, site, slot, -1, receiver); at += 1; continue
+        }
+        mut cursor := syntax.cursor(at, end)
+        begin := source.expressions.forms.len
+        expr := syntax.parse(&mut source.expressions, &mut cursor, &input, 0)
+        if expr < 0 { reject(&mut plan, site, cursor.error); return }
+        for i in begin..expr + 1 {
+            form := source.expressions.forms[i]; name := &source.expressions.names[i]
+            index := source.expressions.positions[i]
+            if form == .Name {
+                param := if root { -1 } else { catalog.slots[index] }
+                if param >= 0 { source.expressions.values[i] = -2 - param }
+                else if name == "Self" { source.expressions.values[i] = -1 }
+                else {
+                    ty := ft.type_id(&reg, name)
+                    if ty < 0 { reject(&mut plan, input.starts[index], "unknown type '" + name + "'"); return }
+                    source.expressions.values[i] = ty
                 }
-                if word == "," { bounds.push(types.kinds.len); i += 1; continue }
+            } else if form == .Apply {
+                decl := i32(catalog.definitions.get_or(name, -1)); count := source.expressions.starts[i + 1] - source.expressions.starts[i]
+                if decl < 0 {
+                    if name != "TaskID" { reject(&mut plan, input.starts[index], "unknown generic type '" + name + "'"); return }
+                    if count != 1 { reject(&mut plan, input.starts[index], "TaskID expects one type argument"); return }
+                } else if count != catalog.counts[decl] {
+                    reject(&mut plan, input.starts[index], "wrong number of type arguments: expected " + catalog.counts[decl].str() + ", got " + count.str()); return
+                } else if i != expr && catalog.kinds[decl] == 0 {
+                    reject(&mut plan, input.starts[index], "expected a generic type"); return
+                }
+                source.expressions.values[i] = decl
             }
-            if word == "(" { parens += 1 } else if word == ")" { parens -= 1 }
-            else if word == "[" { brackets += 1 } else if word == "]" { brackets -= 1 }
-            else if word == "<" { angles += 1 } else if word == ">" { angles -= 1 }
-            if parens < 0 || brackets < 0 || angles < 0 || word == "{" || word == "}" { break }
         }
-        if kind == .Name && args.symbol(&input, i + 1, "<") {
-            next := application(&catalog, &mut plan, &input, &mut types, i, last, self_type, depth + 1)
-            if next > i { i = next; continue }
-        }
-        if !lexer.is_newline(kind) {
-            mut value := word.clone()
-            if kind == .Name && word == "Self" && self_type != "" { value = self_type.clone() }
-            if kind == .Integer {
-                integer := rules.literal_integer(word)
-                if integer.ok { value = integer.value.str() }
-            }
-            args.token(&mut types, kind, value, input.starts[i])
-        }
-        i += 1
-    }
-    at
-}
-
-fn expand(catalog: &Catalog, plan: &mut Instances, input: &lexer.Tokens, output: &mut lexer.Tokens, root: bool, depth: i32) {
-    mut i := 0; mut removed := 0
-    mut self_type := ""; mut braces := 0
-    last := input.kinds.len - 1
-    while i < last && plan.error == "" {
-        if root && removed < catalog.removed.len && i == catalog.removed[removed] {
-            i = catalog.resume[removed]; removed += 1; continue
-        }
-        if input.kinds[i] == .Name && args.symbol(&input, i + 1, "<") {
-            next := application(&catalog, &mut plan, &input, &mut output, i, last, self_type, depth)
-            if next > i { i = next; continue }
-        }
-        if braces == 0 && input.texts[i] == "impl" && input.kinds[i + 1] == .Name { self_type = input.texts[i + 1].clone() }
-        if args.symbol(&input, i, "{") { braces += 1 }
-        if args.symbol(&input, i, "}") { braces -= 1; if braces == 0 { self_type = "" } }
-        args.token(&mut output, input.kinds[i], input.texts[i], input.starts[i])
-        i += 1
+        bound_token(&mut source, kind, word, site, slot, expr, receiver)
+        if cursor.assignment >= 0 { bound_token(&mut source, .Symbol, "=", input.starts[cursor.assignment] + 1, -1, -1, -1) }
+        at = cursor.at
     }
 }
-
-fn instantiate(catalog: &Catalog, plan: &Instances, def: i32, instance: i32, position: &mut i32) -> lexer.Tokens {
-    mut body := lexer.empty(false)
-    first := plan.starts[instance]
-    for i in catalog.starts[def]..catalog.ends[def] {
-        mut at := catalog.bodies.starts[i]
-        if catalog.builtin[def] { at = position; position += 1 }
-        slot := catalog.slots[i]
-        if slot == -2 { args.token(&mut body, .Name, plan.names[instance], at) }
-        else if slot >= 0 {
-            for j in plan.ranges[first + slot]..plan.ranges[first + slot + 1] {
-                args.token(&mut body, plan.arguments.kinds[j], plan.arguments.texts[j], at)
-            }
-        } else { args.token(&mut body, catalog.bodies.kinds[i], catalog.bodies.texts[i], at) }
+fn evaluate(catalog: &Catalog, plan: &mut Instances, reg: &mut ft.TypeRegistry, tree: &syntax.Tree,
+    id: i32, parent: i32, receiver: i32, site: i32, application: bool) -> i32 {
+    form := tree.forms[id]; value := tree.values[id]
+    if form == .Name {
+        if value >= 0 { return value }
+        if value == -1 {
+            if receiver < 0 { reject(&mut plan, site, "Self is only valid inside an impl block") }
+            return receiver
+        }
+        return plan.index.arguments[plan.index.starts[parent] - 2 - value]
     }
-    args.token(&mut body, .End, "", position)
-    body
+    mut types: []i32 = []
+    for i in tree.starts[id]..tree.starts[id + 1] {
+        ty := evaluate(&catalog, &mut plan, &mut reg, &tree, tree.children[i], parent, receiver, site, false)
+        if plan.error != "" { return -1 }
+        types.push(ty)
+    }
+    if form == .Apply && value >= 0 {
+        instance := request(&catalog, &mut plan, &mut reg, value, &types, site, parent)
+        if instance < 0 || application { return instance }
+        return plan.types[instance]
+    }
+    ty := type_reader.resolve(&mut reg, &tree, id, &types, plan.platform)
+    if reg.error != "" { reject(&mut plan, site, reg.error) }
+    ty
+}
+fn lower(catalog: &Catalog, plan: &mut Instances, reg: &mut ft.TypeRegistry, source: &BoundSource,
+    output: &mut lexer.Tokens, first: i32, end: i32, instance: i32, builtin: bool, position: &mut i32) {
+    for at in first..end {
+        mut site := source.tokens.starts[at]
+        if builtin { site = position; position += 1 }
+        slot := source.slots[at]; app := source.applications[at]
+        if app >= 0 {
+            receiver := if instance >= 0 { plan.types[instance] } else { source.receivers[at] }
+            target := evaluate(&catalog, &mut plan, &mut reg, &source.expressions, app, instance, receiver, site, true)
+            if plan.error != "" { return }
+            args.token(&mut output, .Name, plan.names[target], site)
+        } else if slot == -2 {
+            args.token(&mut output, .Name, plan.names[instance], site)
+        } else if slot >= 0 {
+            args.token(&mut output, .Name, plan.arguments[plan.starts[instance] + slot], site)
+        } else {
+            args.token(&mut output, source.tokens.kinds[at], source.tokens.texts[at], site)
+        }
+    }
 }
 
-pub fn specialize(input: &mut lexer.Tokens) -> Layout {
+pub fn specialize(input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platform: i32) -> Layout {
     mut layout := layout()
     mut needed := false
     for i in 0..input.kinds.len - 1 {
@@ -245,16 +351,22 @@ pub fn specialize(input: &mut lexer.Tokens) -> Layout {
         word := &input.texts[i]
         if word == "key_hash" || word == "key_eq" { needed = true; break }
         if !args.symbol(&input, i + 1, "<") { continue }
-        if args.prelude_type(word) || (i > 0 && declaration(input.texts[i - 1])) { needed = true; break }
+        if word == args.prelude_binding("Map") || word == args.prelude_binding("Set") || word == args.prelude_binding("Result") || (i > 0 && declaration(input.texts[i - 1])) { needed = true; break }
     }
     if !needed { return layout }
-    mut catalog := Catalog { definitions:map.new(), names:[], methods:[], next_impl:[], builtin:[], counts:[],
-        bodies:lexer.empty(false), slots:[], starts:[], ends:[], removed:[], resume:[] }
-    mut plan := Instances { index:map.new(), names:[], definitions:[], sites:[], depths:[], arguments:lexer.empty(false),
-        ranges:[], starts:[], error:"", at:0 }
-    prelude := lexer.scan(bundled.generic_prelude(), false)
-    collect(&mut catalog, &mut plan, &prelude, true)
-    collect(&mut catalog, &mut plan, &input, false)
+    mut catalog := Catalog { definitions:map.new(), names:[], methods:[], next_impl:[], builtin:[], counts:[], kinds:[], result:-1,
+        bodies:lexer.empty(false), slots:[], starts:[], ends:[], removed:[], resume:[],
+        constraints:Constraints {parameters:[], methods:[], signatures:lexer.empty(false), starts:[0], slots:[]}, constraint_starts:[0] }
+    mut plan := Instances { index:type_keys.new(), definitions:[], names:[], sites:[], parents:[], arguments:[], types:[],
+        starts:[], reserved:map.new(), platform:platform, requirements:requirements(), error:"", at:0 }
+    mut prelude := lexer.scan(bundled.generic_prelude(), false)
+    for i in 0..prelude.kinds.len - 1 {
+        if prelude.kinds[i] == .Name && args.prelude_type(prelude.texts[i]) && args.symbol(&prelude, i + 1, "<") {
+            prelude.texts[i] = args.prelude_binding(prelude.texts[i])
+        }
+    }
+    collect(&mut catalog, &mut plan, &prelude, true, &mut reg)
+    collect(&mut catalog, &mut plan, &input, false, &mut reg)
     for i in 0..catalog.names.len {
         d := catalog.names.len - 1 - i
         if !catalog.methods[d] { continue }
@@ -266,27 +378,27 @@ pub fn specialize(input: &mut lexer.Tokens) -> Layout {
             catalog.next_impl[target] = d
         }
     }
+    mut source := BoundSource {tokens:lexer.empty(false), slots:[], applications:[], receivers:[], starts:[], ends:[], expressions:syntax.tree()}
+    for d in 0..catalog.names.len {
+        source.starts.push(source.slots.len)
+        bind(&catalog, &mut plan, &reg, &mut source, &catalog.bodies, catalog.starts[d], catalog.ends[d], false)
+        source.ends.push(source.slots.len)
+    }
+    root := source.slots.len
+    bind(&catalog, &mut plan, &reg, &mut source, &input, 0, input.kinds.len - 1, true)
     mut output := lexer.empty(false)
-    expand(&catalog, &mut plan, &input, &mut output, true, 0)
     mut position := input.starts[input.kinds.len - 1] + 1
+    if plan.error == "" { lower(&catalog, &mut plan, &mut reg, &source, &mut output, root, source.slots.len, -1, false, &mut position) }
     layout.first = position
     mut instance := 0
     while instance < plan.names.len && plan.error == "" {
         def := plan.definitions[instance]
-        first := plan.starts[instance]
-        if catalog.builtin[def] && catalog.names[def] == "Result" {
-            layout.result_names.push(plan.names[instance].clone())
-            layout.result_arguments.push(layout.argument_ends.len)
-        }
-        for p in 1..catalog.counts[def] + 1 { layout.argument_ends.push(plan.ranges[first + p]) }
         mut d := def
         while d >= 0 && plan.error == "" {
             site := origin(&layout, plan.sites[instance])
             if catalog.builtin[d] { layout.starts.push(position); layout.positions.push(site) }
-            body := instantiate(&catalog, &plan, d, instance, &mut position)
-            level := plan.depths[instance] + 1
-            args.token(&mut output, .Newline, "\n", body.starts[0])
-            expand(&catalog, &mut plan, &body, &mut output, false, level)
+            args.token(&mut output, .Newline, "\n", site)
+            lower(&catalog, &mut plan, &mut reg, &source, &mut output, source.starts[d], source.ends[d], instance, catalog.builtin[d], &mut position)
             layout.end = position
             d = catalog.next_impl[d]
         }
@@ -308,8 +420,12 @@ pub fn specialize(input: &mut lexer.Tokens) -> Layout {
         layout.end = position
         break
     }
-    layout.arguments = move plan.arguments
-    args.token(&mut layout.arguments, .End, "", position)
+    layout.reserved = move plan.reserved
+    layout.requirements = move plan.requirements
+    for i in 0..plan.names.len {
+        layout.instance_ids.put(plan.names[i].clone(), i64(i)); layout.sites.push(origin(&layout, plan.sites[i]))
+    }
+    layout.parents = move plan.parents
     args.token(&mut output, .End, "", position)
     input.kinds = move output.kinds; input.texts = move output.texts; input.starts = move output.starts
     input.ends.clear(); input.ids.clear(); input.intern = false; input.store_ends = false
