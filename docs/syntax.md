@@ -141,6 +141,41 @@ ett kompileringsfel på originalpositionen. Nästlade interpolerade strängar
 har en gräns på 64 nivåer. En sträng utan `f` behåller alltid sin vanliga
 tolkning, även när den innehåller klamrar.
 
+## Generiska deklarationer
+
+Funktioner på modulnivå, structar och enums kan deklarera en eller flera
+typparametrar. Skriv typargumenten mellan `<` och `>` vid användning.
+Ett `impl` för en generisk typ binder typens parametrar i samma ordning.
+
+```dunder
+struct Box<T> { value: T }
+enum Maybe<T> { Some(T), None }
+
+impl Box<T> {
+    fn new(move value: T) -> Self { Self { value: move value } }
+}
+
+fn identity<T>(move value: T) -> T { value }
+
+fn main() {
+    box := Box<string>::new(identity<string>("Dunder"))
+    maybe := Maybe<Box<string>>.Some(move box)
+    match maybe {
+        .Some(b) => { print(b.value) },
+        .None => {},
+    }
+}
+```
+
+Kompilatorn skapar en specialisering för varje kombination av deklaration
+och konkreta typargument som programmet använder. Kroppen typkontrolleras
+med de konkreta typerna. En metod som anropas på ett värde av typen `T`
+måste därför finnas och vara åtkomlig för den valda typen. Flyttar, lån och
+resursstädning följer de vanliga reglerna i varje specialisering.
+En specialiserad funktion kan skickas vidare som funktionsvärde,
+exempelvis `identity<i32>`. Importerade deklarationer används på samma sätt,
+exempelvis `lib.Box<[]i32>`. [Körbart exempel med två moduler](../tests/fixtures/generics/main.ddr)
+
 ## Funktioner och kontrollflöde
 
 [Fibonacci-exemplet](../examples/fibonacci.ddr) visar en funktion med typad

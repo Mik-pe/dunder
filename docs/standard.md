@@ -193,8 +193,8 @@ i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buff
 
 ## Generiska samlingar
 
-`Map<K, V>` och `Set<T>` byggs med konkreta Dunder-typer och direkta
-anrop för varje specialisering. De kan även skrivas `map.Map<K, V>`
+`Map<K, V>` och `Set<T>` är generiska structar skrivna i Dunder.
+Kompilatorn specialiserar dem med samma regler som [egna generiska deklarationer](syntax.md#generiska-deklarationer). De kan även skrivas `map.Map<K, V>`
 och `set.Set<T>` efter import av standardmodulerna.
 
 ```dunder

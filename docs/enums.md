@@ -168,7 +168,7 @@ härleder kompilatorn typen från den första armen som ger ett värde.
 
 ## Typade fel med Result
 
-`Result<T, E>` är en inbyggd enumtyp med `.Ok(T)` och `.Err(E)`.
+`Result<T, E>` är en generisk enum i språkets fördefinierade bibliotek med varianterna `.Ok(T)` och `.Err(E)`.
 Använd `.Ok` eller `.Err` utan parenteser när den variantens typ är `()`.
 Skriv `Result<i32, string>.Ok(42)` för att välja typen utan förväntad
 kontext. Varje par av konkreta typargument får en egen statisk typ.
@@ -239,7 +239,7 @@ kan i sin tur äga en array, en struct eller en annan enum. Ägarskap och
 kloning följer payloadens typ. [Körbart exempel](../tests/fixtures/aggregate_arrays/enums.ddr)
 
 Ett enumvärde får vara högst 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
-generiska `Option<T>`, alternativa
+alternativa
 mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja
 payload eller en textrepresentation. [sys](sys.md) använder redan konkreta
-`ReadResult` och `IoError` utan generics.
+`ReadResult` och `IoError`. En egen valfri typ kan deklareras som `enum Option<T> { Some(T), None }`.
