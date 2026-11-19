@@ -13,7 +13,7 @@ registerplatser, inklusive syntetiska loopgränser. Arrayer, adresserbara
 värden, spill och okända operationer behåller frame. En verifierad
 parallellflytt hanterar överlappande argument; en separat observation
 kontrollerar att den faktiskt emitterade kroppen saknar anrop.
-[Kontrakt]((../../../docs/optimization.md#framefria-registerfunktioner-på-arm64)).
+[Kontrakt](../../../docs/optimization.md#framefria-registerfunktioner-på-arm64).
 
 Policyn gäller ARM64/macOS och ARM64/Linux. x86-64 och Wasm behåller
 befintlig emission. `--frame-free=off` isolerar mekanismen. Cache och

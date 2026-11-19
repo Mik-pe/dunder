@@ -18,7 +18,7 @@ Analysen har budget för 131 072 arbetsenheter, åtta överföringar per
 loophuvud, djup 64, 32 768 faktaceller och 512 resultatplatser. En återanvänd
 arbetsyta med plana buffertar undviker en heapallokering per uttryck.
 `--range-opt=off` isolerar passet, med separat cache- och kvittoidentitet.
-[Kontrakt]((../../../docs/optimization.md#budgeterade-intervall-och-stabila-arraylängder)).
+[Kontrakt](../../../docs/optimization.md#budgeterade-intervall-och-stabila-arraylängder).
 
 Runtime upprätthåller nu uttryckligen `0 <= len <= cap <= i32::MAX`.
 Tillräcklig befintlig kapacitet är en snabb väg; tillväxt kontrollerar den

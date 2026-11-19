@@ -45,6 +45,8 @@ manifestet det programmet och `tests/suite.ddr` som testrot.
 
 `check` typkontrollerar även biblioteksmoduler. Alla fyra målen kan byggas
 med samma kompilator. [Målplattformar och körmiljöer](docs/targets.md)
+`build --app` paketerar ett ARM64/macOS-program som en signerad `.app`.
+[App-paket för macOS](docs/app-bundles.md)
 
 För en permanent installation, kör `./tools/install.sh` och lägg
 `~/.dunder/bin` i `PATH`. `DUNDER_HOME` väljer installationskatalog.
@@ -69,4 +71,4 @@ standardbiblioteket i riktiga program. [dunder-hundmat](https://github.com/Mik-p
 kompilatorn, målprogrammen och diagnostiken. Sviten använder Python 3.11 eller
 senare, Node för Wasm, en C-kompilator för ABI-proven samt Git, curl, gzip och OpenSSL.
 
-[Guide till kompilatorkoden](selfhost/README.md) · [Bootstrap från frö](bootstrap/README.md) · [Inkrementell kompilering](docs/incremental.md) · [Aktuellt arbete](docs/next-steps.md)
+[Guide till kompilatorkoden](selfhost/README.md) · [Arkitekturöversikt](docs/arkitektur.md) · [Bootstrap från frö](bootstrap/README.md) · [Inkrementell kompilering](docs/incremental.md) · [Aktuellt arbete](docs/next-steps.md)

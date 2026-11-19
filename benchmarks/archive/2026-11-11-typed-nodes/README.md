@@ -11,7 +11,7 @@ en komplett karta kan ange andra frameplatser för uttrycksemission.
 Helfunktions-API:erna kräver identitetsplacering. `emit_expression` lämnar
 resultatet i x0 och skapar ingen frame, entry eller RET. Argument, canonical
 i32-värden och eventuella arraycacher måste förberedas av anroparen.
-[Kontrakt]((../../../docs/optimization.md#typad-funktionsmodell-och-lokalt-optimeringspass)).
+[Kontrakt](../../../docs/optimization.md#typad-funktionsmodell-och-lokalt-optimeringspass).
 
 ## Uppmätt byggkostnad
 
