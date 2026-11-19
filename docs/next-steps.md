@@ -6,9 +6,17 @@ ordning. [Minnesmodellen](memory.md) · [Standardbiblioteket](standard.md)
 
 ## Samlingar
 
-[`Map<K, V>` och `Set<T>`](standard.md#generiska-samlingar) stöder
-statiskt specialiserade typer, lånade uppslag och flytt av ägda värden.
-Proven täcker hashkollisioner, omhashning, resurser och kloningsdiagnostik.
+Det statiska traitsystemet (`Eq`, `Ord`, `Hash`, `Display`, `Default`,
+`Sendable`, `Storable`, `Clone`, `Copy`) stöder villkorliga
+implementationer, standardmetoder i traits och generiska `Self`-signaturer.
+Preludium och standardbibliotek (`std.cmp`, generiska algoritmer i `std.array`,
+`std.hash.Hasher`, `std.wire`, `Result<T, E>`) använder dessa kontrakt.
+[Syntax för traits och generics](syntax.md#generiska-deklarationer) · [Traits-design](generics-design.md)
+
+[`Map<K, V>` och `Set<K>`](standard.md#generiska-samlingar) stöder
+statiskt specialiserade typer med `K: Hash + Storable` och `V: Storable`,
+lånade uppslag och flytt av ägda värden. Proven täcker hashkollisioner,
+omhashning, resurser, villkorlig `Sendable`/`Eq` och kloningsdiagnostik.
 
 [Undersökningen av kolumnlagring](soa-research-plan.md) visar hur en
 följeslagartyp kan ge poståtkomst och kolumnlån med befintliga arrayer.
@@ -57,26 +65,12 @@ med protokollprov. Migrera användare till paketberoenden innan
 
 ### Körbara exempel i manifestet
 
-En provkörning från projektets underkatalog `examples` bekräftade att
-`dunder run named.ddr` hittar projektets lokala beroenden. `dunder run`
-väljer fortfarande `root` och `dunder test` väljer `test_root`.
-[Dagens manifestparser](../selfhost/driver/manifest.ddr) avvisar
-sektionen `[examples]` med en diagnostik på sektionsraden.
-
-Om projekten behöver namngivna exempel kan manifestet mappa namn till
-rotfiler på samma sätt som det i dag anger `root` och `test_root`.
-
-```toml
-[examples]
-atlas = "examples/atlas.ddr"
-```
-
-Ett framtida `dunder run --example atlas` kan välja den rotfilen relativt
-manifestet och använda samma beroendegraf och låsfil som projektet.
-`build` och `check` kan dela väljaren. Utdata under
-`build/<mål>/examples/<namn>` skiljer exempel med samma filnamn
-och undviker kollisioner med huvudprogrammet. `root` och `test_root`
-fortsätter vara standardvalen.
+Namngivna exempel i `[examples]` stöds nu via `--example <namn>` för `build`,
+`run` och `check`. Rotfilen väljs relativt `dunder.toml` med projektets
+gemensamma beroendegraf och `dunder.lock`, och utdata skrivs till
+`build/<mål>/examples/<namn>` för att undvika kollisioner mellan exempel och
+huvudprogram. `root` och `test_root` fortsätter att vara standardvalen.
+[Körbara exempel i `dunder.toml`](dependencies.md#körbara-exempel)
 
 ## Grafik
 

@@ -1,0 +1,257 @@
+capability process, filesystem
+
+import .harness as harness
+import .release_fixture as fixture
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import std.text as text
+import sys
+
+fn write_project_file(path: string, content: string) -> bool {
+    parent := harness.parent_dir(path)
+    if parent.len > 0 && !fs.mkdir_all(parent).ok {
+        return harness.fail(f"cannot create directory {parent}")
+    }
+    sys.write_text(path, content).ok || harness.fail(f"cannot write {path}")
+}
+
+fn contains(output: string, expected: string, context: string) -> bool {
+    text.find(output, expected) >= 0 || harness.fail(f"{context}: expected '{expected}' in:\n{output}")
+}
+
+fn run_status(program: string, args: []string, cwd: string, status: i32, out: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, cwd, status, false, 90000, &mut out)
+}
+
+fn git_run(repo: string, args: []string) -> bool {
+    mut full: []string = ["-C", repo.clone()]
+    for arg in args { full.push(arg.clone()) }
+    mut cmd := process.command("git", move full)
+    cmd.set_env("GIT_ALLOW_PROTOCOL", "file")
+    cmd.set_timeout(60000)
+    res := cmd.exec()
+    if !res.ok || res.timed_out || res.signal != 0 || res.code != 0 {
+        return harness.fail(f"git failed in {repo}: {res.stderr_text()}")
+    }
+    true
+}
+
+fn has_magic(path: string, magic: &[]u8) -> bool {
+    data := sys.read_u8(path)
+    if !data.ok || data.value.len < magic.len {
+        return harness.fail(f"missing or truncated output {path}")
+    }
+    bytes.equal_ranges(&data.value, 0, magic.len, &magic, 0, magic.len) || harness.fail(f"unexpected binary header in {path}")
+}
+
+fn check_reject(compiler: string, args: []string, cwd: string, expected_err: string) -> bool {
+    mut out := harness.empty_output()
+    if !run_status(compiler, args, cwd, 2, &mut out) { return false }
+    contains(out.stderr_text(), expected_err, "cli rejection")
+}
+
+fn run_demo_suite(compiler: string, work: string, host: string) -> bool {
+    helper := work + "/helper"
+    gitdep := work + "/gitdep"
+    demo := work + "/demo"
+    nested := demo + "/nested"
+
+    if !write_project_file(helper + "/dunder.toml", "name = \"helper\"\nroot = \"src/lib.ddr\"\n[examples]\nself_demo = \"examples/self_demo.ddr\"\n") ||
+       !write_project_file(helper + "/src/lib.ddr", "pub fn offset() -> i32 { 10 }\n") ||
+       !write_project_file(helper + "/examples/self_demo.ddr", "fn main() { print(1) }\n") {
+        return false
+    }
+
+    if !write_project_file(gitdep + "/dunder.toml", "root = \"api.ddr\"\n") ||
+       !write_project_file(gitdep + "/api.ddr", "pub fn base() -> i32 { 32 }\n") ||
+       !git_run(gitdep, ["init", "-q"]) ||
+       !git_run(gitdep, ["config", "user.name", "Example Fixture"]) ||
+       !git_run(gitdep, ["config", "user.email", "fixture@invalid.example"]) ||
+       !git_run(gitdep, ["add", "dunder.toml", "api.ddr"]) ||
+       !git_run(gitdep, ["commit", "-qm", "Initial git dependency"]) {
+        return false
+    }
+
+    git_url := fixture.file_url(gitdep)
+    manifest := "name = \"demo\"\nroot = \"src/main.ddr\"\ntest_root = \"tests/suite.ddr\"\n\n" +
+        "[dependencies]\n" +
+        "helper = \"../helper\"\n" +
+        f"gitdep = {{ git = \"{git_url}\" }}\n\n" +
+        "[examples]\n" +
+        "atlas = \"examples/atlas/main.ddr\"\n" +
+        "grid = \"examples/grid/main.ddr\"\n" +
+        "lib_only = \"examples/lib_only.ddr\"\n" +
+        "broken = \"examples/broken.ddr\"\n"
+
+    atlas_src := "import sys\nimport helper\nimport gitdep\n" +
+        "fn main() {\n" +
+        "    mut suffix := \"\"\n" +
+        "    if sys.arg_count() > 1 { suffix = \":\" + sys.arg(1) }\n" +
+        "    print(f\"atlas:{helper.offset() + gitdep.base()}{suffix}\")\n" +
+        "}\n"
+
+    if !write_project_file(demo + "/dunder.toml", manifest) ||
+       !write_project_file(demo + "/src/main.ddr", "import helper\nimport gitdep\nfn main() { print(f\"root:{helper.offset() + gitdep.base()}\") }\n") ||
+       !write_project_file(demo + "/tests/suite.ddr", "import helper\nimport gitdep\n@test fn ok() { assert(helper.offset() + gitdep.base() == 42) }\n") ||
+       !write_project_file(demo + "/examples/atlas/main.ddr", atlas_src) ||
+       !write_project_file(demo + "/examples/grid/main.ddr", "import helper\nfn main() { print(f\"grid:{helper.offset()}\") }\n") ||
+       !write_project_file(demo + "/examples/lib_only.ddr", "import helper\npub fn measure() -> i32 { helper.offset() + 5 }\n") ||
+       !write_project_file(demo + "/examples/broken.ddr", "fn main() -> i32 { true }\n") ||
+       !fs.mkdir_all(nested).ok {
+        return harness.fail("cannot prepare demo project")
+    }
+
+    mut out := harness.empty_output()
+    atlas_out := demo + "/build/" + host + "/examples/atlas"
+    grid_out := demo + "/build/" + host + "/examples/grid"
+
+    if !run_status(compiler, ["run", "--example", "atlas", "--", "hello"], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "atlas:42:hello\n", "run --example atlas") ||
+       !sys.metadata(atlas_out).is_file ||
+       !sys.metadata(demo + "/dunder.lock").is_file {
+        return harness.fail("run --example atlas failed or did not produce expected artifacts")
+    }
+
+    if !run_status(compiler, ["run", "--example=grid"], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "grid:10\n", "run --example=grid") ||
+       !sys.metadata(grid_out).is_file ||
+       !run_status(atlas_out, [], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "atlas:42\n", "preserved atlas example binary") {
+        return false
+    }
+
+    if !run_status(compiler, ["run", "--example", "atlas", "--offline", "--locked", "--", "from-sub"], nested, 0, &mut out) ||
+       !harness.stdout_is(&out, "atlas:42:from-sub\n", "nested run --example --offline --locked") {
+        return false
+    }
+
+    custom_bin := demo + "/custom-bin"
+    if !run_status(compiler, ["run", "--example", "atlas", "-o", "custom-bin", "--", "custom"], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "atlas:42:custom\n", "run --example -o custom-bin") ||
+       !sys.metadata(custom_bin).is_file {
+        return false
+    }
+
+    if !run_status(compiler, ["build", "--example", "atlas"], demo, 0, &mut out) ||
+       !contains(out.stdout_text(), f"built build/{host}/examples/atlas", "build --example atlas") ||
+       !run_status(atlas_out, [], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "atlas:42\n", "built atlas execution") {
+        return false
+    }
+
+    wasm_magic: []u8 = [0, 97, 115, 109]
+    elf_magic: []u8 = [127, 69, 76, 70]
+    if !run_status(compiler, ["build", "--example", "grid", "--target", "wasm32"], demo, 0, &mut out) ||
+       !has_magic(demo + "/build/wasm32/examples/grid.wasm", &wasm_magic) ||
+       !run_status(compiler, ["build", "--example", "atlas", "--target", "x86_64-linux"], demo, 0, &mut out) ||
+       !has_magic(demo + "/build/x86_64-linux/examples/atlas", &elf_magic) ||
+       !run_status(compiler, ["build", "--example", "atlas", "--target", "arm64-linux"], demo, 0, &mut out) ||
+       !has_magic(demo + "/build/arm64-linux/examples/atlas", &elf_magic) {
+        return false
+    }
+
+    if host == "arm64-macos" {
+        app_bin := demo + "/build/arm64-macos/examples/atlas.app/Contents/MacOS/atlas"
+        if !run_status(compiler, ["build", "--example", "atlas", "--app"], demo, 0, &mut out) ||
+           !sys.metadata(app_bin).is_file ||
+           !run_status(app_bin, [], demo, 0, &mut out) ||
+           !harness.stdout_is(&out, "atlas:42\n", "app bundle example execution") {
+            return false
+        }
+    }
+
+    root_out := demo + "/build/" + host + "/demo"
+    if !run_status(compiler, ["build"], demo, 0, &mut out) ||
+       !contains(out.stdout_text(), f"built build/{host}/demo", "default build") ||
+       !run_status(root_out, [], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "root:42\n", "default root binary") ||
+       !run_status(compiler, ["test"], demo, 0, &mut out) ||
+       !contains(out.stdout_text(), "1 passed, 0 failed", "default test") ||
+       !run_status(compiler, ["run", "examples/atlas/main.ddr", "--", "direct"], demo, 0, &mut out) ||
+       !harness.stdout_is(&out, "atlas:42:direct\n", "direct positional example run") {
+        return false
+    }
+
+    if !run_status(compiler, ["check", "--example", "atlas"], demo, 0, &mut out) ||
+       !contains(out.stdout_text(), "checked ", "check --example atlas") ||
+       !run_status(compiler, ["check", "--example", "lib_only", "--agent"], demo, 0, &mut out) ||
+       !harness.agent_ok(&out) ||
+       !run_status(compiler, ["check", "--example", "broken"], demo, 1, &mut out) ||
+       !contains(out.stderr_text(), "broken.ddr:", "check --example broken") ||
+       !check_reject(compiler, ["check", "--example", "atlas", "-o", "nope"], demo, "check does not accept an output path") {
+        return false
+    }
+
+    if !check_reject(compiler, ["run", "--example"], demo, "--example requires an example name") ||
+       !check_reject(compiler, ["run", "--example="], demo, "--example requires an example name") ||
+       !check_reject(compiler, ["run", "--example", "--target", "wasm32"], demo, "--example requires an example name") ||
+       !check_reject(compiler, ["run", "--example", "../bad"], demo, "invalid example name") ||
+       !check_reject(compiler, ["run", "--example", "-bad"], demo, "--example requires an example name") ||
+       !check_reject(compiler, ["run", "--example=-bad"], demo, "invalid example name") ||
+       !check_reject(compiler, ["run", "--example", "atlas", "--example", "grid"], demo, "duplicate --example option") ||
+       !check_reject(compiler, ["run", "--example", "atlas", "src/main.ddr"], demo, "--example cannot be combined with a source file") ||
+       !check_reject(compiler, ["run", "src/main.ddr", "--example", "atlas"], demo, "--example cannot be combined with a source file") ||
+       !check_reject(compiler, ["build", "--example", "missing"], demo, "unknown example 'missing'") ||
+       !check_reject(compiler, ["test", "--example", "atlas"], demo, "--example is supported only for build, run and check") ||
+       !check_reject(compiler, ["build-tests", "--example", "atlas"], demo, "--example is supported only for build, run and check") ||
+       !check_reject(compiler, ["update", "--example", "atlas"], demo, "update accepts only --offline and --locked") {
+        return false
+    }
+
+    true
+}
+
+fn run_edge_cases(compiler: string, work: string) -> bool {
+    ordered := work + "/ordered"
+    if !write_project_file(ordered + "/dunder.toml", "name = \"ordered\"\nroot = \"main.ddr\"\n[examples]\nfirst = \"examples/first.ddr\"\n[dependencies]\nhelper = \"../helper\"\n") ||
+       !write_project_file(ordered + "/main.ddr", "fn main() { print(0) }\n") ||
+       !write_project_file(ordered + "/examples/first.ddr", "import helper\nfn main() { print(helper.offset()) }\n") {
+        return false
+    }
+    mut out := harness.empty_output()
+    if !run_status(compiler, ["run", "--example", "first"], ordered, 0, &mut out) ||
+       !harness.stdout_is(&out, "10\n", "examples before dependencies") {
+        return false
+    }
+
+    no_manifest := work + "/no_manifest"
+    if !fs.mkdir_all(no_manifest).ok { return harness.fail("cannot create no_manifest directory") }
+    if !check_reject(compiler, ["run", "--example", "atlas"], no_manifest, "no dunder.toml found") {
+        return false
+    }
+
+    bad_dir := work + "/bad_manifest"
+    if !fs.mkdir_all(bad_dir).ok { return harness.fail("cannot create bad_manifest directory") }
+    bad_cases: [](string, string) = [
+        ("name = \"bad\"\nroot = \"main.ddr\"\n[examples]\na = \"a.ddr\"\n[examples]\nb = \"b.ddr\"\n", "dunder.toml:5:"),
+        ("name = \"bad\"\nroot = \"main.ddr\"\n[examples]\na = \"a.ddr\"\na = \"b.ddr\"\n", "dunder.toml:5:"),
+        ("name = \"bad\"\nroot = \"main.ddr\"\n[examples]\n-bad = \"a.ddr\"\n", "dunder.toml:4:"),
+        ("name = \"bad\"\nroot = \"main.ddr\"\n[examples]\na/b = \"a.ddr\"\n", "dunder.toml:4:"),
+        ("name = \"bad\"\nroot = \"main.ddr\"\n[examples]\na = \"\"\n", "dunder.toml:4:"),
+        ("name = \"bad\"\nroot = \"main.ddr\"\n[examples]\na = { path = \"a.ddr\" }\n", "dunder.toml:4:"),
+    ]
+    for item in bad_cases {
+        if !write_project_file(bad_dir + "/dunder.toml", item.0) { return false }
+        if !check_reject(compiler, ["build", "--example", "a"], bad_dir, item.1) { return false }
+    }
+
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    host := process.host_target()
+    if host.len == 0 { _ := harness.fail("unsupported host"); return 2 }
+    tmp := fs.temp_dir("dunder-examples-")
+    if !tmp.ok { _ := harness.fail("cannot create temporary directory"); return 1 }
+    defer { _ := fs.remove_all(tmp.value) }
+    real := fs.realpath(tmp.value)
+    if !real.ok { _ := harness.fail("cannot resolve temporary directory"); return 1 }
+    if !run_demo_suite(cli.compiler, real.value, host) || !run_edge_cases(cli.compiler, real.value) {
+        return 1
+    }
+    print("PASS test-examples")
+    0
+}

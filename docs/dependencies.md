@@ -97,3 +97,39 @@ Beroenden har för närvarande en gemensam namnrymd för hela programmet. Två
 krav med samma importnamn måste peka på samma källa och rotmodul. Olika
 versioner behöver olika importnamn. Cykler mellan paket och motstridiga namn
 ger fel vid manifestets rad innan kompileringen börjar.
+
+## Körbara exempel
+
+Ett projektmanifest kan mappa namngivna exempel till rotfiler under `[examples]`:
+
+```toml
+name = "app"
+root = "src/main.ddr"
+test_root = "tests/suite.ddr"
+
+[dependencies]
+verktyg = { path = "../verktyg" }
+
+[examples]
+atlas = "examples/atlas.ddr"
+```
+
+Välj exempel med `--example <namn>` eller `--example=<namn>` vid `build`, `run`
+och `check`:
+
+```sh
+dunder run --example atlas -- arg1
+dunder build --example atlas
+dunder check --example atlas
+```
+
+Exempelsökvägen tolkas relativt manifestets katalog och delar projektets
+beroendegraf och `dunder.lock` (inklusive `--offline` och `--locked`). Utan
+`-o` skrivs utdata till `build/<mål>/examples/<namn>` (med `.wasm` för
+`wasm32` och `.app` med `--app`), så exempel med samma filnamn inte kolliderar
+med varandra eller med huvudprogrammet. `root` och `test_root` fortsätter att
+vara standardvalen när `--example` utelämnas.
+
+Exempelnamn består av ASCII-bokstäver, siffror, `_` och `-` utan inledande
+`-`. `--example` kan inte kombineras med en positionell `.ddr`-fil.
+[`Manifestparser`](../selfhost/driver/manifest.ddr) · [`CLI`](../selfhost/driver/cli.ddr)
