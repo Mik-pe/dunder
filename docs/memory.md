@@ -47,7 +47,7 @@ fn main() {
 }
 ```
 
-Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `Child` och
+Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `UdpSocket`, `Child` och
 `ChildSet` är sådana resurser. Fil- och körningskapabiliteter som bara
 innehåller en sökväg kan däremot uttryckligen klonas.
 Lokala resurser i en worker följer taskens effektregler. Transport över en
@@ -68,8 +68,8 @@ Flytt av hela resursen överför stängningsansvaret. Använd `replace` för
 att ta över ett ägt fält och lämna ett giltigt värde åt stängningsmetoden.
 En separat explicit `close(&mut self)` kan rapportera operationens
 resultat. Låt den markera resursen stängd när ansvaret försvinner och låt
-`dispose` kontrollera markeringen. `TcpListener`, `TcpStream` och
-`StreamSet` använder en negativ filbeskrivare som markering.
+`dispose` kontrollera markeringen. `TcpListener`, `TcpStream`,
+`StreamSet` och `UdpSocket` använder en negativ filbeskrivare som markering.
 `@resource` utan metodnamn ger unikt ägarskap med explicit stängning.
 
 ```dunder

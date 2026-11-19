@@ -191,13 +191,22 @@ och `parse.hex_u64_range` ger fel 1 för stavning och 2 för overflow; både
 i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buffertar
 (`decode_range`, `find_byte`, `find_crlf`, `find_double_crlf`, `equals_text`,
 `equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
-`std.net` ger kapabilitetsstyrd TCP och `PollSet`/`StreamSet` ovanpå
-`capability network` med både `impl`-metoder (`TcpListener::listen`/`.accept`/`.close`,
-`TcpStream::connect`/`.read_append`/`.peek_append`/`.write_all`/`.close`, `PollSet::new`/`Default`,
-`StreamSet::new`) och modulhjälpare (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
-`peek_append` lägger till upp till det angivna antalet byte i en buffert
-och lämnar dem kvar i socketens kö. Den använder samma resultat för
-läsning, vänteläge och EOF som `read_append`.
+`std.net` ger kapabilitetsstyrd TCP och UDP för IPv4 och IPv6 ovanpå
+`capability network` med adresstyperna `IpAddr` (`parse`, `Eq`, `Hash`, `Display`,
+`Sendable`, `Copy`) och `SocketAddr` (`parse`, `Eq`, `Hash`, `Display`, `Sendable`,
+`Copy`), resurshandtagen `TcpListener` (`listen`, `listen_addr`, `accept`,
+`local_addr`, `local_port`, `close`), `TcpStream` (`connect`, `connect_addr`,
+`connect_timeout`, `connect_host`, `local_addr`, `peer_addr`, `read_append`,
+`peek_append`, `write_range`, `write_all`, `shutdown_read`, `shutdown_write`,
+`shutdown_both`, `set_read_timeout`, `set_write_timeout`, `close`),
+`UdpSocket` (`bind`, `connect`, `local_addr`, `peer_addr`, `send_to`,
+`send_to_range`, `send`, `recv_from_append`, `peek_from_append`, `recv_append`,
+`set_read_timeout`, `set_write_timeout`, `close`), samt `PollSet` (`new`/`Default`)
+och `StreamSet` (`new`/`Default`, `peek_append`, `shutdown_read`, `local_addr`,
+`peer_addr`, timeouts) och motsvarande modulhjälpare. `peek_append` och
+`peek_from_append` lämnar lästa byte kvar i socketens kö. TCP- och
+UDP-operationerna använder direkta systemanrop på Linux och behåller statiska
+ELF-binärer; `net.resolve` och `TcpStream::connect_host` använder `getaddrinfo`.
 
 ## Generiska samlingar
 

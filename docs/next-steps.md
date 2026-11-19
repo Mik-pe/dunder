@@ -57,11 +57,17 @@ kan plockas isär, också när en komponent äger en resurs.
 
 ### Nätverk
 
-`std.net` samlar TCP-transporten, inklusive läsning av byte som ligger
-kvar i socketens kö. HTTP-servern och klienten byggs som separata paket
-med protokollprov. Migrera användare till paketberoenden innan
-övergångsimporterna `std.http` och `std.http_client` tas bort.
-[HTTP-paketen](http.md)
+`std.net` samlar TCP- och UDP-transporten för både IPv4 och IPv6:
+`IpAddr`, `SocketAddr`, `TcpListener` (med `listen_addr` och `local_addr`),
+`TcpStream` (med `connect_addr`, `connect_timeout`, `connect_host`,
+`local_addr`, `peer_addr`, `peek_append`, `shutdown_read`, `shutdown_both` samt
+läs-/skrivtimeouts), `StreamSet` (`Default`, `peek_append`, `shutdown_read`,
+`local_addr`, `peer_addr`, timeouts) och `UdpSocket` (`@resource(dispose)`,
+`bind`, `connect`, `send_to`/`send_to_range`, `send`, `recv_from_append`,
+`peek_from_append`, `recv_append`), samt `resolve` för värduppslagning.
+Övergångsimporterna `std.http` och `std.http_client` har tagits bort;
+HTTP-servern och klienten levereras som separata Dunderpaket.
+[HTTP-paketen](http.md) · [Standardbiblioteket](standard.md)
 
 ### Körbara exempel i manifestet
 

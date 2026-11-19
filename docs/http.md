@@ -9,9 +9,7 @@ http = { path = "../dunder/packages/http" }
 http_client = { path = "../dunder/packages/http_client" }
 ```
 
-Importera dem med `import http` och `import http_client`. Under
-övergången går `std.http` och `std.http_client` till samma källor.
-Använd samma importform i alla moduler i ett program så att de delar typidentitet.
+Importera dem med `import http` och `import http_client`.
 Nätverksåtkomst kräver `capability network` hos anroparen.
 [HTTP-serverpaketet](../packages/http/) · [HTTP-klientpaketet](../packages/http_client/)
 
