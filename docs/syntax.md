@@ -72,6 +72,9 @@ Operatorer i fallande prioritet: unärt `-`/`!`, `*`/`/`/`%`, `+`/`-`,
 `<`/`<=`/`>`/`>=`, `==`/`!=`, `&&`, `||`. `&&` och `||` kortsluter.
 Bool stöder likhet/olikhet och logiska operationer. Heltalsoperationer kräver
 matchande typer. Division avrundar mot noll; resten har täljarens tecken.
+För sammansatta och egendefinierade typer skickas `==`/`!=` vidare till traiten
+`Eq` (`eq`/`ne`) och `<`/`<=`/`>`/`>=` till traiten `Ord` (`lt`/`le`/`gt`/`ge`)
+genom att låna operanderna utan att flytta ägarskap.
 
 Spill i `+`, `-`, `*`, unärt minus, divisionen `MIN/-1` och avsmalnande
 konvertering avslutar processen med status 101. Division/rest med noll ger
@@ -195,7 +198,10 @@ som uppfyller kraven.
 ### Traits och `impl Trait for Type`
 
 En `trait`-deklaration namnger ett statiskt kontrakt med noll eller flera
-säkra metodsignaturer samt valfria supertraits efter `:`. Implementering sker
+säkra metodsignaturer samt valfria supertraits efter `:`. Metodsignaturer får
+innehålla `Self` även inuti generiska typer som `Result<Self, string>`, och en
+traitmetod kan ha en standardkropp (`fn ne(&self, other: &Self) -> bool { ... }`)
+som syntetiseras automatiskt när en implementation inte ersätter den. Implementering sker
 explicit med `impl Trait for Type`:
 
 ```dunder
@@ -224,9 +230,8 @@ fn label<T: Ordered>(x: T) -> string {
 
 Metoder i `impl Trait for Type` ärver synlighet från traiten och skrivs utan
 `pub`. Antingen traiten eller måltypen måste deklareras i samma modul
-(lokala traits kan implementeras för primitiva och importerade typer).
-Kompilatorn tillhandahåller två inbyggda markertraits som kontrolleras
-strukturellt:
+(lokala traits kan implementeras för primitiva, sammansatta och importerade
+typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
 
 - `Sendable` härleds automatiskt för vanliga structar, enums, tupler och arrayer
   vars delar är `Sendable` (inklusive `string`, `Result<T, E>` och sammansatta
@@ -236,6 +241,22 @@ strukturellt:
   kompilatorn bevisar att alla privata fält uppfyller regeln. `@resource`,
   råpekare, lån, closures och oklassificerade `opaque struct` är inte `Sendable`.
 - `Storable` anger att typen får lagras som arrayelement eller fält.
+- `Clone` gäller strukturellt för typer utan `@resource`-fält och utan inbyggda
+  lån (`Result<T, E>`, `[]T`, tupler, structar och enums vars delar är `Clone`).
+- `Copy` gäller för värden utan heap- eller ägarskapsstädning (`bool`, heltal,
+  `f32`, `f64`, `rune`, `ptr`, fältlösa enums samt aggregat/tupler vars delar är
+  `Copy`, men inte `string` eller `[]T`).
+- `Clone` och `Copy` är strukturella och kan inte implementeras manuellt.
+
+Förladdade kärntraits från preludium finns alltid tillgängliga utan import:
+`Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord: Eq`, `Hash: Eq`,
+`Display` och `Default`. De är implementerade för primitiva värden (utom att
+`f32` och `f64` avsiktligen inte implementerar `Eq`, `Ord` eller `Hash` — bara
+`Display`, `Default`, `Clone`, `Copy` och `Sendable`), `Result<T, E>` samt
+sammansatta typer `[]T`, `(A, B)` och `(A, B, C)` när deras elementtyper
+uppfyller motsvarande krav (`impl Default for []T where T: Storable`).
+Uttryck som `Result<T, ()>` och `Result<(), E>` konstrueras med bara `.Err`
+respektive `.Ok` när payloadtypen är `()`.
 
 ```dunder
 struct Sized<T> where storable(T), T.size: fn(T) -> i32 { item: T }
@@ -482,10 +503,11 @@ till stderr och programmets stdout bevaras. Ett kompileringsfel startar
 aldrig en tidigare binär från samma utdataplats.
 
 `if` och `while` kräver `bool`, aldrig ett heltal. `else if`, `else`, `break`
-och `continue` stöds. Block ger lexikala scope. `print` är den första inbyggda
-I/O-operationen: ett `i32`, `i64` eller `bool`, följt av radbrytning.
-`print` tar också en UTF-8-sträng eller rune. `assert(condition)` kräver
-`bool` och avslutar processen vid `false`.
+och `continue` stöds. Block ger lexikala scope. `print` tar ett skalärvärde
+(`i32`, `i64`, flyttal, `bool`, `rune`, `string`), ett heltal eller enum, eller
+valfri typ som implementerar `Display` (via `.str()`), följt av radbrytning.
+Stränginterpolering `f"{x}"` använder på samma sätt `Display`/`.str()`.
+`assert(condition)` kräver `bool` och avslutar processen vid `false`.
 
 Vanliga enkla satser avslutas med radbrytning eller valfritt semikolon.
 `}` får avsluta den sista satsen i ett block. Parenteser tillåter flerradiga

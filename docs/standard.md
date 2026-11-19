@@ -24,14 +24,14 @@ fn main() {
     counts.put("dunder", 42)
     print(counts.get_or("dunder", 0))
 
-    mut names := set.new()
-    added := set.insert(&mut names, "å 🌍")
+    mut names := set.Set<string>::new()
+    added := names.insert("å 🌍")
     assert(added)
-    assert(set.contains(&names, "å 🌍"))
+    assert(names.contains("å 🌍"))
 
     mut values: []i64 = [3, 1, 2]
     values.push(4)
-    array.sort(&mut values)
+    array.sort<i64>(&mut values)
     print(array.sum(&values))
 }
 ```
@@ -87,9 +87,9 @@ delar oföränderlig text.
 
 | Operation | Ägarskap |
 | --- | --- |
-| `Map.at`, `Map.get_or`, `Map.contains`, `set.contains` | Lånar nyckeln. |
-| `table.put(move key, move value)`, `set.insert(&mut set, move key)` | Tar över nyckeln även vid en dubblett. `put` tar också över värdet. |
-| `table.keys()`, `set.items(set)` | Returnerar en ny array med klonade nycklar. |
+| `Map.at`, `Map.get_or`, `Map.contains`, `Set.contains` | Lånar nyckeln. |
+| `table.put(move key, move value)`, `set.insert(move key)` | Tar över nyckeln även vid en dubblett. `put` tar också över värdet. `put_new` sätter bara in om nyckeln saknas. |
+| `table.keys()`, `set.values()` | Returnerar en ny array med klonade nycklar. |
 | `process.command(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
 | `process.run(program, args)`, `process.exec(command)` | Lånar under den synkrona körningen. |
 | `process.replace(program, &args)`, `process.replace_as(program, argv0, &args)` | Ersätter den aktuella processen utan en ny PID. Vid fel är miljö, arbetskatalog och standardströmmar orörda. `replace_as` väljer uttryckligen `argv[0]` för multicall-program. |
@@ -154,30 +154,34 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 
 | Import | Innehåll |
 | --- | --- |
-| `std.array` | `ints`, `strings`, `sum`, `sort`, `reverse`, `append` och `sort_strings`. Båda sorteringarna använder introsort på plats med heapsort-fallback, O(n log n). Strängar jämförs lexikografiskt över UTF-8-byte. |
-| `std.map` | [`Map<K, V>`](#generiska-samlingar) med typade nycklar och värden. |
-| `std.set` | `Set` av strängar med metoder via `impl Set` (`Set::new`, `s.len`, `s.length`, `s.reserve`, `s.insert`, `s.contains`, `s.remove`, `s.clear`, `s.items`) samt modulhjälpare (`set.new`, `set.insert`, ...). |
-| `std.hash` | Stabil polynomial hash över UTF-8-byte, använd av strängmängden. |
+| Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Result<T, E>` (med `.is_ok`, `.is_err`, `.unwrap_or`, `.unwrap_or_default` och villkorliga `Eq`/`Ord`/`Hash`/`Display`) samt implementationer för primitiver och `[]T`/`(A, B)`/`(A, B, C)`. |
+| `std.cmp` | Trait-generisk ordning och gränser: `min<T>`, `max<T>`, `clamp<T>` (`T: Ord + Storable`), `Ordering`/`Eq`/`Ord` (re-exporterade) samt omslagstypen `Reverse<T>` med villkorliga `Eq`, `Ord`, `Hash`, `Display`, `Default` och `Sendable`. |
+| `std.array` | `ints`, `strings`, `sum` samt generiska algoritmer (`reverse`, `sort`, `sort_by`, `is_sorted`, `binary_search`, `contains`, `index_of`, `equal`, `min_index`, `max_index`, `dedup`, `append`, `fill`, `resize`, `join`) ovanpå `Ord`/`Eq`/`Clone`/`Display`. `sort` och `sort_by` använder introsort på plats med heapsort-fallback, O(n log n); strängar jämförs som UTF-8-byte. |
+| `std.map` | [`Map<K, V>`](#generiska-samlingar) (`K: Hash + Storable`, `V: Storable`) med `Default`, villkorlig `Eq` och `Sendable`. |
+| `std.set` | [`Set<K>`](#generiska-samlingar) (`K: Hash + Storable`) ovanpå `Map<K, bool>` med `Default`, villkorlig `Eq` och `Sendable`. |
+| `std.hash` | `hash(text)`, `mix`, `combine`, `of<T: Hash + Storable>`, `Hash` och `Hasher` (med `Default`, `.write_u64`, `.write_i64`, `.write_bytes`, `.write_str`, `.finish`). |
 | `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
 | `std.bytes` | Packade bytebuffertar (`[]u8`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kompilatorns kvarvarande `[]i32`-buffertar. |
-| `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str` samt `Reader::new` med `.read_*`/`.remaining`/`.finish`). |
-| `std.json` | `Writer` för att skriva JSON samt lågnivåskrivare till `[]u8`. Läs dokument med `Doc::parse_bytes` eller `Doc::parse_text` och hämta fält med bland annat `.get_str`, `.get_i64`, `.get_u64`, `.get_f64` och `.get_bool`. |
+| `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str`, `Reader::new`/`Default` samt traits `Encode`/`Decode` och `wire.encode<T>`/`wire.decode<T>`). |
+| `std.json` | `Writer` (`Default`) och `Kind` (`Eq`, `Display`) för att skriva JSON, traiten `Encode` (implementerad för skalärer, `string` och `[]T where T: Encode`) med `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`, samt parsern `Doc::parse_bytes`/`Doc::parse_text` med `.get_str`, `.get_i64`, `.get_u64`, `.get_f64` och `.get_bool`. |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
-| `std.parse` | `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse` och deras `range`-varianter läser ASCII-tal. `parse` accepterar understreck mellan siffror. |
-| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError::from_code`/`.code`/`.message` samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
+| `std.parse` | `FromStr` och `parse.value<T: FromStr>` (implementerad för `bool`, `string`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`) samt `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse`. `parse` accepterar understreck mellan siffror. |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError` (`Display`/`Eq`/`Hash`), `FileKind` (`Display`/`Eq`/`Hash`), `Status` (`Eq`) samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
+| `std.toml.tree` | TOML-DOM-träd (`Tree` med `Sendable` och `Default`) och JSON-rendering. |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`, `WriteFile::grant`/`.write`, `ReadDir::grant`/`.resolve_read`/`.list`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
 | `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.terminate`, `.kill`), `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
-ändrar inte antalet poster. `set.insert` returnerar sant för ett nytt värde;
+ändrar inte antalet poster. `Set.insert` returnerar sant för ett nytt värde;
 `remove` returnerar sant när något togs bort. Iterationsordningen hos
-`Map.keys` och `set.items` är ospecificerad. Strängnycklar jämförs
+`Map.keys` och `Set.values` är ospecificerad. Strängnycklar jämförs
 som UTF-8-byte, inklusive tomma strängar och NUL, utan Unicode-normalisering.
 
-Byt från `map.new()` till `Map<string, i64>::new()` och anropa
-metoder på tabellen. Byt `length` till `len`. För uppslag som kan
+Använd `Map<K, V>::new()` och `Set<K>::new()` (eller `Default::default`)
+och anropa metoder direkt på värdet (`len`, `is_empty`, `put`, `put_new`,
+`insert`, `contains`, `remove`, `take`, `values`). För uppslag som kan
 saknas ger `index_of` ett index eller `-1`.
 
 `text.find` returnerar ett byteindex eller -1. `split` bevarar tomma delar;
@@ -189,7 +193,7 @@ i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buff
 `equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
 `std.net` ger kapabilitetsstyrd TCP och `PollSet`/`StreamSet` ovanpå
 `capability network` med både `impl`-metoder (`TcpListener::listen`/`.accept`/`.close`,
-`TcpStream::connect`/`.read_append`/`.peek_append`/`.write_all`/`.close`, `PollSet::new`,
+`TcpStream::connect`/`.read_append`/`.peek_append`/`.write_all`/`.close`, `PollSet::new`/`Default`,
 `StreamSet::new`) och modulhjälpare (`listen`, `connect`, `accept`, `poll`, icke-blockerande I/O).
 `peek_append` lägger till upp till det angivna antalet byte i en buffert
 och lämnar dem kvar i socketens kö. Den använder samma resultat för
@@ -214,30 +218,39 @@ fn main() {
 }
 ```
 
-Strängar, heltal, `bool` och `rune` kan användas direkt som nycklar.
-Andra nyckeltyper definierar `pub fn key_hash(&self) -> u64` och
-`pub fn key_eq(&self, other: Self) -> bool`. Likvärdiga nycklar måste
-ha samma hash. Hash och likhet ska vara stabila medan nyckeln lagras.
-Nycklar och värden använder samma lagringsregler som arrayelement.
-Kraven kontrolleras redan när samlingstypen används, även för en tom
-samling. Egna typer kan deklarera motsvarande metod- och lagringskrav.
+Nyckeltypen `K` kräver `Hash + Storable` (vilket även innefattar supertraiten
+`Eq`). Strängar, heltal, `bool`, `rune`, `[]T`, tupler `(A, B)`/`(A, B, C)` och
+`Result<T, E>` (med `Eq`/`Hash`-element) uppfyller detta direkt; flyttal har
+avsiktligen ingen `Hash`/`Eq`-implementation. Egna typer implementerar `Eq` och
+`Hash`:
+
+```dunder
+impl Eq for Key { fn eq(&self, other: &Self) -> bool { self.id == other.id } }
+impl Hash for Key { fn hash(&self) -> u64 { self.id.hash() } }
+```
+
+Likvärdiga nycklar måste ha samma hash. Hash och likhet ska vara stabila medan
+nyckeln lagras. Nycklar och värden använder samma lagringsregler som arrayelement.
+Kraven kontrolleras redan när samlingstypen används, även för en tom samling.
 [Generiska deklarationer](syntax.md#generiska-deklarationer)
 
-`put` och `insert` tar över sina ägda argument. Vid en dubblett behåller
-`put` den lagrade nyckeln och ersätter värdet. `insert` returnerar
-`false` och släpper den inkommande nyckeln. Omhashning flyttar bara
-index. `take` överför det lagrade värdet eller setelementet i `.Ok`
-och ger `.Err` vid en saknad nyckel. `remove` och `clear` släpper
-borttagna ägare via de vanliga cleanupreglerna. En `.clone()` av hela
+`put`, `put_new` och `insert` tar över sina ägda argument. Vid en dubblett behåller
+`put` den lagrade nyckeln och ersätter värdet, medan `put_new` lämnar befintlig post
+orörd och returnerar `false`. `insert` returnerar `false` och släpper den inkommande
+nyckeln. Omhashning flyttar bara index. `take` överför det lagrade värdet eller
+setelementet i `.Ok` och ger `.Err` vid en saknad nyckel. `remove` och `clear`
+släpper borttagna ägare via de vanliga cleanupreglerna. En `.clone()` av hela
 samlingen kräver klonbara nycklar och värden.
 `Set.take_at(index)` tar ut ett ägt element via dess index.
 
 `Map.index_of(key)` ger postens index eller `-1`. `key_at(index)`
 och `value_at(index)` lånar posten. `Map.at(key)` lånar värdet och
 kräver att nyckeln finns. `Set.at(index)` lånar elementet vid indexet.
-`Map.get_or(key, move fallback)` returnerar en klon av värdet eller
-det ägda reservvärdet vid en saknad nyckel. `Map.keys()` klonar alla
-lagrade nycklar till en ny array.
+`Map.get_or(key, move fallback)` och `Map.get_or_default(key)` (för `V: Default + Clone`)
+returnerar en klon av värdet eller ett reserv-/standardvärde vid en saknad nyckel.
+`Map.keys()` och `Set.values()` klonar alla lagrade nycklar till en ny array.
+Både `Map` och `Set` implementerar `Default`, `Eq` (när nyckel/värde är `Eq`) och
+villkorlig `Sendable`.
 Skrivning till samlingen kräver att lånen har upphört. Använd intervallet
 `0..len()` för att läsa poster i aktuell ordning. Borttagning kan byta
 plats på den sista kvarvarande posten och den borttagna posten.
@@ -254,6 +267,10 @@ ger även NaN om den undre gränsen är större än den övre.
 i radianer. De finns på de nativa målen och i WebAssembly. `sin` och
 `tan` bevarar tecknet på noll, medan `cos(0.0)` ger `1.0`.
 Oändliga vinklar och NaN ger NaN.
+
+`math.total_cmp_f64(a, b)` och `math.total_cmp_f32(a, b)` ger IEEE 754 total
+ordning som `Ordering` (`-NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN`),
+lämplig att skicka till `array.sort_by` när flyttal behöver deterministisk ordning.
 
 Stora vinklar reduceras med binär fastpunktsaritmetik enligt
 [Payne–Hanek-metoden](https://perso.ens-lyon.fr/jean-michel.muller/RangeReductionIEEETC0305.pdf).
@@ -280,7 +297,9 @@ fn main() {
 }
 ```
 
-`Writer` sköter skiljetecken för objekt och arrayer. Anropa `key` före
+`Writer` (som även implementerar `Default`) sköter skiljetecken för objekt och
+arrayer. Typade värden kan dessutom serialiseras via traiten `json.Encode` och
+hjälparna `json.encode<T>`, `json.field_value<T>` och `json.to_string<T>`. Anropa `key` före
 värdet i ett objekt och `end` för varje öppnad behållare. `finish().ok`
 kräver precis ett komplett rotvärde och en giltig följd av anrop.
 `decimal`, `write_f64` och `field_f64` avvisar NaN och oändlighet.

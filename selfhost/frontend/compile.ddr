@@ -110,6 +110,7 @@ pub opaque struct Session {
     ok: bool, error: string, error_at: i32,
     specializations: generics.Layout,
     traits: traits.Table,
+    discovering_compounds: bool, known_compounds: Map<string, i64>, demanded_compounds: Map<string, i64>,
     validating_dead: bool, validated_through: i32, report: bool, bindings: Bindings,
     wasm_abi: wa.Abi, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports,
@@ -866,12 +867,72 @@ fn declaration_owner(c: &Session, offset: i32, starts: &[]i32, owners: &[]i32) -
     fc.source_owner(offset, &starts, &owners)
 }
 struct TraitMethodSig { has_self: bool, signature: i32 }
-fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty: i32) -> TraitMethodSig {
+fn trait_generic_type(c: &mut Session, validating_trait: bool, sig_end: i32) -> i32 {
+    family := advance(&mut c)
+    expect(&mut c, "<")
+    mut spec := family + "<"
+    mut count := 0
+    while c.ok && c.body.cursor < sig_end && !is(&c, ">") {
+        if count > 0 { spec += ", " }
+        arg_ty := type_name_in_trait(&mut c, validating_trait, sig_end)
+        spec += ft.type_spelling(&c.types, arg_ty)
+        count += 1
+        if !eat(&mut c, ",") { break }
+    }
+    if c.ok { expect(&mut c, ">") }
+    if !c.ok { return 0 }
+    spec += ">"
+    found := type_id(&c, spec)
+    if found >= 0 { return found }
+    if validating_trait { return c.types.self_type }
+    -1
+}
+fn type_name_in_trait(c: &mut Session, validating_trait: bool, sig_end: i32) -> i32 {
+    if !c.ok { return 0 }
+    if is(&c, "&") {
+        skip_token(&mut c)
+        mut ref_kind := 4
+        if eat(&mut c, "mut") { ref_kind = 5 }
+        base := type_name_in_trait(&mut c, validating_trait, sig_end)
+        return compound(&mut c, ref_kind, base)
+    }
+    if is(&c, "[") {
+        skip_token(&mut c)
+        if eat(&mut c, "]") {
+            base := type_name_in_trait(&mut c, validating_trait, sig_end)
+            return compound(&mut c, 1, base)
+        }
+        base := type_name_in_trait(&mut c, validating_trait, sig_end)
+        expect(&mut c, ";")
+        len := length_literal(&mut c)
+        expect(&mut c, "]")
+        return fixed(&mut c, base, len)
+    }
+    if is(&c, "(") {
+        skip_token(&mut c)
+        if eat(&mut c, ")") { return 0 }
+        mut parts: []i32 = []
+        while c.ok && c.body.cursor < sig_end && !is(&c, ")") {
+            parts.push(type_name_in_trait(&mut c, validating_trait, sig_end))
+            if !eat(&mut c, ",") { break }
+        }
+        expect(&mut c, ")")
+        ty := ft.tuple_type(&mut c.types, &parts); check_type_error(&mut c); return ty
+    }
+    at := c.body.cursor
+    if c.world.tokens.kinds[at] == .Name && at + 1 < sig_end &&
+        c.world.tokens.kinds[at + 1] == .Symbol && c.world.tokens.texts[at + 1] == "<" {
+        return trait_generic_type(&mut c, validating_trait, sig_end)
+    }
+    type_name(&mut c)
+}
+fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty: i32, validating_trait: bool) -> TraitMethodSig {
     saved_cursor := c.body.cursor; saved_self := c.types.self_type
     saved_names := c.world.param_names.len
     c.body.cursor = sig_start; c.types.self_type = self_ty
     mut has_self := false
     mut args: []i32 = []
+    mut unresolved := false
     expect(&mut c, "(")
     while c.ok && !is(&c, ")") && c.body.cursor < sig_end {
         param_index := args.len
@@ -894,8 +955,9 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
                 mut mode := parameter_mode(&mut c, self_ty, true, false)
                 if eat(&mut c, ":") {
                     if is_mut { fail(&mut c, "cannot combine 'mut self' with an explicit ': Type'"); break }
-                    pt := type_name(&mut c)
-                    if pt == self_ty { mode = parameter_mode(&mut c, pt, true, false) }
+                    pt := type_name_in_trait(&mut c, validating_trait, sig_end)
+                    if pt < 0 { unresolved = true }
+                    else if pt == self_ty { mode = parameter_mode(&mut c, pt, true, false) }
                     else if (ft.type_kind(&c.types, pt) == 4 || ft.type_kind(&c.types, pt) == 5) && ft.type_base(&c.types, pt) == self_ty {
                         if consuming { fail(&mut c, "move argument requires a consuming parameter"); break }
                         mode = parameter_mode(&mut c, pt, false, false)
@@ -904,8 +966,10 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
                 c.world.param_names.push("self"); args.push(mode)
             } else {
                 if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected parameter name in trait method"); break }
-                pname := advance(&mut c); expect(&mut c, ":"); pt := type_name(&mut c)
-                mode := parameter_mode(&mut c, pt, consuming, false)
+                pname := advance(&mut c); expect(&mut c, ":"); pt := type_name_in_trait(&mut c, validating_trait, sig_end)
+                if pt < 0 { unresolved = true }
+                mut mode := 0
+                if pt >= 0 { mode = parameter_mode(&mut c, pt, consuming, false) }
                 c.world.param_names.push(move pname); args.push(mode)
             }
         }
@@ -913,12 +977,15 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
     }
     if c.ok { expect(&mut c, ")") }
     mut ret := 0
-    if c.ok && eat(&mut c, "->") { ret = type_name(&mut c) }
-    mut signature := 0
+    if c.ok && eat(&mut c, "->") {
+        ret = type_name_in_trait(&mut c, validating_trait, sig_end)
+        if ret < 0 { unresolved = true }
+    }
+    mut signature := -1
     if c.ok {
-        source := result_parameter(&mut c, &args, ret, saved_names)
+        source := result_parameter(&mut c, &args, if ret < 0 { 0 } else { ret }, saved_names)
         if c.ok && c.body.cursor != sig_end { fail(&mut c, "unexpected token in trait method signature") }
-        if c.ok { signature = callable_with_parameter(&mut c, &args, ret, 9, source) }
+        if c.ok && !unresolved { signature = callable_with_parameter(&mut c, &args, ret, 9, source) }
     }
     while c.world.param_names.len > saved_names { _ := c.world.param_names.pop() }
     c.body.cursor = saved_cursor; c.types.self_type = saved_self
@@ -927,8 +994,114 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
 fn valid_trait_target(c: &Session, ty: i32) -> bool {
     if ty < 1 { return false }
     if ty < 13 { return true }
-    kind := c.types.declared.type_kinds[ty]
-    kind == 2 || kind == 3 || kind == 7
+    kind := ft.type_kind(&c.types, ty)
+    kind == 1 || kind == 2 || kind == 3 || kind == 7
+}
+fn trait_display_name(name: string) -> string {
+    prefix := "__dunder_module_prelude_"
+    if name.len >= prefix.len && name[0..prefix.len] == prefix { return name[prefix.len..name.len] }
+    name.clone()
+}
+fn parse_impl_target_at(c: &mut Session, target_tok: i32) -> i32 {
+    if c.world.tokens.kinds[target_tok] == .Name {
+        return type_id(&c, c.world.tokens.texts[target_tok])
+    }
+    saved := c.body.cursor
+    c.body.cursor = target_tok
+    ty := type_name(&mut c)
+    c.body.cursor = saved
+    ty
+}
+fn synthesize_trait_method(c: &mut Session, tid: i32, m: i32, target_ty: i32) -> i32 {
+    saved_cursor := c.body.cursor; saved_self := c.types.self_type
+    c.body.cursor = c.traits.method_sig_starts[m]; c.types.self_type = target_ty
+    sig_end := c.traits.method_sig_ends[m]
+    m_name := c.traits.method_names[m].clone()
+    fn_id := c.world.names.len
+    mut has_self := false; mut self_mut := false
+    mut param_tokens: []i32 = []; mut param_names: []string = []; mut param_types: []i32 = []
+    expect(&mut c, "(")
+    while c.ok && !is(&c, ")") && c.body.cursor < sig_end {
+        param_index := param_types.len
+        consuming := eat(&mut c, "move")
+        if !consuming && eat(&mut c, "&") {
+            is_mut := eat(&mut c, "mut")
+            ptok := c.body.cursor
+            if !eat(&mut c, "self") { fail(&mut c, "expected 'self' after '&' in trait method receiver"); break }
+            if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
+            has_self = true
+            mut ref_kind := 4; if is_mut { ref_kind = 5 }
+            mode := compound(&mut c, ref_kind, target_ty)
+            param_tokens.push(ptok); param_names.push("self"); param_types.push(mode)
+        } else {
+            is_mut := eat(&mut c, "mut")
+            if is_mut && !is(&c, "self") { fail(&mut c, "expected 'self' after 'mut' in trait method receiver"); break }
+            if is(&c, "self") {
+                ptok := c.body.cursor; parameter := advance(&mut c)
+                if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
+                has_self = true; self_mut = is_mut
+                mut mode := parameter_mode(&mut c, target_ty, true, false)
+                if eat(&mut c, ":") {
+                    if is_mut { fail(&mut c, "cannot combine 'mut self' with an explicit ': Type'"); break }
+                    pt := type_name_in_trait(&mut c, false, sig_end)
+                if pt < 0 { fail(&mut c, "unresolved type in synthesized trait method"); break }
+                    if pt == target_ty { mode = parameter_mode(&mut c, pt, true, false) }
+                    else if (ft.type_kind(&c.types, pt) == 4 || ft.type_kind(&c.types, pt) == 5) && ft.type_base(&c.types, pt) == target_ty {
+                        if consuming { fail(&mut c, "move argument requires a consuming parameter"); break }
+                        mode = parameter_mode(&mut c, pt, false, false)
+                    } else { fail(&mut c, "self parameter must have type Self, &Self or &mut Self"); break }
+                }
+                param_tokens.push(ptok); param_names.push(move parameter); param_types.push(mode)
+            } else {
+                if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected parameter name in trait method"); break }
+                ptok := c.body.cursor; pname := advance(&mut c); expect(&mut c, ":"); pt := type_name_in_trait(&mut c, false, sig_end)
+                if pt < 0 { fail(&mut c, "unresolved type in synthesized trait method"); break }
+                mode := parameter_mode(&mut c, pt, consuming, false)
+                param_tokens.push(ptok); param_names.push(move pname); param_types.push(mode)
+            }
+        }
+        if !eat(&mut c, ",") { break }
+    }
+    if c.ok { expect(&mut c, ")") }
+    mut ret := 0
+    if c.ok && eat(&mut c, "->") {
+        ret = type_name_in_trait(&mut c, false, sig_end)
+        if ret < 0 { fail(&mut c, "unresolved return type in synthesized trait method") }
+    }
+    mut signature := 0
+    if c.ok {
+        if c.body.cursor != sig_end { fail(&mut c, "unexpected token in trait method signature") }
+        first := c.world.param_names.len
+        for i in 0..param_names.len {
+            c.world.param_tokens.push(param_tokens[i])
+            c.world.param_names.push(param_names[i].clone())
+            c.world.param_types.push(param_types[i])
+        }
+        source := result_parameter(&mut c, &param_types, ret, first)
+        signature = callable_with_parameter(&mut c, &param_types, ret, 9, source)
+        if c.ok {
+            c.world.function_owners.push(c.traits.owners[tid])
+            c.world.test_functions.push(false)
+            c.world.libraries.push(""); c.world.symbols.push("")
+            c.world.unsafe_functions.push(false)
+            c.world.impl_types.push(target_ty)
+            c.world.impl_public.push(c.traits.public[tid])
+            c.world.impl_has_self.push(has_self)
+            c.world.impl_self_mut.push(self_mut)
+            c.world.impl_names.push(m_name.clone())
+            c.world.requires_caps.push(0)
+            c.world.names.push(ft.type_spelling(&c.types, target_ty) + "::" + m_name)
+            c.world.param_starts.push(first)
+            c.world.param_counts.push(param_types.len)
+            c.world.returns.push(ret)
+            c.world.ffi_types.push(signature)
+            c.world.starts.push(c.traits.method_body_starts[m])
+            c.world.ends.push(c.traits.method_body_ends[m])
+        }
+    }
+    c.body.cursor = saved_cursor; c.types.self_type = saved_self
+    if !c.ok { return -1 }
+    fn_id
 }
 fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
     tid := c.traits.impl_trait_ids[k]
@@ -958,6 +1131,12 @@ fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
         }
         c.traits.impl_active[k] = true; return true
     }
+    if tid == traits.clone_id() || tid == traits.copy_id() {
+        c.ok = false
+        c.error = "'" + c.traits.names[tid] + "' is a structural built-in trait and cannot be manually implemented"
+        c.error_at = site
+        return false
+    }
     if !traits.record_conformance(&mut c.traits, tid, target_ty, k) {
         c.ok = false; c.error = "duplicate implementation of trait for '" + ft.type_spelling(&c.types, target_ty) + "'"; c.error_at = site; return false
     }
@@ -971,9 +1150,10 @@ fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
     }
     // Check all required trait methods are present with exact matching signature
     m_start := c.traits.method_starts[tid]; m_count := c.traits.method_counts[tid]
+    mut synth_fns: []i32 = []
     for m in m_start..m_start + m_count {
         req_name := c.traits.method_names[m].clone()
-        expected := parse_trait_method_sig(&mut c, c.traits.method_sig_starts[m], c.traits.method_sig_ends[m], target_ty)
+        expected := parse_trait_method_sig(&mut c, c.traits.method_sig_starts[m], c.traits.method_sig_ends[m], target_ty, false)
         if !c.ok { return false }
         mut found := -1
         for i in fn_start..fn_start + fn_count {
@@ -981,11 +1161,18 @@ fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
             if c.world.impl_names[f] == req_name { found = f; break }
         }
         if found < 0 {
+            if c.traits.method_body_starts[m] >= 0 {
+                synth := synthesize_trait_method(&mut c, tid, m, target_ty)
+                if synth < 0 { return false }
+                synth_fns.push(synth)
+                continue
+            }
             c.ok = false; c.error = "missing trait method '" + req_name + "' in implementation for '" + ft.type_spelling(&c.types, target_ty) + "'"
             c.error_at = site; return false
         }
-        if c.world.impl_has_self[found] != expected.has_self || c.world.ffi_types[found] != expected.signature {
-            c.ok = false; c.error = "trait method '" + req_name + "' signature does not match trait requirement " + ft.type_spelling(&c.types, expected.signature)
+        if expected.signature < 0 || c.world.impl_has_self[found] != expected.has_self || c.world.ffi_types[found] != expected.signature {
+            exp_text := if expected.signature >= 0 { ft.type_spelling(&c.types, expected.signature) } else { "trait requirement" }
+            c.ok = false; c.error = "trait method '" + req_name + "' signature does not match trait requirement " + exp_text
             c.error_at = site; return false
         }
     }
@@ -998,12 +1185,18 @@ fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
             c.ok = false; c.error = "duplicate method '" + m_name + "' on type"; c.error_at = site; return false
         }
     }
+    for f in &synth_fns {
+        m_name := c.world.impl_names[f].clone()
+        if !fc.put_method(&mut c.world, target_ty, m_name, f) {
+            c.ok = false; c.error = "duplicate method '" + m_name + "' on type"; c.error_at = site; return false
+        }
+    }
     c.traits.impl_active[k] = true
     true
 }
 fn resolve_traits(c: &mut Session) {
     // 1. Validate user trait definitions: supertraits, cycles, method signatures
-    for tid in 2..c.traits.names.len {
+    for tid in traits.builtin_count()..c.traits.names.len {
         if !c.ok { return }
         s_start := c.traits.super_starts[tid]; s_count := c.traits.super_counts[tid]
         for s in s_start..s_start + s_count {
@@ -1016,11 +1209,11 @@ fn resolve_traits(c: &mut Session) {
     }
     cycle := traits.has_super_cycle(&c.traits)
     if cycle >= 0 { c.ok = false; c.error = "cyclic trait supertrait inheritance"; c.error_at = c.traits.sites[cycle]; return }
-    for tid in 2..c.traits.names.len {
+    for tid in traits.builtin_count()..c.traits.names.len {
         if !c.ok { return }
         m_start := c.traits.method_starts[tid]; m_count := c.traits.method_counts[tid]
         for m in m_start..m_start + m_count {
-            _ := parse_trait_method_sig(&mut c, c.traits.method_sig_starts[m], c.traits.method_sig_ends[m], 1)
+            _ := parse_trait_method_sig(&mut c, c.traits.method_sig_starts[m], c.traits.method_sig_ends[m], 1, true)
             if !c.ok { return }
         }
     }
@@ -1030,10 +1223,11 @@ fn resolve_traits(c: &mut Session) {
         tname := c.traits.impl_trait_names[k].clone()
         tid := traits.lookup(&c.traits, tname)
         site := c.traits.impl_sites[k]
-        if tid < 0 { c.ok = false; c.error = "unknown trait '" + tname + "'"; c.error_at = site; return }
+        if tid < 0 { c.ok = false; c.error = "unknown trait '" + trait_display_name(tname) + "'"; c.error_at = site; return }
         target_tok := c.traits.impl_target_tokens[k]
         target_name := c.world.tokens.texts[target_tok].clone()
-        target_ty := type_id(&c, target_name)
+        target_ty := parse_impl_target_at(&mut c, target_tok)
+        if !c.ok { return }
         if !valid_trait_target(&c, target_ty) {
             c.ok = false; c.error = "invalid trait implementation target '" + target_name + "'"; c.error_at = c.world.tokens.starts[target_tok]; return
         }
@@ -1093,6 +1287,15 @@ fn resolve_traits(c: &mut Session) {
             }
         }
     }
+    // Mark methods of inactive conditional impls so dead-code checking ignores them.
+    for k in 0..c.traits.impl_trait_names.len {
+        if !c.traits.impl_active[k] {
+            fn_start := c.traits.impl_fn_starts[k]; fn_count := c.traits.impl_fn_counts[k]
+            for i in fn_start..fn_start + fn_count {
+                c.world.impl_types[c.traits.impl_fns[i]] = -2
+            }
+        }
+    }
     // 5. Verify Sendable proofs and supertraits on all activated trait impls
     final_sendable := traits.compute_sendable(&c.types)
     if !traits.apply_sendable(&mut c.traits, move final_sendable) { c.ok = false; c.error = "internal Sendable metadata failure"; return }
@@ -1109,12 +1312,12 @@ fn resolve_traits(c: &mut Session) {
             }
             continue
         }
-        if tid < 2 { continue }
+        if traits.is_builtin(tid) { continue }
         s_start := c.traits.super_starts[tid]; s_count := c.traits.super_counts[tid]
         for s in s_start..s_start + s_count {
             sup := c.traits.super_ids[s]
             if !traits.satisfies(&c.traits, &c.types, sup, target_ty) {
-                c.ok = false; c.error = "trait implementation for '" + ft.type_spelling(&c.types, target_ty) + "' requires supertrait '" + c.traits.names[sup] + "'"
+                c.ok = false; c.error = "trait implementation for '" + ft.type_spelling(&c.types, target_ty) + "' requires supertrait '" + trait_display_name(c.traits.names[sup].clone()) + "'"
                 c.error_at = c.traits.impl_sites[k]; return
             }
         }
@@ -1238,17 +1441,25 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
                 sig_start := c.body.cursor
                 if !is(&c, "(") { fail(&mut c, "expected '(' in trait method signature"); break }
                 mut parens := 0; mut brackets := 0
+                mut body_start := -1; mut body_end := -1
                 while c.ok && c.body.cursor < block_end {
                     if parens == 0 && brackets == 0 {
                         if lexer.is_newline(c.world.tokens.kinds[c.body.cursor]) || is(&c, ";") || is(&c, "}") { break }
-                        if is(&c, "{") { fail(&mut c, "trait method declarations cannot have a body"); break }
+                        if is(&c, "{") {
+                            body_start = c.body.cursor + 1
+                            body_end = c.world.closes[c.body.cursor]
+                            if body_end < 0 || body_end >= block_end { fail(&mut c, "unterminated default trait method body"); break }
+                            break
+                        }
                     }
                     if is(&c, "(") { parens = parens + 1 } else if is(&c, ")") { parens = parens - 1 }
                     else if is(&c, "[") { brackets = brackets + 1 } else if is(&c, "]") { brackets = brackets - 1 }
                     skip_token(&mut c)
                 }
                 if !c.ok { break }
-                traits.add_method(&mut c.traits, tid, move m_name, sig_start, c.body.cursor, c.world.tokens.starts[m_tok])
+                sig_end := c.body.cursor
+                traits.add_method(&mut c.traits, tid, move m_name, sig_start, sig_end, body_start, body_end, c.world.tokens.starts[m_tok])
+                if body_start >= 0 { c.body.cursor = body_end + 1 }
                 separators(&mut c)
             }
             if c.ok { expect(&mut c, "}"); separators(&mut c) }
@@ -1269,8 +1480,15 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             if eat(&mut c, "for") {
                 newlines(&mut c)
                 target_tok = c.body.cursor
-                if c.world.tokens.kinds[target_tok] != .Name { fail(&mut c, "expected target type after 'for'"); break }
-                target_name = advance(&mut c)
+                if is(&c, "[") || is(&c, "(") {
+                    t_end := syntax.type_end(&c.world.tokens, target_tok, c.world.tokens.kinds.len - 1)
+                    if t_end <= target_tok { fail(&mut c, "expected target type after 'for'"); break }
+                    target_name = c.world.tokens.texts[target_tok].clone()
+                    c.body.cursor = t_end
+                } else {
+                    if c.world.tokens.kinds[target_tok] != .Name { fail(&mut c, "expected target type after 'for'"); break }
+                    target_name = advance(&mut c)
+                }
                 mut cond_idx := -1
                 ci := &c.specializations.conditional_impls
                 for idx in 0..ci.impl_types.len {
@@ -1385,7 +1603,8 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         if target_tok < 0 { continue }
         f := declaration_fns[d]
         target_name := c.world.tokens.texts[target_tok].clone()
-        target_ty := type_id(&c, target_name)
+        target_ty := parse_impl_target_at(&mut c, target_tok)
+        if !c.ok { break }
         if declaration_trait_impls[d] >= 0 {
             if !valid_trait_target(&c, target_ty) {
                 c.body.cursor = target_tok
@@ -1545,12 +1764,16 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         name := c.specializations.requirements.trait_names[i].clone()
         receiver := c.specializations.requirements.trait_receivers[i]
         tid := traits.lookup(&c.traits, name)
-        if tid < 0 { c.error = "unknown trait '" + name + "' required by generic declaration" }
+        if tid < 0 { c.error = "unknown trait '" + trait_display_name(name) + "' required by generic declaration" }
         else if !traits.satisfies(&c.traits, &c.types, tid, receiver) {
             if tid == traits.sendable_id() {
                 c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' does not satisfy Sendable (" + traits.sendable_reason(&c.traits, receiver) + ")"
+            } else if tid == traits.clone_id() {
+                c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' is a resource or non-cloneable type"
+            } else if tid == traits.copy_id() {
+                c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' is move-only and does not satisfy Copy"
             } else {
-                c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' does not implement required trait"
+                c.error = "type '" + ft.type_spelling(&c.types, receiver) + "' does not implement required trait '" + trait_display_name(name) + "'"
             }
         }
         if c.error != "" { c.ok = false; c.error_at = c.specializations.requirements.trait_sites[i] }
@@ -2136,16 +2359,46 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         task_effect(&mut c, 256)
         value := expression(&mut c, 0, 0, &catalog, &mut inline_work, &mut model); expect(&mut c, ")")
         ty := read_scalar_result(&mut c, value, token)
-        if c.code.platform == 3 {
-            if ty < 1 || ty > 12 { fail(&mut c, "print requires a scalar value"); return 0 }
-            arm.intrinsic_call(&mut c.code, -1, .Print, ty, 0, source); return 0
+        if ty >= 1 && ty <= 12 {
+            if c.code.platform == 3 {
+                arm.intrinsic_call(&mut c.code, -1, .Print, ty, 0, source); return 0
+            }
+            mut target := c.print_int; mut input := ty
+            if ty == 3 { target = c.print_bool } else if ty == 4 { target = c.print_text }
+            else if floats.has(ty) { format_float(&mut c, ty, source); input = 4; saved_float := temporary(&mut c, 4); target = c.print_text }
+            else if ty == 5 { arm.intrinsic_call(&mut c.code, c.runtime.string_rune, .Format, ty, 4, source); input = 4; saved_rune := temporary(&mut c, 4); target = c.print_text }
+            arm.intrinsic_call(&mut c.code, target, .Print, input, 0, source); return 0
         }
-        mut target := c.print_int; mut input := ty
-        if ty == 3 { target = c.print_bool } else if ty == 4 { target = c.print_text }
-        else if floats.has(ty) { format_float(&mut c, ty, source); input = 4; saved_float := temporary(&mut c, 4); target = c.print_text }
-        else if ty == 5 { arm.intrinsic_call(&mut c.code, c.runtime.string_rune, .Format, ty, 4, source); input = 4; saved_rune := temporary(&mut c, 4); target = c.print_text }
-        else if ty != 1 && ty != 2 && ty != 5 && !unsigned.has(ty) { fail(&mut c, "print requires a scalar value") }
-        arm.intrinsic_call(&mut c.code, target, .Print, input, 0, source); return 0
+        mut val_ty := ty
+        ref_arg := ft.type_kind(&c.types, ty) == 4
+        if ref_arg { val_ty = ft.type_base(&c.types, ty) }
+        display_tid := traits.lookup(&c.traits, "__dunder_module_prelude_Display")
+        if display_tid < 0 || !traits.satisfies(&c.traits, &c.types, display_tid, val_ty) {
+            fail(&mut c, "print requires a scalar value or Display implementation")
+            c.error_at = source; return 0
+        }
+        str_fn := impl_method(&c, val_ty, "str")
+        if str_fn < 0 {
+            fail(&mut c, "print requires a scalar value or Display implementation")
+            c.error_at = source; return 0
+        }
+        if !check_impl_access(&mut c, str_fn, token) { return 0 }
+        if !ref_arg { read_argument(&mut c, val_ty, token) }
+        if c.loans.active {
+            forward_argument_loan(&mut c, c.body.loan.origin, c.body.loan.constrained, str_fn, c.world.ffi_types[str_fn], 0, source)
+        }
+        recv_slot := alloc_arg_slot(&mut c); arm.store(&mut c.code, recv_slot, 0)
+        args: []i32 = [recv_slot]
+        c.body.facts.needed.push(str_fn)
+        task_edge(&mut c, str_fn)
+        source_call.lower(&mut c.code, c.fn_labels[str_fn], -1, -1, &args, c.world.ffi_types[str_fn], 4, source)
+        release_arg_slots(&mut c, &args)
+        _ := temporary(&mut c, 4)
+        fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
+        if c.code.platform == 3 {
+            arm.intrinsic_call(&mut c.code, -1, .Print, 4, 0, source); return 0
+        }
+        arm.intrinsic_call(&mut c.code, c.print_text, .Print, 4, 0, source); return 0
     }
     if name == "assert" {
         call_at := c.body.cursor - 2; first := c.body.cursor; covered = true
@@ -2583,8 +2836,10 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             expect(&mut c, "]"); c.body.place.taking_address = previous_address; arm.pop_temp(&mut c.code, 1)
             mut index := -1
             if place != 0 && ty != 4 && ft.type_base(&c.types, ty) >= 0 {
-                kind := ft.type_kind(&c.types, ft.type_base(&c.types, ty))
-                if c.body.place.taking_address || kind == 1 || kind == 2 || kind == 3 || kind == 6 || kind == 7 { index = slot(&mut c) }
+                base_ty := ft.type_base(&c.types, ty)
+                kind := ft.type_kind(&c.types, base_ty)
+                after_dot := is(&c, ".") || (c.world.tokens.kinds[c.body.cursor] == .GroupedNewline && c.world.tokens.texts[c.body.cursor + 1] == ".")
+                if c.body.place.taking_address || after_dot || base_ty == 4 || kind == 1 || kind == 2 || kind == 3 || kind == 6 || kind == 7 { index = slot(&mut c) }
             }
             indexed := index_place(&mut c, place, ty, packed, index, subscript_at)
             if indexed == 0 { fail(&mut c, "index requires an array or string"); return 0 }
@@ -2609,14 +2864,20 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             }
             if is(&c, "(") && !callable_field {
                 c.body.expr.move_projection = projection_address; c.body.expr.move_temporary = temporary_root
-                impl_fn := impl_method(&c, ty, name)
+                prim_str := name == "str" && ty >= 1 && ty <= 12
+                impl_fn := if prim_str { -1 } else { impl_method(&c, ty, name) }
                 mut result := 0
                 if impl_fn >= 0 {
                     result = method_impl(&mut c, impl_fn, ty, place, materialized, pending, at, temporary_root, projection_address, &catalog, &mut inline_work, &mut model)
                     pending = false
                 } else {
-                    if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
-                    result = method(&mut c, ty, name, place, at, &catalog, &mut inline_work, &mut model)
+                    dummy := demand_compound_method(&mut c, ty, name)
+                    if dummy >= 0 {
+                        skip_balanced_parens(&mut c); result = dummy; pending = false
+                    } else {
+                        if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
+                        result = method(&mut c, ty, name, place, at, &catalog, &mut inline_work, &mut model)
+                    }
                 }
                 if c.body.stream_kind >= 10 { ty = result }
                 else { place = 0; ty = call_result(&mut c, result); temporary_root = c.body.expr.owner; projection_address = -1; fc.clear_rvalue_place(&mut c.body.place) }
@@ -3985,6 +4246,41 @@ fn immediate_div_rem_rhs(c: &mut Session, ty: i32, priority: i32, operator: stri
     }
     false
 }
+fn skip_balanced_parens(c: &mut Session) {
+    expect(&mut c, "(")
+    mut parens := 1
+    while c.ok && parens > 0 && c.body.cursor < c.world.tokens.kinds.len {
+        if c.world.tokens.kinds[c.body.cursor] == .End { fail(&mut c, "expected ')'"); return }
+        if is(&c, "(") { parens += 1 }
+        else if is(&c, ")") { parens -= 1 }
+        skip_token(&mut c)
+    }
+}
+fn demand_compound_method(c: &mut Session, ty: i32, name: string) -> i32 {
+    if !c.discovering_compounds || !bundled.prelude_method(name) { return -1 }
+    if ft.type_kind(&c.types, ty) != 1 && !ft.is_tuple(&c.types, ty) { return -1 }
+    mut dummy := -1
+    if name == "eq" || name == "ne" || name == "lt" || name == "le" || name == "gt" || name == "ge" { dummy = 3 }
+    else if name == "hash" { dummy = 11 }
+    else if name == "cmp" {
+        dummy = resolve_type_name(&c, "__dunder_module_prelude_Ordering")
+        if dummy < 0 { return -1 }
+    } else if name == "str" { dummy = 4 }
+    else if name == "default" { dummy = ty }
+    else { return -1 }
+    canonical := ft.canonical_spelling(&c.types, ty)
+    if c.known_compounds.contains(canonical) { return -1 }
+    c.demanded_compounds.put(move canonical, 1)
+    dummy
+}
+fn is_builtin_comparison(c: &Session, ty: i32, opcode: i32) -> bool {
+    if opcode < 6 || opcode > 11 { return false }
+    if ty == 1 || ty == 2 || ty == 4 || ty == 5 || floats.has(ty) || unsigned.has(ty) { return true }
+    if opcode == 6 || opcode == 7 {
+        return ty == 3 || ty == 13 || ft.type_kind(&c.types, ty) == 3
+    }
+    false
+}
 fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     c.body.depth = c.body.depth + 1
     if c.body.depth > 128 { fail(&mut c, "expression nesting exceeds 128"); c.body.depth = c.body.depth - 1; return 0 }
@@ -4006,8 +4302,83 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
         priority := rules.priority(opcode)
         if priority == 0 || priority < minimum { break }
         operator := c.world.tokens.texts[op_at].clone(); left_node := model.value
+        lhs_place := place; lhs_at := if at >= 0 { at } else { first_token }
         place = 0; skip_token(&mut c); newlines(&mut c)
         observe := c.body.assert_operands.first == first_token && minimum == 0 && opcode >= 6 && opcode <= 11
+        if opcode >= 6 && opcode <= 11 && !is_builtin_comparison(&c, ty, opcode) {
+            mut val_ty := ty
+            lhs_is_ref := ft.type_kind(&c.types, ty) == 4
+            if lhs_is_ref { val_ty = ft.type_base(&c.types, ty) }
+            is_eq := opcode == 6 || opcode == 7
+            trait_sym := if is_eq { "__dunder_module_prelude_Eq" } else { "__dunder_module_prelude_Ord" }
+            method_name := if opcode == 6 { "eq" } else if opcode == 7 { "ne" } else if opcode == 8 { "lt" } else if opcode == 9 { "le" } else if opcode == 10 { "gt" } else { "ge" }
+            tid := traits.lookup(&c.traits, trait_sym)
+            has_trait := tid >= 0 && traits.satisfies(&c.traits, &c.types, tid, val_ty)
+            if !has_trait && c.discovering_compounds && (ft.type_kind(&c.types, val_ty) == 1 || ft.is_tuple(&c.types, val_ty)) {
+                canonical := ft.canonical_spelling(&c.types, val_ty)
+                if !c.known_compounds.contains(canonical) {
+                    c.demanded_compounds.put(move canonical, 1)
+                    _ := expression(&mut c, priority + 1, val_ty, &catalog, &mut inline_work, &mut model)
+                    model.recording = false; ty = 3
+                    fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
+                    continue
+                }
+            }
+            if !has_trait {
+                fail(&mut c, "type '" + type_spelling(&c, val_ty) + "' does not implement " + (if is_eq { "Eq" } else { "Ord" }))
+                c.error_at = c.world.tokens.starts[op_at]; break
+            }
+            m_fn := impl_method(&c, val_ty, method_name)
+            if m_fn < 0 {
+                fail(&mut c, "unknown method '" + method_name + "' on type '" + type_spelling(&c, val_ty) + "'")
+                c.error_at = c.world.tokens.starts[op_at]; break
+            }
+            if !check_impl_access(&mut c, m_fn, op_at) { break }
+            may_invalidate_operand(&mut c)
+            if !lhs_is_ref {
+                c.body.places.current = lhs_place; c.body.places.source = lhs_at
+                read_argument(&mut c, val_ty, lhs_at)
+            }
+            mut lhs_root := source_root(&c, lhs_place); mut lhs_path := owner_path(&c, lhs_place)
+            if c.body.loan.root >= 0 { lhs_root = c.body.loan.root; lhs_path = c.body.loan.path }
+            lhs_origin := c.body.loan.origin; lhs_constrained := c.body.loan.constrained
+            lhs_slot := alloc_arg_slot(&mut c); arm.store(&mut c.code, lhs_slot, 0)
+            lhs_effects := c.body.mutations.len
+            previous_address := c.body.place.taking_address; c.body.place.taking_address = true
+            rhs_first := c.body.cursor
+            right := expression(&mut c, priority + 1, val_ty, &catalog, &mut inline_work, &mut model)
+            c.body.place.taking_address = previous_address
+            rhs_is_ref := ft.type_kind(&c.types, right) == 4 && ft.type_base(&c.types, right) == val_ty
+            if !rhs_is_ref {
+                same(&mut c, val_ty, right); if !c.ok { release_arg_slots(&mut c, &[lhs_slot]); break }
+                read_argument(&mut c, val_ty, rhs_first)
+            }
+            mut rhs_root := source_root(&c, c.body.places.current); mut rhs_path := owner_path(&c, c.body.places.current)
+            if c.body.loan.root >= 0 { rhs_root = c.body.loan.root; rhs_path = c.body.loan.path }
+            rhs_origin := c.body.loan.origin; rhs_constrained := c.body.loan.constrained
+            rhs_slot := alloc_arg_slot(&mut c); arm.store(&mut c.code, rhs_slot, 0)
+            args: []i32 = [lhs_slot, rhs_slot]
+            if lhs_root >= 0 && !ownership.available(&c.body.ownership, lhs_path) {
+                fail(&mut c, "cannot move a value while it is borrowed by another argument")
+                c.error_at = c.world.tokens.starts[lhs_at]; release_arg_slots(&mut c, &args); break
+            }
+            if lhs_root >= 0 && borrows.changed(&c.body.mutations, lhs_effects, c.body.mutations.len, lhs_root) {
+                fail(&mut c, "cannot mutate a value while it is borrowed by another argument")
+                c.error_at = c.world.tokens.starts[lhs_at]; release_arg_slots(&mut c, &args); break
+            }
+            if c.loans.active {
+                sig := c.world.ffi_types[m_fn]
+                forward_argument_loan(&mut c, lhs_origin, lhs_constrained, m_fn, sig, 0, c.world.tokens.starts[lhs_at])
+                forward_argument_loan(&mut c, rhs_origin, rhs_constrained, m_fn, sig, 1, c.world.tokens.starts[rhs_first])
+            }
+            c.body.facts.needed.push(m_fn)
+            task_edge(&mut c, m_fn)
+            source_call.lower(&mut c.code, c.fn_labels[m_fn], -1, -1, &args, c.world.ffi_types[m_fn], 3, c.world.tokens.starts[op_at])
+            release_arg_slots(&mut c, &args)
+            fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
+            ty = 3; model.recording = false
+            continue
+        }
         if !observe && !model.recording && signed_immediate_rhs(&mut c, ty, priority, operator) {
             if priority != 5 { ty = 3 }
             continue
@@ -4372,6 +4743,8 @@ fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &m
             child := match_pattern(&mut c, &mut patterns, &mut bindings, pt, payload, (i + 1) * 8, next, depth + 1)
         }
         expect(&mut c, ")")
+    } else if ft.is_result(&c.types, ty) && eat(&mut c, "(") {
+        expect(&mut c, "_"); expect(&mut c, ")")
     }
     coverage.close(&mut patterns, root)
     root
@@ -5025,6 +5398,7 @@ pub fn new_session() -> Session {
         closure_header: -1, closure_drop: -1, boxed_signatures: [], types: ft.new_registry(), helper_labels: [], array_helpers: -1,
         task_iso_labels: [], task_shared_rc_labels: [], task_shared_prepare_labels: [], task_shared_drop_labels: [],
         ok: true, error: "", error_at: 0, specializations: generics.layout(), traits: traits.new(),
+        discovering_compounds: false, known_compounds: Map<string, i64>::new(), demanded_compounds: Map<string, i64>::new(),
         validating_dead: false, validated_through: -1, report: report, bindings: bindings(),
         wasm_abi: wa.new(), imports: imports(), callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], loans: scratch.loans(),
@@ -5048,6 +5422,7 @@ pub fn freeze_validation_world(c: &Session, declarations: &[]i32) -> frozen.Worl
     libraries := frozen.intern_list(&mut s, &mut index, &c.world.libraries)
     symbols := frozen.intern_list(&mut s, &mut index, &c.world.symbols)
     impl_names := frozen.intern_list(&mut s, &mut index, &c.world.impl_names)
+    trait_names := frozen.intern_list(&mut s, &mut index, &c.traits.names)
     types := frozen.pack_types(&mut s, &mut index, &c.types)
     tokens := frozen.pack_bodies(&mut s, &mut index, &declarations, &c.world.tokens, &c.world.starts, &c.world.ends, &c.world.closes)
     mut offsets: []i32 = []; offsets.reserve(c.world.param_tokens.len)
@@ -5062,7 +5437,8 @@ pub fn freeze_validation_world(c: &Session, declarations: &[]i32) -> frozen.Worl
         module_caps: c.world.module_caps.clone(),
         source_end: c.world.source_end,
         unsafe_capable: c.world.unsafe_capable, tasks: c.tasks.program, loans: c.loans.active, report: c.report,
-        globals: c.jobs.globals, fn_labels: c.fn_labels.clone(), spawners: c.tasks.spawners.clone() }
+        globals: c.jobs.globals, fn_labels: c.fn_labels.clone(), spawners: c.tasks.spawners.clone(),
+        trait_names: trait_names, conformance_traits: c.traits.conformance_traits.clone(), conformance_types: c.traits.conformance_types.clone() }
 }
 pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
     mut cache: []string = []; cache.reserve(src.spellings.starts.len - 1)
@@ -5072,6 +5448,9 @@ pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
     c.world.libraries = frozen.read_list(&src.spellings, &mut cache, &src.libraries)
     c.world.symbols = frozen.read_list(&src.spellings, &mut cache, &src.symbols)
     c.world.impl_names = frozen.read_list(&src.spellings, &mut cache, &src.impl_names)
+    tnames := frozen.read_list(&src.spellings, &mut cache, &src.trait_names)
+    for id in traits.builtin_count()..tnames.len { _ := traits.add_trait(&mut c.traits, tnames[id].clone(), -1, true, 0) }
+    for i in 0..src.conformance_traits.len { _ := traits.record_conformance(&mut c.traits, src.conformance_traits[i], src.conformance_types[i], -1) }
     c.world.impl_types = src.impl_types.clone(); c.world.impl_public = src.impl_public.clone()
     c.world.impl_has_self = src.impl_has_self.clone(); c.world.impl_self_mut = src.impl_self_mut.clone()
     c.world.requires_caps = src.requires_caps.clone(); c.world.module_caps = src.module_caps.clone()
@@ -5210,17 +5589,29 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
         base := c.types.clone()
         mut demand := demands()
         mut definitions := program.checks.len() > 0
+        mut initial_probe := program.has_compound_ops
         while c.ok {
-            c.specializations = generics.materialize(&program, &mut tokens, &mut c.types, platform, &demand.methods, definitions)
+            c.specializations = generics.materialize(&program, &mut tokens, &mut c.types, platform, &demand.methods, &demand.compounds, definitions)
             if !tokens.ok { return session_fail_at(&mut c, tokens.error, tokens.error_at) }
-            if !definitions && c.specializations.pending.len() == 0 { break }
+            if !definitions && !initial_probe && c.specializations.pending.len() == 0 { break }
+            if !definitions { initial_probe = false }
             mut probe := new_session()
             probe.world.tokens = tokens.clone(); probe.types = c.types.clone(); probe.specializations = c.specializations.clone()
             probe.world.module_caps = c.world.module_caps.clone(); probe.sources = c.sources.clone()
+            probe.discovering_compounds = !definitions
+            probe.known_compounds = demand.compounds.clone()
             count := demand.methods.len()
+            comp_count := demand.compounds.len()
             checked := discover(&mut probe, platform, &module_starts, &module_files, source_end, &mut demand)
             if !checked.ok { return session_fail_at(&mut c, checked.error, checked.offset) }
-            if count == demand.methods.len() {
+            for ci in 0..probe.demanded_compounds.len() {
+                demand.compounds.put(probe.demanded_compounds.key_at(ci).clone(), 1)
+            }
+            if comp_count != demand.compounds.len() {
+                demand.checked_live.clear()
+                demand.checked_dead.clear()
+            }
+            if count == demand.methods.len() && comp_count == demand.compounds.len() {
                 if !definitions { break }
                 definitions = false; demand = demands()
             }
@@ -5231,9 +5622,9 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
     begin_concrete(&mut c, platform, &module_starts, &module_files, source_end, check_all, report, directory, identity, &config,
         &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes)
 }
-struct Demands { methods: Map<string, i64>, live: Map<string, i64>, dead: Map<string, i64>, checked_live: Map<string, i64>, checked_dead: Map<string, i64> }
+struct Demands { methods: Map<string, i64>, compounds: Map<string, i64>, live: Map<string, i64>, dead: Map<string, i64>, checked_live: Map<string, i64>, checked_dead: Map<string, i64> }
 fn demands() -> Demands {
-    Demands { methods:Map<string, i64>::new(), live:Map<string, i64>::new(), dead:Map<string, i64>::new(), checked_live:Map<string, i64>::new(), checked_dead:Map<string, i64>::new() }
+    Demands { methods:Map<string, i64>::new(), compounds:Map<string, i64>::new(), live:Map<string, i64>::new(), dead:Map<string, i64>::new(), checked_live:Map<string, i64>::new(), checked_dead:Map<string, i64>::new() }
 }
 fn discover(c: &mut Session, platform: i32, module_starts: &[]i32, module_files: &[]i32, source_end: i32, demand: &mut Demands) -> Result {
     mut config := configuration(); config.scalar_enabled = false
@@ -5251,7 +5642,7 @@ fn discover(c: &mut Session, platform: i32, module_starts: &[]i32, module_files:
         if dead { c.code.platform = 0 }
         for f in 0..c.world.names.len {
             name := &c.world.names[f]
-            if c.specializations.definition_checks.contains(name) || demand.live.contains(name) || (dead && (demand.dead.contains(name) || c.specializations.function_instances[f] < 0)) { c.needed[f] = true }
+            if c.specializations.definition_checks.contains(name) || demand.live.contains(name) || (dead && (demand.dead.contains(name) || c.specializations.function_instances[f] == -1)) { c.needed[f] = true }
         }
         mut more := true
         while more {
@@ -5299,6 +5690,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     if !c.world.tokens.ok { return session_fail_at(&mut c, c.world.tokens.error.clone(), c.world.tokens.error_at) }
     mut uses_float := false
     for i in 0..c.world.tokens.kinds.len {
+        if generics.generated(&c.specializations, c.world.tokens.starts[i]) { continue }
         if c.world.tokens.kinds[i] == .Float || (c.world.tokens.kinds[i] == .Name && (c.world.tokens.texts[i] == "f32" || c.world.tokens.texts[i] == "f64")) { uses_float = true; break }
     }
     if uses_float && c.world.tokens.ok {
@@ -5370,10 +5762,13 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     for f in 0..c.world.names.len {
         label := arm.label(&mut c.code)
         receiver := c.world.impl_types[f]
-        name := if receiver >= 0 { ft.declared_name(&c.types, receiver) } else { c.world.names[f].clone() }
-        site := i32(c.specializations.instance_ids.get_or(name, -1))
+        name := if receiver >= 0 { ft.canonical_spelling(&c.types, receiver) } else { c.world.names[f].clone() }
+        mut site := i32(c.specializations.instance_ids.get_or(name, -1))
+        if site < 0 && (receiver == -2 || (c.world.starts[f] > 0 && generics.generated(&c.specializations, c.world.tokens.starts[c.world.starts[f]]))) {
+            site = -2
+        }
         c.specializations.function_instances.push(site)
-        c.fn_labels.push(label); c.needed.push(check_all && main_id < 0 && site < 0)
+        c.fn_labels.push(label); c.needed.push(check_all && main_id < 0 && site == -1)
     }
     if c.closure_header >= 0 { c.closure_drop = arm.label(&mut c.code) }
     bind_type_helpers(&mut c)
@@ -5729,7 +6124,7 @@ pub fn validation_plan(c: &Session, workers: i32) -> []i32 {
     mut tokens: i64 = 0; mut largest: i64 = 0
     for f in (c.validated_through + 1)..c.world.names.len {
         if f == c.jobs.invalid_declaration { break }
-        if !c.jobs.compiled[f] && c.specializations.function_instances[f] < 0 && c.world.libraries[f] == "" && c.jobs.checked_effects[f] < 0 {
+        if !c.jobs.compiled[f] && c.specializations.function_instances[f] == -1 && c.world.libraries[f] == "" && c.jobs.checked_effects[f] < 0 {
             size := i64(c.world.ends[f] - c.world.starts[f] + 2)
             tokens = tokens + size; ids.push(f)
             if size > largest { largest = size }
@@ -5858,7 +6253,7 @@ pub fn snapshot_check_phase2(c: &mut Session) -> []i32 {
     c.code.platform = 0
     mut dead: []i32 = []
     for f in 0..c.world.names.len {
-        if !c.jobs.compiled[f] && c.specializations.function_instances[f] < 0 && c.world.libraries[f] == "" { dead.push(f) }
+        if !c.jobs.compiled[f] && c.specializations.function_instances[f] == -1 && c.world.libraries[f] == "" { dead.push(f) }
     }
     dead
 }
@@ -5872,7 +6267,7 @@ pub fn accept_validation(c: &mut Session, result: &Validation) -> bool {
     if !c.ok || c.jobs.phase != 2 { return false }
     mut f := c.validated_through + 1
     while f < c.world.names.len {
-        if !c.jobs.compiled[f] && c.specializations.function_instances[f] < 0 && c.world.libraries[f] == "" {
+        if !c.jobs.compiled[f] && c.specializations.function_instances[f] == -1 && c.world.libraries[f] == "" {
             if c.jobs.checked_effects[f] < 0 { break }
             facts.reset(&mut c.body.facts, 0); c.body.facts.effects = c.jobs.checked_effects[f]; accept_facts(&mut c, f)
         }
@@ -5897,7 +6292,7 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
     c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
     c.imports.globals = 0
     for f in (c.validated_through + 1)..c.world.names.len {
-        if !c.jobs.compiled[f] && c.specializations.function_instances[f] < 0 && c.world.libraries[f] == "" {
+        if !c.jobs.compiled[f] && c.specializations.function_instances[f] == -1 && c.world.libraries[f] == "" {
             compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work)
         }
         if !c.ok { return session_error(&c) }
@@ -5906,7 +6301,7 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
     while more {
         more = false
         for f in 0..c.world.names.len {
-            if c.specializations.function_instances[f] < 0 || !c.needed[f] || c.jobs.compiled[f] { continue }
+            if c.specializations.function_instances[f] == -1 || !c.needed[f] || c.jobs.compiled[f] { continue }
             c.jobs.compiled[f] = true; more = true
             compile_body(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work)
             if !c.ok { return session_error(&c) }

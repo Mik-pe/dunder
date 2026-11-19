@@ -37,14 +37,19 @@ anropskonvention, parameterlägen och returlånets källparameter i identiteten.
 
 Ett typkrav tillhör alla instanser av typen. Krav kan uttryckas med
 namngivna traits (`where T: Trait1 + Trait2` eller `<T: Trait1 + Trait2>`),
-inbyggda markertraits (`Sendable`, `Storable`) eller metodkrav (`T.size: fn(T) -> i32`).
-Exempelvis kräver `Map<K, V>` lagringsbara argument och två publika, säkra
-nyckelmetoder av bestämd typ, och deklarerar villkorligt
+inbyggda strukturella traits (`Sendable`, `Storable`, `Clone`, `Copy`) eller metodkrav (`T.size: fn(T) -> i32`).
+Exempelvis kräver `Map<K, V>` `K: Hash + Storable` och `V: Storable`, och deklarerar villkorligt
 `impl Sendable for Map<K, V> where K: Sendable, V: Sendable {}`.
 Villkorliga traitimplementationer (`impl Trait for Box<T> where T: Trait`)
+inklusive implementationer för sammansatta typer (`impl Eq for []T where T: Eq`,
+`impl Ord for (A, B) where A: Ord, B: Ord`) och standardbibliotekets `impl Encode for []T`
 löses till fixpunkt under deklarationskontrollen och aktiveras bara när
 villkoren uppfylls, så exempelvis `Map<string, MyResource>` fortsätter fungera
 i enkeltrådad kod utan att bli `Sendable`.
+Traitmetoder med standardkropp syntetiseras per aktiv `impl` när metoden inte
+ersätts, och generiska typer i trait-signaturer kan innehålla `Self`
+(exempelvis `Result<Self, string>`). Sammansatta traitinstanser materialiseras
+behovsstyrt från typerna i generiska argument, jämförelseoperatorer och metodanrop.
 För en metod som läser `self.value.len` avgör fälttypen vid metodens
 användning om operationen är giltig. Därför kan en annan metod på
 `Box<i32>` användas även om `i32` saknar `len`.
@@ -52,11 +57,13 @@ Ett uttryckligt krav på en funktion eller ett `impl`-block kontrolleras
 också när funktionen eller en metod i blocket väljs.
 [Samlingarnas kontrakt](standard.md#generiska-samlingar) · [Traits](../tools/test_traits.ddr) · [Körbart exempel](../tests/fixtures/generics/main.ddr)
 
-Standardbibliotekets generiska deklarationer bäddas in från Dunderkällan.
+Standardbibliotekets generiska deklarationer och förladdade traits (`Ordering`,
+`Eq`, `Ord`, `Hash`, `Display`, `Default`) samt deras implementationer för
+primitiver, `Result<T, E>` och sammansatta typer bäddas in från Dunderkällan.
 Operatorn `?` använder identiteten för det exporterade `Result` för att
 hitta dess framgångs- och feltyp. En användardeklarerad enum kan ha
 varianterna `Ok` och `Err` med vanlig enumsemantik.
-[Prelude](../runtime/prelude/result.ddr) · [Inbäddning](../selfhost/embed.ddr)
+[Prelude](../runtime/prelude/result.ddr) · [Traits-preludium](../runtime/prelude/traits.ddr) · [Inbäddning](../selfhost/embed.ddr)
 
 ## Från instans till körbar kod
 
