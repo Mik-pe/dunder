@@ -27,7 +27,7 @@ skrivning under ett aktivt kolumnlån.
 
 [Automatisk stängning](memory.md#automatisk-stängning) kan deklareras med
 `@resource(dispose)`. Den följer ägaren genom flytt och körs synkront när
-ägaren släpps. TCP-handtagen och `StreamSet` använder den.
+ägaren släpps. TCP-handtagen, `StreamSet` och `UdpSocket` använder den.
 
 [`Result<T, E>` och felpropagering med `?`](enums.md#typade-fel-med-result)
 använder statiskt typade varianter. Ett prov verifierar att `.Err` kan
@@ -62,7 +62,7 @@ kan plockas isär, också när en komponent äger en resurs.
 `TcpStream` (med `connect_addr`, `connect_timeout`, `connect_host`,
 `local_addr`, `peer_addr`, `peek_append`, `shutdown_read`, `shutdown_both` samt
 läs-/skrivtimeouts), `StreamSet` (`Default`, `peek_append`, `shutdown_read`,
-`local_addr`, `peer_addr`, timeouts) och `UdpSocket` (`@resource(dispose)`,
+`shutdown_both`, `local_addr`, `peer_addr`, timeouts) och `UdpSocket` (`@resource(dispose)`,
 `bind`, `connect`, `send_to`/`send_to_range`, `send`, `recv_from_append`,
 `peek_from_append`, `recv_append`), samt `resolve` för värduppslagning.
 Övergångsimporterna `std.http` och `std.http_client` har tagits bort;

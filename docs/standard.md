@@ -137,9 +137,9 @@ Oföränderliga bindningar kan inte lånas med `&mut`.
 Läslån kan också namnges lokalt med `r := &value` och gäller då till
 deklarationsblockets slut. `&values[start..end]` ger en lånad `&[]T` och
 `&text[start..end]` en UTF-8-kontrollerad bytevy, `&[]u8`, utan ny buffert.
-En funktion kan returnera ett låslån från en av sina delade parametrar
+En funktion kan returnera ett läslån från en av sina delade parametrar
 (med `from namn` vid flera); se
-[låne- och escapegränser](memory.md#lokala-låslån-och-intervallvyer).
+[låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer).
 Referenser kan fortfarande inte lagras i structar/enums/arrayer och lokala
 skrivlån stöds inte. `copy := values.clone()` skapar en ägd kopia av
 det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
@@ -166,8 +166,12 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 | `std.json` | `Writer` (`Default`) och `Kind` (`Eq`, `Display`) för att skriva JSON, traiten `Encode` (implementerad för skalärer, `string` och `[]T where T: Encode`) med `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`, samt parsern `Doc::parse_bytes`/`Doc::parse_text` med `.get_str`, `.get_i64`, `.get_u64`, `.get_f64` och `.get_bool`. |
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `FromStr` och `parse.value<T: FromStr>` (implementerad för `bool`, `string`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`) samt `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse`. `parse` accepterar understreck mellan siffror. |
+| `std.math` | `clamp`, `min`, `max`, `sin`, `cos`, `tan` samt `total_cmp_f64`/`total_cmp_f32`; se [Matematik](#matematik). |
+| `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6, `IpAddr`, `SocketAddr`, `PollSet`, `StreamSet` och `resolve`. |
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError` (`Display`/`Eq`/`Hash`), `FileKind` (`Display`/`Eq`/`Hash`), `Status` (`Eq`) samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
-| `std.toml.tree` | TOML-DOM-träd (`Tree` med `Sendable` och `Default`) och JSON-rendering. |
+| `std.crypto` | Slumpbyte, Argon2id, HMAC-SHA256, HKDF-SHA256, konstanttidslikhet och AES-256-GCM; se [Kryptografi](crypto.md). |
+| `std.sqlite` | SQLite-klient via systemets `libsqlite3`; se [SQLite](sqlite.md). |
+| `std.toml` / `std.toml.tree` | TOML-parser (`toml.parse`), DOM-träd (`Tree` med `Sendable` och `Default`) och JSON-rendering; se [TOML](toml.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`, `WriteFile::grant`/`.write`, `ReadDir::grant`/`.resolve_read`/`.list`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
 | `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.terminate`, `.kill`), `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
@@ -202,8 +206,8 @@ i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buff
 `UdpSocket` (`bind`, `connect`, `local_addr`, `peer_addr`, `send_to`,
 `send_to_range`, `send`, `recv_from_append`, `peek_from_append`, `recv_append`,
 `set_read_timeout`, `set_write_timeout`, `close`), samt `PollSet` (`new`/`Default`)
-och `StreamSet` (`new`/`Default`, `peek_append`, `shutdown_read`, `local_addr`,
-`peer_addr`, timeouts) och motsvarande modulhjälpare. `peek_append` och
+och `StreamSet` (`new`/`Default`, `peek_append`, `shutdown_read`, `shutdown_both`,
+`local_addr`, `peer_addr`, timeouts) och motsvarande modulhjälpare. `peek_append` och
 `peek_from_append` lämnar lästa byte kvar i socketens kö. TCP- och
 UDP-operationerna använder direkta systemanrop på Linux och behåller statiska
 ELF-binärer; `net.resolve` och `TcpStream::connect_host` använder `getaddrinfo`.
