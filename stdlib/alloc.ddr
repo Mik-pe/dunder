@@ -1,0 +1,1094 @@
+capability unsafe
+
+import std.bytes as bytes
+import std.io as io
+import sys
+
+@extern("c", "mmap")
+unsafe fn c_mmap(address: ptr, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> ptr
+
+@extern("c", "munmap")
+unsafe fn c_munmap(address: ptr, length: usize) -> i32
+
+pub enum AllocError {
+    InvalidLayout = 1,
+    OutOfMemory = 2,
+    LimitExceeded = 3,
+    Unsupported = 4,
+}
+
+impl Eq for AllocError {
+    fn eq(&self, other: &Self) -> bool { self.code() == other.code() }
+}
+
+impl Hash for AllocError {
+    fn hash(&self) -> u64 { self.code().hash() }
+}
+
+impl Display for AllocError {
+    fn str(&self) -> string { self.message() }
+}
+
+impl AllocError {
+    pub fn code(&self) -> i32 {
+        match self {
+            .InvalidLayout => 1,
+            .OutOfMemory => 2,
+            .LimitExceeded => 3,
+            .Unsupported => 4,
+        }
+    }
+
+    pub fn message(&self) -> string {
+        match self {
+            .InvalidLayout => "invalid allocation layout",
+            .OutOfMemory => "out of memory",
+            .LimitExceeded => "allocation limit exceeded",
+            .Unsupported => "unsupported allocation operation",
+        }
+    }
+}
+
+fn max_isize() -> usize {
+    if target_is("wasm32") { return usize(2147483647) }
+    hi := u64(9223372036854775807)
+    usize(hi)
+}
+
+fn ptr_bytes() -> usize {
+    if target_is("wasm32") { return usize(4) }
+    usize(8)
+}
+
+fn is_power_of_two(v: usize) -> bool {
+    v > usize(0) && v.bit_and(v - usize(1)) == usize(0)
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    mask := align - usize(1)
+    misalign := value.bit_and(mask)
+    if misalign == usize(0) { value } else { value + (align - misalign) }
+}
+
+pub struct Layout {
+    size: usize,
+    align: usize,
+}
+
+impl Layout {
+    pub fn from_size_align(size: usize, align: usize) -> Result<Self, AllocError> {
+        if !is_power_of_two(align) { return .Err(.InvalidLayout) }
+        limit := max_isize()
+        if align > limit || size > limit - (align - usize(1)) {
+            return .Err(.InvalidLayout)
+        }
+        .Ok(Self { size: size, align: align })
+    }
+
+    pub fn bytes(size: usize) -> Result<Self, AllocError> {
+        Self::from_size_align(size, usize(1))
+    }
+
+    pub fn size(&self) -> usize { self.size }
+    pub fn align(&self) -> usize { self.align }
+
+    pub fn is_valid(&self) -> bool {
+        if !is_power_of_two(self.align) { return false }
+        limit := max_isize()
+        self.align <= limit && self.size <= limit - (self.align - usize(1))
+    }
+
+    pub fn pad_to_align(&self) -> Result<Self, AllocError> {
+        if !self.is_valid() { return .Err(.InvalidLayout) }
+        Self::from_size_align(align_up(self.size, self.align), self.align)
+    }
+
+    pub fn repeat(&self, count: usize) -> Result<Self, AllocError> {
+        match self.pad_to_align() {
+            .Ok(padded) => {
+                if count == usize(0) || padded.size == usize(0) {
+                    return .Ok(Self { size: usize(0), align: self.align })
+                }
+                if count > max_isize() / padded.size { return .Err(.InvalidLayout) }
+                Self::from_size_align(padded.size * count, self.align)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+}
+
+impl Eq for Layout {
+    fn eq(&self, other: &Self) -> bool { self.size == other.size && self.align == other.align }
+}
+
+impl Hash for Layout {
+    fn hash(&self) -> u64 {
+        u64(self.size).hash().bit_xor(u64(self.align).hash().wrapping_mul(u64(11400714819323198485)))
+    }
+}
+
+pub fn layout_of<T>() -> Layout {
+    Layout { size: size_of(T), align: align_of(T) }
+}
+
+pub fn layout_array<T>(count: usize) -> Result<Layout, AllocError> {
+    layout_of<T>().repeat(count)
+}
+
+pub struct Block {
+    ptr: ptr,
+    size: usize,
+}
+
+impl Block {
+    pub fn empty() -> Self {
+        unsafe { return Self { ptr: ptr(0), size: usize(0) } }
+    }
+    pub fn is_empty(&self) -> bool { self.size == usize(0) }
+    pub fn address(&self) -> ptr { self.ptr }
+    pub fn size(&self) -> usize { self.size }
+}
+
+pub trait RawAllocator {
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<Block, AllocError>
+    unsafe fn dealloc(&mut self, block: Block, layout: Layout)
+
+    unsafe fn alloc_zeroed(&mut self, layout: Layout) -> Result<Block, AllocError> {
+        match self.alloc(layout) {
+            .Ok(blk) => {
+                if blk.size > usize(0) && usize(blk.ptr) != usize(0) {
+                    sys.memory_zero(blk.ptr, blk.size)
+                }
+                .Ok(blk)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    unsafe fn realloc(&mut self, block: Block, old_layout: Layout, new_layout: Layout) -> Result<Block, AllocError> {
+        if !new_layout.is_valid() { return .Err(.InvalidLayout) }
+        if new_layout.size == usize(0) {
+            self.dealloc(block, old_layout)
+            return .Ok(Block { ptr: ptr(new_layout.align), size: usize(0) })
+        }
+        match self.alloc(new_layout) {
+            .Ok(next) => {
+                copy_n := if old_layout.size < next.size { old_layout.size } else { next.size }
+                if copy_n > usize(0) && usize(block.ptr) != usize(0) {
+                    sys.memory_copy(next.ptr, block.ptr, copy_n)
+                }
+                self.dealloc(block, old_layout)
+                .Ok(next)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+}
+
+pub struct Global {}
+
+impl Global {
+    pub fn new() -> Self { Self {} }
+}
+
+impl Default for Global {
+    fn default() -> Self { Self {} }
+}
+
+impl RawAllocator for Global {
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<Block, AllocError> {
+        if !layout.is_valid() { return .Err(.InvalidLayout) }
+        if layout.size == usize(0) {
+            return .Ok(Block { ptr: ptr(layout.align), size: usize(0) })
+        }
+        if layout.align <= usize(8) {
+            raw := sys.pool_alloc_try(layout.size)
+            if usize(raw) == usize(0) { return .Err(.OutOfMemory) }
+            return .Ok(Block { ptr: raw, size: layout.size })
+        }
+        meta := ptr_bytes()
+        extra := layout.align + meta
+        if layout.size > max_isize() - extra { return .Err(.InvalidLayout) }
+        raw := sys.pool_alloc_try(layout.size + extra)
+        if usize(raw) == usize(0) { return .Err(.OutOfMemory) }
+        aligned := align_up(usize(raw) + meta, layout.align)
+        store_ptr(ptr(aligned - meta), raw)
+        .Ok(Block { ptr: ptr(aligned), size: layout.size })
+    }
+
+    unsafe fn dealloc(&mut self, block: Block, layout: Layout) {
+        if layout.size == usize(0) || !layout.is_valid() || usize(block.ptr) == usize(0) { return }
+        if layout.align <= usize(8) {
+            sys.pool_free(block.ptr)
+            return
+        }
+        raw := load_ptr(ptr(usize(block.ptr) - ptr_bytes()))
+        if usize(raw) != usize(0) { sys.pool_free(raw) }
+    }
+}
+
+pub struct System {}
+
+impl System {
+    pub fn new() -> Self { Self {} }
+}
+
+impl Default for System {
+    fn default() -> Self { Self {} }
+}
+
+fn system_page_size() -> usize {
+    if target_is("macos") { return usize(16384) }
+    usize(4096)
+}
+
+unsafe fn os_mmap_anon(length: usize) -> Result<ptr, AllocError> {
+    if target_is("macos") {
+        // PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANON = 0x1002 = 4098
+        raw := c_mmap(ptr(0), length, 3, 4098, -1, 0)
+        failed := usize(0).wrapping_sub(usize(1))
+        if usize(raw) == usize(0) || usize(raw) == failed { return .Err(.OutOfMemory) }
+        return .Ok(raw)
+    }
+    if target_is("linux") {
+        // MAP_PRIVATE|MAP_ANONYMOUS = 0x22 = 34; ARM64 mmap syscall 222 (mapped on x86_64)
+        r := sys.linux_syscall(222, 0, i64(length), 3, 34, -1, 0)
+        if r <= 0 { return .Err(.OutOfMemory) }
+        return .Ok(ptr(usize(r)))
+    }
+    .Err(.Unsupported)
+}
+
+unsafe fn os_munmap_anon(raw: ptr, length: usize) {
+    if target_is("macos") {
+        _ := c_munmap(raw, length)
+    } else if target_is("linux") {
+        // ARM64 munmap syscall 215 (mapped on x86_64)
+        _ := sys.linux_syscall(215, i64(usize(raw)), i64(length), 0, 0, 0, 0)
+    }
+}
+
+impl RawAllocator for System {
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<Block, AllocError> {
+        if !layout.is_valid() { return .Err(.InvalidLayout) }
+        if layout.size == usize(0) {
+            return .Ok(Block { ptr: ptr(layout.align), size: usize(0) })
+        }
+        if !target_is("native") {
+            mut g := Global::new()
+            return g.alloc(layout)
+        }
+        page := system_page_size()
+        limit := max_isize()
+        if layout.align <= page {
+            if layout.size > limit - (page - usize(1)) { return .Err(.InvalidLayout) }
+            mapped := align_up(layout.size, page)
+            match os_mmap_anon(mapped) {
+                .Ok(raw) => { return .Ok(Block { ptr: raw, size: layout.size }) },
+                .Err(e) => { return .Err(e) },
+            }
+        }
+        meta := ptr_bytes()
+        if layout.align > limit - meta - (page - usize(1)) { return .Err(.InvalidLayout) }
+        extra := layout.align + meta
+        if layout.size > limit - extra - (page - usize(1)) { return .Err(.InvalidLayout) }
+        mapped := align_up(layout.size + extra, page)
+        match os_mmap_anon(mapped) {
+            .Ok(raw) => {
+                aligned := align_up(usize(raw) + meta, layout.align)
+                store_ptr(ptr(aligned - meta), raw)
+                .Ok(Block { ptr: ptr(aligned), size: layout.size })
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    unsafe fn dealloc(&mut self, block: Block, layout: Layout) {
+        if layout.size == usize(0) || !layout.is_valid() || usize(block.ptr) == usize(0) { return }
+        if !target_is("native") {
+            mut g := Global::new()
+            g.dealloc(block, layout)
+            return
+        }
+        page := system_page_size()
+        limit := max_isize()
+        if layout.align <= page {
+            if layout.size > limit - (page - usize(1)) { return }
+            mapped := align_up(layout.size, page)
+            os_munmap_anon(block.ptr, mapped)
+            return
+        }
+        meta := ptr_bytes()
+        extra := layout.align + meta
+        if layout.size > limit - extra - (page - usize(1)) { return }
+        mapped := align_up(layout.size + extra, page)
+        raw := load_ptr(ptr(usize(block.ptr) - meta))
+        if usize(raw) != usize(0) { os_munmap_anon(raw, mapped) }
+    }
+}
+
+pub struct Capped<A> where A: RawAllocator {
+    inner: A,
+    limit: usize,
+    used: usize,
+}
+
+impl Capped<A> {
+    pub fn new(move inner: A, limit: usize) -> Self {
+        Self { inner: inner, limit: limit, used: usize(0) }
+    }
+
+    pub fn limit(&self) -> usize { self.limit }
+    pub fn used(&self) -> usize { self.used }
+    pub fn remaining(&self) -> usize {
+        if self.used >= self.limit { usize(0) } else { self.limit - self.used }
+    }
+    pub fn inner(&self) -> &A from self { &self.inner }
+    pub fn into_inner(move self) -> A { self.inner }
+}
+
+impl RawAllocator for Capped<A> where A: RawAllocator {
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<Block, AllocError> {
+        if !layout.is_valid() { return .Err(.InvalidLayout) }
+        if layout.size > self.limit || self.used > self.limit - layout.size {
+            return .Err(.LimitExceeded)
+        }
+        match self.inner.alloc(layout) {
+            .Ok(blk) => {
+                self.used += layout.size
+                .Ok(blk)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    unsafe fn dealloc(&mut self, block: Block, layout: Layout) {
+        self.inner.dealloc(block, layout)
+        if self.used >= layout.size { self.used -= layout.size } else { self.used = usize(0) }
+    }
+}
+
+pub struct Stats {
+    allocs: u64,
+    deallocs: u64,
+    live_bytes: usize,
+    peak_bytes: usize,
+    total_bytes: u64,
+}
+
+impl Eq for Stats {
+    fn eq(&self, other: &Self) -> bool {
+        self.allocs == other.allocs && self.deallocs == other.deallocs &&
+            self.live_bytes == other.live_bytes && self.peak_bytes == other.peak_bytes &&
+            self.total_bytes == other.total_bytes
+    }
+}
+
+pub struct Tracking<A> where A: RawAllocator {
+    inner: A,
+    stats: Stats,
+}
+
+impl Tracking<A> {
+    pub fn new(move inner: A) -> Self {
+        Self {
+            inner: inner,
+            stats: Stats { allocs: u64(0), deallocs: u64(0), live_bytes: usize(0), peak_bytes: usize(0), total_bytes: u64(0) },
+        }
+    }
+
+    pub fn stats(&self) -> Stats { self.stats }
+    pub fn inner(&self) -> &A from self { &self.inner }
+    pub fn into_inner(move self) -> A { self.inner }
+}
+
+impl Default for Tracking<A> where A: RawAllocator + Default {
+    fn default() -> Self { Self::new(A::default()) }
+}
+
+impl RawAllocator for Tracking<A> where A: RawAllocator {
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<Block, AllocError> {
+        match self.inner.alloc(layout) {
+            .Ok(blk) => {
+                self.stats.allocs += u64(1)
+                self.stats.total_bytes = self.stats.total_bytes.wrapping_add(u64(layout.size))
+                self.stats.live_bytes += layout.size
+                if self.stats.live_bytes > self.stats.peak_bytes {
+                    self.stats.peak_bytes = self.stats.live_bytes
+                }
+                .Ok(blk)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    unsafe fn dealloc(&mut self, block: Block, layout: Layout) {
+        self.inner.dealloc(block, layout)
+        self.stats.deallocs += u64(1)
+        if self.stats.live_bytes >= layout.size {
+            self.stats.live_bytes -= layout.size
+        } else {
+            self.stats.live_bytes = usize(0)
+        }
+    }
+}
+
+struct Slab {
+    block: Block,
+    layout: Layout,
+}
+
+@resource(dispose)
+pub struct Bump<A> where A: RawAllocator {
+    backing: A,
+    slabs: []Slab,
+    current_cursor: usize,
+    current_end: usize,
+    next_slab_size: usize,
+    bytes_allocated: usize,
+    last_ptr: ptr,
+    last_prev_cursor: usize,
+    last_size: usize,
+}
+
+impl Bump<A> {
+    pub fn with_slab_size(move backing: A, slab_size: usize) -> Self {
+        actual := if slab_size < usize(64) { usize(64) } else { slab_size }
+        unsafe {
+            return Self {
+                backing: backing,
+                slabs: [],
+                current_cursor: usize(0),
+                current_end: usize(0),
+                next_slab_size: actual,
+                bytes_allocated: usize(0),
+                last_ptr: ptr(0),
+                last_prev_cursor: usize(0),
+                last_size: usize(0),
+            }
+        }
+    }
+
+    pub fn new(move backing: A) -> Self {
+        Self::with_slab_size(move backing, usize(4096))
+    }
+
+    pub fn allocated_bytes(&self) -> usize { self.bytes_allocated }
+    pub fn slab_count(&self) -> i32 { self.slabs.len }
+    pub fn backing(&self) -> &A from self { &self.backing }
+
+    pub fn reset(&mut self) {
+        unsafe {
+            self.last_ptr = ptr(0)
+            self.last_prev_cursor = usize(0)
+            self.last_size = usize(0)
+            self.bytes_allocated = usize(0)
+            if self.slabs.len == 0 {
+                self.current_cursor = usize(0)
+                self.current_end = usize(0)
+                return
+            }
+            while self.slabs.len > 1 {
+                s := self.slabs.pop()
+                self.backing.dealloc(s.block, s.layout)
+            }
+            self.current_cursor = usize(self.slabs[0].block.ptr)
+            self.current_end = usize(self.slabs[0].block.ptr) + self.slabs[0].block.size
+        }
+    }
+
+    pub fn release(&mut self) {
+        unsafe {
+            while self.slabs.len > 0 {
+                s := self.slabs.pop()
+                self.backing.dealloc(s.block, s.layout)
+            }
+            self.current_cursor = usize(0)
+            self.current_end = usize(0)
+            self.bytes_allocated = usize(0)
+            self.last_ptr = ptr(0)
+            self.last_prev_cursor = usize(0)
+            self.last_size = usize(0)
+        }
+    }
+
+    fn dispose(&mut self) {
+        self.release()
+    }
+}
+
+impl Default for Bump<A> where A: RawAllocator + Default {
+    fn default() -> Self { Self::new(A::default()) }
+}
+
+impl RawAllocator for Bump<A> where A: RawAllocator {
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<Block, AllocError> {
+        if !layout.is_valid() { return .Err(.InvalidLayout) }
+        if layout.size == usize(0) {
+            return .Ok(Block { ptr: ptr(layout.align), size: usize(0) })
+        }
+        if self.current_cursor != usize(0) && self.current_cursor <= self.current_end {
+            rem := self.current_end - self.current_cursor
+            mis := self.current_cursor.bit_and(layout.align - usize(1))
+            pad := if mis == usize(0) { usize(0) } else { layout.align - mis }
+            if pad <= rem && layout.size <= rem - pad {
+                prev := self.current_cursor
+                aligned := prev + pad
+                self.current_cursor = aligned + layout.size
+                self.bytes_allocated += layout.size
+                self.last_ptr = ptr(aligned)
+                self.last_prev_cursor = prev
+                self.last_size = layout.size
+                return .Ok(Block { ptr: ptr(aligned), size: layout.size })
+            }
+        }
+        slab_align := if layout.align > usize(16) { layout.align } else { usize(16) }
+        need := if self.next_slab_size > layout.size { self.next_slab_size } else { layout.size }
+        mut slab_layout := Layout { size: need, align: slab_align }
+        match Layout::from_size_align(need, slab_align) {
+            .Ok(l) => { slab_layout = l },
+            .Err(e) => { return .Err(e) },
+        }
+        match self.backing.alloc(slab_layout) {
+            .Ok(blk) => {
+                base := usize(blk.ptr)
+                self.slabs.push(Slab { block: blk, layout: slab_layout })
+                self.current_cursor = base + layout.size
+                self.current_end = base + blk.size
+                self.bytes_allocated += layout.size
+                self.last_ptr = blk.ptr
+                self.last_prev_cursor = base
+                self.last_size = layout.size
+                if self.next_slab_size <= usize(33554432) {
+                    self.next_slab_size = self.next_slab_size * usize(2)
+                }
+                .Ok(Block { ptr: blk.ptr, size: layout.size })
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    unsafe fn dealloc(&mut self, block: Block, layout: Layout) {
+        if layout.size == usize(0) { return }
+        if self.last_ptr == block.ptr && layout.size == self.last_size {
+            self.current_cursor = self.last_prev_cursor
+            if self.bytes_allocated >= layout.size {
+                self.bytes_allocated -= layout.size
+            } else {
+                self.bytes_allocated = usize(0)
+            }
+            self.last_ptr = ptr(0)
+            self.last_prev_cursor = usize(0)
+            self.last_size = usize(0)
+        }
+    }
+}
+
+fn alloc_to_io_error(err: AllocError) -> sys.IoError {
+    match err {
+        .InvalidLayout => .InvalidArgument,
+        .OutOfMemory => .OutOfMemory,
+        .LimitExceeded => .OutOfMemory,
+        .Unsupported => .Unsupported,
+    }
+}
+
+unsafe fn copy_slice_to_ptr(dst: ptr, src: &[]u8) {
+    base := usize(dst)
+    for i in 0..src.len {
+        store_u8(ptr(base + usize(i)), src[i])
+    }
+}
+
+@resource(dispose)
+pub struct OwnedBuf<A> where A: RawAllocator {
+    allocator: A,
+    data: ptr,
+    len: usize,
+    cap: usize,
+}
+
+impl OwnedBuf<A> {
+    pub fn new(move allocator: A) -> Self {
+        unsafe { return Self { allocator: allocator, data: ptr(0), len: usize(0), cap: usize(0) } }
+    }
+
+    pub fn with_capacity(move allocator: A, cap: usize) -> Result<Self, AllocError> {
+        mut out := Self::new(move allocator)
+        if cap > usize(0) {
+            match out.reserve(cap) {
+                .Ok => {},
+                .Err(e) => { return .Err(e) },
+            }
+        }
+        .Ok(out)
+    }
+
+    pub fn len(&self) -> usize { self.len }
+    pub fn capacity(&self) -> usize { self.cap }
+    pub fn is_empty(&self) -> bool { self.len == usize(0) }
+    pub fn allocator(&self) -> &A from self { &self.allocator }
+
+    pub fn reserve(&mut self, additional: usize) -> Result<(), AllocError> {
+        if additional == usize(0) { return .Ok }
+        limit := usize(2147483647)
+        if self.len > limit || additional > limit - self.len { return .Err(.InvalidLayout) }
+        needed := self.len + additional
+        if needed <= self.cap { return .Ok }
+        mut next_cap := if self.cap < usize(64) { usize(64) } else { self.cap * usize(2) }
+        if next_cap < needed { next_cap = needed }
+        if next_cap > limit { next_cap = needed }
+        match Layout::bytes(next_cap) {
+            .Ok(new_layout) => {
+                if self.cap == usize(0) {
+                    unsafe {
+                        match self.allocator.alloc(new_layout) {
+                            .Ok(blk) => {
+                                self.data = blk.ptr
+                                self.cap = next_cap
+                                return .Ok
+                            },
+                            .Err(e) => { return .Err(e) },
+                        }
+                    }
+                }
+                old_layout := Layout { size: self.cap, align: usize(1) }
+                unsafe {
+                    match self.allocator.realloc(Block { ptr: self.data, size: self.cap }, old_layout, new_layout) {
+                        .Ok(blk) => {
+                            self.data = blk.ptr
+                            self.cap = next_cap
+                            return .Ok
+                        },
+                        .Err(e) => { return .Err(e) },
+                    }
+                }
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+
+    pub fn push_byte(&mut self, value: u8) -> Result<(), AllocError> {
+        match self.reserve(usize(1)) {
+            .Ok => {
+                unsafe { store_u8(ptr(usize(self.data) + self.len), value) }
+                self.len += usize(1)
+                .Ok
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    pub fn extend_bytes(&mut self, src: &[]u8) -> Result<(), AllocError> {
+        if src.len == 0 { return .Ok }
+        match self.reserve(usize(src.len)) {
+            .Ok => {
+                unsafe {
+                    copy_slice_to_ptr(ptr(usize(self.data) + self.len), &src)
+                }
+                self.len += usize(src.len)
+                .Ok
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    pub fn extend_str(&mut self, s: string) -> Result<(), AllocError> {
+        if s.len == 0 { return .Ok }
+        mut tmp: []u8 = []
+        bytes.append_utf8(&mut tmp, s)
+        self.extend_bytes(&tmp)
+    }
+
+    pub fn as_bytes(&self) -> &[]u8 from self {
+        unsafe { return bytes_view(&self, self.data, self.len) }
+    }
+
+    pub fn clear(&mut self) { self.len = usize(0) }
+
+    pub fn release(&mut self) {
+        unsafe {
+            if self.cap > usize(0) && usize(self.data) != usize(0) {
+                self.allocator.dealloc(Block { ptr: self.data, size: self.cap }, Layout { size: self.cap, align: usize(1) })
+            }
+            self.data = ptr(0)
+            self.len = usize(0)
+            self.cap = usize(0)
+        }
+    }
+
+    fn dispose(&mut self) {
+        self.release()
+    }
+}
+
+impl OwnedBuf<A> where A: RawAllocator + Default {
+    pub fn into_allocator(move self) -> A {
+        mut b := self
+        b.release()
+        replace(&mut b.allocator, A::default())
+    }
+}
+
+pub fn buf_into_allocator<A: RawAllocator + Default>(move buf: OwnedBuf<A>) -> A {
+    buf.into_allocator()
+}
+
+impl Default for OwnedBuf<A> where A: RawAllocator + Default {
+    fn default() -> Self { Self::new(A::default()) }
+}
+
+impl io.Write for OwnedBuf<A> where A: RawAllocator {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        match self.extend_bytes(&data) {
+            .Ok => .Ok(data.len),
+            .Err(e) => .Err(alloc_to_io_error(e)),
+        }
+    }
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+pub struct Span {
+    chunk: i32,
+    offset: usize,
+    len: usize,
+}
+
+impl Span {
+    pub fn empty() -> Self { Self { chunk: -1, offset: usize(0), len: usize(0) } }
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == usize(0) }
+}
+
+impl Eq for Span {
+    fn eq(&self, other: &Self) -> bool {
+        self.chunk == other.chunk && self.offset == other.offset && self.len == other.len
+    }
+}
+
+impl Hash for Span {
+    fn hash(&self) -> u64 {
+        h1 := self.chunk.hash()
+        h2 := u64(self.offset).hash()
+        h3 := u64(self.len).hash()
+        h1.bit_xor(h2.wrapping_mul(u64(11400714819323198485))).bit_xor(h3.wrapping_mul(u64(14029467366897019727)))
+    }
+}
+
+struct ArenaChunk {
+    block: Block,
+    layout: Layout,
+    used: usize,
+}
+
+fn free_arena_chunks<A: RawAllocator>(allocator: &mut A, chunks: &mut []ArenaChunk) {
+    unsafe {
+        while chunks.len > 0 {
+            c := chunks.pop()
+            allocator.dealloc(c.block, c.layout)
+        }
+    }
+}
+
+fn arena_bytes_ptr(chunks: &[]ArenaChunk, span: Span) -> ptr {
+    unsafe {
+        if span.len == usize(0) && span.chunk == -1 { return ptr(0) }
+    }
+    assert(span.chunk >= 0 && span.chunk < chunks.len)
+    c := &chunks[span.chunk]
+    assert(span.offset <= c.used && span.len <= c.used - span.offset)
+    unsafe {
+        if span.len == usize(0) { return ptr(0) }
+        return ptr(usize(c.block.ptr) + span.offset)
+    }
+}
+
+@resource(dispose)
+pub struct Arena<A> where A: RawAllocator {
+    allocator: A,
+    chunks: []ArenaChunk,
+    default_chunk_size: usize,
+    total: usize,
+}
+
+@resource(dispose)
+pub struct FrozenArena<A> where A: RawAllocator {
+    allocator: A,
+    chunks: []ArenaChunk,
+    total: usize,
+}
+
+impl Arena<A> {
+    pub fn with_chunk_size(move allocator: A, chunk_size: usize) -> Self {
+        actual := if chunk_size < usize(64) { usize(64) } else { chunk_size }
+        Self { allocator: allocator, chunks: [], default_chunk_size: actual, total: usize(0) }
+    }
+
+    pub fn new(move allocator: A) -> Self {
+        Self::with_chunk_size(move allocator, usize(4096))
+    }
+
+    pub fn total_bytes(&self) -> usize { self.total }
+    pub fn chunk_count(&self) -> i32 { self.chunks.len }
+    pub fn allocator(&self) -> &A from self { &self.allocator }
+
+    fn reserve_span(&mut self, len: usize) -> Result<Span, AllocError> {
+        if len == usize(0) { return .Ok(Span::empty()) }
+        if len > usize(2147483647) { return .Err(.InvalidLayout) }
+        if self.chunks.len > 0 {
+            last_idx := self.chunks.len - 1
+            if self.chunks[last_idx].block.size >= self.chunks[last_idx].used &&
+               len <= self.chunks[last_idx].block.size - self.chunks[last_idx].used {
+                off := self.chunks[last_idx].used
+                self.chunks[last_idx].used += len
+                self.total += len
+                return .Ok(Span { chunk: last_idx, offset: off, len: len })
+            }
+        }
+        chunk_bytes := if self.default_chunk_size > len { self.default_chunk_size } else { len }
+        match Layout::bytes(chunk_bytes) {
+            .Ok(layout) => {
+                unsafe {
+                    match self.allocator.alloc(layout) {
+                        .Ok(blk) => {
+                            idx := self.chunks.len
+                            self.chunks.push(ArenaChunk { block: blk, layout: layout, used: len })
+                            self.total += len
+                            return .Ok(Span { chunk: idx, offset: usize(0), len: len })
+                        },
+                        .Err(e) => { return .Err(e) },
+                    }
+                }
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+
+    pub fn push_bytes(&mut self, src: &[]u8) -> Result<Span, AllocError> {
+        if src.len == 0 { return .Ok(Span::empty()) }
+        match self.reserve_span(usize(src.len)) {
+            .Ok(span) => {
+                unsafe {
+                    dst := ptr(usize(self.chunks[span.chunk].block.ptr) + span.offset)
+                    copy_slice_to_ptr(dst, &src)
+                }
+                .Ok(span)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    pub fn push_str(&mut self, s: string) -> Result<Span, AllocError> {
+        if s.len == 0 { return .Ok(Span::empty()) }
+        mut tmp: []u8 = []
+        bytes.append_utf8(&mut tmp, s)
+        self.push_bytes(&tmp)
+    }
+
+    pub fn alloc_zeroed(&mut self, len: usize) -> Result<Span, AllocError> {
+        if len == usize(0) { return .Ok(Span::empty()) }
+        match self.reserve_span(len) {
+            .Ok(span) => {
+                unsafe {
+                    dst := ptr(usize(self.chunks[span.chunk].block.ptr) + span.offset)
+                    sys.memory_zero(dst, len)
+                }
+                .Ok(span)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    pub fn bytes(&self, span: Span) -> &[]u8 from self {
+        p := arena_bytes_ptr(&self.chunks, span)
+        unsafe { return bytes_view(&self, p, span.len) }
+    }
+
+    pub fn reset(&mut self) {
+        self.total = usize(0)
+        if self.chunks.len == 0 { return }
+        unsafe {
+            while self.chunks.len > 1 {
+                c := self.chunks.pop()
+                self.allocator.dealloc(c.block, c.layout)
+            }
+        }
+        self.chunks[0].used = usize(0)
+    }
+
+    pub fn release_all(&mut self) {
+        mut chunks := replace(&mut self.chunks, [])
+        free_arena_chunks<A>(&mut self.allocator, &mut chunks)
+        self.total = usize(0)
+    }
+
+    fn dispose(&mut self) {
+        self.release_all()
+    }
+}
+
+impl Default for Arena<A> where A: RawAllocator + Default {
+    fn default() -> Self { Self::new(A::default()) }
+}
+
+impl Arena<A> where A: RawAllocator + Default {
+    pub fn freeze(move self) -> FrozenArena<A> {
+        mut a := self
+        chunks := replace(&mut a.chunks, [])
+        alloc := replace(&mut a.allocator, A::default())
+        total := a.total
+        a.total = usize(0)
+        FrozenArena<A> { allocator: alloc, chunks: chunks, total: total }
+    }
+}
+
+pub fn freeze_arena<A: RawAllocator + Default>(move arena: Arena<A>) -> FrozenArena<A> {
+    arena.freeze()
+}
+
+impl FrozenArena<A> {
+    pub fn bytes(&self, span: Span) -> &[]u8 from self {
+        p := arena_bytes_ptr(&self.chunks, span)
+        unsafe { return bytes_view(&self, p, span.len) }
+    }
+
+    pub fn total_bytes(&self) -> usize { self.total }
+    pub fn chunk_count(&self) -> i32 { self.chunks.len }
+    pub fn allocator(&self) -> &A from self { &self.allocator }
+
+    fn dispose(&mut self) {
+        mut chunks := replace(&mut self.chunks, [])
+        free_arena_chunks<A>(&mut self.allocator, &mut chunks)
+        self.total = usize(0)
+    }
+}
+
+pub fn read_into_arena<A: RawAllocator, R: io.Read>(arena: &mut Arena<A>, reader: &mut R, max_bytes: i64) -> Result<Span, sys.IoError> {
+    mut buf: []u8 = []
+    match io.read_to_end_limit<R>(&mut reader, &mut buf, max_bytes) {
+        .Ok(_) => match arena.push_bytes(&buf) {
+            .Ok(span) => .Ok(span),
+            .Err(e) => .Err(alloc_to_io_error(e)),
+        },
+        .Err(e) => .Err(e),
+    }
+}
+
+struct PoolEntry<T> {
+    value: T,
+    slot: i32,
+}
+
+pub struct Id<T> {
+    index: u32,
+    gen: u32,
+}
+
+impl Id<T> {
+    pub fn index(&self) -> u32 { self.index }
+    pub fn generation(&self) -> u32 { self.gen }
+}
+
+impl Eq for Id<T> {
+    fn eq(&self, other: &Self) -> bool { self.index == other.index && self.gen == other.gen }
+}
+
+impl Hash for Id<T> {
+    fn hash(&self) -> u64 {
+        self.index.hash().bit_xor(self.gen.hash().wrapping_mul(u64(11400714819323198485)))
+    }
+}
+
+pub opaque struct Pool<T> where T: Storable {
+    entries: []PoolEntry<T>,
+    slot_to_entry: []i32,
+    gens: []u32,
+    free_next: []i32,
+    free_head: i32,
+}
+
+impl Pool<T> {
+    pub fn new() -> Self {
+        Self { entries: [], slot_to_entry: [], gens: [], free_next: [], free_head: -1 }
+    }
+
+    pub fn len(&self) -> i32 { self.entries.len }
+    pub fn is_empty(&self) -> bool { self.entries.len == 0 }
+
+    pub fn contains(&self, id: Id<T>) -> bool {
+        if i64(id.index) >= i64(self.slot_to_entry.len) { return false }
+        slot := i32(id.index)
+        self.slot_to_entry[slot] >= 0 && self.gens[slot] == id.gen
+    }
+
+    pub fn insert(&mut self, move value: T) -> Id<T> {
+        if self.free_head >= 0 {
+            slot := self.free_head
+            self.free_head = self.free_next[slot]
+            self.free_next[slot] = -1
+            entry := self.entries.len
+            self.entries.push(PoolEntry<T> { value: value, slot: slot })
+            self.slot_to_entry[slot] = entry
+            return Id<T> { index: u32(slot), gen: self.gens[slot] }
+        }
+        slot := self.slot_to_entry.len
+        entry := self.entries.len
+        self.entries.push(PoolEntry<T> { value: value, slot: slot })
+        self.slot_to_entry.push(entry)
+        self.gens.push(u32(1))
+        self.free_next.push(-1)
+        Id<T> { index: u32(slot), gen: u32(1) }
+    }
+
+    pub fn at(&self, id: Id<T>) -> &T from self {
+        assert(self.contains(id))
+        entry := self.slot_to_entry[i32(id.index)]
+        &self.entries[entry].value
+    }
+
+    pub fn set(&mut self, id: Id<T>, move value: T) -> bool {
+        if !self.contains(id) { return false }
+        entry := self.slot_to_entry[i32(id.index)]
+        self.entries[entry].value = value
+        true
+    }
+
+    pub fn remove(&mut self, id: Id<T>) -> Result<T, ()> {
+        if !self.contains(id) { return .Err }
+        slot := i32(id.index)
+        entry := self.slot_to_entry[slot]
+        last := self.entries.len - 1
+        self.entries.swap(entry, last)
+        popped := self.entries.pop()
+        if entry < last {
+            moved_slot := self.entries[entry].slot
+            self.slot_to_entry[moved_slot] = entry
+        }
+        self.slot_to_entry[slot] = -1
+        mut next_gen := self.gens[slot].wrapping_add(u32(1))
+        if next_gen == u32(0) { next_gen = u32(1) }
+        self.gens[slot] = next_gen
+        self.free_next[slot] = self.free_head
+        self.free_head = slot
+        .Ok(popped.value)
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear()
+        self.free_head = -1
+        for slot in 0..self.slot_to_entry.len {
+            self.slot_to_entry[slot] = -1
+            mut next_gen := self.gens[slot].wrapping_add(u32(1))
+            if next_gen == u32(0) { next_gen = u32(1) }
+            self.gens[slot] = next_gen
+            self.free_next[slot] = self.free_head
+            self.free_head = slot
+        }
+    }
+}
+
+impl Default for Pool<T> where T: Storable {
+    fn default() -> Self { Self::new() }
+}
+
+impl Sendable for Pool<T> where T: Storable + Sendable {}

@@ -159,6 +159,15 @@ lokaler kräver ett separat uttryckligt kontrakt; de följer inte av en
 vanlig `@extern`-deklaration. Dessa regler gäller också när en främmande
 funktion anropar Dunder genom en callback.
 
+För säkra omslag ovanpå råpekare (till exempel i `std.alloc`) skapar
+`unsafe bytes_view(&owner, base, length)` en lånad vy `&[]u8` med angiven
+längd av typen `usize` över `[base, base + length)` och binder vyns livstid
+till den delade referensen `&owner` (den kan också kombineras med `-> &[]u8
+from self`). Vid positiv längd måste `base` vara skild från null. Dessutom kan
+traits och `impl Trait for Type` deklarera `unsafe fn`-metoder, som i
+`std.alloc.RawAllocator`, med krav på att implementationen matchar
+säkerhetsnivån i traiten.
+
 ## Filåtkomst genom delegerade handtag
 
 En modul med `capability filesystem` kan välja sökvägar med
@@ -189,17 +198,21 @@ fn main() {
 ```
 
 Handtagen innehåller en sökväg. Operativsystemet slår upp den vid varje
-operation, inklusive symboliska länkar och relativa sökvägar. Ett handtag
-håller ingen öppen filbeskrivare. Modulen som tar emot ett handtag kan
-delegera det vidare.
+operation, inklusive symboliska länkar och relativa sökvägar. Ett handtag som
+`fs.ReadFile` eller `fs.WriteFile` håller ingen öppen filbeskrivare; via
+`ReadFile::open()`, `WriteFile::create()`, `WriteFile::open_append()` eller
+`fs.File::open(path, OpenOptions)` kan det däremot öppnas till strömmande
+`@resource(dispose)`-handtag (`FileReader`, `FileWriter`, `File`). Modulen som
+tar emot ett handtag kan delegera det vidare.
 
 Modulhuvudet styr direkta unsafe-operationer samt deklarationer märkta
-`@requires(filesystem)`, `@requires(network)` eller `@requires(process)`. Flera
-kapabiliteter anges kommaseparerat i samma modulhuvud, t.ex.
-`capability process, network, filesystem`.
+`@requires(filesystem)`, `@requires(network)`, `@requires(process)` eller
+`@requires(stdio)`. Flera kapabiliteter anges kommaseparerat i samma modulhuvud,
+t.ex. `capability process, network, filesystem, stdio`.
 `fs.ReadDir::grant(path)` och `dir.resolve_read(rel_path)` avgränsar
 relativ läsning till en vald rotkatalog utan `..`-flykt, `std.net.listen` /
-`std.net.connect` kräver `capability network`, och `std.process.run` /
+`std.net.connect` kräver `capability network`, `std.io.stdin` / `stdout` /
+`stderr` / `read_stdin` kräver `capability stdio`, och `std.process.run` /
 `exec` / `spawn` / `grant` kräver `capability process` (där `Executable`
 delegerar rätten att köra ett specifikt program till oprivilegierade moduler).
 Importer av äldre `sys` ger fortfarande processens OS-åtkomst. Bedöm hela

@@ -167,14 +167,16 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 | `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
 | `std.parse` | `FromStr` och `parse.value<T: FromStr>` (implementerad för `bool`, `string`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`) samt `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse`. `parse` accepterar understreck mellan siffror. |
 | `std.math` | `clamp`, `min`, `max`, `sin`, `cos`, `tan` samt `total_cmp_f64`/`total_cmp_f32`; se [Matematik](#matematik). |
-| `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6, `IpAddr`, `SocketAddr`, `PollSet`, `StreamSet` och `resolve`. |
-| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError` (`Display`/`Eq`/`Hash`), `FileKind` (`Display`/`Eq`/`Hash`), `Status` (`Eq`) samt `unsafe` Linux-primitiverna `envp` och `linux_syscall`; se [sys](sys.md). |
+| `std.io` | Ström-traits (`Read`, `Write`, `BufRead: Read`, `Seek`), `SeekFrom`, `Line`, kapabilitetsstyrda `Stdin`/`Stdout`/`Stderr` (`capability stdio`) och `read_stdin`/`read_stdin_bytes`/`read_stdin_limit`, samt ägda omslag (`BufReader<R>`, `BufWriter<W>` med `FlushError<W>`, `Limited<R>`, `Cursor`, `Empty`, `Sink`) och generiska algoritmer (`copy`, `copy_limit`, `write_all`, `write_str`, `read_exact`, `read_to_end`, `read_to_end_limit`, `read_to_string`, `is_would_block`). |
+| `std.alloc` | Generellt allokerings-API: `AllocError`, `Layout`, `layout_of<T>`, `layout_array<T>`, `Block`, traiten `RawAllocator` (`unsafe fn alloc`/`dealloc`/`alloc_zeroed`/`realloc`), `Global`, `System`, `Capped<A>`, `Stats`, `Tracking<A>`, `Bump<A>`, `OwnedBuf<A>` (`as_bytes`, `io.Write`), `Span`, `Arena<A>`/`FrozenArena<A>` (`freeze_arena`, `read_into_arena`) samt generationssäkra `Pool<T: Storable>`/`Id<T>`. |
+| `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6 (`TcpStream` implementerar `io.Read` och `io.Write`), `IpAddr`, `SocketAddr`, `PollSet`, `StreamSet` och `resolve`. |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError` (`Display`/`Eq`/`Hash`, inklusive `Interrupted`, `NoSpace`, `UnexpectedEof`, `WriteZero`, `would_block`, `is_would_block`), `FileKind` (`Display`/`Eq`/`Hash`), `Status` (`Eq`), lågnivå-FD (`fd_read`/`fd_write`/`fd_close`), samt `unsafe`-primitiverna `memory_zero`, `pool_alloc_try`, `pool_free`, `envp` och `linux_syscall`; se [sys](sys.md). |
 | `std.crypto` | Slumpbyte, Argon2id, HMAC-SHA256, HKDF-SHA256, konstanttidslikhet och AES-256-GCM; se [Kryptografi](crypto.md). |
 | `std.sqlite` | SQLite-klient via systemets `libsqlite3`; se [SQLite](sqlite.md). |
 | `std.toml` / `std.toml.tree` | TOML-parser (`toml.parse`), DOM-träd (`Tree` med `Sendable` och `Default`) och JSON-rendering; se [TOML](toml.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
-| `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`, `WriteFile::grant`/`.write`, `ReadDir::grant`/`.resolve_read`/`.list`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
-| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.terminate`, `.kill`), `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
+| `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`/`.open`, `WriteFile::grant`/`.write`/`.create`/`.open_append`, `ReadDir::grant`/`.resolve_read`/`.list`), strömmande `@resource(dispose)`-handtag (`OpenOptions`, `FileReader`, `FileWriter`, `File` med `io.Read`/`io.Write`/`io.Seek`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
+| `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.take_stdin`, `.take_stdout`, `.take_stderr`, `.terminate`, `.kill`), strömhandtagen `ChildStdin`/`ChildStdout`/`ChildStderr`, `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
@@ -327,6 +329,36 @@ annars ges status 103. `.wrapping_add`, `.wrapping_sub`, `.wrapping_mul`
 väljer omslag uttryckligt; vanlig aritmetik behåller sina overflowkontroller.
 Bytekodning och SHA-256 dogfoodar dessa operationer.
 
+## Strömmar och standardinmatning
+
+`std.io` definierar de generiska ström-traitsen `Read` (`fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError>`), `Write` (`write`, `flush`, plus standardmetoderna `write_full`, `write_str` och `write_byte`), `BufRead: Read` (`fill`, `buffered(&self) -> &[]u8 from self`, `consume`, samt standardmetoderna `read_until`, `read_line_into` och `read_line -> Result<Line, sys.IoError>`) och `Seek` (`seek(&mut self, pos: SeekFrom) -> Result<i64, sys.IoError>`).
+
+Åtkomst till standardströmmar skyddas av `capability stdio` (`@requires(stdio)`): `io.stdin()`, `io.stdout()`, `io.stderr()` returnerar ägda `@resource`-handtag (`Stdin`, `Stdout`, `Stderr` med `.fd()` och `.is_tty()`), medan `io.read_stdin()`, `io.read_stdin_bytes()` och `io.read_stdin_limit(max_bytes)` läser hela standardinmatningen tills EOF. Strömmar byggs samman med ägda värdeomslag (`BufReader<R>`, `BufWriter<W>` med `FlushError<W>`, `Limited<R>`, `Cursor`, `Empty`, `Sink`) och generiska funktioner (`copy`, `copy_limit`, `write_all`, `write_str`, `read_exact`, `read_to_end`, `read_to_end_limit`, `read_to_string`). Samma traits implementeras av `fs.FileReader`, `fs.FileWriter` och `fs.File` i `std.fs` (via `ReadFile::open`, `WriteFile::create`/`open_append` och `File::open` med `OpenOptions`), av `net.TcpStream` i `std.net` samt av `ChildStdin`, `ChildStdout` och `ChildStderr` från `Child::take_stdin`/`take_stdout`/`take_stderr` i `std.process`.
+
+```dunder
+capability stdio
+import std.io as io
+
+fn main() {
+    mut br := io.BufReader<io.Stdin>::new(io.stdin())
+    mut bw := io.BufWriter<io.Stdout>::new(io.stdout())
+    while true {
+        match br.read_line() {
+            .Ok(.Data(line)) => { _ := bw.write_str(line + "\n") },
+            .Ok(.Eof) => { break },
+            .Err(_) => { break },
+        }
+    }
+    _ := bw.flush()
+}
+```
+
+## Generell allokering
+
+`std.alloc` erbjuder ett uttryckligt allokeringslager ovanpå `Layout`, `layout_of<T>()`, `layout_array<T>(count)`, `Block`, `AllocError` (`InvalidLayout`, `OutOfMemory`, `LimitExceeded`, `Unsupported`) och traiten `RawAllocator` med `unsafe fn`-metoderna `alloc`, `dealloc` samt standardmetoderna `alloc_zeroed` och `realloc`. Färdiga allokatorer är `Global` (ovanpå `sys.pool_alloc_try` / `sys.pool_free` utan fällor), `System` (OS-sidor via `mmap`/`munmap`), `Capped<A>`, `Tracking<A>` (som samlar `Stats`) och `Bump<A>` (snabb bump-allokator med LIFO-återvinning, `.reset()`, `.release()` och automatisk `dispose(&mut self)`).
+
+För typat och lånekontrollerat minne finns tre `@resource(dispose)`-strukturer: `OwnedBuf<A>` (växande bytebuffert med `.as_bytes()`, `io.Write` och `into_allocator`/`buf_into_allocator`), `Arena<A>` / `FrozenArena<A>` med stabila `Span`-index (`push_bytes`, `push_str`, `alloc_zeroed`, `read_into_arena`, `freeze_arena`) samt generationssäkra `Pool<T: Storable>`/`Id<T>` (`Default`, och `Sendable` när `T: Sendable`).
+
 ## Lagring och verifiering
 
 Dynamiska buffertar använder en gemensam **512 MiB heap** på native, mappad vid första behov. Buffertarna har unika ägare; uttryckliga kloner
@@ -335,13 +367,16 @@ Tilldelning, scope-slut och retur frigör övergivna buffertar, även i nästlad
 structar och aktiva enumpayloads. `clear` frigör elementens strängreferenser
 och behåller själva bufferten för nästa användning.
 Full pool, misslyckad mappning eller för stor/negativ arrayreserv ger
-status 109. Detta är ännu inget generellt allokerar- eller deallokerar-API.
+status 109. För uttrycklig, fällfri blockallokering och arenor används
+i stället [`std.alloc`](#generell-allokering).
 Strängar har referensräkning och delar heap med arrayer.
 Allokatorn återanvänder block per storleksklass. Läs [kostnader och gränser](memory.md).
 
 ```sh
 dunder test tests/suite.ddr
 dunder run tools/test_runtime_contracts.ddr -- "$(command -v dunder)"
+dunder run tools/test_io.ddr -- "$(command -v dunder)"
+dunder run tools/test_alloc.ddr -- "$(command -v dunder)"
 ```
 
 Tester jämför map, set och sortering mot Pythons referensresultat. De

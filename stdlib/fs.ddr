@@ -2,10 +2,20 @@ capability filesystem, unsafe
 import std.array as array
 import std.bytes as bytes
 import std.dl as dl
+import std.io as io
 import sys
 
 @extern("c", "uname")
 unsafe fn c_uname(output: ptr) -> i32
+@c_variadic(2)
+@extern("c", "open")
+unsafe fn c_open_mode(path: ptr, flags: i32, mode: i32) -> i32
+@extern("c", "lseek")
+unsafe fn c_lseek(fd: i32, offset: i64, whence: i32) -> i64
+@extern("c", "fsync")
+unsafe fn c_fsync(fd: i32) -> i32
+@extern("c", "__error")
+unsafe fn c_errno_ptr() -> ptr
 @extern("c", "opendir")
 unsafe fn c_opendir(path: ptr) -> ptr
 @extern("c", "readdir")
@@ -45,6 +55,12 @@ impl ReadFile {
     pub fn read_bytes_limit(&self, max_bytes: i64) -> sys.BytesResult { sys.read_u8_limit(self.path, max_bytes) }
     pub fn read_bytes_into(&self, out: &mut []u8, max_bytes: i64) -> sys.Status { sys.read_u8_into(self.path, &mut out, max_bytes) }
     pub fn metadata(&self) -> sys.Metadata { sys.metadata(self.path) }
+    pub fn open(&self) -> Result<FileReader, sys.IoError> {
+        match os_open_fd(self.path, OpenOptions::read_only()) {
+            .Ok(fd) => .Ok(FileReader { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
 }
 
 impl WriteFile {
@@ -53,6 +69,290 @@ impl WriteFile {
     pub fn write(&self, text: string) -> sys.Status { sys.write_text(self.path, text) }
     pub fn append(&self, text: string) -> sys.Status { sys.append_text(self.path, text) }
     pub fn write_bytes(&self, bytes: &[]u8) -> sys.Status { sys.write_u8(self.path, &bytes) }
+    pub fn create(&self) -> Result<FileWriter, sys.IoError> {
+        match os_open_fd(self.path, OpenOptions::create_truncate()) {
+            .Ok(fd) => .Ok(FileWriter { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
+    pub fn open_append(&self) -> Result<FileWriter, sys.IoError> {
+        match os_open_fd(self.path, OpenOptions::append_only()) {
+            .Ok(fd) => .Ok(FileWriter { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
+}
+
+pub struct OpenOptions {
+    read: bool,
+    write: bool,
+    create: bool,
+    truncate: bool,
+    append: bool,
+    create_new: bool,
+    mode: i32,
+}
+
+impl OpenOptions {
+    pub fn read_only() -> Self {
+        Self { read: true, write: false, create: false, truncate: false, append: false, create_new: false, mode: 420 }
+    }
+    pub fn write_only() -> Self {
+        Self { read: false, write: true, create: false, truncate: false, append: false, create_new: false, mode: 420 }
+    }
+    pub fn create_truncate() -> Self {
+        Self { read: false, write: true, create: true, truncate: true, append: false, create_new: false, mode: 420 }
+    }
+    pub fn append_only() -> Self {
+        Self { read: false, write: true, create: true, truncate: false, append: true, create_new: false, mode: 420 }
+    }
+    pub fn read_write() -> Self {
+        Self { read: true, write: true, create: false, truncate: false, append: false, create_new: false, mode: 420 }
+    }
+    pub fn set_create(&mut self, enabled: bool) { self.create = enabled }
+    pub fn set_truncate(&mut self, enabled: bool) { self.truncate = enabled }
+    pub fn set_append(&mut self, enabled: bool) { self.append = enabled }
+    pub fn set_create_new(&mut self, enabled: bool) { self.create_new = enabled }
+    pub fn set_mode(&mut self, mode: i32) { self.mode = mode }
+}
+
+@resource(dispose)
+pub opaque struct FileReader { fd: i32 }
+
+@resource(dispose)
+pub opaque struct FileWriter { fd: i32 }
+
+@resource(dispose)
+pub opaque struct File { fd: i32 }
+
+fn os_close_fd(fd: i32) -> Result<(), sys.IoError> {
+    if fd < 0 { return .Ok }
+    if !target_is("native") { return .Err(.Unsupported) }
+    n := sys.fd_close(fd)
+    if n < 0 { return .Err(sys.IoError::from_code(i32(-n))) }
+    .Ok
+}
+
+fn os_open_fd(path: string, opts: OpenOptions) -> Result<i32, sys.IoError> {
+    if !target_is("native") { return .Err(.Unsupported) }
+    if !opts.read && !opts.write { return .Err(.InvalidArgument) }
+    if opts.truncate && !opts.write { return .Err(.InvalidArgument) }
+    mut raw_path: []u8 = []
+    path_err := c_path(path, &mut raw_path)
+    if path_err != 0 { return .Err(sys.IoError::from_code(path_err)) }
+    mut base_flags := 0
+    if opts.read && opts.write { base_flags = 2 }
+    else if opts.write { base_flags = 1 }
+    if target_is("macos") {
+        mut flags := base_flags + 16777216 // O_CLOEXEC
+        if opts.create || opts.create_new { flags += 512 }
+        if opts.create_new { flags += 2048 }
+        if opts.truncate { flags += 1024 }
+        if opts.append { flags += 8 }
+        unsafe {
+            fd := c_open_mode(addr(&raw_path[0]), flags, opts.mode)
+            if fd < 0 { return .Err(sys.IoError::from_code(portable_errno(load_i32(c_errno_ptr()), true))) }
+            return .Ok(fd)
+        }
+    } else if target_is("linux") {
+        mut flags := base_flags + 524288 // O_CLOEXEC
+        if opts.create || opts.create_new { flags += 64 }
+        if opts.create_new { flags += 128 }
+        if opts.truncate { flags += 512 }
+        if opts.append { flags += 1024 }
+        unsafe {
+            // openat(AT_FDCWD=-100, path, flags, mode) = ARM64 syscall 56 (mapped on x86_64)
+            r := sys.linux_syscall(56, -100, i64(usize(addr(&raw_path[0]))), i64(flags), i64(opts.mode), 0, 0)
+            if r < 0 { return .Err(sys.IoError::from_code(portable_errno(i32(-r), false))) }
+            return .Ok(i32(r))
+        }
+    }
+    .Err(.Unsupported)
+}
+
+fn seek_whence_and_offset(pos: io.SeekFrom) -> (i32, i64) {
+    match pos {
+        .Start(n) => (0, n),
+        .Current(n) => (1, n),
+        .End(n) => (2, n),
+    }
+}
+
+fn os_lseek(fd: i32, pos: io.SeekFrom) -> Result<i64, sys.IoError> {
+    if fd < 0 { return .Err(.BadDescriptor) }
+    if !target_is("native") { return .Err(.Unsupported) }
+    (whence, offset) := seek_whence_and_offset(pos)
+    if target_is("macos") {
+        unsafe {
+            r := c_lseek(fd, offset, whence)
+            if r < 0 { return .Err(sys.IoError::from_code(portable_errno(load_i32(c_errno_ptr()), true))) }
+            return .Ok(r)
+        }
+    } else if target_is("linux") {
+        unsafe {
+            // lseek(fd, offset, whence) = ARM64 syscall 62 (mapped on x86_64)
+            r := sys.linux_syscall(62, i64(fd), offset, i64(whence), 0, 0, 0)
+            if r < 0 && r >= -4095 { return .Err(sys.IoError::from_code(portable_errno(i32(-r), false))) }
+            return .Ok(r)
+        }
+    }
+    .Err(.Unsupported)
+}
+
+fn os_fsync(fd: i32) -> Result<(), sys.IoError> {
+    if fd < 0 { return .Err(.BadDescriptor) }
+    if !target_is("native") { return .Err(.Unsupported) }
+    if target_is("macos") {
+        unsafe {
+            if c_fsync(fd) != 0 { return .Err(sys.IoError::from_code(portable_errno(load_i32(c_errno_ptr()), true))) }
+            return .Ok
+        }
+    } else if target_is("linux") {
+        unsafe {
+            // fsync(fd) = ARM64 syscall 82 (mapped on x86_64)
+            r := sys.linux_syscall(82, i64(fd), 0, 0, 0, 0, 0)
+            if r < 0 { return .Err(sys.IoError::from_code(portable_errno(i32(-r), false))) }
+            return .Ok
+        }
+    }
+    .Err(.Unsupported)
+}
+
+impl FileReader {
+    @requires(filesystem)
+    pub fn open(path: string) -> Result<Self, sys.IoError> {
+        match os_open_fd(path, OpenOptions::read_only()) {
+            .Ok(fd) => .Ok(Self { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
+    pub fn fd(&self) -> i32 { self.fd }
+    pub fn close(&mut self) -> Result<(), sys.IoError> {
+        fd := self.fd
+        self.fd = -1
+        os_close_fd(fd)
+    }
+    fn dispose(&mut self) {
+        if self.fd >= 0 {
+            _ := sys.fd_close(self.fd)
+            self.fd = -1
+        }
+    }
+}
+
+impl io.Read for FileReader {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        if self.fd < 0 { return .Err(.BadDescriptor) }
+        io.fd_read_chunk(self.fd, &mut out, max_bytes)
+    }
+}
+
+impl io.Seek for FileReader {
+    fn seek(&mut self, pos: io.SeekFrom) -> Result<i64, sys.IoError> {
+        os_lseek(self.fd, pos)
+    }
+}
+
+impl FileWriter {
+    @requires(filesystem)
+    pub fn create(path: string) -> Result<Self, sys.IoError> {
+        match os_open_fd(path, OpenOptions::create_truncate()) {
+            .Ok(fd) => .Ok(Self { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
+    @requires(filesystem)
+    pub fn open_append(path: string) -> Result<Self, sys.IoError> {
+        match os_open_fd(path, OpenOptions::append_only()) {
+            .Ok(fd) => .Ok(Self { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
+    pub fn fd(&self) -> i32 { self.fd }
+    pub fn sync(&self) -> Result<(), sys.IoError> { os_fsync(self.fd) }
+    pub fn close(&mut self) -> Result<(), sys.IoError> {
+        fd := self.fd
+        self.fd = -1
+        os_close_fd(fd)
+    }
+    fn dispose(&mut self) {
+        if self.fd >= 0 {
+            _ := sys.fd_close(self.fd)
+            self.fd = -1
+        }
+    }
+}
+
+impl io.Write for FileWriter {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        if self.fd < 0 { return .Err(.BadDescriptor) }
+        io.fd_write_chunk(self.fd, &data)
+    }
+    fn flush(&mut self) -> Result<(), sys.IoError> {
+        if self.fd < 0 { return .Err(.BadDescriptor) }
+        .Ok
+    }
+}
+
+impl io.Seek for FileWriter {
+    fn seek(&mut self, pos: io.SeekFrom) -> Result<i64, sys.IoError> {
+        os_lseek(self.fd, pos)
+    }
+}
+
+impl File {
+    @requires(filesystem)
+    pub fn open(path: string, opts: OpenOptions) -> Result<Self, sys.IoError> {
+        match os_open_fd(path, opts) {
+            .Ok(fd) => .Ok(Self { fd: fd }),
+            .Err(e) => .Err(e),
+        }
+    }
+    @requires(filesystem)
+    pub fn open_read(path: string) -> Result<Self, sys.IoError> {
+        File::open(path, OpenOptions::read_only())
+    }
+    @requires(filesystem)
+    pub fn create(path: string) -> Result<Self, sys.IoError> {
+        File::open(path, OpenOptions::create_truncate())
+    }
+    pub fn fd(&self) -> i32 { self.fd }
+    pub fn sync(&self) -> Result<(), sys.IoError> { os_fsync(self.fd) }
+    pub fn close(&mut self) -> Result<(), sys.IoError> {
+        fd := self.fd
+        self.fd = -1
+        os_close_fd(fd)
+    }
+    fn dispose(&mut self) {
+        if self.fd >= 0 {
+            _ := sys.fd_close(self.fd)
+            self.fd = -1
+        }
+    }
+}
+
+impl io.Read for File {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        if self.fd < 0 { return .Err(.BadDescriptor) }
+        io.fd_read_chunk(self.fd, &mut out, max_bytes)
+    }
+}
+
+impl io.Write for File {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        if self.fd < 0 { return .Err(.BadDescriptor) }
+        io.fd_write_chunk(self.fd, &data)
+    }
+    fn flush(&mut self) -> Result<(), sys.IoError> {
+        if self.fd < 0 { return .Err(.BadDescriptor) }
+        .Ok
+    }
+}
+
+impl io.Seek for File {
+    fn seek(&mut self, pos: io.SeekFrom) -> Result<i64, sys.IoError> {
+        os_lseek(self.fd, pos)
+    }
 }
 
 impl ReadDir {

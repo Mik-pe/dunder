@@ -198,10 +198,13 @@ som uppfyller kraven.
 ### Traits och `impl Trait for Type`
 
 En `trait`-deklaration namnger ett statiskt kontrakt med noll eller flera
-säkra metodsignaturer samt valfria supertraits efter `:`. Metodsignaturer får
+metodsignaturer (säkra `fn` eller `unsafe fn` i en modul med `capability unsafe`)
+samt valfria supertraits efter `:`. Metodsignaturer får
 innehålla `Self` även inuti generiska typer som `Result<Self, string>`, och en
 traitmetod kan ha en standardkropp (`fn ne(&self, other: &Self) -> bool { ... }`)
-som syntetiseras automatiskt när en implementation inte ersätter den. Implementering sker
+som syntetiseras automatiskt när en implementation inte ersätter den. En
+implementation i `impl Trait for Type` måste matcha säkerheten (`fn` respektive
+`unsafe fn`) i traitdeklarationen. Implementering sker
 explicit med `impl Trait for Type`:
 
 ```dunder
@@ -945,8 +948,10 @@ ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
 
 `u8`, `u16`, `u32`, `u64`, `usize` och `ptr` kan användas i variabler,
 fält och samlingar. `@c_layout struct` anger C-fältlayout. En modul med
-`capability unsafe` kan använda `unsafe fn`, `unsafe { ... }`, `@extern`
-och typade C-funktionspekare. `capability filesystem` ger tillgång till att
-skapa filhandtag. En `pub opaque struct` exponerar typen och låter den
-definierande modulen äga konstruktion och fältåtkomst.
-[Språkkontrakt och exempel](ffi.md)
+`capability unsafe` kan använda `unsafe fn` (även i `trait` och `impl Trait for Type`),
+`unsafe { ... }`, `bytes_view(&owner, base, length)`, `@extern` och typade
+C-funktionspekare. `capability filesystem`, `network`, `process` och `stdio`
+styr tillgången till delegerbara OS-handtag. `@resource(dispose)` stöder
+städmetoden `fn dispose(&self)` eller `fn dispose(&mut self)`. En
+`pub opaque struct` exponerar typen och låter den definierande modulen äga
+konstruktion och fältåtkomst. [Språkkontrakt och exempel](ffi.md)

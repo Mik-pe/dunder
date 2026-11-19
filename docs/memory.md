@@ -47,8 +47,10 @@ fn main() {
 }
 ```
 
-Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `UdpSocket`, `Child` och
-`ChildSet` är sådana resurser. Fil- och körningskapabiliteter som bara
+Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `UdpSocket`, `Child`,
+`ChildSet`, `ChildStdin`, `ChildStdout`, `ChildStderr`, `FileReader`,
+`FileWriter`, `File` samt allokeringsbehållarna `Bump`, `OwnedBuf`, `Arena` och
+`FrozenArena` är sådana resurser. Fil- och körningskapabiliteter som bara
 innehåller en sökväg kan däremot uttryckligen klonas.
 Lokala resurser i en worker följer taskens effektregler. Transport över en
 isolerad taskgräns kräver klonbara värden. Resurstyper använder Dunders
@@ -57,11 +59,14 @@ vanliga structlayout och lagras som ägda värden.
 ### Automatisk stängning
 
 Med `@resource(dispose)` anropar kompilatorn den privata instansmetoden
-`fn dispose(&self)` när det sista ägda värdet släpps. Metoden måste vara
-säker och returnera `()`. Den körs synkront före frigöring av structens
-fält och kan därför blockera om stängningsoperationen blockerar. Samma
-regel gäller vid blockslut, `return` (även av ett felvärde), `break`,
-`continue`, ersättning av ett värde och när ägaren finns i ett aggregat.
+`fn dispose(&self)` eller `fn dispose(&mut self)` när det sista ägda värdet
+släpps. Metoden måste vara säker och returnera `()`. Den körs synkront före
+frigöring av structens fält och kan därför blockera om stängningsoperationen
+blockerar. Samma regel gäller vid blockslut, `return` (även av ett felvärde),
+`break`, `continue`, ersättning av ett värde och när ägaren finns i ett aggregat.
+Muterbar `dispose(&mut self)` gör att resurser som `FileReader`, `Bump`,
+`OwnedBuf`, `Arena` och `FrozenArena` även kan dela på en explicit `.close()`
+eller `.release()` och lämna värdet tomt utan dubbel frigöring.
 En runtimefälla som avslutar hela processen går direkt till processavslut.
 
 Flytt av hela resursen överför stängningsansvaret. Använd `replace` för
@@ -281,7 +286,11 @@ vidarebefordrar en hel array. En uttrycklig `.clone()` ger en ägd kopia.
 
 Returkontraktet gäller delade referenser i vanliga Dunder-anrop. C-anrop,
 taskresultat och referenser lagrade i structar eller arrayer kräver egna
-livstidsregler och ingår inte.
+livstidsregler och ingår inte. För låg-nivåbehållare som lagrar råa pekare
+(till exempel `OwnedBuf::as_bytes`, `Arena::bytes` och `FrozenArena::bytes` i
+`std.alloc`) skapar `unsafe bytes_view(&owner, base, length)` en lånad vy
+`&[]u8` bunden till `&owner`: kompilatorn håller källan lånad lika länge som
+vyn används; se [FFI och råminne](ffi.md).
 
 ## Pool och kostnader
 
@@ -302,7 +311,10 @@ Dynamisk sammanslagning och snitt tillåter högst 16 MiB per strängblock
 inklusive längdordet. En misslyckad strängallokering i dessa operatorer ger
 status 105. En ogiltig UTF-8-gräns eller Unicode-kodpunkt ger 106.
 En ogiltig arraykapacitet eller otillräckligt utrymme för en array eller region ger 109.
-Wasm avbryter den aktuella körningen med en trap.
+Wasm avbryter den aktuella körningen med en trap. För uttrycklig
+blockallokering utan dolda fällor erbjuder [`std.alloc`](standard.md#generell-allokering)
+`RawAllocator` (`Global`, `System`, `Capped<A>`, `Tracking<A>`, `Bump<A>`),
+`OwnedBuf<A>`, `Arena<A>`/`FrozenArena<A>` samt generationssäkra `Pool<T>`/`Id<T>`.
 
 ## Verifiering
 
@@ -315,6 +327,8 @@ dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" run tools/test_stdlib_ownership.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_local_borrows.ddr -- "$dunder_bin"
 "$dunder_bin" run tools/test_returned_borrows.ddr -- "$dunder_bin"
+"$dunder_bin" run tools/test_io.ddr -- "$dunder_bin"
+"$dunder_bin" run tools/test_alloc.ddr -- "$dunder_bin"
 ```
 
 Lånesviten korsbygger de tre nativa målen och kör värdmålets program.

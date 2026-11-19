@@ -139,14 +139,21 @@ giltiga intervall är lika. Funktionerna kräver ingen `unsafe`-behörighet.
 `extend`, `extend_range` och `append_utf8` reserverar utrymme en gång och
 kopierar byte i bulk; `extend_range` avbryter vid ogiltiga intervall.
 
-`unsafe sys.memory_copy` och `unsafe sys.memory_equal` tar råa pekare och ett
-antal byte av typen `usize`. Anroparen ansvarar för läsbart källminne och,
-vid kopiering, skrivbart målminne under hela anropet. Överlappande kopiering
-fungerar i båda riktningarna. Noll byte läser eller skriver inget minne och
-tillåter därför nullpekare; jämförelsen ger då `true`. Jämförelsen har inget
-kontrakt om konstant körtid. Samma funktioner finns som
-`std.bytes.copy_memory` och `std.bytes.equal_memory`. De stöds av samtliga
-native-mål och WebAssembly utan en C-biblioteksimport.
+`unsafe sys.memory_copy`, `unsafe sys.memory_equal` och `unsafe sys.memory_zero`
+tar råa pekare och ett antal byte av typen `usize`. Anroparen ansvarar för
+läsbart källminne och, vid kopiering eller nollställning, skrivbart målminne
+under hela anropet. Överlappande kopiering fungerar i båda riktningarna. Noll
+byte läser eller skriver inget minne och tillåter därför nullpekare; jämförelsen
+ger då `true`. Jämförelsen har inget kontrakt om konstant körtid. `memory_copy`
+och `memory_equal` finns även som `std.bytes.copy_memory` och
+`std.bytes.equal_memory`. Samtliga stöds av alla native-mål och WebAssembly utan
+en C-biblioteksimport.
+
+För generell allokering finns dessutom `unsafe sys.pool_alloc_try(size)` och
+`unsafe sys.pool_free(pointer)` ovanpå Dunders inbyggda poolallokator. Till
+skillnad från automatiska array- och strängtillväxter fäller `pool_alloc_try`
+aldrig utan returnerar en nullpekare vid begäran om `0` byte, storlekar över
+`256 MiB` eller full pool. [Generell allokering](standard.md#generell-allokering).
 
 ## Sökvägar och filer
 
@@ -159,7 +166,11 @@ Högst 1023 UTF-8-byte ryms i en sökväg; OS:et kontrollerar också komponenter
 `read_text`, `write_text` och `append_text` hanterar vanliga filer.
 Kataloger, enheter och FIFO:er används inte som textströmmar. Öppning är
 icke-blockerande, filtypen kontrolleras och filhandtaget stängs både vid
-lyckat anrop och vid fel. Inga råa filhandtag exponeras ännu.
+lyckat anrop och vid fel. Råa filbeskrivare stöds på låg nivå genom `fd_read`,
+`fd_write` och `fd_close`, som ligger till grund för ägda strömhandtag som
+`Stdin`/`Stdout`/`Stderr` i `std.io`, `FileReader`/`FileWriter`/`File` i
+`std.fs` samt `ChildStdin`/`ChildStdout`/`ChildStderr` i `std.process`; se
+[Strömmar och standardinmatning](standard.md#strömmar-och-standardinmatning).
 Textinnehåll får innehålla NUL. Byteföljden måste vara giltig UTF-8 vid läsning.
 
 `write_text` trunkerar en befintlig vanlig fil innan skrivningen. Den är
@@ -194,20 +205,26 @@ Vanliga värden:
 | Fel | Betydelse |
 | --- | --- |
 | 2 | Fil eller katalog saknas. |
+| 4 | Avbruten (`Interrupted`, EINTR). |
 | 12 | Minne/strängarena räcker inte. |
 | 13 | Åtkomst nekad. |
 | 17 | Finns redan. |
 | 21 | En katalog användes som textfil. |
 | 22 | Ogiltigt argument, bland annat NUL i sökvägen. |
 | 27 | Filen är för stor. |
-| 35 | Tillfälligt otillgänglig; kan också betyda tillväxt under läsningen. |
+| 28 | Slut på utrymme (`NoSpace`, ENOSPC). |
+| 35 | Tillfälligt otillgänglig (`WouldBlock`); kan också betyda tillväxt under läsningen. |
 | 45 | Filtypen stöds inte för text-I/O. |
 | 63 | Sökvägen är för lång. |
 | 66 | Katalogen är inte tom. |
 | 92 | Filinnehållet är inte giltig UTF-8. |
+| 93 | Oväntat filslut (`UnexpectedEof`). |
+| 94 | Skrivning skrev noll byte (`WriteZero`). |
 
-OS:et kan ge andra felkoder. `error_message` är en liten Dunder-tabell,
-inte hela systemets lokaliserade felkatalog.
+`IoError::would_block()` konstruerar motsvarande fel och `.is_would_block()`
+provar om felet betyder att anropet skulle ha blockerat. OS:et kan ge andra
+felkoder; `error_message` är en liten Dunder-tabell, inte hela systemets
+lokaliserade felkatalog.
 
 ## Importer och verifiering
 

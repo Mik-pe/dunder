@@ -1,0 +1,361 @@
+capability process, filesystem
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import sys
+
+fn verify_linux_elf(image: &[]u8, expect_dynamic: bool, interpreter: string) -> bool {
+    if image.len < 64 { return harness.fail("ELF image too small") }
+    if image[0] != 0x7f || image[1] != 69 || image[2] != 76 || image[3] != 70 {
+        return harness.fail("missing ELF magic")
+    }
+    table := bytes.i64_le(&image, 32)
+    stride := bytes.u16_le(&image, 54)
+    count := bytes.u16_le(&image, 56)
+    if table < 0 || stride < 56 || count <= 0 || table + i64(count) * i64(stride) > i64(image.len) {
+        return harness.fail("invalid ELF program header table bounds")
+    }
+    mut interp_count := 0
+    mut saw_dynamic := false
+    for i in 0..count {
+        base := i32(table) + i * stride
+        kind := bytes.u32_le(&image, base)
+        offset := bytes.i64_le(&image, base + 8)
+        size := bytes.i64_le(&image, base + 32)
+        if kind == 3 {
+            interp_count += 1
+            if expect_dynamic {
+                want_len := interpreter.len + 1
+                if offset < 0 || size != i64(want_len) || offset + size > i64(image.len) {
+                    return harness.fail("invalid PT_INTERP bounds or size")
+                }
+                off32 := i32(offset)
+                if !bytes.equals_text(&image, off32, off32 + interpreter.len, interpreter) || image[off32 + interpreter.len] != 0 {
+                    return harness.fail("unexpected PT_INTERP string")
+                }
+            }
+        }
+        if kind == 2 { saw_dynamic = true }
+    }
+    if expect_dynamic {
+        if interp_count != 1 { return harness.fail("expected dynamic ELF with 1 PT_INTERP segment") }
+        if !saw_dynamic { return harness.fail("expected dynamic ELF with PT_DYNAMIC segment") }
+    } else {
+        if interp_count != 0 { return harness.fail("expected static ELF with 0 PT_INTERP segments") }
+        if saw_dynamic { return harness.fail("expected static ELF without PT_DYNAMIC segment") }
+    }
+    true
+}
+
+fn core_matrix_program() -> string {
+    "capability unsafe\n\n" +
+    "import std.alloc as alloc\n" +
+    "import std.io as io\n\n" +
+    "@c_layout\n" +
+    "struct CRec {\n" +
+    "    tag: u8,\n" +
+    "    value: i64,\n" +
+    "}\n\n" +
+    "@resource(dispose)\n" +
+    "struct MutDrop {\n" +
+    "    alive: bool,\n" +
+    "}\n\n" +
+    "impl MutDrop {\n" +
+    "    fn dispose(&mut self) {\n" +
+    "        self.alive = false\n" +
+    "    }\n" +
+    "}\n\n" +
+    "fn main() {\n" +
+    "    // Layout & AllocError\n" +
+    "    assert(alloc.AllocError.InvalidLayout == alloc.AllocError.InvalidLayout)\n" +
+    "    assert(alloc.AllocError.OutOfMemory != alloc.AllocError.LimitExceeded)\n" +
+    "    assert(f\"{alloc.AllocError.LimitExceeded}\".len > 0)\n" +
+    "    assert(alloc.Layout::from_size_align(usize(0), usize(0)).is_err())\n" +
+    "    assert(alloc.Layout::from_size_align(usize(16), usize(3)).is_err())\n" +
+    "    l1 := alloc.layout_of<i32>()\n" +
+    "    assert(l1.size() == usize(4) && l1.align() == usize(4) && l1.is_valid())\n" +
+    "    l2 := alloc.layout_of<CRec>()\n" +
+    "    assert(l2.size() == usize(16) && l2.align() == usize(8))\n" +
+    "    match alloc.layout_array<CRec>(usize(4)) {\n" +
+    "        .Ok(arr_l) => assert(arr_l.size() == usize(64) && arr_l.align() == usize(8)),\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "    if !target_is(\"wasm32\") {\n" +
+    "        huge_u64 := u64(9223372036854775807)\n" +
+    "        huge := usize(huge_u64)\n" +
+    "        assert(alloc.Layout::from_size_align(huge, usize(16)).is_err())\n" +
+    "    } else {\n" +
+    "        huge := usize(2147483647)\n" +
+    "        assert(alloc.Layout::from_size_align(huge, usize(16)).is_err())\n" +
+    "    }\n" +
+    "\n" +
+    "    // Global & System raw allocators\n" +
+    "    mut g := alloc.Global::default()\n" +
+    "    mut sys_alloc := alloc.System::default()\n" +
+    "    unsafe {\n" +
+    "        z_lay := alloc.Layout::bytes(usize(0))\n" +
+    "        match z_lay {\n" +
+    "            .Ok(zl) => {\n" +
+    "                match g.alloc(zl) {\n" +
+    "                    .Ok(zb) => { assert(zb.is_empty()); g.dealloc(zb, zl) },\n" +
+    "                    .Err(_) => assert(false),\n" +
+    "                }\n" +
+    "            },\n" +
+    "            .Err(_) => assert(false),\n" +
+    "        }\n" +
+    "\n" +
+    "        l64 := match alloc.Layout::from_size_align(usize(32), usize(64)) {\n" +
+    "            .Ok(v) => v,\n" +
+    "            .Err(_) => { assert(false); alloc.Layout { size: usize(1), align: usize(1) } },\n" +
+    "        }\n" +
+    "        match g.alloc_zeroed(l64) {\n" +
+    "            .Ok(b0) => {\n" +
+    "                assert(usize(b0.address()).bit_and(usize(63)) == usize(0))\n" +
+    "                assert(load_u8(b0.address()) == 0 && load_u8(ptr(usize(b0.address()) + usize(31))) == 0)\n" +
+    "                store_u8(b0.address(), 77)\n" +
+    "                l128 := match alloc.Layout::from_size_align(usize(128), usize(64)) {\n" +
+    "                    .Ok(v) => v,\n" +
+    "                    .Err(_) => { assert(false); l64 },\n" +
+    "                }\n" +
+    "                match g.realloc(b0, l64, l128) {\n" +
+    "                    .Ok(b1) => {\n" +
+    "                        assert(usize(b1.address()).bit_and(usize(63)) == usize(0))\n" +
+    "                        assert(load_u8(b1.address()) == 77)\n" +
+    "                        g.dealloc(b1, l128)\n" +
+    "                    },\n" +
+    "                    .Err(_) => assert(false),\n" +
+    "                }\n" +
+    "            },\n" +
+    "            .Err(_) => assert(false),\n" +
+    "        }\n" +
+    "\n" +
+    "        match sys_alloc.alloc_zeroed(l64) {\n" +
+    "            .Ok(sb) => {\n" +
+    "                assert(usize(sb.address()).bit_and(usize(63)) == usize(0))\n" +
+    "                assert(load_u8(ptr(usize(sb.address()) + usize(15))) == 0)\n" +
+    "                sys_alloc.dealloc(sb, l64)\n" +
+    "            },\n" +
+    "            .Err(_) => assert(false),\n" +
+    "        }\n" +
+    "        match alloc.Layout::from_size_align(usize(64), usize(32768)) {\n" +
+    "            .Ok(l32k) => {\n" +
+    "                match sys_alloc.alloc(l32k) {\n" +
+    "                    .Ok(sb2) => {\n" +
+    "                        assert(usize(sb2.address()).bit_and(usize(32767)) == usize(0))\n" +
+    "                        store_u8(sb2.address(), 99)\n" +
+    "                        assert(load_u8(sb2.address()) == 99)\n" +
+    "                        sys_alloc.dealloc(sb2, l32k)\n" +
+    "                    },\n" +
+    "                    .Err(_) => assert(false),\n" +
+    "                }\n" +
+    "            },\n" +
+    "            .Err(_) => assert(false),\n" +
+    "        }\n" +
+    "\n" +
+    "        // Capped<Global>\n" +
+    "        mut capped := alloc.Capped<alloc.Global>::new(alloc.Global::new(), usize(128))\n" +
+    "        lb := alloc.Layout { size: usize(64), align: usize(8) }\n" +
+    "        lb65 := alloc.Layout { size: usize(65), align: usize(8) }\n" +
+    "        match capped.alloc(lb) {\n" +
+    "            .Ok(cb) => {\n" +
+    "                assert(capped.used() == usize(64) && capped.remaining() == usize(64))\n" +
+    "                match capped.alloc(lb65) {\n" +
+    "                    .Ok(_) => assert(false),\n" +
+    "                    .Err(e) => assert(e == .LimitExceeded),\n" +
+    "                }\n" +
+    "                capped.dealloc(cb, lb)\n" +
+    "                assert(capped.used() == usize(0) && capped.remaining() == usize(128))\n" +
+    "            },\n" +
+    "            .Err(_) => assert(false),\n" +
+    "        }\n" +
+    "    }\n" +
+    "\n" +
+    "    // Tracking<Global> + Bump<Tracking<Global>> + dispose(&mut self)\n" +
+    "    mut bump := alloc.Bump<alloc.Tracking<alloc.Global>>::with_slab_size(alloc.Tracking<alloc.Global>::default(), usize(64))\n" +
+    "    unsafe {\n" +
+    "        l32 := alloc.Layout { size: usize(32), align: usize(8) }\n" +
+    "        l40 := alloc.Layout { size: usize(40), align: usize(8) }\n" +
+    "        b_a := match bump.alloc(l32) { .Ok(v) => v, .Err(_) => { assert(false); alloc.Block::empty() } }\n" +
+    "        b_b := match bump.alloc(l40) { .Ok(v) => v, .Err(_) => { assert(false); alloc.Block::empty() } }\n" +
+    "        assert(bump.slab_count() == 2 && bump.allocated_bytes() == usize(72))\n" +
+    "        // LIFO dealloc fast-path reclaims last allocation\n" +
+    "        bump.dealloc(b_b, l40)\n" +
+    "        assert(bump.allocated_bytes() == usize(32))\n" +
+    "        bump.dealloc(b_a, l32)\n" +
+    "    }\n" +
+    "    bump.reset()\n" +
+    "    assert(bump.slab_count() == 1 && bump.allocated_bytes() == usize(0))\n" +
+    "    bump.release()\n" +
+    "    assert(bump.backing().stats().live_bytes == usize(0))\n" +
+    "    assert(bump.backing().stats().allocs == bump.backing().stats().deallocs)\n" +
+    "\n" +
+    "    // MutDrop tests @resource(dispose) with fn dispose(&mut self)\n" +
+    "    { md := MutDrop { alive: true }; assert(md.alive) }\n" +
+    "\n" +
+    "    // OwnedBuf<Tracking<Global>> + io.Write + bytes_view + buf_into_allocator\n" +
+    "    mut ob := alloc.OwnedBuf<alloc.Tracking<alloc.Global>>::default()\n" +
+    "    assert(ob.extend_str(\"hello \").is_ok())\n" +
+    "    mut cur := io.Cursor::from_text(\"world!\")\n" +
+    "    assert(io.copy<io.Cursor, alloc.OwnedBuf<alloc.Tracking<alloc.Global>>>(&mut cur, &mut ob) == .Ok(6))\n" +
+    "    assert(ob.len() == usize(12))\n" +
+    "    {\n" +
+    "        view := ob.as_bytes()\n" +
+    "        assert(view.len == 12 && view[0] == 104 && view[6] == 119 && view[11] == 33)\n" +
+    "    }\n" +
+    "    tr := alloc.buf_into_allocator<alloc.Tracking<alloc.Global>>(move ob)\n" +
+    "    assert(tr.stats().live_bytes == usize(0) && tr.stats().allocs > u64(0) && tr.stats().allocs == tr.stats().deallocs)\n" +
+    "\n" +
+    "    // Arena + Span + FrozenArena + read_into_arena\n" +
+    "    mut arena := alloc.Arena<alloc.Tracking<alloc.Global>>::with_chunk_size(alloc.Tracking<alloc.Global>::default(), usize(64))\n" +
+    "    s_empty := match arena.push_str(\"\") { .Ok(sp) => sp, .Err(_) => { assert(false); alloc.Span::empty() } }\n" +
+    "    assert(s_empty.is_empty())\n" +
+    "    s1 := match arena.push_str(\"alpha\") { .Ok(sp) => sp, .Err(_) => { assert(false); alloc.Span::empty() } }\n" +
+    "    s2 := match arena.alloc_zeroed(usize(70)) { .Ok(sp) => sp, .Err(_) => { assert(false); alloc.Span::empty() } }\n" +
+    "    mut rcur := io.Cursor::from_text(\"streamed-span\")\n" +
+    "    s3 := match alloc.read_into_arena<alloc.Tracking<alloc.Global>, io.Cursor>(&mut arena, &mut rcur, 128) {\n" +
+    "        .Ok(sp) => sp,\n" +
+    "        .Err(_) => { assert(false); alloc.Span::empty() },\n" +
+    "    }\n" +
+    "    assert(arena.chunk_count() >= 2)\n" +
+    "    {\n" +
+    "        b_empty := arena.bytes(s_empty)\n" +
+    "        assert(b_empty.len == 0)\n" +
+    "        b1 := arena.bytes(s1)\n" +
+    "        assert(b1.len == 5 && b1[0] == 97 && b1[4] == 97)\n" +
+    "        b2 := arena.bytes(s2)\n" +
+    "        assert(b2.len == 70 && b2[0] == 0 && b2[69] == 0)\n" +
+    "        b3 := arena.bytes(s3)\n" +
+    "        assert(b3.len == 13 && b3[0] == 115 && b3[12] == 110)\n" +
+    "    }\n" +
+    "    mut frozen := alloc.freeze_arena<alloc.Tracking<alloc.Global>>(move arena)\n" +
+    "    {\n" +
+    "        fb1 := frozen.bytes(s1)\n" +
+    "        assert(fb1.len == 5 && fb1[1] == 108)\n" +
+    "    }\n" +
+    "    mut arena2 := alloc.Arena<alloc.Tracking<alloc.Global>>::default()\n" +
+    "    _ := arena2.push_str(\"cleanup check\")\n" +
+    "    arena2.release_all()\n" +
+    "    assert(arena2.allocator().stats().live_bytes == usize(0))\n" +
+    "\n" +
+    "    // Pool<T> + Id<T> generational handles\n" +
+    "    mut pool := alloc.Pool<string>::default()\n" +
+    "    id1 := pool.insert(\"one\")\n" +
+    "    id2 := pool.insert(\"two\")\n" +
+    "    id3 := pool.insert(\"three\")\n" +
+    "    assert(pool.len() == 3 && !pool.is_empty())\n" +
+    "    assert(pool.at(id1) == \"one\" && pool.at(id2) == \"two\" && pool.at(id3) == \"three\")\n" +
+    "    assert(pool.set(id2, \"TWO\"))\n" +
+    "    assert(pool.at(id2) == \"TWO\")\n" +
+    "    match move pool.remove(id1) {\n" +
+    "        .Ok(v) => assert(v == \"one\"),\n" +
+    "        .Err => assert(false),\n" +
+    "    }\n" +
+    "    assert(!pool.contains(id1) && pool.at(id2) == \"TWO\" && pool.at(id3) == \"three\")\n" +
+    "    assert(pool.remove(id1).is_err())\n" +
+    "    id4 := pool.insert(\"four\")\n" +
+    "    assert(id4.index() == id1.index() && id4.generation() != id1.generation())\n" +
+    "    assert(!pool.contains(id1) && pool.contains(id4) && pool.at(id4) == \"four\")\n" +
+    "    pool.clear()\n" +
+    "    assert(pool.is_empty() && !pool.contains(id2) && !pool.contains(id3) && !pool.contains(id4))\n" +
+    "\n" +
+    "    // Pool holding @resource(dispose) items\n" +
+    "    mut res_pool := alloc.Pool<MutDrop>::new()\n" +
+    "    rid := res_pool.insert(MutDrop { alive: true })\n" +
+    "    assert(res_pool.at(rid).alive)\n" +
+    "    print(42)\n" +
+    "}\n"
+}
+
+fn task_pool_program() -> string {
+    "import std.alloc as alloc\n\n" +
+    "struct Work {\n" +
+    "    pool: alloc.Pool<i64>,\n" +
+    "    id: alloc.Id<i64>,\n" +
+    "}\n\n" +
+    "fn sum_pool(move w: Work) -> Work {\n" +
+    "    mut next := w\n" +
+    "    target_id := next.id\n" +
+    "    mut val := i64(0)\n" +
+    "    { val = next.pool.at(target_id) + 35 }\n" +
+    "    _ := next.pool.set(target_id, val)\n" +
+    "    next\n" +
+    "}\n\n" +
+    "fn main() {\n" +
+    "    mut p := alloc.Pool<i64>::new()\n" +
+    "    id := p.insert(7)\n" +
+    "    work := Work { pool: p, id: id }\n" +
+    "    task scope s(1) {\n" +
+    "        tid := spawn s sum_pool(move work)\n" +
+    "        out := await! s(tid)\n" +
+    "        assert(out.pool.at(id) == 42)\n" +
+    "    }\n" +
+    "    print(\"task-pool-ok\")\n" +
+    "}\n"
+}
+
+fn invalid_cases() -> [](string, string) {
+    [
+        ("import std.alloc as alloc\nfn main() {\n    mut g := alloc.Global::new()\n    l := alloc.Layout { size: usize(8), align: usize(8) }\n    _ := g.alloc(l)\n}", "call requires unsafe"),
+        ("capability unsafe\nimport std.alloc as alloc\nstruct BadAlloc {}\nimpl alloc.RawAllocator for BadAlloc {\n    fn alloc(&mut self, layout: alloc.Layout) -> Result<alloc.Block, alloc.AllocError> { .Err(.OutOfMemory) }\n    unsafe fn dealloc(&mut self, block: alloc.Block, layout: alloc.Layout) {}\n}\nfn main() {}", "trait method 'alloc' must be declared unsafe"),
+        ("capability unsafe\nimport std.alloc as alloc\nstruct BadAlloc2 {}\nimpl alloc.RawAllocator for BadAlloc2 {\n    unsafe fn alloc(&mut self, layout: alloc.Layout) -> Result<alloc.Block, alloc.AllocError> { .Err(.OutOfMemory) }\n    fn dealloc(&mut self, block: alloc.Block, layout: alloc.Layout) {}\n}\nfn main() {}", "trait method 'dealloc' must be declared unsafe"),
+        ("import std.alloc as alloc\nfn main() {\n    mut ob := alloc.OwnedBuf<alloc.Global>::default()\n    view := ob.as_bytes()\n    _ := ob.push_byte(1)\n    print(view.len)\n}", "cannot mutate, replace or move a value while it is borrowed"),
+        ("import std.alloc as alloc\nfn main() {\n    mut ob := alloc.OwnedBuf<alloc.Global>::default()\n    view := ob.as_bytes()\n    _ := alloc.buf_into_allocator<alloc.Global>(move ob)\n    print(view.len)\n}", "cannot mutate, replace or move a value while it is borrowed"),
+        ("import std.alloc as alloc\nfn main() {\n    mut a := alloc.Arena<alloc.Global>::default()\n    sp := match a.push_str(\"hi\") { .Ok(v) => v, .Err(_) => alloc.Span::empty() }\n    view := a.bytes(sp)\n    _ := a.push_str(\"more\")\n    print(view.len)\n}", "cannot mutate, replace or move a value while it is borrowed"),
+        ("import std.alloc as alloc\nfn main() {\n    mut pool := alloc.Pool<i32>::new()\n    id := pool.insert(5)\n    r := pool.at(id)\n    _ := pool.remove(id)\n    print(r)\n}", "cannot mutate, replace or move a value while it is borrowed"),
+        ("fn main() {\n    buf: []u8 = [1]\n    _ := bytes_view(&buf, ptr(0), usize(0))\n}", "unsafe"),
+        ("capability unsafe\nfn main() {\n    buf: []u8 = [1]\n    unsafe { _ := bytes_view(buf, ptr(0), usize(0)) }\n}", "bytes_view requires a shared borrow as first argument"),
+        ("import std.alloc as alloc\n@resource struct Handle { fd: i32 }\nfn worker(move p: alloc.Pool<Handle>) -> i32 { p.len() }\nfn main() {\n    p := alloc.Pool<Handle>::new()\n    task scope s(1) {\n        tid := spawn s worker(move p)\n        print(await s(tid))\n    }\n}", "does not implement Sendable"),
+    ]
+}
+
+fn check_linux_builds(compiler: string, work: string, path: string, tag: string, expect_dynamic: bool) -> bool {
+    mut out := harness.empty_output()
+    targets := ["arm64-linux", "x86_64-linux"]
+    interps := ["/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-x86-64.so.2"]
+    for i in 0..targets.len {
+        target := targets[i].clone()
+        image := f"{work}/{tag}-{target}"
+        if !harness.run_checked_timeout(compiler, ["build", path.clone(), "--target", target.clone(), "-o", image.clone()], work, 0, false, 60000, &mut out) {
+            return false
+        }
+        data := sys.read_u8(image)
+        if !data.ok || !verify_linux_elf(&data.value, expect_dynamic, interps[i]) { return false }
+    }
+    true
+}
+
+fn run_suite(cli: &harness.BaseCli, work: string) -> bool {
+    core_path := work + "/alloc_core.ddr"
+    if !sys.write_text(core_path, core_matrix_program()).ok { return harness.fail("write alloc_core.ddr") }
+    if !harness.run_specialization_matrix(cli.compiler, core_path, work, "42\n") { return false }
+    if !check_linux_builds(cli.compiler, work, core_path, "alloc-core", false) { return false }
+
+    task_path := work + "/alloc_task.ddr"
+    if !sys.write_text(task_path, task_pool_program()).ok { return harness.fail("write alloc_task.ddr") }
+    task_bin := work + "/alloc_task"
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(cli.compiler, ["build", task_path.clone(), "-o", task_bin.clone()], work, 0, false, 60000, &mut out) {
+        return false
+    }
+    if !harness.run_checked_timeout(task_bin, [], work, 0, false, 60000, &mut out) || !harness.stdout_is(&out, "task-pool-ok\n", "alloc_task") {
+        return false
+    }
+    if !check_linux_builds(cli.compiler, work, task_path, "alloc-task", true) { return false }
+
+    cases := invalid_cases()
+    if !harness.check_rejected_specializations(cli.compiler, work, &cases) { return false }
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    tmp := fs.temp_dir("dunder-alloc-test-")
+    if !tmp.ok { return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if !run_suite(&cli, work) { return 1 }
+    print("PASS alloc")
+    0
+}

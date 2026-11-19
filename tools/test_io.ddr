@@ -1,0 +1,504 @@
+capability process, filesystem
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.io as io
+import std.process as process
+import sys
+
+struct FailingWriter {
+    writes: i32,
+    ok_chunks: i32,
+}
+
+impl io.Write for FailingWriter {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        self.writes += 1
+        if self.writes > self.ok_chunks {
+            return .Err(.BrokenPipe)
+        }
+        .Ok(data.len)
+    }
+
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+struct ZeroWriter {}
+
+impl io.Write for ZeroWriter {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        _ := data.len
+        .Ok(0)
+    }
+
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+fn verify_linux_elf(image: &[]u8, expect_dynamic: bool, interpreter: string) -> bool {
+    if image.len < 64 { return harness.fail("ELF image too small") }
+    if image[0] != 0x7f || image[1] != 69 || image[2] != 76 || image[3] != 70 {
+        return harness.fail("missing ELF magic")
+    }
+    table := bytes.i64_le(&image, 32)
+    stride := bytes.u16_le(&image, 54)
+    count := bytes.u16_le(&image, 56)
+    if table < 0 || stride < 56 || count <= 0 || table + i64(count) * i64(stride) > i64(image.len) {
+        return harness.fail("invalid ELF program header table bounds")
+    }
+    mut interp_count := 0
+    mut saw_dynamic := false
+    for i in 0..count {
+        base := i32(table) + i * stride
+        kind := bytes.u32_le(&image, base)
+        offset := bytes.i64_le(&image, base + 8)
+        size := bytes.i64_le(&image, base + 32)
+        if kind == 3 {
+            interp_count += 1
+            if expect_dynamic {
+                want_len := interpreter.len + 1
+                if offset < 0 || size != i64(want_len) || offset + size > i64(image.len) {
+                    return harness.fail("invalid PT_INTERP bounds or size")
+                }
+                off32 := i32(offset)
+                if !bytes.equals_text(&image, off32, off32 + interpreter.len, interpreter) || image[off32 + interpreter.len] != 0 {
+                    return harness.fail("unexpected PT_INTERP string")
+                }
+            }
+        }
+        if kind == 2 { saw_dynamic = true }
+    }
+    if expect_dynamic {
+        if interp_count != 1 { return harness.fail("expected dynamic ELF with 1 PT_INTERP segment") }
+        if !saw_dynamic { return harness.fail("expected dynamic ELF with PT_DYNAMIC segment") }
+    } else {
+        if interp_count != 0 { return harness.fail("expected static ELF with 0 PT_INTERP segments") }
+        if saw_dynamic { return harness.fail("expected static ELF without PT_DYNAMIC segment") }
+    }
+    true
+}
+
+fn assert_unit_ok(res: Result<(), sys.IoError>) {
+    assert(res.is_ok())
+}
+
+fn assert_unit_err(res: Result<(), sys.IoError>, want: sys.IoError) {
+    match res {
+        .Ok => assert(false),
+        .Err(e) => assert(e == want),
+    }
+}
+
+fn core_matrix_program() -> string {
+    "import std.io as io\n" +
+    "import sys\n\n" +
+    "fn unit_ok(res: Result<(), sys.IoError>) { assert(res.is_ok()) }\n" +
+    "fn unit_err(res: Result<(), sys.IoError>, want: sys.IoError) {\n" +
+    "    match res { .Ok => assert(false), .Err(e) => assert(e == want) }\n" +
+    "}\n\n" +
+    "struct FailWriter { calls: i32, fail_after: i32 }\n" +
+    "impl io.Write for FailWriter {\n" +
+    "    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {\n" +
+    "        self.calls += 1\n" +
+    "        if self.calls > self.fail_after { return .Err(.BrokenPipe) }\n" +
+    "        .Ok(data.len)\n" +
+    "    }\n" +
+    "    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }\n" +
+    "}\n\n" +
+    "struct ZeroWriter {}\n" +
+    "impl io.Write for ZeroWriter {\n" +
+    "    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> { _ := data.len; .Ok(0) }\n" +
+    "    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }\n" +
+    "}\n\n" +
+    "fn main() {\n" +
+    "    // Cursor read, write, seek, BufRead\n" +
+    "    mut cur := io.Cursor::from_text(\"alpha\\r\\nbeta\\n\\ngamma\")\n" +
+    "    assert(cur.len() == 18 && !cur.is_empty() && cur.position() == 0)\n" +
+    "    mut first3: []u8 = []\n" +
+    "    unit_ok(io.read_exact<io.Cursor>(&mut cur, &mut first3, 3))\n" +
+    "    assert(first3 == [97, 108, 112])\n" +
+    "    assert(cur.seek(.Start(0)) == .Ok(0))\n" +
+    "    assert(cur.read_line() == .Ok(.Data(\"alpha\")))\n" +
+    "    assert(cur.read_line() == .Ok(.Data(\"beta\")))\n" +
+    "    assert(cur.read_line() == .Ok(.Data(\"\")))\n" +
+    "    assert(cur.read_line() == .Ok(.Data(\"gamma\")))\n" +
+    "    assert(cur.read_line() == .Ok(.Eof))\n" +
+    "    assert(cur.seek(.Current(-5)) == .Ok(13))\n" +
+    "    assert(io.read_to_string<io.Cursor>(&mut cur) == .Ok(\"gamma\"))\n" +
+    "    assert(cur.seek(.Start(-1)) == .Err(.InvalidArgument))\n" +
+    "\n" +
+    "    // Cursor write, overwrite, gap zero-padding\n" +
+    "    mut wcur := io.Cursor::empty()\n" +
+    "    unit_ok(io.write_str<io.Cursor>(&mut wcur, \"hello world\"))\n" +
+    "    assert(wcur.seek(.Start(6)) == .Ok(6))\n" +
+    "    unit_ok(wcur.write_str(\"dunder\"))\n" +
+    "    assert(wcur.seek(.End(2)) == .Ok(14))\n" +
+    "    unit_ok(wcur.write_byte(33))\n" +
+    "    raw := wcur.into_inner()\n" +
+    "    assert(raw.len == 15 && raw[12] == 0 && raw[13] == 0 && raw[14] == 33)\n" +
+    "\n" +
+    "    // BufReader + BufRead + Limited\n" +
+    "    mut src := io.Cursor::from_text(\"line1\\nline2\\r\\ntail\")\n" +
+    "    mut br := io.BufReader<io.Cursor>::with_capacity(move src, 4)\n" +
+    "    assert(br.read_line() == .Ok(.Data(\"line1\")))\n" +
+    "    assert(br.read_line() == .Ok(.Data(\"line2\")))\n" +
+    "    assert(br.read_line() == .Ok(.Data(\"tail\")))\n" +
+    "    assert(br.read_line() == .Ok(.Eof))\n" +
+    "    _ := br.into_inner()\n" +
+    "\n" +
+    "    mut lim_src := io.Cursor::from_text(\"0123456789\")\n" +
+    "    mut lim := io.Limited<io.Cursor>::new(move lim_src, 4)\n" +
+    "    assert(io.read_to_string<io.Limited<io.Cursor>>(&mut lim) == .Ok(\"0123\"))\n" +
+    "    assert(lim.limit() == 0)\n" +
+    "    restored := lim.into_inner()\n" +
+    "    assert(restored.position() == 4)\n" +
+    "\n" +
+    "    // BufWriter normal flush + into_inner\n" +
+    "    mut bw := io.BufWriter<io.Cursor>::with_capacity(io.Cursor::empty(), 4)\n" +
+    "    assert(bw.write_str(\"ab\").is_ok() && bw.buffered_len() == 2)\n" +
+    "    unit_ok(bw.write_str(\"cdef\"))\n" +
+    "    res_inner := bw.into_inner()\n" +
+    "    match move res_inner {\n" +
+    "        .Ok(out_val) => {\n" +
+    "            mut out_cur := out_val\n" +
+    "            assert(out_cur.seek(.Start(0)) == .Ok(0))\n" +
+    "            assert(io.read_to_string<io.Cursor>(&mut out_cur) == .Ok(\"abcdef\"))\n" +
+    "        },\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "\n" +
+    "    // BufWriter FlushError recovery\n" +
+    "    mut fbw := io.BufWriter<FailWriter>::with_capacity(FailWriter { calls: 0, fail_after: 0 }, 8)\n" +
+    "    unit_ok(fbw.write_str(\"boom\"))\n" +
+    "    fail_res := fbw.into_inner()\n" +
+    "    match move fail_res {\n" +
+    "        .Ok(_) => assert(false),\n" +
+    "        .Err(fe) => {\n" +
+    "            assert(fe.error() == .BrokenPipe)\n" +
+    "            recovered := fe.into_inner()\n" +
+    "            assert(recovered.calls == 1)\n" +
+    "        },\n" +
+    "    }\n" +
+    "\n" +
+    "    // Empty, Sink, copy, copy_limit, errors\n" +
+    "    mut empty := io.Empty::default()\n" +
+    "    assert(empty.read_line() == .Ok(.Eof))\n" +
+    "    mut sink := io.Sink::default()\n" +
+    "    mut csrc := io.Cursor::from_text(\"hello streams\")\n" +
+    "    assert(io.copy<io.Cursor, io.Sink>(&mut csrc, &mut sink) == .Ok(13))\n" +
+    "    assert(sink.bytes_written() == 13)\n" +
+    "\n" +
+    "    mut csrc2 := io.Cursor::from_text(\"abcdef\")\n" +
+    "    mut dst2 := io.Cursor::empty()\n" +
+    "    assert(io.copy_limit<io.Cursor, io.Cursor>(&mut csrc2, &mut dst2, 4) == .Ok(4))\n" +
+    "    assert(dst2.seek(.Start(0)) == .Ok(0))\n" +
+    "    assert(io.read_to_string<io.Cursor>(&mut dst2) == .Ok(\"abcd\"))\n" +
+    "\n" +
+    "    mut c_short := io.Cursor::from_text(\"hi\")\n" +
+    "    mut exact_buf: []u8 = []\n" +
+    "    unit_err(io.read_exact<io.Cursor>(&mut c_short, &mut exact_buf, 5), .UnexpectedEof)\n" +
+    "\n" +
+    "    mut c_lim := io.Cursor::from_text(\"exact\")\n" +
+    "    mut lim_buf: []u8 = []\n" +
+    "    assert(io.read_to_end_limit<io.Cursor>(&mut c_lim, &mut lim_buf, 5) == .Ok(5))\n" +
+    "    assert(c_lim.seek(.Start(0)) == .Ok(0))\n" +
+    "    mut lim_buf2: []u8 = []\n" +
+    "    assert(io.read_to_end_limit<io.Cursor>(&mut c_lim, &mut lim_buf2, 4) == .Err(.TooLarge))\n" +
+    "\n" +
+    "    mut bad_utf8 := io.Cursor::new([255, 254])\n" +
+    "    assert(io.read_to_string<io.Cursor>(&mut bad_utf8) == .Err(.InvalidUtf8))\n" +
+    "\n" +
+    "    mut zw := ZeroWriter {}\n" +
+    "    unit_err(io.write_str<ZeroWriter>(&mut zw, \"x\"), .WriteZero)\n" +
+    "    assert(io.is_would_block(&sys.IoError::would_block()))\n" +
+    "    print(42)\n" +
+    "}\n"
+}
+
+fn native_fs_and_net_program() -> string {
+    "capability filesystem, network\n\n" +
+    "import std.fs as fs\n" +
+    "import std.io as io\n" +
+    "import std.net as net\n" +
+    "import sys\n\n" +
+    "fn main() {\n" +
+    "    dir_res := fs.temp_dir(\"dunder-io-fs-\")\n" +
+    "    assert(dir_res.ok)\n" +
+    "    dir := dir_res.value\n" +
+    "    defer { _ := fs.remove_all(dir) }\n" +
+    "    path := dir + \"/sample.txt\"\n" +
+    "\n" +
+    "    // Write via FileWriter + BufWriter + ReadFile + WriteFile + Seek\n" +
+    "    wf := fs.WriteFile::grant(path.clone())\n" +
+    "    writer := wf.create()\n" +
+    "    match move writer {\n" +
+    "        .Ok(fw) => {\n" +
+    "            mut bw := io.BufWriter<fs.FileWriter>::with_capacity(move fw, 8)\n" +
+    "            assert(bw.write_str(\"hello \").is_ok())\n" +
+    "            assert(bw.write_str(\"world\\n\").is_ok())\n" +
+    "            match move bw.into_inner() {\n" +
+    "                .Ok(fw_val) => {\n" +
+    "                    mut inner_fw := fw_val\n" +
+    "                    assert(inner_fw.sync().is_ok())\n" +
+    "                    assert(inner_fw.close().is_ok())\n" +
+    "                },\n" +
+    "                .Err(_) => assert(false),\n" +
+    "            }\n" +
+    "        },\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "\n" +
+    "    match move wf.open_append() {\n" +
+    "        .Ok(afw_val) => { mut afw := afw_val; assert(io.write_str<fs.FileWriter>(&mut afw, \"line2\\n\").is_ok()) },\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "\n" +
+    "    rf := fs.ReadFile::grant(path.clone())\n" +
+    "    match move rf.open() {\n" +
+    "        .Ok(fr_val) => {\n" +
+    "            mut fr := fr_val\n" +
+    "            assert(fr.seek(.Start(6)) == .Ok(6))\n" +
+    "            assert(io.read_to_string<fs.FileReader>(&mut fr) == .Ok(\"world\\nline2\\n\"))\n" +
+    "            assert(fr.seek(.Start(0)) == .Ok(0))\n" +
+    "            mut br := io.BufReader<fs.FileReader>::new(move fr)\n" +
+    "            assert(br.read_line() == .Ok(.Data(\"hello world\")))\n" +
+    "            assert(br.read_line() == .Ok(.Data(\"line2\")))\n" +
+    "            assert(br.read_line() == .Ok(.Eof))\n" +
+    "        },\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "\n" +
+    "    rw_path := dir + \"/rw.bin\"\n" +
+    "    mut opts := fs.OpenOptions::read_write()\n" +
+    "    opts.set_create(true)\n" +
+    "    opts.set_truncate(true)\n" +
+    "    match move fs.File::open(rw_path.clone(), opts) {\n" +
+    "        .Ok(f_val) => {\n" +
+    "            mut f := f_val\n" +
+    "            assert(io.write_all<fs.File>(&mut f, &[1, 2, 3, 4]).is_ok())\n" +
+    "            assert(f.seek(.Start(1)) == .Ok(1))\n" +
+    "            assert(io.write_all<fs.File>(&mut f, &[9, 8]).is_ok())\n" +
+    "            assert(f.seek(.Start(0)) == .Ok(0))\n" +
+    "            mut got: []u8 = []\n" +
+    "            assert(io.read_to_end<fs.File>(&mut f, &mut got) == .Ok(4))\n" +
+    "            assert(got == [1, 9, 8, 4])\n" +
+    "            assert(f.sync().is_ok())\n" +
+    "        },\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "\n" +
+    "    assert(fs.FileReader::open(dir + \"/missing.txt\").is_err())\n" +
+    "\n" +
+    "    // TcpStream Read + Write over loopback\n" +
+    "    lres := net.TcpListener::listen(net.loopback(), 0, 4)\n" +
+    "    assert(lres.ok)\n" +
+    "    mut listener := lres.listener\n" +
+    "    port := listener.local_port()\n" +
+    "    assert(port > 0)\n" +
+    "    cres := net.TcpStream::connect(net.loopback(), port)\n" +
+    "    assert(cres.ok)\n" +
+    "    client := cres.stream\n" +
+    "    ares := listener.accept()\n" +
+    "    assert(ares.ok)\n" +
+    "    mut server := ares.stream\n" +
+    "\n" +
+    "    mut bw_net := io.BufWriter<net.TcpStream>::with_capacity(move client, 64)\n" +
+    "    assert(bw_net.write_str(\"ping\\npong\\n\").is_ok())\n" +
+    "    match move bw_net.into_inner() {\n" +
+    "        .Ok(sent_client) => { assert(sent_client.shutdown_write().ok) },\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "    mut br_net := io.BufReader<net.TcpStream>::new(move server)\n" +
+    "    assert(br_net.read_line() == .Ok(.Data(\"ping\")))\n" +
+    "    assert(br_net.read_line() == .Ok(.Data(\"pong\")))\n" +
+    "    assert(br_net.read_line() == .Ok(.Eof))\n" +
+    "    print(\"fs-net-ok\")\n" +
+    "}\n"
+}
+
+fn stdio_worker_program() -> string {
+    "capability stdio\n\n" +
+    "import std.io as io\n\n" +
+    "fn main() {\n" +
+    "    mut sin := io.stdin()\n" +
+    "    assert(sin.fd() == 0)\n" +
+    "    _ := sin.is_tty()\n" +
+    "    mut br := io.BufReader<io.Stdin>::with_capacity(move sin, 3)\n" +
+    "    mut sout := io.BufWriter<io.Stdout>::with_capacity(io.stdout(), 6)\n" +
+    "    mut serr := io.stderr()\n" +
+    "    mut count := 0\n" +
+    "    while true {\n" +
+    "        match br.read_line() {\n" +
+    "            .Ok(line) => {\n" +
+    "                match line {\n" +
+    "                    .Data(text) => {\n" +
+    "                        count += 1\n" +
+    "                        assert(sout.write_str(\"out:\" + text + \"\\n\").is_ok())\n" +
+    "                    },\n" +
+    "                    .Eof => { break },\n" +
+    "                }\n" +
+    "            },\n" +
+    "            .Err(_) => assert(false),\n" +
+    "        }\n" +
+    "    }\n" +
+    "    match move sout.into_inner() {\n" +
+    "        .Ok(_) => {},\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "    assert(serr.write_str(f\"err:{count}\\n\").is_ok())\n" +
+    "}\n"
+}
+
+fn stdio_read_all_program() -> string {
+    "capability stdio\n\n" +
+    "import std.io as io\n\n" +
+    "fn main() {\n" +
+    "    match move io.read_stdin() {\n" +
+    "        .Ok(text) => print(text),\n" +
+    "        .Err(_) => assert(false),\n" +
+    "    }\n" +
+    "}\n"
+}
+
+fn check_stdio_pipes(compiler: string, work: string) -> bool {
+    mut out := harness.empty_output()
+    worker_src := work + "/stdio_worker.ddr"
+    worker_bin := work + "/stdio_worker"
+    if !sys.write_text(worker_src, stdio_worker_program()).ok { return harness.fail("write stdio_worker") }
+    if !harness.run_checked_timeout(compiler, ["build", worker_src.clone(), "-o", worker_bin.clone()], work, 0, false, 60000, &mut out) {
+        return false
+    }
+
+    mut cmd := process.command(worker_bin.clone(), [])
+    cmd.set_stdio(.Pipe, .Pipe, .Pipe)
+    sres := process.spawn(&cmd)
+    if !sres.ok { return harness.fail("failed to spawn stdio worker") }
+    mut child := sres.child
+
+    mut c_in := match move child.take_stdin() {
+        .Ok(s) => s,
+        .Err(_) => { return harness.fail("take_stdin failed") },
+    }
+    assert(child.take_stdin().is_err())
+    mut c_out := match move child.take_stdout() {
+        .Ok(s) => s,
+        .Err(_) => { return harness.fail("take_stdout failed") },
+    }
+    mut c_err := match move child.take_stderr() {
+        .Ok(s) => s,
+        .Err(_) => { return harness.fail("take_stderr failed") },
+    }
+
+    assert(c_in.write_str("first\r\nsecond\nlast").is_ok())
+    assert(c_in.close().is_ok())
+
+    got_out := io.read_to_string<process.ChildStdout>(&mut c_out)
+    got_err := io.read_to_string<process.ChildStderr>(&mut c_err)
+    wres := child.wait(5000)
+    if !wres.ok || !wres.exited || wres.code != 0 {
+        return harness.fail(f"stdio worker exited {wres.code}")
+    }
+    match move got_out {
+        .Ok(s) => {
+            if s != "out:first\nout:second\nout:last\n" {
+                return harness.fail("unexpected stdio worker stdout: " + s)
+            }
+        },
+        .Err(e) => { return harness.fail(f"got_out err: {e}") },
+    }
+    match move got_err {
+        .Ok(s) => {
+            if s != "err:3\n" {
+                return harness.fail("unexpected stdio worker stderr: " + s)
+            }
+        },
+        .Err(e) => { return harness.fail(f"got_err err: {e}") },
+    }
+
+    all_src := work + "/stdio_all.ddr"
+    all_bin := work + "/stdio_all"
+    if !sys.write_text(all_src, stdio_read_all_program()).ok { return harness.fail("write stdio_all") }
+    if !harness.run_checked_timeout(compiler, ["build", all_src.clone(), "-o", all_bin.clone()], work, 0, false, 60000, &mut out) {
+        return false
+    }
+    mut cmd2 := process.command(move all_bin, [])
+    cmd2.set_stdin_text("hello-stdin-åäö")
+    res2 := process.exec(&cmd2)
+    if !res2.succeeded() || res2.stdout_text() != "hello-stdin-åäö\n" {
+        return harness.fail("read_stdin mismatch: " + res2.stdout_text())
+    }
+    true
+}
+
+fn check_linux_builds(compiler: string, work: string, path: string, tag: string, expect_dynamic: bool) -> bool {
+    mut out := harness.empty_output()
+    targets := ["arm64-linux", "x86_64-linux"]
+    interps := ["/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-x86-64.so.2"]
+    for i in 0..targets.len {
+        target := targets[i].clone()
+        image := f"{work}/{tag}-{target}"
+        if !harness.run_checked_timeout(compiler, ["build", path.clone(), "--target", target.clone(), "-o", image.clone()], work, 0, false, 60000, &mut out) {
+            return false
+        }
+        data := sys.read_u8(image)
+        if !data.ok || !verify_linux_elf(&data.value, expect_dynamic, interps[i]) { return false }
+    }
+    true
+}
+
+fn invalid_cases() -> [](string, string) {
+    [
+        ("import std.io as io\nfn main() { _ := io.stdin() }", "this function requires capability stdio"),
+        ("import std.io as io\nfn main() { _ := io.stdout() }", "this function requires capability stdio"),
+        ("import std.io as io\nfn main() { _ := io.stderr() }", "this function requires capability stdio"),
+        ("import std.io as io\nfn main() { _ := io.read_stdin() }", "this function requires capability stdio"),
+        ("import std.io as io\nfn main() { _ := io.read_stdin_bytes() }", "this function requires capability stdio"),
+        ("import std.fs as fs\nfn main() { _ := fs.File::open_read(\"x\") }", "this function requires capability filesystem"),
+        ("import std.fs as fs\nfn main() { _ := fs.File::create(\"x\") }", "this function requires capability filesystem"),
+        ("capability unsafe\nimport std.io as io\nimport sys\nstruct S {}\nimpl io.Write for S {\n    unsafe fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> { .Ok(0) }\n    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }\n}\nfn main() {}", "trait method 'write' must be safe"),
+    ]
+}
+
+fn run_suite(cli: &harness.BaseCli, work: string) -> bool {
+    core_path := work + "/io_core.ddr"
+    if !sys.write_text(core_path, core_matrix_program()).ok { return harness.fail("write io_core.ddr") }
+    if !harness.run_specialization_matrix(cli.compiler, core_path, work, "42\n") { return false }
+    if !check_linux_builds(cli.compiler, work, core_path, "io-core", false) { return false }
+
+    fs_net_path := work + "/io_fs_net.ddr"
+    if !sys.write_text(fs_net_path, native_fs_and_net_program()).ok { return harness.fail("write io_fs_net.ddr") }
+    fs_net_bin := work + "/io_fs_net"
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(cli.compiler, ["build", fs_net_path.clone(), "-o", fs_net_bin.clone()], work, 0, false, 60000, &mut out) {
+        return false
+    }
+    if !harness.run_checked_timeout(fs_net_bin, [], work, 0, false, 60000, &mut out) || !harness.stdout_is(&out, "fs-net-ok\n", "io_fs_net") {
+        return false
+    }
+    if !check_linux_builds(cli.compiler, work, fs_net_path, "io-fs-net", true) { return false }
+
+    if !check_stdio_pipes(cli.compiler, work) { return false }
+
+    mut zw := ZeroWriter {}
+    assert_unit_err(io.write_str<ZeroWriter>(&mut zw, "a"), .WriteZero)
+    assert_unit_ok(.Ok)
+    mut fw := FailingWriter { writes: 0, ok_chunks: 1 }
+    assert(fw.write(&[1]) == .Ok(1))
+    assert(fw.write(&[2]) == .Err(.BrokenPipe))
+
+    cases := invalid_cases()
+    if !harness.check_rejected_specializations(cli.compiler, work, &cases) { return false }
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    tmp := fs.temp_dir("dunder-io-test-")
+    if !tmp.ok { return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if !run_suite(&cli, work) { return 1 }
+    print("PASS io")
+    0
+}

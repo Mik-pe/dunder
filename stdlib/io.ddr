@@ -1,0 +1,694 @@
+capability unsafe, stdio
+
+import std.bytes as bytes
+import sys
+
+@extern("c", "isatty")
+unsafe fn c_isatty(fd: i32) -> i32
+
+pub enum SeekFrom { Start(i64), Current(i64), End(i64) }
+pub enum Line { Data(string), Eof }
+
+impl Eq for SeekFrom {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            .Start(a) => match other { .Start(b) => a == b, _ => false },
+            .Current(a) => match other { .Current(b) => a == b, _ => false },
+            .End(a) => match other { .End(b) => a == b, _ => false },
+        }
+    }
+}
+
+impl Eq for Line {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            .Data(a) => match other { .Data(b) => a == b, _ => false },
+            .Eof => match other { .Eof => true, _ => false },
+        }
+    }
+}
+
+pub fn fd_read_chunk(fd: i32, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+    if max_bytes <= 0 { return .Ok(0) }
+    if !target_is("native") { return .Err(.Unsupported) }
+    mut want := max_bytes
+    if want > 65536 { want = 65536 }
+    if out.len > 2147483647 - want { want = 2147483647 - out.len }
+    if want <= 0 { return .Err(.TooLarge) }
+    out.reserve(out.len + want)
+    n := sys.fd_read(fd, &mut out, i64(want))
+    if n < 0 { return .Err(sys.IoError::from_code(i32(-n))) }
+    .Ok(i32(n))
+}
+
+pub fn fd_write_chunk(fd: i32, data: &[]u8) -> Result<i32, sys.IoError> {
+    if data.len == 0 { return .Ok(0) }
+    if !target_is("native") { return .Err(.Unsupported) }
+    n := sys.fd_write(fd, &data, 0, i64(data.len))
+    if n < 0 { return .Err(sys.IoError::from_code(i32(-n))) }
+    .Ok(i32(n))
+}
+
+fn fd_is_tty(fd: i32) -> bool {
+    if fd < 0 { return false }
+    if target_is("macos") {
+        unsafe { return c_isatty(fd) != 0 }
+    }
+    if target_is("linux") {
+        mut termios: [u8; 64] = [0; 64]
+        unsafe {
+            // ioctl(fd, TCGETS = 0x5401 = 21505, &termios); ARM64 syscall 29 is mapped on x86_64.
+            return sys.linux_syscall(29, i64(fd), 21505, i64(usize(addr(&mut termios[0]))), 0, 0, 0) == 0
+        }
+    }
+    false
+}
+
+pub trait Read {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError>
+}
+
+pub trait Write {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError>
+    fn flush(&mut self) -> Result<(), sys.IoError>
+
+    fn write_full(&mut self, data: &[]u8) -> Result<(), sys.IoError> {
+        mut sent := 0
+        while sent < data.len {
+            res := self.write(&data[sent..data.len])
+            match res {
+                .Ok(n) => {
+                    if n <= 0 { return .Err(.WriteZero) }
+                    sent += n
+                },
+                .Err(e) => { return .Err(e) },
+            }
+        }
+        .Ok
+    }
+
+    fn write_str(&mut self, text: string) -> Result<(), sys.IoError> {
+        if text.len == 0 { return .Ok }
+        mut buf: []u8 = []
+        bytes.append_utf8(&mut buf, text)
+        self.write_full(&buf)
+    }
+
+    fn write_byte(&mut self, value: u8) -> Result<(), sys.IoError> {
+        buf: []u8 = [value]
+        self.write_full(&buf)
+    }
+}
+
+pub trait BufRead: Read {
+    fn fill(&mut self) -> Result<i32, sys.IoError>
+    fn buffered(&self) -> &[]u8 from self
+    fn consume(&mut self, count: i32)
+
+    fn read_until(&mut self, delim: u8, out: &mut []u8) -> Result<i32, sys.IoError> {
+        mut total := 0
+        while true {
+            mut found := -1
+            mut take := 0
+            {
+                view := self.buffered()
+                if view.len > 0 {
+                    found = bytes.find_byte(&view, 0, view.len, delim)
+                    take = if found >= 0 { found + 1 } else { view.len }
+                    bytes.extend_range(&mut out, &view, 0, take)
+                }
+            }
+            if take > 0 {
+                self.consume(take)
+                total += take
+            }
+            if found >= 0 { return .Ok(total) }
+            match self.fill() {
+                .Ok(n) => {
+                    if n == 0 { return .Ok(total) }
+                },
+                .Err(e) => { return .Err(e) },
+            }
+        }
+        .Ok(total)
+    }
+
+    fn read_line_into(&mut self, out: &mut []u8) -> Result<i32, sys.IoError> {
+        self.read_until(10, &mut out)
+    }
+
+    fn read_line(&mut self) -> Result<Line, sys.IoError> {
+        mut raw: []u8 = []
+        match self.read_line_into(&mut raw) {
+            .Ok(n) => {
+                if n == 0 { return .Ok(.Eof) }
+                if raw.len > 0 && raw[raw.len - 1] == 10 {
+                    _ := raw.pop()
+                    if raw.len > 0 && raw[raw.len - 1] == 13 { _ := raw.pop() }
+                }
+                dec := bytes.decode(&raw)
+                if !dec.ok { return .Err(.InvalidUtf8) }
+                .Ok(.Data(dec.value))
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+}
+
+pub trait Seek {
+    fn seek(&mut self, pos: SeekFrom) -> Result<i64, sys.IoError>
+}
+
+@resource
+pub opaque struct Stdin { fd: i32 }
+
+@resource
+pub opaque struct Stdout { fd: i32 }
+
+@resource
+pub opaque struct Stderr { fd: i32 }
+
+impl Stdin {
+    pub fn fd(&self) -> i32 { self.fd }
+    pub fn is_tty(&self) -> bool { fd_is_tty(self.fd) }
+}
+
+impl Stdout {
+    pub fn fd(&self) -> i32 { self.fd }
+    pub fn is_tty(&self) -> bool { fd_is_tty(self.fd) }
+}
+
+impl Stderr {
+    pub fn fd(&self) -> i32 { self.fd }
+    pub fn is_tty(&self) -> bool { fd_is_tty(self.fd) }
+}
+
+impl Read for Stdin {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        fd_read_chunk(self.fd, &mut out, max_bytes)
+    }
+}
+
+impl Write for Stdout {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        fd_write_chunk(self.fd, &data)
+    }
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+impl Write for Stderr {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        fd_write_chunk(self.fd, &data)
+    }
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+@requires(stdio)
+pub fn stdin() -> Stdin { Stdin { fd: 0 } }
+
+@requires(stdio)
+pub fn stdout() -> Stdout { Stdout { fd: 1 } }
+
+@requires(stdio)
+pub fn stderr() -> Stderr { Stderr { fd: 2 } }
+
+pub struct BufReader<R> where R: Read {
+    inner: R,
+    buf: []u8,
+    pos: i32,
+    cap: i32,
+    eof: bool,
+}
+
+impl BufReader<R> {
+    pub fn with_capacity(move inner: R, cap: i32) -> Self {
+        actual := if cap < 1 { 1 } else { cap }
+        Self { inner: inner, buf: [], pos: 0, cap: actual, eof: false }
+    }
+
+    pub fn new(move inner: R) -> Self {
+        Self::with_capacity(move inner, 8192)
+    }
+
+    pub fn into_inner(move self) -> R { self.inner }
+    pub fn inner(&self) -> &R from self { &self.inner }
+}
+
+impl Read for BufReader<R> where R: Read {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        if max_bytes <= 0 { return .Ok(0) }
+        if self.pos < self.buf.len {
+            avail := self.buf.len - self.pos
+            take := if avail < max_bytes { avail } else { max_bytes }
+            bytes.extend_range(&mut out, &self.buf, self.pos, self.pos + take)
+            self.pos += take
+            return .Ok(take)
+        }
+        if max_bytes >= self.cap {
+            return self.inner.read(&mut out, max_bytes)
+        }
+        match self.fill() {
+            .Ok(n) => {
+                if n == 0 { return .Ok(0) }
+                avail := self.buf.len - self.pos
+                take := if avail < max_bytes { avail } else { max_bytes }
+                bytes.extend_range(&mut out, &self.buf, self.pos, self.pos + take)
+                self.pos += take
+                .Ok(take)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+}
+
+impl BufRead for BufReader<R> where R: Read {
+    fn fill(&mut self) -> Result<i32, sys.IoError> {
+        if self.pos < self.buf.len {
+            return .Ok(self.buf.len - self.pos)
+        }
+        self.pos = 0
+        if self.eof {
+            self.buf.clear()
+            return .Ok(0)
+        }
+        mut buf := replace(&mut self.buf, [])
+        buf.clear()
+        res := self.inner.read(&mut buf, self.cap)
+        self.buf = buf
+        match res {
+            .Ok(n) => {
+                if n == 0 { self.eof = true }
+                .Ok(self.buf.len)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+
+    fn buffered(&self) -> &[]u8 from self {
+        start := if self.pos < self.buf.len { self.pos } else { self.buf.len }
+        &self.buf[start..self.buf.len]
+    }
+
+    fn consume(&mut self, count: i32) {
+        if count <= 0 { return }
+        avail := self.buf.len - self.pos
+        step := if count < avail { count } else { avail }
+        if step > 0 { self.pos += step }
+    }
+}
+
+pub struct FlushError<W> {
+    writer: W,
+    error: sys.IoError,
+}
+
+impl FlushError<W> {
+    pub fn into_inner(move self) -> W { self.writer }
+    pub fn error(&self) -> sys.IoError { self.error }
+}
+
+pub struct BufWriter<W> where W: Write {
+    inner: W,
+    buf: []u8,
+    cap: i32,
+}
+
+impl BufWriter<W> {
+    pub fn with_capacity(move inner: W, cap: i32) -> Self {
+        actual := if cap < 1 { 1 } else { cap }
+        Self { inner: inner, buf: [], cap: actual }
+    }
+
+    pub fn new(move inner: W) -> Self {
+        Self::with_capacity(move inner, 8192)
+    }
+
+    pub fn into_inner(move self) -> Result<W, FlushError<W>> {
+        mut w := self
+        match w.flush() {
+            .Ok => .Ok(w.inner),
+            .Err(e) => .Err(FlushError<W> { writer: w.inner, error: e }),
+        }
+    }
+
+    pub fn inner(&self) -> &W from self { &self.inner }
+    pub fn buffered_len(&self) -> i32 { self.buf.len }
+}
+
+impl Write for BufWriter<W> where W: Write {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        if data.len == 0 { return .Ok(0) }
+        if data.len > self.cap - self.buf.len {
+            match self.flush() {
+                .Ok => {},
+                .Err(e) => { return .Err(e) },
+            }
+        }
+        if data.len >= self.cap {
+            return self.inner.write(&data)
+        }
+        bytes.extend(&mut self.buf, &data)
+        .Ok(data.len)
+    }
+
+    fn flush(&mut self) -> Result<(), sys.IoError> {
+        mut sent := 0
+        mut buf := replace(&mut self.buf, [])
+        while sent < buf.len {
+            res := self.inner.write(&buf[sent..buf.len])
+            match res {
+                .Ok(n) => {
+                    if n <= 0 {
+                        if sent > 0 { bytes.consume_prefix(&mut buf, sent) }
+                        self.buf = buf
+                        return .Err(.WriteZero)
+                    }
+                    sent += n
+                },
+                .Err(e) => {
+                    if sent > 0 { bytes.consume_prefix(&mut buf, sent) }
+                    self.buf = buf
+                    return .Err(e)
+                },
+            }
+        }
+        buf.clear()
+        self.buf = buf
+        self.inner.flush()
+    }
+}
+
+pub struct Limited<R> where R: Read {
+    inner: R,
+    remaining: i64,
+}
+
+impl Limited<R> {
+    pub fn new(move inner: R, limit: i64) -> Self {
+        rem: i64 = if limit < 0 { 0 } else { limit }
+        Self { inner: inner, remaining: rem }
+    }
+
+    pub fn limit(&self) -> i64 { self.remaining }
+    pub fn into_inner(move self) -> R { self.inner }
+    pub fn inner(&self) -> &R from self { &self.inner }
+}
+
+impl Read for Limited<R> where R: Read {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        if max_bytes <= 0 || self.remaining <= 0 { return .Ok(0) }
+        cap := if i64(max_bytes) < self.remaining { max_bytes } else { i32(self.remaining) }
+        match self.inner.read(&mut out, cap) {
+            .Ok(n) => {
+                if n > 0 { self.remaining -= i64(n) }
+                .Ok(n)
+            },
+            .Err(e) => .Err(e),
+        }
+    }
+}
+
+pub struct Cursor {
+    data: []u8,
+    pos: i32,
+}
+
+impl Cursor {
+    pub fn new(move data: []u8) -> Self { Self { data: data, pos: 0 } }
+    pub fn from_text(text: string) -> Self {
+        mut buf: []u8 = []
+        bytes.append_utf8(&mut buf, text)
+        Self { data: buf, pos: 0 }
+    }
+    pub fn empty() -> Self { Self { data: [], pos: 0 } }
+    pub fn position(&self) -> i32 { self.pos }
+    pub fn set_position(&mut self, pos: i32) {
+        assert(pos >= 0)
+        self.pos = pos
+    }
+    pub fn len(&self) -> i32 { self.data.len }
+    pub fn is_empty(&self) -> bool { self.data.len == 0 }
+    pub fn as_bytes(&self) -> &[]u8 from self { &self.data }
+    pub fn into_inner(move self) -> []u8 { self.data }
+}
+
+impl Default for Cursor {
+    fn default() -> Self { Self::empty() }
+}
+
+impl Read for Cursor {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        if max_bytes <= 0 || self.pos >= self.data.len { return .Ok(0) }
+        avail := self.data.len - self.pos
+        take := if avail < max_bytes { avail } else { max_bytes }
+        bytes.extend_range(&mut out, &self.data, self.pos, self.pos + take)
+        self.pos += take
+        .Ok(take)
+    }
+}
+
+impl BufRead for Cursor {
+    fn fill(&mut self) -> Result<i32, sys.IoError> {
+        if self.pos < self.data.len { .Ok(self.data.len - self.pos) } else { .Ok(0) }
+    }
+
+    fn buffered(&self) -> &[]u8 from self {
+        start := if self.pos < self.data.len { self.pos } else { self.data.len }
+        &self.data[start..self.data.len]
+    }
+
+    fn consume(&mut self, count: i32) {
+        if count <= 0 { return }
+        avail := self.data.len - self.pos
+        step := if count < avail { count } else { avail }
+        if step > 0 { self.pos += step }
+    }
+}
+
+impl Write for Cursor {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        if data.len == 0 { return .Ok(0) }
+        if data.len > 2147483647 - self.pos { return .Err(.TooLarge) }
+        if self.pos > self.data.len {
+            gap := self.pos - self.data.len
+            bytes.pad(&mut self.data, gap)
+        }
+        avail := self.data.len - self.pos
+        overlap := if data.len < avail { data.len } else { avail }
+        for i in 0..overlap {
+            self.data[self.pos + i] = data[i]
+        }
+        if overlap < data.len {
+            bytes.extend_range(&mut self.data, &data, overlap, data.len)
+        }
+        self.pos += data.len
+        .Ok(data.len)
+    }
+
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+impl Seek for Cursor {
+    fn seek(&mut self, pos: SeekFrom) -> Result<i64, sys.IoError> {
+        target := match pos {
+            .Start(n) => n,
+            .Current(n) => i64(self.pos) + n,
+            .End(n) => i64(self.data.len) + n,
+        }
+        if target < 0 { return .Err(.InvalidArgument) }
+        if target > 2147483647 { return .Err(.TooLarge) }
+        self.pos = i32(target)
+        .Ok(target)
+    }
+}
+
+pub struct Empty {}
+
+impl Empty {
+    pub fn new() -> Self { Self {} }
+}
+
+impl Default for Empty {
+    fn default() -> Self { Self {} }
+}
+
+impl Read for Empty {
+    fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError> {
+        if max_bytes <= 0 { return .Ok(0) }
+        _ := out.len
+        .Ok(0)
+    }
+}
+
+impl BufRead for Empty {
+    fn fill(&mut self) -> Result<i32, sys.IoError> { .Ok(0) }
+    fn buffered(&self) -> &[]u8 from self { unsafe { return bytes_view(&self, ptr(0), usize(0)) } }
+    fn consume(&mut self, count: i32) { _ := count }
+}
+
+pub struct Sink { written: i64 }
+
+impl Sink {
+    pub fn new() -> Self { Self { written: 0 } }
+    pub fn bytes_written(&self) -> i64 { self.written }
+}
+
+impl Default for Sink {
+    fn default() -> Self { Self::new() }
+}
+
+impl Write for Sink {
+    fn write(&mut self, data: &[]u8) -> Result<i32, sys.IoError> {
+        self.written += i64(data.len)
+        .Ok(data.len)
+    }
+    fn flush(&mut self) -> Result<(), sys.IoError> { .Ok }
+}
+
+pub fn write_all<W: Write>(writer: &mut W, data: &[]u8) -> Result<(), sys.IoError> {
+    writer.write_full(&data)
+}
+
+pub fn write_str<W: Write>(writer: &mut W, text: string) -> Result<(), sys.IoError> {
+    writer.write_str(text)
+}
+
+pub fn read_exact<R: Read>(reader: &mut R, out: &mut []u8, count: i32) -> Result<(), sys.IoError> {
+    if count < 0 { return .Err(.InvalidArgument) }
+    if count == 0 { return .Ok }
+    mut remaining := count
+    while remaining > 0 {
+        step := if remaining < 65536 { remaining } else { 65536 }
+        match reader.read(&mut out, step) {
+            .Ok(n) => {
+                if n == 0 { return .Err(.UnexpectedEof) }
+                remaining -= n
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+    .Ok
+}
+
+pub fn read_to_end_limit<R: Read>(reader: &mut R, out: &mut []u8, max_bytes: i64) -> Result<i64, sys.IoError> {
+    if max_bytes < 0 { return .Err(.InvalidArgument) }
+    mut total: i64 = 0
+    while true {
+        rem := max_bytes - total
+        if rem == 0 {
+            mut extra: []u8 = []
+            match reader.read(&mut extra, 1) {
+                .Ok(n) => {
+                    if n == 0 { return .Ok(total) }
+                    return .Err(.TooLarge)
+                },
+                .Err(e) => { return .Err(e) },
+            }
+        }
+        step := if rem < 65536 { i32(rem) } else { 65536 }
+        match reader.read(&mut out, step) {
+            .Ok(n) => {
+                if n == 0 { return .Ok(total) }
+                total += i64(n)
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+    .Ok(total)
+}
+
+pub fn read_to_end<R: Read>(reader: &mut R, out: &mut []u8) -> Result<i64, sys.IoError> {
+    mut total: i64 = 0
+    while true {
+        match reader.read(&mut out, 65536) {
+            .Ok(n) => {
+                if n == 0 { return .Ok(total) }
+                total += i64(n)
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+    .Ok(total)
+}
+
+pub fn read_to_string<R: Read>(reader: &mut R) -> Result<string, sys.IoError> {
+    mut buf: []u8 = []
+    match read_to_end<R>(&mut reader, &mut buf) {
+        .Ok(_) => {
+            dec := bytes.decode(&buf)
+            if !dec.ok { return .Err(.InvalidUtf8) }
+            .Ok(dec.value)
+        },
+        .Err(e) => .Err(e),
+    }
+}
+
+pub fn copy_limit<R: Read, W: Write>(reader: &mut R, writer: &mut W, max_bytes: i64) -> Result<i64, sys.IoError> {
+    if max_bytes < 0 { return .Err(.InvalidArgument) }
+    mut total: i64 = 0
+    mut buf: []u8 = []
+    while total < max_bytes {
+        rem := max_bytes - total
+        step := if rem < 65536 { i32(rem) } else { 65536 }
+        buf.clear()
+        match reader.read(&mut buf, step) {
+            .Ok(n) => {
+                if n == 0 { return .Ok(total) }
+                match writer.write_full(&buf) {
+                    .Ok => { total += i64(buf.len) },
+                    .Err(e) => { return .Err(e) },
+                }
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+    .Ok(total)
+}
+
+pub fn copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<i64, sys.IoError> {
+    mut total: i64 = 0
+    mut buf: []u8 = []
+    while true {
+        buf.clear()
+        match reader.read(&mut buf, 65536) {
+            .Ok(n) => {
+                if n == 0 { return .Ok(total) }
+                match writer.write_full(&buf) {
+                    .Ok => { total += i64(buf.len) },
+                    .Err(e) => { return .Err(e) },
+                }
+            },
+            .Err(e) => { return .Err(e) },
+        }
+    }
+    .Ok(total)
+}
+
+pub fn is_would_block(err: &sys.IoError) -> bool { err.is_would_block() }
+
+@requires(stdio)
+pub fn read_stdin_limit(max_bytes: i64) -> Result<[]u8, sys.IoError> {
+    mut s := stdin()
+    mut out: []u8 = []
+    match read_to_end_limit<Stdin>(&mut s, &mut out, max_bytes) {
+        .Ok(_) => .Ok(out),
+        .Err(e) => .Err(e),
+    }
+}
+
+@requires(stdio)
+pub fn read_stdin_bytes() -> Result<[]u8, sys.IoError> {
+    read_stdin_limit(67108864)
+}
+
+@requires(stdio)
+pub fn read_stdin() -> Result<string, sys.IoError> {
+    match move read_stdin_bytes() {
+        .Ok(buf) => {
+            dec := bytes.decode(&buf)
+            if !dec.ok { return .Err(.InvalidUtf8) }
+            .Ok(dec.value)
+        },
+        .Err(e) => .Err(e),
+    }
+}

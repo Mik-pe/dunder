@@ -78,11 +78,113 @@ gemensamma beroendegraf och `dunder.lock`, och utdata skrivs till
 huvudprogram. `root` och `test_root` fortsätter att vara standardvalen.
 [Körbara exempel i `dunder.toml`](dependencies.md#körbara-exempel)
 
-## Grafik
+### Strömmar och standardinmatning
 
-Hundmats macOS-prov testar Dunders FFI med en Metal-texturatlas och
-BGRA8-läsning utan fönster. [macOS-modulen i provet](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/graphics/macos.ddr)
+`std.io` inför ström-traitsen `Read`, `Write`, `BufRead: Read` och `Seek`,
+kapabiliteten `capability stdio` med `@resource`-handtagen `Stdin`, `Stdout` och
+`Stderr` samt hjälpare som `read_stdin`, `read_stdin_bytes` och
+`read_stdin_limit`. Omslag och källor inkluderar `BufReader<R>`, `BufWriter<W>`,
+`Limited<R>`, `Cursor`, `Empty`, `Sink` och generiska funktioner som `copy`,
+`read_to_end`, `read_to_string` och `write_all`. `std.fs` utökas med
+`OpenOptions`, `FileReader`, `FileWriter` och `File`, `std.net.TcpStream`
+implementerar `Read` och `Write`, och `std.process.Child` exponerar
+`take_stdin`, `take_stdout` och `take_stderr` som strömmar.
+[Strömmar och standardinmatning](standard.md#strömmar-och-standardinmatning)
 
-Skrift ritar varje packat textprov med en fyrhörning. Verifieringen
-körde Skrift i fönster och utan fönster och kontrollerade färgkanaler,
-radorientering och alfablendning i [pixelprovet](https://github.com/Mik-pe/dunder-hundmat/blob/7c655764bf5e9a135811aa6bfa50f152f2f98e92/dogfood/metal/pixels.ddr).
+### Generell allokering
+
+`std.alloc` tillhandahåller `Layout`, `layout_of<T>`, `layout_array<T>`,
+`Block`, `AllocError` och traiten `RawAllocator` (med `unsafe fn`-metoder i
+traits och `impl`). Inbyggda allokatorer är `Global`, `System`, `Capped<A>`,
+`Tracking<A>` (`Stats`) och `Bump<A>` ovanpå nya primitiv i `std.sys`
+(`memory_zero`, `pool_alloc_try`, `pool_free`), kompletterade med
+resurshanterade behållare som `OwnedBuf<A>`, `Arena<A>`/`FrozenArena<A>` (`Span`,
+`read_into_arena`) och generationssäkra `Pool<T>`/`Id<T>`. Samtidigt utökas
+`@resource(dispose)` till att stödja `fn dispose(&mut self)` och `bytes_view`
+ger lånebunden `&[]u8`-åtkomst över råa pekarbuffertar.
+[Generell allokering](standard.md#generell-allokering)
+
+
+## Kommande förbättringar
+
+### Diagnostik och kompilator
+
+- **Enummönster med nyttolast:** När en variant som bär ett värde (t.ex. `.Err`
+  i `Result<T, string>`) matchas utan parenteser bör felet peka på själva
+  mönstret och föreslå `.Err(e)` i stället för `expected '('` inne i armens
+  kropp.
+- **Metodanrop utan parenteser:** När en okänd fältåtkomst matchar en befintlig
+  metod (t.ex. `parsed.is_ok`) bör felmeddelandet föreslå metodanropet
+  (`parsed.is_ok()`).
+- **Oföränderlig bindning vid tilldelning:** Fel som `assignment requires a
+  mutable stored value` bör inkludera en notering med radnummer för den
+  ursprungliga `:=`-deklarationen.
+- **Tydligare typfel och `&mut`-vidarebefordran:** Skriv ut vilken typ som är
+  förväntad respektive given i `type mismatch`-fel i stället för `A / B`. När
+  en `&mut`-parameter autoderefereras till sitt värde vid vidarebefordran bör
+  diagnostiken föreslå `&mut namn`.
+- **Effektanalys i task-arbetare:** När en arbetare avvisas för ambient I/O
+  eller systemanrop bör diagnostiken peka ut det faktiska anropet (och vid
+  behov anropskedjan) i stället för enbart arbetarfunktionen.
+- **Slicing av dynamiska arrayer:** Förbättra felmeddelandet för `arr[a..b]`
+  (som i dag ger `slice requires a string`) så att det hänvisar till lånat
+  intervall `&arr[a..b]`, kloning eller `array.append` — eller utred stöd för
+  ägd skivning.
+- **`mut` i `match`-mönster:** Stöd föränderliga mönsterbindningar som
+  `.Ok(mut x)` i `match`, eller ge ett tydligt felmeddelande som föreslår
+  `.Ok(x) => { mut s := x; ... }` i stället för `expected '('` eller
+  `match pattern requires an enum`.
+- **Ignorerad `()`-retur (`_ := ...`):** När `_ := expr` avvisas med
+  `local requires a value` för ett `()`-uttryck (t.ex. `sys.sleep_ms(...)`),
+  lägg till en hänvisning om att anropa uttrycket direkt utan `_ :=`.
+
+### Ägande och lån
+
+- **Mer precisa lån och färskhetsregler vid `push`:** Se över konservativa
+  lån där ett tidigare läslån (t.ex. `.len`, `==` eller ett funktionsanrop med
+  lånat argument) blockerar en senare flytt i samma block, samt att
+  loopbindningar i `for x in move batch` inte känns igen som färska ägda värden
+  vid `push`. Dokumentera de exakta reglerna tydligt i [memory.md](memory.md).
+- **Flytt av `@resource`-nyttolast ur `match`:** Gör det möjligt att flytta
+  nyttolaster (särskilt `@resource`-värden som `Child` i `Result<Child, E>`) ur
+  ägda `match`-värden på samma sätt som fältflyttar ur lokala structar, och
+  föreslå aldrig `.clone()` i felmeddelandet för icke-klonbara resurser.
+  Dokumentera gränsen mellan fältflytt och mönsterbindning i
+  [memory.md](memory.md) och [enums.md](enums.md).
+
+### Standardbibliotek och formatering
+
+- **Stränghjälpare i `std.text`:** Komplettera `std.text` med vanliga
+  CLI-funktioner som `contains`, `replace`, ASCII-`lower`/`upper` och
+  utfyllnad (`pad_left`/`pad_right`).
+- **Strängbredd i f-strängar:** Utöka formatangivelserna i stränginterpolering
+  med bredd- och justeringsstöd för strängar (motsvarande `:<N` / `:>N`),
+  utöver befintlig heltalsformatering.
+- **`std.json.Doc.raw_span`:** Dokumentera hur `raw_span` beter sig per nodtyp
+  (strängnoder saknar citattecken och har kvar escape-sekvenser) och överväg en
+  `raw_json(node)`-metod som returnerar giltig JSON-källtext för alla nodtyper.
+- **`std.process.ChildSet::wait_any`:** Förtydliga (eller se över namnet på)
+  `wait_any`, som returnerar antalet färdiga filbeskrivare från `poll` snarare
+  än en färdig slot.
+
+### CLI och dokumentation
+
+- **`dunder install`:** Lägg till ett `dunder install`-kommando för att bygga
+  och installera det aktuella Dunderpaketets binär till samma
+  installationskatalog som `dunder` (eller en konfigurerbar målkatalog i
+  `PATH`).
+- **Underkatalog för Git-beroenden (`subdir`):** Stöd ett valfritt
+  `subdir`-fält för Git-källor i `dunder.toml` så att paket i ett monorepo
+  (t.ex. `packages/http`) kan bero på direkt utan lokal kopiering.
+- **Arbetskatalog vid `dunder run`:** Säkerställ att den byggda binären körs i
+  anroparens aktuella arbetskatalog (eller dokumentera avvikelsen tydligt).
+- **Testutdata i `dunder test`:** Skilj lokala tester från standardbibliotekets
+  egna `@test`-funktioner i sammanräkningen (eller kör bara paketets tester
+  som standard).
+- **Dokumentationsförtydliganden:** Visa parenteser för metoder på
+  `Result<T, E>` (`.is_ok()`, `.is_err()`, `.unwrap_or(...)`) och förtydliga
+  `.Err` med `()`-nyttolast i [standard.md](standard.md); dokumentera att
+  `spawn` tar exakt ett säkert värdeargument (samt mönstret att samla argument
+  i en `Sendable`-struct) i [tasks.md](tasks.md); dokumentera jokertecken `_`
+  i `match`-mönster (t.ex. `.Err(_)`) i [syntax.md](syntax.md); och förtydliga
+  skillnaden mellan `&arr[a..b]` och `text[a..b]`.
