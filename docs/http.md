@@ -17,7 +17,8 @@ Nätverksåtkomst kräver `capability network` hos anroparen.
 HTTP/1.0- eller HTTP/1.1-anrop. Resultatet innehåller `ok`, `status`, `error`,
 `method`, `target`, parallella `header_names`/`header_values` och binära `body`.
 Headernamnen är normaliserade till gemener. `http.header(&request, name)`
-hämtar ett värde med ett sådant namn.
+hämtar ett värde med ett sådant namn, och `http.headers(&request, name)`
+returnerar alla matchande värden i ordning.
 
 En server som behöver välja gräns eller strömma efter att ha sett sökvägen
 använder `http.read_head(&stream, timeout_ms)` först. Den konsumerar exakt
