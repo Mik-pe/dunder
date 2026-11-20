@@ -20,6 +20,7 @@ import ..backend.imports as native_imports
 import ..driver.fragments
 import frontend_types as ft
 import lexer
+import derive
 import closures
 import generics
 import traits
@@ -440,8 +441,9 @@ fn callable_with_parameter(c: &mut Session, args: &[]i32, result: i32, kind: i32
     ty := type_reader.callable(&mut c.types, &args, result, kind, parameter); check_type_error(&mut c); ty
 }
 fn result_parameter(c: &mut Session, args: &[]i32, result: i32, first_name: i32) -> i32 {
-    if ft.type_kind(&c.types, result) != 4 {
-        if first_name >= 0 && is(&c, "from") { fail(&mut c, "only a shared returned borrow can specify a source parameter") }
+    result_kind := ft.type_kind(&c.types, result)
+    if result_kind != 4 && result_kind != 5 {
+        if first_name >= 0 && is(&c, "from") { fail(&mut c, "only a returned borrow can specify a source parameter") }
         return -1
     }
     if is(&c, "from") && (first_name >= 0 || c.world.tokens.kinds[c.body.cursor + 1] != .Name) {
@@ -460,7 +462,7 @@ fn result_parameter(c: &mut Session, args: &[]i32, result: i32, first_name: i32)
         }
         c.error_at = c.world.tokens.starts[at]; return -1
     }
-    source := type_reader.borrow_source(&mut c.types, &args); check_type_error(&mut c); source
+    source := type_reader.borrow_source_for(&mut c.types, &args, result_kind == 5); check_type_error(&mut c); source
 }
 fn parameter_mode(c: &mut Session, ty: i32, consume: bool, foreign: bool) -> i32 {
     mode := type_reader.parameter_mode(&mut c.types, ty, consume, foreign); check_type_error(&mut c); mode
@@ -691,6 +693,28 @@ fn source_root(c: &Session, place: i32) -> i32 {
     if alias >= 0 || local_borrows.is_transient(&c.body.local_loans, binding) { return alias }
     binding
 }
+fn borrow_parent(c: &Session, place: i32) -> i32 {
+    binding := borrows.root(&c.body.places, place)
+    if binding < 0 { return -1 }
+    if local_borrows.is_transient(&c.body.local_loans, binding) {
+        return local_borrows.parent(&c.body.local_loans, binding)
+    }
+    if local_borrows.shared(&c.body.local_loans, binding) { return binding }
+    -1
+}
+fn record_mutation(c: &mut Session, binding: i32, path: i32) {
+    c.body.mutations.push(binding)
+    c.body.mutation_paths.push(path)
+}
+fn mutated_overlap(c: &Session, first: i32, last: i32, root: i32, path: i32) -> bool {
+    for i in first..last {
+        if c.body.mutations[i] == root {
+            mpath := c.body.mutation_paths[i]
+            if path < 0 || mpath < 0 || ownership.overlaps(&c.body.ownership, mpath, path) { return true }
+        }
+    }
+    false
+}
 fn with_clone_hint(c: &Session, ty: i32, base: string, clone_suffix: string) -> string {
     if ty > 0 && ft.cloneable(&c.types, ty) { return base + clone_suffix }
     base.clone()
@@ -738,8 +762,9 @@ fn is_fresh_owned(c: &Session) -> bool {
 }
 fn writable_loan(c: &mut Session, place: i32) -> bool {
     path := owner_path(&c, place)
+    actor := borrows.root(&c.body.places, place)
     while true {
-        loan := local_borrows.active_conflict_local(&c.body.local_loans, &c.body.ownership, path)
+        loan := local_borrows.active_conflict_local_except(&c.body.local_loans, &c.body.ownership, path, actor, false)
         if loan < 0 { return true }
         limit := local_borrows.scope_end(&c.body.local_loans, loan)
         depth := local_borrows.loop_depth(&c.body.local_loans, loan)
@@ -750,6 +775,25 @@ fn writable_loan(c: &mut Session, place: i32) -> bool {
             continue
         }
         fail(&mut c, "cannot mutate, replace or move a value while it is borrowed")
+        return false
+    }
+    false
+}
+fn readable_loan(c: &mut Session, place: i32) -> bool {
+    path := owner_path(&c, place)
+    actor := borrows.root(&c.body.places, place)
+    while true {
+        loan := local_borrows.active_conflict_local_except(&c.body.local_loans, &c.body.ownership, path, actor, true)
+        if loan < 0 { return true }
+        limit := local_borrows.scope_end(&c.body.local_loans, loan)
+        depth := local_borrows.loop_depth(&c.body.local_loans, loan)
+        if !local_borrows.is_pinned(&c.body.local_loans, loan) && limit >= 0 &&
+            depth == c.body.loop_heads.len &&
+            !local_name_used_later(&c, c.body.locals.names[loan], c.body.cursor, limit) {
+            local_borrows.release_local(&mut c.body.local_loans, loan)
+            continue
+        }
+        fail(&mut c, "cannot read or borrow a value while it is mutably borrowed")
         return false
     }
     false
@@ -799,11 +843,11 @@ fn move_place(c: &mut Session, place: i32, ty: i32, at: i32) -> bool {
                 return false
             }
         }
-        ownership.consume(&mut c.body.ownership, path, at); c.body.mutations.push(binding)
+        ownership.consume(&mut c.body.ownership, path, at); record_mutation(&mut c, binding, path)
         if subj_path >= 0 && ownership.available(&c.body.ownership, subj_path) {
             ownership.consume(&mut c.body.ownership, subj_path, at)
         }
-        if subj_binding >= 0 { c.body.mutations.push(subj_binding) }
+        if subj_binding >= 0 { record_mutation(&mut c, subj_binding, subj_path) }
         return true
     }
     if !writable_loan(&mut c, place) { return false }
@@ -816,7 +860,7 @@ fn move_place(c: &mut Session, place: i32, ty: i32, at: i32) -> bool {
             return false
         }
     }
-    ownership.consume(&mut c.body.ownership, path, at); c.body.mutations.push(binding)
+    ownership.consume(&mut c.body.ownership, path, at); record_mutation(&mut c, binding, path)
     true
 }
 fn move_binding(c: &mut Session, binding: i32, ty: i32, at: i32) -> bool {
@@ -946,7 +990,8 @@ fn temporary(c: &mut Session, ty: i32) -> i32 {
     ty
 }
 fn call_result(c: &mut Session, ty: i32) -> i32 {
-    if ft.type_kind(&c.types, ty) != 4 { return temporary(&mut c, ty) }
+    kind := ft.type_kind(&c.types, ty)
+    if kind != 4 && kind != 5 { return temporary(&mut c, ty) }
     fc.clear_expr(&mut c.body.expr)
     ty
 }
@@ -1116,18 +1161,20 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
     expect(&mut c, "(")
     while c.ok && !is(&c, ")") && c.body.cursor < sig_end {
         param_index := args.len
+        mut is_mut := eat(&mut c, "mut")
         consuming := eat(&mut c, "move")
-        if !consuming && eat(&mut c, "&") {
-            is_mut := eat(&mut c, "mut")
+        if !is_mut && eat(&mut c, "mut") { is_mut = true }
+        if !consuming && !is_mut && eat(&mut c, "&") {
+            ref_mut := eat(&mut c, "mut")
             if !eat(&mut c, "self") { fail(&mut c, "expected 'self' after '&' in trait method receiver"); break }
             if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
             has_self = true
-            mut ref_kind := 4; if is_mut { ref_kind = 5 }
+            mut ref_kind := 4; if ref_mut { ref_kind = 5 }
             mode := compound(&mut c, ref_kind, self_ty)
             c.world.param_names.push("self"); args.push(mode)
+        } else if is(&c, "&") {
+            fail(&mut c, "cannot combine 'move' or 'mut' with '&' in trait method receiver"); break
         } else {
-            is_mut := eat(&mut c, "mut")
-            if is_mut && !is(&c, "self") { fail(&mut c, "expected 'self' after 'mut' in trait method receiver"); break }
             if is(&c, "self") {
                 _ := advance(&mut c)
                 if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
@@ -1149,7 +1196,12 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
                 pname := advance(&mut c); expect(&mut c, ":"); pt := type_name_in_trait(&mut c, validating_trait, sig_end)
                 if pt < 0 { unresolved = true }
                 mut mode := 0
-                if pt >= 0 { mode = parameter_mode(&mut c, pt, consuming, false) }
+                if pt >= 0 {
+                    mode = parameter_mode(&mut c, pt, consuming, false)
+                    if is_mut && (ft.type_kind(&c.types, mode) == 4 || ft.type_kind(&c.types, mode) == 5) {
+                        fail(&mut c, "mutable parameter requires 'mut move' or '&mut'"); break
+                    }
+                }
                 c.world.param_names.push(move pname); args.push(mode)
             }
         }
@@ -1199,23 +1251,25 @@ fn synthesize_trait_method(c: &mut Session, tid: i32, m: i32, target_ty: i32) ->
     m_name := c.traits.method_names[m].clone()
     fn_id := c.world.names.len
     mut has_self := false; mut self_mut := false
-    mut param_tokens: []i32 = []; mut param_names: []string = []; mut param_types: []i32 = []
+    mut param_tokens: []i32 = []; mut param_names: []string = []; mut param_types: []i32 = []; mut param_mutable: []bool = []
     expect(&mut c, "(")
     while c.ok && !is(&c, ")") && c.body.cursor < sig_end {
         param_index := param_types.len
+        mut is_mut := eat(&mut c, "mut")
         consuming := eat(&mut c, "move")
-        if !consuming && eat(&mut c, "&") {
-            is_mut := eat(&mut c, "mut")
+        if !is_mut && eat(&mut c, "mut") { is_mut = true }
+        if !consuming && !is_mut && eat(&mut c, "&") {
+            ref_mut := eat(&mut c, "mut")
             ptok := c.body.cursor
             if !eat(&mut c, "self") { fail(&mut c, "expected 'self' after '&' in trait method receiver"); break }
             if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
             has_self = true
-            mut ref_kind := 4; if is_mut { ref_kind = 5 }
+            mut ref_kind := 4; if ref_mut { ref_kind = 5 }
             mode := compound(&mut c, ref_kind, target_ty)
-            param_tokens.push(ptok); param_names.push("self"); param_types.push(mode)
+            param_tokens.push(ptok); param_names.push("self"); param_types.push(mode); param_mutable.push(false)
+        } else if is(&c, "&") {
+            fail(&mut c, "cannot combine 'move' or 'mut' with '&' in trait method receiver"); break
         } else {
-            is_mut := eat(&mut c, "mut")
-            if is_mut && !is(&c, "self") { fail(&mut c, "expected 'self' after 'mut' in trait method receiver"); break }
             if is(&c, "self") {
                 ptok := c.body.cursor; parameter := advance(&mut c)
                 if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of a trait method"); break }
@@ -1224,20 +1278,23 @@ fn synthesize_trait_method(c: &mut Session, tid: i32, m: i32, target_ty: i32) ->
                 if eat(&mut c, ":") {
                     if is_mut { fail(&mut c, "cannot combine 'mut self' with an explicit ': Type'"); break }
                     pt := type_name_in_trait(&mut c, false, sig_end)
-                if pt < 0 { fail(&mut c, "unresolved type in synthesized trait method"); break }
+                    if pt < 0 { fail(&mut c, "unresolved type in synthesized trait method"); break }
                     if pt == target_ty { mode = parameter_mode(&mut c, pt, true, false) }
                     else if (ft.type_kind(&c.types, pt) == 4 || ft.type_kind(&c.types, pt) == 5) && ft.type_base(&c.types, pt) == target_ty {
                         if consuming { fail(&mut c, "move argument requires a consuming parameter"); break }
                         mode = parameter_mode(&mut c, pt, false, false)
                     } else { fail(&mut c, "self parameter must have type Self, &Self or &mut Self"); break }
                 }
-                param_tokens.push(ptok); param_names.push(move parameter); param_types.push(mode)
+                param_tokens.push(ptok); param_names.push(move parameter); param_types.push(mode); param_mutable.push(is_mut)
             } else {
                 if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected parameter name in trait method"); break }
                 ptok := c.body.cursor; pname := advance(&mut c); expect(&mut c, ":"); pt := type_name_in_trait(&mut c, false, sig_end)
                 if pt < 0 { fail(&mut c, "unresolved type in synthesized trait method"); break }
                 mode := parameter_mode(&mut c, pt, consuming, false)
-                param_tokens.push(ptok); param_names.push(move pname); param_types.push(mode)
+                if is_mut && (ft.type_kind(&c.types, mode) == 4 || ft.type_kind(&c.types, mode) == 5) {
+                    fail(&mut c, "mutable parameter requires 'mut move' or '&mut'"); break
+                }
+                param_tokens.push(ptok); param_names.push(move pname); param_types.push(mode); param_mutable.push(is_mut)
             }
         }
         if !eat(&mut c, ",") { break }
@@ -1256,6 +1313,7 @@ fn synthesize_trait_method(c: &mut Session, tid: i32, m: i32, target_ty: i32) ->
             c.world.param_tokens.push(param_tokens[i])
             c.world.param_names.push(param_names[i].clone())
             c.world.param_types.push(param_types[i])
+            c.world.param_mutable.push(param_mutable[i])
         }
         source := result_parameter(&mut c, &param_types, ret, first)
         signature = callable_with_parameter(&mut c, &param_types, ret, 9, source)
@@ -2700,20 +2758,22 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             expect(&mut c, "("); first := c.world.param_names.len
             while c.ok && !is(&c, ")") {
                 param_index := c.world.param_names.len - first
+                mut is_mut := eat(&mut c, "mut")
                 consuming := eat(&mut c, "move")
-                if !consuming && eat(&mut c, "&") {
-                    is_mut := eat(&mut c, "mut")
+                if !is_mut && eat(&mut c, "mut") { is_mut = true }
+                if !consuming && !is_mut && eat(&mut c, "&") {
+                    ref_mut := eat(&mut c, "mut")
                     param_tok := c.body.cursor
                     if !eat(&mut c, "self") { fail(&mut c, "expected 'self' after '&' in receiver parameter"); break }
                     if c.types.self_type < 0 { fail(&mut c, "'self' parameter is only valid inside an impl block"); break }
                     if param_index != 0 { fail(&mut c, "'self' parameter is only valid as the first parameter of an impl method"); break }
                     c.world.impl_has_self[fn_id] = true
-                    mut ref_kind := 4; if is_mut { ref_kind = 5 }
+                    mut ref_kind := 4; if ref_mut { ref_kind = 5 }
                     mode := compound(&mut c, ref_kind, c.types.self_type)
-                    c.world.param_tokens.push(param_tok); c.world.param_names.push("self"); c.world.param_types.push(mode)
+                    c.world.param_tokens.push(param_tok); c.world.param_names.push("self"); c.world.param_types.push(mode); c.world.param_mutable.push(false)
+                } else if is(&c, "&") {
+                    fail(&mut c, "cannot combine 'move' or 'mut' with '&' in receiver parameter"); break
                 } else {
-                    is_mut := eat(&mut c, "mut")
-                    if is_mut && !is(&c, "self") { fail(&mut c, "expected 'self' after 'mut' in receiver parameter"); break }
                     if is(&c, "self") {
                         param_tok := c.body.cursor; parameter := advance(&mut c)
                         if c.types.self_type < 0 { fail(&mut c, "'self' parameter is only valid inside an impl block"); break }
@@ -2733,11 +2793,16 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
                                 fail(&mut c, "self parameter must have type Self, &Self or &mut Self"); break
                             }
                         }
-                        c.world.param_tokens.push(param_tok); c.world.param_names.push(move parameter); c.world.param_types.push(mode)
+                        c.world.param_tokens.push(param_tok); c.world.param_names.push(move parameter); c.world.param_types.push(mode); c.world.param_mutable.push(is_mut)
                     } else {
+                        if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected parameter name"); break }
                         c.world.param_tokens.push(c.body.cursor); parameter := advance(&mut c); expect(&mut c, ":"); pt := type_name(&mut c)
-                        mode := parameter_mode(&mut c, pt, consuming, c.world.libraries[c.world.returns.len] != "")
-                        c.world.param_names.push(move parameter); c.world.param_types.push(mode)
+                        is_foreign := c.world.libraries[c.world.returns.len] != ""
+                        mode := parameter_mode(&mut c, pt, consuming, is_foreign)
+                        if is_mut && (is_foreign || ft.type_kind(&c.types, mode) == 4 || ft.type_kind(&c.types, mode) == 5) {
+                            fail(&mut c, "mutable parameter requires 'mut move' or '&mut'"); break
+                        }
+                        c.world.param_names.push(move parameter); c.world.param_types.push(mode); c.world.param_mutable.push(is_mut)
                     }
                 }
                 if !eat(&mut c, ",") { break }
@@ -2863,7 +2928,7 @@ fn returned_place(c: &mut Session, ty: i32, token: i32) -> i32 {
     id := locals.add(&mut c.body.locals, "_", ty, false, c.body.scope, token)
     _ := c.body.locals.active.pop()
     local_storage(&mut c, id, home, ty)
-    local_borrows.transient(&mut c.body.local_loans, id, c.body.loan.path, c.body.loan.root, c.body.loan.origin)
+    local_borrows.transient_with_parent(&mut c.body.local_loans, id, c.body.loan.path, c.body.loan.root, c.body.loan.origin, c.body.loan.parent, ft.type_kind(&c.types, ty) == 5)
     fc.clear_loan_eval(&mut c.body.loan)
     borrows.local_id(id)
 }
@@ -2874,7 +2939,8 @@ fn read_returned(c: &mut Session, ty: i32, token: i32) -> i32 {
     ft.type_base(&c.types, ty)
 }
 fn read_scalar_result(c: &mut Session, ty: i32, token: i32) -> i32 {
-    if ft.type_kind(&c.types, ty) == 4 && ft.scalar_element(&c.types, ft.type_base(&c.types, ty)) {
+    kind := ft.type_kind(&c.types, ty)
+    if (kind == 4 || kind == 5) && ft.scalar_element(&c.types, ft.type_base(&c.types, ty)) {
         return read_returned(&mut c, ty, token)
     }
     ty
@@ -3228,22 +3294,27 @@ fn enclosing_generic_instance(c: &Session) -> i32 {
     }
     -1
 }
-fn unify_generic_type(c: &Session, expr_id: i32, actual: i32, inferred: &mut []i32, self_def: i32) -> bool {
+fn unify_generic_type(c: &Session, expr_id: i32, actual: i32, inferred: &mut []i32, self_def: i32, self_ty: i32) -> bool {
     if expr_id < 0 || actual < 0 { return false }
     gf := &c.specializations.generic_fns
     form := gf.exprs.forms[expr_id]; val := gf.exprs.values[expr_id]
     if form == .Name {
-        if val == -1 && self_def >= 0 {
-            if actual <= 0 || actual >= c.specializations.type_instance_def.len { return false }
-            if c.specializations.type_instance_def[actual] != self_def { return false }
-            if c.specializations.type_instance_arg_counts[actual] != inferred.len { return false }
-            astart := c.specializations.type_instance_arg_starts[actual]
-            for i in 0..inferred.len {
-                arg_ty := c.specializations.type_instance_args[astart + i]
-                if inferred[i] < 0 { inferred[i] = arg_ty }
-                else if inferred[i] != arg_ty { return false }
+        if val == -1 {
+            if self_def >= 0 {
+                if actual <= 0 || actual >= c.specializations.type_instance_def.len { return false }
+                if c.specializations.type_instance_def[actual] != self_def { return false }
+                acount := c.specializations.type_instance_arg_counts[actual]
+                if acount > inferred.len { return false }
+                astart := c.specializations.type_instance_arg_starts[actual]
+                for i in 0..acount {
+                    arg_ty := c.specializations.type_instance_args[astart + i]
+                    if inferred[i] < 0 { inferred[i] = arg_ty }
+                    else if inferred[i] != arg_ty { return false }
+                }
+                return true
             }
-            return true
+            if self_ty > 0 { return actual == self_ty }
+            return false
         }
         if val <= -2 {
             p := -2 - val
@@ -3260,22 +3331,22 @@ fn unify_generic_type(c: &Session, expr_id: i32, actual: i32, inferred: &mut []i
     cstart := gf.exprs.starts[expr_id]; ccount := gf.exprs.starts[expr_id + 1] - cstart
     if actual <= 0 && form != .Tuple { return false }
     akind := ft.type_kind(&c.types, actual)
-    if form == .Shared { return akind == 4 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def) }
-    if form == .Exclusive { return akind == 5 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def) }
-    if form == .Array { return akind == 1 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def) }
+    if form == .Shared { return akind == 4 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def, self_ty) }
+    if form == .Exclusive { return akind == 5 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def, self_ty) }
+    if form == .Array { return akind == 1 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def, self_ty) }
     if form == .Fixed {
         if akind != 6 || ccount != 1 { return false }
         mut want_len := val
         if want_len < 0 { want_len = i32(c.types.const_lengths.get_or(gf.exprs.names[expr_id], -1)) }
         return want_len >= 0 && ft.type_count(&c.types, actual) == want_len &&
-            unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def)
+            unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def, self_ty)
     }
-    if form == .Consume { return ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], actual, &mut inferred, self_def) }
+    if form == .Consume { return ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], actual, &mut inferred, self_def, self_ty) }
     if form == .Tuple {
         if !ft.is_tuple(&c.types, actual) || ft.type_count(&c.types, actual) != ccount { return false }
         fstart := ft.type_start(&c.types, actual)
         for i in 0..ccount {
-            if !unify_generic_type(&c, gf.exprs.children[cstart + i], c.types.field_types[fstart + i], &mut inferred, self_def) { return false }
+            if !unify_generic_type(&c, gf.exprs.children[cstart + i], c.types.field_types[fstart + i], &mut inferred, self_def, self_ty) { return false }
         }
         return true
     }
@@ -3286,37 +3357,54 @@ fn unify_generic_type(c: &Session, expr_id: i32, actual: i32, inferred: &mut []i
         if ft.type_count(&c.types, actual) != pcount { return false }
         astart := ft.type_start(&c.types, actual)
         for i in 0..pcount {
-            if !unify_generic_type(&c, gf.exprs.children[cstart + i], ft.parameter_type(&c.types, astart + i), &mut inferred, self_def) { return false }
+            pchild := gf.exprs.children[cstart + i]
+            param_ty := ft.parameter_type(&c.types, astart + i)
+            if unify_generic_type(&c, pchild, param_ty, &mut inferred, self_def, self_ty) { continue }
+            pform := gf.exprs.forms[pchild]
+            if form == .Function && pform != .Consume && pform != .Shared && pform != .Exclusive &&
+                ft.type_kind(&c.types, param_ty) == 4 {
+                base_ty := ft.type_base(&c.types, param_ty)
+                if (ft.owned(&c.types, base_ty) || ft.type_kind(&c.types, base_ty) == 3) &&
+                    unify_generic_type(&c, pchild, base_ty, &mut inferred, self_def, self_ty) {
+                    continue
+                }
+            }
+            return false
         }
-        return unify_generic_type(&c, gf.exprs.children[cstart + pcount], ft.type_base(&c.types, actual), &mut inferred, self_def)
+        return unify_generic_type(&c, gf.exprs.children[cstart + pcount], ft.type_base(&c.types, actual), &mut inferred, self_def, self_ty)
     }
     if val == -1 {
-        return akind == 22 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def)
+        return akind == 22 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def, self_ty)
     }
     if actual >= c.specializations.type_instance_def.len || c.specializations.type_instance_def[actual] != val { return false }
     if c.specializations.type_instance_arg_counts[actual] != ccount { return false }
     astart := c.specializations.type_instance_arg_starts[actual]
     for i in 0..ccount {
-        if !unify_generic_type(&c, gf.exprs.children[cstart + i], c.specializations.type_instance_args[astart + i], &mut inferred, self_def) { return false }
+        if !unify_generic_type(&c, gf.exprs.children[cstart + i], c.specializations.type_instance_args[astart + i], &mut inferred, self_def, self_ty) { return false }
     }
     true
 }
-fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self_def: i32) -> i32 {
+fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self_def: i32, self_ty: i32) -> i32 {
     if expr_id < 0 { return 0 }
     form := c.specializations.generic_fns.exprs.forms[expr_id]
     val := c.specializations.generic_fns.exprs.values[expr_id]
     if form == .Name {
-        if val == -1 && self_def >= 0 {
-            for t in 0..c.specializations.type_instance_def.len {
-                if c.specializations.type_instance_def[t] != self_def { continue }
-                if c.specializations.type_instance_arg_counts[t] != inferred.len { continue }
-                astart := c.specializations.type_instance_arg_starts[t]
-                mut ok := true
-                for i in 0..inferred.len {
-                    if inferred[i] < 0 || c.specializations.type_instance_args[astart + i] != inferred[i] { ok = false; break }
+        if val == -1 {
+            if self_def >= 0 {
+                for t in 0..c.specializations.type_instance_def.len {
+                    if c.specializations.type_instance_def[t] != self_def { continue }
+                    acount := c.specializations.type_instance_arg_counts[t]
+                    if acount > inferred.len { continue }
+                    astart := c.specializations.type_instance_arg_starts[t]
+                    mut ok := true
+                    for i in 0..acount {
+                        if inferred[i] < 0 || c.specializations.type_instance_args[astart + i] != inferred[i] { ok = false; break }
+                    }
+                    if ok { return t }
                 }
-                if ok { return t }
+                return -1
             }
+            if self_ty > 0 { return self_ty }
             return -1
         }
         if val <= -2 {
@@ -3335,12 +3423,12 @@ fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self
     if form == .Consume {
         if ccount != 1 { return -1 }
         child := c.specializations.generic_fns.exprs.children[cstart]
-        return substitute_generic_type(&mut c, child, &inferred, self_def)
+        return substitute_generic_type(&mut c, child, &inferred, self_def, self_ty)
     }
     if form == .Shared || form == .Exclusive || form == .Array || form == .Fixed {
         if ccount != 1 { return -1 }
         child := c.specializations.generic_fns.exprs.children[cstart]
-        base := substitute_generic_type(&mut c, child, &inferred, self_def)
+        base := substitute_generic_type(&mut c, child, &inferred, self_def, self_ty)
         if base <= 0 { return -1 }
         if form == .Shared { return compound(&mut c, 4, base) }
         if form == .Exclusive { return compound(&mut c, 5, base) }
@@ -3360,7 +3448,7 @@ fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self
         mut fields: []i32 = []
         for i in 0..ccount {
             child := c.specializations.generic_fns.exprs.children[cstart + i]
-            fty := substitute_generic_type(&mut c, child, &inferred, self_def)
+            fty := substitute_generic_type(&mut c, child, &inferred, self_def, self_ty)
             if fty <= 0 || !ft.array_element(&c.types, fty) { return -1 }
             fields.push(fty)
         }
@@ -3373,23 +3461,32 @@ fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self
         if ccount == 0 { return -1 }
         pcount := ccount - 1
         mut params: []i32 = []
+        foreign := form == .Foreign
         for i in 0..pcount {
             child := c.specializations.generic_fns.exprs.children[cstart + i]
-            pty := substitute_generic_type(&mut c, child, &inferred, self_def)
+            pty := substitute_generic_type(&mut c, child, &inferred, self_def, self_ty)
             if pty <= 0 { return -1 }
-            params.push(pty)
+            consumes := c.specializations.generic_fns.exprs.forms[child] == .Consume
+            mode_ty := type_reader.parameter_mode(&mut c.types, pty, consumes, foreign)
+            if c.types.error != "" { c.types.error = ""; return -1 }
+            params.push(mode_ty)
         }
         rchild := c.specializations.generic_fns.exprs.children[cstart + pcount]
-        ret := substitute_generic_type(&mut c, rchild, &inferred, self_def)
+        ret := substitute_generic_type(&mut c, rchild, &inferred, self_def, self_ty)
         if ret < 0 { return -1 }
-        source := type_reader.borrow_source(&mut c.types, &params)
-        kind := if form == .Foreign { 8 } else { 9 }
+        mut source := -1
+        ret_kind := ft.type_kind(&c.types, ret)
+        if !foreign && (ret_kind == 4 || ret_kind == 5) {
+            source = type_reader.borrow_source_for(&mut c.types, &params, ret_kind == 5)
+            if c.types.error != "" { c.types.error = ""; return -1 }
+        }
+        kind := if foreign { 8 } else { 9 }
         return callable_with_parameter(&mut c, &params, ret, kind, source)
     }
     if val == -1 {
         if ccount != 1 { return -1 }
         child := c.specializations.generic_fns.exprs.children[cstart]
-        base := substitute_generic_type(&mut c, child, &inferred, self_def)
+        base := substitute_generic_type(&mut c, child, &inferred, self_def, self_ty)
         if base <= 0 { return -1 }
         return compound(&mut c, 22, base)
     }
@@ -3397,7 +3494,7 @@ fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self
     for i in 0..ccount {
         if i > 0 { spec = spec + ", " }
         child := c.specializations.generic_fns.exprs.children[cstart + i]
-        aty := substitute_generic_type(&mut c, child, &inferred, self_def)
+        aty := substitute_generic_type(&mut c, child, &inferred, self_def, self_ty)
         if aty < 0 { return -1 }
         spec = spec + ft.type_spelling(&c.types, aty)
     }
@@ -3484,15 +3581,15 @@ fn infer_generic_call(c: &mut Session, gfn: i32, raw_name: string, mname: string
         if consuming && (pform == .Shared || pform == .Exclusive) {
             fail(&mut c, "move argument requires a consuming parameter"); return 0
         }
-        mut context := substitute_generic_type(&mut c, target_expr, &inferred, self_def)
+        mut context := substitute_generic_type(&mut c, target_expr, &inferred, self_def, -1)
         if context < 0 { context = 0 }
         prev_addr := c.body.place.taking_address
         c.body.place.taking_address = implicit_borrow
         actual := expression(&mut c, 0, context, &catalog, &mut inline_work, &mut model)
         c.body.place.taking_address = prev_addr
         if !c.ok { return 0 }
-        if !unify_generic_type(&c, target_expr, actual, &mut inferred, self_def) {
-            want_ty := substitute_generic_type(&mut c, target_expr, &inferred, self_def)
+        if !unify_generic_type(&c, target_expr, actual, &mut inferred, self_def, -1) {
+            want_ty := substitute_generic_type(&mut c, target_expr, &inferred, self_def, -1)
             if want_ty >= 0 {
                 same(&mut c, want_ty, actual)
                 return 0
@@ -3510,7 +3607,7 @@ fn infer_generic_call(c: &mut Session, gfn: i32, raw_name: string, mname: string
     fc.clear_expr(&mut c.body.expr); fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place)
     ret_expr := c.specializations.generic_fns.ret_exprs[gfn]
     if expected > 0 && ret_expr >= 0 {
-        _ := unify_generic_type(&c, ret_expr, expected, &mut inferred, self_def)
+        _ := unify_generic_type(&c, ret_expr, expected, &mut inferred, self_def, -1)
     }
     mut missing := false
     mut spec := ""
@@ -3537,7 +3634,7 @@ fn infer_generic_call(c: &mut Session, gfn: i32, raw_name: string, mname: string
         c.demanded_inferred_args.push(move spec)
     }
     if ret_expr < 0 { return 0 }
-    ret_ty := substitute_generic_type(&mut c, ret_expr, &inferred, self_def)
+    ret_ty := substitute_generic_type(&mut c, ret_expr, &inferred, self_def, -1)
     if ret_ty >= 0 {
         if owned(&c, ret_ty) { return temporary(&mut c, ret_ty) }
         return ret_ty
@@ -3546,6 +3643,173 @@ fn infer_generic_call(c: &mut Session, gfn: i32, raw_name: string, mname: string
     if c.demanded_inferred_args.len > prev_demanded { return 1 }
     fail(&mut c, "resolving inferred return type for '" + shown + "'")
     c.error_at = c.world.tokens.starts[site_tok]
+    0
+}
+fn strip_generic_suffix(name: string) -> string {
+    for i in 0..name.len {
+        if name[i..i + 1] == "<" { return name[0..i] }
+    }
+    name.clone()
+}
+fn generic_method_base(c: &Session, ty: i32) -> string {
+    if ty <= 0 || ty >= c.types.type_names.len { return "" }
+    strip_generic_suffix(c.types.type_names[ty])
+}
+fn generic_method_lookup(c: &Session, ty: i32, mname: string, has_self: bool) -> i32 {
+    base := generic_method_base(&c, ty)
+    if base == "" { return -1 }
+    gfn := i32(c.specializations.generic_fns.defs.get_or(base + "::" + mname, -1))
+    if gfn < 0 || gfn >= c.specializations.generic_fns.has_self.len { return -1 }
+    if c.specializations.generic_fns.has_self[gfn] != has_self { return -1 }
+    gfn
+}
+fn record_inferred_site(c: &mut Session, site_tok: i32, move spec: string) {
+    inst := enclosing_generic_instance(&c)
+    lkey := inst.str() + "@" + c.world.tokens.starts[site_tok].str()
+    ikey := c.specializations.inferred_lookup.get_or(lkey, "")
+    if ikey != "" && !c.demanded_inferred_keys.contains(ikey) {
+        c.demanded_inferred_keys.put(ikey.clone(), i64(c.demanded_inferred_args.len))
+        c.demanded_inferred_args.push(move spec)
+    }
+}
+fn try_generic_method_call(c: &mut Session, gfn: i32, receiver_ty: i32, raw_base: string, mname: string,
+    owner_tok: i32, mname_tok: i32, expected: i32, has_self: bool,
+    catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    base := if raw_base != "" { raw_base.clone() } else { generic_method_base(&c, receiver_ty) }
+    shown_base := diagnostics.display_symbol(&c.sources, base)
+    shown := shown_base + "::" + mname
+    if !c.code.checking || !c.specializations.generic_fns.valid[gfn] {
+        if eat(&mut c, "<") {
+            mut d := 1
+            while c.ok && d > 0 {
+                if eat(&mut c, "<") { d += 1 }
+                else if eat(&mut c, ">") { d -= 1 }
+                else if c.world.tokens.kinds[c.body.cursor] == .End { break }
+                else { skip_token(&mut c) }
+            }
+        }
+        if eat(&mut c, "(") {
+            mut d := 1
+            while c.ok && d > 0 {
+                if eat(&mut c, "(") { d += 1 }
+                else if eat(&mut c, ")") { d -= 1 }
+                else if c.world.tokens.kinds[c.body.cursor] == .End { break }
+                else { skip_token(&mut c) }
+            }
+        }
+        fail(&mut c, "cannot specialize generic method '" + shown + "'")
+        c.error_at = c.world.tokens.starts[mname_tok]
+        return 0
+    }
+    tcount := c.specializations.generic_fns.type_param_counts[gfn]
+    otcount := c.specializations.generic_fns.owner_tcounts[gfn]
+    self_def := c.specializations.generic_fns.catalog_defs[gfn]
+    pstart := c.specializations.generic_fns.param_starts[gfn]
+    pcount := c.specializations.generic_fns.param_counts[gfn]
+    mut inferred: []i32 = []
+    for _ in 0..tcount { inferred.push(-1) }
+    if otcount > 0 && receiver_ty > 0 && receiver_ty < c.specializations.type_instance_def.len &&
+        c.specializations.type_instance_def[receiver_ty] >= 0 {
+        if c.specializations.type_instance_arg_counts[receiver_ty] == otcount {
+            astart := c.specializations.type_instance_arg_starts[receiver_ty]
+            for oi in 0..otcount { inferred[oi] = c.specializations.type_instance_args[astart + oi] }
+        }
+    }
+    if eat(&mut c, "<") {
+        mut explicit: []i32 = []
+        while c.ok && !is(&c, ">") {
+            explicit.push(type_name(&mut c))
+            if !eat(&mut c, ",") { break }
+        }
+        expect(&mut c, ">")
+        if !c.ok { return 0 }
+        want_m := tcount - otcount
+        if explicit.len != want_m {
+            fail(&mut c, "wrong number of type arguments for generic method '" + shown + "': expected " + want_m.str() + ", got " + explicit.len.str())
+            c.error_at = c.world.tokens.starts[mname_tok]
+            return 0
+        }
+        for mi in 0..want_m { inferred[otcount + mi] = explicit[mi] }
+    }
+    expect(&mut c, "(")
+    if !c.ok { return 0 }
+    mut provided := 0
+    while c.ok && !is(&c, ")") {
+        if provided >= pcount { fail(&mut c, "too many arguments"); break }
+        arg_tok := c.body.cursor; consuming := eat(&mut c, "move")
+        pexpr := c.specializations.generic_fns.param_exprs[pstart + provided]
+        pform := c.specializations.generic_fns.exprs.forms[pexpr]
+        implicit_borrow := pform == .Shared && !starts_borrow(&c)
+        mut target_expr := pexpr
+        if implicit_borrow {
+            s := c.specializations.generic_fns.exprs.starts[pexpr]
+            if s < c.specializations.generic_fns.exprs.starts[pexpr + 1] {
+                target_expr = c.specializations.generic_fns.exprs.children[s]
+            }
+        }
+        if consuming && (pform == .Shared || pform == .Exclusive) {
+            fail(&mut c, "move argument requires a consuming parameter"); return 0
+        }
+        mut context := substitute_generic_type(&mut c, target_expr, &inferred, self_def, receiver_ty)
+        if context < 0 { context = 0 }
+        prev_addr := c.body.place.taking_address
+        c.body.place.taking_address = implicit_borrow
+        actual := expression(&mut c, 0, context, &catalog, &mut inline_work, &mut model)
+        c.body.place.taking_address = prev_addr
+        if !c.ok { return 0 }
+        if !unify_generic_type(&c, target_expr, actual, &mut inferred, self_def, receiver_ty) {
+            want_ty := substitute_generic_type(&mut c, target_expr, &inferred, self_def, receiver_ty)
+            if want_ty >= 0 {
+                same(&mut c, want_ty, actual)
+                return 0
+            }
+            fail(&mut c, "cannot unify argument " + (provided + 1).str() + " for generic method '" + shown + "' (got '" + ft.type_spelling(&c.types, actual) + "')")
+            c.error_at = c.world.tokens.starts[arg_tok]
+            return 0
+        }
+        provided = provided + 1
+        if !eat(&mut c, ",") { break }
+    }
+    expect(&mut c, ")")
+    if !c.ok { return 0 }
+    if provided != pcount { fail(&mut c, "wrong argument count"); return 0 }
+    fc.clear_expr(&mut c.body.expr); fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place)
+    ret_expr := c.specializations.generic_fns.ret_exprs[gfn]
+    if expected > 0 && ret_expr >= 0 {
+        _ := unify_generic_type(&c, ret_expr, expected, &mut inferred, self_def, receiver_ty)
+    }
+    mut missing := false
+    mut spec := base + "::" + mname
+    mut owner_spec := ""
+    for p in 0..tcount {
+        if inferred[p] < 0 { missing = true; break }
+        tname := ft.canonical_spelling(&c.types, inferred[p])
+        spec = spec + "\n" + tname
+        if p < otcount {
+            if p > 0 { owner_spec = owner_spec + "\n" }
+            owner_spec = owner_spec + tname
+        }
+    }
+    if missing {
+        fail(&mut c, "cannot infer type arguments for generic method '" + shown + "'; pass explicit type arguments")
+        c.error_at = c.world.tokens.starts[mname_tok]
+        return 0
+    }
+    prev_demanded := c.demanded_inferred_args.len
+    if owner_tok >= 0 && otcount > 0 && receiver_ty < 0 {
+        record_inferred_site(&mut c, owner_tok, move owner_spec)
+    }
+    record_inferred_site(&mut c, mname_tok, move spec)
+    if ret_expr < 0 { return 0 }
+    ret_ty := substitute_generic_type(&mut c, ret_expr, &inferred, self_def, receiver_ty)
+    if ret_ty >= 0 {
+        if owned(&c, ret_ty) { return temporary(&mut c, ret_ty) }
+        return ret_ty
+    }
+    if expected > 0 { return expected }
+    if c.demanded_inferred_args.len > prev_demanded { return 1 }
+    fail(&mut c, "resolving inferred return type for generic method '" + shown + "'")
+    c.error_at = c.world.tokens.starts[mname_tok]
     0
 }
 fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, covered: &mut bool) -> i32 {
@@ -3632,7 +3896,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         if base < 0 { fail(&mut c, "addr requires a stored place"); return 0 }
         if write && is_for_locked(&c, owner_path(&c, c.body.places.current)) { fail(&mut c, "cannot mutably borrow a collection while iterating over it"); return 0 }
         if write && !writable_loan(&mut c, c.body.places.current) { return 0 }
-        if write { c.body.mutations.push(base) }
+        if write { record_mutation(&mut c, base, owner_path(&c, c.body.places.current)) }
         if c.loans.active {
             origin := loan_origin(&c, c.body.places.current)
             if origin == -2 { fail(&mut c, "scratch storage cannot become a raw address"); return 0 }
@@ -3662,7 +3926,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         require_unsafe(&mut c)
         owner_ty := expression(&mut c, 0, 0, &catalog, &mut inline_work, &mut model)
         owner_path := c.body.loan.path; owner_root := c.body.loan.root
-        owner_origin := c.body.loan.origin; owner_constrained := c.body.loan.constrained
+        owner_origin := c.body.loan.origin; owner_parent := c.body.loan.parent; owner_constrained := c.body.loan.constrained
         effects := c.body.mutations.len
         if c.ok && ft.type_kind(&c.types, owner_ty) != 4 {
             fail(&mut c, "bytes_view requires a shared borrow as first argument"); return 0
@@ -3677,7 +3941,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         len_home := slot(&mut c); arm.store(&mut c.code, len_home, 0)
         expect(&mut c, ")")
         if !c.ok { return 0 }
-        if owner_root >= 0 && borrows.changed(&c.body.mutations, effects, c.body.mutations.len, owner_root) {
+        if owner_root >= 0 && mutated_overlap(&c, effects, c.body.mutations.len, owner_root, owner_path) {
             fail(&mut c, "cannot mutate or move an owner while constructing a borrowed view"); return 0
         }
         for field in 0..5 { _ := slot(&mut c) }
@@ -3688,7 +3952,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         place_step(&mut c, .BorrowHome, arr_ty, 3, 0, holder, token)
         c.body.loan.home = -1
         c.body.loan.path = owner_path; c.body.loan.root = owner_root
-        c.body.loan.origin = owner_origin; c.body.loan.constrained = owner_constrained
+        c.body.loan.origin = owner_origin; c.body.loan.parent = owner_parent; c.body.loan.constrained = owner_constrained
         if !constrain_borrow(&mut c) { return 0 }
         fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
         return compound(&mut c, 4, arr_ty)
@@ -3811,10 +4075,12 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
 }
 fn scoped_borrow_body(c: &Session, f: i32) -> bool {
     for i in c.world.starts[f]..c.world.ends[f] {
-        if c.world.tokens.kinds[i] != .Symbol || c.world.tokens.texts[i] != "&" || c.world.tokens.texts[i + 1] == "mut" { continue }
+        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "as_bytes" { return true }
+        if c.world.tokens.kinds[i] != .Symbol || c.world.tokens.texts[i] != "&" { continue }
         mut before := i - 1
         while before >= c.world.starts[f] && (lexer.is_newline(c.world.tokens.kinds[before]) || c.world.tokens.texts[before] == "(") { before -= 1 }
         if before >= 0 && (c.world.tokens.texts[before] == ":=" || c.world.tokens.texts[before] == "=") { return true }
+        if c.world.tokens.texts[i + 1] == "mut" { continue }
         mut at := i + 1
         if c.world.tokens.kinds[at] != .Name { return true }
         if c.world.tokens.texts[at] == "await" || c.world.tokens.texts[at] == "spawn" { return true }
@@ -3848,6 +4114,8 @@ fn needs_loan_analysis(c: &Session, f: i32) -> bool {
     for i in c.world.starts[f]..c.world.ends[f] {
         if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "region" && c.world.tokens.kinds[i + 1] == .Name { return true }
         if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "bytes_view" && c.world.tokens.texts[i + 1] == "(" { return true }
+        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "as_bytes" && c.world.tokens.texts[i + 1] == "(" { return true }
+        if c.world.tokens.kinds[i] == .Symbol && c.world.tokens.texts[i] == "&" && c.world.tokens.texts[i + 1] == "mut" { return true }
     }
     scoped_borrow_body(&c, f)
 }
@@ -3921,7 +4189,7 @@ fn read_argument(c: &mut Session, ty: i32, token: i32) {
         home := slot(&mut c); arm.store(&mut c.code, home, 0); place_step(&mut c, .BorrowHome, ty, 3, 0, home, token)
     }
     c.body.loan.path = owner_path(&c, place); c.body.loan.root = source_root(&c, place)
-    c.body.loan.origin = loan_origin(&c, place)
+    c.body.loan.origin = loan_origin(&c, place); c.body.loan.parent = borrow_parent(&c, place)
     binding := borrows.root(&c.body.places, place)
     c.body.loan.constrained = local_borrows.shared(&c.body.local_loans, binding)
 }
@@ -3951,10 +4219,10 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
     pending := c.body.pending.slots.len
     for arg in 0..provided { stage_owner(&mut c, .Argument, args_in[arg], ft.parameter_type(&c.types, first + arg), 0) }
     mut args: []i32 = []; mut own_args: []i32 = []; mut arg_starts: []i32 = []; mut arg_sources: []i32 = []; mut effects: []i32 = []
-    mut arg_roots: []i32 = []; mut arg_paths: []i32 = []
+    mut arg_roots: []i32 = []; mut arg_paths: []i32 = []; mut arg_parents: []i32 = []
     for v in &args_in { args.push(v) }
     for v in &starts_in { arg_starts.push(v) }
-    for v in &places_in { arg_roots.push(source_root(&c, v)); arg_paths.push(owner_path(&c, v)) }
+    for v in &places_in { arg_roots.push(source_root(&c, v)); arg_paths.push(owner_path(&c, v)); arg_parents.push(borrow_parent(&c, v)) }
     if source_parameter >= 0 && source_parameter < provided { result_origin = loan_origin(&c, places_in[source_parameter]) }
     for v in &sources_in { arg_sources.push(v) }
     for v in &effects_in { effects.push(v) }
@@ -4019,8 +4287,9 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
         index := alloc_arg_slot(&mut c); arm.store(&mut c.code, index, 0); args.push(index); own_args.push(index)
         stage_owner(&mut c, .Argument, index, want, 0)
         mut root := source_root(&c, c.body.places.current); mut path := owner_path(&c, c.body.places.current)
-        if c.body.loan.root >= 0 { root = c.body.loan.root; path = c.body.loan.path }
-        arg_roots.push(root); arg_paths.push(path)
+        mut parent := borrow_parent(&c, c.body.places.current)
+        if c.body.loan.root >= 0 { root = c.body.loan.root; path = c.body.loan.path; parent = c.body.loan.parent }
+        arg_roots.push(root); arg_paths.push(path); arg_parents.push(parent)
         mut source := c.body.places.source; if source < 0 { source = argument }
         arg_sources.push(source); provided = provided + 1
         if !eat(&mut c, ",") { break }
@@ -4038,12 +4307,18 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
         for sibling in 0..provided {
             if sibling == arg { continue }
             sibling_kind := ft.type_kind(&c.types, ft.parameter_type(&c.types, first + sibling))
-            if (sibling_kind == 4 || sibling_kind == 5) && arg_roots[sibling] == root &&
-                (ft.type_kind(&c.types, want) == 5 || sibling_kind == 5) {
-                fail(&mut c, "mutable arguments must not alias another borrow in the same call")
-                c.error_at = c.world.tokens.starts[arg_sources[sibling]]; return 0
+            if (sibling_kind == 4 || sibling_kind == 5) && (ft.type_kind(&c.types, want) == 5 || sibling_kind == 5) {
+                overlap := if arg_paths[arg] >= 0 && arg_paths[sibling] >= 0 {
+                    ownership.overlaps(&c.body.ownership, arg_paths[arg], arg_paths[sibling])
+                } else {
+                    arg_roots[sibling] == root
+                }
+                if overlap {
+                    fail(&mut c, "mutable arguments must not alias another borrow in the same call")
+                    c.error_at = c.world.tokens.starts[arg_sources[sibling]]; return 0
+                }
             }
-            if sibling > arg && borrows.changed(&c.body.mutations, effects[sibling], effects[sibling + 1], root) {
+            if sibling > arg && mutated_overlap(&c, effects[sibling], effects[sibling + 1], root, arg_paths[arg]) {
                 fail(&mut c, "cannot mutate a value while it is borrowed by another argument")
                 c.error_at = c.world.tokens.starts[arg_starts[sibling]]; return 0
             }
@@ -4097,7 +4372,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
     fc.clear_loan_eval(&mut c.body.loan)
     if source_parameter >= 0 {
         c.body.loan.path = arg_paths[source_parameter]; c.body.loan.root = arg_roots[source_parameter]
-        c.body.loan.origin = result_origin; c.body.loan.constrained = true
+        c.body.loan.origin = result_origin; c.body.loan.parent = arg_parents[source_parameter]; c.body.loan.constrained = true
     }
     result
 }
@@ -4139,7 +4414,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             fc.clear_rvalue_place(&mut c.body.place)
             continue
         }
-        if ft.type_kind(&c.types, ty) == 4 {
+        if ft.type_kind(&c.types, ty) == 4 || ft.type_kind(&c.types, ty) == 5 {
             place = returned_place(&mut c, ty, first_token)
             ty = ft.type_base(&c.types, ty); at = first_token; pending = true; materialized = 0
         }
@@ -4165,7 +4440,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             packed := c.body.place.inline_storage && ft.type_kind(&c.types, ty) == 6
             writable := c.body.place.writable
             view := c.body.loan.depth == c.body.depth
-            source_path := owner_path(&c, place); source_root_id := source_root(&c, place); source_origin := loan_origin(&c, place)
+            source_path := owner_path(&c, place); source_root_id := source_root(&c, place); source_origin := loan_origin(&c, place); source_parent := borrow_parent(&c, place)
             if ty == 4 && !view && !lookahead.read_only_index(&c.world.tokens, c.body.cursor) { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
             arm.push_temp(&mut c.code, 0)
             effects := c.body.mutations.len
@@ -4182,13 +4457,13 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             }
             else { index_type := expression(&mut c, 1, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, index_type) }
             if local_borrows.is_transient(&c.body.local_loans, borrows.root(&c.body.places, place)) &&
-                borrows.changed(&c.body.mutations, effects, c.body.mutations.len, source_root_id) {
+                mutated_overlap(&c, effects, c.body.mutations.len, source_root_id, source_path) {
                 c.body.place.taking_address = previous_address
                 fail(&mut c, "cannot mutate or move an owner while indexing its returned borrow"); break
             }
             if collection(&c, ty) {
                 base := borrows.root(&c.body.places, place)
-                if borrows.changed(&c.body.mutations, effects, c.body.mutations.len, base) {
+                if mutated_overlap(&c, effects, c.body.mutations.len, base, owner_path(&c, place)) {
                     arm.mov(&mut c.code, 1, 0); arm.pop_temp(&mut c.code, 0); arm.push_temp(&mut c.code, 1)
                     lower_place(&mut c, place, 0, .Value, at)
                     arm.pop_temp(&mut c.code, 1); arm.push_temp(&mut c.code, 0); arm.mov(&mut c.code, 0, 1)
@@ -4209,7 +4484,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     } else { last_type := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, last_type) }
                     last_home := slot(&mut c); arm.store(&mut c.code, last_home, 0); expect(&mut c, "]")
                     c.body.place.taking_address = previous_address
-                    if borrows.changed(&c.body.mutations, effects, c.body.mutations.len, source_root_id) {
+                    if mutated_overlap(&c, effects, c.body.mutations.len, source_root_id, source_path) {
                         fail(&mut c, "cannot mutate or move an owner while constructing a borrowed range"); break
                     }
                     text := ty == 4; mut base := 8
@@ -4221,7 +4496,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     borrowed_view.emit(&mut c.code, source_home, first_home, last_home, data_home, text, shift, c.bounds, c.unicode_trap, c.world.tokens.starts[subscript_at])
                     holder := slot(&mut c); arm.store(&mut c.code, holder, 0)
                     c.body.loan.home = holder; c.body.loan.path = source_path
-                    c.body.loan.root = source_root_id; c.body.loan.origin = source_origin; c.body.loan.constrained = true
+                    c.body.loan.root = source_root_id; c.body.loan.origin = source_origin; c.body.loan.parent = source_parent; c.body.loan.constrained = true
                     ty = result; place = 0; fc.clear_rvalue_place(&mut c.body.place)
                     fc.clear_expr_value(&mut c.body.expr); projection_address = -1; temporary_root = -1
                     break
@@ -4274,21 +4549,29 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     if (type_owner < 0 || type_owner == c.body.current_owner) && (fk == 8 || fk == 9) { callable_field = true }
                 }
             }
-            if is(&c, "(") && !callable_field {
+            method_tok := c.body.cursor - 1
+            is_gen_method_call := member < 0 && is(&c, "<") && generic_method_lookup(&c, ty, name, true) >= 0
+            if (is(&c, "(") || is_gen_method_call) && !callable_field {
                 c.body.expr.move_projection = projection_address; c.body.expr.move_temporary = temporary_root
                 prim_str := name == "str" && ty >= 1 && ty <= 12
-                impl_fn := if prim_str { -1 } else { impl_method(&c, ty, name) }
+                impl_fn := if prim_str || is_gen_method_call { -1 } else { impl_method(&c, ty, name) }
                 mut result := 0
                 if impl_fn >= 0 {
                     result = method_impl(&mut c, impl_fn, ty, place, materialized, pending, at, temporary_root, projection_address, &catalog, &mut inline_work, &mut model)
                     pending = false
                 } else {
-                    dummy := demand_compound_method(&mut c, ty, name)
-                    if dummy >= 0 {
-                        skip_balanced_parens(&mut c); result = dummy; pending = false
-                    } else {
+                    gfn := generic_method_lookup(&c, ty, name, true)
+                    if gfn >= 0 {
                         if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
-                        result = method(&mut c, ty, name, place, at, &catalog, &mut inline_work, &mut model)
+                        result = try_generic_method_call(&mut c, gfn, ty, "", name, -1, method_tok, expected, true, &catalog, &mut inline_work, &mut model)
+                    } else {
+                        dummy := demand_compound_method(&mut c, ty, name)
+                        if dummy >= 0 {
+                            skip_balanced_parens(&mut c); result = dummy; pending = false
+                        } else {
+                            if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
+                            result = method(&mut c, ty, name, place, at, &catalog, &mut inline_work, &mut model)
+                        }
                     }
                 }
                 if c.body.stream_kind >= 10 { ty = result }
@@ -4323,9 +4606,10 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
     if pending && c.ok {
         binding := borrows.root(&c.body.places, place)
         if place < 0 && ft.type_kind(&c.types, expected) == 4 && c.body.locals.types[binding] == expected {
+            if !readable_loan(&mut c, place) { return 0 }
             arm.load(&mut c.code, places.local_home(c.body.places.arena.locals[binding]))
             c.body.loan.path = owner_path(&c, place); c.body.loan.root = source_root(&c, place)
-            c.body.loan.origin = loan_origin(&c, place)
+            c.body.loan.origin = loan_origin(&c, place); c.body.loan.parent = borrow_parent(&c, place)
             c.body.loan.constrained = local_borrows.path(&c.body.local_loans, binding) >= 0
             fc.clear_rvalue_place(&mut c.body.place); ty = expected
         } else { lower_place(&mut c, place, materialized, place_access(&c), at) }
@@ -4349,7 +4633,7 @@ fn fail_method_without_parens(c: &mut Session, ty: i32, name: string, tok: i32) 
     kind := ft.type_kind(&c.types, ty)
     mut is_builtin := name == "clone" && (ty == 4 || collection(&c, ty) || kind == 2 || kind == 3 || kind == 6 || kind == 7)
     if !is_builtin && ty == 4 {
-        is_builtin = name == "str" || name == "bytes" || name == "runes" || name == "slice"
+        is_builtin = name == "str" || name == "bytes" || name == "as_bytes" || name == "runes" || name == "slice"
     } else if !is_builtin && ty == 3 {
         is_builtin = name == "str"
     } else if !is_builtin && floats.has(ty) {
@@ -4360,7 +4644,7 @@ fn fail_method_without_parens(c: &mut Session, ty: i32, name: string, tok: i32) 
         is_builtin = name == "str" || integers.method(name) != .Unknown
     } else if !is_builtin && kind == 1 {
         is_builtin = name == "cap" || name == "swap" || name == "iter" || name == "push" || name == "reserve" ||
-            name == "pop" || name == "remove" || name == "clear" || bundled.prelude_method(name)
+            name == "pop" || name == "remove" || name == "clear" || name == "truncate" || bundled.prelude_method(name)
     } else if !is_builtin && kind == 6 {
         is_builtin = name == "swap" || name == "iter" || bundled.prelude_method(name)
     } else if !is_builtin && ft.is_tuple(&c.types, ty) {
@@ -4547,11 +4831,13 @@ fn arm_error(c: &mut Session, match_arm: bool, message: string) {
 }
 fn take_return_value(c: &mut Session, ty: i32, at: i32) {
     if !c.ok { return }
-    if ft.type_kind(&c.types, ty) != 4 { take_value(&mut c, ty); return }
+    kind := ft.type_kind(&c.types, ty)
+    if kind != 4 && kind != 5 { take_value(&mut c, ty); return }
     if c.body.expr.untyped_exit && !ownership.falls_through(&c.body.ownership) { return }
     source := c.body.return_borrow_origin
     if source < 0 || c.body.loan.origin != source || c.body.loan.path < 0 || c.body.loan.root < 0 {
         mut message := "returned borrow must come from its declared shared parameter"
+        if kind == 5 { message = "returned borrow must come from its declared mutable parameter" }
         if source >= 0 { message = message + " '" + c.world.param_names[source] + "'" }
         fail(&mut c, message)
         c.error_at = c.world.tokens.starts[at]
@@ -4561,12 +4847,20 @@ fn yield_value(c: &mut Session, ty: i32, home: i32, match_arm: bool) {
     if !c.ok { return }
     if ty == 0 { arm_error(&mut c, match_arm, "must produce a value"); return }
     kind := ft.type_kind(&c.types, ty)
-    if kind == 5 || (kind == 4 && c.body.return_borrow_origin < 0) { arm_error(&mut c, match_arm, "cannot return a borrow"); return }
+    if (kind == 4 || kind == 5) && c.body.return_borrow_origin < 0 { arm_error(&mut c, match_arm, "cannot return a borrow"); return }
     take_return_value(&mut c, ty, c.body.cursor)
     arm.store(&mut c.code, home, 0)
 }
 fn branch_value(c: &mut Session, expected: i32, home: i32, match_arm: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     if match_arm && !is(&c, "{") {
+        if is(&c, "return") || is(&c, "break") || is(&c, "continue") {
+            prev_tail := c.body.tail; c.body.tail = false
+            enter(&mut c)
+            _ := statement(&mut c, &catalog, &mut inline_work, &mut model)
+            leave(&mut c)
+            c.body.tail = prev_tail
+            return 0
+        }
         live := ownership.falls_through(&c.body.ownership)
         ty := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
         if (ty == 0 && c.body.expr.untyped_exit) || (live && !ownership.falls_through(&c.body.ownership)) { return 0 }
@@ -4791,6 +5085,40 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         arm.branch(&mut c.code, target, 20)
         return temporary(&mut c, 4)
     }
+    if is(&c, "unsafe") && c.body.cursor + 1 < c.world.tokens.kinds.len && c.world.tokens.texts[c.body.cursor + 1] == "{" {
+        if model.probing && decline_projection(&mut c, &mut model) { return 0 }
+        skip_token(&mut c)
+        task_effect_at(&mut c, 16, token)
+        if !c.world.unsafe_capable {
+            has_other := c.body.current_owner >= 0 && c.body.current_owner < c.world.module_caps.len && c.world.module_caps[c.body.current_owner] != 0
+            fail(&mut c, modules.missing_unsafe_message(has_other)); return 0
+        }
+        end := c.world.closes[c.body.cursor]
+        home := slot(&mut c)
+        previous_unsafe := c.body.unsafe_scope; c.body.unsafe_scope = true
+        previous_vb := c.body.value_block
+        c.body.value_block = fc.ValueBlock { end: end, home: home, expected: expected, ty: 0, match_arm: false }
+        ends := block(&mut c, false, &catalog, &mut inline_work, &mut model)
+        ty := c.body.value_block.ty
+        c.body.value_block = previous_vb
+        c.body.unsafe_scope = previous_unsafe
+        if !c.ok { return 0 }
+        fc.clear_place_eval(&mut c.body.place)
+        if ends {
+            out := temporary(&mut c, expected); c.body.expr.untyped_exit = true
+            return out
+        }
+        if ty == 0 { return 0 }
+        arm.load(&mut c.code, home)
+        if ft.type_kind(&c.types, ty) == 4 || ft.type_kind(&c.types, ty) == 5 {
+            fc.clear_expr(&mut c.body.expr); fc.clear_loan_eval(&mut c.body.loan)
+            binding := c.body.return_borrow_origin - c.body.first_parameter
+            c.body.loan.root = binding; c.body.loan.origin = c.body.return_borrow_origin
+            c.body.loan.path = ownership.root_id(&c.body.ownership, binding); c.body.loan.constrained = true
+            return ty
+        }
+        return temporary(&mut c, ty)
+    }
     if kind == .Name {
         next := c.world.tokens.kinds[token + 1]
         if next == .Name || (next == .Symbol && c.world.tokens.texts[token + 1] == "!") {
@@ -4818,10 +5146,19 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         if eat(&mut c, "::") {
             if nominal < 0 {
                 if c.world.tokens.kinds[c.body.cursor] == .Name {
-                    mname := c.world.tokens.texts[c.body.cursor].clone()
+                    method_tok := c.body.cursor
+                    mname := c.world.tokens.texts[method_tok].clone()
                     gfn := i32(c.specializations.generic_fns.defs.get_or(name + "::" + mname, -1))
                     if gfn >= 0 {
                         _ := advance(&mut c)
+                        if gfn < c.specializations.generic_fns.has_self.len &&
+                            !c.specializations.generic_fns.has_self[gfn] &&
+                            c.specializations.generic_fns.owner_tcounts[gfn] < c.specializations.generic_fns.type_param_counts[gfn] &&
+                            (is(&c, "(") || is(&c, "<")) {
+                            result := try_generic_method_call(&mut c, gfn, -1, name, mname, token, method_tok, expected, false, &catalog, &mut inline_work, &mut model)
+                            fc.clear_rvalue_place(&mut c.body.place)
+                            return call_result(&mut c, result)
+                        }
                         shown_base := diagnostics.display_symbol(&c.sources, name)
                         if !eat(&mut c, "(") {
                             fail(&mut c, "cannot infer type arguments for '" + shown_base + "::" + mname + "'; requires explicit type arguments, e.g. '" + shown_base + "<...>::" + mname + "'")
@@ -4837,8 +5174,16 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             }
             if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected method name after '::'"); return 0 }
             method_tok := c.body.cursor; method_name := advance(&mut c)
-            f := impl_method(&c, nominal, method_name)
+            is_explicit_gen := is(&c, "<")
+            mut f := -1
+            if !is_explicit_gen { f = impl_method(&c, nominal, method_name) }
             if f < 0 {
+                gfn := generic_method_lookup(&c, nominal, method_name, false)
+                if gfn >= 0 && (is_explicit_gen || is(&c, "(")) {
+                    result := try_generic_method_call(&mut c, gfn, nominal, "", method_name, -1, method_tok, expected, false, &catalog, &mut inline_work, &mut model)
+                    fc.clear_rvalue_place(&mut c.body.place)
+                    return call_result(&mut c, result)
+                }
                 fail(&mut c, "unknown associated function '" + type_spelling(&c, nominal) + "::" + method_name + "'")
                 c.error_at = c.world.tokens.starts[method_tok]; return 0
             }
@@ -4884,11 +5229,21 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             stage_owner(&mut c, .Storage, saved, nominal, 0)
             for i in 0..ft.type_count(&c.types, nominal) { provided.push(false) }; separators(&mut c)
             while c.ok && !is(&c, "}") {
-                member_at := c.body.cursor; member := advance(&mut c); expect(&mut c, ":"); found := field(&c, nominal, member)
+                member_at := c.body.cursor; member := advance(&mut c); found := field(&c, nominal, member)
                 if found < 0 { fail(&mut c, "unknown constructor field"); break }
                 offset := found - ft.type_start(&c.types, nominal)
                 if provided[offset] { fail(&mut c, "duplicate constructor field") }; provided[offset] = true
-                ty := expression(&mut c, 0, c.types.field_types[found], &catalog, &mut inline_work, &mut model); same(&mut c, c.types.field_types[found], ty)
+                mut ty := 0
+                if eat(&mut c, ":") {
+                    ty = expression(&mut c, 0, c.types.field_types[found], &catalog, &mut inline_work, &mut model)
+                } else {
+                    if !is(&c, ",") && !is(&c, "}") && !lexer.is_newline(c.world.tokens.kinds[c.body.cursor]) {
+                        fail(&mut c, "expected ':' or ',' in struct literal"); break
+                    }
+                    c.body.cursor = member_at
+                    ty = expression(&mut c, 0, c.types.field_types[found], &catalog, &mut inline_work, &mut model)
+                }
+                same(&mut c, c.types.field_types[found], ty)
                 if ft.is_c_record(&c.types, nominal) {
                     take_inline(&mut c, ty)
                     arm.push_temp(&mut c.code,0); arm.load(&mut c.code,saved); place_step(&mut c, .Field, ty, i32(borrows.Access.Address), 0, i32(c.types.field_values[found]), member_at)
@@ -4988,7 +5343,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             return ty
         }
         arm.load(&mut c.code, home)
-        if ft.type_kind(&c.types, result) == 4 {
+        if ft.type_kind(&c.types, result) == 4 || ft.type_kind(&c.types, result) == 5 {
             fc.clear_expr(&mut c.body.expr); fc.clear_loan_eval(&mut c.body.loan)
             binding := c.body.return_borrow_origin - c.body.first_parameter
             c.body.loan.root = binding; c.body.loan.origin = c.body.return_borrow_origin
@@ -5014,6 +5369,12 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             if mutable { fail(&mut c, "cannot mutably borrow a shared reference"); return 0 }
             fc.clear_rvalue_place(&mut c.body.place); return ty
         }
+        if ft.type_kind(&c.types, ty) == 5 {
+            if mutable { fc.clear_rvalue_place(&mut c.body.place); return ty }
+            place = returned_place(&mut c, ty, token)
+            ty = ft.type_base(&c.types, ty)
+            lower_place(&mut c, place, 0, .ValueAndAddress, token)
+        }
         if c.body.loan.home >= 0 {
             if mutable { fail(&mut c, "borrowed ranges are read-only"); return 0 }
             home := c.body.loan.home; place_step(&mut c, .BorrowHome, ty, 3, 0, home, token)
@@ -5031,7 +5392,8 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         }
         if mutable && is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutably borrow a collection while iterating over it"); return 0 }
         if mutable && !writable_loan(&mut c, place) { return 0 }
-        if mutable { c.body.mutations.push(base) }
+        if !mutable && !readable_loan(&mut c, place) { return 0 }
+        if mutable { record_mutation(&mut c, base, owner_path(&c, place)) }
         if ft.type_kind(&c.types, ty)==21 {
             elem:=ft.type_base(&c.types, ty)
             if mutable || ft.type_kind(&c.types, expected)!=4 || ft.type_kind(&c.types, ft.type_base(&c.types, expected))!=1 || ft.type_base(&c.types, ft.type_base(&c.types, expected))!=elem || !ft.scalar_element(&c.types, elem) || i32(1).shl(unsigned.shift(storage_type(&c, elem)))!=scratch_width(&c,elem) {fail(&mut c,"scratch slice needs a shared, representation-compatible parameter");return 0}
@@ -5042,7 +5404,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         if c.body.place.address < 0 { fail(&mut c, "borrow requires a stored value"); return 0 }
         if mutable && !c.body.place.writable { fail_immutable_binding(&mut c, "mutable borrow requires mut or &mut", base) }
         c.body.loan.path = owner_path(&c, place); c.body.loan.root = source_root(&c, place)
-        c.body.loan.origin = loan_origin(&c, place)
+        c.body.loan.origin = loan_origin(&c, place); c.body.loan.parent = borrow_parent(&c, place)
         c.body.loan.constrained = local_borrows.shared(&c.body.local_loans, base)
         borrow_address(&mut c, ty, mutable, token, place); fc.clear_rvalue_place(&mut c.body.place)
         return compound(&mut c, kind, ty)
@@ -5094,6 +5456,7 @@ fn load_binding(c: &mut Session, found: i32, access: borrows.Access, token: i32,
         fail(&mut c, "use of moved value '" + c.body.locals.names[found] + "'")
         c.error_at = c.world.tokens.starts[token]; return
     }
+    if access != .Address && whole && !readable_loan(&mut c, borrows.local_id(found)) { return }
     local_type := c.body.locals.types[found]; kind := ft.type_kind(&c.types, local_type)
     home := places.local_home(c.body.places.arena.locals[found])
     c.body.place.scratch = 0; c.body.place.inline_storage = false
@@ -5122,7 +5485,7 @@ fn field_place(c: &mut Session, parent: i32, receiver: i32, member: i32, token: 
     layout := places.layout(.Field, field_offset(&c, receiver, member), read_shape(&c, ty, packed))
     ordinal := member - ft.type_start(&c.types, receiver)
     mut owner := owner_path(&c, parent)
-    if owner >= 0 && !borrows.has_index(&c.body.places, parent) && !local_borrows.shared(&c.body.local_loans, borrows.root(&c.body.places, parent)) {
+    if owner >= 0 && !borrows.has_index(&c.body.places, parent) && !local_borrows.is_transient(&c.body.local_loans, borrows.root(&c.body.places, parent)) {
         owner = ownership.project(&mut c.body.ownership, owner, ordinal)
     }
     return borrows.project(&mut c.body.places, parent, receiver, ordinal, ty, layout, token, c.world.tokens.starts[token], owner)
@@ -5201,6 +5564,7 @@ fn lower_place(c: &mut Session, place: i32, base: i32, access: borrows.Access, r
             c.error_at = c.world.tokens.starts[root_at]; return
         }
     }
+    if access != .Address && !readable_loan(&mut c, place) { return }
     mut p := place
     c.body.places.path.clear()
     while p > 0 && p != base { c.body.places.path.push(p - 1); p = places.parent(c.body.places.arena.nodes[3 * (p - 1)]) }
@@ -5272,7 +5636,7 @@ fn method_impl(c: &mut Session, f: i32, ty: i32, place: i32, materialized: i32, 
         if !c.body.place.writable { fail_immutable_binding(&mut c, "mutable method requires mut or &mut", base); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
         if !writable_loan(&mut c, place) { return 0 }
         if !ownership.available(&c.body.ownership, owner_path(&c, place)) { fail(&mut c, "cannot borrow a moved value"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
-        c.body.mutations.push(base)
+        record_mutation(&mut c, base, owner_path(&c, place))
         borrow_address(&mut c, ty, true, recv_tok, place)
         if c.loans.active {
             origin := loan_origin(&c, place)
@@ -5340,7 +5704,7 @@ fn replace_value(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut o
     if inline { take_inline(&mut c, ty) } else { take_value(&mut c, ty) }
     expect(&mut c, ")")
     if !c.ok { return 0 }
-    if borrows.changed(&c.body.mutations, effects, c.body.mutations.len, root) {
+    if mutated_overlap(&c, effects, c.body.mutations.len, root, owner_path(&c, place)) {
         fail(&mut c, "cannot mutate or move a value while it is borrowed by replace"); return 0
     }
     replacement := slot(&mut c); arm.store(&mut c.code, replacement, 0)
@@ -5354,7 +5718,7 @@ fn replace_value(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut o
     arm.load(&mut c.code, destination); arm.mov(&mut c.code, 1, 0); arm.pop_temp(&mut c.code, 0)
     if inline { store_inline(&mut c, ty, token) }
     else { place_transfer(&mut c, ty, 0, 1, false, packed, i32(borrows.Access.Address), token) }
-    c.body.mutations.push(root)
+    record_mutation(&mut c, root, owner_path(&c, place))
     arm.load(&mut c.code, previous)
     c.body.places.current = 0; c.body.places.source = -1
     fc.clear_expr_value(&mut c.body.expr)
@@ -5393,7 +5757,7 @@ fn swap_array(c: &mut Session, ty: i32, place: i32, receiver_at: i32, writable: 
     if !writable { fail_immutable_binding(&mut c, "swap requires mut or &mut", root); return 0 }
     if !writable_loan(&mut c, place) { return 0 }
     if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
-    c.body.mutations.push(root)
+    record_mutation(&mut c, root, owner_path(&c, place))
     effects := c.body.mutations.len
     packed := c.body.place.inline_storage && ft.type_kind(&c.types, ty) == 6
     values := slot(&mut c); arm.store(&mut c.code, values, 0)
@@ -5401,7 +5765,7 @@ fn swap_array(c: &mut Session, ty: i32, place: i32, receiver_at: i32, writable: 
     first_slot := slot(&mut c); arm.store(&mut c.code, first_slot, 0); expect(&mut c, ",")
     second_at := c.body.cursor; second := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, second)
     second_slot := slot(&mut c); arm.store(&mut c.code, second_slot, 0); expect(&mut c, ")")
-    if borrows.changed(&c.body.mutations, effects, c.body.mutations.len, root) {
+    if mutated_overlap(&c, effects, c.body.mutations.len, root, owner_path(&c, place)) {
         lower_place(&mut c, place, 0, .Value, receiver_at); arm.store(&mut c.code, values, 0)
     }
     left := swap_address(&mut c, ty, place, packed, values, first_slot, first_at)
@@ -5512,6 +5876,21 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         }
         return 4
     }
+    if ty == 4 && name == "as_bytes" {
+        covered = true; expect(&mut c, ")")
+        source_path := owner_path(&c, place); source_root_id := source_root(&c, place); source_origin := loan_origin(&c, place); source_parent := borrow_parent(&c, place)
+        source_home := slot(&mut c); arm.store(&mut c.code, source_home, 0)
+        for _ in 0..5 { _ := slot(&mut c) }
+        data_home := slot(&mut c)
+        borrowed_view.emit_string_bytes(&mut c.code, source_home, data_home)
+        holder := slot(&mut c); arm.store(&mut c.code, holder, 0)
+        arr_u8 := compound(&mut c, 1, 8)
+        place_step(&mut c, .BorrowHome, arr_u8, 3, 0, holder, c.body.cursor - 2)
+        c.body.loan.home = holder; c.body.loan.path = source_path
+        c.body.loan.root = source_root_id; c.body.loan.origin = source_origin; c.body.loan.parent = source_parent; c.body.loan.constrained = true
+        if !constrain_borrow(&mut c) { return 0 }
+        return compound(&mut c, 4, arr_u8)
+    }
     if name != "str" && (ty == 1 || ty == 2 || unsigned.has(ty)) { return integer_method(&mut c, ty, name, &catalog, &mut inline_work, &mut model, &mut covered) }
     if ty == 4 { copy_value(&mut c, ty); saved_text := temporary(&mut c, ty) }
     arm.push_temp(&mut c.code, 0)
@@ -5533,7 +5912,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         if receiver < 0 { fail(&mut c, "array mutation requires a stored place"); return 0 }
         if !writable_loan(&mut c, place) { return 0 }
         if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
-        c.body.mutations.push(receiver); effects = c.body.mutations.len
+        record_mutation(&mut c, receiver, owner_path(&c, place)); effects = c.body.mutations.len
         if !writable { fail_immutable_binding(&mut c, "array mutation requires mut or &mut", receiver) }
         if name == "push" { covered = true;
             if !writable { fail_immutable_binding(&mut c, "push requires mutable array", receiver) }
@@ -5551,6 +5930,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
             count = 1; operation = .ArrayRemove; target = c.runtime.array_remove; ret = ft.type_base(&c.types, ty)
         }
         else if name == "clear" { covered = true; expect(&mut c, ")"); arm.pop_temp(&mut c.code, 0); arm.intrinsic_call(&mut c.code, c.runtime.array_clear, .ArrayClear, ty, 0, source); return 0 }
+        else if name == "truncate" { covered = true; value := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, value); count = 1; operation = .ArrayTruncate; target = c.runtime.array_truncate; ret = 0 }
     } else if name == "str" { covered = true;
         if ty != 1 && ty != 2 && ty != 3 && ty != 5 && !unsigned.has(ty) { fail(&mut c, "str requires an integer, bool or rune") }
         ret = 4; target = c.runtime.string_integer
@@ -5569,7 +5949,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
     if count == 1 { arm.mov(&mut c.code, 1, 0) }; arm.pop_temp(&mut c.code, 0)
     if count == 1 && ri.mutates_receiver(operation) {
         root := borrows.root(&c.body.places, place)
-        if borrows.changed(&c.body.mutations, effects, c.body.mutations.len, root) {
+        if mutated_overlap(&c, effects, c.body.mutations.len, root, owner_path(&c, place)) {
             arm.push_temp(&mut c.code, 1); lower_place(&mut c, place, 0, .Value, receiver_at); arm.pop_temp(&mut c.code, 1)
         }
     }
@@ -5896,7 +6276,7 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
                 fail(&mut c, "cannot move a value while it is borrowed by another argument")
                 c.error_at = c.world.tokens.starts[lhs_at]; release_arg_slots(&mut c, &args); break
             }
-            if lhs_root >= 0 && borrows.changed(&c.body.mutations, lhs_effects, c.body.mutations.len, lhs_root) {
+            if lhs_root >= 0 && mutated_overlap(&c, lhs_effects, c.body.mutations.len, lhs_root, lhs_path) {
                 fail(&mut c, "cannot mutate a value while it is borrowed by another argument")
                 c.error_at = c.world.tokens.starts[lhs_at]; release_arg_slots(&mut c, &args); break
             }
@@ -6237,17 +6617,246 @@ fn conditional_inner(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.V
     bind_block(&mut c, done)
     left && right
 }
-struct PatternBindings { tokens: []i32, types: []i32, parents: []i32, offsets: []i32, locals: []i32, mutable: []bool }
-fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &mut PatternBindings, ty: i32, parent: i32, offset: i32, next: i32, depth: i32) -> i32 {
+struct PatternBindings {
+    tokens: []i32, types: []i32, parents: []i32, offsets: []i32,
+    locals: []i32, mutable: []bool, or_sources: []i32,
+}
+fn empty_pattern_bindings() -> PatternBindings {
+    PatternBindings { tokens: [], types: [], parents: [], offsets: [], locals: [], mutable: [], or_sources: [] }
+}
+fn matchable_subject(c: &Session, ty: i32) -> bool {
+    enum_type(&c, ty) || ty == 1 || ty == 2 || unsigned.has(ty) || ty == 3 || ty == 4 || ty == 5 || ft.is_tuple(&c.types, ty)
+}
+fn has_or_alternative(tokens: &lexer.Tokens, start: i32) -> bool {
+    mut at := start; mut depth := 0
+    while at < tokens.kinds.len {
+        kind := tokens.kinds[at]; word := &tokens.texts[at]
+        if kind == .End { return false }
+        if kind == .Symbol {
+            if word == "(" || word == "[" || word == "{" { depth += 1 }
+            else if word == ")" || word == "]" || word == "}" {
+                if depth == 0 { return false }
+                depth -= 1
+            } else if depth == 0 {
+                if word == "=>" || word == "," || word == ";" { return false }
+                if word == "|" { return true }
+            }
+        } else if depth == 0 && kind == .Keyword && word == "if" {
+            return false
+        }
+        at += 1
+    }
+    false
+}
+fn rest_trailing_count(c: &Session, start: i32) -> i32 {
+    mut at := start
+    while at < c.world.tokens.kinds.len && lexer.is_newline(c.world.tokens.kinds[at]) { at += 1 }
+    if at < c.world.tokens.kinds.len && c.world.tokens.texts[at] == "," { at += 1 }
+    mut depth := 0; mut count := 0; mut has_item := false
+    while at < c.world.tokens.kinds.len {
+        kind := c.world.tokens.kinds[at]; word := &c.world.tokens.texts[at]
+        if kind == .End { break }
+        if kind == .Symbol && (word == "(" || word == "[" || word == "{") {
+            has_item = true; depth += 1
+        } else if kind == .Symbol && (word == ")" || word == "]" || word == "}") {
+            if depth == 0 {
+                if has_item { count += 1 }
+                break
+            }
+            depth -= 1; has_item = true
+        } else if depth == 0 && kind == .Symbol && word == "," {
+            if has_item { count += 1; has_item = false }
+        } else if !lexer.is_newline(kind) {
+            has_item = true
+        }
+        at += 1
+    }
+    count
+}
+fn load_pattern_subject(c: &mut Session, ty: i32, parent: i32, member_index: i32, token: i32) {
+    arm.load(&mut c.code, parent)
+    if member_index >= 0 {
+        place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), member_index, token)
+    }
+}
+fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &mut PatternBindings,
+                 ty: i32, parent: i32, member_index: i32, next: i32, depth: i32) -> i32 {
     if depth > 128 { fail(&mut c, "match pattern nesting exceeds 128"); return -1 }
+    if !has_or_alternative(&c.world.tokens, c.body.cursor) {
+        return match_pattern_single(&mut c, &mut patterns, &mut bindings, ty, parent, member_index, next, depth)
+    }
+    joined := new_block(&mut c)
+    root := coverage.or_node(&mut patterns)
+    mut first_branch := true
+    mut alt_start := 0
+    while c.ok {
+        newlines(&mut c)
+        more := has_or_alternative(&c.world.tokens, c.body.cursor)
+        mut branch_next := next
+        if more { branch_next = new_block(&mut c) }
+        mut alt := empty_pattern_bindings()
+        _ := match_pattern_single(&mut c, &mut patterns, &mut alt, ty, parent, member_index, branch_next, depth + 1)
+        if !c.ok { return -1 }
+        if first_branch {
+            alt_start = bindings.tokens.len
+            mut seen_names: []string = []
+            for i in 0..alt.tokens.len {
+                bname := c.world.tokens.texts[alt.tokens[i]].clone()
+                for prev in &seen_names {
+                    if prev == bname { fail(&mut c, "duplicate binding '" + bname + "' in pattern"); return -1 }
+                }
+                seen_names.push(move bname)
+                shared := slot(&mut c); src_slot := slot(&mut c)
+                bindings.tokens.push(alt.tokens[i]); bindings.types.push(alt.types[i])
+                bindings.parents.push(shared); bindings.offsets.push(-1)
+                bindings.mutable.push(alt.mutable[i]); bindings.or_sources.push(src_slot)
+            }
+            first_branch = false
+        }
+        expected_count := bindings.tokens.len - alt_start
+        if alt.tokens.len != expected_count {
+            fail(&mut c, "or-pattern alternatives must bind the same names with the same types"); return -1
+        }
+        mut matched: []bool = []
+        for _ in 0..expected_count { matched.push(false) }
+        for i in 0..alt.tokens.len {
+            bname := c.world.tokens.texts[alt.tokens[i]].clone()
+            mut idx := -1
+            for k in 0..expected_count {
+                if c.world.tokens.texts[bindings.tokens[alt_start + k]] == bname { idx = k; break }
+            }
+            if idx < 0 || matched[idx] {
+                fail(&mut c, "or-pattern alternatives must bind the same names with the same types"); return -1
+            }
+            if bindings.types[alt_start + idx] != alt.types[i] || bindings.mutable[alt_start + idx] != alt.mutable[i] {
+                fail(&mut c, "or-pattern alternatives must bind the same names with the same types"); return -1
+            }
+            matched[idx] = true
+            arm.load(&mut c.code, alt.parents[i])
+            if alt.offsets[i] >= 0 {
+                if ft.move_only(&c.types, alt.types[i]) {
+                    arm.integer_binary(&mut c.code, 1, true, false, 0, 0, -1, i64(alt.offsets[i]))
+                    arm.store(&mut c.code, bindings.or_sources[alt_start + idx], 0)
+                    arm.load(&mut c.code, alt.parents[i])
+                } else {
+                    arm.store(&mut c.code, bindings.or_sources[alt_start + idx], 31)
+                }
+                place_step(&mut c, .Member, alt.types[i], 0, i32(place_op.Member.Payload), alt.offsets[i] / 8, alt.tokens[i])
+            } else {
+                arm.store(&mut c.code, bindings.or_sources[alt_start + idx], 31)
+            }
+            arm.store(&mut c.code, bindings.parents[alt_start + idx], 0)
+        }
+        newlines(&mut c)
+        source_edge(&mut c, joined, .Jump, c.body.cursor)
+        if !more { break }
+        expect(&mut c, "|")
+        bind_block(&mut c, branch_next)
+    }
+    bind_block(&mut c, joined)
+    coverage.close(&mut patterns, root)
+    root
+}
+fn match_pattern_single(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &mut PatternBindings,
+                        ty: i32, parent: i32, member_index: i32, next: i32, depth: i32) -> i32 {
+    if depth > 128 { fail(&mut c, "match pattern nesting exceeds 128"); return -1 }
+    newlines(&mut c)
     if eat(&mut c, "_") { return coverage.node(&mut patterns, -1) }
-    if depth > 0 && ((is(&c, "mut") && c.world.tokens.kinds[c.body.cursor + 1] == .Name &&
-            c.world.tokens.texts[c.body.cursor + 1] != "." && c.world.tokens.texts[c.body.cursor + 1] != "_" &&
+    pat_at := c.body.cursor; pat_kind := c.world.tokens.kinds[pat_at]
+    if eat(&mut c, "true") || eat(&mut c, "false") {
+        if ty != 3 { fail(&mut c, "bool pattern requires a bool"); return -1 }
+        val := c.world.tokens.texts[pat_at] == "true"
+        load_pattern_subject(&mut c, 3, parent, member_index, pat_at)
+        arm.imm(&mut c.code, 1, if val { 1 } else { 0 })
+        arm.compare_register(&mut c.code, 0, 1); source_edge(&mut c, next, .NextVariant, pat_at)
+        return coverage.bool_node(&mut patterns, val)
+    }
+    if pat_kind == .Integer || (is(&c, "-") && pat_at + 1 < c.world.tokens.kinds.len && c.world.tokens.kinds[pat_at + 1] == .Integer) {
+        if ty != 1 && ty != 2 && !unsigned.has(ty) { fail(&mut c, "integer pattern requires an integer type"); return -1 }
+        neg := eat(&mut c, "-")
+        if neg && unsigned.has(ty) { fail(&mut c, "negative integer pattern is invalid for unsigned type"); return -1 }
+        lit := advance(&mut c)
+        spelling := if neg { "-" + lit } else { lit }
+        val := integer_literal(&mut c, spelling, ty)
+        if !c.ok { return -1 }
+        load_pattern_subject(&mut c, ty, parent, member_index, pat_at)
+        if ty == 1 { arm.sign_extend_i32(&mut c.code, 0, 0) }
+        arm.imm(&mut c.code, 1, val)
+        arm.compare_register(&mut c.code, 0, 1); source_edge(&mut c, next, .NextVariant, pat_at)
+        return coverage.int_node(&mut patterns, val)
+    }
+    if pat_kind == .Rune {
+        if ty != 5 { fail(&mut c, "rune pattern requires a rune"); return -1 }
+        text := advance(&mut c)
+        scalar := text.runes()[0]
+        load_pattern_subject(&mut c, 5, parent, member_index, pat_at)
+        arm.imm(&mut c.code, 1, i64(i32(scalar)))
+        arm.compare_register(&mut c.code, 0, 1); source_edge(&mut c, next, .NextVariant, pat_at)
+        return coverage.int_node(&mut patterns, i64(i32(scalar)))
+    }
+    if pat_kind == .String {
+        if ty != 4 { fail(&mut c, "string pattern requires a string"); return -1 }
+        text := advance(&mut c)
+        load_pattern_subject(&mut c, 4, parent, member_index, pat_at)
+        arm.push_temp(&mut c.code, 0)
+        lit_label := arm.label(&mut c.code)
+        if !c.code.checking { c.body.facts.literal_tokens.push(pat_at); c.body.facts.literal_labels.push(lit_label) }
+        arm.branch(&mut c.code, lit_label, 20)
+        arm.mov(&mut c.code, 1, 0); arm.pop_temp(&mut c.code, 0)
+        arm.intrinsic_call(&mut c.code, c.runtime.string_compare, .Compare, 4, 1, c.world.tokens.starts[pat_at])
+        arm.imm(&mut c.code, 1, 0)
+        arm.compare_register(&mut c.code, 0, 1); source_edge(&mut c, next, .NextVariant, pat_at)
+        return coverage.string_node(&mut patterns, move text)
+    }
+    if eat(&mut c, "(") {
+        if !ft.is_tuple(&c.types, ty) { fail(&mut c, "tuple pattern requires a tuple"); return -1 }
+        root := coverage.tuple_node(&mut patterns)
+        count := ft.type_count(&c.types, ty)
+        first := ft.type_start(&c.types, ty)
+        mut payload := parent
+        if member_index >= 0 {
+            load_pattern_subject(&mut c, ty, parent, member_index, pat_at)
+            payload = slot(&mut c); arm.store(&mut c.code, payload, 0)
+        }
+        newlines(&mut c)
+        mut idx := 0; mut saw_rest := false
+        while c.ok && !is(&c, ")") {
+            if c.world.tokens.kinds[c.body.cursor] == .Symbol && c.world.tokens.texts[c.body.cursor] == ".." {
+                if saw_rest { fail(&mut c, "only one '..' wildcard is allowed per pattern"); return -1 }
+                saw_rest = true; skip_token(&mut c)
+                trailing := rest_trailing_count(&c, c.body.cursor)
+                skip := count - trailing - idx
+                if skip < 0 { fail(&mut c, "too many elements in tuple pattern"); return -1 }
+                for _ in 0..skip { _ := coverage.node(&mut patterns, -1) }
+                idx += skip
+            } else {
+                if idx >= count { fail(&mut c, "tuple pattern expects " + count.str() + " elements"); return -1 }
+                et := c.types.field_types[first + idx]
+                _ := match_pattern(&mut c, &mut patterns, &mut bindings, et, payload, idx, next, depth + 1)
+                if !c.ok { return -1 }
+                idx += 1
+            }
+            newlines(&mut c)
+            if !eat(&mut c, ",") { break }
+            newlines(&mut c)
+        }
+        if !c.ok { return -1 }
+        expect(&mut c, ")")
+        if !saw_rest && idx != count {
+            fail(&mut c, "tuple pattern expects " + count.str() + " elements"); return -1
+        }
+        coverage.close(&mut patterns, root)
+        return root
+    }
+    if ((is(&c, "mut") && c.world.tokens.kinds[c.body.cursor + 1] == .Name &&
+            c.world.tokens.texts[c.body.cursor + 1] != "_" &&
             c.world.tokens.texts[c.body.cursor + 2] != ".") ||
         (c.world.tokens.kinds[c.body.cursor] == .Name && c.world.tokens.texts[c.body.cursor + 1] != ".")) {
         is_mut := eat(&mut c, "mut")
         bindings.tokens.push(c.body.cursor); bindings.types.push(ty)
-        bindings.parents.push(parent); bindings.offsets.push(offset); bindings.mutable.push(is_mut)
+        bindings.parents.push(parent)
+        bindings.offsets.push(if member_index < 0 { -1 } else { member_index * 8 })
+        bindings.mutable.push(is_mut); bindings.or_sources.push(-1)
         skip_token(&mut c)
         return coverage.node(&mut patterns, -1)
     }
@@ -6271,8 +6880,8 @@ fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &m
     count := c.types.payload_counts[found]
     mut payload := parent
     arm.load(&mut c.code, parent)
-    if offset != 0 {
-        place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), offset / 8, pattern_at)
+    if member_index >= 0 {
+        place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), member_index, pattern_at)
         if count > 0 { payload = slot(&mut c); arm.store(&mut c.code, payload, 0) }
     }
     if ft.type_kind(&c.types, ty) == 7 { place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Tag), 0, pattern_at) }
@@ -6287,13 +6896,34 @@ fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &m
             }
             c.error_at = c.world.tokens.starts[pattern_at]; return -1
         }
-        for i in 0..count {
-            if !c.ok { return -1 }
-            if i > 0 { expect(&mut c, ",") }
-            pt := c.types.payload_types[c.types.payload_starts[found] + i]
-            child := match_pattern(&mut c, &mut patterns, &mut bindings, pt, payload, (i + 1) * 8, next, depth + 1)
+        newlines(&mut c)
+        mut idx := 0; mut saw_rest := false
+        while c.ok && !is(&c, ")") {
+            if c.world.tokens.kinds[c.body.cursor] == .Symbol && c.world.tokens.texts[c.body.cursor] == ".." {
+                if saw_rest { fail(&mut c, "only one '..' wildcard is allowed per pattern"); return -1 }
+                saw_rest = true; skip_token(&mut c)
+                trailing := rest_trailing_count(&c, c.body.cursor)
+                skip := count - trailing - idx
+                if skip < 0 { fail(&mut c, "too many payload bindings for variant '." + name + "'"); return -1 }
+                for _ in 0..skip { _ := coverage.node(&mut patterns, -1) }
+                idx += skip
+            } else {
+                if idx >= count { fail(&mut c, "too many payload bindings for variant '." + name + "'"); return -1 }
+                pt := c.types.payload_types[c.types.payload_starts[found] + idx]
+                _ := match_pattern(&mut c, &mut patterns, &mut bindings, pt, payload, idx + 1, next, depth + 1)
+                if !c.ok { return -1 }
+                idx += 1
+            }
+            newlines(&mut c)
+            if !eat(&mut c, ",") { break }
+            newlines(&mut c)
         }
+        if !c.ok { return -1 }
         expect(&mut c, ")")
+        if !saw_rest && idx != count {
+            fail(&mut c, "variant '." + name + "' requires " + count.str() + " payload bindings; write '." + name + "(...)'")
+            c.error_at = c.world.tokens.starts[pattern_at]; return -1
+        }
     } else if ft.is_result(&c.types, ty) && eat(&mut c, "(") {
         expect(&mut c, "_"); expect(&mut c, ")")
     }
@@ -6301,12 +6931,23 @@ fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &m
     root
 }
 fn transfer_pattern(c: &mut Session, bindings: &PatternBindings, i: i32) {
-    at := bindings.tokens[i]; ty := bindings.types[i]; id := bindings.locals[i]
-    arm.load(&mut c.code, places.local_home(c.body.places.arena.locals[id]))
-    arm.push_temp(&mut c.code, 0); arm.load(&mut c.code, bindings.parents[i])
-    store_mem(&mut c, 31, 0, bindings.offsets[i]); arm.pop_temp(&mut c.code, 0)
-    owner_store(&mut c, .Vacate, ty, places.local_home(c.body.places.arena.locals[id]))
-    save_owner(&mut c, places.local_home(c.body.places.arena.locals[id]), ty, false)
+    ty := bindings.types[i]; id := bindings.locals[i]
+    home := places.local_home(c.body.places.arena.locals[id])
+    if bindings.or_sources[i] >= 0 {
+        zero_done := arm.label(&mut c.code)
+        arm.load(&mut c.code, bindings.or_sources[i])
+        arm.branch(&mut c.code, zero_done, 18)
+        store_mem(&mut c, 31, 0, 0)
+        arm.mark(&mut c.code, zero_done)
+    } else if bindings.offsets[i] >= 0 {
+        arm.load(&mut c.code, home)
+        arm.push_temp(&mut c.code, 0); arm.load(&mut c.code, bindings.parents[i])
+        store_mem(&mut c, 31, 0, bindings.offsets[i]); arm.pop_temp(&mut c.code, 0)
+    } else {
+        owner_store(&mut c, .Vacate, ty, bindings.parents[i])
+    }
+    owner_store(&mut c, .Vacate, ty, home)
+    save_owner(&mut c, home, ty, false)
 }
 fn push_pattern_loan(c: &mut Session, local: i32, subject_place: i32, parent: i32, offset: i32, lock_index: i32) {
     c.body.pattern_loans.locals.push(local)
@@ -6320,10 +6961,13 @@ fn bind_pattern(c: &mut Session, model: &mut opt_ir.Function, bindings: &mut Pat
         at := bindings.tokens[i]; ty := bindings.types[i]; index := slot(&mut c)
         bind(&mut c, &mut model, c.world.tokens.texts[at].clone(), ty, bindings.mutable[i], index, at)
         id := c.body.locals.types.len - 1; bindings.locals.push(id)
-        arm.load(&mut c.code, bindings.parents[i]); place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), bindings.offsets[i] / 8, at)
+        arm.load(&mut c.code, bindings.parents[i])
+        if bindings.offsets[i] >= 0 {
+            place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), bindings.offsets[i] / 8, at)
+        }
         if (borrowed && owned(&c, ty)) || ft.move_only(&c.types, ty) {
             arm.store(&mut c.code, index, 0)
-            if !guarded && borrowed && subject_movable && ft.move_only(&c.types, ty) {
+            if !guarded && borrowed && subject_movable && ft.move_only(&c.types, ty) && bindings.offsets[i] >= 0 && bindings.or_sources[i] < 0 {
                 push_pattern_loan(&mut c, id, subject_place, bindings.parents[i], bindings.offsets[i], lock_index)
             } else if guarded || borrowed {
                 c.body.pattern_borrowed.push(id)
@@ -6355,12 +6999,64 @@ fn match_guard(c: &mut Session, first_owner: i32, first_borrow: i32, next: i32, 
     }
     source_edge(&mut c, next, .Jump, condition_at); bind_block(&mut c, accepted)
 }
+fn emit_loop_exit(c: &mut Session, name: string, exit_at: i32, model: &mut opt_ir.Function) -> bool {
+    if c.body.loop_heads.len == 0 { fail(&mut c, "break or continue requires a loop"); return false }
+    if c.body.in_defer && c.body.loop_heads.len <= c.body.defer_loop_floor { fail(&mut c, "break or continue cannot exit defer"); return false }
+    mut target := c.body.loop_ends[c.body.loop_ends.len - 1]
+    mut action := row.Edge.Break
+    if name == "continue" { action = .Continue; target = c.body.loop_heads[c.body.loop_heads.len - 1] }
+    if model.recording { mut kind := 16; if name == "continue" { kind = 17 }; _ := typed.node(&mut model, kind, 0, -1, -1, -1, 0, -1, exit_at) }
+    if name == "continue" { move_loop_backedge(&mut c) } else { move_loop_break(&mut c) }
+    loop := c.body.loop_heads.len - 1
+    unwind_exit(&mut c, c.body.loop_defers[loop], c.body.loop_operands[loop])
+    cleanup_pending(&mut c, c.body.loop_pending[loop])
+    if c.tasks.program { task_close_locals(&mut c, c.body.loop_task_locals[c.body.loop_task_locals.len - 1]) }
+    cleanup_from(&mut c, c.body.loop_owners[c.body.loop_owners.len - 1], false); source_edge(&mut c, target, action, exit_at)
+    ownership.terminate(&mut c.body.ownership)
+    true
+}
+fn diverging_match_arm(c: &mut Session, tail: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, handled: &mut bool) -> bool {
+    arm_at := c.body.cursor
+    if eat(&mut c, "return") {
+        handled = true
+        if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
+        if is(&c, "\n") || is(&c, ";") || is(&c, "}") || is(&c, ",") {
+            if c.body.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
+        } else {
+            ty := expression(&mut c, 0, c.body.ret_type, &catalog, &mut inline_work, &mut model)
+            same(&mut c, c.body.ret_type, ty)
+        }
+        take_return_value(&mut c, c.body.ret_type, arm_at)
+        return_from_body(&mut c, arm_at)
+        return true
+    }
+    if is(&c, "break") || is(&c, "continue") {
+        handled = true
+        name := advance(&mut c)
+        return emit_loop_exit(&mut c, name, arm_at, &mut model)
+    }
+    if is(&c, "unsafe") && c.body.cursor + 1 < c.world.tokens.kinds.len && c.world.tokens.texts[c.body.cursor + 1] == "{" &&
+        !lookahead.continues_expression(&c.world.tokens, c.world.closes[c.body.cursor + 1] + 1) {
+        handled = true
+        skip_token(&mut c)
+        task_effect_at(&mut c, 16, arm_at)
+        if !c.world.unsafe_capable {
+            has_other := c.body.current_owner >= 0 && c.body.current_owner < c.world.module_caps.len && c.world.module_caps[c.body.current_owner] != 0
+            fail(&mut c, modules.missing_unsafe_message(has_other)); return false
+        }
+        previous := c.body.unsafe_scope; c.body.unsafe_scope = true
+        res := block(&mut c, tail, &catalog, &mut inline_work, &mut model)
+        c.body.unsafe_scope = previous
+        return res
+    }
+    false
+}
 fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     consuming := eat(&mut c, "move")
     subject_at := c.body.cursor
     mut ty := expression(&mut c, 0, 0, &catalog, &mut inline_work, &mut model)
     if ft.type_kind(&c.types, ty) == 4 { ty = read_returned(&mut c, ty, subject_at) }
-    if !enum_type(&c, ty) { fail(&mut c, "match requires an enum"); return false }
+    if !matchable_subject(&c, ty) { fail(&mut c, "match requires an enum, integer, bool, rune, string, or tuple"); return false }
     subject_place := c.body.places.current
     borrowed_subject := !consuming && c.body.expr.owner < 0 && subject_place != 0
     mut match_lock_index := -1
@@ -6397,9 +7093,9 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         ownership.restore_checkpoint(&mut c.body.ownership, &continuing)
         if fallback { fail(&mut c, "wildcard must be the final match arm"); return false }
         next := new_block(&mut c); enter(&mut c)
-        wildcard := is(&c, "_")
-        mut bindings := PatternBindings { tokens: [], types: [], parents: [], offsets: [], locals: [], mutable: [] }
-        root := match_pattern(&mut c, &mut patterns, &mut bindings, ty, saved, 0, next, 0)
+        wildcard := is(&c, "_") && !has_or_alternative(&c.world.tokens, c.body.cursor)
+        mut bindings := empty_pattern_bindings()
+        root := match_pattern(&mut c, &mut patterns, &mut bindings, ty, saved, -1, next, 0)
         if !c.ok { return false }
         newlines(&mut c)
         guarded := eat(&mut c, "if")
@@ -6441,13 +7137,21 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
             }
         } else if is(&c, "{") { ends = block(&mut c, tail, &catalog, &mut inline_work, &mut model) }
         else {
-            arm_at := c.body.cursor; mut expected := 0; if tail { expected = c.body.ret_type }
-            value := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
-            if tail && expected != 0 {
-                if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
-                same(&mut c, expected, value); take_return_value(&mut c, value, arm_at)
-                return_from_body(&mut c, arm_at); ends = true
-            } else if value != 0 { fail(&mut c, "unused match arm value") }
+            mut handled := false
+            diverged := diverging_match_arm(&mut c, tail, &catalog, &mut inline_work, &mut model, &mut handled)
+            if handled {
+                ends = diverged
+            } else {
+                arm_at := c.body.cursor; mut expected := 0; if tail { expected = c.body.ret_type }
+                value := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
+                if c.body.expr.untyped_exit || !ownership.falls_through(&c.body.ownership) {
+                    ends = true
+                } else if tail && expected != 0 {
+                    if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
+                    same(&mut c, expected, value); take_return_value(&mut c, value, arm_at)
+                    return_from_body(&mut c, arm_at); ends = true
+                } else if value != 0 { fail(&mut c, "unused match arm value") }
+            }
         }
         returns = returns && ends
         leave(&mut c)
@@ -6528,7 +7232,14 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
     }
     if is(&c, "task") && c.world.tokens.texts[c.body.cursor + 1] == "scope" { return task_scope_statement(&mut c, &catalog, &mut inline_work, &mut model) }
     if is(&c,"region") && c.world.tokens.kinds[c.body.cursor+1]==.Name {skipped:=advance(&mut c); return scratch_block(&mut c, &catalog, &mut inline_work, &mut model)}
-    if eat(&mut c, "unsafe") {
+    if is(&c, "unsafe") {
+        if c.body.cursor + 1 < c.world.tokens.kinds.len && c.world.tokens.texts[c.body.cursor + 1] == "{" {
+            after := c.world.closes[c.body.cursor + 1] + 1
+            if lookahead.continues_expression(&c.world.tokens, after) {
+                return value_statement(&mut c, &catalog, &mut inline_work, &mut model)
+            }
+        }
+        skip_token(&mut c)
         task_effect_at(&mut c, 16, c.body.cursor - 1)
         if !c.world.unsafe_capable {
             has_other := c.body.current_owner >= 0 && c.body.current_owner < c.world.module_caps.len && c.world.module_caps[c.body.current_owner] != 0
@@ -6723,19 +7434,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
     }
     if is(&c, "break") || is(&c, "continue") {
         exit_at := c.body.cursor; name := advance(&mut c)
-        if c.body.loop_heads.len == 0 { fail(&mut c, "break or continue requires a loop"); return false }
-        if c.body.in_defer && c.body.loop_heads.len <= c.body.defer_loop_floor { fail(&mut c, "break or continue cannot exit defer"); return false }
-        mut target := c.body.loop_ends[c.body.loop_ends.len - 1]
-        mut action := row.Edge.Break
-        if name == "continue" { action = .Continue; target = c.body.loop_heads[c.body.loop_heads.len - 1] }
-        if model.recording { mut kind := 16; if name == "continue" { kind = 17 }; _ := typed.node(&mut model, kind, 0, -1, -1, -1, 0, -1, at) }
-        if name == "continue" { move_loop_backedge(&mut c) } else { move_loop_break(&mut c) }
-        loop := c.body.loop_heads.len - 1
-        unwind_exit(&mut c, c.body.loop_defers[loop], c.body.loop_operands[loop])
-        cleanup_pending(&mut c, c.body.loop_pending[loop])
-        if c.tasks.program { task_close_locals(&mut c, c.body.loop_task_locals[c.body.loop_task_locals.len - 1]) }
-        cleanup_from(&mut c, c.body.loop_owners[c.body.loop_owners.len - 1], false); source_edge(&mut c, target, action, exit_at)
-        ownership.terminate(&mut c.body.ownership)
+        if !emit_loop_exit(&mut c, name, exit_at, &mut model) { return false }
         end_statement(&mut c)
         return true
     }
@@ -6814,6 +7513,163 @@ fn bind_tuple(c: &mut Session, assignment: i32, mutable: bool, catalog: &opt_inl
     arm.load(&mut c.code, box); drop_value(&mut c, ty)
     end_statement(&mut c)
 }
+fn struct_binding_end(c: &Session, start: i32) -> i32 {
+    if start + 3 >= c.world.tokens.kinds.len { return -1 }
+    if c.world.tokens.kinds[start] != .Name || c.world.tokens.texts[start + 1] != "{" { return -1 }
+    ty := resolve_type_name(&c, c.world.tokens.texts[start].clone())
+    if ty < 0 || ft.type_kind(&c.types, ty) != 2 { return -1 }
+    close := c.world.closes[start + 1]
+    if close <= start + 1 || close + 1 >= c.world.tokens.kinds.len { return -1 }
+    if c.world.tokens.texts[close + 1] != ":=" { return -1 }
+    close + 1
+}
+fn bind_struct(c: &mut Session, struct_assign: i32, mutable: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) {
+    if model.probing && decline_projection(&mut c, &mut model) { return }
+    type_tok := c.body.cursor
+    target_ty := resolve_type_name(&c, c.world.tokens.texts[type_tok].clone())
+    if target_ty < 0 || ft.type_kind(&c.types, target_ty) != 2 {
+        fail(&mut c, "struct destructuring requires a struct type"); return
+    }
+    opaque_access(&mut c, target_ty)
+    if !c.ok { return }
+    has_dispose := ft.cleanup_method(&c.types, target_ty) >= 0
+    is_res := has_dispose || (target_ty >= 0 && target_ty < c.types.resource.len && c.types.resource[target_ty])
+    if is_res {
+        owner := if target_ty >= 0 && target_ty < c.types.type_owners.len { c.types.type_owners[target_ty] } else { -1 }
+        if owner >= 0 && owner != c.body.current_owner {
+            fail(&mut c, "cannot destructure @resource type outside its declaring module"); return
+        }
+    }
+    packed := ft.is_c_record(&c.types, target_ty)
+    count := ft.type_count(&c.types, target_ty)
+    first := ft.type_start(&c.types, target_ty)
+    mut seen: []bool = []; seen.reserve(count)
+    for _ in 0..count { seen.push(false) }
+    mut bind_indices: []i32 = []
+    mut bind_names: []string = []
+    mut bind_tokens: []i32 = []
+    mut bind_mutable: []bool = []
+    mut has_rest := false
+    c.body.cursor = type_tok + 2
+    separators(&mut c)
+    while c.ok && c.body.cursor < struct_assign - 1 {
+        if c.world.tokens.kinds[c.body.cursor] == .Symbol && c.world.tokens.texts[c.body.cursor] == ".." {
+            skip_token(&mut c)
+            has_rest = true
+            separators(&mut c)
+            _ := eat(&mut c, ",")
+            separators(&mut c)
+            if c.body.cursor < struct_assign - 1 {
+                fail(&mut c, "'..' must be the final entry in a struct destructuring pattern"); return
+            }
+            break
+        }
+        mut item_mut := mutable
+        mut field_mut := false
+        if eat(&mut c, "mut") {
+            if is(&c, ":") { fail(&mut c, "expected field name before ':'"); return }
+            item_mut = true; field_mut = true
+        }
+        if c.world.tokens.kinds[c.body.cursor] != .Name {
+            fail(&mut c, "expected field name in struct destructuring"); return
+        }
+        field_tok := c.body.cursor; field_name := advance(&mut c)
+        member := field(&c, target_ty, field_name)
+        if member < 0 {
+            fail(&mut c, "unknown field '" + field_name + "' in struct destructuring"); return
+        }
+        fidx := member - first
+        if seen[fidx] {
+            fail(&mut c, "duplicate field '" + field_name + "' in struct destructuring"); return
+        }
+        seen[fidx] = true
+        mut local_name := field_name.clone()
+        mut name_tok := field_tok
+        if eat(&mut c, ":") {
+            if field_mut { fail(&mut c, "place 'mut' after ':' when renaming a field"); return }
+            if eat(&mut c, "mut") { item_mut = true }
+            if c.world.tokens.kinds[c.body.cursor] != .Name {
+                fail(&mut c, "expected local name after ':' in struct destructuring"); return
+            }
+            name_tok = c.body.cursor; local_name = advance(&mut c)
+        }
+        bind_indices.push(fidx); bind_names.push(move local_name)
+        bind_tokens.push(name_tok); bind_mutable.push(item_mut)
+        separators(&mut c)
+        if !eat(&mut c, ",") { separators(&mut c); break }
+        separators(&mut c)
+    }
+    if !c.ok { return }
+    if c.body.cursor != struct_assign - 1 {
+        fail(&mut c, "expected ',' or '}' in struct destructuring"); return
+    }
+    if !has_rest {
+        for s in &seen {
+            if !s {
+                fail(&mut c, "struct pattern must name every field or end with '..'"); return
+            }
+        }
+    }
+    c.body.cursor = struct_assign + 1
+    consuming := is(&c, "move")
+    ty := expression(&mut c, 0, target_ty, &catalog, &mut inline_work, &mut model)
+    same(&mut c, target_ty, ty)
+    if !c.ok { return }
+    if ft.move_only(&c.types, ty) && !consuming && !is_fresh_owned(&c) {
+        fail(&mut c, with_clone_hint(&c, ty, "destructuring a move-only struct requires 'move value'", ", .clone(),") + " or a fresh owned expression"); return
+    }
+    take_value(&mut c, ty)
+    if !c.ok { return }
+    box := slot(&mut c); arm.store(&mut c.code, box, 0)
+    for i in 0..bind_indices.len {
+        if bind_names[i] == "_" { continue }
+        fidx := bind_indices[i]; field_type := c.types.field_types[first + fidx]
+        name_tok := bind_tokens[i]
+        index := slot(&mut c)
+        bind(&mut c, &mut model, bind_names[i].clone(), field_type, bind_mutable[i], index, name_tok)
+        if !c.ok { return }
+        arm.load(&mut c.code, box)
+        if packed {
+            place_step(&mut c, .Field, field_type, i32(borrows.Access.Value), 0, i32(c.types.field_values[first + fidx]), name_tok)
+            if ft.is_c_record(&c.types, field_type) || ft.type_kind(&c.types, field_type) == 6 {
+                inline_value(&mut c, field_type, .Value, name_tok); copy_value(&mut c, field_type)
+            } else {
+                place_transfer(&mut c, field_type, 0, 0, true, true, i32(borrows.Access.Value), name_tok)
+            }
+        } else {
+            place_step(&mut c, .Member, field_type, 0, i32(place_op.Member.Payload), fidx, name_tok)
+        }
+        if owned(&c, field_type) {
+            arm.push_temp(&mut c.code, 0); arm.load(&mut c.code, box)
+            store_mem(&mut c, 31, 0, fidx * 8); arm.pop_temp(&mut c.code, 0)
+            save_owner(&mut c, index, field_type, false)
+        } else {
+            arm.store(&mut c.code, index, 0)
+        }
+    }
+    if has_dispose {
+        mut discarded: []bool = []; discarded.reserve(count)
+        for _ in 0..count { discarded.push(true) }
+        for i in 0..bind_indices.len {
+            if bind_names[i] != "_" { discarded[bind_indices[i]] = false }
+        }
+        if !packed {
+            for fidx in 0..count {
+                if !discarded[fidx] { continue }
+                fty := c.types.field_types[first + fidx]
+                if owned(&c, fty) {
+                    arm.load(&mut c.code, box)
+                    place_step(&mut c, .Member, fty, 0, i32(place_op.Member.Payload), fidx, type_tok)
+                    drop_value(&mut c, fty)
+                }
+            }
+        }
+        arm.load(&mut c.code, box); ownership_call(&mut c, .Drop, target_ty, c.runtime.release)
+    } else {
+        arm.load(&mut c.code, box); drop_value(&mut c, target_ty)
+    }
+    end_statement(&mut c)
+}
 fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     at := c.body.cursor
     mut mutable := false
@@ -6821,6 +7677,11 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
     assignment := lexer.tuple_binding_end(&c.world.tokens, c.body.cursor, c.world.tokens.kinds.len)
     if assignment >= 0 {
         bind_tuple(&mut c, assignment, mutable, &catalog, &mut inline_work, &mut model)
+        return false
+    }
+    struct_assign := struct_binding_end(&c, c.body.cursor)
+    if struct_assign >= 0 {
+        bind_struct(&mut c, struct_assign, mutable, &catalog, &mut inline_work, &mut model)
         return false
     }
     if c.world.tokens.kinds[c.body.cursor] == .Name && (c.world.tokens.texts[c.body.cursor + 1] == ":=" || c.world.tokens.texts[c.body.cursor + 1] == ":") {
@@ -6840,18 +7701,18 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
             return false
         }
         kind := ft.type_kind(&c.types, ty)
-        path := c.body.loan.path; root := c.body.loan.root; origin := c.body.loan.origin
-        if kind == 5 { fail(&mut c, "local mutable borrows are not supported"); return false }
-        if kind == 4 {
+        path := c.body.loan.path; root := c.body.loan.root; origin := c.body.loan.origin; parent := c.body.loan.parent
+        if kind == 4 || kind == 5 {
             if !c.loans.active { fail(&mut c, "scoped borrow analysis was not prepared"); return false }
-            if mutable { fail(&mut c, "local read borrows are immutable"); return false }
+            if kind == 4 && mutable { fail(&mut c, "local read borrows are immutable"); return false }
+            if kind == 5 && mutable { fail(&mut c, "local borrows cannot be rebound; omit 'mut' on the binding"); return false }
             if path < 0 || root < 0 { fail(&mut c, "local borrow requires a named owner; temporary borrows are limited to calls"); return false }
             if origin == -2 { fail(&mut c, "local borrows of scratch storage are not supported"); return false }
         }
         take_value(&mut c, ty); index := slot(&mut c); bind(&mut c, &mut model, move name, ty, mutable, index, name_at)
-        if kind == 4 {
+        if kind == 4 || kind == 5 {
             mut source := origin; if source == -1 { source = -3 }
-            local_borrows.bind_shared_scoped(&mut c.body.local_loans, c.body.locals.names.len - 1, path, root, source, name_at, c.body.block_end, c.body.loop_heads.len)
+            local_borrows.bind_scoped(&mut c.body.local_loans, c.body.locals.names.len - 1, path, root, source, parent, name_at, c.body.block_end, c.body.loop_heads.len, kind == 5)
         }
         if model.recording { _ := typed.node(&mut model, 11, 0, model.value, -1, -1, 0, model.local_types.len - 1, at) }
         if owned(&c, ty) { save_owner(&mut c, index, ty, false) } else { arm.store(&mut c.code, index, 0) }
@@ -6918,11 +7779,12 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         base := borrows.root(&c.body.places, place)
         if base < 0 { fail(&mut c, "assignment requires a named variable, field or array element"); return false }
         if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot assign to a collection while iterating over it"); return false }
-        if place > 0 && borrows.changed(&c.body.mutations, effects, c.body.mutations.len, base) {
+        if place > 0 && mutated_overlap(&c, effects, c.body.mutations.len, base, owner_path(&c, place)) {
             if borrows.has_index(&c.body.places, place) { fail(&mut c, "compute mutations before assigning an array element"); return false }
             arm.push_temp(&mut c.code, 0); lower_place(&mut c, place, 0, .Address, at)
             direct = c.body.place.direct; arm.pop_temp(&mut c.code, 0)
         }
+        record_mutation(&mut c, base, owner_path(&c, place))
         fc.produce_owner(&mut c.body.expr, result_owner, result_type)
         if scratch_target==1 && !ft.is_c_record(&c.types, ty) {
             arm.mov(&mut c.code,1,0);place_address(&mut c, place, direct, assignment_at)
@@ -7039,7 +7901,7 @@ pub fn freeze_validation_world(c: &Session, declarations: &[]i32) -> frozen.Worl
     for at in c.world.param_tokens { offsets.push(c.world.tokens.starts[at]) }
     frozen.World { spellings: s, tokens: tokens, types: types, names: names, parameter_names: parameter_names,
         libraries: libraries, symbols: symbol_names, returns: c.world.returns.clone(), param_starts: c.world.param_starts.clone(),
-        param_counts: c.world.param_counts.clone(), param_types: c.world.param_types.clone(), param_tokens: c.world.param_tokens.clone(),
+        param_counts: c.world.param_counts.clone(), param_types: c.world.param_types.clone(), param_mutable: c.world.param_mutable.clone(), param_tokens: c.world.param_tokens.clone(),
         param_offsets: offsets, unsafe_functions: c.world.unsafe_functions.clone(), test_functions: c.world.test_functions.clone(),
         function_owners: c.world.function_owners.clone(), ffi_types: c.world.ffi_types.clone(),
         impl_types: c.world.impl_types.clone(), impl_public: c.world.impl_public.clone(), impl_has_self: c.world.impl_has_self.clone(),
@@ -7099,7 +7961,7 @@ pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
         c.world.starts.push(0); c.world.ends.push(0)
     }
     c.world.returns = src.returns.clone(); c.world.param_starts = src.param_starts.clone(); c.world.param_counts = src.param_counts.clone()
-    c.world.param_types = src.param_types.clone(); c.world.param_tokens = src.param_tokens.clone()
+    c.world.param_types = src.param_types.clone(); c.world.param_mutable = src.param_mutable.clone(); c.world.param_tokens = src.param_tokens.clone()
     c.world.function_owners = src.function_owners.clone(); c.world.ffi_types = src.ffi_types.clone()
     prepare_closures(&mut c)
     c.world.unsafe_functions = src.unsafe_functions.clone(); c.world.test_functions = src.test_functions.clone()
@@ -7218,6 +8080,12 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
     if c.jobs.phase != 0 { return false }
     source_end := c.world.tokens.starts[c.world.tokens.starts.len - 1]
     if c.world.tokens.ok && module_files.len == 0 { modules.bind_source_generics(&mut c.world.tokens) }
+    if c.world.tokens.ok {
+        mut dtokens := replace(&mut c.world.tokens, lexer.empty(false))
+        derive.expand(&mut dtokens, &c.sources)
+        c.world.tokens = move dtokens
+        if !c.world.tokens.ok { return session_fail_at(&mut c, c.world.tokens.error.clone(), c.world.tokens.error_at) }
+    }
     for name in rules.primitive_types() { _ := add_type(&mut c, name, 0, 0) }
     pre_register_int_consts(&mut c)
     if c.world.tokens.ok && generics.needed(&c.world.tokens) {
@@ -7386,6 +8254,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
         if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "region" && c.world.tokens.kinds[i + 1] == .Name { c.loans.active = true }
         if c.world.tokens.kinds[i] == .Symbol && c.world.tokens.texts[i] == "->" && c.world.tokens.texts[i + 1] == "&" { c.loans.active = true }
         if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "bytes_view" { c.loans.active = true }
+        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "as_bytes" { c.loans.active = true }
         if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "callback" { c.has_callbacks = true }
     }
     headers(&mut c, &module_starts, &module_files)
@@ -7420,8 +8289,14 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     for f in 0..c.world.names.len {
         label := arm.label(&mut c.code)
         receiver := c.world.impl_types[f]
-        name := if receiver >= 0 { ft.canonical_spelling(&c.types, receiver) } else { c.world.names[f].clone() }
-        mut site := i32(c.specializations.instance_ids.get_or(name, -1))
+        mut site := -1
+        if receiver >= 0 {
+            tname := ft.canonical_spelling(&c.types, receiver)
+            site = i32(c.specializations.instance_ids.get_or(tname + "::" + c.world.impl_names[f], -1))
+            if site < 0 { site = i32(c.specializations.instance_ids.get_or(tname, -1)) }
+        } else {
+            site = i32(c.specializations.instance_ids.get_or(c.world.names[f], -1))
+        }
         if site < 0 && (receiver == -2 || (c.world.starts[f] > 0 && generics.generated(&c.specializations, c.world.tokens.starts[c.world.starts[f]]))) {
             site = -2
         }
@@ -8685,7 +9560,7 @@ fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
     mut spilled := 0
     if visible > 8 { spilled = visible - 8 }
     for p in 0..c.world.param_counts[f] {
-        param_mutable := p == 0 && c.world.impl_self_mut[f]
+        param_mutable := c.world.param_mutable[first + p] || (p == 0 && c.world.impl_self_mut[f])
         index := slot(&mut c); bind(&mut c, &mut model, c.world.param_names[first + p].clone(), c.world.param_types[first + p], param_mutable, index, c.world.param_tokens[first + p])
         if owned(&c, c.world.param_types[first + p]) { remember_owner(&mut c, index, c.world.param_types[first + p], false) }
         if p == visible {
