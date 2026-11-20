@@ -105,86 +105,59 @@ ger lånebunden `&[]u8`-åtkomst över råa pekarbuffertar.
 [Generell allokering](standard.md#generell-allokering)
 
 
+### Diagnostik och kompilator (0.6.0)
+
+Kompilatorn ger nu direkta felmeddelanden och förbättringsförslag för vanliga
+mönster: nyttolastbärande enumvarianter utan parenteser (t.ex. `.Err` i
+`Result<T, E>`), fältåtkomst som avsåg metodanrop (t.ex. `parsed.is_ok()`),
+mutering av oföränderliga `:=`-bindningar (med notering om deklarationsrad),
+`&mut`-vidarebefordran och namngivna typer i typfel, exakta anropsplatser och
+anropskedjor vid effektfel i `spawn`-arbetare, vägledning för `&arr[a..b]` vid
+array-skivning, `mut` i `match`-mönsterbindningar (t.ex. `.Ok(mut x)`),
+ignorera-tips för `()`-uttryck vid `_ := expr` samt modulnivåkonstanter
+(`const`, inklusive konstanta arraytabeller). Generiska funktioner och
+associerade funktioner på generiska typer (`array.reverse(&mut v)`,
+`Box::new(42)`, `mut m: Map<string, i32> = Map::new()`) härleder typargument
+från anropsargument eller förväntad typ, och publika typer/konstanter kan
+direktimporteras med `import std.Map`, `import std.json.Doc` eller
+`import .mod.Type`. Tvärsatsig Hindley–Milner-härledning för oannoterade
+nollargumentsanrop som `mut m := Map::new()` hoppades över medvetet; där
+krävs i stället explicita typargument (`Map<K, V>::new()`).
+[Syntax](syntax.md) · [Task-modellen](tasks.md)
+
+### Ägande och lån (0.6.0)
+
+Läslån från `.len`, jämförelser eller lånade anrop avslutas automatiskt efter
+sista läsningen innan senare flytt i samma block, loopvariabler i
+`for x in move batch` känns igen som färska ägda värden vid `push`, och ägda
+nyttolaster kan flyttas ur `match` (både `@resource`-handtag och ägda värden)
+utan falska `.clone()`-förslag för resurser.
+[Minnesmodellen](memory.md) · [Enums](enums.md)
+
+### Standardbibliotek och formatering (0.6.0)
+
+`std.text` har kompletterats med `contains`, `replace`, `lower`, `upper`,
+`pad_left` och `pad_right`; f-strängar stöder bredd- och justeringsangivelser
+för strängar (`:<N` / `:>N`); `std.bytes`, `std.crypto`, `std.text` och `std.sys`
+har samordnats kring `[]u8` med konverteringshjälpare (`from_text`, `to_i32_vec`,
+`sha256_bytes`); heltal och `std.math` erbjuder `checked_add`, `checked_sub`
+och `checked_mul`; `std.json.Doc` dokumenterar `raw_span` och tillhandahåller
+`raw_json`; och `std.process.ChildSet` dokumenterar `wait_any`.
+[Standardbiblioteket](standard.md)
+
+### CLI och dokumentation (0.6.0)
+
+`dunder install` bygger och installerar binärer till `dunder`-katalogen (eller
+`--dir` / `--prefix`), `dunder.toml` stöder `subdir` för Git-beroenden i
+monorepon, `dunder run` bevarar anroparens arbetskatalog, `dunder build` och
+`dunder run` namnger binärer i `build/` efter paketnamnet i `dunder.toml` när
+paketets rotfil byggs, `dunder test` räknar enbart användarens egna `@test` och
+dokumentationen har uppdaterats med kapabilitetsöversikten för `sys`/`std.fs`,
+parenteser och `.Err(())` på `Result`, `Sendable`-argument i `spawn`, `_` i
+`match` samt skillnaden mellan `&arr[a..b]` och `text[a..b]`.
+[Beroenden och manifest](dependencies.md) · [Systembiblioteket](sys.md)
+
 ## Kommande förbättringar
 
-### Diagnostik och kompilator
-
-- **Enummönster med nyttolast:** När en variant som bär ett värde (t.ex. `.Err`
-  i `Result<T, string>`) matchas utan parenteser bör felet peka på själva
-  mönstret och föreslå `.Err(e)` i stället för `expected '('` inne i armens
-  kropp.
-- **Metodanrop utan parenteser:** När en okänd fältåtkomst matchar en befintlig
-  metod (t.ex. `parsed.is_ok`) bör felmeddelandet föreslå metodanropet
-  (`parsed.is_ok()`).
-- **Oföränderlig bindning vid tilldelning:** Fel som `assignment requires a
-  mutable stored value` bör inkludera en notering med radnummer för den
-  ursprungliga `:=`-deklarationen.
-- **Tydligare typfel och `&mut`-vidarebefordran:** Skriv ut vilken typ som är
-  förväntad respektive given i `type mismatch`-fel i stället för `A / B`. När
-  en `&mut`-parameter autoderefereras till sitt värde vid vidarebefordran bör
-  diagnostiken föreslå `&mut namn`.
-- **Effektanalys i task-arbetare:** När en arbetare avvisas för ambient I/O
-  eller systemanrop bör diagnostiken peka ut det faktiska anropet (och vid
-  behov anropskedjan) i stället för enbart arbetarfunktionen.
-- **Slicing av dynamiska arrayer:** Förbättra felmeddelandet för `arr[a..b]`
-  (som i dag ger `slice requires a string`) så att det hänvisar till lånat
-  intervall `&arr[a..b]`, kloning eller `array.append` — eller utred stöd för
-  ägd skivning.
-- **`mut` i `match`-mönster:** Stöd föränderliga mönsterbindningar som
-  `.Ok(mut x)` i `match`, eller ge ett tydligt felmeddelande som föreslår
-  `.Ok(x) => { mut s := x; ... }` i stället för `expected '('` eller
-  `match pattern requires an enum`.
-- **Ignorerad `()`-retur (`_ := ...`):** När `_ := expr` avvisas med
-  `local requires a value` för ett `()`-uttryck (t.ex. `sys.sleep_ms(...)`),
-  lägg till en hänvisning om att anropa uttrycket direkt utan `_ :=`.
-
-### Ägande och lån
-
-- **Mer precisa lån och färskhetsregler vid `push`:** Se över konservativa
-  lån där ett tidigare läslån (t.ex. `.len`, `==` eller ett funktionsanrop med
-  lånat argument) blockerar en senare flytt i samma block, samt att
-  loopbindningar i `for x in move batch` inte känns igen som färska ägda värden
-  vid `push`. Dokumentera de exakta reglerna tydligt i [memory.md](memory.md).
-- **Flytt av `@resource`-nyttolast ur `match`:** Gör det möjligt att flytta
-  nyttolaster (särskilt `@resource`-värden som `Child` i `Result<Child, E>`) ur
-  ägda `match`-värden på samma sätt som fältflyttar ur lokala structar, och
-  föreslå aldrig `.clone()` i felmeddelandet för icke-klonbara resurser.
-  Dokumentera gränsen mellan fältflytt och mönsterbindning i
-  [memory.md](memory.md) och [enums.md](enums.md).
-
-### Standardbibliotek och formatering
-
-- **Stränghjälpare i `std.text`:** Komplettera `std.text` med vanliga
-  CLI-funktioner som `contains`, `replace`, ASCII-`lower`/`upper` och
-  utfyllnad (`pad_left`/`pad_right`).
-- **Strängbredd i f-strängar:** Utöka formatangivelserna i stränginterpolering
-  med bredd- och justeringsstöd för strängar (motsvarande `:<N` / `:>N`),
-  utöver befintlig heltalsformatering.
-- **`std.json.Doc.raw_span`:** Dokumentera hur `raw_span` beter sig per nodtyp
-  (strängnoder saknar citattecken och har kvar escape-sekvenser) och överväg en
-  `raw_json(node)`-metod som returnerar giltig JSON-källtext för alla nodtyper.
-- **`std.process.ChildSet::wait_any`:** Förtydliga (eller se över namnet på)
-  `wait_any`, som returnerar antalet färdiga filbeskrivare från `poll` snarare
-  än en färdig slot.
-
-### CLI och dokumentation
-
-- **`dunder install`:** Lägg till ett `dunder install`-kommando för att bygga
-  och installera det aktuella Dunderpaketets binär till samma
-  installationskatalog som `dunder` (eller en konfigurerbar målkatalog i
-  `PATH`).
-- **Underkatalog för Git-beroenden (`subdir`):** Stöd ett valfritt
-  `subdir`-fält för Git-källor i `dunder.toml` så att paket i ett monorepo
-  (t.ex. `packages/http`) kan bero på direkt utan lokal kopiering.
-- **Arbetskatalog vid `dunder run`:** Säkerställ att den byggda binären körs i
-  anroparens aktuella arbetskatalog (eller dokumentera avvikelsen tydligt).
-- **Testutdata i `dunder test`:** Skilj lokala tester från standardbibliotekets
-  egna `@test`-funktioner i sammanräkningen (eller kör bara paketets tester
-  som standard).
-- **Dokumentationsförtydliganden:** Visa parenteser för metoder på
-  `Result<T, E>` (`.is_ok()`, `.is_err()`, `.unwrap_or(...)`) och förtydliga
-  `.Err` med `()`-nyttolast i [standard.md](standard.md); dokumentera att
-  `spawn` tar exakt ett säkert värdeargument (samt mönstret att samla argument
-  i en `Sendable`-struct) i [tasks.md](tasks.md); dokumentera jokertecken `_`
-  i `match`-mönster (t.ex. `.Err(_)`) i [syntax.md](syntax.md); och förtydliga
-  skillnaden mellan `&arr[a..b]` och `text[a..b]`.
+Allt ovan är genomfört och verifierat inför `0.6.0`. Nya punktlistor för nästa
+cykel läggs här vid behov.

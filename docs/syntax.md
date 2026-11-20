@@ -32,6 +32,23 @@ All deklaration kräver initiering. Det finns inga oinitierade lokaler i denna
 delmängd. Oföränderlighet kräver inte att uttrycket kan beräknas vid byggtid.
 `var` är ett vanligt namn och kan användas för lokaler, parametrar och importalias.
 
+### Konstanter på modulnivå
+
+Konstanter kan deklareras på modulnivå med `const` (och exporteras med
+`pub const`), antingen som skalärer eller konstanta fasta tabeller i
+programbilden:
+
+```dunder
+const LIMIT: i32 = 64
+pub const WEIGHTS: [i32; 4] = [10, 20, 30, 40]
+const ZEROS: [u8; LIMIT] = [0; LIMIT]
+```
+
+Heltalskonstanter kan även ge längden i fasta arraytyper som `[u8; LIMIT]`.
+Konstanta tabeller byggs vid kompilering och delas som skrivskyddade data utan
+att någon ny array allokeras vid varje anrop. `@resource`-typer och körtidsberoende
+uttryck tillåts inte i `const`.
+
 ## Typer och uttryck
 
 | Typ | Betydelse |
@@ -134,7 +151,13 @@ color := 0xaf
 hex := f"#{color:04X}"      // "#00AF"
 position := f"{-7:04d}"    // "-007"
 count := f"{3:02}"         // "03"
+left := f"{name:<6}"       // vänsterjusterad till bredd 6
+right := f"{name:>6}"      // högerjusterad till bredd 6
 ```
+
+För strängar stöder formatangivelsen bredd och justering med `:<N`
+(vänsterjustering) och `:>N` (högerjustering), som fyller ut med blanksteg upp
+till minst `N` byte om strängen är kortare.
 
 `{{` och `}}` ger bokstavliga klamrar. I exemplet blir `escaped` strängen `"{3}"`.
 Övriga escapes fungerar som i vanliga strängar, inklusive Unicode och NUL. Textsegment får inte innehålla råa
@@ -147,7 +170,16 @@ tolkning, även när den innehåller klamrar.
 ## Generiska deklarationer
 
 Funktioner på modulnivå, structar och enums kan deklarera en eller flera
-typparametrar. Skriv typargumenten mellan `<` och `>` vid användning.
+typparametrar. Vid anrop till generiska funktioner kan typargumenten
+antingen skrivas uttryckligen mellan `<` och `>` eller härledas automatiskt
+från argumenten (eller en förväntad returtyp) när alla typparametrar framgår,
+till exempel `array.reverse(&mut v)`, `array.contains(&v, 42)` eller
+`identity("Dunder")`. Detsamma gäller associerade funktioner på generiska
+typer, såsom `Box::new(42)` eller med typannotering på variabel eller returtyp
+(`mut m: Map<string, i32> = Map::new()` och `fn mk() -> Map<string, i32> { Map::new() }`).
+Explicita `<Typargument>` krävs när typerna inte framgår lokalt — exempelvis
+vid en oannoterad `mut m := Map::new()` (`Map<string, i32>::new()`) — eller
+när funktionen används som ett funktionsvärde utan anrop.
 Ett `impl` för en generisk typ binder typens parametrar i samma ordning.
 
 ```dunder
@@ -161,7 +193,7 @@ impl Box<T> {
 fn identity<T>(move value: T) -> T { value }
 
 fn main() {
-    box := Box<string>::new(identity<string>("Dunder"))
+    box := Box::new(identity("Dunder"))
     maybe := Maybe<Box<string>>.Some(move box)
     match maybe {
         .Some(b) => { print(b.value) },
@@ -288,7 +320,8 @@ anropet; skalärer kan överföras som billiga värden. Explicit `&T` fungerar
 också för läslån. `&mut T` kräver ett uttryckligt skrivlån vid anropet.
 Lokala läsreferenser kan namnges med `r := &value` eller `r: &T = &value`.
 Fält och arrayelement går också att låna. Referensen är oföränderlig och
-gäller till deklarationsblockets slut, även efter sista användningen.
+frisätts efter dess sista lexikala läsning i samma block och loopdjup (eller
+gäller till blockets slut vid `defer` eller ändring i en inre loop).
 Oberoende syskonfält får ändras; ett elementlån låser hela arrayen.
 Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
 
@@ -401,7 +434,9 @@ städas. Grenen får använda lokala lån. Kompilatorn avvisar ett lån som
 grenens slutvärde.
 
 För en enum kan ett `match`-uttryck välja värde efter variant och binda
-variantens payload i den valda armen. [Match som uttryck](enums.md#match-som-uttryck)
+variantens payload (`v` eller `mut v` när värdet får ägas/muteras) eller
+kasta bort oanvända värden med jokertecknet `_` (exempelvis `.Err(_)`).
+[Enums och match](enums.md#kontrollflöde-med-match) · [Match som uttryck](enums.md#match-som-uttryck)
 
 ### Funktionsvärden och callbacks
 
@@ -528,11 +563,21 @@ import math
 import geometry.vector as vector
 import ..shared.config
 import std.map
+import std.Map
+import std.json.Doc
 ```
 
 `import sys` väljer det inbäddade systembiblioteket för macOS/Linux; se [sys](sys.md).
 Det kan aliaseras och dedupliceras precis som andra moduler. En egen lokal
 fil med samma namn importeras uttryckligt som `import .sys as local`.
+
+Det sista segmentet kan också peka på en exporterad typ eller konstant med stor
+begynnelsebokstav i modulen i stället för att binda hela modulen som ett alias:
+`import std.Map` (eller `import std.Map as HashMap`), `import std.json.Doc`,
+`import std.alloc.Pool` och `import .geometry.Point`. En sådan direktimport
+ger samma användning utan modulprefix, inklusive metodanrop som `Map::new()`,
+och följer modulens vanliga `pub`-synlighet och kapabilitetskontroll.
+Sökvägar med liten begynnelsebokstav fortsätter att importera modulen.
 
 Den första importen läser `math.ddr` bredvid den importerande filen. Den andra
 läser `geometry/vector.ddr` relativt samma fil. Sökningen beror inte på
@@ -540,7 +585,8 @@ processens arbetskatalog. Punktnotation översätts till kataloger när filen l�
 
 | Import | Var modulen finns |
 | --- | --- |
-| `std.map` | Det inbäddade standardbiblioteket. |
+| `std.map` | Det inbäddade standardbiblioteket (`import std.Map` direktimporterar `Map`). |
+| `std.json.Doc` | Direktimporterar den publika typen `Doc` från `std.json`. |
 | `geometry.vector` | `geometry/vector.ddr` relativt den importerande filen. |
 | `.sys` | `sys.ddr` i samma katalog, även när namnet finns i standardbiblioteket. |
 | `..shared.config` | `shared/config.ddr` en katalog upp. |
@@ -770,12 +816,21 @@ muterbar dynamisk array. Efterföljande element förskjuts åt vänster med
 bibehållen ordning.
 
 `middle := &values[start..end]` skapar en lånad `&[]T` utan heapallokering
-eller retain. En explicit annotering, `middle: &[]i32 = &values[1..3]`, går
+eller retain (observera skillnaden mot `text[start..end]` på en sträng, som
+skapar en ny ägd `string`, medan `&text[start..end]` ger en lånad `&[]u8`).
+En explicit annotering, `middle: &[]i32 = &values[1..3]`, går
 också bra. Vyn använder originalets adress, och dess `len` och `cap()` är
 intervallängden. Fasta arrayer och redan lånade vyer kan skäras på samma sätt.
 Gränserna utvärderas en gång från vänster till höger; ett intervall utanför
 `0 <= start <= end <= values.len` ger status 103. Vyn är oföränderlig och
-lånar hela arrayen till blockslut. `.clone()` ger en egen ägd array.
+lånar hela arrayen fram till sin sista läsning; `values[start..end]` utan `&`
+avvisas för arrayer — använd `(&values[start..end]).clone()` när en egen
+ägd array behövs.
+
+För iteration är `for` lånande som standard men låser bara fältets egen
+ägarskapssökväg (så `for x in record.left` tillåter ändring av `record.right`),
+och `for x in move values` märker varje elementbindning som ett färskt ägt
+värde vid t.ex. `out.push(x)`.
 
 `start..end` har typen `range`, inkluderar start och utesluter slut.
 Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
@@ -903,7 +958,7 @@ inte. Fel i uttrycken pekar på deras ursprungliga källpositioner.
 | --- | --- |
 | `text.len`, `text.len()`, `len(text)` | Antal byte, `i32`, konstant tid. |
 | `text[i]`, `text.bytes()[i]` | Ett byte som `i32` i intervallet 0–255. |
-| `text[start..end]` | Ny sträng från halvöppna bytegränser. Båda måste vara UTF-8-gränser. |
+| `text[start..end]` | Ny ägd `string` från halvöppna bytegränser (till skillnad från arrayer som kräver `&arr[start..end]` för en lånad `&[]T` eller `(&arr[start..end]).clone()` för en kopia). Båda gränserna måste vara UTF-8-gränser. |
 | `&text[start..end]` | Lånad bytevy av typen `&[]u8`, utan ny sträng eller retain. |
 | `text.runes()[i]` | En rune efter avkodning från början; linjär tid. |
 | `text.runes().len` | Antal kodpunkter; linjär tid. `.len()` och `len(...)` fungerar också. |

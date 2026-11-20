@@ -282,6 +282,13 @@ def malformed_contracts(probe, path, kit):
         '{ git = 42 }', '{ git = ' + quote(kit.url),
         '{ git = ' + quote(kit.url) + ', git = ' + quote(kit.url) + ' }',
         table(path=''), table(path=local, branch='main'),
+        table(path=local, subdir='packages/http'),
+        table(git=kit.url, subdir=''),
+        table(git=kit.url, subdir='/abs'),
+        table(git=kit.url, subdir='../escape'),
+        table(git=kit.url, subdir='packages/../escape'),
+        table(git=kit.url, subdir='.'),
+        table(git=kit.url, subdir='a//b'),
     )
     try:
         main.write_text('fn main() { print(42) }\n')
@@ -559,6 +566,48 @@ def hidden_revision_contract(probe):
     checkouts(probe, path, {commit})
 
 
+def subdir_contracts(probe):
+    outside = probe.work / 'monorepo outside'
+    write(outside / 'dunder.toml', 'root = "api.ddr"\n')
+    write(outside / 'api.ddr', 'pub fn value() -> i32 { 99 }\n')
+
+    mono_files = {
+        'README.md': 'monorepo root\n',
+        'packages/common/dunder.toml': 'name = "common"\nroot = "src/lib.ddr"\n',
+        'packages/common/src/lib.ddr': 'pub fn base() -> i32 { 10 }\n',
+        'packages/server/dunder.toml': 'name = "server"\nroot = "src/server.ddr"\n[dependencies]\ncommon = "../common"\n',
+        'packages/server/src/server.ddr': 'import common\npub fn port_offset() -> i32 { common.base() + 20 }\n',
+        'packages/client/dunder.toml': 'name = "client"\nroot = "src/client.ddr"\n[dependencies]\ncommon = "../common"\n',
+        'packages/client/src/client.ddr': 'import common\npub fn client_offset() -> i32 { common.base() + 2 }\n',
+        'packages/bad_rel/dunder.toml': 'root = "api.ddr"\n[dependencies]\nout = ' + table(path='vendor/linked') + '\n',
+        'packages/bad_rel/api.ddr': 'pub fn x() -> i32 { 1 }\n',
+    }
+    mono = Repository(probe, 'monorepo', mono_files, [('packages/escaped_sub', outside), ('packages/bad_rel/vendor/linked', outside)])
+    commit = mono.head()
+
+    app = probe.work / 'projects/monorepo consumer'
+    write(app / 'dunder.toml',
+          'name = "mono-app"\nroot = "src/main.ddr"\ntest_root = "tests/suite.ddr"\n'
+          '[dependencies]\n'
+          'server = ' + table(git=mono.url, branch='main', subdir='packages/server/') + '\n'
+          'client = ' + table(git=mono.url, branch='main', subdir='packages/client') + '\n')
+    write(app / 'src/main.ddr', 'import server\nimport client\nfn main() { print(server.port_offset() + client.client_offset()) }\n')
+    write(app / 'tests/suite.ddr', 'import server\nimport client\n@test fn ok() { assert(server.port_offset() + client.client_offset() == 42) }\n')
+
+    res = probe.cli(app, 'run', '-o', app / 'mono-image')
+    assert (res.stdout, res.stderr) == ('42\n', ''), res
+    pins(app, {(mono.url, 'branch', 'main'): commit})
+    checkouts(probe, app, {commit})
+    offline = probe.cli(app, 'run', '--offline', '--locked', '-o', app / 'mono-offline')
+    assert (offline.stdout, offline.stderr) == ('42\n', ''), offline
+    tested = probe.cli(app, 'test')
+    assert '1 passed, 0 failed' in tested.stdout, tested.stdout
+
+    graph_rejection(probe, app, 'kit = ' + table(git=mono.url, branch='main', subdir='packages/missing'), ('directory not found',))
+    graph_rejection(probe, app, 'kit = ' + table(git=mono.url, branch='main', subdir='packages/escaped_sub'), ('escapes',))
+    graph_rejection(probe, app, 'kit = ' + table(git=mono.url, branch='main', subdir='packages/bad_rel'), ('escapes',))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('compiler', type=Path)
@@ -667,6 +716,7 @@ def main():
         prune_contract(probe, selectors[0][0])
         hidden_revision_contract(probe)
         sha256_contract(probe)
+        subdir_contracts(probe)
         assert not marker.exists(), 'a dependency build script ran'
         assert probe.git_config.read_bytes() == probe.git_config_bytes
         assert (kit.author / '.git/config').read_bytes() == kit.config

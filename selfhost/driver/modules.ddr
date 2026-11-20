@@ -25,7 +25,8 @@ pub opaque struct Loader {
     result: Loaded, key_prefixes: []string, standard: []string, directories: []string, first: []i32, last: []i32,
     raw: lexer.Tokens, last_arm: []i32, namespace_initials: []i64,
     hidden_starts: []i32, hidden_ends: []i32, declaration_tokens: []i32, any_unsafe: bool, requires_caps: []i32,
-    symbols: Map<string, i64>, imports: Map<string, i64>, by_path: Map<string, i64>, by_physical: Map<string, i64>, by_std: Map<string, i64>, owners: []i32,
+    symbols: Map<string, i64>, imports: Map<string, i64>, sym_imports: Map<string, i64>, by_path: Map<string, i64>, by_physical: Map<string, i64>, by_std: Map<string, i64>, owners: []i32,
+    sym_import_owner: []i32, sym_import_alias: []string, sym_import_module: []i32, sym_import_member: []string, sym_import_offset: []i32, sym_import_symbol: []i32, sym_import_prelude: []string,
     public: []bool, records: []bool, types: []bool, traits: []bool, renamed: []string,
     testing: bool, test_tags: []i32, test_targets: []i32, test_ends: []i32, next_test: i32,
     dep_names: []string, dep_dirs: []string, dep_entries: []string,
@@ -180,7 +181,7 @@ fn valid_alias(alias: string) -> bool {
     if n == 4 { return alias != "else" && alias != "enum" && alias != "true" && alias != "move" && alias != "impl" && alias != "self" && alias != "Self" && alias != "bool" && alias != "rune" && alias != "Copy" }
     if n == 5 {
         return alias != "while" && alias != "break" && alias != "match" && alias != "false" &&
-            alias != "print" && alias != "range" && alias != "usize" && alias != "trait" && alias != "Clone"
+            alias != "const" && alias != "print" && alias != "range" && alias != "usize" && alias != "trait" && alias != "Clone"
     }
     if n == 6 {
         return alias != "return" && alias != "struct" && alias != "import" && alias != "assert" &&
@@ -246,6 +247,55 @@ fn resolve_local_or_dep(loader: &Loader, owner: i32, path: string, quoted: bool,
     if resolved != "" { return resolved }
     local_target
 }
+fn register_sym_import(loader: &mut Loader, owner: i32, alias: string, mod_id: i32, member: string, offset: i32) {
+    entry := key(&loader, owner, alias)
+    idx := loader.sym_import_owner.len
+    loader.sym_imports.put(move entry, i64(idx))
+    loader.sym_import_owner.push(owner); loader.sym_import_alias.push(alias.clone())
+    loader.sym_import_module.push(mod_id); loader.sym_import_member.push(member.clone())
+    loader.sym_import_offset.push(offset); loader.sym_import_symbol.push(-1); loader.sym_import_prelude.push("")
+    loader.namespace_initials[owner] = loader.namespace_initials[owner].bit_or(initial_bit(alias))
+}
+fn resolve_symbol_imports(loader: &mut Loader) {
+    for si in 0..loader.sym_import_owner.len {
+        owner := loader.sym_import_owner[si]
+        alias := loader.sym_import_alias[si].clone()
+        mod_id := loader.sym_import_module[si]
+        member := loader.sym_import_member[si].clone()
+        off := loader.sym_import_offset[si]
+        entry := key(&loader, owner, alias)
+        if loader.symbols.contains(entry) || loader.imports.contains(entry) {
+            fail(&mut loader, owner, off, "duplicate import alias '" + alias + "'"); return
+        }
+        if mod_id == -2 {
+            loader.sym_import_prelude[si] = bundled.prelude_export("", member)
+            continue
+        }
+        found := i32(loader.symbols.get_or(key(&loader, mod_id, member), -1))
+        if loader.standard[mod_id] != "" {
+            pre := bundled.prelude_export(loader.standard[mod_id], member)
+            if pre != "" && (found < 0 || bundled.prelude_generic(member)) {
+                loader.sym_import_prelude[si] = pre
+                continue
+            }
+        }
+        if found < 0 {
+            fail(&mut loader, owner, off, "module has no declaration '" + member + "'"); return
+        }
+        if !loader.public[found] {
+            fail(&mut loader, owner, off, "'" + member + "' is private; export it with pub"); return
+        }
+        loader.sym_import_symbol[si] = found
+    }
+}
+fn trim_last_component(raw: string) -> string {
+    mut split := -1
+    for j in 0..raw.len {
+        if raw[j] == 46 || raw[j] == 47 { split = j }
+    }
+    if split <= 0 { return "" }
+    raw[0..split]
+}
 fn import_module(loader: &mut Loader, owner: i32, at: i32) -> i32 {
     mut i := at + 1
     mut path := ""
@@ -282,18 +332,59 @@ fn import_module(loader: &mut Loader, owner: i32, at: i32) -> i32 {
     if path == "" || path[0] == 47 || !valid_alias(alias) {
         fail(&mut loader, owner, loader.raw.starts[at], "import a relative module name with a non-reserved alias"); return i
     }
+    entry := key(&loader, owner, alias)
+    if loader.imports.contains(entry) || loader.sym_imports.contains(entry) || loader.symbols.contains(entry) {
+        fail(&mut loader, owner, loader.raw.starts[at], "duplicate import alias '" + alias + "'"); return i
+    }
     mut standard := ""
     mut target := ""
     mut library := ""
     if path == "sys" { library = "sys" }
     if strings.starts_with(path, "std/") { library = path[4..path.len] }
-    if library != "" && bundled.contains(library) { target = "<stdlib/" + library + ".ddr>"; standard = library }
-    else {
-        if loader.standard[owner] != "" { fail(&mut loader, owner, loader.raw.starts[at], "bundled libraries may only import bundled modules"); return i }
-        target = resolve_local_or_dep(&loader, owner, path, quoted, bare_raw)
+    if library != "" && bundled.contains(library.clone()) {
+        target = "<stdlib/" + library + ".ddr>"; standard = library
+    } else if !quoted && component > 0 && path[0..component - 1] == "std" && bundled.prelude_export("", path[component..path.len]) != "" {
+        register_sym_import(&mut loader, owner, alias, -2, path[component..path.len], loader.raw.starts[at])
+        hide(&mut loader, at, i)
+        return i
+    } else {
+        mut local_candidate := ""
+        if loader.standard[owner] == "" {
+            local_candidate = resolve_local_or_dep(&loader, owner, path.clone(), quoted, bare_raw.clone())
+            if local_candidate != "" && sys.metadata(local_candidate).is_file {
+                target = local_candidate.clone()
+            }
+        }
+        if target == "" && !quoted && component > 0 {
+            member := path[component..path.len]
+            if member.len > 0 && member[0] >= 65 && member[0] <= 90 {
+                parent_path := path[0..component - 1]
+                mut parent_std := ""
+                if parent_path == "sys" { parent_std = "sys" }
+                else if strings.starts_with(parent_path, "std/") { parent_std = parent_path[4..parent_path.len] }
+                if parent_std != "" && bundled.contains(parent_std.clone()) {
+                    mod_id := add(&mut loader, "<stdlib/" + parent_std + ".ddr>", parent_std, owner, loader.raw.starts[at])
+                    if mod_id >= 0 { register_sym_import(&mut loader, owner, alias, mod_id, member, loader.raw.starts[at]) }
+                    hide(&mut loader, at, i)
+                    return i
+                }
+                if loader.standard[owner] == "" {
+                    parent_bare := trim_last_component(bare_raw)
+                    parent_target := resolve_local_or_dep(&loader, owner, parent_path, false, parent_bare)
+                    if sys.metadata(parent_target).is_file {
+                        mod_id := add(&mut loader, parent_target, "", owner, loader.raw.starts[at])
+                        if mod_id >= 0 { register_sym_import(&mut loader, owner, alias, mod_id, member, loader.raw.starts[at]) }
+                        hide(&mut loader, at, i)
+                        return i
+                    }
+                }
+            }
+        }
+        if target == "" {
+            if loader.standard[owner] != "" { fail(&mut loader, owner, loader.raw.starts[at], "bundled libraries may only import bundled modules"); return i }
+            target = move local_candidate
+        }
     }
-    entry := key(&loader, owner, alias)
-    if loader.imports.contains(entry) || loader.symbols.contains(entry) { fail(&mut loader, owner, loader.raw.starts[at], "duplicate import alias '" + alias + "'"); return i }
     id := add(&mut loader, target, standard, owner, loader.raw.starts[at])
     if id >= 0 {
         loader.imports.put(move entry, i64(id))
@@ -452,7 +543,7 @@ fn scan_declarations(loader: &mut Loader, owner: i32, first: i32) {
             }
             name := function + 1
             if name >= last || loader.raw.kinds[name] != .Name { fail(&mut loader, owner, loader.raw.starts[tag], "expected test function name"); return }
-            if loader.testing {
+            if loader.testing && loader.standard[owner] == "" {
                 loader.test_tags.push(tag); loader.test_targets.push(name)
                 if attached { loader.test_ends.push(after) } else { loader.test_ends.push(-1) }
                 loader.result.groups.push(loader.result.paths[owner] + "::" + loader.raw.texts[name])
@@ -519,7 +610,7 @@ fn scan_declarations(loader: &mut Loader, owner: i32, first: i32) {
             impl_targets.push(name_at)
             in_impl = true; depth = depth + 1; i = brace_at + 1; continue
         }
-        if depth == 0 && parens == 0 && !is(&loader, i - 1, "extern") && ((is(&loader, i, "fn") && !is(&loader, i + 1, "(")) || is(&loader, i, "struct") || is(&loader, i, "enum") || is(&loader, i, "trait")) {
+        if depth == 0 && parens == 0 && !is(&loader, i - 1, "extern") && ((is(&loader, i, "fn") && !is(&loader, i + 1, "(")) || is(&loader, i, "struct") || is(&loader, i, "enum") || is(&loader, i, "trait") || is(&loader, i, "const")) {
             name_at := i + 1
             if name_at >= last || loader.raw.kinds[name_at] != .Name { fail(&mut loader, owner, loader.raw.starts[i], "expected declaration name"); return }
             name := loader.raw.texts[name_at].clone()
@@ -599,6 +690,12 @@ fn generic_name(loader: &Loader, owner: i32, at: i32, names: &[]string, active: 
         if loader.standard[module] != "" && bundled.prelude_generic(name) && bundled.prelude_export(loader.standard[module], name) != "" { return true }
     } else {
         if local(&names, &active, at, name) { return false }
+        si := i32(loader.sym_imports.get_or(key(&loader, owner, name), -1))
+        if si >= 0 {
+            if loader.sym_import_prelude[si] != "" { return bundled.prelude_generic(loader.sym_import_member[si]) }
+            sym_id := loader.sym_import_symbol[si]
+            return sym_id >= 0 && is(&loader, loader.declaration_tokens[sym_id] + 1, "<")
+        }
         if bundled.prelude_generic(name) && bundled.prelude_export("", name) != "" { return true }
     }
     id := i32(loader.symbols.get_or(key(&loader, module, name), -1))
@@ -625,7 +722,15 @@ fn constructor_brace(loader: &Loader, owner: i32, at: i32, names: &[]string, act
         if local(&names, &active, alias, loader.raw.texts[alias]) { return false }
         source = i32(loader.imports.get_or(key(&loader, owner, loader.raw.texts[alias]), -1))
         if source < 0 { return false }
-    } else if local(&names, &active, name_at, loader.raw.texts[name_at]) { return false }
+    } else if local(&names, &active, name_at, loader.raw.texts[name_at]) {
+        return false
+    } else {
+        si := i32(loader.sym_imports.get_or(key(&loader, owner, loader.raw.texts[name_at]), -1))
+        if si >= 0 {
+            sym_id := loader.sym_import_symbol[si]
+            return sym_id >= 0 && loader.records[sym_id]
+        }
+    }
     id := i32(loader.symbols.get_or(key(&loader, source, loader.raw.texts[name_at]), -1))
     id >= 0 && loader.records[id]
 }
@@ -693,7 +798,7 @@ fn pattern_start(loader: &Loader, first: i32, end: i32) -> i32 {
         while pos >= first && depth > 0 {
             if is(&loader, pos, ")") { depth = depth + 1 }
             else if is(&loader, pos, "(") { depth = depth - 1 }
-            else if loader.raw.kinds[pos] != .Name && !is(&loader, pos, ",") && !is(&loader, pos, ".") { return -1 }
+            else if loader.raw.kinds[pos] != .Name && !is(&loader, pos, ",") && !is(&loader, pos, ".") && !is(&loader, pos, "mut") { return -1 }
             pos = pos - 1
         }
     }
@@ -798,7 +903,7 @@ fn closure_bindings(loader: &Loader, at: i32, last: i32, depth: i32, initials: i
 fn is_known_compound_type(loader: &Loader, owner: i32, word: string) -> bool {
     if word == "TaskID" || word == "Sendable" || word == "Storable" || word == "Clone" || word == "Copy" || word == "Self" { return true }
     for primitive in rules.primitive_types() { if word == primitive { return true } }
-    if loader.symbols.contains(key(&loader, owner, word)) { return true }
+    if loader.symbols.contains(key(&loader, owner, word)) || loader.sym_imports.contains(key(&loader, owner, word)) { return true }
     bundled.prelude_export("", word) != ""
 }
 fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lexer.Tokens, start: i32, record_names: bool) {
@@ -903,6 +1008,7 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
             }
         }
         if depth == 0 && is(&loader, i, "fn") && i + 1 < last && declaration < loader.declaration_tokens.len && loader.declaration_tokens[declaration] == i + 1 { mode = 1; locals.clear(); levels.clear(); active.clear() }
+        if depth == 0 && is(&loader, i, "const") { mode = 8; locals.clear(); levels.clear(); active.clear() }
         if depth == 0 && is(&loader, i, "struct") { mode = 3 }
         if depth == 0 && is(&loader, i, "enum") { mode = 4 }
         if depth == 0 && is(&loader, i, "trait") { mode = 7; in_trait = true; locals.clear(); levels.clear(); active.clear() }
@@ -981,15 +1087,15 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
         mut consumed := 1
         if kind == .Name {
             // The interpolation scanner anchors the generated name and opening parenthesis at the same byte.
-            generated_format := value == "__dunder_module_format_integer" && i + 1 < last &&
-                loader.raw.starts[i] == loader.raw.starts[i + 1]
+            generated_format := (value == "__dunder_module_format_integer" || value == "__dunder_module_format_string") &&
+                i + 1 < last && loader.raw.starts[i] == loader.raw.starts[i + 1]
             if !record_names && ((strings.starts_with(value, "__dunder_module_") && !generated_format) || (strings.starts_with(value, "__sys_") && loader.standard[owner] != "sys")) {
                 fail(&mut loader, owner, loader.raw.starts[i], "reserved compiler identifier '" + value + "'"); return
             }
         }
         if kind == .Name && initials.bit_and(initial_bit(value)) != 0 {
             field := !in_where && !in_generic_params && is(&loader, i + 1, ":")
-            payload := in_pattern && (is(&loader, previous, "(") || is(&loader, previous, ",")) && (is(&loader, i + 1, ")") || is(&loader, i + 1, ","))
+            payload := in_pattern && (is(&loader, previous, "(") || is(&loader, previous, ",") || is(&loader, previous, "mut")) && (is(&loader, i + 1, ")") || is(&loader, i + 1, ","))
             tuple_binding := i < tuple_assignment
             mut binding := payload || tuple_binding
             if (mode == 1 || mode == 6 || mode == 7) && field && !is(&loader, previous, ".") { binding = true }
@@ -1022,7 +1128,8 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
             mut type_constructor := false
             if is(&loader, i + 1, "<") && bundled.prelude_generic(value) && bundled.prelude_export("", value) != "" {
                 symbol := i32(loader.symbols.get_or(key(&loader, owner, value), -1))
-                type_constructor = symbol < 0 || !is(&loader, loader.declaration_tokens[symbol] + 1, "<")
+                sym_imp := i32(loader.sym_imports.get_or(key(&loader, owner, value), -1))
+                type_constructor = (symbol < 0 || !is(&loader, loader.declaration_tokens[symbol] + 1, "<")) && sym_imp < 0
             }
             method_decl := (mode == 6 || mode == 7) && depth == 1 && is(&loader, previous, "fn")
             enum_member := mode == 4 && depth == 1 && enum_parens == 0 && (previous < 0 || lexer.is_newline(loader.raw.kinds[previous]) || is(&loader, previous, "{") || is(&loader, previous, ","))
@@ -1043,11 +1150,12 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
                     member := loader.raw.texts[i + 2].clone()
                     found := i32(loader.symbols.get_or(key(&loader, alias, member), -1))
                     qualified_generic := is(&loader, i + 3, "<")
-                    if loader.standard[alias] != "" && (found < 0 || qualified_generic) {
+                    qualified_assoc := is(&loader, i + 3, "::")
+                    if loader.standard[alias] != "" && (found < 0 || qualified_generic || qualified_assoc) {
                         spelling = bundled.prelude_export(loader.standard[alias], member)
                     }
                     if spelling != "" {
-                        if bundled.prelude_generic(member) && !qualified_generic { fail(&mut loader, owner, loader.raw.starts[i], "generic declaration '" + member + "' requires explicit type arguments"); return }
+                        if bundled.prelude_generic(member) && !qualified_generic && !qualified_assoc { fail(&mut loader, owner, loader.raw.starts[i], "generic declaration '" + member + "' requires explicit type arguments"); return }
                     } else {
                         if found < 0 { fail(&mut loader, owner, loader.raw.starts[i], "module '" + value + "' has no declaration '" + member + "'"); return }
                         if !loader.public[found] { fail(&mut loader, owner, loader.raw.starts[i], "'" + value + "." + member + "' is private; export it with pub"); return }
@@ -1061,18 +1169,32 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []i32, tokens: &mut lex
                         if !check_caps(&mut loader, owner, i, found) { return }
                         spelling = loader.renamed[found].clone()
                     } else {
-                        pre := bundled.prelude_export("", value)
-                        if pre != "" && !bundled.prelude_generic(value) {
-                            spelling = pre
-                        } else if type_params.len > 0 {
-                            if (i < type_end || in_where || in_generic_params) && value != "extern" && value != "from" && value != "Self" && value != "TaskID" && value != "Sendable" && value != "Storable" && value != "Clone" && value != "Copy" && value != "storable" && value != "where" {
-                                mut known := false
-                                for primitive in rules.primitive_types() { if value == primitive { known = true; break } }
-                                if !known { fail(&mut loader, owner, loader.raw.starts[i], "unknown type '" + value + "'"); return }
-                            } else if mode == 2 && is(&loader, i + 1, "(") && !rules.builtin_call(value) &&
-                                !strings.starts_with(value, "__sys_") && !strings.starts_with(value, "__dunder_module_") &&
-                                !is(&loader, previous, "scope") {
-                                fail(&mut loader, owner, loader.raw.starts[i], "unknown function '" + value + "'"); return
+                        si := i32(loader.sym_imports.get_or(entry, -1))
+                        if si >= 0 {
+                            if loader.sym_import_prelude[si] != "" {
+                                if bundled.prelude_generic(loader.sym_import_member[si]) && !is(&loader, i + 1, "<") && !is(&loader, i + 1, "::") {
+                                    fail(&mut loader, owner, loader.raw.starts[i], "generic declaration '" + loader.sym_import_member[si] + "' requires explicit type arguments"); return
+                                }
+                                spelling = loader.sym_import_prelude[si].clone()
+                            } else {
+                                sym_id := loader.sym_import_symbol[si]
+                                if !check_caps(&mut loader, owner, i, sym_id) { return }
+                                spelling = loader.renamed[sym_id].clone()
+                            }
+                        } else {
+                            pre := bundled.prelude_export("", value)
+                            if pre != "" && (!bundled.prelude_generic(value) || is(&loader, i + 1, "::")) {
+                                spelling = pre
+                            } else if type_params.len > 0 {
+                                if (i < type_end || in_where || in_generic_params) && value != "extern" && value != "from" && value != "Self" && value != "TaskID" && value != "Sendable" && value != "Storable" && value != "Clone" && value != "Copy" && value != "storable" && value != "where" {
+                                    mut known := false
+                                    for primitive in rules.primitive_types() { if value == primitive { known = true; break } }
+                                    if !known { fail(&mut loader, owner, loader.raw.starts[i], "unknown type '" + value + "'"); return }
+                                } else if mode == 2 && is(&loader, i + 1, "(") && !rules.builtin_call(value) &&
+                                    !strings.starts_with(value, "__sys_") && !strings.starts_with(value, "__dunder_module_") &&
+                                    !is(&loader, previous, "scope") {
+                                    fail(&mut loader, owner, loader.raw.starts[i], "unknown function '" + value + "'"); return
+                                }
                             }
                         }
                     }
@@ -1167,7 +1289,8 @@ fn new_loader(path: string, testing: bool, token_offsets: bool, dep_names: &[]st
         result: Loaded { token_offsets: token_offsets, groups: [], calls: [], ok: true, error: "", path: path.clone(), source: "", offset: 0,
             paths: [], sources: [], symbols: [], module_caps: [], map_starts: [], map_files: [], map_offsets: [] },
         key_prefixes: [], standard: [], directories: [], first: [], last: [], raw: lexer.empty(false), last_arm: [], namespace_initials: [], hidden_starts: [], hidden_ends: [], declaration_tokens: [], any_unsafe: false, requires_caps: [],
-        symbols: Map<string, i64>::new(), imports: Map<string, i64>::new(), by_path: Map<string, i64>::new(), by_physical: Map<string, i64>::new(), by_std: Map<string, i64>::new(), owners: [], public: [], records: [], types: [], traits: [], renamed: [],
+        symbols: Map<string, i64>::new(), imports: Map<string, i64>::new(), sym_imports: Map<string, i64>::new(), by_path: Map<string, i64>::new(), by_physical: Map<string, i64>::new(), by_std: Map<string, i64>::new(), owners: [],
+        sym_import_owner: [], sym_import_alias: [], sym_import_module: [], sym_import_member: [], sym_import_offset: [], sym_import_symbol: [], sym_import_prelude: [], public: [], records: [], types: [], traits: [], renamed: [],
         testing: testing, test_tags: [], test_targets: [], test_ends: [], next_test: 0,
         dep_names: dep_names.clone(), dep_dirs: dep_dirs.clone(), dep_entries: dep_entries.clone(),
     }
@@ -1178,7 +1301,7 @@ pub fn bind_source_generics(input: &mut lexer.Tokens) {
     for i in 0..input.kinds.len {
         if input.kinds[i] == .Name {
             word := &input.texts[i]
-            if bundled.prelude_export("", word) != "" && (!bundled.prelude_generic(word) || (i + 1 < input.kinds.len && lexer.symbol(&input, i + 1, "<"))) {
+            if bundled.prelude_export("", word) != "" && (!bundled.prelude_generic(word) || (i + 1 < input.kinds.len && (lexer.symbol(&input, i + 1, "<") || lexer.symbol(&input, i + 1, "::")))) {
                 found = true; break
             }
         }
@@ -1235,6 +1358,7 @@ pub fn load_group_with_deps(path: string, testing: bool, token_offsets: bool, gr
         else { scan_wave_serial(&mut loader, owner, stop, 1) }
         owner = stop
     }
+    if loader.result.ok { resolve_symbol_imports(&mut loader) }
     mut output: []i32 = []
     if loader.result.ok {
         if token_offsets {

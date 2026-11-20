@@ -262,7 +262,35 @@ på macOS, där `std.process` använder plattformens miljö-API. Se
 Systemanropen är en plattformsdetalj som anpassas per mål.
 Binärläsning finns som `sys.read_u8`/`read_u8_limit`/`read_u8_into` och
 katalogverktyg i `std.fs` (`list_dir`, `ReadDir::list`, `remove_all`).
-Strömmar, godtyckliga rättighetsändringar och ett generellt allokerings-API återstår.
+Godtyckliga rättighetsändringar (`chmod`) återstår.
+
+## Kapabilitetsöversikt
+
+Moduler i Dunder deklarerar använda privilegier med `capability ...` högst upp
+i källfilen. De grundläggande fil-, text- och klockfunktionerna i `sys` kräver
+däremot ingen särskild `capability`-rad: de verkar med öppna/stängda
+engangsanrop eller direkt över en filbeskrivare som anroparen redan fått, utan
+delegeringsbara katalog-/filhandtag eller godtycklig process-/nätverksåtkomst.
+Högre standardmoduler skyddar bredare OS-operationer med uttryckliga kapabiliteter
+(`@requires(...)`) så att beroendebibliotek inte tyst kan skaffa behörighet.
+
+| Modul / API | Krävd kapabilitet | Exempel på operationer |
+| --- | --- | --- |
+| `sys` (grundläggande I/O, tid, argument) | Ingen | `sys.read`, `sys.read_text`, `sys.write_text`, `sys.append_text`, `sys.metadata`, `sys.mkdir`, `sys.rename`, `sys.remove_file`, `sys.remove_dir`, `sys.same_file`, `sys.read_u8`, `sys.write_u8`, `sys.now_ms`, `sys.sleep_ms`, `sys.pid`, `sys.arg`, `sys.fd_read`/`fd_write`/`fd_close` |
+| `sys` (råminne & systemanrop) | `capability unsafe` | `sys.envp`, `sys.linux_syscall`, `sys.memory_copy`, `sys.memory_equal`, `sys.memory_zero`, `sys.pool_alloc_try`, `sys.pool_free` |
+| `std.fs` | `capability filesystem` | `fs.list_dir`, `fs.mkdir_all`, `fs.remove_all`, `fs.temp_dir`, `fs.cwd`, `fs.realpath`, `fs.symlink`, `fs.hard_link`, `fs.is_symlink`, samt skapande av handtagen `ReadFile::grant`, `WriteFile::grant`, `ReadDir::grant`, `WriteFile::create` och `File::open` (även `std.sqlite` använder `filesystem` och `unsafe`) |
+| `std.io` (standardströmmar) | `capability stdio` | `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.read_stdin`, `io.read_stdin_bytes`, `io.read_stdin_limit` |
+| `std.net` | `capability network` | `TcpListener`, `TcpStream`, `UdpSocket`, `net.resolve`, `net.listen`, `net.connect` |
+| `std.process` | `capability process` | `Command::spawn`/`exec`, `Executable::grant`, `process.run`, `process.replace`, `process.env`, `ChildSet` |
+| `std.dl`, `std.alloc.RawAllocator`, FFI | `capability unsafe` | `dl.open`/`sym`, `RawAllocator::alloc`/`dealloc`, `extern`, `addr`, `ptr`, `bytes_view` |
+
+Observera varför exempelvis `fs.list_dir` och `fs.realpath` kräver
+`capability filesystem` medan `sys.read_text` inte gör det: `std.fs` exponerar
+katalogtraversering, rekursiv radering och delegeringsbara fil-/kataloghandtag
+(`ReadFile`, `WriteFile`, `ReadDir`), som är tänkta att styras i paketets
+ytterkant. Själva handtagsmetoderna som `.read()` på ett redan beviljat
+`ReadFile`-handtag kan däremot anropas i moduler utan egen `capability
+filesystem`; bara skapandet (`grant`/`open`) kräver kapabiliteten.
 
 För kod som ska få åtkomst till en vald fil via en parameter finns
 `std.fs.ReadFile` och `std.fs.WriteFile`. Handtagen skapas i en modul

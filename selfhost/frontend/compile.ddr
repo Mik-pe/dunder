@@ -107,10 +107,11 @@ pub opaque struct Session {
     tasks: tc.TaskGraph,
     closure_header: i32, closure_drop: i32, boxed_signatures: []bool, types: ft.TypeRegistry, helper_labels: []i32, array_helpers: i32,
     task_iso_labels: []i32, task_shared_rc_labels: []i32, task_shared_prepare_labels: []i32, task_shared_drop_labels: []i32,
-    ok: bool, error: string, error_at: i32,
+    ok: bool, error: string, error_at: i32, error_note: string, error_note_at: i32,
     specializations: generics.Layout,
     traits: traits.Table,
     discovering_compounds: bool, known_compounds: Map<string, i64>, demanded_compounds: Map<string, i64>,
+    demanded_inferred_keys: Map<string, i64>, demanded_inferred_args: []string,
     validating_dead: bool, validated_through: i32, report: bool, bindings: Bindings,
     wasm_abi: wa.Abi, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports,
@@ -120,24 +121,62 @@ pub opaque struct Session {
     mir_opt_enabled: bool, mir_memory_enabled: bool, mir_ssa_enabled: bool, mir_values_enabled: bool, scalar_enabled: bool, ownership_enabled: bool, const_div_enabled: bool, range_enabled: bool, inline_enabled: bool,
     scalar_templates: opt_templates.Cache,
     strings: []string, string_labels: []i32,
+    const_blob_ids: []i32, const_blob_labels: []i32,
     print_int: i32, print_bool: i32, print_text: i32, write: i32,
     float_source: bool, float_trap: i32, unicode_trap: i32, overflow: i32, zero: i32, assertion: i32, io: i32, bounds: i32,
 }
-fn task_effect(c: &mut Session, bits: i64) {
-    if c.tasks.program { c.body.facts.effects = c.body.facts.effects.bit_or(bits) }
+fn task_effect_at(c: &mut Session, bits: i64, tok: i32) {
+    if c.tasks.program {
+        c.body.facts.effects = c.body.facts.effects.bit_or(bits)
+        if bits.bit_and(i64(15).bit_not()) != 0 && c.body.facts.effect_at < 0 &&
+            tok >= 0 && tok < c.world.tokens.starts.len {
+            c.body.facts.effect_at = c.world.tokens.starts[tok]
+        }
+    }
 }
-fn task_edge(c: &mut Session, callee: i32) {
-    if c.tasks.program { c.body.facts.calls.push(callee) }
+fn task_effect(c: &mut Session, bits: i64) {
+    mut tok := c.body.cursor - 2
+    if tok < 0 { tok = c.body.cursor }
+    task_effect_at(&mut c, bits, tok)
+}
+fn task_edge(c: &mut Session, callee: i32, offset: i32) {
+    if c.tasks.program { c.body.facts.calls.push(callee); c.body.facts.call_offsets.push(offset) }
 }
 fn task_use(c: &mut Session, at: i32) {
-    task_effect(&mut c, 1024)
+    task_effect_at(&mut c, 1024, at)
     if c.body.facts.first_task < 0 { c.body.facts.first_task = at }
 }
 fn task_certify(c: &mut Session, certificate: &mut tc.TaskCertificate) -> bool {
     mut at := c.body.cursor
+    mut bad_chain: []i32 = []
+    mut bad_sites: []i32 = []
     err := tc.certify(&c.tasks, &c.types, &c.world.tokens.starts, c.world.names.len, &c.world.param_starts,
-        &c.world.param_counts, &c.world.param_types, &c.world.returns, &mut certificate, &mut at)
-    if err != "" { c.body.cursor = at; fail(&mut c, err); return false }
+        &c.world.param_counts, &c.world.param_types, &c.world.returns, &mut certificate, &mut at,
+        &mut bad_chain, &mut bad_sites)
+    if err != "" {
+        c.body.cursor = at; fail(&mut c, err)
+        if bad_chain.len > 0 {
+            leaf := bad_chain[bad_chain.len - 1]
+            leaf_site := bad_sites[bad_sites.len - 1]
+            leaf_name := diagnostics.display_symbol(&c.sources, c.world.names[leaf].clone())
+            if bad_chain.len == 1 {
+                c.error_note = "offending operation in '" + leaf_name + "'"
+                c.error_note_at = leaf_site
+            } else {
+                mut chain := ""
+                for idx in 0..bad_chain.len {
+                    if idx > 0 { chain += " -> " }
+                    chain += diagnostics.display_symbol(&c.sources, c.world.names[bad_chain[idx]].clone())
+                    if idx + 1 < bad_chain.len && idx < bad_sites.len && bad_sites[idx] >= 0 {
+                        chain += " (" + diagnostics.location_text(&c.sources, generics.origin(&c.specializations, bad_sites[idx])) + ")"
+                    }
+                }
+                c.error_note = "call chain: " + chain
+                c.error_note_at = leaf_site
+            }
+        }
+        return false
+    }
     true
 }
 fn import_c(c: &mut Session, symbol: string) -> i32 {
@@ -305,7 +344,7 @@ fn task_spawn(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_
     if consuming && input_kind == 4 { fail(&mut c, "move argument requires a consuming task parameter"); return 0 }
     actual := expression(&mut c, 0, input, &catalog, &mut inline_work, &mut model); same(&mut c, input, actual); expect(&mut c, ")")
     if input_kind != 4 {
-        if ft.move_only(&c.types, input) && c.body.expr.owner < 0 && !consuming { fail(&mut c, "consuming task parameter requires 'move value' or a fresh owned expression"); return 0 }
+        if ft.move_only(&c.types, input) && !is_fresh_owned(&c) && !consuming { fail(&mut c, "consuming task parameter requires 'move value' or a fresh owned expression"); return 0 }
         take_value(&mut c, input); input_owner := temporary(&mut c, input)
     }
     c.body.facts.needed.push(worker)
@@ -371,6 +410,10 @@ fn compound(c: &mut Session, kind: i32, base: i32) -> i32 {
 }
 fn collection(c: &Session, ty: i32) -> bool { ft.collection(&c.types, ty) }
 fn length_literal(c: &mut Session) -> i32 {
+    if c.world.tokens.kinds[c.body.cursor] == .Name {
+        v := c.types.const_lengths.get_or(peek(&c), -1)
+        if v >= 0 && v <= 1048576 { _ := advance(&mut c); return i32(v) }
+    }
     if c.world.tokens.kinds[c.body.cursor] != .Integer { fail(&mut c, "expected nonnegative array length"); return 0 }
     length := rules.literal_integer(advance(&mut c))
     if !length.ok || length.value < 0 || length.value > 1048576 { fail(&mut c, "array length out of range"); return 0 }
@@ -453,16 +496,33 @@ fn prepare_structural_types(c: &mut Session) {
             } else { continue }
             if !c.ok {
                 // A field initializer or a comparison can resemble a type.
-                c.ok = true; c.error = ""; c.error_at = 0
+                c.ok = true; c.error = ""; c.error_at = 0; c.error_note = ""; c.error_note_at = -1
             }
         }
     }
     c.types.self_type = -1
     ft.finish_tuples(&mut c.types)
 }
+fn fail_immutable_binding(c: &mut Session, message: string, base: i32) {
+    had_error := !c.ok
+    fail(&mut c, message)
+    if had_error || base < 0 || base >= c.body.locals.names.len || c.error_note != "" { return }
+    name := c.body.locals.names[base].clone()
+    decl_tok := c.body.locals.tokens[base]
+    decl_off := if decl_tok >= 0 && decl_tok < c.world.tokens.starts.len { c.world.tokens.starts[decl_tok] } else { -1 }
+    ty := c.body.locals.types[base]
+    if fc.pattern_loan(&c.body, base) {
+        c.error_note = with_clone_hint(&c, ty, "pattern binding '" + name + "' borrows from the match subject; match with 'move'", " or clone") + " to mutate it"
+    } else if ft.type_kind(&c.types, ty) == 4 {
+        c.error_note = "'" + name + "' is a shared borrow ('" + ft.type_spelling(&c.types, ty) + "') declared"
+    } else {
+        c.error_note = "'" + name + "' was declared immutable (add 'mut' to make it mutable)"
+    }
+    c.error_note_at = decl_off
+}
 fn same(c: &mut Session, expected: i32, actual: i32) {
     if expected == actual { return }
-    if c.ok { fail(&mut c, "type mismatch: " + ft.type_spelling(&c.types, expected) + " / " + ft.type_spelling(&c.types, actual)) }
+    if c.ok { fail(&mut c, "type mismatch: expected " + ft.type_spelling(&c.types, expected) + ", got " + ft.type_spelling(&c.types, actual)) }
 }
 fn field(c: &Session, ty: i32, name: string) -> i32 { ft.field(&c.types, ty, name) }
 fn load_mem(c: &mut Session, destination: i32, base: i32, offset: i32) { fa.load_mem(&mut c.code, destination, base, offset) }
@@ -534,7 +594,7 @@ fn require_cleanup(c: &mut Session, ty: i32) {
         hook := ft.cleanup_method(&c.types, current)
         if hook >= 0 {
             c.body.facts.needed.push(hook)
-            task_edge(&mut c, hook)
+            task_edge(&mut c, hook, c.world.tokens.starts[c.body.cursor])
         }
         kind := ft.type_kind(&c.types, current)
         if collection(&c, current) {
@@ -631,11 +691,67 @@ fn source_root(c: &Session, place: i32) -> i32 {
     if alias >= 0 || local_borrows.is_transient(&c.body.local_loans, binding) { return alias }
     binding
 }
+fn with_clone_hint(c: &Session, ty: i32, base: string, clone_suffix: string) -> string {
+    if ty > 0 && ft.cloneable(&c.types, ty) { return base + clone_suffix }
+    base.clone()
+}
+fn has_cleanup_ancestor(c: &Session, place: i32) -> bool {
+    if !c.types.has_cleanup { return false }
+    mut projected := place
+    while projected > 0 {
+        row := (projected - 1) * 3
+        receiver := places.receiver(c.body.places.arena.nodes[row + 1])
+        if ft.cleanup_method(&c.types, receiver) >= 0 { return true }
+        projected = places.parent(c.body.places.arena.nodes[row])
+    }
+    false
+}
+fn local_name_used_later(c: &Session, name: string, from: i32, limit: i32) -> bool {
+    if limit < 0 { return true }
+    mut end := limit
+    if end > c.world.tokens.kinds.len { end = c.world.tokens.kinds.len }
+    if from < 0 || from >= end { return false }
+    for tok in from..end {
+        if c.world.tokens.kinds[tok] == .Name && c.world.tokens.texts[tok] == name {
+            if tok > 0 && c.world.tokens.kinds[tok - 1] == .Symbol &&
+                (c.world.tokens.texts[tok - 1] == "." || c.world.tokens.texts[tok - 1] == "::") {
+                continue
+            }
+            return true
+        }
+    }
+    false
+}
+fn is_fresh_owned(c: &Session) -> bool {
+    if c.body.expr.owner >= 0 || c.body.expr.const_array { return true }
+    if c.body.places.current == 0 && c.body.expr.move_temporary >= 0 &&
+        c.body.expr.move_projection >= 0 && !c.body.place.inline_storage {
+        return true
+    }
+    if c.body.places.current < 0 {
+        binding := borrows.root(&c.body.places, c.body.places.current)
+        if binding >= 0 && binding < c.body.locals.fresh_move.len && c.body.locals.fresh_move[binding] {
+            return true
+        }
+    }
+    false
+}
 fn writable_loan(c: &mut Session, place: i32) -> bool {
     path := owner_path(&c, place)
-    captured := local_borrows.conflict(&c.body.local_loans, &c.body.ownership, path)
-    if captured < 0 { return true }
-    fail(&mut c, "cannot mutate, replace or move a value while it is borrowed")
+    while true {
+        loan := local_borrows.active_conflict_local(&c.body.local_loans, &c.body.ownership, path)
+        if loan < 0 { return true }
+        limit := local_borrows.scope_end(&c.body.local_loans, loan)
+        depth := local_borrows.loop_depth(&c.body.local_loans, loan)
+        if !local_borrows.is_pinned(&c.body.local_loans, loan) && limit >= 0 &&
+            depth == c.body.loop_heads.len &&
+            !local_name_used_later(&c, c.body.locals.names[loan], c.body.cursor, limit) {
+            local_borrows.release_local(&mut c.body.local_loans, loan)
+            continue
+        }
+        fail(&mut c, "cannot mutate, replace or move a value while it is borrowed")
+        return false
+    }
     false
 }
 fn constrain_borrow(c: &mut Session) -> bool {
@@ -643,60 +759,112 @@ fn constrain_borrow(c: &mut Session) -> bool {
     c.body.loan.constrained = true
     true
 }
-fn move_place(c: &mut Session, place: i32, at: i32) -> bool {
-    if c.types.has_cleanup {
-        mut projected := place
-        while projected > 0 {
-            row := (projected - 1) * 3
-            receiver := places.receiver(c.body.places.arena.nodes[row + 1])
-            if ft.cleanup_method(&c.types, receiver) >= 0 {
-                fail(&mut c, "cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
-                return false
-            }
-            projected = places.parent(c.body.places.arena.nodes[row])
-        }
+fn move_place(c: &mut Session, place: i32, ty: i32, at: i32) -> bool {
+    if has_cleanup_ancestor(&c, place) {
+        fail(&mut c, "cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
+        return false
     }
     binding := borrows.root(&c.body.places, place)
     kind := ft.type_kind(&c.types, c.body.locals.types[binding])
-    if kind == 4 || kind == 5 { fail(&mut c, "cannot move out of a borrowed value; use .clone()"); return false }
+    if kind == 4 || kind == 5 {
+        fail(&mut c, with_clone_hint(&c, ty, "cannot move out of a borrowed value", "; use .clone()"))
+        return false
+    }
     for i in 0..c.body.pattern_borrowed.len {
-        if c.body.pattern_borrowed[i] == binding { fail(&mut c, "cannot move a borrowed pattern binding; use .clone()"); return false }
+        if c.body.pattern_borrowed[i] == binding {
+            fail(&mut c, with_clone_hint(&c, ty, "cannot move a borrowed pattern binding", "; use .clone()"))
+            return false
+        }
+    }
+    pl_idx := fc.pattern_loan_index(&c.body, binding)
+    if pl_idx >= 0 {
+        subj_place := c.body.pattern_loans.subject_places[pl_idx]
+        if has_cleanup_ancestor(&c, subj_place) {
+            fail(&mut c, "cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
+            return false
+        }
+        if !writable_loan(&mut c, place) { return false }
+        if !writable_loan(&mut c, subj_place) { return false }
+        path := owner_path(&c, place)
+        if !ownership.available(&c.body.ownership, path) { fail(&mut c, "use of moved value '" + c.body.locals.names[binding] + "'"); return false }
+        if is_for_locked(&c, path) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
+        subj_path := owner_path(&c, subj_place)
+        lock_idx := c.body.pattern_loans.lock_indices[pl_idx]
+        if is_for_locked_except(&c, subj_path, lock_idx) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
+        subj_binding := borrows.root(&c.body.places, subj_place)
+        for i in 0..c.body.move_defer_locks.len {
+            locked := c.body.move_defer_locks[i]
+            if locked == binding || (subj_binding >= 0 && locked == subj_binding) {
+                fail(&mut c, with_clone_hint(&c, ty, "cannot move a value captured by defer", "; use .clone() or move it after the deferred scope"))
+                return false
+            }
+        }
+        ownership.consume(&mut c.body.ownership, path, at); c.body.mutations.push(binding)
+        if subj_path >= 0 && ownership.available(&c.body.ownership, subj_path) {
+            ownership.consume(&mut c.body.ownership, subj_path, at)
+        }
+        if subj_binding >= 0 { c.body.mutations.push(subj_binding) }
+        return true
     }
     if !writable_loan(&mut c, place) { return false }
     path := owner_path(&c, place)
     if !ownership.available(&c.body.ownership, path) { fail(&mut c, "use of moved value '" + c.body.locals.names[binding] + "'"); return false }
-    if is_for_locked(&c, binding) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
+    if is_for_locked(&c, path) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
     for i in 0..c.body.move_defer_locks.len {
-        if c.body.move_defer_locks[i] == binding { fail(&mut c, "cannot move a value captured by defer; use .clone() or move it after the deferred scope"); return false }
+        if c.body.move_defer_locks[i] == binding {
+            fail(&mut c, with_clone_hint(&c, ty, "cannot move a value captured by defer", "; use .clone() or move it after the deferred scope"))
+            return false
+        }
     }
     ownership.consume(&mut c.body.ownership, path, at); c.body.mutations.push(binding)
     true
 }
-fn move_binding(c: &mut Session, binding: i32, at: i32) -> bool {
-    move_place(&mut c, borrows.local_id(binding), at)
+fn move_binding(c: &mut Session, binding: i32, ty: i32, at: i32) -> bool {
+    move_place(&mut c, borrows.local_id(binding), ty, at)
 }
 fn take_value(c: &mut Session, ty: i32) {
     if ft.move_only(&c.types, ty) {
+        if c.body.expr.const_array {
+            copy_value(&mut c, ty); fc.clear_expr(&mut c.body.expr); return
+        }
         if c.body.expr.owner >= 0 && c.body.expr.ty == ty {
             owner_store(&mut c, .Transfer, ty, c.body.expr.owner)
         } else {
             place := c.body.places.current; mut at := c.body.places.source; if at < 0 { at = c.body.cursor }
             if place < 0 {
                 binding := borrows.root(&c.body.places, place)
-                if !move_binding(&mut c, binding, at) { return }
+                if !move_binding(&mut c, binding, ty, at) { return }
                 owner_store(&mut c, .Transfer, ty, places.local_home(c.body.places.arena.locals[binding]))
+                pl_idx := fc.pattern_loan_index(&c.body, binding)
+                if pl_idx >= 0 {
+                    arm.push_temp(&mut c.code, 0)
+                    arm.load(&mut c.code, c.body.pattern_loans.parent_slots[pl_idx])
+                    store_mem(&mut c, 31, 0, c.body.pattern_loans.offsets[pl_idx])
+                    arm.pop_temp(&mut c.code, 0)
+                }
             } else {
                 mut address := c.body.expr.move_projection
                 if place > 0 {
-                    if borrows.has_index(&c.body.places, place) { fail(&mut c, "cannot move out of an indexed element; use .pop() or .clone()"); return }
+                    if borrows.has_index(&c.body.places, place) {
+                        fail(&mut c, with_clone_hint(&c, ty, "cannot move out of an indexed element; use .pop()", " or .clone()"))
+                        return
+                    }
                     binding := borrows.root(&c.body.places, place)
-                    if binding < 0 { fail(&mut c, "cannot transfer this projection; use .clone()"); return }
+                    if binding < 0 {
+                        fail(&mut c, with_clone_hint(&c, ty, "cannot transfer this projection", "; use .clone()"))
+                        return
+                    }
                     lower_place(&mut c, place, 0, .ValueAndAddress, at)
-                    if c.body.place.inline_storage { fail(&mut c, "inline C fields require .clone() when extracted"); return }
+                    if c.body.place.inline_storage {
+                        if ty > 0 && ft.cloneable(&c.types, ty) { fail(&mut c, "inline C fields require .clone() when extracted") }
+                        else { fail(&mut c, "cannot move out of inline C storage") }
+                        return
+                    }
                     address = c.body.place.address
-                    if !move_place(&mut c, place, at) { return }
+                    if !move_place(&mut c, place, ty, at) { return }
                 } else if c.body.expr.move_temporary < 0 || address < 0 || c.body.place.inline_storage {
-                    fail(&mut c, "cannot move out of this borrowed or inline projection; use .clone()"); return
+                    fail(&mut c, with_clone_hint(&c, ty, "cannot move out of this borrowed or inline projection", "; use .clone()"))
+                    return
                 }
                 arm.push_temp(&mut c.code, 0); arm.load(&mut c.code, address)
                 store_mem(&mut c, 31, 0, 0); arm.pop_temp(&mut c.code, 0)
@@ -715,15 +883,21 @@ fn take_value(c: &mut Session, ty: i32) {
 }
 fn take_inline(c: &mut Session, ty: i32) {
     if !ft.move_only(&c.types, ty) { return }
+    if c.body.expr.const_array { fc.clear_expr(&mut c.body.expr); return }
     if c.body.expr.owner >= 0 && c.body.expr.ty == ty { return }
     place := c.body.places.current; mut at := c.body.places.source
     if at < 0 { at = c.body.cursor }
     if place != 0 {
-        if borrows.has_index(&c.body.places, place) { fail(&mut c, "cannot move out of an indexed element; use .pop() or .clone()"); return }
+        if borrows.has_index(&c.body.places, place) {
+            fail(&mut c, with_clone_hint(&c, ty, "cannot move out of an indexed element; use .pop()", " or .clone()"))
+            return
+        }
         binding := borrows.root(&c.body.places, place)
-        if binding >= 0 { moved := move_place(&mut c, place, at); return }
+        if binding >= 0 { moved := move_place(&mut c, place, ty, at); return }
     }
-    if c.body.expr.move_temporary < 0 { fail(&mut c, "cannot move out of this borrowed or inline projection; use .clone()") }
+    if c.body.expr.move_temporary < 0 {
+        fail(&mut c, with_clone_hint(&c, ty, "cannot move out of this borrowed or inline projection", "; use .clone()"))
+    }
 }
 fn drop_target(c: &mut Session, ty: i32) -> i32 {
     if boxed_function(&c, ty) { return c.closure_drop }
@@ -1333,6 +1507,778 @@ fn resolve_traits(c: &mut Session) {
         }
     }
 }
+struct ConstVal { ok: bool, kind: i32, ty: i32, int_val: i64, str_val: string, arr_elem: i32, arr_ints: []i64, error: string, error_tok: i32 }
+fn const_fail(tok: i32, msg: string) -> ConstVal {
+    ConstVal { ok: false, kind: -1, ty: 0, int_val: 0, str_val: "", arr_elem: 0, arr_ints: [], error: msg.clone(), error_tok: tok }
+}
+fn const_ok_int(ty: i32, value: i64) -> ConstVal {
+    ConstVal { ok: true, kind: 0, ty: ty, int_val: value, str_val: "", arr_elem: 0, arr_ints: [], error: "", error_tok: -1 }
+}
+fn const_ok_str(value: string) -> ConstVal {
+    ConstVal { ok: true, kind: 1, ty: 4, int_val: 0, str_val: value.clone(), arr_elem: 0, arr_ints: [], error: "", error_tok: -1 }
+}
+fn const_ok_arr(ty: i32, elem: i32, move ints: []i64) -> ConstVal {
+    ConstVal { ok: true, kind: 2, ty: ty, int_val: i64(ints.len), str_val: "", arr_elem: elem, arr_ints: move ints, error: "", error_tok: -1 }
+}
+fn const_scalar_value_type(c: &Session, ty: i32) -> bool {
+    ty == 1 || ty == 2 || ty == 3 || ty == 5 || floats.has(ty) || unsigned.has(ty)
+}
+fn const_int_type(ty: i32) -> bool {
+    ty == 1 || ty == 2 || unsigned.has(ty)
+}
+fn const_u64_lt(a: i64, b: i64) -> bool {
+    if (a < 0) != (b < 0) { return b < 0 }
+    a < b
+}
+fn const_u64_divmod(a: i64, b: i64, mod_op: bool) -> i64 {
+    if a >= 0 && b >= 0 {
+        if mod_op { return a % b }
+        return a / b
+    }
+    if b < 0 {
+        if const_u64_lt(a, b) {
+            return if mod_op { a } else { 0 }
+        }
+        return if mod_op { a.wrapping_sub(b) } else { 1 }
+    }
+    mut q: i64 = 0
+    mut r: i64 = 0
+    mut i := 63
+    while i >= 0 {
+        bit := a.shr(i).bit_and(1)
+        r = r.shl(1).bit_or(bit)
+        if !const_u64_lt(r, b) {
+            r = r.wrapping_sub(b)
+            q = q.bit_or(i64(1).shl(i))
+        }
+        i = i - 1
+    }
+    if mod_op { r } else { q }
+}
+fn const_u64_mul_checked(a: i64, b: i64, overflow: &mut bool) -> i64 {
+    if a == 0 || b == 0 { return 0 }
+    mut acc: i64 = 0
+    mut lhs := a
+    mut rhs := b
+    mut step := 0
+    while rhs != 0 && step < 64 {
+        if rhs.bit_and(1) != 0 {
+            next := acc.wrapping_add(lhs)
+            if const_u64_lt(next, acc) { overflow = true; return 0 }
+            acc = next
+        }
+        rhs = rhs.shr(1).bit_and(9223372036854775807)
+        if rhs != 0 {
+            if lhs < 0 { overflow = true; return 0 }
+            lhs = lhs.shl(1)
+        }
+        step = step + 1
+    }
+    if rhs != 0 { overflow = true }
+    acc
+}
+fn const_expr_end(t: &lexer.Tokens, first: i32) -> i32 {
+    mut at := first
+    mut parens := 0; mut brackets := 0; mut braces := 0
+    while at < t.kinds.len {
+        kind := t.kinds[at]
+        if kind == .End { break }
+        if parens == 0 && brackets == 0 && braces == 0 {
+            if lexer.is_newline(kind) || (kind == .Symbol && t.texts[at] == ";") { break }
+        }
+        if kind == .Symbol {
+            word := &t.texts[at]
+            if word == "(" { parens = parens + 1 }
+            else if word == ")" { if parens == 0 { break }; parens = parens - 1 }
+            else if word == "[" { brackets = brackets + 1 }
+            else if word == "]" { if brackets == 0 { break }; brackets = brackets - 1 }
+            else if word == "{" { braces = braces + 1 }
+            else if word == "}" { if braces == 0 { break }; braces = braces - 1 }
+        }
+        at = at + 1
+    }
+    at
+}
+fn pre_const_eval(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
+    if depth > 64 { return (false, 0) }
+    pre_const_add(&t, &lengths, &mut pos, end, depth)
+}
+fn pre_const_add(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
+    first := pre_const_mul(&t, &lengths, &mut pos, end, depth)
+    if !first.0 { return first }
+    mut acc := first.1
+    while pos < end {
+        op := &t.texts[pos]
+        if t.kinds[pos] != .Symbol || (op != "+" && op != "-") { break }
+        pos = pos + 1
+        rhs := pre_const_mul(&t, &lengths, &mut pos, end, depth)
+        if !rhs.0 { return rhs }
+        if op == "+" {
+            if (rhs.1 > 0 && acc > 9223372036854775807 - rhs.1) || (rhs.1 < 0 && acc < -9223372036854775807 - 1 - rhs.1) { return (false, 0) }
+            acc = acc + rhs.1
+        } else {
+            if (rhs.1 < 0 && acc > 9223372036854775807 + rhs.1) || (rhs.1 > 0 && acc < -9223372036854775807 - 1 + rhs.1) { return (false, 0) }
+            acc = acc - rhs.1
+        }
+    }
+    (true, acc)
+}
+fn pre_const_mul(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
+    first := pre_const_atom(&t, &lengths, &mut pos, end, depth)
+    if !first.0 { return first }
+    mut acc := first.1
+    while pos < end {
+        op := &t.texts[pos]
+        if t.kinds[pos] != .Symbol || (op != "*" && op != "/" && op != "%") { break }
+        pos = pos + 1
+        rhs := pre_const_atom(&t, &lengths, &mut pos, end, depth)
+        if !rhs.0 { return rhs }
+        if op == "*" {
+            if acc != 0 && rhs.1 != 0 {
+                p := acc.wrapping_mul(rhs.1)
+                if p / acc != rhs.1 { return (false, 0) }
+                acc = p
+            } else { acc = 0 }
+        } else {
+            if rhs.1 == 0 { return (false, 0) }
+            if op == "/" { acc = acc / rhs.1 } else { acc = acc % rhs.1 }
+        }
+    }
+    (true, acc)
+}
+fn pre_const_atom(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
+    if pos >= end { return (false, 0) }
+    if t.kinds[pos] == .Symbol && t.texts[pos] == "-" {
+        pos = pos + 1
+        if pos < end && t.kinds[pos] == .Integer {
+            p := rules.literal_integer("-" + t.texts[pos]); pos = pos + 1
+            return (p.ok, p.value)
+        }
+        v := pre_const_atom(&t, &lengths, &mut pos, end, depth + 1)
+        if !v.0 || v.1 == (-9223372036854775807 - 1) { return (false, 0) }
+        return (true, -v.1)
+    }
+    if t.kinds[pos] == .Symbol && t.texts[pos] == "(" {
+        pos = pos + 1
+        v := pre_const_eval(&t, &lengths, &mut pos, end, depth + 1)
+        if !v.0 || pos >= end || t.texts[pos] != ")" { return (false, 0) }
+        pos = pos + 1; return v
+    }
+    if t.kinds[pos] == .Integer {
+        p := rules.literal_integer(t.texts[pos]); pos = pos + 1
+        return (p.ok, p.value)
+    }
+    if t.kinds[pos] == .Name {
+        name := t.texts[pos].clone(); pos = pos + 1
+        if pos < end && t.kinds[pos] == .Symbol && t.texts[pos] == "(" &&
+            (name == "i32" || name == "i64" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "usize") {
+            pos = pos + 1
+            v := pre_const_eval(&t, &lengths, &mut pos, end, depth + 1)
+            if !v.0 || pos >= end || t.texts[pos] != ")" { return (false, 0) }
+            pos = pos + 1; return v
+        }
+        if lengths.contains(name) { return (true, lengths.get_or(name, -1)) }
+        return (false, 0)
+    }
+    (false, 0)
+}
+fn pre_register_int_consts(c: &mut Session) {
+    t := &c.world.tokens
+    mut depth := 0; mut parens := 0
+    mut i := 0
+    while i < t.kinds.len {
+        if t.kinds[i] == .Symbol {
+            w := &t.texts[i]
+            if w == "{" { depth = depth + 1 }
+            else if w == "}" { if depth > 0 { depth = depth - 1 } }
+            else if w == "(" || w == "[" { parens = parens + 1 }
+            else if (w == ")" || w == "]") && parens > 0 { parens = parens - 1 }
+        }
+        if depth == 0 && parens == 0 && t.kinds[i] == .Name && t.texts[i] == "const" &&
+            i + 1 < t.kinds.len && t.kinds[i + 1] == .Name {
+            cname := t.texts[i + 1].clone()
+            mut j := i + 2
+            while j < t.kinds.len && !lexer.is_newline(t.kinds[j]) && t.texts[j] != ";" && t.texts[j] != "=" { j = j + 1 }
+            if j < t.kinds.len && t.texts[j] == "=" {
+                expr_start := j + 1
+                expr_end := const_expr_end(&t, expr_start)
+                mut p := expr_start
+                val := pre_const_eval(&t, &c.types.const_lengths, &mut p, expr_end, 0)
+                if val.0 && p == expr_end && val.1 >= 0 && val.1 <= 1048576 {
+                    c.types.const_lengths.put(move cname, val.1)
+                }
+                i = expr_end; continue
+            }
+        }
+        i = i + 1
+    }
+}
+fn const_check_int_range(c: &Session, ty: i32, v: i64, tok: i32) -> ConstVal {
+    if ty == 1 {
+        if v < -2147483648 || v > 2147483647 { return const_fail(tok, "constant integer out of i32 range") }
+        return const_ok_int(1, v)
+    }
+    if ty == 2 { return const_ok_int(2, v) }
+    if unsigned.has(ty) {
+        mut maxv := unsigned.maximum(ty)
+        if ty == 12 && c.code.platform == 3 { maxv = 4294967295 }
+        if maxv >= 0 && (v < 0 || v > maxv) { return const_fail(tok, "constant value out of unsigned range") }
+        return const_ok_int(ty, v)
+    }
+    const_fail(tok, "invalid constant integer type")
+}
+fn const_cast_value(c: &Session, target: i32, move src: ConstVal, tok: i32) -> ConstVal {
+    if !src.ok { return src }
+    if target == 5 {
+        if src.ty == 5 { return src }
+        if !const_int_type(src.ty) { return const_fail(tok, "integer conversion requires an integer") }
+        if src.int_val < 0 || src.int_val > 1114111 || (src.int_val >= 55296 && src.int_val <= 57343) {
+            return const_fail(tok, "constant rune value out of Unicode scalar range")
+        }
+        return const_ok_int(5, src.int_val)
+    }
+    if floats.has(target) {
+        if floats.has(src.ty) {
+            if src.ty == target { return src }
+            if src.ty == 6 && target == 7 {
+                d := f64(f32.from_bits(i32(src.int_val)))
+                return const_ok_int(7, d.to_bits())
+            }
+            if src.ty == 7 && target == 6 {
+                f := f32(f64.from_bits(src.int_val))
+                return const_ok_int(6, i64(f.to_bits()).bit_and(4294967295))
+            }
+        }
+        if src.ty == 1 || src.ty == 2 {
+            if target == 6 { return const_ok_int(6, i64(f32(src.int_val).to_bits()).bit_and(4294967295)) }
+            return const_ok_int(7, f64(src.int_val).to_bits())
+        }
+        if unsigned.has(src.ty) {
+            if src.int_val < 0 {
+                // 64-bit unsigned value with high bit set: convert via split halves.
+                hi := f64(src.int_val.shr(1).bit_and(9223372036854775807)) * 2.0 + f64(src.int_val.bit_and(1))
+                if target == 6 { return const_ok_int(6, i64(f32(hi).to_bits()).bit_and(4294967295)) }
+                return const_ok_int(7, hi.to_bits())
+            }
+            if target == 6 { return const_ok_int(6, i64(f32(src.int_val).to_bits()).bit_and(4294967295)) }
+            return const_ok_int(7, f64(src.int_val).to_bits())
+        }
+        return const_fail(tok, "expected a numeric conversion")
+    }
+    if floats.has(src.ty) {
+        if src.ty == 6 {
+            v := f32.from_bits(i32(src.int_val))
+            if !v.is_finite() { return const_fail(tok, "cannot convert non-finite float to integer in constant expression") }
+            if target == 1 {
+                if v < f32(-2147483648) || v >= f32(2147483648) { return const_fail(tok, "constant float conversion out of i32 range") }
+                return const_ok_int(1, i64(i32(v)))
+            }
+            if target == 2 { return const_ok_int(2, i64(v)) }
+            if unsigned.has(target) {
+                if v < f32(0) { return const_fail(tok, "constant float conversion cannot be negative") }
+                return const_check_int_range(&c, target, i64(v), tok)
+            }
+        } else {
+            v := f64.from_bits(src.int_val)
+            if !v.is_finite() { return const_fail(tok, "cannot convert non-finite float to integer in constant expression") }
+            if target == 1 {
+                if v < -2147483648.0 || v >= 2147483648.0 { return const_fail(tok, "constant float conversion out of i32 range") }
+                return const_ok_int(1, i64(i32(v)))
+            }
+            if target == 2 { return const_ok_int(2, i64(v)) }
+            if unsigned.has(target) {
+                if v < 0.0 { return const_fail(tok, "constant float conversion cannot be negative") }
+                return const_check_int_range(&c, target, i64(v), tok)
+            }
+        }
+    }
+    if !const_int_type(src.ty) && src.ty != 5 { return const_fail(tok, "integer conversion requires an integer") }
+    if unsigned.has(src.ty) && src.int_val < 0 {
+        if target == 1 || target == 2 { return const_fail(tok, "constant conversion out of signed integer range") }
+        if target == 11 || (target == 12 && c.code.platform != 3) { return const_ok_int(target, src.int_val) }
+        return const_fail(tok, "constant value out of unsigned range")
+    }
+    if target == 11 || (target == 12 && c.code.platform != 3) {
+        if src.int_val < 0 { return const_fail(tok, "constant value out of unsigned range") }
+        return const_ok_int(target, src.int_val)
+    }
+    const_check_int_range(&c, target, src.int_val, tok)
+}
+fn const_eval_expr(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    if depth > 64 { return const_fail(pos, "constant expression nesting exceeds 64") }
+    const_eval_or(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
+}
+fn const_eval_or(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    mut left := const_eval_and(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
+    if !left.ok { return left }
+    while pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "||" {
+        op_tok := pos; pos = pos + 1
+        right := const_eval_and(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 3, depth)
+        if !right.ok { return right }
+        if left.ty != 3 || right.ty != 3 { return const_fail(op_tok, "logical || requires bool operands") }
+        left = const_ok_int(3, if left.int_val != 0 || right.int_val != 0 { 1 } else { 0 })
+    }
+    left
+}
+fn const_eval_and(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    mut left := const_eval_cmp(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
+    if !left.ok { return left }
+    while pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "&&" {
+        op_tok := pos; pos = pos + 1
+        right := const_eval_cmp(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 3, depth)
+        if !right.ok { return right }
+        if left.ty != 3 || right.ty != 3 { return const_fail(op_tok, "logical && requires bool operands") }
+        left = const_ok_int(3, if left.int_val != 0 && right.int_val != 0 { 1 } else { 0 })
+    }
+    left
+}
+fn const_eval_cmp(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    mut hint := expected; if hint == 3 { hint = 0 }
+    mut left := const_eval_add(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, hint, depth)
+    if !left.ok { return left }
+    if pos < end && c.world.tokens.kinds[pos] == .Symbol {
+        op := c.world.tokens.texts[pos].clone()
+        if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+            op_tok := pos; pos = pos + 1
+            right := const_eval_add(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, left.ty, depth)
+            if !right.ok { return right }
+            if left.ty != right.ty { return const_fail(op_tok, "constant comparison requires matching types") }
+            if left.kind == 2 { return const_fail(op_tok, "constant array comparison is not supported in constant expressions") }
+            if left.kind == 1 {
+                if op != "==" && op != "!=" { return const_fail(op_tok, "strings only support == and != comparisons") }
+                eq := left.str_val == right.str_val
+                return const_ok_int(3, if (op == "==" && eq) || (op == "!=" && !eq) { 1 } else { 0 })
+            }
+            if left.ty == 3 && op != "==" && op != "!=" { return const_fail(op_tok, "bool only supports == and != comparisons") }
+            mut out := false
+            if floats.has(left.ty) {
+                if left.ty == 6 {
+                    a := f32.from_bits(i32(left.int_val)); b := f32.from_bits(i32(right.int_val))
+                    out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { a < b } else if op == "<=" { a <= b } else if op == ">" { a > b } else { a >= b }
+                } else {
+                    a := f64.from_bits(left.int_val); b := f64.from_bits(right.int_val)
+                    out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { a < b } else if op == "<=" { a <= b } else if op == ">" { a > b } else { a >= b }
+                }
+            } else if unsigned.has(left.ty) {
+                a := left.int_val; b := right.int_val
+                out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { const_u64_lt(a, b) } else if op == "<=" { a == b || const_u64_lt(a, b) } else if op == ">" { const_u64_lt(b, a) } else { a == b || const_u64_lt(b, a) }
+            } else {
+                a := left.int_val; b := right.int_val
+                out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { a < b } else if op == "<=" { a <= b } else if op == ">" { a > b } else { a >= b }
+            }
+            left = const_ok_int(3, if out { 1 } else { 0 })
+        }
+    }
+    left
+}
+fn const_eval_add(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    mut left := const_eval_mul(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
+    if !left.ok { return left }
+    while pos < end && c.world.tokens.kinds[pos] == .Symbol && (c.world.tokens.texts[pos] == "+" || c.world.tokens.texts[pos] == "-") {
+        op_tok := pos; op := c.world.tokens.texts[pos].clone(); pos = pos + 1
+        right := const_eval_mul(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, left.ty, depth)
+        if !right.ok { return right }
+        if left.ty != right.ty { return const_fail(op_tok, "constant arithmetic requires matching types") }
+        if left.kind == 1 && op == "+" {
+            left = const_ok_str(left.str_val + right.str_val); continue
+        }
+        if left.kind != 0 || left.ty == 3 || left.ty == 5 { return const_fail(op_tok, "invalid constant operator") }
+        if floats.has(left.ty) {
+            if left.ty == 6 {
+                a := f32.from_bits(i32(left.int_val)); b := f32.from_bits(i32(right.int_val))
+                res := if op == "+" { a + b } else { a - b }
+                left = const_ok_int(6, i64(res.to_bits()).bit_and(4294967295))
+            } else {
+                a := f64.from_bits(left.int_val); b := f64.from_bits(right.int_val)
+                res := if op == "+" { a + b } else { a - b }
+                left = const_ok_int(7, res.to_bits())
+            }
+            continue
+        }
+        if unsigned.has(left.ty) {
+            a := left.int_val; b := right.int_val
+            if op == "+" {
+                sum := a.wrapping_add(b)
+                if const_u64_lt(sum, a) { return const_fail(op_tok, "unsigned constant addition overflows") }
+                left = const_check_int_range(&c, left.ty, sum, op_tok)
+            } else {
+                if const_u64_lt(a, b) { return const_fail(op_tok, "unsigned constant subtraction underflows") }
+                left = const_check_int_range(&c, left.ty, a.wrapping_sub(b), op_tok)
+            }
+        } else {
+            a := left.int_val; b := right.int_val
+            mut v: i64 = 0
+            if op == "+" {
+                if (b > 0 && a > 9223372036854775807 - b) || (b < 0 && a < -9223372036854775807 - 1 - b) {
+                    return const_fail(op_tok, "constant addition overflows")
+                }
+                v = a + b
+            } else {
+                if (b < 0 && a > 9223372036854775807 + b) || (b > 0 && a < -9223372036854775807 - 1 + b) {
+                    return const_fail(op_tok, "constant subtraction overflows")
+                }
+                v = a - b
+            }
+            left = const_check_int_range(&c, left.ty, v, op_tok)
+        }
+        if !left.ok { return left }
+    }
+    left
+}
+fn const_eval_mul(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    mut left := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
+    if !left.ok { return left }
+    while pos < end && c.world.tokens.kinds[pos] == .Symbol {
+        op := c.world.tokens.texts[pos].clone()
+        if op != "*" && op != "/" && op != "%" { break }
+        op_tok := pos; pos = pos + 1
+        right := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, left.ty, depth)
+        if !right.ok { return right }
+        if left.ty != right.ty { return const_fail(op_tok, "constant arithmetic requires matching types") }
+        if left.kind != 0 || left.ty == 3 || left.ty == 5 { return const_fail(op_tok, "invalid constant operator") }
+        if floats.has(left.ty) {
+            if op == "%" { return const_fail(op_tok, "float constants do not support %") }
+            if left.ty == 6 {
+                a := f32.from_bits(i32(left.int_val)); b := f32.from_bits(i32(right.int_val))
+                res := if op == "*" { a * b } else { a / b }
+                left = const_ok_int(6, i64(res.to_bits()).bit_and(4294967295))
+            } else {
+                a := f64.from_bits(left.int_val); b := f64.from_bits(right.int_val)
+                res := if op == "*" { a * b } else { a / b }
+                left = const_ok_int(7, res.to_bits())
+            }
+            continue
+        }
+        if (op == "/" || op == "%") && right.int_val == 0 { return const_fail(op_tok, "division by zero in constant expression") }
+        if unsigned.has(left.ty) {
+            a := left.int_val; b := right.int_val
+            if op == "*" {
+                mut ov := false
+                prod := const_u64_mul_checked(a, b, &mut ov)
+                if ov { return const_fail(op_tok, "unsigned constant multiplication overflows") }
+                left = const_check_int_range(&c, left.ty, prod, op_tok)
+            } else {
+                q := const_u64_divmod(a, b, op == "%")
+                left = const_check_int_range(&c, left.ty, q, op_tok)
+            }
+        } else {
+            a := left.int_val; b := right.int_val
+            i64_min: i64 = -9223372036854775807 - 1
+            mut v: i64 = 0
+            if op == "*" {
+                if a != 0 && b != 0 {
+                    if (a == -1 && b == i64_min) || (b == -1 && a == i64_min) { return const_fail(op_tok, "constant multiplication overflows") }
+                    prod := a.wrapping_mul(b)
+                    if prod / a != b { return const_fail(op_tok, "constant multiplication overflows") }
+                    v = prod
+                }
+            } else if op == "/" {
+                if a == i64_min && b == -1 { return const_fail(op_tok, "constant division overflows") }
+                v = a / b
+            } else {
+                if a == i64_min && b == -1 { v = 0 } else { v = a % b }
+            }
+            left = const_check_int_range(&c, left.ty, v, op_tok)
+        }
+        if !left.ok { return left }
+    }
+    left
+}
+fn const_eval_unary(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    if pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "-" {
+        op_tok := pos; pos = pos + 1
+        if pos < end && c.world.tokens.kinds[pos] == .Integer {
+            spelling := "-" + c.world.tokens.texts[pos]; pos = pos + 1
+            if floats.has(expected) {
+                dec := decimal.decode(spelling, expected == 6)
+                if !dec.ok { return const_fail(op_tok, "floating literal is outside the finite range") }
+                return const_ok_int(expected, dec.bits)
+            }
+            mut ty := expected
+            if ty != 2 && !unsigned.has(ty) { ty = 1 }
+            if unsigned.has(ty) { return const_fail(op_tok, "unsigned constant cannot be negative") }
+            mut parsed := rules.literal_integer(spelling)
+            _ := rules.validate_signed(&mut parsed, ty)
+            if !parsed.ok { return const_fail(op_tok, "integer literal out of range") }
+            return const_ok_int(ty, parsed.value)
+        }
+        if pos < end && c.world.tokens.kinds[pos] == .Float {
+            spelling := "-" + c.world.tokens.texts[pos]; pos = pos + 1
+            mut ty := 7; if expected == 6 { ty = 6 }
+            dec := decimal.decode(spelling, ty == 6)
+            if !dec.ok { return const_fail(op_tok, "floating literal is outside the finite range") }
+            return const_ok_int(ty, dec.bits)
+        }
+        val := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth + 1)
+        if !val.ok { return val }
+        if val.ty == 6 { return const_ok_int(6, val.int_val.bit_xor(2147483648)) }
+        if val.ty == 7 { return const_ok_int(7, val.int_val.bit_xor(i64(-1).shl(63))) }
+        if val.ty != 1 && val.ty != 2 { return const_fail(op_tok, "unary '-' requires signed numeric constant") }
+        if val.int_val == (-9223372036854775807 - 1) || (val.ty == 1 && val.int_val == -2147483648) {
+            return const_fail(op_tok, "constant negation overflows")
+        }
+        return const_ok_int(val.ty, -val.int_val)
+    }
+    if pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "!" {
+        op_tok := pos; pos = pos + 1
+        val := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 3, depth + 1)
+        if !val.ok { return val }
+        if val.ty != 3 { return const_fail(op_tok, "unary '!' requires bool constant") }
+        return const_ok_int(3, if val.int_val == 0 { 1 } else { 0 })
+    }
+    const_eval_primary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
+}
+fn const_eval_primary(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
+    if pos >= end { return const_fail(pos, "expected constant expression") }
+    tok := pos; kind := c.world.tokens.kinds[pos]
+    if kind == .Symbol && c.world.tokens.texts[pos] == "(" {
+        pos = pos + 1
+        val := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth + 1)
+        if !val.ok { return val }
+        if pos >= end || c.world.tokens.texts[pos] != ")" { return const_fail(pos, "expected ')' in constant expression") }
+        pos = pos + 1; return val
+    }
+    if kind == .Symbol && c.world.tokens.texts[pos] == "[" {
+        pos = pos + 1
+        while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
+        mut elem_hint := 0
+        if expected > 0 && collection(&c, expected) { elem_hint = ft.type_base(&c.types, expected) }
+        if elem_hint != 0 && !const_scalar_value_type(&c, elem_hint) {
+            return const_fail(tok, "constant arrays only support scalar elements")
+        }
+        mut arr_ty := expected
+        if pos < end && c.world.tokens.texts[pos] == "]" {
+            pos = pos + 1
+            if elem_hint == 0 { return const_fail(tok, "empty constant array requires a type annotation") }
+            if arr_ty == 0 { arr_ty = compound(&mut c, 1, elem_hint) }
+            return const_ok_arr(arr_ty, elem_hint, [])
+        }
+        if elem_hint == 0 {
+            prefix := array_integer_prefix(&c, pos)
+            if prefix.end > pos {
+                wend := c.world.tokens.texts[prefix.end].clone()
+                if wend == "]" || wend == ";" { elem_hint = prefix.default_type }
+            }
+        }
+        first_tok := pos
+        first := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, elem_hint, depth + 1)
+        if !first.ok { return first }
+        if !const_scalar_value_type(&c, first.ty) { return const_fail(first_tok, "constant arrays only support scalar elements") }
+        elem_ty := if elem_hint != 0 { elem_hint } else { first.ty }
+        if first.ty != elem_ty { return const_fail(first_tok, "constant array element type mismatch") }
+        if pos < end && c.world.tokens.texts[pos] == ";" {
+            pos = pos + 1
+            while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
+            count_tok := pos
+            cnt := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 1, depth + 1)
+            if !cnt.ok { return cnt }
+            if !const_int_type(cnt.ty) || (unsigned.has(cnt.ty) && cnt.int_val < 0) || cnt.int_val < 0 || cnt.int_val > 1048576 {
+                return const_fail(count_tok, "constant array repeat count out of range (0..1048576)")
+            }
+            while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
+            if pos >= end || c.world.tokens.texts[pos] != "]" { return const_fail(pos, "expected ']'") }
+            pos = pos + 1
+            mut vals: []i64 = []; n := i32(cnt.int_val); vals.reserve(n)
+            for _ in 0..n { vals.push(first.int_val) }
+            if arr_ty == 0 { arr_ty = compound(&mut c, 1, elem_ty) }
+            return const_ok_arr(arr_ty, elem_ty, move vals)
+        }
+        mut vals: []i64 = [first.int_val]
+        while pos < end {
+            while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
+            if pos < end && c.world.tokens.texts[pos] == "," {
+                pos = pos + 1
+                while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
+                if pos < end && c.world.tokens.texts[pos] == "]" { break }
+                etok := pos
+                ev := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, elem_ty, depth + 1)
+                if !ev.ok { return ev }
+                if ev.ty != elem_ty { return const_fail(etok, "constant array element type mismatch") }
+                vals.push(ev.int_val)
+            } else { break }
+        }
+        while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
+        if pos >= end || c.world.tokens.texts[pos] != "]" { return const_fail(pos, "expected ']'") }
+        pos = pos + 1
+        if arr_ty == 0 { arr_ty = compound(&mut c, 1, elem_ty) }
+        return const_ok_arr(arr_ty, elem_ty, move vals)
+    }
+    if kind == .Integer {
+        spelling := c.world.tokens.texts[pos].clone(); pos = pos + 1
+        if floats.has(expected) {
+            dec := decimal.decode(spelling, expected == 6)
+            if !dec.ok { return const_fail(tok, "floating literal is outside the finite range") }
+            return const_ok_int(expected, dec.bits)
+        }
+        mut ty := expected
+        if !unsigned.has(ty) && ty != 2 { ty = 1 }
+        if unsigned.has(ty) {
+            num := unsigned.literal(spelling, ty)
+            if !num.ok { return const_fail(tok, "unsigned integer literal out of range") }
+            if c.code.platform == 3 && ty == 12 && (num.value < 0 || num.value > 4294967295) { return const_fail(tok, "usize literal exceeds wasm32 pointer width") }
+            return const_ok_int(ty, num.value)
+        }
+        mut parsed := rules.literal_integer(spelling)
+        _ := rules.validate_signed(&mut parsed, ty)
+        if !parsed.ok { return const_fail(tok, "integer literal out of range") }
+        return const_ok_int(ty, parsed.value)
+    }
+    if kind == .Float {
+        spelling := c.world.tokens.texts[pos].clone(); pos = pos + 1
+        mut ty := 7; if expected == 6 { ty = 6 }
+        dec := decimal.decode(spelling, ty == 6)
+        if !dec.ok { return const_fail(tok, "floating literal is outside the finite range") }
+        return const_ok_int(ty, dec.bits)
+    }
+    if kind == .Byte {
+        parsed := parse.integer(c.world.tokens.texts[pos]); pos = pos + 1
+        return const_ok_int(8, parsed.value)
+    }
+    if kind == .Rune {
+        scalar := c.world.tokens.texts[pos].runes()[0]; pos = pos + 1
+        return const_ok_int(5, i64(i32(scalar)))
+    }
+    if kind == .String {
+        s := c.world.tokens.texts[pos].clone(); pos = pos + 1
+        return const_ok_str(s)
+    }
+    if c.world.tokens.texts[pos] == "true" { pos = pos + 1; return const_ok_int(3, 1) }
+    if c.world.tokens.texts[pos] == "false" { pos = pos + 1; return const_ok_int(3, 0) }
+    if kind == .Name {
+        name := c.world.tokens.texts[pos].clone(); pos = pos + 1
+        cast_ty := type_id(&c, name)
+        if (cast_ty == 1 || cast_ty == 2 || cast_ty == 5 || floats.has(cast_ty) || unsigned.has(cast_ty)) &&
+            pos < end && c.world.tokens.texts[pos] == "(" {
+            pos = pos + 1
+            mut arg_hint := 0
+            mut lit_at := pos; if lit_at < end && c.world.tokens.texts[lit_at] == "-" { lit_at = lit_at + 1 }
+            if lit_at + 1 < end && (c.world.tokens.kinds[lit_at] == .Integer || c.world.tokens.kinds[lit_at] == .Float) &&
+                c.world.tokens.texts[lit_at + 1] == ")" {
+                if floats.has(cast_ty) || c.world.tokens.kinds[lit_at] == .Integer { arg_hint = cast_ty }
+            }
+            inner := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, arg_hint, depth + 1)
+            if !inner.ok { return inner }
+            if pos >= end || c.world.tokens.texts[pos] != ")" { return const_fail(pos, "expected ')' in constant cast") }
+            pos = pos + 1
+            return const_cast_value(&c, cast_ty, move inner, tok)
+        }
+        if floats.has(cast_ty) && pos + 2 < end && c.world.tokens.texts[pos] == "." &&
+            c.world.tokens.texts[pos + 1] == "from_bits" && c.world.tokens.texts[pos + 2] == "(" {
+            pos = pos + 3
+            bits_ty := if cast_ty == 6 { 1 } else { 2 }
+            inner := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, bits_ty, depth + 1)
+            if !inner.ok { return inner }
+            if inner.ty != bits_ty { return const_fail(tok, "from_bits constant type mismatch") }
+            if pos >= end || c.world.tokens.texts[pos] != ")" { return const_fail(pos, "expected ')'") }
+            pos = pos + 1
+            if cast_ty == 6 { return const_ok_int(6, inner.int_val.bit_and(4294967295)) }
+            return const_ok_int(7, inner.int_val)
+        }
+        other := i32(c.world.const_map.get_or(name, -1))
+        if other >= 0 {
+            if !eval_pending_const(&mut c, other, &ptypes, &pexprs, &pends, &mut states, tok) {
+                return const_fail(tok, c.error.clone())
+            }
+            okind := c.world.const_kinds[other]; oty := c.world.const_types[other]
+            if pos + 1 < end && c.world.tokens.texts[pos] == "." && c.world.tokens.texts[pos + 1] == "len" {
+                pos = pos + 2
+                if okind == 1 { return const_ok_int(1, i64(c.world.const_strings[other].len)) }
+                if okind == 2 { return const_ok_int(1, c.world.const_ints[other]) }
+                return const_fail(tok, "len expects a constant array or string")
+            }
+            if okind == 0 { return const_ok_int(oty, c.world.const_ints[other]) }
+            if okind == 1 { return const_ok_str(c.world.const_strings[other].clone()) }
+            return const_fail(tok, "nested constant array reference is not supported inside constant arrays")
+        }
+        return const_fail(tok, "unknown or non-constant identifier '" + diagnostics.display_symbol(&c.sources, name) + "'")
+    }
+    const_fail(tok, "unsupported token in constant expression")
+}
+fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, site_tok: i32) -> bool {
+    if states[cid] == 2 { return true }
+    if states[cid] == 1 {
+        c.body.cursor = site_tok
+        fail(&mut c, "cyclic constant definition '" + diagnostics.display_symbol(&c.sources, c.world.const_names[cid].clone()) + "'")
+        return false
+    }
+    states[cid] = 1
+    saved_cursor := c.body.cursor
+    mut expected := 0
+    if ptypes[cid] >= 0 {
+        mut scan := ptypes[cid]
+        while scan < pexprs[cid] {
+            if c.world.tokens.kinds[scan] == .Name && scan > ptypes[cid] && c.world.tokens.texts[scan - 1] == ";" {
+                dep := i32(c.world.const_map.get_or(c.world.tokens.texts[scan], -1))
+                if dep >= 0 && !eval_pending_const(&mut c, dep, &ptypes, &pexprs, &pends, &mut states, scan) {
+                    return false
+                }
+            }
+            scan = scan + 1
+        }
+        c.body.cursor = ptypes[cid]
+        expected = type_name(&mut c)
+        if !c.ok { return false }
+        if !const_scalar_value_type(&c, expected) && expected != 4 &&
+            !(collection(&c, expected) && const_scalar_value_type(&c, ft.type_base(&c.types, expected))) {
+            c.body.cursor = ptypes[cid]
+            fail(&mut c, "unsupported constant type '" + ft.type_spelling(&c.types, expected) + "'")
+            return false
+        }
+    }
+    mut p := pexprs[cid]
+    val := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut p, pends[cid], expected, 0)
+    if !val.ok {
+        c.body.cursor = if val.error_tok >= 0 { val.error_tok } else { pexprs[cid] }
+        fail(&mut c, val.error)
+        return false
+    }
+    if p != pends[cid] {
+        c.body.cursor = p
+        fail(&mut c, "unexpected trailing token in constant expression")
+        return false
+    }
+    mut final_ty := val.ty
+    if expected != 0 {
+        if expected != val.ty {
+            c.body.cursor = pexprs[cid]
+            fail(&mut c, "type mismatch: expected " + ft.type_spelling(&c.types, expected) + ", got " + ft.type_spelling(&c.types, val.ty))
+            return false
+        }
+        final_ty = expected
+    }
+    if val.kind == 2 && ft.type_kind(&c.types, final_ty) == 6 && val.arr_ints.len != ft.type_count(&c.types, final_ty) {
+        c.body.cursor = pexprs[cid]
+        fail(&mut c, "constant fixed array length mismatch: expected " + ft.type_count(&c.types, final_ty).str() + ", got " + val.arr_ints.len.str())
+        return false
+    }
+    c.world.const_types[cid] = final_ty
+    c.world.const_kinds[cid] = val.kind
+    if val.kind == 0 {
+        c.world.const_ints[cid] = val.int_val
+        if const_int_type(final_ty) && !(unsigned.has(final_ty) && val.int_val < 0) && val.int_val >= 0 && val.int_val <= 1048576 {
+            c.types.const_lengths.put(c.world.const_names[cid].clone(), val.int_val)
+        }
+    } else if val.kind == 1 {
+        c.world.const_strings[cid] = val.str_val.clone()
+    } else {
+        c.world.const_ints[cid] = i64(val.arr_ints.len)
+        first := c.world.const_blobs.len
+        shift := unsigned.shift(storage_type(&c, val.arr_elem))
+        stride := i32(1).shl(shift)
+        for v in &val.arr_ints {
+            mut bits := v
+            for _ in 0..stride {
+                c.world.const_blobs.push(u8(bits.bit_and(255)))
+                bits = bits.shr(8)
+            }
+        }
+        c.world.const_blob_starts[cid] = first
+        c.world.const_blob_counts[cid] = c.world.const_blobs.len - first
+    }
+    states[cid] = 2
+    c.body.cursor = saved_cursor
+    true
+}
 fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     mut stack: []i32 = []
     for i in 0..c.world.tokens.kinds.len {
@@ -1347,6 +2293,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     mut declaration_trait_impls: []i32 = []
     mut declaration_c_variadic: []i32 = []
     mut resource_types: []i32 = []; mut resource_methods: []i32 = []
+    mut pending_const_type_toks: []i32 = []; mut pending_const_expr_toks: []i32 = []; mut pending_const_end_toks: []i32 = []
     mut matched_cond: []bool = []
     for _ in 0..c.specializations.conditional_impls.impl_types.len { matched_cond.push(false) }
     separators(&mut c)
@@ -1565,6 +2512,40 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             if c.ok { expect(&mut c, "}"); separators(&mut c) }
             continue
         }
+        if is(&c, "const") {
+            if unchecked || opaque || layout || resource || test || library != "" || req_caps != 0 || c_variadic >= 0 {
+                fail(&mut c, "invalid declaration attribute"); break
+            }
+            _ := advance(&mut c)
+            if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected constant name"); break }
+            cname := advance(&mut c)
+            if c.world.const_map.contains(cname) || c.world.functions.contains(cname) || type_id(&c, cname) >= 0 || traits.lookup(&c.traits, cname) >= 0 || cname == "TaskID" || rules.reserved(cname) {
+                fail(&mut c, "duplicate or reserved constant name"); break
+            }
+            mut ctype_tok := -1
+            if eat(&mut c, ":") {
+                ctype_tok = c.body.cursor
+                tend := syntax.type_end(&c.world.tokens, ctype_tok, c.world.tokens.kinds.len - 1)
+                if tend <= ctype_tok { fail(&mut c, "expected constant type"); break }
+                c.body.cursor = tend
+            }
+            expect(&mut c, "=")
+            if !c.ok { break }
+            cexpr_tok := c.body.cursor
+            cend_tok := const_expr_end(&c.world.tokens, cexpr_tok)
+            if cend_tok <= cexpr_tok { fail(&mut c, "expected constant expression"); break }
+            cid := c.world.const_names.len
+            c.world.const_map.put(cname.clone(), i64(cid))
+            c.world.const_names.push(move cname)
+            c.world.const_types.push(-1); c.world.const_kinds.push(0); c.world.const_ints.push(0)
+            c.world.const_strings.push(""); c.world.const_blob_starts.push(0); c.world.const_blob_counts.push(0)
+            pending_const_type_toks.push(ctype_tok)
+            pending_const_expr_toks.push(cexpr_tok)
+            pending_const_end_toks.push(cend_tok)
+            c.body.cursor = cend_tok
+            separators(&mut c)
+            continue
+        }
         what := advance(&mut c)
         if opaque && what != "struct" { fail(&mut c, "expected opaque struct"); break }
         if what != "fn" && what != "struct" && what != "enum" { fail(&mut c, "expected fn, struct, enum, trait or impl (imports must be loaded first)"); break }
@@ -1579,7 +2560,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         mut ty := -1
         if what != "fn" {
             reserved := c.specializations.reserved.remove(name)
-            if (!reserved && type_id(&c, name) >= 0) || traits.lookup(&c.traits, name) >= 0 { fail(&mut c, "duplicate type") }
+            if (!reserved && type_id(&c, name) >= 0) || c.world.const_map.contains(name) || traits.lookup(&c.traits, name) >= 0 { fail(&mut c, "duplicate type") }
             else if name == "TaskID" || rules.reserved(name) { fail(&mut c, "reserved type name") }
             mut kind := 2; if what == "enum" { kind = 3 }
             if reserved { ty = type_id(&c, name) } else { ty = add_type(&mut c, name, kind, 0) }
@@ -1588,7 +2569,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             if resource_method >= 0 { resource_types.push(ty); resource_methods.push(resource_method) }
             declaration_fns.push(-1)
         } else {
-            if c.world.functions.contains(name) || traits.lookup(&c.traits, name) >= 0 || rules.reserved(name) { fail(&mut c, "duplicate or reserved function name") }
+            if c.world.functions.contains(name) || c.world.const_map.contains(name) || traits.lookup(&c.traits, name) >= 0 || rules.reserved(name) { fail(&mut c, "duplicate or reserved function name") }
             fn_id := c.world.names.len
             c.world.function_owners.push(owner); c.world.test_functions.push(test)
             c.world.libraries.push(library.clone()); c.world.symbols.push(symbol.clone()); c.world.unsafe_functions.push(unchecked)
@@ -1608,6 +2589,15 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
         }
         while c.ok && !is(&c, "{") { if c.world.tokens.kinds[c.body.cursor] == .End { fail(&mut c, "missing declaration body"); break }; skip_token(&mut c) }
         if c.ok { skip_body(&mut c); separators(&mut c) }
+    }
+    if c.ok && pending_const_expr_toks.len > 0 {
+        mut const_states: []i32 = []
+        for _ in 0..pending_const_expr_toks.len { const_states.push(0) }
+        for cid in 0..pending_const_expr_toks.len {
+            if !eval_pending_const(&mut c, cid, &pending_const_type_toks, &pending_const_expr_toks, &pending_const_end_toks, &mut const_states, pending_const_expr_toks[cid]) {
+                break
+            }
+        }
     }
     for d in 0..declarations.len {
         if !c.ok { break }
@@ -1895,7 +2885,7 @@ fn float_literal(c: &mut Session, spelling: string, expected: i32) -> i32 {
 }
 fn format_float(c: &mut Session, ty: i32, source: i32) {
     id := i32(c.world.functions.get_or("__dunder_module_format_float_bits", -1))
-    task_edge(&mut c, id)
+    task_edge(&mut c, id, source)
     if c.validating_dead { return }
     if id < 0 { fail(&mut c, "missing floating formatter"); return }
     c.body.facts.needed.push(id)
@@ -2213,6 +3203,188 @@ fn raw_memory_type(c: &Session, name: string, start: i32) -> i32 {
     ty := type_id(&c, name[start..name.len])
     if ty < 0 || !foreign_scalar(&c, ty) { return -1 }; ty
 }
+fn enclosing_generic_instance(c: &Session) -> i32 {
+    if c.body.current_fn >= 0 && c.body.current_fn < c.specializations.function_instances.len {
+        return c.specializations.function_instances[c.body.current_fn]
+    }
+    -1
+}
+fn unify_generic_type(c: &Session, expr_id: i32, actual: i32, inferred: &mut []i32, self_def: i32) -> bool {
+    if expr_id < 0 || actual < 0 { return false }
+    gf := &c.specializations.generic_fns
+    form := gf.exprs.forms[expr_id]; val := gf.exprs.values[expr_id]
+    if form == .Name {
+        if val == -1 && self_def >= 0 {
+            if actual <= 0 || actual >= c.specializations.type_instance_def.len { return false }
+            if c.specializations.type_instance_def[actual] != self_def { return false }
+            if c.specializations.type_instance_arg_counts[actual] != inferred.len { return false }
+            astart := c.specializations.type_instance_arg_starts[actual]
+            for i in 0..inferred.len {
+                arg_ty := c.specializations.type_instance_args[astart + i]
+                if inferred[i] < 0 { inferred[i] = arg_ty }
+                else if inferred[i] != arg_ty { return false }
+            }
+            return true
+        }
+        if val <= -2 {
+            p := -2 - val
+            if p < 0 || p >= inferred.len { return false }
+            if inferred[p] < 0 { inferred[p] = actual; return true }
+            return inferred[p] == actual
+        }
+        if val == -1000 {
+            concrete := type_id(&c, gf.exprs.names[expr_id])
+            return concrete >= 0 && concrete == actual
+        }
+        return val == actual
+    }
+    cstart := gf.exprs.starts[expr_id]; ccount := gf.exprs.starts[expr_id + 1] - cstart
+    if actual <= 0 && form != .Tuple { return false }
+    akind := ft.type_kind(&c.types, actual)
+    if form == .Shared { return akind == 4 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def) }
+    if form == .Exclusive { return akind == 5 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def) }
+    if form == .Array { return akind == 1 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def) }
+    if form == .Fixed {
+        if akind != 6 || ccount != 1 { return false }
+        mut want_len := val
+        if want_len < 0 { want_len = i32(c.types.const_lengths.get_or(gf.exprs.names[expr_id], -1)) }
+        return want_len >= 0 && ft.type_count(&c.types, actual) == want_len &&
+            unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def)
+    }
+    if form == .Consume { return ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], actual, &mut inferred, self_def) }
+    if form == .Tuple {
+        if !ft.is_tuple(&c.types, actual) || ft.type_count(&c.types, actual) != ccount { return false }
+        fstart := ft.type_start(&c.types, actual)
+        for i in 0..ccount {
+            if !unify_generic_type(&c, gf.exprs.children[cstart + i], c.types.field_types[fstart + i], &mut inferred, self_def) { return false }
+        }
+        return true
+    }
+    if form == .Function || form == .Foreign {
+        want_k := if form == .Foreign { 8 } else { 9 }
+        if akind != want_k || ccount == 0 { return false }
+        pcount := ccount - 1
+        if ft.type_count(&c.types, actual) != pcount { return false }
+        astart := ft.type_start(&c.types, actual)
+        for i in 0..pcount {
+            if !unify_generic_type(&c, gf.exprs.children[cstart + i], ft.parameter_type(&c.types, astart + i), &mut inferred, self_def) { return false }
+        }
+        return unify_generic_type(&c, gf.exprs.children[cstart + pcount], ft.type_base(&c.types, actual), &mut inferred, self_def)
+    }
+    if val == -1 {
+        return akind == 22 && ccount == 1 && unify_generic_type(&c, gf.exprs.children[cstart], ft.type_base(&c.types, actual), &mut inferred, self_def)
+    }
+    if actual >= c.specializations.type_instance_def.len || c.specializations.type_instance_def[actual] != val { return false }
+    if c.specializations.type_instance_arg_counts[actual] != ccount { return false }
+    astart := c.specializations.type_instance_arg_starts[actual]
+    for i in 0..ccount {
+        if !unify_generic_type(&c, gf.exprs.children[cstart + i], c.specializations.type_instance_args[astart + i], &mut inferred, self_def) { return false }
+    }
+    true
+}
+fn substitute_generic_type(c: &mut Session, expr_id: i32, inferred: &[]i32, self_def: i32) -> i32 {
+    if expr_id < 0 { return 0 }
+    form := c.specializations.generic_fns.exprs.forms[expr_id]
+    val := c.specializations.generic_fns.exprs.values[expr_id]
+    if form == .Name {
+        if val == -1 && self_def >= 0 {
+            for t in 0..c.specializations.type_instance_def.len {
+                if c.specializations.type_instance_def[t] != self_def { continue }
+                if c.specializations.type_instance_arg_counts[t] != inferred.len { continue }
+                astart := c.specializations.type_instance_arg_starts[t]
+                mut ok := true
+                for i in 0..inferred.len {
+                    if inferred[i] < 0 || c.specializations.type_instance_args[astart + i] != inferred[i] { ok = false; break }
+                }
+                if ok { return t }
+            }
+            return -1
+        }
+        if val <= -2 {
+            p := -2 - val
+            if p < 0 || p >= inferred.len || inferred[p] < 0 { return -1 }
+            return inferred[p]
+        }
+        if val == -1000 {
+            cname := c.specializations.generic_fns.exprs.names[expr_id].clone()
+            return type_id(&c, cname)
+        }
+        return val
+    }
+    cstart := c.specializations.generic_fns.exprs.starts[expr_id]
+    ccount := c.specializations.generic_fns.exprs.starts[expr_id + 1] - cstart
+    if form == .Consume {
+        if ccount != 1 { return -1 }
+        child := c.specializations.generic_fns.exprs.children[cstart]
+        return substitute_generic_type(&mut c, child, &inferred, self_def)
+    }
+    if form == .Shared || form == .Exclusive || form == .Array || form == .Fixed {
+        if ccount != 1 { return -1 }
+        child := c.specializations.generic_fns.exprs.children[cstart]
+        base := substitute_generic_type(&mut c, child, &inferred, self_def)
+        if base <= 0 { return -1 }
+        if form == .Shared { return compound(&mut c, 4, base) }
+        if form == .Exclusive { return compound(&mut c, 5, base) }
+        if form == .Array {
+            if !ft.array_element(&c.types, base) { return -1 }
+            return compound(&mut c, 1, base)
+        }
+        mut want_len := val
+        if want_len < 0 {
+            lname := c.specializations.generic_fns.exprs.names[expr_id].clone()
+            want_len = i32(c.types.const_lengths.get_or(lname, -1))
+        }
+        if want_len < 0 { return -1 }
+        return fixed(&mut c, base, want_len)
+    }
+    if form == .Tuple {
+        mut fields: []i32 = []
+        for i in 0..ccount {
+            child := c.specializations.generic_fns.exprs.children[cstart + i]
+            fty := substitute_generic_type(&mut c, child, &inferred, self_def)
+            if fty <= 0 || !ft.array_element(&c.types, fty) { return -1 }
+            fields.push(fty)
+        }
+        ty := ft.tuple_type(&mut c.types, &fields)
+        if c.types.error != "" { c.types.error = ""; return -1 }
+        ft.finish_tuples(&mut c.types)
+        return ty
+    }
+    if form == .Function || form == .Foreign {
+        if ccount == 0 { return -1 }
+        pcount := ccount - 1
+        mut params: []i32 = []
+        for i in 0..pcount {
+            child := c.specializations.generic_fns.exprs.children[cstart + i]
+            pty := substitute_generic_type(&mut c, child, &inferred, self_def)
+            if pty <= 0 { return -1 }
+            params.push(pty)
+        }
+        rchild := c.specializations.generic_fns.exprs.children[cstart + pcount]
+        ret := substitute_generic_type(&mut c, rchild, &inferred, self_def)
+        if ret < 0 { return -1 }
+        source := type_reader.borrow_source(&mut c.types, &params)
+        kind := if form == .Foreign { 8 } else { 9 }
+        return callable_with_parameter(&mut c, &params, ret, kind, source)
+    }
+    if val == -1 {
+        if ccount != 1 { return -1 }
+        child := c.specializations.generic_fns.exprs.children[cstart]
+        base := substitute_generic_type(&mut c, child, &inferred, self_def)
+        if base <= 0 { return -1 }
+        return compound(&mut c, 22, base)
+    }
+    mut spec := c.specializations.generic_fns.exprs.names[expr_id] + "<"
+    for i in 0..ccount {
+        if i > 0 { spec = spec + ", " }
+        child := c.specializations.generic_fns.exprs.children[cstart + i]
+        aty := substitute_generic_type(&mut c, child, &inferred, self_def)
+        if aty < 0 { return -1 }
+        spec = spec + ft.type_spelling(&c.types, aty)
+    }
+    spec = spec + ">"
+    type_id(&c, spec)
+}
 fn call(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     may_invalidate_operand(&mut c)
     mut covered := false
@@ -2255,6 +3427,107 @@ fn bind_closure(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut op
     if c.loans.active { c.body.facts.taken.push(f) }
     install_callable(&mut c, f, env)
     c.world.ffi_types[f]
+}
+fn infer_generic_call(c: &mut Session, gfn: i32, raw_name: string, mname: string, site_tok: i32, expected: i32, self_def: i32,
+    catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    shown_base := diagnostics.display_symbol(&c.sources, raw_name)
+    shown := if mname != "" { shown_base + "::" + mname } else { shown_base.clone() }
+    if !c.code.checking || !c.specializations.generic_fns.valid[gfn] {
+        while c.ok && !is(&c, ")") { skip_token(&mut c) }
+        _ := eat(&mut c, ")")
+        if mname != "" {
+            fail(&mut c, "cannot infer type arguments for '" + shown + "'; requires explicit type arguments, e.g. '" + shown_base + "<...>::" + mname + "(...)'")
+        } else {
+            fail(&mut c, "cannot infer type arguments for generic function '" + shown + "'; pass explicit type arguments like '" + shown + "<...>'")
+        }
+        c.error_at = c.world.tokens.starts[site_tok]
+        return 0
+    }
+    tcount := c.specializations.generic_fns.type_param_counts[gfn]
+    pstart := c.specializations.generic_fns.param_starts[gfn]
+    pcount := c.specializations.generic_fns.param_counts[gfn]
+    mut inferred: []i32 = []
+    for _ in 0..tcount { inferred.push(-1) }
+    mut provided := 0
+    while c.ok && !is(&c, ")") {
+        if provided >= pcount { fail(&mut c, "too many arguments"); break }
+        arg_tok := c.body.cursor; consuming := eat(&mut c, "move")
+        pexpr := c.specializations.generic_fns.param_exprs[pstart + provided]
+        pform := c.specializations.generic_fns.exprs.forms[pexpr]
+        implicit_borrow := pform == .Shared && !starts_borrow(&c)
+        mut target_expr := pexpr
+        if implicit_borrow {
+            s := c.specializations.generic_fns.exprs.starts[pexpr]
+            if s < c.specializations.generic_fns.exprs.starts[pexpr + 1] {
+                target_expr = c.specializations.generic_fns.exprs.children[s]
+            }
+        }
+        if consuming && (pform == .Shared || pform == .Exclusive) {
+            fail(&mut c, "move argument requires a consuming parameter"); return 0
+        }
+        mut context := substitute_generic_type(&mut c, target_expr, &inferred, self_def)
+        if context < 0 { context = 0 }
+        prev_addr := c.body.place.taking_address
+        c.body.place.taking_address = implicit_borrow
+        actual := expression(&mut c, 0, context, &catalog, &mut inline_work, &mut model)
+        c.body.place.taking_address = prev_addr
+        if !c.ok { return 0 }
+        if !unify_generic_type(&c, target_expr, actual, &mut inferred, self_def) {
+            want_ty := substitute_generic_type(&mut c, target_expr, &inferred, self_def)
+            if want_ty >= 0 {
+                same(&mut c, want_ty, actual)
+                return 0
+            }
+            fail(&mut c, "cannot unify argument " + (provided + 1).str() + " for generic function '" + shown + "' (got '" + ft.type_spelling(&c.types, actual) + "')")
+            c.error_at = c.world.tokens.starts[arg_tok]
+            return 0
+        }
+        provided = provided + 1
+        if !eat(&mut c, ",") { break }
+    }
+    expect(&mut c, ")")
+    if !c.ok { return 0 }
+    if provided != pcount { fail(&mut c, "wrong argument count"); return 0 }
+    fc.clear_expr(&mut c.body.expr); fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place)
+    ret_expr := c.specializations.generic_fns.ret_exprs[gfn]
+    if expected > 0 && ret_expr >= 0 {
+        _ := unify_generic_type(&c, ret_expr, expected, &mut inferred, self_def)
+    }
+    mut missing := false
+    mut spec := ""
+    for p in 0..tcount {
+        if inferred[p] < 0 { missing = true; break }
+        if p > 0 { spec = spec + "\n" }
+        spec = spec + ft.canonical_spelling(&c.types, inferred[p])
+    }
+    if missing {
+        if mname != "" {
+            fail(&mut c, "cannot infer type arguments for '" + shown + "'; requires explicit type arguments, e.g. '" + shown_base + "<...>::" + mname + "(...)'")
+        } else {
+            fail(&mut c, "cannot infer type arguments for generic function '" + shown + "'; pass explicit type arguments like '" + shown + "<...>'")
+        }
+        c.error_at = c.world.tokens.starts[site_tok]
+        return 0
+    }
+    prev_demanded := c.demanded_inferred_args.len
+    inst := enclosing_generic_instance(&c)
+    lkey := inst.str() + "@" + c.world.tokens.starts[site_tok].str()
+    ikey := c.specializations.inferred_lookup.get_or(lkey, "")
+    if ikey != "" && !c.demanded_inferred_keys.contains(ikey) {
+        c.demanded_inferred_keys.put(ikey.clone(), i64(c.demanded_inferred_args.len))
+        c.demanded_inferred_args.push(move spec)
+    }
+    if ret_expr < 0 { return 0 }
+    ret_ty := substitute_generic_type(&mut c, ret_expr, &inferred, self_def)
+    if ret_ty >= 0 {
+        if owned(&c, ret_ty) { return temporary(&mut c, ret_ty) }
+        return ret_ty
+    }
+    if expected > 0 { return expected }
+    if c.demanded_inferred_args.len > prev_demanded { return 1 }
+    fail(&mut c, "resolving inferred return type for '" + shown + "'")
+    c.error_at = c.world.tokens.starts[site_tok]
+    0
 }
 fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function, covered: &mut bool) -> i32 {
     expect(&mut c, "(")
@@ -2338,7 +3611,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         c.body.place.taking_address = previous_address
         base := borrows.root(&c.body.places, c.body.places.current)
         if base < 0 { fail(&mut c, "addr requires a stored place"); return 0 }
-        if write && is_for_locked(&c, base) { fail(&mut c, "cannot mutably borrow a collection while iterating over it"); return 0 }
+        if write && is_for_locked(&c, owner_path(&c, c.body.places.current)) { fail(&mut c, "cannot mutably borrow a collection while iterating over it"); return 0 }
         if write && !writable_loan(&mut c, c.body.places.current) { return 0 }
         if write { c.body.mutations.push(base) }
         if c.loans.active {
@@ -2420,7 +3693,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         return length_value(&mut c, ty, token)
     }
     if name == "print" { covered = true; token := c.body.cursor - 2; source := c.world.tokens.starts[token]
-        task_effect(&mut c, 256)
+        task_effect_at(&mut c, 256, token)
         value := expression(&mut c, 0, 0, &catalog, &mut inline_work, &mut model); expect(&mut c, ")")
         ty := read_scalar_result(&mut c, value, token)
         if ty >= 1 && ty <= 12 {
@@ -2454,7 +3727,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         recv_slot := alloc_arg_slot(&mut c); arm.store(&mut c.code, recv_slot, 0)
         args: []i32 = [recv_slot]
         c.body.facts.needed.push(str_fn)
-        task_edge(&mut c, str_fn)
+        task_edge(&mut c, str_fn, source)
         source_call.lower(&mut c.code, c.fn_labels[str_fn], -1, -1, &args, c.world.ffi_types[str_fn], 4, source)
         release_arg_slots(&mut c, &args)
         _ := temporary(&mut c, 4)
@@ -2501,7 +3774,14 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         if ft.type_kind(&c.types, signature) != 9 { fail(&mut c, "local value is not callable"); return 0 }
         address = slot(&mut c); arm.load(&mut c.code, places.local_home(c.body.places.arena.locals[callee])); arm.store(&mut c.code, address, 0)
     } else {
-        if f < 0 { fail(&mut c, "unknown function '" + name + "'"); c.error_at = c.world.tokens.starts[c.body.cursor - 2]; return 0 }
+        call_token := c.body.cursor - 2
+        if f < 0 {
+            gfn := i32(c.specializations.generic_fns.defs.get_or(name, -1))
+            if gfn >= 0 {
+                return infer_generic_call(&mut c, gfn, name, "", call_token, expected, -1, &catalog, &mut inline_work, &mut model)
+            }
+            fail(&mut c, "unknown function '" + diagnostics.display_symbol(&c.sources, name) + "'"); c.error_at = c.world.tokens.starts[call_token]; return 0
+        }
         check_function_caps(&mut c, f, c.body.cursor - 2)
         if !c.ok { return 0 }
         if c.world.unsafe_functions[f] && !c.body.unsafe_scope { fail(&mut c, "call requires unsafe"); return 0 }
@@ -2644,7 +3924,7 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
         arm.load(&mut c.code, address); copy_value(&mut c, signature)
         pin := slot(&mut c); save_owner(&mut c, pin, signature, true)
     }
-    if address >= 0 || wasm_sig >= 0 { task_edge(&mut c, -1) } else { task_edge(&mut c, f) }
+    if address >= 0 || wasm_sig >= 0 { task_edge(&mut c, -1, c.world.tokens.starts[call_token]) } else { task_edge(&mut c, f, c.world.tokens.starts[call_token]) }
     first := ft.type_start(&c.types, signature); count := ft.type_count(&c.types, signature)
     source_parameter := ft.return_borrow_parameter(&c.types, signature)
     mut result_origin := -1
@@ -2677,7 +3957,25 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
             }
         } else {
             same(&mut c, want, ty)
-            if ft.move_only(&c.types, want) && c.body.expr.owner < 0 && !consuming { fail(&mut c, "consuming parameter requires 'move value' or a fresh owned expression"); return 0 }
+            if !c.ok && want != ty && ft.type_kind(&c.types, want) == 5 && ft.type_base(&c.types, want) == ty && c.error_note == "" {
+                binding := borrows.root(&c.body.places, c.body.places.current)
+                if binding >= 0 && binding < c.body.locals.names.len {
+                    bname := c.body.locals.names[binding].clone()
+                    decl_tok := c.body.locals.tokens[binding]
+                    if decl_tok >= 0 && decl_tok < c.world.tokens.starts.len { c.error_note_at = c.world.tokens.starts[decl_tok] }
+                    if ft.type_kind(&c.types, c.body.locals.types[binding]) == 5 {
+                        c.error_note = "'" + bname + "' is a '&mut' parameter that auto-dereferences; pass '&mut " + bname + "' to forward it"
+                    } else if c.body.locals.mutable[binding] {
+                        c.error_note = "pass '&mut " + bname + "' for a mutable borrow parameter"
+                    } else {
+                        c.error_note = "prefix the argument with '&mut ' to pass a mutable borrow (and declare '" + bname + "' with 'mut')"
+                    }
+                } else {
+                    c.error_note = "prefix the argument with '&mut ' to pass a mutable borrow"
+                }
+                return 0
+            }
+            if ft.move_only(&c.types, want) && !is_fresh_owned(&c) && !consuming { fail(&mut c, "consuming parameter requires 'move value' or a fresh owned expression"); return 0 }
             take_value(&mut c, ty)
         }
         if provided == source_parameter {
@@ -2826,7 +4124,12 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             place = returned_place(&mut c, ty, first_token)
             ty = ft.type_base(&c.types, ty); at = first_token; pending = true; materialized = 0
         }
+        const_arr := c.body.expr.const_array
         fc.clear_expr_value(&mut c.body.expr)
+        if const_arr && is(&c, ".") && c.body.cursor + 2 < c.world.tokens.texts.len &&
+            c.world.tokens.texts[c.body.cursor + 1] == "iter" && c.world.tokens.texts[c.body.cursor + 2] == "(" {
+            c.body.expr.const_array = true
+        }
         if eat(&mut c, "(") {
             if model.probing && decline_projection(&mut c, &mut model) { break }
             if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
@@ -2848,7 +4151,16 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
             arm.push_temp(&mut c.code, 0)
             effects := c.body.mutations.len
             previous_address := c.body.place.taking_address; c.body.place.taking_address = false
-            if view && is(&c, "..") { arm.imm(&mut c.code, 0, 0) }
+            if is(&c, "..") {
+                if view { arm.imm(&mut c.code, 0, 0) }
+                else {
+                    c.body.place.taking_address = previous_address
+                    if collection(&c, ty) { fail(&mut c, "open-ended array slice requires a borrow; use '&arr[..end]'") }
+                    else if ty == 4 { fail(&mut c, "open-ended string slice requires a borrow or explicit start; use '&text[..end]' or 'text[0..end]'") }
+                    else { fail(&mut c, "slice requires a string (or use '&arr[start..end]' for an array view)") }
+                    c.error_at = c.world.tokens.starts[subscript_at]; break
+                }
+            }
             else { index_type := expression(&mut c, 1, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, index_type) }
             if local_borrows.is_transient(&c.body.local_loans, borrows.root(&c.body.places, place)) &&
                 borrows.changed(&c.body.mutations, effects, c.body.mutations.len, source_root_id) {
@@ -2895,7 +4207,20 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     fc.clear_expr_value(&mut c.body.expr); projection_address = -1; temporary_root = -1
                     break
                 }
-                if ty != 4 { c.body.place.taking_address = previous_address; fail(&mut c, "slice requires a string") }
+                if ty != 4 {
+                    c.body.place.taking_address = previous_address
+                    if collection(&c, ty) {
+                        fail(&mut c, with_clone_hint(&c, ty, "array slicing requires a borrow; use '&arr[start..end]' for a borrowed view", " or '(&arr[start..end]).clone()' for an owned copy"))
+                    } else {
+                        fail(&mut c, "slice requires a string (or use '&arr[start..end]' for an array view)")
+                    }
+                    c.error_at = c.world.tokens.starts[subscript_at]; break
+                }
+                if is(&c, "]") {
+                    c.body.place.taking_address = previous_address
+                    fail(&mut c, "open-ended string slice requires a borrow or explicit end; use '&text[start..]' or 'text[start..text.len]'")
+                    c.error_at = c.world.tokens.starts[subscript_at]; break
+                }
                 arm.push_temp(&mut c.code, 0); last := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, last); expect(&mut c, "]")
                 c.body.place.taking_address = previous_address
                 arm.mov(&mut c.code, 2, 0); arm.pop_temp(&mut c.code, 1); arm.pop_temp(&mut c.code, 0); arm.intrinsic_call(&mut c.code, c.runtime.string_slice, .Slice, 4, 4, c.world.tokens.starts[subscript_at]); saved_string := temporary(&mut c, 4)
@@ -2953,20 +4278,27 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                 if pending { lower_place(&mut c, place, materialized, .Value, at); pending = false }
                 ty = length_value(&mut c, ty, c.body.cursor - 1); place = 0; fc.clear_rvalue_place(&mut c.body.place)
             } else if ft.type_kind(&c.types, ty) == 2 {
-                opaque_access(&mut c, ty)
-                if member < 0 { fail(&mut c, "unknown field '" + name + "'") }
-                else if place == 0 {
-                    if ft.cleanup_method(&c.types, ty) >= 0 { temporary_root = -1 }
-                    projected := field_place(&mut c, 0, ty, member, c.body.cursor - 1)
-                    ty = load_field(&mut c, ty, member, .ValueAndAddress, c.body.cursor - 1, projected)
-                    projection_address = c.body.place.address
+                if member < 0 {
+                    if !fail_method_without_parens(&mut c, ty, name, c.body.cursor - 1) {
+                        opaque_access(&mut c, ty)
+                        fail(&mut c, "unknown field '" + name + "'")
+                    }
+                } else {
+                    opaque_access(&mut c, ty)
+                    if place == 0 {
+                        if ft.cleanup_method(&c.types, ty) >= 0 { temporary_root = -1 }
+                        projected := field_place(&mut c, 0, ty, member, c.body.cursor - 1)
+                        ty = load_field(&mut c, ty, member, .ValueAndAddress, c.body.cursor - 1, projected)
+                        projection_address = c.body.place.address
+                    } else {
+                        if !pending { materialized = place; pending = true }
+                        place = field_place(&mut c, place, ty, member, c.body.cursor - 1)
+                        ty = c.types.field_types[member]
+                    }
                 }
-                else {
-                    if !pending { materialized = place; pending = true }
-                    place = field_place(&mut c, place, ty, member, c.body.cursor - 1)
-                    ty = c.types.field_types[member]
-                }
-            } else { fail(&mut c, "unknown member '" + name + "'") }
+            } else if !fail_method_without_parens(&mut c, ty, name, c.body.cursor - 1) {
+                fail(&mut c, "unknown member '" + name + "'")
+            }
         }
     }
     if pending && c.ok {
@@ -2983,6 +4315,44 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
     c.body.expr.move_projection = projection_address; c.body.expr.move_temporary = temporary_root
     c.body.places.current = place; c.body.places.source = at
     c.body.depth = c.body.depth - 1; ty
+}
+fn fail_method_without_parens(c: &mut Session, ty: i32, name: string, tok: i32) -> bool {
+    impl_fn := impl_method(&c, ty, name)
+    if impl_fn >= 0 {
+        if !c.world.impl_has_self[impl_fn] {
+            fail(&mut c, "'" + name + "' is an associated function on '" + ft.type_spelling(&c.types, ty) + "', not a field; call '" + ft.type_spelling(&c.types, ty) + "::" + name + "(...)'")
+        } else {
+            fail(&mut c, "cannot access method '" + name + "' without calling it; use '." + name + "()'")
+        }
+        c.error_at = c.world.tokens.starts[tok]
+        return true
+    }
+    kind := ft.type_kind(&c.types, ty)
+    mut is_builtin := name == "clone" && (ty == 4 || collection(&c, ty) || kind == 2 || kind == 3 || kind == 6 || kind == 7)
+    if !is_builtin && ty == 4 {
+        is_builtin = name == "str" || name == "bytes" || name == "runes" || name == "slice"
+    } else if !is_builtin && ty == 3 {
+        is_builtin = name == "str"
+    } else if !is_builtin && floats.has(ty) {
+        is_builtin = name == "str" || name == "to_bits" || name == "is_sign_negative" || name == "abs" || name == "sqrt" ||
+            name == "floor" || name == "ceil" || name == "round" || name == "round_ties_even" || name == "trunc" ||
+            name == "is_nan" || name == "is_finite" || name == "is_infinite"
+    } else if !is_builtin && (ty == 1 || ty == 2 || ty == 5 || unsigned.has(ty)) {
+        is_builtin = name == "str" || integers.method(name) != .Unknown
+    } else if !is_builtin && kind == 1 {
+        is_builtin = name == "cap" || name == "swap" || name == "iter" || name == "push" || name == "reserve" ||
+            name == "pop" || name == "remove" || name == "clear" || bundled.prelude_method(name)
+    } else if !is_builtin && kind == 6 {
+        is_builtin = name == "swap" || name == "iter" || bundled.prelude_method(name)
+    } else if !is_builtin && ft.is_tuple(&c.types, ty) {
+        is_builtin = bundled.prelude_method(name)
+    }
+    if is_builtin {
+        fail(&mut c, "cannot access method '" + name + "' without calling it; use '." + name + "()'")
+        c.error_at = c.world.tokens.starts[tok]
+        return true
+    }
+    false
 }
 fn enum_type(c: &Session, ty: i32) -> bool { ft.enum_type(&c.types, ty) }
 fn extract_result(c: &mut Session, ty: i32, value: i32, box: i32, at: i32) {
@@ -3061,7 +4431,10 @@ fn enumeration(c: &mut Session, ty: i32, catalog: &opt_inline.View, inline_work:
     pending := c.body.pending.slots.len
     stage_owner(&mut c, .Storage, index, ty, 0)
     if count > 0 {
-        expect(&mut c, "(")
+        if !eat(&mut c, "(") {
+            fail(&mut c, "variant '." + name + "' requires " + count.str() + " payload argument(s); write '." + name + "(...)'")
+            c.error_at = source; return ty
+        }
         for i in 0..count {
             if i > 0 { expect(&mut c, ",") }
             payload_at := c.body.cursor; pt := c.types.payload_types[c.types.payload_starts[found] + i]
@@ -3425,8 +4798,22 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         if found < 0 || (next == .Symbol && c.world.tokens.texts[token + 1] == "::") { nominal = resolve_type_name(&c, name) }
         if eat(&mut c, "::") {
             if nominal < 0 {
+                if c.world.tokens.kinds[c.body.cursor] == .Name {
+                    mname := c.world.tokens.texts[c.body.cursor].clone()
+                    gfn := i32(c.specializations.generic_fns.defs.get_or(name + "::" + mname, -1))
+                    if gfn >= 0 {
+                        _ := advance(&mut c)
+                        shown_base := diagnostics.display_symbol(&c.sources, name)
+                        if !eat(&mut c, "(") {
+                            fail(&mut c, "cannot infer type arguments for '" + shown_base + "::" + mname + "'; requires explicit type arguments, e.g. '" + shown_base + "<...>::" + mname + "'")
+                            c.error_at = c.world.tokens.starts[token]; return 0
+                        }
+                        self_def := c.specializations.generic_fns.catalog_defs[gfn]
+                        return infer_generic_call(&mut c, gfn, name, mname, token, expected, self_def, &catalog, &mut inline_work, &mut model)
+                    }
+                }
                 if name == "Self" { fail(&mut c, "Self is only valid inside an impl block") }
-                else { fail(&mut c, "unknown type '" + name + "'") }
+                else { fail(&mut c, "unknown type '" + diagnostics.display_symbol(&c.sources, name) + "'") }
                 c.error_at = c.world.tokens.starts[token]; return 0
             }
             if c.world.tokens.kinds[c.body.cursor] != .Name { fail(&mut c, "expected method name after '::'"); return 0 }
@@ -3519,9 +4906,52 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             if f >= 0 && c.world.libraries[f] != "" { may_invalidate_operand(&mut c); import_address(&mut c, f); return c.world.ffi_types[f] }
         }
         if found < 0 {
+            cid := i32(c.world.const_map.get_or(name, -1))
+            if cid >= 0 {
+                ckind := c.world.const_kinds[cid]; cty := c.world.const_types[cid]
+                if ckind == 0 {
+                    if model.recording {
+                        if cty != 1 && cty != 2 { model.recording = false }
+                        else { _ := typed.node(&mut model, 1, cty, -1, -1, -1, c.world.const_ints[cid], -1, token) }
+                    }
+                    if !c.code.checking || c.code.prefixing { arm.imm(&mut c.code, 0, c.world.const_ints[cid]) }
+                    place = 0; fc.clear_rvalue_place(&mut c.body.place); return cty
+                }
+                if ckind == 1 {
+                    if model.probing && decline_projection(&mut c, &mut model) { return 0 }
+                    target := arm.label(&mut c.code)
+                    if !c.code.checking { c.body.facts.const_string_ids.push(cid); c.body.facts.const_string_labels.push(target) }
+                    arm.branch(&mut c.code, target, 20)
+                    place = 0; fc.clear_rvalue_place(&mut c.body.place); return temporary(&mut c, 4)
+                }
+                if model.probing && decline_projection(&mut c, &mut model) { return 0 }
+                may_invalidate_operand(&mut c)
+                target := arm.label(&mut c.code)
+                if !c.code.checking { c.body.facts.const_blob_ids.push(cid); c.body.facts.const_blob_labels.push(target) }
+                for _ in 0..5 { _ := slot(&mut c) }
+                data_home := slot(&mut c)
+                arm.branch(&mut c.code, target, 20); arm.store(&mut c.code, data_home, 0)
+                arm.imm(&mut c.code, 0, c.world.const_ints[cid]); arm.store(&mut c.code, data_home - 1, 0); arm.store(&mut c.code, data_home - 2, 0)
+                elem_ty := ft.type_base(&c.types, cty)
+                shift := unsigned.shift(storage_type(&c, elem_ty))
+                arm.imm(&mut c.code, 0, i64(shift)); arm.store(&mut c.code, data_home - 3, 0)
+                arm.store(&mut c.code, data_home - 4, 31); arm.store(&mut c.code, data_home - 5, 31)
+                arm.address(&mut c.code, data_home)
+                place = 0; fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
+                c.body.expr.const_array = true
+                return cty
+            }
             if name == "Self" { fail(&mut c, "expected 'Self::...', 'Self { ... }', or 'Self.Variant'"); c.error_at = c.world.tokens.starts[token]; return 0 }
             f := i32(c.world.functions.get_or(name, -1))
-            if f < 0 { fail(&mut c, "unknown local '" + name + "'"); c.error_at = c.world.tokens.starts[c.body.cursor - 1]; return 0 }
+            if f < 0 {
+                if c.specializations.generic_fns.defs.contains(name) {
+                    shown := diagnostics.display_symbol(&c.sources, name)
+                    fail(&mut c, "generic function '" + shown + "' requires explicit type arguments")
+                } else {
+                    fail(&mut c, "unknown local '" + diagnostics.display_symbol(&c.sources, name) + "'")
+                }
+                c.error_at = c.world.tokens.starts[token]; return 0
+            }
             check_function_caps(&mut c, f, c.body.cursor - 1)
             if !c.ok { return 0 }
             if c.world.unsafe_functions[f] { fail(&mut c, "unsafe function requires a foreign function pointer"); return 0 }
@@ -3580,7 +5010,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             fc.clear_rvalue_place(&mut c.body.place)
             return compound(&mut c, 4, ty)
         }
-        if mutable && is_for_locked(&c, base) { fail(&mut c, "cannot mutably borrow a collection while iterating over it"); return 0 }
+        if mutable && is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutably borrow a collection while iterating over it"); return 0 }
         if mutable && !writable_loan(&mut c, place) { return 0 }
         if mutable { c.body.mutations.push(base) }
         if ft.type_kind(&c.types, ty)==21 {
@@ -3591,7 +5021,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
             fail(&mut c,"borrow a value-compatible scratch element or record field");return 0
         }
         if c.body.place.address < 0 { fail(&mut c, "borrow requires a stored value"); return 0 }
-        if mutable && !c.body.place.writable { fail(&mut c, "mutable borrow requires mut or &mut") }
+        if mutable && !c.body.place.writable { fail_immutable_binding(&mut c, "mutable borrow requires mut or &mut", base) }
         c.body.loan.path = owner_path(&c, place); c.body.loan.root = source_root(&c, place)
         c.body.loan.origin = loan_origin(&c, place)
         c.body.loan.constrained = local_borrows.shared(&c.body.local_loans, base)
@@ -3659,7 +5089,8 @@ fn load_binding(c: &mut Session, found: i32, access: borrows.Access, token: i32,
             if access != .Address { inline_value(&mut c, ty, access, token) }
         } else if access != .Address { bound_place(&mut c, .Read, borrows.local_id(found), i32(access), token) }
     } else {
-        c.body.place.writable = c.body.locals.mutable[found]; c.body.place.direct = true; c.body.place.address = home
+        c.body.place.writable = c.body.locals.mutable[found] && !fc.pattern_loan(&c.body, found)
+        c.body.place.direct = true; c.body.place.address = home
         if access != .Address && (!c.code.checking || c.code.prefixing) { bound_place(&mut c, .LocalRead, borrows.local_id(found), i32(access), token) }
     }
 }
@@ -3817,9 +5248,9 @@ fn method_impl(c: &mut Session, f: i32, ty: i32, place: i32, materialized: i32, 
         lower_place(&mut c, place, 0, .ValueAndAddress, recv_tok)
         base := borrows.root(&c.body.places, place)
         if base < 0 { fail(&mut c, "mutable method requires a stored variable, field or array element"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
-        if is_for_locked(&c, base) { fail(&mut c, "cannot mutate a collection while iterating over it"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
+        if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutate a collection while iterating over it"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
         if c.body.place.address < 0 { fail(&mut c, "borrow requires a stored value"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
-        if !c.body.place.writable { fail(&mut c, "mutable method requires mut or &mut"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
+        if !c.body.place.writable { fail_immutable_binding(&mut c, "mutable method requires mut or &mut", base); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
         if !writable_loan(&mut c, place) { return 0 }
         if !ownership.available(&c.body.ownership, owner_path(&c, place)) { fail(&mut c, "cannot borrow a moved value"); c.error_at = c.world.tokens.starts[method_tok]; return 0 }
         c.body.mutations.push(base)
@@ -3871,9 +5302,9 @@ fn replace_value(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut o
     if !c.ok { return 0 }
     place := c.body.places.current; root := borrows.root(&c.body.places, place)
     if root < 0 || c.body.place.address < 0 { fail(&mut c, "replace requires a named variable, field or array element"); return 0 }
-    if !c.body.place.writable { fail(&mut c, "replace requires mutable storage"); return 0 }
+    if !c.body.place.writable { fail_immutable_binding(&mut c, "replace requires mutable storage", root); return 0 }
     if !writable_loan(&mut c, place) { return 0 }
-    if is_for_locked(&c, root) { fail(&mut c, "cannot replace a collection while iterating over it"); return 0 }
+    if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot replace a collection while iterating over it"); return 0 }
     if c.body.place.scratch != 0 || ft.type_kind(&c.types, ty) == 20 || ft.type_kind(&c.types, ty) == 21 {
         fail(&mut c, "replace does not support region-backed storage"); return 0
     }
@@ -3884,8 +5315,8 @@ fn replace_value(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut o
     effects := c.body.mutations.len
     consuming := eat(&mut c, "move")
     actual := expression(&mut c, 0, ty, &catalog, &mut inline_work, &mut model); same(&mut c, ty, actual)
-    if ft.move_only(&c.types, ty) && c.body.expr.owner < 0 && !consuming {
-        fail(&mut c, "replace requires 'move value', .clone(), or a fresh owned expression"); return 0
+    if ft.move_only(&c.types, ty) && !is_fresh_owned(&c) && !consuming {
+        fail(&mut c, with_clone_hint(&c, ty, "replace requires 'move value'", ", .clone(),") + " or a fresh owned expression"); return 0
     }
     if inline { take_inline(&mut c, ty) } else { take_value(&mut c, ty) }
     expect(&mut c, ")")
@@ -3940,9 +5371,9 @@ fn swap_array(c: &mut Session, ty: i32, place: i32, receiver_at: i32, writable: 
     catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     root := borrows.root(&c.body.places, place)
     if root < 0 { fail(&mut c, "swap requires a stored array"); return 0 }
-    if !writable { fail(&mut c, "swap requires mut or &mut"); return 0 }
+    if !writable { fail_immutable_binding(&mut c, "swap requires mut or &mut", root); return 0 }
     if !writable_loan(&mut c, place) { return 0 }
-    if is_for_locked(&c, root) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
+    if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
     c.body.mutations.push(root)
     effects := c.body.mutations.len
     packed := c.body.place.inline_storage && ft.type_kind(&c.types, ty) == 6
@@ -4011,6 +5442,22 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         arm.intrinsic_call(&mut c.code, c.runtime.string_formatted_integer, .FormatInteger, value, 4, source)
         return 4
     }
+    if name == "__dunder_module_format_string" {
+        covered = true
+        spec_at := c.body.cursor
+        if c.world.tokens.kinds[spec_at] != .String { fail(&mut c, "expected string interpolation format"); return 0 }
+        spec := lexer.string_format(advance(&mut c))
+        expect(&mut c, ")")
+        if !spec.valid || ty != 4 {
+            if !spec.valid { fail(&mut c, "invalid string interpolation format") }
+            else { fail(&mut c, "string interpolation format requires a string") }
+            c.error_at = source
+            return 0
+        }
+        arm.imm(&mut c.code, 1, i64(spec.width)); arm.imm(&mut c.code, 2, i64(spec.align))
+        arm.intrinsic_call(&mut c.code, c.runtime.string_formatted_string, .FormatString, 4, 4, source)
+        return 4
+    }
     if name == "clone" {
         covered = true; expect(&mut c, ")")
         if ft.type_kind(&c.types, ty) == 20 || ft.type_kind(&c.types, ty) == 21 { fail(&mut c, "scratch values cannot be cloned out of their region"); return 0 }
@@ -4054,7 +5501,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         if place != 0 && c.body.depth == c.body.stream_depth && is(&c, ")") && c.world.tokens.texts[c.body.cursor + 1] == "{" {
             expect(&mut c, ")"); arm.pop_temp(&mut c.code, 0); c.body.stream_kind = 10; return ty
         }
-        if place != 0 { fail(&mut c, "stored iterators require (move values).iter() or values.clone().iter()"); return 0 }
+        if place != 0 { fail(&mut c, with_clone_hint(&c, ty, "stored iterators require (move values).iter()", " or values.clone().iter()")); return 0 }
         expect(&mut c, ")"); arm.pop_temp(&mut c.code, 0)
         c.body.places.current = place; c.body.places.source = receiver_at
         if c.body.expr.move_projection < 0 && c.body.expr.move_temporary >= 0 { fc.produce_owner(&mut c.body.expr, c.body.expr.move_temporary, ty) }
@@ -4066,15 +5513,15 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         receiver := borrows.root(&c.body.places, place)
         if receiver < 0 { fail(&mut c, "array mutation requires a stored place"); return 0 }
         if !writable_loan(&mut c, place) { return 0 }
-        if is_for_locked(&c, receiver) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
+        if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot mutate a collection while iterating over it"); return 0 }
         c.body.mutations.push(receiver); effects = c.body.mutations.len
-        if !writable { fail(&mut c, "array mutation requires mut or &mut") }
+        if !writable { fail_immutable_binding(&mut c, "array mutation requires mut or &mut", receiver) }
         if name == "push" { covered = true;
-            if !writable { fail(&mut c, "push requires mutable array") }
+            if !writable { fail_immutable_binding(&mut c, "push requires mutable array", receiver) }
             base := ft.type_base(&c.types, ty)
             consuming := eat(&mut c, "move")
             value := expression(&mut c, 0, base, &catalog, &mut inline_work, &mut model); same(&mut c, base, value)
-            if ft.move_only(&c.types, base) && c.body.expr.owner < 0 && !consuming { fail(&mut c, "push requires 'move value', .clone(), or a fresh owned expression"); return 0 }
+            if ft.move_only(&c.types, base) && !is_fresh_owned(&c) && !consuming { fail(&mut c, with_clone_hint(&c, base, "push requires 'move value'", ", .clone(),") + " or a fresh owned expression"); return 0 }
             take_value(&mut c, value)
             operation = .ArrayPush; target = c.runtime.typed_push[unsigned.shift(storage_type(&c, base))]; count = 1; ret = 0
         } else if name == "reserve" { covered = true; value := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, value); count = 1; operation = .ArrayReserve; target = c.runtime.array_reserve; ret = 0 }
@@ -4440,7 +5887,7 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
                 forward_argument_loan(&mut c, rhs_origin, rhs_constrained, m_fn, sig, 1, c.world.tokens.starts[rhs_first])
             }
             c.body.facts.needed.push(m_fn)
-            task_edge(&mut c, m_fn)
+            task_edge(&mut c, m_fn, c.world.tokens.starts[op_at])
             source_call.lower(&mut c.code, c.fn_labels[m_fn], -1, -1, &args, c.world.ffi_types[m_fn], 3, c.world.tokens.starts[op_at])
             release_arg_slots(&mut c, &args)
             fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
@@ -4548,9 +5995,15 @@ fn place_access(c: &Session) -> borrows.Access {
     if next.len == 2 && fc.assign_operator(next) != "" { return .ValueAndAddress }
     .Value
 }
-fn is_for_locked(c: &Session, base: i32) -> bool {
-    for i in 0..c.body.for_locks.len { if c.body.for_locks[i] == base { return true } }
+fn is_for_locked_except(c: &Session, path: i32, skip: i32) -> bool {
+    if path < 0 { return false }
+    for i in 0..c.body.for_locks.len {
+        if i != skip && ownership.overlaps(&c.body.ownership, c.body.for_locks[i], path) { return true }
+    }
     false
+}
+fn is_for_locked(c: &Session, path: i32) -> bool {
+    is_for_locked_except(&c, path, -1)
 }
 fn move_loop_begin(c: &mut Session) {
     ownership.loop_begin(&mut c.body.ownership)
@@ -4765,13 +6218,17 @@ fn conditional_inner(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.V
     bind_block(&mut c, done)
     left && right
 }
-struct PatternBindings { tokens: []i32, types: []i32, parents: []i32, offsets: []i32, locals: []i32 }
+struct PatternBindings { tokens: []i32, types: []i32, parents: []i32, offsets: []i32, locals: []i32, mutable: []bool }
 fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &mut PatternBindings, ty: i32, parent: i32, offset: i32, next: i32, depth: i32) -> i32 {
     if depth > 128 { fail(&mut c, "match pattern nesting exceeds 128"); return -1 }
     if eat(&mut c, "_") { return coverage.node(&mut patterns, -1) }
-    if depth > 0 && c.world.tokens.kinds[c.body.cursor] == .Name && c.world.tokens.texts[c.body.cursor + 1] != "." {
+    if depth > 0 && ((is(&c, "mut") && c.world.tokens.kinds[c.body.cursor + 1] == .Name &&
+            c.world.tokens.texts[c.body.cursor + 1] != "." && c.world.tokens.texts[c.body.cursor + 1] != "_" &&
+            c.world.tokens.texts[c.body.cursor + 2] != ".") ||
+        (c.world.tokens.kinds[c.body.cursor] == .Name && c.world.tokens.texts[c.body.cursor + 1] != ".")) {
+        is_mut := eat(&mut c, "mut")
         bindings.tokens.push(c.body.cursor); bindings.types.push(ty)
-        bindings.parents.push(parent); bindings.offsets.push(offset)
+        bindings.parents.push(parent); bindings.offsets.push(offset); bindings.mutable.push(is_mut)
         skip_token(&mut c)
         return coverage.node(&mut patterns, -1)
     }
@@ -4803,7 +6260,14 @@ fn match_pattern(c: &mut Session, patterns: &mut coverage.Patterns, bindings: &m
     arm.imm(&mut c.code, 1, c.types.field_values[found])
     arm.compare_register(&mut c.code, 0, 1); source_edge(&mut c, next, .NextVariant, pattern_at)
     if count > 0 {
-        expect(&mut c, "(")
+        if !eat(&mut c, "(") {
+            if count == 1 {
+                fail(&mut c, "variant '." + name + "' carries a payload; write '." + name + "(v)' or '." + name + "(_)'")
+            } else {
+                fail(&mut c, "variant '." + name + "' requires " + count.str() + " payload bindings; write '." + name + "(...)'")
+            }
+            c.error_at = c.world.tokens.starts[pattern_at]; return -1
+        }
         for i in 0..count {
             if !c.ok { return -1 }
             if i > 0 { expect(&mut c, ",") }
@@ -4825,16 +6289,28 @@ fn transfer_pattern(c: &mut Session, bindings: &PatternBindings, i: i32) {
     owner_store(&mut c, .Vacate, ty, places.local_home(c.body.places.arena.locals[id]))
     save_owner(&mut c, places.local_home(c.body.places.arena.locals[id]), ty, false)
 }
-fn bind_pattern(c: &mut Session, model: &mut opt_ir.Function, bindings: &mut PatternBindings, guarded: bool, borrowed: bool) {
+fn push_pattern_loan(c: &mut Session, local: i32, subject_place: i32, parent: i32, offset: i32, lock_index: i32) {
+    c.body.pattern_loans.locals.push(local)
+    c.body.pattern_loans.subject_places.push(subject_place)
+    c.body.pattern_loans.parent_slots.push(parent)
+    c.body.pattern_loans.offsets.push(offset)
+    c.body.pattern_loans.lock_indices.push(lock_index)
+}
+fn bind_pattern(c: &mut Session, model: &mut opt_ir.Function, bindings: &mut PatternBindings, guarded: bool, borrowed: bool, subject_movable: bool, subject_place: i32, lock_index: i32) {
     for i in 0..bindings.tokens.len {
         at := bindings.tokens[i]; ty := bindings.types[i]; index := slot(&mut c)
-        bind(&mut c, &mut model, c.world.tokens.texts[at].clone(), ty, false, index, at)
+        bind(&mut c, &mut model, c.world.tokens.texts[at].clone(), ty, bindings.mutable[i], index, at)
         id := c.body.locals.types.len - 1; bindings.locals.push(id)
         arm.load(&mut c.code, bindings.parents[i]); place_step(&mut c, .Member, ty, 0, i32(place_op.Member.Payload), bindings.offsets[i] / 8, at)
         if (borrowed && owned(&c, ty)) || ft.move_only(&c.types, ty) {
             arm.store(&mut c.code, index, 0)
-            if guarded || borrowed { c.body.pattern_borrowed.push(id) }
-            else { transfer_pattern(&mut c, &bindings, i) }
+            if !guarded && borrowed && subject_movable && ft.move_only(&c.types, ty) {
+                push_pattern_loan(&mut c, id, subject_place, bindings.parents[i], bindings.offsets[i], lock_index)
+            } else if guarded || borrowed {
+                c.body.pattern_borrowed.push(id)
+            } else {
+                transfer_pattern(&mut c, &bindings, i)
+            }
         } else {
             copy_value(&mut c, ty)
             if owned(&c, ty) { save_owner(&mut c, index, ty, false) } else { arm.store(&mut c.code, index, 0) }
@@ -4867,12 +6343,24 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
     if ft.type_kind(&c.types, ty) == 4 { ty = read_returned(&mut c, ty, subject_at) }
     if !enum_type(&c, ty) { fail(&mut c, "match requires an enum"); return false }
     subject_place := c.body.places.current
-    subject_root := source_root(&c, subject_place)
     borrowed_subject := !consuming && c.body.expr.owner < 0 && subject_place != 0
+    mut match_lock_index := -1
+    mut subject_movable := false
     saved := slot(&mut c)
     if borrowed_subject {
         arm.store(&mut c.code, saved, 0)
-        if subject_root >= 0 { c.body.for_locks.push(subject_root) }
+        subject_path := owner_path(&c, subject_place)
+        if subject_path >= 0 {
+            match_lock_index = c.body.for_locks.len
+            c.body.for_locks.push(subject_path)
+        }
+        subject_binding := borrows.root(&c.body.places, subject_place)
+        if subject_binding >= 0 && !borrows.has_index(&c.body.places, subject_place) &&
+            !c.body.place.inline_storage && !fc.pattern_loan(&c.body, subject_binding) &&
+            !local_borrows.shared(&c.body.local_loans, subject_binding) {
+            sb_kind := ft.type_kind(&c.types, c.body.locals.types[subject_binding])
+            if sb_kind != 4 && sb_kind != 5 { subject_movable = true }
+        }
     } else {
         take_value(&mut c, ty)
         if owned(&c, ty) { save_owner(&mut c, saved, ty, true) } else { arm.store(&mut c.code, saved, 0) }
@@ -4891,7 +6379,7 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         if fallback { fail(&mut c, "wildcard must be the final match arm"); return false }
         next := new_block(&mut c); enter(&mut c)
         wildcard := is(&c, "_")
-        mut bindings := PatternBindings { tokens: [], types: [], parents: [], offsets: [], locals: [] }
+        mut bindings := PatternBindings { tokens: [], types: [], parents: [], offsets: [], locals: [], mutable: [] }
         root := match_pattern(&mut c, &mut patterns, &mut bindings, ty, saved, 0, next, 0)
         if !c.ok { return false }
         newlines(&mut c)
@@ -4901,7 +6389,8 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         if error != "" { fail(&mut c, error); return false }
         first_owner := c.body.owned_slots.len
         marker_floor := c.body.pattern_borrowed.len
-        bind_pattern(&mut c, &mut model, &mut bindings, guarded, borrowed_subject)
+        loan_floor := c.body.pattern_loans.locals.len
+        bind_pattern(&mut c, &mut model, &mut bindings, guarded, borrowed_subject, subject_movable, subject_place, match_lock_index)
         if guarded {
             match_guard(&mut c, first_owner, marker_floor, next, &catalog, &mut inline_work, &mut model); newlines(&mut c)
             guarded_state := ownership.checkpoint(&c.body.ownership)
@@ -4909,6 +6398,16 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
             if !borrowed_subject {
                 for i in 0..bindings.tokens.len { if ft.move_only(&c.types, bindings.types[i]) { transfer_pattern(&mut c, &bindings, i) } }
                 while c.body.pattern_borrowed.len > marker_floor { _ := c.body.pattern_borrowed.pop() }
+            } else if subject_movable {
+                while c.body.pattern_borrowed.len > marker_floor { _ := c.body.pattern_borrowed.pop() }
+                for i in 0..bindings.tokens.len {
+                    bty := bindings.types[i]; bid := bindings.locals[i]
+                    if ft.move_only(&c.types, bty) {
+                        push_pattern_loan(&mut c, bid, subject_place, bindings.parents[i], bindings.offsets[i], match_lock_index)
+                    } else if owned(&c, bty) {
+                        c.body.pattern_borrowed.push(bid)
+                    }
+                }
             }
         }
         expect(&mut c, "=>"); newlines(&mut c); mut ends := false
@@ -4934,6 +6433,13 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         returns = returns && ends
         leave(&mut c)
         while c.body.pattern_borrowed.len > marker_floor { _ := c.body.pattern_borrowed.pop() }
+        while c.body.pattern_loans.locals.len > loan_floor {
+            _ := c.body.pattern_loans.locals.pop()
+            _ := c.body.pattern_loans.subject_places.pop()
+            _ := c.body.pattern_loans.parent_slots.pop()
+            _ := c.body.pattern_loans.offsets.pop()
+            _ := c.body.pattern_loans.lock_indices.pop()
+        }
         arm_state := ownership.checkpoint(&c.body.ownership)
         if outcome_seen { ownership.combine_checkpoints(&c.body.ownership, &mut outcomes, !falling_through, &arm_state, ends) }
         else { ownership.copy_checkpoint(&mut outcomes, &arm_state); outcome_seen = true }
@@ -4947,7 +6453,7 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
         if error != "" { fail(&mut c, error) }
     }
     ownership.restore_checkpoint(&mut c.body.ownership, &outcomes)
-    if borrowed_subject && subject_root >= 0 { _ := c.body.for_locks.pop() }
+    if match_lock_index >= 0 { _ := c.body.for_locks.pop() }
     returns
 }
 fn scratch_width(c: &Session, ty: i32) -> i32 { ft.scratch_width(&c.types, ty, c.code.platform) }
@@ -5004,7 +6510,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
     if is(&c, "task") && c.world.tokens.texts[c.body.cursor + 1] == "scope" { return task_scope_statement(&mut c, &catalog, &mut inline_work, &mut model) }
     if is(&c,"region") && c.world.tokens.kinds[c.body.cursor+1]==.Name {skipped:=advance(&mut c); return scratch_block(&mut c, &catalog, &mut inline_work, &mut model)}
     if eat(&mut c, "unsafe") {
-        task_effect(&mut c, 16)
+        task_effect_at(&mut c, 16, c.body.cursor - 1)
         if !c.world.unsafe_capable { fail(&mut c, "module requires capability unsafe"); return false }
         previous := c.body.unsafe_scope; c.body.unsafe_scope = true
         enter(&mut c)
@@ -5064,7 +6570,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         if borrowed_for && model.probing && decline_projection(&mut c, &mut model) { return false }
         mut low := 0
         mut place_base := -1
-        mut locked_local := -1
+        mut locked_path := -1
         if borrowed_for {
             c.body.stream_depth = previous_stream; c.body.stream_kind = 0
             if eat(&mut c, "mut") { fail(&mut c, "for loop requires & rather than &mut"); return false }
@@ -5079,6 +6585,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
             low = read_returned(&mut c, low, name_at); borrowed_for = true
         }
         array_place := c.body.places.current
+        const_tbl := c.body.expr.const_array && !consuming_for && c.body.stream_kind == 0 && !is(&c, "..") && collection(&c, low)
         if borrowed_for {
             if !collection(&c, low) { fail(&mut c, "for borrow requires an array"); return false }
             if array_place == 0 { fail(&mut c, "for borrow requires a stored array"); return false }
@@ -5117,10 +6624,12 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         } else {
             if !collection(&c, low) { fail(&mut c, "for requires a range or array"); return false }
             array = true; base = ft.type_base(&c.types, low); kind = .Array; if ft.type_kind(&c.types, low) == 6 { kind = .Fixed }
-            if borrowed_for {
+            if borrowed_for || const_tbl {
                 arm.store(&mut c.code, values, 0)
-                locked_local = place_base
-                if owned(&c, base) { borrow_elem = true }
+                if borrowed_for {
+                    locked_path = owner_path(&c, array_place)
+                    if owned(&c, base) { borrow_elem = true }
+                }
             } else {
                 take_value(&mut c, low); save_owner(&mut c, values, low, true)
             }
@@ -5133,10 +6642,12 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
             mut bind_type := base
             if borrow_elem { bind_type = compound(&mut c, 4, base) }
             bind(&mut c, &mut model, move name, bind_type, false, binding, name_at)
+            id := c.body.locals.names.len - 1
             if borrow_elem {
-                id := c.body.locals.names.len - 1
                 path := owner_path(&c, array_place); origin := loan_origin(&c, array_place)
                 local_borrows.transient(&mut c.body.local_loans, id, path, place_base, origin)
+            } else if array && !borrowed_for && !const_tbl && owned(&c, base) {
+                c.body.locals.fresh_move[id] = true
             }
         } else { bind(&mut c, &mut model, move name, 1, false, cursor, name_at) }
         iterator := model.local_types.len - 1
@@ -5165,7 +6676,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
                 if ft.is_c_record(&c.types, base) || fixed_pod(&c, base) { place_transfer(&mut c, base, 0, 0, true, false, access, name_at) }
                 if fixed_pod(&c, base) { place_transfer(&mut c, base, 0, 0, true, false, access, name_at) }
                 arm.store(&mut c.code, binding, 0)
-            } else if borrowed_for {
+            } else if borrowed_for || const_tbl {
                 place_transfer(&mut c, base, 0, 0, true, false, access, name_at); arm.store(&mut c.code, binding, 0)
             } else {
                 if ft.move_only(&c.types, base) {
@@ -5176,12 +6687,12 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
                 if owned(&c, base) { save_owner(&mut c, binding, base, false) } else { arm.store(&mut c.code, binding, 0) }
             }
         }
-        if locked_local >= 0 { c.body.for_locks.push(locked_local) }
+        if locked_path >= 0 { c.body.for_locks.push(locked_path) }
         begin_loop_scope(&mut c, next, done)
         ends := block(&mut c, false, &catalog, &mut inline_work, &mut model)
         end_loop_scope(&mut c)
         if model.recording { _ := typed.node(&mut model, 19, 0, low_node, high_node, model.value, 0, iterator, at) }
-        if locked_local >= 0 { unlocked := c.body.for_locks.pop() }
+        if locked_path >= 0 { unlocked := c.body.for_locks.pop() }
         bind_block(&mut c, next)
         if stream != 5 { arm.load(&mut c.code, cursor); iteration.emit(&mut c.code, .Advance, kind, base, source); arm.store(&mut c.code, cursor, 0) }
         move_loop_backedge(&mut c); move_loop_end(&mut c, &loop_exit)
@@ -5212,8 +6723,13 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         c.body.move_defer_limits.push(c.body.move_defer_locks.len)
         for token in (c.body.cursor + 1)..c.world.closes[c.body.cursor] {
             if c.world.tokens.kinds[token] == .Name {
+                if token > 0 && c.world.tokens.kinds[token - 1] == .Symbol &&
+                    (c.world.tokens.texts[token - 1] == "." || c.world.tokens.texts[token - 1] == "::") {
+                    continue
+                }
                 captured := local(&c.body, c.world.tokens.texts[token])
                 if captured >= 0 {
+                    local_borrows.pin(&mut c.body.local_loans, captured)
                     mut ty := c.body.locals.types[captured]; kind := ft.type_kind(&c.types, ty)
                     if kind == 4 || kind == 5 { ty = ft.type_base(&c.types, ty) }
                     if ft.move_only(&c.types, ty) { c.body.move_defer_locks.push(captured) }
@@ -5297,6 +6813,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         if expected != 0 { same(&mut c, expected, ty) }
         if ty == 0 {
             if c.body.expr.untyped_exit { fail(&mut c, "cannot infer a value type when every branch exits") }
+            else if name == "_" { fail(&mut c, "local requires a value (expression returns (); call it directly without '_ :=')") }
             else { fail(&mut c, "local requires a value") }
             return false
         }
@@ -5312,7 +6829,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         take_value(&mut c, ty); index := slot(&mut c); bind(&mut c, &mut model, move name, ty, mutable, index, name_at)
         if kind == 4 {
             mut source := origin; if source == -1 { source = -3 }
-            local_borrows.bind_shared(&mut c.body.local_loans, c.body.locals.names.len - 1, path, root, source, name_at)
+            local_borrows.bind_shared_scoped(&mut c.body.local_loans, c.body.locals.names.len - 1, path, root, source, name_at, c.body.block_end, c.body.loop_heads.len)
         }
         if model.recording { _ := typed.node(&mut model, 11, 0, model.value, -1, -1, 0, model.local_types.len - 1, at) }
         if owned(&c, ty) { save_owner(&mut c, index, ty, false) } else { arm.store(&mut c.code, index, 0) }
@@ -5327,7 +6844,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
     mut ty := 0; mut place := 0
     if binding >= 0 && c.world.tokens.kinds[at + 2] == .Name && c.world.tokens.texts[at + 2] == c.world.tokens.texts[at] &&
         (lexer.is_newline(c.world.tokens.kinds[at + 3]) || c.world.tokens.texts[at + 3] == ";" || c.world.tokens.texts[at + 3] == "}") {
-        if !c.body.locals.mutable[binding] && ft.type_kind(&c.types, c.body.locals.types[binding]) != 5 { fail(&mut c, "assignment requires a mutable stored value"); return false }
+        if (!c.body.locals.mutable[binding] || fc.pattern_loan(&c.body, binding)) && ft.type_kind(&c.types, c.body.locals.types[binding]) != 5 { fail_immutable_binding(&mut c, "assignment requires a mutable stored value", binding); return false }
         if !ownership.available(&c.body.ownership, ownership.root_id(&c.body.ownership, binding)) { fail(&mut c, "use of moved value '" + c.body.locals.names[binding] + "'"); return false }
         c.body.cursor = at + 3
         if model.recording { _ := typed.node(&mut model, 10, 0, -1, -1, -1, 0, -1, at) }
@@ -5355,7 +6872,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         may_invalidate_operand(&mut c)
         mut direct := c.body.place.direct; writable := c.body.place.writable; packed := c.body.place.inline_storage; scratch_target := c.body.place.scratch
         if ft.type_kind(&c.types, ty) == 21 || ft.type_kind(&c.types, ty) == 20 { fail(&mut c, "scratch bindings cannot be reassigned"); return false }
-        if c.body.place.address < 0 || !writable { fail(&mut c, "assignment requires a mutable stored value"); return false }
+        if c.body.place.address < 0 || !writable { fail_immutable_binding(&mut c, "assignment requires a mutable stored value", borrows.root(&c.body.places, place)); return false }
         if !writable_loan(&mut c, place) { return false }
         effects := c.body.mutations.len
         if compound_op == "" {
@@ -5378,7 +6895,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         result_owner := c.body.expr.owner; result_type := c.body.expr.ty
         base := borrows.root(&c.body.places, place)
         if base < 0 { fail(&mut c, "assignment requires a named variable, field or array element"); return false }
-        if is_for_locked(&c, base) { fail(&mut c, "cannot assign to a collection while iterating over it"); return false }
+        if is_for_locked(&c, owner_path(&c, place)) { fail(&mut c, "cannot assign to a collection while iterating over it"); return false }
         if place > 0 && borrows.changed(&c.body.mutations, effects, c.body.mutations.len, base) {
             if borrows.has_index(&c.body.places, place) { fail(&mut c, "compute mutations before assigning an array element"); return false }
             arm.push_temp(&mut c.code, 0); lower_place(&mut c, place, 0, .Address, at)
@@ -5465,15 +6982,16 @@ pub fn new_session() -> Session {
         tasks: tc.new_graph(),
         closure_header: -1, closure_drop: -1, boxed_signatures: [], types: ft.new_registry(), helper_labels: [], array_helpers: -1,
         task_iso_labels: [], task_shared_rc_labels: [], task_shared_prepare_labels: [], task_shared_drop_labels: [],
-        ok: true, error: "", error_at: 0, specializations: generics.layout(), traits: traits.new(),
+        ok: true, error: "", error_at: 0, error_note: "", error_note_at: -1, specializations: generics.layout(), traits: traits.new(),
         discovering_compounds: false, known_compounds: Map<string, i64>::new(), demanded_compounds: Map<string, i64>::new(),
+        demanded_inferred_keys: Map<string, i64>::new(), demanded_inferred_args: [],
         validating_dead: false, validated_through: -1, report: report, bindings: bindings(),
         wasm_abi: wa.new(), imports: imports(), callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], loans: scratch.loans(),
         fn_labels: [],
         array_take: array_take, record_take_labels: [],
         mir_opt_enabled: config.mir_opt_enabled, mir_memory_enabled: config.mir_memory_enabled, mir_ssa_enabled: config.mir_ssa_enabled, mir_values_enabled: config.mir_values_enabled, scalar_enabled: scalar_enabled, ownership_enabled: config.ownership_enabled, const_div_enabled: config.const_div_enabled, range_enabled: config.range_enabled, inline_enabled: config.inline_enabled && scalar_enabled && !check_all, scalar_templates: opt_templates.new(),
-        strings: [], string_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, unicode_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
+        strings: [], string_labels: [], const_blob_ids: [], const_blob_labels: [], print_int: 0, print_bool: 0, print_text: 0, write: 0, float_source: uses_float, float_trap: 0, unicode_trap: 0, overflow: 0, zero: 0, assertion: 0, io: 0, bounds: 0,
     }
 }
 pub fn load_group_with_deps_into(c: &mut Session, path: string, testing: bool, group: i32, wasm_suite: bool,
@@ -5488,15 +7006,17 @@ pub fn freeze_validation_world(c: &Session, declarations: &[]i32) -> frozen.Worl
     names := frozen.intern_list(&mut s, &mut index, &c.world.names)
     parameter_names := frozen.intern_list(&mut s, &mut index, &c.world.param_names)
     libraries := frozen.intern_list(&mut s, &mut index, &c.world.libraries)
-    symbols := frozen.intern_list(&mut s, &mut index, &c.world.symbols)
+    symbol_names := frozen.intern_list(&mut s, &mut index, &c.world.symbols)
     impl_names := frozen.intern_list(&mut s, &mut index, &c.world.impl_names)
     trait_names := frozen.intern_list(&mut s, &mut index, &c.traits.names)
+    const_names := frozen.intern_list(&mut s, &mut index, &c.world.const_names)
+    const_strings := frozen.intern_list(&mut s, &mut index, &c.world.const_strings)
     types := frozen.pack_types(&mut s, &mut index, &c.types)
     tokens := frozen.pack_bodies(&mut s, &mut index, &declarations, &c.world.tokens, &c.world.starts, &c.world.ends, &c.world.closes)
     mut offsets: []i32 = []; offsets.reserve(c.world.param_tokens.len)
     for at in c.world.param_tokens { offsets.push(c.world.tokens.starts[at]) }
     frozen.World { spellings: s, tokens: tokens, types: types, names: names, parameter_names: parameter_names,
-        libraries: libraries, symbols: symbols, returns: c.world.returns.clone(), param_starts: c.world.param_starts.clone(),
+        libraries: libraries, symbols: symbol_names, returns: c.world.returns.clone(), param_starts: c.world.param_starts.clone(),
         param_counts: c.world.param_counts.clone(), param_types: c.world.param_types.clone(), param_tokens: c.world.param_tokens.clone(),
         param_offsets: offsets, unsafe_functions: c.world.unsafe_functions.clone(), test_functions: c.world.test_functions.clone(),
         function_owners: c.world.function_owners.clone(), ffi_types: c.world.ffi_types.clone(),
@@ -5506,7 +7026,10 @@ pub fn freeze_validation_world(c: &Session, declarations: &[]i32) -> frozen.Worl
         source_end: c.world.source_end,
         unsafe_capable: c.world.unsafe_capable, tasks: c.tasks.program, loans: c.loans.active, report: c.report,
         globals: c.jobs.globals, fn_labels: c.fn_labels.clone(), spawners: c.tasks.spawners.clone(),
-        trait_names: trait_names, conformance_traits: c.traits.conformance_traits.clone(), conformance_types: c.traits.conformance_types.clone() }
+        trait_names: trait_names, conformance_traits: c.traits.conformance_traits.clone(), conformance_types: c.traits.conformance_types.clone(),
+        const_names: const_names, const_types: c.world.const_types.clone(), const_kinds: c.world.const_kinds.clone(),
+        const_ints: c.world.const_ints.clone(), const_strings: const_strings,
+        const_blob_starts: c.world.const_blob_starts.clone(), const_blob_counts: c.world.const_blob_counts.clone(), const_blobs: c.world.const_blobs.clone() }
 }
 pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
     mut cache: []string = []; cache.reserve(src.spellings.starts.len - 1)
@@ -5516,6 +7039,23 @@ pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
     c.world.libraries = frozen.read_list(&src.spellings, &mut cache, &src.libraries)
     c.world.symbols = frozen.read_list(&src.spellings, &mut cache, &src.symbols)
     c.world.impl_names = frozen.read_list(&src.spellings, &mut cache, &src.impl_names)
+    c.world.const_names = frozen.read_list(&src.spellings, &mut cache, &src.const_names)
+    c.world.const_types = src.const_types.clone(); c.world.const_kinds = src.const_kinds.clone()
+    c.world.const_ints = src.const_ints.clone()
+    c.world.const_strings = frozen.read_list(&src.spellings, &mut cache, &src.const_strings)
+    c.world.const_blob_starts = src.const_blob_starts.clone(); c.world.const_blob_counts = src.const_blob_counts.clone()
+    c.world.const_blobs = src.const_blobs.clone()
+    c.world.const_map.reserve(c.world.const_names.len)
+    for ci in 0..c.world.const_names.len {
+        cname := c.world.const_names[ci].clone()
+        c.world.const_map.put(cname.clone(), i64(ci))
+        if c.world.const_kinds[ci] == 0 {
+            cty := c.world.const_types[ci]
+            if (cty == 1 || cty == 2 || (cty >= 8 && cty <= 12)) && c.world.const_ints[ci] >= 0 && c.world.const_ints[ci] <= 1048576 {
+                c.types.const_lengths.put(move cname, c.world.const_ints[ci])
+            }
+        }
+    }
     tnames := frozen.read_list(&src.spellings, &mut cache, &src.trait_names)
     for id in traits.builtin_count()..tnames.len { _ := traits.add_trait(&mut c.traits, tnames[id].clone(), -1, true, 0) }
     for i in 0..src.conformance_traits.len { _ := traits.record_conformance(&mut c.traits, src.conformance_traits[i], src.conformance_types[i], -1) }
@@ -5610,11 +7150,18 @@ pub fn begin_linker(c: &Session, link: &mut mir_link.Linker) -> bool {
     mir_link.begin(&mut link, &c.code, &c.imports.sites)
 }
 fn session_fail_at(c: &mut Session, message: string, offset: i32) -> bool {
-    c.ok = false; c.error = message.clone(); c.error_at = offset; c.jobs.phase = -1; false
+    c.ok = false; c.error = message.clone(); c.error_at = offset; c.error_note = ""; c.error_note_at = -1; c.jobs.phase = -1; false
 }
 pub fn session_error(c: &Session) -> Result {
     offset := generics.origin(&c.specializations, c.error_at)
     mut message := c.error.clone()
+    if c.error_note != "" {
+        message += "\n  note: " + c.error_note
+        if c.error_note_at >= 0 {
+            note_offset := generics.origin(&c.specializations, c.error_note_at)
+            message += " at " + diagnostics.location_text(&c.sources, note_offset)
+        }
+    }
     f := c.specializations.error_function
     if f >= 0 && f < c.specializations.function_instances.len {
         mut instance := c.specializations.function_instances[f]
@@ -5650,6 +7197,7 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
     source_end := c.world.tokens.starts[c.world.tokens.starts.len - 1]
     if c.world.tokens.ok && module_files.len == 0 { modules.bind_source_generics(&mut c.world.tokens) }
     for name in rules.primitive_types() { _ := add_type(&mut c, name, 0, 0) }
+    pre_register_int_consts(&mut c)
     if c.world.tokens.ok && generics.needed(&c.world.tokens) {
         mut tokens := replace(&mut c.world.tokens, lexer.empty(false))
         program := generics.bind_program(&mut tokens, &mut c.types, platform)
@@ -5657,12 +7205,12 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
         base := c.types.clone()
         mut demand := demands()
         mut definitions := program.checks.len() > 0
-        mut initial_probe := program.has_compound_ops
+        mut need_probe := program.has_compound_ops || program.has_inferred_calls
         while c.ok {
-            c.specializations = generics.materialize(&program, &mut tokens, &mut c.types, platform, &demand.methods, &demand.compounds, definitions)
+            c.specializations = generics.materialize(&program, &mut tokens, &mut c.types, platform, &demand.methods, &demand.compounds, &demand.inferred_keys, &demand.inferred_args, definitions)
             if !tokens.ok { return session_fail_at(&mut c, tokens.error, tokens.error_at) }
-            if !definitions && !initial_probe && c.specializations.pending.len() == 0 { break }
-            if !definitions { initial_probe = false }
+            if !definitions && !need_probe && c.specializations.pending.len() == 0 { break }
+            if !definitions { need_probe = false }
             mut probe := new_session()
             probe.world.tokens = tokens.clone(); probe.types = c.types.clone(); probe.specializations = c.specializations.clone()
             probe.world.module_caps = c.world.module_caps.clone(); probe.sources = c.sources.clone()
@@ -5670,18 +7218,37 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
             probe.known_compounds = demand.compounds.clone()
             count := demand.methods.len()
             comp_count := demand.compounds.len()
+            inf_count := demand.inferred_args.len
             checked := discover(&mut probe, platform, &module_starts, &module_files, source_end, &mut demand)
-            if !checked.ok { return session_fail_at(&mut c, checked.error, checked.offset) }
             for ci in 0..probe.demanded_compounds.len() {
                 demand.compounds.put(probe.demanded_compounds.key_at(ci).clone(), 1)
             }
-            if comp_count != demand.compounds.len() {
-                demand.checked_live.clear()
-                demand.checked_dead.clear()
+            for ii in 0..probe.demanded_inferred_keys.len() {
+                ikey := probe.demanded_inferred_keys.key_at(ii).clone()
+                if !demand.inferred_keys.contains(ikey) {
+                    idx := i32(probe.demanded_inferred_keys.get_or(ikey, -1))
+                    if idx >= 0 {
+                        demand.inferred_keys.put(move ikey, i64(demand.inferred_args.len))
+                        demand.inferred_args.push(probe.demanded_inferred_args[idx].clone())
+                    }
+                }
             }
-            if count == demand.methods.len() && comp_count == demand.compounds.len() {
+            changed := count != demand.methods.len() || comp_count != demand.compounds.len() || inf_count != demand.inferred_args.len
+            if !checked.ok {
+                if definitions || (comp_count == demand.compounds.len() && inf_count == demand.inferred_args.len) {
+                    return session_fail_at(&mut c, checked.error, checked.offset)
+                }
+                if !definitions { need_probe = true }
+            } else if !changed {
                 if !definitions { break }
                 definitions = false; demand = demands()
+                need_probe = program.has_compound_ops || program.has_inferred_calls
+            } else if !definitions {
+                need_probe = true
+            }
+            if comp_count != demand.compounds.len() || inf_count != demand.inferred_args.len {
+                demand.checked_live.clear()
+                demand.checked_dead.clear()
             }
             c.types = base.clone()
         }
@@ -5690,9 +7257,9 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
     begin_concrete(&mut c, platform, &module_starts, &module_files, source_end, check_all, report, directory, identity, &config,
         &mut scalar_model, &mut scalar_work, &mut range_work, &mut catalog, &mut inline_work, &mut emit_settings, &mut record_takes)
 }
-struct Demands { methods: Map<string, i64>, compounds: Map<string, i64>, live: Map<string, i64>, dead: Map<string, i64>, checked_live: Map<string, i64>, checked_dead: Map<string, i64> }
+struct Demands { methods: Map<string, i64>, compounds: Map<string, i64>, inferred_keys: Map<string, i64>, inferred_args: []string, live: Map<string, i64>, dead: Map<string, i64>, checked_live: Map<string, i64>, checked_dead: Map<string, i64> }
 fn demands() -> Demands {
-    Demands { methods:Map<string, i64>::new(), compounds:Map<string, i64>::new(), live:Map<string, i64>::new(), dead:Map<string, i64>::new(), checked_live:Map<string, i64>::new(), checked_dead:Map<string, i64>::new() }
+    Demands { methods:Map<string, i64>::new(), compounds:Map<string, i64>::new(), inferred_keys:Map<string, i64>::new(), inferred_args:[], live:Map<string, i64>::new(), dead:Map<string, i64>::new(), checked_live:Map<string, i64>::new(), checked_dead:Map<string, i64>::new() }
 }
 fn discover(c: &mut Session, platform: i32, module_starts: &[]i32, module_files: &[]i32, source_end: i32, demand: &mut Demands) -> Result {
     mut config := configuration(); config.scalar_enabled = false
@@ -5737,7 +7304,7 @@ fn discover(c: &mut Session, platform: i32, module_starts: &[]i32, module_files:
                 }
                 if !c.ok {
                     if !dead { return session_error(&c) }
-                    c.ok = true; c.error = ""; c.types.error = ""
+                    c.ok = true; c.error = ""; c.error_note = ""; c.error_note_at = -1; c.types.error = ""
                 }
             }
         }
@@ -5912,7 +7479,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
             if config.frame_free_enabled { policy = policy + ":frame-free:on" } else { policy = policy + ":frame-free:off" }
             if config.range_enabled { policy = policy + ":range:on" } else { policy = policy + ":range:off" }
             if c.inline_enabled { policy = policy + ":inline-expression-v3:dependencies1:tokens128-32768:caller4096:utf8-v1-staging48:" + opt_inline.fingerprint(&catalog) } else { policy = policy + ":inline:off" }
-            policy = policy + ":typed-function-v1:ownership-read-default-v2:returned-borrows-v1"
+            policy = policy + ":typed-function-v1:ownership-read-default-v3:returned-borrows-v1"
             if config.mir_opt_enabled { policy = policy + ":mir-opt:on" } else { policy = policy + ":mir-opt:off" }
             policy = policy + ":" + mir_memory.source_policy_tag(config.mir_memory_enabled)
             if config.mir_ssa_enabled { policy = policy + ":mir-ssa:v3-regional-expression1-work4194304" } else { policy = policy + ":mir-ssa:off" }
@@ -5976,7 +7543,7 @@ pub fn compile_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, mod
     continue_serial_loaded(&mut c, check_all, &mut records, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &view, &mut inline_work, &mut record_takes)
 }
 
-pub struct Validation { declaration: i32, at: i32, error: []u8, effects: i64, first_task: i32, observations: []i32, types: []i32 }
+pub struct Validation { declaration: i32, at: i32, error: []u8, note_at: i32, note: []u8, effects: i64, effect_at: i32, first_task: i32, observations: []i32, types: []i32 }
 pub struct ValidationJob { declaration: i32, platform: i32, dead: bool }
 
 pub struct BackendBindings {
@@ -6023,13 +7590,13 @@ pub fn prepare_emitter(c: &mut Session, bindings: &BackendBindings) {
     c.ownership_enabled = bindings.ownership_enabled; c.const_div_enabled = bindings.const_div_enabled; c.inline_enabled = bindings.inline_enabled
 }
 pub struct EmittedBody {
-    declaration: i32, at: i32, error: []u8,
+    declaration: i32, at: i32, error: []u8, note_at: i32, note: []u8,
     words: []i64, labels: []i32, at_words: []i32, targets: []i32, reloc_kinds: []i32,
     facts: facts.Facts, types: []i32, places: places.Arena, dependencies: fragments.Dependencies,
     inlined_calls: i32, inlined_words: i32, estimated_words: i32,
 }
 pub fn empty_emission() -> EmittedBody {
-    EmittedBody { declaration: -1, at: 0, error: [], words: [], labels: [], at_words: [], targets: [],
+    EmittedBody { declaration: -1, at: 0, error: [], note_at: -1, note: [], words: [], labels: [], at_words: [], targets: [],
         reloc_kinds: [], facts: facts.new(), types: [], places: places.new(), dependencies: fragments.new_dependencies(),
         inlined_calls: 0, inlined_words: 0, estimated_words: 0 }
 }
@@ -6039,12 +7606,12 @@ fn restore_tokens(c: &Session, tokens: &mut []i32) {
 pub fn emit_isolated_into(c: &mut Session, f: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace,
     model: &mut opt_ir.Function, project: bool) -> EmittedBody {
     mut out := empty_emission(); out.declaration = f
-    c.ok = true; c.error = ""; c.error_at = 0; c.types.error = ""
+    c.ok = true; c.error = ""; c.error_at = 0; c.error_note = ""; c.error_note_at = -1; c.types.error = ""
     ft.reset_body(&mut c.types); facts.reset(&mut c.body.facts, 0)
     c.code.words.clear(); c.code.at.clear(); c.code.target.clear(); c.code.kinds.clear()
     assert(c.code.labels.len == c.jobs.globals)
     c.body.reenter_owners = false; c.body.scalar_function = false
-    if c.tasks.program && c.world.unsafe_functions[f] { task_effect(&mut c, 16) }
+    if c.tasks.program && c.world.unsafe_functions[f] { task_effect_at(&mut c, 16, c.world.starts[f]) }
     c.bindings.inlined_calls = 0; c.bindings.inlined_words = 0; c.bindings.inline_estimated_words = 0
     arm.begin_mir(&mut c.code, true)
     model.recording = false; model.probing = false; model.supported = false
@@ -6054,7 +7621,11 @@ pub fn emit_isolated_into(c: &mut Session, f: i32, catalog: &opt_inline.View, in
         restore_tokens(&c, &mut model.nodes.starts); restore_tokens(&c, &mut model.local_at)
     }
     arm.end_mir(&mut c.code)
-    if !c.ok { out.at = c.error_at; validation_bytes.append_utf8(&mut out.error, c.error) }
+    if !c.ok {
+        out.at = c.error_at; validation_bytes.append_utf8(&mut out.error, c.error)
+        out.note_at = c.error_note_at
+        if c.error_note != "" { validation_bytes.append_utf8(&mut out.note, c.error_note) }
+    }
     out.facts = replace(&mut c.body.facts, facts.new())
     restore_tokens(&c, &mut out.facts.tokens); restore_tokens(&c, &mut out.facts.worker_tokens)
     restore_tokens(&c, &mut out.facts.factory_tokens); restore_tokens(&c, &mut out.facts.shared_tokens)
@@ -6087,13 +7658,20 @@ pub fn install_emitted(c: &mut Session, f: i32, move out: EmittedBody) -> bool {
     }
     c.body.facts = out.facts
     for i in 0..c.body.facts.literal_labels.len { c.body.facts.literal_labels[i] = c.body.facts.literal_labels[i] + delta }
+    for i in 0..c.body.facts.const_string_labels.len { c.body.facts.const_string_labels[i] = c.body.facts.const_string_labels[i] + delta }
+    for i in 0..c.body.facts.const_blob_labels.len { c.body.facts.const_blob_labels[i] = c.body.facts.const_blob_labels[i] + delta }
     for i in 0..c.body.facts.assert_labels.len { c.body.facts.assert_labels[i] = c.body.facts.assert_labels[i] + delta }
     ft.restore_shapes(&mut c.types, &out.types); c.body.places.arena = out.places
     c.body.scalar_function = false; c.body.inline_deps = out.dependencies
     c.bindings.inlined_calls = c.bindings.inlined_calls + out.inlined_calls
     c.bindings.inlined_words = c.bindings.inlined_words + out.inlined_words
     c.bindings.inline_estimated_words = c.bindings.inline_estimated_words + out.estimated_words
-    if out.error.len > 0 { message := validation_bytes.decode(&out.error); c.ok = false; c.error = message.value; c.error_at = out.at; c.specializations.error_function = f }
+    if out.error.len > 0 {
+        message := validation_bytes.decode(&out.error); c.ok = false; c.error = message.value; c.error_at = out.at
+        c.error_note_at = out.note_at
+        if out.note.len > 0 { note_msg := validation_bytes.decode(&out.note); c.error_note = note_msg.value } else { c.error_note = "" }
+        c.specializations.error_function = f
+    }
     c.code.words = out.words
     if c.body.facts.sites.len > 0 { bind_symbols(&mut c) }
     if c.ok { accept_facts(&mut c, f) }
@@ -6244,15 +7822,19 @@ pub fn check_isolated_job(c: &mut Session, job: ValidationJob) -> Validation {
     f := job.declaration
     mut model := opt_ir.new(); catalog := opt_inline.empty_view(); mut inline_work := opt_inline.workspace()
     ft.reset_body(&mut c.types); facts.reset(&mut c.body.facts, 0)
-    c.ok = true; c.error = ""; c.error_at = 0; c.types.error = ""
+    c.ok = true; c.error = ""; c.error_at = 0; c.error_note = ""; c.error_note_at = -1; c.types.error = ""
     c.validating_dead = job.dead; c.code.platform = job.platform
     c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
     c.body.reenter_owners = false; c.body.scalar_function = false
-    if c.tasks.program && c.world.unsafe_functions[f] { task_effect(&mut c, 16) }
+    if c.tasks.program && c.world.unsafe_functions[f] { task_effect_at(&mut c, 16, c.world.starts[f]) }
     type_body(&mut c, f, &mut model, &catalog, &mut inline_work)
-    mut result := Validation { declaration: f, at: c.error_at, error: [], effects: c.body.facts.effects,
-        first_task: -1, observations: [], types: [] }
-    if !c.ok { validation_bytes.append_utf8(&mut result.error, c.error); return result }
+    mut result := Validation { declaration: f, at: c.error_at, error: [], note_at: c.error_note_at, note: [], effects: c.body.facts.effects,
+        effect_at: c.body.facts.effect_at, first_task: -1, observations: [], types: [] }
+    if !c.ok {
+        validation_bytes.append_utf8(&mut result.error, c.error)
+        if c.error_note != "" { validation_bytes.append_utf8(&mut result.note, c.error_note) }
+        return result
+    }
     if c.body.facts.first_task >= 0 { result.first_task = validation_token(&c, c.body.facts.first_task) }
     for i in 0..c.body.facts.worker_tokens.len { c.body.facts.worker_tokens[i] = validation_token(&c, c.body.facts.worker_tokens[i]) }
     for i in 0..c.body.facts.factory_tokens.len { c.body.facts.factory_tokens[i] = validation_token(&c, c.body.facts.factory_tokens[i]) }
@@ -6269,6 +7851,7 @@ pub fn check_isolated_job(c: &mut Session, job: ValidationJob) -> Validation {
     pack_observation(&mut result.observations, &c.body.facts.exposed, 9)
     pack_observation(&mut result.observations, &c.body.facts.forwards, 10)
     pack_observation(&mut result.observations, &c.body.facts.indirect, 11)
+    pack_observation(&mut result.observations, &c.body.facts.call_offsets, 14)
     if c.report && c.body.facts.binding_tokens.len > 0 {
         for i in 0..c.body.facts.binding_tokens.len { c.body.facts.binding_tokens[i] = validation_token(&c, c.body.facts.binding_tokens[i]) }
         pack_observation(&mut result.observations, &c.body.facts.binding_tokens, 12)
@@ -6280,11 +7863,14 @@ pub fn check_isolated_job(c: &mut Session, job: ValidationJob) -> Validation {
 fn unpack_validation(c: &mut Session, f: i32, result: &Validation) -> bool {
     if result.error.len > 0 {
         message := validation_bytes.decode(&result.error)
-        c.ok = false; c.error_at = result.at; c.error = message.value; c.specializations.error_function = f; return false
+        c.ok = false; c.error_at = result.at; c.error = message.value
+        c.error_note_at = result.note_at
+        if result.note.len > 0 { note_msg := validation_bytes.decode(&result.note); c.error_note = note_msg.value } else { c.error_note = "" }
+        c.specializations.error_function = f; return false
     }
     facts.reset(&mut c.body.facts, 0)
     c.body.scalar_function = false
-    c.body.facts.effects = result.effects; c.body.facts.first_task = result.first_task
+    c.body.facts.effects = result.effects; c.body.facts.effect_at = result.effect_at; c.body.facts.first_task = result.first_task
     mut p := 0
     while p < result.observations.len {
         column := result.observations[p]; count := result.observations[p + 1]; p = p + 2
@@ -6304,6 +7890,7 @@ fn unpack_validation(c: &mut Session, f: i32, result: &Validation) -> bool {
             else if column == 11 { c.body.facts.indirect.push(value) }
             else if column == 12 { c.body.facts.binding_tokens.push(value) }
             else if column == 13 { c.body.facts.binding_types.push(value) }
+            else if column == 14 { c.body.facts.call_offsets.push(value) }
         }
         p = p + count
     }
@@ -6666,7 +8253,8 @@ fn inline_catalog(c: &mut Session, catalog: &mut opt_inline.Catalog, model: &mut
             opt_inline.reject(&mut catalog, f)
             if c.error != "" {
                 c.jobs.invalid_declaration = f; c.jobs.invalid_offset = c.error_at; c.jobs.invalid_message = c.error.clone()
-                c.ok = true; c.error = ""; c.error_at = 0; break
+                c.jobs.invalid_note_offset = c.error_note_at; c.jobs.invalid_note = c.error_note.clone()
+                c.ok = true; c.error = ""; c.error_at = 0; c.error_note = ""; c.error_note_at = -1; break
             }
             continue
         }
@@ -6812,7 +8400,7 @@ pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function,
     c.code.checking = false; c.code.mir_capture = capture; c.report = reporting
     model.probing = false
     if !model.recording {
-        if c.error == "" { c.ok = true; c.error_at = 0 }
+        if c.error == "" { c.ok = true; c.error_at = 0; c.error_note = ""; c.error_note_at = -1 }
         return false
     }
     model.recording = false
@@ -6887,9 +8475,11 @@ fn accept_facts(c: &mut Session, declaration: i32) {
     for i in 0..c.body.facts.needed.len { target := c.body.facts.needed[i]; c.needed[target] = true }
     if c.tasks.program {
         c.tasks.direct[declaration] = c.body.facts.effects; c.tasks.complete[declaration] = true
+        c.tasks.effect_ats[declaration] = c.body.facts.effect_at
         for i in 0..c.body.facts.calls.len {
             target := c.body.facts.calls[i]
-            c.tasks.edges_from.push(declaration); c.tasks.edges_to.push(target)
+            edge_at := if i < c.body.facts.call_offsets.len { c.body.facts.call_offsets[i] } else { -1 }
+            c.tasks.edges_from.push(declaration); c.tasks.edges_to.push(target); c.tasks.edge_offsets.push(edge_at)
         }
         at := c.body.facts.first_task
         c.tasks.uses[declaration] = at >= 0; c.tasks.use_ats[declaration] = at
@@ -6913,6 +8503,14 @@ fn accept_facts(c: &mut Session, declaration: i32) {
     for i in 0..c.body.facts.literal_tokens.len {
         c.strings.push(c.world.tokens.texts[c.body.facts.literal_tokens[i]].clone())
         c.string_labels.push(c.body.facts.literal_labels[i])
+    }
+    for i in 0..c.body.facts.const_string_ids.len {
+        c.strings.push(c.world.const_strings[c.body.facts.const_string_ids[i]].clone())
+        c.string_labels.push(c.body.facts.const_string_labels[i])
+    }
+    for i in 0..c.body.facts.const_blob_ids.len {
+        c.const_blob_ids.push(c.body.facts.const_blob_ids[i])
+        c.const_blob_labels.push(c.body.facts.const_blob_labels[i])
     }
     for i in 0..c.body.facts.assert_tokens.len {
         token := c.body.facts.assert_tokens[i]; first := c.body.facts.assert_begins[i]; last := c.body.facts.assert_ends[i]
@@ -6947,7 +8545,8 @@ fn finish_projection(c: &mut Session, model: &mut opt_ir.Function) -> bool {
 }
 fn produce_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace) {
     if c.jobs.invalid_declaration == f {
-        c.ok = false; c.error = c.jobs.invalid_message.clone(); c.error_at = c.jobs.invalid_offset; return
+        c.ok = false; c.error = c.jobs.invalid_message.clone(); c.error_at = c.jobs.invalid_offset
+        c.error_note = c.jobs.invalid_note.clone(); c.error_note_at = c.jobs.invalid_note_offset; return
     }
     if c.jobs.checked_effects[f] >= 0 {
         c.body.facts.effects = c.jobs.checked_effects[f]
@@ -6955,7 +8554,7 @@ fn produce_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut
     }
     ft.reset_body(&mut c.types)
     c.body.reenter_owners = false
-    if c.tasks.program && c.world.unsafe_functions[f] { task_effect(&mut c, 16) }
+    if c.tasks.program && c.world.unsafe_functions[f] { task_effect_at(&mut c, 16, c.world.starts[f]) }
     c.body.scalar_function = false; model.recording = false; model.probing = false
     if c.scalar_enabled && opt_inline.restore_view_body(&catalog, f, &mut model, &c.world.param_names, &c.world.param_tokens, c.world.param_starts[f]) {
         c.body.scalar_function = true
@@ -7044,6 +8643,7 @@ fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
     if c.inline_enabled { fragments.reset_dependencies(&mut c.body.inline_deps) }
     fc.reset_body(&mut c.body)
     c.code.operand_depth = 0
+    c.body.current_fn = f
     c.body.current_owner = c.world.function_owners[f]
     c.body.self_type = c.world.impl_types[f]
     c.types.self_type = c.world.impl_types[f]
@@ -7495,6 +9095,21 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
         } else {
             rt_emit.emit_literal(&mut c.code, c.strings[i].clone(), c.string_labels[i])
             emitted_strings.put(c.strings[i].clone(), i64(c.string_labels[i]))
+        }
+    }
+    mut emitted_blobs: []i32 = []
+    for _ in 0..c.world.const_names.len { emitted_blobs.push(-1) }
+    for i in 0..c.const_blob_ids.len {
+        cid := c.const_blob_ids[i]
+        lbl := c.const_blob_labels[i]
+        if emitted_blobs[cid] >= 0 {
+            arm.alias_label(&mut c.code, lbl, emitted_blobs[cid])
+        } else {
+            first := c.world.const_blob_starts[cid]
+            count := c.world.const_blob_counts[cid]
+            raw := (&c.world.const_blobs[first..first + count]).clone()
+            rt_emit.emit_raw_bytes(&mut c.code, &raw, lbl)
+            emitted_blobs[cid] = lbl
         }
     }
     runtime.emit_profile_data(&mut c.code, &rt)

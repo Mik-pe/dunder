@@ -38,8 +38,12 @@ En Git-källa får ha högst en av `branch`, `tag` och `rev`:
 gren = { git = "https://github.com/ditt-team/bibliotek.git", branch = "main" }
 utgava = { git = "https://github.com/ditt-team/annat.git", tag = "v1.2.0" }
 exakt = { git = "https://github.com/ditt-team/tredje.git", rev = "0123456789abcdef0123456789abcdef01234567" }
+underpaket = { git = "https://github.com/ditt-team/monorepo.git", branch = "main", subdir = "packages/http" }
 ```
 
+För monorepon kan `subdir` ange en relativ underkatalog inom Git-utcheckningen
+där beroendets `dunder.toml` och källkod ligger (utan `..` eller ledande `/`).
+Låset lagrar den lösta commiten och katalogen för samma Git-källa.
 Utan väljare används repots standardgren. `rev` kan vara en Git-revision, men
 en full commitidentifierare ger en bestämd källa redan i manifestet.
 `path` och `git` kan inte kombineras. Lokala sökvägar är relativa till
@@ -132,4 +136,27 @@ vara standardvalen när `--example` utelämnas.
 
 Exempelnamn består av ASCII-bokstäver, siffror, `_` och `-` utan inledande
 `-`. `--example` kan inte kombineras med en positionell `.ddr`-fil.
+
+## Körning, installation och tester
+
+- **Binärnamn i `build/` från `dunder.toml`:** Utan `-o` döps projektets
+  färdigbyggda binär under `build/<mål>/<namn>` efter paketets `name` i
+  `dunder.toml` (med `.wasm` för `wasm32` och `.app` med `--app`) i stället
+  för källfilens stamnamn (`main`).
+- **Arbetskatalog vid `dunder run`:** När `dunder run` startar den byggda
+  binären körs programmet alltid i anroparens aktuella arbetskatalog (även vid
+  körning av `dunder.toml`, `--example` eller en fil i en annan katalog), så
+  relativa filsökvägar och argument tolkas likadant som när binären körs direkt.
+- **`dunder install`:** Bygger projektets binär (eller ett valt `--example`
+  respektive en positionell `.ddr`-fil) för värdplattformen och installerar den
+  atomiskt som `<namn>` i målkatalogen. Utan `--dir` eller `--prefix` används
+  samma katalog som `dunder`-binären (när den startats via `PATH` eller sökväg);
+  med `--dir KATALOG` respektive `--prefix PREFIX` installeras den i `KATALOG`
+  eller `PREFIX/bin`.
+- **Testutdata i `dunder test`:** Som standard kör och sammanräknar
+  `dunder test` bara testerna i det aktuella paketet/målfilerna (och hoppar över
+  standardbibliotekets egna `@test`-funktioner, inklusive för inbäddad
+  `selfhost/`- eller `stdlib/`-kod), såvida inte själva standardbiblioteket eller
+  kompilatorn testas direkt.
+
 [`Manifestparser`](../selfhost/driver/manifest.ddr) · [`CLI`](../selfhost/driver/cli.ddr)

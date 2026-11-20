@@ -115,9 +115,30 @@ workerarenor avmappas innan snapshoten avfryses och frigörs.
 ## Vad en worker får använda
 
 Spawn kräver en namngiven säker Dunder-funktion (inklusive specialiserade
-generiska funktioner som `spawn jobs work<string>(...)`) med en värdeparameter
-för indata. Ett scope med arbetsyta kräver också en andra parameter av typen
-`&mut Workspace` för den deklarerade arbetsytan.
+generiska funktioner som `spawn jobs work<string>(...)`). Utöver eventuell
+`workspace: &mut Workspace` och `world: &World` från scopet tar en worker och
+därmed `spawn` **exakt ett** säkert (`Sendable`) värdeargument (en vanlig
+läsparameter `T` eller en ägande `move T`). När en uppgift behöver flera
+indata samlas de i en `Sendable`-struct (eller en `Sendable`-tupel):
+
+```dunder
+struct JobInput {
+    id: i32,
+    label: string,
+}
+
+fn process_job(input: JobInput) -> string {
+    f"{input.id}:{input.label}"
+}
+
+fn example() {
+    task scope jobs(2) {
+        key := spawn jobs process_job(JobInput { id: 1, label: "dunder" })
+        print(await! jobs(key))
+    }
+}
+```
+
 Indata och returtyp måste uppfylla den inbyggda kompilatorbevisade traiten
 [`Sendable`](syntax.md#traits-och-impl-trait-for-type):
 

@@ -59,7 +59,9 @@ elementtypen från kontexten.
 En växande strängarray tar ägarskap om elementet. `a.push(move text)`
 flyttar en befintlig strängägare. `a.push(text.clone())` behåller `text`
 och ger arrayen en egen referens till samma oföränderliga text.
-Färska värden som `a.push(f"rad {i}")` lämnas direkt.
+Färska värden som `a.push(f"rad {i}")`, en ny fältprojektion ur ett temporärt
+anrop (`a.push(make_pair().left)`) och loopbindningar från `for x in move
+batch` kan lämnas direkt till `push` utan extra `move`.
 
 Arrayer har unikt ägarskap. `next := values` flyttar ägaren; `values` kan
 sedan inte läsas före återinitiering. `copy := values.clone()` ger en
@@ -107,8 +109,15 @@ immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
 överföringsförsök: framgång lämnar barnet i mängden och tömmer källhandtaget;
 `-1` lämnar det oförändrat hos anroparen. Detta kräver ett skrivlån.
 `ChildSet.try_insert(move child)` tar emot ägaren och returnerar
-`Result<i32, Child>`. `.Ok` innehåller platsen i mängden. `.Err` ger
-tillbaka barnprocessens handtag till anroparen.
+`Result<i32, Child>`. `.Ok(slot)` innehåller platsen i mängden. `.Err(child)`
+ger tillbaka barnprocessens handtag till anroparen. För resultattyper med
+tom nyttolast (`Result<T, ()>`) skrivs varianten utan parenteser (`.Ok`
+respektive `.Err`), och metoder på `Result` skrivs alltid med parenteser:
+`.is_ok()`, `.is_err()`, `.unwrap_or(...)` och `.unwrap_or_default()`.
+`ChildSet::poll_io(timeout_ms)` (samt modulfunktionen `process.set_poll_io`)
+väntar på körbar I/O och returnerar antalet färdiga rörbeskrivare från `poll`;
+`ChildSet::wait_any` / `process.set_wait_any` är ett äldre alias med samma returvärde
+(antal färdiga filbeskrivare, inte en enskild slotindexering).
 
 Sockets, socketmängder, barnprocesser och barnprocessmängder är
 [`@resource`-typer](memory.md#unika-externa-resurser). De flyttas och kan
@@ -154,19 +163,19 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 
 | Import | Innehåll |
 | --- | --- |
-| Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Result<T, E>` (med `.is_ok`, `.is_err`, `.unwrap_or`, `.unwrap_or_default` och villkorliga `Eq`/`Ord`/`Hash`/`Display`) samt implementationer för primitiver och `[]T`/`(A, B)`/`(A, B, C)`. |
+| Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Result<T, E>` (med `.is_ok()`, `.is_err()`, `.unwrap_or(...)`, `.unwrap_or_default()`, `.Ok`/`.Err` utan parenteser för `()`, samt villkorliga `Eq`/`Ord`/`Hash`/`Display`) samt implementationer för primitiver och `[]T`/`(A, B)`/`(A, B, C)`. |
 | `std.cmp` | Trait-generisk ordning och gränser: `min<T>`, `max<T>`, `clamp<T>` (`T: Ord + Storable`), `Ordering`/`Eq`/`Ord` (re-exporterade) samt omslagstypen `Reverse<T>` med villkorliga `Eq`, `Ord`, `Hash`, `Display`, `Default` och `Sendable`. |
 | `std.array` | `ints`, `strings`, `sum` samt generiska algoritmer (`reverse`, `sort`, `sort_by`, `is_sorted`, `binary_search`, `contains`, `index_of`, `equal`, `min_index`, `max_index`, `dedup`, `append`, `fill`, `resize`, `join`) ovanpå `Ord`/`Eq`/`Clone`/`Display`. `sort` och `sort_by` använder introsort på plats med heapsort-fallback, O(n log n); strängar jämförs som UTF-8-byte. |
 | `std.map` | [`Map<K, V>`](#generiska-samlingar) (`K: Hash + Storable`, `V: Storable`) med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.set` | [`Set<K>`](#generiska-samlingar) (`K: Hash + Storable`) ovanpå `Map<K, bool>` med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.hash` | `hash(text)`, `mix`, `combine`, `of<T: Hash + Storable>`, `Hash` och `Hasher` (med `Default`, `.write_u64`, `.write_i64`, `.write_bytes`, `.write_str`, `.finish`). |
-| `std.text` | `starts_with`, `ends_with`, `find`, `split`, `trim`. |
-| `std.bytes` | Packade bytebuffertar (`[]u8`), textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kompilatorns kvarvarande `[]i32`-buffertar. |
+| `std.text` | `starts_with`, `ends_with`, `find`, `contains`, `replace`, ASCII-`lower`/`upper`, `pad_left`/`pad_right`, `split`, `trim`. |
+| `std.bytes` | Packade bytebuffertar (`[]u8`), `from_text`, `from_i32`, `to_i32`, textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kvarvarande `[]i32`-buffertar. |
 | `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str`, `Reader::new`/`Default` samt traits `Encode`/`Decode` och `wire.encode<T>`/`wire.decode<T>`). |
-| `std.json` | `Writer` (`Default`) och `Kind` (`Eq`, `Display`) för att skriva JSON, traiten `Encode` (implementerad för skalärer, `string` och `[]T where T: Encode`) med `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`, samt parsern `Doc::parse_bytes`/`Doc::parse_text` med `.get_str`, `.get_i64`, `.get_u64`, `.get_f64` och `.get_bool`. |
-| `std.sha256` | `digest(&bytes)` och `text(string)` ger 32 digestbyte. Implementerad i Dunder. |
+| `std.json` | `Writer` (`Default`) och `Kind` (`Eq`, `Display`) för att skriva JSON, traiten `Encode` (implementerad för skalärer, `string` och `[]T where T: Encode`) med `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`, samt parsern `Doc::parse_bytes`/`Doc::parse_text` med `.get_str`, `.get_i64`, `.get_u64`, `.get_f64`, `.get_bool`, `.raw_span` och `.raw_json`. |
+| `std.sha256` | `[]u8`-API:t `digest_bytes(&[]u8)`, `digest_text(string)`, `digest_range(&[]u8, start, len)`, `hex_bytes(&[]u8)` och `hex_text(string)` ger 32 byte respektive hexsträng; äldre `digest(&[]i32)` och `text(string)` finns kvar. |
 | `std.parse` | `FromStr` och `parse.value<T: FromStr>` (implementerad för `bool`, `string`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`) samt `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse`. `parse` accepterar understreck mellan siffror. |
-| `std.math` | `clamp`, `min`, `max`, `sin`, `cos`, `tan` samt `total_cmp_f64`/`total_cmp_f32`; se [Matematik](#matematik). |
+| `std.math` | `clamp`, `min`, `max`, `sin`, `cos`, `tan`, `total_cmp_f64`/`total_cmp_f32` samt fällfri `checked_*`-heltalsaritmetik; se [Matematik](#matematik). |
 | `std.io` | Ström-traits (`Read`, `Write`, `BufRead: Read`, `Seek`), `SeekFrom`, `Line`, kapabilitetsstyrda `Stdin`/`Stdout`/`Stderr` (`capability stdio`) och `read_stdin`/`read_stdin_bytes`/`read_stdin_limit`, samt ägda omslag (`BufReader<R>`, `BufWriter<W>` med `FlushError<W>`, `Limited<R>`, `Cursor`, `Empty`, `Sink`) och generiska algoritmer (`copy`, `copy_limit`, `write_all`, `write_str`, `read_exact`, `read_to_end`, `read_to_end_limit`, `read_to_string`, `is_would_block`). |
 | `std.alloc` | Generellt allokerings-API: `AllocError`, `Layout`, `layout_of<T>`, `layout_array<T>`, `Block`, traiten `RawAllocator` (`unsafe fn alloc`/`dealloc`/`alloc_zeroed`/`realloc`), `Global`, `System`, `Capped<A>`, `Stats`, `Tracking<A>`, `Bump<A>`, `OwnedBuf<A>` (`as_bytes`, `io.Write`), `Span`, `Arena<A>`/`FrozenArena<A>` (`freeze_arena`, `read_into_arena`) samt generationssäkra `Pool<T: Storable>`/`Id<T>`. |
 | `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6 (`TcpStream` implementerar `io.Read` och `io.Write`), `IpAddr`, `SocketAddr`, `PollSet`, `StreamSet` och `resolve`. |
@@ -287,6 +296,13 @@ Oändliga vinklar och NaN ger NaN.
 ordning som `Ordering` (`-NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN`),
 lämplig att skicka till `array.sort_by` när flyttal behöver deterministisk ordning.
 
+För fällfri aritmetik på indata erbjuder `std.math` explicita
+`checked_*`-funktioner som returnerar `Result<T, ()>` (`.Err` vid overflow
+eller division/rest med noll i stället för processfälla):
+`checked_add_*`, `checked_sub_*`, `checked_mul_*`, `checked_div_*` och
+`checked_rem_*` för typerna `i32`, `i64`, `u32`, `u64` och `usize`, samt
+`checked_neg_i32` och `checked_neg_i64`.
+
 Stora vinklar reduceras med binär fastpunktsaritmetik enligt
 [Payne–Hanek-metoden](https://perso.ens-lyon.fr/jean-michel.muller/RangeReductionIEEETC0305.pdf).
 
@@ -320,6 +336,11 @@ kräver precis ett komplett rotvärde och en giltig följd av anrop.
 `decimal`, `write_f64` och `field_f64` avvisar NaN och oändlighet.
 `Doc.as_f64` och `Doc.get_f64` ger `ok: false` för saknade värden,
 värden av annan JSON-typ och tal utanför det ändliga binary64-området.
+`Doc.raw_span(node)` returnerar källtextens spann som `string`: för objekt,
+arrayer, tal, bool och `null` ges hela JSON-tokenet, medan strängnoder ger
+det inre råa stränginnehållet utan omgivande citattecken (med eventuella
+escape-sekvenser oförändrade). Använd `Doc.raw_json(node)` när giltig
+JSON-källtext behövs för alla nodtyper, inklusive citattecken runt strängar.
 
 ## Bitoperationer
 

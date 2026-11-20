@@ -14,7 +14,7 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | --- | --- |
 | `b := a`, tilldelning, retur och konstruktion | Flyttar resursägande värden till mottagaren. |
 | Vanlig funktionsparameter | Lånar strängar och aggregat för läsning under anropet. |
-| `r := &place` | Namnger ett oföränderligt läslån till blockets slut. |
+| `r := &place` | Namnger ett oföränderligt läslån fram till dess sista lexikala läsning i blocket (eller till blockslut vid `defer`/inre loopar). |
 | `&mut value` vid anrop | Exklusivt skrivlån; kräver muterbar lagring. |
 | `move`-parameter och `consume(move value)` | Funktionen tar över ägarskapet. |
 | `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
@@ -164,9 +164,12 @@ lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
 
 `r := &owner.field` och `r := &values[index]` skapar oföränderliga lokala
 referenser. Typen kan härledas eller anges, exempelvis `r: &i32 = &values[0]`.
-Lånet gäller till slutet av blocket som deklarerar referensen, även efter
-dess sista läsning; kompilatorn använder inte NLL. Ett inre block kan därför
-avgränsa lånet före en senare ändring av ägaren.
+Ett lokalt läslån inom samma block och loopdjup frisätts automatiskt efter sin
+sista lexikala användning innan en senare skrivning, `replace` eller flytt av
+ägaren. Om referensen fortfarande kan läsas senare i blocket, fångas av ett
+`defer`-block eller deklareras utanför en loop där ägaren ändras (inre
+grenslingor/loopar eller senare läsningar) ligger lånet kvar till blockslut;
+ett inre `{ ... }`-block eller sista läsningen frigör det tidigare.
 
 ```dunder
 fn main() {
@@ -248,12 +251,38 @@ bytekopia av returvärdet. Scratchlagring stöds inte av `replace`.
 Det finns ingen generell `take` med implicit standardvärde: en ersättare
 måste vara ett uttryckligen valt giltigt värde, även för `@resource`.
 
-Vanlig `for` och `match` lånar. `for value in move values` respektive
-`match move value` överför ägaren. `for value in values.iter()` lånar också;
-en lagrad ägande iterator skapas från `(move values).iter()` eller
-`values.clone().iter()`. Ägda payloadbindningar överförs först efter att
-matcharmens villkor har lyckats. Ägare som ett aktivt `defer` behöver får
-inte flyttas före den uppskjutna körningen.
+Vanlig `for` och `match` lånar. Ett aktivt lån under `for x in record.field`
+eller `match record.enum_field` låser enbart det lånade fältets sökväg, så
+oberoende syskonfält kan fortfarande ändras eller växa med `.push(...)`.
+`for value in move values` respektive `match move value` överför ägaren direkt.
+Loopbindningen i `for value in move values` (samt vid iteration över en ägd
+temporär array, `for value in make_values()`) och en färsk fältprojektion
+från ett temporärt uttryck (`make_pair().left`) känns igen som färska ägda
+värden vid `push`, `replace` och ägande parametrar utan att extra `move`
+behövs; lagrade lokaler och fält på namngivna ägare kräver fortfarande
+`move value` (eller `.clone()` för klonbara värden).
+`for value in values.iter()` lånar också; en lagrad ägande iterator skapas
+från `(move values).iter()` eller `values.clone().iter()`.
+
+Även vanlig `match värde` (eller `match s.fält`) över en namngiven lokal eller
+ett ägt structfält tillåter att en arm flyttar ut en ägd eller `@resource`-nyttolast
+genom dess mönsterbindning (exempelvis `failure = e` i `.Err(e)`, `taken := c`
+eller `out.push(move c)` i `.Ok(c)`), på samma sätt som en partiell fältflytt:
+- Själva flytten förbrukar motsvarande ägarskapssökväg från den matchade roten
+  längs den armen, medan armar som bara läser eller divergerar (`return`,
+  `break`, `continue`) lämnar ämnet orört.
+- Gräns mot fältflyttar och lånade källor: en flytt ur `match` kräver ett ägt,
+  oindexerat ämne (inte en parameter/referens `fn f(r: Result<...>)`,
+  `match &r`, `match arr[i]` eller fält inuti en `@resource(dispose)`-struct
+  med automatisk stängning).
+- En `match`-guard får aldrig flytta ut bindningar (`if take(move v)` avvisas);
+  efter att guarden godkänts gäller vanliga flyttregler.
+- `.Ok(mut x)` skapar en muterbar bindning och kräver `match move ...` eller ett
+  färskt ägt uttryck (annars föreslås `match move` eller lokal kopia/`clone` för
+  klonbara typer). Icke-klonbara `@resource`-typer föreslår aldrig `.clone()`
+  i någon ägarskaps- eller lånediagnostik.
+Ägare som ett aktivt `defer` behöver får inte flyttas eller autofrisättas
+före den uppskjutna körningen.
 
 Arrayrepetition som `[text; 4]` är en uttrycklig replikering: initialiseraren
 utvärderas och konsumeras en gång, även om antalet är noll. Skriv
@@ -274,10 +303,12 @@ ett arrayelement, ett lokalt alias till parametern eller ett vidarebefordrat
 anrop kan alla uppfylla det kravet. Lokala ägare, råpekare och
 `move`-parametrar ger ingen sådan livstid.
 
-Om anroparen binder resultatet till en lokal gäller lånet till det blockets
-slut. Det skyddar hela platsen som lämnades som källargument. Den som
-skickar `&record.bytes` kan alltså fortfarande ändra ett oberoende fält
-i `record`. Ett arrayintervall delar elementlagringen med originalet.
+Om anroparen binder resultatet till en lokal gäller lånet fram till
+referensens sista lexikala läsning i blocket (eller till blockets slut vid
+`defer` eller när ägaren ändras i ett djupare loopscope). Det skyddar hela
+platsen som lämnades som källargument. Den som skickar `&record.bytes` kan
+alltså fortfarande ändra ett oberoende fält i `record`. Ett arrayintervall
+delar elementlagringen med originalet.
 Anroparen håller den returnerade vyns beskrivare i sin egen stackram,
 så att flera anrop kan hålla olika intervall levande samtidigt. I
 `unsafe` observerar `addr(&view[i])` adressen till originalelementet.

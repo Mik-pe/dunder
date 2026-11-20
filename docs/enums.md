@@ -124,13 +124,21 @@ före `.Err(.NotFound)` blir den specifika armen onåbar och bygget avvisas.
 För mycket stora mönster kan kompilatorn ge `match pattern coverage limit exceeded`.
 Dela då upp matchningen i flera `match` så att varje kontroll blir mindre.
 
-En payload kan bindas till ett namn eller hoppas över med `_` oavsett
-typ. För att fortsätta mönstret med en variant måste payloaden själv ha
+En payload kan bindas till ett namn (`v` eller `mut v`) eller hoppas över med `_`
+oavsett typ. För att fortsätta mönstret med en variant måste payloaden själv ha
 enumtyp. Kompilatorn kontrollerar variantnamn och antal payloadmönster på
-varje nivå. Vanlig matchning lånar resursägande payloads. `match move value` och
-matchning av ett färskt ägt uttryck överför payloadens ägarskap till den
-valda armen efter att dess villkor lyckats. Komma
-skiljer armarna åt.
+varje nivå.
+
+Vid `match` på en lokal ägd variabel eller ett ägt structfält (`match värde`,
+`match s.fält`) lånar mönsterbindningar som standard när armen bara läser dem.
+Om en arm flyttar ut en ägd payload (t.ex. `failure = e`, `ägd := v` eller
+`lista.push(move v)`) överförs ägarskapet ur det matchade värdet längs just den
+armen på motsvarande sätt som en fältflytt; icke-flyttande armar lämnar värdet
+levande. `match move value` och matchning av ett färskt ägt uttryck flyttar
+däremot in ägarskapet direkt i armarna efter att ett eventuellt villkor har
+lyckats och tillåter också `mut`-mönsterbindningar som `.Ok(mut x)` direkt.
+Se gränserna mellan fältflytt, mönsterbindning och lånade källor i
+[Minne och ägarskap](memory.md#fält-element-och-begränsningar). Komma skiljer armarna åt.
 
 Som sats kan `match` ha block med flera satser.
 En avslutande `match` kan ge funktionens returvärde genom armarnas sista
@@ -192,9 +200,12 @@ feltyp måste vara densamma som operandens. Funktionens framgångstyp
 kan väljas oberoende.
 
 `Result` följer samma ägarskapsregler som andra enums. När ett Result
-innehåller en resurs flyttar `?` ut den valda varianten. Ett anrop som
-misslyckas med att ta över en resurs kan returnera både felet och ägaren
-i `.Err`. Använd `match move` för att ta emot dem.
+innehåller en resurs flyttar `?` ut den valda varianten. Vid vanlig `match res`
+på en ägd lokal eller ett ägt fält kan en arm också flytta ut `.Ok(v)` eller
+`.Err(e)` direkt utan `match move` (och lämnar `res` förbrukat efter den armen),
+medan `.Ok` eller `.Err` utan parenteser används när payloadtypen är `()`.
+Metoder på värdet anropas med parenteser: `.is_ok()`, `.is_err()`,
+`.unwrap_or(...)` och `.unwrap_or_default()`.
 [Körbart exempel med automatisk resursstängning](../tests/fixtures/results.ddr)
 
 ## Lagring och dispatch

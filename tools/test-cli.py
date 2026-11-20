@@ -999,12 +999,28 @@ def manifest_dependencies(p):
             "    assert(a.a_val() == 11)\n"
             "}\n")
 
+    import shutil
     app = p.root / "app"
+    target = "arm64-macos" if sys.platform == "darwin" else ("arm64-linux" if os.uname().machine in ("arm64", "aarch64") else "x86_64-linux")
     # 42 + 32 + 3 + 4 + 11 + 11 + 100 = 203
     assert p.call("run", cwd=app).stdout == "203\n"
-    assert (app / "build/arm64-macos/consumer" if sys.platform == "darwin" else app / "build").exists()
+    assert (app / f"build/{target}/consumer").exists()
+    assert not (app / f"build/{target}/main").exists()
+    shutil.rmtree(app / "build")
+    p.call("build", "src/main.ddr", cwd=app)
+    assert (app / f"build/{target}/consumer").exists()
+    assert not (app / f"build/{target}/main").exists()
+    shutil.rmtree(app / "build")
     assert p.call("run", "src/main.ddr", cwd=app).stdout == "203\n"
+    assert (app / f"build/{target}/consumer").exists()
+    assert not (app / f"build/{target}/main").exists()
     p.call("build", cwd=app / "src")
+    assert (app / f"src/build/{target}/consumer").exists()
+    assert not (app / f"src/build/{target}/main").exists()
+    shutil.rmtree(app / "src/build")
+    p.call("build", "main.ddr", cwd=app / "src")
+    assert (app / f"src/build/{target}/consumer").exists()
+    assert not (app / f"src/build/{target}/main").exists()
     checked = p.call("check", "--agent", cwd=app)
     assert json.loads(checked.stdout.splitlines()[-1])["kind"] == "ok"
     checked_explicit = p.call("check", "src/main.ddr", "--agent", cwd=app)
@@ -1102,11 +1118,90 @@ def mac_bundle(p):
     subprocess.run(["/usr/bin/codesign", "--verify", "--strict", app], check=True)
 
 
+def install_cwd_and_test_scoping(p):
+    import shutil
+    # D3: dunder run executes in the caller's working directory in all modes.
+    cwd_proj = p.root / "cwd_proj"
+    p.write("cwd_proj/dunder.toml",
+            'name = "cwdapp"\nroot = "src/main.ddr"\n[examples]\ndemo = "examples/demo.ddr"\n')
+    cwd_body = (
+        "capability filesystem\nimport std.fs as fs\n"
+        "fn main() { print(fs.cwd().value) }\n"
+    )
+    p.write("cwd_proj/src/main.ddr", cwd_body)
+    p.write("cwd_proj/examples/demo.ddr", cwd_body)
+    sub = cwd_proj / "sub/deep"
+    sub.mkdir(parents=True)
+    outside = p.root / "outside_cwd"
+    outside.mkdir()
+    assert p.call("run", cwd=sub).stdout.strip() == str(sub.resolve())
+    assert p.call("run", "--example", "demo", cwd=sub).stdout.strip() == str(sub.resolve())
+    assert p.call("run", str(cwd_proj / "src/main.ddr"), cwd=outside).stdout.strip() == str(outside.resolve())
+
+    # D4: dunder test excludes bundled stdlib @test functions from user suites.
+    p.write("user_tests.ddr",
+            "capability filesystem\n"
+            "import std.fs as fs\nimport std.bytes as bytes\nimport std.text as text\n"
+            "@test fn only_mine() {\n"
+            "    raw := bytes.from_text(text.upper(\"ok\"))\n"
+            "    assert(raw.len == 2 && fs.cwd().ok)\n"
+            "}\n")
+    listed = p.call("build-tests", "--list", "user_tests.ddr").stdout.splitlines()
+    assert len(listed) == 1 and listed[0].endswith("user_tests.ddr::only_mine"), listed
+    assert all("<stdlib/" not in line for line in listed), listed
+    tested = p.call("test", "user_tests.ddr")
+    assert "1 passed, 0 failed" in tested.stdout, tested.stdout
+    assert "<stdlib/" not in tested.stdout, tested.stdout
+
+    # D1: dunder install into --dir, --prefix, default compiler directory, and reinstall.
+    p.write("cwd_proj/src/tool.ddr", "fn main() { print(\"tool v1\") }\n")
+    p.write("cwd_proj/examples/demo.ddr", "fn main() { print(\"demo installed\") }\n")
+    p.write("cwd_proj/src/main.ddr", "fn main() { print(\"main v1\") }\n")
+
+    bin_dir = p.root / "custom/bin"
+    inst_dir = p.call("install", "--dir", str(bin_dir), cwd=cwd_proj)
+    installed_main = bin_dir / "cwdapp"
+    assert inst_dir.stdout == f"installed {installed_main}\n", inst_dir
+    assert subprocess.run([installed_main], capture_output=True, encoding="utf-8", check=True).stdout == "main v1\n"
+
+    prefix_dir = p.root / "local-prefix"
+    inst_ex = p.call("install", "--example", "demo", f"--prefix={prefix_dir}", cwd=cwd_proj)
+    installed_demo = prefix_dir / "bin/demo"
+    assert inst_ex.stdout == f"installed {installed_demo}\n", inst_ex
+    assert subprocess.run([installed_demo], capture_output=True, encoding="utf-8", check=True).stdout == "demo installed\n"
+
+    # Reinstalling over an already-executed binary uses atomic staging.
+    p.write("cwd_proj/src/main.ddr", "fn main() { print(\"main v2\") }\n")
+    p.call("install", f"--dir={bin_dir}", cwd=cwd_proj)
+    assert subprocess.run([installed_main], capture_output=True, encoding="utf-8", check=True).stdout == "main v2\n"
+
+    # Default install dir matches the running dunder binary's parent directory.
+    fake_home = p.root / "dunder-home/bin"
+    fake_home.mkdir(parents=True)
+    local_dunder = fake_home / "dunder"
+    shutil.copy2(p.compiler, local_dunder)
+    local_cli = Project(local_dunder, cwd_proj)
+    inst_default = local_cli.call("install", "src/tool.ddr")
+    installed_tool = fake_home.resolve() / "tool"
+    assert inst_default.stdout == f"installed {installed_tool}\n", inst_default
+    assert subprocess.run([installed_tool], capture_output=True, encoding="utf-8", check=True).stdout == "tool v1\n"
+
+    # Error handling for invalid install flags / targets / directory destinations.
+    p.call("install", "-o", "out", cwd=cwd_proj, status=2)
+    p.call("install", "--dir", str(bin_dir), "--prefix", str(prefix_dir), cwd=cwd_proj, status=2)
+    p.call("install", "--app", cwd=cwd_proj, status=2)
+    p.call("build", "--dir", str(bin_dir), cwd=cwd_proj, status=2)
+    p.call("install", "--target", "wasm32", cwd=cwd_proj, status=1)
+    dir_clash = p.root / "dir_clash/cwdapp"
+    dir_clash.mkdir(parents=True)
+    p.call("install", "--dir", str(p.root / "dir_clash"), cwd=cwd_proj, status=1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("compiler", type=Path)
     compiler = parser.parse_args().compiler.resolve(strict=True)
-    cases = [modules_and_manifest, manifest_dependencies, bytes_big_endian_guards, targets_and_cache, worker_options, phase_timings, scalar_optimizer_controls,
+    cases = [modules_and_manifest, manifest_dependencies, install_cwd_and_test_scoping, bytes_big_endian_guards, targets_and_cache, worker_options, phase_timings, scalar_optimizer_controls,
              compiler_profile_controls, whole_function_mir_controls, whole_function_optimizer_controls,
              whole_function_memory_controls, whole_function_value_controls, runtime_profile_controls, ownership_optimizer_controls, constant_division_controls, frame_free_controls, range_optimizer_controls, inline_optimizer_controls, isolated_tests, filesystem]
     if sys.platform == "darwin":
