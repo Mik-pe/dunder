@@ -369,8 +369,8 @@ målbinärens absoluta sökväg som sista argument. Sviten kontrollerar adress,
 allokerings- och retainräknare, livstidsfel, intervall och UTF-8; den gör inga
 prestandamätningar.
 
-Testverktyget använder Python 3:s standardbibliotek. Det
-bygger varje program med den angivna Dunder-kompilatorn. Tio minnesprov håller
+Kontrakts- och ägarskapssviterna är skrivna i Dunder
+(`tools/test_runtime_contracts.ddr`, m.fl.) med Node för Wasm-proven. Tio minnesprov håller
 bland annat arraykopior, nästlade enumvärden, lånade parametrar, snitt och
 strängreturer levande medan andra värden ersätts eller frigörs. Exempelvis
 kopierar ett prov en array med 1 024 `i64` i 200 000 varv. Ett annat tar emot
@@ -428,7 +428,8 @@ fält eller en C-layout-struct använder regionens lagring. Ett muterbart lån
 av en hel vanlig struct använder en ägd tillfällig kopia och skriver tillbaka
 fältvärdena efter anropet. Självkompilatorn följer lån genom funktionsanrop,
 återlån och funktionspekare och avvisar lån som når `addr`. En kopia av ett
-element eller en uttrycklig arrayklon har egen lagring.
+enskilt element blir ett vanligt självständigt värde, medan `.clone()` på en
+hel scratch-vy avvisas (`scratch values cannot be cloned out of their region`).
 En inre region kan skugga en yttre. Namnet på regionen och dess direkta
 deklarationer tillhör samma scope. Se `tests/contracts/region_borrows.ddr`
 och de ogiltiga exemplen under `tests/fixtures/region_errors/`.

@@ -140,8 +140,9 @@ utan falska `.clone()`-förslag för resurser.
 `pad_left` och `pad_right`; f-strängar stöder bredd- och justeringsangivelser
 för strängar (`:<N` / `:>N`); `std.bytes`, `std.crypto`, `std.text` och `std.sys`
 har samordnats kring `[]u8` med konverteringshjälpare (`from_text`, `to_i32_vec`,
-`sha256_bytes`); heltal och `std.math` erbjuder `checked_add`, `checked_sub`
-och `checked_mul`; `std.json.Doc` dokumenterar `raw_span` och tillhandahåller
+`sha256_bytes`); `std.math` erbjuder fällfria `checked_add_*`, `checked_sub_*`,
+`checked_mul_*`, `checked_div_*` och `checked_rem_*` som fria typade funktioner
+samt heltal har `.wrapping_add`/`.wrapping_sub`/`.wrapping_mul`; `std.json.Doc` dokumenterar `raw_span` och tillhandahåller
 `raw_json`; och `std.process.ChildSet` dokumenterar `wait_any`.
 [Standardbiblioteket](standard.md)
 
@@ -157,7 +158,89 @@ parenteser och `.Err(())` på `Result`, `Sendable`-argument i `spawn`, `_` i
 `match` samt skillnaden mellan `&arr[a..b]` och `text[a..b]`.
 [Beroenden och manifest](dependencies.md) · [Systembiblioteket](sys.md)
 
+### Korrekthet, kapabilitetsskydd och diagnostik (0.6.x)
+
+- **Tydligare kapabilitets- och importdiagnostik:** Kompilatorn skiljer nu på
+  okända, duplicerade och saknade modulkapabiliteter, pekar på rätt token vid
+  dubbletter och `@requires`, listar giltiga kapabiliteter med förslag för vanliga
+  felskrivningar (`io` → `stdio`, `fs` → `filesystem`, `net` → `network`,
+  `proc` → `process`, `ffi` → `unsafe`), förklarar hur man lägger till saknad
+  `capability` högst upp i modulen och ger specifika fel för okända `std.*`-moduler
+  samt direkta funktionsimporter som `import std.io.stdin`.
+- **`rune`-aritmetik:** `+`/`-`/`*`/`/`/`%` på `rune` avvisas statiskt
+  (jämförelser och explicita konverteringar behålls) så att ogiltiga surrogater
+  eller negativa kodpunkter inte kan skapas i säker kod.
+- **Closure-lyftning i `closures.ddr`:** Funktioner som returnerar konsumerande
+  funktionstyper (`fn mk() -> fn(move []i32)`), closures med flertypade generiska
+  returtyper (`Result<T, E>`), och `Self`/`self`-omskrivning inuti
+  `impl Trait for Type` samt generiska `impl`-block fungerar korrekt.
+- **Täppta kapabilitetsluckor i `sys` och `std.io`:** `sys.net_*` kräver nu
+  `@requires(network)` och råa filbeskrivarprimitiv (`sys.fd_read`/`fd_write`/
+  `fd_close`/`fd_poll`/`fd_set_nonblocking` samt `std.io.fd_read_chunk`/
+  `fd_write_chunk`) är markerade `unsafe`. Motsägande dokumentation i `syntax.md`,
+  `memory.md`, `floating.md`, `arkitektur.md` och `sys.md` är uppdaterad.
+
 ## Kommande förbättringar
 
-Allt ovan är genomfört och verifierat inför `0.6.0`. Nya punktlistor för nästa
-cykel läggs här vid behov.
+Planerad färdplan efter `0.6.x`:
+
+### 0.7.0 — Språk- och standardbiblioteksergonomi
+
+- **Enhetlig felhantering och `Option<T>`:** Inför `Option<T>` i preludiet och
+  samordna `stdlib` kring `Result<T, E>` och `Option<T>` i stället för
+  engångs-`*Result`-structar med dummy-handtag och sentinel `-1`/`-2` (`sys.ReadResult`,
+  `text.find`, `array.index_of`, m.fl.); komplettera `Result` med kombinatorer
+  (`map`, `map_err`, `and_then`, `ok`, `expect`) och byt ut överlastningen av
+  `IoError.Changed` för `WouldBlock`.
+- **Enhetligt byte- och samlings-API:** Fasa ut kvarvarande `[]i32`-bytefunktioner
+  i `std.bytes`, `std.sha256` och `std.sys` till förmån för `[]u8`, lägg till
+  `string.as_bytes() -> &[]u8` och `[]T.truncate(n)`, och rensa eller fasa ut
+  duplicerade fria wrappers i `std.net` och `std.process`.
+- **Traits, generics och mönstermatchning:** Lägg till generiska metoder i
+  `impl`-block (`fn map<U>(...)`), `@derive(Eq, Hash, Display, Default)`,
+  fältsnål konstruktion (`Point { x, y }`) samt bredare `match` för heltal,
+  strängar, tupler, `|`-alternativ och `..` i tuplevarianter.
+- **Lån och ägande utan omvägar:** Stöd disjunkta fältlån bakom `&mut self`
+  (slipper `replace(&mut self.field, [])`-dans), lokala `&mut`-bindningar och
+  `Map::get_mut`/`entry`, smidig konsumering av `@resource(dispose)`-värden utan
+  konstgjort `A: Default`, muterbara `move`-parametrar (`mut move x: T`) samt
+  divergensanalys för alltid-returnerande `unsafe`-block.
+- **FFI och per-paket-kapabiliteter:** Stöd plattformsval direkt i `@extern` och
+  konfigurerbar/dynamisk biblioteksladdning i `std.crypto` (utan hårdkodade
+  Homebrew-sökvägar). Inför per-paket-kapabilitetstak i konsumentens `dunder.toml`
+  (standard: inga privilegier för beroenden) och stäng kvarvarande `sys`-luckor
+  för filsystem/stdio.
+
+### 0.8.0 — Fristående frontend, verktygskedja och paketsystem
+
+- **Fristående AST/HIR-frontend:** Bryt upp `selfhost/frontend/compile.ddr` så att
+  parsning, namnupplösning, typkontroll och ägarskapsanalys skiljs från
+  kodemission — inklusive `dunder check` utan virtuell kodgenerering, flera fel
+  per kompilering, varningar (oanvända variabler/importer) och full `--agent`-utdata
+  även när koden har fel.
+- **Bättre diagnostik och utvecklarverktyg:** Särskilda felkoder utöver `E1000`,
+  källkodsutdrag med `^`-markering och riktiga felspann i `--agent`, samt `dunder fmt`
+  och `dunder init`/`clean`.
+- **Lättare closures och iteratorer:** Härledda capture-typer (`fn[base](...)`),
+  skilja `Copy`-funktionspekare från referensräknade eller flyttbara (`move`-only)
+  closures, lånande/icke-escaping closures (så bl.a. `array.sort_by` och
+  `http_client`-callbacks slipper C-stil `ptr`-kontext) utan global
+  signaturboxning av vanliga funktionspekare, samt användardefinierat
+  `Iterator`-protokoll med `for (i, x)`-enumerate, `0..=n` och direkt iteration
+  över `Map`/`Set`.
+- **Mognare paketsystem:** Isolerade beroendenamnrymder per paket i `dunder.toml`,
+  delad Git-cache i `$DUNDER_HOME`, full `std.toml`-parsning i `manifest.ddr` och
+  användning av paketets `version` i bl.a. `--app`-bundles.
+
+### 0.9.0 — Prestanda i C-klass och plattformsmognad
+
+- **Värdesemantik och helfunktionsoptimering:** Stack-/POD-värden för vanliga
+  structar ([`pod-values-plan.md`](pod-values-plan.md)), helfunktionsinlining och
+  aktiverad MIR-SSA som standard efter mätning mot C-målen i
+  [`optimization.md`](optimization.md).
+- **Direkta backends:** Sänk MIR direkt till x86-64 (med fysisk registerallokering)
+  och Wasm (med lokaler och strukturerade hopp) i stället för att översätta
+  ARM64-maskinord.
+- **Tasks, IDE-stöd och nya mål:** Inkrementell cache och ergonomi för `task scope`,
+  LSP-server och DWARF-debuginfo, mer flexibel heap/filstorlekshantering samt
+  stöd för WASI/Windows.

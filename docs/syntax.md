@@ -98,8 +98,9 @@ konvertering avslutar processen med status 101. Division/rest med noll ger
 102. Ogiltiga arrayindex ger 103 och en misslyckad `assert` ger 104.
 Konvertering från `i32` till en enum utan payload kontrollerar deklarerade
 värden och ger 108 för okända värden; se [enums och match](enums.md).
-Reglerna gäller även optimerade byggen. Wraparound är ännu inte en
-språkoperation.
+Reglerna gäller även optimerade byggen. För uttrycklig omslagsaritmetik finns
+metoderna `.wrapping_add`, `.wrapping_sub` och `.wrapping_mul` (infixoperatorer
+med wraparound saknas).
 
 ### Assertioner
 
@@ -280,7 +281,8 @@ typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
   lån (`Result<T, E>`, `[]T`, tupler, structar och enums vars delar är `Clone`).
 - `Copy` gäller för värden utan heap- eller ägarskapsstädning (`bool`, heltal,
   `f32`, `f64`, `rune`, `ptr`, fältlösa enums samt aggregat/tupler vars delar är
-  `Copy`, men inte `string` eller `[]T`).
+  `Copy`, men inte `string` eller `[]T`). Värden av typen `fn(...)` delar sin
+  infångade miljö genom referensräkning i stället för att djupkopiera fångade värden.
 - `Clone` och `Copy` är strukturella och kan inte implementeras manuellt.
 
 Förladdade kärntraits från preludium finns alltid tillgängliga utan import:
@@ -495,7 +497,9 @@ i kroppen och lever så länge något funktionsvärde använder dem. Vanliga
 äganderegler gäller vid infångning. Heltal kopieras, medan en ägd sträng
 eller dynamisk array flyttas in. Skapa en separat lokal med `.clone()` om
 båda behöver äga värdet. En closure kan fånga andra funktionsvärden.
-Lån får inte lagras i capture-listan.
+Lån får inte lagras i capture-listan. Ett infångat `@resource`-värde flyttas in i
+closurens oföränderliga, referensräknade miljö och dess eventuella
+stängningsmetod körs en gång när den sista referensen till closuren släpps.
 
 ### Flervärdesreturer
 
@@ -885,8 +889,8 @@ fn length_squared(p: Point) -> i32 {
 Testblocket har eget scope och får använda vanliga deklarationer, uttryck,
 anrop, villkor och loopar. Ett fristående bool-uttryck blir en assertion;
 `assert(...)` fungerar också. Oanvända taluttryck är fel. Förväntade
-tabellresultat måste stödja likhet; structar och arrayer saknar ännu
-likhetsoperator. Kortformen anropar alltid den annoterade funktionen, även
+tabellresultat måste stödja likhet (`==`, inklusive typer som implementerar `Eq`
+som `[]T`, tupler, `Result<T, E>` och egna structar/enums med `impl Eq`). Kortformen anropar alltid den annoterade funktionen, även
 om en lokal bindning i testblocket skuggar dess namn.
 
 Fristående tester skrivs `@test fn descriptive_name() { ... }`. En sådan
@@ -936,8 +940,9 @@ en uttrycklig `.clone()` delar den oföränderliga texten med en ny ägare.
 
 `"..."` och `'...'` ger samma typ `string`. Backticks ger typen `rune`,
 exempelvis `` `å` `` eller `` `🌍` ``. En sådan literal måste innehålla exakt
-en Unicode-skalär. `rune` är en egen typ som stödjer jämförelse, `print`,
-`.str()` och explicit heltalskonvertering med `i32(r)`/`i64(r)`.
+en Unicode-skalär. `rune` är en egen typ som stödjer jämförelse (`==`, `!=`,
+`<`, `<=`, `>`, `>=`), `print`, `.str()` och explicit heltalskonvertering med
+`i32(r)`/`i64(r)` (dock inte aritmetik som `+`/`-`/`*`/`/`/`%`).
 `rune(number)` kontrollerar att talet är 0–0x10FFFF och inte en surrogate.
 Ingen implicit konvertering mellan rune, heltal och string sker.
 

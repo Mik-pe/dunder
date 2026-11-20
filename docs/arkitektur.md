@@ -85,7 +85,8 @@ förblir giltig. Lokala lån återanvänder dessa platsidentiteter.
 ägar-ID:n från `ownership_state`. Tabellen har ingen egen initieringsmodell.
 Alias härleds till den ursprungliga platsen; ett nytt återlån skapar ett
 eget aktivt lån på samma ägare. Referenserna är oföränderliga och frigör sitt
-lås vid deklarationsblockets slut, inte vid sista användningen. Skrivning,
+lås efter sista lexikala läsningen i samma block och loopdjup (eller vid
+blockets slut när ett `defer` eller en inre loop ändrar ägaren). Skrivning,
 skrivlån, flytt och `replace` använder samma överlappningsfråga. Ett lån av
 ett fält blockerar dess förfäder och ättlingar men tillåter syskonfält.
 Arrayindex och intervall följer konservativt arrayens identitet.

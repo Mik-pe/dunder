@@ -166,8 +166,9 @@ Högst 1023 UTF-8-byte ryms i en sökväg; OS:et kontrollerar också komponenter
 `read_text`, `write_text` och `append_text` hanterar vanliga filer.
 Kataloger, enheter och FIFO:er används inte som textströmmar. Öppning är
 icke-blockerande, filtypen kontrolleras och filhandtaget stängs både vid
-lyckat anrop och vid fel. Råa filbeskrivare stöds på låg nivå genom `fd_read`,
-`fd_write` och `fd_close`, som ligger till grund för ägda strömhandtag som
+lyckat anrop och vid fel. Råa filbeskrivare stöds på låg nivå genom `unsafe`
+funktionerna `fd_read`, `fd_write`, `fd_close`, `fd_poll` och
+`fd_set_nonblocking`, som ligger till grund för ägda strömhandtag som
 `Stdin`/`Stdout`/`Stderr` i `std.io`, `FileReader`/`FileWriter`/`File` i
 `std.fs` samt `ChildStdin`/`ChildStdout`/`ChildStderr` i `std.process`; se
 [Strömmar och standardinmatning](standard.md#strömmar-och-standardinmatning).
@@ -269,15 +270,17 @@ Godtyckliga rättighetsändringar (`chmod`) återstår.
 Moduler i Dunder deklarerar använda privilegier med `capability ...` högst upp
 i källfilen. De grundläggande fil-, text- och klockfunktionerna i `sys` kräver
 däremot ingen särskild `capability`-rad: de verkar med öppna/stängda
-engangsanrop eller direkt över en filbeskrivare som anroparen redan fått, utan
-delegeringsbara katalog-/filhandtag eller godtycklig process-/nätverksåtkomst.
+engangsanrop utan delegeringsbara katalog-/filhandtag eller processåtkomst.
+Råa filbeskrivare (`sys.fd_*` och `io.fd_*_chunk`) kräver `capability unsafe`,
+och nätverksanropen (`sys.net_*`) kräver `capability network`.
 Högre standardmoduler skyddar bredare OS-operationer med uttryckliga kapabiliteter
 (`@requires(...)`) så att beroendebibliotek inte tyst kan skaffa behörighet.
 
 | Modul / API | Krävd kapabilitet | Exempel på operationer |
 | --- | --- | --- |
-| `sys` (grundläggande I/O, tid, argument) | Ingen | `sys.read`, `sys.read_text`, `sys.write_text`, `sys.append_text`, `sys.metadata`, `sys.mkdir`, `sys.rename`, `sys.remove_file`, `sys.remove_dir`, `sys.same_file`, `sys.read_u8`, `sys.write_u8`, `sys.now_ms`, `sys.sleep_ms`, `sys.pid`, `sys.arg`, `sys.fd_read`/`fd_write`/`fd_close` |
-| `sys` (råminne & systemanrop) | `capability unsafe` | `sys.envp`, `sys.linux_syscall`, `sys.memory_copy`, `sys.memory_equal`, `sys.memory_zero`, `sys.pool_alloc_try`, `sys.pool_free` |
+| `sys` (grundläggande fil-I/O, tid, argument) | Ingen | `sys.read`, `sys.read_text`, `sys.write_text`, `sys.append_text`, `sys.metadata`, `sys.mkdir`, `sys.rename`, `sys.remove_file`, `sys.remove_dir`, `sys.same_file`, `sys.read_u8`, `sys.write_u8`, `sys.now_ms`, `sys.sleep_ms`, `sys.pid`, `sys.arg`, `sys.write_stderr`, `sys.eprint` |
+| `sys` & `std.io` (råa FD, råminne & systemanrop) | `capability unsafe` | `sys.fd_read`/`fd_write`/`fd_close`/`fd_poll`/`fd_set_nonblocking`, `io.fd_read_chunk`/`fd_write_chunk`, `sys.envp`, `sys.linux_syscall`, `sys.memory_copy`, `sys.memory_equal`, `sys.memory_zero`, `sys.pool_alloc_try`, `sys.pool_free` |
+| `sys` (låg-nivå-sockets) | `capability network` | `sys.net_listen`, `sys.net_accept`, `sys.net_connect`, `sys.net_read`, `sys.net_peek`, `sys.net_write`, `sys.net_poll`, `sys.net_set_nonblocking`, `sys.net_set_nodelay`, `sys.net_local_port`, `sys.net_shutdown_write`, `sys.net_close` |
 | `std.fs` | `capability filesystem` | `fs.list_dir`, `fs.mkdir_all`, `fs.remove_all`, `fs.temp_dir`, `fs.cwd`, `fs.realpath`, `fs.symlink`, `fs.hard_link`, `fs.is_symlink`, samt skapande av handtagen `ReadFile::grant`, `WriteFile::grant`, `ReadDir::grant`, `WriteFile::create` och `File::open` (även `std.sqlite` använder `filesystem` och `unsafe`) |
 | `std.io` (standardströmmar) | `capability stdio` | `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.read_stdin`, `io.read_stdin_bytes`, `io.read_stdin_limit` |
 | `std.net` | `capability network` | `TcpListener`, `TcpStream`, `UdpSocket`, `net.resolve`, `net.listen`, `net.connect` |
