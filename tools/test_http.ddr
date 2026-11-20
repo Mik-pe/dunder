@@ -99,7 +99,7 @@ fn two_large_chunks(data: &[]u8) -> []u8 {
     wire
 }
 
-fn await_socket(stream: &net.TcpStream, events: i32, timeout: i64) -> net.IoResult {
+fn await_socket(stream: &net.TcpStream, events: i32, timeout: i64) -> Result<i32, sys.IoError> {
     mut poll := net.PollSet::new()
     poll.add(stream.fd(), events)
     poll.poll(i32(timeout))
@@ -109,32 +109,48 @@ fn send(stream: &net.TcpStream, data: &[]u8, start: i32, end: i32) -> bool {
     mut offset := start
     deadline := sys.now_ms() + 5000
     while offset < end {
-        n := stream.write_range(&data, offset, end - offset)
-        if n.ok && n.count > 0 {
-            offset += i32(n.count)
-        } else {
-            if !n.would_block && n.error != 4 { return harness.fail(f"write failed ({n.error})") }
-            remaining := deadline - sys.now_ms()
-            if remaining <= 0 { return harness.fail("timed out writing request") }
-            ready := await_socket(&stream, net.poll_out(), remaining)
-            if !ready.ok || ready.count == 0 { return harness.fail("socket was not ready for writing") }
+        match stream.write_range(&data, offset, end - offset) {
+            .Ok(count) => {
+                if count <= 0 { return harness.fail("write returned non-positive count") }
+                offset += i32(count)
+            },
+            .Err(err) => {
+                if !err.is_would_block() && err != sys.IoError.Interrupted {
+                    return harness.fail(f"write failed ({err.code()})")
+                }
+                remaining := deadline - sys.now_ms()
+                if remaining <= 0 { return harness.fail("timed out writing request") }
+                match await_socket(&stream, net.poll_out(), remaining) {
+                    .Ok(count) => { if count == 0 { return harness.fail("socket was not ready for writing") } },
+                    .Err(_) => { return harness.fail("socket was not ready for writing") },
+                }
+            },
         }
     }
     true
 }
 
 fn receive(stream: &net.TcpStream, output: &mut []u8, interim: bool) -> bool {
-    reset: sys.IoError = .ConnectionReset
     deadline := sys.now_ms() + 5000
     while true {
         remaining := deadline - sys.now_ms()
         if remaining <= 0 { break }
-        ready := await_socket(&stream, net.poll_in(), remaining)
-        if !ready.ok || ready.count == 0 { return harness.fail("socket was not ready for reading") }
-        n := stream.read_append(&mut output, if interim { 4096 } else { 65536 })
-        if n.eof || n.error == reset.code() { return !interim }
-        if !n.ok && !n.would_block && n.error != 4 { return harness.fail(f"read failed ({n.error})") }
-        if interim && bytes.find_double_crlf(&output, 0, output.len) >= 0 { return true }
+        match await_socket(&stream, net.poll_in(), remaining) {
+            .Ok(count) => { if count == 0 { return harness.fail("socket was not ready for reading") } },
+            .Err(_) => { return harness.fail("socket was not ready for reading") },
+        }
+        match stream.read_append(&mut output, if interim { 4096 } else { 65536 }) {
+            .Ok(count) => {
+                if count == 0 { return !interim }
+            },
+            .Err(err) => {
+                if err == sys.IoError.ConnectionReset { return !interim }
+                if !err.is_would_block() && err != sys.IoError.Interrupted {
+                    return harness.fail(f"read failed ({err.code()})")
+                }
+            },
+        }
+        if interim && bytes.find_double_crlf(&output, 0, output.len).is_some() { return true }
     }
     harness.fail("timed out reading response")
 }
@@ -142,13 +158,15 @@ fn receive(stream: &net.TcpStream, output: &mut []u8, interim: bool) -> bool {
 fn send_request(test: &Case, stream: &net.TcpStream) -> bool {
     wire := &test.wire
     if test.handshake != .None {
-        head := bytes.find_double_crlf(&wire, 0, wire.len)
+        head := bytes.find_double_crlf(&wire, 0, wire.len).unwrap_or(-1)
         if head < 0 { return harness.fail("test request has no header terminator") }
         start := head + 4
         if !send(&stream, &wire, 0, start) { return false }
         if test.handshake == .WaitForBody {
-            ready := await_socket(&stream, net.poll_in(), 100)
-            if !ready.ok || ready.count != 0 { return harness.fail("read_head unexpectedly sent a response before the body") }
+            match await_socket(&stream, net.poll_in(), 100) {
+                .Ok(count) => { if count != 0 { return harness.fail("read_head unexpectedly sent a response before the body") } },
+                .Err(_) => { return harness.fail("read_head unexpectedly sent a response before the body") },
+            }
         } else {
             mut response: []u8 = []
             if !receive(&stream, &mut response, true) ||
@@ -168,11 +186,11 @@ fn send_request(test: &Case, stream: &net.TcpStream) -> bool {
 }
 
 fn check_response(test: &Case, response: &[]u8) -> bool {
-    head := bytes.find_double_crlf(&response, 0, response.len)
+    head := bytes.find_double_crlf(&response, 0, response.len).unwrap_or(-1)
     if head < 0 { return harness.fail("missing HTTP response headers") }
-    status_line := bytes.find_crlf(&response, 0, head + 2)
-    status_start := bytes.find_byte(&response, 0, status_line, b' ') + 1
-    status_end := bytes.find_byte(&response, status_start, status_line, b' ')
+    status_line := bytes.find_crlf(&response, 0, head + 2).unwrap_or(-1)
+    status_start := bytes.find_byte(&response, 0, status_line, b' ').unwrap_or(-1) + 1
+    status_end := bytes.find_byte(&response, status_start, status_line, b' ').unwrap_or(-1)
     if status_start == 0 || status_end < 0 { return harness.fail("malformed HTTP status line") }
     code := parse.integer(bytes.decode_range(&response, status_start, status_end).value)
     if !code.ok || code.value != i64(test.status) {
@@ -191,8 +209,8 @@ fn check_response(test: &Case, response: &[]u8) -> bool {
     mut has_length := false
     mut start := status_line + 2
     while start < head {
-        end := bytes.find_crlf(&response, start, head + 2)
-        colon := bytes.find_byte(&response, start, end, b':')
+        end := bytes.find_crlf(&response, start, head + 2).unwrap_or(-1)
+        colon := bytes.find_byte(&response, start, end, b':').unwrap_or(-1)
         if colon < 0 || colon + 1 >= end || response[colon + 1] != b' ' { return harness.fail("malformed response header") }
         value := colon + 2
         if bytes.equals_text(&response, start, colon, "Connection") {
@@ -227,20 +245,24 @@ fn run_case(binary: string, test: &Case) -> bool {
     mut command := process.Command::new(binary.clone(), [test.limit.str(), test.timeout.str()])
     if test.mode.len > 0 { command.add_arg(test.mode.clone()) }
     spawned := command.spawn()
-    if !spawned.ok { return harness.fail(f"cannot start HTTP fixture ({spawned.error})") }
-    mut child := spawned.child
+    if spawned.is_err() { return harness.fail(f"cannot start HTTP fixture ({spawned.unwrap_err().code()})") }
+    mut child := spawned.unwrap()
     defer {
         _ := child.kill()
         _ := child.wait(5000)
     }
-    announcement := child.read_stdout_line(5000)
-    port := parse.integer(text.trim(announcement.value))
-    if !announcement.ok || !port.ok || port.value < 1 || port.value > 65535 {
+    ann_res := child.read_stdout_line(5000)
+    ann_text := match ann_res {
+        .Ok(opt) => opt.unwrap_or(""),
+        .Err(_) => "",
+    }
+    port := parse.integer(text.trim(ann_text))
+    if ann_text.len == 0 || !port.ok || port.value < 1 || port.value > 65535 {
         return harness.fail("fixture did not announce a port")
     }
     connected := net.TcpStream::connect(net.loopback(), i32(port.value))
-    if !connected.ok { return harness.fail(f"cannot connect to fixture ({connected.error})") }
-    stream := connected.stream
+    if connected.is_err() { return harness.fail(f"cannot connect to fixture ({connected.unwrap_err().code()})") }
+    stream := connected.unwrap()
     nonblocking := stream.set_nonblocking(true)
     if !nonblocking.ok { return harness.fail(f"cannot set socket nonblocking ({nonblocking.error})") }
     if !send_request(&test, &stream) { return false }
@@ -286,7 +308,7 @@ fn main() -> i32 {
             print("usage: test_http [compiler] [--compiler COMPILER] [--binary FIXTURE]")
             return 0
         }
-        equal := text.find(arg, "=")
+        equal := text.find(arg, "=").unwrap_or(-1)
         option := if equal < 0 { arg.clone() } else { arg[0..equal] }
         if option == "--compiler" || option == "--binary" {
             mut value := ""

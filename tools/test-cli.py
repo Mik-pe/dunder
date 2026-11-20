@@ -234,7 +234,7 @@ def isolated_tests(p):
         result = p.call("test", "affected.ddr", "--affected", status=code)
         assert f"{passed} passed" in result.stdout and f"{skipped} unaffected" in result.stdout
     p.write("timeout.ddr", '''
-capability unsafe
+capability filesystem, unsafe
 import sys
 @extern("c","fork") unsafe fn fork()->i32
 @extern("c","usleep") unsafe fn sleep(us:u32)->i32
@@ -913,6 +913,7 @@ fn main(){
 def filesystem(p):
     (p.root / "invalid-utf8").write_bytes(b"\xf0\x80\x80\x80")
     p.write("filesystem.ddr", '''
+capability filesystem
 import sys
 fn main(){
     assert(sys.read_text("invalid-utf8").error==92)
