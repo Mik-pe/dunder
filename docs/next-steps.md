@@ -179,6 +179,13 @@ parenteser och `.Err(())` på `Result`, `Sendable`-argument i `spawn`, `_` i
   `fd_close`/`fd_poll`/`fd_set_nonblocking` samt `std.io.fd_read_chunk`/
   `fd_write_chunk`) är markerade `unsafe`. Motsägande dokumentation i `syntax.md`,
   `memory.md`, `floating.md`, `arkitektur.md` och `sys.md` är uppdaterad.
+- **Snabbare testsvit och nivåindelad `verify.ddr`:** `test_mir_scalar` batchar
+  nu alla skalärfall i tre samlade binärer via `--batch` i stället för en
+  process per instruktion, onödiga kartesiska dubbletter i frontendfel-/matrisloopar
+  har gallrats med bibehållen täckning, och `tools/verify-selfhost.sh` samt
+  `tools/verify.ddr` kör nivåindelat (`--fast` / standard / `--exhaustive` /
+  `--release` / `--all`, plus LPT-ordning) utan att läcka `build/mir-correctness.*`
+  eller andra temporära QA-kataloger i `build/`.
 
 ## Kommande förbättringar
 

@@ -64,7 +64,7 @@ i manifestet. Nyckeln `<mål>.gz.sha256` gäller gzip-arkivet och
 `dunder upgrade` läser manifestet från GitHubs senaste stabila release.
 `dunder upgrade --version v0.6.0` väljer den namngivna releasen.
 
-`dunder run tools/test_release.ddr` provar paketering, avbruten uppladdning och
+`dunder run tools/test_release.ddr` (eller `./tools/verify-selfhost.sh --release`) provar paketering, avbruten uppladdning och
 omkörning i en lokal Git-kopia med simulerad GitHub CLI.
 
 `dunder run tools/test_upgrade.ddr -- KOMPILATOR` provar den nativa uppgraderaren

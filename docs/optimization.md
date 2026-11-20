@@ -657,8 +657,10 @@ CLI-cachen behåller varma fragment separat för båda lägena.
 [`tools/test_optimizer.ddr`](../tools/test_optimizer.ddr) jämför optimerad kod med avstängt pass och kan
 även jämföra med en äldre kompilator genom `--baseline`. Den provar
 resultat, fällor, diagnostik, bindningsposter och vilka funktioner som
-använder modellen. `tools/test_opt_emitter.ddr` provar emission och spill
-separat. Båda ingår i `tools/verify-selfhost.sh`.
+använder modellen. `tools/test_opt_emitter.ddr` (ingår i
+`./tools/verify-selfhost.sh --exhaustive`) provar emission och spill separat.
+Ytterligare syntetiska MIR-orakel och emitterprober körs med `--exhaustive`
+(eller `--all` för att även ta med `test-release`).
 
 ### Signerad division och rest med konstant delare
 
