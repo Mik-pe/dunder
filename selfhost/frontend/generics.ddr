@@ -65,7 +65,7 @@ pub fn origin(layout: &Layout, position: i32) -> i32 {
 
 struct Catalog {
     definitions: Map<string, i64>, names: []string, methods: []bool, impl_traits: []string, next_impl: []i32, builtin: []bool,
-    counts: []i32, kinds: []i32, target_shapes: []i32, c_layout: []bool, result: i32, option: i32, map: i32, set: i32, compound_impls: []i32,
+    counts: []i32, kinds: []i32, target_shapes: []i32, c_layout: []bool, result: i32, option: i32, map: i32, set: i32, compound_impls: []i32, lazy_impls: []i32,
     method_owner_counts: []i32, method_targets: []string, method_names: []string, generic_method_names: Map<string, i64>,
     bodies: lexer.Tokens, slots: []i32, starts: []i32, ends: []i32,
     removed: []i32, resume: []i32, constraints: Constraints, constraint_starts: []i32,
@@ -1151,7 +1151,7 @@ fn rename_prelude_tokens(tokens: &mut lexer.Tokens) {
     }
 }
 pub fn bind_program(input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platform: i32) -> Program {
-    mut catalog := Catalog { definitions:Map<string, i64>::new(), names:[], methods:[], impl_traits:[], next_impl:[], builtin:[], counts:[], kinds:[], target_shapes:[], c_layout:[], result:-1, option:-1, map:-1, set:-1, compound_impls:[],
+    mut catalog := Catalog { definitions:Map<string, i64>::new(), names:[], methods:[], impl_traits:[], next_impl:[], builtin:[], counts:[], kinds:[], target_shapes:[], c_layout:[], result:-1, option:-1, map:-1, set:-1, compound_impls:[], lazy_impls:[],
         method_owner_counts:[], method_targets:[], method_names:[], generic_method_names:Map<string, i64>::new(),
         bodies:lexer.empty(false), slots:[], starts:[], ends:[], removed:[], resume:[],
         constraints:Constraints {parameters:[], methods:[], traits:[], signatures:lexer.empty(false), starts:[0], slots:[]}, constraint_starts:[0] }
@@ -1172,6 +1172,8 @@ pub fn bind_program(input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platfor
         target := i32(catalog.definitions.get_or(catalog.names[d], -1))
         if target < 0 || catalog.counts[target] != catalog.counts[d] {
             reject(&mut plan, catalog.bodies.starts[catalog.starts[d]], "generic impl must match its type's parameters")
+        } else if !catalog.builtin[d] && catalog.impl_traits[d] != "" && catalog.builtin[target] {
+            catalog.lazy_impls.push(d)
         } else {
             catalog.next_impl[d] = catalog.next_impl[target]
             catalog.next_impl[target] = d
@@ -1208,7 +1210,7 @@ pub fn bind_program(input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platfor
     for def in &catalog.compound_impls {
         if !catalog.builtin[def] { has_custom_compound = true; break }
     }
-    probe_compounds := needs_compound_probe(&input, has_custom_compound)
+    probe_compounds := needs_compound_probe(&input, has_custom_compound) || catalog.lazy_impls.len > 0
     gf := capture_generic_fns(&catalog, &reg, platform)
     catalog.bodies = lexer.empty(false); catalog.slots.clear(); catalog.removed.clear(); catalog.resume.clear()
     Program {catalog:move catalog, source:move source, root:root, checks_start:checks_start, checks:move checks, end:input.starts[input.kinds.len - 1], reserved:move plan.reserved, core:move core, has_compound_ops:probe_compounds, generic_fns:move gf, has_inferred_calls:plan.has_inferred_calls}
@@ -1550,6 +1552,103 @@ fn drain_compound_demands(catalog: &Catalog, plan: &mut Instances, reg: &mut ft.
         }
     }
 }
+fn lazy_impl_has_method(source: &BoundSource, d: i32, method_name: string) -> bool {
+    for at in source.starts[d]..source.ends[d] {
+        m := source.method_names[at]
+        if m >= 0 && source.tokens.texts[m] == method_name { return true }
+    }
+    false
+}
+fn split_last_double_colon(key: string) -> i32 {
+    if key.len < 2 { return -1 }
+    mut i := key.len - 2
+    while i >= 0 {
+        if key[i] == 58 && key[i + 1] == 58 { return i }
+        i -= 1
+    }
+    -1
+}
+fn emit_lazy_impl(catalog: &Catalog, source: &BoundSource, plan: &mut Instances, reg: &mut ft.TypeRegistry,
+    layout: &mut Layout, output: &mut lexer.Tokens, position: &mut i32, wanted: &Map<string, i64>,
+    inferred_keys: &Map<string, i64>, inferred_args: &[]string, seen_lazy: &mut Map<string, i64>,
+    inst: i32, d: i32) {
+    lkey := inst.str() + ":" + d.str()
+    if seen_lazy.contains(lkey) { return }
+    seen_lazy.put(move lkey, 1)
+    site := origin(&layout, plan.sites[inst])
+    if catalog.constraint_starts[d] < catalog.constraint_starts[d + 1] {
+        record_conditional_impl(&catalog, &source, &mut plan, &mut reg, d, inst, site)
+    }
+    token(&mut output, .Newline, "\n", site)
+    lower(&catalog, &mut plan, &mut reg, &source, &mut output, source.starts[d], source.ends[d], inst, false, &mut position, &wanted, &inferred_keys, &inferred_args)
+    layout.end = position
+}
+fn drain_lazy_impls(catalog: &Catalog, source: &BoundSource, plan: &mut Instances, reg: &mut ft.TypeRegistry,
+    layout: &mut Layout, output: &mut lexer.Tokens, position: &mut i32, wanted: &Map<string, i64>,
+    inferred_keys: &Map<string, i64>, inferred_args: &[]string, compounds: &Map<string, i64>,
+    seen_lazy: &mut Map<string, i64>, inst_by_ty: &mut Map<string, i64>, inst_by_name: &mut Map<string, i64>,
+    tracked_inst: &mut i32, lazy_req_at: &mut i32, lazy_cond_at: &mut i32) {
+    while tracked_inst < plan.names.len {
+        idx := tracked_inst
+        tracked_inst += 1
+        def_i := plan.definitions[idx]
+        if !catalog.methods[def_i] && (catalog.kinds[def_i] == 2 || catalog.kinds[def_i] == 3) {
+            ty_id := plan.types[idx]
+            if ty_id >= 0 {
+                inst_by_ty.put(ty_id.str(), i64(idx))
+                inst_by_name.put(plan.names[idx].clone(), i64(idx))
+            }
+        }
+    }
+    for i in 0..compounds.len() {
+        if plan.error != "" { return }
+        key := compounds.key_at(i)
+        sep := split_last_double_colon(key)
+        if sep <= 0 { continue }
+        ty_name := key[0..sep]
+        m_name := key[sep + 2..key.len]
+        inst := i32(inst_by_name.get_or(ty_name, -1))
+        if inst < 0 { continue }
+        fam := &catalog.names[plan.definitions[inst]]
+        for d in &catalog.lazy_impls {
+            if catalog.names[d] == fam && lazy_impl_has_method(&source, d, m_name) {
+                emit_lazy_impl(&catalog, &source, &mut plan, &mut reg, &mut layout, &mut output, &mut position, &wanted, &inferred_keys, &inferred_args, &mut seen_lazy, inst, d)
+                if plan.error != "" { return }
+            }
+        }
+    }
+    while lazy_req_at < plan.requirements.trait_receivers.len && plan.error == "" {
+        idx := lazy_req_at
+        lazy_req_at += 1
+        ty := plan.requirements.trait_receivers[idx]
+        tr := plan.requirements.trait_names[idx].clone()
+        inst := i32(inst_by_ty.get_or(ty.str(), -1))
+        if inst < 0 { continue }
+        fam := &catalog.names[plan.definitions[inst]]
+        for d in &catalog.lazy_impls {
+            if catalog.names[d] == fam && catalog.impl_traits[d] == tr {
+                emit_lazy_impl(&catalog, &source, &mut plan, &mut reg, &mut layout, &mut output, &mut position, &wanted, &inferred_keys, &inferred_args, &mut seen_lazy, inst, d)
+                if plan.error != "" { return }
+            }
+        }
+    }
+    while lazy_cond_at < plan.conditional_impls.cond_receivers.len && plan.error == "" {
+        idx := lazy_cond_at
+        lazy_cond_at += 1
+        tr := plan.conditional_impls.cond_traits[idx].clone()
+        if tr == "" { continue }
+        ty := plan.conditional_impls.cond_receivers[idx]
+        inst := i32(inst_by_ty.get_or(ty.str(), -1))
+        if inst < 0 { continue }
+        fam := &catalog.names[plan.definitions[inst]]
+        for d in &catalog.lazy_impls {
+            if catalog.names[d] == fam && catalog.impl_traits[d] == tr {
+                emit_lazy_impl(&catalog, &source, &mut plan, &mut reg, &mut layout, &mut output, &mut position, &wanted, &inferred_keys, &inferred_args, &mut seen_lazy, inst, d)
+                if plan.error != "" { return }
+            }
+        }
+    }
+}
 pub fn materialize(program: &Program, input: &mut lexer.Tokens, reg: &mut ft.TypeRegistry, platform: i32, wanted: &Map<string, i64>, compounds: &Map<string, i64>, inferred_keys: &Map<string, i64>, inferred_args: &[]string, definitions: bool) -> Layout {
     mut layout := layout()
     catalog := &program.catalog; source := &program.source; root := program.root
@@ -1571,32 +1670,44 @@ pub fn materialize(program: &Program, input: &mut lexer.Tokens, reg: &mut ft.Typ
     mut seen_compounds := Map<string, i64>::new()
     mut arg_at := 0; mut req_at := 0; mut cond_at := 0
     drain_compound_demands(&catalog, &mut plan, &mut reg, &compounds, &mut seen_compounds, platform, &mut arg_at, &mut req_at, &mut cond_at)
+    mut seen_lazy := Map<string, i64>::new()
+    mut inst_by_ty := Map<string, i64>::new()
+    mut inst_by_name := Map<string, i64>::new()
+    mut tracked_inst := 0
+    mut lazy_req_at := 0
+    mut lazy_cond_at := 0
     mut instance := 0
-    while instance < plan.names.len && plan.error == "" {
-        def := plan.definitions[instance]
-        mut d := def
-        while d >= 0 && plan.error == "" {
-            site := origin(&layout, plan.sites[instance])
-            if catalog.methods[d] && catalog.constraint_starts[d] < catalog.constraint_starts[d + 1] {
-                if catalog.impl_traits[d] != "" {
-                    record_conditional_impl(&catalog, &source, &mut plan, &mut reg, d, instance, site)
-                } else {
-                    for at in source.starts[d]..source.ends[d] {
-                        method := source.method_names[at]
-                        if method >= 0 && wanted.contains(plan.names[instance] + "::" + source.tokens.texts[method]) {
-                            require_arguments(&catalog, &source, &mut plan, &mut reg, d, instance, site); break
+    while (instance < plan.names.len || (catalog.lazy_impls.len > 0 && (tracked_inst < plan.names.len || lazy_req_at < plan.requirements.trait_receivers.len || lazy_cond_at < plan.conditional_impls.cond_receivers.len))) && plan.error == "" {
+        while instance < plan.names.len && plan.error == "" {
+            def := plan.definitions[instance]
+            mut d := def
+            while d >= 0 && plan.error == "" {
+                site := origin(&layout, plan.sites[instance])
+                if catalog.methods[d] && catalog.constraint_starts[d] < catalog.constraint_starts[d + 1] {
+                    if catalog.impl_traits[d] != "" {
+                        record_conditional_impl(&catalog, &source, &mut plan, &mut reg, d, instance, site)
+                    } else {
+                        for at in source.starts[d]..source.ends[d] {
+                            method := source.method_names[at]
+                            if method >= 0 && wanted.contains(plan.names[instance] + "::" + source.tokens.texts[method]) {
+                                require_arguments(&catalog, &source, &mut plan, &mut reg, d, instance, site); break
+                            }
                         }
                     }
                 }
+                if catalog.builtin[d] { layout.starts.push(position); layout.positions.push(site) }
+                token(&mut output, .Newline, "\n", site)
+                lower(&catalog, &mut plan, &mut reg, &source, &mut output, source.starts[d], source.ends[d], instance, catalog.builtin[d], &mut position, &wanted, &inferred_keys, &inferred_args)
+                layout.end = position
+                d = catalog.next_impl[d]
             }
-            if catalog.builtin[d] { layout.starts.push(position); layout.positions.push(site) }
-            token(&mut output, .Newline, "\n", site)
-            lower(&catalog, &mut plan, &mut reg, &source, &mut output, source.starts[d], source.ends[d], instance, catalog.builtin[d], &mut position, &wanted, &inferred_keys, &inferred_args)
-            layout.end = position
-            d = catalog.next_impl[d]
+            drain_compound_demands(&catalog, &mut plan, &mut reg, &compounds, &mut seen_compounds, platform, &mut arg_at, &mut req_at, &mut cond_at)
+            instance += 1
         }
-        drain_compound_demands(&catalog, &mut plan, &mut reg, &compounds, &mut seen_compounds, platform, &mut arg_at, &mut req_at, &mut cond_at)
-        instance += 1
+        if plan.error == "" && catalog.lazy_impls.len > 0 {
+            drain_lazy_impls(&catalog, &source, &mut plan, &mut reg, &mut layout, &mut output, &mut position, &wanted, &inferred_keys, &inferred_args, &compounds, &mut seen_lazy, &mut inst_by_ty, &mut inst_by_name, &mut tracked_inst, &mut lazy_req_at, &mut lazy_cond_at)
+            drain_compound_demands(&catalog, &mut plan, &mut reg, &compounds, &mut seen_compounds, platform, &mut arg_at, &mut req_at, &mut cond_at)
+        }
     }
     if plan.error != "" {
         input.ok = false; input.error = plan.error.clone(); input.error_at = origin(&layout, plan.at)
