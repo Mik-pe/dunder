@@ -1,0 +1,835 @@
+capability filesystem
+
+import bundle_fs
+import stderr
+import std.bytes as bytes
+import std.text as text
+import ..frontend.diagnostics as diag
+import ..frontend.parser as parser
+import sys
+
+enum RawKind { Word, Number, RawString, CommentLine, CommentBlock, Symbol, Newline, End }
+
+struct RawToken {
+    kind: RawKind,
+    text: string,
+    start: i32,
+    end: i32,
+}
+
+pub struct FormatResult {
+    ok: bool,
+    text: string,
+    error: string,
+}
+
+fn is_ascii_alpha(b: i32) -> bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128
+}
+
+fn is_digit(b: i32) -> bool {
+    b >= 48 && b <= 57
+}
+
+fn is_hex(b: i32) -> bool {
+    is_digit(b) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+}
+
+fn scan_quoted_end(src: string, start: i32, quote: i32, interpolated: bool) -> i32 {
+    mut i := start
+    mut brace_depth := 0
+    while i < src.len {
+        b := src[i]
+        if brace_depth == 0 {
+            if b == 92 {
+                i += 2
+                continue
+            }
+            if b == quote {
+                return i + 1
+            }
+            if interpolated && b == 123 {
+                if i + 1 < src.len && src[i + 1] == 123 { i += 2; continue }
+                brace_depth = 1
+                i += 1
+                continue
+            }
+            if interpolated && b == 125 && i + 1 < src.len && src[i + 1] == 125 {
+                i += 2
+                continue
+            }
+            i += 1
+        } else {
+            if b == 34 || b == 39 || b == 96 {
+                i = scan_quoted_end(src, i + 1, b, false)
+                continue
+            }
+            if b == 102 && i + 1 < src.len && (src[i + 1] == 34 || src[i + 1] == 39) {
+                i = scan_quoted_end(src, i + 2, src[i + 1], true)
+                continue
+            }
+            if b == 123 { brace_depth += 1 }
+            else if b == 125 { brace_depth -= 1 }
+            i += 1
+        }
+    }
+    src.len
+}
+
+fn prev_non_nl_symbol(tokens: &[]RawToken, text_val: string) -> bool {
+    mut idx := tokens.len - 1
+    while idx >= 0 && tokens[idx].kind == .Newline { idx -= 1 }
+    idx >= 0 && tokens[idx].kind == .Symbol && tokens[idx].text == text_val
+}
+
+fn tokenize_raw(src: string) -> []RawToken {
+    mut out: []RawToken = []
+    mut i := 0
+    while i < src.len {
+        b := src[i]
+        next := if i + 1 < src.len { src[i + 1] } else { 0 }
+        if b == 10 {
+            out.push(RawToken { kind: .Newline, text: "\n", start: i, end: i + 1 })
+            i += 1
+            continue
+        }
+        if b == 13 && next == 10 {
+            out.push(RawToken { kind: .Newline, text: "\n", start: i, end: i + 2 })
+            i += 2
+            continue
+        }
+        if b == 32 || b == 9 || b == 13 {
+            i += 1
+            continue
+        }
+        if b == 47 && next == 47 {
+            start := i
+            i += 2
+            while i < src.len && src[i] != 10 && src[i] != 13 { i += 1 }
+            out.push(RawToken { kind: .CommentLine, text: src[start..i], start: start, end: i })
+            continue
+        }
+        if b == 47 && next == 42 {
+            start := i
+            i += 2
+            mut depth := 1
+            while i < src.len && depth > 0 {
+                if i + 1 < src.len && src[i] == 47 && src[i + 1] == 42 { depth += 1; i += 2 }
+                else if i + 1 < src.len && src[i] == 42 && src[i + 1] == 47 { depth -= 1; i += 2 }
+                else { i += 1 }
+            }
+            out.push(RawToken { kind: .CommentBlock, text: src[start..i], start: start, end: i })
+            continue
+        }
+        if b == 102 && (next == 34 || next == 39) {
+            start := i
+            end := scan_quoted_end(src, start + 2, next, true)
+            out.push(RawToken { kind: .RawString, text: src[start..end], start: start, end: end })
+            i = end
+            continue
+        }
+        if b == 98 && next == 39 {
+            start := i
+            end := scan_quoted_end(src, start + 2, 39, false)
+            out.push(RawToken { kind: .RawString, text: src[start..end], start: start, end: end })
+            i = end
+            continue
+        }
+        if b == 34 || b == 39 || b == 96 {
+            start := i
+            end := scan_quoted_end(src, start + 1, b, false)
+            out.push(RawToken { kind: .RawString, text: src[start..end], start: start, end: end })
+            i = end
+            continue
+        }
+        if is_ascii_alpha(b) {
+            start := i
+            i += 1
+            while i < src.len && (is_ascii_alpha(src[i]) || is_digit(src[i])) { i += 1 }
+            out.push(RawToken { kind: .Word, text: src[start..i], start: start, end: i })
+            continue
+        }
+        if is_digit(b) {
+            start := i
+            if prev_non_nl_symbol(&out, ".") {
+                while i < src.len && is_digit(src[i]) { i += 1 }
+                out.push(RawToken { kind: .Number, text: src[start..i], start: start, end: i })
+                continue
+            }
+            if b == 48 && (next == 120 || next == 88) {
+                i += 2
+                while i < src.len && (is_hex(src[i]) || src[i] == 95) { i += 1 }
+            } else if b == 48 && (next == 98 || next == 66) {
+                i += 2
+                while i < src.len && (src[i] == 48 || src[i] == 49 || src[i] == 95) { i += 1 }
+            } else {
+                while i < src.len && (is_digit(src[i]) || src[i] == 95) { i += 1 }
+                if i + 1 < src.len && src[i] == 46 && is_digit(src[i + 1]) {
+                    i += 1
+                    while i < src.len && (is_digit(src[i]) || src[i] == 95) { i += 1 }
+                }
+                if i < src.len && (src[i] == 101 || src[i] == 69) {
+                    i += 1
+                    if i < src.len && (src[i] == 43 || src[i] == 45) { i += 1 }
+                    while i < src.len && (is_digit(src[i]) || src[i] == 95) { i += 1 }
+                }
+            }
+            out.push(RawToken { kind: .Number, text: src[start..i], start: start, end: i })
+            continue
+        }
+        start := i
+        mut sym := ""
+        if i + 2 < src.len && src[i] == 46 && src[i + 1] == 46 {
+            if src[i + 2] == 61 { sym = "..=" }
+            else if src[i + 2] == 46 { sym = "..." }
+        }
+        if sym == "" && next == 61 {
+            if b == 58 { sym = ":=" } else if b == 61 { sym = "==" } else if b == 33 { sym = "!=" }
+            else if b == 60 { sym = "<=" } else if b == 62 { sym = ">=" } else if b == 43 { sym = "+=" }
+            else if b == 45 { sym = "-=" } else if b == 42 { sym = "*=" } else if b == 47 { sym = "/=" }
+            else if b == 37 { sym = "%=" }
+        } else if sym == "" && next == 62 {
+            if b == 45 { sym = "->" } else if b == 61 { sym = "=>" }
+        } else if sym == "" && b == next {
+            if b == 38 { sym = "&&" } else if b == 124 { sym = "||" } else if b == 46 { sym = ".." } else if b == 58 { sym = "::" }
+        }
+        if sym == "" { sym = src[start..start + 1] }
+        i = start + sym.len
+        out.push(RawToken { kind: .Symbol, text: move sym, start: start, end: i })
+    }
+    out.push(RawToken { kind: .End, text: "", start: src.len, end: src.len })
+    out
+}
+
+fn find_matching_brace(tokens: &[]RawToken, open_at: i32) -> i32 {
+    mut depth := 0
+    for i in open_at..tokens.len {
+        t := &tokens[i]
+        if t.kind == .Symbol && t.text == "{" { depth += 1 }
+        else if t.kind == .Symbol && t.text == "}" {
+            depth -= 1
+            if depth == 0 { return i }
+        }
+    }
+    tokens.len - 1
+}
+
+fn is_single_line_brace(tokens: &[]RawToken, open_at: i32, close_at: i32) -> bool {
+    for i in (open_at + 1)..close_at {
+        k := tokens[i].kind
+        if k == .Newline || k == .CommentLine { return false }
+    }
+    true
+}
+
+fn starts_upper_ascii(s: string) -> bool {
+    s.len > 0 && s[0] >= 65 && s[0] <= 90
+}
+
+fn looks_like_generic_angle(tokens: &[]RawToken, open_at: i32, prev_meaningful: i32, prev2_meaningful: i32) -> bool {
+    if prev_meaningful < 0 { return false }
+    pt := &tokens[prev_meaningful]
+    if pt.kind == .Symbol && pt.text == "::" {
+        // Check balanced `<...>` without comparison operators inside
+    } else if pt.kind == .Word {
+        if pt.text == "true" || pt.text == "false" || pt.text == "return" || pt.text == "if" || pt.text == "while" {
+            return false
+        }
+    } else {
+        return false
+    }
+    // Find matching `>` without hitting statement/expression boundaries
+    mut i := open_at + 1
+    mut depth := 1
+    mut has_colon_or_arrow := false
+    mut has_comma := false
+    while i < tokens.len && depth > 0 {
+        t := &tokens[i]
+        if t.kind == .End || t.kind == .Newline || t.kind == .CommentLine || t.kind == .CommentBlock { return false }
+        if t.kind == .Symbol {
+            s := &t.text
+            if s == ";" { return false }
+            if s == "&&" || s == "||" || s == "==" || s == "!=" || s == "<=" || s == ">=" ||
+            s == "+" || s == "-" || s == "*" || s == "/" || s == "%" || s == ":=" || s == ".." || s == "..=" || s == "=>" {
+                return false
+            }
+            if s == "=" {
+                // `=` is only valid if pre-context is struct/enum/fn/trait/impl generic params (defaults?) or not a comparison
+                return false
+            }
+            if s == "{" { return false }
+            if s == ":" || s == "->" { has_colon_or_arrow = true }
+            if s == "," { has_comma = true }
+            if s == "<" { depth += 1 }
+            else if s == ">" { depth -= 1 }
+        }
+        i += 1
+    }
+    if depth != 0 { return false }
+    // Token right after matching `>`
+    if i >= tokens.len { return false }
+    after := &tokens[i]
+    if pt.kind == .Symbol && pt.text == "::" { return true }
+    if prev2_meaningful >= 0 && tokens[prev2_meaningful].kind == .Word {
+        p2 := &tokens[prev2_meaningful].text
+        if p2 == "struct" || p2 == "enum" || p2 == "trait" || p2 == "impl" || p2 == "fn" || p2 == "for" || p2 == "as" {
+            return true
+        }
+    }
+    if pt.kind == .Word && pt.text == "impl" { return true }
+    if pt.kind == .Word && starts_upper_ascii(pt.text) {
+        if after.kind == .Symbol && (after.text == "(" || after.text == "::" || after.text == "{" ||
+            after.text == "," || after.text == ")" || after.text == "]" || after.text == ">" ||
+            after.text == "=" || after.text == ":=" || after.text == ":") {
+            return true
+        }
+        if after.kind == .Newline || after.kind == .End || (after.kind == .Word && after.text == "where") {
+            return true
+        }
+    }
+    if has_colon_or_arrow { return true }
+    if after.kind == .Symbol && (after.text == "::" || (after.text == "(" && !has_comma)) {
+        return true
+    }
+    false
+}
+
+fn is_unary_minus_prev(prev: &RawToken, at_line_start: bool, is_generic_close: bool) -> bool {
+    if at_line_start { return true }
+    if prev.kind == .Word {
+        w := &prev.text
+        return w == "return" || w == "break" || w == "in" || w == "if" || w == "else" || w == "while" || w == "match" || w == "move"
+    }
+    if prev.kind == .Symbol {
+        s := &prev.text
+        if is_generic_close { return false }
+        return s == "(" || s == "[" || s == "{" || s == "," || s == ";" || s == ":" || s == ":=" || s == "=" ||
+        s == "==" || s == "!=" || s == "<" || s == "<=" || s == ">=" || s == "+" || s == "-" || s == "*" ||
+        s == "/" || s == "%" || s == "&&" || s == "||" || s == "->" || s == "=>" || s == "+=" ||
+        s == "-=" || s == "*=" || s == "/=" || s == "%=" || s == ".." || s == "..=" || s == "!" || s == ">"
+    }
+    false
+}
+
+fn is_binary_op_sym(s: string) -> bool {
+    s == "=" || s == ":=" || s == "+=" || s == "-=" || s == "*=" || s == "/=" || s == "%=" ||
+    s == "==" || s == "!=" || s == "<=" || s == ">=" || s == "&&" || s == "||" ||
+    s == "->" || s == "=>" || s == "+" || s == "*" || s == "/" || s == "%" || s == "|"
+}
+
+fn needs_space_after_word(w: string, next_tok: &RawToken, prev_is_dot: bool) -> bool {
+    if next_tok.kind == .End || next_tok.kind == .Newline { return false }
+    if next_tok.kind == .Symbol {
+        ns := &next_tok.text
+        if ns == "," || ns == ";" || ns == ":" || ns == "::" || ns == "." || ns == "?" ||
+        ns == ")" || ns == "]" || ns == ".." || ns == "..=" {
+            return false
+        }
+        if ns == "(" {
+            if prev_is_dot { return false }
+            return w == "if" || w == "while" || w == "match" || w == "for" || w == "return" || w == "else" || w == "in"
+        }
+        if ns == "[" {
+            return w == "in" || w == "return" || w == "else"
+        }
+        if ns == "{" { return true }
+        if ns == "<" || ns == ">" { return false }
+    }
+    true
+}
+
+fn append_indent(out: &mut []u8, level: i32) {
+    for _ in 0..level { bytes.append_utf8(&mut out, "    ") }
+}
+
+fn ends_with_newline(out: &[]u8) -> bool {
+    out.len == 0 || out[out.len - 1] == 10
+}
+
+fn has_prefix_space_needed(prev: &RawToken, curr: &RawToken, at_line_start: bool,
+    prev_was_unary: bool, prev_generic_open: bool, prev_generic_close: bool,
+    curr_generic_open: bool, curr_generic_close: bool, prev_was_dot: bool, prev_was_fn_kw: bool,
+    prev_empty_brackets: bool) -> bool {
+    if at_line_start { return false }
+    if curr.kind == .CommentLine { return true }
+    if curr.kind == .CommentBlock {
+        if prev.kind == .Symbol && (prev.text == "(" || prev.text == "[" || prev.text == "{") { return false }
+        return true
+    }
+    if curr_generic_open || curr_generic_close { return false }
+    if prev_generic_open { return false }
+    if prev.kind == .Symbol && (prev.text == "@" || prev.text == "&" || prev.text == "!" || prev.text == "." ||
+        prev.text == "::" || prev.text == "(" || prev.text == "[" || prev.text == ".." || prev.text == "..=" || prev.text == "...") {
+        return false
+    }
+    if prev_was_unary { return false }
+    if prev.kind == .Symbol && prev.text == "<" && !prev_generic_open { return true }
+    if prev.kind == .Symbol && prev.text == ">" && !prev_generic_close {
+        if curr.kind == .Symbol && (curr.text == "," || curr.text == ";" || curr.text == ")" || curr.text == "]") { return false }
+        return true
+    }
+    if prev.kind == .Symbol && prev.text == "{" { return true }
+    if curr.kind == .Symbol {
+        cs := &curr.text
+        if cs == "," || cs == ";" || cs == ")" || cs == "]" || cs == "::" || cs == "?" || cs == ":" {
+            return false
+        }
+        if cs == "." {
+            if prev.kind == .Symbol {
+                if prev.text == "(" || prev.text == "[" || prev.text == "." || prev.text == ".." ||
+                prev.text == ")" || prev.text == "]" || prev.text == "!" || prev.text == "&" {
+                    return false
+                }
+                return prev.text == "," || prev.text == ":" || prev.text == ";" || prev.text == "{" ||
+                prev.text == "-" || is_binary_op_sym(prev.text)
+            }
+            if prev.kind == .Word {
+                pw := &prev.text
+                return pw == "return" || pw == "import" || pw == "if" || pw == "else" || pw == "match" ||
+                pw == "in" || pw == "for" || pw == "while" || pw == "break" || pw == "defer" ||
+                pw == "move" || pw == "mut" || pw == "spawn" || pw == "await"
+            }
+            return false
+        }
+        if cs == ".." || cs == "..=" || cs == "..." {
+            if prev.kind == .Word && prev.text == "import" { return true }
+            if prev.kind == .Symbol && (prev.text == "," || prev.text == ":" || prev.text == ";" ||
+                prev.text == "{" || is_binary_op_sym(prev.text)) {
+                return true
+            }
+            return false
+        }
+        if cs == "}" { return true }
+        if cs == "{" {
+            if prev.kind == .Symbol && (prev.text == "(" || prev.text == "[" || prev.text == "{" || prev.text == ",") { return false }
+            return true
+        }
+        if cs == "(" {
+            if prev.kind == .Word {
+                pw := &prev.text
+                if !prev_was_dot && (pw == "if" || pw == "while" || pw == "match" || pw == "for" || pw == "return" || pw == "else" || pw == "in") {
+                    return true
+                }
+                return false
+            }
+            if prev.kind == .Symbol && (prev_generic_close || prev.text == ")" || prev.text == "]") { return false }
+            if is_binary_op_sym(prev.text) || prev.text == "-" || prev.text == "," || prev.text == ";" || prev.text == ":" { return true }
+            return false
+        }
+        if cs == "[" {
+            if prev_was_fn_kw { return false }
+            if prev.kind == .Word && (prev.text == "return" || prev.text == "in" || prev.text == "else" || prev.text == "mut" || prev.text == "move") { return true }
+            if prev.kind == .Word || (prev.kind == .Symbol && (prev.text == ")" || prev.text == "]")) { return false }
+            if prev.kind == .Symbol && prev.text == ">" && prev_generic_close { return false }
+            if is_binary_op_sym(prev.text) || prev.text == "-" || prev.text == "," || prev.text == ";" || prev.text == ":" { return true }
+            return false
+        }
+        if is_binary_op_sym(cs) || cs == "-" || cs == "<" || cs == ">" { return true }
+        if cs == "&" {
+            if prev.kind == .Word || is_binary_op_sym(prev.text) || prev.text == "-" || prev.text == "," ||
+            prev.text == ";" || prev.text == ":" || prev.text == "<" {
+                return true
+            }
+            return false
+        }
+    }
+    if prev.kind == .Symbol {
+        ps := &prev.text
+        if ps == "," || ps == ";" || ps == ":" || is_binary_op_sym(ps) || ps == "-" || ps == "<" {
+            return true
+        }
+        if ps == "}" { return true }
+        if ps == ")" || ps == "]" {
+            if ps == "]" && prev_empty_brackets {
+                if curr.kind == .Word || (curr.kind == .Symbol && (curr.text == "&" || curr.text == "(" || curr.text == "[")) {
+                    return false
+                }
+            }
+            return curr.kind == .Word || curr.kind == .Number || curr.kind == .RawString || (curr.kind == .Symbol && curr.text == "{")
+        }
+    }
+    if prev.kind == .Word { return needs_space_after_word(prev.text, &curr, prev_was_dot) }
+    if prev.kind == .Number || prev.kind == .RawString || prev.kind == .CommentBlock { return true }
+    false
+}
+
+fn ensure_paren_wrap_indent(paren_state: &mut []i32, paren_indent: &mut i32) {
+    if paren_state.len > 0 && paren_state[paren_state.len - 1] == 0 {
+        paren_state[paren_state.len - 1] = 1
+        paren_indent += 1
+    }
+}
+
+fn format_tokens(tokens: &[]RawToken) -> string {
+    mut out: []u8 = []
+    mut brace_stack: []bool = [] // true = single line, false = multi line
+    mut paren_depths: []i32 = []
+    mut angle_depths: []i32 = []
+    mut indent := 0
+    mut paren_indent := 0
+    mut paren_state: []i32 = [] // 0 = same line, 1 = wrapped +1 indent, 2 = contains multi-line brace
+    mut prev := RawToken { kind: .End, text: "", start: 0, end: 0 }
+    mut prev_meaningful := -1
+    mut prev2_meaningful := -1
+    mut prev_was_unary := false
+    mut prev_generic_open := false
+    mut prev_generic_close := false
+    mut prev_was_dot := false
+    mut prev_was_fn_kw := false
+    mut at_line_start := true
+    mut pending_nls := 0
+    mut i := 0
+    mut n := tokens.len - 1
+    while n > 0 && tokens[n - 1].kind == .Newline { n -= 1 }
+
+    while i < n {
+        tok := &tokens[i]
+        if tok.kind == .Newline {
+            pending_nls += 1
+            i += 1
+            continue
+        }
+        if pending_nls > 0 && out.len > 0 {
+            if tok.kind == .CommentLine && !at_line_start && pending_nls == 0 {
+                // handled below
+            } else {
+                mut emit_blank := pending_nls >= 2
+                if prev.kind == .Symbol && prev.text == "{" { emit_blank = false }
+                if tok.kind == .Symbol && tok.text == "}" { emit_blank = false }
+                if !ends_with_newline(&out) { out.push(b'\n') }
+                if emit_blank { out.push(b'\n') }
+                at_line_start = true
+                prev_was_unary = false
+                prev_was_dot = false
+            }
+        }
+        pending_nls = 0
+
+        prev_empty_brackets := prev_meaningful >= 0 && prev2_meaningful >= 0 &&
+        tokens[prev_meaningful].kind == .Symbol && tokens[prev_meaningful].text == "]" &&
+        tokens[prev2_meaningful].kind == .Symbol && tokens[prev2_meaningful].text == "["
+
+        if tok.kind == .Symbol && tok.text == "{" {
+            close_idx := find_matching_brace(&tokens, i)
+            single := is_single_line_brace(&tokens, i, close_idx)
+            if at_line_start {
+                append_indent(&mut out, indent + paren_indent)
+            } else if has_prefix_space_needed(&prev, &tok, at_line_start, prev_was_unary, prev_generic_open, prev_generic_close, false, false, prev_was_dot, prev_was_fn_kw, prev_empty_brackets) {
+                out.push(b' ')
+            }
+            out.push(b'{')
+            brace_stack.push(single)
+            if !single {
+                indent += 1
+                if paren_state.len > 0 && paren_state[paren_state.len - 1] == 0 {
+                    paren_state[paren_state.len - 1] = 2
+                }
+            }
+            at_line_start = false
+            prev = tokens[i].clone()
+            prev2_meaningful = prev_meaningful
+            prev_meaningful = i
+            prev_was_unary = false
+            prev_generic_open = false
+            prev_generic_close = false
+            prev_was_dot = false
+            prev_was_fn_kw = false
+            // If multi-line and next token is not newline/comment-on-same-line, force newline after {
+            if !single && i + 1 < n && tokens[i + 1].kind != .Newline && tokens[i + 1].kind != .CommentLine {
+                out.push(b'\n')
+                at_line_start = true
+            }
+            i += 1
+            continue
+        }
+
+        if tok.kind == .Symbol && tok.text == "}" {
+            single := if brace_stack.len > 0 { brace_stack.pop() } else { true }
+            if !single {
+                if indent > 0 { indent -= 1 }
+                if !at_line_start {
+                    out.push(b'\n')
+                    at_line_start = true
+                }
+                append_indent(&mut out, indent + paren_indent)
+            } else if has_prefix_space_needed(&prev, &tok, at_line_start, prev_was_unary, prev_generic_open, prev_generic_close, false, false, prev_was_dot, prev_was_fn_kw, prev_empty_brackets) && !(prev.kind == .Symbol && prev.text == "{") {
+                out.push(b' ')
+            }
+            out.push(b'}')
+            at_line_start = false
+            prev = tokens[i].clone()
+            prev2_meaningful = prev_meaningful
+            prev_meaningful = i
+            prev_was_unary = false
+            prev_generic_open = false
+            prev_generic_close = false
+            prev_was_dot = false
+            prev_was_fn_kw = false
+            i += 1
+            continue
+        }
+
+        if tok.kind == .Symbol && (tok.text == ")" || tok.text == "]") {
+            if paren_depths.len > 0 { _ := paren_depths.pop() }
+            mut pst := 0
+            if paren_state.len > 0 { pst = paren_state.pop() }
+            if pst == 1 && paren_indent > 0 { paren_indent -= 1 }
+        }
+
+        mut curr_generic_open := false
+        mut curr_generic_close := false
+        if tok.kind == .Symbol && tok.text == "<" {
+            if looks_like_generic_angle(&tokens, i, prev_meaningful, prev2_meaningful) {
+                curr_generic_open = true
+                angle_depths.push(paren_depths.len)
+            }
+        } else if tok.kind == .Symbol && tok.text == ">" {
+            if angle_depths.len > 0 && angle_depths[angle_depths.len - 1] == paren_depths.len {
+                _ := angle_depths.pop()
+                curr_generic_close = true
+            }
+        }
+
+        if tok.kind == .Symbol && tok.text == "-" && is_unary_minus_prev(&prev, at_line_start, prev_generic_close) {
+            if at_line_start {
+                ensure_paren_wrap_indent(&mut paren_state, &mut paren_indent)
+                append_indent(&mut out, indent + paren_indent)
+            } else if prev.kind == .Symbol && (prev.text == "(" || prev.text == "[" || prev.text == "{" || prev.text == ".." || prev.text == "..=") {
+                if prev.text == "{" { out.push(b' ') }
+            } else if !(prev.kind == .Symbol && (prev.text == "!" || prev.text == "&" || prev.text == "@")) && !prev_was_unary {
+                out.push(b' ')
+            }
+            out.push(b'-')
+            at_line_start = false
+            prev = tokens[i].clone()
+            prev2_meaningful = prev_meaningful
+            prev_meaningful = i
+            prev_was_unary = true
+            prev_generic_open = false
+            prev_generic_close = false
+            prev_was_dot = false
+            prev_was_fn_kw = false
+            i += 1
+            continue
+        }
+
+        if at_line_start {
+            // Check if a continuation newline opened inside parens
+            ensure_paren_wrap_indent(&mut paren_state, &mut paren_indent)
+            append_indent(&mut out, indent + paren_indent)
+        } else if has_prefix_space_needed(&prev, &tok, at_line_start, prev_was_unary, prev_generic_open, prev_generic_close, curr_generic_open, curr_generic_close, prev_was_dot, prev_was_fn_kw, prev_empty_brackets) {
+            out.push(b' ')
+        }
+
+        bytes.append_utf8(&mut out, tok.text)
+        at_line_start = false
+
+        if tok.kind == .Symbol && (tok.text == "(" || tok.text == "[") {
+            paren_depths.push(1)
+            paren_state.push(0)
+        }
+
+        if tok.kind != .CommentLine && tok.kind != .CommentBlock {
+            prev2_meaningful = prev_meaningful
+            prev_meaningful = i
+            prev_was_dot = tok.kind == .Symbol && (tok.text == "." || tok.text == "::")
+            prev_was_fn_kw = tok.kind == .Word && tok.text == "fn"
+        }
+        prev_was_unary = tok.kind == .Symbol && (tok.text == "!" || tok.text == "&" || tok.text == "@")
+        prev_generic_open = curr_generic_open
+        prev_generic_close = curr_generic_close
+        prev = tokens[i].clone()
+        i += 1
+    }
+    if out.len > 0 && out[out.len - 1] != 10 { out.push(b'\n') }
+    bytes.decode(&out).value
+}
+
+pub fn format_source(path: string, source: string) -> FormatResult {
+    parsed := parser.parse_source(path, source)
+    if !parsed.ok {
+        mut err := "syntax error in " + path
+        if parsed.diagnostics.len > 0 {
+            d := &parsed.diagnostics[0]
+            lc := diag.line_col(parsed.source, d.start)
+            err = d.path + ":" + lc.line.str() + ":" + lc.column.str() + ": " + d.message
+        }
+        return FormatResult { ok: false, text: "", error: err }
+    }
+    raw := tokenize_raw(source)
+    formatted := format_tokens(&raw)
+    recheck := parser.parse_source(path, formatted)
+    if !recheck.ok {
+        return FormatResult { ok: false, text: "", error: "internal formatter verification failed on " + path }
+    }
+    FormatResult { ok: true, text: formatted, error: "" }
+}
+
+fn str_less(a: string, b: string) -> bool {
+    limit := if a.len < b.len { a.len } else { b.len }
+    for i in 0..limit {
+        if a[i] != b[i] { return a[i] < b[i] }
+    }
+    a.len < b.len
+}
+
+fn sort_paths(items: &mut []string) {
+    mut i := 1
+    while i < items.len {
+        mut j := i
+        while j > 0 && str_less(items[j], items[j - 1]) {
+            tmp := items[j].clone()
+            items[j] = items[j - 1].clone()
+            items[j - 1] = tmp
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+fn collect_ddr_files(target: string, out: &mut []string, err: &mut string) -> bool {
+    meta := sys.metadata(target)
+    if !meta.ok {
+        err = "path not found: " + target
+        return false
+    }
+    if meta.is_file {
+        out.push(target.clone())
+        return true
+    }
+    if !meta.is_dir {
+        err = "unsupported path: " + target
+        return false
+    }
+    listing := bundle_fs.entries(target)
+    if listing.error != "" {
+        err = listing.error
+        return false
+    }
+    mut children := listing.paths
+    sort_paths(&mut children)
+    for name in &children {
+        if name.len == 0 || name[0] == 46 || name == "build" { continue }
+        child := if target == "." { name.clone() } else if target == "/" { "/" + name } else { target + "/" + name }
+        cmeta := sys.metadata(child)
+        if !cmeta.ok { continue }
+        if cmeta.is_dir {
+            if !collect_ddr_files(child, &mut out, &mut err) { return false }
+        } else if cmeta.is_file && text.ends_with(name, ".ddr") {
+            out.push(move child)
+        }
+    }
+    true
+}
+
+fn atomic_write_text(path: string, content: string) -> string {
+    tmp := path + ".dunder-fmt-" + sys.pid().str() + ".tmp"
+    w := sys.write_text(tmp, content)
+    if !w.ok {
+        _ := sys.remove_file(tmp)
+        return sys.error_message(w.error)
+    }
+    rn := sys.rename(tmp, path)
+    if !rn.ok {
+        _ := sys.remove_file(tmp)
+        return sys.error_message(rn.error)
+    }
+    ""
+}
+
+pub fn run() -> i32 {
+    mut check_only := false
+    mut to_stdout := false
+    mut targets: []string = []
+    mut i := 2
+    while i < sys.arg_count() {
+        arg := sys.arg(i)
+        if arg == "-h" || arg == "--help" {
+            print("usage: dunder fmt [--check | --stdout] [path...]")
+            return 0
+        } else if arg == "--check" {
+            check_only = true
+        } else if arg == "--stdout" {
+            to_stdout = true
+        } else if text.starts_with(arg, "-") {
+            _ := stderr.eprint("unknown fmt option: " + arg)
+            return 2
+        } else {
+            targets.push(move arg)
+        }
+        i += 1
+    }
+    if check_only && to_stdout {
+        _ := stderr.eprint("cannot combine --check and --stdout")
+        return 2
+    }
+    if targets.len == 0 { targets.push(".") }
+    mut files: []string = []
+    mut collect_err := ""
+    for target in &targets {
+        if !collect_ddr_files(target, &mut files, &mut collect_err) {
+            _ := stderr.eprint(collect_err)
+            return 1
+        }
+    }
+    if to_stdout && files.len != 1 {
+        _ := stderr.eprint("--stdout requires a single file")
+        return 2
+    }
+    sort_paths(&mut files)
+    mut needs_fmt := 0
+    for path in &files {
+        read := sys.read_text(path)
+        if !read.ok {
+            _ := stderr.eprint("cannot read " + path + ": " + sys.error_message(read.error))
+            return 1
+        }
+        res := format_source(path, read.value)
+        if !res.ok {
+            _ := stderr.eprint(res.error)
+            return 1
+        }
+        if to_stdout {
+            st := stderr.write_stdout(res.text)
+            if !st.ok {
+                _ := stderr.eprint("cannot write stdout")
+                return 1
+            }
+            return 0
+        }
+        if res.text != read.value {
+            if check_only {
+                _ := stderr.eprint("unformatted: " + path)
+                needs_fmt += 1
+            } else {
+                werr := atomic_write_text(path, res.text)
+                if werr != "" {
+                    _ := stderr.eprint("cannot write " + path + ": " + werr)
+                    return 1
+                }
+                print("formatted " + path)
+            }
+        }
+    }
+    if check_only && needs_fmt > 0 { return 1 }
+    0
+}
+
+@test fn fmt_is_canonical_and_idempotent() {
+    dirty := "import std.text as text\n\n\nstruct Point<T>{x:T,y:T}\nfn add(a:i32,b:i32)->i32{\nif a<b&&b>0{\ns:=f\"hej åäö {a:04x}\" // trailing comment\nreturn -1\n}\nmut xs:=Map<string,i32>::new()\n0}\n"
+    first := format_source("sample.ddr", dirty)
+    assert(first.ok)
+    second := format_source("sample.ddr", first.text)
+    assert(second.ok && second.text == first.text)
+    assert(text.contains(first.text, "struct Point<T> { x: T, y: T }"))
+    assert(text.contains(first.text, "fn add(a: i32, b: i32) -> i32 {"))
+    assert(text.contains(first.text, "    if a < b && b > 0 {"))
+    assert(text.contains(first.text, "        s := f\"hej åäö {a:04x}\" // trailing comment"))
+    assert(text.contains(first.text, "        return -1"))
+    assert(text.contains(first.text, "    mut xs := Map<string, i32>::new()"))
+}
+
+@test fn fmt_rejects_broken_syntax_without_modifying_code() {
+    bad := format_source("broken.ddr", "fn main( {\n")
+    assert(!bad.ok)
+}
