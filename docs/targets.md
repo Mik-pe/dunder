@@ -80,7 +80,7 @@ referensräknade strängar och scratch-regioner. Adresserbara lokaler ligger på
 en kontrollerad värdestack i linjärt minne. En
 Wasm-fälla avslutar anropet. Skapa en ny instans om programmet ska startas
 om efter ett sådant fel. Program som behöver filer eller fönster anger
-värdens API via importer. `std.sys.decode_utf8` och `decode_u8` fungerar i
+värdens API via importer. `std.sys.decode_u8` och `decode_u8_range` fungerar i
 linjärt minne.
 
 I `tools/verify-selfhost.sh` kör Node bland annat program för sammansatta
