@@ -1,0 +1,475 @@
+capability process, filesystem, network, stdio
+
+import .harness as harness
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+fn put(path: string, program: string) -> bool {
+    sys.write_text(path, program).ok || harness.fail(f"cannot write {path}")
+}
+
+fn build_and_run(journal: &mut evidence.Journal, compiler: string, work: string, name: string, program: string, expected: string) -> bool {
+    source := f"{work}/{name}.ddr"
+    image := f"{work}/{name}"
+    mut output := harness.empty_output()
+    if !put(source, program + "\n") ||
+       !journal.run(compiler, ["check", source.clone(), "--agent"], &mut output) ||
+       !journal.run(compiler, ["build", source.clone(), "-o", image.clone()], &mut output) ||
+       !journal.run(image, [], &mut output) { return false }
+    got := output.stdout_text() + output.stderr_text()
+    got == expected || harness.fail(f"{name}: expected\n{expected}\ngot\n{got}")
+}
+
+fn check_invalid(journal: &mut evidence.Journal, compiler: string, work: string, name: string, program: string, expected: string) -> bool {
+    source := f"{work}/{name}.ddr"
+    image := f"{work}/{name}"
+    if !put(source, program + "\n") { return false }
+    mut output := harness.empty_output()
+    for action in ["check", "build"] {
+        mut args: []string = [action.clone(), source.clone()]
+        if action == "check" { args.push("--agent") } else { args.push("-o"); args.push(image.clone()) }
+        if !journal.run_expected(compiler, args, 1, &mut output) { return false }
+        got := output.stdout_text() + output.stderr_text()
+        if !text.contains(got, expected) {
+            return harness.fail(f"{name} ({action}): expected '{expected}'\ngot:\n{got}")
+        }
+    }
+    true
+}
+
+fn check_atomics(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "capability unsafe\n" +
+        "import sys\n" +
+        "struct Counter { p: usize }\n" +
+        "@thread_safe\n" +
+        "fn atomic_inc(p_addr: usize, delta: i64) -> i64 { unsafe { sys.atomic_fetch_add_i64(ptr(p_addr), delta) } }\n" +
+        "@thread_safe\n" +
+        "fn atomic_cas3(p_addr: usize) {\n" +
+        "    while true {\n" +
+        "        cur := unsafe { sys.atomic_load_i64(ptr(p_addr)) }\n" +
+        "        prev := unsafe { sys.atomic_cas_i64(ptr(p_addr), cur, cur + 3) }\n" +
+        "        if prev == cur { return }\n" +
+        "    }\n" +
+        "}\n" +
+        "fn worker_fn(slot: i64, ctx: &Counter) -> i64 {\n" +
+        "    mut done: i64 = 0\n" +
+        "    for _ in 0..25 {\n" +
+        "        _ := atomic_inc(ctx.p, 1)\n" +
+        "        atomic_cas3(ctx.p)\n" +
+        "        done += 1\n" +
+        "    }\n" +
+        "    done + slot * 0\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut val: i64 = 0\n" +
+        "    mut p_addr: usize = 0\n" +
+        "    unsafe {\n" +
+        "        sys.atomic_store_i64(addr(&mut val), 10)\n" +
+        "        p_addr = usize(addr(&mut val))\n" +
+        "    }\n" +
+        "    ctx := Counter { p: p_addr }\n" +
+        "    task scope s(4, shared ctx) {\n" +
+        "        mut ids: []TaskID<i64> = []\n" +
+        "        for i in 0..4 { ids.push(spawn s worker_fn(i64(i))) }\n" +
+        "        mut done: i64 = 0\n" +
+        "        for i in 0..ids.len { done += await! s(ids[i]) }\n" +
+        "        unsafe {\n" +
+        "            final_val := sys.atomic_load_i64(addr(&val))\n" +
+        "            print(done)\n" +
+        "            print(final_val)\n" +
+        "        }\n" +
+        "    }\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "atomics_workers", program, "100\n410\n")
+}
+
+fn check_capabilities_and_stdlib(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    sub_dir := work + "/fs-workers"
+    if !fs.mkdir_all(sub_dir).ok { return harness.fail("cannot create fs worker dir") }
+
+    net_program := "capability network\n" +
+        "import std.bytes as bytes\n" +
+        "import std.net as net\n" +
+        "fn client_echo(port: i32) -> string {\n" +
+        "    ep := net.SocketAddr::loopback_v4(u16(port))\n" +
+        "    mut stream := net.TcpStream::connect_addr(ep).unwrap()\n" +
+        "    req := bytes.from_text(\"hello\")\n" +
+        "    _ := stream.write_all(&req)\n" +
+        "    mut buf: []u8 = []\n" +
+        "    _ := stream.read_append(&mut buf, 16).unwrap()\n" +
+        "    bytes.decode(&buf).value\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    listener := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(0), 4).unwrap()\n" +
+        "    port := listener.local_port()\n" +
+        "    task scope s(1) with (network) {\n" +
+        "        id := spawn s client_echo(port)\n" +
+        "        srv := listener.accept().unwrap()\n" +
+        "        mut buf: []u8 = []\n" +
+        "        _ := srv.read_append(&mut buf, 16).unwrap()\n" +
+        "        msg := bytes.decode(&buf).value\n" +
+        "        reply := bytes.from_text(msg + \"-world\")\n" +
+        "        _ := srv.write_all(&reply)\n" +
+        "        print(await! s(id))\n" +
+        "    }\n" +
+        "}"
+    if !build_and_run(&mut journal, compiler, work, "cap_network", net_program, "hello-world\n") { return false }
+
+    fs_program := "capability filesystem\n" +
+        "import std.bytes as bytes\n" +
+        "import std.fs as fs\n" +
+        "import std.io as io\n" +
+        "import std.sqlite as sqlite\n" +
+        "import std.time as time\n" +
+        "import sys\n" +
+        "struct Job { path: string, tag: i64 }\n" +
+        "fn fs_worker(job: Job) -> i64 {\n" +
+        "    mut f := fs.File::create(job.path).unwrap()\n" +
+        "    data := bytes.from_text(\"w:\" + job.tag.str())\n" +
+        "    _ := f.write(&data).unwrap()\n" +
+        "    _ := f.close()\n" +
+        "    mut r := fs.File::open_read(job.path).unwrap()\n" +
+        "    mut buf: []u8 = []\n" +
+        "    _ := r.read(&mut buf, 32).unwrap()\n" +
+        "    _ := r.close()\n" +
+        "    now := time.unix_now()\n" +
+        "    db_res := sqlite.Database::open(\":memory:\", false)\n" +
+        "    assert(db_res.ok)\n" +
+        "    mut db := db_res.db\n" +
+        "    empty: []string = []\n" +
+        "    assert(db.exec(\"CREATE TABLE t (x INT)\", &empty).ok)\n" +
+        "    assert(db.exec(\"INSERT INTO t VALUES (?)\", &[job.tag.str()]).ok)\n" +
+        "    qr := db.query(\"SELECT x FROM t\", &empty)\n" +
+        "    assert(qr.ok && qr.rows.len == 1)\n" +
+        "    _ := db.close()\n" +
+        "    if now.as_secs() > 0 && bytes.decode(&buf).value == \"w:\" + job.tag.str() { job.tag } else { -1 }\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    task scope s(4) with (filesystem) {\n" +
+        "        mut ids: []TaskID<i64> = []\n" +
+        "        for i in 0..4 {\n" +
+        "            p := \"" + sub_dir + "/item-\" + i.str() + \".txt\"\n" +
+        "            ids.push(spawn s fs_worker(Job { path: p, tag: i64(i + 1) }))\n" +
+        "        }\n" +
+        "        mut sum: i64 = 0\n" +
+        "        for i in 0..ids.len { sum += await! s(ids[i]) }\n" +
+        "        print(sum)\n" +
+        "    }\n" +
+        "}"
+    if !build_and_run(&mut journal, compiler, work, "cap_filesystem_sqlite_time", fs_program, "10\n") { return false }
+
+    stdio_program := "fn log_worker(n: i64) -> i64 { print(\"stdio-ok-\" + n.str()); n }\n" +
+        "fn main() { task scope s(1) with (stdio) { id := spawn s log_worker(7); print(await! s(id)) } }"
+    if !build_and_run(&mut journal, compiler, work, "cap_stdio", stdio_program, "stdio-ok-7\n7\n") { return false }
+
+    neg_net := "capability network\nimport std.net as net\nfn w(n: i64) -> i64 { _ := net.TcpListener::listen(net.loopback(), 0, 1); n }\nfn main() { task scope s(1) { _ := spawn s w(1) } }"
+    if !check_invalid(&mut journal, compiler, work, "neg_plain_net", neg_net, "network I/O; grant 'with (network)'") { return false }
+
+    neg_fs := "capability filesystem\nimport sys\nfn w(p: string) -> i64 { _ := sys.read_text(p); 1 }\nfn main() { task scope s(1) { _ := spawn s w(\"a\") } }"
+    if !check_invalid(&mut journal, compiler, work, "neg_plain_fs", neg_fs, "filesystem I/O; grant 'with (filesystem)'") { return false }
+
+    neg_stdio := "fn w(n: i64) -> i64 { print(n); n }\nfn main() { task scope s(1) { _ := spawn s w(1) } }"
+    if !check_invalid(&mut journal, compiler, work, "neg_plain_stdio", neg_stdio, "stdio I/O; grant 'with (stdio)'") { return false }
+
+    neg_mod := "fn main() { task scope s(1) with (network) {} }"
+    if !check_invalid(&mut journal, compiler, work, "neg_module_net", neg_mod, "task scope grant 'network' requires 'capability network'") { return false }
+
+    neg_extern := "capability network, unsafe\n@extern(\"c\", \"getpid\")\nunsafe fn raw_pid() -> i32\nfn w(n: i64) -> i64 { unsafe { i64(raw_pid()) + n } }\nfn main() { task scope s(1) with (network) { _ := spawn s w(1) } }"
+    if !check_invalid(&mut journal, compiler, work, "neg_unannotated_extern", neg_extern, "effects outside") { return false }
+
+    neg_borrow_sendable := "capability network\nimport std.net as net\nfn w(s: net.TcpStream) -> i32 { s.fd() }\nfn run(move s: net.TcpStream) { task scope j(1) with (network) { _ := spawn j w(s) } }\nfn main() {}"
+    check_invalid(&mut journal, compiler, work, "neg_borrow_sendable", neg_borrow_sendable, "@resource task input must be passed by move")
+}
+
+fn check_movable_resources(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    fpath := work + "/moved-file.txt"
+    program := "capability network, filesystem, unsafe\n" +
+        "import std.bytes as bytes\n" +
+        "import std.fs as fs\n" +
+        "import std.net as net\n" +
+        "import sys\n" +
+        "@thread_safe\n" +
+        "fn bump(p: usize) { unsafe { _ := sys.atomic_fetch_add_i64(ptr(p), 1) } }\n" +
+        "@resource(dispose)\n" +
+        "struct DropMark { p: usize }\n" +
+        "impl Sendable for DropMark {}\n" +
+        "impl DropMark { fn dispose(&self) { bump(self.p) } }\n" +
+        "fn echo_move(move stream: net.TcpStream) -> net.TcpStream {\n" +
+        "    mut buf: []u8 = []\n" +
+        "    _ := stream.read_append(&mut buf, 16).unwrap()\n" +
+        "    assert(bytes.decode(&buf).value == \"ping\")\n" +
+        "    _ := stream.write_all(&bytes.from_text(\"pong\"))\n" +
+        "    move stream\n" +
+        "}\n" +
+        "fn write_move(move f: fs.File) -> fs.File {\n" +
+        "    mut fh := f\n" +
+        "    _ := fh.write(&bytes.from_text(\"part1-\")).unwrap()\n" +
+        "    move fh\n" +
+        "}\n" +
+        "fn make_unawaited(p: usize) -> DropMark { DropMark { p: p } }\n" +
+        "fn main() {\n" +
+        "    mut drop_count: i64 = 0\n" +
+        "    mut drop_ptr: usize = 0\n" +
+        "    unsafe { drop_ptr = usize(addr(&mut drop_count)) }\n" +
+        "    listener := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(0), 4).unwrap()\n" +
+        "    ep := net.SocketAddr::loopback_v4(u16(listener.local_port()))\n" +
+        "    client := net.TcpStream::connect_addr(ep).unwrap()\n" +
+        "    server := listener.accept().unwrap()\n" +
+        "    f := fs.File::create(\"" + fpath + "\").unwrap()\n" +
+        "    task scope s(2) with (network, filesystem) {\n" +
+        "        sid := spawn s echo_move(move server)\n" +
+        "        _ := client.write_all(&bytes.from_text(\"ping\"))\n" +
+        "        mut rbuf: []u8 = []\n" +
+        "        _ := client.read_append(&mut rbuf, 16).unwrap()\n" +
+        "        assert(bytes.decode(&rbuf).value == \"pong\")\n" +
+        "        mut server2 := await! s(sid)\n" +
+        "        assert(server2.fd() >= 0)\n" +
+        "        _ := server2.write_all(&bytes.from_text(\"!\"))\n" +
+        "        mut rbuf2: []u8 = []\n" +
+        "        _ := client.read_append(&mut rbuf2, 4).unwrap()\n" +
+        "        assert(bytes.decode(&rbuf2).value == \"!\")\n" +
+        "        _ := server2.close()\n" +
+        "        fid := spawn s write_move(move f)\n" +
+        "        mut f2 := await! s(fid)\n" +
+        "        assert(f2.fd() >= 0)\n" +
+        "        _ := f2.write(&bytes.from_text(\"part2\")).unwrap()\n" +
+        "        _ := f2.close()\n" +
+        "        _ := spawn s make_unawaited(drop_ptr)\n" +
+        "    }\n" +
+        "    assert(sys.read_text(\"" + fpath + "\").value == \"part1-part2\")\n" +
+        "    unsafe {\n" +
+        "        print(sys.atomic_load_i64(ptr(drop_ptr)))\n" +
+        "    }\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "movable_resources", program, "1\n")
+}
+
+fn check_workspace_dispose(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "capability unsafe\n" +
+        "import sys\n" +
+        "struct JobCfg { init_p: usize, drop_p: usize, v: i64 }\n" +
+        "@thread_safe\n" +
+        "fn inc(p: usize) { unsafe { _ := sys.atomic_fetch_add_i64(ptr(p), 1) } }\n" +
+        "@thread_safe\n" +
+        "fn get(p: usize) -> i64 { unsafe { sys.atomic_load_i64(ptr(p)) } }\n" +
+        "@resource(dispose)\n" +
+        "struct WorkerState { hits: i64, drop_p: usize }\n" +
+        "impl WorkerState {\n" +
+        "    fn dispose(&self) { if self.drop_p != 0 { inc(self.drop_p) } }\n" +
+        "}\n" +
+        "fn init_ws() -> WorkerState { WorkerState { hits: 0, drop_p: 0 } }\n" +
+        "fn indexed_job(job: JobCfg, ws: &mut WorkerState) -> i64 {\n" +
+        "    if ws.hits == 0 { inc(job.init_p); ws.drop_p = job.drop_p }\n" +
+        "    ws.hits += 1\n" +
+        "    job.v + ws.hits\n" +
+        "}\n" +
+        "fn detached_job(job: JobCfg, ws: &mut WorkerState) {\n" +
+        "    if ws.hits == 0 { inc(job.init_p); ws.drop_p = job.drop_p }\n" +
+        "    ws.hits += 1\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut inits: i64 = 0\n" +
+        "    mut drops: i64 = 0\n" +
+        "    mut ip: usize = 0\n" +
+        "    mut dp: usize = 0\n" +
+        "    unsafe { ip = usize(addr(&mut inits)); dp = usize(addr(&mut drops)) }\n" +
+        "    task scope s1(3, init_ws) {\n" +
+        "        mut ids: []TaskID<i64> = []\n" +
+        "        for i in 0..9 { ids.push(spawn s1 indexed_job(JobCfg { init_p: ip, drop_p: dp, v: i64(i) })) }\n" +
+        "        for i in 0..ids.len { _ := await! s1(ids[i]) }\n" +
+        "    }\n" +
+        "    i1 := get(ip)\n" +
+        "    d1 := get(dp)\n" +
+        "    assert(i1 >= 1 && i1 <= 3 && d1 == i1)\n" +
+        "    unsafe { sys.atomic_store_i64(ptr(ip), 0); sys.atomic_store_i64(ptr(dp), 0) }\n" +
+        "    task scope s2(3, init_ws) {\n" +
+        "        for i in 0..20 { spawn! s2 detached_job(JobCfg { init_p: ip, drop_p: dp, v: i64(i) }) }\n" +
+        "    }\n" +
+        "    i2 := get(ip)\n" +
+        "    d2 := get(dp)\n" +
+        "    assert(i2 >= 1 && i2 <= 3 && d2 == i2)\n" +
+        "    print(42)\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "workspace_dispose", program, "42\n")
+}
+
+fn check_arena_growth(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "import std.bytes as bytes\n" +
+        "fn alloc_heavy(n: i64) -> i64 {\n" +
+        "    mut chunks: [][]u8 = []\n" +
+        "    for round in 0..11 {\n" +
+        "        mut buf: []u8 = []\n" +
+        "        bytes.pad(&mut buf, 1048576)\n" +
+        "        buf[0] = u8(round + 1)\n" +
+        "        buf[buf.len - 1] = u8(n)\n" +
+        "        chunks.push(move buf)\n" +
+        "    }\n" +
+        "    mut acc: i64 = 0\n" +
+        "    for c in &chunks { acc += i64(c[0]) + i64(c[c.len - 1]) }\n" +
+        "    acc\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    task scope s(2) arena 2097152 {\n" +
+        "        a := spawn s alloc_heavy(3)\n" +
+        "        b := spawn s alloc_heavy(5)\n" +
+        "        print(await! s(a))\n" +
+        "        print(await! s(b))\n" +
+        "    }\n" +
+        "}"
+    // sum(1..11) = 66; a: 66 + 11*3 = 99; b: 66 + 11*5 = 121
+    build_and_run(&mut journal, compiler, work, "arena_growth", program, "99\n121\n")
+}
+
+fn check_detached_and_await_any(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "capability unsafe\n" +
+        "import sys\n" +
+        "struct Ctx { p: usize }\n" +
+        "@thread_safe\n" +
+        "fn bump(p: usize) { unsafe { _ := sys.atomic_fetch_add_i64(ptr(p), 1) } }\n" +
+        "fn zero_arg(ctx: &Ctx) { bump(ctx.p) }\n" +
+        "fn stagger(delay_ms: i64) -> i64 {\n" +
+        "    sys.sleep_ms(delay_ms)\n" +
+        "    delay_ms\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut count: i64 = 0\n" +
+        "    mut cp: usize = 0\n" +
+        "    unsafe { cp = usize(addr(&mut count)) }\n" +
+        "    ctx := Ctx { p: cp }\n" +
+        "    task scope s(4, shared ctx) {\n" +
+        "        for _ in 0..200 { spawn! s zero_arg() }\n" +
+        "    }\n" +
+        "    unsafe { assert(sys.atomic_load_i64(ptr(cp)) == 200) }\n" +
+        "    mut order: []i64 = []\n" +
+        "    task scope w(4) {\n" +
+        "        mut pending: []TaskID<i64> = []\n" +
+        "        pending.push(spawn w stagger(160))\n" +
+        "        pending.push(spawn w stagger(5))\n" +
+        "        pending.push(spawn w stagger(120))\n" +
+        "        pending.push(spawn w stagger(1))\n" +
+        "        while pending.len > 0 {\n" +
+        "            idx := i32(await_any w(&pending))\n" +
+        "            val := await! w(pending[idx])\n" +
+        "            order.push(val)\n" +
+        "            mut next_pending: []TaskID<i64> = []\n" +
+        "            for j in 0..pending.len {\n" +
+        "                if j != idx { next_pending.push(pending[j]) }\n" +
+        "            }\n" +
+        "            pending = next_pending\n" +
+        "        }\n" +
+        "    }\n" +
+        "    mut sum: i64 = 0\n" +
+        "    for v in order { sum += v }\n" +
+        "    assert(order.len == 4 && sum == 286)\n" +
+        "    assert(order[0] <= 5)\n" +
+        "    print(200)\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "detached_and_await_any", program, "200\n")
+}
+
+fn check_cross_compile_and_incremental(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    cross_src := work + "/cross_concurrency.ddr"
+    cross_program := "capability network, unsafe\n" +
+        "import std.net as net\n" +
+        "import sys\n" +
+        "@thread_safe\n" +
+        "fn inc(p: usize) -> i64 { unsafe { sys.atomic_fetch_add_i64(ptr(p), 1) } }\n" +
+        "fn detached_net(p: usize) {\n" +
+        "    _ := inc(p)\n" +
+        "    _ := net.IpAddr::localhost_v4()\n" +
+        "}\n" +
+        "fn indexed_net(v: i64) -> i64 { sys.sleep_ms(v); v + 1 }\n" +
+        "fn main() {\n" +
+        "    mut x: i64 = 0\n" +
+        "    mut xp: usize = 0\n" +
+        "    unsafe { xp = usize(addr(&mut x)) }\n" +
+        "    task scope s(2) with (network) arena 2097152 {\n" +
+        "        spawn! s detached_net(xp)\n" +
+        "        mut ids: []TaskID<i64> = [spawn s indexed_net(1)]\n" +
+        "        idx := i32(await_any s(&ids))\n" +
+        "        print(await! s(ids[idx]))\n" +
+        "    }\n" +
+        "}"
+    if !put(cross_src, cross_program + "\n") { return false }
+    mut output := harness.empty_output()
+    for target in ["arm64-linux", "x86_64-linux"] {
+        out_img := f"{work}/cross-{target}"
+        if !journal.run(compiler, ["check", cross_src.clone(), "--target", target.clone()], &mut output) ||
+           !journal.run(compiler, ["build", cross_src.clone(), "--target", target.clone(), "-o", out_img.clone()], &mut output) {
+            return false
+        }
+        info := sys.metadata(out_img)
+        if !info.ok || info.size < 4096 { return harness.fail(f"{out_img}: invalid cross ELF size") }
+    }
+
+    inc_dir := work + "/inc-src"
+    if !fs.mkdir_all(inc_dir).ok { return false }
+    inc_src := inc_dir + "/app.ddr"
+    inc_program := "fn pure_helper(n: i64) -> i64 { n * 3 }\n" +
+        "fn pure_worker(n: i64) -> i64 { pure_helper(n) + 1 }\n" +
+        "fn main() { task scope s(2) { id := spawn s pure_worker(14); print(await! s(id)) } }"
+    if !put(inc_src, inc_program + "\n") { return false }
+    mut first_img: []u8 = []
+    for rep in 0..2 {
+        img := f"{work}/inc-{rep}"
+        if !journal.run(compiler, ["build", inc_src.clone(), "-o", img.clone(), "--incremental", "--timings=json"], &mut output) {
+            return false
+        }
+        timings := output.stdout_text() + output.stderr_text()
+        mut saw := false
+        for line in move harness.lines(timings) {
+            if !text.starts_with(line, "{") { continue }
+            doc := json.Doc::parse_text(line)
+            reused := doc.get_i64(doc.field(doc.root, "functions"), "reused")
+            if !doc.ok || !reused.ok { return harness.fail(f"invalid incremental timings\n{timings}") }
+            if rep == 0 && reused.value != 0 { return harness.fail(f"expected cold cache on pass 0\n{timings}") }
+            if rep > 0 && reused.value <= 0 { return harness.fail(f"expected reused pure fragments on pass 1\n{timings}") }
+            saw = true
+            break
+        }
+        if !saw { return harness.fail(f"missing json timing record\n{timings}") }
+        if !journal.run(img, [], &mut output) || output.stdout_text() != "43\n" {
+            return harness.fail(f"{img}: unexpected output '{output.stdout_text()}'")
+        }
+        data := sys.read_u8(img)
+        if !data.ok { return false }
+        if rep == 0 { first_img = data.value }
+        else if !bytes.equal(&first_img, &data.value) {
+            return harness.fail(f"{img}: incremental rebuild changed output image")
+        }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("-o"), cli.option("--jobs")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_concurrency_workers COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("cannot locate source root"); return 2 }
+    tmp := fs.temp_dir("dunder-concurrency-workers-")
+    if !tmp.ok { _ := harness.fail("cannot create temp dir"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    mut journal := evidence.Journal::new(root, 60000)
+    ok := check_atomics(&mut journal, compiler, work) &&
+        check_capabilities_and_stdlib(&mut journal, compiler, work) &&
+        check_movable_resources(&mut journal, compiler, work) &&
+        check_workspace_dispose(&mut journal, compiler, work) &&
+        check_arena_growth(&mut journal, compiler, work) &&
+        check_detached_and_await_any(&mut journal, compiler, work) &&
+        check_cross_compile_and_incremental(&mut journal, compiler, work)
+    if ok {
+        print("PASS concurrency workers: 7 scenario groups")
+        0
+    } else {
+        1
+    }
+}
