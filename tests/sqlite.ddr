@@ -1,116 +1,166 @@
 capability filesystem
+
 import ..stdlib.sqlite as sqlite
-import std.json as json
 import sys
 
-fn must_exec(db: &sqlite.Database, sql: string, params: &[]string) {
+fn must_exec(db: &sqlite.Database, sql: string, params: &[]sqlite.SqlValue) {
     result := db.exec(sql, &params)
-    if !result.ok { print(result.error) }
-    assert(result.ok)
+    assert(result.is_ok())
+}
+
+fn early_abort_tx(db: &sqlite.Database, insert_name: string) -> Result<(), sqlite.SqliteError> {
+    tx := db.begin()?
+    none: []sqlite.SqlValue = []
+    _ := tx.exec("INSERT INTO tx_items(name) VALUES (?)", &[.Text(insert_name.clone())])?
+    // Trigger an intentional error via constraint / missing table so tx drops without commit()
+    _ := tx.query("SELECT * FROM missing_table_trigger_abort", &none)?
+    .Ok
+}
+
+fn scoped_auto_close(path: string) {
+    db := sqlite.Database::open(path, false).unwrap()
+    _ := db.exec("INSERT INTO tx_items(name) VALUES ('from_scoped')", &[]).unwrap()
+    // db disposed automatically on scope exit without calling db.close()
 }
 
 fn main() {
-    none: []string = []
+    none: []sqlite.SqlValue = []
     path := sys.arg(1)
-    opened := sqlite.Database::open(path, false)
-    if !opened.ok { print(opened.error) }
-    assert(opened.ok)
-    mut db := opened.db
+    mut db := sqlite.Database::open(path, false).unwrap()
+
     must_exec(&db, "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL, number INTEGER, real REAL, absent TEXT)", &none)
-    values: []string = ["åäö 雪\0after", "9223372036854775807", "1.2345678901234567"]
-    inserted := db.exec("INSERT INTO items(value,number,real) VALUES(?,?,?)", &values)
-    if !inserted.ok { print(inserted.error) }
-    assert(inserted.ok && inserted.changes == 1 && inserted.last_id == 1)
-    empty: []string = [""]
+    values: []sqlite.SqlValue = [.Text("åäö 雪\0after"), .Int(9223372036854775807), .Real(1.2345678901234567)]
+    inserted := db.exec("INSERT INTO items(value,number,real) VALUES(?,?,?)", &values).unwrap()
+    assert(inserted.changes == 1 && inserted.last_id == 1)
+
+    empty: []sqlite.SqlValue = [.Text("")]
     must_exec(&db, "INSERT INTO items(value) VALUES(?)", &empty)
-    malicious: []string = ["x'); DROP TABLE items; --"]
+    malicious: []sqlite.SqlValue = [.Text("x'); DROP TABLE items; --")]
     must_exec(&db, "INSERT INTO items(value) VALUES(?)", &malicious)
-    rows := db.query("SELECT id,value,number,real,absent FROM items ORDER BY id", &none)
-    if !rows.ok { print(rows.error) }
-    assert(rows.ok && rows.rows.len == 3)
-    first := json.Doc::parse_text(rows.rows[0])
-    assert(first.ok)
-    assert(first.get_i64(first.root, "id").value == 1)
-    assert(first.get_str(first.root, "value").value == values[0])
-    assert(first.get_i64(first.root, "number").value == 9223372036854775807)
-    assert(first.kind(first.field(first.root, "absent")) == .Null)
-    second := json.Doc::parse_text(rows.rows[1])
-    assert(second.ok && second.get_str(second.root, "value").value == "")
-    print(rows.rows[0])
-    print(rows.rows[1])
-    print(rows.rows[2])
 
-    rejected := db.exec("DELETE FROM items; DROP TABLE items", &none)
-    assert(!rejected.ok)
-    pragma := db.exec("PRAGMA cache_size=123; DELETE FROM items", &none)
-    assert(!pragma.ok)
-    cache := db.query("PRAGMA cache_size", &none)
-    assert(cache.ok && cache.rows.len == 1)
-    cache_doc := json.Doc::parse_text(cache.rows[0])
-    assert(cache_doc.get_i64(cache_doc.root, "cache_size").value != 123)
-    mismatch := db.exec("DELETE FROM items WHERE value=?", &none)
-    assert(!mismatch.ok)
-    mismatch_extra := db.exec("DELETE FROM items", &empty)
-    assert(!mismatch_extra.ok)
-    invalid := db.exec("DELETE FROM items\0", &none)
-    assert(!invalid.ok)
-    missing := db.query("SELECT missing FROM items", &none)
-    assert(!missing.ok)
-    readonly_query := db.query("DELETE FROM items", &none)
-    assert(!readonly_query.ok)
-    count := db.query("SELECT count(*) AS total FROM items", &none)
-    count_doc := json.Doc::parse_text(count.rows[0])
-    assert(count.ok && count_doc.get_i64(count_doc.root, "total").value == 3)
+    rows := db.query("SELECT id,value,number,real,absent FROM items ORDER BY id", &none).unwrap()
+    assert(rows.len == 3)
+    r0 := &rows[0]
+    assert(r0.len() == 5)
+    assert(r0.column_name(0).unwrap() == "id" && r0.column_index("real").unwrap() == 3)
+    assert(r0.get_i64(0).unwrap() == 1 && r0.field_i64("id").unwrap() == 1)
+    assert(r0.get_text(1).unwrap() == "åäö 雪\0after" && r0.field_text("value").unwrap() == "åäö 雪\0after")
+    assert(r0.field_i64("number").unwrap() == 9223372036854775807)
+    assert(r0.field_f64("real").unwrap() == 1.2345678901234567)
+    assert(!r0.field_is_null("real").unwrap() && r0.field_is_null("absent").unwrap())
+    assert(r0.field_i64("absent").is_err())
+    assert(r0.field_text("missing").is_err())
 
-    must_exec(&db, "CREATE TABLE audit(value TEXT)", &none)
-    must_exec(&db, "CREATE TRIGGER record_insert AFTER INSERT ON items BEGIN INSERT INTO audit(value) VALUES('semi;colon'); INSERT INTO audit(value) VALUES(new.value); END; /* final ; comment */", &none)
+    r1 := &rows[1]
+    assert(r1.field_i64("id").unwrap() == 2 && r1.field_text("value").unwrap() == "")
+    assert(r1.field_is_null("number").unwrap() && r1.field_is_null("real").unwrap())
+
+    r2 := &rows[2]
+    assert(r2.field_i64("id").unwrap() == 3 && r2.field_text("value").unwrap() == "x'); DROP TABLE items; --")
+
+    // query_one: 0, 1, >1 rows
+    q_missing := db.query_one("SELECT id FROM items WHERE id=?", &[.Int(999)]).unwrap()
+    assert(q_missing.is_none())
+    q_single := db.query_one("SELECT value, number FROM items WHERE id=?", &[.Int(1)]).unwrap().unwrap()
+    assert(q_single.field_text("value").unwrap() == "åäö 雪\0after")
+    assert(db.query_one("SELECT id FROM items", &none).is_err())
+
+    // Null parameter binding
+    must_exec(&db, "INSERT INTO items(value, number) VALUES(?, ?)", &[.Text("null-num"), .Null])
+    null_row := db.query_one("SELECT number FROM items WHERE value=?", &[.Text("null-num")]).unwrap().unwrap()
+    assert(null_row.field_is_null("number").unwrap())
+
+    // Safety checks: single-statement boundary, parameter mismatch, NUL, readonly
+    assert(db.exec("DELETE FROM items; DROP TABLE items", &none).is_err())
+    assert(db.exec("PRAGMA cache_size=123; DELETE FROM items", &none).is_err())
+    cache_row := db.query_one("PRAGMA cache_size", &none).unwrap().unwrap()
+    assert(cache_row.get_i64(0).unwrap() != 123)
+    assert(db.exec("DELETE FROM items WHERE value=?", &none).is_err())
+    assert(db.exec("DELETE FROM items", &empty).is_err())
+    assert(db.exec("DELETE FROM items\0", &none).is_err())
+    assert(db.query("SELECT missing FROM items", &none).is_err())
+    assert(db.query("DELETE FROM items", &none).is_err())
+
+    total_row := db.query_one("SELECT count(*) AS total FROM items", &none).unwrap().unwrap()
+    assert(total_row.field_i64("total").unwrap() == 4)
+
+    // exec_batch multi-statement migrations & triggers & mid-batch failure rejection
+    batch_sql := "-- migration batch\n" +
+        "CREATE TABLE audit(value TEXT);\n" +
+        "CREATE TRIGGER record_insert AFTER INSERT ON items BEGIN INSERT INTO audit(value) VALUES('semi;colon'); INSERT INTO audit(value) VALUES(new.value); END;\n" +
+        "CREATE TABLE tx_items(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);\n"
+    assert(db.exec_batch(batch_sql).is_ok())
+    assert(db.exec_batch("INSERT INTO tx_items(name) VALUES ('ok_before_err'); SELECT * FROM non_existent_table;").is_err())
+    assert(db.exec_batch("SELECT ?").is_err())
+
     must_exec(&db, "INSERT INTO items(value) VALUES('trigger'); -- trailing comment\n", &none)
-    audit := db.query("SELECT value FROM audit ORDER BY rowid", &none)
-    assert(audit.ok && audit.rows.len == 2)
-    name := json.Doc::parse_text(audit.rows[0])
-    assert(name.get_str(name.root, "value").value == "semi;colon")
-    blob := db.query("SELECT X'0001' AS raw", &none)
-    assert(!blob.ok)
-    bad_utf8 := db.query("SELECT CAST(X'ff' AS TEXT) AS raw", &none)
-    assert(!bad_utf8.ok)
-    finite := db.query("SELECT 1e999 AS value", &none)
-    assert(!finite.ok)
-    large := db.query("WITH RECURSIVE n(x) AS(VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT x FROM n", &none)
-    assert(!large.ok)
-    must_exec(&db, "CREATE TABLE binary_values(label TEXT, data BLOB, suffix TEXT)", &none)
-    sides: []string = ["before", "after"]
-    data: []u8 = [0, 1, 127, 128, 255]
-    stored_blob := db.exec_blob("INSERT INTO binary_values(label,data,suffix) VALUES(?,?,?)", &sides, 2, &data)
-    assert(stored_blob.ok && stored_blob.changes == 1)
-    binary_rows := db.query("SELECT label,hex(data) AS data,suffix,typeof(data) AS kind FROM binary_values", &none)
-    assert(binary_rows.ok && binary_rows.rows.len == 1)
-    binary_doc := json.Doc::parse_text(binary_rows.rows[0])
-    assert(binary_doc.get_str(binary_doc.root, "data").value == "00017F80FF")
-    assert(binary_doc.get_str(binary_doc.root, "label").value == "before" && binary_doc.get_str(binary_doc.root, "suffix").value == "after")
-    assert(binary_doc.get_str(binary_doc.root, "kind").value == "blob")
-    empty_blob: []u8 = []
-    assert(db.exec_blob("INSERT INTO binary_values(data) VALUES(?)", &none, 1, &empty_blob).ok)
-    empty_rows := db.query("SELECT typeof(data) AS kind,length(data) AS size FROM binary_values WHERE rowid=2", &none)
-    empty_doc := json.Doc::parse_text(empty_rows.rows[0])
-    assert(empty_doc.get_str(empty_doc.root, "kind").value == "blob" && empty_doc.get_i64(empty_doc.root, "size").value == 0)
-    assert(!db.exec_blob("DELETE FROM binary_values; SELECT ?", &none, 1, &data).ok)
-    assert(!db.exec_blob("DELETE FROM binary_values", &none, 0, &data).ok)
-    returned := db.execute_rows("INSERT INTO binary_values(label) VALUES('returned') RETURNING label", &none)
-    assert(returned.ok && returned.rows.len == 1)
-    returned_doc := json.Doc::parse_text(returned.rows[0])
-    assert(returned_doc.get_str(returned_doc.root, "label").value == "returned")
-    assert(db.close().ok && db.close().ok)
-    assert(!db.query("SELECT 1", &none).ok)
-    assert(!db.exec("SELECT 1", &none).ok)
+    audit := db.query("SELECT value FROM audit ORDER BY rowid", &none).unwrap()
+    assert(audit.len == 2 && audit[0].field_text("value").unwrap() == "semi;colon")
 
-    read_opened := sqlite.Database::open(path, true)
-    assert(read_opened.ok)
-    mut read_db := read_opened.db
-    read_rows := read_db.query("SELECT count(*) AS total FROM items", &none)
-    assert(read_rows.ok && read_rows.rows.len == 1)
-    assert(!read_db.exec("DELETE FROM items", &none).ok)
-    assert(read_db.close().ok)
+    // Direct BLOB binding and direct BLOB column reads without hex()/JSON
+    must_exec(&db, "CREATE TABLE binary_values(label TEXT, data BLOB, suffix TEXT)", &none)
+    blob_data: []u8 = [0, 1, 127, 128, 255]
+    stored := db.exec("INSERT INTO binary_values(label,data,suffix) VALUES(?,?,?)", &[.Text("before"), .Blob(blob_data.clone()), .Text("after")]).unwrap()
+    assert(stored.changes == 1)
+    bin_row := db.query_one("SELECT label, data, suffix FROM binary_values WHERE label=?", &[.Text("before")]).unwrap().unwrap()
+    got_blob := bin_row.field_blob("data").unwrap()
+    assert(bin_row.field_text("label").unwrap() == "before" && bin_row.field_text("suffix").unwrap() == "after")
+    assert(got_blob.len == 5 && got_blob[0] == 0 && got_blob[1] == 1 && got_blob[2] == 127 && got_blob[3] == 128 && got_blob[4] == 255)
+
+    empty_blob: []u8 = []
+    assert(db.exec("INSERT INTO binary_values(label, data) VALUES(?, ?)", &[.Text("empty"), .Blob(empty_blob)]).is_ok())
+    eb_row := db.query_one("SELECT data FROM binary_values WHERE label=?", &[.Text("empty")]).unwrap().unwrap()
+    assert(eb_row.field_blob("data").unwrap().len == 0)
+
+    // Invalid UTF-8 TEXT rejection and 10,000-row limit
+    assert(db.query("SELECT CAST(X'ff' AS TEXT) AS raw", &none).is_err())
+    assert(db.query("WITH RECURSIVE n(x) AS(VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT x FROM n", &none).is_err())
+
+    // execute_rows RETURNING
+    returned := db.execute_rows("INSERT INTO binary_values(label) VALUES('returned') RETURNING label", &none).unwrap()
+    assert(returned.len == 1 && returned[0].field_text("label").unwrap() == "returned")
+
+    // Transactions: commit, explicit rollback, auto-rollback on early ? drop, begin_immediate
+    {
+        mut tx1 := db.begin().unwrap()
+        assert(db.begin().is_err())
+        assert(db.close().is_err())
+        _ := tx1.exec("INSERT INTO tx_items(name) VALUES (?)", &[.Text("committed")]).unwrap()
+        assert(tx1.commit().is_ok())
+        assert(tx1.commit().is_err())
+    }
+    assert(db.query_one("SELECT name FROM tx_items WHERE name=?", &[.Text("committed")]).unwrap().is_some())
+
+    {
+        mut tx2 := db.begin_immediate().unwrap()
+        _ := tx2.exec("INSERT INTO tx_items(name) VALUES (?)", &[.Text("rolled_back")]).unwrap()
+        assert(tx2.rollback().is_ok())
+    }
+    assert(db.query_one("SELECT name FROM tx_items WHERE name=?", &[.Text("rolled_back")]).unwrap().is_none())
+
+    assert(early_abort_tx(&db, "auto_rolled_back").is_err())
+    assert(db.query_one("SELECT name FROM tx_items WHERE name=?", &[.Text("auto_rolled_back")]).unwrap().is_none())
+
+    // close & idempotent close & post-close rejection
+    assert(db.close().is_ok() && db.close().is_ok())
+    assert(db.query("SELECT 1", &none).is_err())
+    assert(db.exec("SELECT 1", &none).is_err())
+
+    // Auto-dispose on scope exit
+    scoped_auto_close(path)
+
+    // Verify scoped DB write persisted & read-only enforcement
+    read_db := sqlite.Database::open(path, true).unwrap()
+    assert(read_db.query_one("SELECT name FROM tx_items WHERE name=?", &[.Text("from_scoped")]).unwrap().is_some())
+    assert(read_db.exec("DELETE FROM items", &none).is_err())
+
     bad_open := sqlite.Database::open("invalid\0path", false)
-    assert(!bad_open.ok)
+    match bad_open {
+        .Ok(_) => assert(false),
+        .Err(err) => {
+            assert(err.code() != 0 && err.message().len > 0 && f"{err}" == err.message())
+            assert(err == sqlite.SqliteError::new(err.code(), err.message()))
+        },
+    }
     print("sqlite ok")
 }
