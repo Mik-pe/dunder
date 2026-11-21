@@ -1,9 +1,12 @@
-// Lift function literals before declarations are frozen. Generated tokens retain
-// the original module offsets, including tokens copied into a lifted body.
+// Lift function literals and closures before declarations are frozen.
+// Generated tokens retain the original module offsets, including tokens copied into a lifted body.
 import lexer
 
 fn symbol(t: &lexer.Tokens, at: i32, s: string) -> bool {
     at >= 0 && at < t.kinds.len && t.kinds[at] == .Symbol && t.texts[at] == s
+}
+fn is_word(t: &lexer.Tokens, at: i32, w: string) -> bool {
+    at >= 0 && at < t.kinds.len && (t.kinds[at] == .Keyword || t.kinds[at] == .Name) && t.texts[at] == w
 }
 fn token(out: &mut lexer.Tokens, kind: lexer.Kind, word: string, pos: i32) {
     out.kinds.push(kind); out.texts.push(word.clone()); out.starts.push(pos)
@@ -14,8 +17,59 @@ fn copy(src: &lexer.Tokens, out: &mut lexer.Tokens, first: i32, end: i32) {
     for i in first..end { token(&mut out, src.kinds[i], src.texts[i], src.starts[i]) }
 }
 
+fn parse_nonneg(s: string) -> i32 {
+    if s.len == 0 || s.len > 8 { return -1 }
+    mut val := 0
+    for i in 0..s.len {
+        b := s[i]
+        if b < 48 || b > 57 { return -1 }
+        val = val * 10 + (b - 48)
+    }
+    val
+}
+
+fn starts_with(s: string, prefix: string) -> bool {
+    if s.len < prefix.len { return false }
+    for i in 0..prefix.len {
+        if s[i] != prefix[i] { return false }
+    }
+    true
+}
+
+fn next_closure_id(t: &lexer.Tokens) -> i32 {
+    prefix := "__dunder_module_lambda_"
+    mut next := 0
+    for i in 0..t.kinds.len {
+        if t.kinds[i] == .Name && starts_with(t.texts[i], prefix) {
+            id := parse_nonneg(t.texts[i][prefix.len..t.texts[i].len])
+            if id >= next { next = id + 1 }
+        }
+    }
+    next
+}
+
+fn has_callable_header(t: &lexer.Tokens) -> bool {
+    for i in 0..t.kinds.len - 1 {
+        if t.kinds[i] == .Keyword && t.texts[i] == "struct" &&
+            t.kinds[i + 1] == .Name && t.texts[i + 1] == header() {
+            return true
+        }
+    }
+    false
+}
+
+fn mentions_closure_type(t: &lexer.Tokens) -> bool {
+    for i in 0..t.kinds.len - 1 {
+        if t.kinds[i] == .Name && (t.texts[i] == "Fn" || t.texts[i] == "FnMut" || t.texts[i] == "FnOnce") &&
+            symbol(&t, i + 1, "(") {
+            return true
+        }
+    }
+    false
+}
+
 pub fn candidate(t: &lexer.Tokens, i: i32) -> bool {
-    if t.kinds[i] != .Keyword || t.texts[i] != "fn" { return false }
+    if i < 0 || i >= t.kinds.len || t.kinds[i] != .Keyword || t.texts[i] != "fn" { return false }
     if symbol(&t, i + 1, "[") { return true }
     if !symbol(&t, i + 1, "(") { return false }
     if symbol(&t, i - 1, "->") || symbol(&t, i - 1, "]") || symbol(&t, i - 1, "&") { return false }
@@ -30,6 +84,7 @@ pub fn candidate(t: &lexer.Tokens, i: i32) -> bool {
     }
     true
 }
+
 // Scan just the return type, leaving its syntax and semantics to headers().
 pub fn body_start(t: &lexer.Tokens, after: i32, last: i32) -> i32 {
     mut i := after
@@ -60,126 +115,136 @@ pub fn body_start(t: &lexer.Tokens, after: i32, last: i32) -> i32 {
     -1
 }
 
-// Columnar storage keeps the pass buildable by the frozen bootstrap compiler.
+// Closure kinds:
+// 0 = raw fn (0 captures, !is_move)
+// 1 = Fn (owned RC shared captures)
+// 2 = FnMut (owned mutable captures)
+// 3 = &Fn (stack borrowing read-only closure)
+// 4 = &mut FnMut (stack borrowing mutable closure)
+// 5 = FnOnce (move fn one-shot closure)
+//
+// Capture modes:
+// 0 = value (name or move name)
+// 1 = mut owned (mut name)
+// 2 = shared borrow (&name)
+// 3 = exclusive borrow (&mut name)
 struct Pass {
-    starts: []i32, params: []i32, bodies: []i32, impl_type_starts: []i32, impl_type_ends: []i32, ids: []i32,
-    capture_starts: []i32, names: []i32, type_ends: []i32,
+    starts: []i32, fns: []i32, params: []i32, bodies: []i32,
+    impl_type_starts: []i32, impl_type_ends: []i32,
+    kinds: []i32, is_moves: []bool, ready: []bool,
+    ids: []i32, base_id: i32,
+    capture_starts: []i32, names: []i32, modes: []i32,
+    type_starts: []i32, type_ends: []i32, cap_typed: []bool,
 }
+
+fn empty_pass(token_len: i32, base_id: i32) -> Pass {
+    mut pass := Pass {
+        starts: [], fns: [], params: [], bodies: [],
+        impl_type_starts: [], impl_type_ends: [],
+        kinds: [], is_moves: [], ready: [],
+        ids: [], base_id: base_id,
+        capture_starts: [0], names: [], modes: [],
+        type_starts: [], type_ends: [], cap_typed: [],
+    }
+    for _ in 0..token_len { pass.ids.push(-1) }
+    pass
+}
+
 fn invalid(t: &mut lexer.Tokens, at: i32, message: string) {
-    t.ok = false; t.error_at = t.starts[at]; t.error = message.clone()
+    t.ok = false
+    if at >= 0 && at < t.starts.len { t.error_at = t.starts[at] } else { t.error_at = 0 }
+    t.error = message.clone()
 }
-fn captures(t: &mut lexer.Tokens, ends: &[]i32, start: i32, pass: &mut Pass) {
-    mut i := start + 2
-    until := ends[start + 1]; first := pass.names.len
+
+struct CaptureParse {
+    all_typed: bool,
+    has_ref: bool,
+    has_mut_ref: bool,
+    has_mut_cap: bool,
+    count: i32,
+}
+
+fn parse_captures(t: &mut lexer.Tokens, ends: &[]i32, fn_tok: i32, is_move: bool, pass: &mut Pass) -> CaptureParse {
+    mut res := CaptureParse { all_typed: true, has_ref: false, has_mut_ref: false, has_mut_cap: false, count: 0 }
+    mut i := fn_tok + 2
+    until := ends[fn_tok + 1]
+    first := pass.names.len
     while i < until {
-        if t.kinds[i] != .Name || !symbol(&t, i + 1, ":") {
-            invalid(&mut t, i, "expected a closure capture of the form 'name: Type'"); return
+        if lexer.is_newline(t.kinds[i]) { i += 1; continue }
+        is_ref := symbol(&t, i, "&")
+        if is_ref { i += 1 }
+        is_mut := i < until && t.texts[i] == "mut"
+        if is_mut { i += 1 }
+        is_cap_move := !is_ref && !is_mut && i < until && t.texts[i] == "move"
+        if is_cap_move { i += 1 }
+        if i >= until || t.kinds[i] != .Name {
+            invalid(&mut t, i, "expected a closure capture name"); return res
         }
+        name_tok := i
         for n in first..pass.names.len {
-            if t.texts[pass.names[n]] == t.texts[i] { invalid(&mut t, i, "duplicate closure capture"); return }
-        }
-        pass.names.push(i); i += 2
-        if i >= until || symbol(&t, i, ",") { invalid(&mut t, i, "expected closure capture type"); return }
-        if symbol(&t, i, "&") { invalid(&mut t, i, "a closure cannot store a borrowed reference"); return }
-        while i < until && !symbol(&t, i, ",") {
-            if ends[i] > i { i = ends[i] }
-            i += 1
-        }
-        pass.type_ends.push(i); i += 1
-    }
-}
-fn body_name(id: i32) -> string { "__dunder_module_lambda_" + id.str() }
-fn env_name(id: i32) -> string { "__dunder_module_environment_" + id.str() }
-pub fn header() -> string { "__dunder_module_callable" }
-fn header_fields(out: &mut lexer.Tokens, pos: i32, initialize: bool) {
-    for field in ["__dunder_module_entry", "__dunder_module_drop"] {
-        name(&mut out, field, pos); punct(&mut out, ":", pos)
-        if initialize { token(&mut out, .Integer, "0", pos) } else { name(&mut out, "i64", pos) }
-        punct(&mut out, ",", pos)
-    }
-}
-fn replacement(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, id: i32) {
-    pos := t.starts[pass.starts[id]]
-    first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
-    if first == last { name(&mut out, body_name(id), pos); return }
-    name(&mut out, "__dunder_module_bind", pos); punct(&mut out, "(", pos)
-    name(&mut out, body_name(id), pos); punct(&mut out, ",", pos)
-    name(&mut out, env_name(id), pos); punct(&mut out, "{", pos); header_fields(&mut out, pos, true)
-    for idx in first..last {
-        at := pass.names[idx]
-        copy(&t, &mut out, at, at + 2); copy(&t, &mut out, at, at + 1)
-        punct(&mut out, ",", t.starts[at])
-    }
-    punct(&mut out, "}", pos); punct(&mut out, ")", pos)
-}
-fn span(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, ends: &[]i32, first: i32, end: i32) {
-    mut i := first
-    while i < end {
-        id := pass.ids[i]
-        if id >= 0 {
-            replacement(&t, &mut out, &pass, id)
-            i = ends[pass.bodies[id]] + 1
-        } else { copy(&t, &mut out, i, i + 1); i += 1 }
-    }
-}
-fn emit_declaration(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, id: i32, ends: &[]i32) {
-    pos := t.starts[pass.starts[id]]; params := pass.params[id]; body := pass.bodies[id]
-    first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
-    if last > first {
-        token(&mut out, .Keyword, "struct", pos); name(&mut out, env_name(id), pos); punct(&mut out, "{", pos)
-        header_fields(&mut out, pos, false)
-        for n in first..last { copy(&t, &mut out, pass.names[n], pass.type_ends[n]); punct(&mut out, ",", pos) }
-        punct(&mut out, "}", pos); token(&mut out, .Newline, "\n", pos)
-    }
-    token(&mut out, .Keyword, "fn", pos); name(&mut out, body_name(id), pos)
-    close := ends[params]; copy(&t, &mut out, params, close)
-    if last > first {
-        if close > params + 1 && !symbol(&t, close - 1, ",") { punct(&mut out, ",", pos) }
-        name(&mut out, "__dunder_module_env", pos); punct(&mut out, ":", pos)
-        punct(&mut out, "&", pos); name(&mut out, env_name(id), pos)
-    }
-    copy(&t, &mut out, close, body + 1)
-    for idx in first..last {
-        at := pass.names[idx]
-        here := t.starts[at]
-        copy(&t, &mut out, at, at + 1); punct(&mut out, ":=", here); punct(&mut out, "&", here)
-        name(&mut out, "__dunder_module_env", here); punct(&mut out, ".", here)
-        copy(&t, &mut out, at, at + 1); punct(&mut out, ";", here)
-    }
-    span(&t, &mut out, &pass, &ends, body + 1, ends[body] + 1)
-    token(&mut out, .Newline, "\n", t.starts[ends[body]])
-}
-fn declaration(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, id: i32, ends: &[]i32) {
-    impl_start := pass.impl_type_starts[id]; impl_end_tok := pass.impl_type_ends[id]
-    if impl_start < 0 || impl_end_tok <= impl_start {
-        emit_declaration(&t, &mut out, &pass, id, &ends)
-        return
-    }
-    first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
-    mut receiver := false
-    for idx in first..last { if t.texts[pass.names[idx]] == "self" { receiver = true } }
-    mut buf := lexer.empty(false)
-    emit_declaration(&t, &mut buf, &pass, id, &ends)
-    for at in 0..buf.kinds.len {
-        if buf.kinds[at] == .Name && buf.texts[at] == "Self" {
-            for k in impl_start..impl_end_tok {
-                token(&mut out, t.kinds[k], t.texts[k], buf.starts[at])
+            if t.texts[pass.names[n]] == t.texts[name_tok] {
+                invalid(&mut t, name_tok, "duplicate closure capture"); return res
             }
-        } else if receiver && buf.kinds[at] == .Name && buf.texts[at] == "self" && !symbol(&buf, at - 1, ".") && !symbol(&buf, at + 1, ":") {
-            name(&mut out, "__dunder_module_captured_self", buf.starts[at])
-        } else {
-            token(&mut out, buf.kinds[at], buf.texts[at], buf.starts[at])
         }
+        mut mode := 0
+        if is_ref && is_mut { mode = 3; res.has_mut_ref = true }
+        else if is_ref { mode = 2; res.has_ref = true }
+        else if is_mut { mode = 1; res.has_mut_cap = true }
+        if is_move && (mode == 2 || mode == 3) {
+            invalid(&mut t, name_tok, "a 'move fn' closure cannot capture borrowed references"); return res
+        }
+        pass.names.push(name_tok)
+        pass.modes.push(mode)
+        res.count += 1
+        i += 1
+        while i < until && lexer.is_newline(t.kinds[i]) { i += 1 }
+        if i < until && symbol(&t, i, ":") {
+            i += 1
+            while i < until && lexer.is_newline(t.kinds[i]) { i += 1 }
+            t_start := i
+            if i >= until || symbol(&t, i, ",") {
+                invalid(&mut t, i, "expected closure capture type"); return res
+            }
+            if symbol(&t, i, "&") {
+                invalid(&mut t, i, "a closure cannot store a borrowed reference; use 'fn[&" + t.texts[name_tok] + "]' for a borrowing closure"); return res
+            }
+            while i < until && !symbol(&t, i, ",") {
+                if ends[i] > i { i = ends[i] }
+                i += 1
+            }
+            pass.type_starts.push(t_start)
+            pass.type_ends.push(i)
+            pass.cap_typed.push(true)
+        } else {
+            if i < until && !symbol(&t, i, ",") {
+                invalid(&mut t, i, "expected ',' or ': Type' in closure capture"); return res
+            }
+            pass.type_starts.push(-1)
+            pass.type_ends.push(-1)
+            pass.cap_typed.push(false)
+            res.all_typed = false
+        }
+        if i < until && symbol(&t, i, ",") { i += 1 }
     }
+    res
 }
-pub fn lift(t: &mut lexer.Tokens) {
+
+fn determine_kind(is_move: bool, caps: &CaptureParse) -> i32 {
+    if is_move { return 5 }
+    if caps.count == 0 { return 0 }
+    if caps.has_mut_ref || (caps.has_ref && caps.has_mut_cap) { return 4 }
+    if caps.has_ref { return 3 }
+    if caps.has_mut_cap { return 2 }
+    1
+}
+
+fn scan_closures(t: &mut lexer.Tokens, ends: &[]i32, only_ready: bool) -> Pass {
+    base_id := next_closure_id(&t)
+    mut pass := empty_pass(t.kinds.len, base_id)
     mut first := 0
     while first < t.kinds.len && !candidate(&t, first) { first += 1 }
-    if first == t.kinds.len { return }
-    ends := lexer.delimiter_ends(&t, t.kinds.len)
-    mut pass := Pass { starts: [], params: [], bodies: [], impl_type_starts: [], impl_type_ends: [], ids: [], capture_starts: [0], names: [], type_ends: [] }
-    for _ in 0..t.kinds.len { pass.ids.push(-1) }
     mut impl_start := -1; mut impl_end_tok := -1; mut impl_close := -1
+    mut skip_until := -1
     for i in 0..t.kinds.len {
         if i >= impl_close { impl_start = -1; impl_end_tok = -1 }
         if t.kinds[i] == .Keyword && t.texts[i] == "impl" {
@@ -228,30 +293,429 @@ pub fn lift(t: &mut lexer.Tokens) {
                 }
             }
         }
-        if i < first || !candidate(&t, i) { continue }
+        if i < first || i < skip_until || !candidate(&t, i) { continue }
         mut params := i + 1
         explicit := symbol(&t, params, "[")
         if explicit {
+            if ends[params] < 0 { invalid(&mut t, params, "unclosed closure capture list"); return pass }
             params = ends[params] + 1
-            if !symbol(&t, params, "(") { invalid(&mut t, i, "expected closure parameters after capture list"); return }
+            if !symbol(&t, params, "(") { invalid(&mut t, i, "expected closure parameters after capture list"); return pass }
         }
         if ends[params] < 0 { continue }
         body := body_start(&t, ends[params] + 1, t.kinds.len)
         if body < 0 || ends[body] < 0 {
-            if explicit { invalid(&mut t, i, "expected a closure body"); return }
+            if explicit { invalid(&mut t, i, "expected a closure body"); return pass }
             continue
         }
-        if explicit { captures(&mut t, &ends, i, &mut pass); if !t.ok { return } }
+        is_move := i > 0 && is_word(&t, i - 1, "move")
+        start := if is_move { i - 1 } else { i }
+        mut cap_res := CaptureParse { all_typed: true, has_ref: false, has_mut_ref: false, has_mut_cap: false, count: 0 }
+        if explicit {
+            cap_res = parse_captures(&mut t, &ends, i, is_move, &mut pass)
+            if !t.ok { return pass }
+        }
+        ckind := determine_kind(is_move, &cap_res)
+        if only_ready {
+            if !cap_res.all_typed {
+                // Skip nested closures inside an unready closure until it is resolved.
+                while pass.names.len > pass.capture_starts[pass.starts.len] {
+                    _ := pass.names.pop(); _ := pass.modes.pop()
+                    _ := pass.type_starts.pop(); _ := pass.type_ends.pop(); _ := pass.cap_typed.pop()
+                }
+                skip_until = ends[body] + 1
+                continue
+            }
+        } else {
+            // Probe mode collects only outermost closures that need capture type inference.
+            if cap_res.all_typed {
+                while pass.names.len > pass.capture_starts[pass.starts.len] {
+                    _ := pass.names.pop(); _ := pass.modes.pop()
+                    _ := pass.type_starts.pop(); _ := pass.type_ends.pop(); _ := pass.cap_typed.pop()
+                }
+                continue
+            }
+            skip_until = ends[body] + 1
+        }
         pass.capture_starts.push(pass.names.len)
-        pass.ids[i] = pass.starts.len; pass.starts.push(i); pass.params.push(params); pass.bodies.push(body)
-        pass.impl_type_starts.push(impl_start); pass.impl_type_ends.push(impl_end_tok)
+        pass.ids[start] = pass.starts.len
+        pass.starts.push(start)
+        pass.fns.push(i)
+        pass.params.push(params)
+        pass.bodies.push(body)
+        pass.impl_type_starts.push(impl_start)
+        pass.impl_type_ends.push(impl_end_tok)
+        pass.kinds.push(ckind)
+        pass.is_moves.push(is_move)
+        pass.ready.push(cap_res.all_typed)
     }
-    if pass.starts.len == 0 { return }
+    pass
+}
+
+fn body_name(id: i32) -> string { "__dunder_module_lambda_" + id.str() }
+fn env_name(id: i32) -> string { "__dunder_module_environment_" + id.str() }
+pub fn header() -> string { "__dunder_module_callable" }
+
+fn header_fields(out: &mut lexer.Tokens, pos: i32, initialize: bool) {
+    for field in ["__dunder_module_entry", "__dunder_module_drop"] {
+        name(&mut out, field, pos); punct(&mut out, ":", pos)
+        if initialize { token(&mut out, .Integer, "0", pos) } else { name(&mut out, "i64", pos) }
+        punct(&mut out, ",", pos)
+    }
+}
+
+fn has_env_struct(ckind: i32, first: i32, last: i32) -> bool {
+    ckind != 0 && !(ckind == 5 && first == last)
+}
+
+fn replacement(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, id: i32) {
+    pos := t.starts[pass.starts[id]]
+    first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
+    ckind := pass.kinds[id]
+    l_id := pass.base_id + id
+    if ckind == 0 {
+        name(&mut out, body_name(l_id), pos); return
+    }
+    if ckind == 3 || ckind == 4 {
+        bind_fn := if ckind == 4 { "__dunder_module_stack_bind_mut" } else { "__dunder_module_stack_bind" }
+        name(&mut out, bind_fn, pos); punct(&mut out, "(", pos)
+        name(&mut out, body_name(l_id), pos)
+        for idx in first..last {
+            at := pass.names[idx]; mode := pass.modes[idx]; here := t.starts[at]
+            punct(&mut out, ",", here)
+            if mode == 2 { punct(&mut out, "&", here) }
+            else if mode == 3 { punct(&mut out, "&", here); token(&mut out, .Keyword, "mut", here) }
+            copy(&t, &mut out, at, at + 1)
+        }
+        punct(&mut out, ")", pos)
+        return
+    }
+    bind_fn := if ckind == 2 { "__dunder_module_bind_mut" } else if ckind == 5 { "__dunder_module_bind_once" } else { "__dunder_module_bind" }
+    name(&mut out, bind_fn, pos); punct(&mut out, "(", pos)
+    name(&mut out, body_name(l_id), pos); punct(&mut out, ",", pos)
+    if first == last {
+        name(&mut out, header(), pos); punct(&mut out, "{", pos); header_fields(&mut out, pos, true); punct(&mut out, "}", pos)
+    } else {
+        name(&mut out, env_name(l_id), pos); punct(&mut out, "{", pos); header_fields(&mut out, pos, true)
+        for idx in first..last {
+            at := pass.names[idx]; here := t.starts[at]
+            copy(&t, &mut out, at, at + 1); punct(&mut out, ":", here); copy(&t, &mut out, at, at + 1)
+            punct(&mut out, ",", here)
+        }
+        punct(&mut out, "}", pos)
+    }
+    punct(&mut out, ")", pos)
+}
+
+fn span(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, ends: &[]i32, first: i32, end: i32) {
+    mut i := first
+    while i < end {
+        id := pass.ids[i]
+        if id >= 0 {
+            replacement(&t, &mut out, &pass, id)
+            i = ends[pass.bodies[id]] + 1
+        } else { copy(&t, &mut out, i, i + 1); i += 1 }
+    }
+}
+
+fn emit_declaration(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, id: i32, ends: &[]i32) {
+    pos := t.starts[pass.starts[id]]; params := pass.params[id]; body := pass.bodies[id]
+    first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
+    ckind := pass.kinds[id]
+    l_id := pass.base_id + id
+    stack_closure := ckind == 3 || ckind == 4
+    if has_env_struct(ckind, first, last) {
+        token(&mut out, .Keyword, "struct", pos); name(&mut out, env_name(l_id), pos); punct(&mut out, "{", pos)
+        header_fields(&mut out, pos, false)
+        for n in first..last {
+            at := pass.names[n]
+            copy(&t, &mut out, at, at + 1); punct(&mut out, ":", t.starts[at])
+            if stack_closure { name(&mut out, "i64", t.starts[at]) }
+            else { copy(&t, &mut out, pass.type_starts[n], pass.type_ends[n]) }
+            punct(&mut out, ",", pos)
+        }
+        punct(&mut out, "}", pos); token(&mut out, .Newline, "\n", pos)
+    }
+    token(&mut out, .Keyword, "fn", pos); name(&mut out, body_name(l_id), pos)
+    close := ends[params]; copy(&t, &mut out, params, close)
+    if ckind != 0 {
+        if close > params + 1 && !symbol(&t, close - 1, ",") { punct(&mut out, ",", pos) }
+        name(&mut out, "__dunder_module_env", pos); punct(&mut out, ":", pos); punct(&mut out, "&", pos)
+        if ckind == 2 || ckind == 4 || ckind == 5 { token(&mut out, .Keyword, "mut", pos) }
+        if first == last { name(&mut out, header(), pos) }
+        else { name(&mut out, env_name(l_id), pos) }
+    }
+    copy(&t, &mut out, close, body + 1)
+    for idx in first..last {
+        at := pass.names[idx]; mode := pass.modes[idx]; here := t.starts[at]
+        if stack_closure {
+            if mode == 1 {
+                copy(&t, &mut out, at, at + 1); punct(&mut out, ":=", here)
+                name(&mut out, "__dunder_module_cap_stack_mut", here); punct(&mut out, "(", here)
+                name(&mut out, "__dunder_module_env", here); punct(&mut out, ".", here); copy(&t, &mut out, at, at + 1)
+                punct(&mut out, ",", here); copy(&t, &mut out, pass.type_starts[idx], pass.type_ends[idx])
+                punct(&mut out, ")", here); punct(&mut out, ";", here)
+            } else {
+                copy(&t, &mut out, at, at + 1); punct(&mut out, ":=", here)
+                fn_helper := if mode == 3 { "__dunder_module_cap_mut" } else if mode == 2 { "__dunder_module_cap_ref" } else { "__dunder_module_cap_stack_val" }
+                name(&mut out, fn_helper, here); punct(&mut out, "(", here)
+                name(&mut out, "__dunder_module_env", here); punct(&mut out, ".", here); copy(&t, &mut out, at, at + 1)
+                punct(&mut out, ",", here); copy(&t, &mut out, pass.type_starts[idx], pass.type_ends[idx])
+                punct(&mut out, ")", here); punct(&mut out, ";", here)
+            }
+        } else if ckind == 5 {
+            if mode == 1 { token(&mut out, .Keyword, "mut", here) }
+            copy(&t, &mut out, at, at + 1); punct(&mut out, ":=", here)
+            name(&mut out, "__dunder_module_take_cap", here); punct(&mut out, "(", here)
+            name(&mut out, "__dunder_module_env", here); punct(&mut out, ".", here); copy(&t, &mut out, at, at + 1)
+            punct(&mut out, ")", here); punct(&mut out, ";", here)
+        } else if mode == 1 {
+            copy(&t, &mut out, at, at + 1); punct(&mut out, ":=", here); punct(&mut out, "&", here)
+            token(&mut out, .Keyword, "mut", here); name(&mut out, "__dunder_module_env", here); punct(&mut out, ".", here)
+            copy(&t, &mut out, at, at + 1); punct(&mut out, ";", here)
+        } else {
+            copy(&t, &mut out, at, at + 1); punct(&mut out, ":=", here)
+            name(&mut out, "__dunder_module_cap_val", here); punct(&mut out, "(", here)
+            name(&mut out, "__dunder_module_env", here); punct(&mut out, ".", here); copy(&t, &mut out, at, at + 1)
+            punct(&mut out, ")", here); punct(&mut out, ";", here)
+        }
+    }
+    span(&t, &mut out, &pass, &ends, body + 1, ends[body] + 1)
+    token(&mut out, .Newline, "\n", t.starts[ends[body]])
+}
+
+fn declaration(t: &lexer.Tokens, out: &mut lexer.Tokens, pass: &Pass, id: i32, ends: &[]i32) {
+    impl_start := pass.impl_type_starts[id]; impl_end_tok := pass.impl_type_ends[id]
+    if impl_start < 0 || impl_end_tok <= impl_start {
+        emit_declaration(&t, &mut out, &pass, id, &ends)
+        return
+    }
+    first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
+    mut receiver := false
+    for idx in first..last { if t.texts[pass.names[idx]] == "self" { receiver = true } }
+    mut buf := lexer.empty(false)
+    emit_declaration(&t, &mut buf, &pass, id, &ends)
+    for at in 0..buf.kinds.len {
+        if buf.kinds[at] == .Name && buf.texts[at] == "Self" {
+            for k in impl_start..impl_end_tok {
+                token(&mut out, t.kinds[k], t.texts[k], buf.starts[at])
+            }
+        } else if receiver && buf.kinds[at] == .Name && buf.texts[at] == "self" && !symbol(&buf, at - 1, ".") && !symbol(&buf, at + 1, ":") {
+            name(&mut out, "__dunder_module_captured_self", buf.starts[at])
+        } else {
+            token(&mut out, buf.kinds[at], buf.texts[at], buf.starts[at])
+        }
+    }
+}
+
+pub fn has_inferred(t: &lexer.Tokens) -> bool {
+    mut found := false
+    for i in 0..t.kinds.len {
+        if candidate(&t, i) && symbol(&t, i + 1, "[") {
+            mut j := i + 2; mut depth := 1
+            mut seen_colon := false
+            mut has_item := false
+            while j < t.kinds.len && depth > 0 {
+                if symbol(&t, j, "[") || symbol(&t, j, "(") || symbol(&t, j, "{") { depth += 1 }
+                else if symbol(&t, j, "]") || symbol(&t, j, ")") || symbol(&t, j, "}") {
+                    depth -= 1
+                    if depth == 0 {
+                        if has_item && !seen_colon { found = true }
+                        break
+                    }
+                } else if depth == 1 && symbol(&t, j, ":") {
+                    seen_colon = true
+                } else if depth == 1 && symbol(&t, j, ",") {
+                    if has_item && !seen_colon { found = true; break }
+                    seen_colon = false; has_item = false
+                } else if depth == 1 && !lexer.is_newline(t.kinds[j]) {
+                    has_item = true
+                }
+                j += 1
+            }
+            if found { return true }
+        }
+    }
+    false
+}
+
+fn emit_probe_type_tokens(t: &lexer.Tokens, out: &mut lexer.Tokens, ends: &[]i32, pass: &Pass, id: i32) {
+    pos := t.starts[pass.starts[id]]
+    ckind := pass.kinds[id]
+    impl_start := pass.impl_type_starts[id]; impl_end_tok := pass.impl_type_ends[id]
+    if ckind == 3 { punct(&mut out, "&", pos); name(&mut out, "Fn", pos) }
+    else if ckind == 4 { punct(&mut out, "&", pos); token(&mut out, .Keyword, "mut", pos); name(&mut out, "FnMut", pos) }
+    else if ckind == 2 { name(&mut out, "FnMut", pos) }
+    else if ckind == 5 { name(&mut out, "FnOnce", pos) }
+    else { name(&mut out, "Fn", pos) }
+
+    params := pass.params[id]; close := ends[params]
+    mut param_names: []i32 = []
+    punct(&mut out, "(", pos)
+    mut p := params + 1
+    mut pcount := 0
+    while p < close {
+        if lexer.is_newline(t.kinds[p]) { p += 1; continue }
+        mut is_param_move := false
+        mut scan := p
+        while scan < close && !symbol(&t, scan, ":") {
+            if t.texts[scan] == "move" { is_param_move = true }
+            if t.kinds[scan] == .Name { param_names.push(scan) }
+            scan += 1
+        }
+        if pcount > 0 { punct(&mut out, ",", pos) }
+        if is_param_move { token(&mut out, .Keyword, "move", pos) }
+        if scan < close && symbol(&t, scan, ":") {
+            scan += 1
+            mut k := scan
+            while k < close && !symbol(&t, k, ",") {
+                if ends[k] > k {
+                    for s in k..ends[k] + 1 {
+                        if impl_start >= 0 && t.kinds[s] == .Name && t.texts[s] == "Self" {
+                            for it in impl_start..impl_end_tok { token(&mut out, t.kinds[it], t.texts[it], pos) }
+                        } else { token(&mut out, t.kinds[s], t.texts[s], pos) }
+                    }
+                    k = ends[k] + 1
+                    continue
+                }
+                if impl_start >= 0 && t.kinds[k] == .Name && t.texts[k] == "Self" {
+                    for it in impl_start..impl_end_tok { token(&mut out, t.kinds[it], t.texts[it], pos) }
+                } else {
+                    token(&mut out, t.kinds[k], t.texts[k], pos)
+                }
+                k += 1
+            }
+            p = k + 1
+        } else {
+            p += 1
+        }
+        pcount += 1
+    }
+    punct(&mut out, ")", pos)
+
+    body := pass.bodies[id]
+    mut after := close + 1
+    if symbol(&t, after, "->") {
+        punct(&mut out, "->", pos); after += 1
+        while after < body && !lexer.is_newline(t.kinds[after]) {
+            if is_word(&t, after, "from") && after + 1 < body && t.kinds[after + 1] == .Name {
+                token(&mut out, .Keyword, "from", pos)
+                mut resolved := -1
+                for idx in 0..param_names.len {
+                    if t.texts[param_names[idx]] == t.texts[after + 1] { resolved = idx + 1; break }
+                }
+                if resolved > 0 { token(&mut out, .Integer, resolved.str(), pos) }
+                else { token(&mut out, .Integer, "1", pos) }
+                after += 2; continue
+            }
+            if impl_start >= 0 && t.kinds[after] == .Name && t.texts[after] == "Self" {
+                for it in impl_start..impl_end_tok { token(&mut out, t.kinds[it], t.texts[it], pos) }
+            } else {
+                token(&mut out, t.kinds[after], t.texts[after], pos)
+            }
+            after += 1
+        }
+    } else {
+        punct(&mut out, "->", pos); punct(&mut out, "(", pos); punct(&mut out, ")", pos)
+    }
+}
+
+pub fn build_probe(t: &lexer.Tokens) -> lexer.Tokens {
+    mut clone := t.clone()
+    ends := lexer.delimiter_ends(&clone, clone.kinds.len)
+    pass := scan_closures(&mut clone, &ends, false)
+    if !clone.ok { return move clone }
+    mut out := lexer.empty(false)
+    mut i := 0
+    while i < clone.kinds.len - 1 {
+        id := pass.ids[i]
+        if id >= 0 {
+            pos := clone.starts[pass.starts[id]]
+            name(&mut out, "__dunder_module_closure_probe", pos); punct(&mut out, "(", pos)
+            token(&mut out, .Integer, id.str(), pos); punct(&mut out, ",", pos)
+            emit_probe_type_tokens(&clone, &mut out, &ends, &pass, id)
+            first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
+            for idx in first..last {
+                at := pass.names[idx]
+                punct(&mut out, ",", clone.starts[at])
+                copy(&clone, &mut out, at, at + 1)
+            }
+            punct(&mut out, ")", pos)
+            i = ends[pass.bodies[id]] + 1
+        } else {
+            copy(&clone, &mut out, i, i + 1); i += 1
+        }
+    }
+    eof := clone.kinds.len - 1
+    if !has_callable_header(&clone) {
+        pos0 := clone.starts[eof]
+        token(&mut out, .Newline, "\n", pos0)
+        token(&mut out, .Keyword, "struct", pos0); name(&mut out, header(), pos0)
+        punct(&mut out, "{", pos0); header_fields(&mut out, pos0, false); punct(&mut out, "}", pos0)
+        token(&mut out, .Newline, "\n", pos0)
+    }
+    copy(&clone, &mut out, eof, eof + 1)
+    lift_ready(&mut out)
+    out
+}
+
+pub fn inject_capture_types(t: &mut lexer.Tokens, keys: &Map<string, i64>, types: &[]string) -> i32 {
+    ends := lexer.delimiter_ends(&t, t.kinds.len)
+    pass := scan_closures(&mut t, &ends, false)
+    if !t.ok || pass.starts.len == 0 { return 0 }
+    mut insert_after: []i32 = []
+    mut insert_text: []string = []
+    for _ in 0..t.kinds.len { insert_after.push(-1) }
+    for id in 0..pass.starts.len {
+        first := pass.capture_starts[id]; last := pass.capture_starts[id + 1]
+        for idx in first..last {
+            if pass.cap_typed[idx] { continue }
+            cap_idx := idx - first
+            key := id.str() + ":" + cap_idx.str()
+            found := i32(keys.get_or(key, -1))
+            if found >= 0 && found < types.len && types[found] != "" {
+                insert_after[pass.names[idx]] = insert_text.len
+                insert_text.push(types[found].clone())
+            }
+        }
+    }
+    if insert_text.len == 0 { return 0 }
+    mut out := lexer.empty(false)
+    for i in 0..t.kinds.len {
+        copy(&t, &mut out, i, i + 1)
+        ins := insert_after[i]
+        if ins >= 0 {
+            pos := t.starts[i]
+            punct(&mut out, ":", pos)
+            scanned := lexer.scan(insert_text[ins], false)
+            for s in 0..scanned.kinds.len - 1 {
+                token(&mut out, scanned.kinds[s], scanned.texts[s], pos)
+            }
+        }
+    }
+    t.kinds = move out.kinds; t.texts = move out.texts; t.starts = move out.starts
+    t.ids.clear(); t.ends.clear(); t.intern = false; t.store_ends = false
+    insert_text.len
+}
+
+fn lift_pass(t: &mut lexer.Tokens, only_ready: bool) {
+    ends := lexer.delimiter_ends(&t, t.kinds.len)
+    pass := scan_closures(&mut t, &ends, only_ready)
+    if !t.ok { return }
+    mut need_header := false
+    if !has_callable_header(&t) {
+        need_header = mentions_closure_type(&t)
+        if !need_header {
+            for id in 0..pass.starts.len {
+                if pass.kinds[id] != 0 { need_header = true; break }
+            }
+        }
+    }
+    if pass.starts.len == 0 && !need_header { return }
     mut out := lexer.empty(false)
     eof := t.kinds.len - 1; pos := t.starts[eof]
     span(&t, &mut out, &pass, &ends, 0, eof)
     token(&mut out, .Newline, "\n", pos)
-    if pass.names.len > 0 {
+    if need_header {
         token(&mut out, .Keyword, "struct", pos); name(&mut out, header(), pos)
         punct(&mut out, "{", pos); header_fields(&mut out, pos, false); punct(&mut out, "}", pos)
         token(&mut out, .Newline, "\n", pos)
@@ -260,4 +724,12 @@ pub fn lift(t: &mut lexer.Tokens) {
     copy(&t, &mut out, eof, eof + 1)
     t.kinds = move out.kinds; t.texts = move out.texts; t.starts = move out.starts
     t.ids.clear(); t.ends.clear(); t.intern = false; t.store_ends = false
+}
+
+pub fn lift_ready(t: &mut lexer.Tokens) {
+    lift_pass(&mut t, true)
+}
+
+pub fn lift(t: &mut lexer.Tokens) {
+    lift_pass(&mut t, true)
 }
