@@ -1,8 +1,10 @@
 capability network, unsafe
 
+import std.base64 as base64
 import std.bytes as bytes
 import std.net as net
 import std.parse as parse
+import std.sync as sync
 import std.text as text
 import sys
 
@@ -632,22 +634,1292 @@ fn reason(status: i32) -> string {
     "Response"
 }
 
-pub fn write_response(stream: &net.TcpStream, status: i32, content_type: string, extra_names: &[]string, extra_values: &[]string, body: &[]u8, head: bool) -> bool {
-    if status < 100 || status > 599 || extra_names.len != extra_values.len || !valid_value(content_type) { return false }
+fn encode_response_parts(status: i32, content_type: string, extra_headers: &[]Header, body: &[]u8, head: bool, keep_alive: bool) -> Result<[]u8, string> {
+    if status < 100 || status > 599 || !valid_value(content_type) {
+        return .Err("invalid HTTP response status or Content-Type")
+    }
     mut output: []u8 = []
-    bytes.append_utf8(&mut output, f"HTTP/1.1 {status} {reason(status)}\r\nConnection: close\r\n")
+    conn_val := if keep_alive { "keep-alive" } else { "close" }
+    bytes.append_utf8(&mut output, f"HTTP/1.1 {status} {reason(status)}\r\nConnection: {conn_val}\r\n")
     if content_type.len > 0 { bytes.append_utf8(&mut output, f"Content-Type: {content_type}\r\n") }
+    no_body := status < 200 || status == 204 || status == 205 || status == 304
     mut length := body.len
-    if status < 200 || status == 204 || status == 205 || status == 304 { length = 0 }
+    if no_body { length = 0 }
     if status >= 200 && status != 204 && status != 304 {
         bytes.append_utf8(&mut output, f"Content-Length: {length}\r\n")
     }
-    for i in 0..extra_names.len {
-        name := lower(extra_names[i])
-        if !token(name) || !valid_value(extra_values[i]) || name == "content-length" || name == "transfer-encoding" || name == "connection" || name == "content-type" { return false }
-        bytes.append_utf8(&mut output, f"{extra_names[i]}: {extra_values[i]}\r\n")
+    for i in 0..extra_headers.len {
+        hdr := &extra_headers[i]
+        name := lower(hdr.name)
+        if !token(name) || !valid_value(hdr.value) || name == "content-length" || name == "transfer-encoding" || name == "connection" || name == "content-type" {
+            return .Err("invalid or forbidden HTTP response header")
+        }
+        bytes.append_utf8(&mut output, f"{hdr.name}: {hdr.value}\r\n")
     }
     bytes.append_utf8(&mut output, "\r\n")
-    if !head && length > 0 { bytes.extend(&mut output, &body) }
-    write_all(&stream, &output, 30000)
+    if !head && !no_body && length > 0 { bytes.extend(&mut output, &body) }
+    .Ok(output)
+}
+
+pub fn write_response(stream: &net.TcpStream, status: i32, content_type: string, extra_names: &[]string, extra_values: &[]string, body: &[]u8, head: bool) -> bool {
+    if extra_names.len != extra_values.len { return false }
+    mut extra_headers: []Header = []
+    extra_headers.reserve(extra_names.len)
+    for i in 0..extra_names.len {
+        extra_headers.push(Header { name: extra_names[i].clone(), value: extra_values[i].clone() })
+    }
+    encoded := match encode_response_parts(status, content_type, &extra_headers, &body, head, false) {
+        .Ok(raw) => raw,
+        .Err(_) => { return false },
+    }
+    write_all(&stream, &encoded, 30000)
+}
+
+// =============================================================================
+// Response Builder, Keep-Alive Helpers, and Orderly Half-Close
+// =============================================================================
+
+pub struct Header { name: string, value: string }
+
+pub struct Response {
+    status: i32,
+    content_type: string,
+    headers: []Header,
+    body: []u8,
+    keep_alive: bool,
+}
+
+impl Response {
+    pub fn new(status: i32) -> Self {
+        Self { status: status, content_type: "", headers: [], body: [], keep_alive: true }
+    }
+
+    pub fn ok() -> Self { Self::new(200) }
+
+    pub fn text(status: i32, body: string) -> Self {
+        mut out := Self::new(status)
+        out.content_type = "text/plain; charset=utf-8"
+        bytes.append_utf8(&mut out.body, body)
+        out
+    }
+
+    pub fn html(status: i32, body: string) -> Self {
+        mut out := Self::new(status)
+        out.content_type = "text/html; charset=utf-8"
+        bytes.append_utf8(&mut out.body, body)
+        out
+    }
+
+    pub fn json(status: i32, body: string) -> Self {
+        mut out := Self::new(status)
+        out.content_type = "application/json; charset=utf-8"
+        bytes.append_utf8(&mut out.body, body)
+        out
+    }
+
+    pub fn bytes(status: i32, content_type: string, move body: []u8) -> Self {
+        Self { status: status, content_type: content_type.clone(), headers: [], body: body, keep_alive: true }
+    }
+
+    pub fn empty(status: i32) -> Self { Self::new(status) }
+
+    pub fn redirect(status: i32, location: string) -> Self {
+        mut out := Self::new(status)
+        out.header("Location", location)
+        out
+    }
+
+    pub fn set_status(&mut self, status: i32) { self.status = status }
+    pub fn set_content_type(&mut self, content_type: string) { self.content_type = content_type.clone() }
+    pub fn header(&mut self, name: string, value: string) { self.headers.push(Header { name: name.clone(), value: value.clone() }) }
+    pub fn set_keep_alive(&mut self, keep_alive: bool) { self.keep_alive = keep_alive }
+
+    pub fn set_body_text(&mut self, body: string) {
+        self.body.clear()
+        bytes.append_utf8(&mut self.body, body)
+    }
+
+    pub fn set_body_bytes(&mut self, move body: []u8) { self.body = body }
+
+    pub fn set_cookie(&mut self, cookie: &SetCookie) -> bool {
+        match cookie.format() {
+            .Ok(val) => {
+                self.headers.push(Header { name: "Set-Cookie", value: val })
+                true
+            },
+            .Err(_) => false,
+        }
+    }
+
+    pub fn with_header(move self, name: string, value: string) -> Self {
+        mut out := self
+        out.header(name, value)
+        out
+    }
+
+    pub fn with_content_type(move self, content_type: string) -> Self {
+        mut out := self
+        out.content_type = content_type.clone()
+        out
+    }
+
+    pub fn with_keep_alive(move self, keep_alive: bool) -> Self {
+        mut out := self
+        out.keep_alive = keep_alive
+        out
+    }
+
+    pub fn with_cookie(move self, cookie: &SetCookie) -> Self {
+        mut out := self
+        _ := out.set_cookie(&cookie)
+        out
+    }
+}
+
+fn has_connection_token(req: &Request, expected: string) -> bool {
+    conns := headers(&req, "connection")
+    for raw in &conns {
+        parts := text.split(raw, ",")
+        for part in &parts {
+            if lower(trim_ows(part.clone())) == expected { return true }
+        }
+    }
+    false
+}
+
+pub fn connection_wants_close(req: &Request) -> bool {
+    has_connection_token(&req, "close")
+}
+
+pub fn connection_wants_keep_alive(req: &Request) -> bool {
+    has_connection_token(&req, "keep-alive")
+}
+
+pub fn should_keep_alive(req: &Request, http_minor: i32) -> bool {
+    if http_minor >= 1 { return !connection_wants_close(&req) }
+    connection_wants_keep_alive(&req)
+}
+
+pub fn encode_response(resp: &Response, head: bool, keep_alive: bool) -> Result<[]u8, string> {
+    encode_response_parts(resp.status, resp.content_type, &resp.headers, &resp.body, head, keep_alive && resp.keep_alive)
+}
+
+pub fn send_response(stream: &net.TcpStream, resp: &Response, head: bool, keep_alive: bool, timeout_ms: i64) -> bool {
+    match encode_response(&resp, head, keep_alive) {
+        .Ok(raw) => write_all(&stream, &raw, timeout_ms),
+        .Err(_) => false,
+    }
+}
+
+pub fn graceful_close(stream: &net.TcpStream, timeout_ms: i64) {
+    _ := stream.shutdown_write()
+    if timeout_ms <= 0 || !stream.set_nonblocking(true).ok { return }
+    deadline := now_ms() + timeout_ms
+    mut scratch: []u8 = []
+    mut drained := 0
+    while drained < 65536 {
+        if now_ms() >= deadline { break }
+        scratch.clear()
+        match stream.read_append(&mut scratch, 4096) {
+            .Ok(count) => {
+                if count <= 0 { break }
+                drained += i32(count)
+            },
+            .Err(err) => {
+                if err == sys.IoError.Interrupted { continue }
+                if err.is_would_block() {
+                    if !wait_ready(&stream, net.poll_in(), deadline) { break }
+                } else { break }
+            },
+        }
+    }
+}
+
+// =============================================================================
+// Web Primitives: Percent/Form Encoding, Query, Cookies, Auth, HTML Escaping
+// =============================================================================
+
+fn is_unreserved(b: i32) -> bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45 || b == 46 || b == 95 || b == 126
+}
+
+fn hex_digit_upper(n: i32) -> u8 {
+    if n < 10 { u8(48 + n) } else { u8(65 + n - 10) }
+}
+
+fn hex_digit_val(b: i32) -> i32 {
+    if b >= 48 && b <= 57 { return b - 48 }
+    if b >= 65 && b <= 70 { return b - 65 + 10 }
+    if b >= 97 && b <= 102 { return b - 97 + 10 }
+    -1
+}
+
+fn encode_uri_component(input: string, space_as_plus: bool) -> string {
+    mut out: []u8 = []
+    out.reserve(input.len)
+    for b in input.bytes() {
+        if is_unreserved(b) {
+            out.push(u8(b))
+        } else if space_as_plus && b == 32 {
+            out.push(u8(43))
+        } else {
+            out.push(u8(37))
+            out.push(hex_digit_upper(b / 16))
+            out.push(hex_digit_upper(b % 16))
+        }
+    }
+    bytes.decode(&out).value
+}
+
+fn decode_uri_bytes(input: string, plus_as_space: bool) -> Result<[]u8, string> {
+    mut out: []u8 = []
+    out.reserve(input.len)
+    mut i := 0
+    while i < input.len {
+        b := input[i]
+        if plus_as_space && b == 43 {
+            out.push(u8(32))
+            i += 1
+        } else if b == 37 {
+            if i + 2 >= input.len { return .Err("truncated percent escape") }
+            hi := hex_digit_val(input[i + 1])
+            lo := hex_digit_val(input[i + 2])
+            if hi < 0 || lo < 0 { return .Err("invalid hex digit in percent escape") }
+            out.push(u8(hi * 16 + lo))
+            i += 3
+        } else {
+            out.push(u8(b))
+            i += 1
+        }
+    }
+    .Ok(out)
+}
+
+fn decode_utf8_res(raw: &[]u8) -> Result<string, string> {
+    decoded := bytes.decode(&raw)
+    if !decoded.ok { return .Err("invalid UTF-8") }
+    .Ok(decoded.value)
+}
+
+pub fn percent_encode(input: string) -> string { encode_uri_component(input, false) }
+
+pub fn percent_decode_bytes(input: string) -> Result<[]u8, string> { decode_uri_bytes(input, false) }
+
+pub fn percent_decode(input: string) -> Result<string, string> {
+    raw := decode_uri_bytes(input, false)?
+    decode_utf8_res(&raw)
+}
+
+pub fn form_encode_component(input: string) -> string { encode_uri_component(input, true) }
+
+pub fn form_decode(input: string) -> Result<string, string> {
+    raw := decode_uri_bytes(input, true)?
+    decode_utf8_res(&raw)
+}
+
+pub struct FormParam { key: string, value: string }
+
+pub fn target_path(target: string) -> string {
+    match text.find(target, "?") {
+        .Some(pos) => target[0..pos],
+        .None => target.clone(),
+    }
+}
+
+pub fn target_query(target: string) -> string {
+    match text.find(target, "?") {
+        .Some(pos) => target[(pos + 1)..target.len],
+        .None => "",
+    }
+}
+
+fn parse_urlencoded_pairs(raw: string) -> Result<[]FormParam, string> {
+    mut params: []FormParam = []
+    if raw.len == 0 { return .Ok(params) }
+    segments := text.split(raw, "&")
+    for seg in &segments {
+        if seg.len == 0 { continue }
+        match text.find(seg.clone(), "=") {
+            .Some(eq) => {
+                k := form_decode(seg[0..eq])?
+                v := form_decode(seg[(eq + 1)..seg.len])?
+                params.push(FormParam { key: k, value: v })
+            },
+            .None => {
+                k := form_decode(seg.clone())?
+                params.push(FormParam { key: k, value: "" })
+            },
+        }
+    }
+    .Ok(params)
+}
+
+pub fn parse_query(query: string) -> Result<[]FormParam, string> {
+    raw := if text.starts_with(query, "?") { query[1..query.len] } else { query.clone() }
+    parse_urlencoded_pairs(raw)
+}
+
+pub fn parse_form_urlencoded(body: &[]u8) -> Result<[]FormParam, string> {
+    txt := decode_utf8_res(&body)?
+    parse_urlencoded_pairs(txt)
+}
+
+pub fn encode_form_urlencoded(params: &[]FormParam) -> string {
+    mut out := ""
+    for i in 0..params.len {
+        if i > 0 { out = out + "&" }
+        out = out + form_encode_component(params[i].key.clone()) + "=" + form_encode_component(params[i].value.clone())
+    }
+    out
+}
+
+pub fn param_get(params: &[]FormParam, key: string) -> Option<string> {
+    for p in &params {
+        if p.key == key { return .Some(p.value.clone()) }
+    }
+    .None
+}
+
+pub fn param_get_all(params: &[]FormParam, key: string) -> []string {
+    mut out: []string = []
+    for p in &params {
+        if p.key == key { out.push(p.value.clone()) }
+    }
+    out
+}
+
+pub struct Cookie { name: string, value: string }
+
+pub fn parse_cookies(req: &Request) -> []Cookie {
+    mut out: []Cookie = []
+    hdrs := headers(&req, "cookie")
+    for hdr in &hdrs {
+        parts := text.split(hdr, ";")
+        for part in &parts {
+            trimmed := trim_ows(part.clone())
+            if trimmed.len == 0 { continue }
+            match text.find(trimmed.clone(), "=") {
+                .Some(eq) => {
+                    if eq > 0 {
+                        name := trim_ows(trimmed[0..eq])
+                        mut val := trim_ows(trimmed[(eq + 1)..trimmed.len])
+                        if val.len >= 2 && val[0] == 34 && val[val.len - 1] == 34 {
+                            val = val[1..(val.len - 1)]
+                        }
+                        if token(name) { out.push(Cookie { name: name, value: val }) }
+                    }
+                },
+                .None => {},
+            }
+        }
+    }
+    out
+}
+
+pub fn cookie(req: &Request, name: string) -> Option<string> {
+    list := parse_cookies(&req)
+    for c in &list {
+        if c.name == name { return .Some(c.value.clone()) }
+    }
+    .None
+}
+
+pub enum SameSite { None, Lax, Strict }
+
+pub struct SetCookie {
+    name: string,
+    value: string,
+    path: string,
+    domain: string,
+    max_age: Option<i64>,
+    expires: string,
+    secure: bool,
+    http_only: bool,
+    same_site: Option<SameSite>,
+}
+
+fn valid_cookie_attr(val: string) -> bool {
+    valid_value(val) && !text.contains(val, ";")
+}
+
+impl SetCookie {
+    pub fn new(name: string, value: string) -> Self {
+        Self {
+            name: name.clone(), value: value.clone(), path: "", domain: "",
+            max_age: .None, expires: "", secure: false, http_only: false, same_site: .None,
+        }
+    }
+
+    pub fn format(&self) -> Result<string, string> {
+        if !token(self.name) { return .Err("invalid cookie name") }
+        if !valid_cookie_attr(self.value) || !valid_cookie_attr(self.path) || !valid_cookie_attr(self.domain) || !valid_cookie_attr(self.expires) {
+            return .Err("invalid Set-Cookie field value")
+        }
+        mut out := f"{self.name}={self.value}"
+        if self.path.len > 0 { out = out + f"; Path={self.path}" }
+        if self.domain.len > 0 { out = out + f"; Domain={self.domain}" }
+        match self.max_age {
+            .Some(secs) => { out = out + f"; Max-Age={secs}" },
+            .None => {},
+        }
+        if self.expires.len > 0 { out = out + f"; Expires={self.expires}" }
+        if self.secure { out = out + "; Secure" }
+        if self.http_only { out = out + "; HttpOnly" }
+        match self.same_site {
+            .Some(mode) => {
+                label := match mode {
+                    .Strict => "Strict",
+                    .Lax => "Lax",
+                    .None => "None",
+                }
+                out = out + "; SameSite=" + label
+            },
+            .None => {},
+        }
+        .Ok(out)
+    }
+}
+
+pub struct BasicCredentials { username: string, password: string }
+
+fn extract_auth_payload(req: &Request, scheme: string) -> Option<string> {
+    raw := trim_ows(header(&req, "authorization"))
+    if raw.len == 0 { return .None }
+    match text.find(raw.clone(), " ") {
+        .Some(sp) => {
+            if lower(raw[0..sp]) != scheme { return .None }
+            rest := trim_ows(raw[(sp + 1)..raw.len])
+            if rest.len == 0 { return .None }
+            .Some(rest)
+        },
+        .None => .None,
+    }
+}
+
+pub fn parse_bearer(req: &Request) -> Option<string> {
+    match extract_auth_payload(&req, "bearer") {
+        .Some(tok) => {
+            for b in tok.bytes() {
+                if b <= 32 || b == 127 { return .None }
+            }
+            .Some(tok)
+        },
+        .None => .None,
+    }
+}
+
+pub fn parse_basic(req: &Request) -> Option<BasicCredentials> {
+    encoded := extract_auth_payload(&req, "basic")?
+    decoded := base64.decode(encoded)
+    if !decoded.ok { return .None }
+    txt := bytes.decode(&decoded.value)
+    if !txt.ok { return .None }
+    match text.find(txt.value.clone(), ":") {
+        .Some(colon) => .Some(BasicCredentials { username: txt.value[0..colon], password: txt.value[(colon + 1)..txt.value.len] }),
+        .None => .None,
+    }
+}
+
+pub fn format_bearer(token_val: string) -> string { "Bearer " + token_val }
+
+pub fn format_basic(username: string, password: string) -> string {
+    raw := bytes.from_text(username + ":" + password)
+    "Basic " + base64.encode(&raw)
+}
+
+pub fn escape_html(input: string) -> string {
+    mut out: []u8 = []
+    out.reserve(input.len)
+    for b in input.bytes() {
+        if b == 38 { bytes.append_utf8(&mut out, "&amp;") }
+        else if b == 60 { bytes.append_utf8(&mut out, "&lt;") }
+        else if b == 62 { bytes.append_utf8(&mut out, "&gt;") }
+        else if b == 34 { bytes.append_utf8(&mut out, "&quot;") }
+        else if b == 39 { bytes.append_utf8(&mut out, "&#x27;") }
+        else { out.push(u8(b)) }
+    }
+    bytes.decode(&out).value
+}
+
+// =============================================================================
+// Multiplexed HTTP/1.1 Keep-Alive Server (PollSet::waker + task scope)
+// =============================================================================
+
+pub struct ServerConfig {
+    workers: i32,
+    max_connections: i32,
+    max_body_bytes: i32,
+    read_timeout_ms: i64,
+    write_timeout_ms: i64,
+    keep_alive_timeout_ms: i64,
+    max_requests_per_conn: i32,
+    queue_capacity: i32,
+    drain_timeout_ms: i64,
+}
+
+impl ServerConfig {
+    pub fn default() -> Self {
+        Self {
+            workers: 4,
+            max_connections: 1024,
+            max_body_bytes: 16777216,
+            read_timeout_ms: 10000,
+            write_timeout_ms: 10000,
+            keep_alive_timeout_ms: 30000,
+            max_requests_per_conn: 1000,
+            queue_capacity: 256,
+            drain_timeout_ms: 200,
+        }
+    }
+}
+
+pub trait Handler {
+    fn handle(&self, req: &Request) -> Response
+}
+
+pub struct RequestJob {
+    conn_id: i32,
+    generation: i64,
+    request: Request,
+}
+
+pub struct ResponseJob {
+    conn_id: i32,
+    generation: i64,
+    response: Response,
+}
+
+struct WorkerContext<H> {
+    work_rx: sync.Receiver<RequestJob>,
+    done_tx: sync.Sender<ResponseJob>,
+    handler: H,
+}
+
+fn http_worker<H>(move ctx: WorkerContext<H>) where H: Handler + Clone + Sendable {
+    while true {
+        match ctx.work_rx.recv() {
+            .Some(job) => {
+                resp := ctx.handler.handle(&job.request)
+                out := ResponseJob { conn_id: job.conn_id, generation: job.generation, response: resp }
+                if !ctx.done_tx.send(move out) { break }
+            },
+            .None => break,
+        }
+    }
+}
+
+struct Conn {
+    active: bool,
+    fd_slot: i32,
+    generation: i64,
+    state: i32,
+    rx: []u8,
+    rx_off: i32,
+    http_minor: i32,
+    req: Request,
+    remaining: i64,
+    total_body: i64,
+    chunk_remaining: i64,
+    trailer_bytes: i32,
+    trailer_count: i32,
+    expect_continue: bool,
+    continue_pending: bool,
+    req_keep_alive: bool,
+    req_head: bool,
+    requests_handled: i32,
+    pending_job: Option<RequestJob>,
+    write_buf: []u8,
+    write_off: i32,
+    drained_bytes: i32,
+    deadline: i64,
+}
+
+fn empty_req() -> Request {
+    Request { ok: false, status: 400, method: "", target: "", header_names: [], header_values: [], body: [], error: "" }
+}
+
+fn new_conn() -> Conn {
+    Conn {
+        active: false, fd_slot: -1, generation: 0, state: 0,
+        rx: [], rx_off: 0, http_minor: 1, req: empty_req(),
+        remaining: 0, total_body: 0, chunk_remaining: 0,
+        trailer_bytes: 0, trailer_count: 0,
+        expect_continue: false, continue_pending: false,
+        req_keep_alive: false, req_head: false, requests_handled: 0,
+        pending_job: .None, write_buf: [], write_off: 0, drained_bytes: 0, deadline: 0,
+    }
+}
+
+fn conn_reset_for_request(c: &mut Conn, timeout_ms: i64, idle: bool) {
+    if c.rx_off > 0 {
+        if c.rx_off >= c.rx.len { c.rx.clear() }
+        else { bytes.consume_prefix(&mut c.rx, c.rx_off) }
+        c.rx_off = 0
+    }
+    c.state = if idle && c.rx.len == 0 { 0 } else { 1 }
+    c.http_minor = 1
+    c.req = empty_req()
+    c.remaining = 0
+    c.total_body = 0
+    c.chunk_remaining = 0
+    c.trailer_bytes = 0
+    c.trailer_count = 0
+    c.expect_continue = false
+    c.continue_pending = false
+    c.req_keep_alive = false
+    c.req_head = false
+    c.pending_job = .None
+    c.write_buf.clear()
+    c.write_off = 0
+    c.deadline = now_ms() + timeout_ms
+}
+
+fn conn_begin_error(c: &mut Conn, status: i32, msg: string, write_timeout_ms: i64) {
+    resp := Response::text(status, msg)
+    encoded := match encode_response(&resp, false, false) {
+        .Ok(raw) => raw,
+        .Err(_) => [],
+    }
+    c.req_keep_alive = false
+    c.write_buf = move encoded
+    c.write_off = 0
+    c.state = 9
+    c.deadline = now_ms() + write_timeout_ms
+}
+
+fn conn_close(c: &mut Conn, streams: &mut net.StreamSet) {
+    if c.fd_slot >= 0 {
+        _ := streams.close(c.fd_slot)
+        c.fd_slot = -1
+    }
+    c.active = false
+    c.state = 0
+    c.rx.clear()
+    c.rx_off = 0
+    c.req = empty_req()
+    c.pending_job = .None
+    c.write_buf.clear()
+    c.write_off = 0
+}
+
+fn conn_start_drain(c: &mut Conn, streams: &mut net.StreamSet, drain_timeout_ms: i64) {
+    if drain_timeout_ms <= 0 || c.fd_slot < 0 {
+        conn_close(&mut c, &mut streams)
+        return
+    }
+    _ := streams.shutdown_write(c.fd_slot)
+    c.state = 10
+    c.drained_bytes = 0
+    c.deadline = now_ms() + drain_timeout_ms
+}
+
+fn conn_try_parse_head(c: &mut Conn, config: &ServerConfig) -> i32 {
+    // returns: 0 = need more bytes, 1 = head ready, -1 = error response started
+    boundary := bytes.find_double_crlf(&c.rx, c.rx_off, c.rx.len).unwrap_or(-1)
+    if boundary < 0 {
+        partial := partial_head_status(&c.rx)
+        if partial != 0 {
+            conn_begin_error(&mut c, partial, "invalid or oversized HTTP head", config.write_timeout_ms)
+            return -1
+        }
+        if c.rx.len - c.rx_off >= 32768 {
+            conn_begin_error(&mut c, 431, "HTTP headers exceed their limit", config.write_timeout_ms)
+            return -1
+        }
+        return 0
+    }
+    head_end := boundary + 4
+    if head_end - c.rx_off > 32768 {
+        conn_begin_error(&mut c, 431, "HTTP headers exceed their limit", config.write_timeout_ms)
+        return -1
+    }
+    mut line_start := c.rx_off
+    first_crlf := bytes.find_crlf(&c.rx, line_start, head_end).unwrap_or(-1)
+    if first_crlf < 0 || first_crlf - line_start > 8192 {
+        status := if first_crlf < 0 { 400 } else { 431 }
+        conn_begin_error(&mut c, status, "invalid HTTP request line", config.write_timeout_ms)
+        return -1
+    }
+    first_dec := bytes.decode_range(&c.rx, line_start, first_crlf)
+    if !first_dec.ok {
+        conn_begin_error(&mut c, 400, "invalid UTF-8 in HTTP head", config.write_timeout_ms)
+        return -1
+    }
+    mut parts := text.split(first_dec.value, " ")
+    if parts.len != 3 {
+        conn_begin_error(&mut c, 400, "invalid HTTP request line", config.write_timeout_ms)
+        return -1
+    }
+    version := parts.pop()
+    target := parts.pop()
+    method := parts.pop()
+    if !token(method) || (version != "HTTP/1.0" && version != "HTTP/1.1") {
+        conn_begin_error(&mut c, 400, "invalid HTTP request line", config.write_timeout_ms)
+        return -1
+    }
+    if !text.starts_with(target, "/") {
+        conn_begin_error(&mut c, 400, "HTTP target requires origin form", config.write_timeout_ms)
+        return -1
+    }
+    for b in target.bytes() {
+        if b <= 32 || b == 127 || b == 35 || b == 92 {
+            conn_begin_error(&mut c, 400, "invalid HTTP request target", config.write_timeout_ms)
+            return -1
+        }
+    }
+    mut req := Request {
+        ok: true, status: 200, method: method, target: target,
+        header_names: [], header_values: [], body: [], error: "",
+    }
+    line_start = first_crlf + 2
+    while line_start < boundary + 2 {
+        line_crlf := bytes.find_crlf(&c.rx, line_start, head_end).unwrap_or(-1)
+        if line_crlf < 0 {
+            conn_begin_error(&mut c, 400, "HTTP lines require CRLF", config.write_timeout_ms)
+            return -1
+        }
+        if line_crlf - line_start > 8192 {
+            conn_begin_error(&mut c, 431, "HTTP line exceeds its limit", config.write_timeout_ms)
+            return -1
+        }
+        line_dec := bytes.decode_range(&c.rx, line_start, line_crlf)
+        if !line_dec.ok {
+            conn_begin_error(&mut c, 400, "invalid UTF-8 in HTTP head", config.write_timeout_ms)
+            return -1
+        }
+        line_start = line_crlf + 2
+        if line_dec.value.len == 0 { break }
+        if req.header_names.len >= 100 {
+            conn_begin_error(&mut c, 431, "too many HTTP headers", config.write_timeout_ms)
+            return -1
+        }
+        if !append_header(&mut req, line_dec.value) {
+            conn_begin_error(&mut c, 400, "invalid or duplicate HTTP header", config.write_timeout_ms)
+            return -1
+        }
+    }
+    c.rx_off = head_end
+    c.http_minor = if version == "HTTP/1.1" { 1 } else { 0 }
+    if c.http_minor == 1 && header(&req, "host").len == 0 {
+        conn_begin_error(&mut c, 400, "Host required", config.write_timeout_ms)
+        return -1
+    }
+    transfer := lower(header(&req, "transfer-encoding"))
+    has_transfer := has_header(&req, "transfer-encoding")
+    has_length := has_header(&req, "content-length")
+    if has_transfer && (transfer != "chunked" || has_length) {
+        conn_begin_error(&mut c, 400, "ambiguous or unsupported HTTP body framing", config.write_timeout_ms)
+        return -1
+    }
+    c.remaining = 0
+    if has_length {
+        sz := decimal(header(&req, "content-length"), i64(config.max_body_bytes))
+        if sz == -1 { conn_begin_error(&mut c, 400, "invalid Content-Length", config.write_timeout_ms); return -1 }
+        if sz == -2 { conn_begin_error(&mut c, 413, "request body exceeds its limit", config.write_timeout_ms); return -1 }
+        c.remaining = sz
+    }
+    if has_header(&req, "expect") {
+        if lower(header(&req, "expect")) != "100-continue" {
+            conn_begin_error(&mut c, 417, "unsupported Expect header", config.write_timeout_ms)
+            return -1
+        }
+        c.expect_continue = true
+        c.continue_pending = true
+    }
+    keep := should_keep_alive(&req, c.http_minor) && (c.requests_handled + 1 < config.max_requests_per_conn)
+    c.req_keep_alive = keep
+    c.req_head = req.method == "HEAD"
+    c.req = move req
+    c.total_body = 0
+    c.chunk_remaining = 0
+    c.trailer_bytes = 0
+    c.trailer_count = 0
+    if has_transfer { c.state = 3 }
+    else if c.remaining > 0 { c.state = 2 }
+    else { c.state = 7 }
+    1
+}
+
+fn conn_consume_body_step(c: &mut Conn, config: &ServerConfig) -> bool {
+    // Returns true if progressed or completed cleanly without needing socket read; false if need more bytes
+    if c.state == 2 {
+        avail := i64(c.rx.len - c.rx_off)
+        if avail <= 0 { return false }
+        take := if avail < c.remaining { i32(avail) } else { i32(c.remaining) }
+        bytes.extend_range(&mut c.req.body, &c.rx, c.rx_off, c.rx_off + take)
+        c.rx_off += take
+        c.remaining -= i64(take)
+        c.total_body += i64(take)
+        if c.remaining == 0 { c.state = 7 }
+        return true
+    }
+    if c.state == 3 {
+        crlf := bytes.find_crlf(&c.rx, c.rx_off, c.rx.len).unwrap_or(-1)
+        nl := bytes.find_byte(&c.rx, c.rx_off, c.rx.len, b'\n').unwrap_or(-1)
+        if nl >= 0 && (crlf < 0 || nl != crlf + 1) {
+            conn_begin_error(&mut c, 400, "HTTP lines require CRLF", config.write_timeout_ms)
+            return true
+        }
+        if crlf < 0 {
+            if c.rx.len - c.rx_off > 1025 {
+                conn_begin_error(&mut c, 431, "HTTP line exceeds its limit", config.write_timeout_ms)
+                return true
+            }
+            return false
+        }
+        if crlf - c.rx_off > 1024 {
+            conn_begin_error(&mut c, 431, "HTTP line exceeds its limit", config.write_timeout_ms)
+            return true
+        }
+        dec := bytes.decode_range(&c.rx, c.rx_off, crlf)
+        c.rx_off = crlf + 2
+        if !dec.ok {
+            conn_begin_error(&mut c, 400, "invalid UTF-8 in chunk header", config.write_timeout_ms)
+            return true
+        }
+        sz := chunk_size(dec.value, i64(config.max_body_bytes) - c.total_body)
+        if sz == -1 { conn_begin_error(&mut c, 400, "invalid HTTP chunk size", config.write_timeout_ms); return true }
+        if sz == -2 { conn_begin_error(&mut c, 413, "request body exceeds its limit", config.write_timeout_ms); return true }
+        if sz == 0 {
+            c.state = 6
+        } else {
+            c.chunk_remaining = sz
+            c.state = 4
+        }
+        return true
+    }
+    if c.state == 4 {
+        avail := i64(c.rx.len - c.rx_off)
+        if avail <= 0 { return false }
+        take := if avail < c.chunk_remaining { i32(avail) } else { i32(c.chunk_remaining) }
+        bytes.extend_range(&mut c.req.body, &c.rx, c.rx_off, c.rx_off + take)
+        c.rx_off += take
+        c.chunk_remaining -= i64(take)
+        c.total_body += i64(take)
+        if c.chunk_remaining == 0 { c.state = 5 }
+        return true
+    }
+    if c.state == 5 {
+        if c.rx.len - c.rx_off < 2 { return false }
+        if c.rx[c.rx_off] != b'\r' || c.rx[c.rx_off + 1] != b'\n' {
+            conn_begin_error(&mut c, 400, "invalid HTTP chunk ending", config.write_timeout_ms)
+            return true
+        }
+        c.rx_off += 2
+        c.state = 3
+        return true
+    }
+    if c.state == 6 {
+        crlf := bytes.find_crlf(&c.rx, c.rx_off, c.rx.len).unwrap_or(-1)
+        nl := bytes.find_byte(&c.rx, c.rx_off, c.rx.len, b'\n').unwrap_or(-1)
+        if nl >= 0 && (crlf < 0 || nl != crlf + 1) {
+            conn_begin_error(&mut c, 400, "HTTP lines require CRLF", config.write_timeout_ms)
+            return true
+        }
+        if crlf < 0 {
+            if c.rx.len - c.rx_off > 8193 {
+                conn_begin_error(&mut c, 431, "HTTP line exceeds its limit", config.write_timeout_ms)
+                return true
+            }
+            return false
+        }
+        line_len := crlf - c.rx_off
+        if line_len > 8192 {
+            conn_begin_error(&mut c, 431, "HTTP line exceeds its limit", config.write_timeout_ms)
+            return true
+        }
+        c.trailer_bytes += line_len + 2
+        if c.trailer_bytes > 8192 {
+            conn_begin_error(&mut c, 431, "HTTP trailers exceed their limit", config.write_timeout_ms)
+            return true
+        }
+        dec := bytes.decode_range(&c.rx, c.rx_off, crlf)
+        c.rx_off = crlf + 2
+        if !dec.ok {
+            conn_begin_error(&mut c, 400, "invalid UTF-8 in HTTP trailer", config.write_timeout_ms)
+            return true
+        }
+        if dec.value.len == 0 {
+            c.state = 7
+            return true
+        }
+        c.trailer_count += 1
+        if c.trailer_count > 20 {
+            conn_begin_error(&mut c, 431, "too many HTTP trailers", config.write_timeout_ms)
+            return true
+        }
+        part := header_parts(dec.value)
+        if !part.ok {
+            conn_begin_error(&mut c, 400, "invalid HTTP trailer", config.write_timeout_ms)
+            return true
+        }
+        if control_trailer(part.name) {
+            conn_begin_error(&mut c, 400, "HTTP control trailer refused", config.write_timeout_ms)
+            return true
+        }
+        return true
+    }
+    false
+}
+
+fn conn_flush_continue(c: &mut Conn, streams: &mut net.StreamSet) -> bool {
+    if !c.continue_pending || c.fd_slot < 0 { return true }
+    mut msg: []u8 = []
+    bytes.append_utf8(&mut msg, "HTTP/1.1 100 Continue\r\n\r\n")
+    match streams.write_range(c.fd_slot, &msg, 0, msg.len) {
+        .Ok(n) => {
+            if i32(n) == msg.len {
+                c.continue_pending = false
+                return true
+            }
+            false
+        },
+        .Err(err) => {
+            if err == sys.IoError.Interrupted || err.is_would_block() { return true }
+            false
+        },
+    }
+}
+
+fn conn_dispatch(c: &mut Conn, cid: i32, next_gen: &mut i64, work_tx: &sync.Sender<RequestJob>, config: &ServerConfig) {
+    if c.state != 7 { return }
+    opt := replace(&mut c.pending_job, .None)
+    mut job := match opt {
+        .Some(pending) => pending,
+        .None => {
+            g := next_gen
+            next_gen = g + 1
+            c.generation = g
+            req := replace(&mut c.req, empty_req())
+            RequestJob { conn_id: cid, generation: g, request: req }
+        },
+    }
+    match work_tx.try_send(move job) {
+        .Ok => {
+            c.pending_job = .None
+            c.state = 8
+        },
+        .Full(returned) => {
+            c.pending_job = .Some(returned)
+        },
+        .Closed(_) | .TimedOut(_) | .Cancelled(_) => {
+            c.pending_job = .None
+            conn_begin_error(&mut c, 503, "server shutting down", config.write_timeout_ms)
+        },
+    }
+}
+
+fn conn_advance_parse_and_dispatch(c: &mut Conn, cid: i32, next_gen: &mut i64, streams: &mut net.StreamSet, work_tx: &sync.Sender<RequestJob>, config: &ServerConfig) {
+    if c.state == 0 && c.rx.len > c.rx_off { c.state = 1 }
+    mut progressed := true
+    while progressed && c.active {
+        progressed = false
+        if c.state == 1 {
+            res := conn_try_parse_head(&mut c, &config)
+            if res == 1 {
+                if !conn_flush_continue(&mut c, &mut streams) {
+                    conn_close(&mut c, &mut streams)
+                    return
+                }
+                progressed = true
+            }
+        } else if c.state >= 2 && c.state <= 6 {
+            if c.continue_pending {
+                if !conn_flush_continue(&mut c, &mut streams) {
+                    conn_close(&mut c, &mut streams)
+                    return
+                }
+            }
+            if conn_consume_body_step(&mut c, &config) { progressed = true }
+        }
+    }
+    if c.active && c.state == 7 {
+        conn_dispatch(&mut c, cid, &mut next_gen, &work_tx, &config)
+    }
+}
+
+pub fn serve_channel(listener: &net.TcpListener, config: &ServerConfig, cancel: &sync.CancelToken,
+    work_tx: &sync.Sender<RequestJob>, done_rx: &sync.Receiver<ResponseJob>) -> Result<(), sys.IoError> {
+    if config.max_connections < 1 || config.max_body_bytes < 0 || config.read_timeout_ms <= 0 ||
+        config.write_timeout_ms <= 0 || config.keep_alive_timeout_ms <= 0 || config.max_requests_per_conn < 1 {
+        return .Err(.InvalidArgument)
+    }
+    nb := listener.set_nonblocking(true)
+    if !nb.ok { return .Err(sys.IoError::from_code(nb.error)) }
+    mut streams := net.StreamSet::new()
+    mut poll := net.PollSet::new()
+    waker := poll.waker()?
+    cancel.attach_waker(&waker)
+    done_rx.attach_waker(&waker)
+    work_tx.attach_waker(&waker)
+
+    mut conns: []Conn = []
+    mut active_conns := 0
+    mut next_gen: i64 = 1
+
+    while true {
+        // 1. Drain completed responses from worker pool
+        while true {
+            match done_rx.try_recv() {
+                .Value(rjob) => {
+                    cid := rjob.conn_id
+                    if cid >= 0 && cid < conns.len {
+                        c := &mut conns[cid]
+                        if c.active && c.state == 8 && c.generation == rjob.generation {
+                            head_method := c.req_head
+                            keep := c.req_keep_alive && rjob.response.keep_alive && !cancel.is_cancelled()
+                            c.req_keep_alive = keep
+                            match encode_response(&rjob.response, head_method, keep) {
+                                .Ok(raw) => {
+                                    c.write_buf = move raw
+                                    c.write_off = 0
+                                    c.state = 9
+                                    c.deadline = now_ms() + config.write_timeout_ms
+                                    c.requests_handled += 1
+                                },
+                                .Err(err_msg) => {
+                                    conn_begin_error(&mut c, 500, err_msg, config.write_timeout_ms)
+                                },
+                            }
+                        }
+                    }
+                },
+                .Empty => break,
+                .Closed => break,
+            }
+        }
+
+        // 2. Retry queued WAITING_DISPATCH & flush non-blocking WRITES
+        now := now_ms()
+        stopping := cancel.is_cancelled()
+        for cid in 0..conns.len {
+            c := &mut conns[cid]
+            if !c.active { continue }
+            if c.state == 7 {
+                conn_dispatch(&mut c, cid, &mut next_gen, &work_tx, &config)
+            }
+            if c.active && c.state == 9 {
+                while c.write_off < c.write_buf.len {
+                    match streams.write_range(c.fd_slot, &c.write_buf, c.write_off, c.write_buf.len - c.write_off) {
+                        .Ok(wrote) => {
+                            if wrote <= 0 { conn_close(&mut c, &mut streams); active_conns -= 1; break }
+                            c.write_off += i32(wrote)
+                        },
+                        .Err(err) => {
+                            if err == sys.IoError.Interrupted { continue }
+                            if err.is_would_block() { break }
+                            conn_close(&mut c, &mut streams)
+                            active_conns -= 1
+                            break
+                        },
+                    }
+                }
+                if c.active && c.write_off >= c.write_buf.len {
+                    if c.req_keep_alive && !stopping {
+                        has_pipelined := c.rx_off < c.rx.len
+                        tmo := if has_pipelined { config.read_timeout_ms } else { config.keep_alive_timeout_ms }
+                        conn_reset_for_request(&mut c, tmo, !has_pipelined)
+                        if has_pipelined {
+                            conn_advance_parse_and_dispatch(&mut c, cid, &mut next_gen, &mut streams, &work_tx, &config)
+                        }
+                    } else {
+                        conn_start_drain(&mut c, &mut streams, if stopping { 0 } else { config.drain_timeout_ms })
+                        if !c.active { active_conns -= 1 }
+                    }
+                }
+            }
+            if c.active && stopping && c.state == 0 {
+                conn_close(&mut c, &mut streams)
+                active_conns -= 1
+            } else if c.active && c.state != 8 && now >= c.deadline {
+                if c.state >= 1 && c.state <= 6 {
+                    conn_begin_error(&mut c, 408, "request deadline exceeded", config.write_timeout_ms)
+                } else {
+                    conn_close(&mut c, &mut streams)
+                    active_conns -= 1
+                }
+            }
+        }
+
+        if stopping && active_conns == 0 { break }
+
+        // 3. Build PollSet for active connections & optional listener
+        poll.clear()
+        mut poll_targets: []i32 = []
+        if !stopping && active_conns < config.max_connections {
+            poll_targets.push(-1)
+            poll.add(listener.fd(), net.poll_in())
+        }
+        mut min_deadline: i64 = -1
+        for cid in 0..conns.len {
+            c := &conns[cid]
+            if !c.active { continue }
+            if c.state != 8 && (min_deadline < 0 || c.deadline < min_deadline) {
+                min_deadline = c.deadline
+            }
+            mut ev := 0
+            if (c.state >= 0 && c.state <= 6) || c.state == 10 {
+                ev = ev + net.poll_in()
+            }
+            if c.state == 9 { ev = ev + net.poll_out() }
+            if ev != 0 {
+                poll_targets.push(cid)
+                poll.add(streams.fd(c.fd_slot), ev)
+            }
+        }
+
+        mut wait_ms := 250
+        if min_deadline >= 0 {
+            rem := min_deadline - now_ms()
+            if rem <= 0 { wait_ms = 0 }
+            else if rem < i64(wait_ms) { wait_ms = i32(rem) }
+        }
+        mut polled := 0
+        match poll.poll(wait_ms) {
+            .Ok(n) => { polled = n },
+            .Err(err) => {
+                if err == sys.IoError.Interrupted { continue }
+                return .Err(err)
+            },
+        }
+        if polled == 0 && !poll.woken() { continue }
+
+        // 4. Handle listener & ready socket events
+        for pi in 0..poll_targets.len {
+            rev := poll.revents[pi]
+            if rev == 0 { continue }
+            target_cid := poll_targets[pi]
+            if target_cid < 0 {
+                // Accept incoming connections up to capacity
+                while !cancel.is_cancelled() && active_conns < config.max_connections {
+                    match listener.accept() {
+                        .Ok(stream) => {
+                            _ := stream.set_nonblocking(true)
+                            _ := stream.set_nodelay(true)
+                            fslot := streams.insert(move stream)
+                            mut slot_idx := -1
+                            for idx in 0..conns.len {
+                                if !conns[idx].active { slot_idx = idx; break }
+                            }
+                            if slot_idx < 0 {
+                                slot_idx = conns.len
+                                conns.push(new_conn())
+                            }
+                            c := &mut conns[slot_idx]
+                            c.active = true
+                            c.fd_slot = fslot
+                            c.requests_handled = 0
+                            c.rx.clear()
+                            c.rx_off = 0
+                            conn_reset_for_request(&mut c, config.keep_alive_timeout_ms, true)
+                            active_conns += 1
+                        },
+                        .Err(err) => {
+                            if err == sys.IoError.Interrupted { continue }
+                            break
+                        },
+                    }
+                }
+                continue
+            }
+
+            c := &mut conns[target_cid]
+            if !c.active { continue }
+            if c.state >= 0 && c.state <= 6 {
+                if rev.bit_and(net.poll_err()) != 0 {
+                    conn_close(&mut c, &mut streams)
+                    active_conns -= 1
+                    continue
+                }
+                mut eof_or_err := false
+                mut read_any := false
+                while c.rx.len - c.rx_off < 65536 {
+                    match streams.read_append(c.fd_slot, &mut c.rx, 8192) {
+                        .Ok(cnt) => {
+                            if cnt <= 0 {
+                                eof_or_err = true
+                                break
+                            }
+                            read_any = true
+                            if c.state == 0 {
+                                c.state = 1
+                                c.deadline = now_ms() + config.read_timeout_ms
+                            }
+                        },
+                        .Err(err) => {
+                            if err == sys.IoError.Interrupted { continue }
+                            if err.is_would_block() { break }
+                            eof_or_err = true
+                            break
+                        },
+                    }
+                }
+                if read_any {
+                    conn_advance_parse_and_dispatch(&mut c, target_cid, &mut next_gen, &mut streams, &work_tx, &config)
+                }
+                if c.active && eof_or_err {
+                    if c.state == 0 && c.rx.len == c.rx_off {
+                        conn_close(&mut c, &mut streams)
+                        active_conns -= 1
+                    } else if c.state >= 1 && c.state <= 6 {
+                        conn_begin_error(&mut c, 400, "truncated HTTP request", config.write_timeout_ms)
+                    }
+                }
+            } else if c.state == 10 {
+                // Draining peer input until EOF
+                mut done_drain := rev.bit_and(net.poll_err()) != 0
+                mut scratch: []u8 = []
+                while !done_drain && c.drained_bytes < 65536 {
+                    scratch.clear()
+                    match streams.read_append(c.fd_slot, &mut scratch, 4096) {
+                        .Ok(cnt) => {
+                            if cnt <= 0 { done_drain = true; break }
+                            c.drained_bytes += i32(cnt)
+                        },
+                        .Err(err) => {
+                            if err == sys.IoError.Interrupted { continue }
+                            if err.is_would_block() { break }
+                            done_drain = true
+                            break
+                        },
+                    }
+                }
+                if done_drain || c.drained_bytes >= 65536 {
+                    conn_close(&mut c, &mut streams)
+                    active_conns -= 1
+                }
+            }
+        }
+    }
+    .Ok
+}
+
+pub fn serve<H>(listener: &net.TcpListener, config: &ServerConfig, cancel: &sync.CancelToken, handler: &H) -> Result<(), sys.IoError> where H: Handler + Clone + Sendable {
+    mut worker_count := config.workers
+    if worker_count < 1 { worker_count = 1 }
+    mut qcap := config.queue_capacity
+    if qcap < 1 { qcap = worker_count * 4 }
+    work_ch := sync.channel<RequestJob>(qcap)
+    done_ch := sync.channel<ResponseJob>(qcap)
+    work_tx := work_ch.0
+    work_rx := work_ch.1
+    done_tx := done_ch.0
+    done_rx := done_ch.1
+    mut res: Result<(), sys.IoError> = .Ok
+    task scope pool(worker_count) {
+        mut ids: []TaskID<()> = []
+        for _ in 0..worker_count {
+            ctx := WorkerContext<H> {
+                work_rx: work_rx.clone_receiver(),
+                done_tx: done_tx.clone_sender(),
+                handler: handler.clone(),
+            }
+            ids.push(spawn pool http_worker<H>(move ctx))
+        }
+        res = serve_channel(&listener, &config, &cancel, &work_tx, &done_rx)
+        work_tx.close()
+        done_rx.close()
+        for i in 0..ids.len { await! pool(ids[i]) }
+    }
+    res
 }
