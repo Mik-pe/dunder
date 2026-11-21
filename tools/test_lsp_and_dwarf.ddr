@@ -1,0 +1,533 @@
+capability process, filesystem, stdio
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.process as process
+import std.text as text
+import sys
+
+fn write_all_stdin(pin: &mut process.ChildStdin, data: &[]u8) -> bool {
+    mut off := 0
+    while off < data.len {
+        slice := &data[off..data.len]
+        res := pin.write(&slice)
+        if res.is_err() { return false }
+        wrote := res.unwrap()
+        if wrote <= 0 { return false }
+        off += wrote
+    }
+    true
+}
+
+fn send_lsp_msg(pin: &mut process.ChildStdin, json_body: string) -> bool {
+    mut body_bytes: []u8 = []
+    bytes.append_utf8(&mut body_bytes, json_body)
+    hdr := "Content-Length: " + body_bytes.len.str() + "\r\n\r\n"
+    mut frame: []u8 = []
+    bytes.append_utf8(&mut frame, hdr)
+    bytes.extend(&mut frame, &body_bytes)
+    write_all_stdin(&mut pin, &frame)
+}
+
+fn find_hdr_end(buf: &[]u8) -> i32 {
+    mut i := 0
+    while i + 3 < buf.len {
+        if buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn parse_len(hdr: string) -> i32 {
+    lines := harness.lines(hdr)
+    for line in &lines {
+        if text.starts_with(line, "Content-Length:") || text.starts_with(line, "content-length:") {
+            val := text.trim(line[15..line.len])
+            parsed := parse.integer(val)
+            if parsed.ok { return i32(parsed.value) }
+        }
+    }
+    -1
+}
+
+fn drop_front(rx: &mut []u8, count: i32) {
+    if count >= rx.len {
+        rx.clear()
+        return
+    }
+    mut rest: []u8 = []
+    rest.reserve(rx.len - count)
+    for i in count..rx.len { rest.push(rx[i]) }
+    rx = move rest
+}
+
+fn read_lsp_msg(pout: &mut process.ChildStdout, rx: &mut []u8) -> string {
+    while true {
+        hdr_end := find_hdr_end(&rx)
+        if hdr_end < 0 {
+            rd := pout.read(&mut rx, 4096)
+            if rd.is_err() || rd.unwrap() <= 0 { return "" }
+            continue
+        }
+        hdr := bytes.decode_range(&rx, 0, hdr_end).value
+        clen := parse_len(hdr)
+        if clen < 0 { return "" }
+        body_start := hdr_end + 4
+        needed := body_start + clen
+        while rx.len < needed {
+            rd := pout.read(&mut rx, 4096)
+            if rd.is_err() || rd.unwrap() <= 0 { return "" }
+        }
+        body := bytes.decode_range(&rx, body_start, needed).value
+        drop_front(&mut rx, needed)
+        return body
+    }
+    ""
+}
+
+fn read_until_id(pout: &mut process.ChildStdout, rx: &mut []u8, wanted_id: i64) -> json.Doc {
+    for _ in 0..32 {
+        body := read_lsp_msg(&mut pout, &mut rx)
+        if body == "" { break }
+        doc := json.Doc::parse_text(body)
+        if !doc.ok { continue }
+        id_val := doc.get_i64(doc.root, "id")
+        if id_val.ok && id_val.value == wanted_id { return doc }
+    }
+    json.Doc::parse_text("")
+}
+
+fn read_until_diag(pout: &mut process.ChildStdout, rx: &mut []u8, wanted_uri: string) -> json.Doc {
+    for _ in 0..32 {
+        body := read_lsp_msg(&mut pout, &mut rx)
+        if body == "" { break }
+        doc := json.Doc::parse_text(body)
+        if !doc.ok { continue }
+        m := doc.get_str(doc.root, "method")
+        if m.ok && m.value == "textDocument/publishDiagnostics" {
+            params := doc.field(doc.root, "params")
+            uri := doc.get_str(params, "uri")
+            if uri.ok && uri.value == wanted_uri { return doc }
+        }
+    }
+    json.Doc::parse_text("")
+}
+
+fn run_unit_tests(compiler: string, root: string, work: string) -> bool {
+    targets: []string = [
+        root + "/selfhost/backend/dwarf.ddr",
+        root + "/selfhost/backend/elf.ddr",
+        root + "/selfhost/driver/lsp.ddr",
+    ]
+    for idx in 0..targets.len {
+        mut out := harness.empty_output()
+        out_dir := work + "/unit-" + idx.str()
+        if !harness.run_checked(compiler, ["test", targets[idx].clone(), "-o", out_dir], root, 0, false, &mut out) {
+            return false
+        }
+    }
+    true
+}
+
+fn run_lsp_e2e(compiler: string, work: string) -> bool {
+    ws := work + "/lsp_ws"
+    if !fs.mkdir_all(ws).ok { return harness.fail("mkdir_all failed for lsp_ws") }
+    util_path := ws + "/util.ddr"
+    main_path := ws + "/main.ddr"
+    fmt_path := ws + "/format.ddr"
+
+    util_src := "pub fn add_one(x: i32) -> i32 {\n    x + 1\n}\n"
+    main_src := "import util\n\n" +
+        "struct Pair {\n" +
+        "    left: i32,\n" +
+        "    right: i32,\n" +
+        "}\n\n" +
+        "fn compute(v: i32) -> i32 {\n" +
+        "    total := util.add_one(v)\n" +
+        "    total\n" +
+        "}\n\n" +
+        "fn main() {\n" +
+        "    p := Pair { left: 1, right: 2 }\n" +
+        "    val := compute(p.left)\n" +
+        "    print(val)\n" +
+        "}\n"
+    fmt_src := "fn   messy(a : i32 )->i32{\nreturn   a+1\n}\n"
+
+    if !sys.write_text(util_path, util_src).ok || !sys.write_text(main_path, main_src).ok || !sys.write_text(fmt_path, fmt_src).ok {
+        return harness.fail("failed to write lsp fixture files")
+    }
+
+    rp_ws := fs.realpath(ws)
+    rp_util := fs.realpath(util_path)
+    rp_main := fs.realpath(main_path)
+    rp_fmt := fs.realpath(fmt_path)
+    ws_uri := "file://" + (if rp_ws.ok { rp_ws.value } else { ws.clone() })
+    util_uri := "file://" + (if rp_util.ok { rp_util.value } else { util_path.clone() })
+    main_uri := "file://" + (if rp_main.ok { rp_main.value } else { main_path.clone() })
+    fmt_uri := "file://" + (if rp_fmt.ok { rp_fmt.value } else { fmt_path.clone() })
+
+    mut cmd := process.Command::new(compiler.clone(), ["lsp", "--stdio"])
+    cmd.set_stdio(.Pipe, .Pipe, .Pipe)
+    spawned := cmd.spawn()
+    if spawned.is_err() { return harness.fail("failed to spawn dunder lsp") }
+    mut child := spawned.unwrap()
+    pin_res := child.take_stdin()
+    pout_res := child.take_stdout()
+    if pin_res.is_err() || pout_res.is_err() {
+        _ := child.kill()
+        return harness.fail("failed to take lsp pipes")
+    }
+    mut pin := pin_res.unwrap()
+    mut pout := pout_res.unwrap()
+    mut rx: []u8 = []
+
+    // 1. initialize
+    mut w1 := json.Writer::new()
+    w1.object()
+    w1.key("jsonrpc"); w1.string("2.0")
+    w1.key("id"); w1.integer(1)
+    w1.key("method"); w1.string("initialize")
+    w1.key("params"); w1.object()
+    w1.key("processId"); w1.null()
+    w1.key("rootUri"); w1.string(ws_uri)
+    w1.key("capabilities"); w1.object(); w1.end()
+    w1.end(); w1.end()
+    if !send_lsp_msg(&mut pin, w1.finish().value) { _ := child.kill(); return harness.fail("send initialize") }
+
+    init_doc := read_until_id(&mut pout, &mut rx, 1)
+    if !init_doc.ok { _ := child.kill(); return harness.fail("invalid initialize response") }
+    init_res := init_doc.field(init_doc.root, "result")
+    caps := init_doc.field(init_res, "capabilities")
+    if !init_doc.get_bool(caps, "hoverProvider").value ||
+       !init_doc.get_bool(caps, "definitionProvider").value ||
+       !init_doc.get_bool(caps, "documentSymbolProvider").value ||
+       !init_doc.get_bool(caps, "documentFormattingProvider").value ||
+       init_doc.kind(init_doc.field(caps, "completionProvider")) != .Object {
+        _ := child.kill()
+        return harness.fail("missing expected LSP server capabilities")
+    }
+
+    // 2. initialized
+    if !send_lsp_msg(&mut pin, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}") {
+        _ := child.kill(); return harness.fail("send initialized")
+    }
+
+    // 3. didOpen main.ddr -> 0 diagnostics
+    mut w_open := json.Writer::new()
+    w_open.object()
+    w_open.key("jsonrpc"); w_open.string("2.0")
+    w_open.key("method"); w_open.string("textDocument/didOpen")
+    w_open.key("params"); w_open.object()
+    w_open.key("textDocument"); w_open.object()
+    w_open.key("uri"); w_open.string(main_uri)
+    w_open.key("languageId"); w_open.string("dunder")
+    w_open.key("version"); w_open.integer(1)
+    w_open.key("text"); w_open.string(main_src)
+    w_open.end(); w_open.end(); w_open.end()
+    if !send_lsp_msg(&mut pin, w_open.finish().value) { _ := child.kill(); return harness.fail("send didOpen") }
+
+    diag1 := read_until_diag(&mut pout, &mut rx, main_uri)
+    if !diag1.ok { _ := child.kill(); return harness.fail("missing publishDiagnostics after didOpen") }
+    diag1_arr := diag1.field(diag1.field(diag1.root, "params"), "diagnostics")
+    if diag1.count(diag1_arr) != 0 {
+        _ := child.kill()
+        return harness.fail("expected 0 diagnostics on valid main.ddr, got: " + diag1.raw_json(diag1_arr))
+    }
+
+    // 4. hover on local variable 'total' (line 9, char 5)
+    mut w_hov := json.Writer::new()
+    w_hov.object()
+    w_hov.key("jsonrpc"); w_hov.string("2.0")
+    w_hov.key("id"); w_hov.integer(2)
+    w_hov.key("method"); w_hov.string("textDocument/hover")
+    w_hov.key("params"); w_hov.object()
+    w_hov.key("textDocument"); w_hov.object(); w_hov.key("uri"); w_hov.string(main_uri); w_hov.end()
+    w_hov.key("position"); w_hov.object(); w_hov.key("line"); w_hov.integer(9); w_hov.key("character"); w_hov.integer(5); w_hov.end()
+    w_hov.end(); w_hov.end()
+    if !send_lsp_msg(&mut pin, w_hov.finish().value) { _ := child.kill(); return harness.fail("send hover local") }
+    hov1 := read_until_id(&mut pout, &mut rx, 2)
+    hov1_val := hov1.get_str(hov1.field(hov1.field(hov1.root, "result"), "contents"), "value")
+    if !hov1_val.ok || !text.contains(hov1_val.value, "i32") {
+        _ := child.kill(); return harness.fail("hover on total missing i32 type: " + hov1_val.value)
+    }
+
+    // 5. hover on function call 'compute' (line 14, char 12)
+    mut w_hov2 := json.Writer::new()
+    w_hov2.object()
+    w_hov2.key("jsonrpc"); w_hov2.string("2.0")
+    w_hov2.key("id"); w_hov2.integer(3)
+    w_hov2.key("method"); w_hov2.string("textDocument/hover")
+    w_hov2.key("params"); w_hov2.object()
+    w_hov2.key("textDocument"); w_hov2.object(); w_hov2.key("uri"); w_hov2.string(main_uri); w_hov2.end()
+    w_hov2.key("position"); w_hov2.object(); w_hov2.key("line"); w_hov2.integer(14); w_hov2.key("character"); w_hov2.integer(12); w_hov2.end()
+    w_hov2.end(); w_hov2.end()
+    if !send_lsp_msg(&mut pin, w_hov2.finish().value) { _ := child.kill(); return harness.fail("send hover fn") }
+    hov2 := read_until_id(&mut pout, &mut rx, 3)
+    hov2_val := hov2.get_str(hov2.field(hov2.field(hov2.root, "result"), "contents"), "value")
+    if !hov2_val.ok || !text.contains(hov2_val.value, "compute") {
+        _ := child.kill(); return harness.fail("hover on compute missing fn signature")
+    }
+
+    // 6. definition on 'compute' (line 14, char 12) -> line 7 in main.ddr
+    mut w_def1 := json.Writer::new()
+    w_def1.object()
+    w_def1.key("jsonrpc"); w_def1.string("2.0")
+    w_def1.key("id"); w_def1.integer(4)
+    w_def1.key("method"); w_def1.string("textDocument/definition")
+    w_def1.key("params"); w_def1.object()
+    w_def1.key("textDocument"); w_def1.object(); w_def1.key("uri"); w_def1.string(main_uri); w_def1.end()
+    w_def1.key("position"); w_def1.object(); w_def1.key("line"); w_def1.integer(14); w_def1.key("character"); w_def1.integer(12); w_def1.end()
+    w_def1.end(); w_def1.end()
+    if !send_lsp_msg(&mut pin, w_def1.finish().value) { _ := child.kill(); return harness.fail("send def compute") }
+    def1 := read_until_id(&mut pout, &mut rx, 4)
+    def1_res := def1.field(def1.root, "result")
+    def1_line := def1.get_i64(def1.field(def1.field(def1_res, "range"), "start"), "line")
+    if def1.get_str(def1_res, "uri").value != main_uri || !def1_line.ok || def1_line.value != 7 {
+        _ := child.kill(); return harness.fail("definition for compute failed: " + def1.raw_json(def1_res))
+    }
+
+    // 7. cross-file definition on 'add_one' in 'util.add_one(v)' (line 8, char 19) -> util.ddr line 0
+    mut w_def2 := json.Writer::new()
+    w_def2.object()
+    w_def2.key("jsonrpc"); w_def2.string("2.0")
+    w_def2.key("id"); w_def2.integer(5)
+    w_def2.key("method"); w_def2.string("textDocument/definition")
+    w_def2.key("params"); w_def2.object()
+    w_def2.key("textDocument"); w_def2.object(); w_def2.key("uri"); w_def2.string(main_uri); w_def2.end()
+    w_def2.key("position"); w_def2.object(); w_def2.key("line"); w_def2.integer(8); w_def2.key("character"); w_def2.integer(19); w_def2.end()
+    w_def2.end(); w_def2.end()
+    if !send_lsp_msg(&mut pin, w_def2.finish().value) { _ := child.kill(); return harness.fail("send def add_one") }
+    def2 := read_until_id(&mut pout, &mut rx, 5)
+    def2_res := def2.field(def2.root, "result")
+    if def2.get_str(def2_res, "uri").value != util_uri {
+        _ := child.kill(); return harness.fail("cross-file definition for add_one failed: " + def2.raw_json(def2_res))
+    }
+
+    // 8. documentSymbol
+    mut w_sym := json.Writer::new()
+    w_sym.object()
+    w_sym.key("jsonrpc"); w_sym.string("2.0")
+    w_sym.key("id"); w_sym.integer(6)
+    w_sym.key("method"); w_sym.string("textDocument/documentSymbol")
+    w_sym.key("params"); w_sym.object()
+    w_sym.key("textDocument"); w_sym.object(); w_sym.key("uri"); w_sym.string(main_uri); w_sym.end()
+    w_sym.end(); w_sym.end()
+    if !send_lsp_msg(&mut pin, w_sym.finish().value) { _ := child.kill(); return harness.fail("send documentSymbol") }
+    sym_doc := read_until_id(&mut pout, &mut rx, 6)
+    sym_arr := sym_doc.field(sym_doc.root, "result")
+    sym_raw := sym_doc.raw_json(sym_arr)
+    if sym_doc.count(sym_arr) < 3 || !text.contains(sym_raw, "\"Pair\"") || !text.contains(sym_raw, "\"compute\"") || !text.contains(sym_raw, "\"main\"") {
+        _ := child.kill(); return harness.fail("documentSymbol missing expected symbols: " + sym_raw)
+    }
+
+    // 9. completion (prefix "comp" at line 14, char 15)
+    mut w_cmp := json.Writer::new()
+    w_cmp.object()
+    w_cmp.key("jsonrpc"); w_cmp.string("2.0")
+    w_cmp.key("id"); w_cmp.integer(7)
+    w_cmp.key("method"); w_cmp.string("textDocument/completion")
+    w_cmp.key("params"); w_cmp.object()
+    w_cmp.key("textDocument"); w_cmp.object(); w_cmp.key("uri"); w_cmp.string(main_uri); w_cmp.end()
+    w_cmp.key("position"); w_cmp.object(); w_cmp.key("line"); w_cmp.integer(14); w_cmp.key("character"); w_cmp.integer(15); w_cmp.end()
+    w_cmp.end(); w_cmp.end()
+    if !send_lsp_msg(&mut pin, w_cmp.finish().value) { _ := child.kill(); return harness.fail("send completion") }
+    cmp_doc := read_until_id(&mut pout, &mut rx, 7)
+    cmp_items := cmp_doc.field(cmp_doc.field(cmp_doc.root, "result"), "items")
+    if !text.contains(cmp_doc.raw_json(cmp_items), "\"compute\"") {
+        _ := child.kill(); return harness.fail("completion missing 'compute'")
+    }
+
+    // 10. formatting on messy format.ddr
+    mut w_open_fmt := json.Writer::new()
+    w_open_fmt.object()
+    w_open_fmt.key("jsonrpc"); w_open_fmt.string("2.0")
+    w_open_fmt.key("method"); w_open_fmt.string("textDocument/didOpen")
+    w_open_fmt.key("params"); w_open_fmt.object()
+    w_open_fmt.key("textDocument"); w_open_fmt.object()
+    w_open_fmt.key("uri"); w_open_fmt.string(fmt_uri)
+    w_open_fmt.key("languageId"); w_open_fmt.string("dunder")
+    w_open_fmt.key("version"); w_open_fmt.integer(1)
+    w_open_fmt.key("text"); w_open_fmt.string(fmt_src)
+    w_open_fmt.end(); w_open_fmt.end(); w_open_fmt.end()
+    if !send_lsp_msg(&mut pin, w_open_fmt.finish().value) { _ := child.kill(); return harness.fail("send didOpen fmt") }
+    _ := read_until_diag(&mut pout, &mut rx, fmt_uri)
+
+    mut w_fmt := json.Writer::new()
+    w_fmt.object()
+    w_fmt.key("jsonrpc"); w_fmt.string("2.0")
+    w_fmt.key("id"); w_fmt.integer(8)
+    w_fmt.key("method"); w_fmt.string("textDocument/formatting")
+    w_fmt.key("params"); w_fmt.object()
+    w_fmt.key("textDocument"); w_fmt.object(); w_fmt.key("uri"); w_fmt.string(fmt_uri); w_fmt.end()
+    w_fmt.key("options"); w_fmt.object(); w_fmt.key("tabSize"); w_fmt.integer(4); w_fmt.key("insertSpaces"); w_fmt.boolean(true); w_fmt.end()
+    w_fmt.end(); w_fmt.end()
+    if !send_lsp_msg(&mut pin, w_fmt.finish().value) { _ := child.kill(); return harness.fail("send formatting") }
+    fmt_doc := read_until_id(&mut pout, &mut rx, 8)
+    fmt_res := fmt_doc.field(fmt_doc.root, "result")
+    if fmt_doc.count(fmt_res) == 0 || !text.contains(fmt_doc.get_str(fmt_doc.at(fmt_res, 0), "newText").value, "fn messy(a: i32) -> i32") {
+        _ := child.kill(); return harness.fail("formatting did not return expected edit: " + fmt_doc.raw_json(fmt_res))
+    }
+
+    // 11. didChange error -> publishDiagnostics reports Error
+    mut w_bad := json.Writer::new()
+    w_bad.object()
+    w_bad.key("jsonrpc"); w_bad.string("2.0")
+    w_bad.key("method"); w_bad.string("textDocument/didChange")
+    w_bad.key("params"); w_bad.object()
+    w_bad.key("textDocument"); w_bad.object(); w_bad.key("uri"); w_bad.string(main_uri); w_bad.key("version"); w_bad.integer(2); w_bad.end()
+    w_bad.key("contentChanges"); w_bad.array()
+    w_bad.object(); w_bad.key("text"); w_bad.string("fn main() { x: i32 = true }"); w_bad.end()
+    w_bad.end(); w_bad.end(); w_bad.end()
+    if !send_lsp_msg(&mut pin, w_bad.finish().value) { _ := child.kill(); return harness.fail("send bad didChange") }
+    diag2 := read_until_diag(&mut pout, &mut rx, main_uri)
+    diag2_arr := diag2.field(diag2.field(diag2.root, "params"), "diagnostics")
+    if diag2.count(diag2_arr) == 0 || diag2.get_i64(diag2.at(diag2_arr, 0), "severity").value != 1 {
+        _ := child.kill(); return harness.fail("expected error diagnostic after bad didChange")
+    }
+
+    // 12. didChange fix -> publishDiagnostics clears to 0
+    mut w_fix := json.Writer::new()
+    w_fix.object()
+    w_fix.key("jsonrpc"); w_fix.string("2.0")
+    w_fix.key("method"); w_fix.string("textDocument/didChange")
+    w_fix.key("params"); w_fix.object()
+    w_fix.key("textDocument"); w_fix.object(); w_fix.key("uri"); w_fix.string(main_uri); w_fix.key("version"); w_fix.integer(3); w_fix.end()
+    w_fix.key("contentChanges"); w_fix.array()
+    w_fix.object(); w_fix.key("text"); w_fix.string(main_src); w_fix.end()
+    w_fix.end(); w_fix.end(); w_fix.end()
+    if !send_lsp_msg(&mut pin, w_fix.finish().value) { _ := child.kill(); return harness.fail("send fix didChange") }
+    diag3 := read_until_diag(&mut pout, &mut rx, main_uri)
+    diag3_arr := diag3.field(diag3.field(diag3.root, "params"), "diagnostics")
+    if diag3.count(diag3_arr) != 0 {
+        _ := child.kill(); return harness.fail("expected diagnostics cleared after fix")
+    }
+
+    // 13. didClose
+    _ := send_lsp_msg(&mut pin, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"" + main_uri + "\"}}}")
+
+    // 14. shutdown + exit
+    if !send_lsp_msg(&mut pin, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\",\"params\":null}") {
+        _ := child.kill(); return harness.fail("send shutdown")
+    }
+    sh_doc := read_until_id(&mut pout, &mut rx, 9)
+    if !sh_doc.ok || sh_doc.kind(sh_doc.field(sh_doc.root, "result")) != .Null {
+        _ := child.kill(); return harness.fail("invalid shutdown response")
+    }
+    _ := send_lsp_msg(&mut pin, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}")
+    _ := pin.close()
+    _ := pout.close()
+
+    wait := child.wait(10000)
+    if !wait.ok || !wait.exited || wait.code != 0 {
+        return harness.fail("dunder lsp exited " + wait.code.str() + ", expected 0")
+    }
+    true
+}
+
+fn verify_dwarfdump(bin_path: string, work: string, expected_file: string, fn_a: string, fn_b: string) -> bool {
+    if !sys.metadata("/usr/bin/dwarfdump").is_file { return true }
+    mut ver := harness.empty_output()
+    if !harness.run_checked("/usr/bin/dwarfdump", ["--verify", bin_path.clone()], work, 0, false, &mut ver) {
+        return false
+    }
+    mut dump := harness.empty_output()
+    if !harness.run_checked("/usr/bin/dwarfdump", ["--debug-info", "--debug-line", bin_path.clone()], work, 0, false, &mut dump) {
+        return false
+    }
+    txt := dump.stdout_text()
+    if !text.contains(txt, "DW_TAG_compile_unit") || !text.contains(txt, "DW_TAG_subprogram") ||
+       !text.contains(txt, fn_a) || !text.contains(txt, fn_b) || !text.contains(txt, expected_file) {
+        return harness.fail("dwarfdump missing expected tags/symbols for " + expected_file + "\n" + txt)
+    }
+    true
+}
+
+fn run_dwarf_tests(compiler: string, work: string) -> bool {
+    src_a := work + "/prog_a.ddr"
+    src_b := work + "/prog_b.ddr"
+    code_a := "fn helper(x: i32) -> i32 {\n    y := x + 1\n    y * 2\n}\nfn main() -> i32 {\n    res := helper(20)\n    if res == 42 { 0 } else { 1 }\n}\n"
+    code_b := "fn greet_value(n: i32) -> i32 {\n    n + 7\n}\nfn main() {\n    v := greet_value(35)\n    print(v)\n}\n"
+    if !sys.write_text(src_a, code_a).ok || !sys.write_text(src_b, code_b).ok {
+        return harness.fail("failed writing debug test sources")
+    }
+
+    mut out := harness.empty_output()
+    // Reject -g on wasm32 and check
+    bad_wasm := harness.exec_cmd(compiler, ["build", src_a.clone(), "-g", "--target", "wasm32", "-o", work + "/bad.wasm"], work, false, 30000)
+    if bad_wasm.code == 0 { return harness.fail("expected -g on wasm32 to fail") }
+    bad_chk := harness.exec_cmd(compiler, ["check", src_a.clone(), "-g"], work, false, 30000)
+    if bad_chk.code == 0 { return harness.fail("expected -g on check to fail") }
+
+    if process.host_target() == "arm64-macos" {
+        bin_a := work + "/bin_a_macos"
+        bin_b := work + "/bin_b_macos"
+        if !harness.run_checked(compiler, ["build", src_a.clone(), "-g", "-o", bin_a.clone()], work, 0, false, &mut out) { return false }
+        if !harness.run_checked(compiler, ["build", src_b.clone(), "--debug", "-o", bin_b.clone()], work, 0, false, &mut out) { return false }
+        if !harness.run_checked(bin_a, [], work, 0, false, &mut out) { return false }
+        if !harness.run_checked(bin_b, [], work, 0, false, &mut out) { return false }
+        if text.trim(out.stdout_text()) != "42" {
+            return harness.fail("unexpected stdout from macOS -g binary: " + out.stdout_text())
+        }
+        if !verify_dwarfdump(bin_a, work, "prog_a.ddr", "helper", "main") { return false }
+        if !verify_dwarfdump(bin_b, work, "prog_b.ddr", "greet_value", "main") { return false }
+
+        if sys.metadata("/usr/bin/nm").is_file {
+            mut nm_a := harness.empty_output()
+            if !harness.run_checked("/usr/bin/nm", [bin_a.clone()], work, 0, false, &mut nm_a) { return false }
+            if !text.contains(nm_a.stdout_text(), "_helper") || !text.contains(nm_a.stdout_text(), "_main") {
+                return harness.fail("nm missing symbols on bin_a: " + nm_a.stdout_text())
+            }
+            mut nm_b := harness.empty_output()
+            if !harness.run_checked("/usr/bin/nm", [bin_b.clone()], work, 0, false, &mut nm_b) { return false }
+            if !text.contains(nm_b.stdout_text(), "_greet_value") || !text.contains(nm_b.stdout_text(), "_main") {
+                return harness.fail("nm missing symbols on bin_b: " + nm_b.stdout_text())
+            }
+        }
+    }
+
+    elf_targets: []string = ["arm64-linux", "x86_64-linux"]
+    for t in &elf_targets {
+        elf_a := work + "/elf_a_" + t
+        elf_b := work + "/elf_b_" + t
+        if !harness.run_checked(compiler, ["build", src_a.clone(), "-g", "--target", t.clone(), "-o", elf_a.clone()], work, 0, false, &mut out) { return false }
+        if !harness.run_checked(compiler, ["build", src_b.clone(), "--debug", "--target", t.clone(), "-o", elf_b.clone()], work, 0, false, &mut out) { return false }
+        raw_a := sys.read_u8(elf_a)
+        raw_b := sys.read_u8(elf_b)
+        if !raw_a.ok || !raw_b.ok || raw_a.value.len < 64 || raw_b.value.len < 64 {
+            return harness.fail("failed reading ELF output")
+        }
+        if bytes.u16_le(&raw_a.value, 58) != 64 || bytes.u16_le(&raw_a.value, 60) != 9 || bytes.u16_le(&raw_a.value, 62) != 8 {
+            return harness.fail("unexpected ELF section headers on elf_a for " + t)
+        }
+        if bytes.u16_le(&raw_b.value, 58) != 64 || bytes.u16_le(&raw_b.value, 60) != 9 || bytes.u16_le(&raw_b.value, 62) != 8 {
+            return harness.fail("unexpected ELF section headers on elf_b for " + t)
+        }
+        if !verify_dwarfdump(elf_a, work, "prog_a.ddr", "helper", "main") { return false }
+        if !verify_dwarfdump(elf_b, work, "prog_b.ddr", "greet_value", "main") { return false }
+    }
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if cli.extra_args.len > 0 { _ := sys.eprint("unexpected argument: " + cli.extra_args[0]); return 2 }
+
+    tmp := fs.temp_dir("dunder-lsp-dwarf-")
+    if !tmp.ok { _ := sys.eprint("temp_dir failed"); return 1 }
+    work := tmp.value
+
+    mut ok := run_unit_tests(cli.compiler, cli.root, work)
+    if ok { ok = run_lsp_e2e(cli.compiler, work) }
+    if ok { ok = run_dwarf_tests(cli.compiler, work) }
+
+    _ := fs.remove_all(work)
+    if !ok { return 1 }
+    print("PASS lsp and dwarf: unit, LSP stdio E2E, Mach-O and ELF64 -g verified")
+    0
+}
