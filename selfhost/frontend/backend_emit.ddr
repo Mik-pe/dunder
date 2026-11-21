@@ -1,0 +1,437 @@
+import ..backend.arm64 as raw_arm
+import ..runtime.runtime
+import code_sink as arm
+import frontend_types as ft
+
+fn is_collection(types: &ft.TypeRegistry, ty: i32) -> bool {
+    ft.collection(&types, ty)
+}
+
+fn is_boxed(boxed_signatures: &[]bool, ty: i32) -> bool {
+    ty >= 0 && ty < boxed_signatures.len && boxed_signatures[ty]
+}
+
+fn is_owned(types: &ft.TypeRegistry, boxed_signatures: &[]bool, ty: i32) -> bool {
+    ft.owned(&types, ty) || is_boxed(&boxed_signatures, ty)
+}
+
+fn helper_label(types: &ft.TypeRegistry, helper_labels: &[]i32, array_helpers: i32, ty: i32, drop: bool) -> i32 {
+    mut label := array_helpers
+    if ty < helper_labels.len { label = helper_labels[ty] }
+    else {
+        assert(is_collection(&types, ty))
+        if ft.type_base(&types, ty) == 4 { label = label + 2 }
+    }
+    if drop { return label + 1 }
+    label
+}
+
+fn emit_copy_value(code: &mut raw_arm.Code, types: &ft.TypeRegistry, rt: &runtime.Runtime,
+    boxed_signatures: &[]bool, helper_labels: &[]i32, array_helpers: i32, ty: i32) {
+    if ty == 4 || is_boxed(&boxed_signatures, ty) || (ft.type_kind(&types, ty) == 7 && !ft.move_only(&types, ty)) {
+        arm.ownership_call(&mut code, rt.retain, .Copy, ty, 0)
+    } else if is_owned(&types, &boxed_signatures, ty) {
+        label := helper_label(&types, &helper_labels, array_helpers, ty, false)
+        arm.ownership_call(&mut code, label, .Copy, ty, 0)
+    }
+}
+
+fn emit_drop_value(code: &mut raw_arm.Code, types: &ft.TypeRegistry, rt: &runtime.Runtime,
+    boxed_signatures: &[]bool, helper_labels: &[]i32, array_helpers: i32, closure_drop: i32, ty: i32) {
+    mut target := -1
+    if is_boxed(&boxed_signatures, ty) { target = closure_drop }
+    else if ty == 4 { target = rt.release }
+    else if is_owned(&types, &boxed_signatures, ty) {
+        target = helper_label(&types, &helper_labels, array_helpers, ty, true)
+    }
+    if target >= 0 { arm.ownership_call(&mut code, target, .Drop, ty, 0) }
+}
+
+pub fn unwrap_collection_base(types: &ft.TypeRegistry, ty_in: i32) -> i32 {
+    mut ty := ty_in
+    while is_collection(&types, ty) { ty = ft.type_base(&types, ty) }
+    ty
+}
+
+pub fn enqueue_nominal_member(types: &ft.TypeRegistry, helper_labels: &[]i32, boxed_signatures: &[]bool,
+    ty_in: i32, for_clone: bool, needed: &mut []bool, work: &mut []i32) {
+    ty := unwrap_collection_base(&types, ty_in)
+    if ty < 0 || ty >= helper_labels.len || helper_labels[ty] < 0 { return }
+    if !ft.owned(&types, ty) || ty == 4 || is_collection(&types, ty) || is_boxed(&boxed_signatures, ty) { return }
+    if for_clone && ft.type_kind(&types, ty) == 7 && !ft.move_only(&types, ty) { return }
+    if !needed[ty] { needed[ty] = true; work.push(ty) }
+}
+
+pub fn propagate_nominal_helpers(types: &ft.TypeRegistry, helper_labels: &[]i32, boxed_signatures: &[]bool,
+    for_clone: bool, needed: &mut []bool, work: &mut []i32) {
+    while work.len > 0 {
+        ty := work.pop()
+        if for_clone && ft.type_kind(&types, ty) == 7 && !ft.move_only(&types, ty) { continue }
+        if types.c_record[ty] { continue }
+        first := types.declared.type_starts[ty]
+        count := types.declared.type_counts[ty]
+        if ft.type_kind(&types, ty) == 7 {
+            for v in first..first + count {
+                ps := types.payload_starts[v]; pc := types.payload_counts[v]
+                for i in 0..pc {
+                    enqueue_nominal_member(&types, &helper_labels, &boxed_signatures, types.payload_types[ps + i], for_clone, &mut needed, &mut work)
+                }
+            }
+        } else {
+            for i in 0..count {
+                enqueue_nominal_member(&types, &helper_labels, &boxed_signatures, types.field_types[first + i], for_clone, &mut needed, &mut work)
+            }
+        }
+    }
+}
+
+pub fn nominal_clones(code: &mut raw_arm.Code, types: &ft.TypeRegistry, rt: &runtime.Runtime,
+    boxed_signatures: &[]bool, helper_labels: &[]i32, array_helpers: i32, closure_drop: i32,
+    needed_fns: &[]bool, fn_labels: &[]i32) {
+    mut max_label := -1
+    for ty in 0..helper_labels.len {
+        if ft.owned(&types, ty) && ty != 4 && !is_collection(&types, ty) && helper_labels[ty] >= 0 {
+            end := helper_labels[ty] + 1
+            if end > max_label { max_label = end }
+        }
+    }
+    mut label_kind: []i32 = []
+    if max_label >= 0 {
+        label_kind.reserve(max_label + 1)
+        for _ in 0..max_label + 1 { label_kind.push(-1) }
+        for ty in 0..helper_labels.len {
+            if ft.owned(&types, ty) && ty != 4 && !is_collection(&types, ty) && helper_labels[ty] >= 0 {
+                h := helper_labels[ty]
+                label_kind[h] = ty * 2
+                label_kind[h + 1] = ty * 2 + 1
+            }
+        }
+    }
+    n_types := types.type_names.len
+    mut clone_needed: []bool = []; mut drop_needed: []bool = []
+    clone_needed.reserve(n_types); drop_needed.reserve(n_types)
+    for _ in 0..n_types { clone_needed.push(false); drop_needed.push(false) }
+    mut clone_work: []i32 = []; mut drop_work: []i32 = []
+    for target in &code.target {
+        if target >= 0 && target < label_kind.len {
+            enc := label_kind[target]
+            if enc >= 0 {
+                ty := enc / 2
+                if enc % 2 == 0 { if !clone_needed[ty] { clone_needed[ty] = true; clone_work.push(ty) } }
+                else { if !drop_needed[ty] { drop_needed[ty] = true; drop_work.push(ty) } }
+            }
+        }
+    }
+    propagate_nominal_helpers(&types, &helper_labels, &boxed_signatures, true, &mut clone_needed, &mut clone_work)
+    propagate_nominal_helpers(&types, &helper_labels, &boxed_signatures, false, &mut drop_needed, &mut drop_work)
+    for ty in 0..n_types {
+        if !ft.owned(&types, ty) || ty == 4 || is_collection(&types, ty) { continue }
+        if clone_needed[ty] {
+            arm.mark(&mut code, helper_labels[ty]); frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 2)
+            if types.c_record[ty] {
+                arm.push(&mut code, 0); arm.imm(&mut code, 0, i64(types.declared.c_sizes[ty])); arm.branch(&mut code, rt.alloc_clone, 1)
+                arm.mov(&mut code, 1, 0); arm.pop(&mut code, 0); arm.copy_inline(&mut code, types.declared.c_sizes[ty])
+            } else if types.declared.type_kinds[ty] == 7 {
+                if !ft.move_only(&types, ty) { arm.branch(&mut code, rt.retain, 1) }
+                else {
+                    arm.store(&mut code, 0, 0); cloned := arm.label(&mut code)
+                    for variant in types.declared.type_starts[ty]..types.declared.type_starts[ty] + types.declared.type_counts[ty] {
+                        next := arm.label(&mut code); arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, 0)
+                        arm.imm(&mut code, 1, types.field_values[variant]); arm.compare_register(&mut code, 0, 1); arm.branch(&mut code, next, 3)
+                        arm.imm(&mut code, 0, i64(types.payload_counts[variant] + 1) * 8); arm.branch(&mut code, rt.alloc_clone, 1); arm.store(&mut code, 1, 0)
+                        arm.imm(&mut code, 1, types.field_values[variant]); arm.store_mem(&mut code, 1, 0, 0)
+                        for i in 0..types.payload_counts[variant] {
+                            pt := types.payload_types[types.payload_starts[variant] + i]
+                            arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, (i + 1) * 8)
+                            emit_copy_value(&mut code, &types, &rt, &boxed_signatures, &helper_labels, array_helpers, pt)
+                            arm.mov(&mut code, 1, 0); arm.load(&mut code, 1); arm.store_mem(&mut code, 1, 0, (i + 1) * 8)
+                        }
+                        arm.load(&mut code, 1); arm.branch(&mut code, cloned, 0); arm.mark(&mut code, next)
+                    }
+                    arm.mark(&mut code, cloned)
+                }
+            } else {
+                arm.store(&mut code, 0, 0); arm.imm(&mut code, 0, i64(types.declared.type_counts[ty]) * 8); arm.branch(&mut code, rt.alloc_clone, 1); arm.store(&mut code, 1, 0)
+                first := types.declared.type_starts[ty]
+                for i in 0..types.declared.type_counts[ty] {
+                    arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, i * 8)
+                    emit_copy_value(&mut code, &types, &rt, &boxed_signatures, &helper_labels, array_helpers, types.field_types[first + i])
+                    arm.push(&mut code, 0); arm.load(&mut code, 1); arm.pop(&mut code, 1); arm.store_mem(&mut code, 1, 0, i * 8)
+                }
+                arm.load(&mut code, 1)
+            }
+            arm.ret(&mut code)
+        }
+        if drop_needed[ty] {
+            arm.mark(&mut code, helper_labels[ty] + 1); drop_frame := arm.prologue(&mut code); arm.frame(&mut code, drop_frame, 1)
+            done := arm.label(&mut code); arm.branch(&mut code, done, 18); arm.store(&mut code, 0, 0)
+            cleanup := ft.cleanup_method(&types, ty)
+            if cleanup >= 0 && needed_fns[cleanup] {
+                arm.address(&mut code, 0)
+                arm.branch(&mut code, fn_labels[cleanup], 1)
+            }
+            if types.declared.type_kinds[ty] == 7 {
+                shared := arm.label(&mut code)
+                arm.rt_allocation_refcount(&mut code)
+                arm.imm(&mut code, 2, 1); arm.compare_register(&mut code, 1, 2); arm.branch(&mut code, shared, 3)
+                for v in types.declared.type_starts[ty]..types.declared.type_starts[ty] + types.declared.type_counts[ty] {
+                    next := arm.label(&mut code); arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, 0)
+                    arm.imm(&mut code, 1, types.field_values[v]); arm.compare_register(&mut code, 0, 1); arm.branch(&mut code, next, 3)
+                    for i in 0..types.payload_counts[v] {
+                        pt := types.payload_types[types.payload_starts[v] + i]
+                        if is_owned(&types, &boxed_signatures, pt) {
+                            arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, (i + 1) * 8)
+                            emit_drop_value(&mut code, &types, &rt, &boxed_signatures, &helper_labels, array_helpers, closure_drop, pt)
+                        }
+                    }
+                    arm.branch(&mut code, shared, 0); arm.mark(&mut code, next)
+                }
+                arm.mark(&mut code, shared)
+            } else if !types.c_record[ty] {
+                first := types.declared.type_starts[ty]
+                for i in 0..types.declared.type_counts[ty] {
+                    field_ty := types.field_types[first + i]
+                    if is_owned(&types, &boxed_signatures, field_ty) {
+                        arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, i * 8)
+                        emit_drop_value(&mut code, &types, &rt, &boxed_signatures, &helper_labels, array_helpers, closure_drop, field_ty)
+                    }
+                }
+            }
+            arm.load(&mut code, 0); arm.branch(&mut code, rt.release, 1); arm.mark(&mut code, done); arm.ret(&mut code)
+        }
+    }
+    arm.rt_emit_array_helpers(&mut code, &rt, array_helpers)
+}
+
+pub fn emit_iso_copy(code: &mut raw_arm.Code, types: &ft.TypeRegistry, helper_labels: &[]i32, array_helpers: i32,
+    task_iso_labels: &[]i32, ty: i32) {
+    if ty < task_iso_labels.len && task_iso_labels[ty] >= 0 {
+        arm.branch(&mut code, task_iso_labels[ty], 1)
+    } else if ft.owned(&types, ty) {
+        helper := helper_label(&types, &helper_labels, array_helpers, ty, false)
+        arm.branch(&mut code, helper, 1)
+    }
+}
+
+pub fn mark_iso_work(ty: i32, labels: &[]i32, needed: &mut []bool, work: &mut []i32) {
+    if ty >= 0 && ty < labels.len && labels[ty] >= 0 && !needed[ty] {
+        needed[ty] = true; work.push(ty)
+    }
+}
+
+pub fn emit_task_isolated_helpers(code: &mut raw_arm.Code, types: &ft.TypeRegistry, rt: &runtime.Runtime,
+    helper_labels: &[]i32, array_helpers: i32,
+    task_iso_labels: &[]i32, task_shared_rc_labels: &[]i32,
+    task_shared_prepare_labels: &[]i32, task_shared_drop_labels: &[]i32) {
+    n := task_iso_labels.len
+    if n == 0 { return }
+    mut max_label := -1
+    for ty in 0..n {
+        if ty != 4 && task_iso_labels[ty] > max_label { max_label = task_iso_labels[ty] }
+        if task_shared_rc_labels[ty] > max_label { max_label = task_shared_rc_labels[ty] }
+        if task_shared_prepare_labels[ty] > max_label { max_label = task_shared_prepare_labels[ty] }
+        if task_shared_drop_labels[ty] > max_label { max_label = task_shared_drop_labels[ty] }
+    }
+    if max_label < 0 { return }
+    mut label_info: []i32 = []; label_info.reserve(max_label + 1)
+    for _ in 0..max_label + 1 { label_info.push(-1) }
+    for ty in 0..n {
+        if ty != 4 && task_iso_labels[ty] >= 0 { label_info[task_iso_labels[ty]] = ty * 4 }
+        if task_shared_rc_labels[ty] >= 0 { label_info[task_shared_rc_labels[ty]] = ty * 4 + 1 }
+        if task_shared_prepare_labels[ty] >= 0 { label_info[task_shared_prepare_labels[ty]] = ty * 4 + 2 }
+        if task_shared_drop_labels[ty] >= 0 { label_info[task_shared_drop_labels[ty]] = ty * 4 + 3 }
+    }
+    mut iso_needed: []bool = []; mut rc_needed: []bool = []; mut prep_needed: []bool = []; mut drop_needed: []bool = []
+    iso_needed.reserve(n); rc_needed.reserve(n); prep_needed.reserve(n); drop_needed.reserve(n)
+    for _ in 0..n { iso_needed.push(false); rc_needed.push(false); prep_needed.push(false); drop_needed.push(false) }
+    mut iso_work: []i32 = []; mut rc_work: []i32 = []
+    for target in &code.target {
+        if target >= 0 && target < label_info.len {
+            enc := label_info[target]
+            if enc >= 0 {
+                ty := enc / 4; kind := enc % 4
+                if kind == 0 { mark_iso_work(ty, &task_iso_labels, &mut iso_needed, &mut iso_work) }
+                else if kind == 1 { mark_iso_work(ty, &task_shared_rc_labels, &mut rc_needed, &mut rc_work) }
+                else if kind == 2 {
+                    prep_needed[ty] = true
+                    mark_iso_work(ty, &task_iso_labels, &mut iso_needed, &mut iso_work)
+                    mark_iso_work(ty, &task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+                } else {
+                    drop_needed[ty] = true
+                    mark_iso_work(ty, &task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+                }
+            }
+        }
+    }
+    while iso_work.len > 0 {
+        ty := iso_work.pop()
+        if ty == 4 { continue }
+        kind := types.declared.type_kinds[ty]
+        if kind == 1 || kind == 6 {
+            mark_iso_work(types.declared.type_bases[ty], &task_iso_labels, &mut iso_needed, &mut iso_work)
+        } else if kind == 2 {
+            first := types.declared.type_starts[ty]
+            for i in 0..types.declared.type_counts[ty] {
+                mark_iso_work(types.field_types[first + i], &task_iso_labels, &mut iso_needed, &mut iso_work)
+            }
+        } else if kind == 7 {
+            first := types.declared.type_starts[ty]
+            for v in first..first + types.declared.type_counts[ty] {
+                ps := types.payload_starts[v]
+                for i in 0..types.payload_counts[v] {
+                    mark_iso_work(types.payload_types[ps + i], &task_iso_labels, &mut iso_needed, &mut iso_work)
+                }
+            }
+        }
+    }
+    while rc_work.len > 0 {
+        ty := rc_work.pop()
+        if ty == 4 { continue }
+        kind := types.declared.type_kinds[ty]
+        if kind == 1 || kind == 6 {
+            mark_iso_work(types.declared.type_bases[ty], &task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+        } else if kind == 2 {
+            first := types.declared.type_starts[ty]
+            for i in 0..types.declared.type_counts[ty] {
+                mark_iso_work(types.field_types[first + i], &task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+            }
+        } else if kind == 7 {
+            first := types.declared.type_starts[ty]
+            for v in first..first + types.declared.type_counts[ty] {
+                ps := types.payload_starts[v]
+                for i in 0..types.payload_counts[v] {
+                    mark_iso_work(types.payload_types[ps + i], &task_shared_rc_labels, &mut rc_needed, &mut rc_work)
+                }
+            }
+        }
+    }
+    for ty in 0..n {
+        if iso_needed[ty] && ty != 4 {
+            kind := types.declared.type_kinds[ty]
+            arm.mark(&mut code, task_iso_labels[ty])
+            if kind == 1 || kind == 6 {
+                frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 1)
+                arm.store(&mut code, 0, 0)
+                elem_iso := task_iso_labels[types.declared.type_bases[ty]]
+                arm.branch(&mut code, elem_iso, 20); arm.mov(&mut code, 1, 0)
+                arm.load(&mut code, 0); arm.branch(&mut code, rt.array_isolated_clone, 1)
+                arm.ret(&mut code)
+            } else if kind == 7 {
+                frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 2)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                first := types.declared.type_starts[ty]
+                for variant in first..first + types.declared.type_counts[ty] {
+                    next := arm.label(&mut code); arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, 0)
+                    arm.imm(&mut code, 1, types.field_values[variant]); arm.compare_register(&mut code, 0, 1); arm.branch(&mut code, next, 3)
+                    arm.imm(&mut code, 0, i64(types.payload_counts[variant] + 1) * 8); arm.branch(&mut code, rt.alloc_clone, 1); arm.store(&mut code, 1, 0)
+                    arm.imm(&mut code, 1, types.field_values[variant]); arm.store_mem(&mut code, 1, 0, 0)
+                    for i in 0..types.payload_counts[variant] {
+                        pt := types.payload_types[types.payload_starts[variant] + i]
+                        arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, (i + 1) * 8)
+                        emit_iso_copy(&mut code, &types, &helper_labels, array_helpers, &task_iso_labels, pt)
+                        arm.mov(&mut code, 1, 0); arm.load(&mut code, 1); arm.store_mem(&mut code, 1, 0, (i + 1) * 8)
+                    }
+                    arm.load(&mut code, 1); arm.branch(&mut code, done, 0); arm.mark(&mut code, next)
+                }
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else {
+                frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 2)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0); arm.imm(&mut code, 0, i64(types.declared.type_counts[ty]) * 8); arm.branch(&mut code, rt.alloc_clone, 1); arm.store(&mut code, 1, 0)
+                first := types.declared.type_starts[ty]
+                for i in 0..types.declared.type_counts[ty] {
+                    arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, i * 8)
+                    emit_iso_copy(&mut code, &types, &helper_labels, array_helpers, &task_iso_labels, types.field_types[first + i])
+                    arm.push(&mut code, 0); arm.load(&mut code, 1); arm.pop(&mut code, 1); arm.store_mem(&mut code, 1, 0, i * 8)
+                }
+                arm.load(&mut code, 1); arm.mark(&mut code, done); arm.ret(&mut code)
+            }
+        }
+        if rc_needed[ty] {
+            arm.mark(&mut code, task_shared_rc_labels[ty])
+            if ty == 4 {
+                frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 0)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.emit(&mut code, 3506438144 + 8 * 1024 + 0 * 32 + 10)
+                arm.store_mem(&mut code, 1, 10, 0)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else {
+                kind := types.declared.type_kinds[ty]
+                if kind == 1 || kind == 6 {
+                    frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 4)
+                    done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                    arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+                    arm.load_mem(&mut code, 10, 0, 8); arm.store(&mut code, 3, 10)
+                    arm.store(&mut code, 2, 31)
+                    elem_rc := task_shared_rc_labels[types.declared.type_bases[ty]]
+                    head := arm.label(&mut code); arm.mark(&mut code, head)
+                    arm.load_into(&mut code, 2, 10); arm.load_into(&mut code, 3, 11)
+                    arm.compare_register(&mut code, 10, 11); arm.branch(&mut code, done, 4)
+                    arm.load(&mut code, 0); arm.load_mem(&mut code, 11, 0, 0)
+                    arm.emit(&mut code, 3544186880 + (64 - 3) * 65536 + (63 - 3) * 1024 + 10 * 32 + 12)
+                    arm.emit(&mut code, 2332033024 + 12 * 65536 + 11 * 32 + 11)
+                    arm.load_mem(&mut code, 0, 11, 0); arm.load_into(&mut code, 1, 1)
+                    arm.branch(&mut code, elem_rc, 1)
+                    arm.load_into(&mut code, 2, 10)
+                    arm.emit(&mut code, 2432696320 + 1 * 1024 + 10 * 32 + 10)
+                    arm.store(&mut code, 2, 10); arm.branch(&mut code, head, 0)
+                    arm.mark(&mut code, done); arm.ret(&mut code)
+                } else if kind == 7 {
+                    frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 2)
+                    done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                    arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+                    if !ft.move_only(&types, ty) {
+                        arm.emit(&mut code, 3506438144 + 8 * 1024 + 0 * 32 + 10)
+                        arm.store_mem(&mut code, 1, 10, 0)
+                    }
+                    first := types.declared.type_starts[ty]
+                    for v in first..first + types.declared.type_counts[ty] {
+                        next := arm.label(&mut code); arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, 0)
+                        arm.imm(&mut code, 1, types.field_values[v]); arm.compare_register(&mut code, 0, 1); arm.branch(&mut code, next, 3)
+                        for i in 0..types.payload_counts[v] {
+                            pt := types.payload_types[types.payload_starts[v] + i]
+                            if pt < n && task_shared_rc_labels[pt] >= 0 {
+                                arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, (i + 1) * 8)
+                                arm.load_into(&mut code, 1, 1); arm.branch(&mut code, task_shared_rc_labels[pt], 1)
+                            }
+                        }
+                        arm.branch(&mut code, done, 0); arm.mark(&mut code, next)
+                    }
+                    arm.mark(&mut code, done); arm.ret(&mut code)
+                } else {
+                    frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 2)
+                    done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                    arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+                    first := types.declared.type_starts[ty]
+                    for i in 0..types.declared.type_counts[ty] {
+                        ft_ty := types.field_types[first + i]
+                        if ft_ty < n && task_shared_rc_labels[ft_ty] >= 0 {
+                            arm.load(&mut code, 0); arm.load_mem(&mut code, 0, 0, i * 8)
+                            arm.load_into(&mut code, 1, 1); arm.branch(&mut code, task_shared_rc_labels[ft_ty], 1)
+                        }
+                    }
+                    arm.mark(&mut code, done); arm.ret(&mut code)
+                }
+            }
+        }
+        if prep_needed[ty] {
+            arm.mark(&mut code, task_shared_prepare_labels[ty])
+            frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 1)
+            arm.branch(&mut code, task_iso_labels[ty], 1)
+            arm.store(&mut code, 0, 0); arm.imm(&mut code, 1, 0)
+            arm.branch(&mut code, task_shared_rc_labels[ty], 1)
+            arm.load(&mut code, 0); arm.ret(&mut code)
+        }
+        if drop_needed[ty] {
+            arm.mark(&mut code, task_shared_drop_labels[ty])
+            frame := arm.prologue(&mut code); arm.frame(&mut code, frame, 1)
+            done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+            arm.store(&mut code, 0, 0); arm.imm(&mut code, 1, 1)
+            arm.branch(&mut code, task_shared_rc_labels[ty], 1)
+            drop_label := helper_label(&types, &helper_labels, array_helpers, ty, true)
+            arm.load(&mut code, 0); arm.branch(&mut code, drop_label, 1)
+            arm.mark(&mut code, done); arm.ret(&mut code)
+        }
+    }
+}

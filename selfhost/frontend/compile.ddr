@@ -2,18 +2,21 @@ import function_locals as locals
 import frontend_context as fc
 import target_cond as tc_eval
 import token_lookahead as lookahead
-import ..runtime.program_emit as rt_emit
+import backend_emit
+import const_eval
+import hir
+import ownership_check
+import resolve
+import ..runtime.runtime
+import ..runtime.runtime_intrinsic as ri
 import function_facts as facts
 import source_diagnostics as diagnostics
 import diagnostics as diag
 import place_operation as place_op
-import place_emit
 import borrows
 import local_borrows
-import borrowed_view
 import source_types
 import typed_places as places
-import source_call
 import ..driver.compile_session as cs
 import deferred_blocks as deferred
 import ..backend.ffi_abi as fa
@@ -29,12 +32,11 @@ import type_reader
 import type_syntax as syntax
 import ..driver.modules
 import match_coverage as coverage
-import ..backend.arm64 as arm
+import ..backend.arm64 as raw_arm
+import code_sink as arm
 import ..backend.backend_row as row
 import std.parse as parse
 import std.bytes as validation_bytes
-import ..runtime.runtime
-import ..runtime.runtime_intrinsic as ri
 import record_take
 import unsigned
 import ..backend.integer_emit as integers
@@ -117,7 +119,8 @@ pub opaque struct Session {
     discovering_compounds: bool, known_compounds: Map<string, i64>, demanded_compounds: Map<string, i64>,
     demanded_inferred_keys: Map<string, i64>, demanded_inferred_args: []string,
     validating_dead: bool, validated_through: i32, report: bool, bindings: Bindings,
-    wasm_abi: wa.Abi, code: arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
+    hir: hir.Program,
+    wasm_abi: wa.Abi, code: raw_arm.Code, fn_labels: []i32, needed: []bool, runtime: runtime.Runtime,
     imports: Imports,
     callback_labels: []i32, has_callbacks: bool,
     loans: scratch.Loans,
@@ -660,8 +663,8 @@ fn same(c: &mut Session, expected: i32, actual: i32) {
     }
 }
 fn field(c: &Session, ty: i32, name: string) -> i32 { ft.field(&c.types, ty, name) }
-fn load_mem(c: &mut Session, destination: i32, base: i32, offset: i32) { fa.load_mem(&mut c.code, destination, base, offset) }
-fn store_mem(c: &mut Session, source: i32, base: i32, offset: i32) { fa.store_mem(&mut c.code, source, base, offset) }
+fn load_mem(c: &mut Session, destination: i32, base: i32, offset: i32) { arm.load_mem(&mut c.code, destination, base, offset) }
+fn store_mem(c: &mut Session, source: i32, base: i32, offset: i32) { arm.store_mem(&mut c.code, source, base, offset) }
 fn save_address(c: &mut Session, id: i32, token: i32) {
     mut home := places.address(c.body.places.arena.nodes[3 * (id - 1)])
     if home < 0 {
@@ -676,7 +679,7 @@ fn place_address(c: &mut Session, id: i32, direct: bool, token: i32) {
     bound_place(&mut c, op, id, i32(borrows.Access.Address), token)
 }
 fn place_step(c: &mut Session, op: place_op.Op, ty: i32, access: i32, form: i32, parameter: i32, token: i32) {
-    place_emit.emit(&mut c.code, op, ty, access, form, parameter, c.world.tokens.starts[token])
+    arm.place_emit_op(&mut c.code, op, ty, access, form, parameter, c.world.tokens.starts[token])
 }
 fn read_shape(c: &Session, ty: i32, packed: bool) -> i32 {
     storage := storage_type(&c, ty)
@@ -810,122 +813,30 @@ fn can_take(c: &Session, ty: i32) -> bool {
     if ty == 4 || boxed_function(&c, ty) || collection(&c, ty) || ft.type_kind(&c.types, ty) == 7 || ft.is_c_record(&c.types, ty) { return true }
     ft.type_kind(&c.types, ty) == 2 && !c.code.checking && ty < c.record_take_labels.len && c.record_take_labels[ty] >= -1
 }
-fn owner_path(c: &Session, place: i32) -> i32 {
-    if place < 0 {
-        binding := borrows.root(&c.body.places, place)
-        alias := local_borrows.path(&c.body.local_loans, binding)
-        if alias >= 0 { return alias }
-        return ownership.root_id(&c.body.ownership, binding)
-    }
-    if place > 0 { return c.body.places.owners[place - 1] }
-    -1
-}
-fn source_root(c: &Session, place: i32) -> i32 {
-    binding := borrows.root(&c.body.places, place)
-    alias := local_borrows.root(&c.body.local_loans, binding)
-    if alias >= 0 || local_borrows.is_transient(&c.body.local_loans, binding) { return alias }
-    binding
-}
-fn borrow_parent(c: &Session, place: i32) -> i32 {
-    binding := borrows.root(&c.body.places, place)
-    if binding < 0 { return -1 }
-    if local_borrows.is_transient(&c.body.local_loans, binding) {
-        return local_borrows.parent(&c.body.local_loans, binding)
-    }
-    if local_borrows.shared(&c.body.local_loans, binding) { return binding }
-    -1
-}
-fn record_mutation(c: &mut Session, binding: i32, path: i32) {
-    c.body.mutations.push(binding)
-    c.body.mutation_paths.push(path)
-}
-fn mutated_overlap(c: &Session, first: i32, last: i32, root: i32, path: i32) -> bool {
-    for i in first..last {
-        if c.body.mutations[i] == root {
-            mpath := c.body.mutation_paths[i]
-            if path < 0 || mpath < 0 || ownership.overlaps(&c.body.ownership, mpath, path) { return true }
-        }
-    }
-    false
-}
-fn with_clone_hint(c: &Session, ty: i32, base: string, clone_suffix: string) -> string {
-    if ty > 0 && ft.cloneable(&c.types, ty) { return base + clone_suffix }
-    base.clone()
-}
-fn has_cleanup_ancestor(c: &Session, place: i32) -> bool {
-    if !c.types.has_cleanup { return false }
-    mut projected := place
-    while projected > 0 {
-        row := (projected - 1) * 3
-        receiver := places.receiver(c.body.places.arena.nodes[row + 1])
-        if ft.cleanup_method(&c.types, receiver) >= 0 { return true }
-        projected = places.parent(c.body.places.arena.nodes[row])
-    }
-    false
-}
-fn local_name_used_later(c: &Session, name: string, from: i32, limit: i32) -> bool {
-    if limit < 0 { return true }
-    mut end := limit
-    if end > c.world.tokens.kinds.len { end = c.world.tokens.kinds.len }
-    if from < 0 || from >= end { return false }
-    for tok in from..end {
-        if c.world.tokens.kinds[tok] == .Name && c.world.tokens.texts[tok] == name {
-            if tok > 0 && c.world.tokens.kinds[tok - 1] == .Symbol &&
-                (c.world.tokens.texts[tok - 1] == "." || c.world.tokens.texts[tok - 1] == "::") {
-                continue
-            }
-            return true
-        }
-    }
-    false
-}
-fn is_fresh_owned(c: &Session) -> bool {
-    if c.body.expr.owner >= 0 || c.body.expr.const_array { return true }
-    if c.body.places.current == 0 && c.body.expr.move_temporary >= 0 &&
-        c.body.expr.move_projection >= 0 && !c.body.place.inline_storage {
-        return true
-    }
-    if c.body.places.current < 0 {
-        binding := borrows.root(&c.body.places, c.body.places.current)
-        if binding >= 0 && binding < c.body.locals.fresh_move.len && c.body.locals.fresh_move[binding] {
-            return true
-        }
-    }
-    false
-}
+fn owner_path(c: &Session, place: i32) -> i32 { ownership_check.owner_path(&c.body, place) }
+fn source_root(c: &Session, place: i32) -> i32 { ownership_check.source_root(&c.body, place) }
+fn borrow_parent(c: &Session, place: i32) -> i32 { ownership_check.borrow_parent(&c.body, place) }
+fn record_mutation(c: &mut Session, binding: i32, path: i32) { ownership_check.record_mutation(&mut c.body, binding, path) }
+fn mutated_overlap(c: &Session, first: i32, last: i32, root: i32, path: i32) -> bool { ownership_check.mutated_overlap(&c.body, first, last, root, path) }
+fn with_clone_hint(c: &Session, ty: i32, base: string, clone_suffix: string) -> string { ownership_check.with_clone_hint(&c.types, ty, base, clone_suffix) }
+fn has_cleanup_ancestor(c: &Session, place: i32) -> bool { ownership_check.has_cleanup_ancestor(&c.body, &c.types, place) }
+fn local_name_used_later(c: &Session, name: string, from: i32, limit: i32) -> bool { ownership_check.local_name_used_later(&c.world.tokens, name, from, limit) }
+fn is_fresh_owned(c: &Session) -> bool { ownership_check.is_fresh_owned(&c.body) }
 fn writable_loan(c: &mut Session, place: i32) -> bool {
-    path := owner_path(&c, place)
-    actor := borrows.root(&c.body.places, place)
     while true {
-        loan := local_borrows.active_conflict_local_except(&c.body.local_loans, &c.body.ownership, path, actor, false)
-        if loan < 0 { return true }
-        limit := local_borrows.scope_end(&c.body.local_loans, loan)
-        depth := local_borrows.loop_depth(&c.body.local_loans, loan)
-        if !local_borrows.is_pinned(&c.body.local_loans, loan) && limit >= 0 &&
-            depth == c.body.loop_heads.len &&
-            !local_name_used_later(&c, c.body.locals.names[loan], c.body.cursor, limit) {
-            local_borrows.release_local(&mut c.body.local_loans, loan)
-            continue
-        }
+        loan := ownership_check.check_loan_step(&c.body, &c.world.tokens, place, false)
+        if loan == -1 { return true }
+        if loan >= 0 { local_borrows.release_local(&mut c.body.local_loans, loan); continue }
         fail(&mut c, "cannot mutate, replace or move a value while it is borrowed")
         return false
     }
     false
 }
 fn readable_loan(c: &mut Session, place: i32) -> bool {
-    path := owner_path(&c, place)
-    actor := borrows.root(&c.body.places, place)
     while true {
-        loan := local_borrows.active_conflict_local_except(&c.body.local_loans, &c.body.ownership, path, actor, true)
-        if loan < 0 { return true }
-        limit := local_borrows.scope_end(&c.body.local_loans, loan)
-        depth := local_borrows.loop_depth(&c.body.local_loans, loan)
-        if !local_borrows.is_pinned(&c.body.local_loans, loan) && limit >= 0 &&
-            depth == c.body.loop_heads.len &&
-            !local_name_used_later(&c, c.body.locals.names[loan], c.body.cursor, limit) {
-            local_borrows.release_local(&mut c.body.local_loans, loan)
-            continue
-        }
+        loan := ownership_check.check_loan_step(&c.body, &c.world.tokens, place, true)
+        if loan == -1 { return true }
+        if loan >= 0 { local_borrows.release_local(&mut c.body.local_loans, loan); continue }
         fail(&mut c, "cannot read or borrow a value while it is mutably borrowed")
         return false
     }
@@ -937,64 +848,14 @@ fn constrain_borrow(c: &mut Session) -> bool {
     true
 }
 fn move_place(c: &mut Session, place: i32, ty: i32, at: i32) -> bool {
-    if has_cleanup_ancestor(&c, place) {
-        fail(&mut c, "cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
-        return false
-    }
-    binding := borrows.root(&c.body.places, place)
-    kind := ft.type_kind(&c.types, c.body.locals.types[binding])
-    if kind == 4 || kind == 5 {
-        fail(&mut c, with_clone_hint(&c, ty, "cannot move out of a borrowed value", "; use .clone()"))
-        return false
-    }
-    for i in 0..c.body.pattern_borrowed.len {
-        if c.body.pattern_borrowed[i] == binding {
-            fail(&mut c, with_clone_hint(&c, ty, "cannot move a borrowed pattern binding", "; use .clone()"))
-            return false
-        }
-    }
-    pl_idx := fc.pattern_loan_index(&c.body, binding)
-    if pl_idx >= 0 {
-        subj_place := c.body.pattern_loans.subject_places[pl_idx]
-        if has_cleanup_ancestor(&c, subj_place) {
-            fail(&mut c, "cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
-            return false
-        }
-        if !writable_loan(&mut c, place) { return false }
-        if !writable_loan(&mut c, subj_place) { return false }
-        path := owner_path(&c, place)
-        if !ownership.available(&c.body.ownership, path) { fail(&mut c, "use of moved value '" + c.body.locals.names[binding] + "'"); return false }
-        if is_for_locked(&c, path) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
-        subj_path := owner_path(&c, subj_place)
-        lock_idx := c.body.pattern_loans.lock_indices[pl_idx]
-        if is_for_locked_except(&c, subj_path, lock_idx) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
-        subj_binding := borrows.root(&c.body.places, subj_place)
-        for i in 0..c.body.move_defer_locks.len {
-            locked := c.body.move_defer_locks[i]
-            if locked == binding || (subj_binding >= 0 && locked == subj_binding) {
-                fail(&mut c, with_clone_hint(&c, ty, "cannot move a value captured by defer", "; use .clone() or move it after the deferred scope"))
-                return false
-            }
-        }
-        ownership.consume(&mut c.body.ownership, path, at); record_mutation(&mut c, binding, path)
-        if subj_path >= 0 && ownership.available(&c.body.ownership, subj_path) {
-            ownership.consume(&mut c.body.ownership, subj_path, at)
-        }
-        if subj_binding >= 0 { record_mutation(&mut c, subj_binding, subj_path) }
+    while true {
+        step := ownership_check.plan_move_step(&c.body, &c.world.tokens, &c.types, place, ty)
+        if step.status == 1 { local_borrows.release_local(&mut c.body.local_loans, step.release_loan); continue }
+        if step.status != 0 { fail(&mut c, step.error); return false }
+        ownership_check.apply_move(&mut c.body, &step, at)
         return true
     }
-    if !writable_loan(&mut c, place) { return false }
-    path := owner_path(&c, place)
-    if !ownership.available(&c.body.ownership, path) { fail(&mut c, "use of moved value '" + c.body.locals.names[binding] + "'"); return false }
-    if is_for_locked(&c, path) { fail(&mut c, "cannot move a collection while iterating over it"); return false }
-    for i in 0..c.body.move_defer_locks.len {
-        if c.body.move_defer_locks[i] == binding {
-            fail(&mut c, with_clone_hint(&c, ty, "cannot move a value captured by defer", "; use .clone() or move it after the deferred scope"))
-            return false
-        }
-    }
-    ownership.consume(&mut c.body.ownership, path, at); record_mutation(&mut c, binding, path)
-    true
+    false
 }
 fn move_binding(c: &mut Session, binding: i32, ty: i32, at: i32) -> bool {
     move_place(&mut c, borrows.local_id(binding), ty, at)
@@ -1168,64 +1029,34 @@ fn may_invalidate_operand(c: &mut Session) {
 fn skip_body(c: &mut Session) { expect(&mut c, "{"); c.body.cursor = c.world.closes[c.body.cursor - 1] + 1 }
 fn foreign_scalar(c: &Session, ty: i32) -> bool { ft.foreign_scalar(&c.types, ty) }
 fn opaque_access(c: &mut Session, ty: i32) {
-    if ft.declaring_owner(&c.types, ty) >= 0 && ft.declaring_owner(&c.types, ty) != c.body.current_owner {
-        fail(&mut c, "an opaque struct can only be constructed or opened by its defining module")
-    }
+    msg := resolve.opaque_access_msg(&c.types, c.body.current_owner, ty)
+    if msg != "" { fail(&mut c, msg) }
 }
 fn parse_requires(c: &mut Session) -> i32 {
-    expect(&mut c, "(")
-    if !c.ok { return 0 }
-    mut cap_mask := 0
-    while c.ok {
-        tok := c.body.cursor
-        kind := c.world.tokens.kinds[tok]
-        word := c.world.tokens.texts[tok].clone()
-        bit := if kind == .Name { modules.capability_bit(word) } else { 0 }
-        if bit != 0 && bit != 16 && cap_mask.bit_and(bit) == 0 {
-            cap_mask = cap_mask.bit_or(bit)
-            skip_token(&mut c)
-        } else {
-            fail(&mut c, modules.invalid_requires_message(kind, word, cap_mask)); return 0
-        }
-        if eat(&mut c, ")") { return cap_mask }
-        if !eat(&mut c, ",") {
-            fail(&mut c, "expected ')' or ',' after @requires capability"); return 0
-        }
-    }
-    0
+    mut cur := c.body.cursor
+    res := resolve.parse_requires(&c.world.tokens, &mut cur)
+    c.body.cursor = cur
+    if !res.ok { fail(&mut c, res.error); return 0 }
+    res.mask
 }
 fn check_function_caps(c: &mut Session, f: i32, token: i32) {
-    req := c.world.requires_caps[f]
-    if req == 0 { return }
-    mut granted := 0
-    if c.body.current_owner >= 0 && c.body.current_owner < c.world.module_caps.len {
-        granted = c.world.module_caps[c.body.current_owner]
-    }
-    missing := req.bit_and(granted.bit_xor(15))
-    if missing == 0 { return }
-    fail(&mut c, modules.missing_capability_message(missing, granted != 0))
+    msg := resolve.check_function_caps_msg(&c.world, c.body.current_owner, f)
+    if msg == "" { return }
+    fail(&mut c, msg)
     set_error_at(&mut c, c.world.tokens.starts[token])
 }
 fn impl_method(c: &Session, ty: i32, name: string) -> i32 {
     fc.find_method(&c.world, ty, name)
 }
 fn check_impl_access(c: &mut Session, f: i32, token: i32) -> bool {
-    if ft.cleanup_method(&c.types, c.world.impl_types[f]) == f {
-        fail(&mut c, "resource cleanup methods are called automatically")
-        set_error_at(&mut c, c.world.tokens.starts[token])
-        return false
-    }
-    if !c.world.impl_public[f] && c.world.function_owners[f] != c.body.current_owner {
-        fail(&mut c, "method '" + c.world.impl_names[f] + "' is private; export it with pub")
-        set_error_at(&mut c, c.world.tokens.starts[token])
-        return false
-    }
-    check_function_caps(&mut c, f, token)
-    c.ok
+    msg := resolve.check_impl_access_msg(&c.world, &c.types, c.body.current_owner, f)
+    if msg == "" { return c.ok }
+    fail(&mut c, msg)
+    set_error_at(&mut c, c.world.tokens.starts[token])
+    false
 }
 fn declaration_owner(c: &Session, offset: i32, starts: &[]i32, owners: &[]i32) -> i32 {
-    if generics.generated(&c.specializations, offset) { return c.world.module_caps.len }
-    fc.source_owner(offset, &starts, &owners)
+    resolve.declaration_owner(&c.world, &c.specializations, offset, &starts, &owners)
 }
 struct TraitMethodSig { has_self: bool, signature: i32 }
 fn trait_generic_type(c: &mut Session, validating_trait: bool, sig_end: i32) -> i32 {
@@ -1360,15 +1191,10 @@ fn parse_trait_method_sig(c: &mut Session, sig_start: i32, sig_end: i32, self_ty
     TraitMethodSig { has_self: has_self, signature: signature }
 }
 fn valid_trait_target(c: &Session, ty: i32) -> bool {
-    if ty < 1 { return false }
-    if ty < 13 { return true }
-    kind := ft.type_kind(&c.types, ty)
-    kind == 1 || kind == 2 || kind == 3 || kind == 7
+    resolve.valid_trait_target(&c.types, ty)
 }
 fn trait_display_name(name: string) -> string {
-    prefix := "__dunder_module_prelude_"
-    if name.len >= prefix.len && name[0..prefix.len] == prefix { return name[prefix.len..name.len] }
-    name.clone()
+    resolve.trait_display_name(name)
 }
 fn parse_impl_target_at(c: &mut Session, target_tok: i32) -> i32 {
     if c.world.tokens.kinds[target_tok] == .Name {
@@ -1542,17 +1368,9 @@ fn activate_trait_impl(c: &mut Session, k: i32) -> bool {
             fail_span(&mut c, "", site, -1, "missing trait method '" + req_name + "' in implementation for '" + ft.type_spelling(&c.types, target_ty) + "'")
             return false
         }
-        if expected.signature < 0 || c.world.impl_has_self[found] != expected.has_self || c.world.ffi_types[found] != expected.signature {
-            exp_text := if expected.signature >= 0 { ft.type_spelling(&c.types, expected.signature) } else { "trait requirement" }
-            fail_span(&mut c, "", site, -1, "trait method '" + req_name + "' signature does not match trait requirement " + exp_text)
-            return false
-        }
-        if c.world.unsafe_functions[found] != c.traits.method_unsafe[m] {
-            if c.traits.method_unsafe[m] {
-                fail_span(&mut c, "", site, -1, "trait method '" + req_name + "' must be declared unsafe")
-            } else {
-                fail_span(&mut c, "", site, -1, "trait method '" + req_name + "' must be safe")
-            }
+        mismatch := resolve.trait_method_mismatch_msg(&c.world, &c.types, req_name, found, expected.has_self, expected.signature, c.traits.method_unsafe[m])
+        if mismatch != "" {
+            fail_span(&mut c, "", site, -1, mismatch)
             return false
         }
     }
@@ -1650,15 +1468,8 @@ fn resolve_traits(c: &mut Session) {
             mut satisfied := true
             for ci in c_start..c_start + c_count {
                 arg_ty := c.traits.cond_types[ci]
-                if c.traits.cond_traits[ci] != "" {
-                    cid := traits.lookup(&c.traits, c.traits.cond_traits[ci])
-                    if cid < 0 || !traits.satisfies(&c.traits, &c.types, cid, arg_ty) { satisfied = false; break }
-                } else {
-                    f := impl_method(&c, arg_ty, c.traits.cond_methods[ci])
-                    if f < 0 || !c.world.impl_public[f] || !c.world.impl_has_self[f] || c.world.unsafe_functions[f] ||
-                        c.world.requires_caps[f] != 0 || c.world.ffi_types[f] != c.traits.cond_sigs[ci] {
-                        satisfied = false; break
-                    }
+                if !resolve.satisfies_trait_cond_method(&c.world, &c.traits, &c.types, arg_ty, c.traits.cond_traits[ci], c.traits.cond_methods[ci], c.traits.cond_sigs[ci]) {
+                    satisfied = false; break
                 }
             }
             if satisfied {
@@ -1702,693 +1513,6 @@ fn resolve_traits(c: &mut Session) {
         }
     }
 }
-struct ConstVal { ok: bool, kind: i32, ty: i32, int_val: i64, str_val: string, arr_elem: i32, arr_ints: []i64, error: string, error_tok: i32 }
-fn const_fail(tok: i32, msg: string) -> ConstVal {
-    ConstVal { ok: false, kind: -1, ty: 0, int_val: 0, str_val: "", arr_elem: 0, arr_ints: [], error: msg.clone(), error_tok: tok }
-}
-fn const_ok_int(ty: i32, value: i64) -> ConstVal {
-    ConstVal { ok: true, kind: 0, ty: ty, int_val: value, str_val: "", arr_elem: 0, arr_ints: [], error: "", error_tok: -1 }
-}
-fn const_ok_str(value: string) -> ConstVal {
-    ConstVal { ok: true, kind: 1, ty: 4, int_val: 0, str_val: value.clone(), arr_elem: 0, arr_ints: [], error: "", error_tok: -1 }
-}
-fn const_ok_arr(ty: i32, elem: i32, move ints: []i64) -> ConstVal {
-    ConstVal { ok: true, kind: 2, ty: ty, int_val: i64(ints.len), str_val: "", arr_elem: elem, arr_ints: move ints, error: "", error_tok: -1 }
-}
-fn const_scalar_value_type(c: &Session, ty: i32) -> bool {
-    ty == 1 || ty == 2 || ty == 3 || ty == 5 || floats.has(ty) || unsigned.has(ty)
-}
-fn const_int_type(ty: i32) -> bool {
-    ty == 1 || ty == 2 || unsigned.has(ty)
-}
-fn const_u64_lt(a: i64, b: i64) -> bool {
-    if (a < 0) != (b < 0) { return b < 0 }
-    a < b
-}
-fn const_u64_divmod(a: i64, b: i64, mod_op: bool) -> i64 {
-    if a >= 0 && b >= 0 {
-        if mod_op { return a % b }
-        return a / b
-    }
-    if b < 0 {
-        if const_u64_lt(a, b) {
-            return if mod_op { a } else { 0 }
-        }
-        return if mod_op { a.wrapping_sub(b) } else { 1 }
-    }
-    mut q: i64 = 0
-    mut r: i64 = 0
-    mut i := 63
-    while i >= 0 {
-        bit := a.shr(i).bit_and(1)
-        r = r.shl(1).bit_or(bit)
-        if !const_u64_lt(r, b) {
-            r = r.wrapping_sub(b)
-            q = q.bit_or(i64(1).shl(i))
-        }
-        i = i - 1
-    }
-    if mod_op { r } else { q }
-}
-fn const_u64_mul_checked(a: i64, b: i64, overflow: &mut bool) -> i64 {
-    if a == 0 || b == 0 { return 0 }
-    mut acc: i64 = 0
-    mut lhs := a
-    mut rhs := b
-    mut step := 0
-    while rhs != 0 && step < 64 {
-        if rhs.bit_and(1) != 0 {
-            next := acc.wrapping_add(lhs)
-            if const_u64_lt(next, acc) { overflow = true; return 0 }
-            acc = next
-        }
-        rhs = rhs.shr(1).bit_and(9223372036854775807)
-        if rhs != 0 {
-            if lhs < 0 { overflow = true; return 0 }
-            lhs = lhs.shl(1)
-        }
-        step = step + 1
-    }
-    if rhs != 0 { overflow = true }
-    acc
-}
-fn const_expr_end(t: &lexer.Tokens, first: i32) -> i32 {
-    mut at := first
-    mut parens := 0; mut brackets := 0; mut braces := 0
-    while at < t.kinds.len {
-        kind := t.kinds[at]
-        if kind == .End { break }
-        if parens == 0 && brackets == 0 && braces == 0 {
-            if lexer.is_newline(kind) || (kind == .Symbol && t.texts[at] == ";") { break }
-        }
-        if kind == .Symbol {
-            word := &t.texts[at]
-            if word == "(" { parens = parens + 1 }
-            else if word == ")" { if parens == 0 { break }; parens = parens - 1 }
-            else if word == "[" { brackets = brackets + 1 }
-            else if word == "]" { if brackets == 0 { break }; brackets = brackets - 1 }
-            else if word == "{" { braces = braces + 1 }
-            else if word == "}" { if braces == 0 { break }; braces = braces - 1 }
-        }
-        at = at + 1
-    }
-    at
-}
-fn pre_const_eval(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
-    if depth > 64 { return (false, 0) }
-    pre_const_add(&t, &lengths, &mut pos, end, depth)
-}
-fn pre_const_add(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
-    first := pre_const_mul(&t, &lengths, &mut pos, end, depth)
-    if !first.0 { return first }
-    mut acc := first.1
-    while pos < end {
-        op := &t.texts[pos]
-        if t.kinds[pos] != .Symbol || (op != "+" && op != "-") { break }
-        pos = pos + 1
-        rhs := pre_const_mul(&t, &lengths, &mut pos, end, depth)
-        if !rhs.0 { return rhs }
-        if op == "+" {
-            if (rhs.1 > 0 && acc > 9223372036854775807 - rhs.1) || (rhs.1 < 0 && acc < -9223372036854775807 - 1 - rhs.1) { return (false, 0) }
-            acc = acc + rhs.1
-        } else {
-            if (rhs.1 < 0 && acc > 9223372036854775807 + rhs.1) || (rhs.1 > 0 && acc < -9223372036854775807 - 1 + rhs.1) { return (false, 0) }
-            acc = acc - rhs.1
-        }
-    }
-    (true, acc)
-}
-fn pre_const_mul(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
-    first := pre_const_atom(&t, &lengths, &mut pos, end, depth)
-    if !first.0 { return first }
-    mut acc := first.1
-    while pos < end {
-        op := &t.texts[pos]
-        if t.kinds[pos] != .Symbol || (op != "*" && op != "/" && op != "%") { break }
-        pos = pos + 1
-        rhs := pre_const_atom(&t, &lengths, &mut pos, end, depth)
-        if !rhs.0 { return rhs }
-        if op == "*" {
-            if acc != 0 && rhs.1 != 0 {
-                p := acc.wrapping_mul(rhs.1)
-                if p / acc != rhs.1 { return (false, 0) }
-                acc = p
-            } else { acc = 0 }
-        } else {
-            if rhs.1 == 0 { return (false, 0) }
-            if op == "/" { acc = acc / rhs.1 } else { acc = acc % rhs.1 }
-        }
-    }
-    (true, acc)
-}
-fn pre_const_atom(t: &lexer.Tokens, lengths: &Map<string, i64>, pos: &mut i32, end: i32, depth: i32) -> (bool, i64) {
-    if pos >= end { return (false, 0) }
-    if t.kinds[pos] == .Symbol && t.texts[pos] == "-" {
-        pos = pos + 1
-        if pos < end && t.kinds[pos] == .Integer {
-            p := rules.literal_integer("-" + t.texts[pos]); pos = pos + 1
-            return (p.ok, p.value)
-        }
-        v := pre_const_atom(&t, &lengths, &mut pos, end, depth + 1)
-        if !v.0 || v.1 == (-9223372036854775807 - 1) { return (false, 0) }
-        return (true, -v.1)
-    }
-    if t.kinds[pos] == .Symbol && t.texts[pos] == "(" {
-        pos = pos + 1
-        v := pre_const_eval(&t, &lengths, &mut pos, end, depth + 1)
-        if !v.0 || pos >= end || t.texts[pos] != ")" { return (false, 0) }
-        pos = pos + 1; return v
-    }
-    if t.kinds[pos] == .Integer {
-        p := rules.literal_integer(t.texts[pos]); pos = pos + 1
-        return (p.ok, p.value)
-    }
-    if t.kinds[pos] == .Name {
-        name := t.texts[pos].clone(); pos = pos + 1
-        if pos < end && t.kinds[pos] == .Symbol && t.texts[pos] == "(" &&
-            (name == "i32" || name == "i64" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "usize") {
-            pos = pos + 1
-            v := pre_const_eval(&t, &lengths, &mut pos, end, depth + 1)
-            if !v.0 || pos >= end || t.texts[pos] != ")" { return (false, 0) }
-            pos = pos + 1; return v
-        }
-        if lengths.contains(name) { return (true, lengths.get_or(name, -1)) }
-        return (false, 0)
-    }
-    (false, 0)
-}
-fn pre_register_int_consts(c: &mut Session) {
-    t := &c.world.tokens
-    mut depth := 0; mut parens := 0
-    mut i := 0
-    while i < t.kinds.len {
-        if t.kinds[i] == .Symbol {
-            w := &t.texts[i]
-            if w == "{" { depth = depth + 1 }
-            else if w == "}" { if depth > 0 { depth = depth - 1 } }
-            else if w == "(" || w == "[" { parens = parens + 1 }
-            else if (w == ")" || w == "]") && parens > 0 { parens = parens - 1 }
-        }
-        if depth == 0 && parens == 0 && t.kinds[i] == .Name && t.texts[i] == "const" &&
-            i + 1 < t.kinds.len && t.kinds[i + 1] == .Name {
-            cname := t.texts[i + 1].clone()
-            mut j := i + 2
-            while j < t.kinds.len && !lexer.is_newline(t.kinds[j]) && t.texts[j] != ";" && t.texts[j] != "=" { j = j + 1 }
-            if j < t.kinds.len && t.texts[j] == "=" {
-                expr_start := j + 1
-                expr_end := const_expr_end(&t, expr_start)
-                mut p := expr_start
-                val := pre_const_eval(&t, &c.types.const_lengths, &mut p, expr_end, 0)
-                if val.0 && p == expr_end && val.1 >= 0 && val.1 <= 1048576 {
-                    c.types.const_lengths.put(move cname, val.1)
-                }
-                i = expr_end; continue
-            }
-        }
-        i = i + 1
-    }
-}
-fn const_check_int_range(c: &Session, ty: i32, v: i64, tok: i32) -> ConstVal {
-    if ty == 1 {
-        if v < -2147483648 || v > 2147483647 { return const_fail(tok, "constant integer out of i32 range") }
-        return const_ok_int(1, v)
-    }
-    if ty == 2 { return const_ok_int(2, v) }
-    if unsigned.has(ty) {
-        mut maxv := unsigned.maximum(ty)
-        if ty == 12 && c.code.platform == 3 { maxv = 4294967295 }
-        if maxv >= 0 && (v < 0 || v > maxv) { return const_fail(tok, "constant value out of unsigned range") }
-        return const_ok_int(ty, v)
-    }
-    const_fail(tok, "invalid constant integer type")
-}
-fn const_cast_value(c: &Session, target: i32, move src: ConstVal, tok: i32) -> ConstVal {
-    if !src.ok { return src }
-    if target == 5 {
-        if src.ty == 5 { return src }
-        if !const_int_type(src.ty) { return const_fail(tok, "integer conversion requires an integer") }
-        if src.int_val < 0 || src.int_val > 1114111 || (src.int_val >= 55296 && src.int_val <= 57343) {
-            return const_fail(tok, "constant rune value out of Unicode scalar range")
-        }
-        return const_ok_int(5, src.int_val)
-    }
-    if floats.has(target) {
-        if floats.has(src.ty) {
-            if src.ty == target { return src }
-            if src.ty == 6 && target == 7 {
-                d := f64(f32.from_bits(i32(src.int_val)))
-                return const_ok_int(7, d.to_bits())
-            }
-            if src.ty == 7 && target == 6 {
-                f := f32(f64.from_bits(src.int_val))
-                return const_ok_int(6, i64(f.to_bits()).bit_and(4294967295))
-            }
-        }
-        if src.ty == 1 || src.ty == 2 {
-            if target == 6 { return const_ok_int(6, i64(f32(src.int_val).to_bits()).bit_and(4294967295)) }
-            return const_ok_int(7, f64(src.int_val).to_bits())
-        }
-        if unsigned.has(src.ty) {
-            if src.int_val < 0 {
-                // 64-bit unsigned value with high bit set: convert via split halves.
-                hi := f64(src.int_val.shr(1).bit_and(9223372036854775807)) * 2.0 + f64(src.int_val.bit_and(1))
-                if target == 6 { return const_ok_int(6, i64(f32(hi).to_bits()).bit_and(4294967295)) }
-                return const_ok_int(7, hi.to_bits())
-            }
-            if target == 6 { return const_ok_int(6, i64(f32(src.int_val).to_bits()).bit_and(4294967295)) }
-            return const_ok_int(7, f64(src.int_val).to_bits())
-        }
-        return const_fail(tok, "expected a numeric conversion")
-    }
-    if floats.has(src.ty) {
-        if src.ty == 6 {
-            v := f32.from_bits(i32(src.int_val))
-            if !v.is_finite() { return const_fail(tok, "cannot convert non-finite float to integer in constant expression") }
-            if target == 1 {
-                if v < f32(-2147483648) || v >= f32(2147483648) { return const_fail(tok, "constant float conversion out of i32 range") }
-                return const_ok_int(1, i64(i32(v)))
-            }
-            if target == 2 { return const_ok_int(2, i64(v)) }
-            if unsigned.has(target) {
-                if v < f32(0) { return const_fail(tok, "constant float conversion cannot be negative") }
-                return const_check_int_range(&c, target, i64(v), tok)
-            }
-        } else {
-            v := f64.from_bits(src.int_val)
-            if !v.is_finite() { return const_fail(tok, "cannot convert non-finite float to integer in constant expression") }
-            if target == 1 {
-                if v < -2147483648.0 || v >= 2147483648.0 { return const_fail(tok, "constant float conversion out of i32 range") }
-                return const_ok_int(1, i64(i32(v)))
-            }
-            if target == 2 { return const_ok_int(2, i64(v)) }
-            if unsigned.has(target) {
-                if v < 0.0 { return const_fail(tok, "constant float conversion cannot be negative") }
-                return const_check_int_range(&c, target, i64(v), tok)
-            }
-        }
-    }
-    if !const_int_type(src.ty) && src.ty != 5 { return const_fail(tok, "integer conversion requires an integer") }
-    if unsigned.has(src.ty) && src.int_val < 0 {
-        if target == 1 || target == 2 { return const_fail(tok, "constant conversion out of signed integer range") }
-        if target == 11 || (target == 12 && c.code.platform != 3) { return const_ok_int(target, src.int_val) }
-        return const_fail(tok, "constant value out of unsigned range")
-    }
-    if target == 11 || (target == 12 && c.code.platform != 3) {
-        if src.int_val < 0 { return const_fail(tok, "constant value out of unsigned range") }
-        return const_ok_int(target, src.int_val)
-    }
-    const_check_int_range(&c, target, src.int_val, tok)
-}
-fn const_eval_expr(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    if depth > 64 { return const_fail(pos, "constant expression nesting exceeds 64") }
-    const_eval_or(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
-}
-fn const_eval_or(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    mut left := const_eval_and(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
-    if !left.ok { return left }
-    while pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "||" {
-        op_tok := pos; pos = pos + 1
-        right := const_eval_and(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 3, depth)
-        if !right.ok { return right }
-        if left.ty != 3 || right.ty != 3 { return const_fail(op_tok, "logical || requires bool operands") }
-        left = const_ok_int(3, if left.int_val != 0 || right.int_val != 0 { 1 } else { 0 })
-    }
-    left
-}
-fn const_eval_and(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    mut left := const_eval_cmp(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
-    if !left.ok { return left }
-    while pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "&&" {
-        op_tok := pos; pos = pos + 1
-        right := const_eval_cmp(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 3, depth)
-        if !right.ok { return right }
-        if left.ty != 3 || right.ty != 3 { return const_fail(op_tok, "logical && requires bool operands") }
-        left = const_ok_int(3, if left.int_val != 0 && right.int_val != 0 { 1 } else { 0 })
-    }
-    left
-}
-fn const_eval_cmp(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    mut hint := expected; if hint == 3 { hint = 0 }
-    mut left := const_eval_add(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, hint, depth)
-    if !left.ok { return left }
-    if pos < end && c.world.tokens.kinds[pos] == .Symbol {
-        op := c.world.tokens.texts[pos].clone()
-        if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
-            op_tok := pos; pos = pos + 1
-            right := const_eval_add(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, left.ty, depth)
-            if !right.ok { return right }
-            if left.ty != right.ty { return const_fail(op_tok, "constant comparison requires matching types") }
-            if left.kind == 2 { return const_fail(op_tok, "constant array comparison is not supported in constant expressions") }
-            if left.kind == 1 {
-                if op != "==" && op != "!=" { return const_fail(op_tok, "strings only support == and != comparisons") }
-                eq := left.str_val == right.str_val
-                return const_ok_int(3, if (op == "==" && eq) || (op == "!=" && !eq) { 1 } else { 0 })
-            }
-            if left.ty == 3 && op != "==" && op != "!=" { return const_fail(op_tok, "bool only supports == and != comparisons") }
-            mut out := false
-            if floats.has(left.ty) {
-                if left.ty == 6 {
-                    a := f32.from_bits(i32(left.int_val)); b := f32.from_bits(i32(right.int_val))
-                    out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { a < b } else if op == "<=" { a <= b } else if op == ">" { a > b } else { a >= b }
-                } else {
-                    a := f64.from_bits(left.int_val); b := f64.from_bits(right.int_val)
-                    out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { a < b } else if op == "<=" { a <= b } else if op == ">" { a > b } else { a >= b }
-                }
-            } else if unsigned.has(left.ty) {
-                a := left.int_val; b := right.int_val
-                out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { const_u64_lt(a, b) } else if op == "<=" { a == b || const_u64_lt(a, b) } else if op == ">" { const_u64_lt(b, a) } else { a == b || const_u64_lt(b, a) }
-            } else {
-                a := left.int_val; b := right.int_val
-                out = if op == "==" { a == b } else if op == "!=" { a != b } else if op == "<" { a < b } else if op == "<=" { a <= b } else if op == ">" { a > b } else { a >= b }
-            }
-            left = const_ok_int(3, if out { 1 } else { 0 })
-        }
-    }
-    left
-}
-fn const_eval_add(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    mut left := const_eval_mul(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
-    if !left.ok { return left }
-    while pos < end && c.world.tokens.kinds[pos] == .Symbol && (c.world.tokens.texts[pos] == "+" || c.world.tokens.texts[pos] == "-") {
-        op_tok := pos; op := c.world.tokens.texts[pos].clone(); pos = pos + 1
-        right := const_eval_mul(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, left.ty, depth)
-        if !right.ok { return right }
-        if left.ty != right.ty { return const_fail(op_tok, "constant arithmetic requires matching types") }
-        if left.kind == 1 && op == "+" {
-            left = const_ok_str(left.str_val + right.str_val); continue
-        }
-        if left.kind != 0 || left.ty == 3 || left.ty == 5 { return const_fail(op_tok, "invalid constant operator") }
-        if floats.has(left.ty) {
-            if left.ty == 6 {
-                a := f32.from_bits(i32(left.int_val)); b := f32.from_bits(i32(right.int_val))
-                res := if op == "+" { a + b } else { a - b }
-                left = const_ok_int(6, i64(res.to_bits()).bit_and(4294967295))
-            } else {
-                a := f64.from_bits(left.int_val); b := f64.from_bits(right.int_val)
-                res := if op == "+" { a + b } else { a - b }
-                left = const_ok_int(7, res.to_bits())
-            }
-            continue
-        }
-        if unsigned.has(left.ty) {
-            a := left.int_val; b := right.int_val
-            if op == "+" {
-                sum := a.wrapping_add(b)
-                if const_u64_lt(sum, a) { return const_fail(op_tok, "unsigned constant addition overflows") }
-                left = const_check_int_range(&c, left.ty, sum, op_tok)
-            } else {
-                if const_u64_lt(a, b) { return const_fail(op_tok, "unsigned constant subtraction underflows") }
-                left = const_check_int_range(&c, left.ty, a.wrapping_sub(b), op_tok)
-            }
-        } else {
-            a := left.int_val; b := right.int_val
-            mut v: i64 = 0
-            if op == "+" {
-                if (b > 0 && a > 9223372036854775807 - b) || (b < 0 && a < -9223372036854775807 - 1 - b) {
-                    return const_fail(op_tok, "constant addition overflows")
-                }
-                v = a + b
-            } else {
-                if (b < 0 && a > 9223372036854775807 + b) || (b > 0 && a < -9223372036854775807 - 1 + b) {
-                    return const_fail(op_tok, "constant subtraction overflows")
-                }
-                v = a - b
-            }
-            left = const_check_int_range(&c, left.ty, v, op_tok)
-        }
-        if !left.ok { return left }
-    }
-    left
-}
-fn const_eval_mul(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    mut left := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
-    if !left.ok { return left }
-    while pos < end && c.world.tokens.kinds[pos] == .Symbol {
-        op := c.world.tokens.texts[pos].clone()
-        if op != "*" && op != "/" && op != "%" { break }
-        op_tok := pos; pos = pos + 1
-        right := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, left.ty, depth)
-        if !right.ok { return right }
-        if left.ty != right.ty { return const_fail(op_tok, "constant arithmetic requires matching types") }
-        if left.kind != 0 || left.ty == 3 || left.ty == 5 { return const_fail(op_tok, "invalid constant operator") }
-        if floats.has(left.ty) {
-            if op == "%" { return const_fail(op_tok, "float constants do not support %") }
-            if left.ty == 6 {
-                a := f32.from_bits(i32(left.int_val)); b := f32.from_bits(i32(right.int_val))
-                res := if op == "*" { a * b } else { a / b }
-                left = const_ok_int(6, i64(res.to_bits()).bit_and(4294967295))
-            } else {
-                a := f64.from_bits(left.int_val); b := f64.from_bits(right.int_val)
-                res := if op == "*" { a * b } else { a / b }
-                left = const_ok_int(7, res.to_bits())
-            }
-            continue
-        }
-        if (op == "/" || op == "%") && right.int_val == 0 { return const_fail(op_tok, "division by zero in constant expression") }
-        if unsigned.has(left.ty) {
-            a := left.int_val; b := right.int_val
-            if op == "*" {
-                mut ov := false
-                prod := const_u64_mul_checked(a, b, &mut ov)
-                if ov { return const_fail(op_tok, "unsigned constant multiplication overflows") }
-                left = const_check_int_range(&c, left.ty, prod, op_tok)
-            } else {
-                q := const_u64_divmod(a, b, op == "%")
-                left = const_check_int_range(&c, left.ty, q, op_tok)
-            }
-        } else {
-            a := left.int_val; b := right.int_val
-            i64_min: i64 = -9223372036854775807 - 1
-            mut v: i64 = 0
-            if op == "*" {
-                if a != 0 && b != 0 {
-                    if (a == -1 && b == i64_min) || (b == -1 && a == i64_min) { return const_fail(op_tok, "constant multiplication overflows") }
-                    prod := a.wrapping_mul(b)
-                    if prod / a != b { return const_fail(op_tok, "constant multiplication overflows") }
-                    v = prod
-                }
-            } else if op == "/" {
-                if a == i64_min && b == -1 { return const_fail(op_tok, "constant division overflows") }
-                v = a / b
-            } else {
-                if a == i64_min && b == -1 { v = 0 } else { v = a % b }
-            }
-            left = const_check_int_range(&c, left.ty, v, op_tok)
-        }
-        if !left.ok { return left }
-    }
-    left
-}
-fn const_eval_unary(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    if pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "-" {
-        op_tok := pos; pos = pos + 1
-        if pos < end && c.world.tokens.kinds[pos] == .Integer {
-            spelling := "-" + c.world.tokens.texts[pos]; pos = pos + 1
-            if floats.has(expected) {
-                dec := decimal.decode(spelling, expected == 6)
-                if !dec.ok { return const_fail(op_tok, "floating literal is outside the finite range") }
-                return const_ok_int(expected, dec.bits)
-            }
-            mut ty := expected
-            if ty != 2 && !unsigned.has(ty) { ty = 1 }
-            if unsigned.has(ty) { return const_fail(op_tok, "unsigned constant cannot be negative") }
-            mut parsed := rules.literal_integer(spelling)
-            _ := rules.validate_signed(&mut parsed, ty)
-            if !parsed.ok { return const_fail(op_tok, "integer literal out of range") }
-            return const_ok_int(ty, parsed.value)
-        }
-        if pos < end && c.world.tokens.kinds[pos] == .Float {
-            spelling := "-" + c.world.tokens.texts[pos]; pos = pos + 1
-            mut ty := 7; if expected == 6 { ty = 6 }
-            dec := decimal.decode(spelling, ty == 6)
-            if !dec.ok { return const_fail(op_tok, "floating literal is outside the finite range") }
-            return const_ok_int(ty, dec.bits)
-        }
-        val := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth + 1)
-        if !val.ok { return val }
-        if val.ty == 6 { return const_ok_int(6, val.int_val.bit_xor(2147483648)) }
-        if val.ty == 7 { return const_ok_int(7, val.int_val.bit_xor(i64(-1).shl(63))) }
-        if val.ty != 1 && val.ty != 2 { return const_fail(op_tok, "unary '-' requires signed numeric constant") }
-        if val.int_val == (-9223372036854775807 - 1) || (val.ty == 1 && val.int_val == -2147483648) {
-            return const_fail(op_tok, "constant negation overflows")
-        }
-        return const_ok_int(val.ty, -val.int_val)
-    }
-    if pos < end && c.world.tokens.kinds[pos] == .Symbol && c.world.tokens.texts[pos] == "!" {
-        op_tok := pos; pos = pos + 1
-        val := const_eval_unary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 3, depth + 1)
-        if !val.ok { return val }
-        if val.ty != 3 { return const_fail(op_tok, "unary '!' requires bool constant") }
-        return const_ok_int(3, if val.int_val == 0 { 1 } else { 0 })
-    }
-    const_eval_primary(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth)
-}
-fn const_eval_primary(c: &mut Session, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, pos: &mut i32, end: i32, expected: i32, depth: i32) -> ConstVal {
-    if pos >= end { return const_fail(pos, "expected constant expression") }
-    tok := pos; kind := c.world.tokens.kinds[pos]
-    if kind == .Symbol && c.world.tokens.texts[pos] == "(" {
-        pos = pos + 1
-        val := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, expected, depth + 1)
-        if !val.ok { return val }
-        if pos >= end || c.world.tokens.texts[pos] != ")" { return const_fail(pos, "expected ')' in constant expression") }
-        pos = pos + 1; return val
-    }
-    if kind == .Symbol && c.world.tokens.texts[pos] == "[" {
-        pos = pos + 1
-        while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
-        mut elem_hint := 0
-        if expected > 0 && collection(&c, expected) { elem_hint = ft.type_base(&c.types, expected) }
-        if elem_hint != 0 && !const_scalar_value_type(&c, elem_hint) {
-            return const_fail(tok, "constant arrays only support scalar elements")
-        }
-        mut arr_ty := expected
-        if pos < end && c.world.tokens.texts[pos] == "]" {
-            pos = pos + 1
-            if elem_hint == 0 { return const_fail(tok, "empty constant array requires a type annotation") }
-            if arr_ty == 0 { arr_ty = compound(&mut c, 1, elem_hint) }
-            return const_ok_arr(arr_ty, elem_hint, [])
-        }
-        if elem_hint == 0 {
-            prefix := array_integer_prefix(&c, pos)
-            if prefix.end > pos {
-                wend := c.world.tokens.texts[prefix.end].clone()
-                if wend == "]" || wend == ";" { elem_hint = prefix.default_type }
-            }
-        }
-        first_tok := pos
-        first := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, elem_hint, depth + 1)
-        if !first.ok { return first }
-        if !const_scalar_value_type(&c, first.ty) { return const_fail(first_tok, "constant arrays only support scalar elements") }
-        elem_ty := if elem_hint != 0 { elem_hint } else { first.ty }
-        if first.ty != elem_ty { return const_fail(first_tok, "constant array element type mismatch") }
-        if pos < end && c.world.tokens.texts[pos] == ";" {
-            pos = pos + 1
-            while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
-            count_tok := pos
-            cnt := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, 1, depth + 1)
-            if !cnt.ok { return cnt }
-            if !const_int_type(cnt.ty) || (unsigned.has(cnt.ty) && cnt.int_val < 0) || cnt.int_val < 0 || cnt.int_val > 1048576 {
-                return const_fail(count_tok, "constant array repeat count out of range (0..1048576)")
-            }
-            while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
-            if pos >= end || c.world.tokens.texts[pos] != "]" { return const_fail(pos, "expected ']'") }
-            pos = pos + 1
-            mut vals: []i64 = []; n := i32(cnt.int_val); vals.reserve(n)
-            for _ in 0..n { vals.push(first.int_val) }
-            if arr_ty == 0 { arr_ty = compound(&mut c, 1, elem_ty) }
-            return const_ok_arr(arr_ty, elem_ty, move vals)
-        }
-        mut vals: []i64 = [first.int_val]
-        while pos < end {
-            while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
-            if pos < end && c.world.tokens.texts[pos] == "," {
-                pos = pos + 1
-                while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
-                if pos < end && c.world.tokens.texts[pos] == "]" { break }
-                etok := pos
-                ev := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, elem_ty, depth + 1)
-                if !ev.ok { return ev }
-                if ev.ty != elem_ty { return const_fail(etok, "constant array element type mismatch") }
-                vals.push(ev.int_val)
-            } else { break }
-        }
-        while pos < end && lexer.is_newline(c.world.tokens.kinds[pos]) { pos = pos + 1 }
-        if pos >= end || c.world.tokens.texts[pos] != "]" { return const_fail(pos, "expected ']'") }
-        pos = pos + 1
-        if arr_ty == 0 { arr_ty = compound(&mut c, 1, elem_ty) }
-        return const_ok_arr(arr_ty, elem_ty, move vals)
-    }
-    if kind == .Integer {
-        spelling := c.world.tokens.texts[pos].clone(); pos = pos + 1
-        if floats.has(expected) {
-            dec := decimal.decode(spelling, expected == 6)
-            if !dec.ok { return const_fail(tok, "floating literal is outside the finite range") }
-            return const_ok_int(expected, dec.bits)
-        }
-        mut ty := expected
-        if !unsigned.has(ty) && ty != 2 { ty = 1 }
-        if unsigned.has(ty) {
-            num := unsigned.literal(spelling, ty)
-            if !num.ok { return const_fail(tok, "unsigned integer literal out of range") }
-            if c.code.platform == 3 && ty == 12 && (num.value < 0 || num.value > 4294967295) { return const_fail(tok, "usize literal exceeds wasm32 pointer width") }
-            return const_ok_int(ty, num.value)
-        }
-        mut parsed := rules.literal_integer(spelling)
-        _ := rules.validate_signed(&mut parsed, ty)
-        if !parsed.ok { return const_fail(tok, "integer literal out of range") }
-        return const_ok_int(ty, parsed.value)
-    }
-    if kind == .Float {
-        spelling := c.world.tokens.texts[pos].clone(); pos = pos + 1
-        mut ty := 7; if expected == 6 { ty = 6 }
-        dec := decimal.decode(spelling, ty == 6)
-        if !dec.ok { return const_fail(tok, "floating literal is outside the finite range") }
-        return const_ok_int(ty, dec.bits)
-    }
-    if kind == .Byte {
-        parsed := parse.integer(c.world.tokens.texts[pos]); pos = pos + 1
-        return const_ok_int(8, parsed.value)
-    }
-    if kind == .Rune {
-        scalar := c.world.tokens.texts[pos].runes()[0]; pos = pos + 1
-        return const_ok_int(5, i64(i32(scalar)))
-    }
-    if kind == .String {
-        s := c.world.tokens.texts[pos].clone(); pos = pos + 1
-        return const_ok_str(s)
-    }
-    if c.world.tokens.texts[pos] == "true" { pos = pos + 1; return const_ok_int(3, 1) }
-    if c.world.tokens.texts[pos] == "false" { pos = pos + 1; return const_ok_int(3, 0) }
-    if kind == .Name {
-        name := c.world.tokens.texts[pos].clone(); pos = pos + 1
-        cast_ty := type_id(&c, name)
-        if (cast_ty == 1 || cast_ty == 2 || cast_ty == 5 || floats.has(cast_ty) || unsigned.has(cast_ty)) &&
-            pos < end && c.world.tokens.texts[pos] == "(" {
-            pos = pos + 1
-            mut arg_hint := 0
-            mut lit_at := pos; if lit_at < end && c.world.tokens.texts[lit_at] == "-" { lit_at = lit_at + 1 }
-            if lit_at + 1 < end && (c.world.tokens.kinds[lit_at] == .Integer || c.world.tokens.kinds[lit_at] == .Float) &&
-                c.world.tokens.texts[lit_at + 1] == ")" {
-                if floats.has(cast_ty) || c.world.tokens.kinds[lit_at] == .Integer { arg_hint = cast_ty }
-            }
-            inner := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, arg_hint, depth + 1)
-            if !inner.ok { return inner }
-            if pos >= end || c.world.tokens.texts[pos] != ")" { return const_fail(pos, "expected ')' in constant cast") }
-            pos = pos + 1
-            return const_cast_value(&c, cast_ty, move inner, tok)
-        }
-        if floats.has(cast_ty) && pos + 2 < end && c.world.tokens.texts[pos] == "." &&
-            c.world.tokens.texts[pos + 1] == "from_bits" && c.world.tokens.texts[pos + 2] == "(" {
-            pos = pos + 3
-            bits_ty := if cast_ty == 6 { 1 } else { 2 }
-            inner := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut pos, end, bits_ty, depth + 1)
-            if !inner.ok { return inner }
-            if inner.ty != bits_ty { return const_fail(tok, "from_bits constant type mismatch") }
-            if pos >= end || c.world.tokens.texts[pos] != ")" { return const_fail(pos, "expected ')'") }
-            pos = pos + 1
-            if cast_ty == 6 { return const_ok_int(6, inner.int_val.bit_and(4294967295)) }
-            return const_ok_int(7, inner.int_val)
-        }
-        other := i32(c.world.const_map.get_or(name, -1))
-        if other >= 0 {
-            if !eval_pending_const(&mut c, other, &ptypes, &pexprs, &pends, &mut states, tok) {
-                return const_fail(tok, c.error.clone())
-            }
-            okind := c.world.const_kinds[other]; oty := c.world.const_types[other]
-            if pos + 1 < end && c.world.tokens.texts[pos] == "." && c.world.tokens.texts[pos + 1] == "len" {
-                pos = pos + 2
-                if okind == 1 { return const_ok_int(1, i64(c.world.const_strings[other].len)) }
-                if okind == 2 { return const_ok_int(1, c.world.const_ints[other]) }
-                return const_fail(tok, "len expects a constant array or string")
-            }
-            if okind == 0 { return const_ok_int(oty, c.world.const_ints[other]) }
-            if okind == 1 { return const_ok_str(c.world.const_strings[other].clone()) }
-            return const_fail(tok, "nested constant array reference is not supported inside constant arrays")
-        }
-        return const_fail(tok, "unknown or non-constant identifier '" + diagnostics.display_symbol(&c.sources, name) + "'")
-    }
-    const_fail(tok, "unsupported token in constant expression")
-}
 fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, site_tok: i32) -> bool {
     if states[cid] == 2 { return true }
     if states[cid] == 1 {
@@ -2413,15 +1537,26 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
         c.body.cursor = ptypes[cid]
         expected = type_name(&mut c)
         if !c.ok { return false }
-        if !const_scalar_value_type(&c, expected) && expected != 4 &&
-            !(collection(&c, expected) && const_scalar_value_type(&c, ft.type_base(&c.types, expected))) {
+        if !const_eval.scalar_value_type(expected) && expected != 4 &&
+            !(collection(&c, expected) && const_eval.scalar_value_type(ft.type_base(&c.types, expected))) {
             c.body.cursor = ptypes[cid]
             fail(&mut c, "unsupported constant type '" + ft.type_spelling(&c.types, expected) + "'")
             return false
         }
     }
+    mut val := const_eval.empty_val()
     mut p := pexprs[cid]
-    val := const_eval_expr(&mut c, &ptypes, &pexprs, &pends, &mut states, &mut p, pends[cid], expected, 0)
+    while true {
+        p = pexprs[cid]
+        val = const_eval.eval_expr(&c.world, &c.types, &c.sources, c.code.platform, &states, &mut p, pends[cid], expected)
+        if !val.ok && val.need_const >= 0 {
+            if !eval_pending_const(&mut c, val.need_const, &ptypes, &pexprs, &pends, &mut states, val.error_tok) {
+                return false
+            }
+            continue
+        }
+        break
+    }
     if !val.ok {
         c.body.cursor = if val.error_tok >= 0 { val.error_tok } else { pexprs[cid] }
         fail(&mut c, val.error)
@@ -2433,7 +1568,13 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
         return false
     }
     mut final_ty := val.ty
+    if val.kind == 2 && final_ty == 0 { final_ty = compound(&mut c, 1, val.arr_elem) }
     if expected != 0 {
+        if val.kind == 2 && !collection(&c, expected) {
+            c.body.cursor = pexprs[cid]
+            fail(&mut c, "type mismatch: expected " + ft.type_spelling(&c.types, expected) + ", got constant array")
+            return false
+        }
         if expected != val.ty {
             c.body.cursor = pexprs[cid]
             fail(&mut c, "type mismatch: expected " + ft.type_spelling(&c.types, expected) + ", got " + ft.type_spelling(&c.types, val.ty))
@@ -2450,7 +1591,7 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
     c.world.const_kinds[cid] = val.kind
     if val.kind == 0 {
         c.world.const_ints[cid] = val.int_val
-        if const_int_type(final_ty) && !(unsigned.has(final_ty) && val.int_val < 0) && val.int_val >= 0 && val.int_val <= 1048576 {
+        if const_eval.int_type(final_ty) && !(unsigned.has(final_ty) && val.int_val < 0) && val.int_val >= 0 && val.int_val <= 1048576 {
             c.types.const_lengths.put(c.world.const_names[cid].clone(), val.int_val)
         }
     } else if val.kind == 1 {
@@ -2473,77 +1614,6 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
     states[cid] = 2
     c.body.cursor = saved_cursor
     true
-}
-struct ExternBinding { prio: i32, library: string, symbol: string }
-fn extern_target_priority(target: string) -> i32 {
-    if target == "macos" || target == "linux" || target == "arm64" || target == "x86_64" || target == "native" { return 2 }
-    3
-}
-fn parse_extern_attr(c: &mut Session) -> ExternBinding {
-    expect(&mut c, "(")
-    if !c.ok { return ExternBinding { prio: 0, library: "", symbol: "" } }
-    newlines(&mut c)
-    tok := c.body.cursor
-    kind := c.world.tokens.kinds[tok]
-    is_map := kind == .Name || (kind == .String && tok + 1 < c.world.tokens.kinds.len && c.world.tokens.texts[tok + 1] == "=")
-    if !is_map {
-        if kind != .String { fail(&mut c, "expected an extern library"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-        first_str := advance(&mut c); expect(&mut c, ",")
-        if !c.ok { return ExternBinding { prio: 0, library: "", symbol: "" } }
-        if c.world.tokens.kinds[c.body.cursor] != .String { fail(&mut c, "expected an extern symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-        second_str := advance(&mut c)
-        if eat(&mut c, ",") {
-            if c.world.tokens.kinds[c.body.cursor] != .String { fail(&mut c, "expected an extern symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            third_str := advance(&mut c); expect(&mut c, ")")
-            if !c.ok { return ExternBinding { prio: 0, library: "", symbol: "" } }
-            matched := tc_eval.target_match(c.code.platform, first_str)
-            if matched < 0 { fail(&mut c, "unknown @extern target '" + first_str + "'"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            if !fc.valid_foreign_name(second_str) || !fc.valid_foreign_name(third_str) { fail(&mut c, "invalid external library or symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            if matched == 0 { return ExternBinding { prio: 0, library: "", symbol: "" } }
-            return ExternBinding { prio: extern_target_priority(first_str), library: move second_str, symbol: move third_str }
-        }
-        expect(&mut c, ")")
-        if !c.ok { return ExternBinding { prio: 0, library: "", symbol: "" } }
-        if !fc.valid_foreign_name(first_str) || !fc.valid_foreign_name(second_str) { fail(&mut c, "invalid external library or symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-        return ExternBinding { prio: 1, library: move first_str, symbol: move second_str }
-    }
-    mut map_sym := ""; mut map_lib := ""; mut map_prio := 0; mut has_symbol := false
-    while c.ok && !is(&c, ")") {
-        k := c.world.tokens.kinds[c.body.cursor]
-        if k != .Name && k != .String { fail(&mut c, "expected @extern key"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-        key := advance(&mut c)
-        expect(&mut c, "=")
-        if !c.ok { return ExternBinding { prio: 0, library: "", symbol: "" } }
-        if c.world.tokens.kinds[c.body.cursor] != .String { fail(&mut c, "expected string value in @extern"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-        val := advance(&mut c)
-        if key == "symbol" {
-            if has_symbol { fail(&mut c, "duplicate 'symbol' in @extern"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            has_symbol = true
-            if !fc.valid_foreign_name(val) { fail(&mut c, "invalid external library or symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            map_sym = move val
-        } else if key == "default" {
-            if !fc.valid_foreign_name(val) { fail(&mut c, "invalid external library or symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            if 1 > map_prio { map_prio = 1; map_lib = move val }
-            else if 1 == map_prio { fail(&mut c, "duplicate 'default' in @extern"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-        } else {
-            matched := tc_eval.target_match(c.code.platform, key)
-            if matched < 0 { fail(&mut c, "unknown @extern target '" + key + "'"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            if !fc.valid_foreign_name(val) { fail(&mut c, "invalid external library or symbol"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            if matched == 1 {
-                prio := extern_target_priority(key)
-                if prio > map_prio { map_prio = prio; map_lib = move val }
-                else if prio == map_prio { fail(&mut c, "duplicate @extern binding for this target"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-            }
-        }
-        newlines(&mut c)
-        if !eat(&mut c, ",") { break }
-        newlines(&mut c)
-    }
-    expect(&mut c, ")")
-    if !c.ok { return ExternBinding { prio: 0, library: "", symbol: "" } }
-    if !has_symbol { fail(&mut c, "@extern map requires 'symbol'"); return ExternBinding { prio: 0, library: "", symbol: "" } }
-    if map_prio == 0 { return ExternBinding { prio: 0, library: "", symbol: "" } }
-    ExternBinding { prio: map_prio, library: move map_lib, symbol: move map_sym }
 }
 fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
     mut stack: []i32 = []
@@ -2600,8 +1670,10 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             annotation := advance(&mut c)
             if annotation == "extern" {
                 has_extern = true
-                pick := parse_extern_attr(&mut c)
-                if !c.ok { break }
+                mut cur := c.body.cursor
+                pick := resolve.parse_extern_attr(&c.world.tokens, c.code.platform, &mut cur)
+                c.body.cursor = cur
+                if pick.error != "" { fail(&mut c, pick.error); break }
                 if pick.prio > extern_prio {
                     extern_prio = pick.prio; library = move pick.library; symbol = move pick.symbol
                 } else if pick.prio > 0 && pick.prio == extern_prio {
@@ -2816,7 +1888,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             expect(&mut c, "=")
             if !c.ok { break }
             cexpr_tok := c.body.cursor
-            cend_tok := const_expr_end(&c.world.tokens, cexpr_tok)
+            cend_tok := const_eval.expr_end(&c.world.tokens, cexpr_tok)
             if cend_tok <= cexpr_tok { fail(&mut c, "expected constant expression"); break }
             cid := c.world.const_names.len
             c.world.const_map.put(cname.clone(), i64(cid))
@@ -3219,7 +2291,7 @@ fn leave(c: &mut Session) {
     c.body.scope = c.body.scope - 1
 }
 fn narrow(c: &mut Session) {
-    integers.check_i32(&mut c.code, c.overflow)
+    arm.check_i32(&mut c.code, c.overflow)
 }
 fn float_literal(c: &mut Session, spelling: string, expected: i32) -> i32 {
     mut ty := 7; if expected == 6 { ty = 6 }
@@ -3312,7 +2384,7 @@ fn intrinsic_dispatch(c: &mut Session, name: string, expected: i32, catalog: &op
     else if name == "__sys_net_local_port" { covered = true; target = c.runtime.sys_net_local_port; ret = 2 }
     else if name == "__sys_net_shutdown_write" { covered = true; target = c.runtime.sys_net_shutdown_write; ret = 2 }
     else if name == "__sys_net_close" { covered = true; target = c.runtime.sys_net_close; ret = 2 }
-    if target < 0 { fail(&mut c, "unsupported intrinsic '" + name + "'"); return 0 }
+    if !covered || (!c.code.forbid_emit && target < 0) { fail(&mut c, "unsupported intrinsic '" + name + "'"); return 0 }
     mut count := 0
     while c.ok && !is(&c, ")") {
         mut want := 0
@@ -3479,7 +2551,7 @@ fn foreign_call(c: &mut Session, sig: i32, catalog: &opt_inline.View, inline_wor
         arm.store(&mut c.code, result_slot, 0)
     }
     mut patches := fa.new_patches(0)
-    fa.emit_foreign_call(&mut c.code, &spec, callee, &values, &locations,
+    arm.emit_foreign_call(&mut c.code, &spec, callee, &values, &locations,
         result_slot, indirect_result, gp, fp, outgoing, c.has_callbacks,
         &mut patches, c.float_trap, c.overflow)
     for i in 0..patches.sites.len {
@@ -3497,11 +2569,11 @@ fn validate_layouts(c: &mut Session) {
     ft.validate_layouts(&mut c.types, c.code.platform)
     check_type_error(&mut c)
 }
-fn copy_inline(c: &mut Session, bytes: i32) { fa.copy_inline(&mut c.code, bytes) }
+fn copy_inline(c: &mut Session, bytes: i32) { arm.copy_inline(&mut c.code, bytes) }
 fn zero_record(c: &mut Session, ty: i32, at: i32) {
     bytes := ft.c_size(&c.types, ty)
     arm.allocate_value(&mut c.code, c.runtime.alloc_record, .CRecord, ty, bytes, c.world.tokens.starts[at])
-    fa.clear_record(&mut c.code, bytes)
+    arm.clear_record(&mut c.code, bytes)
 }
 fn fixed_pod(c: &Session, ty: i32) -> bool { ft.fixed_pod(&c.types, ty) }
 fn inline_value(c: &mut Session, ty: i32, access: borrows.Access, token: i32) {
@@ -3510,7 +2582,7 @@ fn inline_value(c: &mut Session, ty: i32, access: borrows.Access, token: i32) {
     if !fixed_pod(&c, ty) { fail(&mut c, "inline C arrays require scalar elements"); return }
     elem := ft.type_base(&c.types, ty)
     mut local_slots := c.body.slots; mut err := ""
-    fa.inline_descriptor(&mut c.code, ft.type_count(&c.types, ty), ft.c_size(&c.types, elem), &mut local_slots, &mut err)
+    arm.inline_descriptor(&mut c.code, ft.type_count(&c.types, ty), ft.c_size(&c.types, elem), &mut local_slots, &mut err)
     c.body.slots = local_slots
     if err != "" { fail(&mut c, err) }
 }
@@ -3537,7 +2609,7 @@ fn callback_entry(c: &mut Session, id: i32) {
     ptypes.reserve(count)
     for p in 0..count { ptypes.push(c.world.param_types[first + p]) }
     mut patches := fa.new_patches(c.imports.globals)
-    fa.emit_callback_entry(&mut c.code, &mut patches, c.fn_labels[id], c.callback_labels[id], &ptypes, c.world.returns[id])
+    arm.emit_callback_entry(&mut c.code, &mut patches, c.fn_labels[id], c.callback_labels[id], &ptypes, c.world.returns[id])
     c.imports.globals = patches.globals
     for i in 0..patches.sites.len { c.imports.sites.push(patches.sites[i]); c.imports.slots.push(patches.slots[i]) }
 }
@@ -4209,7 +3281,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         }
         for _ in 0..5 { _ := slot(&mut c) }
         data_home := slot(&mut c)
-        borrowed_view.emit_raw(&mut c.code, base_home, len_home, data_home, c.bounds, c.world.tokens.starts[token])
+        arm.borrowed_emit_raw(&mut c.code, base_home, len_home, data_home, c.bounds, c.world.tokens.starts[token])
         holder := slot(&mut c); arm.store(&mut c.code, holder, 0)
         arr_ty := compound(&mut c, 1, 8)
         place_step(&mut c, .BorrowHome, arr_ty, 3, 0, holder, token)
@@ -4274,7 +3346,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         args: []i32 = [recv_slot]
         c.body.facts.needed.push(str_fn)
         task_edge(&mut c, str_fn, source)
-        source_call.lower(&mut c.code, c.fn_labels[str_fn], -1, -1, &args, c.world.ffi_types[str_fn], 4, source)
+        arm.lower_call(&mut c.code, c.fn_labels[str_fn], -1, -1, &args, c.world.ffi_types[str_fn], 4, source)
         release_arg_slots(&mut c, &args)
         _ := temporary(&mut c, 4)
         fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
@@ -4319,12 +3391,12 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         ty := read_scalar_result(&mut c, value, token)
         if floats.has(ty) || floats.has(hint) {
             if (!floats.has(ty) && ty != 1 && ty != 2 && !unsigned.has(ty)) || hint == 5 { fail(&mut c, "expected a numeric conversion"); return hint }
-            floats.cast(&mut c.code, ty, hint, c.float_trap, offset); return hint
+            arm.float_cast(&mut c.code, ty, hint, c.float_trap, offset); return hint
         }
         if ty == 13 && hint == 12 { require_unsafe(&mut c); return 12 }
         if ty != 1 && ty != 2 && ty != 5 && !unsigned.has(ty) && ft.type_kind(&c.types, ty) != 3 { fail(&mut c, "integer conversion requires an integer") }
         if hint == 5 { arm.intrinsic_call(&mut c.code, c.runtime.valid_rune, .CheckRune, ty, hint, offset) }
-        unsigned.cast(&mut c.code, ty, hint, c.overflow)
+        arm.unsigned_cast(&mut c.code, ty, hint, c.overflow)
         if hint == 1 { narrow(&mut c) }; return hint
     }
     covered = true
@@ -4353,61 +3425,13 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
     invoke(&mut c, signature, address, f, -1, &catalog, &mut inline_work, &mut model)
 }
 fn scoped_borrow_body(c: &Session, f: i32) -> bool {
-    for i in c.world.starts[f]..c.world.ends[f] {
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "as_bytes" { return true }
-        if c.world.tokens.kinds[i] != .Symbol || c.world.tokens.texts[i] != "&" { continue }
-        mut before := i - 1
-        while before >= c.world.starts[f] && (lexer.is_newline(c.world.tokens.kinds[before]) || c.world.tokens.texts[before] == "(") { before -= 1 }
-        if before >= 0 && (c.world.tokens.texts[before] == ":=" || c.world.tokens.texts[before] == "=") { return true }
-        if c.world.tokens.texts[i + 1] == "mut" { continue }
-        mut at := i + 1
-        if c.world.tokens.kinds[at] != .Name { return true }
-        if c.world.tokens.texts[at] == "await" || c.world.tokens.texts[at] == "spawn" { return true }
-        if c.world.functions.get_or(c.world.tokens.texts[at], -1) >= 0 || resolve_type_name(&c, c.world.tokens.texts[at]) >= 0 { return true }
-        at += 1
-        while at < c.world.ends[f] {
-            token := c.world.tokens.texts[at].clone()
-            if token == "(" || token == "{" || token == "::" { return true }
-            if token == "." {
-                if c.world.tokens.texts[at + 1] == "len" { return true }
-                at += 2
-            } else if token == "[" {
-                mut depth := 1; at += 1
-                while at < c.world.ends[f] && depth > 0 {
-                    if c.world.tokens.texts[at] == ".." { return true }
-                    if c.world.tokens.texts[at] == "[" { depth += 1 }
-                    if c.world.tokens.texts[at] == "]" { depth -= 1 }
-                    at += 1
-                }
-            } else { break }
-        }
-    }
-    false
+    ownership_check.scoped_borrow_body(&c.world, &c.types, c.body.self_type, f)
 }
 fn needs_loan_analysis(c: &Session, f: i32) -> bool {
-    if !c.loans.active { return false }
-    for p in c.world.param_starts[f]..c.world.param_starts[f] + c.world.param_counts[f] {
-        kind := ft.type_kind(&c.types, c.world.param_types[p])
-        if kind == 4 || kind == 5 { return true }
-    }
-    for i in c.world.starts[f]..c.world.ends[f] {
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "region" && c.world.tokens.kinds[i + 1] == .Name { return true }
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "bytes_view" && c.world.tokens.texts[i + 1] == "(" { return true }
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "as_bytes" && c.world.tokens.texts[i + 1] == "(" { return true }
-        if c.world.tokens.kinds[i] == .Symbol && c.world.tokens.texts[i] == "&" && c.world.tokens.texts[i + 1] == "mut" { return true }
-    }
-    scoped_borrow_body(&c, f)
+    ownership_check.needs_loan_analysis(&c.world, &c.types, c.loans.active, c.body.self_type, f)
 }
 fn loan_origin(c: &Session, place: i32) -> i32 {
-    binding := borrows.root(&c.body.places, place)
-    if binding < 0 { return -1 }
-    if local_borrows.shared(&c.body.local_loans, binding) { return local_borrows.origin(&c.body.local_loans, binding) }
-    kind := ft.type_kind(&c.types, c.body.locals.types[binding])
-    if kind == 21 { return -2 }
-    if c.body.locals.scopes[binding] == 0 && (kind == 4 || kind == 5) {
-        return c.body.first_parameter + binding
-    }
-    -1
+    ownership_check.loan_origin(&c.body, &c.types, place)
 }
 fn forward_loan(c: &mut Session, origin: i32, f: i32, signature: i32, parameter: i32, at: i32) {
     if origin == -1 { return }
@@ -4440,7 +3464,7 @@ fn inline_rune_stream(c: &mut Session, values: i32, cursor: i32, source: i32) ->
         fragments.remaining_words(&c.body.inline_deps) < estimate { return false }
     first := arm.position(&c.code)
     arm.load(&mut c.code, values)
-    iteration.rune(&mut c.code, source)
+    arm.iter_rune(&mut c.code, source)
     arm.store(&mut c.code, cursor, 1)
     _ := charge_inline(&mut c, -1, estimate, first)
     true
@@ -4635,9 +3659,9 @@ fn invoke_with_args(c: &mut Session, signature: i32, address: i32, f: i32, wasm_
     if view {
         for _ in 0..6 { _ := slot(&mut c) }
         holder := slot(&mut c)
-        borrowed_view.pass_result(&mut c.code, holder)
+        arm.borrowed_pass_result(&mut c.code, holder)
     }
-    source_call.lower(&mut c.code, label, entry, wasm_sig, &args, signature, result, source_offset)
+    arm.lower_call(&mut c.code, label, entry, wasm_sig, &args, signature, result, source_offset)
     release_arg_slots(&mut c, &own_args)
     if view { arm.pop(&mut c.code, 9) }
     if boxed { arm.pop(&mut c.code, 9) }
@@ -4775,7 +3799,7 @@ fn primary(c: &mut Session, expected: i32, catalog: &opt_inline.View, inline_wor
                     mut shift := 0; if !text { shift = unsigned.shift(storage_type(&c, base)) }
                     for _ in 0..5 { _ := slot(&mut c) }
                     data_home := slot(&mut c)
-                    borrowed_view.emit(&mut c.code, source_home, first_home, last_home, data_home, text, shift, c.bounds, c.unicode_trap, c.world.tokens.starts[subscript_at])
+                    arm.borrowed_emit(&mut c.code, source_home, first_home, last_home, data_home, text, shift, c.bounds, c.unicode_trap, c.world.tokens.starts[subscript_at])
                     holder := slot(&mut c); arm.store(&mut c.code, holder, 0)
                     c.body.loan.home = holder; c.body.loan.path = source_path
                     c.body.loan.root = source_root_id; c.body.loan.origin = source_origin; c.body.loan.parent = source_parent; c.body.loan.constrained = true
@@ -5064,6 +4088,7 @@ fn enumeration(c: &mut Session, ty: i32, catalog: &opt_inline.View, inline_work:
     arm.load(&mut c.code, index); fc.clear_rvalue_place(&mut c.body.place); temporary(&mut c, ty)
 }
 fn new_block(c: &mut Session) -> i32 {
+    if c.code.forbid_emit { return 0 }
     arm.label(&mut c.code) - c.body.block_base
 }
 fn bind_block(c: &mut Session, id: i32) { arm.mark(&mut c.code, c.body.block_base + id) }
@@ -5727,7 +4752,7 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
         value := primary(&mut c, expected, &catalog, &mut inline_work, &mut model)
         ty := read_scalar_result(&mut c, value, token)
         if model.recording { _ := typed.node(&mut model, 4, ty, model.value, -1, -1, 1, -1, token) }
-        if floats.has(ty) { result := floats.method(&mut c.code, ty, "negate", c.world.tokens.starts[token]); fc.clear_rvalue_place(&mut c.body.place); return result }
+        if floats.has(ty) { result := arm.float_method(&mut c.code, ty, "negate", c.world.tokens.starts[token]); fc.clear_rvalue_place(&mut c.body.place); return result }
         if ty != 1 && ty != 2 { fail(&mut c, "minus requires a signed number") }
         arm.integer_binary(&mut c.code, 2, true, true, 0, 31, 0, -1); arm.branch(&mut c.code, c.overflow, 8); if ty == 1 { narrow(&mut c) }; fc.clear_rvalue_place(&mut c.body.place); return ty
     }
@@ -6043,20 +5068,20 @@ fn integer_method(c: &mut Session, ty: i32, name: string, catalog: &opt_inline.V
     op := integers.method(name)
     covered = op != .Unknown
     if op == .Not {
-        expect(&mut c, ")"); integers.complement(&mut c.code, ty); return ty
+        expect(&mut c, ")"); arm.int_complement(&mut c.code, ty); return ty
     }
     mut want := ty; if integers.is_shift(op) { want = 1 }
     if covered && c.body.depth < 128 && c.body.cursor + 1 < c.world.tokens.kinds.len && c.world.tokens.kinds[c.body.cursor] == .Integer &&
         c.world.tokens.kinds[c.body.cursor + 1] == .Symbol && c.world.tokens.texts[c.body.cursor + 1] == ")" {
         spelling := advance(&mut c)
         value := integer_literal(&mut c, spelling, want)
-        expect(&mut c, ")"); integers.immediate(&mut c.code, op, ty, value, c.bounds); return ty
+        expect(&mut c, ")"); arm.int_immediate(&mut c.code, op, ty, value, c.bounds); return ty
     }
     arm.push_temp(&mut c.code, 0)
     right := expression(&mut c, 0, want, &catalog, &mut inline_work, &mut model); same(&mut c, want, right)
     expect(&mut c, ")"); arm.pop_temp(&mut c.code, 1)
     if !covered { fail(&mut c, "unknown integer method '" + name + "'"); return ty }
-    integers.dynamic(&mut c.code, op, ty, c.bounds); ty
+    arm.int_dynamic(&mut c.code, op, ty, c.bounds); ty
 }
 fn swap_address(c: &mut Session, ty: i32, place: i32, packed: bool, values: i32, index: i32, token: i32) -> i32 {
     arm.load_into(&mut c.code, values, 1); arm.load(&mut c.code, index)
@@ -6170,7 +5195,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         if name == "str" { covered = true; format_float(&mut c, ty, source); return 4 }
         if name == "negate" { fail(&mut c, "unknown float method"); return ty }
         if name == "to_bits" || name == "is_sign_negative" || name == "abs" || name == "sqrt" || name == "floor" || name == "ceil" || name == "round" || name == "round_ties_even" || name == "trunc" || name == "is_nan" || name == "is_finite" || name == "is_infinite" { covered = true }
-        actual := floats.method(&mut c.code, ty, name, c.world.tokens.starts[c.body.cursor - 3])
+        actual := arm.float_method(&mut c.code, ty, name, c.world.tokens.starts[c.body.cursor - 3])
         if actual < 0 { fail(&mut c, "unknown float method"); return ty }
         return actual
     }
@@ -6196,7 +5221,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
         source_home := slot(&mut c); arm.store(&mut c.code, source_home, 0)
         for _ in 0..5 { _ := slot(&mut c) }
         data_home := slot(&mut c)
-        borrowed_view.emit_string_bytes(&mut c.code, source_home, data_home)
+        arm.borrowed_emit_string_bytes(&mut c.code, source_home, data_home)
         holder := slot(&mut c); arm.store(&mut c.code, holder, 0)
         arr_u8 := compound(&mut c, 1, 8)
         place_step(&mut c, .BorrowHome, arr_u8, 3, 0, holder, c.body.cursor - 2)
@@ -6258,7 +5283,7 @@ fn method_dispatch(c: &mut Session, ty: i32, name: string, place: i32, receiver_
             expect(&mut c, ")"); arm.intrinsic_call(&mut c.code, c.runtime.string_slice, .Slice, ty, 4, source); return 4
         }
     }
-    if target < 0 { fail(&mut c, "unknown method '" + name + "'"); return 0 }
+    if !covered || (!c.code.forbid_emit && target < 0) { fail(&mut c, "unknown method '" + name + "'"); return 0 }
     expect(&mut c, ")")
     if count == 1 { arm.mov(&mut c.code, 1, 0) }; arm.pop_temp(&mut c.code, 0)
     if count == 1 && ri.mutates_receiver(operation) {
@@ -6277,12 +5302,12 @@ fn comparison_value(c: &mut Session, operator: string) {
 }
 fn binary(c: &mut Session, operator: string, ty: i32, token: i32) -> i32 {
     fc.clear_loan_eval(&mut c.body.loan)
-    if ty == 13 && (operator == "==" || operator == "!=") { return unsigned.binary(&mut c.code, operator, 12, c.overflow, c.zero) }
+    if ty == 13 && (operator == "==" || operator == "!=") { return arm.unsigned_binary(&mut c.code, operator, 12, c.overflow, c.zero) }
     if floats.has(ty) {
         if operator == "%" { fail(&mut c, "remainder requires integers"); return ty }
-        return floats.binary(&mut c.code, operator, ty, c.world.tokens.starts[token])
+        return arm.float_binary(&mut c.code, operator, ty, c.world.tokens.starts[token])
     }
-    if unsigned.has(ty) { return unsigned.binary(&mut c.code, operator, ty, c.overflow, c.zero) }
+    if unsigned.has(ty) { return arm.unsigned_binary(&mut c.code, operator, ty, c.overflow, c.zero) }
     if ty == 4 {
         arm.mov(&mut c.code, 2, 0); arm.mov(&mut c.code, 0, 1); arm.mov(&mut c.code, 1, 2)
         if operator == "+" { arm.intrinsic_call(&mut c.code, c.runtime.string_concat, .Concat, 4, 4, c.world.tokens.starts[token]); return 4 }
@@ -6295,7 +5320,7 @@ fn binary(c: &mut Session, operator: string, ty: i32, token: i32) -> i32 {
         fail(&mut c, "comparison requires integers or bool equality")
     }
     if c.code.prefixing { arm.pending_operator(&mut c.code, opcode, ty, token) }
-    else if c.ok && !c.code.checking { integers.signed_binary(&mut c.code, opcode, ty, c.overflow, c.zero) }
+    else if c.ok && !c.code.checking { arm.signed_binary(&mut c.code, opcode, ty, c.overflow, c.zero) }
     if opcode <= 5 { ty } else { 3 }
 }
 fn float_context(c: &Session, expected: i32) -> i32 {
@@ -6392,7 +5417,7 @@ fn signed_immediate_rhs(c: &mut Session, ty: i32, priority: i32, operator: strin
     c.body.cursor = at + 1
     if priority == 5 {
         if field != 0 {
-            integers.signed_add_sub(&mut c.code, ty, (operator == "-") != negative, true, c.overflow, 0, 0, -1, magnitude)
+            arm.signed_add_sub(&mut c.code, ty, (operator == "-") != negative, true, c.overflow, 0, 0, -1, magnitude)
         }
     } else {
         arm.compare_immediate(&mut c.code, 0, magnitude, negative && magnitude != 0)
@@ -6609,7 +5634,7 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
             }
             c.body.facts.needed.push(m_fn)
             task_edge(&mut c, m_fn, c.world.tokens.starts[op_at])
-            source_call.lower(&mut c.code, c.fn_labels[m_fn], -1, -1, &args, c.world.ffi_types[m_fn], 3, c.world.tokens.starts[op_at])
+            arm.lower_call(&mut c.code, c.fn_labels[m_fn], -1, -1, &args, c.world.ffi_types[m_fn], 3, c.world.tokens.starts[op_at])
             release_arg_slots(&mut c, &args)
             fc.clear_loan_eval(&mut c.body.loan); fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
             ty = 3; model.recording = false
@@ -6696,7 +5721,7 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
         range_source := c.world.tokens.starts[c.body.cursor - 1]; model.recording = false
         place = 0; same(&mut c, 1, ty); arm.push_temp(&mut c.code, 0)
         high := expression(&mut c, 1, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, high); arm.pop_temp(&mut c.code, 1)
-        iteration.emit(&mut c.code, .PackRange, .Range, 1, range_source)
+        arm.iter_emit(&mut c.code, .PackRange, .Range, 1, range_source)
         ty = 14; fc.clear_rvalue_place(&mut c.body.place)
     }
     if model.probing && ty > 3 && !is(&c, ")") && owned(&c, ty) {
@@ -6718,14 +5743,10 @@ fn place_access(c: &Session) -> borrows.Access {
     .Value
 }
 fn is_for_locked_except(c: &Session, path: i32, skip: i32) -> bool {
-    if path < 0 { return false }
-    for i in 0..c.body.for_locks.len {
-        if i != skip && ownership.overlaps(&c.body.ownership, c.body.for_locks[i], path) { return true }
-    }
-    false
+    ownership_check.is_for_locked_except(&c.body, path, skip)
 }
 fn is_for_locked(c: &Session, path: i32) -> bool {
-    is_for_locked_except(&c, path, -1)
+    ownership_check.is_for_locked(&c.body, path)
 }
 fn move_loop_begin(c: &mut Session) {
     ownership.loop_begin(&mut c.body.ownership)
@@ -6781,7 +5802,7 @@ fn unwind_exit(c: &mut Session, floor: i32, target_depth: i32) {
     arm.discard_operands(&mut c.code, depth, target_depth)
 }
 fn return_from_body(c: &mut Session, at: i32) {
-    if c.body.view_result_destination >= 0 { borrowed_view.return_to(&mut c.code, c.body.view_result_destination) }
+    if c.body.view_result_destination >= 0 { arm.borrowed_return_to(&mut c.code, c.body.view_result_destination) }
     preserve := !c.code.checking && (c.body.defers.bodies.len > 0 || c.body.pending.slots.len > 0)
     if preserve && c.body.ret_type != 0 {
         if c.body.defers.return_slot < 0 { c.body.defers.return_slot = slot(&mut c) }
@@ -6905,8 +5926,7 @@ fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, in
                 break
             }
             if !c.code.checking {
-                c.code.checking = true; c.code.mir_capture = false
-                c.code.virtual_words = c.code.words.len; c.code.virtual_labels = c.code.labels.len
+                c.code.checking = true; c.code.forbid_emit = true; c.code.mir_capture = false
             }
             ownership.pop_loops_to(&mut c.body.ownership, saved_ow_loops)
             ownership.resume(&mut c.body.ownership)
@@ -7652,7 +6672,7 @@ fn scratch_declaration(c:&mut Session, name:string, mutable:bool, catalog: &opt_
     for _ in 0..5 { _ := slot(&mut c) }
     descriptor:=slot(&mut c)
     stride := unsigned.shift(storage_type(&c, elem))
-    scratch.allocate(&mut c.code,area,descriptor,elem,width,align,c.bounds,stride,c.world.tokens.starts[start + 7])
+    arm.scratch_allocate(&mut c.code,area,descriptor,elem,width,align,c.bounds,stride,c.world.tokens.starts[start + 7])
     arm.store(&mut c.code,binding,0);bind(&mut c, &mut model,name.clone(),view,mutable,binding,start - 1);end_statement(&mut c)
     true
 }
@@ -7793,8 +6813,8 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
             same(&mut c, 1, low); arm.store(&mut c.code, cursor, 0)
             high := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model); same(&mut c, 1, high); arm.store(&mut c.code, limit, 0); high_node = model.value
         } else if !borrowed_for && low == 14 {
-            arm.mov(&mut c.code, 1, 0); iteration.emit(&mut c.code, .RangeStart, kind, base, source); arm.store(&mut c.code, cursor, 0)
-            iteration.emit(&mut c.code, .RangeLimit, kind, base, source); arm.store(&mut c.code, limit, 0)
+            arm.mov(&mut c.code, 1, 0); arm.iter_emit(&mut c.code, .RangeStart, kind, base, source); arm.store(&mut c.code, cursor, 0)
+            arm.iter_emit(&mut c.code, .RangeLimit, kind, base, source); arm.store(&mut c.code, limit, 0)
         } else {
             if !collection(&c, low) { fail(&mut c, "for requires a range or array"); return false }
             array = true; base = ft.type_base(&c.types, low); kind = .Array; if ft.type_kind(&c.types, low) == 6 { kind = .Fixed }
@@ -7827,7 +6847,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         iterator := model.local_types.len - 1
         previous_reentry := c.body.reenter_owners; c.body.reenter_owners = true
         bind_block(&mut c, head); arm.load(&mut c.code, cursor); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, limit)
-        iteration.emit(&mut c.code, .Test, kind, base, source); source_edge(&mut c, done, .RangeDone, name_at)
+        arm.iter_emit(&mut c.code, .Test, kind, base, source); source_edge(&mut c, done, .RangeDone, name_at)
         if stream != 0 {
             mut expanded := false
             if stream == 5 { expanded = inline_rune_stream(&mut c, values, cursor, source) }
@@ -7868,7 +6888,7 @@ fn statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_i
         if model.recording { _ := typed.node(&mut model, 19, 0, low_node, high_node, model.value, 0, iterator, at) }
         if locked_path >= 0 { _ := c.body.for_locks.pop() }
         bind_block(&mut c, next)
-        if stream != 5 { arm.load(&mut c.code, cursor); iteration.emit(&mut c.code, .Advance, kind, base, source); arm.store(&mut c.code, cursor, 0) }
+        if stream != 5 { arm.load(&mut c.code, cursor); arm.iter_emit(&mut c.code, .Advance, kind, base, source); arm.store(&mut c.code, cursor, 0) }
         move_loop_backedge(&mut c); move_loop_end(&mut c, &loop_exit)
         source_edge(&mut c, head, .Jump, c.body.cursor); bind_block(&mut c, done); leave(&mut c)
         c.body.reenter_owners = previous_reentry; return false
@@ -8293,6 +7313,12 @@ pub fn compile_mode(source: string, platform: i32, module_starts: &[]i32, module
     mut c := new_session(); scan_into(&mut c, source); config := configuration()
     compile_loaded(&mut c, platform, &module_starts, &module_files, check_all, report, &mut records, "", "", &config)
 }
+pub fn check_hir(source: string, platform: i32, module_starts: &[]i32, module_files: &[]i32) -> hir.Program {
+    mut c := new_session(); scan_into(&mut c, source); config := configuration()
+    mut ignored := bindings()
+    _ := compile_loaded(&mut c, platform, &module_starts, &module_files, true, true, &mut ignored, "", "", &config)
+    c.hir
+}
 pub fn compile_tokens(tokens: &mut lexer.Tokens, platform: i32, module_starts: &[]i32, module_files: &[]i32, check_all: bool, report: bool, records: &mut Bindings) -> Result {
     compile_configured(&mut tokens, platform, &module_starts, &module_files, check_all, report, &mut records, "", "", true)
 }
@@ -8319,6 +7345,7 @@ pub fn new_session() -> Session {
         discovering_compounds: false, known_compounds: Map<string, i64>::new(), demanded_compounds: Map<string, i64>::new(),
         demanded_inferred_keys: Map<string, i64>::new(), demanded_inferred_args: [],
         validating_dead: false, validated_through: -1, report: report, bindings: bindings(),
+        hir: hir.new_program(),
         wasm_abi: wa.new(), imports: imports(), callback_labels: [], has_callbacks: false,
         code: code, runtime: rt, needed: [], loans: scratch.loans(),
         fn_labels: [],
@@ -8428,8 +7455,9 @@ pub fn hydrate_validation_worker(c: &mut Session, src: &frozen.World) {
     c.warn_unused_fns = src.warn_unused.clone()
     c.specializations.first = src.gen_first; c.specializations.end = src.gen_end
     c.tasks.program = src.tasks; c.tasks.spawners = src.spawners.clone(); c.loans.active = src.loans
-    c.fn_labels = src.fn_labels.clone(); c.jobs.globals = src.globals; c.code.checking = true
-    c.code.platform = 0; c.code.virtual_labels = src.globals; c.validating_dead = true
+    c.fn_labels = src.fn_labels.clone(); c.jobs.globals = src.globals
+    c.code = arm.new_no_emit(0); c.runtime = runtime.empty()
+    c.validating_dead = true
     c.scalar_enabled = false; c.inline_enabled = false; c.report = src.report
 }
 pub fn load_validation_body(c: &mut Session, src: &frozen.World, f: i32) {
@@ -8561,7 +7589,9 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
         if !c.world.tokens.ok { return session_fail_at(&mut c, c.world.tokens.error.clone(), c.world.tokens.error_at) }
     }
     for name in rules.primitive_types() { _ := add_type(&mut c, name, 0, 0) }
-    pre_register_int_consts(&mut c)
+    mut lengths := replace(&mut c.types.const_lengths, Map<string, i64>::new())
+    const_eval.pre_register_int_consts(&c.world.tokens, &mut lengths)
+    c.types.const_lengths = move lengths
     if c.world.tokens.ok && generics.needed(&c.world.tokens) {
         mut tokens := replace(&mut c.world.tokens, lexer.empty(false))
         program := generics.bind_program(&mut tokens, &mut c.types, platform)
@@ -8727,12 +7757,22 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     }
     if !c.world.tokens.ok { return session_fail_at(&mut c, c.world.tokens.error.clone(), c.world.tokens.error_at) }
     mut code := arm.new_for(platform)
-    if check_all { code = arm.new_check(platform) }
     code.profile = instrument_runtime && !check_all
-    rt := runtime.new(&mut code)
-    array_take := arm.label(&mut code)
+    mut rt := runtime.empty()
+    mut array_take := -1
+    if check_all {
+        code = arm.new_no_emit(platform)
+    } else {
+        rt = runtime.new(&mut code)
+        array_take = arm.label(&mut code)
+    }
     c.code = code; c.runtime = rt.clone(); c.array_take = array_take
-    c.report = report; c.world.source_end = source_end; c.float_source = uses_float
+    if check_all {
+        c.closure_drop = -1; c.array_helpers = -1
+        c.print_int = -1; c.print_bool = -1; c.print_text = -1; c.write = -1
+        c.float_trap = -1; c.unicode_trap = -1; c.overflow = -1; c.zero = -1; c.assertion = -1; c.io = -1; c.bounds = -1
+    }
+    c.report = report; c.hir.recording = report; c.world.source_end = source_end; c.float_source = uses_float
     c.scalar_enabled = scalar_enabled; c.ownership_enabled = config.ownership_enabled; c.const_div_enabled = config.const_div_enabled
     c.range_enabled = config.range_enabled; c.inline_enabled = config.inline_enabled && scalar_enabled && !check_all
     c.mir_opt_enabled = config.mir_opt_enabled
@@ -8780,9 +7820,32 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     if !c.ok || c.has_errors { return abort_with_diagnostics(&mut c) }
     main_id := i32(entry)
     ft.seal(&mut c.types, platform); check_type_error(&mut c)
+    if c.hir.recording {
+        for f in 0..c.world.names.len {
+            if c.world.starts[f] > 0 && c.world.starts[f] <= c.world.ends[f] && c.world.ends[f] < c.world.tokens.starts.len {
+                start_off := c.world.tokens.starts[c.world.starts[f]]
+                end_off := c.world.tokens.starts[c.world.ends[f]]
+                if start_off < c.world.source_end && !generics.generated(&c.specializations, start_off) {
+                    fn_name := c.world.names[f].clone()
+                    owner := c.world.function_owners[f]
+                    ret := c.world.returns[f]
+                    tsp := type_spelling(&c, ret)
+                    _ := hir.record_symbol(&mut c.hir, .Fn, move fn_name, owner, start_off, end_off, ret, move tsp)
+                }
+            }
+        }
+        for ci in 0..c.world.const_names.len {
+            cty := c.world.const_types[ci]
+            if cty >= 0 {
+                cname := c.world.const_names[ci].clone()
+                tsp := type_spelling(&c, cty)
+                _ := hir.record_symbol(&mut c.hir, .Const, move cname, -1, 0, 0, cty, move tsp)
+            }
+        }
+    }
     if main_id >= 0 && (c.world.param_counts[main_id] != 0 || (c.world.returns[main_id] != 0 && c.world.returns[main_id] != 1)) { fail(&mut c, "main must take no arguments and return i32 or ()") }
     for f in 0..c.world.names.len {
-        label := arm.label(&mut c.code)
+        label := if check_all { -1 } else { arm.label(&mut c.code) }
         receiver := c.world.impl_types[f]
         mut site := -1
         if receiver >= 0 {
@@ -8798,13 +7861,15 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
         c.specializations.function_instances.push(site)
         c.fn_labels.push(label); c.needed.push(check_all && main_id < 0 && site == -1)
     }
-    if c.closure_header >= 0 { c.closure_drop = arm.label(&mut c.code) }
-    bind_type_helpers(&mut c)
-    c.print_int = arm.label(&mut c.code); c.print_bool = arm.label(&mut c.code); c.print_text = arm.label(&mut c.code); c.write = arm.label(&mut c.code)
-    c.float_trap = arm.label(&mut c.code)
-    c.unicode_trap = arm.label(&mut c.code)
-    c.overflow = arm.label(&mut c.code); c.zero = arm.label(&mut c.code); c.assertion = arm.label(&mut c.code); c.io = arm.label(&mut c.code); c.bounds = arm.label(&mut c.code)
-    if !check_all { rt_emit.emit_start(&mut c.code, &rt, c.fn_labels[main_id]) }
+    if !check_all {
+        if c.closure_header >= 0 { c.closure_drop = arm.label(&mut c.code) }
+        bind_type_helpers(&mut c)
+        c.print_int = arm.label(&mut c.code); c.print_bool = arm.label(&mut c.code); c.print_text = arm.label(&mut c.code); c.write = arm.label(&mut c.code)
+        c.float_trap = arm.label(&mut c.code)
+        c.unicode_trap = arm.label(&mut c.code)
+        c.overflow = arm.label(&mut c.code); c.zero = arm.label(&mut c.code); c.assertion = arm.label(&mut c.code); c.io = arm.label(&mut c.code); c.bounds = arm.label(&mut c.code)
+        arm.rt_emit_start(&mut c.code, &rt, c.fn_labels[main_id])
+    }
     if main_id >= 0 { c.needed[main_id] = true }
     for _ in 0..c.world.names.len { c.jobs.compiled.push(false); c.jobs.checked_effects.push(-1); c.callback_labels.push(-1) }
     if c.tasks.program && !check_all {
@@ -8852,7 +7917,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
             c.record_take_labels.push(selected)
         }
     }
-    globals := arm.label_count(&c.code)
+    globals := if check_all { 0 } else { arm.label_count(&c.code) }
     if c.bindings.profile.enabled { profile.finish(&mut c.bindings.profile, 0, declarations_started, i64(c.world.names.len)) }
     emit_settings.const_div_enabled = config.const_div_enabled; emit_settings.frame_free_enabled = config.frame_free_enabled
     if c.inline_enabled {
@@ -8962,7 +8027,8 @@ pub fn freeze_backend(c: &Session) -> BackendBindings {
     }
 }
 pub fn prepare_emitter(c: &mut Session, bindings: &BackendBindings) {
-    c.runtime = bindings.runtime.clone(); c.code.platform = bindings.platform; c.code.profile = bindings.instrumented; c.code.checking = false
+    c.runtime = bindings.runtime.clone(); c.code.platform = bindings.platform; c.code.profile = bindings.instrumented
+    c.code.checking = false; c.code.forbid_emit = false
     c.validating_dead = false; c.helper_labels = bindings.helper_labels.clone()
     c.record_take_labels = bindings.record_take_labels.clone()
     c.task_iso_labels = bindings.task_iso_labels.clone(); c.task_shared_rc_labels = bindings.task_shared_rc_labels.clone()
@@ -9211,8 +8277,16 @@ fn accept_partial_facts(c: &mut Session) {
     if c.report {
         for i in 0..c.body.facts.binding_tokens.len {
             at := c.body.facts.binding_tokens[i]
-            c.bindings.offsets.push(c.world.tokens.starts[at]); c.bindings.names.push(c.world.tokens.texts[at].clone())
-            c.bindings.types.push(type_spelling(&c, c.body.facts.binding_types[i]))
+            off := c.world.tokens.starts[at]
+            ty := c.body.facts.binding_types[i]
+            tsp := type_spelling(&c, ty)
+            bname := c.world.tokens.texts[at].clone()
+            nlen := bname.len
+            c.bindings.offsets.push(off); c.bindings.names.push(bname.clone())
+            c.bindings.types.push(tsp.clone())
+            if c.hir.recording {
+                _ := hir.record_symbol(&mut c.hir, .Local, move bname, -1, off, off + nlen, ty, move tsp)
+            }
         }
     }
 }
@@ -9240,7 +8314,7 @@ pub fn check_body_local(c: &mut Session, f: i32, platform: i32, dead: bool,
     inline_work: &mut opt_inline.Workspace) -> bool {
     if diag.limit_reached(&c.diag_bag) || c.jobs.compiled[f] { return false }
     c.jobs.compiled[f] = true
-    c.validating_dead = dead; c.code.checking = true; c.code.platform = platform
+    c.validating_dead = dead; c.code.checking = true; c.code.forbid_emit = true; c.code.platform = platform
     check_one_local(&mut c, f, &mut scalar_model, &mut scalar_work, &mut scalar_plan, &emit_settings, &mut range_work, &catalog, &mut inline_work)
 }
 fn pack_observation(out: &mut []i32, values: &[]i32, column: i32) {
@@ -9256,10 +8330,11 @@ pub fn check_isolated_job(c: &mut Session, job: ValidationJob) -> Validation {
     diag.clear(&mut c.diag_bag); c.has_errors = false; c.body_had_error = false
     c.ok = true; c.error = ""; c.error_at = 0; c.error_note = ""; c.error_note_at = -1; c.types.error = ""
     c.validating_dead = job.dead; c.code.platform = job.platform
-    c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
+    c.code.forbid_emit = true; c.code.virtual_words = 0; c.code.virtual_labels = 0
     c.body.reenter_owners = false; c.body.scalar_function = false
     if c.tasks.program && c.world.unsafe_functions[f] { task_effect_at(&mut c, 16, c.world.starts[f]) }
     type_body(&mut c, f, &mut model, &catalog, &mut inline_work)
+    assert(c.code.words.len == 0 && c.code.labels.len == 0 && c.code.virtual_words == 0 && c.code.virtual_labels == 0)
     mut result := Validation { declaration: f, at: c.error_at, error: [], note_at: c.error_note_at, note: [], effects: c.body.facts.effects,
         effect_at: c.body.facts.effect_at, first_task: -1, observations: [], types: [], diag_meta: [], diag_data: [] }
     if !c.ok || c.has_errors {
@@ -9359,7 +8434,7 @@ pub fn snapshot_check_phase2(c: &mut Session) -> []i32 {
     if c.tasks.program { for f in 0..c.world.names.len { c.tasks.reachable.push(c.jobs.compiled[f]) } }
     c.jobs.phase = 2
     c.validating_dead = true
-    c.code.platform = 0
+    c.code.checking = true; c.code.forbid_emit = true; c.code.platform = 0
     mut dead: []i32 = []
     for f in 0..c.world.names.len {
         if !c.jobs.compiled[f] && c.specializations.function_instances[f] == -1 && c.world.libraries[f] == "" { dead.push(f) }
@@ -9401,8 +8476,8 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
     globals := c.imports.globals
     if c.tasks.program { for f in 0..c.world.names.len { c.tasks.reachable.push(c.jobs.compiled[f]) } }
     c.validating_dead = true
-    c.code.checking = true; c.code.platform = 0
-    c.code.virtual_words = 0; c.code.virtual_labels = c.jobs.globals
+    c.code.checking = true; c.code.forbid_emit = true; c.code.platform = 0
+    c.code.virtual_words = 0; c.code.virtual_labels = 0
     c.imports.globals = 0
     for f in (c.validated_through + 1)..c.world.names.len {
         if diag.limit_reached(&c.diag_bag) { break }
@@ -9442,7 +8517,7 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
         }
     }
     c.validating_dead = false
-    c.code.checking = c.jobs.checking; c.code.platform = live_platform
+    c.code.checking = c.jobs.checking; c.code.forbid_emit = c.jobs.checking; c.code.platform = live_platform
     c.imports.globals = globals
     mut certificate := tc.task_certificate()
     if c.tasks.program && !task_certify(&mut c, &mut certificate) {
@@ -9455,6 +8530,9 @@ fn session_tail(c: &mut Session, scalar_model: &mut opt_ir.Function, scalar_work
         c.ok = false; c.has_errors = true; c.error = msg; c.error_at = certificate.at
         if c.report { records = c.bindings.clone() }
         return session_error(&c)
+    }
+    if c.jobs.checking {
+        assert(c.code.words.len == 0 && c.code.labels.len == 0 && c.code.virtual_words == 0 && c.code.virtual_labels == 0)
     }
     mut result := Result { ok: true, error: "", offset: 0, text: [], imports: imports(), diagnostics: finalize_diagnostics(&c) }
     if !c.jobs.checking {
@@ -9863,7 +8941,7 @@ fn decline_projection(c: &mut Session, model: &mut opt_ir.Function) -> bool {
         cell := c.code.prefix[i]; i = i + 1
         if cell < 0 && cell.bit_and(i64(1).shl(56)) == 0 { arm.mark(&mut c.code, i32(row.operand(cell))) }
         else if cell < 0 {
-            integers.signed_binary(&mut c.code, row.reg(cell), i32(cell.shr(32).bit_and(65535)), c.overflow, c.zero)
+            arm.signed_binary(&mut c.code, row.reg(cell), i32(cell.shr(32).bit_and(65535)), c.overflow, c.zero)
         } else if row.control_row(cell) {
             target := i32(c.code.prefix[i]); i = i + 1; arm.resume_reloc(&mut c.code, cell, target, row.reg(cell))
         } else if row.is_checked_add_sub(cell) {
@@ -9877,11 +8955,11 @@ pub fn typed_body_into(c: &mut Session, f: i32, model: &mut opt_ir.Function,
     if !c.ok || c.code.checking || f < 0 || f >= c.world.returns.len || c.world.libraries[f] != "" { return false }
     if c.world.test_functions[f] || c.world.unsafe_functions[f] || c.world.returns[f] > 3 || c.world.param_counts[f] > 8 { return false }
     typed.begin(&mut model, c.world.returns[f], c.world.param_counts[f])
-    capture := c.code.mir_capture; reporting := c.report
-    c.code.checking = true; c.code.mir_capture = false; c.report = false
-    c.code.virtual_words = 0; c.code.virtual_labels = c.code.labels.len
+    capture := c.code.mir_capture; reporting := c.report; saved_forbid := c.code.forbid_emit
+    c.code.checking = true; c.code.forbid_emit = true; c.code.mir_capture = false; c.report = false
+    c.code.virtual_words = 0; c.code.virtual_labels = 0
     walk_body(&mut c, f, &mut model, &catalog, &mut inline_work)
-    c.code.checking = false; c.code.mir_capture = capture; c.report = reporting
+    c.code.checking = false; c.code.forbid_emit = saved_forbid; c.code.mir_capture = capture; c.report = reporting
     model.probing = false
     if !model.recording {
         if c.error == "" { c.ok = true; c.error_at = 0; c.error_note = ""; c.error_note_at = -1 }
@@ -10007,8 +9085,16 @@ fn accept_facts(c: &mut Session, declaration: i32) {
     }
     for i in 0..c.body.facts.binding_tokens.len {
         at := c.body.facts.binding_tokens[i]
-        c.bindings.offsets.push(c.world.tokens.starts[at]); c.bindings.names.push(c.world.tokens.texts[at].clone())
-        c.bindings.types.push(type_spelling(&c, c.body.facts.binding_types[i]))
+        off := c.world.tokens.starts[at]
+        ty := c.body.facts.binding_types[i]
+        tsp := type_spelling(&c, ty)
+        bname := c.world.tokens.texts[at].clone()
+        nlen := bname.len
+        c.bindings.offsets.push(off); c.bindings.names.push(bname.clone())
+        c.bindings.types.push(tsp.clone())
+        if c.hir.recording {
+            _ := hir.record_symbol(&mut c.hir, .Local, move bname, -1, off, off + nlen, ty, move tsp)
+        }
     }
 }
 fn compile_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, work: &mut opt_verify.Workspace, plan: &mut opt_alloc.Plan, emit_settings: &opt_emit.Options, range_work: &mut opt_range.Workspace, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace) {
@@ -10143,32 +9229,16 @@ fn walk_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
 }
 
 fn emit_unused_local_warnings(c: &mut Session, f: i32) {
-    if c.warn_unused_fns.len == c.world.names.len {
-        if f < 0 || f >= c.warn_unused_fns.len || !c.warn_unused_fns[f] { return }
-    } else {
-        owner := c.world.function_owners[f]
-        if owner < 0 || owner >= c.sources.paths.len { return }
-        path := &c.sources.paths[owner]
-        if path.len == 0 || path[0] == 60 { return }
-        if f >= 0 && f < c.specializations.function_instances.len && c.specializations.function_instances[f] != -1 { return }
-        if c.world.starts[f] > 0 && generics.generated(&c.specializations, c.world.tokens.starts[c.world.starts[f]]) { return }
-    }
-    for i in 0..c.body.locals.names.len {
-        if c.body.locals.is_param[i] || c.body.locals.used[i] || c.body.locals.warned[i] { continue }
-        name := &c.body.locals.names[i]
-        if name.len == 0 || name[0] == 95 { continue }
-        tok := c.body.locals.tokens[i]
-        if tok < 0 || tok >= c.world.tokens.starts.len { continue }
-        off := c.world.tokens.starts[tok]
-        if off >= c.world.source_end || generics.generated(&c.specializations, off) { continue }
-        c.body.locals.warned[i] = true
-        diag.push_warning(&mut c.diag_bag, "W1001", off, off, "unused variable '" + name + "'; prefix with '_' if intentional")
+    items := ownership_check.collect_unused_locals(&c.world, &c.body, &c.specializations, &c.warn_unused_fns, &c.sources.paths, f)
+    for item in &items {
+        c.body.locals.warned[item.local_idx] = true
+        diag.push_warning(&mut c.diag_bag, "W1001", item.offset, item.offset, "unused variable '" + item.name + "'; prefix with '_' if intentional")
     }
 }
 fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace) {
     if c.inline_enabled { fragments.reset_dependencies(&mut c.body.inline_deps) }
     fc.reset_body(&mut c.body)
-    saved_checking := c.code.checking
+    saved_checking := c.code.checking; saved_forbid := c.code.forbid_emit
     first_diag := c.diag_bag.items.len
     c.body_had_error = false
     c.code.operand_depth = 0
@@ -10203,13 +9273,13 @@ fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
         if p == visible {
             mut offset := spilled
             if returns_array_view(&c, c.body.ret_type) { offset += 1 }
-            source_call.load_stack_argument(&mut c.code, offset); arm.store(&mut c.code, index, 0)
+            arm.load_stack_argument(&mut c.code, offset); arm.store(&mut c.code, index, 0)
         } else if p < 8 { arm.store(&mut c.code, index, p) }
-        else { source_call.load_stack_argument(&mut c.code, p - 8); arm.store(&mut c.code, index, 0) }
+        else { arm.load_stack_argument(&mut c.code, p - 8); arm.store(&mut c.code, index, 0) }
     }
     if returns_array_view(&c, c.body.ret_type) {
         destination := slot(&mut c)
-        source_call.load_stack_argument(&mut c.code, spilled); arm.store(&mut c.code, destination, 0)
+        arm.load_stack_argument(&mut c.code, spilled); arm.store(&mut c.code, destination, 0)
         c.body.view_result_destination = destination
     }
     param_owners := c.body.owned_slots.len
@@ -10231,375 +9301,12 @@ fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
     arm.branch(&mut c.code, body, 0)
     if c.ok && !c.body_had_error { arm.frame(&mut c.code, frame, c.body.slots) }
     if c.body_had_error {
-        c.code.checking = saved_checking
+        c.code.checking = saved_checking; c.code.forbid_emit = saved_forbid
         c.ok = false; c.has_errors = true; backfill_primary_error(&mut c, first_diag)
     } else if c.ok && !c.suppress_diagnostics && !c.discovering && !model.probing {
         emit_unused_local_warnings(&mut c, f)
     }
     c.types.self_type = -1
-}
-
-fn unwrap_collection_base(c: &Session, ty_in: i32) -> i32 {
-    mut ty := ty_in
-    while collection(&c, ty) { ty = ft.type_base(&c.types, ty) }
-    ty
-}
-fn enqueue_nominal_member(c: &Session, ty_in: i32, for_clone: bool, needed: &mut []bool, work: &mut []i32) {
-    ty := unwrap_collection_base(&c, ty_in)
-    if ty < 0 || ty >= c.helper_labels.len || c.helper_labels[ty] < 0 { return }
-    if !ft.owned(&c.types, ty) || ty == 4 || collection(&c, ty) || boxed_function(&c, ty) { return }
-    if for_clone && ft.type_kind(&c.types, ty) == 7 && !ft.move_only(&c.types, ty) { return }
-    if !needed[ty] { needed[ty] = true; work.push(ty) }
-}
-fn propagate_nominal_helpers(c: &Session, for_clone: bool, needed: &mut []bool, work: &mut []i32) {
-    while work.len > 0 {
-        ty := work.pop()
-        if for_clone && ft.type_kind(&c.types, ty) == 7 && !ft.move_only(&c.types, ty) { continue }
-        if c.types.c_record[ty] { continue }
-        first := c.types.declared.type_starts[ty]
-        count := c.types.declared.type_counts[ty]
-        if ft.type_kind(&c.types, ty) == 7 {
-            for v in first..first + count {
-                ps := c.types.payload_starts[v]; pc := c.types.payload_counts[v]
-                for i in 0..pc { enqueue_nominal_member(&c, c.types.payload_types[ps + i], for_clone, &mut needed, &mut work) }
-            }
-        } else {
-            for i in 0..count { enqueue_nominal_member(&c, c.types.field_types[first + i], for_clone, &mut needed, &mut work) }
-        }
-    }
-}
-fn nominal_clones(c: &mut Session, rt: &runtime.Runtime) {
-    mut max_label := -1
-    for ty in 0..c.helper_labels.len {
-        if ft.owned(&c.types, ty) && ty != 4 && !collection(&c, ty) && c.helper_labels[ty] >= 0 {
-            end := c.helper_labels[ty] + 1
-            if end > max_label { max_label = end }
-        }
-    }
-    mut label_kind: []i32 = []
-    if max_label >= 0 {
-        label_kind.reserve(max_label + 1)
-        for _ in 0..max_label + 1 { label_kind.push(-1) }
-        for ty in 0..c.helper_labels.len {
-            if ft.owned(&c.types, ty) && ty != 4 && !collection(&c, ty) && c.helper_labels[ty] >= 0 {
-                h := c.helper_labels[ty]
-                label_kind[h] = ty * 2
-                label_kind[h + 1] = ty * 2 + 1
-            }
-        }
-    }
-    n_types := c.types.type_names.len
-    mut clone_needed: []bool = []; mut drop_needed: []bool = []
-    clone_needed.reserve(n_types); drop_needed.reserve(n_types)
-    for _ in 0..n_types { clone_needed.push(false); drop_needed.push(false) }
-    mut clone_work: []i32 = []; mut drop_work: []i32 = []
-    for target in &c.code.target {
-        if target >= 0 && target < label_kind.len {
-            enc := label_kind[target]
-            if enc >= 0 {
-                ty := enc / 2
-                if enc % 2 == 0 { if !clone_needed[ty] { clone_needed[ty] = true; clone_work.push(ty) } }
-                else { if !drop_needed[ty] { drop_needed[ty] = true; drop_work.push(ty) } }
-            }
-        }
-    }
-    propagate_nominal_helpers(&c, true, &mut clone_needed, &mut clone_work)
-    propagate_nominal_helpers(&c, false, &mut drop_needed, &mut drop_work)
-    for ty in 0..n_types {
-        if !ft.owned(&c.types, ty) || ty == 4 || collection(&c, ty) { continue }
-        if clone_needed[ty] {
-            arm.mark(&mut c.code, c.helper_labels[ty]); frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
-            if c.types.c_record[ty] {
-                arm.push(&mut c.code,0); arm.imm(&mut c.code,0,i64(c.types.declared.c_sizes[ty])); arm.branch(&mut c.code,rt.alloc_clone,1)
-                arm.mov(&mut c.code,1,0); arm.pop(&mut c.code,0); copy_inline(&mut c,c.types.declared.c_sizes[ty])
-            } else if c.types.declared.type_kinds[ty] == 7 {
-                if !ft.move_only(&c.types, ty) { arm.branch(&mut c.code, rt.retain, 1) }
-                else {
-                    arm.store(&mut c.code, 0, 0); cloned := arm.label(&mut c.code)
-                    for variant in c.types.declared.type_starts[ty]..c.types.declared.type_starts[ty] + c.types.declared.type_counts[ty] {
-                        next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
-                        arm.imm(&mut c.code, 1, c.types.field_values[variant]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
-                        arm.imm(&mut c.code, 0, i64(c.types.payload_counts[variant] + 1) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
-                        arm.imm(&mut c.code, 1, c.types.field_values[variant]); store_mem(&mut c, 1, 0, 0)
-                        for i in 0..c.types.payload_counts[variant] {
-                            pt := c.types.payload_types[c.types.payload_starts[variant] + i]
-                            arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i+1)*8); copy_value(&mut c, pt)
-                            arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, 1); store_mem(&mut c, 1, 0, (i+1)*8)
-                        }
-                        arm.load(&mut c.code, 1); arm.branch(&mut c.code, cloned, 0); arm.mark(&mut c.code, next)
-                    }
-                    arm.mark(&mut c.code, cloned)
-                }
-            }
-            else {
-                arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.types.declared.type_counts[ty]) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
-                first := c.types.declared.type_starts[ty]
-                for i in 0..c.types.declared.type_counts[ty] {
-                    arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); copy_value(&mut c, c.types.field_types[first + i])
-                    arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
-                }
-                arm.load(&mut c.code, 1)
-            }
-            arm.ret(&mut c.code)
-        }
-        if drop_needed[ty] {
-            arm.mark(&mut c.code, c.helper_labels[ty] + 1); drop_frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, drop_frame, 1)
-            done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18); arm.store(&mut c.code, 0, 0)
-            cleanup := ft.cleanup_method(&c.types, ty)
-            if cleanup >= 0 && c.needed[cleanup] {
-                arm.address(&mut c.code, 0)
-                arm.branch(&mut c.code, c.fn_labels[cleanup], 1)
-            }
-            if c.types.declared.type_kinds[ty] == 7 {
-                shared := arm.label(&mut c.code)
-                rt_emit.allocation_refcount(&mut c.code)
-                arm.imm(&mut c.code, 2, 1); arm.compare_register(&mut c.code, 1, 2); arm.branch(&mut c.code, shared, 3)
-                for v in c.types.declared.type_starts[ty]..c.types.declared.type_starts[ty] + c.types.declared.type_counts[ty] {
-                    next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
-                    arm.imm(&mut c.code, 1, c.types.field_values[v]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
-                    for i in 0..c.types.payload_counts[v] {
-                        pt := c.types.payload_types[c.types.payload_starts[v] + i]
-                        if owned(&c, pt) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8); drop_value(&mut c, pt) }
-                    }
-                    arm.branch(&mut c.code, shared, 0); arm.mark(&mut c.code, next)
-                }
-                arm.mark(&mut c.code, shared)
-            } else if !c.types.c_record[ty] {
-                first := c.types.declared.type_starts[ty]
-                for i in 0..c.types.declared.type_counts[ty] {
-                    field_ty := c.types.field_types[first + i]
-                    if owned(&c, field_ty) { arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); drop_value(&mut c, field_ty) }
-                }
-            }
-            arm.load(&mut c.code, 0); arm.branch(&mut c.code, rt.release, 1); arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-        }
-    }
-    rt_emit.emit_array_helpers(&mut c.code, &rt, c.array_helpers)
-}
-
-fn emit_iso_copy(c: &mut Session, ty: i32) {
-    if ty < c.task_iso_labels.len && c.task_iso_labels[ty] >= 0 {
-        arm.branch(&mut c.code, c.task_iso_labels[ty], 1)
-    } else if ft.owned(&c.types, ty) {
-        helper := type_helper(&mut c, ty, false)
-        arm.branch(&mut c.code, helper, 1)
-    }
-}
-fn mark_iso_work(ty: i32, labels: &[]i32, needed: &mut []bool, work: &mut []i32) {
-    if ty >= 0 && ty < labels.len && labels[ty] >= 0 && !needed[ty] {
-        needed[ty] = true; work.push(ty)
-    }
-}
-fn emit_task_isolated_helpers(c: &mut Session, rt: &runtime.Runtime) {
-    n := c.task_iso_labels.len
-    if n == 0 { return }
-    mut max_label := -1
-    for ty in 0..n {
-        if ty != 4 && c.task_iso_labels[ty] > max_label { max_label = c.task_iso_labels[ty] }
-        if c.task_shared_rc_labels[ty] > max_label { max_label = c.task_shared_rc_labels[ty] }
-        if c.task_shared_prepare_labels[ty] > max_label { max_label = c.task_shared_prepare_labels[ty] }
-        if c.task_shared_drop_labels[ty] > max_label { max_label = c.task_shared_drop_labels[ty] }
-    }
-    if max_label < 0 { return }
-    mut label_info: []i32 = []; label_info.reserve(max_label + 1)
-    for _ in 0..max_label + 1 { label_info.push(-1) }
-    for ty in 0..n {
-        if ty != 4 && c.task_iso_labels[ty] >= 0 { label_info[c.task_iso_labels[ty]] = ty * 4 }
-        if c.task_shared_rc_labels[ty] >= 0 { label_info[c.task_shared_rc_labels[ty]] = ty * 4 + 1 }
-        if c.task_shared_prepare_labels[ty] >= 0 { label_info[c.task_shared_prepare_labels[ty]] = ty * 4 + 2 }
-        if c.task_shared_drop_labels[ty] >= 0 { label_info[c.task_shared_drop_labels[ty]] = ty * 4 + 3 }
-    }
-    mut iso_needed: []bool = []; mut rc_needed: []bool = []; mut prep_needed: []bool = []; mut drop_needed: []bool = []
-    iso_needed.reserve(n); rc_needed.reserve(n); prep_needed.reserve(n); drop_needed.reserve(n)
-    for _ in 0..n { iso_needed.push(false); rc_needed.push(false); prep_needed.push(false); drop_needed.push(false) }
-    mut iso_work: []i32 = []; mut rc_work: []i32 = []
-    for target in &c.code.target {
-        if target >= 0 && target < label_info.len {
-            enc := label_info[target]
-            if enc >= 0 {
-                ty := enc / 4; kind := enc % 4
-                if kind == 0 { mark_iso_work(ty, &c.task_iso_labels, &mut iso_needed, &mut iso_work) }
-                else if kind == 1 { mark_iso_work(ty, &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work) }
-                else if kind == 2 {
-                    prep_needed[ty] = true
-                    mark_iso_work(ty, &c.task_iso_labels, &mut iso_needed, &mut iso_work)
-                    mark_iso_work(ty, &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
-                } else {
-                    drop_needed[ty] = true
-                    mark_iso_work(ty, &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
-                }
-            }
-        }
-    }
-    while iso_work.len > 0 {
-        ty := iso_work.pop()
-        if ty == 4 { continue }
-        kind := c.types.declared.type_kinds[ty]
-        if kind == 1 || kind == 6 {
-            mark_iso_work(c.types.declared.type_bases[ty], &c.task_iso_labels, &mut iso_needed, &mut iso_work)
-        } else if kind == 2 {
-            first := c.types.declared.type_starts[ty]
-            for i in 0..c.types.declared.type_counts[ty] {
-                mark_iso_work(c.types.field_types[first + i], &c.task_iso_labels, &mut iso_needed, &mut iso_work)
-            }
-        } else if kind == 7 {
-            first := c.types.declared.type_starts[ty]
-            for v in first..first + c.types.declared.type_counts[ty] {
-                ps := c.types.payload_starts[v]
-                for i in 0..c.types.payload_counts[v] {
-                    mark_iso_work(c.types.payload_types[ps + i], &c.task_iso_labels, &mut iso_needed, &mut iso_work)
-                }
-            }
-        }
-    }
-    while rc_work.len > 0 {
-        ty := rc_work.pop()
-        if ty == 4 { continue }
-        kind := c.types.declared.type_kinds[ty]
-        if kind == 1 || kind == 6 {
-            mark_iso_work(c.types.declared.type_bases[ty], &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
-        } else if kind == 2 {
-            first := c.types.declared.type_starts[ty]
-            for i in 0..c.types.declared.type_counts[ty] {
-                mark_iso_work(c.types.field_types[first + i], &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
-            }
-        } else if kind == 7 {
-            first := c.types.declared.type_starts[ty]
-            for v in first..first + c.types.declared.type_counts[ty] {
-                ps := c.types.payload_starts[v]
-                for i in 0..c.types.payload_counts[v] {
-                    mark_iso_work(c.types.payload_types[ps + i], &c.task_shared_rc_labels, &mut rc_needed, &mut rc_work)
-                }
-            }
-        }
-    }
-    for ty in 0..n {
-        if iso_needed[ty] && ty != 4 {
-            kind := c.types.declared.type_kinds[ty]
-            arm.mark(&mut c.code, c.task_iso_labels[ty])
-            if kind == 1 || kind == 6 {
-                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 1)
-                arm.store(&mut c.code, 0, 0)
-                elem_iso := c.task_iso_labels[c.types.declared.type_bases[ty]]
-                arm.branch(&mut c.code, elem_iso, 20); arm.mov(&mut c.code, 1, 0)
-                arm.load(&mut c.code, 0); arm.branch(&mut c.code, rt.array_isolated_clone, 1)
-                arm.ret(&mut c.code)
-            } else if kind == 7 {
-                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
-                done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-                arm.store(&mut c.code, 0, 0)
-                first := c.types.declared.type_starts[ty]
-                for variant in first..first + c.types.declared.type_counts[ty] {
-                    next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
-                    arm.imm(&mut c.code, 1, c.types.field_values[variant]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
-                    arm.imm(&mut c.code, 0, i64(c.types.payload_counts[variant] + 1) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
-                    arm.imm(&mut c.code, 1, c.types.field_values[variant]); store_mem(&mut c, 1, 0, 0)
-                    for i in 0..c.types.payload_counts[variant] {
-                        pt := c.types.payload_types[c.types.payload_starts[variant] + i]
-                        arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8); emit_iso_copy(&mut c, pt)
-                        arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, 1); store_mem(&mut c, 1, 0, (i + 1) * 8)
-                    }
-                    arm.load(&mut c.code, 1); arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, next)
-                }
-                arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-            } else {
-                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
-                done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-                arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 0, i64(c.types.declared.type_counts[ty]) * 8); arm.branch(&mut c.code, rt.alloc_clone, 1); arm.store(&mut c.code, 1, 0)
-                first := c.types.declared.type_starts[ty]
-                for i in 0..c.types.declared.type_counts[ty] {
-                    arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8); emit_iso_copy(&mut c, c.types.field_types[first + i])
-                    arm.push(&mut c.code, 0); arm.load(&mut c.code, 1); arm.pop(&mut c.code, 1); store_mem(&mut c, 1, 0, i * 8)
-                }
-                arm.load(&mut c.code, 1); arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-            }
-        }
-        if rc_needed[ty] {
-            arm.mark(&mut c.code, c.task_shared_rc_labels[ty])
-            if ty == 4 {
-                frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 0)
-                done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-                arm.emit(&mut c.code, 3506438144 + 8 * 1024 + 0 * 32 + 10)
-                store_mem(&mut c, 1, 10, 0)
-                arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-            } else {
-                kind := c.types.declared.type_kinds[ty]
-                if kind == 1 || kind == 6 {
-                    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 4)
-                    done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-                    arm.store(&mut c.code, 0, 0); arm.store(&mut c.code, 1, 1)
-                    load_mem(&mut c, 10, 0, 8); arm.store(&mut c.code, 3, 10)
-                    arm.store(&mut c.code, 2, 31)
-                    elem_rc := c.task_shared_rc_labels[c.types.declared.type_bases[ty]]
-                    head := arm.label(&mut c.code); arm.mark(&mut c.code, head)
-                    arm.load_into(&mut c.code, 2, 10); arm.load_into(&mut c.code, 3, 11)
-                    arm.compare_register(&mut c.code, 10, 11); arm.branch(&mut c.code, done, 4)
-                    arm.load(&mut c.code, 0); load_mem(&mut c, 11, 0, 0)
-                    arm.emit(&mut c.code, 3544186880 + (64 - 3) * 65536 + (63 - 3) * 1024 + 10 * 32 + 12)
-                    arm.emit(&mut c.code, 2332033024 + 12 * 65536 + 11 * 32 + 11)
-                    load_mem(&mut c, 0, 11, 0); arm.load_into(&mut c.code, 1, 1)
-                    arm.branch(&mut c.code, elem_rc, 1)
-                    arm.load_into(&mut c.code, 2, 10)
-                    arm.emit(&mut c.code, 2432696320 + 1 * 1024 + 10 * 32 + 10)
-                    arm.store(&mut c.code, 2, 10); arm.branch(&mut c.code, head, 0)
-                    arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-                } else if kind == 7 {
-                    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
-                    done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-                    arm.store(&mut c.code, 0, 0); arm.store(&mut c.code, 1, 1)
-                    if !ft.move_only(&c.types, ty) {
-                        arm.emit(&mut c.code, 3506438144 + 8 * 1024 + 0 * 32 + 10)
-                        store_mem(&mut c, 1, 10, 0)
-                    }
-                    first := c.types.declared.type_starts[ty]
-                    for v in first..first + c.types.declared.type_counts[ty] {
-                        next := arm.label(&mut c.code); arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, 0)
-                        arm.imm(&mut c.code, 1, c.types.field_values[v]); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, next, 3)
-                        for i in 0..c.types.payload_counts[v] {
-                            pt := c.types.payload_types[c.types.payload_starts[v] + i]
-                            if pt < n && c.task_shared_rc_labels[pt] >= 0 {
-                                arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, (i + 1) * 8)
-                                arm.load_into(&mut c.code, 1, 1); arm.branch(&mut c.code, c.task_shared_rc_labels[pt], 1)
-                            }
-                        }
-                        arm.branch(&mut c.code, done, 0); arm.mark(&mut c.code, next)
-                    }
-                    arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-                } else {
-                    frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 2)
-                    done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-                    arm.store(&mut c.code, 0, 0); arm.store(&mut c.code, 1, 1)
-                    first := c.types.declared.type_starts[ty]
-                    for i in 0..c.types.declared.type_counts[ty] {
-                        ft_ty := c.types.field_types[first + i]
-                        if ft_ty < n && c.task_shared_rc_labels[ft_ty] >= 0 {
-                            arm.load(&mut c.code, 0); load_mem(&mut c, 0, 0, i * 8)
-                            arm.load_into(&mut c.code, 1, 1); arm.branch(&mut c.code, c.task_shared_rc_labels[ft_ty], 1)
-                        }
-                    }
-                    arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-                }
-            }
-        }
-        if prep_needed[ty] {
-            arm.mark(&mut c.code, c.task_shared_prepare_labels[ty])
-            frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 1)
-            arm.branch(&mut c.code, c.task_iso_labels[ty], 1)
-            arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 1, 0)
-            arm.branch(&mut c.code, c.task_shared_rc_labels[ty], 1)
-            arm.load(&mut c.code, 0); arm.ret(&mut c.code)
-        }
-        if drop_needed[ty] {
-            arm.mark(&mut c.code, c.task_shared_drop_labels[ty])
-            frame := arm.prologue(&mut c.code); arm.frame(&mut c.code, frame, 1)
-            done := arm.label(&mut c.code); arm.branch(&mut c.code, done, 18)
-            arm.store(&mut c.code, 0, 0); arm.imm(&mut c.code, 1, 1)
-            arm.branch(&mut c.code, c.task_shared_rc_labels[ty], 1)
-            drop_label := type_helper(&mut c, ty, true)
-            arm.load(&mut c.code, 0); arm.branch(&mut c.code, drop_label, 1)
-            arm.mark(&mut c.code, done); arm.ret(&mut c.code)
-        }
-    }
 }
 
 fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runtime, record_takes: &mut record_take.Plan) -> Result {
@@ -10609,9 +9316,13 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
     arm.mark(&mut c.code, c.bounds); arm.exit(&mut c.code, 103)
     assert(record_take.emit_array_take(&mut c.code, c.array_take))
     if record_take.status(&record_takes) == 2 { assert(record_take.emit_helpers(&mut c.code, &mut record_takes, c.array_take)) }
-    if c.closure_header >= 0 { rt_emit.emit_closure_drop(&mut c.code, c.closure_drop, rt.release) }
-    emit_task_isolated_helpers(&mut c, &rt)
-    nominal_clones(&mut c, &rt)
+    if c.closure_header >= 0 { arm.rt_emit_closure_drop(&mut c.code, c.closure_drop, rt.release) }
+    mut code := replace(&mut c.code, raw_arm.new_no_emit(0))
+    backend_emit.emit_task_isolated_helpers(&mut code, &c.types, &rt, &c.helper_labels, c.array_helpers,
+        &c.task_iso_labels, &c.task_shared_rc_labels, &c.task_shared_prepare_labels, &c.task_shared_drop_labels)
+    backend_emit.nominal_clones(&mut code, &c.types, &rt, &c.boxed_signatures, &c.helper_labels,
+        c.array_helpers, c.closure_drop, &c.needed, &c.fn_labels)
+    c.code = move code
     arm.runtime(&mut c.code, c.print_int, c.print_bool, c.print_text, c.write, c.overflow, c.zero, c.assertion, c.io)
     if platform == 1 || platform == 2 {
         mut libc := false
@@ -10633,7 +9344,7 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
         if canon >= 0 {
             arm.alias_label(&mut c.code, c.string_labels[i], i32(canon))
         } else {
-            rt_emit.emit_literal(&mut c.code, c.strings[i].clone(), c.string_labels[i])
+            arm.rt_emit_literal(&mut c.code, c.strings[i].clone(), c.string_labels[i])
             emitted_strings.put(c.strings[i].clone(), i64(c.string_labels[i]))
         }
     }
@@ -10648,7 +9359,7 @@ fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runti
             first := c.world.const_blob_starts[cid]
             count := c.world.const_blob_counts[cid]
             raw := (&c.world.const_blobs[first..first + count]).clone()
-            rt_emit.emit_raw_bytes(&mut c.code, &raw, lbl)
+            arm.rt_emit_raw_bytes(&mut c.code, &raw, lbl)
             emitted_blobs[cid] = lbl
         }
     }

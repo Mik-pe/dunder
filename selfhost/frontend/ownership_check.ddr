@@ -1,0 +1,332 @@
+import borrows
+import frontend_context as fc
+import frontend_types as ft
+import generics
+import lexer
+import local_borrows
+import ownership_state as ownership
+import typed_places as places
+
+pub struct MoveStep {
+    status: i32,
+    release_loan: i32,
+    binding: i32,
+    path: i32,
+    subj_binding: i32,
+    subj_path: i32,
+    error: string,
+}
+
+pub struct UnusedLocal {
+    name: string,
+    offset: i32,
+    local_idx: i32,
+}
+
+fn move_err(move msg: string) -> MoveStep {
+    MoveStep { status: 2, release_loan: -1, binding: -1, path: -1, subj_binding: -1, subj_path: -1, error: move msg }
+}
+
+fn move_release(loan: i32) -> MoveStep {
+    MoveStep { status: 1, release_loan: loan, binding: -1, path: -1, subj_binding: -1, subj_path: -1, error: "" }
+}
+
+pub fn owner_path(body: &fc.FunctionContext, place: i32) -> i32 {
+    if place < 0 {
+        binding := borrows.root(&body.places, place)
+        alias := local_borrows.path(&body.local_loans, binding)
+        if alias >= 0 { return alias }
+        return ownership.root_id(&body.ownership, binding)
+    }
+    if place > 0 { return body.places.owners[place - 1] }
+    -1
+}
+
+pub fn source_root(body: &fc.FunctionContext, place: i32) -> i32 {
+    binding := borrows.root(&body.places, place)
+    alias := local_borrows.root(&body.local_loans, binding)
+    if alias >= 0 || local_borrows.is_transient(&body.local_loans, binding) { return alias }
+    binding
+}
+
+pub fn borrow_parent(body: &fc.FunctionContext, place: i32) -> i32 {
+    binding := borrows.root(&body.places, place)
+    if binding < 0 { return -1 }
+    if local_borrows.is_transient(&body.local_loans, binding) {
+        return local_borrows.parent(&body.local_loans, binding)
+    }
+    if local_borrows.shared(&body.local_loans, binding) { return binding }
+    -1
+}
+
+pub fn record_mutation(body: &mut fc.FunctionContext, binding: i32, path: i32) {
+    body.mutations.push(binding)
+    body.mutation_paths.push(path)
+}
+
+pub fn mutated_overlap(body: &fc.FunctionContext, first: i32, last: i32, root: i32, path: i32) -> bool {
+    for i in first..last {
+        if body.mutations[i] == root {
+            mpath := body.mutation_paths[i]
+            if path < 0 || mpath < 0 || ownership.overlaps(&body.ownership, mpath, path) { return true }
+        }
+    }
+    false
+}
+
+pub fn with_clone_hint(types: &ft.TypeRegistry, ty: i32, base: string, clone_suffix: string) -> string {
+    if ty > 0 && ft.cloneable(&types, ty) { return base + clone_suffix }
+    base.clone()
+}
+
+pub fn has_cleanup_ancestor(body: &fc.FunctionContext, types: &ft.TypeRegistry, place: i32) -> bool {
+    if !types.has_cleanup { return false }
+    mut projected := place
+    while projected > 0 {
+        row := (projected - 1) * 3
+        receiver := places.receiver(body.places.arena.nodes[row + 1])
+        if ft.cleanup_method(&types, receiver) >= 0 { return true }
+        projected = places.parent(body.places.arena.nodes[row])
+    }
+    false
+}
+
+pub fn local_name_used_later(tokens: &lexer.Tokens, name: string, from: i32, limit: i32) -> bool {
+    if limit < 0 { return true }
+    mut end := limit
+    if end > tokens.kinds.len { end = tokens.kinds.len }
+    if from < 0 || from >= end { return false }
+    for tok in from..end {
+        if tokens.kinds[tok] == .Name && tokens.texts[tok] == name {
+            if tok > 0 && tokens.kinds[tok - 1] == .Symbol &&
+            (tokens.texts[tok - 1] == "." || tokens.texts[tok - 1] == "::") {
+                continue
+            }
+            return true
+        }
+    }
+    false
+}
+
+pub fn is_fresh_owned(body: &fc.FunctionContext) -> bool {
+    if body.expr.owner >= 0 || body.expr.const_array { return true }
+    if body.places.current == 0 && body.expr.move_temporary >= 0 &&
+    body.expr.move_projection >= 0 && !body.place.inline_storage {
+        return true
+    }
+    if body.places.current < 0 {
+        binding := borrows.root(&body.places, body.places.current)
+        if binding >= 0 && binding < body.locals.fresh_move.len && body.locals.fresh_move[binding] {
+            return true
+        }
+    }
+    false
+}
+
+pub fn is_for_locked_except(body: &fc.FunctionContext, path: i32, skip: i32) -> bool {
+    if path < 0 { return false }
+    for i in 0..body.for_locks.len {
+        if i != skip && ownership.overlaps(&body.ownership, body.for_locks[i], path) { return true }
+    }
+    false
+}
+
+pub fn is_for_locked(body: &fc.FunctionContext, path: i32) -> bool {
+    is_for_locked_except(&body, path, -1)
+}
+
+pub fn check_loan_step(body: &fc.FunctionContext, tokens: &lexer.Tokens, place: i32, read_only: bool) -> i32 {
+    path := owner_path(&body, place)
+    actor := borrows.root(&body.places, place)
+    loan := local_borrows.active_conflict_local_except(&body.local_loans, &body.ownership, path, actor, read_only)
+    if loan < 0 { return -1 }
+    limit := local_borrows.scope_end(&body.local_loans, loan)
+    depth := local_borrows.loop_depth(&body.local_loans, loan)
+    if !local_borrows.is_pinned(&body.local_loans, loan) && limit >= 0 &&
+    depth == body.loop_heads.len &&
+    !local_name_used_later(&tokens, body.locals.names[loan], body.cursor, limit) {
+        return loan
+    }
+    -2
+}
+
+pub fn plan_move_step(body: &fc.FunctionContext, tokens: &lexer.Tokens, types: &ft.TypeRegistry,
+    place: i32, ty: i32) -> MoveStep {
+    if has_cleanup_ancestor(&body, &types, place) {
+        return move_err("cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
+    }
+    binding := borrows.root(&body.places, place)
+    kind := ft.type_kind(&types, body.locals.types[binding])
+    if kind == 4 || kind == 5 {
+        return move_err(with_clone_hint(&types, ty, "cannot move out of a borrowed value", "; use .clone()"))
+    }
+    for i in 0..body.pattern_borrowed.len {
+        if body.pattern_borrowed[i] == binding {
+            return move_err(with_clone_hint(&types, ty, "cannot move a borrowed pattern binding", "; use .clone()"))
+        }
+    }
+    pl_idx := fc.pattern_loan_index(&body, binding)
+    if pl_idx >= 0 {
+        subj_place := body.pattern_loans.subject_places[pl_idx]
+        if has_cleanup_ancestor(&body, &types, subj_place) {
+            return move_err("cannot move out of a resource with automatic cleanup; use replace to leave a valid field")
+        }
+        s1 := check_loan_step(&body, &tokens, place, false)
+        if s1 >= 0 { return move_release(s1) }
+        if s1 == -2 { return move_err("cannot mutate, replace or move a value while it is borrowed") }
+        s2 := check_loan_step(&body, &tokens, subj_place, false)
+        if s2 >= 0 { return move_release(s2) }
+        if s2 == -2 { return move_err("cannot mutate, replace or move a value while it is borrowed") }
+        path := owner_path(&body, place)
+        if !ownership.available(&body.ownership, path) {
+            return move_err("use of moved value '" + body.locals.names[binding] + "'")
+        }
+        if is_for_locked(&body, path) {
+            return move_err("cannot move a collection while iterating over it")
+        }
+        subj_path := owner_path(&body, subj_place)
+        lock_idx := body.pattern_loans.lock_indices[pl_idx]
+        if is_for_locked_except(&body, subj_path, lock_idx) {
+            return move_err("cannot move a collection while iterating over it")
+        }
+        subj_binding := borrows.root(&body.places, subj_place)
+        for i in 0..body.move_defer_locks.len {
+            locked := body.move_defer_locks[i]
+            if locked == binding || (subj_binding >= 0 && locked == subj_binding) {
+                return move_err(with_clone_hint(&types, ty, "cannot move a value captured by defer", "; use .clone() or move it after the deferred scope"))
+            }
+        }
+        return MoveStep {
+            status: 0,
+            release_loan: -1,
+            binding: binding,
+            path: path,
+            subj_binding: subj_binding,
+            subj_path: subj_path,
+            error: "",
+        }
+    }
+    s1 := check_loan_step(&body, &tokens, place, false)
+    if s1 >= 0 { return move_release(s1) }
+    if s1 == -2 { return move_err("cannot mutate, replace or move a value while it is borrowed") }
+    path := owner_path(&body, place)
+    if !ownership.available(&body.ownership, path) {
+        return move_err("use of moved value '" + body.locals.names[binding] + "'")
+    }
+    if is_for_locked(&body, path) {
+        return move_err("cannot move a collection while iterating over it")
+    }
+    for i in 0..body.move_defer_locks.len {
+        if body.move_defer_locks[i] == binding {
+            return move_err(with_clone_hint(&types, ty, "cannot move a value captured by defer", "; use .clone() or move it after the deferred scope"))
+        }
+    }
+    MoveStep {
+        status: 0,
+        release_loan: -1,
+        binding: binding,
+        path: path,
+        subj_binding: -1,
+        subj_path: -1,
+        error: "",
+    }
+}
+
+pub fn apply_move(body: &mut fc.FunctionContext, step: &MoveStep, at: i32) {
+    ownership.consume(&mut body.ownership, step.path, at)
+    record_mutation(&mut body, step.binding, step.path)
+    if step.subj_path >= 0 && ownership.available(&body.ownership, step.subj_path) {
+        ownership.consume(&mut body.ownership, step.subj_path, at)
+    }
+    if step.subj_binding >= 0 {
+        record_mutation(&mut body, step.subj_binding, step.subj_path)
+    }
+}
+
+pub fn collect_unused_locals(world: &fc.DeclarationWorld, body: &fc.FunctionContext,
+    specs: &generics.Layout, warn_unused_fns: &[]bool, source_paths: &[]string, f: i32) -> []UnusedLocal {
+    mut out: []UnusedLocal = []
+    if warn_unused_fns.len == world.names.len {
+        if f < 0 || f >= warn_unused_fns.len || !warn_unused_fns[f] { return out }
+    } else {
+        owner := world.function_owners[f]
+        if owner < 0 || owner >= source_paths.len { return out }
+        path := &source_paths[owner]
+        if path.len == 0 || path[0] == 60 { return out }
+        if f >= 0 && f < specs.function_instances.len && specs.function_instances[f] != -1 { return out }
+        if world.starts[f] > 0 && generics.generated(&specs, world.tokens.starts[world.starts[f]]) { return out }
+    }
+    for i in 0..body.locals.names.len {
+        if body.locals.is_param[i] || body.locals.used[i] || body.locals.warned[i] { continue }
+        name := &body.locals.names[i]
+        if name.len == 0 || name[0] == 95 { continue }
+        tok := body.locals.tokens[i]
+        if tok < 0 || tok >= world.tokens.starts.len { continue }
+        off := world.tokens.starts[tok]
+        if off >= world.source_end || generics.generated(&specs, off) { continue }
+        out.push(UnusedLocal { name: name.clone(), offset: off, local_idx: i })
+    }
+    out
+}
+
+pub fn scoped_borrow_body(world: &fc.DeclarationWorld, types: &ft.TypeRegistry, self_type: i32, f: i32) -> bool {
+    for i in world.starts[f]..world.ends[f] {
+        if world.tokens.kinds[i] == .Name && world.tokens.texts[i] == "as_bytes" { return true }
+        if world.tokens.kinds[i] != .Symbol || world.tokens.texts[i] != "&" { continue }
+        mut before := i - 1
+        while before >= world.starts[f] && (lexer.is_newline(world.tokens.kinds[before]) || world.tokens.texts[before] == "(") { before -= 1 }
+        if before >= 0 && (world.tokens.texts[before] == ":=" || world.tokens.texts[before] == "=") { return true }
+        if world.tokens.texts[i + 1] == "mut" { continue }
+        mut at := i + 1
+        if world.tokens.kinds[at] != .Name { return true }
+        if world.tokens.texts[at] == "await" || world.tokens.texts[at] == "spawn" { return true }
+        ty := if world.tokens.texts[at] == "Self" { self_type } else { ft.type_id(&types, world.tokens.texts[at]) }
+        if world.functions.get_or(world.tokens.texts[at], -1) >= 0 || ty >= 0 { return true }
+        at += 1
+        while at < world.ends[f] {
+            token := world.tokens.texts[at].clone()
+            if token == "(" || token == "{" || token == "::" { return true }
+            if token == "." {
+                if world.tokens.texts[at + 1] == "len" { return true }
+                at += 2
+            } else if token == "[" {
+                mut depth := 1; at += 1
+                while at < world.ends[f] && depth > 0 {
+                    if world.tokens.texts[at] == ".." { return true }
+                    if world.tokens.texts[at] == "[" { depth += 1 }
+                    if world.tokens.texts[at] == "]" { depth -= 1 }
+                    at += 1
+                }
+            } else { break }
+        }
+    }
+    false
+}
+
+pub fn needs_loan_analysis(world: &fc.DeclarationWorld, types: &ft.TypeRegistry, loans_active: bool,
+    self_type: i32, f: i32) -> bool {
+    if !loans_active { return false }
+    for p in world.param_starts[f]..world.param_starts[f] + world.param_counts[f] {
+        kind := ft.type_kind(&types, world.param_types[p])
+        if kind == 4 || kind == 5 { return true }
+    }
+    for i in world.starts[f]..world.ends[f] {
+        if world.tokens.kinds[i] == .Name && world.tokens.texts[i] == "region" && world.tokens.kinds[i + 1] == .Name { return true }
+        if world.tokens.kinds[i] == .Name && world.tokens.texts[i] == "bytes_view" && world.tokens.texts[i + 1] == "(" { return true }
+        if world.tokens.kinds[i] == .Name && world.tokens.texts[i] == "as_bytes" && world.tokens.texts[i + 1] == "(" { return true }
+        if world.tokens.kinds[i] == .Symbol && world.tokens.texts[i] == "&" && world.tokens.texts[i + 1] == "mut" { return true }
+    }
+    scoped_borrow_body(&world, &types, self_type, f)
+}
+
+pub fn loan_origin(body: &fc.FunctionContext, types: &ft.TypeRegistry, place: i32) -> i32 {
+    binding := borrows.root(&body.places, place)
+    if binding < 0 { return -1 }
+    if local_borrows.shared(&body.local_loans, binding) { return local_borrows.origin(&body.local_loans, binding) }
+    kind := ft.type_kind(&types, body.locals.types[binding])
+    if kind == 21 { return -2 }
+    if body.locals.scopes[binding] == 0 && (kind == 4 || kind == 5) {
+        return body.first_parameter + binding
+    }
+    -1
+}
