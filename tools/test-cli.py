@@ -38,6 +38,16 @@ class Project:
         return result
 
 
+def _agent_error(stdout):
+    records = [json.loads(line) for line in stdout.splitlines()]
+    assert records and records[-1]["kind"] == "failed", records
+    for record in records:
+        if record["kind"] == "error":
+            assert record["code"] != "E1000", record
+            return record
+    raise AssertionError(f"missing error record in {records}")
+
+
 def modules_and_manifest(p):
     p.write("dunder.toml", 'name = "consumer"\nroot = "main.ddr"\ntest_root = "cases.ddr"\n')
     p.write("main.ddr", "import sys\nimport link as lib\nfn main()->i32{print(sys.arg(1));return lib.answer()}\n")
@@ -65,7 +75,7 @@ def modules_and_manifest(p):
     p.call("build", "-o", saved, status=1)
     assert saved.read_bytes() == original
     errors = p.call("check", "main.ddr", "--agent", status=1)
-    diagnostic = json.loads(errors.stdout)
+    diagnostic = _agent_error(errors.stdout)
     assert diagnostic["kind"] == "error" and diagnostic["path"].endswith("value.ddr")
     assert 0 <= diagnostic["start"] <= diagnostic["end"] <= len(source.read_bytes())
     original_source = "pub fn answer()->i32{42}\n"
@@ -219,8 +229,9 @@ def worker_options(p):
         result = invoke("check", "bad-workers.ddr", "--agent", "--jobs=" + str(workers), status=1)
         assert result.stderr == ""
         observed(workers, True, True)
-        errors.append(json.loads(result.stdout))
-    assert errors[0] == errors[1] and errors[0]["kind"] == "error"
+        _agent_error(result.stdout)
+        errors.append(result.stdout)
+    assert errors[0] == errors[1]
     p.write("worker-cases.ddr", "@test fn ready(){true}\n")
     for workers, expected in ((1, "1 passed"), (4, "1 unaffected")):
         result = invoke("test", "worker-cases.ddr", "--affected", "--jobs=" + str(workers))
@@ -1045,7 +1056,7 @@ def manifest_dependencies(p):
     # Missing submodule inside a resolved dependency reports a clean load diagnostic.
     p.write("app/src/bad_import.ddr", "import skrift.missing\nfn main() {}\n")
     bad_imp = p.call("check", "src/bad_import.ddr", "--agent", cwd=app, status=1)
-    err_obj = json.loads(bad_imp.stdout)
+    err_obj = _agent_error(bad_imp.stdout)
     assert err_obj["kind"] == "error" and "cannot load module" in err_obj["message"] and "missing.ddr" in err_obj["message"], err_obj
     bad_build = p.call("build", "src/bad_import.ddr", cwd=app, status=1)
     assert "cannot load module" in bad_build.stderr and "missing.ddr" in bad_build.stderr, bad_build

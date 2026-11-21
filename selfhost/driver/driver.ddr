@@ -6,6 +6,7 @@ import cache_io
 import agent
 import cli
 import ..frontend.compile as compiler
+import ..frontend.diagnostics as diag
 import modules
 import process
 import receipts
@@ -53,16 +54,111 @@ fn backend_counts(options: &cli.Options, records: &compiler.Bindings) -> timings
     data.value_analysis_units = records.mir_value_analysis_units; data.value_budget_refusals = records.mir_value_budget_refusals; data
 }
 
-fn report(path: string, source: string, offset: i32, message: string) {
-    mut line := 1
-    mut column := 1
-    for i in 0..offset {
-        if i >= source.len { break }
-        byte := source[i]
-        if byte == 10 { line = line + 1; column = 1 }
-        else if byte < 128 || byte >= 192 { column = column + 1 }
+fn source_for_path(loaded: &modules.Loaded, path: string) -> string {
+    for i in 0..loaded.paths.len {
+        if loaded.paths[i] == path && i < loaded.sources.len { return loaded.sources[i].clone() }
     }
-    _ := stderr.eprint(f"{path}:{line}:{column}: error[E1000]: {message}")
+    if path == loaded.path { return loaded.source.clone() }
+    ""
+}
+
+fn resolve_raw_item(loaded: &modules.Loaded, r: &diag.RawDiagnostic) -> diag.Diagnostic {
+    mut path := loaded.path.clone()
+    mut src := loaded.source.clone()
+    mut off := r.start
+    if loaded.sources.len > 0 {
+        loc := modules.location(&loaded, r.start)
+        path = loc.path; src = loc.source; off = loc.offset
+    }
+    mut last := -1
+    if r.last >= r.start && loaded.sources.len > 0 {
+        end_loc := modules.location(&loaded, r.last)
+        if end_loc.path == path && end_loc.offset >= off { last = end_loc.offset }
+    } else if r.last >= r.start && loaded.sources.len == 0 {
+        last = r.last
+    }
+    sp := diag.resolve_span(src, off, last)
+    mut note_path := ""
+    mut note_start := -1
+    mut note_end := -1
+    if r.note_start >= 0 && loaded.sources.len > 0 {
+        nloc := modules.location(&loaded, r.note_start)
+        note_path = nloc.path
+        mut nlast := -1
+        if r.note_last >= r.note_start {
+            nend := modules.location(&loaded, r.note_last)
+            if nend.path == note_path && nend.offset >= nloc.offset { nlast = nend.offset }
+        }
+        nsp := diag.resolve_span(nloc.source, nloc.offset, nlast)
+        note_start = nsp.start
+        note_end = nsp.end
+    }
+    code := if r.code != "" { r.code.clone() } else { diag.classify_error_code(r.message) }
+    diag.Diagnostic {
+        severity: r.severity,
+        code: code,
+        path: path,
+        start: sp.start,
+        end: sp.end,
+        message: r.message.clone(),
+        note_path: note_path,
+        note_start: note_start,
+        note_end: note_end,
+        note_message: r.note_message.clone(),
+    }
+}
+
+fn resolve_loader_diagnostics(loaded: &modules.Loaded) -> []diag.Diagnostic {
+    mut out: []diag.Diagnostic = []
+    mut saw_error := false
+    for i in 0..loaded.diagnostics.len {
+        d := diag.clone_diag(&loaded.diagnostics[i])
+        if d.severity == .Error { saw_error = true }
+        out.push(move d)
+    }
+    if !loaded.ok && !saw_error && loaded.error != "" {
+        sp := diag.resolve_span(loaded.source, loaded.offset, -1)
+        out.push(diag.Diagnostic {
+            severity: .Error,
+            code: diag.classify_error_code(loaded.error),
+            path: loaded.path.clone(),
+            start: sp.start,
+            end: sp.end,
+            message: loaded.error.clone(),
+            note_path: "",
+            note_start: -1,
+            note_end: -1,
+            note_message: "",
+        })
+    }
+    diag.sort_resolved(&mut out)
+    out
+}
+
+fn resolve_compiler_diagnostics(loaded: &modules.Loaded, raw: &[]diag.RawDiagnostic, ok: bool, fallback_offset: i32, fallback_error: string) -> []diag.Diagnostic {
+    mut out: []diag.Diagnostic = []
+    for i in 0..loaded.diagnostics.len { out.push(diag.clone_diag(&loaded.diagnostics[i])) }
+    mut saw_error := false
+    for i in 0..raw.len {
+        d := resolve_raw_item(&loaded, &raw[i])
+        if d.severity == .Error { saw_error = true }
+        out.push(move d)
+    }
+    if !ok && !saw_error && fallback_error != "" {
+        fb := diag.RawDiagnostic { severity: .Error, code: "", start: fallback_offset, last: -1, message: fallback_error.clone(), note_start: -1, note_last: -1, note_message: "" }
+        out.push(resolve_raw_item(&loaded, &fb))
+    }
+    diag.sort_resolved(&mut out)
+    out
+}
+
+fn emit_human_diagnostics(loaded: &modules.Loaded, items: &[]diag.Diagnostic) {
+    for i in 0..items.len {
+        d := &items[i]
+        src := source_for_path(&loaded, d.path)
+        note_src := if d.note_path != "" { source_for_path(&loaded, d.note_path) } else { "" }
+        _ := stderr.eprint(diag.render_human(&d, src, note_src))
+    }
 }
 
 fn failure(message: string) -> i32 {
@@ -140,8 +236,13 @@ pub fn build_configured(default_target: i32, default_workers: i32, supports_work
     mut session := compiler.new_session()
     loaded := compiler.load_group_with_deps_into(&mut session, options.input, options.tests, options.group, platform == 3, &options.dep_names, &options.dep_dirs, &options.dep_entries, &options.dep_caps, &lexing)
     if !loaded.ok {
-        if options.agent { agent.error(loaded.path, loaded.source, loaded.offset, loaded.error) }
-        else { report(loaded.path, loaded.source, loaded.offset, loaded.error) }
+        items := resolve_loader_diagnostics(&loaded)
+        if options.agent {
+            empty := compiler.bindings()
+            agent.report_result(&loaded, &empty, &items, false)
+        } else {
+            emit_human_diagnostics(&loaded, &items)
+        }
         return 1
     }
     if options.list_groups {
@@ -162,10 +263,10 @@ pub fn build_configured(default_target: i32, default_workers: i32, supports_work
         mut check_setup: i64 = 0
         if options.timings { check_setup = process.monotonic_nanoseconds(default_target) }
         checked := compile_fn(&mut session, platform, &loaded.map_starts, &loaded.map_files, true, options.agent, &mut records, "", "", &config)
+        items := resolve_compiler_diagnostics(&loaded, &checked.diagnostics, checked.ok, checked.offset, checked.error)
         if !checked.ok {
-            location := modules.location(&loaded, checked.offset)
-            if options.agent { agent.error(location.path, location.source, location.offset, checked.error) }
-            else { report(location.path, location.source, location.offset, checked.error) }
+            if options.agent { agent.report_result(&loaded, &records, &items, false) }
+            else { emit_human_diagnostics(&loaded, &items) }
             return 1
         }
         if options.timings {
@@ -176,8 +277,11 @@ pub fn build_configured(default_target: i32, default_workers: i32, supports_work
                 started, load_finished, check_setup, finished, finished, finished,
                 options.scalar_opt, records.modeled, records.optimized, records.rewrites, records.proven_bounds, records.fallbacks, &records.profile, &inline_data, &backend_data)
         }
-        if options.agent { agent.success(&loaded, &records) }
-        else { print(f"checked {options.input} ({loaded.paths.len} modules)") }
+        if options.agent { agent.report_result(&loaded, &records, &items, true) }
+        else {
+            if !options.timings_json { emit_human_diagnostics(&loaded, &items) }
+            print(f"checked {options.input} ({loaded.paths.len} modules)")
+        }
         return 0
     }
     for path in &loaded.paths {
@@ -209,11 +313,12 @@ pub fn build_configured(default_target: i32, default_workers: i32, supports_work
     mut setup_finished: i64 = 0
     if options.timings { setup_finished = process.monotonic_nanoseconds(default_target) }
     result := compile_fn(&mut session, platform, &loaded.map_starts, &loaded.map_files, false, false, &mut records, cache, identity, &config)
+    items := resolve_compiler_diagnostics(&loaded, &result.diagnostics, result.ok, result.offset, result.error)
     if !result.ok {
-        location := modules.location(&loaded, result.offset)
-        report(location.path, location.source, location.offset, result.error)
+        emit_human_diagnostics(&loaded, &items)
         return 1
     }
+    if !options.timings_json { emit_human_diagnostics(&loaded, &items) }
     mut compile_finished: i64 = 0
     if options.timings { compile_finished = process.monotonic_nanoseconds(default_target) }
     signer := macho.Signer { workers: compile_jobs, digest: digest_pages }
