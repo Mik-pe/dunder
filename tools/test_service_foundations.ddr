@@ -1,0 +1,518 @@
+capability process, filesystem, stdio
+
+import std.bytes as bytes
+import std.fs as fs
+import std.path as path
+import std.process as process
+import std.text as text
+import sys
+
+fn fail_msg(msg: string) -> i32 {
+    _ := sys.eprint("FAIL test-service-foundations: " + msg)
+    1
+}
+
+fn verify_static_elf(elf_path: string, arch_label: string) -> bool {
+    raw_res := sys.read_u8(elf_path)
+    if !raw_res.ok {
+        _ := sys.eprint("cannot read ELF " + elf_path)
+        return false
+    }
+    elf := &raw_res.value
+    if elf.len < 64 { return false }
+    if elf[0] != 127 || elf[1] != b'E' || elf[2] != b'L' || elf[3] != b'F' {
+        _ := sys.eprint("bad ELF magic in " + elf_path)
+        return false
+    }
+    e_phoff := i32(bytes.u64_le(&elf, 32))
+    e_phentsize := bytes.u16_le(&elf, 54)
+    e_phnum := bytes.u16_le(&elf, 56)
+    mut interp_count := 0
+    mut dynamic_count := 0
+    for i in 0..e_phnum {
+        off := e_phoff + i * e_phentsize
+        if off + 4 > elf.len { return false }
+        ptype := bytes.u32_le(&elf, off)
+        if ptype == 3 { interp_count += 1 }
+        if ptype == 2 { dynamic_count += 1 }
+    }
+    if interp_count != 0 || dynamic_count != 0 {
+        _ := sys.eprint(arch_label + " ELF has dynamic linkage: PT_INTERP=" + interp_count.str() + " PT_DYNAMIC=" + dynamic_count.str())
+        return false
+    }
+    true
+}
+
+fn compile_source(compiler: string, src_path: string, out_path: string, target: string) -> bool {
+    mut args: []string = ["build", src_path.clone(), "--jobs", "1", "-o", out_path.clone()]
+    if target.len > 0 {
+        args.push("--target")
+        args.push(target.clone())
+    }
+    res := process.run(compiler.clone(), args)
+    if !res.succeeded() {
+        _ := sys.eprint("compile failed (" + target + ") for " + src_path + ": " + res.stderr_text())
+        return false
+    }
+    true
+}
+
+fn write_probe_source(src_path: string, work_dir: string) -> bool {
+    mut code := "capability process, filesystem, stdio, unsafe\n"
+    code += "import std.bytes as bytes\n"
+    code += "import std.crypto as crypto\n"
+    code += "import std.fs as fs\n"
+    code += "import std.path as path\n"
+    code += "import std.process as process\n"
+    code += "import std.signal as signal\n"
+    code += "import std.time as time\n"
+    code += "import sys\n\n"
+    code += "fn expect_ok(r: Result<(), sys.IoError>) {\n"
+    code += "    match r {\n"
+    code += "        .Ok(_) => {},\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "}\n\n"
+    code += "fn expect_err(r: Result<(), sys.IoError>) {\n"
+    code += "    match r {\n"
+    code += "        .Ok(_) => assert(false),\n"
+    code += "        .Err(_) => {},\n"
+    code += "    }\n"
+    code += "}\n\n"
+    code += "fn verify_heap_and_large_files(work: string) -> bool {\n"
+    code += "    mut block: []u8 = []\n"
+    code += "    bytes.pad(&mut block, 65536)\n"
+    code += "    block[0] = 65\n"
+    code += "    for _i in 0..10 {\n"
+    code += "        copy := block.clone()\n"
+    code += "        bytes.extend(&mut block, &copy)\n"
+    code += "    }\n"
+    code += "    assert(block.len == 67108864)\n"
+    code += "    mut slabs: [][]u8 = []\n"
+    code += "    for k in 0..9 {\n"
+    code += "        mut c := block.clone()\n"
+    code += "        c[0] = u8(k + 1)\n"
+    code += "        c[c.len - 1] = u8(250 - k)\n"
+    code += "        slabs.push(move c)\n"
+    code += "    }\n"
+    code += "    for k in 0..9 {\n"
+    code += "        assert(slabs[k].len == 67108864)\n"
+    code += "        assert(slabs[k][0] == u8(k + 1))\n"
+    code += "        assert(slabs[k][67108863] == u8(250 - k))\n"
+    code += "    }\n"
+    code += "    mut big := \"service-foundation-0123456789abcdef-service-foundation-0123456789\\n\"\n"
+    code += "    for _i in 0..17 {\n"
+    code += "        big = big + big\n"
+    code += "    }\n"
+    code += "    assert(big.len > 6000000)\n"
+    code += "    big_path := path.join(work, \"large-6mib.txt\")\n"
+    code += "    assert(sys.write_text(big_path, big).ok)\n"
+    code += "    rd_txt := sys.read_text(big_path)\n"
+    code += "    assert(rd_txt.ok && rd_txt.value == big)\n"
+    code += "    rd_bin := sys.read_u8(big_path)\n"
+    code += "    assert(rd_bin.ok && rd_bin.value.len == big.len)\n"
+    code += "    assert(!sys.read_text_limit(big_path, 1024).ok)\n"
+    code += "    true\n"
+    code += "}\n\n"
+    code += "fn verify_fs_and_meta(work: string) -> bool {\n"
+    code += "    target_file := path.join(work, \"target.txt\")\n"
+    code += "    assert(sys.write_text(target_file, \"hello-metadata\").ok)\n"
+    code += "    m_sys := sys.metadata(target_file)\n"
+    code += "    assert(m_sys.ok && m_sys.is_file && !m_sys.is_dir && !m_sys.is_symlink)\n"
+    code += "    assert(m_sys.size == 14 && m_sys.ino != u64(0) && m_sys.nlink >= u64(1) && m_sys.mtime > 1700000000)\n"
+    code += "    assert(m_sys.kind() == .File && m_sys.permissions() > u32(0))\n"
+    code += "    match fs.metadata(target_file) {\n"
+    code += "        .Ok(m_fs) => {\n"
+    code += "            assert(m_fs.ok && m_fs.size == 14 && m_fs.ino == m_sys.ino && m_fs.nlink >= u64(1) && m_fs.mtime > 1700000000)\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    match fs.FileReader::open(target_file) {\n"
+    code += "        .Ok(mut fr) => {\n"
+    code += "            match fr.metadata() {\n"
+    code += "                .Ok(mf) => assert(mf.ok && mf.ino == m_sys.ino && mf.size == 14),\n"
+    code += "                .Err(_) => assert(false),\n"
+    code += "            }\n"
+    code += "            expect_ok(fr.close())\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    expect_ok(fs.chmod(target_file, u32(384)))\n"
+    code += "    match fs.metadata(target_file) {\n"
+    code += "        .Ok(mc) => assert(mc.permissions() == u32(384)),\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    match fs.File::open(target_file, fs.OpenOptions::read_write()) {\n"
+    code += "        .Ok(mut f) => {\n"
+    code += "            expect_ok(f.set_permissions(u32(416)))\n"
+    code += "            match f.metadata() {\n"
+    code += "                .Ok(mf) => assert(mf.permissions() == u32(416)),\n"
+    code += "                .Err(_) => assert(false),\n"
+    code += "            }\n"
+    code += "            expect_ok(f.close())\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    writer_file := path.join(work, \"writer.txt\")\n"
+    code += "    match fs.FileWriter::create(writer_file) {\n"
+    code += "        .Ok(mut fw) => {\n"
+    code += "            expect_ok(fw.set_permissions(u32(384)))\n"
+    code += "            match fw.metadata() {\n"
+    code += "                .Ok(mw) => assert(mw.permissions() == u32(384)),\n"
+    code += "                .Err(_) => assert(false),\n"
+    code += "            }\n"
+    code += "            expect_ok(fw.close())\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    link_path := path.join(work, \"target-link.txt\")\n"
+    code += "    ln_res := process.run(\"ln\", [\"-s\", target_file.clone(), link_path.clone()])\n"
+    code += "    assert(ln_res.succeeded())\n"
+    code += "    match fs.lstat(link_path) {\n"
+    code += "        .Ok(ml) => {\n"
+    code += "            assert(ml.ok && ml.is_symlink && !ml.is_file && ml.kind() == .Symlink)\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    match fs.metadata(link_path) {\n"
+    code += "        .Ok(mt) => {\n"
+    code += "            assert(mt.ok && !mt.is_symlink && mt.is_file && mt.kind() == .File && mt.size == 14)\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    mut nf_opts := fs.OpenOptions::read_only()\n"
+    code += "    nf_opts.set_nofollow(true)\n"
+    code += "    match fs.File::open(link_path, nf_opts) {\n"
+    code += "        .Ok(_) => assert(false),\n"
+    code += "        .Err(_) => {},\n"
+    code += "    }\n"
+    code += "    match fs.File::open(target_file, nf_opts) {\n"
+    code += "        .Ok(mut f_ok) => expect_ok(f_ok.close()),\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    expect_ok(fs.sync_dir(work))\n"
+    code += "    expect_err(fs.sync_dir(target_file))\n"
+    code += "    mut auto_path := \"\"\n"
+    code += "    {\n"
+    code += "        match fs.temp_file(work, \"auto-\") {\n"
+    code += "            .Ok(tf) => {\n"
+    code += "                auto_path = tf.path()\n"
+    code += "                expect_ok(tf.write_text(\"temp-data\"))\n"
+    code += "                expect_ok(tf.sync())\n"
+    code += "                match tf.metadata() {\n"
+    code += "                    .Ok(tm) => assert(tm.permissions() == u32(384) && tm.size == 9),\n"
+    code += "                    .Err(_) => assert(false),\n"
+    code += "                }\n"
+    code += "            },\n"
+    code += "            .Err(_) => assert(false),\n"
+    code += "        }\n"
+    code += "    }\n"
+    code += "    assert(!sys.metadata(auto_path).ok)\n"
+    code += "    mut kept_path := \"\"\n"
+    code += "    match fs.temp_file(work, \"kept-\") {\n"
+    code += "        .Ok(mut tf2) => {\n"
+    code += "            expect_ok(tf2.write_text(\"kept-body\"))\n"
+    code += "            match tf2.keep() {\n"
+    code += "                .Ok(kp) => { kept_path = kp },\n"
+    code += "                .Err(_) => assert(false),\n"
+    code += "            }\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    assert(sys.metadata(kept_path).is_file && sys.read_text(kept_path).value == \"kept-body\")\n"
+    code += "    atomic_dest := path.join(work, \"secret.cfg\")\n"
+    code += "    expect_ok(fs.write_private_text_atomic(atomic_dest, \"secret-v1\"))\n"
+    code += "    match fs.metadata(atomic_dest) {\n"
+    code += "        .Ok(ma1) => assert(ma1.permissions() == u32(384)),\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    assert(sys.read_text(atomic_dest).value == \"secret-v1\")\n"
+    code += "    expect_ok(fs.write_private_text_atomic(atomic_dest, \"secret-v2\"))\n"
+    code += "    match fs.metadata(atomic_dest) {\n"
+    code += "        .Ok(ma2) => assert(ma2.permissions() == u32(384)),\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    assert(sys.read_text(atomic_dest).value == \"secret-v2\")\n"
+    code += "    true\n"
+    code += "}\n\n"
+    code += "fn verify_crypto_time_path_and_signal_state() -> bool {\n"
+    code += "    assert(path.join(\"/var\", \"log/app.sock\") == \"/var/log/app.sock\")\n"
+    code += "    assert(path.normalize(\"/a/b/../c/./d\") == \"/a/c/d\")\n"
+    code += "    assert(time.unix_now_secs() > 1700000000)\n"
+    code += "    assert(time.monotonic_ms() >= 0)\n"
+    code += "    assert(time.format_rfc3339(0) == \"1970-01-01T00:00:00Z\")\n"
+    code += "    assert(time.format_http_date(0) == \"Thu, 01 Jan 1970 00:00:00 GMT\")\n"
+    code += "    mut buf: []u8 = [10, 20, 30, 40, 50]\n"
+    code += "    crypto.zeroize(&mut buf)\n"
+    code += "    assert(buf.len == 5)\n"
+    code += "    for b in &buf { assert(b == 0) }\n"
+    code += "    mut buf2: []u8 = [1, 2, 3]\n"
+    code += "    crypto.zeroize_and_clear(&mut buf2)\n"
+    code += "    assert(buf2.len == 0)\n"
+    code += "    s1 := crypto.SecretBytes::from_text(\"hunter2\")\n"
+    code += "    s2 := crypto.SecretBytes::from_slice(s1.as_bytes())\n"
+    code += "    assert(s1.len() == 7 && !s1.is_empty() && s1.equal(&s2))\n"
+    code += "    match crypto.SecretBytes::random(32) {\n"
+    code += "        .Ok(mut r) => {\n"
+    code += "            assert(r.len() == 32)\n"
+    code += "            r.as_mut_bytes()[0] = 42\n"
+    code += "            r.clear()\n"
+    code += "            assert(r.len() == 0 && r.is_empty())\n"
+    code += "        },\n"
+    code += "        .Err(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    {\n"
+    code += "        _s3 := crypto.SecretBytes::from_bytes([7, 8, 9])\n"
+    code += "    }\n"
+    code += "    expect_ok(signal.ignore_sigpipe())\n"
+    code += "    expect_ok(signal.install_shutdown_handler())\n"
+    code += "    assert(signal.shutdown_fd() >= 0)\n"
+    code += "    assert(!signal.shutdown_requested())\n"
+    code += "    match signal.take_shutdown_signal() {\n"
+    code += "        .None => {},\n"
+    code += "        .Some(_) => assert(false),\n"
+    code += "    }\n"
+    code += "    signal.reset_shutdown_handler()\n"
+    code += "    assert(signal.shutdown_fd() == -1)\n"
+    code += "    true\n"
+    code += "}\n\n"
+    code += "fn main() -> i32 {\n"
+    code += "    assert(verify_crypto_time_path_and_signal_state())\n"
+    code += "    if target_is(\"macos\") || target_is(\"linux\") {\n"
+    code += "        work := \"" + work_dir + "\"\n"
+    code += "        assert(verify_fs_and_meta(work))\n"
+    code += "        assert(verify_heap_and_large_files(work))\n"
+    code += "    }\n"
+    code += "    print(\"PROBE_OK\")\n"
+    code += "    0\n"
+    code += "}\n"
+    sys.write_text(src_path, code).ok
+}
+
+fn write_static_linux_probe_source(src_path: string) -> bool {
+    mut code := "capability filesystem, stdio\n"
+    code += "import std.crypto as crypto\n"
+    code += "import std.fs as fs\n"
+    code += "import std.path as path\n"
+    code += "import std.signal as signal\n"
+    code += "import std.time as time\n"
+    code += "import sys\n\n"
+    code += "fn main() -> i32 {\n"
+    code += "    joined := path.join(\"/var/log\", \"service/app.sock\")\n"
+    code += "    assert(path.dirname(joined) == \"/var/log/service\")\n"
+    code += "    assert(path.basename(joined) == \"app.sock\")\n"
+    code += "    assert(path.stem(joined) == \"app\")\n"
+    code += "    _ext := path.extension(joined)\n"
+    code += "    _we := path.with_extension(joined, \"pid\")\n"
+    code += "    assert(path.normalize(\"/a/b/../c/./d\") == \"/a/c/d\")\n"
+    code += "    now := time.unix_now()\n"
+    code += "    _ := now.as_secs()\n"
+    code += "    _ := time.unix_now_secs()\n"
+    code += "    _ := time.monotonic_ms()\n"
+    code += "    assert(time.format_rfc3339(0) == \"1970-01-01T00:00:00Z\")\n"
+    code += "    assert(time.format_http_date(0) == \"Thu, 01 Jan 1970 00:00:00 GMT\")\n"
+    code += "    _ := signal.ignore_sigpipe()\n"
+    code += "    _ := signal.install_shutdown_handler()\n"
+    code += "    _ := signal.shutdown_fd()\n"
+    code += "    _ := signal.shutdown_requested()\n"
+    code += "    _ := signal.take_shutdown_signal()\n"
+    code += "    signal.reset_shutdown_handler()\n"
+    code += "    match signal.SignalWatcher::shutdown() {\n"
+    code += "        .Ok(mut w) => w.close(),\n"
+    code += "        .Err(_) => {},\n"
+    code += "    }\n"
+    code += "    _ := sys.metadata(\"/tmp/nonexistent-static-probe\")\n"
+    code += "    _ := sys.write_text(\"/tmp/nonexistent-static-probe\", \"x\")\n"
+    code += "    _ := sys.read_text(\"/tmp/nonexistent-static-probe\")\n"
+    code += "    _ := sys.read_text_limit(\"/tmp/nonexistent-static-probe\", 64)\n"
+    code += "    _ := sys.read_u8(\"/tmp/nonexistent-static-probe\")\n"
+    code += "    _ := fs.metadata(\"/tmp/nonexistent-static-probe\")\n"
+    code += "    _ := fs.lstat(\"/tmp/nonexistent-static-probe\")\n"
+    code += "    _ := fs.chmod(\"/tmp/nonexistent-static-probe\", u32(384))\n"
+    code += "    _ := fs.sync_dir(\"/tmp\")\n"
+    code += "    _ := fs.temp_file(\"/tmp\", \"s-\")\n"
+    code += "    _ := fs.write_private_text_atomic(\"/tmp/nonexistent-static-probe\", \"ok\")\n"
+    code += "    mut opts := fs.OpenOptions::read_only()\n"
+    code += "    opts.set_nofollow(true)\n"
+    code += "    match fs.File::open(\"/tmp/nonexistent-static-probe\", opts) {\n"
+    code += "        .Ok(mut f) => {\n"
+    code += "            _ := f.metadata()\n"
+    code += "            _ := f.set_permissions(u32(384))\n"
+    code += "            _ := f.close()\n"
+    code += "        },\n"
+    code += "        .Err(_) => {},\n"
+    code += "    }\n"
+    code += "    mut b: []u8 = [1, 2, 3]\n"
+    code += "    crypto.zeroize(&mut b)\n"
+    code += "    crypto.zeroize_and_clear(&mut b)\n"
+    code += "    s1 := crypto.SecretBytes::from_text(\"secret\")\n"
+    code += "    s2 := crypto.SecretBytes::from_slice(s1.as_bytes())\n"
+    code += "    assert(s1.equal(&s2))\n"
+    code += "    mut s3 := crypto.SecretBytes::from_bytes([9, 8])\n"
+    code += "    s3.clear()\n"
+    code += "    0\n"
+    code += "}\n"
+    sys.write_text(src_path, code).ok
+}
+
+fn write_wasm_probe_source(src_path: string) -> bool {
+    mut code := "import std.crypto as crypto\n"
+    code += "import std.path as path\n"
+    code += "import std.signal as signal\n"
+    code += "import std.time as time\n\n"
+    code += "fn main() -> i32 {\n"
+    code += "    assert(path.join(\"/srv\", \"bin\") == \"/srv/bin\")\n"
+    code += "    assert(time.format_rfc3339(0) == \"1970-01-01T00:00:00Z\")\n"
+    code += "    assert(signal.Signal.Term.number() == 15)\n"
+    code += "    mut s := crypto.SecretBytes::from_text(\"wasm\")\n"
+    code += "    assert(s.len() == 4)\n"
+    code += "    s.clear()\n"
+    code += "    assert(s.is_empty())\n"
+    code += "    0\n"
+    code += "}\n"
+    sys.write_text(src_path, code).ok
+}
+
+fn write_signal_child_source(src_path: string) -> bool {
+    mut code := "capability stdio\n"
+    code += "import std.signal as signal\n\n"
+    code += "fn main() -> i32 {\n"
+    code += "    match signal.SignalWatcher::shutdown() {\n"
+    code += "        .Ok(mut w) => {\n"
+    code += "            print(\"READY\")\n"
+    code += "            match w.wait(5000) {\n"
+    code += "                .Some(sig) => {\n"
+    code += "                    assert(w.triggered())\n"
+    code += "                    print(\"SIG:\" + sig.str())\n"
+    code += "                    w.close()\n"
+    code += "                    return 0\n"
+    code += "                },\n"
+    code += "                .None => {\n"
+    code += "                    w.close()\n"
+    code += "                    return 2\n"
+    code += "                },\n"
+    code += "            }\n"
+    code += "        },\n"
+    code += "        .Err(_) => { return 3 },\n"
+    code += "    }\n"
+    code += "}\n"
+    sys.write_text(src_path, code).ok
+}
+
+fn read_expected_line(child: &mut process.Child, expected: string, label: string) -> bool {
+    match child.read_stdout_line(5000) {
+        .Ok(opt) => {
+            match opt {
+                .Some(line) => {
+                    if line != expected {
+                        _ := child.kill()
+                        _ := child.wait(1000)
+                        _ := sys.eprint("unexpected " + label + " line: got '" + line + "', expected '" + expected + "'")
+                        return false
+                    }
+                    return true
+                },
+                .None => {
+                    _ := child.kill()
+                    _ := child.wait(1000)
+                    _ := sys.eprint("child closed stdout before " + label)
+                    return false
+                },
+            }
+        },
+        .Err(_) => {
+            _ := child.kill()
+            _ := child.wait(1000)
+            _ := sys.eprint("failed reading " + label + " line")
+            return false
+        },
+    }
+}
+
+fn run_signal_child_case(child_bin: string, use_sigint: bool) -> bool {
+    cmd := process.Command::new(child_bin.clone(), [])
+    mut child := match cmd.spawn() {
+        .Ok(c) => c,
+        .Err(_) => {
+            _ := sys.eprint("failed to spawn signal child")
+            return false
+        },
+    }
+    if !read_expected_line(&mut child, "READY", "ready") { return false }
+    if use_sigint {
+        k := process.run("kill", ["-INT", child.pid().str()])
+        if !k.succeeded() {
+            _ := child.kill()
+            _ := child.wait(1000)
+            _ := sys.eprint("kill -INT failed: " + k.stderr_text())
+            return false
+        }
+    } else {
+        st := child.terminate()
+        if !st.ok {
+            _ := child.kill()
+            _ := child.wait(1000)
+            _ := sys.eprint("child.terminate failed")
+            return false
+        }
+    }
+    expected := if use_sigint { "SIG:SIGINT" } else { "SIG:SIGTERM" }
+    if !read_expected_line(&mut child, expected, "signal") { return false }
+    wr := child.wait(5000)
+    if !wr.exited || wr.code != 0 {
+        _ := sys.eprint("signal child exited badly: exited=" + wr.exited.str() + " code=" + wr.code.str() + " signal=" + wr.signal.str())
+        return false
+    }
+    true
+}
+
+fn main() -> i32 {
+    compiler := if sys.arg_count() >= 2 { sys.arg(1) } else { "build/selfhost/arm64-macos/dunder" }
+    tmp := fs.temp_dir("dunder-service-foundations-")
+    if !tmp.ok { return fail_msg("temp_dir failed") }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    probe_work := path.join(work, "probe-data")
+    if !fs.mkdir_all(probe_work).ok { return fail_msg("mkdir_all failed") }
+
+    probe_src := path.join(work, "probe.ddr")
+    if !write_probe_source(probe_src, probe_work) { return fail_msg("write probe failed") }
+
+    static_src := path.join(work, "static_probe.ddr")
+    if !write_static_linux_probe_source(static_src) { return fail_msg("write static_probe failed") }
+    static_arm64_linux := path.join(work, "static-probe-arm64-linux")
+    static_x86_linux := path.join(work, "static-probe-x86_64-linux")
+    if !compile_source(compiler, static_src, static_arm64_linux, "arm64-linux") { return 1 }
+    if !compile_source(compiler, static_src, static_x86_linux, "x86_64-linux") { return 1 }
+    if !verify_static_elf(static_arm64_linux, "arm64-linux") { return 1 }
+    if !verify_static_elf(static_x86_linux, "x86_64-linux") { return 1 }
+
+    native_bin := path.join(work, "probe-native")
+    arm64_linux_bin := path.join(work, "probe-arm64-linux")
+    x86_linux_bin := path.join(work, "probe-x86_64-linux")
+    if !compile_source(compiler, probe_src, native_bin, "") { return 1 }
+    if !compile_source(compiler, probe_src, arm64_linux_bin, "arm64-linux") { return 1 }
+    if !compile_source(compiler, probe_src, x86_linux_bin, "x86_64-linux") { return 1 }
+
+    wasm_src := path.join(work, "wasm_probe.ddr")
+    wasm_out := path.join(work, "wasm_probe.wasm")
+    if !write_wasm_probe_source(wasm_src) { return fail_msg("write wasm probe failed") }
+    if !compile_source(compiler, wasm_src, wasm_out, "wasm32") { return 1 }
+
+    probe_run := process.run(native_bin, [])
+    if !probe_run.succeeded() || !text.contains(probe_run.stdout_text(), "PROBE_OK") {
+        return fail_msg("native probe failed: " + probe_run.stdout_text() + " / " + probe_run.stderr_text())
+    }
+
+    sig_src := path.join(work, "sig_child.ddr")
+    sig_bin := path.join(work, "sig_child")
+    if !write_signal_child_source(sig_src) { return fail_msg("write sig_child failed") }
+    if !compile_source(compiler, sig_src, sig_bin, "") { return 1 }
+
+    if !run_signal_child_case(sig_bin, false) { return 1 }
+    if !run_signal_child_case(sig_bin, true) { return 1 }
+
+    print("PASS test-service-foundations")
+    0
+}
