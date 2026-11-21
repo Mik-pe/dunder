@@ -86,12 +86,14 @@ class Probe:
         self.work = work
         self.runners = runners
         self.commands = self.images = self.executions = self.rejections = 0
+        self.dunder_home = work / 'dunder-home'
+        self.cache = self.dunder_home / 'git'
         self.git_config = work / 'isolated git config'
         write(self.git_config, '[user]\nname = Dunder fixture\nemail = fixture@example.invalid\n')
         self.git_config_bytes = self.git_config.read_bytes()
-        self.env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1',
-                        GIT_CONFIG_GLOBAL=str(self.git_config), GIT_TERMINAL_PROMPT='0',
-                        GIT_ALLOW_PROTOCOL='file')
+        self.env = dict(os.environ, DUNDER_HOME=str(self.dunder_home),
+                        GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(self.git_config),
+                        GIT_TERMINAL_PROMPT='0', GIT_ALLOW_PROTOCOL='file')
 
     def command(self, argv, cwd=None, status=0, env=None):
         result = subprocess.run(list(map(str, argv)), cwd=cwd or self.work,
@@ -123,11 +125,11 @@ class Probe:
             assert (result.stdout, result.stderr) == (f'{expected}\n', ''), result
             self.executions += 1
 
-    def reject(self, project, args, words=(), output=None):
+    def reject(self, project, args, words=(), output=None, env=None):
         lock = project / 'dunder.lock'
         before = lock.read_bytes() if lock.exists() else None
         previous = output.read_bytes() if output and output.exists() else None
-        result = self.cli(project, *args, status=None)
+        result = self.cli(project, *args, status=None, env=env)
         assert result.stderr, result
         for word in words:
             assert word.lower() in result.stderr.lower(), (word, result.stderr)
@@ -181,23 +183,28 @@ def pins(project, expected):
     return data
 
 
-def checkouts(probe, project, commits):
-    cache = project / 'build/.dunder/git'
+def checkouts(probe, project, commits, cache=None):
+    assert not (project / 'build/.dunder/git').exists(), project
+    target_cache = cache or probe.cache
     found = set()
-    for metadata in cache.rglob('.git'):
+    for metadata in target_cache.rglob('.git'):
         path = metadata.parent
         head = probe.git('-C', path, 'rev-parse', 'HEAD').stdout.strip()
-        assert COMMIT.fullmatch(head) and head in commits, (path, head, commits)
+        assert COMMIT.fullmatch(head), (path, head)
         probe.git('-C', path, 'symbolic-ref', '--quiet', 'HEAD', status=1)
         found.add(head)
-    assert found == commits, (cache, found, commits)
+    if cache is not None:
+        assert found == commits, (target_cache, found, commits)
+    else:
+        assert commits <= found, (target_cache, found, commits)
 
 
-def checkout_for(probe, project, commit):
-    for metadata in (project / 'build/.dunder/git').rglob('.git'):
+def checkout_for(probe, project, commit, cache=None):
+    target_cache = cache or probe.cache
+    for metadata in target_cache.rglob('.git'):
         if probe.git('-C', metadata.parent, 'rev-parse', 'HEAD').stdout.strip() == commit:
             return metadata.parent
-    raise AssertionError(('missing cached checkout', project, commit))
+    raise AssertionError(('missing cached checkout', project, target_cache, commit))
 
 
 def matrix(probe, path, expected, flags=()):
@@ -235,8 +242,10 @@ def offline_contracts(probe, path, repositories, expected, lock_bytes):
     finally:
         for hidden, origin in reversed(moved):
             hidden.rename(origin)
-    cache = path / 'build/.dunder/git'
-    saved = path / 'build/git-cache-saved'
+    cache = probe.cache
+    saved = probe.work / 'git-cache-saved'
+    if saved.exists():
+        shutil.rmtree(saved)
     cache.rename(saved)
     image = path / 'offline-sentinel'
     image.write_bytes(b'previous valid image')
@@ -249,9 +258,9 @@ def offline_contracts(probe, path, repositories, expected, lock_bytes):
 
 
 def readonly_check(probe, path, marker):
-    files = [file for file in (path / 'build/.dunder/git').rglob('*')
+    files = [file for file in probe.cache.rglob('*')
              if file.is_file() and (file.suffix == '.ddr' or file.name == 'dunder.toml')
-             and '.git' not in file.relative_to(path).parts]
+             and '.git' not in file.relative_to(probe.cache).parts]
     assert files, path
     before = [(file, file.read_bytes(), file.stat().st_mode & 0o777) for file in files]
     try:
@@ -330,11 +339,17 @@ def graph_contracts(probe, path, leaf):
     different = Repository(probe, 'different shared', {'dunder.toml': 'root = "api.ddr"\n',
                            'api.ddr': 'pub fn value() -> i32 { 99 }\n'})
     left = Repository(probe, 'left', {'dunder.toml': 'root = "api.ddr"\n[dependencies]\nshared = ' +
-                      table(git=leaf.url) + '\n', 'api.ddr': 'pub fn value() -> i32 { 1 }\n'})
+                      table(git=leaf.url) + '\n', 'api.ddr': 'import shared\npub fn value() -> i32 { shared.value() + 1 }\n'})
     right = Repository(probe, 'right', {'dunder.toml': 'root = "api.ddr"\n[dependencies]\nshared = ' +
-                       table(git=different.url) + '\n', 'api.ddr': 'pub fn value() -> i32 { 2 }\n'})
-    graph_rejection(probe, path, 'left = ' + table(git=left.url) + '\nright = ' + table(git=right.url),
-                    ('conflict',))
+                       table(git=different.url) + '\n', 'api.ddr': 'import shared\npub fn value() -> i32 { shared.value() + 2 }\n'})
+    isolated = probe.work / 'projects/isolated git namespaces'
+    write(isolated / 'dunder.toml', 'name = "isolated"\nroot = "main.ddr"\n[dependencies]\nleft = ' +
+          table(git=left.url) + '\nright = ' + table(git=right.url) + '\n')
+    write(isolated / 'main.ddr', 'import left\nimport right\nfn main() { print(left.value() + right.value()) }\n')
+    iso_res = probe.cli(isolated, 'run', '-o', isolated / 'isolated-image')
+    assert (iso_res.stdout, iso_res.stderr) == ('113\n', ''), iso_res
+    write(isolated / 'leak.ddr', 'import shared\nfn main() { print(shared.value()) }\n')
+    probe.cli(isolated, 'check', 'leak.ddr', status=1)
     missing_root = Repository(probe, 'missing root', {'dunder.toml': 'name = "broken"\n',
                               'api.ddr': 'pub fn value() -> i32 { 1 }\n'})
     graph_rejection(probe, path, 'kit = ' + table(git=missing_root.url), ('root',))
@@ -363,16 +378,18 @@ def graph_contracts(probe, path, leaf):
 
 def local_only_contract(probe):
     path = probe.work / 'local only project'
+    local_home = probe.work / 'local-only-dunder-home'
     write(path / 'dunder.toml', 'name = "plain"\nroot = "main.ddr"\n')
     write(path / 'main.ddr', 'fn main() { print(42) }\n')
     empty_path = probe.work / 'no external programs'
     empty_path.mkdir()
-    environment = dict(probe.env, PATH=str(empty_path))
+    environment = dict(probe.env, PATH=str(empty_path), DUNDER_HOME=str(local_home))
     probe.cli(path, 'check', '--offline', '--locked', env=environment)
     image = path / 'plain'
     probe.cli(path, 'build', '--offline', '--locked', '-o', image, env=environment)
     probe.execute(image, host_target(), 42)
     assert not (path / 'build/.dunder/git').exists()
+    assert not local_home.exists()
     assert probe.git_config.read_bytes() == probe.git_config_bytes
 
 
@@ -412,13 +429,16 @@ def hidden_edit_contracts(probe, path, commit):
 
 
 def concurrent_contract(probe, kit, expected, expected_pins):
-    path = project(probe, 'concurrent cold project', table(git=kit.url, branch='main'), expected)
+    path_a = project(probe, 'concurrent cold project A', table(git=kit.url, branch='main'), expected)
+    path_b = project(probe, 'concurrent cold project B', table(git=kit.url, branch='main'), expected)
+    cold_home = probe.work / 'concurrent-dunder-home'
+    cold_env = dict(probe.env, DUNDER_HOME=str(cold_home))
     children = []
     try:
-        for number in range(2):
-            image = path / f'concurrent-{number}'
+        for proj, number in ((path_a, 0), (path_b, 1)):
+            image = proj / f'concurrent-{number}'
             child = subprocess.Popen([str(probe.compiler), 'build', '--jobs', '1', '-o', str(image)],
-                                     cwd=path, env=probe.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     cwd=proj, env=cold_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      text=True)
             children.append((child, image))
         for child, image in children:
@@ -427,12 +447,34 @@ def concurrent_contract(probe, kit, expected, expected_pins):
             probe.commands += 1
             probe.execute(image, host_target(), expected)
         assert children[0][1].read_bytes() == children[1][1].read_bytes()
-        pins(path, expected_pins)
+        pins(path_a, expected_pins)
+        pins(path_b, expected_pins)
+        assert not (path_a / 'build/.dunder/git').exists()
+        assert not (path_b / 'build/.dunder/git').exists()
     finally:
         for child, _ in children:
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def shared_dunder_home_contracts(probe, kit, leaf, expected, lock_bytes):
+    # A second separate project with no build/.dunder/git shares probe.cache
+    # offline after origins are unavailable.
+    shared_proj = project(probe, 'shared dunder_home consumer', table(git=kit.url, branch='main'), expected)
+    (shared_proj / 'dunder.lock').write_bytes(lock_bytes)
+    moved = []
+    try:
+        for repo in (kit, leaf):
+            hidden = repo.origin.with_name(repo.origin.name + '.shared-offline')
+            repo.origin.rename(hidden)
+            moved.append((hidden, repo.origin))
+        ran = probe.cli(shared_proj, 'run', '--offline', '--locked', '-o', shared_proj / 'shared-image')
+        assert (ran.stdout, ran.stderr) == (f'{expected}\n', ''), ran
+        assert not (shared_proj / 'build/.dunder/git').exists()
+    finally:
+        for hidden, origin in reversed(moved):
+            hidden.rename(origin)
 
 
 def directory_snapshot(root):
@@ -456,16 +498,18 @@ def cache_symlink_contracts(probe):
     probe.cli(sentinel, 'build', '--jobs', '1', '-o', image)
     sentinel_bytes = image.read_bytes()
     for warm in (False, True):
-        for kind in ('repos', 'checkouts', 'checkout-url-parent'):
+        for kind in ('git', 'repos', 'checkouts', 'checkout-url-parent'):
             name = ('warm ' if warm else 'cold ') + kind
             path = probe.work / 'cache symlinks' / name
+            home = probe.work / 'cache symlinks homes' / name
+            sym_env = dict(probe.env, DUNDER_HOME=str(home))
             write(path / 'dunder.toml', 'name = "consumer"\nroot = "main.ddr"\n[dependencies]\nkit = ' +
                   table(git=repo.url) + '\n')
             write(path / 'main.ddr', 'import kit\nfn main() { print(kit.answer()) }\n')
-            cache = path / 'build/.dunder/git'
+            cache = home / 'git'
             image = path / 'image'
             if warm:
-                probe.cli(path, 'build', '--jobs', '1', '-o', image)
+                probe.cli(path, 'build', '--jobs', '1', '-o', image, env=sym_env)
                 probe.execute(image, host_target(), 42)
                 pins(path, {(repo.url, 'head', ''): repo.head()})
             else:
@@ -478,20 +522,24 @@ def cache_symlink_contracts(probe):
             staged_image.write_bytes(sentinel_bytes)
             staged_image.chmod(0o755)
             staged_image.replace(image)
-            link = cache / (('checkouts/' + digest) if kind == 'checkout-url-parent' else kind)
+            link = (cache if kind == 'git' else
+                    cache / (('checkouts/' + digest) if kind == 'checkout-url-parent' else kind))
             outside = probe.work / 'outside cache' / name
             outside.parent.mkdir(parents=True, exist_ok=True)
             if warm:
                 link.rename(outside)
             else:
-                link.parent.mkdir(parents=True, exist_ok=True)
+                if kind == 'git':
+                    link.rmdir()
+                else:
+                    link.parent.mkdir(parents=True, exist_ok=True)
                 outside.mkdir()
                 write(outside / 'sentinel', 'must stay unchanged\n')
             link.symlink_to(outside, target_is_directory=True)
             before = directory_snapshot(outside)
             flags = ('--offline', '--locked') if warm else ()
             probe.reject(path, ['build', '--jobs', '1', *flags, '-o', image],
-                         ('cache', 'symlink'), image)
+                         ('cache', 'symlink'), image, env=sym_env)
             assert directory_snapshot(outside) == before, (name, 'wrote outside Git cache')
             probe.execute(image, host_target(), 7)
 
@@ -559,11 +607,13 @@ def hidden_revision_contract(probe):
     probe.git('--git-dir', repo.origin, 'update-ref', '-d', 'refs/pull/7/head')
     probe.git('--git-dir', repo.origin, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
     assert probe.git('--git-dir', repo.origin, 'cat-file', '-t', commit).stdout.strip() == 'commit'
+    rev_home = probe.work / 'unadvertised-dunder-home'
+    rev_env = dict(probe.env, DUNDER_HOME=str(rev_home))
     path = project(probe, 'unadvertised revision consumer', table(git=repo.url, rev=commit), 57)
-    result = probe.cli(path, 'run', '-o', path / 'revision-image')
+    result = probe.cli(path, 'run', '-o', path / 'revision-image', env=rev_env)
     assert (result.stdout, result.stderr) == ('57\n', ''), result
     pins(path, {(repo.url, 'rev', commit): commit})
-    checkouts(probe, path, {commit})
+    checkouts(probe, path, {commit}, cache=rev_home / 'git')
 
 
 def subdir_contracts(probe):
@@ -712,6 +762,7 @@ def main():
         graph_contracts(probe, main_path, leaf)
         local_only_contract(probe)
         concurrent_contract(probe, kit, 49, expected)
+        shared_dunder_home_contracts(probe, kit, leaf, 49, (main_path / 'dunder.lock').read_bytes())
         cache_symlink_contracts(probe)
         prune_contract(probe, selectors[0][0])
         hidden_revision_contract(probe)

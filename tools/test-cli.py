@@ -1089,13 +1089,20 @@ def manifest_dependencies(p):
     cyc_err = p.call("build", cwd=app, status=2)
     assert "cyc_b/dunder.toml:4:" in cyc_err.stderr and "cycle" in cyc_err.stderr, cyc_err.stderr
 
-    # Dependency alias conflict (app -> shared = shared1, dep_a -> shared = shared)
+    # Isolated per-package dependency namespaces (app -> shared1 = 9, dep_a -> dep_b/shared = 5; no transitive leakage)
     p.write("shared1/dunder.toml", 'name = "shared"\nroot = "lib/common.ddr"\n')
     p.write("shared1/lib/common.ddr", "pub fn offset() -> i32 { 9 }\n")
     p.write("app/dunder.toml",
-            'name = "consumer"\nroot = "src/main.ddr"\n[dependencies]\nshared = "../shared1"\ndep_a = "../dep_a"\n')
-    conf_err = p.call("build", cwd=app, status=2)
-    assert "dep_b/dunder.toml:5:" in conf_err.stderr and "conflicting" in conf_err.stderr, conf_err.stderr
+            'name = "consumer"\nroot = "src/main.ddr"\n[dependencies]\nshared = "../shared1"\n\n'
+            '[dependencies.dep_a]\npath = "../dep_a"\n')
+    p.write("app/src/main.ddr", "import shared\nimport dep_a\nfn main() { print(shared.offset() + dep_a.a_val()) }\n")
+    iso_run = p.call("run", cwd=app)
+    assert iso_run.stdout == "20\n", iso_run
+
+    # Verify transitive dependency alias ('dep_b') does not leak into consumer namespace
+    p.write("app/src/main.ddr", "import dep_b\nfn main() { print(dep_b.b_val()) }\n")
+    leak_err = p.call("check", cwd=app, status=1)
+    assert "cannot load module" in leak_err.stderr, leak_err.stderr
 
 
 def bytes_big_endian_guards(p):
@@ -1128,6 +1135,17 @@ def mac_bundle(p):
     assert info["CFBundleDisplayName"] == name and info["CFBundlePackageType"] == "APPL"
     assert (app / "Contents/MacOS" / info["CFBundleExecutable"]).is_file()
     subprocess.run(["/usr/bin/codesign", "--verify", "--strict", app], check=True)
+
+    ver_pkg = p.root / "ver_bundle_pkg"
+    p.write("ver_bundle_pkg/dunder.toml", 'name = "MyWidget"\nversion = "2.4.1"\nroot = "src/main.ddr"\n')
+    p.write("ver_bundle_pkg/src/main.ddr", 'fn main() { print("bundled") }\n')
+    ver_run = p.call("run", "--app", cwd=ver_pkg)
+    assert ver_run.stdout == "bundled\n"
+    ver_app = ver_pkg / "build/arm64-macos/MyWidget.app"
+    ver_info = plistlib.loads((ver_app / "Contents/Info.plist").read_bytes())
+    assert ver_info["CFBundleVersion"] == "2.4.1", ver_info
+    assert ver_info["CFBundleShortVersionString"] == "2.4.1", ver_info
+    subprocess.run(["/usr/bin/codesign", "--verify", "--strict", ver_app], check=True)
 
 
 def install_cwd_and_test_scoping(p):
