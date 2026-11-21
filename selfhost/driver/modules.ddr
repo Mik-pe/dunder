@@ -33,6 +33,7 @@ pub struct Loaded {
     ok: bool, error: string, path: string, source: string, offset: i32,
     paths: []string, sources: []string, symbols: []string, module_caps: []i32, diagnostics: []diag.Diagnostic,
     map_starts: []i32, map_files: []i32, map_offsets: []i32, json_symbols: []string,
+    embed_blobs: []u8, embed_blob_starts: []i32, embed_blob_counts: []i32, embed_blob_digests: []string, embed_paths: []string,
 }
 pub opaque struct Loader {
     result: Loaded, key_prefixes: []string, standard: []string, directories: []string, first: []i32, last: []i32,
@@ -414,6 +415,91 @@ fn skip_lines(loader: &Loader, at: i32) -> i32 {
     mut i := at
     while i < loader.raw.texts.len && lexer.is_newline(loader.raw.kinds[i]) { i = i + 1 }
     i
+}
+fn skip_lines_in(loader: &Loader, at: i32, last: i32) -> i32 {
+    mut i := at
+    while i < last && lexer.is_newline(loader.raw.kinds[i]) { i += 1 }
+    i
+}
+fn resolve_embed_path(loader: &mut Loader, owner: i32, at: i32, rel: string, form: string) -> string {
+    if loader.standard[owner] != "" {
+        fail(&mut loader, owner, at, "@" + form + " is not allowed in bundled stdlib modules")
+        return ""
+    }
+    pid := if owner >= 0 && owner < loader.module_pkg_id.len { loader.module_pkg_id[owner] } else { -1 }
+    mut pkg_root := ""
+    if pid >= 0 && pid < loader.deps.pkg_dirs.len && loader.deps.pkg_dirs[pid] != "" {
+        pkg_root = loader.deps.pkg_dirs[pid].clone()
+    } else if loader.directories.len > 0 && loader.directories[0] != "" {
+        pkg_root = loader.directories[0].clone()
+    } else {
+        fail(&mut loader, owner, at, "@" + form + " requires a package directory")
+        return ""
+    }
+    if rel.len == 0 {
+        fail(&mut loader, owner, at, "embed path must not be empty")
+        return ""
+    }
+    if rel[0] == 47 || (rel.len >= 2 && rel[1] == 58) {
+        fail(&mut loader, owner, at, "embed path must be relative to the package root")
+        return ""
+    }
+    for i in 0..rel.len {
+        if rel[i] == 0 || rel[i] == 92 {
+            fail(&mut loader, owner, at, "embed path must be relative to the package root")
+            return ""
+        }
+    }
+    norm := paths.normalize(rel)
+    if norm == "." || norm == ".." || strings.starts_with(norm, "../") {
+        fail(&mut loader, owner, at, "embed path must stay within the package root")
+        return ""
+    }
+    full := if pkg_root == "." { norm.clone() } else if pkg_root == "/" { "/" + norm } else { pkg_root + "/" + norm }
+    meta := sys.metadata(full)
+    if !meta.ok {
+        fail(&mut loader, owner, at, "cannot embed '" + rel + "': file not found")
+        return ""
+    }
+    if !meta.is_file {
+        fail(&mut loader, owner, at, "cannot embed '" + rel + "': path is not a regular file")
+        return ""
+    }
+    if meta.size > 67108864 {
+        fail(&mut loader, owner, at, "cannot embed '" + rel + "': file exceeds 64 MiB limit")
+        return ""
+    }
+    canon_root := cache_io.root(pkg_root)
+    canon_file := cache_io.root(full)
+    if canon_root == "" || canon_file == "" || !((canon_root == "/" && strings.starts_with(canon_file, "/")) || strings.starts_with(canon_file, canon_root + "/")) {
+        fail(&mut loader, owner, at, "embed path '" + rel + "' escapes the package root")
+        return ""
+    }
+    full
+}
+fn add_embed_blob(loader: &mut Loader, data: &[]u8, digest: string) -> i32 {
+    for i in 0..loader.result.embed_blob_digests.len {
+        if loader.result.embed_blob_digests[i] == digest { return i }
+    }
+    id := loader.result.embed_blob_starts.len
+    first := loader.result.embed_blobs.len
+    bytes.extend(&mut loader.result.embed_blobs, &data)
+    loader.result.embed_blob_starts.push(first)
+    loader.result.embed_blob_counts.push(data.len)
+    loader.result.embed_blob_digests.push(digest.clone())
+    id
+}
+fn record_embed_path(loader: &mut Loader, full: string) {
+    for p in &loader.result.embed_paths {
+        if p == full { return }
+    }
+    loader.result.embed_paths.push(full.clone())
+}
+fn raw_string_spelling_needed(source: string, first: i32) -> bool {
+    if first < 0 || first >= source.len { return false }
+    b := source[first]
+    if b == 114 { return true }
+    b == 34 && first + 2 < source.len && source[first + 1] == 34 && source[first + 2] == 34
 }
 fn close_block(loader: &Loader, at: i32) -> i32 {
     mut i := at
@@ -1244,7 +1330,7 @@ fn copy_body_tokens(raw: &lexer.Tokens, output: &mut lexer.Tokens, first: i32, l
         if kind == .Name {
             if value[0] == 95 || initials.bit_and(initial_bit(value)) != 0 { break }
         } else if kind == .Symbol {
-            if value == "{" || value == "}" || (shadowed && (value == ":" || value == "->" || value == "<")) ||
+            if value == "@" || value == "{" || value == "}" || (shadowed && (value == ":" || value == "->" || value == "<")) ||
                 (value == "(" && lexer.tuple_binding_end(&raw, i, last) >= 0) { break }
         } else if kind == .End || (kind == .Keyword && (value == "fn" || (value == "for" && i + 1 < last && raw.kinds[i + 1] == .Symbol && raw.texts[i + 1] == "("))) { break }
         flat_token(&mut output, kind, move value, offset + raw.starts[i])
@@ -1377,6 +1463,66 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []u8, bindings: &mut []
             previous = i; i = i + 1; continue
         }
         value := loader.raw.texts[i].clone()
+        if !record_names && kind == .Symbol && value == "@" && i + 1 < last && loader.raw.kinds[i + 1] == .Name &&
+            (loader.raw.texts[i + 1] == "embed_file" || loader.raw.texts[i + 1] == "embed_bytes") {
+            form := loader.raw.texts[i + 1].clone()
+            open_p := skip_lines_in(&loader, i + 2, last)
+            if open_p >= last || !is(&loader, open_p, "(") {
+                fail(&mut loader, owner, loader.raw.starts[i], "@" + form + " expects '(\"path\")'")
+                return
+            }
+            arg_t := skip_lines_in(&loader, open_p + 1, last)
+            if arg_t >= last || loader.raw.kinds[arg_t] != .String {
+                err_at := if arg_t < last { loader.raw.starts[arg_t] } else { loader.raw.starts[open_p] }
+                fail(&mut loader, owner, err_at, "@" + form + " expects a string literal path")
+                return
+            }
+            close_p := skip_lines_in(&loader, arg_t + 1, last)
+            if close_p >= last || !is(&loader, close_p, ")") {
+                err_at := if close_p < last { loader.raw.starts[close_p] } else { loader.raw.starts[arg_t] }
+                fail(&mut loader, owner, err_at, "@" + form + " expects a single string literal argument")
+                return
+            }
+            rel := loader.raw.texts[arg_t].clone()
+            full := resolve_embed_path(&mut loader, owner, loader.raw.starts[i], rel, form)
+            if !loader.result.ok { return }
+            raw_read := sys.read_u8(full)
+            if !raw_read.ok {
+                fail(&mut loader, owner, loader.raw.starts[i], "cannot read embedded file '" + rel + "': " + sys.error_message(raw_read.error))
+                return
+            }
+            record_embed_path(&mut loader, full)
+            if form == "embed_file" {
+                decoded := bytes.decode(&raw_read.value)
+                if !decoded.ok {
+                    fail(&mut loader, owner, loader.raw.starts[i], "embedded file '" + rel + "' is not valid UTF-8")
+                    return
+                }
+                if loader.result.token_offsets {
+                    flat_token(&mut tokens, .String, move decoded.value, start + loader.raw.starts[i])
+                } else {
+                    emit(&mut loader, &mut output, owner, i, string_literal(decoded.value))
+                }
+            } else {
+                digest := cache_io.binary_hash(&raw_read.value)
+                bid := add_embed_blob(&mut loader, &raw_read.value, digest.clone())
+                if loader.result.token_offsets {
+                    at_off := start + loader.raw.starts[i]
+                    flat_token(&mut tokens, .Symbol, "@", at_off)
+                    flat_token(&mut tokens, .Name, "__dunder_module_embed_bytes", at_off)
+                    flat_token(&mut tokens, .Symbol, "(", at_off)
+                    flat_token(&mut tokens, .Integer, bid.str(), at_off)
+                    flat_token(&mut tokens, .Symbol, ",", at_off)
+                    flat_token(&mut tokens, .String, move digest, at_off)
+                    flat_token(&mut tokens, .Symbol, ")", at_off)
+                } else {
+                    emit(&mut loader, &mut output, owner, i, "@__dunder_module_embed_bytes(" + bid.str() + ", " + string_literal(digest) + ")")
+                }
+            }
+            previous = close_p
+            i = close_p + 1
+            continue
+        }
         if mode == 2 && kind == .Symbol && value == "(" {
             assignment := lexer.tuple_binding_end(&loader.raw, i, last)
             if assignment >= 0 { tuple_assignment = assignment; tuple_visible = binding_end(&loader, assignment, last) }
@@ -1479,7 +1625,9 @@ fn flatten(loader: &mut Loader, owner: i32, output: &mut []u8, bindings: &mut []
         }
         mut spelling := ""
         if !loader.result.token_offsets && (kind == .String || kind == .Rune || kind == .Byte) {
-            if kind == .String && loader.raw.starts[i] == loader.raw.ends[i] { spelling = string_literal(value) }
+            if kind == .String && (loader.raw.starts[i] == loader.raw.ends[i] || raw_string_spelling_needed(loader.result.sources[owner], loader.raw.starts[i])) {
+                spelling = string_literal(value)
+            }
             else { spelling = loader.result.sources[owner][loader.raw.starts[i]..loader.raw.ends[i]] }
         }
         mut lexical_brace := true
@@ -1758,7 +1906,8 @@ pub fn load_group(path: string, testing: bool, token_offsets: bool, group: i32, 
 fn new_loader(path: string, testing: bool, token_offsets: bool, deps: &DepGraph) -> Loader {
     Loader {
         result: Loaded { token_offsets: token_offsets, groups: [], calls: [], ok: true, error: "", path: path.clone(), source: "", offset: 0,
-            paths: [], sources: [], symbols: [], module_caps: [], diagnostics: [], map_starts: [], map_files: [], map_offsets: [], json_symbols: [] },
+            paths: [], sources: [], symbols: [], module_caps: [], diagnostics: [], map_starts: [], map_files: [], map_offsets: [], json_symbols: [],
+            embed_blobs: [], embed_blob_starts: [], embed_blob_counts: [], embed_blob_digests: [], embed_paths: [] },
         key_prefixes: [], standard: [], directories: [], first: [], last: [], raw: lexer.empty(false), last_arm: [], namespace_initials: [], hidden_starts: [], hidden_ends: [], declaration_tokens: [], any_unsafe: false, requires_caps: [], has_cap_header: [],
         symbols: Map<string, i64>::new(), imports: Map<string, i64>::new(), sym_imports: Map<string, i64>::new(), by_path: Map<string, i64>::new(), by_physical: Map<string, i64>::new(), by_std: Map<string, i64>::new(), owners: [],
         sym_import_owner: [], sym_import_alias: [], sym_import_module: [], sym_import_member: [], sym_import_offset: [], sym_import_symbol: [], sym_import_prelude: [], public: [], records: [], types: [], traits: [], renamed: [],
@@ -1960,6 +2109,7 @@ pub fn load_group_with_overlays(path: string, testing: bool, token_offsets: bool
         ok: true, error: "", path: "main.ddr", source: "fn main", offset: 0,
         paths: ["main.ddr", "lib.ddr"], symbols: [], module_caps: [], diagnostics: [], sources: ["fn main() {}", "\nfn value() {}"],
         map_starts: [0, 3, 20], map_files: [0, 0, 1], map_offsets: [0, 3, 4], json_symbols: [],
+        embed_blobs: [], embed_blob_starts: [], embed_blob_counts: [], embed_blob_digests: [], embed_paths: [],
     }
     first := location(&loaded, 0)
     first.path == "main.ddr"
