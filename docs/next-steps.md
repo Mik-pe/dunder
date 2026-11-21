@@ -252,24 +252,90 @@ Planerad färdplan efter `0.6.x`:
   LSP-server och DWARF-debuginfo, mer flexibel heap/filstorlekshantering samt
   stöd för WASI/Windows.
 
+### Samtidighetsdesign: arenisolerade arbetare utan `async`-färgning
+
+Dunders minnes- och taskmodell ([`memory.md`](memory.md), [`tasks.md`](tasks.md))
+ger redan per-arbetare-arenor, icke-atomär referensräkning, lexikala
+kapabiliteter, `@resource(dispose)` och frysta `shared`-ögonblicksbilder. För
+att lyfta samtidigheten från rena beräkningsjobb till långlivade tjänster utan
+att offra enkelheten bör Dunder medvetet **undvika både `async`/`await`-färgning**
+(inga splittrade synk-/asynk-bibliotek eller `Future`/`Pin`) och **godtyckligt
+delat muterbart heap-minne** (`Arc<Mutex<T>>` över icke-atomär referensräkning).
+I stället byggs samtidigheten kring strukturerade, arenisolerade arbetare,
+flytt av ägarskap och färglös I/O:
+
+- **Skilj minnesisolering från kapabiliteter i `task scope`:** Låt rena,
+  effektfria scopes (`task scope jobs(N)`) förbli standard för deterministiska
+  beräkningar, men inför uttryckligen kapabilitetsbegränsade I/O-scopes (t.ex.
+  `task scope workers(N) with (network, filesystem)`) underordnade modulens
+  `capability`-deklarationer. Bygg vidare på befintliga transitiva
+  effektbitmasker i `task_effects.ddr` och inför en `@thread_safe`-märkning
+  för granskade `stdlib`-FFI-bindningar (`std.net`, `std.fs`, `std.crypto`,
+  `std.sqlite`), medan godtycklig C-FFI fortsätter kräva `unsafe`.
+- **Flyttbara OS-resurser (`Sendable` `@resource`) och resursägande
+  `workspace`:** Låt renodlade handtagsresurser utan inre heap-pekare
+  (`TcpStream`, `UdpSocket`, `File`, `sqlite.Database`, kanaländar) implementera
+  `Sendable` med strikt `move`-överföring (sändarens ägarslot nollställs, ingen
+  kloning), så en lyssnartråd kan överlämna `move stream` direkt till en
+  arbetare. Tillåt `@resource(dispose)`-fält i en arbetar-`workspace` — t.ex.
+  en egen `sqlite.Database`-koppling och återanvänd HTTP-buffert per arbetare —
+  med garanterad `dispose()` på ägartråden när scopet stängs.
+- **Långlivade scopes, återanvänd trådpool och `CancelToken`:** Stöd återvunna
+  scopade bakgrundsjobb (`()`-jobb utan växande jobbindex, O(kapacitet) minne)
+  och `await_any`, återanvänd långlivade arbetartrådar inom scopet på Linux (i
+  stället för `pthread_create` per jobb), gör workerarenans storlek
+  konfigurerbar/kompakt (i stället för fasta 512 MiB per arbetare) och koppla
+  ett scope-bundet `CancelToken` till `std.signal` som väcker blockerande
+  `recv`/`poll` för ordnad nedstängning.
+- **Tre ortogonala koordineringsprimitiv i minnet (utan delad muterbar heap):**
+  1. **Begränsade `Channel<T>` (`Sender<T>`, `Receiver<T>`, `T: Sendable`) +
+     `select`:** Återanvänder samma isolerade värdeöverföring och resursflytt
+     som `spawn`/`await!`, med naturligt mottryck och stängningssignal
+     (`recv() -> Option<T>`). Möjliggör aktörs- och samordnarmönstret där en
+     ensam ägartråd äger vanlig `Map`/cache/rate-limiter/loggskrivare med
+     icke-atomär RC och svarar över en svarskanal — utan mutexar eller
+     datakapplöpningar.
+  2. **Uppdaterbara frysta ögonblicksbilder (`Published<T>`, `T: Sendable`):**
+     Generaliserar `shared world` (refcount `0` på inre värden) med atomärt
+     pekarbyte och en `@resource(dispose)`-läsvakt (`ReadGuard<T>`) som bara
+     referensräknar yttre snapshot-huvudet. Ger låsfri `&T`-läsning och
+     deterministisk frigöring för konfiguration, routingtabeller och roterade
+     signeringsnycklar/JWKS utan livstidsannoteringar.
+  3. **Skalära atomics och `Semaphore`:** `AtomicI64`, `AtomicBool` och
+     `Semaphore` (t.ex. fast tak för samtidiga tunga lösenordshashningar) rör
+     aldrig heap-arenor eller referensräknare.
+- **Tvålagersmodell för hög anslutningstäthet (`PollSet::waker()` +
+  arbetarpool):** För tusentals vilande HTTP/1.1 keep-alive- eller
+  WebSocket-anslutningar läggs en trådsäker `Waker` (via `eventfd`/pipe) till
+  `std.net.PollSet` kopplad mot `Channel<T>` och `CancelToken`. En eller ett
+  fåtal icke-blockerande I/O-loopar multiplexar vilande anslutningar med litet
+  per-anslutningstillstånd och lämnar aktiva förfrågningar eller blockerande
+  arbete (SQLite, krypto, fil-I/O) till en `task scope`-arbetarpool som väcker
+  I/O-loopen när svaret är klart. `packages/http` kapslar mönstret bakom ett
+  enkelt synkront server-API.
+- **Stegvis införande:**
+  1. *Steg 1 (Tjänstegrund):* Trådpool + kompakt arenastorlek, kapabilitetsbegränsade
+     I/O-scopes (`with (...)`), flyttbara `@resource`-handtag, `@resource(dispose)`
+     i `workspace`, återvunna scopade jobb samt `std.signal` + `CancelToken`
+     (ersätter direkt `fork()`-per-request).
+  2. *Steg 2 (Koordinering i minnet):* `Channel<T>` + `select`, `Semaphore` /
+     `Atomic*` och `Published<T>` (ersätter databaslås som IPC och ger aktörer
+     samt live-uppdatering av nycklar och konfiguration).
+  3. *Steg 3 (Hög anslutningstäthet):* `PollSet::waker()` och multiplexerad
+     keep-alive-server i `packages/http` kopplad till en `task scope`-pool.
+
 ### Tjänste- och servermognad (webbtjänster, SQLite och säker drift)
 
 - **Processignaler och ordnad nedstängning (`std.signal`):** Säkert, portabelt
   stöd för `SIGTERM`, `SIGINT` och `SIGPIPE` så långlivade tjänster kan avsluta
-  ordnat utan rå POSIX-FFI och hårdkodade signalnummer.
-- **I/O-kapabel samtidighet för långlivade servrar:** Eftersom `task scope`
-  medvetet förbjuder I/O och `@resource` och `packages/http` hårdkodar
-  `Connection: close`, behövs antingen en multiplexerad serverloop över
-  `std.net.PollSet`/`StreamSet` i `packages/http` med HTTP/1.1 keep-alive och
-  ordnad half-close-tömning, eller en I/O-kapabel samtidighetsmodell med
-  `Sendable`-kanaler som bevarar Dunders isoleringsgarantier (utan godtyckligt
-  delat minne över icke-atomisk referensräkning).
-- **HTTP- och webbprimitiv i `packages/http` (eller systerpaket):** En
-  `Response`-byggare som ersätter parallella `extra_names`/`extra_values`-listor,
-  procentkodning/-avkodning, query- och `application/x-www-form-urlencoded`-parsning,
-  `Cookie`/`Set-Cookie`, `Authorization`-hjälpare (`Basic`/`Bearer`) samt
-  HTML-escaping — med routing hållen fristående i linje med
-  [`http.md`](http.md).
+  ordnat (och utlösa `CancelToken`) utan rå POSIX-FFI och hårdkodade
+  signalnummer.
+- **HTTP- och webbprimitiv i `packages/http` (eller systerpaket):** HTTP/1.1
+  keep-alive, ordnad half-close-tömning och en `Response`-byggare som ersätter
+  parallella `extra_names`/`extra_values`-listor, plus procentkodning/-avkodning,
+  query- och `application/x-www-form-urlencoded`-parsning, `Cookie`/`Set-Cookie`,
+  `Authorization`-hjälpare (`Basic`/`Bearer`) samt HTML-escaping — med routing
+  hållen fristående i linje med [`http.md`](http.md).
 - **Modernisering av `std.sqlite`:** Byt ut engångsstructarna (`OpenResult`,
   `ExecResult`, `QueryResult`, `CloseResult`) mot `Result<T, SqliteError>`, gör
   `Database` till `@resource(dispose)`, inför typade bind-parametrar
