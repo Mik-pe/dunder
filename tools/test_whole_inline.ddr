@@ -1,0 +1,187 @@
+capability process, filesystem, stdio
+
+import .harness as harness
+import std.fs as fs
+import std.json as json
+import std.process as process
+import sys
+
+struct Case {
+    name: string,
+    source: string,
+    stdout: string,
+    min_calls: i64,
+}
+
+fn cases() -> []Case {
+    mut spilled_src := "fn spilled(x: i64) -> i64 {\n"
+    for i in 0..14 { spilled_src += f"    v{i} := x + {i}\n" }
+    spilled_src += "    v0"
+    for i in 1..14 { spilled_src += f" + v{i}" }
+    spilled_src += "\n}\nfn main() { print(i32(spilled(10))) }\n"
+
+    [
+        Case {
+            name: "local",
+            source: "fn calc(a: i64, b: i64) -> i64 { x := a * 3; y := b + 5; x + y }\nfn main() { print(i32(calc(4, 7))) }\n",
+            stdout: "24\n",
+            min_calls: 1,
+        },
+        Case {
+            name: "mut_local",
+            source: "fn bump(a: i64, b: i64) -> i64 { mut x := a; x += b; mut r := x * 2; r += 1; r }\nfn main() { x: i64 = 10; print(i32(bump(x, 3))) }\n",
+            stdout: "27\n",
+            min_calls: 1,
+        },
+        Case {
+            name: "mut_param_fallback",
+            source: "fn bump_mut(mut a: i64, b: i64) -> i64 { a += b; a }\nfn main() { x: i64 = 10; print(i32(bump_mut(x, 3))) }\n",
+            stdout: "13\n",
+            min_calls: 0,
+        },
+        Case {
+            name: "branch",
+            source: "fn clamp_v(v: i64, lo: i64, hi: i64) -> i64 {\n    if v < lo { return lo }\n    else if v > hi { return hi }\n    v\n}\nfn main() { print(i32(clamp_v(-5, 0, 10) + clamp_v(42, 0, 10) + clamp_v(7, 0, 10))) }\n",
+            stdout: "17\n",
+            min_calls: 3,
+        },
+        Case {
+            name: "loop",
+            source: "fn odd_sum(n: i32) -> i32 {\n    mut acc := 0\n    for i in 0..n { if i % 2 == 0 { continue }; if i >= 8 { break }; acc += i }\n    mut k := 1\n    while k < 4 { acc += k; k += 1 }\n    acc\n}\nfn main() { print(odd_sum(12)) }\n",
+            stdout: "22\n",
+            min_calls: 1,
+        },
+        Case {
+            name: "void_helper",
+            source: "fn add_bias(v: &mut []i64, bias: i64) { for i in 0..v.len { v[i] = v[i] + bias } }\nfn main() { mut a: []i64 = [1, 2, 3, 4]; add_bias(&mut a, 10); print(i32(a[0] + a[3])) }\n",
+            stdout: "25\n",
+            min_calls: 1,
+        },
+        Case {
+            name: "array_sum",
+            source: "import std.array as array\nfn sum_i32(v: &[]i32) -> i32 { mut s := 0; for i in 0..v.len { s += v[i] }; s }\nfn bump_i32(v: &mut []i32, k: i32) { for i in 0..v.len { v[i] = v[i] + k } }\nfn main() { a: []i64 = [10, 20, 30]; mut b: []i32 = [1, 2, 3]; bump_i32(&mut b, 2); print(i32(array.sum(&a)) + sum_i32(&b)) }\n",
+            stdout: "72\n",
+            min_calls: 3,
+        },
+        Case {
+            name: "spilled",
+            source: spilled_src,
+            stdout: "231\n",
+            min_calls: 1,
+        },
+        Case {
+            name: "nested",
+            source: "fn inner(a: i32) -> i32 { if a < 0 { return -a }; mut r := a + 1; r * 2 }\nfn outer(a: i32, b: i32) -> i32 { mut s := 0; for i in 0..a { s += i }; s + b }\nfn main() { print(outer(inner(-4), inner(3))) }\n",
+            stdout: "14\n",
+            min_calls: 3,
+        },
+    ]
+}
+
+fn parse_inlining_calls(stderr: string) -> i64 {
+    lines := harness.lines(stderr)
+    for line in lines {
+        doc := json.Doc::parse_text(line)
+        if !doc.ok || doc.get_str(doc.root, "kind").value != "timings" { continue }
+        inl := doc.field(doc.root, "inlining")
+        calls := doc.get_i64(inl, "calls")
+        if calls.ok { return calls.value }
+    }
+    -1
+}
+
+fn check_cases(cli: &harness.BaseCli, work: string) -> bool {
+    host := process.host_target()
+    mut targets := harness.targets()
+    targets.push("wasm32")
+    mut res := harness.empty_output()
+    for c in cases() {
+        src := f"{work}/{c.name}.ddr"
+        if !sys.write_text(src, c.source).ok { return harness.fail(f"cannot write {src}") }
+        for target in &targets {
+            for mode in 0..5 {
+                image := f"{work}/{c.name}-{target}-{mode}"
+                mut args: []string = ["build", src.clone(), "--target", target.clone(), "-o", image.clone()]
+                if mode == 0 {
+                    args.push("--timings=json")
+                } else if mode == 1 {
+                    args.push("--inline-opt=off")
+                    args.push("--timings=json")
+                } else if mode == 2 {
+                    args.push("--mir-ssa=on")
+                } else if mode == 3 {
+                    args.push("--const-div-opt=off")
+                } else {
+                    args.push("--jobs")
+                    args.push("4")
+                }
+                if !harness.run_checked(cli.compiler, args, work, 0, false, &mut res) { return false }
+                if mode == 0 && target == host {
+                    calls := parse_inlining_calls(res.stderr_text())
+                    if calls < c.min_calls {
+                        return harness.fail(f"{c.name}: expected at least {c.min_calls} inlined calls, got {calls}\n{res.stderr_text()}")
+                    }
+                } else if mode == 1 && target == host {
+                    calls := parse_inlining_calls(res.stderr_text())
+                    if calls != 0 {
+                        return harness.fail(f"{c.name}: expected 0 inlined calls with --inline-opt=off, got {calls}")
+                    }
+                }
+                if target == host || target == "wasm32" {
+                    if !harness.run_target_image(target.clone(), image, work, &mut res) { return false }
+                    if res.stdout_text() != c.stdout {
+                        return harness.fail(f"{c.name} ({target}, mode={mode}): expected {c.stdout}, got {res.stdout_text()}")
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn check_traps_and_cache(cli: &harness.BaseCli, work: string) -> bool {
+    mut res := harness.empty_output()
+    trap_cases: [](string, string, i32, string) = [
+        ("overflow", "fn inc_ovf(x: i32) -> i32 { mut a := x; if a > 0 { a = a + 1 }; a }\nfn main() { print(71); print(inc_ovf(2147483647)) }\n", 101, "71\n"),
+        ("div_zero", "fn div_z(a: i64, b: i64) -> i64 { if b < 0 { return 0 }; a / b }\nfn main() { print(72); print(div_z(10, 0)) }\n", 102, "72\n"),
+        ("oob", "fn pick(v: &[]i64, i: i32) -> i64 { mut acc: i64 = 0; if i >= 0 { acc = v[i] }; acc }\nfn main() { arr: []i64 = [1, 2]; print(73); print(pick(&arr, 5)) }\n", 103, "73\n"),
+    ]
+    for tc in move trap_cases {
+        (name, src_text, code, out) := tc
+        src := f"{work}/trap_{name}.ddr"
+        img := f"{work}/trap_{name}"
+        if !sys.write_text(src, src_text).ok { return harness.fail(f"cannot write {src}") }
+        if !harness.run_checked(cli.compiler, ["build", src, "-o", img.clone()], work, 0, false, &mut res) { return false }
+        res = harness.exec_cmd(img, [], work, false, 30000)
+        if !res.ok || res.timed_out || res.code != code || res.stdout_text() != out {
+            return harness.fail(f"trap {name}: expected code={code} out={out}, got code={res.code} out={res.stdout_text()}")
+        }
+    }
+
+    cache_src := work + "/cache_main.ddr"
+    cache_img := work + "/cache_img"
+    prog1 := "fn calc(a: i64, b: i64) -> i64 { mut x := a; if b > 0 { x += b }; x * 2 }\nfn main() { print(calc(10, 5)) }\n"
+    prog2 := "fn calc(a: i64, b: i64) -> i64 { mut x := a; if b > 0 { x += b + 1 }; x * 2 }\nfn main() { print(calc(10, 5)) }\n"
+    if !sys.write_text(cache_src, prog1).ok { return harness.fail("cannot write cache_main.ddr") }
+    if !harness.run_checked(cli.compiler, ["build", cache_src.clone(), "--incremental", "--timings=json", "-o", cache_img.clone()], work, 0, false, &mut res) { return false }
+    if parse_inlining_calls(res.stderr_text()) < 1 { return harness.fail("cache prog1 was not inlined") }
+    if !harness.run_checked(cache_img.clone(), [], work, 0, false, &mut res) || res.stdout_text() != "30\n" { return false }
+    if !sys.write_text(cache_src, prog2).ok { return harness.fail("cannot update cache_main.ddr") }
+    if !harness.run_checked(cli.compiler, ["build", cache_src, "--incremental", "--timings=json", "-o", cache_img.clone()], work, 0, false, &mut res) { return false }
+    if !harness.run_checked(cache_img, [], work, 0, false, &mut res) || res.stdout_text() != "32\n" {
+        return harness.fail(f"incremental whole-inline invalidation failed, got {res.stdout_text()}")
+    }
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    tmp := fs.temp_dir("dunder-whole-inline-")
+    if !tmp.ok { _ := harness.fail("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if !check_cases(&cli, work) || !check_traps_and_cache(&cli, work) { return 1 }
+    print("whole-function inlining: locals, mut params, branches, loops, void, arrays, spills, traps, cache and cross-targets passed.")
+    0
+}
