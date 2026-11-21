@@ -1,0 +1,173 @@
+capability process, filesystem, stdio
+
+import .harness as harness
+import std.fs as fs
+import std.json as json
+import std.text as text
+import sys
+
+fn demo_no_cap_source() -> string {
+    r"""
+    import cli
+    import log
+
+    fn main() -> i32 {
+        serve := cli.Command::new("serve", "Run worker")
+            .option("level", "l", "LEVEL", "info", false, "Log level")
+            .option("format", "f", "FMT", "json", false, "Output format")
+            .flag("dry-run", "d", "Dry run")
+            .arg("target", true, false, "Target host")
+
+        app := cli.App::new("svcctl", "0.8.0", "Service control")
+            .count_flag("verbose", "v", "Verbosity")
+            .subcommand(move serve)
+
+        match cli.parse_argv(&app) {
+            .Err(.HelpRequested(txt)) => {
+                print(txt)
+                0
+            },
+            .Err(.VersionRequested(txt)) => {
+                print(txt)
+                0
+            },
+            .Err(err) => {
+                print(cli.format_error(&err))
+                2
+            },
+            .Ok(m) => {
+                sub := m.subcommand().unwrap()
+                lvl := log.parse_level(sub.get_or("level", "info")).unwrap_or(.Info)
+                fmt := if sub.get_or("format", "text") == "json" { log.Format.Json } else { log.Format.Text }
+                logger := log.Logger::new(lvl, fmt)
+                    .with_target("svcctl.serve")
+                    .with_timestamps(false)
+                    .with_field(log.int_field("verbosity", i64(m.flag_count("verbose"))))
+                mut sink := log.BufferWriter::new()
+                _ := logger.debug<log.BufferWriter>(&mut sink, "debug hidden", &[])
+                _ := logger.info<log.BufferWriter>(&mut sink, "starting", &[
+                    log.str_field("host", sub.positional(0).unwrap()),
+                    log.bool_field("dry_run", sub.has_flag("dry-run")),
+                ])
+                _ := sink.flush()
+                print(sink.as_string())
+                0
+            },
+        }
+    }
+    """
+}
+
+fn demo_stderr_source() -> string {
+    r"""
+    capability stdio
+
+    import cli
+    import log
+    import std.io as io
+
+    fn main() -> i32 {
+        app := cli.App::new("emit", "0.8.0", "Emit log lines to stderr")
+            .option("tag", "t", "TAG", "app", false, "Tag")
+        m := cli.parse_argv(&app).unwrap()
+        logger := log.Logger::new(.Info, .Json)
+            .with_target(m.get_or("tag", "app"))
+            .with_timestamps(true)
+        mut err := io.stderr()
+        res := logger.info<io.Stderr>(&mut err, "booted", &[log.bool_field("ok", true)])
+        assert(res == .Ok(true))
+        print("STDERR_DONE")
+        0
+    }
+    """
+}
+
+fn run_suite(cli: &harness.BaseCli, work: string) -> bool {
+    mut out := harness.empty_output()
+
+    // 1. Run package unit tests directly
+    if !harness.run_checked_timeout(cli.compiler, ["test", cli.root + "/packages/cli/cli.ddr"], cli.root, 0, false, 60000, &mut out) { return false }
+    if !harness.run_checked_timeout(cli.compiler, ["test", cli.root + "/packages/log/log.ddr"], cli.root, 0, false, 60000, &mut out) { return false }
+
+    // 2. End-to-end project importing cli & log via dunder.toml path dependencies
+    proj := work + "/demo"
+    if !fs.mkdir_all(proj).ok { return harness.fail("mkdir demo") }
+    manifest := f"""
+    name = "cli_log_demo"
+    version = "0.1.0"
+    root = "main.ddr"
+
+    [dependencies]
+    cli = {{ path = "{cli.root}/packages/cli" }}
+    log = {{ path = "{cli.root}/packages/log" }}
+
+    [examples]
+    stderr_demo = "stderr_demo.ddr"
+    """
+    if !sys.write_text(proj + "/dunder.toml", manifest).ok { return harness.fail("write demo/dunder.toml") }
+    if !sys.write_text(proj + "/main.ddr", demo_no_cap_source()).ok { return harness.fail("write demo/main.ddr") }
+    if !sys.write_text(proj + "/stderr_demo.ddr", demo_stderr_source()).ok { return harness.fail("write demo/stderr_demo.ddr") }
+
+    bin_main := proj + "/demo-bin"
+    if !harness.run_checked_timeout(cli.compiler, ["build", "-o", bin_main.clone()], proj, 0, false, 60000, &mut out) { return false }
+
+    // JSON log output via CLI flags + BufferWriter (capability-free)
+    if !harness.run_checked_timeout(bin_main.clone(), ["-vv", "serve", "--dry-run", "-f", "json", "-l", "info", "127.0.0.1:8080"], proj, 0, false, 30000, &mut out) { return false }
+    json_line := out.stdout_text()
+    doc := json.Doc::parse_text(json_line)
+    if !doc.ok { return harness.fail(f"expected valid JSON log line, got: {json_line}") }
+    if doc.get_str(doc.root, "level") != .Some("INFO") ||
+       doc.get_str(doc.root, "target") != .Some("svcctl.serve") ||
+       doc.get_str(doc.root, "msg") != .Some("starting") ||
+       doc.get_i64(doc.root, "verbosity") != .Some(2) ||
+       doc.get_str(doc.root, "host") != .Some("127.0.0.1:8080") ||
+       doc.get_bool(doc.root, "dry_run") != .Some(true) {
+        return harness.fail(f"unexpected JSON log fields: {json_line}")
+    }
+
+    // Text logfmt output via --format=text
+    if !harness.run_checked_timeout(bin_main.clone(), ["serve", "--format=text", "api.local"], proj, 0, false, 30000, &mut out) { return false }
+    txt_line := out.stdout_text()
+    if !text.contains(txt_line, "level=INFO") || !text.contains(txt_line, "msg=\"starting\"") || !text.contains(txt_line, "host=api.local") {
+        return harness.fail(f"unexpected text logfmt line: {txt_line}")
+    }
+
+    // Version flag and error exit code
+    if !harness.run_checked_timeout(bin_main.clone(), ["--version"], proj, 0, false, 30000, &mut out) { return false }
+    if !harness.stdout_is(&out, "svcctl 0.8.0\n", "version output") { return false }
+    if !harness.run_checked_timeout(bin_main.clone(), ["serve", "--bogus"], proj, 2, false, 30000, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "unknown flag '--bogus'") { return harness.fail(f"expected unknown flag error, got: {out.stdout_text()}") }
+
+    // Stderr integration via io.Stderr + live RFC 3339 timestamp
+    bin_err := proj + "/stderr-bin"
+    if !harness.run_checked_timeout(cli.compiler, ["build", "--example", "stderr_demo", "-o", bin_err.clone()], proj, 0, false, 60000, &mut out) { return false }
+    if !harness.run_checked_timeout(bin_err.clone(), ["--tag", "worker"], proj, 0, false, 30000, &mut out) { return false }
+    if !harness.stdout_is(&out, "STDERR_DONE\n", "stderr_demo stdout") { return false }
+    err_json := out.stderr_text()
+    edoc := json.Doc::parse_text(err_json)
+    if !edoc.ok || edoc.get_str(edoc.root, "target") != .Some("worker") || edoc.get_str(edoc.root, "ts").is_none() || edoc.get_bool(edoc.root, "ok") != .Some(true) {
+        return harness.fail(f"unexpected stderr JSON log line: {err_json}")
+    }
+
+    // Cross-target compile check (arm64-linux, x86_64-linux & wasm32-wasi) for capability-free cli+log demo
+    for target in ["arm64-linux", "x86_64-linux", "wasm32-wasi"] {
+        if !harness.run_checked_timeout(cli.compiler, ["build", "--target", target.clone(), "-o", proj + "/demo-" + target], proj, 0, false, 60000, &mut out) {
+            return false
+        }
+    }
+
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if cli.extra_args.len > 0 { _ := sys.eprint("unexpected argument: " + cli.extra_args[0]); return 2 }
+    tmp := fs.temp_dir("dunder-cli-log-")
+    if !tmp.ok { _ := sys.eprint("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    if !run_suite(&cli, work) { return 1 }
+    print("PASS cli and log packages: unit tests, path dependencies, Text/JSON log output, io.Stderr, and cross-targets verified")
+    0
+}
