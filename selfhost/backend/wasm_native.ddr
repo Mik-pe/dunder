@@ -6,6 +6,38 @@ import wasm_flow as flow
 import wasm_memory as memory
 
 pub struct Result {ok:bool,error:string,text:[]u8}
+pub struct LinkedWasm {
+    active: bool,
+    entry_labels: []i32,
+    local_i64_counts: []i32,
+    needs_pc: []bool,
+    prints_masks: []i32,
+    body_starts: []i32,
+    body_ends: []i32,
+    bodies: []u8,
+    patch_starts: []i32,
+    patch_ends: []i32,
+    patch_at: []i32,
+    patch_kind: []i32,
+    patch_target: []i32,
+}
+pub fn empty_linked() -> LinkedWasm {
+    LinkedWasm {
+        active: false,
+        entry_labels: [],
+        local_i64_counts: [],
+        needs_pc: [],
+        prints_masks: [],
+        body_starts: [],
+        body_ends: [],
+        bodies: [],
+        patch_starts: [],
+        patch_ends: [],
+        patch_at: [],
+        patch_kind: [],
+        patch_target: [],
+    }
+}
 struct Image {imports:i32,table_base:i32,data_start:i32,data_base:i32,heap:i32,stack_bottom:i32,print_base:i32}
 fn print_type(tag:i32)->i32 {
     if tag==1 || tag==8 {return 126}
@@ -30,6 +62,26 @@ fn move_constant(out:&mut []u8,w:i64,kind:i64) {
     }else{b.constant(&mut out,value)}
     b.write(&mut out,reg)
 }
+fn raw_word(out: &mut []u8, w: i64, previous: i64) -> bool {
+    if w == 3573751839 { return true }
+    if w == 3596551104 { b.op(&mut out, 15); return true }
+    if w == 3558866944 { b.op(&mut out, 0); return true }
+    if w == 3556769793 {
+        if previous == 3531606984 { b.op(&mut out, 0); return true }
+        return false
+    }
+    kind := w.bit_and(2139095040)
+    if kind == 1384120320 || kind == 1920991232 || kind == 310378496 { move_constant(&mut out, w, kind); return true }
+    if memory.word(&mut out, w) { return true }
+    alu.word(&mut out, w)
+}
+pub fn emit_arm_words(out: &mut []u8, words: &[]i64) -> bool {
+    for i in 0..words.len {
+        prev := if i > 0 { words[i - 1] } else { i64(0) }
+        if !raw_word(&mut out, words[i], prev) { return false }
+    }
+    true
+}
 fn instruction(out:&mut []u8,code:&arm.Code,g:&flow.Graph,m:&Image,a:&abi.Abi,at:i32)->bool {
     r:=g.relocation[at]
     if r>=0 {
@@ -44,13 +96,6 @@ fn instruction(out:&mut []u8,code:&arm.Code,g:&flow.Graph,m:&Image,a:&abi.Abi,at
         return true
     }
     w:=code.words[at]
-    if w==3573751839 {return true}
-    if w==3596551104 {b.op(&mut out,15);return true}
-    if w==3558866944 {b.op(&mut out,0);return true}
-    if w==3556769793 {
-        if at>0 && code.words[at-1]==3531606984 {b.op(&mut out,0);return true}
-        return false
-    }
     if w>=4227858433 && w<=4227858444 {
         tag:=flow.print_tag(i32(w-4227858432));b.read(&mut out,0)
         ty:=print_type(tag)
@@ -61,10 +106,8 @@ fn instruction(out:&mut []u8,code:&arm.Code,g:&flow.Graph,m:&Image,a:&abi.Abi,at
     if w.bit_and(4294966303)==3594452992 {
         b.read(&mut out,b.bits(w,5,31));b.op(&mut out,167);b.indexed(&mut out,17,0);b.op(&mut out,0);return true
     }
-    kind:=w.bit_and(2139095040)
-    if kind==1384120320 || kind==1920991232 || kind==310378496 {move_constant(&mut out,w,kind);return true}
-    if memory.word(&mut out,w) {return true}
-    alu.word(&mut out,w)
+    prev := if at > 0 { code.words[at - 1] } else { i64(0) }
+    raw_word(&mut out, w, prev)
 }
 fn jump_condition(out:&mut []u8,kind:i32) {
     if kind==18 || kind==19 {b.read(&mut out,0);b.op(&mut out,80);if kind==19 {b.op(&mut out,69)}}
@@ -140,8 +183,110 @@ fn header(out:&mut []u8,g:&flow.Graph,m:&Image,a:&abi.Abi,ret:i32) {
     for block in &g.addresses {b.uleb(&mut s,m.imports+g.function_id[block])}
     b.section(&mut out,9,&s)
 }
+fn is_trap_block(code: &arm.Code, g: &flow.Graph, block: i32) -> bool {
+    start := g.starts[block]; limit := g.starts[block + 1]
+    if limit <= start { return false }
+    last := code.words[limit - 1]
+    ok_tail := last == 3558866944 || (last == 3556769793 && limit - 2 >= start && code.words[limit - 2] == 3531606984)
+    if !ok_tail { return false }
+    for at in start..limit - 1 {
+        w := code.words[at]
+        if w != 3573751839 && w.bit_and(2139095040) != 1384120320 { return false }
+    }
+    true
+}
+
+fn splice_mir_body(out: &mut []u8, code: &arm.Code, g: &flow.Graph, m: &Image, a: &abi.Abi, linked: &LinkedWasm, idx: i32) -> bool {
+    if linked.needs_pc[idx] {
+        b.op(&mut out, 2); b.uleb(&mut out, linked.local_i64_counts[idx]); b.op(&mut out, 126); b.op(&mut out, 1); b.op(&mut out, 127)
+    } else {
+        b.op(&mut out, 1); b.uleb(&mut out, linked.local_i64_counts[idx]); b.op(&mut out, 126)
+    }
+    body_start := linked.body_starts[idx]; body_end := linked.body_ends[idx]
+    body_len := body_end - body_start
+    p_start := linked.patch_starts[idx]; p_end := linked.patch_ends[idx]
+    mut cursor := 0
+    for p in p_start..p_end {
+        at := linked.patch_at[p]
+        if at < cursor || at > body_len { return false }
+        for bi in cursor..at { out.push(linked.bodies[body_start + bi]) }
+        cursor = at
+        kind := linked.patch_kind[p]; target := linked.patch_target[p]
+        if kind == 0 {
+            if target < 0 || target >= code.labels.len { return false }
+            loc := code.labels[target]
+            if loc < 0 || loc >= m.data_start { return false }
+            fid := g.function_id[g.block_at[loc]]
+            if fid < 0 { return false }
+            b.indexed(&mut out, 16, m.imports + fid)
+        } else if kind == 1 {
+            if target < 0 || target >= code.labels.len { return false }
+            loc := code.labels[target]
+            if loc < 0 { return false }
+            mut addr := 0
+            if loc >= m.data_start {
+                addr = m.data_base + (loc - m.data_start) * 4
+            } else {
+                aid := g.address_id[g.block_at[loc]]
+                if aid < 0 { return false }
+                addr = m.table_base + aid
+            }
+            b.constant(&mut out, i64(addr))
+        } else if kind == 2 {
+            if target < 0 || target >= g.prints.len || g.prints[target] < 0 { return false }
+            b.indexed(&mut out, 16, g.prints[target])
+        } else if kind == 3 {
+            if target < 0 || target >= code.labels.len { return false }
+            loc := code.labels[target]
+            if loc < 0 || loc >= m.data_start { return false }
+            blk := g.block_at[loc]
+            if is_trap_block(&code, &g, blk) {
+                b.op(&mut out, 0)
+            } else if g.function_id[blk] >= 0 {
+                b.indexed(&mut out, 16, m.imports + g.function_id[blk])
+                b.op(&mut out, 15)
+            } else {
+                return false
+            }
+        } else if kind == 4 {
+            if target < 0 || target >= a.starts.len { return false }
+            abi.dispatch(&mut out, &a, target)
+        } else {
+            return false
+        }
+    }
+    for bi in cursor..body_len { out.push(linked.bodies[body_start + bi]) }
+    true
+}
+
 pub fn image(code:&arm.Code,data_start:i32,entry:i32,ret:i32,a:&abi.Abi)->Result {
+    empty := empty_linked()
+    image_linked(&code, data_start, entry, ret, &a, &empty)
+}
+
+pub fn image_linked(code:&arm.Code,data_start:i32,entry:i32,ret:i32,a:&abi.Abi,linked:&LinkedWasm)->Result {
     mut g:=flow.index(&code,data_start,entry,&a.callback_labels)
+    mut mir_for_block := flow.filled(g.function_id.len, -1)
+    if linked.active {
+        for k in 0..linked.entry_labels.len {
+            lbl := linked.entry_labels[k]
+            if lbl >= 0 && lbl < code.labels.len {
+                loc := code.labels[lbl]
+                if loc >= 0 && loc < data_start {
+                    blk := g.block_at[loc]
+                    if blk >= 0 && blk < mir_for_block.len { mir_for_block[blk] = k }
+                }
+            }
+        }
+        mut merged_prints := 0
+        for fi in 0..g.functions.len {
+            k := mir_for_block[g.functions[fi]]
+            if k >= 0 { merged_prints = merged_prints.bit_or(linked.prints_masks[k]) }
+        }
+        for tag in 0..9 {
+            if merged_prints.bit_and(i32(1).shl(tag)) != 0 { g.prints[tag] = 0 }
+        }
+    }
     mut count:=a.import_sigs.len
     for i in 0..g.prints.len {if g.prints[i]>=0 {g.prints[i]=count;count=count+1}}
     data_base:=16+data_start%2*4
@@ -153,7 +298,14 @@ pub fn image(code:&arm.Code,data_start:i32,entry:i32,ret:i32,a:&abi.Abi)->Result
     mut section:[]u8=[];b.uleb(&mut section,g.functions.len+a.callback_labels.len+1)
     mut indices:=flow.filled(g.function_id.len,-1);mut instructions:[]u8=[]
     for f in &g.functions {
-        instructions.clear();error:=body(&mut instructions,&code,&g,&m,&a,f,&mut indices)
+        instructions.clear()
+        k := mir_for_block[f]
+        if k >= 0 && splice_mir_body(&mut instructions, &code, &g, &m, &a, &linked, k) {
+            b.blob(&mut section, &instructions)
+            continue
+        }
+        instructions.clear()
+        error:=body(&mut instructions,&code,&g,&m,&a,f,&mut indices)
         if error!="" {return Result{ok:false,error:error,text:[]}}
         b.blob(&mut section,&instructions)
     }

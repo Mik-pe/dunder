@@ -1,5 +1,6 @@
 capability filesystem
 import ..backend.arm64 as arm
+import ..backend.wasm_mir
 import ..backend.x86_mir
 import cache_io
 import cli
@@ -201,10 +202,15 @@ fn object_payload(output: &mut []u8, object: &lower.FunctionObject,
     words := lower.object_word_count(&object); labels := label_end - first_label
     relocations := lower.object_reloc_count(&object)
     has_x86 := lower.object_has_x86(&object)
+    has_wasm := lower.object_has_wasm(&object)
+    if has_x86 && has_wasm { return false }
     mut extra_words: i64 = 0
     if has_x86 {
         x := lower.object_x86(&object)
         extra_words = i64(3) + i64((x.text.len + 3) / 4) + i64(labels) + i64(x.reloc_at.len) * 2 + i64(x.stack_traps.len)
+    } else if has_wasm {
+        w := lower.object_wasm(&object)
+        extra_words = i64(6) + i64((w.body.len + 3) / 4) + i64(w.patch_at.len) * 3
     }
     size := i64(7) + i64(words) + i64(labels) + i64(relocations) * 3 + i64(count) + extra_words
     if words <= 0 || size * 8 + 128 > 67108864 { return false }
@@ -218,7 +224,7 @@ fn object_payload(output: &mut []u8, object: &lower.FunctionObject,
     if n > first + labels {
         if first != 0 || lower.object_label_id(&object, n - 1) < label_end || lower.object_label_offset(&object, n - 1) != 0 { return false }
     }
-    version := if has_x86 { i64(2) } else { i64(1) }
+    version := if has_x86 { i64(2) } else if has_wasm { i64(3) } else { i64(1) }
     header_version(&mut output, version, words, labels, relocations, count, charged)
     for i in 0..words {
         word := lower.object_word(&object, i)
@@ -270,6 +276,42 @@ fn append_x86_trailer(output: &mut []u8, object: &lower.FunctionObject, first_la
     for i in 0..x_traps { put(&mut output, i64(x.stack_traps[i])) }
     true
 }
+fn append_wasm_trailer(output: &mut []u8, object: &lower.FunctionObject, first_label: i32, label_end: i32, globals: i32) -> bool {
+    if !lower.object_has_wasm(&object) { return true }
+    w := lower.object_wasm(&object)
+    w_bytes := w.body.len; w_words := (w_bytes + 3) / 4
+    w_patches := w.patch_at.len
+    if w_bytes <= 0 || w.local_i64_count < 8 || w.prints_mask < 0 || w.prints_mask > 511 { return false }
+    put(&mut output, i64(w_bytes))
+    put(&mut output, i64(w.local_i64_count))
+    put(&mut output, if w.needs_pc_local { 1 } else { 0 })
+    put(&mut output, if w.structured { 1 } else { 0 })
+    put(&mut output, i64(w.prints_mask))
+    put(&mut output, i64(w_patches))
+    for wi in 0..w_words {
+        mut word: i64 = 0
+        for bi in 0..4 {
+            idx := wi * 4 + bi
+            if idx < w_bytes { word = word.bit_or(i64(w.body[idx]).shl(bi * 8)) }
+        }
+        put(&mut output, word)
+    }
+    for i in 0..w_patches {
+        at := w.patch_at[i]; kind := w.patch_kind[i]; target := w.patch_target[i]
+        if at < 0 || at > w_bytes || kind < 0 || kind > 4 || target < 0 { return false }
+        put(&mut output, i64(at))
+        put(&mut output, i64(kind))
+        if kind == 0 || kind == 1 || kind == 3 {
+            if target < globals { put(&mut output, 2147483648 + i64(target)) }
+            else if target >= first_label && target < label_end { put(&mut output, i64(target - first_label)) }
+            else { return false }
+        } else {
+            if kind == 2 && target >= 9 { return false }
+            put(&mut output, i64(target))
+        }
+    }
+    true
+}
 pub fn save_object(object: &lower.FunctionObject, first_label: i32, label_end: i32,
     globals: i32, path: string, key: string, dependencies: &Dependencies, declaration_limit: i32) -> bool {
     if !valid_key(key) || !valid_dependencies(&dependencies, declaration_limit) { return false }
@@ -278,6 +320,7 @@ pub fn save_object(object: &lower.FunctionObject, first_label: i32, label_end: i
         dependencies.declarations.len, dependencies.charged_words) { return false }
     for declaration in &dependencies.declarations { put(&mut output, i64(declaration)) }
     if !append_x86_trailer(&mut output, &object, first_label, label_end, globals) { return false }
+    if !append_wasm_trailer(&mut output, &object, first_label, label_end, globals) { return false }
     publish(path, key, &output)
 }
 pub fn restore(code: &mut arm.Code, globals: i32, entry: i32,
@@ -289,7 +332,14 @@ pub fn restore(code: &mut arm.Code, globals: i32, entry: i32,
 pub fn restore_with_x86(code: &mut arm.Code, globals: i32, entry: i32,
     path: string, key: string, declaration_limit: i32, available_words: i32,
     dependencies: &mut Dependencies, out_x86: &mut x86_mir.Object) -> bool {
+    mut ignored_wasm := wasm_mir.empty()
+    restore_with_backends(&mut code, globals, entry, path, key, declaration_limit, available_words, &mut dependencies, &mut out_x86, &mut ignored_wasm)
+}
+pub fn restore_with_backends(code: &mut arm.Code, globals: i32, entry: i32,
+    path: string, key: string, declaration_limit: i32, available_words: i32,
+    dependencies: &mut Dependencies, out_x86: &mut x86_mir.Object, out_wasm: &mut wasm_mir.Object) -> bool {
     x86_mir.reset(&mut out_x86)
+    wasm_mir.reset(&mut out_wasm)
     if !valid_key(key) || declaration_limit < 0 || available_words < 0 || code.checking { return false }
     if globals < 0 || globals > code.labels.len || entry < 0 || entry >= code.labels.len || code.labels[entry] != -1 { return false }
     if code.at.len != code.target.len || code.at.len != code.kinds.len { return false }
@@ -303,9 +353,10 @@ pub fn restore_with_x86(code: &mut arm.Code, globals: i32, entry: i32,
     signature := &read.value[64..128]
     if !bytes.equals_text(&signature, 0, signature.len, cache_io.digest_parts(key, &payload)) { return false }
     data := values(&payload)
-    if data.len < 7 || data[0] != 1146439236 || (data[1] != 1 && data[1] != 2) { return false }
+    if data.len < 7 || data[0] != 1146439236 || (data[1] != 1 && data[1] != 2 && data[1] != 3) { return false }
     version := data[1]
     if code.platform == 2 && version != 2 { return false }
+    if code.platform == 3 && version != 3 { return false }
     word_count := data[2]; label_count := data[3]; relocation_count := data[4]
     dependency_count := data[5]; charged_words := data[6]
     if word_count==0 || dependency_count>256 || charged_words>i64(word_limit()) || charged_words>i64(available_words){return false}
@@ -313,6 +364,7 @@ pub fn restore_with_x86(code: &mut arm.Code, globals: i32, entry: i32,
     if word_count>i64(2147483647-code.words.len) || label_count>i64(2147483647-code.labels.len) || relocation_count>i64(2147483647-code.at.len){return false}
     if version == 1 && size != i64(data.len) { return false }
     if version == 2 && i64(data.len) < size + 3 { return false }
+    if version == 3 && i64(data.len) < size + 6 { return false }
     words:=i32(word_count);labels:=i32(label_count);relocations:=i32(relocation_count);count:=i32(dependency_count)
     label_start := 7 + words; relocation_start := label_start + labels
     declaration_start := relocation_start + relocations * 3
@@ -362,6 +414,38 @@ pub fn restore_with_x86(code: &mut arm.Code, globals: i32, entry: i32,
             if data[x_traps_start + i] > i64(x_bytes - 4) { return false }
         }
     }
+    mut w_bytes := 0; mut w_words := 0; mut w_locals := 8; mut w_needs_pc := false
+    mut w_structured := false; mut w_prints_mask := 0; mut w_patches := 0; mut w_body_start := 0; mut w_patch_start := 0
+    if version == 3 {
+        w_base := i32(size)
+        if data[w_base] <= 0 || data[w_base] > 67108864 || data[w_base + 1] < 8 || data[w_base + 1] > 65536 ||
+            (data[w_base + 2] != 0 && data[w_base + 2] != 1) || (data[w_base + 3] != 0 && data[w_base + 3] != 1) ||
+            data[w_base + 4] < 0 || data[w_base + 4] > 511 || data[w_base + 5] < 0 || data[w_base + 5] > 1048576 { return false }
+        w_bytes = i32(data[w_base]); w_words = (w_bytes + 3) / 4
+        w_locals = i32(data[w_base + 1])
+        w_needs_pc = data[w_base + 2] != 0
+        w_structured = data[w_base + 3] != 0
+        w_prints_mask = i32(data[w_base + 4])
+        w_patches = i32(data[w_base + 5])
+        expected := size + i64(6) + i64(w_words) + i64(w_patches) * 3
+        if expected != i64(data.len) { return false }
+        w_body_start = w_base + 6
+        w_patch_start = w_body_start + w_words
+        mut prev_at: i64 = 0
+        for i in 0..w_patches {
+            at := data[w_patch_start + i * 3]; kind := data[w_patch_start + i * 3 + 1]; target := data[w_patch_start + i * 3 + 2]
+            if at < prev_at || at > i64(w_bytes) || kind > 4 { return false }
+            if kind == 0 || kind == 1 || kind == 3 {
+                if target >= 2147483648 {
+                    if target - 2147483648 >= i64(globals) { return false }
+                } else if target >= i64(labels) || data[label_start + i32(target)] == 4294967295 { return false }
+            } else {
+                if kind == 2 && target >= 9 { return false }
+                if target >= 2147483648 { return false }
+            }
+            prev_at = at
+        }
+    }
     mut accepted := new_dependencies()
     for i in 0..count { accepted.declarations.push(i32(data[declaration_start + i])) }
     accepted.charged_words = i32(charged_words)
@@ -401,6 +485,33 @@ pub fn restore_with_x86(code: &mut arm.Code, globals: i32, entry: i32,
         }
         for i in 0..x_traps { out_x86.stack_traps.push(i32(data[x_traps_start + i])) }
         out_x86.ready = true
+    }
+    if version == 3 {
+        out_wasm.body.reserve(w_bytes)
+        for wi in 0..w_words {
+            w := data[w_body_start + wi]
+            for bi in 0..4 {
+                if wi * 4 + bi < w_bytes { out_wasm.body.push(u8(w.shr(bi * 8).bit_and(255))) }
+            }
+        }
+        out_wasm.local_i64_count = w_locals
+        out_wasm.needs_pc_local = w_needs_pc
+        out_wasm.structured = w_structured
+        out_wasm.prints_mask = w_prints_mask
+        out_wasm.entry_label = entry
+        for i in 0..w_patches {
+            out_wasm.patch_at.push(i32(data[w_patch_start + i * 3]))
+            kind := i32(data[w_patch_start + i * 3 + 1])
+            out_wasm.patch_kind.push(kind)
+            raw_target := data[w_patch_start + i * 3 + 2]
+            if kind == 0 || kind == 1 || kind == 3 {
+                if raw_target >= 2147483648 { out_wasm.patch_target.push(i32(raw_target - 2147483648)) }
+                else { out_wasm.patch_target.push(first + i32(raw_target)) }
+            } else {
+                out_wasm.patch_target.push(i32(raw_target))
+            }
+        }
+        out_wasm.ready = true
     }
     dependencies = accepted; true
 }
