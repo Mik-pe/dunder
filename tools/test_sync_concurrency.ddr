@@ -1,0 +1,724 @@
+capability process, filesystem, network, stdio
+
+import .harness as harness
+import .probe_cli as cli
+import .test_evidence as evidence
+import std.fs as fs
+import std.process as process
+import std.text as text
+import sys
+
+fn put(path: string, program: string) -> bool {
+    sys.write_text(path, program).ok || harness.fail(f"cannot write {path}")
+}
+
+fn build_and_run(journal: &mut evidence.Journal, compiler: string, work: string, name: string, program: string, expected: string) -> bool {
+    source := f"{work}/{name}.ddr"
+    image := f"{work}/{name}"
+    mut output := harness.empty_output()
+    if !put(source, program + "\n") ||
+       !journal.run(compiler, ["check", source.clone(), "--agent"], &mut output) ||
+       !journal.run(compiler, ["build", source.clone(), "-o", image.clone()], &mut output) ||
+       !journal.run(image, [], &mut output) { return false }
+    got := output.stdout_text() + output.stderr_text()
+    got == expected || harness.fail(f"{name}: expected\n{expected}\ngot\n{got}")
+}
+
+fn check_invalid(journal: &mut evidence.Journal, compiler: string, work: string, name: string, program: string, expected: string) -> bool {
+    source := f"{work}/{name}.ddr"
+    image := f"{work}/{name}"
+    if !put(source, program + "\n") { return false }
+    mut output := harness.empty_output()
+    for action in ["check", "build"] {
+        mut args: []string = [action.clone(), source.clone()]
+        if action == "check" { args.push("--agent") } else { args.push("-o"); args.push(image.clone()) }
+        if !journal.run_expected(compiler, args, 1, &mut output) { return false }
+        got := output.stdout_text() + output.stderr_text()
+        if !text.contains(got, expected) {
+            return harness.fail(f"{name} ({action}): expected '{expected}'\ngot:\n{got}")
+        }
+    }
+    true
+}
+
+fn check_atomics_and_semaphore(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "import std.sync as sync\n" +
+        "import sys\n" +
+        "struct AtomicArgs { cnt: sync.AtomicI64, flag: sync.AtomicBool }\n" +
+        "struct SemArgs { sem: sync.Semaphore, active: sync.AtomicI64, max_seen: sync.AtomicI64 }\n" +
+        "fn atomic_worker(move args: AtomicArgs) -> i64 {\n" +
+        "    for _ in 0..100 {\n" +
+        "        _ := args.cnt.fetch_add(1)\n" +
+        "    }\n" +
+        "    _ := args.flag.swap(true)\n" +
+        "    1\n" +
+        "}\n" +
+        "fn sem_worker(move args: SemArgs) -> i64 {\n" +
+        "    mut local_max: i64 = 0\n" +
+        "    for _ in 0..8 {\n" +
+        "        permit := args.sem.acquire_permit()\n" +
+        "        cur := args.active.fetch_add(1) + 1\n" +
+        "        if cur > local_max { local_max = cur }\n" +
+        "        while true {\n" +
+        "            prev := args.max_seen.load()\n" +
+        "            if cur <= prev { break }\n" +
+        "            if args.max_seen.compare_exchange(prev, cur).0 { break }\n" +
+        "        }\n" +
+        "        sys.sleep_ms(2)\n" +
+        "        _ := args.active.fetch_sub(1)\n" +
+        "        drop(move permit)\n" +
+        "    }\n" +
+        "    local_max\n" +
+        "}\n" +
+        "fn drop(move p: sync.SemaphorePermit) {}\n" +
+        "fn main() {\n" +
+        "    c := sync.AtomicI64::new(10)\n" +
+        "    assert(c.load() == 10)\n" +
+        "    assert(c.swap(0) == 10 && c.load() == 0)\n" +
+        "    assert(c.compare_exchange(0, 5).0 && c.load() == 5)\n" +
+        "    assert(!c.compare_exchange(0, 99).0 && c.compare_exchange(0, 99).1 == 5)\n" +
+        "    c.store(0)\n" +
+        "    b := sync.AtomicBool::new(false)\n" +
+        "    assert(!b.load() && b.compare_exchange(false, true).0 && !b.swap(false) == false)\n" +
+        "    b.store(false)\n" +
+        "    task scope s(4) {\n" +
+        "        mut ids: []TaskID<i64> = []\n" +
+        "        for _ in 0..4 { ids.push(spawn s atomic_worker(AtomicArgs { cnt: c.clone_handle(), flag: b.clone_handle() })) }\n" +
+        "        for i in 0..ids.len { assert(await! s(ids[i]) == 1) }\n" +
+        "    }\n" +
+        "    assert(c.load() == 400 && b.load())\n" +
+        "    sem := sync.Semaphore::new(2)\n" +
+        "    assert(sem.available() == 2 && sem.try_acquire() && sem.available() == 1)\n" +
+        "    p1 := sem.try_acquire_permit()\n" +
+        "    assert(p1.is_some() && sem.available() == 0 && !sem.try_acquire() && !sem.acquire_timeout(5))\n" +
+        "    sem.release()\n" +
+        "    match move p1 {\n" +
+        "        .Some(mut pm) => pm.release(),\n" +
+        "        .None => assert(false),\n" +
+        "    }\n" +
+        "    assert(sem.available() == 2)\n" +
+        "    active := sync.AtomicI64::new(0)\n" +
+        "    max_seen := sync.AtomicI64::new(0)\n" +
+        "    task scope s2(4) {\n" +
+        "        mut ids2: []TaskID<i64> = []\n" +
+        "        for _ in 0..4 {\n" +
+        "            ids2.push(spawn s2 sem_worker(SemArgs { sem: sem.clone_handle(), active: active.clone_handle(), max_seen: max_seen.clone_handle() }))\n" +
+        "        }\n" +
+        "        for i in 0..ids2.len { assert(await! s2(ids2[i]) <= 2) }\n" +
+        "    }\n" +
+        "    assert(active.load() == 0 && max_seen.load() >= 1 && max_seen.load() <= 2 && sem.available() == 2)\n" +
+        "    print(\"atomics_sem_ok\")\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "atomics_sem", program, "atomics_sem_ok\n")
+}
+
+fn check_channels_all_types(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "capability network\n" +
+        "import std.bytes as bytes\n" +
+        "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "struct Vec2 { x: f64, y: f64 }\n" +
+        "struct Envelope {\n" +
+        "    tag: string,\n" +
+        "    items: []string,\n" +
+        "    meta: Map<string, string>,\n" +
+        "    seq: Option<i64>,\n" +
+        "}\n" +
+        "struct ActorReq {\n" +
+        "    key: string,\n" +
+        "    delta: i64,\n" +
+        "    reply: sync.Sender<i64>,\n" +
+        "}\n" +
+        "struct ScalarArgs { tx: sync.Sender<i64>, start: i64, count: i64 }\n" +
+        "struct EnvArgs { rx: sync.Receiver<Envelope>, out: sync.Sender<Vec2> }\n" +
+        "struct ActorArgs { req_tx: sync.Sender<ActorReq>, key: string }\n" +
+        "fn scalar_producer(move args: ScalarArgs) -> i64 {\n" +
+        "    for i in 0..i32(args.count) { assert(args.tx.send(args.start + i64(i))) }\n" +
+        "    args.count\n" +
+        "}\n" +
+        "fn big_str_producer(move tx: sync.Sender<string>) -> i32 {\n" +
+        "    mut s := \"\"\n" +
+        "    for _ in 0..256 { s += \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" }\n" +
+        "    n := s.len\n" +
+        "    assert(tx.send(move s))\n" +
+        "    n\n" +
+        "}\n" +
+        "fn env_worker(move args: EnvArgs) -> i64 {\n" +
+        "    mut total: i64 = 0\n" +
+        "    while true {\n" +
+        "        match args.rx.recv() {\n" +
+        "            .Some(env) => {\n" +
+        "                assert(env.tag == \"batch\")\n" +
+        "                assert(env.items.len == 2 && env.meta.at(\"k\") == \"v\")\n" +
+        "                total += env.seq.unwrap_or(0)\n" +
+        "            },\n" +
+        "            .None => break,\n" +
+        "        }\n" +
+        "    }\n" +
+        "    assert(args.out.send(Vec2 { x: 1.5, y: f64(total) }))\n" +
+        "    total\n" +
+        "}\n" +
+        "fn sock_worker(move rx: sync.Receiver<net.TcpStream>) -> string {\n" +
+        "    match rx.recv() {\n" +
+        "        .Some(s) => {\n" +
+        "            mut buf: []u8 = []\n" +
+        "            _ := s.read_append(&mut buf, 32).unwrap()\n" +
+        "            reply := bytes.from_text(\"ack:\" + bytes.decode(&buf).value)\n" +
+        "            _ := s.write_all(&reply)\n" +
+        "            \"done\"\n" +
+        "        },\n" +
+        "        .None => \"none\",\n" +
+        "    }\n" +
+        "}\n" +
+        "fn actor_worker(move args: ActorArgs) -> i64 {\n" +
+        "    pair := sync.channel<i64>(1)\n" +
+        "    rtx := pair.0; rrx := pair.1\n" +
+        "    assert(args.req_tx.send(ActorReq { key: args.key, delta: 7, reply: move rtx }))\n" +
+        "    rrx.recv().unwrap()\n" +
+        "}\n" +
+        "fn test_unreceived_drop() {\n" +
+        "    listener := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(0), 4).unwrap()\n" +
+        "    port := listener.local_port()\n" +
+        "    client := net.TcpStream::connect_addr(net.SocketAddr::loopback_v4(u16(port))).unwrap()\n" +
+        "    srv := listener.accept().unwrap()\n" +
+        "    {\n" +
+        "        ch := sync.channel<net.TcpStream>(2)\n" +
+        "        tx := ch.0; rx := ch.1\n" +
+        "        assert(tx.send(move client))\n" +
+        "        assert(tx.len() == 1 && rx.len() == 1)\n" +
+        "    }\n" +
+        "    // Unreceived client TcpStream must have been disposed (fd closed), so srv reads EOF!\n" +
+        "    mut buf: []u8 = []\n" +
+        "    n := srv.read_append(&mut buf, 16).unwrap()\n" +
+        "    assert(n == 0)\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    // 1. Try-send backpressure & close\n" +
+        "    pair0 := sync.channel<string>(2)\n" +
+        "    tx0 := pair0.0; rx0 := pair0.1\n" +
+        "    assert(tx0.capacity() == 2)\n" +
+        "    match tx0.try_send(\"one\") { .Ok => {}, _ => assert(false) }\n" +
+        "    match tx0.try_send(\"two\") { .Ok => {}, _ => assert(false) }\n" +
+        "    match tx0.try_send(\"three\") {\n" +
+        "        .Full(back) => assert(back == \"three\"),\n" +
+        "        _ => assert(false),\n" +
+        "    }\n" +
+        "    match tx0.send_timeout(\"timed\", 5) {\n" +
+        "        .TimedOut(back) => assert(back == \"timed\"),\n" +
+        "        _ => assert(false),\n" +
+        "    }\n" +
+        "    tx0.close()\n" +
+        "    assert(rx0.recv().unwrap() == \"one\")\n" +
+        "    assert(rx0.recv().unwrap() == \"two\")\n" +
+        "    assert(rx0.recv().is_none() && rx0.is_closed())\n" +
+        "    match tx0.try_send(\"after\") {\n" +
+        "        .Closed(back) => assert(back == \"after\"),\n" +
+        "        _ => assert(false),\n" +
+        "    }\n" +
+        "    // 2. Multi-producer scalar channel across workers (exercise ring wraparound + blocking)\n" +
+        "    sp := sync.channel<i64>(4)\n" +
+        "    stx := sp.0; srx := sp.1\n" +
+        "    task scope s1(3) {\n" +
+        "        a := spawn s1 scalar_producer(ScalarArgs { tx: stx.clone_sender(), start: 0, count: 50 })\n" +
+        "        b := spawn s1 scalar_producer(ScalarArgs { tx: move stx, start: 100, count: 50 })\n" +
+        "        mut sum: i64 = 0\n" +
+        "        mut seen := 0\n" +
+        "        while true {\n" +
+        "            match srx.recv() {\n" +
+        "                .Some(v) => { sum += v; seen += 1 },\n" +
+        "                .None => break,\n" +
+        "            }\n" +
+        "        }\n" +
+        "        assert(seen == 100 && sum == 49 * 50 + 50 * 100 + 49 * 25 - 49 * 25 + 49 * 50 - 49 * 50 + 0)\n" +
+        "        assert(await! s1(a) == 50 && await! s1(b) == 50)\n" +
+        "        // Exact expected sum = (0..49) + (100..149) = 1225 + 6225 = 7450\n" +
+        "        assert(sum == 7450)\n" +
+        "    }\n" +
+        "    // 3. Large >20KB string (overflow slab) & multi-use recycling across ring\n" +
+        "    lp := sync.channel<string>(2)\n" +
+        "    ltx := lp.0; lrx := lp.1\n" +
+        "    task scope s2(2) {\n" +
+        "        id := spawn s2 big_str_producer(move ltx)\n" +
+        "        got_big := lrx.recv().unwrap()\n" +
+        "        exp_len := await! s2(id)\n" +
+        "        assert(got_big.len == exp_len && got_big.len > 20000)\n" +
+        "    }\n" +
+        "    // 4. Rich nested structs + POD Vec2\n" +
+        "    ep := sync.channel<Envelope>(2)\n" +
+        "    vp := sync.channel<Vec2>(2)\n" +
+        "    etx := ep.0; erx := ep.1\n" +
+        "    vtx := vp.0; vrx := vp.1\n" +
+        "    task scope s3(2) {\n" +
+        "        ew := spawn s3 env_worker(EnvArgs { rx: move erx, out: move vtx })\n" +
+        "        for i in 1..6 {\n" +
+        "            mut m := Map<string, string>::new()\n" +
+        "            m.put(\"k\", \"v\")\n" +
+        "            env := Envelope { tag: \"batch\", items: [\"a\", \"b\"], meta: move m, seq: .Some(i64(i)) }\n" +
+        "            assert(etx.send(move env))\n" +
+        "        }\n" +
+        "        etx.close()\n" +
+        "        vec := vrx.recv().unwrap()\n" +
+        "        assert(vec.x == 1.5 && vec.y == 15.0)\n" +
+        "        assert(await! s3(ew) == 15)\n" +
+        "    }\n" +
+        "    // 5. @resource TcpStream sent over Channel + loopback echo\n" +
+        "    listener := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(0), 4).unwrap()\n" +
+        "    port := listener.local_port()\n" +
+        "    tp := sync.channel<net.TcpStream>(2)\n" +
+        "    ttx := tp.0; trx := tp.1\n" +
+        "    task scope s4(2) with (network) {\n" +
+        "        sw := spawn s4 sock_worker(move trx)\n" +
+        "        client := net.TcpStream::connect_addr(net.SocketAddr::loopback_v4(u16(port))).unwrap()\n" +
+        "        srv := listener.accept().unwrap()\n" +
+        "        assert(ttx.send(move srv))\n" +
+        "        ttx.close()\n" +
+        "        req := bytes.from_text(\"ping\")\n" +
+        "        _ := client.write_all(&req)\n" +
+        "        mut resp: []u8 = []\n" +
+        "        _ := client.read_append(&mut resp, 32).unwrap()\n" +
+        "        assert(bytes.decode(&resp).value == \"ack:ping\")\n" +
+        "        assert(await! s4(sw) == \"done\")\n" +
+        "    }\n" +
+        "    test_unreceived_drop()\n" +
+        "    // 6. Actor / coordinator owning non-atomic Map replying over Channel\n" +
+        "    ap := sync.channel<ActorReq>(4)\n" +
+        "    atx := ap.0; arx := ap.1\n" +
+        "    task scope s5(3) {\n" +
+        "        w1 := spawn s5 actor_worker(ActorArgs { req_tx: atx.clone_sender(), key: \"alpha\" })\n" +
+        "        w2 := spawn s5 actor_worker(ActorArgs { req_tx: atx.clone_sender(), key: \"alpha\" })\n" +
+        "        w3 := spawn s5 actor_worker(ActorArgs { req_tx: move atx, key: \"beta\" })\n" +
+        "        mut state := Map<string, i64>::new()\n" +
+        "        while true {\n" +
+        "            match arx.recv() {\n" +
+        "                .Some(req) => {\n" +
+        "                    cur := state.get_or(req.key, 0) + req.delta\n" +
+        "                    state.put(req.key.clone(), cur)\n" +
+        "                    assert(req.reply.send(cur))\n" +
+        "                },\n" +
+        "                .None => break,\n" +
+        "            }\n" +
+        "        }\n" +
+        "        a1 := await! s5(w1); a2 := await! s5(w2); a3 := await! s5(w3)\n" +
+        "        assert(a1 + a2 == 21 && a3 == 7 && state.at(\"alpha\") == 14 && state.at(\"beta\") == 7)\n" +
+        "    }\n" +
+        "    print(\"channels_ok\")\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "channels_all", program, "channels_ok\n")
+}
+
+fn check_select(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "import std.sync as sync\n" +
+        "import sys\n" +
+        "fn delayed_send_str(move tx: sync.Sender<string>) -> i32 {\n" +
+        "    sys.sleep_ms(15)\n" +
+        "    assert(tx.send(\"from_b\"))\n" +
+        "    1\n" +
+        "}\n" +
+        "fn delayed_cancel(move tok: sync.CancelToken) -> i32 {\n" +
+        "    sys.sleep_ms(15)\n" +
+        "    tok.cancel()\n" +
+        "    1\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    a := sync.channel<i64>(2)\n" +
+        "    b := sync.channel<string>(2)\n" +
+        "    match sync.select2<i64, string>(&a.1, &b.1, 0) {\n" +
+        "        .Timeout => {},\n" +
+        "        _ => assert(false),\n" +
+        "    }\n" +
+        "    assert(a.0.send(42))\n" +
+        "    match sync.select2<i64, string>(&a.1, &b.1, 500) {\n" +
+        "        .First(opt) => assert(opt.unwrap() == 42),\n" +
+        "        _ => assert(false),\n" +
+        "    }\n" +
+        "    task scope s(2) {\n" +
+        "        id := spawn s delayed_send_str(move b.0)\n" +
+        "        match sync.select2<i64, string>(&a.1, &b.1, 2000) {\n" +
+        "            .Second(opt) => assert(opt.unwrap() == \"from_b\"),\n" +
+        "            _ => assert(false),\n" +
+        "        }\n" +
+        "        fds: []i32 = [a.1.fd(), b.1.fd()]\n" +
+        "        assert(sync.select_ready(&fds, 1000) == 1)\n" +
+        "        match b.1.recv() { .None => {}, _ => assert(false) }\n" +
+        "        assert(await! s(id) == 1)\n" +
+        "    }\n" +
+        "    tok := sync.CancelToken::new()\n" +
+        "    task scope s2(2) {\n" +
+        "        c := sync.channel<i64>(2)\n" +
+        "        cid := spawn s2 delayed_cancel(tok.clone_handle())\n" +
+        "        match sync.select2_cancel<i64, i64>(&a.1, &c.1, &tok, 5000) {\n" +
+        "            .Cancelled => {},\n" +
+        "            _ => assert(false),\n" +
+        "        }\n" +
+        "        rfds: []i32 = [c.1.fd()]\n" +
+        "        assert(sync.select_ready_cancel(&rfds, &tok, 1000) == -2)\n" +
+        "        assert(await! s2(cid) == 1)\n" +
+        "    }\n" +
+        "    print(\"select_ok\")\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "select_cases", program, "select_ok\n")
+}
+
+fn check_published_snapshots(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "import std.sync as sync\n" +
+        "import sys\n" +
+        "enum Mode {\n" +
+        "    Direct(string),\n" +
+        "    Pooled(i64),\n" +
+        "}\n" +
+        "struct Config {\n" +
+        "    version: i64,\n" +
+        "    host: string,\n" +
+        "    tags: []string,\n" +
+        "    port: Option<i64>,\n" +
+        "    mode: Mode,\n" +
+        "}\n" +
+        "fn read_version_direct(p: &sync.Published<Config>) -> i64 {\n" +
+        "    g := p.read()\n" +
+        "    cfg := g.get()\n" +
+        "    assert(cfg.tags.len >= 2)\n" +
+        "    cfg.version\n" +
+        "}\n" +
+        "struct ReaderArgs { p: sync.Published<Config>, stop: sync.AtomicBool }\n" +
+        "fn reader_worker(move args: ReaderArgs) -> i64 {\n" +
+        "    mut last_ver: i64 = 0\n" +
+        "    mut retained: []Config = []\n" +
+        "    mut retained_modes: []Mode = []\n" +
+        "    mut retained_tags: [][]string = []\n" +
+        "    mut retained_hosts: []string = []\n" +
+        "    mut reads: i64 = 0\n" +
+        "    while !args.stop.load() || reads < 40 {\n" +
+        "        mut cur_ver: i64 = 0\n" +
+        "        {\n" +
+        "            g := args.p.read()\n" +
+        "            r := g.get()\n" +
+        "            cur_ver = r.version\n" +
+        "            assert(cur_ver >= last_ver)\n" +
+        "            assert(r.host == \"svc-\" + cur_ver.str())\n" +
+        "            assert(r.tags.len == 2 && r.tags[0] == \"t0\" && r.tags[1] == cur_ver.str())\n" +
+        "            assert(r.port.unwrap_or(-1) == 8000 + cur_ver)\n" +
+        "            if reads % 7 == 0 {\n" +
+        "                // Clone strings, arrays, enums, and full Config out of ReadGuard and drop g before checking!\n" +
+        "                retained.push(r.clone())\n" +
+        "                retained_modes.push(r.mode.clone())\n" +
+        "                retained_tags.push(r.tags.clone())\n" +
+        "                retained_hosts.push(r.host.clone())\n" +
+        "            }\n" +
+        "        }\n" +
+        "        last_ver = cur_ver\n" +
+        "        reads += 1\n" +
+        "    }\n" +
+        "    for i in 0..retained.len {\n" +
+        "        c := &retained[i]\n" +
+        "        assert(c.host == retained_hosts[i])\n" +
+        "        assert(retained_tags[i].len == 2 && retained_tags[i][1] == c.version.str())\n" +
+        "        match &retained_modes[i] {\n" +
+        "            .Direct(s) => assert(s == \"d-\" + c.version.str()),\n" +
+        "            .Pooled(n) => assert(n == c.version),\n" +
+        "        }\n" +
+        "    }\n" +
+        "    reads\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    ps := sync.Published<i64>::new(100)\n" +
+        "    assert(ps.read().get() == 100)\n" +
+        "    ps.publish(200)\n" +
+        "    assert(ps.read().get() == 200)\n" +
+        "    pa := sync.Published<[]i64>::new([1, 2, 3])\n" +
+        "    {\n" +
+        "        ga := pa.read()\n" +
+        "        arr_ref := ga.get()\n" +
+        "        assert(arr_ref.len == 3 && arr_ref[2] == 3)\n" +
+        "    }\n" +
+        "    pa.publish([4, 5])\n" +
+        "    assert(pa.read().get().len == 2)\n" +
+        "    init_cfg := Config {\n" +
+        "        version: 1,\n" +
+        "        host: \"svc-1\",\n" +
+        "        tags: [\"t0\", \"1\"],\n" +
+        "        port: .Some(8001),\n" +
+        "        mode: .Direct(\"d-1\"),\n" +
+        "    }\n" +
+        "    pub_cfg := sync.Published<Config>::new(move init_cfg)\n" +
+        "    assert(read_version_direct(&pub_cfg) == 1)\n" +
+        "    stop := sync.AtomicBool::new(false)\n" +
+        "    task scope s(4) {\n" +
+        "        mut ids: []TaskID<i64> = []\n" +
+        "        for _ in 0..4 { ids.push(spawn s reader_worker(ReaderArgs { p: pub_cfg.clone_handle(), stop: stop.clone_handle() })) }\n" +
+        "        for v in 2..65 {\n" +
+        "            m := if v % 2 == 0 { Mode.Pooled(i64(v)) } else { Mode.Direct(\"d-\" + v.str()) }\n" +
+        "            pub_cfg.publish(Config {\n" +
+        "                version: i64(v),\n" +
+        "                host: \"svc-\" + v.str(),\n" +
+        "                tags: [\"t0\", v.str()],\n" +
+        "                port: .Some(8000 + i64(v)),\n" +
+        "                mode: move m,\n" +
+        "            })\n" +
+        "            sys.sleep_ms(1)\n" +
+        "        }\n" +
+        "        stop.store(true)\n" +
+        "        for i in 0..ids.len { assert(await! s(ids[i]) >= 40) }\n" +
+        "    }\n" +
+        "    assert(read_version_direct(&pub_cfg) == 64)\n" +
+        "    print(\"published_ok\")\n" +
+        "}"
+    if !build_and_run(&mut journal, compiler, work, "published_snapshots", program, "published_ok\n") {
+        return false
+    }
+
+    // Borrow escape check: ReadGuard::get() cannot escape guard lifetime
+    escape_prog := "import std.sync as sync\n" +
+        "struct Cfg { x: i64 }\n" +
+        "fn leak(p: &sync.Published<Cfg>) -> &Cfg {\n" +
+        "    g := p.read()\n" +
+        "    g.get()\n" +
+        "}\n" +
+        "fn main() { p := sync.Published<Cfg>::new(Cfg { x: 1 }); _ := leak(&p) }"
+    if !check_invalid(&mut journal, compiler, work, "published_escape", escape_prog, "returned borrow must come from its declared shared parameter") {
+        return false
+    }
+
+    // Non-Sendable type in Channel<T> / Published<T> rejected
+    non_send_chan := "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "fn main() { _ := sync.channel<net.StreamSet>(1) }"
+    if !check_invalid(&mut journal, compiler, work, "nonsend_channel", non_send_chan, "does not satisfy Sendable") {
+        return false
+    }
+
+    non_send_pub := "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "fn main() { _ := sync.Published<net.StreamSet>::new(net.StreamSet::new()) }"
+    check_invalid(&mut journal, compiler, work, "nonsend_published", non_send_pub, "does not satisfy Sendable")
+}
+
+fn check_cancel_token_and_signal(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    hier_prog := "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "import sys\n" +
+        "struct WaiterArgs { tok: sync.CancelToken, rx: sync.Receiver<i64> }\n" +
+        "fn waiter_task(move args: WaiterArgs) -> i64 {\n" +
+        "    assert(args.rx.recv_cancel(&args.tok).is_none())\n" +
+        "    args.tok.wait()\n" +
+        "    if args.tok.is_cancelled() { 1 } else { 0 }\n" +
+        "}\n" +
+        "fn cancel_later(move tok: sync.CancelToken) -> i64 {\n" +
+        "    sys.sleep_ms(20)\n" +
+        "    tok.cancel()\n" +
+        "    1\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    parent := sync.CancelToken::new()\n" +
+        "    child := parent.child()\n" +
+        "    grand := child.child()\n" +
+        "    assert(!parent.is_cancelled() && !child.is_cancelled() && !grand.is_cancelled())\n" +
+        "    mut poll := net.PollSet::new()\n" +
+        "    w := poll.waker().unwrap()\n" +
+        "    grand.attach_waker(&w)\n" +
+        "    ch := sync.channel<i64>(2)\n" +
+        "    task scope s(2) {\n" +
+        "        w_id := spawn s waiter_task(WaiterArgs { tok: grand.clone_handle(), rx: move ch.1 })\n" +
+        "        c_id := spawn s cancel_later(parent.clone_handle())\n" +
+        "        mut got_wake := false\n" +
+        "        for _ in 0..8 {\n" +
+        "            _ := poll.poll(2000).unwrap()\n" +
+        "            if poll.woken() { got_wake = true; break }\n" +
+        "        }\n" +
+        "        assert(got_wake)\n" +
+        "        assert(await! s(w_id) == 1 && await! s(c_id) == 1)\n" +
+        "    }\n" +
+        "    assert(parent.is_cancelled() && child.is_cancelled() && grand.is_cancelled())\n" +
+        "    late := parent.child()\n" +
+        "    assert(late.is_cancelled())\n" +
+        "    print(\"cancel_hier_ok\")\n" +
+        "}"
+    if !build_and_run(&mut journal, compiler, work, "cancel_hier", hier_prog, "cancel_hier_ok\n") {
+        return false
+    }
+
+    // Real SIGTERM waking recv_cancel + PollSet::poll via CancelToken::on_shutdown_signals()
+    sig_src := f"{work}/sig_shutdown.ddr"
+    sig_bin := f"{work}/sig_shutdown"
+    sig_prog := "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "struct PollArgs { tok: sync.CancelToken, out: sync.Sender<string> }\n" +
+        "fn poll_worker(move args: PollArgs) -> i32 {\n" +
+        "    mut ps := net.PollSet::new()\n" +
+        "    args.tok.register_poll(&mut ps)\n" +
+        "    while true {\n" +
+        "        _ := ps.poll(5000).unwrap()\n" +
+        "        if args.tok.is_cancelled() {\n" +
+        "            assert(args.out.send(\"poll_cancelled\"))\n" +
+        "            return 1\n" +
+        "        }\n" +
+        "    }\n" +
+        "    0\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    tok := sync.CancelToken::on_shutdown_signals().unwrap()\n" +
+        "    ch := sync.channel<i64>(2)\n" +
+        "    out := sync.channel<string>(2)\n" +
+        "    print(\"READY\")\n" +
+        "    task scope s(2) {\n" +
+        "        pid := spawn s poll_worker(PollArgs { tok: tok.clone_handle(), out: move out.0 })\n" +
+        "        assert(ch.1.recv_cancel(&tok).is_none())\n" +
+        "        msg := out.1.recv().unwrap()\n" +
+        "        assert(await! s(pid) == 1)\n" +
+        "        print(msg)\n" +
+        "    }\n" +
+        "}"
+    mut build_out := harness.empty_output()
+    if !put(sig_src, sig_prog + "\n") ||
+       !journal.run(compiler, ["build", sig_src, "-o", sig_bin.clone()], &mut build_out) {
+        return false
+    }
+
+    mut cmd := process.Command::new(move sig_bin, [])
+    cmd.set_stdio(.Null, .Pipe, .Pipe)
+    sp := cmd.spawn()
+    if sp.is_err() { return harness.fail("failed to spawn sig_shutdown child") }
+    mut child := sp.unwrap()
+    line1 := child.read_stdout_line(5000)
+    mut saw_ready := false
+    match line1 {
+        .Ok(opt) => {
+            if opt.is_some() && opt.unwrap() == "READY" { saw_ready = true }
+        },
+        .Err(_) => {},
+    }
+    if !saw_ready {
+        _ := child.kill()
+        _ := child.wait(2000)
+        return harness.fail("sig_shutdown did not print READY")
+    }
+    term := child.terminate()
+    if !term.ok {
+        _ := child.kill()
+        _ := child.wait(2000)
+        return harness.fail(f"child.terminate() failed: {term.error}")
+    }
+    line2 := child.read_stdout_line(5000)
+    mut saw_cancelled := false
+    match line2 {
+        .Ok(opt) => {
+            if opt.is_some() && opt.unwrap() == "poll_cancelled" { saw_cancelled = true }
+        },
+        .Err(_) => {},
+    }
+    res := child.wait(5000)
+    if !saw_cancelled || !res.exited || res.code != 0 {
+        return harness.fail(f"sig_shutdown unexpected: cancelled={saw_cancelled} exited={res.exited} code={res.code} sig={res.signal}")
+    }
+    true
+}
+
+fn check_pollset_waker(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    program := "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "import sys\n" +
+        "struct WakeArgs { w: net.Waker, tx: sync.Sender<string> }\n" +
+        "fn wake_worker(move args: WakeArgs) -> i32 {\n" +
+        "    sys.sleep_ms(20)\n" +
+        "    args.w.wake()\n" +
+        "    sys.sleep_ms(20)\n" +
+        "    assert(args.tx.send(\"ping\"))\n" +
+        "    1\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut ps := net.PollSet::new()\n" +
+        "    w1 := ps.waker().unwrap()\n" +
+        "    w2 := ps.waker().unwrap()\n" +
+        "    ch := sync.channel<string>(2)\n" +
+        "    ch.1.attach_waker(&w2)\n" +
+        "    t0 := sys.now_ms()\n" +
+        "    task scope s(2) {\n" +
+        "        id := spawn s wake_worker(WakeArgs { w: move w1, tx: move ch.0 })\n" +
+        "        mut woken_direct := false\n" +
+        "        mut woken_chan := false\n" +
+        "        for _ in 0..8 {\n" +
+        "            n := ps.poll(5000).unwrap()\n" +
+        "            assert(n == 0)\n" +
+        "            if ps.woken() { woken_direct = true }\n" +
+        "            match ch.1.try_recv() {\n" +
+        "                .Value(m) => { assert(m == \"ping\"); woken_chan = true; break },\n" +
+        "                .Empty => {},\n" +
+        "                .Closed => break,\n" +
+        "            }\n" +
+        "        }\n" +
+        "        elapsed := sys.now_ms() - t0\n" +
+        "        assert(woken_direct && woken_chan && elapsed < 2000)\n" +
+        "        assert(await! s(id) == 1)\n" +
+        "    }\n" +
+        "    print(\"pollset_waker_ok\")\n" +
+        "}"
+    build_and_run(&mut journal, compiler, work, "pollset_waker", program, "pollset_waker_ok\n")
+}
+
+fn check_cross_compile_linux(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    cross_src := f"{work}/cross_sync.ddr"
+    cross_prog := "import std.net as net\n" +
+        "import std.sync as sync\n" +
+        "struct Cfg { name: string, count: i64 }\n" +
+        "struct WorkerArgs { tx: sync.Sender<string>, pub_cfg: sync.Published<Cfg>, cnt: sync.AtomicI64 }\n" +
+        "fn worker(move args: WorkerArgs) -> i64 {\n" +
+        "    g := args.pub_cfg.read()\n" +
+        "    _ := args.tx.send(g.get().name.clone())\n" +
+        "    args.cnt.fetch_add(g.get().count)\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    cnt := sync.AtomicI64::new(0)\n" +
+        "    sem := sync.Semaphore::new(2)\n" +
+        "    tok := sync.CancelToken::on_shutdown_signals().unwrap()\n" +
+        "    mut ps := net.PollSet::new()\n" +
+        "    w := ps.waker().unwrap()\n" +
+        "    tok.attach_waker(&w)\n" +
+        "    p := sync.Published<Cfg>::new(Cfg { name: \"cfg\", count: 3 })\n" +
+        "    ch := sync.channel<string>(2)\n" +
+        "    task scope s(2) {\n" +
+        "        id := spawn s worker(WorkerArgs { tx: move ch.0, pub_cfg: move p, cnt: cnt.clone_handle() })\n" +
+        "        assert(ch.1.recv_cancel(&tok).unwrap() == \"cfg\")\n" +
+        "        assert(await! s(id) == 0 && sem.available() == 2 && cnt.load() == 3)\n" +
+        "    }\n" +
+        "    tok.cancel()\n" +
+        "}"
+    if !put(cross_src, cross_prog + "\n") { return false }
+    mut output := harness.empty_output()
+    for target in ["arm64-linux", "x86_64-linux"] {
+        out_img := f"{work}/cross-sync-{target}"
+        if !journal.run(compiler, ["check", cross_src.clone(), "--target", target.clone()], &mut output) ||
+           !journal.run(compiler, ["build", cross_src.clone(), "--target", target.clone(), "-o", out_img.clone()], &mut output) {
+            return false
+        }
+        info := sys.metadata(out_img)
+        if !info.ok || info.size < 4096 { return harness.fail(f"{out_img}: invalid cross ELF size") }
+    }
+    true
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = [cli.option("-o"), cli.option("--jobs")]
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_sync_concurrency COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("cannot locate source root"); return 2 }
+    tmp := fs.temp_dir("dunder-sync-concurrency-")
+    if !tmp.ok { _ := harness.fail("cannot create temp dir"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    mut journal := evidence.Journal::new(root, 60000)
+    ok := check_atomics_and_semaphore(&mut journal, compiler, work) &&
+        check_channels_all_types(&mut journal, compiler, work) &&
+        check_select(&mut journal, compiler, work) &&
+        check_published_snapshots(&mut journal, compiler, work) &&
+        check_cancel_token_and_signal(&mut journal, compiler, work) &&
+        check_pollset_waker(&mut journal, compiler, work) &&
+        check_cross_compile_linux(&mut journal, compiler, work)
+    if ok {
+        print("PASS sync concurrency: 7 scenario groups")
+        0
+    } else {
+        1
+    }
+}

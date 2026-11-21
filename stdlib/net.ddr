@@ -52,6 +52,21 @@ unsafe fn c_freeaddrinfo(res: ptr)
 @extern("c", "gai_strerror")
 @thread_safe
 unsafe fn c_gai_strerror(errcode: i32) -> ptr
+@extern("c", "pipe")
+@thread_safe
+unsafe fn net_c_pipe(fds: ptr) -> i32
+@extern("c", "read")
+@thread_safe
+unsafe fn net_c_read(fd: i32, buf: ptr, count: usize) -> i64
+@extern("c", "write")
+@thread_safe
+unsafe fn net_c_write(fd: i32, buf: ptr, count: usize) -> i64
+@extern("c", "mmap")
+@thread_safe
+unsafe fn net_c_mmap(address: ptr, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> ptr
+@extern("c", "munmap")
+@thread_safe
+unsafe fn net_c_munmap(address: ptr, length: usize) -> i32
 
 pub fn poll_in() -> i32 { 1 }
 pub fn poll_out() -> i32 { 4 }
@@ -90,11 +105,18 @@ pub opaque struct StreamSet { fds: []i32 }
 pub opaque struct UdpSocket { fd: i32 }
 impl Sendable for UdpSocket {}
 
+@resource(dispose)
+pub opaque struct Waker { state: ptr }
+impl Sendable for Waker {}
+
+@resource(dispose)
 pub struct PollSet {
     fds: []i32,
     events: []i32,
     revents: []i32,
     scratch: []u8,
+    waker_state: ptr,
+    waker_fired: bool,
 }
 
 fn zero_addr() -> SocketAddr {
@@ -1215,27 +1237,242 @@ impl io.Write for TcpStream {
     }
 }
 
-impl PollSet {
-    pub fn new() -> Self {
-        Self { fds: [], events: [], revents: [], scratch: [] }
+@thread_safe
+unsafe fn waker_block_bytes() -> usize {
+    if target_is("macos") { return usize(16384) }
+    if target_is("linux") { return usize(4096) }
+    usize(64)
+}
+
+@thread_safe
+unsafe fn waker_mmap(length: usize) -> ptr {
+    if target_is("macos") {
+        raw := net_c_mmap(ptr(0), length, 3, 4098, -1, 0)
+        failed := usize(0).wrapping_sub(usize(1))
+        if usize(raw) == usize(0) || usize(raw) == failed { return ptr(0) }
+        return raw
+    }
+    if target_is("linux") {
+        r := sys.linux_syscall(222, 0, i64(length), 3, 34, -1, 0)
+        if r <= 0 { return ptr(0) }
+        return ptr(usize(r))
+    }
+    sys.pool_alloc_try(length)
+}
+
+@thread_safe
+unsafe fn waker_munmap(raw: ptr, length: usize) {
+    if usize(raw) == usize(0) { return }
+    if target_is("macos") {
+        _ := net_c_munmap(raw, length)
+    } else if target_is("linux") {
+        _ := sys.linux_syscall(215, i64(usize(raw)), i64(length), 0, 0, 0, 0)
+    } else {
+        sys.pool_free(raw)
+    }
+}
+
+@thread_safe
+pub unsafe fn waker_retain_raw(state: ptr) {
+    if usize(state) == usize(0) { return }
+    _ := sys.atomic_fetch_add_i64(state, 1)
+}
+
+@thread_safe
+pub unsafe fn waker_wake_raw(state: ptr) {
+    if usize(state) == usize(0) { return }
+    pend := ptr(usize(state) + usize(8))
+    if sys.atomic_cas_i64(pend, 0, 1) != 0 { return }
+    rfd := i32(sys.atomic_load_i64(ptr(usize(state) + usize(16))))
+    wfd := i32(sys.atomic_load_i64(ptr(usize(state) + usize(24))))
+    is_efd := sys.atomic_load_i64(ptr(usize(state) + usize(32))) != 0
+    if is_efd && rfd >= 0 {
+        mut val: u64 = 1
+        _ := sys.linux_syscall(64, i64(rfd), i64(usize(addr(&val))), 8, 0, 0, 0)
+    } else if wfd >= 0 {
+        mut b: i64 = 1
+        if target_is("macos") {
+            _ := net_c_write(wfd, addr(&b), usize(1))
+        } else if target_is("linux") {
+            _ := sys.linux_syscall(64, i64(wfd), i64(usize(addr(&b))), 1, 0, 0, 0)
+        }
+    }
+}
+
+@thread_safe
+pub unsafe fn waker_drain_raw(state: ptr) {
+    if usize(state) == usize(0) { return }
+    pend := ptr(usize(state) + usize(8))
+    rfd := i32(sys.atomic_load_i64(ptr(usize(state) + usize(16))))
+    is_efd := sys.atomic_load_i64(ptr(usize(state) + usize(32))) != 0
+    while true {
+        sys.atomic_store_i64(pend, 0)
+        if is_efd && rfd >= 0 {
+            mut val: u64 = 0
+            while sys.linux_syscall(63, i64(rfd), i64(usize(addr(&mut val))), 8, 0, 0, 0) > 0 {}
+        } else if rfd >= 0 {
+            mut buf: [u64; 8] = [0; 8]
+            if target_is("macos") {
+                while net_c_read(rfd, addr(&mut buf[0]), usize(64)) > 0 {}
+            } else if target_is("linux") {
+                while sys.linux_syscall(63, i64(rfd), i64(usize(addr(&mut buf[0]))), 64, 0, 0, 0) > 0 {}
+            }
+        }
+        if sys.atomic_load_i64(pend) == 0 { break }
+    }
+}
+
+@thread_safe
+pub unsafe fn waker_release_raw(state: ptr) {
+    if usize(state) == usize(0) { return }
+    if sys.atomic_fetch_add_i64(state, -1) != 1 { return }
+    rfd := i32(sys.atomic_load_i64(ptr(usize(state) + usize(16))))
+    wfd := i32(sys.atomic_load_i64(ptr(usize(state) + usize(24))))
+    if rfd >= 0 { _ := sys.fd_close(rfd) }
+    if wfd >= 0 && wfd != rfd { _ := sys.fd_close(wfd) }
+    waker_munmap(state, waker_block_bytes())
+}
+
+impl Waker {
+    @thread_safe
+    pub fn new() -> Result<Self, sys.IoError> {
+        unsafe {
+            blk := waker_block_bytes()
+            st := waker_mmap(blk)
+            if usize(st) == usize(0) { return .Err(.OutOfMemory) }
+            mut rfd: i32 = -1
+            mut wfd: i32 = -1
+            mut is_efd: i64 = 0
+            if target_is("macos") {
+                mut fds_raw: i64 = 0
+                if net_c_pipe(addr(&mut fds_raw)) != 0 {
+                    err := sys.IoError::from_code(macos_errno())
+                    waker_munmap(st, blk)
+                    return .Err(err)
+                }
+                rfd = load_i32(addr(&fds_raw))
+                wfd = load_i32(ptr(usize(addr(&fds_raw)) + usize(4)))
+                _ := sys.fd_set_nonblocking(rfd, true)
+                _ := sys.fd_set_nonblocking(wfd, true)
+                _ := c_ioctl(rfd, usize(536897025))
+                _ := c_ioctl(wfd, usize(536897025))
+            } else if target_is("linux") {
+                efd := sys.linux_syscall(19, 0, 526336, 0, 0, 0, 0)
+                if efd < 0 {
+                    waker_munmap(st, blk)
+                    return .Err(sys.IoError::from_code(i32(-efd)))
+                }
+                rfd = i32(efd)
+                wfd = -1
+                is_efd = 1
+            }
+            sys.atomic_store_i64(st, 1)
+            sys.atomic_store_i64(ptr(usize(st) + usize(8)), 0)
+            sys.atomic_store_i64(ptr(usize(st) + usize(16)), i64(rfd))
+            sys.atomic_store_i64(ptr(usize(st) + usize(24)), i64(wfd))
+            sys.atomic_store_i64(ptr(usize(st) + usize(32)), is_efd)
+            .Ok(Self { state: st })
+        }
     }
 
+    @thread_safe
+    pub fn clone_handle(&self) -> Self {
+        unsafe {
+            waker_retain_raw(self.state)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn wake(&self) {
+        unsafe { waker_wake_raw(self.state) }
+    }
+
+    @thread_safe
+    pub fn drain(&self) {
+        unsafe { waker_drain_raw(self.state) }
+    }
+
+    @thread_safe
+    pub fn fd(&self) -> i32 {
+        unsafe {
+            if usize(self.state) == usize(0) { return -1 }
+            return i32(sys.atomic_load_i64(ptr(usize(self.state) + usize(16))))
+        }
+        -1
+    }
+
+    @thread_safe
+    pub unsafe fn raw_state(&self) -> ptr { self.state }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            waker_release_raw(st)
+        }
+    }
+}
+
+impl PollSet {
+    @thread_safe
+    pub fn new() -> Self {
+        unsafe {
+            return Self { fds: [], events: [], revents: [], scratch: [], waker_state: ptr(0), waker_fired: false }
+        }
+        unsafe { Self { fds: [], events: [], revents: [], scratch: [], waker_state: ptr(0), waker_fired: false } }
+    }
+
+    @thread_safe
+    pub fn waker(&mut self) -> Result<Waker, sys.IoError> {
+        unsafe {
+            if usize(self.waker_state) == usize(0) {
+                w := Waker::new()?
+                st := w.raw_state()
+                waker_retain_raw(st)
+                self.waker_state = st
+                return .Ok(w)
+            }
+            waker_retain_raw(self.waker_state)
+            return .Ok(Waker { state: self.waker_state })
+        }
+        .Err(.Unsupported)
+    }
+
+    @thread_safe
+    pub fn woken(&self) -> bool { self.waker_fired }
+
+    @thread_safe
     pub fn clear(&mut self) {
         self.fds.clear()
         self.events.clear()
         self.revents.clear()
+        self.waker_fired = false
     }
 
+    @thread_safe
     pub fn add(&mut self, fd: i32, events: i32) {
         self.fds.push(fd)
         self.events.push(events)
         self.revents.push(0)
     }
 
+    @thread_safe
     pub fn poll(&mut self, timeout_ms: i32) -> Result<i32, sys.IoError> {
+        self.waker_fired = false
         count := self.fds.len
         assert(self.events.len == count && self.revents.len == count)
-        need := count * 8
+        mut waker_fd: i32 = -1
+        unsafe {
+            if usize(self.waker_state) != usize(0) {
+                waker_fd = i32(sys.atomic_load_i64(ptr(usize(self.waker_state) + usize(16))))
+            }
+        }
+        has_waker := waker_fd >= 0
+        total := if has_waker { count + 1 } else { count }
+        need := total * 8
         if self.scratch.len < need {
             self.scratch.reserve(need)
             while self.scratch.len < need { self.scratch.push(0) }
@@ -1253,7 +1490,20 @@ impl PollSet {
             self.scratch[base + 6] = 0
             self.scratch[base + 7] = 0
         }
-        n := sys.net_poll(&mut self.scratch, i64(count), i64(timeout_ms))
+        if has_waker {
+            base := count * 8
+            wu := i64(waker_fd).bit_and(0xffffffff)
+            self.scratch[base] = u8(wu.bit_and(0xff))
+            self.scratch[base + 1] = u8(wu.shr(8).bit_and(0xff))
+            self.scratch[base + 2] = u8(wu.shr(16).bit_and(0xff))
+            self.scratch[base + 3] = u8(wu.shr(24).bit_and(0xff))
+            self.scratch[base + 4] = 1
+            self.scratch[base + 5] = 0
+            self.scratch[base + 6] = 0
+            self.scratch[base + 7] = 0
+        }
+        mut n: i64 = 0
+        unsafe { n = sys.fd_poll(&mut self.scratch, i64(total), i64(timeout_ms)) }
         if n < 0 { return .Err(sys.IoError::from_code(i32(-n))) }
         for i in 0..count {
             base := i * 8
@@ -1261,7 +1511,26 @@ impl PollSet {
             hi := i32(self.scratch[base + 7])
             self.revents[i] = lo + hi.shl(8)
         }
-        .Ok(i32(n))
+        mut ready := i32(n)
+        if has_waker {
+            wbase := count * 8
+            wrev := i32(self.scratch[wbase + 6]) + i32(self.scratch[wbase + 7]).shl(8)
+            if wrev != 0 {
+                self.waker_fired = true
+                if ready > 0 { ready -= 1 }
+                unsafe { waker_drain_raw(self.waker_state) }
+            }
+        }
+        .Ok(ready)
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.waker_state
+            self.waker_state = ptr(0)
+            waker_release_raw(st)
+        }
     }
 }
 

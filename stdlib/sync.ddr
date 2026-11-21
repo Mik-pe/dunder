@@ -1,0 +1,1937 @@
+capability unsafe
+
+import std.net as net
+import std.signal as signal
+import sys
+
+@extern("c", "pipe")
+@thread_safe
+unsafe fn sync_c_pipe(fds: ptr) -> i32
+@extern("c", "read")
+@thread_safe
+unsafe fn sync_c_read(fd: i32, buf: ptr, count: usize) -> i64
+@extern("c", "write")
+@thread_safe
+unsafe fn sync_c_write(fd: i32, buf: ptr, count: usize) -> i64
+@extern("c", "ioctl")
+@thread_safe
+unsafe fn sync_c_ioctl(fd: i32, req: usize) -> i32
+@extern("c", "mmap")
+@thread_safe
+unsafe fn sync_c_mmap(address: ptr, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> ptr
+@extern("c", "munmap")
+@thread_safe
+unsafe fn sync_c_munmap(address: ptr, length: usize) -> i32
+
+@thread_safe
+unsafe fn sync_page_bytes() -> usize {
+    if target_is("macos") { return usize(16384) }
+    if target_is("linux") { return usize(4096) }
+    usize(4096)
+}
+
+@thread_safe
+unsafe fn mini_pool_bytes() -> i64 { 16384 }
+
+@thread_safe
+unsafe fn align_up(value: usize, align: usize) -> usize {
+    rem := value % align
+    if rem == usize(0) { value } else { value + (align - rem) }
+}
+
+@thread_safe
+unsafe fn sync_mmap(length: usize) -> ptr {
+    if target_is("macos") {
+        raw := sync_c_mmap(ptr(0), length, 3, 4098, -1, 0)
+        failed := usize(0).wrapping_sub(usize(1))
+        assert(usize(raw) != usize(0) && usize(raw) != failed)
+        return raw
+    }
+    if target_is("linux") {
+        r := sys.linux_syscall(222, 0, i64(length), 3, 34, -1, 0)
+        assert(r > 0)
+        return ptr(usize(r))
+    }
+    raw := sys.pool_alloc_try(length)
+    assert(usize(raw) != usize(0))
+    sys.memory_zero(raw, length)
+    raw
+}
+
+@thread_safe
+unsafe fn sync_munmap(raw: ptr, length: usize) {
+    if usize(raw) == usize(0) { return }
+    if target_is("macos") {
+        _ := sync_c_munmap(raw, length)
+    } else if target_is("linux") {
+        _ := sys.linux_syscall(215, i64(usize(raw)), i64(length), 0, 0, 0, 0)
+    } else {
+        sys.pool_free(raw)
+    }
+}
+
+@thread_safe
+unsafe fn unmap_extra_slabs(pool: ptr) {
+    mut extra := load_ptr(ptr(usize(pool) + usize(240)))
+    store_ptr(ptr(usize(pool) + usize(240)), ptr(0))
+    while usize(extra) != usize(0) {
+        next := load_ptr(extra)
+        slab_len := load_i64(ptr(usize(extra) + usize(8)))
+        sync_munmap(extra, usize(slab_len))
+        extra = next
+    }
+}
+
+@thread_safe
+unsafe fn reset_mini_pool(pool: ptr) {
+    if usize(pool) == usize(0) || !target_is("native") { return }
+    unmap_extra_slabs(pool)
+    sys.memory_zero(pool, usize(512))
+}
+
+@thread_safe
+unsafe fn unmap_mini_pool(pool: ptr, pool_size: i64) {
+    if usize(pool) == usize(0) { return }
+    if target_is("native") {
+        unmap_extra_slabs(pool)
+        sync_munmap(pool, usize(pool_size))
+    } else {
+        sys.pool_free(pool)
+    }
+}
+
+@thread_safe
+unsafe fn spin_lock(lock: ptr) {
+    mut spins: i32 = 0
+    while sys.atomic_cas_i64(lock, 0, 1) != 0 {
+        spins += 1
+        if spins >= 64 {
+            sys.sleep_ms(1)
+            spins = 0
+        }
+    }
+}
+
+@thread_safe
+unsafe fn spin_unlock(lock: ptr) {
+    sys.atomic_store_i64(lock, 0)
+}
+
+@thread_safe
+unsafe fn wake_pair_open() -> (i32, i32, i64) {
+    if target_is("macos") {
+        mut fds_raw: i64 = 0
+        assert(sync_c_pipe(addr(&mut fds_raw)) == 0)
+        rfd := load_i32(addr(&fds_raw))
+        wfd := load_i32(ptr(usize(addr(&fds_raw)) + usize(4)))
+        _ := sys.fd_set_nonblocking(rfd, true)
+        _ := sys.fd_set_nonblocking(wfd, true)
+        _ := sync_c_ioctl(rfd, usize(536897025))
+        _ := sync_c_ioctl(wfd, usize(536897025))
+        return (rfd, wfd, 0)
+    }
+    if target_is("linux") {
+        efd := sys.linux_syscall(19, 0, 526336, 0, 0, 0, 0)
+        assert(efd >= 0)
+        return (i32(efd), -1, 1)
+    }
+    (-1, -1, 0)
+}
+
+@thread_safe
+unsafe fn wake_pair_signal(rfd: i32, wfd: i32, is_efd: i64) {
+    if is_efd != 0 && rfd >= 0 {
+        mut val: u64 = 1
+        _ := sys.linux_syscall(64, i64(rfd), i64(usize(addr(&val))), 8, 0, 0, 0)
+    } else if wfd >= 0 {
+        mut b: i64 = 1
+        if target_is("macos") {
+            _ := sync_c_write(wfd, addr(&b), usize(1))
+        } else if target_is("linux") {
+            _ := sys.linux_syscall(64, i64(wfd), i64(usize(addr(&b))), 1, 0, 0, 0)
+        }
+    }
+}
+
+@thread_safe
+unsafe fn wake_pair_drain(rfd: i32, is_efd: i64) {
+    if is_efd != 0 && rfd >= 0 {
+        mut val: u64 = 0
+        while sys.linux_syscall(63, i64(rfd), i64(usize(addr(&mut val))), 8, 0, 0, 0) > 0 {}
+    } else if rfd >= 0 {
+        mut buf: [u64; 8] = [0; 8]
+        if target_is("macos") {
+            while sync_c_read(rfd, addr(&mut buf[0]), usize(64)) > 0 {}
+        } else if target_is("linux") {
+            while sys.linux_syscall(63, i64(rfd), i64(usize(addr(&mut buf[0]))), 64, 0, 0, 0) > 0 {}
+        }
+    }
+}
+
+@thread_safe
+unsafe fn wake_pair_close(rfd: i32, wfd: i32, is_efd: i64) {
+    if rfd >= 0 { _ := sys.fd_close(rfd) }
+    if is_efd == 0 && wfd >= 0 && wfd != rfd { _ := sys.fd_close(wfd) }
+}
+
+@thread_safe
+unsafe fn poll_wait_raw(fds: &[]i32, timeout_ms: i64, revents_out: &mut []i32) -> i32 {
+    count := fds.len
+    revents_out.clear()
+    for _ in 0..count { revents_out.push(0) }
+    if count == 0 {
+        if timeout_ms > 0 { sys.sleep_ms(timeout_ms) }
+        return 0
+    }
+    mut pfd: []u8 = []
+    pfd.reserve(count * 8)
+    for _ in 0..(count * 8) { pfd.push(0) }
+    for i in 0..count {
+        base := i * 8
+        u := i64(fds[i]).bit_and(0xffffffff)
+        pfd[base] = u8(u.bit_and(0xff))
+        pfd[base + 1] = u8(u.shr(8).bit_and(0xff))
+        pfd[base + 2] = u8(u.shr(16).bit_and(0xff))
+        pfd[base + 3] = u8(u.shr(24).bit_and(0xff))
+        pfd[base + 4] = 1
+        pfd[base + 5] = 0
+        pfd[base + 6] = 0
+        pfd[base + 7] = 0
+    }
+    n := sys.fd_poll(&mut pfd, i64(count), timeout_ms)
+    if n < 0 { return i32(n) }
+    for i in 0..count {
+        base := i * 8
+        revents_out[i] = i32(pfd[base + 6]) + i32(pfd[base + 7]).shl(8)
+    }
+    i32(n)
+}
+
+@thread_safe
+unsafe fn poll_fd_ready_zero(fd: i32) -> bool {
+    if fd < 0 { return false }
+    fds: []i32 = [fd]
+    mut revs: []i32 = []
+    n := poll_wait_raw(&fds, 0, &mut revs)
+    n > 0 && revs[0] != 0
+}
+
+// =========================================================================
+// AtomicI64 & AtomicBool
+// =========================================================================
+
+@resource(dispose)
+pub opaque struct AtomicI64 { state: ptr }
+impl Sendable for AtomicI64 {}
+
+impl AtomicI64 {
+    @thread_safe
+    pub fn new(initial: i64) -> Self {
+        unsafe {
+            st := sync_mmap(sync_page_bytes())
+            sys.atomic_store_i64(st, 1)
+            sys.atomic_store_i64(ptr(usize(st) + usize(8)), initial)
+            return Self { state: st }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn clone_handle(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn load(&self) -> i64 {
+        unsafe { return sys.atomic_load_i64(ptr(usize(self.state) + usize(8))) }
+        0
+    }
+
+    @thread_safe
+    pub fn store(&self, value: i64) {
+        unsafe { sys.atomic_store_i64(ptr(usize(self.state) + usize(8)), value) }
+    }
+
+    @thread_safe
+    pub fn swap(&self, value: i64) -> i64 {
+        unsafe {
+            val_ptr := ptr(usize(self.state) + usize(8))
+            while true {
+                cur := sys.atomic_load_i64(val_ptr)
+                if sys.atomic_cas_i64(val_ptr, cur, value) == cur { return cur }
+            }
+        }
+        0
+    }
+
+    @thread_safe
+    pub fn compare_exchange(&self, expected: i64, desired: i64) -> (bool, i64) {
+        unsafe {
+            prev := sys.atomic_cas_i64(ptr(usize(self.state) + usize(8)), expected, desired)
+            return (prev == expected, prev)
+        }
+        (false, 0)
+    }
+
+    @thread_safe
+    pub fn fetch_add(&self, delta: i64) -> i64 {
+        unsafe { return sys.atomic_fetch_add_i64(ptr(usize(self.state) + usize(8)), delta) }
+        0
+    }
+
+    @thread_safe
+    pub fn fetch_sub(&self, delta: i64) -> i64 {
+        self.fetch_add(-delta)
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            if usize(st) == usize(0) { return }
+            if sys.atomic_fetch_add_i64(st, -1) == 1 {
+                sync_munmap(st, sync_page_bytes())
+            }
+        }
+    }
+}
+
+@resource(dispose)
+pub opaque struct AtomicBool { state: ptr }
+impl Sendable for AtomicBool {}
+
+impl AtomicBool {
+    @thread_safe
+    pub fn new(initial: bool) -> Self {
+        unsafe {
+            st := sync_mmap(sync_page_bytes())
+            sys.atomic_store_i64(st, 1)
+            sys.atomic_store_i64(ptr(usize(st) + usize(8)), if initial { 1 } else { 0 })
+            return Self { state: st }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn clone_handle(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn load(&self) -> bool {
+        unsafe { return sys.atomic_load_i64(ptr(usize(self.state) + usize(8))) != 0 }
+        false
+    }
+
+    @thread_safe
+    pub fn store(&self, value: bool) {
+        unsafe { sys.atomic_store_i64(ptr(usize(self.state) + usize(8)), if value { 1 } else { 0 }) }
+    }
+
+    @thread_safe
+    pub fn swap(&self, value: bool) -> bool {
+        unsafe {
+            val_ptr := ptr(usize(self.state) + usize(8))
+            des: i64 = if value { 1 } else { 0 }
+            while true {
+                cur := sys.atomic_load_i64(val_ptr)
+                if sys.atomic_cas_i64(val_ptr, cur, des) == cur { return cur != 0 }
+            }
+        }
+        false
+    }
+
+    @thread_safe
+    pub fn compare_exchange(&self, expected: bool, desired: bool) -> (bool, bool) {
+        unsafe {
+            exp: i64 = if expected { 1 } else { 0 }
+            des: i64 = if desired { 1 } else { 0 }
+            prev := sys.atomic_cas_i64(ptr(usize(self.state) + usize(8)), exp, des)
+            return (prev == exp, prev != 0)
+        }
+        (false, false)
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            if usize(st) == usize(0) { return }
+            if sys.atomic_fetch_add_i64(st, -1) == 1 {
+                sync_munmap(st, sync_page_bytes())
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Semaphore & SemaphorePermit
+// Layout (page):
+//   [0]  refcount
+//   [8]  lock
+//   [16] permits
+//   [24] rfd
+//   [32] wfd
+//   [40] is_efd
+//   [48] signaled (level-triggered: permits > 0)
+// =========================================================================
+
+@resource(dispose)
+pub opaque struct Semaphore { state: ptr }
+impl Sendable for Semaphore {}
+
+@resource(dispose)
+pub opaque struct SemaphorePermit { state: ptr }
+impl Sendable for SemaphorePermit {}
+
+@thread_safe
+unsafe fn sem_release_raw(st: ptr, count: i64) {
+    assert(count > 0)
+    spin_lock(ptr(usize(st) + usize(8)))
+    p_ptr := ptr(usize(st) + usize(16))
+    prev := sys.atomic_load_i64(p_ptr)
+    next := prev + count
+    sys.atomic_store_i64(p_ptr, next)
+    sig_ptr := ptr(usize(st) + usize(48))
+    if next > 0 && sys.atomic_load_i64(sig_ptr) == 0 {
+        rfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(24))))
+        wfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(32))))
+        is_efd := sys.atomic_load_i64(ptr(usize(st) + usize(40)))
+        wake_pair_signal(rfd, wfd, is_efd)
+        sys.atomic_store_i64(sig_ptr, 1)
+    }
+    spin_unlock(ptr(usize(st) + usize(8)))
+}
+
+@thread_safe
+unsafe fn sem_try_acquire_raw(st: ptr) -> bool {
+    spin_lock(ptr(usize(st) + usize(8)))
+    p_ptr := ptr(usize(st) + usize(16))
+    cur := sys.atomic_load_i64(p_ptr)
+    mut ok := false
+    if cur > 0 {
+        next := cur - 1
+        sys.atomic_store_i64(p_ptr, next)
+        if next == 0 {
+            sig_ptr := ptr(usize(st) + usize(48))
+            if sys.atomic_load_i64(sig_ptr) != 0 {
+                rfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(24))))
+                is_efd := sys.atomic_load_i64(ptr(usize(st) + usize(40)))
+                wake_pair_drain(rfd, is_efd)
+                sys.atomic_store_i64(sig_ptr, 0)
+            }
+        }
+        ok = true
+    }
+    spin_unlock(ptr(usize(st) + usize(8)))
+    ok
+}
+
+@thread_safe
+unsafe fn sem_state_drop(st: ptr) {
+    if usize(st) == usize(0) { return }
+    if sys.atomic_fetch_add_i64(st, -1) != 1 { return }
+    rfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(24))))
+    wfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(32))))
+    is_efd := sys.atomic_load_i64(ptr(usize(st) + usize(40)))
+    wake_pair_close(rfd, wfd, is_efd)
+    sync_munmap(st, sync_page_bytes())
+}
+
+impl Semaphore {
+    @thread_safe
+    pub fn new(permits: i64) -> Self {
+        assert(permits >= 0)
+        unsafe {
+            st := sync_mmap(sync_page_bytes())
+            pair := wake_pair_open()
+            sys.atomic_store_i64(st, 1)
+            sys.atomic_store_i64(ptr(usize(st) + usize(8)), 0)
+            sys.atomic_store_i64(ptr(usize(st) + usize(16)), permits)
+            sys.atomic_store_i64(ptr(usize(st) + usize(24)), i64(pair.0))
+            sys.atomic_store_i64(ptr(usize(st) + usize(32)), i64(pair.1))
+            sys.atomic_store_i64(ptr(usize(st) + usize(40)), pair.2)
+            if permits > 0 {
+                wake_pair_signal(pair.0, pair.1, pair.2)
+                sys.atomic_store_i64(ptr(usize(st) + usize(48)), 1)
+            } else {
+                sys.atomic_store_i64(ptr(usize(st) + usize(48)), 0)
+            }
+            return Self { state: st }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn clone_handle(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn available(&self) -> i64 {
+        unsafe { return sys.atomic_load_i64(ptr(usize(self.state) + usize(16))) }
+        0
+    }
+
+    @thread_safe
+    pub fn try_acquire(&self) -> bool {
+        unsafe { return sem_try_acquire_raw(self.state) }
+        false
+    }
+
+    @thread_safe
+    pub fn acquire(&self) {
+        _ := self.acquire_timeout(-1)
+    }
+
+    @thread_safe
+    pub fn acquire_timeout(&self, timeout_ms: i64) -> bool {
+        unsafe {
+            if sem_try_acquire_raw(self.state) { return true }
+            if timeout_ms == 0 { return false }
+            deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+            rfd := i32(sys.atomic_load_i64(ptr(usize(self.state) + usize(24))))
+            fds: []i32 = [rfd]
+            mut revs: []i32 = []
+            while true {
+                if sem_try_acquire_raw(self.state) { return true }
+                mut delay: i64 = -1
+                if timeout_ms > 0 {
+                    rem := deadline - sys.now_ms()
+                    if rem <= 0 { return sem_try_acquire_raw(self.state) }
+                    delay = rem
+                }
+                if rfd < 0 {
+                    sys.sleep_ms(if delay < 0 || delay > 1 { 1 } else { delay })
+                    continue
+                }
+                _ := poll_wait_raw(&fds, delay, &mut revs)
+            }
+        }
+        false
+    }
+
+    @thread_safe
+    pub fn try_acquire_permit(&self) -> Option<SemaphorePermit> {
+        unsafe {
+            if !sem_try_acquire_raw(self.state) { return .None }
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return .Some(SemaphorePermit { state: self.state })
+        }
+        .None
+    }
+
+    @thread_safe
+    pub fn acquire_permit(&self) -> SemaphorePermit {
+        self.acquire()
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return SemaphorePermit { state: self.state }
+        }
+        unsafe { SemaphorePermit { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn release(&self) {
+        unsafe { sem_release_raw(self.state, 1) }
+    }
+
+    @thread_safe
+    pub fn release_many(&self, count: i64) {
+        unsafe { sem_release_raw(self.state, count) }
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            sem_state_drop(st)
+        }
+    }
+}
+
+impl SemaphorePermit {
+    @thread_safe
+    pub fn release(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            if usize(st) == usize(0) { return }
+            sem_release_raw(st, 1)
+            sem_state_drop(st)
+        }
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        self.release()
+    }
+}
+
+// =========================================================================
+// CancelToken (integrated with std.signal & net.Waker)
+// Layout (page):
+//   [0]   refcount
+//   [8]   cancelled (0/1)
+//   [16]  lock
+//   [24]  rfd
+//   [32]  wfd
+//   [40]  is_efd
+//   [48]  sig_fd (-1 if none)
+//   [56]  sig_mask
+//   [64]  owns_sig (1 if dispose calls signal.close_raw_watcher)
+//   [72]  children_ptr (mmap ptr array of child CancelToken state ptrs)
+//   [80]  children_len
+//   [88]  children_cap
+//   [96]  wakers_ptr (mmap ptr array of retained net.Waker state ptrs)
+//   [104] wakers_len
+//   [112] wakers_cap
+//   [120] children_bytes
+//   [128] wakers_bytes
+// =========================================================================
+
+@resource(dispose)
+pub opaque struct CancelToken { state: ptr }
+impl Sendable for CancelToken {}
+
+@thread_safe
+unsafe fn cancel_token_alloc(sig_fd: i32, sig_mask: u32, owns_sig: i64, cancelled_init: i64) -> ptr {
+    st := sync_mmap(sync_page_bytes())
+    pair := wake_pair_open()
+    sys.atomic_store_i64(st, 1)
+    sys.atomic_store_i64(ptr(usize(st) + usize(8)), cancelled_init)
+    sys.atomic_store_i64(ptr(usize(st) + usize(16)), 0)
+    sys.atomic_store_i64(ptr(usize(st) + usize(24)), i64(pair.0))
+    sys.atomic_store_i64(ptr(usize(st) + usize(32)), i64(pair.1))
+    sys.atomic_store_i64(ptr(usize(st) + usize(40)), pair.2)
+    sys.atomic_store_i64(ptr(usize(st) + usize(48)), i64(sig_fd))
+    sys.atomic_store_i64(ptr(usize(st) + usize(56)), i64(sig_mask))
+    sys.atomic_store_i64(ptr(usize(st) + usize(64)), owns_sig)
+    store_ptr(ptr(usize(st) + usize(72)), ptr(0))
+    store_i64(ptr(usize(st) + usize(80)), 0)
+    store_i64(ptr(usize(st) + usize(88)), 0)
+    store_ptr(ptr(usize(st) + usize(96)), ptr(0))
+    store_i64(ptr(usize(st) + usize(104)), 0)
+    store_i64(ptr(usize(st) + usize(112)), 0)
+    store_i64(ptr(usize(st) + usize(120)), 0)
+    store_i64(ptr(usize(st) + usize(128)), 0)
+    if cancelled_init != 0 {
+        wake_pair_signal(pair.0, pair.1, pair.2)
+    }
+    st
+}
+
+@thread_safe
+unsafe fn cancel_push_ptr(list_slot: ptr, len_slot: ptr, cap_slot: ptr, bytes_slot: ptr, item: ptr) {
+    mut arr := load_ptr(list_slot)
+    n := load_i64(len_slot)
+    mut cap := load_i64(cap_slot)
+    if n >= cap {
+        mut next_cap := cap * 2
+        if next_cap < 16 { next_cap = 16 }
+        page := sync_page_bytes()
+        next_bytes := align_up(usize(next_cap) * usize(8), page)
+        next_arr := sync_mmap(next_bytes)
+        if n > 0 && usize(arr) != usize(0) {
+            sys.memory_copy(next_arr, arr, usize(n) * usize(8))
+        }
+        if usize(arr) != usize(0) {
+            old_bytes := load_i64(bytes_slot)
+            sync_munmap(arr, usize(old_bytes))
+        }
+        arr = next_arr
+        cap = i64(next_bytes / usize(8))
+        store_ptr(list_slot, arr)
+        store_i64(cap_slot, cap)
+        store_i64(bytes_slot, i64(next_bytes))
+    }
+    store_ptr(ptr(usize(arr) + usize(n) * usize(8)), item)
+    store_i64(len_slot, n + 1)
+}
+
+@thread_safe
+unsafe fn cancel_state_release(st: ptr) {
+    if usize(st) == usize(0) { return }
+    if sys.atomic_fetch_add_i64(st, -1) != 1 { return }
+    c_arr := load_ptr(ptr(usize(st) + usize(72)))
+    c_len := load_i64(ptr(usize(st) + usize(80)))
+    c_bytes := load_i64(ptr(usize(st) + usize(120)))
+    for i in 0..i32(c_len) {
+        child_st := load_ptr(ptr(usize(c_arr) + usize(i) * usize(8)))
+        cancel_state_release(child_st)
+    }
+    if usize(c_arr) != usize(0) { sync_munmap(c_arr, usize(c_bytes)) }
+    w_arr := load_ptr(ptr(usize(st) + usize(96)))
+    w_len := load_i64(ptr(usize(st) + usize(104)))
+    w_bytes := load_i64(ptr(usize(st) + usize(128)))
+    for i in 0..i32(w_len) {
+        w_st := load_ptr(ptr(usize(w_arr) + usize(i) * usize(8)))
+        net.waker_release_raw(w_st)
+    }
+    if usize(w_arr) != usize(0) { sync_munmap(w_arr, usize(w_bytes)) }
+    rfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(24))))
+    wfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(32))))
+    is_efd := sys.atomic_load_i64(ptr(usize(st) + usize(40)))
+    wake_pair_close(rfd, wfd, is_efd)
+    sfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(48))))
+    smask := u32(sys.atomic_load_i64(ptr(usize(st) + usize(56))))
+    owns_sig := sys.atomic_load_i64(ptr(usize(st) + usize(64)))
+    if owns_sig != 0 && sfd >= 0 {
+        signal.close_raw_watcher(sfd, smask)
+    }
+    sync_munmap(st, sync_page_bytes())
+}
+
+@thread_safe
+unsafe fn cancel_state_fire(st: ptr) {
+    if usize(st) == usize(0) { return }
+    if sys.atomic_cas_i64(ptr(usize(st) + usize(8)), 0, 1) != 0 { return }
+    rfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(24))))
+    wfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(32))))
+    is_efd := sys.atomic_load_i64(ptr(usize(st) + usize(40)))
+    wake_pair_signal(rfd, wfd, is_efd)
+    spin_lock(ptr(usize(st) + usize(16)))
+    c_arr := load_ptr(ptr(usize(st) + usize(72)))
+    c_len := load_i64(ptr(usize(st) + usize(80)))
+    c_bytes := load_i64(ptr(usize(st) + usize(120)))
+    store_ptr(ptr(usize(st) + usize(72)), ptr(0))
+    store_i64(ptr(usize(st) + usize(80)), 0)
+    store_i64(ptr(usize(st) + usize(88)), 0)
+    store_i64(ptr(usize(st) + usize(120)), 0)
+    w_arr := load_ptr(ptr(usize(st) + usize(96)))
+    w_len := load_i64(ptr(usize(st) + usize(104)))
+    w_bytes := load_i64(ptr(usize(st) + usize(128)))
+    store_ptr(ptr(usize(st) + usize(96)), ptr(0))
+    store_i64(ptr(usize(st) + usize(104)), 0)
+    store_i64(ptr(usize(st) + usize(112)), 0)
+    store_i64(ptr(usize(st) + usize(128)), 0)
+    spin_unlock(ptr(usize(st) + usize(16)))
+    for i in 0..i32(c_len) {
+        child_st := load_ptr(ptr(usize(c_arr) + usize(i) * usize(8)))
+        cancel_state_fire(child_st)
+        cancel_state_release(child_st)
+    }
+    if usize(c_arr) != usize(0) { sync_munmap(c_arr, usize(c_bytes)) }
+    for i in 0..i32(w_len) {
+        w_st := load_ptr(ptr(usize(w_arr) + usize(i) * usize(8)))
+        net.waker_wake_raw(w_st)
+        net.waker_release_raw(w_st)
+    }
+    if usize(w_arr) != usize(0) { sync_munmap(w_arr, usize(w_bytes)) }
+}
+
+@thread_safe
+unsafe fn cancel_state_is_cancelled(st: ptr) -> bool {
+    if usize(st) == usize(0) { return false }
+    if sys.atomic_load_i64(ptr(usize(st) + usize(8))) != 0 { return true }
+    sfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(48))))
+    if sfd >= 0 && poll_fd_ready_zero(sfd) {
+        cancel_state_fire(st)
+        return true
+    }
+    false
+}
+
+@thread_safe
+unsafe fn cancel_collect_fds(st: ptr, out: &mut []i32) {
+    if usize(st) == usize(0) { return }
+    rfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(24))))
+    if rfd >= 0 { out.push(rfd) }
+    sfd := i32(sys.atomic_load_i64(ptr(usize(st) + usize(48))))
+    if sfd >= 0 { out.push(sfd) }
+}
+
+impl CancelToken {
+    @thread_safe
+    pub fn new() -> Self {
+        unsafe { return Self { state: cancel_token_alloc(-1, u32(0), 0, 0) } }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn from_signal_watcher(mut move watcher: signal.SignalWatcher) -> Result<Self, sys.IoError> {
+        mask := watcher.mask()
+        fd := watcher.detach_fd()
+        if fd < 0 { return .Err(.BadDescriptor) }
+        unsafe { return .Ok(Self { state: cancel_token_alloc(fd, mask, 1, 0) }) }
+        .Err(.Unsupported)
+    }
+
+    @thread_safe
+    pub fn on_shutdown_signals() -> Result<Self, sys.IoError> {
+        w := signal.SignalWatcher::shutdown()?
+        Self::from_signal_watcher(move w)
+    }
+
+    pub fn from_shutdown_handler() -> Self {
+        fd := signal.shutdown_fd()
+        triggered := if signal.shutdown_requested() { i64(1) } else { i64(0) }
+        unsafe { return Self { state: cancel_token_alloc(fd, u32(0), 0, triggered) } }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn clone_handle(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn child(&self) -> Self {
+        unsafe {
+            if cancel_state_is_cancelled(self.state) {
+                return Self { state: cancel_token_alloc(-1, u32(0), 0, 1) }
+            }
+            c_st := cancel_token_alloc(-1, u32(0), 0, 0)
+            _ := sys.atomic_fetch_add_i64(c_st, 1)
+            spin_lock(ptr(usize(self.state) + usize(16)))
+            already := sys.atomic_load_i64(ptr(usize(self.state) + usize(8))) != 0
+            if !already {
+                cancel_push_ptr(
+                    ptr(usize(self.state) + usize(72)),
+                    ptr(usize(self.state) + usize(80)),
+                    ptr(usize(self.state) + usize(88)),
+                    ptr(usize(self.state) + usize(120)),
+                    c_st
+                )
+            }
+            spin_unlock(ptr(usize(self.state) + usize(16)))
+            if already {
+                cancel_state_fire(c_st)
+                cancel_state_release(c_st)
+            }
+            return Self { state: c_st }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn cancel(&self) {
+        unsafe { cancel_state_fire(self.state) }
+    }
+
+    @thread_safe
+    pub fn is_cancelled(&self) -> bool {
+        unsafe { return cancel_state_is_cancelled(self.state) }
+        false
+    }
+
+    @thread_safe
+    pub fn fd(&self) -> i32 {
+        unsafe { return i32(sys.atomic_load_i64(ptr(usize(self.state) + usize(24)))) }
+        -1
+    }
+
+    @thread_safe
+    pub fn signal_fd(&self) -> i32 {
+        unsafe { return i32(sys.atomic_load_i64(ptr(usize(self.state) + usize(48)))) }
+        -1
+    }
+
+    @thread_safe
+    pub fn attach_waker(&self, waker: &net.Waker) {
+        unsafe {
+            w_st := waker.raw_state()
+            if usize(w_st) == usize(0) { return }
+            if cancel_state_is_cancelled(self.state) {
+                net.waker_wake_raw(w_st)
+                return
+            }
+            net.waker_retain_raw(w_st)
+            spin_lock(ptr(usize(self.state) + usize(16)))
+            already := sys.atomic_load_i64(ptr(usize(self.state) + usize(8))) != 0
+            if !already {
+                cancel_push_ptr(
+                    ptr(usize(self.state) + usize(96)),
+                    ptr(usize(self.state) + usize(104)),
+                    ptr(usize(self.state) + usize(112)),
+                    ptr(usize(self.state) + usize(128)),
+                    w_st
+                )
+            }
+            spin_unlock(ptr(usize(self.state) + usize(16)))
+            if already {
+                net.waker_wake_raw(w_st)
+                net.waker_release_raw(w_st)
+            }
+        }
+    }
+
+    @thread_safe
+    pub fn register_poll(&self, poll: &mut net.PollSet) {
+        rfd := self.fd()
+        if rfd >= 0 { poll.add(rfd, net.poll_in()) }
+        sfd := self.signal_fd()
+        if sfd >= 0 { poll.add(sfd, net.poll_in()) }
+    }
+
+    @thread_safe
+    pub fn wait(&self) {
+        _ := self.wait_timeout(-1)
+    }
+
+    @thread_safe
+    pub fn wait_timeout(&self, timeout_ms: i64) -> bool {
+        unsafe {
+            if cancel_state_is_cancelled(self.state) { return true }
+            if timeout_ms == 0 { return false }
+            deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+            mut fds: []i32 = []
+            cancel_collect_fds(self.state, &mut fds)
+            mut revs: []i32 = []
+            while true {
+                if cancel_state_is_cancelled(self.state) { return true }
+                mut delay: i64 = -1
+                if timeout_ms > 0 {
+                    rem := deadline - sys.now_ms()
+                    if rem <= 0 { return cancel_state_is_cancelled(self.state) }
+                    delay = rem
+                }
+                if fds.len == 0 {
+                    sys.sleep_ms(if delay < 0 || delay > 1 { 1 } else { delay })
+                    continue
+                }
+                _ := poll_wait_raw(&fds, delay, &mut revs)
+            }
+        }
+        false
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            cancel_state_release(st)
+        }
+    }
+}
+
+// =========================================================================
+// Bounded Channel<T> (Sender<T> / Receiver<T>, T: Sendable)
+// Header layout (256 bytes) + ring buffer (capacity * 16 bytes):
+//   [0]   send_refs (i64)
+//   [8]   recv_refs (i64)
+//   [16]  total_refs (i64)
+//   [24]  lock (i64)
+//   [32]  capacity (i64)
+//   [40]  head (i64)
+//   [48]  tail (i64)
+//   [56]  count (i64)
+//   [64]  send_closed (i64)
+//   [72]  recv_closed (i64)
+//   [80]  ne_rfd
+//   [88]  ne_wfd
+//   [96]  ne_efd
+//   [104] nf_rfd
+//   [112] nf_wfd
+//   [120] nf_efd
+//   [128] rx_waker (ptr)
+//   [136] tx_waker (ptr)
+//   [144] alloc_bytes (i64)
+//   [152] pool_cache_count (i64, <= 8)
+//   [160..224] pool_cache[0..8]
+//   [224] ne_signaled (i64)
+//   [232] nf_signaled (i64)
+//   [256..] ring slots: 16 bytes each (packed_word: i64, pool: ptr)
+// =========================================================================
+
+pub enum TryRecv<T> {
+    Value(T),
+    Empty,
+    Closed,
+}
+
+pub enum SendResult<T> {
+    Ok,
+    Full(T),
+    Closed(T),
+    TimedOut(T),
+    Cancelled(T),
+}
+
+pub enum Select2<A, B> {
+    First(Option<A>),
+    Second(Option<B>),
+    Timeout,
+    Cancelled,
+}
+
+@resource(dispose)
+pub opaque struct Sender<T> { state: ptr }
+impl Sendable for Sender<T> where T: Sendable {}
+
+@resource(dispose)
+pub opaque struct Receiver<T> { state: ptr }
+impl Sendable for Receiver<T> where T: Sendable {}
+
+@thread_safe
+unsafe fn chan_sync_signals_locked(st: ptr) {
+    count := load_i64(ptr(usize(st) + usize(56)))
+    cap := load_i64(ptr(usize(st) + usize(32)))
+    sc := load_i64(ptr(usize(st) + usize(64)))
+    rc := load_i64(ptr(usize(st) + usize(72)))
+
+    want_ne: i64 = if count > 0 || sc != 0 { 1 } else { 0 }
+    want_nf: i64 = if count < cap || rc != 0 { 1 } else { 0 }
+
+    ne_sig_ptr := ptr(usize(st) + usize(224))
+    nf_sig_ptr := ptr(usize(st) + usize(232))
+    cur_ne := load_i64(ne_sig_ptr)
+    cur_nf := load_i64(nf_sig_ptr)
+
+    if want_ne != cur_ne {
+        rfd := i32(load_i64(ptr(usize(st) + usize(80))))
+        wfd := i32(load_i64(ptr(usize(st) + usize(88))))
+        efd := load_i64(ptr(usize(st) + usize(96)))
+        if want_ne != 0 { wake_pair_signal(rfd, wfd, efd) } else { wake_pair_drain(rfd, efd) }
+        store_i64(ne_sig_ptr, want_ne)
+    }
+    if want_nf != cur_nf {
+        rfd := i32(load_i64(ptr(usize(st) + usize(104))))
+        wfd := i32(load_i64(ptr(usize(st) + usize(112))))
+        efd := load_i64(ptr(usize(st) + usize(120)))
+        if want_nf != 0 { wake_pair_signal(rfd, wfd, efd) } else { wake_pair_drain(rfd, efd) }
+        store_i64(nf_sig_ptr, want_nf)
+    }
+}
+
+@thread_safe
+unsafe fn chan_retain_waker_locked(st: ptr, offset: usize) -> ptr {
+    w := load_ptr(ptr(usize(st) + offset))
+    if usize(w) != usize(0) { net.waker_retain_raw(w) }
+    w
+}
+
+@thread_safe
+unsafe fn chan_notify_waker(w: ptr) {
+    if usize(w) == usize(0) { return }
+    net.waker_wake_raw(w)
+    net.waker_release_raw(w)
+}
+
+@thread_safe
+unsafe fn chan_take_cached_pool_locked(st: ptr) -> ptr {
+    cnt_ptr := ptr(usize(st) + usize(152))
+    n := load_i64(cnt_ptr)
+    if n <= 0 { return ptr(0) }
+    idx := n - 1
+    store_i64(cnt_ptr, idx)
+    slot := ptr(usize(st) + usize(160) + usize(idx) * usize(8))
+    p := load_ptr(slot)
+    store_ptr(slot, ptr(0))
+    p
+}
+
+@thread_safe
+unsafe fn chan_return_pool_locked(st: ptr, pool: ptr) -> bool {
+    if usize(pool) == usize(0) { return true }
+    cnt_ptr := ptr(usize(st) + usize(152))
+    n := load_i64(cnt_ptr)
+    if n >= 8 { return false }
+    slot := ptr(usize(st) + usize(160) + usize(n) * usize(8))
+    store_ptr(slot, pool)
+    store_i64(cnt_ptr, n + 1)
+    true
+}
+
+@thread_safe
+unsafe fn chan_close_send_raw(st: ptr) {
+    if usize(st) == usize(0) { return }
+    spin_lock(ptr(usize(st) + usize(24)))
+    store_i64(ptr(usize(st) + usize(64)), 1)
+    chan_sync_signals_locked(st)
+    rw := chan_retain_waker_locked(st, usize(128))
+    spin_unlock(ptr(usize(st) + usize(24)))
+    chan_notify_waker(rw)
+}
+
+@thread_safe
+unsafe fn chan_close_recv_raw(st: ptr) {
+    if usize(st) == usize(0) { return }
+    spin_lock(ptr(usize(st) + usize(24)))
+    store_i64(ptr(usize(st) + usize(72)), 1)
+    chan_sync_signals_locked(st)
+    tw := chan_retain_waker_locked(st, usize(136))
+    spin_unlock(ptr(usize(st) + usize(24)))
+    chan_notify_waker(tw)
+}
+
+@thread_safe
+unsafe fn chan_free_state_arrays(st: ptr) {
+    ne_rfd := i32(load_i64(ptr(usize(st) + usize(80))))
+    ne_wfd := i32(load_i64(ptr(usize(st) + usize(88))))
+    ne_efd := load_i64(ptr(usize(st) + usize(96)))
+    wake_pair_close(ne_rfd, ne_wfd, ne_efd)
+
+    nf_rfd := i32(load_i64(ptr(usize(st) + usize(104))))
+    nf_wfd := i32(load_i64(ptr(usize(st) + usize(112))))
+    nf_efd := load_i64(ptr(usize(st) + usize(120)))
+    wake_pair_close(nf_rfd, nf_wfd, nf_efd)
+
+    rw := load_ptr(ptr(usize(st) + usize(128)))
+    if usize(rw) != usize(0) { net.waker_release_raw(rw) }
+    tw := load_ptr(ptr(usize(st) + usize(136)))
+    if usize(tw) != usize(0) { net.waker_release_raw(tw) }
+
+    cached := load_i64(ptr(usize(st) + usize(152)))
+    psz := mini_pool_bytes()
+    for i in 0..i32(cached) {
+        p := load_ptr(ptr(usize(st) + usize(160) + usize(i) * usize(8)))
+        unmap_mini_pool(p, psz)
+    }
+    alloc_len := load_i64(ptr(usize(st) + usize(144)))
+    sync_munmap(st, usize(alloc_len))
+}
+
+@thread_safe
+unsafe fn chan_try_pop_locked(st: ptr) -> (i32, i64, ptr, ptr) {
+    // Returns (status: 1=ok, 0=empty, -1=closed; word, pool, tx_waker_to_wake)
+    count := load_i64(ptr(usize(st) + usize(56)))
+    if count > 0 {
+        cap := load_i64(ptr(usize(st) + usize(32)))
+        head := load_i64(ptr(usize(st) + usize(40)))
+        slot := ptr(usize(st) + usize(256) + usize(head) * usize(16))
+        word := load_i64(slot)
+        pool := load_ptr(ptr(usize(slot) + usize(8)))
+        store_i64(slot, 0)
+        store_ptr(ptr(usize(slot) + usize(8)), ptr(0))
+        store_i64(ptr(usize(st) + usize(40)), (head + 1) % cap)
+        store_i64(ptr(usize(st) + usize(56)), count - 1)
+        chan_sync_signals_locked(st)
+        tw := chan_retain_waker_locked(st, usize(136))
+        return (1, word, pool, tw)
+    }
+    if load_i64(ptr(usize(st) + usize(64))) != 0 {
+        return (-1, 0, ptr(0), ptr(0))
+    }
+    (0, 0, ptr(0), ptr(0))
+}
+
+@thread_safe
+unsafe fn chan_set_waker_raw(st: ptr, offset: usize, waker: &net.Waker) {
+    w_st := waker.raw_state()
+    if usize(w_st) != usize(0) { net.waker_retain_raw(w_st) }
+    spin_lock(ptr(usize(st) + usize(24)))
+    old := load_ptr(ptr(usize(st) + offset))
+    store_ptr(ptr(usize(st) + offset), w_st)
+    spin_unlock(ptr(usize(st) + usize(24)))
+    if usize(old) != usize(0) { net.waker_release_raw(old) }
+}
+
+@thread_safe
+pub fn channel<T>(capacity: i32) -> (Sender<T>, Receiver<T>) where T: Sendable {
+    assert(capacity > 0)
+    unsafe {
+        page := sync_page_bytes()
+        total_bytes := align_up(usize(256) + usize(capacity) * usize(16), page)
+        st := sync_mmap(total_bytes)
+        ne := wake_pair_open()
+        nf := wake_pair_open()
+        sys.atomic_store_i64(st, 1)
+        sys.atomic_store_i64(ptr(usize(st) + usize(8)), 1)
+        sys.atomic_store_i64(ptr(usize(st) + usize(16)), 2)
+        store_i64(ptr(usize(st) + usize(24)), 0)
+        store_i64(ptr(usize(st) + usize(32)), i64(capacity))
+        store_i64(ptr(usize(st) + usize(40)), 0)
+        store_i64(ptr(usize(st) + usize(48)), 0)
+        store_i64(ptr(usize(st) + usize(56)), 0)
+        store_i64(ptr(usize(st) + usize(64)), 0)
+        store_i64(ptr(usize(st) + usize(72)), 0)
+        store_i64(ptr(usize(st) + usize(80)), i64(ne.0))
+        store_i64(ptr(usize(st) + usize(88)), i64(ne.1))
+        store_i64(ptr(usize(st) + usize(96)), ne.2)
+        store_i64(ptr(usize(st) + usize(104)), i64(nf.0))
+        store_i64(ptr(usize(st) + usize(112)), i64(nf.1))
+        store_i64(ptr(usize(st) + usize(120)), nf.2)
+        store_ptr(ptr(usize(st) + usize(128)), ptr(0))
+        store_ptr(ptr(usize(st) + usize(136)), ptr(0))
+        store_i64(ptr(usize(st) + usize(144)), i64(total_bytes))
+        store_i64(ptr(usize(st) + usize(152)), 0)
+        store_i64(ptr(usize(st) + usize(224)), 0)
+        wake_pair_signal(nf.0, nf.1, nf.2)
+        store_i64(ptr(usize(st) + usize(232)), 1)
+        tx := Sender<T> { state: st }
+        rx := Receiver<T> { state: st }
+        return (move tx, move rx)
+    }
+    unsafe { (Sender<T> { state: ptr(0) }, Receiver<T> { state: ptr(0) }) }
+}
+
+impl Sender<T> where T: Sendable {
+    @thread_safe
+    pub fn clone_sender(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(ptr(usize(self.state) + usize(16)), 1)
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn close(&self) {
+        unsafe { chan_close_send_raw(self.state) }
+    }
+
+    @thread_safe
+    pub fn is_closed(&self) -> bool {
+        unsafe {
+            return sys.atomic_load_i64(ptr(usize(self.state) + usize(64))) != 0 ||
+                sys.atomic_load_i64(ptr(usize(self.state) + usize(72))) != 0
+        }
+        true
+    }
+
+    @thread_safe
+    pub fn len(&self) -> i32 {
+        unsafe { return i32(sys.atomic_load_i64(ptr(usize(self.state) + usize(56)))) }
+        0
+    }
+
+    @thread_safe
+    pub fn capacity(&self) -> i32 {
+        unsafe { return i32(load_i64(ptr(usize(self.state) + usize(32)))) }
+        0
+    }
+
+    @thread_safe
+    pub fn attach_waker(&self, waker: &net.Waker) {
+        unsafe { chan_set_waker_raw(self.state, usize(136), &waker) }
+    }
+
+    @thread_safe
+    pub fn try_send(&self, move val: T) -> SendResult<T> {
+        unsafe {
+            st := self.state
+            needs_pool := __sync_needs_pool(T)
+            mut pool := ptr(0)
+            mut closed := false
+            mut full := false
+            spin_lock(ptr(usize(st) + usize(24)))
+            if load_i64(ptr(usize(st) + usize(64))) != 0 || load_i64(ptr(usize(st) + usize(72))) != 0 {
+                closed = true
+            } else if load_i64(ptr(usize(st) + usize(56))) >= load_i64(ptr(usize(st) + usize(32))) {
+                full = true
+            } else if needs_pool {
+                pool = chan_take_cached_pool_locked(st)
+            }
+            spin_unlock(ptr(usize(st) + usize(24)))
+            if closed { return .Closed(move val) }
+            if full { return .Full(move val) }
+            psz := mini_pool_bytes()
+            if needs_pool && usize(pool) == usize(0) {
+                pool = sync_mmap(usize(psz))
+            }
+            packed := __sync_pack(T, pool, psz, move val)
+            mut outcome: i32 = 0
+            mut rw := ptr(0)
+            spin_lock(ptr(usize(st) + usize(24)))
+            if load_i64(ptr(usize(st) + usize(64))) != 0 || load_i64(ptr(usize(st) + usize(72))) != 0 {
+                outcome = -1
+            } else {
+                count := load_i64(ptr(usize(st) + usize(56)))
+                cap := load_i64(ptr(usize(st) + usize(32)))
+                if count >= cap {
+                    outcome = -2
+                } else {
+                    tail := load_i64(ptr(usize(st) + usize(48)))
+                    slot := ptr(usize(st) + usize(256) + usize(tail) * usize(16))
+                    store_i64(slot, packed)
+                    store_ptr(ptr(usize(slot) + usize(8)), pool)
+                    store_i64(ptr(usize(st) + usize(48)), (tail + 1) % cap)
+                    store_i64(ptr(usize(st) + usize(56)), count + 1)
+                    chan_sync_signals_locked(st)
+                    rw = chan_retain_waker_locked(st, usize(128))
+                    outcome = 1
+                }
+            }
+            spin_unlock(ptr(usize(st) + usize(24)))
+            if outcome == 1 {
+                chan_notify_waker(rw)
+                return .Ok
+            }
+            ret_val := __sync_unpack(T, packed)
+            if needs_pool && usize(pool) != usize(0) {
+                reset_mini_pool(pool)
+                spin_lock(ptr(usize(st) + usize(24)))
+                kept := chan_return_pool_locked(st, pool)
+                spin_unlock(ptr(usize(st) + usize(24)))
+                if !kept { unmap_mini_pool(pool, psz) }
+            }
+            if outcome == -1 { return .Closed(move ret_val) }
+            return .Full(move ret_val)
+        }
+        panic("unreachable")
+    }
+
+    @thread_safe
+    pub fn send(&self, move val: T) -> bool {
+        unsafe {
+            st := self.state
+            needs_pool := __sync_needs_pool(T)
+            psz := mini_pool_bytes()
+            mut pending: Option<T> = .Some(move val)
+            mut has_packed := false
+            mut packed: i64 = 0
+            mut pool := ptr(0)
+            mut revs: []i32 = []
+            nf_rfd := i32(load_i64(ptr(usize(st) + usize(104))))
+            nf_fds: []i32 = [nf_rfd]
+            while true {
+                mut status: i32 = 0
+                mut rw := ptr(0)
+                mut take_cached := ptr(0)
+                spin_lock(ptr(usize(st) + usize(24)))
+                if load_i64(ptr(usize(st) + usize(64))) != 0 || load_i64(ptr(usize(st) + usize(72))) != 0 {
+                    status = -1
+                } else {
+                    count := load_i64(ptr(usize(st) + usize(56)))
+                    cap := load_i64(ptr(usize(st) + usize(32)))
+                    if count < cap {
+                        if has_packed || !needs_pool {
+                            if !has_packed {
+                                packed = match replace(&mut pending, .None) {
+                                    .Some(v) => __sync_pack(T, ptr(0), psz, move v),
+                                    .None => panic("sync channel internal send state"),
+                                }
+                                has_packed = true
+                            }
+                            tail := load_i64(ptr(usize(st) + usize(48)))
+                            slot := ptr(usize(st) + usize(256) + usize(tail) * usize(16))
+                            store_i64(slot, packed)
+                            store_ptr(ptr(usize(slot) + usize(8)), pool)
+                            store_i64(ptr(usize(st) + usize(48)), (tail + 1) % cap)
+                            store_i64(ptr(usize(st) + usize(56)), count + 1)
+                            chan_sync_signals_locked(st)
+                            rw = chan_retain_waker_locked(st, usize(128))
+                            status = 1
+                        } else {
+                            take_cached = chan_take_cached_pool_locked(st)
+                            status = 2
+                        }
+                    }
+                }
+                spin_unlock(ptr(usize(st) + usize(24)))
+                if status == 1 {
+                    chan_notify_waker(rw)
+                    return true
+                }
+                if status == -1 {
+                    if has_packed {
+                        __sync_drop_packed(T, pool, psz, packed)
+                        unmap_mini_pool(pool, psz)
+                    }
+                    return false
+                }
+                if status == 2 {
+                    pool = if usize(take_cached) != usize(0) { take_cached } else { sync_mmap(usize(psz)) }
+                    packed = match replace(&mut pending, .None) {
+                        .Some(v) => __sync_pack(T, pool, psz, move v),
+                        .None => panic("sync channel internal send state"),
+                    }
+                    has_packed = true
+                    continue
+                }
+                if nf_rfd < 0 {
+                    sys.sleep_ms(1)
+                } else {
+                    _ := poll_wait_raw(&nf_fds, -1, &mut revs)
+                }
+            }
+        }
+        false
+    }
+
+    @thread_safe
+    pub fn send_timeout(&self, move val: T, timeout_ms: i64) -> SendResult<T> {
+        unsafe {
+            st := self.state
+            mut pending: Option<T> = .Some(move val)
+            deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+            nf_rfd := i32(load_i64(ptr(usize(st) + usize(104))))
+            nf_fds: []i32 = [nf_rfd]
+            mut revs: []i32 = []
+            while true {
+                cur_val := match replace(&mut pending, .None) {
+                    .Some(v) => v,
+                    .None => panic("sync channel internal send state"),
+                }
+                match self.try_send(move cur_val) {
+                    .Ok => { return .Ok },
+                    .Closed(v) => { return .Closed(move v) },
+                    .Cancelled(v) => { return .Cancelled(move v) },
+                    .TimedOut(v) => { return .TimedOut(move v) },
+                    .Full(v) => {
+                        if timeout_ms == 0 { return .Full(move v) }
+                        if timeout_ms > 0 {
+                            rem := deadline - sys.now_ms()
+                            if rem <= 0 { return .TimedOut(move v) }
+                            pending = .Some(move v)
+                            if nf_rfd < 0 { sys.sleep_ms(1) } else { _ := poll_wait_raw(&nf_fds, rem, &mut revs) }
+                        } else {
+                            pending = .Some(move v)
+                            if nf_rfd < 0 { sys.sleep_ms(1) } else { _ := poll_wait_raw(&nf_fds, -1, &mut revs) }
+                        }
+                    },
+                }
+            }
+        }
+        panic("unreachable")
+    }
+
+    @thread_safe
+    pub fn send_cancel(&self, cancel: &CancelToken, move val: T) -> SendResult<T> {
+        unsafe {
+            st := self.state
+            if cancel.is_cancelled() { return .Cancelled(move val) }
+            mut pending: Option<T> = .Some(move val)
+            nf_rfd := i32(load_i64(ptr(usize(st) + usize(104))))
+            mut fds: []i32 = []
+            if nf_rfd >= 0 { fds.push(nf_rfd) }
+            cancel_collect_fds(cancel.state, &mut fds)
+            mut revs: []i32 = []
+            while true {
+                cur_val := match replace(&mut pending, .None) {
+                    .Some(v) => v,
+                    .None => panic("sync channel internal send state"),
+                }
+                if cancel.is_cancelled() { return .Cancelled(move cur_val) }
+                match self.try_send(move cur_val) {
+                    .Ok => { return .Ok },
+                    .Closed(v) => { return .Closed(move v) },
+                    .TimedOut(v) => { return .TimedOut(move v) },
+                    .Cancelled(v) => { return .Cancelled(move v) },
+                    .Full(v) => {
+                        if cancel.is_cancelled() { return .Cancelled(move v) }
+                        pending = .Some(move v)
+                        if fds.len == 0 { sys.sleep_ms(1) } else { _ := poll_wait_raw(&fds, -1, &mut revs) }
+                    },
+                }
+            }
+        }
+        panic("unreachable")
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            if usize(st) == usize(0) { return }
+            if sys.atomic_fetch_add_i64(st, -1) == 1 {
+                chan_close_send_raw(st)
+            }
+            if sys.atomic_fetch_add_i64(ptr(usize(st) + usize(16)), -1) == 1 {
+                cap := load_i64(ptr(usize(st) + usize(32)))
+                mut head := load_i64(ptr(usize(st) + usize(40)))
+                mut count := load_i64(ptr(usize(st) + usize(56)))
+                psz := mini_pool_bytes()
+                while count > 0 {
+                    slot := ptr(usize(st) + usize(256) + usize(head) * usize(16))
+                    word := load_i64(slot)
+                    pool := load_ptr(ptr(usize(slot) + usize(8)))
+                    __sync_drop_packed(T, pool, psz, word)
+                    unmap_mini_pool(pool, psz)
+                    head = (head + 1) % cap
+                    count -= 1
+                }
+                chan_free_state_arrays(st)
+            }
+        }
+    }
+}
+
+impl Receiver<T> where T: Sendable {
+    @thread_safe
+    pub fn clone_receiver(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(ptr(usize(self.state) + usize(16)), 1)
+            _ := sys.atomic_fetch_add_i64(ptr(usize(self.state) + usize(8)), 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn close(&self) {
+        unsafe { chan_close_recv_raw(self.state) }
+    }
+
+    @thread_safe
+    pub fn is_closed(&self) -> bool {
+        unsafe {
+            return sys.atomic_load_i64(ptr(usize(self.state) + usize(64))) != 0 ||
+                sys.atomic_load_i64(ptr(usize(self.state) + usize(72))) != 0
+        }
+        true
+    }
+
+    @thread_safe
+    pub fn len(&self) -> i32 {
+        unsafe { return i32(sys.atomic_load_i64(ptr(usize(self.state) + usize(56)))) }
+        0
+    }
+
+    @thread_safe
+    pub fn capacity(&self) -> i32 {
+        unsafe { return i32(load_i64(ptr(usize(self.state) + usize(32)))) }
+        0
+    }
+
+    @thread_safe
+    pub fn fd(&self) -> i32 {
+        unsafe { return i32(load_i64(ptr(usize(self.state) + usize(80)))) }
+        -1
+    }
+
+    @thread_safe
+    pub fn attach_waker(&self, waker: &net.Waker) {
+        unsafe { chan_set_waker_raw(self.state, usize(128), &waker) }
+    }
+
+    @thread_safe
+    pub fn try_recv(&self) -> TryRecv<T> {
+        unsafe {
+            st := self.state
+            spin_lock(ptr(usize(st) + usize(24)))
+            res := chan_try_pop_locked(st)
+            spin_unlock(ptr(usize(st) + usize(24)))
+            chan_notify_waker(res.3)
+            if res.0 == 0 { return .Empty }
+            if res.0 < 0 { return .Closed }
+            val := __sync_unpack(T, res.1)
+            if usize(res.2) != usize(0) {
+                reset_mini_pool(res.2)
+                spin_lock(ptr(usize(st) + usize(24)))
+                kept := chan_return_pool_locked(st, res.2)
+                spin_unlock(ptr(usize(st) + usize(24)))
+                if !kept { unmap_mini_pool(res.2, mini_pool_bytes()) }
+            }
+            return .Value(move val)
+        }
+        .Closed
+    }
+
+    @thread_safe
+    pub fn recv(&self) -> Option<T> {
+        match self.recv_timeout(-1) {
+            .Value(v) => .Some(move v),
+            .Empty => .None,
+            .Closed => .None,
+        }
+    }
+
+    @thread_safe
+    pub fn recv_timeout(&self, timeout_ms: i64) -> TryRecv<T> {
+        unsafe {
+            match self.try_recv() {
+                .Value(v) => { return .Value(move v) },
+                .Closed => { return .Closed },
+                .Empty => {},
+            }
+            if timeout_ms == 0 { return .Empty }
+            deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+            ne_rfd := i32(load_i64(ptr(usize(self.state) + usize(80))))
+            fds: []i32 = [ne_rfd]
+            mut revs: []i32 = []
+            while true {
+                match self.try_recv() {
+                    .Value(v) => { return .Value(move v) },
+                    .Closed => { return .Closed },
+                    .Empty => {},
+                }
+                mut delay: i64 = -1
+                if timeout_ms > 0 {
+                    rem := deadline - sys.now_ms()
+                    if rem <= 0 { return .Empty }
+                    delay = rem
+                }
+                if ne_rfd < 0 {
+                    sys.sleep_ms(if delay < 0 || delay > 1 { 1 } else { delay })
+                    continue
+                }
+                _ := poll_wait_raw(&fds, delay, &mut revs)
+            }
+        }
+        .Closed
+    }
+
+    @thread_safe
+    pub fn recv_cancel(&self, cancel: &CancelToken) -> Option<T> {
+        unsafe {
+            if cancel.is_cancelled() { return .None }
+            match self.try_recv() {
+                .Value(v) => { return .Some(move v) },
+                .Closed => { return .None },
+                .Empty => {},
+            }
+            ne_rfd := i32(load_i64(ptr(usize(self.state) + usize(80))))
+            mut fds: []i32 = []
+            if ne_rfd >= 0 { fds.push(ne_rfd) }
+            cancel_collect_fds(cancel.state, &mut fds)
+            mut revs: []i32 = []
+            while true {
+                if cancel.is_cancelled() { return .None }
+                match self.try_recv() {
+                    .Value(v) => { return .Some(move v) },
+                    .Closed => { return .None },
+                    .Empty => {},
+                }
+                if fds.len == 0 {
+                    sys.sleep_ms(1)
+                } else {
+                    _ := poll_wait_raw(&fds, -1, &mut revs)
+                }
+            }
+        }
+        .None
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            if usize(st) == usize(0) { return }
+            if sys.atomic_fetch_add_i64(ptr(usize(st) + usize(8)), -1) == 1 {
+                chan_close_recv_raw(st)
+            }
+            if sys.atomic_fetch_add_i64(ptr(usize(st) + usize(16)), -1) == 1 {
+                cap := load_i64(ptr(usize(st) + usize(32)))
+                mut head := load_i64(ptr(usize(st) + usize(40)))
+                mut count := load_i64(ptr(usize(st) + usize(56)))
+                psz := mini_pool_bytes()
+                while count > 0 {
+                    slot := ptr(usize(st) + usize(256) + usize(head) * usize(16))
+                    word := load_i64(slot)
+                    pool := load_ptr(ptr(usize(slot) + usize(8)))
+                    __sync_drop_packed(T, pool, psz, word)
+                    unmap_mini_pool(pool, psz)
+                    head = (head + 1) % cap
+                    count -= 1
+                }
+                chan_free_state_arrays(st)
+            }
+        }
+    }
+}
+
+@thread_safe
+pub fn select2<A, B>(first: &Receiver<A>, second: &Receiver<B>, timeout_ms: i64) -> Select2<A, B> where A: Sendable, B: Sendable {
+    match first.try_recv() {
+        .Value(v) => { return .First(.Some(move v)) },
+        .Closed => { return .First(.None) },
+        .Empty => {},
+    }
+    match second.try_recv() {
+        .Value(v) => { return .Second(.Some(move v)) },
+        .Closed => { return .Second(.None) },
+        .Empty => {},
+    }
+    if timeout_ms == 0 { return .Timeout }
+    deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+    mut fds: []i32 = []
+    f0 := first.fd()
+    f1 := second.fd()
+    if f0 >= 0 { fds.push(f0) }
+    if f1 >= 0 { fds.push(f1) }
+    mut revs: []i32 = []
+    while true {
+        match first.try_recv() {
+            .Value(v) => { return .First(.Some(move v)) },
+            .Closed => { return .First(.None) },
+            .Empty => {},
+        }
+        match second.try_recv() {
+            .Value(v) => { return .Second(.Some(move v)) },
+            .Closed => { return .Second(.None) },
+            .Empty => {},
+        }
+        mut delay: i64 = -1
+        if timeout_ms > 0 {
+            rem := deadline - sys.now_ms()
+            if rem <= 0 { return .Timeout }
+            delay = rem
+        }
+        if fds.len == 0 {
+            sys.sleep_ms(if delay < 0 || delay > 1 { 1 } else { delay })
+        } else {
+            unsafe { _ := poll_wait_raw(&fds, delay, &mut revs) }
+        }
+    }
+    .Timeout
+}
+
+@thread_safe
+pub fn select2_cancel<A, B>(first: &Receiver<A>, second: &Receiver<B>, cancel: &CancelToken, timeout_ms: i64) -> Select2<A, B> where A: Sendable, B: Sendable {
+    if cancel.is_cancelled() { return .Cancelled }
+    match first.try_recv() {
+        .Value(v) => { return .First(.Some(move v)) },
+        .Closed => { return .First(.None) },
+        .Empty => {},
+    }
+    match second.try_recv() {
+        .Value(v) => { return .Second(.Some(move v)) },
+        .Closed => { return .Second(.None) },
+        .Empty => {},
+    }
+    if timeout_ms == 0 { return .Timeout }
+    deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+    mut fds: []i32 = []
+    f0 := first.fd()
+    f1 := second.fd()
+    if f0 >= 0 { fds.push(f0) }
+    if f1 >= 0 { fds.push(f1) }
+    unsafe { cancel_collect_fds(cancel.state, &mut fds) }
+    mut revs: []i32 = []
+    while true {
+        if cancel.is_cancelled() { return .Cancelled }
+        match first.try_recv() {
+            .Value(v) => { return .First(.Some(move v)) },
+            .Closed => { return .First(.None) },
+            .Empty => {},
+        }
+        match second.try_recv() {
+            .Value(v) => { return .Second(.Some(move v)) },
+            .Closed => { return .Second(.None) },
+            .Empty => {},
+        }
+        mut delay: i64 = -1
+        if timeout_ms > 0 {
+            rem := deadline - sys.now_ms()
+            if rem <= 0 { return .Timeout }
+            delay = rem
+        }
+        if fds.len == 0 {
+            sys.sleep_ms(if delay < 0 || delay > 1 { 1 } else { delay })
+        } else {
+            unsafe { _ := poll_wait_raw(&fds, delay, &mut revs) }
+        }
+    }
+    .Timeout
+}
+
+@thread_safe
+pub fn select_ready(fds: &[]i32, timeout_ms: i64) -> i32 {
+    if fds.len == 0 {
+        if timeout_ms > 0 { sys.sleep_ms(timeout_ms) }
+        return -1
+    }
+    mut revs: []i32 = []
+    unsafe {
+        n := poll_wait_raw(&fds, timeout_ms, &mut revs)
+        if n <= 0 { return -1 }
+        for i in 0..revs.len {
+            if revs[i] != 0 { return i }
+        }
+    }
+    -1
+}
+
+@thread_safe
+pub fn select_ready_cancel(fds: &[]i32, cancel: &CancelToken, timeout_ms: i64) -> i32 {
+    if cancel.is_cancelled() { return -2 }
+    mut zero_revs: []i32 = []
+    if fds.len > 0 {
+        unsafe {
+            zn := poll_wait_raw(&fds, 0, &mut zero_revs)
+            if zn > 0 {
+                for i in 0..zero_revs.len {
+                    if zero_revs[i] != 0 { return i }
+                }
+            }
+        }
+    }
+    if timeout_ms == 0 { return -1 }
+    deadline := if timeout_ms > 0 { sys.now_ms() + timeout_ms } else { 0 }
+    mut combined: []i32 = []
+    for f in fds { combined.push(f) }
+    unsafe { cancel_collect_fds(cancel.state, &mut combined) }
+    mut revs: []i32 = []
+    while true {
+        if cancel.is_cancelled() { return -2 }
+        mut delay: i64 = -1
+        if timeout_ms > 0 {
+            rem := deadline - sys.now_ms()
+            if rem <= 0 { return -1 }
+            delay = rem
+        }
+        if combined.len == 0 {
+            sys.sleep_ms(if delay < 0 || delay > 1 { 1 } else { delay })
+            continue
+        }
+        unsafe {
+            n := poll_wait_raw(&combined, delay, &mut revs)
+            if cancel.is_cancelled() { return -2 }
+            if n > 0 {
+                for i in 0..fds.len {
+                    if revs[i] != 0 { return i }
+                }
+            }
+        }
+    }
+    -1
+}
+
+// =========================================================================
+// Updatable Frozen Snapshots: Published<T> & ReadGuard<T>
+// PubState (page):
+//   [0]  handles (i64, atomic)
+//   [8]  rw (i64, atomic: bit 0 = writer active, bits 1..62 = acquire window count)
+//   [16] current_snap (ptr as i64, atomic)
+// Snap (page):
+//   [0]  refcount (i64, atomic)
+//   [8]  pool (ptr, owned mini-pool)
+//   [16] packed_word (i64)
+//   [24] pool_size (i64)
+// =========================================================================
+
+@resource(dispose)
+pub opaque struct Published<T> { state: ptr }
+impl Sendable for Published<T> where T: Sendable {}
+
+@resource(dispose)
+pub opaque struct ReadGuard<T> { snap: ptr }
+
+@thread_safe
+unsafe fn snap_release_typed<T>(snap: ptr) {
+    if usize(snap) == usize(0) { return }
+    if sys.atomic_fetch_add_i64(snap, -1) != 1 { return }
+    pool := load_ptr(ptr(usize(snap) + usize(8)))
+    word := load_i64(ptr(usize(snap) + usize(16)))
+    psz := load_i64(ptr(usize(snap) + usize(24)))
+    __sync_drop_packed(T, pool, psz, word)
+    unmap_mini_pool(pool, psz)
+    sync_munmap(snap, sync_page_bytes())
+}
+
+@thread_safe
+unsafe fn snap_alloc_frozen<T>(move value: T) -> ptr {
+    snap := sync_mmap(sync_page_bytes())
+    needs_pool := __sync_needs_pool(T)
+    psz := mini_pool_bytes()
+    pool := if needs_pool { sync_mmap(usize(psz)) } else { ptr(0) }
+    word := __sync_freeze(T, pool, psz, move value)
+    sys.atomic_store_i64(snap, 1)
+    store_ptr(ptr(usize(snap) + usize(8)), pool)
+    store_i64(ptr(usize(snap) + usize(16)), word)
+    store_i64(ptr(usize(snap) + usize(24)), psz)
+    snap
+}
+
+impl Published<T> where T: Sendable {
+    @thread_safe
+    pub fn new(move initial: T) -> Self {
+        unsafe {
+            snap := snap_alloc_frozen<T>(move initial)
+            st := sync_mmap(sync_page_bytes())
+            sys.atomic_store_i64(st, 1)
+            sys.atomic_store_i64(ptr(usize(st) + usize(8)), 0)
+            sys.atomic_store_i64(ptr(usize(st) + usize(16)), i64(usize(snap)))
+            return Self { state: st }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn clone_handle(&self) -> Self {
+        unsafe {
+            _ := sys.atomic_fetch_add_i64(self.state, 1)
+            return Self { state: self.state }
+        }
+        unsafe { Self { state: ptr(0) } }
+    }
+
+    @thread_safe
+    pub fn publish(&self, move next: T) {
+        unsafe {
+            new_snap := snap_alloc_frozen<T>(move next)
+            rw_ptr := ptr(usize(self.state) + usize(8))
+            cur_ptr := ptr(usize(self.state) + usize(16))
+            mut spins: i32 = 0
+            while true {
+                w := sys.atomic_load_i64(rw_ptr)
+                if w.bit_and(1) != 0 {
+                    spins += 1
+                    if spins >= 64 { sys.sleep_ms(1); spins = 0 }
+                    continue
+                }
+                if sys.atomic_cas_i64(rw_ptr, w, w.bit_or(1)) == w { break }
+            }
+            old_snap := ptr(usize(sys.atomic_load_i64(cur_ptr)))
+            sys.atomic_store_i64(cur_ptr, i64(usize(new_snap)))
+            while sys.atomic_load_i64(rw_ptr) != 1 {}
+            sys.atomic_store_i64(rw_ptr, 0)
+            snap_release_typed<T>(old_snap)
+        }
+    }
+
+    @thread_safe
+    pub fn read(&self) -> ReadGuard<T> {
+        unsafe {
+            rw_ptr := ptr(usize(self.state) + usize(8))
+            cur_ptr := ptr(usize(self.state) + usize(16))
+            mut snap := ptr(0)
+            while true {
+                w := sys.atomic_load_i64(rw_ptr)
+                if w.bit_and(1) != 0 { continue }
+                if sys.atomic_cas_i64(rw_ptr, w, w + 2) == w {
+                    snap = ptr(usize(sys.atomic_load_i64(cur_ptr)))
+                    _ := sys.atomic_fetch_add_i64(snap, 1)
+                    _ := sys.atomic_fetch_add_i64(rw_ptr, -2)
+                    break
+                }
+            }
+            return ReadGuard<T> { snap: snap }
+        }
+        unsafe { ReadGuard<T> { snap: ptr(0) } }
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            st := self.state
+            self.state = ptr(0)
+            if usize(st) == usize(0) { return }
+            if sys.atomic_fetch_add_i64(st, -1) != 1 { return }
+            cur_snap := ptr(usize(sys.atomic_load_i64(ptr(usize(st) + usize(16)))))
+            snap_release_typed<T>(cur_snap)
+            sync_munmap(st, sync_page_bytes())
+        }
+    }
+}
+
+impl ReadGuard<T> {
+    @thread_safe
+    pub fn get(&self) -> &T from self {
+        unsafe { return __sync_borrow_ref(T, &self, ptr(usize(self.snap) + usize(16))) }
+    }
+
+    @thread_safe
+    fn dispose(&mut self) {
+        unsafe {
+            s := self.snap
+            self.snap = ptr(0)
+            snap_release_typed<T>(s)
+        }
+    }
+}
