@@ -9,6 +9,8 @@ vilken körbar fil som ska skrivas, oberoende av värddatorns OS och processor.
 | `arm64-linux` | ELF64, AArch64 | Linux på ARM64 |
 | `x86_64-linux` | ELF64, x86-64 | Linux på x86-64 (SSE2-basnivå) |
 | `wasm32` | WebAssembly-modul | Webbläsare eller fristående Wasm-värd med bulkminnesoperationer |
+| `wasm32-wasi` | WebAssembly-modul (WASIp1) | WASI-värd (`wasi_snapshot_preview1`: `fd_write`, `proc_exit`) |
+| `x86_64-windows` | PE32+ | Windows på x86-64 (`kernel32.dll`-importer för stdout/exit/minne) |
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
@@ -17,24 +19,35 @@ dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" build examples/hello.ddr --target arm64-linux
 "$dunder_bin" build examples/hello.ddr --target arm64-macos
 "$dunder_bin" build examples/hello.ddr --target wasm32
+"$dunder_bin" build examples/hello.ddr --target wasm32-wasi
+"$dunder_bin" build examples/hello.ddr --target x86_64-windows
 ```
 
-Utdata går till `build/<target>/<name>` om `-o` saknas. Wasm-filer får ändelsen `.wasm`. Samma regler gäller
+Utdata går till `build/<target>/<name>` om `-o` saknas. Wasm-filer får ändelsen `.wasm` och Windowsbinärer `.exe`. Samma regler gäller
 projekt med `dunder.toml`. Måltripplarna `aarch64-apple-darwin`,
-`aarch64-unknown-linux-gnu` och `x86_64-unknown-linux-gnu` accepteras också som
+`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-unknown-unknown`,
+`wasm32-wasip1`/`wasi` och `x86_64-pc-windows-msvc`/`windows` accepteras också som
 alias. Vanliga Linuxbinärer använder direkta systemanrop. Program med
 nåbara externa anrop använder systemets dynamiska loader och de bibliotek
 som programmet deklarerar.
 
-Alla fyra mål ingår i samma kompilator. Dunderbyggen behöver inga installerade
+Alla sex mål ingår i samma kompilator. Dunderbyggen behöver inga installerade
 målpaket, headers, sysroot, C-kompilatorer, LLVM, assemblers, länkare eller
-signeringsverktyg. macOS kan därmed skriva Linuxbinärer och Linux kan skriva
-macOS-binärer. Kompilering kräver ingen körning av målplattformens kod.
+signeringsverktyg. macOS kan därmed skriva Linux-, Wasm-, WASI- och Windowsbinärer och Linux kan skriva
+macOS-, WASI- och Windowsbinärer. Kompilering kräver ingen körning av målplattformens kod.
 
 `run` och `test` kör bara program för den egna plattformen. Ett annat mål ger
 ett tydligt fel före publicering eller körning. Använd `build` och flytta
 filen till målplattformen för att köra den där. `check` behöver ingen native
-backend. Windows och x86-64/macOS är ännu inte körmål.
+backend. Flaggan `-g` / `--debug` (stöds för `build`, `run` och `install`)
+emitterar DWARF v4-debuginformation och symboltabeller för nativa mål. `dunder lsp`
+startar en JSON-RPC-språkserver över standardströmmar. x86-64/macOS är ännu inte ett körmål.
+
+Detaljer för Windows- och WASI-målen verifieras i
+[WASI- och Windowsproven](../tools/test_wasi_and_windows.ddr). På nativa mål
+växer programheapen dynamiskt med extra allokeringssidor (slabs) utöver den
+initiala mappningen (med upp till `1 GiB` per enskild allokering), och
+`sys.read_u8`/`read_u8_limit`/`read_text_limit` stöder upp till `1 GiB` (`1 073 741 823` byte).
 
 ## WebAssembly
 
@@ -82,15 +95,21 @@ standardbibliotek för alla mål. Frysta Dunder-kompilatorer för de tre
 nativa värdarna kan bygga om källorna offline. Bootstrap-skriptet
 verifierar två byteidentiska självbyggen. [Återbyggnad](../bootstrap/README.md)
 
-ARM64-backenden skriver maskininstruktioner direkt. x86-64 och Wasm
-översätter samma symboliska instruktionsföljd under kompileringen.
+ARM64-backenden emitterar maskininstruktioner direkt från MIR. x86-64/Linux och
+Wasm har nu också egna direkta MIR-backends: [x86-64-MIR-sänkning](../selfhost/backend/x86_mir.ddr)
+sänker MIR direkt till x86-64 med en 11-registersallokator (`callee-saved` m.fl.)
+ och System V-ABI, medan [Wasm-MIR-sänkning](../selfhost/backend/wasm_mir.ddr)
+sänker MIR direkt till WebAssembly-lokaler och strukturerade kontrollblock.
+x86_64-windows sänker samma MIR-producerade symboliska ström till Win64 via
+[x86-sänkningen](../selfhost/backend/x86.ddr).
 På x86-64 pekar R15 på Dunders privata registerbank. Dunder använder en
-kontrollerad värdestack och nativa System V-anrop använder värdstacken.
-På Wasm blir de nåbara funktionerna Wasm-funktioner med strukturhopp
-mellan grundblocken. Callback-bryggan sparar de virtuella registren på
-Wasm-operandsstacken genom nästlade anrop. Allokerarregistren X19–X21
+kontrollerad värdestack och nativa System V-anrop (eller Win64-anrop) använder värdstacken.
+På Wasm blir de nåbara funktionerna Wasm-funktioner med strukturerade hopp
+mellan grundblocken; `wasm32` använder värdimporten `dunder` medan `wasm32-wasi`
+kopplar standardutskrift och exit till `wasi_snapshot_preview1`. Callback-bryggan
+sparar tillståndet över nästlade anrop. Allokerarregistren X19–X21
 behåller sina nya värden så att anropets allokeringar finns kvar.
-[x86-64-sänkning](../selfhost/backend/x86.ddr) · [Wasm-ABI](../selfhost/backend/wasm_abi.ddr)
+[x86-64-MIR](../selfhost/backend/x86_mir.ddr) · [Wasm-MIR](../selfhost/backend/wasm_mir.ddr) · [PE32+-skrivare](../selfhost/backend/pe.ddr)
 
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
 dynamisk laddare eller libc. Compile-time-predikatet `target_is("...")` i

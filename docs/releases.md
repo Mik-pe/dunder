@@ -1,18 +1,18 @@
 # Lokala kompilatorbyggen för GitHub Releases
 
 Ange versionsnumret från `compiler_version()` i `selfhost/driver/cli.ddr`. Med
-följande kommando hamnar de färdiga filerna i `build/release/v0.7.0/`.
+följande kommando hamnar de färdiga filerna i `build/release/v0.8.0/`.
 
 ```sh
-./tools/release.sh v0.7.0
+./tools/release.sh v0.8.0
 ```
 
 Med en lokal versionstagg byggs den commit som taggen pekar ut. Utan tagg
 används `HEAD`. Skriptet packar upp de incheckade källorna i en tillfällig
 katalog och kör `tools/bootstrap.sh` där. Värdens kompilator måste nå
 fixpunkt och rapportera versionen från taggen. Den bygger sedan de andra
-målens kompilatorer lokalt. macOS-paketet innehåller den parallella
-kompilatorn. För en annan utdatakatalog används `--outdir KATALOG`.
+målens kompilatorer lokalt. Alla tre paketen innehåller den parallella
+kompilatorn (`selfhost/main_parallel.ddr`). För en annan utdatakatalog används `--outdir KATALOG`.
 
 ## Publicera
 
@@ -20,14 +20,14 @@ När bygget ska bli tillgängligt för `dunder upgrade`, använd Git med
 skrivrättighet till repot och en autentiserad GitHub CLI.
 
 ```sh
-./tools/release.sh v0.7.0 --publish
+./tools/release.sh v0.8.0 --publish
 ```
 
 Om taggen saknades vid provbygget, sätt den på
 commitvärdet i `release.txt` innan publiceringskommandot körs.
 
 ```sh
-git tag v0.7.0 "$(sed -n 's/^commit=//p' build/release/v0.7.0/release.txt)"
+git tag v0.8.0 "$(sed -n 's/^commit=//p' build/release/v0.8.0/release.txt)"
 ```
 
 En befintlig tagg på GitHub styr källrevisionen. Om taggen saknas skapar
@@ -43,10 +43,10 @@ publicerad release jämför skriptet de publicerade filerna med det lokala
 bygget.
 
 Skriptet skriver en kort standardbeskrivning. En förberedd versionstext kan
-läggas i `build/release/v0.7.0/notes.md` och uppdateras separat:
+läggas i `build/release/v0.8.0/notes.md` och uppdateras separat:
 
 ```sh
-gh release edit v0.7.0 --repo Mik-pe/dunder --notes-file build/release/v0.7.0/notes.md
+gh release edit v0.8.0 --repo Mik-pe/dunder --notes-file build/release/v0.8.0/notes.md
 ```
 
 ## Filer som uppgraderaren läser
@@ -62,7 +62,7 @@ i manifestet. Nyckeln `<mål>.gz.sha256` gäller gzip-arkivet och
 | x86-64 Linux | `x86_64-linux.gz` | `x86_64-linux.sha256` |
 
 `dunder upgrade` läser manifestet från GitHubs senaste stabila release.
-`dunder upgrade --version v0.7.0` väljer den namngivna releasen.
+`dunder upgrade --version v0.8.0` väljer den namngivna releasen.
 
 `dunder run tools/test_release.ddr` (eller `./tools/verify-selfhost.sh --release`) provar paketering, avbruten uppladdning och
 omkörning i en lokal Git-kopia med simulerad GitHub CLI.

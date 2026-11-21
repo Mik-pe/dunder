@@ -32,7 +32,7 @@ fall. Alla råsvansar, inklusive owned-fallets sämre p95, finns kvar.
 Genererat bygge når 161 499 rader/s vid p95 med fyra workers; alla tre
 workerantal klarar 100 000-gränsen. Separata `check`-prover är seriella
 kontroller. Kontrollerade runtimebilder är byteidentiska, så ingen ny
-C-runtimevinst påstås. Frontenden är fortsatt seriell och C-målet öppet.
+C-runtimevinst påstås. Frontenden var då fortsatt seriell; C-målet är öppet.
 
 Den tidigare [glesa SSA-v2-mätningen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 har 1 440 prover över tre separata jämförelser på samma frysta källor.
@@ -49,7 +49,8 @@ p95 ökar samtidigt 20,41 procent. Samma nya kompilator med SSA av/på ger:
 SSA på klarar 100 000-gränsen för genererat bygge vid p95 med 159 866
 rader/s. Runtime/C-geomedlet är 1,1841 på mot 1,1883 av; text och sort
 med passet på ligger på 1,3376 respektive 1,2649. C-gränserna är alltså
-öppna. SSA förblir av som standard. En separat av/av-serie ger 0,28–0,69
+öppna. Då förblev SSA av som standard; MIR-SSA är numera standard på och
+stängs av med `--mir-ssa=off`. En separat av/av-serie ger 0,28–0,69
 procent högre byggmedian med byteidentiska konsumenter; p95-regressioner
 och alla råsvansar finns kvar i rapporten. Kompilatorkorpuset avser den
 seriella ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
@@ -68,8 +69,9 @@ Alla fyra runtimebilder ändrades, men runtime/C-geomedlet blev 1,181 mot
 1,178 med SSA av. En separat SSA-optimerad kompilatorbinär, med samma
 användarpolicy SSA av, ändrade byggmedianerna mindre än 0,3 procent och gav
 sämre p95 i flera fall. Varken standardprofilen eller bootstrapens
-producentprofil ändras på detta underlag. SSA förblir valbart med
-`--mir-ssa=on`; C-målet är öppet. Kompilatorkorpuset är fortsatt den seriella
+producentprofil ändras på detta underlag. SSA var då valbart med
+`--mir-ssa=on` och är numera standard på; C-målet är öppet.
+Kompilatorkorpuset är fortsatt den seriella
 ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
 
 Den tidigare [parallella kompilatormätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)

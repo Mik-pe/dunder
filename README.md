@@ -5,9 +5,11 @@
 </p>
 
 Dunder är ett statiskt typat språk med filändelsen `.ddr`. Kompilatorn är
-skriven i Dunder och bygger program för ARM64/macOS, ARM64/Linux, x86-64/Linux
-och WebAssembly. För nativa program sköter den också länkningen och signerar
-macOS-binärer.
+skriven i Dunder och bygger program för ARM64/macOS, ARM64/Linux, x86-64/Linux,
+Windows x86-64 (`x86_64-windows`), WebAssembly (`wasm32`) och WASI (`wasm32-wasi`).
+För nativa program sköter den också länkningen, valfri DWARF-debuginformation (`-g`)
+och macOS-signering, och levereras med formaterare (`dunder fmt`) samt inbyggd
+språkserver (`dunder lsp`).
 
 ```dunder
 @test {
@@ -43,8 +45,8 @@ manifestet det programmet och `tests/suite.ddr` som testrot.
 "$dunder_bin" build examples/hello.ddr --target x86_64-linux -o build/hello-linux
 ```
 
-`check` typkontrollerar även biblioteksmoduler. Alla fyra målen kan byggas
-med samma kompilator. [Målplattformar och körmiljöer](docs/targets.md)
+`check` typkontrollerar snabbt med flera fel, varningar och `--agent`-diagnos.
+Alla sex målen kan byggas med samma kompilator. [Målplattformar och körmiljöer](docs/targets.md)
 `build --app` paketerar ett ARM64/macOS-program som en signerad `.app`.
 [App-paket för macOS](docs/app-bundles.md)
 
@@ -55,10 +57,11 @@ installerar den. [Releaser](docs/releases.md)
 
 ## Språket och biblioteken
 
-- [Syntax](docs/syntax.md) beskriver funktioner, moduler, typer och tester. [Små körbara exempel](examples/)
-- [Minnesmodellen](docs/memory.md) beskriver ägarskap, flyttar och lån.
-- [Standardbiblioteket](docs/standard.md) omfattar bland annat samlingar, text och serialisering. [Systembibliotek](docs/sys.md) · [HTTP och TLS](docs/http.md) · [SQLite](docs/sqlite.md) · [TOML](docs/toml.md) · [Kryptografi](docs/crypto.md)
-- [C-FFI](docs/ffi.md) beskriver externa anrop och datalayout. [Parallella uppgifter](docs/tasks.md)
+- [Syntax](docs/syntax.md) beskriver funktioner, moduler, traits, råa/flerradiga strängar, `@embed_file`, `&str` och tester. [Små körbara exempel](examples/)
+- [Minnesmodellen](docs/memory.md) beskriver ägarskap, flyttar, dynamiska slabs och begränsade lån (`&[]T`, `&str`).
+- [Standardbiblioteket](docs/standard.md) omfattar bland annat samlingar, `std.sync`, `std.text.view`, `std.path`, `std.time`, `std.signal` och serialisering. [Systembibliotek](docs/sys.md) · [HTTP och TLS](docs/http.md) · [SQLite](docs/sqlite.md) · [TOML](docs/toml.md) · [Kryptografi](docs/crypto.md)
+- [Ekosystempaketen](packages/) innehåller fristående paket för [`http`](packages/http/), [`http_client`](packages/http_client/), [`cli`](packages/cli/) och [`log`](packages/log/).
+- [C-FFI](docs/ffi.md) beskriver externa anrop och datalayout. [Parallella uppgifter och synkronisering](docs/tasks.md)
 
 Hundmat är Dunders testbädd. Tabell, HTTP-servern och grafikexemplen för
 Metal, Vulkan och WebGPU låter oss prova språket, kompilatorn och

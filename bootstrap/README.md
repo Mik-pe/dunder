@@ -20,7 +20,7 @@ kompilatorns självbyggen vid `--jobs 1` och `--jobs 4`. När alla tre binärer
 [Arbetsbudget och kompilatorjobb](../docs/tasks.md#kompilatorn-som-taskkonsument)
 
 `--serial` publicerar enbart `build/selfhost/<värdmål>/dunder-serial`.
-Båda kompilatoringångarna kan korskompilera till alla fyra mål.
+Båda kompilatoringångarna kan korskompilera till alla sex mål.
 
 ```sh
 serial_bin="$(./tools/bootstrap.sh --serial)"

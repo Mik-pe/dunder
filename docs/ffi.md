@@ -29,7 +29,8 @@ fn main() {
 
 `u8`, `u16`, `u32` och `u64` upptar 1, 2, 4 respektive 8 byte i en array eller
 struct. `usize` och den opaka råpekaren `ptr` följer målets pekarbredd,
-8 byte på de tre native-målen och 4 byte på wasm32. En literal kontrolleras
+8 byte på de fyra nativa målen (ARM64/macOS, ARM64/Linux, x86-64/Linux och
+x86-64/Windows) och 4 byte på wasm32 (båda wasm-målen). En literal kontrolleras
 mot sin förväntade typ. Konverteringar som `u8(value)` kontrollerar att värdet
 ryms. Index och längd i Dunders befintliga samlings-API har typen `i32`.
 
@@ -47,8 +48,10 @@ fält har värdet noll. Noll kan vara ett ogiltigt handtag för ett visst API.
 Funktionsvärdet har typen `extern fn(Parametrar) -> Resultat`. Anrop kontrollerar
 antal och typer och kräver en unsafe-kontext även efter tilldelning till en
 variabel. Dunder-funktioner och C-funktionspekare har skilda typer. På native
-betecknar `"c"` systemets C-bibliotek och `"dl"` systemets dynamiska laddare.
-På Wasm anger de två strängarna importmodul och importnamn.
+betecknar `"c"` systemets C-bibliotek (`libSystem.B.dylib` på macOS,
+`libc.so.6` på Linux, `msvcrt.dll` på Windows där även `"msvcrt"` och
+`"kernel32"`/`"kernel32.dll"` stöds) och `"dl"` systemets dynamiska laddare
+(`libdl.so.2`). På Wasm anger de två strängarna importmodul och importnamn.
 
 En variadisk C-funktion deklareras med `@c_variadic(antal_fasta_parametrar)`.
 Varje anrop har fortfarande en fullständigt statisk signatur: deklarera separata
@@ -68,7 +71,9 @@ aggregat stöds inte. Attributet kräver `@extern unsafe fn` och ett nativt mål
 Gränsen mellan fasta och variadiska parametrar ingår i funktionens typ och
 bevaras vid härledd tilldelning (`call := setopt_ptr`); den kan inte tilldelas
 en vanlig `extern fn`-typ. Apple ARM64 använder åttabytes stackplatser för
-variadiska argument; Linuxmålen använder respektive plattforms C-konvention.
+variadiska argument; Linux- och Windows-målen (SysV respektive Win64, med
+fyra registerargument och 32 byte skuggrymd) använder respektive plattforms
+C-konvention.
 
 Parametrar och returvärden kan vara skalära tal eller pekare. Native-anrop kan
 också överföra en C-struct bestående av en till fyra identiska flyttal (även
@@ -84,17 +89,20 @@ Den osäkra primitiven `static_bytes("native", 16)` ger adressen till ett
 16-byte-justerat och initialt nollställt område i programmets skrivbara
 datasegment. Varje anropsställe äger ett eget område som lever tills processen
 avslutas. Längden är en heltalsliteral mellan en byte och 16 MiB.
-`"linux"` och `"macos"` binder ett nåbart anropsställe till respektive system.
-Ett modultillstånd kan läggas bakom en privat funktion som alltid returnerar
-samma områdesadress. Anroparen ansvarar för samtidighet.
+`"linux"`, `"macos"` och `"windows"` binder ett nåbart anropsställe till
+respektive system. Ett modultillstånd kan läggas bakom en privat funktion som
+alltid returnerar samma områdesadress. Anroparen ansvarar för samtidighet.
 
 För plattformsspecifik kod som väljs statiskt finns compile-time-uttrycket
 `target_is("...")` i `if`/`else if`-villkor (med `!`, `&&`, `||` och
 parenteser), där giltiga namn är `"macos"`, `"arm64-macos"`,
 `"aarch64-apple-darwin"`, `"linux"`, `"arm64-linux"`,
 `"aarch64-unknown-linux-gnu"`, `"x86_64-linux"`,
-`"x86_64-unknown-linux-gnu"`, `"arm64"`, `"x86_64"`, `"native"`, `"wasm32"`
-och `"wasm32-unknown-unknown"`. Onåbara grenar hoppas över före typkontroll
+`"x86_64-unknown-linux-gnu"`, `"windows"`, `"x86_64-windows"`,
+`"x86_64-pc-windows-msvc"`, `"arm64"`, `"x86_64"`, `"native"`, `"wasm32"`,
+`"wasm32-unknown-unknown"`, `"wasi"`, `"wasm32-wasi"` och `"wasm32-wasip1"`
+(`"x86_64"` täcker även Windows och `"wasm32"` täcker även wasi). Onåbara
+grenar hoppas över före typkontroll
 och importregistrering, så `@extern`-anrop i en `target_is("macos")`-gren
 skapar inga dynamiska beroenden vid Linux-kompilering.
 

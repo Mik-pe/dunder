@@ -13,7 +13,7 @@ fn main() {
     doc := json.Doc::parse_text(result.json)
     worker := doc.field(doc.root, "worker")
     count := doc.as_u64(doc.field(worker, "concurrency"))
-    assert(count.ok && count.value == 4)
+    assert(count == .Some(4))
 }
 ```
 

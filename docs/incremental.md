@@ -14,19 +14,21 @@ kontroll rapporterar namn och typ för parametrar och lokala bindningar,
 sedan en post med `kind: "ok"` och antal moduler. Ett källfel ger en post
 med `kind: "error"`, felkod, sökväg, meddelande och spann samt exitkod 1.
 `start` och `end` är nollbaserade UTF-8-byteoffset i den angivna filen.
-Slutpositionen är exklusiv. `--target wasm32` väljer Wasms pekarbredd även
-vid typkontrollen.
+Slutpositionen är exklusiv. `--target wasm32` eller `wasm32-wasi` väljer Wasms
+pekarbredd även vid typkontrollen.
 
 ## Återanvänd maskinkod
 
-`--incremental` aktiverar funktionscachen för nativebyggen och `run`.
+`--incremental` aktiverar funktionscachen för alla mål (inklusive Wasm och
+Windows) och `run`.
 `--timings` rapporterar hur många nåbara funktioner som återanvändes och hur
 många som emitterades. Cachen finns i `build/.dunder-cache/selfhost` under
 aktuell arbetskatalog. Man kan radera hela katalogen mellan två byggen.
 
 Nyckeln innehåller kompilatorns kryptografiska identitet, målet, deklarationernas
 layout, skaläroptimeringens läge och funktionens tokenström. CLI:t behåller
-separata cachekataloger för `--scalar-opt=on` och `--scalar-opt=off`.
+separata cachekataloger för `--scalar-opt=on` och `--scalar-opt=off` (och
+motsvarande underkataloger för övriga optimeringslägen).
 Helfunktionskedjans version och läget `--mir=on/off` ingår också i både
 funktions- och testidentitet. Återställda fragment innehåller slutligt
 sänkt kod och går inte genom IR-kedjan en andra gång.
@@ -130,7 +132,8 @@ Rapportformatet allokerar inget och dess poolinitiering räknas inte som en
 vanlig allokering. Vanlig stdout och programmets exitstatus bevaras, även om
 stderr är stängd. Fällor och explicita processavslut har ingen slutrapport.
 
-Flaggan stöds för de tre nativa målen. `check` accepterar inte flaggan.
+Flaggan stöds för de fyra nativa målen (inklusive x86_64-windows).
+`check` accepterar inte flaggan.
 Cachefragment och `test --affected` skiljer profilerade och vanliga
 byggen åt. Kör allokering och kompilatorns fastider i separata observationer:
 klockans egna temporära värden skulle annars ingå i allokeringstrafiken.

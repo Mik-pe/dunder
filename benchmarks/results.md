@@ -20,23 +20,26 @@ har 1 260 prover över sex fall. Fyra workers ger 1,57× för genererat bygge,
 1,24× för seriell självhostingång och 1,22× för taskingången mot en worker.
 Det nya paketets byggmedianer är 0,64–1,56 procent högre än föregående
 fyrtrådade standard, med lägre minnestopp i större fall. Alla kontrollerade
-runtimebilder är identiska. SSA förblir av; ingen ny runtime/C-vinst påstås.
+runtimebilder är identiska. SSA förblev då av (numera är MIR-SSA standard på);
+ingen ny runtime/C-vinst påstås.
 
 [Gles SSA-v2 och separata anropsindata, 2026-11-12](archive/2026-11-12-ssa-pruned/README.md)
 bevarar 1 440 prover över standard av/av, gamla/nya SSA på/på och nya
 kompilatorns av/på-serie med C. SSA-byggmedianen för kompilatorkorpuset
 minskar 27,65 procent mot v1, men SSA på kostar fortfarande 21,26 procent
 extra för kompilatorkorpuset och 29,47 procent för Tabell. Runtime/C-geomedlet
-1,1841 uppfyller inte C-målet. Standard behåller fyra workers och SSA av;
-alla p95-regressioner och råsvansar ingår i rapporten.
+1,1841 uppfyller inte C-målet. Standarden behöll då fyra workers och SSA av
+(numera är MIR-SSA standard på); alla p95-regressioner och råsvansar ingår i
+rapporten.
 
 [SSA-grund och ABI-kontrakt, 2026-11-12](archive/2026-11-12-ssa-foundation/README.md)
 prövar den valbara cell-SSA:n och en separat SSA-optimerad producentbinär.
 SSA på ökade kompilatorkorpusets byggmedian 70,92 procent och Tabells
 42,34 procent utan samlad runtimevinst mot C. Producentprofilen gav ingen
-meningsfull byggvinst med oförändrad användarpolicy. Standard behåller fyra
-workers och SSA av. Rapporten innehåller båda 30-rundorsserierna och
-korrekthetsunderlaget för SSA samt separata minnes-/utgångs-/ABI-premisser.
+meningsfull byggvinst med oförändrad användarpolicy. Standarden behöll då fyra
+workers och SSA av (numera är MIR-SSA standard på). Rapporten innehåller båda
+30-rundorsserierna och korrekthetsunderlaget för SSA samt separata
+minnes-/utgångs-/ABI-premisser.
 
 [Parallell kompilering, 2026-11-12](archive/2026-11-12-parallel-compiler/README.md)
 motiverar valet av fyra workers på ARM64/macOS. Samma binär med fyra workers

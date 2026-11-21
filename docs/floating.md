@@ -44,7 +44,7 @@ scaled := f64(count) * 0.25
 
 En f32-literal avrundas direkt från decimalstavningen till binary32; den
 passerar inte genom binary64 först. En literal som blir oändlig i sin typ
-avvisas med `E1000`. Mycket små literaler kan avrundas till noll. Använd
+avvisas med `E3099`. Mycket små literaler kan avrundas till noll. Använd
 exponentform för mycket stora/små tal; syntaxen utan decimalpunkt eller
 exponent använder fortfarande lexerns heltalsgräns.
 

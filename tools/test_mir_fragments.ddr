@@ -31,18 +31,39 @@ fn sources() -> []string {
      "tests/mir_fragment.ddr", "tests/fixtures/mir-fragment-emitter.ddr"]
 }
 
-fn valid_words(data: &[]i64, extended: bool, suffix: string) -> bool {
-    if data.len < 7 || data[0] != 0x44554644 || data[1] != 1 { return false }
+struct Payload {
+    full: string,
+    core: string,
+    version: i64,
+}
+
+fn valid_words(data: &[]i64, extended: bool, suffix: string, allow_v2: bool) -> i32 {
+    if data.len < 7 || data[0] != 0x44554644 { return -1 }
+    version := data[1]
+    if !(version == 1 || (allow_v2 && version == 2)) { return -1 }
     entries: i64 = if extended { 2 } else { 0 }
     estimate: i64 = if extended { 10 } else { 0 }
-    if data[5] != entries || data[6] != estimate { return false }
-    if extended && (data[data.len - 2] != 2 || data[data.len - 1] != 8) { return false }
+    if data[5] != entries || data[6] != estimate { return -1 }
     words := data[2]
     labels := data[3]
     relocs := data[4]
     expected_labels: i64 = if suffix == "a" { 3 } else { 2 }
-    length: i64 = 7 + words + labels + 3 * relocs + entries
-    if labels != expected_labels || length != i64(data.len) { return false }
+    core_len: i64 = 7 + words + labels + 3 * relocs + entries
+    if labels != expected_labels || core_len > i64(data.len) { return -1 }
+    if version == 1 {
+        if core_len != i64(data.len) { return -1 }
+    } else {
+        if i64(data.len) < core_len + 3 { return -1 }
+        xb := i32(core_len)
+        x_bytes := data[xb]
+        x_relocs := data[xb + 1]
+        x_traps := data[xb + 2]
+        if x_bytes <= 0 || x_relocs < 0 || x_traps < 0 { return -1 }
+        x_words := (x_bytes + 3) / 4
+        if core_len + 3 + x_words + labels + 2 * x_relocs + x_traps != i64(data.len) { return -1 }
+    }
+    deps_at := i32(core_len - entries)
+    if extended && (data[deps_at] != 2 || data[deps_at + 1] != 8) { return -1 }
     base := 7 + i32(words)
     mut has_end := false
     mut has_unmarked := false
@@ -50,21 +71,22 @@ fn valid_words(data: &[]i64, extended: bool, suffix: string) -> bool {
         if data[base + i] == words { has_end = true }
         if data[base + i] == 0xffffffff { has_unmarked = true }
     }
-    if !has_end || !has_unmarked { return false }
+    if !has_end || !has_unmarked { return -1 }
     for i in 0..i32(relocs) {
         at := base + i32(labels) + 3 * i
         destination := data[at + 1]
         if data[at] >= words || data[at + 2] > 20 ||
-           (destination >= labels && (destination < 0x80000000 || destination >= 0x80000003)) { return false }
+           (destination >= labels && (destination < 0x80000000 || destination >= 0x80000003)) { return -1 }
     }
-    true
+    i32(core_len)
 }
 
-fn payload(path: string, extended: bool, suffix: string) -> string {
+fn payload(path: string, extended: bool, suffix: string, allow_v2: bool) -> Payload {
+    empty := Payload { full: "", core: "", version: 0 }
     input := sys.read_text(path)
     if !input.ok || input.value.len < 128 || (input.value.len - 128) % 8 != 0 {
         _ := harness.fail(f"{path}: invalid fragment length")
-        return ""
+        return empty
     }
     value := input.value
     mut signed: []u8 = []
@@ -72,31 +94,47 @@ fn payload(path: string, extended: bool, suffix: string) -> string {
     bytes.append_utf8(&mut signed, value[128..value.len])
     if harness.sha256_bytes_hex(&signed) != value[64..128] {
         _ := harness.fail(f"{path}: fragment checksum differs")
-        return ""
+        return empty
     }
     mut words: []i64 = []
     for i in 0..((value.len - 128) / 8) {
         start := 128 + i * 8
         word := parse.hex(value[start..start + 8])
-        if !word.ok || word.value < 0 { _ := harness.fail(f"{path}: invalid hexadecimal word"); return "" }
+        if !word.ok || word.value < 0 { _ := harness.fail(f"{path}: invalid hexadecimal word"); return empty }
         words.push(word.value)
     }
-    if !valid_words(&words, extended, suffix) {
+    core_words := valid_words(&words, extended, suffix, allow_v2)
+    if core_words < 0 {
         _ := harness.fail(f"{path}: invalid DUFD payload, labels or relocations")
-        return ""
+        return empty
     }
-    value
+    Payload { full: value.clone(), core: value[128 + 16..128 + core_words * 8], version: words[1] }
 }
 
-fn check_payloads(base: string, extended: bool, restored: bool, report: &mut Report) -> bool {
+fn check_payloads(base: string, extended: bool, restored: bool, is_x86: bool, report: &mut Report) -> bool {
     for suffix in ["a", "b"] {
-        expected := payload(base + ".serial." + suffix, extended, suffix)
-        detached := payload(base + "." + suffix, extended, suffix)
-        if expected.len == 0 || expected != detached {
-            return harness.fail(f"{base}.{suffix}: serial and detached payloads differ")
-        }
-        if restored && detached != payload(base + ".roundtrip." + suffix, extended, suffix) {
-            return harness.fail(f"{base}.{suffix}: restored and detached payloads differ")
+        expected := payload(base + ".serial." + suffix, extended, suffix, false)
+        detached := payload(base + "." + suffix, extended, suffix, is_x86)
+        if !is_x86 {
+            if expected.full.len == 0 || expected.full != detached.full {
+                return harness.fail(f"{base}.{suffix}: serial and detached payloads differ")
+            }
+            if restored {
+                roundtrip := payload(base + ".roundtrip." + suffix, extended, suffix, false)
+                if detached.full != roundtrip.full {
+                    return harness.fail(f"{base}.{suffix}: restored and detached payloads differ")
+                }
+            }
+        } else {
+            if expected.full.len == 0 || detached.full.len == 0 || detached.version != 2 || expected.core != detached.core {
+                return harness.fail(f"{base}.{suffix}: serial and detached payloads differ")
+            }
+            if restored {
+                roundtrip := payload(base + ".roundtrip." + suffix, extended, suffix, false)
+                if roundtrip.full.len == 0 || detached.core != roundtrip.core || expected.full != roundtrip.full {
+                    return harness.fail(f"{base}.{suffix}: restored and detached payloads differ")
+                }
+            }
         }
         report.payloads += 1
     }
@@ -127,7 +165,7 @@ fn check_images(emitter: string, work: string, target: i32, name: string, format
                 return false
             }
             if text.trim(result.stdout_text()) != "objects=2" { return harness.fail(f"{image}: expected two captured objects") }
-            if !check_payloads(base, extended, mode == "restore", &mut report) { return false }
+            if !check_payloads(base, extended, mode == "restore", target == 2, &mut report) { return false }
             data := sys.read_u8(image)
             if !data.ok { return harness.fail(f"cannot read {image}") }
             if !record_image(image, name, format, mode, padding, &data.value, live, &mut report) { return false }

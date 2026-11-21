@@ -1,70 +1,80 @@
 # SQLite
 
-`std.sqlite` exposes the system SQLite 3 library on native macOS and Linux.
-The application grants filesystem access when opening a connection. The
-opaque connection is a resource: move it to transfer ownership and call
-`close()` when finished. Closing an already closed connection succeeds.
+`std.sqlite` exposes the system SQLite 3 library on native macOS and Linux
+(`capability filesystem, unsafe`). The opaque connection is a
+`@resource(dispose)`: move it to transfer ownership and call `close()` when
+finished. Closing an already closed connection succeeds; closing while a
+transaction is still active fails.
 
 ```dunder
 capability filesystem
 import std.sqlite as sqlite
 
 fn main() {
-    opened := sqlite.Database::open("application.db", false)
-    assert(opened.ok)
-    mut db := opened.db
+    db := sqlite.Database::open("application.db", false).unwrap()
     defer { _ := db.close() }
-    params: []string = ["a value with ' quotes"]
-    none: []string = []
-    assert(db.exec("CREATE TABLE IF NOT EXISTS items(value TEXT)", &none).ok)
-    inserted := db.exec("INSERT INTO items(value) VALUES(?)", &params)
-    assert(inserted.ok && inserted.changes == 1)
-    rows := db.query("SELECT rowid AS id, value FROM items", &none)
-    assert(rows.ok)
-    for row in &rows.rows { print(row) }
+    none: []sqlite.SqlValue = []
+    db.exec("CREATE TABLE IF NOT EXISTS items(value TEXT)", &none).unwrap()
+    params: []sqlite.SqlValue = [.Text("a value with ' quotes")]
+    inserted := db.exec("INSERT INTO items(value) VALUES(?)", &params).unwrap()
+    assert(inserted.changes == 1)
+    rows := db.query("SELECT rowid AS id, value FROM items", &none).unwrap()
+    for row in &rows {
+        id := row.field_i64("id").unwrap()
+        text := row.field_text("value").unwrap()
+        print(text)
+    }
 }
 ```
 
-`Database::open(path, read_only)` returns `OpenResult { ok, db, error }`.
-Read-only connections use SQLite's `READONLY` flag and enable `query_only`.
-Every connection uses a five-second busy timeout and `FULLMUTEX`.
+All operations return `Result<T, SqliteError>`; `SqliteError` carries `code`
+and `message` (with `Display` and `Eq`). `Database::open(path, read_only)`
+returns `Result<Database, SqliteError>`. Read-only connections use SQLite's
+`READONLY` flag and enable `PRAGMA query_only=ON`. Every connection uses a
+five-second busy timeout and `FULLMUTEX`.
 
-`exec(sql, &params)` returns `ExecResult { ok, changes, last_id, error }`.
-`query(sql, &params)` returns `QueryResult { ok, rows, error }`. It accepts
-read-only statements and returns each row as a JSON object string. Use column
-aliases to choose object keys. Integer values retain all 64 bits, finite REAL
-values retain their double precision, and TEXT preserves embedded NUL and
-UTF-8. SQL NULL becomes JSON null. BLOB and non-finite REAL values are rejected;
-explicitly select `hex(blob_column)` when a text encoding is wanted.
+Parameters are `&[]SqlValue` with the enum variants `Null`, `Int(i64)`,
+`Real(f64)`, `Text(string)` and `Blob([]u8)` (with `is_null`/`as_i64`/`as_f64`/
+`as_text`/`as_blob` returning `Option`). Binding uses explicit byte lengths
+and `SQLITE_TRANSIENT`; an empty `Blob` binds an empty BLOB rather than SQL
+NULL. Parameter counts must match exactly, and only one statement is accepted
+per call, including a complete trigger definition.
 
-`execute_rows(sql, &params)` deliberately permits a statement with effects
-that returns rows, such as `INSERT ... RETURNING` or
-`PRAGMA wal_checkpoint(TRUNCATE)`. It retains the same single-statement,
-binding, row-encoding and finalization rules. Use `query` when reads alone
-are intended.
+`exec(sql, &params)` returns `Result<ExecInfo, SqliteError>` with `changes`
+and `last_id` (64-bit). `query(sql, &params)` returns `Result<[]Row,
+SqliteError>` and accepts only read-only statements. `query_one` returns
+`Result<Option<Row>, SqliteError>` and fails if more than one row matches.
+`execute_rows` deliberately permits a statement with effects that returns
+rows, such as `INSERT ... RETURNING` or `PRAGMA wal_checkpoint(TRUNCATE)`.
+`exec_batch(sql)` runs a multi-statement script without parameters and
+returns `Result<(), SqliteError>`.
 
-`exec_blob(sql, &params, blob_index, &data)` returns `ExecResult` and binds
-one binary value at a one-based placeholder index. `params` contains the
-other text parameters in order. Binary data is bounded to 64 MiB; an empty
-buffer binds an empty BLOB rather than SQL NULL.
+Rows are read directly as typed values: `Row::len`, `column_name`,
+`column_index`, `value(index)` / `by_name(name)` (returning `Option<SqlValue>`),
+plus `is_null`, `get_i64`, `get_f64`, `get_text`, `get_blob` and the
+`field_*` by-name variants (returning `Result<_, SqliteError>`). Integer
+values retain all 64 bits, REAL values their double precision, TEXT preserves
+embedded NUL and is validated as UTF-8, BLOB becomes `[]u8`, and SQL NULL
+becomes `SqlValue::Null`. Query failure returns no partial rows.
 
-Parameters bind text with explicit byte lengths and `SQLITE_TRANSIENT`.
-SQLite applies the usual column affinity; SQL NULL/numbers can also appear
-directly in trusted SQL expressions. Parameter counts must match exactly.
-Only one statement is accepted, including a complete trigger definition.
-Statement boundaries are checked before preparation, including for PRAGMAs
-that can take effect during compilation. A failed tail or parameter check
-does not execute the statement. Each prepared statement is finalized on
-both success and error. Query failure returns no partial rows.
+`db.begin()` / `db.begin_immediate()` return `Result<Transaction,
+SqliteError>`. A `Transaction` offers the same `exec`/`query`/`query_one`/
+`execute_rows`/`exec_batch`, plus `commit()` and `rollback()`; dropping an
+active transaction rolls it back automatically (`dispose`). Only one
+transaction can be active per connection.
 
 Limits are 4 KiB per path, 1 MiB per statement, 1,024 parameters, 16 MiB per
-parameter or TEXT column, 10,000 rows, and 64 MiB of serialized results.
-A trigger may contain up to 256 statement terminators. Statements and paths
-cannot contain NUL. TEXT containing invalid UTF-8 is rejected.
+TEXT parameter or column, 64 MiB per BLOB parameter or column, 10,000 rows,
+64 MiB of accumulated results, and 1,024 statements per batch. A trigger may
+contain up to 256 statement terminators. Statements and paths cannot contain
+NUL. Statement boundaries are checked before preparation, including for
+PRAGMAs that can take effect during compilation; a failed tail or parameter
+check does not execute the statement. Each prepared statement is finalized on
+both success and error.
 
 Native dependencies are `/usr/lib/libsqlite3.dylib` on macOS and
-`libsqlite3.so.0` on Linux. The compiler links those shared libraries directly;
-SQLite queries do not spawn a command-line process. Test with
+`libsqlite3.so.0` on Linux. The compiler links those shared libraries
+directly; SQLite queries do not spawn a command-line process. Test with
 `/absolute/path/to/dunder run tools/test_sqlite.ddr -- /absolute/path/to/dunder`. It builds all three
 native targets and executes the host; use `--runner TARGET=COMMAND` for
 additional available runtimes.

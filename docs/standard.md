@@ -10,9 +10,9 @@ relativ sökväg, till exempel `import .std.map as local`.
 `std.sqlite` innehåller stöd för SQLite med bundna parametrar.
 [SQLite](sqlite.md)
 
-HTTP-servern och TLS-klienten finns som egna Dunderpaket som använder
-operativsystemets sockets och angivna systembibliotek.
-[HTTP-paketen](http.md)
+HTTP-servern, HTTP-klienten, CLI-parsern och strukturerad loggning finns som egna
+Dunderpaket under `packages/`.
+[HTTP-paketen](http.md) · [CLI-paketet](../packages/cli/) · [Loggpaketet](../packages/log/)
 
 ```dunder
 import std.map as map
@@ -92,20 +92,20 @@ delar oföränderlig text.
 | `Map.at`, `Map.get_or`, `Map.contains`, `Set.contains` | Lånar nyckeln. |
 | `table.put(move key, move value)`, `set.insert(move key)` | Tar över nyckeln även vid en dubblett. `put` tar också över värdet. `put_new` sätter bara in om nyckeln saknas. |
 | `table.keys()`, `set.values()` | Returnerar en ny array med klonade nycklar. |
-| `process.command(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
-| `process.run(program, args)`, `process.exec(command)` | Lånar under den synkrona körningen. |
+| `Command::new(move program, move args)`, `add_arg`, `add_args`, `set_cwd`, `set_env`, `set_stdin` | Tar över lagrade strängar och buffertar. |
+| `process.run(program, args)`, `Command::exec`, `Executable::exec` | Lånar under den synkrona körningen. |
 | `process.replace(program, &args)`, `process.replace_as(program, argv0, &args)` | Ersätter den aktuella processen utan en ny PID. Vid fel är miljö, arbetskatalog och standardströmmar orörda. `replace_as` väljer uttryckligen `argv[0]` för multicall-program. |
 | `json.Doc::parse_bytes(move input)` | Dokumentet tar över bytebufferten utan kopia. |
 | `json.Doc::parse_bytes(input.clone())` | Begär uttryckligen ett dokument med en självständig snapshot. |
 | `json.Doc::parse_text(text)` | Lånar strängen och bygger dokumentets UTF-8-buffert. |
-| `net.set_insert(&mut streams, move stream)` | Flyttar en stream till mängden. |
+| `StreamSet::insert(&mut streams, move stream)` | Flyttar en stream till mängden. |
 
 `Command::spawn` och `Command::exec` nollställer signalmasken i barnprocessen
 före programstart, så blockerad signalpollning i föräldern inte gör kommandon
 immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
 `replace` och `replace_as` ersätter samma process och behåller dess signalmask.
 
-`process.set_insert(&mut children, &mut child)` är ett fallibelt
+`ChildSet::insert(&mut children, &mut child)` är ett fallibelt
 överföringsförsök: framgång lämnar barnet i mängden och tömmer källhandtaget;
 `-1` lämnar det oförändrat hos anroparen. Detta kräver ett skrivlån.
 `ChildSet.try_insert(move child)` tar emot ägaren och returnerar
@@ -114,9 +114,9 @@ ger tillbaka barnprocessens handtag till anroparen. För resultattyper med
 tom nyttolast (`Result<T, ()>`) skrivs varianten utan parenteser (`.Ok`
 respektive `.Err`), och metoder på `Result` skrivs alltid med parenteser:
 `.is_ok()`, `.is_err()`, `.unwrap_or(...)` och `.unwrap_or_default()`.
-`ChildSet::poll_io(timeout_ms)` (samt modulfunktionen `process.set_poll_io`)
-väntar på körbar I/O och returnerar antalet färdiga rörbeskrivare från `poll`;
-`ChildSet::wait_any` / `process.set_wait_any` är ett äldre alias med samma returvärde
+`ChildSet::poll_io(timeout_ms)` väntar på körbar I/O och returnerar
+`Result<i32, sys.IoError>` med antalet färdiga rörbeskrivare från `poll`;
+`ChildSet::wait_any` är ett alias med samma returvärde
 (antal färdiga filbeskrivare, inte en enskild slotindexering).
 
 Sockets, socketmängder, barnprocesser och barnprocessmängder är
@@ -144,14 +144,15 @@ vid läsning, fältåtkomst och indexering. En läsreferens kan inte modifieras.
 Oföränderliga bindningar kan inte lånas med `&mut`.
 
 Läslån kan också namnges lokalt med `r := &value` och gäller då till
-deklarationsblockets slut. `&values[start..end]` ger en lånad `&[]T` och
-`&text[start..end]` en UTF-8-kontrollerad bytevy, `&[]u8`, utan ny buffert.
+sista lexikala läsningen i blocket. `&values[start..end]` ger en lånad `&[]T` och
+`&text[start..end]` (liksom `text.as_str()`) ger en UTF-8-kontrollerad lånad
+strängvy, `&str`, utan ny allokering (`v.as_bytes()` ger motsvarande `&[]u8`).
 En funktion kan returnera ett läslån från en av sina delade parametrar
 (med `from namn` vid flera); se
 [låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer).
-Referenser kan fortfarande inte lagras i structar/enums/arrayer och lokala
-skrivlån stöds inte. `copy := values.clone()` skapar en ägd kopia av
-det lånade värdet. Ett anrop får inte ha överlappande muterbara borrows av
+Vytyper som `&T`, `&[]T` och `&str` kan inte lagras i structar, enums, `Option`
+eller arrayer, och lokala skrivlån stöds inte. `copy := values.clone()` skapar
+en ägd kopia av det lånade värdet (och `view.clone()` på `&str` ger en ägd `string`). Ett anrop får inte ha överlappande muterbara borrows av
 samma rotvariabel; även olika fält i samma struct räknas konservativt som
 samma rot. Ändringar som kan flytta en arraybuffert måste beräknas före
 en elementtilldelning eller ett anrop som lånar elementet.
@@ -163,30 +164,36 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 
 | Import | Innehåll |
 | --- | --- |
-| Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Result<T, E>` (med `.is_ok()`, `.is_err()`, `.unwrap_or(...)`, `.unwrap_or_default()`, `.Ok`/`.Err` utan parenteser för `()`, samt villkorliga `Eq`/`Ord`/`Hash`/`Display`) samt implementationer för primitiver och `[]T`/`(A, B)`/`(A, B, C)`. |
+| Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Option<T>` (`Some(T)`, `None` med `is_some`/`is_none`/`unwrap`/`unwrap_or`/`map`/`ok_or`/`?`), `Result<T, E>` (med `is_ok`/`is_err`/`unwrap`/`unwrap_or`/`unwrap_or_default`/`map`/`map_err`/`and_then`/`ok`, `.Ok`/`.Err` utan parenteser för `()`, samt villkorliga `Eq`/`Ord`/`Hash`/`Display`) och implementationer för primitiver, `[]T` och tupler. |
 | `std.cmp` | Trait-generisk ordning och gränser: `min<T>`, `max<T>`, `clamp<T>` (`T: Ord + Storable`), `Ordering`/`Eq`/`Ord` (re-exporterade) samt omslagstypen `Reverse<T>` med villkorliga `Eq`, `Ord`, `Hash`, `Display`, `Default` och `Sendable`. |
 | `std.array` | `ints`, `strings`, `sum` samt generiska algoritmer (`reverse`, `sort`, `sort_by`, `is_sorted`, `binary_search`, `contains`, `index_of`, `equal`, `min_index`, `max_index`, `dedup`, `append`, `fill`, `resize`, `join`) ovanpå `Ord`/`Eq`/`Clone`/`Display`. `sort` och `sort_by` använder introsort på plats med heapsort-fallback, O(n log n); strängar jämförs som UTF-8-byte. |
 | `std.map` | [`Map<K, V>`](#generiska-samlingar) (`K: Hash + Storable`, `V: Storable`) med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.set` | [`Set<K>`](#generiska-samlingar) (`K: Hash + Storable`) ovanpå `Map<K, bool>` med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.hash` | `hash(text)`, `mix`, `combine`, `of<T: Hash + Storable>`, `Hash` och `Hasher` (med `Default`, `.write_u64`, `.write_i64`, `.write_bytes`, `.write_str`, `.finish`). |
-| `std.text` | `starts_with`, `ends_with`, `find`, `contains`, `replace`, ASCII-`lower`/`upper`, `pad_left`/`pad_right`, `split`, `trim`. |
+| `std.text` | `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `replace`, ASCII-`lower`/`upper`, `pad_left`/`pad_right`, `split`, `trim`. |
+| `std.text.view` | Nollallokerande `&str`-vyhjälpare: `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `trim_start`, `trim_end`, `trim`, `strip_prefix`, `strip_suffix`, `before`, `after`. |
+| `std.path` | Plattformskonsekventa sökvägsfunktioner utan disk-I/O: `is_absolute`, `join`, `basename`, `dirname`, `extension` (`Option<string>`), `stem`, `with_extension`, `normalize`. |
+| `std.time` | `monotonic_ms`, väggklocka (`unix_now`, `unix_now_secs`, `unix_now_ms`), `UnixTime`, `DateTime`, `utc_from_unix`, `unix_from_utc`, `format_rfc3339`, `format_rfc3339_ms` och `format_http_date`. |
+| `std.signal` | Portabel signalhantering för tjänster (`Signal`: `Int`, `Pipe`, `Term`; `ignore_sigpipe`/`restore_sigpipe`, `install_shutdown_handler`, `shutdown_fd`, `shutdown_requested`, `take_shutdown_signal`, `SignalWatcher`). |
+| `std.sync` | Trådsäkra koordineringsprimitiv utan delad muterbar heap: begränsad `Channel<T>` (`channel`, `Sender<T>`, `Receiver<T>`, `TryRecv<T>`, `SendResult<T>`, `select2`, `select2_cancel`, `select_ready`, `select_ready_cancel`), uppdaterbara frysta ögonblicksbilder (`Published<T>`, `ReadGuard<T>`), `Semaphore`/`SemaphorePermit`, `CancelToken` (kopplad till `std.signal`), `AtomicI64` och `AtomicBool`. |
 | `std.base64` | RFC 4648 Base64 och URL-säker Base64 (`encode`, `encode_no_pad`, `encode_url`, `encode_url_no_pad`, `decode`, `decode_url`) med strikt kontroll av utfyllnad och avslutande bitar. |
-| `std.bytes` | Packade bytebuffertar (`[]u8`), `from_text`, `from_i32`, `to_i32`, textappend, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex_u8` och kontrollerad UTF-8-avkodning. `append_text`, `utf8` och `hex` finns också för kvarvarande `[]i32`-buffertar. |
+| `std.bytes` | Packade bytebuffertar (`[]u8`), `from_text`, `from_i32`, `to_i32`, `append_utf8`, `extend`, `pad`, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex`, `hex_u8` och kontrollerad UTF-8-avkodning (`decode`, `decode_range`). |
 | `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str`, `Reader::new`/`Default` samt traits `Encode`/`Decode` och `wire.encode<T>`/`wire.decode<T>`). |
-| `std.json` | `Writer` (`Default`) och `Kind` (`Eq`, `Display`) för att skriva JSON, traiten `Encode` (implementerad för skalärer, `string` och `[]T where T: Encode`) med `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`, samt parsern `Doc::parse_bytes`/`Doc::parse_text` med `.get_str`, `.get_i64`, `.get_u64`, `.get_f64`, `.get_bool`, `.raw_span` och `.raw_json`. |
-| `std.sha256` | `[]u8`-API:t `digest_bytes(&[]u8)`, `digest_text(string)`, `digest_range(&[]u8, start, len)`, `hex_bytes(&[]u8)` och `hex_text(string)` ger 32 byte respektive hexsträng; äldre `digest(&[]i32)` och `text(string)` finns kvar. |
+| `std.json` | `Writer` (`Default`, `.finish() -> Result<string, JsonError>`), `Encode` & `Decode` (`@derive(Encode, Decode)`), `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`/`json.to_bytes<T>` för skrivning och `json.decode<T>`/`json.decode_field<T>`/`json.from_bytes<T>`/`json.from_str<T>` för läsning, samt `Doc::parse`/`Doc::parse_utf8` (`Result<Doc, JsonError>`) och `Doc::parse_bytes`/`Doc::parse_text` med `Option<T>`-fält (`get_str`, `get_i64`, `get_u64`, `get_f64`, `get_bool`), `.raw_span` och `.raw_json`. |
+| `std.sha256` | `[]u8`-API:t `digest_bytes(&[]u8)`, `digest_text(string)`, `digest_range(&[]u8, start, len)`, `hex_bytes(&[]u8)` och `hex_text(string)` ger 32 byte respektive hexsträng; `digest(&[]u8)` är ett alias för `digest_bytes`. |
 | `std.parse` | `FromStr` och `parse.value<T: FromStr>` (implementerad för `bool`, `string`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`) samt `Integer::parse`/`Integer::hex`/`Integer::range`, `Unsigned::range`/`Unsigned::hex_range`, `Float32::parse`/`Float64::parse`. `parse` accepterar understreck mellan siffror. |
 | `std.math` | `clamp`, `min`, `max`, `sin`, `cos`, `tan`, `total_cmp_f64`/`total_cmp_f32` samt fällfri `checked_*`-heltalsaritmetik; se [Matematik](#matematik). |
 | `std.io` | Ström-traits (`Read`, `Write`, `BufRead: Read`, `Seek`), `SeekFrom`, `Line`, kapabilitetsstyrda `Stdin`/`Stdout`/`Stderr` (`capability stdio`) och `read_stdin`/`read_stdin_bytes`/`read_stdin_limit`, samt ägda omslag (`BufReader<R>`, `BufWriter<W>` med `FlushError<W>`, `Limited<R>`, `Cursor`, `Empty`, `Sink`) och generiska algoritmer (`copy`, `copy_limit`, `write_all`, `write_str`, `read_exact`, `read_to_end`, `read_to_end_limit`, `read_to_string`, `is_would_block`). |
 | `std.alloc` | Generellt allokerings-API: `AllocError`, `Layout`, `layout_of<T>`, `layout_array<T>`, `Block`, traiten `RawAllocator` (`unsafe fn alloc`/`dealloc`/`alloc_zeroed`/`realloc`), `Global`, `System`, `Capped<A>`, `Stats`, `Tracking<A>`, `Bump<A>`, `OwnedBuf<A>` (`as_bytes`, `io.Write`), `Span`, `Arena<A>`/`FrozenArena<A>` (`freeze_arena`, `read_into_arena`) samt generationssäkra `Pool<T: Storable>`/`Id<T>`. |
-| `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6 (`TcpStream` implementerar `io.Read` och `io.Write`), `IpAddr`, `SocketAddr`, `PollSet`, `StreamSet` och `resolve`. |
-| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata::kind`, `IoError` (`Display`/`Eq`/`Hash`, inklusive `Interrupted`, `NoSpace`, `UnexpectedEof`, `WriteZero`, `would_block`, `is_would_block`), `FileKind` (`Display`/`Eq`/`Hash`), `Status` (`Eq`), lågnivå-FD (`fd_read`/`fd_write`/`fd_close`), samt `unsafe`-primitiverna `memory_zero`, `pool_alloc_try`, `pool_free`, `envp` och `linux_syscall`; se [sys](sys.md). |
-| `std.crypto` | Slumpbyte, Argon2id, HMAC-SHA256, HKDF-SHA256, konstanttidslikhet, AES-256-GCM och Ed25519-signaturer; se [Kryptografi](crypto.md). |
-| `std.sqlite` | SQLite-klient via systemets `libsqlite3`; se [SQLite](sqlite.md). |
+| `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6 (`TcpStream` implementerar `io.Read` och `io.Write`; `TcpListener`, `TcpStream` och `UdpSocket` implementerar `Sendable`), `IpAddr`, `SocketAddr`, `PollSet`, `Waker` (`Sendable`), `StreamSet` och `resolve`. |
+| `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata` (inklusive `is_symlink`, `mode`, `uid`, `gid`, `nlink`, `dev`, `ino`, `mtime`), `IoError` (`Display`/`Eq`/`Hash`, inklusive `Interrupted`, `NoSpace`, `UnexpectedEof`, `WriteZero`, `would_block`, `is_would_block`), `FileKind`, `Status`, lågnivå-FD (`fd_read`/`fd_write`/`fd_close`), samt `unsafe`-primitiverna `memory_zero`, `pool_alloc_try`, `pool_free`, `atomic_*_i64`, `envp` och `linux_syscall`; se [sys](sys.md). |
+| `std.crypto` | Slumpbyte, Argon2id, HMAC-SHA256, HKDF-SHA256, konstanttidslikhet, AES-256-GCM, Ed25519-signaturer (`Result`), `zeroize` och `@resource(dispose)` `SecretBytes`; se [Kryptografi](crypto.md). |
+| `std.sqlite` | Moderniserad SQLite-klient via systemets `libsqlite3` (`Result`, `SqlValue`, `Row`, `exec_batch`, `Transaction`); se [SQLite](sqlite.md). |
 | `std.toml` / `std.toml.tree` | TOML-parser (`toml.parse`), DOM-träd (`Tree` med `Sendable` och `Default`) och JSON-rendering; se [TOML](toml.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
-| `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`/`.open`, `WriteFile::grant`/`.write`/`.create`/`.open_append`, `ReadDir::grant`/`.resolve_read`/`.list`), strömmande `@resource(dispose)`-handtag (`OpenOptions`, `FileReader`, `FileWriter`, `File` med `io.Read`/`io.Write`/`io.Seek`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`). Se [filsystemets kapabiliteter](ffi.md). |
+| `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`/`.open`, `WriteFile::grant`/`.write`/`.create`/`.open_append`, `ReadDir::grant`/`.resolve_read`/`.list`), strömmande `@resource(dispose)`-handtag (`OpenOptions` med `set_nofollow`, `FileReader`, `FileWriter`, `File` med `io.Read`/`io.Write`/`io.Seek`, `Sendable`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `temp_file`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`, `metadata`, `lstat`, `chmod`, `sync_dir`, `write_private_atomic`, `write_private_text_atomic`). Se [filsystemets kapabiliteter](ffi.md). |
 | `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.take_stdin`, `.take_stdout`, `.take_stderr`, `.terminate`, `.kill`), strömhandtagen `ChildStdin`/`ChildStdout`/`ChildStderr`, `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
+| `packages/http`, `packages/http_client`, `packages/cli`, `packages/log` | Fristående ekosystempaket i repots `packages/`: HTTP/1.1 keep-alive-server & webbprimitiv, TLS HTTP-klient, kapabilitetsfri CLI-parser (`cli.App`/`Command`/`parse`/`parse_argv`/`render_help`) samt strukturerad loggning till valfri `io.Write` (`log.Logger`, `Text`/`Json`, `Field`). |
 
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
@@ -200,7 +207,8 @@ och anropa metoder direkt på värdet (`len`, `is_empty`, `put`, `put_new`,
 `insert`, `contains`, `remove`, `take`, `values`). För uppslag som kan
 saknas ger `index_of` ett index eller `-1`.
 
-`text.find` returnerar ett byteindex eller -1. `split` bevarar tomma delar;
+`text.find` returnerar `Option<i32>` (`.Some(byteindex)` eller `.None`).
+`split` bevarar tomma delar;
 en tom separator ger en del med hela texten. `trim` tar ASCII-mellanslag,
 tabb, CR och LF. `parse.integer`, `parse.hex`, `parse.i64_range`, `parse.u64_range`
 och `parse.hex_u64_range` ger fel 1 för stavning och 2 för overflow; både
@@ -237,8 +245,8 @@ fn main() {
     table.put("values", move samples)
     assert(table.at("values")[1] == 42)
     match table.take("values") {
-        .Ok(values) => { assert(values.len == 2) },
-        .Err => { assert(false) },
+        .Some(values) => { assert(values.len == 2) },
+        .None => { assert(false) },
     }
 }
 ```
@@ -263,7 +271,7 @@ Kraven kontrolleras redan när samlingstypen används, även för en tom samling
 `put` den lagrade nyckeln och ersätter värdet, medan `put_new` lämnar befintlig post
 orörd och returnerar `false`. `insert` returnerar `false` och släpper den inkommande
 nyckeln. Omhashning flyttar bara index. `take` överför det lagrade värdet eller
-setelementet i `.Ok` och ger `.Err` vid en saknad nyckel. `remove` och `clear`
+setelementet i `.Some` och ger `.None` vid en saknad nyckel. `remove` och `clear`
 släpper borttagna ägare via de vanliga cleanupreglerna. En `.clone()` av hela
 samlingen kräver klonbara nycklar och värden.
 `Set.take_at(index)` tar ut ett ägt element via dess index.
@@ -323,20 +331,18 @@ fn main() {
     writer.integer(2)
     writer.end()
     writer.end()
-    encoded := writer.finish()
-    assert(encoded.ok)
-    print(encoded.value)
+    encoded := writer.finish().unwrap()
+    print(encoded)
 }
 ```
 
 `Writer` (som även implementerar `Default`) sköter skiljetecken för objekt och
-arrayer. Typade värden kan dessutom serialiseras via traiten `json.Encode` och
-hjälparna `json.encode<T>`, `json.field_value<T>` och `json.to_string<T>`. Anropa `key` före
-värdet i ett objekt och `end` för varje öppnad behållare. `finish().ok`
+arrayer och returnerar `Result<string, JsonError>` från `.finish()` respektive `Result<[]u8, JsonError>` från `.finish_bytes()`. Typade structar och värden kan dessutom serialiseras och avkodas via traiten `json.Encode` och `json.Decode` (samt `@derive(Encode, Decode)`), tillsammans med hjälparna `json.encode<T>`, `json.decode<T>`, `json.field_value<T>` och `json.to_string<T>`. Anropa `key` före
+värdet i ett objekt och `end` för varje öppnad behållare. `finish()`
 kräver precis ett komplett rotvärde och en giltig följd av anrop.
 `decimal`, `write_f64` och `field_f64` avvisar NaN och oändlighet.
-`Doc.as_f64` och `Doc.get_f64` ger `ok: false` för saknade värden,
-värden av annan JSON-typ och tal utanför det ändliga binary64-området.
+`Doc::as_*` och `Doc::get_*` returnerar `Option<T>` (`None` för saknade värden,
+fel JSON-typ eller flyttal utanför det ändliga binary64-området).
 `Doc.raw_span(node)` returnerar källtextens spann som `string`: för objekt,
 arrayer, tal, bool och `null` ges hela JSON-tokenet, medan strängnoder ger
 det inre råa stränginnehållet utan omgivande citattecken (med eventuella
@@ -383,7 +389,7 @@ För typat och lånekontrollerat minne finns tre `@resource(dispose)`-strukturer
 
 ## Lagring och verifiering
 
-Dynamiska buffertar använder en gemensam **512 MiB heap** på native, mappad vid första behov. Buffertarna har unika ägare; uttryckliga kloner
+Dynamiska buffertar allokeras via `std.alloc` i dynamiska heap-slabs på native (utan något fast 512 MiB-tak) som växer vid behov och frisläpper tomma block tillbaka till operativsystemet. Buffertarna har unika ägare; uttryckliga kloner
 är oberoende. Tillväxt frigör den gamla bufferten efter överföringen.
 Tilldelning, scope-slut och retur frigör övergivna buffertar, även i nästlade
 structar och aktiva enumpayloads. `clear` frigör elementens strängreferenser

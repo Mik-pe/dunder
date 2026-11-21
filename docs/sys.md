@@ -35,7 +35,7 @@ implementeras i [native-backenden](../selfhost/runtime/runtime_sys.ddr).
 
 | Funktion | Returtyp | Beteende |
 | --- | --- | --- |
-| `sys.read(path)` | `sys.ReadResult` | UTF-8-läsning med `Ok(string)` / `Err(IoError)`. |
+| `sys.read(path)` | `Result<string, IoError>` | UTF-8-läsning med `.Ok(string)` / `.Err(IoError)`; `sys.read_limit`, `sys.read_bytes` och `sys.read_bytes_limit` är varianter med explicit gräns. |
 | `sys.read_text(path)` | `sys.TextResult` | Läser en vanlig fil och validerar UTF-8. |
 | `sys.write_text(path, text)` | `sys.Status` | Skapar filen eller ersätter hela dess innehåll. |
 | `sys.write_stderr(text)` | `sys.Status` | Skriver textens exakta UTF-8-byte till stderr, utan radbrytning. |
@@ -48,12 +48,14 @@ implementeras i [native-backenden](../selfhost/runtime/runtime_sys.ddr).
 | `sys.remove_dir(path)` | `sys.Status` | Tar bort en tom katalog. |
 | `sys.pid()` | `i32` | Processens ID. |
 | `sys.error_message(error)` | `string` | Kort meddelande för vanliga fel; annars `"OS error N"`. |
-| `sys.file_kind(info)` | `sys.FileKind` | `Other`, `File` eller `Directory` från en `Metadata`. Kontrollera först `info.ok`. |
+| `sys.file_kind(info)` | `sys.FileKind` | `Other`, `File`, `Directory` eller `Symlink` från en `Metadata`. Kontrollera först `info.ok`. |
 | `sys.error_from_code(code)` | `sys.IoError` | Namngivet fel eller `Other(code)` för en okänd kod. |
 | `sys.error_code(error)` | `i32` | Dunders felkod, även för `Other(code)`. |
 | `sys.io_error_message(error)` | `string` | Feltext för ett typat `IoError`. |
-| `sys.write_bytes(path, &bytes)` | `sys.Status` | Skriver `[]i32` som råa byte; kräver värden 0–255. |
-| `sys.decode_utf8(&bytes)` | `sys.TextResult` | Validerar byteintervallet och avkodar giltig UTF-8. |
+| `sys.write_u8(path, &bytes)` | `sys.Status` | Skriver `[]u8` som råa byte till fil. |
+| `sys.read_u8(path)` / `read_u8_limit(path, max)` | `sys.BytesResult` | Läser upp till 1 GiB (`1 073 741 823` byte) som `[]u8`. |
+| `sys.read_text_limit(path, max_bytes)` | `sys.TextResult` | Läser UTF-8-fil med explicit bytegräns. |
+| `sys.decode_u8(&bytes)` / `decode_u8_range(...)` | `sys.TextResult` | Validerar byteintervallet i `[]u8` och avkodar giltig UTF-8. |
 | `sys.arg_count()` | `i32` | Antal programargument, inklusive programnamnet. |
 | `sys.arg(index)` | `string` | Kopierar och UTF-8-validerar ett argument; `arg(0)` är programnamnet. |
 | `sys.same_file(first, second)` | `bool` | Jämför device/inode, följer länkar. Falskt om stat eller sökvägskontroll misslyckas. |
@@ -64,12 +66,13 @@ implementeras i [native-backenden](../selfhost/runtime/runtime_sys.ddr).
 | `unsafe sys.linux_syscall(nr, a0..a5)` | `i64` | Rått Linux-systemanrop via ARM64-kanoniskt anropsnummer (`nr: i64, a0..a5: i64`; översätts automatiskt på `x86_64-linux`). |
 | `unsafe sys.memory_copy(destination, source, count)` | `()` | Kopierar `count: usize` byte mellan giltiga minnesområden; överlappning är tillåten. |
 | `unsafe sys.memory_equal(lhs, rhs, count)` | `bool` | Jämför `count: usize` byte i giltiga minnesområden. |
+| `unsafe sys.memory_zero(dst, count)` | `()` | Nollställer `count: usize` byte säkert med kompilatorbarriär. |
+| `unsafe sys.atomic_*_i64` | `i64` | Hårdvaruatomiska `atomic_load_i64`, `atomic_store_i64`, `atomic_cas_i64` och `atomic_fetch_add_i64`. |
 
-Samtliga sökvägar och textargument har typen `string`. `read` använder enums:
+Samtliga sökvägar och textargument har typen `string`:
 
 ```dunder
-pub enum FileKind { Other = 0, File = 1, Directory = 2 }
-pub enum ReadResult { Ok(string), Err(IoError) }
+pub enum FileKind { Other = 0, File = 1, Directory = 2, Symlink = 3 }
 ```
 
 `IoError` har bland annat `NotFound`, `PermissionDenied`, `InvalidUtf8` och
@@ -98,6 +101,14 @@ pub struct Metadata {
     is_file: bool,
     is_dir: bool,
     error: i32,
+    is_symlink: bool,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    dev: u64,
+    ino: u64,
+    mtime: i64,
 }
 ```
 
@@ -119,11 +130,10 @@ Ett stängt handtag ger fel 9; ett fullt icke-blockerande handtag ger fel 35.
 Vid ett senare fel kan en del av texten redan ha skrivits. `eprint` använder
 den vanliga strängarenan för att lägga till radbrytningen.
 
-`write_bytes` följer samma fil-/skrivregler som `write_text`, men UTF-8 krävs
-inte för innehållet. Den validerar byteintervallet före öppning/trunkering;
-ett felaktigt element ger 22. En tillfällig packad bytebuffert använder
-strängarenan och kan ge 12 om utrymmet inte räcker. `decode_utf8` har samma
-intervallkontroll, ger 92 för ogiltig UTF-8 och har tom `.value` vid fel.
+`write_u8` (och `write_bytes` med `Result`) följer samma fil-/skrivregler som
+`write_text`, men UTF-8 krävs inte för innehållet eftersom `[]u8` skrivs som
+råa byte. `decode_u8`/`decode_u8_range` har samma intervallkontroll, ger 92
+för ogiltig UTF-8 och har tom `.value` vid fel.
 Sökvägar är fortsatt UTF-8 även vid binär utdata.
 
 Argument exponeras som vanliga oföränderliga Dunder-strängar. Felaktigt
@@ -153,7 +163,7 @@ För generell allokering finns dessutom `unsafe sys.pool_alloc_try(size)` och
 `unsafe sys.pool_free(pointer)` ovanpå Dunders inbyggda poolallokator. Till
 skillnad från automatiska array- och strängtillväxter fäller `pool_alloc_try`
 aldrig utan returnerar en nullpekare vid begäran om `0` byte, storlekar över
-`256 MiB` eller full pool. [Generell allokering](standard.md#generell-allokering).
+`1 GiB` på nativa mål (`256 MiB` i WebAssembly) eller full pool. [Generell allokering](standard.md#generell-allokering).
 
 ## Sökvägar och filer
 
@@ -161,7 +171,7 @@ Relativa sökvägar utgår från programmets arbetskatalog, inte källfilens
 katalog. Absoluta sökvägar fungerar också. Sökvägar måste vara giltig UTF-8;
 filnamn med andra byteföljder kan inte uttryckas med denna första API-version.
 Inbäddad NUL avvisas före OS-anropet så att en sökväg aldrig tyst kapas.
-Högst 1023 UTF-8-byte ryms i en sökväg; OS:et kontrollerar också komponenter.
+Högst 4095 UTF-8-byte ryms i en sökväg (fel 63); OS:et kontrollerar också komponenter.
 
 `read_text`, `write_text` och `append_text` hanterar vanliga filer.
 Kataloger, enheter och FIFO:er används inte som textströmmar. Öppning är
@@ -187,10 +197,12 @@ tar bort länken själv. Borttagning är inte rekursiv. `rename` kan misslyckas
 
 ## Gränser och fel
 
-`read_text` tillåter högst **4 MiB per fil**, baserat på filens storlek efter
-öppning. En större fil ger fel 27. En fil som krymper kan ge ett kortare
-lyckat resultat. Växer den utöver den uppmätta storleken under läsningen
-ger EOF-kontrollen fel 35 i stället för tyst trunkering. Läsningen är inte
+`read_text`, `read_u8` och `read_u8_limit`/`read_bytes_limit` tillåter högst
+**1 GiB per fil** (`1 073 741 823` byte, så intern buffert + NUL ryms inom 1 GiB),
+baserat på filens storlek efter öppning. En större fil ger fel 27. En fil som
+krymper kan ge ett kortare lyckat resultat. Växer den utöver den uppmätta
+storleken under läsningen försöker läsningen igen (upp till fyra gånger) och
+ger till slut fel 35 i stället för tyst trunkering. Läsningen är inte
 en atomisk snapshot gentemot samtidiga skribenter.
 
 Lästa strängar använder samma återanvändbara heap som andra strängar och arrayer.
@@ -262,15 +274,19 @@ på macOS, där `std.process` använder plattformens miljö-API. Se
 [målplattformarnas verifiering](targets.md).
 Systemanropen är en plattformsdetalj som anpassas per mål.
 Binärläsning finns som `sys.read_u8`/`read_u8_limit`/`read_u8_into` och
-katalogverktyg i `std.fs` (`list_dir`, `ReadDir::list`, `remove_all`).
-Godtyckliga rättighetsändringar (`chmod`) återstår.
+katalogverktyg, länkfri öppning, metadata (`lstat`/`fstat`), `sync_dir`,
+atomiska privata filer (`temp_file`, `write_private_atomic`) samt rättighetsändringar
+(`chmod`/`set_permissions`) finns i [`std.fs`](standard.md#moduler).
 
 ## Kapabilitetsöversikt
 
 Moduler i Dunder deklarerar använda privilegier med `capability ...` högst upp
-i källfilen. De grundläggande fil-, text- och klockfunktionerna i `sys` kräver
-däremot ingen särskild `capability`-rad: de verkar med öppna/stängda
-engangsanrop utan delegeringsbara katalog-/filhandtag eller processåtkomst.
+i källfilen, och publika funktioner kan dessutom märkas `@requires(...)`: en
+anropande modul måste då själv deklarera kapabiliteten. Själva `sys`-modulen
+deklarerar `capability unsafe, filesystem, stdio`, och dess funktioner är
+märkta därefter. Fil-, text- och klockfunktionerna i `sys` kräver alltså
+kapabiliteter: fil-I/O kräver `filesystem`, stderr kräver `stdio`, medan
+klocka, argument och process-ID inte kräver någon kapabilitet.
 Råa filbeskrivare (`sys.fd_*` och `io.fd_*_chunk`) kräver `capability unsafe`,
 och nätverksanropen (`sys.net_*`) kräver `capability network`.
 Högre standardmoduler skyddar bredare OS-operationer med uttryckliga kapabiliteter
@@ -278,22 +294,25 @@ Högre standardmoduler skyddar bredare OS-operationer med uttryckliga kapabilite
 
 | Modul / API | Krävd kapabilitet | Exempel på operationer |
 | --- | --- | --- |
-| `sys` (grundläggande fil-I/O, tid, argument) | Ingen | `sys.read`, `sys.read_text`, `sys.write_text`, `sys.append_text`, `sys.metadata`, `sys.mkdir`, `sys.rename`, `sys.remove_file`, `sys.remove_dir`, `sys.same_file`, `sys.read_u8`, `sys.write_u8`, `sys.now_ms`, `sys.sleep_ms`, `sys.pid`, `sys.arg`, `sys.write_stderr`, `sys.eprint` |
+| `sys` (fil-I/O) | `capability filesystem` | `sys.read`, `sys.read_text`, `sys.write_text`, `sys.append_text`, `sys.metadata`, `sys.mkdir`, `sys.rename`, `sys.remove_file`, `sys.remove_dir`, `sys.same_file`, `sys.read_u8`, `sys.write_u8`, `sys.make_executable` |
+| `sys` (stderr, klocka, argument) | `capability stdio` för `write_stderr`/`eprint`; ingen för klocka/argument | `sys.write_stderr`, `sys.eprint`, `sys.now_ms`, `sys.sleep_ms`, `sys.pid`, `sys.arg`, `sys.arg_count` |
 | `sys` & `std.io` (råa FD, råminne & systemanrop) | `capability unsafe` | `sys.fd_read`/`fd_write`/`fd_close`/`fd_poll`/`fd_set_nonblocking`, `io.fd_read_chunk`/`fd_write_chunk`, `sys.envp`, `sys.linux_syscall`, `sys.memory_copy`, `sys.memory_equal`, `sys.memory_zero`, `sys.pool_alloc_try`, `sys.pool_free` |
 | `sys` (låg-nivå-sockets) | `capability network` | `sys.net_listen`, `sys.net_accept`, `sys.net_connect`, `sys.net_read`, `sys.net_peek`, `sys.net_write`, `sys.net_poll`, `sys.net_set_nonblocking`, `sys.net_set_nodelay`, `sys.net_local_port`, `sys.net_shutdown_write`, `sys.net_close` |
 | `std.fs` | `capability filesystem` | `fs.list_dir`, `fs.mkdir_all`, `fs.remove_all`, `fs.temp_dir`, `fs.cwd`, `fs.realpath`, `fs.symlink`, `fs.hard_link`, `fs.is_symlink`, samt skapande av handtagen `ReadFile::grant`, `WriteFile::grant`, `ReadDir::grant`, `WriteFile::create` och `File::open` (även `std.sqlite` använder `filesystem` och `unsafe`) |
 | `std.io` (standardströmmar) | `capability stdio` | `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.read_stdin`, `io.read_stdin_bytes`, `io.read_stdin_limit` |
-| `std.net` | `capability network` | `TcpListener`, `TcpStream`, `UdpSocket`, `net.resolve`, `net.listen`, `net.connect` |
+| `std.net` | `capability network` | `TcpListener`, `TcpStream`, `UdpSocket`, `PollSet`, `StreamSet`, `net.Waker`, `net.resolve` |
 | `std.process` | `capability process` | `Command::spawn`/`exec`, `Executable::grant`, `process.run`, `process.replace`, `process.env`, `ChildSet` |
 | `std.dl`, `std.alloc.RawAllocator`, FFI | `capability unsafe` | `dl.open`/`sym`, `RawAllocator::alloc`/`dealloc`, `extern`, `addr`, `ptr`, `bytes_view` |
 
-Observera varför exempelvis `fs.list_dir` och `fs.realpath` kräver
-`capability filesystem` medan `sys.read_text` inte gör det: `std.fs` exponerar
-katalogtraversering, rekursiv radering och delegeringsbara fil-/kataloghandtag
-(`ReadFile`, `WriteFile`, `ReadDir`), som är tänkta att styras i paketets
-ytterkant. Själva handtagsmetoderna som `.read()` på ett redan beviljat
-`ReadFile`-handtag kan däremot anropas i moduler utan egen `capability
-filesystem`; bara skapandet (`grant`/`open`) kräver kapabiliteten.
+Observera att även `sys.read_text` och `sys.write_text` nu kräver
+`capability filesystem` hos anroparen (`@requires(filesystem)` i
+`sys.ddr`): filåtkomst är inte längre fri bara för att den sker som ett
+öppna/stäng-engångsanrop. `std.fs` exponerar dessutom katalogtraversering,
+rekursiv radering och delegeringsbara fil-/kataloghandtag
+(`ReadFile`, `WriteFile`, `ReadDir`); bara skapandet av handtagen
+(`grant`/`open`) är märkt `@requires(filesystem)` i `std.fs`, men
+handtagsmetoderna som `.read()` går vidare till `sys.read_text` och kräver
+därför ändå `capability filesystem` hos den slutliga anroparen.
 
 För kod som ska få åtkomst till en vald fil via en parameter finns
 `std.fs.ReadFile` och `std.fs.WriteFile`. Handtagen skapas i en modul

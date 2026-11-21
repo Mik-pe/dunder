@@ -1,10 +1,12 @@
 # Isolerade uppgifter
 
 `task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar:
-via `libdispatch` på ARM64/macOS och POSIX-trådar (`pthread_create`/`pthread_join`)
-på ARM64/Linux och x86-64/Linux.
-Runtimen stöder alla tre nativa målen utan runtimeprofilering.
-Nåbara taskoperationer på `wasm32` och med `--runtime-profile` avvisas före kodemission.
+via `libdispatch` på ARM64/macOS och en långlivad POSIX-trådpool
+(`pthread_create`/`pthread_join` plus futex-väckning) på ARM64/Linux och
+x86-64/Linux.
+Runtimen stöder dessa tre nativa mål utan runtimeprofilering.
+Nåbara taskoperationer på wasm-målen (`wasm32`, `wasm32-wasi`), på
+`x86_64-windows` och med `--runtime-profile` avvisas före kodemission.
 
 ```dunder
 fn sum(values: []i64) -> i64 {
@@ -26,8 +28,38 @@ fn main() {
 
 Programmet skriver `6`, `30`, `6`. Kapaciteten är ett positivt `i32`-värde
 som begränsar antalet aktiva jobb i scopet. När gränsen är nådd samlar nästa
-spawn in det äldsta aktiva jobbet innan nästa jobb lämnas till poolen.
-Resultatet sparas tills scopet avslutas.
+spawn in det äldsta aktiva jobbet innan nästa jobb lämnas till poolen (för
+detached `spawn!`-jobb, alltså `()`-resultat, återanvänds slutna kontrollposter
+i O(kapacitet) minne).
+`spawn! jobs worker()` skapar ett detached jobb utan resultatnyckel (workern
+måste returnera `()`); `await_any jobs(ids)` tar en `[]TaskID<T>` (eller lån
+därav) och returnerar indexet för första färdiga jobbet, eller `-1` för en tom
+lista.
+
+### Kapabilitetsstyrda I/O-scopes och konfigurerbar arenastorlek
+
+Rena beräkningsscopes (`task scope jobs(N)`) förbjuder I/O och osäkra anrop.
+Ett scope kan i stället uttryckligen bevilja delmängder av modulens egna
+kapabiliteter (`filesystem`, `network`, `process`, `stdio`) och valfri
+arenastorlek per arbetare med:
+
+```dunder
+task scope workers(4) with (network, filesystem) arena 8 * 1024 * 1024 {
+    ...
+}
+```
+
+Granskade standardbindningar i `std.net`, `std.fs`, `std.sqlite`, `std.crypto`,
+`std.time` och `std.sync` är märkta `@thread_safe` så de får anropas från
+arbetare med motsvarande beviljade kapabilitet, medan godtycklig C-FFI fortfarande
+avvisas utan `unsafe`. På Linux återanvänder scopet långlivade arbetartrådar
+inom scopets livstid. For koordinering i minnet utan delad muterbar heap erbjuder
+[`std.sync`](standard.md#moduler) begränsade kanaler (`Channel<T>` med `Sender`/`Receiver`
+och `select2`/`select2_cancel`), uppdaterbara frysta ögonblicksbilder (`Published<T>`
+och `ReadGuard<T>`), `Semaphore`, `CancelToken` (kopplad till [`std.signal`](standard.md#moduler))
+samt skalära `AtomicI64` och `AtomicBool`.
+
+Resultatvärden sparas tills scopet avslutas eller hämtas med `await!`.
 
 ## Ägare och resultatnycklar
 
@@ -93,8 +125,10 @@ analystillstånd inför jobbet.
 Arbetsytan skapas och stannar i workerarenan. Kompilatorn kontrollerar
 initialiserarens transitiva effekter och alla lagrade typer, även i opaque
 records. Tal, lokala strängar, enums (inklusive payload-enums som `Result`),
-tillåtna arrayer och recordfält stöds. `@resource`, adresser, lån, callbacks
-och tasknycklar avvisas. Separata scope äger separata arbetsytor.
+tillåtna arrayer, recordfält samt `@resource(dispose)`-fält som ägs per
+arbetare (exempelvis en egen `sqlite.Database`-koppling) stöds — de sistnämnda
+får sin `dispose()` körd på ägartråden när scopet stängs. Däremot avvisas
+adresser, lokala lån, callbacks och tasknycklar. Separata scope äger separata arbetsytor.
 
 ## Gemensam läsbar indata
 
@@ -142,43 +176,52 @@ fn example() {
 Indata och returtyp måste uppfylla den inbyggda kompilatorbevisade traiten
 [`Sendable`](syntax.md#traits-och-impl-trait-for-type):
 
-- Primitiva tal, `bool`, `rune`, `unit`, `string` och enums utan payload.
+- Primitiva tal, `bool`, `rune`, `()`, `string` och enums utan payload.
 - Payload-enums (inklusive `Result<T, E>`) vars varianttyper är `Sendable`.
 - Ägda och fasta arrayer (`[]T`, `[T; N]`) vars elementtyp är `Sendable`.
 - Transparenta structar och tupler vars fält rekursivt är `Sendable`.
 - `opaque struct` som uttryckligen deklarerar `impl Sendable for Typ {}`
-  (exempelvis `Map<K, V>` när `K: Sendable, V: Sendable` och `Set<K>` när
-  `K: Sendable`) och vars privata fält bevisas uppfylla `Sendable`.
+  (exempelvis `Map<K, V>` när `K: Sendable, V: Sendable`, `Set<K>` när
+  `K: Sendable`, samt renodlade handtagsresurser som `TcpStream`, `TcpListener`,
+  `UdpSocket`, `fs.File`, `sqlite.Database`, `sync.Sender<T>`, `sync.Receiver<T>`,
+  `sync.Published<T>`, `sync.Semaphore`, `sync.CancelToken`, `sync.AtomicI64`,
+  `sync.AtomicBool` och `net.Waker`), där flyttbara `@resource`-handtag använder
+  strikt `move`-överföring (sändarens ägarslot nollställs).
 
-`@resource`, borrows, råpekare (`ptr`), funktionsvärden/closures, scratch-vyer,
-`TaskID<R>` och oklassificerade `opaque struct` är inte `Sendable` och avvisas
-statiskt. Strängar, payload-enums och sammansatta arrayer går genom dedikerad
+Lån, råpekare (`ptr`), funktionsvärden/closures, scratch-vyer, `TaskID<R>`
+och oklassificerade `@resource`- eller `opaque struct`-typer är inte `Sendable`
+och avvisas statiskt. Strängar, payload-enums och sammansatta arrayer går genom dedikerad
 isolerad djupkloning så att varje tråd får helt egna allokeringar med egen
 referensräkning i sin arena utan delade icke-atomära räknare.
 
 Arbetaren får använda lokala lån, strängar, scratch och allokering i sin
-egen runtime. En separat transitiv effektanalys avvisar unsafe, FFI,
-muterbar global lagring, callbacks, omgivningstjänster som I/O och argv,
+egen runtime samt de kapabiliteter som uttryckligen beviljats via scopets
+`with (...)`-klausul. I övrigt avvisar den transitiva effektanalysen unsafe, FFI,
+muterbar global lagring, callbacks, obeviljad I/O/argv,
 okända indirekta anrop och nästlad task-scheduling. Även hjälpfunktionernas
 anrop och semantiskt kontrollerad död kod ingår. Enbart en funktionssignatur
 bevisar inte att en worker är tillåten.
 
-Vid `spawn` klonas den typgodkända indatan direkt till en exklusiv
-workerarena medan källvärdet fortfarande är lånat på föräldratråden.
-Runtimen lämnar över arenans allokerartillstånd och den ägda kopian till
+Vid `spawn` klonas (eller, för flyttbara `Sendable`-`@resource`, flyttas med
+`move`) den typgodkända indatan till en exklusiv workerarena.
+Runtimen lämnar över arenans allokerartillstånd och ägarkopian till
 ett jobb. På macOS används libdispatch och en dispatchgrupp per jobb. På Linux
-startar och inväntar runtimen en POSIX-tråd. Skalarer skickas som värdebitar. Efter avslutat jobb
+återanvänder scopet en trådpool ovanpå POSIX-trådar. Skalärer skickas som värdebitar. Efter avslutat jobb
 kopieras det efterfrågade resultatet till förälderns arena. En vanlig
 `await` klonar förälderns cache medan `await!` tar över den.
-Varje aktiv worker har en återanvänd arena på 512 MiB och en stack på 8 MiB, åtskilda av ett skyddat adressintervall. Scopet avmappar reservationen vid utgång. Ett scope utan arbetsyta behåller högst 64 lediga arenor. Med arbetsyta begränsar scopets kapacitet antalet arenor.
+Som standard har en arbetare 16 MiB reserverat virtuellt arenautrymme (minst
+256 KiB, avrundat till 16 KiB; kan anpassas med `arena <storlek>`) och en
+stack på 8 MiB, åtskilda av ett skyddat adressintervall på 16 MiB. Scopet
+avmappar reservationen vid utgång. Ett scope utan arbetsyta behåller högst
+64 lediga arenor. Med arbetsyta begränsar scopets kapacitet antalet arenor.
 
 ## Fel och kompilering
 
 Felaktig kapacitet eller resultatnyckel samt fel vid skapande, inväntan eller avmappning
 avslutar processen med status 112. En misslyckad inväntan bevisar inte att arbetaren
 har avslutats; felvägen får därför inte läsa eller frigöra dess lagring.
-Vanliga runtimefällor i en worker behåller processavslut som felmekanism.
-Cancellation, detach och återhämtning från taskfel ingår inte i första API:t.
+Vanliga runtimefällor i en worker behåller processavslut som felmekanism;
+kooperativ avbrytning sker med `std.sync.CancelToken` och `std.signal`.
 
 Typkontrollen registrerar direkta effekter, anrop och spawnplatser under
 den vanliga kroppsvandringen. Både build och check certifierar grafen när
@@ -197,11 +240,11 @@ allokeringsarena. Scopet inväntar aktiva jobb före frigöring av resultaten.
 | Post | Storlek | Fält vid byteoffset |
 | --- | ---: | --- |
 | Samordnare | 32 | 0 initierad, 8 ägartråd, 16 senast utfärdad generation, 24 reserverat |
-| Scope | 128 | 0 generation, 8 tillstånd (1 öppet, 2 stängt), 16 gräns, 24 aktiva jobb, 32 utfärdade jobb, 40 indexkapacitet, 48 indexpekare, 56/64 köhuvud/-slut, 72 ägartråd, 80/88 ledig lista/antal, 96 arbetsytans initierare, 104 delat värde, 112 dess städfunktion |
+| Scope | 192 | 0 generation, 8 tillstånd (1 öppet, 2 stängt), 16 gräns, 24 aktiva jobb, 32 utfärdade jobb, 40 indexkapacitet, 48 indexpekare, 56/64 köhuvud/-slut, 72 ägartråd, 80/88 ledig lista/antal, 96 arbetsytans initierare, 104 delat värde, 112 dess städfunktion, samt utökade fält vid 120–184 (arena-storlek per arbetare, ledig lista för detached-jobb, semafor/väntcell för worker-lane) |
 | Indexpost | 16 | 0 lånad jobbpekare, 8 exakt resultattyp |
-| Jobbpost | 160 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer, 24 scope, 32 aktiv, 40 nästa lediga post, 48 nativ kontrollpost |
+| Jobbpost | 192 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer (−1 för detached), 24 scope, 32 aktiv, 40 nästa lediga post, 48 resultatstatus (4 cachad, 10 övertagen av `await!`), 64 nativ kontrollpost, samt utökade fält vid 96–184 (återvunnen arena, arbetsyta, delad plats, arena-storlek, lane) |
 | Jobbtyp | 64 | 0 initierad, 8 resultattyp, 16 starta, 24 hämta, 32 kassera, 40 klona resultat, 48 städa resultat, 56 reserverat |
-| Nativ kontrollpost | 112 | 0 tillstånd, 8 dispatchgrupp eller `pthread_t`, 16 indata, 24 resultat, 32 arenabas, 40 förälderns resultat, 48 allokeringsposition, 56 väntfel, 64 avmappningsfel, 72 återvunnen arena, 80 arbetsytans initierare, 88 arbetsyta, 96 lån av scopets delade plats |
+| Nativ kontrollpost | 144 | 0 tillstånd, 8 dispatchgrupp eller `pthread_t`, 16 indata, 24 resultat, 32 arenabas, 40 förälderns resultat, 48 allokeringsposition, 56 väntfel, 64 avmappningsfel, 72 återvunnen arena, 80 arbetsytans initierare, 88 arbetsyta, 96 lån av scopets delade plats, samt utökade fält vid 104–136 (worker-pool-lane) |
 
 Kontrollpostens tillstånd är 0 klar för start, 1 inlämnad, 4 cachad, 5 startfel,
 6 väntfel, 8 kasserad, 9 avmappningsfel och 10 resultat övertaget av `await!`.

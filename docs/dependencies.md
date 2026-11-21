@@ -84,8 +84,10 @@ Flaggan kan kombineras med `--locked` och användas med `build`, `run`, `check`,
 
 ## Cache och transitiva beroenden
 
-Git-källorna lagras under rotprojektets `build/.dunder/git`. Varje checkout
-har en bestämd, frikopplad commit. Källorna ska inte redigeras där; använd
+Git-källorna lagras i en delad cache under `$DUNDER_HOME/git` (eller
+`~/.dunder/git` när `DUNDER_HOME` saknas); utan någon av miljövariablerna
+används rotprojektets `build/.dunder/git`. Varje checkout har en bestämd,
+frikopplad commit. Källorna ska inte redigeras där; använd
 `path` för ett bibliotek som du utvecklar lokalt. En ändrad cache-checkout
 avvisas. Cachen kan tas bort och återskapas från manifest och låsfil.
 Samtidiga upplösningar i samma projekt samordnas innan cachen och låsfilen
@@ -130,7 +132,7 @@ dunder check --example atlas
 Exempelsökvägen tolkas relativt manifestets katalog och delar projektets
 beroendegraf och `dunder.lock` (inklusive `--offline` och `--locked`). Utan
 `-o` skrivs utdata till `build/<mål>/examples/<namn>` (med `.wasm` för
-`wasm32` och `.app` med `--app`), så exempel med samma filnamn inte kolliderar
+`wasm32`/`wasm32-wasi`, `.exe` för `x86_64-windows` och `.app` med `--app`), så exempel med samma filnamn inte kolliderar
 med varandra eller med huvudprogrammet. `root` och `test_root` fortsätter att
 vara standardvalen när `--example` utelämnas.
 
@@ -141,7 +143,8 @@ Exempelnamn består av ASCII-bokstäver, siffror, `_` och `-` utan inledande
 
 - **Binärnamn i `build/` från `dunder.toml`:** Utan `-o` döps projektets
   färdigbyggda binär under `build/<mål>/<namn>` efter paketets `name` i
-  `dunder.toml` (med `.wasm` för `wasm32` och `.app` med `--app`) i stället
+  `dunder.toml` (med `.wasm` för `wasm32`/`wasm32-wasi`, `.exe` för
+  `x86_64-windows` och `.app` med `--app`) i stället
   för källfilens stamnamn (`main`).
 - **Arbetskatalog vid `dunder run`:** När `dunder run` startar den byggda
   binären körs programmet alltid i anroparens aktuella arbetskatalog (även vid

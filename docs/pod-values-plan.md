@@ -1,10 +1,12 @@
 # Plan för POD-värden och gemensam anropsmodell
 
-Detta är ännu en design, inte implementerad funktionalitet eller uppmätt
-prestanda. Kompilatorns profiler och POD-dogfood visar varför små poster
-behöver en tydligare representation. Första delmängden är vanliga flata
-structar med bool, signerade/osignerade heltal, rune och råpekare, utan
-ägda barn. Någon ny källsyntax behövs inte.
+Första delmängden — vanliga flata structar med bool, signerade/osignerade
+heltal, rune och råpekare, utan ägda barn — är implementerad som
+stack-POD-värden (se `is_pod_struct` i `selfhost/frontend/frontend_types.ddr`,
+`POD BorrowHome` och proven i `tools/test_pod_values.ddr`); ingen ny
+källsyntax behövs. Resten av denna plan är ännu design, inte implementerad
+funktionalitet eller uppmätt prestanda. Kompilatorns profiler och POD-dogfood
+visar varför små poster behöver en tydligare representation.
 
 ## Värdeplats och lagringsägare
 
@@ -19,9 +21,11 @@ heapcontainrar kan initialt behålla boxade POD-fält; kopiering mellan en
 frameplats och en container gör då boxningen explicit. En runtimepekare
 behöver aldrig gissa om den kom från stack eller heap.
 
-`fixed_pod` gäller i dag fasta skalärarrayer, inte alla vanliga structar.
-`@c_layout` använder också heapkonstruktion och är inte denna mekanism.
-`compile.Result` och `x86.Result` innehåller ägda fält och är inte POD.
+`fixed_pod` gäller fasta skalärarrayer; flata skalära structar täcks numera av
+`is_pod_struct` och lagras som stackvärden, men heapcontainrar boxar
+fortfarande POD-fält (`box_pod_for_container`). `@c_layout` använder också
+heapkonstruktion och är inte denna mekanism. `compile.Result` och
+`x86.Result` innehåller ägda fält och är inte POD.
 
 ## En deklarationsvald intern ABI
 
@@ -84,7 +88,8 @@ scalar on/off måste använda samma ABI. Vanliga POD-structar blir inte
 automatiskt C-structar, och callbacks får inga nya aggregatsignaturer här.
 Fragmentidentiteten måste få ny ABI-/layoutversion och passningssätt.
 
-Första steget bevisar inte registerreturer, allmän scalar replacement,
-packad layout eller boxeliminering bakom råadresser. Det ska först visa
-korrekt och mätbar borttagning av heapkonstruktion/kloning för denna
-uttryckliga delmängd.
+Det införda första steget (stack-POD-värden för flata skalära structar)
+bevisar inte registerreturer, allmän scalar replacement, packad layout eller
+boxeliminering i containrar eller bakom råadresser. Nästa steg ska visa
+korrekt och mätbar borttagning av den kvarvarande heapboxningen/kloneringen
+för containrar med denna uttryckliga delmängd.

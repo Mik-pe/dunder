@@ -3,7 +3,8 @@
 Dunder frigör strängar, arraybuffertar och sammansatta värden under körning.
 Kompilatorn lägger in städning vid tilldelning, blockslut, retur, `break`
 och `continue`. Den genererade koden och minnespoolen följer med varje program
-på ARM64/macOS, ARM64/Linux, x86-64/Linux och Wasm32.
+på ARM64/macOS, ARM64/Linux, x86-64/Linux, x86-64/Windows samt Wasm32
+(`wasm32` och `wasm32-wasi`).
 
 ## Ägare, lån och kloning
 
@@ -47,13 +48,18 @@ fn main() {
 }
 ```
 
-Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `UdpSocket`, `Child`,
+Standardbibliotekets `TcpListener`, `TcpStream`, `StreamSet`, `UdpSocket`, `File`,
+`sqlite.Database`, kanaler (`Sender`/`Receiver`), `Child`,
 `ChildSet`, `ChildStdin`, `ChildStdout`, `ChildStderr`, `FileReader`,
-`FileWriter`, `File` samt allokeringsbehållarna `Bump`, `OwnedBuf`, `Arena` och
-`FrozenArena` är sådana resurser. Fil- och körningskapabiliteter som bara
+`FileWriter` samt allokeringsbehållarna `Bump`, `OwnedBuf`, `Arena` och
+`FrozenArena` är sådana resurser. Handtag som `TcpListener`, `TcpStream`,
+`UdpSocket`, `File`, `sqlite.Database`, `Sender<T>` och `Receiver<T>` implementerar
+dessutom `Sendable` med strikt `move`-överföring mellan trådar (ingen kloning;
+sändarens ägarslot nollställs), och `task scope`-arbetsytor kan även äga
+`@resource(dispose)`-fält som stängs på ägarens tråd när scopet avslutas. Fil- och körningskapabiliteter som bara
 innehåller en sökväg kan däremot uttryckligen klonas.
-Lokala resurser i en worker följer taskens effektregler. Transport över en
-isolerad taskgräns kräver klonbara värden. Resurstyper använder Dunders
+Lokala resurser i en worker följer scopets beviljade kapabiliteter och effektregler. Transport över en
+isolerad taskgräns kräver `Sendable`-värden; frysta ögonblicksbilder kan även delas låsfritt via `std.sync.Published<T>` och `ReadGuard<T>`. Resurstyper använder Dunders
 vanliga structlayout och lagras som ägda värden.
 
 ### Automatisk stängning
@@ -183,24 +189,27 @@ fn main() {
     }
     values[1] = 21
     text := "xå🌍y"
-    utf8 := &text[1..7]
-    assert(utf8.len == 6 && utf8[0] == 195)
+    utf8: &str = &text[1..7]
+    assert(utf8.len == 6 && utf8 == "å🌍" && utf8[0] == 195)
 }
 ```
 
 `&values[start..end]` har typen `&[]T` för arrayens elementtyp. Det fungerar
 för fasta och dynamiska arrayer och för delintervall av en befintlig vy.
-`&text[start..end]` ger `&[]u8`, med bytegränser i originalsträngen.
+`&text[start..end]` och `text.as_str()` ger en scope-bunden lånad UTF-8-strängvy
+av typen `&str` utan livstidsannotationer och utan ny strängallokering (med
+`.as_bytes()` för att se motsvarande `&[]u8`).
 Båda gränserna utvärderas en gång i källordning. Intervallet måste uppfylla
 `0 <= start <= end <= len`, annars blir runtime-status 103. För text krävs
 dessutom UTF-8-gränser, även för ett tomt intervall; ett brott ger 106 efter
 att intervallgränserna kontrollerats.
 
 Vyn pekar på originalets element, skapar ingen heapbuffert och behåller
-ingen ägare genom referensräkning. `len` och `cap()` är båda vyns längd.
-Varken skrivning genom vyn eller storleksändring är tillåten. En uttrycklig
-`.clone()` materialiserar en ägd array; en klon av en textvy är alltså
-`[]u8`. Vyns livslängd skyddas i stället av lånet.
+ingen ägare genom referensräkning. `len` och `cap()` för `&[]T` ger vyns
+längd, medan `&str.len` ger antalet UTF-8-byte. Varken skrivning genom vyn,
+storleksändring eller `&mut str` är tillåten, och `&str` kan inte lagras i
+structar, enums eller arrayer. En uttrycklig `.clone()` (eller `.str()`/`.to_string()`)
+på en `&str` skapar en ägd `string`, medan `.clone()` på `&[]T` ger `[]T`. Vyns livslängd skyddas i stället av lånet.
 
 Ett aktivt lån av ett structfält tillåter ändring och flytt av oberoende
 syskonfält. Flytt, `replace`, skrivning eller ett skrivlån som överlappar
@@ -325,12 +334,12 @@ vyn används; se [FFI och råminne](ffi.md).
 
 ## Pool och kostnader
 
-Nativ kod mappar 512 MiB virtuellt adressutrymme vid första allokeringen.
-Resident minne beror på vilka sidor programmet använder. Wasm utökar sitt
+Nativ kod mappar en initial heapregion (samt dynamiska tilläggsblock/slabs via
+`mmap` vid fortsatt tillväxt) vid första allokeringen. Resident minne beror på vilka sidor programmet använder. Wasm utökar sitt
 linjära minne vid behov. På alla mål delar strängar och arrayer samma pool.
 Frigjorda block läggs på en lista för sin storleksklass. Klasserna börjar vid
 16 byte och växer i tvåpotenser. En ny begäran kan återanvända ett block i rätt
-klass. Blandade storlekar kan lämna lediga block i andra klasser när poolen blir full.
+klass. Blandade storlekar kan lämna lediga block i andra klasser i en enskild slab innan ett nytt block mappas.
 
 Innanför ett dynamiskt stränghandtag ligger en 64-bitars bytelängd följd av
 UTF-8-data. Referensräknaren ligger åtta byte före handtaget. Sexton byte före
@@ -338,9 +347,9 @@ ett dynamiskt handtag ligger en pekare till storleksklassens frilista. Statiska 
 har räknare noll. Strängar kan dela data utan cykler eftersom deras innehåll
 saknar referenser till andra objekt. Referensräkningen är icke-atomär.
 
-Dynamisk sammanslagning och snitt tillåter högst 16 MiB per strängblock
-inklusive längdordet. En misslyckad strängallokering i dessa operatorer ger
-status 105. En ogiltig UTF-8-gräns eller Unicode-kodpunkt ger 106.
+Dynamisk sammanslagning och snitt tillåter högst 1 GiB per strängblock
+inklusive längdordet på de nativa målen och 64 MiB på wasm. En misslyckad
+strängallokering i dessa operatorer ger status 105. En ogiltig UTF-8-gräns eller Unicode-kodpunkt ger 106.
 En ogiltig arraykapacitet eller otillräckligt utrymme för en array eller region ger 109.
 Wasm avbryter den aktuella körningen med en trap. För uttrycklig
 blockallokering utan dolda fällor erbjuder [`std.alloc`](standard.md#generell-allokering)
@@ -440,8 +449,9 @@ och de ogiltiga exemplen under `tests/fixtures/region_errors/`.
 `[]u8` använder en byte per element. `std.bytes.append_utf8` och
 `std.bytes.decode` arbetar med packade buffertar. Tabells CSV-fält, SHA-256
 och selfhost-kompilatorns kodbild och signatur använder samma representation.
-`sys.write_u8` och `sys.decode_u8` tar `&[]u8`. Befintlig kod med
-`&[]i32` kan använda `sys.write_bytes` och `sys.decode_utf8`.
+`sys.write_u8` och `sys.decode_u8` tar `&[]u8`. Äldre `&[]i32`-buffertar
+konverteras mellan representationerna med `std.bytes.from_i32` och
+`std.bytes.to_i32`.
 
 Ett prov med 8 388 608 element rapporterade 9 912 320 byte maximal RSS med
 `[]u8` och 35 078 144 byte med `[]i32` på Apple M5 och macOS 27.2.

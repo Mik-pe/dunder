@@ -1,18 +1,19 @@
 # Dunders arkitektur
 
-Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux och wasm32 med explicit målval. ELF, Mach-O, systemanrop
-och kodgenerering ingår i kompilatorn. x86-64 sänker den delade interna
-instruktionsvokabulären till nativekod vid kompilering; det finns ingen
+Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux, `wasm32`, `wasm32-wasi`
+och `x86_64-windows` (PE32+) med explicit målval. ELF, Mach-O, PE32+, systemanrop
+och kodgenerering ingår i kompilatorn. Alla backends arbetar direkt från
+verifierad och SSA-optimerad MIR: ARM64 emitterar maskinord direkt, medan
+[`x86_mir`](../selfhost/backend/x86_mir.ddr) och [`wasm_mir`](../selfhost/backend/wasm_mir.ddr)
+sänker MIR direkt till x86-64 respektive Wasm med lokaler och strukturerade hopp. Det finns ingen
 runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
 
 Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
-GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Planerad språkutveckling](next-steps.md)
-Automatisk frigöring för arrayer och strängar samt lokal maskinkodsoptimering
-är implementerade i kompilatorns kodgenerering. Anropsfria skalära funktioner
-kan använda en typad lokal modell, begränsat optimeringspass och
-registerallokering. Generella livstider och registerallokering
-för hela språket är fortsatt designmål. Nativebyggen
-kan använda [funktionscachen](incremental.md).
+GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Aktuellt arbete och färdplan](next-steps.md)
+Automatisk frigöring för arrayer och strängar, POD-värden och lokal/helfunktions
+optimering (MIR-SSA, helfunktionsinlining, `BorrowHome`) ingår som standard.
+Native byggen kan dessutom bädda in DWARF v4-debuginformation (`-g`/`--debug`)
+samt använda [funktionscachen](incremental.md), och `dunder lsp` erbjuder språkserverstöd.
 
 ## Språkets kostnadsmodell
 
@@ -93,7 +94,7 @@ Arrayindex och intervall följer konservativt arrayens identitet.
 
 `borrowed_view` emitterar intervallkontroller och en framebaserad deskriptor
 för originalets data; den registrerar ingen runtimeägare. Arrayvyer har
-typen `&[]T`, textvyer `&[]u8`. Längd och kapacitet är intervallängden.
+typen `&[]T` och strängvyer typen `&str` (med `.as_bytes()` för `&[]u8`).
 Gränser kontrolleras före textens UTF-8-gränser, med status 103 respektive
 106. Tomma textvyer kräver också giltiga UTF-8-gränser. Konstruktionen
 allokerar ingen heapbuffert och gör ingen retain; `.clone()` begär en ägare
@@ -149,14 +150,14 @@ Mach-O-skrivaren signerar den slutliga bilden. [Kodgenerering](optimization.md#g
 
 ## Verktygskedjan och målplattformarna
 
-Native-målen är `arm64-macos`, `arm64-linux` och `x86_64-linux`.
-Det fjärde målet är `wasm32`. Dunder äger parser,
-typkontroll, kodgenerering, relokeringar, bildskrivning, macOS ad hoc-signering
-och byggdrivrutin. Ett vanligt Dunderbygge kör aldrig LLVM, GCC, en extern
+Native-målen är `arm64-macos`, `arm64-linux`, `x86_64-linux` och `x86_64-windows` (PE32+).
+Wasm-målen är `wasm32` och `wasm32-wasi`. Dunder äger parser,
+typkontroll, kodgenerering, relokeringar, bildskrivning (Mach-O, ELF64, PE32+, Wasm), DWARF v4-debuginfo, macOS ad hoc-signering
+och byggdrivrutin (`dunder build`/`run`/`test`/`check`/`fmt`/`lsp`/`install`/`upgrade`). Ett vanligt Dunderbygge kör aldrig LLVM, GCC, en extern
 assembler, länkare eller signerare. Vanliga Linuxbilder använder direkta
 systemanrop utan libc. Ett program med nåbara `@extern`-deklarationer får
 en dynamisk ELF med de bibliotek och symboler som deklarationerna anger.
-På Wasm blir deklarationerna typade värdimporter.
+På Wasm blir deklarationerna typade värdimporter (eller WASI-importer under `wasm32-wasi`).
 
 Kompilatorn bäddar in standardmodulerna som räknas upp i
 [stdlib/modules.txt](../stdlib/modules.txt). När självhostens inbäddade
@@ -171,8 +172,10 @@ i `dogfood/webgpu/` anropar sin JavaScript-värd via en vanlig Wasm-import.
 
 Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
 anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen
-delar instruktionskodning; x86-64 sänker samma interna instruktionsvokabulär
-till nativekod vid kompilering. Dunders interna funktions-ABI är inte ett
+delar instruktionskodning; x86-64/Linux (`x86_mir`) sänker MIR direkt till fysiska register
+med System V-ABI, medan x86_64-windows sänker samma MIR-producerade symboliska ström
+till Win64 via x86-sänkningen, och Wasm (`wasm_mir`) sänker MIR direkt till typade
+Wasm-lokaler och strukturerat kontrollflöde. Dunders interna funktions-ABI är inte ett
 publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsningar.
 
 ## Byggkontraktet
@@ -190,11 +193,12 @@ varma och rena bilder byte för byte på alla tre native-mål.
 Ett verifierat Dunder-frö för värdplattformen bygger först kompilatorns
 källträd under `selfhost/`. Den nya binären bygger samma träd igen.
 Två efterföljande byggen måste bli byteidentiska innan skriptet publicerar
-kompilatorn. Den kan därefter bygga program för alla fyra mål.
+kompilatorn. Den kan därefter bygga program för alla sex mål.
 [Frön och återbyggnad](../bootstrap/README.md).
 
-Wasm-backenden använder samma typade funktioner och symboliska instruktioner
-som native. Den omvandlar hopp till Wasm-block, anrop till Wasm-funktioner
-och minnesåtkomster till operationer på modulens linjära minne. Nåbara
-externa deklarationer blir typade importer. Filer och processer hör till
+Wasm-backenden ([`wasm_mir`](../selfhost/backend/wasm_mir.ddr)) sänker samma
+verifierade MIR som native direkt till Wasm. Den omvandlar hopp till
+Wasm-block, anrop till Wasm-funktioner och minnesåtkomster till operationer
+på modulens linjära minne. Nåbara externa deklarationer blir typade importer.
+Filer och processer hör till
 nativevärdens API.

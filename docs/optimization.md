@@ -6,8 +6,8 @@ Den tar med de runtimefunktioner som programmet behöver. Overflow, ogiltiga
 index och ogiltiga konverteringar behåller sina kontroller även vid korsbyggen.
 
 Den gemensamma funktionsrepresentationen (MIR) omfattar även kroppar med
-anrop och ägda värden. Med `--mir-ssa=on` kan privata frameceller och
-uttryckstemporärer placeras i register.
+anrop och ägda värden. Med MIR-SSA (standard på, `--mir-ssa=on`) kan privata
+frameceller och uttryckstemporärer placeras i register.
 
 ## Instruktionsval för heltal och arrayåtkomst
 
@@ -400,13 +400,13 @@ exakt vid avslag. En accepterad omskrivning fullverifieras innan den får
 lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
-gemensamma seriella/taskbaserade kedjan. Standard förblir **off**. I den
-historiska [v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
+gemensamma seriella/taskbaserade kedjan. Standard är **on** (`--mir-ssa=off`
+stänger av steget). I den historiska [v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
 ökade byggmedianen 21,26 procent för kompilatorkorpuset och 29,47 procent
 för Tabell utan belagd samlad runtimevinst. Effektiv aktivering
 kräver både MIR och MIR-opt; `check`, avstängt steg och full cacheträff utför
 inget SSA-arbete. Cache och testkvitton skiljer on/off och SSA-markören
-`v3-regional-expression1-work4194304` åt. Fysisk MIR-policy v5 binder
+`v6-composed-regional-expression2-work4194304` åt. Fysisk MIR-policy v5 binder
 `call-flags1`, `stack-origin1`, `frame-life1` och källanrops-ABI2 även när SSA
 är avstängt. Regional livstid, positivt ursprung och privat lagringsrätt är
 separata premisser trots den gemensamma policyidentiteten.
@@ -436,10 +436,11 @@ Tidigare strukturella prov med sex→noll laster men 26→30 kodord och
 [Källkod, workers, cache och kvitton](../tools/test_ssa_source.ddr).
 
 Generellt SSA-baserat val av skalära operationer, vidare värdeplacering,
-heap-CSE, LICM och direkt registerallokering per mål återstår. Den nuvarande
-placeringen använder den gemensamma logiska GP-banken. Den innebär ingen
-fysisk x86-registerallokering eller ny placering i Wasm-lokaler. C-målet
-är fortfarande öppet.
+heap-CSE och LICM återstår. x86-64/Linux sänker MIR direkt till fysiska
+x86-register ([`x86_mir`](../selfhost/backend/x86_mir.ddr)) och Wasm placerar
+värden i Wasm-lokaler ([`wasm_mir`](../selfhost/backend/wasm_mir.ddr)); ARM64
+använder fortfarande den gemensamma logiska GP-banken. C-målet är fortfarande
+öppet.
 
 Den historiska [30-rundorsmätningen av SSA-v1](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
 visade 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34
@@ -636,8 +637,10 @@ lokaler i tolv register eller i framen. [Emissionen](../selfhost/opt/opt_emit.dd
 behåller arraydata och längd, avger direkta jämförelsegrenar och tar bara
 bort kontroller som modellen har bevisat överflödiga. Inkommande argument
 sparas före registerplaceringen så att överlappande argumentregister är
-säkra. x86-64 och Wasm sänker fortsatt den delade ARM-instruktionsvokabulären;
-detta inför ingen separat direkt backend för dem.
+säkra. x86-64/Linux och Wasm sänker MIR direkt via egna backends
+([`x86_mir`](../selfhost/backend/x86_mir.ddr) respektive
+[`wasm_mir`](../selfhost/backend/wasm_mir.ddr)); x86_64-windows sänker
+fortsatt den delade symboliska instruktionsföljden.
 
 Jämförelser kan använda registerhem och cachade längdregister direkt.
 En spilld operand laddas separat; små positiva konstanter använder CMP:s
@@ -722,8 +725,8 @@ pass. Cachefragment och testkvitton skiljer lägena åt. Emitter-API:t lånar
 en återanvänd `Options`-post; äldre wrappers behåller sina standarder utan
 en ny postallokering per funktion.
 
-`tools/test_frame_free.ddr` bygger 88 riktiga bilder över fyra mål och båda
-lägena. Host/Wasm provar register- och stackbevarande, argumentcykler,
+`tools/test_frame_free.ddr` bygger 66 riktiga bilder över tre mål och båda
+lägena. Värdplattformen provar register- och stackbevarande, argumentcykler,
 normalisering, loopar, tidig retur och fällordning. Den symboliska
 flyttkontrollen tolkar faktiskt emitterade instruktioner över 40 320
 permutationer. Fallbackbilder och bilder för övriga mål är byteidentiska.
@@ -776,7 +779,7 @@ testkvitton skiljer lägena åt; `--profile-compiler` har en separat
 [i32-invarianten i runtime](memory.md).
 
 `tools/test_range_emitter.ddr` provar verklig kontrollborttagning och
-budgetfallback på fyra mål. [`tools/test_range_analysis.ddr`](../tools/test_range_analysis.ddr) exporterar
+budgetfallback på tre mål. [`tools/test_range_analysis.ddr`](../tools/test_range_analysis.ddr) exporterar
 faktiska modeller/bevis och följer dem i en oberoende interpreter med
 kontrollerad aritmetik, kortslutning, snapshots och muterbara arrayer. Den
 kontrollerar varje dynamiskt nådd bevisad åtkomst mot rätt lagring och varje
@@ -837,9 +840,9 @@ bakom snabbare genererad stresskod.
 
 | Etapp | Mekanism och förväntad nytta | Krav före aktivering |
 | --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Regional Frame-SSA och positivt identifierade privata Temp-värden delar GP0–GP17-allokering. Ursprungliga frame-stores bevaras. Generellt operationsval och vidare värdeplacering återstår. | Standard är off tills hela etappens resultat bedömts. Anropsbevarande, frame-livstid, semantiska indata, NoModRef, temporärlagring och terminalobservationer är separata premisser. |
+| Helfunktionsvärden, SSA och minnesmodell | Regional Frame-SSA och positivt identifierade privata Temp-värden delar GP0–GP17-allokering. Ursprungliga frame-stores bevaras. Generellt operationsval och vidare värdeplacering återstår. | MIR-SSA är standard på (`--mir-ssa=on`). Anropsbevarande, frame-livstid, semantiska indata, NoModRef, temporärlagring och terminalobservationer är separata premisser. |
 | Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
-| Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. Dagens översatta ARM-register är inte fysisk x86-registerallokering. |
+| Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. x86-64/Linux sänker redan MIR direkt med fysisk registerallokering (`x86_mir`). |
 | Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
 | POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
 | Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |

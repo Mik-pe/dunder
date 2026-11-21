@@ -68,7 +68,7 @@ Konstruktorer skrivs `Command.Pair(20, 22)`. Kortformen `.Pair(20, 22)`
 fungerar när typen framgår av en annotering, parameter, returtyp eller
 jämförelse. `value := .Pair(20, 22)` saknar däremot typkontext och avvisas.
 Varianter utan data kan skrivas med eller utan tomma parenteser.
-Importerade konstruktorer skrivs exempelvis `sys.ReadResult.Ok("hej")`.
+Importerade konstruktorer skrivs exempelvis `sys.IoError.Other(2)`.
 
 Payloads kan innehålla skalära typer, funktionsvärden, structar, fasta
 arrayer, dynamiska arrayer och andra enums. Direkt rekursiva värden som `enum Node { Next(Node) }`
@@ -89,13 +89,13 @@ samma mönster.
 ```dunder
 import sys
 
-fn beskriv(resultat: sys.ReadResult) -> string {
+fn beskriv(resultat: Result<string, sys.IoError>) -> string {
     match resultat {
         .Ok(text) if text.len > 0 => text.clone(),
         .Ok(_) => "tom fil",
         .Err(.NotFound) => "filen saknas",
         .Err(.Other(kod)) => f"systemfel {kod}",
-        .Err(fel) => sys.io_error_message(fel),
+        .Err(fel) => fel.message(),
     }
 }
 
@@ -113,7 +113,9 @@ I `.Err(.Other(kod))` bestämmer payloadtypen `sys.IoError` vad
 täcker samma fall och kastar bort payloaden. Även nästlade mönster
 som `.Err(.Other(kod)) if kod > 0`, varianter utan payload och `_`
 kan ha villkor. Ett ensamt `_` utan villkor täcker alla återstående fall
-och måste stå sist.
+och måste stå sist. Flera mönster kan också slås samman med `|` i samma arm,
+exempelvis `.Stop | .Reset => 0`; i payloadlistor täcker ett `..` alla
+återstående payloads (högst ett `..` per mönster).
 
 Kompilatorn kräver att armarna utan villkor tillsammans täcker alla möjliga
 kombinationer av varianter. Detta gäller även när ett villkor är `if true`.
@@ -205,7 +207,10 @@ på en ägd lokal eller ett ägt fält kan en arm också flytta ut `.Ok(v)` elle
 `.Err(e)` direkt utan `match move` (och lämnar `res` förbrukat efter den armen),
 medan `.Ok` eller `.Err` utan parenteser används när payloadtypen är `()`.
 Metoder på värdet anropas med parenteser: `.is_ok()`, `.is_err()`,
-`.unwrap_or(...)` och `.unwrap_or_default()`.
+`.unwrap_or(...)`, `.unwrap_or_else(...)`, `.ok()`, `.err()` och
+`.unwrap_or_default()` (den senare kräver `T: Default`). Samma metoder finns
+på preludiets `Option<T>` (`Some`/`None`): `.is_some()`, `.is_none()`,
+`.unwrap_or(...)`, `.unwrap_or_else(...)` och `.unwrap_or_default()`.
 [Körbart exempel med automatisk resursstängning](../tests/fixtures/results.ddr)
 
 ## Lagring och dispatch
@@ -231,26 +236,25 @@ med statiskt kontrollerad `match` behöver ingen dynamisk metodtabell.
 ## Verifiering och nuvarande gränser
 
 ```sh
-# I Dunders testbädd dunder-hundmat:
-dunder run dogfood/enums.ddr
-# 42
-# enums ok
-dunder test dogfood/enums.ddr
-# 5 passed, 0 failed
+dunder run tools/test_results.ddr -- "$(command -v dunder)"
+dunder run tools/test_aggregate_arrays.ddr -- "$(command -v dunder)"
 dunder run tools/test_diagnostics.ddr -- "$(command -v dunder)"
 ```
 
-Testprogrammet `dogfood/enums.ddr` provar båda formerna och nästlade
-`Ok`/`Err`-resultat. Native-integrationstester täcker typfel, modulidentitet,
-privata typer, egna taggvärden, arrayer/structfält, blandade payloads,
-funktionsvärden, callbacks, rekursiva returer, stackargument och verklig fil-I/O.
+`tools/test_results.ddr` provar båda enumformerna, nästlade `Ok`/`Err`-resultat,
+`?`-operatorn och feldiagnostik. Native-integrationstester täcker typfel,
+modulidentitet, privata typer, egna taggvärden, arrayer/structfält, blandade
+payloads, funktionsvärden, callbacks, rekursiva returer, stackargument och
+verklig fil-I/O.
 
 Fasta och dynamiska arrayer kan innehålla enums med payload. Ett element
 kan i sin tur äga en array, en struct eller en annan enum. Ägarskap och
 kloning följer payloadens typ. [Körbart exempel](../tests/fixtures/aggregate_arrays/enums.ddr)
 
-Ett enumvärde får vara högst 64 KiB. För djup rekursiv layoutberäkning avvisas också. Likhet för data-enums,
-alternativa
-mönster och enumutskrift med `.str()` återstår. Använd `match` för att välja
-payload eller en textrepresentation. [sys](sys.md) använder redan konkreta
-`ReadResult` och `IoError`. En egen valfri typ kan deklareras som `enum Option<T> { Some(T), None }`.
+Ett enumvärde får vara högst 64 KiB. För djup rekursiv layoutberäkning avvisas också.
+Alternativa mönster skrivs `.A | .B`. Likhet, hash, utskrift och standardvärde
+för structar och data-enums härleds med `@derive(Eq)`, `@derive(Hash)`,
+`@derive(Display)` och `@derive(Default)` (och med `std.json` även
+`@derive(Encode, Decode)`); utan härledning används `match` för att välja
+payload eller en textrepresentation. [sys](sys.md) använder konkreta
+`Result<...>` och `IoError`. `Option<T>` (`Some`/`None`) finns i preludiet.

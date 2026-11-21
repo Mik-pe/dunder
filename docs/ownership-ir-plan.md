@@ -1,7 +1,10 @@
 # Nästa steg för ägarlivslängder
 
-Den typade strängoperandvägen är implementerad. Analysen nedan av
-tom cleanup vid funktionens olika utgångar återstår.
+Den typade strängoperandvägen är implementerad, och så är analysen av
+tom cleanup vid funktionens olika utgångar: `selfhost/mir/mir_owners.ddr`
+gör en framåtriktad tillståndsanalys över CFG-kanter och eliminerar
+redundanta clear/vacate-sekvenser på statiskt tomma ägarceller (trådad via
+`mir_pipeline.ddr`). Nedanstående beskriver den realiserade modellen.
 Målet är att minska bevisat tom cleanup utan att ändra livslängder,
 värdesemantik, fällordning eller språkets diagnostik.
 

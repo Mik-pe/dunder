@@ -59,6 +59,8 @@ uttryck tillåts inte i `const`.
 | `f64` | IEEE 754 binary64; standard för okontextualiserade flyttalsliteraler. |
 | `bool` | `true` eller `false`; ingen implicit konvertering till/från heltal. |
 | `string` | Oföränderlig, giltig UTF-8. |
+| `&str` | Scope-bunden lånad, oföränderlig UTF-8-vy av en sträng (t.ex. `&text[a..b]`, `text.as_str()`; ej lagringsbar i struct/enum/array). |
+| `u8` .. `u64`, `usize` | Osignerade heltal (bland annat `b'a'`-byteliteraler och `text[i]: u8`). |
 | `rune` | En Unicode-kodpunkt; skild från heltal och sträng. |
 | `()` | Inget returvärde; implicit returtyp för funktioner utan `->`. |
 | `fn(i32) -> i32` | Ett funktionsvärde med angivna parameter- och returtyper. |
@@ -67,9 +69,10 @@ uttryck tillåts inte i `const`.
 | `&Point` | Ett läslån som parameter eller oföränderlig lokal referens. |
 | `&mut Point` | Ett exklusivt skrivlån som funktionsparameter. |
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
-| `Command` / `sys.ReadResult` | En nominell enum med namngivna värden eller payload-varianter. |
+| `Command` / `sys.IoError` | En nominell enum med namngivna värden eller payload-varianter. |
+| `Option<T>` | [Preludiets optionstyp (`Some(T)`, `None`)](enums.md). |
 | `Result<T, E>` | [Typad enum för framgång och fel](enums.md#typade-fel-med-result). |
-| `range` | Ett halvöppet intervall med `i32`-gränser. |
+| `range` | Ett intervall med `i32`-gränser; `a..b` är halvöppet, `a..=b` inkluderar båda gränserna. |
 | `TaskID<R>` | En kopierbar resultatnyckel till en [isolerad uppgift](tasks.md). |
 
 Literaler får typ från en annotering, funktionens parameter/returtyp eller
@@ -136,9 +139,10 @@ nästlade interpolerade strängar. De utvärderas exakt en gång i källordning.
 Tidigare strängvärden hålls levande även om ett senare hål ersätter deras
 ursprungliga variabel. Resultatet är en vanlig ägd `string`.
 
-Tillåtna resultattyper är `string`, signerade och osignerade heltal,
-`usize`, `bool`, `rune`, `f32` och `f64`. Standardformatet motsvarar `.str()`;
-för en sträng delar `.str()` dess oföränderliga text. Aggregat, råpekare och
+Tillåtna resultattyper är `string` och `&str`, signerade och osignerade
+heltal, `usize`, `bool`, `rune`, `f32` och `f64`. Standardformatet motsvarar
+`.str()`; för en sträng delar `.str()` dess oföränderliga text och för en
+`&str`-vy skapas en ägd `string`. Aggregat, råpekare och
 funktioner kräver att programmet först väljer en textrepresentation.
 
 Heltal kan formateras med `:d` för decimal, `:x` för gemena hexadecimala
@@ -161,8 +165,9 @@ För strängar stöder formatangivelsen bredd och justering med `:<N`
 till minst `N` byte om strängen är kortare.
 
 `{{` och `}}` ger bokstavliga klamrar. I exemplet blir `escaped` strängen `"{3}"`.
-Övriga escapes fungerar som i vanliga strängar, inklusive Unicode och NUL. Textsegment får inte innehålla råa
-radbrytningar; uttrycken kan sträcka sig över flera rader. Ett tomt hål,
+Övriga escapes fungerar som i vanliga strängar, inklusive Unicode och NUL. I en enradig `f"..."` får textsegmentet inte innehålla råa
+radbrytningar, men uttrycken kan sträcka sig över flera rader; flerradiga
+`f"""..."""` tillåter råa radbrytningar i textsegmenten. Ett tomt hål,
 en ensam `}`, obalanserade delimiters eller en oavslutad interpolation ger
 ett kompileringsfel på originalpositionen. Nästlade interpolerade strängar
 har en gräns på 64 nivåer. En sträng utan `f` behåller alltid sin vanliga
@@ -274,8 +279,11 @@ typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
   arrayer). För en `opaque struct` deklareras den uttryckligen med
   `impl Sendable for Typ {}` (eller villkorligt som
   `impl Sendable for Map<K, V> where K: Sendable, V: Sendable {}`), varpå
-  kompilatorn bevisar att alla privata fält uppfyller regeln. `@resource`,
-  råpekare, lån, closures och oklassificerade `opaque struct` är inte `Sendable`.
+  kompilatorn bevisar att alla privata fält uppfyller regeln. En
+  `@resource`-typ kan också deklarera `impl Sendable for Typ {}` uttryckligen
+  (som `std.fs.FileReader`), varpå kompilatorn bevisar fälten; annars är
+  `@resource`, råpekare, lån, closures och oklassificerade `opaque struct`
+  inte `Sendable`.
 - `Storable` anger att typen får lagras som arrayelement eller fält.
 - `Clone` gäller strukturellt för typer utan `@resource`-fält och utan inbyggda
   lån (`Result<T, E>`, `[]T`, tupler, structar och enums vars delar är `Clone`).
@@ -289,9 +297,12 @@ Förladdade kärntraits från preludium finns alltid tillgängliga utan import:
 `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord: Eq`, `Hash: Eq`,
 `Display` och `Default`. De är implementerade för primitiva värden (utom att
 `f32` och `f64` avsiktligen inte implementerar `Eq`, `Ord` eller `Hash` — bara
-`Display`, `Default`, `Clone`, `Copy` och `Sendable`), `Result<T, E>` samt
+`Display`, `Default`, `Clone`, `Copy` och `Sendable`), `Option<T>`, `Result<T, E>` samt
 sammansatta typer `[]T`, `(A, B)` och `(A, B, C)` när deras elementtyper
 uppfyller motsvarande krav (`impl Default for []T where T: Storable`).
+Structar och enum kan dessutom automatiskt härleda implementationer med
+`@derive(Eq, Hash, Display, Default)` samt JSON-serialisering med
+`@derive(Encode, Decode)` (kräver `std.json`).
 Uttryck som `Result<T, ()>` och `Result<(), E>` konstrueras med bara `.Err`
 respektive `.Ok` när payloadtypen är `()`.
 
@@ -546,8 +557,9 @@ aldrig en tidigare binär från samma utdataplats.
 
 `if` och `while` kräver `bool`, aldrig ett heltal. `else if`, `else`, `break`
 och `continue` stöds. Block ger lexikala scope. `print` tar ett skalärvärde
-(`i32`, `i64`, flyttal, `bool`, `rune`, `string`), ett heltal eller enum, eller
-valfri typ som implementerar `Display` (via `.str()`), följt av radbrytning.
+(`i32`, `i64`, flyttal, `bool`, `rune`, `string`, `&str`), ett heltal eller
+enum, eller valfri typ som implementerar `Display` (via `.str()`), följt av
+radbrytning.
 Stränginterpolering `f"{x}"` använder på samma sätt `Display`/`.str()`.
 `assert(condition)` kräver `bool` och avslutar processen vid `false`.
 
@@ -571,7 +583,7 @@ import std.Map
 import std.json.Doc
 ```
 
-`import sys` väljer det inbäddade systembiblioteket för macOS/Linux; se [sys](sys.md).
+`import sys` väljer det inbäddade systembiblioteket; se [sys](sys.md).
 Det kan aliaseras och dedupliceras precis som andra moduler. En egen lokal
 fil med samma namn importeras uttryckligt som `import .sys as local`.
 
@@ -821,7 +833,7 @@ bibehållen ordning.
 
 `middle := &values[start..end]` skapar en lånad `&[]T` utan heapallokering
 eller retain (observera skillnaden mot `text[start..end]` på en sträng, som
-skapar en ny ägd `string`, medan `&text[start..end]` ger en lånad `&[]u8`).
+skapar en ny ägd `string`, medan `&text[start..end]` ger en lånad `&str`-vy).
 En explicit annotering, `middle: &[]i32 = &values[1..3]`, går
 också bra. Vyn använder originalets adress, och dess `len` och `cap()` är
 intervallängden. Fasta arrayer och redan lånade vyer kan skäras på samma sätt.
@@ -836,22 +848,27 @@ För iteration är `for` lånande som standard men låser bara fältets egen
 och `for x in move values` märker varje elementbindning som ett färskt ägt
 värde vid t.ex. `out.push(x)`.
 
-`start..end` har typen `range`, inkluderar start och utesluter slut.
-Gränserna är `i32`, utvärderas en gång och iterationen går uppåt.
-Om start är större än eller lika med slut blir det noll varv. Intervall kan
-lagras, skickas och returneras som vanliga värden.
+`start..end` har typen `range`, inkluderar start och utesluter slut;
+`start..=end` inkluderar båda gränserna. Gränserna är `i32`, utvärderas en
+gång och iterationen går uppåt. Om start är större än eller lika med slut
+blir det noll varv. Intervall kan lagras, skickas och returneras som vanliga
+värden.
 
-`for` stöder intervall, arrayer och `.iter()`-värden. Loopvariabeln är
-oföränderlig och lokal till loopen. `break` lämnar närmaste loop; `continue`
-går till nästa element. Vanlig iteration lånar samlingen för läsning och
-avvisar mutation eller flytt av samma samling under loopen.
-`for value in move values` konsumerar ägaren.
+`for` stöder intervall, arrayer, `.iter()`-värden, uppslagstabeller och
+mängder (`for (k, v) in &map`, `for v in &set`) samt vilken typ som helst
+som implementerar den inbyggda traiten `Iterator` (se nedan). Loopvariabeln
+är oföränderlig och lokal till loopen. `break` lämnar närmaste loop;
+`continue` går till nästa element. Vanlig iteration lånar samlingen för
+läsning och avvisar mutation eller flytt av samma samling under loopen.
+`for value in move values` konsumerar ägaren. Med `.enumerate()` fås ett
+tupelmönster: `for (i, x) in values.enumerate()`.
 
 `for value in values.iter()` lånar också. En lagrad ägande iterator skapas
 med `(move values).iter()` eller från en uttrycklig klon, som i exemplet
 ovan. Iteratorn kan läslånas flera gånger; bindning till en ny ägare flyttar
-den. Iteratorns typ härleds med `:=`; den saknar ännu egen typstavning,
-`.next()` och användardefinierat iteratorprotokoll.
+den. En egen typ görs itererbar med `impl Iterator for Typ` och metoden
+`fn next(&mut self) -> Option<T>`; `for`-loopar accepterar då värdet direkt
+(även med `&mut`-lån för att dra flera element i taget).
 
 ## Taggade tester
 
@@ -950,43 +967,54 @@ Escape-sekvenser: `\\`, `\"`, `\'`, `` \` ``, `\n`, `\r`, `\t`, `\0`,
 `\xHH`, `\uHHHH` och `\u{H...}` med en till sex hexsiffror.
 Byte-escapes valideras tillsammans: `"\xC3\xA5"` är `"å"`, men `"\xFF"`
 är ett kompileringsfel. Surrogates och värden över Unicode-intervallet
-avvisas. Oescapade radbrytningar och råsträngar stöds ännu inte.
-NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering används.
+avvisas. NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering används.
+
+Råa strängar skrivs `r"..."`, `r'...'`, `r#"..."#` (med godtyckligt antal `#`)
+samt flerradiga `"""..."""` och `r#"""..."""#` (och `f"""..."""` med
+interpolering). Flerradiga literaler använder automatisk dedent efter
+avslutningsradens indentering; oescapade radbrytningar tillåts i flerradiga och
+råa literaler. Dessutom finns kompileringstidsinbäddning med
+`@embed_file("relativ/sökväg")` (`string`, UTF-8-kontrollerad) och
+`@embed_bytes("relativ/sökväg")` (`[]u8` / `[u8; N]`), strikt begränsad till
+filer innanför paketets rot och spårad av den inkrementella byggcachen.
 
 `f"Hej {name}, {count + 1}!"` och `f'Hej {name}!'` interpolerar uttryck
-från vänster till höger. Hål utan formatkod använder `.str()`. Uttrycken
+från vänster till höger (liksom på `&str`-vyer, med bredd/justering som
+`f"{v:>8}"`). Hål utan formatkod använder `.str()`. Uttrycken
 lånar sina operander; att formatera en sträng flyttar inte dess ägare.
 `{{` och `}}` ger bokstavliga klamrar. Vanliga strängliteraler interpolerar
 inte. Fel i uttrycken pekar på deras ursprungliga källpositioner.
 
 | Operation | Betydelse |
 | --- | --- |
-| `text.len`, `text.len()`, `len(text)` | Antal byte, `i32`, konstant tid. |
-| `text[i]`, `text.bytes()[i]` | Ett byte som `i32` i intervallet 0–255. |
+| `text.len`, `text.len()`, `len(text)` | Antal byte, `i32`, konstant tid (fungerar på både `string` och `&str`). |
+| `text[i]`, `view[i]` | Ett byte som `u8` (i linje med `b'a'`-literaler). |
 | `text[start..end]` | Ny ägd `string` från halvöppna bytegränser (till skillnad från arrayer som kräver `&arr[start..end]` för en lånad `&[]T` eller `(&arr[start..end]).clone()` för en kopia). Båda gränserna måste vara UTF-8-gränser. |
-| `&text[start..end]` | Lånad bytevy av typen `&[]u8`, utan ny sträng eller retain. |
+| `&text[start..end]`, `text.as_str()` | Lånad UTF-8-strängvy av typen `&str`, utan ny sträng eller retain (`view.as_bytes()` ger `&[]u8`). |
 | `text.runes()[i]` | En rune efter avkodning från början; linjär tid. |
 | `text.runes().len` | Antal kodpunkter; linjär tid. `.len()` och `len(...)` fungerar också. |
-| `for r in text.runes()` | Avkodar kodpunkter i ett linjärt pass. |
-| `for byte in text.bytes()` | Itererar byte i ett linjärt pass. |
-| `a + b` | Bygger en ny sträng av två strängar. |
-| `a == b`, `a != b` | Jämför innehåll, inklusive eventuella NUL. |
-| `<`, `<=`, `>`, `>=` | Lexikografisk ordning efter UTF-8-byte, utan språklig sortering. |
-| `value.str()` | Sträng av heltal, flyttal, bool eller rune. På string ges samma värde. |
+| `for r in text.runes()` | Avkodar kodpunkter i ett linjärt pass (på både `string` och `&str`). |
+| `for byte in text.bytes()` | Itererar `u8`-byte i ett linjärt pass (på både `string` och `&str`). |
+| `a + b` | Bygger en ny sträng av två ägda `string` (ej på `&str`; använd `.clone()` vid behov). |
+| `a == b`, `a != b` | Jämför innehåll (även mellan `string` och `&str`), inklusive eventuella NUL. |
+| `<`, `<=`, `>`, `>=` | Lexikografisk ordning efter UTF-8-byte (fungerar mellan `string` och `&str`), utan språklig sortering. |
+| `value.str()` | Sträng av heltal, flyttal, bool eller rune; på `&str` och `.to_string()` skapas en ägd `string`. |
 
-`.bytes()` och `.runes()` ger självständiga arrayer av typen `[]i32`
+`.bytes()` och `.runes()` ger självständiga arrayer av typen `[]u8`
 respektive `[]rune`. Direkt iteration kan strömma från en behållen
-strängsnapshot utan mellanarray. Om originalbindningen får en ny sträng
-behåller konverteringen eller iterationen sina gamla värden. `for` direkt över en string avvisas:
+strängsnapshot eller en `&str`-vy utan mellanarray. Om originalbindningen får en ny sträng
+behåller konverteringen eller iterationen sina gamla värden. `for` direkt över en string eller `&str` avvisas:
 välj `.bytes()` eller `.runes()` uttryckligt. `break` och `continue` fungerar
 för båda. Lagrade arrayiteratorer äger sin samling; skapa dem med
 `(move values).iter()` eller `values.clone().iter()`.
 Strängsnitt kan också ta ett lagrat eller returnerat `range`-värde,
 exempelvis `span := 7..11; part := text[span]`.
-En namngiven textvy, exempelvis `utf8 := &text[1..7]` för `"xå🌍y"`,
-behåller originalets adress. Dess `len` och `cap()` är sex byte. Båda
-gränserna måste vara UTF-8-gränser även när vyn är tom. Intervallfel ger
-103 före UTF-8-kontrollen som ger 106. `.clone()` av vyn ger en ägd `[]u8`.
+En namngiven strängvy, exempelvis `utf8 := &text[1..7]` för `"xå🌍y"`,
+pekar direkt in i originalet med typen `&str` och stöder nollallokerande
+hjälpare i [`std.text.view`](standard.md#moduler). Båda gränserna måste vara
+UTF-8-gränser även när vyn är tom. Intervallfel ger 103 före
+UTF-8-kontrollen som ger 106. `.clone()` på `&str` ger en ägd `string`,
+medan `utf8.as_bytes()` ger motsvarande `&[]u8`-bytevy.
 
 En rune är en Unicode-kodpunkt, inte ett grapheme-kluster. Exempelvis har
 `"é"` en rune och `"e\u{301}"` två; strängarna jämförs som olika.

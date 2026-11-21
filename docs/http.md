@@ -49,10 +49,30 @@ icke-blockerande sockets och en monotont uppmätt deadline. `read_request`
 delar samma totala tidsbudget mellan header och kropp; de separata anropen
 har var sin uttryckliga budget. Anroparen äger och stänger socketen.
 
-`http.write_response` skriver en response med explicit innehållstyp och
-egna headers. Den använder Connection: close och korrekta kroppslösa
-HEAD/204-svar. `http.write_all` hanterar delskrivningar och skrivdeadline.
-Modulen innehåller ingen router, trådpool eller behörighetspolicy.
+`http.write_response` skriver ett engångssvar med explicit innehållstyp och
+egna headers med `Connection: close` och korrekta kroppslösa HEAD/204-svar.
+`http.write_all` hanterar delskrivningar och skrivdeadline.
+
+För strukturerad svarsuppbyggnad och persistent HTTP/1.1 finns byggaren
+`http.Response` (`Response::new(status)`, `ok`, `text`, `html`, `json`,
+`bytes`, `empty`, `redirect`, `.header`/`.with_header`, `.set_content_type`/`.with_content_type`,
+`.set_body_text`/`.set_body_bytes`, `.set_keep_alive` och `.set_cookie`) tillsammans
+med `connection_wants_close`, `connection_wants_keep_alive`, `should_keep_alive`,
+`encode_response`, `send_response` och `graceful_close` (ordnad half-close-tömning).
+
+För fleranvändarservrar erbjuder `packages/http` en multiplexerad HTTP/1.1
+keep-alive-server via `http.serve(listener, config, cancel, &handler)` (samt
+`http.serve_channel`) byggd på `std.net.PollSet`/`Waker`, `std.sync.Channel`
+och en `task scope`-arbetarpool: en händelseloop multiplexar vilande
+anslutningar och lämnar aktiva förfrågningar till arbetartrådar som implementerar
+traiten `http.Handler`. Dessutom finns webbprimitiv utan inbyggd router:
+`percent_encode` / `percent_decode` / `percent_decode_bytes`,
+`form_encode_component` / `form_decode`, `target_path` / `target_query`,
+`parse_query` / `parse_form_urlencoded` / `encode_form_urlencoded` / `param_get` / `param_get_all` (`FormParam`),
+`Cookie` / `parse_cookies` / `cookie` / `SetCookie` / `SameSite`,
+`BasicCredentials` / `parse_bearer` / `parse_basic` / `format_bearer` / `format_basic`
+samt `escape_html`. Modulen innehåller fortsatt ingen router eller behörighetspolicy.
+[HTTP- och webbprov](../tools/test_http_web.ddr)
 
 `http_client.request(method, url, &names, &values, &body, timeout_ms, max_bytes)`
 returnerar `Response { ok, status, transport_code, body, error }`. `ok` gäller transporten;
@@ -72,14 +92,14 @@ Ingen modul loggar credentials. För samtidiga task-anrop krävs en libcurl
 med trådsäker global initiering; en hårt begränsad DNS-uppslagning kräver
 asynkron DNS i libcurl.
 
-`request_monitored(..., monitor, context)` och
-`request_monitored_with_ca(..., ca_bundle, monitor, context)` lägger till en
-synkron `fn(ptr) -> bool`-callback för avbrott och leaseförnyelse. Anropen är
-`unsafe`: kontextpekaren måste leva under hela överföringen och callbacken
-får inte lämna sin Dunder-tråd. `false` avbryter även en anslutning som väntar
-på HTTP-headers eller TLS-handshake. Ett separat HTTP-anrop för leaseförnyelse
-kan göras från callbacken. Svarens deklarerade och faktiskt mottagna längd
-kontrolleras mot samma gräns innan någon större buffert allokeras.
+`request_monitored(..., monitor)` och
+`request_monitored_with_ca(..., ca_bundle, monitor)` lägger till en
+synkron `&mut FnMut() -> bool`-closure för avbrott och leaseförnyelse.
+`false` avbryter även en anslutning som väntar på HTTP-headers eller
+TLS-handshake, och closuren får inte lämna sin Dunder-tråd. Ett separat
+HTTP-anrop för leaseförnyelse kan göras från callbacken. Svarens deklarerade
+och faktiskt mottagna längd kontrolleras mot samma gräns innan någon större
+buffert allokeras.
 
 På macOS används systemets libcurl. Linux behöver `libcurl.so.4`.
 Klientsviten använder Python 3 och OpenSSL för lokala TLS-fixturer.
