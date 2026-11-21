@@ -251,3 +251,60 @@ Planerad färdplan efter `0.6.x`:
 - **Tasks, IDE-stöd och nya mål:** Inkrementell cache och ergonomi för `task scope`,
   LSP-server och DWARF-debuginfo, mer flexibel heap/filstorlekshantering samt
   stöd för WASI/Windows.
+
+### Tjänste- och servermognad (webbtjänster, SQLite och säker drift)
+
+- **Processignaler och ordnad nedstängning (`std.signal`):** Säkert, portabelt
+  stöd för `SIGTERM`, `SIGINT` och `SIGPIPE` så långlivade tjänster kan avsluta
+  ordnat utan rå POSIX-FFI och hårdkodade signalnummer.
+- **I/O-kapabel samtidighet för långlivade servrar:** Eftersom `task scope`
+  medvetet förbjuder I/O och `@resource` och `packages/http` hårdkodar
+  `Connection: close`, behövs antingen en multiplexerad serverloop över
+  `std.net.PollSet`/`StreamSet` i `packages/http` med HTTP/1.1 keep-alive och
+  ordnad half-close-tömning, eller en I/O-kapabel samtidighetsmodell med
+  `Sendable`-kanaler som bevarar Dunders isoleringsgarantier (utan godtyckligt
+  delat minne över icke-atomisk referensräkning).
+- **HTTP- och webbprimitiv i `packages/http` (eller systerpaket):** En
+  `Response`-byggare som ersätter parallella `extra_names`/`extra_values`-listor,
+  procentkodning/-avkodning, query- och `application/x-www-form-urlencoded`-parsning,
+  `Cookie`/`Set-Cookie`, `Authorization`-hjälpare (`Basic`/`Bearer`) samt
+  HTML-escaping — med routing hållen fristående i linje med
+  [`http.md`](http.md).
+- **Modernisering av `std.sqlite`:** Byt ut engångsstructarna (`OpenResult`,
+  `ExecResult`, `QueryResult`, `CloseResult`) mot `Result<T, SqliteError>`, gör
+  `Database` till `@resource(dispose)`, inför typade bind-parametrar
+  (`SqlValue`: `Null`/`Int`/`Real`/`Text`/`Blob`) i stället för `&[]string` +
+  `exec_blob`, läs kolumner direkt utan mellanliggande JSON-serialisering och
+  dubbelparsning, samt lägg till flersatsig `exec_batch` för migreringar och en
+  `@resource(dispose)`-transaktionsvakt med automatisk rollback.
+- **Säker fil-I/O och sökvägar (`std.fs`, `std.path`):** Komplettera
+  `OpenOptions` och `File` med `set_nofollow` (`O_NOFOLLOW`),
+  `chmod`/`set_permissions` (`fchmod`), full `Metadata` (`mode`, `uid`, `gid`,
+  `nlink`, `dev`, `ino`, `mtime`) samt `lstat`/`fstat`, `sync_dir`, atomisk
+  skrivning/ersättning av privata `0600`-filer (`temp_file` + `fchmod` + `fsync`
+  + `rename`/`link`) samt ren sökvägshantering i `std.path` (`join`, `dirname`,
+  `basename`, `extension`) — så tjänster slipper plattformsspecifik `unsafe`-FFI
+  och hårdkodade `struct stat`-offsets.
+- **Väggklocka och tidsformat (`std.time`):** `sys.now_ms()` är strikt monoton;
+  inför väggklocka (`unix_now`) samt RFC 3339- och HTTP-datumformatering utan
+  C-FFI till `time(0)`.
+- **Säker minnesnollställning (`std.crypto`):** `sys.memory_zero` är i dag
+  `unsafe` på råa pekare; inför säker `crypto.zeroize(&mut []u8)` med
+  kompilatorbarriär mot dead-store elimination samt en `@resource(dispose)`-buffert
+  (`SecretBytes`) som nollställer nycklar och lösenord automatiskt vid dropp.
+- **Flerradiga/råa strängar och kompileringstidsinbäddning:** Stöd råa och
+  flerradiga strängliteraler samt `@embed_file`/`@embed_bytes` (begränsat till
+  paketrelativa sökvägar spårade av byggcachen) för SQL-migreringar och
+  webbresurser utan manuell duplicering eller escapad strängkonkatenering.
+- **Konsekvent `std.json`-avkodning:** Migrera `Doc::get_*` och
+  `Writer::finish` från engångs-`*Field`-structar till `Option<T>` /
+  `Result<T, JsonError>`, lägg till en `Decode`-trait bredvid befintliga
+  `Encode` samt `@derive(Encode, Decode)`.
+- **Konsekvent `u8`-byteindexering och lånade UTF-8-vyer:** Låt `text[i]` och
+  `text.bytes()` ge `u8`/`[]u8` i linje med `b'a'`-literaler (i stället för
+  `i32`/`[]i32`) och inför scope-bundna lånade UTF-8-strängvyer (motsvarande
+  `&[]u8`) utan livstidsannoteringar för att minska `.clone()`- och
+  allokeringsbrus vid parsning.
+- **Ekosystempaket för CLI och loggning (`packages/cli`, `packages/log`):**
+  Flagg-/subkommandoparsning och strukturerad loggning som fristående paket i
+  `packages/` så `stdlib` förblir liten.
