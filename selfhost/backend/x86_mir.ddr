@@ -1,0 +1,1371 @@
+import std.bytes as bytes
+import arm64 as arm
+import floats
+import foreign_operation as foreign_abi
+import place_lower
+import x86
+import ..mir.mir
+import ..mir.mir_liveness as live
+import ..mir.mir_place
+import ..frontend.place_operation as place_op
+import ..frontend.iteration
+import ..frontend.region_operation as region
+
+pub struct Object {
+    ready: bool,
+    text: []u8,
+    label_ids: []i32,
+    label_bytes: []i32,
+    reloc_at: []i32,
+    reloc_target: []i32,
+    stack_traps: []i32,
+    import_ids: []i32,
+    import_at: []i32,
+}
+
+pub fn empty() -> Object {
+    Object {
+        ready: false,
+        text: [],
+        label_ids: [],
+        label_bytes: [],
+        reloc_at: [],
+        reloc_target: [],
+        stack_traps: [],
+        import_ids: [],
+        import_at: [],
+    }
+}
+
+pub fn reset(out: &mut Object) {
+    out.ready = false
+    out.text.clear()
+    out.label_ids.clear()
+    out.label_bytes.clear()
+    out.reloc_at.clear()
+    out.reloc_target.clear()
+    out.stack_traps.clear()
+    out.import_ids.clear()
+    out.import_at.clear()
+}
+
+pub fn clone_into(dst: &mut Object, src: &Object) {
+    reset(&mut dst)
+    dst.ready = src.ready
+    bytes.extend(&mut dst.text, &src.text)
+    for i in 0..src.label_ids.len { dst.label_ids.push(src.label_ids[i]); dst.label_bytes.push(src.label_bytes[i]) }
+    for i in 0..src.reloc_at.len { dst.reloc_at.push(src.reloc_at[i]); dst.reloc_target.push(src.reloc_target[i]) }
+    for i in 0..src.stack_traps.len { dst.stack_traps.push(src.stack_traps[i]) }
+    for i in 0..src.import_ids.len { dst.import_ids.push(src.import_ids[i]); dst.import_at.push(src.import_at[i]) }
+}
+
+fn u8_at(out: &mut []u8, value: i32) { out.push(u8(value.bit_and(255))) }
+
+fn le32(out: &mut []u8, value: i64) {
+    for i in 0..4 { out.push(u8(value.shr(i * 8).bit_and(255))) }
+}
+
+fn le64(out: &mut []u8, value: i64) {
+    for i in 0..8 { out.push(u8(value.shr(i * 8).bit_and(255))) }
+}
+
+fn patch_le32(out: &mut []u8, at: i32, value: i64) {
+    for i in 0..4 { out[at + i] = u8(value.shr(i * 8).bit_and(255)) }
+}
+
+fn rex(out: &mut []u8, wide: bool, reg: i32, index: i32, base: i32, force: bool) {
+    mut bits := 0
+    if wide { bits = bits + 8 }
+    if reg >= 8 { bits = bits + 4 }
+    if index >= 8 { bits = bits + 2 }
+    if base >= 8 { bits = bits + 1 }
+    if force || bits != 0 { u8_at(&mut out, 64 + bits) }
+}
+
+fn modrm(out: &mut []u8, mode: i32, reg: i32, rm: i32) {
+    u8_at(&mut out, mode * 64 + reg.bit_and(7) * 8 + rm.bit_and(7))
+}
+
+fn mem_disp(out: &mut []u8, base: i32, disp: i32, reg: i32) {
+    rm := base.bit_and(7)
+    if disp == 0 && rm != 5 {
+        modrm(&mut out, 0, reg, base)
+        if rm == 4 { u8_at(&mut out, 36) }
+    } else if disp >= -128 && disp <= 127 {
+        modrm(&mut out, 1, reg, base)
+        if rm == 4 { u8_at(&mut out, 36) }
+        u8_at(&mut out, disp)
+    } else {
+        modrm(&mut out, 2, reg, base)
+        if rm == 4 { u8_at(&mut out, 36) }
+        le32(&mut out, i64(disp))
+    }
+}
+
+fn mem_sib_scale8(out: &mut []u8, base: i32, index: i32, reg: i32) {
+    rm := base.bit_and(7)
+    if rm == 5 {
+        modrm(&mut out, 1, reg, 4)
+        u8_at(&mut out, 192 + index.bit_and(7) * 8 + rm)
+        u8_at(&mut out, 0)
+    } else {
+        modrm(&mut out, 0, reg, 4)
+        u8_at(&mut out, 192 + index.bit_and(7) * 8 + rm)
+    }
+}
+
+fn mov_rr(out: &mut []u8, wide: bool, dst: i32, src: i32) {
+    if wide && dst == src { return }
+    rex(&mut out, wide, src, 0, dst, false)
+    u8_at(&mut out, 137)
+    modrm(&mut out, 3, src, dst)
+}
+
+fn bank_read(out: &mut []u8, wide: bool, dst: i32, slot: i32) {
+    rex(&mut out, wide, dst, 0, 15, false)
+    u8_at(&mut out, 139)
+    mem_disp(&mut out, 15, slot * 8, dst)
+}
+
+fn bank_write(out: &mut []u8, slot: i32, src: i32) {
+    rex(&mut out, true, src, 0, 15, false)
+    u8_at(&mut out, 137)
+    mem_disp(&mut out, 15, slot * 8, src)
+}
+
+fn mov_imm(out: &mut []u8, wide: bool, dst: i32, value: i64, live_flags: bool) {
+    mut v := value
+    if !wide { v = v.bit_and(4294967295) }
+    if v == 0 && !live_flags {
+        rex(&mut out, false, dst, 0, dst, false)
+        u8_at(&mut out, 49)
+        modrm(&mut out, 3, dst, dst)
+        return
+    }
+    if v >= 0 && v <= 4294967295 {
+        rex(&mut out, false, 0, 0, dst, false)
+        u8_at(&mut out, 184 + dst.bit_and(7))
+        le32(&mut out, v)
+        return
+    }
+    if v >= -2147483648 && v <= 2147483647 {
+        rex(&mut out, true, 0, 0, dst, false)
+        u8_at(&mut out, 199)
+        modrm(&mut out, 3, 0, dst)
+        le32(&mut out, v)
+        return
+    }
+    rex(&mut out, true, 0, 0, dst, false)
+    u8_at(&mut out, 184 + dst.bit_and(7))
+    le64(&mut out, v)
+}
+
+fn lea_disp(out: &mut []u8, dst: i32, base: i32, disp: i32) {
+    rex(&mut out, true, dst, 0, base, false)
+    u8_at(&mut out, 141)
+    mem_disp(&mut out, base, disp, dst)
+}
+
+fn alu_rr(out: &mut []u8, wide: bool, alu_op: i32, dst: i32, src: i32) {
+    rex(&mut out, wide, src, 0, dst, false)
+    u8_at(&mut out, alu_op * 8 + 1)
+    modrm(&mut out, 3, src, dst)
+}
+
+fn alu_ri(out: &mut []u8, wide: bool, alu_op: i32, dst: i32, imm: i64) -> bool {
+    if imm >= -128 && imm <= 127 {
+        rex(&mut out, wide, 0, 0, dst, false)
+        u8_at(&mut out, 131)
+        modrm(&mut out, 3, alu_op, dst)
+        u8_at(&mut out, i32(imm))
+        return true
+    }
+    if imm >= -2147483648 && imm <= 2147483647 {
+        rex(&mut out, wide, 0, 0, dst, false)
+        u8_at(&mut out, 129)
+        modrm(&mut out, 3, alu_op, dst)
+        le32(&mut out, imm)
+        return true
+    }
+    false
+}
+
+fn test_rr(out: &mut []u8, wide: bool, a: i32, b: i32) {
+    rex(&mut out, wide, b, 0, a, false)
+    u8_at(&mut out, 133)
+    modrm(&mut out, 3, b, a)
+}
+
+fn not_r(out: &mut []u8, wide: bool, reg: i32) {
+    rex(&mut out, wide, 0, 0, reg, false)
+    u8_at(&mut out, 247)
+    modrm(&mut out, 3, 2, reg)
+}
+
+fn imul_rr(out: &mut []u8, wide: bool, dst: i32, src: i32) {
+    rex(&mut out, wide, dst, 0, src, false)
+    u8_at(&mut out, 15); u8_at(&mut out, 175)
+    modrm(&mut out, 3, dst, src)
+}
+
+fn shift_imm(out: &mut []u8, wide: bool, subop: i32, dst: i32, amount: i32) {
+    if amount == 0 {
+        if !wide { mov_rr(&mut out, false, dst, dst) }
+        return
+    }
+    rex(&mut out, wide, 0, 0, dst, false)
+    if amount == 1 {
+        u8_at(&mut out, 209); modrm(&mut out, 3, subop, dst)
+    } else {
+        u8_at(&mut out, 193); modrm(&mut out, 3, subop, dst); u8_at(&mut out, amount)
+    }
+}
+
+fn shift_cl(out: &mut []u8, wide: bool, subop: i32, dst: i32) {
+    rex(&mut out, wide, 0, 0, dst, false)
+    u8_at(&mut out, 211); modrm(&mut out, 3, subop, dst)
+}
+
+fn movsxd_rr(out: &mut []u8, dst: i32, src: i32) {
+    rex(&mut out, true, dst, 0, src, false)
+    u8_at(&mut out, 99); modrm(&mut out, 3, dst, src)
+}
+
+fn movzx_byte_rr(out: &mut []u8, dst: i32, src: i32) {
+    rex(&mut out, false, dst, 0, src, src >= 4 && src <= 7)
+    u8_at(&mut out, 15); u8_at(&mut out, 182); modrm(&mut out, 3, dst, src)
+}
+
+fn movzx_word_rr(out: &mut []u8, dst: i32, src: i32) {
+    rex(&mut out, false, dst, 0, src, false)
+    u8_at(&mut out, 15); u8_at(&mut out, 183); modrm(&mut out, 3, dst, src)
+}
+
+fn setcc_reg(out: &mut []u8, cc: i32, reg: i32) {
+    rex(&mut out, false, 0, 0, reg, reg >= 4 && reg <= 7)
+    u8_at(&mut out, 15); u8_at(&mut out, 144 + cc); modrm(&mut out, 3, 0, reg)
+    movzx_byte_rr(&mut out, reg, reg)
+}
+
+fn jmp_rel32(out: &mut []u8) -> i32 {
+    u8_at(&mut out, 233)
+    at := out.len
+    le32(&mut out, 0)
+    at
+}
+
+fn jcc_rel32(out: &mut []u8, cc: i32) -> i32 {
+    u8_at(&mut out, 15); u8_at(&mut out, 128 + cc)
+    at := out.len
+    le32(&mut out, 0)
+    at
+}
+
+fn load_mem_disp(out: &mut []u8, dst: i32, base: i32, disp: i32, width: i32, sign_ext: bool) {
+    if width == 8 {
+        rex(&mut out, true, dst, 0, base, false)
+        u8_at(&mut out, 139); mem_disp(&mut out, base, disp, dst)
+    } else if width == 4 {
+        if sign_ext {
+            rex(&mut out, true, dst, 0, base, false)
+            u8_at(&mut out, 99); mem_disp(&mut out, base, disp, dst)
+        } else {
+            rex(&mut out, false, dst, 0, base, false)
+            u8_at(&mut out, 139); mem_disp(&mut out, base, disp, dst)
+        }
+    } else if width == 2 {
+        rex(&mut out, false, dst, 0, base, false)
+        u8_at(&mut out, 15); u8_at(&mut out, 183); mem_disp(&mut out, base, disp, dst)
+    } else {
+        rex(&mut out, false, dst, 0, base, false)
+        u8_at(&mut out, 15); u8_at(&mut out, 182); mem_disp(&mut out, base, disp, dst)
+    }
+}
+
+fn load_mem_sib8(out: &mut []u8, dst: i32, base: i32, index: i32, width: i32, sign_ext: bool) {
+    if width == 8 {
+        rex(&mut out, true, dst, index, base, false)
+        u8_at(&mut out, 139); mem_sib_scale8(&mut out, base, index, dst)
+    } else if width == 4 {
+        if sign_ext {
+            rex(&mut out, true, dst, index, base, false)
+            u8_at(&mut out, 99); mem_sib_scale8(&mut out, base, index, dst)
+        } else {
+            rex(&mut out, false, dst, index, base, false)
+            u8_at(&mut out, 139); mem_sib_scale8(&mut out, base, index, dst)
+        }
+    } else if width == 2 {
+        rex(&mut out, false, dst, index, base, false)
+        u8_at(&mut out, 15); u8_at(&mut out, 183); mem_sib_scale8(&mut out, base, index, dst)
+    } else {
+        rex(&mut out, false, dst, index, base, false)
+        u8_at(&mut out, 15); u8_at(&mut out, 182); mem_sib_scale8(&mut out, base, index, dst)
+    }
+}
+
+fn store_mem_disp(out: &mut []u8, src: i32, base: i32, disp: i32, width: i32) {
+    if width == 8 {
+        rex(&mut out, true, src, 0, base, false)
+        u8_at(&mut out, 137); mem_disp(&mut out, base, disp, src)
+    } else if width == 4 {
+        rex(&mut out, false, src, 0, base, false)
+        u8_at(&mut out, 137); mem_disp(&mut out, base, disp, src)
+    } else if width == 2 {
+        u8_at(&mut out, 102)
+        rex(&mut out, false, src, 0, base, false)
+        u8_at(&mut out, 137); mem_disp(&mut out, base, disp, src)
+    } else {
+        // Caller must pass src in 0..3 or >= 8; we always pass rax (0) for byte stores.
+        rex(&mut out, false, src, 0, base, false)
+        u8_at(&mut out, 136); mem_disp(&mut out, base, disp, src)
+    }
+}
+
+fn store_mem_sib8(out: &mut []u8, src: i32, base: i32, index: i32, width: i32) {
+    if width == 8 {
+        rex(&mut out, true, src, index, base, false)
+        u8_at(&mut out, 137); mem_sib_scale8(&mut out, base, index, src)
+    } else if width == 4 {
+        rex(&mut out, false, src, index, base, false)
+        u8_at(&mut out, 137); mem_sib_scale8(&mut out, base, index, src)
+    } else if width == 2 {
+        u8_at(&mut out, 102)
+        rex(&mut out, false, src, index, base, false)
+        u8_at(&mut out, 137); mem_sib_scale8(&mut out, base, index, src)
+    } else {
+        rex(&mut out, false, src, index, base, false)
+        u8_at(&mut out, 136); mem_sib_scale8(&mut out, base, index, src)
+    }
+}
+
+struct State {
+    reg_to_phys: []i32,
+    allocated_regs: []i32,
+    allocated_phys: []i32,
+    block_bytes: []i32,
+    internal_at: []i32,
+    internal_target_block: []i32,
+    stub_targets: []i32,
+    stub_bytes: []i32,
+    external_cond_at: []i32,
+    external_cond_stub: []i32,
+    flags_state: i32,
+}
+
+fn new_state() -> State {
+    mut reg_to_phys: []i32 = []
+    for _ in 0..32 { reg_to_phys.push(-1) }
+    State {
+        reg_to_phys: reg_to_phys,
+        allocated_regs: [],
+        allocated_phys: [],
+        block_bytes: [],
+        internal_at: [],
+        internal_target_block: [],
+        stub_targets: [],
+        stub_bytes: [],
+        external_cond_at: [],
+        external_cond_stub: [],
+        flags_state: 0,
+    }
+}
+
+fn load_vreg(st: &State, out: &mut []u8, scratch: i32, v: i32, wide: bool, live_flags: bool) -> i32 {
+    if v < 0 { mov_imm(&mut out, wide, scratch, 0, live_flags); return scratch }
+    if v < 29 {
+        p := st.reg_to_phys[v]
+        if p >= 0 { return p }
+    }
+    bank_read(&mut out, true, scratch, v)
+    scratch
+}
+
+fn write_vreg(st: &State, out: &mut []u8, v: i32, src: i32, wide: bool) {
+    if v < 0 { return }
+    if v < 29 {
+        p := st.reg_to_phys[v]
+        if p >= 0 { mov_rr(&mut out, wide, p, src); return }
+    }
+    if !wide { mov_rr(&mut out, false, src, src) }
+    bank_write(&mut out, v, src)
+}
+
+fn spill_flags(st: &mut State, out: &mut []u8, live_flags: bool) {
+    if !live_flags || st.flags_state == 0 { return }
+    if st.flags_state == 2 { u8_at(&mut out, 245) } // cmc: SUB CF -> ARM64 CF
+    // pushfq; pop qword [r15 + 256]
+    u8_at(&mut out, 156)
+    u8_at(&mut out, 65); u8_at(&mut out, 143); u8_at(&mut out, 135); le32(&mut out, 256)
+    st.flags_state = 0
+}
+
+fn ensure_cond(st: &mut State, out: &mut []u8, cond: i32) -> i32 {
+    if st.flags_state == 0 {
+        // push qword [r15 + 256]; popfq
+        u8_at(&mut out, 65); u8_at(&mut out, 255); u8_at(&mut out, 183); le32(&mut out, 256)
+        u8_at(&mut out, 157)
+        st.flags_state = 1
+    }
+    if st.flags_state == 1 {
+        if cond == 8 || cond == 9 {
+            u8_at(&mut out, 245)
+            st.flags_state = 2
+        } else {
+            arm_table: [i32; 16] = [4, 5, 2, 3, 8, 9, 0, 1, 7, 6, 13, 12, 15, 14, 0, 0]
+            return arm_table[cond]
+        }
+    }
+    sub_table: [i32; 16] = [4, 5, 3, 2, 8, 9, 0, 1, 7, 6, 13, 12, 15, 14, 0, 0]
+    sub_table[cond]
+}
+
+fn flush_all_regs(st: &State, out: &mut []u8) {
+    for i in 0..st.allocated_regs.len {
+        bank_write(&mut out, st.allocated_regs[i], st.allocated_phys[i])
+    }
+}
+
+fn flush_mask_regs(st: &State, out: &mut []u8, mask: i64) {
+    for i in 0..st.allocated_regs.len {
+        v := st.allocated_regs[i]
+        if mask.bit_and(i64(1).shl(v)) != 0 { bank_write(&mut out, v, st.allocated_phys[i]) }
+    }
+}
+
+fn reload_mask_regs(st: &State, out: &mut []u8, mask: i64) {
+    for i in 0..st.allocated_regs.len {
+        v := st.allocated_regs[i]
+        if mask.bit_and(i64(1).shl(v)) != 0 { bank_read(&mut out, true, st.allocated_phys[i], v) }
+    }
+}
+
+fn emit_stack_guard(st: &mut State, obj: &mut Object, sp_reg: i32, live_flags: bool) {
+    spill_flags(&mut st, &mut obj.text, live_flags)
+    mov_rr(&mut obj.text, true, 2, sp_reg)
+    alu_rr(&mut obj.text, true, 5, 2, 15) // sub rdx, r15
+    assert(alu_ri(&mut obj.text, true, 5, 2, 8192))
+    assert(alu_ri(&mut obj.text, true, 7, 2, 67104768))
+    trap_at := jcc_rel32(&mut obj.text, 7) // ja
+    obj.stack_traps.push(trap_at)
+    st.flags_state = 0
+}
+
+fn get_or_add_stub(st: &mut State, target_label: i32) -> i32 {
+    for i in 0..st.stub_targets.len {
+        if st.stub_targets[i] == target_label { return i }
+    }
+    id := st.stub_targets.len
+    st.stub_targets.push(target_label)
+    st.stub_bytes.push(-1)
+    id
+}
+
+fn emit_exit_trap(out: &mut []u8, status: i32) {
+    mov_imm(&mut out, false, 0, 231, false)
+    mov_imm(&mut out, false, 7, i64(status), false)
+    u8_at(&mut out, 15); u8_at(&mut out, 5) // syscall
+    u8_at(&mut out, 15); u8_at(&mut out, 11) // ud2
+}
+
+fn alu_code_for_binary(opcode: i32) -> i32 {
+    if opcode == 1 { return 0 } // add
+    if opcode == 2 { return 5 } // sub
+    if opcode == 8 { return 4 } // and
+    if opcode == 9 { return 1 } // or
+    if opcode == 10 { return 6 } // xor
+    -1
+}
+
+fn apply_shift_imm(st: &State, out: &mut []u8, wide: bool, src_v: i32, aux: i32, dest_scratch: i32, live_flags: bool) -> i32 {
+    if src_v < 0 { mov_imm(&mut out, wide, dest_scratch, 0, live_flags); return dest_scratch }
+    if aux == 0 { return load_vreg(&st, &mut out, dest_scratch, src_v, wide, live_flags) }
+    kind := aux / 64
+    amount := aux.bit_and(63)
+    src_r := load_vreg(&st, &mut out, dest_scratch, src_v, wide, live_flags)
+    mov_rr(&mut out, wide, dest_scratch, src_r)
+    mut subop := 4
+    if kind == 1 { subop = 5 } else if kind == 2 { subop = 7 } else if kind == 3 { subop = 1 }
+    shift_imm(&mut out, wide, subop, dest_scratch, amount)
+    dest_scratch
+}
+
+fn lower_unary(st: &mut State, obj: &mut Object, f: &mir.Function, op: i32, live_flags_before: bool) -> bool {
+    dst := f.dst[op]; if dst < 0 { return true }
+    opcode := f.opcodes[op]; a := f.a[op]; wide := f.types[op] != 1
+    aux := f.aux[op]
+    if opcode == 3 {
+        clear_mask := i64(65535).shl(aux).bit_not()
+        if a < 0 {
+            mov_imm(&mut obj.text, wide, 0, 0, live_flags_before)
+        } else {
+            spill_flags(&mut st, &mut obj.text, live_flags_before)
+            src_r := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+            mov_rr(&mut obj.text, wide, 0, src_r)
+            if !alu_ri(&mut obj.text, wide, 4, 0, clear_mask) {
+                mov_imm(&mut obj.text, wide, 1, clear_mask, false)
+                alu_rr(&mut obj.text, wide, 4, 0, 1)
+            }
+        }
+        if f.imm[op] != 0 {
+            spill_flags(&mut st, &mut obj.text, live_flags_before)
+            if !alu_ri(&mut obj.text, wide, 1, 0, f.imm[op]) {
+                mov_imm(&mut obj.text, wide, 1, f.imm[op], false)
+                alu_rr(&mut obj.text, wide, 1, 0, 1)
+            }
+        }
+        write_vreg(&st, &mut obj.text, dst, 0, wide)
+        return true
+    }
+    signed := opcode == 1
+    r := aux.bit_and(63); s := aux / 64
+    mut width := 32; if wide { width = 64 }
+    if a < 0 {
+        mov_imm(&mut obj.text, wide, 0, 0, live_flags_before)
+        write_vreg(&st, &mut obj.text, dst, 0, wide)
+        return true
+    }
+    src_r := load_vreg(&st, &mut obj.text, 0, a, true, live_flags_before)
+    if signed && wide && r == 0 && s == 31 {
+        if dst < 29 && st.reg_to_phys[dst] >= 0 {
+            movsxd_rr(&mut obj.text, st.reg_to_phys[dst], src_r)
+        } else {
+            movsxd_rr(&mut obj.text, 0, src_r)
+            write_vreg(&st, &mut obj.text, dst, 0, true)
+        }
+        return true
+    }
+    if !signed && r == 0 && s == 7 {
+        if dst < 29 && st.reg_to_phys[dst] >= 0 {
+            movzx_byte_rr(&mut obj.text, st.reg_to_phys[dst], src_r)
+        } else {
+            movzx_byte_rr(&mut obj.text, 0, src_r)
+            write_vreg(&st, &mut obj.text, dst, 0, wide)
+        }
+        return true
+    }
+    if !signed && r == 0 && s == 15 {
+        if dst < 29 && st.reg_to_phys[dst] >= 0 {
+            movzx_word_rr(&mut obj.text, st.reg_to_phys[dst], src_r)
+        } else {
+            movzx_word_rr(&mut obj.text, 0, src_r)
+            write_vreg(&st, &mut obj.text, dst, 0, wide)
+        }
+        return true
+    }
+    if !signed && wide && r == 0 && s == 31 {
+        if dst < 29 && st.reg_to_phys[dst] >= 0 {
+            mov_rr(&mut obj.text, false, st.reg_to_phys[dst], src_r)
+        } else {
+            mov_rr(&mut obj.text, false, 0, src_r)
+            write_vreg(&st, &mut obj.text, dst, 0, true)
+        }
+        return true
+    }
+    spill_flags(&mut st, &mut obj.text, live_flags_before)
+    mov_rr(&mut obj.text, wide, 0, src_r)
+    if s >= r {
+        top := width - 1 - s
+        if top > 0 { shift_imm(&mut obj.text, wide, 4, 0, top) }
+        right := top + r
+        if right > 0 {
+            subop := if signed { 7 } else { 5 }
+            shift_imm(&mut obj.text, wide, subop, 0, right)
+        }
+    } else {
+        mask := i64(1).shl(s + 1).wrapping_sub(1)
+        if !alu_ri(&mut obj.text, wide, 4, 0, mask) {
+            mov_imm(&mut obj.text, wide, 1, mask, false)
+            alu_rr(&mut obj.text, wide, 4, 0, 1)
+        }
+        shift_imm(&mut obj.text, wide, 4, 0, width - r)
+    }
+    write_vreg(&st, &mut obj.text, dst, 0, wide)
+    true
+}
+
+fn lower_div(st: &mut State, obj: &mut Object, wide: bool, signed: bool, a: i32, b: i32, dst: i32, live_flags: bool) {
+    spill_flags(&mut st, &mut obj.text, live_flags)
+    lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+    rhs := load_vreg(&st, &mut obj.text, 1, b, wide, false)
+    mov_rr(&mut obj.text, wide, 0, lhs)
+    mov_rr(&mut obj.text, wide, 1, rhs)
+    test_rr(&mut obj.text, wide, 1, 1)
+    j_nonzero := jcc_rel32(&mut obj.text, 5)
+    mov_imm(&mut obj.text, wide, 0, 0, false)
+    j_done1 := jmp_rel32(&mut obj.text)
+    patch_le32(&mut obj.text, j_nonzero, i64(obj.text.len - (j_nonzero + 4)))
+
+    mut j_done2 := -1
+    if signed {
+        min_val: i64 = if wide { -9223372036854775808 } else { 2147483648 }
+        mov_imm(&mut obj.text, wide, 2, min_val, false)
+        alu_rr(&mut obj.text, wide, 7, 0, 2) // cmp rax, rdx
+        j_not_min := jcc_rel32(&mut obj.text, 5)
+        assert(alu_ri(&mut obj.text, wide, 7, 1, -1))
+        j_not_neg1 := jcc_rel32(&mut obj.text, 5)
+        // INT_MIN / -1 == INT_MIN (already in rax, 32-bit zero-extended if !wide)
+        if !wide { mov_rr(&mut obj.text, false, 0, 0) }
+        j_done2 = jmp_rel32(&mut obj.text)
+        patch_le32(&mut obj.text, j_not_min, i64(obj.text.len - (j_not_min + 4)))
+        patch_le32(&mut obj.text, j_not_neg1, i64(obj.text.len - (j_not_neg1 + 4)))
+    }
+    if signed {
+        if wide { u8_at(&mut obj.text, 72) } // cqo
+        u8_at(&mut obj.text, 153) // cdq / cqo
+        rex(&mut obj.text, wide, 0, 0, 1, false)
+        u8_at(&mut obj.text, 247); modrm(&mut obj.text, 3, 7, 1) // idiv rcx
+    } else {
+        mov_imm(&mut obj.text, false, 2, 0, false)
+        rex(&mut obj.text, wide, 0, 0, 1, false)
+        u8_at(&mut obj.text, 247); modrm(&mut obj.text, 3, 6, 1) // div rcx
+    }
+    end_at := obj.text.len
+    patch_le32(&mut obj.text, j_done1, i64(end_at - (j_done1 + 4)))
+    if j_done2 >= 0 { patch_le32(&mut obj.text, j_done2, i64(end_at - (j_done2 + 4))) }
+    write_vreg(&st, &mut obj.text, dst, 0, wide)
+}
+
+fn lower_binary_or_compare(st: &mut State, obj: &mut Object, f: &mir.Function, op: i32, live_flags_before: bool) -> bool {
+    kind := f.kinds[op]; opcode := f.opcodes[op]
+    dst := f.dst[op]; a := f.a[op]; b := f.b[op]; c := f.c[op]
+    wide := f.types[op] != 1
+    sets_flags := f.flags[op].bit_and(2) != 0
+    if !sets_flags { spill_flags(&mut st, &mut obj.text, live_flags_before) }
+    else if kind == i32(mir.Kind.Binary) || kind == i32(mir.Kind.Compare) {
+        // When a compare/flag-setter runs, prior dead flags are overwritten; if flags were needed they cannot be here.
+        st.flags_state = 0
+    }
+
+    if kind == i32(mir.Kind.Compare) && b < 0 && f.aux[op] == 0 {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        alu_op := if opcode == 1 { 0 } else { 5 }
+        if opcode == 2 && alu_ri(&mut obj.text, wide, 7, lhs, f.imm[op]) {
+            st.flags_state = 2
+            return true
+        }
+        mov_rr(&mut obj.text, wide, 0, lhs)
+        if !alu_ri(&mut obj.text, wide, alu_op, 0, f.imm[op]) {
+            mov_imm(&mut obj.text, wide, 1, f.imm[op], false)
+            alu_rr(&mut obj.text, wide, alu_op, 0, 1)
+        }
+        st.flags_state = if opcode == 1 { 1 } else { 2 }
+        return true
+    }
+
+    if kind == i32(mir.Kind.Compare) && (opcode == 8 || opcode == 11) {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        rhs := apply_shift_imm(&st, &mut obj.text, wide, b, f.aux[op], 1, false)
+        if opcode == 11 {
+            mov_rr(&mut obj.text, wide, 1, rhs)
+            not_r(&mut obj.text, wide, 1)
+            test_rr(&mut obj.text, wide, lhs, 1)
+        } else {
+            test_rr(&mut obj.text, wide, lhs, rhs)
+        }
+        st.flags_state = 1
+        return true
+    }
+
+    if kind == i32(mir.Kind.Compare) {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        rhs := apply_shift_imm(&st, &mut obj.text, wide, b, f.aux[op], 1, false)
+        if opcode == 2 {
+            alu_rr(&mut obj.text, wide, 7, lhs, rhs)
+            st.flags_state = 2
+        } else {
+            mov_rr(&mut obj.text, wide, 0, lhs)
+            alu_rr(&mut obj.text, wide, 0, 0, rhs)
+            st.flags_state = 1
+        }
+        return true
+    }
+
+    if (opcode == 1 || opcode == 2) && b < 0 && f.aux[op] == 0 {
+        alu_op := if opcode == 1 { 0 } else { 5 }
+        dp := if dst >= 0 && dst < 29 { st.reg_to_phys[dst] } else { -1 }
+        ap := if a >= 0 && a < 29 { st.reg_to_phys[a] } else { -1 }
+        if dp >= 0 && dp == ap {
+            if alu_ri(&mut obj.text, wide, alu_op, dp, f.imm[op]) {
+                if sets_flags { st.flags_state = if opcode == 1 { 1 } else { 2 } }
+                return true
+            }
+        }
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        mov_rr(&mut obj.text, wide, 0, lhs)
+        if !alu_ri(&mut obj.text, wide, alu_op, 0, f.imm[op]) {
+            mov_imm(&mut obj.text, wide, 1, f.imm[op], false)
+            alu_rr(&mut obj.text, wide, alu_op, 0, 1)
+        }
+        if sets_flags { st.flags_state = if opcode == 1 { 1 } else { 2 } }
+        write_vreg(&st, &mut obj.text, dst, 0, wide)
+        return true
+    }
+
+    alu := alu_code_for_binary(opcode)
+    if alu >= 0 && (f.aux[op] == 0 || b < 0) {
+        dp := if dst >= 0 && dst < 29 { st.reg_to_phys[dst] } else { -1 }
+        ap := if a >= 0 && a < 29 { st.reg_to_phys[a] } else { -1 }
+        bp := if b >= 0 && b < 29 { st.reg_to_phys[b] } else { -1 }
+        if dp >= 0 && ap >= 0 && bp >= 0 {
+            if dp == ap {
+                alu_rr(&mut obj.text, wide, alu, dp, bp)
+                if sets_flags { st.flags_state = if opcode == 2 { 2 } else { 1 } }
+                return true
+            }
+            if dp != bp {
+                mov_rr(&mut obj.text, wide, dp, ap)
+                alu_rr(&mut obj.text, wide, alu, dp, bp)
+                if sets_flags { st.flags_state = if opcode == 2 { 2 } else { 1 } }
+                return true
+            }
+        }
+    }
+
+    if opcode == 6 || opcode == 7 {
+        lower_div(&mut st, &mut obj, wide, opcode == 6, a, b, dst, false)
+        return true
+    }
+
+    if opcode == 4 || opcode == 5 {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, true, false)
+        rhs := load_vreg(&st, &mut obj.text, 1, b, true, false)
+        mov_rr(&mut obj.text, true, 0, lhs)
+        rex(&mut obj.text, true, 0, 0, rhs, false)
+        u8_at(&mut obj.text, 247)
+        modrm(&mut obj.text, 3, if opcode == 4 { 5 } else { 4 }, rhs)
+        write_vreg(&st, &mut obj.text, dst, 2, true)
+        return true
+    }
+
+    if opcode == 17 || opcode == 18 {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        rhs := load_vreg(&st, &mut obj.text, 1, b, wide, false)
+        mov_rr(&mut obj.text, wide, 0, lhs)
+        imul_rr(&mut obj.text, wide, 0, rhs)
+        acc := load_vreg(&st, &mut obj.text, 2, c, wide, false)
+        if opcode == 17 {
+            alu_rr(&mut obj.text, wide, 0, 0, acc)
+        } else {
+            mov_rr(&mut obj.text, wide, 2, acc)
+            alu_rr(&mut obj.text, wide, 5, 2, 0)
+            mov_rr(&mut obj.text, wide, 0, 2)
+        }
+        write_vreg(&st, &mut obj.text, dst, 0, wide)
+        return true
+    }
+
+    if opcode == 14 || opcode == 15 || opcode == 16 {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        rhs := load_vreg(&st, &mut obj.text, 1, b, wide, false)
+        mov_rr(&mut obj.text, wide, 0, lhs)
+        mov_rr(&mut obj.text, wide, 1, rhs)
+        subop := if opcode == 14 { 4 } else if opcode == 15 { 5 } else { 7 }
+        shift_cl(&mut obj.text, wide, subop, 0)
+        write_vreg(&st, &mut obj.text, dst, 0, wide)
+        return true
+    }
+
+    if opcode == 3 {
+        lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+        rhs := load_vreg(&st, &mut obj.text, 1, b, wide, false)
+        mov_rr(&mut obj.text, wide, 0, lhs)
+        imul_rr(&mut obj.text, wide, 0, rhs)
+        write_vreg(&st, &mut obj.text, dst, 0, wide)
+        return true
+    }
+
+    lhs := load_vreg(&st, &mut obj.text, 0, a, wide, false)
+    rhs := apply_shift_imm(&st, &mut obj.text, wide, b, f.aux[op], 1, false)
+    mov_rr(&mut obj.text, wide, 0, lhs)
+    if alu >= 0 {
+        if rhs == 0 {
+            mov_rr(&mut obj.text, wide, 1, rhs)
+            alu_rr(&mut obj.text, wide, alu, 0, 1)
+        } else {
+            alu_rr(&mut obj.text, wide, alu, 0, rhs)
+        }
+    } else if opcode == 11 || opcode == 12 || opcode == 13 {
+        mov_rr(&mut obj.text, wide, 1, rhs)
+        not_r(&mut obj.text, wide, 1)
+        real_op := if opcode == 11 { 4 } else if opcode == 12 { 1 } else { 6 }
+        alu_rr(&mut obj.text, wide, real_op, 0, 1)
+    } else {
+        return false
+    }
+    if sets_flags { st.flags_state = if opcode == 2 { 2 } else { 1 } }
+    write_vreg(&st, &mut obj.text, dst, 0, wide)
+    true
+}
+
+fn lower_load(st: &State, out: &mut []u8, f: &mir.Function, op: i32, live_flags_before: bool) {
+    dst := f.dst[op]
+    width := f.aux[op]
+    sign_ext := f.extensions[op] == 2
+    base_v := f.a[op]
+    indexed := f.opcodes[op] == 1 && f.b[op] >= 0
+    mut base_r := 0
+    if base_v < 0 {
+        mov_imm(&mut out, true, 0, 0, live_flags_before)
+    } else if base_v < 29 && st.reg_to_phys[base_v] >= 0 {
+        base_r = st.reg_to_phys[base_v]
+    } else {
+        bank_read(&mut out, true, 0, base_v)
+    }
+    dst_r := if dst >= 0 && dst < 29 && st.reg_to_phys[dst] >= 0 { st.reg_to_phys[dst] } else { 0 }
+    if indexed {
+        idx_r := load_vreg(&st, &mut out, 1, f.b[op], true, live_flags_before)
+        load_mem_sib8(&mut out, dst_r, base_r, idx_r, width, sign_ext)
+    } else {
+        load_mem_disp(&mut out, dst_r, base_r, i32(f.imm[op]), width, sign_ext)
+    }
+    if dst >= 0 && dst_r == 0 {
+        if dst < 29 && st.reg_to_phys[dst] >= 0 {
+            mov_rr(&mut out, true, st.reg_to_phys[dst], 0)
+        } else {
+            bank_write(&mut out, dst, 0)
+        }
+    }
+}
+
+fn lower_store(st: &State, out: &mut []u8, f: &mir.Function, op: i32, live_flags_before: bool) {
+    val_v := f.a[op]
+    base_v := f.b[op]
+    width := f.aux[op]
+    indexed := f.opcodes[op] == 1 && f.c[op] >= 0
+    mut val_r := 0
+    if width == 1 {
+        val_r = load_vreg(&st, &mut out, 0, val_v, false, live_flags_before)
+        mov_rr(&mut out, false, 0, val_r)
+        val_r = 0
+    } else {
+        val_r = load_vreg(&st, &mut out, 0, val_v, true, live_flags_before)
+    }
+    mut base_r := 1
+    if base_v < 0 {
+        mov_imm(&mut out, true, 1, 0, live_flags_before)
+    } else if base_v < 29 && st.reg_to_phys[base_v] >= 0 {
+        base_r = st.reg_to_phys[base_v]
+    } else {
+        bank_read(&mut out, true, 1, base_v)
+    }
+    if indexed {
+        idx_r := load_vreg(&st, &mut out, 2, f.c[op], true, live_flags_before)
+        store_mem_sib8(&mut out, val_r, base_r, idx_r, width)
+    } else {
+        store_mem_disp(&mut out, val_r, base_r, i32(f.imm[op]), width)
+    }
+}
+
+fn append_arm_words(obj: &mut Object, words: &[]i64) -> bool {
+    mut text := replace(&mut obj.text, [])
+    mut traps := replace(&mut obj.stack_traps, [])
+    ok := x86.emit_arm_words(&mut text, &mut traps, &words)
+    obj.text = move text
+    obj.stack_traps = move traps
+    ok
+}
+
+fn append_foreign_bytes(obj: &mut Object, gp: i32, fp: i32, stack_slots: i32) -> bool {
+    mut text := replace(&mut obj.text, [])
+    mut traps := replace(&mut obj.stack_traps, [])
+    ok := x86.emit_foreign_bytes(&mut text, &mut traps, gp, fp, stack_slots)
+    obj.text = move text
+    obj.stack_traps = move traps
+    ok
+}
+
+fn lower_arm_fallback(st: &mut State, obj: &mut Object, f: &mir.Function, op: i32,
+    live_flags_before: bool, live_after: i64, scratch_arm: &mut arm.Code) -> bool {
+    spill_flags(&mut st, &mut obj.text, live_flags_before)
+    flush_all_regs(&st, &mut obj.text)
+    scratch_arm.words.clear(); scratch_arm.at.clear(); scratch_arm.target.clear(); scratch_arm.kinds.clear()
+    kind := f.kinds[op]
+    if f.modes[op] == 0 {
+        first := f.raw_starts[op]; size := f.widths[op]
+        for k in 0..size { scratch_arm.words.push(f.raw[first + k]) }
+    } else if kind == i32(mir.Kind.Float) {
+        if foreign_abi.handles(f.opcodes[op]) { foreign_abi.lower(&mut scratch_arm, &f, op) }
+        else { floats.lower(&mut scratch_arm, f.opcodes[op] - 32, f.aux[op]) }
+    } else if kind == i32(mir.Kind.Region) {
+        region.lower(&mut scratch_arm, f.opcodes[op], f.aux[op], f.imm[op])
+    } else if kind == i32(mir.Kind.Iteration) {
+        iteration.lower(&mut scratch_arm, f.opcodes[op])
+    } else if kind == i32(mir.Kind.Foreign) {
+        foreign_abi.lower(&mut scratch_arm, &f, op)
+    } else if kind == i32(mir.Kind.Place) {
+        place_lower.lower(&mut scratch_arm, mir_place.memory_tag(f.opcodes[op]), f.aux[op], i32(f.imm[op]))
+    } else {
+        return false
+    }
+    if scratch_arm.at.len != 0 { return false }
+    if !append_arm_words(&mut obj, &scratch_arm.words) { return false }
+    reload_mask_regs(&st, &mut obj.text, live_after)
+    st.flags_state = 0
+    true
+}
+
+fn lower_hot_place(st: &mut State, obj: &mut Object, f: &mir.Function, op: i32,
+    live_flags_before: bool, live_after: i64, scratch_arm: &mut arm.Code) -> bool {
+    tag := mir_place.memory_tag(f.opcodes[op])
+    form := f.aux[op]; param := i32(f.imm[op])
+    if tag == place_op.tag(.Field) {
+        if param == 0 { return true }
+        r0 := load_vreg(&st, &mut obj.text, 0, 0, true, live_flags_before)
+        if st.reg_to_phys[0] >= 0 {
+            lea_disp(&mut obj.text, st.reg_to_phys[0], r0, param)
+            return true
+        }
+        lea_disp(&mut obj.text, 0, r0, param)
+        write_vreg(&st, &mut obj.text, 0, 0, true)
+        return true
+    }
+    if tag == place_op.tag(.CheckIndex) {
+        r0 := load_vreg(&st, &mut obj.text, 0, 0, true, false)
+        r1 := load_vreg(&st, &mut obj.text, 1, 1, true, false)
+        load_mem_disp(&mut obj.text, 2, r1, form * 8, 8, false)
+        write_vreg(&st, &mut obj.text, 2, 2, true)
+        alu_rr(&mut obj.text, true, 7, r0, 2) // cmp x0, x2
+        st.flags_state = 2
+        return true
+    }
+    if tag == place_op.tag(.Element) {
+        r0 := load_vreg(&st, &mut obj.text, 0, 0, true, live_flags_before)
+        r1 := load_vreg(&st, &mut obj.text, 1, 1, true, live_flags_before)
+        if form == 0 {
+            // x0 = x1 + x0 + 8
+            rex(&mut obj.text, true, 0, r0, r1, false)
+            u8_at(&mut obj.text, 141)
+            modrm(&mut obj.text, 1, 0, 4)
+            u8_at(&mut obj.text, r0.bit_and(7) * 8 + r1.bit_and(7))
+            u8_at(&mut obj.text, 8)
+            write_vreg(&st, &mut obj.text, 0, 0, true)
+            return true
+        }
+        if form == 1 && param == 3 {
+            // x1 = [x1]; x0 = x1 + x0*8
+            load_mem_disp(&mut obj.text, 1, r1, 0, 8, false)
+            write_vreg(&st, &mut obj.text, 1, 1, true)
+            rex(&mut obj.text, true, 0, r0, 1, false)
+            u8_at(&mut obj.text, 141)
+            mem_sib_scale8(&mut obj.text, 1, r0, 0)
+            write_vreg(&st, &mut obj.text, 0, 0, true)
+            return true
+        }
+        if form == 1 && param == 0 {
+            // x1 = [x1]; x0 = x1 + x0
+            load_mem_disp(&mut obj.text, 1, r1, 0, 8, false)
+            write_vreg(&st, &mut obj.text, 1, 1, true)
+            rex(&mut obj.text, true, 0, r0, 1, false)
+            u8_at(&mut obj.text, 141)
+            modrm(&mut obj.text, 0, 0, 4)
+            u8_at(&mut obj.text, r0.bit_and(7) * 8 + 1)
+            write_vreg(&st, &mut obj.text, 0, 0, true)
+            return true
+        }
+        spill_flags(&mut st, &mut obj.text, live_flags_before)
+        load_mem_disp(&mut obj.text, 1, r1, 0, 8, false)
+        write_vreg(&st, &mut obj.text, 1, 1, true)
+        mov_rr(&mut obj.text, true, 0, r0)
+        if form == 1 {
+            shift_imm(&mut obj.text, true, 4, 0, param)
+        } else {
+            mov_imm(&mut obj.text, true, 2, i64(param), false)
+            write_vreg(&st, &mut obj.text, 2, 2, true)
+            imul_rr(&mut obj.text, true, 0, 2)
+        }
+        alu_rr(&mut obj.text, true, 0, 0, 1)
+        write_vreg(&st, &mut obj.text, 0, 0, true)
+        return true
+    }
+    if tag == place_op.tag(.Member) {
+        r0 := load_vreg(&st, &mut obj.text, 0, 0, true, live_flags_before)
+        if place_op.member_write(form) {
+            r1 := load_vreg(&st, &mut obj.text, 1, 1, true, live_flags_before)
+            store_mem_disp(&mut obj.text, r1, r0, param * 8, 8)
+        } else {
+            load_mem_disp(&mut obj.text, 0, r0, param * 8, 8, false)
+            write_vreg(&st, &mut obj.text, 0, 0, true)
+        }
+        return true
+    }
+    if tag == place_op.tag(.BorrowPayload) { return true }
+    lower_arm_fallback(&mut st, &mut obj, &f, op, live_flags_before, live_after, &mut scratch_arm)
+}
+
+fn local_block_for_label(f: &mir.Function, label: i32) -> i32 {
+    mut low := 0; mut high := f.label_ids.len
+    while low < high {
+        mid := low + (high - low) / 2
+        if f.label_ids[mid] < label { low = mid + 1 } else { high = mid }
+    }
+    if low >= f.label_ids.len || f.label_ids[low] != label { return -1 }
+    pos := f.label_ops[low]
+    if pos < 0 { return -1 }
+    if pos == f.order.len { return f.block_starts.len }
+    f.op_blocks[f.order[pos]]
+}
+
+fn select_registers(st: &mut State, f: &mir.Function, live_ws: &live.Workspace, live_ok: bool) {
+    pool: [i32; 11] = [3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    mut scores: []i32 = []
+    for _ in 0..29 { scores.push(0) }
+    for b in 0..f.block_starts.len {
+        weight := if live_ok && live.loop_block(&live_ws, b) { 16 } else { 1 }
+        for pos in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[pos]
+            if f.modes[op] == 2 { continue }
+            kind := f.kinds[op]
+            if f.dst[op] >= 0 && f.dst[op] < 29 { scores[f.dst[op]] = scores[f.dst[op]] + weight }
+            if f.a[op] >= 0 && f.a[op] < 29 { scores[f.a[op]] = scores[f.a[op]] + weight }
+            if f.b[op] >= 0 && f.b[op] < 29 { scores[f.b[op]] = scores[f.b[op]] + weight }
+            if f.c[op] >= 0 && f.c[op] < 29 { scores[f.c[op]] = scores[f.c[op]] + weight }
+            if kind == i32(mir.Kind.Place) {
+                r := f.reads[op]; w := f.writes[op]
+                for v in 0..29 {
+                    bit := i64(1).shl(v)
+                    if r.bit_and(bit) != 0 || w.bit_and(bit) != 0 { scores[v] = scores[v] + weight }
+                }
+            }
+        }
+    }
+    if !live_ok { return }
+    mut used: []bool = []
+    for _ in 0..29 { used.push(false) }
+    for slot in 0..pool.len {
+        mut best_v := -1; mut best_score := 0
+        for v in 0..29 {
+            if !used[v] && scores[v] > best_score {
+                best_score = scores[v]; best_v = v
+            }
+        }
+        if best_v < 0 { break }
+        used[best_v] = true
+        phys := pool[slot]
+        st.reg_to_phys[best_v] = phys
+        st.allocated_regs.push(best_v)
+        st.allocated_phys.push(phys)
+    }
+}
+
+pub fn lower_into(out: &mut Object, f: &mir.Function) -> bool {
+    reset(&mut out)
+    if !f.valid || !f.verified || f.platform != 2 { return false }
+    mut live_ws := live.new()
+    live_ok := f.optimizable && !f.unknown_control && live.analyze_into(&mut live_ws, &f, 4194304)
+    mut st := new_state()
+    select_registers(&mut st, &f, &live_ws, live_ok)
+    mut scratch_arm := arm.new_for(2)
+    out.text.reserve(f.order.len * 16 + 64)
+
+    // Entry loads from [r15] before block 0 body.
+    entry_live := if live_ok && f.block_starts.len > 0 { live.live_in(&live_ws, 0) } else { i64(-1) }
+    reload_mask_regs(&st, &mut out.text, entry_live)
+
+    blocks := f.block_starts.len
+    for b in 0..blocks {
+        st.block_bytes.push(out.text.len)
+        st.flags_state = 0
+        mut prev_flags_live := if live_ok { live_in_flags(&f, &live_ws, b) } else { true }
+        for pos in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[pos]
+            if f.modes[op] == 2 { continue }
+            kind := f.kinds[op]
+            live_after_op := if live_ok { live.live_after(&live_ws, op) } else { i64(-1) }
+            live_flags_after := if live_ok { live.flags_after(&live_ws, op) } else { true }
+
+            if kind == i32(mir.Kind.Nop) {
+                // no-op
+            } else if kind == i32(mir.Kind.ImportAddress) {
+                // mov rax, [rip + disp32] (finish_linked rewrites 0x8b -> 0x8d when global)
+                u8_at(&mut out.text, 72); u8_at(&mut out.text, 139); u8_at(&mut out.text, 5)
+                out.import_ids.push(f.import_ids[op])
+                out.import_at.push(out.text.len)
+                le32(&mut out.text, 0)
+                write_vreg(&st, &mut out.text, f.dst[op], 0, true)
+            } else if kind == i32(mir.Kind.Address) {
+                if f.reloc_kinds[op] == 20 {
+                    // lea rax, [rip + disp32]
+                    u8_at(&mut out.text, 72); u8_at(&mut out.text, 141); u8_at(&mut out.text, 5)
+                    out.reloc_at.push(out.text.len); out.reloc_target.push(f.targets[op])
+                    le32(&mut out.text, 0)
+                    write_vreg(&st, &mut out.text, f.dst[op], 0, true)
+                } else {
+                    base_r := load_vreg(&st, &mut out.text, 0, f.a[op], true, prev_flags_live)
+                    dst := f.dst[op]
+                    if dst >= 0 && dst < 29 && st.reg_to_phys[dst] >= 0 {
+                        lea_disp(&mut out.text, st.reg_to_phys[dst], base_r, i32(f.imm[op]))
+                    } else if dst >= 0 {
+                        lea_disp(&mut out.text, 0, base_r, i32(f.imm[op]))
+                        write_vreg(&st, &mut out.text, dst, 0, true)
+                    }
+                }
+            } else if f.modes[op] == 0 && f.reloc_kinds[op] < 0 {
+                if !lower_arm_fallback(&mut st, &mut out, &f, op, prev_flags_live, live_after_op, &mut scratch_arm) {
+                    return false
+                }
+            } else if kind == i32(mir.Kind.Constant) {
+                dst := f.dst[op]
+                if dst >= 0 {
+                    wide := f.types[op] != 1
+                    mut target_r := 0
+                    if dst < 29 && st.reg_to_phys[dst] >= 0 { target_r = st.reg_to_phys[dst] }
+                    mov_imm(&mut out.text, wide, target_r, f.imm[op], prev_flags_live && st.flags_state != 0)
+                    if dst >= 29 || st.reg_to_phys[dst] < 0 { bank_write(&mut out.text, dst, 0) }
+                }
+            } else if kind == i32(mir.Kind.Copy) {
+                dst := f.dst[op]
+                if dst >= 0 {
+                    wide := f.types[op] != 1
+                    a := f.a[op]
+                    if a < 0 {
+                        mut target_r := 0
+                        if dst < 29 && st.reg_to_phys[dst] >= 0 { target_r = st.reg_to_phys[dst] }
+                        mov_imm(&mut out.text, wide, target_r, 0, prev_flags_live && st.flags_state != 0)
+                        if dst >= 29 || st.reg_to_phys[dst] < 0 { bank_write(&mut out.text, dst, 0) }
+                    } else {
+                        src_r := load_vreg(&st, &mut out.text, 0, a, wide, prev_flags_live && st.flags_state != 0)
+                        write_vreg(&st, &mut out.text, dst, src_r, wide)
+                    }
+                }
+            } else if kind == i32(mir.Kind.Unary) {
+                if !lower_unary(&mut st, &mut out, &f, op, prev_flags_live) { return false }
+            } else if kind == i32(mir.Kind.Binary) || kind == i32(mir.Kind.Compare) {
+                if !lower_binary_or_compare(&mut st, &mut out, &f, op, prev_flags_live) { return false }
+            } else if kind == i32(mir.Kind.Select) {
+                dst := f.dst[op]
+                if dst >= 0 {
+                    cond := i32(f.imm[op])
+                    if cond >= 14 {
+                        mut target_r := 0
+                        if dst < 29 && st.reg_to_phys[dst] >= 0 { target_r = st.reg_to_phys[dst] }
+                        mov_imm(&mut out.text, true, target_r, 1, prev_flags_live && st.flags_state != 0)
+                        if dst >= 29 || st.reg_to_phys[dst] < 0 { bank_write(&mut out.text, dst, 0) }
+                    } else {
+                        cc := ensure_cond(&mut st, &mut out.text, cond)
+                        if dst < 29 && st.reg_to_phys[dst] >= 0 {
+                            setcc_reg(&mut out.text, cc, st.reg_to_phys[dst])
+                        } else {
+                            setcc_reg(&mut out.text, cc, 0)
+                            bank_write(&mut out.text, dst, 0)
+                        }
+                    }
+                }
+            } else if kind == i32(mir.Kind.Load) {
+                lower_load(&st, &mut out.text, &f, op, prev_flags_live && st.flags_state != 0)
+            } else if kind == i32(mir.Kind.Store) {
+                lower_store(&st, &mut out.text, &f, op, prev_flags_live && st.flags_state != 0)
+            } else if kind == i32(mir.Kind.StackPush) {
+                bank_read(&mut out.text, true, 0, 31)
+                lea_disp(&mut out.text, 0, 0, i32(f.imm[op]))
+                emit_stack_guard(&mut st, &mut out, 0, prev_flags_live)
+                bank_write(&mut out.text, 31, 0)
+                val_r := load_vreg(&st, &mut out.text, 1, f.a[op], true, false)
+                store_mem_disp(&mut out.text, val_r, 0, 0, 8)
+            } else if kind == i32(mir.Kind.StackPop) {
+                bank_read(&mut out.text, true, 0, 31)
+                if f.dst[op] >= 0 {
+                    load_mem_disp(&mut out.text, 1, 0, 0, 8, false)
+                    write_vreg(&st, &mut out.text, f.dst[op], 1, true)
+                }
+                lea_disp(&mut out.text, 0, 0, i32(f.imm[op]))
+                emit_stack_guard(&mut st, &mut out, 0, prev_flags_live)
+                bank_write(&mut out.text, 31, 0)
+            } else if kind == i32(mir.Kind.Frame) {
+                delta := if f.opcodes[op] == 2 { -i32(f.imm[op]) } else { i32(f.imm[op]) }
+                bank_read(&mut out.text, true, 0, f.a[op])
+                if delta != 0 { lea_disp(&mut out.text, 0, 0, delta) }
+                if f.dst[op] == 31 { emit_stack_guard(&mut st, &mut out, 0, prev_flags_live) }
+                bank_write(&mut out.text, f.dst[op], 0)
+            } else if kind == i32(mir.Kind.Abi) {
+                if f.opcodes[op] == 1 {
+                    bank_read(&mut out.text, true, 0, 31)
+                    lea_disp(&mut out.text, 0, 0, -16)
+                    emit_stack_guard(&mut st, &mut out, 0, prev_flags_live)
+                    bank_write(&mut out.text, 31, 0)
+                    bank_read(&mut out.text, true, 1, 29); store_mem_disp(&mut out.text, 1, 0, 0, 8)
+                    bank_read(&mut out.text, true, 1, 30); store_mem_disp(&mut out.text, 1, 0, 8, 8)
+                } else {
+                    bank_read(&mut out.text, true, 0, 31)
+                    load_mem_disp(&mut out.text, 1, 0, 0, 8, false); bank_write(&mut out.text, 29, 1)
+                    load_mem_disp(&mut out.text, 1, 0, 8, 8, false); bank_write(&mut out.text, 30, 1)
+                    lea_disp(&mut out.text, 0, 0, 16)
+                    emit_stack_guard(&mut st, &mut out, 0, prev_flags_live)
+                    bank_write(&mut out.text, 31, 0)
+                }
+            } else if kind == i32(mir.Kind.Jump) {
+                spill_flags(&mut st, &mut out.text, live_flags_after)
+                tb := local_block_for_label(&f, f.targets[op])
+                if tb >= 0 {
+                    if tb != b + 1 {
+                        at := jmp_rel32(&mut out.text)
+                        st.internal_at.push(at); st.internal_target_block.push(tb)
+                    }
+                } else {
+                    flush_all_regs(&st, &mut out.text)
+                    at := jmp_rel32(&mut out.text)
+                    out.reloc_at.push(at); out.reloc_target.push(f.targets[op])
+                }
+            } else if kind == i32(mir.Kind.CondJump) {
+                reloc := f.reloc_kinds[op]
+                tb := local_block_for_label(&f, f.targets[op])
+                if reloc == 18 || reloc == 19 {
+                    spill_flags(&mut st, &mut out.text, live_flags_after)
+                    reg_v := if f.a[op] >= 0 { f.a[op] } else { 0 }
+                    r0 := load_vreg(&st, &mut out.text, 0, reg_v, true, false)
+                    test_rr(&mut out.text, true, r0, r0)
+                    st.flags_state = 0
+                    cc := if reloc == 18 { 4 } else { 5 }
+                    at := jcc_rel32(&mut out.text, cc)
+                    if tb >= 0 {
+                        st.internal_at.push(at); st.internal_target_block.push(tb)
+                    } else {
+                        sid := get_or_add_stub(&mut st, f.targets[op])
+                        st.external_cond_at.push(at); st.external_cond_stub.push(sid)
+                    }
+                } else {
+                    cond := reloc - 2
+                    if cond >= 14 {
+                        spill_flags(&mut st, &mut out.text, live_flags_after)
+                        if tb >= 0 {
+                            at := jmp_rel32(&mut out.text)
+                            st.internal_at.push(at); st.internal_target_block.push(tb)
+                        } else {
+                            sid := get_or_add_stub(&mut st, f.targets[op])
+                            at := jmp_rel32(&mut out.text)
+                            st.external_cond_at.push(at); st.external_cond_stub.push(sid)
+                        }
+                    } else {
+                        if live_flags_after { spill_flags(&mut st, &mut out.text, true) }
+                        cc := ensure_cond(&mut st, &mut out.text, cond)
+                        at := jcc_rel32(&mut out.text, cc)
+                        if tb >= 0 {
+                            st.internal_at.push(at); st.internal_target_block.push(tb)
+                        } else {
+                            sid := get_or_add_stub(&mut st, f.targets[op])
+                            st.external_cond_at.push(at); st.external_cond_stub.push(sid)
+                        }
+                    }
+                }
+            } else if kind == i32(mir.Kind.Call) {
+                spill_flags(&mut st, &mut out.text, live_flags_after)
+                flush_all_regs(&st, &mut out.text)
+                if f.reloc_kinds[op] == 1 {
+                    u8_at(&mut out.text, 232)
+                    out.reloc_at.push(out.text.len); out.reloc_target.push(f.targets[op])
+                    le32(&mut out.text, 0)
+                } else if f.opcodes[op] == 115 {
+                    if !append_foreign_bytes(&mut out, f.aux[op] % 256, f.aux[op] / 256, i32(f.imm[op]) / 16) {
+                        return false
+                    }
+                } else if f.opcodes[op] == 62 {
+                    dispatch := f.variant[op].bit_and(4294967295)
+                    if dispatch > 0 {
+                        words: []i64 = [4211081215 + dispatch]
+                        if !append_arm_words(&mut out, &words) { return false }
+                    } else {
+                        bank_read(&mut out.text, true, 0, f.a[op])
+                        u8_at(&mut out.text, 255); u8_at(&mut out.text, 208) // call rax
+                    }
+                } else {
+                    return false
+                }
+                reload_mask_regs(&st, &mut out.text, live_after_op)
+                st.flags_state = 0
+            } else if kind == i32(mir.Kind.Return) {
+                flush_mask_regs(&st, &mut out.text, f.reads[op])
+                u8_at(&mut out.text, 195) // ret
+            } else if kind == i32(mir.Kind.Trap) {
+                emit_exit_trap(&mut out.text, 108 + f.aux[op])
+            } else if kind == i32(mir.Kind.Foreign) {
+                opcode := f.opcodes[op]
+                if opcode == 118 || opcode == 119 {
+                    amount := i32(f.imm[op])
+                    bank_read(&mut out.text, true, 0, 31)
+                    delta := if opcode == 118 { -amount } else { amount }
+                    lea_disp(&mut out.text, 0, 0, delta)
+                    emit_stack_guard(&mut st, &mut out, 0, prev_flags_live)
+                    bank_write(&mut out.text, 31, 0)
+                } else if opcode == 120 {
+                    bank_read(&mut out.text, true, 0, 31)
+                    lea_disp(&mut out.text, 0, 0, i32(f.imm[op]))
+                    write_vreg(&st, &mut out.text, f.dst[op], 0, true)
+                } else {
+                    if !lower_arm_fallback(&mut st, &mut out, &f, op, prev_flags_live, live_after_op, &mut scratch_arm) {
+                        return false
+                    }
+                }
+            } else if kind == i32(mir.Kind.Place) {
+                if !lower_hot_place(&mut st, &mut out, &f, op, prev_flags_live, live_after_op, &mut scratch_arm) {
+                    return false
+                }
+            } else if kind == i32(mir.Kind.Float) || kind == i32(mir.Kind.Region) || kind == i32(mir.Kind.Iteration) {
+                if !lower_arm_fallback(&mut st, &mut out, &f, op, prev_flags_live, live_after_op, &mut scratch_arm) {
+                    return false
+                }
+            } else {
+                return false
+            }
+            prev_flags_live = live_flags_after
+        }
+        // If fallthrough to next block and flags are live out of block, spill to [r15+256].
+        mut has_fallthrough := false
+        for e in f.edge_starts[b]..f.edge_starts[b + 1] {
+            if f.edge_kinds[e] == 0 { has_fallthrough = true; break }
+        }
+        if has_fallthrough && live_ok && prev_flags_live {
+            spill_flags(&mut st, &mut out.text, true)
+        }
+    }
+
+    end_of_blocks := out.text.len
+    st.block_bytes.push(end_of_blocks)
+
+    for s in 0..st.stub_targets.len {
+        st.stub_bytes[s] = out.text.len
+        flush_all_regs(&st, &mut out.text)
+        at := jmp_rel32(&mut out.text)
+        out.reloc_at.push(at)
+        out.reloc_target.push(st.stub_targets[s])
+    }
+
+    for i in 0..st.internal_at.len {
+        at := st.internal_at[i]
+        tb := st.internal_target_block[i]
+        if tb < 0 || tb >= st.block_bytes.len { return false }
+        patch_le32(&mut out.text, at, i64(st.block_bytes[tb] - (at + 4)))
+    }
+    for i in 0..st.external_cond_at.len {
+        at := st.external_cond_at[i]
+        sid := st.external_cond_stub[i]
+        patch_le32(&mut out.text, at, i64(st.stub_bytes[sid] - (at + 4)))
+    }
+
+    for i in 0..f.label_ids.len {
+        id := f.label_ids[i]
+        op_pos := f.label_ops[i]
+        out.label_ids.push(id)
+        if op_pos < 0 { out.label_bytes.push(-1) }
+        else if op_pos == 0 { out.label_bytes.push(0) }
+        else if op_pos == f.order.len { out.label_bytes.push(end_of_blocks) }
+        else {
+            blk := f.op_blocks[f.order[op_pos]]
+            out.label_bytes.push(st.block_bytes[blk])
+        }
+    }
+
+    out.ready = true
+    true
+}
+
+fn live_in_flags(f: &mir.Function, live_ws: &live.Workspace, b: i32) -> bool {
+    first := f.block_starts[b]; end := f.block_ends[b]
+    for pos in first..end {
+        op := f.order[pos]
+        if f.modes[op] == 2 { continue }
+        if f.flags[op].bit_and(1) != 0 { return true }
+        if f.flags[op].bit_and(2) != 0 { return false }
+    }
+    // Empty/flag-neutral block: same as flags after last op (live out).
+    if end > first { return live.flags_after(&live_ws, f.order[end - 1]) }
+    false
+}

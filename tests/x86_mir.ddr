@@ -1,0 +1,972 @@
+import ..selfhost.backend.arm64 as arm
+import ..selfhost.backend.floats
+import ..selfhost.backend.x86
+import ..selfhost.backend.x86_mir
+import ..selfhost.frontend.place_emit
+import ..selfhost.frontend.place_operation as place_op
+import ..selfhost.mir.mir
+import ..selfhost.mir.mir_lift as lift
+import ..selfhost.mir.mir_pipeline as pipeline
+import ..selfhost.mir.mir_verify as verify
+
+struct Cpu {
+    regs: []i64,
+    bank: []i64,
+    stack: []i64,
+    heap: []i64,
+    cf: bool,
+    zf: bool,
+    sf: bool,
+    of: bool,
+    halted: bool,
+    trapped_stack: bool,
+    exit_code: i32,
+    reloc_hits: []i32,
+    bank_reads: i32,
+    bank_writes: i32,
+    count_pc_min: i32,
+    count_pc_max: i32,
+}
+
+fn new_cpu() -> Cpu {
+    mut regs: []i64 = []; for _ in 0..16 { regs.push(0) }
+    mut bank: []i64 = []; for _ in 0..64 { bank.push(0) }
+    mut stack: []i64 = []; for _ in 0..6144 { stack.push(0) }
+    mut heap: []i64 = []; for _ in 0..256 { heap.push(0) }
+    // r15 = bank virtual base 0x1000000, rsp = native stack 0x3000000, bank sp [r15+248] = 0x1006000
+    regs[4] = 50331648
+    regs[15] = 16777216
+    bank[31] = 16777216 + 24576
+    bank[29] = 16777216 + 24576
+    Cpu {
+        regs: regs, bank: bank, stack: stack, heap: heap,
+        cf: false, zf: false, sf: false, of: false,
+        halted: false, trapped_stack: false, exit_code: -1,
+        reloc_hits: [], bank_reads: 0, bank_writes: 0,
+        count_pc_min: 0, count_pc_max: 2147483647,
+    }
+}
+
+fn read_u8(code: &[]u8, pc: i32) -> i32 { i32(code[pc]) }
+
+fn read_i8(code: &[]u8, pc: i32) -> i32 {
+    v := i32(code[pc])
+    if v >= 128 { v - 256 } else { v }
+}
+
+fn read_i32(code: &[]u8, pc: i32) -> i64 {
+    mut v: i64 = 0
+    for i in 0..4 { v = v.bit_or(i64(code[pc + i]).shl(i * 8)) }
+    if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn read_u32(code: &[]u8, pc: i32) -> i64 {
+    mut v: i64 = 0
+    for i in 0..4 { v = v.bit_or(i64(code[pc + i]).shl(i * 8)) }
+    v
+}
+
+fn read_i64(code: &[]u8, pc: i32) -> i64 {
+    mut v: i64 = 0
+    for i in 0..8 { v = v.bit_or(i64(code[pc + i]).shl(i * 8)) }
+    v
+}
+
+fn mask_width(v: i64, wide: bool) -> i64 {
+    if wide { v } else { v.bit_and(4294967295) }
+}
+
+fn msb(v: i64, wide: bool) -> bool {
+    if wide { v < 0 } else { v.bit_and(2147483648) != 0 }
+}
+
+fn update_logic_flags(cpu: &mut Cpu, res: i64, wide: bool) {
+    cpu.cf = false; cpu.of = false
+    cpu.zf = mask_width(res, wide) == 0
+    cpu.sf = msb(res, wide)
+}
+
+fn update_add_flags(cpu: &mut Cpu, a: i64, b: i64, wide: bool) -> i64 {
+    if !wide {
+        ua := a.bit_and(4294967295); ub := b.bit_and(4294967295)
+        sum := ua + ub
+        res := sum.bit_and(4294967295)
+        cpu.cf = sum > 4294967295
+        cpu.zf = res == 0
+        cpu.sf = res >= 2147483648
+        sa := ua >= 2147483648; sb := ub >= 2147483648; sr := res >= 2147483648
+        cpu.of = (sa == sb) && (sr != sa)
+        return res
+    }
+    res := a.wrapping_add(b)
+    sa := a < 0; sb := b < 0; sr := res < 0
+    cpu.of = (sa == sb) && (sr != sa)
+    // Unsigned carry: check unsigned addition overflow via signed comparison of high/low.
+    mut carry := false
+    if a < 0 && b < 0 { carry = true }
+    else if (a < 0 || b < 0) && res >= 0 { carry = true }
+    cpu.cf = carry
+    cpu.zf = res == 0
+    cpu.sf = sr
+    res
+}
+
+fn update_sub_flags(cpu: &mut Cpu, a: i64, b: i64, wide: bool) -> i64 {
+    if !wide {
+        ua := a.bit_and(4294967295); ub := b.bit_and(4294967295)
+        res := ua.wrapping_sub(ub).bit_and(4294967295)
+        cpu.cf = ua < ub
+        cpu.zf = res == 0
+        cpu.sf = res >= 2147483648
+        sa := ua >= 2147483648; sb := ub >= 2147483648; sr := res >= 2147483648
+        cpu.of = (sa != sb) && (sr != sa)
+        return res
+    }
+    res := a.wrapping_sub(b)
+    sa := a < 0; sb := b < 0; sr := res < 0
+    cpu.of = (sa != sb) && (sr != sa)
+    // Unsigned borrow a < b (unsigned):
+    mut borrow := false
+    if (a >= 0 && b < 0) || ((a < 0) == (b < 0) && a < b) { borrow = true }
+    cpu.cf = borrow
+    cpu.zf = res == 0
+    cpu.sf = sr
+    res
+}
+
+fn eval_cc(cpu: &Cpu, cc: i32) -> bool {
+    if cc == 0 { return cpu.of }
+    if cc == 1 { return !cpu.of }
+    if cc == 2 { return cpu.cf }
+    if cc == 3 { return !cpu.cf }
+    if cc == 4 { return cpu.zf }
+    if cc == 5 { return !cpu.zf }
+    if cc == 6 { return cpu.cf || cpu.zf }
+    if cc == 7 { return !cpu.cf && !cpu.zf }
+    if cc == 8 { return cpu.sf }
+    if cc == 9 { return !cpu.sf }
+    if cc == 12 { return cpu.sf != cpu.of }
+    if cc == 13 { return cpu.sf == cpu.of }
+    if cc == 14 { return cpu.zf || (cpu.sf != cpu.of) }
+    if cc == 15 { return !cpu.zf && (cpu.sf == cpu.of) }
+    assert(false); false
+}
+
+fn pack_eflags(cpu: &Cpu) -> i64 {
+    mut f: i64 = 2
+    if cpu.cf { f = f + 1 }
+    if cpu.zf { f = f + 64 }
+    if cpu.sf { f = f + 128 }
+    if cpu.of { f = f + 2048 }
+    f
+}
+
+fn unpack_eflags(cpu: &mut Cpu, f: i64) {
+    cpu.cf = f.bit_and(1) != 0
+    cpu.zf = f.bit_and(64) != 0
+    cpu.sf = f.bit_and(128) != 0
+    cpu.of = f.bit_and(2048) != 0
+}
+
+fn mem_read64(cpu: &mut Cpu, addr: i64, pc: i32) -> i64 {
+    if addr >= 16777216 && addr < 16777216 + 512 {
+        if pc >= cpu.count_pc_min && pc < cpu.count_pc_max { cpu.bank_reads = cpu.bank_reads + 1 }
+        return cpu.bank[i32(addr - 16777216) / 8]
+    }
+    if addr >= 16777216 + 4096 && addr < 16777216 + 4096 + 4096 * 8 {
+        idx := i32(addr - (16777216 + 4096)) / 8
+        return cpu.stack[idx]
+    }
+    if addr >= 33554432 && addr < 33554432 + 256 * 8 {
+        return cpu.heap[i32(addr - 33554432) / 8]
+    }
+    if addr >= 50331648 - 32768 && addr < 50331648 + 32768 {
+        idx := i32(addr - (50331648 - 16384)) / 8
+        return cpu.stack[3072 + idx]
+    }
+    assert(false); 0
+}
+
+fn mem_write64(cpu: &mut Cpu, addr: i64, val: i64, width: i32, pc: i32) {
+    if addr >= 16777216 && addr < 16777216 + 512 {
+        assert(width == 8)
+        if pc >= cpu.count_pc_min && pc < cpu.count_pc_max { cpu.bank_writes = cpu.bank_writes + 1 }
+        cpu.bank[i32(addr - 16777216) / 8] = val
+        return
+    }
+    mut idx := -1
+    mut byte_off := 0
+    if addr >= 16777216 + 4096 && addr < 16777216 + 4096 + 4096 * 8 {
+        rel := i32(addr - (16777216 + 4096))
+        idx = rel / 8; byte_off = rel % 8
+    } else if addr >= 33554432 && addr < 33554432 + 256 * 8 {
+        rel := i32(addr - 33554432)
+        idx = -1000 - rel / 8; byte_off = rel % 8
+    } else if addr >= 50331648 - 32768 && addr < 50331648 + 32768 {
+        rel := i32(addr - (50331648 - 16384))
+        idx = 3072 + rel / 8; byte_off = rel % 8
+    } else { assert(false) }
+
+    mut cur := if idx >= 0 { cpu.stack[idx] } else { cpu.heap[-idx - 1000] }
+    mut nw := val
+    if width < 8 {
+        bits := width * 8
+        shift := byte_off * 8
+        mask := (i64(1).shl(bits) - 1).shl(shift)
+        nw = cur.bit_and(mask.bit_not()).bit_or(val.bit_and(i64(1).shl(bits) - 1).shl(shift))
+    }
+    if idx >= 0 { cpu.stack[idx] = nw } else { cpu.heap[-idx - 1000] = nw }
+}
+
+fn mem_read(cpu: &mut Cpu, addr: i64, width: i32, sign_ext: bool, pc: i32) -> i64 {
+    mut aligned := addr
+    mut byte_off := 0
+    if addr % 8 != 0 {
+        byte_off = i32(addr % 8); aligned = addr - i64(byte_off)
+    }
+    w := mem_read64(&mut cpu, aligned, pc)
+    v := w.shr(byte_off * 8)
+    if width == 8 { return w }
+    if width == 4 {
+        low := v.bit_and(4294967295)
+        if sign_ext && low >= 2147483648 { return low - 4294967296 }
+        return low
+    }
+    if width == 2 { return v.bit_and(65535) }
+    v.bit_and(255)
+}
+
+fn decode_ea(cpu: &Cpu, code: &[]u8, pc: &mut i32, modrm: i32, rx: i32, rb: i32) -> i64 {
+    mode := modrm / 64; rm := modrm.bit_and(7) + rb * 8
+    if mode == 0 && rm.bit_and(7) == 5 {
+        disp := read_i32(&code, pc); pc = pc + 4
+        return i64(pc) + disp
+    }
+    mut addr: i64 = 0
+    if rm.bit_and(7) == 4 {
+        sib := read_u8(&code, pc); pc = pc + 1
+        scale := sib / 64
+        idx_code := (sib / 8).bit_and(7) + rx * 8
+        base_code := sib.bit_and(7) + rb * 8
+        if !(mode == 0 && base_code.bit_and(7) == 5) { addr = cpu.regs[base_code] }
+        if !(idx_code == 4) { addr = addr + cpu.regs[idx_code].shl(scale) }
+        if mode == 0 && base_code.bit_and(7) == 5 { disp := read_i32(&code, pc); pc = pc + 4; addr = addr + disp }
+    } else {
+        addr = cpu.regs[rm]
+    }
+    if mode == 1 { addr = addr + i64(read_i8(&code, pc)); pc = pc + 1 }
+    else if mode == 2 { addr = addr + read_i32(&code, pc); pc = pc + 4 }
+    addr
+}
+
+fn step(cpu: &mut Cpu, obj: &x86_mir.Object, pc_ref: &mut i32, steps: i32) -> bool {
+    code := &obj.text
+    mut pc := pc_ref
+    for _ in 0..steps {
+        if cpu.halted { pc_ref = pc; return true }
+        // Check stack traps / external relocs matching JMP/JCC target.
+        mut p16 := false; mut wide := false; mut rr := 0; mut rx := 0; mut rb := 0; mut has_rex := false
+        mut op := read_u8(&code, pc); pc = pc + 1
+        if op == 102 { p16 = true; op = read_u8(&code, pc); pc = pc + 1 }
+        if op >= 64 && op <= 79 {
+            has_rex = true
+            bits := op - 64
+            wide = bits.bit_and(8) != 0
+            rr = if bits.bit_and(4) != 0 { 1 } else { 0 }
+            rx = if bits.bit_and(2) != 0 { 1 } else { 0 }
+            rb = if bits.bit_and(1) != 0 { 1 } else { 0 }
+            op = read_u8(&code, pc); pc = pc + 1
+        }
+        op_start := pc - (if p16 && has_rex { 3 } else if p16 || has_rex { 2 } else { 1 })
+
+        if op == 195 { cpu.halted = true; pc_ref = pc; return true } // ret
+        if op == 156 { // pushfq
+            cpu.regs[4] = cpu.regs[4] - 8
+            mem_write64(&mut cpu, cpu.regs[4], pack_eflags(&cpu), 8, op_start)
+            continue
+        }
+        if op == 157 { // popfq
+            f := mem_read64(&mut cpu, cpu.regs[4], op_start)
+            cpu.regs[4] = cpu.regs[4] + 8
+            unpack_eflags(&mut cpu, f)
+            continue
+        }
+        if op == 245 { cpu.cf = !cpu.cf; continue } // cmc
+        if op == 153 { // cdq / cqo
+            if wide {
+                cpu.regs[2] = if cpu.regs[0] < 0 { -1 } else { 0 }
+            } else {
+                cpu.regs[2] = if cpu.regs[0].bit_and(2147483648) != 0 { 4294967295 } else { 0 }
+            }
+            continue
+        }
+        if op >= 184 && op <= 191 { // mov r, imm32/64
+            reg := op - 184 + rb * 8
+            if wide { cpu.regs[reg] = read_i64(&code, pc); pc = pc + 8 }
+            else { cpu.regs[reg] = read_u32(&code, pc); pc = pc + 4 }
+            continue
+        }
+        if op == 199 { // mov rm, imm32
+            m := read_u8(&code, pc); pc = pc + 1
+            assert(m / 64 == 3 && (m / 8).bit_and(7) == 0)
+            reg := m.bit_and(7) + rb * 8
+            imm := read_i32(&code, pc); pc = pc + 4
+            cpu.regs[reg] = mask_width(imm, wide)
+            continue
+        }
+        if op == 233 { // jmp rel32
+            disp_at := pc; disp := read_i32(&code, pc); pc = pc + 4
+            mut ext := false
+            for r in 0..obj.reloc_at.len {
+                if obj.reloc_at[r] == disp_at { cpu.reloc_hits.push(obj.reloc_target[r]); cpu.halted = true; ext = true; break }
+            }
+            if ext { pc_ref = pc; return true }
+            pc = pc + i32(disp)
+            continue
+        }
+        if op == 232 { // call rel32
+            disp_at := pc; _ := read_i32(&code, pc); pc = pc + 4
+            for r in 0..obj.reloc_at.len {
+                if obj.reloc_at[r] == disp_at { cpu.reloc_hits.push(obj.reloc_target[r]); break }
+            }
+            continue
+        }
+        if op == 137 || op == 139 || op == 136 || op == 99 || op == 141 { // mov / movsxd / lea
+            m := read_u8(&code, pc); pc = pc + 1
+            reg := (m / 8).bit_and(7) + rr * 8
+            if m / 64 == 3 {
+                rm := m.bit_and(7) + rb * 8
+                if op == 137 { cpu.regs[rm] = mask_width(cpu.regs[reg], wide) }
+                else if op == 139 { cpu.regs[reg] = mask_width(cpu.regs[rm], wide) }
+                else if op == 99 {
+                    v := cpu.regs[rm].bit_and(4294967295)
+                    cpu.regs[reg] = if v >= 2147483648 { v - 4294967296 } else { v }
+                } else { assert(false) }
+                continue
+            }
+            // Check RIP-relative import/address site before touching memory.
+            mut handled_rip := false
+            if m / 64 == 0 && (m.bit_and(7) + rb * 8) == 5 {
+                site := pc
+                for i in 0..obj.import_at.len {
+                    if obj.import_at[i] == site {
+                        _ := read_i32(&code, pc); pc = pc + 4
+                        cpu.regs[reg] = i64(1000 + obj.import_ids[i])
+                        handled_rip = true; break
+                    }
+                }
+                if !handled_rip {
+                    for r in 0..obj.reloc_at.len {
+                        if obj.reloc_at[r] == site {
+                            _ := read_i32(&code, pc); pc = pc + 4
+                            cpu.regs[reg] = i64(20000 + obj.reloc_target[r])
+                            cpu.reloc_hits.push(obj.reloc_target[r])
+                            handled_rip = true; break
+                        }
+                    }
+                }
+            }
+            if handled_rip { continue }
+            ea := decode_ea(&cpu, &code, &mut pc, m, rx, rb)
+            if op == 141 { cpu.regs[reg] = ea }
+            else if op == 139 { v := mem_read(&mut cpu, ea, if wide { 8 } else { 4 }, false, op_start); cpu.regs[reg] = v }
+            else if op == 99 { v := mem_read(&mut cpu, ea, 4, true, op_start); cpu.regs[reg] = v }
+            else if op == 137 {
+                w := if p16 { 2 } else if wide { 8 } else { 4 }
+                mem_write64(&mut cpu, ea, cpu.regs[reg], w, op_start)
+            } else {
+                mem_write64(&mut cpu, ea, cpu.regs[reg], 1, op_start)
+            }
+            continue
+        }
+        if op == 1 || op == 9 || op == 33 || op == 41 || op == 49 || op == 57 || op == 133 { // ALU / cmp / test
+            m := read_u8(&code, pc); pc = pc + 1
+            assert(m / 64 == 3)
+            reg := (m / 8).bit_and(7) + rr * 8
+            rm := m.bit_and(7) + rb * 8
+            lhs := cpu.regs[rm]; rhs := cpu.regs[reg]
+            if op == 1 { v := update_add_flags(&mut cpu, lhs, rhs, wide); cpu.regs[rm] = v }
+            else if op == 41 { v := update_sub_flags(&mut cpu, lhs, rhs, wide); cpu.regs[rm] = v }
+            else if op == 57 { _ := update_sub_flags(&mut cpu, lhs, rhs, wide) }
+            else if op == 9 { res := mask_width(lhs.bit_or(rhs), wide); cpu.regs[rm] = res; update_logic_flags(&mut cpu, res, wide) }
+            else if op == 33 { res := mask_width(lhs.bit_and(rhs), wide); cpu.regs[rm] = res; update_logic_flags(&mut cpu, res, wide) }
+            else if op == 49 { res := mask_width(lhs.bit_xor(rhs), wide); cpu.regs[rm] = res; update_logic_flags(&mut cpu, res, wide) }
+            else { res := mask_width(lhs.bit_and(rhs), wide); update_logic_flags(&mut cpu, res, wide) }
+            continue
+        }
+        if op == 129 || op == 131 { // ALU imm
+            m := read_u8(&code, pc); pc = pc + 1
+            assert(m / 64 == 3)
+            sub := (m / 8).bit_and(7)
+            rm := m.bit_and(7) + rb * 8
+            imm := if op == 131 { i64(read_i8(&code, pc)) } else { read_i32(&code, pc) }
+            pc = pc + if op == 131 { 1 } else { 4 }
+            lhs := cpu.regs[rm]
+            if sub == 0 { v := update_add_flags(&mut cpu, lhs, imm, wide); cpu.regs[rm] = v }
+            else if sub == 5 { v := update_sub_flags(&mut cpu, lhs, imm, wide); cpu.regs[rm] = v }
+            else if sub == 7 { _ := update_sub_flags(&mut cpu, lhs, imm, wide) }
+            else if sub == 4 { res := mask_width(lhs.bit_and(imm), wide); cpu.regs[rm] = res; update_logic_flags(&mut cpu, res, wide) }
+            else if sub == 1 { res := mask_width(lhs.bit_or(imm), wide); cpu.regs[rm] = res; update_logic_flags(&mut cpu, res, wide) }
+            else if sub == 6 { res := mask_width(lhs.bit_xor(imm), wide); cpu.regs[rm] = res; update_logic_flags(&mut cpu, res, wide) }
+            else { assert(false) }
+            continue
+        }
+        if op == 193 || op == 209 || op == 211 { // shift
+            m := read_u8(&code, pc); pc = pc + 1
+            assert(m / 64 == 3)
+            sub := (m / 8).bit_and(7)
+            rm := m.bit_and(7) + rb * 8
+            mut amt := 1
+            if op == 193 { amt = read_u8(&code, pc); pc = pc + 1 }
+            else if op == 211 { amt = i32(cpu.regs[1].bit_and(if wide { 63 } else { 31 })) }
+            v := mask_width(cpu.regs[rm], wide)
+            mut res := v
+            if sub == 4 { res = mask_width(v.shl(amt), wide) }
+            else if sub == 5 {
+                if !wide { res = v.bit_and(4294967295).shr(amt.bit_and(31)) }
+                else {
+                    sa := amt.bit_and(63)
+                    if sa > 0 { res = v.shr(sa).bit_and(i64(1).shl(64 - sa) - 1) }
+                }
+            } else if sub == 7 {
+                if !wide {
+                    sa := amt.bit_and(31)
+                    sv := if v >= 2147483648 { v - 4294967296 } else { v }
+                    res = sv.shr(sa).bit_and(4294967295)
+                } else {
+                    res = v.shr(amt.bit_and(63))
+                }
+            } else if sub == 1 { // ror
+                bits := if wide { 64 } else { 32 }
+                sa := amt % bits
+                if sa > 0 {
+                    right := if wide { v.shr(sa).bit_and(i64(1).shl(64 - sa) - 1) } else { v.shr(sa) }
+                    res = mask_width(right.bit_or(v.shl(bits - sa)), wide)
+                }
+            } else { assert(false) }
+            cpu.regs[rm] = res
+            continue
+        }
+        if op == 247 { // F7 unary/mul/div
+            m := read_u8(&code, pc); pc = pc + 1
+            assert(m / 64 == 3)
+            sub := (m / 8).bit_and(7)
+            rm := m.bit_and(7) + rb * 8
+            if sub == 2 { cpu.regs[rm] = mask_width(cpu.regs[rm].bit_not(), wide) }
+            else if sub == 4 || sub == 5 {
+                // Verify 64-bit mul/imul high word via binary splitting.
+                assert(wide)
+                a := cpu.regs[0]; b := cpu.regs[rm]
+                alo := a.bit_and(4294967295); ahi := a.shr(32).bit_and(4294967295)
+                blo := b.bit_and(4294967295); bhi := b.shr(32).bit_and(4294967295)
+                ll := alo * blo
+                lh := alo * bhi
+                hl := ahi * blo
+                hh := ahi * bhi
+                mid := ll.shr(32).bit_and(4294967295) + lh.bit_and(4294967295) + hl.bit_and(4294967295)
+                mut hi := hh + lh.shr(32) + hl.shr(32) + mid.shr(32)
+                if sub == 5 {
+                    if a < 0 { hi = hi.wrapping_sub(b) }
+                    if b < 0 { hi = hi.wrapping_sub(a) }
+                }
+                cpu.regs[0] = a.wrapping_mul(b)
+                cpu.regs[2] = hi
+            } else if sub == 6 || sub == 7 {
+                d := cpu.regs[rm]
+                assert(d != 0)
+                if wide {
+                    if sub == 7 {
+                        cpu.regs[0] = cpu.regs[0] / d
+                        cpu.regs[2] = cpu.regs[0] % d
+                    } else {
+                        // Unsigned when operands >= 0 cleanly:
+                        assert(cpu.regs[0] >= 0 && d > 0)
+                        cpu.regs[0] = cpu.regs[0] / d
+                        cpu.regs[2] = cpu.regs[0] % d
+                    }
+                } else {
+                    a32 := cpu.regs[0].bit_and(4294967295)
+                    d32 := d.bit_and(4294967295)
+                    if sub == 7 {
+                        sa := if a32 >= 2147483648 { a32 - 4294967296 } else { a32 }
+                        sd := if d32 >= 2147483648 { d32 - 4294967296 } else { d32 }
+                        cpu.regs[0] = (sa / sd).bit_and(4294967295)
+                        cpu.regs[2] = (sa % sd).bit_and(4294967295)
+                    } else {
+                        cpu.regs[0] = (a32 / d32).bit_and(4294967295)
+                        cpu.regs[2] = (a32 % d32).bit_and(4294967295)
+                    }
+                }
+            } else { assert(false) }
+            continue
+        }
+        if op == 143 { // pop m64
+            m := read_u8(&code, pc); pc = pc + 1
+            ea := decode_ea(&cpu, &code, &mut pc, m, rx, rb)
+            v := mem_read64(&mut cpu, cpu.regs[4], op_start)
+            cpu.regs[4] = cpu.regs[4] + 8
+            mem_write64(&mut cpu, ea, v, 8, op_start)
+            continue
+        }
+        if op == 255 {
+            m := read_u8(&code, pc); pc = pc + 1
+            sub := (m / 8).bit_and(7)
+            if sub == 2 && m / 64 == 3 {
+                reg := m.bit_and(7) + rb * 8
+                cpu.reloc_hits.push(-i32(cpu.regs[reg]))
+                continue
+            }
+            if sub == 6 {
+                ea := decode_ea(&cpu, &code, &mut pc, m, rx, rb)
+                v := mem_read64(&mut cpu, ea, op_start)
+                cpu.regs[4] = cpu.regs[4] - 8
+                mem_write64(&mut cpu, cpu.regs[4], v, 8, op_start)
+                continue
+            }
+            assert(false)
+        }
+        if op == 15 {
+            op2 := read_u8(&code, pc); pc = pc + 1
+            if op2 == 5 { // syscall
+                if cpu.regs[0] == 231 { cpu.exit_code = i32(cpu.regs[7]); cpu.halted = true; pc_ref = pc; return true }
+                continue
+            }
+            if op2 == 11 { cpu.halted = true; pc_ref = pc; return true } // ud2
+            if op2 >= 128 && op2 <= 143 { // jcc rel32
+                disp_at := pc; disp := read_i32(&code, pc); pc = pc + 4
+                if eval_cc(&cpu, op2 - 128) {
+                    for t in 0..obj.stack_traps.len {
+                        if obj.stack_traps[t] == disp_at { cpu.trapped_stack = true; cpu.halted = true; pc_ref = pc; return true }
+                    }
+                    pc = pc + i32(disp)
+                }
+                continue
+            }
+            if op2 >= 144 && op2 <= 159 { // setcc
+                m := read_u8(&code, pc); pc = pc + 1
+                assert(m / 64 == 3)
+                rm := m.bit_and(7) + rb * 8
+                b := if eval_cc(&cpu, op2 - 144) { i64(1) } else { i64(0) }
+                cpu.regs[rm] = cpu.regs[rm].bit_and(-256).bit_or(b)
+                continue
+            }
+            if op2 == 175 { // imul r, rm
+                m := read_u8(&code, pc); pc = pc + 1
+                assert(m / 64 == 3)
+                reg := (m / 8).bit_and(7) + rr * 8
+                rm := m.bit_and(7) + rb * 8
+                cpu.regs[reg] = mask_width(cpu.regs[reg].wrapping_mul(cpu.regs[rm]), wide)
+                continue
+            }
+            if op2 == 182 || op2 == 183 { // movzx
+                m := read_u8(&code, pc); pc = pc + 1
+                reg := (m / 8).bit_and(7) + rr * 8
+                if m / 64 == 3 {
+                    rm := m.bit_and(7) + rb * 8
+                    mask: i64 = if op2 == 182 { 255 } else { 65535 }
+                    cpu.regs[reg] = cpu.regs[rm].bit_and(mask)
+                } else {
+                    ea := decode_ea(&cpu, &code, &mut pc, m, rx, rb)
+                    v := mem_read(&mut cpu, ea, if op2 == 182 { 1 } else { 2 }, false, op_start)
+                    cpu.regs[reg] = v
+                }
+                continue
+            }
+        }
+        assert(false)
+    }
+    pc_ref = pc; true
+}
+
+fn run_fn(obj: &x86_mir.Object, cpu: &mut Cpu, max_steps: i32) {
+    mut pc := 0
+    assert(step(&mut cpu, &obj, &mut pc, max_steps))
+    assert(cpu.halted)
+}
+
+@test fn alu_unary_div_mul_and_flags() {
+    mut c := arm.new_for(2)
+    entry := arm.label(&mut c)
+    arm.mark(&mut c, entry)
+    arm.begin_mir(&mut c, true)
+    // x2 = x0 + x1 (flags), x3 = select GT, x4 = x0 / x1 (sdiv), x5 = smulh(x0, x1)
+    // x6 = msub(x3 - x0*x1), x7 = sbfm(32->64), x8 = ubfm(64, r=4,s=15)
+    arm.integer_binary(&mut c, 1, true, true, 19, 0, 1, -1) // x19 = x0 + x1 (93)
+    arm.compare_register(&mut c, 0, 1)
+    arm.set_condition(&mut c, 20, 12) // GT -> x20 (1)
+    arm.integer_binary(&mut c, 6, true, false, 21, 0, 1, -1) // sdiv -> x21 (-14)
+    arm.integer_binary(&mut c, 4, true, false, 22, 0, 1, -1) // smulh -> x22 (-1)
+    arm.multiply_subtract(&mut c, 23, 0, 1, 20) // x23 = x20 - x0*x1
+    arm.sign_extend_i32(&mut c, 24, 1)
+    arm.bitfield(&mut c, false, true, 25, 0, 4, 15)
+    arm.mov(&mut c, 0, 21)
+    arm.ret(&mut c)
+    arm.end_mir(&mut c)
+
+    mut f := mir.new()
+    assert(lift.lift(&mut f, &c, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut f))
+    mut opt := pipeline.new()
+    op_res := pipeline.run_source_into(&mut f, &mut opt, &pipeline.options(), &pipeline.no_terminals())
+    assert(op_res.error == 0)
+
+    mut obj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut obj, &f))
+
+    mut cpu := new_cpu()
+    cpu.bank[0] = 100
+    cpu.bank[1] = -7
+    run_fn(&obj, &mut cpu, 2000)
+    assert(cpu.bank[19] == 93)
+    assert(cpu.bank[20] == 1)
+    assert(cpu.bank[21] == -14)
+    assert(cpu.bank[22] == -1) // 100 * -7 upper 64 bits
+    assert(cpu.bank[23] == 1 - (100 * -7))
+    assert(cpu.bank[24] == -7)
+    assert(cpu.bank[25] == 6)
+
+    // Test /0 and INT_MIN/-1 semantics matching ARM64 sdiv:
+    mut cpu2 := new_cpu()
+    cpu2.bank[0] = -9223372036854775808
+    cpu2.bank[1] = -1
+    run_fn(&obj, &mut cpu2, 2000)
+    assert(cpu2.bank[21] == -9223372036854775808)
+
+    mut cpu3 := new_cpu()
+    cpu3.bank[0] = 55
+    cpu3.bank[1] = 0
+    run_fn(&obj, &mut cpu3, 2000)
+    assert(cpu3.bank[21] == 0)
+}
+
+@test fn unsigned_add_carry_and_sub_borrow_and_select_conditions() {
+    for cond in 0..14 {
+        mut c := arm.new_for(2)
+        entry := arm.label(&mut c)
+        _trap := arm.label(&mut c)
+        arm.mark(&mut c, entry)
+        arm.begin_mir(&mut c, true)
+        arm.compare_register(&mut c, 0, 1)
+        // Force flag save across an add-without-flags before select:
+        arm.integer_binary(&mut c, 1, true, false, 2, 0, 1, -1)
+        arm.set_condition(&mut c, 0, cond)
+        arm.ret(&mut c)
+        arm.end_mir(&mut c)
+
+        mut f := mir.new()
+        assert(lift.lift(&mut f, &c, 0, 0, 0, [], 0))
+        assert(verify.verify(&mut f))
+        mut obj := x86_mir.empty()
+        assert(x86_mir.lower_into(&mut obj, &f))
+
+        mut cpu := new_cpu()
+        cpu.bank[0] = 5; cpu.bank[1] = 10
+        run_fn(&obj, &mut cpu, 1000)
+        // Expected for (5 cmp 10): eq=0,ne=1,cs=0,cc=1,mi=1,pl=0,vs=0,vc=1,hi=0,ls=1,ge=0,lt=1,gt=0,le=1
+        expected: [i64; 14] = [0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1]
+        assert(cpu.bank[0] == expected[cond])
+    }
+
+    // u64 add overflow trap (adds; b.cs trap) and u64 sub borrow trap (subs; b.cc trap)
+    mut c := arm.new_for(2)
+    entry := arm.label(&mut c); trap := arm.label(&mut c)
+    arm.mark(&mut c, entry)
+    arm.begin_mir(&mut c, true)
+    arm.integer_binary(&mut c, 1, true, true, 0, 0, 1, -1)
+    arm.branch(&mut c, trap, 4) // reloc 4 = b.cs (C==1 on add overflow!)
+    arm.integer_binary(&mut c, 2, true, true, 0, 2, 1, -1)
+    arm.branch(&mut c, trap, 5) // reloc 5 = b.cc (C==0 on sub borrow!)
+    arm.ret(&mut c)
+    arm.end_mir(&mut c)
+
+    mut f := mir.new()
+    assert(lift.lift(&mut f, &c, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut f))
+    mut obj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut obj, &f))
+
+    // Normal: no overflow, no borrow -> does NOT hit trap, returns x2 - x1.
+    mut cpu1 := new_cpu()
+    cpu1.bank[0] = 10; cpu1.bank[1] = 20; cpu1.bank[2] = 50
+    run_fn(&obj, &mut cpu1, 1000)
+    assert(cpu1.reloc_hits.len == 0 && cpu1.bank[0] == 30)
+
+    // Add overflow: (-1) + 5 wraps -> must jump to trap via cold stub!
+    mut cpu2 := new_cpu()
+    cpu2.bank[0] = -1; cpu2.bank[1] = 5; cpu2.bank[2] = 50
+    run_fn(&obj, &mut cpu2, 1000)
+    assert(cpu2.reloc_hits.len == 1 && cpu2.reloc_hits[0] == trap)
+
+    // Sub borrow: 10 - 20 borrows -> must jump to trap via cold stub!
+    mut cpu3 := new_cpu()
+    cpu3.bank[0] = 1; cpu3.bank[1] = 20; cpu3.bank[2] = 10
+    run_fn(&obj, &mut cpu3, 1000)
+    assert(cpu3.reloc_hits.len == 1 && cpu3.reloc_hits[0] == trap)
+}
+
+@test fn hot_loop_stays_in_physical_regs_with_zero_bank_traffic() {
+    mut c := arm.new_for(2)
+    entry := arm.label(&mut c); loop_top := arm.label(&mut c); done := arm.label(&mut c)
+    arm.mark(&mut c, entry)
+    arm.begin_mir(&mut c, true)
+    // x0 = n, x1 = acc = 0, x2 = i = 0, x3 = 1
+    arm.imm(&mut c, 1, 0)
+    arm.imm(&mut c, 2, 0)
+    arm.imm(&mut c, 3, 1)
+    arm.mark(&mut c, loop_top)
+    arm.compare_register(&mut c, 2, 0)
+    arm.branch(&mut c, done, 12) // b.ge done (cond 10 -> reloc 12)
+    arm.integer_binary(&mut c, 1, true, false, 1, 1, 2, -1)
+    arm.integer_binary(&mut c, 1, true, false, 2, 2, 3, -1)
+    arm.branch(&mut c, loop_top, 0)
+    arm.mark(&mut c, done)
+    arm.mov(&mut c, 0, 1)
+    arm.ret(&mut c)
+    arm.end_mir(&mut c)
+
+    mut f := mir.new()
+    assert(lift.lift(&mut f, &c, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut f))
+    mut opt := pipeline.new()
+    _ := pipeline.run_source_into(&mut f, &mut opt, &pipeline.options(), &pipeline.no_terminals())
+
+    mut obj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut obj, &f))
+
+    loop_byte := obj.label_bytes[1]
+    done_byte := obj.label_bytes[2]
+    assert(loop_byte > 0 && done_byte > loop_byte)
+
+    mut cpu := new_cpu()
+    cpu.bank[0] = 100
+    cpu.count_pc_min = loop_byte
+    cpu.count_pc_max = done_byte
+    run_fn(&obj, &mut cpu, 5000)
+    assert(cpu.bank[0] == 4950)
+    assert(cpu.bank_reads == 0 && cpu.bank_writes == 0)
+}
+
+@test fn more_than_eleven_live_regs_and_byte_stores_and_frame_slots_work() {
+    mut c := arm.new_for(2)
+    entry := arm.label(&mut c)
+    arm.mark(&mut c, entry)
+    arm.begin_mir(&mut c, true)
+    at := arm.prologue(&mut c)
+    arm.frame(&mut c, at, 48)
+    // Exercise high frame slot 40 and byte store from x5 (rbp) before filling all 15 live regs.
+    arm.imm(&mut c, 5, 15)
+    arm.store(&mut c, 40, 5)
+    arm.address(&mut c, 42)
+    arm.transfer(&mut c, false, 5, 0, 0, 0)
+    arm.load_into(&mut c, 40, 20)
+    arm.transfer(&mut c, true, 21, 0, 0, 0)
+    // Define 15 non-constant live regs derived from input x19 so all 15 stay simultaneously live.
+    for r in 1..16 { arm.integer_binary(&mut c, 1, true, false, r, 19, -1, i64(r * 3)) }
+    mut acc := 20
+    for r in 1..16 {
+        arm.integer_binary(&mut c, 1, true, false, acc, acc, r, -1)
+    }
+    arm.integer_binary(&mut c, 1, true, false, 0, acc, 21, -1)
+    arm.ret(&mut c)
+    arm.end_mir(&mut c)
+
+    mut f := mir.new()
+    assert(lift.lift(&mut f, &c, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut f))
+    mut opt := pipeline.new()
+    _ := pipeline.run_source_into(&mut f, &mut opt, &pipeline.options(), &pipeline.no_terminals())
+
+    mut obj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut obj, &f))
+
+    mut cpu := new_cpu()
+    cpu.bank[19] = 1
+    run_fn(&obj, &mut cpu, 2000)
+    // 15 + 15 + sum_{r=1..15} (1 + 3*r) = 30 + 15 + 360 = 405
+    assert(cpu.bank[0] == 405)
+}
+
+@test fn abi_stack_push_pop_place_and_float_fallback_work() {
+    mut c := arm.new_for(2)
+    entry := arm.label(&mut c)
+    arm.mark(&mut c, entry)
+    arm.begin_mir(&mut c, true)
+    at := arm.prologue(&mut c)
+    arm.frame(&mut c, at, 4)
+    arm.imm(&mut c, 5, 1234)
+    arm.push(&mut c, 5)
+    arm.pop(&mut c, 6)
+    arm.mov(&mut c, 0, 6)
+    arm.ret(&mut c)
+    arm.end_mir(&mut c)
+
+    mut f := mir.new()
+    assert(lift.lift(&mut f, &c, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut f))
+    mut obj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut obj, &f))
+
+    mut cpu := new_cpu()
+    run_fn(&obj, &mut cpu, 2000)
+    assert(cpu.bank[0] == 1234 && !cpu.trapped_stack)
+
+    // Stack overflow guard triggers when sp drops below [r15 + 0x2000]:
+    mut cpu_ov := new_cpu()
+    cpu_ov.bank[31] = 16777216 + 8192 + 4
+    run_fn(&obj, &mut cpu_ov, 500)
+    assert(cpu_ov.trapped_stack)
+
+    // Hot Place (.Field, .CheckIndex, .Element, .Member, .BorrowPayload) and Float fallback lowering:
+    mut pc := arm.new_for(2)
+    pe := arm.label(&mut pc); arm.mark(&mut pc, pe)
+    arm.begin_mir(&mut pc, true)
+    place_emit.emit(&mut pc, .Field, 2, 0, 0, 8, 100)
+    place_emit.emit(&mut pc, .Member, 2, 0, i32(place_op.Member.Length), 1, 101)
+    arm.ret(&mut pc)
+    arm.end_mir(&mut pc)
+    mut pf := mir.new()
+    assert(lift.lift(&mut pf, &pc, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut pf))
+
+    mut pobj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut pobj, &pf))
+    mut pcpu := new_cpu()
+    pcpu.bank[0] = 33554432 // heap[0]
+    pcpu.heap[2] = 99 // field +8 + member 1*8 = +16 = heap[2]
+    run_fn(&pobj, &mut pcpu, 1000)
+    assert(pcpu.bank[0] == 99)
+
+    mut ic := arm.new_for(2)
+    ie := arm.label(&mut ic); arm.mark(&mut ic, ie)
+    arm.begin_mir(&mut ic, true)
+    place_emit.emit(&mut ic, .CheckIndex, 2, 0, 1, 0, 100)
+    arm.set_condition(&mut ic, 20, 3) // cc (unsigned <)
+    place_emit.emit(&mut ic, .Element, 2, 0, 1, 3, 101)
+    arm.transfer(&mut ic, true, 0, 0, 3, 0)
+    place_emit.emit(&mut ic, .BorrowPayload, 2, 0, 0, 0, 102)
+    arm.ret(&mut ic)
+    arm.end_mir(&mut ic)
+    mut i_f := mir.new()
+    assert(lift.lift(&mut i_f, &ic, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut i_f))
+    mut iobj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut iobj, &i_f))
+    mut icpu1 := new_cpu()
+    icpu1.heap[10] = 33554432 + 160 // data pointer at heap[20]
+    icpu1.heap[11] = 4 // length
+    icpu1.heap[22] = 777 // element [2]
+    icpu1.bank[0] = 2
+    icpu1.bank[1] = 33554432 + 80 // header at heap[10]
+    run_fn(&iobj, &mut icpu1, 1000)
+    assert(icpu1.bank[20] == 1 && icpu1.bank[0] == 777)
+    mut icpu2 := new_cpu()
+    icpu2.heap[10] = 33554432 + 160
+    icpu2.heap[11] = 4
+    icpu2.bank[0] = 5
+    icpu2.bank[1] = 33554432 + 80
+    run_fn(&iobj, &mut icpu2, 1000)
+    assert(icpu2.bank[20] == 0)
+
+    // Test Float fallback (fadd d0, d0, d1 -> SSE2 addsd 0xf2 0x0f 0x58):
+    mut fc := arm.new_for(2)
+    fe := arm.label(&mut fc); arm.mark(&mut fc, fe)
+    arm.begin_mir(&mut fc, true)
+    _ := floats.binary(&mut fc, "+", 7, 10)
+    arm.ret(&mut fc)
+    arm.end_mir(&mut fc)
+    mut ff := mir.new()
+    assert(lift.lift(&mut ff, &fc, 0, 0, 0, [], 0))
+    assert(verify.verify(&mut ff))
+    mut fobj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut fobj, &ff))
+    assert(fobj.text.len > 0)
+    mut found_addsd := false
+    for idx in 0..fobj.text.len - 2 {
+        if fobj.text[idx] == u8(242) && fobj.text[idx + 1] == u8(15) && fobj.text[idx + 2] == u8(88) {
+            found_addsd = true; break
+        }
+    }
+    assert(found_addsd)
+}
+
+@test fn finish_linked_patches_static_globals_to_lea_and_relocs() {
+    mut code := arm.new_for(2)
+    entry := arm.label(&mut code)
+    // Build a minimal linked object with one import site and verify slots=-1 rewrites 0x8b -> 0x8d (lea)
+    // and slots=0 preserves 0x8b (mov GOT).
+    mut linked := x86.empty_linked()
+    linked.active = true
+    linked.prefix_words = 0
+    linked.functions_end_word = 0
+    // mov rax, [rip+0]; ret -> 48 8b 05 00 00 00 00 c3
+    linked.text = [u8(72), u8(139), u8(5), u8(0), u8(0), u8(0), u8(0), u8(195)]
+    linked.label_ids = [entry]; linked.label_bytes = [0]
+    linked.import_ids = [0]; linked.import_at = [3]
+
+    sites: []i32 = [0]
+    global_slots: []i32 = [-1]
+    res_global := x86.finish_linked(&code, 0, &sites, &global_slots, &linked)
+    assert(res_global.ok && res_global.imports.len == 1)
+    assert(res_global.text[res_global.imports[0] - 2] == u8(141)) // 0x8d lea
+
+    got_slots: []i32 = [0]
+    res_got := x86.finish_linked(&code, 0, &sites, &got_slots, &linked)
+    assert(res_got.ok && res_got.imports.len == 1)
+    assert(res_got.text[res_got.imports[0] - 2] == u8(139)) // 0x8b mov
+
+    // Verify deferred data-section labels marked in data_start..code.words.len are preserved
+    // when linked.label_bytes carries -1 for labels external to part2.
+    mut dcode := arm.new_for(2)
+    d_entry := arm.label(&mut dcode); data_lbl := arm.label(&mut dcode)
+    arm.mark(&mut dcode, data_lbl); arm.emit(&mut dcode, 42)
+    mut dlinked := x86.empty_linked()
+    dlinked.active = true
+    dlinked.prefix_words = 0
+    dlinked.functions_end_word = 0
+    // lea rax, [rip+disp32]; ret -> 48 8d 05 00 00 00 00 c3
+    dlinked.text = [u8(72), u8(141), u8(5), u8(0), u8(0), u8(0), u8(0), u8(195)]
+    dlinked.label_ids = [d_entry, data_lbl]; dlinked.label_bytes = [0, -1]
+    dlinked.reloc_at = [3]; dlinked.reloc_target = [data_lbl]
+    none_i32: []i32 = []
+    res_data := x86.finish_linked(&dcode, 0, &none_i32, &none_i32, &dlinked)
+    assert(res_data.ok && res_data.text.len > 8)
+}
+
+@test fn mir_call_cold_stub_and_import_patch() {
+    mut c := arm.new_for(2)
+    trap := arm.label(&mut c); helper := arm.label(&mut c); entry := arm.label(&mut c)
+    arm.mark(&mut c, entry)
+    arm.begin_mir(&mut c, true)
+    arm.imm(&mut c, 19, 77)
+    arm.compare_immediate(&mut c, 0, 0, false)
+    arm.branch(&mut c, trap, 13) // lt -> external cold stub must flush x19=77
+    arm.branch(&mut c, helper, 1) // direct call reloc=1
+    site := c.words.len * 4; arm.native_address(&mut c, 16) // import 0 -> x16
+    arm.integer_binary(&mut c, 1, true, false, 0, 16, 19, -1)
+    arm.ret(&mut c)
+    arm.end_mir(&mut c)
+
+    mut f := mir.new()
+    sites: []i32 = [site]
+    assert(lift.lift(&mut f, &c, 0, 2, 0, &sites, 0))
+    assert(verify.verify(&mut f))
+
+    mut obj := x86_mir.empty()
+    assert(x86_mir.lower_into(&mut obj, &f))
+
+    // Taking the external trap at op2 must flush x19=77 into bank[19] in the cold stub!
+    mut cpu_trap := new_cpu()
+    cpu_trap.bank[0] = -1
+    run_fn(&obj, &mut cpu_trap, 1000)
+    assert(cpu_trap.reloc_hits.len == 1 && cpu_trap.reloc_hits[0] == 0)
+    assert(cpu_trap.bank[19] == 77)
+
+    // Fallthrough path: calls label 1, loads import 0 (=1000), returns 1000 + 77 = 1077.
+    mut cpu_ok := new_cpu()
+    cpu_ok.bank[0] = 5
+    run_fn(&obj, &mut cpu_ok, 1000)
+    assert(cpu_ok.reloc_hits.len == 1 && cpu_ok.reloc_hits[0] == 1)
+    assert(cpu_ok.bank[0] == 1077)
+}
+
+fn main() {}
