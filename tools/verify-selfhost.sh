@@ -6,8 +6,8 @@ cd "$root"
 target=
 if [ "${1:-}" = --linux ]; then
     case "${2:-}" in
-        arm64) platform=linux/arm64 ;;
-        x86_64) platform=linux/amd64 ;;
+        arm64) platform=linux/arm64; base=arm64v8/debian ;;
+        x86_64) platform=linux/amd64; base=amd64/debian ;;
         *) echo 'usage: tools/verify-selfhost.sh --linux arm64|x86_64 [verification flags]' >&2; exit 2 ;;
     esac
     arch=$2
@@ -37,9 +37,12 @@ if [ -n "$target" ]; then
     image=${DUNDER_KIRI_IMAGE:-}
     if [ -z "$image" ]; then
         echo "Preparing Linux $arch test image in Kiri" >&2
-        image=$("$kiri" build --platform "$platform" --load --quiet -t "dunder-linux-test:$arch" - <<'IMAGE'
-FROM debian:bookworm-slim
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        image=$("$kiri" build --platform "$platform" --build-arg "BASE=$base" --load --quiet -t "dunder-linux-test:$arch" - <<'IMAGE'
+ARG BASE=debian
+FROM ${BASE}:bookworm-slim
+ARG TARGETARCH
+RUN test "$(dpkg --print-architecture)" = "$TARGETARCH" && \
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     binutils-multiarch build-essential ca-certificates clang curl file git gzip \
     libargon2-dev libcurl4-openssl-dev libsqlite3-dev libssl-dev nodejs openssl \
     && rm -rf /var/lib/apt/lists/*

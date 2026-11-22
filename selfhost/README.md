@@ -76,8 +76,8 @@ välj arkitektur. Alla efterföljande flaggor går till verifieringen.
 ./tools/verify-selfhost.sh --linux x86_64 --filter test-io
 ```
 
-Kiri bygger testbilden från `debian:bookworm-slim` och systempaketen i
-`tools/verify-selfhost.sh`. Oförändrade byggsteg återanvänds ur cachen. Med
+Kiri bygger testbilden från Debians `bookworm-slim` för den valda
+arkitekturen och systempaketen i `tools/verify-selfhost.sh`. Oförändrade byggsteg återanvänds ur cachen. Med
 `DUNDER_KIRI_IMAGE` kan du välja en förberedd bild för samma arkitektur.
 Gästen läser källträdet och de färdigbyggda ELF-filerna skrivskyddat.
 CLI-proven kompilerar sina testprogram i gästen med en egen tillfällig
