@@ -3,7 +3,13 @@
 Arbeta på `main` och pusha verifierade ändringar till `origin/main`.
 Samordna parallellt arbete i separata filer eller arbetskataloger.
 
-Använd Dunder för nya skript och när du ersätter befintliga Python-skript.
+Tillåtna språk i repot är Dunder (`.ddr`) för kompilator, bibliotek, verktyg
+och tester, tunt POSIX `sh` enbart för bootstrap-, installations- och
+startskript som måste köras innan kompilatorn finns byggd, samt C/assembler
+(`.c`/`.S`) enbart för fristående FFI-/ABI-testfixturer och
+benchmark-referenser. Lägg inte till kod, skript eller tester i Python,
+JavaScript/TypeScript, Rust, Go eller andra språk — om något saknas för att
+skriva i Dunder, bygg ut standardbiblioteket eller ett Dunder-paket istället.
 
 Bygg kompilatorn från det frysta fröet med `tools/bootstrap.sh`. Kontrollera
 ändrat beteende med den självbyggda kompilatorn, förväntade resultat och
