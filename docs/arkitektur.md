@@ -11,7 +11,9 @@ GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Fortsatt utveck
 Automatisk frigöring för arrayer och strängar, POD-värden och lokal/helfunktions
 optimering (MIR-SSA, helfunktionsinlining, `BorrowHome`) ingår som standard.
 Byggen för macOS och Linux kan bädda in DWARF v4-debuginformation (`-g`/`--debug`)
-samt använda [funktionscachen](incremental.md), och `dunder lsp` erbjuder språkserverstöd.
+samt använda [funktionscachen](incremental.md). `dunder lsp` föreslår
+`mut` vid tilldelning till en oföränderlig lokal variabel. När en importerad
+modul redigeras uppdateras diagnostiken även i de öppna filer som beror på den.
 
 ## Språkets kostnadsmodell
 

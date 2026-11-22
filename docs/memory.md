@@ -6,6 +6,12 @@ och `continue`. Den genererade koden och minnespoolen följer med varje program
 på ARM64/macOS, ARM64/Linux, x86-64/Linux, x86-64/Windows samt Wasm32
 (`wasm32` och `wasm32-wasi`).
 
+
+I ett program byggt med `-g` anger standardfel källfil, rad, kolumn och
+operation vid heltalsspill (status 101) och index utanför en array eller vy
+(status 103). Positionen avser operatorn eller den inledande hakparentesen,
+även när felet uppstår i en importerad modul.
+
 ## Ägare, lån och kloning
 
 En bindning är oföränderlig utan `mut`. Muterbarhet anger vilka ändringar
