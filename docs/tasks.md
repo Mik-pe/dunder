@@ -1,12 +1,11 @@
 # Isolerade uppgifter
 
-`task scope`, `spawn` och `await` kör oberoende arbete på riktiga OS-trådar:
-via `libdispatch` på ARM64/macOS och en långlivad POSIX-trådpool
-(`pthread_create`/`pthread_join` plus futex-väckning) på ARM64/Linux och
-x86-64/Linux.
-Runtimen stöder dessa tre nativa mål utan runtimeprofilering.
-Nåbara taskoperationer på wasm-målen (`wasm32`, `wasm32-wasi`), på
-`x86_64-windows` och med `--runtime-profile` avvisas före kodemission.
+`task scope`, `spawn` och `await` använder OS-trådar. ARM64/macOS använder
+`libdispatch`. ARM64/Linux och x86-64/Linux använder en långlivad POSIX-trådpool
+med futex-väckning. För x86-64/Windows genererar kompilatorn en trådpool med
+`CreateThread`, `WaitOnAddress` och `WakeByAddressSingle`. Windowskoden
+korsbyggs i testsviten. Nåbara taskoperationer på wasm-målen (`wasm32`,
+`wasm32-wasi`) och med `--runtime-profile` avvisas före kodemission.
 
 ```dunder
 fn sum(values: []i64) -> i64 {
@@ -213,7 +212,7 @@ Vid `spawn` klonas (eller, för flyttbara `Sendable`-`@resource`, flyttas med
 `move`) den typgodkända indatan till en exklusiv workerarena.
 Runtimen lämnar över arenans allokerartillstånd och ägarkopian till
 ett jobb. På macOS används libdispatch och en dispatchgrupp per jobb. På Linux
-återanvänder scopet en trådpool ovanpå POSIX-trådar. Skalärer skickas som värdebitar. Efter avslutat jobb
+och Windows återanvänder scopet arbetstrådarna. Skalärer skickas som värdebitar. Efter avslutat jobb
 kopieras det efterfrågade resultatet till förälderns arena. En vanlig
 `await` klonar förälderns cache medan `await!` tar över den.
 Som standard har en arbetare 16 MiB reserverat virtuellt arenautrymme (minst
