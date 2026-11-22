@@ -27,6 +27,10 @@ fn main() {
 
 ## Typ och layout
 
+`i16` lagrar ett signerat tvåkomplementsvärde i två byte. Arrayer med `i16`
+använder två byte per element. Läsning via `load_i16` och konvertering till
+`i32` eller `i64` bevarar tecknet.
+
 `u8`, `u16`, `u32` och `u64` upptar 1, 2, 4 respektive 8 byte i en array eller
 struct. `usize` och den opaka råpekaren `ptr` följer målets pekarbredd,
 8 byte på de fyra nativa målen (ARM64/macOS, ARM64/Linux, x86-64/Linux och

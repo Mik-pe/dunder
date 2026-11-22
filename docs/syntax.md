@@ -53,6 +53,7 @@ uttryck tillåts inte i `const`.
 
 | Typ | Betydelse |
 | --- | --- |
+| `i16` | Signerat 16-bitars heltal från −32768 till 32767. |
 | `i32` | Signerat 32-bitars heltal; standard för okontextualiserade heltalsliteraler. |
 | `i64` | Signerat 64-bitars heltal. |
 | `f32` | IEEE 754 binary32. |
@@ -77,8 +78,8 @@ uttryck tillåts inte i `const`.
 
 Literaler får typ från en annotering, funktionens parameter/returtyp eller
 den andra heltalsoperanden. Befintliga värden konverteras aldrig implicit
-mellan `i32` och `i64`. `i64(value)` breddar explicit; `i32(value)` smalnar
-med en körningskontroll. En literal utanför sitt typintervall är ett typfel.
+mellan `i16`, `i32` och `i64`. Konvertering till en smalare typ, exempelvis
+`i16(value)`, kontrollerar att värdet ryms. En literal utanför sitt typintervall är ett typfel.
 Flyttalsliteraler, konverteringar, NaN, avrundning och numeriska metoder
 beskrivs i [flyttalsreglerna](floating.md).
 
