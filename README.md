@@ -24,7 +24,24 @@ fn main() {
 }
 ```
 
-## Bygg och kör
+## Installera och kör
+
+Installera den senaste stabila kompilatorn på ARM64/macOS, ARM64/Linux eller
+x86-64/Linux. Standardbiblioteket ingår i binären.
+
+```sh
+curl -fsSLo install-dunder.sh https://raw.githubusercontent.com/Mik-pe/dunder/main/tools/install.sh && sh install-dunder.sh --release
+export PATH="${DUNDER_HOME:-$HOME/.dunder}/bin:$PATH"
+dunder init demo && cd demo
+dunder test
+dunder run
+```
+
+`dunder run program.ddr` bygger och kör en källfil. Med `dunder build program.ddr -o program`
+får du en körbar fil att distribuera. `dunder upgrade` uppdaterar kompilatorn.
+[Installationskrav och val av release](docs/releases.md#installera-en-kompilator)
+
+## Bygg från källkod
 
 Kör från repots rot på ARM64/macOS, ARM64/Linux eller x86-64/Linux. Frökompilatorn
 för värden följer med repot och kan bygga kompilatorn offline.
@@ -50,10 +67,8 @@ Alla sex målen kan byggas med samma kompilator. [Målplattformar och körmiljö
 `build --app` paketerar ett ARM64/macOS-program som en signerad `.app`.
 [App-paket för macOS](docs/app-bundles.md)
 
-För en permanent installation, kör `./tools/install.sh` och lägg
-`~/.dunder/bin` i `PATH`. `DUNDER_HOME` väljer installationskatalog.
-`dunder upgrade --check` kontrollerar aktuell release och `dunder upgrade`
-installerar den. [Releaser](docs/releases.md)
+Kör `./tools/install.sh` för att installera den självbyggda versionen i
+`$DUNDER_HOME/bin` (förvalt `~/.dunder/bin`).
 
 ## Språket och biblioteken
 

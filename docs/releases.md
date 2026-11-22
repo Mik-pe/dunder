@@ -1,4 +1,23 @@
-# Lokala kompilatorbyggen för GitHub Releases
+# Distribuera Dunder
+
+## Installera en kompilator
+
+Färdiga kompilatorer finns för ARM64/macOS och för ARM64 och x86-64 med glibc
+på Linux. Installationen behöver ett POSIX-skal, curl, gzip, awk och antingen
+`sha256sum` eller `shasum`, utöver vanliga filverktyg.
+
+```sh
+curl -fsSLo install-dunder.sh https://raw.githubusercontent.com/Mik-pe/dunder/main/tools/install.sh && sh install-dunder.sh --release
+export PATH="${DUNDER_HOME:-$HOME/.dunder}/bin:$PATH"
+dunder --version
+```
+
+`--release` väljer senaste stabila version. För en bestämd tagg kan du
+exempelvis köra `sh install-dunder.sh --release v0.8.0`. Skriptet kontrollerar
+SHA-256 för arkivet och den uppackade binären samt att kompilatorn rapporterar
+rätt version och värd innan den ersätter `dunder` i installationskatalogen.
+
+## Bygg releasepaket
 
 Ange versionsnumret från `compiler_version()` i `selfhost/driver/cli.ddr`. Med
 följande kommando hamnar de färdiga filerna i `build/release/v0.8.0/`.
