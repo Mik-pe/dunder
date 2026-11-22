@@ -238,6 +238,12 @@ och `parse.hex_u64_range` ger fel 1 för stavning och 2 för overflow; både
 i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buffertar
 (`decode_range`, `find_byte`, `find_crlf`, `find_double_crlf`, `equals_text`,
 `equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
+`bytes.decode(&data)` och `bytes.decode_range(&data, start, end)` ger
+`Result<string, sys.IoError>` och kan användas med `?`. Ett tomt intervall
+ger en tom sträng. Ett ogiltigt byteintervall ger `.InvalidArgument`.
+Ogiltig UTF-8 inom ett giltigt intervall ger `.InvalidUtf8`, även när en
+gräns delar ett flerbytetecken. Slutindex är exklusivt.
+
 `std.net` ger kapabilitetsstyrd TCP och UDP för IPv4 och IPv6 ovanpå
 `capability network` med adresstyperna `IpAddr` (`parse`, `Eq`, `Hash`, `Display`,
 `Sendable`, `Copy`) och `SocketAddr` (`parse`, `Eq`, `Hash`, `Display`, `Sendable`,

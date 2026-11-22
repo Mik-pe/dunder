@@ -89,8 +89,8 @@ fn append_line(path: string, line: string) -> Result<(), sys.IoError> {
 Vid migrering från `sys.read_text(path)` till `sys.read(path)?` följer
 fel och läsgränser med. Motsvarande skrivning är `sys.write(path, text)?`.
 `Status`, `TextResult` och `BytesResult` kan också omvandlas med
-`.into_result()`. Det gör att exempelvis `bytes.decode(&data).into_result()?`
-kan lämna `.InvalidUtf8` till samma anropare. Text- och byteresultaten
+`.into_result()`. UTF-8-avkodning med `bytes.decode(&data)?` ger
+`.InvalidUtf8` direkt till anroparen. Text- och byteresultaten
 överför sina ägda värden. Följande poster används vid systemgränsen.
 
 ```dunder
