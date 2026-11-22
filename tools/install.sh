@@ -35,8 +35,13 @@ if [ "${1:-}" = --release ]; then
         base=${releases%/}/download/$2
     fi
     curl -q -gfsSL --max-time 30 -o "$stage/release.txt" -- "$base/release.txt"
-    manifest_value() { awk -v key="$1=" 'index($0, key) == 1 { print substr($0, length(key)+1) }' "$stage/release.txt"; }
-    version=$(manifest_value version)
+    manifest_value() {
+        awk -v key="$1=" '
+            index($0, key) == 1 { count++; value = substr($0, length(key)+1) }
+            END { if (count != 1 || value == "") exit 1; print value }
+        ' "$stage/release.txt"
+    }
+    version=$(manifest_value version) || fail 'invalid release version'
     case "$version" in ''|*[!a-zA-Z0-9._+-]*) fail 'invalid release version' ;; esac
     if [ "$#" -eq 2 ] && [ "${2#v}" != "$version" ]; then fail "release manifest does not match $2"; fi
     verify() {
