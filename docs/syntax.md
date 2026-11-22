@@ -538,8 +538,10 @@ fn main() {
 
 Komponenterna nås med nollbaserade fält som `.0` och `.1`. En tupel
 har minst två komponenter, kan nästlas och kan lagras som ett vanligt
-värde. Tupelliteraler får sin typ från exempelvis en returtyp,
-parametertyp eller lokal typannotering.
+värde. I `pair := (42, "tagg")` härleds typen `(i32, string)` från
+komponenterna. En returtyp, parametertyp eller lokal typannotering ger
+också komponenterna deras typer, exempelvis för en tom array i
+`pair: (i32, []string) = (42, [])`.
 
 Varje komponent måste vara lagringsbar. En tupel som äger en sträng,
 array eller resurs flyttas när den binds eller plockas isär. Bindningen
