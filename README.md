@@ -41,6 +41,10 @@ dunder run
 får du en körbar fil att distribuera. `dunder upgrade` uppdaterar kompilatorn.
 [Installationskrav och val av release](docs/releases.md#installera-en-kompilator)
 
+För Windows x86-64 finns en separat `.exe` med kontrollsumma. Releasen
+korsbyggs på macOS. Verifiering av hela kompilatorn på Windows återstår.
+[Hämta Windowskompilatorn](docs/releases.md)
+
 ## Bygg från källkod
 
 Kör från repots rot på ARM64/macOS, ARM64/Linux eller x86-64/Linux. Frökompilatorn

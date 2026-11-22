@@ -10,7 +10,7 @@ vilken körbar fil som ska skrivas, oberoende av värddatorns OS och processor.
 | `x86_64-linux` | ELF64, x86-64 | Linux på x86-64 (SSE2-basnivå) |
 | `wasm32` | WebAssembly-modul | Webbläsare eller fristående Wasm-värd med bulkminnesoperationer |
 | `wasm32-wasi` | WebAssembly-modul (WASIp1) | WASI-värd (`wasi_snapshot_preview1`: `fd_write`, `proc_exit`) |
-| `x86_64-windows` | PE32+ | Windows på x86-64 (`kernel32.dll`-importer för stdout/exit/minne) |
+| `x86_64-windows` | PE32+ | Windows på x86-64 med Win64-anropskonvention, Unicode-sökvägar och systemtrådar. Kompilatorn distribueras som en korsbyggd `.exe`. |
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"

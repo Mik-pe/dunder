@@ -1,32 +1,17 @@
 # Nästa steg för Dunder
 
-## Närmast
+## Verifiera Windows som kompilatorvärd
 
-1. **Visa var ett program avbröts.** På macOS ger heltalsspill status 101 och ett ogiltigt arrayindex status 103. Båda lämnar standardfel tomt. Låt ett program byggt med `-g` skriva operation, källfil och rad till standardfel. Prova två felställen i samma funktion och kontrollera att vardera anger rätt rad och behåller sin statuskod. [Körfel och minnesmodell](memory.md)
-2. **Ge UTF-8-avkodning ett typat fel direkt.** `std.bytes.decode` och `decode_range` returnerar `sys.TextResult`. I dag kan anroparen skriva `.into_result()?`. Låt avkodningen användas direkt med `?` och ge skilda fel för ogiltig UTF-8 och ogiltigt intervall. Migrera befintliga anrop i kompilatorn och paketen. Prova tom indata och giltig text med flera byte per tecken. [Bytefunktionerna](../stdlib/bytes.ddr)
-3. **Fyll luckorna i `std.math`.** Program för färgomvandling och exponentiellt avtagande har egna approximationer. Lägg till exponentialfunktion, naturlig logaritm och potens för `f64`. Ange noggrannhet och beteende vid domängränser. Jämför med oberoende referensvärden på nativa mål och Wasm, även för noll, NaN och oändlighet. [Matematik](standard.md#matematik)
+0.9.0 innehåller en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
 
-## Språk och verktyg
+1. Hämta den publicerade exe-filen, kontrollera SHA-256 och bygg kompilatorn två gånger med ett jobb. Jämför filerna byte för byte. Upprepa med flera jobb.
+2. Kör `check`, `build`, `run`, `test` och språkservern i ett projekt med mellanslag och svenska tecken i sökvägen. Använd ett lokalt paketberoende. Prova miljö, processavbrott, standardfel och callback över C-gränsen.
+3. Installera och uppgradera i en tom katalog. Prova även bytet medan den installerade filen används. [Installation och distribution](releases.md) · [Plattformskontrakt](targets.md)
 
-- **Peka på programroten när `main` saknas.** Att bygga en biblioteksfil som importerar `std.io` ger `program needs main` på en rad inne i den inbäddade modulen. Kontrollera att både textdiagnostik och `--agent` visar användarens rotfil. [Modulladdning](../selfhost/driver/modules.ddr)
-- **Signerade 16-bitarsvärden.** Både `[]i16` och `Result<[]i16, E>` avvisas med `unknown type 'i16'`. Ett ljudprogram lagrar därför 16-bitars sampel i `[]i32`. Prova att värdena −32768 och 32767 ryms i två byte per element och behåller tecknet efter indexering, konvertering till `i32` och retur genom `Result`. [Heltal och datalayout](ffi.md)
-- **Härled typen för en fristående tuppel.** `p := (1.0, 2.0)` kräver fortfarande en förväntad tuppeltyp. Låt komponenterna bestämma typen när de själva har entydiga typer. Prova även en tuppel med en ägd sträng och diagnostik för en komponent vars typ saknas. [Flervärdesreturer](syntax.md#flervärdesreturer)
-- **Läs ett värde före uppdatering av samma tabell.** `antal := m.at(k)` följt av `m.put(k, antal + 1)` avvisas för en `Map<string, i32>`. Utred hur anropet kan använda det avlästa heltalet när uppdateringen börjar. Prova även att ett lån som läses efter en möjlig omhashning fortfarande avvisas. [Lån vid tabelluppslag](standard.md#generiska-samlingar)
-- **Windows som kompilatorvärd.** Kör först korskompilerade `.exe`-filer på Windows x86-64 och verifiera Win64-FFI med callbacks. Porta sedan OS-lagret för två byteidentiska seriella självbyggen och fungerande `check`, `build`, `run` och `test` med mellanslag och svenska tecken i sökvägarna. Därefter följer parallell kompilering, språkserver, paket och distribution. [Målplattformar](targets.md)
-- **Kodåtgärder och inkrementell analys i språkservern.** Börja med en kodåtgärd för saknat `mut`. Prova att ändringen tar bort felet och att en senare ändring i en import uppdaterar diagnostiken i berörda moduler. [Språkservern](../selfhost/driver/lsp.ddr)
+## Förbättra diagnostik vid generiska lån
 
-## Biblioteksgränser
+Om en callback till `alloc.with_bytes` försöker returnera ett lån av blocket avvisas det med E4003. Låt diagnostiken visa användarens anrop tillsammans med den specialiserade signaturen. [Bytevyer och ägarskap](memory.md)
 
-- **Skilj operativsystemets slumpkälla från kryptobibliotekens algoritmer.** Program som bara använder `crypto.random` importerar i dag samma modul som bindningarna till Argon2 och OpenSSL. Pröva en uppdelning med ett program som enbart behöver slumpbyte och ett som behöver en extern algoritm. Kontrollera beroenden, kapabiliteter och fel när ett systembibliotek saknas. [Kryptografi](crypto.md)
-- **Förtydliga ägarens livstid vid FFI.** Ett grafikprogram behövde behålla en egen kopia av ett buffertargument. Orsaken är öppen. Granska hur API:t uttrycker giltighet under anropet och vem som äger data om ett bibliotek behöver använda dem senare. [C-FFI](ffi.md)
+## Följ upp mätningar för SIMD
 
-## Minne och stora värden
-
-1. **Låt programmet hantera nekad allokering.** Med en Wasm-värd som tillåter 4 MiB avbryts `sys.pool_alloc_try` vid en begäran på 8 MiB. Rätta felvägen när `memory.grow` misslyckas. Prova att anropet ger en nullpekare och att samma instans kan läsa tidigare data och allokera ett litet block efter felet. Kontrollera också att den vanliga arrayreserven fortfarande fäller vid minnesbrist. [Råallokering](sys.md) · [Wasm-backenden](../selfhost/backend/wasm_memory.ddr)
-2. **Låt typade arrayer växa när begärd kapacitet ryms.** På ARM64/macOS lyckas en direkt reservation av 160 000 001 `f32`. Om programmet först reserverar 160 000 000 och lägger in ett värde ger nästa reservation status 109. Den begärda bufferten ryms under 1 GiB, men den fördubblade kapaciteten överskrider taket. Kontrollera antal gånger elementstorlek och begränsa den extra kapaciteten. Ge `[]T` en `try_reserve` som tar minsta totalkapacitet i element, precis som `reserve`. Prova att ett avvisat anrop ger ett typat fel utan extra allokering och att längd, kapacitet och ägda element finns kvar. [Arrayernas kontrakt](standard.md#växande-arrayer) · [Tillväxt i runtimen](../selfhost/runtime/runtime.ddr)
-3. **Tillåt stora typer vid C-gränsen.** Ett bildkakel på 256 × 256 RGBA-pixlar kräver 262 144 byte. Dunder avvisar redan deklarationen av en C-struct med det fasta bytefältet. Skilj typens layout från kostnaden att lägga en instans på stacken. Verifiera storlek, justering och fältoffset mot en C-fixtur, både för ett stort fält och för flera fält som tillsammans passerar 64 KiB. Prova läsning och skrivning via pekare samt diagnostik för stackramar som målet inte kan hantera. [C-layout](ffi.md) · [Layoutkontroller](../selfhost/frontend/frontend_types.ddr)
-4. **Pröva maskinbreda längder innan samlings-API:t ändras.** Prova först att passera 1 GiB med en typad nativ buffert. En lånad bytevy över `i32::MAX` prövar sedan hela kedjan från allokator till indexering. Jämför `usize` och en signerad typ med pekarbredd för index, baklängesloopar, tomma intervall och C-anrop. Verifiera multiplikation, justering och avsmalning på wasm32. Bygg kompilatorn från fröet och prova befintliga program före ett typbyte. Behåll uttryckliga budgetar för exempelvis HTTP-kroppar och `Capped<A>`. [Minnesmodell](memory.md) · [Buffertar och allokatorer](../stdlib/alloc.ddr)
-
-## Optimering
-
-SIMD, autovektorisering och målspecifik schemaläggning för ARM64 och x86-64 behöver en representativ arbetslast med känt resultat. Jämför byggtid och körprestanda med samma kompilatorrevision när en mätning beställs. För kolumnlagring är jämförelsen en array per fält. En härledd representation behöver dessutom bevara lånereglerna när en kolumn växer. [Mätmetod och mål](prestanda.md)
+Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
