@@ -25,6 +25,14 @@ data, start, slut)` fungerar utan att kopiera. Utred hur `bytes.equal` kan
 jämföra två vyer och samtidigt garantera att deras adresser bara används
 under anropet. Prova även tomma vyer och olika långa intervall.
 
+## Starta nativa program med liten minnesbudget
+
+Den nativa runtimen begär 512 MiB vid första allokeringen. På x86-64/Linux
+med 400 MiB RAM, utan swap och med `vm.overcommit_memory=0` avslutades små
+processprov med status 109. Samma Linuxkärna och binärer klarade proven med
+2 GiB RAM. Låt första reservationen anpassas till arbetslasten och prova att
+ett litet program kan växa i flera steg på den mindre värden. [Runtimens allokator](../selfhost/runtime/runtime.ddr)
+
 ## Följ upp mätningar för SIMD
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
