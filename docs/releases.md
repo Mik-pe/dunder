@@ -19,7 +19,8 @@ rätt version och värd innan den ersätter `dunder` i installationskatalogen.
 
 ### Windows x86-64
 
-Ladda ner `x86_64-windows.exe` och `x86_64-windows.sha256` från samma release.
+Ladda ner [Windowskompilatorn](https://github.com/Mik-pe/dunder/releases/latest/download/x86_64-windows.exe)
+och [dess SHA-256](https://github.com/Mik-pe/dunder/releases/latest/download/x86_64-windows.sha256) från den senaste stabila releasen.
 Kör följande i PowerShell i nedladdningskatalogen.
 
 ```powershell

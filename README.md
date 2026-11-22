@@ -43,7 +43,7 @@ får du en körbar fil att distribuera. `dunder upgrade` uppdaterar kompilatorn.
 
 För Windows x86-64 finns en separat `.exe` med kontrollsumma. Releasen
 korsbyggs på macOS. Verifiering av hela kompilatorn på Windows återstår.
-[Hämta Windowskompilatorn](docs/releases.md)
+[Hämta Windowskompilatorn](docs/releases.md#windows-x86-64)
 
 ## Bygg från källkod
 
