@@ -33,8 +33,8 @@ som fristående ELF-binärer.
 
 ## Frönas ursprung
 
-De tre fröna kommer från Dunder-källrevision `119b5b09e4dfdf2f1353fc833ee54acaec1f06af`
-(Git-träd `ac8b3db892858caed5d6f0f7143b70ceaedda772`). Kör
+De tre fröna kommer från Dunder-källrevision `030ff7d3f704e99fc1acccc22347364b1083ba1b`
+(Git-träd `6c1e6b46e5c73db9367da620fa64be49b202a4d4`). Kör
 `tools/bootstrap.sh --serial` på den revisionen för att reproducera
 den uppackade kompilatorn från föregående frö.
 Komprimeringen är `gzip -9 -n`.
@@ -43,9 +43,9 @@ Tabellen anger SHA-256 för den **uppackade** kompilatorn. Syskonfilerna
 
 | Värd | Ingångsfil | SHA-256 |
 | --- | --- | --- |
-| ARM64/macOS | `selfhost/main.ddr` | `b7922eee39025679a8285d2554c92d62700416bcde34ed5cc3fd52cbfdc47c61` |
-| ARM64/Linux | `selfhost/linux.ddr` | `8626b0268dee2ea52591770904887efa9fb79f95aeb178a24401ef14a37f35a5` |
-| x86-64/Linux | `selfhost/x86_linux.ddr` | `01922963236fcea0bf4b82ba7fb39fc8305e179892eedd5146eb5c284647a8ee` |
+| ARM64/macOS | `selfhost/main.ddr` | `cd3c550f8f4d2ea7da29d5e1aa23f584eae055dba2d8718ff72a1aa681809efe` |
+| ARM64/Linux | `selfhost/linux.ddr` | `0bda3418d84cd78e402cbf06d077570ca1af15936d10b98c0477e9bb5ed72ce2` |
+| x86-64/Linux | `selfhost/x86_linux.ddr` | `e4d39815d6343252cf0f9c7f7677b58bf821c51292258941edbe70bf0fe9bc6f` |
 
 Varje frö verifierades med byteidentiska självbyggen. Linuxfröna är
 dessutom byteidentiska med macOS-kompilatorns korsbyggen. Linuxmålen
