@@ -34,7 +34,8 @@ case "$1" in
     *)
         # A child can open PID 1's actual Rosetta executable. Rosetta virtualizes /proc/self/exe.
         trap 'exit 143' TERM
-        /bin/sh "$0" --open "$@" &
-        wait "$!"
+        status=0
+        /bin/sh "$0" --open "$@" || status=$?
+        exit "$status"
         ;;
 esac
