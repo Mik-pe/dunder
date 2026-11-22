@@ -55,6 +55,16 @@ användning om operationen är giltig. Därför kan en annan metod på
 `Box<i32>` användas även om `i32` saknar `len`.
 Ett uttryckligt krav på en funktion eller ett `impl`-block kontrolleras
 också när funktionen eller en metod i blocket väljs.
+För publika API:er anges gemensamma krav i deklarationen. Ett krav som bara
+en operation behöver hör till den metodens signatur eller villkorade
+`impl`-block. Exempelvis kräver `Map.get` att värdet kan klonas, medan
+`Map.with_value` kan låna även en unik resurs. Hela funktionskroppen
+kontrolleras fortfarande vid specialisering.
+
+En callbackparameter som `&Fn(&T, &T) -> Ordering` deltar i typhärledningen
+även när argumentet lånar lokala värden. För en `[]i32` kan både
+`array.sort_by(&mut xs, cmp)` och `array.sort_by<i32>(&mut xs, cmp)` använda
+samma lånade jämförelsefunktion.
 [Samlingarnas kontrakt](standard.md#generiska-samlingar) · [Traits](../tools/test_traits.ddr) · [Körbart exempel](../tests/fixtures/generics/main.ddr)
 
 Standardbibliotekets generiska deklarationer och förladdade traits (`Ordering`,

@@ -1,5 +1,22 @@
 # Distribuera Dunder
 
+## Betaserien 0.10
+
+Från `0.10.0-beta.1` ska program som följer den dokumenterade syntaxen,
+typ- och ägarskapsreglerna och standardbibliotekets publika kontrakt fortsätta
+att bygga och ha samma dokumenterade beteende i senare 0.10-betor.
+Löftet gäller ARM64/macOS och Linux på ARM64 och x86-64. Varje kandidat provas
+med den självbyggda kompilatorn på alla tre värdarna. Betan får lägga till API:er
+och rätta fel där kompilatorn tidigare accepterade ogiltiga program. En ändring
+som kräver att giltiga program skrivs om hör till en ny versionsserie med
+migrationsanvisningar.
+
+Binärkompatibilitet mellan kompilatorversioner, intern representation och exakt
+diagnostiktext kan ändras. Windows är en förhandsversion. WebAssembly och WASI är
+korskompileringsmål med egna begränsningar för bland annat systemanrop och tasks.
+Stabila installationer följer fortsatt den stabila releasekanalen.
+[Målplattformar](targets.md)
+
 ## Installera en kompilator
 
 För ARM64/macOS och för ARM64 och x86-64 med glibc på Linux behöver

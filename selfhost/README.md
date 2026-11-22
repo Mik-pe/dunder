@@ -64,7 +64,8 @@ använder libcurl, SQLite, OpenSSL 3 och Argon2. [HTTP](../docs/http.md) · [SQL
 ```
 
 `--fast` kör kärnsviterna. Utan nivåflagga körs den ordinarie verifieringen.
-`--exhaustive` tar också med de utökade sviterna och `--all` lägger till
+`--exhaustive` kör även MIR-oraklet som jämför instruktionernas resultat
+med beräknade facit för skalärer, stackramar och kontrollflöde. `--all` lägger till
 releaseproven på macOS. `--filter` väljer sviter med matchande namn.
 
 På macOS bygger skriptet Dunder från det lokala fröet och korskompilerar

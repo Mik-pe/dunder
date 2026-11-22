@@ -143,7 +143,9 @@ skickas programargument efter `--`, exempelvis `dunder run main.ddr -- hello`.
 
 ## Bytebuffertar och rått minne
 
-`std.bytes.equal(&lhs, &rhs)` jämför packade bytebuffertar.
+`std.bytes.equal(&lhs, &rhs)` jämför packade bytebuffertar och lånade
+delvyer direkt i befintlig lagring. Båda argumenten kan vara intervall
+i andra vyer, exempelvis `bytes.equal(&data[1..4], &part[..3])`.
 `equal_ranges(&lhs, lstart, lend, &rhs, rstart, rend)` jämför halvöppna
 intervall och ger `false` för ogiltiga gränser eller olika längd. Tomma,
 giltiga intervall är lika. Funktionerna kräver ingen `unsafe`-behörighet.

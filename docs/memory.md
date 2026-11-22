@@ -22,7 +22,7 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | `b := a`, tilldelning, retur och konstruktion | Flyttar resursägande värden till mottagaren. |
 | Vanlig funktionsparameter | Lånar strängar och aggregat för läsning under anropet. |
 | `r := &place` | Namnger ett oföränderligt läslån fram till dess sista lexikala läsning i blocket (eller till blockslut vid `defer`/inre loopar). |
-| `&mut value` vid anrop | Exklusivt skrivlån; kräver muterbar lagring. |
+| `&mut value` | Exklusivt skrivlån av muterbar lagring, lokalt eller vid anrop. |
 | `move`-parameter och `consume(move value)` | Funktionen tar över ägarskapet. |
 | `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
 | Vanlig `for value in values` | Läslån av samlingen under loopen. |
@@ -116,7 +116,7 @@ användningen; en loop måste återställa värden som behövs i nästa varv.
 Ett lånat resursvärde får inte flyttas till en ägd bindning, retur eller container.
 Välj en `move`-parameter när funktionen ska behålla indata, eller klona när
 det ska finnas två oberoende ägare. Läslån kan namnges lokalt enligt reglerna
-nedan. Funktioner kan även lämna tillbaka ett läslån från en parameter.
+nedan. Funktioner kan även lämna tillbaka läs- och skrivlån från en parameter.
 
 Flytt av en dynamisk array behåller buffert och kapacitet. `.clone()` ger en
 oberoende buffert och klonar ägda barn rekursivt; klonens reservkapacitet
@@ -330,7 +330,10 @@ så att flera anrop kan hålla olika intervall levande samtidigt. I
 `addr(&view)` observerar vyns egen referenscell, även när funktionen
 vidarebefordrar en hel array. En uttrycklig `.clone()` ger en ägd kopia.
 
-Returkontraktet gäller delade referenser i vanliga Dunder-anrop. C-anrop,
+En funktion kan också returnera ett exklusivt lån från en muterbar parameter,
+exempelvis `fn first(a: &mut []i32) -> &mut i32 from a { &mut a[0] }`.
+Anroparen kan binda resultatet lokalt och skriva genom det. Överlappande
+åtkomst måste vänta tills lånet upphör. Returkontraktet gäller vanliga Dunder-anrop. C-anrop,
 taskresultat och referenser lagrade i structar eller arrayer kräver egna
 livstidsregler och ingår inte. För låg-nivåbehållare som lagrar råa pekare
 (till exempel `OwnedBuf::as_bytes`, `Arena::bytes` och `FrozenArena::bytes` i

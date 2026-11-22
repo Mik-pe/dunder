@@ -32,8 +32,8 @@ intervallvyer lånar i stället originalets lagring till blockslut.
 Referensräkningen är icke-atomär och omfattar enbart oföränderliga löv utan
 cykler. Läs [layout, allokering, tester och gränser](memory.md).
 
-Lånemodellen omfattar funktionsparametrar, lokala läslån och delade
-returvärden vars livstid hör till en angiven parameter.
+Lånemodellen omfattar läs- och skrivlån i funktionsparametrar, lokala
+bindningar och returvärden vars livstid hör till en källparameter.
 
 | Situation | Vad kompilatorn ska tillåta eller upptäcka |
 | --- | --- |

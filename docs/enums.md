@@ -211,6 +211,12 @@ Metoder på värdet anropas med parenteser: `.is_ok()`, `.is_err()`,
 `.unwrap_or_default()` (den senare kräver `T: Default`). Samma metoder finns
 på preludiets `Option<T>` (`Some`/`None`): `.is_some()`, `.is_none()`,
 `.unwrap_or(...)`, `.unwrap_or_else(...)` och `.unwrap_or_default()`.
+
+`map`, `and_then`, `map_err`, `ok_or_else` och `unwrap_or_else` lånar
+callbacken som `&mut FnMut`. De accepterar namngivna funktioner och
+closures som fångar egna eller lånade värden. Ett valt anrop sker en gång,
+innan metoden returnerar. Övriga varianter hoppar över callbacken. En
+callback som får variantens innehåll tar över det med en `move`-parameter.
 [Körbart exempel med automatisk resursstängning](../tests/fixtures/results.ddr)
 
 ## Lagring och dispatch

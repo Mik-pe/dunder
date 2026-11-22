@@ -168,18 +168,18 @@ Läslån kan också namnges lokalt med `r := &value` och gäller då till
 sista lexikala läsningen i blocket. `&values[start..end]` ger en lånad `&[]T` och
 `&text[start..end]` (liksom `text.as_str()`) ger en UTF-8-kontrollerad lånad
 strängvy, `&str`, utan ny allokering (`v.as_bytes()` ger motsvarande `&[]u8`).
-En funktion kan returnera ett läslån från en av sina delade parametrar
-(med `from namn` vid flera); se
-[låne- och escapegränser](memory.md#lokala-läslån-och-intervallvyer).
-Vytyper som `&T`, `&[]T` och `&str` kan inte lagras i structar, enums, `Option`
-eller arrayer, och lokala skrivlån stöds inte. `copy := values.clone()` skapar
-en ägd kopia av det lånade värdet (och `view.clone()` på `&str` ger en ägd `string`). Ett anrop får inte ha överlappande muterbara borrows av
-samma rotvariabel; även olika fält i samma struct räknas konservativt som
-samma rot. Ändringar som kan flytta en arraybuffert måste beräknas före
-en elementtilldelning eller ett anrop som lånar elementet.
+Lokala skrivlån skrivs `r := &mut value`. En tilldelning genom `r` ändrar ägaren.
+Två oberoende structfält kan lånas för skrivning samtidigt. Ett elementlån
+skyddar hela arrayen. Operationer som kan flytta bufferten måste vänta tills
+lånet har upphört.
 
-Generella livstidsannotationer återstår. Ägda allokeringar återvinns
-automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
+En funktion kan returnera ett lån från en parameter. Returtypen `&mut T` kräver
+en muterbar källa. Ange `from namn` när källan behöver särskiljas.
+Lån får användas i lokaler och anrop. Structfält, enumpayloads och arrayelement
+kräver lagringsbara typer, vilket även utesluter `Option<&T>`.
+En callback kan ge tillfällig åtkomst till ett värde som kanske saknas.
+För en ägd kopia används `.clone()`, som på `&str` ger en `string`.
+[Lån och intervallvyer](memory.md#lokala-läslån-och-intervallvyer)
 
 ## Moduler
 
@@ -312,6 +312,12 @@ samlingen kräver klonbara nycklar och värden.
 `Map.index_of(key)` ger postens index eller `-1`. `key_at(index)`
 och `value_at(index)` lånar posten. `Map.at(key)` lånar värdet och
 kräver att nyckeln finns. `Set.at(index)` lånar elementet vid indexet.
+`Map.with_value(key, f)` ger callbacken ett läslån av värdet.
+`Map.update(key, f)` ger ett skrivlån. Båda gör ett uppslag och anropar
+callbacken en gång vid träff. Vid saknad nyckel ger metoden `false` och
+hoppar över callbacken. Det fungerar även när värdet är en unik resurs.
+`Map.get(key)` ger en ägd `Option<V>` och kräver `V: Clone`.
+`at_mut` och `get_mut` ger ett direkt skrivlån och kräver en befintlig nyckel.
 `Map.get_or(key, move fallback)` och `Map.get_or_default(key)` (för `V: Default + Clone`)
 returnerar en klon av värdet eller ett reserv-/standardvärde vid en saknad nyckel.
 `Map.keys()` och `Set.values()` klonar alla lagrade nycklar till en ny array.

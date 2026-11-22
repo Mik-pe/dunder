@@ -11,6 +11,11 @@ Kompilatorn länkar nativa program och signerar macOS-binärer. På macOS och Li
 kan bygget bädda in DWARF-debuginformation med `-g`. Verktygskedjan innehåller
 också en formaterare (`dunder fmt`) och en språkserver (`dunder lsp`).
 
+Utvecklingsversionen är **0.10.0-beta.1**. Betan omfattar språkets dokumenterade
+kärna och standardbibliotek på ARM64/macOS samt ARM64 och x86-64 på Linux.
+Bygg betan från källkod med `./tools/bootstrap.sh`.
+[Kompatibilitet under betan](docs/releases.md#betaserien-010)
+
 ```dunder
 @test {
     ("Ada") -> "Hej, Ada!"

@@ -68,7 +68,7 @@ uttryck tillåts inte i `const`.
 | `[i32; 8]` | En array med åtta element; längden ingår i typen. |
 | `[]i64` | En dynamisk typad array. |
 | `&Point` | Ett läslån som parameter eller oföränderlig lokal referens. |
-| `&mut Point` | Ett exklusivt skrivlån som funktionsparameter. |
+| `&mut Point` | Ett exklusivt skrivlån i en parameter, lokal bindning eller retur från en muterbar parameter. |
 | `Point` / `geometry.Point` | En namngiven struct i aktuell eller importerad modul. |
 | `Command` / `sys.IoError` | En nominell enum med namngivna värden eller payload-varianter. |
 | `Option<T>` | [Preludiets optionstyp (`Some(T)`, `None`)](enums.md). |
@@ -342,9 +342,10 @@ Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
 
 Temporära uttryck får lånas direkt vid anrop, exempelvis `read(&f())` och
 `sum(&[1, 2])`, och hålls levande tills anropet är klart. De får inte bindas
-som lokala referenser. En funktion kan returnera ett läslån från en av sina
-delade parametrar. Finns det flera anger `from namn` vilken parameter
-returvärdet lånar från.
+som lokala referenser. Lokala skrivlån skrivs `r := &mut value`. En funktion
+kan returnera ett lån från en parameter. Ett returnerat skrivlån kräver en
+muterbar källparameter. Finns det flera möjliga källor anger `from namn`
+vilken parameter returvärdet lånar från.
 
 ```dunder
 fn tail(values: &[]i32) -> &[]i32 { &values[1..] }
@@ -491,7 +492,7 @@ höger. Inbyggda operationer som `print` är ännu inte funktionsvärden; skriv
 en vanlig `fn` som omslag vid behov. Funktionsvärden saknar likhetsoperator.
 
 En anonym funktion skrivs `fn(x: i32) -> i32 { x * 2 }`. Lägg till en
-typad lista i hakparenteser för att fånga lokala värden. En closure utan
+lista i hakparenteser för att fånga lokala värden. Typerna kan härledas. En closure utan
 infångade värden har samma funktionstyp `fn(...)` som en namngiven funktion,
 men en closure som fångar värden får funktionstypen `Fn(...)` (med varianterna
 `&Fn(...)`, `&mut FnMut(...)`, `FnMut(...)` och `FnOnce(...)`) och kan inte
@@ -508,14 +509,19 @@ fn main() {
 }
 ```
 
-Listan utvärderas när closuren skapas. Infångade värden är skrivskyddade
-i kroppen och lever så länge något funktionsvärde använder dem. Vanliga
-äganderegler gäller vid infångning. Heltal kopieras, medan en ägd sträng
-eller dynamisk array flyttas in. Skapa en separat lokal med `.clone()` om
-båda behöver äga värdet. En closure kan fånga andra funktionsvärden.
-Lån får inte lagras i capture-listan. Ett infångat `@resource`-värde flyttas in i
-closurens oföränderliga, referensräknade miljö och dess eventuella
-stängningsmetod körs en gång när den sista referensen till closuren släpps.
+Listan utvärderas när closuren skapas. `fn[x]` följer vanliga äganderegler.
+Heltal kopieras och en ägd array flyttas in. `fn[mut x]` låter kroppen
+ändra sitt eget infångade värde mellan anrop. `move fn[x]` ger en `FnOnce`
+som förbrukas när den anropas. Resurser som miljön fortfarande äger städas
+när miljön släpps.
+
+`fn[&x]` och `fn[&mut x]` lånar den ursprungliga lagringen. Den senare
+kan ändra anroparens värde. En sådan closure får bindas lokalt eller
+skickas till en synkron callback. Lånen gäller så länge closuren används.
+Kompilatorn avvisar försök att returnera eller lagra dessa closures i en
+container. Parametern `&Fn(...)` tillåter läsanrop. `&mut FnMut(...)`
+tillåter även callbacks som skriver till sin miljö.
+[Körbara exempel](../tools/test_closures.ddr)
 
 ### Flervärdesreturer
 
