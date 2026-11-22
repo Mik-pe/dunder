@@ -1,6 +1,7 @@
 capability process, filesystem, stdio
 
 import .harness as harness
+import std.bytes as bytes
 import std.fs as fs
 import std.process as process
 import std.text as text
@@ -138,14 +139,43 @@ fn span_uses_phys_reg(buf: &[]u8, start: i32, end: i32) -> bool {
     span_contains(&buf, start, end, "%rbx") || span_contains(&buf, start, end, "%rbp")
 }
 
-fn check_objdump_clean(elf_path: string, label: string, require_phys_reg: bool) -> bool {
-    mut out := harness.empty_output()
-    if !harness.run_checked("/usr/bin/objdump", ["-d", "--start-address=0x401000", elf_path.clone()], "", 0, false, &mut out) {
-        return false
+fn executable_range(image: &[]u8) -> (i64, i64, i64) {
+    if image.len < 64 { return (-1, 0, 0) }
+    entry := bytes.i64_le(&image, 24)
+    table := bytes.i64_le(&image, 32)
+    size := bytes.u16_le(&image, 54)
+    count := bytes.u16_le(&image, 56)
+    if table < 0 || table > i64(image.len) || size < 56 || i64(count) * i64(size) > i64(image.len) - table { return (-1, 0, 0) }
+    for i in 0..count {
+        at := i32(table) + i * size
+        if bytes.u32_le(&image, at) != 1 || bytes.u32_le(&image, at + 4).bit_and(1) == 0 { continue }
+        file := bytes.i64_le(&image, at + 8); address := bytes.i64_le(&image, at + 16)
+        length := bytes.i64_le(&image, at + 32)
+        if file < 0 || file > i64(image.len) || length <= 0 || length > i64(image.len) - file || address < 0 || entry < address { continue }
+        delta := entry - address
+        if delta < length && entry <= 9223372036854775807 - (length - delta) { return (entry, file + delta, length - delta) }
     }
+    (-1, 0, 0)
+}
+
+fn check_objdump_clean(elf_path: string, label: string) -> bool {
+    image := sys.read_u8(elf_path)
+    if !image.ok { return harness.fail(f"{label}: failed to read ELF") }
+    (entry, offset, length) := executable_range(&image.value)
+    if entry < 0 { return harness.fail(f"{label}: entry is outside the file-backed executable segment") }
+    tool := process.env("OBJDUMP").unwrap_or("objdump")
+    mut out := harness.empty_output()
+    if !harness.run_checked(tool, ["--version"], "", 0, false, &mut out) { return false }
+    mut args: []string = []
+    mut start_address := entry
+    if text.contains(out.stdout_text(), "GNU objdump") {
+        args = ["-D", "-b", "binary", "-m", "i386:x86-64"]
+        start_address = offset
+    } else { args.push("-d") }
+    args.push(f"--start-address={start_address}"); args.push(f"--stop-address={start_address + length}")
+    args.push(elf_path.clone())
+    if !harness.run_checked(tool, args, "", 0, false, &mut out) { return false }
     buf := &out.stdout
-    mut in_text := false
-    mut decoded := 0
     mut saw_phys := false
     mut saw_exit_code := false
     mut saw_syscall := false
@@ -153,68 +183,20 @@ fn check_objdump_clean(elf_path: string, label: string, require_phys_reg: bool) 
     while start < buf.len {
         mut end := start
         while end < buf.len && buf[end] != 10 { end += 1 }
-        if !in_text {
-            if span_contains(&buf, start, end, "401000:") { in_text = true }
-            else { start = end + 1; continue }
-        }
-        if span_contains(&buf, start, end, "<unknown>") || span_contains(&buf, start, end, "(bad)") {
+        if span_contains(&buf, start, end, "<unknown>") || span_contains(&buf, start, end, "(bad)") || span_contains(&buf, start, end, ".byte") {
             err_txt := out.stdout_text()
-            return harness.fail(f"{label}: invalid instruction in .text: {err_txt[start..end]}")
+            return harness.fail(f"{label}: invalid instruction: {err_txt[start..end]}")
         }
-        if span_contains(&buf, start, end, ":") {
-            decoded += 1
-            if span_uses_phys_reg(&buf, start, end) { saw_phys = true }
+        if span_uses_phys_reg(&buf, start, end) { saw_phys = true }
+        if saw_syscall && span_contains(&buf, start, end, "ud2") {
+            return saw_phys || harness.fail(f"{label}: expected active physical x86-64 registers (%rbx/%rbp)")
         }
-        if span_contains(&buf, start, end, "$0x6e, %edi") || span_contains(&buf, start, end, "$110, %edi") {
-            saw_exit_code = true
-            saw_syscall = false
-        } else if saw_exit_code && span_contains(&buf, start, end, "syscall") {
-            saw_syscall = true
-        } else if saw_syscall && span_contains(&buf, start, end, "ud2") {
-            break
-        } else {
-            saw_exit_code = false
-            saw_syscall = false
-        }
+        saw_syscall = saw_exit_code && span_contains(&buf, start, end, "syscall")
+        saw_exit_code = span_contains(&buf, start, end, "%edi") &&
+            (span_contains(&buf, start, end, "$0x6e,") || span_contains(&buf, start, end, "$110,"))
         start = end + 1
     }
-    if !in_text || decoded == 0 {
-        return harness.fail(f"{label}: failed to locate .text at 401000 in objdump")
-    }
-    if !saw_syscall {
-        return harness.fail(f"{label}: failed to locate stack-overflow trap stub terminator (0x6e/syscall/ud2)")
-    }
-    if require_phys_reg && !saw_phys {
-        return harness.fail(f"{label}: expected active physical x86-64 registers (%rbx/%rbp) in .text")
-    }
-    true
-}
-
-fn check_objdump_clean_streamed(elf_path: string, label: string, require_phys_reg: bool) -> bool {
-    script := "/usr/bin/objdump -d --start-address=0x401000 \"$1\" | /usr/bin/awk '\n" +
-        "/401000:/ { in_text=1 }\n" +
-        "!in_text { next }\n" +
-        "/<unknown>|\\(bad\\)/ { bad++; if (bad <= 3) print \"BAD:\" $0 }\n" +
-        "/:/ { decoded++ }\n" +
-        "/%rbx|%rbp/ { phys++ }\n" +
-        "/\\$0x6e, %edi|\\$110, %edi/ { exit_code=1; sc=0; next }\n" +
-        "exit_code && /syscall/ { sc=1; next }\n" +
-        "sc && /ud2/ { found_end=1; exit }\n" +
-        "{ exit_code=0; sc=0 }\n" +
-        "END { printf \"SUMMARY in_text=%d found_end=%d decoded=%d phys=%d bad=%d\\n\", in_text, found_end, decoded, phys, bad }\n" +
-        "'"
-    mut out := harness.empty_output()
-    if !harness.run_checked("/bin/sh", ["-c", script, "objdump_check", elf_path.clone()], "", 0, false, &mut out) {
-        return false
-    }
-    txt := out.stdout_text()
-    if text.contains(txt, "BAD:") || !text.contains(txt, "SUMMARY in_text=1 found_end=1 ") || !text.contains(txt, " bad=0") {
-        return harness.fail(f"{label}: streamed objdump check failed:\n{txt}")
-    }
-    if require_phys_reg && text.contains(txt, " phys=0 ") {
-        return harness.fail(f"{label}: expected active physical x86-64 registers (%rbx/%rbp) in .text:\n{txt}")
-    }
-    true
+    harness.fail(f"{label}: disassembly did not reach the stack-overflow trap (110/syscall/ud2)")
 }
 
 fn build_x86(compiler: string, src: string, out: string, jobs: i32, incremental: bool, cwd: string) -> bool {
@@ -231,7 +213,7 @@ fn copy_text(src: string, dst: string) -> bool {
     true
 }
 
-fn verify_corpus_item(compiler: string, work: string, name: string, src_in_work: string) -> bool {
+fn verify_corpus_item(compiler: string, work: string, name: string, src_in_work: string, expected: string) -> bool {
     item_dir := work + "/item-" + name
     if !fs.mkdir_all(item_dir).ok { return harness.fail("mkdir_all failed: " + item_dir) }
     out_j1 := item_dir + "/out-j1"
@@ -248,7 +230,11 @@ fn verify_corpus_item(compiler: string, work: string, name: string, src_in_work:
     if !check_bytes_equal(out_j1, out_j4, name + " j1 vs j4") { return false }
     if !check_bytes_equal(out_j1, out_cold, name + " j1 vs cold-inc") { return false }
     if !check_bytes_equal(out_j1, out_warm, name + " j1 vs warm-inc") { return false }
-    if !check_objdump_clean(out_j1, name, true) { return false }
+    if !check_objdump_clean(out_j1, name) { return false }
+    if process.host_target() == "x86_64-linux" {
+        mut run := harness.empty_output()
+        if !harness.run_checked(out_j1, [], item_dir, 0, false, &mut run) || !harness.stdout_is(&run, expected, name) { return false }
+    }
     true
 }
 
@@ -258,7 +244,7 @@ fn run_in_work(cli: &harness.BaseCli, work: string) -> bool {
     hello_bin := work + "/hello"
     if !build_x86(cli.compiler, hello_src, hello_bin, 1, false, cli.root) { return false }
     if !check_elf64_x86_64(hello_bin) { return false }
-    if !check_objdump_clean(hello_bin, "hello", true) { return false }
+    if !check_objdump_clean(hello_bin, "hello") { return false }
 
     // 2. benchmarks/runtime/{numeric, scan, sort}.ddr and synthetic feature_probe.ddr
     bench_names := ["numeric", "scan", "sort"]
@@ -267,7 +253,7 @@ fn run_in_work(cli: &harness.BaseCli, work: string) -> bool {
         bench_bin := work + "/" + name + "-orig"
         if !build_x86(cli.compiler, orig, bench_bin, 4, false, cli.root) { return false }
         if !check_elf64_x86_64(bench_bin) { return false }
-        if !check_objdump_clean(bench_bin, name, true) { return false }
+        if !check_objdump_clean(bench_bin, name) { return false }
     }
 
     feat_dir := work + "/iso-feature"
@@ -276,7 +262,7 @@ fn run_in_work(cli: &harness.BaseCli, work: string) -> bool {
     if !sys.write_text(feat_src, multi_feature_fixture()).ok {
         return harness.fail("failed to write feature_probe.ddr")
     }
-    if !verify_corpus_item(cli.compiler, work, "feature_probe", feat_src) { return false }
+    if !verify_corpus_item(cli.compiler, work, "feature_probe", feat_src, "4698\n") { return false }
 
     // 3. selfhost/main.ddr --target x86_64-linux
     prebuilt := process.env("DUNDER_X86_SELFHOST_BIN").unwrap_or("")
