@@ -1,5 +1,6 @@
 import function_locals as locals
 import frontend_context as fc
+import statement_recovery as recovery
 import target_cond as tc_eval
 import token_lookahead as lookahead
 import backend_emit
@@ -5187,8 +5188,8 @@ fn propagate_result(c: &mut Session, ty: i32, question: i32) -> i32 {
     if !c.ok { return 0 }
     src := current_source(&c)
     if ft.is_option(&c.types, ty) {
-        if !ft.is_option(&c.types, c.body.ret_type) || c.body.in_defer {
-            message := if c.body.in_defer { "'?' is not allowed inside defer" } else { "'?' on Option requires a function returning Option" }
+        if !ft.is_option(&c.types, c.body.ret_type) || c.body.defer_loop_floor >= 0 {
+            message := if c.body.defer_loop_floor >= 0 { "'?' is not allowed inside defer" } else { "'?' on Option requires a function returning Option" }
             fail(&mut c, message)
             set_error_at(&mut c, c.world.tokens.starts[question]); return 0
         }
@@ -5221,8 +5222,8 @@ fn propagate_result(c: &mut Session, ty: i32, question: i32) -> i32 {
         set_error_at(&mut c, c.world.tokens.starts[question]); return 0
     }
     failure := c.types.result_failure[ty]
-    if failure != c.types.result_failure[c.body.ret_type] || c.body.in_defer {
-        message := if c.body.in_defer { "'?' is not allowed inside defer" } else { "'?' requires the same error type as the enclosing Result" }
+    if failure != c.types.result_failure[c.body.ret_type] || c.body.defer_loop_floor >= 0 {
+        message := if c.body.defer_loop_floor >= 0 { "'?' is not allowed inside defer" } else { "'?' requires the same error type as the enclosing Result" }
         fail(&mut c, message)
         set_error_at(&mut c, c.world.tokens.starts[question]); return 0
     }
@@ -7271,9 +7272,8 @@ fn expression(c: &mut Session, minimum: i32, expected: i32, catalog: &opt_inline
                 if observe {
                     c.body.observing_lease = previous
                     if c.body.lease_generation == generation {
-                        if owner == c.body.owned_slots.len - 1 {
-                            _ := c.body.owned_slots.pop(); _ := c.body.owned_types.pop(); _ := c.body.owner_temps.pop()
-                        } else { c.body.owned_slots[owner] = -1 }
+                        if owner == c.body.owned_slots.len - 1 { fc.truncate_owners(&mut c.body, owner) }
+                        else { c.body.owned_slots[owner] = -1 }
                     }
                     else if c.ok {
                         setup := c.code.words.len; reloc := c.code.at.len
@@ -7379,38 +7379,33 @@ fn move_loop_end(c: &mut Session, exit: &ownership.Checkpoint) {
     ownership.loop_end_checkpoint(&mut c.body.ownership, &exit)
 }
 fn begin_loop_scope(c: &mut Session, head: i32, end: i32) {
-    c.body.loop_heads.push(head); c.body.loop_ends.push(end)
-    c.body.loop_owners.push(c.body.owned_slots.len); c.body.loop_defers.push(c.body.defers.bodies.len)
-    c.body.loop_operands.push(c.code.operand_depth); c.body.loop_pending.push(c.body.pending.slots.len)
-    if c.tasks.program { c.body.loop_task_locals.push(c.body.locals.active.len) }
-}
-fn end_loop_scope(c: &mut Session) {
-    _ := c.body.loop_heads.pop(); _ := c.body.loop_ends.pop()
-    _ := c.body.loop_owners.pop(); _ := c.body.loop_defers.pop()
-    _ := c.body.loop_operands.pop(); _ := c.body.loop_pending.pop()
-    if c.tasks.program { _ := c.body.loop_task_locals.pop() }
+    c.body.loops.push(fc.LoopScope {
+        continue_target: head, break_target: end, owner_limit: c.body.owned_slots.len,
+        defer_depth: c.body.defers.stack.len, operand_depth: c.code.operand_depth,
+        pending_limit: c.body.pending.slots.len, local_limit: c.body.locals.active.len,
+    })
 }
 fn unwind_exit(c: &mut Session, floor: i32, target_depth: i32) {
     if !c.ok || c.code.checking { return }
     mut cleaned_to := c.body.owned_slots.len
     mut depth := c.code.operand_depth
-    mut d := c.body.defers.bodies.len - 1
+    mut d := c.body.defers.stack.len - 1
     while d >= floor {
-        limit := c.body.defers.owner_limits[d]
+        limit := c.body.defers.stack[d].owner_limit
         mut i := cleaned_to - 1
         while i >= limit {
             if c.body.owned_slots[i] >= 0 { clear_owner(&mut c, c.body.owned_slots[i], c.body.owned_types[i]) }
             i = i - 1
         }
         cleaned_to = limit
-        arm.discard_operands(&mut c.code, depth, c.body.defers.operand_depths[d])
-        depth = c.body.defers.operand_depths[d]
+        arm.discard_operands(&mut c.code, depth, c.body.defers.stack[d].operand_depth)
+        depth = c.body.defers.stack[d].operand_depth
         if c.body.defers.selector < 0 { c.body.defers.selector = slot(&mut c) }
-        if c.body.defers.entries[d] < 0 { entry := new_block(&mut c); c.body.defers.entries[d] = entry }
+        if c.body.defers.stack[d].entry < 0 { entry := new_block(&mut c); c.body.defers.stack[d].entry = entry }
         resume := new_block(&mut c)
         edge := deferred.add_exit(&mut c.body.defers, d, resume)
         arm.imm(&mut c.code, 0, i64(edge) + 1); arm.store(&mut c.code, c.body.defers.selector, 0)
-        source_edge(&mut c, c.body.defers.entries[d], .Defer, c.body.defers.bodies[d]); bind_block(&mut c, resume)
+        source_edge(&mut c, c.body.defers.stack[d].entry, .Defer, c.body.defers.stack[d].body); bind_block(&mut c, resume)
         d = d - 1
     }
     arm.discard_operands(&mut c.code, depth, target_depth)
@@ -7418,7 +7413,7 @@ fn unwind_exit(c: &mut Session, floor: i32, target_depth: i32) {
 fn return_from_body(c: &mut Session, at: i32) {
     if c.body.view_result_destination >= 0 { arm.borrowed_return_to(&mut c.code, c.body.view_result_destination) }
     else if c.body.pod_result_destination >= 0 { copy_pod_into_addr(&mut c, c.body.ret_type, c.body.pod_result_destination, at) }
-    preserve := !c.code.checking && (c.body.defers.bodies.len > 0 || c.body.pending.slots.len > 0)
+    preserve := !c.code.checking && (c.body.defers.stack.len > 0 || c.body.pending.slots.len > 0)
     if preserve && c.body.ret_type != 0 {
         if c.body.defers.return_slot < 0 { c.body.defers.return_slot = slot(&mut c) }
         arm.store(&mut c.code, c.body.defers.return_slot, 0)
@@ -7436,13 +7431,13 @@ fn resume_defer_exit(c: &mut Session, head: i32) {
     if head < 0 { return }
     arm.load(&mut c.code, c.body.defers.selector)
     mut edge := head
-    while c.body.defers.previous[edge] >= 0 {
+    while c.body.defers.exits[edge].previous >= 0 {
         arm.imm(&mut c.code, 2, i64(edge) + 1)
         arm.compare_register(&mut c.code, 0, 2)
-        source_edge(&mut c, c.body.defers.targets[edge], .Resume, c.body.cursor)
-        edge = c.body.defers.previous[edge]
+        source_edge(&mut c, c.body.defers.exits[edge].target, .Resume, c.body.cursor)
+        edge = c.body.defers.exits[edge].previous
     }
-    source_edge(&mut c, c.body.defers.targets[edge], .WhenTrue, c.body.cursor)
+    source_edge(&mut c, c.body.defers.exits[edge].target, .WhenTrue, c.body.cursor)
 }
 fn block(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     enter(&mut c)
@@ -7455,46 +7450,6 @@ fn scoped_body(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt
     exits := block_body(&mut c, allowed, &catalog, &mut inline_work, &mut model)
     c.body.value_block.end = enclosing
     exits
-}
-fn sync_to_next_statement(c: &mut Session, stmt_start: i32, limit: i32) {
-    mut depth := 0
-    mut i := stmt_start
-    while i < c.body.cursor && i < limit {
-        k := c.world.tokens.kinds[i]
-        if k == .Symbol {
-            w := &c.world.tokens.texts[i]
-            if w == "(" || w == "[" || w == "{" { depth += 1 }
-            else if w == ")" || w == "]" || w == "}" {
-                if depth > 0 { depth -= 1 }
-            }
-        }
-        i += 1
-    }
-    if c.body.cursor <= stmt_start && c.body.cursor < limit {
-        k := c.world.tokens.kinds[c.body.cursor]
-        if k == .Symbol {
-            w := &c.world.tokens.texts[c.body.cursor]
-            if w == "(" || w == "[" || w == "{" { depth += 1 }
-        }
-        c.body.cursor += 1
-    }
-    while c.body.cursor < limit {
-        k := c.world.tokens.kinds[c.body.cursor]
-        if k == .End { break }
-        if depth == 0 && (lexer.is_newline(k) || (k == .Symbol && (c.world.tokens.texts[c.body.cursor] == ";" || c.world.tokens.texts[c.body.cursor] == "}"))) {
-            break
-        }
-        if k == .Symbol {
-            w := &c.world.tokens.texts[c.body.cursor]
-            if w == "(" || w == "[" || w == "{" { depth += 1 }
-            else if w == ")" || w == "]" || w == "}" {
-                if depth > 0 { depth -= 1 }
-                else { break }
-            }
-        }
-        c.body.cursor += 1
-    }
-    if c.body.cursor > limit { c.body.cursor = limit }
 }
 fn block_body(c: &mut Session, tail_allowed: bool, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> bool {
     if !c.ok { return false }
@@ -7526,27 +7481,8 @@ fn block_statements(c: &mut Session, this_end: i32, body: i32, catalog: &opt_inl
         }
         if c.world.tokens.kinds[c.body.cursor] == .End { fail(&mut c, "unterminated block"); break }
         stmt_start := c.body.cursor
-        first_owner := c.body.owned_slots.len
-        saved_scope := c.body.scope
-        saved_block_depth := c.body.block_depth
-        saved_expr_depth := c.body.depth
-        saved_op_depth := c.code.operand_depth
-        saved_locks := c.body.for_locks.len
-        saved_loops := c.body.loop_heads.len
-        saved_ow_loops := ownership.loop_depth(&c.body.ownership)
-        saved_defers := c.body.defers.bodies.len
-        saved_pending := c.body.pending.slots.len
-        saved_free_args := c.body.free_arg_slots.len
-        saved_in_defer := c.body.in_defer
-        saved_reenter := c.body.reenter_owners
-        saved_addr := c.body.place.taking_address
-        saved_stream_depth := c.body.stream_depth
-        saved_stream_kind := c.body.stream_kind
-        saved_vblock_end := c.body.value_block.end
-        saved_vblock_home := c.body.value_block.home
-        saved_vblock_exp := c.body.value_block.expected
-        saved_vblock_ty := c.body.value_block.ty
-        saved_vblock_arm := c.body.value_block.match_arm
+        mark := recovery.checkpoint(&c.body, c.code.operand_depth)
+        value_block := c.body.value_block
         model.value = -1
         ends := statement(&mut c, &catalog, &mut inline_work, &mut model); returns = returns || ends
         if !c.ok {
@@ -7558,78 +7494,44 @@ fn block_statements(c: &mut Session, this_end: i32, body: i32, catalog: &opt_inl
             if !c.code.checking {
                 c.code.checking = true; c.code.forbid_emit = true; c.code.mir_capture = false
             }
-            ownership.pop_loops_to(&mut c.body.ownership, saved_ow_loops)
-            ownership.resume(&mut c.body.ownership)
-            c.body.block_end = this_end
-            c.body.tail = tail_allowed
-            c.body.block_depth = saved_block_depth
-            c.body.depth = saved_expr_depth
-            c.code.operand_depth = saved_op_depth
-            c.body.in_defer = saved_in_defer
-            c.body.reenter_owners = saved_reenter
-            c.body.place.taking_address = saved_addr
-            c.body.stream_depth = saved_stream_depth
-            c.body.stream_kind = saved_stream_kind
-            c.body.value_block.end = saved_vblock_end
-            c.body.value_block.home = saved_vblock_home
-            c.body.value_block.expected = saved_vblock_exp
-            c.body.value_block.ty = saved_vblock_ty
-            c.body.value_block.match_arm = saved_vblock_arm
-            while c.body.for_locks.len > saved_locks { _ := c.body.for_locks.pop() }
-            while c.body.loop_heads.len > saved_loops {
-                _ := c.body.loop_heads.pop(); _ := c.body.loop_ends.pop()
-                _ := c.body.loop_owners.pop(); _ := c.body.loop_defers.pop()
-                _ := c.body.loop_operands.pop(); _ := c.body.loop_pending.pop()
-                if c.tasks.program && c.body.loop_task_locals.len > saved_loops { _ := c.body.loop_task_locals.pop() }
-            }
-            while c.body.defers.bodies.len > saved_defers {
-                _ := c.body.defers.bodies.pop(); _ := c.body.defers.scopes.pop()
-                _ := c.body.defers.owner_limits.pop(); _ := c.body.defers.local_limits.pop()
-                _ := c.body.defers.entries.pop(); _ := c.body.defers.exits.pop()
-                _ := c.body.defers.operand_depths.pop()
-            }
-            fc.finish_pending(&mut c.body.pending, saved_pending)
-            while c.body.owned_slots.len > first_owner {
-                _ := c.body.owned_slots.pop(); _ := c.body.owned_types.pop(); _ := c.body.owner_temps.pop()
-            }
-            while c.body.free_arg_slots.len > saved_free_args { _ := c.body.free_arg_slots.pop() }
-            while c.body.scope > saved_scope { leave(&mut c) }
+            recovery.restore(&mut c.body, &mark)
+            c.body.block_end = this_end; c.body.tail = tail_allowed
+            c.body.value_block = value_block
+            c.code.operand_depth = mark.operand_depth
+            while c.body.scope > mark.scope { leave(&mut c) }
             fc.clear_expr(&mut c.body.expr); fc.reset_place_state(&mut c.body.place); fc.reset_loan_state(&mut c.body.loan)
             c.body.last_expr_start = -1; c.body.last_expr_end = -1
-            sync_to_next_statement(&mut c, stmt_start, this_end)
+            c.body.cursor = recovery.next_statement(&c.world.tokens, stmt_start, c.body.cursor, this_end)
             c.ok = true; c.error = ""; c.error_note = ""; c.error_note_at = -1; c.types.error = ""
             returns = true
             separators(&mut c)
             continue
         }
         if model.recording { previous = typed.append(&mut model, body, previous) }
-        cleanup_from(&mut c, first_owner, true)
+        cleanup_from(&mut c, mark.owners, true)
         separators(&mut c)
     }
     returns
 }
 fn finish_block_defers(c: &mut Session, floor: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) {
-    while c.ok && c.body.defers.scopes.len > floor && c.body.defers.scopes[c.body.defers.scopes.len - 1] == c.body.scope {
-        body := c.body.defers.bodies.pop(); _ := c.body.defers.scopes.pop()
-        _ := c.body.defers.owner_limits.pop(); locals := c.body.defers.local_limits.pop()
-        entry := c.body.defers.entries.pop(); exits := c.body.defers.exits.pop()
-        _ := c.body.defers.operand_depths.pop()
-        drop_locals_to(&mut c, locals, c.body.scope)
-        if entry >= 0 {
-            arm.store(&mut c.code, c.body.defers.selector, 31); bind_block(&mut c, entry)
+    while c.ok && c.body.defers.stack.len > floor {
+        if c.body.defers.stack[c.body.defers.stack.len - 1].scope != c.body.scope { break }
+        block_info := c.body.defers.stack.pop()
+        drop_locals_to(&mut c, block_info.local_limit, c.body.scope)
+        if block_info.entry >= 0 {
+            arm.store(&mut c.code, c.body.defers.selector, 31); bind_block(&mut c, block_info.entry)
         }
-        saved := c.body.cursor; c.body.cursor = body
-        c.body.in_defer = true; c.body.defer_loop_floor = c.body.loop_heads.len
+        saved := c.body.cursor; c.body.cursor = block_info.body
+        c.body.defer_loop_floor = c.body.loops.len
         _ := block(&mut c, false, &catalog, &mut inline_work, &mut model)
-        c.body.in_defer = false; c.body.cursor = saved
-        lock_limit := c.body.move_defer_limits.pop()
-        while c.body.move_defer_locks.len > lock_limit { _ := c.body.move_defer_locks.pop() }
-        resume_defer_exit(&mut c, exits)
+        c.body.defer_loop_floor = -1; c.body.cursor = saved
+        c.body.defers.locked_locals.truncate(block_info.first_lock)
+        resume_defer_exit(&mut c, block_info.last_exit)
     }
 }
 fn check_dead_statements(c: &mut Session, end: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace) {
     first_local := c.body.locals.active.len
-    first_defer := c.body.defers.bodies.len
+    first_defer := c.body.defers.stack.len
     first_owner := c.body.owned_slots.len
     platform := c.code.platform
     live_code := replace(&mut c.code, arm.new())
@@ -7641,7 +7543,7 @@ fn check_dead_statements(c: &mut Session, end: i32, catalog: &opt_inline.View, i
     _ := block_statements(&mut c, end, -1, &catalog, &mut inline_work, &mut model)
     finish_block_defers(&mut c, first_defer, &catalog, &mut inline_work, &mut model)
     drop_locals_to(&mut c, first_local, c.body.scope)
-    c.body.owned_slots.truncate(first_owner); c.body.owned_types.truncate(first_owner); c.body.owner_temps.truncate(first_owner)
+    fc.truncate_owners(&mut c.body, first_owner)
     c.validating_dead = false
     c.code = move live_code
     c.body.facts.needed.truncate(needed)
@@ -8069,11 +7971,11 @@ fn push_pattern_loan(c: &mut Session, local: i32, subject_place: i32, parent: i3
 }
 fn bind_stored_member(c: &mut Session, id: i32, ty: i32, at: i32, src: &local_borrows.Source) {
     if ft.stores_borrow(&c.types, ty) {
-        local_borrows.bind_stored(&mut c.body.local_loans, id, &src, at, c.body.block_end, c.body.loop_heads.len)
+        local_borrows.bind_stored(&mut c.body.local_loans, id, &src, at, c.body.block_end, c.body.loops.len)
         if c.types.has_cleanup && ft.move_only(&c.types, ty) { local_borrows.pin(&mut c.body.local_loans, id) }
     } else if ft.type_kind(&c.types, ty) == 4 && src.path >= 0 {
         local_borrows.set_frame_view(&mut c.body.local_loans, id, src.frame_view)
-        local_borrows.bind_scoped(&mut c.body.local_loans, id, src.path, src.root, src.origin, src.parent, at, c.body.block_end, c.body.loop_heads.len, false)
+        local_borrows.bind_scoped(&mut c.body.local_loans, id, src.path, src.root, src.origin, src.parent, at, c.body.block_end, c.body.loops.len, false)
     }
 }
 fn bind_pattern(c: &mut Session, model: &mut opt_ir.Function, bindings: &mut PatternBindings, guarded: bool, borrowed: bool, subject_movable: bool, subject_place: i32, lock_index: i32, src: &local_borrows.Source) {
@@ -8121,18 +8023,22 @@ fn match_guard(c: &mut Session, first_owner: i32, first_borrow: i32, next: i32, 
     source_edge(&mut c, next, .Jump, condition_at); bind_block(&mut c, accepted)
 }
 fn emit_loop_exit(c: &mut Session, name: string, exit_at: i32, model: &mut opt_ir.Function) -> bool {
-    if c.body.loop_heads.len == 0 { fail(&mut c, "break or continue requires a loop"); return false }
-    if c.body.in_defer && c.body.loop_heads.len <= c.body.defer_loop_floor { fail(&mut c, "break or continue cannot exit defer"); return false }
-    mut target := c.body.loop_ends[c.body.loop_ends.len - 1]
+    if c.body.loops.len == 0 { fail(&mut c, "break or continue requires a loop"); return false }
+    if c.body.loops.len <= c.body.defer_loop_floor { fail(&mut c, "break or continue cannot exit defer"); return false }
+    scope := c.body.loops[c.body.loops.len - 1]
+    mut target := scope.break_target
     mut action := row.Edge.Break
-    if name == "continue" { action = .Continue; target = c.body.loop_heads[c.body.loop_heads.len - 1] }
-    if model.recording { mut kind := 16; if name == "continue" { kind = 17 }; _ := typed.node(&mut model, kind, 0, -1, -1, -1, 0, -1, exit_at) }
-    if name == "continue" { move_loop_backedge(&mut c) } else { move_loop_break(&mut c) }
-    loop := c.body.loop_heads.len - 1
-    unwind_exit(&mut c, c.body.loop_defers[loop], c.body.loop_operands[loop])
-    cleanup_pending(&mut c, c.body.loop_pending[loop])
-    if c.tasks.program { task_close_locals(&mut c, c.body.loop_task_locals[c.body.loop_task_locals.len - 1]) }
-    cleanup_from(&mut c, c.body.loop_owners[c.body.loop_owners.len - 1], false); source_edge(&mut c, target, action, exit_at)
+    mut node_kind := 16
+    if name == "continue" {
+        target = scope.continue_target; action = .Continue; node_kind = 17
+        move_loop_backedge(&mut c)
+    } else { move_loop_break(&mut c) }
+    if model.recording { _ := typed.node(&mut model, node_kind, 0, -1, -1, -1, 0, -1, exit_at) }
+    unwind_exit(&mut c, scope.defer_depth, scope.operand_depth)
+    cleanup_pending(&mut c, scope.pending_limit)
+    if c.tasks.program { task_close_locals(&mut c, scope.local_limit) }
+    cleanup_from(&mut c, scope.owner_limit, false)
+    source_edge(&mut c, target, action, exit_at)
     ownership.terminate(&mut c.body.ownership)
     true
 }
@@ -8140,7 +8046,7 @@ fn diverging_match_arm(c: &mut Session, tail: bool, catalog: &opt_inline.View, i
     arm_at := c.body.cursor
     if eat(&mut c, "return") {
         handled = true
-        if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
+        if c.body.defer_loop_floor >= 0 { fail(&mut c, "return is not allowed inside defer") }
         if is(&c, "\n") || is(&c, ";") || is(&c, "}") || is(&c, ",") {
             if c.body.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
         } else {
@@ -8269,7 +8175,7 @@ fn match_arms(c: &mut Session, context: i32, home: i32, result_type: &mut i32, c
                 if c.body.expr.untyped_exit || !ownership.falls_through(&c.body.ownership) {
                     ends = true
                 } else if tail && expected != 0 {
-                    if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
+                    if c.body.defer_loop_floor >= 0 { fail(&mut c, "return is not allowed inside defer") }
                     cty := coerce_callable(&mut c, expected, value, arm_at)
                     same(&mut c, expected, cty); take_return_value(&mut c, cty, arm_at)
                     return_from_body(&mut c, arm_at); ends = true
@@ -8499,7 +8405,7 @@ fn statement_inner(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         }
     }
     if eat(&mut c, "return") {
-        if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
+        if c.body.defer_loop_floor >= 0 { fail(&mut c, "return is not allowed inside defer") }
         if is(&c, "\n") || is(&c, ";") || is(&c, "}") {
             if c.body.ret_type != 0 { fail(&mut c, "missing return value") }; arm.imm(&mut c.code, 0, 0)
             end_statement(&mut c)
@@ -8535,7 +8441,7 @@ fn statement_inner(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         condition := model.value
         loop_exit := ownership.checkpoint(&c.body.ownership)
         _ := block(&mut c, false, &catalog, &mut inline_work, &mut model)
-        end_loop_scope(&mut c)
+        _ := c.body.loops.pop()
         move_loop_backedge(&mut c); move_loop_end(&mut c, &loop_exit)
         source_edge(&mut c, head, .Jump, c.body.cursor); bind_block(&mut c, done)
         c.body.reenter_owners = previous_reentry
@@ -9064,7 +8970,7 @@ fn statement_inner(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         if locked_path >= 0 { c.body.for_locks.push(locked_path) }
         begin_loop_scope(&mut c, next, done)
         _ := block(&mut c, false, &catalog, &mut inline_work, &mut model)
-        end_loop_scope(&mut c)
+        _ := c.body.loops.pop()
         if model.recording { _ := typed.node(&mut model, 19, 0, low_node, high_node, model.value, 0, iterator, at) }
         if locked_path >= 0 { _ := c.body.for_locks.pop() }
         bind_block(&mut c, next)
@@ -9082,10 +8988,14 @@ fn statement_inner(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         return true
     }
     if eat(&mut c, "defer") {
-        if c.body.in_defer { fail(&mut c, "cannot nest defer blocks"); return false }
+        if c.body.defer_loop_floor >= 0 { fail(&mut c, "cannot nest defer blocks"); return false }
         if !is(&c, "{") { fail(&mut c, "expected block after defer"); return false }
-        c.body.move_defer_limits.push(c.body.move_defer_locks.len)
-        for token in (c.body.cursor + 1)..c.world.closes[c.body.cursor] {
+        body := c.body.cursor
+        skip_body(&mut c)
+        end_statement(&mut c)
+        if !c.ok { return false }
+        deferred.register(&mut c.body.defers, body, c.body.scope, c.body.owned_slots.len, c.body.locals.active.len, c.code.operand_depth)
+        for token in (body + 1)..c.world.closes[body] {
             if c.world.tokens.kinds[token] == .Name {
                 if token > 0 && c.world.tokens.kinds[token - 1] == .Symbol &&
                     (c.world.tokens.texts[token - 1] == "." || c.world.tokens.texts[token - 1] == "::") {
@@ -9097,13 +9007,10 @@ fn statement_inner(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
                     local_borrows.pin(&mut c.body.local_loans, captured)
                     mut ty := c.body.locals.types[captured]; kind := ft.type_kind(&c.types, ty)
                     if kind == 4 || kind == 5 { ty = ft.type_base(&c.types, ty) }
-                    if ft.move_only(&c.types, ty) { c.body.move_defer_locks.push(captured) }
+                    if ft.move_only(&c.types, ty) { c.body.defers.locked_locals.push(captured) }
                 }
             }
         }
-        deferred.register(&mut c.body.defers, c.body.cursor, c.body.scope, c.body.owned_slots.len, c.body.locals.active.len, c.code.operand_depth)
-        skip_body(&mut c)
-        end_statement(&mut c)
         return false
     }
     if is(&c, "{") {
@@ -9378,7 +9285,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
             primary_excl := if c_excls.len > 0 { c_excls[0] } else { kind == 5 }
             local_idx := c.body.locals.names.len - 1
             local_borrows.set_frame_view(&mut c.body.local_loans, local_idx, src.frame_view)
-            local_borrows.bind_scoped(&mut c.body.local_loans, local_idx, path, root, source, parent, name_at, c.body.block_end, c.body.loop_heads.len, primary_excl)
+            local_borrows.bind_scoped(&mut c.body.local_loans, local_idx, path, root, source, parent, name_at, c.body.block_end, c.body.loops.len, primary_excl)
             for k in 1..c_paths.len {
                 local_borrows.add_extra_loan(&mut c.body.local_loans, local_idx, c_paths[k], c_roots[k], c_excls[k], c_toks[k])
             }
@@ -9509,7 +9416,7 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         return false
     }
     if c.body.tail && terminal(&c, c.body.cursor, false) && c.body.ret_type != 0 {
-        if c.body.in_defer { fail(&mut c, "return is not allowed inside defer") }
+        if c.body.defer_loop_floor >= 0 { fail(&mut c, "return is not allowed inside defer") }
         cty := coerce_callable(&mut c, c.body.ret_type, ty, at)
         same(&mut c, c.body.ret_type, cty); take_return_value(&mut c, cty, at)
         if model.recording { _ := typed.node(&mut model, 15, 0, model.value, -1, -1, 0, -1, at) }
