@@ -120,8 +120,8 @@ delar oföränderlig text.
 | `StreamSet::insert(&mut streams, move stream)` | Flyttar en stream till mängden. |
 
 `Command::spawn` och `Command::exec` nollställer signalmasken i barnprocessen
-före programstart, så blockerad signalpollning i föräldern inte gör kommandon
-immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
+före programstart på macOS och Linux. Barnet startar med standardåtgärden för
+SIGINT, SIGTERM och SIGPIPE, även när föräldern bevakar eller ignorerar dem.
 `replace` och `replace_as` ersätter samma process och behåller dess signalmask
 på macOS och Linux. På Windows returnerar dessa anrop `Unsupported`.
 `Command::exec` och `Command::spawn` startar en ny Windowsprocess.

@@ -162,6 +162,12 @@ left := f"{name:<6}"       // vänsterjusterad till bredd 6
 right := f"{name:>6}"      // högerjusterad till bredd 6
 ```
 
+För `f32` och `f64` ger `:.Nf` fast decimalform med exakt N decimaler
+(0–1074). `f"{1.25:.3f}"` ger `1.250` och `f"{2.5:.0f}"` ger `2`.
+Avrundningen använder flyttalets exakta värde och väljer jämn slutsiffra
+vid lika avstånd. Negativ noll behåller sitt tecken. Specialvärden skrivs
+`nan`, `inf` och `-inf`.
+
 För strängar stöder formatangivelsen bredd och justering med `:<N`
 (vänsterjustering) och `:>N` (högerjustering), som fyller ut med blanksteg upp
 till minst `N` kodpunkter om strängen är kortare.
