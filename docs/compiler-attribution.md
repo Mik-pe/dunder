@@ -15,8 +15,8 @@ its bytes to match the input compiler. Thus the checkout and compiler cannot
 silently describe different compiler implementations. An externally re-signed
 or otherwise changed compiler also fails this exact fixed-point check.
 
-It then builds **one** allocation-instrumented compiler using
-`--runtime-profile`. Each default source is compiled twice per round:
+It then builds the single-threaded allocation observer in
+`tools/profile_allocation_compiler.ddr` with `--runtime-profile`. Each default source is compiled twice per round:
 
 1. The original compiler uses `--profile-compiler --timings=json` and supplies
    the nonoverlapping compiler subphases, calls and work units.
@@ -52,13 +52,13 @@ Select a known source or provide a custom source with repeated `--case`:
 
 ```sh
 dunder run tools/profile_compiler.ddr -- /path/to/dunder build/self-attribution \
-  --case selfhost/main_parallel.ddr
+  --case selfhost/main.ddr
 dunder run tools/profile_compiler.ddr -- /path/to/dunder build/pod-attribution \
   --case benchmarks/dogfood/pod.ddr --expected-stdout /path/to/known-output \
   --program-arg 3 --program-arg 1729
 ```
 
-The host selfhost entries retain their authoritative checks. An unknown
+The selfhost entry uses the same checks. An unknown
 custom program is compiled and compared by image identity; it is not executed
 and its semantics are not certified without `--expected-stdout`. Optional
 execution arguments require exactly one custom case and a result reference.

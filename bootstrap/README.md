@@ -7,24 +7,12 @@ dunder_bin="$(./tools/bootstrap.sh)"
 "$dunder_bin" run examples/hello.ddr
 ```
 
-Skriptet väljer ett fryst Dunder-frö för värddatorn, kontrollerar den
-komprimerade filens SHA-256 och bygger den seriella ingången i `selfhost/`.
-Den seriella kompilatorn bygger både sin egen ingång och
-`selfhost/main_parallel.ddr`. Den parallella kompilatorn bygger sedan om sig
-själv med `--jobs 4`. Resultatet måste vara byteidentiskt med den seriella
-kompilatorns bygge av samma ingång. Om de första två seriella binärerna
-skiljer sig bygger den parallella kompilatorn även den seriella ingången
-och jämför resultatet med det senaste seriella bygget. Efter godkända
-jämförelser publiceras `build/selfhost/<värdmål>/dunder` atomiskt.
+Skriptet kontrollerar SHA-256 för värddatorns frö och packar upp det. Fröet
+bygger `selfhost/main.ddr`. Den nya kompilatorn bygger sedan samma källa med
+automatiskt antal jobb. Om binärerna skiljer sig görs ett tredje bygge.
+Två på varandra följande byggen måste vara byteidentiska innan skriptet
+atomiskt ersätter `build/selfhost/<värdmål>/dunder`.
 [Arbetsbudget och kompilatorjobb](../docs/tasks.md#kompilatorn-som-taskkonsument)
-
-`--serial` kontrollerar fixpunkten med enbart seriella självbyggen och publicerar `build/selfhost/<värdmål>/dunder-serial`.
-Båda kompilatoringångarna kan korskompilera till alla sex mål.
-
-```sh
-serial_bin="$(./tools/bootstrap.sh --serial)"
-"$serial_bin" run examples/hello.ddr
-```
 
 Återbyggnaden kan köras offline med POSIX-shell, gzip, en SHA-256-kontroll
 och vanliga filverktyg. Linuxkompilatorerna använder systemets glibc.

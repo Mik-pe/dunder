@@ -2,17 +2,14 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
-serial_only=0
-if [ "$#" -eq 1 ] && [ "$1" = --serial ]; then
-    serial_only=1
-elif [ "$#" -ne 0 ]; then
-    echo 'usage: tools/bootstrap.sh [--serial]' >&2
+if [ "$#" -ne 0 ]; then
+    echo 'usage: tools/bootstrap.sh' >&2
     exit 2
 fi
 case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) host=arm64-macos; entry=main ;;
-    Linux:aarch64|Linux:arm64) host=arm64-linux; entry=linux ;;
-    Linux:x86_64) host=x86_64-linux; entry=x86_linux ;;
+    Darwin:arm64) host=arm64-macos ;;
+    Linux:aarch64|Linux:arm64) host=arm64-linux ;;
+    Linux:x86_64) host=x86_64-linux ;;
     *) echo "Unsupported bootstrap host: $(uname -sm)" >&2; exit 1 ;;
 esac
 
@@ -31,43 +28,11 @@ trap 'exit 1' HUP INT TERM
 ) >&2
 gzip -dc "bootstrap/$host.gz" > "$work/seed"
 chmod 755 "$work/seed"
-"$work/seed" build "selfhost/$entry.ddr" -o "$work/stage2" >&2
-if [ "$serial_only" -eq 1 ]; then
-    "$work/stage2" build "selfhost/$entry.ddr" -o "$work/stage3" >&2
-    if ! cmp -s "$work/stage2" "$work/stage3"; then
-        "$work/stage3" build "selfhost/$entry.ddr" -o "$work/stage4" >&2
-        cmp "$work/stage3" "$work/stage4"
-    fi
-    mv -f "$work/stage3" "$dir/dunder-serial"
-    printf '%s\n' "$root/$dir/dunder-serial"
-    exit 0
+"$work/seed" build selfhost/main.ddr -o "$work/first" >&2
+"$work/first" build selfhost/main.ddr -o "$work/second" >&2
+if ! cmp -s "$work/first" "$work/second"; then
+    "$work/second" build selfhost/main.ddr -o "$work/third" >&2
+    cmp "$work/second" "$work/third" >&2
 fi
-
-"$work/stage2" build "selfhost/$entry.ddr" -o "$work/stage3" >&2 &
-s3_pid=$!
-"$work/stage2" build selfhost/main_parallel.ddr -o "$work/stage2-par" >&2 &
-p2_pid=$!
-s3_rc=0; wait "$s3_pid" || s3_rc=$?
-p2_rc=0; wait "$p2_pid" || p2_rc=$?
-[ "$s3_rc" -eq 0 ] && [ "$p2_rc" -eq 0 ]
-
-if ! cmp -s "$work/stage2" "$work/stage3"; then
-    "$work/stage2-par" build "selfhost/$entry.ddr" --jobs 4 -o "$work/stage4" >&2 &
-    fp_pid=$!
-    "$work/stage2-par" build selfhost/main_parallel.ddr --jobs 4 -o "$work/four-workers" >&2 &
-    p4_pid=$!
-    fp_rc=0; wait "$fp_pid" || fp_rc=$?
-    p4_rc=0; wait "$p4_pid" || p4_rc=$?
-    [ "$fp_rc" -eq 0 ] && [ "$p4_rc" -eq 0 ]
-    cmp "$work/stage3" "$work/stage4"
-    cmp "$work/stage2-par" "$work/four-workers"
-else
-    "$work/stage2-par" build selfhost/main_parallel.ddr --jobs 4 -o "$work/four-workers" >&2
-    cmp "$work/stage2-par" "$work/four-workers"
-fi
-
-mv -f "$work/stage3" "$dir/dunder-serial"
-cp "$work/four-workers" "$work/parallel-pub"
-mv -f "$work/parallel-pub" "$dir/dunder-parallel"
-mv -f "$work/four-workers" "$dir/dunder"
+mv -f "$work/second" "$dir/dunder"
 printf '%s\n' "$root/$dir/dunder"

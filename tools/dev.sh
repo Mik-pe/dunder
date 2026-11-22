@@ -9,7 +9,6 @@ case "$(uname -s):$(uname -m)" in
     Linux:x86_64) host=x86_64-linux ;;
     *) echo "Unsupported host: $(uname -sm)" >&2; exit 1 ;;
 esac
-entry=main_parallel
 
 host_compiler="$root/build/selfhost/$host/dunder"
 if [ ! -x "$host_compiler" ]; then
@@ -24,7 +23,7 @@ fi
 
 mkdir -p build/dev
 dev_compiler="$root/build/dev/dunder"
-"$host_compiler" build "selfhost/$entry.ddr" --incremental -o "$dev_compiler" >&2
+"$host_compiler" build selfhost/main.ddr --incremental -o "$dev_compiler" >&2
 "$dev_compiler" build tools/verify.ddr --incremental -o build/dev/verify >&2
 
 mode="--fast"

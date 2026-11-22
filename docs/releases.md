@@ -31,7 +31,7 @@ används `HEAD`. Skriptet packar upp de incheckade källorna i en tillfällig
 katalog och kör `tools/bootstrap.sh` där. Värdens kompilator måste nå
 fixpunkt och rapportera versionen från taggen. Den bygger sedan de andra
 målens kompilatorer lokalt. Alla tre paketen innehåller den parallella
-kompilatorn (`selfhost/main_parallel.ddr`). För en annan utdatakatalog används `--outdir KATALOG`.
+kompilatorn (`selfhost/main.ddr`). För en annan utdatakatalog används `--outdir KATALOG`.
 
 ## Publicera
 

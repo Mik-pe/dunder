@@ -1,12 +1,11 @@
 #!/bin/sh
 set -eu
 
-usage() { echo 'usage: install.sh [--serial | --release [TAG]]'; }
+usage() { echo 'usage: install.sh [--release [TAG]]'; }
 fail() { echo "install: $*" >&2; exit 1; }
 
 case "${1:-}" in
     --release) [ "$#" -le 2 ] || { usage >&2; exit 2; } ;;
-    --serial) [ "$#" -eq 1 ] || { usage >&2; exit 2; } ;;
     '') [ "$#" -eq 0 ] || { usage >&2; exit 2; } ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
@@ -55,7 +54,7 @@ if [ "${1:-}" = --release ]; then
     [ "$reported" = "dunder $version ($host)" ] || fail 'compiler failed its version check'
 else
     root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-    built=$("$root/tools/bootstrap.sh" "$@")
+    built=$("$root/tools/bootstrap.sh")
     cp "$built" "$stage/dunder"
     chmod 755 "$stage/dunder"
 fi

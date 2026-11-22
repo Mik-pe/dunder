@@ -74,7 +74,7 @@ if [ "$publish" -eq 1 ]; then
 fi
 
 mkdir "$work/source" "$work/images" "$work/assets"
-git archive --format=tar --output="$work/source.tar" "$commit" bootstrap selfhost stdlib runtime tools/bootstrap.sh tools/bootstrap-parallel.sh
+git archive --format=tar --output="$work/source.tar" "$commit" bootstrap selfhost stdlib runtime 'tools/bootstrap*.sh'
 tar -xf "$work/source.tar" -C "$work/source"
 cd "$work/source"
 compiler=$(./tools/bootstrap.sh)
@@ -89,6 +89,8 @@ reported=$("$compiler" --version)
 
 manifest="$work/assets/release.txt"
 printf 'version=%s\ncommit=%s\n' "$version" "$commit" > "$manifest"
+entry=selfhost/main.ddr
+if [ -f selfhost/main_parallel.ddr ]; then entry=selfhost/main_parallel.ddr; fi
 pids=""
 for target in arm64-macos arm64-linux x86_64-linux; do
     (
@@ -96,7 +98,7 @@ for target in arm64-macos arm64-linux x86_64-linux; do
         if [ "$host" = "$target" ]; then
             cp "$compiler" "$image"
         else
-            "$compiler" build selfhost/main_parallel.ddr --target "$target" -o "$image"
+            "$compiler" build "$entry" --target "$target" -o "$image"
         fi
         gzip -9 -n -c "$image" > "$work/assets/$target.gz"
     ) &
