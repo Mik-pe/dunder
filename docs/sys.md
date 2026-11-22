@@ -279,6 +279,27 @@ katalogverktyg, länkfri öppning, metadata (`lstat`/`fstat`), `sync_dir`,
 atomiska privata filer (`temp_file`, `write_private_atomic`) samt rättighetsändringar
 (`chmod`/`set_permissions`) finns i [`std.fs`](standard.md#moduler).
 
+### Filrättigheter på Windows
+
+Win32-porten använder UTF-16 för sökvägar och binära fildeskriptorer.
+En vanlig fil som skapas med standardinställningen för `OpenOptions`
+(`mode` 0644) får katalogens ärvda Windows-ACL. Om `create` eller
+`create_new` kombineras med ett annat `mode` returneras
+`IoError.Unsupported` före skapandet. Detta omfattar `temp_file`,
+`write_private_atomic` och `write_private_text_atomic`, som begär 0600.
+
+`fs.chmod`, filhandtagens `set_permissions` och `fs.sync_dir` returnerar
+också `Unsupported` på Windows. `sys.make_executable` kontrollerar att
+sökvägen finns. Windows använder filformatet när en PE-binär startas.
+Vanliga källfiler och körbara Windows-program kan läsas och skrivas med
+`sys.read_text`, `sys.write_u8` och motsvarande filhandtag.
+
+En Apple-bundle kräver att utdatafilsystemet kan lagra POSIX-lägena
+0755 för programmet och 0644 för resurserna. Bygg bundlen på en värd
+och ett filsystem som kan sätta de rättigheterna. Windows-porten
+rapporterar fel när publiceringen begär privat mellanlagring eller
+POSIX-rättigheter.
+
 ## Kapabilitetsöversikt
 
 Moduler i Dunder deklarerar använda privilegier med `capability ...` högst upp
