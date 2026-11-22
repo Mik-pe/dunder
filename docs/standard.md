@@ -7,12 +7,23 @@ eller suffix i importen. Endast explicita beroenden läses. Delade importer
 och alias har samma typidentitet. En lokal fil väljs med en uttrycklig
 relativ sökväg, till exempel `import .std.map as local`.
 
-`std.sqlite` innehåller stöd för SQLite med bundna parametrar.
-[SQLite](sqlite.md)
+## Välj API-nivå
 
-HTTP-servern, HTTP-klienten, CLI-parsern och strukturerad loggning finns som egna
-Dunderpaket under `packages/`.
-[HTTP-paketen](http.md) · [CLI-paketet](../packages/cli/) · [Loggpaketet](../packages/log/)
+| När du behöver | Börja med |
+| --- | --- |
+| Äga värden och uttrycka frånvaro eller fel | Språkets arrayer, strängar och lån samt preludiets `Option<T>`, `Result<T, E>` och traits. De finns utan import. |
+| Bearbeta data i minnet | `std.text`, `std.bytes`, `std.math` och samlingarna. JSON och TOML ingår också. Kompilatorn använder båda formaten för projekt och verktyg. |
+| Läsa eller skriva en ström | `std.io.Read`, `Write` och `BufRead`. Samma funktion kan ta emot en fil, stdin eller en `Cursor` i ett test. `std.fs`, `std.net` och `std.process` öppnar resurser med respektive kapabilitet. |
+| Arbeta med filbeskrivare, systemets statuskoder eller FFI | `sys` och `std.dl`. Där finns även de primitiv som de typade standardmodulerna använder. |
+| Använda en databas, tala HTTP eller utforma ett kommandoradsprogram | Välj `sqlite`, `http`, `http_client`, `cli` eller `log` i projektets `[dependencies]`. Paket kan ha egna systemberoenden och uppgraderas via manifestet. |
+
+För JSON med känt schema ger `json.from_str<T>(text)?` ett typat värde.
+För dynamiskt innehåll ger `json.Doc::parse(text)?` och
+`json.Doc::parse_utf8(move bytes)?` ett dokument eller `JsonError` med
+byteposition. Ett uppslagsanrop som `doc.get_str(...)` ger `Option<string>`.
+För numerisk text kan `parse.value<i64>(text)?` på samma sätt lämna felet till anroparen.
+
+[Projektberoenden](dependencies.md) · [SQLite](sqlite.md) · [HTTP och TLS](http.md) · [CLI](../packages/cli/) · [Loggning](../packages/log/)
 
 ```dunder
 import std.map as map
@@ -188,7 +199,6 @@ automatiskt; se [minnesmodellen](memory.md#lokala-läslån-och-intervallvyer).
 | `std.net` | Kapabilitetsstyrd TCP och UDP för IPv4/IPv6 (`TcpStream` implementerar `io.Read` och `io.Write`; `TcpListener`, `TcpStream` och `UdpSocket` implementerar `Sendable`), `IpAddr`, `SocketAddr`, `PollSet`, `Waker` (`Sendable`), `StreamSet` och `resolve`. |
 | `sys` / `std.sys` | macOS-/Linux-filer, argument, byteutdata, UTF-8-avkodning, klocka, `sleep_ms`, process-ID, `Metadata` (inklusive `is_symlink`, `mode`, `uid`, `gid`, `nlink`, `dev`, `ino`, `mtime`), `IoError` (`Display`/`Eq`/`Hash`, inklusive `Interrupted`, `NoSpace`, `UnexpectedEof`, `WriteZero`, `would_block`, `is_would_block`), `FileKind`, `Status`, lågnivå-FD (`fd_read`/`fd_write`/`fd_close`), samt `unsafe`-primitiverna `memory_zero`, `pool_alloc_try`, `pool_free`, `atomic_*_i64`, `envp` och `linux_syscall`; se [sys](sys.md). |
 | `std.crypto` | Slumpbyte, Argon2id, HMAC-SHA256, HKDF-SHA256, konstanttidslikhet, AES-256-GCM, Ed25519-signaturer (`Result`), `zeroize` och `@resource(dispose)` `SecretBytes`; se [Kryptografi](crypto.md). |
-| `std.sqlite` | Moderniserad SQLite-klient via systemets `libsqlite3` (`Result`, `SqlValue`, `Row`, `exec_batch`, `Transaction`); se [SQLite](sqlite.md). |
 | `std.toml` / `std.toml.tree` | TOML-parser (`toml.parse`), DOM-träd (`Tree` med `Sendable` och `Default`) och JSON-rendering; se [TOML](toml.md). |
 | `std.dl` | Dynamisk laddning av systembibliotek och uppslagning av symboler via Dunders typade [FFI](ffi.md). |
 | `std.fs` | Delegerade läs-/skriv-/kataloghandtag med `impl` (`ReadFile::grant`/`.read`/`.open`, `WriteFile::grant`/`.write`/`.create`/`.open_append`, `ReadDir::grant`/`.resolve_read`/`.list`), strömmande `@resource(dispose)`-handtag (`OpenOptions` med `set_nofollow`, `FileReader`, `FileWriter`, `File` med `io.Read`/`io.Write`/`io.Seek`, `Sendable`) samt filsystemshjälpare (`cwd`, `realpath`, `mkdir_all`, `temp_dir`, `temp_file`, `list_dir`, `remove_all`, `symlink`, `hard_link`, `is_symlink`, `metadata`, `lstat`, `chmod`, `sync_dir`, `write_private_atomic`, `write_private_text_atomic`). Se [filsystemets kapabiliteter](ffi.md). |
@@ -303,6 +313,10 @@ i radianer. De finns på de nativa målen och i WebAssembly. `sin` och
 `tan` bevarar tecknet på noll, medan `cos(0.0)` ger `1.0`.
 Oändliga vinklar och NaN ger NaN.
 
+`math.PI` är π som `f64`. `math.atan2(y, x)` ger vinkeln i radianer från
+positiva x-axeln i intervallet [−π, π]. På negativa x-axeln väljer tecknet
+på y mellan +π och −π, även när y är noll. NaN i någon koordinat ger NaN.
+
 `math.total_cmp_f64(a, b)` och `math.total_cmp_f32(a, b)` ger IEEE 754 total
 ordning som `Ordering` (`-NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN`),
 lämplig att skicka till `array.sort_by` när flyttal behöver deterministisk ordning.
@@ -313,6 +327,9 @@ eller division/rest med noll i stället för processfälla):
 `checked_add_*`, `checked_sub_*`, `checked_mul_*`, `checked_div_*` och
 `checked_rem_*` för typerna `i32`, `i64`, `u32`, `u64` och `usize`, samt
 `checked_neg_i32` och `checked_neg_i64`.
+
+`x.abs()` ger absolutvärdet av ett `i32` eller `i64`. Typens minsta värde
+ger samma spillfel (101) som `-x`.
 
 Stora vinklar reduceras med binär fastpunktsaritmetik enligt
 [Payne–Hanek-metoden](https://perso.ens-lyon.fr/jean-michel.muller/RangeReductionIEEETC0305.pdf).
@@ -360,6 +377,14 @@ väljer omslag uttryckligt; vanlig aritmetik behåller sina overflowkontroller.
 Bytekodning och SHA-256 dogfoodar dessa operationer.
 
 ## Strömmar och standardinmatning
+
+För radbaserade format med en storleksgräns, använd
+`reader.read_line_limit(max_bytes)`. Gränsen gäller inlästa byte per rad
+inklusive eventuell LF eller CRLF. En sista rad kan sluta vid EOF.
+Vid `.TooLarge` har läsaren förbrukat precis gränsens antal byte och nästa
+byte ligger kvar. En negativ gräns ger `.InvalidArgument`. För binära
+poster finns `read_until_limit(delim, &mut out, max_bytes)`, som räknar
+nytillagda byte och behåller avgränsaren i utdata.
 
 `std.io` definierar de generiska ström-traitsen `Read` (`fn read(&mut self, out: &mut []u8, max_bytes: i32) -> Result<i32, sys.IoError>`), `Write` (`write`, `flush`, plus standardmetoderna `write_full`, `write_str` och `write_byte`), `BufRead: Read` (`fill`, `buffered(&self) -> &[]u8 from self`, `consume`, samt standardmetoderna `read_until`, `read_line_into` och `read_line -> Result<Line, sys.IoError>`) och `Seek` (`seek(&mut self, pos: SeekFrom) -> Result<i64, sys.IoError>`).
 

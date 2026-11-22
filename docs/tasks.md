@@ -56,8 +56,8 @@ fn main() {
 }
 ```
 
-Granskade standardbindningar i `std.net`, `std.fs`, `std.sqlite`, `std.crypto`,
-`std.time` och `std.sync` är märkta `@thread_safe` så de får anropas från
+Granskade bindningar i `std.net`, `std.fs`, `std.crypto`, `std.time`,
+`std.sync` och paketet `sqlite` är märkta `@thread_safe` så de får anropas från
 arbetare med motsvarande beviljade kapabilitet, medan godtycklig C-FFI fortfarande
 avvisas utan `unsafe`. På Linux återanvänder scopet långlivade arbetartrådar
 inom scopets livstid. For koordinering i minnet utan delad muterbar heap erbjuder
@@ -158,7 +158,7 @@ workerarenor avmappas innan snapshoten avfryses och frigörs.
 Spawn kräver en namngiven säker Dunder-funktion (inklusive specialiserade
 generiska funktioner som `spawn jobs work<string>(...)`). Utöver eventuell
 `workspace: &mut Workspace` och `world: &World` från scopet tar en worker och
-därmed `spawn` **exakt ett** säkert (`Sendable`) värdeargument (en vanlig
+därmed `spawn` **högst ett** säkert (`Sendable`) värdeargument (en vanlig
 läsparameter `T` eller en ägande `move T`). När en uppgift behöver flera
 indata samlas de i en `Sendable`-struct (eller en `Sendable`-tupel):
 

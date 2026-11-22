@@ -59,8 +59,8 @@ installerar den. [Releaser](docs/releases.md)
 
 - [Syntax](docs/syntax.md) beskriver funktioner, moduler, traits, råa/flerradiga strängar, `@embed_file`, `&str` och tester. [Små körbara exempel](examples/)
 - [Minnesmodellen](docs/memory.md) beskriver ägarskap, flyttar, dynamiska slabs och begränsade lån (`&[]T`, `&str`).
-- [Standardbiblioteket](docs/standard.md) omfattar bland annat samlingar, `std.sync`, `std.text.view`, `std.path`, `std.time`, `std.signal` och serialisering. [Systembibliotek](docs/sys.md) · [HTTP och TLS](docs/http.md) · [SQLite](docs/sqlite.md) · [TOML](docs/toml.md) · [Kryptografi](docs/crypto.md)
-- [Ekosystempaketen](packages/) innehåller fristående paket för [`http`](packages/http/), [`http_client`](packages/http_client/), [`cli`](packages/cli/) och [`log`](packages/log/).
+- [Standardbiblioteket](docs/standard.md) innehåller samlingar, strömmar, matematik, serialisering och åtkomst till operativsystemet. [API-nivåer](docs/standard.md#välj-api-nivå) · [Systembibliotek](docs/sys.md) · [TOML](docs/toml.md) · [Kryptografi](docs/crypto.md)
+- [Paketen](packages/) ger applikationen [SQLite](docs/sqlite.md), [HTTP-server och HTTP-klient](docs/http.md), [kommandoradsparser](packages/cli/) och [strukturerad loggning](packages/log/).
 - [C-FFI](docs/ffi.md) beskriver externa anrop och datalayout. [Parallella uppgifter och synkronisering](docs/tasks.md)
 
 Hundmat är Dunders testbädd. Tabell, HTTP-servern och grafikexemplen för

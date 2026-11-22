@@ -1,14 +1,25 @@
 # SQLite
 
-`std.sqlite` exposes the system SQLite 3 library on native macOS and Linux
-(`capability filesystem, unsafe`). The opaque connection is a
+`sqlite` is a source package for the system SQLite 3 library on native
+macOS and Linux. To migrate from `import std.sqlite as sqlite`, add
+the package to the application's `dunder.toml` and use `import sqlite`.
+With a sibling Dunder checkout, the dependency is
+
+```toml
+[dependencies]
+sqlite = { path = "../dunder/packages/sqlite", capabilities = ["filesystem", "unsafe"] }
+```
+
+A Git dependency can select the same directory with `subdir = "packages/sqlite"`.
+The package uses FFI internally. Opening a database requires `capability filesystem`
+in the calling module. The opaque connection is a
 `@resource(dispose)`: move it to transfer ownership and call `close()` when
 finished. Closing an already closed connection succeeds; closing while a
 transaction is still active fails.
 
 ```dunder
 capability filesystem
-import std.sqlite as sqlite
+import sqlite
 
 fn main() {
     mut db := sqlite.Database::open("application.db", false).unwrap()
