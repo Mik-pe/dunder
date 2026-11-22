@@ -258,6 +258,8 @@ avsiktligen ingen `Hash`/`Eq`-implementation. Egna typer implementerar `Eq` och
 `Hash`:
 
 ```dunder
+struct Key { id: i64 }
+
 impl Eq for Key { fn eq(&self, other: &Self) -> bool { self.id == other.id } }
 impl Hash for Key { fn hash(&self) -> u64 { self.id.hash() } }
 ```

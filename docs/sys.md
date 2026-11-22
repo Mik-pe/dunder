@@ -5,6 +5,7 @@ implementationen stöder ARM64/macOS, ARM64/Linux och x86-64/Linux med Dunders e
 native-backend. Källfiler har ändelsen `.ddr`; importer skrivs utan suffix.
 
 ```dunder
+capability filesystem
 import sys
 
 fn main() -> i32 {
@@ -80,6 +81,9 @@ pub enum FileKind { Other = 0, File = 1, Directory = 2, Symlink = 3 }
 Hela deklarationen finns i [sys.ddr](../stdlib/sys.ddr).
 
 ```dunder
+capability filesystem
+import sys
+
 fn load(path: string) -> string {
     match sys.read(path) {
         .Ok(text) => text,
@@ -188,7 +192,7 @@ Textinnehåll får innehålla NUL. Byteföljden måste vara giltig UTF-8 vid lä
 inte en atomisk publicering; ett senare skrivfel kan lämna delvis data.
 `append_text` använder OS:ets append-läge. Skrivloopar hanterar korta
 skrivningar och avbrott, men hela strängen är inte en transaktion gentemot
-andra processer. Nya filer begär läge 0600 och nya kataloger 0700,
+andra processer. Nya filer begär läge 0644 och nya kataloger 0755,
 begränsat av processens umask. Befintliga filers behörigheter bevaras.
 
 Läsning/skrivning och metadata följer symboliska länkar. `remove_file`

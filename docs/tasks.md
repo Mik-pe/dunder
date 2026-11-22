@@ -44,8 +44,15 @@ kapabiliteter (`filesystem`, `network`, `process`, `stdio`) och valfri
 arenastorlek per arbetare med:
 
 ```dunder
-task scope workers(4) with (network, filesystem) arena 8 * 1024 * 1024 {
-    ...
+capability network, filesystem
+
+fn worker() -> i32 { 42 }
+
+fn main() {
+    task scope workers(4) with (network, filesystem) arena 8 * 1024 * 1024 {
+        id := spawn workers worker()
+        print(await workers(id))
+    }
 }
 ```
 
@@ -247,7 +254,8 @@ allokeringsarena. Scopet inväntar aktiva jobb före frigöring av resultaten.
 | Nativ kontrollpost | 144 | 0 tillstånd, 8 dispatchgrupp eller `pthread_t`, 16 indata, 24 resultat, 32 arenabas, 40 förälderns resultat, 48 allokeringsposition, 56 väntfel, 64 avmappningsfel, 72 återvunnen arena, 80 arbetsytans initierare, 88 arbetsyta, 96 lån av scopets delade plats, samt utökade fält vid 104–136 (worker-pool-lane) |
 
 Kontrollpostens tillstånd är 0 klar för start, 1 inlämnad, 4 cachad, 5 startfel,
-6 väntfel, 8 kasserad, 9 avmappningsfel och 10 resultat övertaget av `await!`.
+6 väntfel, 8 kasserad och 9 avmappningsfel. (Resultatstatus 10, övertagen av
+`await!`, finns på jobbpostens fält vid byteoffset 48, inte på kontrollposten.)
 Vid väntfel kan arbetaren fortfarande köra. Kontrollpost, trådresurser och
 arena måste då förbli giltiga.
 

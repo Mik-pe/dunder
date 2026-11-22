@@ -152,6 +152,7 @@ används decimalformat. Bredden är ett minimum och räknar med eventuellt
 minustecken. Negativa värden visas med minustecken även i hexadecimal form.
 
 ```dunder
+name := "å 🌍"
 color := 0xaf
 hex := f"#{color:04X}"      // "#00AF"
 position := f"{-7:04d}"    // "-007"
@@ -162,7 +163,7 @@ right := f"{name:>6}"      // högerjusterad till bredd 6
 
 För strängar stöder formatangivelsen bredd och justering med `:<N`
 (vänsterjustering) och `:>N` (högerjustering), som fyller ut med blanksteg upp
-till minst `N` byte om strängen är kortare.
+till minst `N` kodpunkter om strängen är kortare.
 
 `{{` och `}}` ger bokstavliga klamrar. I exemplet blir `escaped` strängen `"{3}"`.
 Övriga escapes fungerar som i vanliga strängar, inklusive Unicode och NUL. I en enradig `f"..."` får textsegmentet inte innehålla råa
@@ -489,11 +490,14 @@ höger. Inbyggda operationer som `print` är ännu inte funktionsvärden; skriv
 en vanlig `fn` som omslag vid behov. Funktionsvärden saknar likhetsoperator.
 
 En anonym funktion skrivs `fn(x: i32) -> i32 { x * 2 }`. Lägg till en
-typad lista i hakparenteser för att fånga lokala värden. En closure har
-samma funktionstyp som en namngiven funktion med samma parametrar och resultat.
+typad lista i hakparenteser för att fånga lokala värden. En closure utan
+infångade värden har samma funktionstyp `fn(...)` som en namngiven funktion,
+men en closure som fångar värden får funktionstypen `Fn(...)` (med varianterna
+`&Fn(...)`, `&mut FnMut(...)`, `FnMut(...)` och `FnOnce(...)`) och kan inte
+omvandlas till en rå `fn(...)`-pekare.
 
 ```dunder
-fn plus(base: i32) -> fn(i32) -> i32 {
+fn plus(base: i32) -> Fn(i32) -> i32 {
     fn[base: i32](x: i32) -> i32 { x + base }
 }
 
@@ -1007,8 +1011,8 @@ behåller konverteringen eller iterationen sina gamla värden. `for` direkt öve
 välj `.bytes()` eller `.runes()` uttryckligt. `break` och `continue` fungerar
 för båda. Lagrade arrayiteratorer äger sin samling; skapa dem med
 `(move values).iter()` eller `values.clone().iter()`.
-Strängsnitt kan också ta ett lagrat eller returnerat `range`-värde,
-exempelvis `span := 7..11; part := text[span]`.
+Intervall i index skrivs direkt i hakparentesen (`text[start..end]`); ett
+lagrat eller returnerat `range`-värde accepteras inte som index.
 En namngiven strängvy, exempelvis `utf8 := &text[1..7]` för `"xå🌍y"`,
 pekar direkt in i originalet med typen `&str` och stöder nollallokerande
 hjälpare i [`std.text.view`](standard.md#moduler). Båda gränserna måste vara

@@ -58,6 +58,8 @@ Varje anrop har fortfarande en fullständigt statisk signatur: deklarera separat
 typade alias när samma C-symbol används med olika typer, till exempel libcurl:
 
 ```dunder
+capability unsafe
+
 @c_variadic(2)
 @extern("/usr/lib/libcurl.dylib", "curl_easy_setopt")
 unsafe fn setopt_ptr(easy: ptr, option: i32, value: ptr) -> i32

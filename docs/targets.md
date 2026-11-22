@@ -118,11 +118,11 @@ grenar innan `@extern`-symboler registreras; exempelvis bygger `std.process`
 statiska ELF-binärer på Linux via `sys.linux_syscall` och `sys.envp` utan
 `libc` eller `libdl`. Nåbara `@extern`-deklarationer ger en dynamisk
 ELF med deklarerade bibliotek och symboler, separata RX/RW-segment och
-målets C-ABI. Vulkanexemplet använder dessa importer för att ladda och
-anropa grafiken. Vulkan-körning med lavapipe är verifierad på både
-ARM64/Linux och x86-64/Linux. Stacken är inte körbar och kodsegmentet
-är inte skrivbart. Linux-retur och runtimefel använder `exit_group` så att
-även grafikdrivrutinens arbetstrådar avslutas.
+målets C-ABI. Grafikexemplen i testbädden
+[dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat) använder dessa
+importer för att ladda och anropa grafiken. Stacken är inte körbar och
+kodsegmentet är inte skrivbart. Linux-retur och runtimefel använder
+`exit_group` så att även grafikdrivrutinens arbetstrådar avslutas.
 Systembiblioteket anpassar anropsnummer, argument, metadata-layout och felkoder
 till målet. Dunders interna funktions-ABI är inte ett publikt C-ABI.
 

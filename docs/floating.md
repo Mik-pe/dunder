@@ -142,10 +142,12 @@ Hjälparna ger exempel på hur flyttalsstödet fungerar i Dunder-program.
 Trigonometriska funktioner finns i `std.math` (`sin`, `cos`, `tan` för `f64`);
 exp/log, decimalflyttal, SIMD och float-fmod återstår.
 
-Skalära flyttalsargument använder v0–v7, separat från x0–x7 för övriga
-argument. Därefter används stacken med naturlig storlek och justering.
-Flyttalsreturer går i s0/d0. Detta följer registeruppdelningen i
-[AArch64:s anropsstandard](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst).
+I Dunders interna ABI passerar skalära flyttalsargument som råbitar i
+x0–x7, precis som övriga skalära argument; från det nionde argumentet
+används stacken. Flyttalsresultat returneras som råbitar i x0.
+Registeruppdelningen v0–v7 för flyttalsargument och s0/d0 för
+flyttalsreturer enligt
+[AArch64:s anropsstandard](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst)
+gäller C-anrop, som har ett separat [FFI-kontrakt](ffi.md).
 Vanliga struct- och arrayparametrar använder Dunders interna lånekonvention;
 `move`-parametrar och resursägande returer överför ägarskapet.
-C-anrop och C-layout har ett separat [FFI-kontrakt](ffi.md).

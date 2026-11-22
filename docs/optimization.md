@@ -87,9 +87,11 @@ För skalära operationer anger `kinds` familjen enligt `mir.Kind`. Följande
 | Binary 1–7 | add, sub, mul, signed mul high, unsigned mul high, signed div, unsigned div |
 | Binary 8–13 | and, or, xor, and-not, or-not, xor-not |
 | Binary 14–18 | logiskt vänsterskift, logiskt högerskift, aritmetiskt högerskift, multiply-add, multiply-subtract |
-| Float 1–8 | add, sub, mul, div, jämför, absolutvärde, negation, kvadratrot |
-| Float 9–15 | GP-bitar till FP, FP-bitar till GP, precisionsbyte, signerat eller osignerat heltal till FP, FP till signerat eller osignerat heltal |
-| Float 16–20 | närmaste, floor, ceil, trunkering, närmaste med halvor bort från noll |
+| Float 1–4 | add, sub, mul, div |
+| Float 6–11 | jämförelserna `==`, `!=`, `<`, `<=`, `>`, `>=` |
+| Float 12–15 | råbitar till GP (`to_bits`), teckenbit, absolutvärde, kvadratrot |
+| Float 16–21 | floor, ceil, round bort från noll, round_ties_even, trunc, negate |
+| Float 22–24 | is_nan, is_finite, is_infinite |
 
 För en skiftad operand bär de sex lägsta bitarna i `aux` skiftlängden.
 Bitarna 6–7 anger vänster, logiskt höger, aritmetiskt höger eller rotation.
@@ -304,7 +306,7 @@ aldrig med värdet före anropet. Återläsningens plats, bredd, scratchbehov oc
 liveness verifieras separat.
 
 [`mir.Function.stack_roles`](../selfhost/mir/mir.ddr) är en parallell
-ursprungskolumn, det 62:a fältet i denna modellversion. Noll betyder rått,
+ursprungskolumn, det 38:e fältet (av 64) i denna modellversion. Noll betyder rått,
 argument-, brygg- eller ospecificerat stackbruk; ett är ett positivt
 producentvittne för en privat uttryckstemporär. Vanliga push/pop blir inte
 Temp genom sin instruktion eller placering. Den fulla frontendens
@@ -562,7 +564,7 @@ vid frysningen. Felaktig signatur, mål, skuggad funktionspekare, frameplats
 eller ordbudget lämnar kodströmmen orörd. Argument måste redan vara
 utvärderade i källordning, även om kroppen inte använder dem.
 
-Producenten prövar deklarationssignaturer och högst 128 kroppstoken, inom
+Producenten prövar deklarationssignaturer och högst 192 kroppstoken, inom
 en gemensam budget på 32 768 skannade/parsade token. Endast slutna,
 anropsfria retur-uttryck med `i32`, `i64` och `bool` godtas. Den vanliga
 valideringen och funktionens nåbarhet behålls. Säkerhetskontroller och bindningsposter
@@ -916,7 +918,7 @@ separata avkodningsvägen med samma diagnostik och källpositioner.
 Direkt `for`-iteration över en typad strängs `.bytes()` eller `.runes()`
 kan strömma från en behållen strängsnapshot, och när källan är en oföränderlig
 lokal sträng eller parameter utan `move <namn>` i loopkroppen (`stream_kind`
-`11`/`15`) utelämnas både kloning och tillfällig ägarlagring helt. Den vägen
+`18`/`15`) utelämnas både kloning och tillfällig ägarlagring helt. Den vägen
 bygger eller kopierar ingen konverteringsarray. Lagrade konverteringar och uttryck som
 inte matchar den begränsade direkta vägen använder vanliga arrayer.
 Källan utvärderas en gång och behålls genom `continue`, `break` och retur.

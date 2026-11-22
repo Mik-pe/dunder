@@ -164,11 +164,11 @@ Kompilatorn bäddar in standardmodulerna som räknas upp i
 källtext regenereras läser [selfhost/embed.ddr](../selfhost/embed.ddr)
 samma lista. Vanliga filimporter löses på disk relativt den importerande filen.
 
-Grafikexemplen i testbädden `dunder-hundmat` provar Dunders FFI och
-kodgenerering. Modulerna i `dogfood/graphics/` beskriver bibliotekens C-layout,
-slår upp funktionspekare och äger fönster-, renderings- och händelselogiken. WebGPU-exemplet
-i `dogfood/webgpu/` anropar sin JavaScript-värd via en vanlig Wasm-import.
-[Dunders FFI-kontrakt](ffi.md)
+Grafikexemplen (Metal, Vulkan, WebGPU) i testbädden `dunder-hundmat` provar
+Dunders FFI och kodgenerering: de beskriver bibliotekens C-layout, slår upp
+funktionspekare och äger fönster-, renderings- och händelselogiken, och
+WebGPU-exemplet anropar sin JavaScript-värd via en vanlig Wasm-import.
+[Dunders FFI-kontrakt](ffi.md) · [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat)
 
 Maskindelen äger instruktionskodning och räckvidd för hopp. Plattformslagret
 anpassar startpunkt, systemanrop, metadata-layout och binärformat. ARM64-målen

@@ -11,16 +11,17 @@ capability filesystem
 import std.sqlite as sqlite
 
 fn main() {
-    db := sqlite.Database::open("application.db", false).unwrap()
+    mut db := sqlite.Database::open("application.db", false).unwrap()
     defer { _ := db.close() }
     none: []sqlite.SqlValue = []
-    db.exec("CREATE TABLE IF NOT EXISTS items(value TEXT)", &none).unwrap()
+    _ := db.exec("CREATE TABLE IF NOT EXISTS items(value TEXT)", &none).unwrap()
     params: []sqlite.SqlValue = [.Text("a value with ' quotes")]
     inserted := db.exec("INSERT INTO items(value) VALUES(?)", &params).unwrap()
     assert(inserted.changes == 1)
     rows := db.query("SELECT rowid AS id, value FROM items", &none).unwrap()
     for row in &rows {
         id := row.field_i64("id").unwrap()
+        assert(id >= 1)
         text := row.field_text("value").unwrap()
         print(text)
     }
