@@ -65,8 +65,8 @@ Med en lokal versionstagg byggs den commit som taggen pekar ut. Utan tagg
 används `HEAD`. Skriptet packar upp de incheckade källorna i en tillfällig
 katalog och kör `tools/bootstrap.sh` där. Värdens kompilator måste nå
 fixpunkt och rapportera versionen från taggen. Den bygger sedan de andra
-målens kompilatorer lokalt. Paketen innehåller den parallella
-kompilatorn (`selfhost/main_parallel.ddr`). För en annan utdatakatalog används `--outdir KATALOG`.
+målens kompilatorer lokalt från samma ingång, `selfhost/main.ddr`.
+Med `--outdir KATALOG` kan paketen skrivas till en annan katalog.
 
 ## Publicera
 

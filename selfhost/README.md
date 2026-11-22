@@ -8,9 +8,7 @@ dunder_bin="$(./tools/bootstrap.sh)"
 ```
 
 [Bootstrap](../bootstrap/README.md) beskriver de frysta kompilatorerna och hur
-självbyggena jämförs. [Huvudingången](main_parallel.ddr) används på ARM64/macOS,
-ARM64/Linux och x86-64/Linux. De tre seriella ingångarna är [main.ddr](main.ddr),
-[linux.ddr](linux.ddr) och [x86_linux.ddr](x86_linux.ddr).
+självbyggena jämförs. Alla tre värdar bygger [samma kompilator](main.ddr).
 
 ## Från källfil till program
 

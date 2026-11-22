@@ -17,7 +17,7 @@ are also supported by the language. Workers have no IO, ambient state or nested 
 | array | A record supplies a primitive array snapshot, job index and pass count. Each worker copies and updates its private array and returns its weighted sum, first and last value. | The Dunder reference composes the passes into one affine transform per job. It checks all result fields and the original array's checksum and endpoints. |
 
 The correctness tool can also call the `*_worker.ddr` modules directly using
-the serial compiler built by `tools/bootstrap.sh`. It checks the same expected
+the compiler passed to `--reference-compiler`. It checks the same expected
 results for each worker.
 
 Whole-process samples include process startup, argument parsing, input setup,
@@ -30,7 +30,7 @@ uncontrolled; the report records host/hardware and paired samples.
 
 ```sh
 dunder run tools/performance_tasks.ddr -- check /path/to/task-compiler \
-  --reference-compiler build/selfhost/arm64-macos/dunder-serial \
+  --reference-compiler build/selfhost/arm64-macos/dunder \
   --report build/task-throughput-check
 ```
 
@@ -74,7 +74,7 @@ produced. Source/compiler/manifest/image changes fail the run.
 
 To check whether a compiler change preserves the generated binaries, run
 the untimed image comparison on a single source checkout. The tool builds
-the runtime kernels, a generated corpus and the serial compiler with both
+the runtime kernels, a generated corpus and the compiler source with both
 binaries, runs the programs and compares image hashes.
 
 ```sh
