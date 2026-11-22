@@ -40,7 +40,7 @@ macOS-, WASI- och Windowsbinärer. Kompilering kräver ingen körning av målpla
 ett tydligt fel före publicering eller körning. Använd `build` och flytta
 filen till målplattformen för att köra den där. `check` behöver ingen native
 backend. Flaggan `-g` / `--debug` (stöds för `build`, `run` och `install`)
-emitterar DWARF v4-debuginformation och symboltabeller för nativa mål. `dunder lsp`
+emitterar DWARF v4-debuginformation och symboltabeller för macOS och Linux. `dunder lsp`
 startar en JSON-RPC-språkserver över standardströmmar. x86-64/macOS är ännu inte ett körmål.
 
 Detaljer för Windows- och WASI-målen verifieras i

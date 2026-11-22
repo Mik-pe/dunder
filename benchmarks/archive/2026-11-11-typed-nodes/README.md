@@ -54,7 +54,7 @@ native/Wasm och 13 CLI-grupper på macOS. Bootstrap nådde identisk fixpunkt.
 Sex källfall över fyra mål och två intervallägen ger 48 exakta jämförelser
 av utbilder samt bindnings-/diagnostikdata mot föregående emitter.
 De täcker aritmetik, arraymutation, spill, åtta argument, ägande och platser.
-[Jämförelseprogram](identity.py), [resultathashar](identity.json).
+[Jämförelseprogram](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-11-typed-nodes/identity.py), [resultathashar](identity.json).
 
 Det nya uttrycksprovet bygger 72 bilder på fyra mål och kontrollerar
 frameplatserna 37/620, kortslutning, fällordning, FP/SP och callee-saved

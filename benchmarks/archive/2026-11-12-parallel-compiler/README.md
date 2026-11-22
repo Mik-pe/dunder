@@ -160,7 +160,7 @@ selected to replace this series.
 ## Untimed whole-compiler allocation observations
 
 [`allocations/metadata.json`](allocations/metadata.json),
-[`summary.json`](allocations/summary.json), [`observer.py`](allocations/observer.py)
+[`summary.json`](allocations/summary.json), [`observer.py`](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-parallel-compiler/allocations/observer.py)
 and every [`raw/`](allocations/raw/) stdout/stderr file are retained unchanged.
 
 The old 598cf and new serial 1267 executables each compiled the SAME current
@@ -230,7 +230,7 @@ changes that left the measured executable unchanged.
 [`identity.json`](acceptance/bootstrap-publication/identity.json),
 [`commands.json`](acceptance/bootstrap-publication/commands.json),
 [`results.json`](acceptance/bootstrap-publication/results.json) and
-[`probe.py`](acceptance/bootstrap-publication/probe.py) preserve a subsequent
+[`probe.py`](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-parallel-compiler/acceptance/bootstrap-publication/probe.py) preserve a subsequent
 publication probe using scripts from
 `60b9c6beebef0047256330ca11795aab6bf07467`. No latency observations were added.
 

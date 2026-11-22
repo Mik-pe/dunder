@@ -80,5 +80,5 @@ Linuxbilder har byggts men inte körts här.
 
 Nästa arbete är intervall-/längdbevis för arrayer och explicit runtimeinvariant
 för längder. För bredare språkfall finns planer för
-[ägartillstånd](../../../docs/ownership-ir-plan.md) och
-[destinationsbaserade POD-värden](../../../docs/pod-values-plan.md).
+[ägartillstånd](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/docs/ownership-ir-plan.md) och
+[destinationsbaserade POD-värden](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/docs/pod-values-plan.md).

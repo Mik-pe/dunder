@@ -53,18 +53,21 @@ kompilatorn. Regenerera [bundled.ddr](bundled.ddr) innan kompilatorn byggs om.
 ## Verifiering
 
 `./tools/dev.sh` gör ett inkrementellt bygge och kör kärnsviterna.
-För en del av sviten kan du välja testnamn med `--filter`. Den fullständiga
-verifieringen börjar med ett nytt självbygge från värdens frö.
+`./tools/verify-selfhost.sh` börjar med ett nytt självbygge från värdens frö.
 
-Testverktygen använder Python 3.11 eller senare, Node.js, en C11-kompilator
-samt Git, curl, gzip och openssl. De nativa biblioteksproven använder även
-libcurl, SQLite, OpenSSL 3 och Argon2. [HTTP](../docs/http.md) · [SQLite](../docs/sqlite.md)
+Testverktygen i Dunder kör bland annat Node.js för Wasm och en C-kompilator för
+ABI-proven. Git, curl, gzip och openssl används också. Biblioteksproven
+använder libcurl, SQLite, OpenSSL 3 och Argon2. [HTTP](../docs/http.md) · [SQLite](../docs/sqlite.md)
 · [Kryptobibliotek per plattform](../docs/crypto.md)
 
 ```sh
 ./tools/dev.sh --filter ssa
 ./tools/verify-selfhost.sh
 ```
+
+`--fast` kör kärnsviterna. Utan nivåflagga körs den ordinarie verifieringen.
+`--exhaustive` tar också med de utökade sviterna och `--all` lägger till
+releaseproven. `--filter` väljer sviter med matchande namn.
 
 Enskilda testgrupper kan listas, byggas och köras från projektets rot.
 

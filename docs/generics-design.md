@@ -3,8 +3,8 @@
 En generisk deklaration beskriver en familj av funktioner eller typer. En
 instans bestäms av **vilken deklaration** som används och **vilka typer**
 som fyller dess parameterplatser. Samma regel gäller för egna deklarationer
-och standardbibliotekets `Map`, `Set` och `Result`. Typargumenten är
-explicita. [Syntax och exempel](syntax.md#generiska-deklarationer)
+och standardbibliotekets `Map`, `Set` och `Result`. Vid anrop kan kompilatorn härleda typargument ur
+argumenten eller den förväntade resultattypen. [Syntax och exempel](syntax.md#generiska-deklarationer)
 
 ## Vad gör två instanser lika?
 

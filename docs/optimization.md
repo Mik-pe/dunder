@@ -155,9 +155,6 @@ cacheberoenden. Passräknarna omfattar även workerresultat. Fulla cacheträffar
 och `check` har noll backendaktivitet.
 [Arbetsbudget och kompilatorjobb](tasks.md#kompilatorn-som-taskkonsument)
 
-[Parallell kompilatormätning](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
-jämför en och fyra workers före SSA-grunden. Runtimebilderna är byteidentiska.
-
 ### Registerhem över hela funktioner
 
 [`mir_liveness`](../selfhost/mir/mir_liveness.ddr) beskriver fysisk register- och
@@ -403,9 +400,7 @@ lämna transaktionen; ett gammalt certifikat ersätter inte den kontrollen.
 
 `--mir-ssa=on` aktiverar steget mellan framepromovering och värdepass i den
 gemensamma seriella/taskbaserade kedjan. Standard är **on** (`--mir-ssa=off`
-stänger av steget). I den historiska [v2-mätmatrisen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
-ökade byggmedianen 21,26 procent för kompilatorkorpuset och 29,47 procent
-för Tabell utan belagd samlad runtimevinst. Effektiv aktivering
+stänger av steget). Aktivering
 kräver både MIR och MIR-opt; `check`, avstängt steg och full cacheträff utför
 inget SSA-arbete. Cache och testkvitton skiljer on/off och SSA-markören
 `v6-composed-regional-expression2-work4194304` åt. Fysisk MIR-policy v5 binder
@@ -421,17 +416,6 @@ committade SSA-resultat i accepterade jobb; arbete och budgetavslag visar
 faktiska försök. Ursprungliga frame-stores bevaras; endast godkänd privat
 Temp-lagring får förlora sina push/pop.
 
-Den historiska funktionella v2-matrisen med `flags=3` passerade 670 målbilder
-över 72 vektorer i 28 grupper, 360 native-/Wasm-körningar och 438 exakta
-bitjämförelser före/efter. Ytterligare 232 par har uttryckligen redovisade
-luckor i den oberoende interpretern, bland annat anrop, flyttal och externa
-utgångar; dessa räknas inte som interpreterbevis. Observerande anropsprov
-körs i riktiga native-/Wasm-bilder. Den matrisens källacceptans passerade också 24
-målbilder och 17 native-/Wasm-körningar med workers, cache och kvitton.
-Linuxmålen är endast bildbyggda i dessa matriser. De riktade resultaten
-ersätter varken full bootstrapverifiering eller en representativ mätmatris.
-Tidigare strukturella prov med sex→noll laster men 26→30 kodord och
-81→noll laster med 329→249 ord är inte latensmått.
 [SSA-/rollback-orakel](../tools/test_mir_ssa.ddr) ·
 [Cellkontrakt](../tests/mir_ssa_cells.ddr) ·
 [SSA-kontrakt](../tests/mir_ssa.ddr) ·
@@ -443,28 +427,6 @@ x86-register ([`x86_mir`](../selfhost/backend/x86_mir.ddr)) och Wasm placerar
 värden i Wasm-lokaler ([`wasm_mir`](../selfhost/backend/wasm_mir.ddr)); ARM64
 använder fortfarande den gemensamma logiska GP-banken. C-målet är fortfarande
 öppet.
-
-Den historiska [30-rundorsmätningen av SSA-v1](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
-visade 70,92 procent högre byggmedian för kompilatorkorpuset och 42,34
-procent för Tabell utan samlad runtimevinst mot C. En separat SSA-optimerad
-producentbinär ändrade byggmedianerna mindre än 0,3 procent och försämrade
-flera p95-värden. Det är v1-resultat, inte mätningar av dagens glesa v2 med
-`source_inputs` och rättat NZCV-kontrakt. Varken standardprofilen eller
-bootstrapprofilen aktiverar SSA på detta historiska underlag. Fortsatt
-värdeanalys och placering behöver dela arbete; den nya mekanismens totala
-kostnad och nytta måste vägas ihop före aktivering.
-
-Den historiska v2-jämförelsen med samma slutliga källor och SSA på i båda
-kompilatorerna minskade kompilatorkorpusets byggmedian 27,65 procent och
-Tabells 8,48 procent; Tabells p95 ökade samtidigt 20,41 procent. Detta
-mäter hela v2-ändringen, inte en isolerad effekt av en enskild mekanism.
-Rapportens v2-kompilator gav i av/på-serien runtime/C-geomedel 1,1883 respektive
-1,1841; text och sort med SSA på låg på 1,3376 och 1,2649. C-gränserna
-1,10 och 1,25 är fortfarande öppna. Genererat bygge med SSA på klarar
-100 000-gränsen vid p95 med 159 866 rader/s i den rapporten. Siffrorna
-föregår regional återläsning, gemensam Frame-/Expr-placering och
-worker-lokal sänkning. De är inga nya mätningar eller aktiveringsbeslut för
-den här etappen.
 
 ### Värdeidentitet över kontrollflödet
 
@@ -831,36 +793,17 @@ i sin egen arena, och ett efterfrågat resultat flyttas till förälderns
 skicka det lånade jobbet direkt. Vanliga funktionsanrop lånar utan denna
 arenakopiering. [Taskkontrakt](tasks.md).
 
-## Nästa etapper mot C-nivå
+## Stacklagrade poster och ägarstädning
 
-Målet prövas över hela den publicerade sviten enligt
-[prestandakontraktet](prestanda.md). En snabb summeringsloop räcker inte.
-Varje etapp behöver jämförelse med avstängt pass, kontrollerade resultat
-och 30 försök för runtime, genererat bygge, självbygge och Tabell.
-Median, p95 och binärstorlek ska redovisas; en högre p95 får inte döljas
-bakom snabbare genererad stresskod.
+Kompilatorn kan lagra en vanlig platt struct med upp till 16 skalärfält i
+stackramen. När posten lagras i en behållare kan den behöva boxas.
+Klassificeringen undantar bland annat resurser och `@c_layout`-typer.
+[Typklassificering](../selfhost/frontend/frontend_types.ddr) · [POD-prov för anrop, returer och behållare](../tools/test_pod_values.ddr)
 
-| Etapp | Mekanism och förväntad nytta | Krav före aktivering |
-| --- | --- | --- |
-| Helfunktionsvärden, SSA och minnesmodell | Regional Frame-SSA och positivt identifierade privata Temp-värden delar GP0–GP17-allokering. Ursprungliga frame-stores bevaras. Generellt operationsval och vidare värdeplacering återstår. | MIR-SSA är standard på (`--mir-ssa=on`). Anropsbevarande, frame-livstid, semantiska indata, NoModRef, temporärlagring och terminalobservationer är separata premisser. |
-| Starkare heltalsbevis | Intervall, induktionsvariabler och reduktion av division/rest med konstanta delare minskar kostnaden i numerik. | Bevara overflow, nollfall, negativa operander och ordningen mellan möjliga fällor. Arbetsbudget och konservativt återfall ska vara deterministiska. |
-| Egna målbackends från modellen | x86-register och Wasm-lokaler kan väljas direkt från de typade värdena. | Samma semantiska kontrakt på alla mål, med faktisk Linuxkörning för Linuxanspråk. x86-64/Linux sänker redan MIR direkt med fysisk registerallokering (`x86_mir`). |
-| Bredare specialisering och inlining | Begränsad uttrycksinlining är standard. Helfunktionsinlining kan öppna fler verkliga callee-kroppar för samma värde- och placeringsmodell. | Fast budget per funktion och anropsställe, begränsad kodtillväxt, fulla ABI/ägarkontrakt och cacheidentitet för samtliga påverkande sammanfattningar. |
-| POD och destinationsbaserade värden | [Gemensamma värdeplatser och ABI](pod-values-plan.md) kan undvika heapkonstruktion för små poster. | Deklarationsvalt passningssätt för både legacy och typed IR, argument-snapshots, returdestination och explicit lagringsägare. |
-| Vektorer och minnesbandbredd | SIMD, loopuppdelning och sammanhängande åtkomst kan närma sig C i bredare dataloopar. | Bevis för aliasering, varje åtkomst och varje relevant mellanresultat. Kontrollerad summering får inte ersättas med en omordnad reduktion utan sådana bevis. |
-| Loopoptimering | Flytta konstanter och rena beräkningar när dominans och kontrollflöde tillåter det. | Även när loopen körs noll gånger måste ordningen för fällor, minnesåtkomst och ägarskap bevaras. |
-| Kortare bygglatens | [Arbetarna](tasks.md#kompilatorn-som-taskkonsument) typkontrollerar och sänker funktioner. Samordnaren sköter symbolbindning, cache och länkning i ordning. | Följ kostnaden för källjobb, kopiering och återanvändning av arbetsytor. Mät varm cache, privat kroppsändring och delad layoutändring separat från kalla byggen. |
-
-Prioritera nästa mekanism efter profiler och maskinkod för arbetsfallen
-som fortfarande missar målet. Mät allokering och kopiering i lexer, parser
-och bibliotek separat när de dominerar; fler maskinkodspass löser inte
-automatiskt dessa kostnader. Den valbara flaggan `--profile-compiler` fördelar
-nu kompilatorarbetet mellan modellbygge, verifiering, förenkling,
-registerallokering, emission och den fulla frontendens kroppar.
-`--runtime-profile` räknar utförd allokerings- och kopieringstrafik i ett
-byggt program. Klockor och allokeringsräknare används i separata observationer;
-vanliga binärer används för tidsjämförelser.
-[Profileringskontrakt](incremental.md#mät-byggkedjans-faser).
+MIR-passet för ägarstädning följer oexponerade ägarceller genom
+kontrollflödet. Det tar bort redundanta städsekvenser där cellen är
+bevisat tom och överflödiga nollskrivningar vid retur.
+[Ägarpasset](../selfhost/mir/mir_owners.ddr)
 
 ## Övrig kodgenerering och runtime
 
@@ -932,7 +875,7 @@ självständig semantisk frontend för hela språket återstår.
 Byggkedjans valbara [fastider i text eller JSON](incremental.md#mät-byggkedjans-faser)
 gör kostnaden synlig. Optimeringar jämförs med samma källor och säkerhetsregler
 genom [`tools/performance.ddr`](../tools/performance.ddr). `--include-check` lägger till kontrolltider,
-och byggsviten omfattar även Tabell som fristående konsumentprojekt.
+och `--tabell` väljer Tabell som konsument för runtimesviten.
 Med samma binär i båda positionerna och
 `--baseline-flag=--scalar-opt=off` isoleras optimeringslägets effekt.
 
@@ -943,8 +886,3 @@ Wasm-instans och kontrollerar att de frigjorda blocken återanvänds.
 
 Tidigare prestandamätningar och de då använda kompilatorrevisionerna finns i
 [benchmarkarkivet](../benchmarks/results.md).
-Helfunktionskedjans [första byggmätning](../benchmarks/archive/2026-11-11-whole-function-mir/README.md)
-redovisar dess kostnad med identiska bilder och separat `check`.
-Konstantdivision och framefria funktioner förbättrar numerikkärnan;
-intervallbevis och registerjämförelser minskar sorteringens kontrollkostnad.
-Högre p95 i vissa arbetsfall redovisas separat från medianvinster.

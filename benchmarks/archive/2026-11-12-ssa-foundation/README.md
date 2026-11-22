@@ -155,7 +155,7 @@ All three consumer images matched exactly across both hosts and all rounds:
 [`policy-proof/metadata.json`](policy-proof/metadata.json) retains the separate
 out-of-band command trace and raw stdout/stderr. It includes the actual
 [`source.ddr`](policy-proof/source.ddr) and the exact
-[`acceptance-reference.py`](policy-proof/acceptance-reference.py) used for its
+[`acceptance-reference.py`](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-ssa-foundation/policy-proof/acceptance-reference.py) used for its
 independent integer results. Its `--timings=json` clock records are diagnostic
 observations used to inspect policy and actual counters; they are outside both
 latency distributions.
@@ -228,7 +228,7 @@ promoted internal calls with twelve arguments, text runtime calls, and a
 twelve-argument C call. Its image hash is identical to the preserved
 [`previous standard`](verification/abi/result-bbd35784aff9.json) and
 [`repair-only compiler`](verification/abi/result-f37d0ad2074e.json) results.
-The [`probe driver`](verification/abi/probe.py) reuses the existing independent
+The [`probe driver`](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-ssa-foundation/verification/abi/probe.py) reuses the existing independent
 assembly oracle in `tools/test-task-native.py`; source and generated C/assembly
 are preserved alongside the receipts.
 

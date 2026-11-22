@@ -2,22 +2,20 @@
 
 Dunder skriver ARM64/macOS, ARM64/Linux, x86-64/Linux, `wasm32`, `wasm32-wasi`
 och `x86_64-windows` (PE32+) med explicit målval. ELF, Mach-O, PE32+, systemanrop
-och kodgenerering ingår i kompilatorn. Alla backends arbetar direkt från
-verifierad och SSA-optimerad MIR: ARM64 emitterar maskinord direkt, medan
-[`x86_mir`](../selfhost/backend/x86_mir.ddr) och [`wasm_mir`](../selfhost/backend/wasm_mir.ddr)
-sänker MIR direkt till x86-64 respektive Wasm med lokaler och strukturerade hopp. Det finns ingen
-runtimeinterpreter. Läs [målplattformar och begränsningar](targets.md).
+och kodgenerering ingår i kompilatorn. Källfunktionerna går genom verifierad MIR. ARM64-backenden emitterar maskinord,
+x86-64/Linux använder `x86_mir` och Wasm-målen använder `wasm_mir`.
+Windows använder x86-sänkningen med Win64-ABI. Läs [målplattformar och begränsningar](targets.md).
 
 Grundkraven är native maskinkod, en egen verktygskedja, minnessäkerhet utan
-GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Aktuellt arbete och färdplan](next-steps.md)
+GC, snabb kompilering och självhosting. [Syntax](syntax.md) · [Fortsatt utveckling](next-steps.md)
 Automatisk frigöring för arrayer och strängar, POD-värden och lokal/helfunktions
 optimering (MIR-SSA, helfunktionsinlining, `BorrowHome`) ingår som standard.
-Native byggen kan dessutom bädda in DWARF v4-debuginformation (`-g`/`--debug`)
+Byggen för macOS och Linux kan bädda in DWARF v4-debuginformation (`-g`/`--debug`)
 samt använda [funktionscachen](incremental.md), och `dunder lsp` erbjuder språkserverstöd.
 
 ## Språkets kostnadsmodell
 
-Ett värde har en statiskt känd typ och layout. Första kärnan innehåller heltal med bestämd bredd, booleska värden, poster, fasta arrayer, slices, funktioner och strukturerat kontrollflöde. En slice består av en adress och en längd och lånar sin lagring. Anrop är direkta när målet är känt. Allokering, kopiering av ägda resurser och dynamisk dispatch ska gå att se där de väljs. Ett litet standardbibliotek får bero på operativsystemets gränssnitt.
+Ett värde har en statiskt känd typ och layout. Språket har bland annat heltal med bestämd bredd, booleska värden, poster, fasta arrayer, slices, funktioner och strukturerat kontrollflöde. En slice består av en adress och en längd och lånar sin lagring. Anrop är direkta när målet är känt. Allokering, kopiering av ägda resurser och dynamisk dispatch ska gå att se där de väljs. Ett litet standardbibliotek får bero på operativsystemets gränssnitt.
 
 Vanlig heltalsaritmetik kontrollerar overflow. Metoder som `wrapping_add` ger explicit omslagsaritmetik för exempelvis hashning. Felaktiga index och division med noll ska ha definierat beteende. Samma program har samma säkerhetsregler i alla byggprofiler. Bevisar kompilatorn att ett index ryms får den ta bort kontrollen.
 
@@ -30,10 +28,7 @@ städar ägda värden. Nästlade structar och aktiva enumpayloads städas rekurs
 Strängkloner och snapshotiteratorer behåller sin strängägare; lokala
 intervallvyer lånar i stället originalets lagring till blockslut.
 Referensräkningen är icke-atomär och omfattar enbart oföränderliga löv utan
-cykler. Det reviderar det tidigare designmålet att helt undvika
-referensräkning: strängkopior behåller nu billig delning och säker livslängd
-utan att hålla kvar alla strängar till processlut. Ingen spårande GC behövs.
-Läs [layout, allokering, tester och gränser](memory.md).
+cykler. Läs [layout, allokering, tester och gränser](memory.md).
 
 Lånemodellen omfattar funktionsparametrar, lokala läslån och delade
 returvärden vars livstid hör till en angiven parameter.
@@ -112,17 +107,11 @@ råpekarexponerande funktion. Direkt `addr` i explicit `unsafe` kan användas
 för att verifiera adressidentitet.
 
 Funktionscachen hoppar inte över dessa kontroller: källkroppar och lån
-kontrolleras även när färdig maskinkod kan återanvändas. HTTP-servern i
-testbädden `dunder-hundmat` provar hur lokala sökvägs- och bodyvyer kan ersätta
-separata offsetpar vid en API-gräns. Kompilatorns fragment-cache lånar tokenstavningar
-och läser nyckel, signatur och payload som lokala vyer ur en bytebuffert.
-Hashningen bygger uttryckligen sin ägda indatabuffert; wireformatet är
-oförändrat. Cacheproven verifierar 24 byteidentiska kalla/varma bilder, åtta
-värdkörningar och 166 atomiska avvisningar, inklusive ogiltig UTF-8.
-Detta är korrekthets- och representationskontrakt, utan nya prestandaanspråk.
+kontrolleras även när färdig maskinkod kan återanvändas. Kompilatorns fragmentcache lånar tokenstavningar
+och läser nyckel, signatur och nyttolast som vyer ur en bytebuffert.
 [Körbara låneprov](../tools/test_local_borrows.ddr).
 
-På alla tre nativa mål kan isolerade uppgifter köras på flera trådar.
+På macOS och Linux kan isolerade uppgifter köras på flera trådar.
 Typkontrollen begränsar vilka data och effekter en uppgift får använda.
 Runtimen kopierar indata och resultat mellan separata allokeringsarenor.
 [Uppgifter och ägarskap](tasks.md)
@@ -185,7 +174,7 @@ publikt C-ABI. Se [målplattformarna](targets.md) för verifiering och begränsn
 Med `--incremental` lagras maskinkodsfragment och symboliska korrigeringsposter.
 Cacheidentiteten omfattar den körande kompilatorn.
 Kompilatorn kontrollerar hela källträdet inför varje bygge. Tester jämför
-varma och rena bilder byte för byte på alla tre native-mål.
+varma och rena bilder byte för byte på de tre bootstrapmålen.
 [Användning och cachekontrakt](incremental.md).
 
 ## Återbyggnad

@@ -379,17 +379,14 @@ allokerings- och retainräknare, livstidsfel, intervall och UTF-8; den gör inga
 prestandamätningar.
 
 Kontrakts- och ägarskapssviterna är skrivna i Dunder
-(`tools/test_runtime_contracts.ddr`, m.fl.) med Node för Wasm-proven. Tio minnesprov håller
-bland annat arraykopior, nästlade enumvärden, lånade parametrar, snitt och
-strängreturer levande medan andra värden ersätts eller frigörs. Exempelvis
-kopierar ett prov en array med 1 024 `i64` i 200 000 varv. Ett annat tar emot
-en miljon dynamiska strängreturer. Alla tio kontrollerar resultatet och
-kräver under 96 MiB maximal RSS på det nativa värdmålet.
-[Dunder-programmen](../tests/contracts/). För Wasm kör Node separata prov för
+(`tools/test_runtime_contracts.ddr`, m.fl.) med Node för Wasm-proven. Minnesproven håller
+bland annat arraykopior, nästlade enumvärden och strängreturer levande medan
+andra värden ersätts eller frigörs. På värdmålet kontrolleras resultat och
+maximal RSS för de minnesbegränsade fallen. [Dunder-programmen](../tests/contracts/). För Wasm kör Node separata prov för
 bland annat minnesoperationer och arrayer. [Wasm-målet](targets.md#webassembly)
 
-Testverktyget jämför även heltal, flyttalsbitar, decimalformatering, UTF-8,
-mappar, mängder och sortering med oberoende Python-beräkningar. Felproven
+För heltal, flyttalsbitar, UTF-8 och samlingar finns
+[körbara referensfall](../tests/fixtures/runtime_contracts/). Felproven
 kontrollerar status och exakt utskrift före felet. Med `--case string_returns`
 körs ett enskilt prov. Vid körning med en emulator kan `--runner` ange
 programmet som startar målbinären. RSS-gränsen gäller när målbinären körs direkt.
@@ -449,22 +446,6 @@ och de ogiltiga exemplen under `tests/fixtures/region_errors/`.
 `[]u8` använder en byte per element. `std.bytes.append_utf8` och
 `std.bytes.decode` arbetar med packade buffertar. Tabells CSV-fält, SHA-256
 och selfhost-kompilatorns kodbild och signatur använder samma representation.
-`sys.write_u8` och `sys.decode_u8` tar `&[]u8`. Äldre `&[]i32`-buffertar
+`sys.write_u8` och `sys.decode_u8` tar `&[]u8`. `&[]i32`-buffertar
 konverteras mellan representationerna med `std.bytes.from_i32` och
 `std.bytes.to_i32`.
-
-Ett prov med 8 388 608 element rapporterade 9 912 320 byte maximal RSS med
-`[]u8` och 35 078 144 byte med `[]i32` på Apple M5 och macOS 27.2.
-Värdena är medianer av fem processer per variant byggda med den självhostade
-Stage 3-kompilatorn den 10 november 2026.
-
-Bygg provet igen med `i32` på båda ställen för fyrabytesvarianten.
-
-```dunder
-fn main() {
-    mut data: []u8 = []
-    data.reserve(8388608)
-    for i in 0..8388608 { data.push(u8(i % 256)) }
-    print(data[8388607])
-}
-```

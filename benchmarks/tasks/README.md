@@ -70,37 +70,14 @@ contains median, nearest-rank p95 and median per-round speedup over capacity 1.
 flags, environment, hardware and limits. No geometric aggregate or C claim is
 produced. Source/compiler/manifest/image changes fail the run.
 
-## Separate serial compiler gate
+## Comparing compiler output
 
-Run the existing compiler harness from the **same frozen feature source
-checkout** for both binaries; its script location determines the source root:
-
-```sh
-python3 /path/to/feature-checkout/tools/performance.py \
-  /path/to/whole-function-objects-final /path/to/frozen-task-compiler \
-  /path/to/empty/compiler-report --suite compiler --include-check --rounds 30
-```
-
-The serial baseline must have SHA256
-`2a0a78477985a6f7542cd90278743bde96d5591bd8e6f50d0c2b702f55dc6020`.
-Generated modules, the actual selfhost compiler and Tabell are built and checked
-in alternating baseline/candidate order, including check-only cases. Samples
-use default safety checks, fresh processes, fresh outputs, no incremental cache
-and no timing/profile flags. Report every median/p95 overhead, including small
-regressions. Generated compilation must retain the 100000 lines/s p95 gate.
-
-Before recording, compile the unchanged 4 runtime kernels with both compilers
-and compare images, and require matching baseline/candidate hashes for all
-normal emitted compiler-suite images. If normal images differ, investigate
-before claiming semantic-hook overhead only. No runtime C timing rerun is
-needed when images are identical. Compiler timing and task throughput are
-separate observations and must be reported separately.
-
-The untimed preflight enforces that image gate and validates every consumer:
+To check whether a compiler change preserves the generated binaries, run
+the untimed image comparison on a single source checkout. The tool builds
+the runtime kernels, a generated corpus and the serial compiler with both
+binaries, runs the programs and compares image hashes.
 
 ```sh
-dunder run tools/check_performance_images.ddr -- /path/to/whole-function-objects-final \
-  /path/to/frozen-task-compiler /path/to/empty/image-report \
-  --source-root /path/to/feature-checkout \
-  --baseline-sha256 2a0a78477985a6f7542cd90278743bde96d5591bd8e6f50d0c2b702f55dc6020
+dunder run tools/check_performance_images.ddr -- /path/to/baseline \
+  /path/to/candidate build/image-report --source-root .
 ```

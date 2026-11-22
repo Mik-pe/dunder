@@ -1,9 +1,4 @@
 #!/bin/sh
-# Fast language-development loop: incremental 1-stage compiler build + parallel core suites.
-# Usage:
-#   ./tools/dev.sh                    # rebuild dev compiler + run fast core suites in parallel
-#   ./tools/dev.sh --filter <substr>  # rebuild dev compiler + run all matching suites in parallel
-#   ./tools/dev.sh --full             # rebuild dev compiler + run full verification matrix in parallel
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"

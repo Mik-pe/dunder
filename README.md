@@ -7,9 +7,9 @@
 Dunder är ett statiskt typat språk med filändelsen `.ddr`. Kompilatorn är
 skriven i Dunder och bygger program för ARM64/macOS, ARM64/Linux, x86-64/Linux,
 Windows x86-64 (`x86_64-windows`), WebAssembly (`wasm32`) och WASI (`wasm32-wasi`).
-För nativa program sköter den också länkningen, valfri DWARF-debuginformation (`-g`)
-och macOS-signering, och levereras med formaterare (`dunder fmt`) samt inbyggd
-språkserver (`dunder lsp`).
+Kompilatorn länkar nativa program och signerar macOS-binärer. På macOS och Linux
+kan bygget bädda in DWARF-debuginformation med `-g`. Verktygskedjan innehåller
+också en formaterare (`dunder fmt`) och en språkserver (`dunder lsp`).
 
 ```dunder
 @test {
@@ -26,7 +26,7 @@ fn main() {
 
 ## Bygg och kör
 
-Kör från repots rot på någon av de tre nativa plattformarna. Frökompilatorn
+Kör från repots rot på ARM64/macOS, ARM64/Linux eller x86-64/Linux. Frökompilatorn
 för värden följer med repot och kan bygga kompilatorn offline.
 
 ```sh
@@ -70,8 +70,7 @@ standardbiblioteket i riktiga program. [dunder-hundmat](https://github.com/Mik-p
 ## Kompilatorutveckling
 
 `./tools/dev.sh` gör ett inkrementellt bygge och kör kärntesterna. Kör
-`./tools/verify-selfhost.sh` för ett fullständigt självbygge och verifiering av
-kompilatorn, målprogrammen och diagnostiken. Sviten använder Python 3.11 eller
-senare, Node för Wasm, en C-kompilator för ABI-proven samt Git, curl, gzip och OpenSSL.
+`./tools/verify-selfhost.sh` för ett bygge från fröet och kompilatorns ordinarie
+verifiering. Testverktygen är skrivna i Dunder. [Testnivåer och systemverktyg](selfhost/README.md#verifiering)
 
-[Guide till kompilatorkoden](selfhost/README.md) · [Arkitekturöversikt](docs/arkitektur.md) · [Bootstrap från frö](bootstrap/README.md) · [Inkrementell kompilering](docs/incremental.md) · [Aktuellt arbete](docs/next-steps.md)
+[Guide till kompilatorkoden](selfhost/README.md) · [Arkitekturöversikt](docs/arkitektur.md) · [Bootstrap från frö](bootstrap/README.md) · [Inkrementell kompilering](docs/incremental.md) · [Utvecklingsområden](docs/next-steps.md)

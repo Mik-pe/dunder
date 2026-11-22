@@ -4,7 +4,7 @@ This is a static machine-code/source audit, not a runtime experiment. No benchma
 
 ## What remains in the actual instructions
 
-The counts below describe **selected feasible control paths**, mechanically checked against branch targets/fallthrough by `classify.py`. They are not measured frequencies, whole-loop averages, throughput estimates or instruction-count speedup predictions. Full disassembly and exact path address lists are retained.
+The counts below describe **selected feasible control paths**, mechanically checked against branch targets/fallthrough by [the classifier](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-ssa-pruned/runtime-gap/classify.py). They are not measured frequencies, whole-loop averages, throughput estimates or instruction-count speedup predictions. Full disassembly and exact path address lists are retained.
 
 | Path hypothesis | Off instructions | On instructions | C instructions | Remaining on-path data traffic |
 |---|---:|---:|---:|---|

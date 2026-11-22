@@ -181,7 +181,7 @@ Alla ursprungliga CSV-radbrytningar, commands.jsonl, loggar och övrig råmetada
 förlustfritt som gzip; den dekomprimerade bytemängden är identisk med originalet. [archive-manifest.json](archive-manifest.json) binder
 kopiorna till sina orörda original; [checksums.sha256](checksums.sha256) täcker
 arkivfilerna. [source-hashes.json](source-hashes.json) innehåller hela den
-uppmätta källhashmängden och utvalda frysta käll-/verktygssnapshots. Komplett
+uppmätta källhashmängden och [frysta källor och mätverktyg](https://github.com/Mik-pe/dunder/tree/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-regional-workers/snapshots). Komplett
 källa och redan committade fixtures finns i Git-revision 073856c. Körbara
 binärpayloads är utelämnade; bilderna och producenterna har SHA-256 i kvittona.
 Absoluta ursprungssökvägar i råmetadata är avsiktligt oförändrade.

@@ -9,17 +9,16 @@ dunder_bin="$(./tools/bootstrap.sh)"
 
 Skriptet väljer ett fryst Dunder-frö för värddatorn, kontrollerar den
 komprimerade filens SHA-256 och bygger den seriella ingången i `selfhost/`.
-Den nya kompilatorn bygger samma källor igen. När kodgeneratorn har ändrats
-kan ytterligare ett bygge behövas; två efterföljande binärer måste vara
-byteidentiska innan den seriella fixpunkten godtas.
-
-Den verifierade kompilatorn bygger sedan `selfhost/main_parallel.ddr`.
-Skriptet jämför den seriella kompilatorns resultat med den taskbaserade
-kompilatorns självbyggen vid `--jobs 1` och `--jobs 4`. När alla tre binärer
-är byteidentiska publiceras `build/selfhost/<värdmål>/dunder` atomiskt.
+Den seriella kompilatorn bygger både sin egen ingång och
+`selfhost/main_parallel.ddr`. Den parallella kompilatorn bygger sedan om sig
+själv med `--jobs 4`. Resultatet måste vara byteidentiskt med den seriella
+kompilatorns bygge av samma ingång. Om de första två seriella binärerna
+skiljer sig bygger den parallella kompilatorn även den seriella ingången
+och jämför resultatet med det senaste seriella bygget. Efter godkända
+jämförelser publiceras `build/selfhost/<värdmål>/dunder` atomiskt.
 [Arbetsbudget och kompilatorjobb](../docs/tasks.md#kompilatorn-som-taskkonsument)
 
-`--serial` publicerar enbart `build/selfhost/<värdmål>/dunder-serial`.
+`--serial` kontrollerar fixpunkten med enbart seriella självbyggen och publicerar `build/selfhost/<värdmål>/dunder-serial`.
 Båda kompilatoringångarna kan korskompilera till alla sex mål.
 
 ```sh
@@ -51,7 +50,3 @@ Tabellen anger SHA-256 för den **uppackade** kompilatorn. Syskonfilerna
 Varje frö verifierades med byteidentiska självbyggen. Linuxfröna är
 dessutom byteidentiska med macOS-kompilatorns korsbyggen. Linuxmålen
 kördes i lokala Docker-containrar med x86-64 emulerat på ARM64.
-
-För att utveckla från en ren utcheckning behövs det incheckade fröet för
-värden. Den äldre Rust-implementationen och dess ursprungliga testsvit finns
-i projekthistoriken vid [deb48dd](https://github.com/Mik-pe/dunder/tree/deb48dd).

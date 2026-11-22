@@ -3,7 +3,7 @@
 Den aktuella självhostade kompilatorn mäts med
 [`tools/performance.ddr`](../tools/performance.ddr).
 Den jämför två Dunder-kompilatorer med fyra runtimeprogram, ett genererat
-byggkorpus, kompilatorns egen källkod och Tabell. Varje binärs resultat verifieras.
+byggkorpus, kompilatorns egen källkod och, med `--tabell`, även Tabell. Varje binärs resultat verifieras.
 Verktyget sparar råtider, median, p95, binärstorlek och SHA-256.
 
 ```sh
@@ -36,3 +36,5 @@ dunder run tools/performance_compiler_matrix.ddr -- /path/to/baseline \
 
 `--mode workers` kräver identiska kompilatorbinärer och ett rundantal
 delbart med sex. Mätlägena sparar råprover, per-process-RSS och parade kvoter.
+
+[Mätmetod och mål](../docs/prestanda.md) · [Daterade resultat och rådata](results.md)

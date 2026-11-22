@@ -1,116 +1,9 @@
 # Så mäter vi Dunder
 
-## Nativ kodgenerering den 15 november 2026
-
-På Apple M5 gick medianen för ett helt bygge av samma kompilatorkälla från
-547,51 till 458,91 ms. En kontroll med identisk kompilatorkälla i båda
-binärerna isolerar effekten av maskinkoden på självbygget (548,22 till
-477,19 ms). Det syntetiska korpuset med identiska funktionskroppar nådde
-1,25 miljoner källrader/s vid medianen. Varianten med unika kroppar och
-blandade uttryck nådde 455 348 källrader/s. Runtimeserien jämför genererade
-Dunder-program över 30 mätpar. [Byggtider, kontroll och runtimeresultat](../benchmarks/compiler/2026-11-15-native-code/README.md)
-
-## Tidigare mätningar
-
-Den [regionala IR-/workermätningen](../benchmarks/archive/2026-11-12-regional-workers/README.md)
-bevarar 1 260 prover: tidigare mot ny standard med fyra workers samt samma
-nya binär med en, två och fyra workers. SSA är av i samtliga jämförelser.
-
-| Arbetsfall | 1 worker, median/p95 ms | 4 workers, median/p95 ms |
-| --- | ---: | ---: |
-| Genererat bygge | 982,428 / 987,013 | 623,820 / 625,539 |
-| `selfhost/main.ddr` | 1 023,754 / 1 025,300 | 823,461 / 826,993 |
-| `selfhost/main_parallel.ddr` | 1 186,908 / 1 189,227 | 971,125 / 975,632 |
-| Tabell | 20,488 / 21,590 | 18,153 / 19,042 |
-| Hello | 5,343 / 5,875 | 5,390 / 5,656 |
-| Owned | 5,970 / 6,796 | 5,743 / 8,545 |
-
-Fyra workers ger 1,57×, 1,24× och 1,22× i de tre större fallen.
-Det dåvarande paketet var 0,64–1,56 procent långsammare i byggmedian
-än tidigare standard med fyra workers. Dess minnestopp minskar i större
-fall. Alla råsvansar, inklusive owned-fallets sämre p95, finns kvar.
-Genererat bygge når 161 499 rader/s vid p95 med fyra workers; alla tre
-workerantal klarar 100 000-gränsen. Separata `check`-prover är seriella
-kontroller. Kontrollerade runtimebilder är byteidentiska, så ingen ny
-C-runtimevinst påstås. Frontenden var då fortsatt seriell; C-målet är öppet.
-
-Den tidigare [glesa SSA-v2-mätningen](../benchmarks/archive/2026-11-12-ssa-pruned/README.md)
-har 1 440 prover över tre separata jämförelser på samma frysta källor.
-Med SSA på i båda kompilatorerna minskar byggmedianen 27,65 procent för
-kompilatorkorpuset och 8,48 procent för Tabell mot tidigare SSA; Tabells
-p95 ökar samtidigt 20,41 procent. Samma nya kompilator med SSA av/på ger:
-
-| Arbetsfall | SSA av, median/p95 ms | SSA på, median/p95 ms | Medianförändring |
-| --- | ---: | ---: | ---: |
-| Genererat bygge | 619,219 / 620,729 | 624,279 / 631,928 | +0,82 % |
-| Kompilatorkorpuset | 785,522 / 788,351 | 952,521 / 954,722 | +21,26 % |
-| Tabell | 18,054 / 18,621 | 23,375 / 25,484 | +29,47 % |
-
-SSA på klarar 100 000-gränsen för genererat bygge vid p95 med 159 866
-rader/s. Runtime/C-geomedlet är 1,1841 på mot 1,1883 av; text och sort
-med passet på ligger på 1,3376 respektive 1,2649. C-gränserna är alltså
-öppna. Då förblev SSA av som standard; MIR-SSA är numera standard på och
-stängs av med `--mir-ssa=off`. En separat av/av-serie ger 0,28–0,69
-procent högre byggmedian med byteidentiska konsumenter; p95-regressioner
-och alla råsvansar finns kvar i rapporten. Kompilatorkorpuset avser den
-seriella ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
-
-Den historiska [SSA-v1-mätningen](../benchmarks/archive/2026-11-12-ssa-foundation/README.md)
-har 30 försök per variant på ARM64/macOS. Samma kompilator med SSA av/på
-gav följande byggmedianer i millisekunder:
-
-| Arbetsfall | SSA av | SSA på | Förändring |
-| --- | ---: | ---: | ---: |
-| Genererat bygge | 606,871 | 613,026 | +1,01 % |
-| Kompilatorkorpuset | 762,977 | 1 304,080 | +70,92 % |
-| Tabell | 17,564 | 25,001 | +42,34 % |
-
-Alla fyra runtimebilder ändrades, men runtime/C-geomedlet blev 1,181 mot
-1,178 med SSA av. En separat SSA-optimerad kompilatorbinär, med samma
-användarpolicy SSA av, ändrade byggmedianerna mindre än 0,3 procent och gav
-sämre p95 i flera fall. Varken standardprofilen eller bootstrapens
-producentprofil ändras på detta underlag. SSA var då valbart med
-`--mir-ssa=on` och är numera standard på; C-målet är öppet.
-Kompilatorkorpuset är fortsatt den seriella
-ingången `selfhost/main.ddr`, inte hela bootstrapkedjan.
-
-Den tidigare [parallella kompilatormätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
-har 30 försök per variant på ARM64/macOS. Den skiljer två jämförelser:
-samma taskbaserade kompilator med en respektive fyra workers, och tidigare
-seriell kompilator mot den nya standarden med fyra workers. Tabellen visar
-medianer i millisekunder; den första jämförelsen isolerar workerantalets effekt.
-
-| Arbetsfall | Samma binär: 1→4 workers | Tidigare seriell → ny standard med 4 |
-| --- | --- | --- |
-| Genererat bygge | 953,718 → 609,106 | 953,519 → 615,609 |
-| Självbygge | 874,940 → 709,677 | 862,428 → 712,768 |
-| Tabell | 20,284 → 18,017 | 20,069 → 18,048 |
-
-Självbygget avser det fasta kompilatorkorpuset `selfhost/main.ddr`, som
-skriver den seriella kompilatoringången. Tiden för `main_parallel.ddr`
-och hela frö-/fixpunktkedjan i `bootstrap.sh` ingår inte i dessa värden.
-
-Den dåvarande standardkandidatens genererade p95 var **619,768 ms**, motsvarande
-**163 003 källrader/s**. Det klarar 100 000-gränsen för det uppmätta
-genererade korpuset. Frontend, sänkning, ordnad sammanfogning och publicering
-ingår; enbart MIR-verifiering och optimering körs parallellt. `check` och
-kompilatorprofilering använder fortsatt den delade seriella vägen.
-
-Runtimebilderna var byteidentiska i den jämförelsen. Den gav
-geometriskt medel **1,178×** och största kvoten **1,308×**, över målen
-1,10× och 1,25×. Snabbare kompilering innebär därför inte att hela
-acceptanskontraktet nedan är uppfyllt. Tidigare
-[taskmätningar](../benchmarks/archive/2026-11-12-isolated-tasks/README.md) redovisar
-språkets isolerade arbetsfall och den dåvarande seriella byggkostnaden
-separat från denna kompilatormätning.
-
-Den lokala [runtime-sviten](../benchmarks/runtime/README.md) jämför nu
-baseline och optimerad maskinkod med fyra frysta arbetsfall, oberoende
-resultatreferenser och 30 växelvisa körningar. Den är ett avgränsat
-före/efter-prov. Fyra arbetsfall har också jämförts med clang `-O3` och
-`-O3 -ftrapv` på ARM64/macOS. Acceptansgränserna nedan återstår.
-
-Två egenskaper hör ihop. Den optimerade **standardprofilen** ska både bygga minst 100 000 källrader/s och ge konkurrenskraftig körprestanda. Samma kompilatorrevision, säkerhetsregler och profil ska användas för båda mätningarna. Siffrorna nedan är acceptansgränser. [Byggmätningar och råvärden](../benchmarks/results.md) skiljer genererat stresskorpus, självbygge och verkliga konsumenter åt; hela kontraktet är ännu inte uppfyllt.
+Målet för standardprofilen är minst 100 000 källrader per sekund vid ett
+rent bygge och konkurrenskraftig körprestanda med säkerhetskontrollerna
+påslagna. Använd samma kompilatorrevision och profil för båda mätningarna.
+[Mätverktyg](../benchmarks/README.md) · [Daterade resultat](../benchmarks/results.md)
 
 ## Från kommando till färdig ARM64-binär
 
@@ -128,7 +21,7 @@ Referensmaskinen till att börja med är en Apple M5 med 24 GiB minne. Publicera
 
 Räkna fysiska källrader med minst en språktoken i de moduler som faktiskt ingår. Blankrader och rena kommentarer bidrar aldrig till täljaren. Varje fil räknas en gång. Publicera även antal byte, token och funktioner, slutlig binärstorlek, toppminne samt tid per fas. För inkrementella byggen är millisekunder och faktiskt ombyggda funktioner mer meningsfulla än rader/s.
 
-Lås en korpus med importer, externa och interna anrop, heltalskod, slices, poster, villkor, loopar, temporärer och lån. Låt en körbar testdrivrutin anropa kod från alla delar och kontrollera resultatet. Märk genererad stresskod separat och särredovisa ett bygge av den självhostade kompilatorn så snart den finns. En tokenizer eller 100 000 identiska deklarationer kan hjälpa vid felsökning men kvalificerar inte som bevis för helkompilatorn.
+Lås en korpus med importer, externa och interna anrop, heltalskod, slices, poster, villkor, loopar, temporärer och lån. Låt en körbar testdrivrutin anropa kod från alla delar och kontrollera resultatet. Märk genererad stresskod separat och särredovisa ett bygge av den självhostade kompilatorn från samma revision. En tokenizer eller 100 000 identiska deklarationer kan hjälpa vid felsökning men kvalificerar inte som bevis för helkompilatorn.
 
 Kör minst 30 försök för vanliga arbetsfall. Publicera råvärden, median och p95 samt arbetsordningen. Återställ ändringar, cache och utdata utifrån arbetsfallet inför varje försök. Använd innehållsändringar som påverkar resultatet. Byggtider med enbart varm Dunder-cache underkänner ett anspråk om ren byggprestanda.
 

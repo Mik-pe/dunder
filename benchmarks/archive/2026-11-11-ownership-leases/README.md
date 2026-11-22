@@ -121,6 +121,6 @@ den tidigare kompilatorn. Linuxkörning har inte gjorts i denna etapp.
 
 Nästa numeriska mekanism är generell konstantdivision/rest med exakt
 signerad semantik. För större compilerkostnader finns en
-[konkret plan för ägar-IR och CFG](../../../docs/ownership-ir-plan.md): först
+[konkret plan för ägar-IR och CFG](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/docs/ownership-ir-plan.md): först
 verifierad analys, därefter borttagning av bevisat tom cleanup. Båda ska
 bedömas med samma byggbudget och säkerhetsregler.

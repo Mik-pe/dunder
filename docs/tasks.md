@@ -335,14 +335,4 @@ enums och inline C-layout är stoppunkter. Lokaler och fältprojektioner
 är skild från språkets allmänna ägarflyttar. Isoleringskopiorna vid
 spawn/join behövs fortfarande mellan workerarenorna.
 
-Den historiska [parallella kompilatormätningen](../benchmarks/archive/2026-11-12-parallel-compiler/README.md)
-skiljer samma binär med en respektive fyra workers från jämförelsen med
-den dåvarande seriella kompilatorn. Rapportens genererade bygge med fyra
-workers nådde p95 619,768 ms, motsvarande 163 003 källrader/s. Runtimebilderna är
-identiska; runtime/C-geomedlet är 1,178× och största kvoten 1,308×.
-Det återstående C-målet löses inte av snabbare kompilering. Rapporten
-föregår regional SSA och worker-lokal sänkning och mäter inte deras kostnad.
-
-Den tidigare [språkmätningen med 30 rundor](../benchmarks/archive/2026-11-12-isolated-tasks/README.md)
-visade 3,59× och 3,78× parad förbättring i två rena taskarbetsfall. Den
-redovisar separat vad själva taskstödet kostade seriella program.
+[Mätning av taskprogram](../benchmarks/tasks/README.md) · [Kompilatormätningar](../benchmarks/results.md)

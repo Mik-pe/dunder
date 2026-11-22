@@ -107,9 +107,9 @@ samma flyttal. `0.1` skrivs som `0.1` för båda typerna. Fast notation får
 16 använder exponentform, exempelvis `1e-5` och `1e+20`. Specialvärden
 skrivs `nan`, `inf`, `-inf`, `0.0` och `-0.0`.
 
-Återläsningen verifieras med Pythons flyttalsparser och binärrepresentation.
-Formatbredd och valbar precision återstår. Formatteraren använder
-exakt heltalsarbete; den har ännu inget uppmätt prestandamål.
+Kontraktsprovet läser tillbaka decimaltexten med `strtod` och jämför
+bitmönstret vid den ursprungliga typens precision. [Formateringsprovet](../tools/test_runtime_contracts.ddr)
+
 Utskriftssträngar använder den delade heapen.
 Direkt utskrift frigör sin formatteringssträng efter skrivningen;
 `.str()` returnerar ett referensräknat värde. Se [minnesmodellen](memory.md).

@@ -409,7 +409,8 @@ dunder run tools/test_io.ddr -- "$(command -v dunder)"
 dunder run tools/test_alloc.ddr -- "$(command -v dunder)"
 ```
 
-Tester jämför map, set och sortering mot Pythons referensresultat. De
+Testerna jämför map, set och sortering mot förväntade värden i en
+[körbar fixtur](../tests/fixtures/runtime_contracts/map_set_sort.ddr). De
 provar även Unicode och NUL, olika elementbredder, djupa värdekopior,
 callbacks och aliasfel.
 SHA-256 kontrolleras mot referensvektorer och används av den

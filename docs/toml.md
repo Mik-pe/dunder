@@ -113,5 +113,4 @@ syskonlänkar och behöver inte söka igenom hela arenan för varje nod.
 `dunder run tools/test_toml.ddr -- KOMPILATOR` kontrollerar publika resultat mot
 oberoende dataorakel. `--runner TARGET=COMMAND` kan lägga till lokala
 Linuxkörningar, och `--toml-test DIR` använder ett separat uppackat
-`toml-test`-korpus. Ingen Pythonkod används av biblioteket, testsviten eller
-programmen som byggs med det.
+`toml-test`-korpus.

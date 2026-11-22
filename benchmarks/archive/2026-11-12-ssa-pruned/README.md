@@ -124,7 +124,7 @@ with 11 cells, 14 removed loads and 17 copies. These functional builds are
 outside the latency series. Their raw instrumented compiler JSON is preserved
 only for policy/codegen counters; incidental clock fields are not analyzed.
 
-The archived `verification/abi/probe.py` assumes a work directory three levels
+The archived [probe driver](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-ssa-pruned/verification/abi/probe.py) assumes a work directory three levels
 below the repository root, such as `build/reproduce-ssa/abi`. Copy it and its
 sources there before rerunning; it writes a dylib and embeds its absolute path,
 so a different directory can change image hashes. Binary/dylib payloads are
@@ -134,10 +134,10 @@ current reproduction entrypoint.
 ## Static evidence for the next value backend
 
 The [`text/sort audit`](runtime-gap/README.md) records six exact measured-image
-identities, raw disassembly, source snapshots and mechanically checked selected
+identities, raw disassembly, [source snapshots](https://github.com/Mik-pe/dunder/tree/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-ssa-pruned/runtime-gap/source) and mechanically checked selected
 branch paths. On/C images were reconstructed without executing them, and their
 SHA-256 values had to match the timing metadata exactly. The archived
-[`classifier`](runtime-gap/classify.py) reproduces the path tables. These are
+[`classifier`](https://github.com/Mik-pe/dunder/blob/e67fa3d887be84a99707c20d5266105c43edb93a/benchmarks/archive/2026-11-12-ssa-pruned/runtime-gap/classify.py) reproduces the path tables. These are
 conditional static counts, not runtime frequencies or instruction-count speedups.
 
 Text still uses the expression stack and a frame bool after the setup calls;

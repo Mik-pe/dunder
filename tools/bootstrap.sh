@@ -1,5 +1,4 @@
 #!/bin/sh
-# Rebuild Dunder from the frozen compiler for this host.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
@@ -36,20 +35,14 @@ chmod 755 "$work/seed"
 if [ "$serial_only" -eq 1 ]; then
     "$work/stage2" build "selfhost/$entry.ddr" -o "$work/stage3" >&2
     if ! cmp -s "$work/stage2" "$work/stage3"; then
-        # A new compiler can intentionally change its own emitted code. Rebuild
-        # once more with the new emitter, then require an identical fixed point.
         "$work/stage3" build "selfhost/$entry.ddr" -o "$work/stage4" >&2
         cmp "$work/stage3" "$work/stage4"
     fi
-    # The frozen seed only needs the serial entry's syntax and dependencies.
-    # Keep that verified compiler as a recovery path and producer for the
-    # task-capable entry. Never replace the standard binary on a failed build.
     mv -f "$work/stage3" "$dir/dunder-serial"
     printf '%s\n' "$root/$dir/dunder-serial"
     exit 0
 fi
 
-# Build the serial entry and task-capable parallel entry concurrently from stage2.
 "$work/stage2" build "selfhost/$entry.ddr" -o "$work/stage3" >&2 &
 s3_pid=$!
 "$work/stage2" build selfhost/main_parallel.ddr -o "$work/stage2-par" >&2 &
@@ -58,9 +51,6 @@ s3_rc=0; wait "$s3_pid" || s3_rc=$?
 p2_rc=0; wait "$p2_pid" || p2_rc=$?
 [ "$s3_rc" -eq 0 ] && [ "$p2_rc" -eq 0 ]
 
-# Verify fixed-point identity for both serial and parallel compilers using the
-# newly built 4-worker compiler so stage3==stage4 and serial-produced==four-workers
-# execute concurrently.
 if ! cmp -s "$work/stage2" "$work/stage3"; then
     "$work/stage2-par" build "selfhost/$entry.ddr" --jobs 4 -o "$work/stage4" >&2 &
     fp_pid=$!
