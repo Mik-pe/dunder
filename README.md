@@ -47,8 +47,9 @@ korsbyggs på macOS. Verifiering av hela kompilatorn på Windows återstår.
 
 ## Bygg från källkod
 
-Kör från repots rot på ARM64/macOS, ARM64/Linux eller x86-64/Linux. Frökompilatorn
-för värden följer med repot och kan bygga kompilatorn offline.
+Projektets release byggs från fröet på ARM64/macOS. Macens kompilator bygger
+även Linuxbinärerna, som körs i Kiri. För egna offlinebyggen finns frön
+för ARM64/macOS, ARM64/Linux och x86-64/Linux. Kör från repots rot.
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
