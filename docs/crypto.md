@@ -3,11 +3,17 @@
 `std.crypto` provides bounded random bytes, Argon2id password hashes,
 HMAC-SHA256, HKDF-SHA256, constant-time byte equality, hex decoding,
 AES-256-GCM authenticated encryption, Ed25519 signatures, and explicit
-secret zeroization (`zeroize`, `SecretBytes`). Native random, Argon2id,
-AES, and Ed25519 load the installed system libraries dynamically at runtime
-without hardcoded compiler paths. HMAC and HKDF build on Dunder's SHA-256 implementation.
+secret zeroization (`zeroize`, `SecretBytes`). Argon2id uses libargon2. AES and
+Ed25519 use OpenSSL. Each loads its library when called. HMAC and HKDF
+build on Dunder's SHA-256 implementation.
 
-`random(count)` returns `Result<[]u8, string>`, with at most 1 MiB per call.
+`std.random.bytes(count)` returns `Result<[]u8, sys.IoError>` with at most
+1 MiB per call. `std.random.fill(&mut buffer)` fills existing storage and takes
+no additional capability in the calling module. On error it may have filled a
+prefix. Discard the contents on failure. The source is the operating system:
+`getrandom` on Linux, `arc4random_buf` on macOS, `BCryptGenRandom` on Windows,
+and `random_get` on WASI. Bare Wasm returns `.Unsupported` for nonempty requests.
+`crypto.random(count)` uses the same source and returns `Result<[]u8, string>`.
 `decode_hex(value)` returns `Result<[]u8, string>`.
 `argon2id_hash(password)` returns `Result<string, string>` containing
 a PHC string with time cost 2, memory cost 19,456 KiB, one lane, a random
