@@ -15,9 +15,17 @@ självbyggena jämförs. Alla tre värdar bygger [samma kompilator](main.ddr).
 1. [Drivrutinen](driver/driver.ddr) läser manifest och väljer mål.
    [Modulladdaren](driver/modules.ddr) löser importer och bevarar källpositionerna
    så att ett fel pekar på rätt fil, rad och kolumn.
-2. [Frontenden](frontend/compile.ddr) samlar deklarationerna och typkontrollerar
-   också funktioner utan anropare. [Funktionskontexten](frontend/frontend_context.ddr)
-   håller det tillstånd som behövs för en kropp. [Ägartillstånd](frontend/ownership_state.ddr)
+2. [Frontenden](frontend/compile.ddr) samlar programmets funktioner, metoder och
+   konstanter i [deklarationstabellen](frontend/declarations.ddr). Metodindexet
+   pekar på den funktion som deklarerar metoden för mottagartypen. Sedan
+   typkontrolleras varje funktionskropp, även om den saknar anropare.
+   [Funktionskontexten](frontend/frontend_context.ddr) håller reda på lokaler
+   och aktiva loopar. Varje loop anger vart `break` och `continue` går och
+   vad som ska städas på vägen. Ett [`defer`-block](frontend/deferred_blocks.ddr)
+   håller sina fångade ägare låsta tills blocket har körts. Vid ett fel
+   [återställer frontenden](frontend/statement_recovery.ddr) stackarna till
+   början av satsen och fortsätter kontrollen vid nästa sats.
+   [Ägartillstånd](frontend/ownership_state.ddr)
    och [lånekontroll](frontend/local_borrows.ddr) avgör vilka platser som får läsas,
    flyttas eller ändras. [Minnesmodellen](../docs/memory.md) beskriver språkreglerna.
 3. För nåbara funktioner kan [skaläroptimeraren](opt/) förenkla typade uttryck.
@@ -32,8 +40,8 @@ självbyggena jämförs. Alla tre värdar bygger [samma kompilator](main.ddr).
 ## Tasks i kompilatorn
 
 [Samordnaren](tasks/compile_parallel.ddr) kan typkontrollera och sänka flera
-funktioner samtidigt. Arbetarna delar en fryst deklarationsbild och använder
-egna arbetsytor. Samordnaren tar emot resultaten i samma ordning som vid
+funktioner samtidigt. Arbetarna delar en [fryst deklarationsbild](frontend/frozen_source.ddr)
+med det färdiga metodindexet och använder egna arbetsytor för funktionskropparna. Samordnaren tar emot resultaten i samma ordning som vid
 seriell kompilering. `--jobs 1` kör kedjan på en tråd. `check` stannar
 efter semantisk kontroll. [Arbetsbudget och funktionsjobb](../docs/tasks.md#kompilatorn-som-taskkonsument)
 · [MIR-pass och verifiering](../docs/optimization.md#gemensam-helfunktionskedja)
