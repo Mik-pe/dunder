@@ -455,3 +455,34 @@ och selfhost-kompilatorns kodbild och signatur använder samma representation.
 `sys.write_u8` och `sys.decode_u8` tar `&[]u8`. `&[]i32`-buffertar
 konverteras mellan representationerna med `std.bytes.from_i32` och
 `std.bytes.to_i32`.
+
+### Maskinbreda buffertar
+
+På nativa 64-bitarsmål tar `std.alloc.layout_array<T>(count)` ett antal av
+typen `usize`. `System` kan reservera en större region än minnespoolens
+blockgräns. Ett prov med 536 870 913 `u32` reserverar 2 147 483 652 byte,
+skriver det första och sista elementet och läser tillbaka det sista.
+Systemallokatorn reserverar virtuellt adressutrymme. Provet berör bara
+sidorna i vardera änden.
+
+En inbyggd `&[]u8` använder `i32` för längd och index. Att skapa den
+över hela regionen ovan ger status 103. En ägare som använder `usize`
+kan i stället låna ut fönster med `bytes_view`. Kontrollera först
+`first <= end && end <= size`, därefter att `end - first` ryms i
+`i32`. Ett tomt intervall vid slutet är giltigt. Fönstrets index
+startar på noll även när `first` ligger över 2 GiB.
+
+`usize` passar för elementantal och C:s `size_t`. En baklängesloop med
+osignerade index kan börja vid den exklusiva slutgränsen, testa
+`end > first` och minska före läsning. En signerad pekarbred differens
+kan också representera läget −1 före första elementet. På de nativa
+64-bitarsmålen kan den uttryckas med `i64`. En sådan C-bindning behöver
+`i32` på wasm32 för att motsvara `ptrdiff_t`.
+
+På wasm32 kontrollerar `Layout` både multiplikation och utfyllnad mot
+2 147 483 647 byte. Exempelvis ryms 536 870 911 stycken `u32` inom
+layoutgränsen. Nästa element ger `AllocError.InvalidLayout`.
+Omvandlingen från `usize` till `i32` kontrollerar att värdet ryms.
+En godkänd layout garanterar inte att värdens minne räcker.
+En HTTP-kropps bytegräns och `Capped<A>` begränsar fortfarande vad
+anroparen får förbruka oavsett adressbredd.
