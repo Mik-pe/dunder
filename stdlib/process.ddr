@@ -5,6 +5,8 @@ import std.parse as decimal
 import std.sys.windows as windows
 import std.text as text
 import sys
+import std.sys.windows as wide
+import std.sys.winprocess as win
 
 @extern("kernel32.dll", "GetActiveProcessorCount")
 unsafe fn active_processors(group: u16) -> u32
@@ -99,6 +101,7 @@ pub struct Output {
 pub opaque struct Child {
     pid: i32,
     pgid: i32,
+    win_process: i64, win_job: i64,
     stdin_fd: i32,
     stdout_fd: i32,
     stderr_fd: i32,
@@ -877,7 +880,8 @@ unsafe fn os_read(fd: i32, buf: ptr, count: usize) -> i64 {
 }
 
 unsafe fn os_write(fd: i32, buf: ptr, count: usize) -> i64 {
-    if target_is("macos") {
+    if target_is("windows") { return win.write(fd, buf, count) }
+    else if target_is("macos") {
         r := c_write(fd, buf, count)
         if r < 0 { return -i64(macos_errno()) }
         return r
@@ -958,6 +962,21 @@ fn effective_path(cmd: &Command) -> string {
 }
 
 fn spawn_internal(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdio) -> Result<Child, sys.IoError> {
+    if target_is("windows") {
+        streams := win.Streams { input: i32(stdin_mode), output: i32(cmd.stdout_mode), error_output: i32(cmd.stderr_mode), output_path: "" }
+        unsafe {
+            env_block := win.environment(&cmd.env_keys, &cmd.env_vals, &cmd.env_unset, cmd.env_mode == .Inherit, wide.path)
+            search := !text.contains(program, "/") && !text.contains(program, "\\") && !text.contains(program, ":")
+            child := win.start(program, program, &args, cmd.cwd, &env_block, &streams, search, wide.path)
+            if child.error != 0 { return .Err(sys.IoError::from_code(child.error)) }
+            return .Ok(Child { pid: child.pid, pgid: -1, win_process: i64(usize(child.process)), win_job: i64(usize(child.job)),
+                               stdin_fd: child.input, stdout_fd: child.output, stderr_fd: child.error_output, reaped: false, code: 0, signal: 0 })
+        }
+    } else { return spawn_posix(program, &args, &cmd, stdin_mode) }
+    .Err(.Unsupported)
+}
+
+fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdio) -> Result<Child, sys.IoError> {
     if program.len == 0 {
         return .Err(.InvalidArgument)
     }
@@ -1238,7 +1257,7 @@ fn spawn_internal(program: string, args: &[]string, cmd: &Command, stdin_mode: S
 
         return .Ok(Child {
             pid: pid,
-            pgid: pid,
+            pgid: pid, win_process: 0, win_job: 0,
             stdin_fd: in_fds[1],
             stdout_fd: out_fds[0],
             stderr_fd: err_out_fds[0],
@@ -1311,7 +1330,10 @@ impl Child {
     fn signal_group(&self, sig: i32) -> sys.Status {
         if self.reaped || self.pid <= 0 { return sys.Status { ok: true, error: 0 } }
         unsafe {
-            if os_kill(-self.pgid, sig) == 0 || os_kill(self.pid, sig) == 0 {
+            if target_is("windows") {
+                ok := win.kill(ptr(usize(self.win_job)), 128 + sig)
+                return sys.Status { ok: ok, error: if ok { 0 } else { 5 } }
+            } else if os_kill(-self.pgid, sig) == 0 || os_kill(self.pid, sig) == 0 {
                 return sys.Status { ok: true, error: 0 }
             }
         }
@@ -1322,6 +1344,7 @@ impl Child {
     pub fn kill(&mut self) -> sys.Status { self.signal_group(9) }
 
     pub fn try_wait(&mut self) -> WaitResult {
+        if target_is("windows") { return wait_windows(&mut self, 0, false) }
         if self.reaped {
             return WaitResult { ok: true, exited: true, timed_out: false, code: self.code, signal: self.signal, error: 0 }
         }
@@ -1340,6 +1363,11 @@ impl Child {
     }
 
     pub fn wait(&mut self, timeout_ms: i64) -> WaitResult {
+        if target_is("windows") {
+            waited := wait_windows(&mut self, if timeout_ms > 0 { timeout_ms } else { -1 }, true)
+            self.close_pipes()
+            return waited
+        }
         if self.reaped {
             self.close_pipes()
             return WaitResult { ok: true, exited: true, timed_out: false, code: self.code, signal: self.signal, error: 0 }
@@ -1454,6 +1482,37 @@ impl Child {
     }
 }
 
+fn wait_windows(child: &mut Child, timeout: i64, kill_on_timeout: bool) -> WaitResult {
+    mut timed_out := false
+    if !child.reaped {
+        unsafe {
+            handle := ptr(usize(child.win_process)); job := ptr(usize(child.win_job))
+            mut status := win.wait(handle, timeout, &mut child.code)
+            if status == 0 && kill_on_timeout {
+                if win.kill(job, 124) {
+                    status = win.wait(handle, -1, &mut child.code)
+                    timed_out = true
+                } else { status = -1 }
+            }
+            if status < 0 { return WaitResult { ok: false, exited: false, timed_out: false, code: -1, signal: 0, error: 5 } }
+            if status == 0 { return WaitResult { ok: true, exited: false, timed_out: false, code: 0, signal: 0, error: 0 } }
+            win.close(handle); win.close(job); child.win_process = 0; child.win_job = 0; child.reaped = true
+        }
+    }
+    WaitResult { ok: !timed_out, exited: true, timed_out: timed_out, code: child.code, signal: 0, error: if timed_out { 60 } else { 0 } }
+}
+
+unsafe fn read_available(fd: i32, out: &mut []u8, max_bytes: i64) -> i64 {
+    if target_is("windows") {
+        if max_bytes < 0 { return -22 }
+        if max_bytes == 0 { return 0 }
+        mut buf: [u8; 4096] = [0; 4096]
+        n := win.read(fd, addr(&mut buf[0]), if max_bytes < 4096 { i32(max_bytes) } else { 4096 })
+        if n > 0 { bytes.extend(&mut out, &buf[..i32(n)]) }
+        return n
+    } else { return sys.fd_read(fd, &mut out, max_bytes) }
+}
+
 fn read_pipe(fd: &mut i32, out: &mut []u8, max_bytes: i64, timeout_ms: i64) -> Result<i64, sys.IoError> {
     if fd < 0 { return .Ok(0) }
     if max_bytes <= 0 { return .Ok(0) }
@@ -1463,7 +1522,7 @@ fn read_pipe(fd: &mut i32, out: &mut []u8, max_bytes: i64, timeout_ms: i64) -> R
     if max_bytes < 65536 { chunk = i32(max_bytes) }
     out.reserve(out.len + chunk)
     mut n: i64 = 0
-    unsafe { n = sys.fd_read(fd, &mut out, max_bytes) }
+    unsafe { n = read_available(fd, &mut out, max_bytes) }
     if n > 0 { return .Ok(n) }
     if n == 0 { unsafe { _ := sys.fd_close(fd) }; fd = -1; return .Ok(0) }
     if n != -35 { return .Err(sys.IoError::from_code(i32(-n))) }
@@ -1473,7 +1532,7 @@ fn read_pipe(fd: &mut i32, out: &mut []u8, max_bytes: i64, timeout_ms: i64) -> R
     if pr < 0 { return .Err(sys.IoError::from_code(i32(-pr))) }
     if pr == 0 { return .Err(.WouldBlock) }
     mut n2: i64 = 0
-    unsafe { n2 = sys.fd_read(fd, &mut out, max_bytes) }
+    unsafe { n2 = read_available(fd, &mut out, max_bytes) }
     if n2 > 0 { return .Ok(n2) }
     if n2 == 0 { unsafe { _ := sys.fd_close(fd) }; fd = -1; return .Ok(0) }
     .Err(sys.IoError::from_code(i32(-n2)))
@@ -1560,7 +1619,7 @@ fn exec_internal(program: string, args: &[]string, cmd: &Command) -> Output {
                     }
                     out_bytes.reserve(out_bytes.len + 16384)
                     mut n: i64 = 0
-                    unsafe { n = sys.fd_read(child.stdout_fd, &mut out_bytes, 65536) }
+                    unsafe { n = read_available(child.stdout_fd, &mut out_bytes, 65536) }
                     if n > 0 { continue }
                     if n == 0 || n != -35 {
                         unsafe { _ := sys.fd_close(child.stdout_fd) }
@@ -1577,7 +1636,7 @@ fn exec_internal(program: string, args: &[]string, cmd: &Command) -> Output {
                     }
                     err_bytes.reserve(err_bytes.len + 16384)
                     mut n: i64 = 0
-                    unsafe { n = sys.fd_read(child.stderr_fd, &mut err_bytes, 65536) }
+                    unsafe { n = read_available(child.stderr_fd, &mut err_bytes, 65536) }
                     if n > 0 { continue }
                     if n == 0 || n != -35 {
                         unsafe { _ := sys.fd_close(child.stderr_fd) }
@@ -1638,6 +1697,24 @@ pub fn replace(program: string, args: &[]string) -> sys.Status {
 
 @requires(process)
 pub fn replace_as(program: string, argv0: string, args: &[]string) -> sys.Status {
+    if target_is("windows") {
+        streams := win.Streams { input: 0, output: 0, error_output: 0, output_path: "" }
+        env_block: []u16 = []
+        unsafe {
+            search := !text.contains(program, "/") && !text.contains(program, "\\") && !text.contains(program, ":")
+            child := win.start(program, argv0, &args, "", &env_block, &streams, search, wide.path)
+            if child.error != 0 { return sys.Status { ok: false, error: child.error } }
+            mut code := 126
+            waited := win.wait(child.process, -1, &mut code)
+            win.close(child.process); win.close(child.job)
+            if waited != 1 { return sys.Status { ok: false, error: 5 } }
+            win.exit(u32(code))
+        }
+    } else { return replace_posix(program, argv0, &args) }
+    sys.Status { ok: false, error: 5 }
+}
+
+fn replace_posix(program: string, argv0: string, args: &[]string) -> sys.Status {
     if program.len == 0 || argv0.len == 0 { return sys.Status { ok: false, error: 22 } }
     mut blob: []u8 = []
     mut arg_offsets: []i32 = []
@@ -1691,6 +1768,7 @@ pub opaque struct ChildSet {
     active: []bool,
     pids: []i32,
     pgids: []i32,
+    win_processes: []i64, win_jobs: []i64,
     stdin_fds: []i32,
     stdout_fds: []i32,
     stderr_fds: []i32,
@@ -1704,7 +1782,7 @@ fn drain_fd_all(fd: &mut i32, out: &mut []u8) {
     while fd >= 0 {
         out.reserve(out.len + 16384)
         mut n: i64 = 0
-        unsafe { n = sys.fd_read(fd, &mut out, 65536) }
+        unsafe { n = read_available(fd, &mut out, 65536) }
         if n > 0 { continue }
         if n == 0 { unsafe { _ := sys.fd_close(fd) }; fd = -1 }
         break
@@ -1715,7 +1793,7 @@ impl ChildSet {
     pub fn new(capacity: i32) -> Self {
         assert(capacity > 0 && capacity <= 1024)
         mut s := Self {
-            cap: capacity, count: 0, active: [], pids: [], pgids: [],
+            cap: capacity, count: 0, active: [], pids: [], pgids: [], win_processes: [], win_jobs: [],
             stdin_fds: [], stdout_fds: [], stderr_fds: [],
             reaped: [], codes: [], signals: [], poll_buf: [],
         }
@@ -1723,6 +1801,7 @@ impl ChildSet {
             s.active.push(false)
             s.pids.push(-1)
             s.pgids.push(-1)
+            if target_is("windows") { s.win_processes.push(0); s.win_jobs.push(0) }
             s.stdin_fds.push(-1)
             s.stdout_fds.push(-1)
             s.stderr_fds.push(-1)
@@ -1746,6 +1825,10 @@ impl ChildSet {
                 self.active[slot] = true
                 self.pids[slot] = child.pid
                 self.pgids[slot] = child.pgid
+                if target_is("windows") {
+                    self.win_processes[slot] = child.win_process; self.win_jobs[slot] = child.win_job
+                    child.win_process = 0; child.win_job = 0
+                }
                 self.stdin_fds[slot] = child.stdin_fd
                 self.stdout_fds[slot] = child.stdout_fd
                 self.stderr_fds[slot] = child.stderr_fd
@@ -1784,6 +1867,10 @@ impl ChildSet {
 
     fn release_slot(&mut self, slot: i32) {
         unsafe {
+            if target_is("windows") {
+                win.close(ptr(usize(self.win_processes[slot]))); win.close(ptr(usize(self.win_jobs[slot])))
+                self.win_processes[slot] = 0; self.win_jobs[slot] = 0
+            }
             if self.stdin_fds[slot] >= 0 { _ := sys.fd_close(self.stdin_fds[slot]); self.stdin_fds[slot] = -1 }
             if self.stdout_fds[slot] >= 0 { _ := sys.fd_close(self.stdout_fds[slot]); self.stdout_fds[slot] = -1 }
             if self.stderr_fds[slot] >= 0 { _ := sys.fd_close(self.stderr_fds[slot]); self.stderr_fds[slot] = -1 }
@@ -1833,6 +1920,15 @@ impl ChildSet {
             return WaitResult { ok: false, exited: false, timed_out: false, code: -1, signal: 0, error: 22 }
         }
         self.drain(slot, &mut stdout_out, &mut stderr_out)
+        if target_is("windows") {
+            mut code := self.codes[slot]
+            mut waited := 1
+            if !self.reaped[slot] { unsafe { waited = win.wait(ptr(usize(self.win_processes[slot])), 0, &mut code) } }
+            if waited != 0 {
+                self.drain(slot, &mut stdout_out, &mut stderr_out); self.release_slot(slot)
+            }
+            return WaitResult { ok: waited >= 0, exited: waited == 1, timed_out: false, code: if waited == 1 { code } else { 0 }, signal: 0, error: if waited < 0 { 5 } else { 0 } }
+        }
         if self.reaped[slot] {
             code := self.codes[slot]
             sig := self.signals[slot]
@@ -1868,6 +1964,15 @@ impl ChildSet {
             return WaitResult { ok: false, exited: false, timed_out: false, code: -1, signal: 0, error: 22 }
         }
         unsafe {
+            if target_is("windows") {
+                mut code := 0
+                if !self.reaped[slot] {
+                    _ := win.kill(ptr(usize(self.win_jobs[slot])), 124)
+                    _ := win.wait(ptr(usize(self.win_processes[slot])), -1, &mut code)
+                }
+                self.drain(slot, &mut stdout_out, &mut stderr_out); self.release_slot(slot)
+                return WaitResult { ok: false, exited: true, timed_out: true, code: 124, signal: 9, error: 60 }
+            }
             pid := self.pids[slot]
             pgid := self.pgids[slot]
             if (pgid <= 0 || os_kill(-pgid, 9) != 0) && pid > 0 {

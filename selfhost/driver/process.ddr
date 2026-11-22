@@ -3,6 +3,8 @@ import std.bytes as buffer
 import budget
 import receipts
 import native_clock as monotonic
+import ...stdlib.sys.winpath as wide
+import ...stdlib.sys.winprocess as win
 import sys
 
 @extern("c","fork") unsafe fn child_process() -> i32
@@ -107,6 +109,24 @@ unsafe fn terminate_group(pid: i32) {
 }
 
 fn run_impl(path: string, args: &[]string, timeout_ms: i64, platform: i32, search_path: bool, stdout_path: string) -> i32 {
+    if target_is("windows") {
+        streams := win.Streams { input: 0, output: if stdout_path.len > 0 { 3 } else { 0 }, error_output: 0, output_path: stdout_path.clone() }
+        env: []u16 = []
+        unsafe {
+            child := win.start(path, path, &args, "", &env, &streams, search_path, wide.path)
+            if child.error != 0 { return if child.error == 2 { 127 } else { 126 } }
+            defer { win.close(child.process); win.close(child.job) }
+            mut code := 126
+            waited := win.wait(child.process, if timeout_ms > 0 { timeout_ms } else { -1 }, &mut code)
+            if waited == 1 { return code }
+            _ := win.kill(child.job, 124); _ := win.wait(child.process, -1, &mut code)
+            return if waited == 0 { 124 } else { 126 }
+        }
+    } else { return run_posix(path, &args, timeout_ms, platform, search_path, stdout_path) }
+    126
+}
+
+fn run_posix(path: string, args: &[]string, timeout_ms: i64, platform: i32, search_path: bool, stdout_path: string) -> i32 {
     mut bytes: []u8 = []
     mut offsets: []i32 = []
     if !append_arg(&mut bytes, &mut offsets, path) { return 126 }
@@ -180,6 +200,13 @@ pub fn run_path(program: string, args: &[]string, timeout_ms: i64, platform: i32
 }
 
 pub fn acquire_file_lock(path: string, timeout_ms: i64, platform: i32) -> i32 {
+    if target_is("windows") {
+        name := wide.path(path)
+        unsafe { return win.lock_file(&name, timeout_ms) }
+    } else { return posix_lock(path, timeout_ms, platform) }
+    -1
+}
+fn posix_lock(path: string, timeout_ms: i64, platform: i32) -> i32 {
     mut bytes: []u8 = []; mut offsets: []i32 = []
     if !append_arg(&mut bytes, &mut offsets, path) { return -1 }
     unsafe {
@@ -199,7 +226,10 @@ pub fn acquire_file_lock(path: string, timeout_ms: i64, platform: i32) -> i32 {
 }
 pub fn release_file_lock(fd: i32) {
     if fd < 0 { return }
-    unsafe { _ := lock_descriptor(fd, 8); _ := close_fd(fd) }
+    unsafe {
+        if target_is("windows") { _ := win.close_fd(fd) }
+        else { _ := lock_descriptor(fd, 8); _ := close_fd(fd) }
+    }
 }
 
 fn status_exit_code(status: i32) -> i32 {
@@ -243,7 +273,9 @@ fn flush_group_output(output: &GroupOutput, group: i32) {
         end := offset + output.lengths[chunk]
         unsafe {
             while offset < end {
-                count := write_fd(1, addr(&output.data[offset]), usize(end - offset))
+                mut count := i64(0)
+                if target_is("windows") { count = win.write(1, addr(&output.data[offset]), usize(end - offset)) }
+                else { count = write_fd(1, addr(&output.data[offset]), usize(end - offset)) }
                 if count <= 0 { break }
                 offset += i32(count)
             }
@@ -253,6 +285,11 @@ fn flush_group_output(output: &GroupOutput, group: i32) {
 }
 
 pub fn tests_parallel(path: string, groups: &[]string, keys: &[]string, affected: bool, timeout_ms: i64, platform: i32, max_jobs: i32) -> i32 {
+    if target_is("windows") { return tests_windows(path, &groups, &keys, affected, timeout_ms, platform, max_jobs) }
+    else { return tests_posix(path, &groups, &keys, affected, timeout_ms, platform, max_jobs) }
+}
+
+fn tests_posix(path: string, groups: &[]string, keys: &[]string, affected: bool, timeout_ms: i64, platform: i32, max_jobs: i32) -> i32 {
     total := groups.len
     mut skipped := 0
     mut passed := 0
@@ -515,4 +552,75 @@ pub fn tests_parallel(path: string, groups: &[]string, keys: &[]string, affected
     print(f"{passed} passed, {failed} failed")
     if failed > 0 { return 1 }
     0
+}
+
+fn tests_windows(path: string, groups: &[]string, keys: &[]string, affected: bool, timeout_ms: i64, platform: i32, requested: i32) -> i32 {
+    mut queue: []i32 = []; mut result: []i32 = []
+    mut output := GroupOutput {data: [], offsets: [], lengths: [], next: [], head: [], tail: []}
+    for i in 0..groups.len {
+        output.head.push(-1); output.tail.push(-1)
+        if affected && i < keys.len && receipts.seen(keys[i]) { result.push(-1) }
+        else { queue.push(i); result.push(126) }
+    }
+    total := if requested > 0 { requested } else { budget.resolve_jobs(platform, 0, false, 0, true).jobs }
+    slots := budget.test_process_slots(total, queue.len)
+    mut cursor := 0
+    if slots > 0 {
+        mut active := 0
+        mut group: [i32; 64] = [-1; 64]
+        mut pipes: [i32; 64] = [-1; 64]; mut starts: [i64; 64] = [0; 64]
+        names: []string = [budget.child_jobs_env()]
+        values: []string = [budget.nested_child_jobs(total, slots).str()]
+        unset: []bool = [false]
+        streams := win.Streams { input: 0, output: 1, error_output: 0, output_path: "" }
+        unsafe {
+            mut processes: [ptr; 64] = [ptr(0); 64]; mut jobs: [ptr; 64] = [ptr(0); 64]
+            env := win.environment(&names, &values, &unset, true, wide.path)
+            mut buf: [u8; 4096] = [0; 4096]
+            while cursor < queue.len || active > 0 {
+                for s in 0..slots {
+                    if group[s] >= 0 || cursor >= queue.len { continue }
+                    g := queue[cursor]; cursor += 1
+                    args: []string = [g.str()]
+                    child := win.start(path, path, &args, "", &env, &streams, false, wide.path)
+                    if child.error != 0 { continue }
+                    group[s] = g; processes[s] = child.process; jobs[s] = child.job; pipes[s] = child.output
+                    starts[s] = win.ticks(); active += 1
+                }
+                mut progress := false
+                for s in 0..slots {
+                    g := group[s]; if g < 0 { continue }
+                    mut code := 126
+                    mut waited := win.wait(processes[s], 0, &mut code)
+                    if waited == 0 && timeout_ms > 0 && win.ticks() - starts[s] >= timeout_ms {
+                        _ := win.kill(jobs[s], 124); _ := win.wait(processes[s], -1, &mut code)
+                        code = 124; waited = 1
+                    }
+                    while true {
+                        count := win.read(pipes[s], addr(&mut buf[0]), 4096)
+                        if count <= 0 { break }
+                        append_chunk(&mut output, g, &buf, i32(count)); progress = true
+                        if waited == 0 { break }
+                    }
+                    if waited != 0 {
+                        if waited > 0 { result[g] = code }
+                        _ := win.close_fd(pipes[s]); win.close(processes[s]); win.close(jobs[s])
+                        group[s] = -1; active -= 1; progress = true
+                    }
+                }
+                if active > 0 && !progress { win.sleep(1) }
+            }
+        }
+    }
+    mut passed := 0; mut failed := 0
+    for g in 0..groups.len {
+        if result[g] == -1 { continue }
+        if g < keys.len { receipts.update(keys[g], result[g] == 0) }
+        flush_group_output(&output, g)
+        if result[g] == 0 { passed += 1; print(f"PASS {groups[g]}") }
+        else { failed += 1; print(f"FAIL {groups[g]} (exit {result[g]})") }
+    }
+    if affected { print(f"{groups.len - queue.len} unaffected") }
+    print(f"{passed} passed, {failed} failed")
+    if failed > 0 { 1 } else { 0 }
 }
