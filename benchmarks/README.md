@@ -37,4 +37,7 @@ dunder run tools/performance_compiler_matrix.ddr -- /path/to/baseline \
 `--mode workers` kräver identiska kompilatorbinärer och ett rundantal
 delbart med sex. Mätlägena sparar råprover, per-process-RSS och parade kvoter.
 
+För jämförelser av SIMD och instruktionsschemaläggning finns en rörelsesimulering
+med både punktposter och en array per fält. [Arbetslast och körrecept](layout/README.md)
+
 [Mätmetod och mål](../docs/prestanda.md) · [Daterade resultat och rådata](results.md)
