@@ -543,7 +543,7 @@ deklarationsberoenden och funktionens ordbudget. Varma fragment
 återställer funktionens uppskattade kodtillväxt och de deklarationer den behöver. Inlining sker före helfunktions-IR; registerpasset kan därmed arbeta
 över de inlagda uttrycken med samma verifiering som resten av kroppen.
 
-[Gemensamma språkregler](../selfhost/opt/scalar_rules.ddr) används av både
+[Gemensamma språkregler](../selfhost/frontend/scalar_rules.ddr) används av både
 den fulla parsern och modellparsern för ASCII-namn, reserverade namn,
 operatorprioritet och kontextuell bredd på signerade heltalsliteraler.
 Breddkontrollen validerar decimalparserns befintliga resultat utan att
