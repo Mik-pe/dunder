@@ -31,6 +31,17 @@ alias. Vanliga Linuxbinärer använder direkta systemanrop. Program med
 nåbara externa anrop använder systemets dynamiska loader och de bibliotek
 som programmet deklarerar.
 
+På macOS kan du köra de två nybyggda Linuxprogrammen i Kiri. Båda ska
+skriva `42` och `true`, en rad vardera.
+
+```sh
+kiri run --rm --platform linux/arm64 -v "$PWD/build/arm64-linux:/out:ro" debian:bookworm-slim /out/hello
+kiri run --rm --platform linux/amd64 -v "$PWD/build/x86_64-linux:/out:ro" debian:bookworm-slim /out/hello
+```
+
+[Kompilatorns verifiering](../selfhost/README.md#verifiering) använder samma
+uppdelning för att prova den korsbyggda Linuxkompilatorn och dess verktyg.
+
 Alla sex mål ingår i samma kompilator. Dunderbyggen behöver inga installerade
 målpaket, headers, sysroot, C-kompilatorer, LLVM, assemblers, länkare eller
 signeringsverktyg. macOS kan därmed skriva Linux-, Wasm-, WASI- och Windowsbinärer och Linux kan skriva

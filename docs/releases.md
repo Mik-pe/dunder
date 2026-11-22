@@ -55,8 +55,9 @@ ersättningsfilens ursprungliga plats.
 
 ## Bygg releasepaket
 
-Ange versionsnumret från `compiler_version()` i `selfhost/driver/cli.ddr`. Med
-följande kommando hamnar de färdiga filerna i `build/release/v0.9.0/`.
+Bygg projektets release på ARM64/macOS. Ange versionsnumret från
+`compiler_version()` i `selfhost/driver/cli.ddr`. Med följande kommando
+hamnar de färdiga filerna i `build/release/v0.9.0/`.
 
 ```sh
 ./tools/release.sh v0.9.0
@@ -64,9 +65,10 @@ följande kommando hamnar de färdiga filerna i `build/release/v0.9.0/`.
 
 Med en lokal versionstagg byggs den commit som taggen pekar ut. Utan tagg
 används `HEAD`. Skriptet packar upp de incheckade källorna i en tillfällig
-katalog och kör `tools/bootstrap.sh` där. Värdens kompilator måste nå
-fixpunkt och rapportera versionen från taggen. Den bygger sedan de andra
-målens kompilatorer lokalt från samma ingång, `selfhost/main.ddr`.
+katalog och kör `tools/bootstrap.sh` där. Macens kompilator måste nå
+fixpunkt och rapportera versionen från taggen. Den korskompilerar sedan
+Linux- och Windowskompilatorerna från samma ingång, `selfhost/main.ddr`.
+Linuxproven i Kiri kör Macens artefakter för ARM64 och x86-64.
 Med `--outdir KATALOG` kan paketen skrivas till en annan katalog.
 
 ## Publicera
