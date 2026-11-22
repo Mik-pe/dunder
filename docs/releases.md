@@ -44,9 +44,13 @@ $candidate = Read-Host 'Sökväg till verifierad ersättning'
 $installed = Read-Host 'Sökväg till installerad kompilator'
 $expected = Read-Host 'SHA-256'
 if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -ne $expected) { throw 'SHA-256 mismatch' }
-[IO.File]::Replace($candidate, $installed, $null)
+$backup = Join-Path ([IO.Path]::GetDirectoryName($candidate)) 'previous.exe'
+[IO.File]::Replace($candidate, $installed, $backup)
 & $installed --version
 ```
+
+Den tidigare kompilatorn ligger nu i `previous.exe` bredvid den angivna
+ersättningsfilens ursprungliga plats.
 
 ## Bygg releasepaket
 
