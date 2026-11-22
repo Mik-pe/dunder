@@ -450,8 +450,10 @@ För typat och lånekontrollerat minne finns tre `@resource(dispose)`-strukturer
 
 ## Lagring och verifiering
 
-Dynamiska buffertar allokeras via `std.alloc` i dynamiska heap-slabs på native (utan något fast 512 MiB-tak) som växer vid behov och frisläpper tomma block tillbaka till operativsystemet. Buffertarna har unika ägare; uttryckliga kloner
-är oberoende. Tillväxt frigör den gamla bufferten efter överföringen.
+På nativa mål hämtar arrayer minne från en [heap som växer vid behov](memory.md#pool-och-kostnader).
+Heapen återanvänder frigjorda block inom samma storleksklass.
+Buffertarna har unika ägare och uttryckliga kloner är oberoende.
+Tillväxt frigör den gamla bufferten efter överföringen.
 Tilldelning, scope-slut och retur frigör övergivna buffertar, även i nästlade
 structar och aktiva enumpayloads. `clear` frigör elementens strängreferenser
 och behåller själva bufferten för nästa användning.

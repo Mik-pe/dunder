@@ -340,8 +340,16 @@ vyn används; se [FFI och råminne](ffi.md).
 
 ## Pool och kostnader
 
-Nativ kod mappar en initial heapregion (samt dynamiska tilläggsblock/slabs via
-`mmap` vid fortsatt tillväxt) vid första allokeringen. Resident minne beror på vilka sidor programmet använder. Wasm utökar sitt
+Ett nativt program begär sin första heapregion när det behöver allokera.
+För små block begär runtimen 64 KiB. En större första allokering får en region
+som rymmer hela storleksklassen och dess metadata. En profilerad körning
+skapar regionen redan vid start för att lagra räknarna.
+
+När den aktiva regionen blir full begär runtimen en ny. Den föredragna
+storleken fördubblas upp till 64 MiB. Ett större enskilt block styr självt
+storleken. Om operativsystemet nekar extra tillväxt försöker runtimen igen
+med utrymmet för just blocket och dess metadata, avrundat uppåt till 4 KiB.
+Resident minne beror på vilka sidor programmet använder. Wasm utökar sitt
 linjära minne vid behov. På alla mål delar strängar och arrayer samma pool.
 Frigjorda block läggs på en lista för sin storleksklass. Klasserna börjar vid
 16 byte och växer i tvåpotenser. En ny begäran kan återanvända ett block i rätt
