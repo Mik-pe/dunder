@@ -14,15 +14,17 @@ if [ "${1:-}" = --linux ]; then
     [ "$(uname -s)" = Darwin ] || { echo 'On Linux, run tools/verify-selfhost.sh directly.' >&2; exit 2; }
     kiri=$(command -v kiri) || kiri=/Applications/Kiri.app/Contents/MacOS/kiri
     [ -x "$kiri" ] || { echo 'Install and start Kiri to run Linux tests on macOS.' >&2; exit 1; }
-    image=${DUNDER_KIRI_IMAGE:-dunder-linux-test:$arch}
-    if [ -z "${DUNDER_KIRI_IMAGE:-}" ] && ! "$kiri" image inspect "$image" >/dev/null 2>&1; then
-        "$kiri" build --platform "$platform" --load -t "$image" - <<'IMAGE'
+    image=${DUNDER_KIRI_IMAGE:-}
+    if [ -z "$image" ]; then
+        echo "Preparing Linux $arch test image in Kiri" >&2
+        image=$("$kiri" build --platform "$platform" --load --quiet -t "dunder-linux-test:$arch" - <<'IMAGE'
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     binutils-multiarch build-essential ca-certificates clang curl file git gzip \
     libargon2-dev libcurl4-openssl-dev libsqlite3-dev libssl-dev nodejs openssl \
     && rm -rf /var/lib/apt/lists/*
 IMAGE
+        )
     fi
     mkdir -p build
     set -- "$image" sh -ec '
