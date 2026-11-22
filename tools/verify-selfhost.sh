@@ -49,7 +49,7 @@ RUN test "$(dpkg --print-architecture)" = "$TARGETARCH" && \
 IMAGE
         )
     fi
-    set -- "$image" sh -ec '
+    set -- sh -ec '
         case "$1:$(uname -m)" in arm64:aarch64|arm64:arm64|x86_64:x86_64) ;;
             *) echo "Kiri guest architecture does not match $1" >&2; exit 1 ;;
         esac
@@ -58,6 +58,18 @@ IMAGE
         "$compiler" --version
         exec /dunder-cross/verify "$compiler" --cross-verify /dunder-cross "$@"
     ' verify-linux "$arch" "$@"
+    argv_probe=0
+    if [ "$arch" = x86_64 ]; then
+        "$kiri" run --rm --platform "$platform" --entrypoint /bin/bash "$image" \
+            -c 'exec -a dunder-argv-probe /bin/sh -c "$1"' probe \
+            '[ "$0" = dunder-argv-probe ] || exit 42' || argv_probe=$?
+    fi
+    case "$argv_probe" in
+        0) set -- "$image" "$@" ;;
+        42) set -- --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETFCAP --security-opt no-new-privileges \
+                --entrypoint /bin/sh "$image" /workspace/tools/kiri-rosetta.sh "$@" ;;
+        *) exit "$argv_probe" ;;
+    esac
     if [ -f .git ]; then
         common=$(git rev-parse --path-format=absolute --git-common-dir)
         set -- --mount "type=bind,source=$common,target=$common,readonly" "$@"

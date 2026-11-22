@@ -69,6 +69,12 @@ katalog och kör `tools/bootstrap.sh` där. Macens kompilator måste nå
 fixpunkt och rapportera versionen från taggen. Den korskompilerar sedan
 Linux- och Windowskompilatorerna från samma ingång, `selfhost/main.ddr`.
 Linuxproven i Kiri kör Macens artefakter för ARM64 och x86-64.
+Inför x86-64-proven kontrollerar skriptet att ett program kan välja
+`argv[0]` vid processbyte. Om Kiri använder Rosetta utan detta stöd
+registrerar skriptet samma Rosetta med flaggan `P` i en privat
+användar- och monteringsnamnrymd. Initieringen behöver `SYS_ADMIN` för
+namnrymden och `SETFCAP` för rotanvändarens id-mappning. Alla
+Linux-capabilities släpps före proven och containerns seccomp-filter är aktivt.
 Med `--outdir KATALOG` kan paketen skrivas till en annan katalog.
 
 ## Publicera
