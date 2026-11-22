@@ -122,7 +122,9 @@ delar oföränderlig text.
 `Command::spawn` och `Command::exec` nollställer signalmasken i barnprocessen
 före programstart, så blockerad signalpollning i föräldern inte gör kommandon
 immuna mot SIGTERM eller SIGINT. Förälderns mask ändras inte.
-`replace` och `replace_as` ersätter samma process och behåller dess signalmask.
+`replace` och `replace_as` ersätter samma process och behåller dess signalmask
+på macOS och Linux. På Windows returnerar dessa anrop `Unsupported`.
+`Command::exec` och `Command::spawn` startar en ny Windowsprocess.
 
 `ChildSet::insert(&mut children, &mut child)` är ett fallibelt
 överföringsförsök: framgång lämnar barnet i mängden och tömmer källhandtaget;
