@@ -933,9 +933,13 @@ gränsen. `-o directory` väljer baskatalog för tillfälliga testbinärer;
 varje körning får en egen underkatalog som städas efteråt. Exitstatus är 0
 när alla tester passerar, annars 1. Noll hittade tester rapporteras uttryckligt.
 
-Utan fil väljer `dunder test` manifestets valfria `test_root`, annars `root`.
-`build`, `run` och `check` använder alltid `root`. Manifestet kräver `name`
-och `root`; alla tre fält är enkla citerade strängar.
+`dunder check` typkontrollerar både funktioner och tester i den valda rotfilen
+och i importerade projektmoduler. Det omfattar fristående testfunktioner och tabellfall.
+Kommandot kör varken programmet eller testerna. En testrot kan sakna `main`.
+
+Utan fil väljer `dunder check`, `build` och `run` manifestets `root`.
+`dunder check --tests` och `dunder test` väljer `test_root` när den anges
+och annars `root`. För en uttrycklig testfil används `dunder check fil.ddr`.
 
 ## UTF-8-strängar och runes
 
