@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <string.h>
@@ -42,3 +43,40 @@ size_t inspect_packet(Packet *p, size_t size, size_t alignment) {
 }
 uint32_t first_nibble(const uint8_t *data) { return data[0] & 15; }
 int32_t invoke_inner(int32_t (*callback)(int32_t), int32_t n) { return callback(n); }
+
+typedef struct { uint8_t tag, rgba[256 * 256 * 4]; uint32_t stamp; } Tile;
+typedef struct { uint16_t first[20000]; uint32_t second[10000]; uint64_t tail; } Planes;
+
+int tile_layout(Tile *tile, size_t size, size_t alignment, size_t pixels, size_t stamp) {
+    if (size != sizeof *tile || alignment != _Alignof(Tile) ||
+        pixels != offsetof(Tile, rgba) || stamp != offsetof(Tile, stamp) ||
+        tile->rgba[sizeof tile->rgba - 1] != 17 || tile->stamp != 111) return 0;
+    tile->rgba[0] = 23;
+    return 1;
+}
+
+int planes_layout(Planes *p, size_t size, size_t alignment, size_t second, size_t tail) {
+    if (size != sizeof *p || alignment != _Alignof(Planes) ||
+        second != offsetof(Planes, second) || tail != offsetof(Planes, tail) ||
+        p->first[19999] != 999 || p->tail != 88) return 0;
+    p->second[9999] = 777;
+    return 1;
+}
+
+size_t sum_bytes(const uint8_t *bytes, size_t length) {
+    size_t sum = 0;
+    for (size_t i = 0; i < length; i++) sum += bytes[i];
+    return sum;
+}
+
+void *copy_bytes(const uint8_t *bytes, size_t length) {
+    void *owned = malloc(length);
+    if (owned && length) memcpy(owned, bytes, length);
+    return owned;
+}
+
+void release_bytes(void *owned) { free(owned); }
+
+int wide_counts(size_t count, ptrdiff_t distance) {
+    return count == (size_t)2147483652ULL && distance == -(ptrdiff_t)1;
+}

@@ -42,6 +42,13 @@ avrundar totalstorleken till den största fältjusteringen. Fält kan vara tal,
 för valt mål. `zeroed()` i en unsafe-kontext skapar en C-struct där alla
 fält har värdet noll. Noll kan vara ett ogiltigt handtag för ett visst API.
 
+En C-struct får uppta högst 1 048 575 byte inklusive utfyllnad. Till
+exempel ryms ett fält av typen `[u8; 262144]` för ett bildkakel på
+256 × 256 RGBA-pixlar. `zeroed()` lägger själva C-värdet på heapen.
+Skicka stora structar med pekare och jämför layouten med C:s `sizeof`,
+`_Alignof` och `offsetof`. Gränsen för utgående stackargument i ett
+enskilt C-anrop är 4 080 byte.
+
 ## Anrop och adresser
 
 `@extern("bibliotek", "symbol") unsafe fn` deklarerar en direkt import.
@@ -168,6 +175,30 @@ Stackbyte, icke-lokala hopp, returns-twice och stackinspektion av privata
 lokaler kräver ett separat uttryckligt kontrakt; de följer inte av en
 vanlig `@extern`-deklaration. Dessa regler gäller också när en främmande
 funktion anropar Dunder genom en callback.
+
+Ett synkront C-anrop som bara läser under anropet kan få ett lån via
+ett säkert omslag. Här är C-funktionens kontrakt att den läser exakt
+`length` byte och accepterar null när längden är noll.
+
+```dunder
+@extern("reader", "sum_bytes") unsafe fn sum_bytes(data: ptr, length: usize) -> usize
+
+fn sum(bytes: &[]u8) -> usize {
+    unsafe {
+        if bytes.len == 0 { return sum_bytes(ptr(0), usize(0)) }
+        return sum_bytes(addr(&bytes[0]), usize(bytes.len))
+    }
+}
+```
+
+Om C-biblioteket sparar data till ett senare anrop behöver bindningen
+följa bibliotekets ägarkontrakt. Ett API som kopierar under anropet kan
+använda samma lån. Kopian lever tills den släpps med bibliotekets
+frigöringsfunktion. Ett API som behåller själva pekaren kräver att
+bindningen håller originalets lagring vid liv och på samma adress tills
+biblioteket kvitterar avslut. En `ptr` från `addr` förlänger inte lånet.
+Ett sådant handtag kan äga en separat stabil allokering och avregistrera
+den från C innan det frigör minnet.
 
 För säkra omslag ovanpå råpekare (till exempel i `std.alloc`) skapar
 `unsafe bytes_view(&owner, base, length)` en lånad vy `&[]u8` med angiven

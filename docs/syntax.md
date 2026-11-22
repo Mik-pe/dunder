@@ -813,7 +813,7 @@ fn main() {
 upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
 en lagringsbar typ som ett primitivt värde, en struct, en enum eller en
 annan array. Den härleds eller hämtas från förväntad arraytyp.
-En fast array får använda högst 64 KiB. Tomma arrayliteraler kräver explicit typ.
+En fast array får använda högst 1 048 575 byte. Tomma arrayliteraler kräver explicit typ.
 
 När kontexten ger en arraytyp används dess elementtyp för heltalsliteralerna.
 Annars kan det första typade numeriska elementet ge typen även åt tidigare
