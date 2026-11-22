@@ -89,15 +89,25 @@ reported=$("$compiler" --version)
 
 manifest="$work/assets/release.txt"
 printf 'version=%s\ncommit=%s\n' "$version" "$commit" > "$manifest"
+pids=""
+for target in arm64-macos arm64-linux x86_64-linux; do
+    (
+        image="$work/images/$target"
+        if [ "$host" = "$target" ]; then
+            cp "$compiler" "$image"
+        else
+            "$compiler" build selfhost/main_parallel.ddr --target "$target" -o "$image"
+        fi
+        gzip -9 -n -c "$image" > "$work/assets/$target.gz"
+    ) &
+    pids="$pids $!"
+done
+for pid in $pids; do
+    wait "$pid"
+done
 for target in arm64-macos arm64-linux x86_64-linux; do
     image="$work/images/$target"
-    if [ "$host" = "$target" ]; then
-        cp "$compiler" "$image"
-    else
-        "$compiler" build selfhost/main_parallel.ddr --target "$target" -o "$image"
-    fi
     archive="$work/assets/$target.gz"
-    gzip -9 -n -c "$image" > "$archive"
     compressed=$(sha256_of "$archive")
     raw=$(sha256_of "$image")
     printf '%s  %s.gz\n' "$compressed" "$target" > "$work/assets/$target.sha256"

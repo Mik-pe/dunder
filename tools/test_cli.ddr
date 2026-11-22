@@ -1,0 +1,2551 @@
+capability process, filesystem, stdio
+
+import .harness as harness
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.path as path
+import std.process as process
+import std.text as text
+import sys
+
+struct Project {
+    compiler: string,
+    root: string,
+}
+
+impl Project {
+    fn path(&self, rel: string) -> string {
+        self.root + "/" + rel
+    }
+
+    fn write(&self, rel: string, content: string) -> bool {
+        full := self.root + "/" + rel
+        parent := path.dirname(full)
+        if !fs.mkdir_all(parent).ok {
+            return harness.fail("mkdir_all failed for " + parent)
+        }
+        if !sys.write_text(full, content).ok {
+            return harness.fail("write_text failed for " + full)
+        }
+        true
+    }
+
+    fn write_bytes(&self, rel: string, data: &[]u8) -> bool {
+        full := self.root + "/" + rel
+        parent := path.dirname(full)
+        if !fs.mkdir_all(parent).ok {
+            return harness.fail("mkdir_all failed for " + parent)
+        }
+        if !sys.write_u8(full, &data).ok {
+            return harness.fail("write_u8 failed for " + full)
+        }
+        true
+    }
+
+    fn call_in(&self, args: []string, cwd: string, status: i32, out: &mut process.Output) -> bool {
+        dir := if cwd.len > 0 { cwd.clone() } else { self.root.clone() }
+        harness.run_checked_timeout(self.compiler, args, dir, status, false, 60000, &mut out)
+    }
+
+    fn call(&self, args: []string, status: i32, out: &mut process.Output) -> bool {
+        self.call_in(args, self.root, status, &mut out)
+    }
+}
+
+fn run_bin(program: string, args: []string, cwd: string, status: i32, timeout_ms: i64, out: &mut process.Output) -> bool {
+    harness.run_checked_timeout(program, args, cwd, status, false, timeout_ms, &mut out)
+}
+
+fn same_file_bytes(a: string, b: string) -> bool {
+    ra := sys.read_u8(a)
+    rb := sys.read_u8(b)
+    ra.ok && rb.ok && bytes.equal(&ra.value, &rb.value)
+}
+
+fn diff_file_bytes(a: string, b: string) -> bool {
+    ra := sys.read_u8(a)
+    rb := sys.read_u8(b)
+    ra.ok && rb.ok && !bytes.equal(&ra.value, &rb.value)
+}
+
+fn file_equals_bytes(file_path: string, expected: &[]u8) -> bool {
+    r := sys.read_u8(file_path)
+    r.ok && bytes.equal(&r.value, &expected)
+}
+
+fn bytes_starts_with(data: &[]u8, prefix: &[]u8) -> bool {
+    if data.len < prefix.len { return false }
+    bytes.equal_ranges(&data, 0, prefix.len, &prefix, 0, prefix.len)
+}
+
+fn copy_executable(src: string, dst: string) -> bool {
+    raw := sys.read_u8(src)
+    if !raw.ok { return harness.fail("read_u8 failed on " + src) }
+    if !sys.write_u8(dst, &raw.value).ok { return harness.fail("write_u8 failed on " + dst) }
+    if !sys.make_executable(dst).ok { return harness.fail("make_executable failed on " + dst) }
+    true
+}
+
+fn count_occurrences(haystack: string, needle: string) -> i32 {
+    if needle.len == 0 { return haystack.len + 1 }
+    mut count := 0
+    mut pos := 0
+    while pos <= haystack.len - needle.len {
+        match text.find(haystack[pos..haystack.len], needle) {
+            .None => { break },
+            .Some(rel) => {
+                count += 1
+                pos = pos + rel + needle.len
+            },
+        }
+    }
+    count
+}
+
+fn split_nonempty_segments(p: string) -> []string {
+    mut out: []string = []
+    for part in move text.split(p, "/") {
+        if part.len > 0 { out.push(move part) }
+    }
+    out
+}
+
+fn relpath(target_abs: string, base_abs: string) -> string {
+    t_norm := path.normalize(target_abs)
+    b_norm := path.normalize(base_abs)
+    t_parts := split_nonempty_segments(t_norm)
+    b_parts := split_nonempty_segments(b_norm)
+    mut common := 0
+    while common < t_parts.len && common < b_parts.len && t_parts[common] == b_parts[common] {
+        common += 1
+    }
+    mut rel: []string = []
+    for _ in common..b_parts.len { rel.push("..") }
+    for i in common..t_parts.len { rel.push(t_parts[i].clone()) }
+    if rel.len == 0 { return "." }
+    mut joined := ""
+    for i in 0..rel.len {
+        if i > 0 { joined += "/" }
+        joined += rel[i]
+    }
+    joined
+}
+
+fn collect_files_with_suffix(dir: string, suffix: string, out: &mut []string) -> bool {
+    entries := fs.list_dir(dir)
+    if entries.is_err() { return false }
+    for name in entries.unwrap() {
+        full := dir + "/" + name
+        if fs.is_symlink(full) { continue }
+        info := sys.metadata(full)
+        if !info.ok { continue }
+        if info.is_dir {
+            if !collect_files_with_suffix(full, suffix, &mut out) { return false }
+        } else if info.is_file && text.ends_with(name, suffix) {
+            out.push(move full)
+        }
+    }
+    true
+}
+
+fn collect_dir_suffix(dir: string, suffix: string, out: &mut []string) -> bool {
+    out.clear()
+    entries := fs.list_dir(dir)
+    if entries.is_err() { return false }
+    for name in entries.unwrap() {
+        if text.ends_with(name, suffix) {
+            out.push(dir + "/" + name)
+        }
+    }
+    true
+}
+
+fn parse_reused_count(stderr_text: string) -> Option<i64> {
+    needle := "functions "
+    mut pos := 0
+    while pos <= stderr_text.len - needle.len {
+        match text.find(stderr_text[pos..stderr_text.len], needle) {
+            .None => { return .None },
+            .Some(rel) => {
+                start := pos + rel + needle.len
+                mut end := start
+                while end < stderr_text.len && stderr_text[end] >= 48 && stderr_text[end] <= 57 {
+                    end += 1
+                }
+                if end > start && text.starts_with(stderr_text[end..stderr_text.len], " reused") {
+                    parsed := parse.i64_range(stderr_text, start, end)
+                    if parsed.ok { return .Some(parsed.value) }
+                }
+                pos = start
+            },
+        }
+    }
+    .None
+}
+
+fn has_str(items: &[]string, target: string) -> bool {
+    for item in items {
+        if item == target { return true }
+    }
+    false
+}
+
+fn json_obj_keys_match(doc: &json.Doc, obj: i32, expected: &[]string) -> bool {
+    if doc.kind(obj) != .Object { return false }
+    n := doc.count(obj)
+    if n != expected.len { return false }
+    for key in expected {
+        if doc.field(obj, key) < 0 { return false }
+    }
+    for i in 0..n {
+        k := doc.key_at(obj, i)
+        if k.is_none() || !has_str(&expected, k.unwrap()) { return false }
+    }
+    true
+}
+
+fn json_str_array_matches_set(doc: &json.Doc, arr: i32, expected: &[]string) -> bool {
+    if doc.kind(arr) != .Array { return false }
+    n := doc.count(arr)
+    if n != expected.len { return false }
+    mut seen: []bool = []
+    for _ in 0..expected.len { seen.push(false) }
+    for i in 0..n {
+        val := doc.as_str(doc.at(arr, i))
+        if val.is_none() { return false }
+        s := val.unwrap()
+        mut matched := false
+        for j in 0..expected.len {
+            if expected[j] == s {
+                if seen[j] { return false }
+                seen[j] = true
+                matched = true
+                break
+            }
+        }
+        if !matched { return false }
+    }
+    true
+}
+
+fn json_all_values_nonneg_int(doc: &json.Doc, obj: i32) -> bool {
+    if doc.kind(obj) != .Object { return false }
+    n := doc.count(obj)
+    for i in 0..n {
+        v := doc.as_i64(doc.val_at(obj, i))
+        if v.is_none() || v.unwrap() < 0 { return false }
+    }
+    true
+}
+
+fn json_sum_nonneg_ints(doc: &json.Doc, obj: i32, sum_out: &mut i64) -> bool {
+    if doc.kind(obj) != .Object { return false }
+    mut total: i64 = 0
+    n := doc.count(obj)
+    for i in 0..n {
+        v := doc.as_i64(doc.val_at(obj, i))
+        if v.is_none() || v.unwrap() < 0 { return false }
+        total += v.unwrap()
+    }
+    sum_out = total
+    true
+}
+
+fn json_keys_nonneg_int(doc: &json.Doc, obj: i32, keys: &[]string) -> bool {
+    if doc.kind(obj) != .Object { return false }
+    for key in keys {
+        v := doc.get_i64(obj, key)
+        if v.is_none() || v.unwrap() < 0 { return false }
+    }
+    true
+}
+
+fn json_keys_zero(doc: &json.Doc, obj: i32, keys: &[]string) -> bool {
+    if doc.kind(obj) != .Object { return false }
+    for key in keys {
+        if doc.get_i64(obj, key) != .Some(0) { return false }
+    }
+    true
+}
+
+fn json_keys_pos(doc: &json.Doc, obj: i32, keys: &[]string) -> bool {
+    if doc.kind(obj) != .Object { return false }
+    for key in keys {
+        v := doc.get_i64(obj, key)
+        if v.is_none() || v.unwrap() <= 0 { return false }
+    }
+    true
+}
+
+fn json_check_functions(doc: &json.Doc, root: i32, want_reused: i64, want_emitted: i64) -> bool {
+    funcs := doc.field(root, "functions")
+    fn_keys: []string = ["reused", "emitted"]
+    if !json_obj_keys_match(&doc, funcs, &fn_keys) { return false }
+    doc.get_i64(funcs, "reused") == .Some(want_reused) &&
+        doc.get_i64(funcs, "emitted") == .Some(want_emitted)
+}
+
+fn mir_integer_output(p: &Project, name: string, target: string, expected: string) -> bool {
+    if target != process.host_target() { return true }
+    mut run := harness.empty_output()
+    if !run_bin(p.path(name), [], p.root, 0, 10000, &mut run) { return false }
+    if run.stdout_text() != expected || run.stderr_text() != "" {
+        return harness.fail(f"{name}: unexpected stdout/stderr: {run.stdout_text()} / {run.stderr_text()}")
+    }
+    true
+}
+
+fn check_agent_error_record(stdout_text: string) -> harness.AgentError {
+    harness.agent_error_info(stdout_text)
+}
+
+fn modules_and_manifest(p: &Project) -> bool {
+    if !p.write("dunder.toml", "name = \"consumer\"\nroot = \"main.ddr\"\ntest_root = \"cases.ddr\"\n") { return false }
+    if !p.write("main.ddr", "import sys\nimport link as lib\nfn main()->i32{print(sys.arg(1));return lib.answer()}\n") { return false }
+    if !p.write("real.v1/depth/module.ddr", "import ../../shared/value as v\npub fn answer()->i32{v.answer()}\n") { return false }
+    if !p.write("shared/value.ddr", "pub fn answer()->i32{42}\n") { return false }
+    source := p.path("shared/value.ddr")
+    if !fs.symlink("real.v1/depth/module.ddr", p.path("link.ddr")).ok {
+        return harness.fail("symlink failed for link.ddr")
+    }
+    if !p.write("cases.ddr", "@test fn selected(){true}\n") { return false }
+    nested := p.path("nested")
+    if !fs.mkdir_all(nested + "/dunder.toml").ok {
+        return harness.fail("mkdir_all failed for nested/dunder.toml")
+    }
+
+    argument := "räksmörgås * \" with spaces"
+    mut out := harness.empty_output()
+    if !p.call_in(["run", "--", argument.clone()], nested, 42, &mut out) { return false }
+    if out.stdout_text() != argument + "\n" {
+        return harness.fail("unexpected run stdout: " + out.stdout_text())
+    }
+    if !p.call_in(["test"], nested, 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "1 passed, 0 failed") {
+        return harness.fail("missing test pass summary: " + out.stdout_text())
+    }
+    if !p.call_in(["build-tests", "--list"], nested, 0, &mut out) { return false }
+    listing := harness.lines(out.stdout_text())
+    if listing.len != 1 || !text.ends_with(listing[0], "cases.ddr::selected") {
+        return harness.fail("unexpected build-tests --list: " + out.stdout_text())
+    }
+    if !p.call_in(["build-tests", "--group", "0", "-o", "group"], nested, 0, &mut out) { return false }
+    if !run_bin(nested + "/group", [], nested, 0, 10000, &mut out) { return false }
+    if !p.call_in(["build-tests", "--group", "8"], nested, 1, &mut out) { return false }
+
+    saved := p.path("published")
+    if !p.call(["build", "-o", saved.clone()], 0, &mut out) { return false }
+    orig_read := sys.read_u8(saved)
+    if !orig_read.ok { return harness.fail("failed reading published binary") }
+    original := orig_read.value
+
+    if !p.write("shared/value.ddr", "pub fn answer()->i32{42}\nfn unused()->i32{true}\n") { return false }
+    for action in ["build", "run", "check", "test", "build-tests"] {
+        if !p.call([action.clone(), "main.ddr"], 1, &mut out) { return false }
+        if !text.contains(out.stderr_text(), "value.ddr:2:") {
+            return harness.fail(action + " missing value.ddr:2: in " + out.stderr_text())
+        }
+    }
+    if !p.call(["build", "-o", saved.clone()], 1, &mut out) { return false }
+    if !file_equals_bytes(saved, &original) {
+        return harness.fail("failed build overwrote published binary")
+    }
+    if !p.call(["check", "main.ddr", "--agent"], 1, &mut out) { return false }
+    diag := check_agent_error_record(out.stdout_text())
+    src_bytes := sys.read_u8(source)
+    if !diag.ok || !src_bytes.ok || !text.ends_with(diag.path, "value.ddr") ||
+       diag.start < 0 || diag.start > diag.end || diag.end > i64(src_bytes.value.len) {
+        return harness.fail("invalid agent diagnostic: " + out.stdout_text())
+    }
+
+    original_source := "pub fn answer()->i32{42}\n"
+    if !p.write("shared/value.ddr", original_source) { return false }
+    alias := p.path("linked-output")
+    if !fs.hard_link(source, alias).ok {
+        return harness.fail("hard_link failed")
+    }
+    if !p.call(["build", "-o", alias.clone()], 1, &mut out) { return false }
+    alias_txt := sys.read_text(alias)
+    if !alias_txt.ok || alias_txt.value != original_source {
+        return harness.fail("hard-linked source was modified")
+    }
+
+    if !p.write("dunder.toml", "# package\nname = \"consumer\"\nroot = main.ddr\n") { return false }
+    if !p.call_in(["build"], nested, 2, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "dunder.toml:3:") {
+        return harness.fail("missing dunder.toml:3: in " + out.stderr_text())
+    }
+    true
+}
+
+fn targets_and_cache_incremental(p: &Project, expected: i32, reused_out: &mut i64) -> bool {
+    mut out := harness.empty_output()
+    if !p.call(["run", "cached.ddr", "--incremental", "--timings", "-o", "cached"], 0, &mut out) { return false }
+    if out.stdout_text() != expected.str() + "\n" {
+        return harness.fail(f"incremental expected {expected}, got {out.stdout_text()}")
+    }
+    parsed := parse_reused_count(out.stderr_text())
+    if parsed.is_none() {
+        return harness.fail("missing functions N reused in stderr: " + out.stderr_text())
+    }
+    reused_out = parsed.unwrap()
+    true
+}
+
+fn targets_and_cache(p: &Project) -> bool {
+    if !p.write("portable.ddr", "fn main(){print(42)}\n") { return false }
+    if !p.write("platform.ddr", "capability unsafe\npub unsafe fn state()->ptr{static_bytes(\"linux\",16)}\n") { return false }
+    if !p.write("with-import.ddr", "import platform\nfn main(){print(42)}\n") { return false }
+
+    triples: []string = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+    macho_magic: []u8 = [0xcf, 0xfa, 0xed, 0xfe]
+    elf_magic: []u8 = [0x7f, 69, 76, 70]
+    mut out := harness.empty_output()
+    for ti in 0..triples.len {
+        triple := triples[ti].clone()
+        for src in ["portable", "with-import"] {
+            if !p.call(["build", src + ".ddr", "--target", triple.clone(), "-o", src.clone()], 0, &mut out) { return false }
+        }
+        data := sys.read_u8(p.path("portable"))
+        other := sys.read_u8(p.path("with-import"))
+        if !data.ok || !other.ok { return harness.fail("failed reading built targets") }
+        magic_ok := if ti == 0 { bytes_starts_with(&data.value, &macho_magic) } else { bytes_starts_with(&data.value, &elf_magic) }
+        if !magic_ok || !bytes.equal(&data.value, &other.value) {
+            return harness.fail("target magic or reproducibility mismatch for " + triple)
+        }
+    }
+
+    if !p.write("cached.ddr", "import calc\nfn main(){print(calc.answer())}\n") { return false }
+    if !p.write("calc.ddr", "fn twice(n:i32)->i32{n+n}\npub fn answer()->i32{twice(21)}\n") { return false }
+    mut reused: i64 = 0
+    if !targets_and_cache_incremental(&p, 42, &mut reused) { return false }
+    if !targets_and_cache_incremental(&p, 42, &mut reused) { return false }
+    if reused <= 0 { return harness.fail("expected incremental reuse > 0") }
+
+    mut fragments: []string = []
+    if !collect_files_with_suffix(p.path("build/.dunder-cache"), ".fn", &mut fragments) || fragments.len == 0 {
+        return harness.fail("expected cached .fn fragments")
+    }
+    corrupt := bytes.from_text("invalid fragment")
+    for frag in &fragments {
+        if !sys.write_u8(frag, &corrupt).ok { return harness.fail("failed corrupting fragment " + frag) }
+    }
+    if !targets_and_cache_incremental(&p, 42, &mut reused) { return false }
+
+    if !p.write("calc.ddr", "fn twice(n:i32)->i32{n+n}\npub fn answer()->i32{twice(22)}\n") { return false }
+    if !targets_and_cache_incremental(&p, 44, &mut reused) { return false }
+
+    // Removing a module capability header must invalidate incremental fragments and test receipts.
+    if !p.write("cap_sec.ddr", "capability filesystem\nimport std.fs as fs\n@test fn ok_read(){true}\nfn main(){if false{_:=fs.ReadFile::grant(\"absent\")};print(7)}\n") { return false }
+    if !p.call(["build", "cap_sec.ddr", "--incremental", "--timings=json", "-o", "cap-sec"], 0, &mut out) { return false }
+    doc := json.Doc::parse_text(out.stderr_text())
+    if !doc.ok || doc.get_i64(doc.field(doc.root, "functions"), "emitted").unwrap_or(0) < 1 {
+        return harness.fail("expected emitted >= 1 for cap_sec: " + out.stderr_text())
+    }
+    if !p.call(["test", "cap_sec.ddr", "--affected", "-o", "cap-sec-tests"], 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), ", 0 failed") { return harness.fail("expected cap_sec test pass") }
+    if !p.call(["test", "cap_sec.ddr", "--affected", "-o", "cap-sec-tests"], 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "unaffected") { return harness.fail("expected cap_sec unaffected") }
+
+    if !p.write("cap_sec.ddr", "import std.fs as fs\n@test fn ok_read(){true}\nfn main(){if false{_:=fs.ReadFile::grant(\"absent\")};print(7)}\n") { return false }
+    if !p.call(["build", "cap_sec.ddr", "--incremental", "-o", "cap-sec"], 1, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "requires capability filesystem") {
+        return harness.fail("missing capability error on incremental build: " + out.stderr_text())
+    }
+    if !p.call(["test", "cap_sec.ddr", "--affected", "-o", "cap-sec-tests"], 1, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "requires capability filesystem") {
+        return harness.fail("missing capability error on affected test: " + out.stderr_text())
+    }
+    true
+}
+
+fn worker_invoke(entry: string, root: string, callback: string, args: []string, status: i32, out: &mut process.Output) -> bool {
+    _ := sys.remove_file(callback)
+    run_bin(entry, args, root, status, 60000, &mut out)
+}
+
+fn worker_observed(callback: string, workers: i32, checking: bool, agent: bool, dir_out: &mut string, id_out: &mut string) -> bool {
+    raw := sys.read_text(callback)
+    if !raw.ok { return harness.fail("missing callback.txt") }
+    lines := harness.lines(raw.value)
+    if lines.len != 5 || lines[0] != workers.str() || lines[1] != checking.str() || lines[2] != agent.str() {
+        return harness.fail("unexpected callback.txt: " + raw.value)
+    }
+    dir_out = lines[3].clone()
+    id_out = lines[4].clone()
+    true
+}
+
+fn worker_options(p: &Project, repo_root: string, serial_compiler: string) -> bool {
+    host := harness.host_id()
+    root_rp := fs.realpath(p.root)
+    if !root_rp.ok { return harness.fail("realpath failed on temp dir") }
+    sources_rp := fs.realpath(repo_root)
+    if !sources_rp.ok { return harness.fail("realpath failed on repo root") }
+    driver_module := relpath(sources_rp.value + "/selfhost/driver/driver", root_rp.value)
+
+    mut out := harness.empty_output()
+    mut serial_path := serial_compiler.clone()
+    if serial_path.len == 0 {
+        if !p.write("serial-entry.ddr", "import " + json.quote(driver_module) + " as driver\nfn main()->i32{driver.build(" + host.str() + ")}\n") { return false }
+        if !p.call(["build", "serial-entry.ddr", "-o", "serial-entry"], 0, &mut out) { return false }
+        serial_path = p.path("serial-entry")
+    }
+    serial := Project { compiler: serial_path, root: p.root.clone() }
+
+    if !p.write("workers.ddr", "fn twice(x:i32)->i32{x+x}\nfn main(){print(twice(21))}\n") { return false }
+    source := p.path("workers.ddr")
+    published := p.path("workers")
+    if !p.call(["build", source.clone(), "-o", published.clone()], 0, &mut out) { return false }
+    orig_read := sys.read_u8(published)
+    if !orig_read.ok { return harness.fail("failed reading workers binary") }
+    original := orig_read.value
+
+    if !p.call(["build", source.clone(), "--jobs", "1", "-o", published.clone()], 0, &mut out) { return false }
+    if out.stdout_text() != "built " + published + "\n" || out.stderr_text() != "" || !file_equals_bytes(published, &original) {
+        return harness.fail("unexpected --jobs 1 output or binary")
+    }
+    if !p.call(["build", source.clone(), "--jobs=1", "-o", published.clone()], 0, &mut out) { return false }
+    if out.stdout_text() != "built " + published + "\n" || out.stderr_text() != "" || !file_equals_bytes(published, &original) {
+        return harness.fail("unexpected --jobs=1 output or binary")
+    }
+
+    for action in ["build", "check", "build-tests", "run", "test"] {
+        if !serial.call([action.clone(), "absent.ddr", "--jobs", "2"], 2, &mut out) { return false }
+        if out.stderr_text() != "this compiler entry supports only --jobs 1\n" || out.stdout_text() != "" {
+            return harness.fail("serial rejection mismatch for " + action + ": " + out.stderr_text())
+        }
+    }
+    if !serial.call(["build", "absent.ddr", "--jobs=256"], 2, &mut out) { return false }
+    if out.stderr_text() != "this compiler entry supports only --jobs 1\n" || out.stdout_text() != "" {
+        return harness.fail("serial rejection mismatch for --jobs=256")
+    }
+    if !p.call(["build", source.clone(), "--jobs"], 2, &mut out) { return false }
+    if out.stderr_text() != "--jobs requires a worker count\n" {
+        return harness.fail("missing --jobs value error mismatch: " + out.stderr_text())
+    }
+    for value in ["", "0", "-1", "257", "1.5", "no", "9223372036854775808"] {
+        if !p.call(["build", source.clone(), "--jobs", value.clone()], 2, &mut out) { return false }
+        if out.stderr_text() != "--jobs must be an integer from 1 to 256\n" {
+            return harness.fail("invalid --jobs " + value + ": " + out.stderr_text())
+        }
+        if !p.call(["build", source.clone(), "--jobs=" + value], 2, &mut out) { return false }
+        if out.stderr_text() != "--jobs must be an integer from 1 to 256\n" {
+            return harness.fail("invalid --jobs=" + value + ": " + out.stderr_text())
+        }
+    }
+    if !p.call(["check", source.clone(), "--jobs", "1", "--jobs=1"], 2, &mut out) { return false }
+    if out.stderr_text() != "duplicate --jobs option\n" {
+        return harness.fail("duplicate --jobs error mismatch: " + out.stderr_text())
+    }
+
+    if !p.write("args.ddr", "import sys\nfn main(){print(sys.arg(1));print(sys.arg(2))}\n") { return false }
+    if !p.call(["run", "args.ddr", "--jobs=1", "--", "--jobs", "4"], 0, &mut out) { return false }
+    if out.stdout_text() != "--jobs\n4\n" {
+        return harness.fail("runtime --jobs passthrough mismatch: " + out.stdout_text())
+    }
+
+    prebuilt_cb := process.env("DUNDER_CALLBACK_BINARY").unwrap_or("")
+    mut entry := ""
+    if prebuilt_cb.len > 0 && sys.metadata(prebuilt_cb).ok {
+        entry = prebuilt_cb
+    } else {
+        fix_read := sys.read_text(sources_rp.value + "/tests/fixtures/driver-workers.ddr")
+        if !fix_read.ok { return harness.fail("failed reading tests/fixtures/driver-workers.ddr") }
+        mut fixture := fix_read.value
+        old_driver := "import ...selfhost.driver.driver"
+        if count_occurrences(fixture, old_driver) != 1 { return harness.fail("expected 1 driver import in driver-workers.ddr") }
+        fixture = text.replace(fixture, old_driver, "import " + json.quote(driver_module) + " as driver")
+        old_compile := "import ...selfhost.frontend.compile as compiler"
+        if count_occurrences(fixture, old_compile) != 1 { return harness.fail("expected 1 compile import in driver-workers.ddr") }
+        compile_module := relpath(sources_rp.value + "/selfhost/frontend/compile", root_rp.value)
+        fixture = text.replace(fixture, old_compile, "import " + json.quote(compile_module) + " as compiler")
+        fixture = text.replace(fixture, "driver.build_using(0,4,true,compile)", "driver.build_using(" + host.str() + ",4,true,compile)")
+        if !p.write("callback-entry.ddr", fixture) { return false }
+        if !p.call(["build", "callback-entry.ddr", "-o", "callback-entry"], 0, &mut out) { return false }
+        entry = p.path("callback-entry")
+    }
+    callback := p.path("callback.txt")
+    mut obs_dir := ""
+    mut obs_id := ""
+
+    if !worker_invoke(entry, p.root, callback, ["--help"], 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "default 4") || sys.metadata(callback).ok {
+        return harness.fail("unexpected --help output or callback invocation")
+    }
+
+    for idx in 0..4 {
+        mut w := 4
+        mut b_args: []string = ["build", source.clone()]
+        mut c_args: []string = ["check", source.clone()]
+        if idx == 1 {
+            w = 1
+            b_args.push("--jobs"); b_args.push("1")
+            c_args.push("--jobs"); c_args.push("1")
+        } else if idx == 2 {
+            w = 2
+            b_args.push("--jobs=2")
+            c_args.push("--jobs=2")
+        } else if idx == 3 {
+            w = 256
+            b_args.push("--jobs"); b_args.push("256")
+            c_args.push("--jobs"); c_args.push("256")
+        }
+        b_args.push("-o"); b_args.push(published.clone())
+        c_args.push("--agent")
+
+        if !worker_invoke(entry, p.root, callback, b_args, 0, &mut out) { return false }
+        if out.stdout_text() != "built " + published + "\n" || out.stderr_text() != "" || !file_equals_bytes(published, &original) {
+            return harness.fail("callback build mismatch for workers=" + w.str())
+        }
+        if !worker_observed(callback, w, false, false, &mut obs_dir, &mut obs_id) { return false }
+        if obs_dir != "" || obs_id != "" { return harness.fail("expected empty cache dir/id on non-incremental build") }
+
+        if !worker_invoke(entry, p.root, callback, c_args, 0, &mut out) { return false }
+        if !harness.agent_ok(&out) || out.stderr_text() != "" { return harness.fail("callback check mismatch for workers=" + w.str()) }
+        if !worker_observed(callback, w, true, true, &mut obs_dir, &mut obs_id) { return false }
+        if obs_dir != "" || obs_id != "" { return harness.fail("expected empty cache dir/id on check") }
+    }
+
+    for target in harness.targets() {
+        if !p.call(["build", source.clone(), "--target", target.clone(), "--jobs=1", "-o", "cross-serial"], 0, &mut out) { return false }
+        if !worker_invoke(entry, p.root, callback, ["build", source.clone(), "--target", target.clone(), "--jobs=4", "-o", "cross-callback"], 0, &mut out) { return false }
+        if out.stderr_text() != "" || !same_file_bytes(p.path("cross-serial"), p.path("cross-callback")) {
+            return harness.fail("cross target serial vs callback binary mismatch for " + target)
+        }
+        if !worker_observed(callback, 4, false, false, &mut obs_dir, &mut obs_id) { return false }
+    }
+
+    if !worker_invoke(entry, p.root, callback, ["check", source.clone(), "--jobs=4", "--profile-compiler", "--timings=json"], 0, &mut out) { return false }
+    clk_doc := json.Doc::parse_text(out.stderr_text())
+    if !clk_doc.ok || clk_doc.get_bool(clk_doc.root, "clock_ok") != .Some(true) {
+        return harness.fail("expected clock_ok true: " + out.stderr_text())
+    }
+    if !worker_observed(callback, 4, true, false, &mut obs_dir, &mut obs_id) { return false }
+    if obs_dir != "" || obs_id != "" { return harness.fail("expected empty cache dir/id on profiled check") }
+
+    mut dir1 := ""
+    mut id1 := ""
+    mut dir4 := ""
+    mut id4 := ""
+    for workers in [1, 4] {
+        if !worker_invoke(entry, p.root, callback, ["build", source.clone(), "--jobs=" + workers.str(), "--incremental", "--timings=json", "-o", published.clone()], 0, &mut out) { return false }
+        t_doc := json.Doc::parse_text(out.stderr_text())
+        if !t_doc.ok || t_doc.field(t_doc.root, "workers") >= 0 || t_doc.field(t_doc.root, "jobs") >= 0 {
+            return harness.fail("unexpected workers/jobs key in timings: " + out.stderr_text())
+        }
+        if workers == 4 {
+            if t_doc.get_i64(t_doc.field(t_doc.root, "functions"), "reused").unwrap_or(0) <= 0 {
+                return harness.fail("expected incremental reuse with --jobs=4: " + out.stderr_text())
+            }
+        }
+        if !file_equals_bytes(published, &original) { return harness.fail("incremental worker build changed image") }
+        if !worker_observed(callback, workers, false, false, &mut obs_dir, &mut obs_id) { return false }
+        if workers == 1 { dir1 = obs_dir.clone(); id1 = obs_id.clone() }
+        else { dir4 = obs_dir.clone(); id4 = obs_id.clone() }
+    }
+    if dir1 != dir4 || id1 != id4 || dir1.len == 0 {
+        return harness.fail("incremental worker cache directory/identity mismatch")
+    }
+
+    if !p.write("bad-workers.ddr", "fn main(){missing()}\n") { return false }
+    mut err1 := ""
+    mut err4 := ""
+    for workers in [1, 4] {
+        if !worker_invoke(entry, p.root, callback, ["check", "bad-workers.ddr", "--agent", "--jobs=" + workers.str()], 1, &mut out) { return false }
+        if out.stderr_text() != "" { return harness.fail("expected empty stderr on agent check") }
+        if !worker_observed(callback, workers, true, true, &mut obs_dir, &mut obs_id) { return false }
+        if !check_agent_error_record(out.stdout_text()).ok { return harness.fail("invalid agent error on bad-workers") }
+        if workers == 1 { err1 = out.stdout_text() } else { err4 = out.stdout_text() }
+    }
+    if err1 != err4 { return harness.fail("agent diagnostics differed between 1 and 4 workers") }
+
+    if !p.write("worker-cases.ddr", "@test fn ready(){true}\n") { return false }
+    if !worker_invoke(entry, p.root, callback, ["test", "worker-cases.ddr", "--affected", "--jobs=1"], 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "1 passed") { return harness.fail("expected 1 passed for worker-cases") }
+    if !worker_observed(callback, 1, false, false, &mut obs_dir, &mut obs_id) { return false }
+    if !worker_invoke(entry, p.root, callback, ["test", "worker-cases.ddr", "--affected", "--jobs=4"], 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "1 unaffected") { return harness.fail("expected 1 unaffected for worker-cases") }
+    if !worker_observed(callback, 4, false, false, &mut obs_dir, &mut obs_id) { return false }
+    true
+}
+
+fn isolated_tests(p: &Project) -> bool {
+    vals: []i32 = [42, 42, 41, 41]
+    pass_counts: []i32 = [2, 0, 0, 0]
+    skip_counts: []i32 = [0, 2, 1, 1]
+    codes: []i32 = [0, 0, 1, 1]
+    mut out := harness.empty_output()
+    for i in 0..4 {
+        src := "fn value()->i32{" + vals[i].str() + "}\n@test fn changed(){value()==42}\n@test fn other(){true}\n"
+        if !p.write("affected.ddr", src) { return false }
+        if !p.call(["test", "affected.ddr", "--affected"], codes[i], &mut out) { return false }
+        stdout_s := out.stdout_text()
+        if !text.contains(stdout_s, pass_counts[i].str() + " passed") ||
+           !text.contains(stdout_s, skip_counts[i].str() + " unaffected") {
+            return harness.fail("affected test mismatch at step " + i.str() + ": " + stdout_s)
+        }
+    }
+
+    timeout_src := "capability filesystem, unsafe\n" +
+        "import sys\n" +
+        "@extern(\"c\",\"fork\") unsafe fn fork()->i32\n" +
+        "@extern(\"c\",\"usleep\") unsafe fn sleep(us:u32)->i32\n" +
+        "@extern(\"c\",\"_exit\") unsafe fn finish(status:i32)\n" +
+        "@test fn descendant(){\n" +
+        "    unsafe {\n" +
+        "        pid:=fork()\n" +
+        "        assert(pid>=0)\n" +
+        "        if pid==0 {\n" +
+        "            print(\"child-ready\")\n" +
+        "            waiting:=sleep(500000)\n" +
+        "            write:=sys.write_text(\"escaped\", \"child survived\")\n" +
+        "            finish(0)\n" +
+        "        }\n" +
+        "        while true { waiting:=sleep(10000) }\n" +
+        "    }\n" +
+        "}\n" +
+        "@test fn next(){true}\n"
+    if !p.write("timeout.ddr", timeout_src) { return false }
+    if !p.call(["test", "timeout.ddr", "--timeout-ms", "300"], 1, &mut out) { return false }
+    report := out.stdout_text()
+    if !text.contains(report, "child-ready") || !text.contains(report, "exit 124") ||
+       !text.contains(report, "PASS timeout.ddr::next") || !text.contains(report, ", 1 failed") {
+        return harness.fail("unexpected timeout test report: " + report)
+    }
+    sys.sleep_ms(300)
+    if sys.metadata(p.path("escaped")).ok {
+        return harness.fail("timed out descendant child survived and created escaped")
+    }
+    true
+}
+
+fn opt_flag_reused(p: &Project, source: string, flag: string, mode: string, name: string, cached: bool, reused_out: &mut i64) -> bool {
+    mut args: []string = ["build", source.clone(), flag + "=" + mode, "--timings=json", "-o", name.clone()]
+    if cached { args.push("--incremental") }
+    mut out := harness.empty_output()
+    if !p.call(args, 0, &mut out) { return false }
+    doc := json.Doc::parse_text(out.stderr_text())
+    if !doc.ok { return harness.fail("invalid timings json: " + out.stderr_text()) }
+    reused := doc.get_i64(doc.field(doc.root, "functions"), "reused")
+    if reused.is_none() { return harness.fail("missing functions.reused: " + out.stderr_text()) }
+    reused_out = reused.unwrap()
+    true
+}
+
+fn scalar_optimizer_controls(p: &Project) -> bool {
+    if !p.write("scalar.ddr", "fn sum(values:&[]i64)->i64{mut result:i64=0;mut i:=0;while i<values.len{result=result+values[i];i=i+1};result}\nfn main(){values:[]i64=[20,22];print(sum(&values))}\n") { return false }
+    mut out := harness.empty_output()
+    if !p.call(["build", "scalar.ddr", "--scalar-opt=on", "--timings=json", "-o", "scalar-on"], 0, &mut out) { return false }
+    on_doc := json.Doc::parse_text(out.stderr_text())
+    if !on_doc.ok { return harness.fail("invalid scalar-on json") }
+    enabled := on_doc.field(on_doc.root, "optimizer")
+    if on_doc.get_bool(enabled, "enabled") != .Some(true) ||
+       on_doc.get_i64(enabled, "modeled").unwrap_or(0) < 1 ||
+       on_doc.get_i64(enabled, "emitted").unwrap_or(0) < 1 ||
+       on_doc.get_i64(enabled, "proven_bounds").unwrap_or(0) < 1 {
+        return harness.fail("unexpected scalar-on optimizer stats: " + out.stderr_text())
+    }
+
+    if !p.call(["build", "scalar.ddr", "--scalar-opt=off", "--timings=json", "-o", "scalar-off"], 0, &mut out) { return false }
+    off_doc := json.Doc::parse_text(out.stderr_text())
+    if !off_doc.ok { return harness.fail("invalid scalar-off json") }
+    disabled := off_doc.field(off_doc.root, "optimizer")
+    zero_keys: []string = ["modeled", "emitted", "rewrites", "proven_bounds", "fallbacks"]
+    if off_doc.get_bool(disabled, "enabled") != .Some(false) || !json_keys_zero(&off_doc, disabled, &zero_keys) {
+        return harness.fail("unexpected scalar-off optimizer stats: " + out.stderr_text())
+    }
+
+    for binary in ["scalar-on", "scalar-off"] {
+        if !run_bin(p.path(binary), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "42\n" { return harness.fail(binary + " stdout mismatch: " + out.stdout_text()) }
+    }
+
+    mut on_chk := harness.empty_output()
+    mut off_chk := harness.empty_output()
+    if !p.call(["check", "scalar.ddr", "--agent", "--scalar-opt=on"], 0, &mut on_chk) { return false }
+    if !p.call(["check", "scalar.ddr", "--agent", "--scalar-opt=off"], 0, &mut off_chk) { return false }
+    if on_chk.stdout_text() != off_chk.stdout_text() || on_chk.stderr_text() != "" || off_chk.stderr_text() != "" {
+        return harness.fail("scalar check mismatch between on and off")
+    }
+
+    mut reused: i64 = 0
+    if !opt_flag_reused(&p, "scalar.ddr", "--scalar-opt", "on", "cached-on", true, &mut reused) { return false }
+    if !opt_flag_reused(&p, "scalar.ddr", "--scalar-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("scalar cached-on expected reuse") }
+    if !opt_flag_reused(&p, "scalar.ddr", "--scalar-opt", "off", "cached-off", true, &mut reused) || reused != 0 { return harness.fail("scalar cached-off cold expected 0 reuse") }
+    if !opt_flag_reused(&p, "scalar.ddr", "--scalar-opt", "off", "cached-off", true, &mut reused) || reused <= 0 { return harness.fail("scalar cached-off warm expected reuse") }
+    if !opt_flag_reused(&p, "scalar.ddr", "--scalar-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("scalar cached-on re-warm expected reuse") }
+
+    if !p.write("scalar-tests.ddr", "fn answer()->i32{40+2}\n@test fn works(){assert(answer()==42)}\n") { return false }
+    modes: []string = ["on", "on", "off", "off", "on"]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed", "1 unaffected", "1 passed"]
+    for i in 0..modes.len {
+        if !p.call(["test", "scalar-tests.ddr", "--affected", "--scalar-opt=" + modes[i], "-o", "scalar-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) {
+            return harness.fail("scalar-tests mismatch at " + i.str() + ": " + out.stdout_text())
+        }
+    }
+    p.call(["check", "scalar.ddr", "--scalar-opt=unknown"], 2, &mut out)
+}
+
+fn ownership_optimizer_controls(p: &Project) -> bool {
+    if !p.write("leases.ddr", "fn same(a:string,b:string)->bool{a==b}\nfn main(){a:=\"same\";print(same(a,\"same\"))}\n") { return false }
+    mut reused: i64 = 0
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "on", "leases-on", false, &mut reused) { return false }
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "off", "leases-off", false, &mut reused) { return false }
+    m_on := sys.metadata(p.path("leases-on"))
+    m_off := sys.metadata(p.path("leases-off"))
+    if !m_on.ok || !m_off.ok || m_on.size > m_off.size {
+        return harness.fail("expected leases-on size <= leases-off size")
+    }
+    mut out := harness.empty_output()
+    for name in ["leases-on", "leases-off"] {
+        if !run_bin(p.path(name), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "true\n" || out.stderr_text() != "" {
+            return harness.fail(name + " unexpected output")
+        }
+    }
+    mut on_chk := harness.empty_output()
+    mut off_chk := harness.empty_output()
+    if !p.call(["check", "leases.ddr", "--agent", "--ownership-opt=on"], 0, &mut on_chk) { return false }
+    if !p.call(["check", "leases.ddr", "--agent", "--ownership-opt=off"], 0, &mut off_chk) { return false }
+    if on_chk.stdout_text() != off_chk.stdout_text() || on_chk.stderr_text() != "" || off_chk.stderr_text() != "" {
+        return harness.fail("ownership check mismatch")
+    }
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "on", "cached-on", true, &mut reused) || reused != 0 { return harness.fail("ownership cached-on cold expected 0") }
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("ownership cached-on warm expected >0") }
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "off", "cached-off", true, &mut reused) || reused != 0 { return harness.fail("ownership cached-off cold expected 0") }
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "off", "cached-off", true, &mut reused) || reused <= 0 { return harness.fail("ownership cached-off warm expected >0") }
+    if !opt_flag_reused(&p, "leases.ddr", "--ownership-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("ownership cached-on re-warm expected >0") }
+
+    if !p.write("lease-tests.ddr", "fn same(a:string,b:string)->bool{a==b}\n@test fn works(){same(\"a\",\"a\")}\n") { return false }
+    modes: []string = ["on", "on", "off"]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..modes.len {
+        if !p.call(["test", "lease-tests.ddr", "--affected", "--ownership-opt=" + modes[i], "-o", "lease-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) { return harness.fail("lease-tests mismatch: " + out.stdout_text()) }
+    }
+    p.call(["check", "leases.ddr", "--ownership-opt=unknown"], 2, &mut out)
+}
+
+fn constant_division_controls(p: &Project) -> bool {
+    if !p.write("division.ddr", "fn divided(x:i64)->i64{x/37}\nfn main(){print(divided(1554))}\n") { return false }
+    mut reused: i64 = 0
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "on", "division-on", false, &mut reused) { return false }
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "off", "division-off", false, &mut reused) { return false }
+    if !diff_file_bytes(p.path("division-on"), p.path("division-off")) {
+        return harness.fail("expected division-on and division-off images to differ")
+    }
+    mut out := harness.empty_output()
+    for name in ["division-on", "division-off"] {
+        if !run_bin(p.path(name), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "42\n" || out.stderr_text() != "" { return harness.fail(name + " unexpected output") }
+    }
+    mut on_chk := harness.empty_output()
+    mut off_chk := harness.empty_output()
+    if !p.call(["check", "division.ddr", "--agent", "--const-div-opt=on"], 0, &mut on_chk) { return false }
+    if !p.call(["check", "division.ddr", "--agent", "--const-div-opt=off"], 0, &mut off_chk) { return false }
+    if on_chk.stdout_text() != off_chk.stdout_text() || on_chk.stderr_text() != "" || off_chk.stderr_text() != "" {
+        return harness.fail("const-div check mismatch")
+    }
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "on", "cached-on", true, &mut reused) || reused != 0 { return harness.fail("const-div cached-on cold expected 0") }
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("const-div cached-on warm expected >0") }
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "off", "cached-off", true, &mut reused) || reused != 0 { return harness.fail("const-div cached-off cold expected 0") }
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "off", "cached-off", true, &mut reused) || reused <= 0 { return harness.fail("const-div cached-off warm expected >0") }
+    if !opt_flag_reused(&p, "division.ddr", "--const-div-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("const-div cached-on re-warm expected >0") }
+
+    if !p.write("division-tests.ddr", "fn divided(x:i64)->i64{x/37}\n@test fn works(){divided(1554)==42}\n") { return false }
+    modes: []string = ["on", "on", "off"]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..modes.len {
+        if !p.call(["test", "division-tests.ddr", "--affected", "--const-div-opt=" + modes[i], "-o", "division-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) { return harness.fail("division-tests mismatch: " + out.stdout_text()) }
+    }
+    p.call(["check", "division.ddr", "--const-div-opt=unknown"], 2, &mut out)
+}
+
+fn frame_free_controls(p: &Project) -> bool {
+    if !p.write("frames.ddr", "fn added(a:i64,b:i64)->i64{a+b}\nfn main(){print(added(20,22))}\n") { return false }
+    mut reused: i64 = 0
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "on", "frame-on", false, &mut reused) { return false }
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "off", "frame-off", false, &mut reused) { return false }
+    identical := same_file_bytes(p.path("frame-on"), p.path("frame-off"))
+    if identical != (process.host_arch() != "arm64") {
+        return harness.fail("unexpected frame-free image comparison for host arch " + process.host_arch())
+    }
+    mut out := harness.empty_output()
+    for name in ["frame-on", "frame-off"] {
+        if !run_bin(p.path(name), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "42\n" || out.stderr_text() != "" { return harness.fail(name + " unexpected output") }
+    }
+    mut on_chk := harness.empty_output()
+    mut off_chk := harness.empty_output()
+    if !p.call(["check", "frames.ddr", "--agent", "--frame-free=on"], 0, &mut on_chk) { return false }
+    if !p.call(["check", "frames.ddr", "--agent", "--frame-free=off"], 0, &mut off_chk) { return false }
+    if on_chk.stdout_text() != off_chk.stdout_text() || on_chk.stderr_text() != "" || off_chk.stderr_text() != "" {
+        return harness.fail("frame-free check mismatch")
+    }
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "on", "cached-on", true, &mut reused) || reused != 0 { return harness.fail("frame-free cached-on cold expected 0") }
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("frame-free cached-on warm expected >0") }
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "off", "cached-off", true, &mut reused) || reused != 0 { return harness.fail("frame-free cached-off cold expected 0") }
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "off", "cached-off", true, &mut reused) || reused <= 0 { return harness.fail("frame-free cached-off warm expected >0") }
+    if !opt_flag_reused(&p, "frames.ddr", "--frame-free", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("frame-free cached-on re-warm expected >0") }
+
+    if !p.write("frame-tests.ddr", "fn added(a:i64,b:i64)->i64{a+b}\n@test fn works(){added(20,22)==42}\n") { return false }
+    modes: []string = ["on", "on", "off"]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..modes.len {
+        if !p.call(["test", "frame-tests.ddr", "--affected", "--frame-free=" + modes[i], "-o", "frame-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) { return harness.fail("frame-tests mismatch: " + out.stdout_text()) }
+    }
+    p.call(["check", "frames.ddr", "--frame-free=unknown"], 2, &mut out)
+}
+
+fn range_build_doc(p: &Project, mode: string, name: string, cached: bool, profiled: bool, doc_out: &mut json.Doc) -> bool {
+    mut args: []string = ["build", "range.ddr", "--range-opt=" + mode, "--timings=json", "-o", name.clone()]
+    if cached { args.push("--incremental") }
+    if profiled { args.push("--profile-compiler") }
+    mut out := harness.empty_output()
+    if !p.call(args, 0, &mut out) { return false }
+    parsed := json.Doc::parse_text(out.stderr_text())
+    if !parsed.ok { return harness.fail("invalid range timings json: " + out.stderr_text()) }
+    doc_out = parsed
+    true
+}
+
+fn range_optimizer_controls(p: &Project) -> bool {
+    if !p.write("range.ddr", "fn fill(values:&mut[]i64){for i in 0..values.len{values[i]=values[i]+1}}\nfn main(){mut values:[]i64=[41,17];fill(&mut values);print(values[0])}\n") { return false }
+    mut on_doc := json.Doc::parse_text("{}")
+    mut off_doc := json.Doc::parse_text("{}")
+    if !range_build_doc(&p, "on", "range-on", false, true, &mut on_doc) { return false }
+    if !range_build_doc(&p, "off", "range-off", false, true, &mut off_doc) { return false }
+
+    on_opt := on_doc.field(on_doc.root, "optimizer")
+    off_opt := off_doc.field(off_doc.root, "optimizer")
+    on_cd := on_doc.field(on_doc.root, "compiler_detail")
+    off_cd := off_doc.field(off_doc.root, "compiler_detail")
+    if on_doc.get_i64(on_opt, "proven_bounds").unwrap_or(0) < 2 ||
+       off_doc.get_i64(off_opt, "proven_bounds") != .Some(0) ||
+       on_doc.get_i64(on_doc.field(on_cd, "calls"), "range_analysis").unwrap_or(0) < 1 ||
+       on_doc.get_i64(on_doc.field(on_cd, "work"), "range_analysis_operations").unwrap_or(0) <= 0 ||
+       off_doc.get_i64(off_doc.field(off_cd, "calls"), "range_analysis") != .Some(0) {
+        return harness.fail("range optimizer counters mismatch")
+    }
+    if !diff_file_bytes(p.path("range-on"), p.path("range-off")) {
+        return harness.fail("expected range-on and range-off images to differ")
+    }
+
+    mut out := harness.empty_output()
+    for name in ["range-on", "range-off"] {
+        if !run_bin(p.path(name), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "42\n" || out.stderr_text() != "" { return harness.fail(name + " unexpected output") }
+    }
+    mut on_chk := harness.empty_output()
+    mut off_chk := harness.empty_output()
+    if !p.call(["check", "range.ddr", "--agent", "--range-opt=on"], 0, &mut on_chk) { return false }
+    if !p.call(["check", "range.ddr", "--agent", "--range-opt=off"], 0, &mut off_chk) { return false }
+    if on_chk.stdout_text() != off_chk.stdout_text() || on_chk.stderr_text() != "" || off_chk.stderr_text() != "" {
+        return harness.fail("range check mismatch")
+    }
+
+    mut reused: i64 = 0
+    if !opt_flag_reused(&p, "range.ddr", "--range-opt", "on", "cached-on", true, &mut reused) || reused != 0 { return harness.fail("range cached-on cold expected 0") }
+    if !opt_flag_reused(&p, "range.ddr", "--range-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("range cached-on warm expected >0") }
+    if !opt_flag_reused(&p, "range.ddr", "--range-opt", "off", "cached-off", true, &mut reused) || reused != 0 { return harness.fail("range cached-off cold expected 0") }
+    if !opt_flag_reused(&p, "range.ddr", "--range-opt", "off", "cached-off", true, &mut reused) || reused <= 0 { return harness.fail("range cached-off warm expected >0") }
+    if !opt_flag_reused(&p, "range.ddr", "--range-opt", "on", "cached-on", true, &mut reused) || reused <= 0 { return harness.fail("range cached-on re-warm expected >0") }
+
+    if !p.write("range-tests.ddr", "fn fill(values:&mut[]i64){for i in 0..values.len{values[i]=1}}\n@test fn works(){mut values:[]i64=[0,0];fill(&mut values);values[0]==1}\n") { return false }
+    modes: []string = ["on", "on", "off"]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..modes.len {
+        if !p.call(["test", "range-tests.ddr", "--affected", "--range-opt=" + modes[i], "-o", "range-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) { return harness.fail("range-tests mismatch: " + out.stdout_text()) }
+    }
+    if !p.call(["check", "range.ddr", "--range-opt=unknown"], 2, &mut out) { return false }
+
+    // Arithmetic eligibility must not depend on a dummy array parameter.
+    if !p.write("range-scalar.ddr", "fn bounded(x:i32)->i32{if x>=-10&&x<=10{return x*x+1};0}\nfn main(){print(bounded(3))}\n") { return false }
+    mut scalar_off_calls: i64 = -1
+    mut scalar_on_calls: i64 = -1
+    for mode in ["off", "on"] {
+        name := "range-scalar-" + mode
+        if !p.call(["build", "range-scalar.ddr", "--range-opt=" + mode, "--profile-compiler", "--timings=json", "-o", name.clone()], 0, &mut out) { return false }
+        doc := json.Doc::parse_text(out.stderr_text())
+        if !doc.ok { return harness.fail("invalid range-scalar json") }
+        calls := doc.get_i64(doc.field(doc.field(doc.root, "compiler_detail"), "calls"), "range_analysis").unwrap_or(-1)
+        if mode == "off" { scalar_off_calls = calls } else { scalar_on_calls = calls }
+        if !run_bin(p.path(name), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "10\n" || out.stderr_text() != "" { return harness.fail(name + " unexpected output") }
+    }
+    if scalar_on_calls <= 0 || scalar_off_calls != 0 {
+        return harness.fail("range-scalar range_analysis call counts mismatch")
+    }
+    if !diff_file_bytes(p.path("range-scalar-off"), p.path("range-scalar-on")) {
+        return harness.fail("expected range-scalar-off and range-scalar-on images to differ")
+    }
+
+    // A child overflow leaves no normal continuation for parent interval math.
+    if !p.write("range-bottom.ddr", "fn bad()->i32{(2147483647*2147483647)*0}\nfn main(){print(bad())}\n") { return false }
+    for mode in ["off", "on"] {
+        name := "range-bottom-" + mode
+        if !p.call(["build", "range-bottom.ddr", "--range-opt=" + mode, "-o", name.clone()], 0, &mut out) { return false }
+        if !run_bin(p.path(name), [], p.root, 101, 10000, &mut out) { return false }
+        if out.stdout_text() != "" || out.stderr_text() != "" { return harness.fail(name + " expected empty output on overflow trap") }
+    }
+    true
+}
+
+fn inline_build_doc(p: &Project, mode: string, name: string, cached: bool, scalar: string, doc_out: &mut json.Doc) -> bool {
+    mut args: []string = ["build", "inline.ddr", "--inline-opt=" + mode, "--scalar-opt=" + scalar, "--timings=json", "-o", name.clone()]
+    if cached { args.push("--incremental") }
+    mut out := harness.empty_output()
+    if !p.call(args, 0, &mut out) { return false }
+    parsed := json.Doc::parse_text(out.stderr_text())
+    if !parsed.ok { return harness.fail("invalid inline timings json: " + out.stderr_text()) }
+    doc_out = parsed
+    true
+}
+
+fn inline_optimizer_controls(p: &Project) -> bool {
+    source := "fn step(value:i64)->i64{value*3+1}\nfn main(){print(step(2))}\n"
+    if !p.write("inline.ddr", source) { return false }
+    mut off_doc := json.Doc::parse_text("{}")
+    mut on_doc := json.Doc::parse_text("{}")
+    if !inline_build_doc(&p, "off", "inline-off", false, "on", &mut off_doc) { return false }
+    if !inline_build_doc(&p, "on", "inline-on", false, "on", &mut on_doc) { return false }
+
+    dis_inl := off_doc.field(off_doc.root, "inlining")
+    if off_doc.get_bool(dis_inl, "enabled") != .Some(false) { return harness.fail("expected inline-off disabled") }
+    for i in 0..off_doc.count(dis_inl) {
+        k := off_doc.key_at(dis_inl, i).unwrap_or("")
+        if k != "enabled" && off_doc.as_i64(off_doc.val_at(dis_inl, i)) != .Some(0) {
+            return harness.fail("expected inline-off key " + k + " == 0")
+        }
+    }
+
+    en_inl := on_doc.field(on_doc.root, "inlining")
+    entries := on_doc.get_i64(en_inl, "entries").unwrap_or(-1)
+    nodes := on_doc.get_i64(en_inl, "nodes").unwrap_or(-1)
+    tokens := on_doc.get_i64(en_inl, "tokens").unwrap_or(-1)
+    units := on_doc.get_i64(en_inl, "units").unwrap_or(-1)
+    calls := on_doc.get_i64(en_inl, "calls").unwrap_or(-1)
+    words := on_doc.get_i64(en_inl, "words").unwrap_or(-1)
+    est_words := on_doc.get_i64(en_inl, "estimated_words").unwrap_or(-1)
+    if on_doc.get_bool(en_inl, "enabled") != .Some(true) ||
+       entries <= 0 || entries > 256 || nodes <= 0 || nodes > 4096 ||
+       tokens <= 0 || tokens > 32768 || units <= 0 || units > 65536 ||
+       calls != 1 || words <= 0 || words > est_words || est_words > 65536 {
+        return harness.fail("unexpected inline-on counters")
+    }
+    if !diff_file_bytes(p.path("inline-on"), p.path("inline-off")) {
+        return harness.fail("expected inline-on and inline-off images to differ")
+    }
+
+    mut out := harness.empty_output()
+    for name in ["inline-on", "inline-off"] {
+        if !run_bin(p.path(name), [], p.root, 0, 10000, &mut out) { return false }
+        if out.stdout_text() != "7\n" || out.stderr_text() != "" { return harness.fail(name + " unexpected output") }
+    }
+
+    mut doc := json.Doc::parse_text("{}")
+    for mode in ["off", "on"] {
+        if !inline_build_doc(&p, mode, "inline-scalar-" + mode, false, "off", &mut doc) { return false }
+        so := doc.field(doc.root, "inlining")
+        if doc.get_bool(so, "enabled") != .Some(false) || doc.get_i64(so, "calls") != .Some(0) || doc.get_i64(so, "tokens") != .Some(0) {
+            return harness.fail("inlining must be disabled when scalar-opt=off")
+        }
+    }
+    if !same_file_bytes(p.path("inline-scalar-on"), p.path("inline-scalar-off")) {
+        return harness.fail("inline-scalar-on and off should match when scalar-opt=off")
+    }
+
+    if !inline_build_doc(&p, "off", "inline-cached-off", true, "on", &mut doc) ||
+       doc.get_i64(doc.field(doc.root, "functions"), "reused") != .Some(0) { return harness.fail("inline-cached-off cold expected 0") }
+    if !inline_build_doc(&p, "off", "inline-cached-off", true, "on", &mut doc) ||
+       doc.get_i64(doc.field(doc.root, "functions"), "reused").unwrap_or(0) <= 0 { return harness.fail("inline-cached-off warm expected >0") }
+    if !inline_build_doc(&p, "on", "inline-cached-on", true, "on", &mut doc) ||
+       doc.get_i64(doc.field(doc.root, "functions"), "reused") != .Some(0) { return harness.fail("inline-cached-on cold expected 0") }
+    if !inline_build_doc(&p, "on", "inline-cached-on", true, "on", &mut doc) { return false }
+    if !same_file_bytes(p.path("inline-cached-on"), p.path("inline-on")) {
+        return harness.fail("inline-cached-on must match inline-on")
+    }
+
+    // Caller fragments must follow private callee changes even without a BL.
+    if !p.write("inline.ddr", text.replace(source, "value*3+1", "value*3+4")) { return false }
+    if !inline_build_doc(&p, "on", "inline-changed", true, "on", &mut doc) ||
+       doc.get_i64(doc.field(doc.root, "functions"), "reused") != .Some(0) {
+        return harness.fail("inline-changed must invalidate caller fragment")
+    }
+    if !inline_build_doc(&p, "on", "inline-uncached", false, "on", &mut doc) { return false }
+    if !same_file_bytes(p.path("inline-changed"), p.path("inline-uncached")) {
+        return harness.fail("inline-changed must match inline-uncached")
+    }
+    if !run_bin(p.path("inline-changed"), [], p.root, 0, 10000, &mut out) { return false }
+    if out.stdout_text() != "10\n" || out.stderr_text() != "" { return harness.fail("inline-changed unexpected output") }
+
+    mut off_chk := harness.empty_output()
+    mut on_chk := harness.empty_output()
+    if !p.call(["check", "inline.ddr", "--agent", "--inline-opt=off"], 0, &mut off_chk) { return false }
+    if !p.call(["check", "inline.ddr", "--agent", "--inline-opt=on", "--timings=json"], 0, &mut on_chk) { return false }
+    if off_chk.stdout_text() != on_chk.stdout_text() || off_chk.stderr_text() != "" {
+        return harness.fail("inline check stdout/stderr mismatch")
+    }
+    chk_doc := json.Doc::parse_text(on_chk.stderr_text())
+    chk_inl := chk_doc.field(chk_doc.root, "inlining")
+    if !chk_doc.ok || chk_doc.get_bool(chk_inl, "enabled") != .Some(false) ||
+       chk_doc.get_i64(chk_inl, "calls") != .Some(0) || chk_doc.get_i64(chk_inl, "tokens") != .Some(0) {
+        return harness.fail("inlining must be disabled during check")
+    }
+
+    if !p.write("inline-tests.ddr", "fn step(x:i32)->i32{x*3+1}\n@test fn works(){step(2)==7}\n") { return false }
+    modes: []string = ["off", "off", "on"]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..modes.len {
+        if !p.call(["test", "inline-tests.ddr", "--inline-opt=" + modes[i], "--affected", "-o", "inline-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) { return harness.fail("inline-tests mismatch: " + out.stdout_text()) }
+    }
+
+    mut wide_expr := "x"
+    for _ in 0..24 { wide_expr += "+1" }
+    if !p.write("closed.ddr", "fn cold(x:i64)->i64{x*7}\nfn leaf(x:i64)->i64{x+1}\nfn wide(x:i64)->i64{" + wide_expr + "}\nfn main(){print(wide(leaf(1)))}\n") { return false }
+    for jobs in [1, 4] {
+        if !p.call(["build", "closed.ddr", "--jobs=" + jobs.str(), "--profile-compiler", "--timings=json", "-o", "closed"], 0, &mut out) { return false }
+        c_doc := json.Doc::parse_text(out.stderr_text())
+        c_calls := c_doc.field(c_doc.field(c_doc.root, "compiler_detail"), "calls")
+        if !c_doc.ok || c_doc.get_i64(c_calls, "model_parse") != .Some(3) || c_doc.get_i64(c_calls, "verify_pre") != .Some(3) {
+            return harness.fail("closed.ddr expected model_parse == verify_pre == 3: " + out.stderr_text())
+        }
+    }
+
+    invalid := "fn bad(x:i64)->bool{x+1}\n"
+    mains: []string = ["missing()", "print(1)"]
+    errs: []string = ["unknown function 'missing'", "type mismatch"]
+    for i in 0..2 {
+        if !p.write("closed-error.ddr", invalid + "fn main(){" + mains[i] + "}\n") { return false }
+        mut expected := harness.empty_output()
+        if !p.call(["build", "closed-error.ddr", "--inline-opt=off", "-o", "invalid"], 1, &mut expected) { return false }
+        if !text.contains(expected.stderr_text(), errs[i]) {
+            return harness.fail("closed-error expected " + errs[i] + ", got " + expected.stderr_text())
+        }
+        for jobs in [1, 4] {
+            mut actual := harness.empty_output()
+            if !p.call(["build", "closed-error.ddr", "--jobs=" + jobs.str(), "-o", "invalid"], 1, &mut actual) { return false }
+            if actual.stderr_text() != expected.stderr_text() {
+                return harness.fail("closed-error stderr differed for jobs=" + jobs.str())
+            }
+        }
+    }
+    p.call(["check", "inline.ddr", "--inline-opt=unknown"], 2, &mut out)
+}
+
+fn whole_function_mir_controls(p: &Project) -> bool {
+    if !p.write("mir.ddr", "fn step(x:i32)->i32{x*3+1}\nfn main(){mut value:i32=1;for i in 0..8{value=step(value)};print(value)}\n") { return false }
+    native := process.host_target()
+    mut out := harness.empty_output()
+    for scalar in ["on", "off"] {
+        targets := if scalar == "on" { harness.targets() } else { [native.clone()] }
+        for target in targets {
+            for mode in ["off", "on"] {
+                name := "mir-" + target + "-" + scalar + "-" + mode
+                if !p.call(["build", "mir.ddr", "--target", target.clone(), "--mir=" + mode, "--scalar-opt=" + scalar, "--inline-opt=off", "--timings=json", "-o", name], 0, &mut out) { return false }
+                doc := json.Doc::parse_text(out.stderr_text())
+                if !doc.ok { return harness.fail("invalid mir json") }
+                backend := doc.field(doc.root, "mir")
+                if doc.get_bool(backend, "enabled") != .Some(true) ||
+                   doc.get_bool(backend, "optimization_enabled") != .Some(mode == "on") ||
+                   doc.get_i64(backend, "functions") != .Some(2) ||
+                   doc.get_i64(doc.field(doc.root, "functions"), "emitted") != .Some(2) ||
+                   doc.get_i64(backend, "operations").unwrap_or(0) <= 0 {
+                    return harness.fail("mir build report mismatch: " + out.stderr_text())
+                }
+            }
+        }
+    }
+    for mode in ["off", "on"] {
+        if !p.call(["run", "mir.ddr", "--mir=" + mode, "--inline-opt=off"], 0, &mut out) { return false }
+        if out.stdout_text() != "9841\n" { return harness.fail("mir run stdout mismatch: " + out.stdout_text()) }
+    }
+    mut normal := harness.empty_output()
+    mut checked := harness.empty_output()
+    if !p.call(["check", "mir.ddr", "--agent", "--mir=off"], 0, &mut normal) { return false }
+    if !p.call(["check", "mir.ddr", "--agent", "--mir=on", "--timings=json"], 0, &mut checked) { return false }
+    if checked.stdout_text() != normal.stdout_text() || normal.stderr_text() != "" {
+        return harness.fail("mir check mismatch")
+    }
+    chk_doc := json.Doc::parse_text(checked.stderr_text())
+    chk_mir := chk_doc.field(chk_doc.root, "mir")
+    if !chk_doc.ok || chk_doc.get_bool(chk_mir, "enabled") != .Some(false) ||
+       chk_doc.get_i64(chk_mir, "functions") != .Some(0) ||
+       chk_doc.get_i64(chk_mir, "operations") != .Some(0) ||
+       chk_doc.get_i64(chk_mir, "opaque") != .Some(0) {
+        return harness.fail("mir should be disabled during check: " + checked.stderr_text())
+    }
+
+    inc_modes: []string = ["on", "on", "off", "off", "on"]
+    inc_reused: []i64 = [0, 2, 0, 2, 2]
+    for i in 0..inc_modes.len {
+        if !p.call(["build", "mir.ddr", "--incremental", "--timings=json", "--inline-opt=off", "--mir=" + inc_modes[i], "-o", "mir-cached"], 0, &mut out) { return false }
+        doc := json.Doc::parse_text(out.stderr_text())
+        if !doc.ok || !json_check_functions(&doc, doc.root, inc_reused[i], 2 - inc_reused[i]) ||
+           doc.get_i64(doc.field(doc.root, "mir"), "functions") != .Some(2 - inc_reused[i]) {
+            return harness.fail("mir incremental mismatch at " + i.str() + ": " + out.stderr_text())
+        }
+    }
+
+    f1s: []string = ["--mir=off", "--mir=on"]
+    f2s: []string = ["--mir-opt=on", "--mir-opt=off"]
+    for i in 0..2 {
+        if !p.call(["build", "mir.ddr", "--incremental", "--timings=json", "--inline-opt=off", f1s[i].clone(), f2s[i].clone(), "-o", "mir-cached"], 0, &mut out) { return false }
+        doc := json.Doc::parse_text(out.stderr_text())
+        mir := doc.field(doc.root, "mir")
+        if !doc.ok || !json_check_functions(&doc, doc.root, 2, 0) ||
+           doc.get_bool(mir, "enabled") != .Some(true) || doc.get_bool(mir, "optimization_enabled") != .Some(false) {
+            return harness.fail("mir flag interaction mismatch: " + out.stderr_text())
+        }
+    }
+
+    if !p.write("mir-tests.ddr", "@test fn works(){true}\n") { return false }
+    t_modes: []string = ["off", "off", "on"]
+    t_expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..t_modes.len {
+        if !p.call(["test", "mir-tests.ddr", "--mir=" + t_modes[i], "--affected", "-o", "mir-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), t_expects[i]) { return harness.fail("mir-tests mismatch: " + out.stdout_text()) }
+    }
+    p.call(["check", "mir.ddr", "--mir=unknown"], 2, &mut out)
+}
+
+fn whole_function_optimizer_controls(p: &Project) -> bool {
+    if !p.write("promotion.ddr", "fn step(x:i32)->i32{x*3+1}\nfn main(){mut value:i32=1;for i in 0..8{value=step(value)};print(value)}\n") { return false }
+    work: []string = ["optimized", "promoted", "removed_loads", "removed_stores", "analysis_units", "budget_refusals"]
+    work_pos: []string = ["optimized", "promoted", "removed_loads", "removed_stores", "analysis_units"]
+    mut out := harness.empty_output()
+    for mode in ["off", "on"] {
+        if !p.call(["run", "promotion.ddr", "--inline-opt=off", "--mir-opt=" + mode, "--timings=json", "-o", "promotion-" + mode], 0, &mut out) { return false }
+        if out.stdout_text() != "9841\n" { return harness.fail("promotion run stdout mismatch") }
+        doc := json.Doc::parse_text(out.stderr_text())
+        backend := doc.field(doc.root, "mir")
+        if !doc.ok || doc.get_bool(backend, "enabled") != .Some(true) ||
+           doc.get_bool(backend, "optimization_enabled") != .Some(mode == "on") ||
+           !json_keys_nonneg_int(&doc, backend, &work) {
+            return harness.fail("promotion mir stats mismatch: " + out.stderr_text())
+        }
+        if mode == "off" {
+            if !json_keys_zero(&doc, backend, &work) { return harness.fail("promotion off expected zero work") }
+        } else {
+            if !json_keys_pos(&doc, backend, &work_pos) { return harness.fail("promotion on expected positive work") }
+        }
+    }
+
+    mut plain := harness.empty_output()
+    mut checked := harness.empty_output()
+    if !p.call(["check", "promotion.ddr", "--agent", "--mir-opt=off"], 0, &mut plain) { return false }
+    if !p.call(["check", "promotion.ddr", "--agent", "--mir-opt=on", "--timings=json"], 0, &mut checked) { return false }
+    if checked.stdout_text() != plain.stdout_text() || plain.stderr_text() != "" {
+        return harness.fail("promotion check mismatch")
+    }
+    chk_doc := json.Doc::parse_text(checked.stderr_text())
+    chk_mir := chk_doc.field(chk_doc.root, "mir")
+    if !chk_doc.ok || chk_doc.get_bool(chk_mir, "enabled") != .Some(false) ||
+       chk_doc.get_bool(chk_mir, "optimization_enabled") != .Some(false) ||
+       !json_keys_zero(&chk_doc, chk_mir, &work) {
+        return harness.fail("promotion check expected zero mir work")
+    }
+
+    if !p.call(["build", "promotion.ddr", "--mir=off", "--mir-opt=on", "--timings=json", "-o", "promotion-disabled"], 0, &mut out) { return false }
+    dis_doc := json.Doc::parse_text(out.stderr_text())
+    dis_mir := dis_doc.field(dis_doc.root, "mir")
+    if !dis_doc.ok || dis_doc.get_bool(dis_mir, "enabled") != .Some(true) ||
+       dis_doc.get_bool(dis_mir, "optimization_enabled") != .Some(false) ||
+       dis_doc.get_i64(dis_mir, "functions") != .Some(2) ||
+       !json_keys_zero(&dis_doc, dis_mir, &work) {
+        return harness.fail("promotion-disabled mismatch")
+    }
+
+    inc_modes: []string = ["on", "on", "off", "off", "on"]
+    inc_reused: []i64 = [0, 2, 0, 2, 2]
+    for i in 0..inc_modes.len {
+        mode := inc_modes[i].clone()
+        reused := inc_reused[i]
+        if !p.call(["build", "promotion.ddr", "--mir-opt=" + mode, "--inline-opt=off", "--incremental", "--timings=json", "-o", "promotion-cached"], 0, &mut out) { return false }
+        doc := json.Doc::parse_text(out.stderr_text())
+        backend := doc.field(doc.root, "mir")
+        if !doc.ok || !json_check_functions(&doc, doc.root, reused, 2 - reused) ||
+           doc.get_bool(backend, "optimization_enabled") != .Some(mode == "on") {
+            return harness.fail("promotion cached mismatch at " + i.str())
+        }
+        if mode == "off" || reused == 2 {
+            if !json_keys_zero(&doc, backend, &work) { return harness.fail("promotion cached expected zero work") }
+        } else {
+            if doc.get_i64(backend, "optimized").unwrap_or(0) <= 0 || doc.get_i64(backend, "promoted").unwrap_or(0) <= 0 {
+                return harness.fail("promotion cached expected positive optimized/promoted")
+            }
+        }
+        if !same_file_bytes(p.path("promotion-cached"), p.path("promotion-" + mode)) {
+            return harness.fail("promotion-cached image mismatch for " + mode)
+        }
+    }
+
+    if !p.write("promotion-tests.ddr", "@test fn works(){true}\n") { return false }
+    t_modes: []string = ["off", "off", "on"]
+    t_expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    for i in 0..t_modes.len {
+        if !p.call(["test", "promotion-tests.ddr", "--mir-opt=" + t_modes[i], "--affected", "-o", "promotion-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), t_expects[i]) { return harness.fail("promotion-tests mismatch") }
+    }
+    p.call(["check", "promotion.ddr", "--mir-opt=unknown"], 2, &mut out)
+}
+
+fn whole_function_memory_controls(p: &Project) -> bool {
+    func_src := "fn inspect(move values:[]i64,n:i32)->i64{mut total:i64=0;mut i:i32=0;while i<n{total=total+values[i];i=i+1};total}\n"
+    if !p.write("memory.ddr", func_src + "fn main(){a:[]i64=[2,4,6];print(inspect(move a,3))}\n") { return false }
+    work: []string = ["private_memory_ops", "optimized", "promoted", "removed_loads", "removed_stores", "analysis_units", "budget_refusals"]
+    on_pos: []string = ["private_memory_ops", "promoted", "removed_loads", "removed_stores"]
+    native := process.host_target()
+    mut out := harness.empty_output()
+
+    for target in harness.targets() {
+        for mode in ["off", "on"] {
+            name := "memory-" + target + "-" + mode
+            if !p.call(["build", "memory.ddr", "--target", target.clone(), "--mir-memory=" + mode, "--inline-opt=off", "--mir-values=off", "--timings=json", "-o", name.clone()], 0, &mut out) { return false }
+            doc := json.Doc::parse_text(out.stderr_text())
+            backend := doc.field(doc.root, "mir")
+            if !doc.ok || doc.get_bool(backend, "enabled") != .Some(true) ||
+               doc.get_bool(backend, "optimization_enabled") != .Some(true) ||
+               doc.get_bool(backend, "source_objects_enabled") != .Some(mode == "on") ||
+               doc.get_bool(backend, "values_enabled") != .Some(false) ||
+               !json_keys_nonneg_int(&doc, backend, &work) {
+                return harness.fail("memory build report mismatch: " + out.stderr_text())
+            }
+            if mode == "on" {
+                if !json_keys_pos(&doc, backend, &on_pos) { return harness.fail("memory on expected positive counters") }
+            } else {
+                if doc.get_i64(backend, "private_memory_ops") != .Some(0) { return harness.fail("memory off expected 0 private_memory_ops") }
+            }
+            if !mir_integer_output(&p, name, target, "12\n") { return false }
+        }
+        if !diff_file_bytes(p.path("memory-" + target + "-off"), p.path("memory-" + target + "-on")) {
+            return harness.fail("expected memory off/on images to differ for " + target)
+        }
+    }
+
+    if !p.call(["build", "memory.ddr", "--inline-opt=off", "--mir-values=off", "--timings=json", "-o", "memory-default"], 0, &mut out) { return false }
+    def_doc := json.Doc::parse_text(out.stderr_text())
+    if !def_doc.ok || def_doc.get_bool(def_doc.field(def_doc.root, "mir"), "source_objects_enabled") != .Some(true) {
+        return harness.fail("memory-default should enable source_objects_enabled")
+    }
+    if !same_file_bytes(p.path("memory-default"), p.path("memory-" + native + "-on")) {
+        return harness.fail("memory-default must match memory-native-on")
+    }
+
+    mut plain := harness.empty_output()
+    mut checked := harness.empty_output()
+    if !p.call(["check", "memory.ddr", "--agent", "--mir-memory=off", "--inline-opt=off", "--mir-values=off"], 0, &mut plain) { return false }
+    if !p.call(["check", "memory.ddr", "--agent", "--mir-memory=on", "--inline-opt=off", "--mir-values=off", "--timings=json"], 0, &mut checked) { return false }
+    if checked.stdout_text() != plain.stdout_text() || plain.stderr_text() != "" {
+        return harness.fail("memory check mismatch")
+    }
+    chk_doc := json.Doc::parse_text(checked.stderr_text())
+    chk_mir := chk_doc.field(chk_doc.root, "mir")
+    if !chk_doc.ok || chk_doc.get_bool(chk_mir, "enabled") != .Some(false) ||
+       chk_doc.get_bool(chk_mir, "optimization_enabled") != .Some(false) ||
+       chk_doc.get_bool(chk_mir, "source_objects_enabled") != .Some(false) ||
+       !json_keys_zero(&chk_doc, chk_mir, &work) {
+        return harness.fail("memory check expected disabled mir")
+    }
+
+    for disabled in ["--mir=off", "--mir-opt=off"] {
+        if !p.call(["build", "memory.ddr", "--mir-memory=on", disabled.clone(), "--inline-opt=off", "--mir-values=off", "--timings=json", "-o", "memory-disabled"], 0, &mut out) { return false }
+        d_doc := json.Doc::parse_text(out.stderr_text())
+        d_mir := d_doc.field(d_doc.root, "mir")
+        if !d_doc.ok || d_doc.get_bool(d_mir, "optimization_enabled") != .Some(false) ||
+           d_doc.get_bool(d_mir, "source_objects_enabled") != .Some(false) ||
+           !json_keys_zero(&d_doc, d_mir, &work) {
+            return harness.fail("memory disabled mismatch for " + disabled)
+        }
+    }
+
+    inc_modes: []string = ["off", "off", "on", "on", "off"]
+    inc_reused: []i64 = [0, 2, 0, 2, 2]
+    for i in 0..inc_modes.len {
+        mode := inc_modes[i].clone()
+        reused := inc_reused[i]
+        if !p.call(["build", "memory.ddr", "--mir-memory=" + mode, "--inline-opt=off", "--mir-values=off", "--incremental", "--timings=json", "-o", "memory-cached"], 0, &mut out) { return false }
+        doc := json.Doc::parse_text(out.stderr_text())
+        backend := doc.field(doc.root, "mir")
+        if !doc.ok || !json_check_functions(&doc, doc.root, reused, 2 - reused) ||
+           doc.get_bool(backend, "source_objects_enabled") != .Some(mode == "on") {
+            return harness.fail("memory cached mismatch at " + i.str())
+        }
+        if reused == 2 {
+            if doc.get_i64(backend, "functions") != .Some(0) || doc.get_i64(backend, "operations") != .Some(0) ||
+               !json_keys_zero(&doc, backend, &work) {
+                return harness.fail("memory cached warm expected zero counters")
+            }
+        } else if mode == "on" {
+            if doc.get_i64(backend, "private_memory_ops").unwrap_or(0) <= 0 { return harness.fail("memory cached on expected private_memory_ops > 0") }
+        } else {
+            if doc.get_i64(backend, "private_memory_ops") != .Some(0) { return harness.fail("memory cached off expected private_memory_ops == 0") }
+        }
+        if !same_file_bytes(p.path("memory-cached"), p.path("memory-" + native + "-" + mode)) {
+            return harness.fail("memory-cached image mismatch for " + mode)
+        }
+    }
+
+    if !p.write("memory-tests.ddr", func_src + "@test fn works(){a:[]i64=[2,4,6];inspect(move a,3)==12}\n") { return false }
+    t_modes: []string = ["off", "off", "on", "on", "off"]
+    t_expects: []string = ["1 passed", "1 unaffected", "1 passed", "1 unaffected", "1 passed"]
+    mut has_off := false
+    mut has_on := false
+    mut receipt_off: []u8 = []
+    mut receipt_on: []u8 = []
+    mut saved: []string = []
+    for i in 0..t_modes.len {
+        mode := t_modes[i].clone()
+        if !p.call(["test", "memory-tests.ddr", "--mir-memory=" + mode, "--inline-opt=off", "--mir-values=off", "--affected", "-o", "memory-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), t_expects[i]) { return harness.fail("memory-tests mismatch: " + out.stdout_text()) }
+        if !collect_dir_suffix(p.path("memory-results/.affected"), ".pass", &mut saved) || saved.len != 1 {
+            return harness.fail("expected 1 .pass receipt in memory-results/.affected")
+        }
+        r := sys.read_u8(saved[0])
+        if !r.ok { return harness.fail("failed reading receipt") }
+        if mode == "off" {
+            if has_off && !bytes.equal(&r.value, &receipt_off) { return harness.fail("memory off receipt drifted") }
+            receipt_off = r.value
+            has_off = true
+        } else {
+            if has_on && !bytes.equal(&r.value, &receipt_on) { return harness.fail("memory on receipt drifted") }
+            receipt_on = r.value
+            has_on = true
+        }
+    }
+    if bytes.equal(&receipt_off, &receipt_on) { return harness.fail("expected different receipts for memory off vs on") }
+    p.call(["check", "memory.ddr", "--mir-memory=unknown", "--inline-opt=off", "--mir-values=off"], 2, &mut out)
+}
+
+fn whole_function_value_controls(p: &Project) -> bool {
+    func_src := "fn copies(x:i64)->i64{a:=x;b:=a;b}\n"
+    if !p.write("values.ddr", func_src + "fn main(){print(copies(42))}\n") { return false }
+    work: []string = ["values_optimized", "value_rewrites", "value_deleted", "value_immediates", "value_analysis_units", "value_budget_refusals"]
+    native := process.host_target()
+    mut out := harness.empty_output()
+
+    for target in harness.targets() {
+        for mode in ["off", "on"] {
+            name := "values-" + target + "-" + mode
+            if !p.call(["build", "values.ddr", "--target", target.clone(), "--mir-values=" + mode, "--inline-opt=off", "--mir-memory=off", "--timings=json", "-o", name.clone()], 0, &mut out) { return false }
+            doc := json.Doc::parse_text(out.stderr_text())
+            backend := doc.field(doc.root, "mir")
+            if !doc.ok || doc.get_bool(backend, "enabled") != .Some(true) ||
+               doc.get_bool(backend, "optimization_enabled") != .Some(true) ||
+               doc.get_bool(backend, "source_objects_enabled") != .Some(false) ||
+               doc.get_bool(backend, "values_enabled") != .Some(mode == "on") ||
+               doc.get_i64(backend, "private_memory_ops") != .Some(0) ||
+               !json_keys_nonneg_int(&doc, backend, &work) {
+                return harness.fail("values build report mismatch: " + out.stderr_text())
+            }
+            if mode == "on" {
+                v_opt := doc.get_i64(backend, "values_optimized").unwrap_or(0)
+                v_rew := doc.get_i64(backend, "value_rewrites").unwrap_or(0)
+                v_del := doc.get_i64(backend, "value_deleted").unwrap_or(0)
+                v_imm := doc.get_i64(backend, "value_immediates").unwrap_or(0)
+                v_au := doc.get_i64(backend, "value_analysis_units").unwrap_or(0)
+                if v_opt <= 0 || v_rew <= 0 || v_del + v_imm <= 0 || v_au <= 0 {
+                    return harness.fail("values on expected positive counters: " + out.stderr_text())
+                }
+            } else {
+                if !json_keys_zero(&doc, backend, &work) { return harness.fail("values off expected zero work") }
+            }
+            if !mir_integer_output(&p, name, target, "42\n") { return false }
+        }
+        if !diff_file_bytes(p.path("values-" + target + "-off"), p.path("values-" + target + "-on")) {
+            return harness.fail("expected values off/on images to differ for " + target)
+        }
+    }
+
+    mut plain := harness.empty_output()
+    mut checked := harness.empty_output()
+    if !p.call(["check", "values.ddr", "--agent", "--mir-values=off", "--inline-opt=off", "--mir-memory=off"], 0, &mut plain) { return false }
+    if !p.call(["check", "values.ddr", "--agent", "--mir-values=on", "--inline-opt=off", "--mir-memory=off", "--timings=json"], 0, &mut checked) { return false }
+    if checked.stdout_text() != plain.stdout_text() || plain.stderr_text() != "" {
+        return harness.fail("values check mismatch")
+    }
+    chk_doc := json.Doc::parse_text(checked.stderr_text())
+    chk_mir := chk_doc.field(chk_doc.root, "mir")
+    if !chk_doc.ok || chk_doc.get_bool(chk_mir, "enabled") != .Some(false) ||
+       chk_doc.get_bool(chk_mir, "optimization_enabled") != .Some(false) ||
+       chk_doc.get_bool(chk_mir, "values_enabled") != .Some(false) ||
+       !json_keys_zero(&chk_doc, chk_mir, &work) {
+        return harness.fail("values check expected disabled mir")
+    }
+
+    for disabled in ["--mir=off", "--mir-opt=off"] {
+        if !p.call(["build", "values.ddr", "--mir-values=on", disabled.clone(), "--inline-opt=off", "--mir-memory=off", "--timings=json", "-o", "values-disabled"], 0, &mut out) { return false }
+        d_doc := json.Doc::parse_text(out.stderr_text())
+        d_mir := d_doc.field(d_doc.root, "mir")
+        if !d_doc.ok || d_doc.get_bool(d_mir, "optimization_enabled") != .Some(false) ||
+           d_doc.get_bool(d_mir, "values_enabled") != .Some(false) ||
+           !json_keys_zero(&d_doc, d_mir, &work) {
+            return harness.fail("values disabled mismatch for " + disabled)
+        }
+    }
+
+    inc_modes: []string = ["off", "off", "on", "on", "off"]
+    inc_reused: []i64 = [0, 2, 0, 2, 2]
+    for i in 0..inc_modes.len {
+        mode := inc_modes[i].clone()
+        reused := inc_reused[i]
+        if !p.call(["build", "values.ddr", "--mir-values=" + mode, "--inline-opt=off", "--mir-memory=off", "--incremental", "--timings=json", "-o", "values-cached"], 0, &mut out) { return false }
+        doc := json.Doc::parse_text(out.stderr_text())
+        backend := doc.field(doc.root, "mir")
+        if !doc.ok || !json_check_functions(&doc, doc.root, reused, 2 - reused) ||
+           doc.get_bool(backend, "values_enabled") != .Some(mode == "on") {
+            return harness.fail("values cached mismatch at " + i.str())
+        }
+        if mode == "off" || reused == 2 {
+            if !json_keys_zero(&doc, backend, &work) { return harness.fail("values cached expected zero work") }
+        } else {
+            if doc.get_i64(backend, "values_optimized").unwrap_or(0) <= 0 || doc.get_i64(backend, "value_rewrites").unwrap_or(0) <= 0 {
+                return harness.fail("values cached on expected positive work")
+            }
+        }
+        if !same_file_bytes(p.path("values-cached"), p.path("values-" + native + "-" + mode)) {
+            return harness.fail("values-cached image mismatch for " + mode)
+        }
+    }
+
+    if !p.write("values-tests.ddr", func_src + "@test fn works(){copies(42)==42}\n") { return false }
+    t_modes: []string = ["off", "off", "on"]
+    t_expects: []string = ["1 passed", "1 unaffected", "1 passed"]
+    mut has_off := false
+    mut receipt_off: []u8 = []
+    mut receipt_on: []u8 = []
+    mut saved: []string = []
+    for i in 0..t_modes.len {
+        mode := t_modes[i].clone()
+        if !p.call(["test", "values-tests.ddr", "--mir-values=" + mode, "--inline-opt=off", "--mir-memory=off", "--affected", "-o", "values-results"], 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), t_expects[i]) { return harness.fail("values-tests mismatch: " + out.stdout_text()) }
+        if !collect_dir_suffix(p.path("values-results/.affected"), ".pass", &mut saved) || saved.len != 1 {
+            return harness.fail("expected 1 .pass receipt in values-results/.affected")
+        }
+        r := sys.read_u8(saved[0])
+        if !r.ok { return harness.fail("failed reading receipt") }
+        if mode == "off" {
+            if has_off && !bytes.equal(&r.value, &receipt_off) { return harness.fail("values off receipt drifted") }
+            receipt_off = r.value
+            has_off = true
+        } else {
+            receipt_on = r.value
+        }
+    }
+    if bytes.equal(&receipt_off, &receipt_on) { return harness.fail("expected different receipts for values off vs on") }
+    p.call(["check", "values.ddr", "--mir-values=unknown", "--inline-opt=off", "--mir-memory=off"], 2, &mut out)
+}
+
+fn compiler_profile_phases() -> []string {
+    ["declarations", "model_parse", "verify_pre", "simplify", "verify_post",
+     "allocation", "scalar_emit", "legacy_body", "fragment_cache", "finalize",
+     "range_analysis", "mir_pipeline"]
+}
+
+fn validate_compiler_detail(stderr_text: string, doc_out: &mut json.Doc) -> bool {
+    doc := json.Doc::parse_text(stderr_text)
+    if !doc.ok { return harness.fail("invalid compiler profile json: " + stderr_text) }
+    d := doc.field(doc.root, "compiler_detail")
+    phases_obj := doc.field(d, "phases")
+    calls_obj := doc.field(d, "calls")
+    work_obj := doc.field(d, "work")
+    expected := compiler_profile_phases()
+    mut sum_phases: i64 = 0
+    if doc.get_bool(d, "enabled") != .Some(true) ||
+       doc.get_bool(d, "clock_ok") != .Some(true) ||
+       doc.get_str(d, "unit") != .Some("ns") ||
+       !json_obj_keys_match(&doc, phases_obj, &expected) ||
+       !json_obj_keys_match(&doc, calls_obj, &expected) ||
+       !json_sum_nonneg_ints(&doc, phases_obj, &mut sum_phases) ||
+       !json_all_values_nonneg_int(&doc, calls_obj) ||
+       !json_all_values_nonneg_int(&doc, work_obj) {
+        return harness.fail("invalid compiler_detail structure: " + stderr_text)
+    }
+    covered := doc.get_i64(d, "covered").unwrap_or(-1)
+    other := doc.get_i64(d, "other").unwrap_or(-1)
+    comp_phase := doc.get_i64(doc.field(doc.root, "phases"), "compiler").unwrap_or(-2)
+    if covered != sum_phases || covered + other != comp_phase ||
+       doc.get_i64(calls_obj, "declarations") != .Some(1) ||
+       doc.get_i64(calls_obj, "legacy_body").unwrap_or(0) < 1 {
+        return harness.fail("compiler_detail totals or calls mismatch: " + stderr_text)
+    }
+    doc_out = doc
+    true
+}
+
+fn compiler_profile_controls(p: &Project) -> bool {
+    if !p.write("profile.ddr", "fn step(x:i64)->i64{x*3+1}\nfn main(){mut sum:i64=0;for i in 0..10{sum=sum+step(2)};print(sum)}\n") { return false }
+    mut out := harness.empty_output()
+    if !p.call(["build", "profile.ddr", "-o", "plain"], 0, &mut out) { return false }
+    if !p.call(["build", "profile.ddr", "--profile-compiler", "--timings=json", "-o", "profile"], 0, &mut out) { return false }
+    if !same_file_bytes(p.path("plain"), p.path("profile")) {
+        return harness.fail("profile build changed output image")
+    }
+    mut doc := json.Doc::parse_text("{}")
+    if !validate_compiler_detail(out.stderr_text(), &mut doc) { return false }
+    en_d := doc.field(doc.root, "compiler_detail")
+    en_calls := doc.field(en_d, "calls")
+    en_work := doc.field(en_d, "work")
+    if doc.get_i64(en_calls, "model_parse").unwrap_or(0) < 1 ||
+       doc.get_i64(en_calls, "verify_pre").unwrap_or(0) < 1 ||
+       doc.get_i64(en_calls, "allocation").unwrap_or(0) < 1 ||
+       doc.get_i64(en_calls, "scalar_emit").unwrap_or(0) < 1 ||
+       doc.get_i64(en_calls, "finalize") != .Some(1) ||
+       doc.get_i64(en_calls, "mir_pipeline") != .Some(2) ||
+       doc.get_i64(en_work, "mir_pipeline_operations").unwrap_or(0) <= 0 {
+        return harness.fail("profile enabled call/work assertions failed")
+    }
+
+    mut normal := harness.empty_output()
+    if !p.call(["check", "profile.ddr", "--agent"], 0, &mut normal) { return false }
+    skipped_list: []string = ["model_parse", "verify_pre", "simplify", "verify_post", "allocation", "scalar_emit", "finalize", "range_analysis", "mir_pipeline"]
+    for target in harness.targets() {
+        mut checked := harness.empty_output()
+        if !p.call(["check", "profile.ddr", "--agent", "--target", target.clone(), "--profile-compiler", "--timings=json"], 0, &mut checked) { return false }
+        if checked.stdout_text() != normal.stdout_text() { return harness.fail("profiled check stdout mismatch for " + target) }
+        if !validate_compiler_detail(checked.stderr_text(), &mut doc) { return false }
+        cd := doc.field(doc.root, "compiler_detail")
+        if !json_keys_zero(&doc, doc.field(cd, "phases"), &skipped_list) ||
+           !json_keys_zero(&doc, doc.field(cd, "calls"), &skipped_list) {
+            return harness.fail("profiled check should skip codegen phases for " + target)
+        }
+    }
+
+    if !p.call(["build", "profile.ddr", "--scalar-opt=off", "--profile-compiler", "--timings=json", "-o", "off"], 0, &mut out) { return false }
+    off_doc := json.Doc::parse_text(out.stderr_text())
+    off_calls := off_doc.field(off_doc.field(off_doc.root, "compiler_detail"), "calls")
+    if !off_doc.ok || off_doc.get_i64(off_calls, "model_parse") != .Some(0) ||
+       off_doc.get_i64(off_calls, "legacy_body").unwrap_or(0) <= 0 ||
+       off_doc.get_i64(off_calls, "mir_pipeline") != .Some(2) {
+        return harness.fail("profile scalar-opt=off calls mismatch")
+    }
+
+    if !p.call(["build", "profile.ddr", "--mir=off", "--profile-compiler", "--timings=json", "-o", "mir-off-profile"], 0, &mut out) { return false }
+    dis_doc := json.Doc::parse_text(out.stderr_text())
+    if !dis_doc.ok || dis_doc.get_i64(dis_doc.field(dis_doc.field(dis_doc.root, "compiler_detail"), "calls"), "mir_pipeline") != .Some(2) {
+        return harness.fail("profile mir=off expected mir_pipeline == 2")
+    }
+
+    if !p.call(["build", "profile.ddr", "--profile-compiler", "-o", "human"], 0, &mut out) { return false }
+    human_err := out.stderr_text()
+    for phase in compiler_profile_phases() {
+        if count_occurrences(human_err, "compiler " + phase + "=") != 1 {
+            return harness.fail("human profile missing phase " + phase + " in " + human_err)
+        }
+    }
+    true
+}
+
+fn runtime_profile_build(p: &Project, enabled: bool, name: string, reused_out: &mut i64) -> bool {
+    mut args: []string = ["build", "runtime.ddr", "--incremental", "--timings=json", "-o", name.clone()]
+    if enabled { args.push("--runtime-profile") }
+    mut out := harness.empty_output()
+    if !p.call(args, 0, &mut out) { return false }
+    doc := json.Doc::parse_text(out.stderr_text())
+    reused := doc.get_i64(doc.field(doc.root, "functions"), "reused")
+    if !doc.ok || reused.is_none() { return harness.fail("invalid runtime profile timings json") }
+    reused_out = reused.unwrap()
+    true
+}
+
+fn runtime_profile_controls(p: &Project) -> bool {
+    if !p.write("runtime.ddr", "fn answer(x:i32)->i32{x+42}\nfn main()->i32{print(answer(0));return 17}\n") { return false }
+    mut reused: i64 = 0
+    if !runtime_profile_build(&p, false, "plain", &mut reused) || reused != 0 { return harness.fail("runtime plain cold expected 0") }
+    if !runtime_profile_build(&p, false, "plain", &mut reused) || reused <= 0 { return harness.fail("runtime plain warm expected >0") }
+    if !runtime_profile_build(&p, true, "profile", &mut reused) || reused != 0 { return harness.fail("runtime profile cold expected 0") }
+    if !runtime_profile_build(&p, true, "profile", &mut reused) || reused <= 0 { return harness.fail("runtime profile warm expected >0") }
+    if !runtime_profile_build(&p, false, "plain", &mut reused) || reused <= 0 { return harness.fail("runtime plain re-warm expected >0") }
+
+    mut out := harness.empty_output()
+    for idx in 0..2 {
+        name := if idx == 0 { "plain" } else { "profile" }
+        enabled := idx == 1
+        if !run_bin(p.path(name), [], p.root, 17, 10000, &mut out) { return false }
+        if out.stdout_text() != "42\n" { return harness.fail(name + " stdout mismatch") }
+        if enabled {
+            doc := json.Doc::parse_text(out.stderr_text())
+            if !doc.ok || doc.get_str(doc.root, "kind") != .Some("runtime_profile") ||
+               doc.get_i64(doc.root, "version") != .Some(1) {
+                return harness.fail("invalid runtime_profile json: " + out.stderr_text())
+            }
+        } else {
+            if out.stderr_text() != "" { return harness.fail("plain binary wrote to stderr: " + out.stderr_text()) }
+        }
+    }
+
+    if !p.call(["check", "runtime.ddr", "--runtime-profile"], 2, &mut out) { return false }
+
+    if !p.write("cases.ddr", "fn answer(x:i32)->i32{x+42}\n@test fn works(){answer(0)==42}\n") { return false }
+    enables: []bool = [false, false, true, true, false]
+    expects: []string = ["1 passed", "1 unaffected", "1 passed", "1 unaffected", "1 passed"]
+    for i in 0..enables.len {
+        mut args: []string = ["test", "cases.ddr", "--affected", "-o", "results"]
+        if enables[i] { args.push("--runtime-profile") }
+        if !p.call(args, 0, &mut out) { return false }
+        if !text.contains(out.stdout_text(), expects[i]) { return harness.fail("runtime cases mismatch: " + out.stdout_text()) }
+        if enables[i] && expects[i] == "1 passed" {
+            doc := json.Doc::parse_text(out.stderr_text())
+            if !doc.ok || doc.get_str(doc.root, "kind") != .Some("runtime_profile") {
+                return harness.fail("missing runtime_profile on test run: " + out.stderr_text())
+            }
+        } else {
+            if out.stderr_text() != "" { return harness.fail("unexpected stderr on runtime test: " + out.stderr_text()) }
+        }
+    }
+    true
+}
+
+fn check_timings_report(stderr_text: string, checking: bool, target: string, reused_out: &mut i64, emitted_out: &mut i64) -> bool {
+    if harness.lines(stderr_text).len != 1 {
+        return harness.fail("expected single-line timings json: " + stderr_text)
+    }
+    doc := json.Doc::parse_text(stderr_text)
+    if !doc.ok || doc.kind(doc.root) != .Object {
+        return harness.fail("invalid timings json: " + stderr_text)
+    }
+    want_op := if checking { "check" } else { "build" }
+    if doc.get_str(doc.root, "kind") != .Some("timings") ||
+       doc.get_i64(doc.root, "version") != .Some(1) ||
+       doc.get_str(doc.root, "operation") != .Some(want_op) ||
+       doc.get_str(doc.root, "scope") != .Some("compiler_pipeline") ||
+       doc.get_str(doc.root, "clock") != .Some("monotonic") ||
+       doc.get_bool(doc.root, "clock_ok") != .Some(true) ||
+       doc.get_str(doc.root, "unit") != .Some("ns") ||
+       doc.get_i64(doc.root, "modules") != .Some(1) {
+        return harness.fail("timings header mismatch: " + stderr_text)
+    }
+    if target.len > 0 && doc.get_str(doc.root, "target") != .Some(target.clone()) {
+        return harness.fail("timings target mismatch: " + stderr_text)
+    }
+    funcs := doc.field(doc.root, "functions")
+    fn_keys: []string = ["reused", "emitted"]
+    if !json_obj_keys_match(&doc, funcs, &fn_keys) {
+        return harness.fail("timings functions keys mismatch: " + stderr_text)
+    }
+    reused := doc.get_i64(funcs, "reused").unwrap_or(-1)
+    emitted := doc.get_i64(funcs, "emitted").unwrap_or(-1)
+    if reused < 0 || emitted < 0 {
+        return harness.fail("negative function counts: " + stderr_text)
+    }
+    phases_obj := doc.field(doc.root, "phases")
+    phase_names: []string = ["module_load_lex_resolve", "build_setup", "compiler", "image_format_sign", "publication"]
+    mut phase_sum: i64 = 0
+    if !json_obj_keys_match(&doc, phases_obj, &phase_names) ||
+       !json_sum_nonneg_ints(&doc, phases_obj, &mut phase_sum) {
+        return harness.fail("timings phases mismatch: " + stderr_text)
+    }
+    total := doc.get_i64(doc.root, "total").unwrap_or(-1)
+    if total != phase_sum || total <= 0 || doc.get_i64(phases_obj, "compiler").unwrap_or(0) <= 0 {
+        return harness.fail("timings total/compiler mismatch: " + stderr_text)
+    }
+    mut skipped_names: []string = []
+    if checking {
+        skipped_names.push("image_format_sign")
+        skipped_names.push("publication")
+    }
+    if !json_str_array_matches_set(&doc, doc.field(doc.root, "skipped_phases"), &skipped_names) {
+        return harness.fail("timings skipped_phases mismatch: " + stderr_text)
+    }
+    if checking {
+        if doc.get_i64(phases_obj, "image_format_sign") != .Some(0) ||
+           doc.get_i64(phases_obj, "publication") != .Some(0) {
+            return harness.fail("checking skipped phases must be 0: " + stderr_text)
+        }
+    }
+    reused_out = reused
+    emitted_out = emitted
+    true
+}
+
+fn phase_timings(p: &Project, repo_root: string) -> bool {
+    if !p.write("phases.ddr", "fn answer()->i32{42}\nfn main(){value:=answer();print(value)}\n") { return false }
+    mut out := harness.empty_output()
+    if !p.call(["build", "phases.ddr", "-o", "plain"], 0, &mut out) { return false }
+    if out.stdout_text() != "built plain\n" || out.stderr_text() != "" {
+        return harness.fail("unexpected plain build output")
+    }
+
+    mut reused: i64 = 0
+    mut emitted: i64 = 0
+    if !p.call(["build", "phases.ddr", "--timings=json", "-o", "measured"], 0, &mut out) { return false }
+    if !check_timings_report(out.stderr_text(), false, "", &mut reused, &mut emitted) { return false }
+    if reused != 0 || emitted != 2 { return harness.fail("expected 0 reused, 2 emitted") }
+    if out.stdout_text() != "built measured\n" { return harness.fail("unexpected measured stdout") }
+    if !same_file_bytes(p.path("plain"), p.path("measured")) {
+        return harness.fail("timings build changed binary image")
+    }
+
+    if !p.call(["build", "phases.ddr", "--timings", "-o", "human"], 0, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "functions 0 reused, 2 emitted\n") ||
+       !text.contains(out.stderr_text(), "timings module_load_lex_resolve=") {
+        return harness.fail("unexpected human timings stderr: " + out.stderr_text())
+    }
+
+    for target in harness.targets() {
+        if !p.call(["build", "phases.ddr", "--target", target.clone(), "--timings=json", "-o", target.clone()], 0, &mut out) { return false }
+        if !check_timings_report(out.stderr_text(), false, target, &mut reused, &mut emitted) { return false }
+    }
+
+    mut baseline := harness.empty_output()
+    mut checked := harness.empty_output()
+    if !p.call(["check", "phases.ddr", "--agent"], 0, &mut baseline) { return false }
+    if !p.call(["check", "phases.ddr", "--agent", "--timings=json"], 0, &mut checked) { return false }
+    if !check_timings_report(checked.stderr_text(), true, "", &mut reused, &mut emitted) { return false }
+    if reused != 0 || emitted != 0 { return harness.fail("expected 0 reused/emitted on check") }
+    if checked.stdout_text() != baseline.stdout_text() || baseline.stderr_text() != "" {
+        return harness.fail("check timings changed stdout/stderr")
+    }
+    if !harness.agent_ok(&checked) { return false }
+
+    if !p.call(["run", "phases.ddr", "--timings=json", "-o", "ran"], 0, &mut out) { return false }
+    if !check_timings_report(out.stderr_text(), false, "", &mut reused, &mut emitted) { return false }
+    if out.stdout_text() != "42\n" { return harness.fail("run timings stdout mismatch") }
+
+    if !p.call(["build", "phases.ddr", "--target", "arm64-macos", "--app", "--timings=json", "-o", "Timed.app"], 0, &mut out) { return false }
+    if !check_timings_report(out.stderr_text(), false, "arm64-macos", &mut reused, &mut emitted) { return false }
+
+    if !p.write("phase-tests.ddr", "@test fn phase(){true}\n") { return false }
+    if !p.call(["test", "phase-tests.ddr", "--timings=json", "-o", "phase-tests"], 0, &mut out) { return false }
+    if !check_timings_report(out.stderr_text(), false, "", &mut reused, &mut emitted) { return false }
+    if !text.contains(out.stdout_text(), "1 passed, 0 failed") { return harness.fail("phase-tests stdout mismatch") }
+
+    for _ in 0..2 {
+        if !p.call(["build", "phases.ddr", "--incremental", "--timings=json", "-o", "cached"], 0, &mut out) { return false }
+        if !check_timings_report(out.stderr_text(), false, "", &mut reused, &mut emitted) { return false }
+    }
+    if reused <= 0 || reused + emitted != 2 {
+        return harness.fail("incremental timings expected reuse with sum == 2")
+    }
+
+    if !p.call(["build", "phases.ddr", "--timings=xml"], 2, &mut out) { return false }
+
+    // Exercise the reporter's clock-failure path independently of host timing.
+    sources := repo_root + "/selfhost/driver"
+    for module in ["cli", "timings", "compiler_profile", "native_clock"] {
+        if !fs.symlink(sources + "/" + module + ".ddr", p.path(module + ".ddr")).ok {
+            return harness.fail("symlink failed for " + module + ".ddr")
+        }
+    }
+    clock_src := "import timings\n" +
+        "import compiler_profile as profile\n" +
+        "fn main(){\n" +
+        "    details := profile.new(-1)\n" +
+        "    inline_data := timings.inlining()\n" +
+        "    backend_data := timings.backend()\n" +
+        "    timings.report(true,false,0,1,0,1,-1,-1,-1,-1,-1,-1,\n" +
+        "        false,0,0,0,0,0,&details,&inline_data,&backend_data)\n" +
+        "}\n"
+    if !p.write("clock-failure.ddr", clock_src) { return false }
+    if !p.call(["run", "clock-failure.ddr"], 0, &mut out) { return false }
+    u_doc := json.Doc::parse_text(out.stderr_text())
+    if !u_doc.ok || u_doc.get_bool(u_doc.root, "clock_ok") != .Some(false) ||
+       u_doc.kind(u_doc.field(u_doc.root, "total")) != .Null {
+        return harness.fail("clock-failure expected clock_ok=false and total=null: " + out.stderr_text())
+    }
+    u_phases := u_doc.field(u_doc.root, "phases")
+    if u_doc.kind(u_phases) != .Object || u_doc.count(u_phases) == 0 {
+        return harness.fail("clock-failure missing phases object")
+    }
+    for i in 0..u_doc.count(u_phases) {
+        if u_doc.kind(u_doc.val_at(u_phases, i)) != .Null {
+            return harness.fail("clock-failure expected all phase values to be null: " + out.stderr_text())
+        }
+    }
+    true
+}
+
+fn filesystem_group(p: &Project) -> bool {
+    bad_utf8: []u8 = [0xf0, 0x80, 0x80, 0x80]
+    if !p.write_bytes("invalid-utf8", &bad_utf8) { return false }
+    fs_src := "capability filesystem\n" +
+        "import sys\n" +
+        "fn main(){\n" +
+        "    assert(sys.read_text(\"invalid-utf8\").error==92)\n" +
+        "    assert(sys.read_text(\"absent\").error==2)\n" +
+        "    assert(sys.mkdir(\"files\").ok)\n" +
+        "    assert(sys.write_text(\"files/å\",\"one\").ok)\n" +
+        "    assert(sys.append_text(\"files/å\", \" två\").ok)\n" +
+        "    assert(sys.rename(\"files/å\",\"files/data\").ok)\n" +
+        "    assert(sys.read_text(\"files/data\").value==\"one två\")\n" +
+        "    assert(sys.metadata(\"files/data\").size==8)\n" +
+        "    assert(!sys.read_text(\"files/data\\0suffix\").ok)\n" +
+        "    assert(sys.remove_file(\"files/data\").ok)\n" +
+        "    assert(sys.remove_dir(\"files\").ok)\n" +
+        "}\n"
+    if !p.write("filesystem.ddr", fs_src) { return false }
+    mut out := harness.empty_output()
+    p.call(["run", "filesystem.ddr"], 0, &mut out)
+}
+
+fn manifest_dependencies(p: &Project) -> bool {
+    if !p.write("dunder-skrift/dunder.toml", "name = \"dunder-skrift\"\nversion = \"0.1.0\"\nroot = \"src/skrift.ddr\"\n") { return false }
+    if !p.write("dunder-skrift/src/skrift.ddr", "import helper\npub fn font_version() -> i32 { helper.version() + 10 }\nfn main() { print(999) }\n") { return false }
+    if !p.write("dunder-skrift/src/helper.ddr", "import binary as bin\npub fn version() -> i32 { bin.tag() }\n") { return false }
+    if !p.write("dunder-skrift/src/binary.ddr",
+            "import std.bytes as bytes\n" +
+            "pub fn tag() -> i32 {\n" +
+            "    mut b: []u8 = []\n" +
+            "    bytes.append_be(&mut b, 32, 2)\n" +
+            "    bytes.u16_be(&b, 0)\n" +
+            "}\n") { return false }
+
+    if !p.write("plain_lib/plain.ddr", "pub fn base() -> i32 { 3 }\n") { return false }
+    if !p.write("plain_lib/extra.ddr", "pub fn delta() -> i32 { 4 }\n") { return false }
+
+    if !p.write("shared/dunder.toml", "name = \"shared\"\nroot = \"lib/common.ddr\"\n") { return false }
+    if !p.write("shared/lib/common.ddr", "pub fn offset() -> i32 { 5 }\n") { return false }
+
+    if !p.write("dep_b/dunder.toml", "name = \"dep_b\"\nroot = \"mod.ddr\"\n\n[dependencies]\nshared = \"../shared\"\n") { return false }
+    if !p.write("dep_b/mod.ddr", "import shared\npub fn b_val() -> i32 { shared.offset() + 1 }\n") { return false }
+
+    if !p.write("dep_a/dunder.toml", "name = \"dep_a\"\nroot = \"src/api.ddr\"\n\n[dependencies]\ndep_b = \"../dep_b\"\nshared = \"../shared\"\n") { return false }
+    if !p.write("dep_a/src/api.ddr", "import dep_b\nimport shared\npub fn a_val() -> i32 { dep_b.b_val() + shared.offset() }\n") { return false }
+
+    if !p.write("app/dunder.toml",
+            "name = \"consumer\"\n" +
+            "version = \"0.1.0\"\n" +
+            "root = \"src/main.ddr\"\n" +
+            "test_root = \"tests/suite.ddr\"\n\n" +
+            "[dependencies]\n" +
+            "skrift = \"../dunder-skrift\"\n" +
+            "plain = \"../plain_lib\"\n" +
+            "dep_a = \"../dep_a\"\n" +
+            "local_shadow = \"../plain_lib\"\n") { return false }
+    if !p.write("app/src/local_shadow.ddr", "pub fn pick() -> i32 { 100 }\n") { return false }
+    if !p.write("app/src/main.ddr",
+            "import skrift\n" +
+            "import skrift.helper as h\n" +
+            "import plain\n" +
+            "import plain.extra\n" +
+            "import dep_a\n" +
+            "import dep_a.api\n" +
+            "import local_shadow\n" +
+            "fn main() -> i32 {\n" +
+            "    total := skrift.font_version() + h.version() + plain.base() + extra.delta() + dep_a.a_val() + api.a_val() + local_shadow.pick()\n" +
+            "    print(total)\n" +
+            "    0\n" +
+            "}\n") { return false }
+    if !p.write("app/tests/suite.ddr",
+            "import skrift.helper as h\n" +
+            "import plain.extra as e\n" +
+            "import dep_a.api as a\n" +
+            "@test fn deps_work_in_tests() {\n" +
+            "    assert(h.version() == 32)\n" +
+            "    assert(e.delta() == 4)\n" +
+            "    assert(a.a_val() == 11)\n" +
+            "}\n") { return false }
+
+    app := p.path("app")
+    app_src := app + "/src"
+    target := process.host_target()
+    mut out := harness.empty_output()
+
+    // 42 + 32 + 3 + 4 + 11 + 11 + 100 = 203
+    if !p.call_in(["run"], app, 0, &mut out) { return false }
+    if out.stdout_text() != "203\n" { return harness.fail("expected 203, got " + out.stdout_text()) }
+    if !sys.metadata(app + "/build/" + target + "/consumer").ok || sys.metadata(app + "/build/" + target + "/main").ok {
+        return harness.fail("unexpected default build output name after run")
+    }
+    if !fs.remove_all(app + "/build").ok { return harness.fail("remove_all app/build failed") }
+
+    if !p.call_in(["build", "src/main.ddr"], app, 0, &mut out) { return false }
+    if !sys.metadata(app + "/build/" + target + "/consumer").ok || sys.metadata(app + "/build/" + target + "/main").ok {
+        return harness.fail("unexpected build output name for explicit root")
+    }
+    if !fs.remove_all(app + "/build").ok { return harness.fail("remove_all app/build failed") }
+
+    if !p.call_in(["run", "src/main.ddr"], app, 0, &mut out) { return false }
+    if out.stdout_text() != "203\n" ||
+       !sys.metadata(app + "/build/" + target + "/consumer").ok || sys.metadata(app + "/build/" + target + "/main").ok {
+        return harness.fail("unexpected run src/main.ddr output or artifact")
+    }
+
+    if !p.call_in(["build"], app_src, 0, &mut out) { return false }
+    if !sys.metadata(app_src + "/build/" + target + "/consumer").ok || sys.metadata(app_src + "/build/" + target + "/main").ok {
+        return harness.fail("unexpected build output from app/src")
+    }
+    if !fs.remove_all(app_src + "/build").ok { return harness.fail("remove_all app/src/build failed") }
+
+    if !p.call_in(["build", "main.ddr"], app_src, 0, &mut out) { return false }
+    if !sys.metadata(app_src + "/build/" + target + "/consumer").ok || sys.metadata(app_src + "/build/" + target + "/main").ok {
+        return harness.fail("unexpected build main.ddr output from app/src")
+    }
+
+    if !p.call_in(["check", "--agent"], app, 0, &mut out) || !harness.agent_ok(&out) { return false }
+    if !p.call_in(["check", "src/main.ddr", "--agent"], app, 0, &mut out) || !harness.agent_ok(&out) { return false }
+
+    if !p.call_in(["test"], app, 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "PASS tests/suite.ddr::deps_work_in_tests") || !text.contains(out.stdout_text(), ", 0 failed") {
+        return harness.fail("manifest test failed: " + out.stdout_text())
+    }
+    if !p.call_in(["test", "tests/suite.ddr"], app, 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "PASS tests/suite.ddr::deps_work_in_tests") || !text.contains(out.stdout_text(), ", 0 failed") {
+        return harness.fail("manifest explicit test failed: " + out.stdout_text())
+    }
+
+    // Incremental rebuild tracks changes inside dependency source files.
+    if !p.call_in(["build", "--incremental", "-o", "inc-app"], app, 0, &mut out) { return false }
+    if !p.write("dunder-skrift/src/binary.ddr",
+            "import std.bytes as bytes\n" +
+            "pub fn tag() -> i32 {\n" +
+            "    mut b: []u8 = []\n" +
+            "    bytes.append_be(&mut b, 33, 2)\n" +
+            "    bytes.u16_be(&b, 0)\n" +
+            "}\n") { return false }
+    if !p.call_in(["run", "--incremental", "-o", "inc-app"], app, 0, &mut out) { return false }
+    if out.stdout_text() != "205\n" { return harness.fail("incremental dep rebuild expected 205, got " + out.stdout_text()) }
+
+    // Missing submodule inside a resolved dependency reports a clean load diagnostic.
+    if !p.write("app/src/bad_import.ddr", "import skrift.missing\nfn main() {}\n") { return false }
+    if !p.call_in(["check", "src/bad_import.ddr", "--agent"], app, 1, &mut out) { return false }
+    err_obj := check_agent_error_record(out.stdout_text())
+    if !err_obj.ok || !text.contains(err_obj.message, "cannot load module") || !text.contains(err_obj.message, "missing.ddr") {
+        return harness.fail("bad_import agent error mismatch: " + out.stdout_text())
+    }
+    if !p.call_in(["build", "src/bad_import.ddr"], app, 1, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "cannot load module") || !text.contains(out.stderr_text(), "missing.ddr") {
+        return harness.fail("bad_import build error mismatch: " + out.stderr_text())
+    }
+
+    // Error diagnostics in dunder.toml (<file>:<line>: ...)
+    bad_tomls: []string = [
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[unknown]\nx = \"y\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies\nx = \"y\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\nbad-id = \"../plain_lib\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\n1abc = \"../plain_lib\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\nsys = \"../plain_lib\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\nstd = \"../plain_lib\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\nskrift = \"../dunder-skrift\"\nskrift = \"../plain_lib\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\nplain = \"\"\n",
+        "name = \"bad\"\nroot = \"src/main.ddr\"\n[dependencies]\nghost = \"../does-not-exist\"\n",
+    ]
+    bad_locs: []string = [
+        "dunder.toml:3:",
+        "dunder.toml:3:",
+        "dunder.toml:4:",
+        "dunder.toml:4:",
+        "dunder.toml:4:",
+        "dunder.toml:4:",
+        "dunder.toml:5:",
+        "dunder.toml:4:",
+        "dunder.toml:4:",
+    ]
+    for i in 0..bad_tomls.len {
+        if !p.write("app/dunder.toml", bad_tomls[i]) { return false }
+        if !p.call_in(["build"], app, 2, &mut out) { return false }
+        if !text.contains(out.stderr_text(), bad_locs[i]) {
+            return harness.fail("toml case " + i.str() + " build missing " + bad_locs[i] + ": " + out.stderr_text())
+        }
+        if !p.call_in(["check", "src/main.ddr", "--agent"], app, 2, &mut out) { return false }
+        if !text.contains(out.stderr_text(), bad_locs[i]) {
+            return harness.fail("toml case " + i.str() + " check missing " + bad_locs[i] + ": " + out.stderr_text())
+        }
+    }
+
+    // Dependency cycle detection (app -> cyc_a -> cyc_b -> cyc_a)
+    if !p.write("cyc_a/dunder.toml", "name = \"cyc_a\"\nroot = \"a.ddr\"\n[dependencies]\ncyc_b = \"../cyc_b\"\n") { return false }
+    if !p.write("cyc_a/a.ddr", "pub fn x() -> i32 { 1 }\n") { return false }
+    if !p.write("cyc_b/dunder.toml", "name = \"cyc_b\"\nroot = \"b.ddr\"\n[dependencies]\ncyc_a = \"../cyc_a\"\n") { return false }
+    if !p.write("cyc_b/b.ddr", "pub fn y() -> i32 { 2 }\n") { return false }
+    if !p.write("app/dunder.toml", "name = \"consumer\"\nroot = \"src/main.ddr\"\n[dependencies]\ncyc_a = \"../cyc_a\"\n") { return false }
+    if !p.call_in(["build"], app, 2, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "cyc_b/dunder.toml:4:") || !text.contains(out.stderr_text(), "cycle") {
+        return harness.fail("cycle diagnostic mismatch: " + out.stderr_text())
+    }
+
+    // Isolated per-package dependency namespaces (app -> shared1 = 9, dep_a -> dep_b/shared = 5; no transitive leakage)
+    if !p.write("shared1/dunder.toml", "name = \"shared\"\nroot = \"lib/common.ddr\"\n") { return false }
+    if !p.write("shared1/lib/common.ddr", "pub fn offset() -> i32 { 9 }\n") { return false }
+    if !p.write("app/dunder.toml",
+            "name = \"consumer\"\nroot = \"src/main.ddr\"\n[dependencies]\nshared = \"../shared1\"\n\n" +
+            "[dependencies.dep_a]\npath = \"../dep_a\"\n") { return false }
+    if !p.write("app/src/main.ddr", "import shared\nimport dep_a\nfn main() { print(shared.offset() + dep_a.a_val()) }\n") { return false }
+    if !p.call_in(["run"], app, 0, &mut out) { return false }
+    if out.stdout_text() != "20\n" { return harness.fail("isolated namespace expected 20, got " + out.stdout_text()) }
+
+    // Verify transitive dependency alias ('dep_b') does not leak into consumer namespace
+    if !p.write("app/src/main.ddr", "import dep_b\nfn main() { print(dep_b.b_val()) }\n") { return false }
+    if !p.call_in(["check"], app, 1, &mut out) { return false }
+    if !text.contains(out.stderr_text(), "cannot load module") {
+        return harness.fail("expected cannot load module for leaked dep_b: " + out.stderr_text())
+    }
+    true
+}
+
+fn bytes_big_endian_guards(p: &Project) -> bool {
+    names: []string = [
+        "u16_neg", "u16_oob", "u16_short", "i16_oob", "u32_oob",
+        "i32_short", "i64_oob", "u64_short", "append_w0", "append_w9", "set_oob",
+    ]
+    bodies: []string = [
+        "mut b: []u8 = [1, 2]; _ := bytes.u16_be(&b, -1)",
+        "mut b: []u8 = [1, 2]; _ := bytes.u16_be(&b, 1)",
+        "mut b: []u8 = [1]; _ := bytes.u16_be(&b, 0)",
+        "mut b: []u8 = [1, 2]; _ := bytes.i16_be(&b, 1)",
+        "mut b: []u8 = [1, 2, 3, 4]; _ := bytes.u32_be(&b, 1)",
+        "mut b: []u8 = [1, 2, 3]; _ := bytes.i32_be(&b, 0)",
+        "mut b: []u8 = [1, 2, 3, 4, 5, 6, 7, 8]; _ := bytes.i64_be(&b, 1)",
+        "mut b: []u8 = [1, 2, 3, 4, 5, 6, 7]; _ := bytes.u64_be(&b, 0)",
+        "mut b: []u8 = []; bytes.append_be(&mut b, 1, 0)",
+        "mut b: []u8 = []; bytes.append_be(&mut b, 1, 9)",
+        "mut b: []u8 = [1, 2]; bytes.set_be(&mut b, 1, 1, 2)",
+    ]
+    mut out := harness.empty_output()
+    for i in 0..names.len {
+        src := "import std.bytes as bytes\nfn main() {\n" + bodies[i] + "\n}\n"
+        if !p.write(names[i] + ".ddr", src) { return false }
+        if !p.call(["run", names[i] + ".ddr", "-o", names[i].clone()], 104, &mut out) { return false }
+    }
+    true
+}
+
+fn read_plist_json(plist_path: string, doc_out: &mut json.Doc) -> bool {
+    mut out := harness.empty_output()
+    if !run_bin("/usr/bin/plutil", ["-convert", "json", "-o", "-", plist_path.clone()], "", 0, 10000, &mut out) {
+        return false
+    }
+    doc := json.Doc::parse_text(out.stdout_text())
+    if !doc.ok || doc.kind(doc.root) != .Object {
+        return harness.fail("invalid plist json for " + plist_path + ": " + out.stdout_text())
+    }
+    doc_out = doc
+    true
+}
+
+fn mac_bundle(p: &Project) -> bool {
+    name := "Å & Tools"
+    app_name := name + ".app"
+    app := p.path(app_name)
+    if !p.write(app_name + "/Contents/Resources/a & b", "preserved") { return false }
+    if !p.write("bundle.ddr", "import sys\nfn main()->i32{print(sys.arg(1));return 17}") { return false }
+    mut out := harness.empty_output()
+    if !p.call(["run", "bundle.ddr", "--app", "-o", app.clone(), "--", "macOS"], 17, &mut out) { return false }
+    if out.stdout_text() != "macOS\n" { return harness.fail("mac_bundle stdout mismatch: " + out.stdout_text()) }
+
+    mut info := json.Doc::parse_text("{}")
+    if !read_plist_json(app + "/Contents/Info.plist", &mut info) { return false }
+    exe_opt := info.get_str(info.root, "CFBundleExecutable")
+    if info.get_str(info.root, "CFBundleDisplayName") != .Some(name) ||
+       info.get_str(info.root, "CFBundlePackageType") != .Some("APPL") ||
+       exe_opt.is_none() || !sys.metadata(app + "/Contents/MacOS/" + exe_opt.unwrap()).is_file {
+        return harness.fail("mac_bundle Info.plist or executable mismatch")
+    }
+    if !run_bin("/usr/bin/codesign", ["--verify", "--strict", app.clone()], "", 0, 10000, &mut out) { return false }
+
+    ver_pkg := p.path("ver_bundle_pkg")
+    if !p.write("ver_bundle_pkg/dunder.toml", "name = \"MyWidget\"\nversion = \"2.4.1\"\nroot = \"src/main.ddr\"\n") { return false }
+    if !p.write("ver_bundle_pkg/src/main.ddr", "fn main() { print(\"bundled\") }\n") { return false }
+    if !p.call_in(["run", "--app"], ver_pkg, 0, &mut out) { return false }
+    if out.stdout_text() != "bundled\n" { return harness.fail("ver_bundle_pkg stdout mismatch: " + out.stdout_text()) }
+
+    ver_app := ver_pkg + "/build/arm64-macos/MyWidget.app"
+    mut ver_info := json.Doc::parse_text("{}")
+    if !read_plist_json(ver_app + "/Contents/Info.plist", &mut ver_info) { return false }
+    if ver_info.get_str(ver_info.root, "CFBundleVersion") != .Some("2.4.1") ||
+       ver_info.get_str(ver_info.root, "CFBundleShortVersionString") != .Some("2.4.1") {
+        return harness.fail("ver_bundle_pkg version mismatch in Info.plist")
+    }
+    run_bin("/usr/bin/codesign", ["--verify", "--strict", ver_app], "", 0, 10000, &mut out)
+}
+
+fn install_cwd_and_test_scoping(p: &Project) -> bool {
+    // D3: dunder run executes in the caller's working directory in all modes.
+    cwd_proj := p.path("cwd_proj")
+    if !p.write("cwd_proj/dunder.toml", "name = \"cwdapp\"\nroot = \"src/main.ddr\"\n[examples]\ndemo = \"examples/demo.ddr\"\n") { return false }
+    cwd_body := "capability filesystem\nimport std.fs as fs\nfn main() { print(fs.cwd().value) }\n"
+    if !p.write("cwd_proj/src/main.ddr", cwd_body) { return false }
+    if !p.write("cwd_proj/examples/demo.ddr", cwd_body) { return false }
+    sub := cwd_proj + "/sub/deep"
+    outside := p.path("outside_cwd")
+    if !fs.mkdir_all(sub).ok || !fs.mkdir_all(outside).ok {
+        return harness.fail("mkdir_all failed for cwd test directories")
+    }
+    sub_rp := fs.realpath(sub)
+    out_rp := fs.realpath(outside)
+    if !sub_rp.ok || !out_rp.ok { return harness.fail("realpath failed for cwd dirs") }
+
+    mut out := harness.empty_output()
+    if !p.call_in(["run"], sub, 0, &mut out) { return false }
+    if text.trim(out.stdout_text()) != sub_rp.value { return harness.fail("cwd run mismatch: " + out.stdout_text()) }
+    if !p.call_in(["run", "--example", "demo"], sub, 0, &mut out) { return false }
+    if text.trim(out.stdout_text()) != sub_rp.value { return harness.fail("cwd run --example mismatch: " + out.stdout_text()) }
+    if !p.call_in(["run", cwd_proj + "/src/main.ddr"], outside, 0, &mut out) { return false }
+    if text.trim(out.stdout_text()) != out_rp.value { return harness.fail("cwd run explicit mismatch: " + out.stdout_text()) }
+
+    // D4: dunder test excludes bundled stdlib @test functions from user suites.
+    if !p.write("user_tests.ddr",
+            "capability filesystem\n" +
+            "import std.fs as fs\nimport std.bytes as bytes\nimport std.text as text\n" +
+            "@test fn only_mine() {\n" +
+            "    raw := bytes.from_text(text.upper(\"ok\"))\n" +
+            "    assert(raw.len == 2 && fs.cwd().ok)\n" +
+            "}\n") { return false }
+    if !p.call(["build-tests", "--list", "user_tests.ddr"], 0, &mut out) { return false }
+    listed := harness.lines(out.stdout_text())
+    if listed.len != 1 || !text.ends_with(listed[0], "user_tests.ddr::only_mine") {
+        return harness.fail("unexpected user_tests --list: " + out.stdout_text())
+    }
+    for line in &listed {
+        if text.contains(line, "<stdlib/") { return harness.fail("stdlib test leaked into listing: " + line) }
+    }
+    if !p.call(["test", "user_tests.ddr"], 0, &mut out) { return false }
+    if !text.contains(out.stdout_text(), "1 passed, 0 failed") || text.contains(out.stdout_text(), "<stdlib/") {
+        return harness.fail("user_tests output mismatch: " + out.stdout_text())
+    }
+
+    // D1: dunder install into --dir, --prefix, default compiler directory, and reinstall.
+    if !p.write("cwd_proj/src/tool.ddr", "fn main() { print(\"tool v1\") }\n") { return false }
+    if !p.write("cwd_proj/examples/demo.ddr", "fn main() { print(\"demo installed\") }\n") { return false }
+    if !p.write("cwd_proj/src/main.ddr", "fn main() { print(\"main v1\") }\n") { return false }
+
+    bin_dir := p.path("custom/bin")
+    if !p.call_in(["install", "--dir", bin_dir.clone()], cwd_proj, 0, &mut out) { return false }
+    installed_main := bin_dir + "/cwdapp"
+    if out.stdout_text() != "installed " + installed_main + "\n" {
+        return harness.fail("install --dir stdout mismatch: " + out.stdout_text())
+    }
+    if !run_bin(installed_main, [], cwd_proj, 0, 10000, &mut out) || out.stdout_text() != "main v1\n" {
+        return harness.fail("installed main v1 mismatch")
+    }
+
+    prefix_dir := p.path("local-prefix")
+    if !p.call_in(["install", "--example", "demo", "--prefix=" + prefix_dir], cwd_proj, 0, &mut out) { return false }
+    installed_demo := prefix_dir + "/bin/demo"
+    if out.stdout_text() != "installed " + installed_demo + "\n" {
+        return harness.fail("install --prefix stdout mismatch: " + out.stdout_text())
+    }
+    if !run_bin(installed_demo, [], cwd_proj, 0, 10000, &mut out) || out.stdout_text() != "demo installed\n" {
+        return harness.fail("installed demo mismatch")
+    }
+
+    // Reinstalling over an already-executed binary uses atomic staging.
+    if !p.write("cwd_proj/src/main.ddr", "fn main() { print(\"main v2\") }\n") { return false }
+    if !p.call_in(["install", "--dir=" + bin_dir], cwd_proj, 0, &mut out) { return false }
+    if !run_bin(installed_main, [], cwd_proj, 0, 10000, &mut out) || out.stdout_text() != "main v2\n" {
+        return harness.fail("reinstalled main v2 mismatch")
+    }
+
+    // Default install dir matches the running dunder binary's parent directory.
+    fake_home := p.path("dunder-home/bin")
+    if !fs.mkdir_all(fake_home).ok { return harness.fail("mkdir_all failed for fake_home") }
+    local_dunder := fake_home + "/dunder"
+    if !copy_executable(p.compiler, local_dunder) { return false }
+    local_cli := Project { compiler: local_dunder, root: cwd_proj.clone() }
+    if !local_cli.call(["install", "src/tool.ddr"], 0, &mut out) { return false }
+    fake_rp := fs.realpath(fake_home)
+    if !fake_rp.ok { return harness.fail("realpath failed for fake_home") }
+    installed_tool := fake_rp.value + "/tool"
+    if out.stdout_text() != "installed " + installed_tool + "\n" {
+        return harness.fail("default install stdout mismatch: " + out.stdout_text())
+    }
+    if !run_bin(installed_tool, [], cwd_proj, 0, 10000, &mut out) || out.stdout_text() != "tool v1\n" {
+        return harness.fail("installed tool mismatch")
+    }
+
+    // Error handling for invalid install flags / targets / directory destinations.
+    if !p.call_in(["install", "-o", "out"], cwd_proj, 2, &mut out) { return false }
+    if !p.call_in(["install", "--dir", bin_dir.clone(), "--prefix", prefix_dir.clone()], cwd_proj, 2, &mut out) { return false }
+    if !p.call_in(["install", "--app"], cwd_proj, 2, &mut out) { return false }
+    if !p.call_in(["build", "--dir", bin_dir.clone()], cwd_proj, 2, &mut out) { return false }
+    if !p.call_in(["install", "--target", "wasm32"], cwd_proj, 1, &mut out) { return false }
+    dir_clash := p.path("dir_clash/cwdapp")
+    if !fs.mkdir_all(dir_clash).ok { return harness.fail("mkdir_all failed for dir_clash") }
+    p.call_in(["install", "--dir", p.path("dir_clash")], cwd_proj, 1, &mut out)
+}
+
+fn run_named_group(name: string, p: &Project, repo_root: string, serial_compiler: string) -> bool {
+    if name == "worker_options" { return worker_options(&p, repo_root, serial_compiler) }
+    if name == "modules_and_manifest" { return modules_and_manifest(&p) }
+    if name == "manifest_dependencies" { return manifest_dependencies(&p) }
+    if name == "install_cwd_and_test_scoping" { return install_cwd_and_test_scoping(&p) }
+    if name == "bytes_big_endian_guards" { return bytes_big_endian_guards(&p) }
+    if name == "targets_and_cache" { return targets_and_cache(&p) }
+    if name == "phase_timings" { return phase_timings(&p, repo_root) }
+    if name == "scalar_optimizer_controls" { return scalar_optimizer_controls(&p) }
+    if name == "compiler_profile_controls" { return compiler_profile_controls(&p) }
+    if name == "whole_function_mir_controls" { return whole_function_mir_controls(&p) }
+    if name == "whole_function_optimizer_controls" { return whole_function_optimizer_controls(&p) }
+    if name == "whole_function_memory_controls" { return whole_function_memory_controls(&p) }
+    if name == "whole_function_value_controls" { return whole_function_value_controls(&p) }
+    if name == "runtime_profile_controls" { return runtime_profile_controls(&p) }
+    if name == "ownership_optimizer_controls" { return ownership_optimizer_controls(&p) }
+    if name == "constant_division_controls" { return constant_division_controls(&p) }
+    if name == "frame_free_controls" { return frame_free_controls(&p) }
+    if name == "range_optimizer_controls" { return range_optimizer_controls(&p) }
+    if name == "inline_optimizer_controls" { return inline_optimizer_controls(&p) }
+    if name == "isolated_tests" { return isolated_tests(&p) }
+    if name == "filesystem" { return filesystem_group(&p) }
+    if name == "mac_bundle" { return mac_bundle(&p) }
+    harness.fail("unknown test group: " + name)
+}
+
+fn find_repo_root(compiler: string) -> string {
+    found := harness.find_root()
+    if found.len > 0 { return found }
+    mut dir := harness.parent_dir(compiler)
+    for _ in 0..8 {
+        if dir.len == 0 { break }
+        if sys.metadata(dir + "/selfhost/main.ddr").is_file &&
+           sys.metadata(dir + "/tests/fixtures/driver-workers.ddr").is_file {
+            return dir
+        }
+        next := harness.parent_dir(dir)
+        if next.len == 0 || next == dir { break }
+        dir = next
+    }
+    ""
+}
+
+fn all_group_names() -> []string {
+    mut names: []string = [
+        "worker_options",
+        "isolated_tests",
+        "bytes_big_endian_guards",
+        "manifest_dependencies",
+        "targets_and_cache",
+        "install_cwd_and_test_scoping",
+        "whole_function_memory_controls",
+        "whole_function_value_controls",
+        "whole_function_mir_controls",
+        "phase_timings",
+        "inline_optimizer_controls",
+        "compiler_profile_controls",
+        "whole_function_optimizer_controls",
+        "range_optimizer_controls",
+        "modules_and_manifest",
+        "scalar_optimizer_controls",
+        "ownership_optimizer_controls",
+        "constant_division_controls",
+        "frame_free_controls",
+        "runtime_profile_controls",
+    ]
+    if process.host_os() == "macos" {
+        names.push("mac_bundle")
+    }
+    names.push("filesystem")
+    names
+}
+
+fn main() -> i32 {
+    mut compiler_arg := ""
+    mut serial_arg := ""
+    mut group_arg := ""
+    mut work_arg := ""
+    mut max_workers := 4
+
+    argc := sys.arg_count()
+    mut i := 1
+    while i < argc {
+        arg := sys.arg(i)
+        if arg == "-h" || arg == "--help" {
+            print("usage: test_cli <compiler> [--serial-compiler <path>] [--group <name>] [--jobs <n>]")
+            return 0
+        } else if arg == "--serial-compiler" {
+            if i + 1 >= argc { _ := sys.eprint("--serial-compiler requires a path"); return 2 }
+            i += 1
+            serial_arg = sys.arg(i)
+        } else if text.starts_with(arg, "--serial-compiler=") {
+            serial_arg = arg[18..arg.len]
+        } else if arg == "--group" {
+            if i + 1 >= argc { _ := sys.eprint("--group requires a name"); return 2 }
+            i += 1
+            group_arg = sys.arg(i)
+        } else if text.starts_with(arg, "--group=") {
+            group_arg = arg[8..arg.len]
+        } else if arg == "--work" {
+            if i + 1 >= argc { _ := sys.eprint("--work requires a directory"); return 2 }
+            i += 1
+            work_arg = sys.arg(i)
+        } else if text.starts_with(arg, "--work=") {
+            work_arg = arg[7..arg.len]
+        } else if arg == "--jobs" {
+            if i + 1 >= argc { _ := sys.eprint("--jobs requires a number"); return 2 }
+            i += 1
+            parsed := parse.integer(sys.arg(i))
+            if !parsed.ok || parsed.value < 1 || parsed.value > 64 {
+                _ := sys.eprint("--jobs must be between 1 and 64")
+                return 2
+            }
+            max_workers = i32(parsed.value)
+        } else if text.starts_with(arg, "--jobs=") {
+            parsed := parse.integer(arg[7..arg.len])
+            if !parsed.ok || parsed.value < 1 || parsed.value > 64 {
+                _ := sys.eprint("--jobs must be between 1 and 64")
+                return 2
+            }
+            max_workers = i32(parsed.value)
+        } else if text.starts_with(arg, "-") {
+            _ := sys.eprint("unknown option: " + arg)
+            return 2
+        } else if compiler_arg.len == 0 {
+            compiler_arg = arg
+        } else {
+            _ := sys.eprint("unexpected positional argument: " + arg)
+            return 2
+        }
+        i += 1
+    }
+
+    if compiler_arg.len == 0 {
+        _ := sys.eprint("usage: test_cli <compiler> [--serial-compiler <path>]")
+        return 2
+    }
+
+    comp_rp := fs.realpath(compiler_arg)
+    if !comp_rp.ok || !sys.metadata(comp_rp.value).is_file {
+        _ := sys.eprint("compiler not found: " + compiler_arg)
+        return 2
+    }
+    compiler := comp_rp.value
+
+    mut serial_compiler := ""
+    if serial_arg.len > 0 {
+        ser_rp := fs.realpath(serial_arg)
+        if !ser_rp.ok || !sys.metadata(ser_rp.value).is_file {
+            _ := sys.eprint("serial compiler not found: " + serial_arg)
+            return 2
+        }
+        serial_compiler = ser_rp.value
+    }
+
+    repo_root := find_repo_root(compiler)
+    if repo_root.len == 0 {
+        _ := sys.eprint("could not locate dunder repository root")
+        return 1
+    }
+
+    if group_arg.len > 0 {
+        mut own_temp := false
+        mut work_dir := work_arg
+        if work_dir.len == 0 {
+            tmp := fs.temp_dir("dunder-cli-")
+            if !tmp.ok { _ := sys.eprint("temp_dir failed"); return 1 }
+            work_dir = tmp.value
+            own_temp = true
+        }
+        defer { if own_temp { _ := fs.remove_all(work_dir) } }
+        proj := Project { compiler: compiler, root: work_dir.clone() }
+        return if run_named_group(group_arg, &proj, repo_root, serial_compiler) { 0 } else { 1 }
+    }
+
+    exe_rp := fs.realpath(sys.arg(0))
+    exe := if exe_rp.ok { exe_rp.value } else { sys.arg(0) }
+
+    batch_tmp := fs.temp_dir("dunder-cli-")
+    if !batch_tmp.ok { _ := sys.eprint("temp_dir failed"); return 1 }
+    batch_root := batch_tmp.value
+    defer { _ := fs.remove_all(batch_root) }
+
+    groups := all_group_names()
+    mut pool_cap := max_workers
+    if pool_cap > groups.len { pool_cap = groups.len }
+    mut pool := process.ChildSet::new(pool_cap)
+    defer { pool.kill_all() }
+
+    mut slot_idx: []i32 = []
+    mut slot_start: []i64 = []
+    mut slot_out: []string = []
+    mut slot_err: []string = []
+    for _ in 0..pool_cap {
+        slot_idx.push(-1)
+        slot_start.push(0)
+        slot_out.push("")
+        slot_err.push("")
+    }
+
+    mut next_idx := 0
+    mut completed := 0
+    mut failed := 0
+    mut raw_out: []u8 = []
+    mut raw_err: []u8 = []
+    timeout_ms: i64 = 180000
+
+    while completed < groups.len {
+        while next_idx < groups.len && pool.len() < pool_cap {
+            gname := groups[next_idx].clone()
+            gwork := batch_root + "/" + gname
+            if !fs.mkdir_all(gwork).ok {
+                _ := sys.eprint("FAIL " + gname + " (mkdir_all failed)")
+                failed += 1
+                completed += 1
+                next_idx += 1
+                continue
+            }
+            mut cargs: []string = ["--group", gname.clone(), "--work", gwork, compiler.clone()]
+            if serial_compiler.len > 0 {
+                cargs.push("--serial-compiler")
+                cargs.push(serial_compiler.clone())
+            }
+            cmd := process.Command::new(exe.clone(), move cargs)
+            sp := cmd.spawn()
+            if sp.is_err() {
+                err_code := sp.unwrap_err().code()
+                if (err_code == 35 || err_code == 12 || err_code == 24 || err_code == 23) && pool.len() > 0 {
+                    break
+                }
+                _ := sys.eprint("FAIL " + gname + " (spawn error " + err_code.str() + ")")
+                failed += 1
+                completed += 1
+                next_idx += 1
+                continue
+            }
+            mut child := sp.unwrap()
+            slot := pool.insert(&mut child)
+            assert(slot >= 0)
+            slot_idx[slot] = next_idx
+            slot_start[slot] = sys.now_ms()
+            slot_out[slot] = ""
+            slot_err[slot] = ""
+            next_idx += 1
+        }
+
+        if pool.len() == 0 { continue }
+        _ := pool.poll_io(10)
+        now := sys.now_ms()
+
+        for slot in 0..pool_cap {
+            if !pool.is_active(slot) { continue }
+            gi := slot_idx[slot]
+            raw_out.clear()
+            raw_err.clear()
+            mut w := pool.try_wait(slot, &mut raw_out, &mut raw_err)
+            if !w.exited && now - slot_start[slot] >= timeout_ms {
+                w = pool.kill_reap(slot, &mut raw_out, &mut raw_err)
+            }
+            if raw_out.len > 0 {
+                dec_o := bytes.decode(&raw_out)
+                if dec_o.ok { slot_out[slot] += dec_o.value }
+            }
+            if raw_err.len > 0 {
+                dec_e := bytes.decode(&raw_err)
+                if dec_e.ok { slot_err[slot] += dec_e.value }
+            }
+            if w.exited {
+                completed += 1
+                gname := groups[gi].clone()
+                if w.ok && !w.timed_out && w.signal == 0 && w.code == 0 {
+                    print("PASS " + gname)
+                } else {
+                    failed += 1
+                    _ := sys.eprint("FAIL " + gname + " (exit " + w.code.str() + ")")
+                    out_trim := text.trim(slot_out[slot])
+                    err_trim := text.trim(slot_err[slot])
+                    if out_trim.len > 0 { _ := sys.eprint(out_trim) }
+                    if err_trim.len > 0 { _ := sys.eprint(err_trim) }
+                }
+                slot_idx[slot] = -1
+            }
+        }
+    }
+
+    if failed == 0 { 0 } else { 1 }
+}

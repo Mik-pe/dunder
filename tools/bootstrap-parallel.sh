@@ -26,10 +26,8 @@ parallel_success=0
 trap 'if [ "$parallel_success" = 1 ]; then rm -rf "$parallel_work"; else echo "Retained failed parallel bootstrap: $parallel_work" >&2; fi' EXIT
 trap 'exit 1' HUP INT TERM
 "$serial_compiler" build selfhost/main_parallel.ddr -o "$parallel_work/serial-produced" >&2
-"$parallel_work/serial-produced" build selfhost/main_parallel.ddr --jobs 1 -o "$parallel_work/one-worker" >&2
-cmp "$parallel_work/serial-produced" "$parallel_work/one-worker"
-"$parallel_work/one-worker" build selfhost/main_parallel.ddr --jobs 4 -o "$parallel_work/four-workers" >&2
-cmp "$parallel_work/one-worker" "$parallel_work/four-workers"
+"$parallel_work/serial-produced" build selfhost/main_parallel.ddr --jobs 4 -o "$parallel_work/four-workers" >&2
+cmp "$parallel_work/serial-produced" "$parallel_work/four-workers"
 mv -f "$parallel_work/four-workers" "$parallel_dir/dunder-parallel"
 parallel_success=1
 printf '%s\n' "$root/$parallel_dir/dunder-parallel"

@@ -246,23 +246,97 @@ fn same_assets(package: string, assets: string) -> bool {
     true
 }
 
-fn run_suite(root: string, work: string, executable: string) -> bool {
+fn run_suite(root: string, work: string, executable: string, compiler: string) -> bool {
     repo := work + "/repo"
     remote := work + "/remote"
     assets := work + "/assets"
-    if !fs.mkdir_all(assets).ok || !fs.symlink(executable, work + "/gh").ok { return harness.fail("cannot prepare offline release fixture") }
+    cache_dir := work + "/target-cache"
+    gz_cache := work + "/gz-cache"
+    if !fs.mkdir_all(assets).ok || !fs.mkdir_all(cache_dir).ok || !fs.mkdir_all(gz_cache).ok || !fs.symlink(executable, work + "/gh").ok {
+        return harness.fail("cannot prepare offline release fixture")
+    }
+    if compiler.len > 0 {
+        host_target := process.host_target()
+        if host_target.len > 0 {
+            _ := fixture.copy_file(compiler, cache_dir + "/" + host_target)
+        }
+    }
+    x86_prebuilt := process.env("DUNDER_X86_SELFHOST_BIN").unwrap_or("")
+    if x86_prebuilt.len > 0 && sys.metadata(x86_prebuilt).is_file {
+        if !fixture.copy_file(x86_prebuilt, cache_dir + "/x86_64-linux") {
+            return harness.fail("cannot seed cached x86_64-linux compiler")
+        }
+    }
+    gzip_wrap := work + "/gzip"
+    gzip_src := "#!/bin/sh\nset -eu\nreal_gzip=\"\"\n" +
+        "for p in /usr/bin/gzip /bin/gzip /opt/homebrew/bin/gzip /usr/local/bin/gzip; do\n" +
+        "  if [ -x \"$p\" ]; then real_gzip=\"$p\"; break; fi\n" +
+        "done\n" +
+        "if [ \"$#\" -eq 4 ] && [ \"$1\" = \"-9\" ] && [ \"$2\" = \"-n\" ] && [ \"$3\" = \"-c\" ]; then\n" +
+        "  base=\"$(basename \"$4\")\"\n" +
+        "  cg=\"" + gz_cache + "/$base.gz\"\n" +
+        "  cs=\"" + gz_cache + "/$base.src\"\n" +
+        "  if [ -f \"$cg\" ] && [ -f \"$cs\" ] && cmp -s \"$4\" \"$cs\"; then cat \"$cg\"; exit 0; fi\n" +
+        "  \"$real_gzip\" -1 -n -c \"$4\" > \"$cg.tmp.$$\"\n" +
+        "  cp \"$4\" \"$cs.tmp.$$\" && mv -f \"$cs.tmp.$$\" \"$cs\" && mv -f \"$cg.tmp.$$\" \"$cg\"\n" +
+        "  cat \"$cg\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "if [ \"${1:-}\" = \"-9\" ]; then shift; exec \"$real_gzip\" -1 \"$@\"; fi\n" +
+        "exec \"$real_gzip\" \"$@\"\n"
+    if !sys.write_text(gzip_wrap, gzip_src).ok || !sys.make_executable(gzip_wrap).ok {
+        return harness.fail("cannot prepare gzip wrapper in release fixture")
+    }
+    if sys.metadata("/usr/bin/openssl").is_file {
+        sha_wrap := work + "/sha256sum"
+        sha_src := "#!/bin/sh\nset -eu\nif [ \"$#\" -eq 0 ]; then\n  out=$(/usr/bin/openssl dgst -sha256)\n  printf '%s  -\\n' \"${out##* }\"\nelse\n  for f in \"$@\"; do\n    out=$(/usr/bin/openssl dgst -sha256 \"$f\")\n    printf '%s  %s\\n' \"${out##* }\" \"$f\"\n  done\nfi\n"
+        if !sys.write_text(sha_wrap, sha_src).ok || !sys.make_executable(sha_wrap).ok {
+            return harness.fail("cannot prepare sha256sum wrapper in release fixture")
+        }
+    }
     mut out := harness.empty_output()
     init := git_command(["init", "--bare", "-q", remote.clone()])
     clone := git_command(["clone", "--shared", "--no-checkout", "--no-tags", "-q", root.clone(), repo.clone()])
     if !execute(&init, 0, &mut out) || !execute(&clone, 0, &mut out) { return false }
-    commit := git_text(root, ["rev-parse", "HEAD"])
-    if commit.len == 0 ||
-       !git_run(repo, ["checkout", "--detach", "-q", commit.clone()]) ||
+    base_commit := git_text(root, ["rev-parse", "HEAD"])
+    obj_dir := git_text(root, ["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+    if obj_dir.len > 0 && base_commit.len > 0 {
+        _ := sys.write_text(remote + "/objects/info/alternates", obj_dir + "\n")
+        _ := git_run(remote, ["update-ref", "refs/heads/main", base_commit.clone()])
+    }
+    if base_commit.len == 0 ||
+       !git_run(repo, ["checkout", "--detach", "-q", base_commit.clone()]) ||
        !git_run(repo, ["config", "user.name", "Release Fixture"]) ||
        !git_run(repo, ["config", "user.email", "fixture@invalid.example"]) ||
        !git_run(repo, ["config", "url." + fixture.file_url(remote) + ".insteadOf", "https://github.com/Mik-pe/dunder.git"]) ||
        !fixture.copy_file(root + "/tools/release.sh", repo + "/tools/release.sh") ||
        !sys.make_executable(repo + "/tools/release.sh").ok { return false }
+    mut commit := base_commit
+    if compiler.len > 0 {
+        wrapper := work + "/cached-compiler"
+        wrapper_src := "#!/bin/sh\nset -eu\n" +
+            "if [ \"$#\" -ge 5 ] && [ \"$1\" = build ] && [ \"$3\" = --target ] && [ \"$5\" = -o ]; then\n" +
+            "  cached=\"" + cache_dir + "/$4\"\n" +
+            "  if [ -f \"$cached\" ]; then cp \"$cached\" \"$6\"; exit 0; fi\n" +
+            "  if [ -n \"${DUNDER_RELEASE_JOBS:-}\" ]; then\n" +
+            "    \"" + compiler + "\" \"$@\" --jobs \"$DUNDER_RELEASE_JOBS\"\n" +
+            "  else\n" +
+            "    \"" + compiler + "\" \"$@\"\n" +
+            "  fi\n" +
+            "  cp \"$6\" \"$cached.tmp.$$\" && mv -f \"$cached.tmp.$$\" \"$cached\"\n" +
+            "  exit 0\n" +
+            "fi\n" +
+            "exec \"" + compiler + "\" \"$@\"\n"
+        stub_boot := "#!/bin/sh\nset -eu\nprintf '%s\\n' '" + wrapper + "'\n"
+        if !sys.write_text(wrapper, wrapper_src).ok || !sys.make_executable(wrapper).ok ||
+           !sys.write_text(repo + "/tools/bootstrap.sh", stub_boot).ok || !sys.make_executable(repo + "/tools/bootstrap.sh").ok ||
+           !git_run(repo, ["add", "tools/bootstrap.sh"]) ||
+           !git_run(repo, ["commit", "-qm", "Use pre-bootstrapped compiler in release fixture"]) {
+            return harness.fail("cannot configure cached compiler in release fixture")
+        }
+        commit = git_text(repo, ["rev-parse", "HEAD"])
+        if commit.len == 0 { return false }
+    }
     version := compiler_version(repo)
     if version.len == 0 { return harness.fail("cannot read release fixture compiler version") }
     tag := "v" + version
@@ -272,6 +346,10 @@ fn run_suite(root: string, work: string, executable: string) -> bool {
     if !release_script(repo, work, package, tag + "-wrong", false, 1) || sys.metadata(package + "/release.txt").ok ||
        !release_script(repo, work, package, tag, false, 0) || sys.metadata(mutations).ok ||
        !check_package(package, version, commit) { return false }
+    x86_export := process.env("DUNDER_X86_SELFHOST_EXPORT").unwrap_or("")
+    if x86_export.len > 0 && sys.metadata(cache_dir + "/x86_64-linux").is_file {
+        _ := fixture.copy_file(cache_dir + "/x86_64-linux", x86_export)
+    }
     if !git_run(repo, ["tag", "-a", tag.clone(), "-m", "Test release", commit.clone()]) ||
        !git_run(repo, ["commit", "--allow-empty", "-qm", "Later local commit"]) ||
        !sys.write_text(repo + "/selfhost/driver/cli.ddr", "this uncommitted file must never be packaged").ok ||
@@ -295,9 +373,14 @@ fn main() -> i32 {
     root := harness.find_root()
     executable := fs.realpath(sys.arg(0))
     if root.len == 0 || !executable.ok { _ := harness.fail("cannot locate release test executable or repository"); return 2 }
+    mut compiler := ""
+    if sys.arg_count() >= 2 {
+        crp := fs.realpath(sys.arg(1))
+        if crp.ok && sys.metadata(crp.value).is_file { compiler = crp.value }
+    }
     temp := fs.temp_dir("dunder-release-test-")
     if !temp.ok { _ := harness.fail("cannot create release test directory"); return 1 }
     work := temp.value
     defer { _ := fs.remove_all(work) }
-    if run_suite(root, work, executable.value) { 0 } else { 1 }
+    if run_suite(root, work, executable.value, compiler) { 0 } else { 1 }
 }

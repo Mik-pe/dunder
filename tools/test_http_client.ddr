@@ -1,0 +1,1513 @@
+capability process, filesystem, network, stdio, unsafe
+
+import .harness as harness
+import std.bytes as bytes
+import std.dl as dl
+import std.fs as fs
+import std.json as json
+import std.net as net
+import std.parse as parse
+import std.process as process
+import std.signal as signal
+import std.text as text
+import sys
+
+// =========================================================================
+// OpenSSL / LibreSSL dynamic TLS server wrapper (via std.dl)
+// =========================================================================
+
+struct SslApi {
+    lib: ptr,
+    sym_method: ptr,
+    sym_ctx_new: ptr,
+    sym_ctx_free: ptr,
+    sym_use_cert: ptr,
+    sym_use_key: ptr,
+    sym_ssl_new: ptr,
+    sym_ssl_free: ptr,
+    sym_set_fd: ptr,
+    sym_accept: ptr,
+    sym_get_error: ptr,
+    sym_read: ptr,
+    sym_write: ptr,
+    sym_shutdown: ptr,
+}
+
+fn cstr_bytes(value: string) -> []u8 {
+    mut out: []u8 = []
+    out.reserve(value.len + 1)
+    bytes.append_utf8(&mut out, value)
+    out.push(0)
+    out
+}
+
+unsafe fn dl_open_path(path: string) -> ptr {
+    if path.len == 0 { return ptr(0) }
+    raw := cstr_bytes(path)
+    dl.open(addr(&raw[0]), 1)
+}
+
+unsafe fn dl_sym(lib: ptr, name: string) -> ptr {
+    raw := cstr_bytes(name)
+    dl.symbol(lib, addr(&raw[0]))
+}
+
+unsafe fn try_load_ssl_candidate(path: string, out: &mut SslApi) -> bool {
+    lib := dl_open_path(path)
+    if usize(lib) == 0 { return false }
+    s_method := dl_sym(lib, "TLS_server_method")
+    s_ctx_new := dl_sym(lib, "SSL_CTX_new")
+    s_ctx_free := dl_sym(lib, "SSL_CTX_free")
+    s_use_cert := dl_sym(lib, "SSL_CTX_use_certificate_file")
+    s_use_key := dl_sym(lib, "SSL_CTX_use_PrivateKey_file")
+    s_ssl_new := dl_sym(lib, "SSL_new")
+    s_ssl_free := dl_sym(lib, "SSL_free")
+    s_set_fd := dl_sym(lib, "SSL_set_fd")
+    s_accept := dl_sym(lib, "SSL_accept")
+    s_get_error := dl_sym(lib, "SSL_get_error")
+    s_read := dl_sym(lib, "SSL_read")
+    s_write := dl_sym(lib, "SSL_write")
+    s_shutdown := dl_sym(lib, "SSL_shutdown")
+    if usize(s_method) == 0 || usize(s_ctx_new) == 0 || usize(s_ctx_free) == 0 ||
+       usize(s_use_cert) == 0 || usize(s_use_key) == 0 || usize(s_ssl_new) == 0 ||
+       usize(s_ssl_free) == 0 || usize(s_set_fd) == 0 || usize(s_accept) == 0 ||
+       usize(s_get_error) == 0 || usize(s_read) == 0 || usize(s_write) == 0 ||
+       usize(s_shutdown) == 0 {
+        _ := dl.close(lib)
+        return false
+    }
+    out = SslApi {
+        lib: lib,
+        sym_method: s_method,
+        sym_ctx_new: s_ctx_new,
+        sym_ctx_free: s_ctx_free,
+        sym_use_cert: s_use_cert,
+        sym_use_key: s_use_key,
+        sym_ssl_new: s_ssl_new,
+        sym_ssl_free: s_ssl_free,
+        sym_set_fd: s_set_fd,
+        sym_accept: s_accept,
+        sym_get_error: s_get_error,
+        sym_read: s_read,
+        sym_write: s_write,
+        sym_shutdown: s_shutdown,
+    }
+    true
+}
+
+fn empty_ssl_api() -> SslApi {
+    unsafe {
+        SslApi {
+            lib: ptr(0), sym_method: ptr(0), sym_ctx_new: ptr(0), sym_ctx_free: ptr(0),
+            sym_use_cert: ptr(0), sym_use_key: ptr(0), sym_ssl_new: ptr(0), sym_ssl_free: ptr(0),
+            sym_set_fd: ptr(0), sym_accept: ptr(0), sym_get_error: ptr(0), sym_read: ptr(0),
+            sym_write: ptr(0), sym_shutdown: ptr(0),
+        }
+    }
+}
+
+fn load_ssl_api(out: &mut SslApi) -> bool {
+    explicit := process.env("DUNDER_SSL_LIB").unwrap_or("")
+    if explicit.len > 0 {
+        unsafe { return try_load_ssl_candidate(explicit, &mut out) }
+    }
+    dir := process.env("OPENSSL_LIB_DIR").unwrap_or("")
+    if dir.len > 0 {
+        mut clean := dir.clone()
+        while clean.len > 1 && clean[clean.len - 1] == 47 { clean = clean[0..clean.len - 1] }
+        if target_is("macos") {
+            for leaf in ["libssl.4.dylib", "libssl.3.dylib", "libssl.dylib"] {
+                unsafe { if try_load_ssl_candidate(clean + "/" + leaf, &mut out) { return true } }
+            }
+        } else if target_is("linux") {
+            for leaf in ["libssl.so.4", "libssl.so.3", "libssl.so.1.1", "libssl.so"] {
+                unsafe { if try_load_ssl_candidate(clean + "/" + leaf, &mut out) { return true } }
+            }
+        }
+    }
+    if target_is("macos") {
+        for cand in [
+            "/opt/homebrew/opt/openssl/lib/libssl.4.dylib",
+            "/opt/homebrew/opt/openssl@4/lib/libssl.4.dylib",
+            "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+            "/opt/homebrew/lib/libssl.dylib",
+            "/usr/local/opt/openssl/lib/libssl.4.dylib",
+            "/usr/local/opt/openssl/lib/libssl.3.dylib",
+            "/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+            "/usr/local/lib/libssl.dylib",
+            "/opt/local/lib/libssl.3.dylib",
+            "libssl.4.dylib",
+            "libssl.3.dylib",
+            "/usr/lib/libssl.48.dylib",
+        ] {
+            unsafe { if try_load_ssl_candidate(cand, &mut out) { return true } }
+        }
+    } else if target_is("linux") {
+        for cand in [
+            "libssl.so.3",
+            "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+            "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+            "/usr/lib64/libssl.so.3",
+            "libssl.so.4",
+            "libssl.so.1.1",
+            "/usr/lib/aarch64-linux-gnu/libssl.so.1.1",
+            "/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+            "/usr/lib64/libssl.so.1.1",
+            "libssl.so",
+        ] {
+            unsafe { if try_load_ssl_candidate(cand, &mut out) { return true } }
+        }
+    }
+    false
+}
+
+unsafe fn ssl_ctx_create(api: &SslApi, cert_path: string, key_path: string) -> ptr {
+    method_fn: extern fn() -> ptr = ffi_fn(api.sym_method)
+    ctx_new: extern fn(ptr) -> ptr = ffi_fn(api.sym_ctx_new)
+    ctx_free: extern fn(ptr) = ffi_fn(api.sym_ctx_free)
+    use_cert: extern fn(ptr, ptr, i32) -> i32 = ffi_fn(api.sym_use_cert)
+    use_key: extern fn(ptr, ptr, i32) -> i32 = ffi_fn(api.sym_use_key)
+    method := method_fn()
+    if usize(method) == 0 { return ptr(0) }
+    ctx := ctx_new(method)
+    if usize(ctx) == 0 { return ptr(0) }
+    cert_c := cstr_bytes(cert_path)
+    key_c := cstr_bytes(key_path)
+    if use_cert(ctx, addr(&cert_c[0]), 1) != 1 || use_key(ctx, addr(&key_c[0]), 1) != 1 {
+        ctx_free(ctx)
+        return ptr(0)
+    }
+    ctx
+}
+
+unsafe fn ssl_ctx_destroy(api: &SslApi, ctx: ptr) {
+    if usize(ctx) == 0 { return }
+    ctx_free: extern fn(ptr) = ffi_fn(api.sym_ctx_free)
+    ctx_free(ctx)
+}
+
+unsafe fn ssl_new_for_fd(api: &SslApi, ctx: ptr, fd: i32) -> ptr {
+    ssl_new: extern fn(ptr) -> ptr = ffi_fn(api.sym_ssl_new)
+    ssl_free: extern fn(ptr) = ffi_fn(api.sym_ssl_free)
+    set_fd: extern fn(ptr, i32) -> i32 = ffi_fn(api.sym_set_fd)
+    ssl := ssl_new(ctx)
+    if usize(ssl) == 0 { return ptr(0) }
+    if set_fd(ssl, fd) != 1 {
+        ssl_free(ssl)
+        return ptr(0)
+    }
+    ssl
+}
+
+unsafe fn ssl_accept_call(api: &SslApi, ssl: ptr) -> i32 {
+    f: extern fn(ptr) -> i32 = ffi_fn(api.sym_accept)
+    f(ssl)
+}
+
+unsafe fn ssl_get_error_call(api: &SslApi, ssl: ptr, ret: i32) -> i32 {
+    f: extern fn(ptr, i32) -> i32 = ffi_fn(api.sym_get_error)
+    f(ssl, ret)
+}
+
+unsafe fn ssl_read_call(api: &SslApi, ssl: ptr, buf: ptr, len: i32) -> i32 {
+    f: extern fn(ptr, ptr, i32) -> i32 = ffi_fn(api.sym_read)
+    f(ssl, buf, len)
+}
+
+unsafe fn ssl_write_call(api: &SslApi, ssl: ptr, buf: ptr, len: i32) -> i32 {
+    f: extern fn(ptr, ptr, i32) -> i32 = ffi_fn(api.sym_write)
+    f(ssl, buf, len)
+}
+
+unsafe fn ssl_shutdown_and_free(api: &SslApi, ssl: ptr) {
+    if usize(ssl) == 0 { return }
+    shut: extern fn(ptr) -> i32 = ffi_fn(api.sym_shutdown)
+    free_fn: extern fn(ptr) = ffi_fn(api.sym_ssl_free)
+    _ := shut(ssl)
+    free_fn(ssl)
+}
+
+// =========================================================================
+// Observed request counters (shared between server JSON export & parent verifier)
+// =========================================================================
+
+struct ObservedCounts {
+    get_ok: i32,
+    post_echo: i32,
+    put_echo: i32,
+    patch_echo: i32,
+    delete_echo: i32,
+    get_status: i32,
+    get_redirect: i32,
+    get_large: i32,
+    get_chunked_large: i32,
+    get_empty: i32,
+    get_slow: i32,
+    get_stall: i32,
+    get_renew: i32,
+    head_head: i32,
+    http_unexpected: i32,
+    https_get_ok: i32,
+    https_unexpected: i32,
+    server_error: string,
+}
+
+fn empty_counts() -> ObservedCounts {
+    ObservedCounts {
+        get_ok: 0, post_echo: 0, put_echo: 0, patch_echo: 0, delete_echo: 0,
+        get_status: 0, get_redirect: 0, get_large: 0, get_chunked_large: 0,
+        get_empty: 0, get_slow: 0, get_stall: 0, get_renew: 0, head_head: 0,
+        http_unexpected: 0, https_get_ok: 0, https_unexpected: 0, server_error: "",
+    }
+}
+
+fn http_request_total(c: &ObservedCounts) -> i32 {
+    c.get_ok + c.post_echo + c.put_echo + c.patch_echo + c.delete_echo +
+    c.get_status + c.get_redirect + c.get_large + c.get_chunked_large +
+    c.get_empty + c.get_slow + c.get_stall + c.get_renew + c.head_head +
+    c.http_unexpected
+}
+
+fn https_request_total(c: &ObservedCounts) -> i32 {
+    c.https_get_ok + c.https_unexpected
+}
+
+fn write_counts_json(path: string, c: &ObservedCounts) -> bool {
+    mut w := json.Writer::new()
+    w.object()
+    w.key("get_ok"); w.integer(i64(c.get_ok))
+    w.key("post_echo"); w.integer(i64(c.post_echo))
+    w.key("put_echo"); w.integer(i64(c.put_echo))
+    w.key("patch_echo"); w.integer(i64(c.patch_echo))
+    w.key("delete_echo"); w.integer(i64(c.delete_echo))
+    w.key("get_status"); w.integer(i64(c.get_status))
+    w.key("get_redirect"); w.integer(i64(c.get_redirect))
+    w.key("get_large"); w.integer(i64(c.get_large))
+    w.key("get_chunked_large"); w.integer(i64(c.get_chunked_large))
+    w.key("get_empty"); w.integer(i64(c.get_empty))
+    w.key("get_slow"); w.integer(i64(c.get_slow))
+    w.key("get_stall"); w.integer(i64(c.get_stall))
+    w.key("get_renew"); w.integer(i64(c.get_renew))
+    w.key("head_head"); w.integer(i64(c.head_head))
+    w.key("http_unexpected"); w.integer(i64(c.http_unexpected))
+    w.key("https_get_ok"); w.integer(i64(c.https_get_ok))
+    w.key("https_unexpected"); w.integer(i64(c.https_unexpected))
+    w.key("server_error"); w.string(c.server_error)
+    w.end()
+    encoded := w.finish()
+    if encoded.is_err() { return false }
+    sys.write_text(path, encoded.unwrap() + "\n").ok
+}
+
+fn read_counts_json(path: string, out: &mut ObservedCounts) -> bool {
+    raw := sys.read_u8(path)
+    if !raw.ok { return false }
+    doc := json.Doc::parse_bytes(move raw.value)
+    if !doc.ok || doc.kind(doc.root) != .Object { return false }
+    out = ObservedCounts {
+        get_ok: i32(doc.get_i64(doc.root, "get_ok").unwrap_or(-1)),
+        post_echo: i32(doc.get_i64(doc.root, "post_echo").unwrap_or(-1)),
+        put_echo: i32(doc.get_i64(doc.root, "put_echo").unwrap_or(-1)),
+        patch_echo: i32(doc.get_i64(doc.root, "patch_echo").unwrap_or(-1)),
+        delete_echo: i32(doc.get_i64(doc.root, "delete_echo").unwrap_or(-1)),
+        get_status: i32(doc.get_i64(doc.root, "get_status").unwrap_or(-1)),
+        get_redirect: i32(doc.get_i64(doc.root, "get_redirect").unwrap_or(-1)),
+        get_large: i32(doc.get_i64(doc.root, "get_large").unwrap_or(-1)),
+        get_chunked_large: i32(doc.get_i64(doc.root, "get_chunked_large").unwrap_or(-1)),
+        get_empty: i32(doc.get_i64(doc.root, "get_empty").unwrap_or(-1)),
+        get_slow: i32(doc.get_i64(doc.root, "get_slow").unwrap_or(-1)),
+        get_stall: i32(doc.get_i64(doc.root, "get_stall").unwrap_or(-1)),
+        get_renew: i32(doc.get_i64(doc.root, "get_renew").unwrap_or(-1)),
+        head_head: i32(doc.get_i64(doc.root, "head_head").unwrap_or(-1)),
+        http_unexpected: i32(doc.get_i64(doc.root, "http_unexpected").unwrap_or(-1)),
+        https_get_ok: i32(doc.get_i64(doc.root, "https_get_ok").unwrap_or(-1)),
+        https_unexpected: i32(doc.get_i64(doc.root, "https_unexpected").unwrap_or(-1)),
+        server_error: doc.get_str(doc.root, "server_error").unwrap_or(""),
+    }
+    true
+}
+
+// =========================================================================
+// HTTP/1.1 request parser & response builders
+// =========================================================================
+
+struct ParsedHead {
+    ok: bool,
+    method: string,
+    path: string,
+    content_length: i32,
+    x_probe: string,
+    content_type: string,
+    expect_continue: bool,
+    body_start: i32,
+}
+
+fn trim_ows_range(buf: &[]u8, start: i32, end: i32) -> (i32, i32) {
+    mut lo := start
+    mut hi := end
+    while lo < hi && (buf[lo] == b' ' || buf[lo] == b'\t') { lo += 1 }
+    while hi > lo && (buf[hi - 1] == b' ' || buf[hi - 1] == b'\t') { hi -= 1 }
+    (lo, hi)
+}
+
+fn parse_http_head(buf: &[]u8, head_end: i32) -> ParsedHead {
+    bad := ParsedHead {
+        ok: false, method: "", path: "", content_length: 0,
+        x_probe: "", content_type: "", expect_continue: false, body_start: 0,
+    }
+    line_end := bytes.find_crlf(&buf, 0, head_end + 2).unwrap_or(-1)
+    if line_end <= 0 { return bad }
+    sp1 := bytes.find_byte(&buf, 0, line_end, b' ').unwrap_or(-1)
+    if sp1 <= 0 { return bad }
+    sp2 := bytes.find_byte(&buf, sp1 + 1, line_end, b' ').unwrap_or(-1)
+    if sp2 <= sp1 + 1 { return bad }
+    method_dec := bytes.decode_range(&buf, 0, sp1)
+    path_dec := bytes.decode_range(&buf, sp1 + 1, sp2)
+    if !method_dec.ok || !path_dec.ok { return bad }
+
+    mut content_length := 0
+    mut x_probe := ""
+    mut content_type := ""
+    mut expect_continue := false
+
+    mut pos := line_end + 2
+    while pos < head_end {
+        end := bytes.find_crlf(&buf, pos, head_end + 2).unwrap_or(-1)
+        if end < 0 { break }
+        colon := bytes.find_byte(&buf, pos, end, b':').unwrap_or(-1)
+        if colon > pos {
+            (v_lo, v_hi) := trim_ows_range(&buf, colon + 1, end)
+            if bytes.equals_ascii_ci(&buf, pos, colon, "content-length") {
+                v_dec := bytes.decode_range(&buf, v_lo, v_hi)
+                if !v_dec.ok { return bad }
+                parsed := parse.integer(v_dec.value)
+                if !parsed.ok || parsed.value < 0 || parsed.value > 1048576 { return bad }
+                content_length = i32(parsed.value)
+            } else if bytes.equals_ascii_ci(&buf, pos, colon, "x-probe") {
+                v_dec := bytes.decode_range(&buf, v_lo, v_hi)
+                if v_dec.ok { x_probe = v_dec.value }
+            } else if bytes.equals_ascii_ci(&buf, pos, colon, "content-type") {
+                v_dec := bytes.decode_range(&buf, v_lo, v_hi)
+                if v_dec.ok { content_type = v_dec.value }
+            } else if bytes.equals_ascii_ci(&buf, pos, colon, "expect") {
+                if bytes.equals_ascii_ci(&buf, v_lo, v_hi, "100-continue") {
+                    expect_continue = true
+                }
+            }
+        }
+        pos = end + 2
+    }
+
+    ParsedHead {
+        ok: true,
+        method: method_dec.value,
+        path: path_dec.value,
+        content_length: content_length,
+        x_probe: x_probe,
+        content_type: content_type,
+        expect_continue: expect_continue,
+        body_start: head_end + 4,
+    }
+}
+
+fn append_http_response(out: &mut []u8, status_line: string, extra_header: string, body: &[]u8) {
+    out.clear()
+    bytes.append_utf8(&mut out, "HTTP/1.1 ")
+    bytes.append_utf8(&mut out, status_line)
+    bytes.append_utf8(&mut out, "\r\nContent-Length: ")
+    bytes.append_decimal(&mut out, i64(body.len))
+    bytes.append_utf8(&mut out, "\r\n")
+    if extra_header.len > 0 {
+        bytes.append_utf8(&mut out, extra_header)
+        bytes.append_utf8(&mut out, "\r\n")
+    }
+    bytes.append_utf8(&mut out, "\r\n")
+    if body.len > 0 {
+        bytes.extend(&mut out, &body)
+    }
+}
+
+fn append_http_text(out: &mut []u8, status_line: string, extra_header: string, text_body: string) {
+    body := bytes.from_text(text_body)
+    append_http_response(&mut out, status_line, extra_header, &body)
+}
+
+fn record_server_error(counts: &mut ObservedCounts, msg: string) {
+    if counts.server_error.len == 0 {
+        counts.server_error = msg.clone()
+    }
+}
+
+fn dispatch_plain_http(head: &ParsedHead, in_buf: &[]u8, counts: &mut ObservedCounts, out: &mut []u8) -> i64 {
+    if head.method == "GET" {
+        if head.path == "/ok" {
+            counts.get_ok += 1
+            append_http_text(&mut out, "200 OK", "", "hello HTTP")
+            return 0
+        }
+        if head.path == "/status" {
+            counts.get_status += 1
+            body: []u8 = [42, 0, 128, 255]
+            append_http_response(&mut out, "418 I'm a Teapot", "", &body)
+            return 0
+        }
+        if head.path == "/redirect" {
+            counts.get_redirect += 1
+            if head.x_probe != "dunder" {
+                record_server_error(&mut counts, f"/redirect expected X-Probe: dunder, got {head.x_probe}")
+                append_http_text(&mut out, "400 Bad Request", "", "bad probe")
+                return 0
+            }
+            append_http_text(&mut out, "302 Found", "Location: /must-not-follow", "redirect")
+            return 0
+        }
+        if head.path == "/large" {
+            counts.get_large += 1
+            out.clear()
+            out.reserve(8256)
+            bytes.append_utf8(&mut out, "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n")
+            for _ in 0..8192 { out.push(b'x') }
+            return 0
+        }
+        if head.path == "/chunked-large" {
+            counts.get_chunked_large += 1
+            out.clear()
+            out.reserve(8300)
+            bytes.append_utf8(&mut out, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2000\r\n")
+            for _ in 0..8192 { out.push(b'x') }
+            bytes.append_utf8(&mut out, "\r\n0\r\n\r\n")
+            return 0
+        }
+        if head.path == "/empty" {
+            counts.get_empty += 1
+            out.clear()
+            bytes.append_utf8(&mut out, "HTTP/1.1 204 No Content\r\n\r\n")
+            return 0
+        }
+        if head.path == "/slow" {
+            counts.get_slow += 1
+            append_http_text(&mut out, "200 OK", "", "slow")
+            return 250
+        }
+        if head.path == "/stall" {
+            counts.get_stall += 1
+            append_http_text(&mut out, "200 OK", "", "stalled")
+            return 3000
+        }
+        if head.path == "/renew" {
+            counts.get_renew += 1
+            append_http_text(&mut out, "200 OK", "", "renewed")
+            return 0
+        }
+        counts.http_unexpected += 1
+        record_server_error(&mut counts, f"unexpected GET {head.path}")
+        append_http_text(&mut out, "500 Internal Server Error", "", "unexpected request")
+        return 0
+    }
+
+    if head.method == "HEAD" {
+        if head.path == "/head" {
+            counts.head_head += 1
+            out.clear()
+            bytes.append_utf8(&mut out, "HTTP/1.1 200 OK\r\nContent-Length: 43\r\n\r\n")
+            return 0
+        }
+        counts.http_unexpected += 1
+        record_server_error(&mut counts, f"unexpected HEAD {head.path}")
+        out.clear()
+        bytes.append_utf8(&mut out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+        return 0
+    }
+
+    if head.method == "POST" || head.method == "PUT" || head.method == "PATCH" || head.method == "DELETE" {
+        if head.method == "POST" { counts.post_echo += 1 }
+        else if head.method == "PUT" { counts.put_echo += 1 }
+        else if head.method == "PATCH" { counts.patch_echo += 1 }
+        else { counts.delete_echo += 1 }
+
+        expected: []u8 = [0, 1, 2, 127, 128, 255, 0]
+        body_end := head.body_start + head.content_length
+        if head.path != "/echo" || head.x_probe != "dunder" ||
+           head.content_type != "application/octet-stream" ||
+           !bytes.equal_ranges(&in_buf, head.body_start, body_end, &expected, 0, expected.len) {
+            record_server_error(&mut counts, f"{head.method} {head.path} failed echo check (probe={head.x_probe}, ct={head.content_type}, len={head.content_length})")
+            append_http_text(&mut out, "400 Bad Request", "", "echo mismatch")
+            return 0
+        }
+        append_http_response(&mut out, "201 Created", "", &expected)
+        return 0
+    }
+
+    counts.http_unexpected += 1
+    record_server_error(&mut counts, f"unexpected method {head.method} {head.path}")
+    append_http_text(&mut out, "500 Internal Server Error", "", "unexpected request")
+    0
+}
+
+// =========================================================================
+// Non-blocking multi-listener fixture server (HTTP + HTTPS + StalledTLS)
+// =========================================================================
+
+// HttpConn states: 0 = READ, 1 = DELAY, 2 = WRITE
+struct HttpConn {
+    fd: i32,
+    state: i32,
+    in_buf: []u8,
+    out_buf: []u8,
+    out_off: i32,
+    send_at_ms: i64,
+    sent_continue: bool,
+}
+
+// TlsConn states: 0 = HANDSHAKE, 1 = READ, 2 = WRITE
+struct TlsConn {
+    fd: i32,
+    ssl: ptr,
+    state: i32,
+    want: i32,
+    in_buf: []u8,
+    out_buf: []u8,
+    out_off: i32,
+}
+
+struct StalledConn {
+    fd: i32,
+    close_at_ms: i64,
+}
+
+fn close_http_conn(conn: &mut HttpConn) {
+    if conn.fd >= 0 {
+        _ := sys.net_close(conn.fd)
+        conn.fd = -1
+    }
+    conn.in_buf.clear()
+    conn.out_buf.clear()
+    conn.out_off = 0
+}
+
+fn close_tls_conn(api: &SslApi, conn: &mut TlsConn) {
+    unsafe {
+        if usize(conn.ssl) != 0 {
+            ssl_shutdown_and_free(&api, conn.ssl)
+            conn.ssl = ptr(0)
+        }
+    }
+    if conn.fd >= 0 {
+        _ := sys.net_close(conn.fd)
+        conn.fd = -1
+    }
+    conn.in_buf.clear()
+    conn.out_buf.clear()
+    conn.out_off = 0
+}
+
+fn flush_http_write(conn: &mut HttpConn) {
+    while conn.fd >= 0 && conn.out_off < conn.out_buf.len {
+        n := sys.net_write(conn.fd, &conn.out_buf, i64(conn.out_off), i64(conn.out_buf.len - conn.out_off))
+        if n > 0 {
+            conn.out_off += i32(n)
+            continue
+        }
+        if n == -4 { continue }
+        if n == -35 { return }
+        close_http_conn(&mut conn)
+        return
+    }
+    if conn.fd >= 0 && conn.out_off >= conn.out_buf.len {
+        conn.out_buf.clear()
+        conn.out_off = 0
+        conn.state = 0
+    }
+}
+
+fn process_http_buffer(conn: &mut HttpConn, counts: &mut ObservedCounts) {
+    while conn.fd >= 0 && conn.state == 0 {
+        head_end := bytes.find_double_crlf(&conn.in_buf, 0, conn.in_buf.len).unwrap_or(-1)
+        if head_end < 0 { return }
+        head := parse_http_head(&conn.in_buf, head_end)
+        if !head.ok {
+            close_http_conn(&mut conn)
+            return
+        }
+        total_req := head.body_start + head.content_length
+        if head.expect_continue && !conn.sent_continue && conn.in_buf.len < total_req {
+            cont := bytes.from_text("HTTP/1.1 100 Continue\r\n\r\n")
+            _ := sys.net_write(conn.fd, &cont, 0, i64(cont.len))
+            conn.sent_continue = true
+        }
+        if conn.in_buf.len < total_req { return }
+
+        delay_ms := dispatch_plain_http(&head, &conn.in_buf, &mut counts, &mut conn.out_buf)
+        conn.out_off = 0
+        bytes.consume_prefix(&mut conn.in_buf, total_req)
+        conn.sent_continue = false
+
+        if delay_ms > 0 {
+            conn.send_at_ms = sys.now_ms() + delay_ms
+            conn.state = 1
+            return
+        }
+        conn.state = 2
+        flush_http_write(&mut conn)
+    }
+}
+
+fn step_http_conn(conn: &mut HttpConn, revents: i32, counts: &mut ObservedCounts) {
+    if conn.fd < 0 { return }
+    if conn.state == 0 {
+        while conn.fd >= 0 {
+            conn.in_buf.reserve(conn.in_buf.len + 16384)
+            n := sys.net_read(conn.fd, &mut conn.in_buf, 16384)
+            if n > 0 { continue }
+            if n == -4 { continue }
+            if n == -35 { break }
+            // EOF or error: process any buffered request first, then close if idle
+            if conn.in_buf.len > 0 {
+                process_http_buffer(&mut conn, &mut counts)
+            }
+            if conn.fd >= 0 && conn.state == 0 {
+                close_http_conn(&mut conn)
+            }
+            return
+        }
+        process_http_buffer(&mut conn, &mut counts)
+        return
+    }
+    if conn.state == 1 {
+        if revents != 0 {
+            mut probe: []u8 = []
+            probe.reserve(16)
+            n := sys.net_peek(conn.fd, &mut probe, 16)
+            if n == 0 || (n < 0 && n != -35 && n != -4) {
+                close_http_conn(&mut conn)
+                return
+            }
+        }
+        return
+    }
+    if conn.state == 2 {
+        flush_http_write(&mut conn)
+        if conn.fd >= 0 && conn.state == 0 && conn.in_buf.len > 0 {
+            process_http_buffer(&mut conn, &mut counts)
+        }
+    }
+}
+
+fn step_tls_conn(api: &SslApi, conn: &mut TlsConn, scratch: &mut []u8, counts: &mut ObservedCounts) {
+    while conn.fd >= 0 {
+        if conn.state == 0 {
+            mut r := 0
+            mut err := 0
+            unsafe {
+                r = ssl_accept_call(&api, conn.ssl)
+                if r <= 0 { err = ssl_get_error_call(&api, conn.ssl, r) }
+            }
+            if r == 1 {
+                conn.state = 1
+                conn.want = net.poll_in()
+                continue
+            }
+            if err == 2 { conn.want = net.poll_in(); return }
+            if err == 3 { conn.want = net.poll_out(); return }
+            close_tls_conn(&api, &mut conn)
+            return
+        }
+
+        if conn.state == 1 {
+            head_end := bytes.find_double_crlf(&conn.in_buf, 0, conn.in_buf.len).unwrap_or(-1)
+            if head_end >= 0 {
+                head := parse_http_head(&conn.in_buf, head_end)
+                if !head.ok {
+                    close_tls_conn(&api, &mut conn)
+                    return
+                }
+                total_req := head.body_start + head.content_length
+                if conn.in_buf.len >= total_req {
+                    if head.method == "GET" && head.path == "/ok" {
+                        counts.https_get_ok += 1
+                        append_http_text(&mut conn.out_buf, "200 OK", "", "hello HTTP")
+                    } else {
+                        counts.https_unexpected += 1
+                        record_server_error(&mut counts, f"unexpected HTTPS {head.method} {head.path}")
+                        append_http_text(&mut conn.out_buf, "500 Internal Server Error", "", "unexpected request")
+                    }
+                    conn.out_off = 0
+                    bytes.consume_prefix(&mut conn.in_buf, total_req)
+                    conn.state = 2
+                    conn.want = net.poll_out()
+                    continue
+                }
+            }
+            mut n := 0
+            mut err := 0
+            unsafe {
+                n = ssl_read_call(&api, conn.ssl, addr(&mut scratch[0]), scratch.len)
+                if n <= 0 { err = ssl_get_error_call(&api, conn.ssl, n) }
+            }
+            if n > 0 {
+                bytes.extend_range(&mut conn.in_buf, &scratch, 0, n)
+                continue
+            }
+            if err == 2 { conn.want = net.poll_in(); return }
+            if err == 3 { conn.want = net.poll_out(); return }
+            close_tls_conn(&api, &mut conn)
+            return
+        }
+
+        if conn.state == 2 {
+            if conn.out_off >= conn.out_buf.len {
+                conn.out_buf.clear()
+                conn.out_off = 0
+                conn.state = 1
+                conn.want = net.poll_in()
+                continue
+            }
+            rem := conn.out_buf.len - conn.out_off
+            mut n := 0
+            mut err := 0
+            unsafe {
+                n = ssl_write_call(&api, conn.ssl, addr(&conn.out_buf[conn.out_off]), rem)
+                if n <= 0 { err = ssl_get_error_call(&api, conn.ssl, n) }
+            }
+            if n > 0 {
+                conn.out_off += n
+                continue
+            }
+            if err == 2 { conn.want = net.poll_in(); return }
+            if err == 3 { conn.want = net.poll_out(); return }
+            close_tls_conn(&api, &mut conn)
+            return
+        }
+    }
+}
+
+fn run_server_mode(cert_path: string, key_path: string, counts_path: string) -> i32 {
+    _ := signal.ignore_sigpipe()
+
+    mut api := empty_ssl_api()
+    if !load_ssl_api(&mut api) {
+        _ := sys.eprint("fixture server: cannot load OpenSSL/LibreSSL libssl")
+        return 1
+    }
+    defer { unsafe { if usize(api.lib) != 0 { _ := dl.close(api.lib) } } }
+
+    mut ssl_ctx := unsafe { ptr(0) }
+    unsafe { ssl_ctx = ssl_ctx_create(&api, cert_path, key_path) }
+    if unsafe { usize(ssl_ctx) == 0 } {
+        _ := sys.eprint("fixture server: cannot initialize SSL_CTX with generated certificate")
+        return 1
+    }
+    defer { unsafe { ssl_ctx_destroy(&api, ssl_ctx) } }
+
+    http_res := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(u16(0)), 64)
+    tls_res := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(u16(0)), 64)
+    stalled_res := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(u16(0)), 64)
+    if http_res.is_err() || tls_res.is_err() || stalled_res.is_err() {
+        _ := sys.eprint("fixture server: cannot bind loopback listeners")
+        return 1
+    }
+    http_listener := http_res.unwrap()
+    tls_listener := tls_res.unwrap()
+    stalled_listener := stalled_res.unwrap()
+    _ := http_listener.set_nonblocking(true)
+    _ := tls_listener.set_nonblocking(true)
+    _ := stalled_listener.set_nonblocking(true)
+    unsafe { _ := sys.fd_set_nonblocking(0, true) }
+
+    http_port := http_listener.local_port()
+    tls_port := tls_listener.local_port()
+    stalled_port := stalled_listener.local_port()
+    if http_port <= 0 || tls_port <= 0 || stalled_port <= 0 {
+        _ := sys.eprint("fixture server: failed querying listener ports")
+        return 1
+    }
+
+    print(f"{http_port} {tls_port} {stalled_port}")
+
+    mut counts := empty_counts()
+    mut http_conns: []HttpConn = []
+    mut tls_conns: []TlsConn = []
+    mut stalled_conns: []StalledConn = []
+    mut tls_scratch: []u8 = []
+    bytes.pad(&mut tls_scratch, 16384)
+    mut stdin_buf: []u8 = []
+    stdin_buf.reserve(64)
+
+    mut ps := net.PollSet::new()
+    mut roles: []i32 = []
+    mut slots: []i32 = []
+    mut running := true
+
+    while running {
+        now := sys.now_ms()
+        mut poll_ms: i64 = 100
+
+        // Fire due delayed HTTP responses
+        for i in 0..http_conns.len {
+            if http_conns[i].fd >= 0 && http_conns[i].state == 1 {
+                if now >= http_conns[i].send_at_ms {
+                    http_conns[i].state = 2
+                    flush_http_write(&mut http_conns[i])
+                } else {
+                    rem := http_conns[i].send_at_ms - now
+                    if rem < poll_ms { poll_ms = rem }
+                }
+            }
+        }
+
+        // Expire stalled TLS sockets
+        for i in 0..stalled_conns.len {
+            if stalled_conns[i].fd >= 0 {
+                if now >= stalled_conns[i].close_at_ms {
+                    _ := sys.net_close(stalled_conns[i].fd)
+                    stalled_conns[i].fd = -1
+                } else {
+                    rem := stalled_conns[i].close_at_ms - now
+                    if rem < poll_ms { poll_ms = rem }
+                }
+            }
+        }
+
+        ps.clear()
+        roles.clear()
+        slots.clear()
+
+        // role 0: control stdin fd 0
+        ps.add(0, net.poll_in())
+        roles.push(0); slots.push(-1)
+
+        // role 1: plain HTTP listener
+        ps.add(http_listener.fd(), net.poll_in())
+        roles.push(1); slots.push(-1)
+
+        // role 2: HTTPS TLS listener
+        ps.add(tls_listener.fd(), net.poll_in())
+        roles.push(2); slots.push(-1)
+
+        // role 3: stalled TLS listener
+        ps.add(stalled_listener.fd(), net.poll_in())
+        roles.push(3); slots.push(-1)
+
+        // role 4: active plain HTTP connections
+        for i in 0..http_conns.len {
+            if http_conns[i].fd < 0 { continue }
+            ev := if http_conns[i].state == 2 { net.poll_out() } else { net.poll_in() }
+            ps.add(http_conns[i].fd, ev)
+            roles.push(4); slots.push(i)
+        }
+
+        // role 5: active HTTPS TLS connections
+        for i in 0..tls_conns.len {
+            if tls_conns[i].fd < 0 { continue }
+            ps.add(tls_conns[i].fd, tls_conns[i].want)
+            roles.push(5); slots.push(i)
+        }
+
+        // role 6: active stalled TLS connections (watch for early client close)
+        for i in 0..stalled_conns.len {
+            if stalled_conns[i].fd < 0 { continue }
+            ps.add(stalled_conns[i].fd, net.poll_in())
+            roles.push(6); slots.push(i)
+        }
+
+        if poll_ms < 1 { poll_ms = 1 }
+        match ps.poll(i32(poll_ms)) {
+            .Err(err) => {
+                if err == .Interrupted { continue }
+                break
+            },
+            .Ok(ready) => {
+                if ready == 0 { continue }
+            },
+        }
+
+        for idx in 0..roles.len {
+            rev := ps.revents[idx]
+            if rev == 0 { continue }
+            role := roles[idx]
+            slot := slots[idx]
+
+            if role == 0 {
+                if rev.bit_and(net.poll_hup().bit_or(net.poll_err()).bit_or(net.poll_nval())) != 0 {
+                    running = false
+                    break
+                }
+                stdin_buf.clear()
+                mut n: i64 = 0
+                unsafe { n = sys.fd_read(0, &mut stdin_buf, 64) }
+                if n == 0 || (n < 0 && n != -35 && n != -4) {
+                    running = false
+                    break
+                }
+            } else if role == 1 {
+                while true {
+                    cfd := sys.net_accept(http_listener.fd())
+                    if cfd < 0 { break }
+                    fd := i32(cfd)
+                    _ := sys.net_set_nonblocking(fd, true)
+                    _ := sys.net_set_nodelay(fd, true)
+                    mut placed := false
+                    for j in 0..http_conns.len {
+                        if http_conns[j].fd < 0 {
+                            http_conns[j].fd = fd
+                            http_conns[j].state = 0
+                            http_conns[j].in_buf.clear()
+                            http_conns[j].out_buf.clear()
+                            http_conns[j].out_off = 0
+                            http_conns[j].send_at_ms = 0
+                            http_conns[j].sent_continue = false
+                            placed = true
+                            break
+                        }
+                    }
+                    if !placed {
+                        http_conns.push(HttpConn {
+                            fd: fd, state: 0, in_buf: [], out_buf: [],
+                            out_off: 0, send_at_ms: 0, sent_continue: false,
+                        })
+                    }
+                }
+            } else if role == 2 {
+                while true {
+                    cfd := sys.net_accept(tls_listener.fd())
+                    if cfd < 0 { break }
+                    fd := i32(cfd)
+                    _ := sys.net_set_nonblocking(fd, true)
+                    _ := sys.net_set_nodelay(fd, true)
+                    mut ssl := unsafe { ptr(0) }
+                    unsafe { ssl = ssl_new_for_fd(&api, ssl_ctx, fd) }
+                    if unsafe { usize(ssl) == 0 } {
+                        _ := sys.net_close(fd)
+                        continue
+                    }
+                    mut slot_idx := -1
+                    for j in 0..tls_conns.len {
+                        if tls_conns[j].fd < 0 {
+                            tls_conns[j].fd = fd
+                            tls_conns[j].ssl = ssl
+                            tls_conns[j].state = 0
+                            tls_conns[j].want = net.poll_in()
+                            tls_conns[j].in_buf.clear()
+                            tls_conns[j].out_buf.clear()
+                            tls_conns[j].out_off = 0
+                            slot_idx = j
+                            break
+                        }
+                    }
+                    if slot_idx < 0 {
+                        slot_idx = tls_conns.len
+                        tls_conns.push(TlsConn {
+                            fd: fd, ssl: ssl, state: 0, want: net.poll_in(),
+                            in_buf: [], out_buf: [], out_off: 0,
+                        })
+                    }
+                    step_tls_conn(&api, &mut tls_conns[slot_idx], &mut tls_scratch, &mut counts)
+                }
+            } else if role == 3 {
+                while true {
+                    cfd := sys.net_accept(stalled_listener.fd())
+                    if cfd < 0 { break }
+                    fd := i32(cfd)
+                    _ := sys.net_set_nonblocking(fd, true)
+                    close_at := sys.now_ms() + 3000
+                    mut placed := false
+                    for j in 0..stalled_conns.len {
+                        if stalled_conns[j].fd < 0 {
+                            stalled_conns[j].fd = fd
+                            stalled_conns[j].close_at_ms = close_at
+                            placed = true
+                            break
+                        }
+                    }
+                    if !placed {
+                        stalled_conns.push(StalledConn { fd: fd, close_at_ms: close_at })
+                    }
+                }
+            } else if role == 4 && slot >= 0 {
+                step_http_conn(&mut http_conns[slot], rev, &mut counts)
+            } else if role == 5 && slot >= 0 {
+                step_tls_conn(&api, &mut tls_conns[slot], &mut tls_scratch, &mut counts)
+            } else if role == 6 && slot >= 0 {
+                if rev.bit_and(net.poll_hup().bit_or(net.poll_err()).bit_or(net.poll_nval())) != 0 {
+                    _ := sys.net_close(stalled_conns[slot].fd)
+                    stalled_conns[slot].fd = -1
+                } else {
+                    mut probe: []u8 = []
+                    probe.reserve(16)
+                    n := sys.net_peek(stalled_conns[slot].fd, &mut probe, 16)
+                    if n == 0 || (n < 0 && n != -35 && n != -4) {
+                        _ := sys.net_close(stalled_conns[slot].fd)
+                        stalled_conns[slot].fd = -1
+                    }
+                }
+            }
+        }
+    }
+
+    for i in 0..http_conns.len { close_http_conn(&mut http_conns[i]) }
+    for i in 0..tls_conns.len { close_tls_conn(&api, &mut tls_conns[i]) }
+    for i in 0..stalled_conns.len {
+        if stalled_conns[i].fd >= 0 {
+            _ := sys.net_close(stalled_conns[i].fd)
+            stalled_conns[i].fd = -1
+        }
+    }
+
+    if !write_counts_json(counts_path, &counts) {
+        _ := sys.eprint("fixture server: failed writing counts file")
+        return 1
+    }
+    0
+}
+
+// =========================================================================
+// Parallel process runner helper (for builds + certgen, and client runs)
+// =========================================================================
+
+struct JobResult {
+    ok: bool,
+    code: i32,
+    signal: i32,
+    timed_out: bool,
+    elapsed_ms: i64,
+    stdout: []u8,
+    stderr: []u8,
+}
+
+fn run_parallel(cmds: &[]process.Command, timeout_ms: i64, results: &mut []JobResult) -> bool {
+    count := cmds.len
+    results.clear()
+    if count == 0 { return true }
+    for _ in 0..count {
+        results.push(JobResult {
+            ok: false, code: -1, signal: 0, timed_out: false,
+            elapsed_ms: 0, stdout: [], stderr: [],
+        })
+    }
+
+    mut pool := process.ChildSet::new(count)
+    defer { pool.kill_all() }
+
+    mut slot_job: []i32 = []
+    mut slot_start: []i64 = []
+    for _ in 0..count {
+        slot_job.push(-1)
+        slot_start.push(0)
+    }
+
+    for i in 0..count {
+        sp := cmds[i].spawn()
+        if sp.is_err() {
+            return harness.fail(f"failed spawning {cmds[i].program} (errno {sp.unwrap_err().code()})")
+        }
+        mut ch := sp.unwrap()
+        slot := pool.insert(&mut ch)
+        if slot < 0 { return harness.fail("ChildSet full while spawning job") }
+        slot_job[slot] = i
+        slot_start[slot] = sys.now_ms()
+    }
+
+    mut raw_out: []u8 = []
+    mut raw_err: []u8 = []
+    mut completed := 0
+    while completed < count {
+        _ := pool.poll_io(25)
+        now := sys.now_ms()
+        for slot in 0..count {
+            if !pool.is_active(slot) { continue }
+            jid := slot_job[slot]
+            raw_out.clear()
+            raw_err.clear()
+            mut w := pool.try_wait(slot, &mut raw_out, &mut raw_err)
+            if !w.exited && timeout_ms > 0 && now - slot_start[slot] >= timeout_ms {
+                w = pool.kill_reap(slot, &mut raw_out, &mut raw_err)
+            }
+            if raw_out.len > 0 { bytes.extend(&mut results[jid].stdout, &raw_out) }
+            if raw_err.len > 0 { bytes.extend(&mut results[jid].stderr, &raw_err) }
+            if w.exited {
+                results[jid].ok = w.ok
+                results[jid].code = w.code
+                results[jid].signal = w.signal
+                results[jid].timed_out = w.timed_out
+                results[jid].elapsed_ms = sys.now_ms() - slot_start[slot]
+                slot_job[slot] = -1
+                completed += 1
+            }
+        }
+    }
+    true
+}
+
+// =========================================================================
+// Verification driver
+// =========================================================================
+
+fn verify_counts(c: &ObservedCounts, executions: i32) -> bool {
+    if c.server_error.len > 0 {
+        return harness.fail(f"fixture server recorded error: {c.server_error}")
+    }
+    if c.get_ok != 12 * executions ||
+       c.post_echo != executions ||
+       c.put_echo != executions ||
+       c.patch_echo != executions ||
+       c.delete_echo != executions ||
+       c.get_status != executions ||
+       c.get_redirect != executions ||
+       c.get_large != executions ||
+       c.get_chunked_large != executions ||
+       c.get_empty != executions ||
+       c.get_slow != executions ||
+       c.get_stall != executions ||
+       c.get_renew != 2 * executions ||
+       c.head_head != executions ||
+       c.http_unexpected != 0 {
+        return harness.fail(
+            f"unexpected HTTP request counts for {executions} executions: " +
+            f"ok={c.get_ok}, post={c.post_echo}, put={c.put_echo}, patch={c.patch_echo}, del={c.delete_echo}, " +
+            f"status={c.get_status}, redirect={c.get_redirect}, large={c.get_large}, chunked={c.get_chunked_large}, " +
+            f"empty={c.get_empty}, slow={c.get_slow}, stall={c.get_stall}, renew={c.get_renew}, " +
+            f"head={c.head_head}, unexpected={c.http_unexpected}"
+        )
+    }
+    if c.https_get_ok != executions || c.https_unexpected != 0 {
+        return harness.fail(
+            f"unexpected HTTPS request counts for {executions} executions: " +
+            f"ok={c.https_get_ok}, unexpected={c.https_unexpected}"
+        )
+    }
+    true
+}
+
+fn write_receipt(
+    receipt_path: string,
+    host: string,
+    images: i32,
+    executions: i32,
+    hashes: &[]string,
+    exec_ms: &[]i64,
+    http_total: i32,
+    https_total: i32,
+    total_ms: i64
+) -> bool {
+    parent := harness.parent_dir(receipt_path)
+    if parent.len > 0 && !fs.mkdir_all(parent).ok {
+        return harness.fail(f"cannot create receipt parent directory: {parent}")
+    }
+    mut w := json.Writer::new()
+    w.object()
+    w.key("schema"); w.string("dunder-http-client-verification/v1")
+    w.key("host_target"); w.string(host)
+    w.key("builds"); w.integer(i64(images))
+    w.key("executions"); w.integer(i64(executions))
+    w.key("binaries")
+    w.array()
+    for i in 0..hashes.len {
+        w.object()
+        w.key("sha256"); w.string(hashes[i])
+        w.key("seconds"); w.decimal(f64(exec_ms[i]) / 1000.0)
+        w.end()
+    }
+    w.end()
+    w.key("http_requests"); w.integer(i64(http_total))
+    w.key("https_requests"); w.integer(i64(https_total))
+    w.key("seconds"); w.decimal(f64(total_ms) / 1000.0)
+    w.key("passed"); w.boolean(true)
+    w.end()
+    encoded := w.finish()
+    if encoded.is_err() { return harness.fail("failed encoding verification receipt JSON") }
+    if !sys.write_text(receipt_path, encoded.unwrap() + "\n").ok {
+        return harness.fail(f"failed writing verification receipt to {receipt_path}")
+    }
+    true
+}
+
+fn usage() -> string {
+    "usage: test_http_client [<compiler> | --binary <path>] [--receipt <path>]"
+}
+
+fn main() -> i32 {
+    if sys.arg_count() == 5 && sys.arg(1) == "--serve-fixture" {
+        return run_server_mode(sys.arg(2), sys.arg(3), sys.arg(4))
+    }
+
+    mut compiler_arg := ""
+    mut binary_arg := ""
+    mut receipt_arg := ""
+    mut i := 1
+    argc := sys.arg_count()
+    while i < argc {
+        arg := sys.arg(i)
+        if arg == "-h" || arg == "--help" {
+            print(usage())
+            return 0
+        }
+        eq := text.find(arg, "=").unwrap_or(-1)
+        opt := if eq < 0 { arg.clone() } else { arg[0..eq] }
+        if opt == "--binary" || opt == "--receipt" {
+            mut val := ""
+            if eq >= 0 {
+                val = arg[(eq + 1)..arg.len]
+            } else {
+                i += 1
+                if i >= argc {
+                    _ := sys.eprint(f"{opt} requires a value\n{usage()}")
+                    return 2
+                }
+                val = sys.arg(i)
+            }
+            if opt == "--binary" { binary_arg = move val }
+            else { receipt_arg = move val }
+        } else if text.starts_with(arg, "-") {
+            _ := sys.eprint(f"unknown argument: {arg}\n{usage()}")
+            return 2
+        } else if compiler_arg.len == 0 {
+            compiler_arg = arg.clone()
+        } else {
+            _ := sys.eprint(f"unexpected positional argument: {arg}\n{usage()}")
+            return 2
+        }
+        i += 1
+    }
+
+    has_compiler := compiler_arg.len > 0
+    has_binary := binary_arg.len > 0
+    if has_compiler == has_binary {
+        _ := sys.eprint(f"provide either a compiler or --binary\n{usage()}")
+        return 2
+    }
+
+    host := process.host_target()
+    if host != "arm64-macos" && host != "arm64-linux" && host != "x86_64-linux" {
+        _ := harness.fail(f"unsupported native host: {host}")
+        return 1
+    }
+
+    mut compiler := ""
+    mut prebuilt_binary := ""
+    if has_compiler {
+        rp := fs.realpath(compiler_arg)
+        if !rp.ok {
+            _ := harness.fail(f"compiler not found: {compiler_arg}")
+            return 1
+        }
+        compiler = rp.value
+    } else {
+        rp := fs.realpath(binary_arg)
+        if !rp.ok {
+            _ := harness.fail(f"binary not found: {binary_arg}")
+            return 1
+        }
+        prebuilt_binary = rp.value
+    }
+
+    root := harness.find_root()
+    if has_compiler && root.len == 0 {
+        _ := harness.fail("could not locate dunder repository root")
+        return 1
+    }
+
+    self_rp := fs.realpath(sys.arg(0))
+    if !self_rp.ok {
+        _ := harness.fail("cannot resolve test_http_client executable path")
+        return 1
+    }
+    self_exe := self_rp.value
+
+    started := sys.now_ms()
+    tmp := fs.temp_dir("dunder-http-client-")
+    if !tmp.ok {
+        _ := harness.fail("cannot create temporary directory")
+        return 1
+    }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    key_path := work + "/server.key"
+    cert_path := work + "/ca.pem"
+    counts_path := work + "/counts.json"
+
+    // Prepare openssl cert generation + (when compiling) all 4 native builds in parallel.
+    mut prep_cmds: []process.Command = []
+    mut prep_labels: []string = []
+
+    openssl_cmd := process.Command::new("openssl", [
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+        "-keyout", key_path.clone(), "-out", cert_path.clone(),
+    ])
+    prep_cmds.push(move openssl_cmd)
+    prep_labels.push("openssl req")
+
+    mut runnable: []string = []
+    mut images := 0
+    if has_binary {
+        runnable.push(prebuilt_binary.clone())
+    } else {
+        pkg_dir := root + "/packages/http_client/tests"
+        for target in harness.targets() {
+            img0 := f"{work}/client-{target}-0"
+            mut c0 := process.Command::new(compiler.clone(), [
+                "build", "--target", target.clone(), "--jobs", "1", "-o", img0.clone(),
+            ])
+            c0.set_cwd(pkg_dir.clone())
+            prep_cmds.push(move c0)
+            prep_labels.push(f"build {target} default")
+            images += 1
+            if target == host {
+                runnable.push(move img0)
+                img1 := f"{work}/client-{target}-1"
+                mut c1 := process.Command::new(compiler.clone(), [
+                    "build", "--target", target.clone(), "--jobs", "1",
+                    "--scalar-opt=off", "--ownership-opt=off", "--mir=off",
+                    "-o", img1.clone(),
+                ])
+                c1.set_cwd(pkg_dir.clone())
+                prep_cmds.push(move c1)
+                prep_labels.push(f"build {target} direct")
+                images += 1
+                runnable.push(move img1)
+            }
+        }
+    }
+
+    mut prep_results: []JobResult = []
+    if !run_parallel(&prep_cmds, 90000, &mut prep_results) { return 1 }
+    for idx in 0..prep_results.len {
+        r := &prep_results[idx]
+        if !r.ok || r.timed_out || r.signal != 0 || r.code != 0 {
+            so := bytes.decode(&r.stdout).value
+            se := bytes.decode(&r.stderr).value
+            _ := harness.fail(f"{prep_labels[idx]} failed (code={r.code}, signal={r.signal}, timed_out={r.timed_out})\nstdout: {so}\nstderr: {se}")
+            return 1
+        }
+    }
+
+    // Reserve an unused loopback port and close it immediately for connection-refused verification.
+    unused_res := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(u16(0)), 1)
+    if unused_res.is_err() {
+        _ := harness.fail("cannot allocate unused loopback port")
+        return 1
+    }
+    mut unused_listener := unused_res.unwrap()
+    refused_port := unused_listener.local_port()
+    _ := unused_listener.close()
+    if refused_port <= 0 {
+        _ := harness.fail("invalid unused loopback port")
+        return 1
+    }
+
+    // Spawn the pure-Dunder fixture server subprocess (HTTP + HTTPS + StalledTLS).
+    mut srv_cmd := process.Command::new(move self_exe, [
+        "--serve-fixture", cert_path.clone(), key_path.clone(), counts_path.clone(),
+    ])
+    srv_cmd.set_stdio(.Pipe, .Pipe, .Pipe)
+    srv_spawn := srv_cmd.spawn()
+    if srv_spawn.is_err() {
+        _ := harness.fail(f"cannot spawn fixture server (errno {srv_spawn.unwrap_err().code()})")
+        return 1
+    }
+    mut server := srv_spawn.unwrap()
+    defer {
+        server.close_stdin()
+        w := server.wait(5000)
+        if !w.exited {
+            _ := server.kill()
+            _ := server.wait(2000)
+        }
+    }
+
+    ports_line := match server.read_stdout_line(10000) {
+        .Ok(opt) => opt.unwrap_or(""),
+        .Err(_) => "",
+    }
+    port_tokens := harness.fields(ports_line)
+    if port_tokens.len != 3 {
+        mut srv_err: []u8 = []
+        _ := server.read_stderr(&mut srv_err, 16384, 500)
+        _ := harness.fail(f"fixture server did not announce 3 ports (got '{ports_line}'): {bytes.decode(&srv_err).value}")
+        return 1
+    }
+    http_p := parse.integer(port_tokens[0])
+    tls_p := parse.integer(port_tokens[1])
+    stalled_p := parse.integer(port_tokens[2])
+    if !http_p.ok || !tls_p.ok || !stalled_p.ok ||
+       http_p.value <= 0 || tls_p.value <= 0 || stalled_p.value <= 0 {
+        _ := harness.fail(f"fixture server announced invalid ports: {ports_line}")
+        return 1
+    }
+
+    origin := f"http://127.0.0.1:{http_p.value}"
+    tls_origin := f"https://localhost:{tls_p.value}"
+    stalled_tls := f"https://127.0.0.1:{stalled_p.value}/"
+    refused := f"http://127.0.0.1:{refused_port}/"
+
+    // Execute all host binaries concurrently against the live HTTP/TLS servers.
+    mut exec_cmds: []process.Command = []
+    for image in &runnable {
+        mut cmd := process.Command::new(image.clone(), [
+            origin.clone(), tls_origin.clone(), cert_path.clone(),
+            stalled_tls.clone(), refused.clone(),
+        ])
+        if root.len > 0 { cmd.set_cwd(root.clone()) }
+        cmd.set_env("NO_PROXY", "localhost,127.0.0.1")
+        cmd.set_env("no_proxy", "localhost,127.0.0.1")
+        exec_cmds.push(move cmd)
+    }
+
+    mut exec_results: []JobResult = []
+    if !run_parallel(&exec_cmds, 30000, &mut exec_results) { return 1 }
+
+    mut exec_hashes: []string = []
+    mut exec_ms: []i64 = []
+    mut executions := 0
+    for idx in 0..exec_results.len {
+        r := &exec_results[idx]
+        so := bytes.decode(&r.stdout).value
+        se := bytes.decode(&r.stderr).value
+        if !r.ok || r.timed_out || r.signal != 0 || r.code != 0 {
+            _ := harness.fail(f"execution {runnable[idx]} failed (code={r.code}, signal={r.signal}, timed_out={r.timed_out})\nstdout: {so}\nstderr: {se}")
+            return 1
+        }
+        if so != "http client ok\n" {
+            _ := harness.fail(f"execution {runnable[idx]} unexpected stdout: '{so}'\nstderr: {se}")
+            return 1
+        }
+        if r.elapsed_ms >= 20000 {
+            _ := harness.fail(f"execution {runnable[idx]} took {r.elapsed_ms}ms (>= 20000ms)")
+            return 1
+        }
+        exec_hashes.push(harness.sha256_file_hex(runnable[idx]))
+        exec_ms.push(r.elapsed_ms)
+        executions += 1
+    }
+
+    // Shut down fixture server cleanly and verify exact observed HTTP/HTTPS request counts.
+    server.close_stdin()
+    mut srv_err: []u8 = []
+    _ := server.read_stderr(&mut srv_err, 16384, 5000)
+    srv_exit := server.wait(5000)
+    if !srv_exit.ok || srv_exit.timed_out || srv_exit.signal != 0 || srv_exit.code != 0 {
+        _ := harness.fail(f"fixture server exited {srv_exit.code} (signal={srv_exit.signal}, timed_out={srv_exit.timed_out}): {bytes.decode(&srv_err).value}")
+        return 1
+    }
+
+    mut observed := empty_counts()
+    if !read_counts_json(counts_path, &mut observed) {
+        _ := harness.fail("cannot read fixture server request counts")
+        return 1
+    }
+    if !verify_counts(&observed, executions) { return 1 }
+
+    total_ms := sys.now_ms() - started
+    if receipt_arg.len > 0 {
+        if !write_receipt(
+            receipt_arg, host, images, executions, &exec_hashes, &exec_ms,
+            http_request_total(&observed), https_request_total(&observed), total_ms
+        ) {
+            return 1
+        }
+    }
+
+    print(f"HTTP client: {images} native builds, {executions} live HTTP/TLS executions passed")
+    0
+}

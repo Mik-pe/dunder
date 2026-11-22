@@ -118,7 +118,7 @@ pub opaque struct Session {
     jobs: cs.JobLog,
     tasks: tc.TaskGraph,
     closure_header: i32, closure_drop: i32, types: ft.TypeRegistry, helper_labels: []i32, array_helpers: i32,
-    probing_closures: bool, closure_probe_keys: Map<string, i64>, closure_probe_types: []string,
+    probing_closures: bool, closures_lifted: bool, closure_probe_keys: Map<string, i64>, closure_probe_types: []string,
     task_iso_labels: []i32, task_shared_rc_labels: []i32, task_shared_prepare_labels: []i32, task_shared_drop_labels: []i32, task_shell_drop_labels: []i32,
     ok: bool, error: string, error_at: i32, error_last: i32, error_code: string, error_note: string, error_note_at: i32, error_note_last: i32,
     diag_bag: diag.Bag, has_errors: bool, suppress_diagnostics: bool, discovering: bool, body_had_error: bool,
@@ -9190,7 +9190,7 @@ pub fn new_session() -> Session {
         jobs: cs.new_job_log(),
         tasks: tc.new_graph(),
         closure_header: -1, closure_drop: -1, types: ft.new_registry(), helper_labels: [], array_helpers: -1,
-        probing_closures: false, closure_probe_keys: Map<string, i64>::new(), closure_probe_types: [],
+        probing_closures: false, closures_lifted: false, closure_probe_keys: Map<string, i64>::new(), closure_probe_types: [],
         task_iso_labels: [], task_shared_rc_labels: [], task_shared_prepare_labels: [], task_shared_drop_labels: [], task_shell_drop_labels: [],
         ok: true, error: "", error_at: 0, error_last: -1, error_code: "", error_note: "", error_note_at: -1, error_note_last: -1,
         diag_bag: diag.new_bag(), has_errors: false, suppress_diagnostics: false, discovering: false, body_had_error: false,
@@ -9488,17 +9488,25 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
             if !tokens.ok { return session_fail_at(&mut c, tokens.error, tokens.error_at) }
             if !definitions && !need_probe && c.specializations.pending.len() == 0 { break }
             if !definitions { need_probe = false }
+            orig_len := tokens.kinds.len
+            orig_eof_pos := if orig_len > 0 { tokens.starts[orig_len - 1] } else { 0 }
             mut probe := new_session()
-            probe.world.tokens = tokens.clone(); probe.types = c.types.clone(); probe.specializations = c.specializations.clone()
-            probe.world.module_caps = c.world.module_caps.clone(); probe.sources = c.sources.clone()
-            probe.world.embed_blob_starts = c.world.embed_blob_starts.clone(); probe.world.embed_blob_counts = c.world.embed_blob_counts.clone()
-            probe.world.embed_blobs = c.world.embed_blobs.clone()
+            probe.world.tokens = move tokens; probe.types = c.types.clone(); probe.specializations = c.specializations.clone()
+            probe.world.module_caps = c.world.module_caps.clone()
+            probe.sources = replace(&mut c.sources, diagnostics.new())
+            probe.world.embed_blob_starts = replace(&mut c.world.embed_blob_starts, [])
+            probe.world.embed_blob_counts = replace(&mut c.world.embed_blob_counts, [])
+            probe.world.embed_blobs = replace(&mut c.world.embed_blobs, [])
             probe.discovering_compounds = !definitions
             probe.known_compounds = demand.compounds.clone()
             count := demand.methods.len()
             comp_count := demand.compounds.len()
             inf_count := demand.inferred_args.len
             checked := discover(&mut probe, platform, &module_starts, &module_files, source_end, &mut demand)
+            c.sources = move probe.sources
+            c.world.embed_blob_starts = move probe.world.embed_blob_starts
+            c.world.embed_blob_counts = move probe.world.embed_blob_counts
+            c.world.embed_blobs = move probe.world.embed_blobs
             for ci in 0..probe.demanded_compounds.len() {
                 demand.compounds.put(probe.demanded_compounds.key_at(ci).clone(), 1)
             }
@@ -9538,7 +9546,27 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
                 }
                 if !definitions { need_probe = true }
             } else if !changed {
-                if !definitions { break }
+                if !definitions {
+                    if !probe.closures_lifted && orig_len > 0 && probe.world.tokens.kinds.len >= orig_len {
+                        while probe.world.tokens.kinds.len > orig_len {
+                            _ := probe.world.tokens.kinds.pop()
+                            _ := probe.world.tokens.texts.pop()
+                            _ := probe.world.tokens.starts.pop()
+                        }
+                        probe.world.tokens.kinds[orig_len - 1] = .End
+                        probe.world.tokens.texts[orig_len - 1] = ""
+                        probe.world.tokens.starts[orig_len - 1] = orig_eof_pos
+                        probe.world.tokens.ids.clear(); probe.world.tokens.ends.clear()
+                        probe.world.tokens.intern = false; probe.world.tokens.store_ends = false
+                        tokens = move probe.world.tokens
+                    } else {
+                        c.types = base.clone()
+                        tokens = lexer.empty(false)
+                        c.specializations = generics.materialize(&program, &mut tokens, &mut c.types, platform, &demand.methods, &demand.compounds, &demand.inferred_keys, &demand.inferred_args, false)
+                        if !tokens.ok { return session_fail_at(&mut c, tokens.error, tokens.error_at) }
+                    }
+                    break
+                }
                 definitions = false; demand = demands()
                 need_probe = program.has_compound_ops || program.has_inferred_calls
             } else if !definitions {
@@ -9548,6 +9576,7 @@ pub fn begin_loaded(c: &mut Session, platform: i32, module_starts: &[]i32, modul
                 demand.checked_live.clear()
                 demand.checked_dead.clear()
             }
+            tokens = lexer.empty(false)
             c.types = base.clone()
         }
         c.world.tokens = move tokens
@@ -9570,6 +9599,17 @@ fn discover(c: &mut Session, platform: i32, module_starts: &[]i32, module_files:
     view := opt_inline.empty_view()
     definitions := c.specializations.definition_checks.len() > 0
     if definitions { for i in 0..c.needed.len { c.needed[i] = false } }
+    mut has_lambdas := false
+    if c.closure_header >= 0 {
+        for f in 0..c.world.names.len {
+            if c.world.param_counts[f] > 0 && c.world.param_names[c.world.param_starts[f] + c.world.param_counts[f] - 1] == "__dunder_module_env" {
+                has_lambdas = true; break
+            }
+            if c.world.names[f].len >= 23 && c.world.names[f][0..23] == "__dunder_module_lambda_" {
+                has_lambdas = true; break
+            }
+        }
+    }
     modes := if definitions { 1 } else { 2 }
     for mode in 0..modes {
         dead := mode == 1; c.validating_dead = dead
@@ -9586,7 +9626,7 @@ fn discover(c: &mut Session, platform: i32, module_starts: &[]i32, module_files:
                 c.jobs.compiled[f] = true; more = true
                 name := c.world.names[f].clone()
                 if c.specializations.pending.contains(name) { demand.methods.put(move name, 1); continue }
-                if c.closure_header < 0 {
+                if !has_lambdas {
                     if dead {
                         if demand.checked_dead.contains(name) || demand.checked_live.contains(name) { continue }
                         demand.checked_dead.put(name.clone(), 1)
@@ -9630,10 +9670,11 @@ fn fail_from_probe(c: &mut Session, probe: &Session) -> bool {
 }
 fn resolve_inferred_closures(c: &mut Session, platform: i32, module_starts: &[]i32, module_files: &[]i32, source_end: i32) -> bool {
     if !closures.has_inferred(&c.world.tokens) {
-        closures.lift_ready(&mut c.world.tokens)
+        if closures.lift_ready_changed(&mut c.world.tokens) { c.closures_lifted = true }
         if !c.world.tokens.ok { return session_fail_at(&mut c, c.world.tokens.error.clone(), c.world.tokens.error_at) }
         return true
     }
+    c.closures_lifted = true
     for _pass in 0..8 {
         if !closures.has_inferred(&c.world.tokens) { break }
         mut probe_tokens := closures.build_probe(&c.world.tokens)
@@ -9778,27 +9819,40 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     c.bindings.mir_ssa_enabled = c.bindings.mir_optimization_enabled && config.mir_ssa_enabled
     c.bindings.mir_values_enabled = c.bindings.mir_optimization_enabled && config.mir_values_enabled
     if profile_host >= 0 { c.bindings.profile = profile.new(profile_host) }
-    for i in 0..c.world.tokens.kinds.len {
-        c.world.closes.push(-1)
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "task" && c.world.tokens.texts[i + 1] == "scope" { c.tasks.program = true }
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "region" && c.world.tokens.kinds[i + 1] == .Name { c.loans.active = true }
-        if c.world.tokens.kinds[i] == .Symbol && c.world.tokens.texts[i] == "->" && c.world.tokens.texts[i + 1] == "&" { c.loans.active = true }
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "bytes_view" { c.loans.active = true }
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "__sync_borrow_ref" { c.loans.active = true }
-        if c.world.tokens.kinds[i] == .Name && (c.world.tokens.texts[i] == "as_bytes" || c.world.tokens.texts[i] == "as_str") { c.loans.active = true }
-        if c.world.tokens.kinds[i] == .Symbol && c.world.tokens.texts[i] == "&" && c.world.tokens.texts[i + 1] == "str" { c.loans.active = true }
-        if c.world.tokens.kinds[i] == .Name {
-            tok_name := &c.world.tokens.texts[i]
-            if tok_name == "__dunder_module_bind" || tok_name == "__dunder_module_bind_mut" ||
-                tok_name == "__dunder_module_bind_once" || tok_name == "__dunder_module_stack_bind" ||
-                tok_name == "__dunder_module_stack_bind_mut" || tok_name == "__dunder_module_cap_val" ||
-                tok_name == "__dunder_module_cap_ref" || tok_name == "__dunder_module_cap_mut" ||
-                tok_name == "__dunder_module_cap_stack_val" || tok_name == "__dunder_module_cap_stack_mut" ||
-                tok_name == "Fn" || tok_name == "FnMut" || tok_name == "FnOnce" {
-                c.loans.active = true
+    n_tok := c.world.tokens.kinds.len
+    c.world.closes.reserve(n_tok)
+    for _ in 0..n_tok { c.world.closes.push(-1) }
+    mut scan_tasks := !c.tasks.program
+    mut scan_loans := !c.loans.active
+    mut scan_cb := !c.has_callbacks
+    for i in 0..n_tok {
+        if !scan_tasks && !scan_loans && !scan_cb { break }
+        k := c.world.tokens.kinds[i]
+        if k == .Name {
+            w := &c.world.tokens.texts[i]
+            if scan_tasks && w == "task" && i + 1 < n_tok && c.world.tokens.texts[i + 1] == "scope" {
+                c.tasks.program = true; scan_tasks = false
+            }
+            if scan_loans {
+                if (w == "region" && i + 1 < n_tok && c.world.tokens.kinds[i + 1] == .Name) ||
+                    w == "bytes_view" || w == "__sync_borrow_ref" || w == "as_bytes" || w == "as_str" ||
+                    w == "Fn" || w == "FnMut" || w == "FnOnce" ||
+                    w == "__dunder_module_bind" || w == "__dunder_module_bind_mut" ||
+                    w == "__dunder_module_bind_once" || w == "__dunder_module_stack_bind" ||
+                    w == "__dunder_module_stack_bind_mut" || w == "__dunder_module_cap_val" ||
+                    w == "__dunder_module_cap_ref" || w == "__dunder_module_cap_mut" ||
+                    w == "__dunder_module_cap_stack_val" || w == "__dunder_module_cap_stack_mut" {
+                    c.loans.active = true; scan_loans = false
+                }
+            }
+            if scan_cb && w == "callback" { c.has_callbacks = true; scan_cb = false }
+        } else if scan_loans && k == .Symbol {
+            w := &c.world.tokens.texts[i]
+            if (w == "->" && i + 1 < n_tok && c.world.tokens.texts[i + 1] == "&") ||
+                (w == "&" && i + 1 < n_tok && c.world.tokens.texts[i + 1] == "str") {
+                c.loans.active = true; scan_loans = false
             }
         }
-        if c.world.tokens.kinds[i] == .Name && c.world.tokens.texts[i] == "callback" { c.has_callbacks = true }
     }
     headers(&mut c, &module_starts, &module_files)
     if c.ok { prepare_structural_types(&mut c) }

@@ -102,11 +102,11 @@ och faktiskt mottagna längd kontrolleras mot samma gräns innan någon större
 buffert allokeras.
 
 På macOS används systemets libcurl. Linux behöver `libcurl.so.4`.
-Klientsviten använder Python 3 och OpenSSL för lokala TLS-fixturer.
+Klientsviten använder OpenSSL för lokala TLS-fixturer.
 
 ```sh
 /absolute/path/to/dunder run tools/test_http.ddr -- --compiler /absolute/path/to/dunder
-python3 tools/test-http-client.py /absolute/path/to/dunder
+/absolute/path/to/dunder run tools/test_http_client.ddr -- /absolute/path/to/dunder
 ```
 
 Sviterna testar riktiga sockets, fragmentering, gränser, deadlines och

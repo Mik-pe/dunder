@@ -110,8 +110,8 @@ nyckelidentitet, tabellernas definitionstillstånd, syskonlänkar och JSON-
 skrivning. Fält indexeras per förälder och avkodad nyckel; rendering följer
 syskonlänkar och behöver inte söka igenom hela arenan för varje nod.
 
-`python3 tools/test-toml.py KOMPILATOR` kontrollerar publika resultat mot
+`dunder run tools/test_toml.ddr -- KOMPILATOR` kontrollerar publika resultat mot
 oberoende dataorakel. `--runner TARGET=COMMAND` kan lägga till lokala
 Linuxkörningar, och `--toml-test DIR` använder ett separat uppackat
-`toml-test`-korpus. Ingen Pythonkod används av biblioteket eller programmen
-som byggs med det.
+`toml-test`-korpus. Ingen Pythonkod används av biblioteket, testsviten eller
+programmen som byggs med det.

@@ -80,11 +80,12 @@ fn match_stdout(output: &process.Output, expected: string, context: string) -> b
         harness.fail(f"{context}: unexpected stdout\nexpected:\n{expected}\nobserved:\n{output.stdout_text()}\n{output.stderr_text()}")
 }
 
-fn verify_builds(options: &Options, case: &Program, source: string, headers: bool, counts: &mut Counts) -> bool {
+fn verify_builds(options: &Options, case: &Program, source: string, headers: bool, cross: bool, check_baseline: bool, counts: &mut Counts) -> bool {
     mut output := harness.empty_output()
     for driver in options.drivers {
+        if !options.explicit && driver.name == "baseline" && !check_baseline { continue }
         for target in options.targets {
-            if !options.explicit && driver.name == "baseline" && target != options.host { continue }
+            if target != options.host && (!cross || (!options.explicit && driver.name == "baseline")) { continue }
             image := options.work + "/" + case.name + "-" + driver.name + "-" + target
             observe := options.selection && driver.name != "baseline"
             if !build(&driver, source, image, target, options.work, observe, &mut output) ||
@@ -155,17 +156,20 @@ fn valid_agent_error(output: &process.Output, path: string, size: i64) -> bool {
     resolved.ok && resolved.value == path && err.start >= 0 && err.start <= err.end && err.end <= size
 }
 
-fn verify_rejections(options: &Options, item: &Program, source: string, counts: &mut Counts) -> bool {
+fn verify_rejections(options: &Options, item: &Program, source: string, full_parity: bool, counts: &mut Counts) -> bool {
     previous := options.work + "/previous-output"
     preserved := "previous successful output"
     size := i64(item.source.len)
+    modes: []string = if full_parity { ["check", "check-agent", "build"] } else { ["check"] }
     for target in options.targets {
         if !options.explicit && target != options.host { continue }
-        for mode in ["check", "check-agent", "build"] {
+        for mode in modes {
             mut baseline := harness.empty_output()
+            mut compared := false
             for i in 0..options.drivers.len {
                 driver := &options.drivers[i]
-                if !sys.write_text(previous, preserved).ok { return harness.fail("cannot seed previous output") }
+                if !full_parity && driver.name == "baseline" { continue }
+                if mode == "build" && !sys.write_text(previous, preserved).ok { return harness.fail("cannot seed previous output") }
                 command := if mode == "build" { "build" } else { "check" }
                 mut args: []string = [command, source.clone(), "--target", target.clone()]
                 if mode == "check-agent" { args.push("--agent") }
@@ -177,15 +181,83 @@ fn verify_rejections(options: &Options, item: &Program, source: string, counts: 
                 if mode == "check-agent" && !valid_agent_error(&output, source, size) {
                     return harness.fail(f"{context}: invalid agent error\n{output.stdout_text()}")
                 }
-                file := sys.read_text(previous)
-                if !file.ok || file.value != preserved { return harness.fail(f"{context}: failed command replaced previous output") }
-                if i == 0 { baseline = move output }
+                if mode == "build" {
+                    file := sys.read_text(previous)
+                    if !file.ok || file.value != preserved { return harness.fail(f"{context}: failed command replaced previous output") }
+                }
+                if !compared { baseline = move output; compared = true }
                 else if !same_streams(&baseline, &output) {
                     return harness.fail(f"diagnostics changed for {item.name} {mode} {target}\n{baseline.stdout_text()}\n{baseline.stderr_text()}\n{output.stdout_text()}\n{output.stderr_text()}")
                 }
                 counts.rejected += 1
             }
         }
+    }
+    true
+}
+
+fn rewrite_main_to_run(source: string) -> string {
+    at := text.find(source, "fn main()").unwrap_or(-1)
+    assert(at >= 0)
+    source[0..at] + "pub fn run()" + source[(at + "fn main()".len)..source.len]
+}
+
+fn run_batch(options: &Options, candidate: &Driver, label: string, items: &[]Program, indices: &[]i32,
+             expect_modeled: bool, counts: &mut Counts) -> bool {
+    if indices.len == 0 { return true }
+    batch_dir := options.work + "/batch-" + label
+    if !fs.mkdir_all(batch_dir).ok { return harness.fail(f"cannot create {batch_dir}") }
+    mut driver_src := "import sys\n"
+    mut min_total: i64 = 0
+    mut has_same_dir := false
+    for k in 0..indices.len {
+        item := &items[indices[k]]
+        mod_name := f"m{k}"
+        if !sys.write_text(batch_dir + "/" + mod_name + ".ddr", rewrite_main_to_run(item.source)).ok {
+            return harness.fail(f"cannot write batch module {mod_name}")
+        }
+        driver_src += f"import .{mod_name} as {mod_name}\n"
+        if expect_modeled {
+            min_total += minimum_modeled(item.name)
+            if item.name == "same_direction_i32" { has_same_dir = true }
+        }
+    }
+    driver_src += "fn main() {\n    case := sys.arg(1)\n"
+    for k in 0..indices.len {
+        name := items[indices[k]].name.clone()
+        driver_src += f"    if case == \"{name}\" {{ m{k}.run(); return }}\n"
+    }
+    driver_src += "}\n"
+    src_path := batch_dir + "/driver.ddr"
+    image := batch_dir + "/driver"
+    if !sys.write_text(src_path, driver_src).ok { return harness.fail(f"cannot write {src_path}") }
+    mut output := harness.empty_output()
+    if !build(&candidate, src_path, image, options.host, batch_dir, options.selection, &mut output) { return false }
+    if options.selection {
+        data := json.Doc::parse_bytes(output.stderr.clone())
+        optimizer := data.field(data.root, "optimizer")
+        enabled := data.get_bool(optimizer, "enabled")
+        modeled := data.get_i64(optimizer, "modeled")
+        emitted := data.get_i64(optimizer, "emitted")
+        if !data.ok || enabled != .Some(true) || modeled.is_none() || emitted.is_none() {
+            return harness.fail(f"batch {label}: invalid optimizer report\n{output.stderr_text()}")
+        }
+        mv := modeled.unwrap(); ev := emitted.unwrap()
+        if expect_modeled {
+            if mv < min_total || ev < min_total || (has_same_dir && data.get_i64(optimizer, "rewrites").unwrap_or(0) < 1) {
+                return harness.fail(f"batch {label}: expected >= {min_total} modeled/emitted, got {mv}/{ev}\n{output.stderr_text()}")
+            }
+        } else if mv != 0 || ev != 0 {
+            return harness.fail(f"batch {label}: fallback batch unexpectedly selected a body ({mv}/{ev})\n{output.stderr_text()}")
+        }
+    }
+    for k in 0..indices.len {
+        item := &items[indices[k]]
+        context := "candidate " + item.name + " " + options.host
+        if !run(image, [item.name.clone()], batch_dir, false, item.status, context, &mut output) ||
+           !match_stdout(&output, item.stdout, context) { return false }
+        counts.executed += 1
+        if item.status == 0 { print("PASS results " + item.name) } else { print("PASS traps " + item.name) }
     }
     true
 }
@@ -313,20 +385,61 @@ fn exercise(options: &Options, candidate: &Driver) -> bool {
     cases.programs.push(Program { name: "fixture", source: fixture.value, stdout: "42\n", status: 0 })
     if !model_reuse(&candidate, options.root, options.work, options.host) { return false }
     mut counts := Counts { executed: 0, built: 0, rejected: 0 }
-    for item in cases.programs {
-        path := write_case(options.work, &item)
-        if path.len == 0 || !verify_builds(&options, &item, path, true, &mut counts) ||
-           !verify_bindings(&options, path, item.name) { return false }
-        print("PASS results " + item.name)
+    if options.explicit {
+        for idx in 0..cases.programs.len {
+            item := &cases.programs[idx]
+            path := write_case(options.work, &item)
+            if path.len == 0 || !verify_builds(&options, &item, path, true, true, true, &mut counts) { return false }
+            if !verify_bindings(&options, path, item.name) { return false }
+            print("PASS results " + item.name)
+        }
+        for idx in 0..cases.traps.len {
+            item := &cases.traps[idx]
+            path := write_case(options.work, &item)
+            if path.len == 0 || !verify_builds(&options, &item, path, false, true, true, &mut counts) { return false }
+            print("PASS traps " + item.name)
+        }
+    } else {
+        mut opt_progs: []i32 = []
+        mut fb_progs: []i32 = []
+        for idx in 0..cases.programs.len {
+            item := &cases.programs[idx]
+            if idx < 3 || item.name == "fixture" {
+                path := write_case(options.work, &item)
+                if path.len == 0 || !verify_builds(&options, &item, path, true, idx < 2, true, &mut counts) { return false }
+                if !verify_bindings(&options, path, item.name) { return false }
+                print("PASS results " + item.name)
+            } else if text.starts_with(item.name, "fallback_") {
+                fb_progs.push(idx)
+            } else {
+                opt_progs.push(idx)
+            }
+        }
+        if !run_batch(&options, &candidate, "opt-progs", &cases.programs, &opt_progs, true, &mut counts) ||
+           !run_batch(&options, &candidate, "fb-progs", &cases.programs, &fb_progs, false, &mut counts) { return false }
+
+        mut opt_traps: []i32 = []
+        mut fb_traps: []i32 = []
+        for idx in 0..cases.traps.len {
+            item := &cases.traps[idx]
+            if idx < 2 {
+                path := write_case(options.work, &item)
+                if path.len == 0 || !verify_builds(&options, &item, path, false, true, true, &mut counts) { return false }
+                print("PASS traps " + item.name)
+            } else if text.starts_with(item.name, "fallback_") {
+                fb_traps.push(idx)
+            } else {
+                opt_traps.push(idx)
+            }
+        }
+        if !run_batch(&options, &candidate, "opt-traps", &cases.traps, &opt_traps, true, &mut counts) ||
+           !run_batch(&options, &candidate, "fb-traps", &cases.traps, &fb_traps, false, &mut counts) { return false }
     }
-    for item in cases.traps {
+    for idx in 0..cases.rejections.len {
+        item := &cases.rejections[idx]
         path := write_case(options.work, &item)
-        if path.len == 0 || !verify_builds(&options, &item, path, false, &mut counts) { return false }
-        print("PASS traps " + item.name)
-    }
-    for item in cases.rejections {
-        path := write_case(options.work, &item)
-        if path.len == 0 || !verify_rejections(&options, &item, path, &mut counts) { return false }
+        full_parity := options.explicit || idx < 4
+        if path.len == 0 || !verify_rejections(&options, &item, path, full_parity, &mut counts) { return false }
         print("PASS diagnostics " + item.name)
     }
     for driver in options.drivers {

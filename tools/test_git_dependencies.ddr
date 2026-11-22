@@ -1,0 +1,2753 @@
+capability process, filesystem, stdio, unsafe
+
+import .harness as harness
+import std.array as array
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.parse as parse
+import std.path as path
+import std.process as process
+import std.sha256 as sha256
+import std.text as text
+import std.toml as toml
+import sys
+
+@extern("c", "readlink")
+unsafe fn c_readlink(file_path: ptr, buffer: ptr, capacity: usize) -> i64
+
+fn readlink_target(file_path: string) -> Option<string> {
+    mut raw: []u8 = []
+    bytes.append_utf8(&mut raw, file_path)
+    raw.push(0)
+    mut buf: [u8; 4096] = [0; 4096]
+    mut n: i64 = -1
+    unsafe {
+        n = c_readlink(addr(&raw[0]), addr(&mut buf[0]), 4096)
+    }
+    if n < 0 || n >= 4096 { return .None }
+    mut out: []u8 = []
+    out.reserve(i32(n))
+    for i in 0..i32(n) { out.push(buf[i]) }
+    dec := bytes.decode(&out)
+    if !dec.ok { return .None }
+    .Some(dec.value)
+}
+
+fn path_exists(p: string) -> bool {
+    sys.metadata(p).ok || fs.is_symlink(p)
+}
+
+fn write_text_file(file_path: string, content: string) -> bool {
+    dir := path.dirname(file_path)
+    if dir.len > 0 && dir != "." {
+        if !fs.mkdir_all(dir).ok {
+            return harness.fail("mkdir_all failed for " + dir)
+        }
+    }
+    if !sys.write_text(file_path, content).ok {
+        return harness.fail("write_text failed for " + file_path)
+    }
+    true
+}
+
+fn write_bytes_file(file_path: string, data: &[]u8) -> bool {
+    dir := path.dirname(file_path)
+    if dir.len > 0 && dir != "." {
+        if !fs.mkdir_all(dir).ok {
+            return harness.fail("mkdir_all failed for " + dir)
+        }
+    }
+    if !sys.write_u8(file_path, &data).ok {
+        return harness.fail("write_u8 failed for " + file_path)
+    }
+    true
+}
+
+fn is_uri_safe(b: u8) -> bool {
+    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') ||
+    b == b'-' || b == b'_' || b == b'.' || b == b'~' || b == b'/'
+}
+
+fn file_uri(abs_path: string) -> string {
+    hex := "0123456789ABCDEF"
+    mut out: []u8 = []
+    out.reserve(abs_path.len + 16)
+    bytes.append_utf8(&mut out, "file://")
+    for b in abs_path.bytes() {
+        ub := u8(b)
+        if is_uri_safe(ub) {
+            out.push(ub)
+        } else {
+            val := i32(ub)
+            out.push(b'%')
+            out.push(u8(hex[val / 16]))
+            out.push(u8(hex[val % 16]))
+        }
+    }
+    dec := bytes.decode(&out)
+    assert(dec.ok)
+    dec.value
+}
+
+fn split_path_segments(p: string) -> []string {
+    norm := path.normalize(p)
+    mut segs: []string = []
+    mut i := 0
+    while i < norm.len {
+        while i < norm.len && norm[i] == 47 { i += 1 }
+        if i >= norm.len { break }
+        start := i
+        while i < norm.len && norm[i] != 47 { i += 1 }
+        segs.push(norm[start..i])
+    }
+    segs
+}
+
+fn relpath(target: string, start: string) -> string {
+    t_segs := split_path_segments(target)
+    s_segs := split_path_segments(start)
+    mut common := 0
+    while common < t_segs.len && common < s_segs.len && t_segs[common] == s_segs[common] {
+        common += 1
+    }
+    mut parts: []string = []
+    for _ in common..s_segs.len {
+        parts.push("..")
+    }
+    for i in common..t_segs.len {
+        parts.push(t_segs[i].clone())
+    }
+    if parts.len == 0 { return "." }
+    mut out := ""
+    for i in 0..parts.len {
+        if i > 0 { out += "/" }
+        out += parts[i]
+    }
+    out
+}
+
+fn sh_quote(s: string) -> string {
+    mut out := "'"
+    for i in 0..s.len {
+        if s[i] == b'\'' {
+            out += "'\"'\"'"
+        } else {
+            out += s[i..(i + 1)]
+        }
+    }
+    out += "'"
+    out
+}
+
+fn toml_table(fields: &[](string, string)) -> string {
+    mut out := "{ "
+    for i in 0..fields.len {
+        if i > 0 { out += ", " }
+        out += fields[i].0 + " = " + json.quote(fields[i].1)
+    }
+    out + " }"
+}
+
+fn is_commit_hex(s: string) -> bool {
+    if s.len != 40 && s.len != 64 { return false }
+    for b in s.bytes() {
+        is_digit := b >= 48 && b <= 57
+        is_lower_hex := b >= 97 && b <= 102
+        if !is_digit && !is_lower_hex { return false }
+    }
+    true
+}
+
+fn shlex_split(input: string) -> Result<[]string, string> {
+    mut out: []string = []
+    mut cur: []u8 = []
+    mut in_token := false
+    mut i := 0
+    while i < input.len {
+        b := input[i]
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            if in_token {
+                dec := bytes.decode(&cur)
+                if !dec.ok { return .Err("invalid UTF-8 in runner command") }
+                out.push(move dec.value)
+                cur.clear()
+                in_token = false
+            }
+            i += 1
+            continue
+        }
+        in_token = true
+        if b == b'\'' {
+            i += 1
+            mut closed := false
+            while i < input.len {
+                if input[i] == b'\'' { closed = true; i += 1; break }
+                cur.push(input[i])
+                i += 1
+            }
+            if !closed { return .Err("unterminated single quote in runner command") }
+        } else if b == b'"' {
+            i += 1
+            mut closed := false
+            while i < input.len {
+                ch := input[i]
+                if ch == b'"' { closed = true; i += 1; break }
+                if ch == b'\\' && i + 1 < input.len {
+                    next := input[i + 1]
+                    if next == b'"' || next == b'\\' || next == b'$' || next == b'`' || next == b'\n' {
+                        if next != b'\n' { cur.push(next) }
+                        i += 2
+                        continue
+                    }
+                }
+                cur.push(ch)
+                i += 1
+            }
+            if !closed { return .Err("unterminated double quote in runner command") }
+        } else if b == b'\\' {
+            if i + 1 >= input.len { return .Err("trailing backslash in runner command") }
+            if input[i + 1] != b'\n' { cur.push(input[i + 1]) }
+            i += 2
+        } else {
+            cur.push(b)
+            i += 1
+        }
+    }
+    if in_token {
+        dec := bytes.decode(&cur)
+        if !dec.ok { return .Err("invalid UTF-8 in runner command") }
+        out.push(move dec.value)
+    }
+    .Ok(out)
+}
+
+fn append_snapshot_entry(root: string, rel: string, full: string, out: &mut []u8) -> Result<(), string> {
+    meta := match fs.lstat(full) {
+        .Ok(m) => m,
+        .Err(e) => { return .Err("lstat failed on " + full + ": " + e.message()) },
+    }
+    bytes.append_utf8(&mut out, "E:")
+    bytes.append_utf8(&mut out, rel)
+    out.push(0)
+    bytes.append_le(&mut out, i64(meta.mode), 4)
+    bytes.append_le(&mut out, meta.mtime, 8)
+    bytes.append_le(&mut out, meta.size, 8)
+    bytes.append_le(&mut out, i64(meta.ino), 8)
+    if meta.is_symlink {
+        out.push(b'L')
+        target := match readlink_target(full) {
+            .Some(t) => t,
+            .None => { return .Err("readlink failed on " + full) },
+        }
+        bytes.append_le(&mut out, i64(target.len), 4)
+        bytes.append_utf8(&mut out, target)
+    } else if meta.is_file {
+        out.push(b'F')
+        data := sys.read_u8(full)
+        if !data.ok { return .Err("read_u8 failed on " + full) }
+        bytes.append_le(&mut out, i64(data.value.len), 8)
+        bytes.extend(&mut out, &data.value)
+    } else if meta.is_dir {
+        out.push(b'D')
+        entries := match fs.list_dir(full) {
+            .Ok(items) => items,
+            .Err(e) => { return .Err("list_dir failed on " + full + ": " + e.message()) },
+        }
+        for name in &entries {
+            child_rel := if rel == "." { name.clone() } else { rel + "/" + name }
+            child_full := full + "/" + name
+            append_snapshot_entry(root, child_rel, child_full, &mut out)?
+        }
+    } else {
+        out.push(b'O')
+    }
+    .Ok
+}
+
+fn directory_snapshot(root: string) -> Result<[]u8, string> {
+    mut out: []u8 = []
+    append_snapshot_entry(root, ".", root, &mut out)?
+    .Ok(out)
+}
+
+fn is_valid_target(t: string) -> bool {
+    t == "arm64-macos" || t == "arm64-linux" || t == "x86_64-linux"
+}
+
+struct Runner {
+    target: string,
+    cmd: []string,
+}
+
+struct BatchCmd {
+    program: string,
+    args: []string,
+    cwd: string,
+    env_keys: []string,
+    env_vals: []string,
+    timeout_ms: i64,
+}
+
+struct SlotBuf {
+    out: []u8,
+    err: []u8,
+}
+
+struct BgUnit {
+    started: bool,
+    done: bool,
+    start_ms: i64,
+    set: process.ChildSet,
+    slot: i32,
+    out: []u8,
+    err: []u8,
+    result: process.Output,
+}
+
+fn new_bg_unit() -> BgUnit {
+    BgUnit {
+        started: false,
+        done: false,
+        start_ms: 0,
+        set: process.ChildSet::new(1),
+        slot: -1,
+        out: [],
+        err: [],
+        result: harness.empty_output(),
+    }
+}
+
+fn drain_bg_unit(bg: &mut BgUnit) {
+    if !bg.started || bg.done || bg.slot < 0 { return }
+    mut raw_out: []u8 = []
+    mut raw_err: []u8 = []
+    mut w := bg.set.try_wait(bg.slot, &mut raw_out, &mut raw_err)
+    if !w.exited && sys.now_ms() - bg.start_ms >= 90000 {
+        w = bg.set.kill_reap(bg.slot, &mut raw_out, &mut raw_err)
+    }
+    if raw_out.len > 0 { bytes.extend(&mut bg.out, &raw_out) }
+    if raw_err.len > 0 { bytes.extend(&mut bg.err, &raw_err) }
+    if w.exited {
+        bg.done = true
+        bg.slot = -1
+        bg.result = process.Output {
+            ok: w.ok,
+            error: w.error,
+            code: w.code,
+            signal: w.signal,
+            timed_out: w.timed_out,
+            stdout: bg.out.clone(),
+            stderr: bg.err.clone(),
+        }
+    }
+}
+
+fn wait_bg_unit(bg: &mut BgUnit) -> process.Output {
+    while bg.started && !bg.done {
+        _ := bg.set.poll_io(25)
+        drain_bg_unit(&mut bg)
+    }
+    bg.result.clone()
+}
+
+fn build_process_cmd(spec: &BatchCmd) -> process.Command {
+    mut cmd := process.Command::new(spec.program.clone(), spec.args.clone())
+    if spec.cwd.len > 0 { cmd.set_cwd(spec.cwd.clone()) }
+    for i in 0..spec.env_keys.len {
+        cmd.set_env(spec.env_keys[i].clone(), spec.env_vals[i].clone())
+    }
+    cmd.set_timeout(spec.timeout_ms)
+    cmd
+}
+
+fn run_batch(cmds: &[]BatchCmd, max_workers: i32, bg: &mut BgUnit) -> []process.Output {
+    total := cmds.len
+    mut results: []process.Output = []
+    for _ in 0..total { results.push(harness.empty_output()) }
+    if total == 0 { return results }
+    if total == 1 {
+        drain_bg_unit(&mut bg)
+        cmd := build_process_cmd(&cmds[0])
+        results[0] = cmd.exec()
+        drain_bg_unit(&mut bg)
+        return results
+    }
+
+    mut pool_cap := max_workers
+    if pool_cap < 2 { pool_cap = 2 }
+    if pool_cap > total { pool_cap = total }
+    if pool_cap > 32 { pool_cap = 32 }
+
+    mut pool := process.ChildSet::new(pool_cap)
+    defer { pool.kill_all() }
+
+    mut slot_job: []i32 = []
+    mut slot_start: []i64 = []
+    mut slot_bufs: []SlotBuf = []
+    for _ in 0..pool_cap {
+        slot_job.push(-1)
+        slot_start.push(0)
+        slot_bufs.push(SlotBuf { out: [], err: [] })
+    }
+
+    mut next_idx := 0
+    mut completed := 0
+    mut raw_out: []u8 = []
+    mut raw_err: []u8 = []
+
+    while completed < total {
+        while next_idx < total && pool.len() < pool_cap {
+            cmd := build_process_cmd(&cmds[next_idx])
+            sp := cmd.spawn()
+            if sp.is_err() {
+                err_code := sp.unwrap_err().code()
+                if (err_code == 35 || err_code == 12 || err_code == 24 || err_code == 23) && pool.len() > 0 {
+                    break
+                }
+                results[next_idx] = process.Output {
+                    ok: false, error: err_code, code: 127, signal: 0, timed_out: false, stdout: [], stderr: [],
+                }
+                next_idx += 1
+                completed += 1
+                continue
+            }
+            mut child := sp.unwrap()
+            slot := pool.insert(&mut child)
+            assert(slot >= 0)
+            slot_job[slot] = next_idx
+            slot_start[slot] = sys.now_ms()
+            slot_bufs[slot].out.clear()
+            slot_bufs[slot].err.clear()
+            next_idx += 1
+        }
+
+        if pool.len() == 0 { continue }
+
+        _ := pool.poll_io(10)
+        drain_bg_unit(&mut bg)
+        now := sys.now_ms()
+
+        for slot in 0..pool_cap {
+            if !pool.is_active(slot) { continue }
+            jid := slot_job[slot]
+            raw_out.clear()
+            raw_err.clear()
+            mut w := pool.try_wait(slot, &mut raw_out, &mut raw_err)
+            limit := if cmds[jid].timeout_ms > 0 { cmds[jid].timeout_ms } else { i64(90000) }
+            if !w.exited && now - slot_start[slot] >= limit {
+                w = pool.kill_reap(slot, &mut raw_out, &mut raw_err)
+            }
+            if raw_out.len > 0 { bytes.extend(&mut slot_bufs[slot].out, &raw_out) }
+            if raw_err.len > 0 { bytes.extend(&mut slot_bufs[slot].err, &raw_err) }
+            if w.exited {
+                results[jid] = process.Output {
+                    ok: w.ok,
+                    error: w.error,
+                    code: w.code,
+                    signal: w.signal,
+                    timed_out: w.timed_out,
+                    stdout: slot_bufs[slot].out.clone(),
+                    stderr: slot_bufs[slot].err.clone(),
+                }
+                slot_job[slot] = -1
+                completed += 1
+            }
+        }
+    }
+    results
+}
+
+struct Probe {
+    compiler: string,
+    root: string,
+    work: string,
+    dunder_home: string,
+    cache: string,
+    git_config: string,
+    git_config_bytes: []u8,
+    host: string,
+    runners: []Runner,
+    max_workers: i32,
+    commands: i32,
+    images: i32,
+    executions: i32,
+    rejections: i32,
+    bg: BgUnit,
+}
+
+fn new_probe(compiler: string, root: string, work: string, host: string, move runners: []Runner) -> Result<Probe, string> {
+    dunder_home := work + "/dunder-home"
+    cache := dunder_home + "/git"
+    git_config := work + "/isolated git config"
+    cfg_text := "[user]\nname = Dunder fixture\nemail = fixture@example.invalid\n"
+    if !write_text_file(git_config, cfg_text) {
+        return .Err("cannot write isolated git config")
+    }
+    cfg_raw := sys.read_u8(git_config)
+    if !cfg_raw.ok { return .Err("cannot read isolated git config") }
+    mut workers := process.host_cpus()
+    if workers < 4 { workers = 4 }
+    if workers > 16 { workers = 16 }
+    .Ok(Probe {
+        compiler: compiler.clone(),
+        root: root.clone(),
+        work: work.clone(),
+        dunder_home: dunder_home,
+        cache: cache,
+        git_config: git_config,
+        git_config_bytes: cfg_raw.value,
+        host: host.clone(),
+        runners: runners,
+        max_workers: workers,
+        commands: 0,
+        images: 0,
+        executions: 0,
+        rejections: 0,
+        bg: new_bg_unit(),
+    })
+}
+
+fn make_cmd(probe: &Probe, program: string, move args: []string, cwd: string, extra_keys: &[]string, extra_vals: &[]string, timeout_ms: i64) -> BatchCmd {
+    mut keys: []string = [
+        "DUNDER_HOME",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_ALLOW_PROTOCOL",
+    ]
+    mut vals: []string = [
+        probe.dunder_home.clone(),
+        "1",
+        probe.git_config.clone(),
+        "0",
+        "file",
+    ]
+    for i in 0..extra_keys.len {
+        keys.push(extra_keys[i].clone())
+        vals.push(extra_vals[i].clone())
+    }
+    use_cwd := if cwd.len > 0 { cwd.clone() } else { probe.work.clone() }
+    BatchCmd {
+        program: program.clone(),
+        args: args,
+        cwd: use_cwd,
+        env_keys: keys,
+        env_vals: vals,
+        timeout_ms: timeout_ms,
+    }
+}
+
+fn git_cmd(probe: &Probe, move args: []string) -> BatchCmd {
+    mut full_args: []string = ["-c", "protocol.file.allow=always"]
+    for a in move args { full_args.push(move a) }
+    empty: []string = []
+    make_cmd(&probe, "git", move full_args, probe.work, &empty, &empty, 90000)
+}
+
+fn cli_cmd(probe: &Probe, project: string, move args: []string, extra_keys: &[]string, extra_vals: &[]string) -> BatchCmd {
+    make_cmd(&probe, probe.compiler, move args, project, &extra_keys, &extra_vals, 90000)
+}
+
+fn cli_cmd_default(probe: &Probe, project: string, move args: []string) -> BatchCmd {
+    empty: []string = []
+    cli_cmd(&probe, project, move args, &empty, &empty)
+}
+
+fn check_status(res: &process.Output, expected_status: i32, label: string) -> bool {
+    if !res.ok || res.timed_out || res.signal != 0 {
+        return harness.fail(f"{label}: failed (ok={res.ok}, code={res.code}, signal={res.signal}, timed_out={res.timed_out})\nstdout: {res.stdout_text()}\nstderr: {res.stderr_text()}")
+    }
+    if expected_status < 0 {
+        if res.code != 1 && res.code != 2 {
+            return harness.fail(f"{label}: expected exit 1 or 2, got {res.code}\nstdout: {res.stdout_text()}\nstderr: {res.stderr_text()}")
+        }
+    } else if res.code != expected_status {
+        return harness.fail(f"{label}: expected exit {expected_status}, got {res.code}\nstdout: {res.stdout_text()}\nstderr: {res.stderr_text()}")
+    }
+    true
+}
+
+fn exec_probe_batch(probe: &mut Probe, cmds: &[]BatchCmd) -> []process.Output {
+    run_batch(&cmds, probe.max_workers, &mut probe.bg)
+}
+
+fn git_run(probe: &mut Probe, move args: []string, expected_status: i32) -> Result<process.Output, string> {
+    drain_bg_unit(&mut probe.bg)
+    spec := git_cmd(&probe, move args)
+    cmd := build_process_cmd(&spec)
+    res := cmd.exec()
+    if !check_status(&res, expected_status, "git") {
+        return .Err("git command failed")
+    }
+    .Ok(res)
+}
+
+fn cli_run_env(probe: &mut Probe, project: string, move args: []string, expected_status: i32, extra_keys: &[]string, extra_vals: &[]string) -> Result<process.Output, string> {
+    drain_bg_unit(&mut probe.bg)
+    probe.commands += 1
+    spec := cli_cmd(&probe, project, move args, &extra_keys, &extra_vals)
+    cmd := build_process_cmd(&spec)
+    res := cmd.exec()
+    if !check_status(&res, expected_status, "dunder in " + project) {
+        return .Err("dunder command failed")
+    }
+    .Ok(res)
+}
+
+fn cli_run(probe: &mut Probe, project: string, move args: []string, expected_status: i32) -> Result<process.Output, string> {
+    empty: []string = []
+    cli_run_env(&mut probe, project, move args, expected_status, &empty, &empty)
+}
+
+fn find_runner(probe: &Probe, target: string) -> i32 {
+    for i in 0..probe.runners.len {
+        if probe.runners[i].target == target { return i }
+    }
+    -1
+}
+
+fn verify_image_header(image: string, target: string) -> bool {
+    raw := sys.read_u8(image)
+    if !raw.ok { return harness.fail("cannot read built image " + image) }
+    data := &raw.value
+    if target == "arm64-macos" {
+        if data.len < 4 || data[0] != 0xcf || data[1] != 0xfa || data[2] != 0xed || data[3] != 0xfe {
+            return harness.fail("invalid Mach-O magic in " + image)
+        }
+    } else {
+        if data.len < 20 || data[0] != 0x7f || data[1] != b'E' || data[2] != b'L' || data[3] != b'F' || data[4] != 2 || data[5] != 1 {
+            return harness.fail("invalid ELF header in " + image)
+        }
+        machine := bytes.u16_le(&data, 18)
+        expected_machine := if target == "arm64-linux" { 183 } else { 62 }
+        if machine != expected_machine {
+            return harness.fail(f"unexpected ELF machine {machine}, expected {expected_machine} in {image}")
+        }
+    }
+    true
+}
+
+fn make_runner_cmd(probe: &Probe, runner_idx: i32, image: string) -> BatchCmd {
+    empty: []string = []
+    prefix := &probe.runners[runner_idx].cmd
+    if prefix.len == 0 {
+        return make_cmd(&probe, image, [], path.dirname(image), &empty, &empty, 90000)
+    }
+    mut args: []string = []
+    for i in 1..prefix.len { args.push(prefix[i].clone()) }
+    args.push(image.clone())
+    make_cmd(&probe, prefix[0], move args, path.dirname(image), &empty, &empty, 90000)
+}
+
+struct ExecItem {
+    image: string,
+    target: string,
+    expected: i32,
+}
+
+fn execute_batch(probe: &mut Probe, items: &[]ExecItem) -> bool {
+    mut cmds: []BatchCmd = []
+    mut expected_outs: []string = []
+    mut labels: []string = []
+    for item in items {
+        if !verify_image_header(item.image, item.target) { return false }
+        probe.images += 1
+        ridx := find_runner(&probe, item.target)
+        if ridx >= 0 {
+            cmds.push(make_runner_cmd(&probe, ridx, item.image))
+            expected_outs.push(item.expected.str() + "\n")
+            labels.push("execute " + item.image)
+        }
+    }
+    if cmds.len == 0 { return true }
+    outs := exec_probe_batch(&mut probe, &cmds)
+    for i in 0..outs.len {
+        if !check_status(&outs[i], 0, labels[i]) { return false }
+        if outs[i].stdout_text() != expected_outs[i] || outs[i].stderr_text() != "" {
+            return harness.fail(f"{labels[i]}: expected stdout {expected_outs[i]} with empty stderr, got stdout={outs[i].stdout_text()} stderr={outs[i].stderr_text()}")
+        }
+        probe.executions += 1
+    }
+    true
+}
+
+fn execute_one(probe: &mut Probe, image: string, target: string, expected: i32) -> bool {
+    execute_batch(&mut probe, &[ExecItem { image: image.clone(), target: target.clone(), expected: expected }])
+}
+
+struct RejectSnap {
+    lock_path: string,
+    had_lock: bool,
+    lock_bytes: []u8,
+    output_path: string,
+    had_output: bool,
+    output_bytes: []u8,
+    words: []string,
+    label: string,
+}
+
+fn capture_reject_snap(project: string, output_path: string, move words: []string, label: string) -> Result<RejectSnap, string> {
+    lock_path := project + "/dunder.lock"
+    had_lock := path_exists(lock_path)
+    mut lock_bytes: []u8 = []
+    if had_lock {
+        r := sys.read_u8(lock_path)
+        if !r.ok { return .Err("cannot read lock before reject: " + lock_path) }
+        lock_bytes = r.value
+    }
+    mut had_output := false
+    mut output_bytes: []u8 = []
+    if output_path.len > 0 {
+        had_output = path_exists(output_path)
+        if had_output {
+            r := sys.read_u8(output_path)
+            if !r.ok { return .Err("cannot read output before reject: " + output_path) }
+            output_bytes = r.value
+        }
+    }
+    .Ok(RejectSnap {
+        lock_path: lock_path,
+        had_lock: had_lock,
+        lock_bytes: lock_bytes,
+        output_path: output_path.clone(),
+        had_output: had_output,
+        output_bytes: output_bytes,
+        words: words,
+        label: label.clone(),
+    })
+}
+
+fn verify_reject_snap(probe: &mut Probe, snap: &RejectSnap, res: &process.Output) -> bool {
+    if !check_status(&res, -1, "reject " + snap.label) { return false }
+    stderr_txt := res.stderr_text()
+    if stderr_txt.len == 0 {
+        return harness.fail("reject " + snap.label + ": expected non-empty stderr")
+    }
+    stderr_lower := text.lower(stderr_txt)
+    for w in &snap.words {
+        if !text.contains(stderr_lower, text.lower(w)) {
+            return harness.fail(f"reject {snap.label}: missing '{w}' in stderr:\n{stderr_txt}")
+        }
+    }
+    has_lock_now := path_exists(snap.lock_path)
+    if has_lock_now != snap.had_lock {
+        return harness.fail(f"reject {snap.label}: lock existence changed ({snap.lock_path})")
+    }
+    if has_lock_now {
+        now := sys.read_u8(snap.lock_path)
+        if !now.ok || !bytes.equal(&now.value, &snap.lock_bytes) {
+            return harness.fail(f"reject {snap.label}: lock contents changed ({snap.lock_path})")
+        }
+    }
+    if snap.output_path.len > 0 {
+        has_out_now := path_exists(snap.output_path)
+        if has_out_now != snap.had_output {
+            return harness.fail(f"reject {snap.label}: output existence changed ({snap.output_path})")
+        }
+        if has_out_now {
+            now := sys.read_u8(snap.output_path)
+            if !now.ok || !bytes.equal(&now.value, &snap.output_bytes) {
+                return harness.fail(f"reject {snap.label}: output contents changed ({snap.output_path})")
+            }
+        }
+    }
+    probe.rejections += 1
+    true
+}
+
+fn reject_one_env(probe: &mut Probe, project: string, move args: []string, move words: []string, output_path: string, extra_keys: &[]string, extra_vals: &[]string) -> bool {
+    snap := match capture_reject_snap(project, output_path, move words, project) {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    res := match cli_run_env(&mut probe, project, move args, -1, &extra_keys, &extra_vals) {
+        .Ok(r) => r,
+        .Err(_) => { return false },
+    }
+    verify_reject_snap(&mut probe, &snap, &res)
+}
+
+fn reject_one(probe: &mut Probe, project: string, move args: []string, move words: []string, output_path: string) -> bool {
+    empty: []string = []
+    reject_one_env(&mut probe, project, move args, move words, output_path, &empty, &empty)
+}
+
+struct RepoSpec {
+    name: string,
+    files: [](string, string),
+    links: [](string, string),
+    object_format: string,
+}
+
+struct Repo {
+    name: string,
+    author: string,
+    origin: string,
+    url: string,
+    head_commit: string,
+    config: []u8,
+}
+
+fn create_repos_batch(probe: &mut Probe, specs: &[]RepoSpec) -> Result<[]Repo, string> {
+    n := specs.len
+    mut authors: []string = []
+    mut origins: []string = []
+    mut init_cmds: []BatchCmd = []
+
+    for i in 0..n {
+        author := probe.work + "/authors/" + specs[i].name
+        origin := probe.work + "/bare origins/" + specs[i].name + ".git"
+        if !fs.mkdir_all(author).ok || !fs.mkdir_all(path.dirname(origin)).ok {
+            return .Err("cannot mkdir repo dirs for " + specs[i].name)
+        }
+        authors.push(author.clone())
+        origins.push(origin.clone())
+        mut args: []string = ["init", "--initial-branch=main"]
+        if specs[i].object_format.len > 0 {
+            args.push("--object-format=" + specs[i].object_format)
+        }
+        args.push(move author)
+        init_cmds.push(git_cmd(&probe, move args))
+    }
+
+    init_outs := exec_probe_batch(&mut probe, &init_cmds)
+    for i in 0..n {
+        if !check_status(&init_outs[i], 0, "git init " + specs[i].name) {
+            return .Err("git init failed for " + specs[i].name)
+        }
+    }
+
+    mut add_cmds: []BatchCmd = []
+    for i in 0..n {
+        for f in &specs[i].files {
+            fpath := authors[i] + "/" + f.0
+            if !write_text_file(fpath, f.1) { return .Err("write repo file failed: " + fpath) }
+            if f.0 == "build.sh" {
+                if fs.chmod(fpath, u32(493)).is_err() {
+                    return .Err("chmod build.sh failed: " + fpath)
+                }
+            }
+        }
+        for lnk in &specs[i].links {
+            lpath := authors[i] + "/" + lnk.0
+            if !fs.mkdir_all(path.dirname(lpath)).ok {
+                return .Err("mkdir for symlink failed: " + lpath)
+            }
+            if !fs.symlink(lnk.1, lpath).ok {
+                return .Err("symlink failed: " + lpath)
+            }
+        }
+        add_cmds.push(git_cmd(&probe, ["-C", authors[i].clone(), "add", "--all"]))
+    }
+
+    add_outs := exec_probe_batch(&mut probe, &add_cmds)
+    for i in 0..n {
+        if !check_status(&add_outs[i], 0, "git add " + specs[i].name) {
+            return .Err("git add failed for " + specs[i].name)
+        }
+    }
+
+    mut commit_cmds: []BatchCmd = []
+    for i in 0..n {
+        commit_cmds.push(git_cmd(&probe, ["-C", authors[i].clone(), "commit", "--quiet", "-m", "initial"]))
+    }
+    commit_outs := exec_probe_batch(&mut probe, &commit_cmds)
+    for i in 0..n {
+        if !check_status(&commit_outs[i], 0, "git commit " + specs[i].name) {
+            return .Err("git commit failed for " + specs[i].name)
+        }
+    }
+
+    mut post_cmds: []BatchCmd = []
+    for i in 0..n {
+        post_cmds.push(git_cmd(&probe, ["-C", authors[i].clone(), "rev-parse", "HEAD"]))
+        post_cmds.push(git_cmd(&probe, ["clone", "--bare", authors[i].clone(), origins[i].clone()]))
+    }
+    post_outs := exec_probe_batch(&mut probe, &post_cmds)
+
+    mut repos: []Repo = []
+    for i in 0..n {
+        if !check_status(&post_outs[i * 2], 0, "git rev-parse " + specs[i].name) {
+            return .Err("git rev-parse failed for " + specs[i].name)
+        }
+        if !check_status(&post_outs[i * 2 + 1], 0, "git clone --bare " + specs[i].name) {
+            return .Err("git clone --bare failed for " + specs[i].name)
+        }
+        cfg := sys.read_u8(authors[i] + "/.git/config")
+        if !cfg.ok { return .Err("cannot read git config for " + specs[i].name) }
+        repos.push(Repo {
+            name: specs[i].name.clone(),
+            author: authors[i].clone(),
+            origin: origins[i].clone(),
+            url: file_uri(origins[i]),
+            head_commit: text.trim(post_outs[i * 2].stdout_text()),
+            config: cfg.value,
+        })
+    }
+    .Ok(repos)
+}
+
+fn create_repo(probe: &mut Probe, name: string, move files: [](string, string), move links: [](string, string), object_format: string) -> Result<Repo, string> {
+    specs: []RepoSpec = [RepoSpec { name: name.clone(), files: files, links: links, object_format: object_format.clone() }]
+    mut repos := create_repos_batch(&mut probe, &specs)?
+    .Ok(repos.pop())
+}
+
+fn repo_commit(probe: &mut Probe, repo: &mut Repo, message: string, files: &[](string, string)) -> Result<string, string> {
+    for f in files {
+        if !write_text_file(repo.author + "/" + f.0, f.1) {
+            return .Err("write commit file failed: " + f.0)
+        }
+    }
+    _ := git_run(&mut probe, ["-C", repo.author.clone(), "add", "--all"], 0)?
+    _ := git_run(&mut probe, ["-C", repo.author.clone(), "commit", "--quiet", "-m", message.clone()], 0)?
+    rev := git_run(&mut probe, ["-C", repo.author.clone(), "rev-parse", "HEAD"], 0)?
+    commit := text.trim(rev.stdout_text())
+    repo.head_commit = commit.clone()
+    .Ok(commit)
+}
+
+fn repo_push(probe: &mut Probe, repo: &Repo, reference: string) -> bool {
+    git_run(&mut probe, ["-C", repo.author.clone(), "push", repo.origin.clone(), "HEAD:refs/heads/" + reference], 0).is_ok()
+}
+
+fn ensure_helper_packages(probe: &Probe) -> bool {
+    local := probe.work + "/local path with spaces"
+    inline := probe.work + "/inline path with spaces"
+    write_text_file(local + "/local.ddr", "pub fn offset() -> i32 { 1 }\n") &&
+    write_text_file(inline + "/dunder.toml", "root = \"src/api.ddr\"\n") &&
+    write_text_file(inline + "/src/api.ddr", "pub fn offset() -> i32 { 2 }\n")
+}
+
+fn create_project(probe: &Probe, name: string, source: string, expected: i32, duplicate: bool) -> Result<string, string> {
+    if !ensure_helper_packages(&probe) { return .Err("failed creating helper packages") }
+    proj := probe.work + "/projects/" + name
+    local := probe.work + "/local path with spaces"
+    inline := probe.work + "/inline path with spaces"
+    mut deps := "kit = " + source + "\n"
+    deps += "local = " + json.quote(relpath(local, proj)) + "\n"
+    deps += "inline = " + toml_table(&[("path", relpath(inline, proj))]) + "\n"
+    if duplicate {
+        deps += "again = " + source + "\n"
+    }
+    manifest := "name = \"consumer\"\nroot = \"src/main.ddr\"\ntest_root = \"tests/suite.ddr\"\n\n[dependencies]\n" + deps
+    if !write_text_file(proj + "/dunder.toml", manifest) {
+        return .Err("cannot write project manifest " + proj)
+    }
+    imports := "import kit\nimport kit.detail as detail\nimport local\nimport inline\n"
+    expr := "kit.answer() + detail.offset() + local.offset() + inline.offset()"
+    alias := if duplicate { "import again\n" } else { "" }
+    check_dup := if duplicate { "assert(kit.answer() == again.answer()); " } else { "" }
+    if !write_text_file(proj + "/src/main.ddr", imports + alias + "fn main() { " + check_dup + "print(" + expr + ") }\n") {
+        return .Err("cannot write project main " + proj)
+    }
+    if !write_text_file(proj + "/tests/suite.ddr", imports + "@test fn resolved() { assert(" + expr + " == " + expected.str() + ") }\n") {
+        return .Err("cannot write project test " + proj)
+    }
+    .Ok(proj)
+}
+
+struct Pin {
+    url: string,
+    kind: string,
+    reference: string,
+    commit: string,
+}
+
+fn check_pins(proj: string, expected: &[]Pin) -> Result<[]u8, string> {
+    lock_path := proj + "/dunder.lock"
+    raw := sys.read_u8(lock_path)
+    if !raw.ok { return .Err("cannot read " + lock_path) }
+    dec := bytes.decode(&raw.value)
+    if !dec.ok { return .Err("invalid UTF-8 in " + lock_path) }
+    parsed := toml.parse(dec.value)
+    if !parsed.ok { return .Err("TOML parse failed for " + lock_path + ": " + parsed.error) }
+    doc := json.Doc::parse_text(parsed.json)
+    if !doc.ok || doc.kind(doc.root) != .Object {
+        return .Err("JSON parse failed for TOML of " + lock_path)
+    }
+    v_node := doc.field(doc.root, "version")
+    if doc.kind(v_node) != .Number || doc.raw_span(v_node) != "1" || doc.as_i64(v_node) != .Some(1) {
+        return .Err("expected version = 1 integer in " + lock_path + ", got " + parsed.json)
+    }
+    git_node := doc.field(doc.root, "git")
+    mut row_count := 0
+    if git_node >= 0 {
+        if doc.kind(git_node) != .Array {
+            return .Err("expected [[git]] array in " + lock_path)
+        }
+        row_count = doc.count(git_node)
+    }
+    if row_count != expected.len {
+        return .Err(f"pin count mismatch in {lock_path}: got {row_count}, expected {expected.len}\n{dec.value}")
+    }
+    mut seen_urls: []string = []
+    mut seen_kinds: []string = []
+    mut seen_refs: []string = []
+    for i in 0..row_count {
+        row := doc.at(git_node, i)
+        if doc.kind(row) != .Object { return .Err("git pin row is not an object in " + lock_path) }
+        u_opt := doc.get_str(row, "url")
+        k_opt := doc.get_str(row, "kind")
+        r_opt := doc.get_str(row, "reference")
+        c_opt := doc.get_str(row, "commit")
+        if u_opt.is_none() || k_opt.is_none() || r_opt.is_none() || c_opt.is_none() {
+            return .Err("missing required fields in git pin row in " + lock_path)
+        }
+        u := u_opt.unwrap()
+        k := k_opt.unwrap()
+        r := r_opt.unwrap()
+        c := c_opt.unwrap()
+        if !is_commit_hex(c) {
+            return .Err("invalid commit hex in " + lock_path + ": " + c)
+        }
+        for j in 0..seen_urls.len {
+            if seen_urls[j] == u && seen_kinds[j] == k && seen_refs[j] == r {
+                return .Err("duplicate pin identity in " + lock_path)
+            }
+        }
+        mut matched := false
+        for exp in expected {
+            if exp.url == u && exp.kind == k && exp.reference == r {
+                if exp.commit != c {
+                    return .Err(f"commit mismatch for ({u}, {k}, {r}): got {c}, expected {exp.commit}")
+                }
+                matched = true
+                break
+            }
+        }
+        if !matched {
+            return .Err(f"unexpected pin ({u}, {k}, {r}) -> {c} in {lock_path}")
+        }
+        seen_urls.push(move u)
+        seen_kinds.push(move k)
+        seen_refs.push(move r)
+    }
+    .Ok(raw.value)
+}
+
+fn collect_checkout_dirs(dir: string, out: &mut []string) -> bool {
+    ls := fs.list_dir(dir)
+    if ls.is_err() { return true }
+    entries := ls.unwrap()
+    for name in &entries {
+        if name == ".git" {
+            out.push(dir.clone())
+            return true
+        }
+    }
+    for name in &entries {
+        child := dir + "/" + name
+        meta := fs.lstat(child)
+        if meta.is_ok() {
+            m := meta.unwrap()
+            if m.is_dir && !m.is_symlink {
+                if !collect_checkout_dirs(child, &mut out) { return false }
+            }
+        }
+    }
+    true
+}
+
+fn check_checkouts(probe: &mut Probe, proj: string, expected_commits: &[]string, cache_override: string) -> bool {
+    if path_exists(proj + "/build/.dunder/git") {
+        return harness.fail("unexpected project-local git cache under " + proj)
+    }
+    target_cache := if cache_override.len > 0 { cache_override.clone() } else { probe.cache.clone() }
+    checkouts_dir := target_cache + "/checkouts"
+    mut dirs: []string = []
+    if sys.metadata(checkouts_dir).is_dir {
+        _ := collect_checkout_dirs(checkouts_dir, &mut dirs)
+    }
+    mut cmds: []BatchCmd = []
+    for d in &dirs {
+        cmds.push(git_cmd(&probe, ["-C", d.clone(), "rev-parse", "HEAD"]))
+        cmds.push(git_cmd(&probe, ["-C", d.clone(), "symbolic-ref", "--quiet", "HEAD"]))
+    }
+    outs := exec_probe_batch(&mut probe, &cmds)
+    mut found: []string = []
+    for i in 0..dirs.len {
+        if !check_status(&outs[i * 2], 0, "rev-parse checkout " + dirs[i]) { return false }
+        head := text.trim(outs[i * 2].stdout_text())
+        if !is_commit_hex(head) {
+            return harness.fail("invalid checkout HEAD " + head + " in " + dirs[i])
+        }
+        if !check_status(&outs[i * 2 + 1], 1, "detached HEAD check " + dirs[i]) { return false }
+        if !array.contains<string>(&found, &head) {
+            found.push(move head)
+        }
+    }
+    for exp in expected_commits {
+        if !array.contains<string>(&found, &exp) {
+            return harness.fail(f"missing expected commit {exp} in checkouts of {target_cache}")
+        }
+    }
+    if cache_override.len > 0 {
+        if found.len != expected_commits.len {
+            return harness.fail(f"exact checkout count mismatch in {target_cache}: found {found.len}, expected {expected_commits.len}")
+        }
+    }
+    true
+}
+
+fn checkout_for(probe: &mut Probe, proj: string, commit: string, cache_override: string) -> Result<string, string> {
+    target_cache := if cache_override.len > 0 { cache_override.clone() } else { probe.cache.clone() }
+    checkouts_dir := target_cache + "/checkouts"
+    mut dirs: []string = []
+    if sys.metadata(checkouts_dir).is_dir {
+        _ := collect_checkout_dirs(checkouts_dir, &mut dirs)
+    }
+    mut cmds: []BatchCmd = []
+    for d in &dirs {
+        cmds.push(git_cmd(&probe, ["-C", d.clone(), "rev-parse", "HEAD"]))
+    }
+    outs := exec_probe_batch(&mut probe, &cmds)
+    for i in 0..dirs.len {
+        if outs[i].succeeded() && text.trim(outs[i].stdout_text()) == commit {
+            return .Ok(dirs[i].clone())
+        }
+    }
+    .Err(f"missing cached checkout for {proj} in {target_cache} at {commit}")
+}
+
+fn collect_readonly_files(dir: string, out: &mut []string) {
+    ls := fs.list_dir(dir)
+    if ls.is_err() { return }
+    for name in ls.unwrap() {
+        if name == ".git" { continue }
+        child := dir + "/" + name
+        meta := fs.lstat(child)
+        if meta.is_err() { continue }
+        m := meta.unwrap()
+        if m.is_dir && !m.is_symlink {
+            collect_readonly_files(child, &mut out)
+        } else if m.is_file && !m.is_symlink {
+            if text.ends_with(name, ".ddr") || name == "dunder.toml" {
+                out.push(move child)
+            }
+        }
+    }
+}
+
+struct SavedFile {
+    file_path: string,
+    data: []u8,
+    mode: u32,
+}
+
+fn restore_modes(saved: &[]SavedFile) {
+    for item in saved {
+        if path_exists(item.file_path) {
+            _ := fs.chmod(item.file_path, item.mode)
+        }
+    }
+}
+
+fn readonly_check(probe: &mut Probe, proj: string, marker: string) -> bool {
+    mut files: []string = []
+    collect_readonly_files(probe.cache, &mut files)
+    if files.len == 0 {
+        return harness.fail("readonly_check found no cached .ddr or dunder.toml files in " + probe.cache)
+    }
+    mut saved: []SavedFile = []
+    for f in &files {
+        raw := sys.read_u8(f)
+        meta := fs.metadata(f)
+        if !raw.ok || meta.is_err() {
+            return harness.fail("cannot inspect cached file " + f)
+        }
+        saved.push(SavedFile {
+            file_path: f.clone(),
+            data: raw.value,
+            mode: meta.unwrap().mode.bit_and(u32(511)),
+        })
+    }
+    defer { restore_modes(&saved) }
+    for item in &saved {
+        if fs.chmod(item.file_path, u32(292)).is_err() {
+            return harness.fail("chmod 0o444 failed on " + item.file_path)
+        }
+    }
+    if cli_run(&mut probe, proj, ["check", "--offline", "--locked"], 0).is_err() {
+        return false
+    }
+    for i in 0..saved.len {
+        after := sys.read_u8(saved[i].file_path)
+        meta := fs.metadata(saved[i].file_path)
+        if !after.ok || meta.is_err() || !bytes.equal(&after.value, &saved[i].data) ||
+           meta.unwrap().mode.bit_and(u32(511)) != u32(292) {
+            return harness.fail("readonly_check detected mutation of " + saved[i].file_path)
+        }
+    }
+    if path_exists(marker) {
+        return harness.fail("a dependency build script ran")
+    }
+    true
+}
+
+fn restore_renamed_origins(moved: &[](string, string)) {
+    mut i := moved.len - 1
+    while i >= 0 {
+        _ := sys.rename(moved[i].0, moved[i].1)
+        i -= 1
+    }
+}
+
+fn offline_phase_origins_hidden(probe: &mut Probe, proj: string, origins: &[]string, expected: i32, lock_bytes: &[]u8) -> bool {
+    mut moved: [](string, string) = []
+    defer { restore_renamed_origins(&moved) }
+    for origin in origins {
+        hidden := origin + ".unavailable"
+        if !sys.rename(origin, hidden).ok {
+            return harness.fail("cannot hide origin " + origin)
+        }
+        moved.push((hidden, origin.clone()))
+    }
+    host := probe.host.clone()
+    host_image := proj + "/image-" + host
+    // Warm build (without --offline/--locked) + all 5 basic_contracts are read-only
+    // on dunder.lock and probe.cache and write to distinct outputs.
+    cmds: []BatchCmd = [
+        cli_cmd_default(&probe, proj, ["build", "--jobs", "1", "-o", proj + "/warm-image"]),
+        cli_cmd_default(&probe, proj, ["check", "--agent", "--offline", "--locked"]),
+        cli_cmd_default(&probe, proj, ["run", "--offline", "--locked", "-o", proj + "/run-image"]),
+        cli_cmd_default(&probe, proj, ["test", "--offline", "--locked", "-o", proj + "/test-images"]),
+        cli_cmd_default(&probe, proj + "/src", ["check", "main.ddr", "--agent", "--offline", "--locked"]),
+        cli_cmd_default(&probe, proj, ["build", "--target", host.clone(), "--jobs", "1", "--offline", "--locked", "-o", host_image.clone()]),
+    ]
+    probe.commands += 6
+    outs := exec_probe_batch(&mut probe, &cmds)
+
+    if !check_status(&outs[0], 0, "offline warm build") { return false }
+    if !check_status(&outs[1], 0, "basic check") || !harness.agent_ok(&outs[1]) { return false }
+    if !check_status(&outs[2], 0, "basic run") { return false }
+    if outs[2].stdout_text() != expected.str() + "\n" || outs[2].stderr_text() != "" {
+        return harness.fail("basic run unexpected output: " + outs[2].stdout_text() + " / " + outs[2].stderr_text())
+    }
+    if !check_status(&outs[3], 0, "basic test") { return false }
+    t_out := outs[3].stdout_text()
+    if !text.contains(t_out, "::resolved") || !text.ends_with(t_out, "1 passed, 0 failed\n") || outs[3].stderr_text() != "" {
+        return harness.fail("basic test unexpected output: " + t_out + " / " + outs[3].stderr_text())
+    }
+    if !check_status(&outs[4], 0, "basic nested check") || !harness.agent_ok(&outs[4]) { return false }
+    if !check_status(&outs[5], 0, "basic host build") { return false }
+    if !execute_one(&mut probe, host_image, host, expected) { return false }
+
+    lock_now := sys.read_u8(proj + "/dunder.lock")
+    if !lock_now.ok || !bytes.equal(&lock_now.value, &lock_bytes) {
+        return harness.fail("basic_contracts mutated dunder.lock")
+    }
+    true
+}
+
+fn restore_cache_dir(cache: string, saved: string) {
+    if path_exists(cache) { _ := fs.remove_all(cache) }
+    _ := sys.rename(saved, cache)
+}
+
+fn offline_contracts(probe: &mut Probe, proj: string, origins: &[]string, expected: i32, lock_bytes: &[]u8) -> bool {
+    if !offline_phase_origins_hidden(&mut probe, proj, &origins, expected, &lock_bytes) {
+        return false
+    }
+    cache := probe.cache.clone()
+    saved := probe.work + "/git-cache-saved"
+    if path_exists(saved) { _ := fs.remove_all(saved) }
+    if !sys.rename(cache, saved).ok {
+        return harness.fail("cannot temporarily move git cache away")
+    }
+    defer { restore_cache_dir(cache, saved) }
+    image := proj + "/offline-sentinel"
+    sentinel := bytes.from_text("previous valid image")
+    if !write_bytes_file(image, &sentinel) { return false }
+    reject_one(&mut probe, proj, ["build", "--offline", "--locked", "-o", image.clone()], ["offline"], image)
+}
+
+struct SymlinkCase {
+    warm: bool,
+    kind: string,
+    name: string,
+    proj: string,
+    home: string,
+    cache: string,
+    image: string,
+    outside: string,
+    before_snap: []u8,
+    rej_snap: RejectSnap,
+}
+
+struct SymlinkSuite {
+    repo: Repo,
+    sentinel_dir: string,
+    sentinel_image: string,
+    cases: []SymlinkCase,
+}
+
+fn prepare_cache_symlink_suite_with_repo(probe: &Probe, move repo: Repo) -> Result<SymlinkSuite, string> {
+    sentinel_dir := probe.work + "/cache sentinel"
+    if !write_text_file(sentinel_dir + "/dunder.toml", "name = \"sentinel\"\nroot = \"main.ddr\"\n") ||
+       !write_text_file(sentinel_dir + "/main.ddr", "fn main() { print(7) }\n") {
+        return .Err("cannot write cache sentinel project")
+    }
+    kinds: []string = ["git", "repos", "checkouts", "checkout-url-parent"]
+    mut cases: []SymlinkCase = []
+    for warm in [false, true] {
+        for kind in &kinds {
+            name := (if warm { "warm " } else { "cold " }) + kind
+            proj := probe.work + "/cache symlinks/" + name
+            home := probe.work + "/cache symlinks homes/" + name
+            cache := home + "/git"
+            image := proj + "/image"
+            outside := probe.work + "/outside cache/" + name
+            manifest := "name = \"consumer\"\nroot = \"main.ddr\"\n[dependencies]\nkit = " + toml_table(&[("git", repo.url.clone())]) + "\n"
+            if !write_text_file(proj + "/dunder.toml", manifest) ||
+               !write_text_file(proj + "/main.ddr", "import kit\nfn main() { print(kit.answer()) }\n") {
+                return .Err("cannot write symlink case " + name)
+            }
+            cases.push(SymlinkCase {
+                warm: warm,
+                kind: kind.clone(),
+                name: name,
+                proj: proj,
+                home: home,
+                cache: cache,
+                image: image,
+                outside: outside,
+                before_snap: [],
+                rej_snap: RejectSnap {
+                    lock_path: "", had_lock: false, lock_bytes: [],
+                    output_path: "", had_output: false, output_bytes: [],
+                    words: [], label: "",
+                },
+            })
+        }
+    }
+    .Ok(SymlinkSuite {
+        repo: repo,
+        sentinel_dir: sentinel_dir.clone(),
+        sentinel_image: sentinel_dir + "/image",
+        cases: cases,
+    })
+}
+
+fn prepare_cache_symlink_suite(probe: &mut Probe) -> Result<SymlinkSuite, string> {
+    repo := create_repo(&mut probe, "cache confinement", [
+        ("dunder.toml", "root = \"api.ddr\"\n"),
+        ("api.ddr", "pub fn answer() -> i32 { 42 }\n"),
+    ], [], "")?
+    prepare_cache_symlink_suite_with_repo(&probe, move repo)
+}
+
+fn cache_symlink_stage_and_build_reject_cmds(probe: &mut Probe, suite: &mut SymlinkSuite, warm_outs: &[]process.Output, sentinel_out: &process.Output) -> Result<[]BatchCmd, string> {
+    if !check_status(&sentinel_out, 0, "cache sentinel build") {
+        return .Err("cache sentinel build failed")
+    }
+    s_raw := sys.read_u8(suite.sentinel_image)
+    if !s_raw.ok { return .Err("cannot read sentinel image") }
+    sentinel_bytes := s_raw.value
+
+    mut warm_execs: []ExecItem = []
+    mut warm_idx := 0
+    for i in 0..suite.cases.len {
+        if suite.cases[i].warm {
+            if !check_status(&warm_outs[warm_idx], 0, "warm build " + suite.cases[i].name) {
+                return .Err("warm build failed for " + suite.cases[i].name)
+            }
+            warm_idx += 1
+            warm_execs.push(ExecItem { image: suite.cases[i].image.clone(), target: probe.host.clone(), expected: 42 })
+            exp: []Pin = [Pin { url: suite.repo.url.clone(), kind: "head", reference: "", commit: suite.repo.head_commit.clone() }]
+            _ := check_pins(suite.cases[i].proj, &exp)?
+        }
+    }
+    if !execute_batch(&mut probe, &warm_execs) {
+        return .Err("warm symlink case execution failed")
+    }
+
+    digest := sha256.hex_text(suite.repo.url)
+    mut reject_cmds: []BatchCmd = []
+
+    for i in 0..suite.cases.len {
+        warm := suite.cases[i].warm
+        kind := suite.cases[i].kind.clone()
+        name := suite.cases[i].name.clone()
+        proj := suite.cases[i].proj.clone()
+        home := suite.cases[i].home.clone()
+        cache := suite.cases[i].cache.clone()
+        image := suite.cases[i].image.clone()
+        outside := suite.cases[i].outside.clone()
+
+        if !warm {
+            if !fs.mkdir_all(cache).ok { return .Err("mkdir cache failed for " + name) }
+            if !write_text_file(proj + "/dunder.lock", "version = 1\n") {
+                return .Err("write cold lock failed for " + name)
+            }
+        }
+
+        staged := proj + "/sentinel-image"
+        if !write_bytes_file(staged, &sentinel_bytes) { return .Err("stage sentinel failed for " + name) }
+        if fs.chmod(staged, u32(493)).is_err() { return .Err("chmod staged sentinel failed for " + name) }
+        if !sys.rename(staged, image).ok { return .Err("replace sentinel image failed for " + name) }
+
+        link := if kind == "git" {
+            cache.clone()
+        } else if kind == "checkout-url-parent" {
+            cache + "/checkouts/" + digest
+        } else {
+            cache + "/" + kind
+        }
+        if !fs.mkdir_all(path.dirname(outside)).ok { return .Err("mkdir outside parent failed for " + name) }
+        if warm {
+            if !sys.rename(link, outside).ok { return .Err("rename warm link to outside failed for " + name) }
+        } else {
+            if kind == "git" {
+                if !sys.remove_dir(link).ok { return .Err("rmdir cold git cache failed for " + name) }
+            } else {
+                if !fs.mkdir_all(path.dirname(link)).ok { return .Err("mkdir cold link parent failed for " + name) }
+            }
+            if !sys.mkdir(outside).ok { return .Err("mkdir outside failed for " + name) }
+            if !write_text_file(outside + "/sentinel", "must stay unchanged\n") {
+                return .Err("write outside sentinel failed for " + name)
+            }
+        }
+        if !fs.symlink(outside, link).ok { return .Err("symlink failed for " + name) }
+        suite.cases[i].before_snap = directory_snapshot(outside)?
+        suite.cases[i].rej_snap = capture_reject_snap(proj, image, ["cache", "symlink"], name)?
+
+        mut args: []string = ["build", "--jobs", "1"]
+        if warm {
+            args.push("--offline")
+            args.push("--locked")
+        }
+        args.push("-o")
+        args.push(move image)
+        keys: []string = ["DUNDER_HOME"]
+        vals: []string = [home]
+        reject_cmds.push(cli_cmd(&probe, proj, move args, &keys, &vals))
+    }
+    .Ok(reject_cmds)
+}
+
+fn cache_symlink_verify_rejections_collect(probe: &mut Probe, suite: &SymlinkSuite, rej_outs: &[]process.Output) -> Result<[]ExecItem, string> {
+    mut sentinel_execs: []ExecItem = []
+    for i in 0..suite.cases.len {
+        if !verify_reject_snap(&mut probe, &suite.cases[i].rej_snap, &rej_outs[i]) {
+            return .Err("cache symlink rejection failed for " + suite.cases[i].name)
+        }
+        after := directory_snapshot(suite.cases[i].outside)?
+        if !bytes.equal(&after, &suite.cases[i].before_snap) {
+            return .Err(suite.cases[i].name + ": wrote outside Git cache")
+        }
+        sentinel_execs.push(ExecItem { image: suite.cases[i].image.clone(), target: probe.host.clone(), expected: 7 })
+    }
+    .Ok(sentinel_execs)
+}
+
+fn cache_symlink_verify_rejections(probe: &mut Probe, suite: &SymlinkSuite, rej_outs: &[]process.Output) -> bool {
+    sentinel_execs := match cache_symlink_verify_rejections_collect(&mut probe, &suite, &rej_outs) {
+        .Ok(items) => items,
+        .Err(e) => { return harness.fail(e) },
+    }
+    execute_batch(&mut probe, &sentinel_execs)
+}
+
+fn cache_symlink_contracts(probe: &mut Probe) -> bool {
+    mut suite := match prepare_cache_symlink_suite(&mut probe) {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    mut phase1: []BatchCmd = [
+        cli_cmd_default(&probe, suite.sentinel_dir, ["build", "--jobs", "1", "-o", suite.sentinel_image.clone()]),
+    ]
+    for c in &suite.cases {
+        if c.warm {
+            keys: []string = ["DUNDER_HOME"]
+            vals: []string = [c.home.clone()]
+            phase1.push(cli_cmd(&probe, c.proj, ["build", "--jobs", "1", "-o", c.image.clone()], &keys, &vals))
+        }
+    }
+    probe.commands += phase1.len
+    outs1 := exec_probe_batch(&mut probe, &phase1)
+    mut warm_outs: []process.Output = []
+    for i in 1..outs1.len { warm_outs.push(outs1[i].clone()) }
+    rej_cmds := match cache_symlink_stage_and_build_reject_cmds(&mut probe, &mut suite, &warm_outs, &outs1[0]) {
+        .Ok(c) => c,
+        .Err(e) => { return harness.fail(e) },
+    }
+    probe.commands += rej_cmds.len
+    rej_outs := exec_probe_batch(&mut probe, &rej_cmds)
+    cache_symlink_verify_rejections(&mut probe, &suite, &rej_outs)
+}
+
+struct MalformedBatch {
+    cmds: []BatchCmd,
+    snaps: []RejectSnap,
+}
+
+fn prepare_malformed_batch(probe: &Probe, kit_url: string) -> Result<MalformedBatch, string> {
+    if !ensure_helper_packages(&probe) { return .Err("cannot prepare helper packages for malformed batch") }
+    sentinel_bytes := bytes.from_text("previous valid image")
+    mut cmds: []BatchCmd = []
+    mut snaps: []RejectSnap = []
+
+    for idx in 0..18 {
+        proj := probe.work + "/projects/malformed consumer " + idx.str()
+        local := relpath(probe.work + "/inline path with spaces", proj)
+        value := if idx == 0 { toml_table(&[("git", "")]) }
+            else if idx == 1 { toml_table(&[("git", kit_url.clone()), ("branch", "main"), ("tag", "v1")]) }
+            else if idx == 2 { toml_table(&[("git", kit_url.clone()), ("rev", "")]) }
+            else if idx == 3 { toml_table(&[("git", kit_url.clone()), ("path", local.clone())]) }
+            else if idx == 4 { toml_table(&[("branch", "main")]) }
+            else if idx == 5 { toml_table(&[("git", kit_url.clone()), ("unexpected", "value")]) }
+            else if idx == 6 { "{ git = 42 }" }
+            else if idx == 7 { "{ git = " + json.quote(kit_url) }
+            else if idx == 8 { "{ git = " + json.quote(kit_url) + ", git = " + json.quote(kit_url) + " }" }
+            else if idx == 9 { toml_table(&[("path", "")]) }
+            else if idx == 10 { toml_table(&[("path", local.clone()), ("branch", "main")]) }
+            else if idx == 11 { toml_table(&[("path", local.clone()), ("subdir", "packages/http")]) }
+            else if idx == 12 { toml_table(&[("git", kit_url.clone()), ("subdir", "")]) }
+            else if idx == 13 { toml_table(&[("git", kit_url.clone()), ("subdir", "/abs")]) }
+            else if idx == 14 { toml_table(&[("git", kit_url.clone()), ("subdir", "../escape")]) }
+            else if idx == 15 { toml_table(&[("git", kit_url.clone()), ("subdir", "packages/../escape")]) }
+            else if idx == 16 { toml_table(&[("git", kit_url.clone()), ("subdir", ".")]) }
+            else { toml_table(&[("git", kit_url.clone()), ("subdir", "a//b")]) }
+
+        manifest := "name = \"consumer\"\nroot = \"src/main.ddr\"\n[dependencies]\nkit = " + value + "\n"
+        if !write_text_file(proj + "/src/main.ddr", "fn main() { print(42) }\n") ||
+           !write_text_file(proj + "/dunder.toml", manifest) {
+            return .Err("cannot write malformed case " + idx.str())
+        }
+        if idx < 4 {
+            image := proj + "/malformed-sentinel"
+            if !write_bytes_file(image, &sentinel_bytes) {
+                return .Err("cannot write malformed sentinel " + idx.str())
+            }
+            snaps.push(capture_reject_snap(proj, image, ["dunder.toml"], "malformed-" + idx.str())?)
+            cmds.push(cli_cmd_default(&probe, proj, ["build", "-o", image]))
+        } else {
+            snaps.push(capture_reject_snap(proj, "", ["dunder.toml"], "malformed-" + idx.str())?)
+            cmds.push(cli_cmd_default(&probe, proj, ["check"]))
+        }
+    }
+    .Ok(MalformedBatch { cmds: cmds, snaps: snaps })
+}
+
+struct IsolatedGraphReject {
+    snap: RejectSnap,
+    cmd: BatchCmd,
+}
+
+fn prepare_isolated_graph_reject(probe: &Probe, dir_name: string, lock_bytes: &[]u8, source: string, move words: []string, home_override: string, label: string) -> Result<IsolatedGraphReject, string> {
+    proj := probe.work + "/projects/" + dir_name
+    if !write_bytes_file(proj + "/dunder.lock", &lock_bytes) ||
+       !write_text_file(proj + "/dunder.toml", "name = \"consumer\"\nroot = \"src/main.ddr\"\n[dependencies]\n" + source + "\n") ||
+       !write_text_file(proj + "/src/main.ddr", "fn main() { print(42) }\n") {
+        return .Err("cannot stage isolated graph rejection " + label)
+    }
+    image := proj + "/graph-sentinel"
+    sentinel := bytes.from_text("previous valid image")
+    if !write_bytes_file(image, &sentinel) {
+        return .Err("cannot write graph-sentinel for " + label)
+    }
+    snap := capture_reject_snap(proj, image, move words, label)?
+    cmd := if home_override.len > 0 {
+        keys: []string = ["DUNDER_HOME"]
+        vals: []string = [home_override.clone()]
+        cli_cmd(&probe, proj, ["build", "-o", image], &keys, &vals)
+    } else {
+        cli_cmd_default(&probe, proj, ["build", "-o", image])
+    }
+    .Ok(IsolatedGraphReject { snap: snap, cmd: cmd })
+}
+
+fn hidden_edit_one(probe: &mut Probe, proj: string, checkout: string, relative: string, source: string, before: &[]u8, mode: u32, image: string, flag: string, undo: string) -> bool {
+    if git_run(&mut probe, ["-C", checkout.clone(), "update-index", flag.clone(), "--", relative.clone()], 0).is_err() {
+        return false
+    }
+    defer {
+        _ := git_run(&mut probe, ["-C", checkout.clone(), "update-index", undo.clone(), "--", relative.clone()], 0)
+        _ := sys.write_u8(source, &before)
+        _ := fs.chmod(source, mode)
+    }
+    if fs.chmod(source, mode.bit_or(u32(128))).is_err() {
+        return harness.fail("chmod writable failed on " + source)
+    }
+    before_txt := bytes.decode(&before).value
+    edited := bytes.from_text(text.replace(before_txt, "+ 21", "+ 91"))
+    if !write_bytes_file(source, &edited) { return false }
+    st := match git_run(&mut probe, ["-C", checkout.clone(), "status", "--porcelain"], 0) {
+        .Ok(r) => r,
+        .Err(_) => { return false },
+    }
+    if st.stdout_text() != "" {
+        return harness.fail("expected clean git status under " + flag + ", got " + st.stdout_text())
+    }
+    reject_one(&mut probe, proj, ["build", "--offline", "--locked", "-o", image.clone()], [], image)
+}
+
+fn hidden_edit_contracts(probe: &mut Probe, proj: string, commit: string) -> bool {
+    checkout := match checkout_for(&mut probe, proj, commit, "") {
+        .Ok(c) => c,
+        .Err(e) => { return harness.fail(e) },
+    }
+    relative := "src/api.ddr"
+    source := checkout + "/" + relative
+    raw := sys.read_u8(source)
+    meta := fs.metadata(source)
+    if !raw.ok || meta.is_err() {
+        return harness.fail("cannot inspect checkout source " + source)
+    }
+    before := raw.value
+    mode := meta.unwrap().mode.bit_and(u32(511))
+    before_txt := bytes.decode(&before)
+    if !before_txt.ok || !text.contains(before_txt.value, "+ 21") {
+        return harness.fail("expected '+ 21' in " + source)
+    }
+    image := proj + "/hidden-edit-sentinel"
+    sentinel := bytes.from_text("previous valid image")
+    if !write_bytes_file(image, &sentinel) { return false }
+
+    pairs: [](string, string) = [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ]
+    for p in &pairs {
+        if !hidden_edit_one(&mut probe, proj, checkout, relative, source, &before, mode, image, p.0, p.1) {
+            return false
+        }
+        st := match git_run(&mut probe, ["-C", checkout.clone(), "status", "--porcelain"], 0) {
+            .Ok(r) => r,
+            .Err(_) => { return false },
+        }
+        if st.stdout_text() != "" {
+            return harness.fail("checkout remained dirty after restoring " + p.0)
+        }
+    }
+    true
+}
+
+fn shared_dunder_home_contracts(probe: &mut Probe, kit: &Repo, leaf: &Repo, expected: i32, lock_bytes: &[]u8) -> bool {
+    shared_proj := match create_project(&probe, "shared dunder_home consumer", toml_table(&[("git", kit.url.clone()), ("branch", "main")]), expected, true) {
+        .Ok(p) => p,
+        .Err(e) => { return harness.fail(e) },
+    }
+    if !write_bytes_file(shared_proj + "/dunder.lock", &lock_bytes) { return false }
+    mut moved: [](string, string) = []
+    defer { restore_renamed_origins(&moved) }
+    origins: []string = [kit.origin.clone(), leaf.origin.clone()]
+    for origin in &origins {
+        hidden := origin + ".shared-offline"
+        if !sys.rename(origin, hidden).ok {
+            return harness.fail("cannot hide origin for shared_dunder_home: " + origin)
+        }
+        moved.push((hidden, origin.clone()))
+    }
+    ran := match cli_run(&mut probe, shared_proj, ["run", "--offline", "--locked", "-o", shared_proj + "/shared-image"], 0) {
+        .Ok(r) => r,
+        .Err(_) => { return false },
+    }
+    if ran.stdout_text() != expected.str() + "\n" || ran.stderr_text() != "" {
+        return harness.fail("shared_dunder_home unexpected output: " + ran.stdout_text() + " / " + ran.stderr_text())
+    }
+    if path_exists(shared_proj + "/build/.dunder/git") {
+        return harness.fail("shared_dunder_home created project-local git cache")
+    }
+    true
+}
+
+fn start_embedded_contracts(probe: &mut Probe) -> bool {
+    spec := cli_cmd_default(&probe, probe.root, [
+        "test",
+        probe.root + "/selfhost/driver/dependencies.ddr",
+        "--jobs",
+        "1",
+        "-o",
+        probe.work + "/dependency-unit-tests",
+    ])
+    cmd := build_process_cmd(&spec)
+    sp := cmd.spawn()
+    if sp.is_err() {
+        return harness.fail("failed spawning embedded dependency unit tests")
+    }
+    mut child := sp.unwrap()
+    slot := probe.bg.set.insert(&mut child)
+    assert(slot >= 0)
+    probe.bg.started = true
+    probe.bg.done = false
+    probe.bg.start_ms = sys.now_ms()
+    probe.bg.slot = slot
+    true
+}
+
+fn verify_embedded_contracts(probe: &mut Probe) -> bool {
+    if !probe.bg.started { return true }
+    res := wait_bg_unit(&mut probe.bg)
+    probe.commands += 1
+    if !check_status(&res, 0, "embedded dependency unit tests") { return false }
+    if res.stderr_text() != "" {
+        return harness.fail("embedded dependency unit tests wrote stderr: " + res.stderr_text())
+    }
+    out := res.stdout_text()
+    suffix := " passed, 0 failed\n"
+    if !text.ends_with(out, suffix) {
+        return harness.fail("embedded unit tests missing summary line:\n" + out)
+    }
+    end_digits := out.len - suffix.len
+    mut start_digits := end_digits
+    while start_digits > 0 && out[start_digits - 1] >= b'0' && out[start_digits - 1] <= b'9' {
+        start_digits -= 1
+    }
+    if start_digits >= end_digits {
+        return harness.fail("embedded unit tests missing pass count:\n" + out)
+    }
+    parsed := parse.integer(out[start_digits..end_digits])
+    if !parsed.ok || parsed.value <= 0 {
+        return harness.fail("embedded unit tests pass count must be > 0:\n" + out)
+    }
+    groups: []string = [
+        "dependency_paths_keep_relative_and_absolute_roots",
+        "malformed_dependency_tables_never_publish_a_partial_row",
+        "git_lock_round_trips_selectors_quoted_urls_and_exact_commits",
+        "git_lock_rejects_ambiguous_records_without_changing_pins",
+    ]
+    for g in &groups {
+        if !text.contains(out, "::" + g) {
+            return harness.fail("embedded unit tests missing group " + g)
+        }
+    }
+    true
+}
+
+struct SelectorRow {
+    name: string,
+    proj: string,
+    kind: string,
+    reference: string,
+    commit: string,
+    answer: i32,
+    lock_bytes: []u8,
+}
+
+fn run_full_suite(probe: &mut Probe, skip_unit_tests: bool) -> bool {
+    if !skip_unit_tests {
+        if !start_embedded_contracts(&mut probe) { return false }
+    }
+
+    // Wave 0: Probe SHA256 support + create ALL 13 (or 14) repos in ONE parallel batch!
+    sha_probe_spec := make_cmd(&probe, "git", ["init", "--bare", "--object-format=sha256", probe.work + "/sha256 capability probe"], probe.work, &[], &[], 30000)
+    sha_probe_cmd := build_process_cmd(&sha_probe_spec)
+    sha_probe := sha_probe_cmd.exec()
+    sha256_supported := sha_probe.succeeded()
+    if !sha256_supported {
+        err_txt := sha_probe.stderr_text()
+        if !text.contains(err_txt, "sha256") && !text.contains(err_txt, "object-format") {
+            return harness.fail("unexpected sha256 git probe failure: " + err_txt)
+        }
+        print("SKIP SHA256-origin contract: installed Git does not support SHA256 repositories")
+    }
+
+    if !ensure_helper_packages(&probe) { return harness.fail("cannot create helper packages") }
+    mono_outside := probe.work + "/monorepo outside"
+    graph_outside := probe.work + "/outside checkout"
+    if !write_text_file(mono_outside + "/dunder.toml", "root = \"api.ddr\"\n") ||
+       !write_text_file(mono_outside + "/api.ddr", "pub fn value() -> i32 { 99 }\n") ||
+       !write_text_file(graph_outside + "/dunder.toml", "root = \"api.ddr\"\n") ||
+       !write_text_file(graph_outside + "/api.ddr", "pub fn answer() -> i32 { 42 }\n") {
+        return false
+    }
+
+    leaf_url := file_uri(probe.work + "/bare origins/leaf library.git")
+    origin_a_url := file_uri(probe.work + "/bare origins/cycle a.git")
+    origin_b_url := file_uri(probe.work + "/bare origins/cycle b.git")
+    diff_url := file_uri(probe.work + "/bare origins/different shared.git")
+    marker := probe.work + "/dependency build script ran"
+    kit_api_v1 := "import leaf\nimport inside\npub fn answer() -> i32 { leaf.value() + inside.offset() + 20 }\n"
+
+    mut all_specs: []RepoSpec = [
+        // 0: leaf library
+        RepoSpec {
+            name: "leaf library",
+            files: [("dunder.toml", "root = \"api.ddr\"\n"), ("api.ddr", "pub fn value() -> i32 { 10 }\n")],
+            links: [], object_format: "",
+        },
+        // 1: kit library
+        RepoSpec {
+            name: "kit library",
+            files: [
+                ("dunder.toml", "root = \"src/api.ddr\"\n[dependencies]\nleaf = " +
+                    toml_table(&[("git", leaf_url.clone()), ("branch", "main")]) +
+                    "\ninside = " + toml_table(&[("path", "vendor/path helper")]) + "\n"),
+                ("src/api.ddr", kit_api_v1.clone()),
+                ("src/detail.ddr", "pub fn offset() -> i32 { 2 }\n"),
+                ("vendor/path helper/dunder.toml", "root = \"api.ddr\"\n"),
+                ("vendor/path helper/api.ddr", "pub fn offset() -> i32 { 12 }\n"),
+                ("build.sh", "#!/bin/sh\nprintf unexpected > " + sh_quote(marker) + "\n"),
+            ],
+            links: [], object_format: "",
+        },
+        // 2: cache confinement
+        RepoSpec {
+            name: "cache confinement",
+            files: [("dunder.toml", "root = \"api.ddr\"\n"), ("api.ddr", "pub fn answer() -> i32 { 42 }\n")],
+            links: [], object_format: "",
+        },
+        // 3: hidden revision
+        RepoSpec {
+            name: "hidden revision",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n"),
+                ("api.ddr", "pub fn answer() -> i32 { 42 }\n"),
+                ("detail.ddr", "pub fn offset() -> i32 { 2 }\n"),
+            ],
+            links: [], object_format: "",
+        },
+        // 4: monorepo
+        RepoSpec {
+            name: "monorepo",
+            files: [
+                ("README.md", "monorepo root\n"),
+                ("packages/common/dunder.toml", "name = \"common\"\nroot = \"src/lib.ddr\"\n"),
+                ("packages/common/src/lib.ddr", "pub fn base() -> i32 { 10 }\n"),
+                ("packages/server/dunder.toml", "name = \"server\"\nroot = \"src/server.ddr\"\n[dependencies]\ncommon = \"../common\"\n"),
+                ("packages/server/src/server.ddr", "import common\npub fn port_offset() -> i32 { common.base() + 20 }\n"),
+                ("packages/client/dunder.toml", "name = \"client\"\nroot = \"src/client.ddr\"\n[dependencies]\ncommon = \"../common\"\n"),
+                ("packages/client/src/client.ddr", "import common\npub fn client_offset() -> i32 { common.base() + 2 }\n"),
+                ("packages/bad_rel/dunder.toml", "root = \"api.ddr\"\n[dependencies]\nout = " + toml_table(&[("path", "vendor/linked")]) + "\n"),
+                ("packages/bad_rel/api.ddr", "pub fn x() -> i32 { 1 }\n"),
+            ],
+            links: [
+                ("packages/escaped_sub", mono_outside.clone()),
+                ("packages/bad_rel/vendor/linked", mono_outside.clone()),
+            ],
+            object_format: "",
+        },
+        // 5: cycle a
+        RepoSpec {
+            name: "cycle a",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n[dependencies]\nb = " + toml_table(&[("git", origin_b_url)]) + "\n"),
+                ("api.ddr", "pub fn value() -> i32 { 1 }\n"),
+            ],
+            links: [], object_format: "",
+        },
+        // 6: cycle b
+        RepoSpec {
+            name: "cycle b",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n[dependencies]\na = " + toml_table(&[("git", origin_a_url)]) + "\n"),
+                ("api.ddr", "pub fn value() -> i32 { 2 }\n"),
+            ],
+            links: [], object_format: "",
+        },
+        // 7: different shared
+        RepoSpec {
+            name: "different shared",
+            files: [("dunder.toml", "root = \"api.ddr\"\n"), ("api.ddr", "pub fn value() -> i32 { 99 }\n")],
+            links: [], object_format: "",
+        },
+        // 8: left
+        RepoSpec {
+            name: "left",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n[dependencies]\nshared = " + toml_table(&[("git", leaf_url.clone())]) + "\n"),
+                ("api.ddr", "import shared\npub fn value() -> i32 { shared.value() + 1 }\n"),
+            ],
+            links: [], object_format: "",
+        },
+        // 9: right
+        RepoSpec {
+            name: "right",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n[dependencies]\nshared = " + toml_table(&[("git", diff_url)]) + "\n"),
+                ("api.ddr", "import shared\npub fn value() -> i32 { shared.value() + 2 }\n"),
+            ],
+            links: [], object_format: "",
+        },
+        // 10: missing root
+        RepoSpec {
+            name: "missing root",
+            files: [("dunder.toml", "name = \"broken\"\n"), ("api.ddr", "pub fn value() -> i32 { 1 }\n")],
+            links: [], object_format: "",
+        },
+        // 11: escaping root
+        RepoSpec {
+            name: "escaping root",
+            files: [("dunder.toml", "root = \"src/link.ddr\"\n")],
+            links: [("src/link.ddr", graph_outside + "/api.ddr")],
+            object_format: "",
+        },
+        // 12: escaping path
+        RepoSpec {
+            name: "escaping path",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n[dependencies]\nexternal = " + toml_table(&[("path", "vendor/linked")]) + "\n"),
+                ("api.ddr", "import external\npub fn answer() -> i32 { external.answer() }\n"),
+            ],
+            links: [("vendor/linked", graph_outside.clone())],
+            object_format: "",
+        },
+    ]
+    if sha256_supported {
+        // 13: sha256 origin
+        all_specs.push(RepoSpec {
+            name: "sha256 origin",
+            files: [
+                ("dunder.toml", "root = \"api.ddr\"\n"),
+                ("api.ddr", "pub fn answer() -> i32 { 42 }\n"),
+                ("detail.ddr", "pub fn offset() -> i32 { 2 }\n"),
+            ],
+            links: [], object_format: "sha256",
+        })
+    }
+
+    all_repos := match create_repos_batch(&mut probe, &all_specs) {
+        .Ok(rs) => rs,
+        .Err(e) => { return harness.fail(e) },
+    }
+    mut leaf := all_repos[0].clone()
+    mut kit := all_repos[1].clone()
+    cache_conf_repo := all_repos[2].clone()
+    hidden_repo := all_repos[3].clone()
+    mono_repo := all_repos[4].clone()
+    cycle_a := all_repos[5].clone()
+    left_repo := all_repos[8].clone()
+    right_repo := all_repos[9].clone()
+    missing_root := all_repos[10].clone()
+    root_link := all_repos[11].clone()
+    path_link := all_repos[12].clone()
+
+    leaf_v1 := leaf.head_commit.clone()
+    kit_v1 := kit.head_commit.clone()
+    mono_commit := mono_repo.head_commit.clone()
+
+    // Interleave kit (tag v1, branch feature/next, push) & hidden_repo (PR commit, push refs/pull/7/head) in parallel git rounds!
+    if !write_text_file(hidden_repo.author + "/api.ddr", "pub fn answer() -> i32 { 52 }\n") { return false }
+    g1 := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["-C", kit.author.clone(), "tag", "v1"]),
+        git_cmd(&probe, ["-C", hidden_repo.author.clone(), "add", "--all"]),
+    ])
+    if !check_status(&g1[0], 0, "kit tag v1") || !check_status(&g1[1], 0, "hidden add") { return false }
+
+    g2 := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["-C", kit.author.clone(), "push", kit.origin.clone(), "refs/tags/v1"]),
+        git_cmd(&probe, ["-C", hidden_repo.author.clone(), "commit", "--quiet", "-m", "PR revision"]),
+    ])
+    if !check_status(&g2[0], 0, "kit push v1") || !check_status(&g2[1], 0, "hidden commit") { return false }
+
+    g3 := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["-C", kit.author.clone(), "checkout", "--quiet", "-b", "feature/next"]),
+        git_cmd(&probe, ["-C", hidden_repo.author.clone(), "rev-parse", "HEAD"]),
+        git_cmd(&probe, ["-C", hidden_repo.author.clone(), "push", hidden_repo.origin.clone(), "HEAD:refs/pull/7/head"]),
+    ])
+    if !check_status(&g3[0], 0, "kit checkout feature") ||
+       !check_status(&g3[1], 0, "hidden rev-parse") ||
+       !check_status(&g3[2], 0, "hidden push pull") {
+        return false
+    }
+    hidden_commit := text.trim(g3[1].stdout_text())
+
+    if !write_text_file(kit.author + "/src/api.ddr", text.replace(kit_api_v1, "+ 20", "+ 30")) { return false }
+    if git_run(&mut probe, ["-C", kit.author.clone(), "add", "--all"], 0).is_err() ||
+       git_run(&mut probe, ["-C", kit.author.clone(), "commit", "--quiet", "-m", "feature branch"], 0).is_err() {
+        return false
+    }
+    g4 := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["-C", kit.author.clone(), "rev-parse", "HEAD"]),
+        git_cmd(&probe, ["-C", kit.author.clone(), "push", kit.origin.clone(), "HEAD:refs/heads/feature/next"]),
+    ])
+    if !check_status(&g4[0], 0, "kit feature rev-parse") || !check_status(&g4[1], 0, "kit feature push") { return false }
+    feature := text.trim(g4[0].stdout_text())
+
+    alternate := probe.work + "/bare origins/alternate kit.git"
+    g5 := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["-C", kit.author.clone(), "checkout", "--quiet", "main"]),
+        git_cmd(&probe, ["clone", "--bare", kit.origin.clone(), alternate.clone()]),
+    ])
+    if !check_status(&g5[0], 0, "kit checkout main") || !check_status(&g5[1], 0, "clone alternate kit") { return false }
+
+    // Prepare Wave 1A projects
+    main_path := match create_project(&probe, "consumer with spaces", toml_table(&[("git", kit.url.clone()), ("branch", "main")]), 47, true) {
+        .Ok(p) => p,
+        .Err(e) => { return harness.fail(e) },
+    }
+    main_sentinel := main_path + "/sentinel"
+    prev_image_bytes := bytes.from_text("previous valid image")
+    if !write_bytes_file(main_sentinel, &prev_image_bytes) { return false }
+
+    local_proj := probe.work + "/local only project"
+    local_home := probe.work + "/local-only-dunder-home"
+    empty_path := probe.work + "/no external programs"
+    if !write_text_file(local_proj + "/dunder.toml", "name = \"plain\"\nroot = \"main.ddr\"\n") ||
+       !write_text_file(local_proj + "/main.ddr", "fn main() { print(42) }\n") ||
+       !fs.mkdir_all(empty_path).ok {
+        return harness.fail("cannot prepare local_only_contract")
+    }
+    local_image := local_proj + "/plain"
+    local_env_keys: []string = ["PATH", "DUNDER_HOME"]
+    local_env_vals: []string = [empty_path.clone(), local_home.clone()]
+
+    mut sym_suite := match prepare_cache_symlink_suite_with_repo(&probe, move cache_conf_repo) {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    malformed := match prepare_malformed_batch(&probe, kit.url) {
+        .Ok(m) => m,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    pull_home := probe.work + "/pull-dunder-home"
+    pull_keys: []string = ["DUNDER_HOME"]
+    pull_vals: []string = [pull_home.clone()]
+    pull_proj := match create_project(&probe, "pull reference consumer", toml_table(&[("git", hidden_repo.url.clone()), ("rev", "refs/pull/7/head")]), 57, true) {
+        .Ok(p) => p,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    subdir_home := probe.work + "/subdir-dunder-home"
+    subdir_keys: []string = ["DUNDER_HOME"]
+    subdir_vals: []string = [subdir_home.clone()]
+    mono_app := probe.work + "/projects/monorepo consumer"
+    mono_manifest := "name = \"mono-app\"\nroot = \"src/main.ddr\"\ntest_root = \"tests/suite.ddr\"\n[dependencies]\n" +
+        "server = " + toml_table(&[("git", mono_repo.url.clone()), ("branch", "main"), ("subdir", "packages/server/")]) + "\n" +
+        "client = " + toml_table(&[("git", mono_repo.url.clone()), ("branch", "main"), ("subdir", "packages/client")]) + "\n"
+    if !write_text_file(mono_app + "/dunder.toml", mono_manifest) ||
+       !write_text_file(mono_app + "/src/main.ddr", "import server\nimport client\nfn main() { print(server.port_offset() + client.client_offset()) }\n") ||
+       !write_text_file(mono_app + "/tests/suite.ddr", "import server\nimport client\n@test fn ok() { assert(server.port_offset() + client.client_offset() == 42) }\n") {
+        return false
+    }
+
+    sha_home := probe.work + "/sha256-dunder-home"
+    sha_keys: []string = ["DUNDER_HOME"]
+    sha_vals: []string = [sha_home.clone()]
+    mut sha_proj := ""
+    mut sha_url := ""
+    mut sha_commit := ""
+    if sha256_supported {
+        sha_repo := &all_repos[13]
+        sha_url = sha_repo.url.clone()
+        sha_commit = sha_repo.head_commit.clone()
+        if sha_commit.len != 64 {
+            return harness.fail("expected 64-char sha256 commit, got " + sha_commit)
+        }
+        sha_proj = match create_project(&probe, "sha256 consumer", toml_table(&[("git", sha_url.clone())]), 47, true) {
+            .Ok(p) => p,
+            .Err(e) => { return harness.fail(e) },
+        }
+    }
+
+    snap_locked := match capture_reject_snap(main_path, main_sentinel, ["locked"], "initial --locked") {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    snap_offline := match capture_reject_snap(main_path, main_sentinel, ["offline"], "initial --offline") {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    // Wave 1A: initial locked/offline rejects + local_only + cache_symlink (sentinel + 4 warm) + pull + mono + sha256 + 18 malformed
+    mut wave1a: []BatchCmd = [
+        cli_cmd_default(&probe, main_path, ["build", "--locked", "-o", main_sentinel.clone()]),
+        cli_cmd_default(&probe, main_path, ["build", "--offline", "-o", main_sentinel.clone()]),
+        cli_cmd(&probe, local_proj, ["check", "--offline", "--locked"], &local_env_keys, &local_env_vals),
+        cli_cmd(&probe, local_proj, ["build", "--offline", "--locked", "-o", local_image.clone()], &local_env_keys, &local_env_vals),
+        cli_cmd_default(&probe, sym_suite.sentinel_dir, ["build", "--jobs", "1", "-o", sym_suite.sentinel_image.clone()]),
+    ]
+    for c in &sym_suite.cases {
+        if c.warm {
+            keys: []string = ["DUNDER_HOME"]
+            vals: []string = [c.home.clone()]
+            wave1a.push(cli_cmd(&probe, c.proj, ["build", "--jobs", "1", "-o", c.image.clone()], &keys, &vals))
+        }
+    }
+    // indices 9, 10
+    wave1a.push(cli_cmd(&probe, pull_proj, ["run", "-o", pull_proj + "/pull-image"], &pull_keys, &pull_vals))
+    wave1a.push(cli_cmd(&probe, mono_app, ["run", "-o", mono_app + "/mono-image"], &subdir_keys, &subdir_vals))
+    malformed_offset := wave1a.len
+    for mc in &malformed.cmds { wave1a.push(mc.clone()) }
+    sha_idx := wave1a.len
+    if sha256_supported {
+        wave1a.push(cli_cmd(&probe, sha_proj, ["run", "-o", sha_proj + "/sha256-image"], &sha_keys, &sha_vals))
+    }
+
+    probe.commands += wave1a.len
+    outs1a := exec_probe_batch(&mut probe, &wave1a)
+
+    if !verify_reject_snap(&mut probe, &snap_locked, &outs1a[0]) { return false }
+    if !verify_reject_snap(&mut probe, &snap_offline, &outs1a[1]) { return false }
+    if !check_status(&outs1a[2], 0, "local_only check") { return false }
+    if !check_status(&outs1a[3], 0, "local_only build") { return false }
+    host := probe.host.clone()
+    if !execute_one(&mut probe, local_image, host, 42) { return false }
+    if path_exists(local_proj + "/build/.dunder/git") || path_exists(local_home) {
+        return harness.fail("local_only_contract created git cache or DUNDER_HOME")
+    }
+    cfg_check := sys.read_u8(probe.git_config)
+    if !cfg_check.ok || !bytes.equal(&cfg_check.value, &probe.git_config_bytes) {
+        return harness.fail("local_only_contract modified git config")
+    }
+
+    for i in 0..malformed.snaps.len {
+        if !verify_reject_snap(&mut probe, &malformed.snaps[i], &outs1a[malformed_offset + i]) {
+            return false
+        }
+    }
+
+    // Verify pull_proj, mono_app, sha_proj
+    if !check_status(&outs1a[9], 0, "pull reference run") ||
+       outs1a[9].stdout_text() != "57\n" || outs1a[9].stderr_text() != "" {
+        return harness.fail("pull reference unexpected output: " + outs1a[9].stdout_text())
+    }
+    if check_pins(pull_proj, &[Pin { url: hidden_repo.url.clone(), kind: "rev", reference: "refs/pull/7/head", commit: hidden_commit.clone() }]).is_err() {
+        return harness.fail("pull reference pins mismatch")
+    }
+    if !check_checkouts(&mut probe, pull_proj, &[hidden_commit.clone()], pull_home + "/git") { return false }
+
+    if !check_status(&outs1a[10], 0, "monorepo run") ||
+       outs1a[10].stdout_text() != "42\n" || outs1a[10].stderr_text() != "" {
+        return harness.fail("monorepo unexpected output: " + outs1a[10].stdout_text())
+    }
+    mono_lock_bytes := match check_pins(mono_app, &[Pin { url: mono_repo.url.clone(), kind: "branch", reference: "main", commit: mono_commit.clone() }]) {
+        .Ok(b) => b,
+        .Err(e) => { return harness.fail(e) },
+    }
+    if !check_checkouts(&mut probe, mono_app, &[mono_commit.clone()], subdir_home + "/git") { return false }
+
+    if sha256_supported {
+        if !check_status(&outs1a[sha_idx], 0, "sha256 run") ||
+           outs1a[sha_idx].stdout_text() != "47\n" || outs1a[sha_idx].stderr_text() != "" {
+            return harness.fail("sha256 consumer unexpected output: " + outs1a[sha_idx].stdout_text())
+        }
+        if check_pins(sha_proj, &[Pin { url: sha_url.clone(), kind: "head", reference: "", commit: sha_commit.clone() }]).is_err() {
+            return harness.fail("sha256 consumer pins mismatch")
+        }
+        if !check_checkouts(&mut probe, sha_proj, &[sha_commit.clone()], sha_home + "/git") { return false }
+    }
+
+    // Prepare hidden_revision Phase 2 (unadvertised SHA-1) in parallel git calls
+    gh_prep := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["--git-dir", hidden_repo.origin.clone(), "update-ref", "-d", "refs/pull/7/head"]),
+        git_cmd(&probe, ["--git-dir", hidden_repo.origin.clone(), "config", "uploadpack.allowAnySHA1InWant", "true"]),
+        git_cmd(&probe, ["--git-dir", hidden_repo.origin.clone(), "cat-file", "-t", hidden_commit.clone()]),
+    ])
+    if !check_status(&gh_prep[0], 0, "delete refs/pull/7/head") ||
+       !check_status(&gh_prep[1], 0, "allowAnySHA1InWant") ||
+       !check_status(&gh_prep[2], 0, "cat-file hidden commit") ||
+       text.trim(gh_prep[2].stdout_text()) != "commit" {
+        return harness.fail("hidden revision phase 2 prep failed")
+    }
+    rev_home := probe.work + "/unadvertised-dunder-home"
+    rev_keys: []string = ["DUNDER_HOME"]
+    rev_vals: []string = [rev_home.clone()]
+    rev_proj := match create_project(&probe, "unadvertised revision consumer", toml_table(&[("git", hidden_repo.url.clone()), ("rev", hidden_commit.clone())]), 57, true) {
+        .Ok(p) => p,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    // Stage cache_symlink warm executions & symlinks
+    mut warm_outs: []process.Output = []
+    for i in 5..9 { warm_outs.push(outs1a[i].clone()) }
+    sym_rej_cmds := match cache_symlink_stage_and_build_reject_cmds(&mut probe, &mut sym_suite, &warm_outs, &outs1a[4]) {
+        .Ok(c) => c,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    // Wave 2A: main_path matrix target 0 (populates probe.cache & dunder.lock) + 8 cache_symlink rejects + unadvertised rev run + monorepo offline run
+    targets := harness.targets()
+    img_t0 := main_path + "/image-" + targets[0]
+    mut wave2a: []BatchCmd = [
+        cli_cmd_default(&probe, main_path, ["build", "--target", targets[0].clone(), "--jobs", "1", "-o", img_t0.clone()]),
+        cli_cmd(&probe, rev_proj, ["run", "-o", rev_proj + "/revision-image"], &rev_keys, &rev_vals),
+        cli_cmd(&probe, mono_app, ["run", "--offline", "--locked", "-o", mono_app + "/mono-offline"], &subdir_keys, &subdir_vals),
+    ]
+    sym_rej_offset := wave2a.len
+    for rc in &sym_rej_cmds { wave2a.push(rc.clone()) }
+    probe.commands += wave2a.len
+    outs2a := exec_probe_batch(&mut probe, &wave2a)
+
+    if !check_status(&outs2a[0], 0, "matrix " + targets[0]) { return false }
+    if !check_status(&outs2a[1], 0, "unadvertised revision run") ||
+       outs2a[1].stdout_text() != "57\n" || outs2a[1].stderr_text() != "" {
+        return harness.fail("unadvertised revision unexpected output: " + outs2a[1].stdout_text())
+    }
+    if check_pins(rev_proj, &[Pin { url: hidden_repo.url.clone(), kind: "rev", reference: hidden_commit.clone(), commit: hidden_commit.clone() }]).is_err() {
+        return harness.fail("unadvertised revision pins mismatch")
+    }
+    if !check_checkouts(&mut probe, rev_proj, &[hidden_commit.clone()], rev_home + "/git") { return false }
+
+    if !check_status(&outs2a[2], 0, "monorepo offline run") ||
+       outs2a[2].stdout_text() != "42\n" || outs2a[2].stderr_text() != "" {
+        return harness.fail("monorepo offline unexpected output: " + outs2a[2].stdout_text())
+    }
+
+    mut sym_rej_outs: []process.Output = []
+    for i in sym_rej_offset..outs2a.len { sym_rej_outs.push(outs2a[i].clone()) }
+    sym_sentinel_execs := match cache_symlink_verify_rejections_collect(&mut probe, &sym_suite, &sym_rej_outs) {
+        .Ok(items) => items,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    // Wave 2B: remaining 2 matrix targets on warm cache + monorepo test
+    img_t1 := main_path + "/image-" + targets[1]
+    img_t2 := main_path + "/image-" + targets[2]
+    wave2b: []BatchCmd = [
+        cli_cmd_default(&probe, main_path, ["build", "--target", targets[1].clone(), "--jobs", "1", "-o", img_t1.clone()]),
+        cli_cmd_default(&probe, main_path, ["build", "--target", targets[2].clone(), "--jobs", "1", "-o", img_t2.clone()]),
+        cli_cmd(&probe, mono_app, ["test"], &subdir_keys, &subdir_vals),
+    ]
+    probe.commands += 3
+    outs2b := exec_probe_batch(&mut probe, &wave2b)
+    if !check_status(&outs2b[0], 0, "matrix " + targets[1]) ||
+       !check_status(&outs2b[1], 0, "matrix " + targets[2]) ||
+       !check_status(&outs2b[2], 0, "monorepo test") {
+        return false
+    }
+    if !text.contains(outs2b[2].stdout_text(), "1 passed, 0 failed") {
+        return harness.fail("monorepo test output mismatch: " + outs2b[2].stdout_text())
+    }
+
+    // Execute main matrix images + 8 cache symlink sentinel images in ONE batch!
+    mut all_w2_execs: []ExecItem = [
+        ExecItem { image: img_t0, target: targets[0].clone(), expected: 47 },
+        ExecItem { image: img_t1, target: targets[1].clone(), expected: 47 },
+        ExecItem { image: img_t2, target: targets[2].clone(), expected: 47 },
+    ]
+    for item in &sym_sentinel_execs { all_w2_execs.push(item.clone()) }
+    if !execute_batch(&mut probe, &all_w2_execs) { return false }
+
+    mut expected_pins: []Pin = [
+        Pin { url: kit.url.clone(), kind: "branch", reference: "main", commit: kit_v1.clone() },
+        Pin { url: leaf.url.clone(), kind: "branch", reference: "main", commit: leaf_v1.clone() },
+    ]
+    lock_bytes := match check_pins(main_path, &expected_pins) {
+        .Ok(b) => b,
+        .Err(e) => { return harness.fail(e) },
+    }
+    if !check_checkouts(&mut probe, main_path, &[kit_v1.clone(), leaf_v1.clone()], "") { return false }
+
+    // Wave 3: strictly synchronized cache-mutating checks (readonly_check & offline_contracts)
+    if !readonly_check(&mut probe, main_path, marker) { return false }
+    if !offline_contracts(&mut probe, main_path, &[kit.origin.clone(), leaf.origin.clone()], 47, &lock_bytes) {
+        return false
+    }
+
+    // Wave 4: 4 selectors + alternate kit URL rejection + 4 graph rejections + 3 subdir rejections (all in parallel!)
+    sel_names: []string = ["default head", "tag", "revision", "feature branch"]
+    sel_sources: []string = [
+        toml_table(&[("git", kit.url.clone())]),
+        toml_table(&[("git", kit.url.clone()), ("tag", "v1")]),
+        toml_table(&[("git", kit.url.clone()), ("rev", feature.clone())]),
+        toml_table(&[("git", kit.url.clone()), ("branch", "feature/next")]),
+    ]
+    sel_kinds: []string = ["head", "tag", "rev", "branch"]
+    sel_refs: []string = ["", "v1", feature.clone(), "feature/next"]
+    sel_commits: []string = [kit_v1.clone(), kit_v1.clone(), feature.clone(), feature.clone()]
+    sel_answers: []i32 = [47, 47, 57, 57]
+
+    mut selectors: []SelectorRow = []
+    mut wave4: []BatchCmd = []
+    for i in 0..4 {
+        p := match create_project(&probe, sel_names[i], sel_sources[i], sel_answers[i], true) {
+            .Ok(path_val) => path_val,
+            .Err(e) => { return harness.fail(e) },
+        }
+        selectors.push(SelectorRow {
+            name: sel_names[i].clone(),
+            proj: p.clone(),
+            kind: sel_kinds[i].clone(),
+            reference: sel_refs[i].clone(),
+            commit: sel_commits[i].clone(),
+            answer: sel_answers[i],
+            lock_bytes: [],
+        })
+        wave4.push(cli_cmd_default(&probe, p, ["build", "--target", host.clone(), "--jobs", "1", "-o", p + "/image-" + host]))
+    }
+
+    main_manifest_path := main_path + "/dunder.toml"
+    orig_main_manifest := sys.read_text(main_manifest_path)
+    if !orig_main_manifest.ok { return harness.fail("cannot read main manifest") }
+    if !write_text_file(main_manifest_path, text.replace(orig_main_manifest.value, kit.url, file_uri(alternate))) {
+        return false
+    }
+    snap_alt := match capture_reject_snap(main_path, main_sentinel, ["locked"], "alternate kit URL") {
+        .Ok(s) => s,
+        .Err(e) => {
+            _ := sys.write_text(main_manifest_path, orig_main_manifest.value)
+            return harness.fail(e)
+        },
+    }
+    wave4.push(cli_cmd_default(&probe, main_path, ["build", "--locked", "-o", main_sentinel.clone()]))
+
+    graph_path_home := probe.work + "/graph-path-dunder-home"
+    gr_cycle := match prepare_isolated_graph_reject(&probe, "graph-rej-cycle", &lock_bytes, "a = " + toml_table(&[("git", cycle_a.url.clone())]), ["dependency cycle"], probe.work + "/graph-cycle-home", "graph cycle") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    gr_missing := match prepare_isolated_graph_reject(&probe, "graph-rej-missing", &lock_bytes, "kit = " + toml_table(&[("git", missing_root.url.clone())]), ["root"], probe.work + "/graph-missing-home", "missing root") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    gr_root := match prepare_isolated_graph_reject(&probe, "graph-rej-root", &lock_bytes, "kit = " + toml_table(&[("git", root_link.url.clone())]), ["root"], probe.work + "/graph-root-home", "escaping root") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    gr_path := match prepare_isolated_graph_reject(&probe, "graph-rej-path", &lock_bytes, "kit = " + toml_table(&[("git", path_link.url.clone())]), ["dependency"], graph_path_home, "escaping path") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    sub_r1 := match prepare_isolated_graph_reject(&probe, "subdir-rej-missing", &mono_lock_bytes, "kit = " + toml_table(&[("git", mono_repo.url.clone()), ("branch", "main"), ("subdir", "packages/missing")]), ["directory not found"], subdir_home, "subdir missing") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    sub_r2 := match prepare_isolated_graph_reject(&probe, "subdir-rej-escaped", &mono_lock_bytes, "kit = " + toml_table(&[("git", mono_repo.url.clone()), ("branch", "main"), ("subdir", "packages/escaped_sub")]), ["escapes"], subdir_home, "subdir escaped") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    sub_r3 := match prepare_isolated_graph_reject(&probe, "subdir-rej-bad-rel", &mono_lock_bytes, "kit = " + toml_table(&[("git", mono_repo.url.clone()), ("branch", "main"), ("subdir", "packages/bad_rel")]), ["escapes"], subdir_home, "subdir bad_rel") {
+        .Ok(r) => r, .Err(e) => { _ := sys.write_text(main_manifest_path, orig_main_manifest.value); return harness.fail(e) },
+    }
+    wave4.push(gr_cycle.cmd.clone())
+    wave4.push(gr_missing.cmd.clone())
+    wave4.push(gr_root.cmd.clone())
+    wave4.push(gr_path.cmd.clone())
+    wave4.push(sub_r1.cmd.clone())
+    wave4.push(sub_r2.cmd.clone())
+    wave4.push(sub_r3.cmd.clone())
+
+    probe.commands += wave4.len
+    outs4 := exec_probe_batch(&mut probe, &wave4)
+    _ := sys.write_text(main_manifest_path, orig_main_manifest.value)
+
+    if !verify_reject_snap(&mut probe, &snap_alt, &outs4[4]) { return false }
+    if !verify_reject_snap(&mut probe, &gr_cycle.snap, &outs4[5]) { return false }
+    if !verify_reject_snap(&mut probe, &gr_missing.snap, &outs4[6]) { return false }
+    if !verify_reject_snap(&mut probe, &gr_root.snap, &outs4[7]) { return false }
+    if !verify_reject_snap(&mut probe, &gr_path.snap, &outs4[8]) { return false }
+    if !verify_reject_snap(&mut probe, &sub_r1.snap, &outs4[9]) { return false }
+    if !verify_reject_snap(&mut probe, &sub_r2.snap, &outs4[10]) { return false }
+    if !verify_reject_snap(&mut probe, &sub_r3.snap, &outs4[11]) { return false }
+
+    mut sel_execs: []ExecItem = []
+    for i in 0..4 {
+        if !check_status(&outs4[i], 0, "selector build " + selectors[i].name) { return false }
+        sel_execs.push(ExecItem {
+            image: selectors[i].proj + "/image-" + host,
+            target: host.clone(),
+            expected: selectors[i].answer,
+        })
+    }
+    if !execute_batch(&mut probe, &sel_execs) { return false }
+    for i in 0..4 {
+        sel_pins: []Pin = [
+            Pin { url: kit.url.clone(), kind: selectors[i].kind.clone(), reference: selectors[i].reference.clone(), commit: selectors[i].commit.clone() },
+            Pin { url: leaf.url.clone(), kind: "branch", reference: "main", commit: leaf_v1.clone() },
+        ]
+        lb := match check_pins(selectors[i].proj, &sel_pins) {
+            .Ok(b) => b,
+            .Err(e) => { return harness.fail(e) },
+        }
+        selectors[i].lock_bytes = lb
+        if path_exists(selectors[i].proj + "/build/.dunder/git") {
+            return harness.fail("unexpected project-local git cache under " + selectors[i].proj)
+        }
+    }
+    if !check_checkouts(&mut probe, selectors[0].proj, &[kit_v1.clone(), leaf_v1.clone(), feature.clone()], "") {
+        return false
+    }
+
+    // Prepare local boundary alias rejection using the immutable checkout left by gr_path
+    pl_checkout := match checkout_for(&mut probe, "graph-rej-path", path_link.head_commit, graph_path_home + "/git") {
+        .Ok(c) => c,
+        .Err(e) => { return harness.fail(e) },
+    }
+    alias_dir := probe.work + "/local boundary alias"
+    if !write_text_file(alias_dir + "/dunder.toml", "root = \"api.ddr\"\n[dependencies]\nkit = " + toml_table(&[("path", pl_checkout)]) + "\n") ||
+       !write_text_file(alias_dir + "/api.ddr", "pub fn value() -> i32 { 1 }\n") {
+        return false
+    }
+    gr_alias := match prepare_isolated_graph_reject(&probe, "graph-rej-alias", &lock_bytes, "a = " + toml_table(&[("path", alias_dir)]) + "\nkit = " + toml_table(&[("git", path_link.url.clone())]), ["dependency"], graph_path_home, "local boundary alias") {
+        .Ok(r) => r, .Err(e) => { return harness.fail(e) },
+    }
+
+    // Wave 5: Advance kit (kit_v2) and nested leaf (leaf_v2)
+    kit_v2 := match repo_commit(&mut probe, &mut kit, "advance main", &[("src/api.ddr", text.replace(kit_api_v1, "+ 20", "+ 21"))]) {
+        .Ok(c) => c,
+        .Err(e) => { return harness.fail(e) },
+    }
+    if !repo_push(&mut probe, &kit, "main") { return false }
+
+    // Wave 5A: pinned run (must stay 47 & lock unchanged) + reject(update --locked) + local boundary alias reject in parallel
+    snap_upd_locked := match capture_reject_snap(main_path, "", ["locked"], "update --locked") {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    wave5a: []BatchCmd = [
+        cli_cmd_default(&probe, main_path, ["run", "-o", main_path + "/pinned"]),
+        cli_cmd_default(&probe, main_path, ["update", "--locked"]),
+        gr_alias.cmd.clone(),
+    ]
+    probe.commands += 3
+    outs5a := exec_probe_batch(&mut probe, &wave5a)
+    if !check_status(&outs5a[0], 0, "pinned run") { return false }
+    cur_lock := sys.read_u8(main_path + "/dunder.lock")
+    if outs5a[0].stdout_text() != "47\n" || !cur_lock.ok || !bytes.equal(&cur_lock.value, &lock_bytes) {
+        return harness.fail("pinned run did not stay at 47 or mutated dunder.lock")
+    }
+    if !verify_reject_snap(&mut probe, &snap_upd_locked, &outs5a[1]) { return false }
+    if !verify_reject_snap(&mut probe, &gr_alias.snap, &outs5a[2]) { return false }
+
+    // Wave 5B: update kit_v2 while staging leaf_v2 locally (not pushed yet!)
+    if !write_text_file(leaf.author + "/api.ddr", "pub fn value() -> i32 { 11 }\n") { return false }
+    probe.commands += 1
+    outs5b := exec_probe_batch(&mut probe, &[
+        cli_cmd_default(&probe, main_path, ["update"]),
+        git_cmd(&probe, ["-C", leaf.author.clone(), "add", "--all"]),
+    ])
+    if !check_status(&outs5b[0], 0, "update kit_v2") || !check_status(&outs5b[1], 0, "leaf add") { return false }
+    expected_pins[0].commit = kit_v2.clone()
+    if check_pins(main_path, &expected_pins).is_err() {
+        return harness.fail("pins after kit_v2 update mismatch")
+    }
+
+    // Commit and push leaf_v2 now, then run BOTH updated (48) and nested-pinned (48) in parallel!
+    if git_run(&mut probe, ["-C", leaf.author.clone(), "commit", "--quiet", "-m", "advance nested branch"], 0).is_err() {
+        return false
+    }
+    leaf_fin := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["-C", leaf.author.clone(), "rev-parse", "HEAD"]),
+        git_cmd(&probe, ["-C", leaf.author.clone(), "push", leaf.origin.clone(), "HEAD:refs/heads/main"]),
+    ])
+    if !check_status(&leaf_fin[0], 0, "leaf_v2 rev-parse") || !check_status(&leaf_fin[1], 0, "leaf_v2 push") { return false }
+    leaf_v2 := text.trim(leaf_fin[0].stdout_text())
+    leaf.head_commit = leaf_v2.clone()
+
+    wave5c: []BatchCmd = [
+        cli_cmd_default(&probe, main_path, ["run", "-o", main_path + "/updated"]),
+        cli_cmd_default(&probe, main_path, ["run", "-o", main_path + "/nested-pinned"]),
+    ]
+    probe.commands += 2
+    outs5c := exec_probe_batch(&mut probe, &wave5c)
+    if !check_status(&outs5c[0], 0, "updated run") || outs5c[0].stdout_text() != "48\n" {
+        return harness.fail("expected 48 after kit_v2 update, got " + outs5c[0].stdout_text())
+    }
+    if !check_status(&outs5c[1], 0, "nested-pinned run") || outs5c[1].stdout_text() != "48\n" {
+        return harness.fail("expected 48 before nested leaf update, got " + outs5c[1].stdout_text())
+    }
+
+    // Update nested leaf_v2
+    if cli_run(&mut probe, main_path, ["update"], 0).is_err() { return false }
+    expected_pins[1].commit = leaf_v2.clone()
+    updated_lock_bytes := match check_pins(main_path, &expected_pins) {
+        .Ok(b) => b,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    // Wave 5E: nested-updated (49) + all 4 selectors still-pinned in parallel!
+    mut wave5e: []BatchCmd = [
+        cli_cmd_default(&probe, main_path, ["run", "-o", main_path + "/nested-updated"]),
+    ]
+    for i in 0..4 {
+        wave5e.push(cli_cmd_default(&probe, selectors[i].proj, ["run", "--offline", "--locked", "-o", selectors[i].proj + "/still-pinned"]))
+    }
+    probe.commands += wave5e.len
+    outs5e := exec_probe_batch(&mut probe, &wave5e)
+    if !check_status(&outs5e[0], 0, "nested-updated run") || outs5e[0].stdout_text() != "49\n" {
+        return harness.fail("expected 49 after nested leaf update, got " + outs5e[0].stdout_text())
+    }
+    for i in 0..4 {
+        if !check_status(&outs5e[i + 1], 0, "still-pinned " + selectors[i].name) { return false }
+        lb := sys.read_u8(selectors[i].proj + "/dunder.lock")
+        if outs5e[i + 1].stdout_text() != selectors[i].answer.str() + "\n" || !lb.ok || !bytes.equal(&lb.value, &selectors[i].lock_bytes) {
+            return harness.fail("selector did not stay pinned: " + selectors[i].name)
+        }
+    }
+
+    // Wave 6: shared_dunder_home_contracts (strictly synchronized while kit/leaf origins are hidden)
+    if !shared_dunder_home_contracts(&mut probe, &kit, &leaf, 49, &updated_lock_bytes) { return false }
+
+    // Wave 7: Delete refs (v1 & feature/next), then run concurrent_contract + deleted_ref rejects +
+    // prune reject + isolated run ALL IN PARALLEL!
+    del_refs := exec_probe_batch(&mut probe, &[
+        git_cmd(&probe, ["--git-dir", kit.origin.clone(), "update-ref", "-d", "refs/tags/v1"]),
+        git_cmd(&probe, ["--git-dir", kit.origin.clone(), "update-ref", "-d", "refs/heads/feature/next"]),
+    ])
+    if !check_status(&del_refs[0], 0, "delete refs/tags/v1") ||
+       !check_status(&del_refs[1], 0, "delete refs/heads/feature/next") {
+        return false
+    }
+
+    // Prepare concurrent_contract projects A & B
+    conc_src := toml_table(&[("git", kit.url.clone()), ("branch", "main")])
+    conc_a := match create_project(&probe, "concurrent cold project A", conc_src, 49, true) {
+        .Ok(p) => p,
+        .Err(e) => { return harness.fail(e) },
+    }
+    conc_b := match create_project(&probe, "concurrent cold project B", conc_src, 49, true) {
+        .Ok(p) => p,
+        .Err(e) => { return harness.fail(e) },
+    }
+    cold_home := probe.work + "/concurrent-dunder-home"
+    cold_keys: []string = ["DUNDER_HOME"]
+    cold_vals: []string = [cold_home]
+    conc_img_a := conc_a + "/concurrent-0"
+    conc_img_b := conc_b + "/concurrent-1"
+
+    // Prepare prune_contract on selectors[0]
+    prune_proj := selectors[0].proj.clone()
+    prune_image := prune_proj + "/pruned"
+    if !write_bytes_file(prune_image, &prev_image_bytes) ||
+       !write_text_file(prune_proj + "/dunder.toml", "name = \"local\"\nroot = \"src/main.ddr\"\n") ||
+       !write_text_file(prune_proj + "/src/main.ddr", "fn main() { print(42) }\n") {
+        return false
+    }
+
+    // Prepare isolated git namespaces project (isolated DUNDER_HOME!)
+    iso_home := probe.work + "/isolated-dunder-home"
+    iso_keys: []string = ["DUNDER_HOME"]
+    iso_vals: []string = [iso_home.clone()]
+    isolated := probe.work + "/projects/isolated git namespaces"
+    if !write_text_file(isolated + "/dunder.toml", "name = \"isolated\"\nroot = \"main.ddr\"\n[dependencies]\nleft = " +
+            toml_table(&[("git", left_repo.url.clone())]) + "\nright = " + toml_table(&[("git", right_repo.url.clone())]) + "\n") ||
+       !write_text_file(isolated + "/main.ddr", "import left\nimport right\nfn main() { print(left.value() + right.value()) }\n") ||
+       !write_text_file(isolated + "/leak.ddr", "import shared\nfn main() { print(shared.value()) }\n") {
+        return false
+    }
+
+    del_snap_tag := match capture_reject_snap(selectors[1].proj, selectors[1].proj + "/image-" + targets[0], [], "deleted tag update") {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    del_snap_br := match capture_reject_snap(selectors[3].proj, selectors[3].proj + "/image-" + targets[0], [], "deleted branch update") {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+    prune_snap := match capture_reject_snap(prune_proj, prune_image, ["locked"], "prune --locked") {
+        .Ok(s) => s,
+        .Err(e) => { return harness.fail(e) },
+    }
+
+    // Slots 0 and 1 are concurrent cold builds so they spawn immediately side-by-side!
+    wave7: []BatchCmd = [
+        cli_cmd(&probe, conc_a, ["build", "--jobs", "1", "-o", conc_img_a.clone()], &cold_keys, &cold_vals),
+        cli_cmd(&probe, conc_b, ["build", "--jobs", "1", "-o", conc_img_b.clone()], &cold_keys, &cold_vals),
+        cli_cmd_default(&probe, selectors[1].proj, ["update"]),
+        cli_cmd_default(&probe, selectors[3].proj, ["update"]),
+        cli_cmd_default(&probe, prune_proj, ["build", "--locked", "-o", prune_image.clone()]),
+        cli_cmd(&probe, isolated, ["run", "-o", isolated + "/isolated-image"], &iso_keys, &iso_vals),
+    ]
+    probe.commands += wave7.len
+    outs7 := exec_probe_batch(&mut probe, &wave7)
+
+    // Verify concurrent builds
+    for i in 0..2 {
+        if !check_status(&outs7[i], 0, "concurrent cold build " + i.str()) { return false }
+        if outs7[i].stderr_text() != "" {
+            return harness.fail("concurrent cold build wrote stderr: " + outs7[i].stderr_text())
+        }
+    }
+    raw_ca := sys.read_u8(conc_img_a)
+    raw_cb := sys.read_u8(conc_img_b)
+    if !raw_ca.ok || !raw_cb.ok || !bytes.equal(&raw_ca.value, &raw_cb.value) {
+        return harness.fail("concurrent cold builds produced non-identical native images")
+    }
+    if check_pins(conc_a, &expected_pins).is_err() || check_pins(conc_b, &expected_pins).is_err() {
+        return harness.fail("concurrent cold builds produced wrong pins")
+    }
+    if path_exists(conc_a + "/build/.dunder/git") || path_exists(conc_b + "/build/.dunder/git") {
+        return harness.fail("concurrent cold builds created project-local git cache")
+    }
+
+    // Verify deleted_ref update rejects, prune reject, isolated run
+    if !verify_reject_snap(&mut probe, &del_snap_tag, &outs7[2]) { return false }
+    if !verify_reject_snap(&mut probe, &del_snap_br, &outs7[3]) { return false }
+    lb_tag := sys.read_u8(selectors[1].proj + "/dunder.lock")
+    lb_br := sys.read_u8(selectors[3].proj + "/dunder.lock")
+    if !lb_tag.ok || !bytes.equal(&lb_tag.value, &selectors[1].lock_bytes) ||
+       !lb_br.ok || !bytes.equal(&lb_br.value, &selectors[3].lock_bytes) {
+        return harness.fail("deleted_ref update mutated lock")
+    }
+    if !verify_reject_snap(&mut probe, &prune_snap, &outs7[4]) { return false }
+    if !check_status(&outs7[5], 0, "isolated run") ||
+       outs7[5].stdout_text() != "113\n" || outs7[5].stderr_text() != "" {
+        return harness.fail("isolated git namespaces unexpected output: " + outs7[5].stdout_text())
+    }
+
+    // Wave 8: deleted_ref offline runs (2) + prune build --offline + isolated check leak.ddr
+    wave8: []BatchCmd = [
+        cli_cmd_default(&probe, selectors[1].proj, ["run", "--offline", "--locked", "-o", selectors[1].proj + "/deleted-ref-pinned"]),
+        cli_cmd_default(&probe, selectors[3].proj, ["run", "--offline", "--locked", "-o", selectors[3].proj + "/deleted-ref-pinned"]),
+        cli_cmd_default(&probe, prune_proj, ["build", "--offline", "-o", prune_image.clone()]),
+        cli_cmd(&probe, isolated, ["check", "leak.ddr"], &iso_keys, &iso_vals),
+    ]
+    probe.commands += wave8.len
+    outs8 := exec_probe_batch(&mut probe, &wave8)
+
+    if !check_status(&outs8[0], 0, "deleted tag offline run") ||
+       outs8[0].stdout_text() != selectors[1].answer.str() + "\n" || outs8[0].stderr_text() != "" {
+        return harness.fail("deleted tag offline run unexpected output")
+    }
+    if !check_status(&outs8[1], 0, "deleted branch offline run") ||
+       outs8[1].stdout_text() != selectors[3].answer.str() + "\n" || outs8[1].stderr_text() != "" {
+        return harness.fail("deleted branch offline run unexpected output")
+    }
+    if !check_status(&outs8[2], 0, "prune build --offline") { return false }
+    empty_pins: []Pin = []
+    if check_pins(prune_proj, &empty_pins).is_err() {
+        return harness.fail("prune_contract did not prune pins")
+    }
+    if !check_status(&outs8[3], 1, "isolated leak.ddr check") { return false }
+
+    if !execute_batch(&mut probe, &[
+        ExecItem { image: conc_img_a, target: host.clone(), expected: 49 },
+        ExecItem { image: conc_img_b, target: host.clone(), expected: 49 },
+        ExecItem { image: prune_image, target: host.clone(), expected: 42 },
+    ]) {
+        return false
+    }
+
+    // Wave 9: hidden_edit_contracts (strictly synchronized on kit_v2 checkout)
+    if !hidden_edit_contracts(&mut probe, main_path, kit_v2) { return false }
+
+    // Finish background embedded unit tests (if enabled)
+    if !verify_embedded_contracts(&mut probe) { return false }
+
+    // Final integrity checks
+    if path_exists(marker) {
+        return harness.fail("a dependency build script ran")
+    }
+    final_git_cfg := sys.read_u8(probe.git_config)
+    kit_cfg := sys.read_u8(kit.author + "/.git/config")
+    leaf_cfg := sys.read_u8(leaf.author + "/.git/config")
+    if !final_git_cfg.ok || !bytes.equal(&final_git_cfg.value, &probe.git_config_bytes) {
+        return harness.fail("isolated git config was modified")
+    }
+    if !kit_cfg.ok || !bytes.equal(&kit_cfg.value, &kit.config) {
+        return harness.fail("kit repo .git/config was modified")
+    }
+    if !leaf_cfg.ok || !bytes.equal(&leaf_cfg.value, &leaf.config) {
+        return harness.fail("leaf repo .git/config was modified")
+    }
+    true
+}
+
+fn main() -> i32 {
+    mut compiler_arg := ""
+    mut only_cache_symlinks := false
+    mut skip_unit_tests := false
+    mut runner_args: []string = []
+
+    argc := sys.arg_count()
+    mut ai := 1
+    while ai < argc {
+        a := sys.arg(ai)
+        if a == "--only-cache-symlinks" {
+            only_cache_symlinks = true
+        } else if a == "--skip-unit-tests" {
+            skip_unit_tests = true
+        } else if a == "--runner" {
+            if ai + 1 >= argc {
+                _ := sys.eprint("--runner requires a native TARGET=COMMAND")
+                return 2
+            }
+            ai += 1
+            runner_args.push(sys.arg(ai))
+        } else if text.starts_with(a, "--runner=") {
+            runner_args.push(a[9..a.len])
+        } else if text.starts_with(a, "-") {
+            _ := sys.eprint("unknown option: " + a)
+            return 2
+        } else if compiler_arg.len == 0 {
+            compiler_arg = a
+        } else {
+            _ := sys.eprint("unexpected positional argument: " + a)
+            return 2
+        }
+        ai += 1
+    }
+
+    if compiler_arg.len == 0 {
+        _ := sys.eprint("usage: test_git_dependencies <compiler> [--skip-unit-tests] [--only-cache-symlinks] [--runner TARGET=COMMAND]")
+        return 2
+    }
+
+    comp_rp := fs.realpath(compiler_arg)
+    if !comp_rp.ok || !sys.metadata(comp_rp.value).is_file {
+        _ := sys.eprint("compiler not found: " + compiler_arg)
+        return 2
+    }
+    compiler := comp_rp.value
+
+    host := process.host_target()
+    if !is_valid_target(host) {
+        _ := sys.eprint("unsupported native host target: " + host)
+        return 1
+    }
+
+    mut runners: []Runner = [Runner { target: host.clone(), cmd: [] }]
+    for raw_r in &runner_args {
+        eq_pos := match text.find(raw_r, "=") {
+            .Some(pos) => pos,
+            .None => {
+                _ := sys.eprint("--runner requires a native TARGET=COMMAND")
+                return 2
+            },
+        }
+        target := raw_r[0..eq_pos]
+        cmd_str := raw_r[(eq_pos + 1)..raw_r.len]
+        if !is_valid_target(target) {
+            _ := sys.eprint("--runner requires a native TARGET=COMMAND")
+            return 2
+        }
+        parsed_cmd := match shlex_split(cmd_str) {
+            .Ok(parts) => parts,
+            .Err(e) => {
+                _ := sys.eprint("--runner invalid command: " + e)
+                return 2
+            },
+        }
+        if parsed_cmd.len == 0 {
+            _ := sys.eprint("--runner requires a native TARGET=COMMAND")
+            return 2
+        }
+        mut updated := false
+        for i in 0..runners.len {
+            if runners[i].target == target {
+                runners[i].cmd = parsed_cmd.clone()
+                updated = true
+                break
+            }
+        }
+        if !updated {
+            runners.push(Runner { target: target, cmd: parsed_cmd })
+        }
+    }
+
+    root := harness.find_root()
+    if root.len == 0 {
+        _ := sys.eprint("could not locate dunder repository root")
+        return 1
+    }
+
+    tmp := fs.temp_dir("dunder-git dependencies-")
+    if !tmp.ok {
+        _ := sys.eprint("temp_dir failed")
+        return 1
+    }
+    work_rp := fs.realpath(tmp.value)
+    work := if work_rp.ok { work_rp.value } else { tmp.value }
+    defer { _ := fs.remove_all(work) }
+
+    mut probe := match new_probe(compiler, root, work, host, move runners) {
+        .Ok(p) => p,
+        .Err(e) => { _ := harness.fail(e); return 1 },
+    }
+    defer { probe.bg.set.kill_all() }
+
+    if only_cache_symlinks {
+        if !cache_symlink_contracts(&mut probe) { return 1 }
+        print(f"Git cache symlinks: {probe.commands} CLI commands, {probe.images} native images, {probe.executions} host executions, {probe.rejections} rejections passed")
+        return 0
+    }
+
+    if !run_full_suite(&mut probe, skip_unit_tests) { return 1 }
+
+    mut runner_names := ""
+    for i in 0..probe.runners.len {
+        if i > 0 { runner_names += ", " }
+        runner_names += probe.runners[i].target
+    }
+    print(f"Git dependencies: {probe.commands} CLI commands, {probe.images} native images, {probe.executions} target executions ({runner_names}), {probe.rejections} rejections; selectors, transitive pins, offline/locked use, update, graph failures, detached checkouts, cache confinement and concurrent cold builds passed")
+    0
+}
