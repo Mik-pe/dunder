@@ -87,10 +87,16 @@ esac
 reported=$("$compiler" --version)
 [ "$reported" = "dunder $version ($host)" ] || fail "tag $tag does not match compiler: $reported"
 
+if git -C "$root" cat-file -e "$commit:tools/release-targets.txt" 2>/dev/null; then
+    artifacts=$(git -C "$root" show "$commit:tools/release-targets.txt")
+else
+    artifacts="arm64-macos.gz arm64-linux.gz x86_64-linux.gz"
+fi
 manifest="$work/assets/release.txt"
 printf 'version=%s\ncommit=%s\n' "$version" "$commit" > "$manifest"
 pids=""
-for target in arm64-macos arm64-linux x86_64-linux; do
+for artifact in $artifacts; do
+    target=${artifact%.*}
     (
         image="$work/images/$target"
         if [ "$host" = "$target" ]; then
@@ -98,26 +104,40 @@ for target in arm64-macos arm64-linux x86_64-linux; do
         else
             "$compiler" build selfhost/main_parallel.ddr --target "$target" -o "$image"
         fi
-        gzip -9 -n -c "$image" > "$work/assets/$target.gz"
+        case "$artifact" in
+            *.gz) gzip -9 -n -c "$image" > "$work/assets/$artifact" ;;
+            *.exe) cp "$image" "$work/assets/$artifact" ;;
+            *) fail "unsupported compiler artifact: $artifact" ;;
+        esac
     ) &
     pids="$pids $!"
 done
+build_status=0
 for pid in $pids; do
-    wait "$pid"
+    wait "$pid" || build_status=1
 done
-for target in arm64-macos arm64-linux x86_64-linux; do
-    image="$work/images/$target"
-    archive="$work/assets/$target.gz"
-    compressed=$(sha256_of "$archive")
-    raw=$(sha256_of "$image")
-    printf '%s  %s.gz\n' "$compressed" "$target" > "$work/assets/$target.sha256"
-    printf '%s.gz.sha256=%s\n%s.sha256=%s\n' "$target" "$compressed" "$target" "$raw" >> "$manifest"
+[ "$build_status" -eq 0 ] || fail 'one or more compiler builds failed'
+asset_files=
+for artifact in $artifacts; do
+    target=${artifact%.*}
+    raw=$(sha256_of "$work/images/$target")
+    file_hash=$raw
+    case "$artifact" in
+        *.gz)
+            file_hash=$(sha256_of "$work/assets/$artifact")
+            printf '%s.sha256=%s\n' "$artifact" "$file_hash" >> "$manifest"
+            ;;
+    esac
+    printf '%s  %s\n' "$file_hash" "$artifact" > "$work/assets/$target.sha256"
+    printf '%s.sha256=%s\n' "$target" "$raw" >> "$manifest"
+    asset_files="$asset_files $artifact $target.sha256"
 done
+asset_files="$asset_files release.txt"
 
 # Complete all builds before replacing any local asset. Readers can validate
 # against release.txt, which is installed last. Upload from this run's snapshot.
 cd "$work/assets"
-for file in *.gz *.sha256 release.txt; do
+for file in $asset_files; do
     cp "$file" "$work/$file"
     mv -f "$work/$file" "$outdir/$file"
 done
@@ -136,7 +156,7 @@ state=$(gh api --paginate "repos/$repo/releases?per_page=100" \
     --jq ".[] | select(.tag_name == \"$tag\") | if .draft then \"draft\" else \"published\" end")
 if [ -z "$state" ]; then
     gh release create "$tag" --repo "$repo" --verify-tag --target "$commit" --draft \
-        --title "Dunder $tag" --notes "Local compiler builds for arm64-macos, arm64-linux and x86_64-linux."
+        --title "Dunder $tag" --notes "Compiler downloads: $artifacts."
     state=draft
 fi
 if [ "$state" = draft ]; then
@@ -144,7 +164,7 @@ if [ "$state" = draft ]; then
     # and repair only missing or incomplete assets, while the release is hidden.
     existing=$(gh release view "$tag" --repo "$repo" --json assets \
         --jq '.assets[] | .name + " " + (.digest // "")')
-    for file in *.gz *.sha256 release.txt; do
+    for file in $asset_files; do
         digest=$(sha256_of "$file")
         previous=$(printf '%s\n' "$existing" | awk -v name="$file" '$1 == name {print ($2 == "" ? "unknown" : $2)}')
         [ "$previous" != "sha256:$digest" ] || continue
@@ -162,9 +182,9 @@ fi
 # A published release is never edited to repair mismatched artifacts.
 mkdir "$work/download"
 set --
-for file in *.gz *.sha256 release.txt; do set -- "$@" --pattern "$file"; done
+for file in $asset_files; do set -- "$@" --pattern "$file"; done
 gh release download "$tag" --repo "$repo" --dir "$work/download" "$@"
-for file in *.gz *.sha256 release.txt; do
+for file in $asset_files; do
     cmp -s "$file" "$work/download/$file" || fail "downloaded release asset differs: $file"
 done
 if [ "$state" = draft ]; then
