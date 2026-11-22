@@ -194,16 +194,17 @@ ett värde eller läsa, skriva och låna dess fält. Kontrollen av
 ```dunder
 capability filesystem
 import std.fs
+import sys
 
-fn copy(src: &fs.ReadFile, dst: &fs.WriteFile) -> bool {
-    result := src.read()
-    result.ok && dst.write(result.value).ok
+fn copy(src: &fs.ReadFile, dst: &fs.WriteFile) -> Result<(), sys.IoError> {
+    text := src.read()?
+    dst.write(text)
 }
 
 fn main() {
     input := fs.ReadFile::grant("source.txt")
     output := fs.WriteFile::grant("copy.txt")
-    assert(copy(&input, &output))
+    assert(copy(&input, &output).is_ok())
 }
 ```
 

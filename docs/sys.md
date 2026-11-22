@@ -8,21 +8,16 @@ native-backend. Källfiler har ändelsen `.ddr`; importer skrivs utan suffix.
 capability filesystem
 import sys
 
+fn greeting(path: string) -> Result<string, sys.IoError> {
+    sys.write(path, "Hej från Dunder 🌍")?
+    sys.read(path)
+}
+
 fn main() -> i32 {
-    written := sys.write_text("hello.txt", "Hej från Dunder 🌍\n")
-    if !written.ok {
-        print(sys.error_message(written.error))
-        return 1
+    match greeting("hello.txt") {
+        .Ok(text) => { print(text); 0 },
+        .Err(error) => { print(error.message()); 1 },
     }
-    content := sys.read_text("hello.txt")
-    if !content.ok {
-        print(sys.error_message(content.error))
-        return 1
-    }
-    print(content.value)
-    info := sys.metadata("hello.txt")
-    if info.ok { print(info.size) }
-    0
 }
 ```
 
@@ -36,7 +31,9 @@ implementeras i [native-backenden](../selfhost/runtime/runtime_sys.ddr).
 
 | Funktion | Returtyp | Beteende |
 | --- | --- | --- |
-| `sys.read(path)` | `Result<string, IoError>` | UTF-8-läsning med `.Ok(string)` / `.Err(IoError)`; `sys.read_limit`, `sys.read_bytes` och `sys.read_bytes_limit` är varianter med explicit gräns. |
+| `sys.read(path)`, `sys.read_limit(path, max_bytes)` | `Result<string, IoError>` | Läser en UTF-8-fil. Den andra formen sätter en bytegräns. |
+| `sys.read_bytes(path)`, `sys.read_bytes_limit(path, max_bytes)` | `Result<[]u8, IoError>` | Läser filens byte. Den andra formen sätter en bytegräns. |
+| `sys.write(path, text)`, `sys.write_bytes(path, &data)` | `Result<(), IoError>` | Skapar filen eller ersätter innehållet. |
 | `sys.read_text(path)` | `sys.TextResult` | Läser en vanlig fil och validerar UTF-8. |
 | `sys.write_text(path, text)` | `sys.Status` | Skapar filen eller ersätter hela dess innehåll. |
 | `sys.write_stderr(text)` | `sys.Status` | Skriver textens exakta UTF-8-byte till stderr, utan radbrytning. |
@@ -84,17 +81,17 @@ Hela deklarationen finns i [sys.ddr](../stdlib/sys.ddr).
 capability filesystem
 import sys
 
-fn load(path: string) -> string {
-    match sys.read(path) {
-        .Ok(text) => text,
-        .Err(error) => { print(sys.io_error_message(error)); return "" },
-    }
+fn append_line(path: string, line: string) -> Result<(), sys.IoError> {
+    sys.append_text(path, line + "\n").into_result()
 }
 ```
 
-`read` är en Dunder-wrapper över `read_text` med samma läsregler och gränser.
-Övriga I/O-funktioner och `read_text` använder nominella resultatstructar,
-som också kan skickas och returneras mellan funktioner:
+Vid migrering från `sys.read_text(path)` till `sys.read(path)?` följer
+fel och läsgränser med. Motsvarande skrivning är `sys.write(path, text)?`.
+`Status`, `TextResult` och `BytesResult` kan också omvandlas med
+`.into_result()`. Det gör att exempelvis `bytes.decode(&data).into_result()?`
+kan lämna `.InvalidUtf8` till samma anropare. Text- och byteresultaten
+överför sina ägda värden. Följande poster används vid systemgränsen.
 
 ```dunder
 pub struct Status { ok: bool, error: i32 }
@@ -302,7 +299,7 @@ Högre standardmoduler skyddar bredare OS-operationer med uttryckliga kapabilite
 | `sys` (stderr, klocka, argument) | `capability stdio` för `write_stderr`/`eprint`; ingen för klocka/argument | `sys.write_stderr`, `sys.eprint`, `sys.now_ms`, `sys.sleep_ms`, `sys.pid`, `sys.arg`, `sys.arg_count` |
 | `sys` & `std.io` (råa FD, råminne & systemanrop) | `capability unsafe` | `sys.fd_read`/`fd_write`/`fd_close`/`fd_poll`/`fd_set_nonblocking`, `io.fd_read_chunk`/`fd_write_chunk`, `sys.envp`, `sys.linux_syscall`, `sys.memory_copy`, `sys.memory_equal`, `sys.memory_zero`, `sys.pool_alloc_try`, `sys.pool_free` |
 | `sys` (låg-nivå-sockets) | `capability network` | `sys.net_listen`, `sys.net_accept`, `sys.net_connect`, `sys.net_read`, `sys.net_peek`, `sys.net_write`, `sys.net_poll`, `sys.net_set_nonblocking`, `sys.net_set_nodelay`, `sys.net_local_port`, `sys.net_shutdown_write`, `sys.net_close` |
-| `std.fs` | `capability filesystem` | `fs.list_dir`, `fs.mkdir_all`, `fs.remove_all`, `fs.temp_dir`, `fs.cwd`, `fs.realpath`, `fs.symlink`, `fs.hard_link`, `fs.is_symlink`, samt skapande av handtagen `ReadFile::grant`, `WriteFile::grant`, `ReadDir::grant`, `WriteFile::create` och `File::open` (även `std.sqlite` använder `filesystem` och `unsafe`) |
+| `std.fs` | `capability filesystem` | `fs.list_dir`, `fs.mkdir_all`, `fs.remove_all`, `fs.temp_dir`, `fs.cwd`, `fs.realpath`, `fs.symlink`, `fs.hard_link`, `fs.is_symlink`, samt skapande av handtagen `ReadFile::grant`, `WriteFile::grant`, `ReadDir::grant`, `WriteFile::create` och `File::open` |
 | `std.io` (standardströmmar) | `capability stdio` | `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.read_stdin`, `io.read_stdin_bytes`, `io.read_stdin_limit` |
 | `std.net` | `capability network` | `TcpListener`, `TcpStream`, `UdpSocket`, `PollSet`, `StreamSet`, `net.Waker`, `net.resolve` |
 | `std.process` | `capability process` | `Command::spawn`/`exec`, `Executable::grant`, `process.run`, `process.replace`, `process.env`, `ChildSet` |
@@ -313,11 +310,10 @@ Observera att även `sys.read_text` och `sys.write_text` nu kräver
 `sys.ddr`): filåtkomst är inte längre fri bara för att den sker som ett
 öppna/stäng-engångsanrop. `std.fs` exponerar dessutom katalogtraversering,
 rekursiv radering och delegeringsbara fil-/kataloghandtag
-(`ReadFile`, `WriteFile`, `ReadDir`); bara skapandet av handtagen
-(`grant`/`open`) är märkt `@requires(filesystem)` i `std.fs`, men
-handtagsmetoderna som `.read()` går vidare till `sys.read_text` och kräver
-därför ändå `capability filesystem` hos den slutliga anroparen.
-
-För kod som ska få åtkomst till en vald fil via en parameter finns
-`std.fs.ReadFile` och `std.fs.WriteFile`. Handtagen skapas i en modul
-med `capability filesystem`. [Filhandtag och deras sökvägssemantik](ffi.md#filåtkomst-genom-delegerade-handtag)
+(`ReadFile`, `WriteFile`, `ReadDir`). För att välja sökväg med `grant`
+behöver modulen `capability filesystem`. En annan modul kan sedan ta
+emot handtaget och använda dess läs- eller skrivmetoder direkt. Dessa
+returnerar `Result<T, sys.IoError>`. Byt exempelvis `input.read().value`
+mot `input.read()?` och `output.write(text).ok` mot
+`output.write(text).is_ok()` eller `output.write(text)?`.
+[Filhandtag och deras sökvägssemantik](ffi.md#filåtkomst-genom-delegerade-handtag)
