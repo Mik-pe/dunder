@@ -218,6 +218,10 @@ och anropa metoder direkt på värdet (`len`, `is_empty`, `put`, `put_new`,
 `insert`, `contains`, `remove`, `take`, `values`). För uppslag som kan
 saknas ger `index_of` ett index eller `-1`.
 
+`at` lånar det lagrade värdet. I `antal := m.at(k); m.put(k, antal + 1)`
+beräknas heltalsargumentet innan metoden uppdaterar tabellen. En senare
+läsning av samma lån efter uppdateringen ger ett kompileringsfel.
+
 `text.find` returnerar `Option<i32>` (`.Some(byteindex)` eller `.None`).
 `split` bevarar tomma delar;
 en tom separator ger en del med hela texten. `trim` tar ASCII-mellanslag,
