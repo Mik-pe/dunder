@@ -16,6 +16,15 @@ beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synk
 
 Om en callback till `alloc.with_bytes` försöker returnera ett lån av blocket avvisas det med E4003. Låt diagnostiken visa användarens anrop tillsammans med den specialiserade signaturen. [Bytevyer och ägarskap](memory.md)
 
+## Jämför lånade bytevyer utan kopiering
+
+`del := &data[start..slut]` kan indexeras när `data` är en lånad bytearray.
+Anropet `bytes.equal(&facit, &del)` ger däremot E4005. Samma fel uppstår om
+intervallet skrivs direkt i anropet. `bytes.equal_ranges(&facit, 0, facit.len,
+data, start, slut)` fungerar utan att kopiera. Utred hur `bytes.equal` kan
+jämföra två vyer och samtidigt garantera att deras adresser bara används
+under anropet. Prova även tomma vyer och olika långa intervall.
+
 ## Följ upp mätningar för SIMD
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
