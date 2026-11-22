@@ -3,6 +3,9 @@
 Samla nya mätresultat här med revision, arbetslast och mätvärden.
 Tidigare körrecept finns i Git-historiken.
 
+Rader och kolumner kördes med samma kompilatorrevision på Apple M5 samt i
+en lokal, översatt Linux-gäst för x86-64. [Mätvärden och råprover](layout/2026-11-22/README.md)
+
 [Parallell byggtid på Apple M5](compiler/2026-11-18-parallel-build-latency/README.md) mäter modullexning, funktionsschemaläggning och Mach-O-signering mot samma låsta källor.
 
 [Byggtid, körprestanda och schemaläggning med den gemensamma funktionsrepresentationen](compiler/2026-11-15-shared-frontend/README.md) jämför sju byggkorpusar, fem native-program och tre schemaläggningsändringar på Apple M5.
