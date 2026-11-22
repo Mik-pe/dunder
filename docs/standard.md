@@ -307,6 +307,19 @@ plats på den sista kvarvarande posten och den borttagna posten.
 
 ## Matematik
 
+`math.exp(x)` ger e upphöjt till x, `math.log(x)` ger den naturliga
+logaritmen och `math.pow(x, y)` ger x upphöjt till y. Alla tre arbetar
+med `f64` på nativa mål och i Wasm. `exp(-∞)` ger +0 och `exp(+∞)`
+ger +∞. `log(±0)` ger −∞ och negativa argument ger NaN. En ändlig
+negativ bas kräver heltalsexponent. För udda heltalsexponenter bevarar
+`pow` basens tecken även vid noll och oändlighet.
+`pow(x, 0)`, `pow(1, y)` och `pow(-1, ±∞)` ger 1.
+
+Verifieringen jämför med värdsystemets matematikbibliotek och tillåter
+högst åtta ULP (steg mellan representerbara tal) i referensfallen.
+Proven omfattar subnormala värden, grannar kring över- och underflöde och
+baser nära ett med stora exponenter.
+
 `import std.math as math` ger `min(a, b)`, `max(a, b)` och
 `clamp(value, low, high)` för `f64`. `min` väljer negativ noll och `max`
 positiv noll när båda tecknen förekommer. `clamp` bevarar tecknet på
