@@ -16,7 +16,9 @@ Bygg kompilatorn från det frysta fröet med `tools/bootstrap.sh`. Kontrollera
 diagnostik. Kör `tools/verify-selfhost.sh` för hela testsviten.
 
 Byggen och tester körs lokalt eller på en uttryckligen vald maskin, utan
-Cargo eller GitHub CI. Kör prestandamätningar bara på begäran.
+Cargo eller GitHub CI. På macOS körs Linuxproven i Kiri med
+`tools/verify-selfhost.sh --linux arm64` eller `--linux x86_64`.
+Kör prestandamätningar bara på begäran.
 
 `../dunder-hundmat` är Dunders testbädd med riktiga program, bland annat
 Tabell, en HTTP-server och grafikexempel. Använd programmen för att hitta
