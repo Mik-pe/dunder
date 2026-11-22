@@ -465,12 +465,19 @@ skriver det första och sista elementet och läser tillbaka det sista.
 Systemallokatorn reserverar virtuellt adressutrymme. Provet berör bara
 sidorna i vardera änden.
 
-En inbyggd `&[]u8` använder `i32` för längd och index. Att skapa den
-över hela regionen ovan ger status 103. En ägare som använder `usize`
-kan i stället låna ut fönster med `bytes_view`. Kontrollera först
-`first <= end && end <= size`, därefter att `end - first` ryms i
-`i32`. Ett tomt intervall vid slutet är giltigt. Fönstrets index
-startar på noll även när `first` ligger över 2 GiB.
+`alloc.with_bytes(block, read)` lånar ut hela blocket till en funktion
+med parametern `&alloc.ByteView` och returnerar funktionens resultat.
+Anropet är `unsafe`. Anroparen ansvarar för att blockets minne är
+initialiserat, läsbart och stabilt under hela anropet. `view.len()` och
+indexet i `view.get(index)` har typen `usize`. Vid slutet eller längre
+bort returnerar `get` värdet `.None`. Vyn och lån från den får bara
+användas under anropet.
+
+`view.window(first, end)` lånar ut intervallet som `&[]u8` utan att
+kopiera data. Gränserna måste uppfylla `first <= end && end <= view.len()`.
+Antalet byte i fönstret måste rymmas i `i32`. Ett tomt fönster vid slutet
+är giltigt och lokala index börjar på noll även när `first` ligger över
+2 GiB.
 
 `usize` passar för elementantal och C:s `size_t`. En baklängesloop med
 osignerade index kan börja vid den exklusiva slutgränsen, testa
