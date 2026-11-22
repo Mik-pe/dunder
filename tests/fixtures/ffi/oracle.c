@@ -80,3 +80,11 @@ void release_bytes(void *owned) { free(owned); }
 int wide_counts(size_t count, ptrdiff_t distance) {
     return count == (size_t)2147483652ULL && distance == -(ptrdiff_t)1;
 }
+typedef int16_t (*SampleCallback)(int16_t, int16_t, int16_t, int16_t, int16_t,
+                                  int16_t, int16_t, int16_t, int16_t);
+int16_t call_samples(SampleCallback callback, int16_t lo, int16_t hi, int16_t a,
+                     int16_t b, int16_t c, int16_t d, int16_t e, int16_t f, int16_t last) {
+    if (lo != INT16_MIN || hi != INT16_MAX || a != -2 || b != 3 || c != -4
+        || d != 5 || e != -6 || f != 7 || last != -8) return 0;
+    return callback(hi, a, b, c, d, e, f, last, lo);
+}
