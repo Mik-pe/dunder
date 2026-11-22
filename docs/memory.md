@@ -213,8 +213,7 @@ att intervallgränserna kontrollerats.
 Vyn pekar på originalets element, skapar ingen heapbuffert och behåller
 ingen ägare genom referensräkning. `len` och `cap()` för `&[]T` ger vyns
 längd, medan `&str.len` ger antalet UTF-8-byte. Varken skrivning genom vyn,
-storleksändring eller `&mut str` är tillåten, och `&str` kan inte lagras i
-structar, enums eller arrayer. En uttrycklig `.clone()` (eller `.str()`/`.to_string()`)
+storleksändring eller `&mut str` är tillåten. En uttrycklig `.clone()` (eller `.str()`/`.to_string()`)
 på en `&str` skapar en ägd `string`, medan `.clone()` på `&[]T` ger `[]T`. Vyns livslängd skyddas i stället av lånet.
 
 Ett aktivt lån av ett structfält tillåter ändring och flytt av oberoende
@@ -233,6 +232,20 @@ Nya lokala lån får inte lämnas till en funktion som kan exponera deras
 lagring som råpekare, inte heller genom indirekta anrop. Explicit `unsafe`
 kan observera adressen direkt, exempelvis med `addr(&view[0])` i ett
 identitetsprov; råpekaren följer då kontraktet för `unsafe`.
+
+### Lån i structar och enums
+
+Delade lån kan ingå i structfält och enumpayloads, även via nästlade typer.
+En funktion som returnerar ett sådant värde kan ange källan med `from`.
+Alla lån i ett enskilt värde måste då komma från samma ägare. Ett tomt
+alternativ som `.None` behöver ingen ägare. Matchning och destrukturering
+bevarar sambandet med den ursprungliga lagringen.
+
+Ett värde med lån kan bindas lokalt och skickas mellan funktioner.
+Lånefälten sätts när värdet skapas. Arrayelement, ägda closuremiljöer och
+taskgränser kräver fristående värden. Ett lokalt delintervall kan användas
+i en struct eller enum i samma funktion. Om vyns beskrivning ligger i
+den aktuella stackramen avvisar kompilatorn en retur av structen eller enumen.
 
 ### Fält, element och begränsningar
 

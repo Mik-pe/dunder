@@ -175,8 +175,8 @@ lånet har upphört.
 
 En funktion kan returnera ett lån från en parameter. Returtypen `&mut T` kräver
 en muterbar källa. Ange `from namn` när källan behöver särskiljas.
-Lån får användas i lokaler och anrop. Structfält, enumpayloads och arrayelement
-kräver lagringsbara typer, vilket även utesluter `Option<&T>`.
+Structfält och enumpayloads kan innehålla delade lån från samma ägare.
+`Option<&T>` representerar ett sådant lån eller ett frånvarande värde.
 En callback kan ge tillfällig åtkomst till ett värde som kanske saknas.
 För en ägd kopia används `.clone()`, som på `&str` ger en `string`.
 [Lån och intervallvyer](memory.md#lokala-läslån-och-intervallvyer)
@@ -316,6 +316,8 @@ kräver att nyckeln finns. `Set.at(index)` lånar elementet vid indexet.
 `Map.update(key, f)` ger ett skrivlån. Båda gör ett uppslag och anropar
 callbacken en gång vid träff. Vid saknad nyckel ger metoden `false` och
 hoppar över callbacken. Det fungerar även när värdet är en unik resurs.
+`Map.get_ref(key)` ger `.Some(&värde)` vid träff och `.None` vid miss.
+Lånet hör till tabellen och fungerar även för unika resurser.
 `Map.get(key)` ger en ägd `Option<V>` och kräver `V: Clone`.
 `at_mut` och `get_mut` ger ett direkt skrivlån och kräver en befintlig nyckel.
 `Map.get_or(key, move fallback)` och `Map.get_or_default(key)` (för `V: Default + Clone`)

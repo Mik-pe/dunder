@@ -60,7 +60,7 @@ uttryck tillåts inte i `const`.
 | `f64` | IEEE 754 binary64; standard för okontextualiserade flyttalsliteraler. |
 | `bool` | `true` eller `false`; ingen implicit konvertering till/från heltal. |
 | `string` | Oföränderlig, giltig UTF-8. |
-| `&str` | Scope-bunden lånad, oföränderlig UTF-8-vy av en sträng (t.ex. `&text[a..b]`, `text.as_str()`; ej lagringsbar i struct/enum/array). |
+| `&str` | Scope-bunden lånad, oföränderlig UTF-8-vy av en sträng (t.ex. `&text[a..b]`, `text.as_str()`; kan ingå i en struct eller enum inom lånets livslängd). |
 | `u8` .. `u64`, `usize` | Osignerade heltal (bland annat `b'a'`-byteliteraler och `text[i]: u8`). |
 | `rune` | En Unicode-kodpunkt; skild från heltal och sträng. |
 | `()` | Inget returvärde; implicit returtyp för funktioner utan `->`. |
@@ -356,6 +356,17 @@ vilken parameter returvärdet lånar från.
 ```dunder
 fn tail(values: &[]i32) -> &[]i32 { &values[1..] }
 fn first(a: &i32, b: &i32) -> &i32 from a { a }
+```
+
+Delade lån får ingå i en struct eller enum. Källan följer med genom anrop,
+fältåtkomst, mönsterbindningar och `?`. I exemplet får anroparen behålla
+resultatet så länge `values` lever och elementen ligger kvar.
+
+```dunder
+fn first_if_present(values: &[]i32) -> Option<&i32> from values {
+    if values.len == 0 { return .None }
+    .Some(&values[0])
+}
 ```
 
 I en funktionstyp anges källan med ett ettbaserat parameternummer, exempelvis
@@ -722,7 +733,7 @@ fält. Importerade typer behåller sin identitet över moduler och i callbacks.
 Alla fält måste anges exakt en gång; deras ordning i uttrycket är valfri.
 Fältuttrycken utvärderas i den ordning de står i källan. Varje fält får vara
 en skalär typ, ett funktionsvärde, en fast/dynamisk array, en struct eller
-en enum. Inline-cykler avvisas; referensfält är ännu inte tillåtna.
+en enum. Ett delat lån får också vara fälttyp. Kompilatorn avvisar inline-cykler.
 
 En struct med enbart kopierbara fält kan kopieras vid bindning och
 tilldelning. Resursägande structar flyttas i stället. Vanliga
