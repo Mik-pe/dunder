@@ -63,9 +63,17 @@ elementtypen från kontexten.
 | `a.pop()` | Tar bort och returnerar sista elementet. Tom array ger status 103. |
 | `a.remove(index)` | Flyttar ut elementet vid ett `i32`-index och flyttar efterföljande element ett steg åt vänster. Ogiltigt index ger status 103. |
 | `a.swap(i, j)` | Byter två element på plats utan kloning. Båda index kontrolleras före bytet; fel ger status 103. |
-| `a.reserve(capacity)` | Säkerställer minst denna kapacitet utan att ändra längden. |
+| `a.reserve(capacity)` | Säkerställer minst denna totalkapacitet i element och behåller längden. Om reservationen avvisas fäller programmet med status 109 på nativa mål och en trap i Wasm. |
+| `a.try_reserve(capacity)` | Samma totalkapacitet. Returnerar `ReserveStatus` och behåller längd, kapacitet och element vid fel. |
 | `a.clear()` | Nollställer längden och behåller bufferten för återanvändning. |
 | `for item in a` | Läslånar samlingen under loopen, utan arraykopia. |
+
+Matcha status från `try_reserve` med `.Ok`, `.InvalidCapacity` eller
+`.OutOfMemory`. Negativa antal och antal vars buffert överskrider
+målets blockgräns ger `.InvalidCapacity`. Poolbrist och en nekad
+Wasm-minnesökning ger `.OutOfMemory`. Status lagras som en skalär enum.
+Det går därför att läsa och matcha felet även när heapen är full.
+Typen finns i preluden och som `std.array.ReserveStatus`.
 
 En växande strängarray tar ägarskap om elementet. `a.push(move text)`
 flyttar en befintlig strängägare. `a.push(text.clone())` behåller `text`
