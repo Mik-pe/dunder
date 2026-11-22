@@ -8,6 +8,10 @@
 2. Kör `check`, `build`, `run`, `test` och språkservern i ett projekt med mellanslag och svenska tecken i sökvägen. Använd ett lokalt paketberoende. Prova miljö, processavbrott, standardfel och callback över C-gränsen.
 3. Installera och uppgradera i en tom katalog. Prova även bytet medan den installerade filen används. [Installation och distribution](releases.md) · [Plattformskontrakt](targets.md)
 
+Privata filer på Windows behöver ett kontrakt för Windows åtkomstkontrollistor.
+Verifiera åtkomsten som ett annat användarkonto och utred vilka garantier ett
+beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synkning](sys.md)
+
 ## Förbättra diagnostik vid generiska lån
 
 Om en callback till `alloc.with_bytes` försöker returnera ett lån av blocket avvisas det med E4003. Låt diagnostiken visa användarens anrop tillsammans med den specialiserade signaturen. [Bytevyer och ägarskap](memory.md)
