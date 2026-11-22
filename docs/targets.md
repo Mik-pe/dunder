@@ -35,8 +35,8 @@ På macOS kan du köra de två nybyggda Linuxprogrammen i Kiri. Båda ska
 skriva `42` och `true`, en rad vardera.
 
 ```sh
-kiri run --rm --platform linux/arm64 -v "$PWD/build/arm64-linux:/out:ro" debian:bookworm-slim /out/hello
-kiri run --rm --platform linux/amd64 -v "$PWD/build/x86_64-linux:/out:ro" debian:bookworm-slim /out/hello
+kiri run --rm --platform linux/arm64 -v "$PWD/build/arm64-linux:/out:ro" arm64v8/debian:bookworm-slim /out/hello
+kiri run --rm --platform linux/amd64 -v "$PWD/build/x86_64-linux:/out:ro" amd64/debian:bookworm-slim /out/hello
 ```
 
 [Kompilatorns verifiering](../selfhost/README.md#verifiering) använder samma
