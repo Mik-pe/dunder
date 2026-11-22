@@ -123,6 +123,11 @@ skapar inga dynamiska beroenden vid Linux-kompilering.
 egna råvärden. Kontrollera laddarens resultat. Behåll bibliotekshandtaget så
 länge någon kan anropa dess funktioner.
 
+På Windows tar `open` en nollavslutad UTF-8-sökväg och laddar biblioteket
+med `LoadLibraryW`. Flaggvärdena 1 och 2 stöds. En nullpekare som sökväg
+hämtar en ägd referens till processens egen modul. Matcha varje lyckat
+`open` med ett `close`. Symbolnamnet är exportens exakta namn.
+
 ```dunder
 capability unsafe
 import std.dl
