@@ -65,10 +65,11 @@ använder libcurl, SQLite, OpenSSL 3 och Argon2. [HTTP](../docs/http.md) · [SQL
 
 `--fast` kör kärnsviterna. Utan nivåflagga körs den ordinarie verifieringen.
 `--exhaustive` tar också med de utökade sviterna och `--all` lägger till
-releaseproven. `--filter` väljer sviter med matchande namn.
+releaseproven på macOS. `--filter` väljer sviter med matchande namn.
 
-På macOS kör Kiri samma fröbygge och testsviter i Linux. Öppna Kiri och välj
-arkitektur. Alla efterföljande flaggor går till verifieringen.
+På macOS bygger skriptet Dunder från det lokala fröet och korskompilerar
+Linuxkompilatorn, verifieraren och kompilatorns API-fixtur. Öppna Kiri och
+välj arkitektur. Alla efterföljande flaggor går till verifieringen.
 
 ```sh
 ./tools/verify-selfhost.sh --linux arm64 --all --jobs 2
@@ -78,8 +79,10 @@ arkitektur. Alla efterföljande flaggor går till verifieringen.
 Kiri bygger testbilden från `debian:bookworm-slim` och systempaketen i
 `tools/verify-selfhost.sh`. Oförändrade byggsteg återanvänds ur cachen. Med
 `DUNDER_KIRI_IMAGE` kan du välja en förberedd bild för samma arkitektur.
-Gästen läser den aktuella arbetskatalogen och får en egen tillfällig
-byggvolym. På en Linuxvärd körs `./tools/verify-selfhost.sh` direkt.
+Gästen läser källträdet och de färdigbyggda ELF-filerna skrivskyddat.
+CLI-proven kompilerar sina testprogram i gästen med en egen tillfällig
+byggvolym. Releasepaketeringen provas på macOS. På en Linuxvärd körs
+`./tools/verify-selfhost.sh` direkt med värdens frö.
 
 Enskilda testgrupper kan listas, byggas och köras från projektets rot.
 
