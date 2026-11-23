@@ -63,7 +63,8 @@ för ARM64/macOS, ARM64/Linux och x86-64/Linux. Kör från repots rot.
 
 ```sh
 dunder_bin="$(./tools/bootstrap.sh)"
-"$dunder_bin" run examples/hello.ddr
+"$dunder_bin" --list-examples
+"$dunder_bin" run --example hello
 "$dunder_bin" test
 ```
 
@@ -71,6 +72,9 @@ dunder_bin="$(./tools/bootstrap.sh)"
 `build` och `test` närmaste `dunder.toml`. I det här projektet anger
 manifestet det programmet och `tests/suite.ddr` som testrot.
 [Projektmanifest och beroenden](docs/dependencies.md)
+
+`dunder run --example` visar namnen om du utelämnar vilket exempel som ska
+köras. [Körbara exempel och Tab-komplettering i zsh](docs/dependencies.md#körbara-exempel)
 
 ```sh
 "$dunder_bin" check examples/modules/math.ddr

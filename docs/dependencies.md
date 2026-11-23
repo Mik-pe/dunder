@@ -121,7 +121,18 @@ ger fel vid manifestets rad innan kompileringen börjar.
 
 ## Körbara exempel
 
-Ett projektmanifest kan mappa namngivna exempel till rotfiler under `[examples]`:
+Kör `dunder --list-examples` för att visa ett namn per rad. Kommandot utgår
+från närmaste `dunder.toml` och kan köras offline. Även `dunder run --example`
+utan namn visar vilka exempel du kan välja.
+
+Ett eget projekt under `examples/<namn>/dunder.toml` kan köras direkt från
+huvudprojektet med `dunder run --example <namn>`. Katalognamnet är namnet
+på kommandoraden. Dunder använder exempelprojektets `root`, beroenden,
+kapabiliteter och låsfil. Argument efter `--` skickas till programmet.
+
+För exempel som delar huvudprojektets manifest, ange rotfilerna under
+`[examples]`. En uttrycklig post har företräde om en exempelprojektkatalog
+har samma namn.
 
 ```toml
 name = "app"
@@ -135,8 +146,8 @@ verktyg = { path = "../verktyg" }
 atlas = "examples/atlas.ddr"
 ```
 
-Välj exempel med `--example <namn>` eller `--example=<namn>` vid `build`, `run`
-och `check`:
+Välj exempel med `--example <namn>` eller `--example=<namn>` vid `build`, `run`,
+`check` och `install`.
 
 ```sh
 dunder run --example atlas -- arg1
@@ -144,8 +155,8 @@ dunder build --example atlas
 dunder check --example atlas
 ```
 
-Exempelsökvägen tolkas relativt manifestets katalog och delar projektets
-beroendegraf och `dunder.lock` (inklusive `--offline` och `--locked`). Utan
+En sökväg i `[examples]` tolkas relativt manifestets katalog och använder
+det projektets beroendegraf och `dunder.lock` (inklusive `--offline` och `--locked`). Utan
 `-o` skrivs utdata till `build/<mål>/examples/<namn>` (med `.wasm` för
 `wasm32`/`wasm32-wasi`, `.exe` för `x86_64-windows` och `.app` med `--app`), så exempel med samma filnamn inte kolliderar
 med varandra eller med huvudprogrammet. `root` och `test_root` fortsätter att
@@ -153,6 +164,23 @@ vara standardvalen när `--example` utelämnas.
 
 Exempelnamn består av ASCII-bokstäver, siffror, `_` och `-` utan inledande
 `-`. `--example` kan inte kombineras med en positionell `.ddr`-fil.
+
+### Tab-komplettering i zsh
+
+Lägg följande i `~/.zshrc` efter att `compinit` har körts. Öppna ett nytt
+skal och tryck Tab efter `dunder run --example ` för att se projektets namn.
+Skriv början av ett namn och tryck Tab för att fylla i det.
+
+```zsh
+_dunder() {
+    case $words[2] in
+        run|build|check|install)
+            _arguments -S '--example=:example:($(dunder --list-examples 2>/dev/null))' '*:file:_files' ;;
+        *) _files ;;
+    esac
+}
+compdef _dunder dunder
+```
 
 ## Körning, installation och tester
 
