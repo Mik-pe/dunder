@@ -73,8 +73,9 @@ dunder_bin="$(./tools/bootstrap.sh)"
 manifestet det programmet och `tests/suite.ddr` som testrot.
 [Projektmanifest och beroenden](docs/dependencies.md)
 
-`dunder run --example` visar namnen om du utelämnar vilket exempel som ska
-köras. [Körbara exempel och Tab-komplettering i zsh](docs/dependencies.md#körbara-exempel)
+`dunder run --example` visar projektets exempelnamn. För att få förslag med
+Tab i zsh, lägg `eval "$(dunder shim zsh)"` i `~/.zshrc`.
+[Körbara exempel och Tab-komplettering](docs/dependencies.md#körbara-exempel)
 
 ```sh
 "$dunder_bin" check examples/modules/math.ddr

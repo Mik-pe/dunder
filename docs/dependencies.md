@@ -167,20 +167,18 @@ Exempelnamn består av ASCII-bokstäver, siffror, `_` och `-` utan inledande
 
 ### Tab-komplettering i zsh
 
-Lägg följande i `~/.zshrc` efter att `compinit` har körts. Öppna ett nytt
-skal och tryck Tab efter `dunder run --example ` för att se projektets namn.
-Skriv början av ett namn och tryck Tab för att fylla i det.
+Lägg raden i `~/.zshrc`, eller kör den direkt i zsh för att aktivera
+komplettering i det öppna skalet.
 
 ```zsh
-_dunder() {
-    case $words[2] in
-        run|build|check|install)
-            _arguments -S '--example=:example:($(dunder --list-examples 2>/dev/null))' '*:file:_files' ;;
-        *) _files ;;
-    esac
-}
-compdef _dunder dunder
+eval "$(dunder shim zsh)"
 ```
+
+Tryck Tab efter `dunder ` för att se kommandon. Efter `dunder run --example `
+föreslår Tab exempel från projektet där du står. Skriv början av ett namn
+och tryck Tab för att fylla i det. Samma komplettering finns för `build`,
+`check` och `install`. Om `$SHELL` pekar på zsh kan du utelämna `zsh`
+från `dunder shim zsh`.
 
 ## Körning, installation och tester
 
