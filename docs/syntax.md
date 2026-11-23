@@ -17,7 +17,8 @@ total += 1
 `:=` deklarerar ett nytt namn i det aktuella blocket och härleder dess typ.
 `: Typ =` gör samma sak med en explicit typ. Ett nytt `:=` med samma namn i
 samma scope är ett fel. `_ := expr` kastar bort ett returvärde utan att binda
-ett läsbart namn och kan upprepas i samma scope. Ett inre block får skugga ett
+ett läsbart namn och kan upprepas i samma scope. Både `ping()` och
+`_ := ping()` kör ett anrop som returnerar `()`. Ett inre block får skugga ett
 yttre namn.
 
 I värdeuttryck väljs en aktiv lokal bindning före ett namngivet typnamn.
@@ -341,8 +342,8 @@ anropet; skalärer kan överföras som billiga värden. Explicit `&T` fungerar
 också för läslån. `&mut T` kräver ett uttryckligt skrivlån vid anropet.
 Lokala läsreferenser kan namnges med `r := &value` eller `r: &T = &value`.
 Fält och arrayelement går också att låna. Referensen är oföränderlig och
-frisätts efter dess sista lexikala läsning i samma block och loopdjup (eller
-gäller till blockets slut vid `defer` eller ändring i en inre loop).
+frisätts efter sin sista lexikala läsning. En läsning i en loop kan köras
+igen vid nästa varv. En läsning i `defer` håller lånet vid liv till blockslut.
 Oberoende syskonfält får ändras; ett elementlån låser hela arrayen.
 Flytt, `replace` och motstridiga skrivningar av lånad lagring avvisas.
 

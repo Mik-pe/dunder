@@ -21,7 +21,7 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | --- | --- |
 | `b := a`, tilldelning, retur och konstruktion | Flyttar resursägande värden till mottagaren. |
 | Vanlig funktionsparameter | Lånar strängar och aggregat för läsning under anropet. |
-| `r := &place` | Namnger ett oföränderligt läslån fram till dess sista lexikala läsning i blocket (eller till blockslut vid `defer`/inre loopar). |
+| `r := &place` | Namnger ett oföränderligt läslån. Läsningar i en loop kan upprepas. En läsning i `defer` håller lånet vid liv till blockslut. |
 | `&mut value` | Exklusivt skrivlån av muterbar lagring, lokalt eller vid anrop. |
 | `move`-parameter och `consume(move value)` | Funktionen tar över ägarskapet. |
 | `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
@@ -176,12 +176,11 @@ lokaler. Ett fatalt runtimefel avslutar processen eller avbryter Wasm-anropet.
 
 `r := &owner.field` och `r := &values[index]` skapar oföränderliga lokala
 referenser. Typen kan härledas eller anges, exempelvis `r: &i32 = &values[0]`.
-Ett lokalt läslån inom samma block och loopdjup frisätts automatiskt efter sin
-sista lexikala användning innan en senare skrivning, `replace` eller flytt av
-ägaren. Om referensen fortfarande kan läsas senare i blocket, fångas av ett
-`defer`-block eller deklareras utanför en loop där ägaren ändras (inre
-grenslingor/loopar eller senare läsningar) ligger lånet kvar till blockslut;
-ett inre `{ ... }`-block eller sista läsningen frigör det tidigare.
+Ett lokalt läslån kan upphöra efter sin sista lexikala användning. Om den
+sista läsningen sker före en loop får loopen ändra ägaren. För ett lån som
+deklarerats utanför loopen räknas även läsningar i loophuvudet och tidigare
+i loopkroppen eftersom nästa varv kan läsa referensen igen. En läsning
+efter loopen eller i `defer` håller också lånet vid liv.
 
 ```dunder
 fn main() {
@@ -332,8 +331,8 @@ anrop kan alla uppfylla det kravet. Lokala ägare, råpekare och
 `move`-parametrar ger ingen sådan livstid.
 
 Om anroparen binder resultatet till en lokal gäller lånet fram till
-referensens sista lexikala läsning i blocket (eller till blockets slut vid
-`defer` eller när ägaren ändras i ett djupare loopscope). Det skyddar hela
+referensens sista lexikala läsning, med samma regler för loopar och
+`defer` som för direkta läslån. Det skyddar hela
 platsen som lämnades som källargument. Den som skickar `&record.bytes` kan
 alltså fortfarande ändra ett oberoende fält i `record`. Ett arrayintervall
 delar elementlagringen med originalet.

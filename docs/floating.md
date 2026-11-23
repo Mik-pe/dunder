@@ -65,6 +65,7 @@ någon operand är NaN. `0.0 == -0.0` är sant, men teckenbiten finns kvar.
 | Metod | Resultat |
 | --- | --- |
 | `x.abs()` | Absolutvärde med samma typ. |
+| `x.sin()`, `x.cos()`, `x.tan()` | Vinkel i radianer. Importera `std.math` för metoderna på `f32` och `f64`. Resultatet har mottagarens typ. |
 | `x.sqrt()` | Kvadratrot; negativt ändligt argument ger NaN. |
 | `x.floor()`, `x.ceil()` | Avrundning nedåt respektive uppåt, med samma flyttalstyp. |
 | `x.trunc()` | Avrundning mot noll, med samma flyttalstyp. |
@@ -78,6 +79,8 @@ någon operand är NaN. `0.0 == -0.0` är sant, men teckenbiten finns kvar.
 
 NaN:s exakta payload efter aritmetik är inte ett portabelt språkresultat.
 `from_bits`/`to_bits` bevarar råbitar när inga beräkningar görs på värdet.
+För ett little-endian-fält i en bytebuffert läser
+`f32.from_bits(bytes.i32_le(&data, offset))` även negativa tal och negativ noll.
 För ungefärliga jämförelser behöver programmet välja tolerans uttryckligt;
 `==` använder vanlig IEEE-likhet.
 
@@ -139,8 +142,9 @@ dunder test dogfood/numeric/main.ddr
 Programmen provar typade vektorer, omskalad hypotenusa, toleransjämförelser,
 kompenserad summering, bisektion med callback och Runge–Kutta-integration.
 Hjälparna ger exempel på hur flyttalsstödet fungerar i Dunder-program.
-Trigonometriska funktioner finns i `std.math` (`sin`, `cos`, `tan` för `f64`);
-exp/log, decimalflyttal, SIMD och float-fmod återstår.
+Metoderna i `std.math.Trigonometry` använder samma beräkning som de fria
+funktionerna `math.sin`, `math.cos` och `math.tan`. Med `f32` breddas
+vinkeln före beräkningen och resultatet avrundas till `f32`.
 
 I Dunders interna ABI passerar skalära flyttalsargument som råbitar i
 x0–x7, precis som övriga skalära argument; från det nionde argumentet

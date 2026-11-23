@@ -139,6 +139,15 @@ till målet. Dunders interna funktions-ABI är inte ett publikt C-ABI.
 
 ## Lokal verifiering
 
+Vid en vanlig körning av `tools/verify-selfhost.sh` ingår Hundmats verifierare
+och Skrifts pakettester när respektive repo finns bredvid Dunder som
+`../dunder-hundmat` och `../dunder-skrift`. Båda använder den nybyggda
+värdkompilatorn. Med `--filter ecosystem:` väljer du dessa prov.
+
+Kör interaktiva fönsterprov i en aktiv grafisk session. På Wayland kan en
+compositor pausa presentation när sessionen låses. Ett prov över SSH kan
+använda en separat renderingsväg utan fönster.
+
 Bygg med `./tools/bootstrap.sh`, kör `dunder test tests/suite.ddr` på
 värdplattformen och välj motsvarande testvärd för korsbyggd kod. QEMU kan
 köra korsbyggda Linuxprogram och Node kan instansiera Wasm-moduler.

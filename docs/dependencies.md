@@ -29,6 +29,21 @@ Biblioteksmanifest behöver inget `name`. `import matematik` läser rotmodulen;
 `import matematik.algebra` läser `algebra.ddr` i rotmodulens katalog. Saknas
 manifest kan katalogens moduler användas genom explicita submodulimporter.
 
+## Kapabiliteter
+
+Ett paket som deklarerar en kapabilitet i en importerad modul behöver få den
+beviljad i det importerande paketets manifest. Ange den under `capabilities`
+på beroendet. Exemplet ger biblioteket rätt att använda filsystemet.
+
+```toml
+[dependencies]
+bildlasare = { path = "../bildlasare", capabilities = ["filesystem"] }
+```
+
+Tillåtna namn är `filesystem`, `network`, `process`, `stdio` och `unsafe`.
+En utelämnad lista ger en tom uppsättning. För en transitiv import måste
+kapabiliteten vara beviljad längs hela beroendekedjan.
+
 ## Välj en Git-version
 
 En Git-källa får ha högst en av `branch`, `tag` och `rev`:

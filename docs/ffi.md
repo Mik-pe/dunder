@@ -40,8 +40,11 @@ ryms. Index och längd i Dunders befintliga samlings-API har typen `i32`.
 
 `@c_layout` placerar fält i deklarationsordning med naturlig justering och
 avrundar totalstorleken till den största fältjusteringen. Fält kan vara tal,
-`ptr`, `extern fn`, fasta arrayer av C-skalärer med positiv längd eller andra
-`@c_layout`-structar. Ange C-API:ets exakta typer: exempelvis `u32` för ett
+`ptr`, `extern fn`, fasta skalärarrayer eller en direkt nästlad
+`@c_layout`-struct. Till exempel stöds både `header: Header` och
+`lengths: [u32; 2]`. Fält av typen `[Header; 2]` saknar stöd.
+`string` har Dunders egen ägarmodell och får inte användas som C-fält.
+Ange C-API:ets exakta typer, exempelvis `u32` för ett
 32-bitars flaggfält. `size_of(Header)` och `align_of(Header)` ger `usize`
 för valt mål. `zeroed()` i en unsafe-kontext skapar en C-struct där alla
 fält har värdet noll. Noll kan vara ett ogiltigt handtag för ett visst API.

@@ -183,6 +183,13 @@ För en ägd kopia används `.clone()`, som på `&str` ger en `string`.
 
 ## Moduler
 
+Vid migrering av äldre kod med `result.ok` och `result.value` på en
+`Result<T, E>` ger `result.is_ok()` ett booleskt svar. Med `match` kommer
+du åt både nyttolasten i `.Ok(value)` och felet i `.Err(error)`.
+`result.ok()` ger en `Option<T>`. Äldre sökkod som jämför ett index med
+`-1` kan i stället matcha `text.find(texten, delen)` eller
+`bytes.find_byte(&data, start, end, byte)` mot `.Some(index)` och `.None`.
+
 | Import | Innehåll |
 | --- | --- |
 | Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Option<T>` (`Some(T)`, `None` med `is_some`/`is_none`/`unwrap`/`unwrap_or`/`map`/`ok_or`/`?`), `Result<T, E>` (med `is_ok`/`is_err`/`unwrap`/`unwrap_or`/`unwrap_or_default`/`map`/`map_err`/`and_then`/`ok`, `.Ok`/`.Err` utan parenteser för `()`, samt villkorliga `Eq`/`Ord`/`Hash`/`Display`) och implementationer för primitiver, `[]T` och tupler. |
@@ -198,7 +205,7 @@ För en ägd kopia används `.clone()`, som på `&str` ger en `string`.
 | `std.signal` | Portabel signalhantering för tjänster (`Signal`: `Int`, `Pipe`, `Term`; `ignore_sigpipe`/`restore_sigpipe`, `install_shutdown_handler`, `shutdown_fd`, `shutdown_requested`, `take_shutdown_signal`, `SignalWatcher`). |
 | `std.sync` | Trådsäkra koordineringsprimitiv utan delad muterbar heap: begränsad `Channel<T>` (`channel`, `Sender<T>`, `Receiver<T>`, `TryRecv<T>`, `SendResult<T>`, `select2`, `select2_cancel`, `select_ready`, `select_ready_cancel`), uppdaterbara frysta ögonblicksbilder (`Published<T>`, `ReadGuard<T>`), `Semaphore`/`SemaphorePermit`, `CancelToken` (kopplad till `std.signal`), `AtomicI64` och `AtomicBool`. |
 | `std.base64` | RFC 4648 Base64 och URL-säker Base64 (`encode`, `encode_no_pad`, `encode_url`, `encode_url_no_pad`, `decode`, `decode_url`) med strikt kontroll av utfyllnad och avslutande bitar. |
-| `std.bytes` | Packade bytebuffertar (`[]u8`), `from_text`, `from_i32`, `to_i32`, `append_utf8`, `extend`, `pad`, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex`, `hex_u8` och kontrollerad UTF-8-avkodning (`decode`, `decode_range`). |
+| `std.bytes` | Packade bytebuffertar (`[]u8`), `from_text`, `from_i32`, `to_i32`, `append_utf8`, `extend`, `pad`, nollfyllning, little-/big-endian-kodning (`append_le`, `append_be`, `set_be`, `u16_le`, `u16_be`, `i16_be`, `u32_le`, `u32_be`, `i32_le`, `i32_be`, `i64_le`, `i64_be`, `u64_le`, `u64_be`), `hex`, `hex_u8` och kontrollerad UTF-8-avkodning (`decode`, `decode_range`). |
 | `std.wire` | Binär serialisering till anroparens `[]u8` (`u8`, `bool`, fasta little-endian-tal, `f32`/`f64`, LEB128 `uvarint`, ZigZag `varint`, längdprefixade `bytes` och `str`, `Reader::new`/`Default` samt traits `Encode`/`Decode` och `wire.encode<T>`/`wire.decode<T>`). |
 | `std.json` | `Writer` (`Default`, `.finish() -> Result<string, JsonError>`), `Encode` & `Decode` (`@derive(Encode, Decode)`), `json.encode<T>`/`json.field_value<T>`/`json.to_string<T>`/`json.to_bytes<T>` för skrivning och `json.decode<T>`/`json.decode_field<T>`/`json.from_bytes<T>`/`json.from_str<T>` för läsning, samt `Doc::parse`/`Doc::parse_utf8` (`Result<Doc, JsonError>`) och `Doc::parse_bytes`/`Doc::parse_text` med `Option<T>`-fält (`get_str`, `get_i64`, `get_u64`, `get_f64`, `get_bool`), `.raw_span` och `.raw_json`. |
 | `std.sha256` | `[]u8`-API:t `digest_bytes(&[]u8)`, `digest_text(string)`, `digest_range(&[]u8, start, len)`, `hex_bytes(&[]u8)` och `hex_text(string)` ger 32 byte respektive hexsträng; `digest(&[]u8)` är ett alias för `digest_bytes`. |
