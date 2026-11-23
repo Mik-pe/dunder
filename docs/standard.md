@@ -224,6 +224,12 @@ du åt både nyttolasten i `.Ok(value)` och felet i `.Err(error)`.
 | `std.process` | Kapabilitetsstyrd processkörning (`capability process`): `Command::new` / `.exec` / `.spawn` / `.add_arg`, `Output::succeeded` / `.stdout_text`, `Executable::grant` / `.exec` / `.run` / `.spawn`, `Child` (`.wait`, `.try_wait`, `.read_stdout`, `.write_stdin`, `.take_stdin`, `.take_stdout`, `.take_stderr`, `.terminate`, `.kill`), strömhandtagen `ChildStdin`/`ChildStdout`/`ChildStderr`, `ChildSet::new` samt modulfunktioner och miljö-/värdfrågor (`env`, `host_os`, `host_arch`, `host_target`, `host_cpus`). På Linux körs den via direkta systemanrop (`sys.linux_syscall`) och start-`envp` (`sys.envp`) helt utan `libc` eller `libdl` (statisk ELF). |
 | `packages/http`, `packages/http_client`, `packages/cli`, `packages/log` | Fristående ekosystempaket i repots `packages/`: HTTP/1.1 keep-alive-server & webbprimitiv, TLS HTTP-klient, kapabilitetsfri CLI-parser (`cli.App`/`Command`/`parse`/`parse_argv`/`render_help`) samt strukturerad loggning till valfri `io.Write` (`log.Logger`, `Text`/`Json`, `Field`). |
 
+I `std.bytes` ger `u16_le` och `u16_be` ett `i32` som rymmer hela det
+osignerade 16-bitarsvärdet. Motsvarande `u32`-läsare ger `i64`.
+Använd `u32(bytes.u32_le(&data, offset))` för ett typat 32-bitarsord
+eller `bytes.i32_le(&data, offset)` för ett signerat bitmönster.
+`wire.Reader.read_u32_le` ger `u32` och flyttar läspositionen.
+
 Map och set använder öppen adressering, linjär sondering och tombstones.
 Tillväxt och omhashning är Dunder-kod. Uppdatering av en befintlig mapnyckel
 ändrar inte antalet poster. `Set.insert` returnerar sant för ett nytt värde;

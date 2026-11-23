@@ -135,8 +135,9 @@ i en samling som utanför den. Ändliga rekursiva värden, exempelvis
 `@resource` avvisas kloning och upprepade arrayliteraler statiskt.
 `for element in &values` lånar ägda element; `for element in move values`
 flyttar dem. Referenser och scratchvyer får inte lagras som arrayelement.
-Vanliga arrayer av C-layout-structar stöds, medan fasta inline-arrayer
-inne i en C-layout-struct fortfarande kräver skalära element.
+Arrayer av ohanterade `@c_layout`-structar lagrar elementen intill
+varandra med C-typens storlek och justering. Ett fast arrayfält i en
+`@c_layout`-struct har samma representation.
 
 Giltiga dynamiska arrayer har `0 <= len <= cap <= i32::MAX`, oberoende av
 minnespoolens storlek. Runtime kontrollerar önskat antal före växande
