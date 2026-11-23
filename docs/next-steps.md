@@ -51,6 +51,10 @@ I 0.11.2 bildar Dunders sökvägskod och TUI:ts konsolskrivare samma surrogatpar
 
 I 0.11.2 kan `std.time` omvandla en Unix-tidsstämpel till UTC. En kalender som markerar dagens datum behöver även operativsystemets lokala tid. Med tidsstämpeln `1711924200` gav provet 31 mars 2024 i UTC och 1 april i Europe/Stockholm på macOS och Linux. Exponera den lokala omvandlingen i `std.time` och ange hur fel och datum utanför systemets intervall rapporteras. Prova även `1704067200` i Pacific/Honolulu (31 december 2023), båda sidor av en sommartidsövergång samt en Windowsinstallation med vald lokal tidszon. [Dagens tidsfunktioner](../stdlib/time.ddr) · [Körbart datumprov](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/tests/calendar_clock.ddr)
 
+## Dela oföränderliga lokala uppslagstabeller
+
+I Dunder 0.11.2 på macOS ARM64 gav 1 048 576 uppslag i en lokal literal med 32 heltal 4 194 305 allokeringsanrop, varav 4 194 300 återanvände poolminne. Samma tabell som modulkonstant gav ett anrop för hela processen. Båda varianterna gav summan 581 894 144. Undersök om en lokal fast array med konstanta element kan läsas direkt ur programbilden när den bara används för uppslag. Mät med `--runtime-profile` och prova att skrivning i en muterbar array fortfarande är lokal för varje anrop. [Körbart prov med lägena `local` och `shared`](https://github.com/Mik-pe/dunder-tui/blob/10628cbee55d47e28e8914c594f3a0fce7af85c1/benchmarks/language/constant_tables.ddr)
+
 ## Minska kostnaden för kortlivade Option-värden
 
 I ett färgprov på ARM64/macOS med 0.11.2 gav 65 536 direkta läsningar ur en förallokerad palett 259 allokeringsanrop inklusive uppstart. När samma färg skickades som `Some(color)` och matchades direkt blev det 65 795 anrop, varav 65 535 återanvände poolminne. Båda gav kontrollsumman 549 755 781 120. Undersök om kompilatorn kan undvika mellanobjektet när värdet stannar i anropet. Kontrollera båda varianterna av `Option`, samt bevarat ägarskap när resultatet sparas. Mät även bildtid i den ursprungliga diagramvyn. [Körbart färgprov](https://github.com/Mik-pe/dunder-tui/blob/v0.9.0/benchmarks/language/colors.ddr)
