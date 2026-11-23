@@ -199,7 +199,7 @@ du åt både nyttolasten i `.Ok(value)` och felet i `.Err(error)`.
 | `std.map` | [`Map<K, V>`](#generiska-samlingar) (`K: Hash + Storable`, `V: Storable`) med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.set` | [`Set<K>`](#generiska-samlingar) (`K: Hash + Storable`) ovanpå `Map<K, bool>` med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.hash` | `hash(text)`, `mix`, `combine`, `of<T: Hash + Storable>`, `Hash` och `Hasher` (med `Default`, `.write_u64`, `.write_i64`, `.write_bytes`, `.write_str`, `.finish`). |
-| `std.text` | `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `replace`, ASCII-`lower`/`upper`, `pad_left`/`pad_right`, `split`, `trim`. |
+| `std.text` | `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `replace`, ASCII-`lower`/`upper`, `pad_left`/`pad_right`, `split`, `trim`. Utfyllnaden upprepar mönstret tills strängen når önskat antal Unicode-skalärer. Ett tomt mönster ger mellanslag och en längre indatasträng behåller sin längd. |
 | `std.text.view` | Nollallokerande `&str`-vyhjälpare: `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `trim_start`, `trim_end`, `trim`, `strip_prefix`, `strip_suffix`, `before`, `after`. |
 | `std.path` | Sökvägar utan disk-I/O. Normalisering bevarar enhetsrötter som `C:/` och nätverksresurser som `//server/share`. Modulen innehåller `is_absolute`, `join`, `basename`, `dirname`, `extension` (`Option<string>`), `stem`, `with_extension` och `normalize`. |
 | `std.time` | `monotonic_ns`, `monotonic_ms`, väggklocka (`unix_now`, `unix_now_secs`, `unix_now_ms`), `UnixTime`, `DateTime`, `utc_from_unix`, `unix_from_utc`, `format_rfc3339`, `format_rfc3339_ms` och `format_http_date`. |
