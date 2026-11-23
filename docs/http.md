@@ -102,6 +102,8 @@ och faktiskt mottagna längd kontrolleras mot samma gräns innan någon större
 buffert allokeras.
 
 På macOS används systemets libcurl. Linux behöver `libcurl.so.4`.
+Övervakade anrop använder `curl_multi_poll` (libcurl 7.66 eller senare)
+och väntar högst 100 ms per pollning innan monitorn anropas igen.
 Klientsviten använder OpenSSL för lokala TLS-fixturer.
 
 ```sh
