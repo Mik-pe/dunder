@@ -11,9 +11,9 @@ Kompilatorn länkar nativa program och signerar macOS-binärer. På macOS och Li
 kan bygget bädda in DWARF-debuginformation med `-g`. Verktygskedjan innehåller
 också en formaterare (`dunder fmt`) och en språkserver (`dunder lsp`).
 
-Dunder **0.10.0** finns för ARM64/macOS och för ARM64 och x86-64 på Linux.
-Structar och enums kan bära delade lån. Ett uppslag med `Map.get_ref` ger
-`Option<&V>` utan att klona värdet.
+Dunder **0.11.0** finns för ARM64/macOS och för ARM64 och x86-64 på Linux.
+Nu kan metoder för en typ delas upp mellan flera filer i samma paket.
+Heltalsliteraler i uttryck som `1 + n` och `n + 1` kan få sin typ från `n`.
 [Installation och kompatibilitet](docs/releases.md)
 
 ```dunder
@@ -41,6 +41,11 @@ dunder init demo && cd demo
 dunder test
 dunder run
 ```
+
+`dunder init demo` skapar programmet `src/main.ddr` och en separat
+testrot i `tests/suite.ddr`. Vill du prova hälsningen ovan, spara den i
+`src/main.ddr`. Kör `dunder test src/main.ddr` för att testa `greet` och
+`dunder run` för att skriva ut `Hej, världen!`.
 
 `dunder run program.ddr` bygger och kör en källfil. Med `dunder build program.ddr -o program`
 får du en körbar fil att distribuera. `dunder upgrade` uppdaterar kompilatorn.

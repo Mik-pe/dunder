@@ -16,6 +16,22 @@ beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synk
 
 Om en callback till `alloc.with_bytes` försöker returnera ett lån av blocket avvisas det med E4003. Låt diagnostiken visa användarens anrop tillsammans med den specialiserade signaturen. [Bytevyer och ägarskap](memory.md)
 
+## Slå upp importalias i språkservern
+
+Skapa `alpha.ddr` med `pub fn lookup(v: string) -> string { v.clone() }` och
+`beta.ddr` med `pub fn lookup(v: i32) -> i32 { v }`. Kör `dunder check main.ddr` med följande rotfil.
+
+```dunder
+import alpha as text_box
+import beta as int_box
+fn main() { print(text_box.lookup("x")); print(int_box.lookup(42)) }
+```
+
+Kompilatorn godkänner alla tre modulerna. På `lookup` i det andra anropet visar
+`textDocument/hover` strängsignaturen och `textDocument/definition` pekar på
+`alpha.ddr`. `textDocument/completion` efter `int_box.loo` ger en tom lista.
+Alla tre svaren ska använda heltalsfunktionen i `beta.ddr`.
+
 ## Följ upp mätningar för SIMD
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.

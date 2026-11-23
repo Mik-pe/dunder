@@ -77,8 +77,9 @@ uttryck tillåts inte i `const`.
 | `range` | Ett intervall med `i32`-gränser; `a..b` är halvöppet, `a..=b` inkluderar båda gränserna. |
 | `TaskID<R>` | En kopierbar resultatnyckel till en [isolerad uppgift](tasks.md). |
 
-Literaler får typ från en annotering, funktionens parameter/returtyp eller
-den andra heltalsoperanden. Befintliga värden konverteras aldrig implicit
+Numeriska literaler kan få sin typ från en annotering, funktionens parameter
+eller returtyp, eller en typad operand på valfri sida. Om `n` är en `i64`
+blir både `1 + n` och `n + 1` en `i64`. Befintliga värden konverteras aldrig implicit
 mellan `i16`, `i32` och `i64`. Konvertering till en smalare typ, exempelvis
 `i16(value)`, kontrollerar att värdet ryms. En literal utanför sitt typintervall är ett typfel.
 Flyttalsliteraler, konverteringar, NaN, avrundning och numeriska metoder
@@ -141,11 +142,11 @@ nästlade interpolerade strängar. De utvärderas exakt en gång i källordning.
 Tidigare strängvärden hålls levande även om ett senare hål ersätter deras
 ursprungliga variabel. Resultatet är en vanlig ägd `string`.
 
-Tillåtna resultattyper är `string` och `&str`, signerade och osignerade
-heltal, `usize`, `bool`, `rune`, `f32` och `f64`. Standardformatet motsvarar
-`.str()`; för en sträng delar `.str()` dess oföränderliga text och för en
-`&str`-vy skapas en ägd `string`. Aggregat, råpekare och
-funktioner kräver att programmet först väljer en textrepresentation.
+Utan formatangivelse använder `f"{value}"` metoden `value.str()`.
+Det fungerar för strängar, strängvyer, tal, `bool` och `rune`, och även
+för egna typer med en åtkomlig `str()` som returnerar `string`.
+Med `impl Display` eller `@derive(Display)` kan samma typ även skrivas
+direkt med `print(value)`.
 
 Heltal kan formateras med `:d` för decimal, `:x` för gemena hexadecimala
 siffror och `:X` för versaler. En bredd före formatkoden fyller ut med
@@ -302,16 +303,24 @@ typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
   infångade miljö genom referensräkning i stället för att djupkopiera fångade värden.
 - `Clone` och `Copy` är strukturella och kan inte implementeras manuellt.
 
-Förladdade kärntraits från preludium finns alltid tillgängliga utan import:
-`Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord: Eq`, `Hash: Eq`,
-`Display` och `Default`. De är implementerade för primitiva värden (utom att
-`f32` och `f64` avsiktligen inte implementerar `Eq`, `Ord` eller `Hash` — bara
-`Display`, `Default`, `Clone`, `Copy` och `Sendable`), `Option<T>`, `Result<T, E>` samt
-sammansatta typer `[]T`, `(A, B)` och `(A, B, C)` när deras elementtyper
-uppfyller motsvarande krav (`impl Default for []T where T: Storable`).
+I preludiet finns `Eq`, `Ord: Eq`, `Hash: Eq`, `Display` och
+`Default` utan import. Metoden `cmp` i `Ord` returnerar enumtypen `Ordering` med
+varianterna `Less`, `Equal` och `Greater`. Heltal, `bool`, `rune` och `string`
+stöder alla fem. Flyttal stöder `Display` och `Default`.
+[Jämförelser för flyttal](floating.md#aritmetik-och-ieee-värden)
+
+`Option<T>` och `Result<T, E>` stöder `Eq`, `Ord`, `Hash` och `Display`
+när deras innehållstyper uppfyller motsvarande krav. Standardvärdet för
+`Option<T>` är `.None`. Dynamiska arrayer och tupler med två eller tre
+element stöder `Eq`, `Ord` och `Hash` på samma villkor. Standardvärdet för
+`[]T` är en tom array när `T: Storable`. En tupel kan skapas med `Default`
+när varje elementtyp har ett standardvärde.
+
 Structar och enum kan dessutom automatiskt härleda implementationer med
 `@derive(Eq, Hash, Display, Default)` samt JSON-serialisering med
 `@derive(Encode, Decode)` (kräver `std.json`).
+För `@derive(Eq)` måste varje structfält och varje värde i en enumvariant
+ha en typ som implementerar `Eq`.
 Uttryck som `Result<T, ()>` och `Result<(), E>` konstrueras med bara `.Err`
 respektive `.Ok` när payloadtypen är `()`.
 
@@ -410,6 +419,7 @@ fn main() {
     assert(previous.len == 2 && values.len == 0)
     next: []i32 = [42]
     empty := replace(&mut values, move next)
+    assert(empty.len == 0 && values[0] == 42)
 }
 ```
 
@@ -577,8 +587,9 @@ array eller resurs flyttas när den binds eller plockas isär. Bindningen
 
 `fn main()` körs vid programstart och ger exitkod 0. Med `fn main() -> i32`
 används returvärdet som processens exitkod. Exempelvis ger `return 7` exitkod
-7, även genom `dunder run`. Felaktig eller saknad `main` upptäcks vid
-typkontroll. En vanlig funktion utan `->` returnerar `()`; den får använda
+7, även genom `dunder run`. `dunder build` och `dunder run` kräver en
+startpunkt i rotfilen. `dunder check` kan även kontrollera en biblioteksmodul
+utan `main`. En vanlig funktion utan `->` returnerar `()`; den får använda
 `return` utan värde eller nå slutet av kroppen. En funktion med returtyp
 måste returnera ett värde av rätt typ på alla vägar enligt kontrollen ovan.
 
@@ -587,18 +598,17 @@ till stderr och programmets stdout bevaras. Ett kompileringsfel startar
 aldrig en tidigare binär från samma utdataplats.
 
 `if` och `while` kräver `bool`, aldrig ett heltal. `else if`, `else`, `break`
-och `continue` stöds. Block ger lexikala scope. `print` tar ett skalärvärde
-(`i32`, `i64`, flyttal, `bool`, `rune`, `string`, `&str`), ett heltal eller
-enum, eller valfri typ som implementerar `Display` (via `.str()`), följt av
-radbrytning.
-Stränginterpolering `f"{x}"` använder på samma sätt `Display`/`.str()`.
+och `continue` stöds. Block ger lexikala scope. `print` skriver en rad
+med ett tal, `bool`, `rune`, `string`, `&str` eller en typ som implementerar
+`Display`. En enum kan till exempel använda `@derive(Display)`.
 `assert(condition)` kräver `bool` och avslutar processen vid `false`.
 
 Vanliga enkla satser avslutas med radbrytning eller valfritt semikolon.
 `}` får avsluta den sista satsen i ett block. Parenteser tillåter flerradiga
 anrop och uttryck; en rad får fortsätta efter en binär operator.
 Kommentarer skrivs `// ...` eller `/* ... */`. Källan är UTF-8 och namn
-får innehålla bokstäver som `å`, `ä` och `ö`; nyckelorden är engelska.
+får innehålla bokstäver som `å`, `ä` och `ö`, även i lokala bindningar och
+parametrar. Nyckelorden är engelska.
 
 ## Moduler och importer
 
@@ -682,15 +692,18 @@ följer samma synlighetsregel; fält och varianter följer typens synlighet.
 Funktionsvärden och deras strukturella typer
 fungerar likadant över modulgränser som inom en fil.
 
-En import kopierar inga namn till aktuell namnrymd. `math.double` fungerar;
-`double` kräver en egen lokal bindning, exempelvis `double := math.double`.
+En modulimport binder ett modulalias. Med `import math` anropas funktionen
+som `math.double`. En lokal bindning som `double := math.double` ger den
+ett kortare namn. Med `import std.math as _` laddas modulen utan att binda
+ett namn. Då kan du exempelvis anropa `angle.sin()` på ett flyttal.
 Alias får inte krocka med ett annat importalias eller en toppnivåfunktion i
 samma fil. Lokala värden får skugga ett alias; det skuggade namnet ger då
 inte längre tillgång till modulen i det scopet. En moduls egna importer
 exporteras inte vidare. Varje fil importerar sina egna beroenden uttryckligt.
 
-Moduler innehåller funktioner, struct- och enumdeklarationer, inga globala värden
-eller initialiseringskod. Typer och signaturer från hela grafen fastställs före kropparna.
+Moduler kan innehålla konstanter, funktioner, typdeklarationer och
+`impl`-block. Konstanternas värden beräknas vid kompilering. Körbara
+satser hör hemma i funktioner. Typer och signaturer från hela grafen fastställs före kropparna.
 Cirkulära importer är därför tillåtna och kan innehålla ömsesidig rekursion.
 Den kanoniska filsökvägen identifierar en modul: flera alias, gemensamma
 beroenden och symboliska länkar laddar samma fil en gång. Filernas och

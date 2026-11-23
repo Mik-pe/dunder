@@ -1,10 +1,10 @@
 # Distribuera Dunder
 
-## Versionsserien 0.10
+## Versionsserien 0.11
 
-Från `0.10.0` ska program som följer den dokumenterade syntaxen,
+Från `0.11.0` ska program som följer den dokumenterade syntaxen,
 typ- och ägarskapsreglerna och standardbibliotekets publika kontrakt fortsätta
-att bygga och ha samma dokumenterade beteende i senare 0.10-versioner.
+att bygga och ha samma dokumenterade beteende i senare 0.11-versioner.
 Löftet gäller ARM64/macOS och Linux på ARM64 och x86-64. Varje kandidat provas
 med den självbyggda kompilatorn på alla tre värdarna. Underhållsversioner får lägga till API:er
 och rätta fel där kompilatorn tidigare accepterade ogiltiga program. En ändring
@@ -16,6 +16,24 @@ diagnostiktext kan ändras. Windows är en förhandsversion. WebAssembly och WAS
 korskompileringsmål med egna begränsningar för bland annat systemanrop och tasks.
 Stabila installationer följer fortsatt den stabila releasekanalen.
 [Målplattformar](targets.md)
+
+### Uppgradera från 0.10
+
+Kör `dunder upgrade` och sedan `dunder test` i projektet. Två kontroller kan
+ge nya felmeddelanden i befintlig kod.
+
+- Med `@derive(Eq)` måste varje structfält och varje enumvariants nyttolast
+  uppfylla traiten `Eq`. Om en fälttyp har en egen `eq`-metod, lägg den i
+  `impl Eq for Typ` eller använd `@derive(Eq)` även på fälttypen.
+- En closure som fångar en ägd array eller resurs genom värde tar över den
+  även när samma closure också innehåller lån. Behöver du fortsätta använda
+  ägaren efteråt kan du låna värdet i fångstlistan, till exempel
+  `fn[&values, &offset]() -> i32 { values.len + offset }`.
+
+Bygg om FFI-kod som använder arrayer av `@c_layout`-structar. Avståndet i
+byte mellan två element är nu `size_of(Typ)`, som i en C-array. Övervakade
+HTTP-anrop behöver libcurl 7.66 eller senare för att kunna avbrytas även
+under väntan på TLS eller svarshuvuden. [C-layout](ffi.md) · [HTTP-klienten](http.md)
 
 ## Installera en kompilator
 
@@ -30,7 +48,7 @@ dunder --version
 ```
 
 `--release` väljer senaste stabila version. För en bestämd tagg kan du
-exempelvis köra `sh install-dunder.sh --release v0.10.0`. Skriptet kontrollerar
+exempelvis köra `sh install-dunder.sh --release v0.11.0`. Skriptet kontrollerar
 SHA-256 för arkivet och den uppackade binären samt att kompilatorn rapporterar
 rätt version och värd innan den ersätter `dunder` i installationskatalogen.
 
@@ -74,10 +92,10 @@ ersättningsfilens ursprungliga plats.
 
 Bygg projektets release på ARM64/macOS. Ange versionsnumret från
 `compiler_version()` i `selfhost/driver/cli.ddr`. Med följande kommando
-hamnar de färdiga filerna i `build/release/v0.10.0/`.
+hamnar de färdiga filerna i `build/release/v0.11.0/`.
 
 ```sh
-./tools/release.sh v0.10.0
+./tools/release.sh v0.11.0
 ```
 
 Med en lokal versionstagg byggs den commit som taggen pekar ut. Utan tagg
@@ -85,14 +103,23 @@ används `HEAD`. Skriptet packar upp de incheckade källorna i en tillfällig
 katalog och kör `tools/bootstrap.sh` där. Macens kompilator måste nå
 fixpunkt och rapportera versionen från taggen. Den korskompilerar sedan
 Linux- och Windowskompilatorerna från samma ingång, `selfhost/main.ddr`.
-Linuxproven i Kiri kör Macens artefakter för ARM64 och x86-64.
-Inför x86-64-proven kontrollerar skriptet att ett program kan välja
+Kör hela testsviten inför publicering från samma incheckade revision.
+Det första kommandot provar även releasepaketeringen på macOS. De andra
+två kör de korsbyggda kompilatorerna i Kiri.
+
+```sh
+./tools/verify-selfhost.sh --all
+./tools/verify-selfhost.sh --linux arm64 --all
+./tools/verify-selfhost.sh --linux x86_64 --all
+```
+
+Inför x86-64-proven kontrollerar verifieraren att ett program kan välja
 `argv[0]` vid processbyte. Om Kiri använder Rosetta utan detta stöd
 registrerar skriptet samma Rosetta med flaggan `P` i en privat
 användar- och monteringsnamnrymd. Initieringen behöver `SYS_ADMIN` för
 namnrymden och `SETFCAP` för rotanvändarens id-mappning. Alla
 Linux-capabilities släpps före proven och containerns seccomp-filter är aktivt.
-Med `--outdir KATALOG` kan paketen skrivas till en annan katalog.
+Med `release.sh`-flaggan `--outdir KATALOG` kan paketen skrivas till en annan katalog.
 
 ## Publicera
 
@@ -100,14 +127,14 @@ När bygget ska bli tillgängligt för `dunder upgrade`, använd Git med
 skrivrättighet till repot och en autentiserad GitHub CLI.
 
 ```sh
-./tools/release.sh v0.10.0 --publish
+./tools/release.sh v0.11.0 --publish
 ```
 
 Om taggen saknades vid provbygget, sätt den på
 commitvärdet i `release.txt` innan publiceringskommandot körs.
 
 ```sh
-git tag v0.10.0 "$(sed -n 's/^commit=//p' build/release/v0.10.0/release.txt)"
+git tag v0.11.0 "$(sed -n 's/^commit=//p' build/release/v0.11.0/release.txt)"
 ```
 
 En befintlig tagg på GitHub styr källrevisionen. Om taggen saknas skapar
@@ -123,10 +150,10 @@ publicerad release jämför skriptet de publicerade filerna med det lokala
 bygget.
 
 Skriptet skriver en kort standardbeskrivning. En förberedd versionstext kan
-läggas i `build/release/v0.10.0/notes.md` och uppdateras separat:
+läggas i `build/release/v0.11.0/notes.md` och uppdateras separat:
 
 ```sh
-gh release edit v0.10.0 --repo Mik-pe/dunder --notes-file build/release/v0.10.0/notes.md
+gh release edit v0.11.0 --repo Mik-pe/dunder --notes-file build/release/v0.11.0/notes.md
 ```
 
 ## Filer som uppgraderaren läser
@@ -142,7 +169,7 @@ gh release edit v0.10.0 --repo Mik-pe/dunder --notes-file build/release/v0.10.0/
 | x86-64 Windows | `x86_64-windows.exe` | `x86_64-windows.sha256` |
 
 `dunder upgrade` läser manifestet från GitHubs senaste stabila release.
-`dunder upgrade --version v0.10.0` väljer den namngivna releasen.
+`dunder upgrade --version v0.11.0` väljer den namngivna releasen.
 
 `dunder run tools/test_release.ddr` (eller `./tools/verify-selfhost.sh --release`) provar paketering, avbruten uppladdning och
 omkörning i en lokal Git-kopia med simulerad GitHub CLI.
