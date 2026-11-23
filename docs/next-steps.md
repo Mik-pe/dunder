@@ -43,6 +43,8 @@ På 0.11.2 ger `operation().unwrap()` E1002 när `operation` returnerar `Result<
 
 I 0.11.2 läser `std.terminal.size()` från standardutmatningen och `RawMode::enter()` ändrar standardinmatningen. En process som förbereder en annan terminal för ett barn behöver fortfarande egna termios-anrop. Ge båda operationerna ett alternativ som tar ett öppet handtag. Prova två pseudoterminaler med olika storlek, återställning vid tidig retur och oförändrade föräldraströmmar. På Windows ska storleken gå att läsa från vald skärmbuffert och konsolläget återställas på valt indatahandtag. [Terminalresursen](../stdlib/terminal.ddr) · [Konsolprovet](../tests/fixtures/windows-terminal.ddr)
 
+Låt storleksfrågan på Unix också exponera pixelbredd och pixelhöjd från samma systemanrop. I ett körbart prov ändrades pixelmåtten från 0 × 0 till 813 × 719 medan cellmåtten låg kvar på 45 × 8. Prova även en ensam känd axel, 65 535 och skillnaden mellan en terminal utan pixeluppgift och ett handtag som är en pipe. [Prov på macOS och Linux](https://github.com/Mik-pe/dunder-tui/blob/1c92bea6f93c819e98b64ce3f807f862596d4865/tests/window_terminal.ddr)
+
 ## Dela UTF-16-kodningen mellan Windowsanrop
 
 I 0.11.2 bildar Dunders sökvägskod och TUI:ts konsolskrivare samma surrogatpar för tecken över U+FFFF. Lägg den gemensamma kodningen i standardbiblioteket och låt anroparen återanvända en `[]u16`. En konsolsträng ska kunna innehålla U+0000. Sökvägsfunktionen ska fortsätta avvisa inre nollor och lägga till en avslutande nolla. Prova tom text, `Ö🌍` och `a\0b` för båda anropssätten. [Sökväg och befintliga prov](../stdlib/sys/winpath.ddr) · [Konsolskrivaren](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/src/windows.ddr#L162-L186)
