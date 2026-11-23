@@ -886,8 +886,8 @@ värde vid t.ex. `out.push(x)`.
 
 `start..end` har typen `range`, inkluderar start och utesluter slut;
 `start..=end` inkluderar båda gränserna. Gränserna är `i32`, utvärderas en
-gång och iterationen går uppåt. Om start är större än eller lika med slut
-blir det noll varv. Intervall kan lagras, skickas och returneras som vanliga
+gång och iterationen går uppåt. Om start är större än slut blir det noll
+varv. Lika gränser ger noll varv med `..` och ett varv med `..=`. Intervall kan lagras, skickas och returneras som vanliga
 värden.
 
 `for` stöder intervall, arrayer, `.iter()`-värden, uppslagstabeller och
