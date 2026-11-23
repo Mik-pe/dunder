@@ -1009,7 +1009,7 @@ Byte-escapes valideras tillsammans: `"\xC3\xA5"` är `"å"`, men `"\xFF"`
 är ett kompileringsfel. Surrogates och värden över Unicode-intervallet
 avvisas. NUL är tillåten i strängdata; längden avgör slutet, ingen nollterminering används.
 
-Råa strängar skrivs `r"..."`, `r'...'`, `r#"..."#` (med godtyckligt antal `#`)
+Råa strängar skrivs `r"..."`, `r'...'`, `r#"..."#` (med högst 64 `#`)
 samt flerradiga `"""..."""` och `r#"""..."""#` (och `f"""..."""` med
 interpolering). Flerradiga literaler använder automatisk dedent efter
 avslutningsradens indentering; oescapade radbrytningar tillåts i flerradiga och
