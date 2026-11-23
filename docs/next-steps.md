@@ -19,6 +19,10 @@ beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synk
 
 Med 0.11.2 på macOS ARM64 lägger `if target_is("windows") && enabled` till `kernel32.dll` i Mach-O-filens laddningskommandon. Bygget lyckas men programmet avslutas innan `main`. Två nästlade `if` ger en körbar fil utan DLL-importen. Prova båda formerna med `otool -L`, kör programmen och kontrollera att ett Windowsbygge fortfarande kan anropa `GetCurrentProcessId`. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/0a9b6dfc4c29ed1fd2d40f8289fc897c54d9e034/tests/dogfood/compiler/target_condition.ddr)
 
+## Visa källkodens typnamn i fel för konstanter
+
+En färgskala med två `u32`-fält ger i 0.11.2 felet E3007 vid `const INK: Scale`. Både `check` och `build` visar `__dunder_module_0` som typnamn. Bevara namnet `Scale` i diagnostiken och ange vilka konstanttyper som stöds. Prova även en importerad posttyp, och kontrollera att samma värden i en fast array fortfarande går att bygga och läsa. [Posten som utlöser felet](https://github.com/Mik-pe/dunder-tui/blob/9e5e89a4e3a6c48d6c3ab509243dd8234d900f34/tests/dogfood/compiler/record_constant.ddr) · [Fungerande array](https://github.com/Mik-pe/dunder-tui/blob/9e5e89a4e3a6c48d6c3ab509243dd8234d900f34/tests/dogfood/compiler/array_constant.ddr) · [Konstanternas typregler](syntax.md#konstanter-på-modulnivå)
+
 ## Härled mottagartypen över en modulgräns
 
 I 0.11.2 avslutas `dunder check` med kod 103 utan diagnostik när `holder := factory.make()?` följs av `holder.get(7)`. Fabriken returnerar `Result<Holder<i32>,string>` och metoden är generisk. Med typen `factory.Holder<i32>` utskriven går programmet att bygga och köra. Kör båda varianterna och kontrollera returvärdet 7. [Tvåmodulsprov](https://github.com/Mik-pe/dunder-tui/tree/adc3814204ec460685054aa39b439efcc22921ba/tests/dogfood/compiler/inferred_receiver)
