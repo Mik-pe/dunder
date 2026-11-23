@@ -31,6 +31,10 @@ I 0.11.2 avslutas `dunder check` med kod 103 utan diagnostik när `holder := fac
 
 På 0.11.2 fungerar `Runner<i32>.outer<i32>` och `Runner<bool>.outer<i32>` var för sig. Om båda anropar den generiska metoden `inner` i samma program får det andra anropet E2003 oavsett ordning. Kör båda mottagartyperna i båda ordningarna och kontrollera varje returvärde. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/tests/dogfood/compiler/nested_methods.ddr)
 
+## Förklara lånet när en metod matchar på ett eget fält
+
+I 0.11.2 ger `match self.mode` följt av `self.grow()` i en gren E4003 om mutation under iteration. Programmet har varken en samling eller en loop. Visa vilket fält matchningen lånar och var det muterande anropet sker. Utvärdera om lånet kan avslutas före anropet i en gren som inte binder några variantdata. Prova även en gren som fortfarande använder ett lånat fält efter anropet. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/2758201f70c69e44e7453f73f15dc41df1c6a968/tests/dogfood/compiler/match_receiver.ddr) · [Fungerande lokal kopia](https://github.com/Mik-pe/dunder-tui/blob/2758201f70c69e44e7453f73f15dc41df1c6a968/tests/dogfood/compiler/match_receiver_copy.ddr)
+
 ## Låt en lokal vy läsa från två ägare
 
 En iterator över ändrade celler behöver läsa både föregående och aktuell bild. I 0.11.2 går det att lagra två delade lån från samma array i en post. Två lokala ägare ger E4003 även när de båda lever längre än posten. Utvärdera om en lokal vy kan knytas till båda ägarna. Prova tidigt avslutad iteration samt att fortsatt användning av vyn håller båda ägarna lånade och att båda blir skrivbara efter sista läsningen. [Två ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views.ddr) · [Gemensam ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views_one_owner.ddr)
