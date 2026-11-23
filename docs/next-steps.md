@@ -53,3 +53,7 @@ Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har
 ## Mät temporära värden när små poster läggs i en array
 
 Fyra omgångar med 4 096 tvåfältsposter gav samma kontrollsumma och 16 387 allokeringsanrop för vanliga poster och `@c_layout` på 0.11.1. Antalet färska allokeringar var 4 099 respektive 4. Följ värdet från konstruktion till `push`, redovisa poolåterbruk separat och mät nyttan av att konstruera direkt i arrayen. [Körbart jämförelseprov](https://github.com/Mik-pe/dunder-tui/blob/v0.7.0/benchmarks/language/records.ddr)
+
+## Formatera generiska fält konsekvent
+
+Kör `dunder fmt --stdout` på en fil med `struct Pair { first: Option<i32>, last: Option<i32> }`. I 0.11.1 blir sista fältet `Option < i32 >` medan det första behåller `Option<i32>`. Bevara typens skrivsätt även precis före `}`. Kontrollera båda fälten, en andra formattering och att jämförelser som `a < b` behåller sina mellanrum.
