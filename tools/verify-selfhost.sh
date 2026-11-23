@@ -44,7 +44,7 @@ ARG TARGETARCH
 RUN test "$(dpkg --print-architecture)" = "$TARGETARCH" && \
     apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     binutils-multiarch build-essential ca-certificates clang curl file git gzip \
-    libargon2-dev libcurl4-openssl-dev libsqlite3-dev libssl-dev nodejs openssl \
+    libargon2-dev libcurl4-openssl-dev libsqlite3-dev libssl-dev llvm nodejs openssl \
     && rm -rf /var/lib/apt/lists/*
 IMAGE
         )

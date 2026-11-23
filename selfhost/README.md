@@ -62,7 +62,9 @@ kompilatorn. Regenerera [bundled.ddr](bundled.ddr) innan kompilatorn byggs om.
 `./tools/verify-selfhost.sh` börjar med ett nytt självbygge från värdens frö.
 
 Testverktygen i Dunder kör bland annat Node.js för Wasm och en C-kompilator för
-ABI-proven. Git, curl, gzip och openssl används också. Biblioteksproven
+ABI-proven. DWARF-proven använder `/usr/bin/dwarfdump` på macOS och
+`/usr/bin/llvm-dwarfdump` på Linux (Debianpaketet `llvm`).
+Git, curl, gzip och openssl används också. Biblioteksproven
 använder libcurl, SQLite, OpenSSL 3 och Argon2. [HTTP](../docs/http.md) · [SQLite](../docs/sqlite.md)
 · [Kryptobibliotek per plattform](../docs/crypto.md)
 
