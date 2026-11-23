@@ -11,9 +11,9 @@ Kompilatorn länkar nativa program och signerar macOS-binärer. På macOS och Li
 kan bygget bädda in DWARF-debuginformation med `-g`. Verktygskedjan innehåller
 också en formaterare (`dunder fmt`) och en språkserver (`dunder lsp`).
 
-Dunder **0.11.0** finns för ARM64/macOS och för ARM64 och x86-64 på Linux.
-Nu kan metoder för en typ delas upp mellan flera filer i samma paket.
-Heltalsliteraler i uttryck som `1 + n` och `n + 1` kan få sin typ från `n`.
+Dunder **0.11.1** finns för ARM64/macOS och för ARM64 och x86-64 på Linux.
+`dunder run --example` listar nu projektets exempel, även de som har ett
+eget manifest. Med `dunder shim zsh` kan du få namnen som Tab-förslag.
 [Installation och kompatibilitet](docs/releases.md)
 
 ```dunder
