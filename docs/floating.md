@@ -98,10 +98,12 @@ Bool och rune konverteras inte direkt till flyttal.
 
 ## Decimalutskrift i Dunder
 
-[runtime/float.ddr](../runtime/float.ddr) implementerar utskriften i Dunder.
-Kompilatorn bäddar in och kompilerar funktionen när ett program använder
-`print` eller `.str()` på flyttal. Färdiga program behöver inte källfilen,
-extern C-runtime, libm eller något kompilatorverktyg vid körning.
+`.str()` använder Dunders decimalformatterare på alla mål. På nativa mål
+och `wasm32-wasi` använder även `print(x)` formatteraren. På `wasm32`
+skickar `print(x)` flyttalet till värdens `print_f32` eller `print_f64`.
+Använd `print(x.str())` för att skicka den färdiga decimaltexten till värden.
+Kompilatorn bäddar in formatteraren i program som använder den.
+[Formatterarens källkod](../runtime/float.ddr)
 
 Formatteraren bygger exakta decimalgränser för värdets avrundningsintervall
 och söker den kortaste decimalrepresentationen som avrundas tillbaka till
