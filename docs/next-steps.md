@@ -41,7 +41,7 @@ I 0.11.2 bildar Dunders sökvägskod och TUI:ts konsolskrivare samma surrogatpar
 
 ## Hämta lokal kalendertid för ett givet ögonblick
 
-I 0.11.2 kan `std.time` omvandla en Unix-tidsstämpel till UTC. En kalender som markerar dagens datum behöver även operativsystemets lokala tid. Med tidsstämpeln `1711924200` gav provet 31 mars 2024 i UTC och 1 april i Europe/Stockholm på macOS och Linux. Exponera den lokala omvandlingen i `std.time` och ange hur fel och datum utanför systemets intervall rapporteras. Prova även `1704067200` i Pacific/Honolulu (31 december 2023), båda sidor av en sommartidsövergång samt en Windowsinstallation med vald lokal tidszon. [Dagens tidsfunktioner](../stdlib/time.ddr)
+I 0.11.2 kan `std.time` omvandla en Unix-tidsstämpel till UTC. En kalender som markerar dagens datum behöver även operativsystemets lokala tid. Med tidsstämpeln `1711924200` gav provet 31 mars 2024 i UTC och 1 april i Europe/Stockholm på macOS och Linux. Exponera den lokala omvandlingen i `std.time` och ange hur fel och datum utanför systemets intervall rapporteras. Prova även `1704067200` i Pacific/Honolulu (31 december 2023), båda sidor av en sommartidsövergång samt en Windowsinstallation med vald lokal tidszon. [Dagens tidsfunktioner](../stdlib/time.ddr) · [Körbart datumprov](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/tests/calendar_clock.ddr)
 
 ## Minska kostnaden för kortlivade Option-värden
 
@@ -50,3 +50,7 @@ I ett färgprov på ARM64/macOS med 0.11.2 gav 65 536 direkta läsningar ur en f
 ## Följ upp mätningar för SIMD
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
+
+## Profilera bildritning på fysisk x86-64
+
+Sex kalendrar gav samma celler i 1 100 bilder i Dunder 0.11.2 och Ratatui. I en pseudoterminal tog en oförändrad bild i median 27 respektive 41 µs på Linux ARM64. På samma värd med x86-64-översättning tog den 265 respektive 68 µs. Kör de låsta programmen på fysisk Linux x86-64 och jämför både ritning i minnet och utmatning till terminal. Om skillnaden kvarstår, profilera den långsamma bildvägen och isolera det dyraste anropet innan kodgeneratorn eller biblioteket ändras. [Körkommandon och arbetslast](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/calendar.md) · [Mätvärden och spridning](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/results/calendar-0.12.0.tsv)
