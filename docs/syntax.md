@@ -842,7 +842,7 @@ fn main() {
 ```
 
 `[a, b, c]` bygger en array. `[value; N]` utvärderar `value` en gång och
-upprepar värdet. Längden måste vara en heltalsliteral. Elementtypen är
+upprepar värdet. Längden anges med en heltalsliteral eller en namngiven heltalskonstant. Elementtypen är
 en lagringsbar typ som ett primitivt värde, en struct, en enum eller en
 annan array. Den härleds eller hämtas från förväntad arraytyp.
 En fast array får använda högst 1 048 575 byte. Tomma arrayliteraler kräver explicit typ.
