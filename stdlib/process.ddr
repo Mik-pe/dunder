@@ -27,6 +27,9 @@ unsafe fn c_execve(path: ptr, argv: ptr, envp: ptr) -> i32
 unsafe fn c_exit(code: i32)
 @extern("c", "pipe")
 unsafe fn c_pipe(fds: ptr) -> i32
+@c_variadic(2)
+@extern("c", "fcntl")
+unsafe fn c_fcntl(fd: i32, op: i32, arg: i32) -> i32
 @extern("c", "dup2")
 unsafe fn c_dup2(oldfd: i32, newfd: i32) -> i32
 @extern("c", "close")
@@ -326,6 +329,19 @@ impl Command {
     pub fn exec(&self) -> Output { exec_internal(self.program, &self.args, &self) }
 
     @requires(process)
+    pub fn spawn_with_handles(&self, input: Option<usize>, output: Option<usize>, error_output: Option<usize>) -> Result<Child, sys.IoError> {
+        mut handles: [i64; 3] = [-1; 3]
+        choices := [input, output, error_output]
+        for i in 0..3 {
+            if choices[i].is_some() {
+                handle := i64(choices[i].unwrap())
+                if handle == -1 || (!target_is("windows") && (handle < 0 || handle > 2147483647)) { return .Err(.BadDescriptor) }
+                handles[i] = handle
+            }
+        }
+        spawn_handles(self.program, &self.args, &self, self.stdin_mode, &handles)
+    }
+
     pub fn spawn(&self) -> Result<Child, sys.IoError> { spawn_internal(self.program, &self.args, &self, self.stdin_mode) }
 }
 
@@ -963,21 +979,55 @@ fn effective_path(cmd: &Command) -> string {
 }
 
 fn spawn_internal(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdio) -> Result<Child, sys.IoError> {
+    handles: [i64; 3] = [-1; 3]
+    spawn_handles(program, &args, &cmd, stdin_mode, &handles)
+}
+
+unsafe fn duplicate_stream(fd: i32, check: bool) -> i32 {
+    if target_is("macos") {
+        result := c_fcntl(fd, if check { 1 } else { 67 }, 3)
+        if result < 0 { return -macos_errno() }
+        return result
+    } else if target_is("linux") {
+        result := sys.linux_syscall(25, i64(fd), if check { i64(1) } else { i64(1030) }, 3, 0, 0, 0)
+        if result < 0 { return -portable_errno(i32(-result), false) }
+        return i32(result)
+    }
+    -45
+}
+
+fn spawn_handles(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdio, handles: &[i64; 3]) -> Result<Child, sys.IoError> {
     if target_is("windows") {
         streams := win.Streams { input: i32(stdin_mode), output: i32(cmd.stdout_mode), error_output: i32(cmd.stderr_mode), output_path: "" }
         unsafe {
             env_block := win.environment(&cmd.env_keys, &cmd.env_vals, &cmd.env_unset, cmd.env_mode == .Inherit, wide.path)
             search := !text.contains(program, "/") && !text.contains(program, "\\") && !text.contains(program, ":")
-            child := win.start(program, &args, cmd.cwd, &env_block, &streams, search, wide.path)
+            child := win.start_with_handles(program, &args, cmd.cwd, &env_block, &streams, search, wide.path, &handles)
             if child.error != 0 { return .Err(sys.IoError::from_code(child.error)) }
             return .Ok(Child { pid: child.pid, pgid: -1, win_process: i64(usize(child.process)), win_job: i64(usize(child.job)),
                                stdin_fd: child.input, stdout_fd: child.output, stderr_fd: child.error_output, reaped: false, code: 0, signal: 0 })
         }
-    } else { return spawn_posix(program, &args, &cmd, stdin_mode) }
+    } else if target_is("macos") || target_is("linux") {
+        mut copies: [i32; 3] = [-1; 3]
+        defer { unsafe { for copy in &copies { if copy >= 0 { _ := os_close(copy) } } } }
+        unsafe {
+            for handle in &handles {
+                if handle < 0 { continue }
+                status := duplicate_stream(i32(handle), true)
+                if status < 0 { return .Err(sys.IoError::from_code(-status)) }
+            }
+            for i in 0..3 {
+                if handles[i] < 0 { continue }
+                copies[i] = duplicate_stream(i32(handles[i]), false)
+                if copies[i] < 0 { return .Err(sys.IoError::from_code(-copies[i])) }
+            }
+        }
+        return spawn_posix(program, &args, &cmd, stdin_mode, &handles, &copies)
+    }
     .Err(.Unsupported)
 }
 
-fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdio) -> Result<Child, sys.IoError> {
+fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdio, handles: &[i64; 3], copies: &[i32; 3]) -> Result<Child, sys.IoError> {
     if program.len == 0 {
         return .Err(.InvalidArgument)
     }
@@ -1099,21 +1149,21 @@ fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdi
         mut null_write := NullFd { fd: -1, stream: ptr(0) }
         mut setup_err := 0
 
-        if stdin_mode == .Pipe {
+        if copies[0] < 0 && stdin_mode == .Pipe {
             setup_err = os_pipe_cloexec(addr(&mut in_fds[0]))
-        } else if stdin_mode == .Null {
+        } else if copies[0] < 0 && stdin_mode == .Null {
             null_read = os_open_devnull(false, &mut setup_err)
         }
 
-        if setup_err == 0 && cmd.stdout_mode == .Pipe {
+        if setup_err == 0 && copies[1] < 0 && cmd.stdout_mode == .Pipe {
             setup_err = os_pipe_cloexec(addr(&mut out_fds[0]))
-        } else if setup_err == 0 && cmd.stdout_mode == .Null {
+        } else if setup_err == 0 && copies[1] < 0 && cmd.stdout_mode == .Null {
             null_write = os_open_devnull(true, &mut setup_err)
         }
 
-        if setup_err == 0 && cmd.stderr_mode == .Pipe {
+        if setup_err == 0 && copies[2] < 0 && cmd.stderr_mode == .Pipe {
             setup_err = os_pipe_cloexec(addr(&mut err_out_fds[0]))
-        } else if setup_err == 0 && cmd.stderr_mode == .Null && null_write.fd < 0 {
+        } else if setup_err == 0 && copies[2] < 0 && cmd.stderr_mode == .Null && null_write.fd < 0 {
             null_write = os_open_devnull(true, &mut setup_err)
         }
 
@@ -1161,6 +1211,10 @@ fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdi
                 r := os_chdir(cwd_ptr)
                 if r < 0 { child_err = -r }
             }
+            for i in 0..3 {
+                if child_err == 0 && copies[i] >= 0 { child_err = -os_dup2(copies[i], i) }
+            }
+            for original in &handles { if original > 2 { _ := os_close(i32(original)) } }
             if child_err == 0 && in_fds[0] >= 0 {
                 r := os_dup2(in_fds[0], 0)
                 if r < 0 { child_err = -r }
@@ -1173,7 +1227,7 @@ fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdi
                 r := os_dup2(out_fds[1], 1)
                 if r < 0 { child_err = -r }
                 if out_fds[1] > 2 { _ := os_close(out_fds[1]) }
-            } else if child_err == 0 && cmd.stdout_mode == .Null && null_wfd >= 0 {
+            } else if child_err == 0 && copies[1] < 0 && cmd.stdout_mode == .Null && null_wfd >= 0 {
                 r := os_dup2(null_wfd, 1)
                 if r < 0 { child_err = -r }
             }
@@ -1181,7 +1235,7 @@ fn spawn_posix(program: string, args: &[]string, cmd: &Command, stdin_mode: Stdi
                 r := os_dup2(err_out_fds[1], 2)
                 if r < 0 { child_err = -r }
                 if err_out_fds[1] > 2 { _ := os_close(err_out_fds[1]) }
-            } else if child_err == 0 && cmd.stderr_mode == .Null && null_wfd >= 0 {
+            } else if child_err == 0 && copies[2] < 0 && cmd.stderr_mode == .Null && null_wfd >= 0 {
                 r := os_dup2(null_wfd, 2)
                 if r < 0 { child_err = -r }
             }

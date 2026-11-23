@@ -296,6 +296,19 @@ sökvägen finns. Windows använder filformatet när en PE-binär startas.
 Vanliga källfiler och körbara Windows-program kan läsas och skrivas med
 `sys.read_text`, `sys.write_u8` och motsvarande filhandtag.
 
+Ett privat Windowskontrakt behöver en skyddad DACL vid skapandet som ger
+den skapande användarens SID läs- och skrivrätt. Innan kontraktet aktiveras
+behöver ett andra vanligt konto prova både den öppna temporära filen och
+den publicerade filen i en katalog där det kontot annars har åtkomst.
+[File security and access rights](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights)
+
+Dunders Windowsbyte använder `MoveFileExW` med `MOVEFILE_REPLACE_EXISTING`
+och `MOVEFILE_WRITE_THROUGH`. Microsoft beskriver uttryckligen spolning
+för byten som utförs genom kopiering följd av borttagning.
+`REPLACEFILE_WRITE_THROUGH` saknar stöd i `ReplaceFileW`. Dunder lämnar
+därför tills vidare ingen garanti om att katalognamnet överlever strömavbrott.
+[MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw) · [ReplaceFileW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)
+
 En Apple-bundle kräver att utdatafilsystemet kan lagra POSIX-lägena
 0755 för programmet och 0644 för resurserna. Bygg bundlen på en värd
 och ett filsystem som kan sätta de rättigheterna. Windows-porten

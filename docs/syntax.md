@@ -1030,6 +1030,8 @@ råa literaler. Dessutom finns kompileringstidsinbäddning med
 `@embed_file("relativ/sökväg")` (`string`, UTF-8-kontrollerad) och
 `@embed_bytes("relativ/sökväg")` (`[]u8` / `[u8; N]`), strikt begränsad till
 filer innanför paketets rot och spårad av den inkrementella byggcachen.
+Sökvägen utgår från katalogen med bibliotekets `dunder.toml`, även när
+biblioteket byggs som beroende och manifestets `root` ligger i en underkatalog.
 
 `f"Hej {name}, {count + 1}!"` och `f'Hej {name}!'` interpolerar uttryck
 från vänster till höger (liksom på `&str`-vyer, med bredd/justering som

@@ -343,6 +343,10 @@ så att flera anrop kan hålla olika intervall levande samtidigt. I
 `addr(&view)` observerar vyns egen referenscell, även när funktionen
 vidarebefordrar en hel array. En uttrycklig `.clone()` ger en ägd kopia.
 
+En metod som uppdaterar sin samling kan lämna tillbaka en delad vy med
+`fn refresh(&mut self) -> &[]i32 from self`. Anroparen får läsa vyn
+och får ändra samlingen igen efter vyns sista användning.
+
 En funktion kan också returnera ett exklusivt lån från en muterbar parameter,
 exempelvis `fn first(a: &mut []i32) -> &mut i32 from a { &mut a[0] }`.
 Anroparen kan binda resultatet lokalt och skriva genom det. Överlappande

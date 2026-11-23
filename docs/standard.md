@@ -47,6 +47,39 @@ fn main() {
 }
 ```
 
+## Strömmande text och terminaler
+
+`std.bytes.utf8.decode_prefix(&bytes)` ger `Prefix.Scalar(rune, antal_byte)`,
+`Incomplete` eller `Invalid`. Behåll ett ofullständigt prefix tills nästa
+läsning. Tom indata ger `Incomplete`. Efter en skalär kan resten av
+bufferten innehålla fler tecken.
+
+`std.text.graphemes(text)` lånar en UTF-8-sträng. Varje element har
+`start()` och `end()` som bytepositioner och `as_str()` för den lånade texten.
+Iteratorn följer reglerna för utökade grafem i Unicode 17.0.0.
+Tabellen kan återskapas med `dunder run tools/grapheme_data.ddr -- KATALOG stdlib/text/grapheme_data.ddr`.
+Katalogen ska innehålla versionens `GraphemeBreakProperty.txt`, `DerivedCoreProperties.txt` och `emoji-data.txt`.
+[Unicode Standard Annex 29](https://www.unicode.org/reports/tr29/tr29-47.html)
+
+```dunder
+import std.text
+fn show(value: &str) {
+    for part in text.graphemes(value) { print(part.as_str()) }
+}
+```
+
+Med `capability stdio` ger `std.terminal.size()` standardutmatningens antal
+kolumner och rader. `terminal.RawMode::enter()` ändrar standardinmatningens
+läge och behåller ett eget handtag. Resursens `restore()` återställer läget
+och kan anropas flera gånger. Om funktionen returnerar tidigt gör resursen
+ett återställningsförsök vid scope-slut.
+
+`process.Command.spawn_with_handles(input, output, error_output)` tar tre
+`Option<usize>`. `.Some(handle)` väljer en öppen POSIX-filbeskrivare eller
+ett Windows-`HANDLE` för barnets ström. `.None` använder inställningen i
+`set_stdio`. Anroparen äger originalet och håller det öppet under anropet.
+Efter starten har barnet en egen referens.
+
 ## Växande arrayer
 
 `[]T` är en typad dynamisk array; `[T; N]` är fortsatt en fast array.
