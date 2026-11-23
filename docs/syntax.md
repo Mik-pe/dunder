@@ -954,10 +954,10 @@ både testbyggen och vanliga byggen.
 `dunder test [file.ddr]` samlar tester ur hela det explicit importerade trädet,
 en gång per kanonisk fil. Saknad `main` är tillåten och en befintlig `main`
 körs inte. Varje testfunktion eller kopplat block blir en egen nativeprocess.
-Första felaktiga assertionen avbryter det blocket; nästa test körs ändå.
-Fel redovisar testnamn, felorsak och upp till 4096 byte vardera av stdout
-och stderr; vid en misslyckad assertion ingår källrad och operandvärden i den
-vidarebefordrade stderr-utskriften.
+Första felaktiga assertionen avbryter det blocket. Nästa test körs ändå.
+Runnern skriver varje tests stdout före dess resultat i testordning, även när
+testet godkänns. Stderr vidarebefordras direkt. Vid en misslyckad assertion
+innehåller stderr källrad och operandvärden.
 
 Standardtidsgränsen är fem sekunder per test, ändringsbar med
 `--timeout-ms 1000`. Runnern stoppar och väntar in en process som överskrider
