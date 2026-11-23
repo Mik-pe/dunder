@@ -19,6 +19,10 @@ beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synk
 
 Med 0.11.2 på macOS ARM64 lägger `if target_is("windows") && enabled` till `kernel32.dll` i Mach-O-filens laddningskommandon. Bygget lyckas men programmet avslutas innan `main`. Två nästlade `if` ger en körbar fil utan DLL-importen. Prova båda formerna med `otool -L`, kör programmen och kontrollera att ett Windowsbygge fortfarande kan anropa `GetCurrentProcessId`. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/0a9b6dfc4c29ed1fd2d40f8289fc897c54d9e034/tests/dogfood/compiler/target_condition.ddr)
 
+## Härled mottagartypen över en modulgräns
+
+I 0.11.2 avslutas `dunder check` med kod 103 utan diagnostik när `holder := factory.make()?` följs av `holder.get(7)`. Fabriken returnerar `Result<Holder<i32>,string>` och metoden är generisk. Med typen `factory.Holder<i32>` utskriven går programmet att bygga och köra. Kör båda varianterna och kontrollera returvärdet 7. [Tvåmodulsprov](https://github.com/Mik-pe/dunder-tui/tree/adc3814204ec460685054aa39b439efcc22921ba/tests/dogfood/compiler/inferred_receiver)
+
 ## Specialisera generiska metoder för varje mottagartyp
 
 På 0.11.2 fungerar `Runner<i32>.outer<i32>` och `Runner<bool>.outer<i32>` var för sig. Om båda anropar den generiska metoden `inner` i samma program får det andra anropet E2003 oavsett ordning. Kör båda mottagartyperna i båda ordningarna och kontrollera varje returvärde. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/tests/dogfood/compiler/nested_methods.ddr)
