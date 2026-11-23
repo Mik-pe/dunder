@@ -9,6 +9,15 @@ void on_worker(NoArgs f) { pthread_t t; if (!pthread_create(&t, 0, from_worker, 
 typedef struct { float a, b, c; } Triple;
 typedef struct { double a, b; } Pair;
 typedef struct { Pair origin, size; } Rect;
+typedef struct { uint8_t tag; Triple samples[2]; uint64_t tail; } Samples;
+int inspect_samples(Samples *s, Triple *values, size_t size, size_t alignment) {
+    if (size != sizeof *s || alignment != _Alignof(Samples) ||
+        s->tag != 7 || s->tail != 99 || s->samples[0].a != 1 || s->samples[1].c != 6 ||
+        values[0].b != 2 || values[1].a != 4) return 0;
+    s->samples[1].b = 42;
+    values[1].c = 77;
+    return 1;
+}
 Triple triple(Triple v) { return (Triple){v.b, v.c, v.a}; }
 Rect rect(Rect a, double step, Rect b) {
     return (Rect){{a.origin.b + step, b.origin.a}, {a.size.b, b.size.a}};

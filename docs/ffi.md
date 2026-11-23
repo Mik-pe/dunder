@@ -40,9 +40,11 @@ ryms. Index och längd i Dunders befintliga samlings-API har typen `i32`.
 
 `@c_layout` placerar fält i deklarationsordning med naturlig justering och
 avrundar totalstorleken till den största fältjusteringen. Fält kan vara tal,
-`ptr`, `extern fn`, fasta skalärarrayer eller en direkt nästlad
-`@c_layout`-struct. Till exempel stöds både `header: Header` och
-`lengths: [u32; 2]`. Fält av typen `[Header; 2]` saknar stöd.
+`ptr`, `extern fn`, inbäddade `@c_layout`-structar och fasta arrayer av
+dessa ohanterade typer. Fältet `headers: [Header; 2]` har samma layout som
+`Header headers[2]` i C. Även i fristående arrayer ligger sådana element med
+`size_of(Header)` bytes mellanrum. Skicka `addr(&headers[0])` och antalet
+element till C när arrayen har minst ett element.
 `string` har Dunders egen ägarmodell och får inte användas som C-fält.
 Ange C-API:ets exakta typer, exempelvis `u32` för ett
 32-bitars flaggfält. `size_of(Header)` och `align_of(Header)` ger `usize`
