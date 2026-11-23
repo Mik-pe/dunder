@@ -758,8 +758,8 @@ anropsargument, deklarationer och testfall behövs inga extra parenteser.
 
 ### `impl`-block och metoder
 
-Structar och enums kan definiera associerade funktioner och metoder i ett eller
-flera `impl`-block i samma modul som deklarerar typen:
+Associerade funktioner och metoder för en struct eller enum kan fördelas på
+flera `impl`-block inom paketet som deklarerar typen.
 
 ```dunder
 pub opaque struct Counter {
@@ -785,10 +785,15 @@ impl Counter {
 }
 ```
 
-- `impl Typ { ... }` får endast förekomma i den modul som deklarerar `Typ`
-  (inte för importerade typer eller inbyggda primitiver). `impl`-blocket
-  kan inte markeras med `pub`; synlighet styrs per metod med `pub fn` (privat
-  `fn` utan `pub` kan endast anropas inom typens modul).
+- En syskonmodul kan använda `import .modell as m` och `impl m.Typ { ... }`,
+  eller importera `Typ` direkt. Modulen med metoderna måste ingå i importgrafen.
+  Paketets rotmodul kan ta med den med `import .metoder as _`. Då kan även
+  paketets användare anropa de publika metoderna.
+- Synligheten anges per metod med `pub fn`. En privat metod är åtkomlig i
+  modulen där metoden deklareras. Fälten i en `opaque struct` är privata för
+  modulen där typen deklareras. Även en privat städmetod som typen anger med
+  `@resource` måste definieras där. Två vanliga `impl`-block för samma typ får
+  inte deklarera samma metodnamn.
 - Inuti ett `impl`-block refererar `Self` till måltypen i typer, structliteraler
   (`Self { ... }`), enumvarianter (`Self.Variant`) och associerade anrop
   (`Self::new(...)`).
