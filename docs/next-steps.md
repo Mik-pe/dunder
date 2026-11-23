@@ -69,6 +69,10 @@ I Dunder 0.11.2 på macOS ARM64 gav 1 048 576 uppslag i en lokal literal med 32 
 
 I ett färgprov på ARM64/macOS med 0.11.2 gav 65 536 direkta läsningar ur en förallokerad palett 259 allokeringsanrop inklusive uppstart. När samma färg skickades som `Some(color)` och matchades direkt blev det 65 795 anrop, varav 65 535 återanvände poolminne. Båda gav kontrollsumman 549 755 781 120. Undersök om kompilatorn kan undvika mellanobjektet när värdet stannar i anropet. Kontrollera båda varianterna av `Option`, samt bevarat ägarskap när resultatet sparas. Mät även bildtid i den ursprungliga diagramvyn. [Körbart färgprov](https://github.com/Mik-pe/dunder-tui/blob/v0.9.0/benchmarks/language/colors.ddr)
 
+## Återanvänd lyckade resultat vid vidarebefordran
+
+I Dunder 0.11.2 på macOS ARM64 gav 65 536 anrop med `Result<(),string>` 65 543 allokeringsanrop inklusive uppstart. Ett mellanled som skickade vidare fel men skapade en ny `.Ok` gav 126 983. Skillnaden är exakt ett poolåterbruk för vart och ett av de 61 440 lyckade anropen. Båda körningarna gav samma 4 096 fel och sju färska allokeringar. Undersök om kompilatorn kan återanvända resultatet när ingen annan äger det. Kontrollera felmeddelandet, ett resultat som sparas av anroparen och en typ med resurs som nyttolast. [Körbart resultatprov](https://github.com/Mik-pe/dunder-tui/blob/a7cb0342938912b20b315b55338ffbe27fcf018e/benchmarks/language/unit_result.ddr)
+
 ## Följ upp mätningar för SIMD
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
