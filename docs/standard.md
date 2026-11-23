@@ -62,6 +62,7 @@ elementtypen från kontexten.
 | `a.push(value)` | Lägger till ett element. Kapaciteten växer geometriskt. |
 | `a.pop()` | Tar bort och returnerar sista elementet. Tom array ger status 103. |
 | `a.remove(index)` | Flyttar ut elementet vid ett `i32`-index och flyttar efterföljande element ett steg åt vänster. Ogiltigt index ger status 103. |
+| `array.swap_remove(&mut a, index)` | Flyttar ut elementet och fyller luckan med sista elementet i O(1). Den inbördes ordningen kan ändras. Ogiltigt index ger status 103. |
 | `a.swap(i, j)` | Byter två element på plats utan kloning. Båda index kontrolleras före bytet; fel ger status 103. |
 | `a.reserve(capacity)` | Säkerställer minst denna totalkapacitet i element och behåller längden. Om reservationen avvisas fäller programmet med status 109 på nativa mål och en trap i Wasm. |
 | `a.try_reserve(capacity)` | Samma totalkapacitet. Returnerar `ReserveStatus` och behåller längd, kapacitet och element vid fel. |
