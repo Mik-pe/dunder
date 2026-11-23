@@ -3,6 +3,7 @@ capability filesystem
 import bundle_fs
 import stderr
 import std.bytes as bytes
+import std.fs as fs
 import ...stdlib.bytes.utf8 as utf8
 import std.text as text
 import ..frontend.lexer
@@ -23,10 +24,6 @@ pub struct FormatResult {
     ok: bool,
     text: string,
     error: string,
-}
-
-fn is_ascii_alpha(b: i32) -> bool {
-    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128
 }
 
 fn is_digit(b: i32) -> bool {
@@ -91,10 +88,10 @@ fn tokenize_raw(src: string) -> []RawToken {
                 continue
             }
         }
-        if is_ascii_alpha(b) {
+        if lexer.name_start_byte(b) {
             start := i
             i += 1
-            while i < src.len && (is_ascii_alpha(i32(src[i])) || is_digit(i32(src[i]))) { i += 1 }
+            while i < src.len && lexer.name_byte(i32(src[i])) { i += 1 }
             out.push(RawToken { kind: .Word, text: src[start..i], start: start, end: i })
             continue
         }
@@ -409,7 +406,19 @@ fn ensure_paren_wrap_indent(paren_state: &mut []i32, paren_indent: &mut i32) {
     }
 }
 
-fn format_tokens(tokens: &[]RawToken) -> string {
+// A leading dot may start an enum variant or continue the previous receiver.
+// The lexer keeps a statement newline only in the former case.
+fn line_continues_member(tokens: &[]RawToken, first: i32, syntax: &lexer.Tokens, cursor: &mut i32) -> bool {
+    mut at := first
+    while tokens[at].kind == .CommentBlock && !has_newline(tokens[at].text) { at += 1 }
+    if tokens[at].kind != .Symbol || tokens[at].text != "." { return false }
+    offset := tokens[at].start
+    while cursor < syntax.kinds.len && syntax.starts[cursor] < offset { cursor += 1 }
+    cursor > 0 && cursor < syntax.kinds.len && syntax.starts[cursor] == offset &&
+        lexer.symbol(&syntax, cursor, ".") && lexer.can_end_receiver(&syntax, cursor - 1)
+}
+
+fn format_tokens(tokens: &[]RawToken, syntax: &lexer.Tokens) -> string {
     mut out: []u8 = []
     mut brace_stack: []bool = [] // true = single line, false = multi line
     mut paren_depths: []i32 = []
@@ -427,6 +436,7 @@ fn format_tokens(tokens: &[]RawToken) -> string {
     mut prev_was_fn_kw := false
     mut at_line_start := true
     mut pending_nls := 0
+    mut syntax_cursor := 0
     mut i := 0
     mut n := tokens.len - 1
     while n > 0 && tokens[n - 1].kind == .Newline { n -= 1 }
@@ -561,7 +571,8 @@ fn format_tokens(tokens: &[]RawToken) -> string {
         if at_line_start {
             // Check if a continuation newline opened inside parens
             ensure_paren_wrap_indent(&mut paren_state, &mut paren_indent)
-            append_indent(&mut out, indent + paren_indent)
+            member_indent := if line_continues_member(&tokens, i, &syntax, &mut syntax_cursor) { 1 } else { 0 }
+            append_indent(&mut out, indent + paren_indent + member_indent)
         } else if has_prefix_space_needed(&prev, &tok, at_line_start, prev_was_unary, prev_generic_open, prev_generic_close, curr_generic_open, curr_generic_close, prev_was_dot, prev_was_fn_kw, prev_empty_brackets) {
             out.push(b' ')
         }
@@ -591,7 +602,8 @@ fn format_tokens(tokens: &[]RawToken) -> string {
 }
 
 pub fn format_source(path: string, source: string) -> FormatResult {
-    parsed := parser.parse_source(path, source)
+    syntax := lexer.lex(source)
+    parsed := parser.parse_tokens(path, &syntax)
     if !parsed.ok {
         mut err := "syntax error in " + path
         if parsed.diagnostics.len > 0 {
@@ -602,7 +614,7 @@ pub fn format_source(path: string, source: string) -> FormatResult {
         return FormatResult { ok: false, text: "", error: err }
     }
     raw := tokenize_raw(source)
-    formatted := format_tokens(&raw)
+    formatted := format_tokens(&raw, &syntax)
     recheck := parser.parse_source(path, formatted)
     if !recheck.ok {
         return FormatResult { ok: false, text: "", error: "internal formatter verification failed on " + path }
@@ -639,7 +651,16 @@ fn collect_ddr_files(target: string, out: &mut []string, err: &mut string) -> bo
         return false
     }
     if meta.is_file {
-        out.push(target.clone())
+        if fs.is_symlink(target) {
+            resolved := fs.realpath(target)
+            if !resolved.ok {
+                err = "cannot resolve " + target + ": " + sys.error_message(resolved.error)
+                return false
+            }
+            out.push(move resolved.value)
+        } else {
+            out.push(target.clone())
+        }
         return true
     }
     if !meta.is_dir {
@@ -656,8 +677,10 @@ fn collect_ddr_files(target: string, out: &mut []string, err: &mut string) -> bo
     for name in &children {
         if name.len == 0 || name[0] == 46 || name == "build" { continue }
         child := if target == "." { name.clone() } else if target == "/" { "/" + name } else { target + "/" + name }
-        cmeta := sys.metadata(child)
-        if !cmeta.ok { continue }
+        entry := fs.lstat(child)
+        if entry.is_err() { continue }
+        cmeta := entry.unwrap()
+        if cmeta.is_symlink { continue }
         if cmeta.is_dir {
             if !collect_ddr_files(child, &mut out, &mut err) { return false }
         } else if cmeta.is_file && text.ends_with(name, ".ddr") {
@@ -691,6 +714,7 @@ pub fn run() -> i32 {
         arg := sys.arg(i)
         if arg == "-h" || arg == "--help" {
             print("usage: dunder fmt [--check | --stdout] [path...]")
+            print("Directory walks skip symbolic links. Pass a link explicitly to format its target.")
             return 0
         } else if arg == "--check" {
             check_only = true
@@ -795,4 +819,22 @@ pub fn run() -> i32 {
 @test fn fmt_rejects_broken_syntax_without_modifying_code() {
     bad := format_source("broken.ddr", "fn main( {\n")
     assert(!bad.ok)
+}
+
+@test fn fmt_preserves_member_continuations_and_standalone_variants() {
+    source := "fn size(row: Row) -> Result<i32, ()> {\n" +
+        "  group := row // keep the chain\n" +
+        "     /* field */ .name\n" +
+        "     .bytes()\n" +
+        "     .len\n" +
+        "  .Ok(group)\n}\n"
+    expected := "fn size(row: Row) -> Result<i32, ()> {\n" +
+        "    group := row // keep the chain\n" +
+        "        /* field */.name\n" +
+        "        .bytes()\n" +
+        "        .len\n" +
+        "    .Ok(group)\n}\n"
+    formatted := format_source("chain.ddr", source)
+    assert(formatted.ok && formatted.text == expected)
+    assert(format_source("chain.ddr", formatted.text).text == expected)
 }
