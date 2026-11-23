@@ -144,7 +144,8 @@ kompenserad summering, bisektion med callback och Runge–Kutta-integration.
 Hjälparna ger exempel på hur flyttalsstödet fungerar i Dunder-program.
 Metoderna i `std.math.Trigonometry` använder samma beräkning som de fria
 funktionerna `math.sin`, `math.cos` och `math.tan`. Med `f32` breddas
-vinkeln före beräkningen och resultatet avrundas till `f32`.
+vinkeln före beräkningen och resultatet avrundas till `f32`. I en modul
+som enbart använder metoderna kan du importera med `import std.math as _`.
 
 I Dunders interna ABI passerar skalära flyttalsargument som råbitar i
 x0–x7, precis som övriga skalära argument; från det nionde argumentet
