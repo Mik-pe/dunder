@@ -1,5 +1,13 @@
 # Nästa steg för Dunder
 
+## Skilj strängdata från syntax i konstanta arrayer
+
+I 0.12.1 får `["[", "]", ","]` E3007. Kontrollera tokentypen när konstantutvärderaren letar efter arrayens slut. Prova `"]"` först, i mitten och sist samt tom array och avslutande komma. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/cb25b80d1d80270aa0311449c6ab4fe30f52d20f/tests/dogfood/compiler/constant_bracket_table.ddr)
+
+## Låt en array växa med en konstruktor
+
+Lägg till `std.array.resize_with` som anropar en funktion en gång per nytt element och noll gånger vid krympning. För 253 440 celler på macOS och Linux ARM64 gav direkt konstruktion 507 103 allokeringsanrop mot 760 543 med `resize`. Verifiera att befintliga element bevaras och att konstruktorn kan lämna ett ägt värde utan krav på `Clone`. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/cb25b80d1d80270aa0311449c6ab4fe30f52d20f/benchmarks/language/fresh_cells.ddr)
+
 ## Minska kostnaden för enkla metodanrop på lånade enumvärden
 
 I 0.12.1 tog 8 192 variantkontroller via `is_reset(&self)` 9 µs på macOS ARM64 och 9,7 µs på Linux ARM64. Samma `match` direkt i loopen tog 5 respektive 5,5 µs. Låt optimeraren lägga in ett enkelt varianttest vid anropet. Kontrollera resultatet 450 560, bildtiden i en färgad buffert samt effekten på byggtid och kodstorlek. [Körbart prov](https://github.com/Mik-pe/dunder-tui/blob/42c65d8fcaa4edb6cdc1ba86fbe08da81182e185/benchmarks/language/enum_predicate.ddr) · [Mätningar](https://github.com/Mik-pe/dunder-tui/blob/42c65d8fcaa4edb6cdc1ba86fbe08da81182e185/benchmarks/results/enum-predicate-0.12.1.tsv)
