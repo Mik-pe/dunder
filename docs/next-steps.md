@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Upprepa ett ägt värde i en array
+
+Lägg till `array.repeat(move värde, antal)` för antal som bestäms vid körning. Flytta sista exemplaret, klona de tidigare och ge en tom array vid noll. För 4 096 arrayer med en post om 128 heltal undviker flytten 4 096 djupa arraykloner och 2 097 152 klonade byte jämfört med `array.resize` i 0.12.0. Verifiera att en ändring i en kopia lämnar de andra intakta. [Mätprogram för noll, en och fyra kopior](https://github.com/Mik-pe/dunder-tui/blob/6044f41affd9516162c4a318db08b21993509902/benchmarks/language/repeat_owned.ddr)
+
 ## Undvik allokering för omedelbart avlästa skalära returvärden
 
 För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 384 kontrolltecken totalt 49 160 allokeringsanrop med både `match` och `unwrap_or(-1)`. Fyra sparade bredder gav åtta anrop och samma summa. Minska kostnaden för `Some(i32)` över funktionsgränsen och behåll `.None` för kontrolltecken. Mät med `--runtime-profile` på macOS och Linux ARM64. [Prov för båda anropssätten](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/benchmarks/language/terminal_option.ddr)
