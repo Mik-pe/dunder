@@ -12,6 +12,8 @@ Behåll ASCII-beteendet i `text.lower` och lägg till en Unicode-variant. I 0.12
 
 ## Läs JSON-objektets fält i en genomgång
 
+Låt iteratorn även lämna en arrays barn i ordning. På macOS ARM64 tog summan av 4 096 redan tolkade heltal 25,34 ms via `doc.at` och 0,26 ms via nodlänkarna i 0.12.0. På Linux ARM64 tog det 20,66 respektive 0,19 ms. Verifiera summan 8 386 560 och linjär tidsökning med publikt API. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/181c1540cb3d0340954ff153b3085db32e712853/benchmarks/language/json_array.ddr)
+
 Ge `std.json.Doc` en iterator som lämnar nyckel och värdenod i källordning, även för dubbla och escapade nycklar. I 0.12.0 går `key_at` och `val_at` från första barnet för varje index. Att läsa ett redan tolkat objekt med 1 024, 2 048 och 4 096 fält tog 1,83, 7,40 och 29,69 ms i median på macOS ARM64. Kör samma prov med iteratorn och kontrollera linjär tidsökning och oförändrade kontrollsummor. [Mätprogram i Dunder](https://github.com/Mik-pe/dunder-tui/blob/247dd05/benchmarks/language/json_members.ddr)
 
 Låt den som använder `@derive(Decode)` välja att avvisa ett upprepat känt fält. I 0.12.0 ger både `{"width":4,"width":9}` och `{"width":4,"w\u0069dth":9}` värdet 9 på macOS och Linux ARM64. Med kontrollen aktiverad ska båda ge fel vid den andra nyckeln och ett okänt fält fortfarande kunna hoppas över. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/6ad7922/tests/dogfood/json_duplicate_fields.ddr)
