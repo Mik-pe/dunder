@@ -4,6 +4,11 @@
 
 Dunder distribuerar en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
 
+Två fel i 0.11.2 påverkar vanliga program på Windows Server 2025 x64.
+
+- **Bygg paket utan Git.** `dunder test --locked --offline` ger `Git dependencies require a native compiler host` även med noll beroenden. Utanför manifestet bygger samma kompilator testfilen och alla 59 test passerar. Beroendelösaren öppnar Git-lagret innan den läser paketets beroenden. Prova ett tomt beroendeträd, ett lokalt sökvägsberoende och ett låst Git-beroende från cache på Windows. [Nativ körning](https://github.com/Mik-pe/dunder-tui/actions/runs/45302071651/job/138136790534) · [Beroendelösare](../selfhost/driver/dependencies.ddr)
+- **Läs process-ID med rätt bredd.** Efter `CreateProcessW` läser `std.process` process-ID och tråd-ID som ett gemensamt 64-bitarsvärde. Konverteringen till `i32` avslutar föräldern med kod 101. När bara process-ID:ts 32 bitar lästes gick både `exec` och `spawn` följt av `wait` igenom i Wine. Kör båda varianterna på Windows och kontrollera även omdirigerade standardströmmar och barnets slutstatus. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/748c099/tests/dogfood/compiler/windows_child.ddr) · [Win32-anropet](../stdlib/sys/winprocess.ddr)
+
 1. Hämta den publicerade exe-filen, kontrollera SHA-256 och bygg kompilatorn två gånger med ett jobb. Jämför filerna byte för byte. Upprepa med flera jobb.
 2. Kör [provet för `check`, `build`, `run`, `test` och språkservern](../tools/test_lsp_and_dwarf.ddr) med kompilatorsökvägen som argument. Det använder ett lokalt paket i en sökväg med mellanslag och svenska tecken. Kör även [provet för miljö, standardfel och processavbrott](../tests/fixtures/process-unicode.ddr) samt [Win64-callbacken](../tests/fixtures/ffi/windows.ddr) med argumenten `"sök väg" "" "🦔"`.
 3. Installera och uppgradera i en tom katalog. Prova även bytet medan den installerade filen används. [Installation och distribution](releases.md) · [Plattformskontrakt](targets.md)
@@ -92,3 +97,5 @@ Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har
 ## Profilera bildritning på fysisk x86-64
 
 Sex kalendrar gav samma celler i 1 100 bilder i Dunder 0.11.2 och Ratatui. I en pseudoterminal tog en oförändrad bild i median 27 respektive 41 µs på Linux ARM64. På samma värd med x86-64-översättning tog den 265 respektive 68 µs. Kör de låsta programmen på fysisk Linux x86-64 och jämför både ritning i minnet och utmatning till terminal. Om skillnaden kvarstår, profilera den långsamma bildvägen och isolera det dyraste anropet innan kodgeneratorn eller biblioteket ändras. [Körkommandon och arbetslast](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/calendar.md) · [Mätvärden och spridning](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/results/calendar-0.12.0.tsv)
+
+På en Xeon 6975P-C med Linux x86-64 under KVM gav en riktextruta med ligaturer samma celler i 1 100 bilder. För en oförändrad bild var medianen 365 µs i Dunder och 57 µs i Ratatui i minnet. Med pseudoterminal var den 370 respektive 61 µs. Profilera den oförändrade bilden först. Jämför sedan en celländring, rullning, storleksbyte och full omritning på samma värd. [Körning med spridning för sju repetitioner](https://github.com/Mik-pe/dunder-tui/actions/runs/45301551701/job/138135086401)
