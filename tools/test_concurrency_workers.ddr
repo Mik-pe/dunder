@@ -440,6 +440,101 @@ fn check_cross_compile_and_incremental(journal: &mut evidence.Journal, compiler:
     true
 }
 
+fn check_task_handle_api(journal: &mut evidence.Journal, compiler: string, work: string) -> bool {
+    fpath := work + "/handle-moved.txt"
+    program := "capability network, filesystem, unsafe\n" +
+        "import std.bytes as bytes\n" +
+        "import std.fs as fs\n" +
+        "import std.net as net\n" +
+        "import sys\n" +
+        "@thread_safe\n" +
+        "fn inc(p: usize) { unsafe { _ := sys.atomic_fetch_add_i64(ptr(p), 1) } }\n" +
+        "@thread_safe\n" +
+        "fn get(p: usize) -> i64 { unsafe { sys.atomic_load_i64(ptr(p)) } }\n" +
+        "struct Ctx { p: usize }\n" +
+        "fn zero_arg(ctx: &Ctx) { inc(ctx.p) }\n" +
+        "fn stagger(delay_ms: i64) -> i64 { sys.sleep_ms(delay_ms); delay_ms }\n" +
+        "fn echo_move(move stream: net.TcpStream) -> net.TcpStream {\n" +
+        "    mut buf: []u8 = []\n" +
+        "    _ := stream.read_append(&mut buf, 16).unwrap()\n" +
+        "    assert(bytes.decode(&buf).unwrap() == \"ping\")\n" +
+        "    _ := stream.write_all(&bytes.from_text(\"pong\"))\n" +
+        "    move stream\n" +
+        "}\n" +
+        "fn write_move(move f: fs.File) -> fs.File {\n" +
+        "    mut fh := f\n" +
+        "    _ := fh.write(&bytes.from_text(\"a-\")).unwrap()\n" +
+        "    move fh\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut count: i64 = 0\n" +
+        "    mut cp: usize = 0\n" +
+        "    unsafe { cp = usize(addr(&mut count)) }\n" +
+        "    task scope s(shared Ctx { p: cp }) {\n" +
+        "        for _ in 0..200 { s.spawn(zero_arg) }\n" +
+        "    }\n" +
+        "    assert(get(cp) == 200)\n" +
+        "    mut order: []i64 = []\n" +
+        "    task scope w {\n" +
+        "        mut pending: []Task<i64> = []\n" +
+        "        pending.push(w.spawn(stagger, 120))\n" +
+        "        pending.push(w.spawn(stagger, 5))\n" +
+        "        pending.push(w.spawn(stagger, 1))\n" +
+        "        while pending.len > 0 {\n" +
+        "            idx := w.wait_any(&pending)\n" +
+        "            order.push(pending.remove(idx).join())\n" +
+        "        }\n" +
+        "    }\n" +
+        "    assert(order.len == 3 && order[0] <= 5 && order[0] + order[1] + order[2] == 126)\n" +
+        "    listener := net.TcpListener::listen_addr(net.SocketAddr::loopback_v4(0), 4).unwrap()\n" +
+        "    ep := net.SocketAddr::loopback_v4(u16(listener.local_port()))\n" +
+        "    client := net.TcpStream::connect_addr(ep).unwrap()\n" +
+        "    server := listener.accept().unwrap()\n" +
+        "    f := fs.File::create(\"" + fpath + "\").unwrap()\n" +
+        "    task scope r(2) with (network, filesystem) {\n" +
+        "        ts := r.spawn(echo_move, move server)\n" +
+        "        _ := client.write_all(&bytes.from_text(\"ping\"))\n" +
+        "        mut rbuf: []u8 = []\n" +
+        "        _ := client.read_append(&mut rbuf, 16).unwrap()\n" +
+        "        assert(bytes.decode(&rbuf).unwrap() == \"pong\")\n" +
+        "        mut server2 := ts.join()\n" +
+        "        _ := server2.close()\n" +
+        "        tf := r.spawn(write_move, move f)\n" +
+        "        mut f2 := tf.join()\n" +
+        "        _ := f2.write(&bytes.from_text(\"b\")).unwrap()\n" +
+        "        _ := f2.close()\n" +
+        "    }\n" +
+        "    assert(sys.read_text(\"" + fpath + "\").value == \"a-b\")\n" +
+        "    print(200)\n" +
+        "}"
+    if !build_and_run(&mut journal, compiler, work, "task_handle_api", program, "200\n") { return false }
+
+    cross_src := work + "/cross_task_handles.ddr"
+    cross_program := "fn work(n: i64) -> i64 { n * n }\n" +
+        "fn noop(n: i64) {}\n" +
+        "fn main() {\n" +
+        "    task scope jobs {\n" +
+        "        jobs.spawn(noop, 1)\n" +
+        "        mut ts: []Task<i64> = [jobs.spawn(work, 6), jobs.spawn(work, 7)]\n" +
+        "        idx := jobs.wait_any(&ts)\n" +
+        "        mut sum := ts.remove(idx).join()\n" +
+        "        for t in move ts { sum += t.join() }\n" +
+        "        print(sum)\n" +
+        "    }\n" +
+        "}"
+    if !put(cross_src, cross_program + "\n") { return false }
+    mut output := harness.empty_output()
+    for target in ["arm64-linux", "x86_64-linux"] {
+        out_img := f"{work}/cross-handles-{target}"
+        if !journal.run(compiler, ["build", cross_src.clone(), "--target", target.clone(), "--jobs", "1", "-o", out_img.clone()], &mut output) {
+            return false
+        }
+        info := sys.metadata(out_img)
+        if !info.ok || info.size < 4096 { return harness.fail(f"{out_img}: invalid cross ELF size") }
+    }
+    true
+}
+
 fn main() -> i32 {
     spec: []cli.Option = [cli.option("-o"), cli.option("--jobs")]
     args := cli.parse(&spec)
@@ -459,9 +554,10 @@ fn main() -> i32 {
         check_workspace_dispose(&mut journal, compiler, work) &&
         check_arena_growth(&mut journal, compiler, work) &&
         check_detached_and_await_any(&mut journal, compiler, work) &&
-        check_cross_compile_and_incremental(&mut journal, compiler, work)
+        check_cross_compile_and_incremental(&mut journal, compiler, work) &&
+        check_task_handle_api(&mut journal, compiler, work)
     if ok {
-        print("PASS concurrency workers: 7 scenario groups")
+        print("PASS concurrency workers: 8 scenario groups")
         0
     } else {
         1

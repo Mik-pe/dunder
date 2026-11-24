@@ -1,6 +1,6 @@
 # Isolerade uppgifter
 
-`task scope`, `spawn` och `await` använder OS-trådar. ARM64/macOS använder
+`task scope`, `.spawn` och `.join()` använder OS-trådar. ARM64/macOS använder
 `libdispatch`. ARM64/Linux och x86-64/Linux använder en långlivad POSIX-trådpool
 med futex-väckning. För x86-64/Windows genererar kompilatorn en trådpool med
 `CreateThread`, `WaitOnAddress` och `WakeByAddressSingle`. Windowskoden
@@ -10,34 +10,34 @@ korsbyggs i testsviten. Nåbara taskoperationer på wasm-målen (`wasm32`,
 ```dunder
 fn sum(values: []i64) -> i64 {
     mut total: i64 = 0
-    for value in values { total = total + value }
+    for value in &values { total = total + value }
     total
 }
 
 fn main() {
-    task scope jobs(4) {
-        first: TaskID<i64> = spawn jobs sum([1, 2, 3])
-        second := spawn jobs sum([10, 20])
-        print(await jobs(first))
-        print(await jobs(second))
-        print(await jobs(first))
+    task scope jobs {
+        first: Task<i64> = jobs.spawn(sum, [1, 2, 3])
+        second := jobs.spawn(sum, [10, 20])
+        print(first.join())
+        print(second.join())
     }
 }
 ```
 
-Programmet skriver `6`, `30`, `6`. Kapaciteten är ett positivt `i32`-värde
-som begränsar antalet aktiva jobb i scopet. När gränsen är nådd samlar nästa
-spawn in det äldsta aktiva jobbet innan nästa jobb lämnas till poolen (för
-detached `spawn!`-jobb, alltså `()`-resultat, återanvänds slutna kontrollposter
-i O(kapacitet) minne).
-`spawn! jobs worker()` skapar ett detached jobb utan resultatnyckel (workern
-måste returnera `()`); `await_any jobs(ids)` tar en `[]TaskID<T>` (eller lån
-därav) och returnerar indexet för första färdiga jobbet, eller `-1` för en tom
-lista.
+Programmet skriver `6` och `30`. Om kapaciteten utelämnas i `task scope jobs { ... }`
+(eller `task scope jobs(shared cfg) { ... }`) används standardgränsen `4` samtidiga
+arbetare; med explicit parameter anges ett positivt `i32`-värde `task scope jobs(N)`.
+När gränsen är nådd samlar nästa `.spawn(...)` in det äldsta aktiva jobbet innan
+nästa jobb lämnas till poolen. Ett fristående uttryckssatsanrop
+`jobs.spawn(worker, arg)` (eller `jobs.spawn(worker)`) där `worker` returnerar
+`()` körs automatiskt som detached utan resultat­handtag och återanvänder slutna
+kontrollposter i O(kapacitet) minne.
+`jobs.wait_any(&tasks)` tar en `[]Task<T>` (eller lån därav) och returnerar
+indexet för första färdiga jobbet, eller `-1` för en tom lista.
 
 ### Kapabilitetsstyrda I/O-scopes och konfigurerbar arenastorlek
 
-Rena beräkningsscopes (`task scope jobs(N)`) förbjuder I/O och osäkra anrop.
+Rena beräkningsscopes (`task scope jobs`) förbjuder I/O och osäkra anrop.
 Ett scope kan i stället uttryckligen bevilja delmängder av modulens egna
 kapabiliteter (`filesystem`, `network`, `process`, `stdio`) och valfri
 arenastorlek per arbetare med:
@@ -49,8 +49,8 @@ fn worker() -> i32 { 42 }
 
 fn main() {
     task scope workers(4) with (network, filesystem) arena 8 * 1024 * 1024 {
-        id := spawn workers worker()
-        print(await workers(id))
+        task := workers.spawn(worker)
+        print(task.join())
     }
 }
 ```
@@ -65,38 +65,38 @@ och `select2`/`select2_cancel`), uppdaterbara frysta ögonblicksbilder (`Publish
 och `ReadGuard<T>`), `Semaphore`, `CancelToken` (kopplad till [`std.signal`](standard.md#moduler))
 samt skalära `AtomicI64` och `AtomicBool`.
 
-Resultatvärden sparas tills scopet avslutas eller hämtas med `await!`.
+Resultatvärden sparas tills scopet avslutas eller tas över en gång av `.join()`.
 
-## Ägare och resultatnycklar
+## Ägare och resultathandtag
 
-Scopet äger jobbens dispatchgrupper, workerarenor och cachade resultat.
+Scopet äger jobbens dispatchgrupper, workerarenor och väntande resultat.
 Det väntar in alla aktiva jobb innan de återstående föräldraägda värdena
 släpps och arenorna avmappas.
 Detta gäller vanlig blockutgång, `return`, `break` och `continue`. Ett
 resultat som aldrig efterfrågas behöver inte kopieras tillbaka från arbetaren.
 
-`TaskID<R>` är en typad 64-bitarsnyckel. Den kan kopieras, returneras och
-lagras i arrayer; en kopia skapar ingen ytterligare trådägare. Den är inte
-ett heltal och stöder inte heltalskonvertering eller aritmetik. Scope-namnet
-är däremot en lexikal kapabilitet som bara får användas med tasksyntaxen.
-Det får inte kopieras, lånas eller lämna sitt block.
+`Task<R>` är ett typat, 8 byte stort flyttbart handtag (`move_only`, ej `Clone`).
+Det kräver ingen egen heapallokering, kan lagras i arrayer (`[]Task<R>`) och `Option<Task<R>>`
+och flyttas in i funktioner som tar `move Task<R>`, medan `for t in move tasks` flyttar ut elementen ett i taget.
+`task.join()` konsumerar handtaget enligt Dunders vanliga ägarskaps- och flyttregler:
+ett andra `.join()`, försök att anropa `.join()` via `&Task<R>`, `tasks[i].join()` utan `.remove(i)`
+eller `task.clone()` stoppas redan vid kompilering.
+Resultatvärdet flyttas till anroparen och överlever scopet precis som andra ägda värden.
 
-`await jobs(id)` kontrollerar scope, generation, ordinal och exakt resultattyp
-innan jobbets kontrollblock läses. Gamla nycklar fungerar därför inte med ett
-nytt scope, även om allokeraren återanvänder samma minnesadress. Generationer
-återanvänds aldrig vid overflow. Vanlig `await` kan läsas upprepade gånger för kopierbara resultat.
-Resursägande resultat kräver `await!`, som tar över resultatet en gång.
-Kloning av ett övertaget värde begärs därefter uttryckligen med `.clone()`.
-
-`await! jobs(id)` tar över det färdiga resultatets ägarskap. För kopierbara resultat går det att först läsa med vanlig `await`
-och sedan använda `await!`.
-Efter övertagandet ger varje ny läsning av samma nyckel, inklusive kopior
-av nyckeln, taskfelet 112. Resultatvärdet överlever scopet som andra ägda värden.
+Om ett `Task<R>`-handtag lämnas tillbaka ut ur ett redan stängt `task scope` kontrollerar
+`.join()` den levande scopelistan i samordnaren och avslutar kontrollerat med status `112`
+i stället för att läsa friat minne. Scope-namnet är en lexikal kapabilitet som bara får
+användas med `.spawn(...)` och `.wait_any(...)`; det får inte kopieras, lånas eller
+lämna sitt block.
 
 Vanliga workerparametrar läser lånade snapshots. `move`-parametrar tar över
-sin jobbägda indata. `spawn` och delade taskdata är uttryckliga gränser för
+sin jobbägda indata. `.spawn` och delade taskdata är uttryckliga gränser för
 isolering: runtime kan behöva kopiera data mellan separata workerarenor.
 Dessa isoleringskopior är skilda från vanliga funktionsanrop, som lånar.
+
+> För tillfällig bootstrap-kompatibilitet med det frysta fröet accepterar kompilatorn fortfarande
+> äldre `spawn`/`await`/`await!`/`await_any`/`TaskID<R>` internt, men ny kod ska använda
+> `jobs.spawn(...)`, `Task<R>.join()` och `jobs.wait_any(...)`.
 
 ## Återanvändbar arbetsyta
 
@@ -112,9 +112,9 @@ fn work(n: i32, ws: &mut Workspace) -> i32 {
 
 fn main() {
     task scope jobs(2, initialize) {
-        a := spawn jobs work(20)
-        b := spawn jobs work(30)
-        print(await! jobs(a) + await! jobs(b))
+        a := jobs.spawn(work, 20)
+        b := jobs.spawn(work, 30)
+        print(a.join() + b.join())
     }
 }
 ```
@@ -134,11 +134,12 @@ records. Tal, lokala strängar, enums (inklusive payload-enums som `Result`),
 tillåtna arrayer, recordfält samt `@resource(dispose)`-fält som ägs per
 arbetare (exempelvis en egen `sqlite.Database`-koppling) stöds — de sistnämnda
 får sin `dispose()` körd på ägartråden när scopet stängs. Däremot avvisas
-adresser, lokala lån, callbacks och tasknycklar. Separata scope äger separata arbetsytor.
+adresser, lokala lån, callbacks och taskhandtag. Separata scope äger separata arbetsytor.
 
 ## Gemensam läsbar indata
 
-`task scope jobs(limit, shared world)` tar en egen isolerad snapshot av `world`
+`task scope jobs(limit, shared world)` (eller `task scope jobs(shared world)` med
+standardkapacitet `4`) tar en egen isolerad snapshot av `world`
 när scopet öppnas. Värdet är ett ägt `Sendable`-record (transparent eller en
 `opaque struct` som implementerar `Sendable`, till exempel `Map<string, []string>`).
 Varje worker får samma snapshot som sista parametern `world: &World`. För ett
@@ -155,9 +156,9 @@ workerarenor avmappas innan snapshoten avfryses och frigörs.
 ## Vad en worker får använda
 
 Spawn kräver en namngiven säker Dunder-funktion (inklusive specialiserade
-generiska funktioner som `spawn jobs work<string>(...)`). Utöver eventuell
+generiska funktioner som `jobs.spawn(work<string>, arg)`). Utöver eventuell
 `workspace: &mut Workspace` och `world: &World` från scopet tar en worker och
-därmed `spawn` **högst ett** säkert (`Sendable`) värdeargument (en vanlig
+därmed `.spawn` **högst ett** säkert (`Sendable`) värdeargument (en vanlig
 läsparameter `T` eller en ägande `move T`). När en uppgift behöver flera
 indata samlas de i en `Sendable`-struct (eller en `Sendable`-tupel):
 
@@ -172,9 +173,9 @@ fn process_job(input: JobInput) -> string {
 }
 
 fn example() {
-    task scope jobs(2) {
-        key := spawn jobs process_job(JobInput { id: 1, label: "dunder" })
-        print(await! jobs(key))
+    task scope jobs {
+        job := jobs.spawn(process_job, JobInput { id: 1, label: "dunder" })
+        print(job.join())
     }
 }
 ```
@@ -194,7 +195,7 @@ Indata och returtyp måste uppfylla den inbyggda kompilatorbevisade traiten
   `sync.AtomicBool` och `net.Waker`), där flyttbara `@resource`-handtag använder
   strikt `move`-överföring (sändarens ägarslot nollställs).
 
-Lån, råpekare (`ptr`), funktionsvärden/closures, scratch-vyer, `TaskID<R>`
+Lån, råpekare (`ptr`), funktionsvärden/closures, scratch-vyer, `Task<R>`
 och oklassificerade `@resource`- eller `opaque struct`-typer är inte `Sendable`
 och avvisas statiskt. Strängar, payload-enums och sammansatta arrayer går genom dedikerad
 isolerad djupkloning så att varje tråd får helt egna allokeringar med egen
@@ -208,13 +209,12 @@ okända indirekta anrop och nästlad task-scheduling. Även hjälpfunktionernas
 anrop och semantiskt kontrollerad död kod ingår. Enbart en funktionssignatur
 bevisar inte att en worker är tillåten.
 
-Vid `spawn` klonas (eller, för flyttbara `Sendable`-`@resource`, flyttas med
+Vid `.spawn` klonas (eller, för flyttbara `Sendable`-`@resource`, flyttas med
 `move`) den typgodkända indatan till en exklusiv workerarena.
 Runtimen lämnar över arenans allokerartillstånd och ägarkopian till
 ett jobb. På macOS används libdispatch och en dispatchgrupp per jobb. På Linux
 och Windows återanvänder scopet arbetstrådarna. Skalärer skickas som värdebitar. Efter avslutat jobb
-kopieras det efterfrågade resultatet till förälderns arena. En vanlig
-`await` klonar förälderns cache medan `await!` tar över den.
+kopieras det efterfrågade resultatet till förälderns arena och `.join()` tar över ägarskapet.
 Som standard har en arbetare 16 MiB reserverat virtuellt arenautrymme (minst
 256 KiB, avrundat till 16 KiB; kan anpassas med `arena <storlek>`) och en
 stack på 8 MiB, åtskilda av ett skyddat adressintervall på 16 MiB. Scopet
@@ -223,7 +223,7 @@ avmappar reservationen vid utgång. Ett scope utan arbetsyta behåller högst
 
 ## Fel och kompilering
 
-Felaktig kapacitet eller resultatnyckel samt fel vid skapande, inväntan eller avmappning
+Felaktig kapacitet, stängt eller felaktigt scope vid `.join()` samt fel vid skapande, inväntan eller avmappning
 avslutar processen med status 112. En misslyckad inväntan bevisar inte att arbetaren
 har avslutats; felvägen får därför inte läsa eller frigöra dess lagring.
 Vanliga runtimefällor i en worker behåller processavslut som felmekanism;
@@ -233,8 +233,7 @@ Typkontrollen registrerar direkta effekter, anrop och spawnplatser under
 den vanliga kroppsvandringen. Både build och check certifierar grafen när
 även onåbara kroppar har kontrollerats. Ett bygge binder taskruntimens
 symboler efter godkänd certifiering, före publicering. Funktionscachen
-avstår för taskprogram tills certifierade effekter och beroenden kan
-återställas tillsammans med fragmenten.
+stöder även taskprogram via innehållsadresserade fragment.
 
 ### Taskruntimens minneslayout
 
@@ -245,10 +244,10 @@ allokeringsarena. Scopet inväntar aktiva jobb före frigöring av resultaten.
 
 | Post | Storlek | Fält vid byteoffset |
 | --- | ---: | --- |
-| Samordnare | 32 | 0 initierad, 8 ägartråd, 16 senast utfärdad generation, 24 reserverat |
-| Scope | 192 | 0 generation, 8 tillstånd (1 öppet, 2 stängt), 16 gräns, 24 aktiva jobb, 32 utfärdade jobb, 40 indexkapacitet, 48 indexpekare, 56/64 köhuvud/-slut, 72 ägartråd, 80/88 ledig lista/antal, 96 arbetsytans initierare, 104 delat värde, 112 dess städfunktion, samt utökade fält vid 120–184 (arena-storlek per arbetare, ledig lista för detached-jobb, semafor/väntcell för worker-lane) |
+| Samordnare | 32 | 0 initierad (`-1` för ext-samordnare), 8 ägartråd, 16 senast utfärdad generation, 24 huvud för lista av levande scope |
+| Scope | 192 | 0 generation, 8 tillstånd (1 öppet, 2 stängt), 16 gräns, 24 aktiva jobb, 32 utfärdade jobb, 40 indexkapacitet, 48 indexpekare, 56/64 köhuvud/-slut, 72 ägartråd, 80/88 ledig lista/antal, 96 arbetsytans initierare, 104 delat värde, 112 dess städfunktion, samt utökade fält vid 120–184 (arena-storlek per arbetare, ledig lista för detached-jobb, semafor/väntcell för worker-lane, 152 nästa levande scope, 160 samordnarpekare) |
 | Indexpost | 16 | 0 lånad jobbpekare, 8 exakt resultattyp |
-| Jobbpost | 192 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer (−1 för detached), 24 scope, 32 aktiv, 40 nästa lediga post, 48 resultatstatus (4 cachad, 10 övertagen av `await!`), 64 nativ kontrollpost, samt utökade fält vid 96–184 (återvunnen arena, arbetsyta, delad plats, arena-storlek, lane) |
+| Jobbpost | 192 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer (−1 för detached), 24 scope, 32 aktiv, 40 nästa lediga post, 48 resultatstatus (4 cachad, 10 övertagen av `.join()`/`await!`), 64 nativ kontrollpost, samt utökade fält vid 96–184 (återvunnen arena, arbetsyta, delad plats, arena-storlek, lane) |
 | Jobbtyp | 64 | 0 initierad, 8 resultattyp, 16 starta, 24 hämta, 32 kassera, 40 klona resultat, 48 städa resultat, 56 reserverat |
 | Nativ kontrollpost | 144 | 0 tillstånd, 8 dispatchgrupp eller `pthread_t`, 16 indata, 24 resultat, 32 arenabas, 40 förälderns resultat, 48 allokeringsposition, 56 väntfel, 64 avmappningsfel, 72 återvunnen arena, 80 arbetsytans initierare, 88 arbetsyta, 96 lån av scopets delade plats, samt utökade fält vid 104–136 (worker-pool-lane) |
 

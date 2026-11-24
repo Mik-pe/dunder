@@ -75,7 +75,7 @@ uttryck tillåts inte i `const`.
 | `Option<T>` | [Preludiets optionstyp (`Some(T)`, `None`)](enums.md). |
 | `Result<T, E>` | [Typad enum för framgång och fel](enums.md#typade-fel-med-result). |
 | `range` | Ett intervall med `i32`-gränser; `a..b` är halvöppet, `a..=b` inkluderar båda gränserna. |
-| `TaskID<R>` | En kopierbar resultatnyckel till en [isolerad uppgift](tasks.md). |
+| `Task<R>` | Ett flyttbart resultat­handtag (`move_only`) till en [isolerad uppgift](tasks.md), konsumeras med `.join()`. |
 
 Numeriska literaler kan få sin typ från en annotering, funktionens parameter
 eller returtyp, eller en typad operand på valfri sida. Om `n` är en `i64`
