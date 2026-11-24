@@ -74,7 +74,8 @@ LF och CRLF avslutar rader. Ett ensamt CR i den sista raden hör till texten.
 
 `std.bytes.ByteQueue::new()` ger en återanvändbar bytebuffert. `append`
 lägger till indata, `pending()` lånar den olästa delen och `advance(n)`
-returnerar `false` om antalet ligger utanför den delen. En UTF-8-läsare kan
+returnerar `false` om antalet ligger utanför den delen. `remove(start, count)`
+tar bort byte från den olästa delen och ger `false` för ogiltiga intervall. En UTF-8-läsare kan
 behålla en ofullständig sekvens till nästa `append`.
 
 `std.utf16.append(&mut units, value)` behåller inre nolltecken och skriver
@@ -89,7 +90,8 @@ cell tillsammans och två när de mäts i var sitt spann.
 
 `std.time.local_from_unix(secs)` använder systemets lokala tidszon, inklusive
 sommartid för det angivna ögonblicket. Den ger `.None` om systemet eller
-`DateTime.year` saknar stöd för datumet.
+`DateTime.year` saknar stöd för datumet. Windows använder FILETIME från
+1601-01-01 UTC och systemets tidszonsregler.
 
 `std.time.MonotonicClock.Raw.now_ns()` ger en klocka för korta intervall.
 `resolution_ns()` ger den upplösning systemet anger, avrundad uppåt till hela
