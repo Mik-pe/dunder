@@ -35,6 +35,8 @@ På 0.11.2 fungerar `Runner<i32>.outer<i32>` och `Runner<bool>.outer<i32>` var f
 
 I 0.11.2 ger `match self.mode` följt av `self.grow()` i en gren E4003 om mutation under iteration. Programmet har varken en samling eller en loop. Visa vilket fält matchningen lånar och var det muterande anropet sker. Utvärdera om lånet kan avslutas före anropet i en gren som inte binder några variantdata. Prova även en gren som fortfarande använder ett lånat fält efter anropet. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/2758201f70c69e44e7453f73f15dc41df1c6a968/tests/dogfood/compiler/match_receiver.ddr) · [Fungerande lokal kopia](https://github.com/Mik-pe/dunder-tui/blob/2758201f70c69e44e7453f73f15dc41df1c6a968/tests/dogfood/compiler/match_receiver_copy.ddr)
 
+Prova också en lokal enum med två varianter utan nyttolast. I 0.11.2 ger `match state` följt av `state = .Done` i grenen samma E4003. En kopia av diskriminanten före matchningen räcker för att bygga programmet. Pröva om den direkta tilldelningen kan tillåtas när grenen saknar lånade variantdata. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/dogfood/compiler/match_local.ddr)
+
 ## Låt en lokal vy läsa från två ägare
 
 En iterator över ändrade celler behöver läsa både föregående och aktuell bild. I 0.11.2 går det att lagra två delade lån från samma array i en post. Två lokala ägare ger E4003 även när de båda lever längre än posten. Utvärdera om en lokal vy kan knytas till båda ägarna. Prova tidigt avslutad iteration samt att fortsatt användning av vyn håller båda ägarna lånade och att båda blir skrivbara efter sista läsningen. [Två ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views.ddr) · [Gemensam ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views_one_owner.ddr)
@@ -49,9 +51,11 @@ I 0.11.2 läser `std.terminal.size()` från standardutmatningen och `RawMode::en
 
 Låt storleksfrågan på Unix också exponera pixelbredd och pixelhöjd från samma systemanrop. I ett körbart prov ändrades pixelmåtten från 0 × 0 till 813 × 719 medan cellmåtten låg kvar på 45 × 8. Prova även en ensam känd axel, 65 535 och skillnaden mellan en terminal utan pixeluppgift och ett handtag som är en pipe. [Prov på macOS och Linux](https://github.com/Mik-pe/dunder-tui/blob/1c92bea6f93c819e98b64ce3f807f862596d4865/tests/window_terminal.ddr)
 
-## Mät ett grafem i terminalkolumner
+## Mät grafem och sammanhängande text i terminalkolumner
 
 I 0.11.2 ger `std.text.graphemes` ett grafem för både 😶‍🌫️ och 😶‍🌫. I dunder-tui och Ratatui tar de två respektive tre kolumner. Exponera en breddfunktion i `std.terminal` som kan läsa grafemets lånade UTF-8-vy. Ange Unicode-version, presentationsregler och hur kontrolltecken hanteras. Verifiera bredden mot de 5 244 fallen i Unicode 18:s emojitest och de 742 registrerade presentationsvarianterna. Låt TUI-biblioteket prova funktionen vid klippning och när markören flyttas efter en emoji. [Prov med Dunders grafemiterator](https://github.com/Mik-pe/dunder-tui/blob/v0.18.1/tests/stdlib_text.ddr) · [Referensprov med terminalceller](https://github.com/Mik-pe/dunder-tui/blob/v0.18.1/tests/text_reference.ddr)
+
+Låt även en lånad sträng mätas som helhet. För `لا` ger grafemiteratorn två grafem som tar en cell var när de ritas separat. Ratatui mäter samma följd till en kolumn i ett sammanhängande spann och två när en spanngräns delar bokstäverna. Prova båda bredderna och markörens position när nästa spann ritas. [Körbart prov med Dunder 0.11.2](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/stdlib_text.ddr) · [Prov i pseudoterminal](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/posix_terminal.ddr)
 
 ## Dela UTF-16-kodningen mellan Windowsanrop
 
