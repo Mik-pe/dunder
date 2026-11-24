@@ -94,10 +94,6 @@ sin jobbägda indata. `.spawn` och delade taskdata är uttryckliga gränser för
 isolering: runtime kan behöva kopiera data mellan separata workerarenor.
 Dessa isoleringskopior är skilda från vanliga funktionsanrop, som lånar.
 
-> För tillfällig bootstrap-kompatibilitet med det frysta fröet accepterar kompilatorn fortfarande
-> äldre `spawn`/`await`/`await!`/`await_any`/`TaskID<R>` internt, men ny kod ska använda
-> `jobs.spawn(...)`, `Task<R>.join()` och `jobs.wait_any(...)`.
-
 ## Återanvändbar arbetsyta
 
 ```dunder
@@ -247,13 +243,13 @@ allokeringsarena. Scopet inväntar aktiva jobb före frigöring av resultaten.
 | Samordnare | 32 | 0 initierad (`-1` för ext-samordnare), 8 ägartråd, 16 senast utfärdad generation, 24 huvud för lista av levande scope |
 | Scope | 192 | 0 generation, 8 tillstånd (1 öppet, 2 stängt), 16 gräns, 24 aktiva jobb, 32 utfärdade jobb, 40 indexkapacitet, 48 indexpekare, 56/64 köhuvud/-slut, 72 ägartråd, 80/88 ledig lista/antal, 96 arbetsytans initierare, 104 delat värde, 112 dess städfunktion, samt utökade fält vid 120–184 (arena-storlek per arbetare, ledig lista för detached-jobb, semafor/väntcell för worker-lane, 152 nästa levande scope, 160 samordnarpekare) |
 | Indexpost | 16 | 0 lånad jobbpekare, 8 exakt resultattyp |
-| Jobbpost | 192 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer (−1 för detached), 24 scope, 32 aktiv, 40 nästa lediga post, 48 resultatstatus (4 cachad, 10 övertagen av `.join()`/`await!`), 64 nativ kontrollpost, samt utökade fält vid 96–184 (återvunnen arena, arbetsyta, delad plats, arena-storlek, lane) |
+| Jobbpost | 192 | 0 jobbtyp, 8 nästa jobb i kön, 16 ordningsnummer (−1 för detached), 24 scope, 32 aktiv, 40 nästa lediga post, 48 resultatstatus (4 cachad, 10 övertagen av `.join()`), 64 nativ kontrollpost, samt utökade fält vid 96–184 (återvunnen arena, arbetsyta, delad plats, arena-storlek, lane) |
 | Jobbtyp | 64 | 0 initierad, 8 resultattyp, 16 starta, 24 hämta, 32 kassera, 40 klona resultat, 48 städa resultat, 56 reserverat |
 | Nativ kontrollpost | 144 | 0 tillstånd, 8 dispatchgrupp eller `pthread_t`, 16 indata, 24 resultat, 32 arenabas, 40 förälderns resultat, 48 allokeringsposition, 56 väntfel, 64 avmappningsfel, 72 återvunnen arena, 80 arbetsytans initierare, 88 arbetsyta, 96 lån av scopets delade plats, samt utökade fält vid 104–136 (worker-pool-lane) |
 
 Kontrollpostens tillstånd är 0 klar för start, 1 inlämnad, 4 cachad, 5 startfel,
 6 väntfel, 8 kasserad och 9 avmappningsfel. (Resultatstatus 10, övertagen av
-`await!`, finns på jobbpostens fält vid byteoffset 48, inte på kontrollposten.)
+`.join()`, finns på jobbpostens fält vid byteoffset 48, inte på kontrollposten.)
 Vid väntfel kan arbetaren fortfarande köra. Kontrollpost, trådresurser och
 arena måste då förbli giltiga.
 
@@ -301,7 +297,7 @@ arbetstråd bygger MIR lokalt, verifierar, optimerar och sänker funktionerna i
 batchen med arbetsytor som återanvänds över batchgränserna.
 Passinställningar och terminal-ID:n delas som en snapshot för hela scopet.
 Svaret innehåller slutobjekt och statistik i `mir_task.BatchAnswer`.
-Föräldern tar över svaren med `await!` och länkar i källordning. [Batchformat och worker](../selfhost/tasks/mir_task.ddr)
+Föräldern tar över svaren med `.join()` och länkar i källordning. [Batchformat och worker](../selfhost/tasks/mir_task.ddr)
 
 `ObjectData` är en vanlig transparent post med primitiva arenor och går
 genom språkets befintliga snapshot-/klonregler. Den ger inget undantag för
