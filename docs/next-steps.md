@@ -1,9 +1,5 @@
 # Nästa steg för Dunder
 
-## Rätta kraschen vid iteration över en temporär array
-
-På macOS ARM64 avbryts det 13 rader långa provet i publicerade 0.12.0 när loopen går över en returnerad array med ett koordinatpar och lägger de två värdena i en bytearray. 0.11.3 och 0.12.0 med `--mir-memory=off` ger de väntade byten 3 och 4. Jämför den optimerade kodens läsningar och skrivningar med kontrollbygget. Verifiera med standardflaggor på macOS och Linux. Det större cellprovet avbröts även på Linux ARM64 och översatt x86-64. [Fristående prov](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/tests/dogfood/compiler/temporary_pair_loop.ddr) · [Ursprungligt cellprov](https://github.com/Mik-pe/dunder-tui/blob/5eb4c33/tests/raw_cells.ddr)
-
 ## Undvik allokering för omedelbart avlästa skalära returvärden
 
 För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 384 kontrolltecken totalt 49 160 allokeringsanrop med både `match` och `unwrap_or(-1)`. Fyra sparade bredder gav åtta anrop och samma summa. Minska kostnaden för `Some(i32)` över funktionsgränsen och behåll `.None` för kontrolltecken. Mät med `--runtime-profile` på macOS och Linux ARM64. [Prov för båda anropssätten](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/benchmarks/language/terminal_option.ddr)
@@ -45,6 +41,10 @@ Verifiera även lokal tid runt nyår, sommartidsbyten och FILETIME-gränser på 
 ## Mät tidsgränser över systemvila
 
 På Apple M5 anger systemet 1 000 ns för `Deadline` och 42 ns för `Raw`. Mät båda klockorna och väggtiden före och efter faktisk systemvila. På macOS använder Dunder `CLOCK_MONOTONIC` för tidsgränser och `CLOCK_MONOTONIC_RAW` för rå tid. Enligt macOS manual för `clock_gettime(3)` räknar båda med systemvilan. En tidsgräns kan därför ha löpt ut vid väckning. [Klockkontrakt](standard.md) · [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2/benchmarks/language/monotonic_clock.ddr)
+
+## Verifierat efter 0.12.0
+
+En loop kan packa upp heltalspar ur en temporär array. Kompilatorn försökte tidigare frigöra stackkopian av varje par. Regressionstestet passerar med standardflaggor på macOS ARM64 och Linux ARM64 och x86-64. Ramprovet avbröts med 0.12.0 efter 3 347 byte på macOS. Med rättningen gav det samma 10 829 338 byte på alla tre som kontrollbygget med 0.12.0 och `--mir-memory=off` på macOS. [Regressionstest](../tests/fixtures/aggregate_arrays/temporary_pairs.ddr) · [Cellprov](https://github.com/Mik-pe/dunder-tui/blob/5eb4c33/tests/border_cells.ddr)
 
 ## Verifierat i 0.12.0
 
