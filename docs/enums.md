@@ -224,19 +224,26 @@ callback som får variantens innehåll tar över det med en `move`-parameter.
 ## Lagring och dispatch
 
 En enum med data innehåller en tagg och plats för den största variantens
-payload direkt i värdet. Alla fältlösa varianter (oavsett taggnummer, inklusive
-`.None`, `.Err`, `?`-propagering och `.clone()` av tomma varianter) återanvänder
-statiska skrivskyddade enkelinstanser utan heapallokering. Själva taggningen
-behöver inget extra heapobjekt eller vtables. Payloads följer sina typers
-ägarskapsregler. Flytt överför befintlig lagring. En uttrycklig `.clone()`
-klonar ägda arraybarn till oberoende buffertar; oföränderlig strängtext kan
-delas med referensräkning. Funktionsvärden i payloads kan vara namngivna
-funktioner eller closures.
+payload direkt i värdet. När en kopieringsbar data-enum (`Copy`, dvs. utan
+resursfält eller `@resource`) ryms inom 16 åttabyte-ord med tagg och platt
+payload — exempelvis `Option<i32>`, `Option<(i32, i32)>`, `Result<u64, ()>`,
+färgenums och enums med kopierbara struct- eller tupelpayloads — lagras den
+inline som ett platt POD-värde på stacken utan heapallokering eller
+referensräkning. Större eller resursägande data-enums lagras på heapen, medan
+alla fältlösa varianter (oavsett taggnummer, inklusive `.None`, `.Err`,
+`?`-propagering och `.clone()` av tomma varianter) återanvänder statiska
+skrivskyddade enkelinstanser utan heapallokering. Själva taggningen behöver
+inget extra heapobjekt eller vtables. Payloads följer sina typers ägarskapsregler.
+Flytt överför befintlig lagring. En uttrycklig `.clone()` klonar ägda arraybarn
+till oberoende buffertar; oföränderlig strängtext kan delas med referensräkning.
+Funktionsvärden i payloads kan vara namngivna funktioner eller closures.
 
-`match` kompileras till taggjämförelser och direkta grenar. Resursägande structar, arrayer och data-enums flyttas vid bindning,
-tilldelning och retur. Vanliga parametrar lånar dem för läsning. Anroparen äger returvärdets lagring, även vid callbacks och rekursion.
-Detta är en första implementation utan optimerings- eller prestandalöften;
-minneslayouten är ännu inget stabilt externt ABI.
+`match` kompileras till taggjämförelser och direkta grenar. Resursägande
+structar, arrayer och resursägande data-enums flyttas vid bindning, tilldelning
+och retur, medan kopieringsbara POD-enums kopieras som vanliga värden. Vanliga
+parametrar lånar för läsning, där lån av POD-värden passerar buffertpekaren
+direkt (`Pod*`). Anroparen äger returvärdets lagring, även vid callbacks och
+rekursion. Minneslayouten är ännu inget stabilt externt ABI.
 
 Modellen ligger nära kombinationen av
 [Zigs tagged unions](https://ziglang.org/documentation/master/#Tagged-union)

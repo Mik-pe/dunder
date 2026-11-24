@@ -30,11 +30,15 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 Regeln för flytt gäller `string`, dynamiska och fasta arrayer, iteratorer,
 fångande closures (`Fn`, `FnMut`, `FnOnce`) och structar/enums som innehåller
 sådana värden, inklusive map och set. Tal, bool, runes, pekare, rena
-funktionspekare (`fn(...)`), fältlösa enums och records utan resursfält eller
-`@resource` kan kopieras som enkla värden. `Fn(...)` implementerar `Clone` via
-referensräkning i miljön så att flera ägare kräver ett explicit `.clone()` eller
-`move`. Typens ägarskap bestämmer regeln, oberoende av om kompilatorn lagrar
-dess representation på stack eller heap.
+funktionspekare (`fn(...)`), fältlösa enums och `Copy`-värden (nästlade structar,
+tupler och data-enums utan resursfält eller `@resource`) kan kopieras som enkla
+värden. `Fn(...)` implementerar `Clone` via referensräkning i miljön så att
+flera ägare kräver ett explicit `.clone()` eller `move`. När en `Copy`-struct,
+tupel eller payload-enum ryms inom 16 åttabyte-ord lagras den som ett platt
+inline POD-värde på stacken (utan heapallokering eller referensräkning), och lån
+(`&T`/`&mut T`) passerar buffertpekaren direkt (`T*`) på samma sätt som för
+`@c_layout`. Typens ägarskap bestämmer kopierings- och flyttreglerna, oberoende
+av om representationen ligger på stack eller heap.
 
 ### Unika externa resurser
 

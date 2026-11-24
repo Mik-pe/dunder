@@ -19,7 +19,7 @@ modul redigeras uppdateras diagnostiken även i de öppna filer som beror på de
 
 Dunder vilar på fem grundläggande designlöften:
 
-1. **Inga överraskningsallokeringar**: vanliga värdeoperationer och fältlösa enumvarianter (inklusive `.None`, `.Err` och `?`-propagering) undviker oväntade heapallokeringar.
+1. **Inga överraskningsallokeringar**: vanliga värdeoperationer — platta POD-värden på stacken för nästlade `Copy`-structar, tupler och `Copy`-enums (inklusive `Option<(i32, i32)>`-iteratorer och `Result`-propagering med `?`) samt statiska fältlösa enumvarianter (`.None`, `.Err`) — undviker oväntade heapallokeringar.
 2. **Inga överraskningskopior**: kopierbara värden kopieras direkt, medan resursägande värden (`string`, samlingar, fångande `Fn`-closures m.fl.) flyttas som standard och kräver uttrycklig `.clone()` eller `move`.
 3. **Säkert som standard**: overflowkontroll, indexgränser och låne- och ägarskapsregler gäller på samma sätt även i optimerade byggen.
 4. **Snabbt av konstruktion**: direkt maskinkodsgenerering, innehållsadresserad fragmentcache och behovsstyrd generisk specialisering håller kompileringstiden förutsägbar.
