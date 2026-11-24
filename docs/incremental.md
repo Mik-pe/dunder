@@ -123,6 +123,12 @@ avstängd, men aldrig vid kontroll utan kodgenerering.
 `calls` och `work` anger antal besök och arbetsenhet för varje fas. Samtliga
 klockor använder värdplattformen även när målet är ett annat.
 
+I textutskriften visas upp till tio funktioner som tog längst tid i `mir_pipeline`,
+med källfil, rad vid funktionskroppens början och antal MIR-operationer.
+I JSON finns samma rader i `compiler_detail.slowest_mir_functions`, sorterade
+efter `elapsed_ns`. Bara funktioner med ett uppmätt intervall tas med.
+Cacheträffar och `check` ger inga sådana intervall.
+
 Klockfel ger `null` för tidsfördelningen. En fas som inte körs har noll besök;
 den är inte ett uppmätt snabbt arbete. Kontroll utan emission besöker inte
 intervallanalys, registerallokering eller skaläremission. Profilering ändrar inte den byggda
