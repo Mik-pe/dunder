@@ -53,6 +53,10 @@ När `Iterator.next` i ett prov med 1 024 element returnerade en post med ett l�
 
 För `std.text.graphemes` ger ett andra `next()` E4003 i 0.11.2 om det första elementets text läses efter anropet. Att läsa det första elementet direkt fungerar. Pröva en returanknytning till iteratorns lånade källtext som låter markören gå vidare medan båda elementen lever. Källan ska förbli lånad till sista läsningen. [Två grafem från samma sträng](https://github.com/Mik-pe/dunder-tui/blob/a94c584/tests/dogfood/compiler/retained_graphemes.ddr)
 
+## Visa hur en loop kan ändra elementen i en lånad array
+
+För `for cue in &mut cues { cue.played = true }` föreslår 0.11.2 att byta `&mut` mot `&` (E4003). Då avvisas tilldelningen med E4002. Föreslå den fungerande indexloopen i diagnostiken. I macOS-provet uppdaterade den båda posterna med noll array- och postkloner. Pröva även direkt iteration över muterbara element med ett lån per varv. En växande array måste behålla sin lagring medan elementet är lånat. [Reproduktionsfall](https://github.com/Mik-pe/dunder-tui/blob/421eb9f/tests/dogfood/compiler/mutable_elements.ddr) · [Fungerande indexloop](https://github.com/Mik-pe/dunder-tui/blob/421eb9f/tests/dogfood/compiler/indexed_mutable_elements.ddr)
+
 ## Låt en lokal vy läsa från två ägare
 
 En iterator över ändrade celler behöver läsa både föregående och aktuell bild. I 0.11.2 går det att lagra två delade lån från samma array i en post. Två lokala ägare ger E4003 även när de båda lever längre än posten. Utvärdera om en lokal vy kan knytas till båda ägarna. Prova tidigt avslutad iteration samt att fortsatt användning av vyn håller båda ägarna lånade och att båda blir skrivbara efter sista läsningen. [Två ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views.ddr) · [Gemensam ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views_one_owner.ddr)
