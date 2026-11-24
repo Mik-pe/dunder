@@ -103,7 +103,13 @@ I Dunder 0.11.2 på macOS ARM64 gav 65 536 anrop med `Result<(),string>` 65 543 
 
 I 0.11.2 gav två lokala bindningar till element i en array av `(f64,f64)` 209 000 tupelkopior och 3 344 000 kopierade byte i ett diagramprov. Med uttryckliga lån till elementen blev båda räknarna noll. Kontrollsumman var 836 000 i båda fallen. Undersök om kompilatorn kan läsa fälten direkt när bindningen bara används lokalt och arrayen förblir oförändrad. Prova också att ett kopierat element behåller sitt värde om programmet sedan skriver till arrayen. [Körbart prov för båda varianterna](https://github.com/Mik-pe/dunder-tui/blob/9972020733fea428c7d9600f3ac7c9259b5266cf/benchmarks/language/borrowed_points.ddr)
 
+## Håll lokala tupelfält i skalära variabler
+
+I 0.11.2 gav `if skip { position(i) } else { (0,0) }` 65 536 tupelkonstruktioner när bara två heltalsfält lästes efteråt. Med två lokala heltal och uppackning i den tagna grenen blev antalet 4 096. Kontrollsumman var 67 096 575 i båda fallen. Mät om kompilatorn kan bära fälten genom förgreningen var för sig. Prova också en tupel som lämnar funktionen och en gren med sidoeffekt. I riktextprovet försvann 75 900 poolåterbruk på 1 100 bilder. [Minimalt prov](https://github.com/Mik-pe/dunder-tui/blob/v0.20.1/benchmarks/language/conditional_pair.ddr) · [Textvägen](https://github.com/Mik-pe/dunder-tui/blob/v0.20.1/src/text.ddr#L473-L487)
+
 ## Följ upp mätningar för SIMD
+
+I ett prov med 96 celler och växlande bakgrund tog en bitmask över två lånade heltalsarrayer 3,18 ns per cell på nativ Linux x64 och 1,05 ns på macOS ARM64. En loop som återanvände senast beräknade stil tog 3,96 respektive 1,31 ns. I det symboliserade x64-bygget av 0.11.2 innehåller maskens loopkropp tio jämförelser mot stackgränsen `0x3fff000`. Pröva att slå samman de kontroller som täcker samma stackintervall. Verifiera befintliga stackfel, indexfel och cellerna utanför intervallet. [Radprov](https://github.com/Mik-pe/dunder-tui/blob/v0.20.1/benchmarks/language/fill_rows.ddr) · [Nativ mätning](https://github.com/Mik-pe/dunder-tui/actions/runs/45314935607/job/138179388595) · [x64-bakändens stackkontroll](../selfhost/backend/x86.ddr#L66-L73)
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
 
