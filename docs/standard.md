@@ -245,7 +245,7 @@ lånet har upphört.
 
 En funktion kan returnera ett lån från en parameter. Returtypen `&mut T` kräver
 en muterbar källa. Ange `from namn` när källan behöver särskiljas.
-Structfält och enumpayloads kan innehålla delade lån från samma ägare.
+En lokal struct eller enum kan innehålla delade lån från flera ägare. Vid retur måste lånen komma från parametern i funktionens returkontrakt.
 `Option<&T>` representerar ett sådant lån eller ett frånvarande värde.
 En callback kan ge tillfällig åtkomst till ett värde som kanske saknas.
 För en ägd kopia används `.clone()`, som på `&str` ger en `string`.

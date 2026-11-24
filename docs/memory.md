@@ -237,7 +237,7 @@ identitetsprov; råpekaren följer då kontraktet för `unsafe`.
 
 Delade lån kan ingå i structfält och enumpayloads, även via nästlade typer.
 En funktion som returnerar ett sådant värde kan ange källan med `from`.
-Alla lån i ett enskilt värde måste då komma från samma ägare. Ett tomt
+Lokala värden kan låna från flera ägare. Varje ägare förblir lånad till sista läsningen. Vid retur måste samtliga lån komma från den deklarerade parametern. Ett tomt
 alternativ som `.None` behöver ingen ägare. Matchning och destrukturering
 bevarar sambandet med den ursprungliga lagringen.
 
@@ -263,6 +263,7 @@ efterföljande element åt vänster inom samma buffert. Kvarvarande element
 behåller sin ordning och sina ägare. `.clone()` skapar en uttrycklig kopia
 av ett element eller ett inline-fält i C-layout.
 `values.swap(i, j)` byter element på plats utan kloning eller referensräkning.
+`swap(&mut a, &mut b)` byter två initierade ägare av samma typ, även bakom muterbara parametrar. Platserna måste vara åtskilda och båda indexuttrycken utvärderas före bytet.
 
 `replace(&mut place, replacement)` installerar ett nytt värde och returnerar
 den tidigare ägaren. Destinationen måste vara initierad och muterbar och kan

@@ -1830,6 +1830,78 @@ fn resolve_traits(c: &mut Session) {
         }
     }
 }
+fn register_blob(c: &mut Session, move key: string, count: i64, start: i32) {
+    id := c.world.const_names.len
+    c.world.const_names.push(key.clone()); c.world.const_map.put(move key,i64(id))
+    c.world.const_ints.push(count); c.world.const_kinds.push(2); c.world.const_types.push(0); c.world.const_strings.push("")
+    c.world.const_blob_starts.push(start); c.world.const_blob_counts.push(c.world.const_blobs.len-start)
+}
+fn empty_variant_data(c: &mut Session) {
+    start := c.world.const_blobs.len
+    for _ in 0..16 { c.world.const_blobs.push(0) }
+    register_blob(&mut c, "#empty-variant", 1, start)
+}
+fn local_table_key(at: i32) -> string { "#table:" + at.str() }
+fn collect_local_tables(c: &mut Session) {
+    mut at := 0
+    while at + 9 < c.world.tokens.kinds.len {
+        name := at; at += 1
+        if !lexer.symbol(&c.world.tokens,name+1,":") || !lexer.symbol(&c.world.tokens,name+2,"[") || !lexer.symbol(&c.world.tokens,name+4,";") ||
+            c.world.tokens.kinds[name+5] != .Integer || !lexer.symbol(&c.world.tokens,name+6,"]") || !lexer.symbol(&c.world.tokens,name+7,"=") ||
+            !lexer.symbol(&c.world.tokens,name+8,"[") || (name > 0 && (c.world.tokens.texts[name-1] == "mut" || c.world.tokens.texts[name-1] == "const")) { continue }
+        base := type_id(&c, c.world.tokens.texts[name+3])
+        if !const_eval.int_type(base) { continue }
+        n := rules.literal_integer(c.world.tokens.texts[name+5])
+        if !n.ok || n.value < 1 || n.value > 1048576 { continue }
+        mut pos := name+9; mut nums: []i64 = []; mut complete := false
+        while pos < c.world.tokens.kinds.len {
+            if lexer.is_newline(c.world.tokens.kinds[pos]) { pos += 1; continue }
+            if lexer.symbol(&c.world.tokens,pos,"]") { complete = true; break }
+            if c.world.tokens.kinds[pos] != .Integer { break }
+            value := rules.literal_integer(c.world.tokens.texts[pos])
+            if !value.ok || value.value < 0 || !const_eval.check_int_range(c.code.platform, base, value.value, pos).ok { break }
+            nums.push(value.value); pos += 1
+            while pos < c.world.tokens.kinds.len && lexer.is_newline(c.world.tokens.kinds[pos]) { pos += 1 }
+            if lexer.symbol(&c.world.tokens,pos,",") { pos += 1 }
+            else if !lexer.symbol(&c.world.tokens,pos,"]") { break }
+        }
+        if !complete || i64(nums.len) != n.value || pos+1 >= c.world.tokens.kinds.len || !statement_separator(&c,pos+1) { continue }
+        first := c.world.const_blobs.len
+        stride := i32(1).shl(unsigned.shift(storage_type(&c,base)))
+        for value in &nums {
+            for byte in 0..stride { c.world.const_blobs.push(u8(value.shr(8*byte).bit_and(255))) }
+        }
+        register_blob(&mut c, local_table_key(name), n.value, first)
+        at = pos+1
+    }
+}
+fn table_reads_only(c: &Session, name: string, start: i32) -> bool {
+    if c.body.block_end < start { return false }
+    for tok in start..c.body.block_end {
+        if c.world.tokens.kinds[tok] != .Name || c.world.tokens.texts[tok] != name { continue }
+        if !lexer.symbol(&c.world.tokens,tok+1,"[") || !single_table_index(&c.world.tokens,tok+1) { return false }
+    }
+    true
+}
+fn write_string_table(blob: &mut []u8, values: &[]string) {
+    start := blob.len
+    for _ in 0..values.len { for _ in 0..8 { blob.push(0) } }
+    mut offsets := Map<string,i32>::new()
+    for i in 0..values.len {
+        value := &values[i]
+        mut offset := offsets.get_or(value, -1)
+        if offset < 0 {
+            while (blob.len - start) % 8 != 0 { blob.push(0) }
+            for _ in 0..8 { blob.push(0) }
+            offset = blob.len - start
+            offsets.put(value.clone(), offset)
+            for byte in 0..8 { blob.push(u8(i64(value.len).shr(8*byte).bit_and(255))) }
+            for j in 0..value.len { blob.push(u8(value[j])) }
+            blob.push(0)
+        }
+        for byte in 0..8 { blob[start+i*8+byte] = u8(i64(offset).shr(8*byte).bit_and(255)) }
+    }
+}
 fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32, pends: &[]i32, states: &mut []i32, site_tok: i32) -> bool {
     if states[cid] == 2 { return true }
     if states[cid] == 1 {
@@ -1855,7 +1927,7 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
         expected = type_name(&mut c)
         if !c.ok { return false }
         if !const_eval.scalar_value_type(expected) && expected != 4 &&
-            !(collection(&c, expected) && const_eval.scalar_value_type(ft.type_base(&c.types, expected))) {
+            !(collection(&c, expected) && (const_eval.scalar_value_type(ft.type_base(&c.types, expected)) || ft.type_base(&c.types, expected) == 4)) {
             c.body.cursor = ptypes[cid]
             fail(&mut c, "unsupported constant type '" + display_type(&c, expected) + "'; use a scalar, string or fixed table of scalars")
             return false
@@ -1899,7 +1971,7 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
         }
         final_ty = expected
     }
-    arr_len := if val.embed_blob >= 0 { i32(val.int_val) } else { val.arr_ints.len }
+    arr_len := i32(val.int_val)
     if val.kind == 2 && ft.type_kind(&c.types, final_ty) == 6 && arr_len != ft.type_count(&c.types, final_ty) {
         c.body.cursor = pexprs[cid]
         fail(&mut c, "constant fixed array length mismatch: expected " + ft.type_count(&c.types, final_ty).str() + ", got " + arr_len.str())
@@ -1925,6 +1997,12 @@ fn eval_pending_const(c: &mut Session, cid: i32, ptypes: &[]i32, pexprs: &[]i32,
         }
         c.world.const_blob_starts[cid] = first
         c.world.const_blob_counts[cid] = eb_count
+    } else if val.arr_elem == 4 {
+        first := c.world.const_blobs.len
+        write_string_table(&mut c.world.const_blobs, &val.arr_strings)
+        c.world.const_ints[cid] = val.int_val
+        c.world.const_blob_starts[cid] = first
+        c.world.const_blob_counts[cid] = c.world.const_blobs.len - first
     } else {
         c.world.const_ints[cid] = i64(val.arr_ints.len)
         first := c.world.const_blobs.len
@@ -2296,6 +2374,7 @@ fn headers(c: &mut Session, module_starts: &[]i32, module_files: &[]i32) {
             }
         }
     }
+    if c.ok { empty_variant_data(&mut c); collect_local_tables(&mut c) }
     for d in 0..declarations.len {
         if !c.ok { break }
         target_tok := declaration_impl_targets[d]
@@ -2673,7 +2752,7 @@ fn drop_locals_to(c: &mut Session, limit: i32, scope: i32) {
     while c.body.locals.active.len > first {
         id := c.body.locals.active.pop(); ty := c.body.locals.types[id]
         local_borrows.release_local(&mut c.body.local_loans, id)
-        if frame_owned(&c, ty) && !fc.pattern_loan(&c.body, id) { clear_owner(&mut c, places.local_home(c.body.places.arena.locals[id]), ty) }
+        if frame_owned(&c, ty) && !fc.pattern_loan(&c.body, id) && !fc.static_table(&c.body, id) { clear_owner(&mut c, places.local_home(c.body.places.arena.locals[id]), ty) }
     }
 }
 fn enter(c: &mut Session) { c.body.scope = c.body.scope + 1 }
@@ -3994,6 +4073,7 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
     if name == "__dunder_module_closure_probe" {
         covered = true; return closure_probe_call(&mut c, &catalog, &mut inline_work, &mut model)
     }
+    if name == "swap" && c.world.functions.get_or(name, -1) < 0 { covered = true; return swap_values(&mut c, &catalog, &mut inline_work, &mut model) }
     if name == "replace" && c.world.functions.get_or(name, -1) < 0 { covered = true;
         return replace_value(&mut c, &catalog, &mut inline_work, &mut model)
     }
@@ -5413,9 +5493,9 @@ fn collect_stored_source(c: &mut Session, dst: &mut local_borrows.Source, ty: i3
         fail(&mut c, "stored borrow requires a named owner"); return
     }
     if dst.root < 0 { dst = src; return }
-    if dst.root != src.root || dst.origin != src.origin { fail(&mut c, "stored borrows in one value must share an owner"); return }
     dst.frame_view = dst.frame_view || src.frame_view
-    if dst.path != src.path { dst.path = ownership.root_id(&c.body.ownership, src.root) }
+    if dst.path != src.path { dst.path = ownership.join_shared(&mut c.body.ownership, dst.path, src.path) }
+    if dst.origin != src.origin || dst.root != src.root { dst.origin = -3; dst.parent = -1 }
 }
 fn finish_stored_value(c: &mut Session, ty: i32, src: &local_borrows.Source, effects: i32) -> i32 {
     if !ft.stores_borrow(&c.types, ty) { return temporary(&mut c, ty) }
@@ -5440,6 +5520,18 @@ fn enumeration(c: &mut Session, ty: i32, catalog: &opt_inline.View, inline_work:
         arm.enum_value(&mut c.code, 0, ty, variant, c.types.field_values[found], source); return ty
     }
     count := c.types.payload_counts[found]
+    if count == 0 && c.types.field_values[found] == 0 && ft.cleanup_method(&c.types, ty) < 0 {
+        id := i32(c.world.const_map.get_or("#empty-variant", -1))
+        if id >= 0 {
+            target := arm.label(&mut c.code)
+            if !c.code.checking { c.body.facts.const_blob_ids.push(id); c.body.facts.const_blob_labels.push(target) }
+            arm.branch(&mut c.code, target, 20)
+            arm.integer_binary(&mut c.code, 1, true, false, 0, 0, -1, 8)
+            fc.clear_rvalue_place(&mut c.body.place)
+            src := local_borrows.empty_source()
+            return finish_stored_value(&mut c, ty, &src, c.body.mutations.len)
+        }
+    }
     mut stored := local_borrows.empty_source(); effects := c.body.mutations.len
     arm.allocate_value(&mut c.code, c.runtime.alloc, .EnumPayload, ty, (count + 1) * 8, source)
     index := slot(&mut c); arm.store(&mut c.code, index, 0); arm.enum_value(&mut c.code, 1, ty, variant, c.types.field_values[found], source)
@@ -5718,6 +5810,69 @@ fn default_array_elements(c: &mut Session, array: i32, expected: i32, token: i32
     arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
     count
 }
+fn single_table_index(tokens: &lexer.Tokens, at: i32) -> bool {
+    if !lexer.symbol(&tokens, at, "[") { return false }
+    mut depth := 0
+    for i in at+1..tokens.kinds.len {
+        if tokens.kinds[i] != .Symbol { continue }
+        word := &tokens.texts[i]
+        if depth == 0 {
+            if word == "]" { return true }
+            if word == ".." || word == "..=" { return false }
+        }
+        if word == "(" || word == "[" || word == "{" { depth += 1 }
+        else if word == ")" || word == "]" || word == "}" { depth -= 1 }
+    }
+    false
+}
+fn static_table_descriptor(c: &mut Session, target: i32, count: i64, elem_ty: i32) {
+    for _ in 0..5 { _ := slot(&mut c) }
+    data_home := slot(&mut c)
+    arm.branch(&mut c.code, target, 20); arm.store(&mut c.code, data_home, 0)
+    arm.imm(&mut c.code, 0, count); arm.store(&mut c.code, data_home - 1, 0); arm.store(&mut c.code, data_home - 2, 0)
+    shift := unsigned.shift(storage_type(&c, elem_ty))
+    arm.imm(&mut c.code, 0, i64(shift)); arm.store(&mut c.code, data_home - 3, 0)
+    arm.store(&mut c.code, data_home - 4, 31); arm.store(&mut c.code, data_home - 5, 31)
+    arm.address(&mut c.code, data_home)
+}
+
+fn string_table_element(c: &mut Session, target: i32) {
+    arm.mov(&mut c.code, 1, 0); arm.branch(&mut c.code, target, 20)
+    arm.add_scaled(&mut c.code, 1, 0, 1, 3); load_mem(&mut c, 1, 1, 0)
+    arm.add_scaled(&mut c.code, 0, 0, 1, 0)
+}
+fn string_table(c: &mut Session, ty: i32, count: i64, target: i32, token: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    source := c.world.tokens.starts[token]
+    if single_table_index(&c.world.tokens, c.body.cursor) {
+        skip_token(&mut c)
+        actual := expression(&mut c, 0, 1, &catalog, &mut inline_work, &mut model)
+        same(&mut c, 1, actual); expect(&mut c, "]")
+        arm.imm(&mut c.code, 1, count); arm.compare_register(&mut c.code, 0, 1)
+        bounds := debug_trap(&mut c, c.bounds, token, "index")
+        trap_edge(&mut c, bounds, .Bounds, token)
+        string_table_element(&mut c, target)
+        fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
+        return temporary(&mut c, 4)
+    }
+    if lexer.symbol(&c.world.tokens, c.body.cursor, ".") && c.world.tokens.texts[c.body.cursor+1] == "len" {
+        c.body.cursor += 2; arm.imm(&mut c.code, 0, count); return 1
+    }
+    allocation := arm.position(&c.code)
+    arm.intrinsic_call(&mut c.code, c.runtime.array_new, .ArrayNew, 4, ty, source)
+    saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
+    index := slot(&mut c); arm.store(&mut c.code, index, 31)
+    head := arm.label(&mut c.code); done := arm.label(&mut c.code)
+    arm.mark(&mut c.code, head); arm.load(&mut c.code, index)
+    arm.imm(&mut c.code, 1, count); arm.compare_register(&mut c.code, 0, 1); arm.branch(&mut c.code, done, 2)
+    string_table_element(&mut c, target); arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, saved)
+    arm.intrinsic_call(&mut c.code, c.runtime.array_push, .ArrayInitializeElement, 4, 0, source)
+    arm.load(&mut c.code, index); arm.integer_binary(&mut c.code, 1, true, false, 0, 0, -1, 1)
+    arm.store(&mut c.code, index, 0); arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
+    arm.load(&mut c.code, saved)
+    arm.finish_array_literal(&mut c.code, allocation, 4, ty, unsigned.shift(storage_type(&c, 4)), source)
+    array_element_helpers(&mut c, 4)
+    temporary(&mut c, ty)
+}
 fn array_literal(c: &mut Session, token: i32, expected: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     first := c.body.cursor
     mut base := 0
@@ -5839,10 +5994,13 @@ fn infer_tuple(c: &mut Session, site: string, at: i32, catalog: &opt_inline.View
 fn tuple_literal(c: &mut Session, ty: i32, at: i32, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
     first := ft.type_start(&c.types, ty); count := ft.type_count(&c.types, ty)
     home := slot(&mut c)
-    arm.allocate_value(&mut c.code, c.runtime.alloc_record, .Record, ty, count * 8, c.world.tokens.starts[at])
+    pod := is_pod(&c, ty)
+    if pod {
+        base := alloc_pod_buffer(&mut c, ty); place_step(&mut c, .BorrowHome, ty, i32(borrows.Access.Address), 0, base, at)
+    } else { arm.allocate_value(&mut c.code, c.runtime.alloc_record, .Record, ty, count * 8, c.world.tokens.starts[at]) }
     arm.store(&mut c.code, home, 0)
     pending := c.body.pending.slots.len
-    stage_owner(&mut c, .Storage, home, ty, 0)
+    if !pod { stage_owner(&mut c, .Storage, home, ty, 0) }
     for i in 0..count {
         if !c.ok { break }
         newlines(&mut c)
@@ -5856,7 +6014,7 @@ fn tuple_literal(c: &mut Session, ty: i32, at: i32, catalog: &opt_inline.View, i
         take_value_boxed(&mut c, field_type)
         arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, home)
         place_step(&mut c, .Member, field_type, i32(borrows.Access.Address), i32(place_op.Member.Initialize), i, component)
-        stage_owner(&mut c, .Field, home, field_type, i)
+        if !pod { stage_owner(&mut c, .Field, home, field_type, i) }
     }
     newlines(&mut c)
     if eat(&mut c, ",") { newlines(&mut c) }
@@ -6156,15 +6314,11 @@ fn primary_inner(c: &mut Session, expected: i32, catalog: &opt_inline.View, inli
                 may_invalidate_operand(&mut c)
                 target := arm.label(&mut c.code)
                 if !c.code.checking { c.body.facts.const_blob_ids.push(cid); c.body.facts.const_blob_labels.push(target) }
-                for _ in 0..5 { _ := slot(&mut c) }
-                data_home := slot(&mut c)
-                arm.branch(&mut c.code, target, 20); arm.store(&mut c.code, data_home, 0)
-                arm.imm(&mut c.code, 0, c.world.const_ints[cid]); arm.store(&mut c.code, data_home - 1, 0); arm.store(&mut c.code, data_home - 2, 0)
-                elem_ty := ft.type_base(&c.types, cty)
-                shift := unsigned.shift(storage_type(&c, elem_ty))
-                arm.imm(&mut c.code, 0, i64(shift)); arm.store(&mut c.code, data_home - 3, 0)
-                arm.store(&mut c.code, data_home - 4, 31); arm.store(&mut c.code, data_home - 5, 31)
-                arm.address(&mut c.code, data_home)
+                if ft.type_base(&c.types, cty) == 4 {
+                    place = 0; fc.clear_rvalue_place(&mut c.body.place)
+                    return string_table(&mut c, cty, c.world.const_ints[cid], target, token, &catalog, &mut inline_work, &mut model)
+                }
+                static_table_descriptor(&mut c, target, c.world.const_ints[cid], ft.type_base(&c.types, cty))
                 place = 0; fc.clear_rvalue_place(&mut c.body.place); fc.clear_expr(&mut c.body.expr)
                 c.body.expr.const_array = true
                 return cty
@@ -6712,21 +6866,82 @@ fn swap_array(c: &mut Session, ty: i32, place: i32, receiver_at: i32, writable: 
     left := swap_address(&mut c, ty, place, packed, values, first_slot, first_at)
     right := swap_address(&mut c, ty, place, packed, values, second_slot, second_at)
     base := ft.type_base(&c.types, ty)
-    if ft.inline_record(&c.types, base) {
-        arm.load_into(&mut c.code, left, 0); arm.load_into(&mut c.code, right, 1)
-        arm.imm(&mut c.code, 2, i64(ft.c_size(&c.types, base)))
-        head := arm.label(&mut c.code); arm.mark(&mut c.code, head)
-        arm.transfer(&mut c.code, true, 3, 0, 0, 0); arm.transfer(&mut c.code, true, 4, 1, 0, 0)
-        arm.transfer(&mut c.code, false, 4, 0, 0, 0); arm.transfer(&mut c.code, false, 3, 1, 0, 0)
-        arm.integer_binary(&mut c.code, 1, true, false, 0, 0, -1, 1); arm.integer_binary(&mut c.code, 1, true, false, 1, 1, -1, 1)
-        arm.integer_binary(&mut c.code, 2, true, true, 2, 2, -1, 1); arm.branch(&mut c.code, head, 3)
-        return 0
-    }
-    arm.load(&mut c.code, left); place_transfer(&mut c, base, 0, 0, true, packed, 0, first_at)
+    if ft.inline_record(&c.types, base) { swap_bytes(&mut c, left, right, ft.c_size(&c.types, base)) }
+    else { swap_slots(&mut c, base, left, right, packed, packed, first_at, second_at) }
+    0
+}
+fn swap_bytes(c: &mut Session, left: i32, right: i32, width: i32) {
+    if width <= 0 { return }
+    arm.load_into(&mut c.code, left, 0); arm.load_into(&mut c.code, right, 1)
+    arm.imm(&mut c.code, 2, i64(width))
+    head := arm.label(&mut c.code); arm.mark(&mut c.code, head)
+    arm.transfer(&mut c.code, true, 3, 0, 0, 0); arm.transfer(&mut c.code, true, 4, 1, 0, 0)
+    arm.transfer(&mut c.code, false, 4, 0, 0, 0); arm.transfer(&mut c.code, false, 3, 1, 0, 0)
+    arm.integer_binary(&mut c.code, 1, true, false, 0, 0, -1, 1); arm.integer_binary(&mut c.code, 1, true, false, 1, 1, -1, 1)
+    arm.integer_binary(&mut c.code, 2, true, true, 2, 2, -1, 1); arm.branch(&mut c.code, head, 3)
+}
+
+fn swap_slots(c: &mut Session, base: i32, left: i32, right: i32, left_packed: bool, right_packed: bool, first_at: i32, second_at: i32) {
+    arm.load(&mut c.code, left); place_transfer(&mut c, base, 0, 0, true, left_packed, 0, first_at)
     saved := slot(&mut c); arm.store(&mut c.code, saved, 0)
-    arm.load(&mut c.code, right); place_transfer(&mut c, base, 1, 0, true, packed, 0, second_at)
-    arm.load(&mut c.code, left); place_transfer(&mut c, base, 1, 0, false, packed, 1, first_at)
-    arm.load_into(&mut c.code, saved, 1); arm.load(&mut c.code, right); place_transfer(&mut c, base, 1, 0, false, packed, 1, second_at)
+    arm.load(&mut c.code, right); place_transfer(&mut c, base, 1, 0, true, right_packed, 0, second_at)
+    arm.load(&mut c.code, left); place_transfer(&mut c, base, 1, 0, false, left_packed, 1, first_at)
+    arm.load_into(&mut c.code, saved, 1); arm.load(&mut c.code, right); place_transfer(&mut c, base, 1, 0, false, right_packed, 1, second_at)
+}
+
+struct SwapPlace { ty: i32, path: i32, root: i32, address: i32, packed: bool, token: i32 }
+fn swap_place(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> SwapPlace {
+    at := c.body.cursor
+    mut out := SwapPlace { ty: 0, path: -1, root: -1, address: -1, packed: false, token: at }
+    expect(&mut c, "&"); expect(&mut c, "mut")
+    previous := c.body.place.taking_address; c.body.place.taking_address = true
+    ty := primary(&mut c, 0, &catalog, &mut inline_work, &mut model)
+    c.body.place.taking_address = previous
+    if !c.ok { return out }
+    place := c.body.places.current
+    root := borrows.root(&c.body.places, place)
+    if root < 0 || c.body.place.address < 0 { fail(&mut c, "swap requires a named owner"); return out }
+    if !c.body.place.writable { fail_immutable_binding(&mut c, "swap requires mutable storage", root); return out }
+    path := owner_path(&c, place)
+    if !ownership.available(&c.body.ownership, path) { fail(&mut c, "cannot swap a moved value"); return out }
+    if !writable_loan(&mut c, place) || locked_mutation(&mut c, path, "swap", "a collection") { return out }
+    if c.body.place.scratch != 0 || ft.type_kind(&c.types, ty) == 20 || ft.type_kind(&c.types, ty) == 21 || ft.lends(&c.types, ty) {
+        fail(&mut c, "swap requires owned values"); return out
+    }
+    out.ty = ty; out.root = root; out.path = path; out.packed = c.body.place.inline_storage
+    if ft.is_c_record(&c.types, ty) || fixed_pod(&c, ty) {
+        c_layout(&mut c, ty)
+        borrow_address(&mut c, ty, true, at, place)
+    } else {
+        place_address(&mut c, place, c.body.place.direct, at)
+        if is_pod(&c, ty) { arm.load_mem(&mut c.code, 0, 0, 0) }
+    }
+    out.address = slot(&mut c); arm.store(&mut c.code, out.address, 0)
+    out
+}
+fn swap_values(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut opt_inline.Workspace, model: &mut opt_ir.Function) -> i32 {
+    may_invalidate_operand(&mut c)
+    left := swap_place(&mut c, &catalog, &mut inline_work, &mut model)
+    expect(&mut c, ",")
+    effects := c.body.mutations.len
+    right := swap_place(&mut c, &catalog, &mut inline_work, &mut model)
+    expect(&mut c, ")")
+    if !c.ok { return 0 }
+    same(&mut c, left.ty, right.ty)
+    if ownership.overlaps(&c.body.ownership, left.path, right.path) ||
+        mutated_overlap(&c, effects, c.body.mutations.len, left.root, left.path) {
+        fail(&mut c, "swap requires two disjoint mutable places"); return 0
+    }
+    if !c.ok { return 0 }
+    if is_pod(&c, left.ty) { swap_bytes(&mut c, left.address, right.address, ft.type_count(&c.types, left.ty) * 8) }
+    else if ft.is_c_record(&c.types, left.ty) || fixed_pod(&c, left.ty) {
+        swap_bytes(&mut c, left.address, right.address, ft.c_size(&c.types, left.ty))
+    } else {
+        swap_slots(&mut c, left.ty, left.address, right.address, left.packed, right.packed, left.token, right.token)
+    }
+    record_mutation(&mut c, left.root, left.path); record_mutation(&mut c, right.root, right.path)
+    c.body.places.current = 0; c.body.places.source = -1
+    fc.clear_expr(&mut c.body.expr); fc.clear_rvalue_place(&mut c.body.place)
     0
 }
 fn safe_borrowed_string_stream(c: &Session, place: i32) -> bool {
@@ -9245,7 +9460,7 @@ fn bind_tuple(c: &mut Session, assignment: i32, mutable: bool, catalog: &opt_inl
             save_owner(&mut c, index, field_type, false)
         } else { arm.store(&mut c.code, index, 0) }
     }
-    arm.load(&mut c.code, box); drop_value(&mut c, ty)
+    if !is_pod(&c, ty) { arm.load(&mut c.code, box); drop_value(&mut c, ty) }
     end_statement(&mut c)
 }
 fn struct_binding_end(c: &Session, start: i32) -> i32 {
@@ -9433,6 +9648,21 @@ fn value_statement(c: &mut Session, catalog: &opt_inline.View, inline_work: &mut
         }
         if scratch_declaration(&mut c,name,mutable, &catalog, &mut inline_work, &mut model) {return false}
         if eat(&mut c, ":") { expected = type_name(&mut c); expect(&mut c, "=") } else { expect(&mut c, ":=") }
+        if !mutable && ft.type_kind(&c.types, expected) == 6 && is(&c, "[") {
+            id := i32(c.world.const_map.get_or(local_table_key(name_at), -1))
+            if id >= 0 {
+                end := const_eval.expr_end(&c.world.tokens, c.body.cursor)
+                if table_reads_only(&c, name, end) {
+                    label := arm.label(&mut c.code)
+                    if !c.code.checking { c.body.facts.const_blob_ids.push(id); c.body.facts.const_blob_labels.push(label) }
+                    static_table_descriptor(&mut c, label, c.world.const_ints[id], ft.type_base(&c.types, expected))
+                    home := slot(&mut c); arm.store(&mut c.code, home, 0)
+                    bind(&mut c, &mut model, move name, expected, false, home, name_at)
+                    c.body.static_tables.push(c.body.locals.names.len - 1)
+                    c.body.cursor = end; end_statement(&mut c); return false
+                }
+            }
+        }
         mut ty := expression(&mut c, 0, expected, &catalog, &mut inline_work, &mut model)
         if expected != 0 { ty = coerce_callable(&mut c, expected, ty, name_at); same(&mut c, expected, ty) }
         if ty == 0 {
