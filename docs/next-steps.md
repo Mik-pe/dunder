@@ -73,6 +73,10 @@ I ett färgprov på ARM64/macOS med 0.11.2 gav 65 536 direkta läsningar ur en f
 
 I Dunder 0.11.2 på macOS ARM64 gav 65 536 anrop med `Result<(),string>` 65 543 allokeringsanrop inklusive uppstart. Ett mellanled som skickade vidare fel men skapade en ny `.Ok` gav 126 983. Skillnaden är exakt ett poolåterbruk för vart och ett av de 61 440 lyckade anropen. Båda körningarna gav samma 4 096 fel och sju färska allokeringar. Undersök om kompilatorn kan återanvända resultatet när ingen annan äger det. Kontrollera felmeddelandet, ett resultat som sparas av anroparen och en typ med resurs som nyttolast. [Körbart resultatprov](https://github.com/Mik-pe/dunder-tui/blob/a7cb0342938912b20b315b55338ffbe27fcf018e/benchmarks/language/unit_result.ddr)
 
+## Undvik kopior vid läsning av koordinatpar
+
+I 0.11.2 gav två lokala bindningar till element i en array av `(f64,f64)` 209 000 tupelkopior och 3 344 000 kopierade byte i ett diagramprov. Med uttryckliga lån till elementen blev båda räknarna noll. Kontrollsumman var 836 000 i båda fallen. Undersök om kompilatorn kan läsa fälten direkt när bindningen bara används lokalt och arrayen förblir oförändrad. Prova också att ett kopierat element behåller sitt värde om programmet sedan skriver till arrayen. [Körbart prov för båda varianterna](https://github.com/Mik-pe/dunder-tui/blob/9972020733fea428c7d9600f3ac7c9259b5266cf/benchmarks/language/borrowed_points.ddr)
+
 ## Följ upp mätningar för SIMD
 
 Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
