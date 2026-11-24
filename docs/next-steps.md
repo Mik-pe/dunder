@@ -43,6 +43,14 @@ I 0.11.2 ger `match self.mode` följt av `self.grow()` i en gren E4003 om mutati
 
 Prova också en lokal enum med två varianter utan nyttolast. I 0.11.2 ger `match state` följt av `state = .Done` i grenen samma E4003. En kopia av diskriminanten före matchningen räcker för att bygga programmet. Pröva om den direkta tilldelningen kan tillåtas när grenen saknar lånade variantdata. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/dogfood/compiler/match_local.ddr)
 
+## Låna två skilda fält i samma metodanrop
+
+I 0.11.2 avvisar både `check` och `build` anropet `self.cursor.advance(self.source)` med E4003. Metoden ändrar ett heltal i `cursor` och läser längden på den separat ägda sträng som `source` lånar. En lokal kopia av markören kan utföra anropet och sedan flyttas tillbaka. Låt lånekontrollen skilja på dessa åtkomstvägar. Prova även två lån av samma fält och ett lån av hela mottagaren. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/f9c8089da7b0cac67db941e1b36186edc733b4bb/tests/dogfood/compiler/disjoint_fields.ddr)
+
+## Låt kortlivade iteratorposter stanna i loopen
+
+När `Iterator.next` i ett prov med 1 024 element returnerade en post med ett lån, ett index och en inre post rapporterade 0.11.2 totalt 5 312 postkopior och 7 489 allokeringsanrop. Direkt läsning av samma byte och vikt gav noll postkopior och ett allokeringsanrop. Båda gav summan 110 080 på macOS och Linux ARM64. Pröva att eliminera kopior genom `Option` och loopbindningen när elementet förbrukas på plats. Kontrollera även ägda element som sparas och att livstidskontrollen fortfarande avvisar lån som lämnar sin ägare. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/f3ecfc12e64df502da617593e7197483582b92fe/benchmarks/language/iterator_item.ddr)
+
 ## Låt en lokal vy läsa från två ägare
 
 En iterator över ändrade celler behöver läsa både föregående och aktuell bild. I 0.11.2 går det att lagra två delade lån från samma array i en post. Två lokala ägare ger E4003 även när de båda lever längre än posten. Utvärdera om en lokal vy kan knytas till båda ägarna. Prova tidigt avslutad iteration samt att fortsatt användning av vyn håller båda ägarna lånade och att båda blir skrivbara efter sista läsningen. [Två ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views.ddr) · [Gemensam ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views_one_owner.ddr)
