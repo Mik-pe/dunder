@@ -37,7 +37,9 @@ Privata filer på Windows behöver ett kontrakt för Windows åtkomstkontrollist
 Verifiera åtkomsten som ett annat användarkonto och utred vilka garantier ett
 beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synkning](sys.md)
 
-Verifiera även lokal tid runt nyår, sommartidsbyten och FILETIME-gränser på Windows. I UTC under Wine 8 gav 0.12.0 rätt kalender och veckodag för 1601-01-01, 1960-01-01, sekunden före Unixepoken, epoken och 2024-03-31. Indata utanför det representerbara intervallet gav `.None`. [Tidsomvandling](../stdlib/time.ddr) · [Windows tidszonsregler per år](https://learn.microsoft.com/en-us/windows/win32/api/timezoneapi/nf-timezoneapi-gettimezoneinformationforyear)
+Under Wine 8 gav 0.12.0 rätt UTC-kalender och veckodag vid 1601-01-01, före Unixepoken och 2024-03-31. Tider utanför FILETIME-intervallet gav `.None`. [Tidsomvandling](../stdlib/time.ddr)
+
+Kör `dunder run tests/fixtures/local-calendar.ddr -- UTC` på Windows. Ange värdens tidszon som `UTC`, `Europe/Stockholm` eller `America/New_York`. Provet kontrollerar årsskiften, början och slutet på sommartid, de ändrade amerikanska reglerna 2007 och FILETIME-gränser. Under Wine 8 passerade alla tre zonerna. [Kalenderprov](../tests/fixtures/local-calendar.ddr) · [Windows tidszonsregler per år](https://learn.microsoft.com/en-us/windows/win32/api/timezoneapi/nf-timezoneapi-gettimezoneinformationforyear)
 
 ## Mät tidsgränser över systemvila
 
