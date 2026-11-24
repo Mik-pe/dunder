@@ -73,6 +73,10 @@ Lägg till stegvis radläsning i `std.text`. På 3 073 rader gav `split` i 0.11.
 
 Med `(&values[0..2]) == (&values[2..4])` ger både `check` och `build` E4002 i 0.11.2 och föreslår ett `&` som redan står där. Om vyerna binds till två lokala namn först fungerar samma jämförelse. Profilen visar noll arraykloner och noll kopierade byte. Tillåt jämförelsen direkt eller visa den fungerande bindningen i diagnostiken. Prova lika, olika och tomma intervall. [Direkt jämförelse](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/inline_view_equality.ddr) · [Namngivna vyer](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/named_view_equality.ddr)
 
+## Byt två ägda värden utan ett mellanvärde
+
+Körlistan och kompilatorns `exchange_data_into` skapar ett tomt värde när två separata ägare byter innehåll med `replace`. I 0.11.2 gav 4 095 byten av poster med två arrayer 12 285 extra allokeringsanrop mot kontrollen, varav en färsk allokering. Arrayens `swap(0, 1)` gav samma slutordning med 21 anrop totalt. Båda ARM64-värdarna gav samma resultat. Pröva ett generellt byte mellan två muterbara platser utan krav på `Default`. Kontrollera flyttbara resurser, överlappande lån och noll allokeringar per byte. [Körbart prov för macOS och Linux](https://github.com/Mik-pe/dunder-tui/blob/ac1f28382af4daca104b12433b04bb0946a4507c/benchmarks/language/swap_storage.ddr) · [Användning i kompilatorn](../selfhost/mir/mir_lower.ddr#L518-L528)
+
 ## Lägg till ägda element i en array
 
 Komplettera `std.array.append` med en variant som tar över en ägd källarray och behåller elementens ordning. Dunder 0.11.2 klarar detta med `T: Storable`, en reservation och `for item in move source`. I ett prov med 1 024 rader om 24 heltal gjorde den lånade varianten 1 024 arraykopior om totalt 98 304 byte. Den flyttande varianten gjorde noll. Alla 24 576 värden verifierades på macOS och Linux ARM64. Täck även tom källa, tom destination och element som bara kan flyttas. [Körbart prov med båda varianterna](https://github.com/Mik-pe/dunder-tui/blob/70f877d54df0b9c2d3bc5cf2dd8f38aeef838c67/benchmarks/language/append_arrays.ddr)
