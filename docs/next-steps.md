@@ -75,7 +75,7 @@ Med `(&values[0..2]) == (&values[2..4])` ger både `check` och `build` E4002 i 0
 
 ## Byt två ägda värden utan ett mellanvärde
 
-Körlistan och kompilatorns `exchange_data_into` skapar ett tomt värde när två separata ägare byter innehåll med `replace`. I 0.11.2 gav 4 095 byten av poster med två arrayer 12 285 extra allokeringsanrop mot kontrollen, varav en färsk allokering. Arrayens `swap(0, 1)` gav samma slutordning med 21 anrop totalt. Båda ARM64-värdarna gav samma resultat. Pröva ett generellt byte mellan två muterbara platser utan krav på `Default`. Kontrollera flyttbara resurser, överlappande lån och noll allokeringar per byte. [Körbart prov för macOS och Linux](https://github.com/Mik-pe/dunder-tui/blob/ac1f28382af4daca104b12433b04bb0946a4507c/benchmarks/language/swap_storage.ddr) · [Användning i kompilatorn](../selfhost/mir/mir_lower.ddr#L518-L528)
+Två lokala ägare kan byta plats med tre flyttar. Samma kod bakom två `&mut`-parametrar ger E4003. Körlistan och kompilatorns `exchange_data_into` använder därför `replace` med ett mellanvärde. I 0.11.2 gav 4 095 byten av poster med två arrayer 12 304 allokeringsanrop, mot 19 för lokala flyttar och 21 för arrayens `swap`. Av de 12 285 extra anropen var ett en färsk allokering. macOS och Linux ARM64 gav samma slutordning och profiler. Pröva platsbyte bakom två muterbara lån utan `Default` eller allokering. Täck flyttbara resurser och överlappande lån. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/52313cc/benchmarks/language/swap_storage.ddr) · [Avvisat lån](https://github.com/Mik-pe/dunder-tui/blob/52313cc/tests/dogfood/compiler/swap_borrowed.ddr) · [Kompilatorns användning](../selfhost/mir/mir_lower.ddr#L518-L528)
 
 ## Lägg till ägda element i en array
 
