@@ -12,6 +12,11 @@ För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 
 
 Ge `std.json.Doc` en iterator som lämnar nyckel och värdenod i källordning, även för dubbla och escapade nycklar. I 0.12.0 går `key_at` och `val_at` från första barnet för varje index. Att läsa ett redan tolkat objekt med 1 024, 2 048 och 4 096 fält tog 1,83, 7,40 och 29,69 ms i median på macOS ARM64. Kör samma prov med iteratorn och kontrollera linjär tidsökning och oförändrade kontrollsummor. [Mätprogram i Dunder](https://github.com/Mik-pe/dunder-tui/blob/247dd05/benchmarks/language/json_members.ddr)
 
+## Komplettera `std.json` för egna kodare och fasta arrayer
+
+- Ge `json.Writer` en publik metod för att avvisa ett värde och behålla det första felet. I 0.12.0 ger `writer.fail("utanför intervallet")` E2004 i en egen kodare. Prova ett ogiltigt värde inuti en array och kontrollera felet från både `finish()` och `finish_bytes()`. [Körbart rektangelprov](https://github.com/Mik-pe/dunder-tui/blob/bbd1564/tests/suite.ddr#L1563)
+- Stöd `Encode` och `Decode` för `[T; N]`. I 0.12.0 ger skrivning och läsning av `[u16; 2]` E3004. Verifiera att `[12,24]` går att läsa tillbaka och att fel arraylängd ger ett avkodningsfel.
+
 ## Verifiera Windows som kompilatorvärd
 
 Dunder distribuerar en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
