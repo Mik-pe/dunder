@@ -1,5 +1,13 @@
 # Nästa steg för Dunder
 
+## Rätta kraschen vid iteration över en temporär array
+
+På macOS ARM64 avbryts det 13 rader långa provet i publicerade 0.12.0 när loopen går över en returnerad array med ett koordinatpar och lägger de två värdena i en bytearray. 0.11.3 och 0.12.0 med `--mir-memory=off` ger de väntade byten 3 och 4. Jämför den optimerade kodens läsningar och skrivningar med kontrollbygget. Verifiera med standardflaggor på macOS och Linux. Det större cellprovet avbröts även på Linux ARM64 och översatt x86-64. [Fristående prov](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/tests/dogfood/compiler/temporary_pair_loop.ddr) · [Ursprungligt cellprov](https://github.com/Mik-pe/dunder-tui/blob/5eb4c33/tests/raw_cells.ddr)
+
+## Undvik allokering för omedelbart avlästa skalära returvärden
+
+För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 384 kontrolltecken totalt 49 160 allokeringsanrop med både `match` och `unwrap_or(-1)`. Fyra sparade bredder gav åtta anrop och samma summa. Minska kostnaden för `Some(i32)` över funktionsgränsen och behåll `.None` för kontrolltecken. Mät med `--runtime-profile` på macOS och Linux ARM64. [Prov för båda anropssätten](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/benchmarks/language/terminal_option.ddr)
+
 ## Verifiera Windows som kompilatorvärd
 
 Dunder distribuerar en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
