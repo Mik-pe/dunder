@@ -20,6 +20,10 @@ En metod med parametern `&[]T` ska kunna ta `&[a, b]` och härleda `T` från ele
 
 En metod med returtypen `&str from self` kan i 0.12.1 låna ett strängfält direkt. I `match &self.symbol` får `.Some(value) => value.as_str()` E4003 även när också reservsträngen ägs av mottagaren. Följ lånet genom mönstret och kontrollera båda grenarna. En strängvy från en lokal variabel ska fortfarande avvisas. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/b22a99fa0d59702c82fa2126d7e59370f11f6dea/tests/dogfood/compiler/borrow_optional_field.ddr)
 
+## Avsluta ett läslån när en retur lämnar loopen
+
+I 0.12.1 ger `return move source` E4003 efter radvyns sista läsning i en loop över `std.text.lines`. Tillåt flytten på returgrenen när läsaren saknar destruktor och inga lån följer med returvärdet. Verifiera att en ensam rad kan flyttas utan kopia och att en flytt följd av `lines.advance()` fortfarande avvisas. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/d772f4072c959adc2ea2677e1ed89eb27259d695/tests/dogfood/compiler/return_owner_from_line_loop.ddr)
+
 ## Tillåt ett valfritt muterbart lån vid uppslag
 
 En metod som returnerar `Option<&mut i32> from self` får E3099 i 0.12.1. Stöd ett kortlivat lån till ett arrayelement när indexet finns och `.None` annars. Verifiera att ändringen syns i arrayen och att ett andra muterbart lån av samma element avvisas medan det första används. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/aa3c7ec06326598063c61d311253d27e3ab6ebec/tests/dogfood/compiler/optional_mutable_element.ddr)
