@@ -197,10 +197,7 @@ från `dunder shim zsh`.
   samma katalog som `dunder`-binären (när den startats via `PATH` eller sökväg);
   med `--dir KATALOG` respektive `--prefix PREFIX` installeras den i `KATALOG`
   eller `PREFIX/bin`.
-- **Testutdata i `dunder test`:** Som standard kör och sammanräknar
-  `dunder test` bara testerna i det aktuella paketet/målfilerna (och hoppar över
-  standardbibliotekets egna `@test`-funktioner, inklusive för inbäddad
-  `selfhost/`- eller `stdlib/`-kod), såvida inte själva standardbiblioteket eller
-  kompilatorn testas direkt.
+- `dunder test` kör varje test i det importerade källträdet en gång per kanonisk fil. Tester i importerade tredjepartspaket ingår och rapporteras med sin sökväg. Standardbibliotekets egna tester körs när biblioteket testas direkt.
+- Paketet `packages/zlib` avkodar en zlib-ström med `decompress(input, max_bytes) -> Result<[]u8, string>`. Gränsen gäller antalet okomprimerade byte. Ett tomt resultat ryms vid gränsen noll. Avkodaren kontrollerar Adler-32 och avvisar förinställda ordlistor. [Paket och tester](../packages/zlib)
 
 [`Manifestparser`](../selfhost/driver/manifest.ddr) · [`CLI`](../selfhost/driver/cli.ddr)

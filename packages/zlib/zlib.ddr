@@ -1,0 +1,287 @@
+import std.bytes as bytes
+
+struct BitStream {
+    pos: i32,
+    end: i32,
+    bit_buf: u64,
+    bit_count: i32,
+    ok: bool,
+    error: string,
+}
+
+impl BitStream {
+    fn new(start: i32, length: i32) -> Self {
+        Self { pos: start, end: start + length, bit_buf: 0, bit_count: 0, ok: true, error: "" }
+    }
+
+    fn fail(&mut self, move msg: string) {
+        if self.ok { self.ok = false; self.error = msg }
+    }
+
+    fn ensure(&mut self, src: &[]u8, n: i32) {
+        while self.bit_count < n {
+            if self.pos >= self.end {
+                self.fail("unexpected end of deflate stream")
+                return
+            }
+            self.bit_buf = self.bit_buf.bit_or(u64(src[self.pos]).shl(self.bit_count))
+            self.pos += 1
+            self.bit_count += 8
+        }
+    }
+
+    fn read_bits(&mut self, src: &[]u8, n: i32) -> i32 {
+        if !self.ok || n == 0 { return 0 }
+        self.ensure(&src, n)
+        if !self.ok { return 0 }
+        mask := u64(1).shl(n) - 1
+        v := i32(self.bit_buf.bit_and(mask))
+        self.bit_buf = self.bit_buf.shr(n)
+        self.bit_count -= n
+        v
+    }
+
+    fn align_byte(&mut self) {
+        drop := self.bit_count % 8
+        if drop > 0 {
+            self.bit_buf = self.bit_buf.shr(drop)
+            self.bit_count -= drop
+        }
+    }
+
+    fn read_aligned_u16(&mut self, src: &[]u8) -> i32 {
+        lo := self.read_bits(&src, 8)
+        hi := self.read_bits(&src, 8)
+        lo + hi * 256
+    }
+}
+
+struct HuffTable {
+    ok: bool,
+    counts: [i32; 16],
+    symbols: []i32,
+}
+
+impl HuffTable {
+    fn build(lengths: &[]i32, start: i32, count: i32, singles: bool) -> Self {
+        mut counts: [i32; 16] = [0; 16]
+        for i in 0..count {
+            l := lengths[start + i]
+            if l < 0 || l > 15 {
+                return Self { ok: false, counts: counts, symbols: [] }
+            }
+            if l > 0 { counts[l] += 1 }
+        }
+        mut left := 1
+        for bits in 1..16 {
+            left = left * 2 - counts[bits]
+            if left < 0 {
+                return Self { ok: false, counts: counts, symbols: [] }
+            }
+        }
+        mut offsets: [i32; 16] = [0; 16]
+        mut total := 0
+        for bits in 1..16 {
+            offsets[bits] = total
+            total += counts[bits]
+        }
+        if left != 0 && !(singles && (total == 0 || (total == 1 && counts[1] == 1))) {
+            return Self { ok: false, counts: counts, symbols: [] }
+        }
+        mut symbols: []i32 = []
+        for _ in 0..total { symbols.push(0) }
+        for sym in 0..count {
+            l := lengths[start + sym]
+            if l > 0 {
+                symbols[offsets[l]] = sym
+                offsets[l] += 1
+            }
+        }
+        Self { ok: true, counts: counts, symbols: symbols }
+    }
+
+    fn decode(&self, bs: &mut BitStream, src: &[]u8) -> i32 {
+        mut code := 0
+        mut first := 0
+        mut index := 0
+        for bits in 1..16 {
+            bit := bs.read_bits(&src, 1)
+            if !bs.ok { return -1 }
+            code = code.bit_or(bit)
+            cnt := self.counts[bits]
+            if code - cnt < first {
+                return self.symbols[index + (code - first)]
+            }
+            index += cnt
+            first = (first + cnt) * 2
+            code = code * 2
+        }
+        bs.fail("invalid Huffman code")
+        -1
+    }
+}
+
+fn adler32(data: &[]u8) -> u32 {
+    mut s1: u32 = 1
+    mut s2: u32 = 0
+    for b in &data {
+        s1 = (s1 + u32(b)) % 65521
+        s2 = (s2 + s1) % 65521
+    }
+    s2.shl(16).bit_or(s1)
+}
+
+pub fn decompress(src: &[]u8, max_bytes: i32) -> Result<[]u8, string> {
+    if max_bytes < 0 { return .Err("negative output limit") }
+    if src.len < 6 {
+        return .Err("zlib stream too short")
+    }
+    cmf := i32(src[0])
+    flg := i32(src[1])
+    if cmf.bit_and(15) != 8 || cmf.shr(4) > 7 || (cmf * 256 + flg) % 31 != 0 {
+        return .Err("invalid zlib header")
+    }
+    if flg.bit_and(32) != 0 {
+        return .Err("zlib preset dictionary unsupported")
+    }
+
+    mut out: []u8 = []
+    mut bs := BitStream::new(2, src.len - 6)
+
+    len_bases: [i32; 29] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+    ]
+    len_extra: [i32; 29] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+    ]
+    dist_bases: [i32; 30] = [
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
+    ]
+    dist_extra: [i32; 30] = [
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+        7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+    ]
+    clen_order: [i32; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+    mut bfinal := 0
+    while bfinal == 0 {
+        bfinal = bs.read_bits(&src, 1)
+        btype := bs.read_bits(&src, 2)
+        if !bs.ok {
+            return .Err(bs.error)
+        }
+        if btype == 0 {
+            bs.align_byte()
+            blk_len := bs.read_aligned_u16(&src)
+            nlen := bs.read_aligned_u16(&src)
+            if !bs.ok || blk_len.bit_xor(nlen) != 65535 {
+                return .Err("invalid stored block")
+            }
+            if blk_len > max_bytes - out.len { return .Err("output limit exceeded") }
+            for _ in 0..blk_len {
+                b := bs.read_bits(&src, 8)
+                if !bs.ok { return .Err(bs.error) }
+                out.push(u8(b))
+            }
+        } else if btype == 1 || btype == 2 {
+            mut lit_lens: []i32 = []
+            mut hlit := 288
+            mut hdist := 32
+            if btype == 1 {
+                for _ in 0..144 { lit_lens.push(8) }
+                for _ in 144..256 { lit_lens.push(9) }
+                for _ in 256..280 { lit_lens.push(7) }
+                for _ in 280..288 { lit_lens.push(8) }
+                for _ in 0..32 { lit_lens.push(5) }
+            } else {
+                hlit = bs.read_bits(&src, 5) + 257
+                hdist = bs.read_bits(&src, 5) + 1
+                hclen := bs.read_bits(&src, 4) + 4
+                if !bs.ok || hlit > 286 || hdist > 30 {
+                    return .Err("invalid dynamic huffman header")
+                }
+                mut clens: []i32 = []
+                for _ in 0..19 { clens.push(0) }
+                for i in 0..hclen {
+                    clens[clen_order[i]] = bs.read_bits(&src, 3)
+                }
+                if !bs.ok { return .Err(bs.error) }
+                cl_tree := HuffTable::build(&clens, 0, 19, false)
+                if !cl_tree.ok {
+                    return .Err("invalid code-length tree")
+                }
+                total_codes := hlit + hdist
+                while lit_lens.len < total_codes {
+                    sym := cl_tree.decode(&mut bs, &src)
+                    if !bs.ok { return .Err(bs.error) }
+                    if sym < 16 {
+                        lit_lens.push(sym)
+                    } else {
+                        mut rep := 0
+                        mut val := 0
+                        if sym == 16 {
+                            if lit_lens.len == 0 {
+                                return .Err("bad repeat 16")
+                            }
+                            val = lit_lens[lit_lens.len - 1]
+                            rep = 3 + bs.read_bits(&src, 2)
+                        } else if sym == 17 {
+                            rep = 3 + bs.read_bits(&src, 3)
+                        } else {
+                            rep = 11 + bs.read_bits(&src, 7)
+                        }
+                        if !bs.ok || lit_lens.len + rep > total_codes {
+                            return .Err("code length overflow")
+                        }
+                        for _ in 0..rep { lit_lens.push(val) }
+                    }
+                }
+            }
+            lit_tree := HuffTable::build(&lit_lens, 0, hlit, true)
+            dist_tree := HuffTable::build(&lit_lens, hlit, hdist, true)
+            if lit_lens[256] == 0 || !lit_tree.ok || !dist_tree.ok {
+                return .Err("invalid literal/distance tree")
+            }
+            while true {
+                sym := lit_tree.decode(&mut bs, &src)
+                if !bs.ok { return .Err(bs.error) }
+                if sym < 256 {
+                    if out.len == max_bytes { return .Err("output limit exceeded") }
+                    out.push(u8(sym))
+                } else if sym == 256 {
+                    break
+                } else {
+                    li := sym - 257
+                    if li < 0 || li >= 29 {
+                        return .Err("invalid length symbol")
+                    }
+                    copy_len := len_bases[li] + bs.read_bits(&src, len_extra[li])
+                    dsym := dist_tree.decode(&mut bs, &src)
+                    if !bs.ok || dsym < 0 || dsym >= 30 {
+                        return .Err("invalid distance symbol")
+                    }
+                    dist := dist_bases[dsym] + bs.read_bits(&src, dist_extra[dsym])
+                    if dist <= 0 || dist > out.len || dist > (1).shl(cmf.shr(4) + 8) {
+                        return .Err("invalid back-reference distance")
+                    }
+                    if copy_len > max_bytes - out.len { return .Err("output limit exceeded") }
+                    for _ in 0..copy_len {
+                        b := out[out.len - dist]
+                        out.push(b)
+                    }
+                }
+            }
+        } else {
+            return .Err("reserved deflate block type")
+        }
+    }
+    if bs.pos != bs.end { return .Err("trailing data after deflate stream") }
+    want_adler := u32(bytes.u32_be(&src, src.len - 4))
+    if adler32(&out) != want_adler {
+        return .Err("zlib adler32 mismatch")
+    }
+    .Ok(move out)
+}
