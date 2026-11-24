@@ -1,9 +1,5 @@
 # Nästa steg för Dunder
 
-## Lagra skalära poster sammanhängande i ägda arrayer
-
-Låt en ägd array av poster med enbart skalära fält lagra elementen direkt, som en scratchvy redan kan göra. Med 65 536 insättningar av ett kolumnnummer och en koefficient gav Dunder 0.12.1 och `90573fc` 65 539 allokeringsanrop mot fem med två talarrayer. Prova summan 58 556 416 och att en klon kan växa till 257 poster och ändras via ett muterbart lån medan originalet behåller sitt värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/7b0a4a5e1cf1f640ba6785645eeec73e272cbe3b/benchmarks/language/sparse_terms.ddr) · [Mätning i layoutlösaren](https://github.com/Mik-pe/dunder-tui/blob/7b0a4a5e1cf1f640ba6785645eeec73e272cbe3b/benchmarks/panels.md)
-
 ## Låna text från en strängkonstant
 
 I 0.12.1 ger `view := LABEL.as_str()` E4003 när `LABEL` är en modulkonstant av typen `string`. Låt den lokala vyn läsa från konstantens lagring direkt. Med en namngiven mellanvariabel fungerar redan samma läsning. Kontrollera längd och byte med båda skrivsätten och behåll livstidskontrollen för tillfälliga ägda strängar. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/81d9c4460bafe84ae1d3eff38b76ed4360070dcf/tests/dogfood/compiler/constant_string_view.ddr)
@@ -36,21 +32,9 @@ Stöd `match &mut pages[index]` så att en arm kan ändra ett fält i den aktiva
 
 Lägg en `u64`-motsvarighet till `append_decimal` i `std.bytes` och låt `std.json.write_u64` använda den. I 0.12.1 gav 7 000 värden via `value.str()` och `append_utf8` 7 007 allokeringsanrop mot sju med JSON-skrivaren i samma förallokerade buffert. Kontrollera att prefixet bevaras och att talen 0, 2⁶³ och 2⁶⁴−1 skrivs exakt. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/18f18243d01ae934861c98fa4fd2d43646a0e5da/benchmarks/language/unsigned_text.ddr)
 
-## Återanvänd lagringen vid kopiering mellan fasta arrayer
-
-I 0.12.1 gav 10 001 tilldelningar med `dst.bounds = src.bounds.clone()` för `[f64;2]` 20 011 allokeringsanrop. Med elementvis kopiering blev det nio. Låt kompilatorn återanvända målets lagring när den ägs exklusivt. Kontrollera summan 100 060 000, att källan kan ändras efter kopieringen och att en sparad kopia behåller sitt värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/9aee09bb692c96999b99565ff35068640c465388/benchmarks/language/fixed_bounds.ddr)
-
 ## Tillåt lånade vyer i synkrona callbacks
 
 I 0.12.1 fungerar en post med ett lånat arrayfält som funktionsargument. Samma post fångad med `fn[&samples]` ger E4003 även när callbacken anropas direkt. Följ ägarens livstid genom posten så att provet kan läsa 17. Behåll fel när en closure kan överleva ägaren. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/09e3017de5467b418361b4f5729438e36d61e196/tests/dogfood/compiler/capture_borrowed_shape.ddr)
-
-## Packa upp iteratorns koordinatpar utan allokering
-
-I 0.12.1 gav både `for (x,y) in pairs` och `match pairs.next()` 506 881 allokeringsanrop över 253 440 par. En markör med två heltalsfält gav ett. Optimera direkt uppackning av `Option<(i32,i32)>`. Kontrollera summan 14 952 960 och att ett sparat par behåller sina koordinater efter nästa steg. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/c97df61f7ef791637ca96553da3e58be946b47f4/benchmarks/language/iterate_pairs.ddr)
-
-## Återanvänd enumvarianter utan fält
-
-Vid 253 440 skrivningar av fyra fältlösa varianter i en enum som även kan bära RGB-data gav `match` 126 736 allokeringsanrop. Uppslag i en färdig tabell gav 16 på både macOS och Linux ARM64. Återanvänd de fältlösa värdena och behåll ägarskapet för varianter med data. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/c97df61f7ef791637ca96553da3e58be946b47f4/benchmarks/language/enum_table.ddr)
 
 ## Skilj strängdata från syntax i konstanta arrayer
 
@@ -102,12 +86,6 @@ Låt `Width.Length` användas där parametern har typen `fn(u16) -> Width`. I 0.
 
 Lägg till `array.repeat(move värde, antal)` för antal som bestäms vid körning. Flytta sista exemplaret, klona de tidigare och ge en tom array vid noll. För 4 096 arrayer med en post om 128 heltal undviker flytten 4 096 djupa arraykloner och 2 097 152 klonade byte jämfört med `array.resize` i 0.12.0. Verifiera att en ändring i en kopia lämnar de andra intakta. [Mätprogram för noll, en och fyra kopior](https://github.com/Mik-pe/dunder-tui/blob/6044f41affd9516162c4a318db08b21993509902/benchmarks/language/repeat_owned.ddr)
 
-## Undvik allokering för omedelbart avlästa skalära returvärden
-
-För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 384 kontrolltecken totalt 49 160 allokeringsanrop med både `match` och `unwrap_or(-1)`. Fyra sparade bredder gav åtta anrop och samma summa. Minska kostnaden för `Some(i32)` över funktionsgränsen och behåll `.None` för kontrolltecken. Mät med `--runtime-profile` på macOS och Linux ARM64. [Prov för båda anropssätten](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/benchmarks/language/terminal_option.ddr)
-
-Mät även `Result<u64,()>` för index som ska stanna vid noll eller maxvärdet. I 0.12.0 gav 65 536 index och tre `math.checked_*_u64` per index med `unwrap_or` 155 393 allokeringsanrop. Direkta heltalsuttryck gav 11. Båda gav summan 23 392 260 på macOS och Linux ARM64. Verifiera samma gränsbeteende och mät allokeringarna efter ändringen. [Körbart indexprov](https://github.com/Mik-pe/dunder-tui/blob/a2be35a2ccd947a9d502e7ff48682ec8f774ad73/benchmarks/language/saturating_indices.ddr)
-
 ## Lägg till Unicode-gemener i `std.text`
 
 Behåll ASCII-beteendet i `text.lower` och lägg till en Unicode-variant. I 0.12.0 lämnas `blacK`, `İ` och `ΟΣ` oförändrade. Verifiera att Unicode-varianten ger `black`, `i` följt av U+0307 och `ος` med slut-sigma på macOS, Linux och Windows. [Minimiprov från TUI-bibliotekets färgläsare](https://github.com/Mik-pe/dunder-tui/blob/142420d3aafdd5d699aed95cddb9a46fec462625/tests/dogfood/unicode_lower.ddr)
@@ -153,9 +131,15 @@ Kör `dunder run tests/fixtures/local-calendar.ddr -- UTC` på Windows. Ange vä
 
 På Apple M5 anger systemet 1 000 ns för `Deadline` och 42 ns för `Raw`. Mät båda klockorna och väggtiden före och efter faktisk systemvila. På macOS använder Dunder `CLOCK_MONOTONIC` för tidsgränser och `CLOCK_MONOTONIC_RAW` för rå tid. Enligt macOS manual för `clock_gettime(3)` räknar båda med systemvilan. En tidsgräns kan därför ha löpt ut vid väckning. [Klockkontrakt](standard.md) · [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2/benchmarks/language/monotonic_clock.ddr)
 
+## Rensa äldre tasksyntax efter nästa fröförnyelse
+
+Kompilatorns nya standardyta för strukturerad samtidighet använder `task scope jobs { ... }`, `jobs.spawn(...)`, `jobs.wait_any(&tasks)` och flyttbara `Task<T>`-handtag med `t.join()`. Den äldre nyckelordssyntaxen (`spawn`, `await`, `await!`, `await_any`, `TaskID<T>`) behålls tillfälligt så att nuvarande frysta bootstrap-frö kan bygga `selfhost/tasks/{compile_parallel,lex_modules,sign_macho,validation_tasks}.ddr`. Migrera dessa fyra filer och ta bort den äldre syntaxvägen när bootstrap-fröna (`bootstrap/*.gz`) förnyas.
+
 ## Verifierat efter 0.12.0
 
 En loop kan packa upp heltalspar ur en temporär array. Kompilatorn försökte tidigare frigöra stackkopian av varje par. Regressionstestet passerar med standardflaggor på macOS ARM64 och Linux ARM64 och x86-64. Ramprovet avbröts med 0.12.0 efter 3 347 byte på macOS. Med rättningen gav det samma 10 829 338 byte på alla tre som kontrollbygget med 0.12.0 och `--mir-memory=off` på macOS. [Regressionstest](../tests/fixtures/aggregate_arrays/temporary_pairs.ddr) · [Cellprov](https://github.com/Mik-pe/dunder-tui/blob/5eb4c33/tests/border_cells.ddr)
+
+- Värdetyper, container-avboxning, konsekvent ägarskap, förenklade generics och ny task-yta: nästlade `Copy`-poster, tupler, `Copy`-enumar (`Color`, `Option<i32>`, `Option<(i32, i32)>`, `Result<u64, ()>`) och fasta `Copy`-arrayer `[T; N]` upp till 128 byte lagras inline på stacken utan heapallokeringar, och avboxas sammanhängande i `[]T`, `[T; N]`, `Map` och `Set`. Fältlösa enumvarianter återanvänder statiska konstanter och rena heltalsenumar passerar som 4-byte-skalärer. I [POD-proven](../tools/test_pod_values.ddr) gav 253 440 varv över `Option<(i32, i32)>`, 10 001 `[f64; 2]`-kopior, 10 001 steg med `Color`/`Styled`/`Rect`/`Option<i32>`/`Result<u64, ()>` samt 12 000 fältlösa enumskrivningar vardera för `Copy`- och ägda enumar noll allokeringsanrop, medan 10 000 `Point`, 10 000 `Color` och 100 `Map<Point, Color>`-poster i containrar gav högst 15 allokeringar totalt (ett `Map`-huvud på 24 byte och noll postkloner). Fasta arrayer `[T; N]` ärver nu `Copy`/flytt från `T`, fångande `Fn`-closures är flyttbara med explicit `.clone()`, de äldre kraven `where storable(T)` och `where T.method: ...` är borttagna, och `task scope` använder nu metoderna `.spawn`/`.wait_any` samt flyttbara `Task<T>`-handtag med `.join()` ([task-prov](../tools/test_concurrency_workers.ddr)).
 
 ## Verifierat i 0.12.0
 
