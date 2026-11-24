@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Snabba upp nollställning och jämförelse på x86-64
+
+I 0.12.1 tog `std.bytes.zero_memory` 28,64 µs för två heltalsarrayer med 2 304 celler vardera på översatt Linux x86-64. En typad loop tog 2,94 µs. Radvis jämförelse med `std.bytes.equal_memory` tog 44,49 µs mot loopens 20,57 µs. Mät på nativ Linux och Windows x64, optimera de två runtime-anropen och bevara ARM64-tiderna. Kontrollera udda radbredder och skillnader i båda arrayerna med samma kontrollsumma 45 120. [Mätprogram för båda implementationerna](https://github.com/Mik-pe/dunder-tui/blob/80d1e1cf10496477dce9a948a18d98145edf179c/benchmarks/language/cell_planes.ddr)
+
 ## Använd en enumvariant som funktion
 
 Låt `Width.Length` användas där parametern har typen `fn(u16) -> Width`. I 0.12.0 får anropet E3003 och kräver omslaget `fn(n: u16) -> Width { .Length(n) }`. Prova att skicka konstruktorn till en funktion och kontrollera att resultatet blir `.Length(7)`. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/a2cc8a10910e98ecd7f3f8157270fb6eb4c6199f/tests/dogfood/compiler/variant_function.ddr)
