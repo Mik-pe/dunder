@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Låt ett returvärde låna från två parametrar
+
+I 0.12.1 kan en lokal post låna två ägare. En funktion som bygger samma post från två parametrar får E4003 när den anger `from left`. Ge returkontraktet stöd för båda ursprungen så att exempelvis en diffiterator kan låna båda buffertarna direkt vid anropet. Prova att läsa båda värdena och att en mutation av vardera ägaren avvisas medan paret används. [Returprov](https://github.com/Mik-pe/dunder-tui/blob/bf2ccc57aa919cd85cb1ad418c6b1364632dbce9/tests/dogfood/compiler/return_two_owners.ddr) · [Fungerande lokalt par](https://github.com/Mik-pe/dunder-tui/blob/bf2ccc57aa919cd85cb1ad418c6b1364632dbce9/tests/dogfood/compiler/paired_views.ddr)
+
 ## Läs en Unicode-skalär vid ett byteindex i `&str`
 
 Ge lånad text ett allokeringsfritt uppslag som lämnar skalären och nästa byteindex. Prova alla fyra UTF-8-längder samt index vid strängslut och mitt i en skalär. I 0.12.1 tog 8 192 uppslag på macOS ARM64 103 µs via `std.bytes.utf8.decode_prefix` och 39 µs direkt ur textvyn. På Linux ARM64 tog de 107 och 39 µs. Över hela provet begärde processerna 227 480 respektive 153 allokeringar och gav samma summa. Behåll prefixavkodarens svar för ofullständiga och ogiltiga byte. [Körbart minimiprov](https://github.com/Mik-pe/dunder-tui/blob/5fb758089574767296a58bc84442ea2c577be3cc/benchmarks/language/string_scalar.ddr)
