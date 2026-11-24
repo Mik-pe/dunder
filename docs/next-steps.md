@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Tillåt lånade vyer i synkrona callbacks
+
+I 0.12.1 fungerar en post med ett lånat arrayfält som funktionsargument. Samma post fångad med `fn[&samples]` ger E4003 även när callbacken anropas direkt. Följ ägarens livstid genom posten så att provet kan läsa 17. Behåll fel när en closure kan överleva ägaren. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/09e3017de5467b418361b4f5729438e36d61e196/tests/dogfood/compiler/capture_borrowed_shape.ddr)
+
 ## Packa upp iteratorns koordinatpar utan allokering
 
 I 0.12.1 gav både `for (x,y) in pairs` och `match pairs.next()` 506 881 allokeringsanrop över 253 440 par. En markör med två heltalsfält gav ett. Optimera direkt uppackning av `Option<(i32,i32)>`. Kontrollera summan 14 952 960 och att ett sparat par behåller sina koordinater efter nästa steg. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/c97df61f7ef791637ca96553da3e58be946b47f4/benchmarks/language/iterate_pairs.ddr)
