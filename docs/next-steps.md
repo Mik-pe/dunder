@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Ändra en enumvariants innehåll via ett exklusivt lån
+
+Stöd `match &mut pages[index]` så att en arm kan ändra ett fält i den aktiva varianten. I 0.12.1 ger uttrycket E3006 och en skrivning via `match &pages[index]` ger E4002. Prova att den tomma varianten bevaras och att `Ready(16)` blir `Ready(17)` i samma array. Behåll skrivskyddet för delade lån. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/de80ef98ba4f7b96fcb7a9a332356db46fc74d7b/tests/dogfood/compiler/match_mutable_payload.ddr)
+
 ## Skriv osignerade decimaltal i bytebuffertar
 
 Lägg en `u64`-motsvarighet till `append_decimal` i `std.bytes` och låt `std.json.write_u64` använda den. I 0.12.1 gav 7 000 värden via `value.str()` och `append_utf8` 7 007 allokeringsanrop mot sju med JSON-skrivaren i samma förallokerade buffert. Kontrollera att prefixet bevaras och att talen 0, 2⁶³ och 2⁶⁴−1 skrivs exakt. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/18f18243d01ae934861c98fa4fd2d43646a0e5da/benchmarks/language/unsigned_text.ddr)
