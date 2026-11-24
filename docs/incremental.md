@@ -24,7 +24,8 @@ pekarbredd även vid typkontrollen.
 Vanlig `dunder build` från ett projekt återanvänder den publicerade binären när
 kompilatorn, byggargumenten, de upplösta källorna och inbäddade resurser är
 identiska. Kompilatorn läser projektet på nytt och kontrollerar binärens
-SHA-256. En ändrad eller borttagen binär byggs om. Lyckade byggen sparar
+SHA-256. Projekt under 512 upplösta token kompileras direkt. En ändrad eller
+borttagen binär byggs om. Lyckade byggen sparar
 ett kvitto i användarens cachekatalog under `dunder/builds`. Vid en träff
 skrivs byggets varningar ut igen.
 
