@@ -49,7 +49,8 @@ element till C när arrayen har minst ett element.
 Ange C-API:ets exakta typer, exempelvis `u32` för ett
 32-bitars flaggfält. `size_of(Header)` och `align_of(Header)` ger `usize`
 för valt mål. `zeroed()` i en unsafe-kontext skapar en C-struct där alla
-fält har värdet noll. Noll kan vara ett ogiltigt handtag för ett visst API.
+fält har värdet noll. En fast array kan initialiseras med exempelvis
+`mut headers: [Header; 2] = [zeroed(); 2]`. Varje element har egen lagring. Noll kan vara ett ogiltigt handtag för ett visst API.
 
 En C-struct får uppta högst 1 048 575 byte inklusive utfyllnad. Till
 exempel ryms ett fält av typen `[u8; 262144]` för ett bildkakel på
