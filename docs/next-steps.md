@@ -94,7 +94,7 @@ Låt den som använder `@derive(Decode)` välja att avvisa ett upprepat känt f�
 
 - Ge `json.Writer` en publik metod för att avvisa ett värde och behålla det första felet. I 0.12.0 ger `writer.fail("utanför intervallet")` E2004 i en egen kodare. Prova ett ogiltigt värde inuti en array och kontrollera felet från både `finish()` och `finish_bytes()`. [Körbart rektangelprov](https://github.com/Mik-pe/dunder-tui/blob/bbd1564/tests/suite.ddr#L1563)
 - Stöd `Encode` och `Decode` för `[T; N]`. I 0.12.0 ger skrivning och läsning av `[u16; 2]` E3004. Verifiera att `[12,24]` går att läsa tillbaka och att fel arraylängd ger ett avkodningsfel.
-- Ge även tuplerna `(A,B)` stöd för JSON-arrayer med två element. Testterminalens markör `(u16,u16)` ger E3004 för både `Encode` och `Decode` i 0.12.0. Prova `[20,4]`, fel längd och ett värde över 65 535. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/b35b26f1286a7214f251253f0b3f133c388860a5/tests/dogfood/json_tuple.ddr)
+- Stöd `(A,B)` som JSON-array även inuti `[]T`. I 0.12.1 ger både markören `(u16,u16)` och ändrade celler av typen `[](i32,i32)` E3004 för `Encode` och `Decode`. Prova `[20,4]` och `[[3,5],[4,5]]` i båda riktningarna. Avvisa fel parlängd även i den andra posten och värden utanför elementtypen. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/017c103c37eb7b3d4623261fb9dab89e5078394a/tests/dogfood/json_tuple.ddr)
 
 ## Verifiera Windows som kompilatorvärd
 
