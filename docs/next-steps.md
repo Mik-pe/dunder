@@ -111,7 +111,7 @@ Med 0.11.2 på macOS ARM64 tog det 6,8, 26 och 105 ms att tömma en kö på 4, 8
 
 ## Krymp arrayer med `truncate` i `std.array.resize`
 
-På Linux ARM64 med 0.11.2 tog det 136 µs i median att krympa 65 536 heltal till 16 med `array.resize`, jämfört med 0,32 µs med `truncate`. För ägda strängar var tiderna 232 och 188 µs. Använd `truncate` vid krympning och behåll kloningen av fyllnadsvärdet vid tillväxt. Prova även oförändrad längd, tom array och att borttagna värden släpps en gång. Kontrollera att prefix och kapacitet bevaras när arrayen växer igen. [Nuvarande implementation](../stdlib/array.ddr) · [Körbart prov](https://github.com/Mik-pe/dunder-tui/blob/68b19261882417fc85563a9a5b628a13fc42f241/benchmarks/language/shrink_arrays.ddr) · [Linuxmätning](https://github.com/Mik-pe/dunder-tui/actions/runs/45333902464/job/138241364659)
+På Linux ARM64 med 0.11.2 tog det 136 µs i median att krympa 65 536 heltal till 16 med `array.resize`, jämfört med 0,32 µs med `truncate`. För ägda strängar var tiderna 232 och 188 µs. Samma heltalsprov på Linux x64 tog 4,23 ms respektive 1,22 µs. Använd `truncate` vid krympning och behåll kloningen av fyllnadsvärdet vid tillväxt. Prova även oförändrad längd, tom array och att borttagna värden släpps en gång. Kontrollera att prefix och kapacitet bevaras när arrayen växer igen. [Nuvarande implementation](../stdlib/array.ddr) · [Körbart prov](https://github.com/Mik-pe/dunder-tui/blob/68b19261882417fc85563a9a5b628a13fc42f241/benchmarks/language/shrink_arrays.ddr) · [Linux ARM64](https://github.com/Mik-pe/dunder-tui/actions/runs/45333902464/job/138241364659) · [Linux x64](https://github.com/Mik-pe/dunder-tui/actions/runs/45333902464/job/138241364256)
 
 ## Exponera klockans upplösning för korta tidsmätningar
 
