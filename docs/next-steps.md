@@ -59,6 +59,10 @@ Lägg till stegvis radläsning i `std.text`. På 3 073 rader gav `split` i 0.11.
 
 Med `(&values[0..2]) == (&values[2..4])` ger både `check` och `build` E4002 i 0.11.2 och föreslår ett `&` som redan står där. Om vyerna binds till två lokala namn först fungerar samma jämförelse. Profilen visar noll arraykloner och noll kopierade byte. Tillåt jämförelsen direkt eller visa den fungerande bindningen i diagnostiken. Prova lika, olika och tomma intervall. [Direkt jämförelse](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/inline_view_equality.ddr) · [Namngivna vyer](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/named_view_equality.ddr)
 
+## Lägg till ägda element i en array
+
+Komplettera `std.array.append` med en variant som tar över en ägd källarray och behåller elementens ordning. Dunder 0.11.2 klarar detta med `T: Storable`, en reservation och `for item in move source`. I ett prov med 1 024 rader om 24 heltal gjorde den lånade varianten 1 024 arraykopior om totalt 98 304 byte. Den flyttande varianten gjorde noll. Alla 24 576 värden verifierades på macOS och Linux ARM64. Täck även tom källa, tom destination och element som bara kan flyttas. [Körbart prov med båda varianterna](https://github.com/Mik-pe/dunder-tui/blob/70f877d54df0b9c2d3bc5cf2dd8f38aeef838c67/benchmarks/language/append_arrays.ddr)
+
 ## Packa upp ett lyckat Result utan returvärde
 
 På 0.11.2 ger `operation().unwrap()` E1002 när `operation` returnerar `Result<(),string>`. Samma program går att köra med `.is_ok()` eller `match`. Prova att uppackning av `.Ok` fortsätter till nästa sats och att `.Err` följer samma felväg som för andra resultattyper. [Tvåradersprov](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/tests/dogfood/compiler/unwrap_unit.ddr)
