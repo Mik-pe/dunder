@@ -8,6 +8,10 @@ En metod med parametern `&[]T` ska kunna ta `&[a, b]` och härleda `T` från ele
 
 En metod med returtypen `&str from self` kan i 0.12.1 låna ett strängfält direkt. I `match &self.symbol` får `.Some(value) => value.as_str()` E4003 även när också reservsträngen ägs av mottagaren. Följ lånet genom mönstret och kontrollera båda grenarna. En strängvy från en lokal variabel ska fortfarande avvisas. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/b22a99fa0d59702c82fa2126d7e59370f11f6dea/tests/dogfood/compiler/borrow_optional_field.ddr)
 
+## Tillåt ett valfritt muterbart lån vid uppslag
+
+En metod som returnerar `Option<&mut i32> from self` får E3099 i 0.12.1. Stöd ett kortlivat lån till ett arrayelement när indexet finns och `.None` annars. Verifiera att ändringen syns i arrayen och att ett andra muterbart lån av samma element avvisas medan det första används. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/aa3c7ec06326598063c61d311253d27e3ab6ebec/tests/dogfood/compiler/optional_mutable_element.ddr)
+
 ## Snabba upp nollställning och jämförelse på x86-64
 
 I 0.12.1 tog `std.bytes.zero_memory` 28,64 µs för två heltalsarrayer med 2 304 celler vardera på översatt Linux x86-64. En typad loop tog 2,94 µs. Radvis jämförelse med `std.bytes.equal_memory` tog 44,49 µs mot loopens 20,57 µs. Mät på nativ Linux och Windows x64, optimera de två runtime-anropen och bevara ARM64-tiderna. Kontrollera udda radbredder och skillnader i båda arrayerna med samma kontrollsumma 45 120. [Mätprogram för båda implementationerna](https://github.com/Mik-pe/dunder-tui/blob/80d1e1cf10496477dce9a948a18d98145edf179c/benchmarks/language/cell_planes.ddr)
