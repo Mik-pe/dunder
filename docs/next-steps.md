@@ -44,9 +44,9 @@ I 0.12.1 kan en lokal post låna två ägare. En funktion som bygger samma post 
 
 Ge lånad text ett allokeringsfritt uppslag som lämnar skalären och nästa byteindex. Prova alla fyra UTF-8-längder samt index vid strängslut och mitt i en skalär. I 0.12.1 tog 8 192 uppslag på macOS ARM64 103 µs via `std.bytes.utf8.decode_prefix` och 39 µs direkt ur textvyn. På Linux ARM64 tog de 107 och 39 µs. Över hela provet begärde processerna 227 480 respektive 153 allokeringar och gav samma summa. Behåll prefixavkodarens svar för ofullständiga och ogiltiga byte. [Körbart minimiprov](https://github.com/Mik-pe/dunder-tui/blob/5fb758089574767296a58bc84442ea2c577be3cc/benchmarks/language/string_scalar.ddr)
 
-## Härled elementtypen från en lånad fast array
+## Härled elementtypen från fasta arrayargument
 
-En metod med parametern `&[]T` ska kunna ta `&[a, b]` och härleda `T` från elementen. I 0.12.1 ger `total(&[a, b])` E3003. Med `total<Item>(&[a, b])` går samma program igenom och ger summan 5. Prova även anropet med en dynamisk array och behåll typfelet för en elementtyp som saknar metodens trait. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/b22a99fa0d59702c82fa2126d7e59370f11f6dea/tests/dogfood/compiler/infer_array_argument.ddr)
+I 0.12.1 ger både `total(&[a, b])` med parametern `&[]T` och `Menu::labels([a, b])` med `move items: []T` E3003. Härled `T` från arrayens element. Med explicit elementtyp ger låneprovet summan 5 och det ägda provet strängarna `Norr` och `Söder` i ordning. Det ägda anropet fungerar redan med en dynamisk array. Behåll typfelet när elementet saknar metodens trait. [Lånat argument](https://github.com/Mik-pe/dunder-tui/blob/b22a99fa0d59702c82fa2126d7e59370f11f6dea/tests/dogfood/compiler/infer_array_argument.ddr) · [Ägt argument](https://github.com/Mik-pe/dunder-tui/blob/8a9ad4bf68d95a6deec9aa99298a4e9b000b2bbb/tests/dogfood/compiler/infer_owned_array.ddr)
 
 ## Bevara lånets ursprung i en matchgren
 
