@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Flytta en returpost som lånar från mottagaren
+
+I 0.12.1 fungerar `return result` för en markör som lånar från `self`. `return move result` ger E4003. Bevara lånets ursprung genom flytten och avvisa returer som lånar från en lokal ägare. För 8 192 markörer gav direkt konstruktion 8 193 postkloner, en fabriksmetod 16 385 och ytterligare en retur 24 577. Mät på nytt med kontrollsumman 598 016. [Kompilatorprov](https://github.com/Mik-pe/dunder-tui/blob/991198e1c1808c70c3f8145ce71ded91d47514b2/tests/dogfood/compiler/return_moved_cursor.ddr) · [Allokeringsprov](https://github.com/Mik-pe/dunder-tui/blob/991198e1c1808c70c3f8145ce71ded91d47514b2/benchmarks/language/borrowed_cursor.ddr)
+
 ## Hasha en lånad strängvy
 
 Låt `vy.hash()` för `&str` ge samma värde som för en ägd sträng med samma UTF-8-byte. I 0.12.1 får anropet E2003. Att hasha 8 192 strängvyer med `vy.to_string().hash()` gav 8 195 allokeringsanrop, mot tre med `Hasher.write_bytes(vy.as_bytes())` och `finish()`. Prova tom vy och delsträngar med två-, tre- och fyrbyteskalärer. [Kompilatorprov](https://github.com/Mik-pe/dunder-tui/blob/fa3e99a60c8d3a4aa611408d852b0a5b5e58b62a/tests/dogfood/compiler/hash_text_view.ddr) · [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/fa3e99a60c8d3a4aa611408d852b0a5b5e58b62a/benchmarks/language/view_hash.ddr)
