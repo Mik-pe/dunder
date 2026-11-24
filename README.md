@@ -11,7 +11,7 @@ Kompilatorn länkar nativa program och signerar macOS-binärer. På macOS och Li
 kan bygget bädda in DWARF-debuginformation med `-g`. Verktygskedjan innehåller
 också en formaterare (`dunder fmt`) och en språkserver (`dunder lsp`).
 
-Dunder **0.11.2** finns för ARM64/macOS och för ARM64 och x86-64 på Linux.
+Dunder **0.11.3** finns för ARM64/macOS och för ARM64 och x86-64 på Linux.
 Standardbiblioteket kan läsa ofullständiga UTF-8-sekvenser, iterera över
 grafem och återställa terminalläget när en funktion lämnas. Språkservern
 följer importalias vid uppslag och komplettering.
