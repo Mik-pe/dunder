@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Använd en enumvariant som funktion
+
+Låt `Width.Length` användas där parametern har typen `fn(u16) -> Width`. I 0.12.0 får anropet E3003 och kräver omslaget `fn(n: u16) -> Width { .Length(n) }`. Prova att skicka konstruktorn till en funktion och kontrollera att resultatet blir `.Length(7)`. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/a2cc8a10910e98ecd7f3f8157270fb6eb4c6199f/tests/dogfood/compiler/variant_function.ddr)
+
 ## Upprepa ett ägt värde i en array
 
 Lägg till `array.repeat(move värde, antal)` för antal som bestäms vid körning. Flytta sista exemplaret, klona de tidigare och ge en tom array vid noll. För 4 096 arrayer med en post om 128 heltal undviker flytten 4 096 djupa arraykloner och 2 097 152 klonade byte jämfört med `array.resize` i 0.12.0. Verifiera att en ändring i en kopia lämnar de andra intakta. [Mätprogram för noll, en och fyra kopior](https://github.com/Mik-pe/dunder-tui/blob/6044f41affd9516162c4a318db08b21993509902/benchmarks/language/repeat_owned.ddr)
