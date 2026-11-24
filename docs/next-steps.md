@@ -61,9 +61,11 @@ Två lokala ägare kan byta plats med tre flyttar. Samma kod bakom två `&mut`-p
 
 `std.terminal.window_size(handle)` och `RawMode::enter_on(handle)` finns i 0.11.3. Det lokala Unixprovet kontrollerar bland annat ändrade pixelmått, en separat styrterminal och omdirigerade strömmar. Kör Win32-provet med två skärmbuffertar och kontrollera att rätt indatahandtag återställs vid tidig retur. [Unixprov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/window_terminal.ddr) · [Win32-prov](../tests/fixtures/windows-terminal.ddr)
 
-## Jämför standardbibliotekets terminalbredder med referensen
+## Minska allokeringarna när terminalbredd mäts
 
-I 0.11.3 ger `std.terminal.columns` bredderna 2 och 3 för 😶‍🌫️ och 😶‍🌫, 1 för ett kombinerat `é` och 1 för det sammanhängande spannet `لا`. Kör breddfunktionen över samtliga 5 244 emoji och skriftspecifika ligaturer från referensprovet. Täck även kontrolltecken, tom text och spann som delar en ligatur. [Ratatui-prov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/benchmarks/reference/examples/text.rs) · [Breddmätning](../stdlib/terminal/width.ddr)
+I 0.11.3 klarade `std.terminal.columns` 48 059 kontroller mot Ratatui 0.30.2, inklusive delade emoji och ligaturer. Kontrolltecken gav `.None` i alla 13 delspann där de ingick. TUI-biblioteket kunde använda funktionen för att rätta 1 440 breddskillnader. [Breddprovet och körkommandon](https://github.com/Mik-pe/dunder-tui/blob/8601157aa06c3888e9018d6bc10069d3dc4e72af/docs/parity.md#bredd-vid-delade-unicode-sekvenser)
+
+65 536 breddanrop fördelade över fyra korta strängar gav 196 625 allokeringsanrop på både macOS och Linux ARM64. När de fyra bredderna beräknades en gång sjönk antalet till 17 inklusive uppstart. Båda varianterna gav kontrollsumman 98 304. Mät kostnaden för `value.runes()` och returvärdet var för sig. Prova att läsa Unicode-skalärer ur den lånade UTF-8-vyn direkt och kör om breddprovet. [Allokeringsprov med lägena `each` och `cached`](https://github.com/Mik-pe/dunder-tui/blob/8601157aa06c3888e9018d6bc10069d3dc4e72af/benchmarks/language/terminal_width.ddr) · [Breddmätningen](../stdlib/terminal/width.ddr)
 
 ## Ange datumintervallet för lokal tid på Windows
 
