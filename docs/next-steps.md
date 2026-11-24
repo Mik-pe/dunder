@@ -6,6 +6,10 @@ För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 
 
 Mät även `Result<u64,()>` för index som ska stanna vid noll eller maxvärdet. I 0.12.0 gav 65 536 index och tre `math.checked_*_u64` per index med `unwrap_or` 155 393 allokeringsanrop. Direkta heltalsuttryck gav 11. Båda gav summan 23 392 260 på macOS och Linux ARM64. Verifiera samma gränsbeteende och mät allokeringarna efter ändringen. [Körbart indexprov](https://github.com/Mik-pe/dunder-tui/blob/a2be35a2ccd947a9d502e7ff48682ec8f774ad73/benchmarks/language/saturating_indices.ddr)
 
+## Lägg till Unicode-gemener i `std.text`
+
+Behåll ASCII-beteendet i `text.lower` och lägg till en Unicode-variant. I 0.12.0 lämnas `blacK`, `İ` och `ΟΣ` oförändrade. Verifiera att Unicode-varianten ger `black`, `i` följt av U+0307 och `ος` med slut-sigma på macOS, Linux och Windows. [Minimiprov från TUI-bibliotekets färgläsare](https://github.com/Mik-pe/dunder-tui/blob/142420d3aafdd5d699aed95cddb9a46fec462625/tests/dogfood/unicode_lower.ddr)
+
 ## Läs JSON-objektets fält i en genomgång
 
 Ge `std.json.Doc` en iterator som lämnar nyckel och värdenod i källordning, även för dubbla och escapade nycklar. I 0.12.0 går `key_at` och `val_at` från första barnet för varje index. Att läsa ett redan tolkat objekt med 1 024, 2 048 och 4 096 fält tog 1,83, 7,40 och 29,69 ms i median på macOS ARM64. Kör samma prov med iteratorn och kontrollera linjär tidsökning och oförändrade kontrollsummor. [Mätprogram i Dunder](https://github.com/Mik-pe/dunder-tui/blob/247dd05/benchmarks/language/json_members.ddr)
