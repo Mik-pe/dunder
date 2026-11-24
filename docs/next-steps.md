@@ -4,11 +4,7 @@
 
 Dunder distribuerar en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
 
-Tre fel i 0.11.2 har reproducerats på Windows Server 2025 x64.
-
-- **Bygg paket utan Git.** `dunder test --locked --offline` ger `Git dependencies require a native compiler host` även med noll beroenden. Utanför manifestet bygger samma kompilator testfilen och alla 59 test passerar. Beroendelösaren öppnar Git-lagret innan den läser paketets beroenden. Prova ett tomt beroendeträd, ett lokalt sökvägsberoende och ett låst Git-beroende från cache på Windows. [Nativ körning](https://github.com/Mik-pe/dunder-tui/actions/runs/45302071651/job/138136790534) · [Beroendelösare](../selfhost/driver/dependencies.ddr)
-- **Läs process-ID med rätt bredd.** Efter `CreateProcessW` läser `std.process` process-ID och tråd-ID som ett gemensamt 64-bitarsvärde. Konverteringen till `i32` avslutar föräldern med kod 101. När bara process-ID:ts DWORD lästes fungerade både `exec` och `spawn` följt av `wait` på samma Windowsvärd. Ändra fältläsningen i standardbiblioteket och behåll ett nativt prov för barnets utmatning och slutstatus. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/748c099/tests/dogfood/compiler/windows_child.ddr) · [Kontrollerad jämförelse](https://github.com/Mik-pe/dunder-tui/actions/runs/45304861929/job/138146099450) · [Win32-anropet](../stdlib/sys/winprocess.ddr)
-- **Skriv slutrapporten för `--runtime-profile`.** Windowsbygget avslutar riktextprovet med kod 0 men saknar JSON-posten på stderr. Även [hello.ddr](../examples/hello.ddr) lämnar stderr tom i Wine. Rapportören försöker blockera SIGPIPE med ett POSIX-systemanrop. Windowsbakänden ger −38 och rapportören hoppar då över utskriften. Kör hello med öppet, omdirigerat och stängt stderr på Windows. Kontrollera en giltig rapport vid öppen ström samt bevarad stdout och slutstatus i alla tre fallen. [Rapportör](../selfhost/runtime/runtime.ddr) · [x86-bakände](../selfhost/backend/x86.ddr) · [Nativ mätning](https://github.com/Mik-pe/dunder-tui/actions/runs/45303881483/job/138142828516)
+Med den publicerade 0.11.3-kompilatorn under Wine 8 klarade ett paket utan externa beroenden sina 71 test med `--locked --offline`. Både `exec` och `spawn` följt av `wait` läste barnets slutstatus. Körlistan skrev en JSON-profil till omdirigerat stderr. Upprepa på nativ Windows x64 med ett sökvägsberoende, ett låst Git-beroende från cache och stängt stderr. [Paketsvit](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/suite.ddr) · [Processprov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/dogfood/compiler/windows_child.ddr) · [Tidigare nativa reproduktioner](https://github.com/Mik-pe/dunder/blob/v0.11.3/docs/next-steps.md#verifiera-windows-som-kompilatorvärd)
 
 1. Hämta den publicerade exe-filen, kontrollera SHA-256 och bygg kompilatorn två gånger med ett jobb. Jämför filerna byte för byte. Upprepa med flera jobb.
 2. Kör [provet för `check`, `build`, `run`, `test` och språkservern](../tools/test_lsp_and_dwarf.ddr) med kompilatorsökvägen som argument. Det använder ett lokalt paket i en sökväg med mellanslag och svenska tecken. Kör även [provet för miljö, standardfel och processavbrott](../tests/fixtures/process-unicode.ddr) samt [Win64-callbacken](../tests/fixtures/ffi/windows.ddr) med argumenten `"sök väg" "" "🦔"`.
@@ -21,37 +17,21 @@ Privata filer på Windows behöver ett kontrakt för Windows åtkomstkontrollist
 Verifiera åtkomsten som ett annat användarkonto och utred vilka garantier ett
 beständigt katalogbyte kan ge när datorn startas om. [Filrättigheter och synkning](sys.md)
 
-## Utvärdera plattformsvillkor före länkning
+## Omprovat med Dunder 0.11.3
 
-Med 0.11.2 på macOS ARM64 lägger `if target_is("windows") && enabled` till `kernel32.dll` i Mach-O-filens laddningskommandon. Bygget lyckas men programmet avslutas innan `main`. Två nästlade `if` ger en körbar fil utan DLL-importen. Prova båda formerna med `otool -L`, kör programmen och kontrollera att ett Windowsbygge fortfarande kan anropa `GetCurrentProcessId`. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/0a9b6dfc4c29ed1fd2d40f8289fc897c54d9e034/tests/dogfood/compiler/target_condition.ddr)
+På macOS ARM64 går de tidigare minimiproven för plattformsvillkor, generiska mottagare över modulgränser, specialisering per mottagartyp, matchgrenar, separata fältlån och uppackning av ett enhetsresultat nu att bygga och köra. `otool -L` visar ingen Windowsimport i plattformsprovet. Behåll proven vid ändringar i typkontrollen, lånekontrollen och länkningen. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/dogfood/compiler) · [Tidigare utfall](https://github.com/Mik-pe/dunder/blob/v0.11.3/docs/next-steps.md#utvärdera-plattformsvillkor-före-länkning)
 
-## Härled mottagartypen över en modulgräns
-
-I 0.11.2 avslutas `dunder check` med kod 103 utan diagnostik när `holder := factory.make()?` följs av `holder.get(7)`. Fabriken returnerar `Result<Holder<i32>,string>` och metoden är generisk. Med typen `factory.Holder<i32>` utskriven går programmet att bygga och köra. Kör båda varianterna och kontrollera returvärdet 7. [Tvåmodulsprov](https://github.com/Mik-pe/dunder-tui/tree/adc3814204ec460685054aa39b439efcc22921ba/tests/dogfood/compiler/inferred_receiver)
-
-## Specialisera generiska metoder för varje mottagartyp
-
-På 0.11.2 fungerar `Runner<i32>.outer<i32>` och `Runner<bool>.outer<i32>` var för sig. Om båda anropar den generiska metoden `inner` i samma program får det andra anropet E2003 oavsett ordning. Kör båda mottagartyperna i båda ordningarna och kontrollera varje returvärde. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/tests/dogfood/compiler/nested_methods.ddr)
-
-## Förklara lånet när en metod matchar på ett eget fält
-
-I 0.11.2 ger `match self.mode` följt av `self.grow()` i en gren E4003 om mutation under iteration. Programmet har varken en samling eller en loop. Visa vilket fält matchningen lånar och var det muterande anropet sker. Utvärdera om lånet kan avslutas före anropet i en gren som inte binder några variantdata. Prova även en gren som fortfarande använder ett lånat fält efter anropet. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/2758201f70c69e44e7453f73f15dc41df1c6a968/tests/dogfood/compiler/match_receiver.ddr) · [Fungerande lokal kopia](https://github.com/Mik-pe/dunder-tui/blob/2758201f70c69e44e7453f73f15dc41df1c6a968/tests/dogfood/compiler/match_receiver_copy.ddr)
-
-Prova också en lokal enum med två varianter utan nyttolast. I 0.11.2 ger `match state` följt av `state = .Done` i grenen samma E4003. En kopia av diskriminanten före matchningen räcker för att bygga programmet. Pröva om den direkta tilldelningen kan tillåtas när grenen saknar lånade variantdata. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/dogfood/compiler/match_local.ddr)
-
-## Låna två skilda fält i samma metodanrop
-
-I 0.11.2 avvisar både `check` och `build` anropet `self.cursor.advance(self.source)` med E4003. Metoden ändrar ett heltal i `cursor` och läser längden på den separat ägda sträng som `source` lånar. En lokal kopia av markören kan utföra anropet och sedan flyttas tillbaka. Låt lånekontrollen skilja på dessa åtkomstvägar. Prova även två lån av samma fält och ett lån av hela mottagaren. [Minimalt program](https://github.com/Mik-pe/dunder-tui/blob/f9c8089da7b0cac67db941e1b36186edc733b4bb/tests/dogfood/compiler/disjoint_fields.ddr)
+`std.utf16.append` används nu i TUI-bibliotekets Win32-utmatning. Det lokala provet bevarade både U+0000 och ett surrogatpar i samma buffert. [UTF-16](../stdlib/utf16.ddr) · [Konsolskrivaren](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/src/windows.ddr)
 
 ## Låt kortlivade iteratorposter stanna i loopen
 
 När `Iterator.next` i ett prov med 1 024 element returnerade en post med ett lån, ett index och en inre post rapporterade 0.11.2 totalt 5 312 postkopior och 7 489 allokeringsanrop. Direkt läsning av samma byte och vikt gav noll postkopior och ett allokeringsanrop. Båda gav summan 110 080 på macOS och Linux ARM64. Pröva att eliminera kopior genom `Option` och loopbindningen när elementet förbrukas på plats. Kontrollera även ägda element som sparas och att livstidskontrollen fortfarande avvisar lån som lämnar sin ägare. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/f3ecfc12e64df502da617593e7197483582b92fe/benchmarks/language/iterator_item.ddr)
 
-För `std.text.graphemes` ger ett andra `next()` E4003 i 0.11.2 om det första elementets text läses efter anropet. Att läsa det första elementet direkt fungerar. Pröva en returanknytning till iteratorns lånade källtext som låter markören gå vidare medan båda elementen lever. Källan ska förbli lånad till sista läsningen. [Två grafem från samma sträng](https://github.com/Mik-pe/dunder-tui/blob/a94c584/tests/dogfood/compiler/retained_graphemes.ddr)
+För `std.text.graphemes` ger ett andra `next()` E4003 även i 0.11.3 om det första elementets text läses efter anropet. Att läsa det första elementet direkt fungerar. Pröva en returanknytning till iteratorns lånade källtext som låter markören gå vidare medan båda elementen lever. Källan ska förbli lånad till sista läsningen. [Två grafem från samma sträng](https://github.com/Mik-pe/dunder-tui/blob/a94c584/tests/dogfood/compiler/retained_graphemes.ddr)
 
-## Visa hur en loop kan ändra elementen i en lånad array
+## Ändra element i en lånad array
 
-För `for cue in &mut cues { cue.played = true }` föreslår 0.11.2 att byta `&mut` mot `&` (E4003). Då avvisas tilldelningen med E4002. Föreslå den fungerande indexloopen i diagnostiken. I macOS-provet uppdaterade den båda posterna med noll array- och postkloner. Pröva även direkt iteration över muterbara element med ett lån per varv. En växande array måste behålla sin lagring medan elementet är lånat. [Reproduktionsfall](https://github.com/Mik-pe/dunder-tui/blob/421eb9f/tests/dogfood/compiler/mutable_elements.ddr) · [Fungerande indexloop](https://github.com/Mik-pe/dunder-tui/blob/421eb9f/tests/dogfood/compiler/indexed_mutable_elements.ddr)
+0.11.3 föreslår en indexloop för `for cue in &mut cues`. Indexloopen i provet uppdaterar båda posterna. Pröva även direkt iteration med ett muterbart elementlån per varv. En växande array måste behålla sin lagring medan elementet är lånat. [Reproduktionsfall](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/dogfood/compiler/mutable_elements.ddr) · [Fungerande indexloop](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/dogfood/compiler/indexed_mutable_elements.ddr)
 
 ## Låt en lokal vy läsa från två ägare
 
@@ -61,57 +41,39 @@ En iterator över ändrade celler behöver läsa både föregående och aktuell 
 
 I 0.11.2 ger både `check` och `build` E3099 för `.Some(&value[1..value.len])` i en funktion med returtypen `Option<&str> from value`. En post som lagrar källvyn och två byteindex fungerar. Låt en valfri delvy bära sitt intervall och behålla lånet från anroparen. Prova en tom träff, en utebliven träff och UTF-8 efter ett ASCII-prefix. En vy in i en lokal ägd sträng ska fortfarande avvisas. [Minimalt kompilatorprov](https://github.com/Mik-pe/dunder-tui/blob/f3890e7fa9b24e6a9e8dbc3c5d3e3a0011b85b9d/tests/dogfood/compiler/optional_text_view.ddr) · [Körbar variant med byteindex](https://github.com/Mik-pe/dunder-tui/blob/f3890e7fa9b24e6a9e8dbc3c5d3e3a0011b85b9d/benchmarks/language/line_views.ddr)
 
-## Läs rader ur lånad UTF-8-text
+## Mät stegvis radläsning
 
-Lägg till stegvis radläsning i `std.text`. På 3 073 rader gav `split` i 0.11.2 på macOS ARM64 3 073 strängsnitt och 8 194 kopierade byte även när anroparen stannade efter första raden. Vid läsning av hela texten gav `split`, en lånad iterator med radposter och en markör med byteindex samma kontrollsumma, 10 243. De gjorde 3 103, 12 314 respektive 19 allokeringsanrop inklusive uppstart och testdata. Kontrollera både tidigt avbrott och full genomläsning, med LF, CRLF, tomrader och ett ensamt CR i sista raden. [Mätprogram med tre läsare](https://github.com/Mik-pe/dunder-tui/blob/f3890e7fa9b24e6a9e8dbc3c5d3e3a0011b85b9d/benchmarks/language/line_views.ddr) · [Anrop som bara använder första raden](../stdlib/process.ddr#L496-L503)
+`std.text.lines` i 0.11.3 hanterar LF, CRLF, tomrader och ett ensamt avslutande CR. Jämför dess tid och allokeringar med indexläsaren över 3 073 rader, både vid första träffen och vid full genomläsning. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/benchmarks/language/line_views.ddr) · [Standardbibliotekets läsare](../stdlib/text.ddr)
 
 ## Jämför två lånade arrayintervall direkt
 
-Med `(&values[0..2]) == (&values[2..4])` ger både `check` och `build` E4002 i 0.11.2 och föreslår ett `&` som redan står där. Om vyerna binds till två lokala namn först fungerar samma jämförelse. Profilen visar noll arraykloner och noll kopierade byte. Tillåt jämförelsen direkt eller visa den fungerande bindningen i diagnostiken. Prova lika, olika och tomma intervall. [Direkt jämförelse](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/inline_view_equality.ddr) · [Namngivna vyer](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/named_view_equality.ddr)
+Direkta arrayvyer går nu att jämföra med `==`. På Dunder 0.11.3 tog 24 radjämförelser om 96 `i64` vardera 9,85 µs med `==`, 9,91 µs med `std.array.equal` och 1,53 µs med `std.bytes.equal_memory` på macOS ARM64. På Linux ARM64 i en lokal VM var motsvarande tider 8,43, 10,12 och 1,14 µs. Pröva specialiserad jämförelse för tätt lagrade heltal så att lånade intervall kan använda samma snabba kod utan råa adresser hos anroparen. Verifiera tomma och förskjutna intervall, tidig och sen skillnad samt användardefinierad `Eq` för andra elementtyper. [Körbart prov med tre lägen](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/benchmarks/language/row_equality.ddr) · [Lika, olika och tomma vyer](../tests/fixtures/local_borrows/views.ddr)
 
 ## Byt två ägda värden utan ett mellanvärde
 
 Två lokala ägare kan byta plats med tre flyttar. Samma kod bakom två `&mut`-parametrar ger E4003. Körlistan och kompilatorns `exchange_data_into` använder därför `replace` med ett mellanvärde. I 0.11.2 gav 4 095 byten av poster med två arrayer 12 304 allokeringsanrop, mot 19 för lokala flyttar och 21 för arrayens `swap`. Av de 12 285 extra anropen var ett en färsk allokering. macOS och Linux ARM64 gav samma slutordning och profiler. Pröva platsbyte bakom två muterbara lån utan `Default` eller allokering. Täck flyttbara resurser och överlappande lån. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/52313cc/benchmarks/language/swap_storage.ddr) · [Avvisat lån](https://github.com/Mik-pe/dunder-tui/blob/52313cc/tests/dogfood/compiler/swap_borrowed.ddr) · [Kompilatorns användning](../selfhost/mir/mir_lower.ddr#L518-L528)
 
-## Lägg till ägda element i en array
+## Följ upp flyttande arraytillägg
 
-Komplettera `std.array.append` med en variant som tar över en ägd källarray och behåller elementens ordning. Dunder 0.11.2 klarar detta med `T: Storable`, en reservation och `for item in move source`. I ett prov med 1 024 rader om 24 heltal gjorde den lånade varianten 1 024 arraykopior om totalt 98 304 byte. Den flyttande varianten gjorde noll. Alla 24 576 värden verifierades på macOS och Linux ARM64. Täck även tom källa, tom destination och element som bara kan flyttas. [Körbart prov med båda varianterna](https://github.com/Mik-pe/dunder-tui/blob/70f877d54df0b9c2d3bc5cf2dd8f38aeef838c67/benchmarks/language/append_arrays.ddr)
+`std.array.append_move` används nu för att flytta textrader i ett publicerat bibliotek. Jämför allokeringsprofilen när färdig kapacitet räcker och när destinationen behöver växa. Behåll prov med element som bara kan flyttas. [Anropet i Text](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/src/text.ddr) · [Arrayoperationen](../stdlib/array.ddr)
 
-## Packa upp ett lyckat Result utan returvärde
+## Verifiera terminalhandtag på nativ Windows
 
-På 0.11.2 ger `operation().unwrap()` E1002 när `operation` returnerar `Result<(),string>`. Samma program går att köra med `.is_ok()` eller `match`. Prova att uppackning av `.Ok` fortsätter till nästa sats och att `.Err` följer samma felväg som för andra resultattyper. [Tvåradersprov](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/tests/dogfood/compiler/unwrap_unit.ddr)
+`std.terminal.window_size(handle)` och `RawMode::enter_on(handle)` finns i 0.11.3. Det lokala Unixprovet kontrollerar bland annat ändrade pixelmått, en separat styrterminal och omdirigerade strömmar. Kör Win32-provet med två skärmbuffertar och kontrollera att rätt indatahandtag återställs vid tidig retur. [Unixprov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/window_terminal.ddr) · [Win32-prov](../tests/fixtures/windows-terminal.ddr)
 
-## Styr en separat terminal via dess handtag
+## Jämför standardbibliotekets terminalbredder med referensen
 
-I 0.11.2 läser `std.terminal.size()` från standardutmatningen och `RawMode::enter()` ändrar standardinmatningen. En process som förbereder en annan terminal för ett barn behöver fortfarande egna termios-anrop. Ge båda operationerna ett alternativ som tar ett öppet handtag. Prova två pseudoterminaler med olika storlek, återställning vid tidig retur och oförändrade föräldraströmmar. På Windows ska storleken gå att läsa från vald skärmbuffert och konsolläget återställas på valt indatahandtag. [Terminalresursen](../stdlib/terminal.ddr) · [Konsolprovet](../tests/fixtures/windows-terminal.ddr)
+I 0.11.3 ger `std.terminal.columns` bredderna 2 och 3 för 😶‍🌫️ och 😶‍🌫, 1 för ett kombinerat `é` och 1 för det sammanhängande spannet `لا`. Kör breddfunktionen över samtliga 5 244 emoji och skriftspecifika ligaturer från referensprovet. Täck även kontrolltecken, tom text och spann som delar en ligatur. [Ratatui-prov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/benchmarks/reference/examples/text.rs) · [Breddmätning](../stdlib/terminal/width.ddr)
 
-Låt storleksfrågan på Unix också exponera pixelbredd och pixelhöjd från samma systemanrop. I ett körbart prov ändrades pixelmåtten från 0 × 0 till 813 × 719 medan cellmåtten låg kvar på 45 × 8. Prova även en ensam känd axel, 65 535 och skillnaden mellan en terminal utan pixeluppgift och ett handtag som är en pipe. [Prov på macOS och Linux](https://github.com/Mik-pe/dunder-tui/blob/1c92bea6f93c819e98b64ce3f807f862596d4865/tests/window_terminal.ddr)
+## Ange datumintervallet för lokal tid på Windows
 
-## Mät grafem och sammanhängande text i terminalkolumner
+`std.time.local_from_unix` i 0.11.3 gav samma kalenderdatum som det tidigare Unix-anropet i UTC, Europe/Stockholm och Pacific/Honolulu. Under Wine i UTC gav Windowsbygget `.None` för −1 och −315619200. Win32-anropet `SystemTimeToTzSpecificLocalTime` gav 1969-12-31 respektive 1960-01-01. Båda gav 1970-01-01 vid tidsstämpeln noll. Verifiera gränserna på nativ Windows x64 och dokumentera intervallet eller utöka stödet för datum före 1970. [Kör datumprovet med `--compare`](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/tests/calendar_clock.ddr) · [Standardbiblioteket](../stdlib/time.ddr)
 
-I 0.11.2 ger `std.text.graphemes` ett grafem för både 😶‍🌫️ och 😶‍🌫. I dunder-tui och Ratatui tar de två respektive tre kolumner. Exponera en breddfunktion i `std.terminal` som kan läsa grafemets lånade UTF-8-vy. Ange Unicode-version, presentationsregler och hur kontrolltecken hanteras. Verifiera bredden mot de 5 244 fallen i Unicode 18:s emojitest och de 742 registrerade presentationsvarianterna. Låt TUI-biblioteket prova funktionen vid klippning och när markören flyttas efter en emoji. [Prov med Dunders grafemiterator](https://github.com/Mik-pe/dunder-tui/blob/v0.18.1/tests/stdlib_text.ddr) · [Referensprov med terminalceller](https://github.com/Mik-pe/dunder-tui/blob/v0.18.1/tests/text_reference.ddr)
+## Följ upp standardbibliotekets prestanda i 0.11.3
 
-Låt även en lånad sträng mätas som helhet. För `لا` ger grafemiteratorn två grafem som tar en cell var när de ritas separat. Ratatui mäter samma följd till en kolumn i ett sammanhängande spann och två när en spanngräns delar bokstäverna. Prova båda bredderna och markörens position när nästa spann ritas. [Körbart prov med Dunder 0.11.2](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/stdlib_text.ddr) · [Prov i pseudoterminal](https://github.com/Mik-pe/dunder-tui/blob/8c41a4e821a21bae7d966bc0f222c65e4383ad99/tests/posix_terminal.ddr)
-
-## Dela UTF-16-kodningen mellan Windowsanrop
-
-I 0.11.2 bildar Dunders sökvägskod och TUI:ts konsolskrivare samma surrogatpar för tecken över U+FFFF. Lägg den gemensamma kodningen i standardbiblioteket och låt anroparen återanvända en `[]u16`. En konsolsträng ska kunna innehålla U+0000. Sökvägsfunktionen ska fortsätta avvisa inre nollor och lägga till en avslutande nolla. Prova tom text, `Ö🌍` och `a\0b` för båda anropssätten. [Sökväg och befintliga prov](../stdlib/sys/winpath.ddr) · [Konsolskrivaren](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/src/windows.ddr#L162-L186)
-
-## Hämta lokal kalendertid för ett givet ögonblick
-
-I 0.11.2 kan `std.time` omvandla en Unix-tidsstämpel till UTC. En kalender som markerar dagens datum behöver även operativsystemets lokala tid. Med tidsstämpeln `1711924200` gav provet 31 mars 2024 i UTC och 1 april i Europe/Stockholm på macOS och Linux. Exponera den lokala omvandlingen i `std.time` och ange hur fel och datum utanför systemets intervall rapporteras. Prova även `1704067200` i Pacific/Honolulu (31 december 2023), båda sidor av en sommartidsövergång samt en Windowsinstallation med vald lokal tidszon. [Dagens tidsfunktioner](../stdlib/time.ddr) · [Körbart datumprov](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/tests/calendar_clock.ddr)
-
-## Läs stegvis ur en bytekö
-
-Med 0.11.2 på macOS ARM64 tog det 6,8, 26 och 105 ms att tömma en kö på 4, 8 respektive 16 KiB med `std.bytes.consume_prefix(&mut data,1)`. Varje anrop flyttar alla efterföljande byte. Med en läsposition och en lånad vy tog samma arbete 13, 26 och 53 µs. Siffrorna är medianer för sju körningar med växlande ordning och samma kontrollsummor. Ge strömmande läsare ett exempel eller ett återanvändbart API för att läsa en vy, avancera och återanvända bufferten. Prova även en ofullständig UTF-8-sekvens följd av ny indata och att en tom kö kan fyllas igen. [Körbart köprov](https://github.com/Mik-pe/dunder-tui/blob/9605bd1be79057fdb5f11dc7470cd2a8ab1da26b/benchmarks/language/byte_queue.ddr) · [Befintlig byteoperation](../stdlib/bytes.ddr)
-
-## Krymp arrayer med `truncate` i `std.array.resize`
-
-På Linux ARM64 med 0.11.2 tog det 136 µs i median att krympa 65 536 heltal till 16 med `array.resize`, jämfört med 0,32 µs med `truncate`. För ägda strängar var tiderna 232 och 188 µs. Samma heltalsprov på Linux x64 tog 4,23 ms respektive 1,22 µs. Använd `truncate` vid krympning och behåll kloningen av fyllnadsvärdet vid tillväxt. Prova även oförändrad längd, tom array och att borttagna värden släpps en gång. Kontrollera att prefix och kapacitet bevaras när arrayen växer igen. [Nuvarande implementation](../stdlib/array.ddr) · [Körbart prov](https://github.com/Mik-pe/dunder-tui/blob/68b19261882417fc85563a9a5b628a13fc42f241/benchmarks/language/shrink_arrays.ddr) · [Linux ARM64](https://github.com/Mik-pe/dunder-tui/actions/runs/45333902464/job/138241364659) · [Linux x64](https://github.com/Mik-pe/dunder-tui/actions/runs/45333902464/job/138241364256)
-
-## Exponera klockans upplösning för korta tidsmätningar
-
-På Apple M5 anger `clock_getres` 1 000 ns för klockan bakom `std.time.monotonic_ns()` i 0.11.2. I tre serier med 100 000 avläsningar var minsta positiva steg 1 000 ns. För `CLOCK_MONOTONIC_RAW` angav systemet 42 ns och provet uppmätte steg på 41 ns. Exponera upplösningen och en monoton klocka för korta intervall. Dokumentera hur systemvila och klockjusteringar påverkar den och verifiera att befintliga tidsgränser behåller sin betydelse. [Klockimplementation](../stdlib/time.ddr) · [Körbart prov](https://github.com/Mik-pe/dunder-tui/blob/10db4a4bb9264d1213de65d8ca5b58e5f8efa278/benchmarks/language/monotonic_clock.ddr)
+- `std.bytes.ByteQueue` klarar delad UTF-8 och återfyllning av en tom kö. Mät kostnaden för att läsa från en filbeskrivare via en mellanbuffert. TUI-parsern måste också kunna ta bort ett markörsvar mitt bland väntande tangenter. [Bytekö](../stdlib/bytes.ddr) · [Inmatningsvägen](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/src/posix.ddr)
+- `std.array.resize` använder nu `truncate` för krympning. Mät helbildstid och allokeringar vid växling mellan smal och bred buffert på fysisk x86-64. [Storleksprov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/benchmarks/buffer-resize.md) · [Arrayoperationen](../stdlib/array.ddr)
+- På Apple M5 anger `MonotonicClock::resolution_ns` 1 000 ns för `Deadline` och 42 ns för `Raw`. Kontrollera klockornas beteende över systemvila och dokumentera hur det påverkar tidsgränser. [Klockorna](../stdlib/time.ddr) · [Mätprov](https://github.com/Mik-pe/dunder-tui/blob/b9d76a2ab0224ad24a6abf2c5bebf33c9dbb3aa9/benchmarks/language/monotonic_clock.ddr)
 
 ## Dela oföränderliga lokala uppslagstabeller
 
@@ -121,7 +83,7 @@ Tillåt även fasta strängtabeller som modulkonstanter. I 0.11.2 avvisas `const
 
 ## Minska kostnaden för kortlivade Option-värden
 
-I ett färgprov på ARM64/macOS med 0.11.2 gav 65 536 direkta läsningar ur en förallokerad palett 259 allokeringsanrop inklusive uppstart. När samma färg skickades som `Some(color)` och matchades direkt blev det 65 795 anrop, varav 65 535 återanvände poolminne. Båda gav kontrollsumman 549 755 781 120. Undersök om kompilatorn kan undvika mellanobjektet när värdet stannar i anropet. Kontrollera båda varianterna av `Option`, samt bevarat ägarskap när resultatet sparas. Mät även bildtid i den ursprungliga diagramvyn. [Körbart färgprov](https://github.com/Mik-pe/dunder-tui/blob/v0.9.0/benchmarks/language/colors.ddr)
+I 0.11.3 gav 65 536 färguppslag på macOS och Linux ARM64 259 allokeringsanrop både för lånad färg och för färg som skickades direkt. Med omedelbart matchad `Some(color)` blev det 65 795. Alla gav summan 549 755 781 120. Eliminera mellanallokeringen när värdet stannar i anropet. Verifiera samma allokeringsantal för alla tre vägar samt korrekt ägarskap för ett sparat resultat och `None`. Mät därefter bildtiden i diagramvyn. [Körbart färgprov](https://github.com/Mik-pe/dunder-tui/blob/d1765d8/benchmarks/language/colors.ddr) · [Tillämpning i skuggritaren](https://github.com/Mik-pe/dunder-tui/blob/d1765d8/benchmarks/shadows.md)
 
 ## Återanvänd lyckade resultat vid vidarebefordran
 
