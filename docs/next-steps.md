@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Minska kostnaden för enkla metodanrop på lånade enumvärden
+
+I 0.12.1 tog 8 192 variantkontroller via `is_reset(&self)` 9 µs på macOS ARM64 och 9,7 µs på Linux ARM64. Samma `match` direkt i loopen tog 5 respektive 5,5 µs. Låt optimeraren lägga in ett enkelt varianttest vid anropet. Kontrollera resultatet 450 560, bildtiden i en färgad buffert samt effekten på byggtid och kodstorlek. [Körbart prov](https://github.com/Mik-pe/dunder-tui/blob/42c65d8fcaa4edb6cdc1ba86fbe08da81182e185/benchmarks/language/enum_predicate.ddr) · [Mätningar](https://github.com/Mik-pe/dunder-tui/blob/42c65d8fcaa4edb6cdc1ba86fbe08da81182e185/benchmarks/results/enum-predicate-0.12.1.tsv)
+
 ## Låt ett returvärde låna från två parametrar
 
 I 0.12.1 kan en lokal post låna två ägare. En funktion som bygger samma post från två parametrar får E4003 när den anger `from left`. Ge returkontraktet stöd för båda ursprungen så att exempelvis en diffiterator kan låna båda buffertarna direkt vid anropet. Prova att läsa båda värdena och att en mutation av vardera ägaren avvisas medan paret används. [Returprov](https://github.com/Mik-pe/dunder-tui/blob/bf2ccc57aa919cd85cb1ad418c6b1364632dbce9/tests/dogfood/compiler/return_two_owners.ddr) · [Fungerande lokalt par](https://github.com/Mik-pe/dunder-tui/blob/bf2ccc57aa919cd85cb1ad418c6b1364632dbce9/tests/dogfood/compiler/paired_views.ddr)
