@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Härled arraylikhet från en generisk anropare
+
+I 0.12.1 ger en jämförelse mellan två konkreta `[]i64` E3004 när hjälpfunktionen anropas från `page_matches<T: Eq>`. Både `==` och `std.array.equal<i64>` träffar felet. Låt båda formerna klara lika och olika arrayer precis som med en konkret anropare. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/af416d9b12c9f15e9d31504bf32668e0b462473d/tests/dogfood/compiler/array_equality_from_generic.ddr)
+
 ## Exportera samma typ från två moduler
 
 I 0.12.1 ger `pub type Clock = time.MonotonicClock` E2001. Lägg till publika typalias så att en enum kan flyttas utan dubbla deklarationer och konverteringar. Prova att båda modulvägarna fungerar i typsignaturer, konstruktorer och mönster och att ett värde kan ges direkt till en funktion som tar den andra vägen. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/f12c0e50108c26dd99bbf099e049c95d91288b50/tests/dogfood/compiler/public_type_alias.ddr)
@@ -79,6 +83,8 @@ En metod som returnerar `Option<&mut i32> from self` får E3099 i 0.12.1. Stöd 
 ## Snabba upp nollställning och jämförelse på x86-64
 
 I 0.12.1 tog `std.bytes.zero_memory` 28,64 µs för två heltalsarrayer med 2 304 celler vardera på översatt Linux x86-64. En typad loop tog 2,94 µs. Radvis jämförelse med `std.bytes.equal_memory` tog 44,49 µs mot loopens 20,57 µs. Mät på nativ Linux och Windows x64, optimera de två runtime-anropen och bevara ARM64-tiderna. Kontrollera udda radbredder och skillnader i båda arrayerna med samma kontrollsumma 45 120. [Mätprogram för båda implementationerna](https://github.com/Mik-pe/dunder-tui/blob/80d1e1cf10496477dce9a948a18d98145edf179c/benchmarks/language/cell_planes.ddr)
+
+För 24 rader med 96 `i64` tog `equal_memory` 26,91 µs mot 1,06 µs med systemets `memcmp` på översatt Linux x64. Upprepa på nativ Linux x64. Bevara gränserna för lånade delarrayer, användardefinierad likhet och kontrollsumman 330 880. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/af416d9b12c9f15e9d31504bf32668e0b462473d/benchmarks/language/row_equality.ddr) · [Rådata](https://github.com/Mik-pe/dunder-tui/blob/af416d9b12c9f15e9d31504bf32668e0b462473d/benchmarks/results/row-equality-0.12.1.tsv)
 
 ## Använd en enumvariant som funktion
 
