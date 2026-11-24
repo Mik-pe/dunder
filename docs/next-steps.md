@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Exportera samma typ från två moduler
+
+I 0.12.1 ger `pub type Clock = time.MonotonicClock` E2001. Lägg till publika typalias så att en enum kan flyttas utan dubbla deklarationer och konverteringar. Prova att båda modulvägarna fungerar i typsignaturer, konstruktorer och mönster och att ett värde kan ges direkt till en funktion som tar den andra vägen. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/f12c0e50108c26dd99bbf099e049c95d91288b50/tests/dogfood/compiler/public_type_alias.ddr)
+
 ## Flytta en returpost som lånar från mottagaren
 
 I 0.12.1 fungerar `return result` för en markör som lånar från `self`. `return move result` ger E4003. Bevara lånets ursprung genom flytten och avvisa returer som lånar från en lokal ägare. För 8 192 markörer gav direkt konstruktion 8 193 postkloner, en fabriksmetod 16 385 och ytterligare en retur 24 577. Mät på nytt med kontrollsumman 598 016. [Kompilatorprov](https://github.com/Mik-pe/dunder-tui/blob/991198e1c1808c70c3f8145ce71ded91d47514b2/tests/dogfood/compiler/return_moved_cursor.ddr) · [Allokeringsprov](https://github.com/Mik-pe/dunder-tui/blob/991198e1c1808c70c3f8145ce71ded91d47514b2/benchmarks/language/borrowed_cursor.ddr)
