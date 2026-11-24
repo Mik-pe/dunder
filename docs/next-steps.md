@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Läs en Unicode-skalär vid ett byteindex i `&str`
+
+Ge lånad text ett allokeringsfritt uppslag som lämnar skalären och nästa byteindex. Prova alla fyra UTF-8-längder samt index vid strängslut och mitt i en skalär. I 0.12.1 tog 8 192 uppslag på macOS ARM64 103 µs via `std.bytes.utf8.decode_prefix` och 39 µs direkt ur textvyn. På Linux ARM64 tog de 107 och 39 µs. Över hela provet begärde processerna 227 480 respektive 153 allokeringar och gav samma summa. Behåll prefixavkodarens svar för ofullständiga och ogiltiga byte. [Körbart minimiprov](https://github.com/Mik-pe/dunder-tui/blob/5fb758089574767296a58bc84442ea2c577be3cc/benchmarks/language/string_scalar.ddr)
+
 ## Härled elementtypen från en lånad fast array
 
 En metod med parametern `&[]T` ska kunna ta `&[a, b]` och härleda `T` från elementen. I 0.12.1 ger `total(&[a, b])` E3003. Med `total<Item>(&[a, b])` går samma program igenom och ger summan 5. Prova även anropet med en dynamisk array och behåll typfelet för en elementtyp som saknar metodens trait. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/b22a99fa0d59702c82fa2126d7e59370f11f6dea/tests/dogfood/compiler/infer_array_argument.ddr)
