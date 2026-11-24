@@ -35,9 +35,10 @@ anropskonvention, parameterlägen och returlånets källparameter i identiteten.
 | När en typ används | Reserverar typens identitet, kontrollerar dess deklarerade krav och fastställer fält, varianttyper och metodsignaturer. Därefter gäller typens vanliga regler för layout, lån och städning. |
 | När en funktion eller metod används | Kontrollerar hela den konkreta kroppen med dess faktiska typer. En hänvisning till ett funktionsvärde räknas också som användning. Fel i en konkret kropp pekar på definitionen och visar vilka användningar som begärde instansen. |
 
-Ett typkrav tillhör alla instanser av typen. Krav kan uttryckas med
-namngivna traits (`where T: Trait1 + Trait2` eller `<T: Trait1 + Trait2>`),
-inbyggda strukturella traits (`Sendable`, `Storable`, `Clone`, `Copy`) eller metodkrav (`T.size: fn(T) -> i32`).
+Ett typkrav tillhör alla instanser av typen. Dunder använder pragmatisk,
+behovsstyrd specialisering kombinerad med uttryckliga kontrakt för publika
+API:er via namngivna traits (`where T: Trait1 + Trait2` eller `<T: Trait1 + Trait2>`)
+samt inbyggda strukturella traits (`Sendable`, `Storable`, `Clone`, `Copy`).
 Exempelvis kräver `Map<K, V>` `K: Hash + Storable` och `V: Storable`, och deklarerar villkorligt
 `impl Sendable for Map<K, V> where K: Sendable, V: Sendable {}`.
 Villkorliga traitimplementationer (`impl Trait for Box<T> where T: Trait`)

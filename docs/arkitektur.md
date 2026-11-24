@@ -17,6 +17,14 @@ modul redigeras uppdateras diagnostiken även i de öppna filer som beror på de
 
 ## Språkets kostnadsmodell
 
+Dunder vilar på fem grundläggande designlöften:
+
+1. **Inga överraskningsallokeringar**: vanliga värdeoperationer och fältlösa enumvarianter (inklusive `.None`, `.Err` och `?`-propagering) undviker oväntade heapallokeringar.
+2. **Inga överraskningskopior**: kopierbara värden kopieras direkt, medan resursägande värden (`string`, samlingar, fångande `Fn`-closures m.fl.) flyttas som standard och kräver uttrycklig `.clone()` eller `move`.
+3. **Säkert som standard**: overflowkontroll, indexgränser och låne- och ägarskapsregler gäller på samma sätt även i optimerade byggen.
+4. **Snabbt av konstruktion**: direkt maskinkodsgenerering, innehållsadresserad fragmentcache och behovsstyrd generisk specialisering håller kompileringstiden förutsägbar.
+5. **Ett tydligt sätt**: en enhetlig modell för traits, värderepresentation och ägarskap utan parallella specialmekanismer för samma problem.
+
 Ett värde har en statiskt känd typ och layout. Språket har bland annat heltal med bestämd bredd, booleska värden, poster, fasta arrayer, slices, funktioner och strukturerat kontrollflöde. En slice består av en adress och en längd och lånar sin lagring. Anrop är direkta när målet är känt. Allokering, kopiering av ägda resurser och dynamisk dispatch ska gå att se där de väljs. Ett litet standardbibliotek får bero på operativsystemets gränssnitt.
 
 Vanlig heltalsaritmetik kontrollerar overflow. Metoder som `wrapping_add` ger explicit omslagsaritmetik för exempelvis hashning. Felaktiga index och division med noll ska ha definierat beteende. Samma program har samma säkerhetsregler i alla byggprofiler. Bevisar kompilatorn att ett index ryms får den ta bort kontrollen.

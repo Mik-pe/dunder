@@ -228,16 +228,13 @@ exempelvis `identity<i32>`. Importerade deklarationer används på samma sätt,
 exempelvis `lib.Box<[]i32>`. [Körbart exempel med två moduler](../tests/fixtures/generics/main.ddr)
 
 Ett `where` efter typens parameterlista anger krav som gäller så fort typen
-används. Krav kan anges som traitgränser (`T: Trait1 + Trait2`), direkt i
-parameterlistan (`<T: Trait1 + Trait2>`), som `storable(T)` (motsvarar
-`T: Storable`) eller som enskilda metodkrav (`T.size: fn(T) -> i32`).
-Ett metodkrav anger namnet och hela funktionstypen inklusive mottagaren;
-metoden måste vara publik och säker och kunna anropas utan ytterligare
-rättigheter.
+används. Krav uttrycks som traitgränser (`T: Trait1 + Trait2`) eller direkt i
+parameterlistan (`<T: Trait1 + Trait2>`), inklusive inbyggda strukturella
+traits som `T: Storable`, `T: Clone`, `T: Copy` och `T: Sendable`.
 
 På en generisk funktion kan `where` stå efter signaturen. På ett
 `impl`-block står det efter mottagartypen, exempelvis
-`impl Box<T> where T.size: fn(T) -> i32` eller
+`impl Box<T> where T: Measurable` eller
 `impl Describe for Box<T> where T: Describe`. För vanliga `impl`-block
 kontrolleras kraven när en av dess metoder används. För villkorliga
 traitimplementationer aktiveras implementationen enbart för de typargument
@@ -298,9 +295,11 @@ typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
 - `Clone` gäller strukturellt för typer utan `@resource`-fält och utan inbyggda
   lån (`Result<T, E>`, `[]T`, tupler, structar och enums vars delar är `Clone`).
 - `Copy` gäller för värden utan heap- eller ägarskapsstädning (`bool`, heltal,
-  `f32`, `f64`, `rune`, `ptr`, fältlösa enums samt aggregat/tupler vars delar är
-  `Copy`, men inte `string` eller `[]T`). Värden av typen `fn(...)` delar sin
-  infångade miljö genom referensräkning i stället för att djupkopiera fångade värden.
+  `f32`, `f64`, `rune`, `ptr`, råa `fn(...)`-funktionsvärden, fältlösa enums
+  samt aggregat/tupler vars delar är `Copy`, men inte `string`, `[]T` eller
+  fångande closures `Fn(...)`).
+- Värden av typen `Fn(...)` följer flyttsemantik och implementerar `Clone`, där
+  `.clone()` delar den infångade miljön genom referensräkning.
 - `Clone` och `Copy` är strukturella och kan inte implementeras manuellt.
 
 I preludiet finns `Eq`, `Ord: Eq`, `Hash: Eq`, `Display` och
@@ -325,9 +324,10 @@ Uttryck som `Result<T, ()>` och `Result<(), E>` konstrueras med bara `.Err`
 respektive `.Ok` när payloadtypen är `()`.
 
 ```dunder
-struct Sized<T> where storable(T), T.size: fn(T) -> i32 { item: T }
+trait Measurable { fn size(&self) -> i32 }
+struct Sized<T> where T: Storable + Measurable { item: T }
 struct Sample { n: i32 }
-impl Sample { pub fn size(&self) -> i32 { self.n } }
+impl Measurable for Sample { fn size(&self) -> i32 { self.n } }
 
 fn main() {
     x := Sized<Sample> { item: Sample { n: 42 } }
@@ -537,11 +537,13 @@ fn main() {
 }
 ```
 
-Listan utvärderas när closuren skapas. `fn[x]` följer vanliga äganderegler.
-Heltal kopieras och en ägd array flyttas in. `fn[mut x]` låter kroppen
-ändra sitt eget infångade värde mellan anrop. `move fn[x]` ger en `FnOnce`
-som förbrukas när den anropas. Resurser som miljön fortfarande äger städas
-när miljön släpps.
+Listan utvärderas när closuren skapas. `fn[x]` följer vanliga äganderegler:
+kopierbara värden kopieras, medan resursägande värden flyttas in. En fångande
+`Fn(...)` är själv flyttbunden (`move_only`) och stöder `.clone()` för delad
+referensräknad användning eller `move` vid ägarbyte, medan en rå `fn(...)` utan
+captures är `Copy`. `fn[mut x]` ger en `FnMut` som låter kroppen ändra sitt
+eget infångade värde mellan anrop. `move fn[x]` ger en `FnOnce` som förbrukas
+när den anropas. Resurser som miljön fortfarande äger städas när miljön släpps.
 
 `fn[&x]` och `fn[&mut x]` lånar den ursprungliga lagringen. Den senare
 kan ändra anroparens värde. En sådan closure får bindas lokalt eller

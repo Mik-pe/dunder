@@ -27,11 +27,14 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
 | Vanlig `for value in values` | Läslån av samlingen under loopen. |
 
-Regeln för flytt gäller `string`, dynamiska och fasta arrayer, iteratorer och
-structar/enums som innehåller sådana värden, inklusive map och set. Tal,
-bool, runes, pekare, funktionsvärden och records utan resursfält eller `@resource`
-kan kopieras som enkla värden. Typens ägarskap bestämmer regeln, oberoende
-av om kompilatorn lagrar dess representation på stack eller heap.
+Regeln för flytt gäller `string`, dynamiska och fasta arrayer, iteratorer,
+fångande closures (`Fn`, `FnMut`, `FnOnce`) och structar/enums som innehåller
+sådana värden, inklusive map och set. Tal, bool, runes, pekare, rena
+funktionspekare (`fn(...)`), fältlösa enums och records utan resursfält eller
+`@resource` kan kopieras som enkla värden. `Fn(...)` implementerar `Clone` via
+referensräkning i miljön så att flera ägare kräver ett explicit `.clone()` eller
+`move`. Typens ägarskap bestämmer regeln, oberoende av om kompilatorn lagrar
+dess representation på stack eller heap.
 
 ### Unika externa resurser
 
@@ -238,8 +241,9 @@ identitetsprov; råpekaren följer då kontraktet för `unsafe`.
 Delade lån kan ingå i structfält och enumpayloads, även via nästlade typer.
 En funktion som returnerar ett sådant värde kan ange källan med `from`.
 Lokala värden kan låna från flera ägare. Varje ägare förblir lånad till sista läsningen. Vid retur måste samtliga lån komma från den deklarerade parametern. Ett tomt
-alternativ som `.None` behöver ingen ägare. Matchning och destrukturering
-bevarar sambandet med den ursprungliga lagringen.
+muteras). Fältlösa enumvarianter som `.None` och `.Err` delar statisk lagring
+utan allokering eller ägare. Matchning och destrukturering bevarar sambandet
+med den ursprungliga lagringen.
 
 Ett värde med lån kan bindas lokalt och skickas mellan funktioner.
 Lånefälten sätts när värdet skapas. Arrayelement, ägda closuremiljöer och

@@ -29,9 +29,11 @@ Ingen implicit konvertering till heltal görs. `i32(kind)` och `i64(kind)`
 läser talvärdet; `FileKind(number)` tar en `i32` och kontrollerar att värdet
 finns i deklarationen. Ett okänt värde avslutar processen med status 108.
 
-En enum utan data lagras som fyra byte och stöder `==` och `!=` mot samma
-typ. Den kan också vara structfält eller element i en fast eller dynamisk array.
-Heltalsaritmetik och ordningsjämförelser kräver en explicit konvertering.
+En enum utan data lagras som fyra byte och skickas direkt som värde i register
+över funktionsanrop, funktionspekare och `task`-gränser. Den stöder `==` och
+`!=` mot samma typ och kan vara structfält eller element i en fast eller
+dynamisk array. Heltalsaritmetik och ordningsjämförelser kräver en explicit
+konvertering.
 
 ## Varianter med data
 
@@ -222,11 +224,14 @@ callback som får variantens innehåll tar över det med en `move`-parameter.
 ## Lagring och dispatch
 
 En enum med data innehåller en tagg och plats för den största variantens
-payload direkt i värdet. Själva taggningen behöver inget extra heapobjekt
-eller vtables. Payloads följer sina typers ägarskapsregler. Flytt överför befintlig lagring.
-En uttrycklig `.clone()` klonar ägda arraybarn till oberoende buffertar;
-oföränderlig strängtext kan delas med referensräkning.
-Funktionsvärden i payloads kan vara namngivna funktioner eller closures.
+payload direkt i värdet. Alla fältlösa varianter (oavsett taggnummer, inklusive
+`.None`, `.Err`, `?`-propagering och `.clone()` av tomma varianter) återanvänder
+statiska skrivskyddade enkelinstanser utan heapallokering. Själva taggningen
+behöver inget extra heapobjekt eller vtables. Payloads följer sina typers
+ägarskapsregler. Flytt överför befintlig lagring. En uttrycklig `.clone()`
+klonar ägda arraybarn till oberoende buffertar; oföränderlig strängtext kan
+delas med referensräkning. Funktionsvärden i payloads kan vara namngivna
+funktioner eller closures.
 
 `match` kompileras till taggjämförelser och direkta grenar. Resursägande structar, arrayer och data-enums flyttas vid bindning,
 tilldelning och retur. Vanliga parametrar lånar dem för läsning. Anroparen äger returvärdets lagring, även vid callbacks och rekursion.
