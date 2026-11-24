@@ -49,6 +49,10 @@ I 0.11.2 läser `std.terminal.size()` från standardutmatningen och `RawMode::en
 
 Låt storleksfrågan på Unix också exponera pixelbredd och pixelhöjd från samma systemanrop. I ett körbart prov ändrades pixelmåtten från 0 × 0 till 813 × 719 medan cellmåtten låg kvar på 45 × 8. Prova även en ensam känd axel, 65 535 och skillnaden mellan en terminal utan pixeluppgift och ett handtag som är en pipe. [Prov på macOS och Linux](https://github.com/Mik-pe/dunder-tui/blob/1c92bea6f93c819e98b64ce3f807f862596d4865/tests/window_terminal.ddr)
 
+## Mät ett grafem i terminalkolumner
+
+I 0.11.2 ger `std.text.graphemes` ett grafem för både 😶‍🌫️ och 😶‍🌫. I dunder-tui och Ratatui tar de två respektive tre kolumner. Exponera en breddfunktion i `std.terminal` som kan läsa grafemets lånade UTF-8-vy. Ange Unicode-version, presentationsregler och hur kontrolltecken hanteras. Verifiera bredden mot de 5 244 fallen i Unicode 18:s emojitest och de 742 registrerade presentationsvarianterna. Låt TUI-biblioteket prova funktionen vid klippning och när markören flyttas efter en emoji. [Prov med Dunders grafemiterator](https://github.com/Mik-pe/dunder-tui/blob/v0.18.1/tests/stdlib_text.ddr) · [Referensprov med terminalceller](https://github.com/Mik-pe/dunder-tui/blob/v0.18.1/tests/text_reference.ddr)
+
 ## Dela UTF-16-kodningen mellan Windowsanrop
 
 I 0.11.2 bildar Dunders sökvägskod och TUI:ts konsolskrivare samma surrogatpar för tecken över U+FFFF. Lägg den gemensamma kodningen i standardbiblioteket och låt anroparen återanvända en `[]u16`. En konsolsträng ska kunna innehålla U+0000. Sökvägsfunktionen ska fortsätta avvisa inre nollor och lägga till en avslutande nolla. Prova tom text, `Ö🌍` och `a\0b` för båda anropssätten. [Sökväg och befintliga prov](../stdlib/sys/winpath.ddr) · [Konsolskrivaren](https://github.com/Mik-pe/dunder-tui/blob/v0.10.0/src/windows.ddr#L162-L186)
