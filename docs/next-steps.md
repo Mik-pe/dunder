@@ -47,6 +47,14 @@ Prova också en lokal enum med två varianter utan nyttolast. I 0.11.2 ger `matc
 
 En iterator över ändrade celler behöver läsa både föregående och aktuell bild. I 0.11.2 går det att lagra två delade lån från samma array i en post. Två lokala ägare ger E4003 även när de båda lever längre än posten. Utvärdera om en lokal vy kan knytas till båda ägarna. Prova tidigt avslutad iteration samt att fortsatt användning av vyn håller båda ägarna lånade och att båda blir skrivbara efter sista läsningen. [Två ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views.ddr) · [Gemensam ägare](https://github.com/Mik-pe/dunder-tui/blob/v0.13.0/tests/dogfood/compiler/paired_views_one_owner.ddr)
 
+## Returnera en valfri delvy av en lånad sträng
+
+I 0.11.2 ger både `check` och `build` E3099 för `.Some(&value[1..value.len])` i en funktion med returtypen `Option<&str> from value`. En post som lagrar källvyn och två byteindex fungerar. Låt en valfri delvy bära sitt intervall och behålla lånet från anroparen. Prova en tom träff, en utebliven träff och UTF-8 efter ett ASCII-prefix. En vy in i en lokal ägd sträng ska fortfarande avvisas. [Minimalt kompilatorprov](https://github.com/Mik-pe/dunder-tui/blob/f3890e7fa9b24e6a9e8dbc3c5d3e3a0011b85b9d/tests/dogfood/compiler/optional_text_view.ddr) · [Körbar variant med byteindex](https://github.com/Mik-pe/dunder-tui/blob/f3890e7fa9b24e6a9e8dbc3c5d3e3a0011b85b9d/benchmarks/language/line_views.ddr)
+
+## Läs rader ur lånad UTF-8-text
+
+Lägg till stegvis radläsning i `std.text`. På 3 073 rader gav `split` i 0.11.2 på macOS ARM64 3 073 strängsnitt och 8 194 kopierade byte även när anroparen stannade efter första raden. Vid läsning av hela texten gav `split`, en lånad iterator med radposter och en markör med byteindex samma kontrollsumma, 10 243. De gjorde 3 103, 12 314 respektive 19 allokeringsanrop inklusive uppstart och testdata. Kontrollera både tidigt avbrott och full genomläsning, med LF, CRLF, tomrader och ett ensamt CR i sista raden. [Mätprogram med tre läsare](https://github.com/Mik-pe/dunder-tui/blob/f3890e7fa9b24e6a9e8dbc3c5d3e3a0011b85b9d/benchmarks/language/line_views.ddr) · [Anrop som bara använder första raden](../stdlib/process.ddr#L496-L503)
+
 ## Jämför två lånade arrayintervall direkt
 
 Med `(&values[0..2]) == (&values[2..4])` ger både `check` och `build` E4002 i 0.11.2 och föreslår ett `&` som redan står där. Om vyerna binds till två lokala namn först fungerar samma jämförelse. Profilen visar noll arraykloner och noll kopierade byte. Tillåt jämförelsen direkt eller visa den fungerande bindningen i diagnostiken. Prova lika, olika och tomma intervall. [Direkt jämförelse](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/inline_view_equality.ddr) · [Namngivna vyer](https://github.com/Mik-pe/dunder-tui/blob/7b6c29a/tests/dogfood/compiler/named_view_equality.ddr)
