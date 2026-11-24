@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Lagra skalära poster sammanhängande i ägda arrayer
+
+Låt en ägd array av poster med enbart skalära fält lagra elementen direkt, som en scratchvy redan kan göra. Med 65 536 insättningar av ett kolumnnummer och en koefficient gav Dunder 0.12.1 och `90573fc` 65 539 allokeringsanrop mot fem med två talarrayer. Prova summan 58 556 416 och att en klon kan växa till 257 poster och ändras via ett muterbart lån medan originalet behåller sitt värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/7b0a4a5e1cf1f640ba6785645eeec73e272cbe3b/benchmarks/language/sparse_terms.ddr) · [Mätning i layoutlösaren](https://github.com/Mik-pe/dunder-tui/blob/7b0a4a5e1cf1f640ba6785645eeec73e272cbe3b/benchmarks/panels.md)
+
 ## Låna text från en strängkonstant
 
 I 0.12.1 ger `view := LABEL.as_str()` E4003 när `LABEL` är en modulkonstant av typen `string`. Låt den lokala vyn läsa från konstantens lagring direkt. Med en namngiven mellanvariabel fungerar redan samma läsning. Kontrollera längd och byte med båda skrivsätten och behåll livstidskontrollen för tillfälliga ägda strängar. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/81d9c4460bafe84ae1d3eff38b76ed4360070dcf/tests/dogfood/compiler/constant_string_view.ddr)
