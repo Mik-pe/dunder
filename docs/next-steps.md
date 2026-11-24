@@ -1,5 +1,13 @@
 # Nästa steg för Dunder
 
+## Packa upp iteratorns koordinatpar utan allokering
+
+I 0.12.1 gav både `for (x,y) in pairs` och `match pairs.next()` 506 881 allokeringsanrop över 253 440 par. En markör med två heltalsfält gav ett. Optimera direkt uppackning av `Option<(i32,i32)>`. Kontrollera summan 14 952 960 och att ett sparat par behåller sina koordinater efter nästa steg. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/c97df61f7ef791637ca96553da3e58be946b47f4/benchmarks/language/iterate_pairs.ddr)
+
+## Återanvänd enumvarianter utan fält
+
+Vid 253 440 skrivningar av fyra fältlösa varianter i en enum som även kan bära RGB-data gav `match` 126 736 allokeringsanrop. Uppslag i en färdig tabell gav 16 på både macOS och Linux ARM64. Återanvänd de fältlösa värdena och behåll ägarskapet för varianter med data. [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/c97df61f7ef791637ca96553da3e58be946b47f4/benchmarks/language/enum_table.ddr)
+
 ## Skilj strängdata från syntax i konstanta arrayer
 
 I 0.12.1 får `["[", "]", ","]` E3007. Kontrollera tokentypen när konstantutvärderaren letar efter arrayens slut. Prova `"]"` först, i mitten och sist samt tom array och avslutande komma. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/cb25b80d1d80270aa0311449c6ab4fe30f52d20f/tests/dogfood/compiler/constant_bracket_table.ddr)
