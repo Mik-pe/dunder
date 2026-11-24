@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Återanvänd lagringen vid kopiering mellan fasta arrayer
+
+I 0.12.1 gav 10 001 tilldelningar med `dst.bounds = src.bounds.clone()` för `[f64;2]` 20 011 allokeringsanrop. Med elementvis kopiering blev det nio. Låt kompilatorn återanvända målets lagring när den ägs exklusivt. Kontrollera summan 100 060 000, att källan kan ändras efter kopieringen och att en sparad kopia behåller sitt värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/9aee09bb692c96999b99565ff35068640c465388/benchmarks/language/fixed_bounds.ddr)
+
 ## Tillåt lånade vyer i synkrona callbacks
 
 I 0.12.1 fungerar en post med ett lånat arrayfält som funktionsargument. Samma post fångad med `fn[&samples]` ger E4003 även när callbacken anropas direkt. Följ ägarens livstid genom posten så att provet kan läsa 17. Behåll fel när en closure kan överleva ägaren. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/09e3017de5467b418361b4f5729438e36d61e196/tests/dogfood/compiler/capture_borrowed_shape.ddr)
