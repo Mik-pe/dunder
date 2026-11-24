@@ -522,3 +522,14 @@ Omvandlingen från `usize` till `i32` kontrollerar att värdet ryms.
 En godkänd layout garanterar inte att värdens minne räcker.
 En HTTP-kropps bytegräns och `Capped<A>` begränsar fortfarande vad
 anroparen får förbruka oavsett adressbredd.
+
+Ett konkret anrop kan knyta resultatet till ett delat lånefält med
+`from self.text`. Kompilatorn kontrollerar ursprunget vid varje retur.
+När mottagaren är en lokal post med lagrade lån hålls dess källor lånade
+medan markörens egna fält kan ändras igen. Funktionspekare använder
+parameterns vanliga returkontrakt. Två resultat från
+`std.text.Graphemes.next` kan därför läsas samtidigt.
+
+En funktion med `Option<&str> from value` eller `Option<&[]T> from value`
+kan returnera ett delintervall. Anroparen äger utrymmet för beskrivningen
+av intervallet. Underliggande data förblir lånade från `value`.

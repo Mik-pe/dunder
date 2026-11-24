@@ -567,3 +567,8 @@ provar även Unicode och NUL, olika elementbredder, djupa värdekopior,
 callbacks och aliasfel.
 SHA-256 kontrolleras mot referensvektorer och används av den
 [Dunder-skrivna kompilatorns](../selfhost/README.md) Mach-O-signering.
+
+
+I `for item in &mut values` är `item` ett exklusivt lån av det aktuella
+arrayelementet. Loopen kan skriva genom lånet och använda `break` eller
+`continue`. Arrayens lagring förblir låst till loopens slut.
