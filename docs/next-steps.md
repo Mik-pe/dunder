@@ -131,11 +131,19 @@ I 0.11.2 gav `if skip { position(i) } else { (0,0) }` 65 536 tupelkonstruktioner
 
 I ett prov med 96 celler och växlande bakgrund tog en bitmask över två lånade heltalsarrayer 3,18 ns per cell på nativ Linux x64 och 1,05 ns på macOS ARM64. En loop som återanvände senast beräknade stil tog 3,96 respektive 1,31 ns. I det symboliserade x64-bygget av 0.11.2 innehåller maskens loopkropp tio jämförelser mot stackgränsen `0x3fff000`. Pröva att slå samman de kontroller som täcker samma stackintervall. Verifiera befintliga stackfel, indexfel och cellerna utanför intervallet. [Radprov](https://github.com/Mik-pe/dunder-tui/blob/v0.20.1/benchmarks/language/fill_rows.ddr) · [Nativ mätning](https://github.com/Mik-pe/dunder-tui/actions/runs/45314935607/job/138179388595) · [x64-bakändens stackkontroll](../selfhost/backend/x86.ddr#L66-L73)
 
-Arbetslasten i [layoutmätningen](../benchmarks/layout/2026-11-22/README.md) har ett oberoende numeriskt facit för både punktposter och separata kolumner. ARM64-serien kördes på fysisk maskin. Upprepa x86-64-serien på fysisk hårdvara inför ett beslut om vektorisering eller instruktionsschemaläggning. Behåll låneprovet för kolonntillväxt vid en framtida representationsändring.
+[Layoutmätningen](../benchmarks/layout/2026-11-22/README.md) innehåller nu
+30 körningar per representation på fysisk x86-64 och ARM64. Samtliga gav
+kontrollsumman 16 774 246. Behåll låneprovet för kolonntillväxt vid en
+framtida representationsändring.
 
 ## Profilera bildritning på fysisk x86-64
 
-Sex kalendrar gav samma celler i 1 100 bilder i Dunder 0.11.2 och Ratatui. I en pseudoterminal tog en oförändrad bild i median 27 respektive 41 µs på Linux ARM64. På samma värd med x86-64-översättning tog den 265 respektive 68 µs. Kör de låsta programmen på fysisk Linux x86-64 och jämför både ritning i minnet och utmatning till terminal. Om skillnaden kvarstår, profilera den långsamma bildvägen och isolera det dyraste anropet innan kodgeneratorn eller biblioteket ändras. [Körkommandon och arbetslast](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/calendar.md) · [Mätvärden och spridning](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/results/calendar-0.12.0.tsv)
+Den låsta kalendervyn i v0.12.0 gav identiska celler i 1 100 bilder på
+fysisk Linux x86-64 med Intel Core i5-1035G7. I minnet tog en oförändrad
+bild 544 µs i Dunder 0.11.2 och 79 µs i Ratatui 0.30.2. I pseudoterminal
+tog den 544 respektive 89 µs. Callgrind mätte 4 725 633 996 instruktioner
+för hela scenen. Det dyraste anropet var `Frame::styled_rune` med 11,40 %
+av instruktionerna. [Arbetslast och metod](https://github.com/Mik-pe/dunder-tui/blob/v0.12.0/benchmarks/calendar.md)
 
 På en Xeon 6975P-C med Linux x86-64 under KVM gav en riktextruta med ligaturer samma celler i 1 100 bilder. En oförändrad bild tog 365 µs i median i Dunder och 57 µs i Ratatui i minnet, respektive 370 och 61 µs med pseudoterminal. I Callgrind gick 25,74 % av Dunderprocessens instruktioner till `Frame::fill_cells` och 21,11 % till `Frame::same_row`. Isolera fyllning och jämförelse av rader med parallella heltalsarrayer. Mät instruktioner per cell och jämför maskinkoden för båda arkitekturerna innan kodgeneratorn ändras. [Mätning](https://github.com/Mik-pe/dunder-tui/actions/runs/45301551701/job/138135086401) · [Instruktionsprofil](https://github.com/Mik-pe/dunder-tui/actions/runs/45304057607/job/138143422641)
 

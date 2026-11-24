@@ -9,6 +9,8 @@ dunder test --affected
 
 ## Läs kontrollresultat som JSON
 
+`dunder check --unused-functions` varnar med W1003 för privata toppnivåfunktioner som saknar referenser i paketet. Publika funktioner, metoder och funktioner med attribut undantas. En referens i ett test eller som funktionsvärde räknas också.
+
 `check --agent` skriver ett JSON-objekt per rad på stdout. En lyckad
 kontroll rapporterar namn och typ för parametrar och lokala bindningar,
 sedan en post med `kind: "ok"` och antal moduler. Ett källfel ger en post

@@ -68,11 +68,47 @@ fn show(value: &str) {
 }
 ```
 
+Med `std.text.lines(value)` kan läsaren stanna efter första raden. Kör
+`advance()` för att läsa nästa rad och `current()` för dess lånade UTF-8-vy.
+LF och CRLF avslutar rader. Ett ensamt CR i den sista raden hör till texten.
+
+`std.bytes.ByteQueue::new()` ger en återanvändbar bytebuffert. `append`
+lägger till indata, `pending()` lånar den olästa delen och `advance(n)`
+returnerar `false` om antalet ligger utanför den delen. En UTF-8-läsare kan
+behålla en ofullständig sekvens till nästa `append`.
+
+`std.utf16.append(&mut units, value)` behåller inre nolltecken och skriver
+surrogatpar för tecken över U+FFFF. `terminated(value)` ger en nollterminerad
+sökväg och avvisar inre nollor med en tom array.
+
+`std.terminal.columns(value)` mäter en lånad text i terminalceller.
+Bredden följer Unicode 18 med smala tvetydiga tecken, presentationsväljare
+och sammansatta emojier. C0- och C1-kontroller, inklusive radbrytning, ger
+`.None`. Varje anrop mäter ett sammanhängande spann. Lam och alef tar en
+cell tillsammans och två när de mäts i var sitt spann.
+
+`std.time.local_from_unix(secs)` använder systemets lokala tidszon, inklusive
+sommartid för det angivna ögonblicket. Den ger `.None` om systemet eller
+`DateTime.year` saknar stöd för datumet.
+
+`std.time.MonotonicClock.Raw.now_ns()` ger en klocka för korta intervall.
+`resolution_ns()` ger den upplösning systemet anger, avrundad uppåt till hela
+nanosekunder. Båda metoderna ger −1 vid fel. På macOS och Linux använder
+raw-klockan `CLOCK_MONOTONIC_RAW` som går oberoende av frekvensjusteringar.
+macOS räknar systemvila, Linux utelämnar den. Windows använder
+prestandaräknaren för båda varianterna. `.Deadline.now_ns()` använder samma
+klocka som `monotonic_ns()` och befintliga tidsgränser.
+
 Med `capability stdio` ger `std.terminal.size()` standardutmatningens antal
 kolumner och rader. `terminal.RawMode::enter()` ändrar standardinmatningens
 läge och behåller ett eget handtag. Resursens `restore()` återställer läget
 och kan anropas flera gånger. Om funktionen returnerar tidigt gör resursen
 ett återställningsförsök vid scope-slut.
+
+`terminal.window_size(handle)` läser cell- och pixelmått på en vald terminal.
+Noll på en pixelaxel betyder att terminalen saknar uppgift för axeln.
+Windows rapporterar skärmbuffertens synliga cellmått och noll för pixlarna.
+`RawMode::enter_on(handle)` håller en egen kopia av handtaget för återställning.
 
 `process.Command.spawn_with_handles(input, output, error_output)` tar tre
 `Option<usize>`. `.Some(handle)` väljer en öppen POSIX-filbeskrivare eller

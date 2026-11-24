@@ -12,10 +12,12 @@ provet i varje grupp. [Arbetslast och mätmetod](../README.md)
 | Apple M5, macOS ARM64 | En array per fält | 24,57 | 26,34 | 35,90 | 39,18 |
 | Översatt Linux x86-64 | Array med poster | 492,87 | 835,66 | 17,93 | 28,85 |
 | Översatt Linux x86-64 | En array per fält | 449,37 | 778,77 | 17,95 | 27,86 |
+| Intel Core i5-1035G7, Linux x86-64 | Array med poster | 497,57 | 556,95 | 19,29 | 20,34 |
+| Intel Core i5-1035G7, Linux x86-64 | En array per fält | 406,50 | 449,06 | 19,27 | 23,96 |
 
 ARM64-processerna kördes direkt på macOS 27.2.1. Linux-processerna kördes i en
 lokal Docker-gäst på samma M5. Både kompilatorn och programmen var x86-64 ELF.
-Gästens tider inkluderar maskinkodsöversättning. [Råprover macOS](arm64-macos.csv)
+Gästens tider inkluderar maskinkodsöversättning. [Råprover fysisk Linux x86-64](x86_64-linux-native.csv) · [Råprover macOS](arm64-macos.csv)
 · [Råprover översatt Linux](x86_64-linux-translated.csv)
 
 De självbyggda kompilatorernas SHA-256 var
