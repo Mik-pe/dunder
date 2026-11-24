@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Hasha en lånad strängvy
+
+Låt `vy.hash()` för `&str` ge samma värde som för en ägd sträng med samma UTF-8-byte. I 0.12.1 får anropet E2003. Att hasha 8 192 strängvyer med `vy.to_string().hash()` gav 8 195 allokeringsanrop, mot tre med `Hasher.write_bytes(vy.as_bytes())` och `finish()`. Prova tom vy och delsträngar med två-, tre- och fyrbyteskalärer. [Kompilatorprov](https://github.com/Mik-pe/dunder-tui/blob/fa3e99a60c8d3a4aa611408d852b0a5b5e58b62a/tests/dogfood/compiler/hash_text_view.ddr) · [Mätprogram](https://github.com/Mik-pe/dunder-tui/blob/fa3e99a60c8d3a4aa611408d852b0a5b5e58b62a/benchmarks/language/view_hash.ddr)
+
 ## Dimensionera korta arrayliteraler efter innehållet
 
 I 0.12.1 reserverade 16 384 dynamiska arrayer byggda med `[i]` plats för 131 072 heltal. En textrad med ett spann fick också åtta platser. Låt literaler med känt antal element börja med mindre kapacitet. Mät högsta RSS för korta rader och tiden för upprepad `push`. Kontrollera att en klon kan växa till 1 025 värden medan originalet behåller sitt enda värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/73e4121202b9791bc9d05241e84c757749bd0f31/benchmarks/language/short_arrays.ddr) · [Minnesmätning](https://github.com/Mik-pe/dunder-tui/blob/73e4121202b9791bc9d05241e84c757749bd0f31/benchmarks/text-storage.md)
