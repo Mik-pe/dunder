@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Låna text från en strängkonstant
+
+I 0.12.1 ger `view := LABEL.as_str()` E4003 när `LABEL` är en modulkonstant av typen `string`. Låt den lokala vyn läsa från konstantens lagring direkt. Med en namngiven mellanvariabel fungerar redan samma läsning. Kontrollera längd och byte med båda skrivsätten och behåll livstidskontrollen för tillfälliga ägda strängar. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/81d9c4460bafe84ae1d3eff38b76ed4360070dcf/tests/dogfood/compiler/constant_string_view.ddr)
+
 ## Härled arraylikhet från en generisk anropare
 
 I 0.12.1 ger en jämförelse mellan två konkreta `[]i64` E3004 när hjälpfunktionen anropas från `page_matches<T: Eq>`. Både `==` och `std.array.equal<i64>` träffar felet. Låt båda formerna klara lika och olika arrayer precis som med en konkret anropare. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/af416d9b12c9f15e9d31504bf32668e0b462473d/tests/dogfood/compiler/array_equality_from_generic.ddr)
