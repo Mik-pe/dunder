@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Dimensionera korta arrayliteraler efter innehållet
+
+I 0.12.1 reserverade 16 384 dynamiska arrayer byggda med `[i]` plats för 131 072 heltal. En textrad med ett spann fick också åtta platser. Låt literaler med känt antal element börja med mindre kapacitet. Mät högsta RSS för korta rader och tiden för upprepad `push`. Kontrollera att en klon kan växa till 1 025 värden medan originalet behåller sitt enda värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/73e4121202b9791bc9d05241e84c757749bd0f31/benchmarks/language/short_arrays.ddr) · [Minnesmätning](https://github.com/Mik-pe/dunder-tui/blob/73e4121202b9791bc9d05241e84c757749bd0f31/benchmarks/text-storage.md)
+
 ## Ändra en enumvariants innehåll via ett exklusivt lån
 
 Stöd `match &mut pages[index]` så att en arm kan ändra ett fält i den aktiva varianten. I 0.12.1 ger uttrycket E3006 och en skrivning via `match &pages[index]` ger E4002. Prova att den tomma varianten bevaras och att `Ready(16)` blir `Ready(17)` i samma array. Behåll skrivskyddet för delade lån. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/de80ef98ba4f7b96fcb7a9a332356db46fc74d7b/tests/dogfood/compiler/match_mutable_payload.ddr)
