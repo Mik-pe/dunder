@@ -27,20 +27,20 @@ som är tillåtna; ägarskap anger vem som ska frigöra värdet.
 | `value.clone()` | Skapar en ytterligare ägare uttryckligen. |
 | Vanlig `for value in values` | Läslån av samlingen under loopen. |
 
-Regeln för flytt gäller `string`, dynamiska och fasta arrayer, iteratorer,
-fångande closures (`Fn`, `FnMut`, `FnOnce`) och structar/enums som innehåller
-sådana värden, inklusive map och set. Tal, bool, runes, pekare, rena
+Regeln för flytt gäller `string`, dynamiska arrayer (`[]T`), iteratorer,
+fångande closures (`Fn`, `FnMut`, `FnOnce`) samt fasta arrayer `[T; N]`, structar och enums som innehåller
+flyttbundna värden (inklusive `Map`, `Set` och `@resource`). Tal, bool, runes, pekare, rena
 funktionspekare (`fn(...)`), fältlösa enums och `Copy`-värden (nästlade structar,
-tupler och data-enums utan resursfält eller `@resource`) kan kopieras som enkla
-värden. `Fn(...)` implementerar `Clone` via referensräkning i miljön så att
+tupler, data-enums och fasta arrayer `[T; N]` vars element är `Copy`) kopieras i stället vid tilldelning och retur.
+`Fn(...)` implementerar `Clone` via referensräkning i miljön så att
 flera ägare kräver ett explicit `.clone()` eller `move`. När en `Copy`-struct,
-tupel eller payload-enum ryms inom 16 åttabyte-ord lagras den som ett platt
+tupel, payload-enum eller positiv fast array `[T; N]` av POD-element ryms inom 16 åttabyte-ord (upp till 128 byte för fasta arrayer) lagras den som ett platt
 inline POD-värde på stacken (utan heapallokering eller referensräkning), och lån
 (`&T`/`&mut T`) passerar buffertpekaren direkt (`T*`) på samma sätt som för
 `@c_layout`. Samma platta POD-värden lagras dessutom avboxade direkt intill
 varandra i bufferten för `[]T`, `[T; N]`, `Map` och `Set` utan separata
 elementallokeringar. Typens ägarskap bestämmer kopierings- och flyttreglerna,
-oberoende av om representationen ligger på stack eller heap.
+oberoende av om representationen ligger på stack eller heap (större `Copy`-värden kopieras automatiskt vid tilldelning och `.clone()`).
 
 ### Unika externa resurser
 
@@ -145,11 +145,12 @@ i en samling som utanför den. Ändliga rekursiva värden, exempelvis
 `for element in &values` lånar ägda element; `for element in move values`
 flyttar dem. Referenser och scratchvyer får inte lagras som arrayelement.
 Arrayer av ohanterade `@c_layout`-structar och av POD-värden (kopierbara
-structar, tupler och data-enums upp till 16 åttabyte-ord) lagrar elementen
+structar, tupler, data-enums och fasta arrayer `[T; N]` upp till 16 åttabyte-ord / 128 byte) lagrar elementen
 avboxade och direkt intill varandra i samma buffert utan separata
 heapallokeringar per element vid `push`, `pop`, `remove`, `swap`, `replace`,
 `clone`, skivning (`&values[a..b]`), `for`-loopar eller lagring i `Map` och `Set`.
-Ett fast arrayfält i en `@c_layout`-struct har samma inline-representation.
+Fasta POD-arrayer `[T; N]` lagras dessutom helt på stacken även som fristående värden och literaler,
+och kopiering eller parameteröverföring av t.ex. `[f64; 2]` eller `[f32; 4]` gör noll heapallokeringar.
 
 Giltiga dynamiska arrayer har `0 <= len <= cap <= i32::MAX`, oberoende av
 minnespoolens storlek. Runtime kontrollerar önskat antal före växande

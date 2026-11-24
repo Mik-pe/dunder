@@ -296,8 +296,8 @@ typer). Kompilatorn tillhandahåller fyra inbyggda strukturella traits:
   lån (`Result<T, E>`, `[]T`, tupler, structar och enums vars delar är `Clone`).
 - `Copy` gäller för värden utan heap- eller ägarskapsstädning (`bool`, heltal,
   `f32`, `f64`, `rune`, `ptr`, råa `fn(...)`-funktionsvärden, fältlösa enums
-  samt aggregat/tupler vars delar är `Copy`, men inte `string`, `[]T` eller
-  fångande closures `Fn(...)`).
+  samt aggregat, tupler och fasta arrayer `[T; N]` vars delar är `Copy`, men inte `string`, `[]T` eller
+  fångande closures `Fn(...)`). Positiva fasta POD-arrayer upp till 128 byte lagras inline på stacken.
 - Värden av typen `Fn(...)` följer flyttsemantik och implementerar `Clone`, där
   `.clone()` delar den infångade miljön genom referensräkning.
 - `Clone` och `Copy` är strukturella och kan inte implementeras manuellt.
@@ -869,10 +869,13 @@ En array med enbart heltalsliteraler får `i32` om alla ryms där, annars
 `i64`. Samma regel gäller `[value; N]` när `value` är en heltalsliteral.
 Literaler måste rymmas i den valda typen och typade element måste ha samma typ.
 
-Arrayer flyttas vid bindning och retur. Vanliga parametrar lånar för
+Dynamiska arrayer `[]T` samt fasta arrayer `[T; N]` med flyttbundna element
+flyttas vid bindning och retur. En fast array `[T; N]` av `Copy`-element är däremot
+själv `Copy` och kopieras automatiskt vid bindning och retur (utan heapallokering
+upp till 128 byte för POD-element). Vanliga parametrar lånar för
 läsning. `mut` krävs för att tilldela ett element. Index har typen `i32`; negativa index och index vid
-eller efter längden ger runtimefel. `len(values)` och `values.len()` ger
-längden som `i32`. Fasta arrayer kan returneras genom ägaröverföring på samma sätt som
+eller efter längden ger runtimefel. `len(values)` och `values.len` ger
+längden som `i32`. Fasta arrayer av flyttbundna element kan returneras genom ägaröverföring på samma sätt som
 andra resursägande värden.
 En lokal variabel eller parameter får heta `len`. Den skuggar det
 fristående anropet `len(a)` i sitt block. Medlemsåtkomst som `a.len`
