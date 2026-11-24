@@ -8,6 +8,10 @@ På macOS ARM64 avbryts det 13 rader långa provet i publicerade 0.12.0 när loo
 
 För 65 536 anrop till `std.terminal.columns` gav 49 152 giltiga bredder och 16 384 kontrolltecken totalt 49 160 allokeringsanrop med både `match` och `unwrap_or(-1)`. Fyra sparade bredder gav åtta anrop och samma summa. Minska kostnaden för `Some(i32)` över funktionsgränsen och behåll `.None` för kontrolltecken. Mät med `--runtime-profile` på macOS och Linux ARM64. [Prov för båda anropssätten](https://github.com/Mik-pe/dunder-tui/blob/95238cd3b27368b24eadf97552ba328914bccd8f/benchmarks/language/terminal_option.ddr)
 
+## Läs JSON-objektets fält i en genomgång
+
+Ge `std.json.Doc` en iterator som lämnar nyckel och värdenod i källordning, även för dubbla och escapade nycklar. I 0.12.0 går `key_at` och `val_at` från första barnet för varje index. Att läsa ett redan tolkat objekt med 1 024, 2 048 och 4 096 fält tog 1,83, 7,40 och 29,69 ms i median på macOS ARM64. Kör samma prov med iteratorn och kontrollera linjär tidsökning och oförändrade kontrollsummor. [Mätprogram i Dunder](https://github.com/Mik-pe/dunder-tui/blob/247dd05/benchmarks/language/json_members.ddr)
+
 ## Verifiera Windows som kompilatorvärd
 
 Dunder distribuerar en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
