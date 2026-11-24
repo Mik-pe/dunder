@@ -1,5 +1,9 @@
 # Nästa steg för Dunder
 
+## Skriv osignerade decimaltal i bytebuffertar
+
+Lägg en `u64`-motsvarighet till `append_decimal` i `std.bytes` och låt `std.json.write_u64` använda den. I 0.12.1 gav 7 000 värden via `value.str()` och `append_utf8` 7 007 allokeringsanrop mot sju med JSON-skrivaren i samma förallokerade buffert. Kontrollera att prefixet bevaras och att talen 0, 2⁶³ och 2⁶⁴−1 skrivs exakt. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/18f18243d01ae934861c98fa4fd2d43646a0e5da/benchmarks/language/unsigned_text.ddr)
+
 ## Återanvänd lagringen vid kopiering mellan fasta arrayer
 
 I 0.12.1 gav 10 001 tilldelningar med `dst.bounds = src.bounds.clone()` för `[f64;2]` 20 011 allokeringsanrop. Med elementvis kopiering blev det nio. Låt kompilatorn återanvända målets lagring när den ägs exklusivt. Kontrollera summan 100 060 000, att källan kan ändras efter kopieringen och att en sparad kopia behåller sitt värde. [Minimiprov](https://github.com/Mik-pe/dunder-tui/blob/9aee09bb692c96999b99565ff35068640c465388/benchmarks/language/fixed_bounds.ddr)
