@@ -83,7 +83,7 @@ Tillåt även fasta strängtabeller som modulkonstanter. I 0.11.2 avvisas `const
 
 ## Minska kostnaden för kortlivade Option-värden
 
-I ett färgprov på ARM64/macOS med 0.11.2 gav 65 536 direkta läsningar ur en förallokerad palett 259 allokeringsanrop inklusive uppstart. När samma färg skickades som `Some(color)` och matchades direkt blev det 65 795 anrop, varav 65 535 återanvände poolminne. Båda gav kontrollsumman 549 755 781 120. Undersök om kompilatorn kan undvika mellanobjektet när värdet stannar i anropet. Kontrollera båda varianterna av `Option`, samt bevarat ägarskap när resultatet sparas. Mät även bildtid i den ursprungliga diagramvyn. [Körbart färgprov](https://github.com/Mik-pe/dunder-tui/blob/v0.9.0/benchmarks/language/colors.ddr)
+I 0.11.3 gav 65 536 färguppslag på macOS och Linux ARM64 259 allokeringsanrop både för lånad färg och för färg som skickades direkt. Med omedelbart matchad `Some(color)` blev det 65 795. Alla gav summan 549 755 781 120. Eliminera mellanallokeringen när värdet stannar i anropet. Verifiera samma allokeringsantal för alla tre vägar samt korrekt ägarskap för ett sparat resultat och `None`. Mät därefter bildtiden i diagramvyn. [Körbart färgprov](https://github.com/Mik-pe/dunder-tui/blob/d1765d8/benchmarks/language/colors.ddr) · [Tillämpning i skuggritaren](https://github.com/Mik-pe/dunder-tui/blob/d1765d8/benchmarks/shadows.md)
 
 ## Återanvänd lyckade resultat vid vidarebefordran
 
