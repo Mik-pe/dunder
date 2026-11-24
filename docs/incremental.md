@@ -19,6 +19,18 @@ med `kind: "error"`, felkod, sökväg, meddelande och spann samt exitkod 1.
 Slutpositionen är exklusiv. `--target wasm32` eller `wasm32-wasi` väljer Wasms
 pekarbredd även vid typkontrollen.
 
+## Bygg om ett projekt
+
+Vanlig `dunder build` från ett projekt återanvänder den publicerade binären när
+kompilatorn, byggargumenten, de upplösta källorna och inbäddade resurser är
+identiska. Kompilatorn läser projektet på nytt och kontrollerar binärens
+SHA-256. En ändrad eller borttagen binär byggs om. Lyckade byggen sparar
+ett kvitto i användarens cachekatalog under `dunder/builds`. Vid en träff
+skrivs byggets varningar ut igen.
+
+Byggen med explicit källfil, `--timings`, `--agent`, `--debug` eller `--app`
+kör hela byggkedjan. Med `--incremental` används funktionscachen nedan.
+
 ## Återanvänd maskinkod
 
 `--incremental` aktiverar funktionscachen för alla mål (inklusive Wasm och

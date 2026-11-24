@@ -13,8 +13,8 @@ pub opaque struct Workspace {
     verifier: verify.Workspace,
     cand_places: []i32,
     place_to_cand: []i32,
-    in_state: []i32,
-    out_state: []i32,
+    empty_in: []i64, defined_out: []i64, live_out: []i64,
+    written: []i64, written_live: []i64,
     cur_state: []i32,
     read_later: []bool,
     pred_starts: []i32,
@@ -37,7 +37,7 @@ pub opaque struct Workspace {
 pub fn new() -> Workspace {
     Workspace {
         verifier: verify.new_work(),
-        cand_places: [], place_to_cand: [], in_state: [], out_state: [], cur_state: [],
+        cand_places: [], place_to_cand: [], empty_in: [], defined_out: [], live_out: [], written: [], written_live: [], cur_state: [],
         read_later: [], pred_starts: [], pred_fill: [], predecessors: [],
         reached: [], queued: [], queue: [], block_ops: [], undo_ops: [], undo_rows: [],
         before_verified: false, status: 0, work: 0, limit: 0,
@@ -52,7 +52,7 @@ pub fn vacated(w: &Workspace) -> i32 { if w.status == 2 { w.eliminated_vacates }
 
 fn reset(w: &mut Workspace, limit: i32) {
     w.cand_places.clear(); w.place_to_cand.clear()
-    w.in_state.clear(); w.out_state.clear(); w.cur_state.clear(); w.read_later.clear()
+    w.empty_in.clear(); w.defined_out.clear(); w.live_out.clear(); w.written.clear(); w.written_live.clear(); w.cur_state.clear(); w.read_later.clear()
     w.pred_starts.clear(); w.pred_fill.clear(); w.predecessors.clear()
     w.reached.clear(); w.queued.clear(); w.queue.clear()
     w.block_ops.clear(); w.undo_ops.clear(); w.undo_rows.clear()
@@ -210,23 +210,40 @@ fn build_cfg(w: &mut Workspace, f: &mir.Function, exits: &terminals.TerminalCont
     true
 }
 
-fn step_op(w: &mut Workspace, f: &mir.Function, op: i32) {
-    if f.modes[op] == 2 || f.kinds[op] != 8 { return }
+fn stored_cell(w: &Workspace, f: &mir.Function, op: i32) -> i32 {
+    if f.modes[op] == 2 || f.kinds[op] != 8 { return -1 }
     p := f.place[op]
-    if p < 0 || p >= w.place_to_cand.len { return }
-    c := w.place_to_cand[p]
-    if c < 0 { return }
-    tag := f.opcodes[op]
-    if tag == 21 || tag == 22 || tag == 23 { w.cur_state[c] = 1 } else { w.cur_state[c] = 2 }
+    if p < 0 || p >= w.place_to_cand.len { return -1 }
+    w.place_to_cand[p]
+}
+
+fn empties_cell(tag: i32) -> bool { tag == 21 || tag == 22 || tag == 23 }
+
+fn step_op(w: &mut Workspace, f: &mir.Function, op: i32) {
+    c := stored_cell(&w, &f, op)
+    if c >= 0 { w.cur_state[c] = if empties_cell(f.opcodes[op]) { 1 } else { 2 } }
 }
 
 fn solve_dataflow(w: &mut Workspace, f: &mir.Function) -> bool {
-    blocks := f.block_starts.len; k := w.cand_places.len; total := blocks * k
-    if !charge(&mut w, total * 4 + f.order.len) { return false }
-    w.in_state.reserve(total); w.out_state.reserve(total)
-    w.cur_state.reserve(k); w.read_later.reserve(k)
-    for _ in 0..total { w.in_state.push(0); w.out_state.push(0) }
+    blocks := f.block_starts.len; k := w.cand_places.len
+    if !charge(&mut w, blocks * k * 4 + f.order.len) { return false }
+    words := (k + 63) / 64
+    for _ in 0..blocks * words {
+        w.empty_in.push(0); w.defined_out.push(0); w.live_out.push(0)
+        w.written.push(0); w.written_live.push(0)
+    }
     for _ in 0..k { w.cur_state.push(0); w.read_later.push(false) }
+    for b in 0..blocks {
+        if !w.reached[b] { continue }
+        for pos in f.block_starts[b]..f.block_ends[b] {
+            op := f.order[pos]; cell := stored_cell(&w, &f, op)
+            if cell < 0 { continue }
+            row := b * words + cell / 64; bit := i64(1).shl(cell % 64)
+            w.written[row] = w.written[row].bit_or(bit)
+            if empties_cell(f.opcodes[op]) { w.written_live[row] = w.written_live[row].bit_and(bit.bit_not()) }
+            else { w.written_live[row] = w.written_live[row].bit_or(bit) }
+        }
+    }
     w.queue.clear()
     mut head := 0; mut tail := 0; mut pending := 0
     for i in 0..blocks { w.queued[i] = false }
@@ -244,26 +261,25 @@ fn solve_dataflow(w: &mut Workspace, f: &mir.Function) -> bool {
         b := w.queue[head]; head = (head + 1) % blocks; pending = pending - 1; w.queued[b] = false
         visits = visits + 1
         if visits > blocks * 16 + 64 || !charge(&mut w, k + f.block_ends[b] - f.block_starts[b]) { return false }
-        if b == 0 {
-            for c in 0..k { w.cur_state[c] = 2 }
-        } else {
-            for c in 0..k { w.cur_state[c] = 0 }
-            for p_idx in w.pred_starts[b]..w.pred_starts[b + 1] {
-                pred := w.predecessors[p_idx]; base := pred * k
-                for c in 0..k {
-                    s := w.out_state[base + c]
-                    if s > w.cur_state[c] { w.cur_state[c] = s }
+        mut changed := false
+        for word in 0..words {
+            mut defined: i64 = 0; mut live: i64 = 0
+            if b == 0 {
+                defined = -1
+                if word == words - 1 && k % 64 != 0 { defined = i64(-1).shl(k % 64).bit_not() }
+                live = defined
+            } else {
+                for p in w.pred_starts[b]..w.pred_starts[b + 1] {
+                    row := w.predecessors[p] * words + word
+                    defined = defined.bit_or(w.defined_out[row]); live = live.bit_or(w.live_out[row])
                 }
             }
-        }
-        in_base := b * k
-        for c in 0..k { w.in_state[in_base + c] = w.cur_state[c] }
-        for pos in f.block_starts[b]..f.block_ends[b] { step_op(&mut w, &f, f.order[pos]) }
-        mut changed := false
-        for c in 0..k {
-            if w.out_state[in_base + c] != w.cur_state[c] {
-                w.out_state[in_base + c] = w.cur_state[c]
-                changed = true
+            row := b * words + word
+            w.empty_in[row] = defined.bit_and(live.bit_not())
+            defined = defined.bit_or(w.written[row])
+            live = live.bit_and(w.written[row].bit_not()).bit_or(w.written_live[row])
+            if w.defined_out[row] != defined || w.live_out[row] != live {
+                w.defined_out[row] = defined; w.live_out[row] = live; changed = true
             }
         }
         if changed {
@@ -319,8 +335,11 @@ fn rewrite_blocks(w: &mut Workspace, f: &mut mir.Function) -> bool {
     mut changed := false
     for b in 0..f.block_starts.len {
         if !w.reached[b] { continue }
-        base := b * k
-        for c in 0..k { w.cur_state[c] = w.in_state[base + c] }
+        base := b * ((k + 63) / 64)
+        for c in 0..k {
+            empty := w.empty_in[base + c / 64].bit_and(i64(1).shl(c % 64)) != 0
+            w.cur_state[c] = if empty { 1 } else { 2 }
+        }
         w.block_ops.clear()
         for pos in f.block_starts[b]..f.block_ends[b] {
             op := f.order[pos]
