@@ -31,6 +31,8 @@ fn main() {
 
 ## Installera och kör
 
+Agenter som skriver Dunder kan läsa projektets portabla skill. Kopiera katalogen till `.agents/skills/dunder/` i ett annat projekt för att ge dess agenter samma syntaxguide och körbara exempel. [Dunder-skill](.agents/skills/dunder/SKILL.md)
+
 Installera den senaste stabila kompilatorn på ARM64/macOS, ARM64/Linux eller
 x86-64/Linux. Standardbiblioteket ingår i binären.
 
