@@ -1,8 +1,10 @@
 # Nästa steg för Dunder
 
-## Mät byggtiden efter en privat ändring
+## Få privata ändringar under 100 ms vid p95
 
-På referensmaskinen ska ett nytt `dunder build` slutföra en privat ändring på högst 100 ms vid p95. Det blandade korpuset omfattar 123 188 tokenbärande rader. Följ också rena byggen, oförändrade byggen och en ändring i delad postlayout. [Mätprotokoll](prestanda.md) · [Mätverktyg](../tools/performance_project.ddr)
+På Apple M5 tog en privat lövändring 104,33 ms vid p95. En ändring i en privat funktion som inlinades hos 50 anropare tog 131,68 ms. Endast 1 respektive 51 av 1 042 funktioner byggdes om. Mät hur mycket av tiden som går åt till att läsa och namnupplösa oförändrade moduler och till att länka om deras kod. Följ även ändrade strängliteraler i de verkliga projekten. [Projektmätningar och rådata](../benchmarks/compiler/2026-11-25-project-builds/README.md)
+
+Det rena bygget av 123 188 tokenbärande rader tog 378,26 ms vid p95, cirka 326 000 rader/s. Oförändrat bygge tog 6,48 ms vid p95. Båda nådde målen i autoläge. Efter ändrad delad postlayout byggdes samtliga funktioner om och resultatet var byteidentiskt med ett rent bygge. [Mätprotokoll](prestanda.md)
 
 ## Mät minnesrutinerna på nativ x86-64
 
@@ -12,7 +14,7 @@ Kör proven för nollning och jämförelse på fysisk Linux och Windows x64. På
 
 Dunder distribuerar en korsbyggd x86-64-kompilator för Windows. Kör följande på en riktig Windowsinstallation och dokumentera Windowsversion, källrevision och resultat.
 
-Under Wine 8 i Kiri byggde den publicerade Windowskompilatorn 0.12.1 sin källtagg byteidentiskt med releasefilen i två generationer med ett och tre jobb. Även en utvecklingskandidat nådde fixpunkt med båda inställningarna. CLI, språkserver, Unicode-argument, barnprocesser, Win64-callbackar, pseudoterminal och kalenderprov för tre tidszoner passerade. Ett låst Git-beroende kunde byggas offline med frånkopplat ursprung. Vid uppgradering till 0.12.1 gav en öppen exe status 3. Efter stängning gick den verifierade ersättningen att installera och den körde ett prov med resultatet 42. [Releasefiler](https://github.com/Mik-pe/dunder/releases/tag/v0.12.1) · [CLI-prov](../tools/test_lsp_and_dwarf.ddr)
+Under Wine 8 i Kiri byggde den publicerade Windowskompilatorn 0.12.1 sin källtagg byteidentiskt med releasefilen i två generationer med ett och tre jobb. Även kompilatorn från `8c82aa0` gav samma x64-binär i alla fyra självbyggen, med SHA-256 `12f276e7c22c9f7aeeb51043128a825b8bdec0a4562109def780d376df57fb86`. CLI, språkserver, Unicode-argument, barnprocesser, Win64-callbackar, pseudoterminal och kalenderprov för tre tidszoner passerade. Ett låst Git-beroende kunde byggas offline med frånkopplat ursprung. Vid uppgradering till 0.12.1 gav en öppen exe status 3. Efter stängning gick den verifierade ersättningen att installera och den körde ett prov med resultatet 42. [Releasefiler](https://github.com/Mik-pe/dunder/releases/tag/v0.12.1) · [CLI-prov](../tools/test_lsp_and_dwarf.ddr)
 
 1. Hämta den publicerade exe-filen, kontrollera SHA-256 och bygg kompilatorn två gånger med ett jobb. Jämför filerna byte för byte. Upprepa med flera jobb.
 2. Kör [provet för `check`, `build`, `run`, `test` och språkservern](../tools/test_lsp_and_dwarf.ddr) med kompilatorsökvägen som argument. Det använder ett lokalt paket i en sökväg med mellanslag och svenska tecken. Kör även [provet för miljö, standardfel och processavbrott](../tests/fixtures/process-unicode.ddr) samt [Win64-callbacken](../tests/fixtures/ffi/windows.ddr) med argumenten `"sök väg" "" "🦔"`.

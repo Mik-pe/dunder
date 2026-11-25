@@ -3,6 +3,11 @@
 Samla nya mätresultat här med revision, arbetslast och mätvärden.
 Tidigare körrecept finns i Git-historiken.
 
+Den 25 november mättes rena och oförändrade byggen av Tabell, HTTP-servern
+och en terminalräknare. Serien omfattar även privata ändringar, ett blandat
+korpus på 123 188 rader och kompilatorns självbygge.
+[Projektbyggen med median, p95 och råprover](compiler/2026-11-25-project-builds/README.md)
+
 Rader och kolumner kördes med samma kompilatorrevision på Apple M5 samt i
 en lokal, översatt Linux-gäst för x86-64. [Mätvärden och råprover](layout/2026-11-22/README.md)
 

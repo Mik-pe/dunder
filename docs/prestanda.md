@@ -3,7 +3,7 @@
 Målet för standardprofilen är minst 100 000 källrader per sekund vid ett
 rent bygge och konkurrenskraftig körprestanda med säkerhetskontrollerna
 påslagna. Använd samma kompilatorrevision och profil för båda mätningarna.
-[Mätverktyg](../benchmarks/README.md) · [Daterade resultat](../benchmarks/results.md)
+[Mätverktyg](../benchmarks/README.md) · [Projektbyggen på Apple M5 den 25 november](../benchmarks/compiler/2026-11-25-project-builds/README.md) · [Daterade resultat](../benchmarks/results.md)
 
 ## Från kommando till färdig ARM64-binär
 
