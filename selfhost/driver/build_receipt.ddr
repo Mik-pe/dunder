@@ -1,16 +1,16 @@
 capability filesystem
 import cache_io
 import cli
+import manifest
 import modules
 import paths
-import ..frontend.lexer
 import std.bytes as bytes
 import std.fs as fs
-import std.text as text
+import std.wire as wire
 import sys
 
-pub struct Receipt { path: string, key: string }
-pub fn empty() -> Receipt { Receipt { path: "", key: "" } }
+pub struct Receipt { path: string, objects: string, key: string, directory: string }
+pub fn empty() -> Receipt { Receipt { path: "", objects: "", key: "", directory: "" } }
 
 fn number(out: &mut []u8, value: i32) { bytes.append_le(&mut out, i64(value), 4) }
 fn field(out: &mut []u8, value: string) {
@@ -36,8 +36,7 @@ fn cache_directory() -> string {
     paths.join(home, ".cache")
 }
 
-pub fn prepare(options: &cli.Options, loaded: &modules.Loaded, tokens: &lexer.Tokens, host: i32) -> Receipt {
-    if tokens.kinds.len < 512 { return empty() }
+pub fn prepare(options: &cli.Options, host: i32) -> Receipt {
     home := cache_directory()
     cwd := fs.cwd()
     if !paths.is_absolute(home) || !cwd.ok { return empty() }
@@ -45,50 +44,122 @@ pub fn prepare(options: &cli.Options, loaded: &modules.Loaded, tokens: &lexer.To
     if identity == "" { return empty() }
     mut raw: []u8 = []
     field(&mut raw, identity)
+    field(&mut raw, cwd.value)
     number(&mut raw, options.platform)
     number(&mut raw, sys.arg_count() - 1)
     for i in 1..sys.arg_count() { field(&mut raw, sys.arg(i)) }
     field(&mut raw, options.input)
-    strings(&mut raw, &loaded.paths)
-    strings(&mut raw, &loaded.sources)
-    strings(&mut raw, &loaded.symbols)
-    strings(&mut raw, &loaded.json_symbols)
-    strings(&mut raw, &loaded.embed_blob_digests)
-    numbers(&mut raw, &loaded.module_caps)
-    numbers(&mut raw, &loaded.map_starts)
-    numbers(&mut raw, &loaded.map_files)
-    numbers(&mut raw, &loaded.map_offsets)
-    number(&mut raw, tokens.kinds.len)
-    for i in 0..tokens.kinds.len {
-        raw.push(u8(i32(tokens.kinds[i])))
-        number(&mut raw, tokens.starts[i])
-        field(&mut raw, tokens.texts[i])
-    }
+    strings(&mut raw, &options.deps.pkg_dirs)
+    strings(&mut raw, &options.deps.pkg_entries)
+    numbers(&mut raw, &options.deps.pkg_caps)
+    strings(&mut raw, &options.deps.pkg_labels)
+    numbers(&mut raw, &options.deps.edge_owners)
+    strings(&mut raw, &options.deps.edge_names)
+    numbers(&mut raw, &options.deps.edge_targets)
     output := paths.join(cwd.value, options.output)
+    project := paths.join(cwd.value, options.input)
     Receipt { path: paths.join(home, "dunder/builds") + "/" + cache_io.digest(output),
-        key: cache_io.host_hash(&raw, host) }
+        objects: paths.join(home, "dunder/objects") + "/" + cache_io.digest(project + ":" + options.platform.str()),
+        key: cache_io.host_hash(&raw, host), directory: cwd.value }
 }
 
-pub fn lookup(receipt: &Receipt, output: string, native_executable: bool, host: i32) -> Option<string> {
+pub fn lookup(receipt: &Receipt, options: &cli.Options, output: string, native_executable: bool, host: i32) -> Option<string> {
     if receipt.path == "" { return .None }
     info := sys.metadata(output)
     if !info.is_file || fs.is_symlink(output) { return .None }
     if native_executable && !target_is("windows") && info.mode.bit_and(u32(4095)) != u32(493) { return .None }
-    prefix := receipt.key + info.size.str() + "\n"
-    stored := sys.read_text_limit(receipt.path, 262400)
-    header_end := prefix.len + 128
-    if !stored.ok || stored.value.len <= header_end || stored.value[header_end] != 10 ||
-        !text.starts_with(stored.value, prefix) { return .None }
-    data := sys.read_u8_limit(output, info.size)
-    if !data.ok { return .None }
-    warnings := stored.value[header_end + 1..stored.value.len]
-    header := prefix + cache_io.host_hash(&data.value, host) + cache_io.digest(warnings)
-    if !text.starts_with(stored.value, header) { return .None }
+    stored := sys.read_u8_limit(receipt.path, 4194304)
+    if !stored.ok || stored.value.len < 64 { return .None }
+    end := stored.value.len - 64
+    digest := bytes.decode_range(&stored.value, end, stored.value.len).unwrap_or_default()
+    mut payload := move stored.value
+    payload.truncate(end)
+    if cache_io.host_hash(&payload, host) != digest { return .None }
+    mut r := wire.Reader::new()
+    if r.read_str(&payload) != receipt.key || r.read_i64_le(&payload) != info.size { return .None }
+    image_digest := r.read_str(&payload)
+    warnings := r.read_str(&payload)
+    while r.ok && r.remaining(&payload) > 0 {
+        kind := r.read_u8(&payload)
+        path := r.read_str(&payload)
+        if !r.ok || path == "" { return .None }
+        if kind == 0 || kind == 4 {
+            if sys.metadata(path).is_file != (kind == 4) { return .None }
+        } else if kind == 1 {
+            expected := r.read_str(&payload)
+            if expected == "" || cache_io.root_from(receipt.directory, path) != expected { return .None }
+        } else if kind == 2 {
+            size := r.read_i64_le(&payload)
+            expected := r.read_str(&payload)
+            stat := sys.metadata(path)
+            if expected.len != 64 || !stat.is_file || stat.size != size { return .None }
+            input := sys.read_u8_limit(path, size)
+            if !input.ok || cache_io.host_hash(&input.value, host) != expected { return .None }
+        } else if kind == 3 {
+            expected := r.read_str(&payload)
+            root := manifest.package_dir(path, &options.deps.pkg_dirs, &options.deps.pkg_entries)
+            canonical := if root != "" { cache_io.root_from(receipt.directory, root) } else { "" }
+            if canonical != expected { return .None }
+        } else { return .None }
+    }
+    if !r.finish(&payload) { return .None }
+    image := sys.read_u8_limit(output, info.size)
+    if !image.ok || cache_io.host_hash(&image.value, host) != image_digest { return .None }
+    if target_is("macos") && !sys.same_file(".", receipt.directory) { return .None }
     .Some(warnings)
 }
 
-pub fn record(receipt: &Receipt, image: &[]u8, warnings: string, host: i32) {
-    if receipt.path == "" || warnings.len > 262144 || !cli.prepare_parent(receipt.path) { return }
-    header := receipt.key + image.len.str() + "\n" + cache_io.host_hash(&image, host) + cache_io.digest(warnings)
-    _ := fs.write_private_text_atomic(receipt.path, header + "\n" + warnings)
+pub fn record(receipt: &Receipt, inputs: &modules.BuildInputs, image: &[]u8, warnings: string, host: i32) {
+    if receipt.path == "" || !inputs.tracking || warnings.len > 262144 || !cli.prepare_parent(receipt.path) { return }
+    mut raw: []u8 = []
+    wire.put_str(&mut raw, receipt.key)
+    wire.put_i64_le(&mut raw, i64(image.len))
+    wire.put_str(&mut raw, cache_io.host_hash(&image, host))
+    wire.put_str(&mut raw, warnings)
+    for i in 0..inputs.files.len() {
+        path := inputs.files.key_at(i)
+        exists := inputs.files.value_at(i)
+        if exists && inputs.contents.contains(path) { continue }
+        raw.push(if exists { u8(4) } else { u8(0) })
+        wire.put_str(&mut raw, path)
+    }
+    for i in 0..inputs.resolved.len() {
+        raw.push(1)
+        wire.put_str(&mut raw, inputs.resolved.key_at(i))
+        wire.put_str(&mut raw, inputs.resolved.value_at(i))
+    }
+    for i in 0..inputs.contents.len() {
+        raw.push(2)
+        wire.put_str(&mut raw, inputs.contents.key_at(i))
+        content := inputs.contents.value_at(i)
+        wire.put_i64_le(&mut raw, content.size)
+        wire.put_str(&mut raw, content.digest)
+    }
+    for i in 0..inputs.packages.len() {
+        raw.push(3)
+        wire.put_str(&mut raw, inputs.packages.key_at(i))
+        wire.put_str(&mut raw, inputs.packages.value_at(i))
+    }
+    if raw.len > 4194304 - 64 { return }
+    digest := cache_io.host_hash(&raw, host)
+    bytes.append_utf8(&mut raw, digest)
+    _ := fs.write_private_atomic(receipt.path, &raw)
+}
+
+@test fn invalidated_build_leaves_the_previous_receipt_intact() {
+    temp := fs.temp_dir("dunder-receipt-")
+    assert(temp.ok)
+    defer { _ := fs.remove_all(temp.value) }
+    receipt := Receipt { path: paths.join(temp.value, "receipt"), objects: "", key: "fixture", directory: temp.value }
+    image: []u8 = [1, 2, 3]
+    mut inputs := modules.build_inputs()
+    inputs.tracking = true
+    host := if target_is("macos") { 0 } else { 1 }
+    record(&receipt, &inputs, &image, "before", host)
+    saved := sys.read_u8(receipt.path)
+    assert(saved.ok && saved.value.len > 64)
+    inputs.tracking = false
+    record(&receipt, &inputs, &image, "after", host)
+    reopened := sys.read_u8(receipt.path)
+    assert(reopened.ok && bytes.equal(&saved.value, &reopened.value))
 }

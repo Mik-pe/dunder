@@ -315,6 +315,11 @@ element stöder `Eq`, `Ord` och `Hash` på samma villkor. Standardvärdet för
 `[]T` är en tom array när `T: Storable`. En tupel kan skapas med `Default`
 när varje elementtyp har ett standardvärde.
 
+En trait kan implementeras för alla fasta arraylängder med
+`impl Trait for [T; N] where T: ...`. Elementtypen `T` och längden `N` är
+tillgängliga i metoden. `Self::from_array(move values)` tar en ägd `[]T`
+av samma längd. Vid längdskillnad stoppar programmets assertionskontroll.
+
 Structar och enum kan dessutom automatiskt härleda implementationer med
 `@derive(Eq, Hash, Display, Default)` samt JSON-serialisering med
 `@derive(Encode, Decode)` (kräver `std.json`).
@@ -361,7 +366,11 @@ Temporära uttryck får lånas direkt vid anrop, exempelvis `read(&f())` och
 som lokala referenser. Lokala skrivlån skrivs `r := &mut value`. En funktion
 kan returnera ett lån från en parameter. Ett returnerat skrivlån kräver en
 muterbar källparameter. Finns det flera möjliga källor anger `from namn`
-vilken parameter returvärdet lånar från.
+vilken parameter returvärdet lånar från. En post eller enum som lånar från
+flera delade parametrar kan ange dem tillsammans med `from (a, b)`.
+Anroparen håller båda ägarna lånade tills returvärdet är färdiganvänt.
+En funktionstyp anger samma kontrakt med positioner, exempelvis
+`fn(&i32, &i32) -> Par from (1, 2)`.
 
 ```dunder
 fn tail(values: &[]i32) -> &[]i32 { &values[1..] }
@@ -476,6 +485,10 @@ uttrycklig typ, exempelvis `x: i32 = ...`.
 Ett ägt slutvärde flyttas ut innan grenens `defer` körs och dess lokaler
 städas. Grenen får använda lokala lån. Kompilatorn avvisar ett lån som
 grenens slutvärde.
+
+En kvalificerad variant med nyttolast kan användas som funktion. För
+`enum Bredd { Fast(u16), Fyll }` har `Bredd.Fast` typen
+`fn(u16) -> Bredd`. Konstruktorer tar ägda nyttolaster med `move`.
 
 För en enum kan ett `match`-uttryck välja värde efter variant och binda
 variantens payload (`v` eller `mut v` när värdet får ägas/muteras) eller
@@ -637,6 +650,10 @@ begynnelsebokstav i modulen i stället för att binda hela modulen som ett alias
 ger samma användning utan modulprefix, inklusive metodanrop som `Map::new()`,
 och följer modulens vanliga `pub`-synlighet och kapabilitetskontroll.
 Sökvägar med liten begynnelsebokstav fortsätter att importera modulen.
+
+Med `pub type Step = state.Phase` kan en modul exportera en namngiven
+struct eller enum under ett annat namn. Aliaset betecknar samma typ i
+signaturer, konstruktorer och mönster. Utan `pub` är aliaset lokalt.
 
 Den första importen läser `math.ddr` bredvid den importerande filen. Den andra
 läser `geometry/vector.ddr` relativt samma fil. Sökningen beror inte på
@@ -992,6 +1009,12 @@ Utan fil väljer `dunder check`, `build` och `run` manifestets `root`.
 och annars `root`. För en uttrycklig testfil används `dunder check fil.ddr`.
 
 ## UTF-8-strängar och runes
+
+En lokal vy kan låna direkt från en strängkonstant med `LABEL.as_str()`.
+Metoden `hash()` på `&str` använder samma UTF-8-byte som en ägd sträng.
+`std.text.view.scalar_at(vy, byteindex)` ger `.Some((skalär, nästa_byteindex))`
+vid en skalärs början. Vid strängslut, utanför vyn eller på en fortsättningsbyte
+blir resultatet `.None`.
 
 ```dunder
 fn greet(name: string) -> string { "Hej, " + name + "!" }

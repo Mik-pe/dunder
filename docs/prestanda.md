@@ -34,6 +34,15 @@ Verktyget jämför varma inkrementella byggen med separata cacher.
 Rapporten sparar råvärden, median, p95, binärernas SHA-256 och cacheutfall
 från en separat körning. Byggresultaten kontrolleras mot rena byggen.
 
+Det blandade genererade korpuset har 22 moduler med interna och importerade anrop, lånade arrayer, delad postlayout, heltalskod, grenar och loopar. Dess 1 042 funktioner ger summan 474 148. Följande prov kör ett jobb och autoläge från nya processer med varm OS-filcache. Varje omgång börjar med tom kompileringscache och tom utdatakatalog. Först ändras returvärdet i en privat funktion med en anropare. Sedan ändras en liten privat funktion som kan inlinas hos 50 anropare. Varje omgång använder nya returvärden. En ändrad postlayout jämförs byte för byte med ett rent bygge av samma källor. Låsta beroendens källor får ligga kvar i Dunders Git-katalog.
+
+```sh
+dunder run tools/performance_mixed.ddr -- build/mixed-input
+dunder run tools/performance_project.ddr -- /sökväg/till/dunder build/mixed-input 30 mixed
+dunder run tools/performance_project.ddr -- /sökväg/till/dunder ../dunder-hundmat/tabell 30
+dunder run tools/performance_project.ddr -- /sökväg/till/dunder . 30 selfhost
+```
+
 ## Vad det innebär att mäta sig med C och C++
 
 Föreslagen första gräns är ett geometriskt medel på högst **1,10×** referensens körtid och inget enskilt arbetsfall över **1,25×**. En faktor på 1,10 betyder tio procent längre körtid för Dunder. Gränsen gäller den publicerade sviten. Den gör en bred ambition möjlig att pröva utan att en snabb innerloop får representera alla program.

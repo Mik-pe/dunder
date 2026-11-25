@@ -54,6 +54,12 @@ fn main() {
 läsning. Tom indata ger `Incomplete`. Efter en skalär kan resten av
 bufferten innehålla fler tecken.
 
+`std.text.lower_unicode(text)` följer Unicodes språkoberoende regler för gemener.
+Exempelvis blir `İ` två skalärer (U+0069 U+0307), och `ΟΣ` blir `ος`.
+Generera om tabellen med `dunder run tools/lowercase_data.ddr -- KATALOG stdlib/text/lowercase_data.ddr`.
+Katalogen ska innehålla `UnicodeData.txt`, `SpecialCasing.txt` och `DerivedCoreProperties.txt` från Unicode 17.0.0.
+[Unicode 17, avsnitt 3.13](https://www.unicode.org/versions/Unicode17.0.0/core-spec/chapter-3/#G33992) · [Databas](https://www.unicode.org/Public/17.0.0/ucd/) · [Licens](../tests/fixtures/unicode-17/LICENSE.txt)
+
 `std.text.graphemes(text)` lånar en UTF-8-sträng. Varje element har
 `start()` och `end()` som bytepositioner och `as_str()` för den lånade texten.
 Iteratorn följer reglerna för utökade grafem i Unicode 17.0.0.
@@ -146,6 +152,12 @@ målets blockgräns ger `.InvalidCapacity`. Poolbrist och en nekad
 Wasm-minnesökning ger `.OutOfMemory`. Status lagras som en skalär enum.
 Det går därför att läsa och matcha felet även när heapen är full.
 Typen finns i preluden och som `std.array.ReserveStatus`.
+
+`array.resize_with(&mut values, length, make)` anropar konstruktorn en gång
+per nytt element och tar emot ägda resurser. Vid krympning släpps överskottet.
+`array.repeat(move value, count)` klonar de första `count - 1` exemplaren
+och flyttar det sista. Noll ger en tom array.
+
 
 En växande strängarray tar ägarskap om elementet. `a.push(move text)`
 flyttar en befintlig strängägare. `a.push(text.clone())` behåller `text`
@@ -266,12 +278,12 @@ du åt både nyttolasten i `.Ok(value)` och felet i `.Err(error)`.
 | --- | --- |
 | Preludium (`runtime/prelude`) | Inbyggda traits `Ordering` (`Less`, `Equal`, `Greater`), `Eq`, `Ord`, `Hash`, `Display`, `Default`, `Option<T>` (`Some(T)`, `None` med `is_some`/`is_none`/`unwrap`/`unwrap_or`/`map`/`ok_or`/`?`), `Result<T, E>` (med `is_ok`/`is_err`/`unwrap`/`unwrap_or`/`unwrap_or_default`/`map`/`map_err`/`and_then`/`ok`, `.Ok`/`.Err` utan parenteser för `()`, samt villkorliga `Eq`/`Ord`/`Hash`/`Display`) och implementationer för primitiver, `[]T` och tupler. |
 | `std.cmp` | Trait-generisk ordning och gränser: `min<T>`, `max<T>`, `clamp<T>` (`T: Ord + Storable`), `Ordering`/`Eq`/`Ord` (re-exporterade) samt omslagstypen `Reverse<T>` med villkorliga `Eq`, `Ord`, `Hash`, `Display`, `Default` och `Sendable`. |
-| `std.array` | `ints`, `strings`, `sum` samt generiska algoritmer (`reverse`, `sort`, `sort_by`, `is_sorted`, `binary_search`, `contains`, `index_of`, `equal`, `min_index`, `max_index`, `dedup`, `append`, `fill`, `resize`, `join`) ovanpå `Ord`/`Eq`/`Clone`/`Display`. `sort` och `sort_by` använder introsort på plats med heapsort-fallback, O(n log n); strängar jämförs som UTF-8-byte. |
+| `std.array` | `ints`, `strings`, `sum` samt generiska algoritmer (`reverse`, `sort`, `sort_by`, `is_sorted`, `binary_search`, `contains`, `index_of`, `equal`, `min_index`, `max_index`, `dedup`, `append`, `fill`, `resize`, `resize_with`, `repeat`, `join`) ovanpå `Ord`/`Eq`/`Clone`/`Display`. `sort` och `sort_by` använder introsort på plats med heapsort-fallback, O(n log n); strängar jämförs som UTF-8-byte. |
 | `std.map` | [`Map<K, V>`](#generiska-samlingar) (`K: Hash + Storable`, `V: Storable`) med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.set` | [`Set<K>`](#generiska-samlingar) (`K: Hash + Storable`) ovanpå `Map<K, bool>` med `Default`, villkorlig `Eq` och `Sendable`. |
 | `std.hash` | `hash(text)`, `mix`, `combine`, `of<T: Hash + Storable>`, `Hash` och `Hasher` (med `Default`, `.write_u64`, `.write_i64`, `.write_bytes`, `.write_str`, `.finish`). |
-| `std.text` | `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `replace`, ASCII-`lower`/`upper`, `pad_left`/`pad_right`, `split`, `trim`. Utfyllnaden upprepar mönstret tills strängen når önskat antal Unicode-skalärer. Ett tomt mönster ger mellanslag och en längre indatasträng behåller sin längd. |
-| `std.text.view` | Nollallokerande `&str`-vyhjälpare: `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `trim_start`, `trim_end`, `trim`, `strip_prefix`, `strip_suffix`, `before`, `after`. |
+| `std.text` | `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `replace`, ASCII-`lower`/`upper`, `lower_unicode`, `pad_left`/`pad_right`, `split`, `trim`. Utfyllnaden upprepar mönstret tills strängen når önskat antal Unicode-skalärer. Ett tomt mönster ger mellanslag och en längre indatasträng behåller sin längd. |
+| `std.text.view` | Nollallokerande `&str`-vyhjälpare: `starts_with`, `ends_with`, `find` (`Option<i32>`), `contains`, `trim_start`, `trim_end`, `trim`, `strip_prefix`, `strip_suffix`, `before`, `after`, `scalar_at`. |
 | `std.path` | Sökvägar utan disk-I/O. Normalisering bevarar enhetsrötter som `C:/` och nätverksresurser som `//server/share`. Modulen innehåller `is_absolute`, `join`, `basename`, `dirname`, `extension` (`Option<string>`), `stem`, `with_extension` och `normalize`. |
 | `std.time` | `monotonic_ns`, `monotonic_ms`, väggklocka (`unix_now`, `unix_now_secs`, `unix_now_ms`), `UnixTime`, `DateTime`, `utc_from_unix`, `unix_from_utc`, `format_rfc3339`, `format_rfc3339_ms` och `format_http_date`. |
 | `std.signal` | Portabel signalhantering för tjänster (`Signal`: `Int`, `Pipe`, `Term`; `ignore_sigpipe`/`restore_sigpipe`, `install_shutdown_handler`, `shutdown_fd`, `shutdown_requested`, `take_shutdown_signal`, `SignalWatcher`). |
@@ -324,7 +336,8 @@ tabb, CR och LF. `parse.integer`, `parse.hex`, `parse.i64_range`, `parse.u64_ran
 och `parse.hex_u64_range` ger fel 1 för stavning och 2 för overflow; både
 i64- och u64-gränser stöds. `bytes` har även hjälpare för sökning och buffertar
 (`decode_range`, `find_byte`, `find_crlf`, `find_double_crlf`, `equals_text`,
-`equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`).
+`equals_ascii_ci`, `extend_range`, `consume_prefix`, `append_decimal`, `append_u64`).
+`append_u64` lägger den osignerade decimalskrivningen sist i bufferten.
 `bytes.decode(&data)` och `bytes.decode_range(&data, start, end)` ger
 `Result<string, sys.IoError>` och kan användas med `?`. Ett tomt intervall
 ger en tom sträng. Ett ogiltigt byteintervall ger `.InvalidArgument`.
@@ -494,6 +507,19 @@ arrayer, tal, bool och `null` ges hela JSON-tokenet, medan strängnoder ger
 det inre råa stränginnehållet utan omgivande citattecken (med eventuella
 escape-sekvenser oförändrade). Använd `Doc.raw_json(node)` när giltig
 JSON-källtext behövs för alla nodtyper, inklusive citattecken runt strängar.
+
+`Doc.members(node)` ger par av avkodad nyckel och värdenod i källordning.
+Upprepade nycklar finns med. `Doc.children(node)` ger en arrays värdenoder
+i ordning. Båda iteratorerna lånar dokumentet och går igenom barnen en gång.
+
+Med `@derive(Decode(deny_duplicate_fields))` på en struct ger andra förekomsten
+av ett känt fält fel vid nyckelns inledande citattecken. Nycklar jämförs efter
+avkodning av escape-sekvenser. Okända fält hoppas över. Vanlig `@derive(Decode)`
+använder det sista värdet för en upprepad nyckel.
+
+`[T; N]` och `(A, B)` kodas som JSON-arrayer. Avkodning kräver rätt antal
+element och kontrollerar varje elements typ. En egen kodare kan anropa
+`writer.fail(meddelande)`. Både `finish()` och `finish_bytes()` ger det första felet.
 
 ## Bitoperationer
 

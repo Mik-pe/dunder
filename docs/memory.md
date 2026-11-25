@@ -307,6 +307,16 @@ behövs; lagrade lokaler och fält på namngivna ägare kräver fortfarande
 `for value in values.iter()` lånar också; en lagrad ägande iterator skapas
 från `(move values).iter()` eller `values.clone().iter()`.
 
+`match &mut pages[i]` lånar variantens nyttolast exklusivt. I en arm som
+`.Ready(n) => { n.value += 1 }` ändras posten i den ursprungliga arrayen.
+Ett delat mönster kan lämna en strängvy från ett fält när mottagaren äger
+fältet och returkontraktet anger `from self`.
+
+Ett uppslag med returtypen `Option<&mut i32> from self` kan ge
+`.Some(&mut self.values[i])` eller `.None`. Värdet i `.Some` håller
+ägaren exklusivt lånad fram till sin sista användning. Matcha resultatet
+direkt eller använd `match move` för ett namngivet resultat.
+
 Även vanlig `match värde` (eller `match s.fält`) över en namngiven lokal eller
 ett ägt structfält tillåter att en arm flyttar ut en ägd eller `@resource`-nyttolast
 genom dess mönsterbindning (exempelvis `failure = e` i `.Err(e)`, `taken := c`
@@ -536,6 +546,10 @@ Omvandlingen från `usize` till `i32` kontrollerar att värdet ryms.
 En godkänd layout garanterar inte att värdens minne räcker.
 En HTTP-kropps bytegräns och `Capped<A>` begränsar fortfarande vad
 anroparen får förbruka oavsett adressbredd.
+
+En synkron callback kan fånga en post med lånade fält genom `fn[&post]`.
+Både posten och fältens ägare förblir lånade medan callbacken kan anropas.
+En callback som ska överleva anropet behöver äga sina fångade data.
 
 Ett konkret anrop kan knyta resultatet till ett delat lånefält med
 `from self.text`. Kompilatorn kontrollerar ursprunget vid varje retur.

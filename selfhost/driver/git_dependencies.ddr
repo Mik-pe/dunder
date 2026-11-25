@@ -243,7 +243,7 @@ fn initialize(store: &mut Store) -> bool {
     true
 }
 
-fn git(args: &[]string, local: bool) -> subprocess.Output {
+fn git_command(args: &[]string, local: bool) -> subprocess.Command {
     mut argv: []string = ["--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.quotePath=true",
         "-c", "submodule.recurse=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
         "-c", "protocol.file.allow=always", "-c", "protocol.ext.allow=never", "-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true",
@@ -259,21 +259,27 @@ fn git(args: &[]string, local: bool) -> subprocess.Output {
         cmd.set_env("GIT_CONFIG_NOSYSTEM", "1"); cmd.set_env("GIT_CONFIG_GLOBAL", "/dev/null")
         cmd.set_env("GIT_ATTR_NOSYSTEM", "1")
     }
-    cmd.exec()
+    move cmd
 }
-fn git_text(store: &mut Store, args: &[]string, local: bool, action: string) -> string {
+fn git(args: &[]string, local: bool) -> subprocess.Output { git_command(&args, local).exec() }
+fn checked_text(args: &[]string, local: bool, action: string) -> Result<string, string> {
     result := git(&args, local)
     if !result.succeeded() {
         mut detail := text.trim(result.stderr_text())
         if result.timed_out { detail = "Git command timed out" }
         if detail == "" { detail = "Git exited " + result.code.str() }
-        fail(&mut store, action + ": " + detail); return ""
+        return .Err(action + ": " + detail)
     }
-    decoded := match utf8.decode(&result.stdout) {
+    match utf8.decode(&result.stdout) {
+        .Ok(value) => .Ok(text.trim(value)),
+        .Err(_) => .Err(action + ": Git returned invalid UTF-8"),
+    }
+}
+fn git_text(store: &mut Store, args: &[]string, local: bool, action: string) -> string {
+    match checked_text(&args, local, action) {
         .Ok(value) => value,
-        .Err(_) => { fail(&mut store, action + ": Git returned invalid UTF-8"); return "" },
+        .Err(error) => { fail(&mut store, error); "" },
     }
-    text.trim(decoded)
 }
 fn contains(values: &[]string, value: string) -> bool {
     for item in &values { if item == value { return true } }
@@ -359,35 +365,63 @@ fn resolve_commit(store: &mut Store, bare: string, kind: string, reference: stri
     if !full_commit(commit) { fail(&mut store, "Git reference did not resolve to a full commit"); return "" }
     commit
 }
-fn checkout_valid(store: &mut Store, path: string, commit: string) -> bool {
+fn validate_checkout(path: string, commit: string) -> Result<(), string> {
     if fs.is_symlink(path) || !sys.metadata(path).is_dir || !stamped(path + "/.git", "dunder-checkout", commit) {
-        fail(&mut store, "Git checkout cache was changed: " + path); return false
+        return .Err("Git checkout cache was changed: " + path)
     }
     head_path := path + "/.git/HEAD"
     head := sys.read_text_limit(head_path, 128)
     if fs.is_symlink(head_path) || !head.ok || text.trim(head.value) != commit {
-        fail(&mut store, "Git checkout cache is not detached at its pinned commit: " + path); return false
+        return .Err("Git checkout cache is not detached at its pinned commit: " + path)
     }
-    tracked := git_text(&mut store, &["-C", path.clone(), "ls-files", "-v", "--cached"], true, "cannot inspect Git checkout index")
-    if !store.ok { return false }
+    tracked := checked_text(&["-C", path.clone(), "ls-files", "-v", "--cached"], true, "cannot inspect Git checkout index")?
     mut at := 0
     while at < tracked.len {
         if at + 1 >= tracked.len || tracked[at] != 72 || tracked[at + 1] != 32 {
-            fail(&mut store, "Git dependency cache has nonstandard index flags: " + path); return false
+            return .Err("Git dependency cache has nonstandard index flags: " + path)
         }
         while at < tracked.len && tracked[at] != 10 { at += 1 }
         at += 1
     }
-    changes := git_text(&mut store, &["-C", path.clone(), "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"], true, "cannot inspect Git checkout changes")
-    if !store.ok { return false }
+    changes := checked_text(&["-C", path.clone(), "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"], true, "cannot inspect Git checkout changes")?
     mut pinned := false; mut detached := false
     for line in text.split(changes, "\n") {
         if line == "# branch.oid " + commit { pinned = true }
         else if line == "# branch.head (detached)" { detached = true }
-        else if !text.starts_with(line, "# ") { fail(&mut store, "Git dependency cache has local changes: " + path); return false }
+        else if !text.starts_with(line, "# ") { return .Err("Git dependency cache has local changes: " + path) }
     }
-    if !pinned || !detached { fail(&mut store, "Git checkout cache is not detached at its pinned commit: " + path); return false }
+    if !pinned || !detached { return .Err("Git checkout cache is not detached at its pinned commit: " + path) }
+    .Ok
+}
+fn ensure_pin(store: &mut Store, bare: string, url: string, commit: string) -> bool {
+    if !has_commit(bare, commit) {
+        if store.offline { fail(&mut store, "pinned Git object is not cached; --offline cannot fetch " + commit); return false }
+        if !fetch(&mut store, bare, url) { return false }
+        if !has_commit(bare, commit) {
+            _ := git_text(&mut store, &["--git-dir=" + bare, "fetch", "--no-tags", "origin", commit.clone()], false, "cannot fetch pinned Git commit")
+            if !store.ok { return false }
+            if !has_commit(bare, commit) { fail(&mut store, "pinned Git commit is unavailable: " + commit); return false }
+        }
+    }
     true
+}
+fn accept_checkout(store: &mut Store, move result: Result<(), string>) -> bool {
+    match move result { .Ok => true, .Err(error) => { fail(&mut store, error); false }, }
+}
+fn check_pinned_checkout(store: &mut Store, bare: string, path: string, url: string, commit: string) -> bool {
+    mut command := git_command(&["--git-dir=" + bare, "cat-file", "-e", commit + "^{commit}"], true)
+    command.set_stdio(.Null, .Null, .Null)
+    match command.spawn() {
+        .Ok(mut child) => {
+            started := sys.now_ms()
+            result := validate_checkout(path, commit)
+            remaining := command.timeout_ms - (sys.now_ms() - started)
+            status := child.wait(if remaining < 1 { 1 } else { remaining })
+            if status.ok && status.exited && status.code == 0 { return accept_checkout(&mut store, move result) }
+        },
+        .Err(_) => {},
+    }
+    ensure_pin(&mut store, bare, url, commit) && accept_checkout(&mut store, validate_checkout(path, commit))
 }
 fn materialize(store: &mut Store, bare: string, url: string, commit: string) -> string {
     checkouts := store.cache + "/checkouts"
@@ -396,8 +430,10 @@ fn materialize(store: &mut Store, bare: string, url: string, commit: string) -> 
     if !cache_directory(&mut store, parent) { return "" }
     path := parent + "/" + commit
     if sys.metadata(path).ok || fs.is_symlink(path) {
-        if checkout_valid(&mut store, path, commit) { return path }; return ""
+        if check_pinned_checkout(&mut store, bare, path, url, commit) { return path }
+        return ""
     }
+    if !ensure_pin(&mut store, bare, url, commit) { return "" }
     temporary := stage(&mut store, "checkout")
     _ := git_text(&mut store, &["clone", "--shared", "--no-checkout", "--no-recurse-submodules", "--template=", "--", bare.clone(), temporary.clone()], true, "cannot create Git checkout")
     if store.ok {
@@ -405,7 +441,7 @@ fn materialize(store: &mut Store, bare: string, url: string, commit: string) -> 
     }
     if !store.ok { _ := fs.remove_all(temporary); return "" }
     if !stamp(temporary + "/.git", "dunder-checkout", commit) { _ := fs.remove_all(temporary); fail(&mut store, "cannot stamp Git checkout cache"); return "" }
-    if !checkout_valid(&mut store, temporary, commit) { _ := fs.remove_all(temporary); return "" }
+    if !accept_checkout(&mut store, validate_checkout(temporary, commit)) { _ := fs.remove_all(temporary); return "" }
     if !sys.rename(temporary, path).ok { _ := fs.remove_all(temporary); fail(&mut store, "cannot publish Git checkout cache"); return "" }
     path
 }
@@ -434,15 +470,6 @@ pub fn checkout(store: &mut Store, url: string, requested_kind: string, referenc
         commit = resolve_commit(&mut store, bare, kind, reference)
     }
     if !store.ok { return "" }
-    if !has_commit(bare, commit) {
-        if store.offline { fail(&mut store, "pinned Git object is not cached; --offline cannot fetch " + commit); return "" }
-        if !fetch(&mut store, bare, url) { return "" }
-        if !has_commit(bare, commit) {
-            _ := git_text(&mut store, &["--git-dir=" + bare, "fetch", "--no-tags", "origin", commit.clone()], false, "cannot fetch pinned Git commit")
-            if !store.ok { return "" }
-            if !has_commit(bare, commit) { fail(&mut store, "pinned Git commit is unavailable: " + commit); return "" }
-        }
-    }
     path := materialize(&mut store, bare, url, commit)
     if !store.ok { return "" }
     store.urls.push(url.clone()); store.kinds.push(move kind); store.references.push(reference.clone()); store.commits.push(move commit); store.paths.push(path.clone())

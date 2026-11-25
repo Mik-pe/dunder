@@ -303,9 +303,10 @@ fn check_agent_error_record(stdout_text: string) -> harness.AgentError {
 
 fn project_rebuilds(parent: &Project) -> bool {
     p := Project { compiler: parent.compiler.clone(), root: parent.path("rebuild") }
-    if !p.write("dunder.toml", "name = \"rebuild\"\nroot = \"main.ddr\"\n") ||
+    if !p.write("dunder.toml", "name = \"rebuild\"\nroot = \"main.ddr\"\n[dependencies]\nleaf = { path = \"library\" }\n") ||
         !p.write("main.ddr", "import leaf\nimport std.text\nfn main() -> i32 { unused := 123; print(text.trim(@embed_file(\"msg\"))); data := @embed_bytes(\"value\"); leaf.answer() + i32(data[0]) }") ||
-        !p.write("leaf.ddr", "pub fn answer() -> i32 { 1 }") ||
+        !p.write("library/dunder.toml", "name = \"library\"\nroot = \"leaf.ddr\"\n") ||
+        !p.write("library/leaf.ddr", "pub fn answer() -> i32 { 1 }") ||
         !p.write("msg", "first") || !p.write_bytes("value", &[u8(2)]) { return false }
     output := p.path("app")
     args: []string = ["build", "-o", output.clone()]
@@ -325,8 +326,24 @@ fn project_rebuilds(parent: &Project) -> bool {
         !run_bin(output, [], p.root, 3, 10000, &mut out) || out.stdout_text() != "other\n" { return harness.fail("stale embedded text") }
     if !p.write_bytes("value", &[u8(5)]) || !p.call(args.clone(), 0, &mut out) ||
         !run_bin(output, [], p.root, 6, 10000, &mut out) { return harness.fail("stale embedded bytes") }
+    if !p.write("library/leaf.ddr", "pub fn answer() -> i32 { 3 }") || !p.call(args.clone(), 0, &mut out) ||
+        out.stderr_text() != warnings || !run_bin(output, [], p.root, 8, 10000, &mut out) { return harness.fail("stale imported function") }
     if !p.write("leaf.ddr", "pub fn answer() -> i32 { 4 }") || !p.call(args.clone(), 0, &mut out) ||
-        !run_bin(output, [], p.root, 9, 10000, &mut out) { return harness.fail("stale imported function") }
+        !run_bin(output, [], p.root, 9, 10000, &mut out) { return harness.fail("new local module did not shadow dependency") }
+    if !sys.remove_file(p.path("leaf.ddr")).ok ||
+        !p.write("library/leaf.ddr", "pub fn answer() -> i32 { 4 }") ||
+        !p.call(args.clone(), 0, &mut out) { return harness.fail("removing local module did not restore dependency") }
+    if !target_is("windows") {
+        if !parent.write("outside", "other") || !sys.remove_file(p.path("msg")).ok ||
+            !fs.symlink("../outside", p.path("msg")).ok || !p.call(args.clone(), 1, &mut out) ||
+            !text.contains(out.stderr_text(), "escapes the package root") {
+            return harness.fail("cached embedded text crossed its package root")
+        }
+        if !sys.remove_file(p.path("msg")).ok || !p.write("msg", "other") { return false }
+    }
+    clean := p.path("clean-control")
+    if !p.call(["build", "main.ddr", "-o", clean.clone()], 0, &mut out) ||
+        !same_file_bytes(output, clean) { return harness.fail("incremental project image differs from clean control") }
     image := sys.read_u8(output)
     if !image.ok || image.value.len < 4 { return harness.fail("cannot read test executable") }
     mut changed := move image.value
@@ -340,7 +357,22 @@ fn project_rebuilds(parent: &Project) -> bool {
     true
 }
 
-fn modules_and_manifest(p: &Project) -> bool {
+fn relocated_directory(p: &Project, repo_root: string) -> bool {
+    stale := p.path("cwd")
+    moved := p.path("moved")
+    if !p.write("cwd/source.ddr", "fn main() {}") || !sys.rename(stale, moved).ok ||
+        !sys.mkdir(stale).ok || !fs.hard_link(moved + "/source.ddr", stale + "/source.ddr").ok {
+        return harness.fail("could not prepare relocated directory with a shared file")
+    }
+    mut out := harness.empty_output()
+    image := p.path("cwd-probe")
+    fixture := repo_root + "/tests/fixtures/compiler-relocated-cwd.ddr"
+    p.call(["build", fixture, "-o", image.clone()], 0, &mut out) &&
+        run_bin(image, [stale], moved, 0, 10000, &mut out)
+}
+
+fn modules_and_manifest(p: &Project, repo_root: string) -> bool {
+    if target_is("macos") && !relocated_directory(&p, repo_root) { return false }
     if !project_rebuilds(&p) { return false }
     if !p.write("dunder.toml", "name = \"consumer\"\nroot = \"main.ddr\"\ntest_root = \"cases.ddr\"\n") { return false }
     if !p.write("main.ddr", "import sys\nimport link as lib\nfn main()->i32{print(sys.arg(1));return lib.answer()}\n") { return false }
@@ -1039,7 +1071,55 @@ fn inline_build_doc(p: &Project, mode: string, name: string, cached: bool, scala
     true
 }
 
+fn fragment_catalog_edits(parent: &Project) -> bool {
+    p := Project { compiler: parent.compiler.clone(), root: parent.path("catalog-edits") }
+    if !p.write("dunder.toml", "name = \"catalog-edits\"\nroot = \"main.ddr\"\n") { return false }
+    mut functions: []u8 = []
+    mut calls: []u8 = []
+    for n in 0..260 {
+        bytes.append_utf8(&mut functions, f"fn lane{n}(x:i64)->i64{{x+{n}}}\n")
+        bytes.append_utf8(&mut calls, f"    sum += lane{n}(0)\n")
+    }
+    body := "fn middle(x:i64)->i64{leaf(x)+1}\n" + bytes.decode(&functions).unwrap() +
+        "fn warn(x:i64)->i64{ values:[]i64=[x]; mut n:=0; for unused in 0..1 { n+=1 }; values[0]+i64(n)-1 }\n" +
+        "fn main(){\n    mut sum := middle(3) + warn(0)\n" +
+        bytes.decode(&calls).unwrap() + "    print(sum)\n}\n"
+    cache := p.path("cache")
+    mut build := process.Command::new(p.compiler.clone(), ["build", "-o", "project"])
+    build.set_cwd(p.root.clone())
+    build.set_env(if target_is("windows") { "LOCALAPPDATA" } else { "XDG_CACHE_HOME" }, cache.clone())
+    build.set_timeout(60000)
+    mut out := harness.empty_output()
+    for edit in 1..4 {
+        leaf := if edit == 1 { "values:[]i64=[x]; values[0]+1" } else { "x+" + edit.str() }
+        gap := if edit == 3 { "\n\n" } else { "\n" }
+        if !p.write("main.ddr", "fn leaf(x:i64)->i64{" + leaf + "}" + gap + body) { return false }
+        rebuilt := build.exec()
+        if !rebuilt.succeeded() || !p.call(["build", "main.ddr", "-o", "clean"], 0, &mut out) ||
+            !text.contains(out.stderr_text(), "unused variable") || rebuilt.stderr_text() != out.stderr_text() ||
+            !same_file_bytes(p.path("project"), p.path("clean")) {
+            return harness.fail("cached catalog differs from clean build after edit " + edit.str())
+        }
+        if !run_bin(p.path("project"), [], p.root, 0, 10000, &mut out) ||
+            out.stdout_text() != (33674 + edit).str() + "\n" { return harness.fail("stale nested call") }
+    }
+    directory := cache + "/dunder/objects"
+    entries := fs.list_dir(directory).unwrap_or([])
+    if entries.len != 1 { return harness.fail("missing project fragment pack") }
+    pack := directory + "/" + entries[0] + "/functions.pack"
+    info := sys.metadata(pack)
+    if !info.is_file || info.size < 100 || (!target_is("windows") && info.mode.bit_and(u32(511)) != u32(384)) {
+        return harness.fail("fragment pack permissions or contents")
+    }
+    if !sys.write_u8(pack, &[u8(1), u8(2)]).ok || !sys.remove_file(p.path("project")).ok ||
+        !build.exec().succeeded() || !same_file_bytes(p.path("project"), p.path("clean")) || sys.metadata(pack).size < 100 {
+        return harness.fail("truncated fragment pack was not rebuilt")
+    }
+    true
+}
+
 fn inline_optimizer_controls(p: &Project) -> bool {
+    if !fragment_catalog_edits(&p) { return false }
     source := "fn step(value:i64)->i64{value*3+1}\nfn main(){print(step(2))}\n"
     if !p.write("inline.ddr", source) { return false }
     mut off_doc := json.Doc::parse_text("{}")
@@ -2328,7 +2408,7 @@ fn install_cwd_and_test_scoping(p: &Project) -> bool {
 
 fn run_named_group(name: string, p: &Project, repo_root: string) -> bool {
     if name == "worker_options" { return worker_options(&p, repo_root) }
-    if name == "modules_and_manifest" { return modules_and_manifest(&p) }
+    if name == "modules_and_manifest" { return modules_and_manifest(&p, repo_root) }
     if name == "manifest_dependencies" { return manifest_dependencies(&p) }
     if name == "install_cwd_and_test_scoping" { return install_cwd_and_test_scoping(&p) }
     if name == "bytes_big_endian_guards" { return bytes_big_endian_guards(&p) }
