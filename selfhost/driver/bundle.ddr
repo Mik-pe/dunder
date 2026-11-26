@@ -3,10 +3,21 @@ import bundle_fs as fs
 import cli
 import ..backend.macho
 import std.bytes as bytes
+import std.fs as stdfs
 import ...stdlib.bytes.utf8 as utf8
 import std.sha256 as sha
 import std.text as text
 import sys
+
+pub struct BundleConfig {
+    bundle_id: string,
+    entitlements: string,
+    frameworks: []string,
+}
+
+pub fn default_config() -> BundleConfig {
+    BundleConfig { bundle_id: "", entitlements: "", frameworks: [] }
+}
 
 fn valid_name(name: string) -> bool {
     if name == "" || name == "." || name == ".." { return false }
@@ -75,7 +86,7 @@ fn plist(name: string, executable: string, id: string, version: string) -> strin
     mut result := header()
     result = result + property("CFBundleExecutable", xml(executable))
     for key in ["CFBundleName", "CFBundleDisplayName"] { result = result + property(key, escaped) }
-    result = result + property("CFBundleIdentifier", id) + property("CFBundlePackageType", "APPL")
+    result = result + property("CFBundleIdentifier", xml(id)) + property("CFBundlePackageType", "APPL")
     result = result + property("CFBundleInfoDictionaryVersion", "6.0")
     result = result + property("CFBundleVersion", bundle_ver) + property("CFBundleShortVersionString", bundle_ver)
     result + "<key>NSHighResolutionCapable</key><true/>\n" + property("LSMinimumSystemVersion", "11.0") + "<key>NSSupportsAutomaticGraphicsSwitching</key><true/>\n</dict>\n</plist>\n"
@@ -101,14 +112,80 @@ fn base64(input: &[]u8) -> string {
     match utf8.decode(&out) { .Ok(value) => value, .Err(_) => "" }
 }
 
-struct Resources { names: []string, hashes: []string, error: string }
+struct Resources {
+    names: []string,
+    hashes: []string,
+    is_symlink: []bool,
+    symlink_targets: []string,
+    error: string,
+}
 fn before(a: string, b: string) -> bool {
     mut i := 0
     while i < a.len && i < b.len { if a[i] != b[i] { return a[i] < b[i] }; i = i + 1 }
     a.len < b.len
 }
 
-fn collect(resources: &mut Resources, base: string, relative: string, executable: string) {
+fn under_frameworks(key: string) -> bool {
+    key == "Frameworks" || text.starts_with(key, "Frameworks/")
+}
+
+fn relative_path(from_dir: string, target: string) -> string {
+    from_parts := text.split(from_dir, "/")
+    to_parts := text.split(target, "/")
+    mut common := 0
+    while common < from_parts.len && common < to_parts.len && from_parts[common] == to_parts[common] {
+        common += 1
+    }
+    mut rel := ""
+    for _ in common..from_parts.len {
+        if rel != "" { rel = rel + "/" }
+        rel = rel + ".."
+    }
+    for j in common..to_parts.len {
+        if rel != "" { rel = rel + "/" }
+        rel = rel + to_parts[j]
+    }
+    if rel == "" { return "." }
+    rel
+}
+
+fn validate_framework_symlink(path: string, canon_base: string) -> string {
+    resolved := stdfs.realpath(path)
+    if !resolved.ok || resolved.value == "" {
+        return ""
+    }
+    prefix := canon_base + "/"
+    if resolved.value != canon_base && !text.starts_with(resolved.value, prefix) {
+        return ""
+    }
+    resolved.value
+}
+
+fn dir_of(path: string) -> string {
+    mut slash := -1
+    for i in 0..path.len {
+        if path[i] == 47 { slash = i }
+    }
+    if slash <= 0 { return "." }
+    path[0..slash]
+}
+
+fn insert_entry(resources: &mut Resources, key: string, hash: string, sym: bool, target: string) {
+    mut pos := resources.names.len
+    resources.names.push(key.clone())
+    resources.hashes.push(hash.clone())
+    resources.is_symlink.push(sym)
+    resources.symlink_targets.push(target.clone())
+    while pos > 0 && before(key, resources.names[pos - 1]) {
+        resources.names.swap(pos - 1, pos)
+        resources.hashes.swap(pos - 1, pos)
+        resources.is_symlink.swap(pos - 1, pos)
+        resources.symlink_targets.swap(pos - 1, pos)
+        pos = pos - 1
+    }
+}
+
+fn collect(resources: &mut Resources, base: string, canon_base: string, relative: string, executable: string) {
     mut folder := base.clone()
     if relative != "" { folder = base + "/" + relative }
     entries := fs.entries(folder)
@@ -118,32 +195,40 @@ fn collect(resources: &mut Resources, base: string, relative: string, executable
         mut key := item.clone()
         if relative != "" { key = relative + "/" + item }
         path := base + "/" + key
-        if fs.is_link(path) { resources.error = "bundle entry is a symbolic link: " + path; return }
+        if fs.is_link(path) {
+            if !under_frameworks(key) {
+                resources.error = "bundle entry is a symbolic link: " + path; return
+            }
+            target_canon := validate_framework_symlink(path, canon_base)
+            if target_canon == "" {
+                resources.error = "framework symbolic link escapes bundle or is dangling: " + path; return
+            }
+            link_dir_canon := stdfs.realpath(dir_of(path))
+            if !link_dir_canon.ok {
+                resources.error = "cannot resolve framework link parent: " + path; return
+            }
+            rel_target := relative_path(link_dir_canon.value, target_canon)
+            insert_entry(&mut resources, key, "", true, rel_target)
+            continue
+        }
         status := sys.metadata(path)
         if key == "Info.plist" || key == executable || key == "_CodeSignature/CodeResources" {
             if !status.is_file { resources.error = "expected regular file: " + path; return }
         } else if relative == "_CodeSignature" { resources.error = "unsupported existing bundle signature file: " + path; return }
         else if status.is_dir {
-            collect(&mut resources, base, key, executable)
+            collect(&mut resources, base, canon_base, key, executable)
             if resources.error != "" { return }
         } else if status.is_file && key != "MacOS" && key != "_CodeSignature" {
             file := fs.contents(path)
             if file.error != "" { resources.error = file.error; return }
             digest := sha.digest_bytes(&file.data)
-            mut pos := resources.names.len
-            resources.names.push(key.clone())
-            resources.hashes.push(base64(&digest))
-            while pos > 0 && before(key, resources.names[pos - 1]) {
-                resources.names.swap(pos - 1, pos)
-                resources.hashes.swap(pos - 1, pos)
-                pos = pos - 1
-            }
+            insert_entry(&mut resources, key, base64(&digest), false, "")
         } else { resources.error = "unsupported bundle entry: " + path; return }
     }
 }
 
 fn resources(path: string, executable: string) -> Resources {
-    mut files := Resources { names: [], hashes: [], error: "" }
+    mut files := Resources { names: [], hashes: [], is_symlink: [], symlink_targets: [], error: "" }
     if fs.is_link(path) { files.error = "bundle must be a directory"; return files }
     status := sys.metadata(path)
     if !status.ok && status.error == 2 { return files }
@@ -154,7 +239,9 @@ fn resources(path: string, executable: string) -> Resources {
         if entry != "Contents" { files.error = "unsupported bundle entry outside Contents: " + entry; return files }
         contents := path + "/Contents"
         if fs.is_link(contents) || !sys.metadata(contents).is_dir { files.error = "Contents must be a real directory"; return files }
-        collect(&mut files, contents, "", executable)
+        canon := stdfs.realpath(contents)
+        canon_base := if canon.ok { canon.value } else { contents.clone() }
+        collect(&mut files, contents, canon_base, "", executable)
     }
     files
 }
@@ -163,7 +250,11 @@ fn envelope(files: &Resources) -> string {
     mut out: []u8 = []
     bytes.append_utf8(&mut out, header() + "<key>files</key><dict/>\n<key>files2</key><dict>\n")
     for i in 0..files.names.len {
-        bytes.append_utf8(&mut out, "<key>" + xml(files.names[i]) + "</key><dict><key>hash2</key><data>" + files.hashes[i] + "</data></dict>\n")
+        if files.is_symlink[i] {
+            bytes.append_utf8(&mut out, "<key>" + xml(files.names[i]) + "</key><dict><key>symlink</key><string>" + xml(files.symlink_targets[i]) + "</string></dict>\n")
+        } else {
+            bytes.append_utf8(&mut out, "<key>" + xml(files.names[i]) + "</key><dict><key>hash2</key><data>" + files.hashes[i] + "</data></dict>\n")
+        }
     }
     bytes.append_utf8(&mut out, "</dict>\n<key>rules</key><dict/>\n<key>rules2</key><dict>\n<key>^.*</key><true/>\n<key>^Info\\.plist$</key><dict><key>omit</key><true/><key>weight</key><real>20</real></dict>\n</dict>\n</dict>\n</plist>\n")
     match utf8.decode(&out) { .Ok(value) => value, .Err(_) => "" }
@@ -173,7 +264,60 @@ fn publish_text(path: string, value: string) -> string {
     bytes.append_utf8(&mut out, value)
     fs.publish(path, &out, false)
 }
+
+fn copy_framework_tree(src: string, dst: string, src_canon_root: string) -> string {
+    if fs.is_link(src) {
+        resolved := stdfs.realpath(src)
+        if !resolved.ok { return "framework symlink is dangling: " + src }
+        prefix := src_canon_root + "/"
+        if resolved.value != src_canon_root && !text.starts_with(resolved.value, prefix) {
+            return "framework symlink escapes framework root: " + src
+        }
+        src_dir_canon := stdfs.realpath(dir_of(src))
+        if !src_dir_canon.ok { return "cannot resolve framework symlink parent: " + src }
+        rel_target := relative_path(src_dir_canon.value, resolved.value)
+        _ := sys.remove_file(dst)
+        if !cli.prepare_parent(dst) { return "cannot create framework directory for " + dst }
+        st := stdfs.symlink(rel_target, dst)
+        if !st.ok { return "cannot create framework symlink " + dst }
+        return ""
+    }
+    meta := sys.metadata(src)
+    if !meta.ok { return "missing framework entry: " + src }
+    if meta.is_dir {
+        if !stdfs.mkdir_all(dst).ok { return "cannot create framework directory: " + dst }
+        entries := fs.entries(src)
+        if entries.error != "" { return entries.error }
+        for item in &entries.paths {
+            if !valid_name(item) { return "invalid framework filename: " + item }
+            err := copy_framework_tree(src + "/" + item, dst + "/" + item, src_canon_root)
+            if err != "" { return err }
+        }
+        return ""
+    }
+    if meta.is_file {
+        file := fs.contents(src)
+        if file.error != "" { return file.error }
+        if !cli.prepare_parent(dst) { return "cannot create framework parent for " + dst }
+        return fs.publish(dst, &file.data, meta.mode.bit_and(64) != 0)
+    }
+    "unsupported framework entry: " + src
+}
+
+fn base_name(path: string) -> string {
+    mut end := path.len
+    while end > 1 && path[end - 1] == 47 { end -= 1 }
+    mut start := 0
+    for i in 0..end { if path[i] == 47 { start = i + 1 } }
+    path[start..end]
+}
+
 pub fn publish(path: string, image: &mut []u8, sources: &[]string, signer: &macho.Signer, version: string) -> string {
+    cfg := default_config()
+    publish_configured(path, &mut image, &sources, &signer, version, &cfg)
+}
+
+pub fn publish_configured(path: string, image: &mut []u8, sources: &[]string, signer: &macho.Signer, version: string, config: &BundleConfig) -> string {
     app := name(path)
     if app == "" { return "--app output must end in a nonempty name followed by '.app'" }
     contents := path + "/Contents"
@@ -188,12 +332,21 @@ pub fn publish(path: string, image: &mut []u8, sources: &[]string, signer: &mach
             }
         }
     }
+    for fw_src in &config.frameworks {
+        fw_name := base_name(fw_src.clone())
+        if !valid_name(fw_name) { return "invalid framework path: " + fw_src }
+        fw_canon := stdfs.realpath(fw_src.clone())
+        if !fw_canon.ok { return "cannot resolve framework: " + fw_src }
+        fw_dst := contents + "/Frameworks/" + fw_name
+        err := copy_framework_tree(fw_src.clone(), fw_dst, fw_canon.value)
+        if err != "" { return err }
+    }
     files := resources(path, "MacOS/" + binary)
     if files.error != "" { return files.error }
-    id := identifier(app)
-    info := plist(app, binary, id, version)
+    id := if config.bundle_id != "" { config.bundle_id.clone() } else { identifier(app) }
+    info := plist(app, binary, id.clone(), version)
     seal := envelope(&files)
-    macho.seal_bundle(&mut image, id, info, seal, &signer)
+    macho.seal_bundle_with_entitlements(&mut image, id, info, seal, config.entitlements.clone(), &signer)
     if !cli.prepare_parent(executable) || !cli.prepare_parent(seal_path) { return "cannot create bundle directories" }
     written := fs.publish(executable, &image, true)
     if written != "" { return written }

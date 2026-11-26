@@ -2,6 +2,40 @@ import std.bytes as bytes
 import imports
 import dwarf
 
+pub struct ElfConfig {
+    libc: imports.LibcAbi,
+    interp: string,
+    rpaths: []string,
+    overrides: []imports.LibraryOverride,
+    relro: bool,
+    pie: bool,
+    gnu_hash: bool,
+}
+
+pub fn default_config() -> ElfConfig {
+    ElfConfig {
+        libc: .Glibc,
+        interp: "",
+        rpaths: [],
+        overrides: [],
+        relro: true,
+        pie: false,
+        gnu_hash: true,
+    }
+}
+
+pub fn pie_config(libc: imports.LibcAbi) -> ElfConfig {
+    ElfConfig {
+        libc: libc,
+        interp: "",
+        rpaths: [],
+        overrides: [],
+        relro: true,
+        pie: true,
+        gnu_hash: true,
+    }
+}
+
 fn u16le(output: &mut []u8, value: i32) {
     output.push(u8(value % 256)); output.push(u8(value / 256))
 }
@@ -49,17 +83,323 @@ pub fn image_for(text: &[]u8, machine: i32) -> []u8 {
     assert(output[4096] == 1 && output[4099] == 4)
 }
 
-fn phdr(out: &mut []u8, index: i32, kind: i32, flags: i32, offset: i32, size: i32, alignment: i32) {
+fn phdr_at(out: &mut []u8, base: i64, index: i32, kind: i64, flags: i32, offset: i32, size: i32, alignment: i32) {
     at := 64 + index * 56
-    imports.set_le(&mut out, at, i64(kind), 4); imports.set_le(&mut out, at + 4, i64(flags), 4)
+    imports.set_le(&mut out, at, kind, 4); imports.set_le(&mut out, at + 4, i64(flags), 4)
     imports.set_le(&mut out, at + 8, i64(offset), 8)
-    imports.set_le(&mut out, at + 16, 4194304 + i64(offset), 8); imports.set_le(&mut out, at + 24, 4194304 + i64(offset), 8)
+    vaddr := if kind == 1685382481 { i64(0) } else { base + i64(offset) }
+    imports.set_le(&mut out, at + 16, vaddr, 8); imports.set_le(&mut out, at + 24, vaddr, 8)
     imports.set_le(&mut out, at + 32, i64(size), 8); imports.set_le(&mut out, at + 40, i64(size), 8)
     imports.set_le(&mut out, at + 48, i64(alignment), 8)
 }
 
-fn tag(out: &mut []u8, key: i32, value: i32) {
-    bytes.append_le(&mut out, i64(key), 8); bytes.append_le(&mut out, i64(value), 8)
+fn tag64(out: &mut []u8, key: i64, value: i64) {
+    bytes.append_le(&mut out, key, 8); bytes.append_le(&mut out, value, 8)
+}
+
+fn elf_sysv_hash(name: string) -> i64 {
+    mut h: i64 = 0
+    for i in 0..name.len {
+        h = h.shl(4) + i64(name[i])
+        g := h.bit_and(4026531840) // 0xf0000000
+        if g != 0 { h = h.bit_xor(g.shr(24)) }
+        h = h.bit_and(g.bit_not()).bit_and(4294967295)
+    }
+    h
+}
+
+fn resolve_interp(machine: i32, config: &ElfConfig) -> string {
+    if config.interp != "" { return config.interp.clone() }
+    if config.libc == .Musl {
+        if machine == 62 { return "/lib/ld-musl-x86_64.so.1" }
+        return "/lib/ld-musl-aarch64.so.1"
+    }
+    if machine == 62 { return "/lib64/ld-linux-x86-64.so.2" }
+    "/lib/ld-linux-aarch64.so.1"
+}
+
+fn join_rpaths(rpaths: &[]string) -> string {
+    mut out := ""
+    for i in 0..rpaths.len {
+        if i > 0 { out = out + ":" }
+        out = out + rpaths[i]
+    }
+    out
+}
+
+pub fn dynamic_image_configured(text: &[]u8, specs: &[]imports.SymbolSpec,
+                                sites: &[]i32, slots: &[]i32, machine: i32, globals: i32,
+                                config: &ElfConfig) -> []u8 {
+    assert(machine == 183 || machine == 62)
+    assert(sites.len == slots.len)
+    platform := if machine == 62 { 2 } else { 1 }
+    mut out := image_for(&text, machine)
+    base: i64 = if config.pie && specs.len > 0 { 0 } else { 4194304 }
+    if config.pie && specs.len > 0 {
+        imports.set_le(&mut out, 16, 3, 2) // ET_DYN
+        imports.set_le(&mut out, 24, 4096, 8) // e_entry relative to base 0
+    }
+    data_start := imports.align(out.len, 4096)
+
+    if specs.len == 0 {
+        if globals == 0 { return out }
+        bytes.pad(&mut out, data_start - out.len + globals)
+        if machine == 183 { imports.relocate_at(&mut out, 4096, text.len, data_start, data_start, 0, &sites, &slots) }
+        else {
+            for i in 0..sites.len {
+                assert(sites[i] >= 0 && sites[i] <= text.len - 4 && slots[i] < 0)
+                at := 4096 + sites[i]
+                destination := data_start - 1 - slots[i]
+                imports.set_le(&mut out, at, i64(destination - at - 4), 4)
+            }
+        }
+        imports.set_le(&mut out, 56, 3, 2)
+        phdr_at(&mut out, 4194304, 0, 1, 5, 0, data_start, 4096)
+        phdr_at(&mut out, 4194304, 1, 1, 6, data_start, out.len - data_start, 4096)
+        phdr_at(&mut out, 4194304, 2, 1685382481, 6, 0, 0, 16)
+        return out
+    }
+
+    got_off := data_start
+    got_bytes := imports.align(specs.len * 8, 16)
+    bytes.pad(&mut out, data_start - out.len + got_bytes)
+
+    table := imports.resolve_table(&specs, platform, config.libc, &config.overrides)
+
+    // Check if any symbol carries ELF symbol versioning
+    mut has_versions := false
+    for s in &specs {
+        if s.version_name != "" { has_versions = true; break }
+    }
+
+    // Collect distinct version groups (lib -> distinct version names)
+    mut ver_libs: []string = []
+    mut ver_lib_offs: []i32 = []
+    mut ver_names: []string = []
+    mut ver_name_lib: []i32 = []
+    mut ver_name_offs: []i32 = []
+    mut sym_ver_idx: []i32 = []
+    if has_versions {
+        for i in 0..specs.len {
+            if specs[i].version_name == "" {
+                sym_ver_idx.push(1) // VER_NDX_GLOBAL
+                continue
+            }
+            vlib := if specs[i].version_lib != "" {
+                imports.resolve_library_with_overrides(specs[i].version_lib.clone(), platform, config.libc, &config.overrides).name
+            } else {
+                table.names[table.ordinals[i] - 1].clone()
+            }
+            mut lidx := -1
+            for l in 0..ver_libs.len {
+                if ver_libs[l] == vlib { lidx = l; break }
+            }
+            if lidx < 0 {
+                lidx = ver_libs.len
+                ver_libs.push(move vlib)
+            }
+            vname := specs[i].version_name.clone()
+            mut vidx := -1
+            for v in 0..ver_names.len {
+                if ver_name_lib[v] == lidx && ver_names[v] == vname { vidx = v; break }
+            }
+            if vidx < 0 {
+                vidx = ver_names.len
+                ver_names.push(move vname)
+                ver_name_lib.push(lidx)
+            }
+            sym_ver_idx.push(2 + vidx)
+        }
+    }
+
+    // .dynstr
+    string_table := out.len
+    out.push(0)
+    mut needed: []i32 = []
+    for library in &table.names {
+        needed.push(out.len - string_table)
+        bytes.append_utf8(&mut out, library.clone()); out.push(0)
+    }
+    runpath_str := join_rpaths(&config.rpaths)
+    mut runpath_off := 0
+    if runpath_str.len > 0 {
+        runpath_off = out.len - string_table
+        bytes.append_utf8(&mut out, runpath_str); out.push(0)
+    }
+    mut names: []i32 = []
+    for spec in &specs {
+        names.push(out.len - string_table)
+        bytes.append_utf8(&mut out, spec.name.clone()); out.push(0)
+    }
+    if has_versions {
+        for vlib in &ver_libs {
+            mut found := -1
+            for ti in 0..table.names.len {
+                if table.names[ti] == vlib { found = needed[ti]; break }
+            }
+            if found >= 0 { ver_lib_offs.push(found) }
+            else {
+                ver_lib_offs.push(out.len - string_table)
+                bytes.append_utf8(&mut out, vlib.clone()); out.push(0)
+            }
+        }
+        for vname in &ver_names {
+            ver_name_offs.push(out.len - string_table)
+            bytes.append_utf8(&mut out, vname.clone()); out.push(0)
+        }
+    }
+    string_size := out.len - string_table
+    bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
+
+    // .dynsym
+    dynsym := out.len
+    bytes.pad(&mut out, 24) // STN_UNDEF
+    for i in 0..specs.len {
+        bytes.append_le(&mut out, i64(names[i]), 4)
+        bind := if specs[i].weak { 2 } else { 1 } // STB_WEAK=2, STB_GLOBAL=1
+        stype := if specs[i].kind == .DataObject { 1 } else { 2 } // STT_OBJECT=1, STT_FUNC=2
+        info := bind * 16 + stype
+        out.push(u8(info)); bytes.pad(&mut out, 19)
+    }
+
+    // SysV .hash
+    hash := out.len
+    bytes.append_le(&mut out, 1, 4); bytes.append_le(&mut out, i64(specs.len + 1), 4)
+    bytes.append_le(&mut out, 1, 4)
+    bytes.append_le(&mut out, 0, 4)
+    for i in 0..specs.len {
+        if i + 1 == specs.len { bytes.append_le(&mut out, 0, 4) }
+        else { bytes.append_le(&mut out, i64(i + 2), 4) }
+    }
+    bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
+
+    // .gnu.hash (all symbols are undefined imports -> symoffset = specs.len + 1)
+    mut gnu_hash_off := -1
+    if config.gnu_hash {
+        gnu_hash_off = out.len
+        bytes.append_le(&mut out, 1, 4) // nbuckets
+        bytes.append_le(&mut out, i64(specs.len + 1), 4) // symoffset
+        bytes.append_le(&mut out, 1, 4) // bloom_size
+        bytes.append_le(&mut out, 0, 4) // bloom_shift
+        bytes.append_le(&mut out, 0, 8) // bloom[0]
+        bytes.append_le(&mut out, 0, 4) // buckets[0]
+        bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
+    }
+
+    // .gnu.version and .gnu.version_r
+    mut versym_off := -1
+    mut verneed_off := -1
+    if has_versions {
+        versym_off = out.len
+        u16le(&mut out, 0) // null symbol 0
+        for v in &sym_ver_idx { u16le(&mut out, v) }
+        bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
+
+        verneed_off = out.len
+        for l in 0..ver_libs.len {
+            mut cnt := 0
+            for v in 0..ver_names.len { if ver_name_lib[v] == l { cnt += 1 } }
+            vn_next := if l + 1 < ver_libs.len { 16 + cnt * 16 } else { 0 }
+            u16le(&mut out, 1) // vn_version = VER_NEED_CURRENT
+            u16le(&mut out, cnt) // vn_cnt
+            bytes.append_le(&mut out, i64(ver_lib_offs[l]), 4) // vn_file
+            bytes.append_le(&mut out, 16, 4) // vn_aux
+            bytes.append_le(&mut out, i64(vn_next), 4) // vn_next
+            mut seen := 0
+            for v in 0..ver_names.len {
+                if ver_name_lib[v] != l { continue }
+                seen += 1
+                vna_next := if seen < cnt { 16 } else { 0 }
+                bytes.append_le(&mut out, elf_sysv_hash(ver_names[v].clone()), 4) // vna_hash
+                u16le(&mut out, 0) // vna_flags
+                u16le(&mut out, 2 + v) // vna_other
+                bytes.append_le(&mut out, i64(ver_name_offs[v]), 4) // vna_name
+                bytes.append_le(&mut out, i64(vna_next), 4) // vna_next
+            }
+        }
+        bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
+    }
+
+    // .rela.dyn
+    rela := out.len
+    mut kind: i64 = 1025 // R_AARCH64_GLOB_DAT
+    if machine == 62 { kind = 6 } // R_X86_64_GLOB_DAT
+    for i in 0..specs.len {
+        bytes.append_le(&mut out, base + i64(got_off + i * 8), 8)
+        bytes.append_le(&mut out, i64(i + 1) * 4294967296 + kind, 8)
+        bytes.append_le(&mut out, 0, 8)
+    }
+
+    // .dynamic
+    dynamic := out.len
+    for library in &needed { tag64(&mut out, 1, i64(library)) } // DT_NEEDED
+    if runpath_off > 0 { tag64(&mut out, 29, i64(runpath_off)) } // DT_RUNPATH
+    tag64(&mut out, 4, base + i64(hash)) // DT_HASH
+    if gnu_hash_off >= 0 { tag64(&mut out, 1879047925, base + i64(gnu_hash_off)) } // DT_GNU_HASH
+    tag64(&mut out, 5, base + i64(string_table)) // DT_STRTAB
+    tag64(&mut out, 10, i64(string_size)) // DT_STRSZ
+    tag64(&mut out, 6, base + i64(dynsym)) // DT_SYMTAB
+    tag64(&mut out, 11, 24) // DT_SYMENT
+    tag64(&mut out, 7, base + i64(rela)) // DT_RELA
+    tag64(&mut out, 8, i64(specs.len * 24)) // DT_RELASZ
+    tag64(&mut out, 9, 24) // DT_RELAENT
+    if has_versions {
+        tag64(&mut out, 1879048176, base + i64(versym_off)) // DT_VERSYM
+        tag64(&mut out, 1879048190, base + i64(verneed_off)) // DT_VERNEED
+        tag64(&mut out, 1879048191, i64(ver_libs.len)) // DT_VERNEEDNUM
+    }
+    tag64(&mut out, 24, 0) // DT_BIND_NOW
+    tag64(&mut out, 30, 8) // DT_FLAGS = DF_BIND_NOW
+    tag64(&mut out, 0, 0) // DT_NULL
+    dynamic_size := out.len - dynamic
+
+    mut relro_end := out.len
+    mut globals_base := out.len
+    if globals > 0 {
+        if config.relro {
+            relro_end = imports.align(out.len, 4096)
+            globals_base = relro_end
+            bytes.pad(&mut out, globals_base - out.len + globals)
+        } else {
+            globals_base = imports.align(out.len, 16)
+            bytes.pad(&mut out, globals_base - out.len + globals)
+        }
+    }
+    length := out.len
+
+    // Patch .text relocations to GOT (slot >= 0) and mutable globals (slot < 0)
+    if machine == 183 {
+        imports.relocate_at(&mut out, 4096, text.len, got_off, globals_base, specs.len, &sites, &slots)
+    } else {
+        for i in 0..sites.len {
+            assert(sites[i] >= 0 && sites[i] <= text.len - 4)
+            assert(slots[i] < specs.len)
+            at := 4096 + sites[i]
+            mut destination := got_off
+            if slots[i] < 0 { destination = globals_base - 1 - slots[i] }
+            else { destination = got_off + slots[i] * 8 }
+            displacement := destination - at - 4
+            imports.set_le(&mut out, at, i64(displacement), 4)
+        }
+    }
+
+    interp := resolve_interp(machine, &config)
+    assert(interp.len < 256)
+    for i in 0..interp.len { out[512 + i] = u8(interp[i]) }
+    out[512 + interp.len] = 0
+
+    phnum := if config.relro { 7 } else { 6 }
+    imports.set_le(&mut out, 56, i64(phnum), 2)
+    phdr_at(&mut out, base, 0, 6, 4, 64, phnum * 56, 8) // PT_PHDR
+    phdr_at(&mut out, base, 1, 3, 4, 512, interp.len + 1, 1) // PT_INTERP
+    phdr_at(&mut out, base, 2, 1, 5, 0, data_start, 4096) // PT_LOAD RX
+    phdr_at(&mut out, base, 3, 1, 6, data_start, length - data_start, 4096) // PT_LOAD RW
+    phdr_at(&mut out, base, 4, 2, 6, dynamic, dynamic_size, 8) // PT_DYNAMIC
+    phdr_at(&mut out, base, 5, 1685382481, 6, 0, 0, 16) // PT_GNU_STACK
+    if config.relro {
+        phdr_at(&mut out, base, 6, 1685382482, 4, data_start, relro_end - data_start, 1) // PT_GNU_RELRO
+    }
+    out
 }
 
 pub fn dynamic_storage_env(text: &[]u8, libraries: &[]string, symbols: &[]string,
@@ -72,91 +412,12 @@ pub fn dynamic_storage_env(text: &[]u8, libraries: &[]string, symbols: &[]string
         assert(symbols[environ_slot] == "environ")
         assert(imports.library_name(libraries[environ_slot], false) == "libc.so.6")
     }
-    mut out := image_for(&text, machine)
-    base := 4194304
-    data := imports.align(out.len, 4096)
-    bytes.pad(&mut out, data - out.len + imports.align(symbols.len * 8, 16) + globals)
-    if machine == 183 { imports.relocate(&mut out, 4096, text.len, data, symbols.len, &sites, &slots) }
-    else {
-        for i in 0..sites.len {
-            assert(sites[i] >= 0 && sites[i] <= text.len - 4)
-            assert(slots[i] < symbols.len)
-            at := 4096 + sites[i]
-            mut destination := data
-            if slots[i] < 0 { destination = data + imports.align(symbols.len * 8, 16) - 1 - slots[i] }
-            else { destination = data + slots[i] * 8 }
-            displacement := destination - at - 4
-            imports.set_le(&mut out, at, i64(displacement), 4)
-        }
-    }
-    if symbols.len == 0 {
-        if globals == 0 { return out }
-        imports.set_le(&mut out, 56, 3, 2)
-        phdr(&mut out, 0, 1, 5, 0, data, 4096)
-        phdr(&mut out, 1, 1, 6, data, out.len - data, 4096)
-        phdr(&mut out, 2, 1685382481, 6, 0, 0, 16)
-        return out
-    }
-    table := imports.libraries(&libraries, false)
-    string_table := out.len
-    out.push(0)
-    mut needed: []i32 = []
-    for library in &table.names {
-        needed.push(out.len - string_table)
-        bytes.append_utf8(&mut out, library); out.push(0)
-    }
-    mut names: []i32 = []
-    for symbol in &symbols {
-        names.push(out.len - string_table)
-        bytes.append_utf8(&mut out, symbol); out.push(0)
-    }
-    string_size := out.len - string_table
-    bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
-    dynsym := out.len
-    bytes.pad(&mut out, 24)
-    for i in 0..names.len {
-        bytes.append_le(&mut out, i64(names[i]), 4)
-        mut info := 18
-        if i == environ_slot { info = 17 }
-        out.push(u8(info)); bytes.pad(&mut out, 19)
-    }
-    hash := out.len
-    bytes.append_le(&mut out, 1, 4); bytes.append_le(&mut out, i64(symbols.len + 1), 4)
-    if symbols.len > 0 { bytes.append_le(&mut out, 1, 4) } else { bytes.append_le(&mut out, 0, 4) }
-    bytes.append_le(&mut out, 0, 4)
-    for i in 0..symbols.len {
-        if i + 1 == symbols.len { bytes.append_le(&mut out, 0, 4) }
-        else { bytes.append_le(&mut out, i64(i + 2), 4) }
-    }
-    bytes.pad(&mut out, imports.align(out.len, 8) - out.len)
-    rela := out.len
-    mut kind: i64 = 1025
-    if machine == 62 { kind = 6 }
-    for i in 0..symbols.len {
-        bytes.append_le(&mut out, i64(base + data + i * 8), 8)
-        bytes.append_le(&mut out, i64(i + 1) * 4294967296 + kind, 8)
-        bytes.append_le(&mut out, 0, 8)
-    }
-    dynamic := out.len
-    for library in &needed { tag(&mut out, 1, library) }
-    tag(&mut out, 4, base + hash); tag(&mut out, 5, base + string_table); tag(&mut out, 10, string_size)
-    tag(&mut out, 6, base + dynsym); tag(&mut out, 11, 24); tag(&mut out, 7, base + rela)
-    tag(&mut out, 8, symbols.len * 24); tag(&mut out, 9, 24); tag(&mut out, 24, 0); tag(&mut out, 0, 0)
-    length := out.len
-    mut interp := "/lib/ld-linux-aarch64.so.1"
-    if machine == 62 { interp = "/lib64/ld-linux-x86-64.so.2" }
-    for i in 0..interp.len { out[512 + i] = u8(interp[i]) }
-    imports.set_le(&mut out, 56, 6, 2)
-    phdr(&mut out, 0, 6, 4, 64, 336, 8)
-    phdr(&mut out, 1, 3, 4, 512, interp.len + 1, 1)
-    phdr(&mut out, 2, 1, 5, 0, data, 4096)
-    phdr(&mut out, 3, 1, 6, data, length - data, 4096)
-    phdr(&mut out, 4, 2, 6, dynamic, length - dynamic, 8)
-    phdr(&mut out, 5, 1685382481, 6, 0, 0, 16)
-    out
+    specs := imports.from_legacy(&libraries, &symbols, environ_slot)
+    cfg := default_config()
+    dynamic_image_configured(&text, &specs, &sites, &slots, machine, globals, &cfg)
 }
 
-fn dynamic_value(image: &[]u8, key: i32) -> i64 {
+fn dynamic_value(image: &[]u8, key: i64) -> i64 {
     headers := i32(bytes.i64_le(&image, 32)); count := bytes.u16_le(&image, 56)
     for i in 0..count {
         header := headers + i * 56
@@ -165,7 +426,7 @@ fn dynamic_value(image: &[]u8, key: i32) -> i64 {
         mut at := start
         while at + 16 <= start + size {
             tag := bytes.i64_le(&image, at)
-            if tag == i64(key) { return bytes.i64_le(&image, at + 8) }
+            if tag == key { return bytes.i64_le(&image, at + 8) }
             if tag == 0 { return -1 }
             at += 16
         }
@@ -290,8 +551,9 @@ pub fn attach_debug(image: &[]u8, text_len: i32, dbg: &dwarf.Bundle) -> []u8 {
     bytes.pad(&mut out, sh_pad)
     shoff := out.len
 
+    text_vaddr := bytes.i64_le(&out, 24) // e_entry (4198400 for ET_EXEC, 4096 for ET_DYN)
     shdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    shdr(&mut out, n_text, 1, 6, 4198400, 4096, i64(text_len), 0, 0, 16, 0)
+    shdr(&mut out, n_text, 1, 6, text_vaddr, 4096, i64(text_len), 0, 0, 16, 0)
     shdr(&mut out, n_symtab, 2, 0, 0, i64(sym_off), i64(sym_size), 3, 1, 8, 24)
     shdr(&mut out, n_strtab, 3, 0, 0, i64(str_off), i64(str_size), 0, 0, 1, 0)
     shdr(&mut out, n_abbrev, 1, 0, 0, i64(abbrev_off), i64(dbg.abbrev.len), 0, 0, 1, 0)

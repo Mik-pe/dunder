@@ -1,0 +1,512 @@
+capability process, filesystem, stdio
+
+import ..selfhost.backend.arm64 as arm
+import ..selfhost.backend.dwarf as dwarf
+import ..selfhost.backend.elf as elf
+import ..selfhost.backend.imports as imports
+import ..selfhost.backend.macho as macho
+import ..selfhost.backend.pe as pe
+import ..selfhost.driver.bundle as bundle
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import std.text as text
+import sys
+
+fn u16_le(raw: &[]u8, off: i32) -> i32 {
+    i32(bytes.u16_le(&raw, off))
+}
+
+fn u32_le(raw: &[]u8, off: i32) -> i64 {
+    i64(bytes.u32_le(&raw, off))
+}
+
+fn i64_le(raw: &[]u8, off: i32) -> i64 {
+    bytes.i64_le(&raw, off)
+}
+
+fn read_cstr(raw: &[]u8, off: i32) -> string {
+    if off < 0 || off >= raw.len { return "" }
+    mut end := off
+    while end < raw.len && raw[end] != 0 { end += 1 }
+    bytes.decode_range(&raw, off, end).unwrap_or_default()
+}
+
+fn run_cmd(program: string, args: []string) -> process.Output {
+    process.run(program, args)
+}
+
+fn make_arm64_exit0_calling_slot0(out_sites: &mut []i32, out_slots: &mut []i32) -> []u8 {
+    // Emits a minimal arm64-macos executable calling imported function slot 0 (e.g. getpid)
+    // and exiting cleanly with status 0 via Darwin syscall 1 (SYS_exit).
+    mut code := arm.new_for(0)
+    // Load slot 0 into x16 via native_address (2 words)
+    out_sites.push(arm.position(&code) * 4)
+    out_slots.push(0)
+    arm.native_address(&mut code, 16)
+    // blr x16 (0xd63f0200 = 3594453504)
+    arm.emit(&mut code, 3594453504)
+    // exit(0)
+    arm.exit(&mut code, 0)
+    arm.finish_for(&mut code, true)
+}
+
+fn make_arm64_check_weak_null_and_exit0(out_sites: &mut []i32, out_slots: &mut []i32) -> []u8 {
+    // Loads slot 0 (strong getpid) -> calls it; loads slot 1 (weak missing symbol) -> asserts == 0 -> exits 0 (else exits 99).
+    mut code := arm.new_for(0)
+    out_sites.push(arm.position(&code) * 4)
+    out_slots.push(0)
+    arm.native_address(&mut code, 16)
+    arm.emit(&mut code, 3594453504) // blr x16 (getpid)
+
+    out_sites.push(arm.position(&code) * 4)
+    out_slots.push(1)
+    arm.native_address(&mut code, 16) // x16 = weak missing symbol address (must be 0)
+    ok_lbl := arm.label(&mut code)
+    arm.mov(&mut code, 0, 16)
+    arm.branch(&mut code, ok_lbl, 18) // cbz x0, ok_lbl
+    arm.exit(&mut code, 99)
+    arm.mark(&mut code, ok_lbl)
+    arm.exit(&mut code, 0)
+    arm.finish_for(&mut code, true)
+}
+
+fn test_logical_library_registry() {
+    // macOS logical keys + framework shorthand
+    assert(imports.resolve_library("c", 0, .Glibc).name == "/usr/lib/libSystem.B.dylib")
+    assert(imports.resolve_library("dl", 0, .Glibc).name == "/usr/lib/libSystem.B.dylib")
+    assert(imports.resolve_library("m", 0, .Glibc).name == "/usr/lib/libSystem.B.dylib")
+    assert(imports.resolve_library("pthread", 0, .Glibc).name == "/usr/lib/libSystem.B.dylib")
+    assert(imports.resolve_library("objc", 0, .Glibc).name == "/usr/lib/libobjc.A.dylib")
+    assert(imports.resolve_library("metal", 0, .Glibc).name == "/System/Library/Frameworks/Metal.framework/Versions/A/Metal")
+    assert(imports.resolve_library("appkit", 0, .Glibc).name == "/System/Library/Frameworks/AppKit.framework/Versions/A/AppKit")
+    assert(imports.resolve_library("cocoa", 0, .Glibc).name == "/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa")
+    assert(imports.resolve_library("foundation", 0, .Glibc).name == "/System/Library/Frameworks/Foundation.framework/Versions/A/Foundation")
+    assert(imports.resolve_library("quartzcore", 0, .Glibc).name == "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore")
+    assert(imports.resolve_library("coregraphics", 0, .Glibc).name == "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics")
+    assert(imports.resolve_library("corevideo", 0, .Glibc).name == "/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo")
+    assert(imports.resolve_library("vulkan", 0, .Glibc).name == "@rpath/libvulkan.1.dylib")
+    fw := imports.resolve_library("framework:CoreAudio", 0, .Glibc)
+    assert(fw.is_framework && fw.name == "/System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio")
+
+    // Linux Glibc & Musl
+    assert(imports.resolve_library("c", 1, .Glibc).name == "libc.so.6")
+    assert(imports.resolve_library("dl", 1, .Glibc).name == "libdl.so.2")
+    assert(imports.resolve_library("m", 2, .Glibc).name == "libm.so.6")
+    assert(imports.resolve_library("pthread", 2, .Glibc).name == "libpthread.so.0")
+    assert(imports.resolve_library("vulkan", 1, .Glibc).name == "libvulkan.so.1")
+    assert(imports.resolve_library("wayland-client", 2, .Glibc).name == "libwayland-client.so.0")
+    assert(imports.resolve_library("x11", 2, .Glibc).name == "libX11.so.6")
+    assert(imports.resolve_library("xcb", 2, .Glibc).name == "libxcb.so.1")
+    assert(imports.resolve_library("xkbcommon", 2, .Glibc).name == "libxkbcommon.so.0")
+    assert(imports.resolve_library("c", 1, .Musl).name == "libc.musl-aarch64.so.1")
+    assert(imports.resolve_library("c", 2, .Musl).name == "libc.musl-x86_64.so.1")
+    assert(imports.resolve_library("dl", 2, .Musl).name == "libc.musl-x86_64.so.1")
+
+    // Windows logical keys
+    assert(imports.resolve_library("c", 5, .Glibc).name == "msvcrt.dll")
+    assert(imports.resolve_library("ucrt", 5, .Glibc).name == "ucrtbase.dll")
+    assert(imports.resolve_library("kernel32", 5, .Glibc).name == "kernel32.dll")
+    assert(imports.resolve_library("user32", 5, .Glibc).name == "user32.dll")
+    assert(imports.resolve_library("gdi32", 5, .Glibc).name == "gdi32.dll")
+    assert(imports.resolve_library("ole32", 5, .Glibc).name == "ole32.dll")
+    assert(imports.resolve_library("ws2_32", 5, .Glibc).name == "ws2_32.dll")
+    assert(imports.resolve_library("d3d12", 5, .Glibc).name == "d3d12.dll")
+    assert(imports.resolve_library("dxgi", 5, .Glibc).name == "dxgi.dll")
+    assert(imports.resolve_library("d3dcompiler", 5, .Glibc).name == "d3dcompiler_47.dll")
+    assert(imports.resolve_library("advapi32", 5, .Glibc).name == "advapi32.dll")
+    assert(imports.resolve_library("shell32", 5, .Glibc).name == "shell32.dll")
+    assert(imports.resolve_library("vulkan", 5, .Glibc).name == "vulkan-1.dll")
+
+    // Overrides
+    ovs: []imports.LibraryOverride = [
+        imports.LibraryOverride { key: "vulkan", path: "", framework: "", soname: "libvulkan.so.1.3", dll: "", weak: true, delay: false },
+        imports.LibraryOverride { key: "metal", path: "", framework: "MetalFX", soname: "", dll: "", weak: true, delay: false },
+        imports.LibraryOverride { key: "d3d12", path: "", framework: "", soname: "", dll: "d3d12core.dll", weak: false, delay: true },
+    ]
+    assert(imports.resolve_library_with_overrides("vulkan", 2, .Glibc, &ovs).name == "libvulkan.so.1.3")
+    assert(imports.resolve_library_with_overrides("vulkan", 2, .Glibc, &ovs).weak)
+    assert(imports.resolve_library_with_overrides("metal", 0, .Glibc, &ovs).name == "/System/Library/Frameworks/MetalFX.framework/Versions/A/MetalFX")
+    win_ov := imports.resolve_library_with_overrides("d3d12", 5, .Glibc, &ovs)
+    assert(win_ov.name == "d3d12core.dll" && win_ov.delay)
+    print("PASS logical_library_registry")
+}
+
+fn macho_find_cmd(img: &[]u8, target_cmd: i64) -> i32 {
+    ncmds := i32(u32_le(&img, 16))
+    mut off := 32
+    for _ in 0..ncmds {
+        cmd := u32_le(&img, off)
+        sz := i32(u32_le(&img, off + 4))
+        if cmd == target_cmd { return off }
+        off += sz
+    }
+    -1
+}
+
+fn test_macho_upgrades(work: string) {
+    signer := macho.serial_signer()
+
+    // 1. Over 16 KiB load commands (>240 weak dylibs -> ADDEND64 + text_off == 32768) + debug + real execution!
+    mut sites: []i32 = []
+    mut slots: []i32 = []
+    text_bytes := make_arm64_exit0_calling_slot0(&mut sites, &mut slots)
+    mut specs: []imports.SymbolSpec = []
+    specs.push(imports.symbol_spec("c", "getpid"))
+    for i in 0..260 {
+        mut ws := imports.symbol_spec(f"@rpath/liboptional_dunder_test_{i}.dylib", f"opt_sym_{i}")
+        ws.weak = true
+        ws.lib_weak = true
+        specs.push(move ws)
+    }
+    mut cfg := macho.default_config()
+    cfg.rpaths = ["@executable_path/../Frameworks", "@loader_path"]
+    cfg.entitlements = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n<key>com.apple.security.get-task-allow</key><true/>\n</dict>\n</plist>\n"
+    cfg.identifier = "org.dunder.test.macho-large"
+
+    expected_off := macho.dynamic_text_offset_for(&specs, 64, false, &cfg)
+    assert(expected_off >= 32768 && expected_off % 16384 == 0)
+
+    large_img := macho.dynamic_storage_configured(&text_bytes, &specs, &sites, &slots, 64, &cfg, &signer)
+    main_cmd := macho_find_cmd(&large_img, 2147483688) // LC_MAIN
+    assert(main_cmd > 0)
+    assert(i32(i64_le(&large_img, main_cmd + 8)) == expected_off)
+    assert(macho_find_cmd(&large_img, 2147483676) > 0) // LC_RPATH
+    assert(macho_find_cmd(&large_img, 2147483672) > 0) // LC_LOAD_WEAK_DYLIB
+    assert(macho_find_cmd(&large_img, 2147483700) > 0) // LC_DYLD_CHAINED_FIXUPS
+    assert(macho_find_cmd(&large_img, 2147483699) > 0) // LC_DYLD_EXPORTS_TRIE
+
+    // Also test debug emission with >16 KiB load commands (previously panicked on assert(text_off == page)!)
+    dbg_off := macho.dynamic_text_offset_for(&specs, 64, true, &cfg)
+    assert(dbg_off >= 32768)
+    dbg := dwarf.build(&dwarf.Input {
+        producer: "dunder", comp_dir: ".", main_file: "main.ddr", files: ["main.ddr"],
+        low_pc: 4294967296 + i64(dbg_off), high_pc: 4294967296 + i64(dbg_off + text_bytes.len),
+        functions: [dwarf.FunctionInfo { name: "main", file_index: 1, line: 1, low_pc: 4294967296 + i64(dbg_off), high_pc: 4294967296 + i64(dbg_off + text_bytes.len) }],
+        lines: [dwarf.LineInfo { address: 4294967296 + i64(dbg_off), file_index: 1, line: 1, column: 1 }],
+    })
+    large_dbg_img := macho.dynamic_storage_debug_configured(&text_bytes, &specs, &sites, &slots, 64, &dbg, &cfg, &signer)
+    dbg_main := macho_find_cmd(&large_dbg_img, 2147483688)
+    assert(dbg_main > 0 && i32(i64_le(&large_dbg_img, dbg_main + 8)) == dbg_off)
+
+    // 2. Weak dylib + framework + rpath + entitlements real macOS execution & tool verification!
+    mut w_sites: []i32 = []
+    mut w_slots: []i32 = []
+    weak_text := make_arm64_check_weak_null_and_exit0(&mut w_sites, &mut w_slots)
+    mut weak_missing := imports.symbol_spec("/nonexistent/libdunder_missing_weak.dylib", "does_not_exist_sym")
+    weak_missing.weak = true
+    weak_missing.lib_weak = true
+    weak_specs: []imports.SymbolSpec = [
+        imports.symbol_spec("c", "getpid"),
+        move weak_missing,
+        imports.symbol_spec("metal", "MTLCreateSystemDefaultDevice"),
+    ]
+    weak_img := macho.dynamic_storage_configured(&weak_text, &weak_specs, &w_sites, &w_slots, 32, &cfg, &signer)
+
+    if target_is("macos") {
+        large_path := work + "/macho_large"
+        weak_path := work + "/macho_weak"
+        dbg_path := work + "/macho_large_dbg"
+        assert(sys.write_u8(large_path, &large_img).ok && sys.make_executable(large_path).ok)
+        assert(sys.write_u8(weak_path, &weak_img).ok && sys.make_executable(weak_path).ok)
+        assert(sys.write_u8(dbg_path, &large_dbg_img).ok && sys.make_executable(dbg_path).ok)
+
+        // Verify codesign, entitlements, otool, dyld_info, and REAL EXECUTION on arm64-macos!
+        cs1 := run_cmd("/usr/bin/codesign", ["--verify", "--strict", large_path.clone()])
+        assert(cs1.ok && cs1.code == 0)
+        cs2 := run_cmd("/usr/bin/codesign", ["--verify", "--strict", weak_path.clone()])
+        assert(cs2.ok && cs2.code == 0)
+        cs3 := run_cmd("/usr/bin/codesign", ["--verify", "--strict", dbg_path.clone()])
+        assert(cs3.ok && cs3.code == 0)
+
+        ent_out := run_cmd("/usr/bin/codesign", ["-d", "--entitlements", ":-", weak_path.clone()])
+        assert(ent_out.ok && ent_out.code == 0 && text.contains(ent_out.stdout_text(), "com.apple.security.get-task-allow"))
+
+        ot_out := run_cmd("/usr/bin/otool", ["-L", weak_path.clone()])
+        assert(ot_out.ok && ot_out.code == 0)
+        assert(text.contains(ot_out.stdout_text(), "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"))
+        assert(text.contains(ot_out.stdout_text(), "weak"))
+
+        di_out := run_cmd("/usr/bin/dyld_info", ["-fixups", weak_path.clone()])
+        assert(di_out.ok && di_out.code == 0 && text.contains(di_out.stdout_text(), "__DATA_CONST"))
+        assert(text.contains(di_out.stdout_text(), "_MTLCreateSystemDefaultDevice"))
+
+        ex_large := run_cmd(large_path, [])
+        assert(ex_large.ok && ex_large.code == 0)
+        ex_weak := run_cmd(weak_path, [])
+        assert(ex_weak.ok && ex_weak.code == 0)
+        ex_dbg := run_cmd(dbg_path, [])
+        assert(ex_dbg.ok && ex_dbg.code == 0)
+
+        // 3. Test bundle.ddr with .framework containing symlinks + custom bundle_id + entitlements!
+        fw_src := work + "/Demo.framework"
+        assert(fs.mkdir_all(fw_src + "/Versions/A/Resources").ok)
+        assert(sys.write_text(fw_src + "/Versions/A/Demo", "fake-framework-binary").ok)
+        assert(sys.write_text(fw_src + "/Versions/A/Resources/Info.plist", "<plist/>").ok)
+        assert(fs.symlink("A", fw_src + "/Versions/Current").ok)
+        assert(fs.symlink("Versions/Current/Demo", fw_src + "/Demo").ok)
+        assert(fs.symlink("Versions/Current/Resources", fw_src + "/Resources").ok)
+
+        mut app_img := weak_img.clone()
+        app_path := work + "/Framed.app"
+        mut bcfg := bundle.default_config()
+        bcfg.bundle_id = "com.example.dunder.framed"
+        bcfg.entitlements = cfg.entitlements.clone()
+        bcfg.frameworks = [fw_src]
+        sources: []string = []
+        berr := bundle.publish_configured(app_path.clone(), &mut app_img, &sources, &signer, "1.2.3", &bcfg)
+        assert(berr == "")
+
+        plist_txt := sys.read_text(app_path + "/Contents/Info.plist")
+        assert(plist_txt.ok && text.contains(plist_txt.value, "com.example.dunder.framed"))
+        cr_txt := sys.read_text(app_path + "/Contents/_CodeSignature/CodeResources")
+        assert(cr_txt.ok && text.contains(cr_txt.value, "<key>symlink</key>"))
+        assert(fs.is_symlink(app_path + "/Contents/Frameworks/Demo.framework/Versions/Current"))
+
+        cs_app := run_cmd("/usr/bin/codesign", ["--verify", "--strict", app_path.clone()])
+        assert(cs_app.ok && cs_app.code == 0)
+
+        // Negative test: escaping symlink inside Contents/Frameworks/ MUST fail!
+        bad_app := work + "/Escape.app"
+        assert(fs.mkdir_all(bad_app + "/Contents/Frameworks/Bad.framework").ok)
+        assert(sys.write_text(work + "/outside.txt", "secret").ok)
+        assert(fs.symlink("../../../outside.txt", bad_app + "/Contents/Frameworks/Bad.framework/leak").ok)
+        mut bad_img := weak_img.clone()
+        esc_err := bundle.publish(bad_app, &mut bad_img, &sources, &signer, "1.0.0")
+        assert(text.contains(esc_err, "escapes bundle"))
+    }
+    print("PASS macho_upgrades")
+}
+
+fn elf_dynamic_val(img: &[]u8, target_tag: i64) -> i64 {
+    phoff := i32(i64_le(&img, 32))
+    phnum := u16_le(&img, 56)
+    for i in 0..phnum {
+        ph := phoff + i * 56
+        if u32_le(&img, ph) != 2 { continue }
+        start := i32(i64_le(&img, ph + 8))
+        sz := i32(i64_le(&img, ph + 32))
+        mut at := start
+        while at + 16 <= start + sz {
+            k := i64_le(&img, at)
+            if k == target_tag { return i64_le(&img, at + 8) }
+            if k == 0 { return -1 }
+            at += 16
+        }
+    }
+    -1
+}
+
+fn elf_find_phdr(img: &[]u8, target_type: i64) -> i32 {
+    phoff := i32(i64_le(&img, 32))
+    phnum := u16_le(&img, 56)
+    for i in 0..phnum {
+        ph := phoff + i * 56
+        if u32_le(&img, ph) == target_type { return ph }
+    }
+    -1
+}
+
+fn test_elf_upgrades() {
+    code: []u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+    sites: []i32 = []
+    slots: []i32 = []
+
+    // 1. Static ELF stays 100% static when specs empty
+    empty_specs: []imports.SymbolSpec = []
+    cfg_def := elf.default_config()
+    static_img := elf.dynamic_image_configured(&code, &empty_specs, &sites, &slots, 183, 64, &cfg_def)
+    assert(elf_find_phdr(&static_img, 3) < 0 && elf_find_phdr(&static_img, 2) < 0)
+
+    // 2. Full dynamic ELF: STT_OBJECT (Wayland), STB_WEAK func & object, DT_RUNPATH, PT_GNU_RELRO, DT_GNU_HASH, DT_VERSYM/DT_VERNEED, ET_DYN PIE!
+    mut fn_ver := imports.symbol_spec("c", "clock_gettime")
+    fn_ver.version_name = "GLIBC_2.17"
+    mut obj_wayland := imports.data_symbol_spec("wayland-client", "wl_compositor_interface")
+    mut weak_fn := imports.symbol_spec("vulkan", "vkCreateInstance")
+    weak_fn.weak = true
+    mut weak_obj := imports.data_symbol_spec("wayland-client", "wl_optional_interface")
+    weak_obj.weak = true
+    specs: []imports.SymbolSpec = [move fn_ver, move obj_wayland, move weak_fn, move weak_obj]
+
+    mut pie_cfg := elf.pie_config(.Glibc)
+    pie_cfg.rpaths = ["$ORIGIN/../lib", "/usr/local/lib"]
+
+    for machine in [183, 62] {
+        img := elf.dynamic_image_configured(&code, &specs, &sites, &slots, machine, 128, &pie_cfg)
+        assert(u16_le(&img, 16) == 3) // ET_DYN PIE
+        assert(i64_le(&img, 24) == 4096) // entry relative to base 0
+        assert(elf_find_phdr(&img, 1685382482) > 0) // PT_GNU_RELRO
+        relro_ph := elf_find_phdr(&img, 1685382482)
+        relro_sz := i64_le(&img, relro_ph + 32)
+        assert(relro_sz > 0 && relro_sz % 4096 == 0) // page-aligned RELRO before mutable globals!
+
+        strtab := i32(elf_dynamic_val(&img, 5))
+        dynsym := i32(elf_dynamic_val(&img, 6))
+        runpath := i32(elf_dynamic_val(&img, 29))
+        gnu_hash := i32(elf_dynamic_val(&img, 1879047925))
+        versym := i32(elf_dynamic_val(&img, 1879048176))
+        verneed := i32(elf_dynamic_val(&img, 1879048190))
+        verneednum := elf_dynamic_val(&img, 1879048191)
+
+        assert(strtab > 0 && dynsym > 0 && gnu_hash > 0)
+        assert(runpath > 0 && read_cstr(&img, strtab + runpath) == "$ORIGIN/../lib:/usr/local/lib")
+        assert(versym > 0 && verneed > 0 && verneednum == 1)
+
+        // Check st_info for all 4 symbols:
+        // [1] clock_gettime: STB_GLOBAL | STT_FUNC = 18
+        // [2] wl_compositor_interface: STB_GLOBAL | STT_OBJECT = 17
+        // [3] vkCreateInstance: STB_WEAK | STT_FUNC = 34
+        // [4] wl_optional_interface: STB_WEAK | STT_OBJECT = 33
+        assert(img[dynsym + 1 * 24 + 4] == 18)
+        assert(img[dynsym + 2 * 24 + 4] == 17)
+        assert(img[dynsym + 3 * 24 + 4] == 34)
+        assert(img[dynsym + 4 * 24 + 4] == 33)
+
+        // Check DT_VERSYM: sym 0 = 0, sym 1 = 2 (GLIBC_2.17), sym 2..4 = 1 (unversioned)
+        assert(u16_le(&img, versym + 0) == 0)
+        assert(u16_le(&img, versym + 2) == 2)
+        assert(u16_le(&img, versym + 4) == 1)
+        assert(u16_le(&img, versym + 6) == 1)
+        assert(u16_le(&img, versym + 8) == 1)
+
+        // Check DT_VERNEED entry & vernaux version name
+        assert(u16_le(&img, verneed + 0) == 1 && u16_le(&img, verneed + 2) == 1)
+        vn_file := i32(u32_le(&img, verneed + 4))
+        assert(read_cstr(&img, strtab + vn_file) == "libc.so.6")
+        vna_name := i32(u32_le(&img, verneed + 16 + 8))
+        assert(read_cstr(&img, strtab + vna_name) == "GLIBC_2.17")
+    }
+
+    // 3. Musl libc interpreter & SONAME
+    musl_cfg := elf.pie_config(.Musl)
+    musl_specs: []imports.SymbolSpec = [imports.symbol_spec("c", "puts")]
+    musl_arm := elf.dynamic_image_configured(&code, &musl_specs, &sites, &slots, 183, 0, &musl_cfg)
+    interp_arm := elf_find_phdr(&musl_arm, 3)
+    assert(read_cstr(&musl_arm, i32(i64_le(&musl_arm, interp_arm + 8))) == "/lib/ld-musl-aarch64.so.1")
+    musl_x64 := elf.dynamic_image_configured(&code, &musl_specs, &sites, &slots, 62, 0, &musl_cfg)
+    interp_x64 := elf_find_phdr(&musl_x64, 3)
+    assert(read_cstr(&musl_x64, i32(i64_le(&musl_x64, interp_x64 + 8))) == "/lib/ld-musl-x86_64.so.1")
+    print("PASS elf_upgrades")
+}
+
+fn pe_rva_to_off(raw: &[]u8, sec_off: i32, num_sec: i32, rva: i64) -> i32 {
+    for s in 0..num_sec {
+        sh := sec_off + s * 40
+        vsize := u32_le(&raw, sh + 8)
+        vrva := u32_le(&raw, sh + 12)
+        rsz := u32_le(&raw, sh + 16)
+        roff := u32_le(&raw, sh + 20)
+        span := if rsz > vsize { rsz } else { vsize }
+        if rva >= vrva && rva < vrva + span { return i32(roff + (rva - vrva)) }
+    }
+    -1
+}
+
+fn test_pe_upgrades() {
+    // 6-section PE32+ exercising dynamic headers_size > 512, GUI subsystem, ASLR .reloc,
+    // .pdata/.xdata unwind tables, .rsrc DPI+UTF-8 manifest, Delay-Load IAT, import-by-ordinal, ucrtbase.dll!
+    mut code: []u8 = [
+        u8(0xff), u8(0x15), u8(0), u8(0), u8(0), u8(0), // call [rip+disp] -> eager kernel32!ExitProcess
+        u8(0xff), u8(0x15), u8(0), u8(0), u8(0), u8(0), // call [rip+disp] -> eager ucrt!puts
+        u8(0xff), u8(0x15), u8(0), u8(0), u8(0), u8(0), // call [rip+disp] -> eager ordinal ws2_32#115
+        u8(0xff), u8(0x15), u8(0), u8(0), u8(0), u8(0), // call [rip+disp] -> delay d3d12!D3D12CreateDevice
+        u8(0x48), u8(0x8d), u8(0x05), u8(0), u8(0), u8(0), u8(0), // lea rax, [rip+disp] -> global+0
+    ]
+    mut ord_sym := imports.symbol_spec("ws2_32", "WSAStartup")
+    ord_sym.ordinal = 115
+    mut delay_sym := imports.symbol_spec("d3d12", "D3D12CreateDevice")
+    delay_sym.delay = true
+    specs: []imports.SymbolSpec = [
+        imports.symbol_spec("kernel32", "ExitProcess"),
+        imports.symbol_spec("ucrt", "puts"),
+        move ord_sym,
+        move delay_sym,
+    ]
+    sites: []i32 = [2, 8, 14, 20, 27]
+    slots: []i32 = [0, 1, 2, 3, -1]
+
+    mut cfg := pe.modern_config(pe.subsystem_gui(), true, true)
+    // Add 2 unwind entries intentionally out of order to verify sorting!
+    cfg.unwind = [
+        pe.UnwindEntry { start_off: 16, end_off: 31, prolog_size: 4, frame_size: 256, frame_reg: 0, saved_reg_mask: 8 },
+        pe.UnwindEntry { start_off: 0, end_off: 16, prolog_size: 4, frame_size: 40, frame_reg: 5, saved_reg_mask: 40 },
+    ]
+
+    img := pe.image_configured(&code, &specs, &sites, &slots, 64, &cfg)
+    lfanew := i32(u32_le(&img, 60))
+    opt := lfanew + 24
+    num_sec := u16_le(&img, lfanew + 6)
+    assert(num_sec == 6) // .text, .rdata, .data, .pdata, .rsrc, .reloc
+    headers_size := i32(u32_le(&img, opt + 60))
+    assert(headers_size == 1024) // dynamically expanded beyond 512!
+    assert(u16_le(&img, opt + 68) == 2) // IMAGE_SUBSYSTEM_WINDOWS_GUI
+    assert(u16_le(&img, opt + 70) == 0x8160) // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TSA
+
+    sec_off := opt + 240
+    // Check DataDirectories:
+    // dir 1: Import Table (opt + 120)
+    // dir 2: Resource Table (opt + 128)
+    // dir 3: Exception Table (opt + 136)
+    // dir 5: Base Reloc Table (opt + 152)
+    // dir 12: IAT (opt + 208)
+    // dir 13: Delay Import Table (opt + 216)
+    imp_rva := u32_le(&img, opt + 120)
+    rsrc_rva := u32_le(&img, opt + 128); rsrc_sz := u32_le(&img, opt + 132)
+    pdata_rva := u32_le(&img, opt + 136); pdata_sz := u32_le(&img, opt + 140)
+    reloc_rva := u32_le(&img, opt + 152); reloc_sz := u32_le(&img, opt + 156)
+    iat_rva := u32_le(&img, opt + 208)
+    delay_rva := u32_le(&img, opt + 216); delay_sz := u32_le(&img, opt + 220)
+
+    assert(imp_rva > 0 && iat_rva > 0)
+    assert(rsrc_rva > 0 && rsrc_sz > 88)
+    assert(pdata_rva > 0 && pdata_sz == 24) // 2 RUNTIME_FUNCTION * 12 bytes
+    assert(reloc_rva > 0 && reloc_sz == 12)
+    assert(delay_rva > 0 && delay_sz == 64) // 1 ImgDelayDescr + null terminator
+
+    // Verify .pdata sorting and UNWIND_INFO version == 1
+    pdata_off := pe_rva_to_off(&img, sec_off, num_sec, pdata_rva)
+    assert(u32_le(&img, pdata_off + 0) == 0x1000 && u32_le(&img, pdata_off + 4) == 0x1010)
+    assert(u32_le(&img, pdata_off + 12) == 0x1010 && u32_le(&img, pdata_off + 16) == 0x101f)
+    uinfo0_off := pe_rva_to_off(&img, sec_off, num_sec, u32_le(&img, pdata_off + 8))
+    assert(img[uinfo0_off] == 1) // Version 1, Flags 0
+
+    // Verify .rsrc manifest XML
+    rsrc_off := pe_rva_to_off(&img, sec_off, num_sec, rsrc_rva)
+    xml_rva := u32_le(&img, rsrc_off + 72)
+    xml_sz := i32(u32_le(&img, rsrc_off + 76))
+    xml_off := pe_rva_to_off(&img, sec_off, num_sec, xml_rva)
+    xml_text := bytes.decode_range(&img, xml_off, xml_off + xml_sz).unwrap_or_default()
+    assert(text.contains(xml_text, "PerMonitorV2"))
+    assert(text.contains(xml_text, "<activeCodePage"))
+    assert(text.contains(xml_text, "UTF-8"))
+
+    // Verify Delay-Load Descriptor points to d3d12.dll and writable .data HMODULE & Delay IAT
+    delay_off := pe_rva_to_off(&img, sec_off, num_sec, delay_rva)
+    assert(u32_le(&img, delay_off + 0) == 1) // dlattrRva
+    dll_name_off := pe_rva_to_off(&img, sec_off, num_sec, u32_le(&img, delay_off + 4))
+    assert(read_cstr(&img, dll_name_off) == "d3d12.dll")
+    delay_iat_rva := u32_le(&img, delay_off + 12)
+    // Verify call site #3 (offset 20) was patched to delay_iat_rva!
+    disp_delay := i32(u32_le(&img, headers_size + 20))
+    assert(i64(0x1000 + 20 + 4 + disp_delay) == delay_iat_rva)
+
+    // Verify import-by-ordinal #115 in eager IAT for ws2_32.dll (slot 2 -> offset 20 in text is slot 3; slot 2 is at text offset 14)
+    disp_ord := i32(u32_le(&img, headers_size + 14))
+    ord_iat_rva := i64(0x1000 + 14 + 4 + disp_ord)
+    ord_iat_off := pe_rva_to_off(&img, sec_off, num_sec, ord_iat_rva)
+    ord_thunk := i64_le(&img, ord_iat_off)
+    assert(ord_thunk < 0 && ord_thunk.bit_and(65535) == 115) // IMAGE_ORDINAL_FLAG64 | 115
+
+    print("PASS pe_upgrades")
+}
+
+fn main() {
+    work := "/tmp/dunder-emitter-test-" + sys.pid().str()
+    assert(fs.mkdir_all(work.clone()).ok)
+    test_logical_library_registry()
+    test_macho_upgrades(work.clone())
+    test_elf_upgrades()
+    test_pe_upgrades()
+    _ := run_cmd("/bin/rm", ["-rf", work])
+    print("ALL NATIVE EMITTER TESTS PASSED")
+}
