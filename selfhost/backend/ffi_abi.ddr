@@ -1,6 +1,8 @@
 import foreign_operation as foreign_abi
 import arm64 as arm
 import ffi_arm64 as abi
+import abi_aapcs64 as aapcs64
+import abi_sysv_x64 as sysv64
 import ..frontend.frontend_types as ft
 import imports as native_libs
 import ..frontend.unsigned
@@ -31,6 +33,13 @@ fn native_address(code: &mut arm.Code, patches: &mut Patches, offset: i32, dst: 
     }
     arm.native_address(&mut code, dst)
 }
+fn import_symbol_address(code: &mut arm.Code, patches: &mut Patches, slot: i32, dst: i32) {
+    if !code.checking {
+        patches.sites.push(arm.position(&code) * 4)
+        patches.slots.push(slot)
+    }
+    arm.native_address(&mut code, dst)
+}
 pub fn static_address(code: &mut arm.Code, patches: &mut Patches, offset: i32) {
     native_address(&mut code, &mut patches, offset, 16)
 }
@@ -44,6 +53,17 @@ pub fn transfer_c(code: &mut arm.Code, ty: i32, packed: i32, reg: i32, base: i32
     if width == 2 { kind = 9 }
     if width == 4 { kind = 10 }
     unsigned.transfer(&mut code, kind, reg, base, load)
+}
+
+fn store_stack_scalar(code: &mut arm.Code, ty: i32, packed: i32, base_reg: i32, slot_width: i32) {
+    width := ft.foreign_width(packed)
+    if slot_width == 8 && width < 8 {
+        signed := ty == 1 || ty == 16
+        arm.bitfield(&mut code, signed, true, 0, 0, 0, width * 8 - 1)
+        store_mem(&mut code, 0, base_reg, 0)
+        return
+    }
+    transfer_c(&mut code, ty, packed, 0, base_reg, false)
 }
 
 pub fn library_name(lib: string, macos: bool) -> string { native_libs.library_name(lib, macos) }
@@ -82,6 +102,222 @@ pub fn inline_descriptor(code: &mut arm.Code, count: i32, layout: i32, slots: &m
     arm.store(&mut code, length, 0); arm.store(&mut code, cap, 0)
     arm.store(&mut code, clone, 31); arm.store(&mut code, drop, 31)
     arm.imm(&mut code, 0, i64(layout)); arm.store(&mut code, last, 0); arm.address(&mut code, data)
+}
+
+fn emit_scalar_return_normalize(code: &mut arm.Code, ret_ty: i32) {
+    if ret_ty == 1 || ret_ty == 16 {
+        arm.bitfield(&mut code, true, true, 0, 0, 0, ft.foreign_width(ret_ty) * 8 - 1)
+    } else if ret_ty == 6 { abi.fp(&mut code, 0, 0, 4, false) }
+    else if ret_ty == 7 { abi.fp(&mut code, 0, 0, 8, false) }
+    else if unsigned.has(ret_ty) { unsigned.mask(&mut code, ret_ty) }
+}
+
+pub fn emit_foreign_call_v2(code: &mut arm.Code, reg: &ft.TypeRegistry, param_types: &[]i32,
+    ret_ty: i32, variadic_fixed: i32, callee: i32, values: &[]i32, result_slot: i32,
+    cb_ctx_slot: i32, cb_before_call: i32, cb_push: i32, cb_pop: i32, has_callbacks: bool, patches: &mut Patches) {
+    if code.platform == 0 || code.platform == 1 {
+        plan := aapcs64.plan_call(&reg, code.platform == 0, variadic_fixed, &param_types, ret_ty)
+        if has_callbacks {
+            arm.branch(&mut code, cb_before_call, 1)
+            arm.store(&mut code, cb_ctx_slot, 0)
+        }
+        if plan.outgoing > 0 { foreign_abi.emit(&mut code, .Reserve, 0, 0, plan.outgoing) }
+        arm.load(&mut code, callee); arm.mov(&mut code, 17, 0)
+        mut i := values.len - 1
+        while i >= 0 {
+            arg := &plan.args[i]
+            ty := param_types[i]
+            packed := ft.storage_type(&reg, ty, code.platform)
+            arm.load(&mut code, values[i])
+            if arg.kind == aapcs64.ARG_GPR {
+                if arg.reg0 != 0 { arm.mov(&mut code, arg.reg0, 0) }
+            } else if arg.kind == aapcs64.ARG_FP {
+                abi.fp(&mut code, arg.reg0, 0, arg.total_size, true)
+            } else if arg.kind == aapcs64.ARG_STACK_SCALAR {
+                foreign_abi.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                store_stack_scalar(&mut code, ty, packed, 9, arg.slot_width)
+            } else if arg.kind == aapcs64.ARG_AGG_HFA {
+                abi.hfa(&mut code, 0, arg.reg0, arg.hfa_shape, true)
+            } else if arg.kind == aapcs64.ARG_AGG_GPR {
+                arm.mov(&mut code, 12, 0)
+                if arg.total_size > 8 {
+                    abi.load_word_partial(&mut code, arg.reg0 + 1, 12, 8, arg.total_size - 8)
+                }
+                if arg.reg0 != 0 {
+                    abi.load_word_partial(&mut code, arg.reg0, 12, 0, if arg.total_size > 8 { 8 } else { arg.total_size })
+                }
+            } else if arg.kind == aapcs64.ARG_AGG_INDIRECT_GPR {
+                if arg.reg0 != 0 { arm.mov(&mut code, arg.reg0, 0) }
+            } else if arg.kind == aapcs64.ARG_AGG_INDIRECT_STACK {
+                foreign_abi.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                store_mem(&mut code, 0, 9, 0)
+            } else {
+                foreign_abi.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                abi.copy(&mut code, 9, 0, arg.total_size)
+            }
+            i = i - 1
+        }
+        if plan.ret.kind == aapcs64.RET_INDIRECT {
+            arm.load(&mut code, result_slot)
+            arm.mov(&mut code, 8, 0)
+        }
+        for idx in 0..values.len {
+            arg := &plan.args[idx]
+            if (arg.kind == aapcs64.ARG_GPR || arg.kind == aapcs64.ARG_AGG_INDIRECT_GPR) && arg.reg0 == 0 {
+                arm.load(&mut code, values[idx])
+            } else if arg.kind == aapcs64.ARG_AGG_GPR && arg.reg0 == 0 {
+                arm.load(&mut code, values[idx])
+                arm.mov(&mut code, 12, 0)
+                abi.load_word_partial(&mut code, 0, 12, 0, if arg.total_size > 8 { 8 } else { arg.total_size })
+            }
+        }
+        foreign_abi.emit(&mut code, .Invoke, plan.gp_used, plan.fp_used, plan.outgoing)
+        if has_callbacks {
+            arm.load_into(&mut code, cb_ctx_slot, 16)
+            for r in 19..25 { abi.load(&mut code, r, 16, (r - 19) * 8, 8) }
+        }
+        if plan.outgoing > 0 { foreign_abi.emit(&mut code, .Release, 0, 0, plan.outgoing) }
+        if plan.ret.kind == aapcs64.RET_AGG_GPR {
+            arm.mov(&mut code, 12, 0)
+            if plan.ret.total_size > 8 { arm.mov(&mut code, 13, 1) }
+            arm.load(&mut code, result_slot)
+            abi.store_word_partial(&mut code, 12, 0, 0, if plan.ret.total_size > 8 { 8 } else { plan.ret.total_size })
+            if plan.ret.total_size > 8 { abi.store_word_partial(&mut code, 13, 0, 8, plan.ret.total_size - 8) }
+        } else if plan.ret.kind == aapcs64.RET_AGG_HFA {
+            arm.load(&mut code, result_slot)
+            abi.hfa(&mut code, 0, 0, plan.ret.hfa_shape, false)
+        } else if plan.ret.kind == aapcs64.RET_INDIRECT {
+            arm.load(&mut code, result_slot)
+        } else if plan.ret.kind != aapcs64.RET_VOID {
+            emit_scalar_return_normalize(&mut code, ret_ty)
+        }
+        return
+    }
+    if code.platform == 2 {
+        plan := sysv64.plan_call(&reg, &param_types, ret_ty)
+        if has_callbacks {
+            arm.branch(&mut code, cb_before_call, 1)
+        }
+        if plan.outgoing > 0 { foreign_abi.emit(&mut code, .Reserve, 0, 0, plan.outgoing) }
+        arm.load(&mut code, callee); arm.mov(&mut code, 17, 0)
+        mut i := values.len - 1
+        while i >= 0 {
+            arg := &plan.args[i]
+            ty := param_types[i]
+            packed := ft.storage_type(&reg, ty, code.platform)
+            arm.load(&mut code, values[i])
+            if arg.kind == sysv64.ARG_GPR {
+                if arg.reg0 != 0 { arm.mov(&mut code, arg.reg0, 0) }
+            } else if arg.kind == sysv64.ARG_XMM {
+                abi.fp(&mut code, arg.reg0, 0, arg.total_size, true)
+            } else if arg.kind == sysv64.ARG_STACK_SCALAR {
+                foreign_abi.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                store_stack_scalar(&mut code, ty, packed, 9, 8)
+            } else if arg.kind == sysv64.ARG_AGG_STACK {
+                foreign_abi.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                abi.copy(&mut code, 9, 0, arg.total_size)
+            } else {
+                arm.mov(&mut code, 12, 0)
+                if arg.eb_count == 2 {
+                    if arg.c1 == sysv64.CLASS_SSE {
+                        abi.load_word_partial(&mut code, 13, 12, 8, arg.size1)
+                        abi.fp(&mut code, arg.reg1, 13, if arg.size1 <= 4 { 4 } else { 8 }, true)
+                    } else if arg.reg1 != 0 {
+                        abi.load_word_partial(&mut code, arg.reg1, 12, 8, arg.size1)
+                    }
+                }
+                if arg.c0 == sysv64.CLASS_SSE {
+                    abi.load_word_partial(&mut code, 13, 12, 0, arg.size0)
+                    abi.fp(&mut code, arg.reg0, 13, if arg.size0 <= 4 { 4 } else { 8 }, true)
+                } else if arg.reg0 != 0 {
+                    abi.load_word_partial(&mut code, arg.reg0, 12, 0, arg.size0)
+                }
+            }
+            i = i - 1
+        }
+        if plan.ret.kind == sysv64.RET_INDIRECT {
+            arm.load(&mut code, result_slot)
+        } else {
+            for idx in 0..values.len {
+                arg := &plan.args[idx]
+                if arg.kind == sysv64.ARG_GPR && arg.reg0 == 0 {
+                    arm.load(&mut code, values[idx])
+                } else if arg.kind == sysv64.ARG_AGG_REGS && arg.c0 == sysv64.CLASS_INT && arg.reg0 == 0 {
+                    arm.load(&mut code, values[idx])
+                    arm.mov(&mut code, 12, 0)
+                    abi.load_word_partial(&mut code, 0, 12, 0, arg.size0)
+                } else if arg.kind == sysv64.ARG_AGG_REGS && arg.eb_count == 2 && arg.c1 == sysv64.CLASS_INT && arg.reg1 == 0 {
+                    arm.load(&mut code, values[idx])
+                    arm.mov(&mut code, 12, 0)
+                    abi.load_word_partial(&mut code, 0, 12, 8, arg.size1)
+                }
+            }
+        }
+        foreign_abi.emit(&mut code, .Invoke, plan.gp_used, plan.fp_used, plan.outgoing)
+        if plan.outgoing > 0 { foreign_abi.emit(&mut code, .Release, 0, 0, plan.outgoing) }
+        if plan.ret.kind == sysv64.RET_INDIRECT {
+            arm.load(&mut code, result_slot)
+        } else if plan.ret.kind == sysv64.RET_AGG_REGS {
+            arm.mov(&mut code, 12, 0)
+            arm.mov(&mut code, 13, 1)
+            arm.load(&mut code, result_slot)
+            if plan.ret.c0 == sysv64.CLASS_INT {
+                src0 := if plan.ret.reg0 == 0 { 12 } else { 13 }
+                abi.store_word_partial(&mut code, src0, 0, 0, plan.ret.size0)
+            } else {
+                abi.fp(&mut code, plan.ret.reg0, 14, if plan.ret.size0 <= 4 { 4 } else { 8 }, false)
+                abi.store_word_partial(&mut code, 14, 0, 0, plan.ret.size0)
+            }
+            if plan.ret.eb_count == 2 {
+                if plan.ret.c1 == sysv64.CLASS_INT {
+                    src1 := if plan.ret.reg1 == 0 { 12 } else { 13 }
+                    abi.store_word_partial(&mut code, src1, 0, 8, plan.ret.size1)
+                } else {
+                    abi.fp(&mut code, plan.ret.reg1, 14, if plan.ret.size1 <= 4 { 4 } else { 8 }, false)
+                    abi.store_word_partial(&mut code, 14, 0, 8, plan.ret.size1)
+                }
+            }
+        } else if plan.ret.kind != sysv64.RET_VOID {
+            emit_scalar_return_normalize(&mut code, ret_ty)
+        }
+        return
+    }
+    // Windows x86_64 (platform == 5)
+    ret_c_record := ft.is_c_record(&reg, ret_ty)
+    ret_size := ft.c_size(&reg, ret_ty)
+    indirect_result := ret_c_record && !win_register_record(ret_size)
+    mut locations: []i32 = []
+    locations.reserve(param_types.len)
+    mut win_slot := if indirect_result { 1 } else { 0 }
+    mut gp := win_slot
+    mut fp := win_slot
+    mut outgoing := 32
+    for idx in 0..param_types.len {
+        ty := param_types[idx]
+        agg := ft.is_c_record(&reg, ty)
+        is_fp := !agg && floats.has(ty)
+        if win_slot < 4 {
+            locations.push(if is_fp { 8 + win_slot } else { win_slot })
+            win_slot += 1; gp = win_slot; fp = win_slot
+        } else {
+            off := 32 + (win_slot - 4) * 8
+            locations.push(16 + off)
+            win_slot += 1
+            outgoing = off + 8
+        }
+    }
+    outgoing = (outgoing + 15) / 16 * 16
+    mut spec := ForeignCallSpec { ret: ret_ty, ret_c_record: ret_c_record, ret_hfa: 0, ret_size: ret_size,
+        variadic: variadic_fixed >= 0, arg_types: [], arg_packed: [], arg_c_record: [], arg_hfas: [], arg_sizes: [] }
+    for idx in 0..param_types.len {
+        ty := param_types[idx]
+        spec.arg_types.push(ty)
+        spec.arg_packed.push(ft.storage_type(&reg, ty, code.platform))
+        spec.arg_c_record.push(ft.is_c_record(&reg, ty))
+        spec.arg_hfas.push(0)
+        spec.arg_sizes.push(ft.c_size(&reg, ty))
+    }
+    emit_foreign_call(&mut code, &spec, callee, &values, &locations, result_slot, indirect_result, gp, fp, outgoing, has_callbacks, cb_push, cb_pop, &mut patches, -1, -1)
 }
 
 pub fn emit_foreign_call(code: &mut arm.Code, spec: &ForeignCallSpec, callee: i32,
@@ -141,7 +377,8 @@ pub fn emit_foreign_call(code: &mut arm.Code, spec: &ForeignCallSpec, callee: i3
             if code.platform == 5 && spec.variadic { arm.mov(&mut code, where - 8, 0) }
         } else {
             foreign_abi.emit(&mut code, .StackAddress, 9, 0, where - 16)
-            transfer_c(&mut code, ty, spec.arg_packed[i], 0, 9, false)
+            slot_w := if code.platform == 0 && !spec.variadic { ft.foreign_width(spec.arg_packed[i]) } else { 8 }
+            store_stack_scalar(&mut code, ty, spec.arg_packed[i], 9, slot_w)
         }
         i = i - 1
     }
@@ -178,12 +415,9 @@ pub fn emit_foreign_call(code: &mut arm.Code, spec: &ForeignCallSpec, callee: i3
             }
             else { abi.hfa(&mut code, 0, 0, spec.ret_hfa, false) }
         }
-    } else if spec.ret == 1 || spec.ret == 16 {
-        arm.bitfield(&mut code, true, true, 0, 0, 0, ft.foreign_width(spec.ret) * 8 - 1)
+    } else {
+        emit_scalar_return_normalize(&mut code, spec.ret)
     }
-    else if spec.ret == 6 { abi.fp(&mut code, 0, 0, 4, false) }
-    else if spec.ret == 7 { abi.fp(&mut code, 0, 0, 8, false) }
-    else if unsigned.has(spec.ret) { unsigned.mask(&mut code, spec.ret) }
     if has_callbacks {
         arm.store(&mut code, callee, 0)
         foreign_abi.emit(&mut code, .StackAddress, 0, 0, 0)
@@ -193,6 +427,523 @@ pub fn emit_foreign_call(code: &mut arm.Code, spec: &ForeignCallSpec, callee: i3
         foreign_abi.emit(&mut code, .Release, 0, 0, 80)
         arm.load(&mut code, callee)
     }
+}
+
+pub fn emit_callback_runtime(code: &mut arm.Code, patches: &mut Patches, cb_before_call: i32,
+    cb_enter_label: i32, atomic_load_i64: i32, atomic_store_i64: i32, atomic_cas_i64: i32,
+    use_tls: bool, sym_key_create: i32, sym_getspecific: i32, sym_setspecific: i32) {
+    if patches.globals < 64 { patches.globals = 64 }
+    if code.platform == 2 {
+        // x86_64-linux
+        arm.mark(&mut code, cb_before_call)
+        if !use_tls {
+            static_address(&mut code, &mut patches, 0)
+            foreign_abi.emit(&mut code, .SaveRuntime, 0, 0, 0)
+            arm.return_to_caller(&mut code)
+            arm.mark(&mut code, cb_enter_label)
+            native_address(&mut code, &mut patches, 0, 0)
+            arm.emit(&mut code, 0xfc00003a)
+            return
+        }
+        already_reg := arm.label(&mut code)
+        arm.emit(&mut code, 0xfc000031)
+        arm.branch(&mut code, already_reg, 19)
+        x86_skip_args := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 24, 0, false); arm.branch(&mut code, x86_skip_args, 2)
+        static_address(&mut code, &mut patches, 0)
+        abi.store(&mut code, 23, 16, 16, 8)
+        abi.store(&mut code, 24, 16, 24, 8)
+        arm.mark(&mut code, x86_skip_args)
+        arm.emit(&mut code, 0xfc000032)
+        arm.branch(&mut code, cb_enter_label, 1)
+        arm.mark(&mut code, already_reg)
+        arm.return_to_caller(&mut code)
+
+        arm.mark(&mut code, cb_enter_label)
+        native_address(&mut code, &mut patches, 0, 0)
+        arm.emit(&mut code, 0xfc000035)
+        import_symbol_address(&mut code, &mut patches, sym_key_create, 0)
+        arm.emit(&mut code, 0xfc000036)
+        import_symbol_address(&mut code, &mut patches, sym_getspecific, 0)
+        arm.emit(&mut code, 0xfc000037)
+        import_symbol_address(&mut code, &mut patches, sym_setspecific, 0)
+        arm.emit(&mut code, 0xfc000038)
+        arm.emit(&mut code, 0xfc000039)
+        return
+    }
+    if code.platform != 0 && code.platform != 1 { return }
+    // ARM64 (arm64-macos and arm64-linux)
+    if !use_tls {
+        arm.mark(&mut code, cb_before_call)
+        static_address(&mut code, &mut patches, 0)
+        for r in 19..25 { abi.store(&mut code, r, 16, (r - 19) * 8, 8) }
+        arm.mov(&mut code, 0, 16)
+        arm.return_to_caller(&mut code)
+
+        arm.mark(&mut code, cb_enter_label)
+        static_address(&mut code, &mut patches, 0)
+        for r in 19..25 { abi.load(&mut code, r, 16, (r - 19) * 8, 8) }
+        arm.mov(&mut code, 0, 16)
+        arm.return_to_caller(&mut code)
+        return
+    }
+
+    dtor_label := arm.label(&mut code)
+    ensure_key_label := arm.label(&mut code)
+
+    // 1. cb_tls_dtor(void *ctx): C AAPCS64 destructor called by OS on thread exit
+    arm.mark(&mut code, dtor_label)
+    dtor_frame := arm.prologue(&mut code); arm.frame(&mut code, dtor_frame, 2)
+    dtor_done := arm.label(&mut code)
+    dtor_unmap_ctx := arm.label(&mut code)
+    arm.branch(&mut code, dtor_done, 18)
+    arm.store(&mut code, 0, 0)
+    abi.load(&mut code, 10, 0, 48, 8)
+    arm.compare_immediate(&mut code, 10, 1, false); arm.branch(&mut code, dtor_unmap_ctx, 3)
+    abi.load(&mut code, 10, 0, 16, 8)
+    arm.compare_immediate(&mut code, 10, 0, false); arm.branch(&mut code, dtor_unmap_ctx, 2)
+    // Walk extension slabs at [root_pool + 240]
+    abi.load(&mut code, 11, 10, 240, 8)
+    slab_loop := arm.label(&mut code); slab_done := arm.label(&mut code)
+    arm.mark(&mut code, slab_loop)
+    arm.compare_immediate(&mut code, 11, 0, false); arm.branch(&mut code, slab_done, 2)
+    abi.load(&mut code, 12, 11, 0, 8)
+    abi.load(&mut code, 1, 11, 8, 8)
+    arm.store(&mut code, 1, 12)
+    arm.mov(&mut code, 0, 11)
+    arm.syscall(&mut code, 33554505, 215)
+    arm.load_into(&mut code, 1, 11)
+    arm.branch(&mut code, slab_loop, 0)
+    arm.mark(&mut code, slab_done)
+    // Unmap root pool
+    arm.load(&mut code, 0)
+    abi.load(&mut code, 0, 0, 16, 8)
+    abi.load(&mut code, 1, 0, 224, 8)
+    have_root_len := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 1, 0, false); arm.branch(&mut code, have_root_len, 3)
+    arm.imm(&mut code, 1, 65536)
+    arm.mark(&mut code, have_root_len)
+    arm.syscall(&mut code, 33554505, 215)
+    // Unmap ctx page
+    arm.mark(&mut code, dtor_unmap_ctx)
+    arm.load(&mut code, 0)
+    arm.imm(&mut code, 1, 4096)
+    arm.syscall(&mut code, 33554505, 215)
+    arm.mark(&mut code, dtor_done)
+    arm.ret(&mut code)
+
+    // 2. cb_ensure_tls_key() -> x0 = pthread_key_t
+    arm.mark(&mut code, ensure_key_label)
+    ek_frame := arm.prologue(&mut code); arm.frame(&mut code, ek_frame, 0)
+    ek_spin := arm.label(&mut code); ek_ready := arm.label(&mut code)
+    arm.mark(&mut code, ek_spin)
+    static_address(&mut code, &mut patches, 0); arm.mov(&mut code, 0, 16)
+    arm.branch(&mut code, atomic_load_i64, 1)
+    arm.compare_immediate(&mut code, 0, 2, false); arm.branch(&mut code, ek_ready, 2)
+    arm.compare_immediate(&mut code, 0, 1, false); arm.branch(&mut code, ek_spin, 2)
+    static_address(&mut code, &mut patches, 0); arm.mov(&mut code, 0, 16)
+    arm.imm(&mut code, 1, 0); arm.imm(&mut code, 2, 1)
+    arm.branch(&mut code, atomic_cas_i64, 1)
+    arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, ek_spin, 3)
+    arm.branch(&mut code, dtor_label, 20); arm.mov(&mut code, 1, 0)
+    static_address(&mut code, &mut patches, 8); arm.mov(&mut code, 0, 16)
+    import_symbol_address(&mut code, &mut patches, sym_key_create, 16)
+    arm.emit(&mut code, 3594453504)
+    ek_ok := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, ek_ok, 2)
+    arm.exit(&mut code, 112)
+    arm.mark(&mut code, ek_ok)
+    static_address(&mut code, &mut patches, 0); arm.mov(&mut code, 0, 16)
+    arm.imm(&mut code, 1, 2)
+    arm.branch(&mut code, atomic_store_i64, 1)
+    arm.mark(&mut code, ek_ready)
+    static_address(&mut code, &mut patches, 8)
+    abi.load(&mut code, 0, 16, 0, 8)
+    arm.ret(&mut code)
+
+    // 3. cb_before_call(): ensure TLS ctx for Dunder thread, write x19..x24, return ctx in x0
+    arm.mark(&mut code, cb_before_call)
+    bc_frame := arm.prologue(&mut code); arm.frame(&mut code, bc_frame, 2)
+    bc_skip_args := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 24, 0, false); arm.branch(&mut code, bc_skip_args, 2)
+    static_address(&mut code, &mut patches, 0)
+    abi.store(&mut code, 23, 16, 16, 8)
+    abi.store(&mut code, 24, 16, 24, 8)
+    arm.mark(&mut code, bc_skip_args)
+    arm.branch(&mut code, ensure_key_label, 1)
+    arm.store(&mut code, 0, 0)
+    import_symbol_address(&mut code, &mut patches, sym_getspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    bc_have := arm.label(&mut code)
+    arm.branch(&mut code, bc_have, 19)
+    // mmap(NULL, 4096, RW, PRIVATE|ANON, -1, 0)
+    arm.imm(&mut code, 0, 0); arm.imm(&mut code, 1, 4096); arm.imm(&mut code, 2, 3)
+    arm.imm(&mut code, 3, if code.platform == 0 { 4098 } else { 34 })
+    arm.imm(&mut code, 4, -1); arm.imm(&mut code, 5, 0)
+    arm.syscall(&mut code, 33554629, 222)
+    bc_map_ok := arm.label(&mut code)
+    if code.platform == 0 { arm.branch(&mut code, bc_map_ok, 5) }
+    else { arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, bc_map_ok, 12) }
+    arm.exit(&mut code, 112)
+    arm.mark(&mut code, bc_map_ok)
+    arm.store(&mut code, 1, 0)
+    arm.mov(&mut code, 1, 0)
+    arm.load(&mut code, 0)
+    import_symbol_address(&mut code, &mut patches, sym_setspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    arm.load(&mut code, 1)
+    arm.mark(&mut code, bc_have)
+    for r in 19..25 { abi.store(&mut code, r, 0, (r - 19) * 8, 8) }
+    arm.ret(&mut code)
+
+    // 4. cb_enter_thread(): get or lazily attach foreign thread TLS ctx, load x19..x24, return ctx in x0
+    arm.mark(&mut code, cb_enter_label)
+    ce_frame := arm.prologue(&mut code); arm.frame(&mut code, ce_frame, 2)
+    arm.branch(&mut code, ensure_key_label, 1)
+    arm.store(&mut code, 0, 0)
+    import_symbol_address(&mut code, &mut patches, sym_getspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    ce_have := arm.label(&mut code)
+    arm.branch(&mut code, ce_have, 19)
+    // Lazy foreign thread attachment
+    arm.imm(&mut code, 0, 0); arm.imm(&mut code, 1, 4096); arm.imm(&mut code, 2, 3)
+    arm.imm(&mut code, 3, if code.platform == 0 { 4098 } else { 34 })
+    arm.imm(&mut code, 4, -1); arm.imm(&mut code, 5, 0)
+    arm.syscall(&mut code, 33554629, 222)
+    ce_map_ok := arm.label(&mut code)
+    if code.platform == 0 { arm.branch(&mut code, ce_map_ok, 5) }
+    else { arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, ce_map_ok, 12) }
+    arm.exit(&mut code, 112)
+    arm.mark(&mut code, ce_map_ok)
+    arm.store(&mut code, 1, 0)
+    static_address(&mut code, &mut patches, 0)
+    abi.load(&mut code, 10, 16, 16, 8); abi.store(&mut code, 10, 0, 32, 8)
+    abi.load(&mut code, 10, 16, 24, 8); abi.store(&mut code, 10, 0, 40, 8)
+    arm.imm(&mut code, 10, 1); abi.store(&mut code, 10, 0, 48, 8)
+    arm.mov(&mut code, 1, 0)
+    arm.load(&mut code, 0)
+    import_symbol_address(&mut code, &mut patches, sym_setspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    arm.load(&mut code, 1)
+    arm.mark(&mut code, ce_have)
+    for r in 19..25 { abi.load(&mut code, r, 0, (r - 19) * 8, 8) }
+    arm.ret(&mut code)
+}
+
+fn alloc_cb_buf(slots: &mut i32, size: i32) -> i32 {
+    mut words := (size + 7) / 8
+    if words < 1 { words = 1 }
+    slots = slots + words
+    slots - 1
+}
+
+fn extend_cb_scalar(code: &mut arm.Code, ty: i32, reg: i32) {
+    if !floats.has(ty) && ft.foreign_width(ty) < 8 {
+        arm.bitfield(&mut code, ty == 1 || ty == 16, true, reg, reg, 0, ft.foreign_width(ty) * 8 - 1)
+    }
+}
+
+pub fn emit_callback_entry_v2(code: &mut arm.Code, reg: &ft.TypeRegistry, patches: &mut Patches,
+    alloc_record: i32, release_fn: i32, fn_label: i32, cb_label: i32, cb_enter_label: i32,
+    param_types: &[]i32, ret_ty: i32) {
+    if code.platform == 5 {
+        emit_callback_entry(&mut code, &mut patches, fn_label, cb_label, -1, &param_types, ret_ty)
+        return
+    }
+    if patches.globals < 64 { patches.globals = 64 }
+    arm.mark(&mut code, cb_label)
+    param_count := param_types.len
+    ret_c_record := ft.is_c_record(&reg, ret_ty)
+    ret_pod := ret_c_record && ft.is_pod_struct(&reg, ret_ty)
+
+    if code.platform == 0 || code.platform == 1 {
+        plan := aapcs64.plan_call(&reg, code.platform == 0, -1, &param_types, ret_ty)
+        arm.emit(&mut code, 2432697326) // add x14, sp, #0
+        frame := arm.prologue(&mut code)
+        // Fixed slots:
+        // 0..8   = saved incoming x0..x8 (x8 = sret)
+        // 9..16  = saved incoming d0..d7
+        // 17     = saved x14 (caller stack args)
+        // 18..27 = saved callee-saved x19..x28
+        // 28..35 = saved callee-saved d8..d15
+        // 36     = TLS ctx ptr
+        // 37..37+param_count-1 = Dunder parameter slots
+        mut total_slots := 37 + param_count
+        mut param_buf_slots: []i32 = []
+        param_buf_slots.reserve(param_count)
+        for p in 0..param_count {
+            ty := param_types[p]
+            if ft.is_c_record(&reg, ty) && ft.is_pod_struct(&reg, ty) {
+                param_buf_slots.push(alloc_cb_buf(&mut total_slots, ft.c_size(&reg, ty)))
+            } else {
+                param_buf_slots.push(-1)
+            }
+        }
+        mut ret_buf_slot := -1
+        if ret_pod {
+            ret_buf_slot = alloc_cb_buf(&mut total_slots, ft.pod_words(&reg, ret_ty) * 8)
+        }
+        mut ret_save_slot := -1
+        if ret_c_record {
+            ret_save_slot = total_slots; total_slots += 1
+        }
+        arm.frame(&mut code, frame, total_slots)
+
+        // Save incoming C args before calling cb_enter_thread
+        for r in 0..9 { arm.store(&mut code, r, r) }
+        for r in 0..8 { abi.fp(&mut code, r, 10, 8, false); arm.store(&mut code, 9 + r, 10) }
+        arm.store(&mut code, 17, 14)
+        // Save ALL callee-saved AAPCS64 registers (x19..x28, d8..d15)
+        for r in 19..29 { arm.store(&mut code, 18 + (r - 19), r) }
+        for r in 8..16 { abi.fp(&mut code, r, 10, 8, false); arm.store(&mut code, 28 + (r - 8), 10) }
+
+        // Attach/load per-thread Dunder runtime state (x19..x24) via OS TLS
+        arm.branch(&mut code, cb_enter_label, 1)
+        arm.store(&mut code, 36, 0)
+
+        // Unmarshal C parameters into Dunder param slots (37 + p)
+        for p in 0..param_count {
+            arg := &plan.args[p]
+            ty := param_types[p]
+            if !ft.is_c_record(&reg, ty) {
+                if arg.kind == aapcs64.ARG_GPR {
+                    arm.load_into(&mut code, arg.reg0, 10)
+                } else if arg.kind == aapcs64.ARG_FP {
+                    arm.load_into(&mut code, 9 + arg.reg0, 10)
+                    if ty == 6 { arm.bitfield(&mut code, false, true, 10, 10, 0, 31) }
+                } else {
+                    arm.load_into(&mut code, 17, 13)
+                    if arg.stack_off > 0 {
+                        arm.imm(&mut code, 10, i64(arg.stack_off))
+                        arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                    }
+                    abi.load(&mut code, 10, 13, 0, ft.foreign_width(ty))
+                }
+                extend_cb_scalar(&mut code, ty, 10)
+                arm.store(&mut code, 37 + p, 10)
+            } else {
+                // Allocate destination buffer (stack if POD, heap if >128B)
+                if param_buf_slots[p] >= 0 {
+                    arm.address(&mut code, param_buf_slots[p])
+                } else {
+                    arm.imm(&mut code, 0, i64(arg.total_size))
+                    arm.branch(&mut code, alloc_record, 1)
+                }
+                arm.store(&mut code, 37 + p, 0)
+                arm.mov(&mut code, 15, 0) // dst ptr in x15
+                if arg.kind == aapcs64.ARG_AGG_GPR {
+                    arm.load_into(&mut code, arg.reg0, 10)
+                    abi.store_word_partial(&mut code, 10, 15, 0, if arg.total_size > 8 { 8 } else { arg.total_size })
+                    if arg.total_size > 8 {
+                        arm.load_into(&mut code, arg.reg0 + 1, 10)
+                        abi.store_word_partial(&mut code, 10, 15, 8, arg.total_size - 8)
+                    }
+                } else if arg.kind == aapcs64.ARG_AGG_HFA {
+                    elem_sz := if arg.hfa_shape > 0 { 4 } else { 8 }
+                    cnt := if arg.hfa_shape > 0 { arg.hfa_shape } else { -arg.hfa_shape }
+                    for k in 0..cnt {
+                        arm.load_into(&mut code, 9 + arg.reg0 + k, 10)
+                        abi.store(&mut code, 10, 15, k * elem_sz, elem_sz)
+                    }
+                } else if arg.kind == aapcs64.ARG_AGG_INDIRECT_GPR {
+                    arm.load_into(&mut code, arg.reg0, 14)
+                    abi.copy(&mut code, 15, 14, arg.total_size)
+                } else if arg.kind == aapcs64.ARG_AGG_INDIRECT_STACK {
+                    arm.load_into(&mut code, 17, 13)
+                    if arg.stack_off > 0 {
+                        arm.imm(&mut code, 10, i64(arg.stack_off))
+                        arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                    }
+                    abi.load(&mut code, 14, 13, 0, 8)
+                    abi.copy(&mut code, 15, 14, arg.total_size)
+                } else {
+                    arm.load_into(&mut code, 17, 13)
+                    if arg.stack_off > 0 {
+                        arm.imm(&mut code, 10, i64(arg.stack_off))
+                        arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                    }
+                    abi.copy(&mut code, 15, 13, arg.total_size)
+                }
+            }
+        }
+
+        // Push hidden POD return buffer first (at highest offset = spilled), then spilled Dunder args >= 8 (in reverse)
+        if ret_pod {
+            arm.address(&mut code, ret_buf_slot)
+            arm.push(&mut code, 0)
+        }
+        mut p := param_count - 1
+        while p >= 8 { arm.load(&mut code, 37 + p); arm.push(&mut code, 0); p = p - 1 }
+        while p >= 0 { arm.load(&mut code, 37 + p); arm.mov(&mut code, p, 0); p = p - 1 }
+        arm.branch(&mut code, fn_label, 1)
+        for _ in 8..param_count { arm.pop(&mut code, 9) }
+        if ret_pod { arm.pop(&mut code, 9) }
+
+        // Marshal Dunder return value into AAPCS64 return regs / sret
+        if plan.ret.kind == aapcs64.RET_FP {
+            abi.fp(&mut code, 0, 0, ft.foreign_width(ret_ty), true)
+        } else if plan.ret.kind == aapcs64.RET_AGG_GPR {
+            arm.mov(&mut code, 15, 0)
+            abi.load_word_partial(&mut code, 0, 15, 0, if plan.ret.total_size > 8 { 8 } else { plan.ret.total_size })
+            if plan.ret.total_size > 8 {
+                abi.load_word_partial(&mut code, 1, 15, 8, plan.ret.total_size - 8)
+            }
+        } else if plan.ret.kind == aapcs64.RET_AGG_HFA {
+            abi.hfa(&mut code, 0, 0, plan.ret.hfa_shape, true)
+        } else if plan.ret.kind == aapcs64.RET_INDIRECT {
+            arm.store(&mut code, ret_save_slot, 0)
+            arm.load_into(&mut code, 8, 15) // saved x8 (sret)
+            abi.copy(&mut code, 15, 0, plan.ret.total_size)
+            if !ret_pod {
+                arm.load(&mut code, ret_save_slot)
+                arm.branch(&mut code, release_fn, 1)
+            }
+        }
+
+        // Write updated x19..x24 back to TLS ctx without touching x0, x1, v0..v3
+        arm.load_into(&mut code, 36, 16)
+        for r in 19..25 { abi.store(&mut code, r, 16, (r - 19) * 8, 8) }
+        // Restore ALL callee-saved AAPCS64 registers (d8..d15, x19..x28)
+        for r in 8..16 { arm.load_into(&mut code, 28 + (r - 8), 10); abi.fp(&mut code, r, 10, 8, true) }
+        for r in 19..29 { arm.load_into(&mut code, 18 + (r - 19), r) }
+        arm.ret(&mut code)
+        return
+    }
+
+    // x86_64-linux (platform == 2)
+    plan := sysv64.plan_call(&reg, &param_types, ret_ty)
+    arm.emit(&mut code, 0xfc000033)
+    arm.branch(&mut code, cb_enter_label, 1)
+    arm.emit(&mut code, 0xfc000034)
+    frame := arm.prologue(&mut code)
+    // Fixed slots on virtual stack:
+    // 0..5   = saved incoming x0..x5 (rdi, rsi, rdx, rcx, r8, r9)
+    // 6..13  = saved incoming v0..v7 (xmm0..xmm7)
+    // 14     = saved x14 (caller stack args)
+    // 15..15+param_count-1 = Dunder param slots
+    mut total_slots := 15 + param_count
+    mut param_buf_slots: []i32 = []
+    param_buf_slots.reserve(param_count)
+    for p in 0..param_count {
+        ty := param_types[p]
+        if ft.is_c_record(&reg, ty) && ft.is_pod_struct(&reg, ty) {
+            param_buf_slots.push(alloc_cb_buf(&mut total_slots, ft.c_size(&reg, ty)))
+        } else {
+            param_buf_slots.push(-1)
+        }
+    }
+    mut ret_buf_slot := -1
+    if ret_pod {
+        ret_buf_slot = alloc_cb_buf(&mut total_slots, ft.pod_words(&reg, ret_ty) * 8)
+    }
+    mut ret_save_slot := -1
+    if ret_c_record {
+        ret_save_slot = total_slots; total_slots += 1
+    }
+    arm.frame(&mut code, frame, total_slots)
+
+    for r in 0..6 { arm.store(&mut code, r, r) }
+    for r in 0..8 { abi.fp(&mut code, r, 10, 8, false); arm.store(&mut code, 6 + r, 10) }
+    arm.store(&mut code, 14, 14)
+
+    // Unmarshal SysV AMD64 parameters into Dunder param slots (15 + p)
+    for p in 0..param_count {
+        arg := &plan.args[p]
+        ty := param_types[p]
+        if !ft.is_c_record(&reg, ty) {
+            if arg.kind == sysv64.ARG_GPR {
+                arm.load_into(&mut code, arg.reg0, 10)
+            } else if arg.kind == sysv64.ARG_XMM {
+                arm.load_into(&mut code, 6 + arg.reg0, 10)
+                if ty == 6 { arm.bitfield(&mut code, false, true, 10, 10, 0, 31) }
+            } else {
+                arm.load_into(&mut code, 14, 13)
+                if arg.stack_off > 0 {
+                    arm.imm(&mut code, 10, i64(arg.stack_off))
+                    arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                }
+                abi.load(&mut code, 10, 13, 0, ft.foreign_width(ty))
+            }
+            extend_cb_scalar(&mut code, ty, 10)
+            arm.store(&mut code, 15 + p, 10)
+        } else {
+            if param_buf_slots[p] >= 0 {
+                arm.address(&mut code, param_buf_slots[p])
+            } else {
+                arm.imm(&mut code, 0, i64(arg.total_size))
+                arm.branch(&mut code, alloc_record, 1)
+            }
+            arm.store(&mut code, 15 + p, 0)
+            arm.mov(&mut code, 15, 0)
+            if arg.kind == sysv64.ARG_AGG_REGS {
+                if arg.c0 == sysv64.CLASS_INT {
+                    arm.load_into(&mut code, arg.reg0, 10)
+                } else {
+                    arm.load_into(&mut code, 6 + arg.reg0, 10)
+                }
+                abi.store_word_partial(&mut code, 10, 15, 0, arg.size0)
+                if arg.eb_count == 2 {
+                    if arg.c1 == sysv64.CLASS_INT {
+                        arm.load_into(&mut code, arg.reg1, 10)
+                    } else {
+                        arm.load_into(&mut code, 6 + arg.reg1, 10)
+                    }
+                    abi.store_word_partial(&mut code, 10, 15, 8, arg.size1)
+                }
+            } else {
+                arm.load_into(&mut code, 14, 13)
+                if arg.stack_off > 0 {
+                    arm.imm(&mut code, 10, i64(arg.stack_off))
+                    arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                }
+                abi.copy(&mut code, 15, 13, arg.total_size)
+            }
+        }
+    }
+
+    if ret_pod {
+        arm.address(&mut code, ret_buf_slot)
+        arm.push(&mut code, 0)
+    }
+    mut p := param_count - 1
+    while p >= 8 { arm.load(&mut code, 15 + p); arm.push(&mut code, 0); p = p - 1 }
+    while p >= 0 { arm.load(&mut code, 15 + p); arm.mov(&mut code, p, 0); p = p - 1 }
+    arm.branch(&mut code, fn_label, 1)
+    for _ in 8..param_count { arm.pop(&mut code, 9) }
+    if ret_pod { arm.pop(&mut code, 9) }
+
+    // Marshal Dunder return value into SysV AMD64 return regs / sret (rax, rdx, xmm0, xmm1)
+    if plan.ret.kind == sysv64.RET_XMM {
+        abi.fp(&mut code, 0, 0, ft.foreign_width(ret_ty), true)
+    } else if plan.ret.kind == sysv64.RET_AGG_REGS {
+        arm.mov(&mut code, 15, 0)
+        if plan.ret.eb_count == 2 {
+            if plan.ret.c1 == sysv64.CLASS_INT {
+                abi.load_word_partial(&mut code, plan.ret.reg1, 15, 8, plan.ret.size1)
+            } else {
+                abi.load_word_partial(&mut code, 13, 15, 8, plan.ret.size1)
+                abi.fp(&mut code, plan.ret.reg1, 13, if plan.ret.size1 <= 4 { 4 } else { 8 }, true)
+            }
+        }
+        if plan.ret.c0 == sysv64.CLASS_INT {
+            abi.load_word_partial(&mut code, plan.ret.reg0, 15, 0, plan.ret.size0)
+        } else {
+            abi.load_word_partial(&mut code, 13, 15, 0, plan.ret.size0)
+            abi.fp(&mut code, plan.ret.reg0, 13, if plan.ret.size0 <= 4 { 4 } else { 8 }, true)
+        }
+    } else if plan.ret.kind == sysv64.RET_INDIRECT {
+        arm.store(&mut code, ret_save_slot, 0)
+        arm.load_into(&mut code, 0, 15) // saved rdi (sret)
+        abi.copy(&mut code, 15, 0, plan.ret.total_size)
+        if !ret_pod {
+            arm.load(&mut code, ret_save_slot)
+            arm.branch(&mut code, release_fn, 1)
+        }
+        arm.load(&mut code, 0) // SysV AMD64 requires returning sret pointer in rax!
+    }
+
+    arm.leave_frame(&mut code)
+    arm.emit(&mut code, 4211081216)
 }
 
 pub fn emit_callback_entry(code: &mut arm.Code, patches: &mut Patches, fn_label: i32, cb_label: i32,

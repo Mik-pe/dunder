@@ -24,6 +24,8 @@ import typed_places as places
 import ..driver.compile_session as cs
 import deferred_blocks as deferred
 import ..backend.ffi_abi as fa
+import ..backend.abi_aapcs64 as aapcs64
+import ..backend.abi_sysv_x64 as sysv64
 import ..backend.imports as native_imports
 import ..driver.fragments
 import frontend_types as ft
@@ -216,6 +218,12 @@ fn import_c(c: &mut Session, symbol: string) -> i32 {
         if c.imports.libraries[i] == "c" && c.imports.symbols[i] == symbol { return i }
     }
     index := c.imports.symbols.len; c.imports.libraries.push("c"); c.imports.symbols.push(symbol.clone()); index
+}
+fn import_pthread(c: &mut Session, symbol: string) -> i32 {
+    for i in 0..c.imports.symbols.len {
+        if c.imports.symbols[i] == symbol { return i }
+    }
+    index := c.imports.symbols.len; c.imports.libraries.push("pthread"); c.imports.symbols.push(symbol.clone()); index
 }
 fn bind_task_runtime(c: &mut Session, rt: &runtime.Runtime, certificate: &tc.TaskCertificate) {
     mut iso_labels: []i32 = []; mut drop_labels: []i32 = []
@@ -968,6 +976,7 @@ fn pod_fixed_bytes(c: &Session, ty: i32) -> i32 {
 }
 fn pod_copy_bytes(c: &Session, ty: i32) -> i32 {
     if is_pod_fixed(&c, ty) { return pod_fixed_bytes(&c, ty) }
+    if ft.is_c_record(&c.types, ty) { return ft.c_size(&c.types, ty) }
     ft.pod_words(&c.types, ty) * 8
 }
 fn fixed_from_array(c: &mut Session, fixed_ty: i32, token: i32, catalog: &opt_inline.View,
@@ -1063,8 +1072,16 @@ fn copy_pod_to_stack(c: &mut Session, ty: i32, token: i32) -> i32 {
     base
 }
 fn copy_pod_into_addr(c: &mut Session, ty: i32, dst_slot: i32, token: i32) {
-    arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, dst_slot)
-    place_step(&mut c, .RegionWrite, ty, i32(borrows.Access.Address), 0, ft.pod_words(&c.types, ty), token)
+    words := ft.pod_words(&c.types, ty)
+    exact := pod_copy_bytes(&c, ty)
+    if exact == words * 8 {
+        arm.mov(&mut c.code, 1, 0); arm.load(&mut c.code, dst_slot)
+        place_step(&mut c, .RegionWrite, ty, i32(borrows.Access.Address), 0, words, token)
+        return
+    }
+    src_slot := slot(&mut c); arm.store(&mut c.code, src_slot, 0)
+    arm.load(&mut c.code, dst_slot)
+    copy_pod_slot_exact_x0(&mut c, ty, src_slot, exact, token)
 }
 fn box_pod_for_container(c: &mut Session, ty: i32) {
     label := type_helper(&mut c, ty, false); ownership_call(&mut c, .Copy, ty, label)
@@ -3233,113 +3250,63 @@ fn foreign_call(c: &mut Session, sig: i32, catalog: &opt_inline.View, inline_wor
     }
     first := ft.type_start(&c.types, sig); count := ft.type_count(&c.types, sig)
     variadic_fixed := ft.c_variadic_fixed(&c.types, sig)
-    mut values: []i32 = []; mut locations: []i32 = []
-    mut gp_limit := 8
-    if c.code.platform == 2 { gp_limit = 6 } else if c.code.platform == 5 { gp_limit = 4 }
-    ret := ft.type_base(&c.types, sig); ret_c_record := ft.is_c_record(&c.types, ret); mut ret_hfa := 0
-    mut result_slot := -1; mut indirect_result := false
+    mut values: []i32 = []
+    mut param_types: []i32 = []
+    ret := ft.type_base(&c.types, sig); ret_c_record := ft.is_c_record(&c.types, ret)
+    mut result_slot := -1
     if ret_c_record {
-        ret_hfa = hfa(&c, ret, 0)
-        if !c.validating_dead && c.code.platform != 0 && c.code.platform != 1 && c.code.platform != 5 && ret_hfa == 0 {
-            fail(&mut c, "unsupported foreign aggregate result"); return 0
-        }
+        c_layout(&mut c, ret)
         result_slot = slot(&mut c)
-        ret_sz := ft.c_size(&c.types, ret)
-        if c.code.platform == 0 || c.code.platform == 1 { indirect_result = ret_hfa == 0 && ret_sz > 16 }
-        else if c.code.platform == 2 { indirect_result = ret_sz > 16 }
-        else if c.code.platform == 5 { indirect_result = !fa.win_register_record(ret_sz) }
     }
-    mut spec := fa.ForeignCallSpec { ret: ret, ret_c_record: ret_c_record, ret_hfa: ret_hfa,
-        ret_size: ft.c_size(&c.types, ret), variadic: variadic_fixed >= 0,
-        arg_types: [], arg_packed: [], arg_c_record: [], arg_hfas: [], arg_sizes: [] }
-    mut gp := 0; if indirect_result && c.code.platform != 0 && c.code.platform != 1 { gp = 1 }; mut fp := 0; mut outgoing := 0
-    mut win_slot := gp
+    mut cb_ctx_slot := -1
+    if c.has_callbacks && (c.code.platform == 0 || c.code.platform == 1) {
+        cb_ctx_slot = slot(&mut c)
+    }
     while c.ok && !is(&c, ")") {
         if values.len == count { fail(&mut c, "too many C call arguments"); return 0 }
-        is_variadic := variadic_fixed >= 0 && values.len >= variadic_fixed
         want := ft.parameter_type(&c.types, first + values.len)
         actual := expression(&mut c, 0, want, &catalog, &mut inline_work, &mut model); same(&mut c, want, actual)
         aggregate := ft.is_c_record(&c.types, want)
         if aggregate {
-            if !c.validating_dead && c.code.platform != 0 && c.code.platform != 1 && c.code.platform != 5 && hfa(&c, want, 0) == 0 {
-                fail(&mut c, "unsupported foreign aggregate parameter"); return 0
-            }
+            c_layout(&mut c, want)
             take_value(&mut c, want); _ := temporary(&mut c, want)
         }
         value := slot(&mut c); arm.store(&mut c.code, value, 0); values.push(value)
-        shape := hfa(&c, want, 0); mut need := shape; if shape < 0 { need = -shape }
-        spec.arg_types.push(want); spec.arg_packed.push(storage_type(&c, want))
-        spec.arg_c_record.push(aggregate); spec.arg_hfas.push(shape); spec.arg_sizes.push(ft.c_size(&c.types, want))
-        if c.code.platform == 5 {
-            if win_slot < 4 {
-                if !aggregate && need > 0 { locations.push(8 + win_slot) }
-                else { locations.push(win_slot) }
-                win_slot += 1
-                gp = win_slot
-                fp = win_slot
-            } else {
-                off := 32 + (win_slot - 4) * 8
-                locations.push(16 + off)
-                win_slot += 1
-                outgoing = off + 8
-            }
-        } else {
-            arm64 := c.code.platform == 0 || c.code.platform == 1
-            if aggregate && c.code.platform == 2 {
-                need = (ft.c_size(&c.types, want) + 7) / 8
-                if need > 2 { need = 9 }
-            }
-            if c.code.platform == 0 && is_variadic {
-                outgoing = (outgoing + 7) / 8 * 8
-                locations.push(16 + outgoing); outgoing = outgoing + 8
-            } else if aggregate && arm64 && shape == 0 {
-                sz := ft.c_size(&c.types, want)
-                if sz <= 16 {
-                    mut regs := (sz + 7) / 8
-                    if regs < 1 { regs = 1 }
-                    if gp + regs <= gp_limit { locations.push(gp); gp = gp + regs }
-                    else {
-                        gp = gp_limit
-                        outgoing = (outgoing + 7) / 8 * 8
-                        locations.push(16 + outgoing); outgoing = outgoing + regs * 8
-                    }
-                } else if gp < gp_limit {
-                    locations.push(gp); gp = gp + 1
-                } else {
-                    outgoing = (outgoing + 7) / 8 * 8
-                    locations.push(16 + outgoing); outgoing = outgoing + 8
-                }
-            }
-            else if need > 0 && fp + need <= 8 { locations.push(8 + fp); fp = fp + need }
-            else if need == 0 && gp < gp_limit { locations.push(gp); gp = gp + 1 }
-            else {
-                if need > 0 && c.code.platform != 2 { fp = 8 }
-                mut alignment := 8; mut width := 8
-                if c.code.platform == 0 { alignment = foreign_width(want); width = alignment }
-                if aggregate {
-                    width = ft.c_size(&c.types, want)
-                    if c.code.platform == 0 { alignment = ft.c_align(&c.types, want) } else { width = (width + 7) / 8 * 8 }
-                }
-                outgoing = (outgoing + alignment - 1) / alignment * alignment
-                locations.push(16 + outgoing); outgoing = outgoing + width
-            }
-        }
+        param_types.push(want)
         if !eat(&mut c, ",") { break }
     }
     expect(&mut c, ")"); if count != values.len { fail(&mut c, "wrong C argument count"); return 0 }
-    if c.code.platform == 5 && outgoing < 32 { outgoing = 32 }
-    outgoing = (outgoing + 15) / 16 * 16
-    if outgoing > 4080 { fail(&mut c, f"C argument frame requires {outgoing} bytes, maximum is 4080"); return 0 }
+    mut outgoing := 0
+    if c.code.platform == 0 || c.code.platform == 1 {
+        outgoing = aapcs64.plan_call(&c.types, c.code.platform == 0, variadic_fixed, &param_types, ret).outgoing
+    } else if c.code.platform == 2 {
+        outgoing = sysv64.plan_call(&c.types, &param_types, ret).outgoing
+    } else if c.code.platform == 5 {
+        mut win_slot := if ret_c_record && !fa.win_register_record(ft.c_size(&c.types, ret)) { 1 } else { 0 }
+        outgoing = 32
+        for _ in 0..param_types.len {
+            if win_slot >= 4 { outgoing = 32 + (win_slot - 4) * 8 + 8 }
+            win_slot += 1
+        }
+        outgoing = (outgoing + 15) / 16 * 16
+    }
+    if outgoing > 1048576 { fail(&mut c, f"C argument frame requires {outgoing} bytes, maximum is 1048576"); return 0 }
     if c.code.checking { return ret }
     if ret_c_record {
-        arm.imm(&mut c.code, 0, i64(ft.c_size(&c.types, ret))); arm.branch(&mut c.code, c.runtime.alloc_record, 1)
-        arm.store(&mut c.code, result_slot, 0)
+        if is_pod(&c, ret) {
+            ret_base := alloc_pod_buffer(&mut c, ret)
+            place_step(&mut c, .BorrowHome, ret, i32(borrows.Access.Address), 0, ret_base, c.body.cursor)
+            arm.store(&mut c.code, result_slot, 0)
+        } else {
+            arm.imm(&mut c.code, 0, i64(ft.c_size(&c.types, ret))); arm.branch(&mut c.code, c.runtime.alloc_record, 1)
+            arm.store(&mut c.code, result_slot, 0)
+        }
     }
     mut patches := fa.new_patches(0)
-    arm.emit_foreign_call(&mut c.code, &spec, callee, &values, &locations,
-        result_slot, indirect_result, gp, fp, outgoing, c.has_callbacks,
-        c.runtime.callback_push, c.runtime.callback_pop,
-        &mut patches, c.float_trap, c.overflow)
+    if !c.code.forbid_emit {
+        fa.emit_foreign_call_v2(&mut c.code, &c.types, &param_types, ret, variadic_fixed, callee, &values,
+            result_slot, cb_ctx_slot, c.runtime.cb_before_call, c.runtime.callback_push, c.runtime.callback_pop, c.has_callbacks, &mut patches)
+    }
     for i in 0..patches.sites.len {
         facts.symbol(&mut c.body.facts, .CallbackStorage, patches.sites[i] / 4, -1 - patches.slots[i], c.body.cursor)
     }
@@ -3358,6 +3325,13 @@ fn validate_layouts(c: &mut Session) {
 fn copy_inline(c: &mut Session, bytes: i32) { arm.copy_inline(&mut c.code, bytes) }
 fn zero_record(c: &mut Session, ty: i32, at: i32) {
     bytes := ft.c_size(&c.types, ty)
+    if is_pod(&c, ty) {
+        base := alloc_pod_buffer(&mut c, ty)
+        place_step(&mut c, .BorrowHome, ty, i32(borrows.Access.Address), 0, base, at)
+        words := ft.pod_words(&c.types, ty)
+        for w in 0..words { store_mem(&mut c, 31, 0, w * 8) }
+        return
+    }
     arm.allocate_value(&mut c.code, c.runtime.alloc_record, .CRecord, ty, bytes, c.world.tokens.starts[at])
     arm.clear_record(&mut c.code, bytes)
 }
@@ -3398,13 +3372,22 @@ fn store_inline(c: &mut Session, ty: i32, token: i32) {
     place_step(&mut c, .CopyPart, ty, access, part, stride, token)
     arm.branch(&mut c.code, head, 0); arm.mark(&mut c.code, done)
 }
-fn callback_entry(c: &mut Session, id: i32) {
+fn callback_param_ffi_type(c: &Session, ty: i32) -> i32 {
+    if ft.type_kind(&c.types, ty) == 4 && ft.is_c_record(&c.types, ft.type_base(&c.types, ty)) {
+        return ft.type_base(&c.types, ty)
+    }
+    ty
+}
+fn callback_entry(c: &mut Session, rt: &runtime.Runtime, cb_enter_label: i32, id: i32) {
     mut ptypes: []i32 = []
     first := c.world.param_starts[id]; count := c.world.param_counts[id]
     ptypes.reserve(count)
-    for p in 0..count { ptypes.push(c.world.param_types[first + p]) }
+    for p in 0..count { ptypes.push(callback_param_ffi_type(&c, c.world.param_types[first + p])) }
     mut patches := fa.new_patches(c.imports.globals)
-    arm.emit_callback_entry(&mut c.code, &mut patches, c.fn_labels[id], c.callback_labels[id], c.runtime.callback_find, &ptypes, c.world.returns[id])
+    if !c.code.forbid_emit {
+        fa.emit_callback_entry_v2(&mut c.code, &c.types, &mut patches, rt.alloc_record, rt.release,
+            c.fn_labels[id], c.callback_labels[id], cb_enter_label, &ptypes, c.world.returns[id])
+    }
     c.imports.globals = patches.globals
     for i in 0..patches.sites.len { c.imports.sites.push(patches.sites[i]); c.imports.slots.push(patches.slots[i]) }
 }
@@ -4373,13 +4356,25 @@ fn call_dispatch(c: &mut Session, name: string, expected: i32, catalog: &opt_inl
         check_function_caps(&mut c, id, sym_tok)
         if !c.ok { return 0 }
         if c.world.unsafe_functions[id] && !c.body.unsafe_scope { fail(&mut c, "callback requires unsafe"); return 0 }
+        allow_c_agg := c.code.platform == 0 || c.code.platform == 1 || c.code.platform == 2
         mut params: []i32 = []
         for i in c.world.param_starts[id]..c.world.param_starts[id] + c.world.param_counts[id] {
-            ty := c.world.param_types[i]
-            if !foreign_scalar(&c, ty) { fail(&mut c, "callbacks require C scalar parameters"); return 0 }
+            ty := callback_param_ffi_type(&c, c.world.param_types[i])
+            if ft.is_c_record(&c.types, ty) && allow_c_agg {
+                c_layout(&mut c, ty)
+            } else if !foreign_scalar(&c, ty) {
+                fail(&mut c, "callbacks require C scalar or @c_layout parameters"); return 0
+            }
             params.push(ty)
         }
-        if c.world.returns[id] != 0 && !foreign_scalar(&c, c.world.returns[id]) { fail(&mut c, "callbacks require a C scalar return"); return 0 }
+        ret_ty := c.world.returns[id]
+        if ret_ty != 0 {
+            if ft.is_c_record(&c.types, ret_ty) && allow_c_agg {
+                c_layout(&mut c, ret_ty)
+            } else if !foreign_scalar(&c, ret_ty) {
+                fail(&mut c, "callbacks require a C scalar or @c_layout return"); return 0
+            }
+        }
         if (c.code.platform == 3 || c.code.platform == 4) {
             ty := foreign_type(&mut c, &params, c.world.returns[id])
             c.body.facts.needed.push(id); request_symbol(&mut c, .WasmCallback, id)
@@ -11878,7 +11873,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     for t in 0..c.types.type_names.len { if c.types.c_record[t] { c_layout(&mut c, t) } }
     validate_layouts(&mut c)
     if c.loans.active { scratch.prepare(&mut c.loans, c.world.param_types.len, c.world.names.len) }
-    if c.code.platform != 0 && c.code.platform != 1 && c.code.platform != 5 {
+    if c.code.platform == 3 || c.code.platform == 4 {
         for f in 0..c.world.names.len {
             if c.world.libraries[f] != "" && c.world.libraries[f] != "__unavailable__" {
                 sig := c.world.ffi_types[f]
@@ -11998,7 +11993,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
     if !c.ok || c.has_errors { return abort_with_diagnostics(&mut c) }
     if !check_all {
         mut take_kinds := c.types.declared.type_kinds.clone()
-        for ty in 0..take_kinds.len { if is_pod(&c, ty) { take_kinds[ty] = 0 } }
+        for ty in 0..take_kinds.len { if is_pod(&c, ty) && !c.types.c_record[ty] { take_kinds[ty] = 0 } }
         prepared := record_take.prepare(&mut record_takes, &take_kinds, &c.types.declared.type_bases, &c.types.declared.type_starts,
             &c.types.declared.type_counts, &c.types.field_types, &c.types.c_record)
         if !prepared && record_take.status(&record_takes) != -2 {
@@ -12036,7 +12031,7 @@ fn begin_concrete(c: &mut Session, platform: i32, module_starts: &[]i32, module_
             if config.frame_free_enabled { policy = policy + ":frame-free:on" } else { policy = policy + ":frame-free:off" }
             if config.range_enabled { policy = policy + ":range:on" } else { policy = policy + ":range:off" }
             if c.inline_enabled { policy = policy + ":inline-whole-v4:dependencies1:tokens192-32768:caller4096:utf8-v1-staging48:" + opt_inline.cache_shape(&catalog, c.world.names.len, &mut c.jobs.inline_versions) } else { policy = policy + ":inline:off" }
-            policy = policy + ":typed-function-v1:ownership-read-default-v4:closures-v2:returned-borrows-v1:pod-values-v2:x86-mir-v1:wasm-mir-v1"
+            policy = policy + ":typed-function-v1:ownership-read-default-v4:closures-v2:returned-borrows-v1:pod-values-v3:ffi-abi-v2:x86-mir-v1:wasm-mir-v1"
             if config.mir_opt_enabled { policy = policy + ":mir-opt:on" } else { policy = policy + ":mir-opt:off" }
             policy = policy + ":" + mir_memory.source_policy_tag(config.mir_memory_enabled)
             if config.mir_ssa_enabled { policy = policy + ":mir-ssa:v6-composed-regional-expression2-work4194304" } else { policy = policy + ":mir-ssa:off" }
@@ -13537,7 +13532,35 @@ fn type_body(c: &mut Session, f: i32, model: &mut opt_ir.Function, catalog: &opt
 }
 
 fn finish_image(c: &mut Session, platform: i32, main_id: i32, rt: &runtime.Runtime, record_takes: &mut record_take.Plan, has_tasks: bool) -> Result {
-    for id in 0..c.callback_labels.len { if c.callback_labels[id] >= 0 { callback_entry(&mut c, id) } }
+    mut cb_enter_label := -1
+    if c.has_callbacks && (platform == 0 || platform == 1 || platform == 2) {
+        mut any_cb := false
+        for id in 0..c.callback_labels.len { if c.callback_labels[id] >= 0 { any_cb = true; break } }
+        mut needs_cb_rt := any_cb
+        if !needs_cb_rt {
+            for target in &c.code.target {
+                if target == rt.cb_before_call { needs_cb_rt = true; break }
+            }
+        }
+        if needs_cb_rt {
+            cb_enter_label = arm.label(&mut c.code)
+            use_tls := (platform == 0 && (any_cb || c.imports.symbols.len > 0)) || c.imports.symbols.len > 0
+            mut sym_kc := -1; mut sym_gs := -1; mut sym_ss := -1
+            if use_tls {
+                sym_kc = import_pthread(&mut c, "pthread_key_create")
+                sym_gs = import_pthread(&mut c, "pthread_getspecific")
+                sym_ss = import_pthread(&mut c, "pthread_setspecific")
+            }
+            mut rt_patches := fa.new_patches(c.imports.globals)
+            if !c.code.forbid_emit {
+                fa.emit_callback_runtime(&mut c.code, &mut rt_patches, rt.cb_before_call, cb_enter_label,
+                    rt.atomic_load_i64, rt.atomic_store_i64, rt.atomic_cas_i64, use_tls, sym_kc, sym_gs, sym_ss)
+            }
+            c.imports.globals = rt_patches.globals
+            for i in 0..rt_patches.sites.len { c.imports.sites.push(rt_patches.sites[i]); c.imports.slots.push(rt_patches.slots[i]) }
+        }
+    }
+    for id in 0..c.callback_labels.len { if c.callback_labels[id] >= 0 { callback_entry(&mut c, &rt, cb_enter_label, id) } }
     mut overflow_exit := c.overflow
     mut float_exit := c.float_trap
     if platform != 3 && platform != 4 {
