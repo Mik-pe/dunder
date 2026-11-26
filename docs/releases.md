@@ -1,5 +1,18 @@
 # Distribuera Dunder
 
+## Uppgradera från 0.12 till 0.13
+
+Byt `id: TaskID<T> = spawn jobs worker(arg)` mot
+`task: Task<T> = jobs.spawn(worker, arg)`. Hämta resultatet med
+`value := task.join()`. Handtaget förbrukas vid anropet. Om koden tidigare
+använde `await jobs(id)` flera gånger, spara resultatet i en lokal variabel
+och använd den igen.
+
+Ersätt `await! jobs(id)` med `task.join()` och `await_any jobs(ids)` med
+`jobs.wait_any(&tasks)`. För ett fristående jobb som returnerar `()` räcker
+en egen sats, `jobs.spawn(worker, arg)`. Kör sedan `dunder test` i projektet.
+[Parallella uppgifter och exempel](tasks.md)
+
 ## Versionsserien 0.11
 
 Från `0.11.0` ska program som följer den dokumenterade syntaxen,
@@ -48,7 +61,7 @@ dunder --version
 ```
 
 `--release` väljer senaste stabila version. För en bestämd tagg kan du
-exempelvis köra `sh install-dunder.sh --release v0.12.1`. Skriptet kontrollerar
+exempelvis köra `sh install-dunder.sh --release v0.13.0`. Skriptet kontrollerar
 SHA-256 för arkivet och den uppackade binären samt att kompilatorn rapporterar
 rätt version och värd innan den ersätter `dunder` i installationskatalogen.
 
@@ -92,10 +105,10 @@ ersättningsfilens ursprungliga plats.
 
 Bygg projektets release på ARM64/macOS. Ange versionsnumret från
 `compiler_version()` i `selfhost/driver/cli.ddr`. Med följande kommando
-hamnar de färdiga filerna i `build/release/v0.12.1/`.
+hamnar de färdiga filerna i `build/release/v0.13.0/`.
 
 ```sh
-./tools/release.sh v0.12.1
+./tools/release.sh v0.13.0
 ```
 
 Med en lokal versionstagg byggs den commit som taggen pekar ut. Utan tagg
@@ -127,14 +140,14 @@ När bygget ska bli tillgängligt för `dunder upgrade`, använd Git med
 skrivrättighet till repot och en autentiserad GitHub CLI.
 
 ```sh
-./tools/release.sh v0.12.1 --publish
+./tools/release.sh v0.13.0 --publish
 ```
 
 Om taggen saknades vid provbygget, sätt den på
 commitvärdet i `release.txt` innan publiceringskommandot körs.
 
 ```sh
-git tag v0.12.1 "$(sed -n 's/^commit=//p' build/release/v0.12.1/release.txt)"
+git tag v0.13.0 "$(sed -n 's/^commit=//p' build/release/v0.13.0/release.txt)"
 ```
 
 En befintlig tagg på GitHub styr källrevisionen. Om taggen saknas skapar
@@ -150,10 +163,10 @@ publicerad release jämför skriptet de publicerade filerna med det lokala
 bygget.
 
 Skriptet skriver en kort standardbeskrivning. En förberedd versionstext kan
-läggas i `build/release/v0.12.1/notes.md` och uppdateras separat:
+läggas i `build/release/v0.13.0/notes.md` och uppdateras separat:
 
 ```sh
-gh release edit v0.12.1 --repo Mik-pe/dunder --notes-file build/release/v0.12.1/notes.md
+gh release edit v0.13.0 --repo Mik-pe/dunder --notes-file build/release/v0.13.0/notes.md
 ```
 
 ## Filer som uppgraderaren läser
@@ -169,7 +182,7 @@ gh release edit v0.12.1 --repo Mik-pe/dunder --notes-file build/release/v0.12.1/
 | x86-64 Windows | `x86_64-windows.exe` | `x86_64-windows.sha256` |
 
 `dunder upgrade` läser manifestet från GitHubs senaste stabila release.
-`dunder upgrade --version v0.12.1` väljer den namngivna releasen.
+`dunder upgrade --version v0.13.0` väljer den namngivna releasen.
 
 `dunder run tools/test_release.ddr` (eller `./tools/verify-selfhost.sh --release`) provar paketering, avbruten uppladdning och
 omkörning i en lokal Git-kopia med simulerad GitHub CLI.

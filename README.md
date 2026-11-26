@@ -11,9 +11,10 @@ Kompilatorn länkar nativa program och signerar macOS-binärer. På macOS och Li
 kan bygget bädda in DWARF-debuginformation med `-g`. Verktygskedjan innehåller
 också en formaterare (`dunder fmt`) och en språkserver (`dunder lsp`).
 
-Dunder **0.12.1** finns för ARM64/macOS, ARM64/Linux, x86-64/Linux och
-x86-64/Windows. Kompilatorn bygger projekt snabbare genom att packa fasta
-heltalsarrayer direkt och läsa igenom färre token vid generisk specialisering.
+Dunder **0.13.0** finns för ARM64/macOS, ARM64/Linux, x86-64/Linux och
+x86-64/Windows. Parallella jobb startas med `jobs.spawn(...)` och lämnar
+ett resultat genom `task.join()`. Projektbyggen kan återanvända verifierade
+byggresultat när källor och inställningar är oförändrade.
 [Installation och kompatibilitet](docs/releases.md)
 
 ```dunder
