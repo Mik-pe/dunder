@@ -44,6 +44,18 @@ Tillåtna namn är `filesystem`, `network`, `process`, `stdio` och `unsafe`.
 En utelämnad lista ger en tom uppsättning. För en transitiv import måste
 kapabiliteten vara beviljad längs hela beroendekedjan.
 
+För beroenden som länkar nativa bibliotek via `@link(...)` krävs dessutom en
+uttrycklig tillåtelselista i `native_libs` (standard `[]`, eller `["*"]` för
+obegränsad länkning):
+
+```toml
+[dependencies]
+sqlite = { path = "../dunder/packages/sqlite", capabilities = ["filesystem", "unsafe"], native_libs = ["/usr/lib/libsqlite3.dylib", "libsqlite3.so.0"] }
+```
+
+Se [FFI och manifestpolicy](ffi.md) för `[native]`-, `[native.libs.*]`- och
+`[app]`-sektionerna.
+
 ## Välj en Git-version
 
 En Git-källa får ha högst en av `branch`, `tag` och `rev`:

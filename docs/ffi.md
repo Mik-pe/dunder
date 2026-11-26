@@ -80,8 +80,8 @@ respektive `*mut ffi.c_void`.
 
 Skapande och konvertering:
 
-- `&place` konverteras till `*const T` via `addr(&place)` (kräver `unsafe`-kontext).
-- `&mut place` konverteras till `*mut T` via `addr(&mut place)` (kräver `unsafe`-kontext).
+- `&place` konverteras till `*const T` via `addr_of(&place)` (kräver `unsafe`-kontext).
+- `&mut place` konverteras till `*mut T` via `addr_of(&mut place)` (kräver `unsafe`-kontext).
 - Nollpekare skapas säkert med `ffi.null<T>() -> *const T` och
   `ffi.null_mut<T>() -> *mut T`.
 - Adresskonvertering: `p.addr() -> usize` (säker), `ffi.from_addr<T>(a: usize) -> *const T`
@@ -106,20 +106,19 @@ Metoder på `*const T` och `*mut T`:
 | `p.as_ref(&owner) -> Option<&T> from owner` | `unsafe` | Returnerar `.None` vid null; binder annars en delad referens `&T` till ägaren `&owner`. |
 | `p.as_mut(&mut owner) -> Option<&mut T> from owner` (`*mut T`) | `unsafe` | Returnerar `.None` vid null; binder annars en exklusiv referens `&mut T` till `&mut owner`. |
 
-För lånade vyer över sammanhängande minnesintervall finns de ägarbundna
-primitiverna:
+För lånade bytevyer över sammanhängande minnesintervall finns den ägarbundna
+primitiven:
 
-- `unsafe ffi.bytes_view(&owner, base: *const u8, len: usize) -> &[]u8 from owner`
-- `unsafe ffi.slice_view<T>(&owner, base: *const T, count: usize) -> &[]T from owner`
-- `unsafe ffi.slice_view_mut<T>(&mut owner, base: *mut T, count: usize) -> &mut []T from owner`
+- `unsafe bytes_view(&owner, base, len: usize) -> &[]u8 from owner`
 
-Vid positiv längd måste `base` vara skild från null och naturligt justerad
-för `T`, och hela intervallet `[base, base + count * size_of(T))` måste
-vara giltigt och orört under `&owner`/`&mut owner`-lånets hela livstid.
+Vid positiv längd måste `base` vara skild från null och hela intervallet
+`[base, base + len)` måste vara giltigt och orört under `&owner`-lånets hela
+livstid.
 
-`==` och `!=` jämför två pekare av samma typ efter adress. Ett `addr(&buf)` på
-en dynamisk array `[]T` pekar på Dunders arraybeskrivare; för elementbufferten
-skickas `addr(&buf[0])` (när `buf.len > 0`) eller `buf.as_ptr()`.
+`==` och `!=` jämför två pekare av samma typ efter adress. Ett `addr_of(&buf)`
+på en dynamisk array `[]T` pekar på Dunders arraybeskrivare; för
+elementbufferten skickas `buf.as_ptr()` respektive `buf.as_mut_ptr()` (eller
+`addr_of(&buf[0])` när `buf.len > 0`).
 
 ### 1.3 Opaka FFI-typer (`extern type`)
 
@@ -174,7 +173,7 @@ Modifierare som kan kombineras med `C`:
 - På en `packed`-typ avvisar kompilatorn att ta en direkt referens (`&s.field`,
   `&mut s.field`) till ett fält vars justering kan understiga fälttypens
   naturliga justering; fältet läses eller skrivs istället per värde (kopia)
-  eller via `addr(&s)` + `read_unaligned()`/`write_unaligned()`.
+  eller via `addr_of(&s)` + `read_unaligned()`/`write_unaligned()`.
 
 Tillåtna fälttyper i `@repr(C)`-structar och -unioner:
 
@@ -206,7 +205,7 @@ med pekare till C-API:er som accepterar pekare.
   unsafe {
       info := VkInstanceCreateInfo {
           sType: .InstanceCreateInfo,
-          pApplicationInfo: addr(&app_info),
+          pApplicationInfo: addr_of(&app_info),
           ..zeroed()
       }
   }
@@ -300,17 +299,25 @@ tillhandahåller språket och `std.ffi` fyra kompletterande typer:
   - `.as_units_with_nul() -> &[]u16` (inklusive avslutande NUL)
   - `.len() -> usize` (antal UTF-16-kodenheter före NUL)
 - **`ffi.CString`**: ägd, heapallokerad, NUL-avslutad UTF-8-sträng.
-  - `CString::new(text: string) -> Result<CString, NulError>` (avvisar inbäddad NUL).
-  - `.as_cstr() -> &CStr`, `.as_ptr() -> *const ffi.c_char`, `.as_bytes() -> &[]u8`, `.len() -> usize`.
+  - `CString::new(text: string) -> Result<CString, NulError>` och
+    `CString::from_bytes(data: &[]u8) -> Result<CString, NulError>` (avvisar inbäddad NUL).
+  - `.as_ptr()`, `.as_bytes() -> &[]u8`, `.as_bytes_with_nul() -> &[]u8`,
+    `.len() -> i32`, `.is_empty() -> bool`, `.to_string() -> Result<string, sys.IoError>`.
 - **`ffi.WString`**: ägd, NUL-avslutad UTF-16LE-sträng för dynamiska
   Win32 `*W`-anrop.
-  - `WString::new(text: string) -> Result<WString, NulError>` (avvisar inbäddad NUL).
-  - `.as_wstr() -> &WStr`, `.as_ptr() -> *const u16`, `.len() -> usize`.
-- **Inläsning från främmande strängpekare** (alla null-säkra):
-  - `unsafe ffi.CStr::from_ptr(&owner, p: *const ffi.c_char) -> Option<&CStr> from owner`
-  - `unsafe ffi.from_cstr(p: *const ffi.c_char) -> Option<string>` (validerar UTF-8)
-  - `unsafe ffi.from_cstr_lossy(p: *const ffi.c_char) -> Option<string>`
-  - `unsafe ffi.from_wstr(p: *const u16) -> Option<string>` (avkodar UTF-16LE)
+  - `WString::new(text: string) -> Result<WString, NulError>` och
+    `WString::from_units(data: &[]u16) -> Result<WString, NulError>` (avvisar inbäddad NUL).
+  - `.as_ptr()`, `.as_units_with_nul() -> &[]u16`, `.len() -> i32`,
+    `.is_empty() -> bool`, `.to_string() -> Option<string>`.
+- **Inläsning från främmande strängpekare och OS-felkoder** (alla null-säkra):
+  - `unsafe ffi.c_strlen(p)` / `unsafe ffi.c_strnlen(p, limit)`
+  - `unsafe ffi.from_cstr(p) -> Option<string>` (validerar UTF-8)
+  - `unsafe ffi.from_cstr_bounded(p, max_bytes) -> Option<string>`
+  - `unsafe ffi.from_cstr_lossy(p) -> Option<string>`
+  - `unsafe ffi.c_wstrlen(p)` / `unsafe ffi.from_wstr(p) -> Option<string>` /
+    `unsafe ffi.from_wstr_lossy(p) -> Option<string>` (avkodar UTF-16LE)
+  - `unsafe ffi.errno() -> i32`, `unsafe ffi.set_errno(value: i32)`,
+    `unsafe ffi.last_os_error() -> i32`
 
 ### 1.6 Nullbara funktionspekare (NPO)
 
@@ -370,9 +377,12 @@ extern "C" {
   `"metal"`, `"vulkan"`, `"wayland-client"`, `"d3d12"`, `"user32"`). På
   `wasm32`/`wasm32-wasi` anger strängen Wasm-importmodulens namn (t.ex.
   `"wasi_snapshot_preview1"`).
+- `@link(macos = "<lib>", linux = "<lib>", windows = "<lib>")` — anger
+  plattformsspecifika biblioteksnycklar eller kanoniska biblioteksnamn direkt
+  i samma block (t.ex. `@link(macos = "/usr/lib/libsqlite3.dylib", linux = "libsqlite3.so.0")`).
 - `@link(framework = "<Namn>")` — macOS-ramverkskortform (motsvarar nyckeln
   `framework:<Namn>`, som löses till
-  `/System/Library/Frameworks/<Namn>.framework/Versions/A/<Namn>` ur dyld
+  `/System/Library/Frameworks/<Namn>.framework/Versions/<A|B|C>/<Namn>` ur dyld
   shared cache om inget annat anges i `dunder.toml`).
 - Valfria namngivna parametrar i `@link(...)`:
   - `weak = true` — mjuk biblioteks- och symbolbindning (`LC_LOAD_WEAK_DYLIB`
@@ -444,7 +454,7 @@ extern "C" {
 
 En `extern static` emitteras som `STT_OBJECT` på ELF64, datapekare i
 `__DATA_CONST`/GOT på Mach-O och dataslot i IAT på PE32+. Både läsning,
-skrivning (`static mut`) och adressbildning (`addr(&wl_compositor_interface)`)
+skrivning (`static mut`) och adressbildning (`addr_of(&wl_compositor_interface)`)
 kräver `unsafe`-kontext.
 
 **Nåbarhetsbaserad beskärning**: `target_is("...")` i `if`/`else if`-grenar
@@ -504,55 +514,52 @@ Garantier och semantik för `extern "<abi>" fn`-callbacks:
    kontrolleras kapabiliteten på det ställe där funktionsvärdet tas, precis
    som för vanliga funktionsvärden.
 
-### 2.3 Typad dynamisk laddning (`std.dl`)
+### 2.3 Resurssäker dynamisk laddning (`std.dl`)
 
 För bibliotek som är valfria vid körning, väljs dynamiskt (t.ex. Wayland vs
 X11 på samma Linux-binär) eller laddar funktioner via en drivrutinsloader
-(t.ex. Vulkan `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`) tillhandahåller
-`std.dl` ett resurssäkert, typat gränssnitt:
+(t.ex. Vulkan `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` eller
+`eglGetProcAddress`) tillhandahåller `std.dl` ett resurssäkert gränssnitt:
 
 ```dunder
 capability unsafe
 import std.dl as dl
-import std.ffi as ffi
 
-@repr(C)
-struct VulkanLoader {
-    vkGetInstanceProcAddr: extern "system" fn(*mut VkInstance_T, *const ffi.c_char) -> *const ffi.c_void,
-    vkEnumerateInstanceVersion: Option<extern "system" fn(*mut u32) -> VkResult>,
-}
-
-unsafe fn open_vulkan() -> Result<(dl.Library, VulkanLoader), dl.DlError> {
+unsafe fn open_vulkan() -> Result<(dl.Library, dl.ProcResolver), string> {
     lib := dl.Library::open_first(&["libvulkan.so.1", "libvulkan.so"], .Now)?
-    table := dl.load_library_table<VulkanLoader>(&lib)?
-    .Ok((lib, table))
+    resolver := dl.ProcResolver::from_library_context_proc_addr(
+        &lib,
+        "vkGetInstanceProcAddr",
+        ptr(0),
+    )?
+    .Ok((lib, resolver))
 }
 ```
 
 Kontrakt i `std.dl`:
 
-- `pub enum LoadMode { Default, Lazy, Now }` — ersätter råa POSIX-heltal (`1`, `2`).
-- `@resource(dispose) pub opaque struct Library`:
-  - `Library::open(name: string, mode: LoadMode) -> Result<Library, DlError>`
-  - `Library::open_first(candidates: &[]string, mode: LoadMode) -> Result<Library, DlError>`
-  - `Library::current_process() -> Result<Library, DlError>`
-  - `unsafe lib.symbol<F>(name: &ffi.CStr) -> Result<F, DlError>` — löser en
-    symbol till en `extern "<abi>" fn(...) -> ...`-typ eller `*const T`/`*mut T`.
-  - `unsafe lib.try_symbol<F>(name: &ffi.CStr) -> Option<F>` — returnerar
-    `.None` om symbolen saknas.
+- `pub enum LoadMode { Default, Lazy, Now }` — ersätter råa POSIX-heltal (`1`, `2`),
+  med `mode_flags(mode: LoadMode) -> i32`.
+- `@resource(dispose) pub opaque struct Library` (och `unsafe impl Sendable for Library`):
+  - `Library::open(path: string) -> Result<Library, string>`
+  - `Library::open_with(path: string, mode: LoadMode) -> Result<Library, string>`
+  - `Library::open_lazy(path: string) -> Result<Library, string>`
+  - `Library::open_first(candidates: &[]string, mode: LoadMode) -> Result<Library, string>` (alias `open_any`)
+  - `Library::current() -> Result<Library, string>` (alias `current_process`)
+  - `lib.is_open() -> bool`, `lib.raw_handle()`, `lib.close() -> bool`, `lib.leak()`
+  - `unsafe lib.symbol(name: string) -> Result<..., string>` / `unsafe lib.try_symbol(name: string)`
+  - `unsafe lib.load_required_symbols(names: &[]string)` (alias `load_symbols`) — laddar en hel grupp obligatoriska symboler och rapporterar alla saknade namn i ett samlat fel.
+  - `unsafe lib.load_optional_symbols(names: &[]string)` — returnerar `.Some(...)`/`.None` per symbol.
+  - `unsafe lib.resolver() -> ProcResolver` — skapar en `ProcResolver` kopplad till biblioteket.
   - `dispose` frigör handtaget (`dlclose` / `FreeLibrary`). Anroparen ansvarar
     för att `Library` hålls vid liv så länge någon upplöst funktionspekare kan
     anropas.
-- **Typade dispatchtabeller**:
-  - `unsafe dl.load_library_table<T>(lib: &Library) -> Result<T, DlError>`
-    fyller varje fält i en `@repr(C)`-struct `T` av `extern fn` och
-    `Option<extern fn>` genom att slå upp fältnamnet i `lib`. Saknas en
-    icke-optionell symbol returneras `.Err(DlError)`; saknas en
-    `Option<extern fn>`-symbol sätts fältet till `.None`.
-  - `unsafe dl.load_proc_table<T>(get_proc: extern "system" fn(*const ffi.c_char) -> *const ffi.c_void) -> Result<T, DlError>`
-    gör motsvarande via en godtycklig drivrutinsuppslagare (t.ex.
-    `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`, `eglGetProcAddress`),
-    vilket eliminerar hundratals rader manuell uppslagnings- och nullkontrollkod.
+- **Enhetlig uppslagning och kedjor (`ProcResolver` och `ProcChain`)**:
+  - `ProcResolver::from_library(&lib)` / `from_raw_library(handle)`
+  - `ProcResolver::from_proc_addr(get_proc)` / `from_proc_addr_ptr(raw_fn)` / `from_library_proc_addr(&lib, loader_symbol)` — för 1-argumentsuppslagare (t.ex. `eglGetProcAddress`, `glXGetProcAddress`).
+  - `ProcResolver::from_context_proc_addr(context, get_proc)` / `from_context_proc_addr_ptr(context, raw_fn)` / `from_library_context_proc_addr(&lib, loader_symbol, context)` samt `resolver.derive_context(loader_symbol, context)` — för 2-arguments kontextuppslagare (t.ex. `vkGetInstanceProcAddr` -> `vkGetDeviceProcAddr`).
+  - `ProcChain` (`new`, `from_resolvers`, `push`, `try_resolve`, `resolve`, `load_required_symbols`, `load_optional_symbols`) — ordnad reservkedja av uppslagare (t.ex. device -> instance -> library).
+  - Modulfunktioner: `dl.load_required_symbols`, `dl.load_optional_symbols`, `dl.load_proc_symbols`, `dl.load_optional_proc_symbols`.
 
 ---
 
@@ -577,7 +584,7 @@ exempelvis `capability filesystem, unsafe`.
 
 - Anrop till `extern`-funktioner, anrop via `extern fn`-värden, avreferering
   eller pekarkalkyl på `*const T`/`*mut T`, läsning av `union`-fält,
-  läsning/skrivning/adress av `extern static` samt `as_ref`/`as_mut`/`bytes_view`/`slice_view`
+  läsning/skrivning/adress av `extern static` samt `as_ref`/`as_mut`/`bytes_view`
   kräver alltid en `unsafe`-kontext.
 - Kapabilitetskrav (`@requires(filesystem | network | process | stdio)`)
   kontrolleras enhetligt både vid direkta anrop, när funktionsvärdet tas från
@@ -616,7 +623,7 @@ Regler:
   rundresa via `usize` ger ingen ny åtkomsträtt till andra lokala objekt.
 - Kompilatorns spillceller, oexponerade lokaler och FP/LR-länkage är privat
   implementationslagring som främmande kod inte får läsa eller skriva. Ett
-  uttryckligt `addr(&place)` exponerar endast det angivna objektet under dess
+  uttryckligt `addr_of(&place)` exponerar endast det angivna objektet under dess
   livstid och låneregel.
 - Rekursion och återanrop skapar separata aktiveringar. Vanliga externa anrop
   returnerar en gång eller avslutar processen; stackbyte, `longjmp` och
@@ -723,10 +730,10 @@ filnamn eller `/System/Library/Frameworks/...`-sökvägar.
 
 | Logisk nyckel | `arm64-macos` | `arm64-linux` / `x86_64-linux` (`glibc`) | `arm64-linux` / `x86_64-linux` (`musl`) | `x86_64-windows` |
 | --- | --- | --- | --- | --- |
-| `c` | `/usr/lib/libSystem.B.dylib` | `libc.so.6` | `libc.musl-<arch>.so.1` | `ucrtbase.dll` |
-| `dl` | `/usr/lib/libSystem.B.dylib` | `libdl.so.2` | `libc.musl-<arch>.so.1` | — (`std.dl` använder `kernel32.dll`) |
+| `c` | `/usr/lib/libSystem.B.dylib` | `libc.so.6` | `libc.musl-<arch>.so.1` | `msvcrt.dll` |
+| `dl` | `/usr/lib/libSystem.B.dylib` | `libdl.so.2` | `libc.musl-<arch>.so.1` | `kernel32.dll` |
 | `m` | `/usr/lib/libSystem.B.dylib` | `libm.so.6` | `libc.musl-<arch>.so.1` | `ucrtbase.dll` |
-| `pthread` | `/usr/lib/libSystem.B.dylib` | `libpthread.so.0` | `libc.musl-<arch>.so.1` | — |
+| `pthread` | `/usr/lib/libSystem.B.dylib` | `libpthread.so.0` | `libc.musl-<arch>.so.1` | `kernel32.dll` |
 | `objc` | `/usr/lib/libobjc.A.dylib` | — | — | — |
 | `metal` | `/System/Library/Frameworks/Metal.framework/Versions/A/Metal` | — | — | — |
 | `appkit` | `/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit` | — | — | — |
@@ -735,7 +742,7 @@ filnamn eller `/System/Library/Frameworks/...`-sökvägar.
 | `quartzcore` | `/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore` | — | — | — |
 | `coregraphics` | `/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics` | — | — | — |
 | `corevideo` | `/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo` | — | — | — |
-| `vulkan` | `@rpath/libMoltenVK.dylib` | `libvulkan.so.1` | `libvulkan.so.1` | `vulkan-1.dll` |
+| `vulkan` | `@rpath/libvulkan.1.dylib` | `libvulkan.so.1` | `libvulkan.so.1` | `vulkan-1.dll` |
 | `wayland-client` | — | `libwayland-client.so.0` | `libwayland-client.so.0` | — |
 | `x11` | — | `libX11.so.6` | `libX11.so.6` | — |
 | `xcb` | — | `libxcb.so.1` | `libxcb.so.1` | — |
@@ -750,12 +757,14 @@ filnamn eller `/System/Library/Frameworks/...`-sökvägar.
 | `d3dcompiler` | — | — | — | `d3dcompiler_47.dll` |
 | `advapi32` | — | — | — | `advapi32.dll` |
 | `shell32` | — | — | — | `shell32.dll` |
-| `ucrt` | — | — | — | `ucrtbase.dll` |
+| `ucrt` | `/usr/lib/libSystem.B.dylib` | `libc.so.6` | `libc.musl-<arch>.so.1` | `ucrtbase.dll` |
 
 Utöver tabellen ovan stöder macOS ramverksformen `@link(framework = "<Namn>")`
 (intern nyckel `framework:<Namn>`), som automatiskt löses till
-`/System/Library/Frameworks/<Namn>.framework/Versions/A/<Namn>`. På Linux
-ersätts `<arch>` med `aarch64` respektive `x86_64`.
+`/System/Library/Frameworks/<Namn>.framework/Versions/<ver>/<Namn>` (`C` för
+`Foundation`/`AppKit`, `B` för `Message`/`System`, annars `A`). På Linux
+ersätts `<arch>` med `aarch64` respektive `x86_64`. För MoltenVK på macOS
+åsidosätts nyckeln `vulkan` vid behov via `[target.arm64-macos.native.libs.vulkan]`.
 
 ### 4.3 Garantier hos de inbyggda binäremittrarna
 
@@ -1017,7 +1026,7 @@ unsafe fn register_window(inst: *mut HINSTANCE_T) -> u16 {
         lpszClassName: w"DunderWindow".as_ptr(),
         ..zeroed()
     }
-    RegisterClassExW(addr(&wc))
+    RegisterClassExW(addr_of(&wc))
 }
 ```
 
@@ -1069,12 +1078,12 @@ Den äldre FFI-ytan fasas ut under migreringen av `stdlib/`, `packages/`,
 
 | Äldre konstruktion | Ny specifikation |
 | --- | --- |
-| `@c_layout struct S { ... }` | `@repr(C) struct S { ... }` (plus `packed`, `align(N)` och `union`) |
+| `@c_layout struct S { ... }` | `@repr(C) struct S { ... }` (plus `packed`, `align(N)`, `union` och `@repr(<heltal>) enum`) |
 | `@extern("lib", "sym") unsafe fn f(...)` | `@link("nyckel") extern "C" { [@link_name("sym")] fn f(...) }` |
 | `@c_variadic(N) @extern(...)` | Variadisk parameter `...` inne i `extern "<abi>" { ... }` |
-| `ptr`, `load_*`, `store_*` | `*const T`, `*mut T`, `.read()`, `.write()`, `.read_unaligned()`, `.write_unaligned()` |
-| `ref_at(p)` (oankrad) | `p.as_ref(&owner)` / `p.as_mut(&mut owner)` |
-| `ffi_fn(addr)` | Typad `std.dl.Library::symbol<F>` / `dl.load_proc_table<T>` |
-| `cstr("...")` | `c"..."` (`&ffi.CStr`) och nytt `w"..."` (`&ffi.WStr`) |
+| `ptr`, `addr(&x)`, `load_*`, `store_*` | `*const T`, `*mut T`, `addr_of(&x)`, `.read()`, `.write()`, `.read_unaligned()`, `.write_unaligned()` |
+| `ref_at(p)` (oankrad) | `p.as_ref(&owner)` / `p.as_mut(&mut owner)` eller `p.read()` / `p.write(v)` |
+| Manuell `dlopen`/`dlsym`-hantering | Resurssäker `std.dl.Library`, `ProcResolver` och `ProcChain` |
+| `cstr("...")` | `c"..."` (`&ffi.CStr`) och `w"..."` (`&ffi.WStr`) |
 | `callback(fn_namn)` | Toppnivå `extern "<abi>" fn fn_namn(...)` |
 | `zeroed()` med heapallokering | Stackallokerad `ffi.zeroed<T>()` och `S { f: v, ..zeroed() }` |

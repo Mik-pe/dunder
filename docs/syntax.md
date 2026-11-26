@@ -1117,12 +1117,20 @@ ett ogiltigt `rune(number)`. [Minneskontrakt och körbara prov](memory.md).
 
 ## Råtyper, privilegier och C-layout
 
-`u8`, `u16`, `u32`, `u64`, `usize` och `ptr` kan användas i variabler,
-fält och samlingar. `@c_layout struct` anger C-fältlayout. En modul med
-`capability unsafe` kan använda `unsafe fn` (även i `trait` och `impl Trait for Type`),
-`unsafe { ... }`, `bytes_view(&owner, base, length)`, `@extern` och typade
-C-funktionspekare. `capability filesystem`, `network`, `process` och `stdio`
-styr tillgången till delegerbara OS-handtag. `@resource(dispose)` stöder
-städmetoden `fn dispose(&self)` eller `fn dispose(&mut self)`. En
-`pub opaque struct` exponerar typen och låter den definierande modulen äga
-konstruktion och fältåtkomst. [Språkkontrakt och exempel](ffi.md)
+`i8`, `i16`, `i32`, `i64`, `isize`, `u8`, `u16`, `u32`, `u64`, `usize` samt
+typade råpekare (`*const T`, `*mut T`) och opaka `extern type`-deklarationer
+kan användas i variabler, fält och samlingar. `@repr(C)` på `struct` och
+`union` (samt modifierarna `packed`, `packed(N)` och `align(N)`) anger
+C-fältlayout, och `@repr(<heltal>) enum` deklarerar öppna C-ABI-enums.
+Statiska C- och UTF-16-strängliteraler skrivs `c"..."` (`&ffi.CStr`) och
+`w"..."` (`&ffi.WStr`). En modul med `capability unsafe` kan använda
+`unsafe fn` (även i `trait` och `impl Trait for Type`), `unsafe { ... }`,
+`addr_of(&place)` / `addr_of(&mut place)`, `bytes_view(&owner, base, length)`,
+`@link(...) extern "<abi>" { ... }` (inklusive variadiska `...`-parametrar och
+`static`/`static mut`-datasymboler) samt toppnivå-callbacks med
+`extern "<abi>" fn` och `Option<extern "<abi>" fn(...)>`.
+`capability filesystem`, `network`, `process` och `stdio` styr tillgången till
+delegerbara OS-handtag. `@resource(dispose)` stöder städmetoden
+`fn dispose(&self)` eller `fn dispose(&mut self)`. En `pub opaque struct`
+exponerar typen och låter den definierande modulen äga konstruktion och
+fältåtkomst. [Språkkontrakt och exempel](ffi.md)

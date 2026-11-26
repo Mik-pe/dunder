@@ -154,7 +154,8 @@ Wasm-målen är `wasm32` och `wasm32-wasi`. Dunder äger parser,
 typkontroll, kodgenerering, relokeringar, bildskrivning (Mach-O, ELF64, PE32+, Wasm), DWARF v4-debuginfo, macOS ad hoc-signering
 och byggdrivrutin (`dunder build`/`run`/`test`/`check`/`fmt`/`lsp`/`install`/`upgrade`). Ett vanligt Dunderbygge kör aldrig LLVM, GCC, en extern
 assembler, länkare eller signerare. Vanliga Linuxbilder använder direkta
-systemanrop utan libc. Ett program med nåbara `@extern`-deklarationer får
+systemanrop utan libc. Ett program med nåbara `extern`-deklarationer
+(`@link(...) extern "<abi>" { ... }`) får
 en dynamisk ELF med de bibliotek och symboler som deklarationerna anger.
 På Wasm blir deklarationerna typade värdimporter (eller WASI-importer under `wasm32-wasi`).
 

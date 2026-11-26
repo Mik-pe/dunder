@@ -5,8 +5,8 @@ av paketen kan ett projekt lägga till dem i sitt `dunder.toml`.
 
 ```toml
 [dependencies]
-http = { path = "../dunder/packages/http" }
-http_client = { path = "../dunder/packages/http_client" }
+http = { path = "../dunder/packages/http", capabilities = ["network", "unsafe"], native_libs = ["c"] }
+http_client = { path = "../dunder/packages/http_client", capabilities = ["network", "unsafe"], native_libs = ["/usr/lib/libcurl.dylib", "libcurl.so.4"] }
 ```
 
 Importera dem med `import http` och `import http_client`.

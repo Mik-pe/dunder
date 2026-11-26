@@ -37,7 +37,7 @@ flera ägare kräver ett explicit `.clone()` eller `move`. När en `Copy`-struct
 tupel, payload-enum eller positiv fast array `[T; N]` av POD-element ryms inom 16 åttabyte-ord (upp till 128 byte för fasta arrayer) lagras den som ett platt
 inline POD-värde på stacken (utan heapallokering eller referensräkning), och lån
 (`&T`/`&mut T`) passerar buffertpekaren direkt (`T*`) på samma sätt som för
-`@c_layout`. Samma platta POD-värden lagras dessutom avboxade direkt intill
+`@repr(C)`. Samma platta POD-värden lagras dessutom avboxade direkt intill
 varandra i bufferten för `[]T`, `[T; N]`, `Map` och `Set` utan separata
 elementallokeringar. Typens ägarskap bestämmer kopierings- och flyttreglerna,
 oberoende av om representationen ligger på stack eller heap (större `Copy`-värden kopieras automatiskt vid tilldelning och `.clone()`).
@@ -144,7 +144,7 @@ i en samling som utanför den. Ändliga rekursiva värden, exempelvis
 `@resource` avvisas kloning och upprepade arrayliteraler statiskt.
 `for element in &values` lånar ägda element; `for element in move values`
 flyttar dem. Referenser och scratchvyer får inte lagras som arrayelement.
-Arrayer av ohanterade `@c_layout`-structar och av POD-värden (kopierbara
+Arrayer av ohanterade `@repr(C)`-structar och av POD-värden (kopierbara
 structar, tupler, data-enums och fasta arrayer `[T; N]` upp till 16 åttabyte-ord / 128 byte) lagrar elementen
 avboxade och direkt intill varandra i samma buffert utan separata
 heapallokeringar per element vid `push`, `pop`, `remove`, `swap`, `replace`,
@@ -485,7 +485,7 @@ regionkapacitet ger arrayallokerarens status 109.
 
 
 Självkompilatorn stöder markörallokering för skalärer, vanliga flata
-structar med skalära fält och `@c_layout`-structar med nästlade värdefält
+structar med skalära fält och `@repr(C)`-structar med nästlade värdefält
 eller fasta arrayer av skalärer. För ett lån
 till ett skalärt element eller en hel vy kräver selfhost att elementens
 representation matchar funktionsparameterns lagring. Ett lån av ett enskilt

@@ -63,15 +63,15 @@ initiala mappningen (med upp till `1 GiB` per enskild allokering), och
 ## WebAssembly
 
 `wasm32` och aliaset `wasm32-unknown-unknown` använder 32-bitars pekare och
-`usize`. `i64` och `u64` behåller 64 bitar. `@c_layout` använder målets
+`usize`. `i64` och `u64` behåller 64 bitar. `@repr(C)` använder målets
 fältstorlekar. Den självbyggda kompilatorn översätter samma typkontrollerade
 funktioner och minnesoperationer som de nativa målen till Wasm. Modulen exporterar
 `main`, `memory` och `__indirect_function_table`. Tabellen kan användas av
 värden för att anropa en Dunder-callback.
 
-`@extern("modul", "namn")` blir en typad funktion i importtabellen när
-deklarationen används. Gränssnittet tar skalärer och pekare och skickar
-C-layout-structar via pekare. JavaScript tar emot i64-värden som `BigInt`
+`@link("modul") extern "C" { ... }` blir typade funktioner i importtabellen när
+deklarationerna används. Gränssnittet tar skalärer och pekare och skickar
+`@repr(C)`-structar via pekare. JavaScript tar emot i64-värden som `BigInt`
 och 32-bitars heltal som `Number`. Ett osignerat i32-format kan läsas med
 `value >>> 0`. Värden tillhandahåller utskriftsfunktioner under importmodulen
 `dunder`. Ett program som skriver ett heltal och en bool kan köras så här.
@@ -125,9 +125,9 @@ behåller sina nya värden så att anropets allokeringar finns kvar.
 Vanliga Linuxbilder innehåller egen startkod och direkta systemanrop, utan
 dynamisk laddare eller libc. Compile-time-predikatet `target_is("...")` i
 `if`/`else if`-grenar utvärderas vid kompilering och hoppar över onåbara
-grenar innan `@extern`-symboler registreras; exempelvis bygger `std.process`
+grenar innan `@link`/`extern`-symboler registreras; exempelvis bygger `std.process`
 statiska ELF-binärer på Linux via `sys.linux_syscall` och `sys.envp` utan
-`libc` eller `libdl`. Nåbara `@extern`-deklarationer ger en dynamisk
+`libc` eller `libdl`. Nåbara `extern`-deklarationer ger en dynamisk
 ELF med deklarerade bibliotek och symboler, separata RX/RW-segment och
 målets C-ABI. Grafikexemplen i testbädden
 [dunder-hundmat](https://github.com/Mik-pe/dunder-hundmat) använder dessa

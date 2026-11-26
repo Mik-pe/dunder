@@ -797,7 +797,7 @@ arenakopiering. [Taskkontrakt](tasks.md).
 
 Kompilatorn kan lagra en vanlig platt struct med upp till 16 skalärfält i
 stackramen. När posten lagras i en behållare kan den behöva boxas.
-Klassificeringen undantar bland annat resurser och `@c_layout`-typer.
+Klassificeringen undantar bland annat resurser och `@repr(C)`-typer.
 [Typklassificering](../selfhost/frontend/frontend_types.ddr) · [POD-prov för anrop, returer och behållare](../tools/test_pod_values.ddr)
 
 MIR-passet för ägarstädning följer oexponerade ägarceller genom

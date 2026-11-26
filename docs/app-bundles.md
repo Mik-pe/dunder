@@ -34,9 +34,15 @@ filesystem normalizations. Read `CFBundleExecutable` for its exact name.
 `Info.plist` identifies an `APPL` bundle, enables high resolution rendering and
 automatic graphics switching, and declares macOS 11.0 as the minimum system
 version. The bundle and short version strings use the Dunder compiler version.
-Its identifier is `org.dunder.<sanitized-name>-<hash>`: the name uses lowercase
-ASCII letters, digits and hyphens, and an eight digit deterministic name hash
-distinguishes names that sanitize to the same text.
+Its identifier is `org.dunder.<sanitized-name>-<hash>` unless overridden via
+`[app].bundle_id` in `dunder.toml`: the default name uses lowercase ASCII
+letters, digits and hyphens, and an eight digit deterministic name hash
+distinguishes names that sanitize to the same text. `[app].entitlements` seals
+an XML entitlements plist into the Mach-O `CodeDirectory`, and
+`[app].frameworks` copies local `.framework`/`.dylib` bundles into
+`Contents/Frameworks/` (preserving relative symlinks such as
+`Versions/Current -> A` while rejecting absolute or escaping symlinks). See
+[FFI and manifest policy](ffi.md) for the full `[app]` and `[native]` schema.
 
 Packaging uses Dunder's own filesystem operations and ad hoc signer. The bundle
 signature binds `Info.plist` and a generated `CodeResources` envelope to the

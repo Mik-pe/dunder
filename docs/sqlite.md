@@ -7,7 +7,7 @@ With a sibling Dunder checkout, the dependency is
 
 ```toml
 [dependencies]
-sqlite = { path = "../dunder/packages/sqlite", capabilities = ["filesystem", "unsafe"] }
+sqlite = { path = "../dunder/packages/sqlite", capabilities = ["filesystem", "unsafe"], native_libs = ["/usr/lib/libsqlite3.dylib", "libsqlite3.so.0"] }
 ```
 
 A Git dependency can select the same directory with `subdir = "packages/sqlite"`.
