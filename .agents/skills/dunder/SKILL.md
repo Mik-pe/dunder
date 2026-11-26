@@ -5,7 +5,7 @@ description: Write, review and debug Dunder (.ddr) programs. Use for Dunder synt
 
 # Dunder
 
-Check the project's compiler version with `dunder --version`. The example below runs with 0.12.1. Look at nearby `.ddr` files for the project's imports and capabilities.
+Check the project's compiler version with `dunder --version`. The example below runs with 0.13.0. Look at nearby `.ddr` files for the project's imports and capabilities.
 
 - Declare a local with `name := value` or `name: Type = value`. Add `mut` when the binding needs reassignment. A diagnostic such as `unknown local 'let'` on a declaration points to this syntax.
 - Convert integers to text with `n.str()`, or interpolate with `f"{n}"`. Widen operands before arithmetic if the result can exceed their original type.
@@ -37,4 +37,4 @@ fn first_positive(values: &[]i32) -> Option<i32> {
 
 Run `dunder test path/to/test.ddr` for a standalone test module, or `dunder test` for the package test root in `dunder.toml`. In a locked checkout with cached dependencies, add `--offline --locked`. Import a sibling module with `import .module_name` and call its public declarations through that name.
 
-For an unfamiliar operation, look up its actual declaration under `stdlib/` or `packages/` in the compiler revision the project uses. The language reference covers expressions, borrowing and standard APIs. [Syntax](https://github.com/Mik-pe/dunder/blob/v0.12.1/docs/syntax.md) · [Ownership](https://github.com/Mik-pe/dunder/blob/v0.12.1/docs/memory.md) · [Standard library](https://github.com/Mik-pe/dunder/blob/v0.12.1/docs/standard.md)
+For an unfamiliar operation, look up its actual declaration under `stdlib/` or `packages/` in the compiler revision the project uses. The language reference covers expressions, borrowing and standard APIs. [Syntax](https://github.com/Mik-pe/dunder/blob/v0.13.0/docs/syntax.md) · [Ownership](https://github.com/Mik-pe/dunder/blob/v0.13.0/docs/memory.md) · [Standard library](https://github.com/Mik-pe/dunder/blob/v0.13.0/docs/standard.md)

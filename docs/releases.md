@@ -13,6 +13,12 @@ Ersätt `await! jobs(id)` med `task.join()` och `await_any jobs(ids)` med
 en egen sats, `jobs.spawn(worker, arg)`. Kör sedan `dunder test` i projektet.
 [Parallella uppgifter och exempel](tasks.md)
 
+I generiska deklarationer skrivs `where storable(T)` nu `where T: Storable`.
+Ersätt ett metodkrav som `T.size: fn(T) -> i32` med en namngiven trait
+och implementera den för de typer som används. En closure av typen `Fn(...)`
+som fångar värden har en ägare. Använd `.clone()` när två ägare behöver dela
+samma closure. [Generiska typer och closures](syntax.md)
+
 ## Versionsserien 0.11
 
 Från `0.11.0` ska program som följer den dokumenterade syntaxen,
