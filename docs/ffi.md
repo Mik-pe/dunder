@@ -1,283 +1,1080 @@
-# Främmande funktioner, råminne och handtag
+# Främmande funktioner (FFI), systemlänkning och råminne
 
-Följande exempel använder den typade kompilatorn. Ett modulhuvud anger vilka
-privilegier som får användas direkt i filen. Kommentarer och tomrader får
-stå före huvudet. Flera privilegier skrivs på samma rad, till exempel
-`capability filesystem, unsafe`.
+Detta dokument är den auktoritativa specifikationen för Dunders FFI-språkyta,
+ABI-kontrakt, säkerhets- och kapabilitetsmodell, manifeststyrda länkpolicy i
+`dunder.toml` samt de inbyggda binäremittrarna (Mach-O, ELF64, PE32+ och
+WebAssembly).
+
+Dunder äger hela verktygskedjan från `.ddr` till körbar binär utan extern
+C-kompilator, assembler, länkare, plattforms-SDK, `.tbd`-stubbar eller
+`.lib`-importbibliotek. System- och grafik-API:er som Metal, Cocoa/AppKit,
+CoreGraphics, QuartzCore, Vulkan, Wayland, X11, DirectX 12, DXGI, Win32 och
+COM är dynamiskt länkade vid operativsystemets ABI-gräns och emitteras direkt
+av kompilatorns inbyggda bildskrivare — inklusive offline-korskompilering.
 
 ```dunder
 capability unsafe
+import std.ffi as ffi
 
-@c_layout
-struct Header { tag: u8, length: u32, data: ptr }
-
-@extern("c", "strlen")
-unsafe fn strlen(text: ptr) -> usize
+@link("c")
+extern "C" {
+    fn strlen(text: *const ffi.c_char) -> usize
+}
 
 fn main() {
     unsafe {
-        mut h: Header = zeroed()
-        h.tag = 7
-        h.data = cstr("dunder")
-        h.length = u32(strlen(h.data))
-        assert(h.length == 6)
+        len := strlen(c"dunder".as_ptr())
+        assert(len == 6)
     }
 }
 ```
 
-## Typ och layout
+---
 
-`i16` lagrar ett signerat tvåkomplementsvärde i två byte. Arrayer med `i16`
-använder två byte per element. Läsning via `load_i16` och konvertering till
-`i32` eller `i64` bevarar tecknet.
+## 1. Språkyta och typsystem
 
-`u8`, `u16`, `u32` och `u64` upptar 1, 2, 4 respektive 8 byte i en array eller
-struct. `usize` och den opaka råpekaren `ptr` följer målets pekarbredd,
-8 byte på de fyra nativa målen (ARM64/macOS, ARM64/Linux, x86-64/Linux och
-x86-64/Windows) och 4 byte på wasm32 (båda wasm-målen). En literal kontrolleras
-mot sin förväntade typ. Konverteringar som `u8(value)` kontrollerar att värdet
-ryms. Index och längd i Dunders befintliga samlings-API har typen `i32`.
+### 1.1 Primitiva FFI-typer och `std.ffi`
 
-`@c_layout` placerar fält i deklarationsordning med naturlig justering och
-avrundar totalstorleken till den största fältjusteringen. Fält kan vara tal,
-`ptr`, `extern fn`, inbäddade `@c_layout`-structar och fasta arrayer av
-dessa ohanterade typer. Fältet `headers: [Header; 2]` har samma layout som
-`Header headers[2]` i C. Även i fristående arrayer ligger sådana element med
-`size_of(Header)` bytes mellanrum. Skicka `addr(&headers[0])` och antalet
-element till C när arrayen har minst ett element.
-`string` har Dunders egen ägarmodell och får inte användas som C-fält.
-Ange C-API:ets exakta typer, exempelvis `u32` för ett
-32-bitars flaggfält. `size_of(Header)` och `align_of(Header)` ger `usize`
-för valt mål. `zeroed()` i en unsafe-kontext skapar en C-struct där alla
-fält har värdet noll. En fast array kan initialiseras med exempelvis
-`mut headers: [Header; 2] = [zeroed(); 2]`. Varje element har egen lagring. Noll kan vara ett ogiltigt handtag för ett visst API.
+Följande primitiva skalärtyper får passera en FFI-gräns och lagras i
+`@repr(C)`-typer:
 
-En C-struct får uppta högst 1 048 575 byte inklusive utfyllnad. Till
-exempel ryms ett fält av typen `[u8; 262144]` för ett bildkakel på
-256 × 256 RGBA-pixlar. `zeroed()` lägger själva C-värdet på heapen.
-Skicka stora structar med pekare och jämför layouten med C:s `sizeof`,
-`_Alignof` och `offsetof`. Gränsen för utgående stackargument i ett
-enskilt C-anrop är 4 080 byte.
+| Dunder-typ | Storlek / ABI | Anmärkning |
+| --- | --- | --- |
+| `i8`, `u8` | 1 byte | Signerat respektive osignerat heltal |
+| `i16`, `u16` | 2 byte | Tvåkomplement respektive osignerat |
+| `i32`, `u32` | 4 byte | Fast bredd |
+| `i64`, `u64` | 8 byte | Fast bredd |
+| `isize`, `usize` | Målets pekarbredd | 8 byte på 64-bitars nativa mål, 4 byte på `wasm32`/`wasm32-wasi` |
+| `f32`, `f64` | 4 respektive 8 byte | IEEE 754 binary32 / binary64 |
+| `bool` | 1 byte | Motsvarar C `_Bool` (`0` = `false`, `1` = `true`); utgående värden är alltid `0` eller `1`, inkommande icke-noll-byte tolkas som `true` |
 
-## Anrop och adresser
+Modulen `std.ffi` exporterar plattformsanpassade C-typalias och opaka
+`void`-typer som följer målplattformens C-ABI:
 
-`@extern("bibliotek", "symbol") unsafe fn` deklarerar en direkt import.
-Funktionsvärdet har typen `extern fn(Parametrar) -> Resultat`. Anrop kontrollerar
-antal och typer och kräver en unsafe-kontext även efter tilldelning till en
-variabel. Dunder-funktioner och C-funktionspekare har skilda typer. På native
-betecknar `"c"` systemets C-bibliotek (`libSystem.B.dylib` på macOS,
-`libc.so.6` på Linux, `msvcrt.dll` på Windows där även `"msvcrt"` och
-`"kernel32"`/`"kernel32.dll"` stöds) och `"dl"` systemets dynamiska laddare
-(`libdl.so.2`). På Wasm anger de två strängarna importmodul och importnamn.
+| Alias i `std.ffi` | `arm64-macos` | `arm64-linux` | `x86_64-linux` | `x86_64-windows` | `wasm32` / `wasi` |
+| --- | --- | --- | --- | --- | --- |
+| `c_char` | `i8` | `u8` | `i8` | `i8` | `i8` |
+| `c_schar` / `c_uchar` | `i8` / `u8` | `i8` / `u8` | `i8` / `u8` | `i8` / `u8` | `i8` / `u8` |
+| `c_short` / `c_ushort` | `i16` / `u16` | `i16` / `u16` | `i16` / `u16` | `i16` / `u16` | `i16` / `u16` |
+| `c_int` / `c_uint` | `i32` / `u32` | `i32` / `u32` | `i32` / `u32` | `i32` / `u32` | `i32` / `u32` |
+| `c_long` / `c_ulong` | `i64` / `u64` | `i64` / `u64` | `i64` / `u64` | `i32` / `u32` | `i32` / `u32` |
+| `c_longlong` / `c_ulonglong` | `i64` / `u64` | `i64` / `u64` | `i64` / `u64` | `i64` / `u64` | `i64` / `u64` |
+| `c_void` | `extern type` | `extern type` | `extern type` | `extern type` | `extern type` |
 
-En variadisk C-funktion deklareras med `@c_variadic(antal_fasta_parametrar)`.
-Varje anrop har fortfarande en fullständigt statisk signatur: deklarera separata
-typade alias när samma C-symbol används med olika typer, till exempel libcurl:
+Notera skillnaden mellan **LP64** (macOS och Linux, där `c_long` är 64 bitar)
+och **LLP64** (Windows, där `c_long` är 32 bitar), samt att `char` är osignerat
+på ARM64/Linux. Använd alltid `std.ffi`-aliasen när en C-signatur anger `long`
+eller `char`, och explicita bredder (`u32`, `i64` m.fl.) när C-API:et anger
+`uint32_t`, `DWORD`, `HRESULT` osv.
+
+### 1.2 Typade råpekare (`*const T` och `*mut T`)
+
+Dunder använder två skilda typade råpekartyper:
+
+- `*const T` — skrivskyddad råpekare till ett värde av typen `T`.
+- `*mut T` — skrivbar råpekare till ett värde av typen `T`.
+
+Råpekare är `Copy`, har målets pekarbredd (`size_of(*const T) == size_of(usize)`)
+och tillåter null. För generiska `void*`-pekare används `*const ffi.c_void`
+respektive `*mut ffi.c_void`.
+
+Skapande och konvertering:
+
+- `&place` konverteras till `*const T` via `addr(&place)` (kräver `unsafe`-kontext).
+- `&mut place` konverteras till `*mut T` via `addr(&mut place)` (kräver `unsafe`-kontext).
+- Nollpekare skapas säkert med `ffi.null<T>() -> *const T` och
+  `ffi.null_mut<T>() -> *mut T`.
+- Adresskonvertering: `p.addr() -> usize` (säker), `ffi.from_addr<T>(a: usize) -> *const T`
+  och `ffi.from_addr_mut<T>(a: usize) -> *mut T` (kräver `unsafe`).
+
+Metoder på `*const T` och `*mut T`:
+
+| Metod | Säkerhet | Beteende |
+| --- | --- | --- |
+| `p.is_null() -> bool` | Säker | Sant exakt när adressen är `0`. |
+| `p.addr() -> usize` | Säker | Returnerar pekarens bitmönster. |
+| `p.cast<U>() -> *const U` / `*mut U` | Säker | Byter elementtyp med bevarad konst-/mut-kvalificering. |
+| `p.cast_const() -> *const T` | Säker | Nedgraderar `*mut T` till `*const T`. |
+| `p.cast_mut() -> *mut T` | Säker | Konverterar `*const T` till `*mut T` (skrivning kräver fortsatt `unsafe`). |
+| `p.add(n: usize) -> Self` | `unsafe` | Förskjuter pekaren `n * size_of(T)` byte framåt inom samma allokering. |
+| `p.sub(n: usize) -> Self` | `unsafe` | Förskjuter pekaren `n * size_of(T)` byte bakåt inom samma allokering. |
+| `p.offset(n: isize) -> Self` | `unsafe` | Signerad elementförskjutning med `n * size_of(T)` byte. |
+| `p.byte_add(n: usize)` / `.byte_sub(n: usize)` | `unsafe` | Bytevis förskjutning utan skalning med `size_of(T)`. |
+| `p.read() -> T` | `unsafe` | Läser ett justerat värde av typen `T` (`T` måste vara `Copy` eller FFI-värdetyp). |
+| `p.write(val: T)` (`*mut T`) | `unsafe` | Skriver ett justerat värde av typen `T`. |
+| `p.read_unaligned() -> T` / `.write_unaligned(val: T)` | `unsafe` | Läser/skriver ojusterat värde (t.ex. från packade nätverks- eller filbuffertar). |
+| `p.as_ref(&owner) -> Option<&T> from owner` | `unsafe` | Returnerar `.None` vid null; binder annars en delad referens `&T` till ägaren `&owner`. |
+| `p.as_mut(&mut owner) -> Option<&mut T> from owner` (`*mut T`) | `unsafe` | Returnerar `.None` vid null; binder annars en exklusiv referens `&mut T` till `&mut owner`. |
+
+För lånade vyer över sammanhängande minnesintervall finns de ägarbundna
+primitiverna:
+
+- `unsafe ffi.bytes_view(&owner, base: *const u8, len: usize) -> &[]u8 from owner`
+- `unsafe ffi.slice_view<T>(&owner, base: *const T, count: usize) -> &[]T from owner`
+- `unsafe ffi.slice_view_mut<T>(&mut owner, base: *mut T, count: usize) -> &mut []T from owner`
+
+Vid positiv längd måste `base` vara skild från null och naturligt justerad
+för `T`, och hela intervallet `[base, base + count * size_of(T))` måste
+vara giltigt och orört under `&owner`/`&mut owner`-lånets hela livstid.
+
+`==` och `!=` jämför två pekare av samma typ efter adress. Ett `addr(&buf)` på
+en dynamisk array `[]T` pekar på Dunders arraybeskrivare; för elementbufferten
+skickas `addr(&buf[0])` (när `buf.len > 0`) eller `buf.as_ptr()`.
+
+### 1.3 Opaka FFI-typer (`extern type`)
+
+För nominellt skilda, nollkostnadshandtag deklareras opaka främmande typer med
+`extern type`:
 
 ```dunder
-capability unsafe
-
-@c_variadic(2)
-@extern("/usr/lib/libcurl.dylib", "curl_easy_setopt")
-unsafe fn setopt_ptr(easy: ptr, option: i32, value: ptr) -> i32
+pub extern type VkInstance_T
+pub extern type VkDevice_T
+pub extern type HWND_T
+pub extern type MTLDevice
 ```
 
-Antalet fasta parametrar måste ligga mellan noll och deklarationens antal
-parametrar. De återstående parametrarna måste redan ha C:s promoverade typer:
-`i32`, `u32`, `i64`, `u64`, `usize`, `ptr`, `f64` eller en C-funktionspekare.
-Konvertera `f32` till `f64` och små heltal till `i32` före anropet. Variadiska
-aggregat stöds inte. Attributet kräver `@extern unsafe fn` och ett nativt mål.
-Gränsen mellan fasta och variadiska parametrar ingår i funktionens typ och
-bevaras vid härledd tilldelning (`call := setopt_ptr`); den kan inte tilldelas
-en vanlig `extern fn`-typ. Apple ARM64 använder åttabytes stackplatser för
-variadiska argument; Linux- och Windows-målen (SysV respektive Win64, med
-fyra registerargument och 32 byte skuggrymd) använder respektive plattforms
-C-konvention.
+Regler för `extern type`:
 
-Parametrar och returvärden kan vara skalära tal eller pekare. Native-anrop kan
-också överföra en C-struct bestående av en till fyra identiska flyttal (även
-nästlade). ARM64 (`arm64-macos` och `arm64-linux`) samt Win64 kan dessutom
-skicka och returnera övriga `@c_layout`-structar som värden enligt respektive
-plattforms ABI (på ARM64 upp till 16 byte i register eller som kopia på
-anroparens stack, och större structar via kopia/pekare och `x8`-retur).
-Win64 använder enbytes-, tvåbytes-, fyrabytes- eller åttabytesplatser i
-register för structar av dessa storlekar och kopia hos anroparen för övriga
-storlekar. På övriga mål (x86-64/Linux och Wasm) skickas övriga structar
-med pekare. Använd en fast signatur för varje
-anrop. `callback(namn)` ger en C-funktionspekare till en namngiven
-Dunder-funktion med skalära argument och skalärt eller tomt resultat. En
-native-callback lånar det pågående Dunder-anropets exekveringstillstånd.
-C-biblioteket får anropa den synkront på samma OS-tråd medan anropet från
-Dunder till C fortfarande pågår. Om ett C-bibliotek anropar funktionen från
-en annan tråd eller utan ett aktivt anrop avslutas processen med kod 111.
+- En `extern type` har okänd storlek vid kompilering och får aldrig förekomma
+  som värde, fält i en struct/union, returtyp per värde eller argument till
+  `size_of`, `align_of`, `.add()`, `.sub()`, `.read()` eller `.write()`.
+- Den används uteslutande bakom råpekare (`*const T`, `*mut T`), exempelvis
+  `type VkDevice = *mut VkDevice_T`.
+- Två olika `extern type`-deklarationer är nominellt skilda typer: `*mut VkDevice_T`
+  kan aldrig av misstag skickas där `*mut VkInstance_T` förväntas.
+- För säkra, ägda handtag paketeras pekaren i en `@resource(dispose) pub opaque struct`.
 
-Den osäkra primitiven `static_bytes("native", 16)` ger adressen till ett
-16-byte-justerat och initialt nollställt område i programmets skrivbara
-datasegment. Varje anropsställe äger ett eget område som lever tills processen
-avslutas. Längden är en heltalsliteral mellan en byte och 16 MiB.
-`"linux"`, `"macos"` och `"windows"` binder ett nåbart anropsställe till
-respektive system. Ett modultillstånd kan läggas bakom en privat funktion som
-alltid returnerar samma områdesadress. Anroparen ansvarar för samtidighet.
+### 1.4 Layoutattribut: `@repr(C)`, `struct`, `union` och öppna C-enums
 
-För plattformsspecifik kod som väljs statiskt finns compile-time-uttrycket
-`target_is("...")` i `if`/`else if`-villkor (med `!`, `&&`, `||` och
-parenteser), där giltiga namn är `"macos"`, `"arm64-macos"`,
-`"aarch64-apple-darwin"`, `"linux"`, `"arm64-linux"`,
-`"aarch64-unknown-linux-gnu"`, `"x86_64-linux"`,
-`"x86_64-unknown-linux-gnu"`, `"windows"`, `"x86_64-windows"`,
-`"x86_64-pc-windows-msvc"`, `"arm64"`, `"x86_64"`, `"native"`, `"wasm32"`,
-`"wasm32-unknown-unknown"`, `"wasi"`, `"wasm32-wasi"` och `"wasm32-wasip1"`
-(`"x86_64"` täcker även Windows och `"wasm32"` täcker även wasi). Onåbara
-grenar hoppas över före typkontroll
-och importregistrering, så `@extern`-anrop i en `target_is("macos")`-gren
-skapar inga dynamiska beroenden vid Linux-kompilering.
+#### `@repr(C)` på `struct`
 
-`std.dl.open`, `std.dl.symbol` och `std.dl.close` tar och returnerar C-API:ets
-egna råvärden. Kontrollera laddarens resultat. Behåll bibliotekshandtaget så
-länge någon kan anropa dess funktioner.
-
-På Windows tar `open` en nollavslutad UTF-8-sökväg och laddar biblioteket
-med `LoadLibraryW`. Flaggvärdena 1 och 2 stöds. En nullpekare som sökväg
-hämtar en ägd referens till processens egen modul. Matcha varje lyckat
-`open` med ett `close`. Symbolnamnet är exportens exakta namn.
+`@repr(C)` placerar fält i deklarationsordning enligt målets C-ABI med
+naturlig fältjustering och avrundar totalstorleken uppåt till den största
+fältjusteringen:
 
 ```dunder
-capability unsafe
-import std.dl
-
-unsafe fn lookup_strlen(library: ptr) -> usize {
-    address := dl.symbol(library, cstr("strlen"))
-    if address == ptr(0) { return 0 }
-    length: extern fn(ptr) -> usize = ffi_fn(address)
-    length(cstr("dunder"))
+@repr(C)
+struct Header {
+    tag: u8,
+    length: u32,
+    data: *const u8,
 }
 ```
 
-En C-strängliteral `cstr("text")` har statisk livstid, UTF-8-innehåll och en
-avslutande nollbyte. Inbäddad NUL avvisas. För dynamisk text kan anroparen
-bygga en `[]u8` med avslutande nolla och skicka `addr(&bytes[0])`. Behåll
-bufferten levande och på samma adress under hela lånet. `addr(&place)` och
-`addr(&mut place)` tar adressen till ett lagrat värde. Ett arrayelement har
-en kontrollerad indexberäkning. `addr(&buf)` på en dynamisk array ger adressen
-till Dunders arraybeskrivare.
+Modifierare som kan kombineras med `C`:
 
-`load_u16(p)` läser två byte. `store_u16(p, v)` skriver två byte som en sats.
-Motsvarande operationer finns för de fem osignerade heltalstyperna, `i32`,
-`i64`, `f32`, `f64` och `ptr`. `usize(p)` ger adressens bitar och
-`ptr(address)` tar en `usize`. `ref_at(p)` överlämnar ett rått värde som en
-`&T`- eller `&mut T`-parameter med förväntad typ. Den som skriver unsafe-koden
-ansvarar för livstid, åtkomst, storlek, justering och aliasregler. Ett främmande
-funktionsanrop förutsätter dessutom att bibliotekets faktiska ABI stämmer med
-deklarationen.
+- `@repr(C, packed)` — sätter fältjustering till 1 byte (ingen utfyllnad mellan
+  fält eller i slutet).
+- `@repr(C, packed(N))` — begränsar varje fälts justering till högst `N`
+  (`N` är en tvåpotens: `1, 2, 4, 8, 16, ...`).
+- `@repr(C, align(N))` — höjer typens minsta justering till minst `N`
+  (`N` är en tvåpotens) och avrundar totalstorleken till en multipel av `N`
+  (används för exempelvis 16-bytejusterade SIMD-, Metal- och DirectX-typer).
+- `packed` och `align` får inte kombineras i samma attribut.
+- På en `packed`-typ avvisar kompilatorn att ta en direkt referens (`&s.field`,
+  `&mut s.field`) till ett fält vars justering kan understiga fälttypens
+  naturliga justering; fältet läses eller skrivs istället per värde (kopia)
+  eller via `addr(&s)` + `read_unaligned()`/`write_unaligned()`.
+
+Tillåtna fälttyper i `@repr(C)`-structar och -unioner:
+
+- Primitiva FFI-typer (`i8..i64`, `u8..u64`, `isize`, `usize`, `f32`, `f64`, `bool`).
+- Typade råpekare (`*const T`, `*mut T`).
+- Externa funktionspekare (`extern "<abi>" fn(...) -> ...`) samt nullbara
+  `Option<extern "<abi>" fn(...) -> ...>`.
+- Öppna C-enums märkta `@repr(<heltal>)`.
+- Nästlade `@repr(C)`-structar och `@repr(C)`-unioner.
+- Fasta arrayer `[T; N]` av ovanstående typer (elementen ligger tätt med
+  `size_of(T)` bytes mellanrum, exakt som `T field[N]` i C).
+
+Hanterade Dunder-typer (`string`, `[]T`, `Map`, `Set`, fångande closures,
+slutna Dunder-enums och `@resource`-typer) är förbjudna i `@repr(C)`-typer.
+`size_of(T) -> usize`, `align_of(T) -> usize` och `offset_of(T, field) -> usize`
+utvärderas vid kompilering för valt mål.
+
+#### Stackallokering och partiell nollinitiering
+
+`@repr(C)`-structar och -unioner är värdetyper som lagras **direkt på stacken**
+(utan tvungen heapallokering vid literalkonstruktion, `zeroed()` eller retur
+från externa anrop). Stora structar bör av prestandaskäl fortfarande skickas
+med pekare till C-API:er som accepterar pekare.
+
+- `ffi.zeroed<T>() -> T` (eller kontexttypad `zeroed()`, kräver `unsafe`) konstruerar ett värde på stacken
+  med alla `size_of(T)` byte — inklusive all utfyllnad — satta till `0`.
+- Partiell nollinitiering tillåts på `@repr(C)`-structar i `unsafe`-kontext:
+  ```dunder
+  unsafe {
+      info := VkInstanceCreateInfo {
+          sType: .InstanceCreateInfo,
+          pApplicationInfo: addr(&app_info),
+          ..zeroed()
+      }
+  }
+  ```
+  Alla utelämnade fält samt all dold utfyllnad mellan och efter fält
+  nollställs deterministiskt, vilket eliminerar behovet av att manuellt lista
+  dussintals nollfält i Vulkan-, Win32- och DirectX-beskrivare.
+
+#### `@repr(C)` på `union`
+
+En `union` lagrar alla sina fält överlappande på byteoffset `0`. Dess
+justering är den största justeringen bland fälten och dess storlek är den
+största fältstorleken avrundad uppåt till justeringen.
+
+```dunder
+@repr(C)
+union VkClearColorValue {
+    float32: [f32; 4],
+    int32: [i32; 4],
+    uint32: [u32; 4],
+}
+```
+
+Regler för `union`:
+
+- Alla `union`-deklarationer måste ha `@repr(C)` (eventuellt med `packed`
+  eller `align(N)`).
+- Endast FFI-kompatibla värdetyper får vara fält (inga ägda/resursbärande
+  typer).
+- Konstruktion med ett fält (`VkClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] }`)
+  nollställer eventuella resterande byte utöver det valda fältet så att inga
+  oinitierade utfyllnadsbyte läcker över FFI.
+- Tilldelning till ett fält (`u.uint32 = [1, 2, 3, 4]`) kräver inte `unsafe`,
+  men **varje läsning eller lån av ett unionfält kräver `unsafe`**.
+
+#### Öppna C-ABI-enums (`@repr(<heltal>)`)
+
+En fältlös `enum` kan märkas med en explicit heltalstyp för direkt
+C-ABI-representation:
+
+`@repr(u8)`, `@repr(i8)`, `@repr(u16)`, `@repr(i16)`, `@repr(u32)`,
+`@repr(i32)`, `@repr(u64)`, `@repr(i64)`, `@repr(usize)`, `@repr(isize)`.
+
+```dunder
+@repr(i32)
+pub enum VkResult {
+    Success = 0,
+    NotReady = 1,
+    Timeout = 2,
+    SuboptimalKhr = 1000001003,
+    ErrorOutOfHostMemory = -1,
+    ErrorOutOfDateKhr = -1000001004,
+}
+```
+
+Kontrakt för `@repr(<heltal>)`-enums:
+
+- Storlek, justering och anropskonvention är identiska med den angivna
+  heltalstypen. Typen är tillåten direkt i `extern`-signaturer och i
+  `@repr(C)`-structar och -unioner.
+- **Öppen semantik utan runtimefälla**: till skillnad från slutna Dunder-enums
+  (som fäller med status 108 för okända värden) kan en `@repr(<heltal>)`-enum
+  bära **vilket bitmönster som helst** i sin underliggande heltalstyp. En ny
+  returkod eller flagga från en grafikdrivrutin eller framtida OS-version
+  orsakar därför aldrig en krasch vid FFI-gränsen.
+- Inbyggda metoder på varje `@repr(Int)`-enum `E`:
+  - `E::from_raw(raw: Int) -> E` — ofelbar konstruktion från valfritt `Int`-värde.
+  - `E::try_from_raw(raw: Int) -> Option<E>` — returnerar `.Some(e)` endast om
+    `raw` matchar en namngiven variant, annars `.None`.
+  - `e.to_raw() -> Int` — returnerar det underliggande råa heltalsvärdet.
+- Eftersom typen är öppen kräver varje `match` på en `@repr(<heltal>)`-enum en
+  avslutande jokerarm (`_ => ...`).
+
+### 1.5 C-strängar och UTF-16-strängar (`CStr`/`CString`, `WStr`/`WString`)
+
+För nollkostnads strängöverföring till POSIX-, C-, ObjC- och Win32-API:er
+tillhandahåller språket och `std.ffi` fyra kompletterande typer:
+
+- **`c"..."` -> `&ffi.CStr`**: statisk, NUL-avslutad UTF-8-sträng i
+  skrivskyddat datautrymme. Inbäddad NUL (`\0`) avvisas vid kompilering.
+  - `.as_ptr() -> *const ffi.c_char`
+  - `.as_bytes() -> &[]u8` (utan avslutande NUL)
+  - `.as_bytes_with_nul() -> &[]u8` (inklusive avslutande NUL)
+  - `.len() -> usize` (antal byte före NUL)
+- **`w"..."` -> `&ffi.WStr`**: statisk, NUL-avslutad UTF-16LE-sträng
+  (kompilerad som konstant `[u16; N]`). Inbäddad NUL avvisas vid kompilering.
+  Eliminerar dynamisk UTF-8 -> UTF-16-konvertering för konstanta Win32-namn
+  som fönsterklasser och DLL-sökvägar.
+  - `.as_ptr() -> *const u16`
+  - `.as_units() -> &[]u16` (utan avslutande NUL)
+  - `.as_units_with_nul() -> &[]u16` (inklusive avslutande NUL)
+  - `.len() -> usize` (antal UTF-16-kodenheter före NUL)
+- **`ffi.CString`**: ägd, heapallokerad, NUL-avslutad UTF-8-sträng.
+  - `CString::new(text: string) -> Result<CString, NulError>` (avvisar inbäddad NUL).
+  - `.as_cstr() -> &CStr`, `.as_ptr() -> *const ffi.c_char`, `.as_bytes() -> &[]u8`, `.len() -> usize`.
+- **`ffi.WString`**: ägd, NUL-avslutad UTF-16LE-sträng för dynamiska
+  Win32 `*W`-anrop.
+  - `WString::new(text: string) -> Result<WString, NulError>` (avvisar inbäddad NUL).
+  - `.as_wstr() -> &WStr`, `.as_ptr() -> *const u16`, `.len() -> usize`.
+- **Inläsning från främmande strängpekare** (alla null-säkra):
+  - `unsafe ffi.CStr::from_ptr(&owner, p: *const ffi.c_char) -> Option<&CStr> from owner`
+  - `unsafe ffi.from_cstr(p: *const ffi.c_char) -> Option<string>` (validerar UTF-8)
+  - `unsafe ffi.from_cstr_lossy(p: *const ffi.c_char) -> Option<string>`
+  - `unsafe ffi.from_wstr(p: *const u16) -> Option<string>` (avkodar UTF-16LE)
+
+### 1.6 Nullbara funktionspekare (NPO)
+
+En främmande funktionspekartyp `extern "<abi>" fn(Parametrar) -> Resultat` är
+garanterat **icke-null**. Dunder-funktionspekare `fn(...)` och
+`extern "<abi>" fn(...)` är skilda typer och kan inte blandas implicit.
+
+`Option<extern "<abi>" fn(Parametrar) -> Resultat>` omfattas av
+**nollpekaroptimering (NPO)**:
+
+- Den har exakt samma storlek, justering och anropskonvention som en rå
+  funktionspekare (`size_of(usize)`).
+- `.None` representeras av adressen `0` (null); `.Some(f)` representeras av
+  funktionsadressen direkt utan taggbyte.
+- Typen får användas direkt som fält i `@repr(C)`-structar och -unioner samt
+  som parameter och returtyp i `extern`-funktioner (t.ex. valfria callbacks i
+  `VkAllocationCallbacks`, `wl_registry_listener` och `WNDCLASSEXW`).
+
+---
+
+## 2. Externa deklarationer, anropskonventioner, globala symboler och callbacks
+
+### 2.1 Grupperade `extern "<abi>"`-block och `@link(...)`
+
+Främmande funktioner och datasymboler deklareras i grupperade `extern`-block
+kopplade till en **logisk biblioteksnyckel** via `@link(...)`:
+
+```dunder
+capability unsafe
+import std.ffi as ffi
+
+@link("c")
+extern "C" {
+    fn malloc(size: usize) -> *mut ffi.c_void
+    fn free(p: *mut ffi.c_void)
+
+    @link_name("snprintf")
+    fn c_snprintf(buf: *mut ffi.c_char, cap: usize, fmt: *const ffi.c_char, ...) -> ffi.c_int
+}
+```
+
+#### Stödda anropskonventioner (`<abi>`)
+
+| Konvention | Betydelse och mål-ABI |
+| --- | --- |
+| `"C"` | Målets standard-C-ABI: AAPCS64 på `arm64-macos`/`arm64-linux` (inkl. Apple-specifik stackpackning och variadik-på-stack på Darwin), full System V AMD64-klassificering (`INTEGER`/`SSE`/`MEMORY` för 1–16 byte samt stackkopia/`sret` för >16 byte) på `x86_64-linux`, Win64 på `x86_64-windows`, Wasm-import-ABI på `wasm32`/`wasm32-wasi`. |
+| `"system"` | Operativsystemets API-konvention: Win64 på `x86_64-windows`, `"C"` på övriga 64-bitars mål (och `stdcall` om 32-bitars x86-Windows någonsin införs). Rekommenderas för Win32 och plattformsoberoende systemanrop. |
+| `"win64"` | Uttrycklig Microsoft x64-anropskonvention: fyra registerargument (`RCX`/`RDX`/`R8`/`R9` eller `XMM0..XMM3`), 32 byte shadow space allokerat av anroparen, 1/2/4/8-bytes structar i GPR och övriga storlekar via anroparkopia/pekare, `XMM6..XMM15` callee-saved. |
+| `"sysv64"` | Uttrycklig System V AMD64-anropskonvention: sex GPR (`RDI`/`RSI`/`RDX`/`RCX`/`R8`/`R9`), åtta XMM (`XMM0..XMM7`), full 8-bytesklassificering, 16-byte stackjustering före `call`, `%al` satt till antal XMM-register vid variadiska anrop. |
+| `"msvc-com"` | Microsoft x64 C++ COM-medlemsfunktions-ABI (DirectX 12, DXGI, DirectWrite, WIC). För metoder som returnerar en struct per värde — **även 1/2/4/8-bytesstructar** som `D3D12_CPU_DESCRIPTOR_HANDLE` (`8` byte) från `GetCPUDescriptorHandleForHeapStart` — skickas `this` i `RCX` och en dold returpekare (`sret`) i **`RDX`**, övriga parametrar från `R8`/`R9`/stack, och funktionen returnerar `sret`-pekaren i `RAX`. (I vanligt Win64 C-ABI returneras en 8-bytesstruct direkt i `RAX`, vilket kraschar COM-anrop.) |
+
+#### `@link(...)`-attributet
+
+`@link(...)` fästs på ett `extern "<abi>" { ... }`-block:
+
+- `@link("<nyckel>")` — anger logisk biblioteksnyckel (t.ex. `"c"`, `"objc"`,
+  `"metal"`, `"vulkan"`, `"wayland-client"`, `"d3d12"`, `"user32"`). På
+  `wasm32`/`wasm32-wasi` anger strängen Wasm-importmodulens namn (t.ex.
+  `"wasi_snapshot_preview1"`).
+- `@link(framework = "<Namn>")` — macOS-ramverkskortform (motsvarar nyckeln
+  `framework:<Namn>`, som löses till
+  `/System/Library/Frameworks/<Namn>.framework/Versions/A/<Namn>` ur dyld
+  shared cache om inget annat anges i `dunder.toml`).
+- Valfria namngivna parametrar i `@link(...)`:
+  - `weak = true` — mjuk biblioteks- och symbolbindning (`LC_LOAD_WEAK_DYLIB`
+    + `BIND_SYMBOL_FLAGS_WEAK_IMPORT` på Mach-O, `STB_WEAK` på ELF64).
+    Används för valfria nyare OS-ramverk (t.ex. `MetalFX`) eller frivilliga
+    symboler.
+  - `delay = true` — fördröjd DLL-laddning på Windows via PE32+ Delay-Load
+    Import Directory (DataDir 13) så att avsaknad av exempelvis `d3d12.dll`
+    eller `d3dcompiler_47.dll` inte stoppar programstarten.
+  - `version = "<ver>"` — sätter ELF-symbolversion (t.ex. `"GLIBC_2.17"`) för
+    samtliga symboler i blocket.
+
+#### Medlemsattribut, variadiker och externa datasymboler (`static`)
+
+Inne i ett `extern "<abi>" { ... }`-block kan varje deklaration ha:
+
+- `pub` — exporterar symbolen från modulen.
+- `@link_name("<symbol>")` — binder Dunder-namnet till ett annat binärt
+  exportnamn (t.ex. flera typade alias för `objc_msgSend` eller
+  `curl_easy_setopt`).
+- `@link_ordinal(N)` — binder med Windows PE-ordinalnummer i stället för namn
+  (`1 <= N <= 65535`).
+- `@link_version("<ver>")` — explicit ELF-symbolversion för enskild symbol
+  (`DT_VERSYM`/`DT_VERNEED`).
+- `@weak` — markerar en enskild symbol som svag även i ett normalt block.
+- `@thread_safe` — markerar att funktionen får anropas från isolerade `task`-arbetare.
+- `@requires(filesystem | network | process | stdio)` — kopplar kapabilitetskrav
+  till externa funktioner precis som vanliga Dunder-funktioner.
+
+**Funktioner i `extern`-block** är alltid osäkra att anropa (anrop kräver
+`unsafe`-kontext). Nyckelordet `unsafe` skrivs därför inte framför `fn` inne i
+blocket.
+
+**Variadiska funktioner** skrivs med `...` sist i parameterlistan efter minst
+en fast parameter:
+
+```dunder
+@link("curl")
+extern "C" {
+    fn curl_easy_setopt(easy: *mut CURL, option: ffi.c_int, ...) -> ffi.c_int
+}
+```
+
+Vid anrop till en variadisk funktion gäller C:s standardregler för promovering:
+argument efter den sista fasta parametern måste vara C-promoverade skalärer
+(`i32`, `u32`, `i64`, `u64`, `isize`, `usize`, `*const T`, `*mut T`, `f64`,
+`extern fn` eller `Option<extern fn>`). Mindre heltal (`i8`, `u8`, `i16`,
+`u16`, `bool`) och `f32` konverteras uttryckligen av anroparen till `i32`/`u32`
+respektive `f64` (kompilatorn ger diagnostik om ett opromoverat värde skickas
+variadiskt). Variadiska aggregat stöds inte.
+
+**Externa datasymboler (`static` / `static mut`)** importerar globala konstanter
+eller variabler exporterade av delade bibliotek (t.ex. Waylands
+`wl_*_interface`-tabeller, Cocoas `NSDefaultRunLoopMode`/`NSApp` och POSIX
+`environ`):
+
+```dunder
+@link("wayland-client")
+extern "C" {
+    static wl_compositor_interface: wl_interface
+    static wl_shm_interface: wl_interface
+}
+
+@link("c")
+extern "C" {
+    static mut environ: *mut *mut ffi.c_char
+}
+```
+
+En `extern static` emitteras som `STT_OBJECT` på ELF64, datapekare i
+`__DATA_CONST`/GOT på Mach-O och dataslot i IAT på PE32+. Både läsning,
+skrivning (`static mut`) och adressbildning (`addr(&wl_compositor_interface)`)
+kräver `unsafe`-kontext.
+
+**Nåbarhetsbaserad beskärning**: `target_is("...")` i `if`/`else if`-grenar
+utvärderas vid kompilering före importregistrering. Onåbara `extern`-deklarationer
+skapar inga `LC_LOAD_DYLIB`-, `DT_NEEDED`- eller IAT-poster. Ett Linux-program
+utan nåbara `extern`-symboler fortsätter därmed att kompileras till en helt
+statisk, libc-fri ELF-binär med direkta systemanrop.
+
+### 2.2 Callbacks (`extern "<abi>" fn`) och trådsäker körmiljö
+
+En toppnivåfunktion kan deklareras direkt med en främmande anropskonvention
+och skickas som typad funktionspekare till C, Objective-C, Win32, Wayland,
+Vulkan eller COM:
+
+```dunder
+capability unsafe
+
+extern "C" fn on_registry_global(
+    data: *mut ffi.c_void,
+    registry: *mut wl_registry,
+    name: u32,
+    iface: *const ffi.c_char,
+    version: u32,
+) {
+    // ...
+}
+```
+
+Garantier och semantik för `extern "<abi>" fn`-callbacks:
+
+1. **Fullständigt C-ABI i båda riktningarna**: parametrar och returvärden får
+   vara godtyckliga FFI-typer, inklusive `@repr(C)`-structar och -unioner per
+   värde, `@repr(<heltal>)`-enums, råpekare och `Option<extern fn>`.
+2. **Registerbevarande**: callback-prologen sparar och återställer samtliga
+   callee-saved register enligt målets ABI (inklusive `x19..x28` och `d8..d15`
+   på ARM64 samt `XMM6..XMM15` på Win64).
+3. **OS-TLS för samtidighet, reentrans och främmande trådar**:
+   - Dunders trådlokala exekveringstillstånd (registerbank och allokatorkontext)
+     lagras i operativsystemets trådlokala lagring (OS-TLS), aldrig i en enda
+     delad global slot.
+   - Flera trådar kan samtidigt korsa FFI-gränsen och anropa callbacks utan
+     datakapplöpning.
+   - Reentranta callbacks (exempelvis `DispatchMessageW` -> `WndProc` ->
+     Win32-anrop -> ny `WndProc`, eller nästlade AppKit-delegater) fungerar
+     genom att varje aktivering sparar och återställer föregående ramtillstånd.
+   - **Främmande OS-trådar** (t.ex. Metal-kompletteringshanterare,
+     ljudcallbacks eller drivrutinstrådar): om en callback anropas på en tråd
+     som inte skapats av Dunder kopplas automatiskt en lättvikts, trådisolerad
+     Dunder-kontext till trådens TLS (med automatisk städning när OS-tråden
+     avslutas). Den gamla tvångsavslutningen med kod 111 vid anrop från annan
+     tråd tas bort.
+4. **Fällgräns (Abort-on-trap)**: Dunder-fällor (`panic`, `assert`, overflow,
+   ogiltigt index) får aldrig rulla upp stacken genom främmande C/ObjC/COM/OS-kod.
+   En fälla som når gränsen för en `extern "<abi>" fn` skriver diagnostik till
+   stderr och avslutar processen omedelbart och deterministiskt.
+5. **Kapabiliteter**: om en `extern "<abi>" fn` använder `@requires(...)`
+   kontrolleras kapabiliteten på det ställe där funktionsvärdet tas, precis
+   som för vanliga funktionsvärden.
+
+### 2.3 Typad dynamisk laddning (`std.dl`)
+
+För bibliotek som är valfria vid körning, väljs dynamiskt (t.ex. Wayland vs
+X11 på samma Linux-binär) eller laddar funktioner via en drivrutinsloader
+(t.ex. Vulkan `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`) tillhandahåller
+`std.dl` ett resurssäkert, typat gränssnitt:
+
+```dunder
+capability unsafe
+import std.dl as dl
+import std.ffi as ffi
+
+@repr(C)
+struct VulkanLoader {
+    vkGetInstanceProcAddr: extern "system" fn(*mut VkInstance_T, *const ffi.c_char) -> *const ffi.c_void,
+    vkEnumerateInstanceVersion: Option<extern "system" fn(*mut u32) -> VkResult>,
+}
+
+unsafe fn open_vulkan() -> Result<(dl.Library, VulkanLoader), dl.DlError> {
+    lib := dl.Library::open_first(&["libvulkan.so.1", "libvulkan.so"], .Now)?
+    table := dl.load_library_table<VulkanLoader>(&lib)?
+    .Ok((lib, table))
+}
+```
+
+Kontrakt i `std.dl`:
+
+- `pub enum LoadMode { Default, Lazy, Now }` — ersätter råa POSIX-heltal (`1`, `2`).
+- `@resource(dispose) pub opaque struct Library`:
+  - `Library::open(name: string, mode: LoadMode) -> Result<Library, DlError>`
+  - `Library::open_first(candidates: &[]string, mode: LoadMode) -> Result<Library, DlError>`
+  - `Library::current_process() -> Result<Library, DlError>`
+  - `unsafe lib.symbol<F>(name: &ffi.CStr) -> Result<F, DlError>` — löser en
+    symbol till en `extern "<abi>" fn(...) -> ...`-typ eller `*const T`/`*mut T`.
+  - `unsafe lib.try_symbol<F>(name: &ffi.CStr) -> Option<F>` — returnerar
+    `.None` om symbolen saknas.
+  - `dispose` frigör handtaget (`dlclose` / `FreeLibrary`). Anroparen ansvarar
+    för att `Library` hålls vid liv så länge någon upplöst funktionspekare kan
+    anropas.
+- **Typade dispatchtabeller**:
+  - `unsafe dl.load_library_table<T>(lib: &Library) -> Result<T, DlError>`
+    fyller varje fält i en `@repr(C)`-struct `T` av `extern fn` och
+    `Option<extern fn>` genom att slå upp fältnamnet i `lib`. Saknas en
+    icke-optionell symbol returneras `.Err(DlError)`; saknas en
+    `Option<extern fn>`-symbol sätts fältet till `.None`.
+  - `unsafe dl.load_proc_table<T>(get_proc: extern "system" fn(*const ffi.c_char) -> *const ffi.c_void) -> Result<T, DlError>`
+    gör motsvarande via en godtycklig drivrutinsuppslagare (t.ex.
+    `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`, `eglGetProcAddress`),
+    vilket eliminerar hundratals rader manuell uppslagnings- och nullkontrollkod.
+
+---
+
+## 3. Säkerhets- och kapabilitetsmodell
+
+### 3.1 Strikt modulbunden `capability unsafe`
+
+Ett modulhuvud deklarerar vilka privilegier som får användas direkt i filen,
+exempelvis `capability filesystem, unsafe`.
+
+- `capability unsafe` kontrolleras **strikt per modul**. Om modul A importerar
+  modul B (t.ex. `std.alloc` eller en FFI-bindning) som deklarerar
+  `capability unsafe`, får modul A **aldrig** ärva `unsafe`-behörighet.
+- Utan `capability unsafe` i modulens eget huvud avvisas `extern`-block,
+  `extern "<abi>" fn`-definitioner, `unsafe fn`, `unsafe { ... }`,
+  `@thread_safe` samt `impl Sendable` för resurser som innehåller råpekare.
+- Säker kod får anropa publika, säkra omslagsfunktioner som exponerats av en
+  `unsafe`-modul, under förutsättning att omslaget upprätthåller kontrakten för
+  livstid, justering, nullfrihet och aliasing.
+
+### 3.2 Enhetlig `unsafe`- och `@requires`-kontroll
+
+- Anrop till `extern`-funktioner, anrop via `extern fn`-värden, avreferering
+  eller pekarkalkyl på `*const T`/`*mut T`, läsning av `union`-fält,
+  läsning/skrivning/adress av `extern static` samt `as_ref`/`as_mut`/`bytes_view`/`slice_view`
+  kräver alltid en `unsafe`-kontext.
+- Kapabilitetskrav (`@requires(filesystem | network | process | stdio)`)
+  kontrolleras enhetligt både vid direkta anrop, när funktionsvärdet tas från
+  en `extern`-deklaration (`f := my_extern`) och när en funktion används som
+  `extern "<abi>" fn`-callback.
+
+### 3.3 Tillåtelselista för nativa bibliotek (`native_libs`)
+
+För tredjepartsberoenden i `dunder.toml` räcker `capabilities = ["unsafe"]`
+inte ensamt för att länka godtyckliga nativa bibliotek. Varje beroende måste
+dessutom ha de logiska biblioteksnycklar det länkar godkända i `native_libs`:
+
+```toml
+[dependencies]
+vk = { path = "../vk", capabilities = ["unsafe"], native_libs = ["vulkan", "wayland-client"] }
+```
+
+Regler:
+
+- Standardvärdet för `native_libs` på ett beroende är `[]` (inga nativa
+  bibliotek tillåtna).
+- `native_libs = ["*"]` beviljar uttryckligen obegränsad nativ länkning till
+  beroendet.
+- Rotpaketet och det inbyggda standardbiblioteket (`std`/`sys`) är obegränsade.
+- För transitiva beroenden gäller snittet längs beroendekedjan: en nyckel
+  måste vara godkänd (explicit eller via `"*"`) i varje led från rotprojektet
+  ned till det länkande paketet.
+- Om ett beroende innehåller en nåbar `@link("<nyckel>")`-deklaration som inte
+  finns i dess beviljade `native_libs` stoppas bygget med felmeddelande som
+  pekar ut beroendet och den otillåtna biblioteksnyckeln.
 
 ### Objektminne och privata stackceller
 
-Rå åtkomst måste avse ett levande, åtkomligt källobjekt eller en uttryckligen
-tillhandahållen extern minnesregion och rymmas inom dess giltiga intervall.
-Pekarens bitar är dess representation. En rundresa genom `usize` bevarar
-åtkomsten till samma region; ett numeriskt värde ger ingen ny rätt att
-läsa eller skriva andra objekt. Utgångna lån, gamla pekare och aritmetik
-utanför regionen ger ingen åtkomst till andra lokala värden.
+- Rå minnesåtkomst måste avse ett levande källobjekt eller en externt
+  tillhandahållen region och hålla sig inom objektets giltiga intervall. En
+  rundresa via `usize` ger ingen ny åtkomsträtt till andra lokala objekt.
+- Kompilatorns spillceller, oexponerade lokaler och FP/LR-länkage är privat
+  implementationslagring som främmande kod inte får läsa eller skriva. Ett
+  uttryckligt `addr(&place)` exponerar endast det angivna objektet under dess
+  livstid och låneregel.
+- Rekursion och återanrop skapar separata aktiveringar. Vanliga externa anrop
+  returnerar en gång eller avslutar processen; stackbyte, `longjmp` och
+  `returns-twice` ingår inte i ett vanligt `extern`-kontrakt.
 
-Kompilatorns spillceller, oexponerade lokaler och FP/LR-länkage är privat
-implementationslagring. Ett vanligt främmande anrop eller en Wasm-värd får
-varken läsa eller skriva dessa genom stackvandring eller tillverkade
-adresser. Ett uttryckligt `addr(&place)` exponerar det angivna objektet
-enligt dess typ, storlek, livstid och lånevillkor. Det exponerar inte andra
-lokaler, dold utfyllnad eller resten av framen. Kompilatorn kan därför
-behålla oexponerade värden i register även när andra objekt ändras.
+### Filåtkomst genom delegerade handtag
 
-Rekursion och återanrop skapar separata aktiveringar. En pekare till ett
-äldre exponerat objekt behåller sitt giltiga lån och ger ingen åtkomst
-till en ny aktiverings privata celler. Registerbevarande och denna
-minnesregel är separata ABI-egenskaper.
+För högre OS-privilegier kompletteras `capability unsafe` av
+`capability filesystem`, `network`, `process` och `stdio` samt delegerade
+handtag (`fs.ReadFile`, `fs.WriteFile`, `fs.ReadDir`, `process.Executable`).
+En modul med `capability filesystem` väljer sökvägar med `grant(path)` och kan
+sedan lämna över det opaka handtaget till oprivilegierade moduler som anropar
+dess metoder utan att själva äga `capability filesystem`. Handtagen lagrar en
+sökväg som operativsystemet slår upp vid varje operation (inklusive
+symboliska länkar och relativa sökvägar) och kan öppnas till strömmande
+`@resource(dispose)`-handtag (`FileReader`, `FileWriter`, `File`).
 
-Vanliga anrop returnerar normalt en gång eller avslutar utan återkomst.
-Stackbyte, icke-lokala hopp, returns-twice och stackinspektion av privata
-lokaler kräver ett separat uttryckligt kontrakt; de följer inte av en
-vanlig `@extern`-deklaration. Dessa regler gäller också när en främmande
-funktion anropar Dunder genom en callback.
+---
 
-Ett synkront C-anrop som bara läser under anropet kan få ett lån via
-ett säkert omslag. Här är C-funktionens kontrakt att den läser exakt
-`length` byte och accepterar null när längden är noll.
+## 4. Manifestpolicy (`dunder.toml`), biblioteksregister och binäremittrar
+
+### 4.1 Schema i `dunder.toml` och CLI-flaggor
+
+Följande sektioner och nycklar styr nativ länkning och applikationspaketering
+i `dunder.toml`:
+
+```toml
+name = "studio"
+version = "0.1.0"
+root = "src/main.ddr"
+
+[dependencies]
+gfx = { path = "../gfx", capabilities = ["unsafe"], native_libs = ["metal", "objc", "vulkan", "d3d12", "dxgi"] }
+
+[native]
+rpath = ["$ORIGIN/../lib"]
+
+[native.libs.vulkan]
+weak = false
+
+[target.arm64-macos.native]
+rpath = ["@executable_path/../Frameworks"]
+
+[target.arm64-macos.native.libs.vulkan]
+path = "@rpath/libMoltenVK.dylib"
+
+[target.x86_64-linux.native]
+libc = "glibc"
+
+[target.x86_64-linux.native.libs.curl]
+soname = "libcurl.so.4"
+
+[target.x86_64-windows.native.libs.d3d12]
+dll = "d3d12.dll"
+delay = true
+
+[app]
+subsystem = "gui"
+dpi_aware = true
+utf8 = true
+icon = "assets/studio.ico"
+bundle_id = "org.example.studio"
+entitlements = "macos/entitlements.plist"
+frameworks = ["vendor/MoltenVK.framework"]
+```
+
+Sammanfattning av schemafälten:
+
+| Sektion / Nyckel | Typ / Värden | Beskrivning |
+| --- | --- | --- |
+| `[dependencies.<namn>].native_libs` | `[]string` (standard `[]`) | Tillåtna logiska biblioteksnycklar eller `["*"]`. |
+| `[native].rpath` / `[target.<t>.native].rpath` | `[]string` | Sökvägar för `LC_RPATH` (Mach-O) eller `DT_RUNPATH` (ELF64). |
+| `[native].libc` / `[target.<t>.native].libc` | `"glibc"` \| `"musl"` | Väljer Linux dynamisk laddare (`PT_INTERP`) och libc-SONAME (standard `"glibc"`). |
+| `[native.libs.<key>]` / `[target.<t>.native.libs.<key>]` | Tabell | Åsidosätter nyckeln `<key>` med fälten `path`, `framework`, `soname`, `dll` (strängar) samt `weak`, `delay` (booleska). |
+| `[app].subsystem` | `"console"` \| `"gui"` | Windows PE32+ subsystem (`CUI = 3` standard, `GUI = 2`). |
+| `[app].dpi_aware` | `bool` | Bäddar in `PerMonitorV2` DPI-medvetenhet i Windows `.rsrc`-manifestet. |
+| `[app].utf8` | `bool` | Bäddar in `<activeCodePage>UTF-8</activeCodePage>` i Windows `.rsrc`-manifestet. |
+| `[app].icon` | `string` | Relativ sökväg till `.ico`-fil som bäddas in i Windows `.rsrc`. |
+| `[app].bundle_id` | `string` | Eget `CFBundleIdentifier` för macOS `.app`-bundle. |
+| `[app].entitlements` | `string` | Relativ sökväg till XML-entitlements som förseglas i Mach-O `CodeDirectory`. |
+| `[app].frameworks` | `[]string` | Lokala `.framework`/`.dylib`-paket som kopieras till `Contents/Frameworks/` i macOS `.app`. |
+
+**Prioritetsordning för upplösning av en logisk nyckel**:
+1. `[target.<exakt-mål>.native.libs.<key>]` (t.ex. `x86_64-linux`, `arm64-macos`)
+2. `[target.<familj>.native.libs.<key>]` (`macos`, `linux`, `windows`)
+3. `[native.libs.<key>]`
+4. Kompilatorns inbyggda biblioteksregister (avsnitt 4.2)
+
+**CLI-flaggor** (åsidosätter respektive manifestvärde för bygget):
+
+- `--subsystem console|gui` — väljer Windows PE32+ subsystem.
+- `--rpath <sökväg>` — lägger till en `LC_RPATH`/`DT_RUNPATH`-post (kan upprepas).
+- `--libc gnu|musl` — väljer Linux libc-ABI och `PT_INTERP`.
+
+Alla `[native]`-, `[app]`-, `native_libs`- och CLI-länkinställningar inkluderas
+i byggkvittot (`build_receipt`) så att ett ändrat länk- eller paketval alltid
+ogiltigförklarar ett tidigare cachat bygge.
+
+### 4.2 Inbyggt logiskt biblioteksregister
+
+Kompilatorn innehåller en inbyggd upplösningstabell för kända OS- och
+grafikbibliotek. Källkod behöver därmed inte hårdkoda plattformsspecifika
+filnamn eller `/System/Library/Frameworks/...`-sökvägar.
+
+| Logisk nyckel | `arm64-macos` | `arm64-linux` / `x86_64-linux` (`glibc`) | `arm64-linux` / `x86_64-linux` (`musl`) | `x86_64-windows` |
+| --- | --- | --- | --- | --- |
+| `c` | `/usr/lib/libSystem.B.dylib` | `libc.so.6` | `libc.musl-<arch>.so.1` | `ucrtbase.dll` |
+| `dl` | `/usr/lib/libSystem.B.dylib` | `libdl.so.2` | `libc.musl-<arch>.so.1` | — (`std.dl` använder `kernel32.dll`) |
+| `m` | `/usr/lib/libSystem.B.dylib` | `libm.so.6` | `libc.musl-<arch>.so.1` | `ucrtbase.dll` |
+| `pthread` | `/usr/lib/libSystem.B.dylib` | `libpthread.so.0` | `libc.musl-<arch>.so.1` | — |
+| `objc` | `/usr/lib/libobjc.A.dylib` | — | — | — |
+| `metal` | `/System/Library/Frameworks/Metal.framework/Versions/A/Metal` | — | — | — |
+| `appkit` | `/System/Library/Frameworks/AppKit.framework/Versions/A/AppKit` | — | — | — |
+| `cocoa` | `/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa` | — | — | — |
+| `foundation` | `/System/Library/Frameworks/Foundation.framework/Versions/A/Foundation` | — | — | — |
+| `quartzcore` | `/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore` | — | — | — |
+| `coregraphics` | `/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics` | — | — | — |
+| `corevideo` | `/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo` | — | — | — |
+| `vulkan` | `@rpath/libMoltenVK.dylib` | `libvulkan.so.1` | `libvulkan.so.1` | `vulkan-1.dll` |
+| `wayland-client` | — | `libwayland-client.so.0` | `libwayland-client.so.0` | — |
+| `x11` | — | `libX11.so.6` | `libX11.so.6` | — |
+| `xcb` | — | `libxcb.so.1` | `libxcb.so.1` | — |
+| `xkbcommon` | — | `libxkbcommon.so.0` | `libxkbcommon.so.0` | — |
+| `kernel32` | — | — | — | `kernel32.dll` |
+| `user32` | — | — | — | `user32.dll` |
+| `gdi32` | — | — | — | `gdi32.dll` |
+| `ole32` | — | — | — | `ole32.dll` |
+| `ws2_32` | — | — | — | `ws2_32.dll` |
+| `d3d12` | — | — | — | `d3d12.dll` |
+| `dxgi` | — | — | — | `dxgi.dll` |
+| `d3dcompiler` | — | — | — | `d3dcompiler_47.dll` |
+| `advapi32` | — | — | — | `advapi32.dll` |
+| `shell32` | — | — | — | `shell32.dll` |
+| `ucrt` | — | — | — | `ucrtbase.dll` |
+
+Utöver tabellen ovan stöder macOS ramverksformen `@link(framework = "<Namn>")`
+(intern nyckel `framework:<Namn>`), som automatiskt löses till
+`/System/Library/Frameworks/<Namn>.framework/Versions/A/<Namn>`. På Linux
+ersätts `<arch>` med `aarch64` respektive `x86_64`.
+
+### 4.3 Garantier hos de inbyggda binäremittrarna
+
+#### Mach-O (`arm64-macos`)
+
+- **Dyld Shared Cache**: Systembibliotek och ramverk löses direkt ur macOS
+  dyld shared cache via sina kanoniska installationsnamn i `LC_LOAD_DYLIB`,
+  utan `.tbd`-filer eller installerad Xcode SDK.
+- **Bindning och segment**: Importerade funktions- och datapekare binds med
+  `LC_DYLD_CHAINED_FIXUPS` i det skrivskyddade segmentet `__DATA_CONST`
+  (kompatibelt med moderna dyld-krav och `codesign --verify --strict`).
+- **Load commands**: Emitterar `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB` (med
+  `BIND_SYMBOL_FLAGS_WEAK_IMPORT` för mjuka symboler) och `LC_RPATH`.
+- **Dynamisk `text_off`**: Startoffset för `__text` beräknas dynamiskt och
+  sidjusteras till `16 384` byte oberoende av antal load commands (ingen övre
+  16 KiB-gräns); DWARF-basadressen och `adrp`-relokeringar följer samma
+  `text_off`.
+- **Signering och `.app`-paket**: Den inbyggda ad hoc-signeraren stöder
+  entitlements i `CodeDirectory` (`CSSLOT_ENTITLEMENTS`) när
+  `[app].entitlements` anges. `.app`-paketeraren stöder inbäddade ramverk i
+  `Contents/Frameworks/` inklusive interna relativa symlänkar som
+  `Versions/Current -> A` (och avvisar alltjämt absoluta eller utbrytande
+  symlänkar).
+
+#### ELF64 (`arm64-linux`, `x86_64-linux`)
+
+- **Statisk standard för ren Dunder**: Program utan nåbara `extern`-symboler
+  emitteras som 100 % statiska, libc-fria ELF-binärer med direkta systemanrop.
+- **Dynamiska ELF-binärer**: Emitterar positionsoberoende `ET_DYN` (PIE) med
+  `PT_GNU_RELRO` och `DT_BIND_NOW` så att GOT-tabellen skrivskyddas direkt
+  efter startbindning.
+- **Tabeller och symboler**: Emitterar `DT_NEEDED` (alltid versionerade
+  SONAMEs, aldrig `-dev`-länkar), `DT_RUNPATH`, `DT_GNU_HASH` (samt vid behov
+  SysV `DT_HASH`), `STT_FUNC` för funktioner, generella `STT_OBJECT`-poster
+  för `extern static`-datasymboler samt `STB_WEAK` för mjuka symboler.
+- **Symbolversionering**: När symbolversioner anges (eller krävs av
+  glibc-symboler) emitteras `DT_VERSYM`, `DT_VERNEED` och `DT_VERNEEDNUM` så
+  att oversionerade referenser inte tyst binds till historiska 1990-talsversioner
+  av glibc-symboler.
+- **Valbar libc-ABI (`glibc` / `musl`)**: Sätter korrekt `PT_INTERP`
+  (`/lib/ld-linux-aarch64.so.1` eller `/lib64/ld-linux-x86-64.so.2` för glibc;
+  `/lib/ld-musl-aarch64.so.1` eller `/lib/ld-musl-x86_64.so.1` för musl) samt
+  motsvarande standard-SONAMEs.
+
+#### PE32+ (`x86_64-windows`)
+
+- **Dynamiska huvuden**: `SizeOfHeaders` beräknas utifrån faktiskt antal
+  sektioner (ingen 512-byte-begränsning).
+- **Subsystem**: Stöder både `IMAGE_SUBSYSTEM_WINDOWS_CUI` (`3`, standard) och
+  `IMAGE_SUBSYSTEM_WINDOWS_GUI` (`2`, via `[app] subsystem = "gui"` eller
+  `--subsystem gui`) utan oönskat konsolfönster för grafikprogram.
+- **Stackupprullning och stackprobning**: Emitterar `.pdata` och `.xdata`
+  (DataDir 3) med giltiga `RUNTIME_FUNCTION`/`UNWIND_INFO`-poster för
+  Win64 SEH, drivrutiner, COM och debuggers, samt `__chkstk`-stackprobning för
+  stackramar större än 4 KiB.
+- **ASLR**: Emitterar `.reloc` (DataDir 5) och sätter
+  `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE | IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA`.
+- **Resurser (`.rsrc`, DataDir 2)**: Bäddar direkt in Win32 XML-applikationsmanifest
+  (`PerMonitorV2` DPI-medvetenhet, `UTF-8` activeCodePage, Windows 10/11
+  `supportedOS`-GUID:er) samt valfri applikationsikon utan `rc.exe`.
+- **Importtabeller**: Skriver direkt IAT i skrivskyddad `.rdata`, stöder
+  Delay-Load Import Directory (DataDir 13) för `delay = true`-bibliotek,
+  import via ordinalnummer (`@link_ordinal(N)`) och använder `ucrtbase.dll`
+  som standard-UCRT.
+
+#### WebAssembly (`wasm32`, `wasm32-wasi`)
+
+- Nåbara `extern`-block blir typade Wasm-funktionsimporter under angiven
+  importmodul (`@link("wasi_snapshot_preview1")`, `@link("env")` osv.).
+- `@repr(C)`-structar och -unioner använder 32-bitars pekare och skickas via
+  pekare i linjärt minne.
+- `extern "C" fn`-callbacks läggs i den exporterade tabellen
+  `__indirect_function_table` så att värden kan anropa dem via `call_indirect`.
+
+---
+
+## 5. Exempel för verkliga OS- och grafik-API:er
+
+### 5.1 Metal och Objective-C (macOS)
 
 ```dunder
-@extern("reader", "sum_bytes") unsafe fn sum_bytes(data: ptr, length: usize) -> usize
+capability unsafe
+import std.ffi as ffi
 
-fn sum(bytes: &[]u8) -> usize {
-    unsafe {
-        if bytes.len == 0 { return sum_bytes(ptr(0), usize(0)) }
-        return sum_bytes(addr(&bytes[0]), usize(bytes.len))
+extern type MTLDevice
+extern type ObjcClass
+extern type ObjcSel
+extern type NSString
+
+@repr(C)
+struct MTLClearColor {
+    red: f64,
+    green: f64,
+    blue: f64,
+    alpha: f64,
+}
+
+@link("metal")
+extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> *mut MTLDevice
+}
+
+@link("foundation")
+extern "C" {
+    static NSDefaultRunLoopMode: *const NSString
+}
+
+@link("objc")
+extern "C" {
+    fn objc_getClass(name: *const ffi.c_char) -> *mut ObjcClass
+    fn sel_registerName(name: *const ffi.c_char) -> *mut ObjcSel
+
+    @link_name("objc_msgSend")
+    fn msg_send_ptr(obj: *mut ffi.c_void, sel: *mut ObjcSel) -> *mut ffi.c_void
+
+    @link_name("objc_msgSend")
+    fn msg_send_set_clear_color(
+        pass: *mut ffi.c_void,
+        sel: *mut ObjcSel,
+        color: MTLClearColor,
+    )
+}
+```
+
+`MTLClearColor` (fyra `f64`, HFA) skickas direkt i `d0..d3` enligt Apple
+ARM64-ABI utan manuell pekaromskrivning, och `NSDefaultRunLoopMode` importeras
+direkt som datasymbol ur `Foundation.framework` i dyld shared cache.
+
+### 5.2 Vulkan (Linux, Windows och macOS)
+
+```dunder
+capability unsafe
+import std.dl as dl
+import std.ffi as ffi
+
+extern type VkInstance_T
+
+@repr(i32)
+enum VkResult {
+    Success = 0,
+    NotReady = 1,
+    ErrorOutOfHostMemory = -1,
+}
+
+@repr(C)
+union VkClearValue {
+    color: [f32; 4],
+    depth_stencil: VkClearDepthStencilValue,
+}
+
+@repr(C)
+struct VkClearDepthStencilValue {
+    depth: f32,
+    stencil: u32,
+}
+
+@repr(C)
+struct VkAllocationCallbacks {
+    pUserData: *mut ffi.c_void,
+    pfnAllocation: Option<extern "system" fn(*mut ffi.c_void, usize, usize, u32) -> *mut ffi.c_void>,
+    pfnReallocation: Option<extern "system" fn(*mut ffi.c_void, *mut ffi.c_void, usize, usize, u32) -> *mut ffi.c_void>,
+    pfnFree: Option<extern "system" fn(*mut ffi.c_void, *mut ffi.c_void)>,
+    pfnInternalAllocation: Option<extern "system" fn(*mut ffi.c_void, usize, u32, u32)>,
+    pfnInternalFree: Option<extern "system" fn(*mut ffi.c_void, usize, u32, u32)>,
+}
+
+@repr(C)
+struct VkInstanceFns {
+    vkDestroyInstance: extern "system" fn(*mut VkInstance_T, *const VkAllocationCallbacks),
+    vkEnumeratePhysicalDevices: extern "system" fn(*mut VkInstance_T, *mut u32, *mut *mut ffi.c_void) -> VkResult,
+}
+```
+
+### 5.3 DirectX 12 och COM (Windows)
+
+```dunder
+capability unsafe
+import std.ffi as ffi
+
+extern type ID3D12DescriptorHeap
+
+@repr(C)
+struct GUID {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+@repr(C)
+struct D3D12_CPU_DESCRIPTOR_HANDLE {
+    ptr_val: usize,
+}
+
+@repr(C)
+struct ID3D12DescriptorHeapVtbl {
+    QueryInterface: extern "system" fn(*mut ID3D12DescriptorHeap, *const GUID, *mut *mut ffi.c_void) -> i32,
+    AddRef: extern "system" fn(*mut ID3D12DescriptorHeap) -> u32,
+    Release: extern "system" fn(*mut ID3D12DescriptorHeap) -> u32,
+    // ... mellanliggande COM-metoder ...
+    GetCPUDescriptorHandleForHeapStart: extern "msvc-com" fn(*mut ID3D12DescriptorHeap) -> D3D12_CPU_DESCRIPTOR_HANDLE,
+}
+
+@link("d3d12", delay = true)
+extern "system" {
+    fn D3D12CreateDevice(
+        adapter: *mut ffi.c_void,
+        min_feature_level: u32,
+        riid: *const GUID,
+        out_device: *mut *mut ffi.c_void,
+    ) -> i32
+}
+```
+
+`"msvc-com"` garanterar att `GetCPUDescriptorHandleForHeapStart` skickar
+`this` i `RCX` och dold `sret`-pekare i `RDX` enligt MSVC:s C++ COM-ABI, medan
+`delay = true` fördröjer laddningen av `d3d12.dll`.
+
+### 5.4 Win32-fönster och callback (Windows)
+
+```dunder
+capability unsafe
+import std.ffi as ffi
+
+extern type HWND_T
+extern type HINSTANCE_T
+
+@repr(C)
+struct WNDCLASSEXW {
+    cbSize: u32,
+    style: u32,
+    lpfnWndProc: Option<extern "system" fn(*mut HWND_T, u32, usize, isize) -> isize>,
+    cbClsExtra: i32,
+    cbWndExtra: i32,
+    hInstance: *mut HINSTANCE_T,
+    hIcon: *mut ffi.c_void,
+    hCursor: *mut ffi.c_void,
+    hbrBackground: *mut ffi.c_void,
+    lpszMenuName: *const u16,
+    lpszClassName: *const u16,
+    hIconSm: *mut ffi.c_void,
+}
+
+@link("user32")
+extern "system" {
+    fn RegisterClassExW(wc: *const WNDCLASSEXW) -> u16
+    fn DefWindowProcW(hwnd: *mut HWND_T, msg: u32, wparam: usize, lparam: isize) -> isize
+}
+
+extern "system" fn wnd_proc(hwnd: *mut HWND_T, msg: u32, wparam: usize, lparam: isize) -> isize {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+unsafe fn register_window(inst: *mut HINSTANCE_T) -> u16 {
+    wc := WNDCLASSEXW {
+        cbSize: u32(size_of(WNDCLASSEXW)),
+        lpfnWndProc: .Some(wnd_proc),
+        hInstance: inst,
+        lpszClassName: w"DunderWindow".as_ptr(),
+        ..zeroed()
     }
+    RegisterClassExW(addr(&wc))
 }
 ```
 
-Om C-biblioteket sparar data till ett senare anrop behöver bindningen
-följa bibliotekets ägarkontrakt. Ett API som kopierar under anropet kan
-använda samma lån. Kopian lever tills den släpps med bibliotekets
-frigöringsfunktion. Ett API som behåller själva pekaren kräver att
-bindningen håller originalets lagring vid liv och på samma adress tills
-biblioteket kvitterar avslut. En `ptr` från `addr` förlänger inte lånet.
-Ett sådant handtag kan äga en separat stabil allokering och avregistrera
-den från C innan det frigör minnet.
-
-För säkra omslag ovanpå råpekare (till exempel i `std.alloc`) skapar
-`unsafe bytes_view(&owner, base, length)` en lånad vy `&[]u8` med angiven
-längd av typen `usize` över `[base, base + length)` och binder vyns livstid
-till den delade referensen `&owner` (den kan också kombineras med `-> &[]u8
-from self`). Vid positiv längd måste `base` vara skild från null. Dessutom kan
-traits och `impl Trait for Type` deklarera `unsafe fn`-metoder, som i
-`std.alloc.RawAllocator`, med krav på att implementationen matchar
-säkerhetsnivån i traiten.
-
-## Filåtkomst genom delegerade handtag
-
-En modul med `capability filesystem` kan välja sökvägar med
-`fs.ReadFile::grant(path)` och `fs.WriteFile::grant(path)`. Därefter kan den
-skicka handtagen till moduler som använder metoderna `.read`, `.metadata`, `.write`,
-`.append` eller `.write_bytes`. Ett läshandtag och ett skrivhandtag är skilda
-nominella typer. En `pub opaque struct` kan skickas över modulgränser och
-följer samma ägarskapsregel som andra structar: handtag som innehåller
-strängar flyttas, och en extra ägare kräver `.clone()`.
-Endast modulen som deklarerar den får i säker kod konstruera
-ett värde eller läsa, skriva och låna dess fält. Kontrollen av
-`@requires(filesystem)` gäller också när modulens kod tar funktionsvärdet.
+### 5.5 Wayland-klient (Linux)
 
 ```dunder
-capability filesystem
-import std.fs
-import sys
+capability unsafe
+import std.ffi as ffi
 
-fn copy(src: &fs.ReadFile, dst: &fs.WriteFile) -> Result<(), sys.IoError> {
-    text := src.read()?
-    dst.write(text)
+extern type wl_display
+extern type wl_registry
+extern type wl_interface
+
+@repr(C)
+union wl_argument {
+    i: i32,
+    u: u32,
+    f: i32,
+    s: *const ffi.c_char,
+    o: *mut ffi.c_void,
+    n: u32,
+    a: *mut ffi.c_void,
+    h: i32,
 }
 
-fn main() {
-    input := fs.ReadFile::grant("source.txt")
-    output := fs.WriteFile::grant("copy.txt")
-    assert(copy(&input, &output).is_ok())
+@repr(C)
+struct wl_registry_listener {
+    global: Option<extern "C" fn(*mut ffi.c_void, *mut wl_registry, u32, *const ffi.c_char, u32)>,
+    global_remove: Option<extern "C" fn(*mut ffi.c_void, *mut wl_registry, u32)>,
+}
+
+@link("wayland-client")
+extern "C" {
+    static wl_compositor_interface: wl_interface
+    static wl_shm_interface: wl_interface
+
+    fn wl_display_connect(name: *const ffi.c_char) -> *mut wl_display
+    fn wl_display_dispatch(display: *mut wl_display) -> ffi.c_int
+    fn wl_display_disconnect(display: *mut wl_display)
 }
 ```
 
-Handtagen innehåller en sökväg. Operativsystemet slår upp den vid varje
-operation, inklusive symboliska länkar och relativa sökvägar. Ett handtag som
-`fs.ReadFile` eller `fs.WriteFile` håller ingen öppen filbeskrivare; via
-`ReadFile::open()`, `WriteFile::create()`, `WriteFile::open_append()` eller
-`fs.File::open(path, OpenOptions)` kan det däremot öppnas till strömmande
-`@resource(dispose)`-handtag (`FileReader`, `FileWriter`, `File`). Modulen som
-tar emot ett handtag kan delegera det vidare.
+---
 
-Modulhuvudet styr direkta unsafe-operationer samt deklarationer märkta
-`@requires(filesystem)`, `@requires(network)`, `@requires(process)` eller
-`@requires(stdio)`. Flera kapabiliteter anges kommaseparerat i samma modulhuvud,
-t.ex. `capability process, network, filesystem, stdio`.
-`fs.ReadDir::grant(path)` och `dir.resolve_read(rel_path)` avgränsar
-relativ läsning till en vald rotkatalog utan `..`-flykt, `std.net.listen` /
-`std.net.connect` kräver `capability network`, `std.io.stdin` / `stdout` /
-`stderr` / `read_stdin` kräver `capability stdio`, och `std.process.run` /
-`exec` / `spawn` / `grant` kräver `capability process` (där `Executable`
-delegerar rätten att köra ett specifikt program till oprivilegierade moduler).
-Importer av äldre `sys` ger fortfarande processens OS-åtkomst. Bedöm hela
-importkedjan för kod som ska köra obetrodda program.
+## 6. Migrering från äldre FFI-syntax
+
+Den äldre FFI-ytan fasas ut under migreringen av `stdlib/`, `packages/`,
+`tests/` och `tools/`:
+
+| Äldre konstruktion | Ny specifikation |
+| --- | --- |
+| `@c_layout struct S { ... }` | `@repr(C) struct S { ... }` (plus `packed`, `align(N)` och `union`) |
+| `@extern("lib", "sym") unsafe fn f(...)` | `@link("nyckel") extern "C" { [@link_name("sym")] fn f(...) }` |
+| `@c_variadic(N) @extern(...)` | Variadisk parameter `...` inne i `extern "<abi>" { ... }` |
+| `ptr`, `load_*`, `store_*` | `*const T`, `*mut T`, `.read()`, `.write()`, `.read_unaligned()`, `.write_unaligned()` |
+| `ref_at(p)` (oankrad) | `p.as_ref(&owner)` / `p.as_mut(&mut owner)` |
+| `ffi_fn(addr)` | Typad `std.dl.Library::symbol<F>` / `dl.load_proc_table<T>` |
+| `cstr("...")` | `c"..."` (`&ffi.CStr`) och nytt `w"..."` (`&ffi.WStr`) |
+| `callback(fn_namn)` | Toppnivå `extern "<abi>" fn fn_namn(...)` |
+| `zeroed()` med heapallokering | Stackallokerad `ffi.zeroed<T>()` och `S { f: v, ..zeroed() }` |
