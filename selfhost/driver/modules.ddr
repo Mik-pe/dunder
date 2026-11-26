@@ -83,6 +83,7 @@ pub opaque struct Loader {
     testing: bool, test_tags: []i32, test_targets: []i32, test_ends: []i32, next_test: i32,
     deps: DepGraph,
     module_cap_limit: []i32, module_pkg: []string, module_pkg_id: []i32,
+    pkg_native_lib_unrestricted: []bool, pkg_native_lib_starts: []i32, pkg_native_lib_counts: []i32, pkg_native_libs: []string,
     error_count: i32,
     tracked_import_owners: []i32, tracked_import_aliases: []string, tracked_import_starts: []i32, tracked_import_lasts: []i32, tracked_import_used: []bool,
     tracked_import_targets: []i32,
@@ -940,6 +941,172 @@ fn scan_requires(loader: &mut Loader, owner: i32, i: i32, last: i32, caps_out: &
     j + 1
 }
 
+fn nlib_contains(list: &[]string, target: string) -> bool {
+    for item in &list {
+        if item == target { return true }
+    }
+    false
+}
+fn nlib_intersect(a_unr: bool, a_libs: &[]string, b_unr: bool, b_libs: &[]string, out_unr: &mut bool) -> []string {
+    if a_unr && b_unr { out_unr = true; return [] }
+    out_unr = false
+    if a_unr { return b_libs.clone() }
+    if b_unr { return a_libs.clone() }
+    mut out: []string = []
+    for item in &a_libs {
+        if nlib_contains(&b_libs, item) { out.push(item.clone()) }
+    }
+    out
+}
+fn loader_pkg_nlibs(loader: &Loader, pkg_id: i32) -> []string {
+    mut out: []string = []
+    if pkg_id < 0 || pkg_id >= loader.pkg_native_lib_starts.len { return out }
+    start := loader.pkg_native_lib_starts[pkg_id]
+    count := loader.pkg_native_lib_counts[pkg_id]
+    for i in start..start + count { out.push(loader.pkg_native_libs[i].clone()) }
+    out
+}
+fn set_loader_pkg_nlibs(loader: &mut Loader, pkg_id: i32, unr: bool, libs: &[]string) {
+    start := loader.pkg_native_libs.len
+    if !unr {
+        for item in &libs { loader.pkg_native_libs.push(item.clone()) }
+    }
+    loader.pkg_native_lib_unrestricted[pkg_id] = unr
+    loader.pkg_native_lib_starts[pkg_id] = start
+    loader.pkg_native_lib_counts[pkg_id] = loader.pkg_native_libs.len - start
+}
+fn init_pkg_native_libs(loader: &mut Loader) {
+    n := loader.deps.pkg_dirs.len
+    for k in 0..n {
+        loader.pkg_native_lib_unrestricted.push(k == 0)
+        loader.pkg_native_lib_starts.push(0)
+        loader.pkg_native_lib_counts.push(0)
+    }
+    if n <= 1 || loader.deps.edge_owners.len == 0 { return }
+    mut manifests: []manifest.Manifest = []
+    mut has_edge: []bool = []
+    for _ in 0..n { has_edge.push(false) }
+    for e in 0..loader.deps.edge_owners.len {
+        owner := loader.deps.edge_owners[e]
+        if owner >= 0 && owner < n { has_edge[owner] = true }
+    }
+    for k in 0..n {
+        mut parsed := manifest.empty()
+        if has_edge[k] && loader.deps.pkg_dirs[k] != "" {
+            toml_path := paths.join(loader.deps.pkg_dirs[k], "dunder.toml")
+            if sys.metadata(toml_path).is_file {
+                parsed = manifest.parse(toml_path, k == 0)
+            }
+        }
+        manifests.push(move parsed)
+    }
+    mut known: []bool = []
+    mut direct: []bool = []
+    for k in 0..n { known.push(k == 0); direct.push(k == 0) }
+    mut pass := 0
+    while pass <= n {
+        mut changed := false
+        for e in 0..loader.deps.edge_owners.len {
+            owner := loader.deps.edge_owners[e]
+            target := loader.deps.edge_targets[e]
+            if owner < 0 || owner >= n || target <= 0 || target >= n || !known[owner] { continue }
+            dep_name := &loader.deps.edge_names[e]
+            mut edge_libs: []string = []
+            if manifests[owner].ok {
+                for di in 0..manifests[owner].dep_names.len {
+                    if manifests[owner].dep_names[di] == dep_name {
+                        edge_libs = manifest.dep_native_libs_for(&manifests[owner], di)
+                        break
+                    }
+                }
+            }
+            edge_unr := nlib_contains(&edge_libs, "*")
+            owner_unr := loader.pkg_native_lib_unrestricted[owner]
+            owner_libs := loader_pkg_nlibs(&loader, owner)
+            mut eff_unr := false
+            eff_libs := nlib_intersect(owner_unr, &owner_libs, edge_unr, &edge_libs, &mut eff_unr)
+            if !known[target] {
+                set_loader_pkg_nlibs(&mut loader, target, eff_unr, &eff_libs)
+                known[target] = true
+                direct[target] = owner == 0
+                changed = true
+            } else if owner == 0 && !direct[target] {
+                set_loader_pkg_nlibs(&mut loader, target, eff_unr, &eff_libs)
+                direct[target] = true
+                changed = true
+            } else if owner != 0 && !direct[target] {
+                prev_unr := loader.pkg_native_lib_unrestricted[target]
+                prev_libs := loader_pkg_nlibs(&loader, target)
+                mut merged_unr := false
+                merged_libs := nlib_intersect(prev_unr, &prev_libs, eff_unr, &eff_libs, &mut merged_unr)
+                if (prev_unr && !merged_unr) || (!prev_unr && merged_libs.len < prev_libs.len) {
+                    set_loader_pkg_nlibs(&mut loader, target, merged_unr, &merged_libs)
+                    changed = true
+                }
+            }
+        }
+        if !changed { break }
+        pass += 1
+    }
+}
+fn loader_allows_native_lib(loader: &Loader, pkg_id: i32, lib: string) -> bool {
+    if pkg_id <= 0 || pkg_id >= loader.pkg_native_lib_unrestricted.len { return true }
+    if loader.pkg_native_lib_unrestricted[pkg_id] { return true }
+    start := loader.pkg_native_lib_starts[pkg_id]
+    count := loader.pkg_native_lib_counts[pkg_id]
+    for i in start..start + count {
+        if loader.pkg_native_libs[i] == "*" || loader.pkg_native_libs[i] == lib { return true }
+    }
+    false
+}
+fn check_extern_native_libs(loader: &mut Loader, owner: i32, at: i32, last: i32) -> bool {
+    if loader.standard[owner] != "" { return true }
+    pkg_id := if owner >= 0 && owner < loader.module_pkg_id.len { loader.module_pkg_id[owner] } else { 0 }
+    if pkg_id <= 0 { return true }
+    pkg_name := if owner >= 0 && owner < loader.module_pkg.len { loader.module_pkg[owner].clone() } else { "" }
+    mut cur := skip_lines_in(&loader, at + 3, last)
+    if cur >= last { return true }
+    k := loader.raw.kinds[cur]
+    is_map := k == .Name || (k == .String && cur + 1 < last && is(&loader, cur + 1, "="))
+    if !is_map {
+        if k != .String { return true }
+        first_tok := cur
+        cur += 1
+        if cur >= last || !is(&loader, cur, ",") { return true }
+        cur += 1
+        if cur >= last || loader.raw.kinds[cur] != .String { return true }
+        second_tok := cur
+        cur += 1
+        lib_tok := if cur < last && is(&loader, cur, ",") { second_tok } else { first_tok }
+        lib := loader.raw.texts[lib_tok].clone()
+        if !loader_allows_native_lib(&loader, pkg_id, lib) {
+            fail(&mut loader, owner, loader.raw.starts[lib_tok], "dependency '" + pkg_name + "' declares @extern for native library '" + lib + "', which is not allowed in native_libs in dunder.toml")
+            return false
+        }
+        return true
+    }
+    while cur < last && !is(&loader, cur, ")") {
+        kk := loader.raw.kinds[cur]
+        if kk != .Name && kk != .String { break }
+        key_name := loader.raw.texts[cur].clone()
+        cur += 1
+        if cur >= last || !is(&loader, cur, "=") { break }
+        cur += 1
+        if cur >= last || loader.raw.kinds[cur] != .String { break }
+        val_tok := cur
+        val := loader.raw.texts[val_tok].clone()
+        cur += 1
+        if key_name != "symbol" && !loader_allows_native_lib(&loader, pkg_id, val) {
+            fail(&mut loader, owner, loader.raw.starts[val_tok], "dependency '" + pkg_name + "' declares @extern for native library '" + val + "', which is not allowed in native_libs in dunder.toml")
+            return false
+        }
+        cur = skip_lines_in(&loader, cur, last)
+        if cur >= last || !is(&loader, cur, ",") { break }
+        cur = skip_lines_in(&loader, cur + 1, last)
+    }
+    true
+}
+
 fn scan_declarations(loader: &mut Loader, owner: i32, first: i32, structure: &lexer.ModuleStructure) {
     if !loader.raw.ok { fail(&mut loader, owner, loader.raw.error_at, loader.raw.error.clone()); return }
     last := loader.raw.texts.len
@@ -968,6 +1135,7 @@ fn scan_declarations(loader: &mut Loader, owner: i32, first: i32, structure: &le
             if bit == 16 {
                 if capable { fail(&mut loader, owner, loader.raw.starts[i], duplicate_module_capability_message(word)); return }
                 capable = true; loader.any_unsafe = true
+                caps = caps.bit_or(16)
             } else if bit != 0 {
                 if caps.bit_and(bit) != 0 { fail(&mut loader, owner, loader.raw.starts[i], duplicate_module_capability_message(word)); return }
                 caps = caps.bit_or(bit)
@@ -1084,6 +1252,9 @@ fn scan_declarations(loader: &mut Loader, owner: i32, first: i32, structure: &le
                 }
                 dpos += 1
             }
+        }
+        if depth == 0 && parens == 0 && is(&loader, i, "@") && is(&loader, i + 1, "extern") && is(&loader, i + 2, "(") {
+            if !check_extern_native_libs(&mut loader, owner, i, last) { return }
         }
         if depth == 0 && is(&loader,i,"@") && is(&loader,i+1,"requires") {
             next := scan_requires(&mut loader, owner, i, last, &mut requires_caps)
@@ -2158,7 +2329,7 @@ pub fn load_group(path: string, testing: bool, token_offsets: bool, group: i32, 
 }
 
 fn new_loader(path: string, testing: bool, token_offsets: bool, deps: &DepGraph) -> Loader {
-    Loader {
+    mut loader := Loader {
         working_directory: if target_is("macos") { fs.cwd().value } else { "" },
         result: Loaded { imports: Map<string, i64>::new(), token_offsets: token_offsets, groups: [], calls: [], ok: true, error: "", path: path.clone(), source: "", offset: 0,
             paths: [], sources: [], symbols: [], module_caps: [], diagnostics: [], unused_namespaces: Map<i32, i64>::new(), map_starts: [], map_files: [], map_offsets: [], json_symbols: [],
@@ -2173,6 +2344,7 @@ fn new_loader(path: string, testing: bool, token_offsets: bool, deps: &DepGraph)
             edge_owners: deps.edge_owners.clone(), edge_names: deps.edge_names.clone(), edge_targets: deps.edge_targets.clone(),
         },
         module_cap_limit: [], module_pkg: [], module_pkg_id: [],
+        pkg_native_lib_unrestricted: [], pkg_native_lib_starts: [], pkg_native_lib_counts: [], pkg_native_libs: [],
         error_count: 0,
         tracked_import_owners: [], tracked_import_aliases: [], tracked_import_starts: [], tracked_import_lasts: [], tracked_import_used: [],
         tracked_import_targets: [],
@@ -2181,6 +2353,8 @@ fn new_loader(path: string, testing: bool, token_offsets: bool, deps: &DepGraph)
         test_hidden_owners: [], test_hidden_starts: [], test_hidden_ends: [],
         overlay_paths: [], overlay_sources: [],
     }
+    init_pkg_native_libs(&mut loader)
+    loader
 }
 
 pub fn bind_source_generics(input: &mut lexer.Tokens) {

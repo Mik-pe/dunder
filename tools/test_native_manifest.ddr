@@ -1,0 +1,381 @@
+capability process, filesystem, stdio
+
+import .harness as harness
+import ..selfhost.driver.manifest as manifest
+import ..selfhost.driver.dependencies as dependencies
+import ..selfhost.driver.cli as driver_cli
+import ..selfhost.driver.build_receipt as build_receipt
+import std.fs as fs
+import std.text as text
+import sys
+
+fn check_manifest_parsing() -> bool {
+    full := "name = \"graphics-app\"\n" +
+        "version = \"0.1.0\"\n" +
+        "root = \"src/main.ddr\"\n\n" +
+        "[native]\n" +
+        "rpath = [\"$ORIGIN/lib\"]\n" +
+        "libc = \"glibc\"\n\n" +
+        "[native.libs.vulkan]\n" +
+        "soname = \"libvulkan.so.1\"\n" +
+        "dll = \"vulkan-1.dll\"\n" +
+        "weak = true\n" +
+        "delay = false\n\n" +
+        "[target.arm64-macos.native]\n" +
+        "rpath = [\"@executable_path/../Frameworks\"]\n\n" +
+        "[target.arm64-macos.native.libs.vulkan]\n" +
+        "framework = \"MoltenVK\"\n" +
+        "path = \"/opt/vulkan/libMoltenVK.dylib\"\n" +
+        "weak = false\n" +
+        "delay = true\n\n" +
+        "[target.x86_64-unknown-linux-gnu.native]\n" +
+        "libc = \"musl\"\n" +
+        "rpath = [\"/usr/local/lib\"]\n\n" +
+        "[app]\n" +
+        "subsystem = \"gui\"\n" +
+        "dpi_aware = true\n" +
+        "utf8 = true\n" +
+        "icon = \"assets/app.ico\"\n" +
+        "bundle_id = \"org.dunder.graphics\"\n" +
+        "entitlements = \"macos/entitlements.plist\"\n" +
+        "frameworks = [\"Metal\", \"AppKit\"]\n\n" +
+        "[dependencies]\n" +
+        "vk = { path = \"../vk\", capabilities = [\"unsafe\"], native_libs = [\"vulkan\", \"c\"] }\n" +
+        "all = { path = \"../all\", capabilities = [\"unsafe\"], native_libs = [\"*\"] }\n" +
+        "plain = \"../plain\"\n"
+    parsed := manifest.parse_text("dunder.toml", full, true)
+    if !parsed.ok { return harness.fail("expected full native/app manifest to parse: " + parsed.error) }
+    if parsed.native.libc != "glibc" || parsed.native.rpath.len != 1 || parsed.native.rpath[0] != "$ORIGIN/lib" {
+        return harness.fail("unexpected [native] config")
+    }
+    mac_cfg := manifest.native_config_for_platform(&parsed, 0)
+    if mac_cfg.libc != "glibc" || mac_cfg.rpath.len != 2 || mac_cfg.rpath[1] != "@executable_path/../Frameworks" {
+        return harness.fail("unexpected merged arm64-macos native config")
+    }
+    lin_cfg := manifest.native_config_for_platform(&parsed, 2)
+    if lin_cfg.libc != "musl" || lin_cfg.rpath.len != 2 || lin_cfg.rpath[1] != "/usr/local/lib" {
+        return harness.fail("unexpected merged x86_64-linux native config")
+    }
+    match manifest.native_lib_override_for_platform(&parsed, 0, "vulkan") {
+        .Some(ov) => {
+            if ov.framework != "MoltenVK" || ov.path != "/opt/vulkan/libMoltenVK.dylib" || ov.weak || !ov.delay {
+                return harness.fail("unexpected arm64-macos vulkan override")
+            }
+        },
+        .None => { return harness.fail("missing arm64-macos vulkan override") },
+    }
+    match manifest.native_lib_override_for_platform(&parsed, 2, "vulkan") {
+        .Some(ov) => {
+            if ov.soname != "libvulkan.so.1" || ov.dll != "vulkan-1.dll" || !ov.weak || ov.delay {
+                return harness.fail("unexpected x86_64-linux vulkan override")
+            }
+        },
+        .None => { return harness.fail("missing x86_64-linux vulkan override") },
+    }
+    if parsed.app.subsystem != "gui" || !parsed.app.dpi_aware || !parsed.app.dpi_aware_set ||
+       !parsed.app.utf8 || !parsed.app.utf8_set || parsed.app.icon != "assets/app.ico" ||
+       parsed.app.bundle_id != "org.dunder.graphics" || parsed.app.entitlements != "macos/entitlements.plist" ||
+       parsed.app.frameworks.len != 2 || parsed.app.frameworks[0] != "Metal" || parsed.app.frameworks[1] != "AppKit" {
+        return harness.fail("unexpected [app] config")
+    }
+    vk_libs := manifest.dep_native_libs_for(&parsed, 0)
+    all_libs := manifest.dep_native_libs_for(&parsed, 1)
+    plain_libs := manifest.dep_native_libs_for(&parsed, 2)
+    if vk_libs.len != 2 || vk_libs[0] != "vulkan" || vk_libs[1] != "c" || !parsed.dep_has_native_libs[0] {
+        return harness.fail("unexpected vk dep native_libs")
+    }
+    if all_libs.len != 1 || all_libs[0] != "*" || !parsed.dep_has_native_libs[1] {
+        return harness.fail("unexpected wildcard dep native_libs")
+    }
+    if plain_libs.len != 0 || parsed.dep_has_native_libs[2] {
+        return harness.fail("unexpected default dep native_libs")
+    }
+
+    bad_manifests: [](string, string) = [
+        ("name='a'\nroot='main.ddr'\n[native]\nlibc='bionic'\n", "invalid libc value"),
+        ("name='a'\nroot='main.ddr'\n[native]\nbogus='x'\n", "unknown native field"),
+        ("name='a'\nroot='main.ddr'\n[native]\nrpath='nope'\n", "rpath must be a string list"),
+        ("name='a'\nroot='main.ddr'\n[native.libs.vk]\nbogus='x'\n", "unknown native library override field"),
+        ("name='a'\nroot='main.ddr'\n[native.libs.vk]\nweak='yes'\n", "must be a boolean"),
+        ("name='a'\nroot='main.ddr'\n[native.libs.vk]\ndelay=1\n", "must be a boolean"),
+        ("name='a'\nroot='main.ddr'\n[target.bogus-target.native]\nlibc='musl'\n", "unknown target in manifest"),
+        ("name='a'\nroot='main.ddr'\n[target.arm64-macos.unknown]\nx='y'\n", "unknown target.arm64-macos section"),
+        ("name='a'\nroot='main.ddr'\n[app]\nsubsystem='daemon'\n", "invalid app.subsystem"),
+        ("name='a'\nroot='main.ddr'\n[app]\ndpi_aware='true'\n", "app.dpi_aware must be a boolean"),
+        ("name='a'\nroot='main.ddr'\n[app]\nutf8=1\n", "app.utf8 must be a boolean"),
+        ("name='a'\nroot='main.ddr'\n[app]\nframeworks=['Metal', 'Metal']\n", "duplicate entry in app.frameworks"),
+        ("name='a'\nroot='main.ddr'\n[app]\nextra='x'\n", "unknown app field"),
+        ("name='a'\nroot='main.ddr'\n[dependencies]\nd={ path='../d', native_libs='c' }\n", "native_libs must be a string list"),
+        ("name='a'\nroot='main.ddr'\n[dependencies]\nd={ path='../d', native_libs=['c', 'c'] }\n", "duplicate native_libs entry"),
+        ("name='a'\nroot='main.ddr'\n[dependencies]\nd={ path='../d', native_libs=[''] }\n", "invalid native_libs entry"),
+    ]
+    for i in 0..bad_manifests.len {
+        res := manifest.parse_text("bad.toml", bad_manifests[i].0, true)
+        if res.ok || !text.contains(res.error, bad_manifests[i].1) {
+            return harness.fail("expected manifest error '" + bad_manifests[i].1 + "', got ok=" + res.ok.str() + " err='" + res.error + "'")
+        }
+    }
+    true
+}
+
+fn check_unsafe_isolation(compiler: string, work: string) -> bool {
+    // Regression: importing std.alloc (which has capability unsafe) MUST NOT leak
+    // capability unsafe into a user module that omits capability unsafe!
+    leak_sendable := work + "/leak_sendable.ddr"
+    leak_ok := work + "/leak_sendable_ok.ddr"
+    if !sys.write_text(leak_sendable, "import std.alloc as alloc\n@resource struct Handle { p: ptr }\nimpl Sendable for Handle {}\nfn main() { _ := alloc.Global {} }\n").ok ||
+       !sys.write_text(leak_ok, "capability unsafe\nimport std.alloc as alloc\n@resource struct Handle { p: ptr }\nimpl Sendable for Handle {}\nfn main() { _ := alloc.Global {} }\n").ok {
+        return harness.fail("cannot write unsafe isolation fixtures")
+    }
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", leak_sendable.clone(), "--agent"], work, 1, false, 60000, &mut out) {
+        return false
+    }
+    if harness.agent_error_message(out.stdout_text(), leak_sendable, "capability unsafe", "").len == 0 {
+        return false
+    }
+    if !harness.run_checked_timeout(compiler, ["check", leak_ok.clone()], work, 0, false, 60000, &mut out) {
+        return false
+    }
+    true
+}
+
+fn check_extern_and_callback_caps(compiler: string, work: string) -> bool {
+    // 1. Taking an @extern with @requires(...) as a function value MUST enforce capabilities
+    // 2. callback(fn_with_requires) MUST enforce capabilities
+    // 3. Qualified callback(mod.fn_name) works and enforces capabilities
+    // 4. Target-gated @c_variadic unavailable on wasm32 MUST NOT reject wasm32 builds (#18)
+    cap_dir := work + "/cap_bypass"
+    if !fs.mkdir_all(cap_dir).ok { return harness.fail("cannot create cap_bypass dir") }
+    helper := cap_dir + "/helper.ddr"
+    helper_src := "capability unsafe, filesystem, network\n" +
+        "@requires(filesystem)\n@extern(\"c\", \"abs\") pub unsafe fn ext_fs(x: i32) -> i32\n" +
+        "@requires(network)\npub fn cb_net(x: i32) -> i32 { x + 1 }\n" +
+        "pub fn cb_pure(x: i32) -> i32 { x + 2 }\n"
+    if !sys.write_text(helper, helper_src).ok { return harness.fail("cannot write helper.ddr") }
+
+    ext_val_bad := cap_dir + "/ext_val_bad.ddr"
+    ext_val_ok := cap_dir + "/ext_val_ok.ddr"
+    cb_local_bad := cap_dir + "/cb_local_bad.ddr"
+    cb_qual_bad := cap_dir + "/cb_qual_bad.ddr"
+    cb_qual_ok := cap_dir + "/cb_qual_ok.ddr"
+    wasm_var_ok := cap_dir + "/wasm_var_ok.ddr"
+    wasm_var_bad := cap_dir + "/wasm_var_bad.ddr"
+
+    if !sys.write_text(ext_val_bad, "capability unsafe\n@requires(filesystem)\n@extern(\"c\", \"abs\") unsafe fn local_ext(x: i32) -> i32\nfn main() { f := local_ext; unsafe { _ := f(-1) } }\n").ok ||
+       !sys.write_text(ext_val_ok, "capability unsafe, filesystem\n@requires(filesystem)\n@extern(\"c\", \"abs\") unsafe fn local_ext(x: i32) -> i32\nfn main() { f := local_ext; unsafe { assert(f(-7) == 7) } }\n").ok ||
+       !sys.write_text(cb_local_bad, "capability unsafe\n@requires(network)\nfn local_cb(x: i32) -> i32 { x }\nfn main() { unsafe { _ := callback(local_cb) } }\n").ok ||
+       !sys.write_text(cb_qual_bad, "capability unsafe\nimport helper\nfn main() { unsafe { _ := callback(helper.cb_net) } }\n").ok ||
+       !sys.write_text(cb_qual_ok, "capability unsafe\nimport helper\nfn main() { unsafe { f := callback(helper.cb_pure); assert(f(40) == 42) } }\n").ok ||
+       !sys.write_text(wasm_var_ok, "capability unsafe\n@c_variadic(2)\n@extern(\"macos\", \"c\", \"ioctl\") unsafe fn mac_ioctl(fd: i32, req: usize, arg: ptr) -> i32\nfn main() { if target_is(\"macos\") { unsafe { _ := mac_ioctl(0, usize(0), ptr(0)) } } }\n").ok ||
+       !sys.write_text(wasm_var_bad, "capability unsafe\n@c_variadic(1)\n@extern(\"c\", \"printf\") unsafe fn c_printf(fmt: ptr, x: i32) -> i32\nfn main() {}\n").ok {
+        return harness.fail("cannot write extern/callback test fixtures")
+    }
+
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", ext_val_bad.clone(), "--agent"], cap_dir, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), ext_val_bad, "requires capability filesystem", "").len == 0 { return false }
+
+    if !harness.run_checked_timeout(compiler, ["check", cb_local_bad.clone(), "--agent"], cap_dir, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), cb_local_bad, "requires capability network", "").len == 0 { return false }
+
+    if !harness.run_checked_timeout(compiler, ["check", cb_qual_bad.clone(), "--agent"], cap_dir, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), cb_qual_bad, "requires capability network", "").len == 0 { return false }
+
+    if !harness.run_checked_timeout(compiler, ["run", ext_val_ok.clone()], cap_dir, 0, false, 60000, &mut out) { return false }
+    if !harness.run_checked_timeout(compiler, ["run", cb_qual_ok.clone()], cap_dir, 0, false, 60000, &mut out) { return false }
+
+    // #18: target-gated @c_variadic must succeed on wasm32 when unavailable, while active @c_variadic fails
+    if !harness.run_checked_timeout(compiler, ["check", wasm_var_ok.clone(), "--target", "wasm32"], cap_dir, 0, false, 60000, &mut out) { return false }
+    if !harness.run_checked_timeout(compiler, ["check", wasm_var_bad.clone(), "--target", "wasm32", "--agent"], cap_dir, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), wasm_var_bad, "C variadic declarations require a native target", "").len == 0 { return false }
+    true
+}
+
+fn check_native_libs_allowlist(compiler: string, work: string) -> bool {
+    root := work + "/nlib_policy"
+    dep_c := root + "/dep_c"
+    dep_map := root + "/dep_map"
+    dep_mid := root + "/dep_mid"
+    app_default_deny := root + "/app_default_deny"
+    app_wrong_lib := root + "/app_wrong_lib"
+    app_allowed := root + "/app_allowed"
+    app_wildcard := root + "/app_wildcard"
+    app_map_bad := root + "/app_map_bad"
+    app_trans_bad := root + "/app_trans_bad"
+    app_trans_ok := root + "/app_trans_ok"
+
+    for dir in [dep_c.clone(), dep_map.clone(), dep_mid.clone(), app_default_deny.clone(), app_wrong_lib.clone(), app_allowed.clone(), app_wildcard.clone(), app_map_bad.clone(), app_trans_bad.clone(), app_trans_ok.clone()] {
+        if !fs.mkdir_all(dir).ok { return harness.fail("cannot create dir " + dir) }
+    }
+
+    if !sys.write_text(dep_c + "/dunder.toml", "name = \"dep_c\"\nroot = \"lib.ddr\"\n").ok ||
+       !sys.write_text(dep_c + "/lib.ddr", "capability unsafe\n@extern(\"c\", \"abs\") unsafe fn c_abs(x: i32) -> i32\npub fn pos(x: i32) -> i32 { unsafe { c_abs(x) } }\n").ok ||
+       !sys.write_text(dep_map + "/dunder.toml", "name = \"dep_map\"\nroot = \"lib.ddr\"\n").ok ||
+       !sys.write_text(dep_map + "/lib.ddr", "capability unsafe\n@extern(symbol = \"abs\", macos = \"c\", linux = \"evil\") unsafe fn c_abs(x: i32) -> i32\npub fn pos(x: i32) -> i32 { unsafe { c_abs(x) } }\n").ok ||
+       !sys.write_text(dep_mid + "/dunder.toml", "name = \"dep_mid\"\nroot = \"lib.ddr\"\n[dependencies]\ndep_c = { path = \"../dep_c\", capabilities = [\"unsafe\"], native_libs = [\"c\", \"extra\"] }\n").ok ||
+       !sys.write_text(dep_mid + "/lib.ddr", "import dep_c\npub fn wrap(x: i32) -> i32 { dep_c.pos(x) }\n").ok {
+        return harness.fail("cannot write dep fixtures")
+    }
+
+    // 1. Default-deny when native_libs omitted on dep with capabilities = ["unsafe"]
+    if !sys.write_text(app_default_deny + "/dunder.toml", "name = \"app1\"\nroot = \"main.ddr\"\n[dependencies]\ndep_c = { path = \"../dep_c\", capabilities = [\"unsafe\"] }\n").ok ||
+       !sys.write_text(app_default_deny + "/main.ddr", "import dep_c\nfn main() { assert(dep_c.pos(-3) == 3) }\n").ok {
+        return harness.fail("cannot write app_default_deny")
+    }
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", app_default_deny + "/main.ddr", "--agent"], app_default_deny, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), dep_c + "/lib.ddr", "dependency 'dep_c' declares @extern for native library 'c', which is not allowed in native_libs", "").len == 0 {
+        return false
+    }
+
+    // 2. Wrong library in native_libs rejected
+    if !sys.write_text(app_wrong_lib + "/dunder.toml", "name = \"app2\"\nroot = \"main.ddr\"\n[dependencies]\ndep_c = { path = \"../dep_c\", capabilities = [\"unsafe\"], native_libs = [\"vulkan\"] }\n").ok ||
+       !sys.write_text(app_wrong_lib + "/main.ddr", "import dep_c\nfn main() { assert(dep_c.pos(-3) == 3) }\n").ok {
+        return harness.fail("cannot write app_wrong_lib")
+    }
+    if !harness.run_checked_timeout(compiler, ["check", app_wrong_lib + "/main.ddr", "--agent"], app_wrong_lib, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), dep_c + "/lib.ddr", "native library 'c', which is not allowed in native_libs", "").len == 0 {
+        return false
+    }
+
+    // 3. Explicit allowlist passes
+    if !sys.write_text(app_allowed + "/dunder.toml", "name = \"app3\"\nroot = \"main.ddr\"\n[dependencies]\ndep_c = { path = \"../dep_c\", capabilities = [\"unsafe\"], native_libs = [\"c\"] }\n").ok ||
+       !sys.write_text(app_allowed + "/main.ddr", "import dep_c\nfn main() { assert(dep_c.pos(-5) == 5) }\n").ok {
+        return harness.fail("cannot write app_allowed")
+    }
+    if !harness.run_checked_timeout(compiler, ["run", app_allowed + "/main.ddr"], app_allowed, 0, false, 60000, &mut out) { return false }
+
+    // 4. Wildcard "*" passes
+    if !sys.write_text(app_wildcard + "/dunder.toml", "name = \"app4\"\nroot = \"main.ddr\"\n[dependencies]\ndep_c = { path = \"../dep_c\", capabilities = [\"unsafe\"], native_libs = [\"*\"] }\n").ok ||
+       !sys.write_text(app_wildcard + "/main.ddr", "import dep_c\nfn main() { assert(dep_c.pos(-9) == 9) }\n").ok {
+        return harness.fail("cannot write app_wildcard")
+    }
+    if !harness.run_checked_timeout(compiler, ["run", app_wildcard + "/main.ddr"], app_wildcard, 0, false, 60000, &mut out) { return false }
+
+    // 5. Map-form @extern rejects any unlisted target library ("evil")
+    if !sys.write_text(app_map_bad + "/dunder.toml", "name = \"app5\"\nroot = \"main.ddr\"\n[dependencies]\ndep_map = { path = \"../dep_map\", capabilities = [\"unsafe\"], native_libs = [\"c\"] }\n").ok ||
+       !sys.write_text(app_map_bad + "/main.ddr", "import dep_map\nfn main() { assert(dep_map.pos(-2) == 2) }\n").ok {
+        return harness.fail("cannot write app_map_bad")
+    }
+    if !harness.run_checked_timeout(compiler, ["check", app_map_bad + "/main.ddr", "--agent"], app_map_bad, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), dep_map + "/lib.ddr", "native library 'evil', which is not allowed in native_libs", "").len == 0 {
+        return false
+    }
+
+    // 6. Transitive intersection: root grants dep_mid ["vulkan"], dep_mid grants dep_c ["c", "extra"] -> intersection is empty -> dep_c rejected!
+    if !sys.write_text(app_trans_bad + "/dunder.toml", "name = \"app6\"\nroot = \"main.ddr\"\n[dependencies]\ndep_mid = { path = \"../dep_mid\", capabilities = [\"unsafe\"], native_libs = [\"vulkan\"] }\n").ok ||
+       !sys.write_text(app_trans_bad + "/main.ddr", "import dep_mid\nfn main() { assert(dep_mid.wrap(-4) == 4) }\n").ok {
+        return harness.fail("cannot write app_trans_bad")
+    }
+    if !harness.run_checked_timeout(compiler, ["check", app_trans_bad + "/main.ddr", "--agent"], app_trans_bad, 1, false, 60000, &mut out) { return false }
+    if harness.agent_error_message(out.stdout_text(), dep_c + "/lib.ddr", "native library 'c', which is not allowed in native_libs", "").len == 0 {
+        return false
+    }
+
+    // 7. Transitive intersection with "c" allowed in both -> passes!
+    if !sys.write_text(app_trans_ok + "/dunder.toml", "name = \"app7\"\nroot = \"main.ddr\"\n[dependencies]\ndep_mid = { path = \"../dep_mid\", capabilities = [\"unsafe\"], native_libs = [\"c\"] }\n").ok ||
+       !sys.write_text(app_trans_ok + "/main.ddr", "import dep_mid\nfn main() { assert(dep_mid.wrap(-6) == 6) }\n").ok {
+        return harness.fail("cannot write app_trans_ok")
+    }
+    if !harness.run_checked_timeout(compiler, ["run", app_trans_ok + "/main.ddr"], app_trans_ok, 0, false, 60000, &mut out) { return false }
+
+    // Also verify dependencies.resolve Graph native_libs fields directly
+    parsed := manifest.parse(app_trans_ok + "/dunder.toml", true)
+    host := if target_is("macos") { 0 } else if target_is("arm64-linux") { 1 } else if target_is("x86_64-linux") { 2 } else { 5 }
+    graph := dependencies.resolve(app_trans_ok, app_trans_ok + "/dunder.toml", &parsed, true, false, false, host)
+    if !graph.ok || graph.pkg_dirs.len != 3 { return harness.fail("expected 3 packages in transitive graph") }
+    if !dependencies.pkg_allows_native_lib(&graph, 0, "anything") { return harness.fail("root pkg should be unrestricted") }
+    if !dependencies.pkg_allows_native_lib(&graph, 2, "c") || dependencies.pkg_allows_native_lib(&graph, 2, "extra") {
+        return harness.fail("transitive intersection in dependencies.Graph failed")
+    }
+    true
+}
+
+fn check_cli_flags(compiler: string, work: string) -> bool {
+    cli_dir := work + "/cli_flags"
+    if !fs.mkdir_all(cli_dir).ok { return harness.fail("cannot create cli_flags dir") }
+    src := cli_dir + "/main.ddr"
+    if !sys.write_text(src, "fn main() { print(42) }\n").ok { return harness.fail("cannot write cli_flags/main.ddr") }
+
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["build", src.clone(), "--subsystem", "gui", "--rpath", "/opt/a", "--rpath=/opt/b", "--libc", "musl", "-o", cli_dir + "/bin1"], cli_dir, 0, false, 60000, &mut out) {
+        return false
+    }
+    if !harness.run_checked_timeout(compiler, ["check", src.clone(), "--subsystem=console", "--libc=gnu", "--rpath", "$ORIGIN"], cli_dir, 0, false, 60000, &mut out) {
+        return false
+    }
+    bad_invocations: []([]string, string) = [
+        (["check", src.clone(), "--subsystem", "daemon"], "unsupported --subsystem value"),
+        (["check", src.clone(), "--subsystem", "gui", "--subsystem", "console"], "duplicate --subsystem option"),
+        (["check", src.clone(), "--libc", "glibc"], "unsupported --libc value"),
+        (["check", src.clone(), "--libc", "gnu", "--libc", "musl"], "duplicate --libc option"),
+        (["check", src.clone(), "--rpath="], "--rpath requires a non-empty path"),
+    ]
+    for i in 0..bad_invocations.len {
+        if !harness.run_checked_timeout(compiler, bad_invocations[i].0.clone(), cli_dir, 2, false, 60000, &mut out) {
+            return false
+        }
+        if !text.contains(out.stderr_text(), bad_invocations[i].1) {
+            return harness.fail("expected CLI stderr containing '" + bad_invocations[i].1 + "', got: " + out.stderr_text())
+        }
+    }
+
+    // Verify build_receipt.prepare invalidates cache key on native/app/CLI option changes
+    host := if target_is("macos") { 0 } else if target_is("arm64-linux") { 1 } else if target_is("x86_64-linux") { 2 } else { 5 }
+    mut base := driver_cli.Options {
+        project_build: true, unused_functions: false, workers: 1, workers_set: false, group: -1, list_groups: false,
+        incremental: false, timings: false, timings_json: false, scalar_opt: true, ownership_opt: true, const_div_opt: true,
+        frame_free: true, range_opt: true, inline_opt: true, mir_opt: true, mir_pass: true, mir_memory: true, mir_ssa: true,
+        mir_values: true, profile_compiler: false, runtime_profile: false, run: false, run_tests: false, install: false,
+        install_dir: "", affected: false, timeout_ms: 5000, args: [], error: "", input: src.clone(), output: cli_dir + "/out",
+        example: "", package_version: "", platform: host, tests: false, app: false, checking: false, agent: false,
+        debug_info: false, offline: false, locked: false, update: false, subsystem: "", rpaths: [], libc: "",
+        native_config: manifest.empty_native_config(""), native_libs: [], app_config: manifest.empty_app_config(),
+        deps: dependencies.empty_graph(),
+    }
+    r0 := build_receipt.prepare(&base, host)
+    if r0.key == "" { return harness.fail("expected non-empty receipt key") }
+    base.subsystem = "gui"
+    r1 := build_receipt.prepare(&base, host)
+    if r1.key == r0.key { return harness.fail("changing CLI subsystem did not invalidate receipt key") }
+    base.rpaths.push("/opt/custom")
+    r2 := build_receipt.prepare(&base, host)
+    if r2.key == r1.key { return harness.fail("changing CLI rpaths did not invalidate receipt key") }
+    base.libc = "musl"
+    r3 := build_receipt.prepare(&base, host)
+    if r3.key == r2.key { return harness.fail("changing CLI libc did not invalidate receipt key") }
+    base.app_config.dpi_aware = true; base.app_config.dpi_aware_set = true
+    r4 := build_receipt.prepare(&base, host)
+    if r4.key == r3.key { return harness.fail("changing [app] config did not invalidate receipt key") }
+    mut ov := manifest.empty_native_lib_override("", "vulkan")
+    ov.soname = "libvulkan.so.1"
+    base.native_libs.push(move ov)
+    r5 := build_receipt.prepare(&base, host)
+    if r5.key == r4.key { return harness.fail("changing [native.libs] did not invalidate receipt key") }
+    base.deps.pkg_native_libs.push("vulkan")
+    r6 := build_receipt.prepare(&base, host)
+    if r6.key == r5.key { return harness.fail("changing dependency native_libs did not invalidate receipt key") }
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    if cli.extra_args.len > 0 { _ := sys.eprint("unexpected argument: " + cli.extra_args[0]); return 2 }
+
+    if !check_manifest_parsing() { return 1 }
+
+    tmp := fs.temp_dir("dunder-native-manifest-")
+    if !tmp.ok { _ := sys.eprint("temp_dir failed"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    if !check_unsafe_isolation(cli.compiler, work) { return 1 }
+    if !check_extern_and_callback_caps(cli.compiler, work) { return 1 }
+    if !check_native_libs_allowlist(cli.compiler, work) { return 1 }
+    if !check_cli_flags(cli.compiler, work) { return 1 }
+
+    print("PASS native manifest, capability isolation, allowlist, and CLI flags")
+    0
+}
