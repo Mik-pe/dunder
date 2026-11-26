@@ -3,6 +3,9 @@
 Samla nya mätresultat här med revision, arbetslast och mätvärden.
 Tidigare körrecept finns i Git-historiken.
 
+Den 26 november jämfördes formattering, en loop med kontrollerad dubblering
+och två rena byggen på Apple M5. [Mätvärden och råprover](compiler/2026-11-26-parser-och-dubblering/README.md)
+
 Den 25 november mättes rena och oförändrade byggen av Tabell, HTTP-servern
 och en terminalräknare. Serien omfattar även privata ändringar, ett blandat
 korpus på 123 188 rader och kompilatorns självbygge.
