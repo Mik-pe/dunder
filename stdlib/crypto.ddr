@@ -2,10 +2,12 @@ capability unsafe
 
 import std.bytes as bytes
 import std.dl as dl
+import std.ffi as ffi
 import std.parse as parse
 import std.random as entropy
 import std.sha256 as sha256
 import std.text as text
+import sys
 
 pub struct Sealed { ciphertext: []u8, tag: []u8 }
 pub struct Keypair { private_key: []u8, public_key: []u8 }
@@ -15,36 +17,23 @@ pub struct Keypair { private_key: []u8, public_key: []u8 }
 unsafe fn c_getenv(name: ptr) -> ptr
 
 fn as_bytes(value: string) -> []u8 { mut out: []u8 = []; bytes.append_utf8(&mut out, value); out }
-fn terminated(value: string) -> []u8 { mut out := as_bytes(value); out.push(0); out }
 @thread_safe
 unsafe fn pointer(value: &[]u8) -> ptr { if value.len == 0 { return ptr(0) }; addr(&value[0]) }
 
 @thread_safe
-unsafe fn decode_cstr(p: ptr) -> string {
-    if usize(p) == 0 { return "" }
-    mut raw: []u8 = []
-    mut offset: usize = 0
-    while offset < 4096 {
-        b := load_u8(ptr(usize(p) + offset))
-        if b == 0 { break }
-        raw.push(b)
-        offset += usize(1)
-    }
-    bytes.decode(&raw).unwrap_or_default()
-}
-
-@thread_safe
 unsafe fn read_env(name: string) -> string {
     if !target_is("native") { return "" }
-    key := terminated(name)
-    decode_cstr(c_getenv(addr(&key[0])))
+    key := match ffi.CString::new(name) {
+        .Ok(c) => c,
+        .Err(_) => { return "" },
+    }
+    ffi.from_cstr_lossy(c_getenv(key.as_ptr())).unwrap_or_default()
 }
 
 @thread_safe
 unsafe fn open_candidate(path: string) -> ptr {
     if path == "" { return ptr(0) }
-    raw := terminated(path)
-    dl.open(addr(&raw[0]), 1)
+    dl.open_lazy(path)
 }
 
 @thread_safe
@@ -63,6 +52,11 @@ unsafe fn open_crypto_lib() -> ptr {
             }
         } else if target_is("linux") {
             for leaf in ["libcrypto.so.3", "libcrypto.so"] {
+                h := open_candidate(clean + "/" + leaf)
+                if usize(h) != 0 { return h }
+            }
+        } else if target_is("windows") {
+            for leaf in ["libcrypto-3-x64.dll", "libcrypto.dll"] {
                 h := open_candidate(clean + "/" + leaf)
                 if usize(h) != 0 { return h }
             }
@@ -87,6 +81,11 @@ unsafe fn open_crypto_lib() -> ptr {
             "/usr/lib64/libcrypto.so.3",
             "libcrypto.so",
         ] {
+            h := open_candidate(cand)
+            if usize(h) != 0 { return h }
+        }
+    } else if target_is("windows") {
+        for cand in ["libcrypto-3-x64.dll", "libcrypto.dll"] {
             h := open_candidate(cand)
             if usize(h) != 0 { return h }
         }
@@ -121,14 +120,71 @@ unsafe fn open_argon2_lib() -> ptr {
             h := open_candidate(cand)
             if usize(h) != 0 { return h }
         }
+    } else if target_is("windows") {
+        for cand in ["libargon2.dll", "argon2.dll"] {
+            h := open_candidate(cand)
+            if usize(h) != 0 { return h }
+        }
     }
     ptr(0)
 }
 
+// Process-wide lock-free cache for lazily loaded OpenSSL/Argon2 handles and symbols.
+// Layout (32 x i64 = 256 bytes):
+//   0: libcrypto handle
+//   1: libargon2 handle
+//   2..21: OpenSSL EVP function pointers
+//   22..23: Argon2 function pointers
 @thread_safe
-unsafe fn load_sym(lib: ptr, name: string) -> ptr {
-    raw := terminated(name)
-    dl.symbol(lib, addr(&raw[0]))
+unsafe fn crypto_cache_base() -> ptr {
+    if target_is("native") { return static_bytes("native", 256) }
+    ptr(0)
+}
+
+@thread_safe
+unsafe fn cache_slot(index: i32) -> ptr {
+    ptr(usize(crypto_cache_base()) + usize(index * 8))
+}
+
+@thread_safe
+unsafe fn cached_crypto_lib() -> ptr {
+    slot := cache_slot(0)
+    existing := sys.atomic_load_i64(slot)
+    if existing != 0 { return ptr(usize(existing)) }
+    opened := open_crypto_lib()
+    if usize(opened) == usize(0) { return ptr(0) }
+    prev := sys.atomic_cas_i64(slot, 0, i64(usize(opened)))
+    if prev != 0 {
+        _ := dl.close(opened)
+        return ptr(usize(prev))
+    }
+    opened
+}
+
+@thread_safe
+unsafe fn cached_argon2_lib() -> ptr {
+    slot := cache_slot(1)
+    existing := sys.atomic_load_i64(slot)
+    if existing != 0 { return ptr(usize(existing)) }
+    opened := open_argon2_lib()
+    if usize(opened) == usize(0) { return ptr(0) }
+    prev := sys.atomic_cas_i64(slot, 0, i64(usize(opened)))
+    if prev != 0 {
+        _ := dl.close(opened)
+        return ptr(usize(prev))
+    }
+    opened
+}
+
+@thread_safe
+unsafe fn cached_sym(lib: ptr, slot_index: i32, name: string) -> ptr {
+    slot := cache_slot(slot_index)
+    existing := sys.atomic_load_i64(slot)
+    if existing != 0 { return ptr(usize(existing)) }
+    sym := dl.symbol_named(lib, name)
+    if usize(sym) == usize(0) { return ptr(0) }
+    _ := sys.atomic_cas_i64(slot, 0, i64(usize(sym)))
+    ptr(usize(sys.atomic_load_i64(slot)))
 }
 
 @thread_safe
@@ -195,25 +251,26 @@ pub fn decode_hex(value: string) -> Result<[]u8, string> {
 @thread_safe
 pub fn argon2id_hash(password: string) -> Result<string, string> {
     if password.len > 1048576 { return .Err("password exceeds its byte limit") }
-    if !target_is("native") { return .Err("Argon2id requires a native target") }
-    salt := random(16)?
-    raw := as_bytes(password)
-    mut encoded: []u8 = []; bytes.pad(&mut encoded, 512)
-    unsafe {
-        lib := open_argon2_lib()
-        if usize(lib) == 0 { return .Err("cannot load Argon2 library; set DUNDER_ARGON2_LIB") }
-        defer { _ := dl.close(lib) }
-        sym := load_sym(lib, "argon2id_hash_encoded")
-        if usize(sym) == 0 { return .Err("missing argon2id_hash_encoded symbol") }
-        hash_fn: extern fn(u32, u32, u32, ptr, usize, ptr, usize, usize, ptr, usize) -> i32 = ffi_fn(sym)
-        if hash_fn(u32(2), u32(19456), u32(1), pointer(&raw), usize(raw.len), pointer(&salt), usize(16), usize(32), addr(&mut encoded[0]), usize(512)) != 0 {
-            return .Err("Argon2id password hashing failed")
+    if target_is("native") {
+        salt := random(16)?
+        raw := as_bytes(password)
+        mut encoded: []u8 = []; bytes.pad(&mut encoded, 512)
+        unsafe {
+            lib := cached_argon2_lib()
+            if usize(lib) == 0 { return .Err("cannot load Argon2 library; set DUNDER_ARGON2_LIB") }
+            sym := cached_sym(lib, 22, "argon2id_hash_encoded")
+            if usize(sym) == 0 { return .Err("missing argon2id_hash_encoded symbol") }
+            hash_fn: extern fn(u32, u32, u32, ptr, usize, ptr, usize, usize, ptr, usize) -> i32 = ffi_fn(sym)
+            if hash_fn(u32(2), u32(19456), u32(1), pointer(&raw), usize(raw.len), pointer(&salt), usize(16), usize(32), addr(&mut encoded[0]), usize(512)) != 0 {
+                return .Err("Argon2id password hashing failed")
+            }
         }
+        mut end := 0
+        while end < encoded.len && encoded[end] != 0 { end += 1 }
+        if end == encoded.len { return .Err("invalid Argon2id output") }
+        return .Ok(bytes.decode_range(&encoded, 0, end).unwrap_or_default())
     }
-    mut end := 0
-    while end < encoded.len && encoded[end] != 0 { end += 1 }
-    if end == encoded.len { return .Err("invalid Argon2id output") }
-    .Ok(bytes.decode_range(&encoded, 0, end).unwrap_or_default())
+    .Err("Argon2id requires a native target")
 }
 
 fn argon_parameters(encoded: string) -> bool {
@@ -239,16 +296,20 @@ fn argon_parameters(encoded: string) -> bool {
 @thread_safe
 pub fn argon2id_verify(password: string, encoded: string) -> bool {
     if password.len > 1048576 || !argon_parameters(encoded) { return false }
-    if !target_is("native") { return false }
-    hash := terminated(encoded); raw := as_bytes(password)
-    unsafe {
-        lib := open_argon2_lib()
-        if usize(lib) == 0 { return false }
-        defer { _ := dl.close(lib) }
-        sym := load_sym(lib, "argon2id_verify")
-        if usize(sym) == 0 { return false }
-        verify_fn: extern fn(ptr, ptr, usize) -> i32 = ffi_fn(sym)
-        return verify_fn(addr(&hash[0]), pointer(&raw), usize(raw.len)) == 0
+    if target_is("native") {
+        hash := match ffi.CString::new(encoded) {
+            .Ok(c) => c,
+            .Err(_) => { return false },
+        }
+        raw := as_bytes(password)
+        unsafe {
+            lib := cached_argon2_lib()
+            if usize(lib) == 0 { return false }
+            sym := cached_sym(lib, 23, "argon2id_verify")
+            if usize(sym) == 0 { return false }
+            verify_fn: extern fn(ptr, ptr, usize) -> i32 = ffi_fn(sym)
+            return verify_fn(hash.as_ptr(), pointer(&raw), usize(raw.len)) == 0
+        }
     }
     false
 }
@@ -258,56 +319,54 @@ pub fn aes256_gcm_seal(key: &[]u8, nonce: &[]u8, aad: &[]u8, plaintext: &[]u8) -
     if key.len != 32 || nonce.len != 12 || plaintext.len > 16777216 || aad.len > 1048576 {
         return .Err("invalid AES-256-GCM inputs")
     }
-    if !target_is("native") {
-        return .Err("AES requires a native target")
-    }
-    unsafe {
-        lib := open_crypto_lib()
-        if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
-        defer { _ := dl.close(lib) }
-        s_ctx_new := load_sym(lib, "EVP_CIPHER_CTX_new")
-        s_ctx_free := load_sym(lib, "EVP_CIPHER_CTX_free")
-        s_cipher := load_sym(lib, "EVP_aes_256_gcm")
-        s_init := load_sym(lib, "EVP_EncryptInit_ex")
-        s_upd := load_sym(lib, "EVP_EncryptUpdate")
-        s_fin := load_sym(lib, "EVP_EncryptFinal_ex")
-        s_ctrl := load_sym(lib, "EVP_CIPHER_CTX_ctrl")
-        if usize(s_ctx_new) == 0 || usize(s_ctx_free) == 0 || usize(s_cipher) == 0 || usize(s_init) == 0 || usize(s_upd) == 0 || usize(s_fin) == 0 || usize(s_ctrl) == 0 {
-            return .Err("missing EVP AES symbols in OpenSSL libcrypto")
-        }
-        ctx_new: extern fn() -> ptr = ffi_fn(s_ctx_new)
-        ctx_free: extern fn(ptr) = ffi_fn(s_ctx_free)
-        cipher_fn: extern fn() -> ptr = ffi_fn(s_cipher)
-        enc_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
-        enc_update: extern fn(ptr, ptr, ptr, ptr, i32) -> i32 = ffi_fn(s_upd)
-        enc_final: extern fn(ptr, ptr, ptr) -> i32 = ffi_fn(s_fin)
-        ctrl: extern fn(ptr, i32, i32, ptr) -> i32 = ffi_fn(s_ctrl)
+    if target_is("native") {
+        unsafe {
+            lib := cached_crypto_lib()
+            if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
+            s_ctx_new := cached_sym(lib, 2, "EVP_CIPHER_CTX_new")
+            s_ctx_free := cached_sym(lib, 3, "EVP_CIPHER_CTX_free")
+            s_cipher := cached_sym(lib, 4, "EVP_aes_256_gcm")
+            s_init := cached_sym(lib, 5, "EVP_EncryptInit_ex")
+            s_upd := cached_sym(lib, 6, "EVP_EncryptUpdate")
+            s_fin := cached_sym(lib, 7, "EVP_EncryptFinal_ex")
+            s_ctrl := cached_sym(lib, 11, "EVP_CIPHER_CTX_ctrl")
+            if usize(s_ctx_new) == 0 || usize(s_ctx_free) == 0 || usize(s_cipher) == 0 || usize(s_init) == 0 || usize(s_upd) == 0 || usize(s_fin) == 0 || usize(s_ctrl) == 0 {
+                return .Err("missing EVP AES symbols in OpenSSL libcrypto")
+            }
+            ctx_new: extern fn() -> ptr = ffi_fn(s_ctx_new)
+            ctx_free: extern fn(ptr) = ffi_fn(s_ctx_free)
+            cipher_fn: extern fn() -> ptr = ffi_fn(s_cipher)
+            enc_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
+            enc_update: extern fn(ptr, ptr, ptr, ptr, i32) -> i32 = ffi_fn(s_upd)
+            enc_final: extern fn(ptr, ptr, ptr) -> i32 = ffi_fn(s_fin)
+            ctrl: extern fn(ptr, i32, i32, ptr) -> i32 = ffi_fn(s_ctrl)
 
-        context := ctx_new()
-        if context == ptr(0) { return .Err("cannot allocate AES context") }
-        defer { ctx_free(context) }
-        if enc_init(context, cipher_fn(), ptr(0), pointer(&key), pointer(&nonce)) != 1 {
-            return .Err("cannot initialize AES-256-GCM")
+            context := ctx_new()
+            if context == ptr(0) { return .Err("cannot allocate AES context") }
+            defer { ctx_free(context) }
+            if enc_init(context, cipher_fn(), ptr(0), pointer(&key), pointer(&nonce)) != 1 {
+                return .Err("cannot initialize AES-256-GCM")
+            }
+            mut count := 0
+            if aad.len > 0 && enc_update(context, ptr(0), addr(&mut count), pointer(&aad), aad.len) != 1 {
+                return .Err("cannot authenticate AES associated data")
+            }
+            mut output: []u8 = []; bytes.pad(&mut output, plaintext.len + 16)
+            count = 0
+            if enc_update(context, addr(&mut output[0]), addr(&mut count), pointer(&plaintext), plaintext.len) != 1 {
+                return .Err("AES encryption failed")
+            }
+            mut final_count := 0
+            if enc_final(context, addr(&mut output[count]), addr(&mut final_count)) != 1 {
+                return .Err("AES encryption failed")
+            }
+            mut tag: []u8 = []; bytes.pad(&mut tag, 16)
+            if ctrl(context, 16, 16, addr(&mut tag[0])) != 1 {
+                return .Err("cannot read AES authentication tag")
+            }
+            while output.len > count + final_count { _ := output.pop() }
+            return .Ok(Sealed { ciphertext: output, tag: tag })
         }
-        mut count := 0
-        if aad.len > 0 && enc_update(context, ptr(0), addr(&mut count), pointer(&aad), aad.len) != 1 {
-            return .Err("cannot authenticate AES associated data")
-        }
-        mut output: []u8 = []; bytes.pad(&mut output, plaintext.len + 16)
-        count = 0
-        if enc_update(context, addr(&mut output[0]), addr(&mut count), pointer(&plaintext), plaintext.len) != 1 {
-            return .Err("AES encryption failed")
-        }
-        mut final_count := 0
-        if enc_final(context, addr(&mut output[count]), addr(&mut final_count)) != 1 {
-            return .Err("AES encryption failed")
-        }
-        mut tag: []u8 = []; bytes.pad(&mut tag, 16)
-        if ctrl(context, 16, 16, addr(&mut tag[0])) != 1 {
-            return .Err("cannot read AES authentication tag")
-        }
-        while output.len > count + final_count { _ := output.pop() }
-        return .Ok(Sealed { ciphertext: output, tag: tag })
     }
     .Err("AES requires a native target")
 }
@@ -315,46 +374,46 @@ pub fn aes256_gcm_seal(key: &[]u8, nonce: &[]u8, aad: &[]u8, plaintext: &[]u8) -
 @thread_safe
 pub fn aes256_gcm_open(key: &[]u8, nonce: &[]u8, aad: &[]u8, ciphertext: &[]u8, tag: &[]u8) -> Result<[]u8, string> {
     if key.len != 32 || nonce.len != 12 || tag.len != 16 || ciphertext.len > 16777216 || aad.len > 1048576 { return .Err("invalid AES-256-GCM inputs") }
-    if !target_is("native") { return .Err("AES requires a native target") }
-    unsafe {
-        lib := open_crypto_lib()
-        if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
-        defer { _ := dl.close(lib) }
-        s_ctx_new := load_sym(lib, "EVP_CIPHER_CTX_new")
-        s_ctx_free := load_sym(lib, "EVP_CIPHER_CTX_free")
-        s_cipher := load_sym(lib, "EVP_aes_256_gcm")
-        s_init := load_sym(lib, "EVP_DecryptInit_ex")
-        s_upd := load_sym(lib, "EVP_DecryptUpdate")
-        s_fin := load_sym(lib, "EVP_DecryptFinal_ex")
-        s_ctrl := load_sym(lib, "EVP_CIPHER_CTX_ctrl")
-        if usize(s_ctx_new) == 0 || usize(s_ctx_free) == 0 || usize(s_cipher) == 0 || usize(s_init) == 0 || usize(s_upd) == 0 || usize(s_fin) == 0 || usize(s_ctrl) == 0 {
-            return .Err("missing EVP AES symbols in OpenSSL libcrypto")
-        }
-        ctx_new: extern fn() -> ptr = ffi_fn(s_ctx_new)
-        ctx_free: extern fn(ptr) = ffi_fn(s_ctx_free)
-        cipher_fn: extern fn() -> ptr = ffi_fn(s_cipher)
-        dec_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
-        dec_update: extern fn(ptr, ptr, ptr, ptr, i32) -> i32 = ffi_fn(s_upd)
-        dec_final: extern fn(ptr, ptr, ptr) -> i32 = ffi_fn(s_fin)
-        ctrl: extern fn(ptr, i32, i32, ptr) -> i32 = ffi_fn(s_ctrl)
+    if target_is("native") {
+        unsafe {
+            lib := cached_crypto_lib()
+            if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
+            s_ctx_new := cached_sym(lib, 2, "EVP_CIPHER_CTX_new")
+            s_ctx_free := cached_sym(lib, 3, "EVP_CIPHER_CTX_free")
+            s_cipher := cached_sym(lib, 4, "EVP_aes_256_gcm")
+            s_init := cached_sym(lib, 8, "EVP_DecryptInit_ex")
+            s_upd := cached_sym(lib, 9, "EVP_DecryptUpdate")
+            s_fin := cached_sym(lib, 10, "EVP_DecryptFinal_ex")
+            s_ctrl := cached_sym(lib, 11, "EVP_CIPHER_CTX_ctrl")
+            if usize(s_ctx_new) == 0 || usize(s_ctx_free) == 0 || usize(s_cipher) == 0 || usize(s_init) == 0 || usize(s_upd) == 0 || usize(s_fin) == 0 || usize(s_ctrl) == 0 {
+                return .Err("missing EVP AES symbols in OpenSSL libcrypto")
+            }
+            ctx_new: extern fn() -> ptr = ffi_fn(s_ctx_new)
+            ctx_free: extern fn(ptr) = ffi_fn(s_ctx_free)
+            cipher_fn: extern fn() -> ptr = ffi_fn(s_cipher)
+            dec_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
+            dec_update: extern fn(ptr, ptr, ptr, ptr, i32) -> i32 = ffi_fn(s_upd)
+            dec_final: extern fn(ptr, ptr, ptr) -> i32 = ffi_fn(s_fin)
+            ctrl: extern fn(ptr, i32, i32, ptr) -> i32 = ffi_fn(s_ctrl)
 
-        context := ctx_new()
-        if context == ptr(0) { return .Err("cannot allocate AES context") }
-        defer { ctx_free(context) }
-        if dec_init(context, cipher_fn(), ptr(0), pointer(&key), pointer(&nonce)) != 1 { return .Err("cannot initialize AES-256-GCM") }
-        mut count := 0
-        if aad.len > 0 && dec_update(context, ptr(0), addr(&mut count), pointer(&aad), aad.len) != 1 { return .Err("cannot authenticate AES associated data") }
-        mut output: []u8 = []; bytes.pad(&mut output, ciphertext.len + 16)
-        count = 0
-        if dec_update(context, addr(&mut output[0]), addr(&mut count), pointer(&ciphertext), ciphertext.len) != 1 { return .Err("AES decryption failed") }
-        if ctrl(context, 17, 16, pointer(&tag)) != 1 { return .Err("cannot set AES authentication tag") }
-        mut final_count := 0
-        if dec_final(context, addr(&mut output[count]), addr(&mut final_count)) != 1 {
-            for i in 0..output.len { output[i] = 0 }
-            return .Err("AES authentication failed")
+            context := ctx_new()
+            if context == ptr(0) { return .Err("cannot allocate AES context") }
+            defer { ctx_free(context) }
+            if dec_init(context, cipher_fn(), ptr(0), pointer(&key), pointer(&nonce)) != 1 { return .Err("cannot initialize AES-256-GCM") }
+            mut count := 0
+            if aad.len > 0 && dec_update(context, ptr(0), addr(&mut count), pointer(&aad), aad.len) != 1 { return .Err("cannot authenticate AES associated data") }
+            mut output: []u8 = []; bytes.pad(&mut output, ciphertext.len + 16)
+            count = 0
+            if dec_update(context, addr(&mut output[0]), addr(&mut count), pointer(&ciphertext), ciphertext.len) != 1 { return .Err("AES decryption failed") }
+            if ctrl(context, 17, 16, pointer(&tag)) != 1 { return .Err("cannot set AES authentication tag") }
+            mut final_count := 0
+            if dec_final(context, addr(&mut output[count]), addr(&mut final_count)) != 1 {
+                for i in 0..output.len { output[i] = 0 }
+                return .Err("AES authentication failed")
+            }
+            while output.len > count + final_count { _ := output.pop() }
+            return .Ok(output)
         }
-        while output.len > count + final_count { _ := output.pop() }
-        return .Ok(output)
     }
     .Err("AES requires a native target")
 }
@@ -362,31 +421,30 @@ pub fn aes256_gcm_open(key: &[]u8, nonce: &[]u8, aad: &[]u8, ciphertext: &[]u8, 
 @thread_safe
 pub fn ed25519_public_key(private_key: &[]u8) -> Result<[]u8, string> {
     if private_key.len != 32 { return .Err("Ed25519 private key must be 32 bytes") }
-    if !target_is("native") { return .Err("Ed25519 requires a native target") }
-    name := terminated("ED25519")
-    unsafe {
-        lib := open_crypto_lib()
-        if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
-        defer { _ := dl.close(lib) }
-        s_new := load_sym(lib, "EVP_PKEY_new_raw_private_key_ex")
-        s_pub := load_sym(lib, "EVP_PKEY_get_raw_public_key")
-        s_free := load_sym(lib, "EVP_PKEY_free")
-        if usize(s_new) == 0 || usize(s_pub) == 0 || usize(s_free) == 0 {
-            return .Err("missing EVP Ed25519 symbols in OpenSSL libcrypto")
-        }
-        pkey_new: extern fn(ptr, ptr, ptr, ptr, usize) -> ptr = ffi_fn(s_new)
-        pkey_pub: extern fn(ptr, ptr, ptr) -> i32 = ffi_fn(s_pub)
-        pkey_free: extern fn(ptr) = ffi_fn(s_free)
+    if target_is("native") {
+        unsafe {
+            lib := cached_crypto_lib()
+            if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
+            s_new := cached_sym(lib, 12, "EVP_PKEY_new_raw_private_key_ex")
+            s_pub := cached_sym(lib, 14, "EVP_PKEY_get_raw_public_key")
+            s_free := cached_sym(lib, 15, "EVP_PKEY_free")
+            if usize(s_new) == 0 || usize(s_pub) == 0 || usize(s_free) == 0 {
+                return .Err("missing EVP Ed25519 symbols in OpenSSL libcrypto")
+            }
+            pkey_new: extern fn(ptr, ptr, ptr, ptr, usize) -> ptr = ffi_fn(s_new)
+            pkey_pub: extern fn(ptr, ptr, ptr) -> i32 = ffi_fn(s_pub)
+            pkey_free: extern fn(ptr) = ffi_fn(s_free)
 
-        pkey := pkey_new(ptr(0), addr(&name[0]), ptr(0), addr(&private_key[0]), usize(32))
-        if pkey == ptr(0) { return .Err("cannot load Ed25519 private key") }
-        defer { pkey_free(pkey) }
-        mut public_key: []u8 = []; bytes.pad(&mut public_key, 32)
-        mut length: usize = usize(32)
-        if pkey_pub(pkey, addr(&mut public_key[0]), addr(&mut length)) != 1 || length != usize(32) {
-            return .Err("cannot derive Ed25519 public key")
+            pkey := pkey_new(ptr(0), cstr("ED25519"), ptr(0), addr(&private_key[0]), usize(32))
+            if pkey == ptr(0) { return .Err("cannot load Ed25519 private key") }
+            defer { pkey_free(pkey) }
+            mut public_key: []u8 = []; bytes.pad(&mut public_key, 32)
+            mut length: usize = usize(32)
+            if pkey_pub(pkey, addr(&mut public_key[0]), addr(&mut length)) != 1 || length != usize(32) {
+                return .Err("cannot derive Ed25519 public key")
+            }
+            return .Ok(public_key)
         }
-        return .Ok(public_key)
     }
     .Err("Ed25519 requires a native target")
 }
@@ -401,45 +459,44 @@ pub fn ed25519_keygen() -> Result<Keypair, string> {
 @thread_safe
 pub fn ed25519_sign(private_key: &[]u8, message: &[]u8) -> Result<[]u8, string> {
     if private_key.len != 32 || message.len > 16777216 { return .Err("invalid Ed25519 signing inputs") }
-    if !target_is("native") { return .Err("Ed25519 requires a native target") }
-    name := terminated("ED25519")
-    mut scratch: u8 = 0
-    unsafe {
-        lib := open_crypto_lib()
-        if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
-        defer { _ := dl.close(lib) }
-        s_new := load_sym(lib, "EVP_PKEY_new_raw_private_key_ex")
-        s_free := load_sym(lib, "EVP_PKEY_free")
-        s_md_new := load_sym(lib, "EVP_MD_CTX_new")
-        s_md_free := load_sym(lib, "EVP_MD_CTX_free")
-        s_init := load_sym(lib, "EVP_DigestSignInit")
-        s_sign := load_sym(lib, "EVP_DigestSign")
-        if usize(s_new) == 0 || usize(s_free) == 0 || usize(s_md_new) == 0 || usize(s_md_free) == 0 || usize(s_init) == 0 || usize(s_sign) == 0 {
-            return .Err("missing EVP Ed25519 signing symbols in OpenSSL libcrypto")
-        }
-        pkey_new: extern fn(ptr, ptr, ptr, ptr, usize) -> ptr = ffi_fn(s_new)
-        pkey_free: extern fn(ptr) = ffi_fn(s_free)
-        md_ctx_new: extern fn() -> ptr = ffi_fn(s_md_new)
-        md_ctx_free: extern fn(ptr) = ffi_fn(s_md_free)
-        digest_sign_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
-        digest_sign: extern fn(ptr, ptr, ptr, ptr, usize) -> i32 = ffi_fn(s_sign)
+    if target_is("native") {
+        mut scratch: u8 = 0
+        unsafe {
+            lib := cached_crypto_lib()
+            if usize(lib) == 0 { return .Err("cannot load OpenSSL libcrypto; set DUNDER_CRYPTO_LIB or OPENSSL_LIB_DIR") }
+            s_new := cached_sym(lib, 12, "EVP_PKEY_new_raw_private_key_ex")
+            s_free := cached_sym(lib, 15, "EVP_PKEY_free")
+            s_md_new := cached_sym(lib, 16, "EVP_MD_CTX_new")
+            s_md_free := cached_sym(lib, 17, "EVP_MD_CTX_free")
+            s_init := cached_sym(lib, 18, "EVP_DigestSignInit")
+            s_sign := cached_sym(lib, 19, "EVP_DigestSign")
+            if usize(s_new) == 0 || usize(s_free) == 0 || usize(s_md_new) == 0 || usize(s_md_free) == 0 || usize(s_init) == 0 || usize(s_sign) == 0 {
+                return .Err("missing EVP Ed25519 signing symbols in OpenSSL libcrypto")
+            }
+            pkey_new: extern fn(ptr, ptr, ptr, ptr, usize) -> ptr = ffi_fn(s_new)
+            pkey_free: extern fn(ptr) = ffi_fn(s_free)
+            md_ctx_new: extern fn() -> ptr = ffi_fn(s_md_new)
+            md_ctx_free: extern fn(ptr) = ffi_fn(s_md_free)
+            digest_sign_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
+            digest_sign: extern fn(ptr, ptr, ptr, ptr, usize) -> i32 = ffi_fn(s_sign)
 
-        pkey := pkey_new(ptr(0), addr(&name[0]), ptr(0), addr(&private_key[0]), usize(32))
-        if pkey == ptr(0) { return .Err("cannot load Ed25519 private key") }
-        defer { pkey_free(pkey) }
-        context := md_ctx_new()
-        if context == ptr(0) { return .Err("cannot allocate Ed25519 signing context") }
-        defer { md_ctx_free(context) }
-        if digest_sign_init(context, ptr(0), ptr(0), ptr(0), pkey) != 1 {
-            return .Err("cannot initialize Ed25519 signature")
+            pkey := pkey_new(ptr(0), cstr("ED25519"), ptr(0), addr(&private_key[0]), usize(32))
+            if pkey == ptr(0) { return .Err("cannot load Ed25519 private key") }
+            defer { pkey_free(pkey) }
+            context := md_ctx_new()
+            if context == ptr(0) { return .Err("cannot allocate Ed25519 signing context") }
+            defer { md_ctx_free(context) }
+            if digest_sign_init(context, ptr(0), ptr(0), ptr(0), pkey) != 1 {
+                return .Err("cannot initialize Ed25519 signature")
+            }
+            mut signature: []u8 = []; bytes.pad(&mut signature, 64)
+            mut signature_len: usize = usize(64)
+            tbs := if message.len > 0 { addr(&message[0]) } else { addr(&mut scratch) }
+            if digest_sign(context, addr(&mut signature[0]), addr(&mut signature_len), tbs, usize(message.len)) != 1 || signature_len != usize(64) {
+                return .Err("Ed25519 signing failed")
+            }
+            return .Ok(signature)
         }
-        mut signature: []u8 = []; bytes.pad(&mut signature, 64)
-        mut signature_len: usize = usize(64)
-        tbs := if message.len > 0 { addr(&message[0]) } else { addr(&mut scratch) }
-        if digest_sign(context, addr(&mut signature[0]), addr(&mut signature_len), tbs, usize(message.len)) != 1 || signature_len != usize(64) {
-            return .Err("Ed25519 signing failed")
-        }
-        return .Ok(signature)
     }
     .Err("Ed25519 requires a native target")
 }
@@ -447,38 +504,37 @@ pub fn ed25519_sign(private_key: &[]u8, message: &[]u8) -> Result<[]u8, string> 
 @thread_safe
 pub fn ed25519_verify(public_key: &[]u8, message: &[]u8, signature: &[]u8) -> bool {
     if public_key.len != 32 || signature.len != 64 || message.len > 16777216 { return false }
-    if !target_is("native") { return false }
-    name := terminated("ED25519")
-    mut scratch: u8 = 0
-    unsafe {
-        lib := open_crypto_lib()
-        if usize(lib) == 0 { return false }
-        defer { _ := dl.close(lib) }
-        s_new := load_sym(lib, "EVP_PKEY_new_raw_public_key_ex")
-        s_free := load_sym(lib, "EVP_PKEY_free")
-        s_md_new := load_sym(lib, "EVP_MD_CTX_new")
-        s_md_free := load_sym(lib, "EVP_MD_CTX_free")
-        s_init := load_sym(lib, "EVP_DigestVerifyInit")
-        s_verify := load_sym(lib, "EVP_DigestVerify")
-        if usize(s_new) == 0 || usize(s_free) == 0 || usize(s_md_new) == 0 || usize(s_md_free) == 0 || usize(s_init) == 0 || usize(s_verify) == 0 {
-            return false
-        }
-        pkey_new: extern fn(ptr, ptr, ptr, ptr, usize) -> ptr = ffi_fn(s_new)
-        pkey_free: extern fn(ptr) = ffi_fn(s_free)
-        md_ctx_new: extern fn() -> ptr = ffi_fn(s_md_new)
-        md_ctx_free: extern fn(ptr) = ffi_fn(s_md_free)
-        digest_verify_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
-        digest_verify: extern fn(ptr, ptr, usize, ptr, usize) -> i32 = ffi_fn(s_verify)
+    if target_is("native") {
+        mut scratch: u8 = 0
+        unsafe {
+            lib := cached_crypto_lib()
+            if usize(lib) == 0 { return false }
+            s_new := cached_sym(lib, 13, "EVP_PKEY_new_raw_public_key_ex")
+            s_free := cached_sym(lib, 15, "EVP_PKEY_free")
+            s_md_new := cached_sym(lib, 16, "EVP_MD_CTX_new")
+            s_md_free := cached_sym(lib, 17, "EVP_MD_CTX_free")
+            s_init := cached_sym(lib, 20, "EVP_DigestVerifyInit")
+            s_verify := cached_sym(lib, 21, "EVP_DigestVerify")
+            if usize(s_new) == 0 || usize(s_free) == 0 || usize(s_md_new) == 0 || usize(s_md_free) == 0 || usize(s_init) == 0 || usize(s_verify) == 0 {
+                return false
+            }
+            pkey_new: extern fn(ptr, ptr, ptr, ptr, usize) -> ptr = ffi_fn(s_new)
+            pkey_free: extern fn(ptr) = ffi_fn(s_free)
+            md_ctx_new: extern fn() -> ptr = ffi_fn(s_md_new)
+            md_ctx_free: extern fn(ptr) = ffi_fn(s_md_free)
+            digest_verify_init: extern fn(ptr, ptr, ptr, ptr, ptr) -> i32 = ffi_fn(s_init)
+            digest_verify: extern fn(ptr, ptr, usize, ptr, usize) -> i32 = ffi_fn(s_verify)
 
-        pkey := pkey_new(ptr(0), addr(&name[0]), ptr(0), addr(&public_key[0]), usize(32))
-        if pkey == ptr(0) { return false }
-        defer { pkey_free(pkey) }
-        context := md_ctx_new()
-        if context == ptr(0) { return false }
-        defer { md_ctx_free(context) }
-        if digest_verify_init(context, ptr(0), ptr(0), ptr(0), pkey) != 1 { return false }
-        tbs := if message.len > 0 { addr(&message[0]) } else { addr(&mut scratch) }
-        return digest_verify(context, addr(&signature[0]), usize(64), tbs, usize(message.len)) == 1
+            pkey := pkey_new(ptr(0), cstr("ED25519"), ptr(0), addr(&public_key[0]), usize(32))
+            if pkey == ptr(0) { return false }
+            defer { pkey_free(pkey) }
+            context := md_ctx_new()
+            if context == ptr(0) { return false }
+            defer { md_ctx_free(context) }
+            if digest_verify_init(context, ptr(0), ptr(0), ptr(0), pkey) != 1 { return false }
+            tbs := if message.len > 0 { addr(&message[0]) } else { addr(&mut scratch) }
+            return digest_verify(context, addr(&signature[0]), usize(64), tbs, usize(message.len)) == 1
+        }
     }
     false
 }
