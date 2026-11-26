@@ -1,0 +1,385 @@
+capability process, filesystem, network, stdio, unsafe
+
+import .harness as harness
+import std.dl as dl
+import std.ffi as ffi
+import std.fs as fs
+import std.text as text
+import sys
+
+// =========================================================================
+// Mock 1-arg (EGL/GLX-style) and 2-arg (Vulkan-style) proc-address loaders
+// =========================================================================
+
+unsafe fn mock_egl_get_proc(name_ptr: ptr) -> ptr {
+    name := match ffi.from_cstr(name_ptr) {
+        .Some(s) => s,
+        .None => { return ptr(0) },
+    }
+    if name == "glClear" { return ptr(usize(0x1001)) }
+    if name == "glDrawArrays" { return ptr(usize(0x1002)) }
+    ptr(0)
+}
+
+unsafe fn mock_vk_get_device_proc_addr(device: ptr, name_ptr: ptr) -> ptr {
+    if usize(device) != usize(0xD00D) { return ptr(0) }
+    name := match ffi.from_cstr(name_ptr) {
+        .Some(s) => s,
+        .None => { return ptr(0) },
+    }
+    if name == "vkCmdDraw" { return ptr(usize(0x2001)) }
+    if name == "vkQueueSubmit" { return ptr(usize(0x2002)) }
+    ptr(0)
+}
+
+unsafe fn mock_vk_get_instance_proc_addr(instance: ptr, name_ptr: ptr) -> ptr {
+    name := match ffi.from_cstr(name_ptr) {
+        .Some(s) => s,
+        .None => { return ptr(0) },
+    }
+    // Pre-instance commands work with VK_NULL_HANDLE (ptr(0)).
+    if usize(instance) == usize(0) {
+        if name == "vkCreateInstance" { return ptr(usize(0x3001)) }
+        if name == "vkEnumerateInstanceVersion" { return ptr(usize(0x3002)) }
+        return ptr(0)
+    }
+    if usize(instance) != usize(0x1A57) { return ptr(0) }
+    if name == "vkDestroyInstance" { return ptr(usize(0x3010)) }
+    if name == "vkEnumeratePhysicalDevices" { return ptr(usize(0x3011)) }
+    if name == "vkGetDeviceProcAddr" {
+        // Return a sentinel so we verify derive_context failure/success paths below;
+        // real libraries return a callable symbol pointer.
+        return ptr(usize(0x3012))
+    }
+    ptr(0)
+}
+
+fn check_dl_in_process() -> bool {
+    if !target_is("native") { return true }
+
+    // LoadMode checks
+    assert(dl.mode_flags(.Default) == 2)
+    assert(dl.mode_flags(.Lazy) == 1)
+    assert(dl.mode_flags(.Now) == 2)
+    assert(dl.LoadMode.Default == dl.LoadMode.Default)
+    assert(dl.LoadMode.Default != dl.LoadMode.Lazy)
+    assert(dl.LoadMode.Default != dl.LoadMode.Now)
+
+    unsafe {
+        // 1. Library::open_first structured errors
+        empty_cands: []string = []
+        empty_res := dl.Library::open_first(&empty_cands, .Now)
+        assert(empty_res.is_err())
+        assert(text.contains(empty_res.unwrap_err(), "no candidates provided"))
+
+        bad_cands: []string = ["", "/nonexistent/dunder_first_missing.so", "bad\0lib", "/nonexistent/dunder_second_missing.so"]
+        bad_res := dl.Library::open_first(&bad_cands, .Default)
+        assert(bad_res.is_err())
+        err_msg := bad_res.unwrap_err()
+        assert(text.contains(err_msg, "<empty>"))
+        assert(text.contains(err_msg, "/nonexistent/dunder_first_missing.so"))
+        assert(text.contains(err_msg, "interior NUL"))
+        assert(text.contains(err_msg, "/nonexistent/dunder_second_missing.so"))
+
+        // 2. Library::open_first succeeds on first valid candidate after missing ones
+        mut sys_cands: []string = ["/nonexistent/dunder_nope_1.so", ""]
+        if target_is("macos") {
+            sys_cands.push("/usr/lib/libSystem.B.dylib")
+        } else if target_is("linux") {
+            sys_cands.push("libc.so.6")
+        }
+        if target_is("macos") || target_is("linux") {
+            mut lib := dl.Library::open_first(&sys_cands, .Now).unwrap()
+            assert(lib.is_open())
+
+            // Required batch loading via method and free function
+            req_names: []string = ["abs", "strlen", "memcmp"]
+            syms := lib.load_required_symbols(&req_names).unwrap()
+            assert(syms.len == 3)
+            abs_fn: extern fn(i32) -> i32 = ffi_fn(syms[0])
+            strlen_fn: extern fn(ptr) -> usize = ffi_fn(syms[1])
+            assert(abs_fn(-99) == 99)
+            hello := ffi.CString::new("dunder").unwrap()
+            assert(strlen_fn(hello.as_ptr()) == usize(6))
+
+            syms2 := dl.load_required_symbols(&lib, &req_names).unwrap()
+            assert(syms2.len == 3 && syms2[0] == syms[0] && syms2[1] == syms[1])
+
+            // Missing single and multiple required symbols list all missing names
+            miss_one := lib.load_required_symbols(&["abs", "__dunder_missing_one__"])
+            assert(miss_one.is_err())
+            assert(text.contains(miss_one.unwrap_err(), "__dunder_missing_one__"))
+
+            miss_many := lib.load_required_symbols(&["__dunder_miss_a__", "abs", "__dunder_miss_b__"])
+            assert(miss_many.is_err())
+            many_msg := miss_many.unwrap_err()
+            assert(text.contains(many_msg, "__dunder_miss_a__"))
+            assert(text.contains(many_msg, "__dunder_miss_b__"))
+
+            // Optional batch loading via method and free function
+            opt_names: []string = ["abs", "__dunder_opt_missing_1__", "strlen", "__dunder_opt_missing_2__"]
+            opts := lib.load_optional_symbols(&opt_names)
+            assert(opts.len == 4)
+            assert(opts[0].is_some() && opts[1].is_none() && opts[2].is_some() && opts[3].is_none())
+            opts2 := dl.load_optional_symbols(&lib, &opt_names)
+            assert(opts2.len == 4 && opts2[0].is_some() && opts2[1].is_none() && opts2[2].is_some() && opts2[3].is_none())
+
+            // Library::current_process()
+            cur := dl.Library::current_process().unwrap()
+            assert(cur.is_open() && cur.try_symbol("abs").is_some())
+
+            // 3. ProcResolver: Library, 1-arg ProcAddr (EGL), 2-arg ContextProcAddr (Vulkan), ProcChain
+            assert(dl.ProcResolver::from_proc_addr_ptr(ptr(0)).is_err())
+            assert(dl.ProcResolver::from_context_proc_addr_ptr(ptr(0), ptr(0)).is_err())
+
+            lib_resolver := lib.resolver()
+            lib_res_syms := dl.load_proc_symbols(&lib_resolver, &["abs", "strlen"]).unwrap()
+            assert(lib_res_syms.len == 2)
+            abs_fn2: extern fn(i32) -> i32 = ffi_fn(lib_res_syms[0])
+            assert(abs_fn2(-123) == 123)
+
+            egl_resolver := dl.ProcResolver::from_proc_addr(callback(mock_egl_get_proc))
+            egl_syms := egl_resolver.load_required_symbols(&["glClear", "glDrawArrays"]).unwrap()
+            assert(egl_syms.len == 2 && usize(egl_syms[0]) == usize(0x1001) && usize(egl_syms[1]) == usize(0x1002))
+            egl_opts := dl.load_optional_proc_symbols(&egl_resolver, &["glClear", "glMissingExt"])
+            assert(egl_opts.len == 2 && egl_opts[0].is_some() && egl_opts[1].is_none())
+
+            // Real 2-arg context proc-address loader using native C dlsym(handle, name),
+            // exercising from_library_context_proc_addr + derive_context end-to-end!
+            dlsym_res := dl.ProcResolver::from_library_context_proc_addr(&lib, "dlsym", lib.raw_handle()).unwrap()
+            derived_res := dlsym_res.derive_context("dlsym", lib.raw_handle()).unwrap()
+            derived_syms := derived_res.load_required_symbols(&["abs", "strlen"]).unwrap()
+            assert(derived_syms.len == 2)
+            derived_abs: extern fn(i32) -> i32 = ffi_fn(derived_syms[0])
+            assert(derived_abs(-55) == 55)
+
+            // Vulkan global (NULL instance) -> instance -> device chain
+            vk_global := dl.ProcResolver::from_context_proc_addr(ptr(0), callback(mock_vk_get_instance_proc_addr))
+            g_syms := vk_global.load_required_symbols(&["vkCreateInstance", "vkEnumerateInstanceVersion"]).unwrap()
+            assert(g_syms.len == 2 && usize(g_syms[0]) == usize(0x3001) && usize(g_syms[1]) == usize(0x3002))
+            assert(vk_global.try_resolve("vkDestroyInstance").is_none())
+
+            vk_inst := dl.ProcResolver::from_context_proc_addr(ptr(usize(0x1A57)), callback(mock_vk_get_instance_proc_addr))
+            vk_dev := dl.ProcResolver::from_context_proc_addr(ptr(usize(0xD00D)), callback(mock_vk_get_device_proc_addr))
+
+            mut chain := dl.ProcChain::new()
+            assert(chain.is_empty() && chain.len() == 0)
+            chain.push(move vk_dev)
+            chain.push(move vk_inst)
+            chain.push(move lib_resolver)
+            assert(!chain.is_empty() && chain.len() == 3)
+
+            chain_syms := chain.load_required_symbols(&["vkCmdDraw", "vkDestroyInstance", "abs"]).unwrap()
+            assert(chain_syms.len == 3)
+            assert(usize(chain_syms[0]) == usize(0x2001))
+            assert(usize(chain_syms[1]) == usize(0x3010))
+            chain_abs: extern fn(i32) -> i32 = ffi_fn(chain_syms[2])
+            assert(chain_abs(-77) == 77)
+
+            chain_opts := chain.load_optional_symbols(&["vkQueueSubmit", "vkOptionalExt", "vkEnumeratePhysicalDevices"])
+            assert(chain_opts.len == 3)
+            assert(chain_opts[0].is_some() && chain_opts[1].is_none() && chain_opts[2].is_some())
+
+            chain_miss := chain.load_required_symbols(&["vkCmdDraw", "vkDefinitelyMissing"])
+            assert(chain_miss.is_err() && text.contains(chain_miss.unwrap_err(), "vkDefinitelyMissing"))
+
+            // Closed library errors cleanly
+            assert(lib.close())
+            assert(!lib.is_open())
+            assert(lib.symbol("abs").is_err())
+            assert(lib.load_required_symbols(&["abs"]).is_err())
+            closed_opts := lib.load_optional_symbols(&["abs"])
+            assert(closed_opts.len == 1 && closed_opts[0].is_none())
+        }
+    }
+    true
+}
+
+fn check_packages_e2e(compiler: string, root: string, work: string) -> bool {
+    pkg_dir := work + "/pkg_probe"
+    if !fs.mkdir_all(pkg_dir).ok { return harness.fail("cannot create pkg_probe dir") }
+
+    toml := "name = \"dl-packages-probe\"\n" +
+        "version = \"0.1.0\"\n" +
+        "root = \"main.ddr\"\n\n" +
+        "[dependencies]\n" +
+        "sqlite = { path = \"" + root + "/packages/sqlite\", capabilities = [\"filesystem\", \"unsafe\"], native_libs = [\"/usr/lib/libsqlite3.dylib\", \"libsqlite3.so.0\"] }\n" +
+        "http_client = { path = \"" + root + "/packages/http_client\", capabilities = [\"network\", \"unsafe\"], native_libs = [\"/usr/lib/libcurl.dylib\", \"libcurl.so.4\"] }\n" +
+        "http = { path = \"" + root + "/packages/http\", capabilities = [\"network\", \"unsafe\"], native_libs = [\"c\"] }\n"
+    if !sys.write_text(pkg_dir + "/dunder.toml", toml).ok { return harness.fail("cannot write probe dunder.toml") }
+
+    probe_src := "capability filesystem, network, process, stdio\n\n" +
+        "import http\n" +
+        "import http_client as client\n" +
+        "import sqlite\n" +
+        "import std.bytes as bytes\n" +
+        "import std.net as net\n" +
+        "import std.parse as parse\n" +
+        "import std.process as process\n" +
+        "import sys\n\n" +
+        "fn test_sqlite_package(db_path: string) {\n" +
+        "    none: []sqlite.SqlValue = []\n" +
+        "    mut db := sqlite.Database::open(db_path, false).unwrap()\n" +
+        "    assert(db.exec_batch(\"CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT, b BLOB);\").is_ok())\n" +
+        "    blob: []u8 = [0, 42, 255]\n" +
+        "    _ := db.exec(\"INSERT INTO kv(k, v, b) VALUES(?, ?, ?)\", &[.Text(\"k1\"), .Text(\"hej\\0nul\"), .Blob(blob.clone())]).unwrap()\n" +
+        "    row := db.query_one(\"SELECT k, v, b FROM kv WHERE k=?\", &[.Text(\"k1\")]).unwrap().unwrap()\n" +
+        "    assert(row.field_text(\"k\").unwrap() == \"k1\")\n" +
+        "    assert(row.field_text(\"v\").unwrap() == \"hej\\0nul\")\n" +
+        "    assert(bytes.equal(&row.field_blob(\"b\").unwrap(), &blob))\n" +
+        "    // Verify error message decoding via std.ffi\n" +
+        "    bad := db.query(\"SELECT * FROM no_such_table\", &none)\n" +
+        "    assert(bad.is_err() && bad.unwrap_err().message().len > 0)\n" +
+        "    assert(db.close().is_ok())\n" +
+        "}\n\n" +
+        "fn run_server(port_file: string) -> i32 {\n" +
+        "    mut listener := net.TcpListener::listen(net.loopback(), 0, 64).unwrap()\n" +
+        "    _ := sys.write_text(port_file, listener.local_port().str())\n" +
+        "    mut handled := 0\n" +
+        "    while handled < 32 {\n" +
+        "        mut stream := match listener.accept() { .Ok(s) => s, .Err(_) => { break } }\n" +
+        "        req := http.read_request(&stream, 65536, 2000)\n" +
+        "        if req.ok {\n" +
+        "            handled += 1\n" +
+        "            empty_s: []string = []\n" +
+        "            if req.target == \"/big\" {\n" +
+        "                mut big: []u8 = []\n" +
+        "                big.reserve(16384)\n" +
+        "                for i in 0..16384 { big.push(u8(i % 251)) }\n" +
+        "                _ := http.write_response(&stream, 200, \"application/octet-stream\", &empty_s, &empty_s, &big, req.method == \"HEAD\")\n" +
+        "            } else if req.target == \"/echo\" {\n" +
+        "                _ := http.write_response(&stream, 200, \"application/octet-stream\", &empty_s, &empty_s, &req.body, req.method == \"HEAD\")\n" +
+        "            } else if req.target == \"/slow\" {\n" +
+        "                sys.sleep_ms(120)\n" +
+        "                ok_body := bytes.from_text(\"slow-ok\")\n" +
+        "                _ := http.write_response(&stream, 200, \"text/plain\", &empty_s, &empty_s, &ok_body, req.method == \"HEAD\")\n" +
+        "            } else if req.target == \"/quit\" {\n" +
+        "                ok_body := bytes.from_text(\"bye\")\n" +
+        "                _ := http.write_response(&stream, 200, \"text/plain\", &empty_s, &empty_s, &ok_body, req.method == \"HEAD\")\n" +
+        "                _ := stream.close()\n" +
+        "                break\n" +
+        "            } else {\n" +
+        "                ok_body := bytes.from_text(\"pong:\" + req.target)\n" +
+        "                _ := http.write_response(&stream, 200, \"text/plain\", &empty_s, &empty_s, &ok_body, req.method == \"HEAD\")\n" +
+        "            }\n" +
+        "        }\n" +
+        "        _ := stream.close()\n" +
+        "    }\n" +
+        "    _ := listener.close()\n" +
+        "    0\n" +
+        "}\n\n" +
+        "struct NestState {\n" +
+        "    origin: string,\n" +
+        "    nested_done: bool,\n" +
+        "}\n\n" +
+        "fn nest_monitor(st: &mut NestState) -> bool {\n" +
+        "    if !st.nested_done {\n" +
+        "        empty_s: []string = []\n" +
+        "        empty_b: []u8 = []\n" +
+        "        inner := client.request(\"GET\", st.origin + \"/inner\", &empty_s, &empty_s, &empty_b, 2000, 4096)\n" +
+        "        assert(inner.ok && inner.status == 200 && bytes.decode(&inner.body).unwrap() == \"pong:/inner\")\n" +
+        "        st.nested_done = true\n" +
+        "    }\n" +
+        "    true\n" +
+        "}\n\n" +
+        "fn test_http_client_and_server(port_file: string) {\n" +
+        "    mut cmd := process.Command::new(sys.arg(0), [\"--serve\", port_file.clone()])\n" +
+        "    mut child := cmd.spawn().unwrap()\n" +
+        "    mut port: i64 = 0\n" +
+        "    for _ in 0..200 {\n" +
+        "        r := sys.read_text(port_file)\n" +
+        "        if r.ok && r.value.len > 0 {\n" +
+        "            port = parse.integer(r.value).value\n" +
+        "            if port > 0 { break }\n" +
+        "        }\n" +
+        "        sys.sleep_ms(10)\n" +
+        "    }\n" +
+        "    assert(port > 0)\n" +
+        "    origin := f\"http://127.0.0.1:{port}\"\n" +
+        "    empty_s: []string = []\n" +
+        "    empty_b: []u8 = []\n" +
+        "    // Repeated requests exercise one-time atomic curl_global_init (never cleaned up mid-flight)\n" +
+        "    for i in 0..16 {\n" +
+        "        r := client.request(\"GET\", f\"{origin}/r{i}\", &empty_s, &empty_s, &empty_b, 3000, 4096)\n" +
+        "        assert(r.ok && r.status == 200 && bytes.decode(&r.body).unwrap() == f\"pong:/r{i}\")\n" +
+        "    }\n" +
+        "    // Large response body (>4096B) exercises @c_layout CallbackContext buffer growth\n" +
+        "    big := client.request(\"GET\", origin + \"/big\", &empty_s, &empty_s, &empty_b, 3000, 32768)\n" +
+        "    assert(big.ok && big.status == 200 && big.body.len == 16384)\n" +
+        "    for i in 0..16384 { assert(big.body[i] == u8(i % 251)) }\n" +
+        "    // Declared Content-Length limit rejection via @c_layout header callback\n" +
+        "    capped := client.request(\"GET\", origin + \"/big\", &empty_s, &empty_s, &empty_b, 3000, 128)\n" +
+        "    assert(!capped.ok && capped.error == \"declared HTTP response exceeds size limit\")\n" +
+        "    // Binary POST with NUL bytes\n" +
+        "    payload: []u8 = [0, 1, 2, 0, 255, 128]\n" +
+        "    echo := client.request(\"POST\", origin + \"/echo\", &empty_s, &empty_s, &payload, 3000, 4096)\n" +
+        "    assert(echo.ok && echo.status == 200 && bytes.equal(&echo.body, &payload))\n" +
+        "    // Nested request while outer monitored request is active (proves no mid-flight curl_global_cleanup!)\n" +
+        "    mut nst := NestState { origin: origin.clone(), nested_done: false }\n" +
+        "    outer := client.request_monitored(\"GET\", origin + \"/slow\", &empty_s, &empty_s, &empty_b, 3000, 4096,\n" +
+        "        fn[&mut nst]() -> bool { nest_monitor(&mut nst) })\n" +
+        "    assert(nst.nested_done && outer.ok && outer.status == 200 && bytes.decode(&outer.body).unwrap() == \"slow-ok\")\n" +
+        "    _ := client.request(\"GET\", origin + \"/quit\", &empty_s, &empty_s, &empty_b, 2000, 1024)\n" +
+        "    _ := child.wait(5000)\n" +
+        "}\n\n" +
+        "fn main() -> i32 {\n" +
+        "    if sys.arg_count() >= 3 && sys.arg(1) == \"--serve\" { return run_server(sys.arg(2)) }\n" +
+        "    test_sqlite_package(sys.arg(1))\n" +
+        "    test_http_client_and_server(sys.arg(2))\n" +
+        "    print(\"packages ok\")\n" +
+        "    0\n" +
+        "}\n"
+
+    if !sys.write_text(pkg_dir + "/main.ddr", probe_src).ok { return harness.fail("cannot write probe main.ddr") }
+
+    bin := work + "/dl_packages_probe"
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["build", "main.ddr", "-o", bin.clone()], pkg_dir, 0, false, 60000, &mut out) {
+        return false
+    }
+    if !harness.run_checked_timeout(bin, [work + "/probe.db", work + "/port.txt"], work, 0, false, 30000, &mut out) {
+        return false
+    }
+    if text.trim(out.stdout_text()) != "packages ok" {
+        return harness.fail("unexpected probe output: " + out.stdout_text())
+    }
+    true
+}
+
+fn check_cross_targets(compiler: string, root: string, work: string) -> bool {
+    mut out := harness.empty_output()
+    targets: []string = ["arm64-macos", "arm64-linux", "x86_64-linux", "x86_64-windows", "wasm32"]
+    for t in &targets {
+        if !harness.run_checked_timeout(compiler, ["check", root + "/stdlib/dl.ddr", "--target", t.clone()], work, 0, false, 30000, &mut out) {
+            return false
+        }
+    }
+    native_targets: []string = ["arm64-macos", "arm64-linux", "x86_64-linux", "x86_64-windows"]
+    for t in &native_targets {
+        if !harness.run_checked_timeout(compiler, ["check", "main.ddr", "--target", t.clone()], root + "/packages/sqlite/tests", 0, false, 30000, &mut out) {
+            return false
+        }
+        if !harness.run_checked_timeout(compiler, ["check", "client.ddr", "--target", t.clone()], root + "/packages/http_client/tests", 0, false, 30000, &mut out) {
+            return false
+        }
+        if !harness.run_checked_timeout(compiler, ["check", "server.ddr", "--target", t.clone()], root + "/packages/http/tests", 0, false, 30000, &mut out) {
+            return false
+        }
+    }
+    true
+}
+
+fn main() -> i32 {
+    cli := harness.parse_cli()
+    if !cli.ok { _ := sys.eprint(cli.error); return 2 }
+    tmp := fs.temp_dir("dunder-dl-pkgs-")
+    if !tmp.ok { return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    ok := check_dl_in_process() &&
+          check_cross_targets(cli.compiler, cli.root, work) &&
+          check_packages_e2e(cli.compiler, cli.root, work)
+    if !ok { return 1 }
+    print("dl tables and packages ok")
+    0
+}

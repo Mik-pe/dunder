@@ -9,6 +9,8 @@ unsafe fn posix_open(path: ptr, flags: i32) -> ptr
 unsafe fn posix_symbol(library: ptr, name: ptr) -> ptr
 @extern("dl", "dlclose") @thread_safe
 unsafe fn posix_close(library: ptr) -> i32
+@extern("dl", "dlerror") @thread_safe
+unsafe fn posix_error() -> ptr
 
 @extern("kernel32.dll", "LoadLibraryW") @thread_safe
 unsafe fn load_library(path: ptr) -> ptr
@@ -20,20 +22,53 @@ unsafe fn get_proc(library: ptr, name: ptr) -> ptr
 unsafe fn free_library(library: ptr) -> i32
 
 pub enum LoadMode {
+    Default,
     Lazy,
     Now,
 }
 
+@thread_safe
+fn mode_tag(mode: LoadMode) -> i32 {
+    match mode {
+        .Default => 0,
+        .Lazy => 1,
+        .Now => 2,
+    }
+}
+
 impl Eq for LoadMode {
-    fn eq(&self, other: &Self) -> bool { mode_flags(self) == mode_flags(other) }
+    fn eq(&self, other: &Self) -> bool { mode_tag(self) == mode_tag(other) }
 }
 
 @thread_safe
 pub fn mode_flags(mode: LoadMode) -> i32 {
     match mode {
+        .Default => 2,
         .Lazy => 1,
         .Now => 2,
     }
+}
+
+@thread_safe
+unsafe fn last_dl_error() -> string {
+    if target_is("windows") {
+        code := ffi.last_os_error()
+        if code != 0 { return f"os error {code}" }
+        return ""
+    } else if target_is("native") {
+        return ffi.from_cstr_lossy(posix_error()).unwrap_or_default()
+    }
+    ""
+}
+
+@thread_safe
+fn join_strings(items: &[]string, sep: string) -> string {
+    mut out := ""
+    for i in 0..items.len {
+        if i > 0 { out = out + sep }
+        out = out + items[i]
+    }
+    out
 }
 
 @thread_safe
@@ -60,25 +95,48 @@ pub unsafe fn open(path: ptr, flags: i32) -> ptr {
 }
 
 @thread_safe
-pub unsafe fn open_with_mode(path: string, mode: LoadMode) -> ptr {
-    if !target_is("native") || path.len == 0 { return ptr(0) }
+unsafe fn open_with_mode_detail(path: string, mode: LoadMode) -> Result<ptr, string> {
+    if !target_is("native") { return .Err("dynamic loading requires a native target") }
+    if path.len == 0 { return .Err("library path must not be empty") }
     if target_is("windows") {
         wide := match ffi.WString::new(path) {
             .Ok(w) => w,
-            .Err(_) => { return ptr(0) },
+            .Err(_) => { return .Err("library path contains interior NUL") },
         }
-        return load_library(wide.as_ptr())
+        h := load_library(wide.as_ptr())
+        if usize(h) == usize(0) {
+            detail := last_dl_error()
+            if detail.len > 0 { return .Err(detail) }
+            return .Err("LoadLibraryW failed")
+        }
+        return .Ok(h)
     }
     cpath := match ffi.CString::new(path) {
         .Ok(c) => c,
-        .Err(_) => { return ptr(0) },
+        .Err(_) => { return .Err("library path contains interior NUL") },
     }
-    posix_open(cpath.as_ptr(), mode_flags(mode))
+    // Clear any stale dlerror before dlopen.
+    _ := posix_error()
+    h := posix_open(cpath.as_ptr(), mode_flags(mode))
+    if usize(h) == usize(0) {
+        detail := last_dl_error()
+        if detail.len > 0 { return .Err(detail) }
+        return .Err("dlopen failed")
+    }
+    .Ok(h)
+}
+
+@thread_safe
+pub unsafe fn open_with_mode(path: string, mode: LoadMode) -> ptr {
+    match open_with_mode_detail(path, mode) {
+        .Ok(h) => h,
+        .Err(_) => ptr(0),
+    }
 }
 
 @thread_safe
 pub unsafe fn open_default(path: string) -> ptr {
-    open_with_mode(path, .Now)
+    open_with_mode(path, .Default)
 }
 
 @thread_safe
@@ -141,9 +199,10 @@ impl Library {
     pub unsafe fn open_with(path: string, mode: LoadMode) -> Result<Self, string> {
         if !target_is("native") { return .Err("dynamic loading requires a native target") }
         if path.len == 0 { return .Err("library path must not be empty") }
-        h := open_with_mode(path.clone(), mode)
-        if usize(h) == usize(0) { return .Err("cannot open dynamic library: " + path) }
-        .Ok(Self { handle: h })
+        match open_with_mode_detail(path.clone(), mode) {
+            .Ok(h) => .Ok(Self { handle: h }),
+            .Err(reason) => .Err("cannot open dynamic library '" + path + "': " + reason),
+        }
     }
 
     @thread_safe
@@ -157,14 +216,27 @@ impl Library {
     }
 
     @thread_safe
-    pub unsafe fn open_any(candidates: &[]string, mode: LoadMode) -> Result<Self, string> {
+    pub unsafe fn open_first(candidates: &[]string, mode: LoadMode) -> Result<Self, string> {
         if !target_is("native") { return .Err("dynamic loading requires a native target") }
+        if candidates.len == 0 { return .Err("cannot open dynamic library: no candidates provided") }
+        mut failures: []string = []
+        failures.reserve(candidates.len)
         for cand in &candidates {
-            if cand.len == 0 { continue }
-            h := open_with_mode(cand.clone(), mode)
-            if usize(h) != usize(0) { return .Ok(Self { handle: h }) }
+            if cand.len == 0 {
+                failures.push("<empty>: library path must not be empty")
+                continue
+            }
+            match open_with_mode_detail(cand.clone(), mode) {
+                .Ok(h) => { return .Ok(Self { handle: h }) },
+                .Err(reason) => { failures.push(cand + ": " + reason) },
+            }
         }
-        .Err("cannot open any candidate dynamic library")
+        .Err("cannot open any candidate dynamic library [" + join_strings(&failures, "; ") + "]")
+    }
+
+    @thread_safe
+    pub unsafe fn open_any(candidates: &[]string, mode: LoadMode) -> Result<Self, string> {
+        Self::open_first(&candidates, mode)
     }
 
     @thread_safe
@@ -173,6 +245,11 @@ impl Library {
         h := open_self()
         if usize(h) == usize(0) { return .Err("cannot open current process image") }
         .Ok(Self { handle: h })
+    }
+
+    @thread_safe
+    pub unsafe fn current_process() -> Result<Self, string> {
+        Self::current()
     }
 
     @thread_safe
@@ -193,6 +270,7 @@ impl Library {
 
     @thread_safe
     pub unsafe fn symbol(&self, name: string) -> Result<ptr, string> {
+        if usize(self.handle) == usize(0) { return .Err("dynamic library is closed") }
         match self.try_symbol(name.clone()) {
             .Some(p) => .Ok(p),
             .None => .Err("missing symbol: " + name),
@@ -200,14 +278,45 @@ impl Library {
     }
 
     @thread_safe
-    pub unsafe fn load_symbols(&self, names: &[]string) -> Result<[]ptr, string> {
+    pub unsafe fn load_required_symbols(&self, names: &[]string) -> Result<[]ptr, string> {
+        if usize(self.handle) == usize(0) {
+            return .Err("cannot load symbols from closed dynamic library")
+        }
         mut out: []ptr = []
         out.reserve(names.len)
+        mut missing: []string = []
         for name in &names {
-            p := self.symbol(name.clone())?
-            out.push(p)
+            match self.try_symbol(name.clone()) {
+                .Some(p) => { out.push(p) },
+                .None => {
+                    if name.len == 0 { missing.push("<empty>") }
+                    else { missing.push(name.clone()) }
+                },
+            }
         }
+        if missing.len == 1 { return .Err("missing required symbol: " + missing[0]) }
+        if missing.len > 1 { return .Err("missing required symbols: " + join_strings(&missing, ", ")) }
         .Ok(out)
+    }
+
+    @thread_safe
+    pub unsafe fn load_optional_symbols(&self, names: &[]string) -> []Option<ptr> {
+        mut out: []Option<ptr> = []
+        out.reserve(names.len)
+        for name in &names {
+            out.push(self.try_symbol(name.clone()))
+        }
+        out
+    }
+
+    @thread_safe
+    pub unsafe fn load_symbols(&self, names: &[]string) -> Result<[]ptr, string> {
+        self.load_required_symbols(&names)
+    }
+
+    @thread_safe
+    pub unsafe fn resolver(&self) -> ProcResolver {
+        ProcResolver::from_library(&self)
     }
 
     @thread_safe
@@ -234,4 +343,234 @@ impl Library {
             }
         }
     }
+}
+
+enum ResolverBackend {
+    Library(ptr),
+    ProcAddr(extern fn(ptr) -> ptr),
+    ContextProcAddr(ptr, extern fn(ptr, ptr) -> ptr),
+}
+
+// Uniform symbol resolver supporting dynamic libraries (dlsym / GetProcAddress),
+// 1-arg proc loaders (eglGetProcAddress / glXGetProcAddress / SDL_GL_GetProcAddress),
+// and 2-arg context proc loaders (vkGetInstanceProcAddr / vkGetDeviceProcAddr).
+pub opaque struct ProcResolver {
+    backend: ResolverBackend,
+}
+
+impl ProcResolver {
+    @thread_safe
+    pub unsafe fn from_library(library: &Library) -> Self {
+        Self { backend: .Library(library.raw_handle()) }
+    }
+
+    @thread_safe
+    pub unsafe fn from_raw_library(handle: ptr) -> Self {
+        Self { backend: .Library(handle) }
+    }
+
+    @thread_safe
+    pub unsafe fn from_proc_addr(get_proc: extern fn(ptr) -> ptr) -> Self {
+        Self { backend: .ProcAddr(get_proc) }
+    }
+
+    @thread_safe
+    pub unsafe fn from_proc_addr_ptr(raw_fn: ptr) -> Result<Self, string> {
+        if !target_is("native") { return .Err("dynamic loading requires a native target") }
+        if usize(raw_fn) == usize(0) { return .Err("proc-address loader pointer is null") }
+        if target_is("native") {
+            f: extern fn(ptr) -> ptr = ffi_fn(raw_fn)
+            return .Ok(Self { backend: .ProcAddr(f) })
+        }
+        .Err("dynamic loading requires a native target")
+    }
+
+    @thread_safe
+    pub unsafe fn from_context_proc_addr(context: ptr, get_proc: extern fn(ptr, ptr) -> ptr) -> Self {
+        Self { backend: .ContextProcAddr(context, get_proc) }
+    }
+
+    @thread_safe
+    pub unsafe fn from_context_proc_addr_ptr(context: ptr, raw_fn: ptr) -> Result<Self, string> {
+        if !target_is("native") { return .Err("dynamic loading requires a native target") }
+        if usize(raw_fn) == usize(0) { return .Err("context proc-address loader pointer is null") }
+        if target_is("native") {
+            f: extern fn(ptr, ptr) -> ptr = ffi_fn(raw_fn)
+            return .Ok(Self { backend: .ContextProcAddr(context, f) })
+        }
+        .Err("dynamic loading requires a native target")
+    }
+
+    @thread_safe
+    pub unsafe fn from_library_proc_addr(library: &Library, loader_symbol: string) -> Result<Self, string> {
+        raw_fn := library.symbol(loader_symbol)?
+        Self::from_proc_addr_ptr(raw_fn)
+    }
+
+    @thread_safe
+    pub unsafe fn from_library_context_proc_addr(library: &Library, loader_symbol: string, context: ptr) -> Result<Self, string> {
+        raw_fn := library.symbol(loader_symbol)?
+        Self::from_context_proc_addr_ptr(context, raw_fn)
+    }
+
+    // Derive a nested context resolver (e.g. resolving vkGetDeviceProcAddr from
+    // a vkGetInstanceProcAddr resolver and binding a VkDevice handle).
+    @thread_safe
+    pub unsafe fn derive_context(&self, loader_symbol: string, context: ptr) -> Result<Self, string> {
+        raw_fn := self.resolve(loader_symbol)?
+        Self::from_context_proc_addr_ptr(context, raw_fn)
+    }
+
+    @thread_safe
+    pub unsafe fn try_resolve(&self, name: string) -> Option<ptr> {
+        if !target_is("native") || name.len == 0 { return .None }
+        if target_is("native") {
+            cname := match ffi.CString::new(name) {
+                .Ok(c) => c,
+                .Err(_) => { return .None },
+            }
+            p := match self.backend {
+                .Library(handle) => symbol(handle, cname.as_ptr()),
+                .ProcAddr(get_proc) => get_proc(cname.as_ptr()),
+                .ContextProcAddr(ctx, get_proc) => get_proc(ctx, cname.as_ptr()),
+            }
+            if usize(p) == usize(0) { return .None }
+            return .Some(p)
+        }
+        .None
+    }
+
+    @thread_safe
+    pub unsafe fn resolve(&self, name: string) -> Result<ptr, string> {
+        match self.try_resolve(name.clone()) {
+            .Some(p) => .Ok(p),
+            .None => .Err("missing symbol: " + name),
+        }
+    }
+
+    @thread_safe
+    pub unsafe fn load_required_symbols(&self, names: &[]string) -> Result<[]ptr, string> {
+        mut out: []ptr = []
+        out.reserve(names.len)
+        mut missing: []string = []
+        for name in &names {
+            match self.try_resolve(name.clone()) {
+                .Some(p) => { out.push(p) },
+                .None => {
+                    if name.len == 0 { missing.push("<empty>") }
+                    else { missing.push(name.clone()) }
+                },
+            }
+        }
+        if missing.len == 1 { return .Err("missing required symbol: " + missing[0]) }
+        if missing.len > 1 { return .Err("missing required symbols: " + join_strings(&missing, ", ")) }
+        .Ok(out)
+    }
+
+    @thread_safe
+    pub unsafe fn load_optional_symbols(&self, names: &[]string) -> []Option<ptr> {
+        mut out: []Option<ptr> = []
+        out.reserve(names.len)
+        for name in &names {
+            out.push(self.try_resolve(name.clone()))
+        }
+        out
+    }
+}
+
+// Ordered fallback chain of ProcResolvers (e.g. device -> instance -> library).
+pub opaque struct ProcChain {
+    resolvers: []ProcResolver,
+}
+
+impl ProcChain {
+    @thread_safe
+    pub fn new() -> Self {
+        Self { resolvers: [] }
+    }
+
+    @thread_safe
+    pub fn from_resolvers(move resolvers: []ProcResolver) -> Self {
+        Self { resolvers: resolvers }
+    }
+
+    @thread_safe
+    pub fn push(&mut self, move resolver: ProcResolver) {
+        self.resolvers.push(resolver)
+    }
+
+    @thread_safe
+    pub fn len(&self) -> i32 { self.resolvers.len }
+
+    @thread_safe
+    pub fn is_empty(&self) -> bool { self.resolvers.len == 0 }
+
+    @thread_safe
+    pub unsafe fn try_resolve(&self, name: string) -> Option<ptr> {
+        if name.len == 0 { return .None }
+        for i in 0..self.resolvers.len {
+            match self.resolvers[i].try_resolve(name.clone()) {
+                .Some(p) => { return .Some(p) },
+                .None => {},
+            }
+        }
+        .None
+    }
+
+    @thread_safe
+    pub unsafe fn resolve(&self, name: string) -> Result<ptr, string> {
+        match self.try_resolve(name.clone()) {
+            .Some(p) => .Ok(p),
+            .None => .Err("missing symbol across resolver chain: " + name),
+        }
+    }
+
+    @thread_safe
+    pub unsafe fn load_required_symbols(&self, names: &[]string) -> Result<[]ptr, string> {
+        mut out: []ptr = []
+        out.reserve(names.len)
+        mut missing: []string = []
+        for name in &names {
+            match self.try_resolve(name.clone()) {
+                .Some(p) => { out.push(p) },
+                .None => {
+                    if name.len == 0 { missing.push("<empty>") }
+                    else { missing.push(name.clone()) }
+                },
+            }
+        }
+        if missing.len == 1 { return .Err("missing required symbol: " + missing[0]) }
+        if missing.len > 1 { return .Err("missing required symbols: " + join_strings(&missing, ", ")) }
+        .Ok(out)
+    }
+
+    @thread_safe
+    pub unsafe fn load_optional_symbols(&self, names: &[]string) -> []Option<ptr> {
+        mut out: []Option<ptr> = []
+        out.reserve(names.len)
+        for name in &names {
+            out.push(self.try_resolve(name.clone()))
+        }
+        out
+    }
+}
+
+@thread_safe
+pub unsafe fn load_required_symbols(library: &Library, names: &[]string) -> Result<[]ptr, string> {
+    library.load_required_symbols(&names)
+}
+
+@thread_safe
+pub unsafe fn load_optional_symbols(library: &Library, names: &[]string) -> []Option<ptr> {
+    library.load_optional_symbols(&names)
+}
+
+@thread_safe
+pub unsafe fn load_proc_symbols(resolver: &ProcResolver, names: &[]string) -> Result<[]ptr, string> {
+    resolver.load_required_symbols(&names)
+}
+
+@thread_safe
+pub unsafe fn load_optional_proc_symbols(resolver: &ProcResolver, names: &[]string) -> []Option<ptr> {
+    resolver.load_optional_symbols(&names)
 }
