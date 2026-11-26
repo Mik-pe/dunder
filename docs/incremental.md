@@ -165,7 +165,9 @@ validerad allokeringsattribuering och en separat vanlig tidsserie.
 
 `test --affected` kör alla grupper första gången. Därefter återanvänder den
 godkända resultat för grupper vars transitivt nåbara funktionskroppar och
-typkontext matchar. Även funktioner som används som värden ingår. En ändrad
+typkontext matchar. Beroendena omfattar även funktionsvärden, jämförelsemetoder,
+`for`-loopars `next`, `Display.str` vid utskrift och resursers städmetoder.
+Om flera typer har en metod med samma namn kan en ändring köra om extra tester. En ändrad
 tidsgräns eller ett ändrat skaläroptimeringsläge ger en ny körning.
 Tester med nåbara systemanrop, råpekare eller
 externa anrop körs varje gång eftersom omvärlden kan ha ändrats.

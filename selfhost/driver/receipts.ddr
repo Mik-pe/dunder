@@ -1,7 +1,9 @@
 capability filesystem
 import cache_io
+import ..bundled
 import cli
 import ..frontend.lexer
+import ..frontend.scalar_rules as rules
 import modules
 import std.bytes as bytes
 import std.text as text
@@ -10,12 +12,22 @@ import ..mir.mir_memory
 
 struct Graph {
     ids: Map<string, i64>, same_next: []i32, body: []string, observable: []bool,
-    first: []i32, end: []i32, edge_start: []i32, edges: []i32,
+    first: []i32, code_start: []i32, end: []i32, edge_start: []i32, edges: []i32,
     context: string, ok: bool,
 }
 fn symbol(t: &lexer.Tokens, i: i32, s: string) -> bool { t.kinds[i] == .Symbol && t.texts[i] == s }
+
+fn add_references(g: &mut Graph, name: string, caller: i32, seen: &mut []i32) {
+    mut dep := i32(g.ids.get_or(name, -1))
+    while dep >= 0 && seen[dep] != caller {
+        seen[dep] = caller
+        g.edges.push(dep)
+        dep = g.same_next[dep]
+    }
+}
+
 fn graph(source: string) -> Graph {
-    mut g := Graph { ids: Map<string, i64>::new(), same_next: [], body: [], observable: [], first: [], end: [],
+    mut g := Graph { ids: Map<string, i64>::new(), same_next: [], body: [], observable: [], first: [], code_start: [], end: [],
         edge_start: [], edges: [], context: "", ok: false }
     t := lexer.scan(source, false)
     if !t.ok { return g }
@@ -23,15 +35,26 @@ fn graph(source: string) -> Graph {
     mut pos := 0
     mut i := 0
     mut external := false
+    mut resource := -1
     while i + 1 < t.kinds.len {
         if symbol(&t, i, "@") && t.texts[i + 1] == "extern" { external = true }
-        if t.kinds[i] != .Keyword || t.texts[i] != "fn" || t.kinds[i + 1] != .Name { i += 1; continue }
+        if symbol(&t, i, "@") && t.texts[i + 1] == "resource" { resource = i }
+        is_type := t.kinds[i] == .Keyword && (t.texts[i] == "struct" || t.texts[i] == "enum")
+        if (!is_type && (t.kinds[i] != .Keyword || t.texts[i] != "fn")) || t.kinds[i + 1] != .Name { i += 1; continue }
+        mut open := i + 2
+        if !external {
+            while open < t.kinds.len && !symbol(&t, open, "{") && !symbol(&t, open, "}") &&
+                !(t.kinds[open] == .Keyword && t.texts[open] == "fn" && open + 1 < t.kinds.len && t.kinds[open + 1] == .Name) { open += 1 }
+            if open >= t.kinds.len { return g }
+            if !symbol(&t, open, "{") { i = open; continue }
+        }
         name := t.texts[i + 1].clone()
         prev := i32(g.ids.get_or(name, -1))
         g.same_next.push(prev)
         g.ids.put(move name, i64(g.body.len))
         if external {
             g.first.push(0)
+            g.code_start.push(0)
             g.end.push(0)
             g.body.push("")
             g.observable.push(true)
@@ -39,9 +62,6 @@ fn graph(source: string) -> Graph {
             i += 2
             continue
         }
-        mut open := i + 2
-        while open < t.kinds.len && !symbol(&t, open, "{") { open += 1 }
-        if open >= t.kinds.len { return g }
         mut end := open + 1
         mut depth := 1
         mut effects := i > 0 && t.texts[i - 1] == "unsafe"
@@ -55,22 +75,37 @@ fn graph(source: string) -> Graph {
             end += 1
         }
         if depth != 0 { return g }
-        bytes.append_utf8(&mut shared, source[pos..t.ends[open]])
-        pos = t.starts[end - 1]
-        g.body.push(cache_io.digest(source[t.starts[open]..t.ends[end - 1]]))
-        g.first.push(open + 1)
+        if is_type {
+            g.body.push("")
+            g.first.push(if resource >= 0 { resource } else { i + 2 })
+            g.code_start.push(end)
+            resource = -1
+        } else {
+            bytes.append_utf8(&mut shared, source[pos..t.ends[open]])
+            pos = t.starts[end - 1]
+            g.body.push(cache_io.digest(source[t.starts[open]..t.ends[end - 1]]))
+            g.first.push(i + 2)
+            g.code_start.push(open + 1)
+        }
         g.end.push(end - 1)
         g.observable.push(effects)
         i = end
     }
     bytes.append_utf8(&mut shared, source[pos..source.len])
     g.context = cache_io.binary_hash(&shared)
+    mut seen: []i32 = []; for _ in 0..g.body.len { seen.push(-1) }
     for f in 0..g.body.len {
         g.edge_start.push(g.edges.len)
         for token in g.first[f]..g.end[f] {
             if t.kinds[token] == .Name {
-                mut dep := i32(g.ids.get_or(t.texts[token], -1))
-                while dep >= 0 { g.edges.push(dep); dep = g.same_next[dep] }
+                add_references(&mut g, t.texts[token], f, &mut seen)
+                if t.texts[token] == "print" { add_references(&mut g, "str", f, &mut seen) }
+            } else if token < g.code_start[f] { continue }
+            else if t.kinds[token] == .Symbol {
+                op := rules.opcode(t.texts[token])
+                if op >= 6 && op <= 11 { add_references(&mut g, rules.comparison_method(op), f, &mut seen) }
+            } else if t.kinds[token] == .Keyword && t.texts[token] == "for" {
+                add_references(&mut g, "next", f, &mut seen)
             }
         }
     }
@@ -138,7 +173,8 @@ pub fn keys_configured(loaded: &modules.Loaded, output: string, platform: i32, t
     if keys.len == 0 || loaded.calls.len != keys.len { return keys }
     root := cache_io.root(loaded.paths[0]); if root == "" { return keys }
     compiler := cache_io.compiler(platform); if compiler == "" { return keys }
-    g := graph(loaded.source); if !g.ok { return keys }
+    g := graph(bundled.core_prelude() + "\n" + bundled.generic_prelude() + "\n" + bundled.combinators_prelude() + "\n" + loaded.source)
+    if !g.ok { return keys }
     mut caps := loaded.module_caps.len.str()
     for cap in &loaded.module_caps { caps += f",{cap}" }
     env := f"dunder-passes-v2:{compiler}:{platform}:{timeout_ms}:caps={caps}:{policy_tag(&config)}"
