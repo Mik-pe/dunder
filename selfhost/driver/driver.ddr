@@ -17,8 +17,11 @@ import receipts
 import shim
 import ..backend.dwarf
 import ..backend.elf
+import ..backend.imports
 import ..backend.macho
 import ..backend.pe
+import manifest
+import paths
 import lsp
 import std.fs as fs
 import std.array as array
@@ -174,47 +177,150 @@ pub fn default_emitter_config() -> EmitterConfig {
     }
 }
 
+fn resolve_project_path(project_dir: string, raw: string) -> string {
+    if raw == "" || paths.is_absolute(raw) || project_dir == "" { return raw.clone() }
+    paths.join(project_dir, raw)
+}
+
+fn resolve_lib_overrides(entries: &[]manifest.NativeLibOverride, platform: i32) -> []imports.LibraryOverride {
+    mut keys: []string = []
+    mut best_idx: []i32 = []
+    mut best_prio: []i32 = []
+    for i in 0..entries.len {
+        entry := &entries[i]
+        if !manifest.target_key_matches(platform, entry.target) { continue }
+        prio := manifest.target_key_priority(entry.target)
+        mut found := -1
+        for k in 0..keys.len {
+            if keys[k] == entry.key { found = k; break }
+        }
+        if found < 0 {
+            keys.push(entry.key.clone())
+            best_idx.push(i)
+            best_prio.push(prio)
+        } else if prio >= best_prio[found] {
+            best_idx[found] = i
+            best_prio[found] = prio
+        }
+    }
+    mut out: []imports.LibraryOverride = []
+    out.reserve(best_idx.len)
+    for idx in &best_idx {
+        e := &entries[idx]
+        out.push(imports.LibraryOverride {
+            key: e.key.clone(),
+            path: e.path.clone(),
+            framework: e.framework.clone(),
+            soname: e.soname.clone(),
+            dll: e.dll.clone(),
+            weak: e.weak,
+            delay: e.delay,
+        })
+    }
+    out
+}
+
+fn build_emitter_config(options: &cli.Options, platform: i32, err: &mut string) -> EmitterConfig {
+    mut cfg := default_emitter_config()
+    project_dir := if options.deps.pkg_dirs.len > 0 { options.deps.pkg_dirs[0].clone() } else { "" }
+
+    mut rpaths: []string = []
+    for rp in &options.native_config.rpath { rpaths.push(rp.clone()) }
+    for rp in &options.rpaths { rpaths.push(rp.clone()) }
+
+    libc_str := if options.libc != "" { options.libc.clone() } else { options.native_config.libc.clone() }
+    libc: imports.LibcAbi = if libc_str == "musl" { .Musl } else { .Glibc }
+
+    overrides := resolve_lib_overrides(&options.native_libs, platform)
+
+    mut entitlements_xml := ""
+    if platform == 0 && options.app_config.entitlements != "" {
+        ent_path := resolve_project_path(project_dir.clone(), options.app_config.entitlements.clone())
+        ent_file := sys.read_text(ent_path.clone())
+        if !ent_file.ok {
+            err = "cannot read entitlements file " + ent_path + ": " + sys.error_message(ent_file.error)
+            return cfg
+        }
+        entitlements_xml = ent_file.value
+    }
+
+    cfg.macho.rpaths = rpaths.clone()
+    cfg.macho.entitlements = entitlements_xml.clone()
+    if options.app_config.bundle_id != "" {
+        cfg.macho.identifier = options.app_config.bundle_id.clone()
+    }
+    cfg.macho.overrides = overrides.clone()
+
+    cfg.elf.libc = libc
+    cfg.elf.rpaths = rpaths.clone()
+    cfg.elf.overrides = overrides.clone()
+
+    sub_str := if options.subsystem != "" { options.subsystem.clone() } else { options.app_config.subsystem.clone() }
+    if sub_str == "gui" { cfg.pe.subsystem = pe.subsystem_gui() }
+    else { cfg.pe.subsystem = pe.subsystem_console() }
+    if options.app_config.dpi_aware_set { cfg.pe.dpi_aware = options.app_config.dpi_aware }
+    if options.app_config.utf8_set { cfg.pe.utf8_codepage = options.app_config.utf8 }
+    cfg.pe.overrides = overrides
+
+    cfg.bundle.bundle_id = options.app_config.bundle_id.clone()
+    cfg.bundle.entitlements = entitlements_xml
+    for fw in &options.app_config.frameworks {
+        cfg.bundle.frameworks.push(resolve_project_path(project_dir.clone(), fw.clone()))
+    }
+    cfg
+}
+
 fn emit_native_image(loaded: &modules.Loaded, result: &compiler.Result, platform: i32,
                      debug_info: bool, input_path: string, signer: &macho.Signer,
                      emitter: &EmitterConfig) -> []u8 {
     has_dynamic := result.imports.symbols.len > 0 || result.imports.globals > 0
+    macho_dynamic := has_dynamic || emitter.macho.rpaths.len > 0 || emitter.macho.entitlements != ""
+    specs := imports.from_legacy(&result.imports.libraries, &result.imports.symbols, result.imports.env_source_slot)
     if debug_info {
-        macho_text_off := if platform == 0 && has_dynamic {
-            macho.dynamic_text_offset(&result.imports.libraries, &result.imports.symbols, result.imports.globals, true, &emitter.macho)
+        macho_text_off := if platform == 0 && macho_dynamic {
+            macho.dynamic_text_offset_for(&specs, result.imports.globals, true, &emitter.macho)
         } else {
             macho.code_page_bytes()
         }
         dbg_bundle := build_dwarf_bundle(&loaded, &result.debug, result.text.len, platform, input_path, macho_text_off)
-        if has_dynamic {
-            if platform == 0 {
-                return macho.dynamic_storage_debug_using(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, result.imports.globals, &dbg_bundle, &signer)
-            } else if platform == 2 {
-                base_elf := elf.dynamic_storage_env(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 62, result.imports.globals, result.imports.env_source_slot)
-                return elf.attach_debug(&base_elf, result.text.len, &dbg_bundle)
-            } else {
-                base_elf := elf.dynamic_storage_env(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 183, result.imports.globals, result.imports.env_source_slot)
-                return elf.attach_debug(&base_elf, result.text.len, &dbg_bundle)
+        if platform == 0 {
+            if macho_dynamic {
+                return macho.dynamic_storage_debug_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, result.imports.globals, &dbg_bundle, &emitter.macho, &signer)
             }
+            return macho.image_debug_using(&result.text, &dbg_bundle, &signer)
         } else if platform == 2 {
-            base_elf := elf.image_for(&result.text, 62)
-            return elf.attach_debug(&base_elf, result.text.len, &dbg_bundle)
-        } else if platform == 1 {
-            base_elf := elf.image(&result.text)
+            base_elf := if has_dynamic {
+                elf.dynamic_image_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, 62, result.imports.globals, &emitter.elf)
+            } else {
+                elf.image_for(&result.text, 62)
+            }
             return elf.attach_debug(&base_elf, result.text.len, &dbg_bundle)
         } else {
-            return macho.image_debug_using(&result.text, &dbg_bundle, &signer)
+            base_elf := if has_dynamic {
+                elf.dynamic_image_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, 183, result.imports.globals, &emitter.elf)
+            } else {
+                elf.image(&result.text)
+            }
+            return elf.attach_debug(&base_elf, result.text.len, &dbg_bundle)
         }
     }
-    if has_dynamic {
-        if platform == 0 { return macho.dynamic_storage_using(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, result.imports.globals, &signer) }
-        else if platform == 5 { return pe.image(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, result.imports.globals) }
-        else if platform == 2 { return elf.dynamic_storage_env(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 62, result.imports.globals, result.imports.env_source_slot) }
-        else { return elf.dynamic_storage_env(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, 183, result.imports.globals, result.imports.env_source_slot) }
+    if platform == 5 {
+        return pe.image_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, result.imports.globals, &emitter.pe)
     }
-    if platform == 5 { return pe.image(&result.text, &result.imports.libraries, &result.imports.symbols, &result.imports.sites, &result.imports.slots, result.imports.globals) }
+    if platform == 0 {
+        if macho_dynamic {
+            return macho.dynamic_storage_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, result.imports.globals, &emitter.macho, &signer)
+        }
+        return macho.image_using(&result.text, &signer)
+    }
+    if has_dynamic {
+        if platform == 2 {
+            return elf.dynamic_image_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, 62, result.imports.globals, &emitter.elf)
+        }
+        return elf.dynamic_image_configured(&result.text, &specs, &result.imports.sites, &result.imports.slots, 183, result.imports.globals, &emitter.elf)
+    }
     if platform == 2 { return elf.image_for(&result.text, 62) }
-    if platform == 1 { return elf.image(&result.text) }
-    macho.image_using(&result.text, &signer)
+    elf.image(&result.text)
 }
 
 fn failure(message: string) -> i32 {
@@ -445,7 +551,9 @@ pub fn build_configured(default_target: i32, default_workers: i32, supports_work
     mut compile_finished: i64 = 0
     if options.timings { compile_finished = time.monotonic_ns() }
     signer := macho.Signer { workers: compile_jobs, digest: digest_pages }
-    emitter := default_emitter_config()
+    mut emitter_err := ""
+    emitter := if is_wasm { default_emitter_config() } else { build_emitter_config(&options, platform, &mut emitter_err) }
+    if emitter_err != "" { return failure(emitter_err) }
     mut image: []u8 = []
     if is_wasm { image = result.text }
     else { image = emit_native_image(&loaded, &result, platform, options.debug_info, options.input, &signer, &emitter) }
