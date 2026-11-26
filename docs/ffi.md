@@ -729,9 +729,9 @@ filnamn eller `/System/Library/Frameworks/...`-sökvägar.
 | `pthread` | `/usr/lib/libSystem.B.dylib` | `libpthread.so.0` | `libc.musl-<arch>.so.1` | — |
 | `objc` | `/usr/lib/libobjc.A.dylib` | — | — | — |
 | `metal` | `/System/Library/Frameworks/Metal.framework/Versions/A/Metal` | — | — | — |
-| `appkit` | `/System/Library/Frameworks/AppKit.framework/Versions/A/AppKit` | — | — | — |
+| `appkit` | `/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit` | — | — | — |
 | `cocoa` | `/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa` | — | — | — |
-| `foundation` | `/System/Library/Frameworks/Foundation.framework/Versions/A/Foundation` | — | — | — |
+| `foundation` | `/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation` | — | — | — |
 | `quartzcore` | `/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore` | — | — | — |
 | `coregraphics` | `/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics` | — | — | — |
 | `corevideo` | `/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo` | — | — | — |
