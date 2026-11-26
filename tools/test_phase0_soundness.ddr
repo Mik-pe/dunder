@@ -1,0 +1,451 @@
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.fs as fs
+import std.process as process
+import std.text as text
+import sys
+
+fn check_rejected(compiler: string, work: string, name: string, source: string, expected: string, checks: &mut i32) -> bool {
+    path := f"{work}/{name}.ddr"
+    image := f"{work}/{name}.bin"
+    if !sys.write_text(path, source + "\n").ok { return harness.fail(f"cannot write {path}") }
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", path.clone(), "--agent", "--jobs", "1"], work, 1, false, 60000, &mut out) {
+        return false
+    }
+    if harness.agent_error_message(out.stdout_text(), path, expected, "").len == 0 { return false }
+    if !harness.run_checked_timeout(compiler, ["build", path.clone(), "--jobs", "1", "-o", image.clone()], work, 1, false, 60000, &mut out) {
+        return false
+    }
+    if !text.contains(out.stderr_text(), expected) {
+        return harness.fail(f"{name}: build diagnostic missing '{expected}'\n{out.stderr_text()}")
+    }
+    checks += 1
+    true
+}
+
+fn check_runs(compiler: string, work: string, name: string, source: string, expected_exit: i32, expected_stdout: string, checks: &mut i32) -> bool {
+    path := f"{work}/{name}.ddr"
+    image := f"{work}/{name}.bin"
+    if !sys.write_text(path, source + "\n").ok { return harness.fail(f"cannot write {path}") }
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", path.clone(), "--jobs", "1"], work, 0, false, 60000, &mut out) {
+        return false
+    }
+    if !harness.run_checked_timeout(compiler, ["build", path.clone(), "--jobs", "1", "-o", image.clone()], work, 0, false, 60000, &mut out) {
+        return false
+    }
+    if !harness.run_checked_timeout(image, [], work, expected_exit, false, 60000, &mut out) {
+        return false
+    }
+    if expected_stdout.len > 0 && !harness.stdout_is(&out, expected_stdout, name) { return false }
+    checks += 1
+    true
+}
+
+fn invalid_cases() -> [](string, string, string) {
+    [
+        // S-1: Option<&mut T> call aliasing
+        ("s1_opt_mut_str_alias",
+            "fn clash(dst: Option<&mut string>, view: &str) -> i32 { match move dst { .Some(s) => { s = \"replaced-buffer\" }, .None => {} }; view.len }\n" +
+            "fn main() { mut s := \"hello\" + \" world\"; _ := clash(.Some(&mut s), s.as_str()) }",
+            "borrowed"),
+        ("s1_opt_mut_slice_alias",
+            "fn clash(dst: Option<&mut []i32>, view: &[]i32) -> i32 { match move dst { .Some(v) => { v.clear() }, .None => {} }; view.len }\n" +
+            "fn main() { mut v: []i32 = [1, 2, 3]; _ := clash(.Some(&mut v), &v[0..2]) }",
+            "borrowed"),
+
+        // S-2: std.alloc opacity
+        ("s2_alloc_ownedbuf_opaque",
+            "import std.alloc as alloc\n" +
+            "fn main() {\n" +
+            "    mut b := alloc.OwnedBuf<alloc.Global>::with_capacity(alloc.Global {}, usize(8)).unwrap()\n" +
+            "    b.len = usize(4096)\n" +
+            "}",
+            "opaque"),
+        ("s2_alloc_layout_opaque",
+            "import std.alloc as alloc\n" +
+            "fn main() {\n" +
+            "    mut l := alloc.Layout::bytes(usize(8)).unwrap()\n" +
+            "    l.size = usize(99)\n" +
+            "}",
+            "opaque"),
+
+        // S-3: &mut alias intra-expr aliasing
+        ("s3_mut_alias_call",
+            "fn grow(v: &mut []i32) -> i32 { for i in 0..32 { v.push(i) }; v.len }\n" +
+            "fn use_both(a: &i32, b: i32) -> i32 { a + b }\n" +
+            "fn bounce(r: &mut []i32) -> i32 { use_both(&r[0], grow(&mut r)) }\n" +
+            "fn main() { mut v: []i32 = [10]; _ := bounce(&mut v) }",
+            "borrowed"),
+        ("s3_mut_alias_slice",
+            "fn grow(v: &mut []i32) -> i32 { for i in 0..32 { v.push(i) }; 1 }\n" +
+            "fn bounce(r: &mut []i32) -> i32 { sl := &r[0..grow(&mut r)]; sl.len }\n" +
+            "fn main() { mut v: []i32 = [10, 20]; _ := bounce(&mut v) }",
+            "borrowed"),
+        ("s3_mut_alias_struct",
+            "struct Pair { a: &i32, b: i32 }\n" +
+            "fn grow(v: &mut []i32) -> i32 { for i in 0..32 { v.push(i) }; v.len }\n" +
+            "fn bounce(r: &mut []i32) -> i32 { p := Pair { a: &r[0], b: grow(&mut r) }; p.a + p.b }\n" +
+            "fn main() { mut v: []i32 = [10]; _ := bounce(&mut v) }",
+            "cannot mutate the source of a stored borrow"),
+
+        // S-4: temporary Iterator with stored borrow
+        ("s4_temp_graphemes_uaf",
+            "import std.text as text\n" +
+            "fn main() {\n" +
+            "    mut s := \"alpha\" + \"-beta\"\n" +
+            "    for g in text.graphemes(s.as_str()) {\n" +
+            "        s = \"overwritten\"\n" +
+            "        _ := g.as_str().len\n" +
+            "    }\n" +
+            "}",
+            "borrowed"),
+        ("s4_temp_custom_iter_uaf",
+            "struct Cursor { items: &[]i32, idx: i32 }\n" +
+            "impl Iterator for Cursor {\n" +
+            "    fn next(&mut self) -> Option<&i32> from self.items {\n" +
+            "        if self.idx >= self.items.len { return .None }\n" +
+            "        i := self.idx; self.idx += 1\n" +
+            "        .Some(&self.items[i])\n" +
+            "    }\n" +
+            "}\n" +
+            "fn scan(xs: &[]i32) -> Cursor from xs { Cursor { items: xs, idx: 0 } }\n" +
+            "fn main() {\n" +
+            "    mut v: []i32 = [1, 2, 3]\n" +
+            "    for x in scan(&v) { v.clear(); _ := x }\n" +
+            "}",
+            "borrowed"),
+
+        // S-5: defer early-exit use-after-move (moved before defer, re-initialized only on fallthrough)
+        ("s5_defer_return_uam",
+            "fn run(flag: bool) {\n" +
+            "    mut s: []i32 = [1, 2, 3]\n" +
+            "    _ := move s\n" +
+            "    defer { _ := s[0] }\n" +
+            "    if flag { return }\n" +
+            "    s = [4, 5, 6]\n" +
+            "}\n" +
+            "fn main() { run(false); run(true) }",
+            "moved"),
+        ("s5_defer_try_uam",
+            "fn might_fail(yes: bool) -> Result<i32, i32> { if yes { return .Err(1) }; .Ok(0) }\n" +
+            "fn run(yes: bool) -> Result<i32, i32> {\n" +
+            "    mut s: []i32 = [1, 2, 3]\n" +
+            "    _ := move s\n" +
+            "    defer { _ := s[0] }\n" +
+            "    _ := might_fail(yes)?\n" +
+            "    s = [4, 5, 6]\n" +
+            "    .Ok(0)\n" +
+            "}\n" +
+            "fn main() { _ := run(true) }",
+            "moved"),
+        ("s5_defer_break_uam",
+            "fn main() {\n" +
+            "    for i in 0..2 {\n" +
+            "        mut s: []i32 = [1, 2, 3]\n" +
+            "        _ := move s\n" +
+            "        defer { _ := s[0] }\n" +
+            "        if i == 0 { break }\n" +
+            "        s = [4, 5, 6]\n" +
+            "    }\n" +
+            "}",
+            "moved"),
+        ("s5_defer_continue_uam",
+            "fn main() {\n" +
+            "    for i in 0..2 {\n" +
+            "        mut s: []i32 = [1, 2, 3]\n" +
+            "        _ := move s\n" +
+            "        defer { _ := s[0] }\n" +
+            "        if i == 0 { continue }\n" +
+            "        s = [4, 5, 6]\n" +
+            "    }\n" +
+            "}",
+            "moved"),
+
+        // S-6: &str == / != aliasing
+        ("s6_str_eq_uaf",
+            "fn nuke(s: &mut string) -> &str from s { s = \"other\"; s.as_str() }\n" +
+            "fn main() {\n" +
+            "    mut s := \"hello\" + \"-world\"\n" +
+            "    _ := s.as_str() == nuke(&mut s)\n" +
+            "}",
+            "borrowed"),
+        ("s6_str_ne_uaf",
+            "fn nuke(s: &mut string) -> &str from s { s = \"other\"; s.as_str() }\n" +
+            "fn main() {\n" +
+            "    mut s := \"hello\" + \"-world\"\n" +
+            "    _ := s.as_str() != nuke(&mut s)\n" +
+            "}",
+            "borrowed"),
+
+        // S-9: @resource(dispose) destructuring forbidden in safe code
+        ("s9_destructure_dispose",
+            "@resource(dispose)\n" +
+            "struct Guard { id: i32 }\n" +
+            "impl Guard { fn dispose(&mut self) {} }\n" +
+            "fn main() {\n" +
+            "    g := Guard { id: 1 }\n" +
+            "    Guard { id } := move g\n" +
+            "    _ := id\n" +
+            "}",
+            "requires unsafe"),
+
+        // S-10: Sync trait, unsafe impl Sendable/Sync, Published<T: Sendable + Sync>, task scope shared
+        ("s10_safe_sendable_resource",
+            "@resource(dispose)\n" +
+            "pub opaque struct Res { x: i32 }\n" +
+            "impl Res { fn dispose(&mut self) {} }\n" +
+            "impl Sendable for Res {}\n" +
+            "fn main() {}",
+            "requires 'unsafe impl'"),
+        ("s10_safe_sync_resource",
+            "@resource(dispose)\n" +
+            "pub opaque struct Res { x: i32 }\n" +
+            "impl Res { fn dispose(&mut self) {} }\n" +
+            "impl Sync for Res {}\n" +
+            "fn main() {}",
+            "requires 'unsafe impl'"),
+        ("s10_unsafe_impl_needs_cap",
+            "@resource(dispose)\n" +
+            "pub opaque struct Res { x: i32 }\n" +
+            "impl Res { fn dispose(&mut self) {} }\n" +
+            "unsafe impl Sendable for Res {}\n" +
+            "fn main() {}",
+            "capability unsafe"),
+        ("s10_published_file_not_sync",
+            "capability filesystem\n" +
+            "import std.fs as fs\n" +
+            "import std.sync as sync\n" +
+            "fn bad(move f: fs.File) { _ := sync.Published<fs.File>::new(move f) }\n" +
+            "fn main() {}",
+            "does not satisfy Sync"),
+        ("s10_published_tcp_not_sync",
+            "capability network\n" +
+            "import std.net as net\n" +
+            "import std.sync as sync\n" +
+            "fn bad(move s: net.TcpStream) { _ := sync.Published<net.TcpStream>::new(move s) }\n" +
+            "fn main() {}",
+            "does not satisfy Sync"),
+        ("s10_shared_task_not_sync",
+            "capability unsafe\n" +
+            "@resource(dispose)\n" +
+            "pub opaque struct SendOnly { fd: i32 }\n" +
+            "impl SendOnly { fn dispose(&mut self) {} }\n" +
+            "unsafe impl Sendable for SendOnly {}\n" +
+            "struct Wrap { r: SendOnly }\n" +
+            "fn worker(n: i32, w: &Wrap) -> i32 { n + w.r.fd }\n" +
+            "fn main() {\n" +
+            "    w := Wrap { r: SendOnly { fd: 1 } }\n" +
+            "    task scope j(1, shared w) { _ := j.spawn(worker, 2) }\n" +
+            "}",
+            "requires Sync"),
+        ("s10_safe_opaque_ptr_rejected",
+            "opaque struct Bad { p: ptr }\n" +
+            "impl Sync for Bad {}\n" +
+            "fn main() {}",
+            "cannot implement Sync"),
+
+        // S-11: Fn closure capturing non-Clone @resource
+        ("s11_fn_captures_resource",
+            "@resource(dispose)\n" +
+            "struct Token { id: i32 }\n" +
+            "impl Token { fn dispose(&mut self) {} }\n" +
+            "fn main() {\n" +
+            "    t := Token { id: 1 }\n" +
+            "    f := fn[t: Token]() -> i32 { t.id }\n" +
+            "    f2 := f.clone()\n" +
+            "    _ := f() + f2()\n" +
+            "}",
+            "non-cloneable"),
+
+        // S-12: scratch borrow raw-address escape via closure
+        ("s12_scratch_closure_escape",
+            "capability unsafe\n" +
+            "fn main() {\n" +
+            "    dummy := 0\n" +
+            "    unsafe {\n" +
+            "        mut escaped := ptr(0)\n" +
+            "        region scratch(256) {\n" +
+            "            mut a: []i32 = scratch.alloc(4)\n" +
+            "            a[0] = 42\n" +
+            "            f := fn[&dummy](p: &i32) -> ptr { unsafe { addr(&p) } }\n" +
+            "            escaped = f(&a[0])\n" +
+            "        }\n" +
+            "        _ := escaped\n" +
+            "    }\n" +
+            "}",
+            "scratch borrow reaches a raw address"),
+
+        // S-13: sys.net_* requires unsafe
+        ("s13_sys_net_close_unsafe",
+            "capability network\n" +
+            "import sys\n" +
+            "fn main() { _ := sys.net_close(1) }",
+            "unsafe"),
+
+        // Cliff 1 negative control: aliasing through match-moved &mut binding is still rejected
+        ("c1_match_move_mut_alias_rejected",
+            "fn clash(a: &mut []i32, b: &[]i32) -> i32 { a.push(1); b.len }\n" +
+            "fn main() {\n" +
+            "    mut xs: []i32 = [1, 2]\n" +
+            "    opt: Option<&mut []i32> = .Some(&mut xs)\n" +
+            "    match move opt {\n" +
+            "        .Some(m) => { _ := clash(&mut m, &m) },\n" +
+            "        .None => {},\n" +
+            "    }\n" +
+            "}",
+            "alias another borrow"),
+    ]
+}
+
+fn check_runtime_cases(compiler: string, work: string, checks: &mut i32) -> bool {
+    // S-7: concurrent workers + C qsort callback invoking heap-allocating Dunder callback
+    s7_prog := "capability unsafe\n" +
+        "import std.sync as sync\n" +
+        "@extern(\"c\", \"qsort\")\n" +
+        "@thread_safe\n" +
+        "unsafe fn c_qsort(base: ptr, nmemb: usize, size: usize, cmp: extern fn(ptr, ptr) -> i32)\n" +
+        "fn cmp_i32(a: ptr, b: ptr) -> i32 {\n" +
+        "    mut va: i32 = 0; mut vb: i32 = 0\n" +
+        "    unsafe { va = load_i32(a); vb = load_i32(b) }\n" +
+        "    s := va.str() + \":\" + vb.str()\n" +
+        "    if s.len == 0 { return 0 }\n" +
+        "    if va < vb { -1 } else if va > vb { 1 } else { 0 }\n" +
+        "}\n" +
+        "fn worker(n: i32) -> i32 {\n" +
+        "    mut acc: i32 = 0\n" +
+        "    for i in 0..200 {\n" +
+        "        mut xs: []i32 = [i + n, i, n]\n" +
+        "        acc += xs[0] + xs[1]\n" +
+        "    }\n" +
+        "    acc\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut nums: []i32 = [9, 1, 7, 3, 5, 2, 8, 4, 6, 0]\n" +
+        "    task scope s(4) {\n" +
+        "        a := s.spawn(worker, 1)\n" +
+        "        b := s.spawn(worker, 2)\n" +
+        "        c := s.spawn(worker, 3)\n" +
+        "        d := s.spawn(worker, 4)\n" +
+        "        unsafe { c_qsort(addr(&mut nums[0]), usize(nums.len), usize(4), callback(cmp_i32)) }\n" +
+        "        assert(a.join() + b.join() + c.join() + d.join() == 161200)\n" +
+        "    }\n" +
+        "    assert(nums[0] == 0 && nums[9] == 9)\n" +
+        "    print(\"s7_ok\")\n" +
+        "}"
+    if !check_runs(compiler, work, "s7_callback_frames", s7_prog, 0, "s7_ok\n", &mut checks) { return false }
+
+    // S-8: task scope joins BEFORE outer defer on early exit
+    s8_prog := "import std.sync as sync\n" +
+        "import sys\n" +
+        "fn mark_done(move flag: sync.AtomicI64) -> i32 {\n" +
+        "    sys.sleep_ms(30)\n" +
+        "    flag.store(1)\n" +
+        "    1\n" +
+        "}\n" +
+        "fn run(flag: &sync.AtomicI64) -> i64 {\n" +
+        "    mut observed: i64 = -1\n" +
+        "    defer {\n" +
+        "        observed = flag.load()\n" +
+        "        print(f\"defer={observed}\")\n" +
+        "    }\n" +
+        "    task scope s(1) {\n" +
+        "        _ := s.spawn(mark_done, flag.clone_handle())\n" +
+        "        return 7\n" +
+        "    }\n" +
+        "    0\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    f := sync.AtomicI64::new(0)\n" +
+        "    assert(run(&f) == 7)\n" +
+        "    assert(f.load() == 1)\n" +
+        "}"
+    if !check_runs(compiler, work, "s8_task_join_before_defer", s8_prog, 0, "defer=1\n", &mut checks) { return false }
+
+    // S-10 positive: safe opaque struct with impl Sendable + impl Sync + Published<T> + AtomicI64
+    s10_prog := "import std.sync as sync\n" +
+        "pub opaque struct SafeBox { label: string, count: i32 }\n" +
+        "impl SafeBox {\n" +
+        "    pub fn new(move label: string, count: i32) -> Self { Self { label: label, count: count } }\n" +
+        "    pub fn value(&self) -> i32 { self.count + self.label.len }\n" +
+        "}\n" +
+        "impl Sendable for SafeBox {}\n" +
+        "impl Sync for SafeBox {}\n" +
+        "fn read_pub(move p: sync.Published<SafeBox>, b: &SafeBox) -> i32 { g := p.read(); g.get().value() + b.value() }\n" +
+        "fn read_shared(n: i32, b: &SafeBox) -> i32 { n + b.value() }\n" +
+        "fn main() {\n" +
+        "    p := sync.Published<SafeBox>::new(SafeBox::new(\"abc\", 39))\n" +
+        "    a := sync.AtomicI64::new(10)\n" +
+        "    pa := sync.Published<sync.AtomicI64>::new(move a)\n" +
+        "    task scope s(2, shared SafeBox::new(\"xy\", 8)) {\n" +
+        "        t1 := s.spawn(read_pub, p.clone_handle())\n" +
+        "        t2 := s.spawn(read_shared, 5)\n" +
+        "        assert(t1.join() == 52 && t2.join() == 15)\n" +
+        "    }\n" +
+        "    g := pa.read()\n" +
+        "    assert(g.get().load() == 10)\n" +
+        "    print(\"s10_ok\")\n" +
+        "}"
+    if !check_runs(compiler, work, "s10_sync_positive", s10_prog, 0, "s10_ok\n", &mut checks) { return false }
+
+    // R-2 (#8.8): bounded TYPE_DESC_TABLE traps with exit 112 on out-of-bounds negative RC
+    r2_prog := "capability unsafe\n" +
+        "import std.sync as sync\n" +
+        "struct Item { name: string, items: []string }\n" +
+        "fn main() {\n" +
+        "    p := sync.Published<Item>::new(Item { name: \"ok\", items: [\"a\", \"b\"] })\n" +
+        "    g := p.read()\n" +
+        "    item := g.get()\n" +
+        "    assert(item.name == \"ok\" && item.items.len == 2)\n" +
+        "    mut s := \"corrupt\" + \"-test\"\n" +
+        "    unsafe {\n" +
+        "        raw := load_ptr(addr(&s))\n" +
+        "        store_i64(ptr(usize(raw) - usize(8)), i64(-99999))\n" +
+        "    }\n" +
+        "    _ := s.clone()\n" +
+        "}"
+    if !check_runs(compiler, work, "r2_type_desc_bounds_trap", r2_prog, 112, "", &mut checks) { return false }
+
+    // C-1: match move Option<&mut []T> reborrow works cleanly
+    c1_prog := "fn bump(xs: &mut []i32) { xs.push(99) }\n" +
+        "fn main() {\n" +
+        "    mut xs: []i32 = [1, 2, 3]\n" +
+        "    opt: Option<&mut []i32> = .Some(&mut xs)\n" +
+        "    match move opt {\n" +
+        "        .Some(m) => {\n" +
+        "            m.clear()\n" +
+        "            m.push(42)\n" +
+        "            bump(&mut m)\n" +
+        "        },\n" +
+        "        .None => {},\n" +
+        "    }\n" +
+        "    assert(xs.len == 2 && xs[0] == 42 && xs[1] == 99)\n" +
+        "    print(\"c1_ok\")\n" +
+        "}"
+    check_runs(compiler, work, "c1_match_move_opt_mut", c1_prog, 0, "c1_ok\n", &mut checks)
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_phase0_soundness COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+    tmp := fs.temp_dir("dunder-phase0-soundness-")
+    if !tmp.ok { _ := harness.fail("cannot create phase0 soundness test directory"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    mut checks := 0
+    cases := invalid_cases()
+    for i in 0..cases.len {
+        (name, source, expected) := cases[i].clone()
+        if !check_rejected(compiler, work, name, source, expected, &mut checks) { return 1 }
+    }
+    if !check_runtime_cases(compiler, work, &mut checks) { return 1 }
+    print(f"phase0 soundness ok: {checks} checks passed on {process.host_target()}")
+    0
+}
