@@ -97,3 +97,41 @@ int16_t call_samples(SampleCallback callback, int16_t lo, int16_t hi, int16_t a,
         || d != 5 || e != -6 || f != 7 || last != -8) return 0;
     return callback(hi, a, b, c, d, e, f, last, lo);
 }
+
+typedef struct { uint8_t v; } S1;
+typedef struct { uint8_t a, b, c; } S3;
+typedef struct { uint32_t a, b; } S8;
+typedef struct { uint32_t a, b, c; } S12;
+typedef struct { uint64_t location, length; } Range;
+typedef struct { uint64_t x, y, z; } Origin;
+typedef struct { uint64_t width, height, depth; } Extent;
+typedef struct { Origin origin; Extent size; } Region;
+typedef struct { uint64_t x, y, width, height; } Scissor;
+typedef struct { double origin_x, origin_y, width, height, near_z, far_z; } Viewport;
+
+uint64_t arm64_take_s1_s3(S1 a, S3 b) { return (uint64_t)a.v + b.a * 10 + b.b * 100 + b.c * 1000; }
+uint64_t arm64_take_s8_s12(S8 a, S12 b) { return a.a + a.b + b.a + b.b + b.c; }
+uint64_t arm64_take_range_x3(void *p0, void *p1, void *p2, Range r) {
+    return (uint64_t)(uintptr_t)p0 + (uint64_t)(uintptr_t)p1 + (uint64_t)(uintptr_t)p2 + r.location * 10 + r.length;
+}
+uint64_t arm64_spill_range(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, Range spilled, S3 tail_s3, uint8_t tail_u8) {
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + spilled.location + spilled.length + tail_s3.c + tail_u8;
+}
+uint64_t arm64_take_region_scissor(Region reg, Scissor sc) {
+    return reg.origin.x + reg.origin.y + reg.origin.z + reg.size.width + reg.size.height + reg.size.depth +
+           sc.x + sc.y + sc.width + sc.height;
+}
+double arm64_take_viewport_and_mutate_local(Viewport v) {
+    double sum = v.origin_x + v.origin_y + v.width + v.height + v.near_z + v.far_z;
+    v.origin_x = -999.0;
+    v.far_z = -999.0;
+    return sum;
+}
+S3 arm64_ret_s3(uint8_t a, uint8_t b, uint8_t c) { return (S3){a, b, c}; }
+S8 arm64_ret_s8(uint32_t a, uint32_t b) { return (S8){a, b}; }
+S12 arm64_ret_s12(uint32_t a, uint32_t b, uint32_t c) { return (S12){a, b, c}; }
+Range arm64_ret_range(uint64_t loc, uint64_t len) { return (Range){loc, len}; }
+Origin arm64_ret_origin(uint64_t x, uint64_t y, uint64_t z) { return (Origin){x, y, z}; }
+Region arm64_ret_region(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    return (Region){{x, y, 7}, {w, h, 2}};
+}

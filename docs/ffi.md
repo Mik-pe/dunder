@@ -96,10 +96,14 @@ C-konvention.
 
 Parametrar och returvärden kan vara skalära tal eller pekare. Native-anrop kan
 också överföra en C-struct bestående av en till fyra identiska flyttal (även
-nästlade). Win64 kan skicka och returnera övriga `@c_layout`-structar
-som värden. Structar på 1, 2, 4 eller 8 byte går via heltalsplatser.
-Större structar och övriga storlekar överförs via en kopia hos anroparen.
-På övriga mål skickas andra structar med pekare. Använd en fast signatur för varje
+nästlade). ARM64 (`arm64-macos` och `arm64-linux`) samt Win64 kan dessutom
+skicka och returnera övriga `@c_layout`-structar som värden enligt respektive
+plattforms ABI (på ARM64 upp till 16 byte i register eller som kopia på
+anroparens stack, och större structar via kopia/pekare och `x8`-retur).
+Win64 använder enbytes-, tvåbytes-, fyrabytes- eller åttabytesplatser i
+register för structar av dessa storlekar och kopia hos anroparen för övriga
+storlekar. På övriga mål (x86-64/Linux och Wasm) skickas övriga structar
+med pekare. Använd en fast signatur för varje
 anrop. `callback(namn)` ger en C-funktionspekare till en namngiven
 Dunder-funktion med skalära argument och skalärt eller tomt resultat. En
 native-callback lånar det pågående Dunder-anropets exekveringstillstånd.
