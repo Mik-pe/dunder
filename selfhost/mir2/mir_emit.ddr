@@ -4,6 +4,7 @@
 // selfhost/frontend/compile.ddr or selfhost/frontend/frontend_types.ddr.
 
 import ..frontend.diagnostics as diag
+import ..frontend.lexer as lexer
 import ..backend.arm64 as arm
 import ..backend.floats as floats
 import ..backend.imports as native_imports
@@ -30,6 +31,26 @@ pub struct EmitResult {
     imports_slots: []i32,
     env_source_slot: i32,
     diagnostics: []diag.Diagnostic,
+    debug_fn_names: []string,
+    debug_fn_mods: []i32,
+    debug_fn_spans: []i32,
+    debug_fn_starts: []i32,
+    debug_fn_ends: []i32,
+    debug_line_mods: []i32,
+    debug_line_spans: []i32,
+    debug_line_offsets: []i32,
+}
+
+struct DebugEmitBuf {
+    enabled: bool,
+    fn_names: []string,
+    fn_mods: []i32,
+    fn_spans: []i32,
+    fn_starts: []i32,
+    fn_ends: []i32,
+    line_mods: []i32,
+    line_spans: []i32,
+    line_offsets: []i32,
 }
 
 struct FnEmitCtx {
@@ -99,7 +120,8 @@ fn emit_load_const(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
                 fc.imp_sites.push(arm.position(&code) * 4)
                 fc.imp_slots.push(slot)
             }
-            arm.native_address(&mut code, dst_reg)
+            arm.native_address(&mut code, if dst_reg == 0 { 0 } else { 16 })
+            if dst_reg != 0 && dst_reg != 16 { arm.mov(&mut code, dst_reg, 16) }
             if c.text == "__ext_static_val" {
                 helpers.load_typed_at(&mut code, &prog.types, c.ty, dst_reg, dst_reg, 0)
             }
@@ -265,7 +287,19 @@ fn operand_type(body: &mb.MirBody, op_id: i32) -> i32 {
     body.places[op.id].ty
 }
 
-// Load a 1-word scalar/pointer/boxed operand into `dst_reg`.
+fn is_true_move(body: &mb.MirBody, op_id: i32) -> bool {
+    op := body.ops[op_id]
+    if op.kind != .Move { return false }
+    pl := body.places[op.id]
+    if body.locals[pl.local].flags.bit_and(mb.LF_BORROW_PARAM) != 0 { return false }
+    for i in 0..pl.proj_len {
+        pk := body.projs[pl.proj_start + i].kind
+        if pk == .Deref || pk == .Index { return false }
+    }
+    true
+}
+
+// Load a 1-word scalar/pointer/boxed operand into `dst_reg` (pure read; never zeroes source).
 fn emit_load_scalar_op(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
     fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, op_id: i32, dst_reg: i32) {
     op := body.ops[op_id]
@@ -277,8 +311,30 @@ fn emit_load_scalar_op(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
     addr_reg := if dst_reg == 10 { 11 } else { 10 }
     emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, addr_reg)
     helpers.load_typed_at(&mut code, &prog.types, ty, dst_reg, addr_reg, 0)
-    if op.kind == .Move && body.places[op.id].proj_len > 0 && helpers.type_needs_drop(&prog.types, ty) {
-        helpers.store_mem(&mut code, 31, addr_reg, 0)
+}
+
+// Load a 1-word owned/scalar operand transferring ownership into destination:
+// - if true move of owned value: zero source slot so Drop will not double-free
+// - if Copy / borrow-param / Deref / Index read of owned value: retain/clone!
+fn emit_take_scalar_op(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, op_id: i32, dst_reg: i32) {
+    op := body.ops[op_id]
+    if op.kind == .Const {
+        emit_load_const(&mut code, &prog, &body, &mut fc, &mut h, op.id, dst_reg)
+        return
+    }
+    ty := body.places[op.id].ty
+    addr_reg := if dst_reg == 10 { 11 } else { 10 }
+    emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, addr_reg)
+    helpers.load_typed_at(&mut code, &prog.types, ty, dst_reg, addr_reg, 0)
+    if helpers.type_needs_drop(&prog.types, ty) {
+        if is_true_move(&body, op_id) {
+            helpers.store_mem(&mut code, 31, addr_reg, 0)
+        } else if ty >= 0 && ty < h.clone_labels.len && h.clone_labels[ty] >= 0 {
+            if dst_reg != 0 { arm.mov(&mut code, 0, dst_reg) }
+            arm.branch(&mut code, h.clone_labels[ty], 1)
+            if dst_reg != 0 { arm.mov(&mut code, dst_reg, 0) }
+        }
     }
 }
 
@@ -324,8 +380,8 @@ fn emit_copy_op_to_addr_slot(code: &mut arm.Code, prog: &hb.HirProgram, body: &m
         return
     }
 
-    // 1-word scalar / pointer / boxed value
-    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
+    // 1-word scalar / pointer / boxed value (retains/clones on Copy/borrow/Deref/Index, zeroes on true move)
+    emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
     arm.load_into(&mut code, dst_addr_slot, 10)
     helpers.store_typed_at(&mut code, &prog.types, ty, 0, 10, 0)
 }
@@ -973,12 +1029,38 @@ fn emit_rvalue(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             }
             e_addr_slot := alloc_slot(&mut fc)
             if rv.op_len == 1 && cnt > 1 {
-                // Repeat literal `[val; N]`
-                for ei in 0..cnt {
-                    arm.load_into(&mut code, base_addr_slot, 10)
-                    emit_add_imm(&mut code, 0, 10, ei * stride)
-                    arm.store(&mut code, e_addr_slot, 0)
-                    emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[rv.op_start], e_addr_slot)
+                // Repeat literal `[val; N]`: materialize val once and loop-copy for N > 8
+                val_slots := helpers.local_slot_count(&prog.types, elem_ty)
+                val_b := alloc_slots(&mut fc, val_slots)
+                val_addr := alloc_slot(&mut fc)
+                emit_slots_addr(&mut code, val_b, val_slots, 0); arm.store(&mut code, val_addr, 0)
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[rv.op_start], val_addr)
+                if cnt <= 8 {
+                    for ei in 0..cnt {
+                        arm.load_into(&mut code, base_addr_slot, 10)
+                        emit_add_imm(&mut code, 10, 10, ei * stride)
+                        arm.load_into(&mut code, val_addr, 11)
+                        helpers.copy_bytes(&mut code, 10, 11, stride)
+                    }
+                } else {
+                    cnt_s := alloc_slot(&mut fc)
+                    cur_s := alloc_slot(&mut fc)
+                    arm.imm(&mut code, 0, i64(cnt)); arm.store(&mut code, cnt_s, 0)
+                    arm.load(&mut code, base_addr_slot); arm.store(&mut code, cur_s, 0)
+                    rep_lp := arm.label(&mut code); rep_done := arm.label(&mut code)
+                    arm.mark(&mut code, rep_lp)
+                    arm.load(&mut code, cnt_s)
+                    arm.branch(&mut code, rep_done, 18) // cbz
+                    arm.integer_binary(&mut code, 2, true, false, 0, 0, -1, 1)
+                    arm.store(&mut code, cnt_s, 0)
+                    arm.load_into(&mut code, cur_s, 10)
+                    arm.load_into(&mut code, val_addr, 11)
+                    helpers.copy_bytes(&mut code, 10, 11, stride)
+                    arm.load_into(&mut code, cur_s, 10)
+                    emit_add_imm(&mut code, 10, 10, stride)
+                    arm.store(&mut code, cur_s, 10)
+                    arm.branch(&mut code, rep_lp, 0)
+                    arm.mark(&mut code, rep_done)
                 }
             } else {
                 for ei in 0..rv.op_len {
@@ -1295,6 +1377,43 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
         return
     }
+    if id == hb.INTRINSIC_SIZE_OF {
+        t_id := tm.sig_ty
+        sz := if t_id >= 0 && t_id < prog.types.entries.len { helpers.type_byte_size(&prog.types, t_id) } else { 0 }
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
+        arm.imm(&mut code, 0, i64(sz))
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_ALIGN_OF {
+        t_id := tm.sig_ty
+        al := if t_id >= 0 && t_id < prog.types.entries.len { prog.types.entries[t_id].align } else { 1 }
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
+        arm.imm(&mut code, 0, i64(if al < 1 { 1 } else { al }))
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_OFFSET_OF {
+        t_id := tm.sig_ty
+        mut off := 0
+        if t_id >= 0 && t_id < prog.types.entries.len && tm.arg_len > 0 {
+            op := body.ops[body.call_args[tm.arg_start]]
+            if op.kind == .Const {
+                fname := body.consts[op.id].text.clone()
+                te := &prog.types.entries[t_id]
+                for fi in 0..te.count {
+                    if prog.types.fields[te.inner_a + fi].name == fname {
+                        off = helpers.struct_field_offset(&prog.types, t_id, fi)
+                        break
+                    }
+                }
+            }
+        }
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
+        arm.imm(&mut code, 0, i64(off))
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return
+    }
     if id == hb.INTRINSIC_ZEROED {
         emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 10)
         sz := helpers.local_slot_count(&prog.types, dest_ty) * 8
@@ -1477,132 +1596,255 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
 
     // 10. Array mutating methods (arg 0 is &mut []T or &mut [T; N])
     if id >= hb.INTRINSIC_ARR_SWAP && id <= hb.INTRINSIC_ARR_PUSH && tm.arg_len >= 1 {
-        recv_op := body.call_args[tm.arg_start]
-        recv_ref_ty := operand_type(&body, recv_op)
-        arr_ty := prog.types.entries[recv_ref_ty].inner_a
-        elem_ty := prog.types.entries[arr_ty].inner_a
-        is_pod_elem := helpers.is_fat_pair(&prog.types, elem_ty) || helpers.is_inline_agg(&prog.types, elem_ty)
-        arr_ptr_slot := alloc_slot(&mut fc)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, recv_op, 10)
-        if prog.types.entries[arr_ty].kind == .Array {
-            helpers.load_mem(&mut code, 0, 10, 0)
-        } else {
-            arm.mov(&mut code, 0, 10)
-        }
-        arm.store(&mut code, arr_ptr_slot, 0)
-
-        if id == hb.INTRINSIC_ARR_PUSH && tm.arg_len >= 2 {
-            val_op := body.call_args[tm.arg_start + 1]
-            if is_pod_elem {
-                slots := helpers.local_slot_count(&prog.types, elem_ty)
-                t_base := alloc_slots(&mut fc, slots)
-                t_addr := alloc_slot(&mut fc)
-                emit_slots_addr(&mut code, t_base, slots, 0); arm.store(&mut code, t_addr, 0)
-                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, val_op, t_addr)
-                arm.load_into(&mut code, arr_ptr_slot, 0)
-                arm.load_into(&mut code, t_addr, 1)
-                arm.branch(&mut code, h.rt.array_push_pod, 1)
-            } else {
-                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 1)
-                arm.load_into(&mut code, arr_ptr_slot, 0)
-                arm.branch(&mut code, h.rt.array_push, 1)
-            }
-            return
-        }
-        if id == hb.INTRINSIC_ARR_POP {
-            dst_addr := alloc_slot(&mut fc)
-            emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-            if is_pod_elem {
-                arm.load_into(&mut code, arr_ptr_slot, 0)
-                arm.load_into(&mut code, dst_addr, 1)
-                arm.branch(&mut code, h.rt.array_pop_pod, 1)
-            } else {
-                arm.load_into(&mut code, arr_ptr_slot, 0)
-                arm.branch(&mut code, h.rt.array_pop, 1)
-                arm.load_into(&mut code, dst_addr, 10)
-                helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
-            }
-            return
-        }
-        if id == hb.INTRINSIC_ARR_CLEAR {
-            arm.load_into(&mut code, arr_ptr_slot, 0)
-            arm.branch(&mut code, h.rt.array_clear, 1)
-            return
-        }
-        if id == hb.INTRINSIC_ARR_RESERVE && tm.arg_len >= 2 {
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
-            arm.load_into(&mut code, arr_ptr_slot, 0)
-            arm.branch(&mut code, h.rt.array_reserve, 1)
-            return
-        }
-        if id == hb.INTRINSIC_ARR_TRY_RESERVE && tm.arg_len >= 2 {
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
-            arm.load_into(&mut code, arr_ptr_slot, 0)
-            arm.branch(&mut code, h.rt.array_try_reserve, 1)
-            return
-        }
-        if id == hb.INTRINSIC_ARR_REMOVE && tm.arg_len >= 2 {
-            dst_addr := alloc_slot(&mut fc)
-            emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
-            arm.load_into(&mut code, arr_ptr_slot, 0)
-            if is_pod_elem {
-                arm.load_into(&mut code, dst_addr, 2)
-                arm.branch(&mut code, h.rt.array_remove_pod, 1)
-            } else {
-                arm.branch(&mut code, h.rt.array_remove, 1)
-                arm.load_into(&mut code, dst_addr, 10)
-                helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
-            }
-            return
-        }
-        if id == hb.INTRINSIC_ARR_TRUNCATE && tm.arg_len >= 2 {
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
-            arm.load_into(&mut code, arr_ptr_slot, 0)
-            arm.branch(&mut code, h.rt.array_truncate, 1)
-            return
-        }
-        if id == hb.INTRINSIC_ARR_SWAP && tm.arg_len >= 3 {
-            i_slot := alloc_slot(&mut fc); j_slot := alloc_slot(&mut fc)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0); arm.store(&mut code, i_slot, 0)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], 0); arm.store(&mut code, j_slot, 0)
-            arm.load_into(&mut code, arr_ptr_slot, 10)
-            if prog.types.entries[arr_ty].kind == .Array {
-                helpers.load_mem(&mut code, 11, 10, 8) // len
-                helpers.load_mem(&mut code, 10, 10, 0) // data
-            } else {
-                arm.imm(&mut code, 11, i64(prog.types.entries[arr_ty].count))
-            }
-            arm.load_into(&mut code, i_slot, 1)
-            arm.load_into(&mut code, j_slot, 2)
-            arm.compare_register(&mut code, 1, 11); arm.branch(&mut code, h.trap_bounds, 4)
-            arm.compare_register(&mut code, 2, 11); arm.branch(&mut code, h.trap_bounds, 4)
-            stride := helpers.elem_stride(&prog.types, elem_ty)
-            arm.imm(&mut code, 12, i64(stride))
-            arm.integer_binary(&mut code, 3, true, false, 13, 1, 12, -1)
-            arm.integer_binary(&mut code, 1, true, false, 13, 10, 13, -1) // addr_i
-            arm.integer_binary(&mut code, 3, true, false, 14, 2, 12, -1)
-            arm.integer_binary(&mut code, 1, true, false, 14, 10, 14, -1) // addr_j
-            if is_pod_elem {
-                slots := helpers.local_slot_count(&prog.types, elem_ty)
-                tmp_b := alloc_slots(&mut fc, slots)
-                ai_s := alloc_slot(&mut fc); aj_s := alloc_slot(&mut fc)
-                arm.store(&mut code, ai_s, 13); arm.store(&mut code, aj_s, 14)
-                emit_slots_addr(&mut code, tmp_b, slots, 0)
-                helpers.copy_bytes(&mut code, 0, 13, stride)
-                arm.load_into(&mut code, ai_s, 10); arm.load_into(&mut code, aj_s, 11); helpers.copy_bytes(&mut code, 10, 11, stride)
-                arm.load_into(&mut code, aj_s, 10); emit_slots_addr(&mut code, tmp_b, slots, 11); helpers.copy_bytes(&mut code, 10, 11, stride)
-            } else {
-                helpers.load_typed_at(&mut code, &prog.types, elem_ty, 0, 13, 0)
-                helpers.load_typed_at(&mut code, &prog.types, elem_ty, 1, 14, 0)
-                helpers.store_typed_at(&mut code, &prog.types, elem_ty, 1, 13, 0)
-                helpers.store_typed_at(&mut code, &prog.types, elem_ty, 0, 14, 0)
-            }
-            return
-        }
+        emit_arr_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
+        return
     }
 
     // 11. Pointer & as_ptr intrinsics
+    if id >= hb.INTRINSIC_PTR_NULL_MUT && id <= hb.INTRINSIC_AS_PTR {
+        emit_ptr_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
+        return
+    }
+
+    // 12. Float methods
+    if id >= hb.INTRINSIC_FLOAT_TRUNC && id <= hb.INTRINSIC_FLOAT_TO_BITS && tm.arg_len >= 1 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        arg_op := body.call_args[tm.arg_start]
+        aty := operand_type(&body, arg_op)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
+        if id == hb.INTRINSIC_FLOAT_TO_BITS || id == hb.INTRINSIC_FLOAT_FROM_BITS {
+            // Raw bit reinterpretation (already in x0!)
+        } else if id == hb.INTRINSIC_MATH_ABS && !helpers.is_float_ty(aty) {
+            pos_lbl := arm.label(&mut code)
+            arm.compare_immediate(&mut code, 0, 0, false)
+            arm.branch(&mut code, pos_lbl, 12)
+            arm.mov(&mut code, 2, 0); arm.imm(&mut code, 1, 0); arm.mov(&mut code, 0, 2)
+            emit_signed_binary(&mut code, &h, hb.BINOP_SUB, aty)
+            arm.mark(&mut code, pos_lbl)
+        } else {
+            mname := if id == hb.INTRINSIC_FLOAT_IS_NAN { "is_nan" }
+                else if id == hb.INTRINSIC_FLOAT_IS_FINITE { "is_finite" }
+                else if id == hb.INTRINSIC_FLOAT_IS_INFINITE { "is_infinite" }
+                else if id == hb.INTRINSIC_FLOAT_IS_SIGN_NEG { "is_sign_negative" }
+                else if id == hb.INTRINSIC_MATH_ABS { "abs" }
+                else if id == hb.INTRINSIC_FLOAT_SQRT { "sqrt" }
+                else if id == hb.INTRINSIC_FLOAT_FLOOR { "floor" }
+                else if id == hb.INTRINSIC_FLOAT_CEIL { "ceil" }
+                else if id == hb.INTRINSIC_FLOAT_ROUND { "round" }
+                else if id == hb.INTRINSIC_FLOAT_ROUND_EVEN { "round_ties_even" }
+                else { "trunc" }
+            _ := floats.method(&mut code, helpers.legacy_ty_id(aty), mname, 0)
+        }
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return
+    }
+
+    // 13. Integer bitwise / wrapping / saturating / rotate / bit-count / min / max / clamp methods
+    if id >= hb.INTRINSIC_INT_COUNT_ZEROS && id <= hb.INTRINSIC_INT_BIT_OR && tm.arg_len >= 1 {
+        emit_int_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
+        return
+    }
+
+    // 13b. .hash() intrinsic
+    if id == hb.INTRINSIC_HASH && tm.arg_len >= 1 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        arg_op := body.call_args[tm.arg_start]
+        aty := operand_type(&body, arg_op)
+        ak := prog.types.entries[aty].kind
+        if ak == .String {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
+            arm.imm(&mut code, 1, 1)
+            arm.branch(&mut code, h.map_hash_key, 1)
+        } else if ak == .FatStr {
+            v_base := alloc_slots(&mut fc, 2); v_addr := alloc_slot(&mut fc)
+            emit_slots_addr(&mut code, v_base, 2, 0); arm.store(&mut code, v_addr, 0)
+            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, arg_op, v_addr)
+            arm.load(&mut code, v_addr)
+            arm.branch(&mut code, h.rt.str_view_to_string, 1)
+            tmp_s := alloc_slot(&mut fc); arm.store(&mut code, tmp_s, 0)
+            arm.imm(&mut code, 1, 1)
+            arm.branch(&mut code, h.map_hash_key, 1)
+            h_s := alloc_slot(&mut fc); arm.store(&mut code, h_s, 0)
+            arm.load(&mut code, tmp_s); arm.branch(&mut code, h.rt.release, 1)
+            arm.load(&mut code, h_s)
+        } else {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
+            if aty == ht.TY_I32 { arm.bitfield(&mut code, false, true, 0, 0, 0, 31) }
+            else if aty == ht.TY_I16 { arm.bitfield(&mut code, false, true, 0, 0, 0, 15) }
+            else if aty == ht.TY_I8 { arm.bitfield(&mut code, false, true, 0, 0, 0, 7) }
+            arm.imm(&mut code, 1, 0)
+            arm.branch(&mut code, h.map_hash_key, 1)
+        }
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return
+    }
+
+    // 13c. Map<K, V> and Set<K> runtime intrinsics
+    if (id >= hb.INTRINSIC_MAP_FIND_INDEX && id <= hb.INTRINSIC_MAP_NEW) ||
+        (id >= hb.INTRINSIC_SET_INSERT && id <= hb.INTRINSIC_MAP_TAKE) {
+        emit_map_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
+        return
+    }
+
+    // 14. Option / Result helper methods
+    if id >= hb.INTRINSIC_RES_ERR && id <= hb.INTRINSIC_OPT_IS_SOME && tm.arg_len >= 1 {
+        emit_opt_res_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
+        return
+    }
+
+    // 15. Internal __sys_* runtime intrinsics
+    if id >= hb.INTRINSIC_SYS_NET_CLOSE && id <= hb.INTRINSIC_SYS_ARG_COUNT {
+        emit_sys_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, id, tm)
+        return
+    }
+
+    // 16. string.bytes(), formatters, raw load/store, bytes_view, static_bytes, legacy sys.*, task/sync
+    emit_misc_intrinsic(&mut code, &prog, &body, &mut fc, &mut h, &mut ffi, &mut ts, id, tm)
+}
+
+fn emit_arr_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
+    recv_op := body.call_args[tm.arg_start]
+    recv_ref_ty := operand_type(&body, recv_op)
+    arr_ty := prog.types.entries[recv_ref_ty].inner_a
+    elem_ty := prog.types.entries[arr_ty].inner_a
+    is_pod_elem := helpers.is_fat_pair(&prog.types, elem_ty) || helpers.is_inline_agg(&prog.types, elem_ty)
+    arr_ptr_slot := alloc_slot(&mut fc)
+    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, recv_op, 10)
+    if prog.types.entries[arr_ty].kind == .Array {
+        helpers.load_mem(&mut code, 0, 10, 0)
+    } else {
+        arm.mov(&mut code, 0, 10)
+    }
+    arm.store(&mut code, arr_ptr_slot, 0)
+
+    if id == hb.INTRINSIC_ARR_PUSH && tm.arg_len >= 2 {
+        val_op := body.call_args[tm.arg_start + 1]
+        if is_pod_elem {
+            slots := helpers.local_slot_count(&prog.types, elem_ty)
+            t_base := alloc_slots(&mut fc, slots)
+            t_addr := alloc_slot(&mut fc)
+            emit_slots_addr(&mut code, t_base, slots, 0); arm.store(&mut code, t_addr, 0)
+            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, val_op, t_addr)
+            arm.load_into(&mut code, arr_ptr_slot, 0)
+            arm.load_into(&mut code, t_addr, 1)
+            arm.branch(&mut code, h.rt.array_push_pod, 1)
+        } else {
+            emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 0)
+            arm.mov(&mut code, 1, 0)
+            arm.load_into(&mut code, arr_ptr_slot, 0)
+            arm.branch(&mut code, h.rt.array_push, 1)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_ARR_POP {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        if is_pod_elem {
+            arm.load_into(&mut code, arr_ptr_slot, 0)
+            arm.load_into(&mut code, dst_addr, 1)
+            arm.branch(&mut code, h.rt.array_pop_pod, 1)
+        } else {
+            arm.load_into(&mut code, arr_ptr_slot, 0)
+            arm.branch(&mut code, h.rt.array_pop, 1)
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_ARR_CLEAR {
+        arm.load_into(&mut code, arr_ptr_slot, 0)
+        arm.branch(&mut code, h.rt.array_clear, 1)
+        return
+    }
+    if id == hb.INTRINSIC_ARR_RESERVE && tm.arg_len >= 2 {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arm.load_into(&mut code, arr_ptr_slot, 0)
+        arm.branch(&mut code, h.rt.array_reserve, 1)
+        return
+    }
+    if id == hb.INTRINSIC_ARR_TRY_RESERVE && tm.arg_len >= 2 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arm.load_into(&mut code, arr_ptr_slot, 0)
+        arm.branch(&mut code, h.rt.array_try_reserve, 1)
+        if dest_ty != ht.TY_UNIT {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_ARR_REMOVE && tm.arg_len >= 2 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arm.load_into(&mut code, arr_ptr_slot, 0)
+        if is_pod_elem {
+            arm.load_into(&mut code, dst_addr, 2)
+            arm.branch(&mut code, h.rt.array_remove_pod, 1)
+        } else {
+            arm.branch(&mut code, h.rt.array_remove, 1)
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_ARR_TRUNCATE && tm.arg_len >= 2 {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arm.load_into(&mut code, arr_ptr_slot, 0)
+        arm.branch(&mut code, h.rt.array_truncate, 1)
+        return
+    }
+    if id == hb.INTRINSIC_ARR_SWAP && tm.arg_len >= 3 {
+        i_slot := alloc_slot(&mut fc); j_slot := alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0); arm.store(&mut code, i_slot, 0)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], 0); arm.store(&mut code, j_slot, 0)
+        arm.load_into(&mut code, arr_ptr_slot, 10)
+        if prog.types.entries[arr_ty].kind == .Array {
+            helpers.load_mem(&mut code, 11, 10, 8)
+            helpers.load_mem(&mut code, 10, 10, 0)
+        } else {
+            arm.imm(&mut code, 11, i64(prog.types.entries[arr_ty].count))
+        }
+        arm.load_into(&mut code, i_slot, 1)
+        arm.load_into(&mut code, j_slot, 2)
+        arm.compare_register(&mut code, 1, 11); arm.branch(&mut code, h.trap_bounds, 4)
+        arm.compare_register(&mut code, 2, 11); arm.branch(&mut code, h.trap_bounds, 4)
+        stride := helpers.elem_stride(&prog.types, elem_ty)
+        arm.imm(&mut code, 12, i64(stride))
+        arm.integer_binary(&mut code, 3, true, false, 13, 1, 12, -1)
+        arm.integer_binary(&mut code, 1, true, false, 13, 10, 13, -1)
+        arm.integer_binary(&mut code, 3, true, false, 14, 2, 12, -1)
+        arm.integer_binary(&mut code, 1, true, false, 14, 10, 14, -1)
+        if is_pod_elem {
+            slots := helpers.local_slot_count(&prog.types, elem_ty)
+            tmp_b := alloc_slots(&mut fc, slots)
+            ai_s := alloc_slot(&mut fc); aj_s := alloc_slot(&mut fc)
+            arm.store(&mut code, ai_s, 13); arm.store(&mut code, aj_s, 14)
+            emit_slots_addr(&mut code, tmp_b, slots, 0)
+            helpers.copy_bytes(&mut code, 0, 13, stride)
+            arm.load_into(&mut code, ai_s, 10); arm.load_into(&mut code, aj_s, 11); helpers.copy_bytes(&mut code, 10, 11, stride)
+            arm.load_into(&mut code, aj_s, 10); emit_slots_addr(&mut code, tmp_b, slots, 11); helpers.copy_bytes(&mut code, 10, 11, stride)
+        } else {
+            helpers.load_typed_at(&mut code, &prog.types, elem_ty, 0, 13, 0)
+            helpers.load_typed_at(&mut code, &prog.types, elem_ty, 1, 14, 0)
+            helpers.store_typed_at(&mut code, &prog.types, elem_ty, 1, 13, 0)
+            helpers.store_typed_at(&mut code, &prog.types, elem_ty, 0, 14, 0)
+        }
+    }
+}
+
+fn emit_ptr_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
     if (id == hb.INTRINSIC_AS_PTR || id == hb.INTRINSIC_AS_MUT_PTR) && tm.arg_len >= 1 {
         dst_addr := alloc_slot(&mut fc)
         emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
@@ -1687,179 +1929,490 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
         arm.integer_binary(&mut code, if id == hb.INTRINSIC_PTR_SUB { 2 } else { 1 }, true, false, 0, 0, 1, -1)
         arm.load_into(&mut code, dst_addr, 10)
         helpers.store_mem(&mut code, 0, 10, 0)
-        return
     }
+}
 
-    // 12. Float methods (to_bits, from_bits, abs, sqrt, floor, ceil, round, trunc, is_nan, is_finite, is_infinite, is_sign_negative)
-    if id >= hb.INTRINSIC_FLOAT_TRUNC && id <= hb.INTRINSIC_FLOAT_TO_BITS && tm.arg_len >= 1 {
-        dst_addr := alloc_slot(&mut fc)
-        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-        arg_op := body.call_args[tm.arg_start]
-        aty := operand_type(&body, arg_op)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
-        if id == hb.INTRINSIC_FLOAT_TO_BITS || id == hb.INTRINSIC_FLOAT_FROM_BITS {
-            // Raw bit reinterpretation (already in x0!)
-        } else if id == hb.INTRINSIC_MATH_ABS && !helpers.is_float_ty(aty) {
-            pos_lbl := arm.label(&mut code)
-            arm.compare_immediate(&mut code, 0, 0, false)
-            arm.branch(&mut code, pos_lbl, 12)
-            arm.mov(&mut code, 2, 0); arm.imm(&mut code, 1, 0); arm.mov(&mut code, 0, 2)
-            emit_signed_binary(&mut code, &h, hb.BINOP_SUB, aty)
-            arm.mark(&mut code, pos_lbl)
-        } else {
-            mname := if id == hb.INTRINSIC_FLOAT_IS_NAN { "is_nan" }
-                else if id == hb.INTRINSIC_FLOAT_IS_FINITE { "is_finite" }
-                else if id == hb.INTRINSIC_FLOAT_IS_INFINITE { "is_infinite" }
-                else if id == hb.INTRINSIC_FLOAT_IS_SIGN_NEG { "is_sign_negative" }
-                else if id == hb.INTRINSIC_MATH_ABS { "abs" }
-                else if id == hb.INTRINSIC_FLOAT_SQRT { "sqrt" }
-                else if id == hb.INTRINSIC_FLOAT_FLOOR { "floor" }
-                else if id == hb.INTRINSIC_FLOAT_CEIL { "ceil" }
-                else if id == hb.INTRINSIC_FLOAT_ROUND { "round" }
-                else if id == hb.INTRINSIC_FLOAT_ROUND_EVEN { "round_ties_even" }
-                else { "trunc" }
-            _ := floats.method(&mut code, helpers.legacy_ty_id(aty), mname, 0)
-        }
-        arm.load_into(&mut code, dst_addr, 10)
-        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
-        return
+fn emit_int_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
+    dst_addr := alloc_slot(&mut fc)
+    emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+    lhs_op := body.call_args[tm.arg_start]
+    lty := operand_type(&body, lhs_op)
+    is_u := helpers.is_unsigned_int(lty) || lty == ht.TY_RUNE
+    is_64 := lty == ht.TY_I64 || lty == ht.TY_U64 || lty == ht.TY_ISIZE || lty == ht.TY_USIZE
+    bits := if lty == ht.TY_I8 || lty == ht.TY_U8 { 8 }
+        else if lty == ht.TY_I16 || lty == ht.TY_U16 { 16 }
+        else if is_64 { 64 } else { 32 }
+    lhs_s := alloc_slot(&mut fc)
+    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, lhs_op, 0)
+    arm.store(&mut code, lhs_s, 0)
+    mut rhs_s := -1
+    if tm.arg_len >= 2 {
+        rhs_s = alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0)
+        arm.store(&mut code, rhs_s, 0)
     }
-
-    // 13. Integer bitwise / wrapping / min / max methods
-    if id >= hb.INTRINSIC_INT_COUNT_ZEROS && id <= hb.INTRINSIC_INT_BIT_OR && tm.arg_len >= 1 {
-        dst_addr := alloc_slot(&mut fc)
-        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-        lhs_s := alloc_slot(&mut fc)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
-        arm.store(&mut code, lhs_s, 0)
-        if tm.arg_len >= 2 {
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+    mut arg2_s := -1
+    if tm.arg_len >= 3 {
+        arg2_s = alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], 0)
+        arm.store(&mut code, arg2_s, 0)
+    }
+    arm.load(&mut code, lhs_s)
+    if rhs_s >= 0 { arm.load_into(&mut code, rhs_s, 1) } else { arm.imm(&mut code, 1, 0) }
+    if id == hb.INTRINSIC_INT_BIT_AND { arm.integer_binary(&mut code, 8, true, false, 0, 0, 1, -1) }
+    else if id == hb.INTRINSIC_INT_BIT_OR { arm.integer_binary(&mut code, 9, true, false, 0, 0, 1, -1) }
+    else if id == hb.INTRINSIC_INT_BIT_XOR { arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1) }
+    else if id == hb.INTRINSIC_INT_BIT_NOT {
+        arm.imm(&mut code, 1, -1); arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1)
+        if is_u { unsigned.mask(&mut code, helpers.legacy_ty_id(lty)) }
+        else if bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+        else if bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
+        else if bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
+    } else if id == hb.INTRINSIC_INT_SHL {
+        arm.integer_binary(&mut code, 14, is_64, false, 0, 0, 1, -1)
+        if is_u { unsigned.mask(&mut code, helpers.legacy_ty_id(lty)) }
+        else if bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+        else if bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
+        else if bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
+    } else if id == hb.INTRINSIC_INT_SHR {
+        if is_u {
+            unsigned.mask(&mut code, helpers.legacy_ty_id(lty))
+            arm.integer_binary(&mut code, 15, is_64, false, 0, 0, 1, -1)
         } else {
-            arm.imm(&mut code, 1, 0)
+            if bits == 32 { arm.bitfield(&mut code, false, true, 0, 0, 0, 31) }
+            else if bits == 16 { arm.bitfield(&mut code, false, true, 0, 0, 0, 15) }
+            else if bits == 8 { arm.bitfield(&mut code, false, true, 0, 0, 0, 7) }
+            arm.integer_binary(&mut code, 15, is_64, false, 0, 0, 1, -1)
+            if bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+            else if bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
+            else if bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
         }
-        arm.load(&mut code, lhs_s) // x0 = lhs, x1 = rhs
-        if id == hb.INTRINSIC_INT_BIT_AND { arm.integer_binary(&mut code, 8, true, false, 0, 0, 1, -1) }
-        else if id == hb.INTRINSIC_INT_BIT_OR { arm.integer_binary(&mut code, 9, true, false, 0, 0, 1, -1) }
-        else if id == hb.INTRINSIC_INT_BIT_XOR { arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1) }
-        else if id == hb.INTRINSIC_INT_BIT_NOT {
-            arm.imm(&mut code, 1, -1); arm.integer_binary(&mut code, 10, true, false, 0, 0, 1, -1)
-        } else if id == hb.INTRINSIC_INT_SHL {
-            arm.integer_binary(&mut code, 14, true, false, 0, 0, 1, -1)
-        } else if id == hb.INTRINSIC_INT_SHR {
-            arm.integer_binary(&mut code, 15, true, false, 0, 0, 1, -1)
-        } else if id == hb.INTRINSIC_INT_WRAPPING_ADD {
-            arm.integer_binary(&mut code, 1, dest_ty == ht.TY_I64 || dest_ty == ht.TY_U64 || dest_ty == ht.TY_ISIZE || dest_ty == ht.TY_USIZE, false, 0, 0, 1, -1)
-            if dest_ty == ht.TY_I32 { arm.sign_extend_i32(&mut code, 0, 0) }
-        } else if id == hb.INTRINSIC_INT_WRAPPING_SUB {
-            arm.integer_binary(&mut code, 2, dest_ty == ht.TY_I64 || dest_ty == ht.TY_U64 || dest_ty == ht.TY_ISIZE || dest_ty == ht.TY_USIZE, false, 0, 0, 1, -1)
-            if dest_ty == ht.TY_I32 { arm.sign_extend_i32(&mut code, 0, 0) }
-        } else if id == hb.INTRINSIC_INT_WRAPPING_MUL {
-            arm.integer_binary(&mut code, 3, dest_ty == ht.TY_I64 || dest_ty == ht.TY_U64 || dest_ty == ht.TY_ISIZE || dest_ty == ht.TY_USIZE, false, 0, 0, 1, -1)
-            if dest_ty == ht.TY_I32 { arm.sign_extend_i32(&mut code, 0, 0) }
-        } else if id == hb.INTRINSIC_INT_MIN || id == hb.INTRINSIC_INT_MAX {
-            keep := arm.label(&mut code)
-            arm.compare_register(&mut code, 0, 1)
-            cc := if helpers.is_unsigned_int(dest_ty) {
-                if id == hb.INTRINSIC_INT_MIN { 5 } else { 4 }
-            } else {
-                if id == hb.INTRINSIC_INT_MIN { 13 } else { 12 }
+    } else if id == hb.INTRINSIC_INT_WRAPPING_ADD || id == hb.INTRINSIC_INT_WRAPPING_SUB || id == hb.INTRINSIC_INT_WRAPPING_MUL {
+        op_code := if id == hb.INTRINSIC_INT_WRAPPING_ADD { 1 } else if id == hb.INTRINSIC_INT_WRAPPING_SUB { 2 } else { 3 }
+        arm.integer_binary(&mut code, op_code, is_64, false, 0, 0, 1, -1)
+        if is_u { unsigned.mask(&mut code, helpers.legacy_ty_id(lty)) }
+        else if bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+        else if bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
+        else if bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
+    } else if id == hb.INTRINSIC_INT_ROT_L || id == hb.INTRINSIC_INT_ROT_R {
+        if bits < 64 { arm.bitfield(&mut code, false, true, 0, 0, 0, bits - 1) }
+        arm.imm(&mut code, 2, i64(bits - 1))
+        arm.integer_binary(&mut code, 8, true, false, 1, 1, 2, -1)
+        arm.imm(&mut code, 3, i64(bits))
+        arm.integer_binary(&mut code, 2, true, false, 3, 3, 1, -1)
+        arm.integer_binary(&mut code, 8, true, false, 3, 3, 2, -1)
+        if id == hb.INTRINSIC_INT_ROT_L {
+            arm.integer_binary(&mut code, 14, true, false, 4, 0, 1, -1)
+            arm.integer_binary(&mut code, 15, true, false, 5, 0, 3, -1)
+        } else {
+            arm.integer_binary(&mut code, 15, true, false, 4, 0, 1, -1)
+            arm.integer_binary(&mut code, 14, true, false, 5, 0, 3, -1)
+        }
+        arm.integer_binary(&mut code, 9, true, false, 0, 4, 5, -1)
+        if is_u { unsigned.mask(&mut code, helpers.legacy_ty_id(lty)) }
+        else if bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+        else if bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
+        else if bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
+    } else if id == hb.INTRINSIC_INT_MIN || id == hb.INTRINSIC_INT_MAX {
+        keep := arm.label(&mut code)
+        arm.compare_register(&mut code, 0, 1)
+        cc := if is_u { if id == hb.INTRINSIC_INT_MIN { 5 } else { 4 } }
+            else { if id == hb.INTRINSIC_INT_MIN { 13 } else { 12 } }
+        arm.branch(&mut code, keep, cc)
+        arm.mov(&mut code, 0, 1)
+        arm.mark(&mut code, keep)
+    } else if id == hb.INTRINSIC_INT_CLAMP && arg2_s >= 0 {
+        ok_lo := arm.label(&mut code); ok_hi := arm.label(&mut code)
+        arm.compare_register(&mut code, 0, 1)
+        arm.branch(&mut code, ok_lo, if is_u { 4 } else { 12 })
+        arm.mov(&mut code, 0, 1)
+        arm.mark(&mut code, ok_lo)
+        arm.load_into(&mut code, arg2_s, 2)
+        arm.compare_register(&mut code, 0, 2)
+        arm.branch(&mut code, ok_hi, if is_u { 11 } else { 15 })
+        arm.mov(&mut code, 0, 2)
+        arm.mark(&mut code, ok_hi)
+    } else if id == hb.INTRINSIC_INT_POPCNT || id == hb.INTRINSIC_INT_COUNT_ZEROS {
+        if bits < 64 { arm.bitfield(&mut code, false, true, 0, 0, 0, bits - 1) }
+        arm.imm(&mut code, 2, 0)
+        pc_lp := arm.label(&mut code); pc_done := arm.label(&mut code)
+        arm.mark(&mut code, pc_lp)
+        arm.branch(&mut code, pc_done, 18)
+        arm.integer_binary(&mut code, 2, true, false, 3, 0, -1, 1)
+        arm.integer_binary(&mut code, 8, true, false, 0, 0, 3, -1)
+        arm.integer_binary(&mut code, 1, true, false, 2, 2, -1, 1)
+        arm.branch(&mut code, pc_lp, 0)
+        arm.mark(&mut code, pc_done)
+        if id == hb.INTRINSIC_INT_COUNT_ZEROS {
+            arm.imm(&mut code, 0, i64(bits))
+            arm.integer_binary(&mut code, 2, true, false, 0, 0, 2, -1)
+        } else {
+            arm.mov(&mut code, 0, 2)
+        }
+    } else if id == hb.INTRINSIC_INT_CLZ {
+        if bits < 64 { arm.bitfield(&mut code, false, true, 0, 0, 0, bits - 1) }
+        arm.imm(&mut code, 2, 0); arm.imm(&mut code, 3, i64(bits - 1)); arm.imm(&mut code, 4, 1)
+        clz_lp := arm.label(&mut code); clz_done := arm.label(&mut code)
+        arm.mark(&mut code, clz_lp)
+        arm.compare_immediate(&mut code, 3, 0, false); arm.branch(&mut code, clz_done, 13)
+        arm.integer_binary(&mut code, 15, true, false, 5, 0, 3, -1)
+        arm.integer_binary(&mut code, 8, true, false, 5, 5, 4, -1)
+        arm.compare_immediate(&mut code, 5, 0, false); arm.branch(&mut code, clz_done, 3)
+        arm.integer_binary(&mut code, 1, true, false, 2, 2, -1, 1)
+        arm.integer_binary(&mut code, 2, true, false, 3, 3, -1, 1)
+        arm.branch(&mut code, clz_lp, 0)
+        arm.mark(&mut code, clz_done)
+        arm.mov(&mut code, 0, 2)
+    } else if id == hb.INTRINSIC_INT_CTZ {
+        if bits < 64 { arm.bitfield(&mut code, false, true, 0, 0, 0, bits - 1) }
+        arm.imm(&mut code, 2, 0); arm.imm(&mut code, 3, i64(bits)); arm.imm(&mut code, 4, 1)
+        ctz_lp := arm.label(&mut code); ctz_done := arm.label(&mut code)
+        arm.mark(&mut code, ctz_lp)
+        arm.compare_register(&mut code, 2, 3); arm.branch(&mut code, ctz_done, 12)
+        arm.integer_binary(&mut code, 8, true, false, 5, 0, 4, -1)
+        arm.compare_immediate(&mut code, 5, 0, false); arm.branch(&mut code, ctz_done, 3)
+        arm.integer_binary(&mut code, 15, true, false, 0, 0, 4, -1)
+        arm.integer_binary(&mut code, 1, true, false, 2, 2, -1, 1)
+        arm.branch(&mut code, ctz_lp, 0)
+        arm.mark(&mut code, ctz_done)
+        arm.mov(&mut code, 0, 2)
+    } else if id == hb.INTRINSIC_INT_SWAP_BYTES {
+        if bits > 8 {
+            arm.imm(&mut code, 2, 0); arm.imm(&mut code, 3, 255); arm.imm(&mut code, 4, 8)
+            for _ in 0..(bits / 8) {
+                arm.integer_binary(&mut code, 14, true, false, 2, 2, 4, -1)
+                arm.integer_binary(&mut code, 8, true, false, 5, 0, 3, -1)
+                arm.integer_binary(&mut code, 9, true, false, 2, 2, 5, -1)
+                arm.integer_binary(&mut code, 15, true, false, 0, 0, 4, -1)
             }
-            arm.branch(&mut code, keep, cc)
-            arm.mov(&mut code, 0, 1)
-            arm.mark(&mut code, keep)
+            arm.mov(&mut code, 0, 2)
+            if !is_u && bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+            else if !is_u && bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
         }
+    } else if id == hb.INTRINSIC_INT_REV_BITS {
+        arm.imm(&mut code, 2, 0); arm.imm(&mut code, 3, i64(bits)); arm.imm(&mut code, 4, 1)
+        rb_lp := arm.label(&mut code); rb_done := arm.label(&mut code)
+        arm.mark(&mut code, rb_lp)
+        arm.compare_immediate(&mut code, 3, 0, false); arm.branch(&mut code, rb_done, 2)
+        arm.integer_binary(&mut code, 14, true, false, 2, 2, 4, -1)
+        arm.integer_binary(&mut code, 8, true, false, 5, 0, 4, -1)
+        arm.integer_binary(&mut code, 9, true, false, 2, 2, 5, -1)
+        arm.integer_binary(&mut code, 15, true, false, 0, 0, 4, -1)
+        arm.integer_binary(&mut code, 2, true, false, 3, 3, -1, 1)
+        arm.branch(&mut code, rb_lp, 0)
+        arm.mark(&mut code, rb_done)
+        arm.mov(&mut code, 0, 2)
+        if !is_u && bits == 32 { arm.sign_extend_i32(&mut code, 0, 0) }
+        else if !is_u && bits == 16 { arm.bitfield(&mut code, true, true, 0, 0, 0, 15) }
+        else if !is_u && bits == 8 { arm.bitfield(&mut code, true, true, 0, 0, 0, 7) }
+    }
+    arm.load_into(&mut code, dst_addr, 10)
+    helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+}
+
+fn emit_opt_res_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
+    dst_addr := alloc_slot(&mut fc)
+    emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+    arg_op := body.call_args[tm.arg_start]
+    aty := operand_type(&body, arg_op)
+    op := body.ops[arg_op]
+    e_addr := alloc_slot(&mut fc)
+    emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, 10)
+    if helpers.is_boxed_heap(&prog.types, aty) { helpers.load_mem(&mut code, 10, 10, 0) }
+    arm.store(&mut code, e_addr, 10)
+
+    if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_RES_IS_OK ||
+        id == hb.INTRINSIC_OPT_IS_NONE || id == hb.INTRINSIC_RES_IS_ERR {
+        arm.transfer(&mut code, true, 0, 10, 4, 0)
+        want: i64 = if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_RES_IS_OK { 0 } else { 1 }
+        arm.compare_immediate(&mut code, 0, want, false)
+        arm.set_condition(&mut code, 0, 0)
         arm.load_into(&mut code, dst_addr, 10)
         helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
         return
     }
-
-    // 14. Option / Result helper methods
-    if id >= hb.INTRINSIC_RES_ERR && id <= hb.INTRINSIC_OPT_IS_SOME && tm.arg_len >= 1 {
-        dst_addr := alloc_slot(&mut fc)
-        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-        arg_op := body.call_args[tm.arg_start]
-        aty := operand_type(&body, arg_op)
-        op := body.ops[arg_op]
-        e_addr := alloc_slot(&mut fc)
-        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, op.id, 10)
-        if helpers.is_boxed_heap(&prog.types, aty) { helpers.load_mem(&mut code, 10, 10, 0) }
-        arm.store(&mut code, e_addr, 10)
-
-        if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_RES_IS_OK ||
-            id == hb.INTRINSIC_OPT_IS_NONE || id == hb.INTRINSIC_RES_IS_ERR {
-            arm.transfer(&mut code, true, 0, 10, 4, 0) // tag
-            want: i64 = if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_RES_IS_OK { 0 } else { 1 }
-            arm.compare_immediate(&mut code, 0, want, false)
-            arm.set_condition(&mut code, 0, 0)
-            arm.load_into(&mut code, dst_addr, 10)
-            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
-            return
+    if id == hb.INTRINSIC_UNWRAP || id == hb.INTRINSIC_UNWRAP_ERR {
+        want_v := if id == hb.INTRINSIC_UNWRAP { 0 } else { 1 }
+        ok_lbl := arm.label(&mut code)
+        arm.transfer(&mut code, true, 0, 10, 4, 0)
+        arm.compare_immediate(&mut code, 0, i64(want_v), false)
+        arm.branch(&mut code, ok_lbl, 2)
+        arm.branch(&mut code, h.trap_panic, 0)
+        arm.mark(&mut code, ok_lbl)
+        v := &prog.types.variants[prog.types.entries[aty].inner_a + want_v]
+        if v.payload_count > 0 {
+            arm.load_into(&mut code, e_addr, 11)
+            emit_add_imm(&mut code, 11, 11, helpers.enum_payload_offset(&prog.types, aty, want_v, 0))
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, dest_ty, 11, dst_addr)
         }
-        if id == hb.INTRINSIC_UNWRAP || id == hb.INTRINSIC_UNWRAP_ERR {
-            want_v := if id == hb.INTRINSIC_UNWRAP { 0 } else { 1 }
-            ok_lbl := arm.label(&mut code)
-            arm.transfer(&mut code, true, 0, 10, 4, 0)
-            arm.compare_immediate(&mut code, 0, i64(want_v), false)
-            arm.branch(&mut code, ok_lbl, 2)
-            arm.branch(&mut code, h.trap_panic, 0)
-            arm.mark(&mut code, ok_lbl)
-            v := &prog.types.variants[prog.types.entries[aty].inner_a + want_v]
-            if v.payload_count > 0 {
+        return
+    }
+    if id == hb.INTRINSIC_UNWRAP_OR && tm.arg_len >= 2 {
+        is_none := arm.label(&mut code); done := arm.label(&mut code)
+        arm.load_into(&mut code, e_addr, 10)
+        arm.transfer(&mut code, true, 0, 10, 4, 0)
+        arm.branch(&mut code, is_none, 19)
+        v := &prog.types.variants[prog.types.entries[aty].inner_a]
+        if v.payload_count > 0 {
+            arm.load_into(&mut code, e_addr, 11)
+            emit_add_imm(&mut code, 11, 11, helpers.enum_payload_offset(&prog.types, aty, 0, 0))
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, dest_ty, 11, dst_addr)
+        }
+        arm.branch(&mut code, done, 0)
+        arm.mark(&mut code, is_none)
+        emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], dst_addr)
+        arm.mark(&mut code, done)
+        return
+    }
+    if id == hb.INTRINSIC_UNWRAP_OR_DEFAULT {
+        is_none := arm.label(&mut code); done := arm.label(&mut code)
+        arm.load_into(&mut code, e_addr, 10)
+        arm.transfer(&mut code, true, 0, 10, 4, 0)
+        arm.branch(&mut code, is_none, 19)
+        v := &prog.types.variants[prog.types.entries[aty].inner_a]
+        if v.payload_count > 0 {
+            arm.load_into(&mut code, e_addr, 11)
+            emit_add_imm(&mut code, 11, 11, helpers.enum_payload_offset(&prog.types, aty, 0, 0))
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, dest_ty, 11, dst_addr)
+        }
+        arm.branch(&mut code, done, 0)
+        arm.mark(&mut code, is_none)
+        emit_default_value_to_addr(&mut code, &prog.types, &mut fc, &mut h, dest_ty, dst_addr)
+        arm.mark(&mut code, done)
+        return
+    }
+    if id == hb.INTRINSIC_RES_OK || id == hb.INTRINSIC_RES_ERR {
+        want_v := if id == hb.INTRINSIC_RES_OK { 0 } else { 1 }
+        is_miss := arm.label(&mut code); done := arm.label(&mut code)
+        arm.load_into(&mut code, e_addr, 10)
+        arm.transfer(&mut code, true, 0, 10, 4, 0)
+        arm.compare_immediate(&mut code, 0, i64(want_v), false)
+        arm.branch(&mut code, is_miss, 3)
+        v_src := &prog.types.variants[prog.types.entries[aty].inner_a + want_v]
+        p_ty := if v_src.payload_count > 0 { prog.types.fields[v_src.payload_start].ty } else { ht.TY_UNIT }
+        if helpers.is_inline_agg(&prog.types, dest_ty) {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            if v_src.payload_count > 0 {
+                p_dst := alloc_slot(&mut fc)
+                arm.load_into(&mut code, dst_addr, 10)
+                emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+                arm.store(&mut code, p_dst, 10)
                 arm.load_into(&mut code, e_addr, 11)
                 emit_add_imm(&mut code, 11, 11, helpers.enum_payload_offset(&prog.types, aty, want_v, 0))
-                arm.load_into(&mut code, dst_addr, 10)
-                if helpers.is_fat_pair(&prog.types, dest_ty) {
-                    helpers.copy_bytes(&mut code, 10, 11, 16)
-                } else if helpers.is_inline_agg(&prog.types, dest_ty) {
-                    helpers.copy_bytes(&mut code, 10, 11, helpers.type_byte_size(&prog.types, dest_ty))
-                } else {
-                    helpers.load_typed_at(&mut code, &prog.types, dest_ty, 0, 11, 0)
-                    helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
-                }
+                emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, p_ty, 11, p_dst)
             }
-            return
-        }
-        if id == hb.INTRINSIC_UNWRAP_OR && tm.arg_len >= 2 {
-            is_none := arm.label(&mut code); done := arm.label(&mut code)
-            arm.load_into(&mut code, e_addr, 10)
-            arm.transfer(&mut code, true, 0, 10, 4, 0)
-            arm.branch(&mut code, is_none, 19) // tag != 0 -> fallback
-            v := &prog.types.variants[prog.types.entries[aty].inner_a]
-            if v.payload_count > 0 {
+        } else {
+            alloc_sz := helpers.enum_alloc_size(&prog.types, dest_ty)
+            obj_s := alloc_slot(&mut fc)
+            arm.imm(&mut code, 0, i64(alloc_sz)); arm.branch(&mut code, h.rt.alloc, 1)
+            arm.store(&mut code, obj_s, 0); helpers.zero_bytes(&mut code, 0, alloc_sz)
+            if v_src.payload_count > 0 {
+                p_dst := alloc_slot(&mut fc)
+                arm.load_into(&mut code, obj_s, 10)
+                emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+                arm.store(&mut code, p_dst, 10)
                 arm.load_into(&mut code, e_addr, 11)
-                emit_add_imm(&mut code, 11, 11, helpers.enum_payload_offset(&prog.types, aty, 0, 0))
-                arm.load_into(&mut code, dst_addr, 10)
-                if helpers.is_fat_pair(&prog.types, dest_ty) { helpers.copy_bytes(&mut code, 10, 11, 16) }
-                else if helpers.is_inline_agg(&prog.types, dest_ty) { helpers.copy_bytes(&mut code, 10, 11, helpers.type_byte_size(&prog.types, dest_ty)) }
-                else {
-                    helpers.load_typed_at(&mut code, &prog.types, dest_ty, 0, 11, 0)
-                    helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
-                }
+                emit_add_imm(&mut code, 11, 11, helpers.enum_payload_offset(&prog.types, aty, want_v, 0))
+                emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, p_ty, 11, p_dst)
             }
-            arm.branch(&mut code, done, 0)
-            arm.mark(&mut code, is_none)
-            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], dst_addr)
-            arm.mark(&mut code, done)
-            return
+            arm.load(&mut code, obj_s); arm.load_into(&mut code, dst_addr, 10); helpers.store_mem(&mut code, 0, 10, 0)
         }
+        arm.branch(&mut code, done, 0)
+        arm.mark(&mut code, is_miss)
+        if helpers.is_inline_agg(&prog.types, dest_ty) {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            arm.imm(&mut code, 0, 1); arm.transfer(&mut code, false, 0, 10, 2, 0)
+        } else {
+            alloc_sz := helpers.enum_alloc_size(&prog.types, dest_ty)
+            arm.imm(&mut code, 0, i64(alloc_sz)); arm.branch(&mut code, h.rt.alloc, 1)
+            obj_s := alloc_slot(&mut fc); arm.store(&mut code, obj_s, 0)
+            helpers.zero_bytes(&mut code, 0, alloc_sz)
+            arm.imm(&mut code, 1, 1); arm.transfer(&mut code, false, 1, 0, 2, 0)
+            arm.load(&mut code, obj_s); arm.load_into(&mut code, dst_addr, 10); helpers.store_mem(&mut code, 0, 10, 0)
+        }
+        arm.mark(&mut code, done)
     }
+}
 
-    // 15. sys.* basics
+fn emit_misc_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, ffi: &mut ffi_emit.FfiState,
+    ts: &mut task_emit.TaskEmitState, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
+    if id == hb.INTRINSIC_STR_BYTES && tm.arg_len >= 1 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        arg_op := body.call_args[tm.arg_start]
+        aty := operand_type(&body, arg_op)
+        if prog.types.entries[aty].kind == .FatStr {
+            v_base := alloc_slots(&mut fc, 2); v_addr := alloc_slot(&mut fc)
+            emit_slots_addr(&mut code, v_base, 2, 0); arm.store(&mut code, v_addr, 0)
+            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, arg_op, v_addr)
+            arm.load(&mut code, v_addr)
+            arm.branch(&mut code, h.rt.str_view_bytes, 1)
+        } else {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, arg_op, 0)
+            arm.branch(&mut code, h.rt.string_bytes, 1)
+        }
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_FORMAT_INT && tm.arg_len >= 2 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        val_op := body.call_args[tm.arg_start]
+        vty := operand_type(&body, val_op)
+        spec_op := body.ops[body.call_args[tm.arg_start + 1]]
+        spec_txt := if spec_op.kind == .Const { body.consts[spec_op.id].text.clone() } else { "" }
+        spec := lexer.integer_format(spec_txt)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 0)
+        arm.imm(&mut code, 1, i64(spec.width))
+        arm.imm(&mut code, 2, if helpers.is_unsigned_int(vty) { 1 } else { 0 })
+        arm.imm(&mut code, 3, i64(spec.radix))
+        arm.imm(&mut code, 4, i64(spec.letter_offset))
+        arm.imm(&mut code, 5, i64(spec.padding))
+        arm.branch(&mut code, h.rt.string_formatted_integer, 1)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_FORMAT_STR && tm.arg_len >= 2 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        val_op := body.call_args[tm.arg_start]
+        vty := operand_type(&body, val_op)
+        spec_op := body.ops[body.call_args[tm.arg_start + 1]]
+        spec_txt := if spec_op.kind == .Const { body.consts[spec_op.id].text.clone() } else { "" }
+        spec := lexer.string_format(spec_txt)
+        if prog.types.entries[vty].kind == .FatStr {
+            v_base := alloc_slots(&mut fc, 2); v_addr := alloc_slot(&mut fc)
+            emit_slots_addr(&mut code, v_base, 2, 0); arm.store(&mut code, v_addr, 0)
+            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, val_op, v_addr)
+            arm.load(&mut code, v_addr)
+            arm.branch(&mut code, h.rt.str_view_to_string, 1)
+            tmp_s := alloc_slot(&mut fc); arm.store(&mut code, tmp_s, 0)
+            arm.imm(&mut code, 1, i64(spec.width))
+            arm.imm(&mut code, 2, i64(spec.align))
+            arm.branch(&mut code, h.rt.string_formatted_string, 1)
+            res_s := alloc_slot(&mut fc); arm.store(&mut code, res_s, 0)
+            arm.load(&mut code, tmp_s); arm.branch(&mut code, h.rt.release, 1)
+            arm.load(&mut code, res_s)
+        } else {
+            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 0)
+            arm.imm(&mut code, 1, i64(spec.width))
+            arm.imm(&mut code, 2, i64(spec.align))
+            arm.branch(&mut code, h.rt.string_formatted_string, 1)
+        }
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+    if id >= hb.INTRINSIC_LOAD_U64 && id <= hb.INTRINSIC_LOAD_PTR && tm.arg_len >= 1 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 11)
+        helpers.load_typed_at(&mut code, &prog.types, dest_ty, 0, 11, 0)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return
+    }
+    if id >= hb.INTRINSIC_STORE_U64 && id <= hb.INTRINSIC_STORE_PTR && tm.arg_len >= 2 {
+        ptr_s := alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
+        arm.store(&mut code, ptr_s, 0)
+        val_op := body.call_args[tm.arg_start + 1]
+        vty := operand_type(&body, val_op)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 0)
+        arm.load_into(&mut code, ptr_s, 11)
+        helpers.store_typed_at(&mut code, &prog.types, vty, 0, 11, 0)
+        return
+    }
+    if id == hb.INTRINSIC_BYTES_VIEW && tm.arg_len >= 3 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        p_s := alloc_slot(&mut fc); l_s := alloc_slot(&mut fc)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0)
+        arm.store(&mut code, p_s, 0)
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], 0)
+        arm.store(&mut code, l_s, 0)
+        arm.load_into(&mut code, p_s, 0)
+        arm.load_into(&mut code, l_s, 1)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        helpers.store_mem(&mut code, 1, 10, 8)
+        return
+    }
+    if id == hb.INTRINSIC_EMBED_BYTES {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        bid := tm.sig_ty
+        cnt := if bid >= 0 && bid < prog.embed_counts.len { prog.embed_counts[bid] } else { 0 }
+        arr_s := alloc_slot(&mut fc)
+        if cnt == 0 {
+            arm.imm(&mut code, 2, 0) // u8 layout
+            arm.branch(&mut code, h.rt.array_new, 1)
+            arm.store(&mut code, arr_s, 0)
+        } else {
+            arm.imm(&mut code, 1, i64(cnt))
+            arm.imm(&mut code, 2, 0) // u8 layout
+            arm.branch(&mut code, h.rt.array_literal, 1)
+            arm.store(&mut code, arr_s, 0)
+            if bid >= 0 && bid < h.embed_labels.len {
+                helpers.load_label_addr(&mut code, h.embed_labels[bid], 1)
+                arm.load_into(&mut code, arr_s, 10)
+                helpers.load_mem(&mut code, 0, 10, 0) // arr.data
+                arm.imm(&mut code, 2, i64(cnt))
+                arm.branch(&mut code, h.rt.memory_copy, 1)
+                arm.load_into(&mut code, arr_s, 10)
+                arm.imm(&mut code, 11, i64(cnt))
+                helpers.store_mem(&mut code, 11, 10, 8) // arr.len = cnt
+            }
+        }
+        arm.load(&mut code, arr_s)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+    if id == hb.INTRINSIC_STATIC_BYTES && tm.arg_len >= 2 {
+        dst_addr := alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
+        len_op := body.ops[body.call_args[tm.arg_start + 1]]
+        mut n_bytes := 8
+        if len_op.kind == .Const && body.consts[len_op.id].int_val > 0 {
+            n_bytes = i32(body.consts[len_op.id].int_val)
+        }
+        ffi.globals = ((ffi.globals + 7) / 8) * 8
+        off := ffi.globals
+        ffi.globals += ((n_bytes + 7) / 8) * 8
+        if !code.checking {
+            ffi.sites.push(arm.position(&code) * 4)
+            ffi.slots.push(-1 - off)
+        }
+        arm.native_address(&mut code, 16)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 16, 10, 0)
+        return
+    }
     if id == hb.INTRINSIC_SYS_STDERR && tm.arg_len >= 1 {
         dst_addr := alloc_slot(&mut fc)
         emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
         emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
         arm.branch(&mut code, h.rt.sys_stderr, 1)
-        arm.load_into(&mut code, dst_addr, 10)
-        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        emit_store_sys_status(&mut code, &prog.types, &mut fc, &h, dest_ty, dst_addr)
         return
     }
     if id == hb.INTRINSIC_SYS_EXIT {
-        if tm.arg_len > 0 {
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
-        } else {
-            arm.imm(&mut code, 0, 0)
-        }
+        if tm.arg_len > 0 { emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0) }
+        else { arm.imm(&mut code, 0, 0) }
         arm.syscall(&mut code, 33554433, 94)
         arm.emit(&mut code, 3558866944)
         return
@@ -2024,87 +2577,609 @@ fn emit_intrinsic_call(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirB
             pool_s, size_s, val_s, val_ty, dst_addr, dest_ty, t1, t2)
         return
     }
+}
 
-    // 18. Raw unsafe memory `load_*` / `store_*` intrinsics
-    if id <= hb.INTRINSIC_LOAD_PTR && id >= hb.INTRINSIC_LOAD_U64 && tm.arg_len >= 1 {
-        dst_addr := alloc_slot(&mut fc)
-        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 10)
-        helpers.load_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+// Helper: emit default value for `ty` into `dst_addr_slot` (empty string, empty array, zeroed POD/scalar, or empty Map/Set).
+fn emit_default_value_to_addr(code: &mut arm.Code, types: &ht.TypeTable, fc: &mut FnEmitCtx,
+    h: &mut helpers.EmitHelpers, ty: i32, dst_addr_slot: i32) {
+    if ty == ht.TY_STRING {
+        lbl := helpers.intern_string(&mut code, &mut h, "")
+        helpers.load_label_addr(&mut code, lbl, 0)
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+    } else if ty >= 0 && ty < types.entries.len && types.entries[ty].kind == .Array {
+        elem_ty := types.entries[ty].inner_a
+        layout := helpers.array_elem_layout(&types, elem_ty)
+        arm.imm(&mut code, 2, i64(layout))
+        arm.branch(&mut code, h.rt.array_new, 1)
+        arr_s := alloc_slot(&mut fc); arm.store(&mut code, arr_s, 0)
+        if elem_ty >= 0 && elem_ty < h.clone_labels.len && h.clone_labels[elem_ty] >= 0 {
+            helpers.load_label_addr(&mut code, h.clone_labels[elem_ty], 1)
+            arm.load_into(&mut code, arr_s, 10); helpers.store_mem(&mut code, 1, 10, 32)
+        }
+        if elem_ty >= 0 && elem_ty < h.drop_labels.len && h.drop_labels[elem_ty] >= 0 {
+            helpers.load_label_addr(&mut code, h.drop_labels[elem_ty], 1)
+            arm.load_into(&mut code, arr_s, 10); helpers.store_mem(&mut code, 1, 10, 40)
+        }
+        arm.load(&mut code, arr_s); arm.load_into(&mut code, dst_addr_slot, 10); helpers.store_mem(&mut code, 0, 10, 0)
+    } else if helpers.is_fat_pair(&types, ty) {
+        arm.load_into(&mut code, dst_addr_slot, 10); helpers.zero_bytes(&mut code, 10, 16)
+    } else if helpers.is_inline_agg(&types, ty) {
+        arm.load_into(&mut code, dst_addr_slot, 10); helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&types, ty))
+    } else {
+        arm.load_into(&mut code, dst_addr_slot, 10); helpers.store_typed_at(&mut code, &types, ty, 31, 10, 0)
+    }
+}
+
+fn map_key_kind_for(types: &ht.TypeTable, key_ty: i32) -> i64 {
+    if key_ty == ht.TY_STRING { return 1 }
+    if helpers.is_inline_agg(&types, key_ty) { return i64(2 + helpers.type_byte_size(&types, key_ty)) }
+    if helpers.is_fat_pair(&types, key_ty) { return 18 }
+    0
+}
+
+// Load a Map key operand into a slot (register value for scalar/string, or stack temp pointer for inline POD).
+fn emit_map_key_slot(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, op_id: i32, key_ty: i32, retain_copy: bool) -> i32 {
+    s := alloc_slot(&mut fc)
+    if helpers.is_inline_agg(&prog.types, key_ty) || helpers.is_fat_pair(&prog.types, key_ty) {
+        slots := helpers.local_slot_count(&prog.types, key_ty)
+        b := alloc_slots(&mut fc, slots)
+        emit_slots_addr(&mut code, b, slots, 0); arm.store(&mut code, s, 0)
+        emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, op_id, s)
+        return s
+    }
+    if retain_copy {
+        emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
+    } else {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
+    }
+    arm.store(&mut code, s, 0)
+    s
+}
+
+// Emit Map<K, V> / Set<K> runtime intrinsic call.
+fn emit_map_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
+    map_ty := if tm.sig_ty >= 0 && ht.find_map_inst(&prog.types, tm.sig_ty) >= 0 { tm.sig_ty }
+        else if ht.find_map_inst(&prog.types, dest_ty) >= 0 { dest_ty }
+        else if tm.arg_len > 0 { operand_type(&body, body.call_args[tm.arg_start]) }
+        else { -1 }
+    mi := ht.find_map_inst(&prog.types, map_ty)
+    if mi < 0 { return }
+    k_ty := prog.types.map_insts[mi].key_ty
+    is_set := prog.types.map_insts[mi].is_set
+    v_ty := if is_set { ht.TY_BOOL } else { prog.types.map_insts[mi].val_ty }
+
+    mut dst_addr := -1
+    if dest_ty != ht.TY_UNIT {
+        dst_addr = alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0)
+        arm.store(&mut code, dst_addr, 0)
+    }
+
+    // 1. Map::new() / Set::new()
+    if id == hb.INTRINSIC_MAP_NEW || id == hb.INTRINSIC_SET_NEW {
+        kl := helpers.array_elem_layout(&prog.types, k_ty)
+        vl := helpers.array_elem_layout(&prog.types, v_ty)
+        kk := map_key_kind_for(&prog.types, k_ty)
+        if k_ty >= 0 && k_ty < h.clone_labels.len && h.clone_labels[k_ty] >= 0 { helpers.load_label_addr(&mut code, h.clone_labels[k_ty], 2) }
+        else { arm.imm(&mut code, 2, 0) }
+        if k_ty >= 0 && k_ty < h.drop_labels.len && h.drop_labels[k_ty] >= 0 { helpers.load_label_addr(&mut code, h.drop_labels[k_ty], 3) }
+        else { arm.imm(&mut code, 3, 0) }
+        if v_ty >= 0 && v_ty < h.clone_labels.len && h.clone_labels[v_ty] >= 0 { helpers.load_label_addr(&mut code, h.clone_labels[v_ty], 4) }
+        else { arm.imm(&mut code, 4, 0) }
+        if v_ty >= 0 && v_ty < h.drop_labels.len && h.drop_labels[v_ty] >= 0 { helpers.load_label_addr(&mut code, h.drop_labels[v_ty], 5) }
+        else { arm.imm(&mut code, 5, 0) }
+        arm.imm(&mut code, 0, i64(kl))
+        arm.imm(&mut code, 1, i64(vl))
+        arm.imm(&mut code, 6, kk)
+        arm.branch(&mut code, h.map_new, 1)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+
+    if tm.arg_len == 0 { return }
+    hdr_s := alloc_slot(&mut fc)
+    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
+    arm.store(&mut code, hdr_s, 0)
+
+    // 2. len / is_empty / clear / reserve
+    if id == hb.INTRINSIC_MAP_LEN || id == hb.INTRINSIC_MAP_IS_EMPTY {
+        arm.load_into(&mut code, hdr_s, 10)
+        helpers.load_mem(&mut code, 10, 10, 0) // keys_arr
+        helpers.load_mem(&mut code, 0, 10, 8)  // len
+        if id == hb.INTRINSIC_MAP_IS_EMPTY {
+            arm.compare_immediate(&mut code, 0, 0, false)
+            arm.set_condition(&mut code, 0, 0)
+        }
         arm.load_into(&mut code, dst_addr, 10)
         helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
         return
     }
-    if id <= hb.INTRINSIC_STORE_PTR && id >= hb.INTRINSIC_STORE_U64 && tm.arg_len >= 2 {
-        ptr_s := alloc_slot(&mut fc); val_s := alloc_slot(&mut fc)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start], 0)
-        arm.store(&mut code, ptr_s, 0)
-        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 0)
-        arm.store(&mut code, val_s, 0)
-        sty := if id == hb.INTRINSIC_STORE_PTR { ht.TY_PTR }
-            else if id == hb.INTRINSIC_STORE_I8 { ht.TY_I8 }
-            else if id == hb.INTRINSIC_STORE_I16 { ht.TY_I16 }
-            else if id == hb.INTRINSIC_STORE_I32 { ht.TY_I32 }
-            else if id == hb.INTRINSIC_STORE_I64 { ht.TY_I64 }
-            else if id == hb.INTRINSIC_STORE_U8 { ht.TY_U8 }
-            else if id == hb.INTRINSIC_STORE_U16 { ht.TY_U16 }
-            else if id == hb.INTRINSIC_STORE_U32 { ht.TY_U32 }
-            else { ht.TY_U64 }
-        arm.load_into(&mut code, ptr_s, 10)
-        arm.load_into(&mut code, val_s, 0)
-        helpers.store_typed_at(&mut code, &prog.types, sty, 0, 10, 0)
+    if id == hb.INTRINSIC_MAP_CLEAR {
+        arm.load(&mut code, hdr_s)
+        arm.branch(&mut code, h.map_clear, 1)
+        return
+    }
+    if id == hb.INTRINSIC_MAP_RESERVE && tm.arg_len >= 2 {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arm.load(&mut code, hdr_s)
+        arm.branch(&mut code, h.map_reserve, 1)
         return
     }
 
-    // 19. Runtime `__sys_*` intrinsics (atomics, memory, pool, net/poll, linux_syscall, now_ms)
-    mut rt_lbl := -1
-    mut deref_arg := -1
-    if id == hb.INTRINSIC_SYS_ATOMIC_LOAD { rt_lbl = h.rt.atomic_load_i64 }
-    else if id == hb.INTRINSIC_SYS_ATOMIC_STORE { rt_lbl = h.rt.atomic_store_i64 }
-    else if id == hb.INTRINSIC_SYS_ATOMIC_CAS { rt_lbl = h.rt.atomic_cas_i64 }
-    else if id == hb.INTRINSIC_SYS_ATOMIC_FETCH_ADD { rt_lbl = h.rt.atomic_fetch_add_i64 }
-    else if id == hb.INTRINSIC_SYS_MEMORY_COPY { rt_lbl = h.rt.memory_copy }
-    else if id == hb.INTRINSIC_SYS_MEMORY_ZERO { rt_lbl = h.rt.memory_zero }
-    else if id == hb.INTRINSIC_SYS_POOL_ALLOC_TRY { rt_lbl = h.rt.pool_alloc_try }
-    else if id == hb.INTRINSIC_SYS_POOL_FREE { rt_lbl = h.rt.release }
-    else if id == hb.INTRINSIC_SYS_LINUX_SYSCALL { rt_lbl = h.rt.sys_linux_syscall }
-    else if id == hb.INTRINSIC_SYS_NET_POLL { rt_lbl = h.rt.sys_net_poll; deref_arg = 0 }
-    else if id == hb.INTRINSIC_SYS_NET_READ { rt_lbl = h.rt.sys_net_read; deref_arg = 1 }
-    else if id == hb.INTRINSIC_SYS_NET_WRITE { rt_lbl = h.rt.sys_net_write; deref_arg = 1 }
-    else if id == hb.INTRINSIC_SYS_NET_CLOSE { rt_lbl = h.rt.sys_net_close }
-    else if id == hb.INTRINSIC_SYS_NET_SET_NONBLOCK { rt_lbl = h.rt.sys_net_set_nonblocking }
-    else if id == hb.INTRINSIC_SYS_NOW_MS { rt_lbl = h.rt.sys_now_ms }
-    else if id == hb.INTRINSIC_SYS_FD_WRITE { rt_lbl = h.rt.sys_fd_write; deref_arg = 1 }
-    if rt_lbl >= 0 {
-        mut arg_s: []i32 = []
-        for ai in 0..tm.arg_len {
-            aop := body.call_args[tm.arg_start + ai]
-            aty := operand_type(&body, aop)
-            s := alloc_slot(&mut fc)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
-            if ai == deref_arg && aty >= 0 && aty < prog.types.entries.len &&
-                (prog.types.entries[aty].kind == .Ref || prog.types.entries[aty].kind == .MutRef) {
-                helpers.load_mem(&mut code, 0, 0, 0)
+    // 3. put / put_new / insert
+    if (id == hb.INTRINSIC_MAP_PUT || id == hb.INTRINSIC_MAP_PUT_NEW || id == hb.INTRINSIC_SET_INSERT) && tm.arg_len >= 2 {
+        key_op := body.call_args[tm.arg_start + 1]
+        k_s := emit_map_key_slot(&mut code, &prog, &body, &mut fc, &mut h, key_op, k_ty, true)
+        v_s := alloc_slot(&mut fc)
+        if id == hb.INTRINSIC_SET_INSERT {
+            arm.imm(&mut code, 0, 1); arm.store(&mut code, v_s, 0)
+        } else if tm.arg_len >= 3 {
+            val_op := body.call_args[tm.arg_start + 2]
+            if helpers.is_inline_agg(&prog.types, v_ty) || helpers.is_fat_pair(&prog.types, v_ty) {
+                vslots := helpers.local_slot_count(&prog.types, v_ty)
+                vb := alloc_slots(&mut fc, vslots)
+                emit_slots_addr(&mut code, vb, vslots, 0); arm.store(&mut code, v_s, 0)
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, val_op, v_s)
+            } else {
+                emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, val_op, 0)
+                arm.store(&mut code, v_s, 0)
             }
-            arm.store(&mut code, s, 0)
-            arg_s.push(s)
+        } else {
+            arm.store(&mut code, v_s, 31)
         }
-        mut dst_addr := -1
+        arm.load(&mut code, hdr_s)
+        arm.load_into(&mut code, k_s, 1)
+        arm.load_into(&mut code, v_s, 2)
+        arm.imm(&mut code, 3, if id == hb.INTRINSIC_MAP_PUT { 1 } else { 0 })
+        arm.branch(&mut code, h.map_put, 1)
+        res_s := alloc_slot(&mut fc); arm.store(&mut code, res_s, 0)
+        // If key already existed (res == 0) and key was owned, release unused incoming key
+        if helpers.type_needs_drop(&prog.types, k_ty) && k_ty >= 0 && k_ty < h.drop_labels.len && h.drop_labels[k_ty] >= 0 {
+            was_ins := arm.label(&mut code)
+            arm.branch(&mut code, was_ins, 19) // cbnz x0 -> inserted
+            arm.load(&mut code, k_s)
+            arm.branch(&mut code, h.drop_labels[k_ty], 1)
+            arm.mark(&mut code, was_ins)
+        }
+        if id != hb.INTRINSIC_MAP_PUT && helpers.type_needs_drop(&prog.types, v_ty) && v_ty >= 0 && v_ty < h.drop_labels.len && h.drop_labels[v_ty] >= 0 {
+            was_ins2 := arm.label(&mut code)
+            arm.load(&mut code, res_s)
+            arm.branch(&mut code, was_ins2, 19)
+            arm.load(&mut code, v_s)
+            arm.branch(&mut code, h.drop_labels[v_ty], 1)
+            arm.mark(&mut code, was_ins2)
+        }
         if dest_ty != ht.TY_UNIT {
-            dst_addr = alloc_slot(&mut fc)
-            emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0); arm.store(&mut code, dst_addr, 0)
-        }
-        for ai in 0..arg_s.len {
-            if ai < 8 { arm.load_into(&mut code, arg_s[ai], ai) }
-        }
-        arm.branch(&mut code, rt_lbl, 1)
-        if dst_addr >= 0 {
-            r0 := alloc_slot(&mut fc); arm.store(&mut code, r0, 0)
+            arm.load(&mut code, res_s)
             arm.load_into(&mut code, dst_addr, 10)
-            arm.load_into(&mut code, r0, 0)
             helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
         }
         return
+    }
+
+    // 4. contains / index_of / find_index / remove
+    if (id == hb.INTRINSIC_MAP_CONTAINS || id == hb.INTRINSIC_MAP_INDEX_OF || id == hb.INTRINSIC_MAP_FIND_INDEX || id == hb.INTRINSIC_MAP_REMOVE) && tm.arg_len >= 2 {
+        k_s := emit_map_key_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], k_ty, false)
+        arm.load(&mut code, hdr_s)
+        arm.load_into(&mut code, k_s, 1)
+        if id == hb.INTRINSIC_MAP_REMOVE {
+            arm.branch(&mut code, h.map_remove, 1)
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+            return
+        }
+        arm.branch(&mut code, h.map_find_index, 1)
+        if id == hb.INTRINSIC_MAP_CONTAINS {
+            arm.compare_immediate(&mut code, 0, 0, false)
+            arm.set_condition(&mut code, 0, 10) // ge 0
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        } else if id == hb.INTRINSIC_MAP_INDEX_OF {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        } else {
+            // find_index -> Option<i32>
+            idx_s := alloc_slot(&mut fc); arm.store(&mut code, idx_s, 0)
+            miss_l := arm.label(&mut code); done_l := arm.label(&mut code)
+            arm.compare_immediate(&mut code, 0, 0, false)
+            arm.branch(&mut code, miss_l, 13)
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            arm.load(&mut code, idx_s)
+            arm.load_into(&mut code, dst_addr, 10)
+            emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+            helpers.store_typed_at(&mut code, &prog.types, ht.TY_I32, 0, 10, 0)
+            arm.branch(&mut code, done_l, 0)
+            arm.mark(&mut code, miss_l)
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            arm.imm(&mut code, 0, 1); arm.transfer(&mut code, false, 0, 10, 2, 0)
+            arm.mark(&mut code, done_l)
+        }
+        return
+    }
+
+    // 5. get / get_or / get_or_default / get_ref / at / at_mut / take
+    if (id == hb.INTRINSIC_MAP_GET || id == hb.INTRINSIC_MAP_GET_OR || id == hb.INTRINSIC_MAP_GET_OR_DEFAULT ||
+        id == hb.INTRINSIC_MAP_GET_REF || id == hb.INTRINSIC_MAP_AT || id == hb.INTRINSIC_MAP_AT_MUT || id == hb.INTRINSIC_MAP_TAKE) && tm.arg_len >= 2 {
+        k_s := emit_map_key_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], k_ty, false)
+        arm.load(&mut code, hdr_s)
+        arm.load_into(&mut code, k_s, 1)
+        arm.branch(&mut code, h.map_find_index, 1)
+        idx_s := alloc_slot(&mut fc); arm.store(&mut code, idx_s, 0)
+        v_stride := helpers.elem_stride(&prog.types, v_ty)
+
+        if id == hb.INTRINSIC_MAP_AT || id == hb.INTRINSIC_MAP_AT_MUT {
+            arm.compare_immediate(&mut code, 0, 0, false)
+            arm.branch(&mut code, h.trap_assert, 13) // assert(index >= 0)
+            arm.load_into(&mut code, hdr_s, 10)
+            helpers.load_mem(&mut code, 10, 10, 8) // vals_arr
+            helpers.load_mem(&mut code, 10, 10, 0) // vals_data
+            arm.imm(&mut code, 11, i64(v_stride))
+            arm.load_into(&mut code, idx_s, 12)
+            arm.integer_binary(&mut code, 3, true, false, 11, 12, 11, -1)
+            arm.integer_binary(&mut code, 1, true, false, 11, 10, 11, -1) // &vals[idx]
+            if id == hb.INTRINSIC_MAP_AT_MUT {
+                arm.load_into(&mut code, dst_addr, 10)
+                helpers.store_mem(&mut code, 11, 10, 0)
+            } else {
+                emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, v_ty, 11, dst_addr)
+            }
+            return
+        }
+
+        if id == hb.INTRINSIC_MAP_GET_OR || id == hb.INTRINSIC_MAP_GET_OR_DEFAULT {
+            miss_l := arm.label(&mut code); done_l := arm.label(&mut code)
+            arm.compare_immediate(&mut code, 0, 0, false)
+            arm.branch(&mut code, miss_l, 13)
+            arm.load_into(&mut code, hdr_s, 10)
+            helpers.load_mem(&mut code, 10, 10, 8)
+            helpers.load_mem(&mut code, 10, 10, 0)
+            arm.imm(&mut code, 11, i64(v_stride))
+            arm.load_into(&mut code, idx_s, 12)
+            arm.integer_binary(&mut code, 3, true, false, 11, 12, 11, -1)
+            arm.integer_binary(&mut code, 1, true, false, 11, 10, 11, -1)
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, v_ty, 11, dst_addr)
+            arm.branch(&mut code, done_l, 0)
+            arm.mark(&mut code, miss_l)
+            if id == hb.INTRINSIC_MAP_GET_OR && tm.arg_len >= 3 {
+                emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 2], dst_addr)
+            } else {
+                emit_default_value_to_addr(&mut code, &prog.types, &mut fc, &mut h, dest_ty, dst_addr)
+            }
+            arm.mark(&mut code, done_l)
+            return
+        }
+
+        // get / get_ref / take -> Option<V> (or Option<&V> / Option<K>)
+        miss_l := arm.label(&mut code); done_l := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 0, 0, false)
+        arm.branch(&mut code, miss_l, 13)
+        // Found at idx_s: compute element pointer into elem_ptr_s
+        elem_ptr_s := alloc_slot(&mut fc)
+        arr_off := if id == hb.INTRINSIC_MAP_TAKE && is_set { 0 } else { 8 }
+        pay_ty := ht.variant_payload_type(&prog.types, dest_ty, 0, 0)
+        arr_e_ty := if id == hb.INTRINSIC_MAP_TAKE && is_set { k_ty } else { v_ty }
+        e_stride := helpers.elem_stride(&prog.types, arr_e_ty)
+        arm.load_into(&mut code, hdr_s, 10)
+        helpers.load_mem(&mut code, 10, 10, arr_off)
+        helpers.load_mem(&mut code, 10, 10, 0)
+        arm.imm(&mut code, 11, i64(e_stride))
+        arm.load_into(&mut code, idx_s, 12)
+        arm.integer_binary(&mut code, 3, true, false, 11, 12, 11, -1)
+        arm.integer_binary(&mut code, 1, true, false, 11, 10, 11, -1)
+        arm.store(&mut code, elem_ptr_s, 11)
+        // Build Option.Some(val)
+        if helpers.is_inline_agg(&prog.types, dest_ty) {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            p_dst := alloc_slot(&mut fc)
+            arm.load_into(&mut code, dst_addr, 10)
+            emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+            arm.store(&mut code, p_dst, 10)
+            if id == hb.INTRINSIC_MAP_GET_REF {
+                arm.load_into(&mut code, elem_ptr_s, 0)
+                arm.load_into(&mut code, p_dst, 10)
+                helpers.store_mem(&mut code, 0, 10, 0)
+            } else {
+                arm.load_into(&mut code, elem_ptr_s, 11)
+                emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, pay_ty, 11, p_dst)
+            }
+        } else {
+            alloc_sz := helpers.enum_alloc_size(&prog.types, dest_ty)
+            obj_s := alloc_slot(&mut fc)
+            arm.imm(&mut code, 0, i64(alloc_sz)); arm.branch(&mut code, h.rt.alloc, 1)
+            arm.store(&mut code, obj_s, 0); helpers.zero_bytes(&mut code, 0, alloc_sz)
+            p_dst := alloc_slot(&mut fc)
+            arm.load_into(&mut code, obj_s, 10)
+            emit_add_imm(&mut code, 10, 10, helpers.enum_payload_offset(&prog.types, dest_ty, 0, 0))
+            arm.store(&mut code, p_dst, 10)
+            if id == hb.INTRINSIC_MAP_GET_REF {
+                arm.load_into(&mut code, elem_ptr_s, 0)
+                arm.load_into(&mut code, p_dst, 10)
+                helpers.store_mem(&mut code, 0, 10, 0)
+            } else {
+                arm.load_into(&mut code, elem_ptr_s, 11)
+                emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, pay_ty, 11, p_dst)
+            }
+            arm.load(&mut code, obj_s); arm.load_into(&mut code, dst_addr, 10); helpers.store_mem(&mut code, 0, 10, 0)
+        }
+        if id == hb.INTRINSIC_MAP_TAKE {
+            arm.load(&mut code, hdr_s)
+            arm.load_into(&mut code, k_s, 1)
+            arm.branch(&mut code, h.map_remove, 1)
+        }
+        arm.branch(&mut code, done_l, 0)
+        arm.mark(&mut code, miss_l)
+        if helpers.is_inline_agg(&prog.types, dest_ty) {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.zero_bytes(&mut code, 10, helpers.type_byte_size(&prog.types, dest_ty))
+            arm.imm(&mut code, 0, 1); arm.transfer(&mut code, false, 0, 10, 2, 0)
+        } else {
+            alloc_sz := helpers.enum_alloc_size(&prog.types, dest_ty)
+            arm.imm(&mut code, 0, i64(alloc_sz)); arm.branch(&mut code, h.rt.alloc, 1)
+            obj_s := alloc_slot(&mut fc); arm.store(&mut code, obj_s, 0)
+            helpers.zero_bytes(&mut code, 0, alloc_sz)
+            arm.imm(&mut code, 1, 1); arm.transfer(&mut code, false, 1, 0, 2, 0)
+            arm.load(&mut code, obj_s); arm.load_into(&mut code, dst_addr, 10); helpers.store_mem(&mut code, 0, 10, 0)
+        }
+        arm.mark(&mut code, done_l)
+        return
+    }
+
+    // 6. key_at / value_at / value_at_mut / keys / values
+    if (id == hb.INTRINSIC_MAP_KEY_AT || id == hb.INTRINSIC_MAP_VAL_AT || id == hb.INTRINSIC_MAP_VAL_AT_MUT) && tm.arg_len >= 2 {
+        emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + 1], 1)
+        arr_off := if id == hb.INTRINSIC_MAP_KEY_AT { 0 } else { 8 }
+        e_ty := if id == hb.INTRINSIC_MAP_KEY_AT { k_ty } else { v_ty }
+        stride := helpers.elem_stride(&prog.types, e_ty)
+        arm.load_into(&mut code, hdr_s, 10)
+        helpers.load_mem(&mut code, 10, 10, arr_off)
+        helpers.load_mem(&mut code, 11, 10, 8) // len
+        arm.compare_register(&mut code, 1, 11)
+        arm.branch(&mut code, h.trap_bounds, 4) // unsigned >= len
+        helpers.load_mem(&mut code, 10, 10, 0) // data
+        arm.imm(&mut code, 12, i64(stride))
+        arm.integer_binary(&mut code, 3, true, false, 12, 1, 12, -1)
+        arm.integer_binary(&mut code, 1, true, false, 11, 10, 12, -1)
+        if id == hb.INTRINSIC_MAP_VAL_AT_MUT {
+            arm.load_into(&mut code, dst_addr, 10)
+            helpers.store_mem(&mut code, 11, 10, 0)
+        } else {
+            emit_read_and_clone_to_addr(&mut code, &prog.types, &mut fc, &h, e_ty, 11, dst_addr)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_MAP_KEYS || id == hb.INTRINSIC_MAP_VALUES {
+        arr_off := if id == hb.INTRINSIC_MAP_KEYS { 0 } else { 8 }
+        arm.load_into(&mut code, hdr_s, 10)
+        helpers.load_mem(&mut code, 0, 10, arr_off)
+        arm.branch(&mut code, h.rt.array_clone, 1)
+        arm.load_into(&mut code, dst_addr, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return
+    }
+}
+
+fn emit_read_and_clone_to_addr(code: &mut arm.Code, types: &ht.TypeTable, fc: &mut FnEmitCtx,
+    h: &helpers.EmitHelpers, ty: i32, src_addr_reg: i32, dst_addr_slot: i32) {
+    if helpers.is_fat_pair(&types, ty) {
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.copy_bytes(&mut code, 10, src_addr_reg, 16)
+    } else if helpers.is_inline_agg(&types, ty) {
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.copy_bytes(&mut code, 10, src_addr_reg, helpers.type_byte_size(&types, ty))
+    } else {
+        helpers.load_typed_at(&mut code, &types, ty, 0, src_addr_reg, 0)
+        if helpers.type_needs_drop(&types, ty) && ty >= 0 && ty < h.clone_labels.len && h.clone_labels[ty] >= 0 {
+            arm.branch(&mut code, h.clone_labels[ty], 1)
+        }
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.store_typed_at(&mut code, &types, ty, 0, 10, 0)
+    }
+}
+
+// Helper: unpack heap-allocated legacy Status { ok@0, error@8 } from x0 into inline POD Status & release heap record.
+fn emit_store_sys_status(code: &mut arm.Code, types: &ht.TypeTable, fc: &mut FnEmitCtx,
+    h: &helpers.EmitHelpers, dest_ty: i32, dst_addr_slot: i32) {
+    if dest_ty == ht.TY_UNIT {
+        arm.branch(&mut code, h.rt.release, 1)
+        return
+    }
+    if helpers.is_inline_agg(&types, dest_ty) && types.entries[dest_ty].kind == .Struct && types.entries[dest_ty].count >= 2 {
+        rec_s := alloc_slot(&mut fc)
+        arm.store(&mut code, rec_s, 0)
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        te := &types.entries[dest_ty]
+        f0_ty := types.fields[te.inner_a].ty
+        f1_ty := types.fields[te.inner_a + 1].ty
+        f0_off := helpers.struct_field_offset(&types, dest_ty, 0)
+        f1_off := helpers.struct_field_offset(&types, dest_ty, 1)
+        helpers.load_mem(&mut code, 1, 0, 0)
+        helpers.store_typed_at(&mut code, &types, f0_ty, 1, 10, f0_off)
+        arm.load_into(&mut code, rec_s, 11)
+        helpers.load_mem(&mut code, 1, 11, 8)
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.store_typed_at(&mut code, &types, f1_ty, 1, 10, f1_off)
+        arm.load(&mut code, rec_s)
+        arm.branch(&mut code, h.rt.release, 1)
+    } else {
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.store_typed_at(&mut code, &types, dest_ty, 0, 10, 0)
+    }
+}
+
+// Helper: unpack heap-allocated 104B legacy Metadata (13 * 8B fields) from x0 into inline POD Metadata & release.
+fn emit_store_sys_metadata(code: &mut arm.Code, types: &ht.TypeTable, fc: &mut FnEmitCtx,
+    h: &helpers.EmitHelpers, dest_ty: i32, dst_addr_slot: i32) {
+    if helpers.is_inline_agg(&types, dest_ty) && types.entries[dest_ty].kind == .Struct {
+        rec_s := alloc_slot(&mut fc)
+        arm.store(&mut code, rec_s, 0)
+        te := &types.entries[dest_ty]
+        for fi in 0..te.count {
+            fty := types.fields[te.inner_a + fi].ty
+            foff := helpers.struct_field_offset(&types, dest_ty, fi)
+            arm.load_into(&mut code, rec_s, 11)
+            helpers.load_mem(&mut code, 1, 11, fi * 8)
+            arm.load_into(&mut code, dst_addr_slot, 10)
+            helpers.store_typed_at(&mut code, &types, fty, 1, 10, foff)
+        }
+        arm.load(&mut code, rec_s)
+        arm.branch(&mut code, h.rt.release, 1)
+    } else {
+        arm.load_into(&mut code, dst_addr_slot, 10)
+        helpers.store_typed_at(&mut code, &types, dest_ty, 0, 10, 0)
+    }
+}
+
+// Materialize an argument for a __sys_* runtime call into a frame slot, adapting &mut []u8 / &[]u8 to 48B array header ABI!
+fn emit_sys_arg_slot(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, op_id: i32, is_arr_arg: bool) -> i32 {
+    s := alloc_slot(&mut fc)
+    aty := operand_type(&body, op_id)
+    ak := prog.types.entries[aty].kind
+    if is_arr_arg {
+        if ak == .MutRef || ak == .Ref {
+            inner := prog.types.entries[aty].inner_a
+            ik := prog.types.entries[inner].kind
+            if ik == .Array {
+                // &mut []u8 or &[]u8 -> dereference to get 48B heap array header pointer
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 10)
+                helpers.load_mem(&mut code, 0, 10, 0)
+                arm.store(&mut code, s, 0)
+                return s
+            }
+            if ik == .FatSlice || ik == .RegionSlice {
+                // &(&[]u8) -> stage 32B stack header { data_ptr, len, len, layout=0 }
+                hdr := alloc_slots(&mut fc, 4)
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 11)
+                helpers.load_mem(&mut code, 1, 11, 0) // data_ptr
+                helpers.load_mem(&mut code, 2, 11, 8) // len
+                emit_slots_addr(&mut code, hdr, 4, 10)
+                helpers.store_mem(&mut code, 1, 10, 0)
+                helpers.store_mem(&mut code, 2, 10, 8)
+                helpers.store_mem(&mut code, 2, 10, 16)
+                helpers.store_mem(&mut code, 31, 10, 24) // layout = 0 (u8)
+                arm.store(&mut code, s, 10)
+                return s
+            }
+        }
+        if ak == .FatSlice || ak == .RegionSlice {
+            // Direct 2-word FatSlice -> stage 32B stack header { data_ptr, len, len, layout=0 }
+            v_base := alloc_slots(&mut fc, 2)
+            v_addr := alloc_slot(&mut fc)
+            emit_slots_addr(&mut code, v_base, 2, 0); arm.store(&mut code, v_addr, 0)
+            emit_copy_op_to_addr_slot(&mut code, &prog, &body, &mut fc, &mut h, op_id, v_addr)
+            hdr := alloc_slots(&mut fc, 4)
+            arm.load_into(&mut code, v_addr, 11)
+            helpers.load_mem(&mut code, 1, 11, 0)
+            helpers.load_mem(&mut code, 2, 11, 8)
+            emit_slots_addr(&mut code, hdr, 4, 10)
+            helpers.store_mem(&mut code, 1, 10, 0)
+            helpers.store_mem(&mut code, 2, 10, 8)
+            helpers.store_mem(&mut code, 2, 10, 16)
+            helpers.store_mem(&mut code, 31, 10, 24)
+            arm.store(&mut code, s, 10)
+            return s
+        }
+    }
+    emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, op_id, 0)
+    arm.store(&mut code, s, 0)
+    s
+}
+
+fn emit_sys_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
+    fc: &mut FnEmitCtx, h: &mut helpers.EmitHelpers, id: i32, tm: &mb.MirTerm) {
+    dest_pl := tm.place_or_op
+    dest_ty := body.places[dest_pl].ty
+    mut dst_addr := -1
+    if dest_ty != ht.TY_UNIT {
+        dst_addr = alloc_slot(&mut fc)
+        emit_place_addr(&mut code, &prog, &body, &mut fc, &mut h, dest_pl, 0)
+        arm.store(&mut code, dst_addr, 0)
+    }
+
+    // Determine runtime target label and which args are byte-array/slice args
+    mut target := -1
+    mut ret_kind := 0 // 0 = scalar/boxed/unit, 1 = Status, 2 = Metadata
+    mut arr_arg_mask := 0 // bit i set if arg i expects 48B array header pointer
+
+    if id == hb.INTRINSIC_SYS_ARG_COUNT { target = h.rt.sys_arg_count }
+    else if id == hb.INTRINSIC_SYS_ARG { target = h.rt.sys_arg }
+    else if id == hb.INTRINSIC_SYS_ENVP { target = h.rt.sys_envp }
+    else if id == hb.INTRINSIC_SYS_LINUX_SYSCALL { target = h.rt.sys_linux_syscall }
+    else if id == hb.INTRINSIC_SYS_PID { target = h.rt.sys_pid }
+    else if id == hb.INTRINSIC_SYS_NOW_MS { target = h.rt.sys_now_ms }
+    else if id == hb.INTRINSIC_SYS_READ_TEXT { target = h.rt.sys_read_text }
+    else if id == hb.INTRINSIC_SYS_READ_U8 { target = h.rt.sys_read_u8; ret_kind = 1; arr_arg_mask = 2 }
+    else if id == hb.INTRINSIC_SYS_METADATA { target = h.rt.sys_metadata; ret_kind = 2 }
+    else if id == hb.INTRINSIC_SYS_SAME_FILE { target = h.rt.sys_same_file }
+    else if id == hb.INTRINSIC_SYS_WRITE_BYTES { target = h.rt.sys_write_bytes; ret_kind = 1; arr_arg_mask = 2 }
+    else if id == hb.INTRINSIC_SYS_MAKE_EXECUTABLE { target = h.rt.sys_make_executable; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_RENAME { target = h.rt.sys_rename; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_REMOVE_FILE { target = h.rt.sys_remove_file; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_DECODE_UTF8 { target = h.rt.sys_decode_utf8; arr_arg_mask = 1 }
+    else if id == hb.INTRINSIC_SYS_DECODE_U8_RANGE { target = h.rt.sys_decode_u8_range; arr_arg_mask = 1 }
+    else if id == hb.INTRINSIC_SYS_WRITE_STDERR { target = h.rt.sys_stderr; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_WRITE_TEXT { target = h.rt.sys_write_text; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_APPEND_TEXT { target = h.rt.sys_append_text; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_MKDIR { target = h.rt.sys_mkdir; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_REMOVE_DIR { target = h.rt.sys_remove_dir; ret_kind = 1 }
+    else if id == hb.INTRINSIC_SYS_MEM_COPY { target = h.rt.memory_copy }
+    else if id == hb.INTRINSIC_SYS_MEM_EQUAL { target = h.rt.memory_equal }
+    else if id == hb.INTRINSIC_SYS_MEM_ZERO { target = h.rt.memory_zero }
+    else if id == hb.INTRINSIC_SYS_ATOMIC_LOAD { target = h.rt.atomic_load_i64 }
+    else if id == hb.INTRINSIC_SYS_ATOMIC_STORE { target = h.rt.atomic_store_i64 }
+    else if id == hb.INTRINSIC_SYS_ATOMIC_CAS { target = h.rt.atomic_cas_i64 }
+    else if id == hb.INTRINSIC_SYS_ATOMIC_FETCH_ADD { target = h.rt.atomic_fetch_add_i64 }
+    else if id == hb.INTRINSIC_SYS_POOL_ALLOC_TRY { target = h.rt.pool_alloc_try }
+    else if id == hb.INTRINSIC_SYS_POOL_FREE { target = h.rt.release }
+    else if id == hb.INTRINSIC_SYS_BYTES_EQUAL { target = h.rt.bytes_equal; arr_arg_mask = 3 }
+    else if id == hb.INTRINSIC_SYS_BYTES_EXTEND { target = h.rt.bytes_extend; arr_arg_mask = 3 }
+    else if id == hb.INTRINSIC_SYS_BYTES_APPEND_TEXT { target = h.rt.bytes_append_text; arr_arg_mask = 1 }
+    else if id == hb.INTRINSIC_SYS_COPY_VALID_UTF8 { target = h.rt.str_view_to_string; arr_arg_mask = 1 }
+    else if id == hb.INTRINSIC_SYS_NET_LISTEN { target = h.rt.sys_net_listen }
+    else if id == hb.INTRINSIC_SYS_NET_ACCEPT { target = h.rt.sys_net_accept }
+    else if id == hb.INTRINSIC_SYS_NET_CONNECT { target = h.rt.sys_net_connect }
+    else if id == hb.INTRINSIC_SYS_NET_READ { target = h.rt.sys_net_read; arr_arg_mask = 2 }
+    else if id == hb.INTRINSIC_SYS_NET_PEEK { target = h.rt.sys_net_peek; arr_arg_mask = 2 }
+    else if id == hb.INTRINSIC_SYS_NET_WRITE { target = h.rt.sys_net_write; arr_arg_mask = 2 }
+    else if id == hb.INTRINSIC_SYS_FD_WRITE { target = h.rt.sys_fd_write; arr_arg_mask = 2 }
+    else if id == hb.INTRINSIC_SYS_NET_POLL { target = h.rt.sys_net_poll; arr_arg_mask = 1 }
+    else if id == hb.INTRINSIC_SYS_NET_SET_NONBLOCKING { target = h.rt.sys_net_set_nonblocking }
+    else if id == hb.INTRINSIC_SYS_NET_SET_NODELAY { target = h.rt.sys_net_set_nodelay }
+    else if id == hb.INTRINSIC_SYS_NET_LOCAL_PORT { target = h.rt.sys_net_local_port }
+    else if id == hb.INTRINSIC_SYS_NET_SHUTDOWN_WRITE { target = h.rt.sys_net_shutdown_write }
+    else if id == hb.INTRINSIC_SYS_NET_CLOSE { target = h.rt.sys_net_close }
+
+    if target < 0 { return }
+
+    mut arg_slots: []i32 = []
+    for ai in 0..tm.arg_len {
+        is_arr := arr_arg_mask.bit_and(i32(1).shl(ai)) != 0
+        arg_slots.push(emit_sys_arg_slot(&mut code, &prog, &body, &mut fc, &mut h, body.call_args[tm.arg_start + ai], is_arr))
+    }
+    for ai in 0..arg_slots.len {
+        if ai < 8 { arm.load_into(&mut code, arg_slots[ai], ai) }
+    }
+    arm.branch(&mut code, target, 1)
+
+    if ret_kind == 1 {
+        emit_store_sys_status(&mut code, &prog.types, &mut fc, &h, dest_ty, dst_addr)
+    } else if ret_kind == 2 {
+        emit_store_sys_metadata(&mut code, &prog.types, &mut fc, &h, dest_ty, dst_addr)
+    } else if dest_ty != ht.TY_UNIT {
+        val_s := alloc_slot(&mut fc)
+        arm.store(&mut code, val_s, 0)
+        arm.load_into(&mut code, dst_addr, 10)
+        arm.load(&mut code, val_s)
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
     }
 }
 
@@ -2235,7 +3310,19 @@ fn emit_call_term(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
             arg_word_slots.push(a_slot) // passes pointer to caller-staged inline aggregate
         } else {
             s := alloc_slot(&mut fc)
-            emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
+            mut is_move_param := false
+            if tm.sig_ty >= 0 && tm.sig_ty < prog.types.entries.len {
+                pcnt := ht.callable_param_count(&prog.types, tm.sig_ty)
+                if ai < pcnt {
+                    pstart := ht.callable_param_start(&prog.types, tm.sig_ty)
+                    is_move_param = prog.types.params[pstart + ai].mode == .MoveVal
+                }
+            }
+            if is_move_param {
+                emit_take_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
+            } else {
+                emit_load_scalar_op(&mut code, &prog, &body, &mut fc, &mut h, aop, 0)
+            }
             arm.store(&mut code, s, 0)
             arg_word_slots.push(s)
         }
@@ -2475,7 +3562,7 @@ fn compute_live_blocks(body: &mb.MirBody, platform: i32) -> []bool {
 
 fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
     h: &mut helpers.EmitHelpers, ffi: &mut ffi_emit.FfiState, ts: &mut task_emit.TaskEmitState,
-    cb_fn_labels: &[]i32, ext_static_slots: &[]i32) {
+    cb_fn_labels: &[]i32, ext_static_slots: &[]i32, dbg: &mut DebugEmitBuf) {
     fid := body.fn_id
     hf := &prog.fns[fid]
     is_cl := hf.is_closure_body
@@ -2538,6 +3625,7 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
 
     // 2. Prologue
     arm.mark(&mut code, h.fn_labels[fid])
+    fn_start_word := arm.position(&code)
     frame_at := arm.prologue(&mut code)
 
     // Save sret (x8) and closure env (x9) immediately
@@ -2600,6 +3688,7 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
     // 4. Emit basic blocks (skipping dead target_is("...") branches so foreign OS imports are never linked!)
     bb_live := compute_live_blocks(&body, code.platform)
     mut cap_init_skipped := 0
+    mut last_dbg_span := -1
     for bb in 0..body.blocks.len {
         arm.mark(&mut code, fc.bb_labels[bb])
         if !bb_live[bb] { continue }
@@ -2629,6 +3718,12 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
 
         for si in blk.stmt_start..blk.stmt_end {
             st := body.stmts[si]
+            if dbg.enabled && st.span_start >= 0 && st.span_start != last_dbg_span {
+                last_dbg_span = st.span_start
+                dbg.line_mods.push(hf.owner_mod)
+                dbg.line_spans.push(st.span_start)
+                dbg.line_offsets.push(arm.position(&code))
+            }
             if st.kind == .Assign {
                 // Skip synthetic zero-init Assign for closure capture locals in bb 0
                 if bb == 0 && is_cl && cap_init_skipped < cap_cnt {
@@ -2819,6 +3914,13 @@ fn emit_function(code: &mut arm.Code, prog: &hb.HirProgram, body: &mb.MirBody,
         ffi.sites.push(fc.imp_sites[ii])
         ffi.slots.push(fc.imp_slots[ii])
     }
+    if dbg.enabled {
+        dbg.fn_names.push(hf.name.clone())
+        dbg.fn_mods.push(hf.owner_mod)
+        dbg.fn_spans.push(hf.span_start)
+        dbg.fn_starts.push(fn_start_word)
+        dbg.fn_ends.push(arm.position(&code))
+    }
 }
 
 // =========================================================================
@@ -2895,38 +3997,54 @@ fn collect_reachable_fns(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: 
     reach
 }
 
+fn fail_emit(msg: string) -> EmitResult {
+    EmitResult {
+        ok: false, error: msg.clone(), text: [],
+        imports_globals: 0, imports_libraries: [], imports_symbols: [],
+        imports_specs: [], imports_sites: [], imports_slots: [],
+        env_source_slot: -1, diagnostics: [],
+        debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
+        debug_fn_starts: [], debug_fn_ends: [],
+        debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
+    }
+}
+
 pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) -> EmitResult {
-    mut empty_diags: []diag.Diagnostic = []
+    emit_program_with_debug(&prog, &bodies, platform, false)
+}
+
+pub fn emit_program_with_debug(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32, debug_info: bool) -> EmitResult {
     if !prog.ok {
-        return EmitResult {
-            ok: false, error: "HIR/MIR verification failed", text: [],
-            imports_globals: 0, imports_libraries: [], imports_symbols: [],
-            imports_specs: [], imports_sites: [], imports_slots: [],
-            env_source_slot: -1, diagnostics: move empty_diags,
-        }
+        return fail_emit("HIR/MIR verification failed")
     }
     if prog.entry_fn < 0 || prog.entry_fn >= prog.fns.len {
-        return EmitResult {
-            ok: false, error: "missing 'main' entry function", text: [],
-            imports_globals: 0, imports_libraries: [], imports_symbols: [],
-            imports_specs: [], imports_sites: [], imports_slots: [],
-            env_source_slot: -1, diagnostics: move empty_diags,
-        }
+        return fail_emit("missing 'main' entry function")
     }
 
     mut code := arm.new_for(platform)
     mut h := helpers.new_helpers(&mut code, &prog)
     mut ffi := ffi_emit.new_ffi()
     mut ts := task_emit.new_task_state(&mut code, &prog)
+    mut dbg := DebugEmitBuf {
+        enabled: debug_info && (platform == 0 || platform == 1),
+        fn_names: [], fn_mods: [], fn_spans: [], fn_starts: [], fn_ends: [],
+        line_mods: [], line_spans: [], line_offsets: [],
+    }
 
     // Pre-scan reachable bodies for ExternFn callbacks (sets ffi.has_callbacks before any extern call!)
     reachable := collect_reachable_fns(&prog, &bodies, platform)
     mut cb_fn_labels: []i32 = []
     for _ in 0..prog.fns.len { cb_fn_labels.push(-1) }
+    mut needs_envp := false
     for bi in 0..bodies.len {
         fid := bodies[bi].fn_id
         if fid < 0 || fid >= reachable.len || !reachable[fid] { continue }
         b := &bodies[bi]
+        for ti in 0..b.terms.len {
+            if b.terms[ti].kind == .Call && b.terms[ti].call_kind == .Intrinsic && b.terms[ti].callee == hb.INTRINSIC_SYS_ENVP {
+                needs_envp = true
+            }
+        }
         for ci in 0..b.consts.len {
             c := &b.consts[ci]
             if c.ty >= 0 && c.ty < prog.types.entries.len && prog.types.entries[c.ty].kind == .ExternFn {
@@ -2952,7 +4070,7 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
     for bi in 0..bodies.len {
         fid := bodies[bi].fn_id
         if fid >= 0 && fid < reachable.len && reachable[fid] {
-            emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots)
+            emit_function(&mut code, &prog, &bodies[bi], &mut h, &mut ffi, &mut ts, &cb_fn_labels, &ext_static_slots, &mut dbg)
         }
     }
 
@@ -2962,9 +4080,17 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
     _ := task_emit.emit_task_runtime(&mut code, &prog, &mut ts, &mut ffi, &h)
     task_emit.emit_iso_and_freeze_helpers(&mut code, &prog.types, &mut ts, &h)
 
-    // Emit runtime, type drop/clone helpers, traps, and deduplicated string/cstr/wstr literals
-    (data_start, env_site) := helpers.emit_all_helpers(&mut code, &prog.types, &h, -1)
-    _ := env_site
+    mut env_source_slot := -1
+    if needs_envp && (platform == 1 || platform == 2) {
+        env_source_slot = ffi_emit.ensure_import(&mut ffi, platform, "c", "environ", true, false, false)
+    }
+
+    // Emit runtime, type drop/clone helpers, traps, and deduplicated string/cstr/wstr/embed literals
+    (data_start, env_site) := helpers.emit_all_helpers(&mut code, &prog, &h, env_source_slot)
+    if env_site >= 0 && env_source_slot >= 0 {
+        ffi.sites.push(env_site)
+        ffi.slots.push(env_source_slot)
+    }
 
     // Sort import sites ascending (required by x86.finish linear scan when extern statics & calls interleave)
     for si in 1..ffi.sites.len {
@@ -2989,6 +4115,18 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
                 ffi.sites[i] = (w - shift[w]) * 4
             }
         }
+        if dbg.enabled {
+            for i in 0..dbg.fn_starts.len {
+                ws := dbg.fn_starts[i]
+                we := dbg.fn_ends[i]
+                if ws >= 0 && ws < shift.len { dbg.fn_starts[i] = (ws - shift[ws]) * 4 } else { dbg.fn_starts[i] = ws * 4 }
+                if we >= 0 && we < shift.len { dbg.fn_ends[i] = (we - shift[we]) * 4 } else { dbg.fn_ends[i] = we * 4 }
+            }
+            for i in 0..dbg.line_offsets.len {
+                wl := dbg.line_offsets[i]
+                if wl >= 0 && wl < shift.len { dbg.line_offsets[i] = (wl - shift[wl]) * 4 } else { dbg.line_offsets[i] = wl * 4 }
+            }
+        }
         has_dynamic := ffi.symbols.len > 0 || ffi.globals > 0
         text := arm.finish_for(&mut code, has_dynamic)
         return EmitResult {
@@ -2999,8 +4137,16 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
             imports_specs: move ffi.specs,
             imports_sites: move ffi.sites,
             imports_slots: move ffi.slots,
-            env_source_slot: -1,
-            diagnostics: move empty_diags,
+            env_source_slot: env_source_slot,
+            diagnostics: [],
+            debug_fn_names: move dbg.fn_names,
+            debug_fn_mods: move dbg.fn_mods,
+            debug_fn_spans: move dbg.fn_spans,
+            debug_fn_starts: move dbg.fn_starts,
+            debug_fn_ends: move dbg.fn_ends,
+            debug_line_mods: move dbg.line_mods,
+            debug_line_spans: move dbg.line_spans,
+            debug_line_offsets: move dbg.line_offsets,
         }
     }
     if platform == 2 {
@@ -3013,8 +4159,11 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
             imports_specs: move ffi.specs,
             imports_sites: move res.imports,
             imports_slots: move res.slots,
-            env_source_slot: -1,
-            diagnostics: move empty_diags,
+            env_source_slot: env_source_slot,
+            diagnostics: [],
+            debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
+            debug_fn_starts: [], debug_fn_ends: [],
+            debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
         }
     }
     if platform == 5 {
@@ -3033,7 +4182,10 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
             imports_sites: move res.imports,
             imports_slots: move res.slots,
             env_source_slot: -1,
-            diagnostics: move empty_diags,
+            diagnostics: [],
+            debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
+            debug_fn_starts: [], debug_fn_ends: [],
+            debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
         }
     }
     if platform == 3 || platform == 4 {
@@ -3047,13 +4199,11 @@ pub fn emit_program(prog: &hb.HirProgram, bodies: &[]mb.MirBody, platform: i32) 
             imports_libraries: [], imports_symbols: [], imports_specs: [],
             imports_sites: [], imports_slots: [],
             env_source_slot: -1,
-            diagnostics: move empty_diags,
+            diagnostics: [],
+            debug_fn_names: [], debug_fn_mods: [], debug_fn_spans: [],
+            debug_fn_starts: [], debug_fn_ends: [],
+            debug_line_mods: [], debug_line_spans: [], debug_line_offsets: [],
         }
     }
-    EmitResult {
-        ok: false, error: "unsupported platform " + platform.str(), text: [],
-        imports_globals: 0, imports_libraries: [], imports_symbols: [],
-        imports_specs: [], imports_sites: [], imports_slots: [],
-        env_source_slot: -1, diagnostics: move empty_diags,
-    }
+    fail_emit("unsupported platform " + platform.str())
 }

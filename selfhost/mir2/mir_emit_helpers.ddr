@@ -27,6 +27,17 @@ pub struct EmitHelpers {
     trap_unreachable: i32,
     eprint_text: i32,
     closure_drop: i32,
+    map_new: i32,
+    map_drop: i32,
+    map_clone: i32,
+    map_hash_key: i32,
+    map_key_eq: i32,
+    map_rehash: i32,
+    map_find_index: i32,
+    map_reserve: i32,
+    map_put: i32,
+    map_remove: i32,
+    map_clear: i32,
     fn_labels: []i32,
     drop_labels: []i32,
     clone_labels: []i32,
@@ -41,6 +52,7 @@ pub struct EmitHelpers {
     wstr_texts: []string,
     wstr_labels: []i32,
     wstr_map: Map<string, i64>,
+    embed_labels: []i32,
 }
 
 // =========================================================================
@@ -75,6 +87,7 @@ pub fn is_inline_agg(types: &ht.TypeTable, ty: i32) -> bool {
     k := te.kind
     if k == .Union { return true }
     if k != .Struct && k != .Tuple && k != .Enum && k != .FixedArr { return false }
+    if te.flags.bit_and(ht.TF_OPAQUE) != 0 || ht.find_map_inst(&types, ty) >= 0 { return false }
     if te.flags.bit_and(ht.TF_POD_INLINE) != 0 { return true }
     if te.flags.bit_and(ht.TF_C_LAYOUT) != 0 && te.flags.bit_and(ht.TF_DISPOSE) == 0 && te.flags.bit_and(ht.TF_RESOURCE) == 0 {
         return true
@@ -96,6 +109,7 @@ pub fn is_boxed_heap(types: &ht.TypeTable, ty: i32) -> bool {
 
 pub fn type_needs_drop(types: &ht.TypeTable, ty: i32) -> bool {
     if ty < 0 || ty >= types.entries.len { return false }
+    if ht.find_map_inst(&types, ty) >= 0 { return true }
     te := &types.entries[ty]
     k := te.kind
     if k == .String || k == .Array { return true }
@@ -397,6 +411,17 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
     iso_labels.reserve(n_tys)
     shared_rc_labels.reserve(n_tys)
     closure_drop := arm.label(&mut code)
+    map_new := arm.label(&mut code)
+    map_drop := arm.label(&mut code)
+    map_clone := arm.label(&mut code)
+    map_hash_key := arm.label(&mut code)
+    map_key_eq := arm.label(&mut code)
+    map_rehash := arm.label(&mut code)
+    map_find_index := arm.label(&mut code)
+    map_reserve := arm.label(&mut code)
+    map_put := arm.label(&mut code)
+    map_remove := arm.label(&mut code)
+    map_clear := arm.label(&mut code)
 
     for ty in 0..n_tys {
         te := &prog.types.entries[ty]
@@ -417,6 +442,9 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
                 }
                 cl = rt.retain
             }
+        } else if te.kind == .Struct && ht.find_map_inst(&prog.types, ty) >= 0 {
+            dl = map_drop
+            cl = map_clone
         } else if (te.kind == .Struct || te.kind == .Tuple || te.kind == .Enum || te.kind == .FixedArr) &&
             !is_inline_agg(&prog.types, ty) {
             if type_needs_drop(&prog.types, ty) { dl = arm.label(&mut code) }
@@ -426,6 +454,11 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
         clone_labels.push(cl)
         iso_labels.push(-1)
         shared_rc_labels.push(-1)
+    }
+
+    mut embed_labels: []i32 = []
+    for _ in 0..prog.embed_starts.len {
+        embed_labels.push(arm.label(&mut code))
     }
 
     EmitHelpers {
@@ -443,6 +476,17 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
         trap_unreachable: arm.label(&mut code),
         eprint_text: arm.label(&mut code),
         closure_drop: closure_drop,
+        map_new: map_new,
+        map_drop: map_drop,
+        map_clone: map_clone,
+        map_hash_key: map_hash_key,
+        map_key_eq: map_key_eq,
+        map_rehash: map_rehash,
+        map_find_index: map_find_index,
+        map_reserve: map_reserve,
+        map_put: map_put,
+        map_remove: map_remove,
+        map_clear: map_clear,
         fn_labels: move fn_labels,
         drop_labels: move drop_labels,
         clone_labels: move clone_labels,
@@ -457,6 +501,7 @@ pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
         wstr_texts: [],
         wstr_labels: [],
         wstr_map: Map<string, i64>::new(),
+        embed_labels: move embed_labels,
     }
 }
 
@@ -658,6 +703,7 @@ fn emit_type_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers)
         }
 
         if (te.kind == .Struct || te.kind == .Tuple) && !is_inline_agg(&types, ty) {
+            if te.kind == .Struct && ht.find_map_inst(&types, ty) >= 0 { continue }
             alloc_sz := struct_alloc_size(&types, ty)
             if dl >= 0 {
                 arm.mark(&mut code, dl)
@@ -968,9 +1014,733 @@ fn emit_wstr_literal_data(code: &mut arm.Code, text: string, label: i32) {
     }
 }
 
+// =========================================================================
+// Shared Runtime Hash-Table Helpers for Map<K, V> and Set<K>
+// Header (48B): [0]=keys_arr, [8]=vals_arr, [16]=hashes_arr, [24]=slots_arr, [32]=used, [40]=key_kind
+// key_kind: 0 = scalar (value in reg), 1 = string ptr, >= 2 = POD ptr of (key_kind - 2) bytes
+// =========================================================================
+
+fn emit_arr_elem_addr(code: &mut arm.Code, arr_reg: i32, idx_reg: i32, out_reg: i32) {
+    // Computes out_reg = [arr_reg + 0] + idx_reg * elem_stride([arr_reg + 24]). Clobbers x14, x15.
+    load_mem(&mut code, 15, arr_reg, 24) // layout
+    is_rec := arm.label(&mut code)
+    done := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 15, i64(ri.RECORD_LAYOUT_BASE), false)
+    arm.branch(&mut code, is_rec, 4) // b.hs
+    // scalar shift 0..3: offset = idx << layout
+    arm.integer_binary(&mut code, 14, true, false, 14, idx_reg, 15, -1)
+    arm.branch(&mut code, done, 0)
+    arm.mark(&mut code, is_rec)
+    arm.integer_binary(&mut code, 2, true, false, 15, 15, -1, i64(ri.RECORD_LAYOUT_BASE))
+    arm.integer_binary(&mut code, 3, true, false, 14, idx_reg, 15, -1)
+    arm.mark(&mut code, done)
+    load_mem(&mut code, out_reg, arr_reg, 0) // data_ptr
+    arm.integer_binary(&mut code, 1, true, false, out_reg, out_reg, 14, -1)
+}
+
+fn emit_map_helpers(code: &mut arm.Code, h: &EmitHelpers) {
+    // 1. map_new(x0=key_layout, x1=val_layout, x2=key_clone, x3=key_drop, x4=val_clone, x5=val_drop, x6=key_kind) -> x0=hdr
+    arm.mark(&mut code, h.map_new)
+    fr_new := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_new, 8)
+    for r in 0..7 { arm.store(&mut code, r, r) }
+    arm.imm(&mut code, 0, 48)
+    arm.branch(&mut code, h.rt.alloc, 1)
+    arm.store(&mut code, 7, 0)
+    store_mem(&mut code, 31, 0, 32) // used = 0
+    arm.load_into(&mut code, 6, 10)
+    store_mem(&mut code, 10, 0, 40) // key_kind
+    // keys_arr
+    arm.load_into(&mut code, 0, 2)
+    arm.branch(&mut code, h.rt.array_new, 1)
+    arm.load_into(&mut code, 2, 10); store_mem(&mut code, 10, 0, 32)
+    arm.load_into(&mut code, 3, 10); store_mem(&mut code, 10, 0, 40)
+    arm.load_into(&mut code, 7, 11); store_mem(&mut code, 0, 11, 0)
+    // vals_arr
+    arm.load_into(&mut code, 1, 2)
+    arm.branch(&mut code, h.rt.array_new, 1)
+    arm.load_into(&mut code, 4, 10); store_mem(&mut code, 10, 0, 32)
+    arm.load_into(&mut code, 5, 10); store_mem(&mut code, 10, 0, 40)
+    arm.load_into(&mut code, 7, 11); store_mem(&mut code, 0, 11, 8)
+    // hashes_arr (u64, layout=3)
+    arm.imm(&mut code, 2, 3)
+    arm.branch(&mut code, h.rt.array_new, 1)
+    arm.load_into(&mut code, 7, 11); store_mem(&mut code, 0, 11, 16)
+    // slots_arr (i32, layout=2)
+    arm.imm(&mut code, 2, 2)
+    arm.branch(&mut code, h.rt.array_new, 1)
+    arm.load_into(&mut code, 7, 11); store_mem(&mut code, 0, 11, 24)
+    arm.load(&mut code, 7)
+    arm.ret(&mut code)
+
+    // 2. map_drop(x0=hdr)
+    arm.mark(&mut code, h.map_drop)
+    fr_drop := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_drop, 1)
+    md_done := arm.label(&mut code)
+    md_shared := arm.label(&mut code)
+    arm.branch(&mut code, md_done, 18) // cbz
+    allocation_refcount(&mut code)
+    arm.compare_immediate(&mut code, 1, 1, false)
+    arm.branch(&mut code, md_shared, 3) // b.ne
+    arm.store(&mut code, 0, 0)
+    for off in [0, 8, 16, 24] {
+        arm.load_into(&mut code, 0, 10)
+        load_mem(&mut code, 0, 10, off)
+        arm.branch(&mut code, h.rt.array_drop, 1)
+    }
+    arm.load(&mut code, 0)
+    arm.branch(&mut code, h.rt.release, 1)
+    arm.branch(&mut code, md_done, 0)
+    arm.mark(&mut code, md_shared)
+    arm.branch(&mut code, h.rt.release, 1)
+    arm.mark(&mut code, md_done)
+    arm.ret(&mut code)
+
+    // 3. map_clone(x0=hdr) -> x0=new_hdr
+    arm.mark(&mut code, h.map_clone)
+    fr_cl := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_cl, 2)
+    mc_done := arm.label(&mut code)
+    arm.branch(&mut code, mc_done, 18)
+    arm.store(&mut code, 0, 0)
+    arm.imm(&mut code, 0, 48)
+    arm.branch(&mut code, h.rt.alloc, 1)
+    arm.store(&mut code, 1, 0)
+    for off in [0, 8, 16, 24] {
+        arm.load_into(&mut code, 0, 10)
+        load_mem(&mut code, 0, 10, off)
+        arm.branch(&mut code, h.rt.array_clone, 1)
+        arm.load_into(&mut code, 1, 11)
+        store_mem(&mut code, 0, 11, off)
+    }
+    arm.load_into(&mut code, 0, 10); arm.load_into(&mut code, 1, 11)
+    load_mem(&mut code, 12, 10, 32); store_mem(&mut code, 12, 11, 32)
+    load_mem(&mut code, 12, 10, 40); store_mem(&mut code, 12, 11, 40)
+    arm.load(&mut code, 1)
+    arm.mark(&mut code, mc_done)
+    arm.ret(&mut code)
+
+    // 4. map_hash_key(x0=key_val_or_ptr, x1=key_kind) -> x0=u64_hash
+    arm.mark(&mut code, h.map_hash_key)
+    fr_hk := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_hk, 0)
+    hk_mix := arm.label(&mut code)
+    hk_bytes := arm.label(&mut code)
+    hk_pod := arm.label(&mut code)
+    hk_loop := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 1, 0, false)
+    arm.branch(&mut code, hk_mix, 2) // key_kind == 0 -> scalar
+    arm.compare_immediate(&mut code, 1, 1, false)
+    arm.branch(&mut code, hk_pod, 3) // key_kind >= 2 -> POD bytes
+    // key_kind == 1: string ptr in x0 -> ptr=x0+8, len=[x0+0]
+    load_mem(&mut code, 11, 0, 0)
+    arm.integer_binary(&mut code, 1, true, false, 10, 0, -1, 8)
+    arm.branch(&mut code, hk_bytes, 0)
+    arm.mark(&mut code, hk_pod)
+    arm.mov(&mut code, 10, 0)
+    arm.integer_binary(&mut code, 2, true, false, 11, 1, -1, 2) // len = key_kind - 2
+    arm.mark(&mut code, hk_bytes)
+    // FNV-1a 64-bit over [x10 .. x10 + x11]
+    arm.imm(&mut code, 0, -3750763034362895579) // 14695981039346656037
+    arm.imm(&mut code, 13, 1099511628211)
+    arm.mark(&mut code, hk_loop)
+    arm.compare_immediate(&mut code, 11, 0, false)
+    arm.branch(&mut code, hk_mix, 2)
+    arm.transfer(&mut code, true, 12, 10, 0, 0) // ldrb x12, [x10]
+    arm.integer_binary(&mut code, 10, true, false, 0, 0, 12, -1) // eor
+    arm.integer_binary(&mut code, 3, true, false, 0, 0, 13, -1)  // mul
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 1)
+    arm.integer_binary(&mut code, 2, true, false, 11, 11, -1, 1)
+    arm.branch(&mut code, hk_loop, 0)
+    arm.mark(&mut code, hk_mix)
+    // __dunder_module_mix_key(x0)
+    arm.imm(&mut code, 14, 32)
+    arm.integer_binary(&mut code, 15, true, false, 12, 0, 14, -1) // lsr x12, x0, 32
+    arm.integer_binary(&mut code, 10, true, false, 0, 0, 12, -1)  // eor
+    arm.imm(&mut code, 13, -7046029254386353131)                  // 11400714819323198485
+    arm.integer_binary(&mut code, 3, true, false, 0, 0, 13, -1)   // mul
+    arm.integer_binary(&mut code, 15, true, false, 12, 0, 14, -1) // lsr
+    arm.integer_binary(&mut code, 10, true, false, 0, 0, 12, -1)  // eor
+    arm.ret(&mut code)
+
+    // 5. map_key_eq(x0=keys_arr, x1=idx, x2=query_key, x3=key_kind) -> x0 (0|1)
+    arm.mark(&mut code, h.map_key_eq)
+    fr_eq := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_eq, 0)
+    eq_str := arm.label(&mut code)
+    eq_pod := arm.label(&mut code)
+    emit_arr_elem_addr(&mut code, 0, 1, 10) // x10 = &keys_arr[idx]
+    arm.compare_immediate(&mut code, 3, 1, false)
+    arm.branch(&mut code, eq_str, 2)
+    arm.compare_immediate(&mut code, 3, 2, false)
+    arm.branch(&mut code, eq_pod, 4) // >= 2
+    // key_kind == 0: scalar comparison masked to element width (layout in [x0 + 24])
+    load_mem(&mut code, 15, 0, 24)
+    eq_s1 := arm.label(&mut code); eq_s2 := arm.label(&mut code); eq_s3 := arm.label(&mut code); eq_cmp := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 15, 0, false); arm.branch(&mut code, eq_s1, 3)
+    arm.transfer(&mut code, true, 11, 10, 0, 0)
+    arm.bitfield(&mut code, false, true, 12, 2, 0, 7)
+    arm.branch(&mut code, eq_cmp, 0)
+    arm.mark(&mut code, eq_s1)
+    arm.compare_immediate(&mut code, 15, 1, false); arm.branch(&mut code, eq_s2, 3)
+    arm.transfer(&mut code, true, 11, 10, 1, 0)
+    arm.bitfield(&mut code, false, true, 12, 2, 0, 15)
+    arm.branch(&mut code, eq_cmp, 0)
+    arm.mark(&mut code, eq_s2)
+    arm.compare_immediate(&mut code, 15, 2, false); arm.branch(&mut code, eq_s3, 3)
+    arm.transfer(&mut code, true, 11, 10, 2, 0)
+    arm.bitfield(&mut code, false, true, 12, 2, 0, 31)
+    arm.branch(&mut code, eq_cmp, 0)
+    arm.mark(&mut code, eq_s3)
+    load_mem(&mut code, 11, 10, 0)
+    arm.mov(&mut code, 12, 2)
+    arm.mark(&mut code, eq_cmp)
+    arm.compare_register(&mut code, 11, 12)
+    arm.set_condition(&mut code, 0, 0)
+    arm.ret(&mut code)
+    // key_kind == 1: string
+    arm.mark(&mut code, eq_str)
+    load_mem(&mut code, 0, 10, 0)
+    arm.mov(&mut code, 1, 2)
+    arm.branch(&mut code, h.rt.string_compare, 1)
+    arm.compare_immediate(&mut code, 0, 0, false)
+    arm.set_condition(&mut code, 0, 0)
+    arm.ret(&mut code)
+    // key_kind >= 2: POD bytes
+    arm.mark(&mut code, eq_pod)
+    arm.mov(&mut code, 0, 10)
+    arm.mov(&mut code, 1, 2)
+    arm.integer_binary(&mut code, 2, true, false, 2, 3, -1, 2)
+    arm.branch(&mut code, h.rt.memory_equal, 1)
+    arm.ret(&mut code)
+
+    // 6. map_rehash(x0=hdr, x1=new_cap)
+    arm.mark(&mut code, h.map_rehash)
+    fr_rh := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_rh, 5)
+    arm.store(&mut code, 0, 0) // hdr
+    arm.store(&mut code, 1, 1) // new_cap
+    load_mem(&mut code, 10, 0, 24) // slots_arr
+    arm.store(&mut code, 2, 10)
+    arm.mov(&mut code, 0, 10)
+    arm.branch(&mut code, h.rt.array_clear, 1)
+    arm.load_into(&mut code, 2, 0)
+    arm.load_into(&mut code, 1, 1)
+    arm.branch(&mut code, h.rt.array_reserve, 1)
+    // Set slots_arr.len = new_cap and fill with -1
+    arm.load_into(&mut code, 2, 10)
+    arm.load_into(&mut code, 1, 11)
+    store_mem(&mut code, 11, 10, 8)
+    load_mem(&mut code, 10, 10, 0) // slots_data
+    arm.imm(&mut code, 12, -1)
+    rh_fill := arm.label(&mut code); rh_fill_done := arm.label(&mut code)
+    arm.mark(&mut code, rh_fill)
+    arm.compare_immediate(&mut code, 11, 0, false)
+    arm.branch(&mut code, rh_fill_done, 2)
+    arm.transfer(&mut code, false, 12, 10, 2, 0)
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 4)
+    arm.integer_binary(&mut code, 2, true, false, 11, 11, -1, 1)
+    arm.branch(&mut code, rh_fill, 0)
+    arm.mark(&mut code, rh_fill_done)
+    // Reinsert all entries 0..keys_arr.len
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 11, 10, 0) // keys_arr
+    load_mem(&mut code, 12, 11, 8) // n = keys_arr.len
+    store_mem(&mut code, 12, 10, 32) // used = n
+    arm.store(&mut code, 3, 12) // n
+    arm.load_into(&mut code, 1, 13)
+    arm.integer_binary(&mut code, 2, true, false, 13, 13, -1, 1) // mask = new_cap - 1
+    arm.store(&mut code, 4, 13)
+    load_mem(&mut code, 14, 10, 16) // hashes_arr
+    load_mem(&mut code, 14, 14, 0)  // hashes_data
+    arm.load_into(&mut code, 2, 15)
+    load_mem(&mut code, 15, 15, 0)  // slots_data
+    arm.imm(&mut code, 1, 0)        // i = 0
+    rh_ins := arm.label(&mut code); rh_ins_done := arm.label(&mut code); rh_probe := arm.label(&mut code); rh_found := arm.label(&mut code)
+    arm.mark(&mut code, rh_ins)
+    arm.load_into(&mut code, 3, 2)
+    arm.compare_register(&mut code, 1, 2)
+    arm.branch(&mut code, rh_ins_done, 12) // i >= n
+    // h = hashes_data[i]
+    arm.imm(&mut code, 4, 3)
+    arm.integer_binary(&mut code, 14, true, false, 3, 1, 4, -1) // i << 3
+    arm.integer_binary(&mut code, 1, true, false, 3, 14, 3, -1)
+    load_mem(&mut code, 5, 3, 0) // hash
+    arm.load_into(&mut code, 4, 6) // mask
+    arm.integer_binary(&mut code, 8, true, false, 5, 5, 6, -1) // slot = hash & mask
+    arm.mark(&mut code, rh_probe)
+    arm.imm(&mut code, 4, 2)
+    arm.integer_binary(&mut code, 14, true, false, 7, 5, 4, -1) // slot << 2
+    arm.integer_binary(&mut code, 1, true, false, 7, 15, 7, -1) // &slots_data[slot]
+    arm.transfer(&mut code, true, 8, 7, 4, 0) // ldrsw x8, [x7]
+    arm.compare_immediate(&mut code, 8, 0, false)
+    arm.branch(&mut code, rh_found, 13) // < 0 -> vacant!
+    arm.integer_binary(&mut code, 1, true, false, 5, 5, -1, 1)
+    arm.integer_binary(&mut code, 8, true, false, 5, 5, 6, -1)
+    arm.branch(&mut code, rh_probe, 0)
+    arm.mark(&mut code, rh_found)
+    arm.transfer(&mut code, false, 1, 7, 2, 0) // slots[slot] = i
+    arm.integer_binary(&mut code, 1, true, false, 1, 1, -1, 1)
+    arm.branch(&mut code, rh_ins, 0)
+    arm.mark(&mut code, rh_ins_done)
+    arm.ret(&mut code)
+
+    // 7. map_find_index(x0=hdr, x1=key) -> x0 (idx or -1)
+    arm.mark(&mut code, h.map_find_index)
+    fr_fi := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_fi, 7)
+    fi_miss := arm.label(&mut code); fi_loop := arm.label(&mut code); fi_next := arm.label(&mut code)
+    arm.store(&mut code, 0, 0) // hdr
+    arm.store(&mut code, 1, 1) // key
+    arm.branch(&mut code, fi_miss, 18) // null hdr -> -1
+    load_mem(&mut code, 10, 0, 24) // slots_arr
+    load_mem(&mut code, 11, 10, 8) // cap
+    arm.compare_immediate(&mut code, 11, 0, false)
+    arm.branch(&mut code, fi_miss, 2)
+    arm.store(&mut code, 3, 11) // cap
+    // hash = map_hash_key(key, key_kind)
+    load_mem(&mut code, 12, 0, 40)
+    arm.mov(&mut code, 0, 1)
+    arm.mov(&mut code, 1, 12)
+    arm.branch(&mut code, h.map_hash_key, 1)
+    arm.store(&mut code, 2, 0) // hash
+    arm.load_into(&mut code, 3, 11)
+    arm.integer_binary(&mut code, 2, true, false, 11, 11, -1, 1) // mask = cap - 1
+    arm.integer_binary(&mut code, 8, true, false, 12, 0, 11, -1) // slot = hash & mask
+    arm.store(&mut code, 4, 12) // slot
+    arm.store(&mut code, 5, 31) // steps = 0
+    arm.mark(&mut code, fi_loop)
+    arm.load_into(&mut code, 5, 10)
+    arm.load_into(&mut code, 3, 11)
+    arm.compare_register(&mut code, 10, 11)
+    arm.branch(&mut code, fi_miss, 12) // steps >= cap
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 10, 10, 24) // slots_arr
+    load_mem(&mut code, 10, 10, 0)  // slots_data
+    arm.load_into(&mut code, 4, 11) // slot
+    arm.imm(&mut code, 12, 2)
+    arm.integer_binary(&mut code, 14, true, false, 11, 11, 12, -1) // slot << 2
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, 11, -1)
+    arm.transfer(&mut code, true, 13, 10, 4, 0) // idx = ldrsw [slots_data + slot*4]
+    arm.compare_immediate(&mut code, 13, 1, true) // cmp idx, #-1
+    arm.branch(&mut code, fi_miss, 2)
+    arm.compare_immediate(&mut code, 13, 0, false)
+    arm.branch(&mut code, fi_next, 13) // idx < 0 (tombstone -2)
+    arm.store(&mut code, 6, 13) // idx
+    // Check hashes_arr[idx] == hash
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 10, 10, 16) // hashes_arr
+    load_mem(&mut code, 10, 10, 0)
+    arm.imm(&mut code, 12, 3)
+    arm.integer_binary(&mut code, 14, true, false, 11, 13, 12, -1)
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, 11, -1)
+    load_mem(&mut code, 14, 10, 0)
+    arm.load_into(&mut code, 2, 15)
+    arm.compare_register(&mut code, 14, 15)
+    arm.branch(&mut code, fi_next, 3)
+    // Call map_key_eq(keys_arr, idx, key, key_kind)
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 0, 10, 0)
+    arm.load_into(&mut code, 6, 1)
+    arm.load_into(&mut code, 1, 2)
+    load_mem(&mut code, 3, 10, 40)
+    arm.branch(&mut code, h.map_key_eq, 1)
+    arm.compare_immediate(&mut code, 0, 0, false)
+    arm.branch(&mut code, fi_next, 2)
+    arm.load(&mut code, 6)
+    arm.ret(&mut code)
+    arm.mark(&mut code, fi_next)
+    arm.load_into(&mut code, 4, 10)
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 1)
+    arm.load_into(&mut code, 3, 11)
+    arm.integer_binary(&mut code, 2, true, false, 11, 11, -1, 1)
+    arm.integer_binary(&mut code, 8, true, false, 10, 10, 11, -1)
+    arm.store(&mut code, 4, 10)
+    arm.load_into(&mut code, 5, 10)
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 1)
+    arm.store(&mut code, 5, 10)
+    arm.branch(&mut code, fi_loop, 0)
+    arm.mark(&mut code, fi_miss)
+    arm.imm(&mut code, 0, -1)
+    arm.ret(&mut code)
+
+    // 8. map_reserve(x0=hdr, x1=count)
+    arm.mark(&mut code, h.map_reserve)
+    fr_res := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_res, 3)
+    arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+    for off in [0, 8, 16] {
+        arm.load_into(&mut code, 0, 10)
+        load_mem(&mut code, 0, 10, off)
+        arm.load_into(&mut code, 1, 1)
+        arm.branch(&mut code, h.rt.array_reserve, 1)
+    }
+    arm.imm(&mut code, 10, 8) // cap = 8
+    arm.load_into(&mut code, 1, 11)
+    arm.imm(&mut code, 12, 10)
+    arm.integer_binary(&mut code, 3, true, false, 11, 11, 12, -1) // count * 10
+    arm.imm(&mut code, 13, 7)
+    res_lp := arm.label(&mut code); res_chk := arm.label(&mut code); res_done := arm.label(&mut code)
+    arm.mark(&mut code, res_lp)
+    arm.integer_binary(&mut code, 3, true, false, 14, 10, 13, -1) // cap * 7
+    arm.compare_register(&mut code, 14, 11)
+    arm.branch(&mut code, res_chk, 12) // cap * 7 >= count * 10
+    arm.integer_binary(&mut code, 1, true, false, 10, 10, 10, -1) // cap *= 2
+    arm.branch(&mut code, res_lp, 0)
+    arm.mark(&mut code, res_chk)
+    arm.load_into(&mut code, 0, 12)
+    load_mem(&mut code, 12, 12, 24)
+    load_mem(&mut code, 12, 12, 8) // slots_arr.len
+    arm.compare_register(&mut code, 10, 12)
+    arm.branch(&mut code, res_done, 15) // cap <= slots_arr.len
+    arm.load(&mut code, 0)
+    arm.mov(&mut code, 1, 10)
+    arm.branch(&mut code, h.map_rehash, 1)
+    arm.mark(&mut code, res_done)
+    arm.ret(&mut code)
+
+    // 9. map_put(x0=hdr, x1=key, x2=val, x3=overwrite) -> x0 (1=inserted, 0=existed)
+    arm.mark(&mut code, h.map_put)
+    fr_put := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_put, 8)
+    arm.store(&mut code, 0, 0) // hdr
+    arm.store(&mut code, 1, 1) // key
+    arm.store(&mut code, 2, 2) // val
+    arm.store(&mut code, 3, 3) // overwrite
+    // Check if key already exists via map_find_index(hdr, key)
+    arm.branch(&mut code, h.map_find_index, 1)
+    put_insert := arm.label(&mut code)
+    put_no_ow := arm.label(&mut code)
+    put_ow_pod := arm.label(&mut code)
+    put_ow_done := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 0, 0, false)
+    arm.branch(&mut code, put_insert, 13) // idx < 0 -> insert new!
+    arm.store(&mut code, 4, 0) // existing idx
+    arm.load_into(&mut code, 3, 10)
+    arm.compare_immediate(&mut code, 10, 0, false)
+    arm.branch(&mut code, put_no_ow, 2)
+    // Overwrite vals_arr[idx]
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 10, 10, 8) // vals_arr
+    arm.store(&mut code, 5, 10)
+    load_mem(&mut code, 15, 10, 24) // layout
+    arm.compare_immediate(&mut code, 15, i64(ri.RECORD_LAYOUT_BASE), false)
+    arm.branch(&mut code, put_ow_pod, 4) // >= RECORD_LAYOUT_BASE
+    // Scalar/boxed value overwrite: drop old value if [vals_arr + 40] != 0
+    arm.load_into(&mut code, 4, 1) // idx
+    emit_arr_elem_addr(&mut code, 10, 1, 11) // x11 = &vals[idx]
+    arm.store(&mut code, 6, 11)
+    load_mem(&mut code, 16, 10, 40) // val_drop
+    ow_no_drop := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 16, 0, false)
+    arm.branch(&mut code, ow_no_drop, 2)
+    load_mem(&mut code, 0, 11, 0)
+    arm.emit(&mut code, 3594453504) // blr x16
+    arm.mark(&mut code, ow_no_drop)
+    arm.load_into(&mut code, 5, 10)
+    load_mem(&mut code, 15, 10, 24)
+    arm.load_into(&mut code, 6, 11) // &vals[idx]
+    arm.load_into(&mut code, 2, 12) // new val
+    ow_s1 := arm.label(&mut code); ow_s2 := arm.label(&mut code); ow_s3 := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 15, 0, false); arm.branch(&mut code, ow_s1, 3)
+    arm.transfer(&mut code, false, 12, 11, 0, 0); arm.branch(&mut code, put_ow_done, 0)
+    arm.mark(&mut code, ow_s1)
+    arm.compare_immediate(&mut code, 15, 1, false); arm.branch(&mut code, ow_s2, 3)
+    arm.transfer(&mut code, false, 12, 11, 1, 0); arm.branch(&mut code, put_ow_done, 0)
+    arm.mark(&mut code, ow_s2)
+    arm.compare_immediate(&mut code, 15, 2, false); arm.branch(&mut code, ow_s3, 3)
+    arm.transfer(&mut code, false, 12, 11, 2, 0); arm.branch(&mut code, put_ow_done, 0)
+    arm.mark(&mut code, ow_s3)
+    store_mem(&mut code, 12, 11, 0); arm.branch(&mut code, put_ow_done, 0)
+    // POD value overwrite: memory_copy(&vals[idx], val_ptr, sz)
+    arm.mark(&mut code, put_ow_pod)
+    arm.load_into(&mut code, 4, 1)
+    emit_arr_elem_addr(&mut code, 10, 1, 0) // dst = &vals[idx]
+    arm.load_into(&mut code, 2, 1)          // src = val_ptr
+    arm.load_into(&mut code, 5, 10)
+    load_mem(&mut code, 2, 10, 24)
+    arm.integer_binary(&mut code, 2, true, false, 2, 2, -1, i64(ri.RECORD_LAYOUT_BASE))
+    arm.branch(&mut code, h.rt.memory_copy, 1)
+    arm.mark(&mut code, put_ow_done)
+    arm.mark(&mut code, put_no_ow)
+    arm.imm(&mut code, 0, 0)
+    arm.ret(&mut code)
+
+    // Insert new entry
+    arm.mark(&mut code, put_insert)
+    // Compute hash
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 1, 10, 40) // key_kind
+    arm.load(&mut code, 1) // key
+    arm.branch(&mut code, h.map_hash_key, 1)
+    arm.store(&mut code, 4, 0) // hash
+    // Check load factor / empty table
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 11, 10, 24) // slots_arr
+    load_mem(&mut code, 12, 11, 8)  // cap
+    put_has_cap := arm.label(&mut code); put_grow := arm.label(&mut code); put_ready := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 12, 0, false)
+    arm.branch(&mut code, put_has_cap, 3)
+    arm.mov(&mut code, 0, 10); arm.imm(&mut code, 1, 8)
+    arm.branch(&mut code, h.map_rehash, 1)
+    arm.branch(&mut code, put_ready, 0)
+    arm.mark(&mut code, put_has_cap)
+    load_mem(&mut code, 13, 10, 32) // used
+    arm.integer_binary(&mut code, 1, true, false, 13, 13, -1, 1) // used + 1
+    arm.imm(&mut code, 14, 10)
+    arm.integer_binary(&mut code, 3, true, false, 13, 13, 14, -1) // (used + 1) * 10
+    arm.imm(&mut code, 14, 7)
+    arm.integer_binary(&mut code, 3, true, false, 14, 12, 14, -1) // cap * 7
+    arm.compare_register(&mut code, 13, 14)
+    arm.branch(&mut code, put_ready, 13) // < cap * 7 -> no rehash
+    arm.mark(&mut code, put_grow)
+    load_mem(&mut code, 15, 10, 0)  // keys_arr
+    load_mem(&mut code, 15, 15, 8)  // len
+    arm.integer_binary(&mut code, 1, true, false, 15, 15, -1, 1)
+    arm.imm(&mut code, 14, 10)
+    arm.integer_binary(&mut code, 3, true, false, 15, 15, 14, -1) // (len + 1) * 10
+    arm.imm(&mut code, 14, 4)
+    arm.integer_binary(&mut code, 3, true, false, 14, 12, 14, -1) // cap * 4
+    put_double := arm.label(&mut code); put_do_rh := arm.label(&mut code)
+    arm.compare_register(&mut code, 15, 14)
+    arm.branch(&mut code, put_double, 12) // >= cap * 4 -> double
+    arm.mov(&mut code, 1, 12); arm.branch(&mut code, put_do_rh, 0)
+    arm.mark(&mut code, put_double)
+    arm.integer_binary(&mut code, 1, true, false, 1, 12, 12, -1) // cap * 2
+    arm.mark(&mut code, put_do_rh)
+    arm.mov(&mut code, 0, 10)
+    arm.branch(&mut code, h.map_rehash, 1)
+
+    arm.mark(&mut code, put_ready)
+    // Find first vacant slot (< 0: empty -1 or tombstone -2)
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 11, 10, 24) // slots_arr
+    load_mem(&mut code, 12, 11, 8)  // cap
+    arm.integer_binary(&mut code, 2, true, false, 12, 12, -1, 1) // mask
+    load_mem(&mut code, 11, 11, 0)  // slots_data
+    arm.load_into(&mut code, 4, 13) // hash
+    arm.integer_binary(&mut code, 8, true, false, 13, 13, 12, -1) // slot = hash & mask
+    put_prb := arm.label(&mut code); put_got_slot := arm.label(&mut code)
+    arm.mark(&mut code, put_prb)
+    arm.imm(&mut code, 14, 2)
+    arm.integer_binary(&mut code, 14, true, false, 14, 13, 14, -1)
+    arm.integer_binary(&mut code, 1, true, false, 14, 11, 14, -1) // &slots[slot]
+    arm.transfer(&mut code, true, 15, 14, 4, 0) // ldrsw
+    arm.compare_immediate(&mut code, 15, 0, false)
+    arm.branch(&mut code, put_got_slot, 13) // < 0 -> vacant!
+    arm.integer_binary(&mut code, 1, true, false, 13, 13, -1, 1)
+    arm.integer_binary(&mut code, 8, true, false, 13, 13, 12, -1)
+    arm.branch(&mut code, put_prb, 0)
+    arm.mark(&mut code, put_got_slot)
+    // If slots[slot] == -1, increment used
+    put_was_tomb := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 15, 1, true) // cmp x15, #-1
+    arm.branch(&mut code, put_was_tomb, 3)
+    load_mem(&mut code, 15, 10, 32)
+    arm.integer_binary(&mut code, 1, true, false, 15, 15, -1, 1)
+    store_mem(&mut code, 15, 10, 32)
+    arm.mark(&mut code, put_was_tomb)
+    // Write new_idx = keys_arr.len into slots[slot]
+    load_mem(&mut code, 15, 10, 0) // keys_arr
+    load_mem(&mut code, 15, 15, 8) // new_idx
+    arm.transfer(&mut code, false, 15, 14, 2, 0) // slots[slot] = new_idx
+    // Push key into keys_arr
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 0, 10, 0)  // keys_arr
+    arm.load_into(&mut code, 1, 1) // key
+    load_mem(&mut code, 11, 10, 40) // key_kind
+    pk_pod := arm.label(&mut code); pk_done := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 11, 2, false)
+    arm.branch(&mut code, pk_pod, 4)
+    arm.branch(&mut code, h.rt.array_push, 1); arm.branch(&mut code, pk_done, 0)
+    arm.mark(&mut code, pk_pod)
+    arm.branch(&mut code, h.rt.array_push_pod, 1)
+    arm.mark(&mut code, pk_done)
+    // Push val into vals_arr
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 0, 10, 8)  // vals_arr
+    arm.load_into(&mut code, 2, 1) // val
+    load_mem(&mut code, 11, 0, 24) // layout
+    pv_pod := arm.label(&mut code); pv_done := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 11, i64(ri.RECORD_LAYOUT_BASE), false)
+    arm.branch(&mut code, pv_pod, 4)
+    arm.branch(&mut code, h.rt.array_push, 1); arm.branch(&mut code, pv_done, 0)
+    arm.mark(&mut code, pv_pod)
+    arm.branch(&mut code, h.rt.array_push_pod, 1)
+    arm.mark(&mut code, pv_done)
+    // Push hash into hashes_arr
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 0, 10, 16)
+    arm.load_into(&mut code, 4, 1)
+    arm.branch(&mut code, h.rt.array_push, 1)
+    arm.imm(&mut code, 0, 1)
+    arm.ret(&mut code)
+
+    // 10. map_remove(x0=hdr, x1=key) -> x0 (1=removed, 0=missing)
+    arm.mark(&mut code, h.map_remove)
+    fr_rm := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_rm, 6)
+    arm.store(&mut code, 0, 0) // hdr
+    arm.store(&mut code, 1, 1) // key
+    arm.branch(&mut code, h.map_find_index, 1)
+    rm_miss := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 0, 0, false)
+    arm.branch(&mut code, rm_miss, 13)
+    arm.store(&mut code, 2, 0) // idx
+    // Mark idx's slot as tombstone (-2)
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 11, 10, 24) // slots_arr
+    load_mem(&mut code, 12, 11, 8)  // cap
+    arm.integer_binary(&mut code, 2, true, false, 12, 12, -1, 1) // mask
+    load_mem(&mut code, 11, 11, 0)  // slots_data
+    load_mem(&mut code, 13, 10, 16) // hashes_arr
+    load_mem(&mut code, 13, 13, 0)  // hashes_data
+    arm.load_into(&mut code, 2, 14) // idx
+    arm.imm(&mut code, 15, 3)
+    arm.integer_binary(&mut code, 14, true, false, 15, 14, 15, -1)
+    arm.integer_binary(&mut code, 1, true, false, 15, 13, 15, -1)
+    load_mem(&mut code, 15, 15, 0) // hashes[idx]
+    arm.integer_binary(&mut code, 8, true, false, 15, 15, 12, -1) // slot
+    rm_find_s := arm.label(&mut code); rm_got_s := arm.label(&mut code)
+    arm.mark(&mut code, rm_find_s)
+    arm.imm(&mut code, 1, 2)
+    arm.integer_binary(&mut code, 14, true, false, 1, 15, 1, -1)
+    arm.integer_binary(&mut code, 1, true, false, 1, 11, 1, -1)
+    arm.transfer(&mut code, true, 2, 1, 4, 0)
+    arm.compare_register(&mut code, 2, 14)
+    arm.branch(&mut code, rm_got_s, 2)
+    arm.integer_binary(&mut code, 1, true, false, 15, 15, -1, 1)
+    arm.integer_binary(&mut code, 8, true, false, 15, 15, 12, -1)
+    arm.branch(&mut code, rm_find_s, 0)
+    arm.mark(&mut code, rm_got_s)
+    arm.imm(&mut code, 2, -2)
+    arm.transfer(&mut code, false, 2, 1, 2, 0) // slots[slot] = -2
+
+    // Drop keys[idx] and vals[idx] if they have drop hooks
+    for arr_off in [0, 8] {
+        arm.load_into(&mut code, 0, 10)
+        load_mem(&mut code, 10, 10, arr_off)
+        load_mem(&mut code, 16, 10, 40) // drop fn
+        no_d := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 16, 0, false)
+        arm.branch(&mut code, no_d, 2)
+        arm.load_into(&mut code, 2, 1)
+        emit_arr_elem_addr(&mut code, 10, 1, 11)
+        load_mem(&mut code, 0, 11, 0)
+        arm.emit(&mut code, 3594453504) // blr x16
+        arm.mark(&mut code, no_d)
+    }
+
+    // last = keys_arr.len - 1
+    arm.load_into(&mut code, 0, 10)
+    load_mem(&mut code, 11, 10, 0)
+    load_mem(&mut code, 12, 11, 8)
+    arm.integer_binary(&mut code, 2, true, false, 12, 12, -1, 1) // last
+    arm.store(&mut code, 3, 12) // last
+    arm.load_into(&mut code, 2, 13) // idx
+    rm_shrink := arm.label(&mut code)
+    arm.compare_register(&mut code, 13, 12)
+    arm.branch(&mut code, rm_shrink, 2) // idx == last -> no swap needed
+    // Update last's slot in slots_arr to point to idx
+    load_mem(&mut code, 11, 10, 24) // slots_arr
+    load_mem(&mut code, 14, 11, 8)
+    arm.integer_binary(&mut code, 2, true, false, 14, 14, -1, 1) // mask
+    load_mem(&mut code, 11, 11, 0)  // slots_data
+    load_mem(&mut code, 15, 10, 16) // hashes_arr
+    load_mem(&mut code, 15, 15, 0)  // hashes_data
+    arm.imm(&mut code, 1, 3)
+    arm.integer_binary(&mut code, 14, true, false, 1, 12, 1, -1)
+    arm.integer_binary(&mut code, 1, true, false, 1, 15, 1, -1)
+    load_mem(&mut code, 15, 1, 0) // hashes[last]
+    arm.integer_binary(&mut code, 8, true, false, 15, 15, 14, -1) // slot
+    rm_find_l := arm.label(&mut code); rm_got_l := arm.label(&mut code)
+    arm.mark(&mut code, rm_find_l)
+    arm.imm(&mut code, 1, 2)
+    arm.integer_binary(&mut code, 14, true, false, 1, 15, 1, -1)
+    arm.integer_binary(&mut code, 1, true, false, 1, 11, 1, -1)
+    arm.transfer(&mut code, true, 2, 1, 4, 0)
+    arm.compare_register(&mut code, 2, 12)
+    arm.branch(&mut code, rm_got_l, 2)
+    arm.integer_binary(&mut code, 1, true, false, 15, 15, -1, 1)
+    arm.integer_binary(&mut code, 8, true, false, 15, 15, 14, -1)
+    arm.branch(&mut code, rm_find_l, 0)
+    arm.mark(&mut code, rm_got_l)
+    arm.transfer(&mut code, false, 13, 1, 2, 0) // slots[last_slot] = idx
+    // Copy entry [last] -> [idx] in keys_arr, vals_arr, hashes_arr
+    for arr_off in [0, 8, 16] {
+        arm.load_into(&mut code, 0, 10)
+        load_mem(&mut code, 10, 10, arr_off)
+        arm.load_into(&mut code, 2, 1)
+        emit_arr_elem_addr(&mut code, 10, 1, 0) // dst = &arr[idx]
+        arm.store(&mut code, 4, 0)
+        arm.load_into(&mut code, 3, 1)
+        emit_arr_elem_addr(&mut code, 10, 1, 1) // src = &arr[last]
+        // elem byte size into x2
+        load_mem(&mut code, 15, 10, 24)
+        is_r := arm.label(&mut code); sz_ok := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 15, i64(ri.RECORD_LAYOUT_BASE), false)
+        arm.branch(&mut code, is_r, 4)
+        arm.imm(&mut code, 2, 1)
+        arm.integer_binary(&mut code, 14, true, false, 2, 2, 15, -1) // 1 << layout
+        arm.branch(&mut code, sz_ok, 0)
+        arm.mark(&mut code, is_r)
+        arm.integer_binary(&mut code, 2, true, false, 2, 15, -1, i64(ri.RECORD_LAYOUT_BASE))
+        arm.mark(&mut code, sz_ok)
+        arm.load(&mut code, 4)
+        arm.branch(&mut code, h.rt.memory_copy, 1)
+    }
+    arm.mark(&mut code, rm_shrink)
+    arm.load_into(&mut code, 0, 10)
+    arm.load_into(&mut code, 3, 12) // new_len = last
+    for arr_off in [0, 8, 16] {
+        load_mem(&mut code, 11, 10, arr_off)
+        store_mem(&mut code, 12, 11, 8)
+    }
+    arm.imm(&mut code, 0, 1)
+    arm.ret(&mut code)
+    arm.mark(&mut code, rm_miss)
+    arm.imm(&mut code, 0, 0)
+    arm.ret(&mut code)
+
+    // 11. map_clear(x0=hdr)
+    arm.mark(&mut code, h.map_clear)
+    fr_clr := arm.prologue(&mut code)
+    arm.frame(&mut code, fr_clr, 1)
+    arm.store(&mut code, 0, 0)
+    for off in [0, 8, 16, 24] {
+        arm.load_into(&mut code, 0, 10)
+        load_mem(&mut code, 0, 10, off)
+        arm.branch(&mut code, h.rt.array_clear, 1)
+    }
+    arm.load_into(&mut code, 0, 10)
+    store_mem(&mut code, 31, 10, 32) // used = 0
+    arm.ret(&mut code)
+}
+
+fn emit_embed_blob_data(code: &mut arm.Code, blobs: &[]u8, start: i32, count: i32, label: i32) {
+    if code.words.len % 2 != 0 { arm.emit(&mut code, 0) }
+    arm.mark(&mut code, label)
+    mut cursor := 0
+    while cursor < count {
+        mut word: i64 = 0
+        mut factor: i64 = 1
+        for _ in 0..4 {
+            if cursor < count {
+                word = word + i64(blobs[start + cursor]) * factor
+                cursor += 1
+            }
+            factor = factor * 256
+        }
+        arm.emit(&mut code, word)
+    }
+    if count == 0 { arm.emit(&mut code, 0) }
+}
+
 // Emits all runtime/trap/type helpers and deduplicated literal data.
-// Returns `data_start` (instruction index where static literal data begins).
-pub fn emit_all_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers, environ_slot: i32) -> (i32, i32) {
+// Returns `(data_start, env_site)`.
+pub fn emit_all_helpers(code: &mut arm.Code, prog: &hb.HirProgram, h: &EmitHelpers, environ_slot: i32) -> (i32, i32) {
+    types := &prog.types
     arm.runtime(&mut code, h.print_int, h.print_bool, h.print_text, h.write_stdout,
         h.trap_overflow, h.trap_zero, h.trap_assert, h.trap_io)
 
@@ -997,6 +1767,7 @@ pub fn emit_all_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpe
     arm.ret(&mut code)
 
     emit_closure_drop_dispatcher(&mut code, &h)
+    emit_map_helpers(&mut code, &h)
     emit_type_helpers(&mut code, &types, &h)
     env_site := runtime.emit_runtime_with_env(&mut code, &h.rt, environ_slot)
 
@@ -1009,6 +1780,9 @@ pub fn emit_all_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpe
     }
     for i in 0..h.wstr_texts.len {
         emit_wstr_literal_data(&mut code, h.wstr_texts[i], h.wstr_labels[i])
+    }
+    for i in 0..h.embed_labels.len {
+        emit_embed_blob_data(&mut code, &prog.embed_blobs, prog.embed_starts[i], prog.embed_counts[i], h.embed_labels[i])
     }
     (data_start, env_site)
 }
