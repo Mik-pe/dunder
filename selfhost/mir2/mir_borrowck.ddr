@@ -1,0 +1,956 @@
+// Pass 2: Polonius-Lite CFG Borrow & Origin Checker over packed []u64 bitsets.
+// Implements:
+// - Backward MirLocal liveness with dropck (Drop(x) keeps O(x) live iff TF_DISPOSE; plain types may_dangle)
+// - Bidirectional invariance (O_a <-> O_b) for nested origins behind &mut T / &mut FnMut
+// - BB-entry-only contains[bb_entry][O] + intra-block streaming scratch matrix (fast compile guardrail)
+// - Origin kill on full overwrite of non-borrowed mut local (mut r: &T rebinding)
+// - Deref-chain alias & reborrow resolution (fixes S-3 & Cliff 1)
+// - TwoPhaseMut reserve-vs-Call-activation conflict re-check
+// - Ban on overwriting stored-borrow fields through &mut function parameters
+// - Return `from` & RegionExit escape checks (fixes S-1, S-3, S-4, S-6, C-1, C-2, C-3).
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import mir_body as mb
+import mir_init as mi
+
+enum AccessKind { Read, Write, Move, SharedRef, MutRef, TwoPhaseReserve }
+
+fn bs_get(bits: &[]u64, base: i32, idx: i32) -> bool {
+    bits[base + (idx / 64)].bit_and(u64(1).shl(idx % 64)) != u64(0)
+}
+
+fn bs_set(bits: &mut []u64, base: i32, idx: i32) {
+    bits[base + (idx / 64)] = bits[base + (idx / 64)].bit_or(u64(1).shl(idx % 64))
+}
+
+fn bs_clear(bits: &mut []u64, base: i32, idx: i32) {
+    bits[base + (idx / 64)] = bits[base + (idx / 64)].bit_and(u64(1).shl(idx % 64).bit_not())
+}
+
+fn bs_or_changed(dst: &mut []u64, dst_base: i32, src: &[]u64, src_base: i32, words: i32) -> bool {
+    mut ch := false
+    for w in 0..words {
+        old := dst[dst_base + w]
+        nw := old.bit_or(src[src_base + w])
+        if nw != old { dst[dst_base + w] = nw; ch = true }
+    }
+    ch
+}
+
+fn bs_zero(bits: &mut []u64, base: i32, words: i32) {
+    for w in 0..words { bits[base + w] = u64(0) }
+}
+
+fn bs_copy(dst: &mut []u64, dst_base: i32, src: &[]u64, src_base: i32, words: i32) {
+    for w in 0..words { dst[dst_base + w] = src[src_base + w] }
+}
+
+fn bs_copy_self(arr: &mut []u64, dst_base: i32, src_base: i32, words: i32) {
+    for w in 0..words { arr[dst_base + w] = arr[src_base + w] }
+}
+
+fn bs_or_self_changed(arr: &mut []u64, dst_base: i32, src_base: i32, words: i32) -> bool {
+    mut ch := false
+    for w in 0..words {
+        old := arr[dst_base + w]
+        nw := old.bit_or(arr[src_base + w])
+        if nw != old { arr[dst_base + w] = nw; ch = true }
+    }
+    ch
+}
+
+fn add_op_use(body: &mb.MirBody, op_id: i32, live: &mut []u64, base: i32) {
+    if op_id < 0 || op_id >= body.ops.len { return }
+    op := body.ops[op_id]
+    if op.kind == .Const { return }
+    add_place_use(&body, op.id, &mut live, base)
+}
+
+fn add_place_use(body: &mb.MirBody, place_id: i32, live: &mut []u64, base: i32) {
+    if place_id < 0 || place_id >= body.places.len { return }
+    pl := body.places[place_id]
+    bs_set(&mut live, base, pl.local)
+    for i in 0..pl.proj_len {
+        pr := body.projs[pl.proj_start + i]
+        if pr.kind == .Index && pr.index >= 0 && pr.index < body.locals.len {
+            bs_set(&mut live, base, pr.index)
+        }
+    }
+}
+
+fn add_rvalue_uses(body: &mb.MirBody, rv_id: i32, live: &mut []u64, base: i32) {
+    if rv_id < 0 || rv_id >= body.rvalues.len { return }
+    rv := body.rvalues[rv_id]
+    if rv.kind == .Use || rv.kind == .Unary || rv.kind == .Cast || rv.kind == .Len || rv.kind == .Discriminant {
+        add_op_use(&body, rv.a, &mut live, base)
+    } else if rv.kind == .Binary {
+        add_op_use(&body, rv.a, &mut live, base)
+        add_op_use(&body, rv.b, &mut live, base)
+    } else if rv.kind == .Ref {
+        add_place_use(&body, body.loans[rv.a].place, &mut live, base)
+    } else if rv.kind == .Slice || rv.kind == .BytesView {
+        add_place_use(&body, body.loans[rv.a].place, &mut live, base)
+        for i in 0..rv.op_len { add_op_use(&body, body.call_args[rv.op_start + i], &mut live, base) }
+    } else if rv.kind == .AddrOf {
+        add_place_use(&body, rv.a, &mut live, base)
+    } else if rv.kind == .Aggregate || rv.kind == .Closure {
+        for i in 0..rv.op_len { add_op_use(&body, body.call_args[rv.op_start + i], &mut live, base) }
+    }
+}
+
+fn step_liveness_stmt_back(body: &mb.MirBody, st: mb.MirStmt, live: &mut []u64, base: i32) {
+    if st.kind == .Assign {
+        pl := body.places[st.place]
+        if pl.proj_len == 0 {
+            bs_clear(&mut live, base, pl.local)
+        } else {
+            add_place_use(&body, st.place, &mut live, base)
+        }
+        add_rvalue_uses(&body, st.rvalue, &mut live, base)
+    } else if st.kind == .StorageDead || st.kind == .SetDeferActive || st.kind == .SetUnwindTarget {
+        bs_clear(&mut live, base, st.place)
+    } else if st.kind == .SetDiscriminant {
+        add_place_use(&body, st.place, &mut live, base)
+    }
+}
+
+fn step_liveness_term_back(types: &ht.TypeTable, body: &mb.MirBody, tm: mb.MirTerm, live: &mut []u64, base: i32) {
+    if tm.kind == .Return {
+        bs_set(&mut live, base, 0)
+    } else if tm.kind == .SwitchInt {
+        add_op_use(&body, tm.place_or_op, &mut live, base)
+    } else if tm.kind == .Call {
+        dest := body.places[tm.place_or_op]
+        if dest.proj_len == 0 { bs_clear(&mut live, base, dest.local) }
+        else { add_place_use(&body, tm.place_or_op, &mut live, base) }
+        if tm.call_kind == .Indirect { add_op_use(&body, tm.callee, &mut live, base) }
+        for i in 0..tm.arg_len { add_op_use(&body, body.call_args[tm.arg_start + i], &mut live, base) }
+    } else if tm.kind == .Drop {
+        // dropck: Drop(x) marks O(x) live IFF ty(x) transitively has TF_DISPOSE.
+        // Plain structs/views without TF_DISPOSE are may_dangle!
+        pl := body.places[tm.place_or_op]
+        if ht.has_dispose(&types, pl.ty) {
+            bs_set(&mut live, base, pl.local)
+        }
+    }
+}
+
+struct Liveness {
+    words: i32,
+    live_in: []u64,
+    live_out: []u64,
+}
+
+fn compute_liveness(types: &ht.TypeTable, body: &mb.MirBody) -> Liveness {
+    n_bbs := body.blocks.len
+    words := (body.locals.len + 63) / 64
+    mut live_in: []u64 = []
+    mut live_out: []u64 = []
+    for _ in 0..(n_bbs * words) { live_in.push(u64(0)); live_out.push(u64(0)) }
+
+    mut cur: []u64 = []
+    for _ in 0..words { cur.push(u64(0)) }
+    mut succs: []i32 = []
+
+    mut changed := true
+    while changed {
+        changed = false
+        mut bb := n_bbs - 1
+        while bb >= 0 {
+            base := bb * words
+            bs_zero(&mut cur, 0, words)
+            mb.term_succs(&body, bb, &mut succs)
+            for si in 0..succs.len {
+                _ := bs_or_changed(&mut cur, 0, &live_in, succs[si] * words, words)
+            }
+            if bs_or_changed(&mut live_out, base, &cur, 0, words) { changed = true }
+            bs_copy(&mut cur, 0, &live_out, base, words)
+            blk := body.blocks[bb]
+            step_liveness_term_back(&types, &body, body.terms[blk.term_id], &mut cur, 0)
+            mut si := blk.stmt_end - 1
+            while si >= blk.stmt_start {
+                step_liveness_stmt_back(&body, body.stmts[si], &mut cur, 0)
+                si -= 1
+            }
+            if bs_or_changed(&mut live_in, base, &cur, 0, words) { changed = true }
+            bb -= 1
+        }
+    }
+    Liveness { words: words, live_in: move live_in, live_out: move live_out }
+}
+
+// Resolve the starting origin slot (within place.local's local_origins) for a place.
+// Returns (origin_start_in_local, origin_count_of_place).
+struct PlaceOriginSlice {
+    start_slot: i32,
+    count: i32,
+}
+
+fn place_origin_slice(types: &ht.TypeTable, body: &mb.MirBody, place_id: i32) -> PlaceOriginSlice {
+    pl := body.places[place_id]
+    mut cur_ty := body.locals[pl.local].ty
+    mut slot := 0
+    mut downcast_var := -1
+    for i in 0..pl.proj_len {
+        pr := body.projs[pl.proj_start + i]
+        if pr.kind == .Deref {
+            k := types.entries[cur_ty].kind
+            if k == .Ref || k == .MutRef {
+                // Slot 0 is the reference's own origin; slots 1.. are the pointee's origins!
+                slot += 1
+                cur_ty = types.entries[cur_ty].inner_a
+            } else {
+                return PlaceOriginSlice { start_slot: -1, count: 0 }
+            }
+            downcast_var = -1
+        } else if pr.kind == .Downcast {
+            downcast_var = pr.index
+        } else if pr.kind == .Field {
+            if downcast_var >= 0 {
+                v := &types.variants[types.entries[cur_ty].inner_a + downcast_var]
+                fslot := types.fields[v.payload_start + pr.index].origin_slot
+                cur_ty = types.fields[v.payload_start + pr.index].ty
+                downcast_var = -1
+                if fslot < 0 { return PlaceOriginSlice { start_slot: -1, count: 0 } }
+                slot += fslot
+            } else {
+                fslot := ht.field_origin_slot(&types, cur_ty, pr.index)
+                cur_ty = ht.field_type(&types, cur_ty, pr.index)
+                if fslot < 0 { return PlaceOriginSlice { start_slot: -1, count: 0 } }
+                slot += fslot
+            }
+        } else if pr.kind == .Index {
+            k := types.entries[cur_ty].kind
+            if k == .FatSlice || k == .RegionSlice {
+                slot += 1
+                cur_ty = types.entries[cur_ty].inner_a
+            } else if k == .Array || k == .FixedArr {
+                cur_ty = types.entries[cur_ty].inner_a
+            } else {
+                return PlaceOriginSlice { start_slot: -1, count: 0 }
+            }
+            downcast_var = -1
+        }
+    }
+    PlaceOriginSlice { start_slot: slot, count: ht.origin_count(&types, pl.ty) }
+}
+
+fn push_edge(edges: &mut []mb.OutlivesEdge, from_o: i32, to_o: i32, bb: i32, stmt_idx: i32, bidir: bool) {
+    if from_o < 0 || to_o < 0 || from_o == to_o { return }
+    edges.push(mb.OutlivesEdge {
+        from_origin: from_o,
+        to_origin: to_o,
+        bb: bb,
+        stmt_idx: stmt_idx,
+        bidirectional: bidir,
+    })
+}
+
+fn emit_place_to_place_edges(types: &ht.TypeTable, body: &mb.MirBody,
+    src_place: i32, dst_place: i32, bb: i32, stmt_idx: i32, edges: &mut []mb.OutlivesEdge) {
+    src_sl := place_origin_slice(&types, &body, src_place)
+    dst_sl := place_origin_slice(&types, &body, dst_place)
+    if src_sl.start_slot < 0 || dst_sl.start_slot < 0 { return }
+    cnt := if src_sl.count < dst_sl.count { src_sl.count } else { dst_sl.count }
+    dst_ty := body.places[dst_place].ty
+    invar := ht.is_invariant_container(&types, dst_ty)
+    for k in 0..cnt {
+        so := mb.local_origin_at(&body, body.places[src_place].local, src_sl.start_slot + k)
+        do := mb.local_origin_at(&body, body.places[dst_place].local, dst_sl.start_slot + k)
+        // Slot 0 of &mut T is covariant (ref lifetime itself); slots >= 1 inside &mut T are INVARIANT!
+        bidir := invar && k >= 1
+        push_edge(&mut edges, so, do, bb, stmt_idx, bidir)
+    }
+}
+
+fn collect_all_edges(types: &ht.TypeTable, body: &mb.MirBody) -> []mb.OutlivesEdge {
+    mut edges: []mb.OutlivesEdge = []
+    for i in 0..body.outlives.len { edges.push(body.outlives[i]) }
+
+    for bb in 0..body.blocks.len {
+        blk := body.blocks[bb]
+        for si in blk.stmt_start..blk.stmt_end {
+            rel := si - blk.stmt_start
+            st := body.stmts[si]
+            if st.kind != .Assign { continue }
+            rv := body.rvalues[st.rvalue]
+            dst_pl := st.place
+            dst_sl := place_origin_slice(&types, &body, dst_pl)
+            dst_loc := body.places[dst_pl].local
+            if rv.kind == .Use {
+                op := body.ops[rv.a]
+                if op.kind != .Const {
+                    emit_place_to_place_edges(&types, &body, op.id, dst_pl, bb, rel, &mut edges)
+                }
+            } else if rv.kind == .Ref {
+                ln := body.loans[rv.a]
+                if dst_sl.start_slot >= 0 && dst_sl.count > 0 {
+                    do0 := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot)
+                    push_edge(&mut edges, ln.origin, do0, bb, rel, false)
+                    // Propagate nested origins of borrowed place into slots 1.. of dst (&T covariant, &mut T INVARIANT!).
+                    src_sl := place_origin_slice(&types, &body, ln.place)
+                    if src_sl.start_slot >= 0 && src_sl.count > 0 {
+                        invar := ht.is_invariant_container(&types, body.places[dst_pl].ty)
+                        for k in 0..src_sl.count {
+                            if 1 + k < dst_sl.count {
+                                so := mb.local_origin_at(&body, body.places[ln.place].local, src_sl.start_slot + k)
+                                do_k := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot + 1 + k)
+                                push_edge(&mut edges, so, do_k, bb, rel, invar)
+                            }
+                        }
+                    }
+                }
+            } else if rv.kind == .Slice || rv.kind == .BytesView {
+                ln := body.loans[rv.a]
+                if dst_sl.start_slot >= 0 && dst_sl.count > 0 {
+                    do0 := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot)
+                    push_edge(&mut edges, ln.origin, do0, bb, rel, false)
+                }
+            } else if rv.kind == .Aggregate {
+                agg_ty := rv.ty
+                ak := types.entries[agg_ty].kind
+                if dst_sl.start_slot >= 0 && (ak == .Struct || ak == .Tuple || ak == .Enum) {
+                    for i in 0..rv.op_len {
+                        op := body.ops[body.call_args[rv.op_start + i]]
+                        if op.kind == .Const { continue }
+                        fslot := if ak == .Enum {
+                            types.fields[types.variants[types.entries[agg_ty].inner_a + rv.a].payload_start + i].origin_slot
+                        } else {
+                            ht.field_origin_slot(&types, agg_ty, i)
+                        }
+                        if fslot < 0 { continue }
+                        src_sl := place_origin_slice(&types, &body, op.id)
+                        if src_sl.start_slot < 0 { continue }
+                        for k in 0..src_sl.count {
+                            so := mb.local_origin_at(&body, body.places[op.id].local, src_sl.start_slot + k)
+                            do_k := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot + fslot + k)
+                            push_edge(&mut edges, so, do_k, bb, rel, false)
+                        }
+                    }
+                }
+            } else if rv.kind == .Closure {
+                cl_ty := rv.ty
+                if dst_sl.start_slot >= 0 {
+                    borrowed := ht.has_flag(&types, cl_ty, ht.TF_CLOSURE_BORROWED)
+                    invar := ht.is_invariant_container(&types, cl_ty)
+                    for i in 0..rv.op_len {
+                        op := body.ops[body.call_args[rv.op_start + i]]
+                        if op.kind == .Const { continue }
+                        src_sl := place_origin_slice(&types, &body, op.id)
+                        if src_sl.start_slot < 0 { continue }
+                        fslot := ht.field_origin_slot(&types, cl_ty, i)
+                        for k in 0..src_sl.count {
+                            so := mb.local_origin_at(&body, body.places[op.id].local, src_sl.start_slot + k)
+                            if borrowed && dst_sl.count > 0 {
+                                do0 := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot)
+                                push_edge(&mut edges, so, do0, bb, rel, invar)
+                            }
+                            if fslot >= 0 && fslot + k < dst_sl.count {
+                                do_k := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot + fslot + k)
+                                push_edge(&mut edges, so, do_k, bb, rel, invar)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Terminator Call `from_edges` (including PARAM_ENV for closures returning borrows!)
+        tm := body.terms[blk.term_id]
+        if tm.kind == .Call && tm.sig_ty >= 0 && tm.sig_ty < types.entries.len {
+            sig := &types.entries[tm.sig_ty]
+            dst_pl := tm.place_or_op
+            dst_sl := place_origin_slice(&types, &body, dst_pl)
+            dst_loc := body.places[dst_pl].local
+            if dst_sl.start_slot >= 0 && dst_sl.count > 0 {
+                for fi in 0..sig.from_len {
+                    fe := types.from_edges[sig.from_start + fi]
+                    mut src_op_id := -1
+                    if fe.param_idx == ht.PARAM_ENV && tm.call_kind == .Indirect {
+                        src_op_id = tm.callee
+                    } else if fe.param_idx >= 0 && fe.param_idx < tm.arg_len {
+                        src_op_id = body.call_args[tm.arg_start + fe.param_idx]
+                    }
+                    if src_op_id < 0 || src_op_id >= body.ops.len { continue }
+                    op := body.ops[src_op_id]
+                    if op.kind == .Const { continue }
+                    src_sl := place_origin_slice(&types, &body, op.id)
+                    if src_sl.start_slot < 0 { continue }
+                    do_r := mb.local_origin_at(&body, dst_loc, dst_sl.start_slot + fe.ret_slot)
+                    if fe.field_slot >= 0 {
+                        // Project specific field origin slot (e.g. `from self.text` on Graphemes::next(&mut self)):
+                        // If arg is &mut Self / &Self, Self's field slot is at 1 + field_slot!
+                        arg_ty := body.places[op.id].ty
+                        offset := if types.entries[arg_ty].kind == .Ref || types.entries[arg_ty].kind == .MutRef {
+                            1 + fe.field_slot
+                        } else {
+                            fe.field_slot
+                        }
+                        if offset < src_sl.count {
+                            so := mb.local_origin_at(&body, body.places[op.id].local, src_sl.start_slot + offset)
+                            push_edge(&mut edges, so, do_r, bb, -1, false)
+                        }
+                    } else {
+                        for k in 0..src_sl.count {
+                            so := mb.local_origin_at(&body, body.places[op.id].local, src_sl.start_slot + k)
+                            push_edge(&mut edges, so, do_r, bb, -1, false)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    edges
+}
+
+fn close_edges(cur: &mut []u64, edges: &[]mb.OutlivesEdge, bb: i32, stmt_idx: i32,
+    loan_words: i32, active_bidir: &[]i32) {
+    mut changed := true
+    while changed {
+        changed = false
+        for i in 0..edges.len {
+            e := edges[i]
+            if e.bb == bb && e.stmt_idx == stmt_idx {
+                if bs_or_self_changed(&mut cur, e.to_origin * loan_words, e.from_origin * loan_words, loan_words) {
+                    changed = true
+                }
+                if e.bidirectional {
+                    if bs_or_self_changed(&mut cur, e.from_origin * loan_words, e.to_origin * loan_words, loan_words) {
+                        changed = true
+                    }
+                }
+            }
+        }
+        // Always propagate across previously established bidirectional invariance equalities!
+        for i in 0..active_bidir.len {
+            e := edges[active_bidir[i]]
+            if bs_or_self_changed(&mut cur, e.to_origin * loan_words, e.from_origin * loan_words, loan_words) {
+                changed = true
+            }
+            if bs_or_self_changed(&mut cur, e.from_origin * loan_words, e.to_origin * loan_words, loan_words) {
+                changed = true
+            }
+        }
+    }
+}
+
+// Two places overlap if they share the same root local and neither diverges on distinct struct fields
+// or distinct enum variants. Index(*) conservatively overlaps all sibling indices.
+fn places_overlap(body: &mb.MirBody, pa_id: i32, pb_id: i32) -> bool {
+    pa := body.places[pa_id]
+    pb := body.places[pb_id]
+    if pa.local != pb.local { return false }
+    min_len := if pa.proj_len < pb.proj_len { pa.proj_len } else { pb.proj_len }
+    for i in 0..min_len {
+        a := body.projs[pa.proj_start + i]
+        b := body.projs[pb.proj_start + i]
+        if a.kind == .Field && b.kind == .Field {
+            if a.index != b.index { return false }
+        } else if a.kind == .Downcast && b.kind == .Downcast {
+            if a.index != b.index { return false }
+        } else if a.kind == .Index || b.kind == .Index {
+            // Wildcard index conservatively overlaps
+            return true
+        }
+    }
+    true
+}
+
+fn is_mut_ref_local(types: &ht.TypeTable, body: &mb.MirBody, local: i32) -> bool {
+    if local < 0 || local >= body.locals.len { return false }
+    types.entries[body.locals[local].ty].kind == .MutRef
+}
+
+fn starts_with_deref(body: &mb.MirBody, place_id: i32) -> bool {
+    pl := body.places[place_id]
+    pl.proj_len > 0 && body.projs[pl.proj_start].kind == .Deref
+}
+
+fn is_write_access(k: AccessKind) -> bool {
+    k == .Write || k == .Move || k == .MutRef || k == .TwoPhaseReserve
+}
+
+fn compute_live_origins(body: &mb.MirBody, live_locals: &[]u64, local_base: i32,
+    ext_origins: &[]u64, origin_words: i32, out_origins: &mut []u64) {
+    bs_copy(&mut out_origins, 0, &ext_origins, 0, origin_words)
+    for l in 0..body.locals.len {
+        if bs_get(&live_locals, local_base, l) {
+            o_start := body.locals[l].origin_start
+            o_len := body.locals[l].origin_len
+            for k in 0..o_len {
+                bs_set(&mut out_origins, 0, body.local_origins[o_start + k])
+            }
+        }
+    }
+}
+
+fn compute_active_loans(cur_contains: &[]u64, live_origins: &[]u64,
+    num_origins: i32, loan_words: i32, out_loans: &mut []u64) {
+    bs_zero(&mut out_loans, 0, loan_words)
+    for o in 0..num_origins {
+        if bs_get(&live_origins, 0, o) {
+            _ := bs_or_changed(&mut out_loans, 0, &cur_contains, o * loan_words, loan_words)
+        }
+    }
+}
+
+fn check_single_access(types: &ht.TypeTable, body: &mb.MirBody, cur_contains: &[]u64,
+    active_loans: &[]u64, loan_words: i32, bb: i32, activating_two_phase: i32,
+    access_place: i32, kind: AccessKind, span_s: i32, span_e: i32,
+    diags: &mut []diag.Diagnostic) -> bool {
+    n_loans := body.loans.len
+    if n_loans == 0 { return true }
+    ap := body.places[access_place]
+    mut ok := true
+
+    // Determine if access_place dereferences a &mut local `r` (reborrow / write through *r)
+    deref_mut := starts_with_deref(&body, access_place) && is_mut_ref_local(&types, &body, ap.local)
+    // Determine if access_place passes/mutates a &mut local `r` directly (e.g. grow(&mut r) — S-3!)
+    direct_mut_alias := !deref_mut && is_mut_ref_local(&types, &body, ap.local) && is_write_access(kind)
+    r_origin := if deref_mut || direct_mut_alias { mb.local_origin_at(&body, ap.local, 0) } else { -1 }
+
+    for li in 0..n_loans {
+        if !bs_get(&active_loans, 0, li) { continue }
+        if li == activating_two_phase { continue }
+        ln := body.loans[li]
+
+        // If `r` holds loan `li`:
+        if r_origin >= 0 && bs_get(&cur_contains, r_origin * loan_words, li) {
+            if deref_mut {
+                // Reborrowing or mutating through `*r` (its own &mut loan) is ALLOWED (Cliff 1)!
+                if ln.kind == .Shared && is_write_access(kind) {
+                    hb.push_error(&mut diags, "E4003", body.path, span_s, span_e,
+                        "cannot mutate through shared borrow")
+                    ok = false
+                }
+                continue
+            }
+            if direct_mut_alias {
+                // Passing `&mut r` (e.g. `grow(&mut r)`) does NOT conflict with `r`'s own underlying loan `li`,
+                // BUT we check `li.place` against ALL OTHER active loans below!
+                continue
+            }
+        }
+
+        // Compute effective overlap: direct place overlap OR alias-target overlap (S-3)!
+        mut overlaps := places_overlap(&body, access_place, ln.place)
+        if !overlaps && r_origin >= 0 {
+            // Check whether ANY loan held by `r` overlaps `ln.place`!
+            for rli in 0..n_loans {
+                if bs_get(&cur_contains, r_origin * loan_words, rli) {
+                    if places_overlap(&body, body.loans[rli].place, ln.place) {
+                        overlaps = true
+                        break
+                    }
+                }
+            }
+        }
+        // Also check reverse: if `ln.place` itself starts with Deref of a &mut local `q`,
+        // does `access_place` overlap any loan held by `q` (e.g. `ln` is `&r[0]` and `access_place` is `v`)?
+        if !overlaps && starts_with_deref(&body, ln.place) && is_mut_ref_local(&types, &body, body.places[ln.place].local) {
+            q_origin := mb.local_origin_at(&body, body.places[ln.place].local, 0)
+            if q_origin >= 0 {
+                for qli in 0..n_loans {
+                    if bs_get(&cur_contains, q_origin * loan_words, qli) {
+                        if places_overlap(&body, access_place, body.loans[qli].place) {
+                            overlaps = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        if !overlaps { continue }
+
+        // TwoPhaseMut rules: before Call activation, Read & SharedRef are allowed;
+        // Write, Move, MutRef, and a second TwoPhaseReserve are REJECTED!
+        if ln.kind == .TwoPhaseMut && activating_two_phase < 0 {
+            if kind == .Read || kind == .SharedRef { continue }
+            hb.push_error(&mut diags, "E4003", body.path, span_s, span_e,
+                "cannot mutate or borrow mutably while two-phase mutable borrow is reserved")
+            ok = false
+            continue
+        }
+
+        // Standard conflict rule: exclusive loan conflicts with any access; shared loan conflicts with write/move/mut-ref.
+        if ln.kind == .Mut || ln.kind == .TwoPhaseMut || is_write_access(kind) {
+            hb.push_error(&mut diags, "E4003", body.path, span_s, span_e,
+                "cannot access or mutate '" + body.locals[ap.local].name + "' while it is borrowed")
+            ok = false
+        }
+    }
+    ok
+}
+
+fn check_operand_access(types: &ht.TypeTable, body: &mb.MirBody, cur_contains: &[]u64,
+    active_loans: &[]u64, loan_words: i32, bb: i32, op_id: i32,
+    span_s: i32, span_e: i32, diags: &mut []diag.Diagnostic) -> bool {
+    if op_id < 0 || op_id >= body.ops.len { return true }
+    op := body.ops[op_id]
+    if op.kind == .Const { return true }
+    ak: AccessKind = if op.kind == .Move && !ht.is_copy(&types, body.places[op.id].ty) { .Move } else { .Read }
+    check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, -1, op.id, ak, span_s, span_e, &mut diags)
+}
+
+fn is_allowed_return_loan(types: &ht.TypeTable, body: &mb.MirBody, loan_id: i32) -> bool {
+    ln := body.loans[loan_id]
+    root := body.places[ln.place].local
+    if root < 1 || root > body.param_count { return false }
+    if body.locals[root].flags.bit_and(mb.LF_PARAM) == 0 { return false }
+    if body.sig_ty >= 0 && body.sig_ty < types.entries.len {
+        sig := &types.entries[body.sig_ty]
+        if sig.from_len > 0 {
+            param_idx := root - 1
+            for fi in 0..sig.from_len {
+                fe := types.from_edges[sig.from_start + fi]
+                if fe.param_idx == param_idx || fe.param_idx == ht.PARAM_ENV { return true }
+            }
+            return false
+        }
+    }
+    true
+}
+
+pub fn check_borrows(types: &ht.TypeTable, body: &mb.MirBody, init: &mi.InitState, diags: &mut []diag.Diagnostic) -> bool {
+    n_bbs := body.blocks.len
+    n_origins := body.origin_count
+    n_loans := body.loans.len
+    if n_origins == 0 && n_loans == 0 { return true }
+
+    loan_words := if n_loans == 0 { 1 } else { (n_loans + 63) / 64 }
+    origin_words := if n_origins == 0 { 1 } else { (n_origins + 63) / 64 }
+    mat_words := n_origins * loan_words
+
+    // Step A: Backward MirLocal liveness with dropck
+    live := compute_liveness(&types, &body)
+
+    // External origins O_ext = return local 0's origins (must survive to Return!)
+    mut ext_origins: []u64 = []
+    for _ in 0..origin_words { ext_origins.push(u64(0)) }
+    for k in 0..body.locals[0].origin_len {
+        bs_set(&mut ext_origins, 0, body.local_origins[body.locals[0].origin_start + k])
+    }
+
+    // Step B: Collect all outlives & bidirectional invariance edges
+    edges := collect_all_edges(&types, &body)
+    mut active_bidir: []i32 = []
+    for i in 0..edges.len {
+        if edges[i].bidirectional { active_bidir.push(i) }
+    }
+
+    // Step C: BB-entry-only forward fixpoint for contains[bb_entry][O]
+    mut bb_contains: []u64 = []
+    for _ in 0..(n_bbs * mat_words) { bb_contains.push(u64(0)) }
+
+    mut cur_contains: []u64 = []
+    for _ in 0..mat_words { cur_contains.push(u64(0)) }
+
+    mut live_origins: []u64 = []
+    for _ in 0..origin_words { live_origins.push(u64(0)) }
+    mut active_loans: []u64 = []
+    for _ in 0..loan_words { active_loans.push(u64(0)) }
+
+    mut work: []i32 = [0]
+    mut in_work: []bool = []
+    for _ in 0..n_bbs { in_work.push(false) }
+    in_work[0] = true
+
+    mut succs: []i32 = []
+    mut stmt_live_after: []u64 = []
+    mut stmt_live_before: []u64 = []
+
+    while work.len > 0 {
+        bb := work.pop()
+        in_work[bb] = false
+        if !init.reachable[bb] { continue }
+
+        blk := body.blocks[bb]
+        s_count := blk.stmt_end - blk.stmt_start
+
+        // Precompute per-stmt live_after within this single BB (streamed backward).
+        stmt_live_after.clear()
+        for _ in 0..((s_count + 1) * live.words) { stmt_live_after.push(u64(0)) }
+        bs_copy(&mut stmt_live_after, s_count * live.words, &live.live_out, bb * live.words, live.words)
+        step_liveness_term_back(&types, &body, body.terms[blk.term_id], &mut stmt_live_after, s_count * live.words)
+        mut k := s_count - 1
+        while k >= 0 {
+            bs_copy_self(&mut stmt_live_after, k * live.words, (k + 1) * live.words, live.words)
+            if k < s_count - 1 {
+                step_liveness_stmt_back(&body, body.stmts[blk.stmt_start + k + 1], &mut stmt_live_after, k * live.words)
+            }
+            k -= 1
+        }
+
+        bs_copy(&mut cur_contains, 0, &bb_contains, bb * mat_words, mat_words)
+        for rel in 0..s_count {
+            st := body.stmts[blk.stmt_start + rel]
+            // Kill previous origin contents on full overwrite of a non-borrowed mut local (`mut r: &T` rebinding).
+            if st.kind == .Assign {
+                dst := body.places[st.place]
+                if dst.proj_len == 0 && body.locals[dst.local].flags.bit_and(mb.LF_MUT) != 0 {
+                    // Only kill if no active loan borrows dst.local itself.
+                    compute_live_origins(&body, &stmt_live_after, rel * live.words, &ext_origins, origin_words, &mut live_origins)
+                    compute_active_loans(&cur_contains, &live_origins, n_origins, loan_words, &mut active_loans)
+                    mut borrowed_self := false
+                    for li in 0..n_loans {
+                        if bs_get(&active_loans, 0, li) && body.places[body.loans[li].place].local == dst.local {
+                            borrowed_self = true; break
+                        }
+                    }
+                    if !borrowed_self {
+                        for oi in 0..body.locals[dst.local].origin_len {
+                            o := body.local_origins[body.locals[dst.local].origin_start + oi]
+                            bs_zero(&mut cur_contains, o * loan_words, loan_words)
+                        }
+                    }
+                }
+            }
+            // Seed any loans defined at (bb, rel)
+            for li in 0..n_loans {
+                if body.loans[li].def_bb == bb && body.loans[li].def_stmt == rel {
+                    bs_set(&mut cur_contains, body.loans[li].origin * loan_words, li)
+                }
+            }
+            // Close over outlives & bidirectional invariance edges at (bb, rel)
+            close_edges(&mut cur_contains, &edges, bb, rel, loan_words, &active_bidir)
+            // Prune dead origins (not live after stmt and not in O_ext)
+            compute_live_origins(&body, &stmt_live_after, rel * live.words, &ext_origins, origin_words, &mut live_origins)
+            for o in 0..n_origins {
+                if !bs_get(&live_origins, 0, o) {
+                    bs_zero(&mut cur_contains, o * loan_words, loan_words)
+                }
+            }
+        }
+        // Close over terminator outlives edges (e.g. Call `from_edges`)
+        close_edges(&mut cur_contains, &edges, bb, -1, loan_words, &active_bidir)
+
+        mb.term_succs(&body, bb, &mut succs)
+        for si in 0..succs.len {
+            s := succs[si]
+            if bs_or_changed(&mut bb_contains, s * mat_words, &cur_contains, 0, mat_words) {
+                if !in_work[s] { in_work[s] = true; work.push(s) }
+            }
+        }
+    }
+
+    // Step D: Single streaming conflict & escape pass per reachable BB
+    mut ok := true
+    for bb in 0..n_bbs {
+        if !init.reachable[bb] { continue }
+        blk := body.blocks[bb]
+        s_count := blk.stmt_end - blk.stmt_start
+
+        stmt_live_after.clear()
+        stmt_live_before.clear()
+        for _ in 0..((s_count + 1) * live.words) {
+            stmt_live_after.push(u64(0))
+            stmt_live_before.push(u64(0))
+        }
+        bs_copy(&mut stmt_live_after, s_count * live.words, &live.live_out, bb * live.words, live.words)
+        bs_copy(&mut stmt_live_before, s_count * live.words, &live.live_out, bb * live.words, live.words)
+        step_liveness_term_back(&types, &body, body.terms[blk.term_id], &mut stmt_live_before, s_count * live.words)
+        mut k := s_count - 1
+        while k >= 0 {
+            bs_copy(&mut stmt_live_after, k * live.words, &stmt_live_before, (k + 1) * live.words, live.words)
+            bs_copy(&mut stmt_live_before, k * live.words, &stmt_live_after, k * live.words, live.words)
+            step_liveness_stmt_back(&body, body.stmts[blk.stmt_start + k], &mut stmt_live_before, k * live.words)
+            k -= 1
+        }
+
+        bs_copy(&mut cur_contains, 0, &bb_contains, bb * mat_words, mat_words)
+
+        for rel in 0..s_count {
+            st := body.stmts[blk.stmt_start + rel]
+            compute_live_origins(&body, &stmt_live_before, rel * live.words, &ext_origins, origin_words, &mut live_origins)
+            compute_active_loans(&cur_contains, &live_origins, n_origins, loan_words, &mut active_loans)
+
+            if st.kind == .Assign {
+                // Ban overwriting stored-borrow fields through &mut function parameters in 1.0!
+                dst := body.places[st.place]
+                if starts_with_deref(&body, st.place) &&
+                    body.locals[dst.local].flags.bit_and(mb.LF_PARAM) != 0 &&
+                    is_mut_ref_local(&types, &body, dst.local) &&
+                    ht.origin_count(&types, dst.ty) > 0 {
+                    hb.push_error(&mut diags, "E4003", body.path, st.span_start, st.span_end,
+                        "cannot overwrite stored borrow through '&mut' parameter '" + body.locals[dst.local].name + "'")
+                    ok = false
+                }
+
+                // Check RHS accesses
+                rv := body.rvalues[st.rvalue]
+                if rv.kind == .Use || rv.kind == .Unary || rv.kind == .Cast || rv.kind == .Len || rv.kind == .Discriminant {
+                    if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, rv.a, st.span_start, st.span_end, &mut diags) { ok = false }
+                } else if rv.kind == .Binary {
+                    if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, rv.a, st.span_start, st.span_end, &mut diags) { ok = false }
+                    if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, rv.b, st.span_start, st.span_end, &mut diags) { ok = false }
+                } else if rv.kind == .Ref {
+                    ln := body.loans[rv.a]
+                    ak: AccessKind = if ln.kind == .Shared { .SharedRef } else if ln.kind == .TwoPhaseMut { .TwoPhaseReserve } else { .MutRef }
+                    if !check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, -1, ln.place, ak, st.span_start, st.span_end, &mut diags) { ok = false }
+                } else if rv.kind == .Slice || rv.kind == .BytesView {
+                    ln := body.loans[rv.a]
+                    ak: AccessKind = if ln.kind == .Shared { .SharedRef } else { .MutRef }
+                    if !check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, -1, ln.place, ak, st.span_start, st.span_end, &mut diags) { ok = false }
+                    for i in 0..rv.op_len {
+                        if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, body.call_args[rv.op_start + i], st.span_start, st.span_end, &mut diags) { ok = false }
+                    }
+                } else if rv.kind == .Aggregate || rv.kind == .Closure {
+                    for i in 0..rv.op_len {
+                        if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, body.call_args[rv.op_start + i], st.span_start, st.span_end, &mut diags) { ok = false }
+                    }
+                }
+
+                // Check LHS write access
+                if !check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, -1, st.place, .Write, st.span_start, st.span_end, &mut diags) {
+                    ok = false
+                }
+
+                // Origin kill on full overwrite of non-borrowed mut local
+                if dst.proj_len == 0 && body.locals[dst.local].flags.bit_and(mb.LF_MUT) != 0 {
+                    mut borrowed_self := false
+                    for li in 0..n_loans {
+                        if bs_get(&active_loans, 0, li) && body.places[body.loans[li].place].local == dst.local {
+                            borrowed_self = true; break
+                        }
+                    }
+                    if !borrowed_self {
+                        for oi in 0..body.locals[dst.local].origin_len {
+                            o := body.local_origins[body.locals[dst.local].origin_start + oi]
+                            bs_zero(&mut cur_contains, o * loan_words, loan_words)
+                        }
+                    }
+                }
+            } else if st.kind == .StorageDead {
+                // StorageDead invalidates stack storage: no active loan may still borrow this local!
+                compute_live_origins(&body, &stmt_live_after, rel * live.words, &ext_origins, origin_words, &mut live_origins)
+                compute_active_loans(&cur_contains, &live_origins, n_origins, loan_words, &mut active_loans)
+                for li in 0..n_loans {
+                    if bs_get(&active_loans, 0, li) && body.places[body.loans[li].place].local == st.place {
+                        hb.push_error(&mut diags, "E4003", body.path, st.span_start, st.span_end,
+                            "'" + body.locals[st.place].name + "' does not live long enough; still borrowed when exiting scope")
+                        ok = false
+                    }
+                }
+            }
+
+            // Advance cur_contains through stmt
+            for li in 0..n_loans {
+                if body.loans[li].def_bb == bb && body.loans[li].def_stmt == rel {
+                    bs_set(&mut cur_contains, body.loans[li].origin * loan_words, li)
+                }
+            }
+            close_edges(&mut cur_contains, &edges, bb, rel, loan_words, &active_bidir)
+            compute_live_origins(&body, &stmt_live_after, rel * live.words, &ext_origins, origin_words, &mut live_origins)
+            for o in 0..n_origins {
+                if !bs_get(&live_origins, 0, o) {
+                    bs_zero(&mut cur_contains, o * loan_words, loan_words)
+                }
+            }
+        }
+
+        // Terminator checks
+        tm := body.terms[blk.term_id]
+        compute_live_origins(&body, &stmt_live_before, s_count * live.words, &ext_origins, origin_words, &mut live_origins)
+        compute_active_loans(&cur_contains, &live_origins, n_origins, loan_words, &mut active_loans)
+
+        if tm.kind == .SwitchInt {
+            if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, tm.place_or_op, tm.span_start, tm.span_end, &mut diags) { ok = false }
+        } else if tm.kind == .Call {
+            if tm.call_kind == .Indirect {
+                if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, tm.callee, tm.span_start, tm.span_end, &mut diags) { ok = false }
+            }
+            for i in 0..tm.arg_len {
+                if !check_operand_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, body.call_args[tm.arg_start + i], tm.span_start, tm.span_end, &mut diags) { ok = false }
+            }
+            // Activate any TwoPhaseMut loans targeting this Call terminator: re-check full Mut against all other active loans!
+            for li in 0..n_loans {
+                if body.loans[li].kind == .TwoPhaseMut && body.loans[li].activate_bb == bb && bs_get(&active_loans, 0, li) {
+                    if !check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, li,
+                        body.loans[li].place, .MutRef, tm.span_start, tm.span_end, &mut diags) {
+                        ok = false
+                    }
+                }
+            }
+            // Also check pairwise aliasing across call arguments (e.g. Option<&mut T> + &T passed together — S-1!):
+            // Any exclusive loan present in arg i's origin(s) cannot overlap any loan in arg j's origin(s) (j != i)!
+            for i in 0..tm.arg_len {
+                op_i := body.ops[body.call_args[tm.arg_start + i]]
+                if op_i.kind == .Const { continue }
+                sl_i := place_origin_slice(&types, &body, op_i.id)
+                if sl_i.start_slot < 0 { continue }
+                for j in (i + 1)..tm.arg_len {
+                    op_j := body.ops[body.call_args[tm.arg_start + j]]
+                    if op_j.kind == .Const { continue }
+                    sl_j := place_origin_slice(&types, &body, op_j.id)
+                    if sl_j.start_slot < 0 { continue }
+                    mut conflict := false
+                    for ki in 0..sl_i.count {
+                        oi := mb.local_origin_at(&body, body.places[op_i.id].local, sl_i.start_slot + ki)
+                        if oi < 0 { continue }
+                        for li in 0..n_loans {
+                            if !bs_get(&cur_contains, oi * loan_words, li) { continue }
+                            for kj in 0..sl_j.count {
+                                oj := mb.local_origin_at(&body, body.places[op_j.id].local, sl_j.start_slot + kj)
+                                if oj < 0 { continue }
+                                for lj in 0..n_loans {
+                                    if !bs_get(&cur_contains, oj * loan_words, lj) { continue }
+                                    if (body.loans[li].kind != .Shared || body.loans[lj].kind != .Shared) &&
+                                        places_overlap(&body, body.loans[li].place, body.loans[lj].place) {
+                                        conflict = true
+                                        break
+                                    }
+                                }
+                                if conflict { break }
+                            }
+                            if conflict { break }
+                        }
+                        if conflict { break }
+                    }
+                    if conflict {
+                        hb.push_error(&mut diags, "E4003", body.path, tm.span_start, tm.span_end,
+                            "mutable borrow argument must not alias another borrow in the same call")
+                        ok = false
+                    }
+                }
+            }
+            if !check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, -1, tm.place_or_op, .Write, tm.span_start, tm.span_end, &mut diags) {
+                ok = false
+            }
+        } else if tm.kind == .Drop {
+            // Drop(x) destroys x; conflicts if ANY active loan borrows x!
+            // With dropck, if an outer/later TF_DISPOSE guard holds &x, its origin is still live here -> E4003!
+            // If a plain struct without TF_DISPOSE holds &x and is no longer used, its origin is dead -> allowed (may_dangle)!
+            if !check_single_access(&types, &body, &cur_contains, &active_loans, loan_words, bb, -1, tm.place_or_op, .Write, tm.span_start, tm.span_end, &mut diags) {
+                ok = false
+            }
+        } else if tm.kind == .Return {
+            for oi in 0..body.locals[0].origin_len {
+                o := body.local_origins[body.locals[0].origin_start + oi]
+                for li in 0..n_loans {
+                    if bs_get(&cur_contains, o * loan_words, li) {
+                        if !is_allowed_return_loan(&types, &body, li) {
+                            hb.push_error(&mut diags, "E4003", body.path, tm.span_start, tm.span_end,
+                                "cannot return borrow of local value or undeclared parameter")
+                            ok = false
+                        }
+                    }
+                }
+            }
+        } else if tm.kind == .RegionExit {
+            compute_live_origins(&body, &stmt_live_after, s_count * live.words, &ext_origins, origin_words, &mut live_origins)
+            compute_active_loans(&cur_contains, &live_origins, n_origins, loan_words, &mut active_loans)
+            scope_id := tm.callee
+            for li in 0..n_loans {
+                if bs_get(&active_loans, 0, li) && body.loans[li].region_scope == scope_id {
+                    hb.push_error(&mut diags, "E4005", body.path, tm.span_start, tm.span_end,
+                        "borrow from scratch region cannot escape region block")
+                    ok = false
+                }
+            }
+        }
+    }
+    ok
+}

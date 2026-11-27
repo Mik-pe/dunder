@@ -1,0 +1,457 @@
+// Full semantic MirVerifier for High-Level Typed CFG MIR (HL-MIR).
+// Enforces CFG/pred integrity, strict TypeId agreement, exact StackSlot layout,
+// balanced TaskScope/Region depths on all paths, and zero leftover Drops post-elaboration.
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import mir_body as mb
+
+fn err(body: &mb.MirBody, diags: &mut []diag.Diagnostic, start: i32, end: i32, msg: string) {
+    hb.push_error(&mut diags, "E9001", body.path, start, end, "mir_verify(" + body.fn_name + "): " + msg)
+}
+
+fn valid_ty(types: &ht.TypeTable, ty: i32) -> bool {
+    ty >= 0 && ty < types.entries.len
+}
+
+fn operand_ty(types: &ht.TypeTable, body: &mb.MirBody, op_id: i32) -> i32 {
+    if op_id < 0 || op_id >= body.ops.len { return -1 }
+    op := body.ops[op_id]
+    if op.kind == .Const {
+        if op.id < 0 || op.id >= body.consts.len { return -1 }
+        return body.consts[op.id].ty
+    }
+    if op.id < 0 || op.id >= body.places.len { return -1 }
+    body.places[op.id].ty
+}
+
+fn verify_place(types: &ht.TypeTable, body: &mb.MirBody, place_id: i32, diags: &mut []diag.Diagnostic) -> bool {
+    p := body.places[place_id]
+    if p.local < 0 || p.local >= body.locals.len {
+        err(&body, &mut diags, 0, 0, "place " + place_id.str() + " has invalid local " + p.local.str())
+        return false
+    }
+    if p.proj_start < 0 || p.proj_len < 0 || p.proj_start + p.proj_len > body.projs.len {
+        err(&body, &mut diags, 0, 0, "place " + place_id.str() + " has invalid projection slice")
+        return false
+    }
+    mut cur_ty := body.locals[p.local].ty
+    mut downcast_var := -1
+    for i in 0..p.proj_len {
+        if !valid_ty(&types, cur_ty) {
+            err(&body, &mut diags, 0, 0, "place " + place_id.str() + " invalid intermediate type")
+            return false
+        }
+        pr := body.projs[p.proj_start + i]
+        if pr.kind == .Deref {
+            k := types.entries[cur_ty].kind
+            if k != .Ref && k != .MutRef && k != .RawConst && k != .RawMut {
+                err(&body, &mut diags, 0, 0, "place " + place_id.str() + " deref on non-pointer type")
+                return false
+            }
+            cur_ty = types.entries[cur_ty].inner_a
+            downcast_var = -1
+        } else if pr.kind == .Downcast {
+            if types.entries[cur_ty].kind != .Enum || pr.index < 0 || pr.index >= types.entries[cur_ty].count {
+                err(&body, &mut diags, 0, 0, "place " + place_id.str() + " invalid enum downcast")
+                return false
+            }
+            downcast_var = pr.index
+        } else if pr.kind == .Field {
+            if downcast_var >= 0 {
+                nty := ht.variant_payload_type(&types, cur_ty, downcast_var, pr.index)
+                if nty < 0 {
+                    err(&body, &mut diags, 0, 0, "place " + place_id.str() + " invalid enum payload field")
+                    return false
+                }
+                cur_ty = nty
+                downcast_var = -1
+            } else {
+                nty := ht.field_type(&types, cur_ty, pr.index)
+                if nty < 0 {
+                    err(&body, &mut diags, 0, 0, "place " + place_id.str() + " invalid field projection " + pr.index.str())
+                    return false
+                }
+                cur_ty = nty
+            }
+        } else if pr.kind == .Index {
+            k := types.entries[cur_ty].kind
+            if k == .Array || k == .FixedArr || k == .FatSlice || k == .RegionSlice {
+                cur_ty = types.entries[cur_ty].inner_a
+            } else if k == .String || k == .FatStr {
+                cur_ty = ht.TY_U8
+            } else {
+                err(&body, &mut diags, 0, 0, "place " + place_id.str() + " index on non-indexable type")
+                return false
+            }
+            downcast_var = -1
+        }
+    }
+    if cur_ty != p.ty {
+        err(&body, &mut diags, 0, 0, "place " + place_id.str() + " type mismatch: projected " + cur_ty.str() + " != declared " + p.ty.str())
+        return false
+    }
+    true
+}
+
+fn verify_rvalue(types: &ht.TypeTable, body: &mb.MirBody, rv_id: i32, span_s: i32, span_e: i32, diags: &mut []diag.Diagnostic) -> bool {
+    if rv_id < 0 || rv_id >= body.rvalues.len {
+        err(&body, &mut diags, span_s, span_e, "invalid rvalue id " + rv_id.str())
+        return false
+    }
+    rv := body.rvalues[rv_id]
+    if !valid_ty(&types, rv.ty) {
+        err(&body, &mut diags, span_s, span_e, "rvalue " + rv_id.str() + " has invalid type " + rv.ty.str())
+        return false
+    }
+    if rv.op_start < 0 || rv.op_len < 0 || rv.op_start + rv.op_len > body.call_args.len {
+        err(&body, &mut diags, span_s, span_e, "rvalue " + rv_id.str() + " has invalid operand slice")
+        return false
+    }
+    if rv.kind == .Use {
+        oty := operand_ty(&types, &body, rv.a)
+        if oty != rv.ty {
+            err(&body, &mut diags, span_s, span_e, "Use rvalue type mismatch: op " + oty.str() + " != " + rv.ty.str())
+            return false
+        }
+    } else if rv.kind == .Ref {
+        if rv.a < 0 || rv.a >= body.loans.len {
+            err(&body, &mut diags, span_s, span_e, "Ref rvalue has invalid loan id " + rv.a.str())
+            return false
+        }
+        ln := body.loans[rv.a]
+        if ln.place < 0 || ln.place >= body.places.len {
+            err(&body, &mut diags, span_s, span_e, "loan has invalid place id")
+            return false
+        }
+        k := types.entries[rv.ty].kind
+        if k != .Ref && k != .MutRef && k != .FatStr && k != .FatSlice && k != .RegionSlice {
+            err(&body, &mut diags, span_s, span_e, "Ref rvalue must produce reference/view type")
+            return false
+        }
+        if (k == .Ref || k == .MutRef) && types.entries[rv.ty].inner_a != body.places[ln.place].ty {
+            err(&body, &mut diags, span_s, span_e, "Ref pointee type mismatch")
+            return false
+        }
+        if k == .MutRef && ln.kind == .Shared {
+            err(&body, &mut diags, span_s, span_e, "MutRef rvalue cannot use Shared loan")
+            return false
+        }
+    } else if rv.kind == .Slice || rv.kind == .BytesView {
+        if rv.a < 0 || rv.a >= body.loans.len {
+            err(&body, &mut diags, span_s, span_e, "Slice/BytesView rvalue has invalid loan id")
+            return false
+        }
+        k := types.entries[rv.ty].kind
+        if k != .FatSlice && k != .FatStr && k != .RegionSlice {
+            err(&body, &mut diags, span_s, span_e, "Slice/BytesView rvalue must produce FatSlice/FatStr/RegionSlice")
+            return false
+        }
+    } else if rv.kind == .AddrOf {
+        if rv.a < 0 || rv.a >= body.places.len {
+            err(&body, &mut diags, span_s, span_e, "AddrOf rvalue has invalid place id")
+            return false
+        }
+        k := types.entries[rv.ty].kind
+        if k != .Ptr && k != .RawConst && k != .RawMut {
+            err(&body, &mut diags, span_s, span_e, "AddrOf must produce ptr/*const/*mut")
+            return false
+        }
+    } else if rv.kind == .Binary {
+        if operand_ty(&types, &body, rv.a) < 0 || operand_ty(&types, &body, rv.b) < 0 {
+            err(&body, &mut diags, span_s, span_e, "Binary rvalue has invalid operand")
+            return false
+        }
+    } else if rv.kind == .Unary || rv.kind == .Cast || rv.kind == .Len || rv.kind == .Discriminant {
+        if operand_ty(&types, &body, rv.a) < 0 {
+            err(&body, &mut diags, span_s, span_e, "Unary/Cast/Len/Discriminant has invalid operand")
+            return false
+        }
+    } else if rv.kind == .Aggregate {
+        k := types.entries[rv.ty].kind
+        if k == .Struct || k == .Tuple {
+            if rv.op_len != types.entries[rv.ty].count {
+                err(&body, &mut diags, span_s, span_e, "Aggregate field count mismatch")
+                return false
+            }
+            for i in 0..rv.op_len {
+                oty := operand_ty(&types, &body, body.call_args[rv.op_start + i])
+                fty := ht.field_type(&types, rv.ty, i)
+                if oty != fty {
+                    err(&body, &mut diags, span_s, span_e, "Aggregate field " + i.str() + " type mismatch")
+                    return false
+                }
+            }
+        } else if k == .Enum {
+            if rv.a < 0 || rv.a >= types.entries[rv.ty].count {
+                err(&body, &mut diags, span_s, span_e, "Enum Aggregate invalid variant index")
+                return false
+            }
+            v := &types.variants[types.entries[rv.ty].inner_a + rv.a]
+            if rv.op_len != v.payload_count {
+                err(&body, &mut diags, span_s, span_e, "Enum Aggregate payload count mismatch")
+                return false
+            }
+            for i in 0..rv.op_len {
+                oty := operand_ty(&types, &body, body.call_args[rv.op_start + i])
+                pty := ht.variant_payload_type(&types, rv.ty, rv.a, i)
+                if oty != pty {
+                    err(&body, &mut diags, span_s, span_e, "Enum Aggregate payload type mismatch")
+                    return false
+                }
+            }
+        }
+    } else if rv.kind == .Closure {
+        if types.entries[rv.ty].kind != .ClosureEnv {
+            err(&body, &mut diags, span_s, span_e, "Closure rvalue must produce ClosureEnv type")
+            return false
+        }
+        if rv.op_len != types.entries[rv.ty].count {
+            err(&body, &mut diags, span_s, span_e, "Closure capture count mismatch")
+            return false
+        }
+        for i in 0..rv.op_len {
+            oty := operand_ty(&types, &body, body.call_args[rv.op_start + i])
+            fty := ht.field_type(&types, rv.ty, i)
+            if oty != fty {
+                err(&body, &mut diags, span_s, span_e, "Closure capture " + i.str() + " type mismatch")
+                return false
+            }
+        }
+    }
+    true
+}
+
+pub fn verify_body(types: &ht.TypeTable, body: &mb.MirBody, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if !types.sealed {
+        err(&body, &mut diags, 0, 0, "TypeTable must be sealed before mir_verify")
+        return false
+    }
+    if body.blocks.len == 0 {
+        err(&body, &mut diags, 0, 0, "MirBody has no basic blocks")
+        return false
+    }
+    if body.locals.len == 0 {
+        err(&body, &mut diags, 0, 0, "MirBody missing return local 0")
+        return false
+    }
+    if body.locals[0].ty != body.ret_ty {
+        err(&body, &mut diags, 0, 0, "local 0 type does not match ret_ty")
+        ok = false
+    }
+
+    // 1. Verify locals (exact size, align, origin slots)
+    for l in 0..body.locals.len {
+        loc := &body.locals[l]
+        if !valid_ty(&types, loc.ty) {
+            err(&body, &mut diags, loc.span_start, loc.span_end, "local " + l.str() + " invalid type " + loc.ty.str())
+            ok = false
+            continue
+        }
+        te := &types.entries[loc.ty]
+        if loc.size != te.size || loc.align != te.align {
+            err(&body, &mut diags, loc.span_start, loc.span_end, "local " + l.str() + " layout mismatch")
+            ok = false
+        }
+        if loc.origin_len != te.origin_count {
+            err(&body, &mut diags, loc.span_start, loc.span_end, "local " + l.str() + " origin_len mismatch")
+            ok = false
+        }
+        if loc.origin_start < 0 || loc.origin_start + loc.origin_len > body.local_origins.len {
+            err(&body, &mut diags, loc.span_start, loc.span_end, "local " + l.str() + " origin slice out of bounds")
+            ok = false
+        } else {
+            for oi in 0..loc.origin_len {
+                oid := body.local_origins[loc.origin_start + oi]
+                if oid < 0 || oid >= body.origin_count {
+                    err(&body, &mut diags, loc.span_start, loc.span_end, "local " + l.str() + " invalid origin id")
+                    ok = false
+                }
+            }
+        }
+    }
+
+    // 2. Verify places
+    for p in 0..body.places.len {
+        if !verify_place(&types, &body, p, &mut diags) { ok = false }
+    }
+
+    // 3. Verify loans
+    for li in 0..body.loans.len {
+        ln := body.loans[li]
+        if ln.place < 0 || ln.place >= body.places.len || ln.origin < 0 || ln.origin >= body.origin_count {
+            err(&body, &mut diags, ln.span_start, ln.span_end, "loan " + li.str() + " invalid place or origin")
+            ok = false
+        }
+    }
+
+    // 4. Verify blocks, statements, terminators, and CFG targets
+    n_bbs := body.blocks.len
+    mut expected_preds: []i32 = []
+    for _ in 0..n_bbs { expected_preds.push(0) }
+    mut succs: []i32 = []
+    for bb in 0..n_bbs {
+        blk := body.blocks[bb]
+        if blk.stmt_start < 0 || blk.stmt_end < blk.stmt_start || blk.stmt_end > body.stmts.len {
+            err(&body, &mut diags, 0, 0, "bb " + bb.str() + " invalid stmt slice")
+            ok = false
+            continue
+        }
+        for si in blk.stmt_start..blk.stmt_end {
+            st := body.stmts[si]
+            if st.kind == .Assign {
+                if st.place < 0 || st.place >= body.places.len {
+                    err(&body, &mut diags, st.span_start, st.span_end, "Assign has invalid place")
+                    ok = false
+                } else if !verify_rvalue(&types, &body, st.rvalue, st.span_start, st.span_end, &mut diags) {
+                    ok = false
+                } else if body.places[st.place].ty != body.rvalues[st.rvalue].ty {
+                    err(&body, &mut diags, st.span_start, st.span_end,
+                        "Assign type mismatch: place " + body.places[st.place].ty.str() +
+                        " != rvalue " + body.rvalues[st.rvalue].ty.str())
+                    ok = false
+                }
+            } else if st.kind == .StorageLive || st.kind == .StorageDead {
+                if st.place < 0 || st.place >= body.locals.len {
+                    err(&body, &mut diags, st.span_start, st.span_end, "StorageLive/Dead invalid local")
+                    ok = false
+                }
+            } else if st.kind == .SetDeferActive {
+                if st.place < 0 || st.place >= body.locals.len || body.locals[st.place].ty != ht.TY_BOOL {
+                    err(&body, &mut diags, st.span_start, st.span_end, "SetDeferActive requires bool local")
+                    ok = false
+                }
+            } else if st.kind == .SetUnwindTarget {
+                if st.place < 0 || st.place >= body.locals.len || body.locals[st.place].ty != ht.TY_I32 {
+                    err(&body, &mut diags, st.span_start, st.span_end, "SetUnwindTarget requires i32 local")
+                    ok = false
+                }
+            }
+        }
+        if blk.term_id < 0 || blk.term_id >= body.terms.len {
+            err(&body, &mut diags, 0, 0, "bb " + bb.str() + " missing terminator")
+            ok = false
+            continue
+        }
+        tm := body.terms[blk.term_id]
+        if tm.kind == .Call {
+            if tm.place_or_op < 0 || tm.place_or_op >= body.places.len {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "Call has invalid dest place")
+                ok = false
+            }
+            if tm.arg_start < 0 || tm.arg_len < 0 || tm.arg_start + tm.arg_len > body.call_args.len {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "Call has invalid arg slice")
+                ok = false
+            } else if tm.sig_ty >= 0 && valid_ty(&types, tm.sig_ty) {
+                ret := ht.callable_ret(&types, tm.sig_ty)
+                if ret >= 0 && tm.place_or_op >= 0 && tm.place_or_op < body.places.len && body.places[tm.place_or_op].ty != ret {
+                    err(&body, &mut diags, tm.span_start, tm.span_end, "Call dest type mismatch with callee signature")
+                    ok = false
+                }
+                p_cnt := ht.callable_param_count(&types, tm.sig_ty)
+                p_start := ht.callable_param_start(&types, tm.sig_ty)
+                if tm.call_kind != .Intrinsic && tm.arg_len != p_cnt {
+                    err(&body, &mut diags, tm.span_start, tm.span_end, "Call arg count mismatch with callee signature")
+                    ok = false
+                } else if tm.call_kind != .Intrinsic {
+                    for ai in 0..tm.arg_len {
+                        aty := operand_ty(&types, &body, body.call_args[tm.arg_start + ai])
+                        pty := types.params[p_start + ai].ty
+                        if aty != pty {
+                            err(&body, &mut diags, tm.span_start, tm.span_end, "Call arg " + ai.str() + " type mismatch")
+                            ok = false
+                        }
+                    }
+                }
+            }
+        } else if tm.kind == .Drop {
+            if tm.place_or_op < 0 || tm.place_or_op >= body.places.len {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "Drop has invalid place")
+                ok = false
+            }
+        } else if tm.kind == .SwitchInt {
+            if operand_ty(&types, &body, tm.place_or_op) < 0 {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "SwitchInt has invalid discriminant operand")
+                ok = false
+            }
+        }
+        mb.term_succs(&body, bb, &mut succs)
+        for si in 0..succs.len {
+            s := succs[si]
+            if s < 0 || s >= n_bbs {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "bb " + bb.str() + " has out-of-range successor " + s.str())
+                ok = false
+            } else {
+                expected_preds[s] += 1
+            }
+        }
+    }
+
+    for bb in 0..n_bbs {
+        got := body.blocks[bb].pred_end - body.blocks[bb].pred_start
+        if got != expected_preds[bb] {
+            err(&body, &mut diags, 0, 0, "bb " + bb.str() + " pred count mismatch (did you call compute_preds?)")
+            ok = false
+        }
+    }
+
+    if !ok { return false }
+
+    // 5. Reachability + balanced TaskScope/Region depth + post_drop zero-Drop invariant
+    mut visited: []bool = []
+    mut td: []i32 = []
+    mut rd: []i32 = []
+    for _ in 0..n_bbs { visited.push(false); td.push(0); rd.push(0) }
+    mut q: []i32 = [0]
+    visited[0] = true
+    mut head := 0
+    while head < q.len {
+        bb := q[head]; head += 1
+        tm := body.terms[body.blocks[bb].term_id]
+        if body.post_drop && tm.kind == .Drop {
+            err(&body, &mut diags, tm.span_start, tm.span_end, "reachable Drop terminator remains after post_drop")
+            ok = false
+        }
+        mut ntd := td[bb]
+        mut nrd := rd[bb]
+        if tm.kind == .TaskScopeEnter { ntd += 1 }
+        else if tm.kind == .TaskScopeJoin {
+            if ntd <= 0 {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "unmatched TaskScopeJoin (depth < 0)")
+                ok = false
+            } else { ntd -= 1 }
+        } else if tm.kind == .RegionEnter { nrd += 1 }
+        else if tm.kind == .RegionExit {
+            if nrd <= 0 {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "unmatched RegionExit (depth < 0)")
+                ok = false
+            } else { nrd -= 1 }
+        } else if tm.kind == .Return {
+            if ntd != 0 {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "Return with unbalanced TaskScope depth " + ntd.str())
+                ok = false
+            }
+            if nrd != 0 {
+                err(&body, &mut diags, tm.span_start, tm.span_end, "Return with unbalanced Region depth " + nrd.str())
+                ok = false
+            }
+        }
+        mb.term_succs(&body, bb, &mut succs)
+        for si in 0..succs.len {
+            s := succs[si]
+            if !visited[s] {
+                visited[s] = true
+                td[s] = ntd
+                rd[s] = nrd
+                q.push(s)
+            } else if td[s] != ntd || rd[s] != nrd {
+                err(&body, &mut diags, tm.span_start, tm.span_end,
+                    "bb " + s.str() + " reached with conflicting TaskScope/Region depth")
+                ok = false
+            }
+        }
+    }
+    ok
+}

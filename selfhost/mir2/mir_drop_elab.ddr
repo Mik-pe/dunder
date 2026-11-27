@@ -1,0 +1,176 @@
+// Pass 3: MIR Drop Elaboration (`mir_drop_elab.ddr`).
+// Consumes InitState from mir_init:
+// - maybe_init == 0  -> deletes dead Drop (rewrites to Goto)
+// - maybe_uninit == 0 -> lowers to unconditional direct drop Call (zero drop flag, zero null check)
+// - conditional (1,1) -> inserts 1-byte LF_DROP_FLAG bool local toggled on init/move + SwitchInt guard.
+// Sets body.post_drop = true so mir_verify confirms zero remaining Drop terminators.
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import mir_body as mb
+import mir_init as mi
+
+fn emit_flag_assign(body: &mut mb.MirBody, bb: i32, flag_local: i32, val: i64, start: i32, end: i32) {
+    c_id := mb.add_const(&mut body, ht.TY_BOOL, val, "")
+    op_id := mb.add_op(&mut body, .Const, c_id)
+    empty_ops: []i32 = []
+    rv := mb.add_rvalue(&mut body, .Use, ht.TY_BOOL, op_id, -1, &empty_ops)
+    pl := mb.add_local_place(&mut body, flag_local)
+    _ := mb.push_stmt(&mut body, bb, mb.MirStmt {
+        kind: .Assign, place: pl, rvalue: rv, aux: 0, in_unsafe: false, span_start: start, span_end: end,
+    })
+}
+
+pub fn elaborate_drops(types: &ht.TypeTable, body: &mut mb.MirBody, init: &mi.InitState) {
+    n_orig_bbs := body.blocks.len
+    words := init.words
+    mut cur_init: []u64 = []
+    mut cur_uninit: []u64 = []
+    for _ in 0..words { cur_init.push(u64(0)); cur_uninit.push(u64(0)) }
+
+    // Map local -> drop flag local (-1 if none needed)
+    mut local_drop_flag: []i32 = []
+    for _ in 0..body.locals.len { local_drop_flag.push(-1) }
+
+    mut dummy_diags: []diag.Diagnostic = []
+    mut unit_tmp := -1
+
+    for bb in 0..n_orig_bbs {
+        tid := body.blocks[bb].term_id
+        if tid < 0 || body.terms[tid].kind != .Drop { continue }
+        tm := body.terms[tid]
+        if !init.reachable[bb] {
+            body.terms[tid].kind = .Goto
+            body.terms[tid].place_or_op = -1
+            continue
+        }
+
+        // Stream init state from BB entry to terminator.
+        base := bb * words
+        for w in 0..words {
+            cur_init[w] = init.bb_in_init[base + w]
+            cur_uninit[w] = init.bb_in_uninit[base + w]
+        }
+        blk := body.blocks[bb]
+        for si in blk.stmt_start..blk.stmt_end {
+            _ := mi.step_stmt(&types, &body, &init.trie, &mut cur_init, &mut cur_uninit, body.stmts[si], false, &mut dummy_diags)
+        }
+
+        pl_id := tm.place_or_op
+        node := init.trie.place_to_node[pl_id]
+        mut maybe_init := true
+        mut maybe_uninit := false
+        if node >= 0 {
+            maybe_init = mi.bs_get(&cur_init, 0, node)
+            maybe_uninit = mi.bs_get(&cur_uninit, 0, node)
+        }
+
+        if !maybe_init {
+            // Definitely uninitialized / already moved -> delete Drop!
+            body.terms[tid].kind = .Goto
+            body.terms[tid].place_or_op = -1
+        } else if !maybe_uninit {
+            // Definitely initialized -> unconditional direct drop call (zero flag!).
+            if unit_tmp < 0 {
+                unit_tmp = mb.add_local(&mut body, &types, "_drop_unit", ht.TY_UNIT, 0, mb.LF_TEMP, 0, 0)
+            }
+            dest_pl := mb.add_local_place(&mut body, unit_tmp)
+            arg_op := mb.add_op(&mut body, .Move, pl_id)
+            args: []i32 = [arg_op]
+            a_start := mb.push_call_args(&mut body, &args)
+            body.terms[tid] = mb.MirTerm {
+                kind: .Call, call_kind: .Intrinsic, target_bb: tm.target_bb,
+                place_or_op: dest_pl, callee: mb.INTRINSIC_DROP, sig_ty: -1,
+                arg_start: a_start, arg_len: 1, in_unsafe: tm.in_unsafe,
+                span_start: tm.span_start, span_end: tm.span_end,
+            }
+        } else {
+            // Conditionally initialized -> allocate 1-byte LF_DROP_FLAG bool local + SwitchInt guard!
+            loc := body.places[pl_id].local
+            mut flag_loc := local_drop_flag[loc]
+            if flag_loc < 0 {
+                flag_loc = mb.add_local(&mut body, &types, "_drop_flag_" + loc.str(), ht.TY_BOOL,
+                    0, mb.LF_DROP_FLAG.bit_or(mb.LF_MUT), tm.span_start, tm.span_end)
+                local_drop_flag[loc] = flag_loc
+                // Seed flag at BB 0 entry (true if param, false otherwise).
+                init_val: i64 = if loc >= 1 && loc <= body.param_count { 1 } else { 0 }
+                emit_flag_assign(&mut body, 0, flag_loc, init_val, tm.span_start, tm.span_end)
+            }
+            if unit_tmp < 0 {
+                unit_tmp = mb.add_local(&mut body, &types, "_drop_unit", ht.TY_UNIT, 0, mb.LF_TEMP, 0, 0)
+            }
+            dest_pl := mb.add_local_place(&mut body, unit_tmp)
+            drop_bb := mb.add_block(&mut body, body.blocks[bb].scope)
+            arg_op := mb.add_op(&mut body, .Move, pl_id)
+            args: []i32 = [arg_op]
+            a_start := mb.push_call_args(&mut body, &args)
+            _ := mb.set_term(&mut body, drop_bb, mb.MirTerm {
+                kind: .Call, call_kind: .Intrinsic, target_bb: tm.target_bb,
+                place_or_op: dest_pl, callee: mb.INTRINSIC_DROP, sig_ty: -1,
+                arg_start: a_start, arg_len: 1, in_unsafe: tm.in_unsafe,
+                span_start: tm.span_start, span_end: tm.span_end,
+            })
+            flag_pl := mb.add_local_place(&mut body, flag_loc)
+            flag_op := mb.add_op(&mut body, .Copy, flag_pl)
+            vals: []i64 = [1]
+            bbs: []i32 = [drop_bb]
+            sw_start := mb.push_switch_targets(&mut body, &vals, &bbs)
+            body.terms[tid] = mb.MirTerm {
+                kind: .SwitchInt, call_kind: .Direct, target_bb: tm.target_bb,
+                place_or_op: flag_op, callee: -1, sig_ty: -1,
+                arg_start: sw_start, arg_len: 1, in_unsafe: tm.in_unsafe,
+                span_start: tm.span_start, span_end: tm.span_end,
+            }
+        }
+    }
+
+    // Instrument Assign/Move sites for any local that needed a conditional drop flag.
+    for bb in 0..n_orig_bbs {
+        if !init.reachable[bb] { continue }
+        s_start := body.blocks[bb].stmt_start
+        s_end := body.blocks[bb].stmt_end
+        mut toggles_flag: []i32 = []
+        mut toggles_val: []i64 = []
+        for si in s_start..s_end {
+            st := body.stmts[si]
+            if st.kind == .Assign {
+                rv := body.rvalues[st.rvalue]
+                if rv.kind == .Use {
+                    op := body.ops[rv.a]
+                    if op.kind == .Move {
+                        mloc := body.places[op.id].local
+                        if mloc >= 0 && mloc < local_drop_flag.len && local_drop_flag[mloc] >= 0 &&
+                            body.places[op.id].proj_len == 0 && !ht.is_copy(&types, body.places[op.id].ty) {
+                            toggles_flag.push(local_drop_flag[mloc]); toggles_val.push(0)
+                        }
+                    }
+                }
+                dloc := body.places[st.place].local
+                if dloc >= 0 && dloc < local_drop_flag.len && local_drop_flag[dloc] >= 0 && body.places[st.place].proj_len == 0 {
+                    toggles_flag.push(local_drop_flag[dloc]); toggles_val.push(1)
+                }
+            }
+        }
+        // Also check Call moves out of flagged locals
+        tid := body.blocks[bb].term_id
+        if tid >= 0 && body.terms[tid].kind == .Call && body.terms[tid].callee != mb.INTRINSIC_DROP {
+            tm := body.terms[tid]
+            for ai in 0..tm.arg_len {
+                op := body.ops[body.call_args[tm.arg_start + ai]]
+                if op.kind == .Move {
+                    mloc := body.places[op.id].local
+                    if mloc >= 0 && mloc < local_drop_flag.len && local_drop_flag[mloc] >= 0 &&
+                        body.places[op.id].proj_len == 0 && !ht.is_copy(&types, body.places[op.id].ty) {
+                        toggles_flag.push(local_drop_flag[mloc]); toggles_val.push(0)
+                    }
+                }
+            }
+        }
+        for ti in 0..toggles_flag.len {
+            emit_flag_assign(&mut body, bb, toggles_flag[ti], toggles_val[ti], 0, 0)
+        }
+    }
+
+    mb.compute_preds(&mut body)
+    body.post_drop = true
+}

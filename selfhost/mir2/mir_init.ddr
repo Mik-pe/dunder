@@ -1,0 +1,482 @@
+// Pass 1: Canonical sparse PlaceNode trie + forward CFG definite-init & partial-move analysis.
+// Catches use-after-move across branches, loops, and defer_bb early exits (S-5),
+// and rejects partial/destructuring moves on TF_DISPOSE outside unsafe in owner_mod (S-9).
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import mir_body as mb
+
+pub struct PlaceNode {
+    local: i32,
+    parent: i32,        // -1 for root local nodes
+    proj_kind: mb.ProjKind,
+    proj_index: i32,
+    ty: i32,
+    first_child: i32,
+    next_sibling: i32,
+}
+
+pub struct PlaceTrie {
+    nodes: []PlaceNode,
+    place_to_node: []i32, // -1 if place crosses Deref or Index
+}
+
+pub struct InitState {
+    trie: PlaceTrie,
+    words: i32,
+    bb_in_init: []u64,
+    bb_in_uninit: []u64,
+    reachable: []bool,
+    ok: bool,
+}
+
+pub fn bs_get(bits: &[]u64, base: i32, idx: i32) -> bool {
+    w := idx / 64
+    b := idx % 64
+    bits[base + w].bit_and(u64(1).shl(b)) != u64(0)
+}
+
+pub fn bs_set(bits: &mut []u64, base: i32, idx: i32) {
+    w := idx / 64
+    b := idx % 64
+    bits[base + w] = bits[base + w].bit_or(u64(1).shl(b))
+}
+
+pub fn bs_clear(bits: &mut []u64, base: i32, idx: i32) {
+    w := idx / 64
+    b := idx % 64
+    bits[base + w] = bits[base + w].bit_and(u64(1).shl(b).bit_not())
+}
+
+fn bs_or_changed(dst: &mut []u64, dst_base: i32, src: &[]u64, src_base: i32, words: i32) -> bool {
+    mut changed := false
+    for w in 0..words {
+        old := dst[dst_base + w]
+        nw := old.bit_or(src[src_base + w])
+        if nw != old {
+            dst[dst_base + w] = nw
+            changed = true
+        }
+    }
+    changed
+}
+
+fn find_or_add_child(trie: &mut PlaceTrie, parent: i32, kind: mb.ProjKind, index: i32, ty: i32) -> i32 {
+    mut cur := trie.nodes[parent].first_child
+    while cur >= 0 {
+        if trie.nodes[cur].proj_kind == kind && trie.nodes[cur].proj_index == index {
+            return cur
+        }
+        cur = trie.nodes[cur].next_sibling
+    }
+    id := trie.nodes.len
+    loc := trie.nodes[parent].local
+    old_first := trie.nodes[parent].first_child
+    trie.nodes.push(PlaceNode {
+        local: loc,
+        parent: parent,
+        proj_kind: kind,
+        proj_index: index,
+        ty: ty,
+        first_child: -1,
+        next_sibling: old_first,
+    })
+    trie.nodes[parent].first_child = id
+    id
+}
+
+fn build_trie(types: &ht.TypeTable, body: &mb.MirBody) -> PlaceTrie {
+    mut trie := PlaceTrie { nodes: [], place_to_node: [] }
+    for l in 0..body.locals.len {
+        trie.nodes.push(PlaceNode {
+            local: l,
+            parent: -1,
+            proj_kind: .Field,
+            proj_index: -1,
+            ty: body.locals[l].ty,
+            first_child: -1,
+            next_sibling: -1,
+        })
+    }
+    for p in 0..body.places.len {
+        pl := body.places[p]
+        mut node := pl.local
+        mut cur_ty := body.locals[pl.local].ty
+        mut downcast_var := -1
+        mut valid := true
+        for i in 0..pl.proj_len {
+            pr := body.projs[pl.proj_start + i]
+            if pr.kind == .Deref || pr.kind == .Index {
+                valid = false
+                break
+            } else if pr.kind == .Downcast {
+                downcast_var = pr.index
+                node = find_or_add_child(&mut trie, node, .Downcast, pr.index, cur_ty)
+            } else if pr.kind == .Field {
+                nty := if downcast_var >= 0 {
+                    ht.variant_payload_type(&types, cur_ty, downcast_var, pr.index)
+                } else {
+                    ht.field_type(&types, cur_ty, pr.index)
+                }
+                downcast_var = -1
+                cur_ty = nty
+                node = find_or_add_child(&mut trie, node, .Field, pr.index, cur_ty)
+            }
+        }
+        trie.place_to_node.push(if valid { node } else { -1 })
+    }
+    trie
+}
+
+fn mark_subtree(trie: &PlaceTrie, init: &mut []u64, uninit: &mut []u64, node: i32, is_init: bool) {
+    mut stack: []i32 = [node]
+    while stack.len > 0 {
+        cur := stack.pop()
+        if is_init {
+            bs_set(&mut init, 0, cur)
+            bs_clear(&mut uninit, 0, cur)
+        } else {
+            bs_clear(&mut init, 0, cur)
+            bs_set(&mut uninit, 0, cur)
+        }
+        mut ch := trie.nodes[cur].first_child
+        while ch >= 0 {
+            stack.push(ch)
+            ch = trie.nodes[ch].next_sibling
+        }
+    }
+}
+
+fn set_initialized(trie: &PlaceTrie, init: &mut []u64, uninit: &mut []u64, node: i32) {
+    mark_subtree(&trie, &mut init, &mut uninit, node, true)
+    // Walk up ancestors: if an ancestor has maybe_init == 1 and ALL its tracked children
+    // now have maybe_uninit == 0, clear ancestor's maybe_uninit (re-initialized after partial move).
+    mut p := trie.nodes[node].parent
+    while p >= 0 {
+        bs_set(&mut init, 0, p)
+        mut all_children_init := true
+        mut ch := trie.nodes[p].first_child
+        while ch >= 0 {
+            if bs_get(&uninit, 0, ch) { all_children_init = false; break }
+            ch = trie.nodes[ch].next_sibling
+        }
+        if all_children_init { bs_clear(&mut uninit, 0, p) }
+        p = trie.nodes[p].parent
+    }
+}
+
+fn set_moved(trie: &PlaceTrie, init: &mut []u64, uninit: &mut []u64, node: i32) {
+    mark_subtree(&trie, &mut init, &mut uninit, node, false)
+    mut p := trie.nodes[node].parent
+    while p >= 0 {
+        bs_set(&mut uninit, 0, p)
+        p = trie.nodes[p].parent
+    }
+}
+
+fn subtree_may_be_uninit(trie: &PlaceTrie, uninit: &[]u64, node: i32) -> bool {
+    mut stack: []i32 = [node]
+    while stack.len > 0 {
+        cur := stack.pop()
+        if bs_get(&uninit, 0, cur) { return true }
+        mut ch := trie.nodes[cur].first_child
+        while ch >= 0 {
+            stack.push(ch)
+            ch = trie.nodes[ch].next_sibling
+        }
+    }
+    false
+}
+
+fn has_proj_kind(body: &mb.MirBody, place_id: i32, kind: mb.ProjKind) -> bool {
+    pl := body.places[place_id]
+    for i in 0..pl.proj_len {
+        if body.projs[pl.proj_start + i].kind == kind { return true }
+    }
+    false
+}
+
+// Check if moving a partial/projected place violates TF_DISPOSE uniqueness (S-9).
+fn check_dispose_partial_move(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
+    node: i32, in_unsafe: bool, span_s: i32, span_e: i32, diags: &mut []diag.Diagnostic) -> bool {
+    mut p := trie.nodes[node].parent
+    while p >= 0 {
+        anc_ty := trie.nodes[p].ty
+        if ht.has_dispose(&types, anc_ty) {
+            owner := types.entries[anc_ty].owner_mod
+            if !(in_unsafe && owner == body.owner_mod) {
+                hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+                    "cannot move or destructure field of '@resource(dispose)' type '" +
+                    types.entries[anc_ty].name + "' outside unsafe in its defining module")
+                return false
+            }
+        }
+        p = trie.nodes[p].parent
+    }
+    true
+}
+
+pub fn step_stmt(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
+    init: &mut []u64, uninit: &mut []u64, st: mb.MirStmt, check: bool,
+    diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if st.kind == .Assign {
+        rv := body.rvalues[st.rvalue]
+        if !step_rvalue(&types, &body, &trie, &mut init, &mut uninit, rv, st.in_unsafe, st.span_start, st.span_end, check, &mut diags) {
+            ok = false
+        }
+        node := trie.place_to_node[st.place]
+        if node >= 0 {
+            set_initialized(&trie, &mut init, &mut uninit, node)
+        } else {
+            // Assigning through Deref/Index requires root local to be initialized.
+            root := body.places[st.place].local
+            if check && bs_get(&uninit, 0, root) {
+                hb.push_error(&mut diags, "E4001", body.path, st.span_start, st.span_end,
+                    "use of moved or uninitialized value '" + body.locals[root].name + "'")
+                ok = false
+            }
+        }
+    } else if st.kind == .SetDeferActive || st.kind == .SetUnwindTarget {
+        set_initialized(&trie, &mut init, &mut uninit, st.place)
+    } else if st.kind == .StorageDead {
+        mark_subtree(&trie, &mut init, &mut uninit, st.place, false)
+    } else if st.kind == .SetDiscriminant {
+        node := trie.place_to_node[st.place]
+        if node >= 0 { bs_set(&mut init, 0, node) }
+    }
+    ok
+}
+
+fn step_operand(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
+    init: &mut []u64, uninit: &mut []u64, op_id: i32, in_unsafe: bool,
+    span_s: i32, span_e: i32, check: bool, diags: &mut []diag.Diagnostic) -> bool {
+    if op_id < 0 || op_id >= body.ops.len { return true }
+    op := body.ops[op_id]
+    if op.kind == .Const { return true }
+    place_id := op.id
+    pl := body.places[place_id]
+    node := trie.place_to_node[place_id]
+    if op.kind == .Move {
+        if has_proj_kind(&body, place_id, .Index) {
+            if check {
+                hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+                    "cannot move out of an indexed element")
+            }
+            return false
+        }
+        if has_proj_kind(&body, place_id, .Deref) {
+            if !ht.is_copy(&types, pl.ty) {
+                if check {
+                    hb.push_error(&mut diags, "E4003", body.path, span_s, span_e,
+                        "cannot move out of a borrowed value")
+                }
+                return false
+            }
+            if check && bs_get(&uninit, 0, pl.local) {
+                hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+                    "use of moved value '" + body.locals[pl.local].name + "'")
+                return false
+            }
+            return true
+        }
+        if node >= 0 {
+            if check && subtree_may_be_uninit(&trie, &uninit, node) {
+                hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+                    "use of moved value '" + body.locals[pl.local].name + "'")
+                return false
+            }
+            if check && !check_dispose_partial_move(&types, &body, &trie, node, in_unsafe, span_s, span_e, &mut diags) {
+                return false
+            }
+            if !ht.is_copy(&types, pl.ty) {
+                set_moved(&trie, &mut init, &mut uninit, node)
+            }
+        }
+        return true
+    }
+    // OpKind.Copy
+    if node >= 0 {
+        if check && subtree_may_be_uninit(&trie, &uninit, node) {
+            hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+                "use of moved value '" + body.locals[pl.local].name + "'")
+            return false
+        }
+    } else if check && bs_get(&uninit, 0, pl.local) {
+        hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+            "use of moved value '" + body.locals[pl.local].name + "'")
+        return false
+    }
+    true
+}
+
+fn check_place_readable(body: &mb.MirBody, trie: &PlaceTrie, uninit: &[]u64, place_id: i32,
+    span_s: i32, span_e: i32, check: bool, diags: &mut []diag.Diagnostic) -> bool {
+    if !check { return true }
+    pl := body.places[place_id]
+    node := trie.place_to_node[place_id]
+    if node >= 0 {
+        if subtree_may_be_uninit(&trie, &uninit, node) {
+            hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+                "use of moved value '" + body.locals[pl.local].name + "'")
+            return false
+        }
+    } else if bs_get(&uninit, 0, pl.local) {
+        hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
+            "use of moved value '" + body.locals[pl.local].name + "'")
+        return false
+    }
+    true
+}
+
+fn step_rvalue(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
+    init: &mut []u64, uninit: &mut []u64, rv: mb.MirRvalue, in_unsafe: bool,
+    span_s: i32, span_e: i32, check: bool, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if rv.kind == .Use || rv.kind == .Unary || rv.kind == .Cast || rv.kind == .Len || rv.kind == .Discriminant {
+        if !step_operand(&types, &body, &trie, &mut init, &mut uninit, rv.a, in_unsafe, span_s, span_e, check, &mut diags) { ok = false }
+    } else if rv.kind == .Binary {
+        if !step_operand(&types, &body, &trie, &mut init, &mut uninit, rv.a, in_unsafe, span_s, span_e, check, &mut diags) { ok = false }
+        if !step_operand(&types, &body, &trie, &mut init, &mut uninit, rv.b, in_unsafe, span_s, span_e, check, &mut diags) { ok = false }
+    } else if rv.kind == .Ref {
+        ln := body.loans[rv.a]
+        if !check_place_readable(&body, &trie, &uninit, ln.place, span_s, span_e, check, &mut diags) { ok = false }
+    } else if rv.kind == .Slice || rv.kind == .BytesView {
+        ln := body.loans[rv.a]
+        if !check_place_readable(&body, &trie, &uninit, ln.place, span_s, span_e, check, &mut diags) { ok = false }
+        for i in 0..rv.op_len {
+            if !step_operand(&types, &body, &trie, &mut init, &mut uninit, body.call_args[rv.op_start + i], in_unsafe, span_s, span_e, check, &mut diags) { ok = false }
+        }
+    } else if rv.kind == .AddrOf {
+        if !check_place_readable(&body, &trie, &uninit, rv.a, span_s, span_e, check, &mut diags) { ok = false }
+    } else if rv.kind == .Aggregate || rv.kind == .Closure {
+        for i in 0..rv.op_len {
+            if !step_operand(&types, &body, &trie, &mut init, &mut uninit, body.call_args[rv.op_start + i], in_unsafe, span_s, span_e, check, &mut diags) { ok = false }
+        }
+    }
+    ok
+}
+
+pub fn step_term(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
+    init: &mut []u64, uninit: &mut []u64, tm: mb.MirTerm, check: bool,
+    diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    if tm.kind == .SwitchInt {
+        if !step_operand(&types, &body, &trie, &mut init, &mut uninit, tm.place_or_op, tm.in_unsafe, tm.span_start, tm.span_end, check, &mut diags) { ok = false }
+    } else if tm.kind == .Call {
+        if tm.call_kind == .Indirect {
+            if !step_operand(&types, &body, &trie, &mut init, &mut uninit, tm.callee, tm.in_unsafe, tm.span_start, tm.span_end, check, &mut diags) { ok = false }
+        }
+        for i in 0..tm.arg_len {
+            if !step_operand(&types, &body, &trie, &mut init, &mut uninit, body.call_args[tm.arg_start + i], tm.in_unsafe, tm.span_start, tm.span_end, check, &mut diags) { ok = false }
+        }
+        dest_node := trie.place_to_node[tm.place_or_op]
+        if dest_node >= 0 { set_initialized(&trie, &mut init, &mut uninit, dest_node) }
+    } else if tm.kind == .Drop {
+        node := trie.place_to_node[tm.place_or_op]
+        if node >= 0 { mark_subtree(&trie, &mut init, &mut uninit, node, false) }
+    } else if tm.kind == .Return {
+        if check && body.ret_ty != ht.TY_UNIT && subtree_may_be_uninit(&trie, &uninit, 0) {
+            hb.push_error(&mut diags, "E4001", body.path, tm.span_start, tm.span_end,
+                "function may return without initializing return value")
+            ok = false
+        }
+    }
+    ok
+}
+
+pub fn check_init(types: &ht.TypeTable, body: &mb.MirBody, diags: &mut []diag.Diagnostic) -> InitState {
+    trie := build_trie(&types, &body)
+    n_nodes := trie.nodes.len
+    words := (n_nodes + 63) / 64
+    n_bbs := body.blocks.len
+
+    mut bb_in_init: []u64 = []
+    mut bb_in_uninit: []u64 = []
+    mut reachable: []bool = []
+    for _ in 0..(n_bbs * words) { bb_in_init.push(u64(0)); bb_in_uninit.push(u64(0)) }
+    for _ in 0..n_bbs { reachable.push(false) }
+
+    // Seed entry block 0: params 1..=param_count initialized; rest uninitialized.
+    reachable[0] = true
+    for n in 0..n_nodes {
+        loc := trie.nodes[n].local
+        if loc >= 1 && loc <= body.param_count {
+            bs_set(&mut bb_in_init, 0, n)
+        } else {
+            bs_set(&mut bb_in_uninit, 0, n)
+        }
+    }
+
+    mut cur_init: []u64 = []
+    mut cur_uninit: []u64 = []
+    for _ in 0..words { cur_init.push(u64(0)); cur_uninit.push(u64(0)) }
+
+    mut work: []i32 = [0]
+    mut in_work: []bool = []
+    for _ in 0..n_bbs { in_work.push(false) }
+    in_work[0] = true
+
+    mut succs: []i32 = []
+    mut dummy_diags: []diag.Diagnostic = []
+    while work.len > 0 {
+        bb := work.pop()
+        in_work[bb] = false
+        base := bb * words
+        for w in 0..words {
+            cur_init[w] = bb_in_init[base + w]
+            cur_uninit[w] = bb_in_uninit[base + w]
+        }
+        blk := body.blocks[bb]
+        for si in blk.stmt_start..blk.stmt_end {
+            _ := step_stmt(&types, &body, &trie, &mut cur_init, &mut cur_uninit, body.stmts[si], false, &mut dummy_diags)
+        }
+        tm := body.terms[blk.term_id]
+        _ := step_term(&types, &body, &trie, &mut cur_init, &mut cur_uninit, tm, false, &mut dummy_diags)
+
+        mb.term_succs(&body, bb, &mut succs)
+        for si in 0..succs.len {
+            s := succs[si]
+            s_base := s * words
+            mut changed := !reachable[s]
+            reachable[s] = true
+            if bs_or_changed(&mut bb_in_init, s_base, &cur_init, 0, words) { changed = true }
+            if bs_or_changed(&mut bb_in_uninit, s_base, &cur_uninit, 0, words) { changed = true }
+            if changed && !in_work[s] {
+                in_work[s] = true
+                work.push(s)
+            }
+        }
+    }
+
+    // Final diagnostic pass over all reachable blocks at fixpoint.
+    mut ok := true
+    for bb in 0..n_bbs {
+        if !reachable[bb] { continue }
+        base := bb * words
+        for w in 0..words {
+            cur_init[w] = bb_in_init[base + w]
+            cur_uninit[w] = bb_in_uninit[base + w]
+        }
+        blk := body.blocks[bb]
+        for si in blk.stmt_start..blk.stmt_end {
+            if !step_stmt(&types, &body, &trie, &mut cur_init, &mut cur_uninit, body.stmts[si], true, &mut diags) {
+                ok = false
+            }
+        }
+        tm := body.terms[blk.term_id]
+        if !step_term(&types, &body, &trie, &mut cur_init, &mut cur_uninit, tm, true, &mut diags) {
+            ok = false
+        }
+    }
+
+    InitState {
+        trie: move trie,
+        words: words,
+        bb_in_init: move bb_in_init,
+        bb_in_uninit: move bb_in_uninit,
+        reachable: move reachable,
+        ok: ok,
+    }
+}

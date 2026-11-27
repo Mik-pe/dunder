@@ -1,0 +1,248 @@
+// Interprocedural raw-pointer / scratch-region escape checker (`mir_escape.ddr`).
+// Computes unconditional `exposes_param_addr(fn_id, param_idx)` fixpoint over ALL callables
+// (direct functions, monomorphized generics, function pointers, and closures — eliminating S-12).
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import mir_body as mb
+
+fn region_bit() -> u64 { u64(1).shl(63) }
+fn param_mask() -> u64 { u64(1).shl(63).bit_not() }
+
+fn op_mask(body: &mb.MirBody, local_masks: &[]u64, op_id: i32) -> u64 {
+    if op_id < 0 || op_id >= body.ops.len { return u64(0) }
+    op := body.ops[op_id]
+    if op.kind == .Const { return u64(0) }
+    local_masks[body.places[op.id].local]
+}
+
+fn compute_local_masks(types: &ht.TypeTable, body: &mb.MirBody) -> []u64 {
+    n := body.locals.len
+    mut masks: []u64 = []
+    for l in 0..n {
+        mut m := u64(0)
+        if l >= 1 && l <= body.param_count && (l - 1) < 63 {
+            m = m.bit_or(u64(1).shl(l - 1))
+        }
+        ty := body.locals[l].ty
+        if ty >= 0 && ty < types.entries.len && types.entries[ty].kind == .RegionSlice {
+            m = m.bit_or(region_bit())
+        }
+        masks.push(m)
+    }
+
+    mut changed := true
+    mut iter := 0
+    while changed && iter < 32 {
+        changed = false
+        iter += 1
+        for bb in 0..body.blocks.len {
+            blk := body.blocks[bb]
+            for si in blk.stmt_start..blk.stmt_end {
+                st := body.stmts[si]
+                if st.kind != .Assign { continue }
+                dloc := body.places[st.place].local
+                rv := body.rvalues[st.rvalue]
+                mut src := u64(0)
+                if rv.kind == .Use || rv.kind == .Unary || rv.kind == .Cast {
+                    src = op_mask(&body, &masks, rv.a)
+                } else if rv.kind == .Binary {
+                    src = op_mask(&body, &masks, rv.a).bit_or(op_mask(&body, &masks, rv.b))
+                } else if rv.kind == .Ref || rv.kind == .Slice || rv.kind == .BytesView {
+                    ln := body.loans[rv.a]
+                    src = masks[body.places[ln.place].local]
+                    if ln.region_scope >= 0 { src = src.bit_or(region_bit()) }
+                } else if rv.kind == .AddrOf {
+                    src = masks[body.places[rv.a].local]
+                } else if rv.kind == .Aggregate || rv.kind == .Closure {
+                    for i in 0..rv.op_len {
+                        src = src.bit_or(op_mask(&body, &masks, body.call_args[rv.op_start + i]))
+                    }
+                }
+                old := masks[dloc]
+                nw := old.bit_or(src)
+                if nw != old { masks[dloc] = nw; changed = true }
+            }
+            tm := body.terms[blk.term_id]
+            if tm.kind == .Call && tm.sig_ty >= 0 && tm.sig_ty < types.entries.len {
+                sig := &types.entries[tm.sig_ty]
+                dloc := body.places[tm.place_or_op].local
+                mut src := u64(0)
+                for fi in 0..sig.from_len {
+                    fe := types.from_edges[sig.from_start + fi]
+                    if fe.param_idx == ht.PARAM_ENV && tm.call_kind == .Indirect {
+                        src = src.bit_or(op_mask(&body, &masks, tm.callee))
+                    } else if fe.param_idx >= 0 && fe.param_idx < tm.arg_len {
+                        src = src.bit_or(op_mask(&body, &masks, body.call_args[tm.arg_start + fe.param_idx]))
+                    }
+                }
+                old := masks[dloc]
+                nw := old.bit_or(src)
+                if nw != old { masks[dloc] = nw; changed = true }
+            }
+        }
+    }
+    masks
+}
+
+fn canonical_sig_ty(types: &ht.TypeTable, sig_ty: i32) -> i32 {
+    if sig_ty < 0 || sig_ty >= types.entries.len { return -1 }
+    e := &types.entries[sig_ty]
+    if e.kind == .ClosureEnv && e.inner_b >= 0 { return e.inner_b }
+    sig_ty
+}
+
+fn sigs_compatible(types: &ht.TypeTable, a_in: i32, b_in: i32) -> bool {
+    a := canonical_sig_ty(&types, a_in)
+    b := canonical_sig_ty(&types, b_in)
+    if a < 0 || b < 0 { return false }
+    if a == b { return true }
+    if ht.callable_ret(&types, a) != ht.callable_ret(&types, b) { return false }
+    pc := ht.callable_param_count(&types, a)
+    if pc != ht.callable_param_count(&types, b) { return false }
+    ps_a := ht.callable_param_start(&types, a)
+    ps_b := ht.callable_param_start(&types, b)
+    for i in 0..pc {
+        if types.params[ps_a + i].ty != types.params[ps_b + i].ty { return false }
+    }
+    true
+}
+
+pub fn check_program_escapes(prog: &hb.HirProgram, bodies: &[]mb.MirBody, diags: &mut []diag.Diagnostic) -> bool {
+    n_bodies := bodies.len
+    if n_bodies == 0 { return true }
+
+    mut max_fn := prog.fns.len
+    for bi in 0..n_bodies {
+        if bodies[bi].fn_id + 1 > max_fn { max_fn = bodies[bi].fn_id + 1 }
+    }
+
+    mut exposes_fn: []u64 = []
+    for _ in 0..max_fn { exposes_fn.push(u64(0)) }
+
+    // Precompute local provenance masks for every body.
+    mut all_masks: [][]u64 = []
+    // Also track closure fn_ids created by RvalueKind.Closure in each body (maps local -> closure fn_id, -1 if none/unknown).
+    mut all_closure_targets: [][]i32 = []
+
+    for bi in 0..n_bodies {
+        b := &bodies[bi]
+        masks := compute_local_masks(&prog.types, &b)
+        mut cl_targets: []i32 = []
+        for _ in 0..b.locals.len { cl_targets.push(-1) }
+        for bb in 0..b.blocks.len {
+            blk := b.blocks[bb]
+            for si in blk.stmt_start..blk.stmt_end {
+                st := b.stmts[si]
+                if st.kind != .Assign { continue }
+                rv := b.rvalues[st.rvalue]
+                if rv.kind == .Closure {
+                    cl_targets[b.places[st.place].local] = rv.a
+                } else if rv.kind == .Use {
+                    op := b.ops[rv.a]
+                    if op.kind != .Const {
+                        src_loc := b.places[op.id].local
+                        if cl_targets[src_loc] >= 0 { cl_targets[b.places[st.place].local] = cl_targets[src_loc] }
+                    }
+                } else if rv.kind == .AddrOf {
+                    // Base case: taking raw address of a place exposes every parameter flowing into that place!
+                    pm := masks[b.places[rv.a].local].bit_and(param_mask())
+                    exposes_fn[b.fn_id] = exposes_fn[b.fn_id].bit_or(pm)
+                }
+            }
+        }
+        all_masks.push(move masks)
+        all_closure_targets.push(move cl_targets)
+    }
+
+    // Interprocedural fixed-point propagation over BOTH direct and indirect/closure calls.
+    mut changed := true
+    mut iter := 0
+    while changed && iter < 64 {
+        changed = false
+        iter += 1
+        for bi in 0..n_bodies {
+            b := &bodies[bi]
+            masks := &all_masks[bi]
+            cl_targets := &all_closure_targets[bi]
+            for bb in 0..b.blocks.len {
+                tm := b.terms[b.blocks[bb].term_id]
+                if tm.kind != .Call { continue }
+                mut cmask := u64(0)
+                if tm.call_kind == .Direct && tm.callee >= 0 && tm.callee < max_fn {
+                    cmask = exposes_fn[tm.callee]
+                } else if tm.call_kind == .Indirect {
+                    // Direct tracked closure target
+                    if tm.callee >= 0 && tm.callee < b.ops.len && b.ops[tm.callee].kind != .Const {
+                        cl_loc := b.places[b.ops[tm.callee].id].local
+                        if cl_loc >= 0 && cl_loc < cl_targets.len && cl_targets[cl_loc] >= 0 && cl_targets[cl_loc] < max_fn {
+                            cmask = cmask.bit_or(exposes_fn[cl_targets[cl_loc]])
+                        }
+                    }
+                    // Also union all bodies with compatible canonical signature (unifying FnPtr & ClosureEnv — fixes S-12!)
+                    if tm.sig_ty >= 0 {
+                        for ob in 0..n_bodies {
+                            if sigs_compatible(&prog.types, tm.sig_ty, bodies[ob].sig_ty) {
+                                cmask = cmask.bit_or(exposes_fn[bodies[ob].fn_id])
+                            }
+                        }
+                    }
+                }
+                if cmask == u64(0) { continue }
+                mut extra := u64(0)
+                for ai in 0..tm.arg_len {
+                    if ai < 63 && cmask.bit_and(u64(1).shl(ai)) != u64(0) {
+                        am := op_mask(&b, &masks, b.call_args[tm.arg_start + ai]).bit_and(param_mask())
+                        extra = extra.bit_or(am)
+                    }
+                }
+                old := exposes_fn[b.fn_id]
+                nw := old.bit_or(extra)
+                if nw != old { exposes_fn[b.fn_id] = nw; changed = true }
+            }
+        }
+    }
+
+    // Check every call site: passing a scratch-region borrow (REGION_BIT) to an address-exposing param -> E4005!
+    mut ok := true
+    for bi in 0..n_bodies {
+        b := &bodies[bi]
+        masks := &all_masks[bi]
+        cl_targets := &all_closure_targets[bi]
+        for bb in 0..b.blocks.len {
+            tm := b.terms[b.blocks[bb].term_id]
+            if tm.kind != .Call { continue }
+            mut cmask := u64(0)
+            if tm.call_kind == .Direct && tm.callee >= 0 && tm.callee < max_fn {
+                cmask = exposes_fn[tm.callee]
+            } else if tm.call_kind == .Indirect {
+                if tm.callee >= 0 && tm.callee < b.ops.len && b.ops[tm.callee].kind != .Const {
+                    cl_loc := b.places[b.ops[tm.callee].id].local
+                    if cl_loc >= 0 && cl_loc < cl_targets.len && cl_targets[cl_loc] >= 0 && cl_targets[cl_loc] < max_fn {
+                        cmask = cmask.bit_or(exposes_fn[cl_targets[cl_loc]])
+                    }
+                }
+                if tm.sig_ty >= 0 {
+                    for ob in 0..n_bodies {
+                        if sigs_compatible(&prog.types, tm.sig_ty, bodies[ob].sig_ty) {
+                            cmask = cmask.bit_or(exposes_fn[bodies[ob].fn_id])
+                        }
+                    }
+                }
+            }
+            if cmask == u64(0) { continue }
+            for ai in 0..tm.arg_len {
+                if ai < 63 && cmask.bit_and(u64(1).shl(ai)) != u64(0) {
+                    am := op_mask(&b, &masks, b.call_args[tm.arg_start + ai])
+                    if am.bit_and(region_bit()) != u64(0) {
+                        hb.push_error(&mut diags, "E4005", b.path, tm.span_start, tm.span_end,
+                            "cannot pass scratch-region borrow to function or closure that exposes its raw address")
+                        ok = false
+                    }
+                }
+            }
+        }
+    }
+    ok
+}

@@ -1,0 +1,1345 @@
+// Comprehensive unit tests for Phase 1 Milestone 1C:
+// selfhost/hir/{hir_types, hir_body} + selfhost/mir2/{mir_body, mir_build, mir_verify, mir_init, mir_borrowck, mir_escape, mir_drop_elab, mir_check}.
+
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.hir.hir_types as ht
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.mir2.mir_body as mb
+import ..selfhost.mir2.mir_build as mir_build
+import ..selfhost.mir2.mir_verify as mir_verify
+import ..selfhost.mir2.mir_init as mir_init
+import ..selfhost.mir2.mir_borrowck as mir_borrowck
+import ..selfhost.mir2.mir_escape as mir_escape
+import ..selfhost.mir2.mir_drop_elab as mir_drop_elab
+import ..selfhost.mir2.mir_check as mir_check
+
+// --- Helpers for concise MIR construction in tests ---
+
+fn assign_const(b: &mut mb.MirBody, bb: i32, local: i32, ty: i32, val: i64) {
+    cid := mb.add_const(&mut b, ty, val, "")
+    op := mb.add_op(&mut b, .Const, cid)
+    empty: []i32 = []
+    rv := mb.add_rvalue(&mut b, .Use, ty, op, -1, &empty)
+    pl := mb.add_local_place(&mut b, local)
+    _ := mb.push_stmt(&mut b, bb, mb.MirStmt {
+        kind: .Assign, place: pl, rvalue: rv, aux: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+}
+
+fn assign_use(b: &mut mb.MirBody, bb: i32, dst_place: i32, op_kind: mb.OpKind, src_place: i32, in_unsafe: bool) {
+    op := mb.add_op(&mut b, op_kind, src_place)
+    empty: []i32 = []
+    ty := b.places[dst_place].ty
+    rv := mb.add_rvalue(&mut b, .Use, ty, op, -1, &empty)
+    _ := mb.push_stmt(&mut b, bb, mb.MirStmt {
+        kind: .Assign, place: dst_place, rvalue: rv, aux: 0, in_unsafe: in_unsafe, span_start: 1, span_end: 2,
+    })
+}
+
+fn assign_ref(b: &mut mb.MirBody, bb: i32, dst_place: i32, target_place: i32, kind: mb.BorrowKind, region_scope: i32, activate_bb: i32) -> i32 {
+    rel := b.blocks[bb].stmt_end - b.blocks[bb].stmt_start
+    ln := mb.add_loan(&mut b, target_place, kind, bb, rel, region_scope, activate_bb, 1, 2)
+    empty: []i32 = []
+    rv := mb.add_rvalue(&mut b, .Ref, b.places[dst_place].ty, ln, -1, &empty)
+    _ := mb.push_stmt(&mut b, bb, mb.MirStmt {
+        kind: .Assign, place: dst_place, rvalue: rv, aux: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    ln
+}
+
+fn set_goto(b: &mut mb.MirBody, bb: i32, target: i32) {
+    _ := mb.set_term(&mut b, bb, mb.MirTerm {
+        kind: .Goto, call_kind: .Direct, target_bb: target, place_or_op: -1, callee: -1, sig_ty: -1,
+        arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+}
+
+fn set_ret(b: &mut mb.MirBody, bb: i32) {
+    _ := mb.set_term(&mut b, bb, mb.MirTerm {
+        kind: .Return, call_kind: .Direct, target_bb: -1, place_or_op: -1, callee: -1, sig_ty: -1,
+        arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+}
+
+fn set_drop(b: &mut mb.MirBody, bb: i32, place: i32, next_bb: i32) {
+    _ := mb.set_term(&mut b, bb, mb.MirTerm {
+        kind: .Drop, call_kind: .Direct, target_bb: next_bb, place_or_op: place, callee: -1, sig_ty: -1,
+        arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+}
+
+fn has_code(diags: &[]diag.Diagnostic, code: string) -> bool {
+    for i in 0..diags.len {
+        if diags[i].code == code { return true }
+    }
+    false
+}
+
+// =========================================================================
+// 1. hir_types tests: 2-word Copy fat views, transitive seal(), invariance
+// =========================================================================
+
+@test
+fn mir2_hir_types_fat_views_and_seal() {
+    // 64-bit platform (arm64-macos = 0): FatStr & FatSlice are 16B (2 words), Copy, POD inline, 1 origin
+    mut t64 := ht.new_table(0)
+    fstr64 := ht.add_fat_str(&mut t64)
+    fslice64 := ht.add_fat_slice(&mut t64, ht.TY_I32)
+    ref_i32 := ht.add_ref(&mut t64, ht.TY_I32)
+    mut_i32 := ht.add_mut_ref(&mut t64, ht.TY_I32)
+
+    // Struct holding FatStr -> Copy, 1 origin, NOT Sendable/Sync
+    view_fields: []ht.FieldEntry = [
+        ht.FieldEntry { name: "text", ty: fstr64, offset: 0, is_pub: true, origin_slot: -1 },
+        ht.FieldEntry { name: "line", ty: ht.TY_I32, offset: 0, is_pub: true, origin_slot: -1 },
+    ]
+    tok_ty := ht.add_struct(&mut t64, "Token", 0, 0, &view_fields)
+
+    // @resource(dispose) struct -> NOT Copy, TF_DISPOSE, propagates TF_DISPOSE to wrapper struct
+    res_fields: []ht.FieldEntry = [ht.FieldEntry { name: "fd", ty: ht.TY_I32, offset: 0, is_pub: false, origin_slot: -1 }]
+    res_ty := ht.add_struct(&mut t64, "Handle", 0, ht.TF_RESOURCE.bit_or(ht.TF_DISPOSE), &res_fields)
+    wrap_fields: []ht.FieldEntry = [ht.FieldEntry { name: "h", ty: res_ty, offset: 0, is_pub: true, origin_slot: -1 }]
+    wrap_ty := ht.add_struct(&mut t64, "Wrapper", 0, 0, &wrap_fields)
+
+    // Plain POD struct -> Copy, Sendable, Sync, POD_INLINE
+    pt_fields: []ht.FieldEntry = [
+        ht.FieldEntry { name: "x", ty: ht.TY_I64, offset: 0, is_pub: true, origin_slot: -1 },
+        ht.FieldEntry { name: "y", ty: ht.TY_I64, offset: 0, is_pub: true, origin_slot: -1 },
+    ]
+    pt_ty := ht.add_struct(&mut t64, "Point", 0, 0, &pt_fields)
+    mut_tok := ht.add_mut_ref(&mut t64, tok_ty)
+
+    // Borrowed &mut FnMut closure -> invariant container
+    cl_caps: []ht.FieldEntry = [ht.FieldEntry { name: "r", ty: ref_i32, offset: 0, is_pub: false, origin_slot: -1 }]
+    cl_params: []ht.ParamEntry = []
+    cl_from: []ht.FromEdge = []
+    cl_mut_ty := ht.add_closure_env(&mut t64, "ClMut", 0, true, false, true, &cl_caps, &cl_params, ht.TY_UNIT, &cl_from)
+
+    ht.seal(&mut t64)
+
+    assert(t64.entries[fstr64].size == 16 && t64.entries[fstr64].align == 8)
+    assert(t64.entries[fslice64].size == 16 && t64.entries[fslice64].align == 8)
+    assert(ht.is_copy(&t64, fstr64) && ht.is_copy(&t64, fslice64))
+    assert(ht.origin_count(&t64, fstr64) == 1 && ht.origin_count(&t64, fslice64) == 1)
+
+    assert(ht.is_copy(&t64, tok_ty) && ht.origin_count(&t64, tok_ty) == 1)
+    assert(!ht.is_sendable(&t64, tok_ty) && !ht.is_sync(&t64, tok_ty))
+
+    assert(!ht.is_copy(&t64, res_ty) && ht.has_dispose(&t64, res_ty))
+    assert(!ht.is_copy(&t64, wrap_ty) && ht.has_dispose(&t64, wrap_ty))
+
+    assert(ht.is_copy(&t64, pt_ty) && ht.is_sendable(&t64, pt_ty) && ht.is_sync(&t64, pt_ty))
+    assert(ht.has_flag(&t64, pt_ty, ht.TF_POD_INLINE))
+
+    assert(!ht.is_invariant_container(&t64, ref_i32))
+    assert(ht.is_invariant_container(&t64, mut_i32))
+    assert(ht.is_invariant_container(&t64, mut_tok) && ht.has_invariant_nested_origins(&t64, mut_tok))
+    assert(ht.is_invariant_container(&t64, cl_mut_ty) && ht.has_invariant_nested_origins(&t64, cl_mut_ty))
+
+    // WASM32 platform (3): FatStr & FatSlice are 8B (2 x 4B words)
+    mut t32 := ht.new_table(3)
+    fstr32 := ht.add_fat_str(&mut t32)
+    fslice32 := ht.add_fat_slice(&mut t32, ht.TY_U8)
+    ht.seal(&mut t32)
+    assert(t32.entries[fstr32].size == 8 && t32.entries[fstr32].align == 4)
+    assert(t32.entries[fslice32].size == 8 && t32.entries[fslice32].align == 4)
+}
+
+// =========================================================================
+// 2. mir_verify tests: valid pre/post-drop, type mismatch, unbalanced TaskScope/Region, leftover Drop
+// =========================================================================
+
+@test
+fn mir2_verify_invariants() {
+    mut t := ht.new_table(0)
+    ht.seal(&mut t)
+
+    // 2a: Valid body
+    mut ok_b := mb.new_body(0, 0, "ok_fn", "test.ddr", -1, ht.TY_I32, 0, false)
+    _ := mb.add_local(&mut ok_b, &t, "_ret", ht.TY_I32, 0, mb.LF_MUT, 0, 0)
+    bb0 := mb.add_block(&mut ok_b, 0)
+    assign_const(&mut ok_b, bb0, 0, ht.TY_I32, 42)
+    set_ret(&mut ok_b, bb0)
+    mb.compute_preds(&mut ok_b)
+    mut d1: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &ok_b, &mut d1))
+
+    // 2b: Rejects Assign type mismatch (assigning bool to i32)
+    mut bad_ty := mb.new_body(1, 0, "bad_ty", "test.ddr", -1, ht.TY_I32, 0, false)
+    _ := mb.add_local(&mut bad_ty, &t, "_ret", ht.TY_I32, 0, mb.LF_MUT, 0, 0)
+    b0 := mb.add_block(&mut bad_ty, 0)
+    cid := mb.add_const(&mut bad_ty, ht.TY_BOOL, 1, "")
+    op := mb.add_op(&mut bad_ty, .Const, cid)
+    empty: []i32 = []
+    rv := mb.add_rvalue(&mut bad_ty, .Use, ht.TY_BOOL, op, -1, &empty)
+    pl := mb.add_local_place(&mut bad_ty, 0)
+    _ := mb.push_stmt(&mut bad_ty, b0, mb.MirStmt { kind: .Assign, place: pl, rvalue: rv, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+    set_ret(&mut bad_ty, b0)
+    mb.compute_preds(&mut bad_ty)
+    mut d2: []diag.Diagnostic = []
+    assert(!mir_verify.verify_body(&t, &bad_ty, &mut d2))
+
+    // 2c: Rejects unbalanced TaskScopeEnter without TaskScopeJoin before Return
+    mut bad_ts := mb.new_body(2, 0, "bad_ts", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut bad_ts, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    ts_bb0 := mb.add_block(&mut bad_ts, 0)
+    ts_bb1 := mb.add_block(&mut bad_ts, 0)
+    _ := mb.set_term(&mut bad_ts, ts_bb0, mb.MirTerm {
+        kind: .TaskScopeEnter, call_kind: .Direct, target_bb: ts_bb1, place_or_op: -1, callee: 0, sig_ty: -1,
+        arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut bad_ts, ts_bb1)
+    mb.compute_preds(&mut bad_ts)
+    mut d3: []diag.Diagnostic = []
+    assert(!mir_verify.verify_body(&t, &bad_ts, &mut d3))
+
+    // 2d: Rejects leftover Drop when post_drop == true
+    mut bad_drop := mb.new_body(3, 0, "bad_drop", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut bad_drop, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    s_loc := mb.add_local(&mut bad_drop, &t, "s", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    db0 := mb.add_block(&mut bad_drop, 0)
+    db1 := mb.add_block(&mut bad_drop, 0)
+    s_pl := mb.add_local_place(&mut bad_drop, s_loc)
+    set_drop(&mut bad_drop, db0, s_pl, db1)
+    set_ret(&mut bad_drop, db1)
+    bad_drop.post_drop = true
+    mb.compute_preds(&mut bad_drop)
+    mut d4: []diag.Diagnostic = []
+    assert(!mir_verify.verify_body(&t, &bad_drop, &mut d4))
+}
+
+// =========================================================================
+// 3. mir_init tests: defer early-exit UAM (S-5), @resource(dispose) partial move (S-9), branch re-init
+// =========================================================================
+
+@test
+fn mir2_init_defer_early_exit_uam_s5() {
+    // S-5: `s := "hi"; defer { use(s) }; if cond { _ = move s; return }; return`
+    mut t := ht.new_table(0)
+    ht.seal(&mut t)
+
+    mut b := mb.new_body(0, 0, "defer_uam", "test.ddr", -1, ht.TY_UNIT, 1, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    cond := mb.add_local(&mut b, &t, "cond", ht.TY_BOOL, 0, mb.LF_PARAM, 0, 0)
+    s := mb.add_local(&mut b, &t, "s", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    sink := mb.add_local(&mut b, &t, "sink", ht.TY_STRING, 0, mb.LF_TEMP, 0, 0)
+    d_use := mb.add_local(&mut b, &t, "d_use", ht.TY_STRING, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    bb_early := mb.add_block(&mut b, 0)
+    bb_defer := mb.add_block(&mut b, 0)
+    bb_ret := mb.add_block(&mut b, 0)
+
+    assign_const(&mut b, bb0, s, ht.TY_STRING, 0)
+    cond_pl := mb.add_local_place(&mut b, cond)
+    cond_op := mb.add_op(&mut b, .Copy, cond_pl)
+    vals: []i64 = [1]
+    bbs: []i32 = [bb_early]
+    sw := mb.push_switch_targets(&mut b, &vals, &bbs)
+    _ := mb.set_term(&mut b, bb0, mb.MirTerm {
+        kind: .SwitchInt, call_kind: .Direct, target_bb: bb_defer, place_or_op: cond_op,
+        callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+
+    // Early exit moves `s`, then jumps to shared defer_bb!
+    s_pl := mb.add_local_place(&mut b, s)
+    sink_pl := mb.add_local_place(&mut b, sink)
+    assign_use(&mut b, bb_early, sink_pl, .Move, s_pl, false)
+    set_goto(&mut b, bb_early, bb_defer)
+
+    // Shared defer_bb reads `s` -> MUST trigger E4001!
+    du_pl := mb.add_local_place(&mut b, d_use)
+    assign_use(&mut b, bb_defer, du_pl, .Copy, s_pl, false)
+    set_goto(&mut b, bb_defer, bb_ret)
+    set_ret(&mut b, bb_ret)
+    mb.compute_preds(&mut b)
+
+    mut diags: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &b, &mut diags))
+    init := mir_init.check_init(&t, &b, &mut diags)
+    assert(!init.ok && has_code(&diags, "E4001"))
+}
+
+@test
+fn mir2_init_dispose_destructure_s9() {
+    // S-9: Moving a field out of `@resource(dispose)` struct fails outside unsafe,
+    // fails in unsafe in another module, and SUCCEEDS inside unsafe in declaring module!
+    mut t := ht.new_table(0)
+    fields: []ht.FieldEntry = [ht.FieldEntry { name: "data", ty: ht.TY_STRING, offset: 0, is_pub: true, origin_slot: -1 }]
+    res_ty := ht.add_struct(&mut t, "OwnedRes", 7, ht.TF_RESOURCE.bit_or(ht.TF_DISPOSE), &fields)
+    ht.seal(&mut t)
+
+    // Case A: Safe destructure in declaring module 7 -> REJECTED E4001
+    mut b1 := mb.new_body(0, 7, "safe_destr", "test.ddr", -1, ht.TY_UNIT, 1, false)
+    _ := mb.add_local(&mut b1, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    r1 := mb.add_local(&mut b1, &t, "r", res_ty, 0, mb.LF_PARAM, 0, 0)
+    out1 := mb.add_local(&mut b1, &t, "out", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    bb1 := mb.add_block(&mut b1, 0)
+    r1_pl := mb.add_local_place(&mut b1, r1)
+    f1_pl := mb.add_projected_place(&mut b1, r1_pl, .Field, 0, ht.TY_STRING)
+    o1_pl := mb.add_local_place(&mut b1, out1)
+    assign_use(&mut b1, bb1, o1_pl, .Move, f1_pl, false)
+    set_ret(&mut b1, bb1)
+    mb.compute_preds(&mut b1)
+    mut d1: []diag.Diagnostic = []
+    assert(!mir_init.check_init(&t, &b1, &mut d1).ok && has_code(&d1, "E4001"))
+
+    // Case B: Unsafe destructure in OTHER module 9 -> REJECTED E4001
+    mut b2 := mb.new_body(1, 9, "other_mod_unsafe", "other.ddr", -1, ht.TY_UNIT, 1, true)
+    _ := mb.add_local(&mut b2, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    r2 := mb.add_local(&mut b2, &t, "r", res_ty, 0, mb.LF_PARAM, 0, 0)
+    out2 := mb.add_local(&mut b2, &t, "out", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    bb2 := mb.add_block(&mut b2, 0)
+    r2_pl := mb.add_local_place(&mut b2, r2)
+    f2_pl := mb.add_projected_place(&mut b2, r2_pl, .Field, 0, ht.TY_STRING)
+    o2_pl := mb.add_local_place(&mut b2, out2)
+    assign_use(&mut b2, bb2, o2_pl, .Move, f2_pl, true)
+    set_ret(&mut b2, bb2)
+    mb.compute_preds(&mut b2)
+    mut d2: []diag.Diagnostic = []
+    assert(!mir_init.check_init(&t, &b2, &mut d2).ok && has_code(&d2, "E4001"))
+
+    // Case C: Unsafe destructure in DECLARING module 7 -> ACCEPTED
+    mut b3 := mb.new_body(2, 7, "owner_mod_unsafe", "alloc.ddr", -1, ht.TY_UNIT, 1, true)
+    _ := mb.add_local(&mut b3, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    r3 := mb.add_local(&mut b3, &t, "r", res_ty, 0, mb.LF_PARAM, 0, 0)
+    out3 := mb.add_local(&mut b3, &t, "out", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    bb3 := mb.add_block(&mut b3, 0)
+    r3_pl := mb.add_local_place(&mut b3, r3)
+    f3_pl := mb.add_projected_place(&mut b3, r3_pl, .Field, 0, ht.TY_STRING)
+    o3_pl := mb.add_local_place(&mut b3, out3)
+    assign_use(&mut b3, bb3, o3_pl, .Move, f3_pl, true)
+    set_ret(&mut b3, bb3)
+    mb.compute_preds(&mut b3)
+    mut d3: []diag.Diagnostic = []
+    assert(mir_init.check_init(&t, &b3, &mut d3).ok)
+}
+
+@test
+fn mir2_init_conditional_move_and_reinit() {
+    // Move `s` in then-branch, re-initialize `s` in then-branch, use `s` at join -> OK!
+    mut t := ht.new_table(0)
+    ht.seal(&mut t)
+    mut b := mb.new_body(0, 0, "reinit", "test.ddr", -1, ht.TY_UNIT, 1, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    cond := mb.add_local(&mut b, &t, "c", ht.TY_BOOL, 0, mb.LF_PARAM, 0, 0)
+    s := mb.add_local(&mut b, &t, "s", ht.TY_STRING, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    tmp := mb.add_local(&mut b, &t, "t", ht.TY_STRING, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    bb_then := mb.add_block(&mut b, 0)
+    bb_join := mb.add_block(&mut b, 0)
+    assign_const(&mut b, bb0, s, ht.TY_STRING, 0)
+    cond_pl := mb.add_local_place(&mut b, cond)
+    cond_op := mb.add_op(&mut b, .Copy, cond_pl)
+    vals: []i64 = [1]
+    bbs: []i32 = [bb_then]
+    sw := mb.push_switch_targets(&mut b, &vals, &bbs)
+    _ := mb.set_term(&mut b, bb0, mb.MirTerm {
+        kind: .SwitchInt, call_kind: .Direct, target_bb: bb_join, place_or_op: cond_op,
+        callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    s_pl := mb.add_local_place(&mut b, s)
+    t_pl := mb.add_local_place(&mut b, tmp)
+    assign_use(&mut b, bb_then, t_pl, .Move, s_pl, false)
+    assign_const(&mut b, bb_then, s, ht.TY_STRING, 0)
+    set_goto(&mut b, bb_then, bb_join)
+    assign_use(&mut b, bb_join, t_pl, .Move, s_pl, false)
+    set_ret(&mut b, bb_join)
+    mb.compute_preds(&mut b)
+    mut d: []diag.Diagnostic = []
+    assert(mir_init.check_init(&t, &b, &mut d).ok)
+}
+
+// =========================================================================
+// 4. mir_borrowck tests — ALL REJECTS (S-1, S-3, S-4, S-6, variance, dropck, TwoPhaseMut, &mut param, escapes)
+// =========================================================================
+
+@test
+fn mir2_borrowck_rejects_opt_mut_alias_s1() {
+    // S-1: clash(.Some(&mut s), &s) -> Option<&mut string> + &string MUST fail with E4003!
+    mut t := ht.new_table(0)
+    mut_s := ht.add_mut_ref(&mut t, ht.TY_STRING)
+    ref_s := ht.add_ref(&mut t, ht.TY_STRING)
+    opt_mut_s := ht.add_option(&mut t, mut_s)
+    params: []ht.ParamEntry = [
+        ht.ParamEntry { ty: opt_mut_s, mode: .MoveVal },
+        ht.ParamEntry { ty: ref_s, mode: .CopyVal },
+    ]
+    no_from: []ht.FromEdge = []
+    clash_sig := ht.add_fn_ptr(&mut t, &params, ht.TY_UNIT, &no_from)
+    ht.seal(&mut t)
+
+    mut b := mb.new_body(0, 0, "s1_test", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    s := mb.add_local(&mut b, &t, "s", ht.TY_STRING, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    r_mut := mb.add_local(&mut b, &t, "r_mut", mut_s, 0, mb.LF_TEMP, 0, 0)
+    opt := mb.add_local(&mut b, &t, "opt", opt_mut_s, 0, mb.LF_TEMP, 0, 0)
+    r_sh := mb.add_local(&mut b, &t, "r_sh", ref_s, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    bb1 := mb.add_block(&mut b, 0)
+    assign_const(&mut b, bb0, s, ht.TY_STRING, 0)
+    s_pl := mb.add_local_place(&mut b, s)
+    rm_pl := mb.add_local_place(&mut b, r_mut)
+    _ := assign_ref(&mut b, bb0, rm_pl, s_pl, .Mut, -1, -1)
+
+    // opt = .Some(move r_mut)
+    opt_pl := mb.add_local_place(&mut b, opt)
+    rm_op := mb.add_op(&mut b, .Move, rm_pl)
+    agg_ops: []i32 = [rm_op]
+    rv_agg := mb.add_rvalue(&mut b, .Aggregate, opt_mut_s, 0, 0, &agg_ops)
+    _ := mb.push_stmt(&mut b, bb0, mb.MirStmt { kind: .Assign, place: opt_pl, rvalue: rv_agg, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+
+    // r_sh = &s (conflicts with active Mut loan inside opt!)
+    rs_pl := mb.add_local_place(&mut b, r_sh)
+    _ := assign_ref(&mut b, bb0, rs_pl, s_pl, .Shared, -1, -1)
+
+    // clash(move opt, copy r_sh)
+    op_opt := mb.add_op(&mut b, .Move, opt_pl)
+    op_rs := mb.add_op(&mut b, .Copy, rs_pl)
+    c_args: []i32 = [op_opt, op_rs]
+    a_start := mb.push_call_args(&mut b, &c_args)
+    ret_pl0 := mb.add_local_place(&mut b, 0)
+    _ := mb.set_term(&mut b, bb0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: bb1, place_or_op: ret_pl0,
+        callee: 1, sig_ty: clash_sig, arg_start: a_start, arg_len: 2, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut b, bb1)
+    mb.compute_preds(&mut b)
+
+    mut d: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &b, &mut d))
+    init := mir_init.check_init(&t, &b, &mut d)
+    assert(init.ok)
+    assert(!mir_borrowck.check_borrows(&t, &b, &init, &mut d) && has_code(&d, "E4003"))
+}
+
+@test
+fn mir2_borrowck_rejects_mut_alias_mutation_s3() {
+    // S-3: `r := &mut v; p := &(*r)[0]; grow(&mut r); use(p)` -> E4003!
+    mut t := ht.new_table(0)
+    arr_i32 := ht.add_array(&mut t, ht.TY_I32)
+    mut_arr := ht.add_mut_ref(&mut t, arr_i32)
+    ref_i32 := ht.add_ref(&mut t, ht.TY_I32)
+    g_params: []ht.ParamEntry = [ht.ParamEntry { ty: mut_arr, mode: .MoveVal }]
+    no_from: []ht.FromEdge = []
+    grow_sig := ht.add_fn_ptr(&mut t, &g_params, ht.TY_UNIT, &no_from)
+    ht.seal(&mut t)
+
+    mut b := mb.new_body(0, 0, "s3_test", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    v := mb.add_local(&mut b, &t, "v", arr_i32, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    r := mb.add_local(&mut b, &t, "r", mut_arr, 0, mb.LF_USER, 0, 0)
+    p := mb.add_local(&mut b, &t, "p", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    r2 := mb.add_local(&mut b, &t, "r2", mut_arr, 0, mb.LF_TEMP, 0, 0)
+    out := mb.add_local(&mut b, &t, "out", ref_i32, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    bb1 := mb.add_block(&mut b, 0)
+    assign_const(&mut b, bb0, v, arr_i32, 0)
+    v_pl := mb.add_local_place(&mut b, v)
+    r_pl := mb.add_local_place(&mut b, r)
+    _ := assign_ref(&mut b, bb0, r_pl, v_pl, .Mut, -1, -1)
+
+    // p = &(*r)[0]
+    deref_r := mb.add_projected_place(&mut b, r_pl, .Deref, 0, arr_i32)
+    elem_r := mb.add_projected_place(&mut b, deref_r, .Index, -1, ht.TY_I32)
+    p_pl := mb.add_local_place(&mut b, p)
+    _ := assign_ref(&mut b, bb0, p_pl, elem_r, .Shared, -1, -1)
+
+    // r2 = &mut (*r) -> conflicts with active child loan `p` on (*r)[0]!
+    r2_pl := mb.add_local_place(&mut b, r2)
+    _ := assign_ref(&mut b, bb0, r2_pl, deref_r, .Mut, -1, -1)
+
+    c_args: []i32 = [mb.add_op(&mut b, .Move, r2_pl)]
+    a_start := mb.push_call_args(&mut b, &c_args)
+    ret_pl1 := mb.add_local_place(&mut b, 0)
+    _ := mb.set_term(&mut b, bb0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: bb1, place_or_op: ret_pl1,
+        callee: 1, sig_ty: grow_sig, arg_start: a_start, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    // Use `p` after grow() so `p` is live across the call!
+    out_pl := mb.add_local_place(&mut b, out)
+    assign_use(&mut b, bb1, out_pl, .Copy, p_pl, false)
+    set_ret(&mut b, bb1)
+    mb.compute_preds(&mut b)
+
+    mut d: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &b, &mut d))
+    init := mir_init.check_init(&t, &b, &mut d)
+    assert(init.ok)
+    assert(!mir_borrowck.check_borrows(&t, &b, &init, &mut d) && has_code(&d, "E4003"))
+}
+
+@test
+fn mir2_borrowck_rejects_temp_iterator_mutation_s4_and_str_eq_s6() {
+    // S-4 via mir_build: ForIter over temporary Cursor { data: &str } mutating `s` inside loop body -> E4003!
+    mut prog := hb.new_program(0)
+    prog.mod_paths.push("test.ddr")
+    fstr := ht.add_fat_str(&mut prog.types)
+    c_fields: []ht.FieldEntry = [ht.FieldEntry { name: "text", ty: fstr, offset: 0, is_pub: true, origin_slot: -1 }]
+    cursor_ty := ht.add_struct(&mut prog.types, "Graphemes", 0, 0, &c_fields)
+    mut_cursor := ht.add_mut_ref(&mut prog.types, cursor_ty)
+    opt_str := ht.add_option(&mut prog.types, fstr)
+    // Graphemes::next(&mut self) -> Option<&str> from self.text (field_slot = 0)
+    next_params: []ht.ParamEntry = [ht.ParamEntry { ty: mut_cursor, mode: .MutBorrow }]
+    next_from: []ht.FromEdge = [ht.FromEdge { param_idx: 0, field_slot: 0, ret_slot: 0 }]
+    next_sig := ht.add_fn_ptr(&mut prog.types, &next_params, opt_str, &next_from)
+    main_params: []ht.ParamEntry = []
+    no_from: []ht.FromEdge = []
+    main_sig := ht.add_fn_ptr(&mut prog.types, &main_params, ht.TY_UNIT, &no_from)
+    ht.seal(&mut prog.types)
+
+    // fn 0: extern Graphemes::next
+    mut f_next := hb.new_fn(0, "Graphemes::next", 0, next_sig, opt_str, 1)
+    f_next.is_extern = true
+    next_id := hb.add_fn(&mut prog, move f_next)
+
+    // fn 1: `mut s := "abc"; for g in Graphemes { text: &s[..] } { s = "zzz" }`
+    mut f_main := hb.new_fn(1, "s4_for_uaf", 0, main_sig, ht.TY_UNIT, 0)
+    l_s := hb.add_local(&mut f_main, "s", ht.TY_STRING, .MoveVal, true, false, 1, 2)
+    l_g := hb.add_local(&mut f_main, "g", fstr, .CopyVal, false, false, 1, 2)
+
+    e_init_s := hb.add_expr(&mut f_main, hb.make_expr(.LitStr, ht.TY_STRING, 0, 0, 0, 0, 0, 0, "abc", false, 1, 2))
+    st_let_s := hb.add_stmt(&mut f_main, hb.make_stmt(.Let, l_s, e_init_s, -1, 0, 0, false, 1, 2))
+
+    e_ref_s := hb.add_expr(&mut f_main, hb.make_expr(.LocalRef, ht.TY_STRING, l_s, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_slice := hb.add_expr(&mut f_main, hb.make_expr(.Slice, fstr, e_ref_s, 0, 0, 0, 0, 0, "", false, 1, 2))
+    c_args := hb.push_expr_list(&mut f_main, &[e_slice])
+    e_cursor := hb.add_expr(&mut f_main, hb.make_expr(.StructLit, cursor_ty, 0, 0, 0, c_args, 1, 0, "", false, 1, 2))
+
+    e_lhs_s := hb.add_expr(&mut f_main, hb.make_expr(.LocalRef, ht.TY_STRING, l_s, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_rhs_s := hb.add_expr(&mut f_main, hb.make_expr(.LitStr, ht.TY_STRING, 0, 0, 0, 0, 0, 0, "zzz", false, 1, 2))
+    st_mut_s := hb.add_stmt(&mut f_main, hb.make_stmt(.Assign, -1, e_lhs_s, e_rhs_s, 0, 0, false, 1, 2))
+    for_body_list := hb.push_stmt_list(&mut f_main, &[st_mut_s])
+    st_for := hb.add_stmt(&mut f_main, hb.make_stmt(.ForIter, l_g, e_cursor, next_id, for_body_list, 1, false, 1, 2))
+
+    root_list := hb.push_stmt_list(&mut f_main, &[st_let_s, st_for])
+    f_main.body_stmt = hb.add_stmt(&mut f_main, hb.make_stmt(.Block, -1, -1, -1, root_list, 2, false, 1, 2))
+    _ := hb.add_fn(&mut prog, move f_main)
+
+    res := mir_check.check_program(&prog)
+    assert(!res.ok && has_code(&res.diagnostics, "E4003"))
+
+    // S-6: `&str ==` where RHS mutates `s` via `&mut s` -> E4003!
+    mut prog2 := hb.new_program(0)
+    prog2.mod_paths.push("test.ddr")
+    fstr2 := ht.add_fat_str(&mut prog2.types)
+    mut_s2 := ht.add_mut_ref(&mut prog2.types, ht.TY_STRING)
+    nuke_p: []ht.ParamEntry = [ht.ParamEntry { ty: mut_s2, mode: .MutBorrow }]
+    nuke_sig := ht.add_fn_ptr(&mut prog2.types, &nuke_p, fstr2, &no_from)
+    m2_sig := ht.add_fn_ptr(&mut prog2.types, &main_params, ht.TY_UNIT, &no_from)
+    ht.seal(&mut prog2.types)
+
+    mut f_nuke := hb.new_fn(0, "nuke", 0, nuke_sig, fstr2, 1)
+    f_nuke.is_extern = true
+    nuke_id := hb.add_fn(&mut prog2, move f_nuke)
+
+    mut f2 := hb.new_fn(1, "s6_str_eq", 0, m2_sig, ht.TY_UNIT, 0)
+    ls2 := hb.add_local(&mut f2, "s", ht.TY_STRING, .MoveVal, true, false, 1, 2)
+    e_s0 := hb.add_expr(&mut f2, hb.make_expr(.LitStr, ht.TY_STRING, 0, 0, 0, 0, 0, 0, "hello", false, 1, 2))
+    st_l2 := hb.add_stmt(&mut f2, hb.make_stmt(.Let, ls2, e_s0, -1, 0, 0, false, 1, 2))
+    e_sref := hb.add_expr(&mut f2, hb.make_expr(.LocalRef, ht.TY_STRING, ls2, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_lhs := hb.add_expr(&mut f2, hb.make_expr(.Slice, fstr2, e_sref, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_sref2 := hb.add_expr(&mut f2, hb.make_expr(.LocalRef, ht.TY_STRING, ls2, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_muts := hb.add_expr(&mut f2, hb.make_expr(.MutRef, mut_s2, e_sref2, 0, 0, 0, 0, 0, "", false, 1, 2))
+    nk_args := hb.push_expr_list(&mut f2, &[e_muts])
+    e_rhs := hb.add_expr(&mut f2, hb.make_expr(.Call, fstr2, nuke_id, nuke_sig, 0, nk_args, 1, 0, "", false, 1, 2))
+    e_eq := hb.add_expr(&mut f2, hb.make_expr(.Binary, ht.TY_BOOL, e_lhs, e_rhs, 0, 0, 0, 0, "==", false, 1, 2))
+    st_eq := hb.add_stmt(&mut f2, hb.make_stmt(.Expr, -1, e_eq, -1, 0, 0, false, 1, 2))
+    rl2 := hb.push_stmt_list(&mut f2, &[st_l2, st_eq])
+    f2.body_stmt = hb.add_stmt(&mut f2, hb.make_stmt(.Block, -1, -1, -1, rl2, 2, false, 1, 2))
+    _ := hb.add_fn(&mut prog2, move f2)
+
+    res2 := mir_check.check_program(&prog2)
+    assert(!res2.ok && has_code(&res2.diagnostics, "E4003"))
+}
+
+@test
+fn mir2_borrowck_rejects_variance_smuggling_and_mut_param_stored_write() {
+    // Variance / invariance trap:
+    // `mut h := Holder { r: &outer }; { inner := 2; p: &mut Holder = &mut h; (*p).r = &inner; StorageDead(inner) }; use(h)`
+    // Bidirectional invariance O(h,0) <-> O(p,1) pulls L_inner back into O(h,0) -> E4003 at StorageDead(inner)!
+    mut t := ht.new_table(0)
+    ref_i32 := ht.add_ref(&mut t, ht.TY_I32)
+    h_fields: []ht.FieldEntry = [ht.FieldEntry { name: "r", ty: ref_i32, offset: 0, is_pub: true, origin_slot: -1 }]
+    holder_ty := ht.add_struct(&mut t, "Holder", 0, 0, &h_fields)
+    mut_holder := ht.add_mut_ref(&mut t, holder_ty)
+    ht.seal(&mut t)
+
+    mut b := mb.new_body(0, 0, "smuggle", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    outer := mb.add_local(&mut b, &t, "outer", ht.TY_I32, 0, mb.LF_USER, 0, 0)
+    inner := mb.add_local(&mut b, &t, "inner", ht.TY_I32, 0, mb.LF_USER, 0, 0)
+    r_out := mb.add_local(&mut b, &t, "r_out", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    h := mb.add_local(&mut b, &t, "h", holder_ty, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    p := mb.add_local(&mut b, &t, "p", mut_holder, 0, mb.LF_USER, 0, 0)
+    r_in := mb.add_local(&mut b, &t, "r_in", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    read_h := mb.add_local(&mut b, &t, "read_h", holder_ty, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    assign_const(&mut b, bb0, outer, ht.TY_I32, 1)
+    r_out_pl := mb.add_local_place(&mut b, r_out)
+    outer_pl := mb.add_local_place(&mut b, outer)
+    _ := assign_ref(&mut b, bb0, r_out_pl, outer_pl, .Shared, -1, -1)
+    h_pl := mb.add_local_place(&mut b, h)
+    agg_ops: []i32 = [mb.add_op(&mut b, .Copy, r_out_pl)]
+    rv_h := mb.add_rvalue(&mut b, .Aggregate, holder_ty, 0, 0, &agg_ops)
+    _ := mb.push_stmt(&mut b, bb0, mb.MirStmt { kind: .Assign, place: h_pl, rvalue: rv_h, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+
+    // Inner block: inner := 2; p = &mut h; (*p).r = &inner; StorageDead(inner)
+    assign_const(&mut b, bb0, inner, ht.TY_I32, 2)
+    p_pl := mb.add_local_place(&mut b, p)
+    _ := assign_ref(&mut b, bb0, p_pl, h_pl, .Mut, -1, -1)
+    r_in_pl := mb.add_local_place(&mut b, r_in)
+    inner_pl := mb.add_local_place(&mut b, inner)
+    _ := assign_ref(&mut b, bb0, r_in_pl, inner_pl, .Shared, -1, -1)
+    deref_p := mb.add_projected_place(&mut b, p_pl, .Deref, 0, holder_ty)
+    p_r := mb.add_projected_place(&mut b, deref_p, .Field, 0, ref_i32)
+    assign_use(&mut b, bb0, p_r, .Copy, r_in_pl, false)
+    _ := mb.push_stmt(&mut b, bb0, mb.MirStmt { kind: .StorageDead, place: inner, rvalue: -1, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+
+    // After inner scope: read `h` -> `O(h,0)` still live at StorageDead(inner) -> E4003!
+    read_h_pl := mb.add_local_place(&mut b, read_h)
+    assign_use(&mut b, bb0, read_h_pl, .Copy, h_pl, false)
+    set_ret(&mut b, bb0)
+    mb.compute_preds(&mut b)
+
+    mut d1: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &b, &mut d1))
+    init1 := mir_init.check_init(&t, &b, &mut d1)
+    assert(init1.ok)
+    assert(!mir_borrowck.check_borrows(&t, &b, &init1, &mut d1) && has_code(&d1, "E4003"))
+
+    // Stored-borrow write through &mut function parameter: `fn set(dst: &mut Holder, val: &i32) { (*dst).r = val }` -> E4003!
+    mut b2 := mb.new_body(1, 0, "set_param", "test.ddr", -1, ht.TY_UNIT, 2, false)
+    _ := mb.add_local(&mut b2, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    dst := mb.add_local(&mut b2, &t, "dst", mut_holder, 0, mb.LF_PARAM, 0, 0)
+    val := mb.add_local(&mut b2, &t, "val", ref_i32, 0, mb.LF_PARAM, 0, 0)
+    bb2 := mb.add_block(&mut b2, 0)
+    dst_pl := mb.add_local_place(&mut b2, dst)
+    d_deref := mb.add_projected_place(&mut b2, dst_pl, .Deref, 0, holder_ty)
+    d_r := mb.add_projected_place(&mut b2, d_deref, .Field, 0, ref_i32)
+    val_pl := mb.add_local_place(&mut b2, val)
+    assign_use(&mut b2, bb2, d_r, .Copy, val_pl, false)
+    set_ret(&mut b2, bb2)
+    mb.compute_preds(&mut b2)
+    mut d2: []diag.Diagnostic = []
+    init2 := mir_init.check_init(&t, &b2, &mut d2)
+    assert(!mir_borrowck.check_borrows(&t, &b2, &init2, &mut d2) && has_code(&d2, "E4003"))
+}
+
+@test
+fn mir2_borrowck_dropck_dispose_vs_may_dangle() {
+    // dropck:
+    // Case A: `@resource(dispose) struct Guard { r: &string }` declared BEFORE `s: string`,
+    // then `s` dropped BEFORE `Guard` -> `Drop(Guard)` keeps O(Guard) live -> `Drop(s)` fails with E4003!
+    // Case B: Plain `struct PlainView { r: &string }` (no TF_DISPOSE) in exact same drop order -> may_dangle -> ACCEPTED!
+    mut t := ht.new_table(0)
+    ref_s := ht.add_ref(&mut t, ht.TY_STRING)
+    g_fields: []ht.FieldEntry = [ht.FieldEntry { name: "r", ty: ref_s, offset: 0, is_pub: false, origin_slot: -1 }]
+    guard_ty := ht.add_struct(&mut t, "Guard", 0, ht.TF_RESOURCE.bit_or(ht.TF_DISPOSE), &g_fields)
+    plain_ty := ht.add_struct(&mut t, "PlainView", 0, 0, &g_fields)
+    ht.seal(&mut t)
+
+    // Case A (Guard with TF_DISPOSE) -> REJECTED E4003
+    mut b1 := mb.new_body(0, 0, "dropck_fail", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b1, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    g := mb.add_local(&mut b1, &t, "g", guard_ty, 0, mb.LF_USER, 0, 0)
+    s := mb.add_local(&mut b1, &t, "s", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    rs := mb.add_local(&mut b1, &t, "rs", ref_s, 0, mb.LF_TEMP, 0, 0)
+    bb0 := mb.add_block(&mut b1, 0)
+    bb1 := mb.add_block(&mut b1, 0)
+    bb2 := mb.add_block(&mut b1, 0)
+    assign_const(&mut b1, bb0, s, ht.TY_STRING, 0)
+    s_pl := mb.add_local_place(&mut b1, s)
+    rs_pl := mb.add_local_place(&mut b1, rs)
+    _ := assign_ref(&mut b1, bb0, rs_pl, s_pl, .Shared, -1, -1)
+    g_pl := mb.add_local_place(&mut b1, g)
+    ops1: []i32 = [mb.add_op(&mut b1, .Copy, rs_pl)]
+    rv_g := mb.add_rvalue(&mut b1, .Aggregate, guard_ty, 0, 0, &ops1)
+    _ := mb.push_stmt(&mut b1, bb0, mb.MirStmt { kind: .Assign, place: g_pl, rvalue: rv_g, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+    // Drop `s` FIRST, then Drop `g` (which runs dispose(&self) reading `g.r`!)
+    set_drop(&mut b1, bb0, s_pl, bb1)
+    set_drop(&mut b1, bb1, g_pl, bb2)
+    set_ret(&mut b1, bb2)
+    mb.compute_preds(&mut b1)
+    mut d1: []diag.Diagnostic = []
+    init1 := mir_init.check_init(&t, &b1, &mut d1)
+    assert(!mir_borrowck.check_borrows(&t, &b1, &init1, &mut d1) && has_code(&d1, "E4003"))
+
+    // Case B (PlainView without TF_DISPOSE) -> ACCEPTED (may_dangle!)
+    mut b2 := mb.new_body(1, 0, "may_dangle_ok", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b2, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    pv := mb.add_local(&mut b2, &t, "pv", plain_ty, 0, mb.LF_USER, 0, 0)
+    s2 := mb.add_local(&mut b2, &t, "s", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    rs2 := mb.add_local(&mut b2, &t, "rs", ref_s, 0, mb.LF_TEMP, 0, 0)
+    p0 := mb.add_block(&mut b2, 0)
+    p1 := mb.add_block(&mut b2, 0)
+    p2 := mb.add_block(&mut b2, 0)
+    assign_const(&mut b2, p0, s2, ht.TY_STRING, 0)
+    s2_pl := mb.add_local_place(&mut b2, s2)
+    rs2_pl := mb.add_local_place(&mut b2, rs2)
+    _ := assign_ref(&mut b2, p0, rs2_pl, s2_pl, .Shared, -1, -1)
+    pv_pl := mb.add_local_place(&mut b2, pv)
+    ops2: []i32 = [mb.add_op(&mut b2, .Copy, rs2_pl)]
+    rv_pv := mb.add_rvalue(&mut b2, .Aggregate, plain_ty, 0, 0, &ops2)
+    _ := mb.push_stmt(&mut b2, p0, mb.MirStmt { kind: .Assign, place: pv_pl, rvalue: rv_pv, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+    set_drop(&mut b2, p0, s2_pl, p1)
+    set_drop(&mut b2, p1, pv_pl, p2)
+    set_ret(&mut b2, p2)
+    mb.compute_preds(&mut b2)
+    mut d2: []diag.Diagnostic = []
+    init2 := mir_init.check_init(&t, &b2, &mut d2)
+    assert(mir_borrowck.check_borrows(&t, &b2, &init2, &mut d2))
+}
+
+@test
+fn mir2_borrowck_two_phase_mut_and_escapes() {
+    mut t := ht.new_table(0)
+    arr := ht.add_array(&mut t, ht.TY_I32)
+    mut_arr := ht.add_mut_ref(&mut t, arr)
+    ref_i32 := ht.add_ref(&mut t, ht.TY_I32)
+    no_from: []ht.FromEdge = []
+    push_params: []ht.ParamEntry = [
+        ht.ParamEntry { ty: mut_arr, mode: .MutBorrow },
+        ht.ParamEntry { ty: ht.TY_I32, mode: .CopyVal },
+    ]
+    push_sig := ht.add_fn_ptr(&mut t, &push_params, ht.TY_UNIT, &no_from)
+    push_ref_params: []ht.ParamEntry = [
+        ht.ParamEntry { ty: mut_arr, mode: .MutBorrow },
+        ht.ParamEntry { ty: ref_i32, mode: .CopyVal },
+    ]
+    push_ref_sig := ht.add_fn_ptr(&mut t, &push_ref_params, ht.TY_UNIT, &no_from)
+    ht.seal(&mut t)
+
+    // 4a: VALID TwoPhaseMut: `v.push(v.len)` -> ACCEPTED!
+    mut b_ok := mb.new_body(0, 0, "tp_ok", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b_ok, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    v := mb.add_local(&mut b_ok, &t, "v", arr, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    r_tp := mb.add_local(&mut b_ok, &t, "r_tp", mut_arr, 0, mb.LF_TEMP, 0, 0)
+    n := mb.add_local(&mut b_ok, &t, "n", ht.TY_I32, 0, mb.LF_TEMP, 0, 0)
+    bb0 := mb.add_block(&mut b_ok, 0)
+    bb1 := mb.add_block(&mut b_ok, 0)
+    assign_const(&mut b_ok, bb0, v, arr, 0)
+    v_pl := mb.add_local_place(&mut b_ok, v)
+    rtp_pl := mb.add_local_place(&mut b_ok, r_tp)
+    _ := assign_ref(&mut b_ok, bb0, rtp_pl, v_pl, .TwoPhaseMut, -1, bb0)
+    // Shared read `v.len` while TwoPhaseMut is reserved -> OK!
+    empty: []i32 = []
+    v_op := mb.add_op(&mut b_ok, .Copy, v_pl)
+    rv_len := mb.add_rvalue(&mut b_ok, .Len, ht.TY_I32, v_op, -1, &empty)
+    n_pl := mb.add_local_place(&mut b_ok, n)
+    _ := mb.push_stmt(&mut b_ok, bb0, mb.MirStmt { kind: .Assign, place: n_pl, rvalue: rv_len, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+    op_rtp := mb.add_op(&mut b_ok, .Move, rtp_pl)
+    op_n := mb.add_op(&mut b_ok, .Copy, n_pl)
+    args_ok: []i32 = [op_rtp, op_n]
+    a0 := mb.push_call_args(&mut b_ok, &args_ok)
+    ok_ret_pl := mb.add_local_place(&mut b_ok, 0)
+    _ := mb.set_term(&mut b_ok, bb0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: bb1, place_or_op: ok_ret_pl,
+        callee: 1, sig_ty: push_sig, arg_start: a0, arg_len: 2, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut b_ok, bb1)
+    mb.compute_preds(&mut b_ok)
+    mut d_ok: []diag.Diagnostic = []
+    init_ok := mir_init.check_init(&t, &b_ok, &mut d_ok)
+    assert(mir_borrowck.check_borrows(&t, &b_ok, &init_ok, &mut d_ok))
+
+    // 4b: INVALID TwoPhaseMut double-mut: `v.push(v.pop())` (second TwoPhaseMut while reserved) -> REJECTED E4003!
+    mut b_dbl := mb.new_body(1, 0, "tp_double", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b_dbl, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    v2 := mb.add_local(&mut b_dbl, &t, "v", arr, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    tp1 := mb.add_local(&mut b_dbl, &t, "tp1", mut_arr, 0, mb.LF_TEMP, 0, 0)
+    tp2 := mb.add_local(&mut b_dbl, &t, "tp2", mut_arr, 0, mb.LF_TEMP, 0, 0)
+    db0 := mb.add_block(&mut b_dbl, 0)
+    db1 := mb.add_block(&mut b_dbl, 0)
+    assign_const(&mut b_dbl, db0, v2, arr, 0)
+    v2_pl := mb.add_local_place(&mut b_dbl, v2)
+    tp1_pl := mb.add_local_place(&mut b_dbl, tp1)
+    tp2_pl := mb.add_local_place(&mut b_dbl, tp2)
+    _ := assign_ref(&mut b_dbl, db0, tp1_pl, v2_pl, .TwoPhaseMut, -1, db1)
+    _ := assign_ref(&mut b_dbl, db0, tp2_pl, v2_pl, .TwoPhaseMut, -1, db0)
+    op_tp1 := mb.add_op(&mut b_dbl, .Move, tp1_pl)
+    op_tp2 := mb.add_op(&mut b_dbl, .Move, tp2_pl)
+    a_d: []i32 = [op_tp1, op_tp2]
+    ad0 := mb.push_call_args(&mut b_dbl, &a_d)
+    dbl_ret_pl := mb.add_local_place(&mut b_dbl, 0)
+    _ := mb.set_term(&mut b_dbl, db0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: db1, place_or_op: dbl_ret_pl,
+        callee: 1, sig_ty: -1, arg_start: ad0, arg_len: 2, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut b_dbl, db1)
+    mb.compute_preds(&mut b_dbl)
+    mut d_dbl: []diag.Diagnostic = []
+    init_dbl := mir_init.check_init(&t, &b_dbl, &mut d_dbl)
+    assert(!mir_borrowck.check_borrows(&t, &b_dbl, &init_dbl, &mut d_dbl) && has_code(&d_dbl, "E4003"))
+
+    // 4c: INVALID TwoPhaseMut activation alias: `v.push_ref(&v[0])` -> REJECTED E4003 at Call activation!
+    mut b_act := mb.new_body(2, 0, "tp_act", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b_act, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    v3 := mb.add_local(&mut b_act, &t, "v", arr, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    tp3 := mb.add_local(&mut b_act, &t, "tp3", mut_arr, 0, mb.LF_TEMP, 0, 0)
+    e0 := mb.add_local(&mut b_act, &t, "e0", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    ab0 := mb.add_block(&mut b_act, 0)
+    ab1 := mb.add_block(&mut b_act, 0)
+    assign_const(&mut b_act, ab0, v3, arr, 0)
+    v3_pl := mb.add_local_place(&mut b_act, v3)
+    tp3_pl := mb.add_local_place(&mut b_act, tp3)
+    _ := assign_ref(&mut b_act, ab0, tp3_pl, v3_pl, .TwoPhaseMut, -1, ab0)
+    e0_pl := mb.add_local_place(&mut b_act, e0)
+    v3_idx := mb.add_projected_place(&mut b_act, v3_pl, .Index, -1, ht.TY_I32)
+    _ := assign_ref(&mut b_act, ab0, e0_pl, v3_idx, .Shared, -1, -1)
+    op_tp3 := mb.add_op(&mut b_act, .Move, tp3_pl)
+    op_e0 := mb.add_op(&mut b_act, .Copy, e0_pl)
+    a_act: []i32 = [op_tp3, op_e0]
+    aa0 := mb.push_call_args(&mut b_act, &a_act)
+    act_ret_pl := mb.add_local_place(&mut b_act, 0)
+    _ := mb.set_term(&mut b_act, ab0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: ab1, place_or_op: act_ret_pl,
+        callee: 1, sig_ty: push_ref_sig, arg_start: aa0, arg_len: 2, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut b_act, ab1)
+    mb.compute_preds(&mut b_act)
+    mut d_act: []diag.Diagnostic = []
+    init_act := mir_init.check_init(&t, &b_act, &mut d_act)
+    assert(!mir_borrowck.check_borrows(&t, &b_act, &init_act, &mut d_act) && has_code(&d_act, "E4003"))
+
+    // 4d: Return escape (returning `&local`) -> REJECTED E4003!
+    mut b_ret := mb.new_body(3, 0, "ret_local", "test.ddr", -1, ref_i32, 0, false)
+    _ := mb.add_local(&mut b_ret, &t, "_ret", ref_i32, 0, mb.LF_MUT, 0, 0)
+    x := mb.add_local(&mut b_ret, &t, "x", ht.TY_I32, 0, mb.LF_USER, 0, 0)
+    rb0 := mb.add_block(&mut b_ret, 0)
+    assign_const(&mut b_ret, rb0, x, ht.TY_I32, 7)
+    ret_dst := mb.add_local_place(&mut b_ret, 0)
+    x_pl := mb.add_local_place(&mut b_ret, x)
+    _ := assign_ref(&mut b_ret, rb0, ret_dst, x_pl, .Shared, -1, -1)
+    set_ret(&mut b_ret, rb0)
+    mb.compute_preds(&mut b_ret)
+    mut d_ret: []diag.Diagnostic = []
+    init_ret := mir_init.check_init(&t, &b_ret, &mut d_ret)
+    assert(!mir_borrowck.check_borrows(&t, &b_ret, &init_ret, &mut d_ret) && has_code(&d_ret, "E4003"))
+
+    // 4e: RegionExit escape (borrow created inside region R still live after RegionExit) -> REJECTED E4005!
+    mut b_reg := mb.new_body(4, 0, "reg_escape", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b_reg, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    escaped := mb.add_local(&mut b_reg, &t, "escaped", ref_i32, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    rx := mb.add_local(&mut b_reg, &t, "rx", ht.TY_I32, 0, mb.LF_USER, 0, 0)
+    used := mb.add_local(&mut b_reg, &t, "used", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    reg_sc := mb.add_scope(&mut b_reg, 0, .Region, -1, -1)
+    rg0 := mb.add_block(&mut b_reg, 0)
+    rg1 := mb.add_block(&mut b_reg, reg_sc)
+    rg2 := mb.add_block(&mut b_reg, 0)
+    _ := mb.set_term(&mut b_reg, rg0, mb.MirTerm {
+        kind: .RegionEnter, call_kind: .Direct, target_bb: rg1, place_or_op: -1, callee: reg_sc, sig_ty: -1,
+        arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    assign_const(&mut b_reg, rg1, rx, ht.TY_I32, 99)
+    esc_pl := mb.add_local_place(&mut b_reg, escaped)
+    rx_pl := mb.add_local_place(&mut b_reg, rx)
+    _ := assign_ref(&mut b_reg, rg1, esc_pl, rx_pl, .Shared, reg_sc, -1)
+    _ := mb.set_term(&mut b_reg, rg1, mb.MirTerm {
+        kind: .RegionExit, call_kind: .Direct, target_bb: rg2, place_or_op: -1, callee: reg_sc, sig_ty: -1,
+        arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    used_pl := mb.add_local_place(&mut b_reg, used)
+    assign_use(&mut b_reg, rg2, used_pl, .Copy, esc_pl, false)
+    set_ret(&mut b_reg, rg2)
+    mb.compute_preds(&mut b_reg)
+    mut d_reg: []diag.Diagnostic = []
+    init_reg := mir_init.check_init(&t, &b_reg, &mut d_reg)
+    assert(!mir_borrowck.check_borrows(&t, &b_reg, &init_reg, &mut d_reg) && has_code(&d_reg, "E4005"))
+}
+
+// =========================================================================
+// 4B. mir_borrowck ACCEPTS: Cliff 1, Cliff 2, Cliff 3, mut r rebinding, non-lending Graphemes
+// =========================================================================
+
+@test
+fn mir2_borrowck_accepts_cliffs_rebinding_and_non_lending_iter() {
+    mut t := ht.new_table(0)
+    arr := ht.add_array(&mut t, ht.TY_I32)
+    mut_arr := ht.add_mut_ref(&mut t, arr)
+    ref_i32 := ht.add_ref(&mut t, ht.TY_I32)
+    opt_mut := ht.add_option(&mut t, mut_arr)
+    fstr := ht.add_fat_str(&mut t)
+    g_fields: []ht.FieldEntry = [ht.FieldEntry { name: "text", ty: fstr, offset: 0, is_pub: true, origin_slot: -1 }]
+    graph_ty := ht.add_struct(&mut t, "Graphemes", 0, 0, &g_fields)
+    mut_graph := ht.add_mut_ref(&mut t, graph_ty)
+    opt_str := ht.add_option(&mut t, fstr)
+    no_from: []ht.FromEdge = []
+    clr_p: []ht.ParamEntry = [ht.ParamEntry { ty: mut_arr, mode: .MutBorrow }]
+    clr_sig := ht.add_fn_ptr(&mut t, &clr_p, ht.TY_UNIT, &no_from)
+    next_p: []ht.ParamEntry = [ht.ParamEntry { ty: mut_graph, mode: .MutBorrow }]
+    next_from: []ht.FromEdge = [ht.FromEdge { param_idx: 0, field_slot: 0, ret_slot: 0 }]
+    next_sig := ht.add_fn_ptr(&mut t, &next_p, opt_str, &next_from)
+    ht.seal(&mut t)
+
+    // Cliff 1: `match move opt { .Some(m) => clear(&mut *m) }` -> ACCEPTED!
+    mut c1 := mb.new_body(0, 0, "cliff1", "test.ddr", -1, ht.TY_UNIT, 1, false)
+    _ := mb.add_local(&mut c1, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    opt_l := mb.add_local(&mut c1, &t, "opt", opt_mut, 0, mb.LF_PARAM, 0, 0)
+    m_l := mb.add_local(&mut c1, &t, "m", mut_arr, 0, mb.LF_USER, 0, 0)
+    reb_l := mb.add_local(&mut c1, &t, "reb", mut_arr, 0, mb.LF_TEMP, 0, 0)
+    c1_b0 := mb.add_block(&mut c1, 0)
+    c1_b1 := mb.add_block(&mut c1, 0)
+    opt_l_pl := mb.add_local_place(&mut c1, opt_l)
+    opt_dc := mb.add_projected_place(&mut c1, opt_l_pl, .Downcast, 0, opt_mut)
+    opt_pay := mb.add_projected_place(&mut c1, opt_dc, .Field, 0, mut_arr)
+    m_pl := mb.add_local_place(&mut c1, m_l)
+    assign_use(&mut c1, c1_b0, m_pl, .Move, opt_pay, false)
+    // Reborrow `&mut *m` and pass to `clear`!
+    deref_m := mb.add_projected_place(&mut c1, m_pl, .Deref, 0, arr)
+    reb_pl := mb.add_local_place(&mut c1, reb_l)
+    _ := assign_ref(&mut c1, c1_b0, reb_pl, deref_m, .Mut, -1, -1)
+    c1_args: []i32 = [mb.add_op(&mut c1, .Move, reb_pl)]
+    c1_as := mb.push_call_args(&mut c1, &c1_args)
+    c1_ret_pl := mb.add_local_place(&mut c1, 0)
+    _ := mb.set_term(&mut c1, c1_b0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: c1_b1, place_or_op: c1_ret_pl,
+        callee: 1, sig_ty: clr_sig, arg_start: c1_as, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut c1, c1_b1)
+    mb.compute_preds(&mut c1)
+    mut dc1: []diag.Diagnostic = []
+    ic1 := mir_init.check_init(&t, &c1, &mut dc1)
+    assert(ic1.ok && mir_borrowck.check_borrows(&t, &c1, &ic1, &mut dc1))
+
+    // Cliff 2 (dead borrow released at last CFG use) + Cliff 3 (disjoint if/else branch):
+    // `r := &v[0]; if c { mutate(v) } else { use(r) }` -> ACCEPTED!
+    mut c3 := mb.new_body(1, 0, "cliff2_3", "test.ddr", -1, ht.TY_UNIT, 1, false)
+    _ := mb.add_local(&mut c3, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    cond := mb.add_local(&mut c3, &t, "c", ht.TY_BOOL, 0, mb.LF_PARAM, 0, 0)
+    v := mb.add_local(&mut c3, &t, "v", arr, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    r := mb.add_local(&mut c3, &t, "r", ref_i32, 0, mb.LF_USER, 0, 0)
+    u := mb.add_local(&mut c3, &t, "u", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    b0 := mb.add_block(&mut c3, 0)
+    b_then := mb.add_block(&mut c3, 0)
+    b_else := mb.add_block(&mut c3, 0)
+    b_join := mb.add_block(&mut c3, 0)
+    assign_const(&mut c3, b0, v, arr, 0)
+    v_pl := mb.add_local_place(&mut c3, v)
+    r_pl := mb.add_local_place(&mut c3, r)
+    v_idx := mb.add_projected_place(&mut c3, v_pl, .Index, -1, ht.TY_I32)
+    _ := assign_ref(&mut c3, b0, r_pl, v_idx, .Shared, -1, -1)
+    cond_pl3 := mb.add_local_place(&mut c3, cond)
+    c_op := mb.add_op(&mut c3, .Copy, cond_pl3)
+    vals: []i64 = [1]
+    bbs: []i32 = [b_then]
+    sw := mb.push_switch_targets(&mut c3, &vals, &bbs)
+    _ := mb.set_term(&mut c3, b0, mb.MirTerm {
+        kind: .SwitchInt, call_kind: .Direct, target_bb: b_else, place_or_op: c_op,
+        callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    // In then-branch: `r` is NOT used, so `O(r)` is dead -> mutating `v` is ACCEPTED!
+    assign_const(&mut c3, b_then, v, arr, 0)
+    set_goto(&mut c3, b_then, b_join)
+    // In else-branch: `r` IS read; after read, `r` is dead (Cliff 2), so mutating `v` right after is also ACCEPTED!
+    u_pl := mb.add_local_place(&mut c3, u)
+    assign_use(&mut c3, b_else, u_pl, .Copy, r_pl, false)
+    assign_const(&mut c3, b_else, v, arr, 0)
+    set_goto(&mut c3, b_else, b_join)
+    set_ret(&mut c3, b_join)
+    mb.compute_preds(&mut c3)
+    mut dc3: []diag.Diagnostic = []
+    ic3 := mir_init.check_init(&t, &c3, &mut dc3)
+    assert(ic3.ok && mir_borrowck.check_borrows(&t, &c3, &ic3, &mut dc3))
+
+    // Local `mut r: &i32` rebinding with origin kill:
+    // `mut r := &a; r = &b; a = 99; use(r)` -> ACCEPTED!
+    mut rb := mb.new_body(2, 0, "rebind_kill", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut rb, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    la := mb.add_local(&mut rb, &t, "a", ht.TY_I32, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    lb := mb.add_local(&mut rb, &t, "b", ht.TY_I32, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    lr := mb.add_local(&mut rb, &t, "r", ref_i32, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    lu := mb.add_local(&mut rb, &t, "u", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    rb0 := mb.add_block(&mut rb, 0)
+    assign_const(&mut rb, rb0, la, ht.TY_I32, 1)
+    assign_const(&mut rb, rb0, lb, ht.TY_I32, 2)
+    lr_pl := mb.add_local_place(&mut rb, lr)
+    la_pl := mb.add_local_place(&mut rb, la)
+    lb_pl := mb.add_local_place(&mut rb, lb)
+    _ := assign_ref(&mut rb, rb0, lr_pl, la_pl, .Shared, -1, -1)
+    _ := assign_ref(&mut rb, rb0, lr_pl, lb_pl, .Shared, -1, -1)
+    // `a` is unlocked immediately after `r = &b`!
+    assign_const(&mut rb, rb0, la, ht.TY_I32, 99)
+    lu_pl := mb.add_local_place(&mut rb, lu)
+    assign_use(&mut rb, rb0, lu_pl, .Copy, lr_pl, false)
+    set_ret(&mut rb, rb0)
+    mb.compute_preds(&mut rb)
+    mut drb: []diag.Diagnostic = []
+    irb := mir_init.check_init(&t, &rb, &mut drb)
+    assert(irb.ok && mir_borrowck.check_borrows(&t, &rb, &irb, &mut drb))
+
+    // Non-lending `Graphemes<@o>` yielding TWO simultaneously live `&str` items (`o1 = g.next(); o2 = g.next(); use(o1, o2)`) -> ACCEPTED!
+    mut nl := mb.new_body(3, 0, "non_lending", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut nl, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    ls := mb.add_local(&mut nl, &t, "s", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    lsv := mb.add_local(&mut nl, &t, "sv", fstr, 0, mb.LF_TEMP, 0, 0)
+    lg := mb.add_local(&mut nl, &t, "g", graph_ty, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    lgm1 := mb.add_local(&mut nl, &t, "gm1", mut_graph, 0, mb.LF_TEMP, 0, 0)
+    lgm2 := mb.add_local(&mut nl, &t, "gm2", mut_graph, 0, mb.LF_TEMP, 0, 0)
+    lo1 := mb.add_local(&mut nl, &t, "o1", opt_str, 0, mb.LF_USER, 0, 0)
+    lo2 := mb.add_local(&mut nl, &t, "o2", opt_str, 0, mb.LF_USER, 0, 0)
+    luse := mb.add_local(&mut nl, &t, "use", opt_str, 0, mb.LF_TEMP, 0, 0)
+
+    n0 := mb.add_block(&mut nl, 0)
+    n1 := mb.add_block(&mut nl, 0)
+    n2 := mb.add_block(&mut nl, 0)
+    assign_const(&mut nl, n0, ls, ht.TY_STRING, 0)
+    lsv_pl := mb.add_local_place(&mut nl, lsv)
+    ls_pl := mb.add_local_place(&mut nl, ls)
+    _ := assign_ref(&mut nl, n0, lsv_pl, ls_pl, .Shared, -1, -1)
+    lg_pl := mb.add_local_place(&mut nl, lg)
+    g_ops: []i32 = [mb.add_op(&mut nl, .Copy, lsv_pl)]
+    rv_gr := mb.add_rvalue(&mut nl, .Aggregate, graph_ty, 0, 0, &g_ops)
+    _ := mb.push_stmt(&mut nl, n0, mb.MirStmt { kind: .Assign, place: lg_pl, rvalue: rv_gr, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+
+    // First next(&mut g) -> o1 (origin comes from g.text == s, NOT from &mut g!)
+    lgm1_pl := mb.add_local_place(&mut nl, lgm1)
+    _ := assign_ref(&mut nl, n0, lgm1_pl, lg_pl, .Mut, -1, -1)
+    na1: []i32 = [mb.add_op(&mut nl, .Move, lgm1_pl)]
+    ns1 := mb.push_call_args(&mut nl, &na1)
+    lo1_pl := mb.add_local_place(&mut nl, lo1)
+    _ := mb.set_term(&mut nl, n0, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: n1, place_or_op: lo1_pl,
+        callee: 1, sig_ty: next_sig, arg_start: ns1, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+
+    // Second next(&mut g) -> o2 while o1 is STILL LIVE!
+    lgm2_pl := mb.add_local_place(&mut nl, lgm2)
+    _ := assign_ref(&mut nl, n1, lgm2_pl, lg_pl, .Mut, -1, -1)
+    na2: []i32 = [mb.add_op(&mut nl, .Move, lgm2_pl)]
+    ns2 := mb.push_call_args(&mut nl, &na2)
+    lo2_pl := mb.add_local_place(&mut nl, lo2)
+    _ := mb.set_term(&mut nl, n1, mb.MirTerm {
+        kind: .Call, call_kind: .Direct, target_bb: n2, place_or_op: lo2_pl,
+        callee: 1, sig_ty: next_sig, arg_start: ns2, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    luse_pl := mb.add_local_place(&mut nl, luse)
+    assign_use(&mut nl, n2, luse_pl, .Copy, lo1_pl, false)
+    assign_use(&mut nl, n2, luse_pl, .Copy, lo2_pl, false)
+    set_ret(&mut nl, n2)
+    mb.compute_preds(&mut nl)
+    mut dnl: []diag.Diagnostic = []
+    inl := mir_init.check_init(&t, &nl, &mut dnl)
+    assert(inl.ok && mir_borrowck.check_borrows(&t, &nl, &inl, &mut dnl))
+}
+
+// =========================================================================
+// 5. mir_build (S-8 TaskScopeJoin before outer Defer + loop defer_active_flag reset),
+//    mir_drop_elab (dead / definite / conditional drop flags), and mir_escape (S-12 closure E4005)
+// =========================================================================
+
+@test
+fn mir2_build_task_scope_before_outer_defer_s8_and_loop_defer_reset() {
+    mut prog := hb.new_program(0)
+    prog.mod_paths.push("test.ddr")
+    empty_p: []ht.ParamEntry = []
+    no_from: []ht.FromEdge = []
+    unit_sig := ht.add_fn_ptr(&mut prog.types, &empty_p, ht.TY_UNIT, &no_from)
+    ht.seal(&mut prog.types)
+
+    // fn 0: `defer { x = 1 }; task scope { return }`
+    // Verify TaskScopeJoin strictly precedes Defer entry_bb along the early-return CFG path!
+    mut f0 := hb.new_fn(0, "s8_order", 0, unit_sig, ht.TY_UNIT, 0)
+    lx := hb.add_local(&mut f0, "x", ht.TY_I32, .CopyVal, true, false, 1, 2)
+    e0 := hb.add_expr(&mut f0, hb.make_expr(.LitInt, ht.TY_I32, 0, 0, 0, 0, 0, 0, "", false, 1, 2))
+    st_let := hb.add_stmt(&mut f0, hb.make_stmt(.Let, lx, e0, -1, 0, 0, false, 1, 2))
+
+    elx := hb.add_expr(&mut f0, hb.make_expr(.LocalRef, ht.TY_I32, lx, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e1 := hb.add_expr(&mut f0, hb.make_expr(.LitInt, ht.TY_I32, 0, 0, 0, 0, 0, 1, "", false, 1, 2))
+    st_def_body := hb.add_stmt(&mut f0, hb.make_stmt(.Assign, -1, elx, e1, 0, 0, false, 1, 2))
+    def_list := hb.push_stmt_list(&mut f0, &[st_def_body])
+    st_def := hb.add_stmt(&mut f0, hb.make_stmt(.Defer, -1, -1, -1, def_list, 1, false, 1, 2))
+
+    st_ret := hb.add_stmt(&mut f0, hb.make_stmt(.Return, -1, -1, -1, 0, 0, false, 1, 2))
+    ts_list := hb.push_stmt_list(&mut f0, &[st_ret])
+    st_ts := hb.add_stmt(&mut f0, hb.make_stmt(.TaskScope, -1, -1, -1, ts_list, 1, false, 1, 2))
+
+    root := hb.push_stmt_list(&mut f0, &[st_let, st_def, st_ts])
+    f0.body_stmt = hb.add_stmt(&mut f0, hb.make_stmt(.Block, -1, -1, -1, root, 3, false, 1, 2))
+    _ := hb.add_fn(&mut prog, move f0)
+
+    // fn 1: `while cond { defer { ... } }` -> verify SetDeferActive(flag, 0) sits inside the loop body!
+    cond_p: []ht.ParamEntry = [ht.ParamEntry { ty: ht.TY_BOOL, mode: .CopyVal }]
+    loop_sig := ht.add_fn_ptr(&mut prog.types, &cond_p, ht.TY_UNIT, &no_from)
+    ht.seal(&mut prog.types)
+    mut f1 := hb.new_fn(1, "loop_defer", 0, loop_sig, ht.TY_UNIT, 1)
+    lc := hb.add_local(&mut f1, "c", ht.TY_BOOL, .CopyVal, false, true, 1, 2)
+    ec := hb.add_expr(&mut f1, hb.make_expr(.LocalRef, ht.TY_BOOL, lc, 0, 0, 0, 0, 0, "", false, 1, 2))
+    st_nop := hb.add_stmt(&mut f1, hb.make_stmt(.Expr, -1, -1, -1, 0, 0, false, 1, 2))
+    dl := hb.push_stmt_list(&mut f1, &[st_nop])
+    st_ldef := hb.add_stmt(&mut f1, hb.make_stmt(.Defer, -1, -1, -1, dl, 1, false, 1, 2))
+    b_list := hb.push_stmt_list(&mut f1, &[st_ldef])
+    st_inner := hb.add_stmt(&mut f1, hb.make_stmt(.Block, -1, -1, -1, b_list, 1, false, 1, 2))
+    w_list := hb.push_stmt_list(&mut f1, &[st_inner])
+    st_while := hb.add_stmt(&mut f1, hb.make_stmt(.While, -1, ec, -1, w_list, 1, false, 1, 2))
+    r1 := hb.push_stmt_list(&mut f1, &[st_while])
+    f1.body_stmt = hb.add_stmt(&mut f1, hb.make_stmt(.Block, -1, -1, -1, r1, 1, false, 1, 2))
+    _ := hb.add_fn(&mut prog, move f1)
+
+    res := mir_check.check_program(&prog)
+    assert(res.ok && res.bodies.len == 2)
+
+    // Walk fn 0 from TaskScopeEnter: confirm TaskScopeJoin is reached BEFORE SetUnwindTarget (defer entry)!
+    b0 := &res.bodies[0]
+    mut join_bb := -1
+    mut unwind_bb := -1
+    for bb in 0..b0.blocks.len {
+        if b0.terms[b0.blocks[bb].term_id].kind == .TaskScopeJoin { join_bb = bb }
+        for si in b0.blocks[bb].stmt_start..b0.blocks[bb].stmt_end {
+            if b0.stmts[si].kind == .SetUnwindTarget { unwind_bb = bb }
+        }
+    }
+    assert(join_bb >= 0 && unwind_bb >= 0 && join_bb < unwind_bb)
+
+    // In fn 1: verify SetDeferActive(flag, 0) AND SetDeferActive(flag, 1) are emitted inside loop body blocks!
+    b1 := &res.bodies[1]
+    mut saw_reset := false
+    mut saw_activate := false
+    for bb in 1..b1.blocks.len {
+        for si in b1.blocks[bb].stmt_start..b1.blocks[bb].stmt_end {
+            st := b1.stmts[si]
+            if st.kind == .SetDeferActive && st.aux == 0 { saw_reset = true }
+            if st.kind == .SetDeferActive && st.aux == 1 { saw_activate = true }
+        }
+    }
+    assert(saw_reset && saw_activate)
+}
+
+@test
+fn mir2_drop_elab_dead_definite_and_conditional_flags() {
+    mut t := ht.new_table(0)
+    ht.seal(&mut t)
+
+    // Build body with 3 string locals:
+    // - s_dead: moved before Drop -> Drop deleted (0 flags, rewritten to Goto)
+    // - s_def: definitely initialized at Drop -> direct Call(INTRINSIC_DROP), 0 flags
+    // - s_cond: moved only in then-branch -> 1 LF_DROP_FLAG bool local + SwitchInt guard!
+    mut b := mb.new_body(0, 0, "drops", "test.ddr", -1, ht.TY_UNIT, 1, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    cond := mb.add_local(&mut b, &t, "c", ht.TY_BOOL, 0, mb.LF_PARAM, 0, 0)
+    s_dead := mb.add_local(&mut b, &t, "s_dead", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    s_def := mb.add_local(&mut b, &t, "s_def", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    s_cond := mb.add_local(&mut b, &t, "s_cond", ht.TY_STRING, 0, mb.LF_USER, 0, 0)
+    sink := mb.add_local(&mut b, &t, "sink", ht.TY_STRING, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    bb_then := mb.add_block(&mut b, 0)
+    bb_d1 := mb.add_block(&mut b, 0)
+    bb_d2 := mb.add_block(&mut b, 0)
+    bb_d3 := mb.add_block(&mut b, 0)
+    bb_ret := mb.add_block(&mut b, 0)
+
+    assign_const(&mut b, bb0, s_dead, ht.TY_STRING, 0)
+    assign_const(&mut b, bb0, s_def, ht.TY_STRING, 0)
+    assign_const(&mut b, bb0, s_cond, ht.TY_STRING, 0)
+    sink_pl := mb.add_local_place(&mut b, sink)
+    dead_pl := mb.add_local_place(&mut b, s_dead)
+    def_pl := mb.add_local_place(&mut b, s_def)
+    cond_s_pl := mb.add_local_place(&mut b, s_cond)
+    cond_l_pl := mb.add_local_place(&mut b, cond)
+    // Move s_dead unconditionally
+    assign_use(&mut b, bb0, sink_pl, .Move, dead_pl, false)
+    c_op := mb.add_op(&mut b, .Copy, cond_l_pl)
+    vals: []i64 = [1]
+    bbs: []i32 = [bb_then]
+    sw := mb.push_switch_targets(&mut b, &vals, &bbs)
+    _ := mb.set_term(&mut b, bb0, mb.MirTerm {
+        kind: .SwitchInt, call_kind: .Direct, target_bb: bb_d1, place_or_op: c_op,
+        callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    // Then-branch moves s_cond conditionally
+    assign_use(&mut b, bb_then, sink_pl, .Move, cond_s_pl, false)
+    set_goto(&mut b, bb_then, bb_d1)
+
+    set_drop(&mut b, bb_d1, dead_pl, bb_d2)
+    set_drop(&mut b, bb_d2, def_pl, bb_d3)
+    set_drop(&mut b, bb_d3, cond_s_pl, bb_ret)
+    set_ret(&mut b, bb_ret)
+    mb.compute_preds(&mut b)
+
+    mut d: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &b, &mut d))
+    init := mir_init.check_init(&t, &b, &mut d)
+    assert(init.ok)
+
+    mir_drop_elab.elaborate_drops(&t, &mut b, &init)
+    assert(b.post_drop)
+    assert(mir_verify.verify_body(&t, &b, &mut d))
+
+    // s_dead Drop rewritten to Goto; s_def Drop rewritten to direct Call; s_cond Drop rewritten to SwitchInt + 1 LF_DROP_FLAG!
+    assert(b.terms[b.blocks[bb_d1].term_id].kind == .Goto)
+    assert(b.terms[b.blocks[bb_d2].term_id].kind == .Call && b.terms[b.blocks[bb_d2].term_id].callee == mb.INTRINSIC_DROP)
+    assert(b.terms[b.blocks[bb_d3].term_id].kind == .SwitchInt)
+    mut drop_flags := 0
+    for l in 0..b.locals.len {
+        if b.locals[l].flags.bit_and(mb.LF_DROP_FLAG) != 0 { drop_flags += 1 }
+    }
+    assert(drop_flags == 1)
+}
+
+@test
+fn mir2_escape_closure_raw_ptr_scratch_s12() {
+    // S-12: `f := fn[&dummy](p: &i32) -> ptr { unsafe { addr(&p) } }; region R { f(&a[0]) }` -> E4005!
+    mut prog := hb.new_program(0)
+    prog.mod_paths.push("test.ddr")
+    ref_i32 := ht.add_ref(&mut prog.types, ht.TY_I32)
+    reg_i32 := ht.add_region_slice(&mut prog.types, ht.TY_I32)
+    no_from: []ht.FromEdge = []
+    cl_caps: []ht.FieldEntry = [ht.FieldEntry { name: "dummy", ty: ref_i32, offset: 0, is_pub: false, origin_slot: -1 }]
+    cl_params: []ht.ParamEntry = [ht.ParamEntry { ty: ref_i32, mode: .SharedBorrow }]
+    cl_ty := ht.add_closure_env(&mut prog.types, "LeakCl", 0, false, false, true, &cl_caps, &cl_params, ht.TY_PTR, &no_from)
+    empty_p: []ht.ParamEntry = []
+    main_sig := ht.add_fn_ptr(&mut prog.types, &empty_p, ht.TY_UNIT, &no_from)
+    ht.seal(&mut prog.types)
+
+    // fn 0: closure body `(p: &i32) -> ptr { return &raw p }`
+    mut b_cl := mb.new_body(0, 0, "leak_closure", "test.ddr", cl_ty, ht.TY_PTR, 1, true)
+    _ := mb.add_local(&mut b_cl, &prog.types, "_ret", ht.TY_PTR, 0, mb.LF_MUT, 0, 0)
+    lp := mb.add_local(&mut b_cl, &prog.types, "p", ref_i32, 0, mb.LF_PARAM, 0, 0)
+    cb0 := mb.add_block(&mut b_cl, 0)
+    empty: []i32 = []
+    lp_pl := mb.add_local_place(&mut b_cl, lp)
+    rv_addr := mb.add_rvalue(&mut b_cl, .AddrOf, ht.TY_PTR, lp_pl, -1, &empty)
+    cl_ret_pl := mb.add_local_place(&mut b_cl, 0)
+    _ := mb.push_stmt(&mut b_cl, cb0, mb.MirStmt {
+        kind: .Assign, place: cl_ret_pl, rvalue: rv_addr, aux: 0, in_unsafe: true, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut b_cl, cb0)
+    mb.compute_preds(&mut b_cl)
+
+    // fn 1: constructs Closure(fn 0) and calls it indirectly with `&a[0]` where `a: RegionSlice<i32>`!
+    mut b_main := mb.new_body(1, 0, "s12_caller", "test.ddr", main_sig, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b_main, &prog.types, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    ldummy := mb.add_local(&mut b_main, &prog.types, "dummy", ht.TY_I32, 0, mb.LF_USER, 0, 0)
+    ldref := mb.add_local(&mut b_main, &prog.types, "dref", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    lf := mb.add_local(&mut b_main, &prog.types, "f", cl_ty, 0, mb.LF_USER, 0, 0)
+    la := mb.add_local(&mut b_main, &prog.types, "a", reg_i32, 0, mb.LF_USER, 0, 0)
+    lelem := mb.add_local(&mut b_main, &prog.types, "elem", ref_i32, 0, mb.LF_TEMP, 0, 0)
+    lptr := mb.add_local(&mut b_main, &prog.types, "esc", ht.TY_PTR, 0, mb.LF_TEMP, 0, 0)
+
+    mb0 := mb.add_block(&mut b_main, 0)
+    mb1 := mb.add_block(&mut b_main, 0)
+    assign_const(&mut b_main, mb0, ldummy, ht.TY_I32, 0)
+    ldref_pl := mb.add_local_place(&mut b_main, ldref)
+    ldummy_pl := mb.add_local_place(&mut b_main, ldummy)
+    _ := assign_ref(&mut b_main, mb0, ldref_pl, ldummy_pl, .Shared, -1, -1)
+    cap_ops: []i32 = [mb.add_op(&mut b_main, .Copy, ldref_pl)]
+    rv_cl := mb.add_rvalue(&mut b_main, .Closure, cl_ty, 0, 0, &cap_ops)
+    lf_pl := mb.add_local_place(&mut b_main, lf)
+    _ := mb.push_stmt(&mut b_main, mb0, mb.MirStmt { kind: .Assign, place: lf_pl, rvalue: rv_cl, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+
+    // Borrow element of RegionSlice `a` and pass to indirect closure call `f(&a[0])`!
+    la_pl := mb.add_local_place(&mut b_main, la)
+    a_elem := mb.add_projected_place(&mut b_main, la_pl, .Index, -1, ht.TY_I32)
+    lelem_pl := mb.add_local_place(&mut b_main, lelem)
+    _ := assign_ref(&mut b_main, mb0, lelem_pl, a_elem, .Shared, 1, -1)
+    callee_op := mb.add_op(&mut b_main, .Copy, lf_pl)
+    c_args: []i32 = [mb.add_op(&mut b_main, .Copy, lelem_pl)]
+    as0 := mb.push_call_args(&mut b_main, &c_args)
+    lptr_pl := mb.add_local_place(&mut b_main, lptr)
+    _ := mb.set_term(&mut b_main, mb0, mb.MirTerm {
+        kind: .Call, call_kind: .Indirect, target_bb: mb1, place_or_op: lptr_pl,
+        callee: callee_op, sig_ty: cl_ty, arg_start: as0, arg_len: 1, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    set_ret(&mut b_main, mb1)
+    mb.compute_preds(&mut b_main)
+
+    bodies: []mb.MirBody = [move b_cl, move b_main]
+    mut diags: []diag.Diagnostic = []
+    assert(!mir_escape.check_program_escapes(&prog, &bodies, &mut diags) && has_code(&diags, "E4005"))
+}
+
+@test
+fn mir2_borrowck_param_env_closure_return_borrow() {
+    // Closure returning a borrow from its captured environment (PARAM_ENV = -1):
+    // `f := fn[&v]() -> &i32 from env { &v[0] }; r := f(); v = []; use(r)`
+    // Even after `f` is dead, `r` carries `v`'s loan via PARAM_ENV -> mutating `v` MUST fail E4003!
+    mut t := ht.new_table(0)
+    arr := ht.add_array(&mut t, ht.TY_I32)
+    ref_arr := ht.add_ref(&mut t, arr)
+    ref_i32 := ht.add_ref(&mut t, ht.TY_I32)
+    caps: []ht.FieldEntry = [ht.FieldEntry { name: "v", ty: ref_arr, offset: 0, is_pub: false, origin_slot: -1 }]
+    no_params: []ht.ParamEntry = []
+    env_from: []ht.FromEdge = [ht.FromEdge { param_idx: ht.PARAM_ENV, field_slot: -1, ret_slot: 0 }]
+    cl_ty := ht.add_closure_env(&mut t, "EnvBorrowCl", 0, false, false, true, &caps, &no_params, ref_i32, &env_from)
+    ht.seal(&mut t)
+
+    mut b := mb.new_body(0, 0, "param_env_test", "test.ddr", -1, ht.TY_UNIT, 0, false)
+    _ := mb.add_local(&mut b, &t, "_ret", ht.TY_UNIT, 0, mb.LF_MUT, 0, 0)
+    lv := mb.add_local(&mut b, &t, "v", arr, 0, mb.LF_MUT.bit_or(mb.LF_USER), 0, 0)
+    lvr := mb.add_local(&mut b, &t, "vr", ref_arr, 0, mb.LF_TEMP, 0, 0)
+    lf := mb.add_local(&mut b, &t, "f", cl_ty, 0, mb.LF_USER, 0, 0)
+    lr := mb.add_local(&mut b, &t, "r", ref_i32, 0, mb.LF_USER, 0, 0)
+    lu := mb.add_local(&mut b, &t, "u", ref_i32, 0, mb.LF_TEMP, 0, 0)
+
+    bb0 := mb.add_block(&mut b, 0)
+    bb1 := mb.add_block(&mut b, 0)
+    assign_const(&mut b, bb0, lv, arr, 0)
+    lv_pl := mb.add_local_place(&mut b, lv)
+    lvr_pl := mb.add_local_place(&mut b, lvr)
+    _ := assign_ref(&mut b, bb0, lvr_pl, lv_pl, .Shared, -1, -1)
+    cap_op := mb.add_op(&mut b, .Copy, lvr_pl)
+    cap_ops: []i32 = [cap_op]
+    rv_cl := mb.add_rvalue(&mut b, .Closure, cl_ty, 1, 0, &cap_ops)
+    lf_pl := mb.add_local_place(&mut b, lf)
+    _ := mb.push_stmt(&mut b, bb0, mb.MirStmt { kind: .Assign, place: lf_pl, rvalue: rv_cl, aux: 0, in_unsafe: false, span_start: 1, span_end: 2 })
+    f_op := mb.add_op(&mut b, .Copy, lf_pl)
+    lr_pl := mb.add_local_place(&mut b, lr)
+    _ := mb.set_term(&mut b, bb0, mb.MirTerm {
+        kind: .Call, call_kind: .Indirect, target_bb: bb1, place_or_op: lr_pl,
+        callee: f_op, sig_ty: cl_ty, arg_start: 0, arg_len: 0, in_unsafe: false, span_start: 1, span_end: 2,
+    })
+    // In bb1: `f` is dead, `v` is mutated, then `r` is read -> MUST reject E4003!
+    assign_const(&mut b, bb1, lv, arr, 0)
+    lu_pl := mb.add_local_place(&mut b, lu)
+    assign_use(&mut b, bb1, lu_pl, .Copy, lr_pl, false)
+    set_ret(&mut b, bb1)
+    mb.compute_preds(&mut b)
+
+    mut d: []diag.Diagnostic = []
+    assert(mir_verify.verify_body(&t, &b, &mut d))
+    init := mir_init.check_init(&t, &b, &mut d)
+    assert(init.ok)
+    assert(!mir_borrowck.check_borrows(&t, &b, &init, &mut d) && has_code(&d, "E4003"))
+}
+
+@test
+fn mir2_build_defer_early_return_uam_end_to_end() {
+    // Full HIR -> mir_build -> mir_verify -> mir_init end-to-end proof of S-5:
+    // `s := "hi"; defer { sink = move s }; sink = move s; return` -> E4001!
+    mut prog := hb.new_program(0)
+    prog.mod_paths.push("test.ddr")
+    no_p: []ht.ParamEntry = []
+    no_f: []ht.FromEdge = []
+    sig := ht.add_fn_ptr(&mut prog.types, &no_p, ht.TY_UNIT, &no_f)
+    ht.seal(&mut prog.types)
+
+    mut f := hb.new_fn(0, "s5_e2e", 0, sig, ht.TY_UNIT, 0)
+    ls := hb.add_local(&mut f, "s", ht.TY_STRING, .MoveVal, true, false, 1, 2)
+    lsink := hb.add_local(&mut f, "sink", ht.TY_STRING, .MoveVal, true, false, 1, 2)
+    e_hi := hb.add_expr(&mut f, hb.make_expr(.LitStr, ht.TY_STRING, 0, 0, 0, 0, 0, 0, "hi", false, 1, 2))
+    st_let := hb.add_stmt(&mut f, hb.make_stmt(.Let, ls, e_hi, -1, 0, 0, false, 1, 2))
+
+    e_s1 := hb.add_expr(&mut f, hb.make_expr(.LocalRef, ht.TY_STRING, ls, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_mv1 := hb.add_expr(&mut f, hb.make_expr(.Move, ht.TY_STRING, e_s1, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_sk1 := hb.add_expr(&mut f, hb.make_expr(.LocalRef, ht.TY_STRING, lsink, 0, 0, 0, 0, 0, "", false, 1, 2))
+    st_db := hb.add_stmt(&mut f, hb.make_stmt(.Assign, -1, e_sk1, e_mv1, 0, 0, false, 1, 2))
+    dl := hb.push_stmt_list(&mut f, &[st_db])
+    st_def := hb.add_stmt(&mut f, hb.make_stmt(.Defer, -1, -1, -1, dl, 1, false, 1, 2))
+
+    e_s2 := hb.add_expr(&mut f, hb.make_expr(.LocalRef, ht.TY_STRING, ls, 0, 0, 0, 0, 0, "", false, 1, 2))
+    e_mv2 := hb.add_expr(&mut f, hb.make_expr(.Move, ht.TY_STRING, e_s2, 0, 0, 0, 0, 0, "", false, 1, 2))
+    st_let_sk := hb.add_stmt(&mut f, hb.make_stmt(.Let, lsink, e_mv2, -1, 0, 0, false, 1, 2))
+    st_ret := hb.add_stmt(&mut f, hb.make_stmt(.Return, -1, -1, -1, 0, 0, false, 1, 2))
+
+    root := hb.push_stmt_list(&mut f, &[st_let, st_def, st_let_sk, st_ret])
+    f.body_stmt = hb.add_stmt(&mut f, hb.make_stmt(.Block, -1, -1, -1, root, 4, false, 1, 2))
+    _ := hb.add_fn(&mut prog, move f)
+
+    res := mir_check.check_program(&prog)
+    assert(!res.ok && has_code(&res.diagnostics, "E4001"))
+}
