@@ -1,0 +1,471 @@
+// End-to-end test suite for `dunder check --check-v2` (Phase 1 Milestone 1D).
+// Verifies that the new HIR + HL-MIR2 pipeline rejects ALL Phase 0 soundness exploits (S-1..S-13)
+// plus the two new 1.0 soundness checks (variance/invariance & dropck) and non-lending Iterator,
+// accepts ALL 3 usability cliffs (C-1, C-2, C-3) plus valid 1.0 constructs, and supports --agent.
+
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.fs as fs
+import std.process as process
+import std.text as text
+import sys
+
+fn check_v2_rejected(compiler: string, work: string, name: string, source: string, expected_code: string, checks: &mut i32) -> bool {
+    path := f"{work}/{name}.ddr"
+    if !sys.write_text(path, source + "\n").ok { return harness.fail(f"cannot write {path}") }
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", "--check-v2", path.clone(), "--jobs", "1"], work, 1, false, 60000, &mut out) {
+        return harness.fail(f"{name}: expected check --check-v2 to reject (exit 1)\nstdout:\n{out.stdout_text()}\nstderr:\n{out.stderr_text()}")
+    }
+    combined := out.stderr_text() + out.stdout_text()
+    if expected_code.len > 0 && !text.contains(combined, expected_code) {
+        return harness.fail(f"{name}: check --check-v2 diagnostic missing '{expected_code}'\n{combined}")
+    }
+    checks += 1
+    true
+}
+
+fn check_v2_accepted(compiler: string, work: string, name: string, source: string, checks: &mut i32) -> bool {
+    path := f"{work}/{name}.ddr"
+    if !sys.write_text(path, source + "\n").ok { return harness.fail(f"cannot write {path}") }
+    mut out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", "--check-v2", path.clone(), "--jobs", "1"], work, 0, false, 60000, &mut out) {
+        return harness.fail(f"{name}: expected check --check-v2 to accept (exit 0)\nstdout:\n{out.stdout_text()}\nstderr:\n{out.stderr_text()}")
+    }
+    if !text.contains(out.stdout_text(), "checked (v2)") {
+        return harness.fail(f"{name}: expected 'checked (v2)' banner, got:\n{out.stdout_text()}")
+    }
+    checks += 1
+    true
+}
+
+fn rejected_cases() -> [](string, string, string) {
+    [
+        // S-1: Option<&mut T> call aliasing
+        ("s1_opt_mut_str_alias",
+            "fn clash(dst: Option<&mut string>, view: &str) -> i32 { match move dst { .Some(s) => { s = \"replaced\" }, .None => {} }; view.len }\n" +
+            "fn main() { mut s := \"hello\" + \" world\"; _ := clash(.Some(&mut s), s.as_str()) }",
+            "E4003"),
+        ("s1_opt_mut_slice_alias",
+            "fn clash(dst: Option<&mut []i32>, view: &[]i32) -> i32 { match move dst { .Some(v) => { v.clear() }, .None => {} }; view.len }\n" +
+            "fn main() { mut v: []i32 = [1, 2, 3]; _ := clash(.Some(&mut v), &v[0..2]) }",
+            "E4003"),
+
+        // S-2: std.alloc opacity (E2006)
+        ("s2_alloc_ownedbuf_opaque",
+            "import std.alloc as alloc\n" +
+            "fn main() {\n" +
+            "    mut b := alloc.OwnedBuf<alloc.Global>::with_capacity(alloc.Global {}, usize(8)).unwrap()\n" +
+            "    b.len = usize(4096)\n" +
+            "}",
+            "E2006"),
+        ("s2_alloc_layout_opaque",
+            "import std.alloc as alloc\n" +
+            "fn main() {\n" +
+            "    mut l := alloc.Layout::bytes(usize(8)).unwrap()\n" +
+            "    l.size = usize(99)\n" +
+            "}",
+            "E2006"),
+
+        // S-3: &mut alias intra-expression aliasing
+        ("s3_mut_alias_call",
+            "fn grow(v: &mut []i32) -> i32 { for i in 0..32 { v.push(i) }; v.len }\n" +
+            "fn use_both(a: &i32, b: i32) -> i32 { a + b }\n" +
+            "fn bounce(r: &mut []i32) -> i32 { use_both(&r[0], grow(&mut r)) }\n" +
+            "fn main() { mut v: []i32 = [10]; _ := bounce(&mut v) }",
+            "E4003"),
+        ("s3_mut_alias_slice",
+            "fn grow(v: &mut []i32) -> i32 { for i in 0..32 { v.push(i) }; 1 }\n" +
+            "fn bounce(r: &mut []i32) -> i32 { sl := &r[0..grow(&mut r)]; sl.len }\n" +
+            "fn main() { mut v: []i32 = [10, 20]; _ := bounce(&mut v) }",
+            "E4003"),
+        ("s3_mut_alias_struct",
+            "struct Pair { a: &i32, b: i32 }\n" +
+            "fn grow(v: &mut []i32) -> i32 { for i in 0..32 { v.push(i) }; v.len }\n" +
+            "fn bounce(r: &mut []i32) -> i32 { p := Pair { a: &r[0], b: grow(&mut r) }; p.a + p.b }\n" +
+            "fn main() { mut v: []i32 = [10]; _ := bounce(&mut v) }",
+            "E4003"),
+
+        // S-4: temporary Iterator with stored borrow
+        ("s4_temp_graphemes_uaf",
+            "import std.text as text\n" +
+            "fn main() {\n" +
+            "    mut s := \"alpha\" + \"-beta\"\n" +
+            "    for g in text.graphemes(s.as_str()) {\n" +
+            "        s = \"overwritten\"\n" +
+            "        _ := g.as_str().len\n" +
+            "    }\n" +
+            "}",
+            "E4003"),
+        ("s4_temp_custom_iter_uaf",
+            "struct Cursor { items: &[]i32, idx: i32 }\n" +
+            "impl Iterator for Cursor {\n" +
+            "    fn next(&mut self) -> Option<&i32> from self.items {\n" +
+            "        if self.idx >= self.items.len { return .None }\n" +
+            "        i := self.idx; self.idx += 1\n" +
+            "        .Some(&self.items[i])\n" +
+            "    }\n" +
+            "}\n" +
+            "fn scan(xs: &[]i32) -> Cursor from xs { Cursor { items: xs, idx: 0 } }\n" +
+            "fn main() {\n" +
+            "    mut v: []i32 = [1, 2, 3]\n" +
+            "    for x in scan(&v) { v.clear(); _ := x }\n" +
+            "}",
+            "E4003"),
+
+        // S-5: defer early-exit use-after-move (return / ? / break / continue)
+        ("s5_defer_return_uam",
+            "fn run(flag: bool) {\n" +
+            "    mut s: []i32 = [1, 2, 3]\n" +
+            "    _ := move s\n" +
+            "    defer { _ := s[0] }\n" +
+            "    if flag { return }\n" +
+            "    s = [4, 5, 6]\n" +
+            "}\n" +
+            "fn main() { run(false); run(true) }",
+            "E4001"),
+        ("s5_defer_try_uam",
+            "fn might_fail(yes: bool) -> Result<i32, i32> { if yes { return .Err(1) }; .Ok(0) }\n" +
+            "fn run(yes: bool) -> Result<i32, i32> {\n" +
+            "    mut s: []i32 = [1, 2, 3]\n" +
+            "    _ := move s\n" +
+            "    defer { _ := s[0] }\n" +
+            "    _ := might_fail(yes)?\n" +
+            "    s = [4, 5, 6]\n" +
+            "    .Ok(0)\n" +
+            "}\n" +
+            "fn main() { _ := run(true) }",
+            "E4001"),
+        ("s5_defer_break_uam",
+            "fn main() {\n" +
+            "    for i in 0..2 {\n" +
+            "        mut s: []i32 = [1, 2, 3]\n" +
+            "        _ := move s\n" +
+            "        defer { _ := s[0] }\n" +
+            "        if i == 0 { break }\n" +
+            "        s = [4, 5, 6]\n" +
+            "    }\n" +
+            "}",
+            "E4001"),
+        ("s5_defer_continue_uam",
+            "fn main() {\n" +
+            "    for i in 0..2 {\n" +
+            "        mut s: []i32 = [1, 2, 3]\n" +
+            "        _ := move s\n" +
+            "        defer { _ := s[0] }\n" +
+            "        if i == 0 { continue }\n" +
+            "        s = [4, 5, 6]\n" +
+            "    }\n" +
+            "}",
+            "E4001"),
+
+        // S-6: &str == / != UAF
+        ("s6_str_eq_uaf",
+            "fn nuke(s: &mut string) -> &str from s { s = \"other\"; s.as_str() }\n" +
+            "fn main() {\n" +
+            "    mut s := \"hello\" + \"-world\"\n" +
+            "    _ := s.as_str() == nuke(&mut s)\n" +
+            "}",
+            "E4003"),
+        ("s6_str_ne_uaf",
+            "fn nuke(s: &mut string) -> &str from s { s = \"other\"; s.as_str() }\n" +
+            "fn main() {\n" +
+            "    mut s := \"hello\" + \"-world\"\n" +
+            "    _ := s.as_str() != nuke(&mut s)\n" +
+            "}",
+            "E4003"),
+
+        // S-9: @resource(dispose) safe destructuring
+        ("s9_destructure_dispose",
+            "@resource(dispose)\n" +
+            "struct Guard { id: i32 }\n" +
+            "impl Guard { fn dispose(&mut self) {} }\n" +
+            "fn main() {\n" +
+            "    g := Guard { id: 1 }\n" +
+            "    Guard { id } := move g\n" +
+            "    _ := id\n" +
+            "}",
+            "E4001"),
+
+        // S-10: Sendable / Sync / Published / task scope shared
+        ("s10_safe_sendable_resource",
+            "@resource(dispose)\n" +
+            "pub opaque struct Res { x: i32 }\n" +
+            "impl Res { fn dispose(&mut self) {} }\n" +
+            "impl Sendable for Res {}\n" +
+            "fn main() {}",
+            "E5001"),
+        ("s10_safe_sync_resource",
+            "@resource(dispose)\n" +
+            "pub opaque struct Res { x: i32 }\n" +
+            "impl Res { fn dispose(&mut self) {} }\n" +
+            "impl Sync for Res {}\n" +
+            "fn main() {}",
+            "E5001"),
+        ("s10_unsafe_impl_needs_cap",
+            "@resource(dispose)\n" +
+            "pub opaque struct Res { x: i32 }\n" +
+            "impl Res { fn dispose(&mut self) {} }\n" +
+            "unsafe impl Sendable for Res {}\n" +
+            "fn main() {}",
+            "E5001"),
+        ("s10_published_file_not_sync",
+            "capability filesystem\n" +
+            "import std.fs as fs\n" +
+            "import std.sync as sync\n" +
+            "fn bad(move f: fs.File) { _ := sync.Published<fs.File>::new(move f) }\n" +
+            "fn main() {}",
+            "E5004"),
+        ("s10_published_tcp_not_sync",
+            "capability network\n" +
+            "import std.net as net\n" +
+            "import std.sync as sync\n" +
+            "fn bad(move s: net.TcpStream) { _ := sync.Published<net.TcpStream>::new(move s) }\n" +
+            "fn main() {}",
+            "E5004"),
+        ("s10_shared_task_not_sync",
+            "capability unsafe\n" +
+            "@resource(dispose)\n" +
+            "pub opaque struct SendOnly { fd: i32 }\n" +
+            "impl SendOnly { fn dispose(&mut self) {} }\n" +
+            "unsafe impl Sendable for SendOnly {}\n" +
+            "struct Wrap { r: SendOnly }\n" +
+            "fn worker(n: i32, w: &Wrap) -> i32 { n + w.r.fd }\n" +
+            "fn main() {\n" +
+            "    w := Wrap { r: SendOnly { fd: 1 } }\n" +
+            "    task scope j(1, shared w) { _ := j.spawn(worker, 2) }\n" +
+            "}",
+            "E5004"),
+        ("s10_safe_opaque_ptr_rejected",
+            "opaque struct Bad { p: ptr }\n" +
+            "impl Sync for Bad {}\n" +
+            "fn main() {}",
+            "E5004"),
+
+        // S-11: Fn closure capturing non-Clone @resource
+        ("s11_fn_captures_resource",
+            "@resource(dispose)\n" +
+            "struct Token { id: i32 }\n" +
+            "impl Token { fn dispose(&mut self) {} }\n" +
+            "fn main() {\n" +
+            "    t := Token { id: 1 }\n" +
+            "    f := fn[t: Token]() -> i32 { t.id }\n" +
+            "    f2 := f.clone()\n" +
+            "    _ := f() + f2()\n" +
+            "}",
+            "E3099"),
+
+        // S-12: scratch borrow raw-address escape via closure (E4005)
+        ("s12_scratch_closure_escape",
+            "capability unsafe\n" +
+            "fn main() {\n" +
+            "    dummy := 0\n" +
+            "    unsafe {\n" +
+            "        mut escaped := ptr(0)\n" +
+            "        region scratch(256) {\n" +
+            "            mut a: []i32 = scratch.alloc(4)\n" +
+            "            a[0] = 42\n" +
+            "            f := fn[&dummy](p: &i32) -> ptr { unsafe { addr(&p) } }\n" +
+            "            escaped = f(&a[0])\n" +
+            "        }\n" +
+            "        _ := escaped\n" +
+            "    }\n" +
+            "}",
+            "E4005"),
+
+        // S-13: sys.net_close without unsafe
+        ("s13_sys_net_close_unsafe",
+            "capability network\n" +
+            "import sys\n" +
+            "fn main() { _ := sys.net_close(1) }",
+            "E5001"),
+
+        // Cliff 1 negative control: aliasing through match-moved &mut binding rejected
+        ("c1_match_move_mut_alias_rejected",
+            "fn clash(a: &mut []i32, b: &[]i32) -> i32 { a.push(1); b.len }\n" +
+            "fn main() {\n" +
+            "    mut xs: []i32 = [1, 2]\n" +
+            "    opt: Option<&mut []i32> = .Some(&mut xs)\n" +
+            "    match move opt {\n" +
+            "        .Some(m) => { _ := clash(&mut m, &m) },\n" +
+            "        .None => {},\n" +
+            "    }\n" +
+            "}",
+            "E4003"),
+
+        // NEW 1.0 Soundness Check 1: Variance/invariance `&mut Holder` smuggling
+        ("v10_invariance_mut_holder_smuggling",
+            "struct Holder { r: &i32 }\n" +
+            "fn main() {\n" +
+            "    outer := 1\n" +
+            "    mut h := Holder { r: &outer }\n" +
+            "    {\n" +
+            "        inner := 2\n" +
+            "        hm := &mut h\n" +
+            "        hm.r = &inner\n" +
+            "    }\n" +
+            "    _ := h.r\n" +
+            "}",
+            "E4003"),
+
+        // NEW 1.0 Soundness Check 2: dropck (`@resource(dispose)` holding `&T` outliving target)
+        ("v10_dropck_dispose_guard_dangling",
+            "@resource(dispose)\n" +
+            "struct Guard { r: &i32 }\n" +
+            "impl Guard { fn dispose(&mut self) { _ := self.r } }\n" +
+            "fn main() {\n" +
+            "    a := 1\n" +
+            "    mut g := Guard { r: &a }\n" +
+            "    b := 2\n" +
+            "    g = Guard { r: &b }\n" +
+            "}",
+            "E4003"),
+
+        // Non-lending Iterator enforcement
+        ("v10_lending_iterator_rejected",
+            "struct BadIter { items: &[]i32, idx: i32 }\n" +
+            "impl Iterator for BadIter {\n" +
+            "    fn next(&mut self) -> Option<&i32> from self {\n" +
+            "        if self.idx >= self.items.len { return .None }\n" +
+            "        .Some(&self.items[self.idx])\n" +
+            "    }\n" +
+            "}\n" +
+            "fn main() {}",
+            "E4003"),
+    ]
+}
+
+fn accepted_cases() -> [](string, string) {
+    [
+        // Cliff 1: match move Option<&mut []T> -> m.clear(), m.push(), bump(&mut m)
+        ("cliff1_match_move_opt_mut",
+            "fn bump(xs: &mut []i32) { xs.push(99) }\n" +
+            "fn main() {\n" +
+            "    mut xs: []i32 = [1, 2, 3]\n" +
+            "    opt: Option<&mut []i32> = .Some(&mut xs)\n" +
+            "    match move opt {\n" +
+            "        .Some(m) => {\n" +
+            "            m.clear()\n" +
+            "            m.push(42)\n" +
+            "            bump(&mut m)\n" +
+            "        },\n" +
+            "        .None => {},\n" +
+            "    }\n" +
+            "    assert(xs.len == 2)\n" +
+            "}"),
+
+        // Cliff 2: Struct field name after dead borrow released at last CFG use
+        ("cliff2_struct_field_after_dead_borrow",
+            "struct Foo { r: i32 }\n" +
+            "fn main() {\n" +
+            "    mut v: []i32 = [1, 2]\n" +
+            "    r := &v[0]\n" +
+            "    _ := r\n" +
+            "    v.push(3)\n" +
+            "    f := Foo { r: 1 }\n" +
+            "    _ := f.r\n" +
+            "}"),
+
+        // Cliff 3: Disjoint if/else branch (borrow used only in else -> mutation allowed in then!)
+        ("cliff3_disjoint_if_else_branch",
+            "fn main() {\n" +
+            "    mut v: []i32 = [1, 2]\n" +
+            "    r := &v[0]\n" +
+            "    c := true\n" +
+            "    if c {\n" +
+            "        v.push(3)\n" +
+            "    } else {\n" +
+            "        print(r)\n" +
+            "    }\n" +
+            "}"),
+
+        // Valid `mut r: &i32` rebinding (origin kill unlocks `a` immediately after `r = &b`)
+        ("ok_mut_ref_rebinding",
+            "fn main() {\n" +
+            "    mut a := 1\n" +
+            "    b := 2\n" +
+            "    mut r := &a\n" +
+            "    r = &b\n" +
+            "    a = 99\n" +
+            "    _ := r\n" +
+            "}"),
+
+        // Valid TwoPhaseMut (`v.push(v.len)`)
+        ("ok_two_phase_mut_push_len",
+            "fn main() {\n" +
+            "    mut v: []i32 = [1, 2]\n" +
+            "    v.push(v.len)\n" +
+            "}"),
+
+        // Valid generics, traits, closures, defer, region, task scope, may_dangle plain view
+        ("ok_generics_traits_closures_defer_region_task",
+            "pub opaque struct SafeBox { label: string, count: i32 }\n" +
+            "impl Sendable for SafeBox {}\n" +
+            "impl Sync for SafeBox {}\n" +
+            "struct PlainView { r: &i32 }\n" +
+            "fn id<T>(x: T) -> T { x }\n" +
+            "fn main() {\n" +
+            "    a := id(7)\n" +
+            "    s := id(\"ok\")\n" +
+            "    mut b := 10\n" +
+            "    mut pv := PlainView { r: &a }\n" +
+            "    pv = PlainView { r: &b }\n" +
+            "    f := fn[&a](k: i32) -> i32 { a + k }\n" +
+            "    _ := f(3)\n" +
+            "    defer { _ := s.len }\n" +
+            "    region scratch(128) {\n" +
+            "        mut tmp: []i32 = scratch.alloc(4)\n" +
+            "        tmp[0] = 1\n" +
+            "    }\n" +
+            "    box := SafeBox { label: \"x\", count: 1 }\n" +
+            "    task scope w(1, shared box) { _ := 1 }\n" +
+            "}"),
+    ]
+}
+
+fn main() -> i32 {
+    spec: []cli.Option = []
+    args := cli.parse(&spec)
+    compiler := cli.compiler(&args, "usage: test_check_v2 COMPILER")
+    if args.help { return 0 }
+    if compiler.len == 0 { return 2 }
+
+    tmp := fs.temp_dir("dunder-check-v2-")
+    if !tmp.ok { _ := harness.fail("cannot create check-v2 test directory"); return 1 }
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    mut checks := 0
+    neg := rejected_cases()
+    for i in 0..neg.len {
+        (name, source, expected_code) := neg[i].clone()
+        if !check_v2_rejected(compiler, work, name, source, expected_code, &mut checks) { return 1 }
+    }
+
+    pos := accepted_cases()
+    for i in 0..pos.len {
+        (name, source) := pos[i].clone()
+        if !check_v2_accepted(compiler, work, name, source, &mut checks) { return 1 }
+    }
+
+    // Verify --agent mode works cleanly with --check-v2
+    agent_path := f"{work}/agent_ok.ddr"
+    if !sys.write_text(agent_path, "fn main() { x := 1; _ := x }\n").ok {
+        _ := harness.fail("cannot write agent_ok.ddr"); return 1
+    }
+    mut agent_out := harness.empty_output()
+    if !harness.run_checked_timeout(compiler, ["check", "--check-v2", "--agent", agent_path, "--jobs", "1"], work, 0, false, 60000, &mut agent_out) {
+        _ := harness.fail("check --check-v2 --agent failed")
+        return 1
+    }
+    if !text.contains(agent_out.stdout_text(), "\"kind\":\"ok\"") && !text.contains(agent_out.stdout_text(), "\"kind\": \"ok\"") {
+        _ := harness.fail("check --check-v2 --agent missing ok json:\n" + agent_out.stdout_text())
+        return 1
+    }
+    checks += 1
+
+    print(f"check-v2 ok: {checks} end-to-end checks passed on {process.host_target()}")
+    0
+}

@@ -39,6 +39,8 @@ struct Builder {
     scope_stack: []i32,
     scope_owned_starts: []i32,
     scope_owned_locals: []i32,
+    scope_all_starts: []i32,
+    scope_all_locals: []i32,
     defers: []DeferInfo,
     loops: []LoopInfo,
     loop_defer_flags: []i32,
@@ -56,6 +58,7 @@ fn push_scope(b: &mut Builder, kind: mb.ScopeKind, cleanup_bb: i32, flag_local: 
     sid := mb.add_scope(&mut b.body, parent, kind, cleanup_bb, flag_local)
     b.scope_stack.push(sid)
     b.scope_owned_starts.push(b.scope_owned_locals.len)
+    b.scope_all_starts.push(b.scope_all_locals.len)
     sid
 }
 
@@ -64,6 +67,8 @@ fn pop_scope(b: &mut Builder) {
     _ := b.scope_stack.pop()
     start := b.scope_owned_starts.pop()
     while b.scope_owned_locals.len > start { _ := b.scope_owned_locals.pop() }
+    all_start := b.scope_all_starts.pop()
+    while b.scope_all_locals.len > all_start { _ := b.scope_all_locals.pop() }
 }
 
 fn new_temp(b: &mut Builder, types: &ht.TypeTable, ty: i32, start: i32, end: i32) -> i32 {
@@ -76,9 +81,15 @@ fn new_temp(b: &mut Builder, types: &ht.TypeTable, ty: i32, start: i32, end: i32
 
 fn register_owned_local(b: &mut Builder, types: &ht.TypeTable, loc: i32) {
     ty := b.body.locals[loc].ty
+    if ty >= 0 && ty < types.entries.len && types.entries[ty].kind == .MutRef { return }
     if !ht.is_copy(&types, ty) || ht.has_dispose(&types, ty) {
         b.scope_owned_locals.push(loc)
     }
+}
+
+fn register_scope_local(b: &mut Builder, types: &ht.TypeTable, loc: i32) {
+    b.scope_all_locals.push(loc)
+    register_owned_local(&mut b, &types, loc)
 }
 
 fn emit_goto(b: &mut Builder, target: i32, start: i32, end: i32) {
@@ -105,22 +116,51 @@ fn emit_unwind_to(b: &mut Builder, types: &ht.TypeTable, stop_depth: i32, final_
     while depth >= stop_depth {
         sid := b.scope_stack[depth]
         sc := b.body.scopes[sid]
-        // Drop owned locals declared in this scope in reverse declaration order.
+        // Drop and end storage of locals declared in this scope in reverse declaration order (LIFO).
+        all_start := b.scope_all_starts[depth]
+        all_end := if depth + 1 < b.scope_all_starts.len { b.scope_all_starts[depth + 1] } else { b.scope_all_locals.len }
+        mut ai := all_end - 1
+        while ai >= all_start {
+            loc := b.scope_all_locals[ai]
+            ty := b.body.locals[loc].ty
+            needs_drop := !(ty >= 0 && ty < types.entries.len && types.entries[ty].kind == .MutRef) &&
+                (!ht.is_copy(&types, ty) || ht.has_dispose(&types, ty))
+            if needs_drop {
+                pl := mb.add_local_place(&mut b.body, loc)
+                next_bb := mb.add_block(&mut b.body, sid)
+                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                    kind: .Drop, call_kind: .Direct, target_bb: next_bb, place_or_op: pl, callee: -1, sig_ty: -1,
+                    arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: start, span_end: end,
+                })
+                b.cur_bb = next_bb
+            }
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .StorageDead, place: loc, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe, span_start: start, span_end: end,
+            })
+            ai -= 1
+        }
+        // Also drop any owned temps registered directly via register_owned_local (not in scope_all_locals).
         own_start := b.scope_owned_starts[depth]
         own_end := if depth + 1 < b.scope_owned_starts.len { b.scope_owned_starts[depth + 1] } else { b.scope_owned_locals.len }
         mut oi := own_end - 1
         while oi >= own_start {
             loc := b.scope_owned_locals[oi]
-            pl := mb.add_local_place(&mut b.body, loc)
-            next_bb := mb.add_block(&mut b.body, sid)
-            _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
-                kind: .Drop, call_kind: .Direct, target_bb: next_bb, place_or_op: pl, callee: -1, sig_ty: -1,
-                arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: start, span_end: end,
-            })
-            b.cur_bb = next_bb
-            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
-                kind: .StorageDead, place: loc, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe, span_start: start, span_end: end,
-            })
+            mut already := false
+            for ci in all_start..all_end {
+                if b.scope_all_locals[ci] == loc { already = true; break }
+            }
+            if !already {
+                pl := mb.add_local_place(&mut b.body, loc)
+                next_bb := mb.add_block(&mut b.body, sid)
+                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                    kind: .Drop, call_kind: .Direct, target_bb: next_bb, place_or_op: pl, callee: -1, sig_ty: -1,
+                    arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: start, span_end: end,
+                })
+                b.cur_bb = next_bb
+                _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                    kind: .StorageDead, place: loc, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe, span_start: start, span_end: end,
+                })
+            }
             oi -= 1
         }
         if sc.kind == .TaskScope {
@@ -208,7 +248,8 @@ fn lower_place(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id: i32
 
 fn lower_expr_to_op(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id: i32) -> i32 {
     e := &f.exprs[expr_id]
-    if e.kind == .LitInt || e.kind == .LitBool || e.kind == .LitRune || e.kind == .LitByte || e.kind == .LitFloat {
+    if e.kind == .LitInt || e.kind == .LitBool || e.kind == .LitRune || e.kind == .LitByte || e.kind == .LitFloat ||
+        e.kind == .FnRef || e.kind == .ConstRef || e.kind == .Error {
         cid := mb.add_const(&mut b.body, e.ty, e.int_val, e.text)
         return mb.add_op(&mut b.body, .Const, cid)
     }
@@ -216,7 +257,7 @@ fn lower_expr_to_op(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id
         cid := mb.add_const(&mut b.body, e.ty, 0, e.text)
         return mb.add_op(&mut b.body, .Const, cid)
     }
-    if e.kind == .LocalRef || e.kind == .Field || e.kind == .Deref || e.kind == .Index {
+    if e.kind == .LocalRef || (e.kind == .Field && e.b >= 0) || e.kind == .Deref || e.kind == .Index {
         pl := lower_place(&mut b, &prog, &f, expr_id)
         if ht.is_copy(&prog.types, e.ty) { return mb.add_op(&mut b.body, .Copy, pl) }
         return mb.add_op(&mut b.body, .Move, pl)
@@ -234,6 +275,28 @@ fn lower_expr_to_op(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id
     else { mb.add_op(&mut b.body, .Move, pl) }
 }
 
+// Non-moving borrowed read operand (used for Binary ops like string `==`/`+` and SharedBorrow call args).
+fn lower_expr_to_read_op(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id: i32) -> i32 {
+    e := &f.exprs[expr_id]
+    if e.kind == .Move {
+        return lower_expr_to_op(&mut b, &prog, &f, expr_id)
+    }
+    if e.kind == .LocalRef || (e.kind == .Field && e.b >= 0) || e.kind == .Deref || e.kind == .Index {
+        pl := lower_place(&mut b, &prog, &f, expr_id)
+        return mb.add_op(&mut b.body, .Copy, pl)
+    }
+    lower_expr_to_op(&mut b, &prog, &f, expr_id)
+}
+
+fn param_is_shared_read(types: &ht.TypeTable, sig_ty: i32, arg_idx: i32) -> bool {
+    if sig_ty < 0 || sig_ty >= types.entries.len { return false }
+    p_cnt := ht.callable_param_count(&types, sig_ty)
+    if arg_idx < 0 || arg_idx >= p_cnt { return false }
+    p_start := ht.callable_param_start(&types, sig_ty)
+    m := types.params[p_start + arg_idx].mode
+    m == .SharedBorrow || m == .BorrowOrCopy
+}
+
 fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id: i32, dest_place: i32) {
     if b.terminated { return }
     e := &f.exprs[expr_id]
@@ -243,9 +306,19 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
 
     if e.kind == .LitInt || e.kind == .LitBool || e.kind == .LitStr || e.kind == .LitCStr ||
         e.kind == .LitWStr || e.kind == .LitRune || e.kind == .LitByte || e.kind == .LitFloat ||
-        e.kind == .LocalRef || e.kind == .Field || e.kind == .Deref || e.kind == .Index || e.kind == .Move {
+        e.kind == .FnRef || e.kind == .ConstRef || e.kind == .Error ||
+        e.kind == .LocalRef || (e.kind == .Field && e.b >= 0) || e.kind == .Deref || e.kind == .Index || e.kind == .Move {
         op := lower_expr_to_op(&mut b, &prog, &f, expr_id)
         rv := mb.add_rvalue(&mut b.body, .Use, e.ty, op, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: dest_place, rvalue: rv, aux: 0, in_unsafe: b.in_unsafe,
+            span_start: e.span_start, span_end: e.span_end,
+        })
+    } else if e.kind == .Field && e.b < 0 {
+        // Builtin `.len` on array/slice/string/str -> non-moving RvalueKind.Len read!
+        pl := lower_place(&mut b, &prog, &f, e.a)
+        op := mb.add_op(&mut b.body, .Copy, pl)
+        rv := mb.add_rvalue(&mut b.body, .Len, e.ty, op, -1, &empty_ops)
         _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
             kind: .Assign, place: dest_place, rvalue: rv, aux: 0, in_unsafe: b.in_unsafe,
             span_start: e.span_start, span_end: e.span_end,
@@ -262,8 +335,23 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         })
     } else if e.kind == .Slice || e.kind == .BytesView {
         target_pl := lower_place(&mut b, &prog, &f, e.a)
+        // If slicing with bound expressions, hold a live Shared borrow of target_pl while evaluating bounds (S-3!).
+        mut guard_op := -1
+        if e.kind == .Slice && e.arg_len > 0 {
+            guard_tmp := new_temp(&mut b, &prog.types, e.ty, e.span_start, e.span_end)
+            guard_pl := mb.add_local_place(&mut b.body, guard_tmp)
+            g_rel := b.body.blocks[b.cur_bb].stmt_end - b.body.blocks[b.cur_bb].stmt_start
+            g_ln := mb.add_loan(&mut b.body, target_pl, .Shared, b.cur_bb, g_rel, b.cur_region_scope, -1, e.span_start, e.span_end)
+            g_rv := mb.add_rvalue(&mut b.body, .Slice, e.ty, g_ln, -1, &empty_ops)
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .Assign, place: guard_pl, rvalue: g_rv, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: e.span_start, span_end: e.span_end,
+            })
+            guard_op = mb.add_op(&mut b.body, .Copy, guard_pl)
+        }
         mut ops: []i32 = []
         for i in 0..e.arg_len { ops.push(lower_expr_to_op(&mut b, &prog, &f, f.expr_list[e.arg_start + i])) }
+        if guard_op >= 0 { ops.push(guard_op) }
         rel := b.body.blocks[b.cur_bb].stmt_end - b.body.blocks[b.cur_bb].stmt_start
         ln := mb.add_loan(&mut b.body, target_pl, .Shared, b.cur_bb, rel, b.cur_region_scope, -1, e.span_start, e.span_end)
         rk: mb.RvalueKind = if e.kind == .Slice { .Slice } else { .BytesView }
@@ -283,8 +371,8 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         })
     } else if e.kind == .Binary {
         // Strict left-to-right: materialize LHS into a temp before evaluating RHS (fixes S-6!).
-        lhs_op := lower_expr_to_op(&mut b, &prog, &f, e.a)
-        rhs_op := lower_expr_to_op(&mut b, &prog, &f, e.b)
+        lhs_op := lower_expr_to_read_op(&mut b, &prog, &f, e.a)
+        rhs_op := lower_expr_to_read_op(&mut b, &prog, &f, e.b)
         rv := mb.add_rvalue(&mut b.body, .Binary, e.ty, lhs_op, rhs_op, &empty_ops)
         _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
             kind: .Assign, place: dest_place, rvalue: rv, aux: e.c, in_unsafe: b.in_unsafe,
@@ -338,16 +426,30 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
             })
             arg_ops.push(mb.add_op(&mut b.body, .Move, recv_tmp_pl))
             for i in 1..e.arg_len {
-                arg_ops.push(lower_expr_to_op(&mut b, &prog, &f, f.expr_list[e.arg_start + i]))
+                ae := f.expr_list[e.arg_start + i]
+                if param_is_shared_read(&prog.types, sig_ty, i) {
+                    arg_ops.push(lower_expr_to_read_op(&mut b, &prog, &f, ae))
+                } else {
+                    arg_ops.push(lower_expr_to_op(&mut b, &prog, &f, ae))
+                }
             }
         } else {
             if e.kind == .Call && e.c == 1 {
                 // Indirect call: e.a is callee expr!
                 call_kind = .Indirect
                 callee_id = lower_expr_to_op(&mut b, &prog, &f, e.a)
+            } else if e.kind == .Call && e.c == 2 {
+                call_kind = .Extern
+            } else if e.kind == .Call && e.c == 3 {
+                call_kind = .Intrinsic
             }
             for i in 0..e.arg_len {
-                arg_ops.push(lower_expr_to_op(&mut b, &prog, &f, f.expr_list[e.arg_start + i]))
+                ae := f.expr_list[e.arg_start + i]
+                if call_kind == .Intrinsic || param_is_shared_read(&prog.types, sig_ty, i) {
+                    arg_ops.push(lower_expr_to_read_op(&mut b, &prog, &f, ae))
+                } else {
+                    arg_ops.push(lower_expr_to_op(&mut b, &prog, &f, ae))
+                }
             }
         }
         if two_phase_loan >= 0 { b.body.loans[two_phase_loan].activate_bb = b.cur_bb }
@@ -363,7 +465,6 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         cond_op := lower_expr_to_op(&mut b, &prog, &f, e.a)
         then_bb := mb.add_block(&mut b.body, cur_scope(&b))
         else_bb := mb.add_block(&mut b.body, cur_scope(&b))
-        join_bb := mb.add_block(&mut b.body, cur_scope(&b))
         vals: []i64 = [1]
         bbs: []i32 = [then_bb]
         sw_start := mb.push_switch_targets(&mut b.body, &vals, &bbs)
@@ -374,18 +475,149 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         })
         b.cur_bb = then_bb; b.terminated = false
         lower_expr_into(&mut b, &prog, &f, e.b, dest_place)
-        emit_goto(&mut b, join_bb, e.span_start, e.span_end)
+        then_done := b.terminated
+        then_end_bb := b.cur_bb
 
         b.cur_bb = else_bb; b.terminated = false
         if e.c >= 0 { lower_expr_into(&mut b, &prog, &f, e.c, dest_place) }
-        emit_goto(&mut b, join_bb, e.span_start, e.span_end)
+        else_done := b.terminated
+        else_end_bb := b.cur_bb
 
-        b.cur_bb = join_bb; b.terminated = false
-    } else if e.kind == .Block {
-        lower_stmt(&mut b, &prog, &f, e.a)
-        if e.b >= 0 && !b.terminated {
-            lower_expr_into(&mut b, &prog, &f, e.b, dest_place)
+        if then_done && else_done {
+            b.terminated = true
+        } else {
+            join_bb := mb.add_block(&mut b.body, cur_scope(&b))
+            if !then_done {
+                b.cur_bb = then_end_bb; b.terminated = false
+                emit_goto(&mut b, join_bb, e.span_start, e.span_end)
+            }
+            if !else_done {
+                b.cur_bb = else_end_bb; b.terminated = false
+                emit_goto(&mut b, join_bb, e.span_start, e.span_end)
+            }
+            b.cur_bb = join_bb; b.terminated = false
         }
+    } else if e.kind == .Block {
+        lower_block_stmt_with_tail(&mut b, &prog, &f, e.a, e.b, dest_place)
+    } else if e.kind == .Match {
+        // e.a = subject expr, e.b = is_move (1/0), e.c = arm_count
+        // expr_list[arg_start + i*3 + 0..2] = (pat_id, guard_expr_id, body_expr_id)
+        mut subj_pl := -1
+        if e.b == 1 && f.exprs[e.a].kind == .Move {
+            // `match move x` -> evaluate into a fresh temp via Move so `x` is moved cleanly
+            subj_tmp := new_temp(&mut b, &prog.types, f.exprs[e.a].ty, e.span_start, e.span_end)
+            subj_pl = mb.add_local_place(&mut b.body, subj_tmp)
+            lower_expr_into(&mut b, &prog, &f, e.a, subj_pl)
+        } else {
+            subj_pl = lower_place(&mut b, &prog, &f, e.a)
+        }
+        subj_ty := b.body.places[subj_pl].ty
+        is_enum := subj_ty >= 0 && subj_ty < prog.types.entries.len && prog.types.entries[subj_ty].kind == .Enum
+        mut discr_op := -1
+        if is_enum {
+            discr_loc := new_temp(&mut b, &prog.types, ht.TY_I32, e.span_start, e.span_end)
+            discr_pl := mb.add_local_place(&mut b.body, discr_loc)
+            s_op := mb.add_op(&mut b.body, .Copy, subj_pl)
+            rv_d := mb.add_rvalue(&mut b.body, .Discriminant, ht.TY_I32, s_op, -1, &empty_ops)
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .Assign, place: discr_pl, rvalue: rv_d, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: e.span_start, span_end: e.span_end,
+            })
+            discr_op = mb.add_op(&mut b.body, .Copy, discr_pl)
+        }
+        join_bb := mb.add_block(&mut b.body, cur_scope(&b))
+        arm_count := e.c
+        for ai in 0..arm_count {
+            pat_id := f.expr_list[e.arg_start + ai * 3]
+            guard_e := f.expr_list[e.arg_start + ai * 3 + 1]
+            body_e := f.expr_list[e.arg_start + ai * 3 + 2]
+            arm_bb := mb.add_block(&mut b.body, cur_scope(&b))
+            next_arm_bb := if ai + 1 < arm_count { mb.add_block(&mut b.body, cur_scope(&b)) } else { join_bb }
+            pat := &f.pats[pat_id]
+            is_last_arm := ai + 1 >= arm_count
+            if is_last_arm && guard_e < 0 {
+                emit_goto(&mut b, arm_bb, pat.span_start, pat.span_end)
+            } else if is_enum && pat.kind == .Variant && discr_op >= 0 {
+                vals: []i64 = [i64(pat.tag)]
+                bbs: []i32 = [arm_bb]
+                sw := mb.push_switch_targets(&mut b.body, &vals, &bbs)
+                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                    kind: .SwitchInt, call_kind: .Direct, target_bb: next_arm_bb, place_or_op: discr_op,
+                    callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1,
+                    in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
+                })
+            } else if pat.kind == .Lit {
+                s_op := mb.add_op(&mut b.body, .Copy, subj_pl)
+                vals: []i64 = [i64(pat.tag)]
+                bbs: []i32 = [arm_bb]
+                sw := mb.push_switch_targets(&mut b.body, &vals, &bbs)
+                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                    kind: .SwitchInt, call_kind: .Direct, target_bb: next_arm_bb, place_or_op: s_op,
+                    callee: -1, sig_ty: -1, arg_start: sw, arg_len: 1,
+                    in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
+                })
+            } else {
+                emit_goto(&mut b, arm_bb, pat.span_start, pat.span_end)
+            }
+            b.cur_bb = arm_bb; b.terminated = false
+            sid := push_scope(&mut b, .Lexical, -1, -1)
+            arm_depth := b.scope_stack.len - 1
+            lower_pat_bind(&mut b, &prog, &f, pat_id, subj_pl, e.b == 1)
+            if guard_e >= 0 {
+                g_op := lower_expr_to_op(&mut b, &prog, &f, guard_e)
+                body_bb := mb.add_block(&mut b.body, sid)
+                g_fail_bb := mb.add_block(&mut b.body, sid)
+                g_vals: []i64 = [1]
+                g_bbs: []i32 = [body_bb]
+                g_sw := mb.push_switch_targets(&mut b.body, &g_vals, &g_bbs)
+                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                    kind: .SwitchInt, call_kind: .Direct, target_bb: g_fail_bb, place_or_op: g_op,
+                    callee: -1, sig_ty: -1, arg_start: g_sw, arg_len: 1,
+                    in_unsafe: b.in_unsafe, span_start: pat.span_start, span_end: pat.span_end,
+                })
+                b.cur_bb = g_fail_bb; b.terminated = false
+                emit_unwind_to(&mut b, &prog.types, arm_depth, next_arm_bb, pat.span_start, pat.span_end)
+                b.cur_bb = body_bb; b.terminated = false
+            }
+            if body_e >= 0 {
+                lower_expr_into(&mut b, &prog, &f, body_e, dest_place)
+            }
+            if !b.terminated {
+                emit_unwind_to(&mut b, &prog.types, arm_depth, join_bb, pat.span_start, pat.span_end)
+            }
+            pop_scope(&mut b)
+            b.cur_bb = next_arm_bb; b.terminated = false
+        }
+        if !b.terminated && b.cur_bb != join_bb {
+            emit_goto(&mut b, join_bb, e.span_start, e.span_end)
+        }
+        b.cur_bb = join_bb; b.terminated = false
+    } else if e.kind == .Replace {
+        // replace(place, new_val) -> old_val
+        target_pl := lower_place(&mut b, &prog, &f, e.a)
+        old_op := mb.add_op(&mut b.body, if ht.is_copy(&prog.types, e.ty) { .Copy } else { .Move }, target_pl)
+        rv_old := mb.add_rvalue(&mut b.body, .Use, e.ty, old_op, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: dest_place, rvalue: rv_old, aux: 0, in_unsafe: b.in_unsafe,
+            span_start: e.span_start, span_end: e.span_end,
+        })
+        lower_expr_into(&mut b, &prog, &f, e.b, target_pl)
+    } else if e.kind == .Swap {
+        pl_a := lower_place(&mut b, &prog, &f, e.a)
+        pl_b := lower_place(&mut b, &prog, &f, e.b)
+        aty := b.body.places[pl_a].ty
+        tmp := new_temp(&mut b, &prog.types, aty, e.span_start, e.span_end)
+        tmp_pl := mb.add_local_place(&mut b.body, tmp)
+        op_k: mb.OpKind = if ht.is_copy(&prog.types, aty) { .Copy } else { .Move }
+        op_a := mb.add_op(&mut b.body, op_k, pl_a)
+        rv_t := mb.add_rvalue(&mut b.body, .Use, aty, op_a, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt { kind: .Assign, place: tmp_pl, rvalue: rv_t, aux: 0, in_unsafe: b.in_unsafe, span_start: e.span_start, span_end: e.span_end })
+        op_b := mb.add_op(&mut b.body, op_k, pl_b)
+        rv_a := mb.add_rvalue(&mut b.body, .Use, aty, op_b, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt { kind: .Assign, place: pl_a, rvalue: rv_a, aux: 0, in_unsafe: b.in_unsafe, span_start: e.span_start, span_end: e.span_end })
+        op_t := mb.add_op(&mut b.body, op_k, tmp_pl)
+        rv_b := mb.add_rvalue(&mut b.body, .Use, aty, op_t, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt { kind: .Assign, place: pl_b, rvalue: rv_b, aux: 0, in_unsafe: b.in_unsafe, span_start: e.span_start, span_end: e.span_end })
     } else if e.kind == .Try {
         // Early-return `?` on Result/Option: unwinds all scopes LIFO on Err/None branch!
         sub_op := lower_expr_to_op(&mut b, &prog, &f, e.a)
@@ -439,6 +671,176 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
     b.in_unsafe = prev_unsafe
 }
 
+fn lower_pat_bind(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, pat_id: i32, subj_pl: i32, is_move: bool) {
+    if pat_id < 0 || pat_id >= f.pats.len { return }
+    pat := &f.pats[pat_id]
+    empty_ops: []i32 = []
+    if pat.kind == .Bind && pat.local_id >= 0 && pat.local_id < b.hir_to_mir.len {
+        ml := b.hir_to_mir[pat.local_id]
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .StorageLive, place: ml, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
+            span_start: pat.span_start, span_end: pat.span_end,
+        })
+        dst_pl := mb.add_local_place(&mut b.body, ml)
+        pty := b.body.places[subj_pl].ty
+        op_k: mb.OpKind = if (is_move || pat.is_move_bind) && !ht.is_copy(&prog.types, pty) { .Move } else if ht.is_copy(&prog.types, pty) { .Copy } else { .Move }
+        op := mb.add_op(&mut b.body, op_k, subj_pl)
+        rv := mb.add_rvalue(&mut b.body, .Use, pty, op, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: dst_pl, rvalue: rv, aux: 0, in_unsafe: b.in_unsafe,
+            span_start: pat.span_start, span_end: pat.span_end,
+        })
+        register_scope_local(&mut b, &prog.types, ml)
+    } else if pat.kind == .Variant {
+        subj_ty := b.body.places[subj_pl].ty
+        dc := mb.add_projected_place(&mut b.body, subj_pl, .Downcast, pat.tag, subj_ty)
+        for i in 0..pat.child_len {
+            cid := f.pat_list[pat.child_start + i]
+            pty := ht.variant_payload_type(&prog.types, subj_ty, pat.tag, i)
+            if pty >= 0 {
+                pay := mb.add_projected_place(&mut b.body, dc, .Field, i, pty)
+                lower_pat_bind(&mut b, &prog, &f, cid, pay, is_move)
+            }
+        }
+    } else if pat.kind == .Tuple {
+        subj_ty := b.body.places[subj_pl].ty
+        for i in 0..pat.child_len {
+            cid := f.pat_list[pat.child_start + i]
+            fty := ht.field_type(&prog.types, subj_ty, i)
+            if fty >= 0 {
+                fpl := mb.add_projected_place(&mut b.body, subj_pl, .Field, i, fty)
+                lower_pat_bind(&mut b, &prog, &f, cid, fpl, is_move)
+            }
+        }
+    } else if pat.kind == .Struct {
+        subj_ty := b.body.places[subj_pl].ty
+        for i in 0..pat.child_len {
+            cid := f.pat_list[pat.child_start + i]
+            fidx := f.pats[cid].tag
+            fty := ht.field_type(&prog.types, subj_ty, fidx)
+            if fty >= 0 {
+                fpl := mb.add_projected_place(&mut b.body, subj_pl, .Field, fidx, fty)
+                lower_pat_bind(&mut b, &prog, &f, cid, fpl, is_move)
+            }
+        }
+    }
+}
+
+fn lower_block_stmt_with_tail(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn,
+    stmt_id: i32, tail_expr_id: i32, dest_place: i32) {
+    if b.terminated || stmt_id < 0 || stmt_id >= f.stmts.len { return }
+    st := &f.stmts[stmt_id]
+    prev_unsafe := b.in_unsafe
+    if st.in_unsafe || st.kind == .UnsafeBlock { b.in_unsafe = true }
+
+    sid := push_scope(&mut b, .Lexical, -1, -1)
+    depth := b.scope_stack.len - 1
+    // Pre-allocate Defer flags (initialized to 0 at block entry for loop reset) & shared defer_bbs,
+    // while pushing each Defer scope AT its lexical statement position so LIFO drop order matches source!
+    mut block_defers: []i32 = []
+    for i in 0..st.stmt_len {
+        child_id := f.stmt_list[st.stmt_start + i]
+        if f.stmts[child_id].kind == .Defer {
+            flag_loc := mb.add_local(&mut b.body, &prog.types, "_defer_flag_" + b.defers.len.str(),
+                ht.TY_BOOL, sid, mb.LF_DEFER_FLAG.bit_or(mb.LF_MUT), st.span_start, st.span_end)
+            unwind_loc := mb.add_local(&mut b.body, &prog.types, "_defer_route_" + b.defers.len.str(),
+                ht.TY_I32, sid, mb.LF_TEMP.bit_or(mb.LF_MUT), st.span_start, st.span_end)
+            entry_bb := mb.add_block(&mut b.body, sid)
+            exit_bb := mb.add_block(&mut b.body, sid)
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .SetDeferActive, place: flag_loc, rvalue: -1, aux: 0,
+                in_unsafe: b.in_unsafe, span_start: st.span_start, span_end: st.span_end,
+            })
+            if b.loops.len > 0 { b.loop_defer_flags.push(flag_loc) }
+            di := b.defers.len
+            b.defers.push(DeferInfo {
+                scope_id: -1,
+                hir_stmt: child_id,
+                flag_local: flag_loc,
+                unwind_local: unwind_loc,
+                entry_bb: entry_bb,
+                exit_bb: exit_bb,
+                route_vals: [],
+                route_bbs: [],
+                loop_depth: b.loops.len,
+            })
+            block_defers.push(di)
+        }
+    }
+    for i in 0..st.stmt_len {
+        if b.terminated { break }
+        child_id := f.stmt_list[st.stmt_start + i]
+        if f.stmts[child_id].kind == .Defer {
+            for di_idx in 0..block_defers.len {
+                di := block_defers[di_idx]
+                if b.defers[di].hir_stmt == child_id {
+                    _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                        kind: .SetDeferActive, place: b.defers[di].flag_local, rvalue: -1, aux: 1,
+                        in_unsafe: b.in_unsafe, span_start: f.stmts[child_id].span_start, span_end: f.stmts[child_id].span_end,
+                    })
+                    d_sid := push_scope(&mut b, .Defer, b.defers[di].entry_bb, b.defers[di].flag_local)
+                    b.defers[di].scope_id = d_sid
+                    _ := push_scope(&mut b, .Lexical, -1, -1)
+                }
+            }
+        } else {
+            lower_stmt(&mut b, &prog, &f, child_id)
+        }
+    }
+    // Evaluate trailing block expression INSIDE the block scope BEFORE unwinding locals!
+    if tail_expr_id >= 0 && !b.terminated {
+        lower_expr_into(&mut b, &prog, &f, tail_expr_id, dest_place)
+    }
+    fell_through := !b.terminated
+    mut after_bb := -1
+    if fell_through {
+        after_bb = mb.add_block(&mut b.body, if b.scope_stack.len > 1 { b.scope_stack[depth - 1] } else { 0 })
+        emit_unwind_to(&mut b, &prog.types, depth, after_bb, st.span_start, st.span_end)
+    }
+    // Lower each shared defer_bb body ONCE and wire its SwitchInt exit to all collected routes!
+    for di_idx in 0..block_defers.len {
+        di := block_defers[di_idx]
+        saved_bb := b.cur_bb; saved_term := b.terminated
+        b.cur_bb = b.defers[di].entry_bb
+        b.terminated = false
+        d_stmt := &f.stmts[b.defers[di].hir_stmt]
+        for j in 0..d_stmt.stmt_len {
+            lower_stmt(&mut b, &prog, &f, f.stmt_list[d_stmt.stmt_start + j])
+        }
+        if !b.terminated { emit_goto(&mut b, b.defers[di].exit_bb, d_stmt.span_start, d_stmt.span_end) }
+        r_cnt := b.defers[di].route_bbs.len
+        if r_cnt == 0 {
+            _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
+                kind: .Return, call_kind: .Direct, target_bb: -1, place_or_op: -1, callee: -1, sig_ty: -1,
+                arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
+            })
+        } else if r_cnt == 1 {
+            _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
+                kind: .Goto, call_kind: .Direct, target_bb: b.defers[di].route_bbs[0], place_or_op: -1, callee: -1, sig_ty: -1,
+                arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
+            })
+        } else {
+            u_pl := mb.add_local_place(&mut b.body, b.defers[di].unwind_local)
+            u_op := mb.add_op(&mut b.body, .Copy, u_pl)
+            sw_start := mb.push_switch_targets(&mut b.body, &b.defers[di].route_vals, &b.defers[di].route_bbs)
+            _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
+                kind: .SwitchInt, call_kind: .Direct, target_bb: b.defers[di].route_bbs[0],
+                place_or_op: u_op, callee: -1, sig_ty: -1, arg_start: sw_start, arg_len: r_cnt,
+                in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
+            })
+        }
+        b.cur_bb = saved_bb; b.terminated = saved_term
+    }
+    while b.scope_stack.len > depth { pop_scope(&mut b) }
+    if fell_through {
+        b.cur_bb = after_bb
+        b.terminated = false
+    } else {
+        b.terminated = true
+    }
+    b.in_unsafe = prev_unsafe
+}
+
 fn lower_stmt(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, stmt_id: i32) {
     if b.terminated || stmt_id < 0 || stmt_id >= f.stmts.len { return }
     st := &f.stmts[stmt_id]
@@ -446,104 +848,7 @@ fn lower_stmt(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, stmt_id: i32)
     if st.in_unsafe { b.in_unsafe = true }
 
     if st.kind == .Block || st.kind == .UnsafeBlock {
-        if st.kind == .UnsafeBlock { b.in_unsafe = true }
-        sid := push_scope(&mut b, .Lexical, -1, -1)
-        depth := b.scope_stack.len - 1
-        // Pre-register any Defer statements directly in this block so their flags & shared defer_bbs exist.
-        mut block_defers: []i32 = []
-        for i in 0..st.stmt_len {
-            child_id := f.stmt_list[st.stmt_start + i]
-            if f.stmts[child_id].kind == .Defer {
-                flag_loc := mb.add_local(&mut b.body, &prog.types, "_defer_flag_" + b.defers.len.str(),
-                    ht.TY_BOOL, sid, mb.LF_DEFER_FLAG.bit_or(mb.LF_MUT), st.span_start, st.span_end)
-                unwind_loc := mb.add_local(&mut b.body, &prog.types, "_defer_route_" + b.defers.len.str(),
-                    ht.TY_I32, sid, mb.LF_TEMP.bit_or(mb.LF_MUT), st.span_start, st.span_end)
-                entry_bb := mb.add_block(&mut b.body, sid)
-                exit_bb := mb.add_block(&mut b.body, sid)
-                _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
-                    kind: .SetDeferActive, place: flag_loc, rvalue: -1, aux: 0,
-                    in_unsafe: b.in_unsafe, span_start: st.span_start, span_end: st.span_end,
-                })
-                if b.loops.len > 0 { b.loop_defer_flags.push(flag_loc) }
-                d_sid := push_scope(&mut b, .Defer, entry_bb, flag_loc)
-                di := b.defers.len
-                b.defers.push(DeferInfo {
-                    scope_id: d_sid,
-                    hir_stmt: child_id,
-                    flag_local: flag_loc,
-                    unwind_local: unwind_loc,
-                    entry_bb: entry_bb,
-                    exit_bb: exit_bb,
-                    route_vals: [],
-                    route_bbs: [],
-                    loop_depth: b.loops.len,
-                })
-                block_defers.push(di)
-            }
-        }
-        for i in 0..st.stmt_len {
-            if b.terminated { break }
-            child_id := f.stmt_list[st.stmt_start + i]
-            if f.stmts[child_id].kind == .Defer {
-                // Activate this defer at its lexical statement position!
-                for di_idx in 0..block_defers.len {
-                    di := block_defers[di_idx]
-                    if b.defers[di].hir_stmt == child_id {
-                        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
-                            kind: .SetDeferActive, place: b.defers[di].flag_local, rvalue: -1, aux: 1,
-                            in_unsafe: b.in_unsafe, span_start: f.stmts[child_id].span_start, span_end: f.stmts[child_id].span_end,
-                        })
-                    }
-                }
-            } else {
-                lower_stmt(&mut b, &prog, &f, child_id)
-            }
-        }
-        after_bb := mb.add_block(&mut b.body, if b.scope_stack.len > 1 { b.scope_stack[depth - 1] } else { 0 })
-        if !b.terminated {
-            emit_unwind_to(&mut b, &prog.types, depth, after_bb, st.span_start, st.span_end)
-        }
-        // Now lower each shared defer_bb body ONCE and wire its SwitchInt exit to all collected routes!
-        for di_idx in 0..block_defers.len {
-            di := block_defers[di_idx]
-            saved_bb := b.cur_bb; saved_term := b.terminated
-            b.cur_bb = b.defers[di].entry_bb
-            b.terminated = false
-            d_stmt := &f.stmts[b.defers[di].hir_stmt]
-            for j in 0..d_stmt.stmt_len {
-                lower_stmt(&mut b, &prog, &f, f.stmt_list[d_stmt.stmt_start + j])
-            }
-            if !b.terminated { emit_goto(&mut b, b.defers[di].exit_bb, d_stmt.span_start, d_stmt.span_end) }
-            // Wire SwitchInt in exit_bb
-            r_cnt := b.defers[di].route_bbs.len
-            if r_cnt == 0 {
-                _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
-                    kind: .Goto, call_kind: .Direct, target_bb: after_bb, place_or_op: -1, callee: -1, sig_ty: -1,
-                    arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
-                })
-            } else if r_cnt == 1 {
-                _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
-                    kind: .Goto, call_kind: .Direct, target_bb: b.defers[di].route_bbs[0], place_or_op: -1, callee: -1, sig_ty: -1,
-                    arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
-                })
-            } else {
-                u_pl := mb.add_local_place(&mut b.body, b.defers[di].unwind_local)
-                u_op := mb.add_op(&mut b.body, .Copy, u_pl)
-                sw_start := mb.push_switch_targets(&mut b.body, &b.defers[di].route_vals, &b.defers[di].route_bbs)
-                _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
-                    kind: .SwitchInt, call_kind: .Direct, target_bb: b.defers[di].route_bbs[0],
-                    place_or_op: u_op, callee: -1, sig_ty: -1, arg_start: sw_start, arg_len: r_cnt,
-                    in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
-                })
-            }
-            b.cur_bb = saved_bb; b.terminated = saved_term
-        }
-        while b.scope_stack.len > depth { pop_scope(&mut b) }
-        if b.terminated {
-            // Check if after_bb was targeted by any path
-            b.cur_bb = after_bb
-            b.terminated = false
-        }
+        lower_block_stmt_with_tail(&mut b, &prog, &f, stmt_id, -1, -1)
     } else if st.kind == .Let {
         ml := b.hir_to_mir[st.local_id]
         _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
@@ -552,7 +857,7 @@ fn lower_stmt(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, stmt_id: i32)
         })
         pl := mb.add_local_place(&mut b.body, ml)
         if st.expr_a >= 0 { lower_expr_into(&mut b, &prog, &f, st.expr_a, pl) }
-        register_owned_local(&mut b, &prog.types, ml)
+        register_scope_local(&mut b, &prog.types, ml)
     } else if st.kind == .Assign {
         lhs_pl := lower_place(&mut b, &prog, &f, st.expr_a)
         lower_expr_into(&mut b, &prog, &f, st.expr_b, lhs_pl)
@@ -730,6 +1035,78 @@ fn lower_stmt(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, stmt_id: i32)
         emit_unwind_to(&mut b, &prog.types, depth, after_bb, st.span_start, st.span_end)
         pop_scope(&mut b)
         b.cur_bb = after_bb; b.terminated = false
+    } else if st.kind == .ForRange {
+        sid := push_scope(&mut b, .Lexical, -1, -1)
+        depth := b.scope_stack.len - 1
+        mut idx_loc := -1
+        mut idx_ty := ht.TY_I32
+        if st.local_id >= 0 && st.local_id < b.hir_to_mir.len {
+            idx_loc = b.hir_to_mir[st.local_id]
+            idx_ty = b.body.locals[idx_loc].ty
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .StorageLive, place: idx_loc, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: st.span_start, span_end: st.span_end,
+            })
+        } else {
+            idx_loc = new_temp(&mut b, &prog.types, ht.TY_I32, st.span_start, st.span_end)
+        }
+        idx_pl := mb.add_local_place(&mut b.body, idx_loc)
+        if st.expr_a >= 0 { lower_expr_into(&mut b, &prog, &f, st.expr_a, idx_pl) }
+        end_tmp := new_temp(&mut b, &prog.types, idx_ty, st.span_start, st.span_end)
+        end_pl := mb.add_local_place(&mut b.body, end_tmp)
+        if st.expr_b >= 0 { lower_expr_into(&mut b, &prog, &f, st.expr_b, end_pl) }
+        register_scope_local(&mut b, &prog.types, idx_loc)
+
+        head_bb := mb.add_block(&mut b.body, sid)
+        body_bb := mb.add_block(&mut b.body, sid)
+        step_bb := mb.add_block(&mut b.body, sid)
+        exit_bb := mb.add_block(&mut b.body, sid)
+        emit_goto(&mut b, head_bb, st.span_start, st.span_end)
+
+        b.cur_bb = head_bb; b.terminated = false
+        cond_tmp := new_temp(&mut b, &prog.types, ht.TY_BOOL, st.span_start, st.span_end)
+        cond_pl := mb.add_local_place(&mut b.body, cond_tmp)
+        empty_ops: []i32 = []
+        lhs_op := mb.add_op(&mut b.body, .Copy, idx_pl)
+        rhs_op := mb.add_op(&mut b.body, .Copy, end_pl)
+        rv_cmp := mb.add_rvalue(&mut b.body, .Binary, ht.TY_BOOL, lhs_op, rhs_op, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: cond_pl, rvalue: rv_cmp, aux: 10, in_unsafe: b.in_unsafe,
+            span_start: st.span_start, span_end: st.span_end,
+        })
+        c_op := mb.add_op(&mut b.body, .Copy, cond_pl)
+        vals: []i64 = [1]
+        bbs: []i32 = [body_bb]
+        sw_start := mb.push_switch_targets(&mut b.body, &vals, &bbs)
+        _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+            kind: .SwitchInt, call_kind: .Direct, target_bb: exit_bb, place_or_op: c_op,
+            callee: -1, sig_ty: -1, arg_start: sw_start, arg_len: 1,
+            in_unsafe: b.in_unsafe, span_start: st.span_start, span_end: st.span_end,
+        })
+
+        b.loops.push(LoopInfo { continue_bb: step_bb, break_bb: exit_bb, scope_depth: b.scope_stack.len, defer_flags_start: b.loop_defer_flags.len })
+        b.cur_bb = body_bb; b.terminated = false
+        for i in 0..st.stmt_len { lower_stmt(&mut b, &prog, &f, f.stmt_list[st.stmt_start + i]) }
+        if !b.terminated { emit_goto(&mut b, step_bb, st.span_start, st.span_end) }
+        lp := b.loops.pop()
+        while b.loop_defer_flags.len > lp.defer_flags_start { _ := b.loop_defer_flags.pop() }
+
+        b.cur_bb = step_bb; b.terminated = false
+        one_c := mb.add_const(&mut b.body, idx_ty, 1, "")
+        one_op := mb.add_op(&mut b.body, .Const, one_c)
+        cur_op := mb.add_op(&mut b.body, .Copy, idx_pl)
+        rv_inc := mb.add_rvalue(&mut b.body, .Binary, idx_ty, cur_op, one_op, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: idx_pl, rvalue: rv_inc, aux: 1, in_unsafe: b.in_unsafe,
+            span_start: st.span_start, span_end: st.span_end,
+        })
+        emit_goto(&mut b, head_bb, st.span_start, st.span_end)
+
+        b.cur_bb = exit_bb; b.terminated = false
+        after_bb := mb.add_block(&mut b.body, b.scope_stack[depth - 1])
+        emit_unwind_to(&mut b, &prog.types, depth, after_bb, st.span_start, st.span_end)
+        pop_scope(&mut b)
+        b.cur_bb = after_bb; b.terminated = false
     } else if st.kind == .Break {
         if b.loops.len > 0 {
             lp := b.loops[b.loops.len - 1]
@@ -772,6 +1149,8 @@ pub fn build_body(prog: &hb.HirProgram, fn_id: i32, diags: &mut []diag.Diagnosti
         scope_stack: [0],
         scope_owned_starts: [0],
         scope_owned_locals: [],
+        scope_all_starts: [0],
+        scope_all_locals: [],
         defers: [],
         loops: [],
         loop_defer_flags: [],

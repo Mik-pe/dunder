@@ -1,0 +1,3487 @@
+// HIR Lowering: lossless AST (`ast.Module`) -> typed HIR (`hb.HirProgram`).
+// Performs module/import resolution, type & generic-type lowering into sealed TypeTable,
+// trait & concurrency contract validation (non-lending Iterator, safe/unsafe Sendable/Sync,
+// Published<T: Sendable + Sync>, task scope shared Sync), opaque struct sealing (E2006),
+// capability & unsafe gating (E5001/E5002), closure env lowering (S-11 E3099, PARAM_ENV),
+// and full expression/statement/pattern lowering for mir2.
+
+import ..frontend.ast as ast
+import ..frontend.diagnostics as diag
+import hir_types as ht
+import hir_body as hb
+
+// Capability bitmask constants matching selfhost/driver/modules.ddr
+const CAP_FILESYSTEM: i32 = 1
+const CAP_NETWORK: i32    = 2
+const CAP_PROCESS: i32    = 4
+const CAP_STDIO: i32      = 8
+const CAP_UNSAFE: i32     = 16
+
+// Internal descriptor for a declared Struct / Union / Enum / ExternType / TypeAlias / Trait
+enum DefKind { Struct, Union, Enum, ExternType, TypeAlias, Trait }
+
+struct TypeDef {
+    kind: DefKind,
+    mod_id: i32,
+    item_idx: i32,
+    name: string,
+    is_pub: bool,
+    is_opaque: bool,
+    flags: i64,
+    gen_count: i32,
+    concrete_ty: i32,      // >= 0 for non-generic concrete types or pre-interned shells
+    alias_target_ty: i32,  // for TypeAlias
+    has_clone: bool,
+    has_dispose_method: bool,
+}
+
+struct InstCacheEntry {
+    def_id: i32,
+    arg_key: string,
+    ty_id: i32,
+}
+
+struct FnDef {
+    mod_id: i32,
+    item_idx: i32,          // Item index in mod.ast.items (or Impl item index for methods)
+    member_idx: i32,        // -1 for free/extern fn; >= 0 for impl/trait method
+    name: string,
+    owner_def: i32,         // -1 for free fn, else TypeDef id for inherent/trait impl method
+    trait_name: string,     // "" for free/inherent fn, else trait name (e.g. "Iterator", "Clone")
+    is_pub: bool,
+    is_unsafe: bool,
+    is_extern: bool,
+    is_generic: bool,
+    requires_caps: i32,
+    hir_fn_id: i32,         // index in prog.fns (-1 if not lowered yet)
+    owner_ty: i32,          // concrete Self TypeId if non-generic impl
+    recv_kind: ast.ReceiverKind,
+}
+
+struct ConstDef {
+    mod_id: i32,
+    item_idx: i32,
+    name: string,
+    is_pub: bool,
+    ty: i32,
+    int_val: i64,
+    text_val: string,
+}
+
+struct SendSyncImpl {
+    mod_id: i32,
+    item_idx: i32,
+    trait_name: string,     // "Sendable" or "Sync"
+    target_def: i32,
+    is_unsafe: bool,
+    has_where: bool,
+    span_start: i32,
+    span_end: i32,
+}
+
+struct TypeParamBinding {
+    name: string,
+    ty: i32,
+}
+
+struct LocalScopeEntry {
+    name: string,
+    local_id: i32,
+    ty: i32,
+    is_mut: bool,
+    is_region: bool,
+    is_task_scope: bool,
+    depth: i32,
+}
+
+struct LowerCtx {
+    prog: hb.HirProgram,
+    platform: i32,
+    type_defs: []TypeDef,
+    inst_cache: []InstCacheEntry,
+    fn_defs: []FnDef,
+    const_defs: []ConstDef,
+    send_sync_impls: []SendSyncImpl,
+    // Generic parameter type bindings during type/body lowering
+    tp_stack: []TypeParamBinding,
+    self_ty: i32,
+    // Well-known builtin/prelude TypeDef IDs
+    opt_def: i32,
+    res_def: i32,
+    map_def: i32,
+    set_def: i32,
+    task_def: i32,
+    // Sentinel types for region handle and task scope handle
+    region_handle_ty: i32,
+    task_scope_handle_ty: i32,
+    // Per-function body lowering state
+    cur_mod: i32,
+    cur_ret_ty: i32,
+    cur_in_unsafe: bool,
+    cur_scope_depth: i32,
+    locals_env: []LocalScopeEntry,
+    // Pending closure bodies collected while lowering a function
+    pending_closures: []hb.HirFn,
+    closure_counter: i32,
+    // Synthetic intrinsic/builtin fn IDs
+    next_intrinsic_id: i32,
+}
+
+// =========================================================================
+// Small self-contained string/int/capability utilities
+// =========================================================================
+
+fn cap_bit(name: string) -> i32 {
+    if name == "filesystem" { return CAP_FILESYSTEM }
+    if name == "network" { return CAP_NETWORK }
+    if name == "process" { return CAP_PROCESS }
+    if name == "stdio" { return CAP_STDIO }
+    if name == "unsafe" { return CAP_UNSAFE }
+    0
+}
+
+fn parse_i64_lit(s: string) -> i64 {
+    if s.len == 0 { return 0 }
+    mut neg := false
+    mut i := 0
+    if s[0] == 45 { neg = true; i = 1 }
+    mut base: i64 = 10
+    if i + 1 < s.len && s[i] == 48 && (s[i + 1] == 120 || s[i + 1] == 88) {
+        base = 16; i += 2
+    } else if i + 1 < s.len && s[i] == 48 && (s[i + 1] == 98 || s[i + 1] == 66) {
+        base = 2; i += 2
+    }
+    max_v: i64 = 9223372036854775807
+    mut acc: i64 = 0
+    while i < s.len {
+        c := i32(s[i])
+        if c == 95 { i += 1; continue }
+        mut d: i64 = -1
+        if c >= 48 && c <= 57 { d = i64(c - 48) }
+        else if c >= 97 && c <= 102 { d = i64(c - 97 + 10) }
+        else if c >= 65 && c <= 70 { d = i64(c - 65 + 10) }
+        else { break }
+        if d >= base { break }
+        if acc > (max_v - d) / base {
+            acc = max_v
+        } else {
+            acc = acc * base + d
+        }
+        i += 1
+    }
+    if neg { -acc } else { acc }
+}
+
+fn clamp_i32(v: i64) -> i32 {
+    if v > 2147483647 { return 2147483647 }
+    if v < -2147483647 { return -2147483647 }
+    i32(v)
+}
+
+fn split_dot_left(s: string) -> string {
+    for i in 0..s.len {
+        if s[i] == 46 { return s[0..i] }
+    }
+    ""
+}
+
+fn split_dot_right(s: string) -> string {
+    for i in 0..s.len {
+        if s[i] == 46 { return s[(i + 1)..s.len] }
+    }
+    s.clone()
+}
+
+fn has_dot(s: string) -> bool {
+    for i in 0..s.len {
+        if s[i] == 46 { return true }
+    }
+    false
+}
+
+fn strip_generic_suffix(s: string) -> string {
+    for i in 0..s.len {
+        if s[i] == 60 { return s[0..i] }
+    }
+    s.clone()
+}
+
+fn emit_err(ctx: &mut LowerCtx, mod_id: i32, code: string, start: i32, end: i32, msg: string) {
+    path := if mod_id >= 0 && mod_id < ctx.prog.mod_paths.len { ctx.prog.mod_paths[mod_id].clone() } else { "" }
+    hb.push_error(&mut ctx.prog.diagnostics, code, path, start, end, msg)
+    ctx.prog.ok = false
+}
+
+fn mod_has_cap(ctx: &LowerCtx, mod_id: i32, bit: i32) -> bool {
+    if mod_id < 0 || mod_id >= ctx.prog.mod_caps.len { return false }
+    ctx.prog.mod_caps[mod_id].bit_and(bit) != 0
+}
+
+fn resolve_import_mod(imports: &[]hb.ImportEdge, owner_mod: i32, alias: string) -> i32 {
+    for i in 0..imports.len {
+        if imports[i].owner_mod == owner_mod && imports[i].alias == alias {
+            return imports[i].target_mod
+        }
+    }
+    if alias == "sys" { return -2 }
+    -1
+}
+
+fn has_sys_import(mods: &[]hb.ModuleInput, mod_id: i32) -> bool {
+    if mod_id < 0 || mod_id >= mods.len { return false }
+    m := &mods[mod_id].ast
+    for i in 0..m.items.len {
+        it := &m.items[i]
+        if it.kind == .Import && (it.name == "sys" || it.target_name == "sys") {
+            return true
+        }
+    }
+    false
+}
+
+fn is_unsafe_sys_fn(name: string) -> bool {
+    name == "net_close" || name == "net_read" || name == "net_write" || name == "net_poll" ||
+    name == "fd_close" || name == "fd_read" || name == "fd_write" || name == "fd_poll" ||
+    name == "fd_set_nonblocking" || name == "envp" || name == "linux_syscall" ||
+    name == "memory_copy" || name == "memory_equal" || name == "memory_zero" ||
+    name == "atomic_load_i64" || name == "atomic_store_i64" || name == "atomic_cas_i64" || name == "atomic_fetch_add_i64" ||
+    name == "pool_alloc_try" || name == "pool_free" ||
+    name == "alloc" || name == "dealloc" || name == "realloc" || name == "memcpy" ||
+    name == "memmove" || name == "memset" || name == "dlopen" || name == "dlsym" || name == "dlclose"
+}
+
+fn sys_fn_ret_ty(ctx: &mut LowerCtx, name: string) -> i32 {
+    if name == "arg" || name == "error_message" || name == "env" { return ht.TY_STRING }
+    if name == "arg_count" || name == "pid" || name == "net_close" || name == "fd_close" { return ht.TY_I32 }
+    if name == "now_ms" || name == "fd_read" || name == "fd_write" || name == "net_read" || name == "net_write" { return ht.TY_I64 }
+    if name == "same_file" { return ht.TY_BOOL }
+    if name == "alloc" || name == "realloc" || name == "dlopen" || name == "dlsym" { return ht.TY_PTR }
+    if name == "sleep_ms" || name == "exit" || name == "dealloc" { return ht.TY_UNIT }
+    ht.TY_I32
+}
+
+fn is_primitive_type_name(name: string) -> i32 {
+    if name == "()" || name == "void" { return ht.TY_UNIT }
+    if name == "bool" { return ht.TY_BOOL }
+    if name == "i8" { return ht.TY_I8 }
+    if name == "i16" { return ht.TY_I16 }
+    if name == "i32" { return ht.TY_I32 }
+    if name == "i64" { return ht.TY_I64 }
+    if name == "isize" { return ht.TY_ISIZE }
+    if name == "u8" { return ht.TY_U8 }
+    if name == "u16" { return ht.TY_U16 }
+    if name == "u32" { return ht.TY_U32 }
+    if name == "u64" { return ht.TY_U64 }
+    if name == "usize" { return ht.TY_USIZE }
+    if name == "f32" { return ht.TY_F32 }
+    if name == "f64" { return ht.TY_F64 }
+    if name == "rune" { return ht.TY_RUNE }
+    if name == "ptr" { return ht.TY_PTR }
+    if name == "string" { return ht.TY_STRING }
+    if name == "range" { return ht.TY_RANGE }
+    if name == "CStr" { return ht.TY_CSTR }
+    if name == "WStr" { return ht.TY_WSTR }
+    -1
+}
+
+fn is_int_ty(ty: i32) -> bool {
+    ty == ht.TY_I8 || ty == ht.TY_I16 || ty == ht.TY_I32 || ty == ht.TY_I64 || ty == ht.TY_ISIZE ||
+    ty == ht.TY_U8 || ty == ht.TY_U16 || ty == ht.TY_U32 || ty == ht.TY_U64 || ty == ht.TY_USIZE
+}
+
+fn is_float_ty(ty: i32) -> bool {
+    ty == ht.TY_F32 || ty == ht.TY_F64
+}
+
+fn binop_code(op: string) -> i32 {
+    if op == "+" { return 1 }
+    if op == "-" { return 2 }
+    if op == "*" { return 3 }
+    if op == "/" { return 4 }
+    if op == "%" { return 5 }
+    if op == "==" { return 6 }
+    if op == "!=" { return 7 }
+    if op == "<" { return 10 }
+    if op == "<=" { return 11 }
+    if op == ">" { return 12 }
+    if op == ">=" { return 13 }
+    if op == "&&" { return 14 }
+    if op == "||" { return 15 }
+    0
+}
+
+fn is_cmp_op(op: string) -> bool {
+    op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "&&" || op == "||"
+}
+
+fn lookup_tp(ctx: &LowerCtx, name: string) -> i32 {
+    mut i := ctx.tp_stack.len - 1
+    while i >= 0 {
+        if ctx.tp_stack[i].name == name { return ctx.tp_stack[i].ty }
+        i -= 1
+    }
+    -1
+}
+
+fn find_type_def_in_mod(ctx: &LowerCtx, mod_id: i32, name: string) -> i32 {
+    for i in 0..ctx.type_defs.len {
+        if ctx.type_defs[i].mod_id == mod_id && ctx.type_defs[i].name == name { return i }
+    }
+    -1
+}
+
+fn find_type_def_by_name(ctx: &LowerCtx, imports: &[]hb.ImportEdge, cur_mod: i32, raw_name: string) -> i32 {
+    if has_dot(raw_name) {
+        alias := split_dot_left(raw_name)
+        item_name := split_dot_right(raw_name)
+        tmod := resolve_import_mod(&imports, cur_mod, alias)
+        if tmod >= 0 {
+            return find_type_def_in_mod(&ctx, tmod, item_name)
+        }
+        return -1
+    }
+    local := find_type_def_in_mod(&ctx, cur_mod, raw_name)
+    if local >= 0 { return local }
+    if raw_name == "Option" { return ctx.opt_def }
+    if raw_name == "Result" { return ctx.res_def }
+    if raw_name == "Map" { return ctx.map_def }
+    if raw_name == "Set" { return ctx.set_def }
+    if raw_name == "Task" { return ctx.task_def }
+    -1
+}
+
+fn find_type_def_for_ty(ctx: &LowerCtx, ty: i32) -> i32 {
+    if ty < 0 || ty >= ctx.prog.types.entries.len { return -1 }
+    for i in 0..ctx.type_defs.len {
+        if ctx.type_defs[i].concrete_ty == ty { return i }
+    }
+    for i in 0..ctx.inst_cache.len {
+        if ctx.inst_cache[i].ty_id == ty { return ctx.inst_cache[i].def_id }
+    }
+    // Also match by owner_mod + base name
+    e := &ctx.prog.types.entries[ty]
+    base := strip_generic_suffix(e.name)
+    for i in 0..ctx.type_defs.len {
+        if ctx.type_defs[i].mod_id == e.owner_mod && ctx.type_defs[i].name == base { return i }
+    }
+    -1
+}
+
+fn find_field_idx(t: &ht.TypeTable, ty: i32, fname: string) -> i32 {
+    if ty < 0 || ty >= t.entries.len { return -1 }
+    e := &t.entries[ty]
+    if e.kind != .Struct && e.kind != .Union && e.kind != .Tuple && e.kind != .ClosureEnv { return -1 }
+    for i in 0..e.count {
+        if t.fields[e.inner_a + i].name == fname { return i }
+    }
+    -1
+}
+
+fn find_variant_idx(t: &ht.TypeTable, ty: i32, vname: string) -> i32 {
+    if ty < 0 || ty >= t.entries.len { return -1 }
+    e := &t.entries[ty]
+    if e.kind != .Enum { return -1 }
+    for i in 0..e.count {
+        if t.variants[e.inner_a + i].name == vname { return i }
+    }
+    -1
+}
+
+fn peel_ref(t: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= t.entries.len { return ty }
+    k := t.entries[ty].kind
+    if k == .Ref || k == .MutRef { return t.entries[ty].inner_a }
+    ty
+}
+
+fn is_type_cloneable(ctx: &LowerCtx, ty: i32) -> bool {
+    if ty < 0 || ty >= ctx.prog.types.entries.len { return true }
+    if ht.is_copy(&ctx.prog.types, ty) { return true }
+    e := &ctx.prog.types.entries[ty]
+    if e.kind == .String || e.kind == .Array { return true }
+    if e.kind == .ClosureEnv {
+        // Borrowed shared Fn is Copy (handled above); owned ClosureEnv is cloneable iff all captures are cloneable
+        for i in 0..e.count {
+            if !is_type_cloneable(&ctx, ctx.prog.types.fields[e.inner_a + i].ty) { return false }
+        }
+        return true
+    }
+    def_id := find_type_def_for_ty(&ctx, ty)
+    if def_id >= 0 && ctx.type_defs[def_id].has_clone { return true }
+    if ht.has_flag(&ctx.prog.types, ty, ht.TF_RESOURCE) || ht.has_flag(&ctx.prog.types, ty, ht.TF_DISPOSE) {
+        return false
+    }
+    if e.kind == .Struct || e.kind == .Tuple {
+        for i in 0..e.count {
+            if !is_type_cloneable(&ctx, ctx.prog.types.fields[e.inner_a + i].ty) { return false }
+        }
+        return true
+    }
+    if e.kind == .Enum {
+        for vi in 0..e.count {
+            v := &ctx.prog.types.variants[e.inner_a + vi]
+            for pi in 0..v.payload_count {
+                if !is_type_cloneable(&ctx, ctx.prog.types.fields[v.payload_start + pi].ty) { return false }
+            }
+        }
+        return true
+    }
+    true
+}
+
+// =========================================================================
+// Attribute parsing helpers
+// =========================================================================
+
+fn parse_item_attrs(m: &ast.Module, first_attr: i32, attr_count: i32,
+    flags_out: &mut i64, req_caps_out: &mut i32, has_clone_out: &mut bool) {
+    for i in 0..attr_count {
+        a := &m.attrs[first_attr + i]
+        if a.name == "resource" {
+            flags_out = flags_out.bit_or(ht.TF_RESOURCE)
+            for j in 0..a.arg_count {
+                if m.attr_args[a.first_arg + j].value == "dispose" {
+                    flags_out = flags_out.bit_or(ht.TF_DISPOSE)
+                }
+            }
+        } else if a.name == "c_layout" {
+            flags_out = flags_out.bit_or(ht.TF_C_LAYOUT)
+        } else if a.name == "repr" {
+            for j in 0..a.arg_count {
+                v := &m.attr_args[a.first_arg + j].value
+                if v == "C" || v == "c" { flags_out = flags_out.bit_or(ht.TF_C_LAYOUT) }
+                else if v == "i8" || v == "i16" || v == "i32" || v == "i64" ||
+                    v == "u8" || v == "u16" || v == "u32" || v == "u64" {
+                    flags_out = flags_out.bit_or(ht.TF_OPEN_ENUM)
+                }
+            }
+        } else if a.name == "requires" {
+            for j in 0..a.arg_count {
+                req_caps_out = req_caps_out.bit_or(cap_bit(m.attr_args[a.first_arg + j].value))
+            }
+        } else if a.name == "derive" {
+            for j in 0..a.arg_count {
+                if m.attr_args[a.first_arg + j].value == "Clone" { has_clone_out = true }
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Pass 1: Collect top-level declarations across all modules
+// =========================================================================
+
+fn collect_all_items(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge) {
+    // 1a. Pre-register prelude generic TypeDefs
+    ctx.opt_def = ctx.type_defs.len
+    ctx.type_defs.push(TypeDef {
+        kind: .Enum, mod_id: -1, item_idx: -1, name: "Option", is_pub: true, is_opaque: false,
+        flags: 0, gen_count: 1, concrete_ty: -1, alias_target_ty: -1, has_clone: false, has_dispose_method: false,
+    })
+    ctx.res_def = ctx.type_defs.len
+    ctx.type_defs.push(TypeDef {
+        kind: .Enum, mod_id: -1, item_idx: -1, name: "Result", is_pub: true, is_opaque: false,
+        flags: 0, gen_count: 2, concrete_ty: -1, alias_target_ty: -1, has_clone: false, has_dispose_method: false,
+    })
+    ctx.map_def = ctx.type_defs.len
+    ctx.type_defs.push(TypeDef {
+        kind: .Struct, mod_id: -1, item_idx: -1, name: "Map", is_pub: true, is_opaque: true,
+        flags: ht.TF_OPAQUE, gen_count: 2, concrete_ty: -1, alias_target_ty: -1, has_clone: true, has_dispose_method: false,
+    })
+    ctx.set_def = ctx.type_defs.len
+    ctx.type_defs.push(TypeDef {
+        kind: .Struct, mod_id: -1, item_idx: -1, name: "Set", is_pub: true, is_opaque: true,
+        flags: ht.TF_OPAQUE, gen_count: 1, concrete_ty: -1, alias_target_ty: -1, has_clone: true, has_dispose_method: false,
+    })
+    ctx.task_def = ctx.type_defs.len
+    ctx.type_defs.push(TypeDef {
+        kind: .Struct, mod_id: -1, item_idx: -1, name: "Task", is_pub: true, is_opaque: true,
+        flags: ht.TF_OPAQUE, gen_count: 1, concrete_ty: -1, alias_target_ty: -1, has_clone: false, has_dispose_method: false,
+    })
+
+    // 1b. Scan modules for capabilities and type/const/fn items
+    for mi in 0..mods.len {
+        m := &mods[mi].ast
+        mut cap_mask := mods[mi].caps_mask
+        for ii in 0..m.items.len {
+            it := &m.items[ii]
+            if it.kind == .Capability {
+                for ci in 0..it.name_count {
+                    cap_mask = cap_mask.bit_or(cap_bit(m.name_lists[it.first_name + ci]))
+                }
+            }
+        }
+        ctx.prog.mod_caps[mi] = cap_mask
+
+        for ii in 0..m.items.len {
+            it := &m.items[ii]
+            mut fl: i64 = 0
+            mut req_caps := 0
+            mut has_clone := false
+            parse_item_attrs(&m, it.first_attr, it.attr_count, &mut fl, &mut req_caps, &mut has_clone)
+            if it.is_opaque { fl = fl.bit_or(ht.TF_OPAQUE) }
+            if it.is_extern { fl = fl.bit_or(ht.TF_EXTERN) }
+
+            if it.kind == .Struct || it.kind == .Union || it.kind == .Enum ||
+                it.kind == .ExternType || it.kind == .TypeAlias || it.kind == .Trait {
+                dk: DefKind = if it.kind == .Struct { .Struct }
+                    else if it.kind == .Union { .Union }
+                    else if it.kind == .Enum { .Enum }
+                    else if it.kind == .ExternType { .ExternType }
+                    else if it.kind == .TypeAlias { .TypeAlias }
+                    else { .Trait }
+                mut shell_ty := -1
+                if it.gen_count == 0 {
+                    empty_f: []ht.FieldEntry = []
+                    empty_v: []ht.VariantEntry = []
+                    if dk == .Struct {
+                        shell_ty = ht.add_struct(&mut ctx.prog.types, it.name.clone(), mi, fl, &empty_f)
+                    } else if dk == .Union {
+                        shell_ty = ht.add_union(&mut ctx.prog.types, it.name.clone(), mi, fl, &empty_f)
+                    } else if dk == .Enum {
+                        shell_ty = ht.add_enum(&mut ctx.prog.types, it.name.clone(), mi, fl, &empty_v, &empty_f)
+                    } else if dk == .ExternType {
+                        shell_ty = ht.add_struct(&mut ctx.prog.types, it.name.clone(), mi, fl.bit_or(ht.TF_OPAQUE).bit_or(ht.TF_EXTERN), &empty_f)
+                    }
+                }
+                ctx.type_defs.push(TypeDef {
+                    kind: dk, mod_id: mi, item_idx: ii, name: it.name.clone(),
+                    is_pub: it.is_pub, is_opaque: it.is_opaque, flags: fl,
+                    gen_count: it.gen_count, concrete_ty: shell_ty, alias_target_ty: -1,
+                    has_clone: has_clone, has_dispose_method: false,
+                })
+            } else if it.kind == .Const || it.kind == .ExternStatic {
+                ctx.const_defs.push(ConstDef {
+                    mod_id: mi, item_idx: ii, name: it.name.clone(), is_pub: it.is_pub,
+                    ty: ht.TY_I32, int_val: 0, text_val: "",
+                })
+            } else if it.kind == .Fn || it.kind == .ExternFn {
+                is_ext := it.kind == .ExternFn
+                ctx.fn_defs.push(FnDef {
+                    mod_id: mi, item_idx: ii, member_idx: -1, name: it.name.clone(),
+                    owner_def: -1, trait_name: "", is_pub: it.is_pub,
+                    is_unsafe: it.is_unsafe || is_ext, is_extern: is_ext,
+                    is_generic: it.gen_count > 0, requires_caps: req_caps,
+                    hir_fn_id: -1, owner_ty: -1, recv_kind: .None,
+                })
+            }
+        }
+    }
+
+    // 1c. Collect Impl blocks (inherent methods, trait impls, Sendable/Sync impls, Clone/dispose tracking)
+    for mi in 0..mods.len {
+        m := &mods[mi].ast
+        for ii in 0..m.items.len {
+            it := &m.items[ii]
+            if it.kind != .Impl { continue }
+            target_base := strip_generic_suffix(it.target_name)
+            tdef := find_type_def_by_name(&ctx, &imports, mi, target_base)
+            tname := strip_generic_suffix(it.trait_name)
+            if tname == "Sendable" || tname == "Sync" {
+                ctx.send_sync_impls.push(SendSyncImpl {
+                    mod_id: mi, item_idx: ii, trait_name: tname.clone(),
+                    target_def: tdef, is_unsafe: it.is_unsafe,
+                    has_where: it.where_count > 0,
+                    span_start: it.span.start, span_end: it.span.end,
+                })
+            }
+            if tname == "Clone" && tdef >= 0 {
+                ctx.type_defs[tdef].has_clone = true
+            }
+            impl_is_generic := it.gen_count > 0 || (tdef >= 0 && ctx.type_defs[tdef].gen_count > 0)
+            for k in 0..it.member_count {
+                mem_idx := it.first_member + k
+                mem := &m.members[mem_idx]
+                mut mfl: i64 = 0
+                mut mreq := 0
+                mut mclone := false
+                parse_item_attrs(&m, mem.first_attr, mem.attr_count, &mut mfl, &mut mreq, &mut mclone)
+                if mem.name == "clone" && tdef >= 0 { ctx.type_defs[tdef].has_clone = true }
+                if mem.name == "dispose" && tdef >= 0 { ctx.type_defs[tdef].has_dispose_method = true }
+                recv: ast.ReceiverKind = if mem.param_count > 0 { m.params[mem.first_param].receiver } else { .None }
+                ctx.fn_defs.push(FnDef {
+                    mod_id: mi, item_idx: ii, member_idx: mem_idx, name: mem.name.clone(),
+                    owner_def: tdef, trait_name: tname.clone(), is_pub: mem.is_pub || tname != "",
+                    is_unsafe: mem.is_unsafe, is_extern: false,
+                    is_generic: impl_is_generic || mem.gen_count > 0,
+                    requires_caps: mreq, hir_fn_id: -1,
+                    owner_ty: if tdef >= 0 && !impl_is_generic { ctx.type_defs[tdef].concrete_ty } else { -1 },
+                    recv_kind: recv,
+                })
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Pass 2: Type resolution & on-demand generic type instantiation
+// =========================================================================
+
+fn check_where_bounds_for_inst(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput,
+    def_mod: i32, where_first: i32, where_count: i32,
+    gen_names: &[]string, arg_tys: &[]i32, call_mod: i32, span_s: i32, span_e: i32) {
+    if def_mod < 0 || def_mod >= mods.len || where_count <= 0 { return }
+    dm := &mods[def_mod].ast
+    for wi in 0..where_count {
+        wp := &dm.where_preds[where_first + wi]
+        if wp.target_ty < 0 || wp.target_ty >= dm.types.len { continue }
+        tname := &dm.types[wp.target_ty].name
+        mut arg_ty := -1
+        for gi in 0..gen_names.len {
+            if gen_names[gi] == tname && gi < arg_tys.len { arg_ty = arg_tys[gi]; break }
+        }
+        if arg_ty < 0 || arg_ty >= ctx.prog.types.entries.len { continue }
+        if ctx.prog.types.entries[arg_ty].kind == .TypeParam { continue }
+        for bi in 0..wp.bound_count {
+            bty_id := dm.id_lists[wp.first_bound + bi]
+            if bty_id < 0 || bty_id >= dm.types.len { continue }
+            bname := strip_generic_suffix(dm.types[bty_id].name)
+            if bname == "Sendable" && !ht.is_sendable(&ctx.prog.types, arg_ty) {
+                emit_err(&mut ctx, call_mod, "E5004", span_s, span_e,
+                    "type '" + ctx.prog.types.entries[arg_ty].name + "' does not satisfy Sendable")
+            } else if bname == "Sync" && !ht.is_sync(&ctx.prog.types, arg_ty) {
+                emit_err(&mut ctx, call_mod, "E5004", span_s, span_e,
+                    "type '" + ctx.prog.types.entries[arg_ty].name + "' does not satisfy Sync")
+            }
+        }
+    }
+}
+
+fn check_type_send_sync_where(ctx: &LowerCtx, mods: &[]hb.ModuleInput, ssi: &SendSyncImpl,
+    gen_names: &[]string, arg_tys: &[]i32) -> bool {
+    if !ssi.has_where { return true }
+    dm := &mods[ssi.mod_id].ast
+    it := &dm.items[ssi.item_idx]
+    for wi in 0..it.where_count {
+        wp := &dm.where_preds[it.first_where + wi]
+        if wp.target_ty < 0 || wp.target_ty >= dm.types.len { continue }
+        tname := &dm.types[wp.target_ty].name
+        mut arg_ty := -1
+        for gi in 0..gen_names.len {
+            if gen_names[gi] == tname && gi < arg_tys.len { arg_ty = arg_tys[gi]; break }
+        }
+        if arg_ty < 0 || arg_ty >= ctx.prog.types.entries.len { continue }
+        for bi in 0..wp.bound_count {
+            bty_id := dm.id_lists[wp.first_bound + bi]
+            if bty_id < 0 || bty_id >= dm.types.len { continue }
+            bname := strip_generic_suffix(dm.types[bty_id].name)
+            if bname == "Sendable" && !ht.is_sendable(&ctx.prog.types, arg_ty) { return false }
+            if bname == "Sync" && !ht.is_sync(&ctx.prog.types, arg_ty) { return false }
+        }
+    }
+    true
+}
+
+fn instantiate_type_def(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    def_id: i32, arg_tys: &[]i32, call_mod: i32, span_s: i32, span_e: i32) -> i32 {
+    if def_id < 0 || def_id >= ctx.type_defs.len { return ht.TY_ERROR }
+    if def_id == ctx.opt_def {
+        inner := if arg_tys.len > 0 { arg_tys[0] } else { ht.TY_I32 }
+        return ht.add_option(&mut ctx.prog.types, inner)
+    }
+    if def_id == ctx.res_def {
+        ok_t := if arg_tys.len > 0 { arg_tys[0] } else { ht.TY_UNIT }
+        err_t := if arg_tys.len > 1 { arg_tys[1] } else { ht.TY_I32 }
+        return ht.add_result(&mut ctx.prog.types, ok_t, err_t)
+    }
+    if def_id == ctx.task_def {
+        inner := if arg_tys.len > 0 { arg_tys[0] } else { ht.TY_UNIT }
+        return ht.add_task(&mut ctx.prog.types, inner)
+    }
+    if ctx.type_defs[def_id].gen_count == 0 && ctx.type_defs[def_id].concrete_ty >= 0 {
+        return ctx.type_defs[def_id].concrete_ty
+    }
+
+    // Cache lookup
+    mut key := ""
+    for i in 0..arg_tys.len {
+        if i > 0 { key += "," }
+        key += arg_tys[i].str()
+    }
+    for ci in 0..ctx.inst_cache.len {
+        if ctx.inst_cache[ci].def_id == def_id && ctx.inst_cache[ci].arg_key == key {
+            return ctx.inst_cache[ci].ty_id
+        }
+    }
+
+    // Build concrete display name
+    mut full_name := ctx.type_defs[def_id].name.clone()
+    if arg_tys.len > 0 {
+        full_name += "<"
+        for i in 0..arg_tys.len {
+            if i > 0 { full_name += ", " }
+            aty := arg_tys[i]
+            if aty >= 0 && aty < ctx.prog.types.entries.len { full_name += ctx.prog.types.entries[aty].name }
+            else { full_name += "?" }
+        }
+        full_name += ">"
+    }
+
+    // Prelude Map<K, V> / Set<T>
+    if def_id == ctx.map_def || def_id == ctx.set_def {
+        ht.seal(&mut ctx.prog.types)
+        mut fl_map: i64 = ht.TF_OPAQUE
+        mut all_send := true
+        mut all_sync := true
+        for ai in 0..arg_tys.len {
+            if !ht.is_sendable(&ctx.prog.types, arg_tys[ai]) || ht.origin_count(&ctx.prog.types, arg_tys[ai]) > 0 { all_send = false }
+            if !ht.is_sync(&ctx.prog.types, arg_tys[ai]) || ht.origin_count(&ctx.prog.types, arg_tys[ai]) > 0 { all_sync = false }
+        }
+        if all_send { fl_map = fl_map.bit_or(ht.TF_EXPLICIT_SENDABLE) }
+        if all_sync { fl_map = fl_map.bit_or(ht.TF_EXPLICIT_SYNC) }
+        empty_f: []ht.FieldEntry = []
+        ty_id := ht.add_struct(&mut ctx.prog.types, full_name, -1, fl_map, &empty_f)
+        ctx.inst_cache.push(InstCacheEntry { def_id: def_id, arg_key: key, ty_id: ty_id })
+        return ty_id
+    }
+
+    def_mod := ctx.type_defs[def_id].mod_id
+    item_idx := ctx.type_defs[def_id].item_idx
+    dk := ctx.type_defs[def_id].kind
+    fl := ctx.type_defs[def_id].flags
+
+    // Pre-allocate shell so recursive references terminate
+    empty_f: []ht.FieldEntry = []
+    empty_v: []ht.VariantEntry = []
+    ty_id := if dk == .Enum {
+        ht.add_enum(&mut ctx.prog.types, full_name, def_mod, fl, &empty_v, &empty_f)
+    } else if dk == .Union {
+        ht.add_union(&mut ctx.prog.types, full_name, def_mod, fl, &empty_f)
+    } else {
+        ht.add_struct(&mut ctx.prog.types, full_name, def_mod, fl, &empty_f)
+    }
+    ctx.inst_cache.push(InstCacheEntry { def_id: def_id, arg_key: key, ty_id: ty_id })
+
+    if def_mod < 0 || def_mod >= mods.len { return ty_id }
+    dm := &mods[def_mod].ast
+    it := &dm.items[item_idx]
+
+    // Bind generic params
+    saved_tp_len := ctx.tp_stack.len
+    mut gen_names: []string = []
+    for gi in 0..it.gen_count {
+        gp := &dm.generic_params[it.first_gen + gi]
+        gen_names.push(gp.name.clone())
+        bound_ty := if gi < arg_tys.len { arg_tys[gi] } else { ht.TY_I32 }
+        ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: bound_ty })
+    }
+
+    // Check struct/enum where bounds AND check conditional Sendable/Sync impls!
+    ht.seal(&mut ctx.prog.types)
+    check_where_bounds_for_inst(&mut ctx, &mods, def_mod, it.first_where, it.where_count, &gen_names, &arg_tys, call_mod, span_s, span_e)
+
+    // Populate fields or variants
+    if dk == .Struct || dk == .Union {
+        mut fields: []ht.FieldEntry = []
+        for k in 0..it.member_count {
+            mem := &dm.members[it.first_member + k]
+            fty := lower_type_node(&mut ctx, &mods, &imports, def_mod, mem.ty)
+            fields.push(ht.FieldEntry {
+                name: mem.name.clone(), ty: fty, offset: 0, is_pub: mem.is_pub, origin_slot: -1,
+            })
+        }
+        ht.set_struct_fields(&mut ctx.prog.types, ty_id, &fields)
+    } else if dk == .Enum {
+        mut vars: []ht.VariantEntry = []
+        mut payloads: []ht.FieldEntry = []
+        mut next_tag: i64 = 0
+        for k in 0..it.member_count {
+            mem := &dm.members[it.first_member + k]
+            mut tag := next_tag
+            if mem.discriminant_expr >= 0 {
+                de := &dm.exprs[mem.discriminant_expr]
+                if de.kind == .Int { tag = parse_i64_lit(de.text) }
+                else if de.kind == .Unary && de.op == "-" && de.left >= 0 {
+                    tag = -parse_i64_lit(dm.exprs[de.left].text)
+                }
+            }
+            next_tag = tag + 1
+            p_start := payloads.len
+            for pi in 0..mem.payload_count {
+                pty := lower_type_node(&mut ctx, &mods, &imports, def_mod, dm.id_lists[mem.first_payload + pi])
+                payloads.push(ht.FieldEntry { name: pi.str(), ty: pty, offset: 0, is_pub: true, origin_slot: -1 })
+            }
+            vars.push(ht.VariantEntry { name: mem.name.clone(), tag_value: tag, payload_start: p_start, payload_count: mem.payload_count })
+        }
+        ht.set_enum_variants(&mut ctx.prog.types, ty_id, &vars, &payloads)
+    }
+
+    // Apply conditional Sendable/Sync impls (e.g. unsafe impl Sendable for Published<T> where T: Sendable + Sync)
+    for si in 0..ctx.send_sync_impls.len {
+        if ctx.send_sync_impls[si].target_def == def_id {
+            ok_where := check_type_send_sync_where(&ctx, &mods, &ctx.send_sync_impls[si], &gen_names, &arg_tys)
+            if ok_where {
+                if ctx.send_sync_impls[si].trait_name == "Sendable" {
+                    ctx.prog.types.entries[ty_id].flags = ctx.prog.types.entries[ty_id].flags.bit_or(ht.TF_EXPLICIT_SENDABLE)
+                } else if ctx.send_sync_impls[si].trait_name == "Sync" {
+                    ctx.prog.types.entries[ty_id].flags = ctx.prog.types.entries[ty_id].flags.bit_or(ht.TF_EXPLICIT_SYNC)
+                }
+            }
+        }
+    }
+
+    while ctx.tp_stack.len > saved_tp_len { _ := ctx.tp_stack.pop() }
+    ht.seal(&mut ctx.prog.types)
+    ty_id
+}
+
+fn lower_type_node(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    mod_id: i32, ty_node_id: i32) -> i32 {
+    if ty_node_id < 0 || mod_id < 0 || mod_id >= mods.len { return ht.TY_UNIT }
+    m := &mods[mod_id].ast
+    if ty_node_id >= m.types.len { return ht.TY_ERROR }
+    tn := &m.types[ty_node_id]
+
+    if tn.kind == .Unit { return ht.TY_UNIT }
+    if tn.kind == .Error { return ht.TY_ERROR }
+    if tn.kind == .ConstArg { return ht.TY_USIZE }
+
+    if tn.kind == .Ref {
+        // Check for &str -> FatStr and &[]T -> FatSlice!
+        if tn.inner >= 0 && tn.inner < m.types.len {
+            inn := &m.types[tn.inner]
+            if inn.kind == .Named && inn.name == "str" {
+                return ht.add_fat_str(&mut ctx.prog.types)
+            }
+            if inn.kind == .Slice {
+                elem := lower_type_node(&mut ctx, &mods, &imports, mod_id, inn.inner)
+                return ht.add_fat_slice(&mut ctx.prog.types, elem)
+            }
+            // &Fn(...) -> R -> borrowed shared ClosureEnv
+            if inn.kind == .FnType && (inn.name == "Fn" || inn.name == "FnMut" || inn.name == "FnOnce") {
+                return lower_callable_trait_type(&mut ctx, &mods, &imports, mod_id, tn.inner, false, true)
+            }
+        }
+        inner := lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner)
+        return ht.add_ref(&mut ctx.prog.types, inner)
+    }
+
+    if tn.kind == .MutRef {
+        if tn.inner >= 0 && tn.inner < m.types.len {
+            inn := &m.types[tn.inner]
+            if inn.kind == .FnType && (inn.name == "Fn" || inn.name == "FnMut" || inn.name == "FnOnce") {
+                return lower_callable_trait_type(&mut ctx, &mods, &imports, mod_id, tn.inner, true, true)
+            }
+        }
+        inner := lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner)
+        return ht.add_mut_ref(&mut ctx.prog.types, inner)
+    }
+
+    if tn.kind == .RawConst || tn.kind == .RawMut {
+        inner := lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner)
+        return ht.add_raw_ptr(&mut ctx.prog.types, inner, tn.kind == .RawMut)
+    }
+
+    if tn.kind == .Slice {
+        elem := lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner)
+        return ht.add_array(&mut ctx.prog.types, elem)
+    }
+
+    if tn.kind == .FixedArray {
+        elem := lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner)
+        mut flen := tn.count
+        if flen <= 0 && tn.len_expr >= 0 && tn.len_expr < m.exprs.len && m.exprs[tn.len_expr].kind == .Int {
+            flen = clamp_i32(parse_i64_lit(m.exprs[tn.len_expr].text))
+        }
+        if flen < 0 { flen = 0 }
+        return ht.add_fixed_array(&mut ctx.prog.types, elem, flen)
+    }
+
+    if tn.kind == .Tuple {
+        mut elems: []i32 = []
+        for i in 0..tn.arg_count {
+            elems.push(lower_type_node(&mut ctx, &mods, &imports, mod_id, m.id_lists[tn.first_arg + i]))
+        }
+        return ht.add_tuple(&mut ctx.prog.types, &elems)
+    }
+
+    if tn.kind == .FnType {
+        if tn.name == "Fn" || tn.name == "FnMut" || tn.name == "FnOnce" {
+            return lower_callable_trait_type(&mut ctx, &mods, &imports, mod_id, ty_node_id, tn.name == "FnMut", false)
+        }
+        mut params: []ht.ParamEntry = []
+        for i in 0..tn.arg_count {
+            fp := &m.fn_param_types[tn.first_arg + i]
+            if fp.is_variadic { continue }
+            pty := lower_type_node(&mut ctx, &mods, &imports, mod_id, fp.ty)
+            pm: ht.ParamMode = if fp.is_move { .MoveVal }
+                else if ctx.prog.types.entries[pty].kind == .MutRef { .MutBorrow }
+                else if ctx.prog.types.entries[pty].kind == .Ref { .SharedBorrow }
+                else { .BorrowOrCopy }
+            params.push(ht.ParamEntry { ty: pty, mode: pm })
+        }
+        ret_ty := if tn.inner >= 0 { lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner) } else { ht.TY_UNIT }
+        if tn.is_extern {
+            return ht.add_extern_fn(&mut ctx.prog.types, &params, ret_ty)
+        }
+        mut from_edges: []ht.FromEdge = []
+        for fi in 0..tn.from_count {
+            fs := &m.from_sources[tn.first_from + fi]
+            pidx := clamp_i32(parse_i64_lit(fs.root_name))
+            from_edges.push(ht.FromEdge { param_idx: pidx, field_slot: -1, ret_slot: 0 })
+        }
+        return ht.add_fn_ptr(&mut ctx.prog.types, &params, ret_ty, &from_edges)
+    }
+
+    // TypeKind.Named
+    name := tn.name.clone()
+    if name == "Self" {
+        if ctx.self_ty >= 0 { return ctx.self_ty }
+        return ht.TY_ERROR
+    }
+    if name == "str" { return ht.add_fat_str(&mut ctx.prog.types) }
+    prim := is_primitive_type_name(name)
+    if prim >= 0 { return prim }
+
+    // Type param in scope?
+    tp := lookup_tp(&ctx, name)
+    if tp >= 0 { return tp }
+
+    // User / stdlib / prelude TypeDef
+    def_id := find_type_def_by_name(&ctx, &imports, mod_id, name)
+    if def_id >= 0 {
+        if ctx.type_defs[def_id].mod_id >= 0 && ctx.type_defs[def_id].mod_id != mod_id && !ctx.type_defs[def_id].is_pub {
+            emit_err(&mut ctx, mod_id, "E2004", tn.span.start, tn.span.end,
+                "type '" + name + "' is private")
+        }
+        if ctx.type_defs[def_id].kind == .TypeAlias {
+            if ctx.type_defs[def_id].alias_target_ty >= 0 {
+                return ctx.type_defs[def_id].alias_target_ty
+            }
+            dm_id := ctx.type_defs[def_id].mod_id
+            dm_it := ctx.type_defs[def_id].item_idx
+            resolved := lower_type_node(&mut ctx, &mods, &imports, dm_id, mods[dm_id].ast.items[dm_it].ret_type)
+            ctx.type_defs[def_id].alias_target_ty = resolved
+            return resolved
+        }
+        if tn.arg_count > 0 || ctx.type_defs[def_id].gen_count > 0 {
+            mut arg_tys: []i32 = []
+            for ai in 0..tn.arg_count {
+                arg_tys.push(lower_type_node(&mut ctx, &mods, &imports, mod_id, m.id_lists[tn.first_arg + ai]))
+            }
+            return instantiate_type_def(&mut ctx, &mods, &imports, def_id, &arg_tys, mod_id, tn.span.start, tn.span.end)
+        }
+        return ctx.type_defs[def_id].concrete_ty
+    }
+
+    // Unknown type (e.g. sys.IoError / sys.Metadata or C typedef like c_void): intern opaque placeholder so checking continues smoothly
+    if name == "c_void" || has_dot(name) {
+        empty_f: []ht.FieldEntry = []
+        return ht.add_struct(&mut ctx.prog.types, name, mod_id, ht.TF_COPY, &empty_f)
+    }
+    ht.TY_ERROR
+}
+
+fn lower_callable_trait_type(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    mod_id: i32, ty_node_id: i32, is_mut: bool, is_borrowed: bool) -> i32 {
+    m := &mods[mod_id].ast
+    tn := &m.types[ty_node_id]
+    mut params: []ht.ParamEntry = []
+    for i in 0..tn.arg_count {
+        fp := &m.fn_param_types[tn.first_arg + i]
+        pty := lower_type_node(&mut ctx, &mods, &imports, mod_id, fp.ty)
+        pm: ht.ParamMode = if fp.is_move { .MoveVal }
+            else if ctx.prog.types.entries[pty].kind == .MutRef { .MutBorrow }
+            else if ctx.prog.types.entries[pty].kind == .Ref { .SharedBorrow }
+            else { .BorrowOrCopy }
+        params.push(ht.ParamEntry { ty: pty, mode: pm })
+    }
+    ret_ty := if tn.inner >= 0 { lower_type_node(&mut ctx, &mods, &imports, mod_id, tn.inner) } else { ht.TY_UNIT }
+    empty_caps: []ht.FieldEntry = []
+    empty_from: []ht.FromEdge = []
+    is_once := tn.name == "FnOnce"
+    ht.add_closure_env(&mut ctx.prog.types, tn.name.clone(), mod_id, is_mut, is_once, is_borrowed,
+        &empty_caps, &params, ret_ty, &empty_from)
+}
+
+fn populate_concrete_type_defs(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge) {
+    for di in 0..ctx.type_defs.len {
+        if ctx.type_defs[di].mod_id < 0 || ctx.type_defs[di].gen_count > 0 { continue }
+        mod_id := ctx.type_defs[di].mod_id
+        item_idx := ctx.type_defs[di].item_idx
+        dk := ctx.type_defs[di].kind
+        ty_id := ctx.type_defs[di].concrete_ty
+        m := &mods[mod_id].ast
+        it := &m.items[item_idx]
+
+        if dk == .TypeAlias {
+            if ctx.type_defs[di].alias_target_ty < 0 {
+                resolved := lower_type_node(&mut ctx, &mods, &imports, mod_id, it.ret_type)
+                ctx.type_defs[di].alias_target_ty = resolved
+            }
+            continue
+        }
+        if ty_id < 0 { continue }
+        ctx.self_ty = ty_id
+        if dk == .Struct || dk == .Union {
+            mut fields: []ht.FieldEntry = []
+            for k in 0..it.member_count {
+                mem := &m.members[it.first_member + k]
+                fty := lower_type_node(&mut ctx, &mods, &imports, mod_id, mem.ty)
+                fields.push(ht.FieldEntry {
+                    name: mem.name.clone(), ty: fty, offset: 0, is_pub: mem.is_pub, origin_slot: -1,
+                })
+            }
+            ht.set_struct_fields(&mut ctx.prog.types, ty_id, &fields)
+        } else if dk == .Enum {
+            mut vars: []ht.VariantEntry = []
+            mut payloads: []ht.FieldEntry = []
+            mut next_tag: i64 = 0
+            for k in 0..it.member_count {
+                mem := &m.members[it.first_member + k]
+                mut tag := next_tag
+                if mem.discriminant_expr >= 0 {
+                    de := &m.exprs[mem.discriminant_expr]
+                    if de.kind == .Int { tag = parse_i64_lit(de.text) }
+                    else if de.kind == .Unary && de.op == "-" && de.left >= 0 {
+                        tag = -parse_i64_lit(m.exprs[de.left].text)
+                    }
+                }
+                next_tag = tag + 1
+                p_start := payloads.len
+                for pi in 0..mem.payload_count {
+                    pty := lower_type_node(&mut ctx, &mods, &imports, mod_id, m.id_lists[mem.first_payload + pi])
+                    payloads.push(ht.FieldEntry { name: pi.str(), ty: pty, offset: 0, is_pub: true, origin_slot: -1 })
+                }
+                vars.push(ht.VariantEntry { name: mem.name.clone(), tag_value: tag, payload_start: p_start, payload_count: mem.payload_count })
+            }
+            ht.set_enum_variants(&mut ctx.prog.types, ty_id, &vars, &payloads)
+        }
+        ctx.self_ty = -1
+    }
+
+    // Lower const types & simple literal values
+    for ci in 0..ctx.const_defs.len {
+        mod_id := ctx.const_defs[ci].mod_id
+        item_idx := ctx.const_defs[ci].item_idx
+        m := &mods[mod_id].ast
+        it := &m.items[item_idx]
+        cty := if it.ret_type >= 0 { lower_type_node(&mut ctx, &mods, &imports, mod_id, it.ret_type) } else { ht.TY_I32 }
+        ctx.const_defs[ci].ty = cty
+        if it.body_expr >= 0 && it.body_expr < m.exprs.len {
+            be := &m.exprs[it.body_expr]
+            if be.kind == .Int { ctx.const_defs[ci].int_val = parse_i64_lit(be.text) }
+            else if be.kind == .Unary && be.op == "-" && be.left >= 0 {
+                ctx.const_defs[ci].int_val = -parse_i64_lit(m.exprs[be.left].text)
+            } else if be.kind == .Bool {
+                ctx.const_defs[ci].int_val = if be.text == "true" { 1 } else { 0 }
+            } else if be.kind == .String {
+                ctx.const_defs[ci].text_val = be.text.clone()
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Pass 3: Sendable/Sync validation, Function signatures, from-clauses & Iterator check
+// =========================================================================
+
+fn validate_send_sync_impls(ctx: &mut LowerCtx) {
+    // Provisional seal so field Sendable/Sync/origin_count are known
+    ht.seal(&mut ctx.prog.types)
+
+    for i in 0..ctx.send_sync_impls.len {
+        mod_id := ctx.send_sync_impls[i].mod_id
+        tname := ctx.send_sync_impls[i].trait_name.clone()
+        tdef := ctx.send_sync_impls[i].target_def
+        is_unsafe := ctx.send_sync_impls[i].is_unsafe
+        sp_s := ctx.send_sync_impls[i].span_start
+        sp_e := ctx.send_sync_impls[i].span_end
+
+        if is_unsafe {
+            if !mod_has_cap(&ctx, mod_id, CAP_UNSAFE) {
+                emit_err(&mut ctx, mod_id, "E5001", sp_s, sp_e,
+                    "unsafe impl " + tname + " requires 'capability unsafe'")
+                continue
+            }
+            if tdef >= 0 && ctx.type_defs[tdef].concrete_ty >= 0 {
+                ty := ctx.type_defs[tdef].concrete_ty
+                if tname == "Sendable" {
+                    ctx.prog.types.entries[ty].flags = ctx.prog.types.entries[ty].flags.bit_or(ht.TF_EXPLICIT_SENDABLE)
+                } else {
+                    ctx.prog.types.entries[ty].flags = ctx.prog.types.entries[ty].flags.bit_or(ht.TF_EXPLICIT_SYNC)
+                }
+            }
+            continue
+        }
+
+        // Safe `impl Sendable/Sync for T`:
+        if tdef < 0 { continue }
+        // Must NOT be @resource / @resource(dispose)
+        if ctx.type_defs[tdef].flags.bit_and(ht.TF_RESOURCE.bit_or(ht.TF_DISPOSE)) != 0 {
+            emit_err(&mut ctx, mod_id, "E5001", sp_s, sp_e,
+                "impl " + tname + " for @resource type '" + ctx.type_defs[tdef].name + "' requires 'unsafe impl'")
+            continue
+        }
+
+        ty := ctx.type_defs[tdef].concrete_ty
+        if ty < 0 { continue }
+
+        // Structurally verify ALL fields of T!
+        ek := ctx.prog.types.entries[ty].kind
+        e_start := ctx.prog.types.entries[ty].inner_a
+        e_cnt := ctx.prog.types.entries[ty].count
+        mut all_ok := true
+        mut bad_field := ""
+        if ek == .Struct || ek == .Tuple {
+            for fi in 0..e_cnt {
+                fty := ctx.prog.types.fields[e_start + fi].ty
+                f_ok := if tname == "Sendable" { ht.is_sendable(&ctx.prog.types, fty) } else { ht.is_sync(&ctx.prog.types, fty) }
+                if !f_ok || ht.origin_count(&ctx.prog.types, fty) > 0 {
+                    all_ok = false
+                    bad_field = ctx.prog.types.fields[e_start + fi].name.clone()
+                    break
+                }
+            }
+        } else if ek == .Enum {
+            for vi in 0..e_cnt {
+                p_start := ctx.prog.types.variants[e_start + vi].payload_start
+                p_cnt := ctx.prog.types.variants[e_start + vi].payload_count
+                for pi in 0..p_cnt {
+                    pty := ctx.prog.types.fields[p_start + pi].ty
+                    p_ok := if tname == "Sendable" { ht.is_sendable(&ctx.prog.types, pty) } else { ht.is_sync(&ctx.prog.types, pty) }
+                    if !p_ok || ht.origin_count(&ctx.prog.types, pty) > 0 {
+                        all_ok = false
+                        bad_field = ctx.prog.types.variants[e_start + vi].name.clone()
+                        break
+                    }
+                }
+                if !all_ok { break }
+            }
+        } else {
+            all_ok = false
+        }
+
+        if !all_ok {
+            emit_err(&mut ctx, mod_id, "E5004", sp_s, sp_e,
+                "cannot implement " + tname + " for '" + ctx.type_defs[tdef].name +
+                "': field '" + bad_field + "' does not satisfy " + tname)
+            continue
+        }
+
+        if tname == "Sendable" {
+            ctx.prog.types.entries[ty].flags = ctx.prog.types.entries[ty].flags.bit_or(ht.TF_EXPLICIT_SENDABLE)
+        } else {
+            ctx.prog.types.entries[ty].flags = ctx.prog.types.entries[ty].flags.bit_or(ht.TF_EXPLICIT_SYNC)
+        }
+    }
+
+    // Re-seal so explicit Sendable/Sync flags propagate transitively into wrapper structs/enums!
+    ht.seal(&mut ctx.prog.types)
+}
+
+fn lower_from_clauses(ctx: &mut LowerCtx, m: &ast.Module, mod_id: i32,
+    first_from: i32, from_count: i32, param_names: &[]string, param_tys: &[]i32,
+    ret_ty: i32, is_iterator_next: bool, span_s: i32, span_e: i32) -> []ht.FromEdge {
+    mut edges: []ht.FromEdge = []
+    ret_oc := ht.origin_count(&ctx.prog.types, ret_ty)
+
+    for fi in 0..from_count {
+        fs := &m.from_sources[first_from + fi]
+        mut pidx := -1
+        for pi in 0..param_names.len {
+            if param_names[pi] == fs.root_name { pidx = pi; break }
+        }
+        if pidx < 0 { continue }
+
+        if is_iterator_next && fs.root_name == "self" && fs.field_name == "" && ret_oc > 0 {
+            emit_err(&mut ctx, mod_id, "E4003", fs.span.start, fs.span.end,
+                "Iterator::next cannot return a borrow 'from self' (lending iterators are forbidden; use 'from self.<field>')")
+            continue
+        }
+
+        mut fslot := -1
+        if fs.field_name != "" {
+            base_ty := peel_ref(&ctx.prog.types, param_tys[pidx])
+            fidx := find_field_idx(&ctx.prog.types, base_ty, fs.field_name)
+            if fidx >= 0 {
+                fslot = ht.field_origin_slot(&ctx.prog.types, base_ty, fidx)
+            }
+            if is_iterator_next && fslot < 0 && ret_oc > 0 {
+                emit_err(&mut ctx, mod_id, "E4003", fs.span.start, fs.span.end,
+                    "Iterator::next 'from self." + fs.field_name + "' must reference a borrowing field of Self")
+            }
+        }
+        edges.push(ht.FromEdge { param_idx: pidx, field_slot: fslot, ret_slot: 0 })
+    }
+
+    // Non-lending Iterator check when no explicit `from` clause is given on a borrowing `next(&mut self)`
+    if is_iterator_next && from_count == 0 && ret_oc > 0 {
+        emit_err(&mut ctx, mod_id, "E4003", span_s, span_e,
+            "Iterator::next returning a borrowed value must declare 'from self.<field>' (cannot borrow from '&mut self')")
+    }
+
+    // Standard single-borrow elision for non-Iterator functions returning borrows with no explicit `from`
+    if !is_iterator_next && from_count == 0 && ret_oc > 0 {
+        mut borrow_param := -1
+        mut borrow_count := 0
+        for pi in 0..param_tys.len {
+            if ht.origin_count(&ctx.prog.types, param_tys[pi]) > 0 {
+                borrow_param = pi
+                borrow_count += 1
+            }
+        }
+        if borrow_count == 1 {
+            edges.push(ht.FromEdge { param_idx: borrow_param, field_slot: -1, ret_slot: 0 })
+        }
+    }
+    edges
+}
+
+fn lower_fn_signatures(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge) {
+    for fdi in 0..ctx.fn_defs.len {
+        mod_id := ctx.fn_defs[fdi].mod_id
+        item_idx := ctx.fn_defs[fdi].item_idx
+        mem_idx := ctx.fn_defs[fdi].member_idx
+        owner_def := ctx.fn_defs[fdi].owner_def
+        is_generic := ctx.fn_defs[fdi].is_generic
+        is_extern := ctx.fn_defs[fdi].is_extern
+        is_unsafe := ctx.fn_defs[fdi].is_unsafe
+        is_pub := ctx.fn_defs[fdi].is_pub
+        req_caps := ctx.fn_defs[fdi].requires_caps
+        trait_name := ctx.fn_defs[fdi].trait_name.clone()
+        fname := ctx.fn_defs[fdi].name.clone()
+
+        m := &mods[mod_id].ast
+        it := &m.items[item_idx]
+
+        // Validate `unsafe fn` requires `capability unsafe`
+        if is_unsafe && !is_extern && !mod_has_cap(&ctx, mod_id, CAP_UNSAFE) {
+            sp := if mem_idx >= 0 { m.members[mem_idx].span } else { it.span }
+            emit_err(&mut ctx, mod_id, "E5001", sp.start, sp.end,
+                "unsafe fn '" + fname + "' requires 'capability unsafe'")
+        }
+
+        // Bind generic type params if generic template
+        saved_tp_len := ctx.tp_stack.len
+        if owner_def >= 0 && ctx.type_defs[owner_def].gen_count > 0 && ctx.type_defs[owner_def].mod_id >= 0 {
+            dmod := ctx.type_defs[owner_def].mod_id
+            dit := &mods[dmod].ast.items[ctx.type_defs[owner_def].item_idx]
+            for gi in 0..dit.gen_count {
+                gp := &mods[dmod].ast.generic_params[dit.first_gen + gi]
+                tpty := ht.add_type_param(&mut ctx.prog.types, gp.name.clone(), mod_id)
+                ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: tpty })
+            }
+        }
+        if mem_idx < 0 {
+            for gi in 0..it.gen_count {
+                gp := &m.generic_params[it.first_gen + gi]
+                tpty := ht.add_type_param(&mut ctx.prog.types, gp.name.clone(), mod_id)
+                ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: tpty })
+            }
+        } else {
+            mem := &m.members[mem_idx]
+            for gi in 0..it.gen_count {
+                gp := &m.generic_params[it.first_gen + gi]
+                if lookup_tp(&ctx, gp.name) < 0 {
+                    tpty := ht.add_type_param(&mut ctx.prog.types, gp.name.clone(), mod_id)
+                    ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: tpty })
+                }
+            }
+            for gi in 0..mem.gen_count {
+                gp := &m.generic_params[mem.first_gen + gi]
+                tpty := ht.add_type_param(&mut ctx.prog.types, gp.name.clone(), mod_id)
+                ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: tpty })
+            }
+        }
+
+        // Set Self type
+        mut self_ty := -1
+        if owner_def >= 0 {
+            if ctx.type_defs[owner_def].concrete_ty >= 0 {
+                self_ty = ctx.type_defs[owner_def].concrete_ty
+            } else if it.target_ty >= 0 {
+                self_ty = lower_type_node(&mut ctx, &mods, &imports, mod_id, it.target_ty)
+            }
+            ctx.fn_defs[fdi].owner_ty = self_ty
+        }
+        ctx.self_ty = self_ty
+
+        first_param := if mem_idx >= 0 { m.members[mem_idx].first_param } else { it.first_param }
+        param_count := if mem_idx >= 0 { m.members[mem_idx].param_count } else { it.param_count }
+        ret_node := if mem_idx >= 0 { m.members[mem_idx].ty } else { it.ret_type }
+        first_from := if mem_idx >= 0 { m.members[mem_idx].first_from } else { it.first_from }
+        from_count := if mem_idx >= 0 { m.members[mem_idx].from_count } else { it.from_count }
+        sp := if mem_idx >= 0 { m.members[mem_idx].span } else { it.span }
+
+        mut params: []ht.ParamEntry = []
+        mut p_names: []string = []
+        mut p_tys: []i32 = []
+        mut p_muts: []bool = []
+        mut p_starts: []i32 = []
+        mut p_ends: []i32 = []
+
+        for pi in 0..param_count {
+            pr := &m.params[first_param + pi]
+            if pr.is_variadic { continue }
+            mut pty := ht.TY_I32
+            mut pmode: ht.ParamMode = .BorrowOrCopy
+            if pr.receiver == .SharedRef {
+                pty = if self_ty >= 0 { ht.add_ref(&mut ctx.prog.types, self_ty) } else { ht.TY_ERROR }
+                pmode = .SharedBorrow
+            } else if pr.receiver == .MutRef {
+                pty = if self_ty >= 0 { ht.add_mut_ref(&mut ctx.prog.types, self_ty) } else { ht.TY_ERROR }
+                pmode = .MutBorrow
+            } else if pr.receiver == .Owned {
+                pty = if self_ty >= 0 { self_ty } else { ht.TY_ERROR }
+                pmode = if pr.is_move { .MoveVal } else { .BorrowOrCopy }
+            } else {
+                pty = lower_type_node(&mut ctx, &mods, &imports, mod_id, pr.ty)
+                if pr.is_move { pmode = .MoveVal }
+                else if pty >= 0 && pty < ctx.prog.types.entries.len && ctx.prog.types.entries[pty].kind == .MutRef { pmode = .MutBorrow }
+                else if pty >= 0 && pty < ctx.prog.types.entries.len && ctx.prog.types.entries[pty].kind == .Ref { pmode = .SharedBorrow }
+                else { pmode = .BorrowOrCopy }
+            }
+            params.push(ht.ParamEntry { ty: pty, mode: pmode })
+            p_names.push(pr.name.clone())
+            p_tys.push(pty)
+            p_muts.push(pr.is_mut || pr.receiver == .MutRef)
+            p_starts.push(pr.span.start)
+            p_ends.push(pr.span.end)
+        }
+
+        ret_ty := if ret_node >= 0 { lower_type_node(&mut ctx, &mods, &imports, mod_id, ret_node) } else { ht.TY_UNIT }
+
+        // Ensure newly added Ref/MutRef/Option types have origin_count computed before from-clause resolution
+        ht.seal(&mut ctx.prog.types)
+
+        is_iter_next := trait_name == "Iterator" && fname == "next"
+        from_edges := lower_from_clauses(&mut ctx, &m, mod_id, first_from, from_count, &p_names, &p_tys, ret_ty, is_iter_next, sp.start, sp.end)
+
+        sig_ty := if is_extern {
+            ht.add_extern_fn(&mut ctx.prog.types, &params, ret_ty)
+        } else {
+            ht.add_fn_ptr(&mut ctx.prog.types, &params, ret_ty, &from_edges)
+        }
+
+        full_fn_name := if owner_def >= 0 { ctx.type_defs[owner_def].name + "::" + fname } else { fname.clone() }
+        mut hf := hb.new_fn(0, full_fn_name, mod_id, sig_ty, ret_ty, params.len)
+        hf.is_pub = is_pub
+        hf.is_unsafe = is_unsafe
+        hf.is_extern = is_extern
+        hf.is_generic_template = is_generic
+        hf.requires_caps = req_caps
+        hf.span_start = sp.start
+        hf.span_end = sp.end
+
+        for pi in 0..params.len {
+            _ := hb.add_local(&mut hf, p_names[pi], p_tys[pi], params[pi].mode, p_muts[pi], true, p_starts[pi], p_ends[pi])
+        }
+
+        fid := hb.add_fn(&mut ctx.prog, move hf)
+        ctx.fn_defs[fdi].hir_fn_id = fid
+        if mod_id == 0 && owner_def < 0 && fname == "main" {
+            ctx.prog.entry_fn = fid
+        }
+
+        ctx.self_ty = -1
+        while ctx.tp_stack.len > saved_tp_len { _ := ctx.tp_stack.pop() }
+    }
+}
+
+// =========================================================================
+// Pass 4: Expression, Pattern, Statement, and Function Body Lowering
+// =========================================================================
+
+fn push_local_scope(ctx: &mut LowerCtx) {
+    ctx.cur_scope_depth += 1
+}
+
+fn pop_local_scope(ctx: &mut LowerCtx) {
+    while ctx.locals_env.len > 0 && ctx.locals_env[ctx.locals_env.len - 1].depth >= ctx.cur_scope_depth {
+        _ := ctx.locals_env.pop()
+    }
+    ctx.cur_scope_depth -= 1
+}
+
+fn lookup_local(ctx: &LowerCtx, name: string) -> i32 {
+    mut i := ctx.locals_env.len - 1
+    while i >= 0 {
+        if ctx.locals_env[i].name == name { return i }
+        i -= 1
+    }
+    -1
+}
+
+fn find_free_fn(ctx: &LowerCtx, mod_id: i32, name: string) -> i32 {
+    for i in 0..ctx.fn_defs.len {
+        if ctx.fn_defs[i].mod_id == mod_id && ctx.fn_defs[i].owner_def < 0 && ctx.fn_defs[i].name == name {
+            return i
+        }
+    }
+    -1
+}
+
+fn find_method_on_def(ctx: &LowerCtx, def_id: i32, name: string) -> i32 {
+    if def_id < 0 { return -1 }
+    for i in 0..ctx.fn_defs.len {
+        if ctx.fn_defs[i].owner_def == def_id && ctx.fn_defs[i].name == name {
+            return i
+        }
+    }
+    -1
+}
+
+fn find_iterator_next_fn(ctx: &LowerCtx, iter_ty: i32) -> i32 {
+    def_id := find_type_def_for_ty(&ctx, iter_ty)
+    if def_id < 0 { return -1 }
+    for i in 0..ctx.fn_defs.len {
+        if ctx.fn_defs[i].owner_def == def_id && ctx.fn_defs[i].name == "next" &&
+            (ctx.fn_defs[i].trait_name == "Iterator" || ctx.fn_defs[i].trait_name == "") {
+            return ctx.fn_defs[i].hir_fn_id
+        }
+    }
+    -1
+}
+
+fn find_const_in_mod(ctx: &LowerCtx, mod_id: i32, name: string) -> i32 {
+    for i in 0..ctx.const_defs.len {
+        if ctx.const_defs[i].mod_id == mod_id && ctx.const_defs[i].name == name { return i }
+    }
+    -1
+}
+
+fn make_zero_expr(ctx: &mut LowerCtx, hf: &mut hb.HirFn, ty: i32, start: i32, end: i32) -> i32 {
+    if ty == ht.TY_BOOL {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitBool, ht.TY_BOOL, 0, 0, 0, 0, 0, 0, "false", ctx.cur_in_unsafe, start, end))
+    }
+    if ty == ht.TY_STRING {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitStr, ht.TY_STRING, 0, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, start, end))
+    }
+    if is_float_ty(ty) {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitFloat, ty, 0, 0, 0, 0, 0, 0, "0.0", ctx.cur_in_unsafe, start, end))
+    }
+    if ty == ht.TY_UNIT {
+        return hb.add_expr(&mut hf, hb.make_expr(.ConstRef, ht.TY_UNIT, 0, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, start, end))
+    }
+    if is_int_ty(ty) || ty == ht.TY_RUNE || ty == ht.TY_PTR {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitInt, ty, 0, 0, 0, 0, 0, 0, "0", ctx.cur_in_unsafe, start, end))
+    }
+    hb.add_expr(&mut hf, hb.make_expr(.ConstRef, ty, 0, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, start, end))
+}
+
+fn coerce_expr(ctx: &mut LowerCtx, hf: &mut hb.HirFn, expr_id: i32, expected_ty: i32) -> i32 {
+    if expected_ty < 0 || expected_ty >= ctx.prog.types.entries.len || expr_id < 0 || expr_id >= hf.exprs.len {
+        return expr_id
+    }
+    got_ty := hf.exprs[expr_id].ty
+    if got_ty == expected_ty || expected_ty == ht.TY_ERROR { return expr_id }
+    exp_k := ctx.prog.types.entries[expected_ty].kind
+    got_k := if got_ty >= 0 && got_ty < ctx.prog.types.entries.len { ctx.prog.types.entries[got_ty].kind } else { ht.TypeKind.Error }
+
+    // Untyped int literal coercion
+    if hf.exprs[expr_id].kind == .LitInt && (is_int_ty(expected_ty) || is_float_ty(expected_ty)) {
+        hf.exprs[expr_id].ty = expected_ty
+        return expr_id
+    }
+    // Untyped empty array literal `[]` coercion
+    if hf.exprs[expr_id].kind == .ArrayLit && hf.exprs[expr_id].arg_len == 0 && (exp_k == .Array || exp_k == .FixedArr || exp_k == .FatSlice) {
+        hf.exprs[expr_id].ty = expected_ty
+        return expr_id
+    }
+    // ArrayLit element coercion ([1, 2] -> []i32 when ArrayLit was inferred as FixedArr or Array)
+    if hf.exprs[expr_id].kind == .ArrayLit && (exp_k == .Array || exp_k == .FixedArr) {
+        hf.exprs[expr_id].ty = expected_ty
+        return expr_id
+    }
+    // &[]T coercion from &Array / &FixedArr / Ref(Array)
+    if exp_k == .FatSlice && got_k == .Ref {
+        inner := ctx.prog.types.entries[got_ty].inner_a
+        ik := ctx.prog.types.entries[inner].kind
+        if ik == .Array || ik == .FixedArr {
+            if hf.exprs[expr_id].kind == .Ref {
+                base_e := hf.exprs[expr_id].a
+                sp_s := hf.exprs[expr_id].span_start
+                sp_e := hf.exprs[expr_id].span_end
+                return hb.add_expr(&mut hf, hb.make_expr(.Slice, expected_ty, base_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+        }
+    }
+    // &[]T coercion directly from Array / FixedArr when passed to BorrowOrCopy / FatSlice
+    if exp_k == .FatSlice && (got_k == .Array || got_k == .FixedArr) {
+        sp_s := hf.exprs[expr_id].span_start
+        sp_e := hf.exprs[expr_id].span_end
+        return hb.add_expr(&mut hf, hb.make_expr(.Slice, expected_ty, expr_id, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    // &str coercion from &string or string
+    if exp_k == .FatStr && got_k == .Ref && ctx.prog.types.entries[got_ty].inner_a == ht.TY_STRING {
+        if hf.exprs[expr_id].kind == .Ref {
+            base_e := hf.exprs[expr_id].a
+            sp_s := hf.exprs[expr_id].span_start
+            sp_e := hf.exprs[expr_id].span_end
+            return hb.add_expr(&mut hf, hb.make_expr(.BytesView, expected_ty, base_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+    }
+    if exp_k == .FatStr && got_ty == ht.TY_STRING {
+        sp_s := hf.exprs[expr_id].span_start
+        sp_e := hf.exprs[expr_id].span_end
+        return hb.add_expr(&mut hf, hb.make_expr(.BytesView, expected_ty, expr_id, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    // &T reborrow from &mut T
+    if exp_k == .Ref && got_k == .MutRef && ctx.prog.types.entries[exp_k_inner(&ctx.prog.types, expected_ty)].kind == ctx.prog.types.entries[ctx.prog.types.entries[got_ty].inner_a].kind {
+        if ctx.prog.types.entries[expected_ty].inner_a == ctx.prog.types.entries[got_ty].inner_a {
+            sp_s := hf.exprs[expr_id].span_start
+            sp_e := hf.exprs[expr_id].span_end
+            d := hb.add_expr(&mut hf, hb.make_expr(.Deref, ctx.prog.types.entries[got_ty].inner_a, expr_id, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            return hb.add_expr(&mut hf, hb.make_expr(.Ref, expected_ty, d, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+    }
+    // &[]T reborrow from &mut []T
+    if exp_k == .FatSlice && got_k == .MutRef {
+        inner := ctx.prog.types.entries[got_ty].inner_a
+        if ctx.prog.types.entries[inner].kind == .Array && ctx.prog.types.entries[inner].inner_a == ctx.prog.types.entries[expected_ty].inner_a {
+            sp_s := hf.exprs[expr_id].span_start
+            sp_e := hf.exprs[expr_id].span_end
+            d := hb.add_expr(&mut hf, hb.make_expr(.Deref, inner, expr_id, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            return hb.add_expr(&mut hf, hb.make_expr(.Slice, expected_ty, d, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+    }
+    // Implicit shared borrow: T -> &T
+    if exp_k == .Ref && ctx.prog.types.entries[expected_ty].inner_a == got_ty {
+        sp_s := hf.exprs[expr_id].span_start
+        sp_e := hf.exprs[expr_id].span_end
+        return hb.add_expr(&mut hf, hb.make_expr(.Ref, expected_ty, expr_id, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    // Auto-deref for Copy values: &T / &mut T -> T (e.g. `a + b` where `a: &i32`)
+    if (got_k == .Ref || got_k == .MutRef) && ctx.prog.types.entries[got_ty].inner_a == expected_ty {
+        sp_s := hf.exprs[expr_id].span_start
+        sp_e := hf.exprs[expr_id].span_end
+        return hb.add_expr(&mut hf, hb.make_expr(.Deref, expected_ty, expr_id, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    // RegionSlice<T> -> []T (keep RegionSlice type if possible, else Cast so mir_escape preserves REGION_BIT!)
+    if got_k == .RegionSlice && exp_k == .Array {
+        sp_s := hf.exprs[expr_id].span_start
+        sp_e := hf.exprs[expr_id].span_end
+        return hb.add_expr(&mut hf, hb.make_expr(.Cast, expected_ty, expr_id, expected_ty, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    // Numeric / ClosureEnv / general fallback cast when types differ only on error/placeholder
+    if got_ty == ht.TY_ERROR {
+        hf.exprs[expr_id].ty = expected_ty
+        return expr_id
+    }
+    expr_id
+}
+
+fn exp_k_inner(t: &ht.TypeTable, ty: i32) -> i32 {
+    if ty >= 0 && ty < t.entries.len && t.entries[ty].inner_a >= 0 { return t.entries[ty].inner_a }
+    0
+}
+
+fn check_call_safety(ctx: &mut LowerCtx, callee_mod: i32, is_unsafe: bool, req_caps: i32,
+    name: string, start: i32, end: i32) {
+    if is_unsafe && !ctx.cur_in_unsafe {
+        emit_err(&mut ctx, ctx.cur_mod, "E5001", start, end,
+            "call to unsafe function '" + name + "' requires an 'unsafe' block")
+    }
+    if req_caps != 0 && callee_mod != ctx.cur_mod {
+        missing := req_caps.bit_and(ctx.prog.mod_caps[ctx.cur_mod].bit_not())
+        if missing != 0 {
+            emit_err(&mut ctx, ctx.cur_mod, "E5002", start, end,
+                "call to '" + name + "' requires a module capability not declared in this module")
+        }
+    }
+}
+
+fn lower_ast_call_to_fndef(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, fdi: i32, arg_start: i32, arg_count: i32,
+    recv_hir_expr: i32, use_two_phase: bool, expected_ty: i32, span_s: i32, span_e: i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    fd_mod := ctx.fn_defs[fdi].mod_id
+    fd_pub := ctx.fn_defs[fdi].is_pub
+    fd_unsafe := ctx.fn_defs[fdi].is_unsafe
+    fd_caps := ctx.fn_defs[fdi].requires_caps
+    fd_name := ctx.fn_defs[fdi].name.clone()
+    fd_extern := ctx.fn_defs[fdi].is_extern
+    hir_fid := ctx.fn_defs[fdi].hir_fn_id
+
+    if fd_mod != ctx.cur_mod && !fd_pub {
+        emit_err(&mut ctx, ctx.cur_mod, "E2004", span_s, span_e, "function '" + fd_name + "' is private")
+    }
+    check_call_safety(&mut ctx, fd_mod, fd_unsafe, fd_caps, fd_name, span_s, span_e)
+
+    sig_ty := if hir_fid >= 0 && hir_fid < ctx.prog.fns.len { ctx.prog.fns[hir_fid].sig_ty } else { -1 }
+    ret_ty := if sig_ty >= 0 { ht.callable_ret(&ctx.prog.types, sig_ty) } else { if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT } }
+    p_start := if sig_ty >= 0 { ht.callable_param_start(&ctx.prog.types, sig_ty) } else { 0 }
+    p_cnt := if sig_ty >= 0 { ht.callable_param_count(&ctx.prog.types, sig_ty) } else { 0 }
+
+    mut args: []i32 = []
+    mut p_offset := 0
+    if recv_hir_expr >= 0 {
+        if use_two_phase {
+            args.push(recv_hir_expr)
+        } else if p_cnt > 0 {
+            pty := ctx.prog.types.params[p_start].ty
+            args.push(coerce_expr(&mut ctx, &mut hf, recv_hir_expr, pty))
+        } else {
+            args.push(recv_hir_expr)
+        }
+        p_offset = 1
+    }
+
+    for ai in 0..arg_count {
+        ca := &m.call_args[arg_start + ai]
+        pidx := p_offset + ai
+        pty := if pidx < p_cnt { ctx.prog.types.params[p_start + pidx].ty } else { -1 }
+        // Don't coerce to TypeParam (leave concrete arg type for hir_mono inference!)
+        exp_arg_ty := if pty >= 0 && pty < ctx.prog.types.entries.len && ctx.prog.types.entries[pty].kind != .TypeParam { pty } else { -1 }
+        mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, exp_arg_ty)
+        if ca.is_move {
+            ae = hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end))
+        }
+        if exp_arg_ty >= 0 { ae = coerce_expr(&mut ctx, &mut hf, ae, exp_arg_ty) }
+        args.push(ae)
+    }
+
+    // Substitute concrete ret_ty if generic template
+    mut final_ret := ret_ty
+    if final_ret >= 0 && final_ret < ctx.prog.types.entries.len && ctx.prog.types.entries[final_ret].kind == .TypeParam {
+        if expected_ty >= 0 { final_ret = expected_ty }
+        else if args.len > 0 { final_ret = hf.exprs[args[0]].ty }
+    }
+
+    alist := hb.push_expr_list(&mut hf, &args)
+    if recv_hir_expr >= 0 {
+        c_flag := if use_two_phase { 1 } else { 0 }
+        return hb.add_expr(&mut hf, hb.make_expr(.MethodCall, final_ret, hir_fid, sig_ty, c_flag, alist, args.len, 0, fd_name, ctx.cur_in_unsafe, span_s, span_e))
+    }
+    call_c := if fd_extern { 2 } else { 0 }
+    hb.add_expr(&mut hf, hb.make_expr(.Call, final_ret, hir_fid, sig_ty, call_c, alist, args.len, 0, fd_name, ctx.cur_in_unsafe, span_s, span_e))
+}
+
+fn lower_builtin_method(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, recv_expr: i32, recv_ty: i32, mname: string,
+    arg_start: i32, arg_count: i32, expected_ty: i32, span_s: i32, span_e: i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    safe_recv_ty := if recv_ty >= 0 && recv_ty < ctx.prog.types.entries.len { recv_ty } else { ht.TY_ERROR }
+    rk := ctx.prog.types.entries[safe_recv_ty].kind
+
+    // Handle `&mut T` / `&T` auto-deref for builtin methods
+    mut base_expr := recv_expr
+    mut base_ty := safe_recv_ty
+    mut is_mut_ref_recv := false
+    if rk == .MutRef {
+        base_ty = ctx.prog.types.entries[safe_recv_ty].inner_a
+        base_expr = hb.add_expr(&mut hf, hb.make_expr(.Deref, base_ty, recv_expr, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, span_s, span_e))
+        is_mut_ref_recv = true
+    } else if rk == .Ref {
+        base_ty = ctx.prog.types.entries[safe_recv_ty].inner_a
+        base_expr = hb.add_expr(&mut hf, hb.make_expr(.Deref, base_ty, recv_expr, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, span_s, span_e))
+    }
+    if base_ty < 0 || base_ty >= ctx.prog.types.entries.len { base_ty = ht.TY_ERROR }
+    bk := ctx.prog.types.entries[base_ty].kind
+
+    // Region allocator `scratch.alloc(n)` -> RegionSlice<elem>
+    if base_ty == ctx.region_handle_ty && mname == "alloc" {
+        mut elem_ty := ht.TY_I32
+        if expected_ty >= 0 && expected_ty < ctx.prog.types.entries.len {
+            ek := ctx.prog.types.entries[expected_ty].kind
+            if ek == .Array || ek == .FatSlice || ek == .RegionSlice {
+                elem_ty = ctx.prog.types.entries[expected_ty].inner_a
+            }
+        }
+        rslice_ty := ht.add_region_slice(&mut ctx.prog.types, elem_ty)
+        mut args: []i32 = []
+        for ai in 0..arg_count {
+            args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[arg_start + ai].expr, ht.TY_I32))
+        }
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Slice, rslice_ty, base_expr, 0, 0, alist, args.len, 0, "alloc", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // TaskScope `s.spawn(worker, args...)` -> Task<ret>
+    if base_ty == ctx.task_scope_handle_ty && mname == "spawn" {
+        mut args: []i32 = []
+        mut ret_inner := ht.TY_I32
+        for ai in 0..arg_count {
+            ca := &m.call_args[arg_start + ai]
+            ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, -1)
+            if ai == 0 && hf.exprs[ae].kind == .FnRef {
+                w_sig := hf.exprs[ae].ty
+                w_ret := ht.callable_ret(&ctx.prog.types, w_sig)
+                if w_ret >= 0 { ret_inner = w_ret }
+            }
+            if ca.is_move {
+                args.push(hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end)))
+            } else {
+                args.push(ae)
+            }
+        }
+        task_ty := ht.add_task(&mut ctx.prog.types, ret_inner)
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, task_ty, -1, -1, 3, alist, args.len, 0, "spawn", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // Task<T>.join() -> T
+    if bk == .Task && mname == "join" {
+        inner := ctx.prog.types.entries[base_ty].inner_a
+        args: []i32 = [base_expr]
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, inner, -1, -1, 3, alist, 1, 0, "join", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // `s.as_str()` on string or &str -> FatStr borrowing `s` (S-6 & S-4!)
+    if mname == "as_str" && (base_ty == ht.TY_STRING || bk == .FatStr) {
+        fstr := ht.add_fat_str(&mut ctx.prog.types)
+        return hb.add_expr(&mut hf, hb.make_expr(.BytesView, fstr, base_expr, 0, 0, 0, 0, 0, "as_str", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // `s.bytes()` -> `&[]u8` (FatSlice of u8) borrowing `s`
+    if mname == "bytes" && (base_ty == ht.TY_STRING || bk == .FatStr) {
+        u8_sl := ht.add_fat_slice(&mut ctx.prog.types, ht.TY_U8)
+        return hb.add_expr(&mut hf, hb.make_expr(.BytesView, u8_sl, base_expr, 0, 0, 0, 0, 0, "bytes", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // `s.runes()` -> `[]rune`
+    if mname == "runes" && (base_ty == ht.TY_STRING || bk == .FatStr) {
+        r_arr := ht.add_array(&mut ctx.prog.types, ht.TY_RUNE)
+        args: []i32 = [base_expr]
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, r_arr, -1, -1, 3, alist, 1, 0, "runes", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // `[]T` mutating methods: push, pop, clear, reserve -> TwoPhaseMut on `&mut []T`!
+    if bk == .Array && (mname == "push" || mname == "pop" || mname == "clear" || mname == "reserve") {
+        elem_ty := ctx.prog.types.entries[base_ty].inner_a
+        mut_arr_ty := ht.add_mut_ref(&mut ctx.prog.types, base_ty)
+        no_from: []ht.FromEdge = []
+        mut p_entries: []ht.ParamEntry = [ht.ParamEntry { ty: mut_arr_ty, mode: .MutBorrow }]
+        mut rty := ht.TY_UNIT
+        if mname == "push" {
+            p_entries.push(ht.ParamEntry { ty: elem_ty, mode: .BorrowOrCopy })
+        } else if mname == "reserve" {
+            p_entries.push(ht.ParamEntry { ty: ht.TY_I32, mode: .CopyVal })
+        } else if mname == "pop" {
+            rty = elem_ty
+        }
+        sig := ht.add_fn_ptr(&mut ctx.prog.types, &p_entries, rty, &no_from)
+        mut args: []i32 = [base_expr]
+        for ai in 0..arg_count {
+            ca := &m.call_args[arg_start + ai]
+            exp_a := if mname == "push" { elem_ty } else { ht.TY_I32 }
+            mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, exp_a)
+            if ca.is_move {
+                ae = hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end))
+            }
+            ae = coerce_expr(&mut ctx, &mut hf, ae, exp_a)
+            args.push(ae)
+        }
+        alist := hb.push_expr_list(&mut hf, &args)
+        _ := is_mut_ref_recv
+        return hb.add_expr(&mut hf, hb.make_expr(.MethodCall, rty, -1, sig, 1, alist, args.len, 0, mname, ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // `.clone()` on any value or closure (check S-11 on ClosureEnv!)
+    if mname == "clone" {
+        if bk == .ClosureEnv && !is_type_cloneable(&ctx, base_ty) {
+            emit_err(&mut ctx, ctx.cur_mod, "E3099", span_s, span_e,
+                "cannot clone closure capturing non-cloneable '@resource' value")
+        }
+        ref_ty := ht.add_ref(&mut ctx.prog.types, base_ty)
+        r_e := hb.add_expr(&mut hf, hb.make_expr(.Ref, ref_ty, base_expr, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, span_s, span_e))
+        args: []i32 = [r_e]
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, base_ty, -1, -1, 3, alist, 1, 0, "clone", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // `.str()` -> string
+    if mname == "str" {
+        args: []i32 = [base_expr]
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, ht.TY_STRING, -1, -1, 3, alist, 1, 0, "str", ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // Bitwise methods on integers (`bit_or`, `bit_and`, `bit_xor`, `bit_not`, `shl`, `shr`)
+    if is_int_ty(base_ty) && (mname == "bit_or" || mname == "bit_and" || mname == "bit_xor" || mname == "bit_not" || mname == "shl" || mname == "shr") {
+        mut args: []i32 = [base_expr]
+        for ai in 0..arg_count {
+            ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[arg_start + ai].expr, base_ty)
+            args.push(coerce_expr(&mut ctx, &mut hf, ae, base_ty))
+        }
+        alist := hb.push_expr_list(&mut hf, &args)
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, base_ty, -1, -1, 3, alist, args.len, 0, mname, ctx.cur_in_unsafe, span_s, span_e))
+    }
+
+    // Option<T> / Result<T, E> helper methods
+    if bk == .Enum {
+        e_name := ctx.prog.types.entries[base_ty].name.clone()
+        is_opt := e_name.len >= 7 && e_name[0..7] == "Option<"
+        is_res := e_name.len >= 7 && e_name[0..7] == "Result<"
+        if is_opt || is_res {
+            if mname == "is_some" || mname == "is_none" || mname == "is_ok" || mname == "is_err" {
+                args: []i32 = [base_expr]
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, ht.TY_BOOL, -1, -1, 3, alist, 1, 0, mname, ctx.cur_in_unsafe, span_s, span_e))
+            }
+            if mname == "unwrap" || mname == "unwrap_or" || mname == "unwrap_or_default" {
+                inner := ht.variant_payload_type(&ctx.prog.types, base_ty, 0, 0)
+                rty := if inner >= 0 { inner } else { ht.TY_UNIT }
+                mut args: []i32 = [base_expr]
+                for ai in 0..arg_count {
+                    args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[arg_start + ai].expr, rty))
+                }
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, args.len, 0, mname, ctx.cur_in_unsafe, span_s, span_e))
+            }
+            if mname == "unwrap_err" && is_res {
+                err_t := ht.variant_payload_type(&ctx.prog.types, base_ty, 1, 0)
+                rty := if err_t >= 0 { err_t } else { ht.TY_UNIT }
+                args: []i32 = [base_expr]
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, 1, 0, mname, ctx.cur_in_unsafe, span_s, span_e))
+            }
+        }
+    }
+
+    // Fallback intrinsic method call (e.g. Map/Set/bytes/etc.)
+    mut args: []i32 = [recv_expr]
+    for ai in 0..arg_count {
+        args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[arg_start + ai].expr, -1))
+    }
+    rty := if expected_ty >= 0 { expected_ty } else if mname == "len" || mname == "index_of" { ht.TY_I32 }
+        else if mname == "contains" || mname == "eq" || mname == "is_empty" { ht.TY_BOOL }
+        else { ht.TY_UNIT }
+    alist := hb.push_expr_list(&mut hf, &args)
+    hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, args.len, 0, mname, ctx.cur_in_unsafe, span_s, span_e))
+}
+
+fn lower_closure_expr(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, expr_node_id: i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    en := &m.exprs[expr_node_id]
+    cl := &m.closures[en.extra]
+
+    mut cap_fields: []ht.FieldEntry = []
+    mut cap_exprs: []i32 = []
+    mut cap_names: []string = []
+    mut is_borrowed := false
+    mut is_mut := false
+    is_once := false
+
+    for ci in 0..cl.cap_count {
+        cap := &m.captures[cl.first_cap + ci]
+        cap_names.push(cap.name.clone())
+        mut cap_e := -1
+        mut cap_ty := ht.TY_I32
+        if cap.init_expr >= 0 {
+            exp_cty := if cap.ty >= 0 { lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, cap.ty) } else { -1 }
+            cap_e = lower_expr(&mut ctx, &mods, &imports, &mut hf, cap.init_expr, exp_cty)
+            cap_ty = hf.exprs[cap_e].ty
+        } else {
+            lidx := lookup_local(&ctx, cap.name)
+            if lidx >= 0 {
+                lid := ctx.locals_env[lidx].local_id
+                lty := ctx.locals_env[lidx].ty
+                lref := hb.add_expr(&mut hf, hb.make_expr(.LocalRef, lty, lid, 0, 0, 0, 0, 0, cap.name, ctx.cur_in_unsafe, cap.span.start, cap.span.end))
+                if cap.is_ref && cap.is_mut {
+                    is_borrowed = true; is_mut = true
+                    cap_ty = ht.add_mut_ref(&mut ctx.prog.types, lty)
+                    cap_e = hb.add_expr(&mut hf, hb.make_expr(.MutRef, cap_ty, lref, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, cap.span.start, cap.span.end))
+                } else if cap.is_ref {
+                    is_borrowed = true
+                    cap_ty = ht.add_ref(&mut ctx.prog.types, lty)
+                    cap_e = hb.add_expr(&mut hf, hb.make_expr(.Ref, cap_ty, lref, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, cap.span.start, cap.span.end))
+                } else {
+                    // By-value capture
+                    cap_ty = if cap.ty >= 0 { lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, cap.ty) } else { lty }
+                    // S-11: non-move Fn closure capturing a non-Clone @resource by value -> E3099!
+                    ht.seal(&mut ctx.prog.types)
+                    if !cl.is_move && (ht.has_flag(&ctx.prog.types, cap_ty, ht.TF_RESOURCE) || ht.has_flag(&ctx.prog.types, cap_ty, ht.TF_DISPOSE)) &&
+                        !is_type_cloneable(&ctx, cap_ty) {
+                        emit_err(&mut ctx, ctx.cur_mod, "E3099", cap.span.start, cap.span.end,
+                            "closure cannot capture non-cloneable '@resource' type '" + ctx.prog.types.entries[cap_ty].name + "' by value")
+                    }
+                    if cap.is_move || !ht.is_copy(&ctx.prog.types, cap_ty) {
+                        cap_e = hb.add_expr(&mut hf, hb.make_expr(.Move, cap_ty, lref, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, cap.span.start, cap.span.end))
+                    } else {
+                        cap_e = lref
+                    }
+                }
+            } else {
+                cap_e = make_zero_expr(&mut ctx, &mut hf, ht.TY_I32, cap.span.start, cap.span.end)
+            }
+        }
+        cap_exprs.push(cap_e)
+        cap_fields.push(ht.FieldEntry { name: cap.name.clone(), ty: cap_ty, offset: 0, is_pub: false, origin_slot: -1 })
+    }
+
+    // Lower closure parameters & return type
+    mut params: []ht.ParamEntry = []
+    mut p_names: []string = []
+    mut p_tys: []i32 = []
+    mut p_muts: []bool = []
+    for pi in 0..cl.param_count {
+        pr := &m.params[cl.first_param + pi]
+        pty := if pr.ty >= 0 { lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, pr.ty) } else { ht.TY_I32 }
+        pm: ht.ParamMode = if pr.is_move { .MoveVal }
+            else if ctx.prog.types.entries[pty].kind == .MutRef { .MutBorrow }
+            else if ctx.prog.types.entries[pty].kind == .Ref { .SharedBorrow }
+            else { .BorrowOrCopy }
+        params.push(ht.ParamEntry { ty: pty, mode: pm })
+        p_names.push(pr.name.clone())
+        p_tys.push(pty)
+        p_muts.push(pr.is_mut)
+    }
+    ret_ty := if cl.ret_ty >= 0 { lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, cl.ret_ty) } else { ht.TY_UNIT }
+
+    // Lower `from` edges on closure (supporting both parameter names AND captured env names -> PARAM_ENV!)
+    mut from_edges: []ht.FromEdge = []
+    for fi in 0..cl.from_count {
+        fs := &m.from_sources[cl.first_from + fi]
+        mut matched_param := -1
+        for pi in 0..p_names.len {
+            if p_names[pi] == fs.root_name { matched_param = pi; break }
+        }
+        if matched_param >= 0 {
+            from_edges.push(ht.FromEdge { param_idx: matched_param, field_slot: -1, ret_slot: 0 })
+        } else {
+            // Capture name or `env` -> PARAM_ENV!
+            from_edges.push(ht.FromEdge { param_idx: ht.PARAM_ENV, field_slot: -1, ret_slot: 0 })
+        }
+    }
+
+    ctx.closure_counter += 1
+    cl_name := "__closure_" + ctx.closure_counter.str()
+    cl_ty := ht.add_closure_env(&mut ctx.prog.types, cl_name.clone(), ctx.cur_mod,
+        is_mut, is_once, is_borrowed, &cap_fields, &params, ret_ty, &from_edges)
+
+    // Reserve a concrete fn_id for the closure body
+    cl_fn_id := ctx.prog.fns.len + ctx.pending_closures.len
+    mut cl_fn := hb.new_fn(cl_fn_id, cl_name, ctx.cur_mod, cl_ty, ret_ty, params.len)
+    cl_fn.is_closure_body = true
+    cl_fn.span_start = cl.span.start
+    cl_fn.span_end = cl.span.end
+
+    // Save enclosing local env & state, then lower closure body
+    saved_env := ctx.locals_env.clone()
+    saved_depth := ctx.cur_scope_depth
+    saved_ret := ctx.cur_ret_ty
+    saved_unsafe := ctx.cur_in_unsafe
+    ctx.locals_env.clear()
+    ctx.cur_scope_depth = 0
+    ctx.cur_ret_ty = ret_ty
+
+    // Add params as locals 0..param_count-1 (so mir_escape param indices align 1:1!)
+    for pi in 0..params.len {
+        lid := hb.add_local(&mut cl_fn, p_names[pi], p_tys[pi], params[pi].mode, p_muts[pi], true, cl.span.start, cl.span.end)
+        ctx.locals_env.push(LocalScopeEntry {
+            name: p_names[pi].clone(), local_id: lid, ty: p_tys[pi], is_mut: p_muts[pi],
+            is_region: false, is_task_scope: false, depth: 0,
+        })
+    }
+    // Add captures as initialized locals in closure body
+    mut body_prefix: []i32 = []
+    for ci in 0..cap_fields.len {
+        cname := cap_names[ci].clone()
+        cty := cap_fields[ci].ty
+        lid := hb.add_local(&mut cl_fn, cname.clone(), cty, .CopyVal, is_mut, false, cl.span.start, cl.span.end)
+        z := make_zero_expr(&mut ctx, &mut cl_fn, cty, cl.span.start, cl.span.end)
+        body_prefix.push(hb.add_stmt(&mut cl_fn, hb.make_stmt(.Let, lid, z, -1, 0, 0, ctx.cur_in_unsafe, cl.span.start, cl.span.end)))
+        ctx.locals_env.push(LocalScopeEntry {
+            name: cname, local_id: lid, ty: cty, is_mut: is_mut,
+            is_region: false, is_task_scope: false, depth: 0,
+        })
+    }
+
+    body_stmt := lower_fn_root_block(&mut ctx, &mods, &imports, &mut cl_fn, cl.body, ret_ty, &body_prefix)
+    cl_fn.body_stmt = body_stmt
+    ctx.pending_closures.push(move cl_fn)
+
+    // Restore enclosing env
+    ctx.locals_env = move saved_env
+    ctx.cur_scope_depth = saved_depth
+    ctx.cur_ret_ty = saved_ret
+    ctx.cur_in_unsafe = saved_unsafe
+
+    clist := hb.push_expr_list(&mut hf, &cap_exprs)
+    hb.add_expr(&mut hf, hb.make_expr(.Closure, cl_ty, cl_fn_id, 0, 0, clist, cap_exprs.len, 0, "", ctx.cur_in_unsafe, en.span.start, en.span.end))
+}
+
+fn lower_expr(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, expr_node_id: i32, expected_ty: i32) -> i32 {
+    if expr_node_id < 0 {
+        return make_zero_expr(&mut ctx, &mut hf, if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }, 0, 0)
+    }
+    m := &mods[ctx.cur_mod].ast
+    if expr_node_id >= m.exprs.len {
+        return make_zero_expr(&mut ctx, &mut hf, ht.TY_ERROR, 0, 0)
+    }
+    en := &m.exprs[expr_node_id]
+    sp_s := en.span.start
+    sp_e := en.span.end
+
+    if en.kind == .Group {
+        return lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, expected_ty)
+    }
+    if en.kind == .Int {
+        ty := if expected_ty >= 0 && is_int_ty(expected_ty) { expected_ty } else { ht.TY_I32 }
+        return hb.add_expr(&mut hf, hb.make_expr(.LitInt, ty, 0, 0, 0, 0, 0, parse_i64_lit(en.text), en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .Float {
+        ty := if expected_ty == ht.TY_F32 { ht.TY_F32 } else { ht.TY_F64 }
+        return hb.add_expr(&mut hf, hb.make_expr(.LitFloat, ty, 0, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .Bool {
+        v: i64 = if en.text == "true" { 1 } else { 0 }
+        return hb.add_expr(&mut hf, hb.make_expr(.LitBool, ht.TY_BOOL, 0, 0, 0, 0, 0, v, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .String {
+        ty := if expected_ty >= 0 && expected_ty < ctx.prog.types.entries.len && ctx.prog.types.entries[expected_ty].kind == .FatStr { expected_ty } else { ht.TY_STRING }
+        return hb.add_expr(&mut hf, hb.make_expr(.LitStr, ty, 0, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .CString {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitCStr, ht.TY_CSTR, 0, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .WString {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitWStr, ht.TY_WSTR, 0, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .Rune {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitRune, ht.TY_RUNE, 0, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    if en.kind == .Byte {
+        return hb.add_expr(&mut hf, hb.make_expr(.LitByte, ht.TY_U8, 0, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Ident {
+        // 1. Local variable
+        lidx := lookup_local(&ctx, en.text)
+        if lidx >= 0 {
+            lid := ctx.locals_env[lidx].local_id
+            lty := ctx.locals_env[lidx].ty
+            return hb.add_expr(&mut hf, hb.make_expr(.LocalRef, lty, lid, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        // 2. Const in current module
+        ci := find_const_in_mod(&ctx, ctx.cur_mod, en.text)
+        if ci >= 0 {
+            return hb.add_expr(&mut hf, hb.make_expr(.ConstRef, ctx.const_defs[ci].ty, ci, 0, 0, 0, 0, ctx.const_defs[ci].int_val, ctx.const_defs[ci].text_val, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        // 3. Function reference in current module
+        fdi := find_free_fn(&ctx, ctx.cur_mod, en.text)
+        if fdi >= 0 {
+            fid := ctx.fn_defs[fdi].hir_fn_id
+            sig := ctx.prog.fns[fid].sig_ty
+            return hb.add_expr(&mut hf, hb.make_expr(.FnRef, sig, fid, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        return make_zero_expr(&mut ctx, &mut hf, if expected_ty >= 0 { expected_ty } else { ht.TY_ERROR }, sp_s, sp_e)
+    }
+
+    if en.kind == .Move {
+        inner := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, expected_ty)
+        return hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[inner].ty, inner, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Unary {
+        if en.op == "&" || en.op == "&mut" {
+            is_mut := en.op == "&mut"
+            // Special case: `&arr[lo..hi]` or `&s[lo..hi]` -> HirExprKind.Slice (FatSlice / FatStr)!
+            if !is_mut && en.left >= 0 && m.exprs[en.left].kind == .Slice {
+                sl_node := &m.exprs[en.left]
+                base_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, sl_node.left, -1)
+                mut bty := hf.exprs[base_e].ty
+                mut actual_base := base_e
+                if bty >= 0 && bty < ctx.prog.types.entries.len &&
+                    (ctx.prog.types.entries[bty].kind == .Ref || ctx.prog.types.entries[bty].kind == .MutRef) {
+                    bty = ctx.prog.types.entries[bty].inner_a
+                    actual_base = hb.add_expr(&mut hf, hb.make_expr(.Deref, bty, base_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+                mut bounds: []i32 = []
+                if sl_node.right >= 0 { bounds.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, sl_node.right, ht.TY_I32)) }
+                if sl_node.extra >= 0 { bounds.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, sl_node.extra, ht.TY_I32)) }
+                blist := hb.push_expr_list(&mut hf, &bounds)
+                bk := ctx.prog.types.entries[bty].kind
+                res_ty := if bk == .String || bk == .FatStr { ht.add_fat_str(&mut ctx.prog.types) }
+                    else if bk == .Array || bk == .FixedArr || bk == .FatSlice || bk == .RegionSlice {
+                        ht.add_fat_slice(&mut ctx.prog.types, ctx.prog.types.entries[bty].inner_a)
+                    } else { ht.add_fat_slice(&mut ctx.prog.types, ht.TY_U8) }
+                return hb.add_expr(&mut hf, hb.make_expr(.Slice, res_ty, actual_base, 0, 0, blist, bounds.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            sub := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+            sty := hf.exprs[sub].ty
+            sk := if sty >= 0 && sty < ctx.prog.types.entries.len { ctx.prog.types.entries[sty].kind } else { ht.TypeKind.Error }
+
+            // Reborrow `&mut r` or `&r` when `r: &mut T` -> `&mut *r` / `&*r`! (Cliff 1 + S-3!)
+            if sk == .MutRef {
+                inner_ty := ctx.prog.types.entries[sty].inner_a
+                deref_e := hb.add_expr(&mut hf, hb.make_expr(.Deref, inner_ty, sub, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                if is_mut {
+                    return hb.add_expr(&mut hf, hb.make_expr(.MutRef, sty, deref_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+                ref_ty := ht.add_ref(&mut ctx.prog.types, inner_ty)
+                return hb.add_expr(&mut hf, hb.make_expr(.Ref, ref_ty, deref_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+            // Shared ref `&arr` when expected is `&[]T` -> FatSlice
+            if !is_mut && (sk == .Array || sk == .FixedArr) && expected_ty >= 0 &&
+                expected_ty < ctx.prog.types.entries.len && ctx.prog.types.entries[expected_ty].kind == .FatSlice {
+                return hb.add_expr(&mut hf, hb.make_expr(.Slice, expected_ty, sub, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+            if is_mut {
+                mty := ht.add_mut_ref(&mut ctx.prog.types, sty)
+                return hb.add_expr(&mut hf, hb.make_expr(.MutRef, mty, sub, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+            rty := ht.add_ref(&mut ctx.prog.types, sty)
+            return hb.add_expr(&mut hf, hb.make_expr(.Ref, rty, sub, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        sub := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, expected_ty)
+        rty := if en.op == "!" { ht.TY_BOOL } else { hf.exprs[sub].ty }
+        uop := if en.op == "-" { 1 } else if en.op == "!" { 2 } else { 0 }
+        return hb.add_expr(&mut hf, hb.make_expr(.Unary, rty, sub, uop, 0, 0, 0, 0, en.op, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Binary {
+        mut lhs := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, if is_cmp_op(en.op) { -1 } else { expected_ty })
+        lty := hf.exprs[lhs].ty
+        mut rhs := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.right, lty)
+        // Auto-deref copy operands (e.g. `a + b` where `a: &i32`)
+        lk := ctx.prog.types.entries[lty].kind
+        mut final_lty := lty
+        if (lk == .Ref || lk == .MutRef) && ht.is_copy(&ctx.prog.types, ctx.prog.types.entries[lty].inner_a) {
+            final_lty = ctx.prog.types.entries[lty].inner_a
+            lhs = hb.add_expr(&mut hf, hb.make_expr(.Deref, final_lty, lhs, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        rhs = coerce_expr(&mut ctx, &mut hf, rhs, final_lty)
+        rty := if is_cmp_op(en.op) { ht.TY_BOOL } else { final_lty }
+        return hb.add_expr(&mut hf, hb.make_expr(.Binary, rty, lhs, rhs, binop_code(en.op), 0, 0, 0, en.op, ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Index {
+        base_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+        mut bty := hf.exprs[base_e].ty
+        mut actual_base := base_e
+        if bty >= 0 && bty < ctx.prog.types.entries.len &&
+            (ctx.prog.types.entries[bty].kind == .Ref || ctx.prog.types.entries[bty].kind == .MutRef) {
+            bty = ctx.prog.types.entries[bty].inner_a
+            actual_base = hb.add_expr(&mut hf, hb.make_expr(.Deref, bty, base_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        idx_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.right, ht.TY_I32)
+        bk := ctx.prog.types.entries[bty].kind
+        elem_ty := if bk == .Array || bk == .FixedArr || bk == .FatSlice || bk == .RegionSlice {
+            ctx.prog.types.entries[bty].inner_a
+        } else if bk == .String || bk == .FatStr { ht.TY_U8 }
+        else { ht.TY_I32 }
+        return hb.add_expr(&mut hf, hb.make_expr(.Index, elem_ty, actual_base, idx_e, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Slice {
+        // Standalone `s[lo..hi]` without `&`: on `string` returns owned `string`, else FatStr / FatSlice!
+        base_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+        mut bty := hf.exprs[base_e].ty
+        mut actual_base := base_e
+        if bty >= 0 && bty < ctx.prog.types.entries.len &&
+            (ctx.prog.types.entries[bty].kind == .Ref || ctx.prog.types.entries[bty].kind == .MutRef) {
+            bty = ctx.prog.types.entries[bty].inner_a
+            actual_base = hb.add_expr(&mut hf, hb.make_expr(.Deref, bty, base_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        mut bounds: []i32 = []
+        if en.right >= 0 { bounds.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, en.right, ht.TY_I32)) }
+        if en.extra >= 0 { bounds.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, en.extra, ht.TY_I32)) }
+        bk := if bty >= 0 && bty < ctx.prog.types.entries.len { ctx.prog.types.entries[bty].kind } else { ht.TypeKind.Error }
+        if bk == .String {
+            mut cargs: []i32 = [actual_base]
+            for bi in 0..bounds.len { cargs.push(bounds[bi]) }
+            alist := hb.push_expr_list(&mut hf, &cargs)
+            return hb.add_expr(&mut hf, hb.make_expr(.Call, ht.TY_STRING, -1, -1, 3, alist, cargs.len, 0, "str_slice", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        blist := hb.push_expr_list(&mut hf, &bounds)
+        res_ty := if bk == .FatStr { ht.add_fat_str(&mut ctx.prog.types) }
+            else if bk == .Array || bk == .FixedArr || bk == .FatSlice || bk == .RegionSlice {
+                ht.add_fat_slice(&mut ctx.prog.types, ctx.prog.types.entries[bty].inner_a)
+            } else { ht.add_fat_slice(&mut ctx.prog.types, ht.TY_U8) }
+        return hb.add_expr(&mut hf, hb.make_expr(.Slice, res_ty, actual_base, 0, 0, blist, bounds.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Field {
+        // Module-qualified item `alias.CONST` or `alias.fn_ref`
+        if en.left >= 0 && m.exprs[en.left].kind == .Ident && lookup_local(&ctx, m.exprs[en.left].text) < 0 {
+            tmod := resolve_import_mod(&imports, ctx.cur_mod, m.exprs[en.left].text)
+            if tmod >= 0 {
+                ci := find_const_in_mod(&ctx, tmod, en.text)
+                if ci >= 0 {
+                    if !ctx.const_defs[ci].is_pub {
+                        emit_err(&mut ctx, ctx.cur_mod, "E2004", sp_s, sp_e, "const '" + en.text + "' is private")
+                    }
+                    return hb.add_expr(&mut hf, hb.make_expr(.ConstRef, ctx.const_defs[ci].ty, ci, 0, 0, 0, 0, ctx.const_defs[ci].int_val, ctx.const_defs[ci].text_val, ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+                fdi := find_free_fn(&ctx, tmod, en.text)
+                if fdi >= 0 {
+                    fid := ctx.fn_defs[fdi].hir_fn_id
+                    return hb.add_expr(&mut hf, hb.make_expr(.FnRef, ctx.prog.fns[fid].sig_ty, fid, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+            }
+            // Enum unit variant `EnumName::Variant` or `EnumName.Variant`
+            edef := find_type_def_by_name(&ctx, &imports, ctx.cur_mod, m.exprs[en.left].text)
+            if edef >= 0 && ctx.type_defs[edef].kind == .Enum && ctx.type_defs[edef].concrete_ty >= 0 {
+                ety := ctx.type_defs[edef].concrete_ty
+                vidx := find_variant_idx(&ctx.prog.types, ety, en.text)
+                if vidx >= 0 {
+                    return hb.add_expr(&mut hf, hb.make_expr(.EnumLit, ety, vidx, 0, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+            }
+        }
+
+        // Normal field access (with auto-deref on &T / &mut T)
+        base_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+        mut bty := hf.exprs[base_e].ty
+        mut actual_base := base_e
+        if bty >= 0 && bty < ctx.prog.types.entries.len &&
+            (ctx.prog.types.entries[bty].kind == .Ref || ctx.prog.types.entries[bty].kind == .MutRef) {
+            bty = ctx.prog.types.entries[bty].inner_a
+            actual_base = hb.add_expr(&mut hf, hb.make_expr(.Deref, bty, base_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        bk := ctx.prog.types.entries[bty].kind
+        // Builtin `.len` on Array / FixedArr / FatSlice / RegionSlice / String / FatStr
+        if en.text == "len" && (bk == .Array || bk == .FixedArr || bk == .FatSlice || bk == .RegionSlice || bk == .String || bk == .FatStr) {
+            return hb.add_expr(&mut hf, hb.make_expr(.Field, ht.TY_I32, actual_base, -1, 0, 0, 0, 0, "len", ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+
+        // Opaque struct sealing check (S-2 -> E2006!)
+        if bk == .Struct && ht.has_flag(&ctx.prog.types, bty, ht.TF_OPAQUE) &&
+            ctx.prog.types.entries[bty].owner_mod != ctx.cur_mod {
+            emit_err(&mut ctx, ctx.cur_mod, "E2006", sp_s, sp_e,
+                "cannot access field '" + en.text + "' of opaque struct '" + ctx.prog.types.entries[bty].name + "' outside its declaring module")
+            return make_zero_expr(&mut ctx, &mut hf, ht.TY_ERROR, sp_s, sp_e)
+        }
+
+        fidx := find_field_idx(&ctx.prog.types, bty, en.text)
+        if fidx >= 0 {
+            f_entry_idx := ctx.prog.types.entries[bty].inner_a + fidx
+            fe_ty := ctx.prog.types.fields[f_entry_idx].ty
+            return hb.add_expr(&mut hf, hb.make_expr(.Field, fe_ty, actual_base, fidx, 0, 0, 0, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        return make_zero_expr(&mut ctx, &mut hf, if expected_ty >= 0 { expected_ty } else { ht.TY_I32 }, sp_s, sp_e)
+    }
+
+    if en.kind == .StructLit {
+        // Resolve struct type name (may be `Foo`, `Self`, `mod.Foo`, `Foo<T>`)
+        mut s_ty := -1
+        mut base_name := en.text.clone()
+        mut ty_arg_start := en.first_ty_arg
+        mut ty_arg_count := en.ty_arg_count
+        if en.left >= 0 {
+            le := &m.exprs[en.left]
+            if le.kind == .Ident {
+                if base_name == "" {
+                    base_name = le.text.clone()
+                    if ty_arg_count == 0 { ty_arg_start = le.first_ty_arg; ty_arg_count = le.ty_arg_count }
+                } else {
+                    base_name = le.text + "." + base_name
+                }
+            }
+        }
+        if base_name == "Self" && ctx.self_ty >= 0 {
+            s_ty = ctx.self_ty
+        } else {
+            def_id := find_type_def_by_name(&ctx, &imports, ctx.cur_mod, base_name)
+            if def_id >= 0 {
+                if ty_arg_count > 0 {
+                    mut targs: []i32 = []
+                    for ti in 0..ty_arg_count {
+                        targs.push(lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, m.id_lists[ty_arg_start + ti]))
+                    }
+                    s_ty = instantiate_type_def(&mut ctx, &mods, &imports, def_id, &targs, ctx.cur_mod, sp_s, sp_e)
+                } else {
+                    s_ty = ctx.type_defs[def_id].concrete_ty
+                }
+            }
+        }
+        if s_ty < 0 && expected_ty >= 0 { s_ty = expected_ty }
+        if s_ty < 0 { return make_zero_expr(&mut ctx, &mut hf, ht.TY_ERROR, sp_s, sp_e) }
+
+        // Opaque struct construction check (E2006)
+        if ht.has_flag(&ctx.prog.types, s_ty, ht.TF_OPAQUE) && ctx.prog.types.entries[s_ty].owner_mod != ctx.cur_mod {
+            emit_err(&mut ctx, ctx.cur_mod, "E2006", sp_s, sp_e,
+                "cannot construct opaque struct '" + ctx.prog.types.entries[s_ty].name + "' outside its declaring module")
+        }
+
+        // Order field initializer expressions strictly in field index order!
+        f_count := ctx.prog.types.entries[s_ty].count
+        f_start := ctx.prog.types.entries[s_ty].inner_a
+        mut ordered: []i32 = []
+        for _ in 0..f_count { ordered.push(-1) }
+        for fi in 0..en.child_count {
+            finit := &m.field_inits[en.first_child + fi]
+            if finit.is_rest { continue }
+            idx := find_field_idx(&ctx.prog.types, s_ty, finit.name)
+            if idx >= 0 {
+                fty := ctx.prog.types.fields[f_start + idx].ty
+                ve := lower_expr(&mut ctx, &mods, &imports, &mut hf, finit.expr, fty)
+                ordered[idx] = coerce_expr(&mut ctx, &mut hf, ve, fty)
+            } else {
+                _ := lower_expr(&mut ctx, &mods, &imports, &mut hf, finit.expr, -1)
+            }
+        }
+        for idx in 0..f_count {
+            if ordered[idx] < 0 {
+                fty := ctx.prog.types.fields[f_start + idx].ty
+                ordered[idx] = make_zero_expr(&mut ctx, &mut hf, fty, sp_s, sp_e)
+            }
+        }
+        alist := hb.push_expr_list(&mut hf, &ordered)
+        return hb.add_expr(&mut hf, hb.make_expr(.StructLit, s_ty, 0, 0, 0, alist, ordered.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .VariantShorthand {
+        // `.Some(x)`, `.None`, `.Ok(x)`, `.Err(e)`, or user enum shorthand
+        mut ety := if expected_ty >= 0 && expected_ty < ctx.prog.types.entries.len && ctx.prog.types.entries[expected_ty].kind == .Enum {
+            expected_ty
+        } else { -1 }
+
+        mut args: []i32 = []
+        if ety >= 0 {
+            vidx := find_variant_idx(&ctx.prog.types, ety, en.text)
+            if vidx >= 0 {
+                v_entry := ctx.prog.types.entries[ety].inner_a + vidx
+                vp_start := ctx.prog.types.variants[v_entry].payload_start
+                vp_cnt := ctx.prog.types.variants[v_entry].payload_count
+                for ai in 0..en.child_count {
+                    ca := &m.call_args[en.first_child + ai]
+                    pty := if ai < vp_cnt { ctx.prog.types.fields[vp_start + ai].ty } else { -1 }
+                    mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, pty)
+                    if ca.is_move {
+                        ae = hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end))
+                    }
+                    if pty >= 0 { ae = coerce_expr(&mut ctx, &mut hf, ae, pty) }
+                    args.push(ae)
+                }
+                while args.len < vp_cnt {
+                    pty := ctx.prog.types.fields[vp_start + args.len].ty
+                    args.push(make_zero_expr(&mut ctx, &mut hf, pty, sp_s, sp_e))
+                }
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.EnumLit, ety, vidx, 0, 0, alist, args.len, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+        }
+        // Infer Option<T> or Result<T, E> when no expected enum type
+        for ai in 0..en.child_count {
+            ca := &m.call_args[en.first_child + ai]
+            mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, -1)
+            if ca.is_move {
+                ae = hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end))
+            }
+            args.push(ae)
+        }
+        if en.text == "Some" || en.text == "None" {
+            inner := if args.len > 0 { hf.exprs[args[0]].ty } else { ht.TY_I32 }
+            ety = ht.add_option(&mut ctx.prog.types, inner)
+            vidx := if en.text == "Some" { 0 } else { 1 }
+            alist := hb.push_expr_list(&mut hf, &args)
+            return hb.add_expr(&mut hf, hb.make_expr(.EnumLit, ety, vidx, 0, 0, alist, args.len, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        if en.text == "Ok" || en.text == "Err" {
+            ok_t := if en.text == "Ok" && args.len > 0 { hf.exprs[args[0]].ty } else { ht.TY_UNIT }
+            err_t := if en.text == "Err" && args.len > 0 { hf.exprs[args[0]].ty } else { ht.TY_I32 }
+            ety = ht.add_result(&mut ctx.prog.types, ok_t, err_t)
+            vidx := if en.text == "Ok" { 0 } else { 1 }
+            if args.len == 0 { args.push(make_zero_expr(&mut ctx, &mut hf, if vidx == 0 { ok_t } else { err_t }, sp_s, sp_e)) }
+            alist := hb.push_expr_list(&mut hf, &args)
+            return hb.add_expr(&mut hf, hb.make_expr(.EnumLit, ety, vidx, 0, 0, alist, args.len, 0, en.text, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        return make_zero_expr(&mut ctx, &mut hf, if expected_ty >= 0 { expected_ty } else { ht.TY_ERROR }, sp_s, sp_e)
+    }
+
+    if en.kind == .TupleLit {
+        mut elems: []i32 = []
+        mut elem_tys: []i32 = []
+        for i in 0..en.child_count {
+            cid := m.id_lists[en.first_child + i]
+            exp_e := if expected_ty >= 0 && expected_ty < ctx.prog.types.entries.len &&
+                ctx.prog.types.entries[expected_ty].kind == .Tuple && i < ctx.prog.types.entries[expected_ty].count {
+                ht.field_type(&ctx.prog.types, expected_ty, i)
+            } else { -1 }
+            mut ee := lower_expr(&mut ctx, &mods, &imports, &mut hf, cid, exp_e)
+            if exp_e >= 0 { ee = coerce_expr(&mut ctx, &mut hf, ee, exp_e) }
+            elems.push(ee)
+            elem_tys.push(hf.exprs[ee].ty)
+        }
+        if elems.len == 0 {
+            return make_zero_expr(&mut ctx, &mut hf, ht.TY_UNIT, sp_s, sp_e)
+        }
+        tty := ht.add_tuple(&mut ctx.prog.types, &elem_tys)
+        alist := hb.push_expr_list(&mut hf, &elems)
+        return hb.add_expr(&mut hf, hb.make_expr(.TupleLit, tty, 0, 0, 0, alist, elems.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .ArrayLit {
+        mut exp_elem := -1
+        if expected_ty >= 0 && expected_ty < ctx.prog.types.entries.len {
+            ek := ctx.prog.types.entries[expected_ty].kind
+            if ek == .Array || ek == .FixedArr || ek == .FatSlice {
+                exp_elem = ctx.prog.types.entries[expected_ty].inner_a
+            }
+        }
+        mut elems: []i32 = []
+        mut elem_ty := if exp_elem >= 0 { exp_elem } else { ht.TY_I32 }
+        for i in 0..en.child_count {
+            cid := m.id_lists[en.first_child + i]
+            mut ee := lower_expr(&mut ctx, &mods, &imports, &mut hf, cid, exp_elem)
+            if i == 0 && exp_elem < 0 { elem_ty = hf.exprs[ee].ty }
+            ee = coerce_expr(&mut ctx, &mut hf, ee, elem_ty)
+            elems.push(ee)
+        }
+        arr_ty := if expected_ty >= 0 && expected_ty < ctx.prog.types.entries.len &&
+            (ctx.prog.types.entries[expected_ty].kind == .Array || ctx.prog.types.entries[expected_ty].kind == .FixedArr) {
+            expected_ty
+        } else { ht.add_array(&mut ctx.prog.types, elem_ty) }
+        alist := hb.push_expr_list(&mut hf, &elems)
+        return hb.add_expr(&mut hf, hb.make_expr(.ArrayLit, arr_ty, 0, 0, 0, alist, elems.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .ArrayRepeat {
+        val_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+        cnt := if en.right >= 0 && m.exprs[en.right].kind == .Int { clamp_i32(parse_i64_lit(m.exprs[en.right].text)) } else { 1 }
+        arr_ty := ht.add_fixed_array(&mut ctx.prog.types, hf.exprs[val_e].ty, cnt)
+        alist := hb.push_expr_list(&mut hf, &[val_e])
+        return hb.add_expr(&mut hf, hb.make_expr(.ArrayLit, arr_ty, 0, 0, 0, alist, 1, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .Call {
+        return lower_call_expr(&mut ctx, &mods, &imports, &mut hf, expr_node_id, expected_ty)
+    }
+
+    if en.kind == .MethodCall {
+        return lower_method_call_expr(&mut ctx, &mods, &imports, &mut hf, expr_node_id, expected_ty)
+    }
+
+    if en.kind == .Closure {
+        return lower_closure_expr(&mut ctx, &mods, &imports, &mut hf, expr_node_id)
+    }
+
+    if en.kind == .Try {
+        sub := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+        sty := hf.exprs[sub].ty
+        mut ok_ty := if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }
+        if sty >= 0 && sty < ctx.prog.types.entries.len && ctx.prog.types.entries[sty].kind == .Enum {
+            pt := ht.variant_payload_type(&ctx.prog.types, sty, 0, 0)
+            if pt >= 0 { ok_ty = pt }
+        }
+        return hb.add_expr(&mut hf, hb.make_expr(.Try, ok_ty, sub, 0, 0, 0, 0, 0, "?", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .IfExpr {
+        cond := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, ht.TY_BOOL)
+        then_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.right, expected_ty)
+        then_ty := hf.exprs[then_e].ty
+        mut else_e := -1
+        if en.extra >= 0 {
+            else_e = lower_expr(&mut ctx, &mods, &imports, &mut hf, en.extra, if expected_ty >= 0 { expected_ty } else { then_ty })
+            if expected_ty >= 0 { else_e = coerce_expr(&mut ctx, &mut hf, else_e, expected_ty) }
+            else { else_e = coerce_expr(&mut ctx, &mut hf, else_e, then_ty) }
+        }
+        res_ty := if en.extra < 0 { ht.TY_UNIT } else if expected_ty >= 0 { expected_ty } else { then_ty }
+        return hb.add_expr(&mut hf, hb.make_expr(.If, res_ty, cond, then_e, else_e, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .BlockExpr || en.kind == .UnsafeBlock {
+        is_u := en.kind == .UnsafeBlock
+        if is_u && !mod_has_cap(&ctx, ctx.cur_mod, CAP_UNSAFE) {
+            emit_err(&mut ctx, ctx.cur_mod, "E5001", sp_s, sp_e,
+                "'unsafe' block requires 'capability unsafe'")
+        }
+        prev_u := ctx.cur_in_unsafe
+        if is_u { ctx.cur_in_unsafe = true }
+        push_local_scope(&mut ctx)
+        mut child_stmts: []i32 = []
+        for i in 0..en.child_count {
+            lower_stmt_into(&mut ctx, &mods, &imports, &mut hf, m.id_lists[en.first_child + i], &mut child_stmts)
+        }
+        mut tail := -1
+        mut bty := ht.TY_UNIT
+        if en.extra >= 0 {
+            tail = lower_expr(&mut ctx, &mods, &imports, &mut hf, en.extra, expected_ty)
+            if expected_ty >= 0 { tail = coerce_expr(&mut ctx, &mut hf, tail, expected_ty) }
+            bty = hf.exprs[tail].ty
+        }
+        pop_local_scope(&mut ctx)
+        ctx.cur_in_unsafe = prev_u
+        slist := hb.push_stmt_list(&mut hf, &child_stmts)
+        sk: hb.HirStmtKind = if is_u { .UnsafeBlock } else { .Block }
+        blk_stmt := hb.add_stmt(&mut hf, hb.make_stmt(sk, -1, -1, -1, slist, child_stmts.len, is_u || ctx.cur_in_unsafe, sp_s, sp_e))
+        return hb.add_expr(&mut hf, hb.make_expr(.Block, bty, blk_stmt, tail, 0, 0, 0, 0, "", is_u || ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .MatchExpr {
+        return lower_match_expr(&mut ctx, &mods, &imports, &mut hf, expr_node_id, expected_ty)
+    }
+
+    if en.kind == .ReturnExpr {
+        mut rv := -1
+        if en.left >= 0 {
+            rv = lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, ctx.cur_ret_ty)
+            rv = coerce_expr(&mut ctx, &mut hf, rv, ctx.cur_ret_ty)
+        }
+        rs := hb.add_stmt(&mut hf, hb.make_stmt(.Return, -1, rv, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e))
+        slist := hb.push_stmt_list(&mut hf, &[rs])
+        blk := hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, slist, 1, ctx.cur_in_unsafe, sp_s, sp_e))
+        return hb.add_expr(&mut hf, hb.make_expr(.Block, if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }, blk, -1, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    if en.kind == .BreakExpr || en.kind == .ContinueExpr {
+        sk: hb.HirStmtKind = if en.kind == .BreakExpr { .Break } else { .Continue }
+        bs := hb.add_stmt(&mut hf, hb.make_stmt(sk, -1, -1, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e))
+        slist := hb.push_stmt_list(&mut hf, &[bs])
+        blk := hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, slist, 1, ctx.cur_in_unsafe, sp_s, sp_e))
+        return hb.add_expr(&mut hf, hb.make_expr(.Block, if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }, blk, -1, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+
+    make_zero_expr(&mut ctx, &mut hf, if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }, sp_s, sp_e)
+}
+
+fn lower_call_expr(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, expr_node_id: i32, expected_ty: i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    en := &m.exprs[expr_node_id]
+    sp_s := en.span.start
+    sp_e := en.span.end
+
+    if en.left >= 0 {
+        callee := &m.exprs[en.left]
+
+        // 1. Direct identifier callee: builtins, casts, free fns, or local fn/closure var
+        if callee.kind == .Ident {
+            cname := callee.text.clone()
+
+            // Primitive type cast `i32(x)`, `usize(x)`, `ptr(x)`, etc.
+            cast_ty := is_primitive_type_name(cname)
+            if cast_ty >= 0 && en.child_count == 1 {
+                sub := lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child].expr, -1)
+                return hb.add_expr(&mut hf, hb.make_expr(.Cast, cast_ty, sub, cast_ty, 0, 0, 0, 0, cname, ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            // `addr(&x)` -> AddrOf (unsafe! + feeds mir_escape E4005!)
+            if cname == "addr" && en.child_count == 1 {
+                if !ctx.cur_in_unsafe {
+                    emit_err(&mut ctx, ctx.cur_mod, "E5001", sp_s, sp_e,
+                        "call to 'addr' requires an 'unsafe' block")
+                }
+                arg_ast := m.call_args[en.first_child].expr
+                // Unwrap `&x` / `&mut x` so AddrOf takes place `x` directly!
+                mut place_ast := arg_ast
+                if arg_ast >= 0 && m.exprs[arg_ast].kind == .Unary && (m.exprs[arg_ast].op == "&" || m.exprs[arg_ast].op == "&mut") {
+                    place_ast = m.exprs[arg_ast].left
+                }
+                pe := lower_expr(&mut ctx, &mods, &imports, &mut hf, place_ast, -1)
+                return hb.add_expr(&mut hf, hb.make_expr(.AddrOf, ht.TY_PTR, pe, 0, 0, 0, 0, 0, "addr", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            // Unsafe raw memory intrinsics `load_*` / `store_*`
+            if cname == "load_ptr" || cname == "load_i32" || cname == "load_i64" || cname == "load_u8" ||
+                cname == "store_ptr" || cname == "store_i32" || cname == "store_i64" || cname == "store_u8" {
+                if !ctx.cur_in_unsafe {
+                    emit_err(&mut ctx, ctx.cur_mod, "E5001", sp_s, sp_e,
+                        "call to unsafe intrinsic '" + cname + "' requires an 'unsafe' block")
+                }
+                mut args: []i32 = []
+                for ai in 0..en.child_count {
+                    args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child + ai].expr, -1))
+                }
+                rty := if cname == "load_ptr" { ht.TY_PTR } else if cname == "load_i32" { ht.TY_I32 }
+                    else if cname == "load_i64" { ht.TY_I64 } else if cname == "load_u8" { ht.TY_U8 } else { ht.TY_UNIT }
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, args.len, 0, cname, ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            // `replace(place, val)` / `swap(a, b)`
+            if cname == "replace" && en.child_count == 2 {
+                pa := lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child].expr, -1)
+                pb := lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child + 1].expr, hf.exprs[pa].ty)
+                return hb.add_expr(&mut hf, hb.make_expr(.Replace, hf.exprs[pa].ty, pa, pb, 0, 0, 0, 0, "replace", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+            if cname == "swap" && en.child_count == 2 {
+                pa := lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child].expr, -1)
+                pb := lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child + 1].expr, hf.exprs[pa].ty)
+                return hb.add_expr(&mut hf, hb.make_expr(.Swap, ht.TY_UNIT, pa, pb, 0, 0, 0, 0, "swap", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            // Standard builtins: print, eprint, assert, panic, unreachable, target_is, size_of, align_of, offset_of, zeroed
+            if cname == "print" || cname == "eprint" || cname == "assert" || cname == "panic" ||
+                cname == "unreachable" || cname == "target_is" || cname == "size_of" ||
+                cname == "align_of" || cname == "offset_of" || cname == "zeroed" {
+                mut args: []i32 = []
+                for ai in 0..en.child_count {
+                    a_ast := m.call_args[en.first_child + ai].expr
+                    if a_ast >= 0 && m.exprs[a_ast].kind == .TypeExpr {
+                        _ := lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, m.exprs[a_ast].ty)
+                    } else {
+                        args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, a_ast, -1))
+                    }
+                }
+                rty := if cname == "target_is" { ht.TY_BOOL }
+                    else if cname == "size_of" || cname == "align_of" || cname == "offset_of" { ht.TY_USIZE }
+                    else if cname == "zeroed" && expected_ty >= 0 { expected_ty }
+                    else { ht.TY_UNIT }
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, args.len, 0, cname, ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            // Local variable holding a closure or fn pointer -> Indirect call!
+            lidx := lookup_local(&ctx, cname)
+            if lidx >= 0 {
+                lid := ctx.locals_env[lidx].local_id
+                lty := ctx.locals_env[lidx].ty
+                callee_e := hb.add_expr(&mut hf, hb.make_expr(.LocalRef, lty, lid, 0, 0, 0, 0, 0, cname, ctx.cur_in_unsafe, callee.span.start, callee.span.end))
+                rty := ht.callable_ret(&ctx.prog.types, lty)
+                final_rty := if rty >= 0 { rty } else if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }
+                p_start := ht.callable_param_start(&ctx.prog.types, lty)
+                p_cnt := ht.callable_param_count(&ctx.prog.types, lty)
+                mut args: []i32 = []
+                for ai in 0..en.child_count {
+                    ca := &m.call_args[en.first_child + ai]
+                    exp_a := if ai < p_cnt { ctx.prog.types.params[p_start + ai].ty } else { -1 }
+                    mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, exp_a)
+                    if ca.is_move {
+                        ae = hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end))
+                    }
+                    if exp_a >= 0 { ae = coerce_expr(&mut ctx, &mut hf, ae, exp_a) }
+                    args.push(ae)
+                }
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, final_rty, callee_e, lty, 1, alist, args.len, 0, cname, ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+
+            // Free function in current module
+            fdi := find_free_fn(&ctx, ctx.cur_mod, cname)
+            if fdi >= 0 {
+                return lower_ast_call_to_fndef(&mut ctx, &mods, &imports, &mut hf, fdi,
+                    en.first_child, en.child_count, -1, false, expected_ty, sp_s, sp_e)
+            }
+        }
+
+        // 2. Associated function call `Type::method(...)` or `mod.Type<T>::method(...)`!
+        if callee.kind == .Field && callee.op == "::" {
+            mname := callee.text.clone()
+            mut type_expr := callee.left
+            mut type_name := ""
+            mut ta_start := 0
+            mut ta_count := 0
+            if type_expr >= 0 {
+                te := &m.exprs[type_expr]
+                if te.kind == .Ident {
+                    type_name = te.text.clone()
+                    ta_start = te.first_ty_arg; ta_count = te.ty_arg_count
+                } else if te.kind == .Field && te.left >= 0 && m.exprs[te.left].kind == .Ident {
+                    type_name = m.exprs[te.left].text + "." + te.text
+                    ta_start = te.first_ty_arg; ta_count = te.ty_arg_count
+                }
+            }
+            def_id := if type_name == "Self" && ctx.self_ty >= 0 { find_type_def_for_ty(&ctx, ctx.self_ty) }
+                else { find_type_def_by_name(&ctx, &imports, ctx.cur_mod, type_name) }
+
+            mut owner_ty := -1
+            mut arg_tys: []i32 = []
+            if def_id >= 0 {
+                if ta_count > 0 {
+                    for ti in 0..ta_count {
+                        arg_tys.push(lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, m.id_lists[ta_start + ti]))
+                    }
+                    owner_ty = instantiate_type_def(&mut ctx, &mods, &imports, def_id, &arg_tys, ctx.cur_mod, sp_s, sp_e)
+                } else if ctx.type_defs[def_id].concrete_ty >= 0 {
+                    owner_ty = ctx.type_defs[def_id].concrete_ty
+                }
+
+                // Also enforce `where` bounds on impl blocks of generic structs (e.g. `impl Published<T> where T: Sendable + Sync` — S-10!)
+                if arg_tys.len > 0 && ctx.type_defs[def_id].mod_id >= 0 {
+                    dmod := ctx.type_defs[def_id].mod_id
+                    dm := &mods[dmod].ast
+                    dit := &dm.items[ctx.type_defs[def_id].item_idx]
+                    mut gnames: []string = []
+                    for gi in 0..dit.gen_count { gnames.push(dm.generic_params[dit.first_gen + gi].name.clone()) }
+                    // Check where bounds on the impl block owning `mname`
+                    fdi_w := find_method_on_def(&ctx, def_id, mname)
+                    if fdi_w >= 0 {
+                        impl_mod := ctx.fn_defs[fdi_w].mod_id
+                        impl_it := &mods[impl_mod].ast.items[ctx.fn_defs[fdi_w].item_idx]
+                        ht.seal(&mut ctx.prog.types)
+                        check_where_bounds_for_inst(&mut ctx, &mods, impl_mod, impl_it.first_where, impl_it.where_count,
+                            &gnames, &arg_tys, ctx.cur_mod, sp_s, sp_e)
+                    }
+                }
+
+                // Enum constructor `Enum::Variant(args)`?
+                if ctx.type_defs[def_id].kind == .Enum && owner_ty >= 0 {
+                    vidx := find_variant_idx(&ctx.prog.types, owner_ty, mname)
+                    if vidx >= 0 {
+                        mut args: []i32 = []
+                        for ai in 0..en.child_count {
+                            ca := &m.call_args[en.first_child + ai]
+                            pty := ht.variant_payload_type(&ctx.prog.types, owner_ty, vidx, ai)
+                            mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, pty)
+                            if pty >= 0 { ae = coerce_expr(&mut ctx, &mut hf, ae, pty) }
+                            args.push(ae)
+                        }
+                        alist := hb.push_expr_list(&mut hf, &args)
+                        return hb.add_expr(&mut hf, hb.make_expr(.EnumLit, owner_ty, vidx, 0, 0, alist, args.len, 0, mname, ctx.cur_in_unsafe, sp_s, sp_e))
+                    }
+                }
+
+                // Associated method call (e.g. `SafeBox::new(...)`, `Published<T>::new(...)`, `Layout::bytes(...)`, `OwnedBuf<A>::with_capacity(...)`)
+                fdi := find_method_on_def(&ctx, def_id, mname)
+                if fdi >= 0 && !ctx.fn_defs[fdi].is_generic {
+                    return lower_ast_call_to_fndef(&mut ctx, &mods, &imports, &mut hf, fdi,
+                        en.first_child, en.child_count, -1, false, if expected_ty >= 0 { expected_ty } else { owner_ty }, sp_s, sp_e)
+                }
+                // Generic associated method (e.g. `OwnedBuf<Global>::with_capacity(...)` -> Result<OwnedBuf<Global>, AllocError> or `Published<T>::new(...)` -> Published<T>)
+                mut args: []i32 = []
+                for ai in 0..en.child_count {
+                    ca := &m.call_args[en.first_child + ai]
+                    mut ae := lower_expr(&mut ctx, &mods, &imports, &mut hf, ca.expr, -1)
+                    if ca.is_move {
+                        ae = hb.add_expr(&mut hf, hb.make_expr(.Move, hf.exprs[ae].ty, ae, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, ca.span.start, ca.span.end))
+                    }
+                    args.push(ae)
+                }
+                mut rty := if expected_ty >= 0 { expected_ty } else if owner_ty >= 0 { owner_ty } else { ht.TY_UNIT }
+                if fdi >= 0 && owner_ty >= 0 {
+                    // Check if associated method returns Result<Self, E> (like OwnedBuf::with_capacity)
+                    f_mod := ctx.fn_defs[fdi].mod_id
+                    f_mem := &mods[f_mod].ast.members[ctx.fn_defs[fdi].member_idx]
+                    if f_mem.ty >= 0 && mods[f_mod].ast.types[f_mem.ty].name == "Result" {
+                        rty = ht.add_result(&mut ctx.prog.types, owner_ty, ht.TY_I32)
+                    } else if f_mem.ty >= 0 && mods[f_mod].ast.types[f_mem.ty].name == "Option" {
+                        rty = ht.add_option(&mut ctx.prog.types, owner_ty)
+                    }
+                }
+                alist := hb.push_expr_list(&mut hf, &args)
+                return hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, args.len, 0, mname, ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+        }
+    }
+
+    // Generic fallback indirect call
+    callee_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+    cty := hf.exprs[callee_e].ty
+    rty := ht.callable_ret(&ctx.prog.types, cty)
+    final_rty := if rty >= 0 { rty } else if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }
+    mut args: []i32 = []
+    for ai in 0..en.child_count {
+        args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child + ai].expr, -1))
+    }
+    alist := hb.push_expr_list(&mut hf, &args)
+    if cty >= 0 && (ctx.prog.types.entries[cty].kind == .FnPtr || ctx.prog.types.entries[cty].kind == .ExternFn || ctx.prog.types.entries[cty].kind == .ClosureEnv) {
+        return hb.add_expr(&mut hf, hb.make_expr(.Call, final_rty, callee_e, cty, 1, alist, args.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+    }
+    hb.add_expr(&mut hf, hb.make_expr(.Call, final_rty, -1, -1, 3, alist, args.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+}
+
+fn lower_method_call_expr(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, expr_node_id: i32, expected_ty: i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    en := &m.exprs[expr_node_id]
+    sp_s := en.span.start
+    sp_e := en.span.end
+    mname := en.text.clone()
+
+    // 1. Module-qualified function call `alias.func(args)` (including `sys.*`!)
+    if en.left >= 0 && m.exprs[en.left].kind == .Ident && lookup_local(&ctx, m.exprs[en.left].text) < 0 {
+        alias := m.exprs[en.left].text.clone()
+        tmod := resolve_import_mod(&imports, ctx.cur_mod, alias)
+        if tmod == -2 {
+            // Virtual `sys` module (S-13!)
+            if is_unsafe_sys_fn(mname) && !ctx.cur_in_unsafe {
+                emit_err(&mut ctx, ctx.cur_mod, "E5001", sp_s, sp_e,
+                    "call to unsafe sys function 'sys." + mname + "' requires an 'unsafe' block")
+            }
+            mut args: []i32 = []
+            for ai in 0..en.child_count {
+                args.push(lower_expr(&mut ctx, &mods, &imports, &mut hf, m.call_args[en.first_child + ai].expr, -1))
+            }
+            rty := sys_fn_ret_ty(&mut ctx, mname)
+            alist := hb.push_expr_list(&mut hf, &args)
+            return hb.add_expr(&mut hf, hb.make_expr(.Call, rty, -1, -1, 3, alist, args.len, 0, "sys." + mname, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        if tmod >= 0 {
+            fdi := find_free_fn(&ctx, tmod, mname)
+            if fdi >= 0 {
+                return lower_ast_call_to_fndef(&mut ctx, &mods, &imports, &mut hf, fdi,
+                    en.first_child, en.child_count, -1, false, expected_ty, sp_s, sp_e)
+            }
+        }
+    }
+
+    // 2. Receiver method call `recv.method(args)`
+    recv_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+    recv_ty := hf.exprs[recv_e].ty
+    base_ty := peel_ref(&ctx.prog.types, recv_ty)
+    def_id := find_type_def_for_ty(&ctx, base_ty)
+
+    if def_id >= 0 {
+        fdi := find_method_on_def(&ctx, def_id, mname)
+        if fdi >= 0 && !ctx.fn_defs[fdi].is_generic {
+            rk := ctx.fn_defs[fdi].recv_kind
+            mut actual_recv := recv_e
+            mut use_two_phase := false
+            if rk == .MutRef {
+                use_two_phase = true
+                if ctx.prog.types.entries[recv_ty].kind == .MutRef {
+                    actual_recv = hb.add_expr(&mut hf, hb.make_expr(.Deref, base_ty, recv_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+            } else if rk == .SharedRef {
+                if ctx.prog.types.entries[recv_ty].kind == .MutRef {
+                    d := hb.add_expr(&mut hf, hb.make_expr(.Deref, base_ty, recv_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                    rty_ref := ht.add_ref(&mut ctx.prog.types, base_ty)
+                    actual_recv = hb.add_expr(&mut hf, hb.make_expr(.Ref, rty_ref, d, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                } else if ctx.prog.types.entries[recv_ty].kind != .Ref {
+                    rty_ref := ht.add_ref(&mut ctx.prog.types, base_ty)
+                    actual_recv = hb.add_expr(&mut hf, hb.make_expr(.Ref, rty_ref, recv_e, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+            }
+            return lower_ast_call_to_fndef(&mut ctx, &mods, &imports, &mut hf, fdi,
+                en.first_child, en.child_count, actual_recv, use_two_phase, expected_ty, sp_s, sp_e)
+        }
+    }
+
+    // 3. Builtin methods on arrays, strings, Option, Result, Region, TaskScope, etc.
+    lower_builtin_method(&mut ctx, &mods, &imports, &mut hf, recv_e, recv_ty, mname,
+        en.first_child, en.child_count, expected_ty, sp_s, sp_e)
+}
+
+fn lower_pat(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, hf: &mut hb.HirFn,
+    pat_node_id: i32, subj_ty: i32, is_move: bool) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    if pat_node_id < 0 || pat_node_id >= m.pats.len {
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Wild, ty: subj_ty, local_id: -1, tag: 0, child_start: 0, child_len: 0, is_move_bind: false, span_start: 0, span_end: 0 })
+    }
+    pn := &m.pats[pat_node_id]
+    sp_s := pn.span.start
+    sp_e := pn.span.end
+
+    if pn.kind == .Wildcard || pn.kind == .Rest {
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Wild, ty: subj_ty, local_id: -1, tag: 0, child_start: 0, child_len: 0, is_move_bind: false, span_start: sp_s, span_end: sp_e })
+    }
+    if pn.kind == .Binding {
+        if pn.name == "_" {
+            return hb.add_pat(&mut hf, hb.HirPat { kind: .Wild, ty: subj_ty, local_id: -1, tag: 0, child_start: 0, child_len: 0, is_move_bind: false, span_start: sp_s, span_end: sp_e })
+        }
+        lid := hb.add_local(&mut hf, pn.name.clone(), subj_ty, if is_move { .MoveVal } else { .CopyVal }, pn.is_mut, false, sp_s, sp_e)
+        ctx.locals_env.push(LocalScopeEntry {
+            name: pn.name.clone(), local_id: lid, ty: subj_ty, is_mut: pn.is_mut,
+            is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+        })
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Bind, ty: subj_ty, local_id: lid, tag: 0, child_start: 0, child_len: 0, is_move_bind: is_move || pn.is_move, span_start: sp_s, span_end: sp_e })
+    }
+    if pn.kind == .Literal {
+        v := clamp_i32(parse_i64_lit(pn.name))
+        tag := if pn.neg { -v } else { v }
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Lit, ty: subj_ty, local_id: -1, tag: tag, child_start: 0, child_len: 0, is_move_bind: false, span_start: sp_s, span_end: sp_e })
+    }
+    if pn.kind == .Variant || pn.kind == .Path {
+        // Strip leading `.` or `Enum.`
+        vname := if pn.name.len > 0 && pn.name[0] == 46 { pn.name[1..pn.name.len] } else { split_dot_right(pn.name) }
+        vidx := find_variant_idx(&ctx.prog.types, subj_ty, vname)
+        mut kids: []i32 = []
+        if vidx >= 0 {
+            for ci in 0..pn.child_count {
+                cid := m.id_lists[pn.first_child + ci]
+                pty := ht.variant_payload_type(&ctx.prog.types, subj_ty, vidx, ci)
+                kids.push(lower_pat(&mut ctx, &mods, &mut hf, cid, if pty >= 0 { pty } else { ht.TY_I32 }, is_move))
+            }
+        }
+        plist := hb.push_pat_list(&mut hf, &kids)
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Variant, ty: subj_ty, local_id: -1, tag: if vidx >= 0 { vidx } else { 0 }, child_start: plist, child_len: kids.len, is_move_bind: is_move, span_start: sp_s, span_end: sp_e })
+    }
+    if pn.kind == .Tuple {
+        mut kids: []i32 = []
+        for ci in 0..pn.child_count {
+            cid := m.id_lists[pn.first_child + ci]
+            fty := ht.field_type(&ctx.prog.types, subj_ty, ci)
+            kids.push(lower_pat(&mut ctx, &mods, &mut hf, cid, if fty >= 0 { fty } else { ht.TY_I32 }, is_move))
+        }
+        plist := hb.push_pat_list(&mut hf, &kids)
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Tuple, ty: subj_ty, local_id: -1, tag: 0, child_start: plist, child_len: kids.len, is_move_bind: is_move, span_start: sp_s, span_end: sp_e })
+    }
+    if pn.kind == .Struct {
+        mut kids: []i32 = []
+        for ci in 0..pn.child_count {
+            fp := &m.field_pats[pn.first_child + ci]
+            if fp.is_rest { continue }
+            fidx := find_field_idx(&ctx.prog.types, subj_ty, fp.name)
+            if fidx >= 0 {
+                fty := ht.field_type(&ctx.prog.types, subj_ty, fidx)
+                sub_p := if fp.pat >= 0 {
+                    lower_pat(&mut ctx, &mods, &mut hf, fp.pat, fty, is_move)
+                } else {
+                    lid := hb.add_local(&mut hf, fp.name.clone(), fty, if is_move { .MoveVal } else { .CopyVal }, fp.is_mut, false, fp.span.start, fp.span.end)
+                    ctx.locals_env.push(LocalScopeEntry {
+                        name: fp.name.clone(), local_id: lid, ty: fty, is_mut: fp.is_mut,
+                        is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+                    })
+                    hb.add_pat(&mut hf, hb.HirPat { kind: .Bind, ty: fty, local_id: lid, tag: fidx, child_start: 0, child_len: 0, is_move_bind: is_move, span_start: fp.span.start, span_end: fp.span.end })
+                }
+                hf.pats[sub_p].tag = fidx
+                kids.push(sub_p)
+            }
+        }
+        plist := hb.push_pat_list(&mut hf, &kids)
+        return hb.add_pat(&mut hf, hb.HirPat { kind: .Struct, ty: subj_ty, local_id: -1, tag: 0, child_start: plist, child_len: kids.len, is_move_bind: is_move, span_start: sp_s, span_end: sp_e })
+    }
+    hb.add_pat(&mut hf, hb.HirPat { kind: .Wild, ty: subj_ty, local_id: -1, tag: 0, child_start: 0, child_len: 0, is_move_bind: false, span_start: sp_s, span_end: sp_e })
+}
+
+fn lower_match_expr(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, expr_node_id: i32, expected_ty: i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    en := &m.exprs[expr_node_id]
+    sp_s := en.span.start
+    sp_e := en.span.end
+
+    is_move := en.flags == 1
+    subj := lower_expr(&mut ctx, &mods, &imports, &mut hf, en.left, -1)
+    subj_ty := hf.exprs[subj].ty
+
+    mut arm_triples: []i32 = []
+    mut res_ty := if expected_ty >= 0 { expected_ty } else { ht.TY_UNIT }
+    mut saw_ty := expected_ty >= 0
+    for ai in 0..en.child_count {
+        arm := &m.match_arms[en.first_child + ai]
+        push_local_scope(&mut ctx)
+        pat_id := lower_pat(&mut ctx, &mods, &mut hf, arm.pat, subj_ty, is_move)
+        guard_e := if arm.guard >= 0 { lower_expr(&mut ctx, &mods, &imports, &mut hf, arm.guard, ht.TY_BOOL) } else { -1 }
+        mut body_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, arm.body, if saw_ty { res_ty } else { -1 })
+        if !saw_ty && hf.exprs[body_e].ty != ht.TY_UNIT {
+            res_ty = hf.exprs[body_e].ty
+            saw_ty = true
+        } else if saw_ty {
+            body_e = coerce_expr(&mut ctx, &mut hf, body_e, res_ty)
+        }
+        pop_local_scope(&mut ctx)
+        arm_triples.push(pat_id)
+        arm_triples.push(guard_e)
+        arm_triples.push(body_e)
+    }
+
+    alist := hb.push_expr_list(&mut hf, &arm_triples)
+    hb.add_expr(&mut hf, hb.make_expr(.Match, res_ty, subj, if is_move { 1 } else { 0 }, en.child_count, alist, arm_triples.len, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+}
+
+fn lower_block_stmts_list(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, block_expr_id: i32) -> []i32 {
+    mut out: []i32 = []
+    if block_expr_id < 0 { return out }
+    m := &mods[ctx.cur_mod].ast
+    be := &m.exprs[block_expr_id]
+    if be.kind == .BlockExpr || be.kind == .UnsafeBlock {
+        is_u := be.kind == .UnsafeBlock
+        if is_u && !mod_has_cap(&ctx, ctx.cur_mod, CAP_UNSAFE) {
+            emit_err(&mut ctx, ctx.cur_mod, "E5001", be.span.start, be.span.end,
+                "'unsafe' block requires 'capability unsafe'")
+        }
+        prev_u := ctx.cur_in_unsafe
+        if is_u { ctx.cur_in_unsafe = true }
+        push_local_scope(&mut ctx)
+        for i in 0..be.child_count {
+            lower_stmt_into(&mut ctx, &mods, &imports, &mut hf, m.id_lists[be.first_child + i], &mut out)
+        }
+        if be.extra >= 0 {
+            te := lower_expr(&mut ctx, &mods, &imports, &mut hf, be.extra, -1)
+            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, te, -1, 0, 0, ctx.cur_in_unsafe, be.span.start, be.span.end)))
+        }
+        pop_local_scope(&mut ctx)
+        ctx.cur_in_unsafe = prev_u
+    } else {
+        te := lower_expr(&mut ctx, &mods, &imports, &mut hf, block_expr_id, -1)
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, te, -1, 0, 0, ctx.cur_in_unsafe, be.span.start, be.span.end)))
+    }
+    out
+}
+
+fn lower_stmt_into(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, stmt_node_id: i32, out: &mut []i32) {
+    if stmt_node_id < 0 { return }
+    m := &mods[ctx.cur_mod].ast
+    if stmt_node_id >= m.stmts.len { return }
+    sn := &m.stmts[stmt_node_id]
+    sp_s := sn.span.start
+    sp_e := sn.span.end
+
+    if sn.kind == .Let {
+        // Destructuring let (`Guard { id } := move g` or `(a, b) := tup`)
+        if sn.pat >= 0 {
+            pat := &m.pats[sn.pat]
+            is_move_rhs := sn.expr >= 0 && m.exprs[sn.expr].kind == .Move
+            // For struct destructuring `Guard { id } := move g`: keep place `g` directly so `mir_init` catches S-9!
+            mut base_e := -1
+            if pat.kind == .Struct && is_move_rhs {
+                base_e = lower_expr(&mut ctx, &mods, &imports, &mut hf, m.exprs[sn.expr].left, -1)
+            } else {
+                rhs_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, -1)
+                rhs_ty := hf.exprs[rhs_e].ty
+                tmp_l := hb.add_local(&mut hf, "_pat", rhs_ty, .MoveVal, false, false, sp_s, sp_e)
+                out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, tmp_l, rhs_e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+                base_e = hb.add_expr(&mut hf, hb.make_expr(.LocalRef, rhs_ty, tmp_l, 0, 0, 0, 0, 0, "_pat", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+            bty := hf.exprs[base_e].ty
+            if pat.kind == .Struct {
+                if ht.has_flag(&ctx.prog.types, bty, ht.TF_OPAQUE) && ctx.prog.types.entries[bty].owner_mod != ctx.cur_mod {
+                    emit_err(&mut ctx, ctx.cur_mod, "E2006", sp_s, sp_e,
+                        "cannot destructure opaque struct '" + ctx.prog.types.entries[bty].name + "' outside its declaring module")
+                }
+                for ci in 0..pat.child_count {
+                    fp := &m.field_pats[pat.first_child + ci]
+                    if fp.is_rest { continue }
+                    fidx := find_field_idx(&ctx.prog.types, bty, fp.name)
+                    if fidx >= 0 {
+                        fty := ht.field_type(&ctx.prog.types, bty, fidx)
+                        fe := hb.add_expr(&mut hf, hb.make_expr(.Field, fty, base_e, fidx, 0, 0, 0, 0, fp.name, ctx.cur_in_unsafe, fp.span.start, fp.span.end))
+                        mv_or_fe := if is_move_rhs {
+                            hb.add_expr(&mut hf, hb.make_expr(.Move, fty, fe, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, fp.span.start, fp.span.end))
+                        } else { fe }
+                        bname := if fp.pat >= 0 && m.pats[fp.pat].kind == .Binding { m.pats[fp.pat].name.clone() } else { fp.name.clone() }
+                        if bname != "_" {
+                            lid := hb.add_local(&mut hf, bname.clone(), fty, .MoveVal, sn.is_mut || fp.is_mut, false, fp.span.start, fp.span.end)
+                            ctx.locals_env.push(LocalScopeEntry {
+                                name: bname, local_id: lid, ty: fty, is_mut: sn.is_mut || fp.is_mut,
+                                is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+                            })
+                            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, lid, mv_or_fe, -1, 0, 0, ctx.cur_in_unsafe, fp.span.start, fp.span.end)))
+                        }
+                    }
+                }
+            } else if pat.kind == .Tuple {
+                for ci in 0..pat.child_count {
+                    cid := m.id_lists[pat.first_child + ci]
+                    cp := &m.pats[cid]
+                    if cp.kind == .Wildcard || cp.kind == .Rest || cp.name == "_" { continue }
+                    fty := ht.field_type(&ctx.prog.types, bty, ci)
+                    if fty >= 0 {
+                        fe := hb.add_expr(&mut hf, hb.make_expr(.Field, fty, base_e, ci, 0, 0, 0, 0, ci.str(), ctx.cur_in_unsafe, cp.span.start, cp.span.end))
+                        lid := hb.add_local(&mut hf, cp.name.clone(), fty, .MoveVal, sn.is_mut || cp.is_mut, false, cp.span.start, cp.span.end)
+                        ctx.locals_env.push(LocalScopeEntry {
+                            name: cp.name.clone(), local_id: lid, ty: fty, is_mut: sn.is_mut || cp.is_mut,
+                            is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+                        })
+                        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, lid, fe, -1, 0, 0, ctx.cur_in_unsafe, cp.span.start, cp.span.end)))
+                    }
+                }
+            }
+            return
+        }
+
+        // Standard let binding: `x := expr` or `mut x: T = expr`
+        ann_ty := if sn.ty >= 0 { lower_type_node(&mut ctx, &mods, &imports, ctx.cur_mod, sn.ty) } else { -1 }
+        mut val_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, ann_ty)
+        if ann_ty >= 0 { val_e = coerce_expr(&mut ctx, &mut hf, val_e, ann_ty) }
+        final_ty := if ann_ty >= 0 && hf.exprs[val_e].ty == ann_ty { ann_ty } else { hf.exprs[val_e].ty }
+
+        if sn.name == "_" {
+            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, val_e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+            return
+        }
+        lid := hb.add_local(&mut hf, sn.name.clone(), final_ty, .MoveVal, sn.is_mut, false, sp_s, sp_e)
+        ctx.locals_env.push(LocalScopeEntry {
+            name: sn.name.clone(), local_id: lid, ty: final_ty, is_mut: sn.is_mut,
+            is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+        })
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, lid, val_e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Assign {
+        mut lhs := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.lhs, -1)
+        mut lty := hf.exprs[lhs].ty
+        // Auto-deref `&mut T` local on assignment when RHS has type `T` (e.g. `s = "other"` for `s: &mut string`)!
+        mut exp_rhs_ty := lty
+        if lty >= 0 && lty < ctx.prog.types.entries.len && ctx.prog.types.entries[lty].kind == .MutRef {
+            inner := ctx.prog.types.entries[lty].inner_a
+            mut rhs_probe := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, inner)
+            if hf.exprs[rhs_probe].ty == inner {
+                lhs = hb.add_expr(&mut hf, hb.make_expr(.Deref, inner, lhs, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+                lty = inner
+                if sn.op != "=" {
+                    base_op := sn.op[0..(sn.op.len - 1)]
+                    rhs_probe = hb.add_expr(&mut hf, hb.make_expr(.Binary, lty, lhs, rhs_probe, binop_code(base_op), 0, 0, 0, base_op, ctx.cur_in_unsafe, sp_s, sp_e))
+                }
+                out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Assign, -1, lhs, rhs_probe, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+                return
+            }
+            rhs_probe = coerce_expr(&mut ctx, &mut hf, rhs_probe, lty)
+            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Assign, -1, lhs, rhs_probe, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+            return
+        }
+        mut rhs := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, exp_rhs_ty)
+        rhs = coerce_expr(&mut ctx, &mut hf, rhs, lty)
+        if sn.op != "=" {
+            base_op := sn.op[0..(sn.op.len - 1)]
+            rhs = hb.add_expr(&mut hf, hb.make_expr(.Binary, lty, lhs, rhs, binop_code(base_op), 0, 0, 0, base_op, ctx.cur_in_unsafe, sp_s, sp_e))
+        }
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Assign, -1, lhs, rhs, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Expr {
+        e := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, -1)
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Return {
+        mut rv := -1
+        if sn.expr >= 0 {
+            rv = lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, ctx.cur_ret_ty)
+            rv = coerce_expr(&mut ctx, &mut hf, rv, ctx.cur_ret_ty)
+        }
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Return, -1, rv, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Break {
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Break, -1, -1, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Continue {
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Continue, -1, -1, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Defer {
+        d_stmts := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+        dlist := hb.push_stmt_list(&mut hf, &d_stmts)
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Defer, -1, -1, -1, dlist, d_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .While {
+        cond := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, ht.TY_BOOL)
+        b_stmts := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+        blist := hb.push_stmt_list(&mut hf, &b_stmts)
+        blk := hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, blist, b_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e))
+        wlist := hb.push_stmt_list(&mut hf, &[blk])
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.While, -1, cond, -1, wlist, 1, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .For {
+        // Case A: Range loop `for i in lo..hi { ... }`
+        if sn.expr >= 0 && m.exprs[sn.expr].kind == .Range {
+            rn := &m.exprs[sn.expr]
+            mut lo := lower_expr(&mut ctx, &mods, &imports, &mut hf, rn.left, ht.TY_I32)
+            mut idx_ty := hf.exprs[lo].ty
+            if idx_ty >= 0 && idx_ty < ctx.prog.types.entries.len &&
+                (ctx.prog.types.entries[idx_ty].kind == .Ref || ctx.prog.types.entries[idx_ty].kind == .MutRef) {
+                idx_ty = ctx.prog.types.entries[idx_ty].inner_a
+                lo = hb.add_expr(&mut hf, hb.make_expr(.Deref, idx_ty, lo, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            }
+            mut hi := lower_expr(&mut ctx, &mods, &imports, &mut hf, rn.right, idx_ty)
+            hi = coerce_expr(&mut ctx, &mut hf, hi, idx_ty)
+            push_local_scope(&mut ctx)
+            mut lid := -1
+            if sn.name != "_" && sn.name != "" {
+                lid = hb.add_local(&mut hf, sn.name.clone(), idx_ty, .CopyVal, true, false, sp_s, sp_e)
+                ctx.locals_env.push(LocalScopeEntry {
+                    name: sn.name.clone(), local_id: lid, ty: idx_ty, is_mut: false,
+                    is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+                })
+            }
+            b_stmts := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+            pop_local_scope(&mut ctx)
+            blist := hb.push_stmt_list(&mut hf, &b_stmts)
+            blk := hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, blist, b_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e))
+            flist := hb.push_stmt_list(&mut hf, &[blk])
+            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.ForRange, lid, lo, hi, flist, 1, ctx.cur_in_unsafe, sp_s, sp_e)))
+            return
+        }
+
+        // Case B: Iterator struct (`for g in text.graphemes(s.as_str())` / `for x in scan(&v)` — S-4!)
+        iter_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.expr, -1)
+        iter_ty := hf.exprs[iter_e].ty
+        next_fid := find_iterator_next_fn(&ctx, iter_ty)
+        if next_fid >= 0 {
+            next_sig := ctx.prog.fns[next_fid].sig_ty
+            opt_ty := ht.callable_ret(&ctx.prog.types, next_sig)
+            item_ty := ht.variant_payload_type(&ctx.prog.types, opt_ty, 0, 0)
+            final_item_ty := if item_ty >= 0 { item_ty } else { ht.TY_I32 }
+            push_local_scope(&mut ctx)
+            mut lid := -1
+            if sn.name != "_" && sn.name != "" {
+                lid = hb.add_local(&mut hf, sn.name.clone(), final_item_ty, .MoveVal, false, false, sp_s, sp_e)
+                ctx.locals_env.push(LocalScopeEntry {
+                    name: sn.name.clone(), local_id: lid, ty: final_item_ty, is_mut: false,
+                    is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+                })
+            }
+            b_stmts := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+            pop_local_scope(&mut ctx)
+            blist := hb.push_stmt_list(&mut hf, &b_stmts)
+            blk := hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, blist, b_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e))
+            flist := hb.push_stmt_list(&mut hf, &[blk])
+            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.ForIter, lid, iter_e, next_fid, flist, 1, ctx.cur_in_unsafe, sp_s, sp_e)))
+            return
+        }
+
+        // Case C: Array / Slice iteration (`for x in &xs` or `for x in xs`) -> ForRange 0..xs.len + element binding
+        base_iter_ty := peel_ref(&ctx.prog.types, iter_ty)
+        bk := ctx.prog.types.entries[base_iter_ty].kind
+        elem_ty := if bk == .Array || bk == .FixedArr || bk == .FatSlice || bk == .RegionSlice {
+            ctx.prog.types.entries[base_iter_ty].inner_a
+        } else if bk == .String || bk == .FatStr { ht.TY_U8 } else { ht.TY_I32 }
+        tmp_arr := hb.add_local(&mut hf, "_for_seq", iter_ty, .CopyVal, false, false, sp_s, sp_e)
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, tmp_arr, iter_e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        arr_ref := hb.add_expr(&mut hf, hb.make_expr(.LocalRef, iter_ty, tmp_arr, 0, 0, 0, 0, 0, "_for_seq", ctx.cur_in_unsafe, sp_s, sp_e))
+        arr_deref := if ctx.prog.types.entries[iter_ty].kind == .Ref || ctx.prog.types.entries[iter_ty].kind == .MutRef {
+            hb.add_expr(&mut hf, hb.make_expr(.Deref, base_iter_ty, arr_ref, 0, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+        } else { arr_ref }
+        lo := hb.add_expr(&mut hf, hb.make_expr(.LitInt, ht.TY_I32, 0, 0, 0, 0, 0, 0, "0", ctx.cur_in_unsafe, sp_s, sp_e))
+        hi := hb.add_expr(&mut hf, hb.make_expr(.Field, ht.TY_I32, arr_deref, -1, 0, 0, 0, 0, "len", ctx.cur_in_unsafe, sp_s, sp_e))
+        idx_l := hb.add_local(&mut hf, "_for_i", ht.TY_I32, .CopyVal, true, false, sp_s, sp_e)
+        push_local_scope(&mut ctx)
+        mut body_stmts: []i32 = []
+        if sn.name != "_" && sn.name != "" {
+            idx_e := hb.add_expr(&mut hf, hb.make_expr(.LocalRef, ht.TY_I32, idx_l, 0, 0, 0, 0, 0, "_for_i", ctx.cur_in_unsafe, sp_s, sp_e))
+            elem_e := hb.add_expr(&mut hf, hb.make_expr(.Index, elem_ty, arr_deref, idx_e, 0, 0, 0, 0, "", ctx.cur_in_unsafe, sp_s, sp_e))
+            lid := hb.add_local(&mut hf, sn.name.clone(), elem_ty, .CopyVal, false, false, sp_s, sp_e)
+            ctx.locals_env.push(LocalScopeEntry {
+                name: sn.name.clone(), local_id: lid, ty: elem_ty, is_mut: false,
+                is_region: false, is_task_scope: false, depth: ctx.cur_scope_depth,
+            })
+            body_stmts.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, lid, elem_e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        }
+        rest := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+        for ri in 0..rest.len { body_stmts.push(rest[ri]) }
+        pop_local_scope(&mut ctx)
+        blist := hb.push_stmt_list(&mut hf, &body_stmts)
+        blk := hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, blist, body_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e))
+        flist := hb.push_stmt_list(&mut hf, &[blk])
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.ForRange, idx_l, lo, hi, flist, 1, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .Region {
+        if sn.cap_expr >= 0 {
+            cap_e := lower_expr(&mut ctx, &mods, &imports, &mut hf, sn.cap_expr, ht.TY_I32)
+            out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, cap_e, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        }
+        push_local_scope(&mut ctx)
+        rlid := hb.add_local(&mut hf, sn.name.clone(), ctx.region_handle_ty, .CopyVal, false, false, sp_s, sp_e)
+        ctx.locals_env.push(LocalScopeEntry {
+            name: sn.name.clone(), local_id: rlid, ty: ctx.region_handle_ty, is_mut: false,
+            is_region: true, is_task_scope: false, depth: ctx.cur_scope_depth,
+        })
+        mut r_stmts: []i32 = []
+        r_init := make_zero_expr(&mut ctx, &mut hf, ctx.region_handle_ty, sp_s, sp_e)
+        r_stmts.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, rlid, r_init, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        b_stmts := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+        for bi in 0..b_stmts.len { r_stmts.push(b_stmts[bi]) }
+        pop_local_scope(&mut ctx)
+        rlist := hb.push_stmt_list(&mut hf, &r_stmts)
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.RegionBlock, rlid, -1, -1, rlist, r_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+
+    if sn.kind == .TaskScope {
+        // Validate `shared` arguments require `Sync` (S-10 -> E5004!)
+        if sn.clause_idx >= 0 && sn.clause_idx < m.task_clauses.len {
+            tc := &m.task_clauses[sn.clause_idx]
+            ht.seal(&mut ctx.prog.types)
+            for si in 0..tc.shared_count {
+                sa := &m.task_shared_args[tc.first_shared + si]
+                se := lower_expr(&mut ctx, &mods, &imports, &mut hf, sa.expr, -1)
+                sty := hf.exprs[se].ty
+                if sa.is_shared && !ht.is_sync(&ctx.prog.types, sty) {
+                    emit_err(&mut ctx, ctx.cur_mod, "E5004", sa.span.start, sa.span.end,
+                        "task scope 'shared' argument of type '" + ctx.prog.types.entries[sty].name + "' requires Sync")
+                }
+                out.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, se, -1, 0, 0, ctx.cur_in_unsafe, sa.span.start, sa.span.end)))
+            }
+        }
+        push_local_scope(&mut ctx)
+        ts_lid := hb.add_local(&mut hf, sn.name.clone(), ctx.task_scope_handle_ty, .CopyVal, false, false, sp_s, sp_e)
+        ctx.locals_env.push(LocalScopeEntry {
+            name: sn.name.clone(), local_id: ts_lid, ty: ctx.task_scope_handle_ty, is_mut: false,
+            is_region: false, is_task_scope: true, depth: ctx.cur_scope_depth,
+        })
+        mut ts_stmts: []i32 = []
+        ts_init := make_zero_expr(&mut ctx, &mut hf, ctx.task_scope_handle_ty, sp_s, sp_e)
+        ts_stmts.push(hb.add_stmt(&mut hf, hb.make_stmt(.Let, ts_lid, ts_init, -1, 0, 0, ctx.cur_in_unsafe, sp_s, sp_e)))
+        b_stmts := lower_block_stmts_list(&mut ctx, &mods, &imports, &mut hf, sn.body)
+        for bi in 0..b_stmts.len { ts_stmts.push(b_stmts[bi]) }
+        pop_local_scope(&mut ctx)
+        tlist := hb.push_stmt_list(&mut hf, &ts_stmts)
+        out.push(hb.add_stmt(&mut hf, hb.make_stmt(.TaskScope, ts_lid, -1, -1, tlist, ts_stmts.len, ctx.cur_in_unsafe, sp_s, sp_e)))
+        return
+    }
+}
+
+fn lower_fn_root_block(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge,
+    hf: &mut hb.HirFn, body_expr_id: i32, ret_ty: i32, prefix_stmts: &[]i32) -> i32 {
+    m := &mods[ctx.cur_mod].ast
+    if body_expr_id < 0 || body_expr_id >= m.exprs.len { return -1 }
+    be := &m.exprs[body_expr_id]
+    mut stmts: []i32 = []
+    for i in 0..prefix_stmts.len { stmts.push(prefix_stmts[i]) }
+    for i in 0..be.child_count {
+        lower_stmt_into(&mut ctx, &mods, &imports, &mut hf, m.id_lists[be.first_child + i], &mut stmts)
+    }
+    if be.extra >= 0 {
+        mut tail := lower_expr(&mut ctx, &mods, &imports, &mut hf, be.extra, if ret_ty != ht.TY_UNIT { ret_ty } else { -1 })
+        if ret_ty != ht.TY_UNIT {
+            tail = coerce_expr(&mut ctx, &mut hf, tail, ret_ty)
+            stmts.push(hb.add_stmt(&mut hf, hb.make_stmt(.Return, -1, tail, -1, 0, 0, ctx.cur_in_unsafe, be.span.start, be.span.end)))
+        } else {
+            stmts.push(hb.add_stmt(&mut hf, hb.make_stmt(.Expr, -1, tail, -1, 0, 0, ctx.cur_in_unsafe, be.span.start, be.span.end)))
+        }
+    }
+    slist := hb.push_stmt_list(&mut hf, &stmts)
+    hb.add_stmt(&mut hf, hb.make_stmt(.Block, -1, -1, -1, slist, stmts.len, ctx.cur_in_unsafe, be.span.start, be.span.end))
+}
+
+fn lower_all_fn_bodies(ctx: &mut LowerCtx, mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge) {
+    empty_prefix: []i32 = []
+    for fdi in 0..ctx.fn_defs.len {
+        fid := ctx.fn_defs[fdi].hir_fn_id
+        if fid < 0 || ctx.fn_defs[fdi].is_extern { continue }
+        mod_id := ctx.fn_defs[fdi].mod_id
+        item_idx := ctx.fn_defs[fdi].item_idx
+        mem_idx := ctx.fn_defs[fdi].member_idx
+        m := &mods[mod_id].ast
+        body_expr := if mem_idx >= 0 { m.members[mem_idx].body_expr } else { m.items[item_idx].body_expr }
+        if body_expr < 0 { continue }
+
+        ctx.cur_mod = mod_id
+        ctx.self_ty = ctx.fn_defs[fdi].owner_ty
+        ctx.cur_ret_ty = ctx.prog.fns[fid].ret_ty
+        ctx.cur_in_unsafe = ctx.prog.fns[fid].is_unsafe
+        ctx.cur_scope_depth = 0
+        ctx.locals_env.clear()
+
+        // Bind generic params if template
+        saved_tp_len := ctx.tp_stack.len
+        if ctx.fn_defs[fdi].is_generic {
+            it := &m.items[item_idx]
+            for gi in 0..it.gen_count {
+                gp := &m.generic_params[it.first_gen + gi]
+                tpty := ht.add_type_param(&mut ctx.prog.types, gp.name.clone(), mod_id)
+                ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: tpty })
+            }
+            if mem_idx >= 0 {
+                mem := &m.members[mem_idx]
+                for gi in 0..mem.gen_count {
+                    gp := &m.generic_params[mem.first_gen + gi]
+                    tpty := ht.add_type_param(&mut ctx.prog.types, gp.name.clone(), mod_id)
+                    ctx.tp_stack.push(TypeParamBinding { name: gp.name.clone(), ty: tpty })
+                }
+            }
+        }
+
+        // Seed locals_env from function parameters
+        for li in 0..ctx.prog.fns[fid].locals.len {
+            lname := ctx.prog.fns[fid].locals[li].name.clone()
+            lty := ctx.prog.fns[fid].locals[li].ty
+            lmut := ctx.prog.fns[fid].locals[li].is_mut
+            ctx.locals_env.push(LocalScopeEntry {
+                name: lname, local_id: li, ty: lty, is_mut: lmut,
+                is_region: false, is_task_scope: false, depth: 0,
+            })
+        }
+
+        // Extract HirFn temporarily so we can mutate both ctx and hf cleanly
+        mut hf := hb.new_fn(fid, ctx.prog.fns[fid].name.clone(), mod_id,
+            ctx.prog.fns[fid].sig_ty, ctx.prog.fns[fid].ret_ty, ctx.prog.fns[fid].param_count)
+        hf.is_pub = ctx.prog.fns[fid].is_pub
+        hf.is_unsafe = ctx.prog.fns[fid].is_unsafe
+        hf.is_extern = ctx.prog.fns[fid].is_extern
+        hf.is_generic_template = ctx.prog.fns[fid].is_generic_template
+        hf.requires_caps = ctx.prog.fns[fid].requires_caps
+        hf.span_start = ctx.prog.fns[fid].span_start
+        hf.span_end = ctx.prog.fns[fid].span_end
+        for li in 0..ctx.prog.fns[fid].locals.len {
+            hl := &ctx.prog.fns[fid].locals[li]
+            _ := hb.add_local(&mut hf, hl.name.clone(), hl.ty, hl.mode, hl.is_mut, hl.is_param, hl.span_start, hl.span_end)
+        }
+
+        root_stmt := lower_fn_root_block(&mut ctx, &mods, &imports, &mut hf, body_expr, hf.ret_ty, &empty_prefix)
+        hf.body_stmt = root_stmt
+        ctx.prog.fns[fid] = move hf
+
+        // Append any closure bodies lowered inside this function at their reserved IDs!
+        while ctx.pending_closures.len > 0 {
+            // Drain in order (index 0 first)
+            mut drained: []hb.HirFn = []
+            for ci in 0..ctx.pending_closures.len {
+                // Move each closure into prog.fns in order
+                c := &ctx.pending_closures[ci]
+                mut cf := hb.new_fn(ctx.prog.fns.len, c.name.clone(), c.owner_mod, c.sig_ty, c.ret_ty, c.param_count)
+                cf.is_closure_body = c.is_closure_body
+                cf.is_unsafe = c.is_unsafe
+                cf.body_stmt = c.body_stmt
+                cf.span_start = c.span_start
+                cf.span_end = c.span_end
+                for i in 0..c.locals.len {
+                    l := &c.locals[i]
+                    _ := hb.add_local(&mut cf, l.name.clone(), l.ty, l.mode, l.is_mut, l.is_param, l.span_start, l.span_end)
+                }
+                for i in 0..c.stmts.len { _ := hb.add_stmt(&mut cf, c.stmts[i]) }
+                for i in 0..c.exprs.len {
+                    ex := &c.exprs[i]
+                    _ := hb.add_expr(&mut cf, hb.make_expr(ex.kind, ex.ty, ex.a, ex.b, ex.c, ex.arg_start, ex.arg_len, ex.int_val, ex.text.clone(), ex.in_unsafe, ex.span_start, ex.span_end))
+                }
+                for i in 0..c.pats.len { _ := hb.add_pat(&mut cf, c.pats[i]) }
+                for i in 0..c.expr_list.len { cf.expr_list.push(c.expr_list[i]) }
+                for i in 0..c.stmt_list.len { cf.stmt_list.push(c.stmt_list[i]) }
+                for i in 0..c.pat_list.len { cf.pat_list.push(c.pat_list[i]) }
+                drained.push(move cf)
+            }
+            ctx.pending_closures.clear()
+            for df in move drained {
+                _ := hb.add_fn(&mut ctx.prog, move df)
+            }
+        }
+
+        ctx.self_ty = -1
+        while ctx.tp_stack.len > saved_tp_len { _ := ctx.tp_stack.pop() }
+    }
+}
+
+// =========================================================================
+// Public Entry Point
+// =========================================================================
+
+pub fn lower_modules(mods: &[]hb.ModuleInput, imports: &[]hb.ImportEdge, platform: i32) -> hb.HirProgram {
+    mut prog := hb.new_program(platform)
+    for mi in 0..mods.len {
+        prog.mod_paths.push(mods[mi].path.clone())
+        prog.mod_caps.push(mods[mi].caps_mask)
+        // Propagate any parser diagnostics
+        m := &mods[mi].ast
+        for di in 0..m.diagnostics.len {
+            prog.diagnostics.push(diag.clone_diag(&m.diagnostics[di]))
+            if m.diagnostics[di].severity == .Error { prog.ok = false }
+        }
+    }
+
+    empty_f: []ht.FieldEntry = []
+    region_ty := ht.add_struct(&mut prog.types, "__RegionHandle", -1, ht.TF_COPY, &empty_f)
+    tscope_ty := ht.add_struct(&mut prog.types, "__TaskScopeHandle", -1, ht.TF_COPY, &empty_f)
+
+    mut ctx := LowerCtx {
+        prog: move prog,
+        platform: platform,
+        type_defs: [],
+        inst_cache: [],
+        fn_defs: [],
+        const_defs: [],
+        send_sync_impls: [],
+        tp_stack: [],
+        self_ty: -1,
+        opt_def: -1,
+        res_def: -1,
+        map_def: -1,
+        set_def: -1,
+        task_def: -1,
+        region_handle_ty: region_ty,
+        task_scope_handle_ty: tscope_ty,
+        cur_mod: 0,
+        cur_ret_ty: ht.TY_UNIT,
+        cur_in_unsafe: false,
+        cur_scope_depth: 0,
+        locals_env: [],
+        pending_closures: [],
+        closure_counter: 0,
+        next_intrinsic_id: -100,
+    }
+
+    collect_all_items(&mut ctx, &mods, &imports)
+    populate_concrete_type_defs(&mut ctx, &mods, &imports)
+    validate_send_sync_impls(&mut ctx)
+    lower_fn_signatures(&mut ctx, &mods, &imports)
+    lower_all_fn_bodies(&mut ctx, &mods, &imports)
+
+    ctx.prog
+}

@@ -1,0 +1,244 @@
+// Unit tests for Phase 1 Milestone 1B: selfhost/hir/{hir_lower, hir_mono} + end-to-end MIR2 checking.
+
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import ..selfhost.hir.hir_types as ht
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.hir.hir_lower as hir_lower
+import ..selfhost.hir.hir_mono as hir_mono
+import ..selfhost.mir2.mir_check as mir_check
+
+fn check_single_src(src: string) -> mir_check.CheckResult {
+    tree := parser.parse_source("unit.ddr", src)
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "unit.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut prog := hir_lower.lower_modules(&mods, &edges, 0)
+    if !prog.ok {
+        return mir_check.CheckResult { ok: false, bodies: [], diagnostics: move prog.diagnostics }
+    }
+    hir_mono.monomorphize(&mut prog)
+    mir_check.check_program(&prog)
+}
+
+fn check_two_mods(src0: string, alias: string, src1: string) -> mir_check.CheckResult {
+    t0 := parser.parse_source("main.ddr", src0)
+    t1 := parser.parse_source("lib.ddr", src1)
+    mods: []hb.ModuleInput = [
+        hb.ModuleInput { mod_id: 0, path: "main.ddr", source: src0.clone(), caps_mask: 0, ast: move t0 },
+        hb.ModuleInput { mod_id: 1, path: "lib.ddr", source: src1.clone(), caps_mask: 0, ast: move t1 },
+    ]
+    edges: []hb.ImportEdge = [hb.ImportEdge { owner_mod: 0, alias: alias.clone(), target_mod: 1 }]
+    mut prog := hir_lower.lower_modules(&mods, &edges, 0)
+    if !prog.ok {
+        return mir_check.CheckResult { ok: false, bodies: [], diagnostics: move prog.diagnostics }
+    }
+    hir_mono.monomorphize(&mut prog)
+    mir_check.check_program(&prog)
+}
+
+fn has_diag_code(diags: &[]diag.Diagnostic, code: string) -> bool {
+    for i in 0..diags.len {
+        if diags[i].code == code { return true }
+    }
+    false
+}
+
+@test
+fn hir_lower_wave2b_ffi_and_types() {
+    src := "capability unsafe\n" +
+        "pub extern type Handle\n" +
+        "pub type Cb = extern \"C\" fn(i32, *const u8) -> *mut u8\n" +
+        "@repr(C)\n" +
+        "struct Packet { tag: u8, val: i64 }\n" +
+        "@repr(C)\n" +
+        "union RawVal { i: i32, f: f32 }\n" +
+        "@repr(i32)\n" +
+        "enum Status { Ok = 0, ErrMem = -1 }\n" +
+        "extern \"C\" {\n" +
+        "    pub fn c_call(p: *const u8) -> i32\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    cs := c\"hello\"\n" +
+        "    ws := w\"wide\"\n" +
+        "    p := Packet { tag: u8(1), val: i64(42) }\n" +
+        "    _ := cs; _ := ws; _ := p.val\n" +
+        "}\n"
+    res := check_single_src(src)
+    assert(res.ok)
+}
+
+@test
+fn hir_lower_opaque_sealing_e2006() {
+    lib := "pub opaque struct Secret { val: i32 }\n" +
+        "impl Secret { pub fn make(v: i32) -> Self { Self { val: v } } }\n"
+    bad_field := "import .lib as lib\n" +
+        "fn main() { s := lib.Secret::make(1); _ := s.val }\n"
+    r1 := check_two_mods(bad_field, "lib", lib)
+    assert(!r1.ok && has_diag_code(&r1.diagnostics, "E2006"))
+
+    bad_ctor := "import .lib as lib\n" +
+        "fn main() { _ := lib.Secret { val: 1 } }\n"
+    r2 := check_two_mods(bad_ctor, "lib", lib)
+    assert(!r2.ok && has_diag_code(&r2.diagnostics, "E2006"))
+
+    good := "import .lib as lib\n" +
+        "fn main() { _ := lib.Secret::make(42) }\n"
+    r3 := check_two_mods(good, "lib", lib)
+    assert(r3.ok)
+}
+
+@test
+fn hir_lower_sendable_sync_and_task_scope() {
+    // 1. Safe impl Sendable on @resource -> E5001
+    r1 := check_single_src(
+        "@resource(dispose)\n" +
+        "pub opaque struct Res { x: i32 }\n" +
+        "impl Res { fn dispose(&mut self) {} }\n" +
+        "impl Sendable for Res {}\n" +
+        "fn main() {}\n")
+    assert(!r1.ok && has_diag_code(&r1.diagnostics, "E5001"))
+
+    // 2. unsafe impl Sendable without capability unsafe -> E5001
+    r2 := check_single_src(
+        "@resource(dispose)\n" +
+        "pub opaque struct Res { x: i32 }\n" +
+        "impl Res { fn dispose(&mut self) {} }\n" +
+        "unsafe impl Sendable for Res {}\n" +
+        "fn main() {}\n")
+    assert(!r2.ok && has_diag_code(&r2.diagnostics, "E5001"))
+
+    // 3. Safe impl Sync on opaque struct holding ptr -> E5004
+    r3 := check_single_src(
+        "opaque struct Bad { p: ptr }\n" +
+        "impl Sync for Bad {}\n" +
+        "fn main() {}\n")
+    assert(!r3.ok && has_diag_code(&r3.diagnostics, "E5004"))
+
+    // 4. Safe impl Sendable + Sync on opaque struct with all Sendable/Sync fields -> OK!
+    r4 := check_single_src(
+        "pub opaque struct SafeBox { label: string, count: i32 }\n" +
+        "impl Sendable for SafeBox {}\n" +
+        "impl Sync for SafeBox {}\n" +
+        "fn main() {\n" +
+        "    b := SafeBox { label: \"hi\", count: 1 }\n" +
+        "    task scope s(1, shared b) { _ := 1 }\n" +
+        "}\n")
+    assert(r4.ok)
+
+    // 5. task scope shared with SendOnly (not Sync) -> E5004
+    r5 := check_single_src(
+        "capability unsafe\n" +
+        "@resource(dispose)\n" +
+        "pub opaque struct SendOnly { fd: i32 }\n" +
+        "impl SendOnly { fn dispose(&mut self) {} }\n" +
+        "unsafe impl Sendable for SendOnly {}\n" +
+        "fn main() {\n" +
+        "    w := SendOnly { fd: 1 }\n" +
+        "    task scope s(1, shared w) { _ := 1 }\n" +
+        "}\n")
+    assert(!r5.ok && has_diag_code(&r5.diagnostics, "E5004"))
+}
+
+@test
+fn hir_lower_non_lending_iterator_validation() {
+    // Lending Iterator (`from self`) MUST be rejected with E4003!
+    bad_iter := "struct BadIter { items: &[]i32, idx: i32 }\n" +
+        "impl Iterator for BadIter {\n" +
+        "    fn next(&mut self) -> Option<&i32> from self {\n" +
+        "        if self.idx >= self.items.len { return .None }\n" +
+        "        .Some(&self.items[self.idx])\n" +
+        "    }\n" +
+        "}\n" +
+        "fn main() {}\n"
+    r1 := check_single_src(bad_iter)
+    assert(!r1.ok && has_diag_code(&r1.diagnostics, "E4003"))
+
+    // Non-lending Iterator (`from self.items`) is ACCEPTED and yields two live borrows!
+    good_iter := "struct Cursor { items: &[]i32, idx: i32 }\n" +
+        "impl Iterator for Cursor {\n" +
+        "    fn next(&mut self) -> Option<&i32> from self.items {\n" +
+        "        if self.idx >= self.items.len { return .None }\n" +
+        "        i := self.idx; self.idx += 1\n" +
+        "        .Some(&self.items[i])\n" +
+        "    }\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    v: []i32 = [10, 20]\n" +
+        "    mut c := Cursor { items: &v, idx: 0 }\n" +
+        "    a := c.next()\n" +
+        "    b := c.next()\n" +
+        "    _ := a; _ := b\n" +
+        "}\n"
+    r2 := check_single_src(good_iter)
+    assert(r2.ok)
+}
+
+@test
+fn hir_lower_closures_s11_param_env_and_unsafe_gates() {
+    // S-11: Fn closure capturing non-Clone @resource -> E3099
+    r1 := check_single_src(
+        "@resource(dispose)\n" +
+        "struct Token { id: i32 }\n" +
+        "impl Token { fn dispose(&mut self) {} }\n" +
+        "fn main() {\n" +
+        "    t := Token { id: 1 }\n" +
+        "    f := fn[t: Token]() -> i32 { t.id }\n" +
+        "    _ := f()\n" +
+        "}\n")
+    assert(!r1.ok && has_diag_code(&r1.diagnostics, "E3099"))
+
+    // PARAM_ENV closure returning borrow from captured vector -> mutating v while r live fails E4003!
+    r2 := check_single_src(
+        "fn main() {\n" +
+        "    mut v: []i32 = [1, 2, 3]\n" +
+        "    f := fn[&v]() -> &i32 from v { &v[0] }\n" +
+        "    r := f()\n" +
+        "    v.push(4)\n" +
+        "    _ := r\n" +
+        "}\n")
+    assert(!r2.ok && has_diag_code(&r2.diagnostics, "E4003"))
+
+    // S-13: sys.net_close outside unsafe -> E5001
+    r3 := check_single_src(
+        "capability network\n" +
+        "import sys\n" +
+        "fn main() { _ := sys.net_close(1) }\n")
+    assert(!r3.ok && has_diag_code(&r3.diagnostics, "E5001"))
+}
+
+@test
+fn hir_mono_direct_generic_instantiation_and_param_mode() {
+    src := "fn id<T>(x: T) -> T { x }\n" +
+        "fn main() {\n" +
+        "    a := id(42)\n" +
+        "    s := \"hello\"\n" +
+        "    b := id(s)\n" +
+        "    _ := a; _ := b\n" +
+        "}\n"
+    tree := parser.parse_source("mono.ddr", src)
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "mono.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut prog := hir_lower.lower_modules(&mods, &edges, 0)
+    assert(prog.ok)
+    // Before mono: `id` is a generic template with ParamMode.BorrowOrCopy
+    assert(prog.fns[0].is_generic_template)
+    hir_mono.monomorphize(&mut prog)
+    assert(prog.types.sealed)
+    // After mono: two concrete instantiations created (`id<...i32>` with CopyVal, `id<...string>` with SharedBorrow)!
+    mut found_i32 := false
+    mut found_str := false
+    for i in 0..prog.fns.len {
+        f := &prog.fns[i]
+        if !f.is_generic_template && f.param_count == 1 && f.locals.len >= 1 {
+            if f.locals[0].ty == ht.TY_I32 && f.locals[0].mode == .CopyVal { found_i32 = true }
+            if f.locals[0].ty == ht.TY_STRING && f.locals[0].mode == .SharedBorrow { found_str = true }
+        }
+    }
+    assert(found_i32 && found_str)
+    res := mir_check.check_program(&prog)
+    assert(res.ok)
+}

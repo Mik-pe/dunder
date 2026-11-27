@@ -1,0 +1,309 @@
+// Direct HIR Monomorphizer & Post-Mono Finalizer (`hir_mono.ddr`).
+// Instantiates reachable generic HirFn templates directly on HIR (zero token rewriting),
+// resolves ParamMode::BorrowOrCopy -> CopyVal (if TF_COPY) or SharedBorrow (if Move),
+// derives ClosureEnv flags, and seals prog.types via ht.seal().
+
+import hir_types as ht
+import hir_body as hb
+
+struct SubstPair {
+    param_ty: i32,
+    concrete_ty: i32,
+}
+
+struct MonoEntry {
+    template_id: i32,
+    key: string,
+    concrete_id: i32,
+}
+
+fn find_subst(subst: &[]SubstPair, ty: i32) -> i32 {
+    for i in 0..subst.len {
+        if subst[i].param_ty == ty { return subst[i].concrete_ty }
+    }
+    -1
+}
+
+fn unify_types(t: &ht.TypeTable, pattern_ty: i32, actual_ty: i32, subst: &mut []SubstPair) {
+    if pattern_ty < 0 || pattern_ty >= t.entries.len || actual_ty < 0 || actual_ty >= t.entries.len {
+        return
+    }
+    pe := &t.entries[pattern_ty]
+    ae := &t.entries[actual_ty]
+    if pe.kind == .TypeParam {
+        if ae.kind != .TypeParam && find_subst(&subst, pattern_ty) < 0 {
+            subst.push(SubstPair { param_ty: pattern_ty, concrete_ty: actual_ty })
+        }
+        return
+    }
+    if pe.kind == ae.kind {
+        if pe.kind == .Ref || pe.kind == .MutRef || pe.kind == .RawConst || pe.kind == .RawMut ||
+            pe.kind == .Array || pe.kind == .FixedArr || pe.kind == .FatSlice || pe.kind == .RegionSlice || pe.kind == .Task {
+            unify_types(&t, pe.inner_a, ae.inner_a, &mut subst)
+        } else if pe.kind == .Tuple && pe.count == ae.count {
+            for i in 0..pe.count {
+                unify_types(&t, t.fields[pe.inner_a + i].ty, t.fields[ae.inner_a + i].ty, &mut subst)
+            }
+        }
+    }
+}
+
+fn substitute_type(t: &mut ht.TypeTable, ty: i32, subst: &[]SubstPair) -> i32 {
+    if ty < 0 || ty >= t.entries.len { return ty }
+    mapped := find_subst(&subst, ty)
+    if mapped >= 0 { return mapped }
+
+    k := t.entries[ty].kind
+    inner_a := t.entries[ty].inner_a
+    cnt := t.entries[ty].count
+
+    if k == .Ref {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_ref(&mut t, ni) }
+    } else if k == .MutRef {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_mut_ref(&mut t, ni) }
+    } else if k == .RawConst {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_raw_ptr(&mut t, ni, false) }
+    } else if k == .RawMut {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_raw_ptr(&mut t, ni, true) }
+    } else if k == .Array {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_array(&mut t, ni) }
+    } else if k == .FixedArr {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_fixed_array(&mut t, ni, cnt) }
+    } else if k == .FatSlice {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_fat_slice(&mut t, ni) }
+    } else if k == .RegionSlice {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_region_slice(&mut t, ni) }
+    } else if k == .Task {
+        ni := substitute_type(&mut t, inner_a, &subst)
+        if ni != inner_a { return ht.add_task(&mut t, ni) }
+    } else if k == .Tuple {
+        mut changed := false
+        mut elems: []i32 = []
+        for i in 0..cnt {
+            old_e := t.fields[inner_a + i].ty
+            new_e := substitute_type(&mut t, old_e, &subst)
+            if new_e != old_e { changed = true }
+            elems.push(new_e)
+        }
+        if changed { return ht.add_tuple(&mut t, &elems) }
+    } else if k == .Enum {
+        ename := t.entries[ty].name.clone()
+        if ename.len >= 7 && ename[0..7] == "Option<" && cnt == 2 {
+            old_p := ht.variant_payload_type(&t, ty, 0, 0)
+            new_p := substitute_type(&mut t, old_p, &subst)
+            if new_p != old_p { return ht.add_option(&mut t, new_p) }
+        } else if ename.len >= 7 && ename[0..7] == "Result<" && cnt == 2 {
+            old_ok := ht.variant_payload_type(&t, ty, 0, 0)
+            old_err := ht.variant_payload_type(&t, ty, 1, 0)
+            new_ok := substitute_type(&mut t, old_ok, &subst)
+            new_err := substitute_type(&mut t, old_err, &subst)
+            if new_ok != old_ok || new_err != old_err { return ht.add_result(&mut t, new_ok, new_err) }
+        }
+    }
+    ty
+}
+
+fn clone_and_substitute_fn(prog: &mut hb.HirProgram, template_id: i32, subst: &[]SubstPair, suffix: string) -> i32 {
+    // Copy metadata & build concrete sig_ty
+    old_sig := prog.fns[template_id].sig_ty
+    old_ret := prog.fns[template_id].ret_ty
+    new_ret := substitute_type(&mut prog.types, old_ret, &subst)
+
+    mut new_params: []ht.ParamEntry = []
+    mut new_from: []ht.FromEdge = []
+    if old_sig >= 0 && old_sig < prog.types.entries.len {
+        p_start := ht.callable_param_start(&prog.types, old_sig)
+        p_cnt := ht.callable_param_count(&prog.types, old_sig)
+        for i in 0..p_cnt {
+            p_ty := prog.types.params[p_start + i].ty
+            p_mode := prog.types.params[p_start + i].mode
+            new_params.push(ht.ParamEntry { ty: substitute_type(&mut prog.types, p_ty, &subst), mode: p_mode })
+        }
+        f_start := prog.types.entries[old_sig].from_start
+        f_len := prog.types.entries[old_sig].from_len
+        for i in 0..f_len { new_from.push(prog.types.from_edges[f_start + i]) }
+    }
+    new_sig := ht.add_fn_ptr(&mut prog.types, &new_params, new_ret, &new_from)
+
+    tname := prog.fns[template_id].name + "<" + suffix + ">"
+    owner_mod := prog.fns[template_id].owner_mod
+    pcnt := prog.fns[template_id].param_count
+    mut nf := hb.new_fn(0, tname, owner_mod, new_sig, new_ret, pcnt)
+    nf.is_pub = prog.fns[template_id].is_pub
+    nf.is_unsafe = prog.fns[template_id].is_unsafe
+    nf.is_extern = prog.fns[template_id].is_extern
+    nf.is_generic_template = false
+    nf.is_trait_default = prog.fns[template_id].is_trait_default
+    nf.is_closure_body = prog.fns[template_id].is_closure_body
+    nf.requires_caps = prog.fns[template_id].requires_caps
+    nf.body_stmt = prog.fns[template_id].body_stmt
+    nf.span_start = prog.fns[template_id].span_start
+    nf.span_end = prog.fns[template_id].span_end
+
+    n_locs := prog.fns[template_id].locals.len
+    for i in 0..n_locs {
+        l_name := prog.fns[template_id].locals[i].name.clone()
+        l_ty := prog.fns[template_id].locals[i].ty
+        l_mode := prog.fns[template_id].locals[i].mode
+        l_mut := prog.fns[template_id].locals[i].is_mut
+        l_param := prog.fns[template_id].locals[i].is_param
+        l_s := prog.fns[template_id].locals[i].span_start
+        l_e := prog.fns[template_id].locals[i].span_end
+        new_lty := substitute_type(&mut prog.types, l_ty, &subst)
+        _ := hb.add_local(&mut nf, l_name, new_lty, l_mode, l_mut, l_param, l_s, l_e)
+    }
+
+    n_stmts := prog.fns[template_id].stmts.len
+    for i in 0..n_stmts {
+        _ := hb.add_stmt(&mut nf, prog.fns[template_id].stmts[i])
+    }
+
+    n_exprs := prog.fns[template_id].exprs.len
+    for i in 0..n_exprs {
+        ek := prog.fns[template_id].exprs[i].kind
+        ety := prog.fns[template_id].exprs[i].ty
+        ea := prog.fns[template_id].exprs[i].a
+        eb := prog.fns[template_id].exprs[i].b
+        ec := prog.fns[template_id].exprs[i].c
+        eas := prog.fns[template_id].exprs[i].arg_start
+        eal := prog.fns[template_id].exprs[i].arg_len
+        eiv := prog.fns[template_id].exprs[i].int_val
+        etxt := prog.fns[template_id].exprs[i].text.clone()
+        eu := prog.fns[template_id].exprs[i].in_unsafe
+        es := prog.fns[template_id].exprs[i].span_start
+        ee := prog.fns[template_id].exprs[i].span_end
+        new_ety := substitute_type(&mut prog.types, ety, &subst)
+        _ := hb.add_expr(&mut nf, hb.make_expr(ek, new_ety, ea, eb, ec, eas, eal, eiv, etxt, eu, es, ee))
+    }
+
+    n_pats := prog.fns[template_id].pats.len
+    for i in 0..n_pats {
+        pk := prog.fns[template_id].pats[i].kind
+        pty := prog.fns[template_id].pats[i].ty
+        plid := prog.fns[template_id].pats[i].local_id
+        ptag := prog.fns[template_id].pats[i].tag
+        pcs := prog.fns[template_id].pats[i].child_start
+        pcl := prog.fns[template_id].pats[i].child_len
+        pmv := prog.fns[template_id].pats[i].is_move_bind
+        ps := prog.fns[template_id].pats[i].span_start
+        pe := prog.fns[template_id].pats[i].span_end
+        new_pty := substitute_type(&mut prog.types, pty, &subst)
+        _ := hb.add_pat(&mut nf, hb.HirPat {
+            kind: pk, ty: new_pty, local_id: plid, tag: ptag,
+            child_start: pcs, child_len: pcl, is_move_bind: pmv, span_start: ps, span_end: pe,
+        })
+    }
+
+    for i in 0..prog.fns[template_id].expr_list.len { nf.expr_list.push(prog.fns[template_id].expr_list[i]) }
+    for i in 0..prog.fns[template_id].stmt_list.len { nf.stmt_list.push(prog.fns[template_id].stmt_list[i]) }
+    for i in 0..prog.fns[template_id].pat_list.len { nf.pat_list.push(prog.fns[template_id].pat_list[i]) }
+
+    hb.add_fn(&mut prog, move nf)
+}
+
+pub fn monomorphize(prog: &mut hb.HirProgram) {
+    // 1. Provisional seal so TF_COPY and layout are up to date for initial concrete types
+    ht.seal(&mut prog.types)
+
+    // 2. Worklist monomorphization over all concrete HirFns calling generic templates
+    mut cache: []MonoEntry = []
+    mut work: []i32 = []
+    for fid in 0..prog.fns.len {
+        if !prog.fns[fid].is_generic_template && !prog.fns[fid].is_extern && prog.fns[fid].body_stmt >= 0 {
+            work.push(fid)
+        }
+    }
+
+    mut head := 0
+    while head < work.len {
+        fid := work[head]
+        head += 1
+        n_exprs := prog.fns[fid].exprs.len
+        for ei in 0..n_exprs {
+            ek := prog.fns[fid].exprs[ei].kind
+            ec := prog.fns[fid].exprs[ei].c
+            if (ek == .Call && ec == 0) || ek == .MethodCall {
+                target := prog.fns[fid].exprs[ei].a
+                if target < 0 || target >= prog.fns.len || !prog.fns[target].is_generic_template {
+                    continue
+                }
+                // Unify template signature param types + ret_ty against concrete call arg types + expr ty
+                t_sig := prog.fns[target].sig_ty
+                p_start := ht.callable_param_start(&prog.types, t_sig)
+                p_cnt := ht.callable_param_count(&prog.types, t_sig)
+                arg_start := prog.fns[fid].exprs[ei].arg_start
+                arg_len := prog.fns[fid].exprs[ei].arg_len
+                mut subst: []SubstPair = []
+                limit := if p_cnt < arg_len { p_cnt } else { arg_len }
+                for ai in 0..limit {
+                    pat_ty := prog.types.params[p_start + ai].ty
+                    arg_eid := prog.fns[fid].expr_list[arg_start + ai]
+                    act_ty := prog.fns[fid].exprs[arg_eid].ty
+                    unify_types(&prog.types, pat_ty, act_ty, &mut subst)
+                }
+                unify_types(&prog.types, prog.fns[target].ret_ty, prog.fns[fid].exprs[ei].ty, &mut subst)
+
+                mut key := ""
+                for si in 0..subst.len {
+                    if si > 0 { key += "," }
+                    key += subst[si].param_ty.str() + "=" + subst[si].concrete_ty.str()
+                }
+                mut conc_id := -1
+                for ci in 0..cache.len {
+                    if cache[ci].template_id == target && cache[ci].key == key {
+                        conc_id = cache[ci].concrete_id
+                        break
+                    }
+                }
+                if conc_id < 0 {
+                    conc_id = clone_and_substitute_fn(&mut prog, target, &subst, key)
+                    cache.push(MonoEntry { template_id: target, key: key, concrete_id: conc_id })
+                    work.push(conc_id)
+                }
+                prog.fns[fid].exprs[ei].a = conc_id
+                prog.fns[fid].exprs[ei].b = prog.fns[conc_id].sig_ty
+                prog.fns[fid].exprs[ei].ty = prog.fns[conc_id].ret_ty
+            }
+        }
+    }
+
+    // 3. Seal TypeTable to compute transitive TF_COPY, TF_DISPOSE, TF_SENDABLE, TF_SYNC, ClosureEnv flags & sizes
+    ht.seal(&mut prog.types)
+
+    // 4. Resolve ParamMode::BorrowOrCopy -> CopyVal (if TF_COPY) or SharedBorrow (if Move)
+    for pi in 0..prog.types.params.len {
+        if prog.types.params[pi].mode == .BorrowOrCopy {
+            pty := prog.types.params[pi].ty
+            if ht.is_copy(&prog.types, pty) {
+                prog.types.params[pi].mode = .CopyVal
+            } else {
+                prog.types.params[pi].mode = .SharedBorrow
+            }
+        }
+    }
+
+    for fid in 0..prog.fns.len {
+        if prog.fns[fid].is_generic_template { continue }
+        for li in 0..prog.fns[fid].locals.len {
+            if prog.fns[fid].locals[li].mode == .BorrowOrCopy {
+                lty := prog.fns[fid].locals[li].ty
+                if ht.is_copy(&prog.types, lty) {
+                    prog.fns[fid].locals[li].mode = .CopyVal
+                } else {
+                    prog.fns[fid].locals[li].mode = .SharedBorrow
+                }
+            }
+        }
+    }
+
+    // 5. Final seal guarantee
+    ht.seal(&mut prog.types)
+}
