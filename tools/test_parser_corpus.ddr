@@ -1,0 +1,434 @@
+capability filesystem, stdio
+
+import .harness as harness
+import ..selfhost.frontend.ast as ast
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import std.fs as fs
+import std.text as text
+import sys
+
+fn is_syntax_error_fixture(rel: string) -> bool {
+    // Exact allowlist of intentional syntax-error fixtures under tests/fixtures/.
+    rel == "tests/fixtures/conditional_errors/mismatched-bracket.ddr" ||
+    rel == "tests/fixtures/conditional_errors/mismatched-parenthesis.ddr" ||
+    rel == "tests/fixtures/impl_errors/impl-non-fn.ddr" ||
+    rel == "tests/fixtures/impl_errors/self-param-outside-impl.ddr"
+}
+
+fn collect_ddr_files(dir: string, out: &mut []string) {
+    listed := fs.list_dir(dir)
+    if listed.is_err() { return }
+    names := listed.unwrap()
+    for name in &names {
+        if name == "." || name == ".." || name == ".git" || name == "build" { continue }
+        full := dir + "/" + name
+        meta := fs.lstat(full)
+        if meta.is_err() { continue }
+        m := meta.unwrap()
+        if m.is_dir {
+            collect_ddr_files(full, &mut out)
+        } else if text.ends_with(name, ".ddr") {
+            out.push(move full)
+        }
+    }
+}
+
+fn check_structural_ast() -> bool {
+    // 1. Items, generics, where, traits, impls, unsafe impl, receivers, from, attributes
+    src1 := "capability process, filesystem\n" +
+        "import std.text as text\n" +
+        "const MAX_LEN: usize = 64\n" +
+        "@derive(Eq, Clone)\n" +
+        "@resource(dispose)\n" +
+        "pub struct Holder<T: Clone + Eq, const N: usize> where T: Sendable {\n" +
+        "    pub data: [T; N],\n" +
+        "    view: &[]T,\n" +
+        "}\n" +
+        "trait Inspect<U>: Clone + Eq where U: Copy {\n" +
+        "    fn peek(&self) -> &U from self.view\n" +
+        "    fn reset(&mut self) { _ := self }\n" +
+        "    fn consume(self) -> i32\n" +
+        "}\n" +
+        "unsafe impl<T: Clone + Eq> Sendable for Holder<T, 4> {}\n" +
+        "impl<T: Clone + Eq> Holder<T, 4> {\n" +
+        "    @requires(process)\n" +
+        "    pub fn get(&self, idx: i32) -> &T from (self.view, self) {\n" +
+        "        &self.view[idx]\n" +
+        "    }\n" +
+        "}\n"
+    m1 := parser.parse_source("struct_check_1.ddr", src1)
+    if !m1.ok || m1.diagnostics.len != 0 {
+        return harness.fail("structural check 1 failed to parse: " +
+            (if m1.diagnostics.len > 0 { m1.diagnostics[0].message.clone() } else { "" }))
+    }
+    if m1.items.len != 7 { return harness.fail("expected 7 items in check 1, got " + m1.items.len.str()) }
+    // Capability names
+    if m1.items[0].kind != .Capability || m1.items[0].name_count != 2 ||
+       m1.name_lists[m1.items[0].first_name] != "process" || m1.name_lists[m1.items[0].first_name + 1] != "filesystem" {
+        return harness.fail("capability names not preserved")
+    }
+    // Import
+    if m1.items[1].kind != .Import || m1.items[1].name != "text" || m1.items[1].target_name != "std.text" {
+        return harness.fail("import alias/path not preserved")
+    }
+    // Const init expr
+    if m1.items[2].kind != .Const || m1.items[2].body_expr < 0 || m1.exprs[m1.items[2].body_expr].kind != .Int {
+        return harness.fail("const initializer not preserved")
+    }
+    // Struct generics, where, attrs, field types
+    st := &m1.items[3]
+    if st.kind != .Struct || st.gen_count != 2 || st.where_count != 1 || st.attr_count != 2 {
+        return harness.fail("struct generics/where/attrs missing")
+    }
+    gp0 := &m1.generic_params[st.first_gen]
+    gp1 := &m1.generic_params[st.first_gen + 1]
+    if gp0.name != "T" || gp0.is_const || gp0.bound_count != 2 {
+        return harness.fail("type generic param bounds missing")
+    }
+    if gp1.name != "N" || !gp1.is_const || gp1.const_ty < 0 {
+        return harness.fail("const generic param missing")
+    }
+    if m1.attrs[st.first_attr].arg_count != 2 || m1.attrs[st.first_attr + 1].name != "resource" {
+        return harness.fail("struct attr args missing")
+    }
+    f0 := &m1.members[st.first_member]
+    if !f0.is_pub || m1.types[f0.ty].kind != .FixedArray || m1.types[f0.ty].len_expr < 0 {
+        return harness.fail("struct fixed array field / pub missing")
+    }
+    // Trait supertraits, methods, receiver kinds, default body, from clause
+    tr := &m1.items[4]
+    if tr.kind != .Trait || tr.child_count != 2 || tr.member_count != 3 || tr.where_count != 1 {
+        return harness.fail("trait supertraits/members/where missing")
+    }
+    tm0 := &m1.members[tr.first_member]
+    tm1 := &m1.members[tr.first_member + 1]
+    tm2 := &m1.members[tr.first_member + 2]
+    if m1.params[tm0.first_param].receiver != .SharedRef || tm0.from_count != 1 ||
+       m1.from_sources[tm0.first_from].root_name != "self" || m1.from_sources[tm0.first_from].field_name != "view" {
+        return harness.fail("trait method &self / from clause missing")
+    }
+    if m1.params[tm1.first_param].receiver != .MutRef || tm1.body_expr < 0 {
+        return harness.fail("trait default method &mut self / body missing")
+    }
+    if m1.params[tm2.first_param].receiver != .Owned || tm2.body_expr != -1 {
+        return harness.fail("trait owned self / bodyless mismatch")
+    }
+    // Unsafe impl & impl method attrs + multi-source from
+    if m1.items[5].kind != .Impl || !m1.items[5].is_unsafe || m1.items[5].trait_ty < 0 || m1.items[5].target_ty < 0 {
+        return harness.fail("unsafe impl metadata missing")
+    }
+    im := &m1.members[m1.items[6].first_member]
+    if im.attr_count != 1 || m1.attrs[im.first_attr].name != "requires" || im.from_count != 2 || im.body_expr < 0 {
+        return harness.fail("impl method attrs/from/body missing")
+    }
+
+    // 2. Wave 2B FFI syntax: union, type alias, extern type, @repr(C, packed(2)), @link(...),
+    //    extern "C" { fn ...(...); static mut ... }, extern "C" fn, open enum signed tags,
+    //    *const/*mut, c""/w"", ..zeroed()
+    src2 := "capability unsafe\n" +
+        "pub extern type OpaqueHandle\n" +
+        "pub type Cb = extern \"C\" fn(i32, *const u8, ...) -> *mut u8\n" +
+        "@repr(C, packed(2))\n" +
+        "struct Wire { tag: u8, val: i64 }\n" +
+        "@repr(C, align(16))\n" +
+        "union RawVal { i: i32, f: f32 }\n" +
+        "@repr(i32)\n" +
+        "enum VkCode { Ok = 0, ErrMem = -1, Payload(i32, string) }\n" +
+        "@link(macos = \"objc\", weak = true)\n" +
+        "extern \"C\" {\n" +
+        "    @link_name(\"snprintf\")\n" +
+        "    pub fn c_fmt(buf: *mut u8, cap: usize, fmt: *const u8, ...) -> i32\n" +
+        "    @weak\n" +
+        "    pub static mut global_flag: i32\n" +
+        "}\n" +
+        "extern \"C\" fn callback(a: i32) -> i32 { a * 2 }\n"
+    m2 := parser.parse_source("struct_check_2.ddr", src2)
+    if !m2.ok || m2.diagnostics.len != 0 {
+        return harness.fail("structural check 2 (Wave 2B FFI) failed to parse: " +
+            (if m2.diagnostics.len > 0 { m2.diagnostics[0].message.clone() } else { "" }))
+    }
+    if m2.items[1].kind != .ExternType || !m2.items[1].is_opaque || !m2.items[1].is_extern {
+        return harness.fail("extern type mismatch")
+    }
+    if m2.items[2].kind != .TypeAlias { return harness.fail("type alias mismatch") }
+    cb_ty := &m2.types[m2.items[2].ret_type]
+    if cb_ty.kind != .FnType || !cb_ty.is_extern || cb_ty.abi != "C" || !cb_ty.is_variadic || cb_ty.arg_count != 3 {
+        return harness.fail("extern C fn type metadata missing")
+    }
+    if m2.types[m2.fn_param_types[cb_ty.first_arg + 1].ty].kind != .RawConst ||
+       m2.types[cb_ty.inner].kind != .RawMut {
+        return harness.fail("raw pointer types *const/*mut not distinct")
+    }
+    // Nested @repr(C, packed(2))
+    w_attr := &m2.attrs[m2.items[3].first_attr]
+    if w_attr.name != "repr" || w_attr.arg_count != 2 ||
+       m2.attr_args[w_attr.first_arg].value != "C" ||
+       m2.attr_args[w_attr.first_arg + 1].kind != .Call ||
+       m2.attr_args[w_attr.first_arg + 1].key != "packed" ||
+       m2.attr_args[m2.attr_args[w_attr.first_arg + 1].first_arg].value != "2" {
+        return harness.fail("nested @repr(C, packed(2)) args missing")
+    }
+    if m2.items[4].kind != .Union || m2.items[4].member_count != 2 {
+        return harness.fail("union item mismatch")
+    }
+    // Open enum signed tag & payload
+    e_mem0 := &m2.members[m2.items[5].first_member]
+    e_mem1 := &m2.members[m2.items[5].first_member + 1]
+    e_mem2 := &m2.members[m2.items[5].first_member + 2]
+    if e_mem0.discriminant_expr < 0 || m2.exprs[e_mem0.discriminant_expr].kind != .Int {
+        return harness.fail("enum positive discriminant missing")
+    }
+    if e_mem1.discriminant_expr < 0 || m2.exprs[e_mem1.discriminant_expr].kind != .Unary || m2.exprs[e_mem1.discriminant_expr].op != "-" {
+        return harness.fail("enum negative discriminant missing")
+    }
+    if e_mem2.payload_count != 2 { return harness.fail("enum variant payload types missing") }
+    // ExternBlock with children
+    eb := &m2.items[6]
+    if eb.kind != .ExternBlock || eb.abi != "C" || eb.child_count != 2 || eb.attr_count != 1 {
+        return harness.fail("extern block structure missing")
+    }
+    if m2.attrs[eb.first_attr].arg_count != 2 || m2.attr_args[m2.attrs[eb.first_attr].first_arg].kind != .Named {
+        return harness.fail("@link named args missing")
+    }
+    efn := &m2.items[m2.id_lists[eb.first_child]]
+    est := &m2.items[m2.id_lists[eb.first_child + 1]]
+    if efn.kind != .ExternFn || efn.parent_item != 6 || efn.param_count != 4 || !m2.params[efn.first_param + 3].is_variadic {
+        return harness.fail("extern fn inside block mismatch")
+    }
+    if est.kind != .ExternStatic || !est.is_mut || est.parent_item != 6 || est.attr_count != 1 {
+        return harness.fail("extern static mut inside block mismatch")
+    }
+    // Exported extern "C" fn
+    exp_idx := m2.id_lists[eb.first_child + 1] + 1
+    if m2.items[exp_idx].kind != .Fn || !m2.items[exp_idx].is_extern || m2.items[exp_idx].abi != "C" || m2.items[exp_idx].body_expr < 0 {
+        return harness.fail("exported extern C fn mismatch")
+    }
+
+    // 3. Expressions, statements, patterns, closures, region(cap), task scope, defer, unsafe, ..zeroed()
+    src3 := "fn full_body(mut xs: []i32, opt: Option<i32>, cb: &Fn(&i32) -> i32) -> i32 {\n" +
+        "    w := Wire { tag: 1, ..zeroed() }\n" +
+        "    arr := [0; 8]\n" +
+        "    tup := (1, 2, 3)\n" +
+        "    (a, mut b, ..) := tup\n" +
+        "    Box<i32> { val } := get_box()\n" +
+        "    sl := &xs[1..=3]\n" +
+        "    cs := c\"abc\"\n" +
+        "    ws := w\"xyz\"\n" +
+        "    sh := .Some(42)\n" +
+        "    cl := move fn[&xs, mut z: i32 = 1](p: i32) -> &i32 from xs { &xs[p] }\n" +
+        "    region scratch(4096) {\n" +
+        "        defer { cleanup() }\n" +
+        "        unsafe { _ := w.tag }\n" +
+        "    }\n" +
+        "    region plain { _ := 1 }\n" +
+        "    task scope workers(shared xs, arr) with (process, filesystem) arena scratch {\n" +
+        "        for (k, v) in move pairs { b += k + v }\n" +
+        "    }\n" +
+        "    v := match move opt {\n" +
+        "        .Some(0..=5 | -1) if a < b == true => 10,\n" +
+        "        .Some(x) => return x,\n" +
+        "        .None => 0,\n" +
+        "    }\n" +
+        "    v + cb(&a) + sl.len + cs.len + ws.len + sh.len + cl(0) + val\n" +
+        "}\n"
+    m3 := parser.parse_source("struct_check_3.ddr", src3)
+    if !m3.ok || m3.diagnostics.len != 0 {
+        return harness.fail("structural check 3 (full body) failed to parse: " +
+            (if m3.diagnostics.len > 0 { m3.diagnostics[0].message.clone() } else { "" }))
+    }
+    body := &m3.exprs[m3.items[0].body_expr]
+    if body.kind != .BlockExpr || body.extra < 0 || body.child_count != 14 {
+        return harness.fail("full_body block stmt/tail count mismatch: got " + body.child_count.str())
+    }
+    // StructLit with ..zeroed()
+    s0 := &m3.stmts[m3.id_lists[body.first_child]]
+    slit := &m3.exprs[s0.expr]
+    if slit.kind != .StructLit || slit.child_count != 2 || !m3.field_inits[slit.first_child + 1].is_rest {
+        return harness.fail("StructLit ..zeroed() rest field missing")
+    }
+    // ArrayRepeat
+    s1 := &m3.stmts[m3.id_lists[body.first_child + 1]]
+    if m3.exprs[s1.expr].kind != .ArrayRepeat || m3.exprs[s1.expr].left < 0 || m3.exprs[s1.expr].right < 0 {
+        return harness.fail("ArrayRepeat missing")
+    }
+    // TupleLit 3 elems
+    s2 := &m3.stmts[m3.id_lists[body.first_child + 2]]
+    if m3.exprs[s2.expr].kind != .TupleLit || m3.exprs[s2.expr].child_count != 3 {
+        return harness.fail("TupleLit 3 elems missing")
+    }
+    // Tuple destructuring with ..
+    s3 := &m3.stmts[m3.id_lists[body.first_child + 3]]
+    if s3.kind != .Let || s3.pat < 0 || m3.pats[s3.pat].kind != .Tuple || m3.pats[s3.pat].child_count != 3 {
+        return harness.fail("tuple destructure pattern missing")
+    }
+    if m3.pats[m3.id_lists[m3.pats[s3.pat].first_child + 2]].kind != .Rest {
+        return harness.fail("tuple rest pattern missing")
+    }
+    // Generic struct destructuring
+    s4 := &m3.stmts[m3.id_lists[body.first_child + 4]]
+    if s4.kind != .Let || s4.pat < 0 || m3.pats[s4.pat].kind != .Struct || m3.pats[s4.pat].ty_arg_count != 1 {
+        return harness.fail("generic struct destructure pattern missing")
+    }
+    // Slice ..=
+    s5 := &m3.stmts[m3.id_lists[body.first_child + 5]]
+    slice_e := &m3.exprs[m3.exprs[s5.expr].left]
+    if slice_e.kind != .Slice || slice_e.op != "..=" || slice_e.right < 0 || slice_e.extra < 0 {
+        return harness.fail("inclusive slice expr missing")
+    }
+    // CString & WString & VariantShorthand
+    s6 := &m3.stmts[m3.id_lists[body.first_child + 6]]
+    s7 := &m3.stmts[m3.id_lists[body.first_child + 7]]
+    s8 := &m3.stmts[m3.id_lists[body.first_child + 8]]
+    if m3.exprs[s6.expr].kind != .CString || m3.exprs[s7.expr].kind != .WString {
+        return harness.fail("CString / WString expr kinds missing")
+    }
+    if m3.exprs[s8.expr].kind != .VariantShorthand || m3.exprs[s8.expr].text != "Some" || m3.exprs[s8.expr].child_count != 1 {
+        return harness.fail("VariantShorthand missing")
+    }
+    // Closure
+    s9 := &m3.stmts[m3.id_lists[body.first_child + 9]]
+    cl_e := &m3.exprs[s9.expr]
+    if cl_e.kind != .Closure || cl_e.extra < 0 { return harness.fail("ClosureData index missing") }
+    cl_d := &m3.closures[cl_e.extra]
+    if !cl_d.is_move || cl_d.cap_count != 2 || cl_d.param_count != 1 || cl_d.from_count != 1 || cl_d.body < 0 {
+        return harness.fail("ClosureData fields missing")
+    }
+    // Region with capacity + defer + unsafe block
+    s10 := &m3.stmts[m3.id_lists[body.first_child + 10]]
+    if s10.kind != .Region || s10.name != "scratch" || s10.cap_expr < 0 || s10.body < 0 {
+        return harness.fail("region(cap) stmt missing")
+    }
+    rblk := &m3.exprs[s10.body]
+    if rblk.child_count != 1 || rblk.extra < 0 || m3.exprs[rblk.extra].kind != .UnsafeBlock {
+        return harness.fail("defer / unsafe block inside region missing")
+    }
+    // Plain region
+    s11 := &m3.stmts[m3.id_lists[body.first_child + 11]]
+    if s11.kind != .Region || s11.name != "plain" || s11.cap_expr != -1 {
+        return harness.fail("plain region stmt mismatch")
+    }
+    // TaskScope with shared, with, arena, and for-move tuple loop
+    s12 := &m3.stmts[m3.id_lists[body.first_child + 12]]
+    if s12.kind != .TaskScope || s12.clause_idx < 0 { return harness.fail("task scope clause missing") }
+    tc := &m3.task_clauses[s12.clause_idx]
+    if tc.shared_count != 2 || tc.cap_count != 2 || tc.arena_expr < 0 {
+        return harness.fail("task scope shared/with/arena missing")
+    }
+    ts_blk := &m3.exprs[s12.body]
+    for_st := &m3.stmts[m3.id_lists[ts_blk.first_child]]
+    if for_st.kind != .For || !for_st.is_move || for_st.pat < 0 || m3.pats[for_st.pat].kind != .Tuple || for_st.body < 0 {
+        return harness.fail("for (k, v) in move pairs missing")
+    }
+    // Match with move, or-pattern, range, negative literal, guard precedence (a < b) == true, return arm
+    s13 := &m3.stmts[m3.id_lists[body.first_child + 13]]
+    me := &m3.exprs[s13.expr]
+    if me.kind != .MatchExpr || me.flags != 1 || me.child_count != 3 {
+        return harness.fail("match move / arm count mismatch")
+    }
+    arm0 := &m3.match_arms[me.first_child]
+    arm1 := &m3.match_arms[me.first_child + 1]
+    if arm0.guard < 0 || m3.exprs[arm0.guard].op != "==" {
+        return harness.fail("guard operator precedence (< tighter than ==) mismatch")
+    }
+    if m3.exprs[arm1.body].kind != .ReturnExpr || m3.exprs[arm1.body].left < 0 {
+        return harness.fail("match return arm body missing")
+    }
+    true
+}
+
+fn parse_directory_corpus(root: string, subdirs: &[]string, check_allowlist: bool, files_out: &mut i32, skipped_out: &mut i32, nodes_out: &mut i64) -> bool {
+    mut paths: []string = []
+    for sub in subdirs {
+        dir := if sub == "." { root.clone() } else { root + "/" + sub }
+        collect_ddr_files(dir, &mut paths)
+    }
+    mut failures: []string = []
+    prefix := root + "/"
+    for p in &paths {
+        mut rel := p.clone()
+        if text.starts_with(rel, prefix) { rel = rel[prefix.len..rel.len] }
+        if check_allowlist && is_syntax_error_fixture(rel) {
+            rd_neg := sys.read_text(p)
+            if !rd_neg.ok {
+                failures.push(rel + ": failed to read allowlisted syntax-error fixture")
+                continue
+            }
+            m_neg := parser.parse_source(rel, rd_neg.value)
+            if m_neg.ok {
+                failures.push(rel + ": allowlisted syntax-error fixture unexpectedly parsed cleanly")
+                continue
+            }
+            skipped_out += 1
+            continue
+        }
+        rd := sys.read_text(p)
+        if !rd.ok {
+            failures.push(rel + ": failed to read file")
+            continue
+        }
+        m := parser.parse_source(rel, rd.value)
+        files_out += 1
+        nodes_out += i64(ast.total_node_count(&m))
+        if !m.ok || m.diagnostics.len != 0 {
+            mut msg := "parse failed"
+            if m.diagnostics.len > 0 {
+                d := &m.diagnostics[0]
+                lc := diag.line_col(m.source, d.start)
+                msg = lc.line.str() + ":" + lc.column.str() + ": " + d.message
+            }
+            failures.push(rel + ":" + msg)
+        }
+    }
+    if failures.len > 0 {
+        mut report := f"parser corpus had {failures.len} failures:\n"
+        limit := if failures.len < 40 { failures.len } else { 40 }
+        for i in 0..limit { report += "  " + failures[i] + "\n" }
+        return harness.fail(report)
+    }
+    true
+}
+
+fn main() -> i32 {
+    if !check_structural_ast() { return 1 }
+
+    root := harness.find_root()
+    if root.len == 0 { _ := harness.fail("cannot locate repository root"); return 1 }
+
+    mut extra_dir := ""
+    argc := sys.arg_count()
+    mut ai := 1
+    while ai < argc {
+        arg := sys.arg(ai)
+        if arg == "--extra-dir" && ai + 1 < argc {
+            extra_dir = sys.arg(ai + 1)
+            ai += 2
+            continue
+        }
+        ai += 1
+    }
+
+    subdirs: []string = ["selfhost", "stdlib", "tools", "packages", "examples", "tests"]
+    mut total_files := 0
+    mut skipped := 0
+    mut total_nodes: i64 = 0
+    if !parse_directory_corpus(root, &subdirs, true, &mut total_files, &mut skipped, &mut total_nodes) {
+        return 1
+    }
+    if total_files < 700 {
+        _ := harness.fail(f"expected >= 700 corpus files, parsed only {total_files}")
+        return 1
+    }
+    if extra_dir.len > 0 {
+        mut extra_files := 0
+        mut extra_skipped := 0
+        mut extra_nodes: i64 = 0
+        extra_subs: []string = ["."]
+        if !parse_directory_corpus(extra_dir, &extra_subs, false, &mut extra_files, &mut extra_skipped, &mut extra_nodes) {
+            return 1
+        }
+        print(f"extra corpus ok ({extra_dir}): {extra_files} files, {extra_nodes} AST nodes")
+    }
+    print(f"parser corpus ok: {total_files} files parsed ({skipped} syntax-error fixtures skipped), {total_nodes} AST nodes, structural checks passed")
+    0
+}
