@@ -19,7 +19,8 @@ pub struct PlaceNode {
 
 pub struct PlaceTrie {
     nodes: []PlaceNode,
-    place_to_node: []i32, // -1 if place crosses Deref or Index
+    place_to_node: []i32,        // -1 if place crosses Deref or Index
+    place_to_prefix_node: []i32, // deepest non-Deref/non-Index prefix node (always >= 0)
 }
 
 pub struct InitState {
@@ -87,7 +88,7 @@ fn find_or_add_child(trie: &mut PlaceTrie, parent: i32, kind: mb.ProjKind, index
 }
 
 fn build_trie(types: &ht.TypeTable, body: &mb.MirBody) -> PlaceTrie {
-    mut trie := PlaceTrie { nodes: [], place_to_node: [] }
+    mut trie := PlaceTrie { nodes: [], place_to_node: [], place_to_prefix_node: [] }
     for l in 0..body.locals.len {
         trie.nodes.push(PlaceNode {
             local: l,
@@ -125,6 +126,7 @@ fn build_trie(types: &ht.TypeTable, body: &mb.MirBody) -> PlaceTrie {
             }
         }
         trie.place_to_node.push(if valid { node } else { -1 })
+        trie.place_to_prefix_node.push(node)
     }
     trie
 }
@@ -224,16 +226,22 @@ pub fn step_stmt(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
     mut ok := true
     if st.kind == .Assign {
         rv := body.rvalues[st.rvalue]
-        if !step_rvalue(&types, &body, &trie, &mut init, &mut uninit, rv, st.in_unsafe, st.span_start, st.span_end, check, &mut diags) {
+        if st.aux == 1 && rv.kind == .Use && rv.a >= 0 && rv.a < body.ops.len && body.ops[rv.a].kind != .Const {
+            // Atomic replace/swap source read: verify source place is initialized, without leaving a move hole!
+            if !check_place_readable(&body, &trie, &uninit, body.ops[rv.a].id, st.span_start, st.span_end, check, &mut diags) {
+                ok = false
+            }
+        } else if !step_rvalue(&types, &body, &trie, &mut init, &mut uninit, rv, st.in_unsafe, st.span_start, st.span_end, check, &mut diags) {
             ok = false
         }
         node := trie.place_to_node[st.place]
         if node >= 0 {
             set_initialized(&trie, &mut init, &mut uninit, node)
         } else {
-            // Assigning through Deref/Index requires root local to be initialized.
+            // Assigning through Deref/Index requires the prefix place (before Deref/Index) to be initialized.
+            pnode := trie.place_to_prefix_node[st.place]
             root := body.places[st.place].local
-            if check && bs_get(&uninit, 0, root) {
+            if check && subtree_may_be_uninit(&trie, &uninit, pnode) {
                 hb.push_error(&mut diags, "E4001", body.path, st.span_start, st.span_end,
                     "use of moved or uninitialized value '" + body.locals[root].name + "'")
                 ok = false
@@ -275,7 +283,7 @@ fn step_operand(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
                 }
                 return false
             }
-            if check && bs_get(&uninit, 0, pl.local) {
+            if check && subtree_may_be_uninit(&trie, &uninit, trie.place_to_prefix_node[place_id]) {
                 hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
                     "use of moved value '" + body.locals[pl.local].name + "'")
                 return false
@@ -298,13 +306,8 @@ fn step_operand(types: &ht.TypeTable, body: &mb.MirBody, trie: &PlaceTrie,
         return true
     }
     // OpKind.Copy
-    if node >= 0 {
-        if check && subtree_may_be_uninit(&trie, &uninit, node) {
-            hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
-                "use of moved value '" + body.locals[pl.local].name + "'")
-            return false
-        }
-    } else if check && bs_get(&uninit, 0, pl.local) {
+    chk_node := if node >= 0 { node } else { trie.place_to_prefix_node[place_id] }
+    if check && subtree_may_be_uninit(&trie, &uninit, chk_node) {
         hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
             "use of moved value '" + body.locals[pl.local].name + "'")
         return false
@@ -317,13 +320,8 @@ fn check_place_readable(body: &mb.MirBody, trie: &PlaceTrie, uninit: &[]u64, pla
     if !check { return true }
     pl := body.places[place_id]
     node := trie.place_to_node[place_id]
-    if node >= 0 {
-        if subtree_may_be_uninit(&trie, &uninit, node) {
-            hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
-                "use of moved value '" + body.locals[pl.local].name + "'")
-            return false
-        }
-    } else if bs_get(&uninit, 0, pl.local) {
+    chk_node := if node >= 0 { node } else { trie.place_to_prefix_node[place_id] }
+    if subtree_may_be_uninit(&trie, &uninit, chk_node) {
         hb.push_error(&mut diags, "E4001", body.path, span_s, span_e,
             "use of moved value '" + body.locals[pl.local].name + "'")
         return false
@@ -421,8 +419,10 @@ pub fn check_init(types: &ht.TypeTable, body: &mb.MirBody, diags: &mut []diag.Di
 
     mut succs: []i32 = []
     mut dummy_diags: []diag.Diagnostic = []
-    while work.len > 0 {
-        bb := work.pop()
+    mut work_head := 0
+    while work_head < work.len {
+        bb := work[work_head]
+        work_head += 1
         in_work[bb] = false
         base := bb * words
         for w in 0..words {
