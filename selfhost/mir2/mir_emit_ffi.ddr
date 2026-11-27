@@ -1,14 +1,118 @@
-// Wave 2B `@link extern "C"` call adapter over sealed ht.TypeTable.
-// Supports arm64-macos / arm64-linux (AAPCS64), x86_64-linux (SysV), and x86_64-windows (Win64).
-// Zero imports of selfhost/frontend/compile.ddr or selfhost/frontend/frontend_types.ddr.
+// Wave 2B `@link extern "C"` / `"system"` call, `extern static`, and `extern "C" fn` callback
+// emitter over sealed ht.TypeTable.
+// Supports arm64-macos (0), arm64-linux (1), x86_64-linux (2), and x86_64-windows (5).
+// Zero imports of selfhost/frontend/compile.ddr, selfhost/frontend/frontend_types.ddr,
+// or selfhost/backend/ffi_abi.ddr.
 
 import ..backend.arm64 as arm
 import ..backend.ffi_arm64 as abi
 import ..backend.foreign_operation as fop
 import ..backend.imports as native_imports
+import ..runtime.runtime as runtime
 import ..hir.hir_types as ht
 import ..hir.hir_body as hb
 import mir_emit_helpers as helpers
+
+// AAPCS64 argument & return classification constants
+const A64_ARG_GPR: i32 = 0
+const A64_ARG_FP: i32 = 1
+const A64_ARG_STACK_SCALAR: i32 = 2
+const A64_ARG_AGG_GPR: i32 = 3
+const A64_ARG_AGG_HFA: i32 = 4
+const A64_ARG_AGG_INDIRECT_GPR: i32 = 5
+const A64_ARG_AGG_INDIRECT_STACK: i32 = 6
+const A64_ARG_AGG_STACK: i32 = 7
+
+const A64_RET_VOID: i32 = 0
+const A64_RET_GPR: i32 = 1
+const A64_RET_FP: i32 = 2
+const A64_RET_AGG_GPR: i32 = 3
+const A64_RET_AGG_HFA: i32 = 4
+const A64_RET_INDIRECT: i32 = 5
+
+// SysV x86_64 eightbyte & plan constants
+const SYSV_NO: i32 = 0
+const SYSV_SSE: i32 = 1
+const SYSV_INT: i32 = 2
+const SYSV_MEM: i32 = 3
+
+const SYSV_ARG_GPR: i32 = 0
+const SYSV_ARG_XMM: i32 = 1
+const SYSV_ARG_STACK_SCALAR: i32 = 2
+const SYSV_ARG_AGG_REGS: i32 = 3
+const SYSV_ARG_AGG_STACK: i32 = 4
+
+const SYSV_RET_VOID: i32 = 0
+const SYSV_RET_GPR: i32 = 1
+const SYSV_RET_XMM: i32 = 2
+const SYSV_RET_AGG_REGS: i32 = 3
+const SYSV_RET_INDIRECT: i32 = 4
+
+struct A64Arg {
+    kind: i32,
+    reg0: i32,
+    reg_count: i32,
+    hfa_shape: i32,
+    stack_off: i32,
+    slot_width: i32,
+    total_size: i32,
+}
+
+struct A64Ret {
+    kind: i32,
+    hfa_shape: i32,
+    total_size: i32,
+}
+
+struct A64Plan {
+    ret: A64Ret,
+    args: []A64Arg,
+    gp_used: i32,
+    fp_used: i32,
+    outgoing: i32,
+}
+
+struct SysvEB {
+    count: i32,
+    c0: i32,
+    c1: i32,
+    size: i32,
+    align: i32,
+    memory: bool,
+}
+
+struct SysvArg {
+    kind: i32,
+    eb_count: i32,
+    c0: i32,
+    reg0: i32,
+    size0: i32,
+    c1: i32,
+    reg1: i32,
+    size1: i32,
+    stack_off: i32,
+    total_size: i32,
+}
+
+struct SysvRet {
+    kind: i32,
+    eb_count: i32,
+    c0: i32,
+    reg0: i32,
+    size0: i32,
+    c1: i32,
+    reg1: i32,
+    size1: i32,
+    total_size: i32,
+}
+
+struct SysvPlan {
+    ret: SysvRet,
+    args: []SysvArg,
+    gp_used: i32,
+    fp_used: i32,
+    outgoing: i32,
+}
 
 pub struct FfiState {
     libraries: []string,
@@ -18,6 +122,13 @@ pub struct FfiState {
     slots: []i32,
     globals: i32,
     sym_map: Map<string, i64>,
+    has_callbacks: bool,
+    cb_enter_label: i32,
+    cb_fn_ids: []i32,
+    cb_labels: []i32,
+    cb_map: Map<string, i64>,
+    overrides: []native_imports.LibraryOverride,
+    libc: native_imports.LibcAbi,
 }
 
 pub fn new_ffi() -> FfiState {
@@ -29,16 +140,59 @@ pub fn new_ffi() -> FfiState {
         slots: [],
         globals: 0,
         sym_map: Map<string, i64>::new(),
+        has_callbacks: false,
+        cb_enter_label: -1,
+        cb_fn_ids: [],
+        cb_labels: [],
+        cb_map: Map<string, i64>::new(),
+        overrides: [],
+        libc: .Glibc,
     }
 }
+
+pub fn set_link_config(ffi: &mut FfiState, libc: native_imports.LibcAbi, overrides: &[]native_imports.LibraryOverride) {
+    ffi.libc = libc
+    ffi.overrides.clear()
+    for i in 0..overrides.len {
+        ov := &overrides[i]
+        ffi.overrides.push(native_imports.LibraryOverride {
+            key: ov.key.clone(),
+            path: ov.path.clone(),
+            framework: ov.framework.clone(),
+            soname: ov.soname.clone(),
+            dll: ov.dll.clone(),
+            weak: ov.weak,
+            delay: ov.delay,
+        })
+    }
+}
+
+fn align_up(v: i32, a: i32) -> i32 {
+    if a <= 1 { return v }
+    (v + a - 1) / a * a
+}
+
+// =========================================================================
+// Imports, Frameworks, Overrides, Weak/Delay & Static Data Addressing
+// =========================================================================
 
 pub fn ensure_import(ffi: &mut FfiState, platform: i32, raw_lib: string, sym: string,
     is_data: bool, weak: bool, delay: bool) -> i32 {
     lib_in := if raw_lib == "" { "c" } else { raw_lib.clone() }
-    resolved := native_imports.resolve_library(lib_in, platform, .Glibc)
-    key := resolved.name + "\u{0000}" + sym
+    resolved := native_imports.resolve_library_with_overrides(lib_in, platform, ffi.libc, &ffi.overrides)
+    key := resolved.name + "\u{0000}" + sym + (if is_data { "\u{0001}D" } else { "\u{0001}F" })
     existing := ffi.sym_map.get_or(key, -1)
-    if existing >= 0 { return i32(existing) }
+    if existing >= 0 {
+        idx := i32(existing)
+        if !weak && !resolved.weak {
+            ffi.specs[idx].weak = false
+            ffi.specs[idx].lib_weak = false
+        }
+        if !delay && !resolved.delay {
+            ffi.specs[idx].delay = false
+        }
+        return idx
+    }
 
     slot := ffi.symbols.len
     mut spec := if is_data {
@@ -47,6 +201,7 @@ pub fn ensure_import(ffi: &mut FfiState, platform: i32, raw_lib: string, sym: st
         native_imports.symbol_spec(resolved.name.clone(), sym.clone())
     }
     spec.weak = weak || resolved.weak
+    spec.lib_weak = weak || resolved.weak
     spec.delay = delay || resolved.delay
     ffi.libraries.push(resolved.name.clone())
     ffi.symbols.push(sym.clone())
@@ -63,136 +218,1332 @@ pub fn emit_import_addr(code: &mut arm.Code, ffi: &mut FfiState, slot: i32, dst_
     arm.native_address(&mut code, dst_reg)
 }
 
-fn c_arg_is_float(ty: i32) -> bool {
+pub fn emit_static_addr(code: &mut arm.Code, ffi: &mut FfiState, offset: i32, dst_reg: i32) {
+    if !code.checking {
+        ffi.sites.push(arm.position(&code) * 4)
+        ffi.slots.push(-1 - offset)
+    }
+    arm.native_address(&mut code, dst_reg)
+}
+
+pub fn emit_extern_static_addr(code: &mut arm.Code, ffi: &mut FfiState, platform: i32,
+    st: &hb.HirExternStatic, dst_reg: i32) {
+    sym := if st.extern_symbol != "" { st.extern_symbol.clone() } else { st.name.clone() }
+    slot := ensure_import(&mut ffi, platform, st.extern_lib.clone(), sym, true, st.link_weak, st.link_delay)
+    emit_import_addr(&mut code, &mut ffi, slot, dst_reg)
+}
+
+// =========================================================================
+// Type Classification over Sealed ht.TypeTable (Zero frontend_types import!)
+// =========================================================================
+
+pub fn is_opt_extern_fn(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    if te.kind != .Enum || te.count != 2 { return false }
+    v0 := &types.variants[te.inner_a]
+    v1 := &types.variants[te.inner_a + 1]
+    if v0.payload_count == 1 && v1.payload_count == 0 {
+        pty := types.fields[v0.payload_start].ty
+        return pty >= 0 && pty < types.entries.len && types.entries[pty].kind == .ExternFn
+    }
+    false
+}
+
+pub fn is_c_record(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    if te.kind == .Union { return true }
+    if te.kind == .Struct && te.flags.bit_and(ht.TF_C_LAYOUT) != 0 { return true }
+    false
+}
+
+pub fn c_abi_scalar_type(types: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= types.entries.len { return ht.TY_I64 }
+    te := &types.entries[ty]
+    if is_opt_extern_fn(&types, ty) { return ht.TY_PTR }
+    if te.kind == .Enum {
+        if te.repr_ty >= 0 { return te.repr_ty }
+        return ht.TY_I32
+    }
+    if te.kind == .Ptr || te.kind == .RawConst || te.kind == .RawMut ||
+        te.kind == .CStr || te.kind == .WStr || te.kind == .ExternFn || te.kind == .FnPtr {
+        return ht.TY_PTR
+    }
+    ty
+}
+
+fn c_scalar_is_float(ty: i32) -> bool {
     ty == ht.TY_F32 || ty == ht.TY_F64
 }
 
-fn c_arg_width(types: &ht.TypeTable, ty: i32) -> i32 {
-    if ty == ht.TY_BOOL || ty == ht.TY_I8 || ty == ht.TY_U8 { return 1 }
-    if ty == ht.TY_I16 || ty == ht.TY_U16 { return 2 }
-    if ty == ht.TY_I32 || ty == ht.TY_U32 || ty == ht.TY_F32 || ty == ht.TY_RUNE { return 4 }
-    if ty >= 0 && ty < types.entries.len {
-        sz := types.entries[ty].size
+pub fn c_arg_width(types: &ht.TypeTable, ty: i32) -> i32 {
+    base := c_abi_scalar_type(&types, ty)
+    if base == ht.TY_BOOL || base == ht.TY_I8 || base == ht.TY_U8 { return 1 }
+    if base == ht.TY_I16 || base == ht.TY_U16 { return 2 }
+    if base == ht.TY_I32 || base == ht.TY_U32 || base == ht.TY_F32 || base == ht.TY_RUNE { return 4 }
+    if base >= 0 && base < types.entries.len {
+        sz := types.entries[base].size
         if sz > 0 && sz <= 8 { return sz }
     }
     8
 }
 
-// Emits a Wave 2B C ABI foreign call.
-// `arg_slots[i]` holds the frame slot where argument `i`'s 8-byte scalar/pointer/float value (or struct ptr) was materialized.
-// On return, scalar/float result is left in `x0` (or written to `sret_slot` if large C struct).
+fn win_register_record(size: i32) -> bool {
+    size == 1 || size == 2 || size == 4 || size == 8
+}
+
+// Returns +1..+4 for HFA of 1..4 f32, -1..-4 for HFA of 1..4 f64, 0 if not HFA.
+fn hfa_walk(types: &ht.TypeTable, ty: i32, depth: i32, base_f: &mut i32, count: &mut i32) -> bool {
+    if depth > 32 || ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    if te.kind == .F32 || te.kind == .F64 {
+        kind_code := if te.kind == .F32 { 1 } else { 2 }
+        if base_f == 0 { base_f = kind_code }
+        else if base_f != kind_code { return false }
+        count = count + 1
+        return count <= 4
+    }
+    if te.kind == .FixedArr {
+        if te.count <= 0 || te.count > 4 { return false }
+        for _ in 0..te.count {
+            if !hfa_walk(&types, te.inner_a, depth + 1, &mut base_f, &mut count) { return false }
+        }
+        return true
+    }
+    if te.kind == .Struct && te.flags.bit_and(ht.TF_C_LAYOUT) != 0 {
+        if te.count <= 0 { return false }
+        for i in 0..te.count {
+            fty := types.fields[te.inner_a + i].ty
+            if !hfa_walk(&types, fty, depth + 1, &mut base_f, &mut count) { return false }
+        }
+        // Reject padded/over-aligned structs whose byte size != count * elem_size
+        elem_sz := if base_f == 1 { 4 } else { 8 }
+        return te.size == count * elem_sz
+    }
+    if te.kind == .Union {
+        // AAPCS64 union HFA: every member is an HFA of the same float base type; count is max member count
+        mut max_c := 0
+        for i in 0..te.count {
+            mut mc := 0
+            if !hfa_walk(&types, types.fields[te.inner_a + i].ty, depth + 1, &mut base_f, &mut mc) { return false }
+            if mc > max_c { max_c = mc }
+        }
+        count = count + max_c
+        if count > 4 { return false }
+        elem_sz := if base_f == 1 { 4 } else { 8 }
+        return te.size == count * elem_sz
+    }
+    false
+}
+
+pub fn hfa_shape(types: &ht.TypeTable, ty: i32) -> i32 {
+    if !is_c_record(&types, ty) { return 0 }
+    mut base_f := 0
+    mut count := 0
+    if !hfa_walk(&types, ty, 0, &mut base_f, &mut count) { return 0 }
+    if count <= 0 || count > 4 { return 0 }
+    if base_f == 1 { count } else { -count }
+}
+
+// =========================================================================
+// AAPCS64 Planner over ht.TypeTable (Darwin & Linux ARM64)
+// =========================================================================
+
+fn plan_aapcs64_ret(types: &ht.TypeTable, ret_ty: i32) -> A64Ret {
+    if ret_ty == ht.TY_UNIT {
+        return A64Ret { kind: A64_RET_VOID, hfa_shape: 0, total_size: 0 }
+    }
+    if !is_c_record(&types, ret_ty) {
+        base := c_abi_scalar_type(&types, ret_ty)
+        w := c_arg_width(&types, base)
+        if c_scalar_is_float(base) {
+            return A64Ret { kind: A64_RET_FP, hfa_shape: 0, total_size: w }
+        }
+        return A64Ret { kind: A64_RET_GPR, hfa_shape: 0, total_size: w }
+    }
+    shape := hfa_shape(&types, ret_ty)
+    size := helpers.type_byte_size(&types, ret_ty)
+    if shape != 0 {
+        return A64Ret { kind: A64_RET_AGG_HFA, hfa_shape: shape, total_size: size }
+    }
+    if size <= 16 {
+        return A64Ret { kind: A64_RET_AGG_GPR, hfa_shape: 0, total_size: size }
+    }
+    A64Ret { kind: A64_RET_INDIRECT, hfa_shape: 0, total_size: size }
+}
+
+fn plan_aapcs64(types: &ht.TypeTable, darwin: bool, variadic_fixed: i32, arg_tys: &[]i32, ret_ty: i32) -> A64Plan {
+    ret := plan_aapcs64_ret(&types, ret_ty)
+    mut gp := 0
+    mut fp := 0
+    mut outgoing := 0
+    mut args: []A64Arg = []
+    args.reserve(arg_tys.len)
+    for i in 0..arg_tys.len {
+        ty := arg_tys[i]
+        is_var := variadic_fixed >= 0 && i >= variadic_fixed
+        if darwin && is_var {
+            w := c_arg_width(&types, ty)
+            outgoing = align_up(outgoing, 8)
+            args.push(A64Arg { kind: A64_ARG_STACK_SCALAR, reg0: 0, reg_count: 0, hfa_shape: 0, stack_off: outgoing, slot_width: 8, total_size: w })
+            outgoing += 8
+            continue
+        }
+        if !is_c_record(&types, ty) {
+            base := c_abi_scalar_type(&types, ty)
+            w := c_arg_width(&types, base)
+            if c_scalar_is_float(base) {
+                if fp < 8 {
+                    args.push(A64Arg { kind: A64_ARG_FP, reg0: fp, reg_count: 1, hfa_shape: 0, stack_off: 0, slot_width: w, total_size: w })
+                    fp += 1
+                } else {
+                    slot_al := if darwin { w } else { 8 }
+                    slot_w := if darwin { w } else { 8 }
+                    outgoing = align_up(outgoing, slot_al)
+                    args.push(A64Arg { kind: A64_ARG_STACK_SCALAR, reg0: 0, reg_count: 0, hfa_shape: 0, stack_off: outgoing, slot_width: slot_w, total_size: w })
+                    outgoing += slot_w
+                }
+            } else {
+                if gp < 8 {
+                    args.push(A64Arg { kind: A64_ARG_GPR, reg0: gp, reg_count: 1, hfa_shape: 0, stack_off: 0, slot_width: w, total_size: w })
+                    gp += 1
+                } else {
+                    slot_al := if darwin { w } else { 8 }
+                    slot_w := if darwin { w } else { 8 }
+                    outgoing = align_up(outgoing, slot_al)
+                    args.push(A64Arg { kind: A64_ARG_STACK_SCALAR, reg0: 0, reg_count: 0, hfa_shape: 0, stack_off: outgoing, slot_width: slot_w, total_size: w })
+                    outgoing += slot_w
+                }
+            }
+            continue
+        }
+        shape := hfa_shape(&types, ty)
+        size := helpers.type_byte_size(&types, ty)
+        al := if types.entries[ty].align > 0 { types.entries[ty].align } else { 1 }
+        if shape != 0 {
+            need := if shape < 0 { -shape } else { shape }
+            if fp + need <= 8 {
+                args.push(A64Arg { kind: A64_ARG_AGG_HFA, reg0: fp, reg_count: need, hfa_shape: shape, stack_off: 0, slot_width: size, total_size: size })
+                fp += need
+            } else {
+                fp = 8
+                slot_al := if darwin { al } else if al > 8 { al } else { 8 }
+                stride := if darwin { size } else { align_up(size, 8) }
+                outgoing = align_up(outgoing, slot_al)
+                args.push(A64Arg { kind: A64_ARG_AGG_STACK, reg0: 0, reg_count: 0, hfa_shape: shape, stack_off: outgoing, slot_width: stride, total_size: size })
+                outgoing += stride
+            }
+        } else if size <= 16 {
+            mut regs := (size + 7) / 8
+            if regs < 1 { regs = 1 }
+            if gp + regs <= 8 {
+                args.push(A64Arg { kind: A64_ARG_AGG_GPR, reg0: gp, reg_count: regs, hfa_shape: 0, stack_off: 0, slot_width: size, total_size: size })
+                gp += regs
+            } else {
+                gp = 8
+                slot_al := if al > 8 { al } else { 8 }
+                stride := align_up(size, 8)
+                outgoing = align_up(outgoing, slot_al)
+                args.push(A64Arg { kind: A64_ARG_AGG_STACK, reg0: 0, reg_count: 0, hfa_shape: 0, stack_off: outgoing, slot_width: stride, total_size: size })
+                outgoing += stride
+            }
+        } else {
+            if gp < 8 {
+                args.push(A64Arg { kind: A64_ARG_AGG_INDIRECT_GPR, reg0: gp, reg_count: 1, hfa_shape: 0, stack_off: 0, slot_width: 8, total_size: size })
+                gp += 1
+            } else {
+                outgoing = align_up(outgoing, 8)
+                args.push(A64Arg { kind: A64_ARG_AGG_INDIRECT_STACK, reg0: 0, reg_count: 0, hfa_shape: 0, stack_off: outgoing, slot_width: 8, total_size: size })
+                outgoing += 8
+            }
+        }
+    }
+    outgoing = align_up(outgoing, 16)
+    A64Plan { ret: ret, args: move args, gp_used: gp, fp_used: fp, outgoing: outgoing }
+}
+
+// =========================================================================
+// SysV x86_64 Eightbyte Classifier & Planner over ht.TypeTable
+// =========================================================================
+
+fn merge_sysv_class(a: i32, b: i32) -> i32 {
+    if a == b { return a }
+    if a == SYSV_NO { return b }
+    if b == SYSV_NO { return a }
+    if a == SYSV_MEM || b == SYSV_MEM { return SYSV_MEM }
+    if a == SYSV_INT || b == SYSV_INT { return SYSV_INT }
+    SYSV_SSE
+}
+
+fn sysv_walk(types: &ht.TypeTable, ty: i32, base_off: i32, depth: i32, eb0: &mut i32, eb1: &mut i32) {
+    if depth > 64 || ty < 0 || ty >= types.entries.len {
+        eb0 = SYSV_MEM; eb1 = SYSV_MEM; return
+    }
+    te := &types.entries[ty]
+    if is_c_record(&types, ty) {
+        for i in 0..te.count {
+            f := &types.fields[te.inner_a + i]
+            sysv_walk(&types, f.ty, base_off + f.offset, depth + 1, &mut eb0, &mut eb1)
+            if eb0 == SYSV_MEM || eb1 == SYSV_MEM { return }
+        }
+        return
+    }
+    if te.kind == .FixedArr {
+        stride := helpers.elem_stride(&types, te.inner_a)
+        for i in 0..te.count {
+            sysv_walk(&types, te.inner_a, base_off + i * stride, depth + 1, &mut eb0, &mut eb1)
+            if eb0 == SYSV_MEM || eb1 == SYSV_MEM { return }
+        }
+        return
+    }
+    base := c_abi_scalar_type(&types, ty)
+    w := c_arg_width(&types, base)
+    if w > 1 && base_off % w != 0 {
+        eb0 = SYSV_MEM; eb1 = SYSV_MEM; return
+    }
+    cls := if c_scalar_is_float(base) { SYSV_SSE } else { SYSV_INT }
+    first_eb := base_off / 8
+    last_eb := (base_off + w - 1) / 8
+    if first_eb < 0 || last_eb > 1 {
+        eb0 = SYSV_MEM; eb1 = SYSV_MEM; return
+    }
+    if first_eb == 0 { eb0 = merge_sysv_class(eb0, cls) }
+    if first_eb == 1 || last_eb == 1 { eb1 = merge_sysv_class(eb1, cls) }
+}
+
+fn classify_sysv(types: &ht.TypeTable, ty: i32) -> SysvEB {
+    if ty == ht.TY_UNIT {
+        return SysvEB { count: 0, c0: SYSV_NO, c1: SYSV_NO, size: 0, align: 1, memory: false }
+    }
+    if !is_c_record(&types, ty) {
+        base := c_abi_scalar_type(&types, ty)
+        w := c_arg_width(&types, base)
+        cls := if c_scalar_is_float(base) { SYSV_SSE } else { SYSV_INT }
+        return SysvEB { count: 1, c0: cls, c1: SYSV_NO, size: w, align: w, memory: false }
+    }
+    size := helpers.type_byte_size(&types, ty)
+    al := if types.entries[ty].align > 0 { types.entries[ty].align } else { 1 }
+    if size <= 0 || size > 16 {
+        return SysvEB { count: 0, c0: SYSV_MEM, c1: SYSV_MEM, size: size, align: al, memory: true }
+    }
+    mut eb0 := SYSV_NO
+    mut eb1 := SYSV_NO
+    sysv_walk(&types, ty, 0, 0, &mut eb0, &mut eb1)
+    if eb0 == SYSV_MEM || eb1 == SYSV_MEM {
+        return SysvEB { count: 0, c0: SYSV_MEM, c1: SYSV_MEM, size: size, align: al, memory: true }
+    }
+    cnt := if size > 8 { 2 } else { 1 }
+    if eb0 == SYSV_NO { eb0 = SYSV_INT }
+    if cnt == 2 && eb1 == SYSV_NO { eb1 = SYSV_INT }
+    SysvEB { count: cnt, c0: eb0, c1: eb1, size: size, align: al, memory: false }
+}
+
+fn plan_sysv_ret(types: &ht.TypeTable, ret_ty: i32) -> SysvRet {
+    if ret_ty == ht.TY_UNIT {
+        return SysvRet { kind: SYSV_RET_VOID, eb_count: 0, c0: SYSV_NO, reg0: 0, size0: 0, c1: SYSV_NO, reg1: 0, size1: 0, total_size: 0 }
+    }
+    if !is_c_record(&types, ret_ty) {
+        base := c_abi_scalar_type(&types, ret_ty)
+        w := c_arg_width(&types, base)
+        if c_scalar_is_float(base) {
+            return SysvRet { kind: SYSV_RET_XMM, eb_count: 1, c0: SYSV_SSE, reg0: 0, size0: w, c1: SYSV_NO, reg1: 0, size1: 0, total_size: w }
+        }
+        return SysvRet { kind: SYSV_RET_GPR, eb_count: 1, c0: SYSV_INT, reg0: 0, size0: w, c1: SYSV_NO, reg1: 0, size1: 0, total_size: w }
+    }
+    eb := classify_sysv(&types, ret_ty)
+    if eb.memory {
+        return SysvRet { kind: SYSV_RET_INDIRECT, eb_count: 0, c0: SYSV_MEM, reg0: 0, size0: 0, c1: SYSV_NO, reg1: 0, size1: 0, total_size: eb.size }
+    }
+    mut gp := 0; mut fp := 0; mut r0 := 0; mut r1 := 0
+    s0 := if eb.size > 8 { 8 } else { eb.size }
+    s1 := if eb.size > 8 { eb.size - 8 } else { 0 }
+    if eb.c0 == SYSV_INT { r0 = gp; gp += 1 } else { r0 = fp; fp += 1 }
+    if eb.count == 2 {
+        if eb.c1 == SYSV_INT { r1 = gp; gp += 1 } else { r1 = fp; fp += 1 }
+    }
+    SysvRet { kind: SYSV_RET_AGG_REGS, eb_count: eb.count, c0: eb.c0, reg0: r0, size0: s0, c1: eb.c1, reg1: r1, size1: s1, total_size: eb.size }
+}
+
+fn plan_sysv64(types: &ht.TypeTable, arg_tys: &[]i32, ret_ty: i32) -> SysvPlan {
+    ret := plan_sysv_ret(&types, ret_ty)
+    mut gp := if ret.kind == SYSV_RET_INDIRECT { 1 } else { 0 }
+    mut fp := 0
+    mut outgoing := 0
+    mut args: []SysvArg = []
+    args.reserve(arg_tys.len)
+    for i in 0..arg_tys.len {
+        ty := arg_tys[i]
+        if !is_c_record(&types, ty) {
+            base := c_abi_scalar_type(&types, ty)
+            w := c_arg_width(&types, base)
+            if c_scalar_is_float(base) {
+                if fp < 8 {
+                    args.push(SysvArg { kind: SYSV_ARG_XMM, eb_count: 1, c0: SYSV_SSE, reg0: fp, size0: w, c1: SYSV_NO, reg1: 0, size1: 0, stack_off: 0, total_size: w })
+                    fp += 1
+                } else {
+                    outgoing = align_up(outgoing, 8)
+                    args.push(SysvArg { kind: SYSV_ARG_STACK_SCALAR, eb_count: 1, c0: SYSV_SSE, reg0: 0, size0: w, c1: SYSV_NO, reg1: 0, size1: 0, stack_off: outgoing, total_size: w })
+                    outgoing += 8
+                }
+            } else {
+                if gp < 6 {
+                    args.push(SysvArg { kind: SYSV_ARG_GPR, eb_count: 1, c0: SYSV_INT, reg0: gp, size0: w, c1: SYSV_NO, reg1: 0, size1: 0, stack_off: 0, total_size: w })
+                    gp += 1
+                } else {
+                    outgoing = align_up(outgoing, 8)
+                    args.push(SysvArg { kind: SYSV_ARG_STACK_SCALAR, eb_count: 1, c0: SYSV_INT, reg0: 0, size0: w, c1: SYSV_NO, reg1: 0, size1: 0, stack_off: outgoing, total_size: w })
+                    outgoing += 8
+                }
+            }
+        } else {
+            eb := classify_sysv(&types, ty)
+            mut placed := false
+            if !eb.memory {
+                mut need_gp := 0; mut need_fp := 0
+                if eb.c0 == SYSV_INT { need_gp += 1 } else if eb.c0 == SYSV_SSE { need_fp += 1 }
+                if eb.count == 2 {
+                    if eb.c1 == SYSV_INT { need_gp += 1 } else if eb.c1 == SYSV_SSE { need_fp += 1 }
+                }
+                if gp + need_gp <= 6 && fp + need_fp <= 8 {
+                    mut r0 := 0; mut r1 := 0
+                    s0 := if eb.size > 8 { 8 } else { eb.size }
+                    s1 := if eb.size > 8 { eb.size - 8 } else { 0 }
+                    if eb.c0 == SYSV_INT { r0 = gp; gp += 1 } else { r0 = fp; fp += 1 }
+                    if eb.count == 2 {
+                        if eb.c1 == SYSV_INT { r1 = gp; gp += 1 } else { r1 = fp; fp += 1 }
+                    }
+                    args.push(SysvArg { kind: SYSV_ARG_AGG_REGS, eb_count: eb.count, c0: eb.c0, reg0: r0, size0: s0, c1: eb.c1, reg1: r1, size1: s1, stack_off: 0, total_size: eb.size })
+                    placed = true
+                }
+            }
+            if !placed {
+                slot_al := if eb.align > 8 { eb.align } else { 8 }
+                outgoing = align_up(outgoing, slot_al)
+                args.push(SysvArg { kind: SYSV_ARG_AGG_STACK, eb_count: 0, c0: SYSV_MEM, reg0: 0, size0: eb.size, c1: SYSV_NO, reg1: 0, size1: 0, stack_off: outgoing, total_size: eb.size })
+                outgoing += align_up(eb.size, 8)
+            }
+        }
+    }
+    outgoing = align_up(outgoing, 16)
+    SysvPlan { ret: ret, args: move args, gp_used: gp, fp_used: fp, outgoing: outgoing }
+}
+
+// =========================================================================
+// Scalar Normalization & Stack Scalar Spill Helpers
+// =========================================================================
+
+fn emit_scalar_normalize(code: &mut arm.Code, types: &ht.TypeTable, ty: i32, reg: i32) {
+    base := c_abi_scalar_type(&types, ty)
+    if base == ht.TY_BOOL {
+        arm.bitfield(&mut code, false, true, reg, reg, 0, 7)
+        arm.compare_immediate(&mut code, reg, 0, false)
+        arm.set_condition(&mut code, reg, 1)
+    } else if base == ht.TY_F32 {
+        // already converted via abi.fp or kept as 32-bit float bits
+    } else if base == ht.TY_F64 {
+    } else if helpers.is_int_ty(base) {
+        w := c_arg_width(&types, base)
+        if w < 8 {
+            arm.bitfield(&mut code, helpers.is_signed_int(base), true, reg, reg, 0, w * 8 - 1)
+        }
+    }
+}
+
+fn emit_scalar_ret_normalize(code: &mut arm.Code, types: &ht.TypeTable, ret_ty: i32) {
+    base := c_abi_scalar_type(&types, ret_ty)
+    if base == ht.TY_F32 {
+        abi.fp(&mut code, 0, 0, 4, false)
+    } else if base == ht.TY_F64 {
+        abi.fp(&mut code, 0, 0, 8, false)
+    } else {
+        emit_scalar_normalize(&mut code, &types, ret_ty, 0)
+    }
+}
+
+fn store_stack_scalar(code: &mut arm.Code, types: &ht.TypeTable, ty: i32, base_reg: i32, slot_width: i32) {
+    base := c_abi_scalar_type(&types, ty)
+    w := c_arg_width(&types, base)
+    if slot_width == 8 && w < 8 {
+        if helpers.is_signed_int(base) {
+            arm.bitfield(&mut code, true, true, 0, 0, 0, w * 8 - 1)
+        } else if base == ht.TY_F32 {
+            // keep 32-bit bits zero-extended in 64-bit slot
+            arm.bitfield(&mut code, false, true, 0, 0, 0, 31)
+        } else {
+            arm.bitfield(&mut code, false, true, 0, 0, 0, w * 8 - 1)
+        }
+        helpers.store_mem(&mut code, 0, base_reg, 0)
+        return
+    }
+    abi.store(&mut code, 0, base_reg, 0, w)
+}
+
+// =========================================================================
+// Full Wave 2B Foreign Call Emission (ARM64 Mac/Linux, SysV x86_64, Win64)
+// =========================================================================
+
+// Backwards-compatible scalar wrapper (preserves Commit 1 standalone build).
 pub fn emit_extern_call(code: &mut arm.Code, types: &ht.TypeTable, ffi: &mut FfiState,
     ext_fn: &hb.HirFn, arg_tys: &[]i32, arg_slots: &[]i32, ret_ty: i32) {
+    empty_rt := runtime.empty()
+    emit_extern_call_v2(&mut code, &types, &mut ffi, &empty_rt, &ext_fn, &arg_tys, &arg_slots, ret_ty, -1, -1)
+}
+
+// Full Wave 2B C ABI call emitter.
+// - `arg_slots[i]`: for scalar/ptr/Option<ExternFn> args, holds the 8B scalar value;
+//                   for C-record (struct/union) args, holds the address of a caller-staged copy!
+// - `ret_addr_slot`: for C-record returns, holds the destination address where bytes are written.
+// - `cb_ctx_slot`: caller scratch frame slot used to hold TLS ctx ptr across ARM64 calls when `ffi.has_callbacks`.
+pub fn emit_extern_call_v2(code: &mut arm.Code, types: &ht.TypeTable, ffi: &mut FfiState,
+    rt: &runtime.Runtime, ext_fn: &hb.HirFn, arg_tys: &[]i32, arg_slots: &[]i32,
+    ret_ty: i32, ret_addr_slot: i32, cb_ctx_slot: i32) {
     platform := code.platform
     sym_name := if ext_fn.extern_symbol != "" { ext_fn.extern_symbol.clone() } else { ext_fn.name.clone() }
     slot := ensure_import(&mut ffi, platform, ext_fn.extern_lib.clone(), sym_name, false, ext_fn.link_weak, ext_fn.link_delay)
+    use_cb := ffi.has_callbacks && rt.cb_before_call >= 0
 
-    max_gp := if platform == 5 { 4 } else if platform == 2 { 6 } else { 8 }
-    max_fp := if platform == 5 { 4 } else { 8 }
-    is_win := platform == 5
-    is_var := ext_fn.variadic_fixed >= 0
-    fixed_cnt := if is_var { ext_fn.variadic_fixed } else { arg_tys.len }
+    // ---------------------------------------------------------------------
+    // ARM64 (arm64-macos = 0, arm64-linux = 1) — AAPCS64
+    // ---------------------------------------------------------------------
+    if platform == 0 || platform == 1 {
+        plan := plan_aapcs64(&types, platform == 0, ext_fn.variadic_fixed, &arg_tys, ret_ty)
+        if use_cb && cb_ctx_slot >= 0 {
+            arm.branch(&mut code, rt.cb_before_call, 1)
+            arm.store(&mut code, cb_ctx_slot, 0)
+        }
+        if plan.outgoing > 0 { fop.emit(&mut code, .Reserve, 0, 0, plan.outgoing) }
 
-    // Plan GP / FP / stack assignment for each argument
-    mut arg_kind: []i32 = [] // 0 = GP reg, 1 = FP reg, 2 = stack offset
-    mut arg_loc: []i32 = []
-    mut gp_used := 0
-    mut fp_used := 0
-    mut stack_bytes := 0
-
-    for i in 0..arg_tys.len {
-        aty := arg_tys[i]
-        is_fp := c_arg_is_float(aty)
-        if is_win {
-            // Win64: unified positional slots 0..3 in GP/XMM, rest on stack
-            if i < 4 {
-                if is_fp {
-                    arg_kind.push(1); arg_loc.push(i)
-                    if i + 1 > fp_used { fp_used = i + 1 }
-                    if is_var && i + 1 > gp_used { gp_used = i + 1 }
-                } else {
-                    arg_kind.push(0); arg_loc.push(i)
-                    if i + 1 > gp_used { gp_used = i + 1 }
+        // Spill & load non-x0 args in reverse order
+        mut i := arg_tys.len - 1
+        while i >= 0 {
+            arg := &plan.args[i]
+            ty := arg_tys[i]
+            arm.load(&mut code, arg_slots[i])
+            if arg.kind == A64_ARG_GPR {
+                if arg.reg0 != 0 { arm.mov(&mut code, arg.reg0, 0) }
+            } else if arg.kind == A64_ARG_FP {
+                abi.fp(&mut code, arg.reg0, 0, arg.total_size, true)
+            } else if arg.kind == A64_ARG_STACK_SCALAR {
+                fop.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                store_stack_scalar(&mut code, &types, ty, 9, arg.slot_width)
+            } else if arg.kind == A64_ARG_AGG_HFA {
+                abi.hfa(&mut code, 0, arg.reg0, arg.hfa_shape, true)
+            } else if arg.kind == A64_ARG_AGG_GPR {
+                arm.mov(&mut code, 12, 0)
+                if arg.total_size > 8 {
+                    abi.load_word_partial(&mut code, arg.reg0 + 1, 12, 8, arg.total_size - 8)
                 }
+                if arg.reg0 != 0 {
+                    abi.load_word_partial(&mut code, arg.reg0, 12, 0, if arg.total_size > 8 { 8 } else { arg.total_size })
+                }
+            } else if arg.kind == A64_ARG_AGG_INDIRECT_GPR {
+                if arg.reg0 != 0 { arm.mov(&mut code, arg.reg0, 0) }
+            } else if arg.kind == A64_ARG_AGG_INDIRECT_STACK {
+                fop.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                helpers.store_mem(&mut code, 0, 9, 0)
             } else {
-                arg_kind.push(2); arg_loc.push(stack_bytes)
-                stack_bytes += 8
+                fop.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                abi.copy(&mut code, 9, 0, arg.total_size)
             }
-        } else if platform == 0 && is_var && i >= fixed_cnt {
-            // Darwin ARM64 variadic args always spill to 8-byte aligned stack slots
-            arg_kind.push(2); arg_loc.push(stack_bytes)
-            stack_bytes += 8
-        } else if is_fp {
-            if fp_used < max_fp {
-                arg_kind.push(1); arg_loc.push(fp_used)
-                fp_used += 1
+            i -= 1
+        }
+        if plan.ret.kind == A64_RET_INDIRECT && ret_addr_slot >= 0 {
+            arm.load_into(&mut code, ret_addr_slot, 8)
+        }
+        // Finally load x0 if used
+        for idx in 0..arg_tys.len {
+            arg := &plan.args[idx]
+            if (arg.kind == A64_ARG_GPR || arg.kind == A64_ARG_AGG_INDIRECT_GPR) && arg.reg0 == 0 {
+                arm.load(&mut code, arg_slots[idx])
+            } else if arg.kind == A64_ARG_AGG_GPR && arg.reg0 == 0 {
+                arm.load(&mut code, arg_slots[idx])
+                arm.mov(&mut code, 12, 0)
+                abi.load_word_partial(&mut code, 0, 12, 0, if arg.total_size > 8 { 8 } else { arg.total_size })
+            }
+        }
+        emit_import_addr(&mut code, &mut ffi, slot, 16)
+        arm.mov(&mut code, 17, 16)
+        fop.emit(&mut code, .Invoke, plan.gp_used, plan.fp_used, plan.outgoing)
+        if use_cb && cb_ctx_slot >= 0 {
+            arm.load_into(&mut code, cb_ctx_slot, 16)
+            for r in 19..25 { abi.load(&mut code, r, 16, (r - 19) * 8, 8) }
+        }
+        if plan.outgoing > 0 { fop.emit(&mut code, .Release, 0, 0, plan.outgoing) }
+
+        if plan.ret.kind == A64_RET_AGG_GPR && ret_addr_slot >= 0 {
+            arm.mov(&mut code, 12, 0)
+            if plan.ret.total_size > 8 { arm.mov(&mut code, 13, 1) }
+            arm.load(&mut code, ret_addr_slot)
+            abi.store_word_partial(&mut code, 12, 0, 0, if plan.ret.total_size > 8 { 8 } else { plan.ret.total_size })
+            if plan.ret.total_size > 8 {
+                abi.store_word_partial(&mut code, 13, 0, 8, plan.ret.total_size - 8)
+            }
+        } else if plan.ret.kind == A64_RET_AGG_HFA && ret_addr_slot >= 0 {
+            arm.load(&mut code, ret_addr_slot)
+            abi.hfa(&mut code, 0, 0, plan.ret.hfa_shape, false)
+        } else if plan.ret.kind == A64_RET_INDIRECT {
+            // callee wrote directly into [ret_addr_slot] via x8
+        } else if plan.ret.kind != A64_RET_VOID {
+            emit_scalar_ret_normalize(&mut code, &types, ret_ty)
+        }
+        return
+    }
+
+    // ---------------------------------------------------------------------
+    // x86_64-linux (platform == 2) — SysV AMD64
+    // ---------------------------------------------------------------------
+    if platform == 2 {
+        plan := plan_sysv64(&types, &arg_tys, ret_ty)
+        if use_cb {
+            arm.branch(&mut code, rt.cb_before_call, 1)
+        }
+        if plan.outgoing > 0 { fop.emit(&mut code, .Reserve, 0, 0, plan.outgoing) }
+        mut i := arg_tys.len - 1
+        while i >= 0 {
+            arg := &plan.args[i]
+            ty := arg_tys[i]
+            arm.load(&mut code, arg_slots[i])
+            if arg.kind == SYSV_ARG_GPR {
+                if arg.reg0 != 0 { arm.mov(&mut code, arg.reg0, 0) }
+            } else if arg.kind == SYSV_ARG_XMM {
+                abi.fp(&mut code, arg.reg0, 0, arg.total_size, true)
+            } else if arg.kind == SYSV_ARG_STACK_SCALAR {
+                fop.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                store_stack_scalar(&mut code, &types, ty, 9, 8)
+            } else if arg.kind == SYSV_ARG_AGG_STACK {
+                fop.emit(&mut code, .StackAddress, 9, 0, arg.stack_off)
+                abi.copy(&mut code, 9, 0, arg.total_size)
             } else {
-                arg_kind.push(2); arg_loc.push(stack_bytes)
-                stack_bytes += 8
+                arm.mov(&mut code, 12, 0)
+                if arg.eb_count == 2 {
+                    if arg.c1 == SYSV_SSE {
+                        abi.load_word_partial(&mut code, 13, 12, 8, arg.size1)
+                        abi.fp(&mut code, arg.reg1, 13, if arg.size1 <= 4 { 4 } else { 8 }, true)
+                    } else if arg.reg1 != 0 {
+                        abi.load_word_partial(&mut code, arg.reg1, 12, 8, arg.size1)
+                    }
+                }
+                if arg.c0 == SYSV_SSE {
+                    abi.load_word_partial(&mut code, 13, 12, 0, arg.size0)
+                    abi.fp(&mut code, arg.reg0, 13, if arg.size0 <= 4 { 4 } else { 8 }, true)
+                } else if arg.reg0 != 0 {
+                    abi.load_word_partial(&mut code, arg.reg0, 12, 0, arg.size0)
+                }
             }
+            i -= 1
+        }
+        if plan.ret.kind == SYSV_RET_INDIRECT && ret_addr_slot >= 0 {
+            arm.load(&mut code, ret_addr_slot)
         } else {
-            if gp_used < max_gp {
-                arg_kind.push(0); arg_loc.push(gp_used)
-                gp_used += 1
+            for idx in 0..arg_tys.len {
+                arg := &plan.args[idx]
+                if arg.kind == SYSV_ARG_GPR && arg.reg0 == 0 {
+                    arm.load(&mut code, arg_slots[idx])
+                } else if arg.kind == SYSV_ARG_AGG_REGS && arg.c0 == SYSV_INT && arg.reg0 == 0 {
+                    arm.load(&mut code, arg_slots[idx])
+                    arm.mov(&mut code, 12, 0)
+                    abi.load_word_partial(&mut code, 0, 12, 0, arg.size0)
+                } else if arg.kind == SYSV_ARG_AGG_REGS && arg.eb_count == 2 && arg.c1 == SYSV_INT && arg.reg1 == 0 {
+                    arm.load(&mut code, arg_slots[idx])
+                    arm.mov(&mut code, 12, 0)
+                    abi.load_word_partial(&mut code, 0, 12, 8, arg.size1)
+                }
+            }
+        }
+        emit_import_addr(&mut code, &mut ffi, slot, 16)
+        arm.mov(&mut code, 17, 16)
+        fop.emit(&mut code, .Invoke, plan.gp_used, plan.fp_used, plan.outgoing)
+        if plan.outgoing > 0 { fop.emit(&mut code, .Release, 0, 0, plan.outgoing) }
+
+        if plan.ret.kind == SYSV_RET_INDIRECT {
+            // callee wrote into [ret_addr_slot]
+        } else if plan.ret.kind == SYSV_RET_AGG_REGS && ret_addr_slot >= 0 {
+            arm.mov(&mut code, 12, 0)
+            arm.mov(&mut code, 13, 1)
+            arm.load(&mut code, ret_addr_slot)
+            if plan.ret.c0 == SYSV_INT {
+                src0 := if plan.ret.reg0 == 0 { 12 } else { 13 }
+                abi.store_word_partial(&mut code, src0, 0, 0, plan.ret.size0)
             } else {
-                arg_kind.push(2); arg_loc.push(stack_bytes)
-                stack_bytes += 8
+                abi.fp(&mut code, plan.ret.reg0, 14, if plan.ret.size0 <= 4 { 4 } else { 8 }, false)
+                abi.store_word_partial(&mut code, 14, 0, 0, plan.ret.size0)
+            }
+            if plan.ret.eb_count == 2 {
+                if plan.ret.c1 == SYSV_INT {
+                    src1 := if plan.ret.reg1 == 0 { 12 } else { 13 }
+                    abi.store_word_partial(&mut code, src1, 0, 8, plan.ret.size1)
+                } else {
+                    abi.fp(&mut code, plan.ret.reg1, 14, if plan.ret.size1 <= 4 { 4 } else { 8 }, false)
+                    abi.store_word_partial(&mut code, 14, 0, 8, plan.ret.size1)
+                }
+            }
+        } else if plan.ret.kind != SYSV_RET_VOID {
+            emit_scalar_ret_normalize(&mut code, &types, ret_ty)
+        }
+        return
+    }
+
+    // ---------------------------------------------------------------------
+    // x86_64-windows (platform == 5) — Win64 ABI
+    // ---------------------------------------------------------------------
+    ret_is_rec := is_c_record(&types, ret_ty)
+    ret_sz := if ret_is_rec { helpers.type_byte_size(&types, ret_ty) } else { c_arg_width(&types, ret_ty) }
+    indirect_ret := ret_is_rec && !win_register_record(ret_sz)
+    is_var := ext_fn.variadic_fixed >= 0
+
+    mut win_slot := if indirect_ret { 1 } else { 0 }
+    mut gp := win_slot
+    mut fp := win_slot
+    mut outgoing := 32
+    mut locs: []i32 = [] // 0..3 GP, 8..11 XMM, >=16 stack at (loc - 16)
+    locs.reserve(arg_tys.len)
+    for idx in 0..arg_tys.len {
+        ty := arg_tys[idx]
+        agg := is_c_record(&types, ty)
+        base := c_abi_scalar_type(&types, ty)
+        is_fp := !agg && c_scalar_is_float(base)
+        if win_slot < 4 {
+            locs.push(if is_fp { 8 + win_slot } else { win_slot })
+            win_slot += 1; gp = win_slot; fp = win_slot
+        } else {
+            off := 32 + (win_slot - 4) * 8
+            locs.push(16 + off)
+            win_slot += 1
+            outgoing = off + 8
+        }
+    }
+    outgoing = align_up(outgoing, 16)
+
+    use_win_cb := ffi.has_callbacks && rt.callback_push >= 0 && rt.callback_pop >= 0
+    if use_win_cb {
+        if ffi.globals < 64 { ffi.globals = 64 }
+        fop.emit(&mut code, .Reserve, 0, 0, 80)
+        fop.emit(&mut code, .StackAddress, 0, 0, 0)
+        arm.mov(&mut code, 16, 0)
+        fop.emit(&mut code, .SaveRuntime, 0, 0, 0)
+        emit_static_addr(&mut code, &mut ffi, 0, 16)
+        arm.mov(&mut code, 1, 16)
+        arm.branch(&mut code, rt.callback_push, 1)
+    }
+    if outgoing > 0 { fop.emit(&mut code, .Reserve, 0, 0, outgoing) }
+
+    mut i := arg_tys.len - 1
+    while i >= 0 {
+        where := locs[i]
+        ty := arg_tys[i]
+        arm.load(&mut code, arg_slots[i])
+        if is_c_record(&types, ty) {
+            sz := helpers.type_byte_size(&types, ty)
+            if win_register_record(sz) { abi.load(&mut code, 0, 0, 0, sz) }
+            if where < 8 {
+                if where != 0 { arm.mov(&mut code, where, 0) }
+            } else {
+                fop.emit(&mut code, .StackAddress, 9, 0, where - 16)
+                helpers.store_mem(&mut code, 0, 9, 0)
+            }
+        } else if where < 8 {
+            if where != 0 { arm.mov(&mut code, where, 0) }
+        } else if where < 16 {
+            w := c_arg_width(&types, ty)
+            abi.fp(&mut code, where - 8, 0, w, true)
+            if is_var { arm.mov(&mut code, where - 8, 0) }
+        } else {
+            fop.emit(&mut code, .StackAddress, 9, 0, where - 16)
+            store_stack_scalar(&mut code, &types, ty, 9, 8)
+        }
+        i -= 1
+    }
+    if indirect_ret && ret_addr_slot >= 0 {
+        arm.load(&mut code, ret_addr_slot)
+    } else {
+        for idx in 0..arg_tys.len {
+            if locs[idx] == 0 {
+                arm.load(&mut code, arg_slots[idx])
+                if is_c_record(&types, arg_tys[idx]) {
+                    sz := helpers.type_byte_size(&types, arg_tys[idx])
+                    if win_register_record(sz) { abi.load(&mut code, 0, 0, 0, sz) }
+                }
             }
         }
     }
-
-    aligned_stack := ((stack_bytes + 15) / 16) * 16
-    if aligned_stack > 0 {
-        fop.emit(&mut code, .Reserve, 0, 0, aligned_stack)
-    }
-
-    // 1. Spill stack arguments
-    for i in 0..arg_tys.len {
-        if arg_kind[i] != 2 { continue }
-        arm.load_into(&mut code, arg_slots[i], 0)
-        fop.emit(&mut code, .StackAddress, 10, 0, arg_loc[i])
-        helpers.store_mem(&mut code, 0, 10, 0)
-    }
-
-    // 2. Load FP register arguments
-    for i in 0..arg_tys.len {
-        if arg_kind[i] != 1 { continue }
-        w := if arg_tys[i] == ht.TY_F32 { 4 } else { 8 }
-        arm.load_into(&mut code, arg_slots[i], 10)
-        abi.fp(&mut code, arg_loc[i], 10, w, true)
-        if is_win && is_var && arg_loc[i] < 4 {
-            arm.mov(&mut code, arg_loc[i], 10)
-        }
-    }
-
-    // 3. Load GP register arguments
-    for i in 0..arg_tys.len {
-        if arg_kind[i] != 0 { continue }
-        arm.load_into(&mut code, arg_slots[i], arg_loc[i])
-    }
-
-    // 4. Load target symbol address (imports.relocate_at patches adrp+ldr into x16) -> move to x17 and invoke
     emit_import_addr(&mut code, &mut ffi, slot, 16)
     arm.mov(&mut code, 17, 16)
-    fop.emit(&mut code, .Invoke, gp_used, fp_used, aligned_stack)
+    fop.emit(&mut code, .Invoke, gp, fp, outgoing)
+    if outgoing > 0 { fop.emit(&mut code, .Release, 0, 0, outgoing) }
 
-    if aligned_stack > 0 {
-        fop.emit(&mut code, .Release, 0, 0, aligned_stack)
+    if ret_is_rec {
+        if !indirect_ret && ret_addr_slot >= 0 {
+            arm.mov(&mut code, 12, 0)
+            arm.load(&mut code, ret_addr_slot)
+            abi.store(&mut code, 12, 0, 0, ret_sz)
+        }
+    } else if ret_ty != ht.TY_UNIT {
+        emit_scalar_ret_normalize(&mut code, &types, ret_ty)
+    }
+    if use_win_cb && cb_ctx_slot >= 0 {
+        arm.store(&mut code, cb_ctx_slot, 0)
+        fop.emit(&mut code, .StackAddress, 0, 0, 0)
+        emit_static_addr(&mut code, &mut ffi, 0, 16)
+        arm.mov(&mut code, 1, 16)
+        arm.branch(&mut code, rt.callback_pop, 1)
+        fop.emit(&mut code, .Release, 0, 0, 80)
+        arm.load(&mut code, cb_ctx_slot)
+    }
+}
+
+// =========================================================================
+// `extern "C" fn` Callback Registration, TLS Runtime & Trampolines
+// =========================================================================
+
+pub fn register_callback(code: &mut arm.Code, ffi: &mut FfiState, fn_id: i32) -> i32 {
+    key := fn_id.str()
+    existing := ffi.cb_map.get_or(key, -1)
+    if existing >= 0 { return ffi.cb_labels[i32(existing)] }
+    idx := ffi.cb_fn_ids.len
+    lbl := arm.label(&mut code)
+    ffi.cb_fn_ids.push(fn_id)
+    ffi.cb_labels.push(lbl)
+    ffi.cb_map.put(move key, i64(idx))
+    ffi.has_callbacks = true
+    if ffi.cb_enter_label < 0 { ffi.cb_enter_label = arm.label(&mut code) }
+    lbl
+}
+
+// Emits Wave 2B TLS callback bridge (`rt.cb_before_call` + `ffi.cb_enter_label`).
+// Uses OS dynamic TLS keys (`pthread_key_create`/`getspecific`/`setspecific`) on macOS/Linux
+// (zero linker TLS changes!) and lazy foreign-thread attachment with automatic cleanup destructor.
+pub fn emit_callback_runtime(code: &mut arm.Code, ffi: &mut FfiState, rt: &runtime.Runtime) {
+    if !ffi.has_callbacks { return }
+    platform := code.platform
+    if platform == 3 || platform == 4 { return }
+    if ffi.globals < 64 { ffi.globals = 64 }
+    if ffi.cb_enter_label < 0 { ffi.cb_enter_label = arm.label(&mut code) }
+
+    if platform == 5 {
+        // Win64 uses rt.callback_push / rt.callback_pop / rt.callback_find directly
+        return
     }
 
-    // 5. Normalize return value into x0
-    if ret_ty == ht.TY_F32 {
-        abi.fp(&mut code, 0, 0, 4, false)
-    } else if ret_ty == ht.TY_F64 {
-        abi.fp(&mut code, 0, 0, 8, false)
-    } else if ret_ty == ht.TY_BOOL {
-        arm.bitfield(&mut code, false, true, 0, 0, 0, 7)
-        arm.compare_immediate(&mut code, 0, 0, false)
-        arm.set_condition(&mut code, 0, 1)
-    } else if helpers.is_int_ty(ret_ty) {
-        w := c_arg_width(&types, ret_ty)
-        if w < 8 {
-            arm.bitfield(&mut code, helpers.is_signed_int(ret_ty), true, 0, 0, 0, w * 8 - 1)
+    sym_key_create := ensure_import(&mut ffi, platform, "pthread", "pthread_key_create", false, false, false)
+    sym_getspecific := ensure_import(&mut ffi, platform, "pthread", "pthread_getspecific", false, false, false)
+    sym_setspecific := ensure_import(&mut ffi, platform, "pthread", "pthread_setspecific", false, false, false)
+
+    if platform == 2 {
+        // x86_64-linux: emit cb_before_call + cb_enter_label using x86.ddr TLS pseudo-opcodes
+        arm.mark(&mut code, rt.cb_before_call)
+        already_reg := arm.label(&mut code)
+        arm.emit(&mut code, 0xfc000031)
+        arm.branch(&mut code, already_reg, 19)
+        skip_args := arm.label(&mut code)
+        arm.compare_immediate(&mut code, 24, 0, false); arm.branch(&mut code, skip_args, 2)
+        emit_static_addr(&mut code, &mut ffi, 0, 16)
+        abi.store(&mut code, 23, 16, 16, 8)
+        abi.store(&mut code, 24, 16, 24, 8)
+        arm.mark(&mut code, skip_args)
+        arm.emit(&mut code, 0xfc000032)
+        arm.branch(&mut code, ffi.cb_enter_label, 1)
+        arm.mark(&mut code, already_reg)
+        arm.return_to_caller(&mut code)
+
+        arm.mark(&mut code, ffi.cb_enter_label)
+        emit_static_addr(&mut code, &mut ffi, 0, 0)
+        arm.emit(&mut code, 0xfc000035)
+        emit_import_addr(&mut code, &mut ffi, sym_key_create, 0)
+        arm.emit(&mut code, 0xfc000036)
+        emit_import_addr(&mut code, &mut ffi, sym_getspecific, 0)
+        arm.emit(&mut code, 0xfc000037)
+        emit_import_addr(&mut code, &mut ffi, sym_setspecific, 0)
+        arm.emit(&mut code, 0xfc000038)
+        arm.emit(&mut code, 0xfc000039)
+        return
+    }
+
+    // ARM64 (arm64-macos = 0, arm64-linux = 1)
+    dtor_label := arm.label(&mut code)
+    ensure_key_label := arm.label(&mut code)
+
+    // 1. cb_tls_dtor(void *ctx): OS thread-exit destructor freeing foreign-thread arena slabs + ctx page
+    arm.mark(&mut code, dtor_label)
+    dtor_frame := arm.prologue(&mut code); arm.frame(&mut code, dtor_frame, 2)
+    dtor_done := arm.label(&mut code)
+    dtor_unmap_ctx := arm.label(&mut code)
+    arm.branch(&mut code, dtor_done, 18)
+    arm.store(&mut code, 0, 0)
+    abi.load(&mut code, 10, 0, 48, 8)
+    arm.compare_immediate(&mut code, 10, 1, false); arm.branch(&mut code, dtor_unmap_ctx, 3)
+    abi.load(&mut code, 10, 0, 16, 8)
+    arm.compare_immediate(&mut code, 10, 0, false); arm.branch(&mut code, dtor_unmap_ctx, 2)
+    abi.load(&mut code, 11, 10, 240, 8)
+    slab_loop := arm.label(&mut code); slab_done := arm.label(&mut code)
+    arm.mark(&mut code, slab_loop)
+    arm.compare_immediate(&mut code, 11, 0, false); arm.branch(&mut code, slab_done, 2)
+    abi.load(&mut code, 12, 11, 0, 8)
+    abi.load(&mut code, 1, 11, 8, 8)
+    arm.store(&mut code, 1, 12)
+    arm.mov(&mut code, 0, 11)
+    arm.syscall(&mut code, 33554505, 215)
+    arm.load_into(&mut code, 1, 11)
+    arm.branch(&mut code, slab_loop, 0)
+    arm.mark(&mut code, slab_done)
+    arm.load(&mut code, 0)
+    abi.load(&mut code, 0, 0, 16, 8)
+    abi.load(&mut code, 1, 0, 224, 8)
+    have_root_len := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 1, 0, false); arm.branch(&mut code, have_root_len, 3)
+    arm.imm(&mut code, 1, 65536)
+    arm.mark(&mut code, have_root_len)
+    arm.syscall(&mut code, 33554505, 215)
+    arm.mark(&mut code, dtor_unmap_ctx)
+    arm.load(&mut code, 0)
+    arm.imm(&mut code, 1, 4096)
+    arm.syscall(&mut code, 33554505, 215)
+    arm.mark(&mut code, dtor_done)
+    arm.ret(&mut code)
+
+    // 2. cb_ensure_tls_key() -> x0 = pthread_key_t (atomic once-init in globals[0..16])
+    arm.mark(&mut code, ensure_key_label)
+    ek_frame := arm.prologue(&mut code); arm.frame(&mut code, ek_frame, 0)
+    ek_spin := arm.label(&mut code); ek_ready := arm.label(&mut code)
+    arm.mark(&mut code, ek_spin)
+    emit_static_addr(&mut code, &mut ffi, 0, 16); arm.mov(&mut code, 0, 16)
+    arm.branch(&mut code, rt.atomic_load_i64, 1)
+    arm.compare_immediate(&mut code, 0, 2, false); arm.branch(&mut code, ek_ready, 2)
+    arm.compare_immediate(&mut code, 0, 1, false); arm.branch(&mut code, ek_spin, 2)
+    emit_static_addr(&mut code, &mut ffi, 0, 16); arm.mov(&mut code, 0, 16)
+    arm.imm(&mut code, 1, 0); arm.imm(&mut code, 2, 1)
+    arm.branch(&mut code, rt.atomic_cas_i64, 1)
+    arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, ek_spin, 3)
+    arm.branch(&mut code, dtor_label, 20); arm.mov(&mut code, 1, 0)
+    emit_static_addr(&mut code, &mut ffi, 8, 16); arm.mov(&mut code, 0, 16)
+    emit_import_addr(&mut code, &mut ffi, sym_key_create, 16)
+    arm.emit(&mut code, 3594453504)
+    ek_ok := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, ek_ok, 2)
+    arm.exit(&mut code, 112)
+    arm.mark(&mut code, ek_ok)
+    emit_static_addr(&mut code, &mut ffi, 0, 16); arm.mov(&mut code, 0, 16)
+    arm.imm(&mut code, 1, 2)
+    arm.branch(&mut code, rt.atomic_store_i64, 1)
+    arm.mark(&mut code, ek_ready)
+    emit_static_addr(&mut code, &mut ffi, 8, 16)
+    abi.load(&mut code, 0, 16, 0, 8)
+    arm.ret(&mut code)
+
+    // 3. cb_before_call(): ensure per-thread TLS ctx, save x19..x24, return ctx in x0
+    arm.mark(&mut code, rt.cb_before_call)
+    bc_frame := arm.prologue(&mut code); arm.frame(&mut code, bc_frame, 2)
+    bc_skip_args := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 24, 0, false); arm.branch(&mut code, bc_skip_args, 2)
+    emit_static_addr(&mut code, &mut ffi, 0, 16)
+    abi.store(&mut code, 23, 16, 16, 8)
+    abi.store(&mut code, 24, 16, 24, 8)
+    arm.mark(&mut code, bc_skip_args)
+    arm.branch(&mut code, ensure_key_label, 1)
+    arm.store(&mut code, 0, 0)
+    emit_import_addr(&mut code, &mut ffi, sym_getspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    bc_have := arm.label(&mut code)
+    arm.branch(&mut code, bc_have, 19)
+    arm.imm(&mut code, 0, 0); arm.imm(&mut code, 1, 4096); arm.imm(&mut code, 2, 3)
+    arm.imm(&mut code, 3, if platform == 0 { 4098 } else { 34 })
+    arm.imm(&mut code, 4, -1); arm.imm(&mut code, 5, 0)
+    arm.syscall(&mut code, 33554629, 222)
+    bc_map_ok := arm.label(&mut code)
+    if platform == 0 { arm.branch(&mut code, bc_map_ok, 5) }
+    else { arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, bc_map_ok, 12) }
+    arm.exit(&mut code, 112)
+    arm.mark(&mut code, bc_map_ok)
+    arm.store(&mut code, 1, 0)
+    arm.mov(&mut code, 1, 0)
+    arm.load(&mut code, 0)
+    emit_import_addr(&mut code, &mut ffi, sym_setspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    arm.load(&mut code, 1)
+    arm.mark(&mut code, bc_have)
+    for r in 19..25 { abi.store(&mut code, r, 0, (r - 19) * 8, 8) }
+    arm.ret(&mut code)
+
+    // 4. cb_enter_thread(): get or lazily attach foreign OS thread TLS ctx, load x19..x24, return ctx in x0
+    arm.mark(&mut code, ffi.cb_enter_label)
+    ce_frame := arm.prologue(&mut code); arm.frame(&mut code, ce_frame, 2)
+    arm.branch(&mut code, ensure_key_label, 1)
+    arm.store(&mut code, 0, 0)
+    emit_import_addr(&mut code, &mut ffi, sym_getspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    ce_have := arm.label(&mut code)
+    arm.branch(&mut code, ce_have, 19)
+    arm.imm(&mut code, 0, 0); arm.imm(&mut code, 1, 4096); arm.imm(&mut code, 2, 3)
+    arm.imm(&mut code, 3, if platform == 0 { 4098 } else { 34 })
+    arm.imm(&mut code, 4, -1); arm.imm(&mut code, 5, 0)
+    arm.syscall(&mut code, 33554629, 222)
+    ce_map_ok := arm.label(&mut code)
+    if platform == 0 { arm.branch(&mut code, ce_map_ok, 5) }
+    else { arm.compare_immediate(&mut code, 0, 0, false); arm.branch(&mut code, ce_map_ok, 12) }
+    arm.exit(&mut code, 112)
+    arm.mark(&mut code, ce_map_ok)
+    arm.store(&mut code, 1, 0)
+    emit_static_addr(&mut code, &mut ffi, 0, 16)
+    abi.load(&mut code, 10, 16, 16, 8); abi.store(&mut code, 10, 0, 32, 8)
+    abi.load(&mut code, 10, 16, 24, 8); abi.store(&mut code, 10, 0, 40, 8)
+    arm.imm(&mut code, 10, 1); abi.store(&mut code, 10, 0, 48, 8)
+    arm.mov(&mut code, 1, 0)
+    arm.load(&mut code, 0)
+    emit_import_addr(&mut code, &mut ffi, sym_setspecific, 16)
+    arm.emit(&mut code, 3594453504)
+    arm.load(&mut code, 1)
+    arm.mark(&mut code, ce_have)
+    for r in 19..25 { abi.load(&mut code, r, 0, (r - 19) * 8, 8) }
+    arm.ret(&mut code)
+}
+
+fn alloc_cb_buf(slots: &mut i32, size: i32) -> i32 {
+    mut words := (size + 7) / 8
+    if words < 1 { words = 1 }
+    slots = slots + words
+    slots - 1
+}
+
+// Emits C -> Dunder callback trampolines for every registered `extern "C" fn` body.
+// Bridges C ABI (AAPCS64 / SysV / Win64) directly into mir_emit's internal calling convention
+// (where inline C-record params arrive by pointer in GP/stack and inline C-record returns use x8 sret!).
+pub fn emit_callback_trampolines(code: &mut arm.Code, prog: &hb.HirProgram, ffi: &mut FfiState,
+    h: &helpers.EmitHelpers) {
+    if !ffi.has_callbacks || ffi.cb_fn_ids.len == 0 { return }
+    platform := code.platform
+    if platform == 3 || platform == 4 { return }
+    if ffi.globals < 64 { ffi.globals = 64 }
+
+    for ci in 0..ffi.cb_fn_ids.len {
+        fid := ffi.cb_fn_ids[ci]
+        cb_label := ffi.cb_labels[ci]
+        fn_label := h.fn_labels[fid]
+        hf := &prog.fns[fid]
+        ret_ty := hf.ret_ty
+        mut param_tys: []i32 = []
+        p_start := ht.callable_param_start(&prog.types, hf.sig_ty)
+        p_cnt := ht.callable_param_count(&prog.types, hf.sig_ty)
+        for pi in 0..p_cnt {
+            param_tys.push(prog.types.params[p_start + pi].ty)
         }
+        param_count := param_tys.len
+        ret_is_rec := is_c_record(&prog.types, ret_ty)
+        ret_is_inline := helpers.is_inline_agg(&prog.types, ret_ty)
+        ret_sz := if ret_is_rec { helpers.type_byte_size(&prog.types, ret_ty) } else { c_arg_width(&prog.types, ret_ty) }
+
+        arm.mark(&mut code, cb_label)
+
+        // -----------------------------------------------------------------
+        // ARM64 (arm64-macos = 0, arm64-linux = 1)
+        // -----------------------------------------------------------------
+        if platform == 0 || platform == 1 {
+            plan := plan_aapcs64(&prog.types, platform == 0, -1, &param_tys, ret_ty)
+            arm.emit(&mut code, 2432697326) // add x14, sp, #0 (caller incoming stack args)
+            frame := arm.prologue(&mut code)
+            // Fixed slots:
+            // 0..8   = saved incoming x0..x8 (x8 = C sret)
+            // 9..16  = saved incoming d0..d7
+            // 17     = saved x14
+            // 18..27 = saved callee-saved x19..x28
+            // 28..35 = saved callee-saved d8..d15
+            // 36     = TLS ctx ptr
+            // 37..37+param_count-1 = Dunder param slots
+            mut total_slots := 37 + param_count
+            mut param_buf_slots: []i32 = []
+            for p in 0..param_count {
+                pty := param_tys[p]
+                if is_c_record(&prog.types, pty) {
+                    param_buf_slots.push(alloc_cb_buf(&mut total_slots, helpers.type_byte_size(&prog.types, pty)))
+                } else {
+                    param_buf_slots.push(-1)
+                }
+            }
+            mut ret_buf_slot := -1
+            if ret_is_inline {
+                ret_buf_slot = alloc_cb_buf(&mut total_slots, ret_sz)
+            }
+            arm.frame(&mut code, frame, total_slots)
+
+            for r in 0..9 { arm.store(&mut code, r, r) }
+            for r in 0..8 { abi.fp(&mut code, r, 10, 8, false); arm.store(&mut code, 9 + r, 10) }
+            arm.store(&mut code, 17, 14)
+            for r in 19..29 { arm.store(&mut code, 18 + (r - 19), r) }
+            for r in 8..16 { abi.fp(&mut code, r, 10, 8, false); arm.store(&mut code, 28 + (r - 8), 10) }
+
+            arm.branch(&mut code, ffi.cb_enter_label, 1)
+            arm.store(&mut code, 36, 0)
+
+            for p in 0..param_count {
+                arg := &plan.args[p]
+                ty := param_tys[p]
+                if !is_c_record(&prog.types, ty) {
+                    if arg.kind == A64_ARG_GPR {
+                        arm.load_into(&mut code, arg.reg0, 10)
+                    } else if arg.kind == A64_ARG_FP {
+                        arm.load_into(&mut code, 9 + arg.reg0, 10)
+                        if ty == ht.TY_F32 { arm.bitfield(&mut code, false, true, 10, 10, 0, 31) }
+                    } else {
+                        arm.load_into(&mut code, 17, 13)
+                        if arg.stack_off > 0 {
+                            arm.imm(&mut code, 10, i64(arg.stack_off))
+                            arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                        }
+                        abi.load(&mut code, 10, 13, 0, c_arg_width(&prog.types, ty))
+                    }
+                    emit_scalar_normalize(&mut code, &prog.types, ty, 10)
+                    arm.store(&mut code, 37 + p, 10)
+                } else {
+                    arm.address(&mut code, param_buf_slots[p])
+                    arm.store(&mut code, 37 + p, 0)
+                    arm.mov(&mut code, 15, 0)
+                    if arg.kind == A64_ARG_AGG_GPR {
+                        arm.load_into(&mut code, arg.reg0, 10)
+                        abi.store_word_partial(&mut code, 10, 15, 0, if arg.total_size > 8 { 8 } else { arg.total_size })
+                        if arg.total_size > 8 {
+                            arm.load_into(&mut code, arg.reg0 + 1, 10)
+                            abi.store_word_partial(&mut code, 10, 15, 8, arg.total_size - 8)
+                        }
+                    } else if arg.kind == A64_ARG_AGG_HFA {
+                        elem_sz := if arg.hfa_shape > 0 { 4 } else { 8 }
+                        cnt := if arg.hfa_shape > 0 { arg.hfa_shape } else { -arg.hfa_shape }
+                        for k in 0..cnt {
+                            arm.load_into(&mut code, 9 + arg.reg0 + k, 10)
+                            abi.store(&mut code, 10, 15, k * elem_sz, elem_sz)
+                        }
+                    } else if arg.kind == A64_ARG_AGG_INDIRECT_GPR {
+                        arm.load_into(&mut code, arg.reg0, 14)
+                        abi.copy(&mut code, 15, 14, arg.total_size)
+                    } else if arg.kind == A64_ARG_AGG_INDIRECT_STACK {
+                        arm.load_into(&mut code, 17, 13)
+                        if arg.stack_off > 0 {
+                            arm.imm(&mut code, 10, i64(arg.stack_off))
+                            arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                        }
+                        abi.load(&mut code, 14, 13, 0, 8)
+                        abi.copy(&mut code, 15, 14, arg.total_size)
+                    } else {
+                        arm.load_into(&mut code, 17, 13)
+                        if arg.stack_off > 0 {
+                            arm.imm(&mut code, 10, i64(arg.stack_off))
+                            arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                        }
+                        abi.copy(&mut code, 15, 13, arg.total_size)
+                    }
+                }
+            }
+
+            // Call Dunder mir_emit function: args in x0..x7 (+ stack overflow at [sp]), sret in x8!
+            mut sp_bytes := 0
+            if param_count > 8 {
+                sp_bytes = align_up((param_count - 8) * 8, 16)
+                arm.integer_binary(&mut code, 2, true, false, 31, 31, -1, i64(sp_bytes))
+                for pi in 8..param_count {
+                    arm.load_into(&mut code, 37 + pi, 10)
+                    helpers.store_mem(&mut code, 10, 31, (pi - 8) * 8)
+                }
+            }
+            reg_lim := if param_count < 8 { param_count } else { 8 }
+            for pi in 0..reg_lim { arm.load_into(&mut code, 37 + pi, pi) }
+            if ret_is_inline {
+                if plan.ret.kind == A64_RET_INDIRECT {
+                    arm.load_into(&mut code, 8, 8) // pass C's x8 sret directly to Dunder callee!
+                } else {
+                    arm.address(&mut code, ret_buf_slot)
+                    arm.mov(&mut code, 8, 0)
+                    // reload x0 if param 0 was in x0
+                    if reg_lim > 0 { arm.load_into(&mut code, 37, 0) }
+                }
+            }
+            arm.branch(&mut code, fn_label, 1)
+            if sp_bytes > 0 {
+                arm.integer_binary(&mut code, 1, true, false, 31, 31, -1, i64(sp_bytes))
+            }
+
+            // Marshal Dunder return into AAPCS64 return registers
+            if plan.ret.kind == A64_RET_FP {
+                abi.fp(&mut code, 0, 0, c_arg_width(&prog.types, ret_ty), true)
+            } else if plan.ret.kind == A64_RET_AGG_GPR {
+                arm.address(&mut code, ret_buf_slot)
+                arm.mov(&mut code, 15, 0)
+                abi.load_word_partial(&mut code, 0, 15, 0, if ret_sz > 8 { 8 } else { ret_sz })
+                if ret_sz > 8 { abi.load_word_partial(&mut code, 1, 15, 8, ret_sz - 8) }
+            } else if plan.ret.kind == A64_RET_AGG_HFA {
+                arm.address(&mut code, ret_buf_slot)
+                abi.hfa(&mut code, 0, 0, plan.ret.hfa_shape, true)
+            }
+
+            // Write updated x19..x24 back to TLS ctx without clobbering x0/x1/v0..v3
+            arm.load_into(&mut code, 36, 16)
+            for r in 19..25 { abi.store(&mut code, r, 16, (r - 19) * 8, 8) }
+            for r in 8..16 { arm.load_into(&mut code, 28 + (r - 8), 10); abi.fp(&mut code, r, 10, 8, true) }
+            for r in 19..29 { arm.load_into(&mut code, 18 + (r - 19), r) }
+            arm.ret(&mut code)
+            continue
+        }
+
+        // -----------------------------------------------------------------
+        // x86_64-linux (platform == 2) — SysV AMD64
+        // -----------------------------------------------------------------
+        if platform == 2 {
+            plan := plan_sysv64(&prog.types, &param_tys, ret_ty)
+            arm.emit(&mut code, 0xfc000033)
+            arm.branch(&mut code, ffi.cb_enter_label, 1)
+            arm.emit(&mut code, 0xfc000034)
+            frame := arm.prologue(&mut code)
+            mut total_slots := 15 + param_count
+            mut param_buf_slots: []i32 = []
+            for p in 0..param_count {
+                pty := param_tys[p]
+                if is_c_record(&prog.types, pty) {
+                    param_buf_slots.push(alloc_cb_buf(&mut total_slots, helpers.type_byte_size(&prog.types, pty)))
+                } else {
+                    param_buf_slots.push(-1)
+                }
+            }
+            mut ret_buf_slot := -1
+            if ret_is_inline { ret_buf_slot = alloc_cb_buf(&mut total_slots, ret_sz) }
+            arm.frame(&mut code, frame, total_slots)
+
+            for r in 0..6 { arm.store(&mut code, r, r) }
+            for r in 0..8 { abi.fp(&mut code, r, 10, 8, false); arm.store(&mut code, 6 + r, 10) }
+            arm.store(&mut code, 14, 14)
+
+            for p in 0..param_count {
+                arg := &plan.args[p]
+                ty := param_tys[p]
+                if !is_c_record(&prog.types, ty) {
+                    if arg.kind == SYSV_ARG_GPR {
+                        arm.load_into(&mut code, arg.reg0, 10)
+                    } else if arg.kind == SYSV_ARG_XMM {
+                        arm.load_into(&mut code, 6 + arg.reg0, 10)
+                        if ty == ht.TY_F32 { arm.bitfield(&mut code, false, true, 10, 10, 0, 31) }
+                    } else {
+                        arm.load_into(&mut code, 14, 13)
+                        if arg.stack_off > 0 {
+                            arm.imm(&mut code, 10, i64(arg.stack_off))
+                            arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                        }
+                        abi.load(&mut code, 10, 13, 0, c_arg_width(&prog.types, ty))
+                    }
+                    emit_scalar_normalize(&mut code, &prog.types, ty, 10)
+                    arm.store(&mut code, 15 + p, 10)
+                } else {
+                    arm.address(&mut code, param_buf_slots[p])
+                    arm.store(&mut code, 15 + p, 0)
+                    arm.mov(&mut code, 15, 0)
+                    if arg.kind == SYSV_ARG_AGG_REGS {
+                        if arg.c0 == SYSV_INT { arm.load_into(&mut code, arg.reg0, 10) }
+                        else { arm.load_into(&mut code, 6 + arg.reg0, 10) }
+                        abi.store_word_partial(&mut code, 10, 15, 0, arg.size0)
+                        if arg.eb_count == 2 {
+                            if arg.c1 == SYSV_INT { arm.load_into(&mut code, arg.reg1, 10) }
+                            else { arm.load_into(&mut code, 6 + arg.reg1, 10) }
+                            abi.store_word_partial(&mut code, 10, 15, 8, arg.size1)
+                        }
+                    } else {
+                        arm.load_into(&mut code, 14, 13)
+                        if arg.stack_off > 0 {
+                            arm.imm(&mut code, 10, i64(arg.stack_off))
+                            arm.integer_binary(&mut code, 1, true, false, 13, 13, 10, -1)
+                        }
+                        abi.copy(&mut code, 15, 13, arg.total_size)
+                    }
+                }
+            }
+
+            mut sp_bytes := 0
+            if param_count > 8 {
+                sp_bytes = align_up((param_count - 8) * 8, 16)
+                arm.integer_binary(&mut code, 2, true, false, 31, 31, -1, i64(sp_bytes))
+                for pi in 8..param_count {
+                    arm.load_into(&mut code, 15 + pi, 10)
+                    helpers.store_mem(&mut code, 10, 31, (pi - 8) * 8)
+                }
+            }
+            reg_lim := if param_count < 8 { param_count } else { 8 }
+            for pi in 0..reg_lim { arm.load_into(&mut code, 15 + pi, pi) }
+            if ret_is_inline {
+                if plan.ret.kind == SYSV_RET_INDIRECT {
+                    arm.load_into(&mut code, 0, 8) // C's rdi sret -> Dunder x8 sret
+                } else {
+                    arm.address(&mut code, ret_buf_slot)
+                    arm.mov(&mut code, 8, 0)
+                    if reg_lim > 0 { arm.load_into(&mut code, 15, 0) }
+                }
+            }
+            arm.branch(&mut code, fn_label, 1)
+            if sp_bytes > 0 {
+                arm.integer_binary(&mut code, 1, true, false, 31, 31, -1, i64(sp_bytes))
+            }
+
+            if plan.ret.kind == SYSV_RET_XMM {
+                abi.fp(&mut code, 0, 0, c_arg_width(&prog.types, ret_ty), true)
+            } else if plan.ret.kind == SYSV_RET_AGG_REGS {
+                arm.address(&mut code, ret_buf_slot)
+                arm.mov(&mut code, 15, 0)
+                if plan.ret.eb_count == 2 {
+                    if plan.ret.c1 == SYSV_INT {
+                        abi.load_word_partial(&mut code, plan.ret.reg1, 15, 8, plan.ret.size1)
+                    } else {
+                        abi.load_word_partial(&mut code, 13, 15, 8, plan.ret.size1)
+                        abi.fp(&mut code, plan.ret.reg1, 13, if plan.ret.size1 <= 4 { 4 } else { 8 }, true)
+                    }
+                }
+                if plan.ret.c0 == SYSV_INT {
+                    abi.load_word_partial(&mut code, plan.ret.reg0, 15, 0, plan.ret.size0)
+                } else {
+                    abi.load_word_partial(&mut code, 13, 15, 0, plan.ret.size0)
+                    abi.fp(&mut code, plan.ret.reg0, 13, if plan.ret.size0 <= 4 { 4 } else { 8 }, true)
+                }
+            } else if plan.ret.kind == SYSV_RET_INDIRECT {
+                arm.load(&mut code, 0) // SysV requires returning sret pointer in rax
+            }
+            arm.leave_frame(&mut code)
+            arm.emit(&mut code, 4211081216)
+            continue
+        }
+
+        // -----------------------------------------------------------------
+        // x86_64-windows (platform == 5) — Win64 ABI
+        // -----------------------------------------------------------------
+        emit_static_addr(&mut code, &mut ffi, 0, 0)
+        arm.emit(&mut code, 4227858432)
+        frame := arm.prologue(&mut code)
+        arm.frame(&mut code, frame, param_count)
+        mut stack := 0
+        for p in 0..param_count {
+            ty := param_tys[p]
+            base := c_abi_scalar_type(&prog.types, ty)
+            if p < 4 {
+                if c_scalar_is_float(base) { abi.fp(&mut code, p, 10, c_arg_width(&prog.types, base), false) }
+                else { arm.mov(&mut code, 10, p) }
+            } else {
+                arm.imm(&mut code, 10, i64(stack))
+                arm.emit(&mut code, 2332688845)
+                abi.load(&mut code, 10, 13, 0, c_arg_width(&prog.types, base))
+                stack += 8
+            }
+            emit_scalar_normalize(&mut code, &prog.types, ty, 10)
+            arm.store(&mut code, p, 10)
+        }
+        mut sp_bytes := 0
+        if param_count > 8 {
+            sp_bytes = align_up((param_count - 8) * 8, 16)
+            arm.integer_binary(&mut code, 2, true, false, 31, 31, -1, i64(sp_bytes))
+            for pi in 8..param_count {
+                arm.load_into(&mut code, pi, 10)
+                helpers.store_mem(&mut code, 10, 31, (pi - 8) * 8)
+            }
+        }
+        reg_lim := if param_count < 8 { param_count } else { 8 }
+        for pi in 0..reg_lim { arm.load_into(&mut code, pi, pi) }
+        arm.branch(&mut code, fn_label, 1)
+        if sp_bytes > 0 {
+            arm.integer_binary(&mut code, 1, true, false, 31, 31, -1, i64(sp_bytes))
+        }
+        if c_scalar_is_float(c_abi_scalar_type(&prog.types, ret_ty)) {
+            abi.fp(&mut code, 0, 0, c_arg_width(&prog.types, ret_ty), true)
+        }
+        arm.emit(&mut code, 2432697279); arm.emit(&mut code, 2831252477); arm.emit(&mut code, 4211081216)
     }
 }

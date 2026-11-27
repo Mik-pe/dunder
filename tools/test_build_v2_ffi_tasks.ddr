@@ -1,0 +1,549 @@
+// Differential parity suite for Phase 2B Wave 2B FFI + `task scope` + `std.sync` on `--build-v2`.
+// Compiles and executes all cases in parallel via process.ChildSet (< 2s target), comparing
+// legacy `dunder build` vs `dunder build --build-v2` stdout, stderr, and exit codes,
+// plus v2-specific soundness verification (early-return `defer` LIFO after `task scope` join!).
+
+capability process, filesystem, stdio
+
+import .harness as harness
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import sys
+
+struct ParityCase {
+    name: string,
+    source: string,
+}
+
+struct CmdJob {
+    kind: i32, // 0 = build legacy, 1 = build v2, 2 = run legacy, 3 = run v2, 4 = v2-only build, 5 = v2-only run, 6 = cross x86_64-linux
+    case_idx: i32,
+    prog: string,
+    args: []string,
+}
+
+struct RunOut {
+    done: bool,
+    code: i32,
+    signal: i32,
+    timed_out: bool,
+    stdout_s: string,
+    stderr_s: string,
+}
+
+fn empty_out() -> RunOut {
+    RunOut { done: false, code: -1, signal: 0, timed_out: false, stdout_s: "", stderr_s: "" }
+}
+
+fn escape_ddr_string(s: string) -> string {
+    mut out: []u8 = []
+    out.reserve(s.len + 8)
+    for b in s.bytes() {
+        if b == 92 { out.push(b'\\'); out.push(b'\\') }
+        else if b == 34 { out.push(b'\\'); out.push(b'"') }
+        else { out.push(u8(b)) }
+    }
+    bytes.decode(&out).unwrap()
+}
+
+fn parity_cases(oracle_lib: string) -> []ParityCase {
+    escaped_lib := escape_ddr_string(oracle_lib)
+    [
+        // 1. Wave 2B FFI: C-struct by-value (16B GP pair, >16B sret, HFA float struct, mixed IntFloat)
+        ParityCase {
+            name: "ffi_structs_hfa_sret",
+            source:
+                "capability unsafe\n" +
+                "@repr(C) struct I64Pair { a: i64, b: i64 }\n" +
+                "@repr(C) struct F32Quad { a: f32, b: f32, c: f32, d: f32 }\n" +
+                "@repr(C) struct ClearColor { r: f64, g: f64, b: f64, a: f64 }\n" +
+                "@repr(C) struct IntFloat { tag: i64, value: f64 }\n" +
+                "@repr(C) struct Origin { x: u64, y: u64, z: u64 }\n" +
+                "@repr(C) struct Extent { w: u64, h: u64, d: u64 }\n" +
+                "@repr(C) struct Region { origin: Origin, size: Extent }\n" +
+                "@link(\"" + escaped_lib + "\")\n" +
+                "extern \"C\" {\n" +
+                "    fn roundtrip_i64_pair(p: I64Pair) -> I64Pair\n" +
+                "    fn roundtrip_f32_quad(q: F32Quad) -> F32Quad\n" +
+                "    fn roundtrip_clear_color(c: ClearColor) -> ClearColor\n" +
+                "    fn roundtrip_int_float(v: IntFloat) -> IntFloat\n" +
+                "    fn roundtrip_region(r: Region, dx: u64, dy: u64) -> Region\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    unsafe {\n" +
+                "        p := roundtrip_i64_pair(I64Pair { a: 1000, b: 2000 })\n" +
+                "        print(p.a)\n" +
+                "        print(p.b)\n" +
+                "        q := roundtrip_f32_quad(F32Quad { a: 1.0, b: 2.0, c: 3.0, d: 4.0 })\n" +
+                "        print(i32(q.a * 10.0 + q.d * 10.0))\n" +
+                "        cc := roundtrip_clear_color(ClearColor { r: 0.25, g: 0.5, b: 0.75, a: 1.0 })\n" +
+                "        print(i32((cc.r + cc.g + cc.b + cc.a) * 100.0))\n" +
+                "        inf := roundtrip_int_float(IntFloat { tag: 14, value: 2.5 })\n" +
+                "        print(inf.tag)\n" +
+                "        print(i32(inf.value * 100.0))\n" +
+                "        r0 := Region { origin: Origin { x: 1, y: 2, z: 3 }, size: Extent { w: 4, h: 5, d: 6 } }\n" +
+                "        r1 := roundtrip_region(r0, 10, 20)\n" +
+                "        print(r1.origin.x)\n" +
+                "        print(r1.origin.y)\n" +
+                "        print(r1.origin.z)\n" +
+                "        print(r1.size.w)\n" +
+                "        print(r1.size.h)\n" +
+                "        print(r1.size.d)\n" +
+                "    }\n" +
+                "}\n",
+        },
+
+        // 2. Wave 2B FFI: C variadics (`snprintf`) + `extern static` (`environ`) + `extern "C" fn` callback (`qsort` with heap-allocating Dunder callback!)
+        ParityCase {
+            name: "ffi_variadic_static_qsort_cb",
+            source:
+                "capability unsafe\n" +
+                "@link(\"c\")\n" +
+                "extern \"C\" {\n" +
+                "    fn snprintf(buf: *mut u8, cap: usize, fmt: *const u8, ...) -> i32\n" +
+                "    fn qsort(base: ptr, nmemb: usize, size: usize, cmp: extern \"C\" fn(ptr, ptr) -> i32)\n" +
+                "    static environ: ptr\n" +
+                "}\n" +
+                "extern \"C\" fn cmp_i64_alloc(pa: ptr, pb: ptr) -> i32 {\n" +
+                "    a := unsafe { load_i64(pa) }\n" +
+                "    b := unsafe { load_i64(pb) }\n" +
+                "    // Allocate in Dunder heap inside C callback to verify Wave 2B TLS arena save/restore!\n" +
+                "    tag := \"k:\" + a.str() + \",\" + b.str()\n" +
+                "    assert(tag.len >= 5)\n" +
+                "    if a < b { -1 } else if a > b { 1 } else { 0 }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    unsafe {\n" +
+                "        mut buf: [u8; 64] = [u8(0); 64]\n" +
+                "        n := snprintf(buf.as_mut_ptr(), usize(64), c\"v=%d,%lld\".as_ptr().cast<u8>(), i32(42), i64(9001))\n" +
+                "        print(n)\n" +
+                "        print(i32(buf[0]))\n" +
+                "        print(i32(buf[2]))\n" +
+                "        // Verify extern static DataObject address is non-null\n" +
+                "        env_ptr := load_ptr(addr(&environ))\n" +
+                "        print(usize(env_ptr) != usize(0))\n" +
+                "        // Sort array via libc qsort + heap-allocating extern \"C\" fn callback\n" +
+                "        mut nums: [i64; 6] = [50, 10, 40, 20, 60, 30]\n" +
+                "        qsort(ptr(usize(nums.as_mut_ptr().addr())), usize(6), usize(8), cmp_i64_alloc)\n" +
+                "        for i in 0..6 { print(nums[i]) }\n" +
+                "    }\n" +
+                "}\n",
+        },
+
+        // 3. Wave 2B FFI: C-struct & re-entrant & foreign-thread `extern "C" fn` callbacks
+        ParityCase {
+            name: "ffi_callbacks_struct_reentrant",
+            source:
+                "capability unsafe\n" +
+                "@repr(C) struct I64Pair { a: i64, b: i64 }\n" +
+                "@repr(C) struct IntFloat { tag: i64, value: f64 }\n" +
+                "@link(\"" + escaped_lib + "\")\n" +
+                "extern \"C\" {\n" +
+                "    fn call_cb_i64_pair(cb: extern \"C\" fn(I64Pair, i64) -> I64Pair, p: I64Pair, k: i64) -> I64Pair\n" +
+                "    fn bounce_reentrant(cb: extern \"C\" fn(i64) -> i64, depth: i64) -> i64\n" +
+                "    fn run_single_foreign_thread(cb: extern \"C\" fn(i64, i64) -> IntFloat, tid: i64, iters: i64) -> IntFloat\n" +
+                "}\n" +
+                "extern \"C\" fn cb_pair(p: I64Pair, k: i64) -> I64Pair {\n" +
+                "    I64Pair { a: p.a + k, b: p.b - k }\n" +
+                "}\n" +
+                "extern \"C\" fn cb_bounce(depth: i64) -> i64 {\n" +
+                "    s := \"d-\" + depth.str()\n" +
+                "    if depth <= 0 { assert(s == \"d-0\"); return 100 }\n" +
+                "    sub := unsafe { bounce_reentrant(cb_bounce, depth - 1) }\n" +
+                "    assert(s == \"d-\" + depth.str())\n" +
+                "    sub + depth\n" +
+                "}\n" +
+                "extern \"C\" fn cb_foreign(tid: i64, iter: i64) -> IntFloat {\n" +
+                "    txt := \"t\" + tid.str() + \":\" + iter.str()\n" +
+                "    assert(txt.len >= 3)\n" +
+                "    IntFloat { tag: tid * 100 + iter, value: f64(iter) * 0.5 }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    unsafe {\n" +
+                "        r := call_cb_i64_pair(cb_pair, I64Pair { a: 50, b: 20 }, 7)\n" +
+                "        print(r.a)\n" +
+                "        print(r.b)\n" +
+                "        print(bounce_reentrant(cb_bounce, 5))\n" +
+                "        fr := run_single_foreign_thread(cb_foreign, 3, 4)\n" +
+                "        print(fr.tag)\n" +
+                "    }\n" +
+                "}\n",
+        },
+
+        // 4. Multi-worker `task scope` (.spawn, .wait_any, .join)
+        ParityCase {
+            name: "task_scope_spawn_wait_any_join",
+            source:
+                "fn work_item(x: i32) -> i32 {\n" +
+                "    mut acc := 0\n" +
+                "    for i in 1..(x + 1) { acc += i }\n" +
+                "    acc\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    mut total := 0\n" +
+                "    task scope jobs(4) {\n" +
+                "        mut ts: []Task<i32> = []\n" +
+                "        for k in 1..7 {\n" +
+                "            ts.push(jobs.spawn(work_item, k * 10))\n" +
+                "        }\n" +
+                "        while ts.len > 0 {\n" +
+                "            idx := jobs.wait_any(&ts)\n" +
+                "            t := ts.remove(idx)\n" +
+                "            total += (move t).join()\n" +
+                "        }\n" +
+                "    }\n" +
+                "    print(total)\n" +
+                "}\n",
+        },
+
+        // 5. `task scope (shared ...)` + `Published<T>` with frozen compound payload enum (`TYPE_DESC_TABLE` `rc <= -3`)
+        ParityCase {
+            name: "task_scope_shared_published_typedesc",
+            source:
+                "import std.sync as sync\n" +
+                "enum Payload {\n" +
+                "    Text(string),\n" +
+                "    Pair(string, i32),\n" +
+                "}\n" +
+                "struct Config {\n" +
+                "    prefix: string,\n" +
+                "    item: Payload,\n" +
+                "    factor: i32,\n" +
+                "}\n" +
+                "fn worker(id: i32, cfg: &Config) -> string {\n" +
+                "    copied := cfg.item.clone()\n" +
+                "    match copied {\n" +
+                "        .Text(t) => cfg.prefix + \":\" + t + \":\" + (id * cfg.factor).str(),\n" +
+                "        .Pair(label, n) => cfg.prefix + \":\" + label + \":\" + (n + id * cfg.factor).str(),\n" +
+                "    }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    pub_cfg := sync.Published<Config>::new(Config {\n" +
+                "        prefix: \"P\",\n" +
+                "        item: .Pair(\"ok\", 10),\n" +
+                "        factor: 3,\n" +
+                "    })\n" +
+                "    guard := pub_cfg.read()\n" +
+                "    snap_copy := guard.get().item.clone()\n" +
+                "    match snap_copy {\n" +
+                "        .Pair(s, n) => { print(s); print(n) },\n" +
+                "        .Text(s) => print(s),\n" +
+                "    }\n" +
+                "    shared_cfg := Config { prefix: \"S\", item: .Pair(\"tag\", 100), factor: 5 }\n" +
+                "    task scope jobs(2, shared shared_cfg) {\n" +
+                "        t1 := jobs.spawn(worker, 2)\n" +
+                "        t2 := jobs.spawn(worker, 4)\n" +
+                "        print((move t1).join())\n" +
+                "        print((move t2).join())\n" +
+                "    }\n" +
+                "}\n",
+        },
+
+        // 6. `std.sync`: `Channel<T>` cross-worker deep-clone + `AtomicI64` + `Semaphore` + `CancelToken`
+        ParityCase {
+            name: "sync_channel_atomic_sem_cancel",
+            source:
+                "import std.sync as sync\n" +
+                "struct Msg { tag: string, vals: []i32 }\n" +
+                "struct Job {\n" +
+                "    tx: sync.Sender<Msg>,\n" +
+                "    counter: sync.AtomicI64,\n" +
+                "    sem: sync.Semaphore,\n" +
+                "    cancel: sync.CancelToken,\n" +
+                "    id: i32,\n" +
+                "}\n" +
+                "fn producer(move job: Job) -> i32 {\n" +
+                "    job.sem.acquire()\n" +
+                "    defer { job.sem.release() }\n" +
+                "    _ := job.counter.fetch_add(i64(job.id))\n" +
+                "    mut xs: []i32 = [job.id, job.id * 10]\n" +
+                "    _ := job.tx.send(Msg { tag: \"m\" + job.id.str(), vals: move xs })\n" +
+                "    if job.cancel.is_cancelled() { return -1 }\n" +
+                "    job.id\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    (tx, rx) := sync.channel<Msg>(8)\n" +
+                "    counter := sync.AtomicI64::new(0)\n" +
+                "    sem := sync.Semaphore::new(2)\n" +
+                "    cancel := sync.CancelToken::new()\n" +
+                "    task scope jobs(3) {\n" +
+                "        t1 := jobs.spawn(producer, move Job { tx: tx.clone_sender(), counter: counter.clone_handle(), sem: sem.clone_handle(), cancel: cancel.clone_handle(), id: 1 })\n" +
+                "        t2 := jobs.spawn(producer, move Job { tx: tx.clone_sender(), counter: counter.clone_handle(), sem: sem.clone_handle(), cancel: cancel.clone_handle(), id: 2 })\n" +
+                "        t3 := jobs.spawn(producer, move Job { tx: tx.clone_sender(), counter: counter.clone_handle(), sem: sem.clone_handle(), cancel: cancel.clone_handle(), id: 3 })\n" +
+                "        _ := (move t1).join()\n" +
+                "        _ := (move t2).join()\n" +
+                "        _ := (move t3).join()\n" +
+                "    }\n" +
+                "    tx.close()\n" +
+                "    mut sum := 0\n" +
+                "    mut count := 0\n" +
+                "    while true {\n" +
+                "        match rx.recv() {\n" +
+                "            .Some(m) => { sum += m.vals[0] + m.vals[1]; count += 1 },\n" +
+                "            .None => break,\n" +
+                "        }\n" +
+                "    }\n" +
+                "    cancel.cancel()\n" +
+                "    print(count)\n" +
+                "    print(sum)\n" +
+                "    print(counter.load())\n" +
+                "    print(cancel.is_cancelled())\n" +
+                "}\n",
+        },
+    ]
+}
+
+fn run_batch(jobs: &[]CmdJob, workers: i32) -> []RunOut {
+    mut results: []RunOut = []
+    results.reserve(jobs.len)
+    for _ in 0..jobs.len { results.push(empty_out()) }
+    if jobs.len == 0 { return results }
+
+    pool_cap := if workers < 1 { 1 } else if workers > jobs.len { jobs.len } else { workers }
+    mut pool := process.ChildSet::new(pool_cap)
+    mut slot_job: []i32 = []
+    mut slot_start: []i64 = []
+    mut slot_out: []string = []
+    mut slot_err: []string = []
+    for _ in 0..pool_cap {
+        slot_job.push(-1)
+        slot_start.push(0)
+        slot_out.push("")
+        slot_err.push("")
+    }
+
+    mut next_idx := 0
+    mut completed := 0
+    mut raw_out: []u8 = []
+    mut raw_err: []u8 = []
+
+    while completed < jobs.len {
+        while next_idx < jobs.len && pool.len() < pool_cap {
+            j := next_idx
+            mut args_copy: []string = []
+            for a in &jobs[j].args { args_copy.push(a.clone()) }
+            mut cmd := process.Command::new(jobs[j].prog.clone(), move args_copy)
+            sp := cmd.spawn()
+            if sp.is_err() {
+                if pool.len() > 0 { break }
+                results[j] = RunOut { done: true, code: -1, signal: 0, timed_out: false, stdout_s: "", stderr_s: "spawn failed" }
+                completed += 1
+                next_idx += 1
+                continue
+            }
+            mut child := sp.unwrap()
+            slot := pool.insert(&mut child)
+            assert(slot >= 0)
+            slot_job[slot] = j
+            slot_start[slot] = sys.now_ms()
+            slot_out[slot] = ""
+            slot_err[slot] = ""
+            next_idx += 1
+        }
+        if pool.len() == 0 { continue }
+        _ := pool.poll_io(5)
+        now := sys.now_ms()
+        for slot in 0..pool_cap {
+            if !pool.is_active(slot) { continue }
+            j := slot_job[slot]
+            raw_out.clear(); raw_err.clear()
+            mut w := pool.try_wait(slot, &mut raw_out, &mut raw_err)
+            if !w.exited && now - slot_start[slot] >= i64(30000) {
+                w = pool.kill_reap(slot, &mut raw_out, &mut raw_err)
+            }
+            if raw_out.len > 0 { slot_out[slot] += bytes.decode(&raw_out).unwrap_or_default() }
+            if raw_err.len > 0 { slot_err[slot] += bytes.decode(&raw_err).unwrap_or_default() }
+            if w.exited {
+                completed += 1
+                results[j] = RunOut {
+                    done: true, code: w.code, signal: w.signal, timed_out: w.timed_out,
+                    stdout_s: slot_out[slot].clone(), stderr_s: slot_err[slot].clone(),
+                }
+                slot_job[slot] = -1
+            }
+        }
+    }
+    results
+}
+
+fn main() -> i32 {
+    t0 := sys.now_ms()
+    empty_opts: []cli.Option = []
+    args := cli.parse(&empty_opts)
+    compiler := cli.compiler(&args, "usage: test_build_v2_ffi_tasks <compiler>")
+    if compiler == "" { return 2 }
+
+    work := f"/tmp/dunder-build-v2-ffi-tasks-{sys.pid()}"
+    if !sys.mkdir(work).ok && !sys.metadata(work).is_dir {
+        _ := harness.fail(f"cannot create {work}")
+        return 1
+    }
+    defer { _ := fs.remove_all(work) }
+
+    // Compile tiny C oracle shared library from tests/fixtures/ffi/abi_v2_oracle.c
+    mac := process.host_os() == "macos"
+    oracle_lib := work + if mac { "/abi_v2_oracle.dylib" } else { "/abi_v2_oracle.so" }
+    shared_flag := if mac { "-dynamiclib" } else { "-shared" }
+    cc_cmd := "cc"
+    mut cc_args: []string = ["-std=c11", "-O2", "-pthread", "-fPIC", shared_flag,
+        "tests/fixtures/ffi/abi_v2_oracle.c", "-o", oracle_lib.clone()]
+    if !mac { cc_args.push("-lm") }
+    cc_jobs: []CmdJob = [CmdJob { kind: -1, case_idx: -1, prog: cc_cmd, args: move cc_args }]
+    cc_res := run_batch(&cc_jobs, 1)
+    if cc_res[0].code != 0 || cc_res[0].signal != 0 {
+        _ := harness.fail(f"cc oracle build failed: exit={cc_res[0].code} stderr={cc_res[0].stderr_s}")
+        return 1
+    }
+
+    cases := parity_cases(oracle_lib)
+    mut src_paths: []string = []
+    mut leg_bins: []string = []
+    mut v2_bins: []string = []
+    for i in 0..cases.len {
+        sp := f"{work}/{cases[i].name}.ddr"
+        if !sys.write_text(sp, cases[i].source).ok { _ := harness.fail(f"cannot write {sp}"); return 1 }
+        src_paths.push(move sp)
+        leg_bins.push(f"{work}/{cases[i].name}.legacy")
+        v2_bins.push(f"{work}/{cases[i].name}.v2")
+    }
+
+    // V2 LIFO Soundness Test (S-8): early `return` inside `task scope` MUST join running workers BEFORE outer `defer` executes!
+    lifo_src := f"{work}/v2_task_defer_lifo.ddr"
+    lifo_bin := f"{work}/v2_task_defer_lifo.v2"
+    lifo_code := "import std.sync as sync\n" +
+        "import sys\n" +
+        "fn slow_worker(move flag: sync.AtomicI64) -> i32 {\n" +
+        "    sys.sleep_ms(30)\n" +
+        "    flag.store(2)\n" +
+        "    print(\"worker_done\")\n" +
+        "    1\n" +
+        "}\n" +
+        "fn run_early(flag: &sync.AtomicI64) -> i32 {\n" +
+        "    defer {\n" +
+        "        print(\"defer_saw:\" + flag.load().str())\n" +
+        "    }\n" +
+        "    task scope jobs(2) {\n" +
+        "        _ := jobs.spawn(slow_worker, move flag.clone_handle())\n" +
+        "        return 7\n" +
+        "    }\n" +
+        "    0\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    flag := sync.AtomicI64::new(1)\n" +
+        "    r := run_early(&flag)\n" +
+        "    print(\"ret:\" + r.str())\n" +
+        "}\n"
+    if !sys.write_text(lifo_src, lifo_code).ok { _ := harness.fail("cannot write v2_task_defer_lifo.ddr"); return 1 }
+
+    // Cross-target smoke check (x86_64-linux FFI struct + variadic)
+    x86_src := src_paths[1].clone()
+    x86_bin := f"{work}/ffi_x86_64_linux.elf"
+
+    // Phase 1: Parallel build all legacy + v2 + v2-only + x86_64-linux cross targets
+    mut build_jobs: []CmdJob = []
+    for i in 0..cases.len {
+        build_jobs.push(CmdJob {
+            kind: 0, case_idx: i, prog: compiler.clone(),
+            args: ["build", src_paths[i].clone(), "-o", leg_bins[i].clone(), "--jobs", "1"],
+        })
+        build_jobs.push(CmdJob {
+            kind: 1, case_idx: i, prog: compiler.clone(),
+            args: ["build", "--build-v2", src_paths[i].clone(), "-o", v2_bins[i].clone(), "--jobs", "1"],
+        })
+    }
+    build_jobs.push(CmdJob {
+        kind: 4, case_idx: -1, prog: compiler.clone(),
+        args: ["build", "--build-v2", lifo_src.clone(), "-o", lifo_bin.clone(), "--jobs", "1"],
+    })
+    build_jobs.push(CmdJob {
+        kind: 6, case_idx: -1, prog: compiler.clone(),
+        args: ["build", "--build-v2", "--target", "x86_64-linux", x86_src, "-o", x86_bin.clone(), "--jobs", "1"],
+    })
+
+    workers := process.host_cpus()
+    build_res := run_batch(&build_jobs, workers)
+    mut failed := 0
+    mut built_ok: []bool = []
+    for _ in 0..cases.len { built_ok.push(true) }
+    mut lifo_built := true
+
+    for bi in 0..build_jobs.len {
+        j := &build_jobs[bi]
+        r := &build_res[bi]
+        if r.timed_out || r.signal != 0 || r.code != 0 {
+            if j.case_idx >= 0 { built_ok[j.case_idx] = false }
+            if j.kind == 4 { lifo_built = false }
+            tag := if j.kind == 0 { "legacy-build" }
+                else if j.kind == 1 { "v2-build" }
+                else if j.kind == 4 { "v2-lifo-build" }
+                else { "cross-x86_64-linux" }
+            cname := if j.case_idx >= 0 { cases[j.case_idx].name.clone() } else { tag.clone() }
+            _ := harness.fail(f"{cname} ({tag}): exit={r.code} sig={r.signal}\nstdout:\n{r.stdout_s}\nstderr:\n{r.stderr_s}")
+            failed += 1
+        }
+    }
+
+    if failed == 0 {
+        xb_res := sys.read_u8(x86_bin)
+        if !xb_res.ok || xb_res.value.len < 64 || xb_res.value[0] != 127 || xb_res.value[1] != 69 {
+            _ := harness.fail("cross-x86_64-linux: invalid ELF output")
+            failed += 1
+        }
+    }
+
+    // Phase 2: Parallel execution
+    mut run_jobs: []CmdJob = []
+    for i in 0..cases.len {
+        if !built_ok[i] { continue }
+        run_jobs.push(CmdJob { kind: 2, case_idx: i, prog: leg_bins[i].clone(), args: [] })
+        run_jobs.push(CmdJob { kind: 3, case_idx: i, prog: v2_bins[i].clone(), args: [] })
+    }
+    lifo_run_idx := run_jobs.len
+    if lifo_built {
+        run_jobs.push(CmdJob { kind: 5, case_idx: -1, prog: lifo_bin.clone(), args: [] })
+    }
+    run_res := run_batch(&run_jobs, workers)
+
+    mut leg_idx: []i32 = []
+    mut v2_idx: []i32 = []
+    for _ in 0..cases.len { leg_idx.push(-1); v2_idx.push(-1) }
+    for ri in 0..run_jobs.len {
+        ci := run_jobs[ri].case_idx
+        if run_jobs[ri].kind == 2 { leg_idx[ci] = ri }
+        else if run_jobs[ri].kind == 3 { v2_idx[ci] = ri }
+    }
+
+    mut passed := 0
+    for i in 0..cases.len {
+        if !built_ok[i] { continue }
+        rl := &run_res[leg_idx[i]]
+        rv := &run_res[v2_idx[i]]
+        if rl.timed_out || rv.timed_out || rl.signal != rv.signal || rl.code != rv.code ||
+            rl.stdout_s != rv.stdout_s || rl.stderr_s != rv.stderr_s {
+            _ := harness.fail(
+                f"{cases[i].name}: PARITY MISMATCH!\n" +
+                f"  legacy: exit={rl.code} sig={rl.signal} stdout={rl.stdout_s} stderr={rl.stderr_s}\n" +
+                f"  v2:     exit={rv.code} sig={rv.signal} stdout={rv.stdout_s} stderr={rv.stderr_s}"
+            )
+            failed += 1
+        } else {
+            passed += 1
+        }
+    }
+
+    if lifo_built && lifo_run_idx < run_res.len {
+        lr := &run_res[lifo_run_idx]
+        expected := "worker_done\ndefer_saw:2\nret:7\n"
+        if lr.timed_out || lr.signal != 0 || lr.code != 0 || lr.stdout_s != expected || lr.stderr_s != "" {
+            _ := harness.fail(f"v2_task_defer_lifo: exit={lr.code} sig={lr.signal}\nexpected:\n{expected}\ngot:\n{lr.stdout_s}\nstderr:\n{lr.stderr_s}")
+            failed += 1
+        }
+    }
+
+    elapsed := sys.now_ms() - t0
+    if failed > 0 { return 1 }
+    print(f"build-v2 FFI+tasks parity ok: {passed}/{cases.len} differential cases + early-return LIFO + x86_64-linux ELF in {elapsed}ms on {process.host_target()}")
+    0
+}

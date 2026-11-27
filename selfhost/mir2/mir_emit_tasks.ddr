@@ -1,0 +1,1326 @@
+// Concurrency (`task scope`, `Task<T>`, `.spawn`, `.wait_any`, `.join`) & `std.sync`
+// (`__sync_needs_pool`, `__sync_pack`, `__sync_freeze`, `__sync_unpack`, `__sync_drop_packed`,
+// `__sync_borrow_ref`, `__sync_thread_token`, `TYPE_DESC_TABLE` bounded frozen RC `rc <= -3`)
+// code generator over sealed ht.TypeTable.
+// Wired directly to selfhost/tasks/task_scope_emit.ddr (RuntimeExt) & task_native.ddr.
+// Zero imports of selfhost/frontend/compile.ddr, selfhost/frontend/frontend_types.ddr,
+// or selfhost/backend/ffi_abi.ddr.
+
+import ..backend.arm64 as arm
+import ..backend.ffi_arm64 as abi
+import ..tasks.task_scope_emit as tse
+import ..tasks.task_native as tn
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import mir_emit_helpers as helpers
+import mir_emit_ffi as ffi_emit
+
+pub struct TaskEmitState {
+    used: bool,
+    open_label: i32,
+    await_result_label: i32,
+    await_any_label: i32,
+    close_label: i32,
+    coord_offset: i32,
+    worker_fn_ids: []i32,
+    worker_has_input: []bool,
+    worker_spawner_labels: []i32,
+    worker_detached_labels: []i32,
+    worker_thunk_labels: []i32,
+    factory_fn_ids: []i32,
+    factory_thunk_labels: []i32,
+    iso_labels: []i32,
+    shared_rc_labels: []i32,
+    shared_prepare_labels: []i32,
+    shared_drop_labels: []i32,
+    shell_drop_labels: []i32,
+    iso_needed: []bool,
+    rc_needed: []bool,
+    prep_needed: []bool,
+    sdrop_needed: []bool,
+    shell_needed: []bool,
+}
+
+pub fn new_task_state(code: &mut arm.Code, prog: &hb.HirProgram) -> TaskEmitState {
+    n := prog.types.entries.len
+    mut iso: []i32 = []
+    mut src: []i32 = []
+    mut sprep: []i32 = []
+    mut sdrop: []i32 = []
+    mut shell: []i32 = []
+    mut ineed: []bool = []
+    mut rneed: []bool = []
+    mut pneed: []bool = []
+    mut dneed: []bool = []
+    mut hneed: []bool = []
+    iso.reserve(n); src.reserve(n); sprep.reserve(n); sdrop.reserve(n); shell.reserve(n)
+    ineed.reserve(n); rneed.reserve(n); pneed.reserve(n); dneed.reserve(n); hneed.reserve(n)
+    for _ in 0..n {
+        iso.push(-1); src.push(-1); sprep.push(-1); sdrop.push(-1); shell.push(-1)
+        ineed.push(false); rneed.push(false); pneed.push(false); dneed.push(false); hneed.push(false)
+    }
+    TaskEmitState {
+        used: false,
+        open_label: arm.label(&mut code),
+        await_result_label: arm.label(&mut code),
+        await_any_label: arm.label(&mut code),
+        close_label: arm.label(&mut code),
+        coord_offset: 64,
+        worker_fn_ids: [],
+        worker_has_input: [],
+        worker_spawner_labels: [],
+        worker_detached_labels: [],
+        worker_thunk_labels: [],
+        factory_fn_ids: [],
+        factory_thunk_labels: [],
+        iso_labels: move iso,
+        shared_rc_labels: move src,
+        shared_prepare_labels: move sprep,
+        shared_drop_labels: move sdrop,
+        shell_drop_labels: move shell,
+        iso_needed: move ineed,
+        rc_needed: move rneed,
+        prep_needed: move pneed,
+        sdrop_needed: move dneed,
+        shell_needed: move hneed,
+    }
+}
+
+// =========================================================================
+// Type Classification Predicates over ht.TypeTable
+// =========================================================================
+
+pub fn type_needs_pool(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    if helpers.is_boxed_heap(&types, ty) { return true }
+    te := &types.entries[ty]
+    if helpers.is_inline_agg(&types, ty) &&
+        (te.kind == .Struct || te.kind == .Tuple || te.kind == .Enum || te.kind == .FixedArr) {
+        return true
+    }
+    false
+}
+
+pub fn type_contains_resource(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    if te.flags.bit_and(ht.TF_RESOURCE.bit_or(ht.TF_DISPOSE)) != 0 { return true }
+    false
+}
+
+fn type_is_scalar_or_copy_word(types: &ht.TypeTable, ty: i32) -> bool {
+    !type_needs_pool(&types, ty)
+}
+
+fn ensure_iso_label(code: &mut arm.Code, types: &ht.TypeTable, ts: &mut TaskEmitState,
+    h: &helpers.EmitHelpers, ty: i32) -> i32 {
+    if ty < 0 || ty >= ts.iso_labels.len { return -1 }
+    if ty == ht.TY_STRING { return h.rt.string_isolated_clone }
+    if !type_needs_pool(&types, ty) { return -1 }
+    if ts.iso_labels[ty] < 0 { ts.iso_labels[ty] = arm.label(&mut code) }
+    ts.iso_needed[ty] = true
+    ts.iso_labels[ty]
+}
+
+fn ensure_rc_label(code: &mut arm.Code, types: &ht.TypeTable, ts: &mut TaskEmitState, ty: i32) -> i32 {
+    if ty < 0 || ty >= ts.shared_rc_labels.len { return -1 }
+    if !type_needs_pool(&types, ty) { return -1 }
+    if ts.shared_rc_labels[ty] < 0 { ts.shared_rc_labels[ty] = arm.label(&mut code) }
+    ts.rc_needed[ty] = true
+    ts.shared_rc_labels[ty]
+}
+
+fn ensure_prep_label(code: &mut arm.Code, types: &ht.TypeTable, ts: &mut TaskEmitState,
+    h: &helpers.EmitHelpers, ty: i32) -> i32 {
+    if ty < 0 || ty >= ts.shared_prepare_labels.len { return -1 }
+    if !type_needs_pool(&types, ty) { return -1 }
+    _ := ensure_iso_label(&mut code, &types, &mut ts, &h, ty)
+    _ := ensure_rc_label(&mut code, &types, &mut ts, ty)
+    if ts.shared_prepare_labels[ty] < 0 { ts.shared_prepare_labels[ty] = arm.label(&mut code) }
+    ts.prep_needed[ty] = true
+    ts.shared_prepare_labels[ty]
+}
+
+fn ensure_sdrop_label(code: &mut arm.Code, types: &ht.TypeTable, ts: &mut TaskEmitState, ty: i32) -> i32 {
+    if ty < 0 || ty >= ts.shared_drop_labels.len { return -1 }
+    if !type_needs_pool(&types, ty) { return -1 }
+    _ := ensure_rc_label(&mut code, &types, &mut ts, ty)
+    if ts.shared_drop_labels[ty] < 0 { ts.shared_drop_labels[ty] = arm.label(&mut code) }
+    ts.sdrop_needed[ty] = true
+    ts.shared_drop_labels[ty]
+}
+
+fn ensure_shell_drop_label(code: &mut arm.Code, types: &ht.TypeTable, ts: &mut TaskEmitState, ty: i32) -> i32 {
+    if ty < 0 || ty >= ts.shell_drop_labels.len { return -1 }
+    if !type_needs_pool(&types, ty) { return -1 }
+    if ts.shell_drop_labels[ty] < 0 { ts.shell_drop_labels[ty] = arm.label(&mut code) }
+    ts.shell_needed[ty] = true
+    ts.shell_drop_labels[ty]
+}
+
+// =========================================================================
+// Worker & Factory Registration (Bridging mir_emit x8 sret <-> task_native)
+// =========================================================================
+
+pub fn ensure_worker_spawner(code: &mut arm.Code, prog: &hb.HirProgram, ts: &mut TaskEmitState,
+    h: &helpers.EmitHelpers, worker_fn_id: i32, has_input: bool, detached: bool) -> i32 {
+    ts.used = true
+    for i in 0..ts.worker_fn_ids.len {
+        if ts.worker_fn_ids[i] == worker_fn_id {
+            return if detached { ts.worker_detached_labels[i] } else { ts.worker_spawner_labels[i] }
+        }
+    }
+    sp_lbl := arm.label(&mut code)
+    det_lbl := arm.label(&mut code)
+    hf := &prog.fns[worker_fn_id]
+    ret_ty := hf.ret_ty
+    mut thunk_lbl := -1
+    if helpers.is_inline_agg(&prog.types, ret_ty) && ret_ty != ht.TY_UNIT {
+        thunk_lbl = arm.label(&mut code)
+    }
+    // Pre-register iso/shell_drop helpers for worker input and result types
+    if has_input && hf.param_count >= 1 {
+        mut in_ty := hf.locals[0].ty
+        if prog.types.entries[in_ty].kind == .Ref { in_ty = prog.types.entries[in_ty].inner_a }
+        if type_needs_pool(&prog.types, in_ty) {
+            _ := ensure_iso_label(&mut code, &prog.types, &mut ts, &h, in_ty)
+            if type_contains_resource(&prog.types, in_ty) {
+                _ := ensure_shell_drop_label(&mut code, &prog.types, &mut ts, in_ty)
+            }
+        }
+    }
+    if type_needs_pool(&prog.types, ret_ty) {
+        _ := ensure_iso_label(&mut code, &prog.types, &mut ts, &h, ret_ty)
+        if type_contains_resource(&prog.types, ret_ty) {
+            _ := ensure_shell_drop_label(&mut code, &prog.types, &mut ts, ret_ty)
+        }
+    }
+
+    ts.worker_fn_ids.push(worker_fn_id)
+    ts.worker_has_input.push(has_input)
+    ts.worker_spawner_labels.push(sp_lbl)
+    ts.worker_detached_labels.push(det_lbl)
+    ts.worker_thunk_labels.push(thunk_lbl)
+    if detached { det_lbl } else { sp_lbl }
+}
+
+fn ensure_factory_thunk(code: &mut arm.Code, prog: &hb.HirProgram, ts: &mut TaskEmitState,
+    h: &helpers.EmitHelpers, factory_fn_id: i32, workspace_ty: i32) -> i32 {
+    if !helpers.is_inline_agg(&prog.types, workspace_ty) {
+        return h.fn_labels[factory_fn_id]
+    }
+    for i in 0..ts.factory_fn_ids.len {
+        if ts.factory_fn_ids[i] == factory_fn_id { return ts.factory_thunk_labels[i] }
+    }
+    tlbl := arm.label(&mut code)
+    ts.factory_fn_ids.push(factory_fn_id)
+    ts.factory_thunk_labels.push(tlbl)
+    tlbl
+}
+
+// =========================================================================
+// TaskScope Enter / Join & Task / Sync Intrinsic Codegen
+// =========================================================================
+
+// Emits `task scope` entry, storing the open scope handle into `handle_slot`.
+// - `cap_slot`: slot containing i64 concurrency cap (or -1 for default 4)
+// - `factory_fn_id`: workspace initializer HirFn id (or -1)
+// - `shared_slot` / `shared_ty`: slot holding shared value (or -1)
+// - `arena_slot`: slot holding i64 arena bytes (or -1 for default 16 MiB)
+pub fn emit_task_scope_enter(code: &mut arm.Code, prog: &hb.HirProgram, ts: &mut TaskEmitState,
+    ffi: &mut ffi_emit.FfiState, h: &helpers.EmitHelpers,
+    handle_slot: i32, cap_slot: i32, factory_fn_id: i32, workspace_ty: i32,
+    shared_slot: i32, shared_ty: i32, arena_slot: i32, tmp_shared_slot: i32) {
+    ts.used = true
+
+    // 1. Prepare frozen isolated shared value into tmp_shared_slot if present
+    mut prepared_shared := false
+    mut shared_drop_lbl := -1
+    if shared_ty >= 0 && shared_slot >= 0 {
+        if helpers.is_inline_agg(&prog.types, shared_ty) {
+            // Box inline POD struct into a heap allocation (rt.alloc) so task_native can share & deref it
+            sz := helpers.type_byte_size(&prog.types, shared_ty)
+            alloc_sz := if sz < 8 { 8 } else { (sz + 7) / 8 * 8 }
+            arm.imm(&mut code, 0, i64(alloc_sz))
+            arm.branch(&mut code, h.rt.alloc, 1)
+            arm.store(&mut code, tmp_shared_slot, 0)
+            arm.load_into(&mut code, shared_slot, 1) // caller passed address of inline shared struct in shared_slot
+            helpers.copy_bytes(&mut code, 0, 1, sz)
+            shared_drop_lbl = h.rt.release
+            prepared_shared = true
+        } else if type_needs_pool(&prog.types, shared_ty) {
+            prep_lbl := ensure_prep_label(&mut code, &prog.types, &mut ts, &h, shared_ty)
+            sdrop_lbl := ensure_sdrop_label(&mut code, &prog.types, &mut ts, shared_ty)
+            arm.load(&mut code, shared_slot)
+            arm.branch(&mut code, prep_lbl, 1)
+            arm.store(&mut code, tmp_shared_slot, 0)
+            shared_drop_lbl = sdrop_lbl
+            prepared_shared = true
+        } else {
+            arm.load(&mut code, shared_slot)
+            arm.store(&mut code, tmp_shared_slot, 0)
+            prepared_shared = true
+        }
+    }
+
+    // 2. Marshal arguments to task_scope_emit.open_ext(cap, coord, factory, shared, shared_drop, ws_drop, arena)
+    if factory_fn_id >= 0 {
+        flbl := ensure_factory_thunk(&mut code, &prog, &mut ts, &h, factory_fn_id, workspace_ty)
+        helpers.load_label_addr(&mut code, flbl, 2)
+    } else {
+        arm.imm(&mut code, 2, 0)
+    }
+    if shared_drop_lbl >= 0 {
+        helpers.load_label_addr(&mut code, shared_drop_lbl, 4)
+    } else {
+        arm.imm(&mut code, 4, 0)
+    }
+    if factory_fn_id >= 0 && workspace_ty >= 0 {
+        if helpers.is_inline_agg(&prog.types, workspace_ty) {
+            helpers.load_label_addr(&mut code, h.rt.release, 5)
+        } else if workspace_ty < h.drop_labels.len && h.drop_labels[workspace_ty] >= 0 {
+            helpers.load_label_addr(&mut code, h.drop_labels[workspace_ty], 5)
+        } else {
+            arm.imm(&mut code, 5, 0)
+        }
+    } else {
+        arm.imm(&mut code, 5, 0)
+    }
+    if prepared_shared { arm.load_into(&mut code, tmp_shared_slot, 3) }
+    else { arm.imm(&mut code, 3, 0) }
+    if arena_slot >= 0 { arm.load_into(&mut code, arena_slot, 6) }
+    else { arm.imm(&mut code, 6, tn.default_arena_bytes()) }
+
+    ffi_emit.emit_static_addr(&mut code, &mut ffi, ts.coord_offset, 16)
+    arm.mov(&mut code, 1, 16)
+    if cap_slot >= 0 { arm.load(&mut code, cap_slot) }
+    else { arm.imm(&mut code, 0, 4) }
+
+    arm.branch(&mut code, ts.open_label, 1)
+    if handle_slot >= 0 { arm.store(&mut code, handle_slot, 0) }
+}
+
+// Emits `task scope` join/close (always placed on CFG edges BEFORE outer `defer` and `Drop`).
+pub fn emit_task_scope_join(code: &mut arm.Code, ts: &mut TaskEmitState, handle_slot: i32) {
+    if handle_slot < 0 { return }
+    ts.used = true
+    done := arm.label(&mut code)
+    arm.load(&mut code, handle_slot)
+    arm.branch(&mut code, done, 18) // cbz x0, done
+    arm.branch(&mut code, ts.close_label, 1)
+    arm.store(&mut code, handle_slot, 31)
+    arm.mark(&mut code, done)
+}
+
+// Emits `scope.spawn`, `scope.wait_any`, or `task.join`.
+pub fn emit_task_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, ts: &mut TaskEmitState,
+    ffi: &mut ffi_emit.FfiState, h: &helpers.EmitHelpers,
+    intrinsic_id: i32, scope_handle_slot: i32, worker_fn_id: i32,
+    input_slot: i32, input_ty: i32, has_input: bool,
+    task_val_slot: i32, ret_ty: i32, dest_addr_slot: i32, tmp_slot: i32) {
+    ts.used = true
+
+    if intrinsic_id == hb.INTRINSIC_TASK_SPAWN {
+        detached := ret_ty == ht.TY_UNIT
+        spawner := ensure_worker_spawner(&mut code, &prog, &mut ts, &h, worker_fn_id, has_input, detached)
+        has_res := has_input && input_ty >= 0 && type_contains_resource(&prog.types, input_ty)
+
+        // Prepare input in x1 (if inline POD, box a copy so task_native's input_clone sees a heap ptr)
+        if has_input {
+            if helpers.is_inline_agg(&prog.types, input_ty) {
+                sz := helpers.type_byte_size(&prog.types, input_ty)
+                alloc_sz := if sz < 8 { 8 } else { (sz + 7) / 8 * 8 }
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc, 1)
+                arm.store(&mut code, tmp_slot, 0)
+                arm.load_into(&mut code, input_slot, 1) // input_slot holds address of inline struct
+                helpers.copy_bytes(&mut code, 0, 1, sz)
+                arm.load_into(&mut code, tmp_slot, 1)
+            } else {
+                arm.load_into(&mut code, input_slot, 1)
+            }
+        } else {
+            arm.imm(&mut code, 1, 0)
+        }
+        arm.load(&mut code, scope_handle_slot)
+        arm.branch(&mut code, spawner, 1)
+
+        if !detached && dest_addr_slot >= 0 {
+            arm.store(&mut code, tmp_slot, 0)
+        }
+        // If input had @resource, release parent shell without running dispose
+        if has_res {
+            sdrop := ensure_shell_drop_label(&mut code, &prog.types, &mut ts, input_ty)
+            if sdrop >= 0 {
+                arm.load(&mut code, input_slot)
+                arm.branch(&mut code, sdrop, 1)
+            }
+        } else if has_input && helpers.is_inline_agg(&prog.types, input_ty) {
+            // Free temporary boxed inline POD input buffer
+            arm.load(&mut code, tmp_slot)
+            if detached { arm.branch(&mut code, h.rt.release, 1) }
+        }
+        if !detached && dest_addr_slot >= 0 {
+            arm.load(&mut code, tmp_slot)
+            arm.load_into(&mut code, dest_addr_slot, 10)
+            helpers.store_mem(&mut code, 0, 10, 0)
+        }
+        return
+    }
+
+    if intrinsic_id == hb.INTRINSIC_TASK_JOIN {
+        arm.load_into(&mut code, task_val_slot, 1)
+        ffi_emit.emit_static_addr(&mut code, &mut ffi, ts.coord_offset, 16)
+        arm.mov(&mut code, 0, 16)
+        arm.imm(&mut code, 2, i64(ret_ty))
+        arm.imm(&mut code, 3, 1) // consume once
+        arm.branch(&mut code, ts.await_result_label, 1)
+        if ret_ty != ht.TY_UNIT && dest_addr_slot >= 0 {
+            if helpers.is_inline_agg(&prog.types, ret_ty) {
+                arm.store(&mut code, tmp_slot, 0)
+                arm.load_into(&mut code, dest_addr_slot, 10)
+                helpers.copy_bytes(&mut code, 10, 0, helpers.type_byte_size(&prog.types, ret_ty))
+                arm.load(&mut code, tmp_slot)
+                arm.branch(&mut code, h.rt.release, 1)
+            } else {
+                arm.store(&mut code, tmp_slot, 0)
+                arm.load_into(&mut code, dest_addr_slot, 10)
+                arm.load(&mut code, tmp_slot)
+                helpers.store_typed_at(&mut code, &prog.types, ret_ty, 0, 10, 0)
+            }
+        }
+        return
+    }
+
+    // wait_any(tasks_arr_ptr) -> i32
+    arm.load_into(&mut code, task_val_slot, 1)
+    arm.load(&mut code, scope_handle_slot)
+    arm.branch(&mut code, ts.await_any_label, 1)
+    if dest_addr_slot >= 0 {
+        arm.store(&mut code, tmp_slot, 0)
+        arm.load_into(&mut code, dest_addr_slot, 10)
+        arm.load(&mut code, tmp_slot)
+        helpers.store_typed_at(&mut code, &prog.types, ht.TY_I32, 0, 10, 0)
+    }
+}
+
+// Emits `std.sync` intrinsics (`__sync_needs_pool`, `__sync_pack`, `__sync_freeze`,
+// `__sync_unpack`, `__sync_drop_packed`, `__sync_borrow_ref`, `__sync_thread_token`,
+// `__sync_iso_clone`, `__sync_shell_drop`). Returns true if handled.
+pub fn emit_sync_intrinsic(code: &mut arm.Code, prog: &hb.HirProgram, ts: &mut TaskEmitState,
+    h: &helpers.EmitHelpers, name: string, type_arg: i32,
+    pool_slot: i32, size_slot: i32, val_slot: i32, val_ty: i32,
+    dest_addr_slot: i32, dest_ty: i32, tmp_slot: i32, tmp_slot2: i32) -> bool {
+    is_wasm := code.platform == 3 || code.platform == 4
+
+    if name == "__sync_needs_pool" {
+        needs: i64 = if type_needs_pool(&prog.types, type_arg) { 1 } else { 0 }
+        arm.imm(&mut code, 0, needs)
+        arm.load_into(&mut code, dest_addr_slot, 10)
+        helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        return true
+    }
+
+    if name == "__sync_thread_token" {
+        abi.thread_token(&mut code)
+        arm.mov(&mut code, 0, 10)
+        arm.load_into(&mut code, dest_addr_slot, 11)
+        helpers.store_mem(&mut code, 0, 11, 0)
+        return true
+    }
+
+    if name == "__sync_iso_clone" {
+        if type_needs_pool(&prog.types, type_arg) {
+            iso := ensure_iso_label(&mut code, &prog.types, &mut ts, &h, type_arg)
+            arm.load(&mut code, val_slot)
+            arm.branch(&mut code, iso, 1)
+            arm.store(&mut code, tmp_slot, 0)
+            arm.load_into(&mut code, dest_addr_slot, 10)
+            arm.load(&mut code, tmp_slot)
+            if helpers.is_inline_agg(&prog.types, dest_ty) {
+                helpers.copy_bytes(&mut code, 10, 0, helpers.type_byte_size(&prog.types, dest_ty))
+                arm.load(&mut code, tmp_slot)
+                arm.branch(&mut code, h.rt.release, 1)
+            } else {
+                helpers.store_mem(&mut code, 0, 10, 0)
+            }
+        } else {
+            arm.load(&mut code, val_slot)
+            arm.load_into(&mut code, dest_addr_slot, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+        }
+        return true
+    }
+
+    if name == "__sync_shell_drop" {
+        if type_needs_pool(&prog.types, type_arg) {
+            sdrop := ensure_shell_drop_label(&mut code, &prog.types, &mut ts, type_arg)
+            if sdrop >= 0 {
+                arm.load(&mut code, val_slot)
+                arm.branch(&mut code, sdrop, 1)
+            }
+        }
+        return true
+    }
+
+    if name == "__sync_pack" || name == "__sync_freeze" {
+        is_freeze := name == "__sync_freeze"
+        if !type_needs_pool(&prog.types, type_arg) {
+            arm.load(&mut code, val_slot)
+            arm.load_into(&mut code, dest_addr_slot, 10)
+            helpers.store_mem(&mut code, 0, 10, 0)
+            return true
+        }
+        iso := ensure_iso_label(&mut code, &prog.types, &mut ts, &h, type_arg)
+        if is_wasm {
+            arm.load(&mut code, val_slot)
+            arm.branch(&mut code, iso, 1)
+        } else {
+            helpers.load_label_addr(&mut code, iso, 3)
+            arm.store(&mut code, tmp_slot2, 3)
+            arm.load_into(&mut code, pool_slot, 0)
+            arm.load_into(&mut code, size_slot, 1)
+            arm.load_into(&mut code, val_slot, 2)
+            arm.load_into(&mut code, tmp_slot2, 3)
+            arm.branch(&mut code, h.rt.sync_call_in_pool, 1)
+        }
+        arm.store(&mut code, tmp_slot, 0) // packed_word
+
+        if is_freeze {
+            rc_lbl := ensure_rc_label(&mut code, &prog.types, &mut ts, type_arg)
+            if rc_lbl >= 0 {
+                arm.load(&mut code, tmp_slot)
+                arm.imm(&mut code, 1, if is_wasm { 0 } else { -2 })
+                arm.branch(&mut code, rc_lbl, 1)
+            }
+        }
+        // Release caller's moved shell (without running dispose on @resource!)
+        if helpers.type_needs_drop(&prog.types, type_arg) {
+            arm.load(&mut code, val_slot)
+            if type_contains_resource(&prog.types, type_arg) {
+                sdrop := ensure_shell_drop_label(&mut code, &prog.types, &mut ts, type_arg)
+                if sdrop >= 0 { arm.branch(&mut code, sdrop, 1) }
+            } else if type_arg < h.drop_labels.len && h.drop_labels[type_arg] >= 0 {
+                arm.branch(&mut code, h.drop_labels[type_arg], 1)
+            }
+        }
+        arm.load(&mut code, tmp_slot)
+        arm.load_into(&mut code, dest_addr_slot, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return true
+    }
+
+    if name == "__sync_unpack" {
+        if !type_needs_pool(&prog.types, type_arg) {
+            arm.load(&mut code, val_slot)
+            arm.load_into(&mut code, dest_addr_slot, 10)
+            helpers.store_typed_at(&mut code, &prog.types, dest_ty, 0, 10, 0)
+            return true
+        }
+        if helpers.is_inline_agg(&prog.types, type_arg) {
+            arm.load(&mut code, val_slot)
+            arm.load_into(&mut code, dest_addr_slot, 10)
+            helpers.copy_bytes(&mut code, 10, 0, helpers.type_byte_size(&prog.types, type_arg))
+            return true
+        }
+        iso := ensure_iso_label(&mut code, &prog.types, &mut ts, &h, type_arg)
+        arm.load(&mut code, val_slot)
+        arm.branch(&mut code, iso, 1)
+        arm.store(&mut code, tmp_slot, 0)
+        arm.load_into(&mut code, dest_addr_slot, 10)
+        arm.load(&mut code, tmp_slot)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return true
+    }
+
+    if name == "__sync_drop_packed" {
+        if type_needs_pool(&prog.types, type_arg) && type_contains_resource(&prog.types, type_arg) {
+            if type_arg >= 0 && type_arg < h.drop_labels.len && h.drop_labels[type_arg] >= 0 {
+                dlbl := h.drop_labels[type_arg]
+                if is_wasm {
+                    arm.load(&mut code, val_slot)
+                    arm.branch(&mut code, dlbl, 1)
+                } else {
+                    helpers.load_label_addr(&mut code, dlbl, 3)
+                    arm.store(&mut code, tmp_slot, 3)
+                    arm.load_into(&mut code, pool_slot, 0)
+                    arm.load_into(&mut code, size_slot, 1)
+                    arm.load_into(&mut code, val_slot, 2)
+                    arm.load_into(&mut code, tmp_slot, 3)
+                    arm.branch(&mut code, h.rt.sync_call_in_pool, 1)
+                }
+            }
+        }
+        return true
+    }
+
+    if name == "__sync_borrow_ref" {
+        // val_slot holds slot_ptr (address of word containing packed_word in Snap).
+        // For inline POD structs/enums, packed_word IS the heap address of the struct bytes, so deref once!
+        // For scalars & boxed heap handles, slot_ptr itself IS &T (pointer to 8-byte slot holding T / T*).
+        arm.load(&mut code, val_slot)
+        if helpers.is_inline_agg(&prog.types, type_arg) {
+            helpers.load_mem(&mut code, 0, 0, 0)
+        }
+        arm.load_into(&mut code, dest_addr_slot, 10)
+        helpers.store_mem(&mut code, 0, 10, 0)
+        return true
+    }
+
+    _ := val_ty
+    false
+}
+
+// =========================================================================
+// Task Runtime Emission (task_scope_emit.RuntimeExt + task_native.emit_ext)
+// =========================================================================
+
+pub fn emit_task_runtime(code: &mut arm.Code, prog: &hb.HirProgram, ts: &mut TaskEmitState,
+    ffi: &mut ffi_emit.FfiState, h: &helpers.EmitHelpers) -> bool {
+    if !ts.used { return true }
+    platform := code.platform
+    if !tn.supported(platform, code.profile) { return false }
+
+    // Reserve coordinator global slot (aligned to 16, >= 64)
+    coord_off := if ffi.globals < 64 { 64 } else { (ffi.globals + 15) / 16 * 16 }
+    ts.coord_offset = coord_off
+    ffi.globals = coord_off + tse.coordinator_bytes()
+
+    // Emit POD-sret worker & factory thunks bridging task_native's stack-pushed sret -> mir_emit's x8 sret!
+    for wi in 0..ts.worker_fn_ids.len {
+        tlbl := ts.worker_thunk_labels[wi]
+        if tlbl < 0 { continue }
+        fid := ts.worker_fn_ids[wi]
+        arm.mark(&mut code, tlbl)
+        // task_native pushed heap buffer pointer on stack right before calling us (`arm.push(&mut c, 10)` -> [sp+0]).
+        // After prologue (stp x29, x30, [sp, #-16]!; mov x29, sp), that buffer pointer sits at [x29 + 16]!
+        fr := arm.prologue(&mut code)
+        arm.frame(&mut code, fr, 1)
+        helpers.load_mem(&mut code, 8, 29, 16)
+        arm.store(&mut code, 0, 8)
+        arm.branch(&mut code, h.fn_labels[fid], 1)
+        arm.load(&mut code, 0) // return buffer pointer in x0 as task_native expects
+        arm.ret(&mut code)
+    }
+    for fi in 0..ts.factory_fn_ids.len {
+        tlbl := ts.factory_thunk_labels[fi]
+        fid := ts.factory_fn_ids[fi]
+        arm.mark(&mut code, tlbl)
+        fr := arm.prologue(&mut code)
+        arm.frame(&mut code, fr, 1)
+        helpers.load_mem(&mut code, 8, 29, 16)
+        arm.store(&mut code, 0, 8)
+        arm.branch(&mut code, h.fn_labels[fid], 1)
+        arm.load(&mut code, 0)
+        arm.ret(&mut code)
+    }
+
+    // Import platform task symbols via ffi_emit.ensure_import
+    mut symbols := tn.posix_symbols_ext(0, -1, -1, -1)
+    if platform == 0 {
+        queue := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_get_global_queue", false, false, false)
+        create := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_group_create", false, false, false)
+        submit := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_group_async_f", false, false, false)
+        wait := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_group_wait", false, false, false)
+        release := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_release", false, false, false)
+        unmap := ffi_emit.ensure_import(&mut ffi, platform, "c", "munmap", false, false, false)
+        sem_c := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_semaphore_create", false, false, false)
+        sem_w := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_semaphore_wait", false, false, false)
+        sem_s := ffi_emit.ensure_import(&mut ffi, platform, "c", "dispatch_semaphore_signal", false, false, false)
+        base_s := tn.Symbols {
+            symbol_count: ffi.symbols.len,
+            global_queue: queue, create_group: create, submit: submit,
+            wait: wait, release_group: release, munmap: unmap,
+        }
+        symbols = tn.SymbolsExt { base: base_s, sem_create: sem_c, sem_wait: sem_w, sem_signal: sem_s }
+    } else if platform == 5 {
+        start := ffi_emit.ensure_import(&mut ffi, platform, "kernel32.dll", "CreateThread", false, false, false)
+        join := ffi_emit.ensure_import(&mut ffi, platform, "kernel32.dll", "WaitForSingleObject", false, false, false)
+        unmap := ffi_emit.ensure_import(&mut ffi, platform, "kernel32.dll", "VirtualFree", false, false, false)
+        close := ffi_emit.ensure_import(&mut ffi, platform, "kernel32.dll", "CloseHandle", false, false, false)
+        symbols = tn.posix_symbols_ext(ffi.symbols.len, start, join, unmap)
+        symbols.base.release_group = close
+    } else {
+        create := ffi_emit.ensure_import(&mut ffi, platform, "pthread", "pthread_create", false, false, false)
+        join := ffi_emit.ensure_import(&mut ffi, platform, "pthread", "pthread_join", false, false, false)
+        unmap := ffi_emit.ensure_import(&mut ffi, platform, "c", "munmap", false, false, false)
+        symbols = tn.posix_symbols_ext(ffi.symbols.len, create, join, unmap)
+    }
+
+    trap := arm.label(&mut code)
+    arm.mark(&mut code, trap); arm.exit(&mut code, 112)
+
+    unmap_h := tn.emit_unmap_pool_ext(&mut code, &h.rt, &symbols)
+    if !unmap_h.ok { return false }
+    for i in 0..unmap_h.import_sites.len {
+        ffi.sites.push(unmap_h.import_sites[i]); ffi.slots.push(unmap_h.import_slots[i])
+    }
+    lane_loop := tn.emit_lane_loop(&mut code, &h.rt)
+    emitted := tse.emit_runtime_ext(&mut code, &h.rt, &symbols, trap, unmap_h.label)
+    if !emitted.ok { return false }
+    for i in 0..emitted.import_sites.len {
+        ffi.sites.push(emitted.import_sites[i]); ffi.slots.push(emitted.import_slots[i])
+    }
+
+    // Bind forward-declared runtime entry labels
+    code.labels[ts.open_label] = code.labels[emitted.open]
+    code.labels[ts.await_result_label] = code.labels[emitted.await_result]
+    code.labels[ts.await_any_label] = code.labels[emitted.await_any]
+    code.labels[ts.close_label] = code.labels[emitted.close]
+
+    // Emit per-worker native provider & kind spawners
+    for wi in 0..ts.worker_fn_ids.len {
+        fid := ts.worker_fn_ids[wi]
+        has_in := ts.worker_has_input[wi]
+        hf := &prog.fns[fid]
+        ret_ty := hf.ret_ty
+
+        mut in_clone := -1; mut in_drop := -1; mut in_mode := 0; mut in_pod := false
+        if has_in && hf.param_count >= 1 {
+            raw_in := hf.locals[0].ty
+            mut in_ty := raw_in
+            if prog.types.entries[raw_in].kind == .Ref {
+                in_ty = prog.types.entries[raw_in].inner_a
+                in_mode = if helpers.is_inline_agg(&prog.types, in_ty) { 2 } else { 1 }
+            } else if helpers.is_inline_agg(&prog.types, in_ty) {
+                in_pod = true
+            }
+            if type_needs_pool(&prog.types, in_ty) {
+                in_clone = ensure_iso_label(&mut code, &prog.types, &mut ts, &h, in_ty)
+                if in_mode != 0 || in_pod {
+                    in_drop = if helpers.is_inline_agg(&prog.types, in_ty) { h.rt.release }
+                        else if in_ty < h.drop_labels.len { h.drop_labels[in_ty] }
+                        else { -1 }
+                }
+            }
+        }
+
+        mut res_clone := -1; mut res_drop := -1; mut res_sdrop := -1; mut res_pod_words := 0
+        if type_needs_pool(&prog.types, ret_ty) {
+            res_clone = ensure_iso_label(&mut code, &prog.types, &mut ts, &h, ret_ty)
+            res_drop = if helpers.is_inline_agg(&prog.types, ret_ty) { h.rt.release }
+                else if ret_ty < h.drop_labels.len { h.drop_labels[ret_ty] }
+                else { -1 }
+            if type_contains_resource(&prog.types, ret_ty) {
+                res_sdrop = ensure_shell_drop_label(&mut code, &prog.types, &mut ts, ret_ty)
+            }
+        }
+        if helpers.is_inline_agg(&prog.types, ret_ty) && ret_ty != ht.TY_UNIT {
+            res_pod_words = (helpers.type_byte_size(&prog.types, ret_ty) + 7) / 8
+            if res_pod_words < 1 { res_pod_words = 1 }
+        }
+
+        // Detect optional workspace (&mut W) and shared (&S) parameters
+        mut ws_words := 0
+        mut sh_pod := false
+        ws_idx := if has_in { 1 } else { 0 }
+        if hf.param_count > ws_idx {
+            p1 := hf.locals[ws_idx].ty
+            k1 := prog.types.entries[p1].kind
+            if k1 == .MutRef {
+                wty := prog.types.entries[p1].inner_a
+                if helpers.is_inline_agg(&prog.types, wty) {
+                    ws_words = (helpers.type_byte_size(&prog.types, wty) + 7) / 8
+                    if ws_words < 1 { ws_words = 1 }
+                }
+                if hf.param_count > ws_idx + 1 {
+                    p2 := hf.locals[ws_idx + 1].ty
+                    if prog.types.entries[p2].kind == .Ref {
+                        sh_pod = helpers.is_inline_agg(&prog.types, prog.types.entries[p2].inner_a)
+                    }
+                }
+            } else if k1 == .Ref {
+                sh_pod = helpers.is_inline_agg(&prog.types, prog.types.entries[p1].inner_a)
+            }
+        }
+
+        worker_entry_lbl := if ts.worker_thunk_labels[wi] >= 0 { ts.worker_thunk_labels[wi] } else { h.fn_labels[fid] }
+        base_spec := tn.TaskSpec {
+            input_clone: in_clone, input_mode: in_mode, input_drop: in_drop, input_pod: in_pod,
+            worker: worker_entry_lbl, result_clone: res_clone, result_drop: res_drop,
+            result_pod_words: res_pod_words, workspace_pod_words: ws_words, shared_pod: sh_pod,
+        }
+        ext_spec := tn.TaskSpecExt {
+            base: base_spec, has_input: has_in, result_shell_drop: res_sdrop, use_pool: platform != 0,
+        }
+        prov := tn.emit_ext(&mut code, &h.rt, &ext_spec, &symbols, unmap_h.label, lane_loop)
+        if !prov.ok { return false }
+        for i in 0..prov.import_sites.len {
+            ffi.sites.push(prov.import_sites[i]); ffi.slots.push(prov.import_slots[i])
+        }
+        kspec := tse.KindSpec {
+            result_type: ret_ty, create: prov.create, collect: prov.collect, discard: prov.discard,
+            result_clone: res_clone, result_drop: res_drop,
+        }
+        koff := (ffi.globals + 15) / 16 * 16
+        ffi.globals = koff + tse.kind_bytes()
+        kind := tse.emit_kind_ext(&mut code, &emitted, &kspec, -1 - koff)
+        if !kind.ok { return false }
+        for i in 0..kind.import_sites.len {
+            ffi.sites.push(kind.import_sites[i]); ffi.slots.push(kind.import_slots[i])
+        }
+        code.labels[ts.worker_spawner_labels[wi]] = code.labels[kind.spawn]
+        code.labels[ts.worker_detached_labels[wi]] = code.labels[kind.spawn_detached]
+    }
+    true
+}
+
+// =========================================================================
+// Isolated Clone, Frozen RC, Shell Drop & Bounded TYPE_DESC_TABLE Dispatch
+// =========================================================================
+
+fn emit_type_desc_search(code: &mut arm.Code, labels: &[]i32, lo: i32, hi: i32, trap: i32) {
+    if lo >= hi { arm.branch(&mut code, trap, 0); return }
+    if hi - lo == 1 {
+        arm.imm(&mut code, 12, i64(lo))
+        arm.compare_register(&mut code, 11, 12)
+        arm.branch(&mut code, trap, 3)
+        arm.branch(&mut code, labels[lo], 0)
+        return
+    }
+    mid := lo + (hi - lo) / 2
+    right := arm.label(&mut code)
+    arm.imm(&mut code, 12, i64(mid))
+    arm.compare_register(&mut code, 11, 12)
+    arm.branch(&mut code, right, 4) // b.hs right
+    emit_type_desc_search(&mut code, &labels, lo, mid, trap)
+    arm.mark(&mut code, right)
+    emit_type_desc_search(&mut code, &labels, mid, hi, trap)
+}
+
+fn mark_work_ty(code: &mut arm.Code, types: &ht.TypeTable, ty: i32,
+    labels: &mut []i32, needed: &mut []bool, work: &mut []i32, string_skip: bool) {
+    if ty < 0 || ty >= labels.len { return }
+    if string_skip && ty == ht.TY_STRING { return }
+    if !type_needs_pool(&types, ty) { return }
+    if labels[ty] < 0 { labels[ty] = arm.label(&mut code) }
+    if !needed[ty] {
+        needed[ty] = true
+        work.push(ty)
+    }
+}
+
+fn emit_iso_copy_field(code: &mut arm.Code, types: &ht.TypeTable, ts: &TaskEmitState,
+    h: &helpers.EmitHelpers, fty: i32) {
+    if fty == ht.TY_STRING {
+        arm.branch(&mut code, h.rt.string_isolated_clone, 1)
+    } else if fty >= 0 && fty < ts.iso_labels.len && ts.iso_labels[fty] >= 0 && !helpers.is_inline_agg(&types, fty) {
+        arm.branch(&mut code, ts.iso_labels[fty], 1)
+    }
+}
+
+pub fn emit_iso_and_freeze_helpers(code: &mut arm.Code, types: &ht.TypeTable,
+    ts: &mut TaskEmitState, h: &helpers.EmitHelpers) {
+    n := types.entries.len
+    is_wasm := code.platform == 3 || code.platform == 4
+
+    // 1. Seed transitive worklists from already-marked types
+    mut iso_work: []i32 = []
+    mut rc_work: []i32 = []
+    mut shell_work: []i32 = []
+    for ty in 0..n {
+        if ts.prep_needed[ty] {
+            mark_work_ty(&mut code, &types, ty, &mut ts.iso_labels, &mut ts.iso_needed, &mut iso_work, true)
+            mark_work_ty(&mut code, &types, ty, &mut ts.shared_rc_labels, &mut ts.rc_needed, &mut rc_work, false)
+        }
+        if ts.sdrop_needed[ty] {
+            mark_work_ty(&mut code, &types, ty, &mut ts.shared_rc_labels, &mut ts.rc_needed, &mut rc_work, false)
+        }
+        if ts.iso_needed[ty] && ty != ht.TY_STRING { iso_work.push(ty) }
+        if ts.rc_needed[ty] { rc_work.push(ty) }
+        if ts.shell_needed[ty] { shell_work.push(ty) }
+    }
+
+    // Close shell_work
+    while shell_work.len > 0 {
+        ty := shell_work.pop()
+        te := &types.entries[ty]
+        if ty == ht.TY_STRING || type_contains_resource(&types, ty) && te.flags.bit_and(ht.TF_RESOURCE) != 0 || helpers.is_inline_agg(&types, ty) {
+            continue
+        }
+        if te.kind == .Array || te.kind == .FixedArr {
+            mark_work_ty(&mut code, &types, te.inner_a, &mut ts.shell_drop_labels, &mut ts.shell_needed, &mut shell_work, true)
+        } else if te.kind == .Struct || te.kind == .Tuple {
+            for i in 0..te.count {
+                mark_work_ty(&mut code, &types, types.fields[te.inner_a + i].ty, &mut ts.shell_drop_labels, &mut ts.shell_needed, &mut shell_work, true)
+            }
+        } else if te.kind == .Enum {
+            for vi in 0..te.count {
+                v := &types.variants[te.inner_a + vi]
+                for pi in 0..v.payload_count {
+                    mark_work_ty(&mut code, &types, types.fields[v.payload_start + pi].ty, &mut ts.shell_drop_labels, &mut ts.shell_needed, &mut shell_work, true)
+                }
+            }
+        }
+    }
+
+    // Close rc_work (frozen compound payload enums also require iso_clone for TYPE_DESC_TABLE!)
+    while rc_work.len > 0 {
+        ty := rc_work.pop()
+        te := &types.entries[ty]
+        if ty == ht.TY_STRING || helpers.is_inline_agg(&types, ty) { continue }
+        if te.kind == .Enum && !type_contains_resource(&types, ty) && !is_wasm {
+            mark_work_ty(&mut code, &types, ty, &mut ts.iso_labels, &mut ts.iso_needed, &mut iso_work, true)
+        }
+        if te.kind == .Array || te.kind == .FixedArr {
+            mark_work_ty(&mut code, &types, te.inner_a, &mut ts.shared_rc_labels, &mut ts.rc_needed, &mut rc_work, false)
+        } else if te.kind == .Struct || te.kind == .Tuple {
+            for i in 0..te.count {
+                mark_work_ty(&mut code, &types, types.fields[te.inner_a + i].ty, &mut ts.shared_rc_labels, &mut ts.rc_needed, &mut rc_work, false)
+            }
+        } else if te.kind == .Enum {
+            for vi in 0..te.count {
+                v := &types.variants[te.inner_a + vi]
+                for pi in 0..v.payload_count {
+                    mark_work_ty(&mut code, &types, types.fields[v.payload_start + pi].ty, &mut ts.shared_rc_labels, &mut ts.rc_needed, &mut rc_work, false)
+                }
+            }
+        }
+    }
+
+    // Close iso_work
+    while iso_work.len > 0 {
+        ty := iso_work.pop()
+        te := &types.entries[ty]
+        if ty == ht.TY_STRING || helpers.is_inline_agg(&types, ty) { continue }
+        if te.kind == .Array || te.kind == .FixedArr {
+            mark_work_ty(&mut code, &types, te.inner_a, &mut ts.iso_labels, &mut ts.iso_needed, &mut iso_work, true)
+        } else if te.kind == .Struct || te.kind == .Tuple {
+            for i in 0..te.count {
+                mark_work_ty(&mut code, &types, types.fields[te.inner_a + i].ty, &mut ts.iso_labels, &mut ts.iso_needed, &mut iso_work, true)
+            }
+        } else if te.kind == .Enum {
+            for vi in 0..te.count {
+                v := &types.variants[te.inner_a + vi]
+                for pi in 0..v.payload_count {
+                    mark_work_ty(&mut code, &types, types.fields[v.payload_start + pi].ty, &mut ts.iso_labels, &mut ts.iso_needed, &mut iso_work, true)
+                }
+            }
+        }
+    }
+
+    // 2. Assign bounded TYPE_DESC_TABLE IDs (`rc = -3 - desc_id`, preserving -1 freed & -2 frozen string!)
+    mut desc_ids: []i32 = []
+    mut desc_labels: []i32 = []
+    desc_ids.reserve(n)
+    for _ in 0..n { desc_ids.push(-1) }
+    if !is_wasm {
+        for ty in 0..n {
+            te := &types.entries[ty]
+            if ts.rc_needed[ty] && te.kind == .Enum && !helpers.is_inline_agg(&types, ty) &&
+                !type_contains_resource(&types, ty) && ts.iso_labels[ty] >= 0 {
+                desc_ids[ty] = desc_labels.len
+                desc_labels.push(ts.iso_labels[ty])
+            }
+        }
+    }
+
+    // 3. Emit per-type iso / shared_rc / shared_prepare / shared_drop / shell_drop helpers
+    for ty in 0..n {
+        te := &types.entries[ty]
+
+        // --- iso_clone(x0 = src_ptr) -> x0 = new_ptr in current thread's arena ---
+        if ts.iso_needed[ty] && ty != ht.TY_STRING && ts.iso_labels[ty] >= 0 {
+            arm.mark(&mut code, ts.iso_labels[ty])
+            if helpers.is_inline_agg(&types, ty) {
+                sz := helpers.type_byte_size(&types, ty)
+                alloc_sz := if sz < 8 { 8 } else { (sz + 7) / 8 * 8 }
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc_clone, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                helpers.copy_bytes(&mut code, 0, 1, sz)
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Array {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 1)
+                arm.store(&mut code, 0, 0)
+                elem_ty := te.inner_a
+                if elem_ty == ht.TY_STRING {
+                    helpers.load_label_addr(&mut code, h.rt.string_isolated_clone, 1)
+                } else if elem_ty >= 0 && elem_ty < n && !helpers.is_inline_agg(&types, elem_ty) && ts.iso_labels[elem_ty] >= 0 {
+                    helpers.load_label_addr(&mut code, ts.iso_labels[elem_ty], 1)
+                } else {
+                    arm.imm(&mut code, 1, 0)
+                }
+                arm.load(&mut code, 0)
+                arm.branch(&mut code, h.rt.array_isolated_clone, 1)
+                arm.ret(&mut code)
+            } else if te.kind == .Struct || te.kind == .Tuple {
+                alloc_sz := helpers.struct_alloc_size(&types, ty)
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc_clone, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                if alloc_sz <= 128 {
+                    helpers.copy_bytes(&mut code, 0, 1, alloc_sz)
+                } else {
+                    arm.imm(&mut code, 2, i64(alloc_sz))
+                    arm.branch(&mut code, h.rt.memory_copy, 1)
+                }
+                for fi in 0..te.count {
+                    fty := types.fields[te.inner_a + fi].ty
+                    if fty == ht.TY_STRING || (!helpers.is_inline_agg(&types, fty) && fty >= 0 && fty < n && ts.iso_labels[fty] >= 0) {
+                        off := helpers.struct_field_offset(&types, ty, fi)
+                        arm.load_into(&mut code, 1, 10)
+                        helpers.load_mem(&mut code, 0, 10, off)
+                        emit_iso_copy_field(&mut code, &types, &ts, &h, fty)
+                        arm.load_into(&mut code, 1, 10)
+                        helpers.store_mem(&mut code, 0, 10, off)
+                    }
+                }
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Enum {
+                alloc_sz := helpers.enum_alloc_size(&types, ty)
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code); iso_done := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc_clone, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                if alloc_sz <= 128 {
+                    helpers.copy_bytes(&mut code, 0, 1, alloc_sz)
+                } else {
+                    arm.imm(&mut code, 2, i64(alloc_sz))
+                    arm.branch(&mut code, h.rt.memory_copy, 1)
+                }
+                for vi in 0..te.count {
+                    v := &types.variants[te.inner_a + vi]
+                    mut has_iso_p := false
+                    for pi in 0..v.payload_count {
+                        pty := types.fields[v.payload_start + pi].ty
+                        if pty == ht.TY_STRING || (!helpers.is_inline_agg(&types, pty) && pty >= 0 && pty < n && ts.iso_labels[pty] >= 0) {
+                            has_iso_p = true; break
+                        }
+                    }
+                    if !has_iso_p { continue }
+                    next_v := arm.label(&mut code)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.transfer(&mut code, true, 11, 10, 4, 0)
+                    arm.imm(&mut code, 12, v.tag_value)
+                    arm.compare_register(&mut code, 11, 12)
+                    arm.branch(&mut code, next_v, 3)
+                    for pi in 0..v.payload_count {
+                        pty := types.fields[v.payload_start + pi].ty
+                        if pty == ht.TY_STRING || (!helpers.is_inline_agg(&types, pty) && pty >= 0 && pty < n && ts.iso_labels[pty] >= 0) {
+                            off := helpers.enum_payload_offset(&types, ty, vi, pi)
+                            arm.load_into(&mut code, 1, 10)
+                            helpers.load_mem(&mut code, 0, 10, off)
+                            emit_iso_copy_field(&mut code, &types, &ts, &h, pty)
+                            arm.load_into(&mut code, 1, 10)
+                            helpers.store_mem(&mut code, 0, 10, off)
+                        }
+                    }
+                    arm.branch(&mut code, iso_done, 0)
+                    arm.mark(&mut code, next_v)
+                }
+                arm.mark(&mut code, iso_done)
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .FixedArr {
+                elem_ty := te.inner_a
+                cnt := te.count
+                stride := helpers.elem_stride(&types, elem_ty)
+                alloc_sz := if stride * cnt < 8 { 8 } else { stride * cnt }
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 3)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc_clone, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                arm.imm(&mut code, 2, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.memory_copy, 1)
+                if elem_ty == ht.TY_STRING || (!helpers.is_inline_agg(&types, elem_ty) && elem_ty >= 0 && elem_ty < n && ts.iso_labels[elem_ty] >= 0) {
+                    arm.store(&mut code, 2, 31)
+                    lp := arm.label(&mut code); lp_end := arm.label(&mut code)
+                    arm.mark(&mut code, lp)
+                    arm.load(&mut code, 2)
+                    arm.imm(&mut code, 11, i64(cnt))
+                    arm.compare_register(&mut code, 0, 11)
+                    arm.branch(&mut code, lp_end, 4)
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 0, 12, -1)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, 12, -1)
+                    helpers.load_mem(&mut code, 0, 10, 0)
+                    emit_iso_copy_field(&mut code, &types, &ts, &h, elem_ty)
+                    arm.load_into(&mut code, 2, 11)
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 11, 12, -1)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, 12, -1)
+                    helpers.store_mem(&mut code, 0, 10, 0)
+                    arm.load(&mut code, 2)
+                    arm.integer_binary(&mut code, 1, true, false, 0, 0, -1, 1)
+                    arm.store(&mut code, 2, 0)
+                    arm.branch(&mut code, lp, 0)
+                    arm.mark(&mut code, lp_end)
+                }
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            }
+        }
+
+        // --- shared_rc(x0 = ptr, x1 = rc_val) ---
+        if ts.rc_needed[ty] && ts.shared_rc_labels[ty] >= 0 {
+            arm.mark(&mut code, ts.shared_rc_labels[ty])
+            if ty == ht.TY_STRING {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 0)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.integer_binary(&mut code, 2, true, false, 10, 0, -1, 8) // x10 = x0 - 8
+                helpers.store_mem(&mut code, 1, 10, 0)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if helpers.is_inline_agg(&types, ty) {
+                arm.ret(&mut code)
+            } else if te.kind == .Array {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 4)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+                elem_ty := te.inner_a
+                if elem_ty >= 0 && elem_ty < n && ts.shared_rc_labels[elem_ty] >= 0 {
+                    helpers.load_mem(&mut code, 10, 0, 8); arm.store(&mut code, 3, 10) // len
+                    arm.store(&mut code, 2, 31) // idx = 0
+                    elem_rc := ts.shared_rc_labels[elem_ty]
+                    head := arm.label(&mut code); arm.mark(&mut code, head)
+                    arm.load_into(&mut code, 2, 10); arm.load_into(&mut code, 3, 11)
+                    arm.compare_register(&mut code, 10, 11); arm.branch(&mut code, done, 4)
+                    arm.load(&mut code, 0); helpers.load_mem(&mut code, 11, 0, 0) // data
+                    arm.imm(&mut code, 12, 8)
+                    arm.integer_binary(&mut code, 3, true, false, 12, 10, 12, -1)
+                    arm.integer_binary(&mut code, 1, true, false, 11, 11, 12, -1)
+                    helpers.load_mem(&mut code, 0, 11, 0)
+                    arm.load_into(&mut code, 1, 1)
+                    arm.branch(&mut code, elem_rc, 1)
+                    arm.load_into(&mut code, 2, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 1)
+                    arm.store(&mut code, 2, 10)
+                    arm.branch(&mut code, head, 0)
+                }
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Enum {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+                // Tag compound enum RC header with `-3 - desc_id` when freezing (x1 == -2)!
+                if !type_contains_resource(&types, ty) {
+                    if desc_ids[ty] >= 0 {
+                        store_direct := arm.label(&mut code); rc_stored := arm.label(&mut code)
+                        arm.imm(&mut code, 10, -2); arm.compare_register(&mut code, 1, 10)
+                        arm.branch(&mut code, store_direct, 3)
+                        arm.imm(&mut code, 11, i64(-3 - desc_ids[ty]))
+                        arm.load(&mut code, 0)
+                        arm.integer_binary(&mut code, 2, true, false, 10, 0, -1, 8)
+                        helpers.store_mem(&mut code, 11, 10, 0)
+                        arm.branch(&mut code, rc_stored, 0)
+                        arm.mark(&mut code, store_direct)
+                        arm.load(&mut code, 0)
+                        arm.integer_binary(&mut code, 2, true, false, 10, 0, -1, 8)
+                        arm.load_into(&mut code, 1, 11)
+                        helpers.store_mem(&mut code, 11, 10, 0)
+                        arm.mark(&mut code, rc_stored)
+                    } else {
+                        arm.load(&mut code, 0)
+                        arm.integer_binary(&mut code, 2, true, false, 10, 0, -1, 8)
+                        arm.load_into(&mut code, 1, 11)
+                        helpers.store_mem(&mut code, 11, 10, 0)
+                    }
+                }
+                for vi in 0..te.count {
+                    v := &types.variants[te.inner_a + vi]
+                    mut has_rc_p := false
+                    for pi in 0..v.payload_count {
+                        pty := types.fields[v.payload_start + pi].ty
+                        if pty >= 0 && pty < n && ts.shared_rc_labels[pty] >= 0 { has_rc_p = true; break }
+                    }
+                    if !has_rc_p { continue }
+                    next_v := arm.label(&mut code)
+                    arm.load_into(&mut code, 0, 10)
+                    arm.transfer(&mut code, true, 11, 10, 4, 0)
+                    arm.imm(&mut code, 12, v.tag_value)
+                    arm.compare_register(&mut code, 11, 12)
+                    arm.branch(&mut code, next_v, 3)
+                    for pi in 0..v.payload_count {
+                        pty := types.fields[v.payload_start + pi].ty
+                        if pty >= 0 && pty < n && ts.shared_rc_labels[pty] >= 0 {
+                            off := helpers.enum_payload_offset(&types, ty, vi, pi)
+                            arm.load_into(&mut code, 0, 10)
+                            helpers.load_mem(&mut code, 0, 10, off)
+                            arm.load_into(&mut code, 1, 1)
+                            arm.branch(&mut code, ts.shared_rc_labels[pty], 1)
+                        }
+                    }
+                    arm.branch(&mut code, done, 0)
+                    arm.mark(&mut code, next_v)
+                }
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Struct || te.kind == .Tuple {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0); arm.store(&mut code, 1, 1)
+                for fi in 0..te.count {
+                    fty := types.fields[te.inner_a + fi].ty
+                    if fty >= 0 && fty < n && ts.shared_rc_labels[fty] >= 0 {
+                        off := helpers.struct_field_offset(&types, ty, fi)
+                        arm.load_into(&mut code, 0, 10)
+                        helpers.load_mem(&mut code, 0, 10, off)
+                        arm.load_into(&mut code, 1, 1)
+                        arm.branch(&mut code, ts.shared_rc_labels[fty], 1)
+                    }
+                }
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else {
+                arm.ret(&mut code)
+            }
+        }
+
+        // --- shared_prepare(x0 = val) -> x0 = isolated value with RC=0 ---
+        if ts.prep_needed[ty] && ts.shared_prepare_labels[ty] >= 0 {
+            arm.mark(&mut code, ts.shared_prepare_labels[ty])
+            fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 1)
+            iso_lbl := if ty == ht.TY_STRING { h.rt.string_isolated_clone } else { ts.iso_labels[ty] }
+            if iso_lbl >= 0 { arm.branch(&mut code, iso_lbl, 1) }
+            arm.store(&mut code, 0, 0)
+            if ts.shared_rc_labels[ty] >= 0 {
+                arm.imm(&mut code, 1, 0)
+                arm.branch(&mut code, ts.shared_rc_labels[ty], 1)
+            }
+            arm.load(&mut code, 0); arm.ret(&mut code)
+        }
+
+        // --- shared_drop(x0 = val): restore RC=1 and drop ---
+        if ts.sdrop_needed[ty] && ts.shared_drop_labels[ty] >= 0 {
+            arm.mark(&mut code, ts.shared_drop_labels[ty])
+            fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 1)
+            done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+            arm.store(&mut code, 0, 0)
+            if ts.shared_rc_labels[ty] >= 0 {
+                arm.imm(&mut code, 1, 1)
+                arm.branch(&mut code, ts.shared_rc_labels[ty], 1)
+            }
+            arm.load(&mut code, 0)
+            if ty < h.drop_labels.len && h.drop_labels[ty] >= 0 {
+                arm.branch(&mut code, h.drop_labels[ty], 1)
+            } else {
+                arm.branch(&mut code, h.rt.release, 1)
+            }
+            arm.mark(&mut code, done); arm.ret(&mut code)
+        }
+
+        // --- shell_drop(x0 = val): free container shells without invoking @resource(dispose) ---
+        if ts.shell_needed[ty] && ts.shell_drop_labels[ty] >= 0 {
+            arm.mark(&mut code, ts.shell_drop_labels[ty])
+            if te.flags.bit_and(ht.TF_RESOURCE) != 0 || helpers.is_inline_agg(&types, ty) {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 0)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Array {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 3)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                elem := te.inner_a
+                if elem >= 0 && elem < n && ts.shell_drop_labels[elem] >= 0 {
+                    helpers.load_mem(&mut code, 10, 0, 8); arm.store(&mut code, 2, 10)
+                    arm.store(&mut code, 1, 31)
+                    head := arm.label(&mut code); rel := arm.label(&mut code)
+                    arm.mark(&mut code, head)
+                    arm.load_into(&mut code, 1, 10); arm.load_into(&mut code, 2, 11)
+                    arm.compare_register(&mut code, 10, 11); arm.branch(&mut code, rel, 4)
+                    arm.load(&mut code, 0); helpers.load_mem(&mut code, 11, 0, 0)
+                    arm.imm(&mut code, 12, 8)
+                    arm.integer_binary(&mut code, 3, true, false, 12, 10, 12, -1)
+                    arm.integer_binary(&mut code, 1, true, false, 11, 11, 12, -1)
+                    helpers.load_mem(&mut code, 0, 11, 0)
+                    arm.branch(&mut code, ts.shell_drop_labels[elem], 1)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 1)
+                    arm.store(&mut code, 1, 10)
+                    arm.branch(&mut code, head, 0)
+                    arm.mark(&mut code, rel)
+                }
+                arm.load(&mut code, 0); helpers.load_mem(&mut code, 0, 0, 0)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.load(&mut code, 0); arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Struct || te.kind == .Tuple {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 1)
+                done := arm.label(&mut code); arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                for fi in 0..te.count {
+                    fty := types.fields[te.inner_a + fi].ty
+                    off := helpers.struct_field_offset(&types, ty, fi)
+                    if fty >= 0 && fty < n && ts.shell_drop_labels[fty] >= 0 {
+                        arm.load_into(&mut code, 0, 10); helpers.load_mem(&mut code, 0, 10, off)
+                        arm.branch(&mut code, ts.shell_drop_labels[fty], 1)
+                    } else if helpers.type_needs_drop(&types, fty) && fty < h.drop_labels.len && h.drop_labels[fty] >= 0 {
+                        arm.load_into(&mut code, 0, 10); helpers.load_mem(&mut code, 0, 10, off)
+                        arm.branch(&mut code, h.drop_labels[fty], 1)
+                    }
+                }
+                arm.load(&mut code, 0); arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else if te.kind == .Enum {
+                fr := arm.prologue(&mut code); arm.frame(&mut code, fr, 1)
+                done := arm.label(&mut code); rel := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                for vi in 0..te.count {
+                    v := &types.variants[te.inner_a + vi]
+                    next_v := arm.label(&mut code)
+                    arm.load_into(&mut code, 0, 10)
+                    arm.transfer(&mut code, true, 11, 10, 4, 0)
+                    arm.imm(&mut code, 12, v.tag_value)
+                    arm.compare_register(&mut code, 11, 12)
+                    arm.branch(&mut code, next_v, 3)
+                    for pi in 0..v.payload_count {
+                        pty := types.fields[v.payload_start + pi].ty
+                        off := helpers.enum_payload_offset(&types, ty, vi, pi)
+                        if pty >= 0 && pty < n && ts.shell_drop_labels[pty] >= 0 {
+                            arm.load_into(&mut code, 0, 10); helpers.load_mem(&mut code, 0, 10, off)
+                            arm.branch(&mut code, ts.shell_drop_labels[pty], 1)
+                        } else if helpers.type_needs_drop(&types, pty) && pty < h.drop_labels.len && h.drop_labels[pty] >= 0 {
+                            arm.load_into(&mut code, 0, 10); helpers.load_mem(&mut code, 0, 10, off)
+                            arm.branch(&mut code, h.drop_labels[pty], 1)
+                        }
+                    }
+                    arm.branch(&mut code, rel, 0)
+                    arm.mark(&mut code, next_v)
+                }
+                arm.mark(&mut code, rel)
+                arm.load(&mut code, 0); arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done); arm.ret(&mut code)
+            } else {
+                arm.ret(&mut code)
+            }
+        }
+    }
+
+    // 4. ALWAYS emit bounded TYPE_DESC_TABLE dispatch at `h.rt.type_desc_dispatch`!
+    // Expects x0 = frozen compound enum ptr, x11 = (-rc) - 3 (set by runtime.ddr:476-477).
+    // Traps with status 112 on any out-of-range desc_id (preserving -1 freed sentinel & -2 string clone).
+    if h.rt.type_desc_dispatch >= 0 && code.labels[h.rt.type_desc_dispatch] < 0 {
+        trap := arm.label(&mut code)
+        arm.mark(&mut code, h.rt.type_desc_dispatch)
+        if desc_labels.len == 0 {
+            arm.mark(&mut code, trap)
+            arm.exit(&mut code, 112)
+        } else {
+            arm.imm(&mut code, 12, i64(desc_labels.len))
+            arm.compare_register(&mut code, 11, 12)
+            arm.branch(&mut code, trap, 4) // unsigned >= desc_labels.len -> trap 112
+            emit_type_desc_search(&mut code, &desc_labels, 0, desc_labels.len, trap)
+            arm.mark(&mut code, trap)
+            arm.exit(&mut code, 112)
+        }
+    }
+}
