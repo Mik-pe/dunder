@@ -45,6 +45,8 @@ struct Builder {
     defers: []DeferInfo,
     loops: []LoopInfo,
     loop_defer_flags: []i32,
+    guard_lock_locals: []i32,
+    guard_lock_depths: []i32,
     cur_region_scope: i32,
     in_unsafe: bool,
 }
@@ -113,6 +115,35 @@ fn find_defer_for_scope(b: &Builder, scope_id: i32) -> i32 {
 // RegionExit, and shared Defer routing strictly inner-to-outer (LIFO).
 fn emit_unwind_to(b: &mut Builder, types: &ht.TypeTable, stop_depth: i32, final_bb: i32, start: i32, end: i32) {
     if b.terminated { return }
+    // Keep any active match-guard borrow locks live along diverging unwind edges (return/break/continue/?).
+    if b.guard_lock_locals.len > 0 {
+        empty_ops: []i32 = []
+        mut gi := b.guard_lock_locals.len - 1
+        while gi >= 0 {
+            if b.guard_lock_depths[gi] >= stop_depth {
+                lk := b.guard_lock_locals[gi]
+                lk_ty := b.body.locals[lk].ty
+                sink_tmp := new_temp(&mut b, &types, lk_ty, start, end)
+                sink_pl := mb.add_local_place(&mut b.body, sink_tmp)
+                lk_pl := mb.add_local_place(&mut b.body, lk)
+                lk_op := mb.add_op(&mut b.body, .Copy, lk_pl)
+                lk_rv := mb.add_rvalue(&mut b.body, .Use, lk_ty, lk_op, -1, &empty_ops)
+                _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                    kind: .Assign, place: sink_pl, rvalue: lk_rv, aux: 0, in_unsafe: b.in_unsafe,
+                    span_start: start, span_end: end,
+                })
+                _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                    kind: .StorageDead, place: sink_tmp, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
+                    span_start: start, span_end: end,
+                })
+                _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                    kind: .StorageDead, place: lk, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
+                    span_start: start, span_end: end,
+                })
+            }
+            gi -= 1
+        }
+    }
     mut depth := b.scope_stack.len - 1
     while depth >= stop_depth {
         sid := b.scope_stack[depth]
@@ -621,9 +652,11 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
             sid := push_scope(&mut b, .Lexical, -1, -1)
             arm_depth := b.scope_stack.len - 1
             if guard_e >= 0 && e.b == 1 {
-                // Guard on `match move`: read bindings without moving `subj_pl` until the guard succeeds!
+                // Guard on `match move`: read bindings under a Shared borrow lock until the guard succeeds!
                 lower_pat_bind(&mut b, &prog, &f, pat_id, subj_pl, false, true, false)
+                lock_start := push_match_guard_locks(&mut b, &prog, &f, pat_id, arm_depth, pat.span_start, pat.span_end)
                 g_op := lower_expr_to_op(&mut b, &prog, &f, guard_e)
+                release_match_guard_locks(&mut b, &prog.types, lock_start, pat.span_start, pat.span_end)
                 body_bb := mb.add_block(&mut b.body, sid)
                 g_fail_bb := mb.add_block(&mut b.body, sid)
                 g_vals: []i64 = [1]
@@ -641,7 +674,9 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
             } else {
                 lower_pat_bind(&mut b, &prog, &f, pat_id, subj_pl, e.b == 1, false, false)
                 if guard_e >= 0 {
+                    lock_start := push_match_guard_locks(&mut b, &prog, &f, pat_id, arm_depth, pat.span_start, pat.span_end)
                     g_op := lower_expr_to_op(&mut b, &prog, &f, guard_e)
+                    release_match_guard_locks(&mut b, &prog.types, lock_start, pat.span_start, pat.span_end)
                     body_bb := mb.add_block(&mut b.body, sid)
                     g_fail_bb := mb.add_block(&mut b.body, sid)
                     g_vals: []i64 = [1]
@@ -782,6 +817,81 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         })
     }
     b.in_unsafe = prev_unsafe
+}
+
+fn collect_pat_bind_locals(b: &Builder, f: &hb.HirFn, pat_id: i32, out: &mut []i32) {
+    if pat_id < 0 || pat_id >= f.pats.len { return }
+    pat := &f.pats[pat_id]
+    if pat.kind == .Bind && pat.local_id >= 0 && pat.local_id < b.hir_to_mir.len {
+        out.push(b.hir_to_mir[pat.local_id])
+    } else if pat.kind == .Variant || pat.kind == .Tuple || pat.kind == .Struct {
+        for i in 0..pat.child_len {
+            collect_pat_bind_locals(&b, &f, f.pat_list[pat.child_start + i], &mut out)
+        }
+    }
+}
+
+fn push_match_guard_locks(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn,
+    pat_id: i32, arm_depth: i32, span_s: i32, span_e: i32) -> i32 {
+    start := b.guard_lock_locals.len
+    mut bound: []i32 = []
+    collect_pat_bind_locals(&b, &f, pat_id, &mut bound)
+    empty_ops: []i32 = []
+    for i in 0..bound.len {
+        ml := bound[i]
+        pty := b.body.locals[ml].ty
+        if ht.is_copy(&prog.types, pty) && b.body.locals[ml].flags.bit_and(mb.LF_MUT) == 0 {
+            continue
+        }
+        ref_ty := ht.find_ref(&prog.types, pty)
+        if ref_ty < 0 { continue }
+        lock_tmp := new_temp(&mut b, &prog.types, ref_ty, span_s, span_e)
+        lock_pl := mb.add_local_place(&mut b.body, lock_tmp)
+        ml_pl := mb.add_local_place(&mut b.body, ml)
+        rel := b.body.blocks[b.cur_bb].stmt_end - b.body.blocks[b.cur_bb].stmt_start
+        ln := mb.add_loan(&mut b.body, ml_pl, .Shared, b.cur_bb, rel, b.cur_region_scope, -1, span_s, span_e)
+        rv := mb.add_rvalue(&mut b.body, .Ref, ref_ty, ln, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: lock_pl, rvalue: rv, aux: 0, in_unsafe: b.in_unsafe,
+            span_start: span_s, span_end: span_e,
+        })
+        b.guard_lock_locals.push(lock_tmp)
+        b.guard_lock_depths.push(arm_depth)
+    }
+    start
+}
+
+fn release_match_guard_locks(b: &mut Builder, types: &ht.TypeTable, lock_start: i32, span_s: i32, span_e: i32) {
+    empty_ops: []i32 = []
+    if !b.terminated {
+        mut i := b.guard_lock_locals.len - 1
+        while i >= lock_start {
+            lk := b.guard_lock_locals[i]
+            lk_ty := b.body.locals[lk].ty
+            sink_tmp := new_temp(&mut b, &types, lk_ty, span_s, span_e)
+            sink_pl := mb.add_local_place(&mut b.body, sink_tmp)
+            lk_pl := mb.add_local_place(&mut b.body, lk)
+            lk_op := mb.add_op(&mut b.body, .Copy, lk_pl)
+            lk_rv := mb.add_rvalue(&mut b.body, .Use, lk_ty, lk_op, -1, &empty_ops)
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .Assign, place: sink_pl, rvalue: lk_rv, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: span_s, span_end: span_e,
+            })
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .StorageDead, place: sink_tmp, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: span_s, span_end: span_e,
+            })
+            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                kind: .StorageDead, place: lk, rvalue: -1, aux: 0, in_unsafe: b.in_unsafe,
+                span_start: span_s, span_end: span_e,
+            })
+            i -= 1
+        }
+    }
+    while b.guard_lock_locals.len > lock_start {
+        _ := b.guard_lock_locals.pop()
+        _ := b.guard_lock_depths.pop()
+    }
 }
 
 fn lower_pat_bind(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, pat_id: i32, subj_pl: i32, is_move: bool, for_guard: bool, commit_only: bool) {
@@ -1288,6 +1398,8 @@ pub fn build_body(prog: &hb.HirProgram, fn_id: i32, diags: &mut []diag.Diagnosti
         defers: [],
         loops: [],
         loop_defer_flags: [],
+        guard_lock_locals: [],
+        guard_lock_depths: [],
         cur_region_scope: -1,
         in_unsafe: f.is_unsafe,
     }
