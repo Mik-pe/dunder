@@ -1,0 +1,1004 @@
+// Type-driven codegen helpers for Post-Drop HL-MIR -> arm.Code:
+// - Type representation predicates (FatStr/FatSlice 2-word inline, POD inline vs boxed heap)
+// - Synthesized per-type drop_label[ty] & clone_label[ty] (correct rc==1 dispose_fn + x0 reload,
+//   @resource(dispose) inside enum payloads, arrays, closures)
+// - Runtime, print/trap helpers, and deduplicated string/cstr/wstr/raw-bytes literal pools.
+// Zero imports of selfhost/frontend/compile.ddr or selfhost/frontend/frontend_types.ddr.
+
+import ..backend.arm64 as arm
+import ..backend.ffi_arm64 as abi
+import ..runtime.runtime as runtime
+import ..runtime.runtime_intrinsic as ri
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+
+pub struct EmitHelpers {
+    rt: runtime.Runtime,
+    print_int: i32,
+    print_bool: i32,
+    print_text: i32,
+    write_stdout: i32,
+    trap_overflow: i32,
+    trap_zero: i32,
+    trap_assert: i32,
+    trap_io: i32,
+    trap_bounds: i32,
+    trap_panic: i32,
+    trap_unreachable: i32,
+    eprint_text: i32,
+    closure_drop: i32,
+    fn_labels: []i32,
+    drop_labels: []i32,
+    clone_labels: []i32,
+    iso_labels: []i32,
+    shared_rc_labels: []i32,
+    str_texts: []string,
+    str_labels: []i32,
+    str_map: Map<string, i64>,
+    cstr_texts: []string,
+    cstr_labels: []i32,
+    cstr_map: Map<string, i64>,
+    wstr_texts: []string,
+    wstr_labels: []i32,
+    wstr_map: Map<string, i64>,
+}
+
+// =========================================================================
+// Type representation & layout predicates over sealed ht.TypeTable
+// =========================================================================
+
+pub fn is_signed_int(ty: i32) -> bool {
+    ty == ht.TY_I8 || ty == ht.TY_I16 || ty == ht.TY_I32 || ty == ht.TY_I64 || ty == ht.TY_ISIZE
+}
+
+pub fn is_unsigned_int(ty: i32) -> bool {
+    ty == ht.TY_U8 || ty == ht.TY_U16 || ty == ht.TY_U32 || ty == ht.TY_U64 || ty == ht.TY_USIZE
+}
+
+pub fn is_int_ty(ty: i32) -> bool {
+    is_signed_int(ty) || is_unsigned_int(ty) || ty == ht.TY_RUNE
+}
+
+pub fn is_float_ty(ty: i32) -> bool {
+    ty == ht.TY_F32 || ty == ht.TY_F64
+}
+
+pub fn is_fat_pair(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    k := types.entries[ty].kind
+    k == .FatStr || k == .FatSlice || k == .RegionSlice
+}
+
+pub fn is_inline_agg(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    k := te.kind
+    if k == .Union { return true }
+    if k != .Struct && k != .Tuple && k != .Enum && k != .FixedArr { return false }
+    if te.flags.bit_and(ht.TF_POD_INLINE) != 0 { return true }
+    if te.flags.bit_and(ht.TF_C_LAYOUT) != 0 && te.flags.bit_and(ht.TF_DISPOSE) == 0 && te.flags.bit_and(ht.TF_RESOURCE) == 0 {
+        return true
+    }
+    false
+}
+
+pub fn is_boxed_heap(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    k := te.kind
+    if k == .String || k == .Array { return true }
+    if k == .ClosureEnv { return te.flags.bit_and(ht.TF_CLOSURE_BORROWED) == 0 }
+    if k == .Struct || k == .Tuple || k == .Enum || k == .FixedArr {
+        return !is_inline_agg(&types, ty)
+    }
+    false
+}
+
+pub fn type_needs_drop(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    te := &types.entries[ty]
+    k := te.kind
+    if k == .String || k == .Array { return true }
+    if k == .ClosureEnv { return te.flags.bit_and(ht.TF_CLOSURE_BORROWED) == 0 }
+    if k == .Struct || k == .Tuple || k == .Enum || k == .FixedArr {
+        if te.flags.bit_and(ht.TF_DISPOSE) != 0 || te.flags.bit_and(ht.TF_RESOURCE) != 0 { return true }
+        return !ht.is_copy(&types, ty)
+    }
+    false
+}
+
+pub fn type_byte_size(types: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= types.entries.len { return 8 }
+    sz := types.entries[ty].size
+    if sz <= 0 { 0 } else { sz }
+}
+
+fn align_up_i32(v: i32, a: i32) -> i32 {
+    if a <= 1 { return v }
+    rem := v % a
+    if rem == 0 { v } else { v + (a - rem) }
+}
+
+pub fn field_storage_size(types: &ht.TypeTable, fty: i32) -> i32 {
+    if is_boxed_heap(&types, fty) { return 8 }
+    if is_fat_pair(&types, fty) { return 16 }
+    sz := type_byte_size(&types, fty)
+    if sz < 1 { 1 } else { sz }
+}
+
+pub fn field_storage_align(types: &ht.TypeTable, fty: i32) -> i32 {
+    if is_boxed_heap(&types, fty) || is_fat_pair(&types, fty) { return 8 }
+    if fty < 0 || fty >= types.entries.len { return 8 }
+    al := types.entries[fty].align
+    if al < 1 { 1 } else { al }
+}
+
+pub fn struct_field_offset(types: &ht.TypeTable, ty: i32, fidx: i32) -> i32 {
+    if is_inline_agg(&types, ty) {
+        return types.fields[types.entries[ty].inner_a + fidx].offset
+    }
+    te := &types.entries[ty]
+    mut off := 0
+    for i in 0..te.count {
+        fty := types.fields[te.inner_a + i].ty
+        al := field_storage_align(&types, fty)
+        off = align_up_i32(off, al)
+        if i == fidx { return off }
+        off += field_storage_size(&types, fty)
+    }
+    off
+}
+
+pub fn struct_alloc_size(types: &ht.TypeTable, ty: i32) -> i32 {
+    if is_inline_agg(&types, ty) {
+        sz := type_byte_size(&types, ty)
+        return if sz < 8 { 8 } else { sz }
+    }
+    te := &types.entries[ty]
+    mut off := 0
+    mut max_al := 1
+    for i in 0..te.count {
+        fty := types.fields[te.inner_a + i].ty
+        al := field_storage_align(&types, fty)
+        if al > max_al { max_al = al }
+        off = align_up_i32(off, al)
+        off += field_storage_size(&types, fty)
+    }
+    sz := align_up_i32(off, max_al)
+    if sz < 8 { 8 } else { sz }
+}
+
+pub fn enum_payload_offset(types: &ht.TypeTable, ty: i32, vidx: i32, pidx: i32) -> i32 {
+    te := &types.entries[ty]
+    v := &types.variants[te.inner_a + vidx]
+    if is_inline_agg(&types, ty) {
+        base := align_up_i32(4, if te.align > 4 { te.align } else { 4 })
+        return base + types.fields[v.payload_start + pidx].offset
+    }
+    // Boxed enum: tag at [0..4], payload fields aligned starting at offset 8
+    mut off := 8
+    for i in 0..v.payload_count {
+        pty := types.fields[v.payload_start + i].ty
+        al := field_storage_align(&types, pty)
+        off = align_up_i32(off, al)
+        if i == pidx { return off }
+        off += field_storage_size(&types, pty)
+    }
+    off
+}
+
+pub fn enum_alloc_size(types: &ht.TypeTable, ty: i32) -> i32 {
+    if is_inline_agg(&types, ty) {
+        sz := type_byte_size(&types, ty)
+        return if sz < 8 { 8 } else { sz }
+    }
+    te := &types.entries[ty]
+    mut max_end := 8
+    for vi in 0..te.count {
+        v := &types.variants[te.inner_a + vi]
+        mut off := 8
+        for pi in 0..v.payload_count {
+            pty := types.fields[v.payload_start + pi].ty
+            al := field_storage_align(&types, pty)
+            off = align_up_i32(off, al)
+            off += field_storage_size(&types, pty)
+        }
+        if off > max_end { max_end = off }
+    }
+    align_up_i32(max_end, 8)
+}
+
+pub fn local_slot_count(types: &ht.TypeTable, ty: i32) -> i32 {
+    if is_fat_pair(&types, ty) { return 2 }
+    if is_inline_agg(&types, ty) {
+        sz := type_byte_size(&types, ty)
+        if sz <= 8 { return 1 }
+        return (sz + 7) / 8
+    }
+    1
+}
+
+// Element storage size in bytes inside an array/slice/fixed-array buffer
+pub fn elem_stride(types: &ht.TypeTable, elem_ty: i32) -> i32 {
+    if is_fat_pair(&types, elem_ty) { return 16 }
+    if is_inline_agg(&types, elem_ty) {
+        sz := type_byte_size(&types, elem_ty)
+        return if sz < 1 { 1 } else { sz }
+    }
+    if is_boxed_heap(&types, elem_ty) { return 8 }
+    sz := type_byte_size(&types, elem_ty)
+    if sz <= 0 { 1 } else { sz }
+}
+
+pub fn array_elem_layout(types: &ht.TypeTable, elem_ty: i32) -> i32 {
+    if is_fat_pair(&types, elem_ty) { return ri.RECORD_LAYOUT_BASE + 16 }
+    if is_inline_agg(&types, elem_ty) {
+        sz := type_byte_size(&types, elem_ty)
+        return ri.RECORD_LAYOUT_BASE + (if sz < 1 { 1 } else { sz })
+    }
+    if is_boxed_heap(&types, elem_ty) { return 3 }
+    sz := type_byte_size(&types, elem_ty)
+    if sz <= 1 { return 0 }
+    if sz == 2 { return 1 }
+    if sz == 4 { return 2 }
+    3
+}
+
+// Map ht.TypeId -> legacy backend scalar type ID used by backend/floats.ddr and frontend/unsigned.ddr
+pub fn legacy_ty_id(ty: i32) -> i32 {
+    if ty == ht.TY_I32 { return 1 }
+    if ty == ht.TY_I64 { return 2 }
+    if ty == ht.TY_BOOL { return 3 }
+    if ty == ht.TY_STRING { return 4 }
+    if ty == ht.TY_RUNE { return 5 }
+    if ty == ht.TY_F32 { return 6 }
+    if ty == ht.TY_F64 { return 7 }
+    if ty == ht.TY_U8 { return 8 }
+    if ty == ht.TY_U16 { return 9 }
+    if ty == ht.TY_U32 { return 10 }
+    if ty == ht.TY_U64 { return 11 }
+    if ty == ht.TY_USIZE { return 12 }
+    if ty == ht.TY_I16 { return 16 }
+    if ty == ht.TY_I8 { return 17 }
+    if ty == ht.TY_ISIZE { return 18 }
+    2
+}
+
+// =========================================================================
+// Low-level ARM64 memory & address helpers (zero ffi_abi dependency)
+// =========================================================================
+
+pub fn load_mem(code: &mut arm.Code, dst: i32, base: i32, offset: i32) {
+    if offset >= 0 && offset < 32760 && offset % 8 == 0 {
+        arm.transfer(&mut code, true, dst, base, 3, offset)
+    } else {
+        arm.imm(&mut code, 15, i64(offset))
+        arm.integer_binary(&mut code, 1, true, false, 15, base, 15, -1)
+        arm.transfer(&mut code, true, dst, 15, 3, 0)
+    }
+}
+
+pub fn store_mem(code: &mut arm.Code, src: i32, base: i32, offset: i32) {
+    if offset >= 0 && offset < 32760 && offset % 8 == 0 {
+        arm.transfer(&mut code, false, src, base, 3, offset)
+    } else {
+        arm.imm(&mut code, 15, i64(offset))
+        arm.integer_binary(&mut code, 1, true, false, 15, base, 15, -1)
+        arm.transfer(&mut code, false, src, 15, 3, 0)
+    }
+}
+
+pub fn load_typed_at(code: &mut arm.Code, types: &ht.TypeTable, ty: i32, dst: i32, base: i32, offset: i32) {
+    if is_boxed_heap(&types, ty) || is_fat_pair(&types, ty) {
+        load_mem(&mut code, dst, base, offset)
+        return
+    }
+    sz := type_byte_size(&types, ty)
+    mut eff_base := base
+    mut eff_off := offset
+    if offset < 0 || offset >= 4096 || (sz > 1 && offset % sz != 0) {
+        arm.imm(&mut code, 15, i64(offset))
+        arm.integer_binary(&mut code, 1, true, false, 15, base, 15, -1)
+        eff_base = 15
+        eff_off = 0
+    }
+    if sz <= 1 {
+        arm.transfer(&mut code, true, dst, eff_base, 0, eff_off)
+        if ty == ht.TY_I8 { arm.bitfield(&mut code, true, true, dst, dst, 0, 7) }
+    } else if sz == 2 {
+        arm.transfer(&mut code, true, dst, eff_base, 1, eff_off)
+        if ty == ht.TY_I16 { arm.bitfield(&mut code, true, true, dst, dst, 0, 15) }
+    } else if sz == 4 {
+        if ty == ht.TY_I32 {
+            arm.transfer(&mut code, true, dst, eff_base, 4, eff_off)
+        } else {
+            arm.transfer(&mut code, true, dst, eff_base, 2, eff_off)
+        }
+    } else {
+        arm.transfer(&mut code, true, dst, eff_base, 3, eff_off)
+    }
+}
+
+pub fn store_typed_at(code: &mut arm.Code, types: &ht.TypeTable, ty: i32, src: i32, base: i32, offset: i32) {
+    if is_boxed_heap(&types, ty) {
+        store_mem(&mut code, src, base, offset)
+        return
+    }
+    sz := type_byte_size(&types, ty)
+    mut eff_base := base
+    mut eff_off := offset
+    if offset < 0 || offset >= 4096 || (sz > 1 && offset % sz != 0) {
+        arm.imm(&mut code, 15, i64(offset))
+        arm.integer_binary(&mut code, 1, true, false, 15, base, 15, -1)
+        eff_base = 15
+        eff_off = 0
+    }
+    if sz <= 1 { arm.transfer(&mut code, false, src, eff_base, 0, eff_off) }
+    else if sz == 2 { arm.transfer(&mut code, false, src, eff_base, 1, eff_off) }
+    else if sz == 4 { arm.transfer(&mut code, false, src, eff_base, 2, eff_off) }
+    else { arm.transfer(&mut code, false, src, eff_base, 3, eff_off) }
+}
+
+pub fn copy_bytes(code: &mut arm.Code, dst_reg: i32, src_reg: i32, size: i32) {
+    if size <= 0 { return }
+    abi.copy(&mut code, dst_reg, src_reg, size)
+}
+
+pub fn zero_bytes(code: &mut arm.Code, base_reg: i32, size: i32) {
+    mut off := 0
+    while off + 8 <= size {
+        store_mem(&mut code, 31, base_reg, off)
+        off += 8
+    }
+    while off < size {
+        arm.transfer(&mut code, false, 31, base_reg, 0, off)
+        off += 1
+    }
+}
+
+pub fn load_label_addr(code: &mut arm.Code, target_label: i32, dst_reg: i32) {
+    arm.branch(&mut code, target_label, 20)
+    if dst_reg != 0 { arm.mov(&mut code, dst_reg, 0) }
+}
+
+pub fn allocation_refcount(code: &mut arm.Code) {
+    // ldur x1, [x0, #-8]
+    arm.emit(&mut code, 4167008257)
+}
+
+// =========================================================================
+// Helper initialization & deduplicated literal pools
+// =========================================================================
+
+pub fn new_helpers(code: &mut arm.Code, prog: &hb.HirProgram) -> EmitHelpers {
+    rt := runtime.new(&mut code)
+    n_fns := prog.fns.len
+    mut fn_labels: []i32 = []
+    fn_labels.reserve(n_fns)
+    for _ in 0..n_fns { fn_labels.push(arm.label(&mut code)) }
+
+    n_tys := prog.types.entries.len
+    mut drop_labels: []i32 = []
+    mut clone_labels: []i32 = []
+    mut iso_labels: []i32 = []
+    mut shared_rc_labels: []i32 = []
+    drop_labels.reserve(n_tys)
+    clone_labels.reserve(n_tys)
+    iso_labels.reserve(n_tys)
+    shared_rc_labels.reserve(n_tys)
+    closure_drop := arm.label(&mut code)
+
+    for ty in 0..n_tys {
+        te := &prog.types.entries[ty]
+        mut dl := -1
+        mut cl := -1
+        if te.kind == .String {
+            dl = rt.release
+            cl = rt.retain
+        } else if te.kind == .Array {
+            dl = arm.label(&mut code)
+            cl = arm.label(&mut code)
+        } else if te.kind == .ClosureEnv {
+            if te.flags.bit_and(ht.TF_CLOSURE_BORROWED) == 0 {
+                if te.closure_fn_id >= 0 {
+                    dl = arm.label(&mut code)
+                } else {
+                    dl = closure_drop
+                }
+                cl = rt.retain
+            }
+        } else if (te.kind == .Struct || te.kind == .Tuple || te.kind == .Enum || te.kind == .FixedArr) &&
+            !is_inline_agg(&prog.types, ty) {
+            if type_needs_drop(&prog.types, ty) { dl = arm.label(&mut code) }
+            cl = arm.label(&mut code)
+        }
+        drop_labels.push(dl)
+        clone_labels.push(cl)
+        iso_labels.push(-1)
+        shared_rc_labels.push(-1)
+    }
+
+    EmitHelpers {
+        rt: rt,
+        print_int: arm.label(&mut code),
+        print_bool: arm.label(&mut code),
+        print_text: arm.label(&mut code),
+        write_stdout: arm.label(&mut code),
+        trap_overflow: arm.label(&mut code),
+        trap_zero: arm.label(&mut code),
+        trap_assert: arm.label(&mut code),
+        trap_io: arm.label(&mut code),
+        trap_bounds: arm.label(&mut code),
+        trap_panic: arm.label(&mut code),
+        trap_unreachable: arm.label(&mut code),
+        eprint_text: arm.label(&mut code),
+        closure_drop: closure_drop,
+        fn_labels: move fn_labels,
+        drop_labels: move drop_labels,
+        clone_labels: move clone_labels,
+        iso_labels: move iso_labels,
+        shared_rc_labels: move shared_rc_labels,
+        str_texts: [],
+        str_labels: [],
+        str_map: Map<string, i64>::new(),
+        cstr_texts: [],
+        cstr_labels: [],
+        cstr_map: Map<string, i64>::new(),
+        wstr_texts: [],
+        wstr_labels: [],
+        wstr_map: Map<string, i64>::new(),
+    }
+}
+
+pub fn intern_string(code: &mut arm.Code, h: &mut EmitHelpers, text: string) -> i32 {
+    existing := h.str_map.get_or(text, -1)
+    if existing >= 0 { return h.str_labels[i32(existing)] }
+    idx := h.str_texts.len
+    lbl := arm.label(&mut code)
+    h.str_texts.push(text.clone())
+    h.str_labels.push(lbl)
+    h.str_map.put(text.clone(), i64(idx))
+    lbl
+}
+
+pub fn intern_cstr(code: &mut arm.Code, h: &mut EmitHelpers, text: string) -> i32 {
+    existing := h.cstr_map.get_or(text, -1)
+    if existing >= 0 { return h.cstr_labels[i32(existing)] }
+    idx := h.cstr_texts.len
+    lbl := arm.label(&mut code)
+    h.cstr_texts.push(text.clone())
+    h.cstr_labels.push(lbl)
+    h.cstr_map.put(text.clone(), i64(idx))
+    lbl
+}
+
+pub fn intern_wstr(code: &mut arm.Code, h: &mut EmitHelpers, text: string) -> i32 {
+    existing := h.wstr_map.get_or(text, -1)
+    if existing >= 0 { return h.wstr_labels[i32(existing)] }
+    idx := h.wstr_texts.len
+    lbl := arm.label(&mut code)
+    h.wstr_texts.push(text.clone())
+    h.wstr_labels.push(lbl)
+    h.wstr_map.put(text.clone(), i64(idx))
+    lbl
+}
+
+// =========================================================================
+// Start header & Runtime / Per-type Drop + Clone helper emission
+// =========================================================================
+
+pub fn emit_start(code: &mut arm.Code, h: &EmitHelpers, main_label: i32) {
+    arm.imm(&mut code, 19, 0)
+    arm.imm(&mut code, 20, 0)
+    if code.platform == 0 || code.platform == 5 {
+        arm.mov(&mut code, 23, 0)
+        arm.mov(&mut code, 24, 1)
+    } else {
+        arm.emit(&mut code, 4181722103)
+        arm.emit(&mut code, 2432705528)
+    }
+    runtime.emit_profile_start(&mut code, &h.rt)
+    arm.branch(&mut code, main_label, 1)
+    runtime.emit_profile_report(&mut code, &h.rt)
+    arm.syscall(&mut code, 33554433, 94)
+    arm.emit(&mut code, 3558866944)
+}
+
+fn emit_closure_drop_dispatcher(code: &mut arm.Code, h: &EmitHelpers) {
+    arm.mark(&mut code, h.closure_drop)
+    frame := arm.prologue(&mut code)
+    arm.frame(&mut code, frame, 0)
+    done := arm.label(&mut code)
+    shared := arm.label(&mut code)
+    arm.branch(&mut code, done, 18) // cbz x0, done
+    allocation_refcount(&mut code)
+    arm.compare_immediate(&mut code, 1, 1, false)
+    arm.branch(&mut code, shared, 3) // b.ne shared
+    // rc == 1 -> load concrete drop fn from [x0 + 8] and call it
+    load_mem(&mut code, 16, 0, 8)
+    no_custom := arm.label(&mut code)
+    arm.compare_immediate(&mut code, 16, 0, false)
+    arm.branch(&mut code, no_custom, 2)
+    arm.emit(&mut code, 3594453504) // blr x16
+    arm.branch(&mut code, done, 0)
+    arm.mark(&mut code, no_custom)
+    arm.mark(&mut code, shared)
+    arm.branch(&mut code, h.rt.release, 1)
+    arm.mark(&mut code, done)
+    arm.ret(&mut code)
+}
+
+fn emit_drop_field_at(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers, fty: i32, base_slot: i32, offset: i32) {
+    if !type_needs_drop(&types, fty) { return }
+    dl := h.drop_labels[fty]
+    if dl < 0 { return }
+    arm.load_into(&mut code, base_slot, 10)
+    load_mem(&mut code, 0, 10, offset)
+    arm.branch(&mut code, dl, 1)
+}
+
+fn emit_clone_field_at(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers, fty: i32, dst_slot: i32, offset: i32) {
+    if ht.is_copy(&types, fty) { return }
+    cl := h.clone_labels[fty]
+    if cl < 0 { return }
+    arm.load_into(&mut code, dst_slot, 10)
+    load_mem(&mut code, 0, 10, offset)
+    arm.branch(&mut code, cl, 1)
+    arm.load_into(&mut code, dst_slot, 10)
+    store_mem(&mut code, 0, 10, offset)
+}
+
+fn emit_type_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers) {
+    n_tys := types.entries.len
+    for ty in 0..n_tys {
+        te := &types.entries[ty]
+        dl := h.drop_labels[ty]
+        cl := h.clone_labels[ty]
+
+        if te.kind == .Array {
+            // Array drop: check cbz + rc == 1 before array_drop (or rt.release if shared)
+            if dl >= 0 {
+                arm.mark(&mut code, dl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 0)
+                done := arm.label(&mut code)
+                shared := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                allocation_refcount(&mut code)
+                arm.compare_immediate(&mut code, 1, 1, false)
+                arm.branch(&mut code, shared, 3)
+                arm.branch(&mut code, h.rt.array_drop, 1)
+                arm.branch(&mut code, done, 0)
+                arm.mark(&mut code, shared)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+            // Array clone: array_clone (+ retain/clone elements if element has clone_label)
+            if cl >= 0 {
+                arm.mark(&mut code, cl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 3)
+                arm.branch(&mut code, h.rt.array_clone, 1)
+                elem_ty := te.inner_a
+                if elem_ty >= 0 && elem_ty < n_tys && !ht.is_copy(&types, elem_ty) && h.clone_labels[elem_ty] >= 0 {
+                    ecl := h.clone_labels[elem_ty]
+                    // If [arr + 32] == 0, clone elements manually (array_clone calls [arr + 32] when non-zero)
+                    already := arm.label(&mut code)
+                    load_mem(&mut code, 1, 0, 32)
+                    arm.compare_immediate(&mut code, 1, 0, false)
+                    arm.branch(&mut code, already, 3)
+                    arm.store(&mut code, 0, 0)
+                    load_mem(&mut code, 10, 0, 0) // data
+                    load_mem(&mut code, 11, 0, 8) // len
+                    arm.store(&mut code, 1, 10)
+                    arm.store(&mut code, 2, 11)
+                    lp := arm.label(&mut code)
+                    lp_done := arm.label(&mut code)
+                    arm.mark(&mut code, lp)
+                    arm.load(&mut code, 2)
+                    arm.branch(&mut code, lp_done, 18)
+                    arm.load_into(&mut code, 1, 10)
+                    load_mem(&mut code, 0, 10, 0)
+                    arm.branch(&mut code, ecl, 1)
+                    arm.load_into(&mut code, 1, 10)
+                    store_mem(&mut code, 0, 10, 0)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, -1, 8)
+                    arm.store(&mut code, 1, 10)
+                    arm.load(&mut code, 2)
+                    arm.integer_binary(&mut code, 2, true, false, 0, 0, -1, 1)
+                    arm.store(&mut code, 2, 0)
+                    arm.branch(&mut code, lp, 0)
+                    arm.mark(&mut code, lp_done)
+                    arm.load(&mut code, 0)
+                    arm.mark(&mut code, already)
+                }
+                arm.ret(&mut code)
+            }
+            continue
+        }
+
+        if te.kind == .ClosureEnv && te.flags.bit_and(ht.TF_CLOSURE_BORROWED) == 0 && te.closure_fn_id >= 0 && dl >= 0 {
+            // Concrete closure drop: called either directly or via closure_drop dispatcher when rc == 1
+            arm.mark(&mut code, dl)
+            fr := arm.prologue(&mut code)
+            arm.frame(&mut code, fr, 1)
+            done := arm.label(&mut code)
+            shared := arm.label(&mut code)
+            arm.branch(&mut code, done, 18)
+            allocation_refcount(&mut code)
+            arm.compare_immediate(&mut code, 1, 1, false)
+            arm.branch(&mut code, shared, 3)
+            arm.store(&mut code, 0, 0)
+            // Drop each owned capture stored at [env + 16 + cap_idx * 8]
+            mut cap_off := 16
+            for ci in 0..te.count {
+                cty := types.fields[te.inner_a + ci].ty
+                emit_drop_field_at(&mut code, &types, &h, cty, 0, cap_off)
+                cap_off += local_slot_count(&types, cty) * 8
+            }
+            arm.load(&mut code, 0)
+            arm.branch(&mut code, h.rt.release, 1)
+            arm.branch(&mut code, done, 0)
+            arm.mark(&mut code, shared)
+            arm.branch(&mut code, h.rt.release, 1)
+            arm.mark(&mut code, done)
+            arm.ret(&mut code)
+            continue
+        }
+
+        if (te.kind == .Struct || te.kind == .Tuple) && !is_inline_agg(&types, ty) {
+            alloc_sz := struct_alloc_size(&types, ty)
+            if dl >= 0 {
+                arm.mark(&mut code, dl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 1)
+                done := arm.label(&mut code)
+                shared := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                allocation_refcount(&mut code)
+                arm.compare_immediate(&mut code, 1, 1, false)
+                arm.branch(&mut code, shared, 3)
+                arm.store(&mut code, 0, 0)
+                // Run @resource(dispose) method ONLY when rc == 1, passing &slot0 (&self / &mut self), then reload x0!
+                if te.dispose_fn >= 0 && te.dispose_fn < h.fn_labels.len {
+                    arm.address(&mut code, 0)
+                    arm.branch(&mut code, h.fn_labels[te.dispose_fn], 1)
+                }
+                // Drop owned fields in declaration order (matching legacy)
+                for fi in 0..te.count {
+                    f := &types.fields[te.inner_a + fi]
+                    emit_drop_field_at(&mut code, &types, &h, f.ty, 0, struct_field_offset(&types, ty, fi))
+                }
+                arm.load(&mut code, 0)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.branch(&mut code, done, 0)
+                arm.mark(&mut code, shared)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+            if cl >= 0 {
+                arm.mark(&mut code, cl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                copy_bytes(&mut code, 0, 1, alloc_sz)
+                for fi in 0..te.count {
+                    f := &types.fields[te.inner_a + fi]
+                    emit_clone_field_at(&mut code, &types, &h, f.ty, 1, struct_field_offset(&types, ty, fi))
+                }
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+            continue
+        }
+
+        if te.kind == .Enum && !is_inline_agg(&types, ty) {
+            alloc_sz := enum_alloc_size(&types, ty)
+            if dl >= 0 {
+                arm.mark(&mut code, dl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 1)
+                done := arm.label(&mut code)
+                shared := arm.label(&mut code)
+                rel_lbl := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                allocation_refcount(&mut code)
+                arm.compare_immediate(&mut code, 1, 1, false)
+                arm.branch(&mut code, shared, 3)
+                arm.store(&mut code, 0, 0)
+                if te.dispose_fn >= 0 && te.dispose_fn < h.fn_labels.len {
+                    arm.address(&mut code, 0)
+                    arm.branch(&mut code, h.fn_labels[te.dispose_fn], 1)
+                    arm.load(&mut code, 0)
+                }
+                // Switch on enum tag at [x0 + 0] to drop active variant payload (including @resource(dispose)!)
+                for vi in 0..te.count {
+                    v := &types.variants[te.inner_a + vi]
+                    mut has_owned := false
+                    for pi in 0..v.payload_count {
+                        if type_needs_drop(&types, types.fields[v.payload_start + pi].ty) {
+                            has_owned = true; break
+                        }
+                    }
+                    if !has_owned { continue }
+                    next_v := arm.label(&mut code)
+                    arm.load_into(&mut code, 0, 10)
+                    arm.transfer(&mut code, true, 11, 10, 4, 0)
+                    arm.imm(&mut code, 12, v.tag_value)
+                    arm.compare_register(&mut code, 11, 12)
+                    arm.branch(&mut code, next_v, 3)
+                    for pi in 0..v.payload_count {
+                        pf := &types.fields[v.payload_start + pi]
+                        emit_drop_field_at(&mut code, &types, &h, pf.ty, 0, enum_payload_offset(&types, ty, vi, pi))
+                    }
+                    arm.branch(&mut code, rel_lbl, 0)
+                    arm.mark(&mut code, next_v)
+                }
+                arm.mark(&mut code, rel_lbl)
+                arm.load(&mut code, 0)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.branch(&mut code, done, 0)
+                arm.mark(&mut code, shared)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+            if cl >= 0 {
+                arm.mark(&mut code, cl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code)
+                cl_done := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                copy_bytes(&mut code, 0, 1, alloc_sz)
+                for vi in 0..te.count {
+                    v := &types.variants[te.inner_a + vi]
+                    mut has_nc := false
+                    for pi in 0..v.payload_count {
+                        if !ht.is_copy(&types, types.fields[v.payload_start + pi].ty) {
+                            has_nc = true; break
+                        }
+                    }
+                    if !has_nc { continue }
+                    next_v := arm.label(&mut code)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.transfer(&mut code, true, 11, 10, 4, 0)
+                    arm.imm(&mut code, 12, v.tag_value)
+                    arm.compare_register(&mut code, 11, 12)
+                    arm.branch(&mut code, next_v, 3)
+                    for pi in 0..v.payload_count {
+                        pf := &types.fields[v.payload_start + pi]
+                        emit_clone_field_at(&mut code, &types, &h, pf.ty, 1, enum_payload_offset(&types, ty, vi, pi))
+                    }
+                    arm.branch(&mut code, cl_done, 0)
+                    arm.mark(&mut code, next_v)
+                }
+                arm.mark(&mut code, cl_done)
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+            continue
+        }
+
+        if te.kind == .FixedArr && !is_inline_agg(&types, ty) {
+            elem_ty := te.inner_a
+            cnt := te.count
+            stride := elem_stride(&types, elem_ty)
+            alloc_sz := if stride * cnt < 8 { 8 } else { stride * cnt }
+            if dl >= 0 {
+                arm.mark(&mut code, dl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 2)
+                done := arm.label(&mut code)
+                shared := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                allocation_refcount(&mut code)
+                arm.compare_immediate(&mut code, 1, 1, false)
+                arm.branch(&mut code, shared, 3)
+                arm.store(&mut code, 0, 0)
+                if type_needs_drop(&types, elem_ty) && h.drop_labels[elem_ty] >= 0 {
+                    edl := h.drop_labels[elem_ty]
+                    arm.imm(&mut code, 10, 0)
+                    arm.store(&mut code, 1, 10)
+                    lp := arm.label(&mut code)
+                    lp_end := arm.label(&mut code)
+                    arm.mark(&mut code, lp)
+                    arm.load(&mut code, 1)
+                    arm.imm(&mut code, 11, i64(cnt))
+                    arm.compare_register(&mut code, 0, 11)
+                    arm.branch(&mut code, lp_end, 12)
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 0, 12, -1)
+                    arm.load_into(&mut code, 0, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, 12, -1)
+                    load_mem(&mut code, 0, 10, 0)
+                    arm.branch(&mut code, edl, 1)
+                    arm.load(&mut code, 1)
+                    arm.integer_binary(&mut code, 1, true, false, 0, 0, -1, 1)
+                    arm.store(&mut code, 1, 0)
+                    arm.branch(&mut code, lp, 0)
+                    arm.mark(&mut code, lp_end)
+                }
+                arm.load(&mut code, 0)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.branch(&mut code, done, 0)
+                arm.mark(&mut code, shared)
+                arm.branch(&mut code, h.rt.release, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+            if cl >= 0 {
+                arm.mark(&mut code, cl)
+                fr := arm.prologue(&mut code)
+                arm.frame(&mut code, fr, 3)
+                done := arm.label(&mut code)
+                arm.branch(&mut code, done, 18)
+                arm.store(&mut code, 0, 0)
+                arm.imm(&mut code, 0, i64(alloc_sz))
+                arm.branch(&mut code, h.rt.alloc, 1)
+                arm.store(&mut code, 1, 0)
+                arm.load_into(&mut code, 0, 1)
+                copy_bytes(&mut code, 0, 1, alloc_sz)
+                if !ht.is_copy(&types, elem_ty) && h.clone_labels[elem_ty] >= 0 {
+                    ecl := h.clone_labels[elem_ty]
+                    arm.imm(&mut code, 10, 0)
+                    arm.store(&mut code, 2, 10)
+                    lp := arm.label(&mut code)
+                    lp_end := arm.label(&mut code)
+                    arm.mark(&mut code, lp)
+                    arm.load(&mut code, 2)
+                    arm.imm(&mut code, 11, i64(cnt))
+                    arm.compare_register(&mut code, 0, 11)
+                    arm.branch(&mut code, lp_end, 12)
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 0, 12, -1)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, 12, -1)
+                    load_mem(&mut code, 0, 10, 0)
+                    arm.branch(&mut code, ecl, 1)
+                    arm.load_into(&mut code, 2, 11)
+                    arm.imm(&mut code, 12, i64(stride))
+                    arm.integer_binary(&mut code, 3, true, false, 12, 11, 12, -1)
+                    arm.load_into(&mut code, 1, 10)
+                    arm.integer_binary(&mut code, 1, true, false, 10, 10, 12, -1)
+                    store_mem(&mut code, 0, 10, 0)
+                    arm.load(&mut code, 2)
+                    arm.integer_binary(&mut code, 1, true, false, 0, 0, -1, 1)
+                    arm.store(&mut code, 2, 0)
+                    arm.branch(&mut code, lp, 0)
+                    arm.mark(&mut code, lp_end)
+                }
+                arm.load(&mut code, 1)
+                arm.mark(&mut code, done)
+                arm.ret(&mut code)
+            }
+        }
+    }
+}
+
+fn emit_string_literal_data(code: &mut arm.Code, text: string, label: i32) {
+    if code.words.len % 2 != 0 { arm.emit(&mut code, 0) }
+    arm.emit(&mut code, 0)
+    arm.emit(&mut code, 0)
+    arm.mark(&mut code, label)
+    arm.emit(&mut code, i64(text.len))
+    arm.emit(&mut code, 0)
+    mut cursor := 0
+    while cursor < text.len {
+        mut word: i64 = 0
+        mut factor: i64 = 1
+        for _ in 0..4 {
+            if cursor < text.len {
+                word = word + i64(text[cursor]) * factor
+                cursor += 1
+            }
+            factor = factor * 256
+        }
+        arm.emit(&mut code, word)
+    }
+    if text.len % 4 == 0 { arm.emit(&mut code, 0) }
+}
+
+fn emit_cstr_literal_data(code: &mut arm.Code, text: string, label: i32) {
+    if code.words.len % 2 != 0 { arm.emit(&mut code, 0) }
+    arm.mark(&mut code, label)
+    mut cursor := 0
+    total := text.len + 1 // trailing NUL
+    while cursor < total {
+        mut word: i64 = 0
+        mut factor: i64 = 1
+        for _ in 0..4 {
+            if cursor < text.len {
+                word = word + i64(text[cursor]) * factor
+            }
+            cursor += 1
+            factor = factor * 256
+        }
+        arm.emit(&mut code, word)
+    }
+}
+
+fn emit_wstr_literal_data(code: &mut arm.Code, text: string, label: i32) {
+    if code.words.len % 2 != 0 { arm.emit(&mut code, 0) }
+    arm.mark(&mut code, label)
+    rs := text.runes()
+    mut units: []i32 = []
+    for i in 0..rs.len {
+        cp := i32(rs[i])
+        if cp <= 65535 {
+            units.push(cp)
+        } else {
+            u := cp - 65536
+            units.push(55296 + u / 1024)
+            units.push(56320 + u % 1024)
+        }
+    }
+    units.push(0)
+    mut cursor := 0
+    while cursor < units.len {
+        lo := i64(units[cursor])
+        hi := if cursor + 1 < units.len { i64(units[cursor + 1]) } else { 0 }
+        arm.emit(&mut code, lo + hi * 65536)
+        cursor += 2
+    }
+}
+
+// Emits all runtime/trap/type helpers and deduplicated literal data.
+// Returns `data_start` (instruction index where static literal data begins).
+pub fn emit_all_helpers(code: &mut arm.Code, types: &ht.TypeTable, h: &EmitHelpers, environ_slot: i32) -> (i32, i32) {
+    arm.runtime(&mut code, h.print_int, h.print_bool, h.print_text, h.write_stdout,
+        h.trap_overflow, h.trap_zero, h.trap_assert, h.trap_io)
+
+    arm.mark(&mut code, h.trap_bounds); arm.exit(&mut code, hb.TRAP_BOUNDS)
+    arm.mark(&mut code, h.trap_panic); arm.exit(&mut code, hb.TRAP_PANIC)
+    arm.mark(&mut code, h.trap_unreachable); arm.exit(&mut code, hb.TRAP_UNREACHABLE)
+
+    // eprint_text(x0 = string): write string bytes + '\n' to stderr (fd 2)
+    arm.mark(&mut code, h.eprint_text)
+    efr := arm.prologue(&mut code)
+    arm.frame(&mut code, efr, 2)
+    arm.store(&mut code, 0, 0)
+    arm.branch(&mut code, h.rt.assert_report, 1)
+    // emit newline to stderr
+    if code.platform != 3 && code.platform != 4 {
+        arm.imm(&mut code, 9, 10)
+        arm.store(&mut code, 1, 9)
+        arm.address(&mut code, 1)
+        arm.mov(&mut code, 1, 0)
+        arm.imm(&mut code, 2, 1)
+        arm.imm(&mut code, 0, 2)
+        arm.syscall(&mut code, 33554436, 64)
+    }
+    arm.ret(&mut code)
+
+    emit_closure_drop_dispatcher(&mut code, &h)
+    emit_type_helpers(&mut code, &types, &h)
+    env_site := runtime.emit_runtime_with_env(&mut code, &h.rt, environ_slot)
+
+    data_start := code.words.len
+    for i in 0..h.str_texts.len {
+        emit_string_literal_data(&mut code, h.str_texts[i], h.str_labels[i])
+    }
+    for i in 0..h.cstr_texts.len {
+        emit_cstr_literal_data(&mut code, h.cstr_texts[i], h.cstr_labels[i])
+    }
+    for i in 0..h.wstr_texts.len {
+        emit_wstr_literal_data(&mut code, h.wstr_texts[i], h.wstr_labels[i])
+    }
+    (data_start, env_site)
+}

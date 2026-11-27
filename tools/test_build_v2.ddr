@@ -1,0 +1,810 @@
+// Differential runtime parity suite for `dunder build --build-v2` (Phase 2 Milestone 2A).
+// Compiles and executes a comprehensive matrix of programs under BOTH legacy `dunder build`
+// and `dunder build --build-v2` in parallel via process.ChildSet, asserting identical stdout,
+// stderr, and exit codes, plus cross-build smoke checks for x86_64-linux and wasm32.
+
+capability process, filesystem
+
+import .harness as harness
+import .probe_cli as cli
+import std.bytes as bytes
+import std.fs as fs
+import std.process as process
+import sys
+
+struct ParityCase {
+    name: string,
+    source: string,
+}
+
+struct CmdJob {
+    kind: i32, // 0 = build legacy, 1 = build v2, 2 = run legacy, 3 = run v2, 4 = cross x86_64-linux, 5 = cross wasm32
+    case_idx: i32,
+    prog: string,
+    args: []string,
+}
+
+struct RunOut {
+    done: bool,
+    code: i32,
+    signal: i32,
+    timed_out: bool,
+    stdout_s: string,
+    stderr_s: string,
+}
+
+fn empty_out() -> RunOut {
+    RunOut { done: false, code: -1, signal: 0, timed_out: false, stdout_s: "", stderr_s: "" }
+}
+
+fn parity_cases() -> []ParityCase {
+    [
+        // 1. Scalars, signed/unsigned arithmetic, casts, bitwise methods, short-circuit && / ||
+        ParityCase {
+            name: "scalars_and_casts",
+            source:
+                "fn side(tag: i32) -> bool { print(tag); tag > 0 }\n" +
+                "fn main() {\n" +
+                "    a: i32 = -17\n" +
+                "    b: i32 = 5\n" +
+                "    print(a + b)\n" +
+                "    print(a - b)\n" +
+                "    print(a * b)\n" +
+                "    print(a / b)\n" +
+                "    print(a % b)\n" +
+                "    u: u32 = u32(250)\n" +
+                "    v: u32 = u32(12)\n" +
+                "    print(u + v)\n" +
+                "    print(u / v)\n" +
+                "    print(u % v)\n" +
+                "    x: i64 = i64(1000000) * i64(2000)\n" +
+                "    print(x)\n" +
+                "    print(i32(u8(200)))\n" +
+                "    print(i32(i8(-42)))\n" +
+                "    print(i32(6).bit_or(i32(3)))\n" +
+                "    print(i32(6).bit_and(i32(3)))\n" +
+                "    print(i32(6).bit_xor(i32(3)))\n" +
+                "    print(i32(1).shl(i32(5)))\n" +
+                "    print(i32(64).shr(i32(2)))\n" +
+                "    print(false && side(1))\n" +
+                "    print(true || side(2))\n" +
+                "    print(true && side(3))\n" +
+                "    print(false || side(4))\n" +
+                "}\n",
+        },
+
+        // 2. Floats (f32 / f64), bits, math methods, casts
+        ParityCase {
+            name: "floats_f32_f64",
+            source:
+                "fn main() {\n" +
+                "    a: f64 = 3.5\n" +
+                "    b: f64 = 2.0\n" +
+                "    print(i64((a + b) * 10.0))\n" +
+                "    print(i64((a - b) * 10.0))\n" +
+                "    print(i64((a * b) * 10.0))\n" +
+                "    print(i64((a / b) * 100.0))\n" +
+                "    print(a > b)\n" +
+                "    print(a == 3.5)\n" +
+                "    print((-a) < 0.0)\n" +
+                "    print(i64(a.floor()))\n" +
+                "    print(i64(a.ceil()))\n" +
+                "    print(i64((-a).abs() * 10.0))\n" +
+                "    print(i64(f64(9.0).sqrt()))\n" +
+                "    bits := a.to_bits()\n" +
+                "    rt := f64.from_bits(bits)\n" +
+                "    print(rt == a)\n" +
+                "    c: f32 = 1.5\n" +
+                "    d: f32 = 2.5\n" +
+                "    print(i32(c + d))\n" +
+                "    print(c.is_finite())\n" +
+                "}\n",
+        },
+
+        // 3. Overflow trap (exit 101)
+        ParityCase {
+            name: "trap_overflow",
+            source:
+                "fn add(a: i32, b: i32) -> i32 { a + b }\n" +
+                "fn main() { print(add(2147483647, 1)) }\n",
+        },
+
+        // 4. Div-by-zero trap (exit 102)
+        ParityCase {
+            name: "trap_div_zero",
+            source:
+                "fn div(a: i32, b: i32) -> i32 { a / b }\n" +
+                "fn main() { print(div(10, 0)) }\n",
+        },
+
+        // 5. Bounds trap (exit 103)
+        ParityCase {
+            name: "trap_bounds",
+            source:
+                "fn at(xs: &[]i32, i: i32) -> i32 { xs[i] }\n" +
+                "fn main() { xs: []i32 = [10, 20, 30]; print(at(&xs, 5)) }\n",
+        },
+
+        // 6. Boxed structs, nested structs, &self / &mut self methods
+        ParityCase {
+            name: "structs_boxed_and_methods",
+            source:
+                "struct Counter { label: string, values: []i32, total: i32 }\n" +
+                "impl Counter {\n" +
+                "    fn new(move label: string) -> Counter { Counter { label: move label, values: [], total: 0 } }\n" +
+                "    fn add(&mut self, n: i32) { self.values.push(n); self.total += n }\n" +
+                "    fn summary(&self) -> string { self.label + \":\" + self.total.str() + \"/\" + self.values.len.str() }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    mut c := Counter::new(\"sum\")\n" +
+                "    c.add(10); c.add(20); c.add(12)\n" +
+                "    print(c.summary())\n" +
+                "}\n",
+        },
+
+        // 7. POD inline structs (<= 128B), pass-by-value, return-by-value (sret), tuples
+        ParityCase {
+            name: "structs_pod_inline_and_tuples",
+            source:
+                "struct Vec3 { x: i32, y: i32, z: i32 }\n" +
+                "struct Box2 { lo: Vec3, hi: Vec3 }\n" +
+                "fn add_v(a: Vec3, b: Vec3) -> Vec3 { Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z } }\n" +
+                "fn make_box(n: i32) -> Box2 { Box2 { lo: Vec3 { x: n, y: n + 1, z: n + 2 }, hi: Vec3 { x: n * 2, y: n * 3, z: n * 4 } } }\n" +
+                "fn divmod(a: i32, b: i32) -> (i32, i32) { (a / b, a % b) }\n" +
+                "fn main() {\n" +
+                "    b := make_box(3)\n" +
+                "    s := add_v(b.lo, b.hi)\n" +
+                "    print(s.x); print(s.y); print(s.z)\n" +
+                "    (q, r) := divmod(29, 6)\n" +
+                "    print(q); print(r)\n" +
+                "}\n",
+        },
+
+        // 8. Enums (POD inline + boxed payload) & match (guards, literals, wildcards)
+        ParityCase {
+            name: "enums_and_match",
+            source:
+                "enum Shape { Circle(i32), Rect(i32, i32), Empty }\n" +
+                "enum Msg { Text(string, i32), Ping }\n" +
+                "fn area(s: Shape) -> i32 {\n" +
+                "    match s {\n" +
+                "        .Circle(r) if r > 5 => r * r * 3,\n" +
+                "        .Circle(r) => r * r,\n" +
+                "        .Rect(w, h) => w * h,\n" +
+                "        .Empty => 0,\n" +
+                "    }\n" +
+                "}\n" +
+                "fn fmt_msg(m: &Msg) -> string {\n" +
+                "    match m {\n" +
+                "        .Text(s, n) => s.clone() + \"#\" + n.str(),\n" +
+                "        .Ping => \"ping\",\n" +
+                "    }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    print(area(.Circle(3)))\n" +
+                "    print(area(.Circle(6)))\n" +
+                "    print(area(.Rect(4, 7)))\n" +
+                "    print(area(.Empty))\n" +
+                "    m1 := Msg.Text(\"hi\", 9)\n" +
+                "    m2 := Msg.Ping\n" +
+                "    print(fmt_msg(&m1))\n" +
+                "    print(fmt_msg(&m2))\n" +
+                "}\n",
+        },
+
+        // 9. Option, Result, `?` propagation
+        ParityCase {
+            name: "option_result_try",
+            source:
+                "fn parse_pos(n: i32) -> Result<i32, string> {\n" +
+                "    if n < 0 { return .Err(\"neg\") }\n" +
+                "    .Ok(n * 2)\n" +
+                "}\n" +
+                "fn chain(a: i32, b: i32) -> Result<i32, string> {\n" +
+                "    x := parse_pos(a)?\n" +
+                "    y := parse_pos(b)?\n" +
+                "    .Ok(x + y)\n" +
+                "}\n" +
+                "fn opt_add(a: Option<i32>, b: Option<i32>) -> Option<i32> {\n" +
+                "    x := a?\n" +
+                "    y := b?\n" +
+                "    .Some(x + y)\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    r1 := chain(3, 4)\n" +
+                "    r2 := chain(3, -1)\n" +
+                "    print(r1.is_ok()); print(r1.unwrap())\n" +
+                "    print(r2.is_err()); print(r2.unwrap_or(-99))\n" +
+                "    o1 := opt_add(.Some(10), .Some(25))\n" +
+                "    o2 := opt_add(.Some(10), .None)\n" +
+                "    print(o1.unwrap_or(0)); print(o2.is_none())\n" +
+                "}\n",
+        },
+
+        // 10. Strings & First-class 2-word `&str` (legacy-compatible parity!)
+        ParityCase {
+            name: "strings_and_fat_str",
+            source:
+                "fn first_half(s: &str) -> &str from s {\n" +
+                "    half := s.len / 2\n" +
+                "    &s[0..half]\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    owned := \"hello\" + \"_world\"\n" +
+                "    print(owned)\n" +
+                "    print(owned.len)\n" +
+                "    print(owned == \"hello_world\")\n" +
+                "    h := first_half(owned.as_str())\n" +
+                "    print(h)\n" +
+                "    print(h == \"hello\")\n" +
+                "    t := &owned[6..11]\n" +
+                "    print(t)\n" +
+                "    print(t.clone() + \"!\")\n" +
+                "}\n",
+        },
+
+        // 11. Arrays, slices, POD arrays, fixed arrays, array methods
+        ParityCase {
+            name: "arrays_and_slices",
+            source:
+                "struct Pt { x: i32, y: i32 }\n" +
+                "fn sum_slice(xs: &[]i32) -> i32 {\n" +
+                "    mut acc := 0\n" +
+                "    for i in 0..xs.len { acc += xs[i] }\n" +
+                "    acc\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    mut a: []i32 = [1, 2, 3]\n" +
+                "    a.push(4); a.push(5)\n" +
+                "    print(sum_slice(&a))\n" +
+                "    print(sum_slice(&a[1..4]))\n" +
+                "    a.swap(0, 4)\n" +
+                "    print(a[0]); print(a[4])\n" +
+                "    rm := a.remove(1)\n" +
+                "    print(rm); print(a.len)\n" +
+                "    last := a.pop()\n" +
+                "    print(last)\n" +
+                "    a.truncate(2)\n" +
+                "    print(a.len)\n" +
+                "    mut pts: []Pt = []\n" +
+                "    pts.push(Pt { x: 7, y: 8 })\n" +
+                "    pts.push(Pt { x: 9, y: 10 })\n" +
+                "    p := pts.pop()\n" +
+                "    print(p.x + p.y + pts[0].x)\n" +
+                "    mut fx: [i32; 4] = [3; 4]\n" +
+                "    fx[2] = 99\n" +
+                "    print(fx[0] + fx[2])\n" +
+                "}\n",
+        },
+
+        // 12. Generics & traits
+        ParityCase {
+            name: "generics_and_traits",
+            source:
+                "trait Score { fn score(&self) -> i32 }\n" +
+                "struct Card { v: i32 }\n" +
+                "impl Score for Card { fn score(&self) -> i32 { self.v * 10 } }\n" +
+                "fn pick<T>(cond: bool, a: T, b: T) -> T { if cond { a } else { b } }\n" +
+                "fn main() {\n" +
+                "    print(pick<i32>(true, 11, 22))\n" +
+                "    print(pick<i32>(false, 11, 22))\n" +
+                "    c := Card { v: 7 }\n" +
+                "    print(c.score())\n" +
+                "}\n",
+        },
+
+        // 13. Closures: fn ptr, Fn, FnMut, FnOnce, &Fn, &mut FnMut
+        ParityCase {
+            name: "closures_all_kinds",
+            source:
+                "fn double(x: i32) -> i32 { x * 2 }\n" +
+                "fn apply_fn(f: fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+                "fn apply_ref(f: &Fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+                "fn apply_mut(f: &mut FnMut(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+                "fn apply_once(f: FnOnce() -> i32) -> i32 { f() }\n" +
+                "fn main() {\n" +
+                "    print(apply_fn(double, 21))\n" +
+                "    bias := 10\n" +
+                "    adder := fn[bias](x: i32) -> i32 { x + bias }\n" +
+                "    print(adder(5))\n" +
+                "    print(apply_ref(&adder, 7))\n" +
+                "    mut acc := 0\n" +
+                "    step := fn[&mut acc](d: i32) -> i32 { acc += d; acc }\n" +
+                "    print(apply_mut(&mut step, 3))\n" +
+                "    print(apply_mut(&mut step, 4))\n" +
+                "    print(acc)\n" +
+                "    mut n := 100\n" +
+                "    mut owned := fn[mut n](d: i32) -> i32 { n += d; n }\n" +
+                "    print(owned(5))\n" +
+                "    print(owned(6))\n" +
+                "    s := \"abc\" + \"def\"\n" +
+                "    once := fn[move s]() -> i32 { s.len }\n" +
+                "    print(apply_once(move once))\n" +
+                "}\n",
+        },
+
+        // 14. Control flow, loops, custom Iterator
+        ParityCase {
+            name: "control_flow_and_iterators",
+            source:
+                "struct CounterIter { cur: i32, end: i32 }\n" +
+                "impl Iterator for CounterIter {\n" +
+                "    fn next(&mut self) -> Option<i32> {\n" +
+                "        if self.cur >= self.end { return .None }\n" +
+                "        v := self.cur\n" +
+                "        self.cur += 1\n" +
+                "        .Some(v)\n" +
+                "    }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    mut sum := 0\n" +
+                "    for i in 0..10 {\n" +
+                "        if i % 2 == 0 { continue }\n" +
+                "        if i > 7 { break }\n" +
+                "        sum += i\n" +
+                "    }\n" +
+                "    print(sum)\n" +
+                "    mut w := 0\n" +
+                "    mut k := 1\n" +
+                "    while k <= 5 { w += k; k += 1 }\n" +
+                "    print(w)\n" +
+                "    words: []string = [\"a\", \"bb\", \"ccc\"]\n" +
+                "    mut lens := 0\n" +
+                "    for s in words { lens += s.len }\n" +
+                "    print(lens)\n" +
+                "    mut it_sum := 0\n" +
+                "    mut it := CounterIter { cur: 10, end: 15 }\n" +
+                "    for v in &mut it { it_sum += v }\n" +
+                "    print(it_sum)\n" +
+                "}\n",
+        },
+
+        // 15. defer: LIFO, early return, ? unwind, break, loop flag reset
+        ParityCase {
+            name: "defer_semantics",
+            source:
+                "fn early(flag: bool) -> i32 {\n" +
+                "    defer { print(\"d1\") }\n" +
+                "    if flag { return 7 }\n" +
+                "    defer { print(\"d2\") }\n" +
+                "    9\n" +
+                "}\n" +
+                "fn try_defer(fail: bool) -> Result<i32, i32> {\n" +
+                "    defer { print(\"td\") }\n" +
+                "    r: Result<i32, i32> = if fail { .Err(5) } else { .Ok(8) }\n" +
+                "    v := r?\n" +
+                "    .Ok(v + 1)\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    print(early(true))\n" +
+                "    print(early(false))\n" +
+                "    print(try_defer(true).unwrap_or(-1))\n" +
+                "    print(try_defer(false).unwrap_or(-1))\n" +
+                "    for i in 0..3 {\n" +
+                "        defer { print(i + 100) }\n" +
+                "        if i == 1 { break }\n" +
+                "        defer { print(i + 200) }\n" +
+                "    }\n" +
+                "}\n",
+        },
+
+        // 16. @resource(dispose) definite drops, LIFO order, nested struct, reassignment
+        ParityCase {
+            name: "resource_dispose_definite",
+            source:
+                "@resource(dispose)\n" +
+                "struct Token { id: i32 }\n" +
+                "impl Token {\n" +
+                "    fn dispose(&self) { print(\"drop:\" + self.id.str()) }\n" +
+                "}\n" +
+                "struct Pair { a: Token, b: Token }\n" +
+                "fn main() {\n" +
+                "    t1 := Token { id: 1 }\n" +
+                "    t2 := Token { id: 2 }\n" +
+                "    print(\"mid:\" + t1.id.str() + \",\" + t2.id.str())\n" +
+                "    p := Pair { a: Token { id: 3 }, b: Token { id: 4 } }\n" +
+                "    print(\"pair:\" + p.a.id.str() + \",\" + p.b.id.str())\n" +
+                "}\n",
+        },
+
+        // 17. @resource(dispose) conditional drop flag (LF_DROP_FLAG)
+        ParityCase {
+            name: "resource_dispose_conditional",
+            source:
+                "@resource(dispose)\n" +
+                "struct Guard { id: i32 }\n" +
+                "impl Guard { fn dispose(&self) { print(\"guard:\" + self.id.str()) } }\n" +
+                "fn sink(move g: Guard) { print(\"sink:\" + g.id.str()) }\n" +
+                "fn test(consume: bool, id: i32) {\n" +
+                "    g := Guard { id: id }\n" +
+                "    if consume { sink(move g) }\n" +
+                "    print(\"after:\" + id.str())\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    test(true, 10)\n" +
+                "    test(false, 20)\n" +
+                "}\n",
+        },
+
+        // 18. @resource(dispose) inside enum payload!
+        ParityCase {
+            name: "resource_dispose_enum_payload",
+            source:
+                "@resource(dispose)\n" +
+                "struct Handle { id: i32 }\n" +
+                "impl Handle { fn dispose(&self) { print(\"handle:\" + self.id.str()) } }\n" +
+                "enum Slot { Full(Handle), Empty }\n" +
+                "fn make(active: bool, id: i32) -> Slot {\n" +
+                "    if active { .Full(Handle { id: id }) } else { .Empty }\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    s1 := make(true, 7)\n" +
+                "    s2 := make(false, 8)\n" +
+                "    match &s1 { .Full(h) => print(h.id), .Empty => print(0) }\n" +
+                "    match &s2 { .Full(h) => print(h.id), .Empty => print(-1) }\n" +
+                "}\n",
+        },
+
+        // 19. replace() and swap() on scalars, strings, POD structs, and @resource(dispose)
+        ParityCase {
+            name: "replace_and_swap",
+            source:
+                "@resource(dispose)\n" +
+                "struct Res { id: i32 }\n" +
+                "impl Res { fn dispose(&self) { print(\"res:\" + self.id.str()) } }\n" +
+                "struct Pt { x: i32, y: i32 }\n" +
+                "fn main() {\n" +
+                "    mut a := 10; mut b := 20\n" +
+                "    swap(&mut a, &mut b)\n" +
+                "    print(a); print(b)\n" +
+                "    old_a := replace(&mut a, 99)\n" +
+                "    print(old_a); print(a)\n" +
+                "    mut p1 := Pt { x: 1, y: 2 }; mut p2 := Pt { x: 3, y: 4 }\n" +
+                "    swap(&mut p1, &mut p2)\n" +
+                "    print(p1.x); print(p2.y)\n" +
+                "    mut r := Res { id: 1 }\n" +
+                "    prev := replace(&mut r, Res { id: 2 })\n" +
+                "    print(\"prev:\" + prev.id.str() + \",cur:\" + r.id.str())\n" +
+                "}\n",
+        },
+
+        // 20. Region bump arena
+        ParityCase {
+            name: "region_bump_arena",
+            source:
+                "fn compute(n: i32) -> i32 {\n" +
+                "    mut total := 0\n" +
+                "    region scratch(4096) {\n" +
+                "        mut buf: []i32 = scratch.alloc(n)\n" +
+                "        buf[0] = 7\n" +
+                "        total = buf.len + buf[0]\n" +
+                "    }\n" +
+                "    total\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    print(compute(16))\n" +
+                "    print(compute(64))\n" +
+                "}\n",
+        },
+
+        // 21. Wave 2B @link extern "C" (strlen)
+        ParityCase {
+            name: "extern_c_strlen",
+            source:
+                "capability unsafe\n" +
+                "@link(\"c\")\n" +
+                "extern \"C\" {\n" +
+                "    fn strlen(s: *const i8) -> usize\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    s := c\"dunder-v2\"\n" +
+                "    n := unsafe { strlen(s.as_ptr()) }\n" +
+                "    print(n)\n" +
+                "}\n",
+        },
+
+        // 22. Recursion + closures in structs
+        ParityCase {
+            name: "recursion_and_fn_fields",
+            source:
+                "struct Ops { f: fn(i32) -> i32 }\n" +
+                "fn fib(n: i32) -> i32 { if n <= 1 { return n }; fib(n - 1) + fib(n - 2) }\n" +
+                "fn inc(x: i32) -> i32 { x + 1 }\n" +
+                "fn main() {\n" +
+                "    print(fib(10))\n" +
+                "    ops := Ops { f: inc }\n" +
+                "    print(ops.f(41))\n" +
+                "}\n",
+        },
+
+        // 23. > 8 arguments (register + stack spill ABI)
+        ParityCase {
+            name: "many_args_over_8",
+            source:
+                "fn sum10(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32, i: i32, j: i32) -> i32 {\n" +
+                "    a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    print(sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))\n" +
+                "}\n",
+        },
+
+        // 24. stderr via extern "C" write(2, ...) + assert passing
+        ParityCase {
+            name: "stderr_and_assert_ok",
+            source:
+                "capability unsafe\n" +
+                "@link(\"c\")\n" +
+                "extern \"C\" {\n" +
+                "    @link_name(\"write\")\n" +
+                "    fn c_write(fd: i32, buf: *const i8, n: usize) -> i64\n" +
+                "}\n" +
+                "fn main() {\n" +
+                "    assert(2 + 2 == 4)\n" +
+                "    print(\"out-line\")\n" +
+                "    msg := c\"err-line\\n\"\n" +
+                "    _ := unsafe { c_write(2, msg.as_ptr(), usize(9)) }\n" +
+                "}\n",
+        },
+
+        // 25. assert failure trap (exit 104)
+        ParityCase {
+            name: "trap_assert_fail",
+            source:
+                "fn main() {\n" +
+                "    assert(1 == 2)\n" +
+                "}\n",
+        },
+    ]
+}
+
+fn run_batch(jobs: &[]CmdJob, max_workers: i32) -> []RunOut {
+    mut results: []RunOut = []
+    for _ in 0..jobs.len { results.push(empty_out()) }
+    if jobs.len == 0 { return results }
+
+    mut pool_cap := max_workers
+    if pool_cap < 2 { pool_cap = 2 }
+    if pool_cap > 8 { pool_cap = 8 }
+    mut pool := process.ChildSet::new(pool_cap)
+    mut slot_job: []i32 = []
+    mut slot_start: []i64 = []
+    mut slot_out: []string = []
+    mut slot_err: []string = []
+    for _ in 0..pool_cap {
+        slot_job.push(-1); slot_start.push(0); slot_out.push(""); slot_err.push("")
+    }
+
+    mut next_idx := 0
+    mut completed := 0
+    mut raw_out: []u8 = []
+    mut raw_err: []u8 = []
+
+    while completed < jobs.len {
+        while next_idx < jobs.len && pool.len() < pool_cap {
+            j := next_idx
+            mut args_copy: []string = []
+            for a in &jobs[j].args { args_copy.push(a.clone()) }
+            mut cmd := process.Command::new(jobs[j].prog.clone(), move args_copy)
+            sp := cmd.spawn()
+            if sp.is_err() {
+                if pool.len() > 0 { break }
+                results[j] = RunOut { done: true, code: -1, signal: 0, timed_out: false, stdout_s: "", stderr_s: "spawn failed" }
+                completed += 1
+                next_idx += 1
+                continue
+            }
+            mut child := sp.unwrap()
+            slot := pool.insert(&mut child)
+            assert(slot >= 0)
+            slot_job[slot] = j
+            slot_start[slot] = sys.now_ms()
+            slot_out[slot] = ""
+            slot_err[slot] = ""
+            next_idx += 1
+        }
+        if pool.len() == 0 { continue }
+        _ := pool.poll_io(5)
+        now := sys.now_ms()
+        for slot in 0..pool_cap {
+            if !pool.is_active(slot) { continue }
+            j := slot_job[slot]
+            raw_out.clear(); raw_err.clear()
+            mut w := pool.try_wait(slot, &mut raw_out, &mut raw_err)
+            if !w.exited && now - slot_start[slot] >= i64(30000) {
+                w = pool.kill_reap(slot, &mut raw_out, &mut raw_err)
+            }
+            if raw_out.len > 0 { slot_out[slot] += bytes.decode(&raw_out).unwrap_or_default() }
+            if raw_err.len > 0 { slot_err[slot] += bytes.decode(&raw_err).unwrap_or_default() }
+            if w.exited {
+                completed += 1
+                results[j] = RunOut {
+                    done: true, code: w.code, signal: w.signal, timed_out: w.timed_out,
+                    stdout_s: slot_out[slot].clone(), stderr_s: slot_err[slot].clone(),
+                }
+                slot_job[slot] = -1
+            }
+        }
+    }
+    results
+}
+
+fn main() -> i32 {
+    t0 := sys.now_ms()
+    empty_opts: []cli.Option = []
+    args := cli.parse(&empty_opts)
+    compiler := cli.compiler(&args, "usage: test_build_v2 <compiler>")
+    if compiler == "" { return 2 }
+    work := f"/tmp/dunder-build-v2-{sys.pid()}"
+    if !sys.mkdir(work).ok && !sys.metadata(work).is_dir {
+        _ := harness.fail(f"cannot create {work}")
+        return 1
+    }
+    defer { _ := fs.remove_all(work) }
+
+    cases := parity_cases()
+    mut src_paths: []string = []
+    mut leg_bins: []string = []
+    mut v2_bins: []string = []
+    for i in 0..cases.len {
+        sp := f"{work}/{cases[i].name}.ddr"
+        if !sys.write_text(sp, cases[i].source).ok { _ := harness.fail(f"cannot write {sp}"); return 1 }
+        src_paths.push(move sp)
+        leg_bins.push(f"{work}/{cases[i].name}.legacy")
+        v2_bins.push(f"{work}/{cases[i].name}.v2")
+    }
+
+    cross_src := f"{work}/cross_smoke.ddr"
+    cross_code := "fn add(a: i32, b: i32) -> i32 { a + b }\n" +
+        "fn main() { print(add(20, 22)) }\n"
+    if !sys.write_text(cross_src, cross_code).ok { _ := harness.fail("cannot write cross_smoke.ddr"); return 1 }
+    x86_bin := f"{work}/cross_smoke.x86_64"
+    wasm_bin := f"{work}/cross_smoke.wasm"
+
+    // V2-only first-class 2-word &str aggregate return check (Result<&str, i32> & struct Span { head: &str, tail: &str }!)
+    fat_src := f"{work}/v2_first_class_views.ddr"
+    fat_code := "struct Span { head: &str, tail: &str }\n" +
+        "fn split_mid(s: &str) -> Span from s {\n" +
+        "    half := s.len / 2\n" +
+        "    Span { head: &s[0..half], tail: &s[half..s.len] }\n" +
+        "}\n" +
+        "fn non_empty(s: &str) -> Result<&str, i32> from s {\n" +
+        "    if s.len == 0 { return .Err(-1) }\n" +
+        "    .Ok(&s[1..s.len])\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    owned := \"hello\" + \"_world\"\n" +
+        "    sp := split_mid(owned.as_str())\n" +
+        "    print(sp.head)\n" +
+        "    print(sp.tail)\n" +
+        "    match non_empty(owned.as_str()) { .Ok(v) => print(v), .Err(e) => print(e) }\n" +
+        "    match non_empty(\"\".as_str()) { .Ok(v) => print(v), .Err(e) => print(e) }\n" +
+        "}\n"
+    if !sys.write_text(fat_src, fat_code).ok { _ := harness.fail("cannot write v2_first_class_views.ddr"); return 1 }
+    fat_bin := f"{work}/v2_first_class_views.v2"
+
+    // Phase 1: Parallel build (legacy + --build-v2 + v2-views + x86_64-linux + wasm32)
+    mut build_jobs: []CmdJob = []
+    for i in 0..cases.len {
+        build_jobs.push(CmdJob {
+            kind: 0, case_idx: i, prog: compiler.clone(),
+            args: ["build", src_paths[i].clone(), "-o", leg_bins[i].clone(), "--jobs", "1"],
+        })
+        build_jobs.push(CmdJob {
+            kind: 1, case_idx: i, prog: compiler.clone(),
+            args: ["build", "--build-v2", src_paths[i].clone(), "-o", v2_bins[i].clone(), "--jobs", "1"],
+        })
+    }
+    build_jobs.push(CmdJob {
+        kind: 6, case_idx: -1, prog: compiler.clone(),
+        args: ["build", "--build-v2", fat_src.clone(), "-o", fat_bin.clone(), "--jobs", "1"],
+    })
+    build_jobs.push(CmdJob {
+        kind: 4, case_idx: -1, prog: compiler.clone(),
+        args: ["build", "--build-v2", "--target", "x86_64-linux", cross_src.clone(), "-o", x86_bin.clone(), "--jobs", "1"],
+    })
+    build_jobs.push(CmdJob {
+        kind: 5, case_idx: -1, prog: compiler.clone(),
+        args: ["build", "--build-v2", "--target", "wasm32", cross_src.clone(), "-o", wasm_bin.clone(), "--jobs", "1"],
+    })
+
+    workers := process.host_cpus()
+    build_res := run_batch(&build_jobs, workers)
+    mut failed := 0
+    mut built_ok: []bool = []
+    for _ in 0..cases.len { built_ok.push(true) }
+
+    for bi in 0..build_jobs.len {
+        j := &build_jobs[bi]
+        r := &build_res[bi]
+        if r.timed_out || r.signal != 0 || r.code != 0 {
+            if j.case_idx >= 0 { built_ok[j.case_idx] = false }
+            tag := if j.kind == 0 { "legacy-build" } else if j.kind == 1 { "v2-build" } else if j.kind == 4 { "cross-x86_64-linux" } else { "cross-wasm32" }
+            cname := if j.case_idx >= 0 { cases[j.case_idx].name.clone() } else { tag.clone() }
+            _ := harness.fail(f"{cname} ({tag}): exit={r.code} sig={r.signal}\nstdout:\n{r.stdout_s}\nstderr:\n{r.stderr_s}")
+            failed += 1
+        }
+    }
+
+    // Verify cross-build binary magic headers
+    if failed == 0 {
+        x86_bytes := sys.read_u8(x86_bin)
+        if !x86_bytes.ok {
+            _ := harness.fail("cross-x86_64-linux: missing output binary")
+            failed += 1
+        } else {
+            xb := x86_bytes.value
+            if xb.len < 64 || xb[0] != 127 || xb[1] != 69 || xb[2] != 76 || xb[3] != 70 {
+                _ := harness.fail("cross-x86_64-linux: invalid ELF magic")
+                failed += 1
+            }
+        }
+        wasm_bytes := sys.read_u8(wasm_bin)
+        if !wasm_bytes.ok {
+            _ := harness.fail("cross-wasm32: missing output binary")
+            failed += 1
+        } else {
+            wb := wasm_bytes.value
+            if wb.len < 8 || wb[0] != 0 || wb[1] != 97 || wb[2] != 115 || wb[3] != 109 {
+                _ := harness.fail("cross-wasm32: invalid WASM magic")
+                failed += 1
+            }
+        }
+    }
+
+    // Phase 2: Parallel execution of all successfully built legacy & v2 binaries (+ v2-first-class-views)
+    mut run_jobs: []CmdJob = []
+    for i in 0..cases.len {
+        if !built_ok[i] { continue }
+        run_jobs.push(CmdJob { kind: 2, case_idx: i, prog: leg_bins[i].clone(), args: [] })
+        run_jobs.push(CmdJob { kind: 3, case_idx: i, prog: v2_bins[i].clone(), args: [] })
+    }
+    fat_run_idx := run_jobs.len
+    if failed == 0 {
+        run_jobs.push(CmdJob { kind: 6, case_idx: -1, prog: fat_bin.clone(), args: [] })
+    }
+    run_res := run_batch(&run_jobs, workers)
+
+    mut leg_idx: []i32 = []
+    mut v2_idx: []i32 = []
+    for _ in 0..cases.len { leg_idx.push(-1); v2_idx.push(-1) }
+    for ri in 0..run_jobs.len {
+        ci := run_jobs[ri].case_idx
+        if run_jobs[ri].kind == 2 { leg_idx[ci] = ri }
+        else if run_jobs[ri].kind == 3 { v2_idx[ci] = ri }
+    }
+
+    if failed == 0 && fat_run_idx < run_res.len {
+        fr := &run_res[fat_run_idx]
+        expected_fat := "hello\n_world\nello_world\n-1\n"
+        if fr.timed_out || fr.signal != 0 || fr.code != 0 || fr.stdout_s != expected_fat || fr.stderr_s != "" {
+            _ := harness.fail(f"v2_first_class_views: exit={fr.code} sig={fr.signal} stdout={fr.stdout_s} stderr={fr.stderr_s}")
+            failed += 1
+        }
+    }
+
+    mut passed := 0
+    for i in 0..cases.len {
+        if !built_ok[i] { continue }
+        rl := &run_res[leg_idx[i]]
+        rv := &run_res[v2_idx[i]]
+        is_trap := rl.code >= 101 && rl.code <= 106
+        stderr_ok := is_trap || rl.stderr_s == rv.stderr_s
+        if rl.timed_out || rv.timed_out || rl.signal != rv.signal || rl.code != rv.code ||
+            rl.stdout_s != rv.stdout_s || !stderr_ok {
+            _ := harness.fail(
+                f"{cases[i].name}: PARITY MISMATCH!\n" +
+                f"  legacy: exit={rl.code} sig={rl.signal} stdout={rl.stdout_s} stderr={rl.stderr_s}\n" +
+                f"  v2:     exit={rv.code} sig={rv.signal} stdout={rv.stdout_s} stderr={rv.stderr_s}"
+            )
+            failed += 1
+        } else {
+            passed += 1
+        }
+    }
+
+    elapsed := sys.now_ms() - t0
+    if failed > 0 { return 1 }
+    print(f"build-v2 parity ok: {passed}/{cases.len} runtime cases + 2 cross-targets (x86_64-linux, wasm32) matched legacy identically in {elapsed}ms on {process.host_target()}")
+    0
+}
