@@ -21,6 +21,7 @@ struct DeferInfo {
     exit_bb: i32,
     route_vals: []i64,
     route_bbs: []i32,
+    route_run_bbs: []i32,
     loop_depth: i32,
 }
 
@@ -185,6 +186,7 @@ fn emit_unwind_to(b: &mut Builder, types: &ht.TypeTable, stop_depth: i32, final_
                 route_id := b.defers[di].route_vals.len
                 b.defers[di].route_vals.push(i64(route_id))
                 b.defers[di].route_bbs.push(resume_bb)
+                b.defers[di].route_run_bbs.push(run_bb)
                 flag_pl := mb.add_local_place(&mut b.body, b.defers[di].flag_local)
                 flag_op := mb.add_op(&mut b.body, .Copy, flag_pl)
                 vals: []i64 = [1]
@@ -195,18 +197,13 @@ fn emit_unwind_to(b: &mut Builder, types: &ht.TypeTable, stop_depth: i32, final_
                     callee: -1, sig_ty: -1, arg_start: sw_start, arg_len: 1,
                     in_unsafe: b.in_unsafe, span_start: start, span_end: end,
                 })
-                // In run_bb: set unwind_target = route_id, reset flag, jump to shared defer_bb!
+                // In run_bb: set unwind_target = route_id and reset flag; terminator is wired when lowering defer!
                 _ := mb.push_stmt(&mut b.body, run_bb, mb.MirStmt {
                     kind: .SetDeferActive, place: b.defers[di].flag_local, rvalue: -1, aux: 0,
                     in_unsafe: b.in_unsafe, span_start: start, span_end: end,
                 })
                 _ := mb.push_stmt(&mut b.body, run_bb, mb.MirStmt {
                     kind: .SetUnwindTarget, place: b.defers[di].unwind_local, rvalue: -1, aux: route_id,
-                    in_unsafe: b.in_unsafe, span_start: start, span_end: end,
-                })
-                _ := mb.set_term(&mut b.body, run_bb, mb.MirTerm {
-                    kind: .Goto, call_kind: .Direct, target_bb: b.defers[di].entry_bb, place_or_op: -1,
-                    callee: -1, sig_ty: -1, arg_start: 0, arg_len: 0,
                     in_unsafe: b.in_unsafe, span_start: start, span_end: end,
                 })
                 b.cur_bb = resume_bb
@@ -620,10 +617,14 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt { kind: .Assign, place: pl_b, rvalue: rv_b, aux: 0, in_unsafe: b.in_unsafe, span_start: e.span_start, span_end: e.span_end })
     } else if e.kind == .Try {
         // Early-return `?` on Result/Option: unwinds all scopes LIFO on Err/None branch!
-        sub_op := lower_expr_to_op(&mut b, &prog, &f, e.a)
+        sub_ty := f.exprs[e.a].ty
+        sub_tmp := new_temp(&mut b, &prog.types, sub_ty, e.span_start, e.span_end)
+        sub_pl := mb.add_local_place(&mut b.body, sub_tmp)
+        lower_expr_into(&mut b, &prog, &f, e.a, sub_pl)
         discr_loc := new_temp(&mut b, &prog.types, ht.TY_I32, e.span_start, e.span_end)
         discr_pl := mb.add_local_place(&mut b.body, discr_loc)
-        rv := mb.add_rvalue(&mut b.body, .Discriminant, ht.TY_I32, sub_op, -1, &empty_ops)
+        sub_copy_op := mb.add_op(&mut b.body, .Copy, sub_pl)
+        rv := mb.add_rvalue(&mut b.body, .Discriminant, ht.TY_I32, sub_copy_op, -1, &empty_ops)
         _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
             kind: .Assign, place: discr_pl, rvalue: rv, aux: 0, in_unsafe: b.in_unsafe,
             span_start: e.span_start, span_end: e.span_end,
@@ -639,15 +640,39 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
             callee: -1, sig_ty: -1, arg_start: sw_start, arg_len: 1,
             in_unsafe: b.in_unsafe, span_start: e.span_start, span_end: e.span_end,
         })
-        // Err path: assign _ret (if ret_ty != Unit) and unwind all scopes LIFO -> Return
+        // Err path: assign _ret and unwind all scopes LIFO -> Return
         b.cur_bb = err_bb; b.terminated = false
         ret_pl := mb.add_local_place(&mut b.body, 0)
-        if b.body.ret_ty == f.exprs[e.a].ty {
-            rv_err := mb.add_rvalue(&mut b.body, .Use, b.body.ret_ty, sub_op, -1, &empty_ops)
+        if b.body.ret_ty == sub_ty {
+            sub_mv_op := mb.add_op(&mut b.body, if ht.is_copy(&prog.types, sub_ty) { .Copy } else { .Move }, sub_pl)
+            rv_err := mb.add_rvalue(&mut b.body, .Use, b.body.ret_ty, sub_mv_op, -1, &empty_ops)
             _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
                 kind: .Assign, place: ret_pl, rvalue: rv_err, aux: 0, in_unsafe: b.in_unsafe,
                 span_start: e.span_start, span_end: e.span_end,
             })
+        } else if b.body.ret_ty >= 0 && b.body.ret_ty < prog.types.entries.len &&
+            prog.types.entries[b.body.ret_ty].kind == .Enum &&
+            prog.types.entries[b.body.ret_ty].count >= 2 {
+            // Repackage Err(err_payload) or None into caller's Result<T2, E> / Option<T2>!
+            ret_v1 := &prog.types.variants[prog.types.entries[b.body.ret_ty].inner_a + 1]
+            mut err_ops: []i32 = []
+            if ret_v1.payload_count == 1 && sub_ty >= 0 && sub_ty < prog.types.entries.len &&
+                prog.types.entries[sub_ty].kind == .Enum && prog.types.entries[sub_ty].count >= 2 {
+                sub_err_ty := ht.variant_payload_type(&prog.types, sub_ty, 1, 0)
+                ret_err_ty := ht.variant_payload_type(&prog.types, b.body.ret_ty, 1, 0)
+                if sub_err_ty >= 0 && sub_err_ty == ret_err_ty {
+                    dc_e := mb.add_projected_place(&mut b.body, sub_pl, .Downcast, 1, sub_ty)
+                    pay_e := mb.add_projected_place(&mut b.body, dc_e, .Field, 0, sub_err_ty)
+                    err_ops.push(mb.add_op(&mut b.body, if ht.is_copy(&prog.types, sub_err_ty) { .Copy } else { .Move }, pay_e))
+                }
+            }
+            if err_ops.len == ret_v1.payload_count {
+                rv_err := mb.add_rvalue(&mut b.body, .Aggregate, b.body.ret_ty, 1, 0, &err_ops)
+                _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+                    kind: .Assign, place: ret_pl, rvalue: rv_err, aux: 0, in_unsafe: b.in_unsafe,
+                    span_start: e.span_start, span_end: e.span_end,
+                })
+            }
         }
         ret_bb := mb.add_block(&mut b.body, 0)
         emit_unwind_to(&mut b, &prog.types, 0, ret_bb, e.span_start, e.span_end)
@@ -657,16 +682,14 @@ fn lower_expr_into(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, expr_id:
         })
         // Ok path: extract payload 0 into dest_place
         b.cur_bb = ok_bb; b.terminated = false
-        if b.body.ops[sub_op].kind != .Const {
-            dc := mb.add_projected_place(&mut b.body, b.body.ops[sub_op].id, .Downcast, 0, f.exprs[e.a].ty)
-            pay := mb.add_projected_place(&mut b.body, dc, .Field, 0, e.ty)
-            p_op := mb.add_op(&mut b.body, if ht.is_copy(&prog.types, e.ty) { .Copy } else { .Move }, pay)
-            rv_ok := mb.add_rvalue(&mut b.body, .Use, e.ty, p_op, -1, &empty_ops)
-            _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
-                kind: .Assign, place: dest_place, rvalue: rv_ok, aux: 0, in_unsafe: b.in_unsafe,
-                span_start: e.span_start, span_end: e.span_end,
-            })
-        }
+        dc := mb.add_projected_place(&mut b.body, sub_pl, .Downcast, 0, sub_ty)
+        pay := mb.add_projected_place(&mut b.body, dc, .Field, 0, e.ty)
+        p_op := mb.add_op(&mut b.body, if ht.is_copy(&prog.types, e.ty) { .Copy } else { .Move }, pay)
+        rv_ok := mb.add_rvalue(&mut b.body, .Use, e.ty, p_op, -1, &empty_ops)
+        _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
+            kind: .Assign, place: dest_place, rvalue: rv_ok, aux: 0, in_unsafe: b.in_unsafe,
+            span_start: e.span_start, span_end: e.span_end,
+        })
     }
     b.in_unsafe = prev_unsafe
 }
@@ -683,23 +706,30 @@ fn lower_pat_bind(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirFn, pat_id: i
         })
         dst_pl := mb.add_local_place(&mut b.body, ml)
         pty := b.body.places[subj_pl].ty
-        op_k: mb.OpKind = if (is_move || pat.is_move_bind) && !ht.is_copy(&prog.types, pty) { .Move } else if ht.is_copy(&prog.types, pty) { .Copy } else { .Move }
+        do_move := (is_move || pat.is_move_bind) && !ht.is_copy(&prog.types, pty)
+        op_k: mb.OpKind = if do_move { .Move } else { .Copy }
         op := mb.add_op(&mut b.body, op_k, subj_pl)
         rv := mb.add_rvalue(&mut b.body, .Use, pty, op, -1, &empty_ops)
         _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
             kind: .Assign, place: dst_pl, rvalue: rv, aux: 0, in_unsafe: b.in_unsafe,
             span_start: pat.span_start, span_end: pat.span_end,
         })
-        register_scope_local(&mut b, &prog.types, ml)
+        if do_move {
+            register_scope_local(&mut b, &prog.types, ml)
+        } else {
+            b.scope_all_locals.push(ml)
+        }
     } else if pat.kind == .Variant {
         subj_ty := b.body.places[subj_pl].ty
-        dc := mb.add_projected_place(&mut b.body, subj_pl, .Downcast, pat.tag, subj_ty)
-        for i in 0..pat.child_len {
-            cid := f.pat_list[pat.child_start + i]
-            pty := ht.variant_payload_type(&prog.types, subj_ty, pat.tag, i)
-            if pty >= 0 {
-                pay := mb.add_projected_place(&mut b.body, dc, .Field, i, pty)
-                lower_pat_bind(&mut b, &prog, &f, cid, pay, is_move)
+        if subj_ty >= 0 && subj_ty < prog.types.entries.len && prog.types.entries[subj_ty].kind == .Enum {
+            dc := mb.add_projected_place(&mut b.body, subj_pl, .Downcast, pat.tag, subj_ty)
+            for i in 0..pat.child_len {
+                cid := f.pat_list[pat.child_start + i]
+                pty := ht.variant_payload_type(&prog.types, subj_ty, pat.tag, i)
+                if pty >= 0 {
+                    pay := mb.add_projected_place(&mut b.body, dc, .Field, i, pty)
+                    lower_pat_bind(&mut b, &prog, &f, cid, pay, is_move)
+                }
             }
         }
     } else if pat.kind == .Tuple {
@@ -746,7 +776,6 @@ fn lower_block_stmt_with_tail(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirF
             unwind_loc := mb.add_local(&mut b.body, &prog.types, "_defer_route_" + b.defers.len.str(),
                 ht.TY_I32, sid, mb.LF_TEMP.bit_or(mb.LF_MUT), st.span_start, st.span_end)
             entry_bb := mb.add_block(&mut b.body, sid)
-            exit_bb := mb.add_block(&mut b.body, sid)
             _ := mb.push_stmt(&mut b.body, b.cur_bb, mb.MirStmt {
                 kind: .SetDeferActive, place: flag_loc, rvalue: -1, aux: 0,
                 in_unsafe: b.in_unsafe, span_start: st.span_start, span_end: st.span_end,
@@ -759,9 +788,10 @@ fn lower_block_stmt_with_tail(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirF
                 flag_local: flag_loc,
                 unwind_local: unwind_loc,
                 entry_bb: entry_bb,
-                exit_bb: exit_bb,
+                exit_bb: -1,
                 route_vals: [],
                 route_bbs: [],
+                route_run_bbs: [],
                 loop_depth: b.loops.len,
             })
             block_defers.push(di)
@@ -797,37 +827,41 @@ fn lower_block_stmt_with_tail(b: &mut Builder, prog: &hb.HirProgram, f: &hb.HirF
         after_bb = mb.add_block(&mut b.body, if b.scope_stack.len > 1 { b.scope_stack[depth - 1] } else { 0 })
         emit_unwind_to(&mut b, &prog.types, depth, after_bb, st.span_start, st.span_end)
     }
-    // Lower each shared defer_bb body ONCE and wire its SwitchInt exit to all collected routes!
+    // Lower each defer body per route so init/borrow analysis stays path-sensitive across normal vs early returns!
     for di_idx in 0..block_defers.len {
         di := block_defers[di_idx]
         saved_bb := b.cur_bb; saved_term := b.terminated
-        b.cur_bb = b.defers[di].entry_bb
-        b.terminated = false
         d_stmt := &f.stmts[b.defers[di].hir_stmt]
-        for j in 0..d_stmt.stmt_len {
-            lower_stmt(&mut b, &prog, &f, f.stmt_list[d_stmt.stmt_start + j])
-        }
-        if !b.terminated { emit_goto(&mut b, b.defers[di].exit_bb, d_stmt.span_start, d_stmt.span_end) }
         r_cnt := b.defers[di].route_bbs.len
         if r_cnt == 0 {
-            _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
-                kind: .Return, call_kind: .Direct, target_bb: -1, place_or_op: -1, callee: -1, sig_ty: -1,
-                arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
-            })
-        } else if r_cnt == 1 {
-            _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
-                kind: .Goto, call_kind: .Direct, target_bb: b.defers[di].route_bbs[0], place_or_op: -1, callee: -1, sig_ty: -1,
-                arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
-            })
+            b.cur_bb = b.defers[di].entry_bb
+            b.terminated = false
+            for j in 0..d_stmt.stmt_len {
+                lower_stmt(&mut b, &prog, &f, f.stmt_list[d_stmt.stmt_start + j])
+            }
+            if !b.terminated {
+                _ := mb.set_term(&mut b.body, b.cur_bb, mb.MirTerm {
+                    kind: .Return, call_kind: .Direct, target_bb: -1, place_or_op: -1, callee: -1, sig_ty: -1,
+                    arg_start: 0, arg_len: 0, in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
+                })
+            }
         } else {
-            u_pl := mb.add_local_place(&mut b.body, b.defers[di].unwind_local)
-            u_op := mb.add_op(&mut b.body, .Copy, u_pl)
-            sw_start := mb.push_switch_targets(&mut b.body, &b.defers[di].route_vals, &b.defers[di].route_bbs)
-            _ := mb.set_term(&mut b.body, b.defers[di].exit_bb, mb.MirTerm {
-                kind: .SwitchInt, call_kind: .Direct, target_bb: b.defers[di].route_bbs[0],
-                place_or_op: u_op, callee: -1, sig_ty: -1, arg_start: sw_start, arg_len: r_cnt,
-                in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
-            })
+            for ri in 0..r_cnt {
+                d_bb := if ri == 0 { b.defers[di].entry_bb } else { mb.add_block(&mut b.body, sid) }
+                run_bb := b.defers[di].route_run_bbs[ri]
+                res_bb := b.defers[di].route_bbs[ri]
+                _ := mb.set_term(&mut b.body, run_bb, mb.MirTerm {
+                    kind: .Goto, call_kind: .Direct, target_bb: d_bb, place_or_op: -1,
+                    callee: -1, sig_ty: -1, arg_start: 0, arg_len: 0,
+                    in_unsafe: b.in_unsafe, span_start: d_stmt.span_start, span_end: d_stmt.span_end,
+                })
+                b.cur_bb = d_bb
+                b.terminated = false
+                for j in 0..d_stmt.stmt_len {
+                    lower_stmt(&mut b, &prog, &f, f.stmt_list[d_stmt.stmt_start + j])
+                }
+                if !b.terminated { emit_goto(&mut b, res_bb, d_stmt.span_start, d_stmt.span_end) }
+            }
         }
         b.cur_bb = saved_bb; b.terminated = saved_term
     }
