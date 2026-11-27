@@ -1,5 +1,17 @@
 # Nästa steg för Dunder
 
+## Minnessäkerhet, lån och ny IR inför 1.0
+
+**Fas 0 (`0.13.2`, verifierad i `07c7c6e`)** är genomförd och incheckad: de tolv bekräftade minnessäkerhetshålen i frontenden, `std.alloc`-inkapslingen, `unsafe fn` för råa filbeskrivare i `sys.net_*`, `Sync` och `unsafe impl Sendable`/`Sync`, trådsäkra per-tråd-callbackramar, Windows `VirtualAlloc`/`VirtualFree` i `std.sync`/`std.net` samt begränsad `TYPE_DESC_TABLE` i stället för negativ RC-hoppadress är åtgärdade och verifierade på `arm64-macos` (88/88 sviter), `arm64-linux` och `x86_64-linux` i Kiri (84/84 sviter) samt med 0/58 intrång i rödteamsproven. [Arkitekturspecifikation](memory-safety-1.0.md) · [Fas 0-regressioner](../tools/test_phase0_soundness.ddr)
+
+För att lämna beta och nå en 1.0-garanti utan GC ersätts den enkelpassbaserade token-kompilatorn (`compile.ddr`) och den ARM64-lyfta MIR-kedjan stegvis med en enkelriktad pipeline samtidigt som byteidentisk självhosting och samtliga sex mål hålls gröna i varje steg:
+
+1. **Fas 1 (`0.14`) — Fullständigt AST, typad HIR och HL-MIR (`--check-v2`):** Bygg ut `selfhost/frontend/ast.ddr` och `parser.ddr` till en gemensam fullkroppsparser för hela språket, inför `selfhost/hir/` (namnupplösning, typinferens med `ParamMode::BorrowOrCopy`, icke-lånande `Iterator`, closures som typade fångststructar, HIR-monomorfisering och en enad `TypeTable`) samt `selfhost/mir2/` (`mir_build` med delade `defer`-block och LIFO-`ScopeNode`, `mir_verify`, `mir_init`, Polonius-lik `mir_borrowck` med invarians under `&mut` och `dropck` för `@resource(dispose)`, `mir_escape` och `mir_drop_elab`). Validera sidoordnat via `--check-v2` mot `selfhost/`, `stdlib/`, `tests/` och `dunder-hundmat` utan någon engångskodgenerator mot `compile.ddr`.
+2. **Fas 2 (`0.15`) — Tunn HL-MIR → `arm.Code`-brygga och radering av äldre frontend:** Sänk `Post-Drop HL-MIR` via en tunn (~600–900 raders) brygga till befintlig kodgenerering, inför 2-ords `Copy`-vyer `(ptr, len)` för `&str` och `&[]T`, och radera i ett samlat klipp `compile.ddr`, `generics.ddr`, `closures.ddr`, `variant_functions.ddr`, `open_bodies.ddr`, de token-skannande lånetabellerna (`ownership_check`, `local_borrows`, `borrows`, `ownership_lease`, `deferred_blocks`, `scratch`, `borrowed_view`), `mir_owners.ddr` och `selfhost/opt/*`. Förnya därefter bootstrap-fröna.
+3. **Fas 3 (`0.16`) — Måloberoende SSA MIR, enad inliner och runtime-frikoppling:** Sänk `Post-Drop HL-MIR` till typad, måloberoende SSA MIR med uttryckliga `StackSlot(size, align)` och fullständig semantisk `MirVerifier` efter varje pass; ersätt `selfhost/opt/*` och `mir_lift.ddr` med en enad SSA MIR-inliner, SROA/mem2reg, GVN, gränskontrollseliminering och DCE. Porta `backend_emit.ddr`, `runtime.ddr`, `program_emit.ddr`, `task_scope_emit.ddr` och `task_native.ddr` till SSA MIR/`.ddr`, extrahera tillståndslösa `arm64_enc.ddr`/`x86_enc.ddr` och ersätt `mir_link.ddr`:s `arm.Code`-beroende med en måloberoende `ObjectModule`.
+4. **Fas 4 (`0.17`) — Nativ LIR/ISel för ARM64, x86-64 och Wasm:** Sänk SSA MIR direkt till målspecifik LIR och registerallokering — nativ SysV/Win64 på x86-64 (utan `[r15]`-emulering av ARM64-registerbanken) och nativa typade Wasm-lokaler med per-signatur `call_indirect` (utan globalbank `0..31`) — samt uppdatera `fragments.ddr` och `compile_parallel.ddr` till per-funktionscachning av `HIR → MIR → ObjectModule`.
+5. **Fas 5 (`0.18 → 1.0`) — Slutverifiering, speclåsning och 1.0-frön:** Kör fullständig adversariell säkerhetssvit och fuzzing över alla sex mål samt `dunder-hundmat`, synkronisera språk-, FFI-, task- och minnesdokumentationen med 1.0-kontrakten och frys de byteidentiska 1.0-bootstrapfröna.
+
 ## Få privata ändringar under 100 ms vid p95
 
 På Apple M5 tog en privat lövändring 104,33 ms vid p95. En ändring i en privat funktion som inlinades hos 50 anropare tog 131,68 ms. Endast 1 respektive 51 av 1 042 funktioner byggdes om. Mät hur mycket av tiden som går åt till att läsa och namnupplösa oförändrade moduler och till att länka om deras kod. Följ även ändrade strängliteraler i de verkliga projekten. [Projektmätningar och rådata](../benchmarks/compiler/2026-11-25-project-builds/README.md)
@@ -34,6 +46,10 @@ Kör `dunder run tests/fixtures/local-calendar.ddr -- UTC` på Windows. Ange vä
 ## Mät tidsgränser över systemvila
 
 Kör `dunder run tools/clock_suspend.ddr`, låt datorn gå i vila och tryck på Retur efter väckningen. Spara väggtid, `Deadline` och `Raw` från samma intervall tillsammans med operativsystem och uppmätt tid i vila. [Mätprogram](../tools/clock_suspend.ddr) · [Klockkontrakt](standard.md)
+
+## Genomfört den 26 november 2026
+
+- **Fas 0 för minnessäkerhet och samtidighet (`07c7c6e`)**: stängde alias- och lånehål i `Option<&mut T>`, `&mut`-aliasmutationer, tillfälliga lånande iteratorer, `&str`-jämförelser, `defer` vid tidig retur/`?`/`break`/`continue`, `task scope`-stängning före yttre `defer`, `@resource(dispose)`-destrukturering utanför `unsafe`, kloning av `Fn` som fångar `@resource` samt `E4005`-kontroll genom closures; kapslade `std.alloc` som `pub opaque struct`, markerade råa FD-anrop i `sys.net_*` som `unsafe fn`, införde `Sync` och `unsafe impl Sendable`/`Sync` med `T: Sendable + Sync` för `Published<T>` och delade task-scopes, ersatte negativ RC-hoppadress med begränsad `TYPE_DESC_TABLE`, flyttade Windows `sync_mmap`/`waker_mmap` till `VirtualAlloc`/`VirtualFree` och isolerade FFI-callbackramar per tråd. Verifierat över `arm64-macos` (88/88), `arm64-linux` (84/84) och `x86_64-linux` (84/84) med 3-stegs byteidentisk självhosting. [Arkitekturspecifikation](memory-safety-1.0.md) · [Fas 0-regressioner](../tools/test_phase0_soundness.ddr)
 
 ## Genomfört den 25 november 2026
 
