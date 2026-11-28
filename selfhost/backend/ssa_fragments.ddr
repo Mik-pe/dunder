@@ -1,0 +1,1136 @@
+// Phase 4D: Per-Function Content-Hash `HIR -> MIR -> SSA -> ObjectModule` Fragment Compiler & Cache
+// (`selfhost/backend/ssa_fragments.ddr`).
+//
+// Features:
+// - Canonical per-function SHA-256 content hashing over HirFn + transitively referenced TypeEntry
+//   layouts/flags + direct callee signatures + referenced constants (ignoring source byte spans).
+// - In-memory and atomic on-disk `.dunder-ssa-cache` fragment cache with magic/version/SHA-256
+//   payload integrity verification.
+// - Per-function compilation through the full Phase 1-4 pipeline (mir_build -> mir_verify ->
+//   mir_init -> mir_borrowck -> mir_drop_elab -> ssa_lower -> ssa_opt -> ssa_verify -> ISel),
+//   skipping unchanged functions and merging fragments via `object_module.merge_fragment`.
+// - Guarantees 100% byte-identical executable output between cold clean builds, warm builds,
+//   disk-restored builds, and incremental rebuilds across ARM64, x86_64, and WASM.
+// ZERO imports of legacy `compile.ddr`, `selfhost/mir/*`, `arm64.ddr`, `x86_mir.ddr`, or `wasm_mir.ddr`.
+
+capability filesystem
+
+import std.bytes as bytes
+import std.fs as fs
+import std.sha256 as sha256
+import sys
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ..mir2.mir_build as mir_build
+import ..mir2.mir_verify as mir_verify
+import ..mir2.mir_init as mir_init
+import ..mir2.mir_borrowck as mir_borrowck
+import ..mir2.mir_drop_elab as mir_drop_elab
+import ..ssa.ssa_ir as ssa
+import ..ssa.ssa_lower as ssa_lower
+import ..ssa.ssa_opt as ssa_opt
+import ..ssa.ssa_verify as ssa_verify
+import object_module as obj
+import arm64_isel
+import x86_isel
+import wasm_isel
+import imports as native_imports
+import macho
+import elf
+import pe
+
+pub const FRAGMENT_MAGIC: i64   = 0x47465344  // "DSFG" little-endian
+pub const FRAGMENT_VERSION: i32 = 1
+
+// =========================================================================
+// Public Cache & Result Types
+// =========================================================================
+
+pub struct FragmentCache {
+    cache_dir: string,
+    disk_enabled: bool,
+    mem_keys: []string,
+    mem_frags: []obj.ObjectModule,
+    wasm_keys: []string,
+    wasm_funcs: []ssa.SsaFunc,
+}
+
+pub struct FnFragmentResult {
+    ok: bool,
+    error: string,
+    hash: string,
+    from_cache: bool,
+    fragment: obj.ObjectModule,
+}
+
+pub struct CachedBuildResult {
+    ok: bool,
+    error: string,
+    module: obj.ObjectModule,
+    executable: []u8,
+    total_fns: i32,
+    cache_hits: i32,
+    cache_misses: i32,
+    recompiled_fn_ids: []i32,
+    fn_hashes: []string,
+    diagnostics: []diag.Diagnostic,
+}
+
+pub fn new_cache(cache_dir: string) -> FragmentCache {
+    FragmentCache {
+        cache_dir: cache_dir.clone(),
+        disk_enabled: cache_dir.len > 0,
+        mem_keys: [],
+        mem_frags: [],
+        wasm_keys: [],
+        wasm_funcs: [],
+    }
+}
+
+pub fn new_memory_cache() -> FragmentCache {
+    new_cache("")
+}
+
+pub fn clear_memory(cache: &mut FragmentCache) {
+    cache.mem_keys.clear()
+    cache.mem_frags.clear()
+    cache.wasm_keys.clear()
+    cache.wasm_funcs.clear()
+}
+
+// =========================================================================
+// Low-Level Byte Encoding / Decoding Helpers
+// =========================================================================
+
+fn put_u8(out: &mut []u8, v: i32) {
+    out.push(u8(v.bit_and(255)))
+}
+
+fn put_bool(out: &mut []u8, v: bool) {
+    out.push(if v { u8(1) } else { u8(0) })
+}
+
+fn put_i32(out: &mut []u8, v: i32) {
+    bytes.append_le(&mut out, i64(v), 4)
+}
+
+fn put_i64(out: &mut []u8, v: i64) {
+    bytes.append_le(&mut out, v, 8)
+}
+
+fn put_str(out: &mut []u8, s: string) {
+    put_i32(&mut out, s.len)
+    if s.len > 0 { bytes.append_utf8(&mut out, s) }
+}
+
+fn put_blob(out: &mut []u8, b: &[]u8) {
+    put_i32(&mut out, b.len)
+    if b.len > 0 { bytes.extend(&mut out, &b) }
+}
+
+struct Reader {
+    pos: i32,
+    ok: bool,
+}
+
+fn rd_u8(buf: &[]u8, r: &mut Reader) -> i32 {
+    if !r.ok || r.pos + 1 > buf.len { r.ok = false; return 0 }
+    v := i32(buf[r.pos])
+    r.pos += 1
+    v
+}
+
+fn rd_bool(buf: &[]u8, r: &mut Reader) -> bool {
+    rd_u8(&buf, &mut r) != 0
+}
+
+fn rd_i32(buf: &[]u8, r: &mut Reader) -> i32 {
+    if !r.ok || r.pos + 4 > buf.len { r.ok = false; return 0 }
+    u := bytes.u32_le(&buf, r.pos)
+    r.pos += 4
+    if u >= 2147483648 { return i32(u - 4294967296) }
+    i32(u)
+}
+
+fn rd_i64(buf: &[]u8, r: &mut Reader) -> i64 {
+    if !r.ok || r.pos + 8 > buf.len { r.ok = false; return 0 }
+    lo := bytes.u32_le(&buf, r.pos)
+    hi := bytes.u32_le(&buf, r.pos + 4)
+    r.pos += 8
+    hi.shl(32).bit_or(lo)
+}
+
+fn rd_str(buf: &[]u8, r: &mut Reader) -> string {
+    n := rd_i32(&buf, &mut r)
+    if !r.ok || n < 0 || r.pos + n > buf.len { r.ok = false; return "" }
+    if n == 0 { return "" }
+    sub := &buf[r.pos..r.pos + n]
+    r.pos += n
+    dec := sys.decode_u8(&sub)
+    if !dec.ok { r.ok = false; return "" }
+    dec.value
+}
+
+fn rd_blob(buf: &[]u8, r: &mut Reader) -> []u8 {
+    n := rd_i32(&buf, &mut r)
+    if !r.ok || n < 0 || r.pos + n > buf.len { r.ok = false; return [] }
+    mut out: []u8 = []
+    if n > 0 {
+        out.reserve(n)
+        bytes.extend_range(&mut out, &buf, r.pos, r.pos + n)
+        r.pos += n
+    }
+    out
+}
+
+// =========================================================================
+// Canonical Structural Content Hashing (HirFn + Referenced Types & Callees)
+// =========================================================================
+
+fn hash_type_canonical(out: &mut []u8, types: &ht.TypeTable, ty: i32, visited: &mut []bool) {
+    if ty < 0 || ty >= types.entries.len {
+        put_i32(&mut out, -1)
+        return
+    }
+    if visited[ty] {
+        // Back-edge marker for recursive types: identify by name + kind
+        put_u8(&mut out, 0xfe)
+        put_i32(&mut out, i32(types.entries[ty].kind))
+        put_str(&mut out, types.entries[ty].name.clone())
+        return
+    }
+    visited[ty] = true
+
+    e := &types.entries[ty]
+    put_u8(&mut out, 0x01)
+    put_i32(&mut out, i32(e.kind))
+    put_str(&mut out, e.name.clone())
+    put_i32(&mut out, e.size)
+    put_i32(&mut out, e.align)
+    put_i64(&mut out, e.flags)
+    put_i32(&mut out, e.origin_count)
+    put_bool(&mut out, e.dispose_fn >= 0)
+    put_i32(&mut out, e.repr_ty)
+
+    k := e.kind
+    if k == .Ref || k == .MutRef || k == .FatSlice || k == .RegionSlice ||
+        k == .Array || k == .RawConst || k == .RawMut || k == .Task {
+        hash_type_canonical(&mut out, &types, e.inner_a, &mut visited)
+    } else if k == .FixedArr {
+        put_i32(&mut out, e.count)
+        hash_type_canonical(&mut out, &types, e.inner_a, &mut visited)
+    } else if k == .Struct || k == .Tuple || k == .Union {
+        put_i32(&mut out, e.count)
+        for fi in 0..e.count {
+            fld := &types.fields[e.inner_a + fi]
+            put_str(&mut out, fld.name.clone())
+            put_i32(&mut out, fld.offset)
+            put_bool(&mut out, fld.is_pub)
+            put_i32(&mut out, fld.origin_slot)
+            hash_type_canonical(&mut out, &types, fld.ty, &mut visited)
+        }
+    } else if k == .Enum {
+        put_i32(&mut out, e.count)
+        for vi in 0..e.count {
+            v := &types.variants[e.inner_a + vi]
+            put_str(&mut out, v.name.clone())
+            put_i64(&mut out, v.tag_value)
+            put_i32(&mut out, v.payload_count)
+            for pi in 0..v.payload_count {
+                pf := &types.fields[v.payload_start + pi]
+                put_str(&mut out, pf.name.clone())
+                put_i32(&mut out, pf.offset)
+                hash_type_canonical(&mut out, &types, pf.ty, &mut visited)
+            }
+        }
+    } else if k == .FnPtr || k == .ExternFn {
+        hash_type_canonical(&mut out, &types, e.inner_a, &mut visited)
+        put_i32(&mut out, e.count)
+        for pi in 0..e.count {
+            pe := types.params[e.inner_b + pi]
+            put_i32(&mut out, i32(pe.mode))
+            hash_type_canonical(&mut out, &types, pe.ty, &mut visited)
+        }
+        put_i32(&mut out, e.from_len)
+        for fi in 0..e.from_len {
+            fe := types.from_edges[e.from_start + fi]
+            put_i32(&mut out, fe.param_idx)
+            put_i32(&mut out, fe.field_slot)
+            put_i32(&mut out, fe.ret_slot)
+        }
+    } else if k == .ClosureEnv {
+        hash_type_canonical(&mut out, &types, e.inner_b, &mut visited)
+        put_i32(&mut out, e.count)
+        for fi in 0..e.count {
+            fld := &types.fields[e.inner_a + fi]
+            put_str(&mut out, fld.name.clone())
+            put_i32(&mut out, fld.offset)
+            hash_type_canonical(&mut out, &types, fld.ty, &mut visited)
+        }
+    }
+    visited[ty] = false
+}
+
+fn hash_type_fresh(out: &mut []u8, types: &ht.TypeTable, ty: i32) {
+    mut visited: []bool = []
+    for _ in 0..types.entries.len { visited.push(false) }
+    hash_type_canonical(&mut out, &types, ty, &mut visited)
+}
+
+pub fn hash_fn_fragment(hir: &hb.HirProgram, fn_id: i32, target: obj.TargetKind, run_opt: bool) -> string {
+    assert(fn_id >= 0 && fn_id < hir.fns.len)
+    hf := &hir.fns[fn_id]
+    mut buf: []u8 = []
+    buf.reserve(512)
+
+    // Domain separation: version, target, opt level, entry status
+    put_str(&mut buf, "dunder-ssa-frag-v1")
+    put_i32(&mut buf, FRAGMENT_VERSION)
+    put_i32(&mut buf, obj.target_to_platform(target))
+    put_bool(&mut buf, run_opt)
+    put_bool(&mut buf, fn_id == hir.entry_fn)
+
+    // Canonical function header (deliberately excludes source span_start/span_end)
+    put_str(&mut buf, hf.name.clone())
+    put_i32(&mut buf, hf.param_count)
+    put_bool(&mut buf, hf.is_unsafe)
+    put_bool(&mut buf, hf.is_extern)
+    put_bool(&mut buf, hf.is_closure_body)
+    put_bool(&mut buf, hf.is_thread_safe)
+    put_i32(&mut buf, hf.requires_caps)
+    put_str(&mut buf, hf.extern_lib.clone())
+    put_str(&mut buf, hf.extern_symbol.clone())
+    put_i32(&mut buf, hf.variadic_fixed)
+    put_bool(&mut buf, hf.link_weak)
+    put_bool(&mut buf, hf.link_delay)
+    put_i32(&mut buf, hf.body_stmt)
+
+    hash_type_fresh(&mut buf, &hir.types, hf.sig_ty)
+    hash_type_fresh(&mut buf, &hir.types, hf.ret_ty)
+
+    // Locals
+    put_i32(&mut buf, hf.locals.len)
+    for i in 0..hf.locals.len {
+        loc := &hf.locals[i]
+        put_str(&mut buf, loc.name.clone())
+        put_i32(&mut buf, i32(loc.mode))
+        put_bool(&mut buf, loc.is_mut)
+        put_bool(&mut buf, loc.is_param)
+        hash_type_fresh(&mut buf, &hir.types, loc.ty)
+    }
+
+    // Statements
+    put_i32(&mut buf, hf.stmts.len)
+    for i in 0..hf.stmts.len {
+        st := hf.stmts[i]
+        put_i32(&mut buf, i32(st.kind))
+        put_i32(&mut buf, st.local_id)
+        put_i32(&mut buf, st.expr_a)
+        put_i32(&mut buf, st.expr_b)
+        put_i32(&mut buf, st.stmt_start)
+        put_i32(&mut buf, st.stmt_len)
+        put_bool(&mut buf, st.in_unsafe)
+    }
+
+    // Expressions + callee signatures + referenced constants
+    put_i32(&mut buf, hf.exprs.len)
+    for i in 0..hf.exprs.len {
+        ex := &hf.exprs[i]
+        put_i32(&mut buf, i32(ex.kind))
+        hash_type_fresh(&mut buf, &hir.types, ex.ty)
+        put_i32(&mut buf, ex.a)
+        put_i32(&mut buf, ex.b)
+        put_i32(&mut buf, ex.c)
+        put_i32(&mut buf, ex.arg_start)
+        put_i32(&mut buf, ex.arg_len)
+        put_i64(&mut buf, ex.int_val)
+        put_str(&mut buf, ex.text.clone())
+        put_bool(&mut buf, ex.in_unsafe)
+
+        // Include direct callee signature so signature edits invalidate callers automatically
+        if ex.kind == .Call || ex.kind == .MethodCall || ex.kind == .FnRef || ex.kind == .Closure {
+            cid := ex.a
+            if cid >= 0 && cid < hir.fns.len {
+                cf := &hir.fns[cid]
+                put_u8(&mut buf, 0xc1)
+                put_str(&mut buf, cf.name.clone())
+                put_bool(&mut buf, cf.is_extern)
+                put_str(&mut buf, cf.extern_lib.clone())
+                put_str(&mut buf, cf.extern_symbol.clone())
+                hash_type_fresh(&mut buf, &hir.types, cf.sig_ty)
+                hash_type_fresh(&mut buf, &hir.types, cf.ret_ty)
+            }
+        } else if ex.kind == .ConstRef {
+            cid := ex.a
+            if cid >= 0 && cid < hir.consts.len {
+                hc := &hir.consts[cid]
+                put_u8(&mut buf, 0xc2)
+                put_str(&mut buf, hc.name.clone())
+                put_i64(&mut buf, hc.int_val)
+                put_str(&mut buf, hc.text_val.clone())
+                hash_type_fresh(&mut buf, &hir.types, hc.ty)
+            }
+        }
+    }
+
+    // Patterns
+    put_i32(&mut buf, hf.pats.len)
+    for i in 0..hf.pats.len {
+        pt := hf.pats[i]
+        put_i32(&mut buf, i32(pt.kind))
+        hash_type_fresh(&mut buf, &hir.types, pt.ty)
+        put_i32(&mut buf, pt.local_id)
+        put_i32(&mut buf, pt.tag)
+        put_i32(&mut buf, pt.child_start)
+        put_i32(&mut buf, pt.child_len)
+        put_bool(&mut buf, pt.is_move_bind)
+    }
+
+    // Index lists
+    put_i32(&mut buf, hf.expr_list.len)
+    for i in 0..hf.expr_list.len { put_i32(&mut buf, hf.expr_list[i]) }
+    put_i32(&mut buf, hf.stmt_list.len)
+    for i in 0..hf.stmt_list.len { put_i32(&mut buf, hf.stmt_list[i]) }
+    put_i32(&mut buf, hf.pat_list.len)
+    for i in 0..hf.pat_list.len { put_i32(&mut buf, hf.pat_list[i]) }
+
+    sha256.hex_bytes(&buf)
+}
+
+// =========================================================================
+// ObjectModule Fragment Binary Codec & On-Disk Cache (`.dunder-ssa-cache`)
+// =========================================================================
+
+fn sym_kind_from_i32(v: i32) -> obj.ObjSymKind {
+    if v == 1 { return .GlobalData }
+    if v == 2 { return .RodataBlob }
+    if v == 3 { return .TypeDescTable }
+    .Function
+}
+
+fn section_from_i32(v: i32) -> obj.SectionKind {
+    if v == 1 { return .Rodata }
+    if v == 2 { return .Data }
+    .Text
+}
+
+fn reloc_kind_from_i32(v: i32) -> obj.ObjRelocKind {
+    if v == 1 { return .Arm64Call26 }
+    if v == 2 { return .Arm64AdrpAdd }
+    if v == 3 { return .Arm64AdrpLdr }
+    if v == 4 { return .X86Rel32 }
+    if v == 5 { return .X86RipDisp32 }
+    if v == 6 { return .Abs64 }
+    if v == 7 { return .WasmFuncIdx }
+    .Arm64Branch26
+}
+
+fn import_kind_from_i32(v: i32) -> native_imports.SymbolKind {
+    if v == 1 { return .DataObject }
+    .Function
+}
+
+pub fn clone_object_module(src: &obj.ObjectModule) -> obj.ObjectModule {
+    mut dst := obj.new(src.target)
+    dst.text = src.text.clone()
+    dst.rodata = src.rodata.clone()
+    dst.data = src.data.clone()
+    dst.bss_bytes = src.bss_bytes
+    dst.entry_sym = src.entry_sym
+    for i in 0..src.symbols.len {
+        s := &src.symbols[i]
+        _ := obj.add_symbol(&mut dst, s.name.clone(), s.kind, s.section, s.offset, s.size, s.is_exported)
+    }
+    for i in 0..src.relocs.len {
+        r := src.relocs[i]
+        _ := obj.add_reloc(&mut dst, r.section, r.offset, r.kind, r.sym_id, r.addend, r.reg)
+    }
+    for i in 0..src.imports.len {
+        imp := &src.imports[i]
+        iid := obj.add_import(&mut dst, &imp.spec)
+        for k in 0..imp.sites.len {
+            obj.add_import_site(&mut dst, iid, imp.sites[k])
+        }
+    }
+    for i in 0..src.type_descs.len {
+        td := &src.type_descs[i]
+        _ := obj.add_type_desc(&mut dst, td.type_id, td.name.clone(),
+            td.clone_sym, td.drop_sym, td.iso_sym, td.size, td.align)
+    }
+    for i in 0..src.debug_files.len {
+        _ := obj.add_debug_file(&mut dst, src.debug_files[i].clone())
+    }
+    for i in 0..src.func_ranges.len {
+        fr := &src.func_ranges[i]
+        obj.add_func_range(&mut dst, fr.name.clone(), fr.file_index, fr.line, fr.start_byte, fr.end_byte)
+    }
+    for i in 0..src.debug_lines.len {
+        dl := src.debug_lines[i]
+        obj.add_debug_line(&mut dst, dl.byte_offset, dl.file_index, dl.line, dl.column)
+    }
+    dst
+}
+
+pub fn encode_fragment(key: string, m: &obj.ObjectModule) -> []u8 {
+    mut payload: []u8 = []
+    payload.reserve(m.text.len + m.rodata.len + 256)
+
+    put_blob(&mut payload, &m.text)
+    put_blob(&mut payload, &m.rodata)
+    put_blob(&mut payload, &m.data)
+    put_i32(&mut payload, m.bss_bytes)
+    put_i32(&mut payload, m.entry_sym)
+
+    put_i32(&mut payload, m.symbols.len)
+    for i in 0..m.symbols.len {
+        s := &m.symbols[i]
+        put_str(&mut payload, s.name.clone())
+        put_i32(&mut payload, i32(s.kind))
+        put_i32(&mut payload, i32(s.section))
+        put_i32(&mut payload, s.offset)
+        put_i32(&mut payload, s.size)
+        put_bool(&mut payload, s.is_exported)
+    }
+
+    put_i32(&mut payload, m.relocs.len)
+    for i in 0..m.relocs.len {
+        r := m.relocs[i]
+        put_i32(&mut payload, i32(r.section))
+        put_i32(&mut payload, r.offset)
+        put_i32(&mut payload, i32(r.kind))
+        put_i32(&mut payload, r.sym_id)
+        put_i64(&mut payload, r.addend)
+        put_i32(&mut payload, r.reg)
+    }
+
+    put_i32(&mut payload, m.imports.len)
+    for i in 0..m.imports.len {
+        imp := &m.imports[i]
+        sp := &imp.spec
+        put_str(&mut payload, sp.library.clone())
+        put_str(&mut payload, sp.name.clone())
+        put_i32(&mut payload, i32(sp.kind))
+        put_bool(&mut payload, sp.weak)
+        put_bool(&mut payload, sp.delay)
+        put_bool(&mut payload, sp.lib_weak)
+        put_i32(&mut payload, sp.ordinal)
+        put_str(&mut payload, sp.version_lib.clone())
+        put_str(&mut payload, sp.version_name.clone())
+        put_i32(&mut payload, imp.sites.len)
+        for k in 0..imp.sites.len { put_i32(&mut payload, imp.sites[k]) }
+    }
+
+    put_i32(&mut payload, m.debug_files.len)
+    for i in 0..m.debug_files.len { put_str(&mut payload, m.debug_files[i].clone()) }
+
+    put_i32(&mut payload, m.func_ranges.len)
+    for i in 0..m.func_ranges.len {
+        fr := &m.func_ranges[i]
+        put_str(&mut payload, fr.name.clone())
+        put_i32(&mut payload, fr.file_index)
+        put_i32(&mut payload, fr.line)
+        put_i32(&mut payload, fr.start_byte)
+        put_i32(&mut payload, fr.end_byte)
+    }
+
+    put_i32(&mut payload, m.debug_lines.len)
+    for i in 0..m.debug_lines.len {
+        dl := m.debug_lines[i]
+        put_i32(&mut payload, dl.byte_offset)
+        put_i32(&mut payload, dl.file_index)
+        put_i32(&mut payload, dl.line)
+        put_i32(&mut payload, dl.column)
+    }
+
+    payload_sig := sha256.hex_bytes(&payload)
+    mut out: []u8 = []
+    out.reserve(140 + payload.len)
+    bytes.append_le(&mut out, FRAGMENT_MAGIC, 4)
+    put_i32(&mut out, FRAGMENT_VERSION)
+    put_i32(&mut out, obj.target_to_platform(m.target))
+    bytes.append_utf8(&mut out, key)
+    bytes.append_utf8(&mut out, payload_sig)
+    bytes.extend(&mut out, &payload)
+    out
+}
+
+pub fn decode_fragment(expected_key: string, expected_target: obj.TargetKind,
+    raw: &[]u8) -> (bool, obj.ObjectModule) {
+    empty := obj.new(expected_target)
+    if expected_key.len != 64 || raw.len < 140 { return (false, move empty) }
+    magic := bytes.u32_le(&raw, 0)
+    ver := i32(bytes.u32_le(&raw, 4))
+    plat := i32(bytes.u32_le(&raw, 8))
+    if magic != FRAGMENT_MAGIC || ver != FRAGMENT_VERSION || plat != obj.target_to_platform(expected_target) {
+        return (false, move empty)
+    }
+    key_slice := &raw[12..76]
+    if !bytes.equals_text(&key_slice, 0, 64, expected_key) {
+        return (false, move empty)
+    }
+    sig_slice := &raw[76..140]
+    payload_slice := &raw[140..raw.len]
+    mut payload_vec: []u8 = []
+    payload_vec.reserve(payload_slice.len)
+    bytes.extend_range(&mut payload_vec, &raw, 140, raw.len)
+    actual_sig := sha256.hex_bytes(&payload_vec)
+    if !bytes.equals_text(&sig_slice, 0, 64, actual_sig) {
+        return (false, move empty)
+    }
+
+    mut r := Reader { pos: 0, ok: true }
+    mut m := obj.new(expected_target)
+    m.text = rd_blob(&payload_vec, &mut r)
+    m.rodata = rd_blob(&payload_vec, &mut r)
+    m.data = rd_blob(&payload_vec, &mut r)
+    m.bss_bytes = rd_i32(&payload_vec, &mut r)
+    m.entry_sym = rd_i32(&payload_vec, &mut r)
+
+    n_syms := rd_i32(&payload_vec, &mut r)
+    if !r.ok || n_syms < 0 { return (false, move empty) }
+    for _ in 0..n_syms {
+        sname := rd_str(&payload_vec, &mut r)
+        sk := sym_kind_from_i32(rd_i32(&payload_vec, &mut r))
+        ssec := section_from_i32(rd_i32(&payload_vec, &mut r))
+        soff := rd_i32(&payload_vec, &mut r)
+        ssz := rd_i32(&payload_vec, &mut r)
+        sexp := rd_bool(&payload_vec, &mut r)
+        if !r.ok { return (false, move empty) }
+        _ := obj.add_symbol(&mut m, sname, sk, ssec, soff, ssz, sexp)
+    }
+
+    n_relocs := rd_i32(&payload_vec, &mut r)
+    if !r.ok || n_relocs < 0 { return (false, move empty) }
+    for _ in 0..n_relocs {
+        rsec := section_from_i32(rd_i32(&payload_vec, &mut r))
+        roff := rd_i32(&payload_vec, &mut r)
+        rk := reloc_kind_from_i32(rd_i32(&payload_vec, &mut r))
+        rsym := rd_i32(&payload_vec, &mut r)
+        radd := rd_i64(&payload_vec, &mut r)
+        rreg := rd_i32(&payload_vec, &mut r)
+        if !r.ok { return (false, move empty) }
+        _ := obj.add_reloc(&mut m, rsec, roff, rk, rsym, radd, rreg)
+    }
+
+    n_imps := rd_i32(&payload_vec, &mut r)
+    if !r.ok || n_imps < 0 { return (false, move empty) }
+    for _ in 0..n_imps {
+        lib := rd_str(&payload_vec, &mut r)
+        nm := rd_str(&payload_vec, &mut r)
+        ik := import_kind_from_i32(rd_i32(&payload_vec, &mut r))
+        wk := rd_bool(&payload_vec, &mut r)
+        dl := rd_bool(&payload_vec, &mut r)
+        lwk := rd_bool(&payload_vec, &mut r)
+        ord := rd_i32(&payload_vec, &mut r)
+        vlib := rd_str(&payload_vec, &mut r)
+        vnm := rd_str(&payload_vec, &mut r)
+        ns := rd_i32(&payload_vec, &mut r)
+        if !r.ok || ns < 0 { return (false, move empty) }
+        spec := native_imports.SymbolSpec {
+            library: move lib, name: move nm, kind: ik, weak: wk, delay: dl,
+            lib_weak: lwk, ordinal: ord, version_lib: move vlib, version_name: move vnm,
+        }
+        iid := obj.add_import(&mut m, &spec)
+        for _ in 0..ns {
+            st := rd_i32(&payload_vec, &mut r)
+            if !r.ok { return (false, move empty) }
+            obj.add_import_site(&mut m, iid, st)
+        }
+    }
+
+    n_df := rd_i32(&payload_vec, &mut r)
+    if !r.ok || n_df < 0 { return (false, move empty) }
+    for _ in 0..n_df {
+        p := rd_str(&payload_vec, &mut r)
+        if !r.ok { return (false, move empty) }
+        _ := obj.add_debug_file(&mut m, p)
+    }
+
+    n_fr := rd_i32(&payload_vec, &mut r)
+    if !r.ok || n_fr < 0 { return (false, move empty) }
+    for _ in 0..n_fr {
+        nm := rd_str(&payload_vec, &mut r)
+        fi := rd_i32(&payload_vec, &mut r)
+        ln := rd_i32(&payload_vec, &mut r)
+        sb := rd_i32(&payload_vec, &mut r)
+        eb := rd_i32(&payload_vec, &mut r)
+        if !r.ok { return (false, move empty) }
+        obj.add_func_range(&mut m, nm, fi, ln, sb, eb)
+    }
+
+    n_dl := rd_i32(&payload_vec, &mut r)
+    if !r.ok || n_dl < 0 { return (false, move empty) }
+    for _ in 0..n_dl {
+        bo := rd_i32(&payload_vec, &mut r)
+        fi := rd_i32(&payload_vec, &mut r)
+        ln := rd_i32(&payload_vec, &mut r)
+        co := rd_i32(&payload_vec, &mut r)
+        if !r.ok { return (false, move empty) }
+        obj.add_debug_line(&mut m, bo, fi, ln, co)
+    }
+
+    if !r.ok || r.pos != payload_vec.len { return (false, move empty) }
+    (true, move m)
+}
+
+fn cache_file_path(cache_dir: string, key: string) -> string {
+    cache_dir + "/" + key + ".frag"
+}
+
+fn lookup_mem_frag(cache: &FragmentCache, key: string) -> i32 {
+    for i in 0..cache.mem_keys.len {
+        if cache.mem_keys[i] == key { return i }
+    }
+    -1
+}
+
+fn store_frag_cache(cache: &mut FragmentCache, key: string, frag: &obj.ObjectModule) {
+    if lookup_mem_frag(&cache, key) < 0 {
+        cache.mem_keys.push(key.clone())
+        cache.mem_frags.push(clone_object_module(&frag))
+    }
+    if cache.disk_enabled {
+        _ := fs.mkdir_all(cache.cache_dir)
+        encoded := encode_fragment(key, &frag)
+        _ := fs.write_private_atomic(cache_file_path(cache.cache_dir, key), &encoded)
+    }
+}
+
+fn load_frag_cache(cache: &mut FragmentCache, key: string, target: obj.TargetKind) -> (bool, obj.ObjectModule) {
+    midx := lookup_mem_frag(&cache, key)
+    if midx >= 0 {
+        return (true, clone_object_module(&cache.mem_frags[midx]))
+    }
+    if cache.disk_enabled {
+        path := cache_file_path(cache.cache_dir, key)
+        meta := sys.metadata(path)
+        if meta.is_file && meta.size >= 140 && meta.size <= 67108864 {
+            rd := sys.read_u8(path)
+            if rd.ok {
+                (ok, decoded) := decode_fragment(key, target, &rd.value)
+                if ok {
+                    cache.mem_keys.push(key.clone())
+                    cache.mem_frags.push(clone_object_module(&decoded))
+                    return (true, move decoded)
+                }
+            }
+        }
+    }
+    (false, obj.new(target))
+}
+
+fn lookup_wasm_func(cache: &FragmentCache, key: string) -> i32 {
+    for i in 0..cache.wasm_keys.len {
+        if cache.wasm_keys[i] == key { return i }
+    }
+    -1
+}
+
+fn clone_ssa_func(f: &ssa.SsaFunc) -> ssa.SsaFunc {
+    mut slots: []ssa.StackSlot = []
+    for i in 0..f.slots.len {
+        s := &f.slots[i]
+        slots.push(ssa.StackSlot {
+            id: s.id, ty: s.ty, size: s.size, align: s.align,
+            addr_taken: s.addr_taken, is_param: s.is_param, is_sret: s.is_sret,
+            dead: s.dead, name: s.name.clone(),
+        })
+    }
+    ssa.SsaFunc {
+        fn_id: f.fn_id,
+        owner_mod: f.owner_mod,
+        name: f.name.clone(),
+        path: f.path.clone(),
+        sig_ty: f.sig_ty,
+        ret_ty: f.ret_ty,
+        param_count: f.param_count,
+        is_unsafe: f.is_unsafe,
+        is_extern: f.is_extern,
+        is_closure_body: f.is_closure_body,
+        slots: move slots,
+        vals: f.vals.clone(),
+        param_vals: f.param_vals.clone(),
+        blocks: f.blocks.clone(),
+        block_params: f.block_params.clone(),
+        block_insts: f.block_insts.clone(),
+        insts: f.insts.clone(),
+        terms: f.terms.clone(),
+        preds: f.preds.clone(),
+        val_args: f.val_args.clone(),
+        const_strs: f.const_strs.clone(),
+        switch_vals: f.switch_vals.clone(),
+        switch_bbs: f.switch_bbs.clone(),
+        switch_arg_starts: f.switch_arg_starts.clone(),
+        switch_arg_lens: f.switch_arg_lens.clone(),
+    }
+}
+
+// =========================================================================
+// Per-Function HIR -> MIR2 -> SSA -> Native ObjectModule Fragment Pipeline
+// =========================================================================
+
+fn make_stub_ssa_func(hir: &hb.HirProgram, fn_id: i32) -> ssa.SsaFunc {
+    hf := &hir.fns[fn_id]
+    path := if hf.owner_mod >= 0 && hf.owner_mod < hir.mod_paths.len {
+        hir.mod_paths[hf.owner_mod].clone()
+    } else { "" }
+    mut sf := ssa.new_func(hf.id, hf.owner_mod, hf.name.clone(), path,
+        hf.sig_ty, hf.ret_ty, hf.param_count, hf.is_unsafe)
+    sf.is_extern = hf.is_extern
+    sf.is_closure_body = hf.is_closure_body
+    sf
+}
+
+fn emit_native_base_module(hir: &hb.HirProgram, target: obj.TargetKind) -> obj.ObjectModule {
+    mut stub_prog := ssa.new_program(hir.fns.len, hir.entry_fn)
+    for fi in 0..hir.fns.len {
+        _ := ssa.add_program_func(&mut stub_prog, make_stub_ssa_func(&hir, fi))
+    }
+    if target == .Arm64Macos || target == .Arm64Linux {
+        return arm64_isel.emit_program(&stub_prog, &hir, target)
+    }
+    x86_isel.emit_program(&stub_prog, &hir, target)
+}
+
+fn compile_single_fn_ssa(hir: &hb.HirProgram, fn_id: i32, run_opt: bool,
+    diags: &mut []diag.Diagnostic) -> (bool, ssa.SsaFunc) {
+    mut body := mir_build.build_body(&hir, fn_id, &mut diags)
+    if !mir_verify.verify_body(&hir.types, &body, &mut diags) {
+        return (false, make_stub_ssa_func(&hir, fn_id))
+    }
+    init := mir_init.check_init(&hir.types, &body, &mut diags)
+    if !init.ok {
+        return (false, make_stub_ssa_func(&hir, fn_id))
+    }
+    if !mir_borrowck.check_borrows(&hir.types, &body, &init, &mut diags) {
+        return (false, make_stub_ssa_func(&hir, fn_id))
+    }
+    mir_drop_elab.elaborate_drops(&hir.types, &mut body, &init)
+    if !mir_verify.verify_body(&hir.types, &body, &mut diags) {
+        return (false, make_stub_ssa_func(&hir, fn_id))
+    }
+    mut sf := ssa_lower.lower_body(&hir, &body, &mut diags)
+    if !ssa_verify.verify_func(&hir.types, &sf, &mut diags) {
+        return (false, move sf)
+    }
+    if run_opt {
+        _ := ssa_opt.optimize_func(&hir.types, &mut sf, true, &mut diags)
+        if !ssa_verify.verify_func(&hir.types, &sf, &mut diags) {
+            return (false, move sf)
+        }
+    }
+    (true, move sf)
+}
+
+// Extract a self-contained per-function ObjectModule fragment from `mini_mod`:
+//   - `.text` contains ONLY this function's machine code (rebased to 0)
+//   - `.rodata` contains ONLY this function's own rodata blobs (rebased to 0)
+//   - Symbol 0 is the defined function (size > 0); local rodata blobs have size > 0;
+//     external/cross-fragment refs (callees & runtime stubs) are emitted with `size = -1`
+//     so `resolve_cross_fragment_symbols` binds them cleanly after `object_module.merge_fragment`.
+fn extract_fn_fragment(mini_mod: &obj.ObjectModule, fn_name: string, is_entry: bool,
+    base_rodata_len: i32) -> (bool, obj.ObjectModule) {
+    mut fn_sym_idx := -1
+    for i in 0..mini_mod.symbols.len {
+        s := &mini_mod.symbols[i]
+        if s.kind == .Function && s.name == fn_name && s.size > 0 {
+            fn_sym_idx = i
+            break
+        }
+    }
+    if fn_sym_idx < 0 {
+        return (false, obj.new(mini_mod.target))
+    }
+
+    fsym := &mini_mod.symbols[fn_sym_idx]
+    fn_start := fsym.offset
+    fn_size := fsym.size
+    fn_end := fn_start + fn_size
+
+    // Align base_rodata_len up to 8 so fragment .rodata preserves 8-byte alignment of RC headers & blobs
+    ro_rem := base_rodata_len % 8
+    aligned_ro_base := if ro_rem == 0 { base_rodata_len } else { base_rodata_len + (8 - ro_rem) }
+
+    mut frag := obj.new(mini_mod.target)
+    if fn_size > 0 {
+        frag.text.reserve(fn_size)
+        bytes.extend_range(&mut frag.text, &mini_mod.text, fn_start, fn_end)
+    }
+    if mini_mod.rodata.len > aligned_ro_base {
+        frag.rodata.reserve(mini_mod.rodata.len - aligned_ro_base)
+        bytes.extend_range(&mut frag.rodata, &mini_mod.rodata, aligned_ro_base, mini_mod.rodata.len)
+    }
+
+    // Symbol 0: the function itself (defined)
+    _ := obj.add_symbol(&mut frag, fn_name.clone(), .Function, .Text, 0, fn_size, is_entry)
+
+    // Map mini_mod sym_id -> frag sym_id
+    mut sym_map: []i32 = []
+    for _ in 0..mini_mod.symbols.len { sym_map.push(-1) }
+    sym_map[fn_sym_idx] = 0
+
+    // Rebase relocations belonging to this function's .text or its own .rodata
+    for i in 0..mini_mod.relocs.len {
+        r := mini_mod.relocs[i]
+        in_fn_text := r.section == .Text && r.offset >= fn_start && r.offset < fn_end
+        in_fn_rodata := r.section == .Rodata && r.offset >= aligned_ro_base
+        if !in_fn_text && !in_fn_rodata { continue }
+
+        mut mapped_sym := sym_map[r.sym_id]
+        if mapped_sym < 0 {
+            os := &mini_mod.symbols[r.sym_id]
+            if os.section == .Rodata && os.offset >= aligned_ro_base {
+                // Local rodata blob owned by this fragment (size > 0 so cross-fragment resolver preserves it!)
+                ro_sz := if os.size > 0 { os.size } else { 1 }
+                mapped_sym = obj.add_symbol(&mut frag, os.name.clone(), os.kind, .Rodata,
+                    os.offset - aligned_ro_base, ro_sz, false)
+            } else {
+                // External-to-fragment reference (other user function or shared runtime stub): size = -1
+                mapped_sym = obj.add_symbol(&mut frag, os.name.clone(), os.kind, os.section,
+                    0, -1, false)
+            }
+            sym_map[r.sym_id] = mapped_sym
+        }
+        new_off := if in_fn_text { r.offset - fn_start } else { r.offset - aligned_ro_base }
+        _ := obj.add_reloc(&mut frag, r.section, new_off, r.kind, mapped_sym, r.addend, r.reg)
+    }
+
+    // Rebase external dynamic imports referenced within [fn_start, fn_end)
+    for i in 0..mini_mod.imports.len {
+        imp := &mini_mod.imports[i]
+        mut added_id := -1
+        for k in 0..imp.sites.len {
+            st := imp.sites[k]
+            if st >= fn_start && st < fn_end {
+                if added_id < 0 { added_id = obj.add_import(&mut frag, &imp.spec) }
+                obj.add_import_site(&mut frag, added_id, st - fn_start)
+            }
+        }
+    }
+
+    // Rebase debug ranges belonging to this function
+    for i in 0..mini_mod.debug_files.len {
+        _ := obj.add_debug_file(&mut frag, mini_mod.debug_files[i].clone())
+    }
+    for i in 0..mini_mod.func_ranges.len {
+        fr := &mini_mod.func_ranges[i]
+        if fr.start_byte >= fn_start && fr.end_byte <= fn_end {
+            obj.add_func_range(&mut frag, fr.name.clone(), fr.file_index, fr.line,
+                fr.start_byte - fn_start, fr.end_byte - fn_start)
+        }
+    }
+
+    (true, move frag)
+}
+
+// Compile a single function into a cached or freshly lowered `ObjectModule` fragment.
+pub fn compile_fn_fragment(cache: &mut FragmentCache, hir: &hb.HirProgram, fn_id: i32,
+    target: obj.TargetKind, run_opt: bool, base_rodata_len: i32,
+    diags: &mut []diag.Diagnostic) -> FnFragmentResult {
+    key := hash_fn_fragment(&hir, fn_id, target, run_opt)
+    (hit, cached_frag) := load_frag_cache(&mut cache, key, target)
+    if hit {
+        return FnFragmentResult {
+            ok: true, error: "", hash: key, from_cache: true, fragment: move cached_frag,
+        }
+    }
+
+    (ssa_ok, sf) := compile_single_fn_ssa(&hir, fn_id, run_opt, &mut diags)
+    if !ssa_ok {
+        return FnFragmentResult {
+            ok: false, error: "per-function MIR/SSA lowering failed for " + hir.fns[fn_id].name,
+            hash: key, from_cache: false, fragment: obj.new(target),
+        }
+    }
+
+    // Build single-function mini SsaProgram (all other functions remain empty stubs)
+    mut mini_prog := ssa.new_program(hir.fns.len, -1)
+    for fi in 0..hir.fns.len {
+        if fi == fn_id {
+            _ := ssa.add_program_func(&mut mini_prog, clone_ssa_func(&sf))
+        } else {
+            _ := ssa.add_program_func(&mut mini_prog, make_stub_ssa_func(&hir, fi))
+        }
+    }
+
+    mini_mod := if target == .Arm64Macos || target == .Arm64Linux {
+        arm64_isel.emit_program(&mini_prog, &hir, target)
+    } else {
+        x86_isel.emit_program(&mini_prog, &hir, target)
+    }
+
+    (ext_ok, frag) := extract_fn_fragment(&mini_mod, hir.fns[fn_id].name.clone(),
+        fn_id == hir.entry_fn, base_rodata_len)
+    if !ext_ok {
+        return FnFragmentResult {
+            ok: false, error: "failed to extract fragment for " + hir.fns[fn_id].name,
+            hash: key, from_cache: false, fragment: obj.new(target),
+        }
+    }
+
+    store_frag_cache(&mut cache, key, &frag)
+    FnFragmentResult {
+        ok: true, error: "", hash: key, from_cache: false, fragment: move frag,
+    }
+}
+
+// =========================================================================
+// Cross-Fragment Symbol Resolution & Whole-Program Cached Assembly
+// =========================================================================
+
+pub fn resolve_cross_fragment_symbols(m: &mut obj.ObjectModule) -> bool {
+    mut def_names: []string = []
+    mut def_ids: []i32 = []
+    for i in 0..m.symbols.len {
+        s := &m.symbols[i]
+        if s.size > 0 {
+            def_names.push(s.name.clone())
+            def_ids.push(i)
+        }
+    }
+
+    for ri in 0..m.relocs.len {
+        sid := m.relocs[ri].sym_id
+        if sid < 0 || sid >= m.symbols.len { return false }
+        if m.symbols[sid].size > 0 { continue }
+        target_name := m.symbols[sid].name.clone()
+        mut found := -1
+        for di in 0..def_names.len {
+            if def_names[di] == target_name { found = def_ids[di]; break }
+        }
+        if found < 0 { return false }
+        m.relocs[ri].sym_id = found
+    }
+    true
+}
+
+fn emit_native_executable(m: &obj.ObjectModule) -> []u8 {
+    if m.target == .Arm64Macos {
+        cfg := macho.default_config()
+        signer := macho.serial_signer()
+        return obj.emit_macho(&m, &cfg, &signer, false, "dunder-ssa-fragments", ".", "main.ddr")
+    }
+    if m.target == .Arm64Linux || m.target == .X86_64Linux {
+        ecfg := elf.default_config()
+        return obj.emit_elf(&m, &ecfg, false, "dunder-ssa-fragments", ".", "main.ddr")
+    }
+    pcfg := pe.default_config()
+    obj.emit_pe(&m, &pcfg)
+}
+
+// Compile an entire HirProgram using the per-function fragment cache.
+// Unchanged functions reuse cached fragments (0 re-lowering/re-opt/re-ISel);
+// merged via `object_module.merge_fragment` to produce 100% byte-identical executables.
+pub fn compile_program_cached(cache: &mut FragmentCache, hir: &hb.HirProgram,
+    target: obj.TargetKind, run_opt: bool) -> CachedBuildResult {
+    mut diags: []diag.Diagnostic = []
+    mut recompiled: []i32 = []
+    mut fn_hashes: []string = []
+    mut total_fns := 0
+    mut hits := 0
+    mut misses := 0
+
+    if !hir.ok {
+        return CachedBuildResult {
+            ok: false, error: "HirProgram is not ok", module: obj.new(target),
+            executable: [], total_fns: 0, cache_hits: 0, cache_misses: 0,
+            recompiled_fn_ids: [], fn_hashes: [], diagnostics: move diags,
+        }
+    }
+
+    // WASM path: cache verified post-opt SsaFuncs per content hash, emit canonical .wasm binary
+    if target == .Wasm32 || target == .Wasm32Wasi {
+        mut ssa_prog := ssa.new_program(hir.fns.len, hir.entry_fn)
+        for fi in 0..hir.fns.len {
+            hf := &hir.fns[fi]
+            if hf.is_extern || hf.is_generic_template || hf.body_stmt < 0 {
+                fn_hashes.push("")
+                continue
+            }
+            total_fns += 1
+            key := hash_fn_fragment(&hir, fi, target, run_opt)
+            fn_hashes.push(key.clone())
+            widx := lookup_wasm_func(&cache, key)
+            if widx >= 0 {
+                hits += 1
+                mut cached_sf := clone_ssa_func(&cache.wasm_funcs[widx])
+                cached_sf.fn_id = fi
+                _ := ssa.add_program_func(&mut ssa_prog, move cached_sf)
+            } else {
+                misses += 1
+                recompiled.push(fi)
+                (ok_fn, sf) := compile_single_fn_ssa(&hir, fi, run_opt, &mut diags)
+                if !ok_fn {
+                    return CachedBuildResult {
+                        ok: false, error: "WASM per-function compilation failed for " + hf.name,
+                        module: obj.new(target), executable: [], total_fns: total_fns,
+                        cache_hits: hits, cache_misses: misses,
+                        recompiled_fn_ids: move recompiled, fn_hashes: move fn_hashes,
+                        diagnostics: move diags,
+                    }
+                }
+                cache.wasm_keys.push(move key)
+                cache.wasm_funcs.push(clone_ssa_func(&sf))
+                _ := ssa.add_program_func(&mut ssa_prog, move sf)
+            }
+        }
+        wasm_bin := wasm_isel.emit_wasm(&ssa_prog, &hir, target == .Wasm32Wasi)
+        mut wmod := obj.new(target)
+        _ := obj.append_text(&mut wmod, &wasm_bin, 1)
+        return CachedBuildResult {
+            ok: true, error: "", module: move wmod, executable: move wasm_bin,
+            total_fns: total_fns, cache_hits: hits, cache_misses: misses,
+            recompiled_fn_ids: move recompiled, fn_hashes: move fn_hashes,
+            diagnostics: move diags,
+        }
+    }
+
+    // Native ARM64 / x86_64 path: emit shared runtime base + merge per-function ObjectModule fragments!
+    mut final_mod := emit_native_base_module(&hir, target)
+    base_rodata_len := final_mod.rodata.len
+
+    for fi in 0..hir.fns.len {
+        hf := &hir.fns[fi]
+        if hf.is_extern || hf.is_generic_template || hf.body_stmt < 0 {
+            fn_hashes.push("")
+            continue
+        }
+        total_fns += 1
+        res := compile_fn_fragment(&mut cache, &hir, fi, target, run_opt, base_rodata_len, &mut diags)
+        fn_hashes.push(res.hash.clone())
+        if !res.ok {
+            return CachedBuildResult {
+                ok: false, error: res.error, module: move final_mod, executable: [],
+                total_fns: total_fns, cache_hits: hits, cache_misses: misses,
+                recompiled_fn_ids: move recompiled, fn_hashes: move fn_hashes,
+                diagnostics: move diags,
+            }
+        }
+        if res.from_cache {
+            hits += 1
+        } else {
+            misses += 1
+            recompiled.push(fi)
+        }
+        _ := obj.merge_fragment(&mut final_mod, &res.fragment)
+    }
+
+    if !resolve_cross_fragment_symbols(&mut final_mod) {
+        return CachedBuildResult {
+            ok: false, error: "unresolved cross-fragment symbol during link",
+            module: move final_mod, executable: [], total_fns: total_fns,
+            cache_hits: hits, cache_misses: misses,
+            recompiled_fn_ids: move recompiled, fn_hashes: move fn_hashes,
+            diagnostics: move diags,
+        }
+    }
+
+    exe := emit_native_executable(&final_mod)
+    CachedBuildResult {
+        ok: true, error: "", module: move final_mod, executable: move exe,
+        total_fns: total_fns, cache_hits: hits, cache_misses: misses,
+        recompiled_fn_ids: move recompiled, fn_hashes: move fn_hashes,
+        diagnostics: move diags,
+    }
+}

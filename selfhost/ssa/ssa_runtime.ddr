@@ -1,0 +1,1760 @@
+// Phase 3C: Structured Target-Independent SSA Runtime & Task Helpers (`selfhost/ssa/ssa_runtime.ddr`).
+// Synthesizes verified `ssa_ir.SsaFunc` routines directly from sealed `ht.TypeTable`:
+//   - Type-driven `drop`, `clone`, `iso_clone`, and `shared_rc_freeze` helpers
+//   - Preserved RC sentinels: 0=static, -1=freed trap (110), -2=frozen string iso-clone,
+//     <=-3=bounded TYPE_DESC_TABLE[(-rc)-3] dispatch (OOB trap 112)
+//   - `@resource(dispose)` invocation strictly at `rc == 1`
+//   - Bump allocator fast/slow path, string/array/slice primitives
+//   - OS dynamic TLS `CallbackFrame` push/pop & foreign-thread trampoline guard (trap 111)
+//   - Per-target task worker entry & arena-init stubs fixing R-3 (macOS ARM64 x29 unwind root,
+//     omitting unused 8 MiB worker stack + 16 MiB guard on x86_64)
+// ZERO imports of `compile.ddr`, `selfhost/mir/*`, or legacy `arm64.ddr`.
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ..backend.object_module as obj
+import ssa_ir as ssa
+import ssa_verify
+
+// =========================================================================
+// Runtime Constants, Sentinels & Trap Codes
+// =========================================================================
+
+pub const RC_STATIC: i64              = 0
+pub const RC_FREED: i64               = -1
+pub const RC_FROZEN_STR: i64          = -2
+pub const RC_FROZEN_COMPOUND_BASE: i64 = -3
+
+pub const TRAP_OOM: i32               = 109
+pub const TRAP_USE_AFTER_FREE: i32    = 110
+pub const TRAP_FOREIGN_CALLBACK: i32  = 111
+pub const TRAP_TYPE_DESC_OOB: i32     = 112
+
+// Structured ABI layouts (byte sizes & offsets)
+pub const ARENA_CTX_BYTES: i32        = 32   // [0]=bump_cur, [8]=bump_end, [16]=base, [24]=slab_size
+pub const CALLBACK_FRAME_BYTES: i32   = 64   // [0]=prev, [8]=cur, [16]=end, [24]=base, [32..48]=regs, [56]=token
+pub const TASK_DESC_BYTES: i32        = 64   // [0]=state, [8]=pool_base, [16]=pool_bytes, [24]=fn, [32]=arg, [40]=res, [48]=saved_fp, [56]=arena_ctx
+pub const TYPE_DESC_ENTRY_BYTES: i32  = 32   // [0]=clone, [8]=drop, [16]=iso, [24]=size(i32), [28]=align(i32)
+
+// =========================================================================
+// R-3 Per-Target Task Worker Layout Specification
+// =========================================================================
+
+pub struct WorkerLayoutSpec {
+    platform: i32,
+    needs_custom_stack: bool,
+    preserve_frame_pointer: bool,
+    stack_bytes: i64,
+    guard_bytes: i64,
+    pool_bytes: i64,
+    total_mapping_bytes: i64,
+}
+
+// Fixes R-3:
+// - macOS ARM64 (platform 0, GCD 512 KiB stack): allocates 8 MiB stack + 16 MiB guard AND
+//   explicitly clears/chains x29 frame pointer on stack switch so unwinders never chase
+//   libdispatch's old stack.
+// - x86_64 Linux/Windows (platform 2 / 5): omits the unused 8 MiB worker stack + 16 MiB guard
+//   (saving 24 MiB virtual address space per worker).
+// - ARM64 Linux (platform 1, pthread 8 MiB stack): uses OS pthread stack, preserves x29.
+// - WASM (platform 3 / 4): single-threaded, zero worker pool mapping.
+pub fn worker_layout_for_platform(platform: i32) -> WorkerLayoutSpec {
+    if platform == 0 {
+        pool: i64 = 536870912
+        guard: i64 = 16777216
+        stack: i64 = 8388608
+        return WorkerLayoutSpec {
+            platform: platform,
+            needs_custom_stack: true,
+            preserve_frame_pointer: true,
+            stack_bytes: stack,
+            guard_bytes: guard,
+            pool_bytes: pool,
+            total_mapping_bytes: pool + guard + stack,
+        }
+    }
+    if platform == 1 {
+        pool: i64 = 536870912
+        return WorkerLayoutSpec {
+            platform: platform,
+            needs_custom_stack: false,
+            preserve_frame_pointer: true,
+            stack_bytes: 0,
+            guard_bytes: 0,
+            pool_bytes: pool,
+            total_mapping_bytes: pool,
+        }
+    }
+    if platform == 2 || platform == 5 {
+        pool: i64 = 536870912
+        return WorkerLayoutSpec {
+            platform: platform,
+            needs_custom_stack: false,
+            preserve_frame_pointer: false,
+            stack_bytes: 0,
+            guard_bytes: 0,
+            pool_bytes: pool,
+            total_mapping_bytes: pool,
+        }
+    }
+    WorkerLayoutSpec {
+        platform: platform,
+        needs_custom_stack: false,
+        preserve_frame_pointer: false,
+        stack_bytes: 0,
+        guard_bytes: 0,
+        pool_bytes: 0,
+        total_mapping_bytes: 0,
+    }
+}
+
+// =========================================================================
+// Runtime Registry & Type Descriptor Metadata
+// =========================================================================
+
+pub struct TypeDescInfo {
+    desc_id: i32,
+    type_id: i32,
+    name: string,
+    clone_fn: i32,
+    drop_fn: i32,
+    iso_fn: i32,
+    freeze_fn: i32,
+    size: i32,
+    align: i32,
+}
+
+pub struct RuntimeRegistry {
+    platform: i32,
+    worker_layout: WorkerLayoutSpec,
+
+    // Core synthesized SSA runtime function IDs
+    fn_bump_alloc_slow: i32,
+    fn_bump_alloc: i32,
+    fn_pool_free: i32,
+    fn_string_iso_clone: i32,
+    fn_rc_release_checked: i32,
+    fn_rc_retain: i32,
+    fn_type_desc_dispatch: i32,
+    fn_type_desc_lookup: i32,
+    fn_bytes_eq: i32,
+    fn_slice_bounds_addr: i32,
+    fn_cb_frame_push: i32,
+    fn_cb_frame_pop: i32,
+    fn_cb_trampoline_enter: i32,
+    fn_cb_trampoline_exit: i32,
+    fn_task_arena_init: i32,
+    fn_task_worker_entry: i32,
+
+    // Per-TypeId synthesized helper maps (indexed by TypeId; -1 if none)
+    drop_fns: []i32,
+    clone_fns: []i32,
+    iso_clone_fns: []i32,
+    freeze_fns: []i32,
+    type_desc_ids: []i32,
+
+    // Dense TYPE_DESC_TABLE descriptors (desc_id = 0..type_descs.len-1)
+    type_descs: []TypeDescInfo,
+
+    // Next available fn_id after runtime synthesis
+    next_fn_id: i32,
+}
+
+// Shared interned FnPtr signature TypeIds used by runtime calls
+struct RuntimeSigs {
+    ptr_to_unit: i32,           // fn(ptr) -> ()
+    ptr_to_ptr: i32,            // fn(ptr) -> ptr
+    ptr_to_bool: i32,           // fn(ptr) -> bool
+    ptr_to_i64: i32,            // fn(ptr) -> i64
+    ptr_i64_to_ptr: i32,        // fn(ptr, i64) -> ptr
+    i64_ptr_to_ptr: i32,        // fn(i64, ptr) -> ptr
+    ptr_i64_i64_to_ptr: i32,    // fn(ptr, i64, i64) -> ptr
+    ptr_ptr_i64_to_bool: i32,   // fn(ptr, ptr, i64) -> bool
+    ptr_i64x4_to_ptr: i32,      // fn(ptr, i64, i64, i64, i64) -> ptr
+    cb_push: i32,               // fn(ptr, ptr, ptr, i64) -> ()
+    cb_pop: i32,                // fn(ptr, ptr, ptr) -> ()
+    cb_enter: i32,              // fn(ptr, ptr) -> ptr
+    cb_exit: i32,               // fn(ptr, ptr) -> ()
+    arena_init: i32,            // fn(ptr, ptr, i64) -> ()
+}
+
+fn p_copy(ty: i32) -> ht.ParamEntry {
+    ht.ParamEntry { ty: ty, mode: .CopyVal }
+}
+
+fn intern_runtime_sigs(types: &mut ht.TypeTable) -> RuntimeSigs {
+    empty_from: []ht.FromEdge = []
+    p1_ptr: []ht.ParamEntry = [p_copy(ht.TY_PTR)]
+    p_ptr_i64: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_I64)]
+    p_i64_ptr: []ht.ParamEntry = [p_copy(ht.TY_I64), p_copy(ht.TY_PTR)]
+    p_ptr_i64_i64: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_I64), p_copy(ht.TY_I64)]
+    p_ptr_ptr_i64: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_PTR), p_copy(ht.TY_I64)]
+    p_slice: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_I64), p_copy(ht.TY_I64), p_copy(ht.TY_I64), p_copy(ht.TY_I64)]
+    p_cb_push: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_PTR), p_copy(ht.TY_PTR), p_copy(ht.TY_I64)]
+    p_cb_pop: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_PTR), p_copy(ht.TY_PTR)]
+    p_cb_pair: []ht.ParamEntry = [p_copy(ht.TY_PTR), p_copy(ht.TY_PTR)]
+
+    sigs := RuntimeSigs {
+        ptr_to_unit: ht.add_fn_ptr(&mut types, &p1_ptr, ht.TY_UNIT, &empty_from),
+        ptr_to_ptr: ht.add_fn_ptr(&mut types, &p1_ptr, ht.TY_PTR, &empty_from),
+        ptr_to_bool: ht.add_fn_ptr(&mut types, &p1_ptr, ht.TY_BOOL, &empty_from),
+        ptr_to_i64: ht.add_fn_ptr(&mut types, &p1_ptr, ht.TY_I64, &empty_from),
+        ptr_i64_to_ptr: ht.add_fn_ptr(&mut types, &p_ptr_i64, ht.TY_PTR, &empty_from),
+        i64_ptr_to_ptr: ht.add_fn_ptr(&mut types, &p_i64_ptr, ht.TY_PTR, &empty_from),
+        ptr_i64_i64_to_ptr: ht.add_fn_ptr(&mut types, &p_ptr_i64_i64, ht.TY_PTR, &empty_from),
+        ptr_ptr_i64_to_bool: ht.add_fn_ptr(&mut types, &p_ptr_ptr_i64, ht.TY_BOOL, &empty_from),
+        ptr_i64x4_to_ptr: ht.add_fn_ptr(&mut types, &p_slice, ht.TY_PTR, &empty_from),
+        cb_push: ht.add_fn_ptr(&mut types, &p_cb_push, ht.TY_UNIT, &empty_from),
+        cb_pop: ht.add_fn_ptr(&mut types, &p_cb_pop, ht.TY_UNIT, &empty_from),
+        cb_enter: ht.add_fn_ptr(&mut types, &p_cb_pair, ht.TY_PTR, &empty_from),
+        cb_exit: ht.add_fn_ptr(&mut types, &p_cb_pair, ht.TY_UNIT, &empty_from),
+        arena_init: ht.add_fn_ptr(&mut types, &p_ptr_ptr_i64, ht.TY_UNIT, &empty_from),
+    }
+    ht.seal(&mut types)
+    sigs
+}
+
+// =========================================================================
+// SSA IR Building Helpers (Portable Across ARM64, x86_64 & WASM32)
+// =========================================================================
+
+fn align_up_i32(v: i32, al: i32) -> i32 {
+    if al <= 1 { return v }
+    rem := v % al
+    if rem == 0 { v } else { v + (al - rem) }
+}
+
+// Compute `ptr + byte_delta` cleanly using i64 arithmetic + Cast so offsets are always >= 0
+// on Load/Store (required by WASM unsigned memory offsets!).
+fn emit_ptr_add_i64(f: &mut ssa.SsaFunc, bb: i32, base_ptr: i32, delta_i64: i32) -> i32 {
+    base_i := ssa.emit_cast(&mut f, bb, ht.TY_I64, base_ptr, 0, 0)
+    sum_i := ssa.emit_binary(&mut f, bb, ht.TY_I64, hb.BINOP_ADD, base_i, delta_i64, 0, 0)
+    ssa.emit_cast(&mut f, bb, ht.TY_PTR, sum_i, 0, 0)
+}
+
+fn emit_ptr_add_const(f: &mut ssa.SsaFunc, bb: i32, base_ptr: i32, delta: i64) -> i32 {
+    if delta == 0 { return base_ptr }
+    c := ssa.emit_const_int(&mut f, bb, ht.TY_I64, delta, 0, 0)
+    emit_ptr_add_i64(&mut f, bb, base_ptr, c)
+}
+
+fn emit_ptr_sub_const(f: &mut ssa.SsaFunc, bb: i32, base_ptr: i32, delta: i64) -> i32 {
+    if delta == 0 { return base_ptr }
+    base_i := ssa.emit_cast(&mut f, bb, ht.TY_I64, base_ptr, 0, 0)
+    c := ssa.emit_const_int(&mut f, bb, ht.TY_I64, delta, 0, 0)
+    diff_i := ssa.emit_binary(&mut f, bb, ht.TY_I64, hb.BINOP_SUB, base_i, c, 0, 0)
+    ssa.emit_cast(&mut f, bb, ht.TY_PTR, diff_i, 0, 0)
+}
+
+fn emit_is_null(f: &mut ssa.SsaFunc, bb: i32, p: i32) -> i32 {
+    pi := ssa.emit_cast(&mut f, bb, ht.TY_I64, p, 0, 0)
+    z := ssa.emit_const_int(&mut f, bb, ht.TY_I64, 0, 0, 0)
+    ssa.emit_binary(&mut f, bb, ht.TY_BOOL, hb.BINOP_EQ, pi, z, 0, 0)
+}
+
+fn emit_null_ptr(f: &mut ssa.SsaFunc, bb: i32) -> i32 {
+    z := ssa.emit_const_int(&mut f, bb, ht.TY_I64, 0, 0, 0)
+    ssa.emit_cast(&mut f, bb, ht.TY_PTR, z, 0, 0)
+}
+
+fn emit_call_term(f: &mut ssa.SsaFunc, bb: i32, callee: i32, sig_ty: i32,
+    args: &[]i32, ret_ty: i32, next_bb: i32) -> i32 {
+    a_start := ssa.push_val_args(&mut f, &args)
+    mut dest_val := -1
+    if ret_ty != ht.TY_UNIT {
+        dest_val = ssa.add_val(&mut f, ret_ty, bb, ssa.DEF_TERM_RESULT)
+    }
+    mut tm := ssa.make_term(.Call)
+    tm.callee = callee
+    tm.sig_ty = sig_ty
+    tm.dest_val = dest_val
+    tm.arg_start = a_start
+    tm.arg_len = args.len
+    tm.target_a = next_bb
+    _ := ssa.set_term(&mut f, bb, tm)
+    dest_val
+}
+
+fn emit_indirect_call_term(f: &mut ssa.SsaFunc, bb: i32, fn_val: i32, sig_ty: i32,
+    args: &[]i32, ret_ty: i32, next_bb: i32) -> i32 {
+    a_start := ssa.push_val_args(&mut f, &args)
+    mut dest_val := -1
+    if ret_ty != ht.TY_UNIT {
+        dest_val = ssa.add_val(&mut f, ret_ty, bb, ssa.DEF_TERM_RESULT)
+    }
+    mut tm := ssa.make_term(.IndirectCall)
+    tm.cond_val = fn_val
+    tm.env_val = -1
+    tm.sig_ty = sig_ty
+    tm.dest_val = dest_val
+    tm.arg_start = a_start
+    tm.arg_len = args.len
+    tm.target_a = next_bb
+    _ := ssa.set_term(&mut f, bb, tm)
+    dest_val
+}
+
+// =========================================================================
+// 1. Bump Allocator Fast / Slow Path & Pool Free
+// =========================================================================
+
+// __dunder_rt_bump_alloc_slow(arena_ctx: ptr, aligned: i64) -> ptr
+// Grows arena by max(65536, aligned) via AllocHeap, traps OOM (109) on null, updates arena_ctx.
+fn synth_bump_alloc_slow(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_bump_alloc_slow", "<ssa_runtime>",
+        sigs.ptr_i64_to_ptr, ht.TY_PTR, 2, true)
+    p_ctx := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_aligned := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_oom := ssa.add_block(&mut f)
+    bb_ok := ssa.add_block(&mut f)
+
+    // slab_sz = max(65536, aligned)
+    c_min := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 65536, 0, 0)
+    is_big := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_GT, p_aligned, c_min, 0, 0)
+    slab_sz := ssa.emit_inst(&mut f, bb_entry,
+        ssa.make_inst(.Select, ht.TY_I64, is_big, p_aligned, c_min, 0, -1, 0, -1, 0, 0, 0, 0))
+
+    raw := ssa.emit_inst(&mut f, bb_entry,
+        ssa.make_inst(.AllocHeap, ht.TY_PTR, slab_sz, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    null_chk := emit_is_null(&mut f, bb_entry, raw)
+    no_args: []i32 = []
+    _ := ssa.set_branch(&mut f, bb_entry, null_chk, bb_oom, &no_args, bb_ok, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_oom, TRAP_OOM, 0, 0)
+
+    // Update arena_ctx: [0]=raw+aligned, [8]=raw+slab_sz, [16]=raw, [24]=slab_sz
+    raw_i := ssa.emit_cast(&mut f, bb_ok, ht.TY_I64, raw, 0, 0)
+    new_cur := ssa.emit_binary(&mut f, bb_ok, ht.TY_I64, hb.BINOP_ADD, raw_i, p_aligned, 0, 0)
+    new_end := ssa.emit_binary(&mut f, bb_ok, ht.TY_I64, hb.BINOP_ADD, raw_i, slab_sz, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_ctx, new_cur, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_ctx, new_end, 8, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_ctx, raw_i, 16, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_ctx, slab_sz, 24, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_ok, raw, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_bump_alloc(arena_ctx: ptr, bytes: i64) -> ptr
+fn synth_bump_alloc(fn_id: i32, slow_fn: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_bump_alloc", "<ssa_runtime>",
+        sigs.ptr_i64_to_ptr, ht.TY_PTR, 2, true)
+    p_ctx := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_bytes := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_fast := ssa.add_block(&mut f)
+    bb_slow := ssa.add_block(&mut f)
+    bb_slow_ret := ssa.add_block(&mut f)
+
+    // Clamp bytes to >= 16 and align up to 16: aligned = ((n + 15) / 16) * 16
+    c16 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 16, 0, 0)
+    c15 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 15, 0, 0)
+    too_small := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_LT, p_bytes, c16, 0, 0)
+    req := ssa.emit_inst(&mut f, bb_entry,
+        ssa.make_inst(.Select, ht.TY_I64, too_small, c16, p_bytes, 0, -1, 0, -1, 0, 0, 0, 0))
+    plus15 := ssa.emit_binary(&mut f, bb_entry, ht.TY_I64, hb.BINOP_ADD, req, c15, 0, 0)
+    blocks := ssa.emit_binary(&mut f, bb_entry, ht.TY_I64, hb.BINOP_DIV, plus15, c16, 0, 0)
+    aligned := ssa.emit_binary(&mut f, bb_entry, ht.TY_I64, hb.BINOP_MUL, blocks, c16, 0, 0)
+
+    cur := ssa.emit_load(&mut f, bb_entry, ht.TY_I64, p_ctx, 0, -1, 0, 0)
+    end := ssa.emit_load(&mut f, bb_entry, ht.TY_I64, p_ctx, 8, -1, 0, 0)
+    next := ssa.emit_binary(&mut f, bb_entry, ht.TY_I64, hb.BINOP_ADD, cur, aligned, 0, 0)
+
+    // Fast path iff cur != 0 && next <= end
+    c0 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 0, 0, 0)
+    has_cur := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_NE, cur, c0, 0, 0)
+    fits := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_LE, next, end, 0, 0)
+    fast_ok := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_AND, has_cur, fits, 0, 0)
+    no_args: []i32 = []
+    _ := ssa.set_branch(&mut f, bb_entry, fast_ok, bb_fast, &no_args, bb_slow, &no_args, 0, 0)
+
+    // Fast bump
+    ssa.emit_store(&mut f, bb_fast, ht.TY_I64, p_ctx, next, 0, -1, 0, 0)
+    res_fast := ssa.emit_cast(&mut f, bb_fast, ht.TY_PTR, cur, 0, 0)
+    _ := ssa.set_return(&mut f, bb_fast, res_fast, 0, 0)
+
+    // Slow path
+    slow_args: []i32 = [p_ctx, aligned]
+    res_slow := emit_call_term(&mut f, bb_slow, slow_fn, sigs.ptr_i64_to_ptr, &slow_args, ht.TY_PTR, bb_slow_ret)
+    _ := ssa.set_return(&mut f, bb_slow_ret, res_slow, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_pool_free(p: ptr) -> ()
+// Guards null, detects double-free sentinel (-1 -> trap 110), marks RC_FREED (-1).
+fn synth_pool_free(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_pool_free", "<ssa_runtime>",
+        sigs.ptr_to_unit, ht.TY_UNIT, 1, true)
+    p := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_done := ssa.add_block(&mut f)
+    bb_check := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+    bb_mark := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, p)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_done, &no_args, bb_check, &no_args, 0, 0)
+
+    _ := ssa.set_return(&mut f, bb_done, -1, 0, 0)
+
+    hdr := emit_ptr_sub_const(&mut f, bb_check, p, 8)
+    rc := ssa.emit_load(&mut f, bb_check, ht.TY_I64, hdr, 0, -1, 0, 0)
+    c_freed := ssa.emit_const_int(&mut f, bb_check, ht.TY_I64, RC_FREED, 0, 0)
+    is_freed := ssa.emit_binary(&mut f, bb_check, ht.TY_BOOL, hb.BINOP_EQ, rc, c_freed, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_check, is_freed, bb_trap, &no_args, bb_mark, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_USE_AFTER_FREE, 0, 0)
+
+    ssa.emit_store(&mut f, bb_mark, ht.TY_I64, hdr, c_freed, 0, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_mark, -1, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// =========================================================================
+// 2. String / Array / Slice Runtime Primitives
+// =========================================================================
+
+// __dunder_rt_string_iso_clone(src: ptr) -> ptr
+// Deep-copies a Dunder string ([p-8]=rc, [p+0]=len:i64, [p+8..]=utf8 bytes) into local arena with rc=1.
+fn synth_string_iso_clone(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_string_iso_clone", "<ssa_runtime>",
+        sigs.ptr_to_ptr, ht.TY_PTR, 1, true)
+    src := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_null := ssa.add_block(&mut f)
+    bb_alloc := ssa.add_block(&mut f)
+    bb_loop := ssa.add_block(&mut f)
+    bb_body := ssa.add_block(&mut f)
+    bb_done := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, src)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_null, &no_args, bb_alloc, &no_args, 0, 0)
+
+    nptr := emit_null_ptr(&mut f, bb_null)
+    _ := ssa.set_return(&mut f, bb_null, nptr, 0, 0)
+
+    // Load byte length at [src + 0], allocate 16 + len + 1 bytes ([0]=rc=1, [8]=len, [16..]=bytes, NUL)
+    slen := ssa.emit_load(&mut f, bb_alloc, ht.TY_I64, src, 0, -1, 0, 0)
+    c17 := ssa.emit_const_int(&mut f, bb_alloc, ht.TY_I64, 17, 0, 0)
+    total := ssa.emit_binary(&mut f, bb_alloc, ht.TY_I64, hb.BINOP_ADD, slen, c17, 0, 0)
+    raw := ssa.emit_inst(&mut f, bb_alloc,
+        ssa.make_inst(.AllocHeap, ht.TY_PTR, total, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    c1 := ssa.emit_const_int(&mut f, bb_alloc, ht.TY_I64, 1, 0, 0)
+    ssa.emit_store(&mut f, bb_alloc, ht.TY_I64, raw, c1, 0, -1, 0, 0)
+    dst := emit_ptr_add_const(&mut f, bb_alloc, raw, 8)
+    ssa.emit_store(&mut f, bb_alloc, ht.TY_I64, dst, slen, 0, -1, 0, 0)
+    src_data := emit_ptr_add_const(&mut f, bb_alloc, src, 8)
+    dst_data := emit_ptr_add_const(&mut f, bb_alloc, dst, 8)
+
+    c0 := ssa.emit_const_int(&mut f, bb_alloc, ht.TY_I64, 0, 0, 0)
+    loop_init: []i32 = [c0]
+    _ := ssa.set_goto(&mut f, bb_alloc, bb_loop, &loop_init, 0, 0)
+
+    // Loop: copy 0..slen bytes
+    iv := ssa.add_block_param(&mut f, bb_loop, ht.TY_I64)
+    cond := ssa.emit_binary(&mut f, bb_loop, ht.TY_BOOL, hb.BINOP_LT, iv, slen, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_loop, cond, bb_body, &no_args, bb_done, &no_args, 0, 0)
+
+    sp := emit_ptr_add_i64(&mut f, bb_body, src_data, iv)
+    dp := emit_ptr_add_i64(&mut f, bb_body, dst_data, iv)
+    bval := ssa.emit_load(&mut f, bb_body, ht.TY_U8, sp, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_body, ht.TY_U8, dp, bval, 0, -1, 0, 0)
+    next_i := ssa.emit_binary(&mut f, bb_body, ht.TY_I64, hb.BINOP_ADD, iv, c1, 0, 0)
+    next_args: []i32 = [next_i]
+    _ := ssa.set_goto(&mut f, bb_body, bb_loop, &next_args, 0, 0)
+
+    // Write NUL terminator and return dst
+    end_p := emit_ptr_add_i64(&mut f, bb_done, dst_data, slen)
+    z8 := ssa.emit_const_int(&mut f, bb_done, ht.TY_U8, 0, 0, 0)
+    ssa.emit_store(&mut f, bb_done, ht.TY_U8, end_p, z8, 0, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_done, dst, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_bytes_eq(a: ptr, b: ptr, len: i64) -> bool
+fn synth_bytes_eq(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_bytes_eq", "<ssa_runtime>",
+        sigs.ptr_ptr_i64_to_bool, ht.TY_BOOL, 3, true)
+    pa := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    pb := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    plen := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_loop := ssa.add_block(&mut f)
+    bb_body := ssa.add_block(&mut f)
+    bb_next := ssa.add_block(&mut f)
+    bb_false := ssa.add_block(&mut f)
+    bb_true := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    c0 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 0, 0, 0)
+    c1 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 1, 0, 0)
+    init_args: []i32 = [c0]
+    _ := ssa.set_goto(&mut f, bb_entry, bb_loop, &init_args, 0, 0)
+
+    iv := ssa.add_block_param(&mut f, bb_loop, ht.TY_I64)
+    more := ssa.emit_binary(&mut f, bb_loop, ht.TY_BOOL, hb.BINOP_LT, iv, plen, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_loop, more, bb_body, &no_args, bb_true, &no_args, 0, 0)
+
+    ap := emit_ptr_add_i64(&mut f, bb_body, pa, iv)
+    bp := emit_ptr_add_i64(&mut f, bb_body, pb, iv)
+    av := ssa.emit_load(&mut f, bb_body, ht.TY_U8, ap, 0, -1, 0, 0)
+    bv := ssa.emit_load(&mut f, bb_body, ht.TY_U8, bp, 0, -1, 0, 0)
+    same := ssa.emit_binary(&mut f, bb_body, ht.TY_BOOL, hb.BINOP_EQ, av, bv, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_body, same, bb_next, &no_args, bb_false, &no_args, 0, 0)
+
+    ni := ssa.emit_binary(&mut f, bb_next, ht.TY_I64, hb.BINOP_ADD, iv, c1, 0, 0)
+    nargs: []i32 = [ni]
+    _ := ssa.set_goto(&mut f, bb_next, bb_loop, &nargs, 0, 0)
+
+    bf := ssa.emit_const_int(&mut f, bb_false, ht.TY_BOOL, 0, 0, 0)
+    _ := ssa.set_return(&mut f, bb_false, bf, 0, 0)
+
+    bt := ssa.emit_const_int(&mut f, bb_true, ht.TY_BOOL, 1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_true, bt, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_slice_bounds_addr(base: ptr, arr_len: i64, lo: i64, hi: i64, stride: i64) -> ptr
+// Enforces 0 <= lo <= hi <= arr_len (traps TRAP_BOUNDS=103 on OOB), returns base + lo * stride.
+fn synth_slice_bounds_addr(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_slice_bounds_addr", "<ssa_runtime>",
+        sigs.ptr_i64x4_to_ptr, ht.TY_PTR, 5, true)
+    p_base := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_len := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+    p_lo := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+    p_hi := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+    p_stride := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_ok := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+
+    c0 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 0, 0, 0)
+    ok1 := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_GE, p_lo, c0, 0, 0)
+    ok2 := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_LE, p_lo, p_hi, 0, 0)
+    ok3 := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_LE, p_hi, p_len, 0, 0)
+    ok12 := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_AND, ok1, ok2, 0, 0)
+    ok_all := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_AND, ok12, ok3, 0, 0)
+    no_args: []i32 = []
+    _ := ssa.set_branch(&mut f, bb_entry, ok_all, bb_ok, &no_args, bb_trap, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, hb.TRAP_BOUNDS, 0, 0)
+
+    off := ssa.emit_binary(&mut f, bb_ok, ht.TY_I64, hb.BINOP_MUL, p_lo, p_stride, 0, 0)
+    res := emit_ptr_add_i64(&mut f, bb_ok, p_base, off)
+    _ := ssa.set_return(&mut f, bb_ok, res, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// =========================================================================
+// 3. Refcount Sentinels & Bounded TYPE_DESC_TABLE Dispatch
+// =========================================================================
+
+// __dunder_rt_rc_release_checked(p: ptr) -> bool
+// Returns true IFF rc == 1 (marking RC_FREED = -1 first so dispose runs strictly at rc == 1!).
+// Sentinels: 0 -> false (static), -1 -> TRAP 110 (UAF), <= -2 -> false (frozen no-op).
+fn synth_rc_release_checked(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_rc_release_checked", "<ssa_runtime>",
+        sigs.ptr_to_bool, ht.TY_BOOL, 1, true)
+    p := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_false := ssa.add_block(&mut f)
+    bb_load := ssa.add_block(&mut f)
+    bb_neg := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+    bb_pos := ssa.add_block(&mut f)
+    bb_last := ssa.add_block(&mut f)
+    bb_decr := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, p)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_false, &no_args, bb_load, &no_args, 0, 0)
+
+    bf := ssa.emit_const_int(&mut f, bb_false, ht.TY_BOOL, 0, 0, 0)
+    _ := ssa.set_return(&mut f, bb_false, bf, 0, 0)
+
+    hdr := emit_ptr_sub_const(&mut f, bb_load, p, 8)
+    rc := ssa.emit_load(&mut f, bb_load, ht.TY_I64, hdr, 0, -1, 0, 0)
+    c0 := ssa.emit_const_int(&mut f, bb_load, ht.TY_I64, 0, 0, 0)
+    is_pos := ssa.emit_binary(&mut f, bb_load, ht.TY_BOOL, hb.BINOP_GT, rc, c0, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_load, is_pos, bb_pos, &no_args, bb_neg, &no_args, 0, 0)
+
+    // rc <= 0: if rc == -1 -> trap 110 (UAF); else (0 static or <= -2 frozen) -> false
+    c_freed := ssa.emit_const_int(&mut f, bb_neg, ht.TY_I64, RC_FREED, 0, 0)
+    is_freed := ssa.emit_binary(&mut f, bb_neg, ht.TY_BOOL, hb.BINOP_EQ, rc, c_freed, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_neg, is_freed, bb_trap, &no_args, bb_false, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_USE_AFTER_FREE, 0, 0)
+
+    // rc > 0: if rc == 1 -> mark RC_FREED and return true; else store rc - 1 and return false
+    c1 := ssa.emit_const_int(&mut f, bb_pos, ht.TY_I64, 1, 0, 0)
+    is_one := ssa.emit_binary(&mut f, bb_pos, ht.TY_BOOL, hb.BINOP_EQ, rc, c1, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_pos, is_one, bb_last, &no_args, bb_decr, &no_args, 0, 0)
+
+    c_poison := ssa.emit_const_int(&mut f, bb_last, ht.TY_I64, RC_FREED, 0, 0)
+    ssa.emit_store(&mut f, bb_last, ht.TY_I64, hdr, c_poison, 0, -1, 0, 0)
+    bt := ssa.emit_const_int(&mut f, bb_last, ht.TY_BOOL, 1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_last, bt, 0, 0)
+
+    rc_dec := ssa.emit_binary(&mut f, bb_decr, ht.TY_I64, hb.BINOP_SUB, rc, c1, 0, 0)
+    ssa.emit_store(&mut f, bb_decr, ht.TY_I64, hdr, rc_dec, 0, -1, 0, 0)
+    _ := ssa.set_goto(&mut f, bb_decr, bb_false, &no_args, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_type_desc_lookup(table_ptr: ptr, table_count: i64, desc_id: i64) -> ptr
+// Bounds-checked .rodata TYPE_DESC_TABLE[desc_id].iso_fn lookup (traps 112 on OOB).
+fn synth_type_desc_lookup(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_type_desc_lookup", "<ssa_runtime>",
+        sigs.ptr_i64_i64_to_ptr, ht.TY_PTR, 3, true)
+    p_tbl := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_cnt := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+    p_id := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_ok := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+
+    c0 := ssa.emit_const_int(&mut f, bb_entry, ht.TY_I64, 0, 0, 0)
+    ge0 := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_GE, p_id, c0, 0, 0)
+    ltc := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_LT, p_id, p_cnt, 0, 0)
+    in_bounds := ssa.emit_binary(&mut f, bb_entry, ht.TY_BOOL, hb.BINOP_AND, ge0, ltc, 0, 0)
+    no_args: []i32 = []
+    _ := ssa.set_branch(&mut f, bb_entry, in_bounds, bb_ok, &no_args, bb_trap, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_TYPE_DESC_OOB, 0, 0)
+
+    // entry_ptr = table_ptr + desc_id * 32; iso_fn at offset +16
+    c32 := ssa.emit_const_int(&mut f, bb_ok, ht.TY_I64, i64(TYPE_DESC_ENTRY_BYTES), 0, 0)
+    off := ssa.emit_binary(&mut f, bb_ok, ht.TY_I64, hb.BINOP_MUL, p_id, c32, 0, 0)
+    entry_p := emit_ptr_add_i64(&mut f, bb_ok, p_tbl, off)
+    iso_p := ssa.emit_load(&mut f, bb_ok, ht.TY_PTR, entry_p, 16, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_ok, iso_p, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_type_desc_dispatch(desc_id: i64, src: ptr) -> ptr
+// Portable bounded Switch dispatch over all registered compound TypeDescInfo entries.
+// Any out-of-range desc_id traps with TRAP_TYPE_DESC_OOB (112) — zero arbitrary `blr -rc`!
+fn synth_type_desc_dispatch(fn_id: i32, descs: &[]TypeDescInfo, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_type_desc_dispatch", "<ssa_runtime>",
+        sigs.i64_ptr_to_ptr, ht.TY_PTR, 2, true)
+    p_id := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+    p_src := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    if descs.len == 0 {
+        _ := ssa.set_trap(&mut f, bb_entry, TRAP_TYPE_DESC_OOB, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    bb_trap := ssa.add_block(&mut f)
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_TYPE_DESC_OOB, 0, 0)
+
+    mut case_vals: []i64 = []
+    mut case_bbs: []i32 = []
+    for i in 0..descs.len {
+        d := &descs[i]
+        bb_c := ssa.add_block(&mut f)
+        bb_r := ssa.add_block(&mut f)
+        case_vals.push(i64(d.desc_id))
+        case_bbs.push(bb_c)
+        if d.iso_fn >= 0 {
+            cargs: []i32 = [p_src]
+            cloned := emit_call_term(&mut f, bb_c, d.iso_fn, sigs.ptr_to_ptr, &cargs, ht.TY_PTR, bb_r)
+            _ := ssa.set_return(&mut f, bb_r, cloned, 0, 0)
+        } else {
+            _ := ssa.set_return(&mut f, bb_c, p_src, 0, 0)
+            _ := ssa.set_return(&mut f, bb_r, p_src, 0, 0)
+        }
+    }
+
+    c_start := ssa.push_switch_cases(&mut f, &case_vals, &case_bbs)
+    mut sw := ssa.make_term(.Switch)
+    sw.cond_val = p_id
+    sw.target_a = bb_trap
+    sw.case_start = c_start
+    sw.case_len = case_vals.len
+    _ := ssa.set_term(&mut f, bb_entry, sw)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_rc_retain(p: ptr) -> ptr
+// Preserves all 4 RC bands:
+//   rc == 0  : static/immortal literal -> return p
+//   rc > 0   : normal local RC -> rc += 1, return p
+//   rc == -1 : freed sentinel -> TRAP 110 (UAF)
+//   rc == -2 : frozen string -> rt_string_iso_clone(p)
+//   rc <= -3 : frozen compound -> desc_id = (-rc) - 3 -> rt_type_desc_dispatch(desc_id, p) (OOB -> TRAP 112)
+fn synth_rc_retain(fn_id: i32, str_iso_fn: i32, desc_dispatch_fn: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_rc_retain", "<ssa_runtime>",
+        sigs.ptr_to_ptr, ht.TY_PTR, 1, true)
+    p := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_ret_p := ssa.add_block(&mut f)
+    bb_load := ssa.add_block(&mut f)
+    bb_inc := ssa.add_block(&mut f)
+    bb_nonpos := ssa.add_block(&mut f)
+    bb_neg := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+    bb_frozen := ssa.add_block(&mut f)
+    bb_str_iso := ssa.add_block(&mut f)
+    bb_str_ret := ssa.add_block(&mut f)
+    bb_cmp_iso := ssa.add_block(&mut f)
+    bb_cmp_ret := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, p)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_ret_p, &no_args, bb_load, &no_args, 0, 0)
+
+    _ := ssa.set_return(&mut f, bb_ret_p, p, 0, 0)
+
+    hdr := emit_ptr_sub_const(&mut f, bb_load, p, 8)
+    rc := ssa.emit_load(&mut f, bb_load, ht.TY_I64, hdr, 0, -1, 0, 0)
+    c0 := ssa.emit_const_int(&mut f, bb_load, ht.TY_I64, 0, 0, 0)
+    is_pos := ssa.emit_binary(&mut f, bb_load, ht.TY_BOOL, hb.BINOP_GT, rc, c0, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_load, is_pos, bb_inc, &no_args, bb_nonpos, &no_args, 0, 0)
+
+    // rc > 0: increment and return p
+    c1 := ssa.emit_const_int(&mut f, bb_inc, ht.TY_I64, 1, 0, 0)
+    rc_inc := ssa.emit_binary(&mut f, bb_inc, ht.TY_I64, hb.BINOP_ADD, rc, c1, 0, 0)
+    ssa.emit_store(&mut f, bb_inc, ht.TY_I64, hdr, rc_inc, 0, -1, 0, 0)
+    _ := ssa.set_goto(&mut f, bb_inc, bb_ret_p, &no_args, 0, 0)
+
+    // rc <= 0: rc == 0 -> static literal
+    is_zero := ssa.emit_binary(&mut f, bb_nonpos, ht.TY_BOOL, hb.BINOP_EQ, rc, c0, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_nonpos, is_zero, bb_ret_p, &no_args, bb_neg, &no_args, 0, 0)
+
+    // rc < 0: rc == -1 -> freed sentinel trap 110
+    cm1 := ssa.emit_const_int(&mut f, bb_neg, ht.TY_I64, RC_FREED, 0, 0)
+    is_freed := ssa.emit_binary(&mut f, bb_neg, ht.TY_BOOL, hb.BINOP_EQ, rc, cm1, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_neg, is_freed, bb_trap, &no_args, bb_frozen, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_USE_AFTER_FREE, 0, 0)
+
+    // rc <= -2: rc == -2 -> frozen string iso-clone; rc <= -3 -> TYPE_DESC_TABLE[(-rc)-3]
+    cm2 := ssa.emit_const_int(&mut f, bb_frozen, ht.TY_I64, RC_FROZEN_STR, 0, 0)
+    is_fstr := ssa.emit_binary(&mut f, bb_frozen, ht.TY_BOOL, hb.BINOP_EQ, rc, cm2, 0, 0)
+    _ := ssa.set_branch(&mut f, bb_frozen, is_fstr, bb_str_iso, &no_args, bb_cmp_iso, &no_args, 0, 0)
+
+    sargs: []i32 = [p]
+    s_cloned := emit_call_term(&mut f, bb_str_iso, str_iso_fn, sigs.ptr_to_ptr, &sargs, ht.TY_PTR, bb_str_ret)
+    _ := ssa.set_return(&mut f, bb_str_ret, s_cloned, 0, 0)
+
+    // desc_id = (0 - rc) - 3
+    neg_rc := ssa.emit_binary(&mut f, bb_cmp_iso, ht.TY_I64, hb.BINOP_SUB, c0, rc, 0, 0)
+    c3 := ssa.emit_const_int(&mut f, bb_cmp_iso, ht.TY_I64, 3, 0, 0)
+    desc_id := ssa.emit_binary(&mut f, bb_cmp_iso, ht.TY_I64, hb.BINOP_SUB, neg_rc, c3, 0, 0)
+    dargs: []i32 = [desc_id, p]
+    c_cloned := emit_call_term(&mut f, bb_cmp_iso, desc_dispatch_fn, sigs.i64_ptr_to_ptr, &dargs, ht.TY_PTR, bb_cmp_ret)
+    _ := ssa.set_return(&mut f, bb_cmp_ret, c_cloned, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// =========================================================================
+// 4. OS Dynamic TLS CallbackFrame Push / Pop / Trampoline Guard (S-7)
+// =========================================================================
+
+// __dunder_rt_cb_frame_push(tls_slot: ptr, frame: ptr, arena_ctx: ptr, token: i64) -> ()
+// Pushes a stack-allocated CallbackFrame onto the thread's dynamic TLS linked list (lock-free, re-entrant).
+fn synth_cb_frame_push(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_cb_frame_push", "<ssa_runtime>",
+        sigs.cb_push, ht.TY_UNIT, 4, true)
+    p_tls := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_frame := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_arena := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_token := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb0 := ssa.add_block(&mut f)
+    prev := ssa.emit_load(&mut f, bb0, ht.TY_PTR, p_tls, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_PTR, p_frame, prev, 0, -1, 0, 0)
+
+    cur := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_arena, 0, -1, 0, 0)
+    end := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_arena, 8, -1, 0, 0)
+    base := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_arena, 16, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, cur, 8, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, end, 16, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, base, 24, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, p_token, 56, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_PTR, p_tls, p_frame, 0, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb0, -1, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_cb_frame_pop(tls_slot: ptr, frame: ptr, arena_ctx: ptr) -> ()
+// Reloads potentially-updated arena state from CallbackFrame and restores previous TLS head.
+fn synth_cb_frame_pop(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_cb_frame_pop", "<ssa_runtime>",
+        sigs.cb_pop, ht.TY_UNIT, 3, true)
+    p_tls := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_frame := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_arena := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb0 := ssa.add_block(&mut f)
+    cur := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_frame, 8, -1, 0, 0)
+    end := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_frame, 16, -1, 0, 0)
+    base := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_frame, 24, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_arena, cur, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_arena, end, 8, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_arena, base, 16, -1, 0, 0)
+
+    prev := ssa.emit_load(&mut f, bb0, ht.TY_PTR, p_frame, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_PTR, p_tls, prev, 0, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb0, -1, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_cb_trampoline_enter(tls_slot: ptr, arena_ctx: ptr) -> ptr
+// Traps 111 on foreign OS thread (tls head == null); restores Dunder arena state from CallbackFrame.
+fn synth_cb_trampoline_enter(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_cb_trampoline_enter", "<ssa_runtime>",
+        sigs.cb_enter, ht.TY_PTR, 2, true)
+    p_tls := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_arena := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+    bb_ok := ssa.add_block(&mut f)
+
+    frame := ssa.emit_load(&mut f, bb_entry, ht.TY_PTR, p_tls, 0, -1, 0, 0)
+    is_null := emit_is_null(&mut f, bb_entry, frame)
+    no_args: []i32 = []
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_trap, &no_args, bb_ok, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_FOREIGN_CALLBACK, 0, 0)
+
+    cur := ssa.emit_load(&mut f, bb_ok, ht.TY_I64, frame, 8, -1, 0, 0)
+    end := ssa.emit_load(&mut f, bb_ok, ht.TY_I64, frame, 16, -1, 0, 0)
+    base := ssa.emit_load(&mut f, bb_ok, ht.TY_I64, frame, 24, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_arena, cur, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_arena, end, 8, -1, 0, 0)
+    ssa.emit_store(&mut f, bb_ok, ht.TY_I64, p_arena, base, 16, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb_ok, frame, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_cb_trampoline_exit(frame: ptr, arena_ctx: ptr) -> ()
+// Flushes updated arena registers back into CallbackFrame before returning to C.
+fn synth_cb_trampoline_exit(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_cb_trampoline_exit", "<ssa_runtime>",
+        sigs.cb_exit, ht.TY_UNIT, 2, true)
+    p_frame := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_arena := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb0 := ssa.add_block(&mut f)
+    cur := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_arena, 0, -1, 0, 0)
+    end := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_arena, 8, -1, 0, 0)
+    base := ssa.emit_load(&mut f, bb0, ht.TY_I64, p_arena, 16, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, cur, 8, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, end, 16, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_frame, base, 24, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb0, -1, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// =========================================================================
+// 5. Per-Target Task Worker Entry & Arena Init Stubs (Fixing R-3)
+// =========================================================================
+
+// __dunder_rt_task_arena_init(arena_ctx: ptr, pool_base: ptr, pool_bytes: i64) -> ()
+// Zeros 256-byte freelist header and initializes bump_cur = pool_base + 256, bump_end = pool_base + pool_bytes.
+fn synth_task_arena_init(fn_id: i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_task_arena_init", "<ssa_runtime>",
+        sigs.arena_init, ht.TY_UNIT, 3, true)
+    p_ctx := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_base := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+    p_bytes := ssa.add_fn_param_val(&mut f, ht.TY_I64)
+
+    bb0 := ssa.add_block(&mut f)
+    // Zero 256-byte freelist bin header at pool_base
+    _ := ssa.emit_inst(&mut f, bb0,
+        ssa.make_inst(.MemZero, ht.TY_UNIT, p_base, -1, -1, 0, -1, 256, -1, 0, 0, 0, 0))
+    base_i := ssa.emit_cast(&mut f, bb0, ht.TY_I64, p_base, 0, 0)
+    c256 := ssa.emit_const_int(&mut f, bb0, ht.TY_I64, 256, 0, 0)
+    cur := ssa.emit_binary(&mut f, bb0, ht.TY_I64, hb.BINOP_ADD, base_i, c256, 0, 0)
+    end := ssa.emit_binary(&mut f, bb0, ht.TY_I64, hb.BINOP_ADD, base_i, p_bytes, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_ctx, cur, 0, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_ctx, end, 8, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_ctx, base_i, 16, -1, 0, 0)
+    ssa.emit_store(&mut f, bb0, ht.TY_I64, p_ctx, p_bytes, 24, -1, 0, 0)
+    _ := ssa.set_return(&mut f, bb0, -1, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// __dunder_rt_task_worker_entry(task_desc: ptr) -> i64
+// Structured SSA worker entry routine replacing hand-encoded ARM64 words in task_native.ddr:
+//   - Validates task_desc != null (trap 111)
+//   - Initializes per-thread arena via rt_task_arena_init (using target layout without wasted x86_64 8 MiB stack)
+//   - Writes clean saved_fp = 0 unwind root (fixing R-3 macOS ARM64 x29 libdispatch unwinding)
+//   - Transitions state 0 -> 1 (running), invokes worker_fn(arg_ptr), records result & state = 2 (done)
+fn synth_task_worker_entry(fn_id: i32, arena_init_fn: i32, layout: &WorkerLayoutSpec, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_rt_task_worker_entry", "<ssa_runtime>",
+        sigs.ptr_to_i64, ht.TY_I64, 1, true)
+    p_desc := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_trap := ssa.add_block(&mut f)
+    bb_init := ssa.add_block(&mut f)
+    bb_run := ssa.add_block(&mut f)
+    bb_done := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, p_desc)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_trap, &no_args, bb_init, &no_args, 0, 0)
+
+    _ := ssa.set_trap(&mut f, bb_trap, TRAP_FOREIGN_CALLBACK, 0, 0)
+
+    // R-3: Terminate frame pointer chain cleanly on stack-switched workers (macOS ARM64 x29 unwind root)
+    if layout.preserve_frame_pointer {
+        z_fp := ssa.emit_const_int(&mut f, bb_init, ht.TY_I64, 0, 0, 0)
+        ssa.emit_store(&mut f, bb_init, ht.TY_I64, p_desc, z_fp, 48, -1, 0, 0)
+    }
+
+    pool_base := ssa.emit_load(&mut f, bb_init, ht.TY_PTR, p_desc, 8, -1, 0, 0)
+    pool_bytes := ssa.emit_load(&mut f, bb_init, ht.TY_I64, p_desc, 16, -1, 0, 0)
+    arena_ctx := ssa.emit_load(&mut f, bb_init, ht.TY_PTR, p_desc, 56, -1, 0, 0)
+    init_args: []i32 = [arena_ctx, pool_base, pool_bytes]
+    _ := emit_call_term(&mut f, bb_init, arena_init_fn, sigs.arena_init, &init_args, ht.TY_UNIT, bb_run)
+
+    // State = 1 (running)
+    c1 := ssa.emit_const_int(&mut f, bb_run, ht.TY_I64, 1, 0, 0)
+    ssa.emit_store(&mut f, bb_run, ht.TY_I64, p_desc, c1, 0, -1, 0, 0)
+    wfn := ssa.emit_load(&mut f, bb_run, sigs.ptr_to_i64, p_desc, 24, -1, 0, 0)
+    warg := ssa.emit_load(&mut f, bb_run, ht.TY_PTR, p_desc, 32, -1, 0, 0)
+    wargs: []i32 = [warg]
+    res := emit_indirect_call_term(&mut f, bb_run, wfn, sigs.ptr_to_i64, &wargs, ht.TY_I64, bb_done)
+
+    // Store result and mark state = 2 (done)
+    ssa.emit_store(&mut f, bb_done, ht.TY_I64, p_desc, res, 40, -1, 0, 0)
+    c2 := ssa.emit_const_int(&mut f, bb_done, ht.TY_I64, 2, 0, 0)
+    ssa.emit_store(&mut f, bb_done, ht.TY_I64, p_desc, c2, 0, -1, 0, 0)
+    c0 := ssa.emit_const_int(&mut f, bb_done, ht.TY_I64, 0, 0, 0)
+    _ := ssa.set_return(&mut f, bb_done, c0, 0, 0)
+
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// =========================================================================
+// 6. Type-Driven Synthesized Helpers (Drop, Clone, IsoClone, SharedRcFreeze)
+// =========================================================================
+
+fn needs_type_helpers(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    e := &types.entries[ty]
+    k := e.kind
+    if k == .String || k == .Array { return true }
+    if k == .Struct || k == .Tuple || k == .Enum || k == .FixedArr || k == .ClosureEnv {
+        if ht.has_dispose(&types, ty) || !ht.is_copy(&types, ty) { return true }
+    }
+    false
+}
+
+fn is_compound_desc_type(types: &ht.TypeTable, ty: i32) -> bool {
+    if !needs_type_helpers(&types, ty) { return false }
+    k := types.entries[ty].kind
+    k == .Array || k == .Struct || k == .Tuple || k == .Enum || k == .FixedArr || k == .ClosureEnv
+}
+
+fn enum_payload_base_offset(types: &ht.TypeTable, ty: i32) -> i32 {
+    al := types.entries[ty].align
+    align_up_i32(4, if al > 0 { al } else { 4 })
+}
+
+// Look up the exact signature & parameter TypeId of a user `dispose` method in `prog`, if present.
+fn find_dispose_sig_and_param_ty(prog: &ssa.SsaProgram, types: &ht.TypeTable, dispose_fn: i32,
+    fallback_sig: i32) -> (i32, i32) {
+    if dispose_fn >= 0 && dispose_fn < prog.fn_id_to_idx.len {
+        idx := prog.fn_id_to_idx[dispose_fn]
+        if idx >= 0 && idx < prog.funcs.len {
+            df := &prog.funcs[idx]
+            if df.sig_ty >= 0 && df.sig_ty < types.entries.len &&
+                ht.callable_param_count(&types, df.sig_ty) == 1 {
+                ps := ht.callable_param_start(&types, df.sig_ty)
+                return (df.sig_ty, types.params[ps].ty)
+            }
+        }
+    }
+    (fallback_sig, ht.TY_PTR)
+}
+
+// Helper: emit a drop call for a field of type `fty` stored at `field_addr` (pointer to field storage).
+// For heap-handle fields (String, Array, ClosureEnv), loads the handle pointer first.
+// For inline aggregate fields (Struct, Tuple, Enum, FixedArr), passes `field_addr` directly.
+fn emit_field_drop(f: &mut ssa.SsaFunc, cur_bb: i32, types: &ht.TypeTable,
+    field_addr: i32, fty: i32, drop_fns: &[]i32, sigs: &RuntimeSigs) -> i32 {
+    if fty < 0 || fty >= drop_fns.len || drop_fns[fty] < 0 { return cur_bb }
+    fk := types.entries[fty].kind
+    next_bb := ssa.add_block(&mut f)
+    if fk == .String || fk == .Array || fk == .ClosureEnv {
+        h := ssa.emit_load(&mut f, cur_bb, ht.TY_PTR, field_addr, 0, -1, 0, 0)
+        args: []i32 = [h]
+        _ := emit_call_term(&mut f, cur_bb, drop_fns[fty], sigs.ptr_to_unit, &args, ht.TY_UNIT, next_bb)
+    } else {
+        args: []i32 = [field_addr]
+        _ := emit_call_term(&mut f, cur_bb, drop_fns[fty], sigs.ptr_to_unit, &args, ht.TY_UNIT, next_bb)
+    }
+    next_bb
+}
+
+// Synthesize `__dunder_drop_<ty>(p: ptr) -> ()`
+// Guarantees:
+// - Null check
+// - For RC-managed heap objects (String, Array, ClosureEnv) and `@resource(dispose)` types:
+//   calls `rt_rc_release_checked(p)` and runs `dispose_fn` + child drops STRICTLY when `rc == 1`!
+// - For inline structs/tuples/enums/fixed-arrays: drops every non-Copy child in reverse order.
+fn synth_type_drop(fn_id: i32, ty: i32, types: &ht.TypeTable, prog: &ssa.SsaProgram,
+    reg: &RuntimeRegistry, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_drop_" + ty.str(), "<ssa_runtime>",
+        sigs.ptr_to_unit, ht.TY_UNIT, 1, true)
+    p := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_ret := ssa.add_block(&mut f)
+    bb_work := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, p)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_ret, &no_args, bb_work, &no_args, 0, 0)
+    _ := ssa.set_return(&mut f, bb_ret, -1, 0, 0)
+
+    e := &types.entries[ty]
+    k := e.kind
+    mut cur_bb := bb_work
+
+    // String: release RC; if last owner (rc == 1), return (RC already poisoned to -1 by release_checked).
+    if k == .String {
+        rargs: []i32 = [p]
+        bb_after := ssa.add_block(&mut f)
+        _ := emit_call_term(&mut f, cur_bb, reg.fn_rc_release_checked, sigs.ptr_to_bool, &rargs, ht.TY_BOOL, bb_after)
+        _ := ssa.set_return(&mut f, bb_after, -1, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // Array: release RC; if rc == 1, drop non-Copy elements in reverse order [len-1 .. 0].
+    if k == .Array {
+        rargs: []i32 = [p]
+        bb_chk := ssa.add_block(&mut f)
+        should_drop := emit_call_term(&mut f, cur_bb, reg.fn_rc_release_checked, sigs.ptr_to_bool, &rargs, ht.TY_BOOL, bb_chk)
+        elem_ty := e.inner_a
+        has_elem_drop := elem_ty >= 0 && elem_ty < reg.drop_fns.len && reg.drop_fns[elem_ty] >= 0
+        if !has_elem_drop {
+            _ := ssa.set_return(&mut f, bb_chk, -1, 0, 0)
+            ssa.compute_preds(&mut f)
+            return f
+        }
+        bb_drop := ssa.add_block(&mut f)
+        _ := ssa.set_branch(&mut f, bb_chk, should_drop, bb_drop, &no_args, bb_ret, &no_args, 0, 0)
+
+        // Load len from [p - 16] (or header word) and loop 0..len dropping each element
+        len_hdr := emit_ptr_sub_const(&mut f, bb_drop, p, 16)
+        alen := ssa.emit_load(&mut f, bb_drop, ht.TY_I64, len_hdr, 0, -1, 0, 0)
+        c0 := ssa.emit_const_int(&mut f, bb_drop, ht.TY_I64, 0, 0, 0)
+        c1 := ssa.emit_const_int(&mut f, bb_drop, ht.TY_I64, 1, 0, 0)
+        estride := i64(if types.entries[elem_ty].size > 0 { types.entries[elem_ty].size } else { 8 })
+        c_stride := ssa.emit_const_int(&mut f, bb_drop, ht.TY_I64, estride, 0, 0)
+        bb_loop := ssa.add_block(&mut f)
+        bb_body := ssa.add_block(&mut f)
+        linit: []i32 = [c0]
+        _ := ssa.set_goto(&mut f, bb_drop, bb_loop, &linit, 0, 0)
+
+        iv := ssa.add_block_param(&mut f, bb_loop, ht.TY_I64)
+        cond := ssa.emit_binary(&mut f, bb_loop, ht.TY_BOOL, hb.BINOP_LT, iv, alen, 0, 0)
+        _ := ssa.set_branch(&mut f, bb_loop, cond, bb_body, &no_args, bb_ret, &no_args, 0, 0)
+
+        eoff := ssa.emit_binary(&mut f, bb_body, ht.TY_I64, hb.BINOP_MUL, iv, c_stride, 0, 0)
+        ep := emit_ptr_add_i64(&mut f, bb_body, p, eoff)
+        bb_after_e := emit_field_drop(&mut f, bb_body, &types, ep, elem_ty, &reg.drop_fns, &sigs)
+        ni := ssa.emit_binary(&mut f, bb_after_e, ht.TY_I64, hb.BINOP_ADD, iv, c1, 0, 0)
+        nargs: []i32 = [ni]
+        _ := ssa.set_goto(&mut f, bb_after_e, bb_loop, &nargs, 0, 0)
+
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // If this type has its own `@resource(dispose)` (`TF_SELF_DISPOSE`), guard with `rc == 1`!
+    // (When stored in an RC-headered box, `rt_rc_release_checked` guarantees dispose runs strictly at rc == 1.)
+    if ht.has_flag(&types, ty, ht.TF_SELF_DISPOSE) {
+        rargs: []i32 = [p]
+        bb_chk := ssa.add_block(&mut f)
+        should_disp := emit_call_term(&mut f, cur_bb, reg.fn_rc_release_checked, sigs.ptr_to_bool, &rargs, ht.TY_BOOL, bb_chk)
+        bb_disp := ssa.add_block(&mut f)
+        _ := ssa.set_branch(&mut f, bb_chk, should_disp, bb_disp, &no_args, bb_ret, &no_args, 0, 0)
+        cur_bb = bb_disp
+
+        if e.dispose_fn >= 0 {
+            (dsig, dparam_ty) := find_dispose_sig_and_param_ty(&prog, &types, e.dispose_fn, sigs.ptr_to_unit)
+            dp := if dparam_ty == ht.TY_PTR { p } else { ssa.emit_cast(&mut f, cur_bb, dparam_ty, p, 0, 0) }
+            dargs: []i32 = [dp]
+            bb_post_disp := ssa.add_block(&mut f)
+            _ := emit_call_term(&mut f, cur_bb, e.dispose_fn, dsig, &dargs, ht.TY_UNIT, bb_post_disp)
+            cur_bb = bb_post_disp
+        }
+    }
+
+    // Struct / Tuple / ClosureEnv: drop non-Copy fields in reverse declaration order
+    if k == .Struct || k == .Tuple || k == .ClosureEnv {
+        if k == .ClosureEnv {
+            rargs: []i32 = [p]
+            bb_chk := ssa.add_block(&mut f)
+            should_drop := emit_call_term(&mut f, cur_bb, reg.fn_rc_release_checked, sigs.ptr_to_bool, &rargs, ht.TY_BOOL, bb_chk)
+            bb_drop := ssa.add_block(&mut f)
+            _ := ssa.set_branch(&mut f, bb_chk, should_drop, bb_drop, &no_args, bb_ret, &no_args, 0, 0)
+            cur_bb = bb_drop
+        }
+        mut fi := e.count - 1
+        while fi >= 0 {
+            fld := &types.fields[e.inner_a + fi]
+            if fld.ty >= 0 && fld.ty < reg.drop_fns.len && reg.drop_fns[fld.ty] >= 0 {
+                // ClosureEnv fields live after 16-byte [entry_fn, drop_fn] header
+                base_off := if k == .ClosureEnv { 16 + fi * 8 } else { fld.offset }
+                fp := emit_ptr_add_const(&mut f, cur_bb, p, i64(base_off))
+                cur_bb = emit_field_drop(&mut f, cur_bb, &types, fp, fld.ty, &reg.drop_fns, &sigs)
+            }
+            fi -= 1
+        }
+        _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // Enum: switch on tag at [p + 0], drop active variant's non-Copy payload fields
+    if k == .Enum {
+        tag := ssa.emit_load(&mut f, cur_bb, ht.TY_I32, p, 0, -1, 0, 0)
+        pbase := enum_payload_base_offset(&types, ty)
+        mut cvals: []i64 = []
+        mut cbbs: []i32 = []
+        for vi in 0..e.count {
+            v := &types.variants[e.inner_a + vi]
+            mut has_any := false
+            for pi in 0..v.payload_count {
+                pty := types.fields[v.payload_start + pi].ty
+                if pty >= 0 && pty < reg.drop_fns.len && reg.drop_fns[pty] >= 0 { has_any = true; break }
+            }
+            if !has_any { continue }
+            mut vbb := ssa.add_block(&mut f)
+            cvals.push(v.tag_value)
+            cbbs.push(vbb)
+            mut pi := v.payload_count - 1
+            while pi >= 0 {
+                pf := &types.fields[v.payload_start + pi]
+                if pf.ty >= 0 && pf.ty < reg.drop_fns.len && reg.drop_fns[pf.ty] >= 0 {
+                    pp := emit_ptr_add_const(&mut f, vbb, p, i64(pbase + pf.offset))
+                    vbb = emit_field_drop(&mut f, vbb, &types, pp, pf.ty, &reg.drop_fns, &sigs)
+                }
+                pi -= 1
+            }
+            _ := ssa.set_return(&mut f, vbb, -1, 0, 0)
+        }
+        if cvals.len == 0 {
+            _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+        } else {
+            cs := ssa.push_switch_cases(&mut f, &cvals, &cbbs)
+            mut sw := ssa.make_term(.Switch)
+            sw.cond_val = tag
+            sw.target_a = bb_ret
+            sw.case_start = cs
+            sw.case_len = cvals.len
+            _ := ssa.set_term(&mut f, cur_bb, sw)
+        }
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // FixedArr: loop 0..count dropping non-Copy elements
+    if k == .FixedArr {
+        elem_ty := e.inner_a
+        if elem_ty >= 0 && elem_ty < reg.drop_fns.len && reg.drop_fns[elem_ty] >= 0 && e.count > 0 {
+            ea := if types.entries[elem_ty].align > 0 { types.entries[elem_ty].align } else { 1 }
+            estride := i64(align_up_i32(types.entries[elem_ty].size, ea))
+            c0 := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, 0, 0, 0)
+            c1 := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, 1, 0, 0)
+            ccnt := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, i64(e.count), 0, 0)
+            cstr := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, estride, 0, 0)
+            bb_loop := ssa.add_block(&mut f)
+            bb_body := ssa.add_block(&mut f)
+            linit: []i32 = [c0]
+            _ := ssa.set_goto(&mut f, cur_bb, bb_loop, &linit, 0, 0)
+
+            iv := ssa.add_block_param(&mut f, bb_loop, ht.TY_I64)
+            cond := ssa.emit_binary(&mut f, bb_loop, ht.TY_BOOL, hb.BINOP_LT, iv, ccnt, 0, 0)
+            _ := ssa.set_branch(&mut f, bb_loop, cond, bb_body, &no_args, bb_ret, &no_args, 0, 0)
+
+            off := ssa.emit_binary(&mut f, bb_body, ht.TY_I64, hb.BINOP_MUL, iv, cstr, 0, 0)
+            ep := emit_ptr_add_i64(&mut f, bb_body, p, off)
+            bb_next := emit_field_drop(&mut f, bb_body, &types, ep, elem_ty, &reg.drop_fns, &sigs)
+            ni := ssa.emit_binary(&mut f, bb_next, ht.TY_I64, hb.BINOP_ADD, iv, c1, 0, 0)
+            nargs: []i32 = [ni]
+            _ := ssa.set_goto(&mut f, bb_next, bb_loop, &nargs, 0, 0)
+            ssa.compute_preds(&mut f)
+            return f
+        }
+    }
+
+    _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// Helper: emit field clone/iso_clone from `src_field_addr` into `dst_field_addr`.
+fn emit_field_clone_or_iso(f: &mut ssa.SsaFunc, cur_bb: i32, types: &ht.TypeTable,
+    dst_addr: i32, src_addr: i32, fty: i32, helper_fns: &[]i32, sigs: &RuntimeSigs) -> i32 {
+    if fty < 0 || fty >= helper_fns.len || helper_fns[fty] < 0 { return cur_bb }
+    fk := types.entries[fty].kind
+    next_bb := ssa.add_block(&mut f)
+    if fk == .String || fk == .Array || fk == .ClosureEnv {
+        h := ssa.emit_load(&mut f, cur_bb, ht.TY_PTR, src_addr, 0, -1, 0, 0)
+        args: []i32 = [h]
+        ch := emit_call_term(&mut f, cur_bb, helper_fns[fty], sigs.ptr_to_ptr, &args, ht.TY_PTR, next_bb)
+        ssa.emit_store(&mut f, next_bb, ht.TY_PTR, dst_addr, ch, 0, -1, 0, 0)
+    } else {
+        args: []i32 = [src_addr]
+        cp := emit_call_term(&mut f, cur_bb, helper_fns[fty], sigs.ptr_to_ptr, &args, ht.TY_PTR, next_bb)
+        fsz := i64(types.entries[fty].size)
+        if fsz > 0 {
+            _ := ssa.emit_inst(&mut f, next_bb,
+                ssa.make_inst(.MemCopy, ht.TY_UNIT, dst_addr, cp, -1, 0, -1, fsz, -1, 0, 0, 0, 0))
+        }
+    }
+    next_bb
+}
+
+// Synthesize `__dunder_clone_<ty>` (is_iso=false) or `__dunder_iso_clone_<ty>` (is_iso=true)
+fn synth_type_clone(fn_id: i32, ty: i32, is_iso: bool, types: &ht.TypeTable,
+    reg: &RuntimeRegistry, child_fns: &[]i32, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    prefix := if is_iso { "__dunder_iso_clone_" } else { "__dunder_clone_" }
+    mut f := ssa.new_func(fn_id, -1, prefix + ty.str(), "<ssa_runtime>",
+        sigs.ptr_to_ptr, ht.TY_PTR, 1, true)
+    src := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_null := ssa.add_block(&mut f)
+    bb_work := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, src)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_null, &no_args, bb_work, &no_args, 0, 0)
+
+    nptr := emit_null_ptr(&mut f, bb_null)
+    _ := ssa.set_return(&mut f, bb_null, nptr, 0, 0)
+
+    e := &types.entries[ty]
+    k := e.kind
+
+    // String: clone uses rt_rc_retain (respects all RC bands); iso_clone deep-copies into local arena with rc=1!
+    if k == .String {
+        sargs: []i32 = [src]
+        bb_ret := ssa.add_block(&mut f)
+        callee := if is_iso { reg.fn_string_iso_clone } else { reg.fn_rc_retain }
+        res := emit_call_term(&mut f, bb_work, callee, sigs.ptr_to_ptr, &sargs, ht.TY_PTR, bb_ret)
+        _ := ssa.set_return(&mut f, bb_ret, res, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // Array: allocate fresh [rc=1, len, cap, elements...] and clone/iso_clone each element
+    if k == .Array {
+        elem_ty := e.inner_a
+        estride := i64(if elem_ty >= 0 && types.entries[elem_ty].size > 0 { types.entries[elem_ty].size } else { 8 })
+        len_hdr := emit_ptr_sub_const(&mut f, bb_work, src, 16)
+        alen := ssa.emit_load(&mut f, bb_work, ht.TY_I64, len_hdr, 0, -1, 0, 0)
+        c24 := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, 24, 0, 0)
+        cstr := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, estride, 0, 0)
+        data_bytes := ssa.emit_binary(&mut f, bb_work, ht.TY_I64, hb.BINOP_MUL, alen, cstr, 0, 0)
+        total := ssa.emit_binary(&mut f, bb_work, ht.TY_I64, hb.BINOP_ADD, data_bytes, c24, 0, 0)
+        raw := ssa.emit_inst(&mut f, bb_work,
+            ssa.make_inst(.AllocHeap, ht.TY_PTR, total, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+        c1 := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, 1, 0, 0)
+        ssa.emit_store(&mut f, bb_work, ht.TY_I64, raw, alen, 8, -1, 0, 0)   // [dst-16] = len
+        ssa.emit_store(&mut f, bb_work, ht.TY_I64, raw, c1, 16, -1, 0, 0)    // [dst-8]  = rc = 1
+        dst := emit_ptr_add_const(&mut f, bb_work, raw, 24)
+
+        c0 := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, 0, 0, 0)
+        bb_loop := ssa.add_block(&mut f)
+        bb_body := ssa.add_block(&mut f)
+        bb_done := ssa.add_block(&mut f)
+        linit: []i32 = [c0]
+        _ := ssa.set_goto(&mut f, bb_work, bb_loop, &linit, 0, 0)
+
+        iv := ssa.add_block_param(&mut f, bb_loop, ht.TY_I64)
+        cond := ssa.emit_binary(&mut f, bb_loop, ht.TY_BOOL, hb.BINOP_LT, iv, alen, 0, 0)
+        _ := ssa.set_branch(&mut f, bb_loop, cond, bb_body, &no_args, bb_done, &no_args, 0, 0)
+
+        off := ssa.emit_binary(&mut f, bb_body, ht.TY_I64, hb.BINOP_MUL, iv, cstr, 0, 0)
+        sp := emit_ptr_add_i64(&mut f, bb_body, src, off)
+        dp := emit_ptr_add_i64(&mut f, bb_body, dst, off)
+        mut bb_after := bb_body
+        if elem_ty >= 0 && elem_ty < child_fns.len && child_fns[elem_ty] >= 0 {
+            bb_after = emit_field_clone_or_iso(&mut f, bb_body, &types, dp, sp, elem_ty, &child_fns, &sigs)
+        } else {
+            _ := ssa.emit_inst(&mut f, bb_body,
+                ssa.make_inst(.MemCopy, ht.TY_UNIT, dp, sp, -1, 0, -1, estride, -1, 0, 0, 0, 0))
+        }
+        ni := ssa.emit_binary(&mut f, bb_after, ht.TY_I64, hb.BINOP_ADD, iv, c1, 0, 0)
+        nargs: []i32 = [ni]
+        _ := ssa.set_goto(&mut f, bb_after, bb_loop, &nargs, 0, 0)
+
+        _ := ssa.set_return(&mut f, bb_done, dst, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // Allocate RC-headered box `[rc=1, payload(sz bytes)]` so iso_clone produces an isolated local-arena copy
+    sz := i64(if e.size > 0 { e.size } else { 8 })
+    alloc_sz := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, sz + 8, 0, 0)
+    raw := ssa.emit_inst(&mut f, bb_work,
+        ssa.make_inst(.AllocHeap, ht.TY_PTR, alloc_sz, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    c1 := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, 1, 0, 0)
+    ssa.emit_store(&mut f, bb_work, ht.TY_I64, raw, c1, 0, -1, 0, 0)
+    dst := emit_ptr_add_const(&mut f, bb_work, raw, 8)
+    _ := ssa.emit_inst(&mut f, bb_work,
+        ssa.make_inst(.MemCopy, ht.TY_UNIT, dst, src, -1, 0, -1, sz, -1, 0, 0, 0, 0))
+
+    mut cur_bb := bb_work
+    if k == .Struct || k == .Tuple {
+        for fi in 0..e.count {
+            fld := &types.fields[e.inner_a + fi]
+            if fld.ty >= 0 && fld.ty < child_fns.len && child_fns[fld.ty] >= 0 {
+                sp := emit_ptr_add_const(&mut f, cur_bb, src, i64(fld.offset))
+                dp := emit_ptr_add_const(&mut f, cur_bb, dst, i64(fld.offset))
+                cur_bb = emit_field_clone_or_iso(&mut f, cur_bb, &types, dp, sp, fld.ty, &child_fns, &sigs)
+            }
+        }
+        _ := ssa.set_return(&mut f, cur_bb, dst, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    if k == .Enum {
+        tag := ssa.emit_load(&mut f, cur_bb, ht.TY_I32, src, 0, -1, 0, 0)
+        pbase := enum_payload_base_offset(&types, ty)
+        bb_done := ssa.add_block(&mut f)
+        _ := ssa.set_return(&mut f, bb_done, dst, 0, 0)
+
+        mut cvals: []i64 = []
+        mut cbbs: []i32 = []
+        for vi in 0..e.count {
+            v := &types.variants[e.inner_a + vi]
+            mut has_any := false
+            for pi in 0..v.payload_count {
+                pty := types.fields[v.payload_start + pi].ty
+                if pty >= 0 && pty < child_fns.len && child_fns[pty] >= 0 { has_any = true; break }
+            }
+            if !has_any { continue }
+            mut vbb := ssa.add_block(&mut f)
+            cvals.push(v.tag_value)
+            cbbs.push(vbb)
+            for pi in 0..v.payload_count {
+                pf := &types.fields[v.payload_start + pi]
+                if pf.ty >= 0 && pf.ty < child_fns.len && child_fns[pf.ty] >= 0 {
+                    sp := emit_ptr_add_const(&mut f, vbb, src, i64(pbase + pf.offset))
+                    dp := emit_ptr_add_const(&mut f, vbb, dst, i64(pbase + pf.offset))
+                    vbb = emit_field_clone_or_iso(&mut f, vbb, &types, dp, sp, pf.ty, &child_fns, &sigs)
+                }
+            }
+            _ := ssa.set_goto(&mut f, vbb, bb_done, &no_args, 0, 0)
+        }
+        if cvals.len == 0 {
+            _ := ssa.set_goto(&mut f, cur_bb, bb_done, &no_args, 0, 0)
+        } else {
+            cs := ssa.push_switch_cases(&mut f, &cvals, &cbbs)
+            mut sw := ssa.make_term(.Switch)
+            sw.cond_val = tag
+            sw.target_a = bb_done
+            sw.case_start = cs
+            sw.case_len = cvals.len
+            _ := ssa.set_term(&mut f, cur_bb, sw)
+        }
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    _ := ssa.set_return(&mut f, cur_bb, dst, 0, 0)
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// Helper: emit freeze call for a field stored at `field_addr`.
+fn emit_field_freeze(f: &mut ssa.SsaFunc, cur_bb: i32, types: &ht.TypeTable,
+    field_addr: i32, fty: i32, freeze_fns: &[]i32, sigs: &RuntimeSigs) -> i32 {
+    if fty < 0 || fty >= freeze_fns.len || freeze_fns[fty] < 0 { return cur_bb }
+    fk := types.entries[fty].kind
+    next_bb := ssa.add_block(&mut f)
+    if fk == .String || fk == .Array || fk == .ClosureEnv {
+        h := ssa.emit_load(&mut f, cur_bb, ht.TY_PTR, field_addr, 0, -1, 0, 0)
+        args: []i32 = [h]
+        _ := emit_call_term(&mut f, cur_bb, freeze_fns[fty], sigs.ptr_to_unit, &args, ht.TY_UNIT, next_bb)
+    } else {
+        args: []i32 = [field_addr]
+        _ := emit_call_term(&mut f, cur_bb, freeze_fns[fty], sigs.ptr_to_unit, &args, ht.TY_UNIT, next_bb)
+    }
+    next_bb
+}
+
+// Synthesize `__dunder_shared_rc_freeze_<ty>(p: ptr) -> ()`
+// Marks reachable RC headers with preserved frozen sentinels:
+//   - String -> RC_FROZEN_STR (-2)
+//   - Compound payload -> RC_FROZEN_COMPOUND_BASE - desc_id (-3 - desc_id)
+fn synth_type_freeze(fn_id: i32, ty: i32, types: &ht.TypeTable,
+    reg: &RuntimeRegistry, sigs: &RuntimeSigs) -> ssa.SsaFunc {
+    mut f := ssa.new_func(fn_id, -1, "__dunder_shared_rc_freeze_" + ty.str(), "<ssa_runtime>",
+        sigs.ptr_to_unit, ht.TY_UNIT, 1, true)
+    p := ssa.add_fn_param_val(&mut f, ht.TY_PTR)
+
+    bb_entry := ssa.add_block(&mut f)
+    bb_ret := ssa.add_block(&mut f)
+    bb_work := ssa.add_block(&mut f)
+
+    no_args: []i32 = []
+    is_null := emit_is_null(&mut f, bb_entry, p)
+    _ := ssa.set_branch(&mut f, bb_entry, is_null, bb_ret, &no_args, bb_work, &no_args, 0, 0)
+    _ := ssa.set_return(&mut f, bb_ret, -1, 0, 0)
+
+    e := &types.entries[ty]
+    k := e.kind
+    desc_id := if ty >= 0 && ty < reg.type_desc_ids.len { reg.type_desc_ids[ty] } else { -1 }
+
+    // String: write RC_FROZEN_STR (-2) if rc > 0
+    if k == .String {
+        hdr := emit_ptr_sub_const(&mut f, bb_work, p, 8)
+        rc := ssa.emit_load(&mut f, bb_work, ht.TY_I64, hdr, 0, -1, 0, 0)
+        c0 := ssa.emit_const_int(&mut f, bb_work, ht.TY_I64, 0, 0, 0)
+        is_pos := ssa.emit_binary(&mut f, bb_work, ht.TY_BOOL, hb.BINOP_GT, rc, c0, 0, 0)
+        bb_set := ssa.add_block(&mut f)
+        _ := ssa.set_branch(&mut f, bb_work, is_pos, bb_set, &no_args, bb_ret, &no_args, 0, 0)
+        cm2 := ssa.emit_const_int(&mut f, bb_set, ht.TY_I64, RC_FROZEN_STR, 0, 0)
+        ssa.emit_store(&mut f, bb_set, ht.TY_I64, hdr, cm2, 0, -1, 0, 0)
+        _ := ssa.set_return(&mut f, bb_set, -1, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    // Write bounded compound frozen RC tag `-3 - desc_id` at [p - 8] when this type has a TypeDesc entry
+    mut cur_bb := bb_work
+    if desc_id >= 0 && (k == .Array || k == .Enum || k == .Struct || k == .Tuple) {
+        hdr := emit_ptr_sub_const(&mut f, cur_bb, p, 8)
+        rc := ssa.emit_load(&mut f, cur_bb, ht.TY_I64, hdr, 0, -1, 0, 0)
+        c0 := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, 0, 0, 0)
+        is_pos := ssa.emit_binary(&mut f, cur_bb, ht.TY_BOOL, hb.BINOP_GT, rc, c0, 0, 0)
+        bb_tag := ssa.add_block(&mut f)
+        bb_cont := ssa.add_block(&mut f)
+        _ := ssa.set_branch(&mut f, cur_bb, is_pos, bb_tag, &no_args, bb_cont, &no_args, 0, 0)
+        frozen_rc := ssa.emit_const_int(&mut f, bb_tag, ht.TY_I64, RC_FROZEN_COMPOUND_BASE - i64(desc_id), 0, 0)
+        ssa.emit_store(&mut f, bb_tag, ht.TY_I64, hdr, frozen_rc, 0, -1, 0, 0)
+        _ := ssa.set_goto(&mut f, bb_tag, bb_cont, &no_args, 0, 0)
+        cur_bb = bb_cont
+    }
+
+    if k == .Array {
+        elem_ty := e.inner_a
+        if elem_ty >= 0 && elem_ty < reg.freeze_fns.len && reg.freeze_fns[elem_ty] >= 0 {
+            estride := i64(if types.entries[elem_ty].size > 0 { types.entries[elem_ty].size } else { 8 })
+            len_hdr := emit_ptr_sub_const(&mut f, cur_bb, p, 16)
+            alen := ssa.emit_load(&mut f, cur_bb, ht.TY_I64, len_hdr, 0, -1, 0, 0)
+            c0 := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, 0, 0, 0)
+            c1 := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, 1, 0, 0)
+            cstr := ssa.emit_const_int(&mut f, cur_bb, ht.TY_I64, estride, 0, 0)
+            bb_loop := ssa.add_block(&mut f)
+            bb_body := ssa.add_block(&mut f)
+            linit: []i32 = [c0]
+            _ := ssa.set_goto(&mut f, cur_bb, bb_loop, &linit, 0, 0)
+
+            iv := ssa.add_block_param(&mut f, bb_loop, ht.TY_I64)
+            cond := ssa.emit_binary(&mut f, bb_loop, ht.TY_BOOL, hb.BINOP_LT, iv, alen, 0, 0)
+            _ := ssa.set_branch(&mut f, bb_loop, cond, bb_body, &no_args, bb_ret, &no_args, 0, 0)
+
+            off := ssa.emit_binary(&mut f, bb_body, ht.TY_I64, hb.BINOP_MUL, iv, cstr, 0, 0)
+            ep := emit_ptr_add_i64(&mut f, bb_body, p, off)
+            bb_next := emit_field_freeze(&mut f, bb_body, &types, ep, elem_ty, &reg.freeze_fns, &sigs)
+            ni := ssa.emit_binary(&mut f, bb_next, ht.TY_I64, hb.BINOP_ADD, iv, c1, 0, 0)
+            nargs: []i32 = [ni]
+            _ := ssa.set_goto(&mut f, bb_next, bb_loop, &nargs, 0, 0)
+            ssa.compute_preds(&mut f)
+            return f
+        }
+        _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    if k == .Struct || k == .Tuple {
+        for fi in 0..e.count {
+            fld := &types.fields[e.inner_a + fi]
+            if fld.ty >= 0 && fld.ty < reg.freeze_fns.len && reg.freeze_fns[fld.ty] >= 0 {
+                fp := emit_ptr_add_const(&mut f, cur_bb, p, i64(fld.offset))
+                cur_bb = emit_field_freeze(&mut f, cur_bb, &types, fp, fld.ty, &reg.freeze_fns, &sigs)
+            }
+        }
+        _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    if k == .Enum {
+        tag := ssa.emit_load(&mut f, cur_bb, ht.TY_I32, p, 0, -1, 0, 0)
+        pbase := enum_payload_base_offset(&types, ty)
+        mut cvals: []i64 = []
+        mut cbbs: []i32 = []
+        for vi in 0..e.count {
+            v := &types.variants[e.inner_a + vi]
+            mut has_any := false
+            for pi in 0..v.payload_count {
+                pty := types.fields[v.payload_start + pi].ty
+                if pty >= 0 && pty < reg.freeze_fns.len && reg.freeze_fns[pty] >= 0 { has_any = true; break }
+            }
+            if !has_any { continue }
+            mut vbb := ssa.add_block(&mut f)
+            cvals.push(v.tag_value)
+            cbbs.push(vbb)
+            for pi in 0..v.payload_count {
+                pf := &types.fields[v.payload_start + pi]
+                if pf.ty >= 0 && pf.ty < reg.freeze_fns.len && reg.freeze_fns[pf.ty] >= 0 {
+                    pp := emit_ptr_add_const(&mut f, vbb, p, i64(pbase + pf.offset))
+                    vbb = emit_field_freeze(&mut f, vbb, &types, pp, pf.ty, &reg.freeze_fns, &sigs)
+                }
+            }
+            _ := ssa.set_return(&mut f, vbb, -1, 0, 0)
+        }
+        if cvals.len == 0 {
+            _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+        } else {
+            cs := ssa.push_switch_cases(&mut f, &cvals, &cbbs)
+            mut sw := ssa.make_term(.Switch)
+            sw.cond_val = tag
+            sw.target_a = bb_ret
+            sw.case_start = cs
+            sw.case_len = cvals.len
+            _ := ssa.set_term(&mut f, cur_bb, sw)
+        }
+        ssa.compute_preds(&mut f)
+        return f
+    }
+
+    _ := ssa.set_return(&mut f, cur_bb, -1, 0, 0)
+    ssa.compute_preds(&mut f)
+    f
+}
+
+// =========================================================================
+// 7. Public Top-Level Synthesizer & ObjectModule TYPE_DESC_TABLE Builder
+// =========================================================================
+
+pub fn synthesize_runtime(types: &mut ht.TypeTable, prog: &mut ssa.SsaProgram,
+    start_fn_id: i32) -> RuntimeRegistry {
+    ht.seal(&mut types)
+    sigs := intern_runtime_sigs(&mut types)
+    layout := worker_layout_for_platform(types.platform)
+
+    mut next_id := start_fn_id
+    for i in 0..prog.funcs.len {
+        if prog.funcs[i].fn_id >= next_id { next_id = prog.funcs[i].fn_id + 1 }
+    }
+
+    // Reserve core runtime function IDs
+    id_bump_slow := next_id; next_id += 1
+    id_bump := next_id; next_id += 1
+    id_pool_free := next_id; next_id += 1
+    id_str_iso := next_id; next_id += 1
+    id_rc_rel := next_id; next_id += 1
+    id_rc_ret := next_id; next_id += 1
+    id_td_disp := next_id; next_id += 1
+    id_td_lookup := next_id; next_id += 1
+    id_bytes_eq := next_id; next_id += 1
+    id_slice_addr := next_id; next_id += 1
+    id_cb_push := next_id; next_id += 1
+    id_cb_pop := next_id; next_id += 1
+    id_cb_enter := next_id; next_id += 1
+    id_cb_exit := next_id; next_id += 1
+    id_arena_init := next_id; next_id += 1
+    id_worker_entry := next_id; next_id += 1
+
+    // Pre-allocate per-type helper IDs and TYPE_DESC_TABLE desc_ids
+    n_tys := types.entries.len
+    mut drop_fns: []i32 = []
+    mut clone_fns: []i32 = []
+    mut iso_clone_fns: []i32 = []
+    mut freeze_fns: []i32 = []
+    mut type_desc_ids: []i32 = []
+    mut type_descs: []TypeDescInfo = []
+    for _ in 0..n_tys {
+        drop_fns.push(-1)
+        clone_fns.push(-1)
+        iso_clone_fns.push(-1)
+        freeze_fns.push(-1)
+        type_desc_ids.push(-1)
+    }
+
+    for ty in 0..n_tys {
+        if !needs_type_helpers(&types, ty) { continue }
+        d_id := next_id; next_id += 1
+        c_id := next_id; next_id += 1
+        i_id := next_id; next_id += 1
+        f_id := next_id; next_id += 1
+        drop_fns[ty] = d_id
+        clone_fns[ty] = c_id
+        iso_clone_fns[ty] = i_id
+        freeze_fns[ty] = f_id
+        if is_compound_desc_type(&types, ty) {
+            did := type_descs.len
+            type_desc_ids[ty] = did
+            te := &types.entries[ty]
+            type_descs.push(TypeDescInfo {
+                desc_id: did,
+                type_id: ty,
+                name: te.name.clone(),
+                clone_fn: c_id,
+                drop_fn: d_id,
+                iso_fn: i_id,
+                freeze_fn: f_id,
+                size: te.size,
+                align: te.align,
+            })
+        }
+    }
+
+    reg := RuntimeRegistry {
+        platform: types.platform,
+        worker_layout: layout,
+        fn_bump_alloc_slow: id_bump_slow,
+        fn_bump_alloc: id_bump,
+        fn_pool_free: id_pool_free,
+        fn_string_iso_clone: id_str_iso,
+        fn_rc_release_checked: id_rc_rel,
+        fn_rc_retain: id_rc_ret,
+        fn_type_desc_dispatch: id_td_disp,
+        fn_type_desc_lookup: id_td_lookup,
+        fn_bytes_eq: id_bytes_eq,
+        fn_slice_bounds_addr: id_slice_addr,
+        fn_cb_frame_push: id_cb_push,
+        fn_cb_frame_pop: id_cb_pop,
+        fn_cb_trampoline_enter: id_cb_enter,
+        fn_cb_trampoline_exit: id_cb_exit,
+        fn_task_arena_init: id_arena_init,
+        fn_task_worker_entry: id_worker_entry,
+        drop_fns: move drop_fns,
+        clone_fns: move clone_fns,
+        iso_clone_fns: move iso_clone_fns,
+        freeze_fns: move freeze_fns,
+        type_desc_ids: move type_desc_ids,
+        type_descs: move type_descs,
+        next_fn_id: next_id,
+    }
+
+    // Emit core runtime SsaFuncs
+    _ := ssa.add_program_func(&mut prog, synth_bump_alloc_slow(id_bump_slow, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_bump_alloc(id_bump, id_bump_slow, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_pool_free(id_pool_free, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_string_iso_clone(id_str_iso, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_rc_release_checked(id_rc_rel, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_type_desc_lookup(id_td_lookup, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_type_desc_dispatch(id_td_disp, &reg.type_descs, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_rc_retain(id_rc_ret, id_str_iso, id_td_disp, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_bytes_eq(id_bytes_eq, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_slice_bounds_addr(id_slice_addr, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_cb_frame_push(id_cb_push, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_cb_frame_pop(id_cb_pop, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_cb_trampoline_enter(id_cb_enter, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_cb_trampoline_exit(id_cb_exit, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_task_arena_init(id_arena_init, &sigs))
+    _ := ssa.add_program_func(&mut prog, synth_task_worker_entry(id_worker_entry, id_arena_init, &reg.worker_layout, &sigs))
+
+    // Emit per-type drop / clone / iso_clone / shared_rc_freeze helpers
+    for ty in 0..n_tys {
+        if reg.drop_fns[ty] < 0 { continue }
+        _ := ssa.add_program_func(&mut prog, synth_type_drop(reg.drop_fns[ty], ty, &types, &prog, &reg, &sigs))
+        _ := ssa.add_program_func(&mut prog, synth_type_clone(reg.clone_fns[ty], ty, false, &types, &reg, &reg.clone_fns, &sigs))
+        _ := ssa.add_program_func(&mut prog, synth_type_clone(reg.iso_clone_fns[ty], ty, true, &types, &reg, &reg.iso_clone_fns, &sigs))
+        _ := ssa.add_program_func(&mut prog, synth_type_freeze(reg.freeze_fns[ty], ty, &types, &reg, &sigs))
+    }
+
+    reg
+}
+
+// Verifies every synthesized runtime SsaFunc in `prog` via `ssa_verify.verify_func`.
+pub fn verify_runtime(types: &ht.TypeTable, prog: &ssa.SsaProgram,
+    reg: &RuntimeRegistry, diags: &mut []diag.Diagnostic) -> bool {
+    mut ok := true
+    core_ids: []i32 = [
+        reg.fn_bump_alloc_slow, reg.fn_bump_alloc, reg.fn_pool_free,
+        reg.fn_string_iso_clone, reg.fn_rc_release_checked, reg.fn_rc_retain,
+        reg.fn_type_desc_dispatch, reg.fn_type_desc_lookup, reg.fn_bytes_eq,
+        reg.fn_slice_bounds_addr, reg.fn_cb_frame_push, reg.fn_cb_frame_pop,
+        reg.fn_cb_trampoline_enter, reg.fn_cb_trampoline_exit,
+        reg.fn_task_arena_init, reg.fn_task_worker_entry,
+    ]
+    for i in 0..core_ids.len {
+        fid := core_ids[i]
+        idx := prog.fn_id_to_idx[fid]
+        if idx < 0 || !ssa_verify.verify_func(&types, &prog.funcs[idx], &mut diags) {
+            ok = false
+        }
+    }
+    for ty in 0..reg.drop_fns.len {
+        fids: []i32 = [reg.drop_fns[ty], reg.clone_fns[ty], reg.iso_clone_fns[ty], reg.freeze_fns[ty]]
+        for k in 0..fids.len {
+            fid := fids[k]
+            if fid < 0 { continue }
+            idx := prog.fn_id_to_idx[fid]
+            if idx < 0 || !ssa_verify.verify_func(&types, &prog.funcs[idx], &mut diags) {
+                ok = false
+            }
+        }
+    }
+    ok
+}
+
+// Registers every TypeDescInfo into `m.type_descs` (linking clone/drop/iso symbols) and
+// materializes the read-only `.rodata` `__dunder_type_desc_table` symbol.
+pub fn populate_type_desc_table(m: &mut obj.ObjectModule, reg: &RuntimeRegistry) -> i32 {
+    for i in 0..reg.type_descs.len {
+        d := &reg.type_descs[i]
+        c_sym := obj.find_symbol(&m, "__dunder_clone_" + d.type_id.str())
+        d_sym := obj.find_symbol(&m, "__dunder_drop_" + d.type_id.str())
+        i_sym := obj.find_symbol(&m, "__dunder_iso_clone_" + d.type_id.str())
+        _ := obj.add_type_desc(&mut m, d.type_id, d.name.clone(), c_sym, d_sym, i_sym, d.size, d.align)
+    }
+    obj.materialize_type_desc_table(&mut m)
+}

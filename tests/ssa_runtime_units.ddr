@@ -1,0 +1,863 @@
+// Phase 3C + 4D Unit & Live Native Execution Tests (`tests/ssa_runtime_units.ddr`):
+//   1. `ssa_runtime`: structured SSA synthesis of drop/clone/iso_clone/shared_rc_freeze,
+//      `@resource(dispose)` strictly at rc == 1, preserved RC sentinels (-1 freed trap 110,
+//      -2 frozen string iso-clone, <= -3 bounded TYPE_DESC_TABLE[(-rc)-3] OOB trap 112),
+//      bump allocator, OS TLS CallbackFrame push/pop/guard (trap 111), and R-3 task worker
+//      entry layout (macOS x29 unwind root; x86_64 omits unused 8 MiB stack + 16 MiB guard).
+//      Verified by `ssa_verify` with 0 errors and lowered through arm64_isel, x86_isel, wasm_isel
+//      with LIVE native ARM64 Mach-O execution!
+//   2. `ssa_fragments`: per-function content-hash cache (in-memory + on-disk `.dunder-ssa-cache`):
+//      cold build -> 0-recompile warm rebuild -> disk-restored rebuild -> 1-function private edit
+//      (only 1 of N recompiled!) -> shared struct layout invalidation -> 100% byte-identical
+//      executables across ARM64 Mach-O, x86_64 ELF/PE, and WASM32-WASI!
+
+capability process, filesystem
+
+import std.fs as fs
+import std.process as process
+import sys
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import ..selfhost.hir.hir_types as ht
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.hir.hir_lower as hir_lower
+import ..selfhost.hir.hir_mono as hir_mono
+import ..selfhost.ssa.ssa_ir as ssa
+import ..selfhost.ssa.ssa_verify as ssa_verify
+import ..selfhost.ssa.ssa_runtime as rt
+import ..selfhost.backend.object_module as obj
+import ..selfhost.backend.arm64_isel as arm64_isel
+import ..selfhost.backend.x86_isel as x86_isel
+import ..selfhost.backend.wasm_isel as wasm_isel
+import ..selfhost.backend.ssa_fragments as frag
+
+// =========================================================================
+// Helpers: Live Native Execution & Byte Equality
+// =========================================================================
+
+struct ExecOut {
+    code: i32,
+    stdout: string,
+    stderr: string,
+}
+
+fn bytes_identical(a: &[]u8, b: &[]u8) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false }
+    }
+    true
+}
+
+fn exec_native_image(img: &[]u8, name: string) -> ExecOut {
+    is_linux := process.host_target() == "arm64-linux"
+    assert(img.len > 64)
+    if is_linux {
+        assert(i32(img[0]) == 127 && i32(img[1]) == 69 && i32(img[2]) == 76 && i32(img[3]) == 70)
+    } else {
+        assert(i32(img[0]) == 0xcf && i32(img[1]) == 0xfa && i32(img[2]) == 0xed && i32(img[3]) == 0xfe)
+    }
+    tmp := fs.temp_dir("dunder-ssa-rt-" + name + "-")
+    assert(tmp.ok)
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    bin_path := work + "/" + name
+    assert(sys.write_u8(bin_path, &img).ok)
+    assert(sys.make_executable(bin_path).ok)
+
+    mut cmd := process.Command::new(move bin_path, [])
+    cmd.set_timeout(5000)
+    res := cmd.exec()
+    assert(res.ok && !res.timed_out)
+    ExecOut { code: res.code, stdout: res.stdout_text(), stderr: res.stderr_text() }
+}
+
+fn host_arm64_target() -> obj.TargetKind {
+    if process.host_target() == "arm64-linux" { return .Arm64Linux }
+    .Arm64Macos
+}
+
+fn parse_and_lower_hir(src: string, target: obj.TargetKind) -> hb.HirProgram {
+    platform := obj.target_to_platform(target)
+    tree := parser.parse_source("frag_test.ddr", src)
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "frag_test.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut prog := hir_lower.lower_modules(&mods, &edges, platform)
+    assert(prog.ok)
+    hir_mono.monomorphize(&mut prog)
+    prog
+}
+
+// =========================================================================
+// Helper: Build Rich Sealed TypeTable + SsaProgram for `ssa_runtime` Tests
+// =========================================================================
+
+struct RuntimeFixture {
+    hir: hb.HirProgram,
+    prog: ssa.SsaProgram,
+    reg: rt.RuntimeRegistry,
+    ty_record: i32,
+    ty_resource: i32,
+    ty_enum: i32,
+    ty_arr_str: i32,
+    ty_nested_arr: i32,
+    ty_fixed_str: i32,
+    fn_dispose_res: i32,
+    fn_sample_worker: i32,
+}
+
+fn make_p_copy(ty: i32) -> ht.ParamEntry {
+    ht.ParamEntry { ty: ty, mode: .CopyVal }
+}
+
+fn build_rich_runtime_fixture(platform: i32) -> RuntimeFixture {
+    mut hir := hb.new_program(platform)
+    empty_from: []ht.FromEdge = []
+
+    // 1. Add user `dispose_res(self: ptr)` function that increments counter at `[self + 0]`
+    //    (proving live that `dispose` runs strictly at `rc == 1` and NOT at `rc == 2`!).
+    p_ptr: []ht.ParamEntry = [make_p_copy(ht.TY_PTR)]
+    sig_dispose := ht.add_fn_ptr(&mut hir.types, &p_ptr, ht.TY_UNIT, &empty_from)
+    sig_worker := ht.add_fn_ptr(&mut hir.types, &p_ptr, ht.TY_I64, &empty_from)
+
+    // Reserve fn_id 0 = dispose_res, fn_id 1 = sample_worker
+    fn_dispose_id := 0
+    fn_worker_id := 1
+
+    // 2. Define managed types:
+    //    - `Record { tag: i64, label: string }`
+    rec_fields: []ht.FieldEntry = [
+        ht.FieldEntry { name: "tag", ty: ht.TY_I64, offset: 0, is_pub: true, origin_slot: -1 },
+        ht.FieldEntry { name: "label", ty: ht.TY_STRING, offset: 8, is_pub: true, origin_slot: -1 },
+    ]
+    ty_record := ht.add_struct(&mut hir.types, "Record", 0, 0, &rec_fields)
+
+    //    - `@resource(dispose) Handle { counter_ptr: ptr, name: string }`
+    res_fields: []ht.FieldEntry = [
+        ht.FieldEntry { name: "counter_ptr", ty: ht.TY_PTR, offset: 0, is_pub: false, origin_slot: -1 },
+        ht.FieldEntry { name: "name", ty: ht.TY_STRING, offset: 8, is_pub: false, origin_slot: -1 },
+    ]
+    ty_resource := ht.add_struct(&mut hir.types, "Handle", 0,
+        ht.TF_RESOURCE.bit_or(ht.TF_DISPOSE), &res_fields)
+    hir.types.entries[ty_resource].dispose_fn = fn_dispose_id
+
+    //    - `[]string`, `[][]string`, `[string; 3]`
+    ty_arr_str := ht.add_array(&mut hir.types, ht.TY_STRING)
+    ty_nested_arr := ht.add_array(&mut hir.types, ty_arr_str)
+    ty_fixed_str := ht.add_fixed_array(&mut hir.types, ht.TY_STRING, 3)
+
+    //    - `PayloadEnum { Text(string), List([]string), Empty }`
+    epay: []ht.FieldEntry = [
+        ht.FieldEntry { name: "0", ty: ht.TY_STRING, offset: 0, is_pub: true, origin_slot: -1 },
+        ht.FieldEntry { name: "0", ty: ty_arr_str, offset: 0, is_pub: true, origin_slot: -1 },
+    ]
+    evars: []ht.VariantEntry = [
+        ht.VariantEntry { name: "Text", tag_value: 0, payload_start: 0, payload_count: 1 },
+        ht.VariantEntry { name: "List", tag_value: 1, payload_start: 1, payload_count: 1 },
+        ht.VariantEntry { name: "Empty", tag_value: 2, payload_start: 2, payload_count: 0 },
+    ]
+    ty_enum := ht.add_enum(&mut hir.types, "PayloadEnum", 0, 0, &evars, &epay)
+
+    ht.seal(&mut hir.types)
+
+    mut prog := ssa.new_program(2, -1)
+
+    // Build `dispose_res(p: ptr) -> ()`: loads `counter_ptr = [p + 0]`, increments `*[counter_ptr] += 1`
+    mut f_disp := ssa.new_func(fn_dispose_id, 0, "dispose_res", "rt_unit.ddr", sig_dispose, ht.TY_UNIT, 1, true)
+    dp := ssa.add_fn_param_val(&mut f_disp, ht.TY_PTR)
+    d_bb0 := ssa.add_block(&mut f_disp)
+    cptr := ssa.emit_load(&mut f_disp, d_bb0, ht.TY_PTR, dp, 0, -1, 0, 0)
+    cur := ssa.emit_load(&mut f_disp, d_bb0, ht.TY_I64, cptr, 0, -1, 0, 0)
+    one := ssa.emit_const_int(&mut f_disp, d_bb0, ht.TY_I64, 1, 0, 0)
+    inc := ssa.emit_binary(&mut f_disp, d_bb0, ht.TY_I64, hb.BINOP_ADD, cur, one, 0, 0)
+    ssa.emit_store(&mut f_disp, d_bb0, ht.TY_I64, cptr, inc, 0, -1, 0, 0)
+    _ := ssa.set_return(&mut f_disp, d_bb0, -1, 0, 0)
+    ssa.compute_preds(&mut f_disp)
+    _ := ssa.add_program_func(&mut prog, move f_disp)
+
+    // Build `sample_worker(arg: ptr) -> i64`: loads `x = [arg + 0]`, returns `x * 2 + 10`
+    mut f_wrk := ssa.new_func(fn_worker_id, 0, "sample_worker", "rt_unit.ddr", sig_worker, ht.TY_I64, 1, true)
+    wp := ssa.add_fn_param_val(&mut f_wrk, ht.TY_PTR)
+    w_bb0 := ssa.add_block(&mut f_wrk)
+    wx := ssa.emit_load(&mut f_wrk, w_bb0, ht.TY_I64, wp, 0, -1, 0, 0)
+    c2 := ssa.emit_const_int(&mut f_wrk, w_bb0, ht.TY_I64, 2, 0, 0)
+    c10 := ssa.emit_const_int(&mut f_wrk, w_bb0, ht.TY_I64, 10, 0, 0)
+    w2 := ssa.emit_binary(&mut f_wrk, w_bb0, ht.TY_I64, hb.BINOP_MUL, wx, c2, 0, 0)
+    wres := ssa.emit_binary(&mut f_wrk, w_bb0, ht.TY_I64, hb.BINOP_ADD, w2, c10, 0, 0)
+    _ := ssa.set_return(&mut f_wrk, w_bb0, wres, 0, 0)
+    ssa.compute_preds(&mut f_wrk)
+    _ := ssa.add_program_func(&mut prog, move f_wrk)
+
+    // Synthesize all structured SSA runtime + type helpers!
+    reg := rt.synthesize_runtime(&mut hir.types, &mut prog, 2)
+
+    RuntimeFixture {
+        hir: move hir,
+        prog: move prog,
+        reg: move reg,
+        ty_record: ty_record,
+        ty_resource: ty_resource,
+        ty_enum: ty_enum,
+        ty_arr_str: ty_arr_str,
+        ty_nested_arr: ty_nested_arr,
+        ty_fixed_str: ty_fixed_str,
+        fn_dispose_res: fn_dispose_id,
+        fn_sample_worker: fn_worker_id,
+    }
+}
+
+// =========================================================================
+// Test 1: R-3 Per-Target Worker Layout Plan Verification
+// =========================================================================
+
+@test
+fn ssa_runtime_r3_worker_layouts() {
+    mac := rt.worker_layout_for_platform(0)
+    assert(mac.needs_custom_stack)
+    assert(mac.preserve_frame_pointer)
+    assert(mac.stack_bytes == 8388608)
+    assert(mac.guard_bytes == 16777216)
+    assert(mac.pool_bytes == 536870912)
+    assert(mac.total_mapping_bytes == 536870912 + 16777216 + 8388608)
+
+    arm_lin := rt.worker_layout_for_platform(1)
+    assert(!arm_lin.needs_custom_stack)
+    assert(arm_lin.preserve_frame_pointer)
+    assert(arm_lin.stack_bytes == 0 && arm_lin.guard_bytes == 0)
+    assert(arm_lin.total_mapping_bytes == 536870912)
+
+    // R-3 fix: x86_64 Linux & Windows omit the unused 8 MiB worker stack + 16 MiB guard!
+    x86_lin := rt.worker_layout_for_platform(2)
+    assert(!x86_lin.needs_custom_stack)
+    assert(x86_lin.stack_bytes == 0 && x86_lin.guard_bytes == 0)
+    assert(x86_lin.total_mapping_bytes == 536870912)
+
+    x86_win := rt.worker_layout_for_platform(5)
+    assert(!x86_win.needs_custom_stack)
+    assert(x86_win.stack_bytes == 0 && x86_win.guard_bytes == 0)
+    assert(x86_win.total_mapping_bytes == 536870912)
+
+    wasm := rt.worker_layout_for_platform(3)
+    assert(!wasm.needs_custom_stack && wasm.total_mapping_bytes == 0)
+}
+
+// =========================================================================
+// Test 2: Full `ssa_verify` (0 Errors) + Multi-Target ISel (ARM64, x86_64, WASM)
+//         + `.rodata` TYPE_DESC_TABLE Materialization
+// =========================================================================
+
+@test
+fn ssa_runtime_verify_and_lower_all_three_backends() {
+    // 1. ARM64 (macOS + Linux)
+    fx_arm := build_rich_runtime_fixture(0)
+    mut d_arm: []diag.Diagnostic = []
+    assert(rt.verify_runtime(&fx_arm.hir.types, &fx_arm.prog, &fx_arm.reg, &mut d_arm))
+    assert(ssa_verify.verify_program(&fx_arm.hir.types, &fx_arm.prog, &mut d_arm))
+    assert(d_arm.len == 0)
+    assert(fx_arm.reg.type_descs.len >= 6) // Record, Handle, []string, [][]string, [string;3], PayloadEnum
+    assert(fx_arm.reg.type_desc_ids[fx_arm.ty_record] >= 0)
+    assert(fx_arm.reg.type_desc_ids[fx_arm.ty_resource] >= 0)
+    assert(fx_arm.reg.type_desc_ids[fx_arm.ty_enum] >= 0)
+    assert(fx_arm.reg.type_desc_ids[fx_arm.ty_nested_arr] >= 0)
+
+    mut m_mac := arm64_isel.emit_program(&fx_arm.prog, &fx_arm.hir, .Arm64Macos)
+    td_sym_mac := rt.populate_type_desc_table(&mut m_mac, &fx_arm.reg)
+    assert(td_sym_mac >= 0)
+    assert(m_mac.symbols[td_sym_mac].name == "__dunder_type_desc_table")
+    assert(m_mac.symbols[td_sym_mac].size == fx_arm.reg.type_descs.len * rt.TYPE_DESC_ENTRY_BYTES)
+    assert(m_mac.text.len > 512)
+
+    m_alin := arm64_isel.emit_program(&fx_arm.prog, &fx_arm.hir, .Arm64Linux)
+    assert(m_alin.text.len > 512)
+
+    // 2. x86_64 (Linux ELF64 + Windows PE64)
+    fx_x86 := build_rich_runtime_fixture(2)
+    mut d_x86: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&fx_x86.hir.types, &fx_x86.prog, &mut d_x86))
+    assert(d_x86.len == 0)
+
+    mut m_xlin := x86_isel.emit_program(&fx_x86.prog, &fx_x86.hir, .X86_64Linux)
+    td_sym_x86 := rt.populate_type_desc_table(&mut m_xlin, &fx_x86.reg)
+    assert(td_sym_x86 >= 0)
+    assert(m_xlin.symbols[td_sym_x86].size == fx_x86.reg.type_descs.len * rt.TYPE_DESC_ENTRY_BYTES)
+    assert(m_xlin.text.len > 512)
+    elf_bin := x86_isel.emit_executable(&fx_x86.prog, &fx_x86.hir, .X86_64Linux)
+    assert(elf_bin.len > 128 && i32(elf_bin[0]) == 127 && i32(elf_bin[1]) == 69)
+
+    pe_bin := x86_isel.emit_executable(&fx_x86.prog, &fx_x86.hir, .X86_64Windows)
+    assert(pe_bin.len > 128 && i32(pe_bin[0]) == 77 && i32(pe_bin[1]) == 90) // "MZ"
+
+    // 3. WebAssembly (Wasm32 + Wasm32-WASI)
+    fx_wasm := build_rich_runtime_fixture(3)
+    mut d_wasm: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&fx_wasm.hir.types, &fx_wasm.prog, &mut d_wasm))
+    assert(d_wasm.len == 0)
+    wasm_bin := wasm_isel.emit_wasm(&fx_wasm.prog, &fx_wasm.hir, false)
+    assert(wasm_bin.len > 64)
+    assert(i32(wasm_bin[0]) == 0 && i32(wasm_bin[1]) == 97 && i32(wasm_bin[2]) == 115 && i32(wasm_bin[3]) == 109)
+    wasi_bin := wasm_isel.emit_wasm(&fx_wasm.prog, &fx_wasm.hir, true)
+    assert(wasi_bin.len > 64)
+}
+
+// =========================================================================
+// Test 3: LIVE Native ARM64 Mach-O Execution of Synthesized SSA Runtime!
+//   - Bump allocator fast + slow path
+//   - RC retain / release_checked (rc=1 -> 2 -> 1 -> -1)
+//   - `@resource(dispose)` executes STRICTLY at rc == 1 (NOT at rc == 2!)
+//   - Frozen string (rc == -2) deep-clones to fresh address with rc == 1
+//   - Frozen compound Record (rc == -3 - desc_id) dispatches via TYPE_DESC_TABLE
+//   - TLS CallbackFrame nested push / trampoline_enter / arena growth / exit / pop
+//   - Task worker entry (R-3 zeroed saved_fp + IndirectCall result == 42 + state == 2)
+// =========================================================================
+
+fn add_call(f: &mut ssa.SsaFunc, bb: i32, callee: i32, sig_ty: i32, args: &[]i32, ret_ty: i32, next_bb: i32) -> i32 {
+    a_start := ssa.push_val_args(&mut f, &args)
+    mut dest := -1
+    if ret_ty != ht.TY_UNIT {
+        dest = ssa.add_val(&mut f, ret_ty, bb, ssa.DEF_TERM_RESULT)
+    }
+    mut tm := ssa.make_term(.Call)
+    tm.callee = callee
+    tm.sig_ty = sig_ty
+    tm.dest_val = dest
+    tm.arg_start = a_start
+    tm.arg_len = args.len
+    tm.target_a = next_bb
+    _ := ssa.set_term(&mut f, bb, tm)
+    dest
+}
+
+fn ptr_offset(f: &mut ssa.SsaFunc, bb: i32, p: i32, delta: i64) -> i32 {
+    pi := ssa.emit_cast(&mut f, bb, ht.TY_I64, p, 0, 0)
+    c := ssa.emit_const_int(&mut f, bb, ht.TY_I64, delta, 0, 0)
+    s := ssa.emit_binary(&mut f, bb, ht.TY_I64, hb.BINOP_ADD, pi, c, 0, 0)
+    ssa.emit_cast(&mut f, bb, ht.TY_PTR, s, 0, 0)
+}
+
+fn emit_assert_eq(f: &mut ssa.SsaFunc, bb: i32, a: i32, b: i32, fail_code: i32) -> i32 {
+    ok_bb := ssa.add_block(&mut f)
+    bad_bb := ssa.add_block(&mut f)
+    eq := ssa.emit_binary(&mut f, bb, ht.TY_BOOL, hb.BINOP_EQ, a, b, 0, 0)
+    no_a: []i32 = []
+    _ := ssa.set_branch(&mut f, bb, eq, ok_bb, &no_a, bad_bb, &no_a, 0, 0)
+    c_err := ssa.emit_const_int(&mut f, bad_bb, ht.TY_I32, i64(fail_code), 0, 0)
+    _ := ssa.set_return(&mut f, bad_bb, c_err, 0, 0)
+    ok_bb
+}
+
+@test
+fn ssa_runtime_live_exec_rc_dispose_frozen_bump_tls_and_worker() {
+    target := host_arm64_target()
+    mut fx := build_rich_runtime_fixture(obj.target_to_platform(target))
+
+    empty_from: []ht.FromEdge = []
+    p0: []ht.ParamEntry = []
+    p1_ptr: []ht.ParamEntry = [make_p_copy(ht.TY_PTR)]
+    p_ptr_i64: []ht.ParamEntry = [make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_I64)]
+    p_cb_push: []ht.ParamEntry = [make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_I64)]
+    p_cb_pop: []ht.ParamEntry = [make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_PTR)]
+    p_cb_pair: []ht.ParamEntry = [make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_PTR)]
+
+    sig_main := ht.add_fn_ptr(&mut fx.hir.types, &p0, ht.TY_I32, &empty_from)
+    sig_p2u := ht.add_fn_ptr(&mut fx.hir.types, &p1_ptr, ht.TY_UNIT, &empty_from)
+    sig_p2p := ht.add_fn_ptr(&mut fx.hir.types, &p1_ptr, ht.TY_PTR, &empty_from)
+    sig_p2i64 := ht.add_fn_ptr(&mut fx.hir.types, &p1_ptr, ht.TY_I64, &empty_from)
+    sig_bump := ht.add_fn_ptr(&mut fx.hir.types, &p_ptr_i64, ht.TY_PTR, &empty_from)
+    sig_cb_push := ht.add_fn_ptr(&mut fx.hir.types, &p_cb_push, ht.TY_UNIT, &empty_from)
+    sig_cb_pop := ht.add_fn_ptr(&mut fx.hir.types, &p_cb_pop, ht.TY_UNIT, &empty_from)
+    sig_cb_enter := ht.add_fn_ptr(&mut fx.hir.types, &p_cb_pair, ht.TY_PTR, &empty_from)
+    sig_cb_exit := ht.add_fn_ptr(&mut fx.hir.types, &p_cb_pair, ht.TY_UNIT, &empty_from)
+    ht.seal(&mut fx.hir.types)
+
+    main_id := fx.reg.next_fn_id
+    mut fm := ssa.new_func(main_id, 0, "main", "rt_live.ddr", sig_main, ht.TY_I32, 0, true)
+    mut bb := ssa.add_block(&mut fm)
+
+    // --- A. Bump allocator slow + fast path ---
+    c32 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 32, 0, 0)
+    c64 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 64, 0, 0)
+    c0 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 0, 0, 0)
+    c1 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 1, 0, 0)
+    c2 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 2, 0, 0)
+
+    arena_ctx := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, arena_ctx, c0, 0, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, arena_ctx, c0, 8, -1, 0, 0)
+
+    b1_args: []i32 = [arena_ctx, c32]
+    bb_a1 := ssa.add_block(&mut fm)
+    p1 := add_call(&mut fm, bb, fx.reg.fn_bump_alloc, sig_bump, &b1_args, ht.TY_PTR, bb_a1)
+    bb = bb_a1
+
+    b2_args: []i32 = [arena_ctx, c32]
+    bb_a2 := ssa.add_block(&mut fm)
+    p2 := add_call(&mut fm, bb, fx.reg.fn_bump_alloc, sig_bump, &b2_args, ht.TY_PTR, bb_a2)
+    bb = bb_a2
+
+    // Verify fast-path bump advanced exactly by 32 bytes: p2 - p1 == 32
+    p1_i := ssa.emit_cast(&mut fm, bb, ht.TY_I64, p1, 0, 0)
+    p2_i := ssa.emit_cast(&mut fm, bb, ht.TY_I64, p2, 0, 0)
+    diff12 := ssa.emit_binary(&mut fm, bb, ht.TY_I64, hb.BINOP_SUB, p2_i, p1_i, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, diff12, c32, 11)
+
+    // --- B. `@resource(dispose)` strictly runs at rc == 1 (NOT at rc == 2!) ---
+    counter_box := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, counter_box, c0, 0, -1, 0, 0)
+
+    // Allocate RC-headered Handle box: [raw+0]=rc=2, [raw+8]=counter_ptr, [raw+16]=name=null
+    res_raw := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c64, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, res_raw, c2, 0, -1, 0, 0)
+    res_obj := ptr_offset(&mut fm, bb, res_raw, 8)
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, res_obj, counter_box, 0, -1, 0, 0)
+    null_p := ssa.emit_cast(&mut fm, bb, ht.TY_PTR, c0, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, res_obj, null_p, 8, -1, 0, 0)
+
+    // Drop #1 (rc 2 -> 1): dispose MUST NOT run!
+    drop_res_fn := fx.reg.drop_fns[fx.ty_resource]
+    d1_args: []i32 = [res_obj]
+    bb_d1 := ssa.add_block(&mut fm)
+    _ := add_call(&mut fm, bb, drop_res_fn, sig_p2u, &d1_args, ht.TY_UNIT, bb_d1)
+    bb = bb_d1
+    cnt1 := ssa.emit_load(&mut fm, bb, ht.TY_I64, counter_box, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, cnt1, c0, 12)
+    rc_after1 := ssa.emit_load(&mut fm, bb, ht.TY_I64, res_raw, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, rc_after1, c1, 13)
+
+    // Drop #2 (rc 1 -> -1): dispose MUST run ONCE!
+    d2_args: []i32 = [res_obj]
+    bb_d2 := ssa.add_block(&mut fm)
+    _ := add_call(&mut fm, bb, drop_res_fn, sig_p2u, &d2_args, ht.TY_UNIT, bb_d2)
+    bb = bb_d2
+    cnt2 := ssa.emit_load(&mut fm, bb, ht.TY_I64, counter_box, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, cnt2, c1, 14)
+    cm1 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, rt.RC_FREED, 0, 0)
+    rc_after2 := ssa.emit_load(&mut fm, bb, ht.TY_I64, res_raw, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, rc_after2, cm1, 15)
+
+    // --- C. Frozen string (rc == -2) deep-clones to fresh address with rc == 1 ---
+    str_raw := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    cm2 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, rt.RC_FROZEN_STR, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, str_raw, cm2, 0, -1, 0, 0)
+    str_obj := ptr_offset(&mut fm, bb, str_raw, 8)
+    c4 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 4, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, str_obj, c4, 0, -1, 0, 0)
+    c_a := ssa.emit_const_int(&mut fm, bb, ht.TY_U8, 65, 0, 0) // 'A'
+    ssa.emit_store(&mut fm, bb, ht.TY_U8, str_obj, c_a, 8, -1, 0, 0)
+
+    rstr_args: []i32 = [str_obj]
+    bb_rs := ssa.add_block(&mut fm)
+    cloned_str := add_call(&mut fm, bb, fx.reg.fn_rc_retain, sig_p2p, &rstr_args, ht.TY_PTR, bb_rs)
+    bb = bb_rs
+    // Cloned string must have rc == 1, len == 4, first byte == 'A', and different address!
+    cstr_hdr := ptr_offset(&mut fm, bb, cloned_str, -8)
+    cstr_rc := ssa.emit_load(&mut fm, bb, ht.TY_I64, cstr_hdr, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, cstr_rc, c1, 16)
+    cstr_len := ssa.emit_load(&mut fm, bb, ht.TY_I64, cloned_str, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, cstr_len, c4, 17)
+    cstr_b0 := ssa.emit_load(&mut fm, bb, ht.TY_U8, cloned_str, 8, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, cstr_b0, c_a, 18)
+
+    // --- D. Frozen compound Record (rc == -3 - desc_id) dispatches via TYPE_DESC_TABLE ---
+    rec_desc_id := fx.reg.type_desc_ids[fx.ty_record]
+    rec_raw := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    frozen_rec_rc := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, rt.RC_FROZEN_COMPOUND_BASE - i64(rec_desc_id), 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, rec_raw, frozen_rec_rc, 0, -1, 0, 0)
+    rec_obj := ptr_offset(&mut fm, bb, rec_raw, 8)
+    c777 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 777, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, rec_obj, c777, 0, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, rec_obj, str_obj, 8, -1, 0, 0)
+
+    rrec_args: []i32 = [rec_obj]
+    bb_rr := ssa.add_block(&mut fm)
+    cloned_rec := add_call(&mut fm, bb, fx.reg.fn_rc_retain, sig_p2p, &rrec_args, ht.TY_PTR, bb_rr)
+    bb = bb_rr
+    crec_hdr := ptr_offset(&mut fm, bb, cloned_rec, -8)
+    crec_rc := ssa.emit_load(&mut fm, bb, ht.TY_I64, crec_hdr, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, crec_rc, c1, 19)
+    crec_tag := ssa.emit_load(&mut fm, bb, ht.TY_I64, cloned_rec, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, crec_tag, c777, 20)
+
+    // --- E. TLS CallbackFrame nested push -> trampoline enter -> arena update -> exit -> pop ---
+    tls_slot := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, tls_slot, null_p, 0, -1, 0, 0)
+    cb_frame := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c64, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    cb_arena := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    c999 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 999, 0, 0)
+    push_args: []i32 = [tls_slot, cb_frame, arena_ctx, c999]
+    bb_cp := ssa.add_block(&mut fm)
+    _ := add_call(&mut fm, bb, fx.reg.fn_cb_frame_push, sig_cb_push, &push_args, ht.TY_UNIT, bb_cp)
+    bb = bb_cp
+
+    ent_args: []i32 = [tls_slot, cb_arena]
+    bb_ce := ssa.add_block(&mut fm)
+    active_f := add_call(&mut fm, bb, fx.reg.fn_cb_trampoline_enter, sig_cb_enter, &ent_args, ht.TY_PTR, bb_ce)
+    bb = bb_ce
+    // Simulate arena growth inside callback (bump_cur = 123456)
+    c123456 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 123456, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, cb_arena, c123456, 0, -1, 0, 0)
+
+    ex_args: []i32 = [active_f, cb_arena]
+    bb_cx := ssa.add_block(&mut fm)
+    _ := add_call(&mut fm, bb, fx.reg.fn_cb_trampoline_exit, sig_cb_exit, &ex_args, ht.TY_UNIT, bb_cx)
+    bb = bb_cx
+
+    pop_args: []i32 = [tls_slot, cb_frame, arena_ctx]
+    bb_co := ssa.add_block(&mut fm)
+    _ := add_call(&mut fm, bb, fx.reg.fn_cb_frame_pop, sig_cb_pop, &pop_args, ht.TY_UNIT, bb_co)
+    bb = bb_co
+    // Outer arena MUST see 123456 written inside callback!
+    outer_cur := ssa.emit_load(&mut fm, bb, ht.TY_I64, arena_ctx, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, outer_cur, c123456, 21)
+
+    // --- F. Task worker entry (R-3: zeroed saved_fp + IndirectCall result == 42 + state == 2) ---
+    tdesc := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c64, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    c512 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 512, 0, 0)
+    wpool := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c512, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    warg_box := ssa.emit_inst(&mut fm, bb, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    c16 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 16, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, warg_box, c16, 0, -1, 0, 0) // 16 * 2 + 10 == 42!
+    wfn_ptr := ssa.emit_inst(&mut fm, bb,
+        ssa.make_inst(.ConstFn, sig_p2i64, -1, -1, -1, fx.fn_sample_worker, -1, 0, -1, 0, 0, 0, 0))
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, tdesc, c0, 0, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, tdesc, wpool, 8, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, tdesc, c512, 16, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, sig_p2i64, tdesc, wfn_ptr, 24, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, tdesc, warg_box, 32, -1, 0, 0)
+    ssa.emit_store(&mut fm, bb, ht.TY_I64, tdesc, c999, 48, -1, 0, 0) // non-zero sentinel; R-3 MUST zero saved_fp!
+    ssa.emit_store(&mut fm, bb, ht.TY_PTR, tdesc, cb_arena, 56, -1, 0, 0)
+
+    tw_args: []i32 = [tdesc]
+    bb_tw := ssa.add_block(&mut fm)
+    _ := add_call(&mut fm, bb, fx.reg.fn_task_worker_entry, sig_p2i64, &tw_args, ht.TY_I64, bb_tw)
+    bb = bb_tw
+
+    w_state := ssa.emit_load(&mut fm, bb, ht.TY_I64, tdesc, 0, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, w_state, c2, 22)
+    w_res := ssa.emit_load(&mut fm, bb, ht.TY_I64, tdesc, 40, -1, 0, 0)
+    c42 := ssa.emit_const_int(&mut fm, bb, ht.TY_I64, 42, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, w_res, c42, 23)
+    w_fp := ssa.emit_load(&mut fm, bb, ht.TY_I64, tdesc, 48, -1, 0, 0)
+    bb = emit_assert_eq(&mut fm, bb, w_fp, c0, 24)
+
+    ok_exit := ssa.emit_const_int(&mut fm, bb, ht.TY_I32, 0, 0, 0)
+    _ := ssa.set_return(&mut fm, bb, ok_exit, 0, 0)
+    ssa.compute_preds(&mut fm)
+
+    _ := ssa.add_program_func(&mut fx.prog, move fm)
+    fx.prog.entry_fn = main_id
+
+    mut diags: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&fx.hir.types, &fx.prog, &mut diags))
+    assert(diags.len == 0)
+
+    img := arm64_isel.emit_executable(&fx.prog, &fx.hir, target)
+    out := exec_native_image(&img, "ssa_rt_live_all")
+    assert(out.code == 0)
+}
+
+// =========================================================================
+// Test 4: LIVE Native ARM64 Trap Probes (OOB TYPE_DESC_TABLE 112, UAF 110, Foreign CB 111)
+// =========================================================================
+
+fn run_rc_trap_probe(rc_val: i64, name: string) -> i32 {
+    target := host_arm64_target()
+    mut fx := build_rich_runtime_fixture(obj.target_to_platform(target))
+    empty_from: []ht.FromEdge = []
+    p0: []ht.ParamEntry = []
+    p1_ptr: []ht.ParamEntry = [make_p_copy(ht.TY_PTR)]
+    sig_main := ht.add_fn_ptr(&mut fx.hir.types, &p0, ht.TY_I32, &empty_from)
+    sig_p2p := ht.add_fn_ptr(&mut fx.hir.types, &p1_ptr, ht.TY_PTR, &empty_from)
+    ht.seal(&mut fx.hir.types)
+
+    main_id := fx.reg.next_fn_id
+    mut fm := ssa.new_func(main_id, 0, "main", "trap_probe.ddr", sig_main, ht.TY_I32, 0, true)
+    bb0 := ssa.add_block(&mut fm)
+    bb1 := ssa.add_block(&mut fm)
+    c32 := ssa.emit_const_int(&mut fm, bb0, ht.TY_I64, 32, 0, 0)
+    raw := ssa.emit_inst(&mut fm, bb0, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    bad_rc := ssa.emit_const_int(&mut fm, bb0, ht.TY_I64, rc_val, 0, 0)
+    ssa.emit_store(&mut fm, bb0, ht.TY_I64, raw, bad_rc, 0, -1, 0, 0)
+    obj_p := ptr_offset(&mut fm, bb0, raw, 8)
+    args: []i32 = [obj_p]
+    _ := add_call(&mut fm, bb0, fx.reg.fn_rc_retain, sig_p2p, &args, ht.TY_PTR, bb1)
+    z := ssa.emit_const_int(&mut fm, bb1, ht.TY_I32, 0, 0, 0)
+    _ := ssa.set_return(&mut fm, bb1, z, 0, 0)
+    ssa.compute_preds(&mut fm)
+
+    _ := ssa.add_program_func(&mut fx.prog, move fm)
+    fx.prog.entry_fn = main_id
+    mut diags: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&fx.hir.types, &fx.prog, &mut diags))
+    img := arm64_isel.emit_executable(&fx.prog, &fx.hir, target)
+    exec_native_image(&img, name).code
+}
+
+@test
+fn ssa_runtime_live_traps_oob_desc_112_uaf_110_and_foreign_cb_111() {
+    // Out-of-bounds TYPE_DESC_TABLE index (rc = -9999 -> desc_id = 9996 >= count) MUST trap 112!
+    assert(run_rc_trap_probe(-9999, "trap_112") == rt.TRAP_TYPE_DESC_OOB)
+
+    // Freed-object sentinel (rc = -1) MUST trap 110 (UAF)!
+    assert(run_rc_trap_probe(rt.RC_FREED, "trap_110") == rt.TRAP_USE_AFTER_FREE)
+
+    // Foreign OS thread callback entry (TLS slot == null) MUST trap 111!
+    target := host_arm64_target()
+    mut fx := build_rich_runtime_fixture(obj.target_to_platform(target))
+    empty_from: []ht.FromEdge = []
+    p0: []ht.ParamEntry = []
+    p_pair: []ht.ParamEntry = [make_p_copy(ht.TY_PTR), make_p_copy(ht.TY_PTR)]
+    sig_main := ht.add_fn_ptr(&mut fx.hir.types, &p0, ht.TY_I32, &empty_from)
+    sig_enter := ht.add_fn_ptr(&mut fx.hir.types, &p_pair, ht.TY_PTR, &empty_from)
+    ht.seal(&mut fx.hir.types)
+
+    main_id := fx.reg.next_fn_id
+    mut fm := ssa.new_func(main_id, 0, "main", "cb_trap.ddr", sig_main, ht.TY_I32, 0, true)
+    bb0 := ssa.add_block(&mut fm)
+    bb1 := ssa.add_block(&mut fm)
+    c32 := ssa.emit_const_int(&mut fm, bb0, ht.TY_I64, 32, 0, 0)
+    c0 := ssa.emit_const_int(&mut fm, bb0, ht.TY_I64, 0, 0, 0)
+    null_p := ssa.emit_cast(&mut fm, bb0, ht.TY_PTR, c0, 0, 0)
+    tls_slot := ssa.emit_inst(&mut fm, bb0, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    arena_ctx := ssa.emit_inst(&mut fm, bb0, ssa.make_inst(.AllocHeap, ht.TY_PTR, c32, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    ssa.emit_store(&mut fm, bb0, ht.TY_PTR, tls_slot, null_p, 0, -1, 0, 0)
+    eargs: []i32 = [tls_slot, arena_ctx]
+    _ := add_call(&mut fm, bb0, fx.reg.fn_cb_trampoline_enter, sig_enter, &eargs, ht.TY_PTR, bb1)
+    z := ssa.emit_const_int(&mut fm, bb1, ht.TY_I32, 0, 0, 0)
+    _ := ssa.set_return(&mut fm, bb1, z, 0, 0)
+    ssa.compute_preds(&mut fm)
+
+    _ := ssa.add_program_func(&mut fx.prog, move fm)
+    fx.prog.entry_fn = main_id
+    mut diags: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&fx.hir.types, &fx.prog, &mut diags))
+    img := arm64_isel.emit_executable(&fx.prog, &fx.hir, target)
+    assert(exec_native_image(&img, "trap_111").code == rt.TRAP_FOREIGN_CALLBACK)
+}
+
+// =========================================================================
+// Test 5: `ssa_fragments` Cold -> Warm -> Disk -> 1-Fn Edit -> Struct Layout Change
+//         Asserting Exact Recompile Counts, Live Execution & 100% Byte-Identical Output!
+// =========================================================================
+
+@test
+fn ssa_fragments_cold_warm_disk_single_edit_and_struct_invalidation() {
+    target := host_arm64_target()
+    tmp := fs.temp_dir("dunder-ssa-cache-test-")
+    assert(tmp.ok)
+    cache_dir := tmp.value + "/.dunder-ssa-cache"
+    defer { _ := fs.remove_all(tmp.value) }
+
+    src_v1 := "struct Point { x: i32, y: i32 }\n" +
+        "fn helper_a(n: i32) -> i32 { n * 3 + 1 }\n" +
+        "fn helper_b(n: i32) -> i32 { n + 10 }\n" +
+        "fn leaf_const() -> i32 { 7 }\n" +
+        "fn use_point(p: Point) -> i32 { p.x + p.y }\n" +
+        "fn main() {\n" +
+        "    p := Point { x: 4, y: 5 }\n" +
+        "    print(helper_a(5))\n" +
+        "    print(helper_b(5))\n" +
+        "    print(leaf_const())\n" +
+        "    print(use_point(p))\n" +
+        "}\n"
+
+    // 1. Cold build: all 5 functions compiled (0 hits, 5 misses)
+    hir_v1 := parse_and_lower_hir(src_v1, target)
+    mut cache := frag.new_cache(cache_dir)
+    cold := frag.compile_program_cached(&mut cache, &hir_v1, target, true)
+    assert(cold.ok)
+    assert(cold.total_fns == 5)
+    assert(cold.cache_hits == 0)
+    assert(cold.cache_misses == 5)
+    assert(cold.recompiled_fn_ids.len == 5)
+
+    out_v1 := exec_native_image(&cold.executable, "frag_v1_cold")
+    assert(out_v1.code == 0)
+    assert(out_v1.stdout == "16\n15\n7\n9\n")
+
+    // 2. Warm in-memory rebuild (0 edits): 0 recompiled, 100% BYTE-IDENTICAL!
+    warm := frag.compile_program_cached(&mut cache, &hir_v1, target, true)
+    assert(warm.ok)
+    assert(warm.cache_hits == 5)
+    assert(warm.cache_misses == 0)
+    assert(warm.recompiled_fn_ids.len == 0)
+    assert(bytes_identical(&cold.executable, &warm.executable))
+
+    // 3. Fresh cold-memory cache backed by on-disk `.dunder-ssa-cache`: 0 recompiled, 100% BYTE-IDENTICAL!
+    mut disk_cache := frag.new_cache(cache_dir)
+    from_disk := frag.compile_program_cached(&mut disk_cache, &hir_v1, target, true)
+    assert(from_disk.ok)
+    assert(from_disk.cache_hits == 5)
+    assert(from_disk.cache_misses == 0)
+    assert(bytes_identical(&cold.executable, &from_disk.executable))
+
+    // 4. 1-function private edit (ONLY `helper_b` body changes from `n + 10` to `n + 25`!)
+    //    MUST recompile ONLY 1 of 5 functions and match fresh cold build BYTE-FOR-BYTE!
+    src_v2 := "struct Point { x: i32, y: i32 }\n" +
+        "fn helper_a(n: i32) -> i32 { n * 3 + 1 }\n" +
+        "fn helper_b(n: i32) -> i32 { n + 25 }\n" +
+        "fn leaf_const() -> i32 { 7 }\n" +
+        "fn use_point(p: Point) -> i32 { p.x + p.y }\n" +
+        "fn main() {\n" +
+        "    p := Point { x: 4, y: 5 }\n" +
+        "    print(helper_a(5))\n" +
+        "    print(helper_b(5))\n" +
+        "    print(leaf_const())\n" +
+        "    print(use_point(p))\n" +
+        "}\n"
+
+    hir_v2 := parse_and_lower_hir(src_v2, target)
+    incr_v2 := frag.compile_program_cached(&mut cache, &hir_v2, target, true)
+    assert(incr_v2.ok)
+    assert(incr_v2.total_fns == 5)
+    assert(incr_v2.cache_hits == 4)
+    assert(incr_v2.cache_misses == 1)
+    assert(incr_v2.recompiled_fn_ids.len == 1)
+    assert(hir_v2.fns[incr_v2.recompiled_fn_ids[0]].name == "helper_b")
+
+    mut fresh_cache_v2 := frag.new_memory_cache()
+    cold_v2 := frag.compile_program_cached(&mut fresh_cache_v2, &hir_v2, target, true)
+    assert(cold_v2.ok)
+    assert(bytes_identical(&incr_v2.executable, &cold_v2.executable))
+
+    out_v2 := exec_native_image(&incr_v2.executable, "frag_v2_incr")
+    assert(out_v2.code == 0)
+    assert(out_v2.stdout == "16\n30\n7\n9\n")
+
+    // 5. Shared struct layout change: add `z: i64` to `struct Point`!
+    //    `use_point` and `main` reference `Point` -> BOTH invalidated & recompiled!
+    //    `helper_a`, `helper_b`, `leaf_const` do NOT reference `Point` -> ALL 3 stay cached!
+    src_v3 := "struct Point { x: i32, y: i32, z: i64 }\n" +
+        "fn helper_a(n: i32) -> i32 { n * 3 + 1 }\n" +
+        "fn helper_b(n: i32) -> i32 { n + 25 }\n" +
+        "fn leaf_const() -> i32 { 7 }\n" +
+        "fn use_point(p: Point) -> i32 { p.x + p.y + i32(p.z) }\n" +
+        "fn main() {\n" +
+        "    p := Point { x: 4, y: 5, z: 100 }\n" +
+        "    print(helper_a(5))\n" +
+        "    print(helper_b(5))\n" +
+        "    print(leaf_const())\n" +
+        "    print(use_point(p))\n" +
+        "}\n"
+
+    hir_v3 := parse_and_lower_hir(src_v3, target)
+    incr_v3 := frag.compile_program_cached(&mut cache, &hir_v3, target, true)
+    assert(incr_v3.ok)
+    assert(incr_v3.total_fns == 5)
+    assert(incr_v3.cache_hits == 3)
+    assert(incr_v3.cache_misses == 2)
+
+    mut fresh_cache_v3 := frag.new_memory_cache()
+    cold_v3 := frag.compile_program_cached(&mut fresh_cache_v3, &hir_v3, target, true)
+    assert(cold_v3.ok)
+    assert(bytes_identical(&incr_v3.executable, &cold_v3.executable))
+
+    out_v3 := exec_native_image(&incr_v3.executable, "frag_v3_struct")
+    assert(out_v3.code == 0)
+    assert(out_v3.stdout == "16\n30\n7\n109\n")
+}
+
+// =========================================================================
+// Test 6: Cross-Target Fragment Cache Byte-Identicality (x86_64 ELF, Win64 PE, WASM32-WASI)
+// =========================================================================
+
+@test
+fn ssa_fragments_cross_target_x86_and_wasm_byte_identical() {
+    src1 := "fn sq(x: i32) -> i32 { x * x }\n" +
+        "fn add1(x: i32) -> i32 { x + 1 }\n" +
+        "fn main() -> i32 { sq(4) + add1(5) }\n"
+    src2 := "fn sq(x: i32) -> i32 { x * x }\n" +
+        "fn add1(x: i32) -> i32 { x + 9 }\n" +
+        "fn main() -> i32 { sq(4) + add1(5) }\n"
+
+    targets: []obj.TargetKind = [.X86_64Linux, .X86_64Windows, .Wasm32Wasi]
+    for ti in 0..targets.len {
+        t := targets[ti]
+        h1 := parse_and_lower_hir(src1, t)
+        mut c := frag.new_memory_cache()
+        r1 := frag.compile_program_cached(&mut c, &h1, t, true)
+        assert(r1.ok && r1.total_fns == 3 && r1.cache_hits == 0 && r1.cache_misses == 3)
+
+        r1_warm := frag.compile_program_cached(&mut c, &h1, t, true)
+        assert(r1_warm.ok && r1_warm.cache_hits == 3 && r1_warm.cache_misses == 0)
+        assert(bytes_identical(&r1.executable, &r1_warm.executable))
+
+        h2 := parse_and_lower_hir(src2, t)
+        r2_incr := frag.compile_program_cached(&mut c, &h2, t, true)
+        assert(r2_incr.ok && r2_incr.cache_hits == 2 && r2_incr.cache_misses == 1)
+
+        mut fresh := frag.new_memory_cache()
+        r2_cold := frag.compile_program_cached(&mut fresh, &h2, t, true)
+        assert(r2_cold.ok)
+        assert(bytes_identical(&r2_incr.executable, &r2_cold.executable))
+    }
+}
+
+// =========================================================================
+// Test 7: Multi-Fragment `.rodata` String Literals, Callee Signature Change &
+//         On-Disk Cache Integrity Recovery (Tamper Detection)
+// =========================================================================
+
+@test
+fn ssa_fragments_rodata_strings_callee_sig_and_disk_corruption_recovery() {
+    target := host_arm64_target()
+    tmp := fs.temp_dir("dunder-ssa-rodata-")
+    assert(tmp.ok)
+    cache_dir := tmp.value + "/.dunder-ssa-cache"
+    defer { _ := fs.remove_all(tmp.value) }
+
+    src := "fn greet_a() { print(\"alpha\") }\n" +
+        "fn greet_b() { print(\"beta\") }\n" +
+        "fn scale(x: i32) -> i32 { x * 2 }\n" +
+        "fn main() {\n" +
+        "    greet_a()\n" +
+        "    greet_b()\n" +
+        "    print(\"gamma\")\n" +
+        "    print(scale(21))\n" +
+        "}\n"
+
+    hir := parse_and_lower_hir(src, target)
+    mut cache := frag.new_cache(cache_dir)
+    cold := frag.compile_program_cached(&mut cache, &hir, target, true)
+    assert(cold.ok && cold.total_fns == 4 && cold.cache_misses == 4)
+
+    out := exec_native_image(&cold.executable, "frag_rodata_live")
+    assert(out.code == 0)
+    assert(out.stdout == "alpha\nbeta\ngamma\n42\n")
+
+    // Corrupt 1 byte inside greet_a's on-disk `.frag` file; fresh cache MUST detect SHA-256 mismatch
+    // and recompile ONLY greet_a while hitting cache for the other 3 functions!
+    frag_path := cache_dir + "/" + cold.fn_hashes[0] + ".frag"
+    rd := sys.read_u8(frag_path)
+    assert(rd.ok && rd.value.len > 140)
+    mut tampered := rd.value.clone()
+    tampered[tampered.len - 1] = u8(i32(tampered[tampered.len - 1]).bit_xor(0xff))
+    assert(sys.write_u8(frag_path, &tampered).ok)
+
+    mut recovery_cache := frag.new_cache(cache_dir)
+    recovered := frag.compile_program_cached(&mut recovery_cache, &hir, target, true)
+    assert(recovered.ok)
+    assert(recovered.cache_hits == 3)
+    assert(recovered.cache_misses == 1)
+    assert(bytes_identical(&cold.executable, &recovered.executable))
+
+    // Callee signature change (`scale(x: i32) -> i32` => `scale(x: i64) -> i64`):
+    // `scale` and `main` MUST invalidate, while `greet_a` and `greet_b` stay cached!
+    src_sig := "fn greet_a() { print(\"alpha\") }\n" +
+        "fn greet_b() { print(\"beta\") }\n" +
+        "fn scale(x: i64) -> i64 { x * 2 }\n" +
+        "fn main() {\n" +
+        "    greet_a()\n" +
+        "    greet_b()\n" +
+        "    print(\"gamma\")\n" +
+        "    print(scale(21))\n" +
+        "}\n"
+    hir_sig := parse_and_lower_hir(src_sig, target)
+    sig_res := frag.compile_program_cached(&mut recovery_cache, &hir_sig, target, true)
+    assert(sig_res.ok && sig_res.cache_hits == 2 && sig_res.cache_misses == 2)
+    out_sig := exec_native_image(&sig_res.executable, "frag_sig_live")
+    assert(out_sig.code == 0)
+    assert(out_sig.stdout == "alpha\nbeta\ngamma\n42\n")
+}
