@@ -1,0 +1,720 @@
+// Comprehensive end-to-end tests for Phase 4C:
+// Native WebAssembly Typed-Local LIR/ISel (`selfhost/backend/wasm_isel.ddr`).
+// Compiles real Dunder programs through:
+//   parser -> hir_lower -> hir_mono -> mir_check -> ssa_lower -> ssa_opt -> ssa_verify -> wasm_isel -> .wasm
+// Validates WASM binary structure, ZERO ARM64 global-bank (0..31) emulation,
+// multiple distinct per-signature `call_indirect` types, and LIVE execution in Node!
+
+capability process, filesystem
+
+import std.fs as fs
+import std.process as process
+import sys
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.hir.hir_lower as hir_lower
+import ..selfhost.hir.hir_mono as hir_mono
+import ..selfhost.mir2.mir_check as mir_check
+import ..selfhost.ssa.ssa_ir as ssa
+import ..selfhost.ssa.ssa_verify as ssa_verify
+import ..selfhost.ssa.ssa_lower as ssa_lower
+import ..selfhost.ssa.ssa_opt as ssa_opt
+import ..selfhost.backend.wasm_isel as wasm_isel
+
+struct WasmBuild {
+    ok: bool,
+    wasm: []u8,
+    hir: hb.HirProgram,
+    ssa_prog: ssa.SsaProgram,
+}
+
+fn compile_to_wasm(src: string, is_wasi: bool, run_opt: bool) -> WasmBuild {
+    platform := if is_wasi { 4 } else { 3 } // 3=wasm32, 4=wasm32-wasi
+    tree := parser.parse_source("wasm_unit.ddr", src)
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "wasm_unit.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut prog := hir_lower.lower_modules(&mods, &edges, platform)
+    if !prog.ok {
+        return WasmBuild { ok: false, wasm: [], hir: move prog, ssa_prog: ssa.new_program(0, -1) }
+    }
+    hir_mono.monomorphize(&mut prog)
+    chk := mir_check.check_program(&prog)
+    if !chk.ok {
+        return WasmBuild { ok: false, wasm: [], hir: move prog, ssa_prog: ssa.new_program(0, -1) }
+    }
+    mut diags: []diag.Diagnostic = []
+    mut sp := ssa_lower.lower_program(&prog, &chk.bodies, &mut diags)
+    if !ssa_verify.verify_program(&prog.types, &sp, &mut diags) || diags.len > 0 {
+        return WasmBuild { ok: false, wasm: [], hir: move prog, ssa_prog: move sp }
+    }
+    if run_opt {
+        if !ssa_opt.optimize_program(&prog.types, &mut sp, true, &mut diags) || diags.len > 0 {
+            return WasmBuild { ok: false, wasm: [], hir: move prog, ssa_prog: move sp }
+        }
+    }
+    wasm := wasm_isel.emit_wasm(&sp, &prog, is_wasi)
+    WasmBuild { ok: true, wasm: move wasm, hir: move prog, ssa_prog: move sp }
+}
+
+// =========================================================================
+// Binary WASM Section & Invariant Parser
+// =========================================================================
+
+struct LebRes {
+    val: i32,
+    next: i32,
+}
+
+fn read_uleb(buf: &[]u8, pos_in: i32) -> LebRes {
+    mut pos := pos_in
+    mut result := 0
+    mut shift := 0
+    while pos < buf.len {
+        byte := i32(buf[pos])
+        pos += 1
+        result = result.bit_or(byte.bit_and(127).shl(shift))
+        if byte.bit_and(128) == 0 { break }
+        shift += 7
+    }
+    LebRes { val: result, next: pos }
+}
+
+struct WasmInspection {
+    valid_header: bool,
+    sections_ordered: bool,
+    type_count: i32,
+    global_count: i32,
+    all_globals_i32: bool,
+    table_min: i32,
+    elem_count: i32,
+    code_count: i32,
+    has_data_sec: bool,
+}
+
+fn inspect_wasm(buf: &[]u8) -> WasmInspection {
+    mut res := WasmInspection {
+        valid_header: false,
+        sections_ordered: true,
+        type_count: 0,
+        global_count: 0,
+        all_globals_i32: true,
+        table_min: 0,
+        elem_count: 0,
+        code_count: 0,
+        has_data_sec: false,
+    }
+    if buf.len < 8 { return res }
+    res.valid_header = buf[0] == u8(0) && buf[1] == u8(97) && buf[2] == u8(115) && buf[3] == u8(109) &&
+        buf[4] == u8(1) && buf[5] == u8(0) && buf[6] == u8(0) && buf[7] == u8(0)
+    if !res.valid_header { return res }
+
+    mut pos := 8
+    mut prev_id := 0
+    while pos < buf.len {
+        sec_id := i32(buf[pos]); pos += 1
+        if sec_id <= prev_id { res.sections_ordered = false }
+        prev_id = sec_id
+        sz := read_uleb(&buf, pos)
+        sec_start := sz.next
+        sec_end := sec_start + sz.val
+        if sec_end > buf.len { res.sections_ordered = false; break }
+
+        if sec_id == 1 {
+            c := read_uleb(&buf, sec_start)
+            res.type_count = c.val
+        } else if sec_id == 4 {
+            // 1 table: 0x70, flags, min
+            if sec_start + 3 <= sec_end {
+                m := read_uleb(&buf, sec_start + 3)
+                res.table_min = m.val
+            }
+        } else if sec_id == 6 {
+            c := read_uleb(&buf, sec_start)
+            res.global_count = c.val
+            mut gp := c.next
+            for _ in 0..c.val {
+                if gp >= sec_end { res.all_globals_i32 = false; break }
+                if i32(buf[gp]) != 127 { res.all_globals_i32 = false } // must be i32 (0x7f), NEVER i64 (0x7e)!
+                gp += 2 // valtype + mutability
+                while gp < sec_end && i32(buf[gp]) != 11 { gp += 1 }
+                gp += 1 // skip 0x0b end
+            }
+        } else if sec_id == 9 {
+            // 1 active segment: count(1), table(0), i32.const 1, end, n_funcs
+            mut ep := sec_start + 2
+            while ep < sec_end && i32(buf[ep]) != 11 { ep += 1 }
+            ep += 1
+            if ep < sec_end {
+                ec := read_uleb(&buf, ep)
+                res.elem_count = ec.val
+            }
+        } else if sec_id == 10 {
+            c := read_uleb(&buf, sec_start)
+            res.code_count = c.val
+        } else if sec_id == 11 {
+            res.has_data_sec = true
+        }
+        pos = sec_end
+    }
+    res
+}
+
+// Execute a `.wasm` binary inside Node with a caller-supplied JS snippet receiving `wasmPath`.
+fn run_node_wasm(wasm: &[]u8, js_code: string) -> process.Output {
+    tmp := fs.temp_dir("dunder-wasm-isel-")
+    assert(tmp.ok)
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    wasm_path := work + "/mod.wasm"
+    st := sys.write_u8(wasm_path, &wasm)
+    assert(st.ok)
+    mut cmd := process.Command::new("node", ["-e", js_code.clone(), wasm_path])
+    cmd.set_timeout(15000)
+    cmd.exec()
+}
+
+// =========================================================================
+// 1. Binary Structure, Native Locals & ZERO ARM64 Global-Bank Emulation
+// =========================================================================
+
+@test
+fn wasm_isel_zero_arm64_global_bank_and_native_arithmetic() {
+    src := "fn add_i32(a: i32, b: i32) -> i32 { a + b }\n" +
+        "fn mul_i64(a: i64, b: i64) -> i64 { a * b + 7 }\n" +
+        "fn blend_f64(a: f64, b: f64) -> f64 { (a + b) * 0.5 }\n" +
+        "fn mix_f32(x: f32) -> f32 { x * 2.0 + 1.5 }\n" +
+        "fn narrow_ops(a: u8, b: u8) -> i32 { i32(a) + i32(b) * 10 }\n" +
+        "fn main() -> i32 { add_i32(19, 23) }\n"
+
+    b := compile_to_wasm(src, false, true)
+    assert(b.ok)
+
+    info := inspect_wasm(&b.wasm)
+    assert(info.valid_header)
+    assert(info.sections_ordered)
+    // Strictly ONLY 2 native i32 globals ($sp=0, $hp=1) — ZERO ARM64 0..31 global bank!
+    assert(info.global_count == 2)
+    assert(info.all_globals_i32)
+
+    // Verify live in Node: WebAssembly.validate + exact native return values + bytecode check!
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "if (!WebAssembly.validate(bytes)) throw new Error('invalid wasm');\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  const out = [\n" +
+        "    e.add_i32(19, 23),\n" +
+        "    e.mul_i64(100000n, 300000n).toString(),\n" +
+        "    e.blend_f64(3.0, 5.0),\n" +
+        "    e.mix_f32(2.5),\n" +
+        "    e.narrow_ops(4, 3),\n" +
+        "    e.main()\n" +
+        "  ];\n" +
+        "  process.stdout.write(out.join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    assert(res.stdout_text() == "42,30000000007,4,6.5,34,42")
+}
+
+// =========================================================================
+// 2. Loops, Recursion, Fibonacci & Parallel Block-Param Swap Safety
+// =========================================================================
+
+@test
+fn wasm_isel_loops_recursion_and_fibonacci() {
+    src := "fn fib_rec(n: i32) -> i32 {\n" +
+        "    if n <= 1 { return n }\n" +
+        "    fib_rec(n - 1) + fib_rec(n - 2)\n" +
+        "}\n" +
+        "fn fib_iter(n: i32) -> i64 {\n" +
+        "    mut a: i64 = 0\n" +
+        "    mut b: i64 = 1\n" +
+        "    mut i := 0\n" +
+        "    while i < n {\n" +
+        "        next := a + b\n" +
+        "        a = b\n" +
+        "        b = next\n" +
+        "        i += 1\n" +
+        "    }\n" +
+        "    a\n" +
+        "}\n" +
+        "fn classify(x: i32) -> i32 {\n" +
+        "    if x < 0 { return -1 }\n" +
+        "    if x == 0 { return 0 }\n" +
+        "    mut acc := 0\n" +
+        "    for i in 1..x {\n" +
+        "        if i % 2 == 0 { acc += i } else { acc += i * 3 }\n" +
+        "    }\n" +
+        "    acc\n" +
+        "}\n" +
+        "fn main() -> i32 { fib_rec(10) }\n"
+
+    b := compile_to_wasm(src, false, true)
+    assert(b.ok)
+    info := inspect_wasm(&b.wasm)
+    assert(info.valid_header && info.global_count == 2 && info.all_globals_i32)
+
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  const out = [\n" +
+        "    e.fib_rec(10),\n" +
+        "    e.fib_iter(20).toString(),\n" +
+        "    e.fib_iter(50).toString(),\n" +
+        "    e.classify(-5),\n" +
+        "    e.classify(0),\n" +
+        "    e.classify(6)\n" +
+        "  ];\n" +
+        "  process.stdout.write(out.join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    // classify(6): i=1(3)+i=2(2)+i=3(9)+i=4(4)+i=5(15) = 33
+    assert(res.stdout_text() == "55,6765,12586269025,-1,0,33")
+}
+
+// =========================================================================
+// 3. Structs, Methods, Enums, Match, Option/Result & Inlined Functions
+// =========================================================================
+
+@test
+fn wasm_isel_structs_enums_and_inlined_helpers() {
+    src := "struct Vec2 { x: i32, y: i32 }\n" +
+        "impl Vec2 {\n" +
+        "    fn dot(&self, other: &Vec2) -> i32 { self.x * other.x + self.y * other.y }\n" +
+        "    fn scaled(&self, k: i32) -> Vec2 { Vec2 { x: self.x * k, y: self.y * k } }\n" +
+        "}\n" +
+        "enum Shape {\n" +
+        "    Unit,\n" +
+        "    Square(i32),\n" +
+        "    Rect(i32, i32),\n" +
+        "}\n" +
+        "fn area(s: Shape) -> i32 {\n" +
+        "    match s {\n" +
+        "        .Unit => 1,\n" +
+        "        .Square(side) => side * side,\n" +
+        "        .Rect(w, h) => w * h,\n" +
+        "    }\n" +
+        "}\n" +
+        "fn opt_val(x: i32) -> i32 {\n" +
+        "    o: Option<i32> = if x > 0 { .Some(x * 10) } else { .None }\n" +
+        "    match o {\n" +
+        "        .Some(v) => v,\n" +
+        "        .None => -1,\n" +
+        "    }\n" +
+        "}\n" +
+        "fn add_one(v: i32) -> i32 { v + 1 }\n" +
+        "fn run_all(a: i32, b: i32) -> i32 {\n" +
+        "    v1 := Vec2 { x: add_one(a), y: add_one(b) }\n" +
+        "    v2 := v1.scaled(2)\n" +
+        "    d := v1.dot(&v2)\n" +
+        "    a1 := area(.Square(4))\n" +
+        "    a2 := area(.Rect(3, 5))\n" +
+        "    a3 := area(.Unit)\n" +
+        "    d + a1 + a2 + a3 + opt_val(2) + opt_val(0)\n" +
+        "}\n" +
+        "fn main() -> i32 { run_all(2, 3) }\n"
+
+    b := compile_to_wasm(src, false, true)
+    assert(b.ok)
+
+    // Verify SSA inliner actually inlined helper calls before WASM ISel!
+    mut ri := -1
+    for i in 0..b.ssa_prog.funcs.len {
+        if b.ssa_prog.funcs[i].name == "run_all" { ri = i }
+    }
+    assert(ri >= 0)
+    mut rem_calls := 0
+    rf := &b.ssa_prog.funcs[ri]
+    for bb in 0..rf.blocks.len {
+        tid := rf.blocks[bb].term_id
+        if tid >= 0 && rf.terms[tid].kind == .Call { rem_calls += 1 }
+    }
+    // Verify SSA inliner inlined >= 8 helper/method/enum calls (capped at 8 per fn by ssa_opt)!
+    assert(rem_calls <= 1)
+
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  process.stdout.write([e.run_all(2, 3), e.opt_val(5), e.opt_val(-2)].join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    // v1=(3,4), v2=(6,8), dot=18+32=50, areas=16+15+1=32, opt_val(2)=20, opt_val(0)=-1 -> 101
+    assert(res.stdout_text() == "101,50,-1")
+}
+
+// =========================================================================
+// 4. First-Class 2-Word `&str` Fat Views, Arrays (`[]T` & `[T; N]`), Region
+// =========================================================================
+
+@test
+fn wasm_isel_fat_str_views_arrays_and_region() {
+    src := "fn pick_str(flag: bool, a: &str, b: &str) -> &str from (a, b) {\n" +
+        "    if flag { a } else { b }\n" +
+        "}\n" +
+        "fn sum_slice(xs: &[]i32) -> i32 {\n" +
+        "    mut total := 0\n" +
+        "    for i in 0..xs.len {\n" +
+        "        total += xs[i]\n" +
+        "    }\n" +
+        "    total\n" +
+        "}\n" +
+        "fn test_views() -> i32 {\n" +
+        "    s1 := \"hello\"\n" +
+        "    s2 := \"world!\"\n" +
+        "    chosen := pick_str(false, s1.as_str(), s2.as_str())\n" +
+        "    sub := chosen[1..5]\n" +
+        "    eq_ok := if sub == \"orld\" { 100 } else { 0 }\n" +
+        "    cat := s1 + \" \" + s2\n" +
+        "    mut arr: []i32 = [10, 20, 30]\n" +
+        "    arr.push(40)\n" +
+        "    arr.push(50)\n" +
+        "    s_arr := sum_slice(&arr)\n" +
+        "    fixed: [i32; 4] = [1, 2, 3, 4]\n" +
+        "    s_fix := fixed[0] + fixed[1] + fixed[2] + fixed[3]\n" +
+        "    mut reg_len := 0\n" +
+        "    region r(256) {\n" +
+        "        buf := r.alloc(6)\n" +
+        "        reg_len = buf.len\n" +
+        "    }\n" +
+        "    eq_ok + cat.len + s_arr + s_fix + reg_len\n" +
+        "}\n" +
+        "fn main() -> i32 { test_views() }\n"
+
+    b := compile_to_wasm(src, false, true)
+    assert(b.ok)
+    info := inspect_wasm(&b.wasm)
+    assert(info.valid_header && info.has_data_sec && info.global_count == 2)
+
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  // Test direct multi-value (i32, i32) fat-view return from pick_str too!\n" +
+        "  const [ptr, len] = e.pick_str(1, 100, 5, 200, 6);\n" +
+        "  process.stdout.write([e.test_views(), ptr, len].join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    // eq_ok(100) + cat.len(12) + s_arr(150) + s_fix(10) + reg_len(6) = 278; pick_str(1) -> [100, 5]
+    assert(res.stdout_text() == "278,100,5")
+}
+
+// =========================================================================
+// 5. Per-Signature Typed `call_indirect` (Multiple Distinct Signatures & Closures!)
+// =========================================================================
+
+@test
+fn wasm_isel_per_signature_call_indirect_and_closures() {
+    src := "fn inc(x: i32) -> i32 { x + 1 }\n" +
+        "fn dbl(x: i32) -> i32 { x * 2 }\n" +
+        "fn add2(a: i32, b: i32) -> i32 { a + b }\n" +
+        "fn mul2(a: i32, b: i32) -> i32 { a * b }\n" +
+        "fn sq64(x: i64) -> i64 { x * x }\n" +
+        "fn apply1(f: fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+        "fn apply2(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 { f(a, b) }\n" +
+        "fn apply64(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }\n" +
+        "fn apply_closure(f: &Fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+        "fn run_indirect(flag: bool) -> i64 {\n" +
+        "    f1: fn(i32) -> i32 = if flag { inc } else { dbl }\n" +
+        "    f2: fn(i32, i32) -> i32 = if flag { add2 } else { mul2 }\n" +
+        "    f3: fn(i64) -> i64 = sq64\n" +
+        "    r1 := apply1(f1, 10)\n" +
+        "    r2 := apply2(f2, 6, 7)\n" +
+        "    r3 := apply64(f3, 9)\n" +
+        "    cl := fn(x: i32) -> i32 { x + 100 }\n" +
+        "    r4 := apply_closure(&cl, 5)\n" +
+        "    i64(r1 + r2 + r4) + r3\n" +
+        "}\n" +
+        "fn main() -> i32 { i32(run_indirect(true)) }\n"
+
+    // Compile WITHOUT inlining so apply1/apply2/apply64/apply_closure keep distinct IndirectCalls,
+    // AND ALSO compile WITH optimization to verify both execute identically!
+    b_unopt := compile_to_wasm(src, false, false)
+    assert(b_unopt.ok)
+    b_opt := compile_to_wasm(src, false, true)
+    assert(b_opt.ok)
+
+    info := inspect_wasm(&b_unopt.wasm)
+    assert(info.valid_header && info.sections_ordered)
+    assert(info.global_count == 2 && info.all_globals_i32)
+    // Function table must hold all 5 fn-ptr targets + closure body (>= 6 entries)
+    assert(info.elem_count >= 6)
+    // Type section must have multiple distinct signatures!
+    assert(info.type_count >= 5)
+
+    // Verify live in Node: BOTH distinct call_indirect type indices in Code section AND exact execution!
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "if (!WebAssembly.validate(bytes)) throw new Error('invalid wasm');\n" +
+        "// Scan Code section (id 10) for 0x11 <type_idx> 0x00 call_indirect patterns and verify >= 3 distinct type indices\n" +
+        "let p = 8, codeStart = 0, codeEnd = 0;\n" +
+        "function uleb(b, i) { let r = 0, s = 0; while (true) { const v = b[i++]; r |= (v & 0x7f) << s; if (!(v & 0x80)) return [r, i]; s += 7; } }\n" +
+        "while (p < bytes.length) { const id = bytes[p++]; const [sz, np] = uleb(bytes, p); if (id === 10) { codeStart = np; codeEnd = np + sz; } p = np + sz; }\n" +
+        "const sigs = new Set();\n" +
+        "for (let i = codeStart; i + 2 < codeEnd; i++) { if (bytes[i] === 0x11 && bytes[i + 2] === 0x00) sigs.add(bytes[i + 1]); }\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  const t = e.run_indirect(1).toString();\n" +
+        "  const f = e.run_indirect(0).toString();\n" +
+        "  process.stdout.write([t, f, sigs.size >= 3 ? 'multi_sig_ok' : 'single_sig'].join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    r_unopt := run_node_wasm(&b_unopt.wasm, js)
+    assert(r_unopt.succeeded())
+    // flag=true: inc(10)=11 + add2(6,7)=13 + cl(5)=105 + sq64(9)=81 => 210
+    // flag=false: dbl(10)=20 + mul2(6,7)=42 + cl(5)=105 + sq64(9)=81 => 248
+    assert(r_unopt.stdout_text() == "210,248,multi_sig_ok")
+
+    r_opt := run_node_wasm(&b_opt.wasm, js)
+    assert(r_opt.succeeded())
+    assert(r_opt.stdout_text() == "210,248,multi_sig_ok")
+}
+
+// =========================================================================
+// 6. Capturing Closure Live Execution (env_ptr -> [table_idx, 0, caps...])
+// =========================================================================
+
+@test
+fn wasm_isel_capturing_closure_execution() {
+    src := "fn call_cl(f: &Fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+        "fn test_capture(base: i32, mult: i32) -> i32 {\n" +
+        "    cl := fn[base, mult](x: i32) -> i32 { x * mult + base }\n" +
+        "    call_cl(&cl, 7) + call_cl(&cl, 3)\n" +
+        "}\n" +
+        "fn main() -> i32 { test_capture(10, 4) }\n"
+
+    // Unoptimized SSA keeps capture StackSlots live so wasm_isel unpacks [env_ptr + 8..]
+    b := compile_to_wasm(src, false, false)
+    assert(b.ok)
+
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  // (7*4+10) + (3*4+10) = 38 + 22 = 60\n" +
+        "  process.stdout.write(String(e.test_capture(10, 4)));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    assert(res.stdout_text() == "60")
+}
+
+// =========================================================================
+// 7. Checked Arithmetic, Div-Zero, Bounds & Assert Traps (wasm32 & WASI)
+// =========================================================================
+
+@test
+fn wasm_isel_checked_traps_overflow_divzero_bounds_and_assert() {
+    src := "fn do_add(a: i32, b: i32) -> i32 { a + b }\n" +
+        "fn do_div(a: i32, b: i32) -> i32 { a / b }\n" +
+        "fn do_get(k: i32) -> i32 {\n" +
+        "    arr: [i32; 3] = [10, 20, 30]\n" +
+        "    arr[k]\n" +
+        "}\n" +
+        "fn do_assert(ok: bool) -> i32 {\n" +
+        "    assert(ok)\n" +
+        "    99\n" +
+        "}\n" +
+        "fn main() -> i32 { do_add(1, 2) }\n"
+
+    // 7a: Non-WASI mode -> traps with WebAssembly.RuntimeError (unreachable)
+    b_raw := compile_to_wasm(src, false, true)
+    assert(b_raw.ok)
+    js_raw := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  function trapped(fn) { try { fn(); return false; } catch (err) { return err instanceof WebAssembly.RuntimeError; } }\n" +
+        "  const res = [\n" +
+        "    e.do_add(10, 20),\n" +
+        "    trapped(() => e.do_add(2147483647, 1)),\n" +
+        "    trapped(() => e.do_div(10, 0)),\n" +
+        "    e.do_get(1),\n" +
+        "    trapped(() => e.do_get(3)),\n" +
+        "    trapped(() => e.do_get(-1)),\n" +
+        "    e.do_assert(1),\n" +
+        "    trapped(() => e.do_assert(0))\n" +
+        "  ];\n" +
+        "  process.stdout.write(res.join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+    r_raw := run_node_wasm(&b_raw.wasm, js_raw)
+    assert(r_raw.succeeded())
+    assert(r_raw.stdout_text() == "30,true,true,20,true,true,99,true")
+
+    // 7b: WASI mode -> traps report exact Dunder trap codes via proc_exit(101/102/103/104)!
+    b_wasi := compile_to_wasm(src, true, true)
+    assert(b_wasi.ok)
+    js_wasi := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "class ExitCode extends Error { constructor(c) { super(); this.code = c; } }\n" +
+        "(async () => {\n" +
+        "  const imports = { wasi_snapshot_preview1: { fd_write: () => 0, proc_exit: (c) => { throw new ExitCode(c); } } };\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes, imports);\n" +
+        "  const e = instance.exports;\n" +
+        "  function codeOf(fn) { try { fn(); return 0; } catch (err) { return err instanceof ExitCode ? err.code : -1; } }\n" +
+        "  const codes = [\n" +
+        "    codeOf(() => e.do_add(2147483647, 1)),\n" +
+        "    codeOf(() => e.do_div(10, 0)),\n" +
+        "    codeOf(() => e.do_get(5)),\n" +
+        "    codeOf(() => e.do_assert(0))\n" +
+        "  ];\n" +
+        "  process.stdout.write(codes.join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+    r_wasi := run_node_wasm(&b_wasi.wasm, js_wasi)
+    assert(r_wasi.succeeded())
+    assert(r_wasi.stdout_text() == "101,102,103,104")
+}
+
+// =========================================================================
+// 8. WASI `_start` + `fd_write` Live Stdout Verification in Node
+// =========================================================================
+
+@test
+fn wasm_isel_wasi_start_and_stdout_execution() {
+    src := "fn fib(n: i32) -> i32 {\n" +
+        "    mut a := 0\n" +
+        "    mut b := 1\n" +
+        "    for _ in 0..n {\n" +
+        "        t := a + b\n" +
+        "        a = b\n" +
+        "        b = t\n" +
+        "    }\n" +
+        "    a\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    s := \"hello wasm\"\n" +
+        "    print(s)\n" +
+        "    print(s.as_str()[6..10])\n" +
+        "    print(fib(10))\n" +
+        "    print(-42)\n" +
+        "    print(true)\n" +
+        "    print(false)\n" +
+        "}\n"
+
+    b := compile_to_wasm(src, true, true)
+    assert(b.ok)
+    info := inspect_wasm(&b.wasm)
+    assert(info.valid_header && info.sections_ordered)
+    assert(info.global_count == 2 && info.all_globals_i32)
+
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "if (!WebAssembly.validate(bytes)) throw new Error('invalid wasi wasm');\n" +
+        "(async () => {\n" +
+        "  let mem = null;\n" +
+        "  const chunks = [];\n" +
+        "  const imports = {\n" +
+        "    wasi_snapshot_preview1: {\n" +
+        "      fd_write(fd, iovs, iovsLen, nwritten) {\n" +
+        "        const dv = new DataView(mem.buffer);\n" +
+        "        const u8 = new Uint8Array(mem.buffer);\n" +
+        "        let total = 0;\n" +
+        "        for (let i = 0; i < iovsLen; i++) {\n" +
+        "          const ptr = dv.getUint32(iovs + i * 8, true);\n" +
+        "          const len = dv.getUint32(iovs + i * 8 + 4, true);\n" +
+        "          if (fd === 1) chunks.push(Buffer.from(u8.subarray(ptr, ptr + len)));\n" +
+        "          total += len;\n" +
+        "        }\n" +
+        "        dv.setUint32(nwritten, total, true);\n" +
+        "        return 0;\n" +
+        "      },\n" +
+        "      proc_exit(code) { process.exit(code); }\n" +
+        "    }\n" +
+        "  };\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes, imports);\n" +
+        "  mem = instance.exports.memory;\n" +
+        "  instance.exports._start();\n" +
+        "  process.stdout.write(Buffer.concat(chunks).toString('utf8'));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    assert(res.stdout_text() == "hello wasm\nwasm\n55\n-42\ntrue\nfalse\n")
+}
+
+// =========================================================================
+// 9. Multi-Arm Switch, Break/Continue, Bitwise, Floats, Result & Pop/Replace
+// =========================================================================
+
+@test
+fn wasm_isel_switch_break_continue_bitwise_and_pop() {
+    src := "fn switch_score(k: i32) -> i32 {\n" +
+        "    match k {\n" +
+        "        1 => 10,\n" +
+        "        2 => 25,\n" +
+        "        3 => 40,\n" +
+        "        _ => 99,\n" +
+        "    }\n" +
+        "}\n" +
+        "fn loop_break_continue(n: i32) -> i32 {\n" +
+        "    mut sum := 0\n" +
+        "    mut i := 0\n" +
+        "    while i < n {\n" +
+        "        i += 1\n" +
+        "        if i == 3 { continue }\n" +
+        "        if i == 7 { break }\n" +
+        "        sum += i\n" +
+        "    }\n" +
+        "    sum\n" +
+        "}\n" +
+        "fn bitwise_and_pop() -> i32 {\n" +
+        "    a := 12.bit_or(3).bit_and(7).bit_xor(2)\n" +
+        "    b := 1.shl(4).shr(2)\n" +
+        "    mut xs: []i32 = [5, 8]\n" +
+        "    xs.push(13)\n" +
+        "    top := xs.pop()\n" +
+        "    mut slot := 100\n" +
+        "    old := replace(&mut slot, 200)\n" +
+        "    a + b + top + old + slot + xs.len\n" +
+        "}\n" +
+        "fn main() -> i32 { switch_score(2) }\n"
+
+    b := compile_to_wasm(src, false, true)
+    assert(b.ok)
+    info := inspect_wasm(&b.wasm)
+    assert(info.valid_header && info.sections_ordered && info.global_count == 2 && info.all_globals_i32)
+
+    js := "const fs = require('fs');\n" +
+        "const bytes = fs.readFileSync(process.argv[1]);\n" +
+        "if (!WebAssembly.validate(bytes)) throw new Error('invalid wasm');\n" +
+        "(async () => {\n" +
+        "  const { instance } = await WebAssembly.instantiate(bytes);\n" +
+        "  const e = instance.exports;\n" +
+        "  const out = [\n" +
+        "    e.switch_score(1),\n" +
+        "    e.switch_score(2),\n" +
+        "    e.switch_score(3),\n" +
+        "    e.switch_score(42),\n" +
+        "    e.loop_break_continue(20),\n" +
+        "    e.bitwise_and_pop()\n" +
+        "  ];\n" +
+        "  process.stdout.write(out.join(','));\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    res := run_node_wasm(&b.wasm, js)
+    assert(res.succeeded())
+    // loop_break_continue(20): 1+2+4+5+6 = 18
+    // bitwise_and_pop: a=((12|3)&7)^2=(15&7)^2=7^2=5, b=(1<<4)>>2=4, top=13, old=100, slot=200, xs.len=2 => 324
+    assert(res.stdout_text() == "10,25,40,99,18,324")
+}
+

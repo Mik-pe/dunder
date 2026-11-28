@@ -1,0 +1,3105 @@
+// Phase 4C: Native WebAssembly Typed-Local LIR/ISel (`selfhost/backend/wasm_isel.ddr`).
+// Compiles Target-Independent Typed SSA MIR (`selfhost/ssa/ssa_ir.ddr`) directly to valid
+// WebAssembly 32-bit binaries (`wasm32` & `wasm32-wasi`) using:
+// - Native typed WASM locals (`i32`, `i64`, `f32`, `f64`, and 2 `i32` locals `(ptr, len)`
+//   for 2-word `FatStr` / `FatSlice` / `RegionSlice` fat views)
+// - Per-signature deduplicated `call_indirect` types registered via `object_module.add_wasm_sig`
+//   and dispatched through `__indirect_function_table`
+// - Structured CFG lowering (fast-path straight-line / `if`-`else` / `while`-`loop` + general
+//   `$pc` block-dispatch loop for arbitrary reducible/irreducible CFGs)
+// - ONLY 2 linear-memory globals (`$sp` = global 0, `$hp` = global 1) — ZERO ARM64 global-bank emulation!
+// - ONLY `wasm_bytes.ddr` LEB128/section/op primitives (NEVER `read`/`write`/`base`/`set_base`).
+
+import std.bytes as bytes
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ..ssa.ssa_ir as ssa
+import wasm_bytes as b
+import object_module as om
+
+// =========================================================================
+// Constants & WebAssembly Opcodes
+// =========================================================================
+
+const GL_SP: i32 = 0 // Linear-memory downward-growing stack pointer (mut i32)
+const GL_HP: i32 = 1 // Linear-memory upward-growing bump heap pointer (mut i32)
+
+const WASI_SCRATCH: i32 = 64  // 64..255: iovecs (16B), nwritten (4B), digit/str scratch
+const DATA_BASE: i32    = 256 // Start of static read-only data segment
+const STACK_BYTES: i32  = 1048576 // 1 MiB shadow stack for StackSlots & aggregate temps
+
+// WASM value type encodings
+const VT_I32: i32 = 127 // 0x7f
+const VT_I64: i32 = 126 // 0x7e
+const VT_F32: i32 = 125 // 0x7d
+const VT_F64: i32 = 124 // 0x7c
+
+// WASM control opcodes
+const OP_UNREACHABLE: i32   = 0   // 0x00
+const OP_NOP: i32           = 1   // 0x01
+const OP_BLOCK: i32         = 2   // 0x02
+const OP_LOOP: i32          = 3   // 0x03
+const OP_IF: i32            = 4   // 0x04
+const OP_ELSE: i32          = 5   // 0x05
+const OP_END: i32           = 11  // 0x0b
+const OP_BR: i32            = 12  // 0x0c
+const OP_BR_IF: i32         = 13  // 0x0d
+const OP_BR_TABLE: i32      = 14  // 0x0e
+const OP_RETURN: i32        = 15  // 0x0f
+const OP_CALL: i32          = 16  // 0x10
+const OP_CALL_INDIRECT: i32 = 17  // 0x11
+const OP_DROP: i32          = 26  // 0x1a
+const OP_SELECT: i32        = 27  // 0x1b
+const OP_LOCAL_GET: i32     = 32  // 0x20
+const OP_LOCAL_SET: i32     = 33  // 0x21
+const OP_LOCAL_TEE: i32     = 34  // 0x22
+const OP_GLOBAL_GET: i32    = 35  // 0x23
+const OP_GLOBAL_SET: i32    = 36  // 0x24
+const BT_VOID: i32          = 64  // 0x40
+
+// WASM memory opcodes
+const OP_I32_LOAD: i32     = 40  // 0x28
+const OP_I64_LOAD: i32     = 41  // 0x29
+const OP_F32_LOAD: i32     = 42  // 0x2a
+const OP_F64_LOAD: i32     = 43  // 0x2b
+const OP_I32_LOAD8_S: i32  = 44  // 0x2c
+const OP_I32_LOAD8_U: i32  = 45  // 0x2d
+const OP_I32_LOAD16_S: i32 = 46  // 0x2e
+const OP_I32_LOAD16_U: i32 = 47  // 0x2f
+const OP_I32_STORE: i32    = 54  // 0x36
+const OP_I64_STORE: i32    = 55  // 0x37
+const OP_F32_STORE: i32    = 56  // 0x38
+const OP_F64_STORE: i32    = 57  // 0x39
+const OP_I32_STORE8: i32   = 58  // 0x3a
+const OP_I32_STORE16: i32  = 59  // 0x3b
+const OP_MEM_SIZE: i32     = 63  // 0x3f
+const OP_MEM_GROW: i32     = 64  // 0x40
+
+// WASM numeric comparison opcodes
+const OP_I32_EQZ: i32  = 69
+const OP_I32_EQ: i32   = 70
+const OP_I32_NE: i32   = 71
+const OP_I32_LT_S: i32 = 72
+const OP_I32_LT_U: i32 = 73
+const OP_I32_GT_S: i32 = 74
+const OP_I32_GT_U: i32 = 75
+const OP_I32_LE_S: i32 = 76
+const OP_I32_LE_U: i32 = 77
+const OP_I32_GE_S: i32 = 78
+const OP_I32_GE_U: i32 = 79
+
+const OP_I64_EQZ: i32  = 80
+const OP_I64_EQ: i32   = 81
+const OP_I64_NE: i32   = 82
+const OP_I64_LT_S: i32 = 83
+const OP_I64_LT_U: i32 = 84
+const OP_I64_GT_S: i32 = 85
+const OP_I64_GT_U: i32 = 86
+const OP_I64_LE_S: i32 = 87
+const OP_I64_LE_U: i32 = 88
+const OP_I64_GE_S: i32 = 89
+const OP_I64_GE_U: i32 = 90
+
+const OP_F32_EQ: i32 = 91
+const OP_F32_NE: i32 = 92
+const OP_F32_LT: i32 = 93
+const OP_F32_GT: i32 = 94
+const OP_F32_LE: i32 = 95
+const OP_F32_GE: i32 = 96
+
+const OP_F64_EQ: i32 = 97
+const OP_F64_NE: i32 = 98
+const OP_F64_LT: i32 = 99
+const OP_F64_GT: i32 = 100
+const OP_F64_LE: i32 = 101
+const OP_F64_GE: i32 = 102
+
+// WASM integer arithmetic & bit opcodes
+const OP_I32_CLZ: i32    = 103
+const OP_I32_CTZ: i32    = 104
+const OP_I32_POPCNT: i32 = 105
+const OP_I32_ADD: i32    = 106
+const OP_I32_SUB: i32    = 107
+const OP_I32_MUL: i32    = 108
+const OP_I32_DIV_S: i32  = 109
+const OP_I32_DIV_U: i32  = 110
+const OP_I32_REM_S: i32  = 111
+const OP_I32_REM_U: i32  = 112
+const OP_I32_AND: i32    = 113
+const OP_I32_OR: i32     = 114
+const OP_I32_XOR: i32    = 115
+const OP_I32_SHL: i32    = 116
+const OP_I32_SHR_S: i32  = 117
+const OP_I32_SHR_U: i32  = 118
+const OP_I32_ROTL: i32   = 119
+const OP_I32_ROTR: i32   = 120
+
+const OP_I64_CLZ: i32    = 121
+const OP_I64_CTZ: i32    = 122
+const OP_I64_POPCNT: i32 = 123
+const OP_I64_ADD: i32    = 124
+const OP_I64_SUB: i32    = 125
+const OP_I64_MUL: i32    = 126
+const OP_I64_DIV_S: i32  = 127
+const OP_I64_DIV_U: i32  = 128
+const OP_I64_REM_S: i32  = 129
+const OP_I64_REM_U: i32  = 130
+const OP_I64_AND: i32    = 131
+const OP_I64_OR: i32     = 132
+const OP_I64_XOR: i32    = 133
+const OP_I64_SHL: i32    = 134
+const OP_I64_SHR_S: i32  = 135
+const OP_I64_SHR_U: i32  = 136
+const OP_I64_ROTL: i32   = 137
+const OP_I64_ROTR: i32   = 138
+
+// WASM float arithmetic opcodes
+const OP_F32_ABS: i32     = 139
+const OP_F32_NEG: i32     = 140
+const OP_F32_CEIL: i32    = 141
+const OP_F32_FLOOR: i32   = 142
+const OP_F32_TRUNC: i32   = 143
+const OP_F32_NEAREST: i32 = 144
+const OP_F32_SQRT: i32    = 145
+const OP_F32_ADD: i32     = 146
+const OP_F32_SUB: i32     = 147
+const OP_F32_MUL: i32     = 148
+const OP_F32_DIV: i32     = 149
+
+const OP_F64_ABS: i32     = 153
+const OP_F64_NEG: i32     = 154
+const OP_F64_CEIL: i32    = 155
+const OP_F64_FLOOR: i32   = 156
+const OP_F64_TRUNC: i32   = 157
+const OP_F64_NEAREST: i32 = 158
+const OP_F64_SQRT: i32    = 159
+const OP_F64_ADD: i32     = 160
+const OP_F64_SUB: i32     = 161
+const OP_F64_MUL: i32     = 162
+const OP_F64_DIV: i32     = 163
+
+// WASM conversion & sign-extension opcodes
+const OP_I32_WRAP_I64: i32        = 167
+const OP_I32_TRUNC_F32_S: i32     = 168
+const OP_I32_TRUNC_F32_U: i32     = 169
+const OP_I32_TRUNC_F64_S: i32     = 170
+const OP_I32_TRUNC_F64_U: i32     = 171
+const OP_I64_EXTEND_I32_S: i32    = 172
+const OP_I64_EXTEND_I32_U: i32    = 173
+const OP_I64_TRUNC_F32_S: i32     = 174
+const OP_I64_TRUNC_F32_U: i32     = 175
+const OP_I64_TRUNC_F64_S: i32     = 176
+const OP_I64_TRUNC_F64_U: i32     = 177
+const OP_F32_CONVERT_I32_S: i32   = 178
+const OP_F32_CONVERT_I32_U: i32   = 179
+const OP_F32_CONVERT_I64_S: i32   = 180
+const OP_F32_CONVERT_I64_U: i32   = 181
+const OP_F32_DEMOTE_F64: i32      = 182
+const OP_F64_CONVERT_I32_S: i32   = 183
+const OP_F64_CONVERT_I32_U: i32   = 184
+const OP_F64_CONVERT_I64_S: i32   = 185
+const OP_F64_CONVERT_I64_U: i32   = 186
+const OP_F64_PROMOTE_F32: i32     = 187
+const OP_I32_REINTERPRET_F32: i32 = 188
+const OP_I64_REINTERPRET_F64: i32 = 189
+const OP_F32_REINTERPRET_I32: i32 = 190
+const OP_F64_REINTERPRET_I64: i32 = 191
+const OP_I32_EXTEND8_S: i32       = 192
+const OP_I32_EXTEND16_S: i32      = 193
+
+// =========================================================================
+// Value Representation Classification
+// =========================================================================
+
+enum ValRep {
+    RepVoid, // Unit, Error: 0 locals
+    RepI32,  // Bool, i8/i16/i32/isize, u8/u16/u32/usize, rune, ptr/ref, string/array/closure handle, fieldless enum
+    RepI64,  // i64, u64
+    RepF32,  // f32
+    RepF64,  // f64
+    RepFat,  // FatStr, FatSlice, RegionSlice: 2 native i32 locals (ptr, len)
+    RepAgg,  // Struct, Tuple, Union, FixedArr, Range, payload Enum: i32 address of inline memory copy
+}
+
+fn val_rep(types: &ht.TypeTable, ty: i32) -> ValRep {
+    if ty < 0 || ty >= types.entries.len { return .RepVoid }
+    te := &types.entries[ty]
+    k := te.kind
+    if k == .Unit || k == .Error { return .RepVoid }
+    if k == .I64 || k == .U64 { return .RepI64 }
+    if k == .F32 { return .RepF32 }
+    if k == .F64 { return .RepF64 }
+    if k == .FatStr || k == .FatSlice || k == .RegionSlice { return .RepFat }
+    if k == .Bool || k == .I8 || k == .I16 || k == .I32 || k == .Isize ||
+        k == .U8 || k == .U16 || k == .U32 || k == .Usize || k == .Rune ||
+        k == .Ptr || k == .Ref || k == .MutRef || k == .RawConst || k == .RawMut ||
+        k == .String || k == .Array || k == .CStr || k == .WStr ||
+        k == .FnPtr || k == .ExternFn || k == .ClosureEnv || k == .Task {
+        return .RepI32
+    }
+    if k == .Enum && te.size <= 4 { return .RepI32 }
+    if k == .Struct && ht.find_map_inst(&types, ty) >= 0 { return .RepI32 }
+    .RepAgg
+}
+
+fn is_unsigned_kind(k: ht.TypeKind) -> bool {
+    k == .Bool || k == .U8 || k == .U16 || k == .U32 || k == .U64 || k == .Usize || k == .Rune ||
+    k == .Ptr || k == .Ref || k == .MutRef || k == .RawConst || k == .RawMut
+}
+
+fn type_size(types: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= types.entries.len { return 0 }
+    types.entries[ty].size
+}
+
+fn type_align(types: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= types.entries.len { return 1 }
+    al := types.entries[ty].align
+    if al > 0 { al } else { 1 }
+}
+
+fn align_up_i32(v: i32, al: i32) -> i32 {
+    if al <= 1 { return v }
+    rem := v % al
+    if rem == 0 { v } else { v + (al - rem) }
+}
+
+fn fat_len_offset(types: &ht.TypeTable) -> i32 {
+    ht.word_size(types.platform)
+}
+
+fn wasm_vt_byte(vt: om.WasmValType) -> i32 {
+    if vt == .I32 { return VT_I32 }
+    if vt == .I64 { return VT_I64 }
+    if vt == .F32 { return VT_F32 }
+    VT_F64
+}
+
+fn push_param_wasm_types(types: &ht.TypeTable, ty: i32, out: &mut []om.WasmValType) {
+    rep := val_rep(&types, ty)
+    if rep == .RepVoid { return }
+    if rep == .RepI32 || rep == .RepAgg { out.push(.I32); return }
+    if rep == .RepI64 { out.push(.I64); return }
+    if rep == .RepF32 { out.push(.F32); return }
+    if rep == .RepF64 { out.push(.F64); return }
+    // RepFat: 2 native i32 parameters (ptr, len)
+    out.push(.I32)
+    out.push(.I32)
+}
+
+fn push_ret_wasm_types(types: &ht.TypeTable, ret_ty: i32, out: &mut []om.WasmValType) {
+    rep := val_rep(&types, ret_ty)
+    if rep == .RepVoid || rep == .RepAgg { return } // RepAgg uses hidden sret i32 param
+    if rep == .RepI32 { out.push(.I32); return }
+    if rep == .RepI64 { out.push(.I64); return }
+    if rep == .RepF32 { out.push(.F32); return }
+    if rep == .RepF64 { out.push(.F64); return }
+    // RepFat: native WASM multi-value return (i32, i32)
+    out.push(.I32)
+    out.push(.I32)
+}
+
+// =========================================================================
+// Module Compilation Context
+// =========================================================================
+
+struct ImportEntry {
+    module_name: string,
+    field_name: string,
+    sig_idx: i32,
+}
+
+struct ExportEntry {
+    name: string,
+    kind: i32, // 0=func, 1=table, 2=mem, 3=global
+    idx: i32,
+}
+
+struct StrCacheEntry {
+    kind: i32, // 0=ConstStr, 1=ConstCStr, 2=ConstWStr
+    text: string,
+    addr: i32,
+}
+
+struct WasmCtx {
+    is_wasi: bool,
+    obj: om.ObjectModule,
+    imports: []ImportEntry,
+    defined_sigs: []i32,
+    table_funcs: []i32,
+    rodata: []u8,
+    str_cache: []StrCacheEntry,
+
+    // WASI imported function indices (-1 when !is_wasi)
+    fn_wasi_fd_write: i32,
+    fn_wasi_proc_exit: i32,
+
+    // Internal native-local runtime helper function indices
+    fn_rt_alloc: i32,
+    fn_rt_mem_eq: i32,
+    fn_rt_str_concat: i32,
+    fn_rt_trap: i32,
+    fn_rt_wasi_write: i32,
+    fn_rt_wasi_print_i64: i32,
+    fn_rt_wasi_print_bool: i32,
+
+    // Mapping from SsaFunc.fn_id -> WASM function index & WasmSig index
+    fn_id_to_wasm: []i32,
+    fn_id_to_sig: []i32,
+    start_wasm_fn: i32,
+}
+
+fn new_ctx(is_wasi: bool) -> WasmCtx {
+    target: om.TargetKind = if is_wasi { .Wasm32Wasi } else { .Wasm32 }
+    WasmCtx {
+        is_wasi: is_wasi,
+        obj: om.new(target),
+        imports: [],
+        defined_sigs: [],
+        table_funcs: [],
+        rodata: [],
+        str_cache: [],
+        fn_wasi_fd_write: -1,
+        fn_wasi_proc_exit: -1,
+        fn_rt_alloc: -1,
+        fn_rt_mem_eq: -1,
+        fn_rt_str_concat: -1,
+        fn_rt_trap: -1,
+        fn_rt_wasi_write: -1,
+        fn_rt_wasi_print_i64: -1,
+        fn_rt_wasi_print_bool: -1,
+        fn_id_to_wasm: [],
+        fn_id_to_sig: [],
+        start_wasm_fn: -1,
+    }
+}
+
+fn intern_sig(ctx: &mut WasmCtx, params: &[]om.WasmValType, rets: &[]om.WasmValType) -> i32 {
+    om.add_wasm_sig(&mut ctx.obj, &params, &rets)
+}
+
+fn add_table_entry(ctx: &mut WasmCtx, wasm_fn_idx: i32) -> i32 {
+    for i in 0..ctx.table_funcs.len {
+        if ctx.table_funcs[i] == wasm_fn_idx { return i + 1 }
+    }
+    ctx.table_funcs.push(wasm_fn_idx)
+    ctx.table_funcs.len // 1-based table slot (0 reserved as null)
+}
+
+fn ensure_fn_maps(ctx: &mut WasmCtx, fn_id: i32) {
+    while ctx.fn_id_to_wasm.len <= fn_id {
+        ctx.fn_id_to_wasm.push(-1)
+        ctx.fn_id_to_sig.push(-1)
+    }
+}
+
+fn intern_sig_for_ssa_func(ctx: &mut WasmCtx, types: &ht.TypeTable, f: &ssa.SsaFunc) -> i32 {
+    mut params: []om.WasmValType = []
+    mut rets: []om.WasmValType = []
+    if f.is_closure_body { params.push(.I32) } // hidden env_ptr
+    if val_rep(&types, f.ret_ty) == .RepAgg { params.push(.I32) } // hidden sret
+    for i in 0..f.param_vals.len {
+        pty := f.vals[f.param_vals[i]].ty
+        push_param_wasm_types(&types, pty, &mut params)
+    }
+    push_ret_wasm_types(&types, f.ret_ty, &mut rets)
+    intern_sig(&mut ctx, &params, &rets)
+}
+
+fn intern_sig_for_callable_ty(ctx: &mut WasmCtx, types: &ht.TypeTable, sig_ty: i32, has_env: bool) -> i32 {
+    mut params: []om.WasmValType = []
+    mut rets: []om.WasmValType = []
+    if has_env { params.push(.I32) }
+    ret_ty := ht.callable_ret(&types, sig_ty)
+    if val_rep(&types, ret_ty) == .RepAgg { params.push(.I32) }
+    p_start := ht.callable_param_start(&types, sig_ty)
+    p_cnt := ht.callable_param_count(&types, sig_ty)
+    for i in 0..p_cnt {
+        push_param_wasm_types(&types, types.params[p_start + i].ty, &mut params)
+    }
+    push_ret_wasm_types(&types, ret_ty, &mut rets)
+    intern_sig(&mut ctx, &params, &rets)
+}
+
+fn align_rodata(ctx: &mut WasmCtx, al: i32) {
+    if al <= 1 { return }
+    rem := ctx.rodata.len % al
+    if rem != 0 {
+        for _ in 0..(al - rem) { ctx.rodata.push(u8(0)) }
+    }
+}
+
+fn push_rodata_le32(ctx: &mut WasmCtx, v: i32) {
+    for i in 0..4 { ctx.rodata.push(u8(i64(v).shr(i * 8).bit_and(255))) }
+}
+
+// Interns a static Dunder `string` into rodata with layout:
+//   [ptr - 8] = len (i32)
+//   [ptr - 4] = cap (i32)
+//   [ptr + 0..] = UTF-8 bytes + trailing NUL
+// Returns `ptr` (pointing directly to byte 0 so `Cast(String -> Ptr)` is a zero-cost no-op!).
+fn intern_const_str(ctx: &mut WasmCtx, text: string) -> i32 {
+    for i in 0..ctx.str_cache.len {
+        if ctx.str_cache[i].kind == 0 && ctx.str_cache[i].text == text {
+            return ctx.str_cache[i].addr
+        }
+    }
+    align_rodata(&mut ctx, 8)
+    push_rodata_le32(&mut ctx, text.len) // [ptr - 8] = len
+    push_rodata_le32(&mut ctx, text.len) // [ptr - 4] = cap
+    data_addr := DATA_BASE + ctx.rodata.len
+    bytes.append_utf8(&mut ctx.rodata, text)
+    ctx.rodata.push(u8(0))
+    ctx.str_cache.push(StrCacheEntry { kind: 0, text: text.clone(), addr: data_addr })
+    data_addr
+}
+
+fn intern_const_cstr(ctx: &mut WasmCtx, text: string) -> i32 {
+    for i in 0..ctx.str_cache.len {
+        if ctx.str_cache[i].kind == 1 && ctx.str_cache[i].text == text {
+            return ctx.str_cache[i].addr
+        }
+    }
+    align_rodata(&mut ctx, 4)
+    addr := DATA_BASE + ctx.rodata.len
+    bytes.append_utf8(&mut ctx.rodata, text)
+    ctx.rodata.push(u8(0))
+    ctx.str_cache.push(StrCacheEntry { kind: 1, text: text.clone(), addr: addr })
+    addr
+}
+
+fn intern_const_wstr(ctx: &mut WasmCtx, text: string) -> i32 {
+    for i in 0..ctx.str_cache.len {
+        if ctx.str_cache[i].kind == 2 && ctx.str_cache[i].text == text {
+            return ctx.str_cache[i].addr
+        }
+    }
+    align_rodata(&mut ctx, 4)
+    addr := DATA_BASE + ctx.rodata.len
+    mut utf8: []u8 = []
+    bytes.append_utf8(&mut utf8, text)
+    for i in 0..utf8.len {
+        ctx.rodata.push(utf8[i])
+        ctx.rodata.push(u8(0))
+    }
+    ctx.rodata.push(u8(0))
+    ctx.rodata.push(u8(0))
+    ctx.str_cache.push(StrCacheEntry { kind: 2, text: text.clone(), addr: addr })
+    addr
+}
+
+fn intern_embed_blob(ctx: &mut WasmCtx, hir: &hb.HirProgram, blob_id: i32) -> i32 {
+    align_rodata(&mut ctx, 8)
+    if blob_id < 0 || blob_id >= hir.embed_starts.len { return DATA_BASE }
+    start := hir.embed_starts[blob_id]
+    cnt := hir.embed_counts[blob_id]
+    push_rodata_le32(&mut ctx, cnt)
+    push_rodata_le32(&mut ctx, cnt)
+    addr := DATA_BASE + ctx.rodata.len
+    for i in 0..cnt {
+        if start + i < hir.embed_blobs.len {
+            ctx.rodata.push(hir.embed_blobs[start + i])
+        }
+    }
+    addr
+}
+
+// =========================================================================
+// Low-Level Bytecode Emitters (Strictly using wasm_bytes LEB/op primitives)
+// =========================================================================
+
+fn emit_local_get(out: &mut []u8, idx: i32) { b.indexed(&mut out, OP_LOCAL_GET, idx) }
+fn emit_local_set(out: &mut []u8, idx: i32) { b.indexed(&mut out, OP_LOCAL_SET, idx) }
+fn emit_local_tee(out: &mut []u8, idx: i32) { b.indexed(&mut out, OP_LOCAL_TEE, idx) }
+
+fn emit_sp_get(out: &mut []u8) { b.indexed(&mut out, OP_GLOBAL_GET, GL_SP) }
+fn emit_sp_set(out: &mut []u8) { b.indexed(&mut out, OP_GLOBAL_SET, GL_SP) }
+fn emit_hp_get(out: &mut []u8) { b.indexed(&mut out, OP_GLOBAL_GET, GL_HP) }
+fn emit_hp_set(out: &mut []u8) { b.indexed(&mut out, OP_GLOBAL_SET, GL_HP) }
+
+fn emit_call(out: &mut []u8, fn_idx: i32) { b.indexed(&mut out, OP_CALL, fn_idx) }
+
+fn emit_call_indirect(out: &mut []u8, sig_idx: i32) {
+    b.indexed(&mut out, OP_CALL_INDIRECT, sig_idx)
+    b.op(&mut out, 0) // table 0
+}
+
+fn emit_mem_op(out: &mut []u8, opcode: i32, align_log2: i32, offset: i32) {
+    b.op(&mut out, opcode)
+    b.uleb(&mut out, align_log2)
+    b.uleb(&mut out, offset)
+}
+
+fn emit_mem_copy(out: &mut []u8) {
+    // Stack: [dst: i32, src: i32, len: i32] -> []
+    b.op(&mut out, 252); b.uleb(&mut out, 10); b.op(&mut out, 0); b.op(&mut out, 0)
+}
+
+fn emit_mem_fill(out: &mut []u8) {
+    // Stack: [dst: i32, byte_val: i32, len: i32] -> []
+    b.op(&mut out, 252); b.uleb(&mut out, 11); b.op(&mut out, 0)
+}
+
+fn emit_i32_const_from_i64(out: &mut []u8, v: i64) {
+    low := v.bit_and(4294967295)
+    s32 := if low >= 2147483648 { i32(low - 4294967296) } else { i32(low) }
+    b.i32_const(&mut out, s32)
+}
+
+fn emit_f32_const_bits(out: &mut []u8, bits: i64) {
+    b.op(&mut out, 67) // f32.const
+    for i in 0..4 { b.op(&mut out, i32(bits.shr(i * 8).bit_and(255))) }
+}
+
+fn emit_f64_const_bits(out: &mut []u8, bits: i64) {
+    b.op(&mut out, 68) // f64.const
+    for i in 0..8 { b.op(&mut out, i32(bits.shr(i * 8).bit_and(255))) }
+}
+
+fn emit_local_decls(out: &mut []u8, n_i32: i32, n_i64: i32, n_f32: i32, n_f64: i32) {
+    mut groups := 0
+    if n_i32 > 0 { groups += 1 }
+    if n_i64 > 0 { groups += 1 }
+    if n_f32 > 0 { groups += 1 }
+    if n_f64 > 0 { groups += 1 }
+    b.uleb(&mut out, groups)
+    if n_i32 > 0 { b.uleb(&mut out, n_i32); b.op(&mut out, VT_I32) }
+    if n_i64 > 0 { b.uleb(&mut out, n_i64); b.op(&mut out, VT_I64) }
+    if n_f32 > 0 { b.uleb(&mut out, n_f32); b.op(&mut out, VT_F32) }
+    if n_f64 > 0 { b.uleb(&mut out, n_f64); b.op(&mut out, VT_F64) }
+}
+
+fn emit_scalar_load(out: &mut []u8, types: &ht.TypeTable, ty: i32, offset: i32) {
+    // Assumes base address (i32) is on stack; leaves loaded scalar on stack.
+    k := types.entries[ty].kind
+    if k == .I8 { emit_mem_op(&mut out, OP_I32_LOAD8_S, 0, offset) }
+    else if k == .U8 || k == .Bool { emit_mem_op(&mut out, OP_I32_LOAD8_U, 0, offset) }
+    else if k == .I16 { emit_mem_op(&mut out, OP_I32_LOAD16_S, 1, offset) }
+    else if k == .U16 { emit_mem_op(&mut out, OP_I32_LOAD16_U, 1, offset) }
+    else if k == .I64 || k == .U64 { emit_mem_op(&mut out, OP_I64_LOAD, 3, offset) }
+    else if k == .F32 { emit_mem_op(&mut out, OP_F32_LOAD, 2, offset) }
+    else if k == .F64 { emit_mem_op(&mut out, OP_F64_LOAD, 3, offset) }
+    else { emit_mem_op(&mut out, OP_I32_LOAD, 2, offset) }
+}
+
+fn emit_scalar_store(out: &mut []u8, types: &ht.TypeTable, ty: i32, offset: i32) {
+    // Assumes [addr: i32, val] on stack; stores val at addr + offset.
+    k := types.entries[ty].kind
+    if k == .I8 || k == .U8 || k == .Bool { emit_mem_op(&mut out, OP_I32_STORE8, 0, offset) }
+    else if k == .I16 || k == .U16 { emit_mem_op(&mut out, OP_I32_STORE16, 1, offset) }
+    else if k == .I64 || k == .U64 { emit_mem_op(&mut out, OP_I64_STORE, 3, offset) }
+    else if k == .F32 { emit_mem_op(&mut out, OP_F32_STORE, 2, offset) }
+    else if k == .F64 { emit_mem_op(&mut out, OP_F64_STORE, 3, offset) }
+    else { emit_mem_op(&mut out, OP_I32_STORE, 2, offset) }
+}
+
+fn emit_narrow_normalize(out: &mut []u8, k: ht.TypeKind) {
+    if k == .I8 { b.op(&mut out, OP_I32_EXTEND8_S) }
+    else if k == .I16 { b.op(&mut out, OP_I32_EXTEND16_S) }
+    else if k == .U8 { b.i32_const(&mut out, 255); b.op(&mut out, OP_I32_AND) }
+    else if k == .U16 { b.i32_const(&mut out, 65535); b.op(&mut out, OP_I32_AND) }
+    else if k == .Bool { b.i32_const(&mut out, 0); b.op(&mut out, OP_I32_NE) }
+}
+
+// =========================================================================
+// Native Typed-Local Runtime Helper Emitters
+// =========================================================================
+
+// __rt_alloc(size: i32) -> i32
+// Bump-allocates 8-byte aligned memory from global $hp, calling memory.grow when needed.
+fn emit_rt_alloc_body(out: &mut []u8) {
+    // param 0 = size: i32
+    // local 1 = ptr: i32, local 2 = new_end: i32, local 3 = need_pages: i32
+    emit_local_decls(&mut out, 3, 0, 0, 0)
+    // aligned_size = (size + 7) & ~7 (min 8 bytes so zero-size allocs have distinct non-null addr)
+    emit_local_get(&mut out, 0)
+    b.i32_const(&mut out, 7)
+    b.op(&mut out, OP_I32_ADD)
+    b.i32_const(&mut out, -8)
+    b.op(&mut out, OP_I32_AND)
+    emit_local_tee(&mut out, 0)
+    b.i32_const(&mut out, 0)
+    b.op(&mut out, OP_I32_LE_S)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    b.i32_const(&mut out, 8)
+    emit_local_set(&mut out, 0)
+    b.op(&mut out, OP_END)
+
+    // ptr = $hp; new_end = ptr + size
+    emit_hp_get(&mut out)
+    emit_local_tee(&mut out, 1)
+    emit_local_get(&mut out, 0)
+    b.op(&mut out, OP_I32_ADD)
+    emit_local_tee(&mut out, 2)
+
+    // if (new_end >u memory.size * 65536) grow!
+    b.op(&mut out, OP_MEM_SIZE); b.op(&mut out, 0)
+    b.i32_const(&mut out, 16); b.op(&mut out, OP_I32_SHL)
+    b.op(&mut out, OP_I32_GT_U)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    emit_local_get(&mut out, 2)
+    b.i32_const(&mut out, 65535); b.op(&mut out, OP_I32_ADD)
+    b.i32_const(&mut out, 16); b.op(&mut out, OP_I32_SHR_U)
+    b.op(&mut out, OP_MEM_SIZE); b.op(&mut out, 0)
+    b.op(&mut out, OP_I32_SUB)
+    emit_local_set(&mut out, 3)
+    emit_local_get(&mut out, 3)
+    b.op(&mut out, OP_MEM_GROW); b.op(&mut out, 0)
+    b.i32_const(&mut out, -1)
+    b.op(&mut out, OP_I32_EQ)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    b.op(&mut out, OP_UNREACHABLE)
+    b.op(&mut out, OP_END)
+    b.op(&mut out, OP_END)
+
+    // $hp = new_end; return ptr
+    emit_local_get(&mut out, 2)
+    emit_hp_set(&mut out)
+    emit_local_get(&mut out, 1)
+    b.op(&mut out, OP_END)
+}
+
+// __rt_mem_eq(a: i32, b: i32, len: i32) -> i32
+fn emit_rt_mem_eq_body(out: &mut []u8) {
+    // params: 0=a, 1=b, 2=len; local 3 = i
+    emit_local_decls(&mut out, 1, 0, 0, 0)
+    b.op(&mut out, OP_BLOCK); b.op(&mut out, BT_VOID)
+    b.op(&mut out, OP_LOOP); b.op(&mut out, BT_VOID)
+    emit_local_get(&mut out, 3)
+    emit_local_get(&mut out, 2)
+    b.op(&mut out, OP_I32_GE_S)
+    b.indexed(&mut out, OP_BR_IF, 1)
+    emit_local_get(&mut out, 0)
+    emit_local_get(&mut out, 3)
+    b.op(&mut out, OP_I32_ADD)
+    emit_mem_op(&mut out, OP_I32_LOAD8_U, 0, 0)
+    emit_local_get(&mut out, 1)
+    emit_local_get(&mut out, 3)
+    b.op(&mut out, OP_I32_ADD)
+    emit_mem_op(&mut out, OP_I32_LOAD8_U, 0, 0)
+    b.op(&mut out, OP_I32_NE)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    b.i32_const(&mut out, 0)
+    b.op(&mut out, OP_RETURN)
+    b.op(&mut out, OP_END)
+    emit_local_get(&mut out, 3)
+    b.i32_const(&mut out, 1)
+    b.op(&mut out, OP_I32_ADD)
+    emit_local_set(&mut out, 3)
+    b.indexed(&mut out, OP_BR, 0)
+    b.op(&mut out, OP_END)
+    b.op(&mut out, OP_END)
+    b.i32_const(&mut out, 1)
+    b.op(&mut out, OP_END)
+}
+
+// __rt_str_concat(ap: i32, al: i32, bp: i32, bl: i32) -> i32 (Dunder string ptr with [-8]=len, [-4]=cap)
+fn emit_rt_str_concat_body(out: &mut []u8, fn_alloc: i32) {
+    // params: 0=ap, 1=al, 2=bp, 3=bl; locals: 4=total, 5=raw, 6=data
+    emit_local_decls(&mut out, 3, 0, 0, 0)
+    emit_local_get(&mut out, 1)
+    emit_local_get(&mut out, 3)
+    b.op(&mut out, OP_I32_ADD)
+    emit_local_tee(&mut out, 4)
+    b.i32_const(&mut out, 17) // 16B header + trailing NUL
+    b.op(&mut out, OP_I32_ADD)
+    emit_call(&mut out, fn_alloc)
+    emit_local_tee(&mut out, 5)
+    b.i32_const(&mut out, 16)
+    b.op(&mut out, OP_I32_ADD)
+    emit_local_set(&mut out, 6)
+    // [raw + 8] = total (data - 8 = len), [raw + 12] = total (data - 4 = cap)
+    emit_local_get(&mut out, 5); emit_local_get(&mut out, 4); emit_mem_op(&mut out, OP_I32_STORE, 2, 8)
+    emit_local_get(&mut out, 5); emit_local_get(&mut out, 4); emit_mem_op(&mut out, OP_I32_STORE, 2, 12)
+    // copy a
+    emit_local_get(&mut out, 6); emit_local_get(&mut out, 0); emit_local_get(&mut out, 1); emit_mem_copy(&mut out)
+    // copy b
+    emit_local_get(&mut out, 6); emit_local_get(&mut out, 1); b.op(&mut out, OP_I32_ADD)
+    emit_local_get(&mut out, 2); emit_local_get(&mut out, 3); emit_mem_copy(&mut out)
+    // NUL terminate
+    emit_local_get(&mut out, 6); emit_local_get(&mut out, 4); b.op(&mut out, OP_I32_ADD)
+    b.i32_const(&mut out, 0); emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    emit_local_get(&mut out, 6)
+    b.op(&mut out, OP_END)
+}
+
+// __rt_trap(code: i32) -> ()
+fn emit_rt_trap_body(out: &mut []u8, is_wasi: bool, fn_proc_exit: i32) {
+    emit_local_decls(&mut out, 0, 0, 0, 0)
+    if is_wasi && fn_proc_exit >= 0 {
+        emit_local_get(&mut out, 0)
+        emit_call(&mut out, fn_proc_exit)
+    }
+    b.op(&mut out, OP_UNREACHABLE)
+    b.op(&mut out, OP_END)
+}
+
+// __rt_wasi_write(fd: i32, ptr: i32, len: i32) -> () (writes bytes + '\n' via WASI fd_write)
+fn emit_rt_wasi_write_body(out: &mut []u8, fn_fd_write: i32) {
+    emit_local_decls(&mut out, 0, 0, 0, 0)
+    // iov[0] = (ptr, len), iov[1] = (&nl, 1)
+    b.i32_const(&mut out, WASI_SCRATCH + 0); emit_local_get(&mut out, 1); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 4); emit_local_get(&mut out, 2); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 8); b.i32_const(&mut out, WASI_SCRATCH + 20); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 12); b.i32_const(&mut out, 1); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 20); b.i32_const(&mut out, 10); emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    emit_local_get(&mut out, 0)
+    b.i32_const(&mut out, WASI_SCRATCH)
+    b.i32_const(&mut out, 2)
+    b.i32_const(&mut out, WASI_SCRATCH + 16)
+    emit_call(&mut out, fn_fd_write)
+    b.op(&mut out, OP_DROP)
+    b.op(&mut out, OP_END)
+}
+
+// __rt_wasi_print_i64(fd: i32, val: i64, is_unsigned: i32) -> ()
+fn emit_rt_wasi_print_i64_body(out: &mut []u8, fn_fd_write: i32) {
+    // params: 0=fd:i32, 1=val:i64, 2=is_unsigned:i32
+    // locals: 3=pos:i32, 4=neg:i32, 5=u:i64
+    emit_local_decls(&mut out, 2, 1, 0, 0)
+    emit_local_get(&mut out, 1)
+    emit_local_set(&mut out, 5)
+    // if !is_unsigned && val < 0: neg = 1; u = 0 - val
+    emit_local_get(&mut out, 2)
+    b.op(&mut out, OP_I32_EQZ)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    emit_local_get(&mut out, 5)
+    b.constant(&mut out, 0)
+    b.op(&mut out, OP_I64_LT_S)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    b.i32_const(&mut out, 1); emit_local_set(&mut out, 4)
+    b.constant(&mut out, 0); emit_local_get(&mut out, 5); b.op(&mut out, OP_I64_SUB); emit_local_set(&mut out, 5)
+    b.op(&mut out, OP_END)
+    b.op(&mut out, OP_END)
+
+    // Scratch buffer: WASI_SCRATCH + 60 holds '\n', digits written backwards
+    b.i32_const(&mut out, WASI_SCRATCH + 60); b.i32_const(&mut out, 10); emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 60); emit_local_set(&mut out, 3)
+
+    b.op(&mut out, OP_LOOP); b.op(&mut out, BT_VOID)
+    emit_local_get(&mut out, 3); b.i32_const(&mut out, 1); b.op(&mut out, OP_I32_SUB); emit_local_tee(&mut out, 3)
+    emit_local_get(&mut out, 5); b.constant(&mut out, 10); b.op(&mut out, OP_I64_REM_U)
+    b.op(&mut out, OP_I32_WRAP_I64); b.i32_const(&mut out, 48); b.op(&mut out, OP_I32_ADD)
+    emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    emit_local_get(&mut out, 5); b.constant(&mut out, 10); b.op(&mut out, OP_I64_DIV_U); emit_local_tee(&mut out, 5)
+    b.constant(&mut out, 0); b.op(&mut out, OP_I64_NE)
+    b.indexed(&mut out, OP_BR_IF, 0)
+    b.op(&mut out, OP_END)
+
+    emit_local_get(&mut out, 4)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    emit_local_get(&mut out, 3); b.i32_const(&mut out, 1); b.op(&mut out, OP_I32_SUB); emit_local_tee(&mut out, 3)
+    b.i32_const(&mut out, 45); emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    b.op(&mut out, OP_END)
+
+    b.i32_const(&mut out, WASI_SCRATCH + 0); emit_local_get(&mut out, 3); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 4); b.i32_const(&mut out, WASI_SCRATCH + 61); emit_local_get(&mut out, 3); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    emit_local_get(&mut out, 0)
+    b.i32_const(&mut out, WASI_SCRATCH)
+    b.i32_const(&mut out, 1)
+    b.i32_const(&mut out, WASI_SCRATCH + 16)
+    emit_call(&mut out, fn_fd_write)
+    b.op(&mut out, OP_DROP)
+    b.op(&mut out, OP_END)
+}
+
+// __rt_wasi_print_bool(fd: i32, val: i32) -> ()
+fn emit_rt_wasi_print_bool_body(out: &mut []u8, fn_fd_write: i32) {
+    // params: 0=fd, 1=val; local 2 = len
+    emit_local_decls(&mut out, 1, 0, 0, 0)
+    emit_local_get(&mut out, 1)
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    t_bytes: [i32; 5] = [116, 114, 117, 101, 10]
+    for i in 0..5 {
+        b.i32_const(&mut out, WASI_SCRATCH + 24 + i); b.i32_const(&mut out, t_bytes[i]); emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    }
+    b.i32_const(&mut out, 5); emit_local_set(&mut out, 2)
+    b.op(&mut out, OP_ELSE)
+    f_bytes: [i32; 6] = [102, 97, 108, 115, 101, 10]
+    for i in 0..6 {
+        b.i32_const(&mut out, WASI_SCRATCH + 24 + i); b.i32_const(&mut out, f_bytes[i]); emit_mem_op(&mut out, OP_I32_STORE8, 0, 0)
+    }
+    b.i32_const(&mut out, 6); emit_local_set(&mut out, 2)
+    b.op(&mut out, OP_END)
+    b.i32_const(&mut out, WASI_SCRATCH + 0); b.i32_const(&mut out, WASI_SCRATCH + 24); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    b.i32_const(&mut out, WASI_SCRATCH + 4); emit_local_get(&mut out, 2); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+    emit_local_get(&mut out, 0)
+    b.i32_const(&mut out, WASI_SCRATCH)
+    b.i32_const(&mut out, 1)
+    b.i32_const(&mut out, WASI_SCRATCH + 16)
+    emit_call(&mut out, fn_fd_write)
+    b.op(&mut out, OP_DROP)
+    b.op(&mut out, OP_END)
+}
+
+// =========================================================================
+// Per-Function Native Local Allocation & Frame Layout
+// =========================================================================
+
+struct FnCtx {
+    env_local: i32,     // >= 0 iff closure body
+    sret_local: i32,    // >= 0 iff RepAgg return
+    fp_local: i32,      // >= 0 iff frame_size > 0
+    pc_local: i32,      // >= 0 iff dispatch loop used
+    tmp_i32_0: i32,
+    tmp_i32_1: i32,
+    tmp_i32_2: i32,
+    tmp_i64_0: i32,
+    tmp_i64_1: i32,
+    tmp_f32_0: i32,
+    tmp_f64_0: i32,
+    n_decl_i32: i32,
+    n_decl_i64: i32,
+    n_decl_f32: i32,
+    n_decl_f64: i32,
+    frame_size: i32,
+    slot_offsets: []i32,     // frame offset per StackSlot (-1 if dead)
+    val_loc_a: []i32,        // primary WASM local per SsaVal (-1 if RepVoid)
+    val_loc_b: []i32,        // secondary WASM local per SsaVal (len for RepFat, -1 otherwise)
+    inst_agg_off: []i32,     // frame offset for RepAgg Load result (-1 otherwise)
+    term_agg_off: []i32,     // frame offset for RepAgg Call result (-1 otherwise)
+    region_hp_locals: []i32, // per-region saved $hp i32 local
+    cap_count: i32,
+    cap_init_skipped: i32,
+}
+
+fn build_fn_ctx(types: &ht.TypeTable, f: &ssa.SsaFunc, needs_dispatch: bool) -> FnCtx {
+    // 1. Assign WASM parameter local indices: [env?], [sret?], [user params...]
+    mut val_loc_a: []i32 = []
+    mut val_loc_b: []i32 = []
+    for _ in 0..f.vals.len {
+        val_loc_a.push(-1)
+        val_loc_b.push(-1)
+    }
+
+    mut next_param := 0
+    mut env_local := -1
+    if f.is_closure_body {
+        env_local = next_param
+        next_param += 1
+    }
+    mut sret_local := -1
+    if val_rep(&types, f.ret_ty) == .RepAgg {
+        sret_local = next_param
+        next_param += 1
+    }
+    for pi in 0..f.param_vals.len {
+        pv := f.param_vals[pi]
+        rep := val_rep(&types, f.vals[pv].ty)
+        if rep == .RepFat {
+            val_loc_a[pv] = next_param
+            val_loc_b[pv] = next_param + 1
+            next_param += 2
+        } else if rep != .RepVoid {
+            val_loc_a[pv] = next_param
+            next_param += 1
+        }
+    }
+
+    // 2. Compute stack frame offsets for live StackSlots & RepAgg temp buffers
+    mut frame_off := 0
+    mut slot_offsets: []i32 = []
+    for s in 0..f.slots.len {
+        sl := &f.slots[s]
+        if sl.dead {
+            slot_offsets.push(-1)
+        } else {
+            al := if sl.align > 0 { sl.align } else { 1 }
+            frame_off = align_up_i32(frame_off, al)
+            slot_offsets.push(frame_off)
+            sz := if sl.size > 0 { sl.size } else { 4 }
+            frame_off += sz
+        }
+    }
+
+    mut inst_agg_off: []i32 = []
+    for i in 0..f.insts.len {
+        ins := f.insts[i]
+        if ins.kind == .Load && val_rep(&types, ins.ty) == .RepAgg {
+            al := type_align(&types, ins.ty)
+            sz := type_size(&types, ins.ty)
+            frame_off = align_up_i32(frame_off, al)
+            inst_agg_off.push(frame_off)
+            frame_off += if sz > 0 { sz } else { 4 }
+        } else {
+            inst_agg_off.push(-1)
+        }
+    }
+
+    mut term_agg_off: []i32 = []
+    mut max_region_id := -1
+    for t in 0..f.terms.len {
+        tm := f.terms[t]
+        if tm.kind == .RegionEnter || tm.kind == .RegionExit {
+            if tm.callee > max_region_id { max_region_id = tm.callee }
+        }
+        if (tm.kind == .Call || tm.kind == .IndirectCall || tm.kind == .ExternCall || tm.kind == .IntrinsicCall) &&
+            tm.dest_val >= 0 && tm.dest_val < f.vals.len && val_rep(&types, f.vals[tm.dest_val].ty) == .RepAgg {
+            dty := f.vals[tm.dest_val].ty
+            al := type_align(&types, dty)
+            sz := type_size(&types, dty)
+            frame_off = align_up_i32(frame_off, al)
+            term_agg_off.push(frame_off)
+            frame_off += if sz > 0 { sz } else { 4 }
+        } else {
+            term_agg_off.push(-1)
+        }
+    }
+    frame_size := align_up_i32(frame_off, 16)
+
+    // 3. Allocate native typed WASM locals grouped by (i32, i64, f32, f64)
+    mut n_i32 := 0
+    mut n_i64 := 0
+    mut n_f32 := 0
+    mut n_f64 := 0
+
+    // Reserve i32 control/scratch locals
+    mut fp_local := -1
+    if frame_size > 0 { fp_local = next_param + n_i32; n_i32 += 1 }
+    mut pc_local := -1
+    if needs_dispatch { pc_local = next_param + n_i32; n_i32 += 1 }
+    tmp_i32_0 := next_param + n_i32; n_i32 += 1
+    tmp_i32_1 := next_param + n_i32; n_i32 += 1
+    tmp_i32_2 := next_param + n_i32; n_i32 += 1
+
+    mut region_hp_locals: []i32 = []
+    for _ in 0..(max_region_id + 1) {
+        region_hp_locals.push(next_param + n_i32)
+        n_i32 += 1
+    }
+
+    // Pass A: assign i32 locals for RepI32, RepAgg, and RepFat (2 locals each!)
+    for vid in 0..f.vals.len {
+        if val_loc_a[vid] >= 0 { continue } // already a WASM param
+        rep := val_rep(&types, f.vals[vid].ty)
+        if rep == .RepI32 || rep == .RepAgg {
+            val_loc_a[vid] = next_param + n_i32
+            n_i32 += 1
+        } else if rep == .RepFat {
+            val_loc_a[vid] = next_param + n_i32
+            val_loc_b[vid] = next_param + n_i32 + 1
+            n_i32 += 2
+        }
+    }
+
+    // Pass B: assign i64 locals
+    i64_base := next_param + n_i32
+    tmp_i64_0 := i64_base + n_i64; n_i64 += 1
+    tmp_i64_1 := i64_base + n_i64; n_i64 += 1
+    for vid in 0..f.vals.len {
+        if val_loc_a[vid] >= 0 { continue }
+        if val_rep(&types, f.vals[vid].ty) == .RepI64 {
+            val_loc_a[vid] = i64_base + n_i64
+            n_i64 += 1
+        }
+    }
+
+    // Pass C: assign f32 locals
+    f32_base := i64_base + n_i64
+    tmp_f32_0 := f32_base + n_f32; n_f32 += 1
+    for vid in 0..f.vals.len {
+        if val_loc_a[vid] >= 0 { continue }
+        if val_rep(&types, f.vals[vid].ty) == .RepF32 {
+            val_loc_a[vid] = f32_base + n_f32
+            n_f32 += 1
+        }
+    }
+
+    // Pass D: assign f64 locals
+    f64_base := f32_base + n_f32
+    tmp_f64_0 := f64_base + n_f64; n_f64 += 1
+    for vid in 0..f.vals.len {
+        if val_loc_a[vid] >= 0 { continue }
+        if val_rep(&types, f.vals[vid].ty) == .RepF64 {
+            val_loc_a[vid] = f64_base + n_f64
+            n_f64 += 1
+        }
+    }
+
+    mut cap_cnt := 0
+    if f.is_closure_body && f.sig_ty >= 0 && f.sig_ty < types.entries.len {
+        cap_cnt = types.entries[f.sig_ty].count
+    }
+
+    FnCtx {
+        env_local: env_local,
+        sret_local: sret_local,
+        fp_local: fp_local,
+        pc_local: pc_local,
+        tmp_i32_0: tmp_i32_0,
+        tmp_i32_1: tmp_i32_1,
+        tmp_i32_2: tmp_i32_2,
+        tmp_i64_0: tmp_i64_0,
+        tmp_i64_1: tmp_i64_1,
+        tmp_f32_0: tmp_f32_0,
+        tmp_f64_0: tmp_f64_0,
+        n_decl_i32: n_i32,
+        n_decl_i64: n_i64,
+        n_decl_f32: n_f32,
+        n_decl_f64: n_f64,
+        frame_size: frame_size,
+        slot_offsets: move slot_offsets,
+        val_loc_a: move val_loc_a,
+        val_loc_b: move val_loc_b,
+        inst_agg_off: move inst_agg_off,
+        term_agg_off: move term_agg_off,
+        region_hp_locals: move region_hp_locals,
+        cap_count: cap_cnt,
+        cap_init_skipped: 0,
+    }
+}
+
+fn emit_push_val(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, vid: i32) {
+    rep := val_rep(&types, f.vals[vid].ty)
+    if rep == .RepVoid { return }
+    if rep == .RepFat {
+        emit_local_get(&mut out, fc.val_loc_a[vid])
+        emit_local_get(&mut out, fc.val_loc_b[vid])
+    } else {
+        emit_local_get(&mut out, fc.val_loc_a[vid])
+    }
+}
+
+fn emit_push_val_as_i64(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, vid: i32) {
+    ty := f.vals[vid].ty
+    k := types.entries[ty].kind
+    emit_local_get(&mut out, fc.val_loc_a[vid])
+    if k != .I64 && k != .U64 {
+        if is_unsigned_kind(k) { b.op(&mut out, OP_I64_EXTEND_I32_U) }
+        else { b.op(&mut out, OP_I64_EXTEND_I32_S) }
+    }
+}
+
+fn emit_push_val_as_i32(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, vid: i32) {
+    ty := f.vals[vid].ty
+    k := types.entries[ty].kind
+    emit_local_get(&mut out, fc.val_loc_a[vid])
+    if k == .I64 || k == .U64 { b.op(&mut out, OP_I32_WRAP_I64) }
+}
+
+fn emit_store_val_result(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, vid: i32) {
+    rep := val_rep(&types, f.vals[vid].ty)
+    if rep == .RepVoid { return }
+    if rep == .RepFat {
+        // Multi-value return leaves [ptr, len] on stack -> pop len first, then ptr!
+        emit_local_set(&mut out, fc.val_loc_b[vid])
+        emit_local_set(&mut out, fc.val_loc_a[vid])
+    } else {
+        emit_local_set(&mut out, fc.val_loc_a[vid])
+    }
+}
+
+// =========================================================================
+// Cast, Binary, Unary, OverflowCheck, BoundsCheck Emitters
+// =========================================================================
+
+fn emit_cast_inst(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, ins: ssa.SsaInst) {
+    src_ty := f.vals[ins.op_a].ty
+    dst_ty := ins.ty
+    srep := val_rep(&types, src_ty)
+    drep := val_rep(&types, dst_ty)
+    if drep == .RepVoid { return }
+    sk := types.entries[src_ty].kind
+    dk := types.entries[dst_ty].kind
+
+    if srep == .RepFat && drep == .RepFat {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a]); emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        emit_local_get(&mut out, fc.val_loc_b[ins.op_a]); emit_local_set(&mut out, fc.val_loc_b[ins.res])
+        return
+    }
+    if srep == .RepFat && drep == .RepI32 {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a]); emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+    if dk == .ClosureEnv && (sk == .Ref || sk == .MutRef) {
+        // Borrowed `&closure` / `&mut closure` -> load heap env_ptr from [ref + 0]
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+    if srep == .RepI32 || srep == .RepAgg {
+        if drep == .RepI32 || drep == .RepAgg {
+            emit_narrow_normalize(&mut out, dk)
+        } else if drep == .RepI64 {
+            if is_unsigned_kind(sk) { b.op(&mut out, OP_I64_EXTEND_I32_U) }
+            else { b.op(&mut out, OP_I64_EXTEND_I32_S) }
+        } else if drep == .RepF32 {
+            if is_unsigned_kind(sk) { b.op(&mut out, OP_F32_CONVERT_I32_U) }
+            else { b.op(&mut out, OP_F32_CONVERT_I32_S) }
+        } else if drep == .RepF64 {
+            if is_unsigned_kind(sk) { b.op(&mut out, OP_F64_CONVERT_I32_U) }
+            else { b.op(&mut out, OP_F64_CONVERT_I32_S) }
+        }
+    } else if srep == .RepI64 {
+        if drep == .RepI32 || drep == .RepAgg {
+            b.op(&mut out, OP_I32_WRAP_I64)
+            emit_narrow_normalize(&mut out, dk)
+        } else if drep == .RepF32 {
+            if is_unsigned_kind(sk) { b.op(&mut out, OP_F32_CONVERT_I64_U) }
+            else { b.op(&mut out, OP_F32_CONVERT_I64_S) }
+        } else if drep == .RepF64 {
+            if is_unsigned_kind(sk) { b.op(&mut out, OP_F64_CONVERT_I64_U) }
+            else { b.op(&mut out, OP_F64_CONVERT_I64_S) }
+        }
+    } else if srep == .RepF32 {
+        if drep == .RepI32 {
+            if is_unsigned_kind(dk) { b.op(&mut out, OP_I32_TRUNC_F32_U) }
+            else { b.op(&mut out, OP_I32_TRUNC_F32_S) }
+            emit_narrow_normalize(&mut out, dk)
+        } else if drep == .RepI64 {
+            if is_unsigned_kind(dk) { b.op(&mut out, OP_I64_TRUNC_F32_U) }
+            else { b.op(&mut out, OP_I64_TRUNC_F32_S) }
+        } else if drep == .RepF64 {
+            b.op(&mut out, OP_F64_PROMOTE_F32)
+        }
+    } else if srep == .RepF64 {
+        if drep == .RepI32 {
+            if is_unsigned_kind(dk) { b.op(&mut out, OP_I32_TRUNC_F64_U) }
+            else { b.op(&mut out, OP_I32_TRUNC_F64_S) }
+            emit_narrow_normalize(&mut out, dk)
+        } else if drep == .RepI64 {
+            if is_unsigned_kind(dk) { b.op(&mut out, OP_I64_TRUNC_F64_U) }
+            else { b.op(&mut out, OP_I64_TRUNC_F64_S) }
+        } else if drep == .RepF32 {
+            b.op(&mut out, OP_F32_DEMOTE_F64)
+        }
+    }
+    emit_local_set(&mut out, fc.val_loc_a[ins.res])
+}
+
+fn emit_binary_inst(ctx: &WasmCtx, out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, ins: ssa.SsaInst) {
+    opty := f.vals[ins.op_a].ty
+    ok := types.entries[opty].kind
+    rep := val_rep(&types, opty)
+    op := ins.aux
+
+    // String & FatStr equality / inequality / concatenation
+    if ok == .String || ok == .FatStr {
+        if op == hb.BINOP_ADD && ok == .String {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a]); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b]); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+            emit_call(&mut out, ctx.fn_rt_str_concat)
+            emit_local_set(&mut out, fc.val_loc_a[ins.res])
+            return
+        }
+        if op == hb.BINOP_EQ || op == hb.BINOP_NE {
+            // tmp0 = len_a, tmp1 = len_b
+            if ok == .FatStr {
+                emit_local_get(&mut out, fc.val_loc_b[ins.op_a]); emit_local_set(&mut out, fc.tmp_i32_0)
+                emit_local_get(&mut out, fc.val_loc_b[ins.op_b]); emit_local_set(&mut out, fc.tmp_i32_1)
+            } else {
+                emit_local_get(&mut out, fc.val_loc_a[ins.op_a]); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0); emit_local_set(&mut out, fc.tmp_i32_0)
+                emit_local_get(&mut out, fc.val_loc_a[ins.op_b]); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0); emit_local_set(&mut out, fc.tmp_i32_1)
+            }
+            emit_local_get(&mut out, fc.tmp_i32_0); emit_local_get(&mut out, fc.tmp_i32_1); b.op(&mut out, OP_I32_EQ)
+            b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+            emit_local_get(&mut out, fc.tmp_i32_0)
+            emit_call(&mut out, ctx.fn_rt_mem_eq)
+            emit_local_set(&mut out, fc.val_loc_a[ins.res])
+            b.op(&mut out, OP_ELSE)
+            b.i32_const(&mut out, 0)
+            emit_local_set(&mut out, fc.val_loc_a[ins.res])
+            b.op(&mut out, OP_END)
+            if op == hb.BINOP_NE {
+                emit_local_get(&mut out, fc.val_loc_a[ins.res])
+                b.op(&mut out, OP_I32_EQZ)
+                emit_local_set(&mut out, fc.val_loc_a[ins.res])
+            }
+            return
+        }
+    }
+
+    emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+    emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+    uns := is_unsigned_kind(ok)
+
+    if rep == .RepI32 || rep == .RepAgg {
+        if op == hb.BINOP_ADD { b.op(&mut out, OP_I32_ADD); emit_narrow_normalize(&mut out, ok) }
+        else if op == hb.BINOP_SUB { b.op(&mut out, OP_I32_SUB); emit_narrow_normalize(&mut out, ok) }
+        else if op == hb.BINOP_MUL { b.op(&mut out, OP_I32_MUL); emit_narrow_normalize(&mut out, ok) }
+        else if op == hb.BINOP_DIV { b.op(&mut out, if uns { OP_I32_DIV_U } else { OP_I32_DIV_S }); emit_narrow_normalize(&mut out, ok) }
+        else if op == hb.BINOP_MOD { b.op(&mut out, if uns { OP_I32_REM_U } else { OP_I32_REM_S }); emit_narrow_normalize(&mut out, ok) }
+        else if op == hb.BINOP_EQ { b.op(&mut out, OP_I32_EQ) }
+        else if op == hb.BINOP_NE { b.op(&mut out, OP_I32_NE) }
+        else if op == hb.BINOP_LT { b.op(&mut out, if uns { OP_I32_LT_U } else { OP_I32_LT_S }) }
+        else if op == hb.BINOP_LE { b.op(&mut out, if uns { OP_I32_LE_U } else { OP_I32_LE_S }) }
+        else if op == hb.BINOP_GT { b.op(&mut out, if uns { OP_I32_GT_U } else { OP_I32_GT_S }) }
+        else if op == hb.BINOP_GE { b.op(&mut out, if uns { OP_I32_GE_U } else { OP_I32_GE_S }) }
+        else if op == hb.BINOP_AND { b.op(&mut out, OP_I32_AND) }
+        else if op == hb.BINOP_OR { b.op(&mut out, OP_I32_OR) }
+    } else if rep == .RepI64 {
+        if op == hb.BINOP_ADD { b.op(&mut out, OP_I64_ADD) }
+        else if op == hb.BINOP_SUB { b.op(&mut out, OP_I64_SUB) }
+        else if op == hb.BINOP_MUL { b.op(&mut out, OP_I64_MUL) }
+        else if op == hb.BINOP_DIV { b.op(&mut out, if uns { OP_I64_DIV_U } else { OP_I64_DIV_S }) }
+        else if op == hb.BINOP_MOD { b.op(&mut out, if uns { OP_I64_REM_U } else { OP_I64_REM_S }) }
+        else if op == hb.BINOP_EQ { b.op(&mut out, OP_I64_EQ) }
+        else if op == hb.BINOP_NE { b.op(&mut out, OP_I64_NE) }
+        else if op == hb.BINOP_LT { b.op(&mut out, if uns { OP_I64_LT_U } else { OP_I64_LT_S }) }
+        else if op == hb.BINOP_LE { b.op(&mut out, if uns { OP_I64_LE_U } else { OP_I64_LE_S }) }
+        else if op == hb.BINOP_GT { b.op(&mut out, if uns { OP_I64_GT_U } else { OP_I64_GT_S }) }
+        else if op == hb.BINOP_GE { b.op(&mut out, if uns { OP_I64_GE_U } else { OP_I64_GE_S }) }
+        else if op == hb.BINOP_AND { b.op(&mut out, OP_I64_AND) }
+        else if op == hb.BINOP_OR { b.op(&mut out, OP_I64_OR) }
+    } else if rep == .RepF32 {
+        if op == hb.BINOP_ADD { b.op(&mut out, OP_F32_ADD) }
+        else if op == hb.BINOP_SUB { b.op(&mut out, OP_F32_SUB) }
+        else if op == hb.BINOP_MUL { b.op(&mut out, OP_F32_MUL) }
+        else if op == hb.BINOP_DIV { b.op(&mut out, OP_F32_DIV) }
+        else if op == hb.BINOP_EQ { b.op(&mut out, OP_F32_EQ) }
+        else if op == hb.BINOP_NE { b.op(&mut out, OP_F32_NE) }
+        else if op == hb.BINOP_LT { b.op(&mut out, OP_F32_LT) }
+        else if op == hb.BINOP_LE { b.op(&mut out, OP_F32_LE) }
+        else if op == hb.BINOP_GT { b.op(&mut out, OP_F32_GT) }
+        else if op == hb.BINOP_GE { b.op(&mut out, OP_F32_GE) }
+    } else if rep == .RepF64 {
+        if op == hb.BINOP_ADD { b.op(&mut out, OP_F64_ADD) }
+        else if op == hb.BINOP_SUB { b.op(&mut out, OP_F64_SUB) }
+        else if op == hb.BINOP_MUL { b.op(&mut out, OP_F64_MUL) }
+        else if op == hb.BINOP_DIV { b.op(&mut out, OP_F64_DIV) }
+        else if op == hb.BINOP_EQ { b.op(&mut out, OP_F64_EQ) }
+        else if op == hb.BINOP_NE { b.op(&mut out, OP_F64_NE) }
+        else if op == hb.BINOP_LT { b.op(&mut out, OP_F64_LT) }
+        else if op == hb.BINOP_LE { b.op(&mut out, OP_F64_LE) }
+        else if op == hb.BINOP_GT { b.op(&mut out, OP_F64_GT) }
+        else if op == hb.BINOP_GE { b.op(&mut out, OP_F64_GE) }
+    }
+    emit_local_set(&mut out, fc.val_loc_a[ins.res])
+}
+
+fn emit_unary_inst(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, ins: ssa.SsaInst) {
+    opty := f.vals[ins.op_a].ty
+    ok := types.entries[opty].kind
+    rep := val_rep(&types, opty)
+    if ins.aux == hb.UNOP_NOT {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        b.op(&mut out, OP_I32_EQZ)
+    } else if ins.aux == hb.UNOP_NEG {
+        if rep == .RepI32 {
+            b.i32_const(&mut out, 0)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.op(&mut out, OP_I32_SUB)
+            emit_narrow_normalize(&mut out, ok)
+        } else if rep == .RepI64 {
+            b.constant(&mut out, 0)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.op(&mut out, OP_I64_SUB)
+        } else if rep == .RepF32 {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.op(&mut out, OP_F32_NEG)
+        } else {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.op(&mut out, OP_F64_NEG)
+        }
+    } else {
+        // UNOP_BIT_NOT
+        if rep == .RepI64 {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.constant(&mut out, -1)
+            b.op(&mut out, OP_I64_XOR)
+        } else {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.i32_const(&mut out, -1)
+            b.op(&mut out, OP_I32_XOR)
+            emit_narrow_normalize(&mut out, ok)
+        }
+    }
+    emit_local_set(&mut out, fc.val_loc_a[ins.res])
+}
+
+fn emit_trap_if_cond(ctx: &WasmCtx, out: &mut []u8, code: i32) {
+    // Assumes i32 condition on stack; calls __rt_trap(code) when nonzero.
+    b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+    b.i32_const(&mut out, code)
+    emit_call(&mut out, ctx.fn_rt_trap)
+    b.op(&mut out, OP_UNREACHABLE)
+    b.op(&mut out, OP_END)
+}
+
+fn emit_bounds_check(ctx: &WasmCtx, out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, ins: ssa.SsaInst) {
+    // Promote both idx and len to i64:
+    // BOUNDS_LT: trap if len <= 0 || idx >=u len
+    // BOUNDS_LE: trap if len < 0  || idx >u len
+    emit_push_val_as_i64(&mut out, &types, &f, &fc, ins.op_a)
+    emit_local_set(&mut out, fc.tmp_i64_0) // idx
+    emit_push_val_as_i64(&mut out, &types, &f, &fc, ins.op_b)
+    emit_local_set(&mut out, fc.tmp_i64_1) // len
+
+    emit_local_get(&mut out, fc.tmp_i64_1)
+    b.constant(&mut out, 0)
+    b.op(&mut out, if ins.aux == ssa.BOUNDS_LE { OP_I64_LT_S } else { OP_I64_LE_S })
+    emit_local_get(&mut out, fc.tmp_i64_0)
+    emit_local_get(&mut out, fc.tmp_i64_1)
+    b.op(&mut out, if ins.aux == ssa.BOUNDS_LE { OP_I64_GT_U } else { OP_I64_GE_U })
+    b.op(&mut out, OP_I32_OR)
+    emit_trap_if_cond(&ctx, &mut out, hb.TRAP_BOUNDS)
+}
+
+fn emit_overflow_check(ctx: &WasmCtx, out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, ins: ssa.SsaInst) {
+    ty := if ins.aux_ty >= 0 && ins.aux_ty < types.entries.len { ins.aux_ty } else { f.vals[ins.op_a].ty }
+    k := types.entries[ty].kind
+    op := ins.aux
+    uns := is_unsigned_kind(k)
+
+    // Division & modulo: check rhs == 0 -> TRAP_DIV_ZERO, and signed MIN / -1 -> TRAP_OVERFLOW
+    if op == hb.BINOP_DIV || op == hb.BINOP_MOD {
+        if k == .I64 || k == .U64 {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+            b.op(&mut out, OP_I64_EQZ)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_DIV_ZERO)
+            if k == .I64 {
+                emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+                b.constant(&mut out, -9223372036854775807 - 1)
+                b.op(&mut out, OP_I64_EQ)
+                emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+                b.constant(&mut out, -1)
+                b.op(&mut out, OP_I64_EQ)
+                b.op(&mut out, OP_I32_AND)
+                emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+            }
+        } else {
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+            b.op(&mut out, OP_I32_EQZ)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_DIV_ZERO)
+            if !uns {
+                min_v := if k == .I8 { -128 } else if k == .I16 { -32768 } else { -2147483647 - 1 }
+                emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+                b.i32_const(&mut out, min_v)
+                b.op(&mut out, OP_I32_EQ)
+                emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+                b.i32_const(&mut out, -1)
+                b.op(&mut out, OP_I32_EQ)
+                b.op(&mut out, OP_I32_AND)
+                emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+            }
+        }
+        return
+    }
+
+    // 8/16/32-bit checked ADD/SUB/MUL via exact 64-bit widening!
+    if k != .I64 && k != .U64 {
+        emit_push_val_as_i64(&mut out, &types, &f, &fc, ins.op_a)
+        emit_push_val_as_i64(&mut out, &types, &f, &fc, ins.op_b)
+        if op == hb.BINOP_ADD { b.op(&mut out, OP_I64_ADD) }
+        else if op == hb.BINOP_SUB { b.op(&mut out, OP_I64_SUB) }
+        else { b.op(&mut out, OP_I64_MUL) }
+        emit_local_tee(&mut out, fc.tmp_i64_0)
+        if uns {
+            max_u: i64 = if k == .U8 { 255 } else if k == .U16 { 65535 } else { 4294967295 }
+            b.constant(&mut out, max_u)
+            b.op(&mut out, OP_I64_GT_U)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+        } else {
+            min_s: i64 = if k == .I8 { -128 } else if k == .I16 { -32768 } else { -2147483648 }
+            max_s: i64 = if k == .I8 { 127 } else if k == .I16 { 32767 } else { 2147483647 }
+            b.constant(&mut out, min_s)
+            b.op(&mut out, OP_I64_LT_S)
+            emit_local_get(&mut out, fc.tmp_i64_0)
+            b.constant(&mut out, max_s)
+            b.op(&mut out, OP_I64_GT_S)
+            b.op(&mut out, OP_I32_OR)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+        }
+        return
+    }
+
+    // 64-bit checked ADD/SUB/MUL
+    la := fc.val_loc_a[ins.op_a]
+    lb := fc.val_loc_a[ins.op_b]
+    if k == .U64 {
+        if op == hb.BINOP_ADD {
+            emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_ADD)
+            emit_local_get(&mut out, la); b.op(&mut out, OP_I64_LT_U)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+        } else if op == hb.BINOP_SUB {
+            emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_LT_U)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+        } else if op == hb.BINOP_MUL {
+            emit_local_get(&mut out, lb); b.constant(&mut out, 0); b.op(&mut out, OP_I64_NE)
+            b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+            emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_MUL)
+            emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_DIV_U)
+            emit_local_get(&mut out, la); b.op(&mut out, OP_I64_NE)
+            emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+            b.op(&mut out, OP_END)
+        }
+        return
+    }
+    // Signed I64
+    if op == hb.BINOP_ADD {
+        // ((a ^ res) & (b ^ res)) < 0
+        emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_ADD); emit_local_set(&mut out, fc.tmp_i64_0)
+        emit_local_get(&mut out, la); emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I64_XOR)
+        emit_local_get(&mut out, lb); emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I64_XOR)
+        b.op(&mut out, OP_I64_AND); b.constant(&mut out, 0); b.op(&mut out, OP_I64_LT_S)
+        emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+    } else if op == hb.BINOP_SUB {
+        // ((a ^ b) & (a ^ res)) < 0
+        emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_SUB); emit_local_set(&mut out, fc.tmp_i64_0)
+        emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_XOR)
+        emit_local_get(&mut out, la); emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I64_XOR)
+        b.op(&mut out, OP_I64_AND); b.constant(&mut out, 0); b.op(&mut out, OP_I64_LT_S)
+        emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+    } else if op == hb.BINOP_MUL {
+        emit_local_get(&mut out, lb); b.constant(&mut out, 0); b.op(&mut out, OP_I64_NE)
+        b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+        // Check a == MIN_I64 && b == -1
+        emit_local_get(&mut out, la); b.constant(&mut out, -9223372036854775807 - 1); b.op(&mut out, OP_I64_EQ)
+        emit_local_get(&mut out, lb); b.constant(&mut out, -1); b.op(&mut out, OP_I64_EQ)
+        b.op(&mut out, OP_I32_AND)
+        emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+        emit_local_get(&mut out, la); emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_MUL)
+        emit_local_get(&mut out, lb); b.op(&mut out, OP_I64_DIV_S)
+        emit_local_get(&mut out, la); b.op(&mut out, OP_I64_NE)
+        emit_trap_if_cond(&ctx, &mut out, hb.TRAP_OVERFLOW)
+        b.op(&mut out, OP_END)
+    }
+}
+
+// =========================================================================
+// SSA Instruction Emitter
+// =========================================================================
+
+fn emit_ssa_inst(ctx: &mut WasmCtx, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &mut FnCtx, out: &mut []u8, bb: i32, iid: i32) {
+    types := &hir.types
+    ins := f.insts[iid]
+    k := ins.kind
+    if k == .Nop { return }
+
+    if k == .ConstInt {
+        rep := val_rep(&types, ins.ty)
+        if rep == .RepVoid { return }
+        if rep == .RepI64 { b.constant(&mut out, ins.imm_i64) }
+        else { emit_i32_const_from_i64(&mut out, ins.imm_i64) }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ConstFloat {
+        if val_rep(&types, ins.ty) == .RepF32 { emit_f32_const_bits(&mut out, ins.imm_i64) }
+        else { emit_f64_const_bits(&mut out, ins.imm_i64) }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ConstStr {
+        text := if ins.str_idx >= 0 && ins.str_idx < f.const_strs.len { f.const_strs[ins.str_idx].clone() } else { "" }
+        addr := intern_const_str(&mut ctx, text)
+        b.i32_const(&mut out, addr)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ConstCStr {
+        text := if ins.str_idx >= 0 && ins.str_idx < f.const_strs.len { f.const_strs[ins.str_idx].clone() } else { "" }
+        addr := intern_const_cstr(&mut ctx, text)
+        b.i32_const(&mut out, addr)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ConstWStr {
+        text := if ins.str_idx >= 0 && ins.str_idx < f.const_strs.len { f.const_strs[ins.str_idx].clone() } else { "" }
+        addr := intern_const_wstr(&mut ctx, text)
+        b.i32_const(&mut out, addr)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ConstBlob {
+        addr := intern_embed_blob(&mut ctx, &hir, i32(ins.imm_i64))
+        b.i32_const(&mut out, addr)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ConstFn {
+        fid := ins.aux
+        mut slot := 0
+        if fid >= 0 && fid < ctx.fn_id_to_wasm.len && ctx.fn_id_to_wasm[fid] >= 0 {
+            slot = add_table_entry(&mut ctx, ctx.fn_id_to_wasm[fid])
+        }
+        b.i32_const(&mut out, slot)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .Copy {
+        rep := val_rep(&types, ins.ty)
+        if rep == .RepVoid { return }
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        if rep == .RepFat {
+            emit_local_get(&mut out, fc.val_loc_b[ins.op_a])
+            emit_local_set(&mut out, fc.val_loc_b[ins.res])
+        }
+        return
+    }
+
+    if k == .Binary {
+        emit_binary_inst(&ctx, &mut out, &types, &f, &fc, ins)
+        return
+    }
+
+    if k == .Unary {
+        emit_unary_inst(&mut out, &types, &f, &fc, ins)
+        return
+    }
+
+    if k == .Cast {
+        emit_cast_inst(&mut out, &types, &f, &fc, ins)
+        return
+    }
+
+    if k == .SlotAddr {
+        slot_id := ins.aux
+        off := if slot_id >= 0 && slot_id < fc.slot_offsets.len && fc.slot_offsets[slot_id] >= 0 {
+            fc.slot_offsets[slot_id] + i32(ins.imm_i64)
+        } else { 0 }
+        if fc.fp_local >= 0 {
+            emit_local_get(&mut out, fc.fp_local)
+            if off != 0 {
+                b.i32_const(&mut out, off)
+                b.op(&mut out, OP_I32_ADD)
+            }
+        } else {
+            b.i32_const(&mut out, 0)
+        }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .Load {
+        rep := val_rep(&types, ins.ty)
+        if rep == .RepVoid { return }
+        off := i32(ins.imm_i64)
+        if rep == .RepFat {
+            len_off := fat_len_offset(&types)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, off)
+            emit_local_set(&mut out, fc.val_loc_a[ins.res])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, off + len_off)
+            emit_local_set(&mut out, fc.val_loc_b[ins.res])
+            return
+        }
+        if rep == .RepAgg {
+            sz := type_size(&types, ins.ty)
+            buf_off := fc.inst_agg_off[iid]
+            emit_local_get(&mut out, fc.fp_local)
+            if buf_off != 0 { b.i32_const(&mut out, buf_off); b.op(&mut out, OP_I32_ADD) }
+            emit_local_tee(&mut out, fc.val_loc_a[ins.res])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            if off != 0 { b.i32_const(&mut out, off); b.op(&mut out, OP_I32_ADD) }
+            b.i32_const(&mut out, sz)
+            emit_mem_copy(&mut out)
+            return
+        }
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_scalar_load(&mut out, &types, ins.ty, off)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .Store {
+        // Skip synthetic zero-init Stores into closure capture slots at entry of bb 0
+        if bb == 0 && f.is_closure_body && fc.cap_init_skipped < fc.cap_count {
+            ci := ins.aux - (1 + f.param_count)
+            if ins.aux >= 0 && ci >= 0 && ci < fc.cap_count && ins.imm_i64 == 0 {
+                fc.cap_init_skipped += 1
+                return
+            }
+        }
+        rep := val_rep(&types, ins.ty)
+        if rep == .RepVoid { return }
+        off := i32(ins.imm_i64)
+        if rep == .RepFat {
+            len_off := fat_len_offset(&types)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+            emit_mem_op(&mut out, OP_I32_STORE, 2, off)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_local_get(&mut out, fc.val_loc_b[ins.op_b])
+            emit_mem_op(&mut out, OP_I32_STORE, 2, off + len_off)
+            return
+        }
+        if rep == .RepAgg {
+            sz := type_size(&types, ins.ty)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            if off != 0 { b.i32_const(&mut out, off); b.op(&mut out, OP_I32_ADD) }
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+            b.i32_const(&mut out, sz)
+            emit_mem_copy(&mut out)
+            return
+        }
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+        emit_scalar_store(&mut out, &types, ins.ty, off)
+        return
+    }
+
+    if k == .FieldAddr {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        off := i32(ins.imm_i64)
+        if off != 0 {
+            b.i32_const(&mut out, off)
+            b.op(&mut out, OP_I32_ADD)
+        }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .IndexAddr {
+        stride := i32(ins.imm_i64)
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        if stride > 0 {
+            emit_push_val_as_i32(&mut out, &types, &f, &fc, ins.op_b)
+            if stride != 1 {
+                b.i32_const(&mut out, stride)
+                b.op(&mut out, OP_I32_MUL)
+            }
+            b.op(&mut out, OP_I32_ADD)
+        }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .FatMake {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        emit_push_val_as_i32(&mut out, &types, &f, &fc, ins.op_b)
+        emit_local_set(&mut out, fc.val_loc_b[ins.res])
+        return
+    }
+
+    if k == .FatPtr {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .FatLen {
+        emit_local_get(&mut out, fc.val_loc_b[ins.op_a])
+        if val_rep(&types, ins.ty) == .RepI64 {
+            b.op(&mut out, OP_I64_EXTEND_I32_U)
+        }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .AllocHeap {
+        stride := if ins.imm_i64 > 0 { i32(ins.imm_i64) } else { 1 }
+        res_k := types.entries[ins.ty].kind
+        if res_k == .Array {
+            // Dynamic array: allocate 16B header + max(cnt, 4) * stride; [ptr-8]=cnt, [ptr-4]=cap
+            if ins.op_a >= 0 {
+                emit_push_val_as_i32(&mut out, &types, &f, &fc, ins.op_a)
+            } else {
+                b.i32_const(&mut out, 0)
+            }
+            emit_local_set(&mut out, fc.tmp_i32_0) // cnt
+            emit_local_get(&mut out, fc.tmp_i32_0)
+            b.i32_const(&mut out, 4)
+            emit_local_get(&mut out, fc.tmp_i32_0)
+            b.i32_const(&mut out, 4)
+            b.op(&mut out, OP_I32_GT_S)
+            b.op(&mut out, OP_SELECT)
+            emit_local_tee(&mut out, fc.tmp_i32_1) // cap = max(cnt, 4)
+            b.i32_const(&mut out, stride); b.op(&mut out, OP_I32_MUL)
+            b.i32_const(&mut out, 16); b.op(&mut out, OP_I32_ADD)
+            emit_call(&mut out, ctx.fn_rt_alloc)
+            emit_local_tee(&mut out, fc.tmp_i32_2) // raw base
+            emit_local_get(&mut out, fc.tmp_i32_0)
+            emit_mem_op(&mut out, OP_I32_STORE, 2, 8) // [raw+8] = len
+            emit_local_get(&mut out, fc.tmp_i32_2)
+            emit_local_get(&mut out, fc.tmp_i32_1)
+            emit_mem_op(&mut out, OP_I32_STORE, 2, 12) // [raw+12] = cap
+            emit_local_get(&mut out, fc.tmp_i32_2)
+            b.i32_const(&mut out, 16); b.op(&mut out, OP_I32_ADD)
+            emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        } else {
+            // Raw / RegionSlice bump allocation: cnt * stride bytes, zero-initialized
+            if ins.op_a >= 0 {
+                emit_push_val_as_i32(&mut out, &types, &f, &fc, ins.op_a)
+                b.i32_const(&mut out, stride); b.op(&mut out, OP_I32_MUL)
+            } else {
+                b.i32_const(&mut out, stride)
+            }
+            emit_local_tee(&mut out, fc.tmp_i32_0)
+            emit_call(&mut out, ctx.fn_rt_alloc)
+            emit_local_tee(&mut out, fc.val_loc_a[ins.res])
+            b.i32_const(&mut out, 0)
+            emit_local_get(&mut out, fc.tmp_i32_0)
+            emit_mem_fill(&mut out)
+        }
+        return
+    }
+
+    if k == .MemCopy {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+        b.i32_const(&mut out, i32(ins.imm_i64))
+        emit_mem_copy(&mut out)
+        return
+    }
+
+    if k == .MemZero {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        b.i32_const(&mut out, 0)
+        b.i32_const(&mut out, i32(ins.imm_i64))
+        emit_mem_fill(&mut out)
+        return
+    }
+
+    if k == .Discriminant {
+        opty := f.vals[ins.op_a].ty
+        if val_rep(&types, opty) == .RepI32 {
+            // Fieldless enum: SSA value IS the i32 discriminant
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        } else {
+            // Payload enum: 4-byte discriminant lives at offset 0 of the enum memory
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .SetDiscriminant {
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        b.i32_const(&mut out, ins.aux)
+        emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        return
+    }
+
+    if k == .Len {
+        opty := f.vals[ins.op_a].ty
+        ok := types.entries[opty].kind
+        if ok == .FatStr || ok == .FatSlice || ok == .RegionSlice {
+            emit_local_get(&mut out, fc.val_loc_b[ins.op_a])
+        } else if ok == .FixedArr {
+            b.i32_const(&mut out, types.entries[opty].count)
+        } else {
+            // String or Array: [ptr - 8] = len (i32)
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB)
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        }
+        if val_rep(&types, ins.ty) == .RepI64 { b.op(&mut out, OP_I64_EXTEND_I32_U) }
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        return
+    }
+
+    if k == .ClosureMake {
+        // Allocate env: [0]=table_idx (i32), [4]=0 (i32), [8..]=captures (8-byte aligned slots)
+        te := &types.entries[ins.ty]
+        cl_fid := if te.closure_fn_id >= 0 { te.closure_fn_id } else { ins.aux }
+        mut tbl_slot := 0
+        if cl_fid >= 0 && cl_fid < ctx.fn_id_to_wasm.len && ctx.fn_id_to_wasm[cl_fid] >= 0 {
+            tbl_slot = add_table_entry(&mut ctx, ctx.fn_id_to_wasm[cl_fid])
+        }
+        mut env_bytes := 8
+        for ci in 0..ins.arg_len {
+            cty := ht.field_type(&types, ins.ty, ci)
+            al := type_align(&types, cty)
+            env_bytes = align_up_i32(env_bytes, al)
+            sz := type_size(&types, cty)
+            env_bytes += if sz > 0 { sz } else { 4 }
+        }
+        b.i32_const(&mut out, env_bytes)
+        emit_call(&mut out, ctx.fn_rt_alloc)
+        emit_local_tee(&mut out, fc.val_loc_a[ins.res])
+        b.i32_const(&mut out, tbl_slot)
+        emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        emit_local_get(&mut out, fc.val_loc_a[ins.res])
+        b.i32_const(&mut out, 0)
+        emit_mem_op(&mut out, OP_I32_STORE, 2, 4)
+
+        mut cap_off := 8
+        for ci in 0..ins.arg_len {
+            cv := f.val_args[ins.arg_start + ci]
+            cty := ht.field_type(&types, ins.ty, ci)
+            al := type_align(&types, cty)
+            cap_off = align_up_i32(cap_off, al)
+            crep := val_rep(&types, cty)
+            if crep == .RepFat {
+                len_off := fat_len_offset(&types)
+                emit_local_get(&mut out, fc.val_loc_a[ins.res]); emit_local_get(&mut out, fc.val_loc_a[cv]); emit_mem_op(&mut out, OP_I32_STORE, 2, cap_off)
+                emit_local_get(&mut out, fc.val_loc_a[ins.res]); emit_local_get(&mut out, fc.val_loc_b[cv]); emit_mem_op(&mut out, OP_I32_STORE, 2, cap_off + len_off)
+            } else if crep == .RepAgg {
+                sz := type_size(&types, cty)
+                emit_local_get(&mut out, fc.val_loc_a[ins.res]); b.i32_const(&mut out, cap_off); b.op(&mut out, OP_I32_ADD)
+                emit_local_get(&mut out, fc.val_loc_a[cv])
+                b.i32_const(&mut out, sz)
+                emit_mem_copy(&mut out)
+            } else if crep != .RepVoid {
+                emit_local_get(&mut out, fc.val_loc_a[ins.res])
+                emit_local_get(&mut out, fc.val_loc_a[cv])
+                emit_scalar_store(&mut out, &types, cty, cap_off)
+            }
+            sz := type_size(&types, cty)
+            cap_off += if sz > 0 { sz } else { 4 }
+        }
+        return
+    }
+
+    if k == .Select {
+        rep := val_rep(&types, ins.ty)
+        if rep == .RepVoid { return }
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_b])
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_c])
+        emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+        b.op(&mut out, OP_SELECT)
+        emit_local_set(&mut out, fc.val_loc_a[ins.res])
+        if rep == .RepFat {
+            emit_local_get(&mut out, fc.val_loc_b[ins.op_b])
+            emit_local_get(&mut out, fc.val_loc_b[ins.op_c])
+            emit_local_get(&mut out, fc.val_loc_a[ins.op_a])
+            b.op(&mut out, OP_SELECT)
+            emit_local_set(&mut out, fc.val_loc_b[ins.res])
+        }
+        return
+    }
+
+    if k == .BoundsCheck {
+        emit_bounds_check(&ctx, &mut out, &types, &f, &fc, ins)
+        return
+    }
+
+    if k == .OverflowCheck {
+        emit_overflow_check(&ctx, &mut out, &types, &f, &fc, ins)
+        return
+    }
+}
+
+// =========================================================================
+// Intrinsic Call Lowering
+// =========================================================================
+
+fn emit_intrinsic_call(ctx: &mut WasmCtx, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &FnCtx, out: &mut []u8, tid: i32) {
+    types := &hir.types
+    tm := f.terms[tid]
+    id := tm.callee
+
+    if id == hb.INTRINSIC_DROP { return } // bump-allocator WASM: safe no-op
+
+    if id == hb.INTRINSIC_PRINT || id == hb.INTRINSIC_EPRINT {
+        if !ctx.is_wasi || tm.arg_len == 0 { return }
+        fd := if id == hb.INTRINSIC_PRINT { 1 } else { 2 }
+        av := f.val_args[tm.arg_start]
+        aty := f.vals[av].ty
+        ak := types.entries[aty].kind
+        if ak == .String {
+            b.i32_const(&mut out, fd)
+            emit_local_get(&mut out, fc.val_loc_a[av])
+            emit_local_get(&mut out, fc.val_loc_a[av]); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+            emit_call(&mut out, ctx.fn_rt_wasi_write)
+        } else if ak == .FatStr {
+            b.i32_const(&mut out, fd)
+            emit_local_get(&mut out, fc.val_loc_a[av])
+            emit_local_get(&mut out, fc.val_loc_b[av])
+            emit_call(&mut out, ctx.fn_rt_wasi_write)
+        } else if ak == .Bool {
+            b.i32_const(&mut out, fd)
+            emit_local_get(&mut out, fc.val_loc_a[av])
+            emit_call(&mut out, ctx.fn_rt_wasi_print_bool)
+        } else if ak == .F32 || ak == .F64 {
+            b.i32_const(&mut out, fd)
+            emit_local_get(&mut out, fc.val_loc_a[av])
+            b.op(&mut out, if ak == .F32 { OP_I64_TRUNC_F32_S } else { OP_I64_TRUNC_F64_S })
+            b.i32_const(&mut out, 0)
+            emit_call(&mut out, ctx.fn_rt_wasi_print_i64)
+        } else {
+            b.i32_const(&mut out, fd)
+            emit_push_val_as_i64(&mut out, &types, &f, &fc, av)
+            b.i32_const(&mut out, if is_unsigned_kind(ak) { 1 } else { 0 })
+            emit_call(&mut out, ctx.fn_rt_wasi_print_i64)
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_ASSERT && tm.arg_len > 0 {
+        av := f.val_args[tm.arg_start]
+        emit_local_get(&mut out, fc.val_loc_a[av])
+        b.op(&mut out, OP_I32_EQZ)
+        emit_trap_if_cond(&ctx, &mut out, hb.TRAP_ASSERT)
+        return
+    }
+
+    if id == hb.INTRINSIC_PANIC {
+        b.i32_const(&mut out, hb.TRAP_PANIC)
+        emit_call(&mut out, ctx.fn_rt_trap)
+        b.op(&mut out, OP_UNREACHABLE)
+        return
+    }
+
+    if id == hb.INTRINSIC_UNREACHABLE {
+        b.i32_const(&mut out, hb.TRAP_UNREACHABLE)
+        emit_call(&mut out, ctx.fn_rt_trap)
+        b.op(&mut out, OP_UNREACHABLE)
+        return
+    }
+
+    if id == hb.INTRINSIC_SYS_EXIT {
+        if tm.arg_len > 0 {
+            emit_push_val_as_i32(&mut out, &types, &f, &fc, f.val_args[tm.arg_start])
+        } else {
+            b.i32_const(&mut out, 0)
+        }
+        emit_call(&mut out, ctx.fn_rt_trap)
+        b.op(&mut out, OP_UNREACHABLE)
+        return
+    }
+
+    if id == hb.INTRINSIC_ARR_PUSH && tm.arg_len >= 2 {
+        // arg0 = &mut []T (ptr to array handle slot), arg1 = elem value
+        arr_ref := f.val_args[tm.arg_start]
+        elem_v := f.val_args[tm.arg_start + 1]
+        elem_ty := f.vals[elem_v].ty
+        elem_al := type_align(&types, elem_ty)
+        elem_sz := type_size(&types, elem_ty)
+        stride := align_up_i32(if elem_sz > 0 { elem_sz } else { 1 }, elem_al)
+
+        // tmp0 = arr_ptr, tmp1 = len, tmp2 = cap
+        emit_local_get(&mut out, fc.val_loc_a[arr_ref])
+        emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        emit_local_tee(&mut out, fc.tmp_i32_0)
+        b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        emit_local_set(&mut out, fc.tmp_i32_1)
+        emit_local_get(&mut out, fc.tmp_i32_0)
+        b.i32_const(&mut out, 4); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        emit_local_set(&mut out, fc.tmp_i32_2)
+
+        // Grow if len >= cap
+        emit_local_get(&mut out, fc.tmp_i32_1)
+        emit_local_get(&mut out, fc.tmp_i32_2)
+        b.op(&mut out, OP_I32_GE_S)
+        b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+        // new_cap = max(cap * 2, 4)
+        emit_local_get(&mut out, fc.tmp_i32_2); b.i32_const(&mut out, 2); b.op(&mut out, OP_I32_MUL)
+        b.i32_const(&mut out, 4)
+        emit_local_get(&mut out, fc.tmp_i32_2); b.i32_const(&mut out, 2); b.op(&mut out, OP_I32_GE_S)
+        b.op(&mut out, OP_SELECT)
+        emit_local_tee(&mut out, fc.tmp_i32_2)
+        b.i32_const(&mut out, stride); b.op(&mut out, OP_I32_MUL)
+        b.i32_const(&mut out, 16); b.op(&mut out, OP_I32_ADD)
+        emit_call(&mut out, ctx.fn_rt_alloc)
+        b.i32_const(&mut out, 16); b.op(&mut out, OP_I32_ADD)
+        // store new_ptr into tmp_i64_0 temporarily (reused as i32 via wrap/extend)
+        b.op(&mut out, OP_I64_EXTEND_I32_U); emit_local_set(&mut out, fc.tmp_i64_0)
+        // header: [new_ptr-8] = len, [new_ptr-4] = new_cap
+        emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I32_WRAP_I64); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB)
+        emit_local_get(&mut out, fc.tmp_i32_1); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I32_WRAP_I64); b.i32_const(&mut out, 4); b.op(&mut out, OP_I32_SUB)
+        emit_local_get(&mut out, fc.tmp_i32_2); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        // copy old elements
+        emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I32_WRAP_I64)
+        emit_local_get(&mut out, fc.tmp_i32_0)
+        emit_local_get(&mut out, fc.tmp_i32_1); b.i32_const(&mut out, stride); b.op(&mut out, OP_I32_MUL)
+        emit_mem_copy(&mut out)
+        // update tmp0 & *arr_ref = new_ptr
+        emit_local_get(&mut out, fc.tmp_i64_0); b.op(&mut out, OP_I32_WRAP_I64); emit_local_set(&mut out, fc.tmp_i32_0)
+        emit_local_get(&mut out, fc.val_loc_a[arr_ref])
+        emit_local_get(&mut out, fc.tmp_i32_0)
+        emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        b.op(&mut out, OP_END)
+
+        // Store elem at arr_ptr + len * stride
+        emit_local_get(&mut out, fc.tmp_i32_0)
+        emit_local_get(&mut out, fc.tmp_i32_1); b.i32_const(&mut out, stride); b.op(&mut out, OP_I32_MUL)
+        b.op(&mut out, OP_I32_ADD)
+        erep := val_rep(&types, elem_ty)
+        if erep == .RepFat {
+            len_off := fat_len_offset(&types)
+            emit_local_tee(&mut out, fc.tmp_i32_2)
+            emit_local_get(&mut out, fc.val_loc_a[elem_v]); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+            emit_local_get(&mut out, fc.tmp_i32_2)
+            emit_local_get(&mut out, fc.val_loc_b[elem_v]); emit_mem_op(&mut out, OP_I32_STORE, 2, len_off)
+        } else if erep == .RepAgg {
+            emit_local_get(&mut out, fc.val_loc_a[elem_v])
+            b.i32_const(&mut out, elem_sz)
+            emit_mem_copy(&mut out)
+        } else if erep != .RepVoid {
+            emit_local_get(&mut out, fc.val_loc_a[elem_v])
+            emit_scalar_store(&mut out, &types, elem_ty, 0)
+        } else {
+            b.op(&mut out, OP_DROP)
+        }
+
+        // [arr_ptr - 8] = len + 1
+        emit_local_get(&mut out, fc.tmp_i32_0); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB)
+        emit_local_get(&mut out, fc.tmp_i32_1); b.i32_const(&mut out, 1); b.op(&mut out, OP_I32_ADD)
+        emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        return
+    }
+
+    if id == hb.INTRINSIC_ARR_CLEAR && tm.arg_len >= 1 {
+        arr_ref := f.val_args[tm.arg_start]
+        emit_local_get(&mut out, fc.val_loc_a[arr_ref]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB)
+        b.i32_const(&mut out, 0)
+        emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        return
+    }
+
+    if id == hb.INTRINSIC_ARR_POP && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        arr_ref := f.val_args[tm.arg_start]
+        dty := f.vals[tm.dest_val].ty
+        elem_al := type_align(&types, dty)
+        elem_sz := type_size(&types, dty)
+        stride := align_up_i32(if elem_sz > 0 { elem_sz } else { 1 }, elem_al)
+        emit_local_get(&mut out, fc.val_loc_a[arr_ref]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        emit_local_tee(&mut out, fc.tmp_i32_0)
+        b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        b.i32_const(&mut out, 1); b.op(&mut out, OP_I32_SUB)
+        emit_local_tee(&mut out, fc.tmp_i32_1)
+        b.i32_const(&mut out, 0); b.op(&mut out, OP_I32_LT_S)
+        emit_trap_if_cond(&ctx, &mut out, hb.TRAP_BOUNDS)
+        // store decremented len
+        emit_local_get(&mut out, fc.tmp_i32_0); b.i32_const(&mut out, 8); b.op(&mut out, OP_I32_SUB)
+        emit_local_get(&mut out, fc.tmp_i32_1); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+        // load popped element
+        emit_local_get(&mut out, fc.tmp_i32_0)
+        emit_local_get(&mut out, fc.tmp_i32_1); b.i32_const(&mut out, stride); b.op(&mut out, OP_I32_MUL)
+        b.op(&mut out, OP_I32_ADD)
+        drep := val_rep(&types, dty)
+        if drep == .RepAgg {
+            buf_off := fc.term_agg_off[tid]
+            emit_local_set(&mut out, fc.tmp_i32_2)
+            emit_local_get(&mut out, fc.fp_local)
+            if buf_off != 0 { b.i32_const(&mut out, buf_off); b.op(&mut out, OP_I32_ADD) }
+            emit_local_tee(&mut out, fc.val_loc_a[tm.dest_val])
+            emit_local_get(&mut out, fc.tmp_i32_2)
+            b.i32_const(&mut out, elem_sz)
+            emit_mem_copy(&mut out)
+        } else if drep == .RepFat {
+            len_off := fat_len_offset(&types)
+            emit_local_tee(&mut out, fc.tmp_i32_2)
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+            emit_local_get(&mut out, fc.tmp_i32_2)
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, len_off); emit_local_set(&mut out, fc.val_loc_b[tm.dest_val])
+        } else if drep != .RepVoid {
+            emit_scalar_load(&mut out, &types, dty, 0)
+            emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        } else {
+            b.op(&mut out, OP_DROP)
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_CLONE && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        aty := f.vals[av].ty
+        dty := f.vals[tm.dest_val].ty
+        ak := types.entries[aty].kind
+        drep := val_rep(&types, dty)
+        if ak == .Ref || ak == .MutRef {
+            // Dereference source reference into dest_val
+            if drep == .RepAgg {
+                sz := type_size(&types, dty)
+                buf_off := fc.term_agg_off[tid]
+                emit_local_get(&mut out, fc.fp_local)
+                if buf_off != 0 { b.i32_const(&mut out, buf_off); b.op(&mut out, OP_I32_ADD) }
+                emit_local_tee(&mut out, fc.val_loc_a[tm.dest_val])
+                emit_local_get(&mut out, fc.val_loc_a[av])
+                b.i32_const(&mut out, sz)
+                emit_mem_copy(&mut out)
+            } else if drep == .RepFat {
+                len_off := fat_len_offset(&types)
+                emit_local_get(&mut out, fc.val_loc_a[av]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+                emit_local_get(&mut out, fc.val_loc_a[av]); emit_mem_op(&mut out, OP_I32_LOAD, 2, len_off); emit_local_set(&mut out, fc.val_loc_b[tm.dest_val])
+            } else if drep != .RepVoid {
+                emit_local_get(&mut out, fc.val_loc_a[av]); emit_scalar_load(&mut out, &types, dty, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+            }
+        } else if drep != .RepVoid {
+            emit_local_get(&mut out, fc.val_loc_a[av]); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+            if drep == .RepFat {
+                emit_local_get(&mut out, fc.val_loc_b[av]); emit_local_set(&mut out, fc.val_loc_b[tm.dest_val])
+            }
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_REPLACE && tm.arg_len >= 2 && tm.dest_val >= 0 {
+        ref_v := f.val_args[tm.arg_start]
+        new_v := f.val_args[tm.arg_start + 1]
+        dty := f.vals[tm.dest_val].ty
+        drep := val_rep(&types, dty)
+        if drep == .RepAgg {
+            sz := type_size(&types, dty)
+            buf_off := fc.term_agg_off[tid]
+            emit_local_get(&mut out, fc.fp_local)
+            if buf_off != 0 { b.i32_const(&mut out, buf_off); b.op(&mut out, OP_I32_ADD) }
+            emit_local_tee(&mut out, fc.val_loc_a[tm.dest_val])
+            emit_local_get(&mut out, fc.val_loc_a[ref_v])
+            b.i32_const(&mut out, sz); emit_mem_copy(&mut out)
+            emit_local_get(&mut out, fc.val_loc_a[ref_v])
+            emit_local_get(&mut out, fc.val_loc_a[new_v])
+            b.i32_const(&mut out, sz); emit_mem_copy(&mut out)
+        } else if drep == .RepFat {
+            len_off := fat_len_offset(&types)
+            emit_local_get(&mut out, fc.val_loc_a[ref_v]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+            emit_local_get(&mut out, fc.val_loc_a[ref_v]); emit_mem_op(&mut out, OP_I32_LOAD, 2, len_off); emit_local_set(&mut out, fc.val_loc_b[tm.dest_val])
+            emit_local_get(&mut out, fc.val_loc_a[ref_v]); emit_local_get(&mut out, fc.val_loc_a[new_v]); emit_mem_op(&mut out, OP_I32_STORE, 2, 0)
+            emit_local_get(&mut out, fc.val_loc_a[ref_v]); emit_local_get(&mut out, fc.val_loc_b[new_v]); emit_mem_op(&mut out, OP_I32_STORE, 2, len_off)
+        } else if drep != .RepVoid {
+            emit_local_get(&mut out, fc.val_loc_a[ref_v]); emit_scalar_load(&mut out, &types, dty, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+            emit_local_get(&mut out, fc.val_loc_a[ref_v]); emit_local_get(&mut out, fc.val_loc_a[new_v]); emit_scalar_store(&mut out, &types, dty, 0)
+        }
+        return
+    }
+
+    if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_OPT_IS_NONE ||
+        id == hb.INTRINSIC_RES_IS_OK || id == hb.INTRINSIC_RES_IS_ERR {
+        if tm.arg_len >= 1 && tm.dest_val >= 0 {
+            av := f.val_args[tm.arg_start]
+            aty := f.vals[av].ty
+            ak := types.entries[aty].kind
+            if ak == .Ref || ak == .MutRef {
+                inner := types.entries[aty].inner_a
+                if val_rep(&types, inner) == .RepI32 {
+                    emit_local_get(&mut out, fc.val_loc_a[av]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+                } else {
+                    emit_local_get(&mut out, fc.val_loc_a[av]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+                }
+            } else if val_rep(&types, aty) == .RepI32 {
+                emit_local_get(&mut out, fc.val_loc_a[av])
+            } else {
+                emit_local_get(&mut out, fc.val_loc_a[av]); emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+            }
+            want := if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_RES_IS_OK { 0 } else { 1 }
+            b.i32_const(&mut out, want); b.op(&mut out, OP_I32_EQ)
+            emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        }
+        return
+    }
+
+    if (id == hb.INTRINSIC_INT_BIT_OR || id == hb.INTRINSIC_INT_BIT_AND ||
+        id == hb.INTRINSIC_INT_BIT_XOR || id == hb.INTRINSIC_INT_SHL ||
+        id == hb.INTRINSIC_INT_SHR || id == hb.INTRINSIC_INT_WRAPPING_ADD ||
+        id == hb.INTRINSIC_INT_WRAPPING_SUB || id == hb.INTRINSIC_INT_WRAPPING_MUL ||
+        id == hb.INTRINSIC_INT_ROT_L || id == hb.INTRINSIC_INT_ROT_R) && tm.arg_len >= 2 && tm.dest_val >= 0 {
+        a := f.val_args[tm.arg_start]
+        bv := f.val_args[tm.arg_start + 1]
+        dty := f.vals[tm.dest_val].ty
+        dk := types.entries[dty].kind
+        rep := val_rep(&types, dty)
+        uns := is_unsigned_kind(dk)
+        emit_local_get(&mut out, fc.val_loc_a[a])
+        if rep == .RepI64 {
+            emit_push_val_as_i64(&mut out, &types, &f, &fc, bv)
+            if id == hb.INTRINSIC_INT_BIT_OR { b.op(&mut out, OP_I64_OR) }
+            else if id == hb.INTRINSIC_INT_BIT_AND { b.op(&mut out, OP_I64_AND) }
+            else if id == hb.INTRINSIC_INT_BIT_XOR { b.op(&mut out, OP_I64_XOR) }
+            else if id == hb.INTRINSIC_INT_SHL { b.op(&mut out, OP_I64_SHL) }
+            else if id == hb.INTRINSIC_INT_SHR { b.op(&mut out, if uns { OP_I64_SHR_U } else { OP_I64_SHR_S }) }
+            else if id == hb.INTRINSIC_INT_WRAPPING_ADD { b.op(&mut out, OP_I64_ADD) }
+            else if id == hb.INTRINSIC_INT_WRAPPING_SUB { b.op(&mut out, OP_I64_SUB) }
+            else if id == hb.INTRINSIC_INT_WRAPPING_MUL { b.op(&mut out, OP_I64_MUL) }
+            else if id == hb.INTRINSIC_INT_ROT_L { b.op(&mut out, OP_I64_ROTL) }
+            else { b.op(&mut out, OP_I64_ROTR) }
+        } else {
+            emit_push_val_as_i32(&mut out, &types, &f, &fc, bv)
+            if id == hb.INTRINSIC_INT_BIT_OR { b.op(&mut out, OP_I32_OR) }
+            else if id == hb.INTRINSIC_INT_BIT_AND { b.op(&mut out, OP_I32_AND) }
+            else if id == hb.INTRINSIC_INT_BIT_XOR { b.op(&mut out, OP_I32_XOR) }
+            else if id == hb.INTRINSIC_INT_SHL { b.op(&mut out, OP_I32_SHL) }
+            else if id == hb.INTRINSIC_INT_SHR { b.op(&mut out, if uns { OP_I32_SHR_U } else { OP_I32_SHR_S }) }
+            else if id == hb.INTRINSIC_INT_WRAPPING_ADD { b.op(&mut out, OP_I32_ADD) }
+            else if id == hb.INTRINSIC_INT_WRAPPING_SUB { b.op(&mut out, OP_I32_SUB) }
+            else if id == hb.INTRINSIC_INT_WRAPPING_MUL { b.op(&mut out, OP_I32_MUL) }
+            else if id == hb.INTRINSIC_INT_ROT_L { b.op(&mut out, OP_I32_ROTL) }
+            else { b.op(&mut out, OP_I32_ROTR) }
+            emit_narrow_normalize(&mut out, dk)
+        }
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    if (id == hb.INTRINSIC_INT_BIT_NOT || id == hb.INTRINSIC_INT_CLZ ||
+        id == hb.INTRINSIC_INT_CTZ || id == hb.INTRINSIC_INT_POPCNT ||
+        id == hb.INTRINSIC_FLOAT_SQRT || id == hb.INTRINSIC_FLOAT_FLOOR ||
+        id == hb.INTRINSIC_FLOAT_CEIL || id == hb.INTRINSIC_FLOAT_TRUNC ||
+        id == hb.INTRINSIC_FLOAT_ROUND_EVEN || id == hb.INTRINSIC_MATH_ABS) && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        a := f.val_args[tm.arg_start]
+        aty := f.vals[a].ty
+        rep := val_rep(&types, aty)
+        emit_local_get(&mut out, fc.val_loc_a[a])
+        if id == hb.INTRINSIC_INT_BIT_NOT {
+            if rep == .RepI64 { b.constant(&mut out, -1); b.op(&mut out, OP_I64_XOR) }
+            else { b.i32_const(&mut out, -1); b.op(&mut out, OP_I32_XOR); emit_narrow_normalize(&mut out, types.entries[aty].kind) }
+        } else if id == hb.INTRINSIC_INT_CLZ {
+            if rep == .RepI64 { b.op(&mut out, OP_I64_CLZ); if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI32 { b.op(&mut out, OP_I32_WRAP_I64) } }
+            else { b.op(&mut out, OP_I32_CLZ) }
+        } else if id == hb.INTRINSIC_INT_CTZ {
+            if rep == .RepI64 { b.op(&mut out, OP_I64_CTZ); if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI32 { b.op(&mut out, OP_I32_WRAP_I64) } }
+            else { b.op(&mut out, OP_I32_CTZ) }
+        } else if id == hb.INTRINSIC_INT_POPCNT {
+            if rep == .RepI64 { b.op(&mut out, OP_I64_POPCNT); if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI32 { b.op(&mut out, OP_I32_WRAP_I64) } }
+            else { b.op(&mut out, OP_I32_POPCNT) }
+        } else if id == hb.INTRINSIC_FLOAT_SQRT {
+            b.op(&mut out, if rep == .RepF32 { OP_F32_SQRT } else { OP_F64_SQRT })
+        } else if id == hb.INTRINSIC_FLOAT_FLOOR {
+            b.op(&mut out, if rep == .RepF32 { OP_F32_FLOOR } else { OP_F64_FLOOR })
+        } else if id == hb.INTRINSIC_FLOAT_CEIL {
+            b.op(&mut out, if rep == .RepF32 { OP_F32_CEIL } else { OP_F64_CEIL })
+        } else if id == hb.INTRINSIC_FLOAT_TRUNC {
+            b.op(&mut out, if rep == .RepF32 { OP_F32_TRUNC } else { OP_F64_TRUNC })
+        } else if id == hb.INTRINSIC_FLOAT_ROUND_EVEN {
+            b.op(&mut out, if rep == .RepF32 { OP_F32_NEAREST } else { OP_F64_NEAREST })
+        } else if id == hb.INTRINSIC_MATH_ABS {
+            if rep == .RepF32 { b.op(&mut out, OP_F32_ABS) }
+            else if rep == .RepF64 { b.op(&mut out, OP_F64_ABS) }
+            else if rep == .RepI64 {
+                b.constant(&mut out, 0); emit_local_get(&mut out, fc.val_loc_a[a]); b.op(&mut out, OP_I64_SUB)
+                emit_local_get(&mut out, fc.val_loc_a[a]); b.constant(&mut out, 0); b.op(&mut out, OP_I64_GE_S)
+                b.op(&mut out, OP_SELECT)
+            } else {
+                b.i32_const(&mut out, 0); emit_local_get(&mut out, fc.val_loc_a[a]); b.op(&mut out, OP_I32_SUB)
+                emit_local_get(&mut out, fc.val_loc_a[a]); b.i32_const(&mut out, 0); b.op(&mut out, OP_I32_GE_S)
+                b.op(&mut out, OP_SELECT)
+            }
+        }
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    if id == hb.INTRINSIC_SIZE_OF && tm.dest_val >= 0 {
+        sz := type_size(&types, tm.aux_ty)
+        if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI64 { b.constant(&mut out, i64(sz)) }
+        else { b.i32_const(&mut out, sz) }
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    if id == hb.INTRINSIC_ALIGN_OF && tm.dest_val >= 0 {
+        al := type_align(&types, tm.aux_ty)
+        if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI64 { b.constant(&mut out, i64(al)) }
+        else { b.i32_const(&mut out, al) }
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    if id == hb.INTRINSIC_CAP && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        emit_local_get(&mut out, fc.val_loc_a[av])
+        b.i32_const(&mut out, 4); b.op(&mut out, OP_I32_SUB)
+        emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI64 { b.op(&mut out, OP_I64_EXTEND_I32_U) }
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    if (id == hb.INTRINSIC_PTR_ADDR || id == hb.INTRINSIC_AS_PTR || id == hb.INTRINSIC_AS_MUT_PTR) &&
+        tm.arg_len >= 1 && tm.dest_val >= 0 {
+        emit_local_get(&mut out, fc.val_loc_a[f.val_args[tm.arg_start]])
+        if val_rep(&types, f.vals[tm.dest_val].ty) == .RepI64 { b.op(&mut out, OP_I64_EXTEND_I32_U) }
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    if id == hb.INTRINSIC_PTR_IS_NULL && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        emit_local_get(&mut out, fc.val_loc_a[f.val_args[tm.arg_start]])
+        b.op(&mut out, OP_I32_EQZ)
+        emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+        return
+    }
+
+    // Fallback: zero-init dest_val if non-void so WASM locals remain defined
+    if tm.dest_val >= 0 {
+        dty := f.vals[tm.dest_val].ty
+        drep := val_rep(&types, dty)
+        if drep == .RepI32 { b.i32_const(&mut out, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val]) }
+        else if drep == .RepI64 { b.constant(&mut out, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val]) }
+        else if drep == .RepF32 { emit_f32_const_bits(&mut out, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val]) }
+        else if drep == .RepF64 { emit_f64_const_bits(&mut out, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val]) }
+        else if drep == .RepFat {
+            b.i32_const(&mut out, 0); emit_local_set(&mut out, fc.val_loc_a[tm.dest_val])
+            b.i32_const(&mut out, 0); emit_local_set(&mut out, fc.val_loc_b[tm.dest_val])
+        } else if drep == .RepAgg {
+            buf_off := fc.term_agg_off[tid]
+            emit_local_get(&mut out, fc.fp_local)
+            if buf_off != 0 { b.i32_const(&mut out, buf_off); b.op(&mut out, OP_I32_ADD) }
+            emit_local_tee(&mut out, fc.val_loc_a[tm.dest_val])
+            b.i32_const(&mut out, 0)
+            b.i32_const(&mut out, type_size(&types, dty))
+            emit_mem_fill(&mut out)
+        }
+    }
+}
+
+// =========================================================================
+// Parallel Block-Parameter Edge Copies (Cycle-Safe via WASM Value Stack!)
+// =========================================================================
+
+fn emit_edge_copies(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx,
+    target_bb: i32, arg_start: i32, arg_len: i32) {
+    if arg_len <= 0 || target_bb < 0 || target_bb >= f.blocks.len { return }
+    ps := f.blocks[target_bb].params_start
+    // Step 1: push all edge args onto the WASM stack in forward order
+    for i in 0..arg_len {
+        av := f.val_args[arg_start + i]
+        emit_push_val(&mut out, &types, &f, &fc, av)
+    }
+    // Step 2: pop into destination block-param locals in REVERSE order (zero clobber on swaps!)
+    mut i := arg_len - 1
+    while i >= 0 {
+        pv := f.block_params[ps + i]
+        emit_store_val_result(&mut out, &types, &f, &fc, pv)
+        i -= 1
+    }
+}
+
+// =========================================================================
+// Call & Return Terminator Helpers
+// =========================================================================
+
+fn emit_call_action(ctx: &mut WasmCtx, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &FnCtx, out: &mut []u8, tid: i32) {
+    types := &hir.types
+    tm := f.terms[tid]
+    if tm.kind == .IntrinsicCall {
+        emit_intrinsic_call(&mut ctx, &hir, &f, &fc, &mut out, tid)
+        return
+    }
+
+    has_agg_ret := tm.dest_val >= 0 && val_rep(&types, f.vals[tm.dest_val].ty) == .RepAgg
+    // For IndirectCall with ClosureEnv: push env_ptr first!
+    is_closure_call := tm.kind == .IndirectCall && tm.env_val >= 0
+    if is_closure_call {
+        emit_local_get(&mut out, fc.val_loc_a[tm.env_val])
+    }
+
+    // If callee returns an inline aggregate, allocate/pass its sret buffer address
+    if has_agg_ret {
+        buf_off := fc.term_agg_off[tid]
+        emit_local_get(&mut out, fc.fp_local)
+        if buf_off != 0 { b.i32_const(&mut out, buf_off); b.op(&mut out, OP_I32_ADD) }
+        emit_local_tee(&mut out, fc.val_loc_a[tm.dest_val])
+    }
+
+    // Push all user arguments
+    for ai in 0..tm.arg_len {
+        av := f.val_args[tm.arg_start + ai]
+        emit_push_val(&mut out, &types, &f, &fc, av)
+    }
+
+    // Emit direct call or per-signature typed call_indirect!
+    if tm.kind == .Call || tm.kind == .ExternCall {
+        fid := tm.callee
+        if fid >= 0 && fid < ctx.fn_id_to_wasm.len && ctx.fn_id_to_wasm[fid] >= 0 {
+            emit_call(&mut out, ctx.fn_id_to_wasm[fid])
+        } else {
+            b.op(&mut out, OP_UNREACHABLE)
+            return
+        }
+    } else {
+        // IndirectCall: per-signature typed WASM call_indirect!
+        sig_idx := if tm.sig_ty >= 0 && tm.sig_ty < types.entries.len {
+            intern_sig_for_callable_ty(&mut ctx, &types, tm.sig_ty, is_closure_call)
+        } else {
+            // Fallback: synthesize signature directly from actual call arg/dest types
+            mut ps: []om.WasmValType = []
+            mut rs: []om.WasmValType = []
+            if is_closure_call { ps.push(.I32) }
+            if has_agg_ret { ps.push(.I32) }
+            for ai in 0..tm.arg_len {
+                push_param_wasm_types(&types, f.vals[f.val_args[tm.arg_start + ai]].ty, &mut ps)
+            }
+            if tm.dest_val >= 0 { push_ret_wasm_types(&types, f.vals[tm.dest_val].ty, &mut rs) }
+            intern_sig(&mut ctx, &ps, &rs)
+        }
+        if is_closure_call {
+            // [env_ptr + 0] holds the 1-based table index of the closure body!
+            emit_local_get(&mut out, fc.val_loc_a[tm.env_val])
+            emit_mem_op(&mut out, OP_I32_LOAD, 2, 0)
+        } else {
+            emit_local_get(&mut out, fc.val_loc_a[tm.cond_val])
+        }
+        emit_call_indirect(&mut out, sig_idx)
+    }
+
+    // Receive non-sret return value(s) into native typed local(s)
+    if tm.dest_val >= 0 && !has_agg_ret {
+        emit_store_val_result(&mut out, &types, &f, &fc, tm.dest_val)
+    }
+}
+
+fn emit_scope_action(f: &ssa.SsaFunc, fc: &FnCtx, out: &mut []u8, tid: i32) {
+    tm := f.terms[tid]
+    if tm.kind == .RegionEnter && tm.callee >= 0 && tm.callee < fc.region_hp_locals.len {
+        emit_hp_get(&mut out)
+        emit_local_set(&mut out, fc.region_hp_locals[tm.callee])
+    } else if tm.kind == .RegionExit && tm.callee >= 0 && tm.callee < fc.region_hp_locals.len {
+        emit_local_get(&mut out, fc.region_hp_locals[tm.callee])
+        emit_hp_set(&mut out)
+    }
+    // TaskScopeEnter / TaskScopeJoin: single-threaded WASM no-op
+}
+
+fn emit_epilogue_and_return(out: &mut []u8, types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, ret_val: i32) {
+    rep := val_rep(&types, f.ret_ty)
+    if rep == .RepAgg && ret_val >= 0 && fc.sret_local >= 0 {
+        emit_local_get(&mut out, fc.sret_local)
+        emit_local_get(&mut out, fc.val_loc_a[ret_val])
+        b.i32_const(&mut out, type_size(&types, f.ret_ty))
+        emit_mem_copy(&mut out)
+    }
+    if fc.frame_size > 0 {
+        emit_sp_get(&mut out)
+        b.i32_const(&mut out, fc.frame_size)
+        b.op(&mut out, OP_I32_ADD)
+        emit_sp_set(&mut out)
+    }
+    if rep != .RepVoid && rep != .RepAgg && ret_val >= 0 {
+        emit_push_val(&mut out, &types, &f, &fc, ret_val)
+    }
+    b.op(&mut out, OP_RETURN)
+}
+
+fn emit_block_insts(ctx: &mut WasmCtx, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &mut FnCtx, out: &mut []u8, bb: i32) {
+    is0 := f.blocks[bb].inst_start
+    in0 := f.blocks[bb].inst_len
+    for i in 0..in0 {
+        emit_ssa_inst(&mut ctx, &hir, &f, &mut fc, &mut out, bb, f.block_insts[is0 + i])
+    }
+}
+
+fn emit_fn_prologue(types: &ht.TypeTable, f: &ssa.SsaFunc, fc: &FnCtx, out: &mut []u8) {
+    if fc.frame_size > 0 {
+        emit_sp_get(&mut out)
+        b.i32_const(&mut out, fc.frame_size)
+        b.op(&mut out, OP_I32_SUB)
+        emit_local_tee(&mut out, fc.fp_local)
+        emit_sp_set(&mut out)
+    }
+    // For closure bodies with live capture StackSlots, unpack captures from [env_ptr + 8..]
+    if f.is_closure_body && fc.cap_count > 0 && fc.env_local >= 0 {
+        mut cap_off := 8
+        for ci in 0..fc.cap_count {
+            cty := ht.field_type(&types, f.sig_ty, ci)
+            al := type_align(&types, cty)
+            cap_off = align_up_i32(cap_off, al)
+            sz := type_size(&types, cty)
+            slot_id := 1 + f.param_count + ci
+            if slot_id < fc.slot_offsets.len && fc.slot_offsets[slot_id] >= 0 && fc.fp_local >= 0 {
+                slot_off := fc.slot_offsets[slot_id]
+                emit_local_get(&mut out, fc.fp_local)
+                if slot_off != 0 { b.i32_const(&mut out, slot_off); b.op(&mut out, OP_I32_ADD) }
+                emit_local_get(&mut out, fc.env_local)
+                b.i32_const(&mut out, cap_off); b.op(&mut out, OP_I32_ADD)
+                b.i32_const(&mut out, if sz > 0 { sz } else { 4 })
+                emit_mem_copy(&mut out)
+            }
+            cap_off += if sz > 0 { sz } else { 4 }
+        }
+    }
+}
+
+// =========================================================================
+// Structured CFG Shape Detection & Lowering
+// =========================================================================
+
+// Returns true if `rpo` forms a straight-line chain (no Branch, no Switch, no back-edges).
+fn is_linear_cfg(f: &ssa.SsaFunc, rpo: &[]i32) -> bool {
+    for i in 0..rpo.len {
+        bb := rpo[i]
+        tid := f.blocks[bb].term_id
+        if tid < 0 { return false }
+        tm := f.terms[tid]
+        if tm.kind == .Branch || tm.kind == .Switch { return false }
+        if tm.kind == .Return || tm.kind == .Trap {
+            if i + 1 != rpo.len { return false }
+        } else {
+            if i + 1 >= rpo.len || tm.target_a != rpo[i + 1] { return false }
+        }
+    }
+    rpo.len > 0
+}
+
+// Detects a clean 4-block structured `while` loop:
+//   bb0 -> Goto(hdr) -> Branch(cond, body, exit), body -> Goto(hdr), exit -> Return|Trap
+fn is_simple_while_cfg(f: &ssa.SsaFunc, rpo: &[]i32) -> bool {
+    if rpo.len != 4 { return false }
+    b0 := rpo[0]
+    t0 := f.blocks[b0].term_id
+    if t0 < 0 || f.terms[t0].kind != .Goto { return false }
+    hdr := f.terms[t0].target_a
+    if hdr == b0 || hdr < 0 { return false }
+    th := f.blocks[hdr].term_id
+    if th < 0 || f.terms[th].kind != .Branch { return false }
+    body := f.terms[th].target_a
+    exit_bb := f.terms[th].target_b
+    if body == hdr || exit_bb == hdr || body == exit_bb || body == b0 || exit_bb == b0 { return false }
+    tb := f.blocks[body].term_id
+    te := f.blocks[exit_bb].term_id
+    if tb < 0 || te < 0 { return false }
+    if f.terms[tb].kind != .Goto || f.terms[tb].target_a != hdr { return false }
+    f.terms[te].kind == .Return || f.terms[te].kind == .Trap
+}
+
+// Detects a clean structured `if`/`else` diamond (3 or 4 blocks, zero loops):
+//   b0 -> Branch(cond, b_then, b_else), where b_then and b_else either Return/Trap or Goto(b_join),
+//   and b_join (if present) ends in Return/Trap.
+fn is_simple_if_cfg(f: &ssa.SsaFunc, rpo: &[]i32) -> bool {
+    if rpo.len != 3 && rpo.len != 4 { return false }
+    b0 := rpo[0]
+    t0 := f.blocks[b0].term_id
+    if t0 < 0 || f.terms[t0].kind != .Branch { return false }
+    bt := f.terms[t0].target_a
+    be := f.terms[t0].target_b
+    if bt == b0 || be == b0 || bt == be { return false }
+    tt := f.blocks[bt].term_id
+    te := f.blocks[be].term_id
+    if tt < 0 || te < 0 { return false }
+    kt := f.terms[tt].kind
+    ke := f.terms[te].kind
+    if rpo.len == 3 {
+        return (kt == .Return || kt == .Trap) && (ke == .Return || ke == .Trap)
+    }
+    // 4 blocks: at least one goes to a shared join block which returns/traps
+    mut join := -1
+    if kt == .Goto { join = f.terms[tt].target_a }
+    else if ke == .Goto { join = f.terms[te].target_a }
+    if join < 0 || join == b0 || join == bt || join == be { return false }
+    ok_t := (kt == .Goto && f.terms[tt].target_a == join) || kt == .Return || kt == .Trap
+    ok_e := (ke == .Goto && f.terms[te].target_a == join) || ke == .Return || ke == .Trap
+    if !ok_t || !ok_e { return false }
+    tj := f.blocks[join].term_id
+    tj >= 0 && (f.terms[tj].kind == .Return || f.terms[tj].kind == .Trap)
+}
+
+fn emit_dispatch_jump(out: &mut []u8, fc: &FnCtx, target_dense: i32, cur_dense: i32, n_blocks: i32, extra_depth: i32) {
+    b.i32_const(&mut out, target_dense)
+    emit_local_set(&mut out, fc.pc_local)
+    b.indexed(&mut out, OP_BR, (n_blocks - 1 - cur_dense) + extra_depth)
+}
+
+fn emit_function_body(ctx: &mut WasmCtx, hir: &hb.HirProgram, f: &ssa.SsaFunc) -> []u8 {
+    types := &hir.types
+    dom := ssa.compute_doms(&f)
+    rpo := &dom.rpo_order
+    n_blocks := rpo.len
+
+    linear := is_linear_cfg(&f, &rpo)
+    simple_while := !linear && is_simple_while_cfg(&f, &rpo)
+    simple_if := !linear && !simple_while && is_simple_if_cfg(&f, &rpo)
+    needs_dispatch := !linear && !simple_while && !simple_if
+
+    mut fc := build_fn_ctx(&types, &f, needs_dispatch)
+    mut out: []u8 = []
+    emit_local_decls(&mut out, fc.n_decl_i32, fc.n_decl_i64, fc.n_decl_f32, fc.n_decl_f64)
+    emit_fn_prologue(&types, &f, &fc, &mut out)
+
+    if n_blocks == 0 {
+        b.op(&mut out, OP_UNREACHABLE)
+        b.op(&mut out, OP_END)
+        return out
+    }
+
+    // --- Fast-path 1: Straight-line linear CFG (0 $pc, 0 loop, 0 br_table) ---
+    if linear {
+        for i in 0..n_blocks {
+            bb := rpo[i]
+            emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, bb)
+            tid := f.blocks[bb].term_id
+            tm := f.terms[tid]
+            if tm.kind == .Goto {
+                emit_edge_copies(&mut out, &types, &f, &fc, tm.target_a, tm.arg_start, tm.arg_len)
+            } else if tm.kind == .Call || tm.kind == .IndirectCall || tm.kind == .ExternCall || tm.kind == .IntrinsicCall {
+                emit_call_action(&mut ctx, &hir, &f, &fc, &mut out, tid)
+            } else if tm.kind == .RegionEnter || tm.kind == .RegionExit || tm.kind == .TaskScopeEnter || tm.kind == .TaskScopeJoin {
+                emit_scope_action(&f, &fc, &mut out, tid)
+            } else if tm.kind == .Return {
+                emit_epilogue_and_return(&mut out, &types, &f, &fc, tm.cond_val)
+            } else if tm.kind == .Trap {
+                b.i32_const(&mut out, tm.callee)
+                emit_call(&mut out, ctx.fn_rt_trap)
+                b.op(&mut out, OP_UNREACHABLE)
+            }
+        }
+        b.op(&mut out, OP_END)
+        return out
+    }
+
+    // --- Fast-path 2: Clean structured `if`/`else` diamond (native WASM if/else, 0 $pc) ---
+    if simple_if {
+        b0 := rpo[0]
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, b0)
+        tm0 := f.terms[f.blocks[b0].term_id]
+        bt := tm0.target_a
+        be := tm0.target_b
+        mut join := -1
+        if f.terms[f.blocks[bt].term_id].kind == .Goto { join = f.terms[f.blocks[bt].term_id].target_a }
+        else if f.terms[f.blocks[be].term_id].kind == .Goto { join = f.terms[f.blocks[be].term_id].target_a }
+
+        emit_local_get(&mut out, fc.val_loc_a[tm0.cond_val])
+        b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+        emit_edge_copies(&mut out, &types, &f, &fc, bt, tm0.arg_start, tm0.arg_len)
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, bt)
+        tmt := f.terms[f.blocks[bt].term_id]
+        if tmt.kind == .Goto {
+            emit_edge_copies(&mut out, &types, &f, &fc, tmt.target_a, tmt.arg_start, tmt.arg_len)
+        } else if tmt.kind == .Return {
+            emit_epilogue_and_return(&mut out, &types, &f, &fc, tmt.cond_val)
+        } else if tmt.kind == .Trap {
+            b.i32_const(&mut out, tmt.callee); emit_call(&mut out, ctx.fn_rt_trap); b.op(&mut out, OP_UNREACHABLE)
+        }
+        b.op(&mut out, OP_ELSE)
+        emit_edge_copies(&mut out, &types, &f, &fc, be, tm0.arg2_start, tm0.arg2_len)
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, be)
+        tme := f.terms[f.blocks[be].term_id]
+        if tme.kind == .Goto {
+            emit_edge_copies(&mut out, &types, &f, &fc, tme.target_a, tme.arg_start, tme.arg_len)
+        } else if tme.kind == .Return {
+            emit_epilogue_and_return(&mut out, &types, &f, &fc, tme.cond_val)
+        } else if tme.kind == .Trap {
+            b.i32_const(&mut out, tme.callee); emit_call(&mut out, ctx.fn_rt_trap); b.op(&mut out, OP_UNREACHABLE)
+        }
+        b.op(&mut out, OP_END)
+
+        if join >= 0 {
+            emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, join)
+            tmj := f.terms[f.blocks[join].term_id]
+            if tmj.kind == .Return {
+                emit_epilogue_and_return(&mut out, &types, &f, &fc, tmj.cond_val)
+            } else {
+                b.i32_const(&mut out, tmj.callee); emit_call(&mut out, ctx.fn_rt_trap); b.op(&mut out, OP_UNREACHABLE)
+            }
+        } else {
+            b.op(&mut out, OP_UNREACHABLE)
+        }
+        b.op(&mut out, OP_END)
+        return out
+    }
+
+    // --- Fast-path 3: Clean structured `while` loop (native WASM block/loop/br_if/br, 0 $pc) ---
+    if simple_while {
+        b0 := rpo[0]
+        tm0 := f.terms[f.blocks[b0].term_id]
+        hdr := tm0.target_a
+        tmh := f.terms[f.blocks[hdr].term_id]
+        body := tmh.target_a
+        exit_bb := tmh.target_b
+        tmb := f.terms[f.blocks[body].term_id]
+        tme := f.terms[f.blocks[exit_bb].term_id]
+
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, b0)
+        emit_edge_copies(&mut out, &types, &f, &fc, hdr, tm0.arg_start, tm0.arg_len)
+
+        b.op(&mut out, OP_BLOCK); b.op(&mut out, BT_VOID) // $exit (depth 1 from loop, 2 from if)
+        b.op(&mut out, OP_LOOP); b.op(&mut out, BT_VOID)  // $hdr  (depth 0 from loop)
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, hdr)
+        emit_local_get(&mut out, fc.val_loc_a[tmh.cond_val])
+        b.op(&mut out, OP_I32_EQZ)
+        b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+        emit_edge_copies(&mut out, &types, &f, &fc, exit_bb, tmh.arg2_start, tmh.arg2_len)
+        b.indexed(&mut out, OP_BR, 2) // break out of $exit
+        b.op(&mut out, OP_END)
+
+        emit_edge_copies(&mut out, &types, &f, &fc, body, tmh.arg_start, tmh.arg_len)
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, body)
+        emit_edge_copies(&mut out, &types, &f, &fc, hdr, tmb.arg_start, tmb.arg_len)
+        b.indexed(&mut out, OP_BR, 0) // continue $hdr
+        b.op(&mut out, OP_END) // end loop
+        b.op(&mut out, OP_END) // end block $exit
+
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, exit_bb)
+        if tme.kind == .Return {
+            emit_epilogue_and_return(&mut out, &types, &f, &fc, tme.cond_val)
+        } else {
+            b.i32_const(&mut out, tme.callee); emit_call(&mut out, ctx.fn_rt_trap); b.op(&mut out, OP_UNREACHABLE)
+        }
+        b.op(&mut out, OP_END)
+        return out
+    }
+
+    // --- General Path: Block-Dispatch Loop with `$pc` local (handles ANY arbitrary SSA CFG) ---
+    mut bb_to_dense: []i32 = []
+    for _ in 0..f.blocks.len { bb_to_dense.push(-1) }
+    for di in 0..n_blocks { bb_to_dense[rpo[di]] = di }
+
+    // (loop $dispatch (block $b_{N-1} ... (block $b_0 (local.get $pc) (br_table 0..N-1 0)) ...))
+    b.op(&mut out, OP_LOOP); b.op(&mut out, BT_VOID)
+    for _ in 0..n_blocks {
+        b.op(&mut out, OP_BLOCK); b.op(&mut out, BT_VOID)
+    }
+    emit_local_get(&mut out, fc.pc_local)
+    b.indexed(&mut out, OP_BR_TABLE, n_blocks)
+    for di in 0..n_blocks { b.uleb(&mut out, di) }
+    b.uleb(&mut out, 0) // default label
+
+    for di in 0..n_blocks {
+        b.op(&mut out, OP_END) // end $b_{di} -> code for dense block `di` starts here!
+        bb := rpo[di]
+        emit_block_insts(&mut ctx, &hir, &f, &mut fc, &mut out, bb)
+        tid := f.blocks[bb].term_id
+        if tid < 0 {
+            b.op(&mut out, OP_UNREACHABLE)
+            continue
+        }
+        tm := f.terms[tid]
+        if tm.kind == .Goto {
+            emit_edge_copies(&mut out, &types, &f, &fc, tm.target_a, tm.arg_start, tm.arg_len)
+            dst_d := bb_to_dense[tm.target_a]
+            if dst_d != di + 1 {
+                emit_dispatch_jump(&mut out, &fc, dst_d, di, n_blocks, 0)
+            }
+        } else if tm.kind == .Branch {
+            emit_local_get(&mut out, fc.val_loc_a[tm.cond_val])
+            b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+            emit_edge_copies(&mut out, &types, &f, &fc, tm.target_a, tm.arg_start, tm.arg_len)
+            emit_dispatch_jump(&mut out, &fc, bb_to_dense[tm.target_a], di, n_blocks, 1)
+            b.op(&mut out, OP_ELSE)
+            emit_edge_copies(&mut out, &types, &f, &fc, tm.target_b, tm.arg2_start, tm.arg2_len)
+            emit_dispatch_jump(&mut out, &fc, bb_to_dense[tm.target_b], di, n_blocks, 1)
+            b.op(&mut out, OP_END)
+        } else if tm.kind == .Switch {
+            c_ty := f.vals[tm.cond_val].ty
+            is64 := val_rep(&types, c_ty) == .RepI64
+            for ci in 0..tm.case_len {
+                emit_local_get(&mut out, fc.val_loc_a[tm.cond_val])
+                if is64 {
+                    b.constant(&mut out, f.switch_vals[tm.case_start + ci])
+                    b.op(&mut out, OP_I64_EQ)
+                } else {
+                    emit_i32_const_from_i64(&mut out, f.switch_vals[tm.case_start + ci])
+                    b.op(&mut out, OP_I32_EQ)
+                }
+                b.op(&mut out, OP_IF); b.op(&mut out, BT_VOID)
+                c_bb := f.switch_bbs[tm.case_start + ci]
+                emit_edge_copies(&mut out, &types, &f, &fc, c_bb,
+                    f.switch_arg_starts[tm.case_start + ci], f.switch_arg_lens[tm.case_start + ci])
+                emit_dispatch_jump(&mut out, &fc, bb_to_dense[c_bb], di, n_blocks, 1)
+                b.op(&mut out, OP_END)
+            }
+            emit_edge_copies(&mut out, &types, &f, &fc, tm.target_a, tm.arg_start, tm.arg_len)
+            dst_d := bb_to_dense[tm.target_a]
+            if dst_d != di + 1 {
+                emit_dispatch_jump(&mut out, &fc, dst_d, di, n_blocks, 0)
+            }
+        } else if tm.kind == .Call || tm.kind == .IndirectCall || tm.kind == .ExternCall || tm.kind == .IntrinsicCall {
+            emit_call_action(&mut ctx, &hir, &f, &fc, &mut out, tid)
+            if tm.target_a >= 0 {
+                dst_d := bb_to_dense[tm.target_a]
+                if dst_d != di + 1 {
+                    emit_dispatch_jump(&mut out, &fc, dst_d, di, n_blocks, 0)
+                }
+            }
+        } else if tm.kind == .RegionEnter || tm.kind == .RegionExit || tm.kind == .TaskScopeEnter || tm.kind == .TaskScopeJoin {
+            emit_scope_action(&f, &fc, &mut out, tid)
+            if tm.target_a >= 0 {
+                dst_d := bb_to_dense[tm.target_a]
+                if dst_d != di + 1 {
+                    emit_dispatch_jump(&mut out, &fc, dst_d, di, n_blocks, 0)
+                }
+            }
+        } else if tm.kind == .Return {
+            emit_epilogue_and_return(&mut out, &types, &f, &fc, tm.cond_val)
+        } else if tm.kind == .Trap {
+            b.i32_const(&mut out, tm.callee)
+            emit_call(&mut out, ctx.fn_rt_trap)
+            b.op(&mut out, OP_UNREACHABLE)
+        }
+    }
+
+    b.op(&mut out, OP_END) // end $dispatch loop
+    b.op(&mut out, OP_UNREACHABLE)
+    b.op(&mut out, OP_END) // end function
+    out
+}
+
+// =========================================================================
+// WASI `_start` Wrapper Emitter
+// =========================================================================
+
+fn emit_wasi_start_body(entry_wasm_fn: i32, entry_ret_rep: ValRep, fn_proc_exit: i32) -> []u8 {
+    mut out: []u8 = []
+    emit_local_decls(&mut out, 0, 0, 0, 0)
+    emit_call(&mut out, entry_wasm_fn)
+    if entry_ret_rep == .RepI32 {
+        emit_call(&mut out, fn_proc_exit)
+    } else if entry_ret_rep == .RepI64 {
+        b.op(&mut out, OP_I32_WRAP_I64)
+        emit_call(&mut out, fn_proc_exit)
+    } else if entry_ret_rep == .RepF32 || entry_ret_rep == .RepF64 {
+        b.op(&mut out, OP_DROP)
+    } else if entry_ret_rep == .RepFat {
+        b.op(&mut out, OP_DROP)
+        b.op(&mut out, OP_DROP)
+    }
+    b.op(&mut out, OP_END)
+    out
+}
+
+// =========================================================================
+// Public Entry Point: `emit_wasm`
+// =========================================================================
+
+pub fn emit_wasm(prog: &ssa.SsaProgram, hir: &hb.HirProgram, is_wasi: bool) -> []u8 {
+    types := &hir.types
+    mut ctx := new_ctx(is_wasi)
+
+    // 1. Register WASI imports (fd_write, proc_exit) first when is_wasi
+    empty_vt: []om.WasmValType = []
+    if is_wasi {
+        fd_p: []om.WasmValType = [.I32, .I32, .I32, .I32]
+        fd_r: []om.WasmValType = [.I32]
+        sig_fd := intern_sig(&mut ctx, &fd_p, &fd_r)
+        ctx.fn_wasi_fd_write = ctx.imports.len
+        ctx.imports.push(ImportEntry { module_name: "wasi_snapshot_preview1", field_name: "fd_write", sig_idx: sig_fd })
+
+        ex_p: []om.WasmValType = [.I32]
+        sig_ex := intern_sig(&mut ctx, &ex_p, &empty_vt)
+        ctx.fn_wasi_proc_exit = ctx.imports.len
+        ctx.imports.push(ImportEntry { module_name: "wasi_snapshot_preview1", field_name: "proc_exit", sig_idx: sig_ex })
+    }
+
+    // 2. Register any extern functions from HIR/SSA as WASM imports
+    for fi in 0..hir.fns.len {
+        hf := &hir.fns[fi]
+        if !hf.is_extern { continue }
+        ensure_fn_maps(&mut ctx, hf.id)
+        sig_idx := if hf.sig_ty >= 0 && hf.sig_ty < types.entries.len {
+            intern_sig_for_callable_ty(&mut ctx, &types, hf.sig_ty, false)
+        } else {
+            intern_sig(&mut ctx, &empty_vt, &empty_vt)
+        }
+        w_idx := ctx.imports.len
+        mod_n := if hf.extern_lib.len > 0 { hf.extern_lib.clone() } else { "env" }
+        sym_n := if hf.extern_symbol.len > 0 { hf.extern_symbol.clone() } else { hf.name.clone() }
+        ctx.imports.push(ImportEntry { module_name: move mod_n, field_name: move sym_n, sig_idx: sig_idx })
+        ctx.fn_id_to_wasm[hf.id] = w_idx
+        ctx.fn_id_to_sig[hf.id] = sig_idx
+    }
+
+    n_imports := ctx.imports.len
+
+    // 3. Register native-local runtime helper functions (defined indices start at n_imports)
+    p_i32: []om.WasmValType = [.I32]
+    r_i32: []om.WasmValType = [.I32]
+    sig_alloc := intern_sig(&mut ctx, &p_i32, &r_i32)
+    ctx.fn_rt_alloc = n_imports + ctx.defined_sigs.len
+    ctx.defined_sigs.push(sig_alloc)
+
+    p_3i32: []om.WasmValType = [.I32, .I32, .I32]
+    sig_mem_eq := intern_sig(&mut ctx, &p_3i32, &r_i32)
+    ctx.fn_rt_mem_eq = n_imports + ctx.defined_sigs.len
+    ctx.defined_sigs.push(sig_mem_eq)
+
+    p_4i32: []om.WasmValType = [.I32, .I32, .I32, .I32]
+    sig_concat := intern_sig(&mut ctx, &p_4i32, &r_i32)
+    ctx.fn_rt_str_concat = n_imports + ctx.defined_sigs.len
+    ctx.defined_sigs.push(sig_concat)
+
+    sig_trap := intern_sig(&mut ctx, &p_i32, &empty_vt)
+    ctx.fn_rt_trap = n_imports + ctx.defined_sigs.len
+    ctx.defined_sigs.push(sig_trap)
+
+    if is_wasi {
+        sig_w := intern_sig(&mut ctx, &p_3i32, &empty_vt)
+        ctx.fn_rt_wasi_write = n_imports + ctx.defined_sigs.len
+        ctx.defined_sigs.push(sig_w)
+
+        p_pi64: []om.WasmValType = [.I32, .I64, .I32]
+        sig_pi64 := intern_sig(&mut ctx, &p_pi64, &empty_vt)
+        ctx.fn_rt_wasi_print_i64 = n_imports + ctx.defined_sigs.len
+        ctx.defined_sigs.push(sig_pi64)
+
+        p_pb: []om.WasmValType = [.I32, .I32]
+        sig_pb := intern_sig(&mut ctx, &p_pb, &empty_vt)
+        ctx.fn_rt_wasi_print_bool = n_imports + ctx.defined_sigs.len
+        ctx.defined_sigs.push(sig_pb)
+    }
+
+    // 4. Pre-assign WASM function indices & deduplicated WasmSigs for all defined SsaFuncs
+    for i in 0..prog.funcs.len {
+        sf := &prog.funcs[i]
+        if sf.is_extern { continue }
+        ensure_fn_maps(&mut ctx, sf.fn_id)
+        sig_idx := intern_sig_for_ssa_func(&mut ctx, &types, &sf)
+        w_idx := n_imports + ctx.defined_sigs.len
+        ctx.defined_sigs.push(sig_idx)
+        ctx.fn_id_to_wasm[sf.fn_id] = w_idx
+        ctx.fn_id_to_sig[sf.fn_id] = sig_idx
+    }
+
+    // Optional WASI `_start` wrapper calling prog.entry_fn
+    mut has_wasi_start := false
+    mut entry_wasm := -1
+    mut entry_ret_rep: ValRep = .RepVoid
+    if is_wasi && prog.entry_fn >= 0 && prog.entry_fn < ctx.fn_id_to_wasm.len && ctx.fn_id_to_wasm[prog.entry_fn] >= 0 {
+        entry_wasm = ctx.fn_id_to_wasm[prog.entry_fn]
+        eidx := if prog.entry_fn < prog.fn_id_to_idx.len { prog.fn_id_to_idx[prog.entry_fn] } else { -1 }
+        if eidx >= 0 && eidx < prog.funcs.len {
+            entry_ret_rep = val_rep(&types, prog.funcs[eidx].ret_ty)
+        }
+        if entry_ret_rep != .RepAgg {
+            sig_void := intern_sig(&mut ctx, &empty_vt, &empty_vt)
+            ctx.start_wasm_fn = n_imports + ctx.defined_sigs.len
+            ctx.defined_sigs.push(sig_void)
+            has_wasi_start = true
+        }
+    }
+
+    // 5. Compile all defined function bodies (this also populates ctx.rodata, ctx.table_funcs, and call_indirect sigs!)
+    mut code_sec: []u8 = []
+    b.uleb(&mut code_sec, ctx.defined_sigs.len)
+
+    mut body_buf: []u8 = []
+    emit_rt_alloc_body(&mut body_buf); b.blob(&mut code_sec, &body_buf)
+    body_buf.clear(); emit_rt_mem_eq_body(&mut body_buf); b.blob(&mut code_sec, &body_buf)
+    body_buf.clear(); emit_rt_str_concat_body(&mut body_buf, ctx.fn_rt_alloc); b.blob(&mut code_sec, &body_buf)
+    body_buf.clear(); emit_rt_trap_body(&mut body_buf, is_wasi, ctx.fn_wasi_proc_exit); b.blob(&mut code_sec, &body_buf)
+    if is_wasi {
+        body_buf.clear(); emit_rt_wasi_write_body(&mut body_buf, ctx.fn_wasi_fd_write); b.blob(&mut code_sec, &body_buf)
+        body_buf.clear(); emit_rt_wasi_print_i64_body(&mut body_buf, ctx.fn_wasi_fd_write); b.blob(&mut code_sec, &body_buf)
+        body_buf.clear(); emit_rt_wasi_print_bool_body(&mut body_buf, ctx.fn_wasi_fd_write); b.blob(&mut code_sec, &body_buf)
+    }
+
+    for i in 0..prog.funcs.len {
+        sf := &prog.funcs[i]
+        if sf.is_extern { continue }
+        fn_body := emit_function_body(&mut ctx, &hir, &sf)
+        b.blob(&mut code_sec, &fn_body)
+    }
+
+    if has_wasi_start {
+        st_body := emit_wasi_start_body(entry_wasm, entry_ret_rep, ctx.fn_wasi_proc_exit)
+        b.blob(&mut code_sec, &st_body)
+    }
+
+    // 6. Compute final linear-memory layout
+    stack_bottom := align_up_i32(DATA_BASE + ctx.rodata.len, 16)
+    stack_top := stack_bottom + STACK_BYTES
+    heap_start := stack_top
+    init_pages := (heap_start + 65536 + 65535) / 65536
+
+    // 7. Assemble final .wasm binary in canonical section order (1..11)
+    mut out: []u8 = [0, 97, 115, 109, 1, 0, 0, 0] // \0asm v1
+    mut sec: []u8 = []
+
+    // Section 1: Type section (all deduplicated WasmSigs from ctx.obj!)
+    b.uleb(&mut sec, ctx.obj.wasm_fn_types.len)
+    for si in 0..ctx.obj.wasm_fn_types.len {
+        sig := ctx.obj.wasm_fn_types[si]
+        b.op(&mut sec, 96) // 0x60 func type
+        b.uleb(&mut sec, sig.param_len)
+        for pi in 0..sig.param_len {
+            b.op(&mut sec, wasm_vt_byte(ctx.obj.wasm_val_types[sig.param_start + pi]))
+        }
+        b.uleb(&mut sec, sig.ret_len)
+        for ri in 0..sig.ret_len {
+            b.op(&mut sec, wasm_vt_byte(ctx.obj.wasm_val_types[sig.ret_start + ri]))
+        }
+    }
+    b.section(&mut out, 1, &sec)
+
+    // Section 2: Import section (only if imports exist)
+    if ctx.imports.len > 0 {
+        sec.clear()
+        b.uleb(&mut sec, ctx.imports.len)
+        for i in 0..ctx.imports.len {
+            imp := &ctx.imports[i]
+            b.name(&mut sec, imp.module_name)
+            b.name(&mut sec, imp.field_name)
+            b.op(&mut sec, 0) // func import
+            b.uleb(&mut sec, imp.sig_idx)
+        }
+        b.section(&mut out, 2, &sec)
+    }
+
+    // Section 3: Function section
+    sec.clear()
+    b.uleb(&mut sec, ctx.defined_sigs.len)
+    for i in 0..ctx.defined_sigs.len { b.uleb(&mut sec, ctx.defined_sigs[i]) }
+    b.section(&mut out, 3, &sec)
+
+    // Section 4: Table section (funcref table for per-signature typed call_indirect)
+    sec.clear()
+    b.op(&mut sec, 1)    // 1 table
+    b.op(&mut sec, 112)  // 0x70 funcref
+    b.op(&mut sec, 0)    // limits: min only
+    b.uleb(&mut sec, ctx.table_funcs.len + 1)
+    b.section(&mut out, 4, &sec)
+
+    // Section 5: Memory section
+    sec.clear()
+    b.op(&mut sec, 1)    // 1 memory
+    b.op(&mut sec, 0)    // limits: min only
+    b.uleb(&mut sec, init_pages)
+    b.section(&mut out, 5, &sec)
+
+    // Section 6: Global section — ONLY 2 native linear-memory globals ($sp = 0, $hp = 1)!
+    sec.clear()
+    b.uleb(&mut sec, 2)
+    // Global 0: $sp (mut i32 = stack_top)
+    b.op(&mut sec, VT_I32); b.op(&mut sec, 1); b.i32_const(&mut sec, stack_top); b.op(&mut sec, OP_END)
+    // Global 1: $hp (mut i32 = heap_start)
+    b.op(&mut sec, VT_I32); b.op(&mut sec, 1); b.i32_const(&mut sec, heap_start); b.op(&mut sec, OP_END)
+    b.section(&mut out, 6, &sec)
+
+    // Section 7: Export section (memory, __indirect_function_table, _start, and user functions)
+    mut exports: []ExportEntry = []
+    exports.push(ExportEntry { name: "memory", kind: 2, idx: 0 })
+    exports.push(ExportEntry { name: "__indirect_function_table", kind: 1, idx: 0 })
+    if has_wasi_start {
+        exports.push(ExportEntry { name: "_start", kind: 0, idx: ctx.start_wasm_fn })
+    }
+    for i in 0..prog.funcs.len {
+        sf := &prog.funcs[i]
+        if sf.is_extern || sf.is_closure_body { continue }
+        if sf.fn_id < 0 || sf.fn_id >= ctx.fn_id_to_wasm.len || ctx.fn_id_to_wasm[sf.fn_id] < 0 { continue }
+        mut dup := false
+        for k in 0..exports.len {
+            if exports[k].name == sf.name { dup = true; break }
+        }
+        if !dup {
+            exports.push(ExportEntry { name: sf.name.clone(), kind: 0, idx: ctx.fn_id_to_wasm[sf.fn_id] })
+        }
+    }
+    sec.clear()
+    b.uleb(&mut sec, exports.len)
+    for i in 0..exports.len {
+        ex := &exports[i]
+        b.name(&mut sec, ex.name)
+        b.indexed(&mut sec, ex.kind, ex.idx)
+    }
+    b.section(&mut out, 7, &sec)
+
+    // Section 9: Element section (active funcref table initialization starting at slot 1)
+    if ctx.table_funcs.len > 0 {
+        sec.clear()
+        b.op(&mut sec, 1) // 1 segment
+        b.op(&mut sec, 0) // table 0 active
+        b.i32_const(&mut sec, 1); b.op(&mut sec, OP_END)
+        b.uleb(&mut sec, ctx.table_funcs.len)
+        for i in 0..ctx.table_funcs.len { b.uleb(&mut sec, ctx.table_funcs[i]) }
+        b.section(&mut out, 9, &sec)
+    }
+
+    // Section 10: Code section
+    b.section(&mut out, 10, &code_sec)
+
+    // Section 11: Data section (static rodata at DATA_BASE)
+    if ctx.rodata.len > 0 {
+        sec.clear()
+        b.op(&mut sec, 1) // 1 active segment
+        b.op(&mut sec, 0) // memory 0
+        b.i32_const(&mut sec, DATA_BASE); b.op(&mut sec, OP_END)
+        b.blob(&mut sec, &ctx.rodata)
+        b.section(&mut out, 11, &sec)
+    }
+
+    out
+}
