@@ -1,0 +1,3927 @@
+// Phase 4A: Native ARM64 LIR/ISel + Linear-Scan Register Allocator (`selfhost/backend/arm64_isel.ddr`).
+// Direct lowering: `selfhost/ssa/ssa_ir` -> `selfhost/backend/arm64_enc` -> `selfhost/backend/object_module`.
+// ZERO imports of `compile.ddr`, `selfhost/mir/*`, `selfhost/mir2/*`, or legacy `arm64.ddr`.
+//
+// Register Discipline (Native ARM64 AAPCS64 + Per-Thread Arena Reservation):
+// - Reserved per-thread arena regs (NEVER allocated/clobbered): x19 (cursor), x20 (end), x21 (slab root)
+// - Platform reserved: x18 (Darwin), x29 (FP), x30 (LR), sp/xzr (31)
+// - Allocatable GP callee-saved: x22..x28 (7 regs, live across calls)
+// - Allocatable GP caller-saved: x9..x15 (7 regs, non-call-crossing intervals)
+// - Allocatable FP callee-saved: d8..d15 (8 regs, live across calls)
+// - Allocatable FP caller-saved: d0..d7 (8 regs, non-call-crossing intervals)
+// - Scratch/ABI regs (never allocated to live intervals): x0..x8, x16, x17; FP scratch: d16, d17
+//
+// Calling Convention:
+// - Scalars: x0..x7 (overflow on stack), return in x0
+// - Floats (f32/f64): d0..d7 (overflow on stack), return in d0
+// - First-class 2-word FatStr/FatSlice/RegionSlice: 2 GP regs (ptr, len), return in (x0, x1)
+// - Inline aggregates <= 16B: 1-2 GP regs, return in x0 / (x0, x1); > 16B: ptr arg & indirect sret in x8
+// - Closures: env_ptr passed in x9 (loaded right before blr x16, saved at top of closure prologue)
+
+import std.bytes as bytes
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ..ssa.ssa_ir as ssa
+import arm64_enc as a64
+import object_module as obj
+import imports as native_imports
+import macho
+import elf
+
+// =========================================================================
+// 1. Value Classification & Register Allocation Plan
+// =========================================================================
+
+pub enum ValClass {
+    Void,
+    Gp,     // single GP reg (scalars, bool, ptr, refs, String, Array, FnPtr, ClosureEnv, small enum <= 4B)
+    Fp,     // single FP reg (f32 / f64)
+    Fat,    // 2-word GP pair (ptr, len) for FatStr / FatSlice / RegionSlice
+    Agg,    // memory-backed stack home (Struct, Tuple, Union, FixedArr, Range, payload Enum > 4B)
+}
+
+pub enum LocKind {
+    None,
+    Reg,    // GP reg (or FP reg for ValClass.Fp); Fat uses (reg_lo, reg_hi)
+    Spill,  // negative byte offset from FP: [fp - spill_off]
+    AggHome,// negative byte offset from FP: [fp - spill_off] of agg size bytes
+}
+
+pub struct ValLoc {
+    cls: ValClass,
+    kind: LocKind,
+    reg_lo: i32,
+    reg_hi: i32,
+    spill_off: i32, // positive magnitude -> stored at [fp - spill_off]
+    is_f64: bool,
+}
+
+pub struct RegAllocPlan {
+    rpo: []i32,
+    locs: []ValLoc,
+    used_callee_gp: []i32,
+    used_callee_fp: []i32,
+    spill_count: i32,
+    live_starts: []i32,
+    live_ends: []i32,
+    crosses_call: []bool,
+}
+
+pub fn classify_type(types: &ht.TypeTable, ty: i32) -> ValClass {
+    if ty < 0 || ty >= types.entries.len { return .Void }
+    te := &types.entries[ty]
+    k := te.kind
+    if k == .Unit || k == .Error || te.size == 0 { return .Void }
+    if k == .F32 || k == .F64 { return .Fp }
+    if k == .FatStr || k == .FatSlice || k == .RegionSlice { return .Fat }
+    if k == .Bool || k == .I8 || k == .I16 || k == .I32 || k == .I64 || k == .Isize ||
+        k == .U8 || k == .U16 || k == .U32 || k == .U64 || k == .Usize ||
+        k == .Rune || k == .Ptr || k == .String || k == .Array || k == .CStr || k == .WStr ||
+        k == .Ref || k == .MutRef || k == .RawConst || k == .RawMut ||
+        k == .FnPtr || k == .ExternFn || k == .ClosureEnv || k == .Task {
+        return .Gp
+    }
+    if k == .Enum && te.size <= 4 { return .Gp }
+    .Agg
+}
+
+fn type_size(types: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= types.entries.len { return 0 }
+    types.entries[ty].size
+}
+
+fn type_align(types: &ht.TypeTable, ty: i32) -> i32 {
+    if ty < 0 || ty >= types.entries.len { return 1 }
+    al := types.entries[ty].align
+    if al < 1 { 1 } else { al }
+}
+
+fn align_up_i32(v: i32, al: i32) -> i32 {
+    if al <= 1 { return v }
+    rem := v % al
+    if rem == 0 { v } else { v + (al - rem) }
+}
+
+fn is_signed_int_ty(types: &ht.TypeTable, ty: i32) -> bool {
+    if ty < 0 || ty >= types.entries.len { return false }
+    k := types.entries[ty].kind
+    k == .I8 || k == .I16 || k == .I32 || k == .I64 || k == .Isize
+}
+
+fn is_f64_ty(types: &ht.TypeTable, ty: i32) -> bool {
+    ty >= 0 && ty < types.entries.len && types.entries[ty].kind == .F64
+}
+
+fn enum_payload_offset(types: &ht.TypeTable, enum_ty: i32, var_idx: i32, field_idx: i32) -> i32 {
+    te := &types.entries[enum_ty]
+    al := if te.align > 0 { te.align } else { 4 }
+    tag_aligned := align_up_i32(4, al)
+    v := &types.variants[te.inner_a + var_idx]
+    f := &types.fields[v.payload_start + field_idx]
+    tag_aligned + f.offset
+}
+
+fn inst_clobbers_caller_saved(types: &ht.TypeTable, ins: &ssa.SsaInst) -> bool {
+    k := ins.kind
+    if k == .AllocHeap || k == .ClosureMake { return true }
+    if (k == .MemCopy || k == .MemZero) && ins.imm_i64 > 64 { return true }
+    if k == .Binary && ins.op_a >= 0 {
+        // String and FatStr binary ops call runtime concat/eq/cmp helpers
+        // Checked via operand type by caller; here check ins.ty or aux
+        if ins.ty == ht.TY_STRING { return true }
+    }
+    _ := types.sealed
+    false
+}
+
+fn inst_actually_clobbers(types: &ht.TypeTable, f: &ssa.SsaFunc, ins: &ssa.SsaInst) -> bool {
+    if inst_clobbers_caller_saved(&types, &ins) { return true }
+    if ins.kind == .Binary && ins.op_a >= 0 && ins.op_a < f.vals.len {
+        aty := f.vals[ins.op_a].ty
+        if aty >= 0 && aty < types.entries.len {
+            ak := types.entries[aty].kind
+            if ak == .String || ak == .FatStr { return true }
+        }
+    }
+    false
+}
+
+fn term_clobbers_caller_saved(kind: ssa.SsaTermKind) -> bool {
+    kind == .Call || kind == .IndirectCall || kind == .ExternCall || kind == .IntrinsicCall ||
+    kind == .TaskScopeEnter || kind == .TaskScopeJoin
+}
+
+// =========================================================================
+// 2. Bitset Helpers & Backward CFG Liveness + Linear-Scan RegAlloc
+// =========================================================================
+
+fn bs_set(bits: &mut []u64, base: i32, idx: i32) {
+    if idx < 0 { return }
+    w := idx / 64
+    b := idx % 64
+    bits[base + w] = bits[base + w].bit_or(u64(1).shl(b))
+}
+
+fn bs_clear(bits: &mut []u64, base: i32, idx: i32) {
+    if idx < 0 { return }
+    w := idx / 64
+    b := idx % 64
+    bits[base + w] = bits[base + w].bit_and(u64(1).shl(b).bit_not())
+}
+
+fn bs_test(bits: &[]u64, base: i32, idx: i32) -> bool {
+    if idx < 0 { return false }
+    w := idx / 64
+    b := idx % 64
+    bits[base + w].bit_and(u64(1).shl(b)) != 0
+}
+
+fn record_inst_uses(f: &ssa.SsaFunc, ins: &ssa.SsaInst, bits: &mut []u64, base: i32) {
+    if ins.op_a >= 0 { bs_set(&mut bits, base, ins.op_a) }
+    if ins.op_b >= 0 { bs_set(&mut bits, base, ins.op_b) }
+    if ins.op_c >= 0 { bs_set(&mut bits, base, ins.op_c) }
+    if ins.kind == .ClosureMake {
+        for ci in 0..ins.arg_len {
+            bs_set(&mut bits, base, f.val_args[ins.arg_start + ci])
+        }
+    }
+}
+
+fn record_term_uses(f: &ssa.SsaFunc, tm: &ssa.SsaTerm, bits: &mut []u64, base: i32) {
+    if tm.cond_val >= 0 { bs_set(&mut bits, base, tm.cond_val) }
+    if tm.env_val >= 0 { bs_set(&mut bits, base, tm.env_val) }
+    for ai in 0..tm.arg_len {
+        v := f.val_args[tm.arg_start + ai]
+        if v >= 0 { bs_set(&mut bits, base, v) }
+    }
+    for ai in 0..tm.arg2_len {
+        v := f.val_args[tm.arg2_start + ai]
+        if v >= 0 { bs_set(&mut bits, base, v) }
+    }
+    if tm.kind == .Switch {
+        for ci in 0..tm.case_len {
+            as0 := f.switch_arg_starts[tm.case_start + ci]
+            al0 := f.switch_arg_lens[tm.case_start + ci]
+            for ai in 0..al0 {
+                v := f.val_args[as0 + ai]
+                if v >= 0 { bs_set(&mut bits, base, v) }
+            }
+        }
+    }
+}
+
+fn extend_use(starts: &mut []i32, ends: &mut []i32, v: i32, pt: i32) {
+    if v < 0 || v >= ends.len { return }
+    if starts[v] < 0 || pt < starts[v] { starts[v] = pt }
+    if pt > ends[v] { ends[v] = pt }
+}
+
+fn push_unique_i32(arr: &mut []i32, v: i32) {
+    for i in 0..arr.len {
+        if arr[i] == v { return }
+    }
+    arr.push(v)
+}
+
+pub fn allocate_registers(types: &ht.TypeTable, f: &ssa.SsaFunc) -> RegAllocPlan {
+    n_bbs := f.blocks.len
+    n_vals := f.vals.len
+    dom := ssa.compute_doms(&f)
+    mut rpo: []i32 = []
+    if dom.rpo_order.len > 0 {
+        for i in 0..dom.rpo_order.len { rpo.push(dom.rpo_order[i]) }
+    } else {
+        for b in 0..n_bbs { rpo.push(b) }
+    }
+
+    // 1. Assign linear program points in RPO order & collect call clobber points
+    mut bb_start: []i32 = []
+    mut bb_end: []i32 = []
+    for _ in 0..n_bbs { bb_start.push(-1); bb_end.push(-1) }
+    mut call_pts: []i32 = []
+    mut cur_pt := 0
+    for ri in 0..rpo.len {
+        bb := rpo[ri]
+        bb_start[bb] = cur_pt
+        cur_pt += 2 // entry / block params at bb_start[bb]
+        blk := f.blocks[bb]
+        for pi in 0..blk.inst_len {
+            iid := f.block_insts[blk.inst_start + pi]
+            if inst_actually_clobbers(&types, &f, &f.insts[iid]) {
+                call_pts.push(cur_pt + 1)
+            }
+            cur_pt += 2
+        }
+        if blk.term_id >= 0 && term_clobbers_caller_saved(f.terms[blk.term_id].kind) {
+            call_pts.push(cur_pt + 1)
+        }
+        bb_end[bb] = cur_pt + 1
+        cur_pt += 2
+    }
+
+    // 2. Backward dataflow liveness (bitset per block)
+    words := (n_vals + 63) / 64
+    mut w_sz := if words < 1 { 1 } else { words }
+    mut live_in: []u64 = []
+    mut live_out: []u64 = []
+    live_in.reserve(n_bbs * w_sz)
+    live_out.reserve(n_bbs * w_sz)
+    for _ in 0..(n_bbs * w_sz) {
+        live_in.push(u64(0))
+        live_out.push(u64(0))
+    }
+
+    mut tmp_live: []u64 = []
+    for _ in 0..w_sz { tmp_live.push(u64(0)) }
+    mut succs: []i32 = []
+
+    mut changed := true
+    mut iters := 0
+    while changed && iters < 64 {
+        changed = false
+        iters += 1
+        mut ri := rpo.len - 1
+        while ri >= 0 {
+            bb := rpo[ri]
+            blk := f.blocks[bb]
+            for w in 0..w_sz { tmp_live[w] = u64(0) }
+
+            // Union live_in[s] \ block_params(s) over all successors s
+            ssa.term_succs(&f, bb, &mut succs)
+            for si in 0..succs.len {
+                s := succs[si]
+                if s < 0 || s >= n_bbs { continue }
+                s_base := s * w_sz
+                // Copy live_in[s], clearing s's own block params
+                for w in 0..w_sz {
+                    mut mask := live_in[s_base + w]
+                    // Clear any block param of s in this word
+                    sp_s := f.blocks[s].params_start
+                    sp_n := f.blocks[s].params_len
+                    for pi in 0..sp_n {
+                        pv := f.block_params[sp_s + pi]
+                        if pv >= 0 && pv / 64 == w {
+                            mask = mask.bit_and(u64(1).shl(pv % 64).bit_not())
+                        }
+                    }
+                    tmp_live[w] = tmp_live[w].bit_or(mask)
+                }
+            }
+
+            // Record live_out[bb] (values live across outgoing edges, excluding edge args not live-through)
+            b_base := bb * w_sz
+            for w in 0..w_sz {
+                if live_out[b_base + w] != tmp_live[w] {
+                    live_out[b_base + w] = tmp_live[w]
+                    changed = true
+                }
+            }
+
+            // Walk terminator backwards: kill dest_val, gen terminator uses & edge args
+            if blk.term_id >= 0 {
+                tm := f.terms[blk.term_id]
+                if tm.dest_val >= 0 { bs_clear(&mut tmp_live, 0, tm.dest_val) }
+                record_term_uses(&f, &tm, &mut tmp_live, 0)
+            }
+
+            // Walk instructions backwards: kill def, gen uses
+            mut idx := blk.inst_len - 1
+            while idx >= 0 {
+                ins := f.insts[f.block_insts[blk.inst_start + idx]]
+                if ins.res >= 0 { bs_clear(&mut tmp_live, 0, ins.res) }
+                record_inst_uses(&f, &ins, &mut tmp_live, 0)
+                idx -= 1
+            }
+
+            for w in 0..w_sz {
+                if live_in[b_base + w] != tmp_live[w] {
+                    live_in[b_base + w] = tmp_live[w]
+                    changed = true
+                }
+            }
+            ri -= 1
+        }
+    }
+
+    // 3. Build conservative linear intervals [live_starts[v], live_ends[v]]
+    mut starts: []i32 = []
+    mut ends: []i32 = []
+    mut classes: []ValClass = []
+    for v in 0..n_vals {
+        starts.push(-1)
+        ends.push(-1)
+        classes.push(classify_type(&types, f.vals[v].ty))
+    }
+
+    // Entry function params defined at point 0
+    for pi in 0..f.param_vals.len {
+        pv := f.param_vals[pi]
+        if pv >= 0 && pv < n_vals {
+            starts[pv] = 0
+            ends[pv] = 0
+        }
+    }
+
+    for ri in 0..rpo.len {
+        bb := rpo[ri]
+        blk := f.blocks[bb]
+        bs := bb_start[bb]
+        be := bb_end[bb]
+
+        // Block params defined at bs
+        for pi in 0..blk.params_len {
+            pv := f.block_params[blk.params_start + pi]
+            if pv >= 0 && pv < n_vals {
+                extend_use(&mut starts, &mut ends, pv, bs)
+            }
+        }
+
+        // Values live_in / live_out of this block
+        b_base := bb * w_sz
+        for v in 0..n_vals {
+            if bs_test(&live_out, b_base, v) {
+                extend_use(&mut starts, &mut ends, v, be)
+                if bs_test(&live_in, b_base, v) {
+                    extend_use(&mut starts, &mut ends, v, bs)
+                }
+            } else if bs_test(&live_in, b_base, v) {
+                extend_use(&mut starts, &mut ends, v, bs)
+            }
+        }
+
+        // Instruction defs and uses
+        for ii in 0..blk.inst_len {
+            use_pt := bs + 2 + ii * 2
+            def_pt := use_pt + 1
+            ins := f.insts[f.block_insts[blk.inst_start + ii]]
+            if ins.op_a >= 0 { extend_use(&mut starts, &mut ends, ins.op_a, use_pt) }
+            if ins.op_b >= 0 { extend_use(&mut starts, &mut ends, ins.op_b, use_pt) }
+            if ins.op_c >= 0 { extend_use(&mut starts, &mut ends, ins.op_c, use_pt) }
+            if ins.kind == .ClosureMake {
+                for ci in 0..ins.arg_len {
+                    extend_use(&mut starts, &mut ends, f.val_args[ins.arg_start + ci], use_pt)
+                }
+            }
+            if ins.res >= 0 { extend_use(&mut starts, &mut ends, ins.res, def_pt) }
+        }
+
+        // Terminator uses and call result def
+        if blk.term_id >= 0 {
+            tm := f.terms[blk.term_id]
+            t_use := be - 1
+            if tm.cond_val >= 0 { extend_use(&mut starts, &mut ends, tm.cond_val, t_use) }
+            if tm.env_val >= 0 { extend_use(&mut starts, &mut ends, tm.env_val, t_use) }
+            for ai in 0..tm.arg_len {
+                v := f.val_args[tm.arg_start + ai]
+                if v >= 0 { extend_use(&mut starts, &mut ends, v, t_use) }
+            }
+            for ai in 0..tm.arg2_len {
+                v := f.val_args[tm.arg2_start + ai]
+                if v >= 0 { extend_use(&mut starts, &mut ends, v, t_use) }
+            }
+            if tm.kind == .Switch {
+                for ci in 0..tm.case_len {
+                    as0 := f.switch_arg_starts[tm.case_start + ci]
+                    al0 := f.switch_arg_lens[tm.case_start + ci]
+                    for ai in 0..al0 {
+                        v := f.val_args[as0 + ai]
+                        if v >= 0 { extend_use(&mut starts, &mut ends, v, t_use) }
+                    }
+                }
+            }
+            if tm.dest_val >= 0 { extend_use(&mut starts, &mut ends, tm.dest_val, be) }
+        }
+    }
+
+    // 4. Determine which values cross any call site
+    mut crosses: []bool = []
+    for v in 0..n_vals {
+        mut cc := false
+        if starts[v] >= 0 && ends[v] > starts[v] {
+            for ci in 0..call_pts.len {
+                cp := call_pts[ci]
+                if starts[v] < cp && cp < ends[v] {
+                    cc = true
+                    break
+                }
+            }
+        }
+        crosses.push(cc)
+    }
+
+    // 5. Initialize ValLoc array
+    mut locs: []ValLoc = []
+    for v in 0..n_vals {
+        cls := classes[v]
+        locs.push(ValLoc {
+            cls: cls,
+            kind: if cls == .Agg { .AggHome } else { .None },
+            reg_lo: -1,
+            reg_hi: -1,
+            spill_off: 0,
+            is_f64: is_f64_ty(&types, f.vals[v].ty),
+        })
+    }
+
+    // 6. Linear-scan allocation over GP/Fat intervals and FP intervals
+    // Collect active candidate value IDs sorted by start[v] ascending
+    mut gp_order: []i32 = []
+    mut fp_order: []i32 = []
+    for v in 0..n_vals {
+        if starts[v] < 0 { continue }
+        c := classes[v]
+        if c == .Gp || c == .Fat { gp_order.push(v) }
+        else if c == .Fp { fp_order.push(v) }
+    }
+    // Insertion sort by starts[v]
+    for i in 1..gp_order.len {
+        key := gp_order[i]
+        mut j := i - 1
+        while j >= 0 && starts[gp_order[j]] > starts[key] {
+            gp_order[j + 1] = gp_order[j]
+            j -= 1
+        }
+        gp_order[j + 1] = key
+    }
+    for i in 1..fp_order.len {
+        key := fp_order[i]
+        mut j := i - 1
+        while j >= 0 && starts[fp_order[j]] > starts[key] {
+            fp_order[j + 1] = fp_order[j]
+            j -= 1
+        }
+        fp_order[j + 1] = key
+    }
+
+    // GP physical register pools:
+    // Caller-saved: x9..x15 (7 regs); Callee-saved: x22..x28 (7 regs)
+    // x19, x20, x21 are strictly RESERVED for per-thread arena!
+    gp_caller: [i32; 7] = [a64.X9, a64.X10, a64.X11, a64.X12, a64.X13, a64.X14, a64.X15]
+    gp_callee: [i32; 7] = [a64.X22, a64.X23, a64.X24, a64.X25, a64.X26, a64.X27, a64.X28]
+    mut gp_in_use: []bool = []
+    for _ in 0..32 { gp_in_use.push(false) }
+
+    mut active_gp: []i32 = []
+    mut used_callee_gp: []i32 = []
+    mut spill_count := 0
+
+    for oi in 0..gp_order.len {
+        v := gp_order[oi]
+        st := starts[v]
+        // Expire old intervals with ends[u] < st
+        mut wi := 0
+        for ai in 0..active_gp.len {
+            u := active_gp[ai]
+            if ends[u] < st {
+                if locs[u].reg_lo >= 0 { gp_in_use[locs[u].reg_lo] = false }
+                if locs[u].reg_hi >= 0 { gp_in_use[locs[u].reg_hi] = false }
+            } else {
+                active_gp[wi] = u
+                wi += 1
+            }
+        }
+        active_gp.truncate(wi)
+
+        need := if classes[v] == .Fat { 2 } else { 1 }
+        must_callee := crosses[v]
+
+        mut r0 := -1
+        mut r1 := -1
+        if !must_callee {
+            for k in 0..7 {
+                reg := gp_caller[k]
+                if !gp_in_use[reg] {
+                    if r0 < 0 { r0 = reg }
+                    else if need == 2 && r1 < 0 { r1 = reg; break }
+                    if need == 1 { break }
+                }
+            }
+        }
+        if r0 < 0 || (need == 2 && r1 < 0) {
+            for k in 0..7 {
+                reg := gp_callee[k]
+                if !gp_in_use[reg] {
+                    if r0 < 0 { r0 = reg }
+                    else if need == 2 && r1 < 0 { r1 = reg; break }
+                    if need == 1 { break }
+                }
+            }
+        }
+
+        if r0 >= 0 && (need == 1 || r1 >= 0) {
+            locs[v].kind = .Reg
+            locs[v].reg_lo = r0
+            gp_in_use[r0] = true
+            if r0 >= a64.X22 && r0 <= a64.X28 { push_unique_i32(&mut used_callee_gp, r0) }
+            if need == 2 {
+                locs[v].reg_hi = r1
+                gp_in_use[r1] = true
+                if r1 >= a64.X22 && r1 <= a64.X28 { push_unique_i32(&mut used_callee_gp, r1) }
+            }
+            active_gp.push(v)
+        } else if need == 1 {
+            // Try spilling the active 1-reg interval with furthest end > ends[v]
+            mut victim_idx := -1
+            mut victim_end := ends[v]
+            for ai in 0..active_gp.len {
+                u := active_gp[ai]
+                if classes[u] != .Gp { continue }
+                ur := locs[u].reg_lo
+                if must_callee && !(ur >= a64.X22 && ur <= a64.X28) { continue }
+                if ends[u] > victim_end {
+                    victim_end = ends[u]
+                    victim_idx = ai
+                }
+            }
+            if victim_idx >= 0 {
+                u := active_gp[victim_idx]
+                stolen := locs[u].reg_lo
+                locs[u].kind = .Spill
+                locs[u].reg_lo = -1
+                spill_count += 1
+                locs[v].kind = .Reg
+                locs[v].reg_lo = stolen
+                if stolen >= a64.X22 && stolen <= a64.X28 { push_unique_i32(&mut used_callee_gp, stolen) }
+                active_gp[victim_idx] = v
+            } else {
+                locs[v].kind = .Spill
+                spill_count += 1
+            }
+        } else {
+            // Spill 2-word Fat value (16 bytes)
+            locs[v].kind = .Spill
+            spill_count += 1
+        }
+    }
+
+    // FP physical register pools:
+    // Caller-saved: d0..d7 (8 regs); Callee-saved: d8..d15 (8 regs)
+    fp_caller: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7]
+    fp_callee: [i32; 8] = [8, 9, 10, 11, 12, 13, 14, 15]
+    mut fp_in_use: []bool = []
+    for _ in 0..32 { fp_in_use.push(false) }
+
+    mut active_fp: []i32 = []
+    mut used_callee_fp: []i32 = []
+
+    for oi in 0..fp_order.len {
+        v := fp_order[oi]
+        st := starts[v]
+        mut wi := 0
+        for ai in 0..active_fp.len {
+            u := active_fp[ai]
+            if ends[u] < st {
+                if locs[u].reg_lo >= 0 { fp_in_use[locs[u].reg_lo] = false }
+            } else {
+                active_fp[wi] = u
+                wi += 1
+            }
+        }
+        active_fp.truncate(wi)
+
+        must_callee := crosses[v]
+        mut r0 := -1
+        if !must_callee {
+            for k in 0..8 {
+                reg := fp_caller[k]
+                if !fp_in_use[reg] { r0 = reg; break }
+            }
+        }
+        if r0 < 0 {
+            for k in 0..8 {
+                reg := fp_callee[k]
+                if !fp_in_use[reg] { r0 = reg; break }
+            }
+        }
+
+        if r0 >= 0 {
+            locs[v].kind = .Reg
+            locs[v].reg_lo = r0
+            fp_in_use[r0] = true
+            if r0 >= 8 && r0 <= 15 { push_unique_i32(&mut used_callee_fp, r0) }
+            active_fp.push(v)
+        } else {
+            mut victim_idx := -1
+            mut victim_end := ends[v]
+            for ai in 0..active_fp.len {
+                u := active_fp[ai]
+                ur := locs[u].reg_lo
+                if must_callee && !(ur >= 8 && ur <= 15) { continue }
+                if ends[u] > victim_end {
+                    victim_end = ends[u]
+                    victim_idx = ai
+                }
+            }
+            if victim_idx >= 0 {
+                u := active_fp[victim_idx]
+                stolen := locs[u].reg_lo
+                locs[u].kind = .Spill
+                locs[u].reg_lo = -1
+                spill_count += 1
+                locs[v].kind = .Reg
+                locs[v].reg_lo = stolen
+                if stolen >= 8 && stolen <= 15 { push_unique_i32(&mut used_callee_fp, stolen) }
+                active_fp[victim_idx] = v
+            } else {
+                locs[v].kind = .Spill
+                spill_count += 1
+            }
+        }
+    }
+
+    RegAllocPlan {
+        rpo: move rpo,
+        locs: move locs,
+        used_callee_gp: move used_callee_gp,
+        used_callee_fp: move used_callee_fp,
+        spill_count: spill_count,
+        live_starts: move starts,
+        live_ends: move ends,
+        crosses_call: move crosses,
+    }
+}
+
+// =========================================================================
+// 3. Low-Level ARM64 Emission Helpers (Safe Arbitary Offsets & Immediates)
+// =========================================================================
+
+fn emit_add_imm_any(buf: &mut a64.ArmBuf, dst: i32, src: i32, val: i64) {
+    if val == 0 {
+        a64.mov(&mut buf, dst, src)
+        return
+    }
+    if val > 0 && a64.add_sub_imm_field(val) >= 0 {
+        a64.add_imm(&mut buf, true, false, dst, src, val)
+        return
+    }
+    if val < 0 && a64.add_sub_imm_field(-val) >= 0 {
+        a64.sub_imm(&mut buf, true, false, dst, src, -val)
+        return
+    }
+    a64.imm(&mut buf, a64.X17, val)
+    a64.add_reg(&mut buf, true, false, dst, src, a64.X17)
+}
+
+fn emit_sub_imm_any(buf: &mut a64.ArmBuf, dst: i32, src: i32, val: i64) {
+    emit_add_imm_any(&mut buf, dst, src, -val)
+}
+
+fn emit_cmp_imm_any(buf: &mut a64.ArmBuf, wide: bool, lhs: i32, val: i64) {
+    if val >= 0 && val <= 4095 {
+        a64.cmp_imm(&mut buf, wide, lhs, val)
+    } else if val < 0 && val >= -4095 {
+        a64.cmn_imm(&mut buf, wide, lhs, -val)
+    } else {
+        a64.imm(&mut buf, a64.X17, val)
+        a64.cmp_reg(&mut buf, wide, lhs, a64.X17)
+    }
+}
+
+// Load 1/2/4/8 bytes from [base + off] (arbitrary signed offset, handles unaligned offsets cleanly).
+fn emit_ldr_off(buf: &mut a64.ArmBuf, dst: i32, base: i32, off: i64, width: i32, sign_ext: bool) {
+    if off >= 0 && off <= i64(4095 * width) && (off % i64(width)) == 0 {
+        a64.ldr(&mut buf, dst, base, i32(off), width, sign_ext)
+        return
+    }
+    if off >= -256 && off <= 255 {
+        a64.ldur(&mut buf, dst, base, i32(off), width, sign_ext)
+        return
+    }
+    emit_add_imm_any(&mut buf, a64.X17, base, off)
+    a64.ldr(&mut buf, dst, a64.X17, 0, width, sign_ext)
+}
+
+fn emit_str_off(buf: &mut a64.ArmBuf, src: i32, base: i32, off: i64, width: i32) {
+    if off >= 0 && off <= i64(4095 * width) && (off % i64(width)) == 0 {
+        a64.str(&mut buf, src, base, i32(off), width)
+        return
+    }
+    if off >= -256 && off <= 255 {
+        a64.stur(&mut buf, src, base, i32(off), width)
+        return
+    }
+    emit_add_imm_any(&mut buf, a64.X17, base, off)
+    a64.str(&mut buf, src, a64.X17, 0, width)
+}
+
+fn emit_ldr_fp_off(buf: &mut a64.ArmBuf, is_f64: bool, vt: i32, base: i32, off: i64) {
+    w := if is_f64 { 8 } else { 4 }
+    if off >= 0 && off <= i64(4095 * w) && (off % i64(w)) == 0 {
+        a64.ldr_fp(&mut buf, is_f64, vt, base, i32(off))
+        return
+    }
+    emit_add_imm_any(&mut buf, a64.X17, base, off)
+    a64.ldr_fp(&mut buf, is_f64, vt, a64.X17, 0)
+}
+
+fn emit_str_fp_off(buf: &mut a64.ArmBuf, is_f64: bool, vt: i32, base: i32, off: i64) {
+    w := if is_f64 { 8 } else { 4 }
+    if off >= 0 && off <= i64(4095 * w) && (off % i64(w)) == 0 {
+        a64.str_fp(&mut buf, is_f64, vt, base, i32(off))
+        return
+    }
+    emit_add_imm_any(&mut buf, a64.X17, base, off)
+    a64.str_fp(&mut buf, is_f64, vt, a64.X17, 0)
+}
+
+// Inline small memory copy (dst_reg, src_reg untouched; uses x16, x17) for size <= 64
+fn emit_inline_memcpy(buf: &mut a64.ArmBuf, dst_reg: i32, src_reg: i32, size: i32) {
+    mut off := 0
+    while off + 8 <= size {
+        emit_ldr_off(&mut buf, a64.X16, src_reg, i64(off), 8, false)
+        emit_str_off(&mut buf, a64.X16, dst_reg, i64(off), 8)
+        off += 8
+    }
+    if off + 4 <= size {
+        emit_ldr_off(&mut buf, a64.X16, src_reg, i64(off), 4, false)
+        emit_str_off(&mut buf, a64.X16, dst_reg, i64(off), 4)
+        off += 4
+    }
+    if off + 2 <= size {
+        emit_ldr_off(&mut buf, a64.X16, src_reg, i64(off), 2, false)
+        emit_str_off(&mut buf, a64.X16, dst_reg, i64(off), 2)
+        off += 2
+    }
+    if off < size {
+        emit_ldr_off(&mut buf, a64.X16, src_reg, i64(off), 1, false)
+        emit_str_off(&mut buf, a64.X16, dst_reg, i64(off), 1)
+    }
+}
+
+fn emit_inline_memzero(buf: &mut a64.ArmBuf, dst_reg: i32, size: i32) {
+    mut off := 0
+    while off + 8 <= size {
+        emit_str_off(&mut buf, a64.XZR, dst_reg, i64(off), 8)
+        off += 8
+    }
+    if off + 4 <= size {
+        emit_str_off(&mut buf, a64.XZR, dst_reg, i64(off), 4)
+        off += 4
+    }
+    if off + 2 <= size {
+        emit_str_off(&mut buf, a64.XZR, dst_reg, i64(off), 2)
+        off += 2
+    }
+    if off < size {
+        emit_str_off(&mut buf, a64.XZR, dst_reg, i64(off), 1)
+    }
+}
+
+fn emit_syscall(buf: &mut a64.ArmBuf, target: obj.TargetKind, darwin_nr: i64, linux_nr: i64) {
+    if target == .Arm64Macos {
+        a64.imm(&mut buf, a64.X16, darwin_nr)
+        a64.svc(&mut buf, 128) // svc #0x80
+    } else {
+        a64.imm(&mut buf, a64.X8, linux_nr)
+        a64.svc(&mut buf, 0)   // svc #0
+    }
+}
+
+fn emit_normalize_int(buf: &mut a64.ArmBuf, types: &ht.TypeTable, ty: i32, dst: i32, src: i32) {
+    if ty < 0 || ty >= types.entries.len {
+        a64.mov(&mut buf, dst, src)
+        return
+    }
+    k := types.entries[ty].kind
+    if k == .I8 { a64.sxtb(&mut buf, dst, src) }
+    else if k == .I16 { a64.sxth(&mut buf, dst, src) }
+    else if k == .I32 { a64.sxtw(&mut buf, dst, src) }
+    else if k == .U8 || k == .Bool { a64.uxtb(&mut buf, dst, src) }
+    else if k == .U16 { a64.uxth(&mut buf, dst, src) }
+    else if k == .U32 || k == .Rune { a64.mov32(&mut buf, dst, src) }
+    else { a64.mov(&mut buf, dst, src) }
+}
+
+// =========================================================================
+// 4. Shared Self-Contained Runtime Helpers (Emitted into ObjectModule)
+// =========================================================================
+
+struct RuntimeSyms {
+    alloc: i32,
+    trap: i32,
+    write_buf: i32,
+    print_str: i32,
+    print_int: i32,
+    print_bool: i32,
+    int_to_str: i32,
+    str_concat: i32,
+    str_eq: i32,
+    str_cmp: i32,
+    arr_alloc: i32,
+    arr_grow: i32,
+    memcpy: i32,
+    memzero: i32,
+    ro_true: i32,
+    ro_false: i32,
+    ro_nl: i32,
+}
+
+struct PendingReloc {
+    site_lbl: i32,
+    kind: obj.ObjRelocKind,
+    sym_id: i32,
+    addend: i64,
+    reg: i32,
+}
+
+struct PendingImport {
+    site_lbl: i32,
+    imp_id: i32,
+}
+
+fn emit_call_sym(buf: &mut a64.ArmBuf, relocs: &mut []PendingReloc, sym_id: i32) {
+    lbl := a64.label(&mut buf)
+    a64.mark(&mut buf, lbl)
+    a64.emit(&mut buf, 0) // patched by Arm64Call26
+    relocs.push(PendingReloc {
+        site_lbl: lbl,
+        kind: .Arm64Call26,
+        sym_id: sym_id,
+        addend: 0,
+        reg: 0,
+    })
+}
+
+fn emit_adrp_sym(buf: &mut a64.ArmBuf, relocs: &mut []PendingReloc, reg: i32, sym_id: i32, addend: i64) {
+    lbl := a64.label(&mut buf)
+    a64.mark(&mut buf, lbl)
+    a64.emit(&mut buf, 0) // patched by Arm64AdrpAdd
+    a64.emit(&mut buf, 0)
+    relocs.push(PendingReloc {
+        site_lbl: lbl,
+        kind: .Arm64AdrpAdd,
+        sym_id: sym_id,
+        addend: addend,
+        reg: reg,
+    })
+}
+
+fn flush_buf_to_module(m: &mut obj.ObjectModule, buf: &mut a64.ArmBuf,
+    relocs: &[]PendingReloc, imp_sites: &[]PendingImport,
+    name: string, exported: bool) -> i32 {
+    code := a64.finish_at_offset(&mut buf, 0)
+    start := obj.append_text(&mut m, &code, 4)
+    sym := obj.add_symbol(&mut m, name, .Function, .Text, start, code.len, exported)
+    for i in 0..relocs.len {
+        r := relocs[i]
+        off := start + a64.label_word(&buf, r.site_lbl) * 4
+        _ := obj.add_reloc(&mut m, .Text, off, r.kind, r.sym_id, r.addend, r.reg)
+    }
+    for i in 0..imp_sites.len {
+        p := imp_sites[i]
+        off := start + a64.label_word(&buf, p.site_lbl) * 4
+        obj.add_import_site(&mut m, p.imp_id, off)
+    }
+    sym
+}
+
+fn append_rodata_cstr(m: &mut obj.ObjectModule, name: string, text: string) -> i32 {
+    mut blob: []u8 = []
+    bytes.append_utf8(&mut blob, text)
+    blob.push(u8(0))
+    off := obj.append_rodata(&mut m, &blob, 8)
+    obj.add_symbol(&mut m, name, .RodataBlob, .Rodata, off, blob.len, false)
+}
+
+fn append_rodata_dunder_str(m: &mut obj.ObjectModule, name: string, text: string) -> i32 {
+    mut blob: []u8 = []
+    bytes.append_le(&mut blob, 0, 8) // immortal RC = 0 at [ptr - 8]
+    bytes.append_le(&mut blob, i64(text.len), 8) // length at [ptr + 0]
+    bytes.append_utf8(&mut blob, text)
+    blob.push(u8(0))
+    off := obj.append_rodata(&mut m, &blob, 8)
+    // Symbol points at [len, bytes...] (+8 past RC header)
+    obj.add_symbol(&mut m, name, .RodataBlob, .Rodata, off + 8, blob.len - 8, false)
+}
+
+fn emit_runtime_stubs(m: &mut obj.ObjectModule, target: obj.TargetKind) -> RuntimeSyms {
+    ro_true := append_rodata_cstr(&mut m, "__rt_str_true", "true\n")
+    ro_false := append_rodata_cstr(&mut m, "__rt_str_false", "false\n")
+    ro_nl := append_rodata_cstr(&mut m, "__rt_str_nl", "\n")
+
+    empty_imp: []PendingImport = []
+
+    // 1. __dunder_rt_trap(x0 = exit_code)
+    mut b_trap := a64.new()
+    emit_syscall(&mut b_trap, target, 33554433, 94) // exit / exit_group
+    a64.brk(&mut b_trap, 1)
+    mut r_trap: []PendingReloc = []
+    sym_trap := flush_buf_to_module(&mut m, &mut b_trap, &r_trap, &empty_imp, "__dunder_rt_trap", false)
+
+    // 2. __dunder_rt_alloc(x0 = size_bytes) -> x0 = 16B-aligned pointer via x19..x21 + mmap slow-path
+    mut b_alloc := a64.new()
+    mut r_alloc: []PendingReloc = []
+    // Round x0 up to 16-byte multiple (min 16)
+    lbl_nonzero := a64.label(&mut b_alloc)
+    a64.cbnz(&mut b_alloc, true, a64.X0, lbl_nonzero)
+    a64.imm(&mut b_alloc, a64.X0, 16)
+    a64.mark(&mut b_alloc, lbl_nonzero)
+    a64.add_imm(&mut b_alloc, true, false, a64.X10, a64.X0, 15)
+    a64.lsr_imm(&mut b_alloc, true, a64.X10, a64.X10, 4)
+    a64.lsl_imm(&mut b_alloc, true, a64.X10, a64.X10, 4)
+
+    // Fast path: x19 != 0 && x19 + x10 <= x20
+    lbl_slow := a64.label(&mut b_alloc)
+    a64.cbz(&mut b_alloc, true, a64.X19, lbl_slow)
+    a64.add_reg(&mut b_alloc, true, false, a64.X11, a64.X19, a64.X10)
+    a64.cmp_reg(&mut b_alloc, true, a64.X11, a64.X20)
+    a64.b_cond(&mut b_alloc, a64.CC_HI, lbl_slow)
+    a64.mov(&mut b_alloc, a64.X0, a64.X19)
+    a64.mov(&mut b_alloc, a64.X19, a64.X11)
+    a64.ret(&mut b_alloc)
+
+    // Slow path: mmap max(65536, align_page(x10))
+    a64.mark(&mut b_alloc, lbl_slow)
+    a64.emit_prologue(&mut b_alloc, 16)
+    a64.str(&mut b_alloc, a64.X10, a64.SP, 0, 8) // save requested size
+    // chunk = max(65536, (x10 + 16383) & ~16383)
+    a64.imm(&mut b_alloc, a64.X11, 16383)
+    a64.add_reg(&mut b_alloc, true, false, a64.X1, a64.X10, a64.X11)
+    a64.lsr_imm(&mut b_alloc, true, a64.X1, a64.X1, 14)
+    a64.lsl_imm(&mut b_alloc, true, a64.X1, a64.X1, 14)
+    a64.imm(&mut b_alloc, a64.X11, 65536)
+    a64.cmp_reg(&mut b_alloc, true, a64.X1, a64.X11)
+    lbl_sized := a64.label(&mut b_alloc)
+    a64.b_cond(&mut b_alloc, a64.CC_HS, lbl_sized)
+    a64.mov(&mut b_alloc, a64.X1, a64.X11)
+    a64.mark(&mut b_alloc, lbl_sized)
+    a64.str(&mut b_alloc, a64.X1, a64.SP, 8, 8) // save chunk size
+    a64.imm(&mut b_alloc, a64.X0, 0)            // addr = NULL
+    a64.imm(&mut b_alloc, a64.X2, 3)            // PROT_READ | PROT_WRITE
+    if target == .Arm64Macos {
+        a64.imm(&mut b_alloc, a64.X3, 4098)     // MAP_PRIVATE | MAP_ANON
+    } else {
+        a64.imm(&mut b_alloc, a64.X3, 34)       // MAP_PRIVATE | MAP_ANONYMOUS
+    }
+    a64.imm(&mut b_alloc, a64.X4, -1)           // fd = -1
+    a64.imm(&mut b_alloc, a64.X5, 0)            // offset = 0
+    emit_syscall(&mut b_alloc, target, 33554629, 222) // mmap
+    lbl_oom := a64.label(&mut b_alloc)
+    if target == .Arm64Macos {
+        a64.b_cond(&mut b_alloc, a64.CC_CS, lbl_oom)
+    } else {
+        a64.cmp_imm(&mut b_alloc, true, a64.X0, 0)
+        a64.b_cond(&mut b_alloc, a64.CC_LT, lbl_oom)
+    }
+    a64.ldr(&mut b_alloc, a64.X10, a64.SP, 0, 8, false) // req size
+    a64.ldr(&mut b_alloc, a64.X11, a64.SP, 8, 8, false) // chunk size
+    a64.mov(&mut b_alloc, a64.X21, a64.X0)              // slab root
+    a64.add_reg(&mut b_alloc, true, false, a64.X20, a64.X0, a64.X11)
+    a64.add_reg(&mut b_alloc, true, false, a64.X19, a64.X0, a64.X10)
+    a64.emit_epilogue(&mut b_alloc)
+
+    a64.mark(&mut b_alloc, lbl_oom)
+    a64.imm(&mut b_alloc, a64.X0, 109)
+    emit_call_sym(&mut b_alloc, &mut r_alloc, sym_trap)
+    sym_alloc := flush_buf_to_module(&mut m, &mut b_alloc, &r_alloc, &empty_imp, "__dunder_rt_alloc", false)
+
+    // 3. __dunder_rt_memcpy(x0 = dst, x1 = src, x2 = bytes)
+    mut b_cpy := a64.new()
+    mut r_cpy: []PendingReloc = []
+    lbl_cpy_w := a64.label(&mut b_cpy)
+    lbl_cpy_b := a64.label(&mut b_cpy)
+    lbl_cpy_done := a64.label(&mut b_cpy)
+    a64.mark(&mut b_cpy, lbl_cpy_w)
+    a64.cmp_imm(&mut b_cpy, true, a64.X2, 8)
+    a64.b_cond(&mut b_cpy, a64.CC_LO, lbl_cpy_b)
+    a64.ldr(&mut b_cpy, a64.X10, a64.X1, 0, 8, false)
+    a64.str(&mut b_cpy, a64.X10, a64.X0, 0, 8)
+    a64.add_imm(&mut b_cpy, true, false, a64.X0, a64.X0, 8)
+    a64.add_imm(&mut b_cpy, true, false, a64.X1, a64.X1, 8)
+    a64.sub_imm(&mut b_cpy, true, false, a64.X2, a64.X2, 8)
+    a64.b(&mut b_cpy, lbl_cpy_w)
+    a64.mark(&mut b_cpy, lbl_cpy_b)
+    a64.cbz(&mut b_cpy, true, a64.X2, lbl_cpy_done)
+    a64.ldr(&mut b_cpy, a64.X10, a64.X1, 0, 1, false)
+    a64.str(&mut b_cpy, a64.X10, a64.X0, 0, 1)
+    a64.add_imm(&mut b_cpy, true, false, a64.X0, a64.X0, 1)
+    a64.add_imm(&mut b_cpy, true, false, a64.X1, a64.X1, 1)
+    a64.sub_imm(&mut b_cpy, true, false, a64.X2, a64.X2, 1)
+    a64.b(&mut b_cpy, lbl_cpy_b)
+    a64.mark(&mut b_cpy, lbl_cpy_done)
+    a64.ret(&mut b_cpy)
+    sym_memcpy := flush_buf_to_module(&mut m, &mut b_cpy, &r_cpy, &empty_imp, "__dunder_rt_memcpy", false)
+
+    // 4. __dunder_rt_memzero(x0 = dst, x1 = bytes)
+    mut b_zero := a64.new()
+    mut r_zero: []PendingReloc = []
+    lbl_zw := a64.label(&mut b_zero)
+    lbl_zb := a64.label(&mut b_zero)
+    lbl_zdone := a64.label(&mut b_zero)
+    a64.mark(&mut b_zero, lbl_zw)
+    a64.cmp_imm(&mut b_zero, true, a64.X1, 8)
+    a64.b_cond(&mut b_zero, a64.CC_LO, lbl_zb)
+    a64.str(&mut b_zero, a64.XZR, a64.X0, 0, 8)
+    a64.add_imm(&mut b_zero, true, false, a64.X0, a64.X0, 8)
+    a64.sub_imm(&mut b_zero, true, false, a64.X1, a64.X1, 8)
+    a64.b(&mut b_zero, lbl_zw)
+    a64.mark(&mut b_zero, lbl_zb)
+    a64.cbz(&mut b_zero, true, a64.X1, lbl_zdone)
+    a64.str(&mut b_zero, a64.XZR, a64.X0, 0, 1)
+    a64.add_imm(&mut b_zero, true, false, a64.X0, a64.X0, 1)
+    a64.sub_imm(&mut b_zero, true, false, a64.X1, a64.X1, 1)
+    a64.b(&mut b_zero, lbl_zb)
+    a64.mark(&mut b_zero, lbl_zdone)
+    a64.ret(&mut b_zero)
+    sym_memzero := flush_buf_to_module(&mut m, &mut b_zero, &r_zero, &empty_imp, "__dunder_rt_memzero", false)
+
+    // 5. __dunder_rt_write_buf(x0 = fd, x1 = ptr, x2 = len)
+    mut b_wr := a64.new()
+    mut r_wr: []PendingReloc = []
+    lbl_wr_done := a64.label(&mut b_wr)
+    a64.cbz(&mut b_wr, true, a64.X2, lbl_wr_done)
+    emit_syscall(&mut b_wr, target, 33554436, 64) // write
+    a64.mark(&mut b_wr, lbl_wr_done)
+    a64.ret(&mut b_wr)
+    sym_write_buf := flush_buf_to_module(&mut m, &mut b_wr, &r_wr, &empty_imp, "__dunder_rt_write_buf", false)
+
+    // 6. __dunder_rt_print_str(x0 = fd, x1 = ptr, x2 = len) -> prints bytes + '\n'
+    mut b_pstr := a64.new()
+    mut r_pstr: []PendingReloc = []
+    a64.emit_prologue(&mut b_pstr, 16)
+    a64.str(&mut b_pstr, a64.X0, a64.SP, 0, 8) // save fd
+    emit_call_sym(&mut b_pstr, &mut r_pstr, sym_write_buf)
+    a64.ldr(&mut b_pstr, a64.X0, a64.SP, 0, 8, false)
+    emit_adrp_sym(&mut b_pstr, &mut r_pstr, a64.X1, ro_nl, 0)
+    a64.imm(&mut b_pstr, a64.X2, 1)
+    emit_call_sym(&mut b_pstr, &mut r_pstr, sym_write_buf)
+    a64.emit_epilogue(&mut b_pstr)
+    sym_print_str := flush_buf_to_module(&mut m, &mut b_pstr, &r_pstr, &empty_imp, "__dunder_rt_print_str", false)
+
+    // 7. __dunder_rt_print_bool(x0 = fd, x1 = val)
+    mut b_pbool := a64.new()
+    mut r_pbool: []PendingReloc = []
+    a64.emit_prologue(&mut b_pbool, 0)
+    lbl_pb_false := a64.label(&mut b_pbool)
+    lbl_pb_go := a64.label(&mut b_pbool)
+    a64.cbz(&mut b_pbool, true, a64.X1, lbl_pb_false)
+    emit_adrp_sym(&mut b_pbool, &mut r_pbool, a64.X1, ro_true, 0)
+    a64.imm(&mut b_pbool, a64.X2, 5)
+    a64.b(&mut b_pbool, lbl_pb_go)
+    a64.mark(&mut b_pbool, lbl_pb_false)
+    emit_adrp_sym(&mut b_pbool, &mut r_pbool, a64.X1, ro_false, 0)
+    a64.imm(&mut b_pbool, a64.X2, 6)
+    a64.mark(&mut b_pbool, lbl_pb_go)
+    emit_call_sym(&mut b_pbool, &mut r_pbool, sym_write_buf)
+    a64.emit_epilogue(&mut b_pbool)
+    sym_print_bool := flush_buf_to_module(&mut m, &mut b_pbool, &r_pbool, &empty_imp, "__dunder_rt_print_bool", false)
+
+    // 8. __dunder_rt_print_int(x0 = fd, x1 = val, x2 = is_unsigned)
+    mut b_pint := a64.new()
+    mut r_pint: []PendingReloc = []
+    a64.emit_prologue(&mut b_pint, 48) // [sp..sp+31] = digit buf, [sp+32] = fd
+    a64.str(&mut b_pint, a64.X0, a64.SP, 32, 8)
+    // x10 = cur write ptr (filling backwards from sp + 31)
+    a64.add_imm(&mut b_pint, true, false, a64.X10, a64.SP, 31)
+    a64.imm(&mut b_pint, a64.X11, 10) // '\n'
+    a64.str(&mut b_pint, a64.X11, a64.X10, 0, 1)
+    a64.imm(&mut b_pint, a64.X12, 0) // is_neg = 0
+    lbl_pi_pos := a64.label(&mut b_pint)
+    a64.cbnz(&mut b_pint, true, a64.X2, lbl_pi_pos)
+    a64.cmp_imm(&mut b_pint, true, a64.X1, 0)
+    a64.b_cond(&mut b_pint, a64.CC_GE, lbl_pi_pos)
+    a64.imm(&mut b_pint, a64.X12, 1)
+    a64.neg(&mut b_pint, true, false, a64.X1, a64.X1)
+    a64.mark(&mut b_pint, lbl_pi_pos)
+    a64.imm(&mut b_pint, a64.X13, 10) // radix 10
+    lbl_pi_loop := a64.label(&mut b_pint)
+    a64.mark(&mut b_pint, lbl_pi_loop)
+    a64.udiv(&mut b_pint, true, a64.X14, a64.X1, a64.X13)
+    a64.msub(&mut b_pint, true, a64.X15, a64.X14, a64.X13, a64.X1)
+    a64.add_imm(&mut b_pint, true, false, a64.X15, a64.X15, 48) // '0'
+    a64.sub_imm(&mut b_pint, true, false, a64.X10, a64.X10, 1)
+    a64.str(&mut b_pint, a64.X15, a64.X10, 0, 1)
+    a64.mov(&mut b_pint, a64.X1, a64.X14)
+    a64.cbnz(&mut b_pint, true, a64.X1, lbl_pi_loop)
+    lbl_pi_no_sign := a64.label(&mut b_pint)
+    a64.cbz(&mut b_pint, true, a64.X12, lbl_pi_no_sign)
+    a64.imm(&mut b_pint, a64.X15, 45) // '-'
+    a64.sub_imm(&mut b_pint, true, false, a64.X10, a64.X10, 1)
+    a64.str(&mut b_pint, a64.X15, a64.X10, 0, 1)
+    a64.mark(&mut b_pint, lbl_pi_no_sign)
+    a64.ldr(&mut b_pint, a64.X0, a64.SP, 32, 8, false)
+    a64.mov(&mut b_pint, a64.X1, a64.X10)
+    a64.add_imm(&mut b_pint, true, false, a64.X2, a64.SP, 32)
+    a64.sub_reg(&mut b_pint, true, false, a64.X2, a64.X2, a64.X10)
+    emit_call_sym(&mut b_pint, &mut r_pint, sym_write_buf)
+    a64.emit_epilogue(&mut b_pint)
+    sym_print_int := flush_buf_to_module(&mut m, &mut b_pint, &r_pint, &empty_imp, "__dunder_rt_print_int", false)
+
+    // 9. __dunder_rt_int_to_str(x0 = val, x1 = is_unsigned) -> x0 = String ([len, bytes...])
+    mut b_its := a64.new()
+    mut r_its: []PendingReloc = []
+    a64.emit_prologue(&mut b_its, 48)
+    a64.add_imm(&mut b_its, true, false, a64.X10, a64.SP, 32)
+    a64.imm(&mut b_its, a64.X12, 0)
+    lbl_its_pos := a64.label(&mut b_its)
+    a64.cbnz(&mut b_its, true, a64.X1, lbl_its_pos)
+    a64.cmp_imm(&mut b_its, true, a64.X0, 0)
+    a64.b_cond(&mut b_its, a64.CC_GE, lbl_its_pos)
+    a64.imm(&mut b_its, a64.X12, 1)
+    a64.neg(&mut b_its, true, false, a64.X0, a64.X0)
+    a64.mark(&mut b_its, lbl_its_pos)
+    a64.imm(&mut b_its, a64.X13, 10)
+    lbl_its_loop := a64.label(&mut b_its)
+    a64.mark(&mut b_its, lbl_its_loop)
+    a64.udiv(&mut b_its, true, a64.X14, a64.X0, a64.X13)
+    a64.msub(&mut b_its, true, a64.X15, a64.X14, a64.X13, a64.X0)
+    a64.add_imm(&mut b_its, true, false, a64.X15, a64.X15, 48)
+    a64.sub_imm(&mut b_its, true, false, a64.X10, a64.X10, 1)
+    a64.str(&mut b_its, a64.X15, a64.X10, 0, 1)
+    a64.mov(&mut b_its, a64.X0, a64.X14)
+    a64.cbnz(&mut b_its, true, a64.X0, lbl_its_loop)
+    lbl_its_nosign := a64.label(&mut b_its)
+    a64.cbz(&mut b_its, true, a64.X12, lbl_its_nosign)
+    a64.imm(&mut b_its, a64.X15, 45)
+    a64.sub_imm(&mut b_its, true, false, a64.X10, a64.X10, 1)
+    a64.str(&mut b_its, a64.X15, a64.X10, 0, 1)
+    a64.mark(&mut b_its, lbl_its_nosign)
+    a64.add_imm(&mut b_its, true, false, a64.X11, a64.SP, 32)
+    a64.sub_reg(&mut b_its, true, false, a64.X11, a64.X11, a64.X10) // len
+    a64.str(&mut b_its, a64.X10, a64.SP, 32, 8) // src ptr
+    a64.str(&mut b_its, a64.X11, a64.SP, 40, 8) // len
+    a64.add_imm(&mut b_its, true, false, a64.X0, a64.X11, 17) // 8B rc + 8B len + bytes + 1B nul
+    emit_call_sym(&mut b_its, &mut r_its, sym_alloc)
+    a64.imm(&mut b_its, a64.X10, 1)
+    a64.str(&mut b_its, a64.X10, a64.X0, 0, 8) // rc = 1
+    a64.add_imm(&mut b_its, true, false, a64.X0, a64.X0, 8) // string ptr
+    a64.ldr(&mut b_its, a64.X1, a64.SP, 32, 8, false) // src
+    a64.ldr(&mut b_its, a64.X2, a64.SP, 40, 8, false) // len
+    a64.str(&mut b_its, a64.X2, a64.X0, 0, 8)
+    a64.str(&mut b_its, a64.X0, a64.SP, 32, 8) // save result string ptr
+    a64.add_imm(&mut b_its, true, false, a64.X0, a64.X0, 8)
+    emit_call_sym(&mut b_its, &mut r_its, sym_memcpy)
+    a64.ldr(&mut b_its, a64.X0, a64.SP, 32, 8, false)
+    a64.emit_epilogue(&mut b_its)
+    sym_int_to_str := flush_buf_to_module(&mut m, &mut b_its, &r_its, &empty_imp, "__dunder_rt_int_to_str", false)
+
+    // 10. __dunder_rt_str_concat(x0 = s1, x1 = s2) -> x0 = new String
+    mut b_cat := a64.new()
+    mut r_cat: []PendingReloc = []
+    a64.emit_prologue(&mut b_cat, 32)
+    a64.str(&mut b_cat, a64.X0, a64.SP, 0, 8) // s1
+    a64.str(&mut b_cat, a64.X1, a64.SP, 8, 8) // s2
+    a64.ldr(&mut b_cat, a64.X10, a64.X0, 0, 8, false)
+    a64.ldr(&mut b_cat, a64.X11, a64.X1, 0, 8, false)
+    a64.add_reg(&mut b_cat, true, false, a64.X12, a64.X10, a64.X11)
+    a64.str(&mut b_cat, a64.X12, a64.SP, 16, 8) // total_len
+    a64.add_imm(&mut b_cat, true, false, a64.X0, a64.X12, 17)
+    emit_call_sym(&mut b_cat, &mut r_cat, sym_alloc)
+    a64.imm(&mut b_cat, a64.X10, 1)
+    a64.str(&mut b_cat, a64.X10, a64.X0, 0, 8)
+    a64.add_imm(&mut b_cat, true, false, a64.X0, a64.X0, 8)
+    a64.str(&mut b_cat, a64.X0, a64.SP, 24, 8) // res
+    a64.ldr(&mut b_cat, a64.X12, a64.SP, 16, 8, false)
+    a64.str(&mut b_cat, a64.X12, a64.X0, 0, 8)
+    // copy s1
+    a64.add_imm(&mut b_cat, true, false, a64.X0, a64.X0, 8)
+    a64.ldr(&mut b_cat, a64.X1, a64.SP, 0, 8, false)
+    a64.ldr(&mut b_cat, a64.X2, a64.X1, 0, 8, false)
+    a64.add_imm(&mut b_cat, true, false, a64.X1, a64.X1, 8)
+    emit_call_sym(&mut b_cat, &mut r_cat, sym_memcpy)
+    // copy s2 (x0 is already advanced? memcpy advances x0 by len, let's recompute safely)
+    a64.ldr(&mut b_cat, a64.X0, a64.SP, 24, 8, false)
+    a64.ldr(&mut b_cat, a64.X10, a64.SP, 0, 8, false)
+    a64.ldr(&mut b_cat, a64.X10, a64.X10, 0, 8, false)
+    a64.add_imm(&mut b_cat, true, false, a64.X0, a64.X0, 8)
+    a64.add_reg(&mut b_cat, true, false, a64.X0, a64.X0, a64.X10)
+    a64.ldr(&mut b_cat, a64.X1, a64.SP, 8, 8, false)
+    a64.ldr(&mut b_cat, a64.X2, a64.X1, 0, 8, false)
+    a64.add_imm(&mut b_cat, true, false, a64.X1, a64.X1, 8)
+    emit_call_sym(&mut b_cat, &mut r_cat, sym_memcpy)
+    a64.ldr(&mut b_cat, a64.X0, a64.SP, 24, 8, false)
+    a64.emit_epilogue(&mut b_cat)
+    sym_str_concat := flush_buf_to_module(&mut m, &mut b_cat, &r_cat, &empty_imp, "__dunder_rt_str_concat", false)
+
+    // 11. __dunder_rt_str_eq(x0 = p1, x1 = l1, x2 = p2, x3 = l2) -> x0 = 0/1
+    mut b_eq := a64.new()
+    mut r_eq: []PendingReloc = []
+    lbl_neq := a64.label(&mut b_eq)
+    lbl_eq_loop := a64.label(&mut b_eq)
+    lbl_eq_yes := a64.label(&mut b_eq)
+    a64.cmp_reg(&mut b_eq, true, a64.X1, a64.X3)
+    a64.b_cond(&mut b_eq, a64.CC_NE, lbl_neq)
+    a64.mark(&mut b_eq, lbl_eq_loop)
+    a64.cbz(&mut b_eq, true, a64.X1, lbl_eq_yes)
+    a64.ldr(&mut b_eq, a64.X10, a64.X0, 0, 1, false)
+    a64.ldr(&mut b_eq, a64.X11, a64.X2, 0, 1, false)
+    a64.cmp_reg(&mut b_eq, true, a64.X10, a64.X11)
+    a64.b_cond(&mut b_eq, a64.CC_NE, lbl_neq)
+    a64.add_imm(&mut b_eq, true, false, a64.X0, a64.X0, 1)
+    a64.add_imm(&mut b_eq, true, false, a64.X2, a64.X2, 1)
+    a64.sub_imm(&mut b_eq, true, false, a64.X1, a64.X1, 1)
+    a64.b(&mut b_eq, lbl_eq_loop)
+    a64.mark(&mut b_eq, lbl_eq_yes)
+    a64.imm(&mut b_eq, a64.X0, 1)
+    a64.ret(&mut b_eq)
+    a64.mark(&mut b_eq, lbl_neq)
+    a64.imm(&mut b_eq, a64.X0, 0)
+    a64.ret(&mut b_eq)
+    sym_str_eq := flush_buf_to_module(&mut m, &mut b_eq, &r_eq, &empty_imp, "__dunder_rt_str_eq", false)
+
+    // 12. __dunder_rt_str_cmp(x0 = p1, x1 = l1, x2 = p2, x3 = l2) -> x0 = -1/0/1
+    mut b_cmp := a64.new()
+    mut r_cmp: []PendingReloc = []
+    lbl_cl := a64.label(&mut b_cmp)
+    lbl_c_lt := a64.label(&mut b_cmp)
+    lbl_c_gt := a64.label(&mut b_cmp)
+    lbl_c_lens := a64.label(&mut b_cmp)
+    a64.mark(&mut b_cmp, lbl_cl)
+    a64.cbz(&mut b_cmp, true, a64.X1, lbl_c_lens)
+    a64.cbz(&mut b_cmp, true, a64.X3, lbl_c_lens)
+    a64.ldr(&mut b_cmp, a64.X10, a64.X0, 0, 1, false)
+    a64.ldr(&mut b_cmp, a64.X11, a64.X2, 0, 1, false)
+    a64.cmp_reg(&mut b_cmp, true, a64.X10, a64.X11)
+    a64.b_cond(&mut b_cmp, a64.CC_LO, lbl_c_lt)
+    a64.b_cond(&mut b_cmp, a64.CC_HI, lbl_c_gt)
+    a64.add_imm(&mut b_cmp, true, false, a64.X0, a64.X0, 1)
+    a64.add_imm(&mut b_cmp, true, false, a64.X2, a64.X2, 1)
+    a64.sub_imm(&mut b_cmp, true, false, a64.X1, a64.X1, 1)
+    a64.sub_imm(&mut b_cmp, true, false, a64.X3, a64.X3, 1)
+    a64.b(&mut b_cmp, lbl_cl)
+    a64.mark(&mut b_cmp, lbl_c_lens)
+    a64.cmp_reg(&mut b_cmp, true, a64.X1, a64.X3)
+    a64.b_cond(&mut b_cmp, a64.CC_LO, lbl_c_lt)
+    a64.b_cond(&mut b_cmp, a64.CC_HI, lbl_c_gt)
+    a64.imm(&mut b_cmp, a64.X0, 0)
+    a64.ret(&mut b_cmp)
+    a64.mark(&mut b_cmp, lbl_c_lt)
+    a64.imm(&mut b_cmp, a64.X0, -1)
+    a64.ret(&mut b_cmp)
+    a64.mark(&mut b_cmp, lbl_c_gt)
+    a64.imm(&mut b_cmp, a64.X0, 1)
+    a64.ret(&mut b_cmp)
+    sym_str_cmp := flush_buf_to_module(&mut m, &mut b_cmp, &r_cmp, &empty_imp, "__dunder_rt_str_cmp", false)
+
+    // 13. __dunder_rt_arr_alloc(x0 = count, x1 = stride) -> x0 = arr_hdr ([data, len, cap, stride])
+    mut b_aa := a64.new()
+    mut r_aa: []PendingReloc = []
+    a64.emit_prologue(&mut b_aa, 32)
+    a64.str(&mut b_aa, a64.X0, a64.SP, 0, 8) // count
+    a64.str(&mut b_aa, a64.X1, a64.SP, 8, 8) // stride
+    // cap = max(count, 8)
+    a64.mov(&mut b_aa, a64.X10, a64.X0)
+    a64.cmp_imm(&mut b_aa, true, a64.X10, 8)
+    lbl_aa_cap := a64.label(&mut b_aa)
+    a64.b_cond(&mut b_aa, a64.CC_HS, lbl_aa_cap)
+    a64.imm(&mut b_aa, a64.X10, 8)
+    a64.mark(&mut b_aa, lbl_aa_cap)
+    a64.str(&mut b_aa, a64.X10, a64.SP, 16, 8) // cap
+    // Alloc 32-byte header
+    a64.imm(&mut b_aa, a64.X0, 32)
+    emit_call_sym(&mut b_aa, &mut r_aa, sym_alloc)
+    a64.str(&mut b_aa, a64.X0, a64.SP, 24, 8) // hdr
+    // Alloc cap * stride data buffer
+    a64.ldr(&mut b_aa, a64.X10, a64.SP, 16, 8, false)
+    a64.ldr(&mut b_aa, a64.X11, a64.SP, 8, 8, false)
+    a64.mul(&mut b_aa, true, a64.X0, a64.X10, a64.X11)
+    emit_call_sym(&mut b_aa, &mut r_aa, sym_alloc)
+    // Fill header
+    a64.ldr(&mut b_aa, a64.X12, a64.SP, 24, 8, false) // hdr
+    a64.ldr(&mut b_aa, a64.X10, a64.SP, 0, 8, false)  // count
+    a64.ldr(&mut b_aa, a64.X11, a64.SP, 16, 8, false) // cap
+    a64.ldr(&mut b_aa, a64.X13, a64.SP, 8, 8, false)  // stride
+    a64.str(&mut b_aa, a64.X0, a64.X12, 0, 8)         // [hdr+0] = data
+    a64.str(&mut b_aa, a64.X10, a64.X12, 8, 8)        // [hdr+8] = len
+    a64.str(&mut b_aa, a64.X11, a64.X12, 16, 8)       // [hdr+16] = cap
+    a64.str(&mut b_aa, a64.X13, a64.X12, 24, 8)       // [hdr+24] = stride
+    a64.mov(&mut b_aa, a64.X0, a64.X12)
+    a64.emit_epilogue(&mut b_aa)
+    sym_arr_alloc := flush_buf_to_module(&mut m, &mut b_aa, &r_aa, &empty_imp, "__dunder_rt_arr_alloc", false)
+
+    // 14. __dunder_rt_arr_grow(x0 = arr_hdr, x1 = min_cap)
+    mut b_ag := a64.new()
+    mut r_ag: []PendingReloc = []
+    lbl_ag_ok := a64.label(&mut b_ag)
+    a64.ldr(&mut b_ag, a64.X10, a64.X0, 16, 8, false) // cur cap
+    a64.cmp_reg(&mut b_ag, true, a64.X10, a64.X1)
+    a64.b_cond(&mut b_ag, a64.CC_HS, lbl_ag_ok)
+    a64.emit_prologue(&mut b_ag, 32)
+    a64.str(&mut b_ag, a64.X0, a64.SP, 0, 8) // hdr
+    // new_cap = max(cur_cap * 2, min_cap, 8)
+    a64.lsl_imm(&mut b_ag, true, a64.X10, a64.X10, 1)
+    a64.cmp_reg(&mut b_ag, true, a64.X10, a64.X1)
+    lbl_ag1 := a64.label(&mut b_ag)
+    a64.b_cond(&mut b_ag, a64.CC_HS, lbl_ag1)
+    a64.mov(&mut b_ag, a64.X10, a64.X1)
+    a64.mark(&mut b_ag, lbl_ag1)
+    a64.cmp_imm(&mut b_ag, true, a64.X10, 8)
+    lbl_ag2 := a64.label(&mut b_ag)
+    a64.b_cond(&mut b_ag, a64.CC_HS, lbl_ag2)
+    a64.imm(&mut b_ag, a64.X10, 8)
+    a64.mark(&mut b_ag, lbl_ag2)
+    a64.str(&mut b_ag, a64.X10, a64.SP, 8, 8) // new_cap
+    a64.ldr(&mut b_ag, a64.X11, a64.X0, 24, 8, false) // stride
+    a64.mul(&mut b_ag, true, a64.X0, a64.X10, a64.X11)
+    emit_call_sym(&mut b_ag, &mut r_ag, sym_alloc)
+    a64.str(&mut b_ag, a64.X0, a64.SP, 16, 8) // new_buf
+    // copy old elements
+    a64.ldr(&mut b_ag, a64.X12, a64.SP, 0, 8, false) // hdr
+    a64.ldr(&mut b_ag, a64.X1, a64.X12, 0, 8, false) // old_buf
+    a64.ldr(&mut b_ag, a64.X13, a64.X12, 8, 8, false) // len
+    a64.ldr(&mut b_ag, a64.X14, a64.X12, 24, 8, false) // stride
+    a64.mul(&mut b_ag, true, a64.X2, a64.X13, a64.X14)
+    emit_call_sym(&mut b_ag, &mut r_ag, sym_memcpy)
+    a64.ldr(&mut b_ag, a64.X12, a64.SP, 0, 8, false)
+    a64.ldr(&mut b_ag, a64.X10, a64.SP, 16, 8, false) // new_buf
+    a64.ldr(&mut b_ag, a64.X11, a64.SP, 8, 8, false)  // new_cap
+    a64.str(&mut b_ag, a64.X10, a64.X12, 0, 8)
+    a64.str(&mut b_ag, a64.X11, a64.X12, 16, 8)
+    a64.emit_epilogue(&mut b_ag)
+    a64.mark(&mut b_ag, lbl_ag_ok)
+    a64.ret(&mut b_ag)
+    sym_arr_grow := flush_buf_to_module(&mut m, &mut b_ag, &r_ag, &empty_imp, "__dunder_rt_arr_grow", false)
+
+    RuntimeSyms {
+        alloc: sym_alloc,
+        trap: sym_trap,
+        write_buf: sym_write_buf,
+        print_str: sym_print_str,
+        print_int: sym_print_int,
+        print_bool: sym_print_bool,
+        int_to_str: sym_int_to_str,
+        str_concat: sym_str_concat,
+        str_eq: sym_str_eq,
+        str_cmp: sym_str_cmp,
+        arr_alloc: sym_arr_alloc,
+        arr_grow: sym_arr_grow,
+        memcpy: sym_memcpy,
+        memzero: sym_memzero,
+        ro_true: ro_true,
+        ro_false: ro_false,
+        ro_nl: ro_nl,
+    }
+}
+
+// =========================================================================
+// 5. Function Codegen Context & Value Load / Store Helpers
+// =========================================================================
+
+struct FnCodegen {
+    buf: a64.ArmBuf,
+    relocs: []PendingReloc,
+    imp_sites: []PendingImport,
+    plan: RegAllocPlan,
+    slot_offs: []i32,     // negative offset magnitude from FP for each StackSlot
+    callee_gp_offs: []i32,
+    callee_fp_offs: []i32,
+    sret_off: i32,        // >0 if function uses indirect sret in x8
+    env_off: i32,         // >0 if function is closure body (x9 saved here)
+    region_offs: []i32,   // negative offset magnitude for saved (x19, x20) per region scope
+    region_ids: []i32,
+    frame_bytes: i32,
+    bb_labels: []i32,
+    epilogue_lbl: i32,
+    trap_101: i32,
+    trap_102: i32,
+    trap_103: i32,
+    trap_104: i32,
+    trap_105: i32,
+    trap_106: i32,
+    ro_counter: i32,
+}
+
+fn find_region_off(fc: &FnCodegen, scope_id: i32) -> i32 {
+    for i in 0..fc.region_ids.len {
+        if fc.region_ids[i] == scope_id { return fc.region_offs[i] }
+    }
+    -1
+}
+
+// Materialize GP SsaVal `v` into physical GP register `dst` (or return its already-assigned GP reg if `prefer_reg < 0`).
+fn load_gp_val(fc: &mut FnCodegen, v: i32, scratch: i32) -> i32 {
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg { return loc.reg_lo }
+    if loc.kind == .Spill {
+        emit_ldr_off(&mut fc.buf, scratch, a64.FP, -i64(loc.spill_off), 8, false)
+        return scratch
+    }
+    a64.imm(&mut fc.buf, scratch, 0)
+    scratch
+}
+
+fn load_gp_into(fc: &mut FnCodegen, v: i32, dst: i32) {
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg {
+        a64.mov(&mut fc.buf, dst, loc.reg_lo)
+    } else if loc.kind == .Spill {
+        emit_ldr_off(&mut fc.buf, dst, a64.FP, -i64(loc.spill_off), 8, false)
+    } else {
+        a64.imm(&mut fc.buf, dst, 0)
+    }
+}
+
+fn store_gp_val(fc: &mut FnCodegen, v: i32, src: i32) {
+    if v < 0 { return }
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg {
+        a64.mov(&mut fc.buf, loc.reg_lo, src)
+    } else if loc.kind == .Spill {
+        emit_str_off(&mut fc.buf, src, a64.FP, -i64(loc.spill_off), 8)
+    }
+}
+
+fn dst_gp_reg(fc: &FnCodegen, v: i32, scratch: i32) -> i32 {
+    if v >= 0 && fc.plan.locs[v].kind == .Reg { return fc.plan.locs[v].reg_lo }
+    scratch
+}
+
+fn commit_gp_dst(fc: &mut FnCodegen, v: i32, reg: i32) {
+    if v >= 0 && fc.plan.locs[v].kind == .Spill {
+        emit_str_off(&mut fc.buf, reg, a64.FP, -i64(fc.plan.locs[v].spill_off), 8)
+    }
+}
+
+// Materialize FP SsaVal `v` into FP reg (returns its reg or loads into `scratch`).
+fn load_fp_val(fc: &mut FnCodegen, v: i32, scratch: i32) -> i32 {
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg { return loc.reg_lo }
+    if loc.kind == .Spill {
+        emit_ldr_fp_off(&mut fc.buf, loc.is_f64, scratch, a64.FP, -i64(loc.spill_off))
+        return scratch
+    }
+    a64.fmov_to_fp(&mut fc.buf, loc.is_f64, scratch, a64.XZR)
+    scratch
+}
+
+fn load_fp_into(fc: &mut FnCodegen, v: i32, dst: i32) {
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg {
+        if dst != loc.reg_lo { a64.fmov_reg(&mut fc.buf, loc.is_f64, dst, loc.reg_lo) }
+    } else if loc.kind == .Spill {
+        emit_ldr_fp_off(&mut fc.buf, loc.is_f64, dst, a64.FP, -i64(loc.spill_off))
+    } else {
+        a64.fmov_to_fp(&mut fc.buf, loc.is_f64, dst, a64.XZR)
+    }
+}
+
+fn store_fp_val(fc: &mut FnCodegen, v: i32, src: i32) {
+    if v < 0 { return }
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg {
+        if loc.reg_lo != src { a64.fmov_reg(&mut fc.buf, loc.is_f64, loc.reg_lo, src) }
+    } else if loc.kind == .Spill {
+        emit_str_fp_off(&mut fc.buf, loc.is_f64, src, a64.FP, -i64(loc.spill_off))
+    }
+}
+
+fn dst_fp_reg(fc: &FnCodegen, v: i32, scratch: i32) -> i32 {
+    if v >= 0 && fc.plan.locs[v].kind == .Reg { return fc.plan.locs[v].reg_lo }
+    scratch
+}
+
+fn commit_fp_dst(fc: &mut FnCodegen, v: i32, reg: i32) {
+    if v >= 0 && fc.plan.locs[v].kind == .Spill {
+        emit_str_fp_off(&mut fc.buf, fc.plan.locs[v].is_f64, reg, a64.FP, -i64(fc.plan.locs[v].spill_off))
+    }
+}
+
+// Materialize 2-word Fat SsaVal `v` into (ptr_dst, len_dst) GP registers.
+fn load_fat_into(fc: &mut FnCodegen, v: i32, ptr_dst: i32, len_dst: i32) {
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg {
+        if ptr_dst == loc.reg_hi && len_dst == loc.reg_lo {
+            a64.mov(&mut fc.buf, a64.X16, loc.reg_lo)
+            a64.mov(&mut fc.buf, ptr_dst, loc.reg_hi)
+            a64.mov(&mut fc.buf, len_dst, a64.X16)
+        } else if ptr_dst == loc.reg_hi {
+            a64.mov(&mut fc.buf, len_dst, loc.reg_hi)
+            a64.mov(&mut fc.buf, ptr_dst, loc.reg_lo)
+        } else {
+            a64.mov(&mut fc.buf, ptr_dst, loc.reg_lo)
+            a64.mov(&mut fc.buf, len_dst, loc.reg_hi)
+        }
+    } else if loc.kind == .Spill {
+        emit_ldr_off(&mut fc.buf, ptr_dst, a64.FP, -i64(loc.spill_off), 8, false)
+        emit_ldr_off(&mut fc.buf, len_dst, a64.FP, -i64(loc.spill_off) + 8, 8, false)
+    } else {
+        a64.imm(&mut fc.buf, ptr_dst, 0)
+        a64.imm(&mut fc.buf, len_dst, 0)
+    }
+}
+
+fn store_fat_val(fc: &mut FnCodegen, v: i32, ptr_src: i32, len_src: i32) {
+    if v < 0 { return }
+    loc := fc.plan.locs[v]
+    if loc.kind == .Reg {
+        if loc.reg_lo == len_src && loc.reg_hi == ptr_src {
+            a64.mov(&mut fc.buf, a64.X16, ptr_src)
+            a64.mov(&mut fc.buf, loc.reg_lo, len_src)
+            a64.mov(&mut fc.buf, loc.reg_hi, a64.X16)
+        } else if loc.reg_lo == len_src {
+            a64.mov(&mut fc.buf, loc.reg_hi, len_src)
+            a64.mov(&mut fc.buf, loc.reg_lo, ptr_src)
+        } else {
+            a64.mov(&mut fc.buf, loc.reg_lo, ptr_src)
+            a64.mov(&mut fc.buf, loc.reg_hi, len_src)
+        }
+    } else if loc.kind == .Spill {
+        emit_str_off(&mut fc.buf, ptr_src, a64.FP, -i64(loc.spill_off), 8)
+        emit_str_off(&mut fc.buf, len_src, a64.FP, -i64(loc.spill_off) + 8, 8)
+    }
+}
+
+fn emit_memcpy_size(fc: &mut FnCodegen, rt: &RuntimeSyms, dst_reg: i32, src_reg: i32, size: i32) {
+    if size <= 0 { return }
+    if size <= 64 {
+        emit_inline_memcpy(&mut fc.buf, dst_reg, src_reg, size)
+    } else {
+        a64.mov(&mut fc.buf, a64.X0, dst_reg)
+        a64.mov(&mut fc.buf, a64.X1, src_reg)
+        a64.imm(&mut fc.buf, a64.X2, i64(size))
+        emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.memcpy)
+    }
+}
+
+fn emit_memzero_size(fc: &mut FnCodegen, rt: &RuntimeSyms, dst_reg: i32, size: i32) {
+    if size <= 0 { return }
+    if size <= 64 {
+        emit_inline_memzero(&mut fc.buf, dst_reg, size)
+    } else {
+        a64.mov(&mut fc.buf, a64.X0, dst_reg)
+        a64.imm(&mut fc.buf, a64.X1, i64(size))
+        emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.memzero)
+    }
+}
+
+// =========================================================================
+// 6. Parallel Copy Lowering on CFG Edges (Handles Cycles via x16/x17, d16/d17)
+// =========================================================================
+
+struct ScalarMove {
+    src_is_reg: bool,
+    src_loc: i32,    // reg num if src_is_reg, else negative-offset magnitude from FP
+    dst_is_reg: bool,
+    dst_loc: i32,
+    is_f64: bool,
+    done: bool,
+}
+
+fn emit_one_gp_move(buf: &mut a64.ArmBuf, mv: ScalarMove) {
+    if mv.src_is_reg && mv.dst_is_reg {
+        a64.mov(&mut buf, mv.dst_loc, mv.src_loc)
+    } else if mv.src_is_reg && !mv.dst_is_reg {
+        emit_str_off(&mut buf, mv.src_loc, a64.FP, -i64(mv.dst_loc), 8)
+    } else if !mv.src_is_reg && mv.dst_is_reg {
+        emit_ldr_off(&mut buf, mv.dst_loc, a64.FP, -i64(mv.src_loc), 8, false)
+    } else {
+        emit_ldr_off(&mut buf, a64.X16, a64.FP, -i64(mv.src_loc), 8, false)
+        emit_str_off(&mut buf, a64.X16, a64.FP, -i64(mv.dst_loc), 8)
+    }
+}
+
+fn emit_one_fp_move(buf: &mut a64.ArmBuf, mv: ScalarMove) {
+    if mv.src_is_reg && mv.dst_is_reg {
+        if mv.dst_loc != mv.src_loc { a64.fmov_reg(&mut buf, mv.is_f64, mv.dst_loc, mv.src_loc) }
+    } else if mv.src_is_reg && !mv.dst_is_reg {
+        emit_str_fp_off(&mut buf, mv.is_f64, mv.src_loc, a64.FP, -i64(mv.dst_loc))
+    } else if !mv.src_is_reg && mv.dst_is_reg {
+        emit_ldr_fp_off(&mut buf, mv.is_f64, mv.dst_loc, a64.FP, -i64(mv.src_loc))
+    } else {
+        emit_ldr_fp_off(&mut buf, mv.is_f64, 16, a64.FP, -i64(mv.src_loc))
+        emit_str_fp_off(&mut buf, mv.is_f64, 16, a64.FP, -i64(mv.dst_loc))
+    }
+}
+
+fn run_parallel_moves(buf: &mut a64.ArmBuf, moves: &mut []ScalarMove, is_fp: bool) {
+    mut remaining := 0
+    for i in 0..moves.len {
+        m := moves[i]
+        if m.src_is_reg == m.dst_is_reg && m.src_loc == m.dst_loc {
+            moves[i].done = true
+        } else {
+            remaining += 1
+        }
+    }
+    scratch := if is_fp { 17 } else { a64.X17 }
+    while remaining > 0 {
+        // Find a move whose dst is NOT the src of any other undone move
+        mut ready := -1
+        for i in 0..moves.len {
+            if moves[i].done { continue }
+            di_r := moves[i].dst_is_reg
+            di_l := moves[i].dst_loc
+            mut blocked := false
+            for j in 0..moves.len {
+                if i == j || moves[j].done { continue }
+                if moves[j].src_is_reg == di_r && moves[j].src_loc == di_l {
+                    blocked = true
+                    break
+                }
+            }
+            if !blocked {
+                ready = i
+                break
+            }
+        }
+        if ready >= 0 {
+            if is_fp { emit_one_fp_move(&mut buf, moves[ready]) }
+            else { emit_one_gp_move(&mut buf, moves[ready]) }
+            moves[ready].done = true
+            remaining -= 1
+        } else {
+            // Break cycle: pick first undone move, save its dst to scratch (x17/d17)
+            mut pick := -1
+            for i in 0..moves.len {
+                if !moves[i].done { pick = i; break }
+            }
+            if pick < 0 { break }
+            d_r := moves[pick].dst_is_reg
+            d_l := moves[pick].dst_loc
+            mv_f64 := moves[pick].is_f64
+            save_mv := ScalarMove {
+                src_is_reg: d_r, src_loc: d_l,
+                dst_is_reg: true, dst_loc: scratch,
+                is_f64: mv_f64, done: false,
+            }
+            if is_fp { emit_one_fp_move(&mut buf, save_mv) }
+            else { emit_one_gp_move(&mut buf, save_mv) }
+            for j in 0..moves.len {
+                if !moves[j].done && moves[j].src_is_reg == d_r && moves[j].src_loc == d_l {
+                    moves[j].src_is_reg = true
+                    moves[j].src_loc = scratch
+                }
+            }
+        }
+    }
+}
+
+fn emit_edge_copies(fc: &mut FnCodegen, types: &ht.TypeTable, f: &ssa.SsaFunc, rt: &RuntimeSyms,
+    target_bb: i32, arg_start: i32, arg_len: i32) {
+    if arg_len <= 0 { return }
+    p_start := f.blocks[target_bb].params_start
+    mut gp_moves: []ScalarMove = []
+    mut fp_moves: []ScalarMove = []
+
+    for i in 0..arg_len {
+        src_v := f.val_args[arg_start + i]
+        dst_v := f.block_params[p_start + i]
+        sl := fc.plan.locs[src_v]
+        dl := fc.plan.locs[dst_v]
+        if dl.cls == .Void || dl.kind == .None { continue }
+        if dl.cls == .Gp {
+            gp_moves.push(ScalarMove {
+                src_is_reg: sl.kind == .Reg,
+                src_loc: if sl.kind == .Reg { sl.reg_lo } else { sl.spill_off },
+                dst_is_reg: dl.kind == .Reg,
+                dst_loc: if dl.kind == .Reg { dl.reg_lo } else { dl.spill_off },
+                is_f64: false,
+                done: false,
+            })
+        } else if dl.cls == .Fp {
+            fp_moves.push(ScalarMove {
+                src_is_reg: sl.kind == .Reg,
+                src_loc: if sl.kind == .Reg { sl.reg_lo } else { sl.spill_off },
+                dst_is_reg: dl.kind == .Reg,
+                dst_loc: if dl.kind == .Reg { dl.reg_lo } else { dl.spill_off },
+                is_f64: dl.is_f64,
+                done: false,
+            })
+        } else if dl.cls == .Fat {
+            gp_moves.push(ScalarMove {
+                src_is_reg: sl.kind == .Reg,
+                src_loc: if sl.kind == .Reg { sl.reg_lo } else { sl.spill_off },
+                dst_is_reg: dl.kind == .Reg,
+                dst_loc: if dl.kind == .Reg { dl.reg_lo } else { dl.spill_off },
+                is_f64: false,
+                done: false,
+            })
+            gp_moves.push(ScalarMove {
+                src_is_reg: sl.kind == .Reg,
+                src_loc: if sl.kind == .Reg { sl.reg_hi } else { sl.spill_off - 8 },
+                dst_is_reg: dl.kind == .Reg,
+                dst_loc: if dl.kind == .Reg { dl.reg_hi } else { dl.spill_off - 8 },
+                is_f64: false,
+                done: false,
+            })
+        } else if dl.cls == .Agg {
+            sz := type_size(&types, f.vals[dst_v].ty)
+            if sz > 0 && sl.spill_off != dl.spill_off {
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(dl.spill_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(sl.spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+            }
+        }
+    }
+
+    if gp_moves.len > 0 { run_parallel_moves(&mut fc.buf, &mut gp_moves, false) }
+    if fp_moves.len > 0 { run_parallel_moves(&mut fc.buf, &mut fp_moves, true) }
+}
+
+// =========================================================================
+// 7. Instruction Lowering (All SsaInstKind Ops)
+// =========================================================================
+
+fn emit_overflow_check(fc: &mut FnCodegen, types: &ht.TypeTable, ins: &ssa.SsaInst) {
+    ty := ins.aux_ty
+    sz := type_size(&types, ty)
+    is_unsigned := ssa.is_unsigned_int_ty(&types, ty)
+    op := ins.aux
+    ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+    rb := load_gp_val(&mut fc, ins.op_b, a64.X1)
+
+    if op == hb.BINOP_DIV || op == hb.BINOP_MOD {
+        // Check rhs == 0 -> trap 102
+        a64.cbz(&mut fc.buf, true, rb, fc.trap_102)
+        // Signed MIN / -1 -> trap 101
+        if !is_unsigned {
+            min_v: i64 = if sz == 1 { -128 }
+                else if sz == 2 { -32768 }
+                else if sz == 4 { -2147483648 }
+                else { -9223372036854775807 - 1 }
+            ok_lbl := a64.label(&mut fc.buf)
+            emit_cmp_imm_any(&mut fc.buf, true, rb, -1)
+            a64.b_cond(&mut fc.buf, a64.CC_NE, ok_lbl)
+            emit_cmp_imm_any(&mut fc.buf, true, ra, min_v)
+            a64.b_cond(&mut fc.buf, a64.CC_EQ, fc.trap_101)
+            a64.mark(&mut fc.buf, ok_lbl)
+        }
+        return
+    }
+
+    if op == hb.BINOP_ADD {
+        if sz == 4 || sz == 8 {
+            wide := sz == 8
+            a64.add_reg(&mut fc.buf, wide, true, a64.X16, ra, rb)
+            a64.b_cond(&mut fc.buf, if is_unsigned { a64.CC_CS } else { a64.CC_VS }, fc.trap_101)
+        } else {
+            a64.add_reg(&mut fc.buf, true, false, a64.X16, ra, rb)
+            emit_normalize_int(&mut fc.buf, &types, ty, a64.X17, a64.X16)
+            a64.cmp_reg(&mut fc.buf, true, a64.X16, a64.X17)
+            a64.b_cond(&mut fc.buf, a64.CC_NE, fc.trap_101)
+        }
+        return
+    }
+
+    if op == hb.BINOP_SUB {
+        if sz == 4 || sz == 8 {
+            wide := sz == 8
+            a64.sub_reg(&mut fc.buf, wide, true, a64.X16, ra, rb)
+            a64.b_cond(&mut fc.buf, if is_unsigned { a64.CC_CC } else { a64.CC_VS }, fc.trap_101)
+        } else {
+            a64.sub_reg(&mut fc.buf, true, false, a64.X16, ra, rb)
+            emit_normalize_int(&mut fc.buf, &types, ty, a64.X17, a64.X16)
+            a64.cmp_reg(&mut fc.buf, true, a64.X16, a64.X17)
+            a64.b_cond(&mut fc.buf, a64.CC_NE, fc.trap_101)
+        }
+        return
+    }
+
+    if op == hb.BINOP_MUL {
+        if sz == 8 {
+            if is_unsigned {
+                a64.umulh(&mut fc.buf, a64.X17, ra, rb)
+                a64.cbnz(&mut fc.buf, true, a64.X17, fc.trap_101)
+            } else {
+                a64.mul(&mut fc.buf, true, a64.X16, ra, rb)
+                a64.smulh(&mut fc.buf, a64.X17, ra, rb)
+                a64.asr_imm(&mut fc.buf, true, a64.X2, a64.X16, 63)
+                a64.cmp_reg(&mut fc.buf, true, a64.X17, a64.X2)
+                a64.b_cond(&mut fc.buf, a64.CC_NE, fc.trap_101)
+            }
+        } else {
+            a64.mul(&mut fc.buf, true, a64.X16, ra, rb)
+            emit_normalize_int(&mut fc.buf, &types, ty, a64.X17, a64.X16)
+            a64.cmp_reg(&mut fc.buf, true, a64.X16, a64.X17)
+            a64.b_cond(&mut fc.buf, a64.CC_NE, fc.trap_101)
+        }
+    }
+}
+
+fn emit_inst(m: &mut obj.ObjectModule, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &mut FnCodegen, rt: &RuntimeSyms, fn_syms: &[]i32, ins: &ssa.SsaInst) {
+    types := &hir.types
+    k := ins.kind
+    if k == .Nop { return }
+
+    if k == .ConstInt {
+        if ins.res < 0 || fc.plan.locs[ins.res].cls == .Void { return }
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        a64.imm(&mut fc.buf, dst, ins.imm_i64)
+        emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .ConstFloat {
+        if ins.res < 0 { return }
+        is64 := is_f64_ty(&types, ins.ty)
+        vd := dst_fp_reg(&fc, ins.res, 16)
+        a64.imm(&mut fc.buf, a64.X16, ins.imm_i64)
+        a64.fmov_to_fp(&mut fc.buf, is64, vd, a64.X16)
+        commit_fp_dst(&mut fc, ins.res, vd)
+        return
+    }
+
+    if k == .ConstStr {
+        if ins.res < 0 { return }
+        text := f.const_strs[ins.str_idx].clone()
+        fc.ro_counter += 1
+        sym := append_rodata_dunder_str(&mut m, "__str_" + f.fn_id.str() + "_" + fc.ro_counter.str(), text)
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        emit_adrp_sym(&mut fc.buf, &mut fc.relocs, dst, sym, 0)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .ConstCStr {
+        if ins.res < 0 { return }
+        text := f.const_strs[ins.str_idx].clone()
+        fc.ro_counter += 1
+        sym := append_rodata_cstr(&mut m, "__cstr_" + f.fn_id.str() + "_" + fc.ro_counter.str(), text)
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        emit_adrp_sym(&mut fc.buf, &mut fc.relocs, dst, sym, 0)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .ConstWStr {
+        if ins.res < 0 { return }
+        text := f.const_strs[ins.str_idx].clone()
+        mut blob: []u8 = []
+        for i in 0..text.len {
+            blob.push(text[i])
+            blob.push(u8(0))
+        }
+        blob.push(u8(0))
+        blob.push(u8(0))
+        off := obj.append_rodata(&mut m, &blob, 2)
+        fc.ro_counter += 1
+        sym := obj.add_symbol(&mut m, "__wstr_" + f.fn_id.str() + "_" + fc.ro_counter.str(), .RodataBlob, .Rodata, off, blob.len, false)
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        emit_adrp_sym(&mut fc.buf, &mut fc.relocs, dst, sym, 0)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .ConstBlob {
+        if ins.res < 0 { return }
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        bid := i32(ins.imm_i64)
+        if bid >= 0 && bid < hir.embed_starts.len {
+            bs := hir.embed_starts[bid]
+            bc := hir.embed_counts[bid]
+            mut blob: []u8 = []
+            for i in 0..bc { blob.push(hir.embed_blobs[bs + i]) }
+            off := obj.append_rodata(&mut m, &blob, 8)
+            fc.ro_counter += 1
+            sym := obj.add_symbol(&mut m, "__blob_" + f.fn_id.str() + "_" + fc.ro_counter.str(), .RodataBlob, .Rodata, off, blob.len, false)
+            emit_adrp_sym(&mut fc.buf, &mut fc.relocs, dst, sym, 0)
+        } else {
+            a64.imm(&mut fc.buf, dst, 0)
+        }
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .ConstFn {
+        if ins.res < 0 { return }
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        fid := ins.aux
+        if fid >= 0 && fid < fn_syms.len && fn_syms[fid] >= 0 {
+            emit_adrp_sym(&mut fc.buf, &mut fc.relocs, dst, fn_syms[fid], 0)
+        } else {
+            a64.imm(&mut fc.buf, dst, 0)
+        }
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .Copy {
+        if ins.res < 0 { return }
+        cls := fc.plan.locs[ins.res].cls
+        if cls == .Void { return }
+        if cls == .Gp {
+            src := load_gp_val(&mut fc, ins.op_a, a64.X0)
+            store_gp_val(&mut fc, ins.res, src)
+        } else if cls == .Fp {
+            src := load_fp_val(&mut fc, ins.op_a, 16)
+            store_fp_val(&mut fc, ins.res, src)
+        } else if cls == .Fat {
+            load_fat_into(&mut fc, ins.op_a, a64.X0, a64.X1)
+            store_fat_val(&mut fc, ins.res, a64.X0, a64.X1)
+        } else if cls == .Agg {
+            sz := type_size(&types, ins.ty)
+            if sz > 0 {
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[ins.res].spill_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[ins.op_a].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+            }
+        }
+        return
+    }
+
+    if k == .Binary {
+        if ins.res < 0 { return }
+        aty := f.vals[ins.op_a].ty
+        ak := types.entries[aty].kind
+        op := ins.aux
+
+        // String binary ops
+        if ak == .String {
+            if op == hb.BINOP_ADD {
+                load_gp_into(&mut fc, ins.op_a, a64.X0)
+                load_gp_into(&mut fc, ins.op_b, a64.X1)
+                emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.str_concat)
+                store_gp_val(&mut fc, ins.res, a64.X0)
+            } else if op == hb.BINOP_EQ || op == hb.BINOP_NE {
+                load_gp_into(&mut fc, ins.op_a, a64.X4)
+                load_gp_into(&mut fc, ins.op_b, a64.X5)
+                a64.ldr(&mut fc.buf, a64.X1, a64.X4, 0, 8, false)
+                a64.add_imm(&mut fc.buf, true, false, a64.X0, a64.X4, 8)
+                a64.ldr(&mut fc.buf, a64.X3, a64.X5, 0, 8, false)
+                a64.add_imm(&mut fc.buf, true, false, a64.X2, a64.X5, 8)
+                emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.str_eq)
+                if op == hb.BINOP_NE {
+                    a64.imm(&mut fc.buf, a64.X16, 1)
+                    a64.eor_reg(&mut fc.buf, true, a64.X0, a64.X0, a64.X16)
+                }
+                store_gp_val(&mut fc, ins.res, a64.X0)
+            } else {
+                load_gp_into(&mut fc, ins.op_a, a64.X4)
+                load_gp_into(&mut fc, ins.op_b, a64.X5)
+                a64.ldr(&mut fc.buf, a64.X1, a64.X4, 0, 8, false)
+                a64.add_imm(&mut fc.buf, true, false, a64.X0, a64.X4, 8)
+                a64.ldr(&mut fc.buf, a64.X3, a64.X5, 0, 8, false)
+                a64.add_imm(&mut fc.buf, true, false, a64.X2, a64.X5, 8)
+                emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.str_cmp)
+                a64.cmp_imm(&mut fc.buf, true, a64.X0, 0)
+                cc := if op == hb.BINOP_LT { a64.CC_LT }
+                    else if op == hb.BINOP_LE { a64.CC_LE }
+                    else if op == hb.BINOP_GT { a64.CC_GT }
+                    else { a64.CC_GE }
+                a64.cset(&mut fc.buf, a64.X0, cc)
+                store_gp_val(&mut fc, ins.res, a64.X0)
+            }
+            return
+        }
+
+        // FatStr binary ops
+        if ak == .FatStr {
+            load_fat_into(&mut fc, ins.op_a, a64.X0, a64.X1)
+            load_fat_into(&mut fc, ins.op_b, a64.X2, a64.X3)
+            if op == hb.BINOP_EQ || op == hb.BINOP_NE {
+                emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.str_eq)
+                if op == hb.BINOP_NE {
+                    a64.imm(&mut fc.buf, a64.X16, 1)
+                    a64.eor_reg(&mut fc.buf, true, a64.X0, a64.X0, a64.X16)
+                }
+                store_gp_val(&mut fc, ins.res, a64.X0)
+            } else {
+                emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.str_cmp)
+                a64.cmp_imm(&mut fc.buf, true, a64.X0, 0)
+                cc := if op == hb.BINOP_LT { a64.CC_LT }
+                    else if op == hb.BINOP_LE { a64.CC_LE }
+                    else if op == hb.BINOP_GT { a64.CC_GT }
+                    else { a64.CC_GE }
+                a64.cset(&mut fc.buf, a64.X0, cc)
+                store_gp_val(&mut fc, ins.res, a64.X0)
+            }
+            return
+        }
+
+        // Float binary ops
+        if ak == .F32 || ak == .F64 {
+            is64 := ak == .F64
+            va := load_fp_val(&mut fc, ins.op_a, 16)
+            vb := load_fp_val(&mut fc, ins.op_b, 17)
+            if op == hb.BINOP_ADD || op == hb.BINOP_SUB || op == hb.BINOP_MUL || op == hb.BINOP_DIV {
+                vd := dst_fp_reg(&fc, ins.res, 16)
+                if op == hb.BINOP_ADD { a64.fadd(&mut fc.buf, is64, vd, va, vb) }
+                else if op == hb.BINOP_SUB { a64.fsub(&mut fc.buf, is64, vd, va, vb) }
+                else if op == hb.BINOP_MUL { a64.fmul(&mut fc.buf, is64, vd, va, vb) }
+                else { a64.fdiv(&mut fc.buf, is64, vd, va, vb) }
+                commit_fp_dst(&mut fc, ins.res, vd)
+            } else {
+                a64.fcmp(&mut fc.buf, is64, va, vb)
+                cc := if op == hb.BINOP_EQ { a64.CC_EQ }
+                    else if op == hb.BINOP_NE { a64.CC_NE }
+                    else if op == hb.BINOP_LT { a64.CC_MI }
+                    else if op == hb.BINOP_LE { a64.CC_LS }
+                    else if op == hb.BINOP_GT { a64.CC_GT }
+                    else { a64.CC_GE }
+                dst := dst_gp_reg(&fc, ins.res, a64.X0)
+                a64.cset(&mut fc.buf, dst, cc)
+                commit_gp_dst(&mut fc, ins.res, dst)
+            }
+            return
+        }
+
+        // Integer / Bool / Ptr / Enum binary ops
+        ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        rb := load_gp_val(&mut fc, ins.op_b, a64.X1)
+        dst := dst_gp_reg(&fc, ins.res, a64.X2)
+        is_u := ssa.is_unsigned_int_ty(&types, aty) || ak == .Bool || ak == .Ptr || ak == .Ref || ak == .MutRef || ak == .RawConst || ak == .RawMut
+        if op == hb.BINOP_ADD {
+            a64.add_reg(&mut fc.buf, true, false, dst, ra, rb)
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        } else if op == hb.BINOP_SUB {
+            a64.sub_reg(&mut fc.buf, true, false, dst, ra, rb)
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        } else if op == hb.BINOP_MUL {
+            a64.mul(&mut fc.buf, true, dst, ra, rb)
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        } else if op == hb.BINOP_DIV {
+            if is_u { a64.udiv(&mut fc.buf, true, dst, ra, rb) }
+            else { a64.sdiv(&mut fc.buf, true, dst, ra, rb) }
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        } else if op == hb.BINOP_MOD {
+            if is_u { a64.udiv(&mut fc.buf, true, a64.X16, ra, rb) }
+            else { a64.sdiv(&mut fc.buf, true, a64.X16, ra, rb) }
+            a64.msub(&mut fc.buf, true, dst, a64.X16, rb, ra)
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        } else if op == hb.BINOP_AND {
+            a64.and_reg(&mut fc.buf, true, false, dst, ra, rb)
+        } else if op == hb.BINOP_OR {
+            a64.orr_reg(&mut fc.buf, true, dst, ra, rb)
+        } else {
+            a64.cmp_reg(&mut fc.buf, true, ra, rb)
+            cc := if op == hb.BINOP_EQ { a64.CC_EQ }
+                else if op == hb.BINOP_NE { a64.CC_NE }
+                else if op == hb.BINOP_LT { if is_u { a64.CC_LO } else { a64.CC_LT } }
+                else if op == hb.BINOP_LE { if is_u { a64.CC_LS } else { a64.CC_LE } }
+                else if op == hb.BINOP_GT { if is_u { a64.CC_HI } else { a64.CC_GT } }
+                else { if is_u { a64.CC_HS } else { a64.CC_GE } }
+            a64.cset(&mut fc.buf, dst, cc)
+        }
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .Unary {
+        if ins.res < 0 { return }
+        aty := f.vals[ins.op_a].ty
+        ak := types.entries[aty].kind
+        if ak == .F32 || ak == .F64 {
+            is64 := ak == .F64
+            va := load_fp_val(&mut fc, ins.op_a, 16)
+            vd := dst_fp_reg(&fc, ins.res, 16)
+            a64.fneg(&mut fc.buf, is64, vd, va)
+            commit_fp_dst(&mut fc, ins.res, vd)
+            return
+        }
+        ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        dst := dst_gp_reg(&fc, ins.res, a64.X1)
+        if ins.aux == hb.UNOP_NEG {
+            a64.neg(&mut fc.buf, true, false, dst, ra)
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        } else if ins.aux == hb.UNOP_NOT {
+            a64.cmp_imm(&mut fc.buf, true, ra, 0)
+            a64.cset(&mut fc.buf, dst, a64.CC_EQ)
+        } else {
+            a64.mvn(&mut fc.buf, true, dst, ra)
+            emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        }
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .Cast {
+        if ins.res < 0 { return }
+        src_ty := f.vals[ins.op_a].ty
+        dst_ty := ins.ty
+        sk := types.entries[src_ty].kind
+        dk := types.entries[dst_ty].kind
+
+        // Special ssa_lower casts: String -> Ptr (+8), Array -> Ptr ([arr+0])
+        if sk == .String && (dk == .Ptr || dk == .RawConst || dk == .RawMut) {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+            dst := dst_gp_reg(&fc, ins.res, a64.X1)
+            a64.add_imm(&mut fc.buf, true, false, dst, ra, 8)
+            commit_gp_dst(&mut fc, ins.res, dst)
+            return
+        }
+        if sk == .Array && (dk == .Ptr || dk == .RawConst || dk == .RawMut) {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+            dst := dst_gp_reg(&fc, ins.res, a64.X1)
+            a64.ldr(&mut fc.buf, dst, ra, 0, 8, false)
+            commit_gp_dst(&mut fc, ins.res, dst)
+            return
+        }
+
+        // Float <-> Float
+        if (sk == .F32 || sk == .F64) && (dk == .F32 || dk == .F64) {
+            va := load_fp_val(&mut fc, ins.op_a, 16)
+            vd := dst_fp_reg(&fc, ins.res, 16)
+            if sk == .F32 && dk == .F64 { a64.fcvt_f32_to_f64(&mut fc.buf, vd, va) }
+            else if sk == .F64 && dk == .F32 { a64.fcvt_f64_to_f32(&mut fc.buf, vd, va) }
+            else if vd != va { a64.fmov_reg(&mut fc.buf, dk == .F64, vd, va) }
+            commit_fp_dst(&mut fc, ins.res, vd)
+            return
+        }
+
+        // Int -> Float
+        if (dk == .F32 || dk == .F64) {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+            vd := dst_fp_reg(&fc, ins.res, 16)
+            if ssa.is_unsigned_int_ty(&types, src_ty) || sk == .Bool {
+                a64.ucvtf(&mut fc.buf, true, dk == .F64, vd, ra)
+            } else {
+                a64.scvtf(&mut fc.buf, true, dk == .F64, vd, ra)
+            }
+            commit_fp_dst(&mut fc, ins.res, vd)
+            return
+        }
+
+        // Float -> Int
+        if (sk == .F32 || sk == .F64) {
+            va := load_fp_val(&mut fc, ins.op_a, 16)
+            dst := dst_gp_reg(&fc, ins.res, a64.X0)
+            if ssa.is_unsigned_int_ty(&types, dst_ty) {
+                a64.fcvtzu(&mut fc.buf, true, sk == .F64, dst, va)
+            } else {
+                a64.fcvtzs(&mut fc.buf, true, sk == .F64, dst, va)
+            }
+            emit_normalize_int(&mut fc.buf, &types, dst_ty, dst, dst)
+            commit_gp_dst(&mut fc, ins.res, dst)
+            return
+        }
+
+        // GP -> GP (int/bool/ptr/ref/fn/closure)
+        if fc.plan.locs[ins.res].cls == .Gp {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X0)
+            dst := dst_gp_reg(&fc, ins.res, a64.X1)
+            if dk == .Bool {
+                a64.cmp_imm(&mut fc.buf, true, ra, 0)
+                a64.cset(&mut fc.buf, dst, a64.CC_NE)
+            } else {
+                emit_normalize_int(&mut fc.buf, &types, dst_ty, dst, ra)
+            }
+            commit_gp_dst(&mut fc, ins.res, dst)
+        }
+        return
+    }
+
+    if k == .SlotAddr {
+        if ins.res < 0 { return }
+        sl_off := fc.slot_offs[ins.aux]
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        emit_add_imm_any(&mut fc.buf, dst, a64.FP, -i64(sl_off) + ins.imm_i64)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .FieldAddr {
+        if ins.res < 0 { return }
+        base := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        dst := dst_gp_reg(&fc, ins.res, a64.X1)
+        emit_add_imm_any(&mut fc.buf, dst, base, ins.imm_i64)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .IndexAddr {
+        if ins.res < 0 { return }
+        base := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        idx := load_gp_val(&mut fc, ins.op_b, a64.X1)
+        dst := dst_gp_reg(&fc, ins.res, a64.X2)
+        stride := ins.imm_i64
+        if stride == 0 {
+            a64.mov(&mut fc.buf, dst, base)
+        } else if stride == 1 {
+            a64.add_reg(&mut fc.buf, true, false, dst, base, idx)
+        } else if stride == 2 {
+            a64.add_reg_lsl(&mut fc.buf, true, dst, base, idx, 1)
+        } else if stride == 4 {
+            a64.add_reg_lsl(&mut fc.buf, true, dst, base, idx, 2)
+        } else if stride == 8 {
+            a64.add_reg_lsl(&mut fc.buf, true, dst, base, idx, 3)
+        } else {
+            a64.imm(&mut fc.buf, a64.X16, stride)
+            a64.madd(&mut fc.buf, true, dst, idx, a64.X16, base)
+        }
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .Load {
+        if ins.res < 0 { return }
+        cls := fc.plan.locs[ins.res].cls
+        if cls == .Void { return }
+        addr := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        if cls == .Gp {
+            sz := type_size(&types, ins.ty)
+            w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+            sext := is_signed_int_ty(&types, ins.ty)
+            dst := dst_gp_reg(&fc, ins.res, a64.X1)
+            emit_ldr_off(&mut fc.buf, dst, addr, ins.imm_i64, w, sext)
+            commit_gp_dst(&mut fc, ins.res, dst)
+        } else if cls == .Fp {
+            is64 := is_f64_ty(&types, ins.ty)
+            vd := dst_fp_reg(&fc, ins.res, 16)
+            emit_ldr_fp_off(&mut fc.buf, is64, vd, addr, ins.imm_i64)
+            commit_fp_dst(&mut fc, ins.res, vd)
+        } else if cls == .Fat {
+            emit_ldr_off(&mut fc.buf, a64.X1, addr, ins.imm_i64, 8, false)
+            emit_ldr_off(&mut fc.buf, a64.X2, addr, ins.imm_i64 + 8, 8, false)
+            store_fat_val(&mut fc, ins.res, a64.X1, a64.X2)
+        } else if cls == .Agg {
+            sz := type_size(&types, ins.ty)
+            if sz > 0 {
+                emit_add_imm_any(&mut fc.buf, a64.X7, addr, ins.imm_i64)
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[ins.res].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+            }
+        }
+        return
+    }
+
+    if k == .Store {
+        cls := fc.plan.locs[ins.op_b].cls
+        if cls == .Void { return }
+        addr := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        if cls == .Gp {
+            val := load_gp_val(&mut fc, ins.op_b, a64.X1)
+            sz := type_size(&types, ins.ty)
+            w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+            emit_str_off(&mut fc.buf, val, addr, ins.imm_i64, w)
+        } else if cls == .Fp {
+            is64 := is_f64_ty(&types, ins.ty)
+            vv := load_fp_val(&mut fc, ins.op_b, 16)
+            emit_str_fp_off(&mut fc.buf, is64, vv, addr, ins.imm_i64)
+        } else if cls == .Fat {
+            a64.mov(&mut fc.buf, a64.X3, addr)
+            load_fat_into(&mut fc, ins.op_b, a64.X1, a64.X2)
+            emit_str_off(&mut fc.buf, a64.X1, a64.X3, ins.imm_i64, 8)
+            emit_str_off(&mut fc.buf, a64.X2, a64.X3, ins.imm_i64 + 8, 8)
+        } else if cls == .Agg {
+            sz := type_size(&types, ins.ty)
+            if sz > 0 {
+                emit_add_imm_any(&mut fc.buf, a64.X6, addr, ins.imm_i64)
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[ins.op_b].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+            }
+        }
+        return
+    }
+
+    if k == .FatMake {
+        if ins.res < 0 { return }
+        load_gp_into(&mut fc, ins.op_a, a64.X0)
+        load_gp_into(&mut fc, ins.op_b, a64.X1)
+        store_fat_val(&mut fc, ins.res, a64.X0, a64.X1)
+        return
+    }
+
+    if k == .FatPtr {
+        if ins.res < 0 { return }
+        load_fat_into(&mut fc, ins.op_a, a64.X0, a64.X1)
+        store_gp_val(&mut fc, ins.res, a64.X0)
+        return
+    }
+
+    if k == .FatLen {
+        if ins.res < 0 { return }
+        load_fat_into(&mut fc, ins.op_a, a64.X0, a64.X1)
+        emit_normalize_int(&mut fc.buf, &types, ins.ty, a64.X1, a64.X1)
+        store_gp_val(&mut fc, ins.res, a64.X1)
+        return
+    }
+
+    if k == .Len {
+        if ins.res < 0 { return }
+        aty := f.vals[ins.op_a].ty
+        ak := types.entries[aty].kind
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        if ak == .String {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X1)
+            a64.ldr(&mut fc.buf, dst, ra, 0, 8, false)
+        } else if ak == .Array {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X1)
+            a64.ldr(&mut fc.buf, dst, ra, 8, 8, false)
+        } else if ak == .FixedArr {
+            a64.imm(&mut fc.buf, dst, i64(types.entries[aty].count))
+        } else {
+            a64.imm(&mut fc.buf, dst, 0)
+        }
+        emit_normalize_int(&mut fc.buf, &types, ins.ty, dst, dst)
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .Discriminant {
+        if ins.res < 0 { return }
+        sl := fc.plan.locs[ins.op_a]
+        dst := dst_gp_reg(&fc, ins.res, a64.X0)
+        if sl.cls == .Agg {
+            emit_ldr_off(&mut fc.buf, dst, a64.FP, -i64(sl.spill_off), 4, true)
+        } else {
+            ra := load_gp_val(&mut fc, ins.op_a, a64.X1)
+            a64.sxtw(&mut fc.buf, dst, ra)
+        }
+        commit_gp_dst(&mut fc, ins.res, dst)
+        return
+    }
+
+    if k == .SetDiscriminant {
+        addr := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        a64.imm(&mut fc.buf, a64.X16, i64(ins.aux))
+        a64.str(&mut fc.buf, a64.X16, addr, 0, 4)
+        return
+    }
+
+    if k == .AllocHeap {
+        if ins.res < 0 { return }
+        rk := types.entries[ins.ty].kind
+        if rk == .Array {
+            // Dynamic array allocation: op_a = count, imm_i64 = stride
+            if ins.op_a >= 0 { load_gp_into(&mut fc, ins.op_a, a64.X0) }
+            else { a64.imm(&mut fc.buf, a64.X0, 0) }
+            stride := if ins.imm_i64 > 0 { ins.imm_i64 } else { 8 }
+            a64.imm(&mut fc.buf, a64.X1, stride)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.arr_alloc)
+            store_gp_val(&mut fc, ins.res, a64.X0)
+        } else {
+            // Raw / Region bump allocation: op_a * stride (or imm_i64 bytes if op_a < 0)
+            if ins.op_a >= 0 {
+                load_gp_into(&mut fc, ins.op_a, a64.X0)
+                stride := if ins.imm_i64 > 0 { ins.imm_i64 } else { 1 }
+                if stride > 1 {
+                    a64.imm(&mut fc.buf, a64.X16, stride)
+                    a64.mul(&mut fc.buf, true, a64.X0, a64.X0, a64.X16)
+                }
+            } else {
+                a64.imm(&mut fc.buf, a64.X0, if ins.imm_i64 > 0 { ins.imm_i64 } else { 16 })
+            }
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.alloc)
+            store_gp_val(&mut fc, ins.res, a64.X0)
+        }
+        return
+    }
+
+    if k == .MemCopy {
+        sz := i32(ins.imm_i64)
+        if sz <= 0 { return }
+        load_gp_into(&mut fc, ins.op_a, a64.X6)
+        load_gp_into(&mut fc, ins.op_b, a64.X7)
+        emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+        return
+    }
+
+    if k == .MemZero {
+        sz := i32(ins.imm_i64)
+        if sz <= 0 { return }
+        load_gp_into(&mut fc, ins.op_a, a64.X6)
+        emit_memzero_size(&mut fc, &rt, a64.X6, sz)
+        return
+    }
+
+    if k == .Select {
+        if ins.res < 0 { return }
+        cls := fc.plan.locs[ins.res].cls
+        if cls == .Void { return }
+        rc := load_gp_val(&mut fc, ins.op_a, a64.X3)
+        a64.cmp_imm(&mut fc.buf, true, rc, 0)
+        if cls == .Gp {
+            rt_r := load_gp_val(&mut fc, ins.op_b, a64.X0)
+            rf_r := load_gp_val(&mut fc, ins.op_c, a64.X1)
+            dst := dst_gp_reg(&fc, ins.res, a64.X2)
+            a64.csel(&mut fc.buf, true, dst, rt_r, rf_r, a64.CC_NE)
+            commit_gp_dst(&mut fc, ins.res, dst)
+        } else {
+            lbl_f := a64.label(&mut fc.buf)
+            lbl_d := a64.label(&mut fc.buf)
+            a64.b_cond(&mut fc.buf, a64.CC_EQ, lbl_f)
+            if cls == .Fp {
+                vt := load_fp_val(&mut fc, ins.op_b, 16)
+                store_fp_val(&mut fc, ins.res, vt)
+                a64.b(&mut fc.buf, lbl_d)
+                a64.mark(&mut fc.buf, lbl_f)
+                vf := load_fp_val(&mut fc, ins.op_c, 16)
+                store_fp_val(&mut fc, ins.res, vf)
+            } else if cls == .Fat {
+                load_fat_into(&mut fc, ins.op_b, a64.X0, a64.X1)
+                store_fat_val(&mut fc, ins.res, a64.X0, a64.X1)
+                a64.b(&mut fc.buf, lbl_d)
+                a64.mark(&mut fc.buf, lbl_f)
+                load_fat_into(&mut fc, ins.op_c, a64.X0, a64.X1)
+                store_fat_val(&mut fc, ins.res, a64.X0, a64.X1)
+            } else if cls == .Agg {
+                sz := type_size(&types, ins.ty)
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[ins.res].spill_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[ins.op_b].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+                a64.b(&mut fc.buf, lbl_d)
+                a64.mark(&mut fc.buf, lbl_f)
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[ins.res].spill_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[ins.op_c].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+            }
+            a64.mark(&mut fc.buf, lbl_d)
+        }
+        return
+    }
+
+    if k == .BoundsCheck {
+        r_idx := load_gp_val(&mut fc, ins.op_a, a64.X0)
+        r_len := load_gp_val(&mut fc, ins.op_b, a64.X1)
+        a64.cmp_reg(&mut fc.buf, true, r_idx, r_len)
+        if ins.aux == ssa.BOUNDS_LE {
+            a64.b_cond(&mut fc.buf, a64.CC_HI, fc.trap_103)
+        } else {
+            a64.b_cond(&mut fc.buf, a64.CC_HS, fc.trap_103)
+        }
+        return
+    }
+
+    if k == .OverflowCheck {
+        emit_overflow_check(&mut fc, &types, &ins)
+        return
+    }
+
+    if k == .ClosureMake {
+        if ins.res < 0 { return }
+        te := &types.entries[ins.ty]
+        cl_fn_id := if te.closure_fn_id >= 0 { te.closure_fn_id } else { ins.aux }
+        // Layout: [entry_fn (8B), drop_fn (8B), cap_0 (aligned 8B), ...]
+        mut total_bytes := 16
+        for ci in 0..ins.arg_len {
+            cty := ht.field_type(&types, ins.ty, ci)
+            csz := align_up_i32(type_size(&types, cty), 8)
+            total_bytes += if csz < 8 { 8 } else { csz }
+        }
+        a64.imm(&mut fc.buf, a64.X0, i64(total_bytes))
+        emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.alloc)
+        // Store env_ptr into res right away so it survives if any cap copy uses x0..x7
+        store_gp_val(&mut fc, ins.res, a64.X0)
+        a64.mov(&mut fc.buf, a64.X4, a64.X0)
+
+        // [env + 0] = closure body entry fn address
+        if cl_fn_id >= 0 && cl_fn_id < fn_syms.len && fn_syms[cl_fn_id] >= 0 {
+            emit_adrp_sym(&mut fc.buf, &mut fc.relocs, a64.X5, fn_syms[cl_fn_id], 0)
+        } else {
+            a64.imm(&mut fc.buf, a64.X5, 0)
+        }
+        a64.str(&mut fc.buf, a64.X5, a64.X4, 0, 8)
+        // [env + 8] = drop fn (0)
+        a64.str(&mut fc.buf, a64.XZR, a64.X4, 8, 8)
+
+        mut cap_off := 16
+        for ci in 0..ins.arg_len {
+            cv := f.val_args[ins.arg_start + ci]
+            cty := f.vals[cv].ty
+            ccls := fc.plan.locs[cv].cls
+            csz := align_up_i32(type_size(&types, cty), 8)
+            step := if csz < 8 { 8 } else { csz }
+            load_gp_into(&mut fc, ins.res, a64.X4)
+            if ccls == .Gp {
+                rv := load_gp_val(&mut fc, cv, a64.X5)
+                emit_str_off(&mut fc.buf, rv, a64.X4, i64(cap_off), 8)
+            } else if ccls == .Fp {
+                vv := load_fp_val(&mut fc, cv, 16)
+                emit_str_fp_off(&mut fc.buf, is_f64_ty(&types, cty), vv, a64.X4, i64(cap_off))
+            } else if ccls == .Fat {
+                load_fat_into(&mut fc, cv, a64.X5, a64.X6)
+                emit_str_off(&mut fc.buf, a64.X5, a64.X4, i64(cap_off), 8)
+                emit_str_off(&mut fc.buf, a64.X6, a64.X4, i64(cap_off + 8), 8)
+            } else if ccls == .Agg {
+                emit_add_imm_any(&mut fc.buf, a64.X6, a64.X4, i64(cap_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[cv].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, type_size(&types, cty))
+            }
+            cap_off += step
+        }
+        return
+    }
+}
+
+// =========================================================================
+// 8. Call & Intrinsic Lowering
+// =========================================================================
+
+fn emit_intrinsic_call(m: &mut obj.ObjectModule, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &mut FnCodegen, rt: &RuntimeSyms, fn_syms: &[]i32, target: obj.TargetKind, tm: &ssa.SsaTerm) {
+    types := &hir.types
+    id := tm.callee
+    a_start := tm.arg_start
+    a_len := tm.arg_len
+
+    // 1. print / eprint
+    if id == hb.INTRINSIC_PRINT || id == hb.INTRINSIC_EPRINT {
+        if a_len == 0 { return }
+        av := f.val_args[a_start]
+        aty := f.vals[av].ty
+        ak := types.entries[aty].kind
+        fd: i64 = if id == hb.INTRINSIC_EPRINT { 2 } else { 1 }
+        if ak == .String {
+            load_gp_into(&mut fc, av, a64.X3)
+            a64.imm(&mut fc.buf, a64.X0, fd)
+            a64.add_imm(&mut fc.buf, true, false, a64.X1, a64.X3, 8)
+            a64.ldr(&mut fc.buf, a64.X2, a64.X3, 0, 8, false)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.print_str)
+        } else if ak == .FatStr {
+            load_fat_into(&mut fc, av, a64.X1, a64.X2)
+            a64.imm(&mut fc.buf, a64.X0, fd)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.print_str)
+        } else if ak == .Bool {
+            load_gp_into(&mut fc, av, a64.X1)
+            a64.imm(&mut fc.buf, a64.X0, fd)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.print_bool)
+        } else if ssa.is_int_ty(&types, aty) {
+            load_gp_into(&mut fc, av, a64.X1)
+            a64.imm(&mut fc.buf, a64.X0, fd)
+            a64.imm(&mut fc.buf, a64.X2, if ssa.is_unsigned_int_ty(&types, aty) { 1 } else { 0 })
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.print_int)
+        }
+        return
+    }
+
+    // 2. assert / panic / unreachable / sys.exit
+    if id == hb.INTRINSIC_ASSERT {
+        if a_len > 0 {
+            av := f.val_args[a_start]
+            rc := load_gp_val(&mut fc, av, a64.X0)
+            a64.cbz(&mut fc.buf, true, rc, fc.trap_104)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_PANIC {
+        a64.b(&mut fc.buf, fc.trap_105)
+        return
+    }
+    if id == hb.INTRINSIC_UNREACHABLE {
+        a64.b(&mut fc.buf, fc.trap_106)
+        return
+    }
+    if id == hb.INTRINSIC_SYS_EXIT {
+        if a_len > 0 { load_gp_into(&mut fc, f.val_args[a_start], a64.X0) }
+        else { a64.imm(&mut fc.buf, a64.X0, 0) }
+        emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+        return
+    }
+
+    // 3. INTRINSIC_DROP
+    if id == hb.INTRINSIC_DROP {
+        if a_len > 0 {
+            av := f.val_args[a_start]
+            mut ty := f.vals[av].ty
+            if types.entries[ty].kind == .Ref || types.entries[ty].kind == .MutRef {
+                inner := types.entries[ty].inner_a
+                if inner >= 0 && inner < types.entries.len && types.entries[inner].dispose_fn >= 0 {
+                    dfid := types.entries[inner].dispose_fn
+                    if dfid < fn_syms.len && fn_syms[dfid] >= 0 {
+                        load_gp_into(&mut fc, av, a64.X0)
+                        emit_call_sym(&mut fc.buf, &mut fc.relocs, fn_syms[dfid])
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    // 4. INTRINSIC_REPLACE(mut_ref, new_val) -> old_val
+    if id == hb.INTRINSIC_REPLACE && a_len >= 2 {
+        ref_v := f.val_args[a_start]
+        new_v := f.val_args[a_start + 1]
+        d_ty := if tm.dest_val >= 0 { f.vals[tm.dest_val].ty } else { f.vals[new_v].ty }
+        cls := classify_type(&types, d_ty)
+        load_gp_into(&mut fc, ref_v, a64.X4)
+        if cls == .Gp {
+            sz := type_size(&types, d_ty)
+            w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+            emit_ldr_off(&mut fc.buf, a64.X5, a64.X4, 0, w, is_signed_int_ty(&types, d_ty))
+            nv := load_gp_val(&mut fc, new_v, a64.X6)
+            emit_str_off(&mut fc.buf, nv, a64.X4, 0, w)
+            store_gp_val(&mut fc, tm.dest_val, a64.X5)
+        } else if cls == .Fp {
+            is64 := is_f64_ty(&types, d_ty)
+            emit_ldr_fp_off(&mut fc.buf, is64, 16, a64.X4, 0)
+            nv := load_fp_val(&mut fc, new_v, 17)
+            emit_str_fp_off(&mut fc.buf, is64, nv, a64.X4, 0)
+            store_fp_val(&mut fc, tm.dest_val, 16)
+        } else if cls == .Fat {
+            emit_ldr_off(&mut fc.buf, a64.X5, a64.X4, 0, 8, false)
+            emit_ldr_off(&mut fc.buf, a64.X6, a64.X4, 8, 8, false)
+            load_fat_into(&mut fc, new_v, a64.X0, a64.X1)
+            emit_str_off(&mut fc.buf, a64.X0, a64.X4, 0, 8)
+            emit_str_off(&mut fc.buf, a64.X1, a64.X4, 8, 8)
+            store_fat_val(&mut fc, tm.dest_val, a64.X5, a64.X6)
+        } else if cls == .Agg {
+            sz := type_size(&types, d_ty)
+            if tm.dest_val >= 0 {
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X4, sz)
+            }
+            load_gp_into(&mut fc, ref_v, a64.X4)
+            emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[new_v].spill_off))
+            emit_memcpy_size(&mut fc, &rt, a64.X4, a64.X7, sz)
+        }
+        return
+    }
+
+    // 5. INTRINSIC_SWAP(a_mut_ref, b_mut_ref)
+    if id == hb.INTRINSIC_SWAP && a_len >= 2 {
+        ra_v := f.val_args[a_start]
+        rb_v := f.val_args[a_start + 1]
+        a_ty := types.entries[f.vals[ra_v].ty].inner_a
+        cls := classify_type(&types, a_ty)
+        load_gp_into(&mut fc, ra_v, a64.X4)
+        load_gp_into(&mut fc, rb_v, a64.X5)
+        if cls == .Gp {
+            sz := type_size(&types, a_ty)
+            w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+            emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, 0, w, false)
+            emit_ldr_off(&mut fc.buf, a64.X1, a64.X5, 0, w, false)
+            emit_str_off(&mut fc.buf, a64.X1, a64.X4, 0, w)
+            emit_str_off(&mut fc.buf, a64.X0, a64.X5, 0, w)
+        } else if cls == .Fp {
+            is64 := is_f64_ty(&types, a_ty)
+            emit_ldr_fp_off(&mut fc.buf, is64, 16, a64.X4, 0)
+            emit_ldr_fp_off(&mut fc.buf, is64, 17, a64.X5, 0)
+            emit_str_fp_off(&mut fc.buf, is64, 17, a64.X4, 0)
+            emit_str_fp_off(&mut fc.buf, is64, 16, a64.X5, 0)
+        } else {
+            sz := type_size(&types, a_ty)
+            mut off := 0
+            while off + 8 <= sz {
+                emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, i64(off), 8, false)
+                emit_ldr_off(&mut fc.buf, a64.X1, a64.X5, i64(off), 8, false)
+                emit_str_off(&mut fc.buf, a64.X1, a64.X4, i64(off), 8)
+                emit_str_off(&mut fc.buf, a64.X0, a64.X5, i64(off), 8)
+                off += 8
+            }
+            while off < sz {
+                emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, i64(off), 1, false)
+                emit_ldr_off(&mut fc.buf, a64.X1, a64.X5, i64(off), 1, false)
+                emit_str_off(&mut fc.buf, a64.X1, a64.X4, i64(off), 1)
+                emit_str_off(&mut fc.buf, a64.X0, a64.X5, i64(off), 1)
+                off += 1
+            }
+        }
+        return
+    }
+
+    // 6. Array intrinsics (push, pop, clear, reserve, try_reserve, truncate, remove, swap, cap)
+    if (id >= hb.INTRINSIC_ARR_SWAP && id <= hb.INTRINSIC_ARR_PUSH || id == hb.INTRINSIC_CAP) && a_len >= 1 {
+        av := f.val_args[a_start]
+        mut aty := f.vals[av].ty
+        load_gp_into(&mut fc, av, a64.X4)
+        if types.entries[aty].kind == .Ref || types.entries[aty].kind == .MutRef {
+            aty = types.entries[aty].inner_a
+            if types.entries[aty].kind == .Array {
+                a64.ldr(&mut fc.buf, a64.X4, a64.X4, 0, 8, false) // x4 = arr_hdr
+            }
+        }
+        elem_ty := types.entries[aty].inner_a
+        elem_cls := classify_type(&types, elem_ty)
+        elem_sz := type_size(&types, elem_ty)
+        elem_al := type_align(&types, elem_ty)
+        stride := align_up_i32(elem_sz, elem_al)
+
+        if id == hb.INTRINSIC_CAP {
+            a64.ldr(&mut fc.buf, a64.X0, a64.X4, 16, 8, false)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            return
+        }
+        if id == hb.INTRINSIC_ARR_CLEAR {
+            a64.str(&mut fc.buf, a64.XZR, a64.X4, 8, 8)
+            return
+        }
+        if id == hb.INTRINSIC_ARR_RESERVE && a_len >= 2 {
+            a64.mov(&mut fc.buf, a64.X0, a64.X4)
+            load_gp_into(&mut fc, f.val_args[a_start + 1], a64.X1)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.arr_grow)
+            return
+        }
+        if id == hb.INTRINSIC_ARR_TRY_RESERVE && a_len >= 2 {
+            a64.mov(&mut fc.buf, a64.X0, a64.X4)
+            load_gp_into(&mut fc, f.val_args[a_start + 1], a64.X1)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.arr_grow)
+            if tm.dest_val >= 0 {
+                a64.imm(&mut fc.buf, a64.X0, 0)
+                store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            }
+            return
+        }
+        if id == hb.INTRINSIC_ARR_TRUNCATE && a_len >= 2 {
+            load_gp_into(&mut fc, f.val_args[a_start + 1], a64.X5)
+            a64.ldr(&mut fc.buf, a64.X6, a64.X4, 8, 8, false)
+            a64.cmp_reg(&mut fc.buf, true, a64.X5, a64.X6)
+            lbl_ok := a64.label(&mut fc.buf)
+            a64.b_cond(&mut fc.buf, a64.CC_HS, lbl_ok)
+            a64.str(&mut fc.buf, a64.X5, a64.X4, 8, 8)
+            a64.mark(&mut fc.buf, lbl_ok)
+            return
+        }
+        if id == hb.INTRINSIC_ARR_PUSH && a_len >= 2 {
+            // Grow if len + 1 > cap
+            a64.ldr(&mut fc.buf, a64.X1, a64.X4, 8, 8, false)
+            a64.add_imm(&mut fc.buf, true, false, a64.X1, a64.X1, 1)
+            a64.mov(&mut fc.buf, a64.X0, a64.X4)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.arr_grow)
+            // Reload arr_hdr cleanly
+            load_gp_into(&mut fc, av, a64.X4)
+            if types.entries[f.vals[av].ty].kind == .Ref || types.entries[f.vals[av].ty].kind == .MutRef {
+                a64.ldr(&mut fc.buf, a64.X4, a64.X4, 0, 8, false)
+            }
+            a64.ldr(&mut fc.buf, a64.X5, a64.X4, 0, 8, false) // data_ptr
+            a64.ldr(&mut fc.buf, a64.X6, a64.X4, 8, 8, false) // len
+            a64.imm(&mut fc.buf, a64.X16, i64(stride))
+            a64.madd(&mut fc.buf, true, a64.X5, a64.X6, a64.X16, a64.X5) // &data[len]
+            a64.add_imm(&mut fc.buf, true, false, a64.X6, a64.X6, 1)
+            a64.str(&mut fc.buf, a64.X6, a64.X4, 8, 8) // len += 1
+            vv := f.val_args[a_start + 1]
+            if elem_cls == .Gp {
+                w := if elem_sz == 1 || elem_sz == 2 || elem_sz == 4 || elem_sz == 8 { elem_sz } else { 8 }
+                rv := load_gp_val(&mut fc, vv, a64.X0)
+                emit_str_off(&mut fc.buf, rv, a64.X5, 0, w)
+            } else if elem_cls == .Fp {
+                vf := load_fp_val(&mut fc, vv, 16)
+                emit_str_fp_off(&mut fc.buf, is_f64_ty(&types, elem_ty), vf, a64.X5, 0)
+            } else if elem_cls == .Fat {
+                load_fat_into(&mut fc, vv, a64.X0, a64.X1)
+                emit_str_off(&mut fc.buf, a64.X0, a64.X5, 0, 8)
+                emit_str_off(&mut fc.buf, a64.X1, a64.X5, 8, 8)
+            } else if elem_cls == .Agg {
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[vv].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X5, a64.X7, elem_sz)
+            }
+            return
+        }
+        if id == hb.INTRINSIC_ARR_POP {
+            a64.ldr(&mut fc.buf, a64.X6, a64.X4, 8, 8, false)
+            a64.cbz(&mut fc.buf, true, a64.X6, fc.trap_103)
+            a64.sub_imm(&mut fc.buf, true, false, a64.X6, a64.X6, 1)
+            a64.str(&mut fc.buf, a64.X6, a64.X4, 8, 8)
+            a64.ldr(&mut fc.buf, a64.X5, a64.X4, 0, 8, false)
+            a64.imm(&mut fc.buf, a64.X16, i64(stride))
+            a64.madd(&mut fc.buf, true, a64.X5, a64.X6, a64.X16, a64.X5)
+            if tm.dest_val >= 0 {
+                if elem_cls == .Gp {
+                    w := if elem_sz == 1 || elem_sz == 2 || elem_sz == 4 || elem_sz == 8 { elem_sz } else { 8 }
+                    emit_ldr_off(&mut fc.buf, a64.X0, a64.X5, 0, w, is_signed_int_ty(&types, elem_ty))
+                    store_gp_val(&mut fc, tm.dest_val, a64.X0)
+                } else if elem_cls == .Fp {
+                    emit_ldr_fp_off(&mut fc.buf, is_f64_ty(&types, elem_ty), 16, a64.X5, 0)
+                    store_fp_val(&mut fc, tm.dest_val, 16)
+                } else if elem_cls == .Fat {
+                    emit_ldr_off(&mut fc.buf, a64.X0, a64.X5, 0, 8, false)
+                    emit_ldr_off(&mut fc.buf, a64.X1, a64.X5, 8, 8, false)
+                    store_fat_val(&mut fc, tm.dest_val, a64.X0, a64.X1)
+                } else if elem_cls == .Agg {
+                    emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+                    emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X5, elem_sz)
+                }
+            }
+            return
+        }
+        return
+    }
+
+    // 7. Option / Result intrinsics
+    if (id >= hb.INTRINSIC_OPT_IS_SOME && id <= hb.INTRINSIC_RES_ERR || id >= hb.INTRINSIC_RES_ERR && id <= hb.INTRINSIC_OPT_IS_SOME) && a_len >= 1 {
+        av := f.val_args[a_start]
+        mut ety := f.vals[av].ty
+        // Get address of enum in x4 (if Ref/MutRef, load ptr; if Agg, compute home; if Gp, it's the tag directly)
+        mut tag_in_reg := false
+        if types.entries[ety].kind == .Ref || types.entries[ety].kind == .MutRef {
+            ety = types.entries[ety].inner_a
+            load_gp_into(&mut fc, av, a64.X4)
+        } else if fc.plan.locs[av].cls == .Agg {
+            emit_sub_imm_any(&mut fc.buf, a64.X4, a64.FP, i64(fc.plan.locs[av].spill_off))
+        } else {
+            load_gp_into(&mut fc, av, a64.X5)
+            tag_in_reg = true
+        }
+        if !tag_in_reg {
+            a64.ldr(&mut fc.buf, a64.X5, a64.X4, 0, 4, true)
+        }
+        if id == hb.INTRINSIC_OPT_IS_SOME || id == hb.INTRINSIC_RES_IS_OK {
+            a64.cmp_imm(&mut fc.buf, true, a64.X5, 0)
+            a64.cset(&mut fc.buf, a64.X0, a64.CC_EQ)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            return
+        }
+        if id == hb.INTRINSIC_OPT_IS_NONE || id == hb.INTRINSIC_RES_IS_ERR {
+            a64.cmp_imm(&mut fc.buf, true, a64.X5, 0)
+            a64.cset(&mut fc.buf, a64.X0, a64.CC_NE)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            return
+        }
+        if id == hb.INTRINSIC_UNWRAP || id == hb.INTRINSIC_UNWRAP_ERR {
+            want: i64 = if id == hb.INTRINSIC_UNWRAP { 0 } else { 1 }
+            a64.cmp_imm(&mut fc.buf, true, a64.X5, want)
+            a64.b_cond(&mut fc.buf, a64.CC_NE, fc.trap_105)
+            if tm.dest_val >= 0 {
+                d_ty := f.vals[tm.dest_val].ty
+                d_cls := fc.plan.locs[tm.dest_val].cls
+                poff := enum_payload_offset(&types, ety, i32(want), 0)
+                if d_cls == .Gp {
+                    sz := type_size(&types, d_ty)
+                    w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+                    emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, i64(poff), w, is_signed_int_ty(&types, d_ty))
+                    store_gp_val(&mut fc, tm.dest_val, a64.X0)
+                } else if d_cls == .Fp {
+                    emit_ldr_fp_off(&mut fc.buf, is_f64_ty(&types, d_ty), 16, a64.X4, i64(poff))
+                    store_fp_val(&mut fc, tm.dest_val, 16)
+                } else if d_cls == .Fat {
+                    emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, i64(poff), 8, false)
+                    emit_ldr_off(&mut fc.buf, a64.X1, a64.X4, i64(poff + 8), 8, false)
+                    store_fat_val(&mut fc, tm.dest_val, a64.X0, a64.X1)
+                } else if d_cls == .Agg {
+                    emit_add_imm_any(&mut fc.buf, a64.X7, a64.X4, i64(poff))
+                    emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+                    emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, type_size(&types, d_ty))
+                }
+            }
+            return
+        }
+        if id == hb.INTRINSIC_UNWRAP_OR && a_len >= 2 && tm.dest_val >= 0 {
+            lbl_def := a64.label(&mut fc.buf)
+            lbl_done := a64.label(&mut fc.buf)
+            a64.cbnz(&mut fc.buf, true, a64.X5, lbl_def)
+            d_ty := f.vals[tm.dest_val].ty
+            d_cls := fc.plan.locs[tm.dest_val].cls
+            poff := enum_payload_offset(&types, ety, 0, 0)
+            def_v := f.val_args[a_start + 1]
+            if d_cls == .Gp {
+                sz := type_size(&types, d_ty)
+                w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+                emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, i64(poff), w, is_signed_int_ty(&types, d_ty))
+                store_gp_val(&mut fc, tm.dest_val, a64.X0)
+                a64.b(&mut fc.buf, lbl_done)
+                a64.mark(&mut fc.buf, lbl_def)
+                load_gp_into(&mut fc, def_v, a64.X0)
+                store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            } else if d_cls == .Fp {
+                emit_ldr_fp_off(&mut fc.buf, is_f64_ty(&types, d_ty), 16, a64.X4, i64(poff))
+                store_fp_val(&mut fc, tm.dest_val, 16)
+                a64.b(&mut fc.buf, lbl_done)
+                a64.mark(&mut fc.buf, lbl_def)
+                load_fp_into(&mut fc, def_v, 16)
+                store_fp_val(&mut fc, tm.dest_val, 16)
+            } else if d_cls == .Fat {
+                emit_ldr_off(&mut fc.buf, a64.X0, a64.X4, i64(poff), 8, false)
+                emit_ldr_off(&mut fc.buf, a64.X1, a64.X4, i64(poff + 8), 8, false)
+                store_fat_val(&mut fc, tm.dest_val, a64.X0, a64.X1)
+                a64.b(&mut fc.buf, lbl_done)
+                a64.mark(&mut fc.buf, lbl_def)
+                load_fat_into(&mut fc, def_v, a64.X0, a64.X1)
+                store_fat_val(&mut fc, tm.dest_val, a64.X0, a64.X1)
+            } else if d_cls == .Agg {
+                emit_add_imm_any(&mut fc.buf, a64.X7, a64.X4, i64(poff))
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, type_size(&types, d_ty))
+                a64.b(&mut fc.buf, lbl_done)
+                a64.mark(&mut fc.buf, lbl_def)
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[def_v].spill_off))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, type_size(&types, d_ty))
+            }
+            a64.mark(&mut fc.buf, lbl_done)
+            return
+        }
+    }
+
+    // 8. INTRINSIC_TO_STR
+    if id == hb.INTRINSIC_TO_STR && a_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[a_start]
+        aty := f.vals[av].ty
+        ak := types.entries[aty].kind
+        if ssa.is_int_ty(&types, aty) {
+            load_gp_into(&mut fc, av, a64.X0)
+            a64.imm(&mut fc.buf, a64.X1, if ssa.is_unsigned_int_ty(&types, aty) { 1 } else { 0 })
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.int_to_str)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        } else if ak == .String {
+            load_gp_into(&mut fc, av, a64.X0)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        } else if ak == .FatStr {
+            // Allocate String from FatStr (ptr, len)
+            load_fat_into(&mut fc, av, a64.X4, a64.X5)
+            a64.add_imm(&mut fc.buf, true, false, a64.X0, a64.X5, 17)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.alloc)
+            a64.imm(&mut fc.buf, a64.X16, 1)
+            a64.str(&mut fc.buf, a64.X16, a64.X0, 0, 8)
+            a64.add_imm(&mut fc.buf, true, false, a64.X0, a64.X0, 8)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            load_fat_into(&mut fc, av, a64.X1, a64.X2)
+            a64.str(&mut fc.buf, a64.X2, a64.X0, 0, 8)
+            a64.add_imm(&mut fc.buf, true, false, a64.X0, a64.X0, 8)
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.memcpy)
+        } else if ak == .Bool {
+            fc.ro_counter += 1
+            st_t := append_rodata_dunder_str(&mut m, "__str_t_" + f.fn_id.str() + "_" + fc.ro_counter.str(), "true")
+            st_f := append_rodata_dunder_str(&mut m, "__str_f_" + f.fn_id.str() + "_" + fc.ro_counter.str(), "false")
+            lbl_f := a64.label(&mut fc.buf)
+            lbl_d := a64.label(&mut fc.buf)
+            rc := load_gp_val(&mut fc, av, a64.X1)
+            a64.cbz(&mut fc.buf, true, rc, lbl_f)
+            emit_adrp_sym(&mut fc.buf, &mut fc.relocs, a64.X0, st_t, 0)
+            a64.b(&mut fc.buf, lbl_d)
+            a64.mark(&mut fc.buf, lbl_f)
+            emit_adrp_sym(&mut fc.buf, &mut fc.relocs, a64.X0, st_f, 0)
+            a64.mark(&mut fc.buf, lbl_d)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        }
+        return
+    }
+
+    // 9. INTRINSIC_CLONE
+    if id == hb.INTRINSIC_CLONE && a_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[a_start]
+        d_ty := f.vals[tm.dest_val].ty
+        d_cls := fc.plan.locs[tm.dest_val].cls
+        aty := f.vals[av].ty
+        is_ref := types.entries[aty].kind == .Ref || types.entries[aty].kind == .MutRef
+        if d_cls == .Gp {
+            load_gp_into(&mut fc, av, a64.X0)
+            if is_ref {
+                sz := type_size(&types, d_ty)
+                w := if sz == 1 || sz == 2 || sz == 4 || sz == 8 { sz } else { 8 }
+                emit_ldr_off(&mut fc.buf, a64.X0, a64.X0, 0, w, is_signed_int_ty(&types, d_ty))
+            }
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        } else if d_cls == .Fp {
+            if is_ref {
+                load_gp_into(&mut fc, av, a64.X0)
+                emit_ldr_fp_off(&mut fc.buf, is_f64_ty(&types, d_ty), 16, a64.X0, 0)
+            } else {
+                load_fp_into(&mut fc, av, 16)
+            }
+            store_fp_val(&mut fc, tm.dest_val, 16)
+        } else if d_cls == .Fat {
+            if is_ref {
+                load_gp_into(&mut fc, av, a64.X2)
+                emit_ldr_off(&mut fc.buf, a64.X0, a64.X2, 0, 8, false)
+                emit_ldr_off(&mut fc.buf, a64.X1, a64.X2, 8, 8, false)
+            } else {
+                load_fat_into(&mut fc, av, a64.X0, a64.X1)
+            }
+            store_fat_val(&mut fc, tm.dest_val, a64.X0, a64.X1)
+        } else if d_cls == .Agg {
+            sz := type_size(&types, d_ty)
+            emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+            if is_ref {
+                load_gp_into(&mut fc, av, a64.X7)
+            } else {
+                emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.plan.locs[av].spill_off))
+            }
+            emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+        }
+        return
+    }
+
+    // 10. Integer bit/wrapping/math intrinsics
+    if a_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[a_start]
+        d_ty := f.vals[tm.dest_val].ty
+        if id == hb.INTRINSIC_INT_BIT_NOT {
+            ra := load_gp_val(&mut fc, av, a64.X0)
+            a64.mvn(&mut fc.buf, true, a64.X1, ra)
+            emit_normalize_int(&mut fc.buf, &types, d_ty, a64.X1, a64.X1)
+            store_gp_val(&mut fc, tm.dest_val, a64.X1)
+            return
+        }
+        if id == hb.INTRINSIC_INT_CLZ {
+            ra := load_gp_val(&mut fc, av, a64.X0)
+            a64.clz(&mut fc.buf, type_size(&types, f.vals[av].ty) == 8, a64.X1, ra)
+            store_gp_val(&mut fc, tm.dest_val, a64.X1)
+            return
+        }
+        if id == hb.INTRINSIC_INT_REV_BITS {
+            ra := load_gp_val(&mut fc, av, a64.X0)
+            a64.rbit(&mut fc.buf, type_size(&types, f.vals[av].ty) == 8, a64.X1, ra)
+            store_gp_val(&mut fc, tm.dest_val, a64.X1)
+            return
+        }
+        if id == hb.INTRINSIC_MATH_ABS {
+            if fc.plan.locs[tm.dest_val].cls == .Fp {
+                va := load_fp_val(&mut fc, av, 16)
+                a64.fabs(&mut fc.buf, is_f64_ty(&types, d_ty), 16, va)
+                store_fp_val(&mut fc, tm.dest_val, 16)
+            } else {
+                ra := load_gp_val(&mut fc, av, a64.X0)
+                a64.neg(&mut fc.buf, true, false, a64.X1, ra)
+                a64.cmp_imm(&mut fc.buf, true, ra, 0)
+                a64.csel(&mut fc.buf, true, a64.X2, ra, a64.X1, a64.CC_GE)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+            }
+            return
+        }
+        if id == hb.INTRINSIC_FLOAT_SQRT {
+            va := load_fp_val(&mut fc, av, 16)
+            a64.fsqrt(&mut fc.buf, is_f64_ty(&types, d_ty), 16, va)
+            store_fp_val(&mut fc, tm.dest_val, 16)
+            return
+        }
+        if id == hb.INTRINSIC_FLOAT_TO_BITS {
+            va := load_fp_val(&mut fc, av, 16)
+            a64.fmov_from_fp(&mut fc.buf, is_f64_ty(&types, f.vals[av].ty), a64.X0, va)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+            return
+        }
+        if id == hb.INTRINSIC_FLOAT_FROM_BITS {
+            ra := load_gp_val(&mut fc, av, a64.X0)
+            a64.fmov_to_fp(&mut fc.buf, is_f64_ty(&types, d_ty), 16, ra)
+            store_fp_val(&mut fc, tm.dest_val, 16)
+            return
+        }
+        if a_len >= 2 {
+            bv := f.val_args[a_start + 1]
+            ra := load_gp_val(&mut fc, av, a64.X0)
+            rb := load_gp_val(&mut fc, bv, a64.X1)
+            is_u := ssa.is_unsigned_int_ty(&types, d_ty)
+            if id == hb.INTRINSIC_INT_BIT_OR {
+                a64.orr_reg(&mut fc.buf, true, a64.X2, ra, rb)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_BIT_AND {
+                a64.and_reg(&mut fc.buf, true, false, a64.X2, ra, rb)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_BIT_XOR {
+                a64.eor_reg(&mut fc.buf, true, a64.X2, ra, rb)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_SHL {
+                a64.lsl_reg(&mut fc.buf, true, a64.X2, ra, rb)
+                emit_normalize_int(&mut fc.buf, &types, d_ty, a64.X2, a64.X2)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_SHR {
+                if is_u { a64.lsr_reg(&mut fc.buf, true, a64.X2, ra, rb) }
+                else { a64.asr_reg(&mut fc.buf, true, a64.X2, ra, rb) }
+                emit_normalize_int(&mut fc.buf, &types, d_ty, a64.X2, a64.X2)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_WRAPPING_ADD {
+                a64.add_reg(&mut fc.buf, true, false, a64.X2, ra, rb)
+                emit_normalize_int(&mut fc.buf, &types, d_ty, a64.X2, a64.X2)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_WRAPPING_SUB {
+                a64.sub_reg(&mut fc.buf, true, false, a64.X2, ra, rb)
+                emit_normalize_int(&mut fc.buf, &types, d_ty, a64.X2, a64.X2)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_WRAPPING_MUL {
+                a64.mul(&mut fc.buf, true, a64.X2, ra, rb)
+                emit_normalize_int(&mut fc.buf, &types, d_ty, a64.X2, a64.X2)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+            if id == hb.INTRINSIC_INT_MIN || id == hb.INTRINSIC_INT_MAX {
+                a64.cmp_reg(&mut fc.buf, true, ra, rb)
+                cc := if id == hb.INTRINSIC_INT_MIN {
+                    if is_u { a64.CC_LO } else { a64.CC_LT }
+                } else {
+                    if is_u { a64.CC_HI } else { a64.CC_GT }
+                }
+                a64.csel(&mut fc.buf, true, a64.X2, ra, rb, cc)
+                store_gp_val(&mut fc, tm.dest_val, a64.X2)
+                return
+            }
+        }
+    }
+
+    // 11. Compile-time info intrinsics
+    if id == hb.INTRINSIC_SIZE_OF && tm.dest_val >= 0 {
+        sz := if tm.aux_ty >= 0 { type_size(&types, tm.aux_ty) } else { 0 }
+        a64.imm(&mut fc.buf, a64.X0, i64(sz))
+        store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        return
+    }
+    if id == hb.INTRINSIC_ALIGN_OF && tm.dest_val >= 0 {
+        al := if tm.aux_ty >= 0 { type_align(&types, tm.aux_ty) } else { 1 }
+        a64.imm(&mut fc.buf, a64.X0, i64(al))
+        store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        return
+    }
+    if id == hb.INTRINSIC_TARGET_IS && tm.dest_val >= 0 {
+        a64.imm(&mut fc.buf, a64.X0, if target == .Arm64Macos || target == .Arm64Linux { 1 } else { 0 })
+        store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        return
+    }
+    if id == hb.INTRINSIC_PTR_NULL || id == hb.INTRINSIC_PTR_NULL_MUT {
+        if tm.dest_val >= 0 {
+            a64.imm(&mut fc.buf, a64.X0, 0)
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        }
+        return
+    }
+    if id == hb.INTRINSIC_PTR_IS_NULL && a_len >= 1 && tm.dest_val >= 0 {
+        ra := load_gp_val(&mut fc, f.val_args[a_start], a64.X0)
+        a64.cmp_imm(&mut fc.buf, true, ra, 0)
+        a64.cset(&mut fc.buf, a64.X1, a64.CC_EQ)
+        store_gp_val(&mut fc, tm.dest_val, a64.X1)
+        return
+    }
+    if (id == hb.INTRINSIC_AS_PTR || id == hb.INTRINSIC_AS_MUT_PTR || id == hb.INTRINSIC_PTR_ADDR) && a_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[a_start]
+        if fc.plan.locs[av].cls == .Fat {
+            load_fat_into(&mut fc, av, a64.X0, a64.X1)
+        } else {
+            load_gp_into(&mut fc, av, a64.X0)
+        }
+        store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        return
+    }
+}
+
+fn emit_abi_call(m: &mut obj.ObjectModule, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    fc: &mut FnCodegen, fn_syms: &[]i32, tm: &ssa.SsaTerm) {
+    types := &hir.types
+
+    // Plan GP regs (x0..x7), FP regs (d0..d7), and outgoing stack words
+    mut gp_idx := 0
+    mut fp_idx := 0
+    mut stack_words := 0
+    mut arg_kind: []i32 = []   // 0=void, 1=gp_reg, 2=fp_reg, 3=fat_reg, 4=agg_reg1, 5=agg_reg2, 6=agg_ptr_reg, 7=stack1, 8=stack2, 9=agg_ptr_stack
+    mut arg_slot: []i32 = []   // reg num or stack word index
+
+    for ai in 0..tm.arg_len {
+        av := f.val_args[tm.arg_start + ai]
+        aty := f.vals[av].ty
+        cls := fc.plan.locs[av].cls
+        if cls == .Void {
+            arg_kind.push(0); arg_slot.push(0)
+        } else if cls == .Gp {
+            if gp_idx < 8 { arg_kind.push(1); arg_slot.push(gp_idx); gp_idx += 1 }
+            else { arg_kind.push(7); arg_slot.push(stack_words); stack_words += 1 }
+        } else if cls == .Fp {
+            if fp_idx < 8 { arg_kind.push(2); arg_slot.push(fp_idx); fp_idx += 1 }
+            else { arg_kind.push(7); arg_slot.push(stack_words); stack_words += 1 }
+        } else if cls == .Fat {
+            if gp_idx + 2 <= 8 { arg_kind.push(3); arg_slot.push(gp_idx); gp_idx += 2 }
+            else { gp_idx = 8; arg_kind.push(8); arg_slot.push(stack_words); stack_words += 2 }
+        } else {
+            sz := type_size(&types, aty)
+            if sz <= 8 {
+                if gp_idx < 8 { arg_kind.push(4); arg_slot.push(gp_idx); gp_idx += 1 }
+                else { arg_kind.push(7); arg_slot.push(stack_words); stack_words += 1 }
+            } else if sz <= 16 {
+                if gp_idx + 2 <= 8 { arg_kind.push(5); arg_slot.push(gp_idx); gp_idx += 2 }
+                else { gp_idx = 8; arg_kind.push(8); arg_slot.push(stack_words); stack_words += 2 }
+            } else {
+                if gp_idx < 8 { arg_kind.push(6); arg_slot.push(gp_idx); gp_idx += 1 }
+                else { arg_kind.push(9); arg_slot.push(stack_words); stack_words += 1 }
+            }
+        }
+    }
+
+    stack_bytes := if stack_words > 0 { align_up_i32(stack_words * 8, 16) } else { 0 }
+    if stack_bytes > 0 {
+        emit_sub_imm_any(&mut fc.buf, a64.SP, a64.SP, i64(stack_bytes))
+    }
+
+    // Populate stack overflow args first
+    for ai in 0..tm.arg_len {
+        k := arg_kind[ai]
+        if k != 7 && k != 8 && k != 9 { continue }
+        av := f.val_args[tm.arg_start + ai]
+        soff := i64(arg_slot[ai] * 8)
+        cls := fc.plan.locs[av].cls
+        if k == 7 {
+            if cls == .Gp {
+                load_gp_into(&mut fc, av, a64.X16)
+                emit_str_off(&mut fc.buf, a64.X16, a64.SP, soff, 8)
+            } else if cls == .Fp {
+                load_fp_into(&mut fc, av, 16)
+                emit_str_fp_off(&mut fc.buf, fc.plan.locs[av].is_f64, 16, a64.SP, soff)
+            } else {
+                emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, -i64(fc.plan.locs[av].spill_off), 8, false)
+                emit_str_off(&mut fc.buf, a64.X16, a64.SP, soff, 8)
+            }
+        } else if k == 8 {
+            if cls == .Fat {
+                load_fat_into(&mut fc, av, a64.X0, a64.X1)
+                emit_str_off(&mut fc.buf, a64.X0, a64.SP, soff, 8)
+                emit_str_off(&mut fc.buf, a64.X1, a64.SP, soff + 8, 8)
+            } else {
+                emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, -i64(fc.plan.locs[av].spill_off), 8, false)
+                emit_str_off(&mut fc.buf, a64.X16, a64.SP, soff, 8)
+                emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, -i64(fc.plan.locs[av].spill_off) + 8, 8, false)
+                emit_str_off(&mut fc.buf, a64.X16, a64.SP, soff + 8, 8)
+            }
+        } else if k == 9 {
+            emit_sub_imm_any(&mut fc.buf, a64.X16, a64.FP, i64(fc.plan.locs[av].spill_off))
+            emit_str_off(&mut fc.buf, a64.X16, a64.SP, soff, 8)
+        }
+    }
+
+    // Populate register args (note: x0..x7 are NOT in GP alloc pool, so loading x0..x7 never clobbers live GP vals!
+    // For FP args, d0..d7 MAY hold live caller-saved FP vals whose last use is THIS call, so use parallel moves for FP!)
+    mut fp_arg_moves: []ScalarMove = []
+    for ai in 0..tm.arg_len {
+        k := arg_kind[ai]
+        av := f.val_args[tm.arg_start + ai]
+        reg := arg_slot[ai]
+        if k == 1 {
+            load_gp_into(&mut fc, av, reg)
+        } else if k == 2 {
+            sl := fc.plan.locs[av]
+            fp_arg_moves.push(ScalarMove {
+                src_is_reg: sl.kind == .Reg,
+                src_loc: if sl.kind == .Reg { sl.reg_lo } else { sl.spill_off },
+                dst_is_reg: true,
+                dst_loc: reg,
+                is_f64: sl.is_f64,
+                done: false,
+            })
+        } else if k == 3 {
+            load_fat_into(&mut fc, av, reg, reg + 1)
+        } else if k == 4 {
+            emit_ldr_off(&mut fc.buf, reg, a64.FP, -i64(fc.plan.locs[av].spill_off), 8, false)
+        } else if k == 5 {
+            emit_ldr_off(&mut fc.buf, reg, a64.FP, -i64(fc.plan.locs[av].spill_off), 8, false)
+            emit_ldr_off(&mut fc.buf, reg + 1, a64.FP, -i64(fc.plan.locs[av].spill_off) + 8, 8, false)
+        } else if k == 6 {
+            emit_sub_imm_any(&mut fc.buf, reg, a64.FP, i64(fc.plan.locs[av].spill_off))
+        }
+    }
+    if fp_arg_moves.len > 0 {
+        run_parallel_moves(&mut fc.buf, &mut fp_arg_moves, true)
+    }
+
+    // Setup indirect sret in x8 if return value is Agg with size > 16
+    mut use_sret := false
+    if tm.dest_val >= 0 && fc.plan.locs[tm.dest_val].cls == .Agg {
+        rsz := type_size(&types, f.vals[tm.dest_val].ty)
+        if rsz > 16 {
+            use_sret = true
+            emit_sub_imm_any(&mut fc.buf, a64.X8, a64.FP, i64(fc.plan.locs[tm.dest_val].spill_off))
+        }
+    }
+
+    // Emit the actual call instruction
+    if tm.kind == .Call {
+        if tm.callee >= 0 && tm.callee < fn_syms.len && fn_syms[tm.callee] >= 0 {
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, fn_syms[tm.callee])
+        }
+    } else if tm.kind == .IndirectCall {
+        if tm.env_val >= 0 {
+            // Closure call: x9 = env_ptr, x16 = [x9 + 0], blr x16
+            load_gp_into(&mut fc, tm.env_val, a64.X9)
+            a64.ldr(&mut fc.buf, a64.X16, a64.X9, 0, 8, false)
+        } else {
+            load_gp_into(&mut fc, tm.cond_val, a64.X16)
+        }
+        a64.blr(&mut fc.buf, a64.X16)
+    } else if tm.kind == .ExternCall {
+        if tm.callee >= 0 && tm.callee < hir.fns.len {
+            hf := &hir.fns[tm.callee]
+            lib := if hf.extern_lib != "" { hf.extern_lib.clone() } else { "c" }
+            sym_name := if hf.extern_symbol != "" { hf.extern_symbol.clone() } else { hf.name.clone() }
+            mut spec := native_imports.symbol_spec(lib, sym_name)
+            spec.weak = hf.link_weak
+            spec.delay = hf.link_delay
+            imp_id := obj.add_import(&mut m, &spec)
+            lbl := a64.label(&mut fc.buf)
+            a64.mark(&mut fc.buf, lbl)
+            a64.nop(&mut fc.buf)
+            a64.nop(&mut fc.buf)
+            fc.imp_sites.push(PendingImport { site_lbl: lbl, imp_id: imp_id })
+            a64.blr(&mut fc.buf, a64.X16)
+        }
+    }
+
+    if stack_bytes > 0 {
+        emit_add_imm_any(&mut fc.buf, a64.SP, a64.SP, i64(stack_bytes))
+    }
+
+    // Receive return value
+    if tm.dest_val >= 0 && !use_sret {
+        dl := fc.plan.locs[tm.dest_val]
+        if dl.cls == .Gp {
+            store_gp_val(&mut fc, tm.dest_val, a64.X0)
+        } else if dl.cls == .Fp {
+            store_fp_val(&mut fc, tm.dest_val, 0)
+        } else if dl.cls == .Fat {
+            store_fat_val(&mut fc, tm.dest_val, a64.X0, a64.X1)
+        } else if dl.cls == .Agg {
+            rsz := type_size(&types, f.vals[tm.dest_val].ty)
+            if rsz > 0 {
+                emit_str_off(&mut fc.buf, a64.X0, a64.FP, -i64(dl.spill_off), 8)
+                if rsz > 8 {
+                    emit_str_off(&mut fc.buf, a64.X1, a64.FP, -i64(dl.spill_off) + 8, 8)
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 9. Function-Level Frame Layout, Prologue, Blocks, Epilogue & Emission
+// =========================================================================
+
+fn emit_closure_writeback(fc: &mut FnCodegen, types: &ht.TypeTable, f: &ssa.SsaFunc, rt: &RuntimeSyms) {
+    if !f.is_closure_body || fc.env_off <= 0 { return }
+    if f.sig_ty < 0 || f.sig_ty >= types.entries.len { return }
+    cte := &types.entries[f.sig_ty]
+    if cte.flags.bit_and(ht.TF_CLOSURE_MUT) == 0 || cte.count <= 0 { return }
+    mut cap_off := 16
+    for ci in 0..cte.count {
+        loc_id := 1 + f.param_count + ci
+        cty := ht.field_type(&types, f.sig_ty, ci)
+        csz := align_up_i32(type_size(&types, cty), 8)
+        step := if csz < 8 { 8 } else { csz }
+        if loc_id < f.slots.len && !f.slots[loc_id].dead && fc.slot_offs[loc_id] > 0 {
+            emit_ldr_off(&mut fc.buf, a64.X4, a64.FP, -i64(fc.env_off), 8, false)
+            emit_add_imm_any(&mut fc.buf, a64.X6, a64.X4, i64(cap_off))
+            emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(fc.slot_offs[loc_id]))
+            emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, type_size(&types, cty))
+        }
+        cap_off += step
+    }
+}
+
+fn emit_function(m: &mut obj.ObjectModule, hir: &hb.HirProgram, f: &ssa.SsaFunc,
+    rt: &RuntimeSyms, fn_syms: &[]i32, target: obj.TargetKind) {
+    types := &hir.types
+    mut plan := allocate_registers(&types, &f)
+
+    // 1. Lay out frame slots (all negative byte offsets from FP, aligned to natural alignment)
+    mut cur_off := 0
+
+    // Callee-saved GP regs (x22..x28)
+    mut callee_gp_offs: []i32 = []
+    for _ in 0..plan.used_callee_gp.len {
+        cur_off = align_up_i32(cur_off + 8, 8)
+        callee_gp_offs.push(cur_off)
+    }
+    // Callee-saved FP regs (d8..d15)
+    mut callee_fp_offs: []i32 = []
+    for _ in 0..plan.used_callee_fp.len {
+        cur_off = align_up_i32(cur_off + 8, 8)
+        callee_fp_offs.push(cur_off)
+    }
+
+    // sret save slot (if return type is Agg > 16B)
+    ret_cls := classify_type(&types, f.ret_ty)
+    ret_sz := type_size(&types, f.ret_ty)
+    mut sret_off := 0
+    if ret_cls == .Agg && ret_sz > 16 {
+        cur_off = align_up_i32(cur_off + 8, 8)
+        sret_off = cur_off
+    }
+
+    // Closure env save slot
+    mut env_off := 0
+    if f.is_closure_body {
+        cur_off = align_up_i32(cur_off + 8, 8)
+        env_off = cur_off
+    }
+
+    // Region save slots (2 words: saved x19, x20 per RegionEnter scope_id)
+    mut region_ids: []i32 = []
+    mut region_offs: []i32 = []
+    for bb in 0..f.blocks.len {
+        tid := f.blocks[bb].term_id
+        if tid >= 0 && f.terms[tid].kind == .RegionEnter {
+            sid := f.terms[tid].callee
+            mut found := false
+            for k in 0..region_ids.len { if region_ids[k] == sid { found = true; break } }
+            if !found {
+                cur_off = align_up_i32(cur_off + 16, 8)
+                region_ids.push(sid)
+                region_offs.push(cur_off)
+            }
+        }
+    }
+
+    // Explicit StackSlots (non-dead)
+    mut slot_offs: []i32 = []
+    for si in 0..f.slots.len {
+        sl := &f.slots[si]
+        if sl.dead || sl.size <= 0 {
+            slot_offs.push(0)
+            continue
+        }
+        al := if sl.align > 8 { sl.align } else { 8 }
+        sz := align_up_i32(sl.size, 8)
+        cur_off = align_up_i32(cur_off + sz, al)
+        slot_offs.push(cur_off)
+    }
+
+    // Spill slots & Agg value homes
+    for v in 0..plan.locs.len {
+        lk := plan.locs[v].kind
+        if lk == .Spill {
+            sz := if plan.locs[v].cls == .Fat { 16 } else { 8 }
+            cur_off = align_up_i32(cur_off + sz, 8)
+            plan.locs[v].spill_off = cur_off
+        } else if lk == .AggHome {
+            vty := f.vals[v].ty
+            vsz := align_up_i32(type_size(&types, vty), 8)
+            val := if type_align(&types, vty) > 8 { type_align(&types, vty) } else { 8 }
+            if vsz > 0 {
+                cur_off = align_up_i32(cur_off + vsz, val)
+                plan.locs[v].spill_off = cur_off
+            }
+        }
+    }
+
+    frame_bytes := align_up_i32(cur_off, 16)
+
+    mut buf := a64.new()
+    mut bb_labels: []i32 = []
+    for _ in 0..f.blocks.len { bb_labels.push(a64.label(&mut buf)) }
+    epilogue_lbl := a64.label(&mut buf)
+    trap_101 := a64.label(&mut buf)
+    trap_102 := a64.label(&mut buf)
+    trap_103 := a64.label(&mut buf)
+    trap_104 := a64.label(&mut buf)
+    trap_105 := a64.label(&mut buf)
+    trap_106 := a64.label(&mut buf)
+
+    mut fc := FnCodegen {
+        buf: move buf,
+        relocs: [],
+        imp_sites: [],
+        plan: move plan,
+        slot_offs: move slot_offs,
+        callee_gp_offs: move callee_gp_offs,
+        callee_fp_offs: move callee_fp_offs,
+        sret_off: sret_off,
+        env_off: env_off,
+        region_offs: move region_offs,
+        region_ids: move region_ids,
+        frame_bytes: frame_bytes,
+        bb_labels: move bb_labels,
+        epilogue_lbl: epilogue_lbl,
+        trap_101: trap_101,
+        trap_102: trap_102,
+        trap_103: trap_103,
+        trap_104: trap_104,
+        trap_105: trap_105,
+        trap_106: trap_106,
+        ro_counter: 0,
+    }
+
+    // 2. Prologue
+    a64.stp_pre(&mut fc.buf, a64.FP, a64.LR, a64.SP, -16)
+    a64.mov(&mut fc.buf, a64.FP, a64.SP)
+    if frame_bytes > 0 {
+        emit_sub_imm_any(&mut fc.buf, a64.SP, a64.SP, i64(frame_bytes))
+    }
+    for i in 0..fc.plan.used_callee_gp.len {
+        emit_str_off(&mut fc.buf, fc.plan.used_callee_gp[i], a64.FP, -i64(fc.callee_gp_offs[i]), 8)
+    }
+    for i in 0..fc.plan.used_callee_fp.len {
+        emit_str_fp_off(&mut fc.buf, true, fc.plan.used_callee_fp[i], a64.FP, -i64(fc.callee_fp_offs[i]))
+    }
+    if fc.sret_off > 0 {
+        emit_str_off(&mut fc.buf, a64.X8, a64.FP, -i64(fc.sret_off), 8)
+    }
+    if fc.env_off > 0 {
+        emit_str_off(&mut fc.buf, a64.X9, a64.FP, -i64(fc.env_off), 8)
+    }
+
+    // 3. Receive incoming function parameters into their allocated SsaVal locations
+    // NOTE: Handle FP params via parallel moves because d0..d7 may be allocated to incoming FP params!
+    mut in_gp := 0
+    mut in_fp := 0
+    mut in_stk := 0
+    mut fp_in_moves: []ScalarMove = []
+    for pi in 0..f.param_vals.len {
+        pv := f.param_vals[pi]
+        pty := f.vals[pv].ty
+        ploc := fc.plan.locs[pv]
+        if ploc.cls == .Void { continue }
+        if ploc.cls == .Gp {
+            if in_gp < 8 {
+                if ploc.kind != .None { store_gp_val(&mut fc, pv, in_gp) }
+                in_gp += 1
+            } else {
+                if ploc.kind != .None {
+                    emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, i64(16 + in_stk * 8), 8, false)
+                    store_gp_val(&mut fc, pv, a64.X16)
+                }
+                in_stk += 1
+            }
+        } else if ploc.cls == .Fp {
+            if in_fp < 8 {
+                if ploc.kind != .None {
+                    fp_in_moves.push(ScalarMove {
+                        src_is_reg: true, src_loc: in_fp,
+                        dst_is_reg: ploc.kind == .Reg,
+                        dst_loc: if ploc.kind == .Reg { ploc.reg_lo } else { ploc.spill_off },
+                        is_f64: ploc.is_f64, done: false,
+                    })
+                }
+                in_fp += 1
+            } else {
+                if ploc.kind != .None {
+                    emit_ldr_fp_off(&mut fc.buf, ploc.is_f64, 16, a64.FP, i64(16 + in_stk * 8))
+                    store_fp_val(&mut fc, pv, 16)
+                }
+                in_stk += 1
+            }
+        } else if ploc.cls == .Fat {
+            if in_gp + 2 <= 8 {
+                if ploc.kind != .None { store_fat_val(&mut fc, pv, in_gp, in_gp + 1) }
+                in_gp += 2
+            } else {
+                in_gp = 8
+                if ploc.kind != .None {
+                    emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, i64(16 + in_stk * 8), 8, false)
+                    emit_ldr_off(&mut fc.buf, a64.X17, a64.FP, i64(16 + (in_stk + 1) * 8), 8, false)
+                    store_fat_val(&mut fc, pv, a64.X16, a64.X17)
+                }
+                in_stk += 2
+            }
+        } else if ploc.cls == .Agg {
+            sz := type_size(&types, pty)
+            if sz <= 8 {
+                if in_gp < 8 {
+                    if ploc.spill_off > 0 { emit_str_off(&mut fc.buf, in_gp, a64.FP, -i64(ploc.spill_off), 8) }
+                    in_gp += 1
+                } else {
+                    if ploc.spill_off > 0 {
+                        emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, i64(16 + in_stk * 8), 8, false)
+                        emit_str_off(&mut fc.buf, a64.X16, a64.FP, -i64(ploc.spill_off), 8)
+                    }
+                    in_stk += 1
+                }
+            } else if sz <= 16 {
+                if in_gp + 2 <= 8 {
+                    if ploc.spill_off > 0 {
+                        emit_str_off(&mut fc.buf, in_gp, a64.FP, -i64(ploc.spill_off), 8)
+                        emit_str_off(&mut fc.buf, in_gp + 1, a64.FP, -i64(ploc.spill_off) + 8, 8)
+                    }
+                    in_gp += 2
+                } else {
+                    in_gp = 8
+                    if ploc.spill_off > 0 {
+                        emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, i64(16 + in_stk * 8), 8, false)
+                        emit_str_off(&mut fc.buf, a64.X16, a64.FP, -i64(ploc.spill_off), 8)
+                        emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, i64(16 + (in_stk + 1) * 8), 8, false)
+                        emit_str_off(&mut fc.buf, a64.X16, a64.FP, -i64(ploc.spill_off) + 8, 8)
+                    }
+                    in_stk += 2
+                }
+            } else {
+                // Indirect pointer passed in GP reg or stack
+                if in_gp < 8 {
+                    if ploc.spill_off > 0 {
+                        emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(ploc.spill_off))
+                        emit_memcpy_size(&mut fc, &rt, a64.X6, in_gp, sz)
+                    }
+                    in_gp += 1
+                } else {
+                    if ploc.spill_off > 0 {
+                        emit_ldr_off(&mut fc.buf, a64.X7, a64.FP, i64(16 + in_stk * 8), 8, false)
+                        emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(ploc.spill_off))
+                        emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, sz)
+                    }
+                    in_stk += 1
+                }
+            }
+        }
+    }
+    if fp_in_moves.len > 0 {
+        run_parallel_moves(&mut fc.buf, &mut fp_in_moves, true)
+    }
+
+    // 4. Load closure captures from [env + 16..] into capture slots if closure body
+    mut cap_cnt := 0
+    mut cap_skipped: []bool = []
+    if f.is_closure_body && fc.env_off > 0 && f.sig_ty >= 0 && f.sig_ty < types.entries.len {
+        cte := &types.entries[f.sig_ty]
+        cap_cnt = cte.count
+        mut cap_off := 16
+        for ci in 0..cap_cnt {
+            cap_skipped.push(false)
+            loc_id := 1 + f.param_count + ci
+            cty := ht.field_type(&types, f.sig_ty, ci)
+            csz := align_up_i32(type_size(&types, cty), 8)
+            step := if csz < 8 { 8 } else { csz }
+            if loc_id < f.slots.len && !f.slots[loc_id].dead && fc.slot_offs[loc_id] > 0 {
+                emit_ldr_off(&mut fc.buf, a64.X4, a64.FP, -i64(fc.env_off), 8, false)
+                emit_add_imm_any(&mut fc.buf, a64.X7, a64.X4, i64(cap_off))
+                emit_sub_imm_any(&mut fc.buf, a64.X6, a64.FP, i64(fc.slot_offs[loc_id]))
+                emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, type_size(&types, cty))
+            }
+            cap_off += step
+        }
+    }
+
+    // 5. Emit Basic Blocks in RPO order
+    rpo_len := fc.plan.rpo.len
+    for ri in 0..rpo_len {
+        bb := fc.plan.rpo[ri]
+        next_rpo_bb := if ri + 1 < rpo_len { fc.plan.rpo[ri + 1] } else { -1 }
+        a64.mark(&mut fc.buf, fc.bb_labels[bb])
+        blk := f.blocks[bb]
+
+        for ii in 0..blk.inst_len {
+            ins := f.insts[f.block_insts[blk.inst_start + ii]]
+            // Skip synthetic zero-init Store into closure capture slots in bb 0
+            if bb == 0 && cap_cnt > 0 && ins.kind == .Store && ins.aux >= 0 {
+                ci := ins.aux - (1 + f.param_count)
+                if ci >= 0 && ci < cap_cnt && !cap_skipped[ci] {
+                    cap_skipped[ci] = true
+                    continue
+                }
+            }
+            emit_inst(&mut m, &hir, &f, &mut fc, &rt, &fn_syms, &ins)
+        }
+
+        if blk.term_id < 0 { continue }
+        tm := f.terms[blk.term_id]
+
+        if tm.kind == .Goto {
+            emit_edge_copies(&mut fc, &types, &f, &rt, tm.target_a, tm.arg_start, tm.arg_len)
+            if tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .Branch {
+            rc := load_gp_val(&mut fc, tm.cond_val, a64.X0)
+            if tm.arg_len == 0 && tm.arg2_len == 0 {
+                if tm.target_a == next_rpo_bb {
+                    a64.cbz(&mut fc.buf, true, rc, fc.bb_labels[tm.target_b])
+                } else if tm.target_b == next_rpo_bb {
+                    a64.cbnz(&mut fc.buf, true, rc, fc.bb_labels[tm.target_a])
+                } else {
+                    a64.cbnz(&mut fc.buf, true, rc, fc.bb_labels[tm.target_a])
+                    a64.b(&mut fc.buf, fc.bb_labels[tm.target_b])
+                }
+            } else {
+                else_tramp := a64.label(&mut fc.buf)
+                a64.cbz(&mut fc.buf, true, rc, else_tramp)
+                emit_edge_copies(&mut fc, &types, &f, &rt, tm.target_a, tm.arg_start, tm.arg_len)
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+                a64.mark(&mut fc.buf, else_tramp)
+                emit_edge_copies(&mut fc, &types, &f, &rt, tm.target_b, tm.arg2_start, tm.arg2_len)
+                if tm.target_b != next_rpo_bb {
+                    a64.b(&mut fc.buf, fc.bb_labels[tm.target_b])
+                }
+            }
+        } else if tm.kind == .Switch {
+            rv := load_gp_val(&mut fc, tm.cond_val, a64.X0)
+            mut tramp_lbls: []i32 = []
+            for ci in 0..tm.case_len {
+                c_val := f.switch_vals[tm.case_start + ci]
+                c_bb := f.switch_bbs[tm.case_start + ci]
+                c_al := f.switch_arg_lens[tm.case_start + ci]
+                emit_cmp_imm_any(&mut fc.buf, true, rv, c_val)
+                if c_al == 0 {
+                    a64.b_cond(&mut fc.buf, a64.CC_EQ, fc.bb_labels[c_bb])
+                    tramp_lbls.push(-1)
+                } else {
+                    tl := a64.label(&mut fc.buf)
+                    a64.b_cond(&mut fc.buf, a64.CC_EQ, tl)
+                    tramp_lbls.push(tl)
+                }
+            }
+            emit_edge_copies(&mut fc, &types, &f, &rt, tm.target_a, tm.arg_start, tm.arg_len)
+            a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            for ci in 0..tm.case_len {
+                if tramp_lbls[ci] >= 0 {
+                    a64.mark(&mut fc.buf, tramp_lbls[ci])
+                    c_bb := f.switch_bbs[tm.case_start + ci]
+                    c_as := f.switch_arg_starts[tm.case_start + ci]
+                    c_al := f.switch_arg_lens[tm.case_start + ci]
+                    emit_edge_copies(&mut fc, &types, &f, &rt, c_bb, c_as, c_al)
+                    a64.b(&mut fc.buf, fc.bb_labels[c_bb])
+                }
+            }
+        } else if tm.kind == .Call || tm.kind == .IndirectCall || tm.kind == .ExternCall {
+            emit_abi_call(&mut m, &hir, &f, &mut fc, &fn_syms, &tm)
+            if tm.target_a >= 0 && tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .IntrinsicCall {
+            emit_intrinsic_call(&mut m, &hir, &f, &mut fc, &rt, &fn_syms, target, &tm)
+            if tm.target_a >= 0 && tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .RegionEnter {
+            roff := find_region_off(&fc, tm.callee)
+            if roff > 0 {
+                emit_str_off(&mut fc.buf, a64.X19, a64.FP, -i64(roff), 8)
+                emit_str_off(&mut fc.buf, a64.X20, a64.FP, -i64(roff) + 8, 8)
+            }
+            if tm.target_a >= 0 && tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .RegionExit {
+            roff := find_region_off(&fc, tm.callee)
+            if roff > 0 {
+                // Only rewind bump cursor x19 if slab end x20 did not grow to a new mmap slab
+                emit_ldr_off(&mut fc.buf, a64.X16, a64.FP, -i64(roff) + 8, 8, false)
+                a64.cmp_reg(&mut fc.buf, true, a64.X16, a64.X20)
+                lbl_skip := a64.label(&mut fc.buf)
+                a64.b_cond(&mut fc.buf, a64.CC_NE, lbl_skip)
+                emit_ldr_off(&mut fc.buf, a64.X19, a64.FP, -i64(roff), 8, false)
+                a64.mark(&mut fc.buf, lbl_skip)
+            }
+            if tm.target_a >= 0 && tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .TaskScopeEnter {
+            if tm.cond_val >= 0 {
+                load_gp_into(&mut fc, tm.cond_val, a64.X0)
+                a64.str(&mut fc.buf, a64.XZR, a64.X0, 0, 8)
+            }
+            if tm.target_a >= 0 && tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .TaskScopeJoin {
+            if tm.target_a >= 0 && tm.target_a != next_rpo_bb {
+                a64.b(&mut fc.buf, fc.bb_labels[tm.target_a])
+            }
+        } else if tm.kind == .Return {
+            emit_closure_writeback(&mut fc, &types, &f, &rt)
+            if tm.cond_val >= 0 && ret_cls != .Void {
+                if ret_cls == .Gp {
+                    load_gp_into(&mut fc, tm.cond_val, a64.X0)
+                } else if ret_cls == .Fp {
+                    load_fp_into(&mut fc, tm.cond_val, 0)
+                } else if ret_cls == .Fat {
+                    load_fat_into(&mut fc, tm.cond_val, a64.X0, a64.X1)
+                } else if ret_cls == .Agg {
+                    voff := fc.plan.locs[tm.cond_val].spill_off
+                    if ret_sz <= 8 {
+                        emit_ldr_off(&mut fc.buf, a64.X0, a64.FP, -i64(voff), 8, false)
+                    } else if ret_sz <= 16 {
+                        emit_ldr_off(&mut fc.buf, a64.X0, a64.FP, -i64(voff), 8, false)
+                        emit_ldr_off(&mut fc.buf, a64.X1, a64.FP, -i64(voff) + 8, 8, false)
+                    } else if fc.sret_off > 0 {
+                        emit_ldr_off(&mut fc.buf, a64.X6, a64.FP, -i64(fc.sret_off), 8, false)
+                        emit_sub_imm_any(&mut fc.buf, a64.X7, a64.FP, i64(voff))
+                        emit_memcpy_size(&mut fc, &rt, a64.X6, a64.X7, ret_sz)
+                    }
+                }
+            }
+            a64.b(&mut fc.buf, fc.epilogue_lbl)
+        } else if tm.kind == .Trap {
+            code := if tm.callee > 0 { tm.callee } else { hb.TRAP_UNREACHABLE }
+            a64.imm(&mut fc.buf, a64.X0, i64(code))
+            emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+        }
+    }
+
+    // 6. Trap landing pads
+    a64.mark(&mut fc.buf, fc.trap_101)
+    a64.imm(&mut fc.buf, a64.X0, i64(hb.TRAP_OVERFLOW))
+    emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+
+    a64.mark(&mut fc.buf, fc.trap_102)
+    a64.imm(&mut fc.buf, a64.X0, i64(hb.TRAP_DIV_ZERO))
+    emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+
+    a64.mark(&mut fc.buf, fc.trap_103)
+    a64.imm(&mut fc.buf, a64.X0, i64(hb.TRAP_BOUNDS))
+    emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+
+    a64.mark(&mut fc.buf, fc.trap_104)
+    a64.imm(&mut fc.buf, a64.X0, i64(hb.TRAP_ASSERT))
+    emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+
+    a64.mark(&mut fc.buf, fc.trap_105)
+    a64.imm(&mut fc.buf, a64.X0, i64(hb.TRAP_PANIC))
+    emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+
+    a64.mark(&mut fc.buf, fc.trap_106)
+    a64.imm(&mut fc.buf, a64.X0, i64(hb.TRAP_UNREACHABLE))
+    emit_call_sym(&mut fc.buf, &mut fc.relocs, rt.trap)
+
+    // 7. Epilogue
+    a64.mark(&mut fc.buf, fc.epilogue_lbl)
+    for i in 0..fc.plan.used_callee_fp.len {
+        emit_ldr_fp_off(&mut fc.buf, true, fc.plan.used_callee_fp[i], a64.FP, -i64(fc.callee_fp_offs[i]))
+    }
+    for i in 0..fc.plan.used_callee_gp.len {
+        emit_ldr_off(&mut fc.buf, fc.plan.used_callee_gp[i], a64.FP, -i64(fc.callee_gp_offs[i]), 8, false)
+    }
+    a64.mov(&mut fc.buf, a64.SP, a64.FP)
+    a64.ldp_post(&mut fc.buf, a64.FP, a64.LR, a64.SP, 16)
+    a64.ret(&mut fc.buf)
+
+    // 8. Finalize ArmBuf -> append to ObjectModule & patch pre-registered function symbol offset/size!
+    code := a64.finish_at_offset(&mut fc.buf, 0)
+    start := obj.append_text(&mut m, &code, 4)
+    sym_id := fn_syms[f.fn_id]
+    m.symbols[sym_id].offset = start
+    m.symbols[sym_id].size = code.len
+    for i in 0..fc.relocs.len {
+        r := fc.relocs[i]
+        off := start + a64.label_word(&fc.buf, r.site_lbl) * 4
+        _ := obj.add_reloc(&mut m, .Text, off, r.kind, r.sym_id, r.addend, r.reg)
+    }
+    for i in 0..fc.imp_sites.len {
+        p := fc.imp_sites[i]
+        off := start + a64.label_word(&fc.buf, p.site_lbl) * 4
+        obj.add_import_site(&mut m, p.imp_id, off)
+    }
+}
+
+// =========================================================================
+// 10. Top-Level Entry Points: emit_program & emit_executable
+// =========================================================================
+
+pub fn emit_program(prog: &ssa.SsaProgram, hir: &hb.HirProgram, target: obj.TargetKind) -> obj.ObjectModule {
+    assert(target == .Arm64Macos || target == .Arm64Linux)
+    mut m := obj.new(target)
+
+    // Pre-register placeholder symbols for all SSA functions so forward/recursive calls resolve cleanly
+    mut max_fid := prog.fn_id_to_idx.len
+    for i in 0..prog.funcs.len {
+        if prog.funcs[i].fn_id + 1 > max_fid { max_fid = prog.funcs[i].fn_id + 1 }
+    }
+    mut fn_syms: []i32 = []
+    for _ in 0..max_fid { fn_syms.push(-1) }
+    for i in 0..prog.funcs.len {
+        sf := &prog.funcs[i]
+        if sf.fn_id >= 0 {
+            fn_syms[sf.fn_id] = obj.add_symbol(&mut m, sf.name.clone(), .Function, .Text, 0, 0, sf.fn_id == prog.entry_fn)
+        }
+    }
+
+    // 1. Emit `_start` at byte offset 0 of .text (required entry point for Mach-O LC_MAIN and ELF e_entry)
+    mut b_start := a64.new()
+    mut r_start: []PendingReloc = []
+    empty_imp: []PendingImport = []
+    // Initialize reserved per-thread bump arena registers x19, x20, x21 = 0
+    a64.imm(&mut b_start, a64.X19, 0)
+    a64.imm(&mut b_start, a64.X20, 0)
+    a64.imm(&mut b_start, a64.X21, 0)
+
+    mut entry_returns_int := false
+    if prog.entry_fn >= 0 && prog.entry_fn < fn_syms.len && fn_syms[prog.entry_fn] >= 0 {
+        e_idx := prog.fn_id_to_idx[prog.entry_fn]
+        if e_idx >= 0 && e_idx < prog.funcs.len {
+            entry_returns_int = ssa.is_int_ty(&hir.types, prog.funcs[e_idx].ret_ty)
+        }
+        emit_call_sym(&mut b_start, &mut r_start, fn_syms[prog.entry_fn])
+    }
+    if !entry_returns_int {
+        a64.imm(&mut b_start, a64.X0, 0)
+    }
+    emit_syscall(&mut b_start, target, 33554433, 94) // exit / exit_group
+    a64.brk(&mut b_start, 0)
+    start_sym := flush_buf_to_module(&mut m, &mut b_start, &r_start, &empty_imp, "_start", true)
+    m.entry_sym = start_sym
+
+    // 2. Emit self-contained native runtime stubs (bump allocator, print, strings, arrays, memcpy, traps)
+    rt := emit_runtime_stubs(&mut m, target)
+
+    // 3. Emit every SSA function into ObjectModule
+    for i in 0..prog.funcs.len {
+        sf := &prog.funcs[i]
+        if sf.is_extern || sf.blocks.len == 0 { continue }
+        emit_function(&mut m, &hir, &sf, &rt, &fn_syms, target)
+    }
+
+    m
+}
+
+pub fn emit_executable(prog: &ssa.SsaProgram, hir: &hb.HirProgram, target: obj.TargetKind) -> []u8 {
+    m := emit_program(&prog, &hir, target)
+    if target == .Arm64Macos {
+        cfg := macho.default_config()
+        signer := macho.serial_signer()
+        return obj.emit_macho(&m, &cfg, &signer, false, "dunder-arm64-isel", ".", "main.ddr")
+    }
+    ecfg := elf.default_config()
+    obj.emit_elf(&m, &ecfg, false, "dunder-arm64-isel", ".", "main.ddr")
+}

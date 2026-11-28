@@ -1,0 +1,502 @@
+// End-to-end native execution unit tests for Phase 4A:
+// Full 1.0 pipeline:
+//   parser -> hir_lower -> hir_mono -> mir_check -> ssa_lower -> ssa_opt -> ssa_verify
+//   -> arm64_isel -> ObjectModule -> Mach-O / ELF64
+// Writes real native ARM64 Mach-O binaries on macOS, executes them, and verifies exact stdout & exit codes!
+
+capability process, filesystem
+
+import std.fs as fs
+import std.process as process
+import sys
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.hir.hir_lower as hir_lower
+import ..selfhost.hir.hir_mono as hir_mono
+import ..selfhost.mir2.mir_check as mir_check
+import ..selfhost.ssa.ssa_ir as ssa
+import ..selfhost.ssa.ssa_verify as ssa_verify
+import ..selfhost.ssa.ssa_lower as ssa_lower
+import ..selfhost.ssa.ssa_opt as ssa_opt
+import ..selfhost.backend.arm64_enc as a64
+import ..selfhost.backend.object_module as obj
+import ..selfhost.backend.arm64_isel as arm64_isel
+
+struct CompiledBin {
+    ok: bool,
+    err: string,
+    image: []u8,
+    hir: hb.HirProgram,
+    ssa_prog: ssa.SsaProgram,
+}
+
+fn compile_full_pipeline(src: string, run_opt: bool, target: obj.TargetKind) -> CompiledBin {
+    platform := obj.target_to_platform(target)
+    tree := parser.parse_source("isel_test.ddr", src)
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "isel_test.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut prog := hir_lower.lower_modules(&mods, &edges, platform)
+    if !prog.ok {
+        return CompiledBin { ok: false, err: "hir_lower failed", image: [], hir: move prog, ssa_prog: ssa.new_program(0, -1) }
+    }
+    hir_mono.monomorphize(&mut prog)
+    chk := mir_check.check_program(&prog)
+    if !chk.ok {
+        return CompiledBin { ok: false, err: "mir_check failed", image: [], hir: move prog, ssa_prog: ssa.new_program(0, -1) }
+    }
+    mut diags: []diag.Diagnostic = []
+    mut sp := ssa_lower.lower_program(&prog, &chk.bodies, &mut diags)
+    if !ssa_verify.verify_program(&prog.types, &sp, &mut diags) || diags.len > 0 {
+        return CompiledBin { ok: false, err: "ssa_verify(pre) failed", image: [], hir: move prog, ssa_prog: move sp }
+    }
+    if run_opt {
+        if !ssa_opt.optimize_program(&prog.types, &mut sp, true, &mut diags) || diags.len > 0 {
+            return CompiledBin { ok: false, err: "ssa_opt failed", image: [], hir: move prog, ssa_prog: move sp }
+        }
+        if !ssa_verify.verify_program(&prog.types, &sp, &mut diags) || diags.len > 0 {
+            return CompiledBin { ok: false, err: "ssa_verify(post) failed", image: [], hir: move prog, ssa_prog: move sp }
+        }
+    }
+    img := arm64_isel.emit_executable(&sp, &prog, target)
+    CompiledBin { ok: true, err: "", image: move img, hir: move prog, ssa_prog: move sp }
+}
+
+struct RunOutcome {
+    code: i32,
+    stdout: string,
+    stderr: string,
+}
+
+fn compile_and_exec(src: string, run_opt: bool, name: string) -> RunOutcome {
+    c := compile_full_pipeline(src, run_opt, .Arm64Macos)
+    assert(c.ok)
+    assert(c.image.len > 64)
+    // Verify Mach-O 64-bit magic 0xfeedfacf
+    assert(i32(c.image[0]) == 0xcf && i32(c.image[1]) == 0xfa && i32(c.image[2]) == 0xed && i32(c.image[3]) == 0xfe)
+
+    tmp := fs.temp_dir("dunder-isel-" + name + "-")
+    assert(tmp.ok)
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    bin_path := work + "/" + name
+    assert(sys.write_u8(bin_path, &c.image).ok)
+    assert(sys.make_executable(bin_path).ok)
+
+    mut cmd := process.Command::new(move bin_path, [])
+    cmd.set_timeout(5000)
+    res := cmd.exec()
+    assert(res.ok && !res.timed_out)
+    RunOutcome { code: res.code, stdout: res.stdout_text(), stderr: res.stderr_text() }
+}
+
+// =========================================================================
+// 1. Arithmetic, Loops, Recursion (fib), Floats, Casts & Parallel Swap Cycles
+// =========================================================================
+
+@test
+fn arm64_isel_exec_arithmetic_loops_fib_floats_and_swaps() {
+    src := "fn fib(n: i32) -> i32 {\n" +
+        "    if n <= 1 { return n }\n" +
+        "    fib(n - 1) + fib(n - 2)\n" +
+        "}\n" +
+        "fn iter_fib(n: i32) -> i64 {\n" +
+        "    mut a: i64 = 0\n" +
+        "    mut b: i64 = 1\n" +
+        "    mut i: i32 = 0\n" +
+        "    while i < n {\n" +
+        "        next := a + b\n" +
+        "        a = b\n" +
+        "        b = next\n" +
+        "        i += 1\n" +
+        "    }\n" +
+        "    a\n" +
+        "}\n" +
+        "fn swap_cycle_loop(n: i32) -> i32 {\n" +
+        "    mut x: i32 = 10\n" +
+        "    mut y: i32 = 20\n" +
+        "    mut z: i32 = 30\n" +
+        "    mut i: i32 = 0\n" +
+        "    while i < n {\n" +
+        "        tmp := x\n" +
+        "        x = y\n" +
+        "        y = z\n" +
+        "        z = tmp\n" +
+        "        i += 1\n" +
+        "    }\n" +
+        "    x * 100 + y * 10 + z\n" +
+        "}\n" +
+        "fn float_math(a: f64, b: f64) -> i64 {\n" +
+        "    c := (a * b) + (a - b) / 2.0\n" +
+        "    i64(c * 10.0)\n" +
+        "}\n" +
+        "fn narrow_ints(x: i8, y: u8, z: u16) -> i64 {\n" +
+        "    i64(x) + i64(y) + i64(z)\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    print(fib(15))\n" +
+        "    print(iter_fib(30))\n" +
+        "    print(swap_cycle_loop(4))\n" +
+        "    print(float_math(5.0, 3.0))\n" +
+        "    print(narrow_ints(-5, 200, 1000))\n" +
+        "    print(100 / 7)\n" +
+        "    print(100 % 7)\n" +
+        "    print(-17 / 5)\n" +
+        "    print(-17 % 5)\n" +
+        "}\n"
+
+    expected := "610\n832040\n2310\n160\n1195\n14\n2\n-3\n-2\n"
+    out_opt := compile_and_exec(src, true, "arith_opt")
+    assert(out_opt.code == 0)
+    assert(out_opt.stdout == expected)
+
+    out_unopt := compile_and_exec(src, false, "arith_unopt")
+    assert(out_unopt.code == 0)
+    assert(out_unopt.stdout == expected)
+}
+
+// =========================================================================
+// 2. Structs (Small <=16B & Large >16B sret), Methods, Enums, Option, Result
+// =========================================================================
+
+@test
+fn arm64_isel_exec_structs_sret_enums_option_result() {
+    src := "struct Vec2 { x: i32, y: i32 }\n" +
+        "impl Vec2 {\n" +
+        "    fn dot(&self, other: &Vec2) -> i32 { self.x * other.x + self.y * other.y }\n" +
+        "}\n" +
+        "struct Big4 { a: i64, b: i64, c: i64, d: i64 }\n" +
+        "fn make_big(seed: i64) -> Big4 {\n" +
+        "    Big4 { a: seed, b: seed * 2, c: seed * 3, d: seed * 4 }\n" +
+        "}\n" +
+        "fn sum_big(v: Big4) -> i64 {\n" +
+        "    v.a + v.b + v.c + v.d\n" +
+        "}\n" +
+        "enum Shape {\n" +
+        "    Circle(i32),\n" +
+        "    Rect(i32, i32),\n" +
+        "    Empty,\n" +
+        "}\n" +
+        "fn area(s: Shape) -> i32 {\n" +
+        "    match s {\n" +
+        "        .Circle(r) => r * r * 3,\n" +
+        "        .Rect(w, h) => w * h,\n" +
+        "        .Empty => 0,\n" +
+        "    }\n" +
+        "}\n" +
+        "fn safe_div(a: i32, b: i32) -> Result<i32, i32> {\n" +
+        "    if b == 0 { return .Err(-99) }\n" +
+        "    .Ok(a / b)\n" +
+        "}\n" +
+        "fn opt_val(flag: bool) -> Option<i64> {\n" +
+        "    if flag { .Some(777) } else { .None }\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    v1 := Vec2 { x: 3, y: 4 }\n" +
+        "    v2 := Vec2 { x: 5, y: 6 }\n" +
+        "    print(v1.dot(&v2))\n" +
+        "    big := make_big(10)\n" +
+        "    print(sum_big(big))\n" +
+        "    print(area(.Circle(4)))\n" +
+        "    print(area(.Rect(6, 7)))\n" +
+        "    print(area(.Empty))\n" +
+        "    print(opt_val(true).unwrap_or(-1))\n" +
+        "    print(opt_val(false).unwrap_or(-1))\n" +
+        "    r1 := safe_div(84, 2)\n" +
+        "    r2 := safe_div(84, 0)\n" +
+        "    print(r1.unwrap())\n" +
+        "    print(r2.unwrap_err())\n" +
+        "    mut p: i32 = 11\n" +
+        "    mut q: i32 = 22\n" +
+        "    old := replace(&mut p, 99)\n" +
+        "    swap(&mut p, &mut q)\n" +
+        "    print(old)\n" +
+        "    print(p)\n" +
+        "    print(q)\n" +
+        "}\n"
+
+    expected := "39\n100\n48\n42\n0\n777\n-1\n42\n-99\n11\n22\n99\n"
+    out := compile_and_exec(src, true, "structs_enums")
+    assert(out.code == 0)
+    assert(out.stdout == expected)
+}
+
+// =========================================================================
+// 3. First-Class 2-Word Fat Views (&str, &[]i32), Strings & Dynamic Arrays
+// =========================================================================
+
+@test
+fn arm64_isel_exec_fat_views_strings_and_arrays() {
+    src := "fn pick_str(cond: bool, a: &str, b: &str) -> &str from (a, b) {\n" +
+        "    mut s := a\n" +
+        "    if cond { s = b }\n" +
+        "    s\n" +
+        "}\n" +
+        "fn sub_str(s: &str, lo: i32, hi: i32) -> &str from s {\n" +
+        "    &s[lo..hi]\n" +
+        "}\n" +
+        "fn sum_slice(xs: &[]i32) -> i32 {\n" +
+        "    mut total := 0\n" +
+        "    for i in 0..xs.len {\n" +
+        "        total += xs[i]\n" +
+        "    }\n" +
+        "    total\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    hello := \"hello\"\n" +
+        "    world := \"world\"\n" +
+        "    joined := hello + \" \" + world\n" +
+        "    print(joined)\n" +
+        "    v1 := pick_str(false, &hello, &world)\n" +
+        "    v2 := pick_str(true, &hello, &world)\n" +
+        "    print(v1)\n" +
+        "    print(v2)\n" +
+        "    sub := sub_str(&joined, 6, 11)\n" +
+        "    print(sub)\n" +
+        "    print(sub == \"world\")\n" +
+        "    print(joined.len)\n" +
+        "    mut arr: []i32 = [10, 20, 30]\n" +
+        "    arr.push(40)\n" +
+        "    arr.push(50)\n" +
+        "    print(sum_slice(&arr))\n" +
+        "    tail := &arr[1..4]\n" +
+        "    print(sum_slice(tail))\n" +
+        "    popped := arr.pop()\n" +
+        "    print(popped)\n" +
+        "    print(arr.len)\n" +
+        "    n := 12345\n" +
+        "    print(\"n=\" + n.str())\n" +
+        "}\n"
+
+    expected := "hello world\nhello\nworld\nworld\ntrue\n11\n150\n90\n50\n4\nn=12345\n"
+    out := compile_and_exec(src, true, "fat_arrays")
+    assert(out.code == 0)
+    assert(out.stdout == expected)
+}
+
+// =========================================================================
+// 4. Closures, Function Pointers, IndirectCall, Inlining, Region & TaskScope
+// =========================================================================
+
+@test
+fn arm64_isel_exec_closures_inlining_region_and_task_scope() {
+    src := "fn apply_fn(f: fn(i32) -> i32, x: i32) -> i32 {\n" +
+        "    f(x)\n" +
+        "}\n" +
+        "fn double(v: i32) -> i32 { v * 2 }\n" +
+        "fn add_one(v: i32) -> i32 { v + 1 }\n" +
+        "fn compute_inlined(a: i32, b: i32) -> i32 {\n" +
+        "    double(add_one(a)) + double(add_one(b))\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    print(apply_fn(double, 21))\n" +
+        "    print(compute_inlined(4, 5))\n" +
+        "    inc := fn(x: i32) -> i32 { x + 100 }\n" +
+        "    print(inc(23))\n" +
+        "    task scope s(1) {\n" +
+        "        t := 7 * 6\n" +
+        "        print(t)\n" +
+        "    }\n" +
+        "    region r(256) {\n" +
+        "        buf := r.alloc(4)\n" +
+        "        print(buf.len)\n" +
+        "    }\n" +
+        "}\n"
+
+    expected := "42\n22\n123\n42\n4\n"
+    out := compile_and_exec(src, true, "closures_inline_region")
+    assert(out.code == 0)
+    assert(out.stdout == expected)
+}
+
+@test
+fn arm64_isel_exec_capturing_closures() {
+    src := "struct Offset { delta: i32, scale: i32 }\n" +
+        "fn main() {\n" +
+        "    off := Offset { delta: 7, scale: 3 }\n" +
+        "    f := fn[off](x: i32) -> i32 { x * off.scale + off.delta }\n" +
+        "    print(f(10))\n" +
+        "    print(f(20))\n" +
+        "}\n"
+
+    expected := "37\n67\n"
+    out_unopt := compile_and_exec(src, false, "cap_closure_unopt")
+    assert(out_unopt.code == 0)
+    assert(out_unopt.stdout == expected)
+
+    out_opt := compile_and_exec(src, true, "cap_closure_opt")
+    assert(out_opt.code == 0)
+    assert(out_opt.stdout == expected)
+}
+
+// =========================================================================
+// 5. Runtime Traps: Overflow (101), Div-Zero (102), Bounds (103), Assert (104), Panic (105)
+// =========================================================================
+
+@test
+fn arm64_isel_exec_runtime_traps() {
+    // 101: checked signed i32 overflow
+    src_ovf := "fn boom(x: i32) -> i32 { x + 1 }\n" +
+        "fn main() {\n" +
+        "    mut m: i32 = 2147483647\n" +
+        "    print(boom(m))\n" +
+        "}\n"
+    r_ovf := compile_and_exec(src_ovf, true, "trap_ovf")
+    assert(r_ovf.code == 101)
+
+    // 102: division by zero
+    src_div0 := "fn div(a: i32, b: i32) -> i32 { a / b }\n" +
+        "fn main() {\n" +
+        "    mut z: i32 = 0\n" +
+        "    print(div(42, z))\n" +
+        "}\n"
+    r_div0 := compile_and_exec(src_div0, true, "trap_div0")
+    assert(r_div0.code == 102)
+
+    // 103: array out-of-bounds
+    src_oob := "fn get_at(xs: &[]i32, idx: i32) -> i32 { xs[idx] }\n" +
+        "fn main() {\n" +
+        "    arr: []i32 = [1, 2, 3]\n" +
+        "    print(get_at(&arr, 5))\n" +
+        "}\n"
+    r_oob := compile_and_exec(src_oob, true, "trap_oob")
+    assert(r_oob.code == 103)
+
+    // 104: assert(false)
+    src_assert := "fn check(c: bool) { assert(c) }\n" +
+        "fn main() { check(false) }\n"
+    r_assert := compile_and_exec(src_assert, true, "trap_assert")
+    assert(r_assert.code == 104)
+
+    // 105: panic()
+    src_panic := "fn main() { panic(\"boom\") }\n"
+    r_panic := compile_and_exec(src_panic, true, "trap_panic")
+    assert(r_panic.code == 105)
+}
+
+// =========================================================================
+// 6. Register Allocator Pressure & Spill Stress (Verifies x19..x21 Reserved!)
+// =========================================================================
+
+@test
+fn arm64_isel_regalloc_pressure_spill_and_arena_reservation() {
+    // 12 live values simultaneously across a non-inlinable recursive call forces > 7 callee-saved GP regs -> real spills!
+    src := "fn bump(x: i64, d: i32) -> i64 {\n" +
+        "    if d > 0 { return bump(x, d - 1) }\n" +
+        "    x + 1\n" +
+        "}\n" +
+        "fn pressure(n: i64) -> i64 {\n" +
+        "    v0 := bump(n + 1, 0)\n" +
+        "    v1 := bump(n + 2, 0)\n" +
+        "    v2 := bump(n + 3, 0)\n" +
+        "    v3 := bump(n + 4, 0)\n" +
+        "    v4 := bump(n + 5, 0)\n" +
+        "    v5 := bump(n + 6, 0)\n" +
+        "    v6 := bump(n + 7, 0)\n" +
+        "    v7 := bump(n + 8, 0)\n" +
+        "    v8 := bump(n + 9, 0)\n" +
+        "    v9 := bump(n + 10, 0)\n" +
+        "    v10 := bump(n + 11, 0)\n" +
+        "    v11 := bump(n + 12, 0)\n" +
+        "    v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    print(pressure(10))\n" +
+        "}\n"
+
+    // Check regalloc plan directly on `pressure` after SSA optimization (mem2reg keeps all 12 SSA vals live across calls!)
+    c := compile_full_pipeline(src, true, .Arm64Macos)
+    assert(c.ok)
+    mut p_idx := -1
+    for i in 0..c.ssa_prog.funcs.len {
+        if c.ssa_prog.funcs[i].name == "pressure" { p_idx = i; break }
+    }
+    assert(p_idx >= 0)
+    plan := arm64_isel.allocate_registers(&c.hir.types, &c.ssa_prog.funcs[p_idx])
+    // Must use all 7 callee-saved GP regs (x22..x28) AND spill excess call-crossing live values!
+    assert(plan.used_callee_gp.len == 7)
+    assert(plan.spill_count > 0)
+    // STRICT INVARIANT: x19, x20, x21 (arena regs) and x18 MUST NEVER be allocated!
+    for v in 0..plan.locs.len {
+        loc := plan.locs[v]
+        if loc.kind == .Reg && (loc.cls == .Gp || loc.cls == .Fat) {
+            assert(loc.reg_lo != a64.X18 && loc.reg_lo != a64.X19 && loc.reg_lo != a64.X20 && loc.reg_lo != a64.X21)
+            if loc.cls == .Fat {
+                assert(loc.reg_hi != a64.X18 && loc.reg_hi != a64.X19 && loc.reg_hi != a64.X20 && loc.reg_hi != a64.X21)
+            }
+        }
+    }
+
+    // Also run optimized + unoptimized native binaries and verify exact sum:
+    // sum_{k=1..12} (10 + k + 1) = 12*11 + 78 = 210
+    out_opt := compile_and_exec(src, true, "pressure_opt")
+    assert(out_opt.code == 0 && out_opt.stdout == "210\n")
+
+    out_unopt := compile_and_exec(src, false, "pressure_unopt")
+    assert(out_unopt.code == 0 && out_unopt.stdout == "210\n")
+}
+
+// =========================================================================
+// 7. Stack-Overflow Args (>8 GP & >8 FP), FixedArr, Bitwise & Float Intrinsics
+// =========================================================================
+
+@test
+fn arm64_isel_exec_stack_args_fixed_arr_and_intrinsics() {
+    src := "fn sum10(a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64, a7: i64, a8: i64, a9: i64) -> i64 {\n" +
+        "    if a0 < 0 { return sum10(0, a1, a2, a3, a4, a5, a6, a7, a8, a9) }\n" +
+        "    a0 + a1 * 2 + a2 * 3 + a3 * 4 + a4 * 5 + a5 * 6 + a6 * 7 + a7 * 8 + a8 * 9 + a9 * 10\n" +
+        "}\n" +
+        "fn sum10_f64(a0: f64, a1: f64, a2: f64, a3: f64, a4: f64, a5: f64, a6: f64, a7: f64, a8: f64, a9: f64) -> i64 {\n" +
+        "    if a0 < 0.0 { return sum10_f64(0.0, a1, a2, a3, a4, a5, a6, a7, a8, a9) }\n" +
+        "    i64(a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9)\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    print(sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))\n" +
+        "    print(sum10_f64(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0))\n" +
+        "    mut fixed: [i32; 4] = [3, 6, 9, 12]\n" +
+        "    fixed[2] = 100\n" +
+        "    print(fixed[0] + fixed[1] + fixed[2] + fixed[3])\n" +
+        "    x: i64 = 0x0f\n" +
+        "    y: i64 = 0x33\n" +
+        "    print(x.bit_or(y))\n" +
+        "    print(x.bit_and(y))\n" +
+        "    print(x.bit_xor(y))\n" +
+        "    print(i64(1).shl(10))\n" +
+        "    print(i64(1024).shr(3))\n" +
+        "    print(i64(81.0.sqrt()))\n" +
+        "}\n"
+
+    // sum_{k=1..10} k^2 = 385; sum_{k=1..10} k = 55; fixed sum = 3+6+100+12 = 121
+    // 0x0f | 0x33 = 0x3f = 63; 0x0f & 0x33 = 0x03 = 3; 0x0f ^ 0x33 = 0x3c = 60
+    expected := "385\n55\n121\n63\n3\n60\n1024\n128\n9\n"
+    out := compile_and_exec(src, true, "stack_args_intrinsics")
+    assert(out.code == 0)
+    assert(out.stdout == expected)
+}
+
+// =========================================================================
+// 8. Cross-Target ARM64 Linux ELF64 Emission Verification
+// =========================================================================
+
+@test
+fn arm64_isel_emits_valid_elf64_for_arm64_linux() {
+    src := "fn add(a: i32, b: i32) -> i32 { a + b }\n" +
+        "fn main() {\n" +
+        "    print(add(20, 22))\n" +
+        "    print(\"hello linux arm64\")\n" +
+        "}\n"
+
+    c := compile_full_pipeline(src, true, .Arm64Linux)
+    assert(c.ok)
+    img := &c.image
+    assert(img.len > 4096)
+    // Verify ELF64 magic: 0x7f 'E' 'L' 'F'
+    assert(i32(img[0]) == 127 && i32(img[1]) == 69 && i32(img[2]) == 76 && i32(img[3]) == 70)
+    // ELFCLASS64 (2), ELFDATA2LSB (1)
+    assert(i32(img[4]) == 2 && i32(img[5]) == 1)
+    // e_machine == 183 (EM_AARCH64)
+    assert(i32(img[18]) == 183 && i32(img[19]) == 0)
+}
