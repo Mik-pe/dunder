@@ -2722,12 +2722,40 @@ fn emit_ssa_inst(b: &mut x64.X86Buf, ctx: &mut EmitCtx, prog: &ssa.SsaProgram, h
 // IntrinsicCall Lowering
 // =========================================================================
 
-fn emit_intrinsic_call(b: &mut x64.X86Buf, ctx: &mut EmitCtx, hir: &hb.HirProgram,
+fn emit_intrinsic_call(b: &mut x64.X86Buf, ctx: &mut EmitCtx, prog: &ssa.SsaProgram, hir: &hb.HirProgram,
     f: &ssa.SsaFunc, ra: &RegAllocResult, relocs: &mut []PendingReloc, tm: &ssa.SsaTerm) {
     types := &hir.types
     id := tm.callee
 
-    if id == hb.INTRINSIC_DROP { return }
+    if id == hb.INTRINSIC_DROP {
+        if tm.arg_len > 0 {
+            av := f.val_args[tm.arg_start]
+            ty := f.vals[av].ty
+            is_ref := types.entries[ty].kind == .Ref || types.entries[ty].kind == .MutRef
+            inner := if is_ref { types.entries[ty].inner_a } else { ty }
+            if inner >= 0 && inner < types.entries.len && types.entries[inner].dispose_fn >= 0 {
+                dfid := types.entries[inner].dispose_fn
+                if dfid < prog.fn_id_to_idx.len {
+                    c_idx := prog.fn_id_to_idx[dfid]
+                    if c_idx >= 0 && c_idx < ctx.fn_syms.len {
+                        a0 := gp_arg_reg(ctx.is_win64, 0)
+                        if is_ref {
+                            _ := load_gp_val_into(&mut b, &ra, av, a0)
+                        } else if ra.locs[av].kind == LOC_MEM_HOME {
+                            x64.lea_disp(&mut b, a0, x64.RBP, ra.locs[av].rbp_off)
+                        } else {
+                            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+                            x64.mov_store(&mut b, x64.RBP, ra.scratch_save_off, SCRATCH_A, 8)
+                            x64.lea_disp(&mut b, a0, x64.RBP, ra.scratch_save_off)
+                        }
+                        co := x64.call_lbl(&mut b, -1)
+                        relocs.push(PendingReloc { local_off: co, kind: .X86Rel32, sym_id: ctx.fn_syms[c_idx], addend: 0 })
+                    }
+                }
+            }
+        }
+        return
+    }
 
     if id == hb.INTRINSIC_ASSERT {
         if tm.arg_len > 0 {
@@ -3000,6 +3028,125 @@ fn emit_intrinsic_call(b: &mut x64.X86Buf, ctx: &mut EmitCtx, hir: &hb.HirProgra
         x64.cmp_ri(&mut b, false, SCRATCH_A, want)
         x64.setcc_bool(&mut b, x64.CC_E, SCRATCH_A)
         store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+        return
+    }
+
+    // Option / Result unwrap & unwrap_err
+    if (id == hb.INTRINSIC_UNWRAP || id == hb.INTRINSIC_UNWRAP_ERR) && tm.arg_len >= 1 {
+        av := f.val_args[tm.arg_start]
+        mut ety := f.vals[av].ty
+        if types.entries[ety].kind == .Ref || types.entries[ety].kind == .MutRef {
+            ety = types.entries[ety].inner_a
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+        } else if classify_repr(&types, ety, ctx.is_win64) == REPR_MEM {
+            x64.lea_disp(&mut b, SCRATCH_A, x64.RBP, ra.locs[av].rbp_off)
+        } else {
+            // Pair or GP enum: check tag directly
+            if classify_repr(&types, ety, ctx.is_win64) == REPR_PAIR {
+                _ := load_pair_lo_into(&mut b, &ra, av, SCRATCH_B)
+            } else {
+                _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_B)
+            }
+            want: i64 = if id == hb.INTRINSIC_UNWRAP { 0 } else { 1 }
+            ok_lbl := x64.label(&mut b)
+            x64.cmp_ri(&mut b, false, SCRATCH_B, want)
+            _ := x64.jcc_lbl(&mut b, x64.CC_E, ok_lbl)
+            emit_trap_call(&mut b, &ctx, &mut relocs, hb.TRAP_PANIC)
+            x64.mark(&mut b, ok_lbl)
+            if tm.dest_val >= 0 {
+                if classify_repr(&types, ety, ctx.is_win64) == REPR_PAIR {
+                    load_pair_halves(&mut b, &ra, av, SCRATCH_A, SCRATCH_B)
+                    store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_B)
+                } else {
+                    x64.mov_imm(&mut b, true, SCRATCH_A, 0)
+                    store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+                }
+            }
+            return
+        }
+        want: i64 = if id == hb.INTRINSIC_UNWRAP { 0 } else { 1 }
+        x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, 0, 4, true)
+        ok_lbl := x64.label(&mut b)
+        x64.cmp_ri(&mut b, false, SCRATCH_B, want)
+        _ := x64.jcc_lbl(&mut b, x64.CC_E, ok_lbl)
+        emit_trap_call(&mut b, &ctx, &mut relocs, hb.TRAP_PANIC)
+        x64.mark(&mut b, ok_lbl)
+        if tm.dest_val >= 0 {
+            dty := f.vals[tm.dest_val].ty
+            drepr := classify_repr(&types, dty, ctx.is_win64)
+            te := &types.entries[ety]
+            al := if te.align > 0 { te.align } else { 4 }
+            tag_al := align_up_i32(4, al)
+            v_entry := &types.variants[te.inner_a + i32(want)]
+            poff := if v_entry.payload_count > 0 { tag_al + types.fields[v_entry.payload_start].offset } else { tag_al }
+            if drepr == REPR_GP {
+                x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, poff, scalar_width(&types, dty), is_signed_int_ty(&types, dty))
+                store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_B)
+            } else if drepr == REPR_FP {
+                is64 := is_f64_ty(&types, dty)
+                x64.movs_load(&mut b, is64, FP_SCRATCH_A, SCRATCH_A, poff)
+                store_fp_val_from(&mut b, &ra, tm.dest_val, is64, FP_SCRATCH_A)
+            } else if drepr == REPR_PAIR {
+                x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, poff + 8, 8, false)
+                x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, poff, 8, false)
+                store_pair_halves(&mut b, &ra, tm.dest_val, SCRATCH_A, SCRATCH_B)
+            } else if drepr == REPR_MEM {
+                emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, poff, types.entries[dty].size, SCRATCH_B)
+            }
+        }
+        return
+    }
+
+    // Raw pointer & clone intrinsics
+    if (id == hb.INTRINSIC_AS_PTR || id == hb.INTRINSIC_AS_MUT_PTR || id == hb.INTRINSIC_PTR_ADDR) && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        aty := f.vals[av].ty
+        ak := types.entries[aty].kind
+        if classify_repr(&types, aty, ctx.is_win64) == REPR_PAIR {
+            _ := load_pair_lo_into(&mut b, &ra, av, SCRATCH_A)
+        } else if (ak == .Ref || ak == .MutRef) && id != hb.INTRINSIC_PTR_ADDR {
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+            inner := types.entries[aty].inner_a
+            if inner >= 0 && inner < types.entries.len &&
+                (types.entries[inner].kind == .Array || types.entries[inner].kind == .String) {
+                x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false)
+            }
+        } else {
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+        }
+        store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+        return
+    }
+
+    if id == hb.INTRINSIC_CLONE && tm.arg_len >= 1 && tm.dest_val >= 0 {
+        av := f.val_args[tm.arg_start]
+        dty := f.vals[tm.dest_val].ty
+        drepr := classify_repr(&types, dty, ctx.is_win64)
+        ak := types.entries[f.vals[av].ty].kind
+        is_ref := ak == .Ref || ak == .MutRef
+        if drepr == REPR_GP {
+            _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+            if is_ref {
+                x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, scalar_width(&types, dty), is_signed_int_ty(&types, dty))
+            }
+            store_gp_val_from(&mut b, &ra, tm.dest_val, SCRATCH_A)
+        } else if drepr == REPR_PAIR {
+            if is_ref {
+                _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+                x64.mov_load(&mut b, SCRATCH_B, SCRATCH_A, 8, 8, false)
+                x64.mov_load(&mut b, SCRATCH_A, SCRATCH_A, 0, 8, false)
+            } else {
+                load_pair_halves(&mut b, &ra, av, SCRATCH_A, SCRATCH_B)
+            }
+            store_pair_halves(&mut b, &ra, tm.dest_val, SCRATCH_A, SCRATCH_B)
+        } else if drepr == REPR_MEM {
+            if is_ref {
+                _ := load_gp_val_into(&mut b, &ra, av, SCRATCH_A)
+                emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, SCRATCH_A, 0, types.entries[dty].size, SCRATCH_B)
+            } else {
+                emit_inline_copy_regs(&mut b, x64.RBP, ra.locs[tm.dest_val].rbp_off, x64.RBP, ra.locs[av].rbp_off, types.entries[dty].size, SCRATCH_B)
+            }
+        }
         return
     }
 
@@ -3440,7 +3587,7 @@ fn emit_func(ctx: &mut EmitCtx, prog: &ssa.SsaProgram, hir: &hb.HirProgram, fidx
                 _ := x64.jmp_lbl(&mut b, bb_lbls[tm.target_a])
             }
         } else if tk == .IntrinsicCall {
-            emit_intrinsic_call(&mut b, &mut ctx, &hir, &f, &ra, &mut relocs, &tm)
+            emit_intrinsic_call(&mut b, &mut ctx, &prog, &hir, &f, &ra, &mut relocs, &tm)
             if tm.target_a >= 0 && tm.target_a != next_bb {
                 _ := x64.jmp_lbl(&mut b, bb_lbls[tm.target_a])
             }

@@ -1,0 +1,474 @@
+// Phase 3/4 End-to-End Native SSA Backend Driver (`selfhost/backend/ssa_driver.ddr`).
+//
+// Complete target-independent SSA compilation pipeline:
+//   MirProgram + TypeTable + BuildOptions
+//     -> ssa_lower (all fns, closures, string/cstr/wstr/embed blobs, extern decls, FFI, task scope, @test entry)
+//     -> ssa_verify (pre-opt structural/type/dominance/scope verification)
+//     -> ssa_opt (Mem2Reg/SROA, unified SSA inliner, GVN/ConstFold/CopyProp, bounds/overflow elision, CFG/DCE)
+//     -> ssa_runtime (optional type-driven drop/clone/iso_clone/freeze, RC sentinels 0/-1/-2/<=-3,
+//                     TYPE_DESC_TABLE, TLS CallbackFrame, bump alloc, R-3 task worker entries)
+//     -> { arm64_isel | x86_isel | wasm_isel }
+//     -> ObjectModule (relocations, dynamic imports, TYPE_DESC_TABLE, DWARF -g line tables)
+//     -> { Mach-O (arm64-macos) | ELF64 (arm64-linux, x86_64-linux) | PE32+ (x86_64-windows) | WASM32/WASI }
+//
+// Also supports incremental content-hashed per-function compilation via `ssa_fragments`
+// (`compile_mir_program_ssa_cached`) guaranteeing 100% byte-identical output across cold, warm,
+// and disk-restored builds.
+//
+// ZERO imports of legacy `compile.ddr`, `mir_emit*.ddr`, `mir_lift.ddr`, `arm64.ddr`,
+// `x86.ddr`, `x86_mir.ddr`, `wasm_mir.ddr`, or `wasm_native.ddr`.
+
+capability filesystem
+
+import ..frontend.diagnostics as diag
+import ..hir.hir_types as ht
+import ..hir.hir_body as hb
+import ..mir2.mir_body as mb
+import ..ssa.ssa_ir as ssa
+import ..ssa.ssa_verify as ssa_verify
+import ..ssa.ssa_lower as ssa_lower
+import ..ssa.ssa_opt as ssa_opt
+import ..ssa.ssa_runtime as ssa_rt
+import object_module as obj
+import arm64_isel
+import x86_isel
+import wasm_isel
+import ssa_fragments as frag
+import imports as native_imports
+import macho
+import elf
+import pe
+
+// =========================================================================
+// Public Pipeline Types & Constructors
+// =========================================================================
+
+pub struct MirProgram {
+    hir: hb.HirProgram,
+    bodies: []mb.MirBody,
+    sources: []string,
+}
+
+pub struct BuildOptions {
+    target: obj.TargetKind,
+    run_opt: bool,
+    verify_ssa: bool,
+    synthesize_runtime: bool,
+    debug_info: bool,
+    cache_dir: string,
+    producer: string,
+    comp_dir: string,
+    main_file: string,
+    macho_cfg: macho.MachoConfig,
+    elf_cfg: elf.ElfConfig,
+    pe_cfg: pe.PeConfig,
+    lib_overrides: []native_imports.LibraryOverride,
+}
+
+pub struct CompileOutput {
+    ok: bool,
+    error: string,
+    image: []u8,
+    module: obj.ObjectModule,
+    ssa_prog: ssa.SsaProgram,
+    diagnostics: []diag.Diagnostic,
+    total_fns: i32,
+    cache_hits: i32,
+    cache_misses: i32,
+    type_desc_count: i32,
+    recompiled_fn_ids: []i32,
+}
+
+pub fn new_mir_program(move hir: hb.HirProgram, move bodies: []mb.MirBody) -> MirProgram {
+    MirProgram {
+        hir: move hir,
+        bodies: move bodies,
+        sources: [],
+    }
+}
+
+pub fn new_mir_program_with_sources(move hir: hb.HirProgram, move bodies: []mb.MirBody,
+    move sources: []string) -> MirProgram {
+    MirProgram {
+        hir: move hir,
+        bodies: move bodies,
+        sources: move sources,
+    }
+}
+
+pub fn default_options(target: obj.TargetKind) -> BuildOptions {
+    BuildOptions {
+        target: target,
+        run_opt: true,
+        verify_ssa: true,
+        synthesize_runtime: false,
+        debug_info: false,
+        cache_dir: "",
+        producer: "dunder-ssa-driver 1.0",
+        comp_dir: ".",
+        main_file: "main.ddr",
+        macho_cfg: macho.default_config(),
+        elf_cfg: elf.default_config(),
+        pe_cfg: pe.default_config(),
+        lib_overrides: [],
+    }
+}
+
+pub fn target_from_name(name: string) -> Result<obj.TargetKind, string> {
+    if name == "arm64-macos" { return .Ok(.Arm64Macos) }
+    if name == "arm64-linux" { return .Ok(.Arm64Linux) }
+    if name == "x86_64-linux" { return .Ok(.X86_64Linux) }
+    if name == "x86_64-windows" { return .Ok(.X86_64Windows) }
+    if name == "wasm32" { return .Ok(.Wasm32) }
+    if name == "wasm32-wasi" { return .Ok(.Wasm32Wasi) }
+    .Err("unknown SSA backend target: " + name)
+}
+
+// =========================================================================
+// Internal Metadata Cloning & Image Packaging Helpers
+// =========================================================================
+
+fn clone_type_table(tt: &ht.TypeTable) -> ht.TypeTable {
+    mut entries: []ht.TypeEntry = []
+    entries.reserve(tt.entries.len)
+    for i in 0..tt.entries.len {
+        e := &tt.entries[i]
+        entries.push(ht.TypeEntry {
+            kind: e.kind,
+            name: e.name.clone(),
+            owner_mod: e.owner_mod,
+            size: e.size,
+            align: e.align,
+            inner_a: e.inner_a,
+            inner_b: e.inner_b,
+            count: e.count,
+            flags: e.flags,
+            origin_count: e.origin_count,
+            dispose_fn: e.dispose_fn,
+            from_start: e.from_start,
+            from_len: e.from_len,
+            repr_ty: e.repr_ty,
+            closure_fn_id: e.closure_fn_id,
+        })
+    }
+    mut fields: []ht.FieldEntry = []
+    fields.reserve(tt.fields.len)
+    for i in 0..tt.fields.len {
+        f := &tt.fields[i]
+        fields.push(ht.FieldEntry {
+            name: f.name.clone(),
+            ty: f.ty,
+            offset: f.offset,
+            is_pub: f.is_pub,
+            origin_slot: f.origin_slot,
+        })
+    }
+    mut variants: []ht.VariantEntry = []
+    variants.reserve(tt.variants.len)
+    for i in 0..tt.variants.len {
+        v := &tt.variants[i]
+        variants.push(ht.VariantEntry {
+            name: v.name.clone(),
+            tag_value: v.tag_value,
+            payload_start: v.payload_start,
+            payload_count: v.payload_count,
+        })
+    }
+    ht.TypeTable {
+        entries: move entries,
+        fields: move fields,
+        variants: move variants,
+        params: tt.params.clone(),
+        from_edges: tt.from_edges.clone(),
+        map_insts: tt.map_insts.clone(),
+        gen_insts: tt.gen_insts.clone(),
+        gen_inst_args: tt.gen_inst_args.clone(),
+        ref_of: tt.ref_of.clone(),
+        mut_ref_of: tt.mut_ref_of.clone(),
+        array_of: tt.array_of.clone(),
+        fat_slice_of: tt.fat_slice_of.clone(),
+        region_slice_of: tt.region_slice_of.clone(),
+        raw_const_of: tt.raw_const_of.clone(),
+        raw_mut_of: tt.raw_mut_of.clone(),
+        task_of: tt.task_of.clone(),
+        option_of: tt.option_of.clone(),
+        map_inst_of: tt.map_inst_of.clone(),
+        gen_inst_of: tt.gen_inst_of.clone(),
+        fat_str_ty: tt.fat_str_ty,
+        fn_ptr_map: Map<string, i64>::new(),
+        sealed: tt.sealed,
+        platform: tt.platform,
+    }
+}
+
+// Lightweight HirProgram metadata clone for runtime synthesis (copies type table,
+// extern/fn headers, extern statics, and embed blobs without duplicating HIR expr/stmt trees).
+fn clone_hir_metadata(hir: &hb.HirProgram, tt: &ht.TypeTable) -> hb.HirProgram {
+    mut fns: []hb.HirFn = []
+    fns.reserve(hir.fns.len)
+    for i in 0..hir.fns.len {
+        sf := &hir.fns[i]
+        mut nf := hb.new_fn(sf.id, sf.name.clone(), sf.owner_mod, sf.sig_ty, sf.ret_ty, sf.param_count)
+        nf.is_pub = sf.is_pub
+        nf.is_unsafe = sf.is_unsafe
+        nf.is_extern = sf.is_extern
+        nf.is_generic_template = sf.is_generic_template
+        nf.is_trait_default = sf.is_trait_default
+        nf.is_closure_body = sf.is_closure_body
+        nf.requires_caps = sf.requires_caps
+        nf.extern_lib = sf.extern_lib.clone()
+        nf.extern_symbol = sf.extern_symbol.clone()
+        nf.variadic_fixed = sf.variadic_fixed
+        nf.link_weak = sf.link_weak
+        nf.link_delay = sf.link_delay
+        nf.is_thread_safe = sf.is_thread_safe
+        nf.is_test = sf.is_test
+        nf.test_group = sf.test_group.clone()
+        nf.span_start = sf.span_start
+        nf.span_end = sf.span_end
+        fns.push(move nf)
+    }
+    mut ext_statics: []hb.HirExternStatic = []
+    ext_statics.reserve(hir.extern_statics.len)
+    for i in 0..hir.extern_statics.len {
+        es := &hir.extern_statics[i]
+        ext_statics.push(hb.HirExternStatic {
+            name: es.name.clone(),
+            owner_mod: es.owner_mod,
+            ty: es.ty,
+            is_mut: es.is_mut,
+            extern_lib: es.extern_lib.clone(),
+            extern_symbol: es.extern_symbol.clone(),
+            link_weak: es.link_weak,
+            link_delay: es.link_delay,
+            span_start: es.span_start,
+            span_end: es.span_end,
+        })
+    }
+    mut mod_paths: []string = []
+    for i in 0..hir.mod_paths.len { mod_paths.push(hir.mod_paths[i].clone()) }
+    hb.HirProgram {
+        types: clone_type_table(&tt),
+        fns: move fns,
+        consts: [],
+        extern_statics: move ext_statics,
+        entry_fn: hir.entry_fn,
+        mod_paths: move mod_paths,
+        mod_caps: hir.mod_caps.clone(),
+        embed_blobs: hir.embed_blobs.clone(),
+        embed_starts: hir.embed_starts.clone(),
+        embed_counts: hir.embed_counts.clone(),
+        safe_send_sync_checks: [],
+        diagnostics: [],
+        ok: hir.ok,
+    }
+}
+
+fn format_diags_summary(diags: &[]diag.Diagnostic) -> string {
+    if diags.len == 0 { return "unknown SSA error" }
+    mut out := ""
+    mut lim := diags.len
+    if lim > 5 { lim = 5 }
+    for i in 0..lim {
+        if i > 0 { out = out + "; " }
+        d := &diags[i]
+        out = out + d.code + ": " + d.message
+    }
+    out
+}
+
+fn fail_output(target: obj.TargetKind, err: string, move diags: []diag.Diagnostic) -> CompileOutput {
+    CompileOutput {
+        ok: false,
+        error: err.clone(),
+        image: [],
+        module: obj.new(target),
+        ssa_prog: ssa.new_program(0, -1),
+        diagnostics: move diags,
+        total_fns: 0,
+        cache_hits: 0,
+        cache_misses: 0,
+        type_desc_count: 0,
+        recompiled_fn_ids: [],
+    }
+}
+
+fn emit_native_image_for_options(m: &obj.ObjectModule, opts: &BuildOptions) -> []u8 {
+    if m.target == .Arm64Macos {
+        signer := macho.serial_signer()
+        return obj.emit_macho(&m, &opts.macho_cfg, &signer, opts.debug_info,
+            opts.producer.clone(), opts.comp_dir.clone(), opts.main_file.clone())
+    }
+    if m.target == .Arm64Linux || m.target == .X86_64Linux {
+        return obj.emit_elf(&m, &opts.elf_cfg, opts.debug_info,
+            opts.producer.clone(), opts.comp_dir.clone(), opts.main_file.clone())
+    }
+    obj.emit_pe(&m, &opts.pe_cfg)
+}
+
+// =========================================================================
+// Core End-to-End Compilation Pipeline
+// =========================================================================
+
+pub fn compile_mir_program_ssa_detailed(prog: &MirProgram, tt: &ht.TypeTable,
+    opts: &BuildOptions) -> CompileOutput {
+    mut diags: []diag.Diagnostic = []
+    if !prog.hir.ok {
+        return fail_output(opts.target, "HirProgram contains errors", move diags)
+    }
+
+    // 1. Lower post-drop HL-MIR bodies to Target-Independent Typed SSA MIR
+    mut sp := ssa_lower.lower_program(&prog.hir, &prog.bodies, &mut diags)
+    if diags.len > 0 {
+        err := "ssa_lower failed: " + format_diags_summary(&diags)
+        return fail_output(opts.target, err, move diags)
+    }
+
+    // 2. Verify pre-opt SSA invariants
+    if opts.verify_ssa {
+        if !ssa_verify.verify_program(&tt, &sp, &mut diags) || diags.len > 0 {
+            err := "ssa_verify(pre-opt) failed: " + format_diags_summary(&diags)
+            return fail_output(opts.target, err, move diags)
+        }
+    }
+
+    // 3. Run unified SSA optimization pipeline (Mem2Reg, Inliner, GVN/ConstFold, Bounds/Ovf Elision, CFG/DCE)
+    if opts.run_opt {
+        if !ssa_opt.optimize_program(&tt, &mut sp, opts.verify_ssa, &mut diags) || diags.len > 0 {
+            err := "ssa_opt failed: " + format_diags_summary(&diags)
+            return fail_output(opts.target, err, move diags)
+        }
+        if opts.verify_ssa {
+            if !ssa_verify.verify_program(&tt, &sp, &mut diags) || diags.len > 0 {
+                err := "ssa_verify(post-opt) failed: " + format_diags_summary(&diags)
+                return fail_output(opts.target, err, move diags)
+            }
+        }
+    }
+
+    total_fns := sp.funcs.len
+
+    // 4. Optional structured SSA runtime synthesis + TYPE_DESC_TABLE preparation
+    if opts.synthesize_runtime {
+        mut rt_hir := clone_hir_metadata(&prog.hir, &tt)
+        start_fid := rt_hir.fns.len
+        reg := ssa_rt.synthesize_runtime(&mut rt_hir.types, &mut sp, start_fid)
+        if opts.verify_ssa {
+            if !ssa_rt.verify_runtime(&rt_hir.types, &sp, &reg, &mut diags) || diags.len > 0 {
+                err := "ssa_runtime verification failed: " + format_diags_summary(&diags)
+                return fail_output(opts.target, err, move diags)
+            }
+        }
+        if opts.target == .Wasm32 || opts.target == .Wasm32Wasi {
+            wasm_bin := wasm_isel.emit_wasm(&sp, &rt_hir, opts.target == .Wasm32Wasi)
+            mut wm := obj.new(opts.target)
+            _ := obj.append_text(&mut wm, &wasm_bin, 1)
+            return CompileOutput {
+                ok: true, error: "", image: move wasm_bin, module: move wm, ssa_prog: move sp,
+                diagnostics: move diags, total_fns: total_fns, cache_hits: 0, cache_misses: total_fns,
+                type_desc_count: reg.type_descs.len, recompiled_fn_ids: [],
+            }
+        }
+        mut obj_mod := if opts.target == .Arm64Macos || opts.target == .Arm64Linux {
+            arm64_isel.emit_program_with_sources(&sp, &rt_hir, opts.target, &prog.sources)
+        } else {
+            x86_isel.emit_program(&sp, &rt_hir, opts.target)
+        }
+        _ := ssa_rt.populate_type_desc_table(&mut obj_mod, &reg)
+        img := emit_native_image_for_options(&obj_mod, &opts)
+        return CompileOutput {
+            ok: true, error: "", image: move img, module: move obj_mod, ssa_prog: move sp,
+            diagnostics: move diags, total_fns: total_fns, cache_hits: 0, cache_misses: total_fns,
+            type_desc_count: reg.type_descs.len, recompiled_fn_ids: [],
+        }
+    }
+
+    // 5. Direct ISel -> ObjectModule -> Native/WASM executable packaging
+    if opts.target == .Wasm32 || opts.target == .Wasm32Wasi {
+        wasm_bin := wasm_isel.emit_wasm(&sp, &prog.hir, opts.target == .Wasm32Wasi)
+        mut wm := obj.new(opts.target)
+        _ := obj.append_text(&mut wm, &wasm_bin, 1)
+        return CompileOutput {
+            ok: true, error: "", image: move wasm_bin, module: move wm, ssa_prog: move sp,
+            diagnostics: move diags, total_fns: total_fns, cache_hits: 0, cache_misses: total_fns,
+            type_desc_count: 0, recompiled_fn_ids: [],
+        }
+    }
+
+    obj_mod := if opts.target == .Arm64Macos || opts.target == .Arm64Linux {
+        arm64_isel.emit_program_with_sources(&sp, &prog.hir, opts.target, &prog.sources)
+    } else {
+        x86_isel.emit_program(&sp, &prog.hir, opts.target)
+    }
+    img := emit_native_image_for_options(&obj_mod, &opts)
+    CompileOutput {
+        ok: true, error: "", image: move img, module: move obj_mod, ssa_prog: move sp,
+        diagnostics: move diags, total_fns: total_fns, cache_hits: 0, cache_misses: total_fns,
+        type_desc_count: 0, recompiled_fn_ids: [],
+    }
+}
+
+// =========================================================================
+// Incremental Content-Hashed Fragment-Cached Compilation Pipeline
+// =========================================================================
+
+pub fn compile_mir_program_ssa_cached_detailed(cache: &mut frag.FragmentCache,
+    prog: &MirProgram, tt: &ht.TypeTable, opts: &BuildOptions) -> CompileOutput {
+    _ := tt.sealed
+    res := frag.compile_program_cached(&mut cache, &prog.hir, opts.target, opts.run_opt)
+    if !res.ok {
+        return CompileOutput {
+            ok: false,
+            error: res.error,
+            image: [],
+            module: move res.module,
+            ssa_prog: ssa.new_program(0, -1),
+            diagnostics: move res.diagnostics,
+            total_fns: res.total_fns,
+            cache_hits: res.cache_hits,
+            cache_misses: res.cache_misses,
+            type_desc_count: 0,
+            recompiled_fn_ids: move res.recompiled_fn_ids,
+        }
+    }
+    // Re-emit with BuildOptions debug_info / configs when targeting native with custom options
+    mut img := move res.executable
+    if opts.debug_info && opts.target != .Wasm32 && opts.target != .Wasm32Wasi {
+        img = emit_native_image_for_options(&res.module, &opts)
+    }
+    CompileOutput {
+        ok: true,
+        error: "",
+        image: move img,
+        module: move res.module,
+        ssa_prog: ssa.new_program(0, -1),
+        diagnostics: move res.diagnostics,
+        total_fns: res.total_fns,
+        cache_hits: res.cache_hits,
+        cache_misses: res.cache_misses,
+        type_desc_count: 0,
+        recompiled_fn_ids: move res.recompiled_fn_ids,
+    }
+}
+
+// =========================================================================
+// Primary Clean Public Entrypoints (`Result<[]u8, string>`)
+// =========================================================================
+
+pub fn compile_mir_program_ssa(prog: &MirProgram, tt: &ht.TypeTable,
+    opts: &BuildOptions) -> Result<[]u8, string> {
+    if opts.cache_dir.len > 0 && !opts.synthesize_runtime {
+        mut cache := frag.new_cache(opts.cache_dir.clone())
+        return compile_mir_program_ssa_cached(&mut cache, &prog, &tt, &opts)
+    }
+    out := compile_mir_program_ssa_detailed(&prog, &tt, &opts)
+    if !out.ok { return .Err(out.error) }
+    .Ok(move out.image)
+}
+
+pub fn compile_mir_program_ssa_cached(cache: &mut frag.FragmentCache,
+    prog: &MirProgram, tt: &ht.TypeTable, opts: &BuildOptions) -> Result<[]u8, string> {
+    out := compile_mir_program_ssa_cached_detailed(&mut cache, &prog, &tt, &opts)
+    if !out.ok { return .Err(out.error) }
+    .Ok(move out.image)
+}

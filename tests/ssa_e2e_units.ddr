@@ -1,0 +1,705 @@
+// Phase 3/4 End-to-End Native SSA Backend Driver Tests (`tests/ssa_e2e_units.ddr`).
+//
+// Full 1.0 pipeline from real Dunder source:
+//   parser -> hir_lower -> hir_mono -> mir_check -> ssa_driver.compile_mir_program_ssa
+//   (ssa_lower -> ssa_verify -> ssa_opt -> ssa_runtime -> {arm64_isel | x86_isel | wasm_isel}
+//    -> ObjectModule -> {Mach-O | ELF64 | PE32+ | WASM32/WASI})
+//
+// Verifies LIVE native ARM64 Mach-O execution, FFI libc + qsort callback, multi-worker
+// parallel `task scope`, `@resource(dispose)` + `defer` LIFO, `Result<&str, string>`,
+// `ssa_runtime` TYPE_DESC_TABLE + `rc=-99999` trap 112, DWARF `-g`, `@test` runner,
+// incremental `ssa_fragments` byte-identity + < 100ms private edit, and all 6 targets
+// (including 0 `(%r15)` check on x86_64-linux and LIVE `node` execution of wasm32/wasi).
+
+capability process, filesystem
+
+import std.fs as fs
+import std.process as process
+import std.time as time
+import sys
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import ..selfhost.hir.hir_types as ht
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.hir.hir_lower as hir_lower
+import ..selfhost.hir.hir_mono as hir_mono
+import ..selfhost.mir2.mir_check as mir_check
+import ..selfhost.ssa.ssa_ir as ssa
+import ..selfhost.ssa.ssa_verify as ssa_verify
+import ..selfhost.ssa.ssa_runtime as rt
+import ..selfhost.backend.object_module as obj
+import ..selfhost.backend.arm64_isel as arm64_isel
+import ..selfhost.backend.ssa_fragments as frag
+import ..selfhost.backend.ssa_driver as driver
+
+// =========================================================================
+// Helpers
+// =========================================================================
+
+struct ExecOut {
+    code: i32,
+    stdout: string,
+    stderr: string,
+}
+
+fn host_native_target() -> obj.TargetKind {
+    if process.host_target() == "arm64-linux" { return .Arm64Linux }
+    .Arm64Macos
+}
+
+fn build_mir_single(src: string, path: string, target: obj.TargetKind) -> driver.MirProgram {
+    platform := obj.target_to_platform(target)
+    tree := parser.parse_source(path.clone(), src.clone())
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: path.clone(), source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut hir := hir_lower.lower_modules(&mods, &edges, platform)
+    if !hir.ok {
+        for i in 0..hir.diagnostics.len { print("HIR ERR: " + hir.diagnostics[i].code + " " + hir.diagnostics[i].message) }
+    }
+    assert(hir.ok)
+    hir_mono.monomorphize(&mut hir)
+    chk := mir_check.check_program(&hir)
+    if !chk.ok {
+        for i in 0..chk.diagnostics.len { print("MIR ERR: " + chk.diagnostics[i].code + " " + chk.diagnostics[i].message) }
+    }
+    assert(chk.ok)
+    sources: []string = [src.clone()]
+    driver.new_mir_program_with_sources(move hir, move chk.bodies, move sources)
+}
+
+fn exec_native_image(img: &[]u8, name: string) -> ExecOut {
+    is_linux := process.host_target() == "arm64-linux"
+    assert(img.len > 64)
+    if is_linux {
+        assert(i32(img[0]) == 127 && i32(img[1]) == 69 && i32(img[2]) == 76 && i32(img[3]) == 70)
+    } else {
+        assert(i32(img[0]) == 0xcf && i32(img[1]) == 0xfa && i32(img[2]) == 0xed && i32(img[3]) == 0xfe)
+    }
+    tmp := fs.temp_dir("dunder-e2e-" + name + "-")
+    assert(tmp.ok)
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+
+    bin_path := work + "/" + name
+    assert(sys.write_u8(bin_path, &img).ok)
+    assert(sys.make_executable(bin_path).ok)
+
+    mut cmd := process.Command::new(move bin_path, [])
+    cmd.set_timeout(5000)
+    res := cmd.exec()
+    assert(res.ok && !res.timed_out)
+    ExecOut { code: res.code, stdout: res.stdout_text(), stderr: res.stderr_text() }
+}
+
+fn bytes_identical(a: &[]u8, b: &[]u8) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false }
+    }
+    true
+}
+
+fn contains_ascii(buf: &[]u8, needle: string) -> bool {
+    if needle.len == 0 || buf.len < needle.len { return false }
+    for i in 0..(buf.len - needle.len + 1) {
+        mut ok := true
+        for j in 0..needle.len {
+            if buf[i + j] != needle[j] { ok = false; break }
+        }
+        if ok { return true }
+    }
+    false
+}
+
+fn read_u16_le(buf: &[]u8, off: i32) -> i32 {
+    i32(buf[off]) + i32(buf[off + 1]) * 256
+}
+
+fn read_u32_le(buf: &[]u8, off: i32) -> i64 {
+    i64(buf[off])
+        .bit_or(i64(buf[off + 1]).shl(8))
+        .bit_or(i64(buf[off + 2]).shl(16))
+        .bit_or(i64(buf[off + 3]).shl(24))
+}
+
+fn count_x86_r15_mem_accesses(text: &[]u8) -> i32 {
+    // Check for legacy ARM64 virtual-bank pattern `[r15 + disp]` (REX.B=1 0x41/0x49/0x45/0x4d,
+    // opcode 0x89/0x8b mov, ModRM rm=7 with mod!=3 and SIB byte 0x24 -> `mov reg, [r15+...]`).
+    // Native x86_isel ONLY uses r15 as a register (never dereferences `[r15+disp]`).
+    mut hits := 0
+    mut i := 0
+    while i + 3 < text.len {
+        b0 := i32(text[i])
+        b1 := i32(text[i + 1])
+        b2 := i32(text[i + 2])
+        if (b0 == 0x49 || b0 == 0x4d || b0 == 0x41 || b0 == 0x45) &&
+            (b1 == 0x89 || b1 == 0x8b) {
+            mod_bits := b2.shr(6).bit_and(3)
+            rm_bits := b2.bit_and(7)
+            if mod_bits != 3 && rm_bits == 7 {
+                hits += 1
+            }
+        }
+        i += 1
+    }
+    hits
+}
+
+// =========================================================================
+// 1. Live Multi-Module Execution: Arith, Fib, Structs, Enums, `Result<&str, string>` + `?`
+// =========================================================================
+
+@test
+fn ssa_e2e_live_multi_module_arith_structs_enums_fat_result_try() {
+    target := host_native_target()
+    platform := obj.target_to_platform(target)
+
+    mod_math := "pub struct Vec2 { pub x: i32, pub y: i32 }\n" +
+        "impl Vec2 {\n" +
+        "    pub fn dot(&self, other: &Vec2) -> i32 { self.x * other.x + self.y * other.y }\n" +
+        "}\n" +
+        "pub fn fib(n: i32) -> i32 {\n" +
+        "    if n <= 1 { return n }\n" +
+        "    fib(n - 1) + fib(n - 2)\n" +
+        "}\n"
+
+    mod_main := "import .math as math\n" +
+        "enum Expr {\n" +
+        "    Num(i32),\n" +
+        "    Add(i32, i32),\n" +
+        "    Zero,\n" +
+        "}\n" +
+        "fn eval(e: Expr) -> i32 {\n" +
+        "    match e {\n" +
+        "        .Num(v) => v,\n" +
+        "        .Add(a, b) => a + b,\n" +
+        "        .Zero => 0,\n" +
+        "    }\n" +
+        "}\n" +
+        "fn slice_word(s: &str, lo: i32, hi: i32) -> Result<&str, string> from s {\n" +
+        "    if lo < 0 || hi > i32(s.len) || lo > hi {\n" +
+        "        return .Err(\"bad-range\")\n" +
+        "    }\n" +
+        "    .Ok(&s[lo..hi])\n" +
+        "}\n" +
+        "fn extract_tag(s: &str) -> Result<&str, string> from s {\n" +
+        "    mid := slice_word(s, 6, 11)?\n" +
+        "    .Ok(mid)\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    v1 := math.Vec2 { x: 3, y: 4 }\n" +
+        "    v2 := math.Vec2 { x: 5, y: 6 }\n" +
+        "    print(v1.dot(&v2))\n" +
+        "    print(math.fib(12))\n" +
+        "    print(eval(.Add(19, 23)))\n" +
+        "    print(eval(.Zero))\n" +
+        "    text := \"hello world!\"\n" +
+        "    ok_res := extract_tag(&text)\n" +
+        "    print(ok_res.unwrap())\n" +
+        "    err_res := slice_word(&text, 10, 2)\n" +
+        "    print(err_res.unwrap_err())\n" +
+        "}\n"
+
+    t0 := parser.parse_source("main.ddr", mod_main.clone())
+    t1 := parser.parse_source("math.ddr", mod_math.clone())
+    mods: []hb.ModuleInput = [
+        hb.ModuleInput { mod_id: 0, path: "main.ddr", source: mod_main.clone(), caps_mask: 0, ast: move t0 },
+        hb.ModuleInput { mod_id: 1, path: "math.ddr", source: mod_math.clone(), caps_mask: 0, ast: move t1 },
+    ]
+    edges: []hb.ImportEdge = [
+        hb.ImportEdge { owner_mod: 0, alias: "math", target_mod: 1 },
+    ]
+    mut hir := hir_lower.lower_modules(&mods, &edges, platform)
+    if !hir.ok {
+        for i in 0..hir.diagnostics.len { print("HIR ERR: " + hir.diagnostics[i].code + " " + hir.diagnostics[i].message) }
+    }
+    assert(hir.ok)
+    hir_mono.monomorphize(&mut hir)
+    chk := mir_check.check_program(&hir)
+    if !chk.ok {
+        for i in 0..chk.diagnostics.len { print("MIR ERR: " + chk.diagnostics[i].code + " " + chk.diagnostics[i].message) }
+    }
+    assert(chk.ok)
+
+    sources: []string = [mod_main, mod_math]
+    mp := driver.new_mir_program_with_sources(move hir, move chk.bodies, move sources)
+    opts := driver.default_options(target)
+    res := driver.compile_mir_program_ssa(&mp, &mp.hir.types, &opts)
+    assert(res.is_ok())
+
+    out := exec_native_image(&res.unwrap(), "multi_mod")
+    assert(out.code == 0)
+    assert(out.stdout == "39\n144\n42\n0\nworld\nbad-range\n")
+}
+
+// =========================================================================
+// 2. Live Execution: Dynamic Array Sorting, Capturing Closures, `@resource(dispose)` + `defer` LIFO
+// =========================================================================
+
+@test
+fn ssa_e2e_live_arrays_sorting_closures_resource_dispose_and_defer_lifo() {
+    target := host_native_target()
+    src := "@resource(dispose)\n" +
+        "struct Guard { id: i32 }\n" +
+        "impl Guard {\n" +
+        "    fn dispose(&mut self) {\n" +
+        "        print(self.id)\n" +
+        "    }\n" +
+        "}\n" +
+        "struct Linear { scale: i32, bias: i32 }\n" +
+        "fn apply(f: fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+        "fn triple(x: i32) -> i32 { x * 3 }\n" +
+        "fn sort_i32(xs: &mut []i32) {\n" +
+        "    mut i := 0\n" +
+        "    while i < xs.len {\n" +
+        "        mut j := i + 1\n" +
+        "        while j < xs.len {\n" +
+        "            if xs[j] < xs[i] {\n" +
+        "                xs.swap(i, j)\n" +
+        "            }\n" +
+        "            j += 1\n" +
+        "        }\n" +
+        "        i += 1\n" +
+        "    }\n" +
+        "}\n" +
+        "fn run_lifo() {\n" +
+        "    g1 := Guard { id: 101 }\n" +
+        "    defer { print(201) }\n" +
+        "    g2 := Guard { id: 102 }\n" +
+        "    defer { print(202) }\n" +
+        "    _ := g1.id + g2.id\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut arr: []i32 = [42, 7, 99, 13, 25]\n" +
+        "    arr.push(3)\n" +
+        "    sort_i32(&mut arr)\n" +
+        "    removed := arr.remove(2)\n" +
+        "    print(removed)\n" +
+        "    for i in 0..arr.len { print(arr[i]) }\n" +
+        "    lin := Linear { scale: 4, bias: 5 }\n" +
+        "    cl := fn[lin](v: i32) -> i32 { v * lin.scale + lin.bias }\n" +
+        "    print(cl(10))\n" +
+        "    print(apply(triple, 11))\n" +
+        "    run_lifo()\n" +
+        "}\n"
+
+    mp := build_mir_single(src, "arrays_closures_lifo.ddr", target)
+    opts := driver.default_options(target)
+    res := driver.compile_mir_program_ssa(&mp, &mp.hir.types, &opts)
+    assert(res.is_ok())
+
+    out := exec_native_image(&res.unwrap(), "arr_cl_lifo")
+    assert(out.code == 0)
+    // Sorted [3, 7, 13, 25, 42, 99] -> remove(2)=13 -> remaining [3, 7, 25, 42, 99]
+    // cl(10)=45, apply(triple, 11)=33, LIFO: defer 202 -> drop g2(102) -> defer 201 -> drop g1(101)
+    assert(out.stdout == "13\n3\n7\n25\n42\n99\n45\n33\n202\n102\n201\n101\n")
+}
+
+// =========================================================================
+// 3. Live FFI C Calls (`libc` `strlen`, `memcmp`, `qsort` w/ Callback!) + DWARF `-g`
+// =========================================================================
+
+@test
+fn ssa_e2e_live_ffi_libc_strlen_memcmp_qsort_callback_and_dwarf() {
+    target := host_native_target()
+    src := "capability unsafe\n" +
+        "@link(\"c\")\n" +
+        "extern \"C\" {\n" +
+        "    fn strlen(s: *const u8) -> i64\n" +
+        "    fn memcmp(a: *const u8, b: *const u8, n: i64) -> i32\n" +
+        "    fn qsort(base: *mut i32, nmemb: i64, size: i64, cmp: extern \"C\" fn(*const i32, *const i32) -> i32)\n" +
+        "}\n" +
+        "extern \"C\" fn cmp_i32(pa: *const i32, pb: *const i32) -> i32 {\n" +
+        "    unsafe {\n" +
+        "        a := pa.read()\n" +
+        "        b := pb.read()\n" +
+        "        if a < b { return -1 }\n" +
+        "        if a > b { return 1 }\n" +
+        "        0\n" +
+        "    }\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    s1 := \"dunder-ssa\"\n" +
+        "    s2 := \"dunder-ssa\"\n" +
+        "    s3 := \"dunder-old\"\n" +
+        "    mut nums: []i32 = [50, 10, 40, 20, 30]\n" +
+        "    unsafe {\n" +
+        "        print(strlen(s1.as_ptr()))\n" +
+        "        print(memcmp(s1.as_ptr(), s2.as_ptr(), 10))\n" +
+        "        cmp_diff := memcmp(s1.as_ptr(), s3.as_ptr(), 10)\n" +
+        "        print(if cmp_diff > 0 { 1 } else { 0 })\n" +
+        "        qsort(nums.as_mut_ptr(), i64(nums.len), 4, cmp_i32)\n" +
+        "    }\n" +
+        "    for i in 0..nums.len { print(nums[i]) }\n" +
+        "}\n"
+
+    mp := build_mir_single(src, "ffi_qsort.ddr", target)
+
+    // 1. Standard build + live execution
+    opts := driver.default_options(target)
+    res := driver.compile_mir_program_ssa(&mp, &mp.hir.types, &opts)
+    assert(res.is_ok())
+    bin := res.unwrap()
+    out := exec_native_image(&bin, "ffi_qsort")
+    assert(out.code == 0)
+    assert(out.stdout == "10\n0\n1\n10\n20\n30\n40\n50\n")
+
+    // 2. Debug (-g) build: verify DWARF sections emitted & binary executes identically!
+    mut dbg_opts := driver.default_options(target)
+    dbg_opts.debug_info = true
+    dbg_opts.main_file = "ffi_qsort.ddr"
+    dbg_out := driver.compile_mir_program_ssa_detailed(&mp, &mp.hir.types, &dbg_opts)
+    assert(dbg_out.ok)
+    assert(dbg_out.module.func_ranges.len >= 2)
+    assert(dbg_out.module.debug_lines.len >= 2)
+    if target == .Arm64Macos {
+        assert(contains_ascii(&dbg_out.image, "__DWARF"))
+        assert(contains_ascii(&dbg_out.image, "__debug_line"))
+    } else {
+        assert(contains_ascii(&dbg_out.image, ".debug_line"))
+    }
+    out_dbg := exec_native_image(&dbg_out.image, "ffi_qsort_dbg")
+    assert(out_dbg.code == 0)
+    assert(out_dbg.stdout == out.stdout)
+}
+
+// =========================================================================
+// 4. Live Multi-Worker Parallel `task scope` + `ssa_runtime` TYPE_DESC_TABLE + `rc=-99999` Trap 112
+// =========================================================================
+
+@test
+fn ssa_e2e_live_task_scope_multi_worker_and_runtime_trap_112() {
+    target := host_native_target()
+
+    // Part A: Live parallel 4-worker `task scope` computation (with per-worker heap string allocation!)
+    src_tasks := "fn worker_compute(n: i64) -> i64 {\n" +
+        "    mut sum: i64 = 0\n" +
+        "    mut i: i64 = 1\n" +
+        "    while i <= n {\n" +
+        "        sum += i * i\n" +
+        "        i += 1\n" +
+        "    }\n" +
+        "    // Exercise worker's private isolated bump arena!\n" +
+        "    tag := \"w-\" + n.str()\n" +
+        "    sum + i64(tag.len)\n" +
+        "}\n" +
+        "fn main() {\n" +
+        "    mut total: i64 = 0\n" +
+        "    task scope pool(4) {\n" +
+        "        t1 := pool.spawn(worker_compute, 10)\n" +
+        "        t2 := pool.spawn(worker_compute, 20)\n" +
+        "        t3 := pool.spawn(worker_compute, 30)\n" +
+        "        t4 := pool.spawn(worker_compute, 40)\n" +
+        "        total = t1.join() + t2.join() + t3.join() + t4.join()\n" +
+        "    }\n" +
+        "    print(total)\n" +
+        "}\n"
+
+    mp_t := build_mir_single(src_tasks, "task_parallel.ddr", target)
+    mut opts_rt := driver.default_options(target)
+    opts_rt.synthesize_runtime = true
+    out_rt := driver.compile_mir_program_ssa_detailed(&mp_t, &mp_t.hir.types, &opts_rt)
+    if !out_rt.ok { print("OUT_RT ERR: " + out_rt.error) }
+    assert(out_rt.ok)
+    assert(obj.find_symbol(&out_rt.module, "__dunder_type_desc_table") >= 0)
+    assert(obj.find_symbol(&out_rt.module, "__dunder_rt_rc_retain") >= 0)
+
+    exec_t := exec_native_image(&out_rt.image, "task_parallel")
+    assert(exec_t.code == 0)
+    // sum(i^2, 1..n): n=10 -> 385+4=389, n=20 -> 2870+4=2874, n=30 -> 9455+4=9459, n=40 -> 22140+4=22144
+    // total = 389 + 2874 + 9459 + 22144 = 34866
+    assert(exec_t.stdout == "34866\n")
+
+    // Part B: Verify `rc = -99999` triggers exact trap `112` (`TRAP_TYPE_DESC_OOB`)!
+    platform := obj.target_to_platform(target)
+    mut hir_trap := hb.new_program(platform)
+    empty_from: []ht.FromEdge = []
+    no_params: []ht.ParamEntry = []
+    main_sig := ht.add_fn_ptr(&mut hir_trap.types, &no_params, ht.TY_I32, &empty_from)
+    rec_fields: []ht.FieldEntry = [
+        ht.FieldEntry { name: "label", ty: ht.TY_STRING, offset: 0, is_pub: true, origin_slot: -1 },
+    ]
+    _ := ht.add_struct(&mut hir_trap.types, "ManagedBox", 0, 0, &rec_fields)
+    ht.seal(&mut hir_trap.types)
+
+    mut sp := ssa.new_program(1, 0)
+    reg := rt.synthesize_runtime(&mut hir_trap.types, &mut sp, 1)
+    assert(reg.type_descs.len >= 1)
+
+    // main() allocates 16B header+payload, writes rc = -99999 at [buf+0], calls __dunder_rt_rc_retain(buf+8) -> trap 112!
+    mut f_main := ssa.new_func(0, 0, "main", "trap112.ddr", main_sig, ht.TY_I32, 0, true)
+    bb0 := ssa.add_block(&mut f_main)
+    bb1 := ssa.add_block(&mut f_main)
+    c16 := ssa.emit_const_int(&mut f_main, bb0, ht.TY_I64, 16, 0, 0)
+    raw := ssa.emit_inst(&mut f_main, bb0, ssa.make_inst(.AllocHeap, ht.TY_PTR, c16, -1, -1, 0, -1, 1, -1, 0, 0, 0, 0))
+    bad_rc := ssa.emit_const_int(&mut f_main, bb0, ht.TY_I64, -99999, 0, 0)
+    ssa.emit_store(&mut f_main, bb0, ht.TY_I64, raw, bad_rc, 0, -1, 0, 0)
+    ri := ssa.emit_cast(&mut f_main, bb0, ht.TY_I64, raw, 0, 0)
+    c8 := ssa.emit_const_int(&mut f_main, bb0, ht.TY_I64, 8, 0, 0)
+    obj_i := ssa.emit_binary(&mut f_main, bb0, ht.TY_I64, hb.BINOP_ADD, ri, c8, 0, 0)
+    obj_p := ssa.emit_cast(&mut f_main, bb0, ht.TY_PTR, obj_i, 0, 0)
+    cargs: []i32 = [obj_p]
+    a_start := ssa.push_val_args(&mut f_main, &cargs)
+    ret_idx := sp.fn_id_to_idx[reg.fn_rc_retain]
+    mut ctm := ssa.make_term(.Call)
+    ctm.callee = reg.fn_rc_retain
+    ctm.sig_ty = sp.funcs[ret_idx].sig_ty
+    ctm.dest_val = ssa.add_val(&mut f_main, ht.TY_PTR, bb0, ssa.DEF_TERM_RESULT)
+    ctm.arg_start = a_start
+    ctm.arg_len = 1
+    ctm.target_a = bb1
+    _ := ssa.set_term(&mut f_main, bb0, ctm)
+    c0 := ssa.emit_const_int(&mut f_main, bb1, ht.TY_I32, 0, 0, 0)
+    _ := ssa.set_return(&mut f_main, bb1, c0, 0, 0)
+    ssa.compute_preds(&mut f_main)
+    _ := ssa.add_program_func(&mut sp, move f_main)
+    sp.entry_fn = 0
+
+    mut diags: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&hir_trap.types, &sp, &mut diags))
+    trap_img := arm64_isel.emit_executable(&sp, &hir_trap, target)
+    trap_res := exec_native_image(&trap_img, "rc_trap_112")
+    assert(trap_res.code == rt.TRAP_TYPE_DESC_OOB)
+}
+
+// =========================================================================
+// 5. `@test` Runner Harness via `hir_lower.synthesize_test_entry` -> `ssa_driver`
+// =========================================================================
+
+@test
+fn ssa_e2e_live_test_runner_harness() {
+    target := host_native_target()
+    platform := obj.target_to_platform(target)
+    src := "@test fn check_add() { assert(2 + 2 == 4); print(\"PASS_ADD\") }\n" +
+        "@test fn check_str() {\n" +
+        "    s := \"hello\" + \"!\"\n" +
+        "    assert(s == \"hello!\")\n" +
+        "    print(\"PASS_STR\")\n" +
+        "}\n"
+
+    tree := parser.parse_source("mini_tests.ddr", src.clone())
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "mini_tests.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut hir := hir_lower.lower_modules(&mods, &edges, platform)
+    assert(hir.ok)
+    groups: []string = ["mini_tests.ddr::check_add", "mini_tests.ddr::check_str"]
+    _ := hir_lower.synthesize_test_entry(&mut hir, &groups, -1, true)
+    hir_mono.monomorphize(&mut hir)
+    chk := mir_check.check_program(&hir)
+    assert(chk.ok)
+
+    mp := driver.new_mir_program(move hir, move chk.bodies)
+    opts := driver.default_options(target)
+    res := driver.compile_mir_program_ssa(&mp, &mp.hir.types, &opts)
+    assert(res.is_ok())
+
+    out := exec_native_image(&res.unwrap(), "test_harness")
+    assert(out.code == 0)
+    assert(out.stdout == "PASS_ADD\nPASS_STR\n")
+}
+
+// =========================================================================
+// 6. Incremental `ssa_fragments` Rebuild: Byte-Identity + `< 100ms` Private Edit
+// =========================================================================
+
+fn make_12_fn_program(f5_delta: i32) -> string {
+    "fn f0(x: i32) -> i32 { x + 1 }\n" +
+    "fn f1(x: i32) -> i32 { x * 2 }\n" +
+    "fn f2(x: i32) -> i32 { x + 3 }\n" +
+    "fn f3(x: i32) -> i32 { x * 3 }\n" +
+    "fn f4(x: i32) -> i32 { x + 5 }\n" +
+    "fn f5(x: i32) -> i32 { x + " + f5_delta.str() + " }\n" +
+    "fn f6(x: i32) -> i32 { x * 4 }\n" +
+    "fn f7(x: i32) -> i32 { x + 7 }\n" +
+    "fn f8(x: i32) -> i32 { x + 8 }\n" +
+    "fn f9(x: i32) -> i32 { x * 5 }\n" +
+    "fn f10(x: i32) -> i32 { x + 10 }\n" +
+    "fn main() {\n" +
+    "    v := f0(1) + f1(2) + f2(3) + f3(4) + f4(5) + f5(6) + f6(7) + f7(8) + f8(9) + f9(10) + f10(11)\n" +
+    "    print(v)\n" +
+    "}\n"
+}
+
+@test
+fn ssa_e2e_incremental_fragments_byte_identical_and_sub_100ms_edit() {
+    target := host_native_target()
+    tmp := fs.temp_dir("dunder-ssa-e2e-cache-")
+    assert(tmp.ok)
+    cache_dir := tmp.value + "/.dunder-ssa-cache"
+    defer { _ := fs.remove_all(tmp.value) }
+
+    mut cache := frag.new_cache(cache_dir.clone())
+    opts := driver.default_options(target)
+
+    // 1. Cold build (v1: f5 adds 100)
+    mp1 := build_mir_single(make_12_fn_program(100), "inc12.ddr", target)
+    r_cold := driver.compile_mir_program_ssa_cached_detailed(&mut cache, &mp1, &mp1.hir.types, &opts)
+    assert(r_cold.ok)
+    assert(r_cold.total_fns == 12)
+    assert(r_cold.cache_hits == 0 && r_cold.cache_misses == 12)
+
+    // 2. Warm rebuild -> 0 misses, 100% byte-identical
+    r_warm := driver.compile_mir_program_ssa_cached_detailed(&mut cache, &mp1, &mp1.hir.types, &opts)
+    assert(r_warm.ok)
+    assert(r_warm.cache_hits == 12 && r_warm.cache_misses == 0)
+    assert(bytes_identical(&r_cold.image, &r_warm.image))
+
+    // 3. Private 1-function edit (f5 adds 200) -> ONLY 1 of 12 recompiled, < 100ms, byte-identical to clean!
+    mp2 := build_mir_single(make_12_fn_program(200), "inc12.ddr", target)
+    t0 := time.monotonic_ns()
+    r_edit := driver.compile_mir_program_ssa_cached_detailed(&mut cache, &mp2, &mp2.hir.types, &opts)
+    elapsed_ms := (time.monotonic_ns() - t0) / 1000000
+    assert(r_edit.ok)
+    assert(r_edit.cache_hits == 11 && r_edit.cache_misses == 1)
+    assert(r_edit.recompiled_fn_ids.len == 1)
+    assert(elapsed_ms < 100)
+
+    mut fresh_cache := frag.new_memory_cache()
+    r_clean2 := driver.compile_mir_program_ssa_cached_detailed(&mut fresh_cache, &mp2, &mp2.hir.types, &opts)
+    assert(r_clean2.ok)
+    assert(bytes_identical(&r_edit.image, &r_clean2.image))
+
+    // Live execute edited binary to prove semantic correctness (+100 difference)
+    ex1 := exec_native_image(&r_cold.image, "inc_v1")
+    ex2 := exec_native_image(&r_edit.image, "inc_v2")
+    assert(ex1.code == 0 && ex2.code == 0)
+    assert(ex1.stdout != ex2.stdout)
+}
+
+// =========================================================================
+// 7. Cross-Compile ALL 6 Targets + 0 `(%r15)` Check + LIVE WASM32/WASI Execution in Node
+// =========================================================================
+
+@test
+fn ssa_e2e_cross_compile_all_six_targets_zero_r15_and_live_wasm_node() {
+    src := "struct Pair { a: i32, b: i32 }\n" +
+        "impl Pair {\n" +
+        "    fn sum(&self) -> i32 { self.a + self.b }\n" +
+        "}\n" +
+        "pub fn compute(n: i32) -> i32 {\n" +
+        "    mut acc := 0\n" +
+        "    for i in 1..(n + 1) {\n" +
+        "        p := Pair { a: i, b: i * 2 }\n" +
+        "        acc += p.sum()\n" +
+        "    }\n" +
+        "    acc\n" +
+        "}\n" +
+        "fn main() -> i32 {\n" +
+        "    r := compute(5)\n" +
+        "    print(r)\n" +
+        "    0\n" +
+        "}\n"
+
+    // Verify target_from_name for all 6 canonical targets
+    assert(driver.target_from_name("arm64-macos").unwrap() == .Arm64Macos)
+    assert(driver.target_from_name("arm64-linux").unwrap() == .Arm64Linux)
+    assert(driver.target_from_name("x86_64-linux").unwrap() == .X86_64Linux)
+    assert(driver.target_from_name("x86_64-windows").unwrap() == .X86_64Windows)
+    assert(driver.target_from_name("wasm32").unwrap() == .Wasm32)
+    assert(driver.target_from_name("wasm32-wasi").unwrap() == .Wasm32Wasi)
+    assert(driver.target_from_name("invalid-target").is_err())
+
+    // 1. arm64-macos (Mach-O)
+    mp_mac := build_mir_single(src.clone(), "cross.ddr", .Arm64Macos)
+    r_mac := driver.compile_mir_program_ssa(&mp_mac, &mp_mac.hir.types, &driver.default_options(.Arm64Macos))
+    assert(r_mac.is_ok())
+    img_mac := r_mac.unwrap()
+    assert(i32(img_mac[0]) == 0xcf && i32(img_mac[1]) == 0xfa && i32(img_mac[2]) == 0xed && i32(img_mac[3]) == 0xfe)
+    if process.host_target() == "arm64-macos" {
+        em := exec_native_image(&img_mac, "cross_mac")
+        assert(em.code == 0 && em.stdout == "45\n")
+    }
+
+    // 2. arm64-linux (ELF64 e_machine == 183)
+    mp_alin := build_mir_single(src.clone(), "cross.ddr", .Arm64Linux)
+    r_alin := driver.compile_mir_program_ssa(&mp_alin, &mp_alin.hir.types, &driver.default_options(.Arm64Linux))
+    assert(r_alin.is_ok())
+    img_alin := r_alin.unwrap()
+    assert(i32(img_alin[0]) == 0x7f && i32(img_alin[1]) == 69 && i32(img_alin[2]) == 76 && i32(img_alin[3]) == 70)
+    assert(read_u16_le(&img_alin, 18) == 183)
+
+    // 3. x86_64-linux (ELF64 e_machine == 62 AND strictly 0 `(%r15)` accesses!)
+    mp_xlin := build_mir_single(src.clone(), "cross.ddr", .X86_64Linux)
+    d_xlin := driver.compile_mir_program_ssa_detailed(&mp_xlin, &mp_xlin.hir.types, &driver.default_options(.X86_64Linux))
+    assert(d_xlin.ok)
+    assert(i32(d_xlin.image[0]) == 0x7f && i32(d_xlin.image[1]) == 69 && i32(d_xlin.image[2]) == 76 && i32(d_xlin.image[3]) == 70)
+    assert(read_u16_le(&d_xlin.image, 18) == 62)
+    assert(count_x86_r15_mem_accesses(&d_xlin.module.text) == 0)
+
+    // 4. x86_64-windows (PE32+ MZ + PE\0\0 + AMD64 0x8664 + 0x020B)
+    mp_win := build_mir_single(src.clone(), "cross.ddr", .X86_64Windows)
+    r_win := driver.compile_mir_program_ssa(&mp_win, &mp_win.hir.types, &driver.default_options(.X86_64Windows))
+    assert(r_win.is_ok())
+    img_win := r_win.unwrap()
+    assert(i32(img_win[0]) == 77 && i32(img_win[1]) == 90)
+    lfanew := i32(read_u32_le(&img_win, 60))
+    assert(read_u16_le(&img_win, lfanew + 4) == 0x8664)
+    assert(read_u16_le(&img_win, lfanew + 24) == 0x020B)
+
+    // 5. wasm32 + LIVE execution in `node`
+    mp_w32 := build_mir_single(src.clone(), "cross.ddr", .Wasm32)
+    r_w32 := driver.compile_mir_program_ssa(&mp_w32, &mp_w32.hir.types, &driver.default_options(.Wasm32))
+    assert(r_w32.is_ok())
+    img_w32 := r_w32.unwrap()
+    assert(i32(img_w32[0]) == 0 && i32(img_w32[1]) == 97 && i32(img_w32[2]) == 115 && i32(img_w32[3]) == 109)
+
+    // 6. wasm32-wasi + LIVE execution in `node`
+    mp_wasi := build_mir_single(src.clone(), "cross.ddr", .Wasm32Wasi)
+    r_wasi := driver.compile_mir_program_ssa(&mp_wasi, &mp_wasi.hir.types, &driver.default_options(.Wasm32Wasi))
+    assert(r_wasi.is_ok())
+    img_wasi := r_wasi.unwrap()
+    assert(i32(img_wasi[0]) == 0 && i32(img_wasi[1]) == 97 && i32(img_wasi[2]) == 115 && i32(img_wasi[3]) == 109)
+
+    // Execute both wasm32 (compute(5) == 45) & wasm32-wasi (_start prints "45\n") in a single fast `node` invocation!
+    tmp := fs.temp_dir("dunder-e2e-wasm-")
+    assert(tmp.ok)
+    work := tmp.value
+    defer { _ := fs.remove_all(work) }
+    p32 := work + "/mod32.wasm"
+    pwasi := work + "/modwasi.wasm"
+    assert(sys.write_u8(p32, &img_w32).ok)
+    assert(sys.write_u8(pwasi, &img_wasi).ok)
+
+    js := "const fs = require('fs');\n" +
+        "const b32 = fs.readFileSync(process.argv[1]);\n" +
+        "const bw = fs.readFileSync(process.argv[2]);\n" +
+        "if (!WebAssembly.validate(b32) || !WebAssembly.validate(bw)) throw new Error('invalid wasm');\n" +
+        "(async () => {\n" +
+        "  const { instance: i32 } = await WebAssembly.instantiate(b32);\n" +
+        "  const c5 = i32.exports.compute(5);\n" +
+        "  let printed = '';\n" +
+        "  let exitCode = -1;\n" +
+        "  let mem = null;\n" +
+        "  const wasi = {\n" +
+        "    wasi_snapshot_preview1: {\n" +
+        "      fd_write(fd, iovs, iovsLen, nwritten) {\n" +
+        "        const dv = new DataView(mem.buffer);\n" +
+        "        let total = 0;\n" +
+        "        for (let k = 0; k < iovsLen; k++) {\n" +
+        "          const p = dv.getUint32(iovs + k * 8, true);\n" +
+        "          const l = dv.getUint32(iovs + k * 8 + 4, true);\n" +
+        "          printed += Buffer.from(mem.buffer, p, l).toString('utf8');\n" +
+        "          total += l;\n" +
+        "        }\n" +
+        "        dv.setUint32(nwritten, total, true);\n" +
+        "        return 0;\n" +
+        "      },\n" +
+        "      proc_exit(code) { exitCode = code; throw { __wasi_exit: true, code }; }\n" +
+        "    }\n" +
+        "  };\n" +
+        "  const { instance: iw } = await WebAssembly.instantiate(bw, wasi);\n" +
+        "  mem = iw.exports.memory;\n" +
+        "  try { iw.exports._start(); } catch (e) { if (!e || !e.__wasi_exit) throw e; }\n" +
+        "  process.stdout.write(c5 + '|' + exitCode + '|' + printed.trim());\n" +
+        "})().catch(err => { console.error(err); process.exit(1); });\n"
+
+    mut cmd := process.Command::new("node", ["-e", js, p32, pwasi])
+    cmd.set_timeout(10000)
+    nres := cmd.exec()
+    assert(nres.succeeded())
+    assert(nres.stdout_text() == "45|0|45")
+}
