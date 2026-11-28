@@ -1,0 +1,745 @@
+// Pure, stateless native x86_64 instruction encoder (SysV & Win64).
+// ZERO [r15] ARM64 virtual register bank emulation.
+// Designed for Phase 3 SSA MIR lowering and Phase 4 native x86_isel.
+
+// General-purpose register indices (0..15)
+pub const RAX: i32 = 0
+pub const RCX: i32 = 1
+pub const RDX: i32 = 2
+pub const RBX: i32 = 3
+pub const RSP: i32 = 4
+pub const RBP: i32 = 5
+pub const RSI: i32 = 6
+pub const RDI: i32 = 7
+pub const R8: i32  = 8
+pub const R9: i32  = 9
+pub const R10: i32 = 10
+pub const R11: i32 = 11
+pub const R12: i32 = 12
+pub const R13: i32 = 13
+pub const R14: i32 = 14
+pub const R15: i32 = 15
+
+// SSE2/AVX scalar floating-point register indices (0..15)
+pub const XMM0: i32  = 0
+pub const XMM1: i32  = 1
+pub const XMM2: i32  = 2
+pub const XMM3: i32  = 3
+pub const XMM4: i32  = 4
+pub const XMM5: i32  = 5
+pub const XMM6: i32  = 6
+pub const XMM7: i32  = 7
+pub const XMM8: i32  = 8
+pub const XMM9: i32  = 9
+pub const XMM10: i32 = 10
+pub const XMM11: i32 = 11
+pub const XMM12: i32 = 12
+pub const XMM13: i32 = 13
+pub const XMM14: i32 = 14
+pub const XMM15: i32 = 15
+
+// x86_64 condition codes (0..15)
+pub const CC_O: i32  = 0
+pub const CC_NO: i32 = 1
+pub const CC_B: i32  = 2
+pub const CC_C: i32  = 2
+pub const CC_AE: i32 = 3
+pub const CC_NB: i32 = 3
+pub const CC_E: i32  = 4
+pub const CC_Z: i32  = 4
+pub const CC_NE: i32 = 5
+pub const CC_NZ: i32 = 5
+pub const CC_BE: i32 = 6
+pub const CC_A: i32  = 7
+pub const CC_S: i32  = 8
+pub const CC_NS: i32 = 9
+pub const CC_P: i32  = 10
+pub const CC_NP: i32 = 11
+pub const CC_L: i32  = 12
+pub const CC_GE: i32 = 13
+pub const CC_LE: i32 = 14
+pub const CC_G: i32  = 15
+
+// Native ABI constants
+pub const SYSV_GP_ARG_COUNT: i32  = 6
+pub const SYSV_XMM_ARG_COUNT: i32 = 8
+pub const WIN64_ARG_COUNT: i32    = 4
+pub const WIN64_SHADOW_SPACE: i32 = 32
+
+pub fn sysv_gp_arg(index: i32) -> i32 {
+    if index == 0 { return RDI }
+    if index == 1 { return RSI }
+    if index == 2 { return RDX }
+    if index == 3 { return RCX }
+    if index == 4 { return R8 }
+    assert(index == 5)
+    R9
+}
+
+pub fn win64_gp_arg(index: i32) -> i32 {
+    if index == 0 { return RCX }
+    if index == 1 { return RDX }
+    if index == 2 { return R8 }
+    assert(index == 3)
+    R9
+}
+
+pub fn sysv_is_callee_saved(reg: i32) -> bool {
+    reg == RBX || reg == RBP || reg == R12 || reg == R13 || reg == R14 || reg == R15
+}
+
+pub fn win64_is_callee_saved(reg: i32) -> bool {
+    reg == RBX || reg == RBP || reg == RDI || reg == RSI ||
+    reg == R12 || reg == R13 || reg == R14 || reg == R15
+}
+
+pub fn invert_cc(cc: i32) -> i32 { cc.bit_xor(1) }
+
+pub enum FixupKind {
+    Rel32,
+    RipDisp32,
+}
+
+pub struct X86Buf {
+    bytes: []u8,
+    labels: []i32,
+    fixup_at: []i32,
+    fixup_target: []i32,
+    fixup_kind: []FixupKind,
+}
+
+pub fn new() -> X86Buf {
+    X86Buf {
+        bytes: [],
+        labels: [],
+        fixup_at: [],
+        fixup_target: [],
+        fixup_kind: [],
+    }
+}
+
+pub fn byte_len(b: &X86Buf) -> i32 { b.bytes.len }
+
+pub fn u8_emit(b: &mut X86Buf, v: i32) {
+    b.bytes.push(u8(v.bit_and(255)))
+}
+
+pub fn le16(b: &mut X86Buf, v: i64) {
+    b.bytes.push(u8(v.bit_and(255)))
+    b.bytes.push(u8(v.shr(8).bit_and(255)))
+}
+
+pub fn le32(b: &mut X86Buf, v: i64) {
+    for i in 0..4 { b.bytes.push(u8(v.shr(i * 8).bit_and(255))) }
+}
+
+pub fn le64(b: &mut X86Buf, v: i64) {
+    for i in 0..8 { b.bytes.push(u8(v.shr(i * 8).bit_and(255))) }
+}
+
+pub fn patch_le32(b: &mut X86Buf, at: i32, v: i64) {
+    assert(at >= 0 && at + 4 <= b.bytes.len)
+    for i in 0..4 { b.bytes[at + i] = u8(v.shr(i * 8).bit_and(255)) }
+}
+
+pub fn label(b: &mut X86Buf) -> i32 {
+    id := b.labels.len
+    b.labels.push(-1)
+    id
+}
+
+pub fn mark(b: &mut X86Buf, lbl: i32) {
+    assert(lbl >= 0 && lbl < b.labels.len)
+    b.labels[lbl] = b.bytes.len
+}
+
+pub fn label_byte(b: &X86Buf, lbl: i32) -> i32 {
+    assert(lbl >= 0 && lbl < b.labels.len)
+    b.labels[lbl]
+}
+
+// --- Core Prefix / ModRM / SIB Encoders ---
+
+pub fn rex(b: &mut X86Buf, wide: bool, reg: i32, index: i32, base: i32, force: bool) {
+    mut bits := 0
+    if wide { bits += 8 }
+    if reg >= 8 { bits += 4 }
+    if index >= 8 { bits += 2 }
+    if base >= 8 { bits += 1 }
+    if force || bits != 0 { u8_emit(&mut b, 0x40 + bits) }
+}
+
+pub fn modrm(b: &mut X86Buf, mode: i32, reg: i32, rm: i32) {
+    u8_emit(&mut b, mode * 64 + reg.bit_and(7) * 8 + rm.bit_and(7))
+}
+
+pub fn sib(b: &mut X86Buf, scale_bits: i32, index: i32, base: i32) {
+    u8_emit(&mut b, scale_bits * 64 + index.bit_and(7) * 8 + base.bit_and(7))
+}
+
+fn scale_to_bits(scale: i32) -> i32 {
+    if scale == 1 { return 0 }
+    if scale == 2 { return 1 }
+    if scale == 4 { return 2 }
+    assert(scale == 8)
+    3
+}
+
+pub fn mem_disp(b: &mut X86Buf, base: i32, disp: i32, reg: i32) {
+    rm := base.bit_and(7)
+    if disp == 0 && rm != 5 {
+        modrm(&mut b, 0, reg, base)
+        if rm == 4 { u8_emit(&mut b, 0x24) }
+    } else if disp >= -128 && disp <= 127 {
+        modrm(&mut b, 1, reg, base)
+        if rm == 4 { u8_emit(&mut b, 0x24) }
+        u8_emit(&mut b, disp)
+    } else {
+        modrm(&mut b, 2, reg, base)
+        if rm == 4 { u8_emit(&mut b, 0x24) }
+        le32(&mut b, i64(disp))
+    }
+}
+
+pub fn mem_sib(b: &mut X86Buf, base: i32, index: i32, scale: i32, disp: i32, reg: i32) {
+    assert(index != RSP)
+    sb := scale_to_bits(scale)
+    rm := base.bit_and(7)
+    if disp == 0 && rm != 5 {
+        modrm(&mut b, 0, reg, 4)
+        sib(&mut b, sb, index, base)
+    } else if disp >= -128 && disp <= 127 {
+        modrm(&mut b, 1, reg, 4)
+        sib(&mut b, sb, index, base)
+        u8_emit(&mut b, disp)
+    } else {
+        modrm(&mut b, 2, reg, 4)
+        sib(&mut b, sb, index, base)
+        le32(&mut b, i64(disp))
+    }
+}
+
+pub fn mem_rip(b: &mut X86Buf, reg: i32, lbl: i32) -> i32 {
+    modrm(&mut b, 0, reg, 5)
+    at := b.bytes.len
+    if lbl >= 0 {
+        b.fixup_at.push(at)
+        b.fixup_target.push(lbl)
+        b.fixup_kind.push(.RipDisp32)
+    }
+    le32(&mut b, 0)
+    at
+}
+
+// --- GP Moves, Loads, Stores, LEA, Push/Pop ---
+
+pub fn mov_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32) {
+    if wide && dst == src { return }
+    rex(&mut b, wide, src, 0, dst, false)
+    u8_emit(&mut b, 0x89)
+    modrm(&mut b, 3, src, dst)
+}
+
+pub fn mov_imm(b: &mut X86Buf, wide: bool, dst: i32, value: i64) {
+    mut v := value
+    if !wide { v = v.bit_and(4294967295) }
+    if v == 0 {
+        rex(&mut b, false, dst, 0, dst, false)
+        u8_emit(&mut b, 0x31)
+        modrm(&mut b, 3, dst, dst)
+        return
+    }
+    mov_imm_preserve_flags(&mut b, wide, dst, v)
+}
+
+pub fn mov_imm_preserve_flags(b: &mut X86Buf, wide: bool, dst: i32, value: i64) {
+    mut v := value
+    if !wide { v = v.bit_and(4294967295) }
+    if v >= 0 && v <= 4294967295 {
+        rex(&mut b, false, 0, 0, dst, false)
+        u8_emit(&mut b, 0xb8 + dst.bit_and(7))
+        le32(&mut b, v)
+        return
+    }
+    if v >= -2147483648 && v <= 2147483647 {
+        rex(&mut b, true, 0, 0, dst, false)
+        u8_emit(&mut b, 0xc7)
+        modrm(&mut b, 3, 0, dst)
+        le32(&mut b, v)
+        return
+    }
+    rex(&mut b, true, 0, 0, dst, false)
+    u8_emit(&mut b, 0xb8 + dst.bit_and(7))
+    le64(&mut b, v)
+}
+
+pub fn lea_disp(b: &mut X86Buf, dst: i32, base: i32, disp: i32) {
+    rex(&mut b, true, dst, 0, base, false)
+    u8_emit(&mut b, 0x8d)
+    mem_disp(&mut b, base, disp, dst)
+}
+
+pub fn lea_sib(b: &mut X86Buf, dst: i32, base: i32, index: i32, scale: i32, disp: i32) {
+    rex(&mut b, true, dst, index, base, false)
+    u8_emit(&mut b, 0x8d)
+    mem_sib(&mut b, base, index, scale, disp, dst)
+}
+
+pub fn lea_rip(b: &mut X86Buf, dst: i32, lbl: i32) -> i32 {
+    rex(&mut b, true, dst, 0, 0, false)
+    u8_emit(&mut b, 0x8d)
+    mem_rip(&mut b, dst, lbl)
+}
+
+pub fn mov_load(b: &mut X86Buf, dst: i32, base: i32, disp: i32, width: i32, sign_ext: bool) {
+    if width == 8 {
+        rex(&mut b, true, dst, 0, base, false)
+        u8_emit(&mut b, 0x8b); mem_disp(&mut b, base, disp, dst)
+    } else if width == 4 {
+        if sign_ext {
+            rex(&mut b, true, dst, 0, base, false)
+            u8_emit(&mut b, 0x63); mem_disp(&mut b, base, disp, dst)
+        } else {
+            rex(&mut b, false, dst, 0, base, false)
+            u8_emit(&mut b, 0x8b); mem_disp(&mut b, base, disp, dst)
+        }
+    } else if width == 2 {
+        rex(&mut b, sign_ext, dst, 0, base, false)
+        u8_emit(&mut b, 0x0f); u8_emit(&mut b, if sign_ext { 0xbf } else { 0xb7 })
+        mem_disp(&mut b, base, disp, dst)
+    } else {
+        assert(width == 1)
+        rex(&mut b, sign_ext, dst, 0, base, false)
+        u8_emit(&mut b, 0x0f); u8_emit(&mut b, if sign_ext { 0xbe } else { 0xb6 })
+        mem_disp(&mut b, base, disp, dst)
+    }
+}
+
+pub fn mov_load_sib(b: &mut X86Buf, dst: i32, base: i32, index: i32, scale: i32, disp: i32, width: i32, sign_ext: bool) {
+    if width == 8 {
+        rex(&mut b, true, dst, index, base, false)
+        u8_emit(&mut b, 0x8b); mem_sib(&mut b, base, index, scale, disp, dst)
+    } else if width == 4 {
+        if sign_ext {
+            rex(&mut b, true, dst, index, base, false)
+            u8_emit(&mut b, 0x63); mem_sib(&mut b, base, index, scale, disp, dst)
+        } else {
+            rex(&mut b, false, dst, index, base, false)
+            u8_emit(&mut b, 0x8b); mem_sib(&mut b, base, index, scale, disp, dst)
+        }
+    } else if width == 2 {
+        rex(&mut b, sign_ext, dst, index, base, false)
+        u8_emit(&mut b, 0x0f); u8_emit(&mut b, if sign_ext { 0xbf } else { 0xb7 })
+        mem_sib(&mut b, base, index, scale, disp, dst)
+    } else {
+        assert(width == 1)
+        rex(&mut b, sign_ext, dst, index, base, false)
+        u8_emit(&mut b, 0x0f); u8_emit(&mut b, if sign_ext { 0xbe } else { 0xb6 })
+        mem_sib(&mut b, base, index, scale, disp, dst)
+    }
+}
+
+pub fn mov_store(b: &mut X86Buf, base: i32, disp: i32, src: i32, width: i32) {
+    if width == 8 {
+        rex(&mut b, true, src, 0, base, false)
+        u8_emit(&mut b, 0x89); mem_disp(&mut b, base, disp, src)
+    } else if width == 4 {
+        rex(&mut b, false, src, 0, base, false)
+        u8_emit(&mut b, 0x89); mem_disp(&mut b, base, disp, src)
+    } else if width == 2 {
+        u8_emit(&mut b, 0x66)
+        rex(&mut b, false, src, 0, base, false)
+        u8_emit(&mut b, 0x89); mem_disp(&mut b, base, disp, src)
+    } else {
+        assert(width == 1)
+        rex(&mut b, false, src, 0, base, src >= 4 && src <= 7)
+        u8_emit(&mut b, 0x88); mem_disp(&mut b, base, disp, src)
+    }
+}
+
+pub fn mov_store_sib(b: &mut X86Buf, base: i32, index: i32, scale: i32, disp: i32, src: i32, width: i32) {
+    if width == 8 {
+        rex(&mut b, true, src, index, base, false)
+        u8_emit(&mut b, 0x89); mem_sib(&mut b, base, index, scale, disp, src)
+    } else if width == 4 {
+        rex(&mut b, false, src, index, base, false)
+        u8_emit(&mut b, 0x89); mem_sib(&mut b, base, index, scale, disp, src)
+    } else if width == 2 {
+        u8_emit(&mut b, 0x66)
+        rex(&mut b, false, src, index, base, false)
+        u8_emit(&mut b, 0x89); mem_sib(&mut b, base, index, scale, disp, src)
+    } else {
+        assert(width == 1)
+        rex(&mut b, false, src, index, base, src >= 4 && src <= 7)
+        u8_emit(&mut b, 0x88); mem_sib(&mut b, base, index, scale, disp, src)
+    }
+}
+
+pub fn mov_rip_load(b: &mut X86Buf, wide: bool, dst: i32, lbl: i32) -> i32 {
+    rex(&mut b, wide, dst, 0, 0, false)
+    u8_emit(&mut b, 0x8b)
+    mem_rip(&mut b, dst, lbl)
+}
+
+pub fn mov_rip_store(b: &mut X86Buf, wide: bool, lbl: i32, src: i32) -> i32 {
+    rex(&mut b, wide, src, 0, 0, false)
+    u8_emit(&mut b, 0x89)
+    mem_rip(&mut b, src, lbl)
+}
+
+pub fn movzx_r8(b: &mut X86Buf, dst: i32, src: i32) {
+    rex(&mut b, false, dst, 0, src, src >= 4 && src <= 7)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xb6); modrm(&mut b, 3, dst, src)
+}
+
+pub fn movzx_r16(b: &mut X86Buf, dst: i32, src: i32) {
+    rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xb7); modrm(&mut b, 3, dst, src)
+}
+
+pub fn movsx_r8(b: &mut X86Buf, wide: bool, dst: i32, src: i32) {
+    rex(&mut b, wide, dst, 0, src, src >= 4 && src <= 7)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xbe); modrm(&mut b, 3, dst, src)
+}
+
+pub fn movsx_r16(b: &mut X86Buf, wide: bool, dst: i32, src: i32) {
+    rex(&mut b, wide, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xbf); modrm(&mut b, 3, dst, src)
+}
+
+pub fn movsxd_rr(b: &mut X86Buf, dst: i32, src: i32) {
+    rex(&mut b, true, dst, 0, src, false)
+    u8_emit(&mut b, 0x63); modrm(&mut b, 3, dst, src)
+}
+
+pub fn push_r(b: &mut X86Buf, reg: i32) {
+    if reg >= 8 { u8_emit(&mut b, 0x41) }
+    u8_emit(&mut b, 0x50 + reg.bit_and(7))
+}
+
+pub fn pop_r(b: &mut X86Buf, reg: i32) {
+    if reg >= 8 { u8_emit(&mut b, 0x41) }
+    u8_emit(&mut b, 0x58 + reg.bit_and(7))
+}
+
+// --- GP ALU, Multiply/Divide, Shifts, Conditionals ---
+
+// alu_op: 0=ADD, 1=OR, 2=ADC, 3=SBB, 4=AND, 5=SUB, 6=XOR, 7=CMP
+pub fn alu_rr(b: &mut X86Buf, wide: bool, alu_op: i32, dst: i32, src: i32) {
+    rex(&mut b, wide, src, 0, dst, false)
+    u8_emit(&mut b, alu_op * 8 + 1)
+    modrm(&mut b, 3, src, dst)
+}
+
+pub fn alu_ri(b: &mut X86Buf, wide: bool, alu_op: i32, dst: i32, imm: i64) {
+    assert(imm >= -2147483648 && imm <= 2147483647)
+    rex(&mut b, wide, 0, 0, dst, false)
+    if imm >= -128 && imm <= 127 {
+        u8_emit(&mut b, 0x83)
+        modrm(&mut b, 3, alu_op, dst)
+        u8_emit(&mut b, i32(imm))
+    } else {
+        u8_emit(&mut b, 0x81)
+        modrm(&mut b, 3, alu_op, dst)
+        le32(&mut b, imm)
+    }
+}
+
+pub fn add_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32) { alu_rr(&mut b, wide, 0, dst, src) }
+pub fn add_ri(b: &mut X86Buf, wide: bool, dst: i32, imm: i64) { alu_ri(&mut b, wide, 0, dst, imm) }
+pub fn or_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32)  { alu_rr(&mut b, wide, 1, dst, src) }
+pub fn or_ri(b: &mut X86Buf, wide: bool, dst: i32, imm: i64)  { alu_ri(&mut b, wide, 1, dst, imm) }
+pub fn and_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32) { alu_rr(&mut b, wide, 4, dst, src) }
+pub fn and_ri(b: &mut X86Buf, wide: bool, dst: i32, imm: i64) { alu_ri(&mut b, wide, 4, dst, imm) }
+pub fn sub_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32) { alu_rr(&mut b, wide, 5, dst, src) }
+pub fn sub_ri(b: &mut X86Buf, wide: bool, dst: i32, imm: i64) { alu_ri(&mut b, wide, 5, dst, imm) }
+pub fn xor_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32) { alu_rr(&mut b, wide, 6, dst, src) }
+pub fn xor_ri(b: &mut X86Buf, wide: bool, dst: i32, imm: i64) { alu_ri(&mut b, wide, 6, dst, imm) }
+pub fn cmp_rr(b: &mut X86Buf, wide: bool, lhs: i32, rhs: i32) { alu_rr(&mut b, wide, 7, lhs, rhs) }
+pub fn cmp_ri(b: &mut X86Buf, wide: bool, lhs: i32, imm: i64) { alu_ri(&mut b, wide, 7, lhs, imm) }
+
+pub fn test_rr(b: &mut X86Buf, wide: bool, lhs: i32, rhs: i32) {
+    rex(&mut b, wide, rhs, 0, lhs, false)
+    u8_emit(&mut b, 0x85)
+    modrm(&mut b, 3, rhs, lhs)
+}
+
+pub fn test_ri(b: &mut X86Buf, wide: bool, lhs: i32, imm: i64) {
+    assert(imm >= -2147483648 && imm <= 2147483647)
+    rex(&mut b, wide, 0, 0, lhs, false)
+    u8_emit(&mut b, 0xf7)
+    modrm(&mut b, 3, 0, lhs)
+    le32(&mut b, imm)
+}
+
+pub fn not_r(b: &mut X86Buf, wide: bool, reg: i32) {
+    rex(&mut b, wide, 0, 0, reg, false)
+    u8_emit(&mut b, 0xf7); modrm(&mut b, 3, 2, reg)
+}
+
+pub fn neg_r(b: &mut X86Buf, wide: bool, reg: i32) {
+    rex(&mut b, wide, 0, 0, reg, false)
+    u8_emit(&mut b, 0xf7); modrm(&mut b, 3, 3, reg)
+}
+
+pub fn imul_rr(b: &mut X86Buf, wide: bool, dst: i32, src: i32) {
+    rex(&mut b, wide, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xaf); modrm(&mut b, 3, dst, src)
+}
+
+pub fn imul_rri(b: &mut X86Buf, wide: bool, dst: i32, src: i32, imm: i64) {
+    assert(imm >= -2147483648 && imm <= 2147483647)
+    rex(&mut b, wide, dst, 0, src, false)
+    if imm >= -128 && imm <= 127 {
+        u8_emit(&mut b, 0x6b); modrm(&mut b, 3, dst, src); u8_emit(&mut b, i32(imm))
+    } else {
+        u8_emit(&mut b, 0x69); modrm(&mut b, 3, dst, src); le32(&mut b, imm)
+    }
+}
+
+pub fn cdq(b: &mut X86Buf) { u8_emit(&mut b, 0x99) }
+pub fn cqo(b: &mut X86Buf) { u8_emit(&mut b, 0x48); u8_emit(&mut b, 0x99) }
+
+pub fn idiv_r(b: &mut X86Buf, wide: bool, divisor: i32) {
+    rex(&mut b, wide, 0, 0, divisor, false)
+    u8_emit(&mut b, 0xf7); modrm(&mut b, 3, 7, divisor)
+}
+
+pub fn div_r(b: &mut X86Buf, wide: bool, divisor: i32) {
+    rex(&mut b, wide, 0, 0, divisor, false)
+    u8_emit(&mut b, 0xf7); modrm(&mut b, 3, 6, divisor)
+}
+
+// subop: 0=ROL, 1=ROR, 4=SHL, 5=SHR, 7=SAR
+pub fn shift_imm(b: &mut X86Buf, wide: bool, subop: i32, dst: i32, amount: i32) {
+    if amount == 0 {
+        if !wide { mov_rr(&mut b, false, dst, dst) }
+        return
+    }
+    rex(&mut b, wide, 0, 0, dst, false)
+    if amount == 1 {
+        u8_emit(&mut b, 0xd1); modrm(&mut b, 3, subop, dst)
+    } else {
+        u8_emit(&mut b, 0xc1); modrm(&mut b, 3, subop, dst); u8_emit(&mut b, amount)
+    }
+}
+
+pub fn shift_cl(b: &mut X86Buf, wide: bool, subop: i32, dst: i32) {
+    rex(&mut b, wide, 0, 0, dst, false)
+    u8_emit(&mut b, 0xd3); modrm(&mut b, 3, subop, dst)
+}
+
+pub fn shl_imm(b: &mut X86Buf, wide: bool, dst: i32, amt: i32) { shift_imm(&mut b, wide, 4, dst, amt) }
+pub fn shr_imm(b: &mut X86Buf, wide: bool, dst: i32, amt: i32) { shift_imm(&mut b, wide, 5, dst, amt) }
+pub fn sar_imm(b: &mut X86Buf, wide: bool, dst: i32, amt: i32) { shift_imm(&mut b, wide, 7, dst, amt) }
+pub fn ror_imm(b: &mut X86Buf, wide: bool, dst: i32, amt: i32) { shift_imm(&mut b, wide, 1, dst, amt) }
+pub fn shl_cl(b: &mut X86Buf, wide: bool, dst: i32) { shift_cl(&mut b, wide, 4, dst) }
+pub fn shr_cl(b: &mut X86Buf, wide: bool, dst: i32) { shift_cl(&mut b, wide, 5, dst) }
+pub fn sar_cl(b: &mut X86Buf, wide: bool, dst: i32) { shift_cl(&mut b, wide, 7, dst) }
+
+pub fn setcc(b: &mut X86Buf, cc: i32, dst: i32) {
+    rex(&mut b, false, 0, 0, dst, dst >= 4 && dst <= 7)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x90 + cc); modrm(&mut b, 3, 0, dst)
+}
+
+pub fn setcc_bool(b: &mut X86Buf, cc: i32, dst: i32) {
+    setcc(&mut b, cc, dst)
+    movzx_r8(&mut b, dst, dst)
+}
+
+pub fn cmovcc(b: &mut X86Buf, wide: bool, cc: i32, dst: i32, src: i32) {
+    rex(&mut b, wide, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x40 + cc); modrm(&mut b, 3, dst, src)
+}
+
+// --- SSE2 Scalar Floating-Point (f32 / f64) ---
+
+fn sse_prefix(b: &mut X86Buf, is_f64: bool) {
+    u8_emit(&mut b, if is_f64 { 0xf2 } else { 0xf3 })
+}
+
+pub fn movs_rr(b: &mut X86Buf, is_f64: bool, dst: i32, src: i32) {
+    sse_prefix(&mut b, is_f64)
+    rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x10); modrm(&mut b, 3, dst, src)
+}
+
+pub fn movs_load(b: &mut X86Buf, is_f64: bool, dst: i32, base: i32, disp: i32) {
+    sse_prefix(&mut b, is_f64)
+    rex(&mut b, false, dst, 0, base, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x10); mem_disp(&mut b, base, disp, dst)
+}
+
+pub fn movs_store(b: &mut X86Buf, is_f64: bool, base: i32, disp: i32, src: i32) {
+    sse_prefix(&mut b, is_f64)
+    rex(&mut b, false, src, 0, base, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x11); mem_disp(&mut b, base, disp, src)
+}
+
+pub fn mov_gp_to_xmm(b: &mut X86Buf, wide: bool, xmm: i32, gp: i32) {
+    u8_emit(&mut b, 0x66)
+    rex(&mut b, wide, xmm, 0, gp, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x6e); modrm(&mut b, 3, xmm, gp)
+}
+
+pub fn mov_xmm_to_gp(b: &mut X86Buf, wide: bool, gp: i32, xmm: i32) {
+    u8_emit(&mut b, 0x66)
+    rex(&mut b, wide, xmm, 0, gp, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x7e); modrm(&mut b, 3, xmm, gp)
+}
+
+fn sse_alu_rr(b: &mut X86Buf, is_f64: bool, opcode: i32, dst: i32, src: i32) {
+    sse_prefix(&mut b, is_f64)
+    rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, opcode); modrm(&mut b, 3, dst, src)
+}
+
+pub fn adds_rr(b: &mut X86Buf, is_f64: bool, dst: i32, src: i32)  { sse_alu_rr(&mut b, is_f64, 0x58, dst, src) }
+pub fn subs_rr(b: &mut X86Buf, is_f64: bool, dst: i32, src: i32)  { sse_alu_rr(&mut b, is_f64, 0x5c, dst, src) }
+pub fn muls_rr(b: &mut X86Buf, is_f64: bool, dst: i32, src: i32)  { sse_alu_rr(&mut b, is_f64, 0x59, dst, src) }
+pub fn divs_rr(b: &mut X86Buf, is_f64: bool, dst: i32, src: i32)  { sse_alu_rr(&mut b, is_f64, 0x5e, dst, src) }
+pub fn sqrts_rr(b: &mut X86Buf, is_f64: bool, dst: i32, src: i32) { sse_alu_rr(&mut b, is_f64, 0x51, dst, src) }
+
+pub fn ucomis_rr(b: &mut X86Buf, is_f64: bool, lhs: i32, rhs: i32) {
+    if is_f64 { u8_emit(&mut b, 0x66) }
+    rex(&mut b, false, lhs, 0, rhs, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x2e); modrm(&mut b, 3, lhs, rhs)
+}
+
+pub fn xorps_rr(b: &mut X86Buf, dst: i32, src: i32) {
+    rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x57); modrm(&mut b, 3, dst, src)
+}
+
+pub fn xorpd_rr(b: &mut X86Buf, dst: i32, src: i32) {
+    u8_emit(&mut b, 0x66)
+    rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x57); modrm(&mut b, 3, dst, src)
+}
+
+pub fn cvtsi2s(b: &mut X86Buf, wide_int: bool, is_f64: bool, dst_xmm: i32, src_gp: i32) {
+    sse_prefix(&mut b, is_f64)
+    rex(&mut b, wide_int, dst_xmm, 0, src_gp, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x2a); modrm(&mut b, 3, dst_xmm, src_gp)
+}
+
+pub fn cvtts2si(b: &mut X86Buf, wide_int: bool, is_f64: bool, dst_gp: i32, src_xmm: i32) {
+    sse_prefix(&mut b, is_f64)
+    rex(&mut b, wide_int, dst_gp, 0, src_xmm, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x2c); modrm(&mut b, 3, dst_gp, src_xmm)
+}
+
+pub fn cvtss2sd(b: &mut X86Buf, dst: i32, src: i32) {
+    u8_emit(&mut b, 0xf3); rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x5a); modrm(&mut b, 3, dst, src)
+}
+
+pub fn cvtsd2ss(b: &mut X86Buf, dst: i32, src: i32) {
+    u8_emit(&mut b, 0xf2); rex(&mut b, false, dst, 0, src, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x5a); modrm(&mut b, 3, dst, src)
+}
+
+// --- Control Flow, Atomics, System & Frame Helpers ---
+
+pub fn jmp_lbl(b: &mut X86Buf, lbl: i32) -> i32 {
+    u8_emit(&mut b, 0xe9)
+    at := b.bytes.len
+    if lbl >= 0 {
+        b.fixup_at.push(at); b.fixup_target.push(lbl); b.fixup_kind.push(.Rel32)
+    }
+    le32(&mut b, 0)
+    at
+}
+
+pub fn jcc_lbl(b: &mut X86Buf, cc: i32, lbl: i32) -> i32 {
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x80 + cc)
+    at := b.bytes.len
+    if lbl >= 0 {
+        b.fixup_at.push(at); b.fixup_target.push(lbl); b.fixup_kind.push(.Rel32)
+    }
+    le32(&mut b, 0)
+    at
+}
+
+pub fn call_lbl(b: &mut X86Buf, lbl: i32) -> i32 {
+    u8_emit(&mut b, 0xe8)
+    at := b.bytes.len
+    if lbl >= 0 {
+        b.fixup_at.push(at); b.fixup_target.push(lbl); b.fixup_kind.push(.Rel32)
+    }
+    le32(&mut b, 0)
+    at
+}
+
+pub fn call_reg(b: &mut X86Buf, reg: i32) {
+    rex(&mut b, false, 0, 0, reg, false)
+    u8_emit(&mut b, 0xff); modrm(&mut b, 3, 2, reg)
+}
+
+pub fn jmp_reg(b: &mut X86Buf, reg: i32) {
+    rex(&mut b, false, 0, 0, reg, false)
+    u8_emit(&mut b, 0xff); modrm(&mut b, 3, 4, reg)
+}
+
+pub fn call_rip_ind(b: &mut X86Buf, lbl: i32) -> i32 {
+    u8_emit(&mut b, 0xff)
+    mem_rip(&mut b, 2, lbl)
+}
+
+pub fn ret(b: &mut X86Buf) { u8_emit(&mut b, 0xc3) }
+pub fn nop(b: &mut X86Buf) { u8_emit(&mut b, 0x90) }
+pub fn syscall(b: &mut X86Buf) { u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x05) }
+pub fn ud2(b: &mut X86Buf) { u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0x0b) }
+pub fn int3(b: &mut X86Buf) { u8_emit(&mut b, 0xcc) }
+
+// Atomics & Barriers
+pub fn lock_cmpxchg(b: &mut X86Buf, wide: bool, base: i32, disp: i32, src: i32) {
+    u8_emit(&mut b, 0xf0)
+    rex(&mut b, wide, src, 0, base, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xb1); mem_disp(&mut b, base, disp, src)
+}
+
+pub fn lock_xadd(b: &mut X86Buf, wide: bool, base: i32, disp: i32, src: i32) {
+    u8_emit(&mut b, 0xf0)
+    rex(&mut b, wide, src, 0, base, false)
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xc1); mem_disp(&mut b, base, disp, src)
+}
+
+pub fn xchg_mem(b: &mut X86Buf, wide: bool, base: i32, disp: i32, reg: i32) {
+    rex(&mut b, wide, reg, 0, base, false)
+    u8_emit(&mut b, 0x87); mem_disp(&mut b, base, disp, reg)
+}
+
+pub fn mfence(b: &mut X86Buf) {
+    u8_emit(&mut b, 0x0f); u8_emit(&mut b, 0xae); u8_emit(&mut b, 0xf0)
+}
+
+// Native Prologue / Epilogue Helpers (16-byte aligned RSP on call boundary)
+pub fn emit_prologue(b: &mut X86Buf, frame_bytes: i32, win64_shadow: bool) {
+    push_r(&mut b, RBP)
+    mov_rr(&mut b, true, RBP, RSP)
+    extra := if win64_shadow { WIN64_SHADOW_SPACE } else { 0 }
+    total := (frame_bytes + extra + 15) / 16 * 16
+    if total > 0 { sub_ri(&mut b, true, RSP, i64(total)) }
+}
+
+pub fn emit_epilogue(b: &mut X86Buf) {
+    mov_rr(&mut b, true, RSP, RBP)
+    pop_r(&mut b, RBP)
+    ret(&mut b)
+}
+
+// Patch all local label fixups (both Rel32 and RipDisp32 resolve as target - (at + 4)).
+pub fn patch_labels(b: &mut X86Buf) {
+    for i in 0..b.fixup_at.len {
+        at := b.fixup_at[i]
+        target := b.labels[b.fixup_target[i]]
+        assert(target >= 0)
+        patch_le32(&mut b, at, i64(target - (at + 4)))
+    }
+}
+
+pub fn finish(b: &mut X86Buf) -> []u8 {
+    patch_labels(&mut b)
+    b.bytes.clone()
+}

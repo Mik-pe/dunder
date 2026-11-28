@@ -1,0 +1,628 @@
+// Target-neutral ObjectModule decoupling Phase 3 SSA MIR & Phase 4 native ISel
+// (arm64_isel, x86_isel, wasm_isel) from legacy arm.Code / mir_link.LinkedImage.
+// Bridges cleanly into existing macho.ddr, elf.ddr, pe.ddr, and dwarf.ddr emitters.
+
+import std.bytes as bytes
+import arm64_enc
+import dwarf
+import elf
+import imports
+import macho
+import pe
+
+pub enum TargetKind {
+    Arm64Macos,
+    Arm64Linux,
+    X86_64Linux,
+    X86_64Windows,
+    Wasm32,
+    Wasm32Wasi,
+}
+
+pub fn target_from_platform(platform: i32) -> TargetKind {
+    if platform == 0 { return .Arm64Macos }
+    if platform == 1 { return .Arm64Linux }
+    if platform == 2 { return .X86_64Linux }
+    if platform == 3 { return .Wasm32 }
+    if platform == 4 { return .Wasm32Wasi }
+    assert(platform == 5)
+    .X86_64Windows
+}
+
+pub fn target_to_platform(t: TargetKind) -> i32 {
+    if t == .Arm64Macos { return 0 }
+    if t == .Arm64Linux { return 1 }
+    if t == .X86_64Linux { return 2 }
+    if t == .Wasm32 { return 3 }
+    if t == .Wasm32Wasi { return 4 }
+    5
+}
+
+pub enum SectionKind {
+    Text,
+    Rodata,
+    Data,
+}
+
+pub enum ObjSymKind {
+    Function,
+    GlobalData,
+    RodataBlob,
+    TypeDescTable,
+}
+
+pub enum ObjRelocKind {
+    Arm64Branch26,
+    Arm64Call26,
+    Arm64AdrpAdd,
+    Arm64AdrpLdr,
+    X86Rel32,
+    X86RipDisp32,
+    Abs64,
+    WasmFuncIdx,
+}
+
+pub struct ObjSym {
+    name: string,
+    kind: ObjSymKind,
+    section: SectionKind,
+    offset: i32,
+    size: i32,
+    is_exported: bool,
+}
+
+pub struct ObjReloc {
+    section: SectionKind,
+    offset: i32,
+    kind: ObjRelocKind,
+    sym_id: i32,
+    addend: i64,
+    reg: i32,           // target GP reg for Arm64AdrpAdd / Arm64AdrpLdr (0 otherwise)
+}
+
+pub struct ObjImport {
+    spec: imports.SymbolSpec,
+    sites: []i32,
+}
+
+// Populates read-only .rodata TYPE_DESC_TABLE for safe negative-RC frozen compound dispatch.
+pub struct TypeDescEntry {
+    type_id: i32,
+    name: string,
+    clone_sym: i32,
+    drop_sym: i32,
+    iso_sym: i32,
+    size: i32,
+    align: i32,
+}
+
+pub enum WasmValType {
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+pub struct WasmSig {
+    param_start: i32,
+    param_len: i32,
+    ret_start: i32,
+    ret_len: i32,
+}
+
+pub struct DebugLine {
+    byte_offset: i32,
+    file_index: i32,
+    line: i32,
+    column: i32,
+}
+
+pub struct FuncRange {
+    name: string,
+    file_index: i32,
+    line: i32,
+    start_byte: i32,
+    end_byte: i32,
+}
+
+pub struct ObjectModule {
+    target: TargetKind,
+    text: []u8,
+    rodata: []u8,
+    data: []u8,
+    bss_bytes: i32,
+    symbols: []ObjSym,
+    relocs: []ObjReloc,
+    imports: []ObjImport,
+    type_descs: []TypeDescEntry,
+    wasm_fn_types: []WasmSig,
+    wasm_val_types: []WasmValType,
+    debug_files: []string,
+    debug_lines: []DebugLine,
+    func_ranges: []FuncRange,
+    entry_sym: i32,
+}
+
+pub struct LinkedImageData {
+    ok: bool,
+    error: string,
+    text: []u8,
+    rodata_offset: i32,
+    globals: i32,
+    specs: []imports.SymbolSpec,
+    sites: []i32,
+    slots: []i32,
+}
+
+pub fn new(target: TargetKind) -> ObjectModule {
+    ObjectModule {
+        target: target,
+        text: [],
+        rodata: [],
+        data: [],
+        bss_bytes: 0,
+        symbols: [],
+        relocs: [],
+        imports: [],
+        type_descs: [],
+        wasm_fn_types: [],
+        wasm_val_types: [],
+        debug_files: [],
+        debug_lines: [],
+        func_ranges: [],
+        entry_sym: -1,
+    }
+}
+
+fn align_bytes(buf: &mut []u8, align: i32) {
+    if align <= 1 { return }
+    rem := buf.len % align
+    if rem == 0 { return }
+    pad := align - rem
+    for _ in 0..pad { buf.push(u8(0)) }
+}
+
+fn put_le32(buf: &mut []u8, at: i32, val: i64) {
+    assert(at >= 0 && at + 4 <= buf.len)
+    for i in 0..4 { buf[at + i] = u8(val.shr(i * 8).bit_and(255)) }
+}
+
+fn put_le64(buf: &mut []u8, at: i32, val: i64) {
+    assert(at >= 0 && at + 8 <= buf.len)
+    for i in 0..8 { buf[at + i] = u8(val.shr(i * 8).bit_and(255)) }
+}
+
+fn push_le32(buf: &mut []u8, val: i64) {
+    for i in 0..4 { buf.push(u8(val.shr(i * 8).bit_and(255))) }
+}
+
+fn push_le64(buf: &mut []u8, val: i64) {
+    for i in 0..8 { buf.push(u8(val.shr(i * 8).bit_and(255))) }
+}
+
+// --- Section & Metadata Builders ---
+
+pub fn append_text(m: &mut ObjectModule, code: &[]u8, align: i32) -> i32 {
+    align_bytes(&mut m.text, align)
+    start := m.text.len
+    bytes.extend(&mut m.text, &code)
+    start
+}
+
+pub fn append_rodata(m: &mut ObjectModule, blob: &[]u8, align: i32) -> i32 {
+    align_bytes(&mut m.rodata, align)
+    start := m.rodata.len
+    bytes.extend(&mut m.rodata, &blob)
+    start
+}
+
+pub fn append_data(m: &mut ObjectModule, blob: &[]u8, align: i32) -> i32 {
+    align_bytes(&mut m.data, align)
+    start := m.data.len
+    bytes.extend(&mut m.data, &blob)
+    start
+}
+
+pub fn reserve_bss(m: &mut ObjectModule, size: i32, align: i32) -> i32 {
+    if align > 1 {
+        rem := m.bss_bytes % align
+        if rem != 0 { m.bss_bytes += align - rem }
+    }
+    off := m.bss_bytes
+    m.bss_bytes += size
+    off
+}
+
+pub fn add_symbol(m: &mut ObjectModule, name: string, kind: ObjSymKind, section: SectionKind,
+    offset: i32, size: i32, is_exported: bool) -> i32 {
+    id := m.symbols.len
+    m.symbols.push(ObjSym {
+        name: name.clone(),
+        kind: kind,
+        section: section,
+        offset: offset,
+        size: size,
+        is_exported: is_exported,
+    })
+    id
+}
+
+pub fn find_symbol(m: &ObjectModule, name: string) -> i32 {
+    for i in 0..m.symbols.len {
+        if m.symbols[i].name == name { return i }
+    }
+    -1
+}
+
+pub fn add_reloc(m: &mut ObjectModule, section: SectionKind, offset: i32, kind: ObjRelocKind,
+    sym_id: i32, addend: i64, reg: i32) -> i32 {
+    id := m.relocs.len
+    m.relocs.push(ObjReloc {
+        section: section,
+        offset: offset,
+        kind: kind,
+        sym_id: sym_id,
+        addend: addend,
+        reg: reg,
+    })
+    id
+}
+
+fn clone_spec(s: &imports.SymbolSpec) -> imports.SymbolSpec {
+    imports.SymbolSpec {
+        library: s.library.clone(),
+        name: s.name.clone(),
+        kind: s.kind,
+        weak: s.weak,
+        delay: s.delay,
+        lib_weak: s.lib_weak,
+        ordinal: s.ordinal,
+        version_lib: s.version_lib.clone(),
+        version_name: s.version_name.clone(),
+    }
+}
+
+pub fn add_import(m: &mut ObjectModule, spec: &imports.SymbolSpec) -> i32 {
+    for i in 0..m.imports.len {
+        ex := &m.imports[i].spec
+        if ex.library == spec.library && ex.name == spec.name && ex.kind == spec.kind {
+            return i
+        }
+    }
+    id := m.imports.len
+    m.imports.push(ObjImport { spec: clone_spec(&spec), sites: [] })
+    id
+}
+
+pub fn add_import_site(m: &mut ObjectModule, import_id: i32, text_byte_offset: i32) {
+    assert(import_id >= 0 && import_id < m.imports.len)
+    m.imports[import_id].sites.push(text_byte_offset)
+}
+
+pub fn add_type_desc(m: &mut ObjectModule, type_id: i32, name: string,
+    clone_sym: i32, drop_sym: i32, iso_sym: i32, size: i32, align: i32) -> i32 {
+    id := m.type_descs.len
+    m.type_descs.push(TypeDescEntry {
+        type_id: type_id,
+        name: name.clone(),
+        clone_sym: clone_sym,
+        drop_sym: drop_sym,
+        iso_sym: iso_sym,
+        size: size,
+        align: align,
+    })
+    id
+}
+
+// Materializes a read-only .rodata TYPE_DESC_TABLE (32 bytes per entry:
+// [0..8]=clone_fn, [8..16]=drop_fn, [16..24]=iso_fn, [24..28]=size, [28..32]=align)
+// and returns the table symbol id.
+pub fn materialize_type_desc_table(m: &mut ObjectModule) -> i32 {
+    align_bytes(&mut m.rodata, 8)
+    start := m.rodata.len
+    for i in 0..m.type_descs.len {
+        c_sym := m.type_descs[i].clone_sym
+        d_sym := m.type_descs[i].drop_sym
+        i_sym := m.type_descs[i].iso_sym
+        td_sz := m.type_descs[i].size
+        td_al := m.type_descs[i].align
+        entry_off := m.rodata.len
+        push_le64(&mut m.rodata, 0)
+        push_le64(&mut m.rodata, 0)
+        push_le64(&mut m.rodata, 0)
+        push_le32(&mut m.rodata, i64(td_sz))
+        push_le32(&mut m.rodata, i64(td_al))
+        if c_sym >= 0 { _ := add_reloc(&mut m, .Rodata, entry_off, .Abs64, c_sym, 0, 0) }
+        if d_sym >= 0 { _ := add_reloc(&mut m, .Rodata, entry_off + 8, .Abs64, d_sym, 0, 0) }
+        if i_sym >= 0 { _ := add_reloc(&mut m, .Rodata, entry_off + 16, .Abs64, i_sym, 0, 0) }
+    }
+    table_size := m.rodata.len - start
+    add_symbol(&mut m, "__dunder_type_desc_table", .TypeDescTable, .Rodata, start, table_size, false)
+}
+
+pub fn add_wasm_sig(m: &mut ObjectModule, params: &[]WasmValType, rets: &[]WasmValType) -> i32 {
+    for i in 0..m.wasm_fn_types.len {
+        sig := m.wasm_fn_types[i]
+        if sig.param_len == params.len && sig.ret_len == rets.len {
+            mut same := true
+            for k in 0..params.len {
+                if m.wasm_val_types[sig.param_start + k] != params[k] { same = false; break }
+            }
+            if same {
+                for k in 0..rets.len {
+                    if m.wasm_val_types[sig.ret_start + k] != rets[k] { same = false; break }
+                }
+            }
+            if same { return i }
+        }
+    }
+    p_start := m.wasm_val_types.len
+    for i in 0..params.len { m.wasm_val_types.push(params[i]) }
+    r_start := m.wasm_val_types.len
+    for i in 0..rets.len { m.wasm_val_types.push(rets[i]) }
+    id := m.wasm_fn_types.len
+    m.wasm_fn_types.push(WasmSig {
+        param_start: p_start,
+        param_len: params.len,
+        ret_start: r_start,
+        ret_len: rets.len,
+    })
+    id
+}
+
+pub fn add_debug_file(m: &mut ObjectModule, path: string) -> i32 {
+    for i in 0..m.debug_files.len {
+        if m.debug_files[i] == path { return i + 1 }
+    }
+    m.debug_files.push(path.clone())
+    m.debug_files.len
+}
+
+pub fn add_func_range(m: &mut ObjectModule, name: string, file_index: i32, line: i32, start_byte: i32, end_byte: i32) {
+    m.func_ranges.push(FuncRange {
+        name: name.clone(),
+        file_index: file_index,
+        line: line,
+        start_byte: start_byte,
+        end_byte: end_byte,
+    })
+}
+
+pub fn add_debug_line(m: &mut ObjectModule, byte_offset: i32, file_index: i32, line: i32, column: i32) {
+    m.debug_lines.push(DebugLine {
+        byte_offset: byte_offset,
+        file_index: file_index,
+        line: line,
+        column: column,
+    })
+}
+
+// --- Per-Function Parallel Fragment Merge ---
+
+pub fn merge_fragment(dst: &mut ObjectModule, src: &ObjectModule) -> i32 {
+    assert(dst.target == src.target)
+    text_base := append_text(&mut dst, &src.text, 16)
+    rodata_base := append_rodata(&mut dst, &src.rodata, 8)
+    data_base := append_data(&mut dst, &src.data, 8)
+
+    // Rebase symbols
+    mut sym_map: []i32 = []
+    sym_map.reserve(src.symbols.len)
+    for i in 0..src.symbols.len {
+        s := &src.symbols[i]
+        off := if s.section == .Text { text_base + s.offset }
+            else if s.section == .Rodata { rodata_base + s.offset }
+            else { data_base + s.offset }
+        new_id := add_symbol(&mut dst, s.name.clone(), s.kind, s.section, off, s.size, s.is_exported)
+        sym_map.push(new_id)
+    }
+    if src.entry_sym >= 0 && src.entry_sym < sym_map.len && dst.entry_sym < 0 {
+        dst.entry_sym = sym_map[src.entry_sym]
+    }
+
+    // Rebase relocs
+    for i in 0..src.relocs.len {
+        r := src.relocs[i]
+        off := if r.section == .Text { text_base + r.offset }
+            else if r.section == .Rodata { rodata_base + r.offset }
+            else { data_base + r.offset }
+        target_sym := if r.sym_id >= 0 && r.sym_id < sym_map.len { sym_map[r.sym_id] } else { r.sym_id }
+        _ := add_reloc(&mut dst, r.section, off, r.kind, target_sym, r.addend, r.reg)
+    }
+
+    // Merge imports & rebase sites
+    for i in 0..src.imports.len {
+        imp := &src.imports[i]
+        dst_id := add_import(&mut dst, &imp.spec)
+        for k in 0..imp.sites.len {
+            add_import_site(&mut dst, dst_id, text_base + imp.sites[k])
+        }
+    }
+
+    // Merge debug info
+    mut file_map: []i32 = []
+    for i in 0..src.debug_files.len {
+        file_map.push(add_debug_file(&mut dst, src.debug_files[i].clone()))
+    }
+    for i in 0..src.func_ranges.len {
+        fr := &src.func_ranges[i]
+        fidx := if fr.file_index >= 1 && fr.file_index <= file_map.len { file_map[fr.file_index - 1] } else { fr.file_index }
+        add_func_range(&mut dst, fr.name.clone(), fidx, fr.line, text_base + fr.start_byte, text_base + fr.end_byte)
+    }
+    for i in 0..src.debug_lines.len {
+        dl := src.debug_lines[i]
+        fidx := if dl.file_index >= 1 && dl.file_index <= file_map.len { file_map[dl.file_index - 1] } else { dl.file_index }
+        add_debug_line(&mut dst, text_base + dl.byte_offset, fidx, dl.line, dl.column)
+    }
+
+    text_base
+}
+
+// --- Internal Relocation Resolution & Flat Native Image Adapters ---
+
+pub fn flatten_and_link(m: &ObjectModule, text_offset: i32, base_vaddr: i64) -> LinkedImageData {
+    mut out := m.text.clone()
+    align_bytes(&mut out, 16)
+    rodata_base := out.len
+    bytes.extend(&mut out, &m.rodata)
+
+    for i in 0..m.relocs.len {
+        r := m.relocs[i]
+        if r.sym_id < 0 || r.sym_id >= m.symbols.len {
+            return LinkedImageData { ok: false, error: "unresolved relocation symbol", text: [], rodata_offset: 0, globals: 0, specs: [], sites: [], slots: [] }
+        }
+        sym := &m.symbols[r.sym_id]
+        if sym.section == .Data { continue }
+        from_off := if r.section == .Text { r.offset } else if r.section == .Rodata { rodata_base + r.offset } else { -1 }
+        if from_off < 0 { continue }
+        dest_off := (if sym.section == .Text { sym.offset } else { rodata_base + sym.offset }) + i32(r.addend)
+
+        if r.kind == .Arm64Branch26 || r.kind == .Arm64Call26 {
+            word_delta := i64((dest_off - from_off) / 4)
+            base_op: i64 = if r.kind == .Arm64Call26 { 0x94000000 } else { 0x14000000 }
+            put_le32(&mut out, from_off, (base_op + word_delta.bit_and(67108863)).bit_and(0xffffffff))
+        } else if r.kind == .Arm64AdrpAdd {
+            pair := arm64_enc.encode_adrp_add_words(text_offset + from_off, text_offset + dest_off, r.reg)
+            put_le32(&mut out, from_off, pair.w0)
+            put_le32(&mut out, from_off + 4, pair.w1)
+        } else if r.kind == .Arm64AdrpLdr {
+            pair := arm64_enc.encode_adrp_ldr_words(text_offset + from_off, text_offset + dest_off, r.reg)
+            put_le32(&mut out, from_off, pair.w0)
+            put_le32(&mut out, from_off + 4, pair.w1)
+        } else if r.kind == .X86Rel32 || r.kind == .X86RipDisp32 {
+            disp := i64(dest_off - (from_off + 4))
+            put_le32(&mut out, from_off, disp)
+        } else if r.kind == .Abs64 {
+            put_le64(&mut out, from_off, base_vaddr + i64(dest_off))
+        }
+    }
+
+    mut specs: []imports.SymbolSpec = []
+    mut sites: []i32 = []
+    mut slots: []i32 = []
+    for i in 0..m.imports.len {
+        imp := &m.imports[i]
+        specs.push(clone_spec(&imp.spec))
+        for k in 0..imp.sites.len {
+            sites.push(imp.sites[k])
+            slots.push(i)
+        }
+    }
+
+    mut globals := m.bss_bytes
+    if m.data.len > globals { globals = m.data.len }
+
+    LinkedImageData {
+        ok: true,
+        error: "",
+        text: move out,
+        rodata_offset: rodata_base,
+        globals: globals,
+        specs: move specs,
+        sites: move sites,
+        slots: move slots,
+    }
+}
+
+pub fn build_dwarf(m: &ObjectModule, text_len: i32, base_addr: i64,
+    producer: string, comp_dir: string, main_file: string) -> dwarf.Bundle {
+    mut funcs: []dwarf.FunctionInfo = []
+    for i in 0..m.func_ranges.len {
+        fr := &m.func_ranges[i]
+        if fr.end_byte <= fr.start_byte || fr.start_byte < 0 || fr.end_byte > text_len { continue }
+        funcs.push(dwarf.FunctionInfo {
+            name: fr.name.clone(),
+            file_index: fr.file_index,
+            line: fr.line,
+            low_pc: base_addr + i64(fr.start_byte),
+            high_pc: base_addr + i64(fr.end_byte),
+        })
+    }
+    mut lines: []dwarf.LineInfo = []
+    for i in 0..m.debug_lines.len {
+        dl := m.debug_lines[i]
+        if dl.byte_offset < 0 || dl.byte_offset >= text_len { continue }
+        lines.push(dwarf.LineInfo {
+            address: base_addr + i64(dl.byte_offset),
+            file_index: dl.file_index,
+            line: dl.line,
+            column: dl.column,
+        })
+    }
+    mut files := m.debug_files.clone()
+    if files.len == 0 { files.push(main_file.clone()) }
+    input := dwarf.Input {
+        producer: producer.clone(),
+        comp_dir: comp_dir.clone(),
+        main_file: main_file.clone(),
+        files: move files,
+        low_pc: base_addr,
+        high_pc: base_addr + i64(text_len),
+        functions: move funcs,
+        lines: move lines,
+    }
+    dwarf.build(&input)
+}
+
+pub fn emit_macho(m: &ObjectModule, cfg: &macho.MachoConfig, signer: &macho.Signer,
+    debug_info: bool, producer: string, comp_dir: string, main_file: string) -> []u8 {
+    has_dynamic := m.imports.len > 0 || m.bss_bytes > 0 || m.data.len > 0 ||
+        cfg.rpaths.len > 0 || cfg.entitlements != ""
+    mut probe_specs: []imports.SymbolSpec = []
+    for i in 0..m.imports.len { probe_specs.push(clone_spec(&m.imports[i].spec)) }
+    mut probe_globals := m.bss_bytes
+    if m.data.len > probe_globals { probe_globals = m.data.len }
+
+    text_off := if has_dynamic {
+        macho.dynamic_text_offset_for(&probe_specs, probe_globals, debug_info, &cfg)
+    } else if debug_info {
+        macho.code_page_bytes()
+    } else {
+        432
+    }
+    base_vaddr: i64 = 4294967296 + i64(text_off)
+    linked := flatten_and_link(&m, text_off, base_vaddr)
+    assert(linked.ok)
+
+    if debug_info {
+        dbg := build_dwarf(&m, linked.text.len, base_vaddr, producer, comp_dir, main_file)
+        if has_dynamic {
+            return macho.dynamic_storage_debug_configured(&linked.text, &linked.specs,
+                &linked.sites, &linked.slots, linked.globals, &dbg, &cfg, &signer)
+        }
+        return macho.image_debug_using(&linked.text, &dbg, &signer)
+    }
+    if has_dynamic {
+        return macho.dynamic_storage_configured(&linked.text, &linked.specs,
+            &linked.sites, &linked.slots, linked.globals, &cfg, &signer)
+    }
+    macho.image_using(&linked.text, &signer)
+}
+
+pub fn emit_elf(m: &ObjectModule, cfg: &elf.ElfConfig,
+    debug_info: bool, producer: string, comp_dir: string, main_file: string) -> []u8 {
+    machine := if m.target == .X86_64Linux { 62 } else { 183 }
+    text_off := 4096
+    base_vaddr: i64 = 4194304 + i64(text_off)
+    linked := flatten_and_link(&m, text_off, base_vaddr)
+    assert(linked.ok)
+    has_dynamic := linked.specs.len > 0 || linked.globals > 0
+    base_elf := if has_dynamic {
+        elf.dynamic_image_configured(&linked.text, &linked.specs, &linked.sites, &linked.slots, machine, linked.globals, &cfg)
+    } else {
+        elf.image_for(&linked.text, machine)
+    }
+    if debug_info {
+        dbg := build_dwarf(&m, linked.text.len, base_vaddr, producer, comp_dir, main_file)
+        return elf.attach_debug(&base_elf, linked.text.len, &dbg)
+    }
+    base_elf
+}
+
+pub fn emit_pe(m: &ObjectModule, cfg: &pe.PeConfig) -> []u8 {
+    text_off := 4096
+    base_vaddr: i64 = 0x140000000 + i64(text_off)
+    linked := flatten_and_link(&m, text_off, base_vaddr)
+    assert(linked.ok)
+    pe.image_configured(&linked.text, &linked.specs, &linked.sites, &linked.slots, linked.globals, &cfg)
+}
