@@ -1,0 +1,519 @@
+// End-to-end unit tests for Phase 4B:
+// Native x86_64 SysV (Linux ELF64) & Win64 (Windows PE32+) LIR/ISel + Linear-Scan RegAlloc
+// (`selfhost/backend/x86_isel.ddr`).
+//
+// Pipeline tested end-to-end:
+//   Source (.ddr) -> parser -> hir_lower -> hir_mono -> mir_check
+//                 -> ssa_lower -> ssa_opt -> ssa_verify
+//                 -> x86_isel -> ObjectModule -> ELF64 / PE32+
+
+import ..selfhost.frontend.diagnostics as diag
+import ..selfhost.frontend.parser as parser
+import ..selfhost.hir.hir_types as ht
+import ..selfhost.hir.hir_body as hb
+import ..selfhost.hir.hir_lower as hir_lower
+import ..selfhost.hir.hir_mono as hir_mono
+import ..selfhost.mir2.mir_check as mir_check
+import ..selfhost.ssa.ssa_ir as ssa
+import ..selfhost.ssa.ssa_verify as ssa_verify
+import ..selfhost.ssa.ssa_lower as ssa_lower
+import ..selfhost.ssa.ssa_opt as ssa_opt
+import ..selfhost.backend.x86_enc as x64
+import ..selfhost.backend.object_module as obj
+import ..selfhost.backend.x86_isel as x86_isel
+
+struct CompiledSsa {
+    ok: bool,
+    hir: hb.HirProgram,
+    ssa_prog: ssa.SsaProgram,
+}
+
+fn compile_ssa_for(src: string, platform: i32, run_opt: bool) -> CompiledSsa {
+    tree := parser.parse_source("x86_unit.ddr", src)
+    mods: []hb.ModuleInput = [hb.ModuleInput {
+        mod_id: 0, path: "x86_unit.ddr", source: src.clone(), caps_mask: 0, ast: move tree,
+    }]
+    edges: []hb.ImportEdge = []
+    mut prog := hir_lower.lower_modules(&mods, &edges, platform)
+    if !prog.ok {
+        return CompiledSsa { ok: false, hir: move prog, ssa_prog: ssa.new_program(0, -1) }
+    }
+    hir_mono.monomorphize(&mut prog)
+    chk := mir_check.check_program(&prog)
+    if !chk.ok {
+        return CompiledSsa { ok: false, hir: move prog, ssa_prog: ssa.new_program(0, -1) }
+    }
+    mut diags: []diag.Diagnostic = []
+    mut sp := ssa_lower.lower_program(&prog, &chk.bodies, &mut diags)
+    if !ssa_verify.verify_program(&prog.types, &sp, &mut diags) || diags.len != 0 {
+        return CompiledSsa { ok: false, hir: move prog, ssa_prog: move sp }
+    }
+    if run_opt {
+        if !ssa_opt.optimize_program(&prog.types, &mut sp, true, &mut diags) || diags.len != 0 {
+            return CompiledSsa { ok: false, hir: move prog, ssa_prog: move sp }
+        }
+    }
+    CompiledSsa { ok: true, hir: move prog, ssa_prog: move sp }
+}
+
+fn read_u16_le(buf: &[]u8, off: i32) -> i32 {
+    i32(buf[off]) + i32(buf[off + 1]) * 256
+}
+
+fn read_u32_le(buf: &[]u8, off: i32) -> i64 {
+    i64(buf[off])
+        .bit_or(i64(buf[off + 1]).shl(8))
+        .bit_or(i64(buf[off + 2]).shl(16))
+        .bit_or(i64(buf[off + 3]).shl(24))
+}
+
+fn read_i64_le(buf: &[]u8, off: i32) -> i64 {
+    lo := read_u32_le(&buf, off)
+    hi := read_u32_le(&buf, off + 4)
+    lo.bit_or(hi.shl(32))
+}
+
+fn assert_valid_elf64_x86(img: &[]u8) {
+    assert(img.len > 4096)
+    // ELF magic: 0x7f 'E' 'L' 'F'
+    assert(i32(img[0]) == 0x7f && i32(img[1]) == 69 && i32(img[2]) == 76 && i32(img[3]) == 70)
+    // ELFCLASS64 (2), ELFDATA2LSB (1), EV_CURRENT (1)
+    assert(i32(img[4]) == 2 && i32(img[5]) == 1 && i32(img[6]) == 1)
+    // e_machine == EM_X86_64 (62)
+    assert(read_u16_le(&img, 18) == 62)
+    // e_entry == 0x401000 (4198400)
+    assert(read_i64_le(&img, 24) == 4198400)
+    // e_ehsize == 64, e_phentsize == 56, e_phnum >= 2
+    assert(read_u16_le(&img, 52) == 64 && read_u16_le(&img, 54) == 56 && read_u16_le(&img, 56) >= 2)
+}
+
+fn assert_valid_pe32_plus_x86(img: &[]u8) {
+    assert(img.len > 512)
+    // DOS header "MZ"
+    assert(i32(img[0]) == 77 && i32(img[1]) == 90)
+    lfanew := i32(read_u32_le(&img, 60))
+    assert(lfanew == 128)
+    // PE\0\0 signature
+    assert(i32(img[lfanew]) == 80 && i32(img[lfanew + 1]) == 69 && i32(img[lfanew + 2]) == 0 && i32(img[lfanew + 3]) == 0)
+    // Machine == IMAGE_FILE_MACHINE_AMD64 (0x8664)
+    assert(read_u16_le(&img, lfanew + 4) == 0x8664)
+    // Optional header magic == PE32+ (0x020B)
+    assert(read_u16_le(&img, lfanew + 24) == 0x020B)
+    // AddressOfEntryPoint == 0x1000 (.text RVA)
+    assert(read_u32_le(&img, lfanew + 24 + 16) == 0x1000)
+    // ImageBase == 0x140000000
+    assert(read_i64_le(&img, lfanew + 24 + 24) == 5368709120)
+    // Import directory & IAT present (kernel32.dll ExitProcess / VirtualAlloc / WriteFile)
+    assert(read_u32_le(&img, lfanew + 24 + 120) > 0)
+    assert(read_u32_le(&img, lfanew + 24 + 208) > 0)
+}
+
+fn find_ssa_fn(sp: &ssa.SsaProgram, name: string) -> i32 {
+    for i in 0..sp.funcs.len {
+        if sp.funcs[i].name == name { return i }
+    }
+    -1
+}
+
+fn contains_ascii(buf: &[]u8, needle: string) -> bool {
+    if needle.len == 0 || buf.len < needle.len { return false }
+    for i in 0..(buf.len - needle.len + 1) {
+        mut ok := true
+        for j in 0..needle.len {
+            if buf[i + j] != needle[j] { ok = false; break }
+        }
+        if ok { return true }
+    }
+    false
+}
+
+// =========================================================================
+// 1. Native Register Allocator & ABI Rules (SysV vs Win64)
+// =========================================================================
+
+@test
+fn x86_isel_regalloc_sysv_vs_win64_abi_and_sret_rules() {
+    src := "struct Small8 { a: i32, b: i32 }\n" +
+        "struct Med12 { a: i32, b: i32, c: i32 }\n" +
+        "struct Big24 { a: i64, b: i64, c: i64 }\n" +
+        "fn helper(x: i64) -> i64 { x * 3 + 1 }\n" +
+        "fn cross_call(a: i64, b: i64, c: i64) -> i64 {\n" +
+        "    h1 := helper(a)\n" +
+        "    h2 := helper(b)\n" +
+        "    h1 + h2 + c\n" +
+        "}\n" +
+        "fn make_med(x: i32) -> Med12 { Med12 { a: x, b: x + 1, c: x + 2 } }\n" +
+        "fn make_big(x: i64) -> Big24 { Big24 { a: x, b: x + 1, c: x + 2 } }\n" +
+        "fn pick_view(s: &str) -> &str { s }\n" +
+        "fn main() -> i32 {\n" +
+        "    m := make_med(1)\n" +
+        "    b := make_big(2)\n" +
+        "    v := pick_view(\"hi\")\n" +
+        "    i32(cross_call(b.a, b.b, b.c)) + m.a + i32(v.len)\n" +
+        "}\n"
+
+    // Check SysV Linux (platform 2)
+    c_lin := compile_ssa_for(src, 2, true)
+    assert(c_lin.ok)
+    ci := find_ssa_fn(&c_lin.ssa_prog, "cross_call")
+    mi := find_ssa_fn(&c_lin.ssa_prog, "make_med")
+    bi := find_ssa_fn(&c_lin.ssa_prog, "make_big")
+    pi := find_ssa_fn(&c_lin.ssa_prog, "pick_view")
+    assert(ci >= 0 && mi >= 0 && bi >= 0 && pi >= 0)
+
+    // SysV sret: > 16B only (Med12 is 12B -> REPR_PAIR, Big24 is 24B -> REPR_MEM sret!)
+    assert(!x86_isel.is_sret_return(&c_lin.hir.types, c_lin.ssa_prog.funcs[mi].ret_ty, false))
+    assert(x86_isel.is_sret_return(&c_lin.hir.types, c_lin.ssa_prog.funcs[bi].ret_ty, false))
+    assert(x86_isel.classify_repr(&c_lin.hir.types, c_lin.ssa_prog.funcs[pi].ret_ty, false) == x86_isel.REPR_PAIR)
+
+    // Win64 sret: > 8B aggregates (BOTH Med12 and Big24 use sret in RCX; FatStr stays REPR_PAIR!)
+    assert(x86_isel.is_sret_return(&c_lin.hir.types, c_lin.ssa_prog.funcs[mi].ret_ty, true))
+    assert(x86_isel.is_sret_return(&c_lin.hir.types, c_lin.ssa_prog.funcs[bi].ret_ty, true))
+    assert(x86_isel.classify_repr(&c_lin.hir.types, c_lin.ssa_prog.funcs[pi].ret_ty, true) == x86_isel.REPR_PAIR)
+
+    // Verify SysV linear scan uses real GPRs and NEVER allocates reserved RSP/RBP/R10/R11/R15
+    ra_sysv := x86_isel.alloc_regs_for_func(&c_lin.hir.types, &c_lin.ssa_prog.funcs[ci], .X86_64Linux)
+    assert(ra_sysv.gp_regs_assigned > 0)
+    for i in 0..ra_sysv.locs.len {
+        loc := ra_sysv.locs[i]
+        if loc.kind == x86_isel.LOC_GP_REG || loc.kind == x86_isel.LOC_PAIR_REG {
+            assert(loc.reg != x64.RSP && loc.reg != x64.RBP && loc.reg != x64.R10 && loc.reg != x64.R11 && loc.reg != x64.R15)
+        }
+    }
+    // Check Win64 linear scan respects 32B shadow space and Win64 callee-saved GPR set
+    ra_win := x86_isel.alloc_regs_for_func(&c_lin.hir.types, &c_lin.ssa_prog.funcs[ci], .X86_64Windows)
+    assert(ra_win.max_outgoing_bytes >= x64.WIN64_SHADOW_SPACE)
+    assert(ra_win.frame_sub_bytes >= 0)
+    for i in 0..ra_win.saved_gp_regs.len {
+        assert(x64.win64_is_callee_saved(ra_win.saved_gp_regs[i]))
+    }
+
+    // Emit both ELF64 and PE32+ executables
+    elf_img := x86_isel.emit_executable(&c_lin.ssa_prog, &c_lin.hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_img)
+    c_win := compile_ssa_for(src, 5, true)
+    assert(c_win.ok)
+    pe_img := x86_isel.emit_executable(&c_win.ssa_prog, &c_win.hir, .X86_64Windows)
+    assert_valid_pe32_plus_x86(&pe_img)
+    assert(contains_ascii(&pe_img, "ExitProcess"))
+    assert(contains_ascii(&pe_img, "VirtualAlloc"))
+    assert(contains_ascii(&pe_img, "WriteFile"))
+}
+
+// =========================================================================
+// 2. Arithmetic, Loops, Recursive & Iterative Fibonacci (Cycle-Safe Block Params!)
+// =========================================================================
+
+@test
+fn x86_isel_arithmetic_loops_and_fibonacci_both_targets() {
+    src := "fn fib_rec(n: i32) -> i32 {\n" +
+        "    if n <= 1 { return n }\n" +
+        "    fib_rec(n - 1) + fib_rec(n - 2)\n" +
+        "}\n" +
+        "fn fib_iter(n: i32) -> i32 {\n" +
+        "    mut a := 0\n" +
+        "    mut b := 1\n" +
+        "    mut i := 0\n" +
+        "    while i < n {\n" +
+        "        next := a + b\n" +
+        "        a = b\n" +
+        "        b = next\n" +
+        "        i += 1\n" +
+        "    }\n" +
+        "    a\n" +
+        "}\n" +
+        "fn main() -> i32 {\n" +
+        "    r := fib_rec(10)\n" +
+        "    it := fib_iter(10)\n" +
+        "    assert(r == 55)\n" +
+        "    assert(it == 55)\n" +
+        "    r\n" +
+        "}\n"
+
+    c_lin := compile_ssa_for(src, 2, true)
+    assert(c_lin.ok)
+    m_lin := x86_isel.emit_program(&c_lin.ssa_prog, &c_lin.hir, .X86_64Linux)
+    assert(obj.find_symbol(&m_lin, "_start") >= 0)
+    assert(obj.find_symbol(&m_lin, "main") >= 0)
+    assert(obj.find_symbol(&m_lin, "fib_rec") >= 0)
+    assert(obj.find_symbol(&m_lin, "fib_iter") >= 0)
+    assert(m_lin.relocs.len > 0)
+    // _start must sit at .text offset 0
+    assert(m_lin.symbols[obj.find_symbol(&m_lin, "_start")].offset == 0)
+
+    elf_img := x86_isel.emit_executable(&c_lin.ssa_prog, &c_lin.hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_img)
+    // Also verify DWARF debug ELF64 emission
+    elf_dbg := x86_isel.emit_executable_debug(&c_lin.ssa_prog, &c_lin.hir, .X86_64Linux, "fib.ddr")
+    assert_valid_elf64_x86(&elf_dbg)
+    assert(elf_dbg.len > elf_img.len)
+
+    c_win := compile_ssa_for(src, 5, true)
+    assert(c_win.ok)
+    pe_img := x86_isel.emit_executable(&c_win.ssa_prog, &c_win.hir, .X86_64Windows)
+    assert_valid_pe32_plus_x86(&pe_img)
+}
+
+// =========================================================================
+// 3. Structs, Enums, Match/Switch, &str Fat Views, Arrays, Regions & Inlining
+// =========================================================================
+
+@test
+fn x86_isel_structs_enums_fat_views_arrays_and_inlining() {
+    src := "struct Vec2 { x: i32, y: i32 }\n" +
+        "impl Vec2 {\n" +
+        "    fn dot(&self, other: &Vec2) -> i32 { self.x * other.x + self.y * other.y }\n" +
+        "}\n" +
+        "enum Shape {\n" +
+        "    Dot,\n" +
+        "    Line(i32),\n" +
+        "    Rect(i32, i32),\n" +
+        "}\n" +
+        "fn shape_score(s: Shape) -> i32 {\n" +
+        "    match s {\n" +
+        "        .Dot => 1,\n" +
+        "        .Line(n) => n,\n" +
+        "        .Rect(w, h) => w * h,\n" +
+        "    }\n" +
+        "}\n" +
+        "fn sum_slice(xs: &[]i32) -> i32 {\n" +
+        "    mut total := 0\n" +
+        "    for i in 0..xs.len {\n" +
+        "        total += xs[i]\n" +
+        "    }\n" +
+        "    total\n" +
+        "}\n" +
+        "fn str_head_len(s: &str) -> i32 {\n" +
+        "    sub := s[0..3]\n" +
+        "    i32(sub.len)\n" +
+        "}\n" +
+        "fn main() -> i32 {\n" +
+        "    a := Vec2 { x: 3, y: 4 }\n" +
+        "    b := Vec2 { x: 2, y: 5 }\n" +
+        "    d := a.dot(&b)\n" +
+        "    sh := shape_score(.Rect(3, 4))\n" +
+        "    arr: []i32 = [1, 2, 3, 4]\n" +
+        "    sm := sum_slice(&arr)\n" +
+        "    txt := \"hello\"\n" +
+        "    hl := str_head_len(txt.as_str())\n" +
+        "    region r(128) {\n" +
+        "        buf := r.alloc(4)\n" +
+        "        _ := buf.len\n" +
+        "    }\n" +
+        "    d + sh + sm + hl\n" +
+        "}\n"
+
+    // Test both unoptimized AND optimized (inlined + mem2reg + bounds-elided) SSA!
+    c_raw := compile_ssa_for(src, 2, false)
+    assert(c_raw.ok)
+    elf_raw := x86_isel.emit_executable(&c_raw.ssa_prog, &c_raw.hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_raw)
+
+    c_opt := compile_ssa_for(src, 2, true)
+    assert(c_opt.ok)
+    elf_opt := x86_isel.emit_executable(&c_opt.ssa_prog, &c_opt.hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_opt)
+    assert(contains_ascii(&elf_opt, "hello"))
+
+    c_win := compile_ssa_for(src, 5, true)
+    assert(c_win.ok)
+    pe_opt := x86_isel.emit_executable(&c_win.ssa_prog, &c_win.hir, .X86_64Windows)
+    assert_valid_pe32_plus_x86(&pe_opt)
+    assert(contains_ascii(&pe_opt, "hello"))
+}
+
+// =========================================================================
+// 4. Floating-Point (SSE2), Closures, Function Pointers & Traps
+// =========================================================================
+
+@test
+fn x86_isel_sse2_fp_closures_fn_ptrs_and_traps() {
+    src := "fn apply_fn(f: fn(i32) -> i32, x: i32) -> i32 { f(x) }\n" +
+        "fn double_it(x: i32) -> i32 { x * 2 }\n" +
+        "fn fma_like(a: f64, b: f64, c: f64) -> f64 {\n" +
+        "    p := a * b + c\n" +
+        "    if p > 10.0 { p - 1.5 } else { -p }\n" +
+        "}\n" +
+        "fn checked_div(a: i32, b: i32) -> i32 { a / b }\n" +
+        "fn main() -> i32 {\n" +
+        "    r1 := apply_fn(double_it, 7)\n" +
+        "    cl := fn(v: i32) -> i32 { v + 5 }\n" +
+        "    r2 := cl(10)\n" +
+        "    fp := fma_like(3.0, 4.0, 2.5)\n" +
+        "    r3 := checked_div(20, 4)\n" +
+        "    r1 + r2 + r3 + i32(fp)\n" +
+        "}\n"
+
+    c_lin := compile_ssa_for(src, 2, true)
+    assert(c_lin.ok)
+    fi := find_ssa_fn(&c_lin.ssa_prog, "fma_like")
+    assert(fi >= 0)
+    ra_fp := x86_isel.alloc_regs_for_func(&c_lin.hir.types, &c_lin.ssa_prog.funcs[fi], .X86_64Linux)
+    assert(ra_fp.uses_fp && ra_fp.fp_regs_assigned > 0)
+
+    elf_img := x86_isel.emit_executable(&c_lin.ssa_prog, &c_lin.hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_img)
+
+    c_win := compile_ssa_for(src, 5, true)
+    assert(c_win.ok)
+    ra_fp_win := x86_isel.alloc_regs_for_func(&c_win.hir.types, &c_win.ssa_prog.funcs[find_ssa_fn(&c_win.ssa_prog, "fma_like")], .X86_64Windows)
+    assert(ra_fp_win.uses_fp && ra_fp_win.saved_fp_regs.len >= 2)
+    pe_img := x86_isel.emit_executable(&c_win.ssa_prog, &c_win.hir, .X86_64Windows)
+    assert_valid_pe32_plus_x86(&pe_img)
+}
+
+// =========================================================================
+// 5. ExternCall Dynamic Imports (ELF64 PT_DYNAMIC/GOT & PE32+ IAT) + Many Args
+// =========================================================================
+
+@test
+fn x86_isel_extern_call_imports_and_many_args_stack_spilling() {
+    // Build an explicit SSA program with:
+    // - 8-parameter GP function (exercises SysV 6 GP regs + 2 stack args AND Win64 4 GP regs + 4 stack args)
+    // - An ExternCall to libc `puts` (exercises ELF64 dynamic GOT & PE32+ IAT!)
+    mut hir := hb.new_program(2)
+    cstr_params: []ht.ParamEntry = [ht.ParamEntry { ty: ht.TY_CSTR, mode: .CopyVal }]
+    puts_sig := ht.add_extern_fn(&mut hir.types, &cstr_params, ht.TY_I32)
+    mut gp8_params: []ht.ParamEntry = []
+    for _ in 0..8 { gp8_params.push(ht.ParamEntry { ty: ht.TY_I64, mode: .CopyVal }) }
+    no_from: []ht.FromEdge = []
+    sum8_sig := ht.add_fn_ptr(&mut hir.types, &gp8_params, ht.TY_I64, &no_from)
+    no_params: []ht.ParamEntry = []
+    main_sig := ht.add_fn_ptr(&mut hir.types, &no_params, ht.TY_I32, &no_from)
+    ht.seal(&mut hir.types)
+
+    mut hf_puts := hb.new_fn(0, "puts", 0, puts_sig, ht.TY_I32, 1)
+    hf_puts.is_extern = true
+    hf_puts.extern_lib = "c"
+    hf_puts.extern_symbol = "puts"
+    _ := hb.add_fn(&mut hir, move hf_puts)
+
+    hf_sum8 := hb.new_fn(1, "sum8", 0, sum8_sig, ht.TY_I64, 8)
+    _ := hb.add_fn(&mut hir, move hf_sum8)
+
+    hf_main := hb.new_fn(2, "main", 0, main_sig, ht.TY_I32, 0)
+    _ := hb.add_fn(&mut hir, move hf_main)
+    hir.entry_fn = 2
+
+    mut sp := ssa.new_program(3, 2)
+
+    // sum8(p0..p7) -> p0+p1+p2+p3+p4+p5+p6+p7
+    mut f_sum8 := ssa.new_func(1, 0, "sum8", "ext.ddr", sum8_sig, ht.TY_I64, 8, false)
+    mut ps: []i32 = []
+    for _ in 0..8 { ps.push(ssa.add_fn_param_val(&mut f_sum8, ht.TY_I64)) }
+    b0 := ssa.add_block(&mut f_sum8)
+    mut acc := ps[0]
+    for i in 1..8 {
+        acc = ssa.emit_binary(&mut f_sum8, b0, ht.TY_I64, hb.BINOP_ADD, acc, ps[i], 0, 0)
+    }
+    _ := ssa.set_return(&mut f_sum8, b0, acc, 0, 0)
+    ssa.compute_preds(&mut f_sum8)
+    _ := ssa.add_program_func(&mut sp, move f_sum8)
+
+    // main() -> calls puts("ok"), calls sum8(1..8), returns i32(res)
+    mut f_main := ssa.new_func(2, 0, "main", "ext.ddr", main_sig, ht.TY_I32, 0, false)
+    m0 := ssa.add_block(&mut f_main)
+    m1 := ssa.add_block(&mut f_main)
+    m2 := ssa.add_block(&mut f_main)
+    sidx := ssa.add_const_str(&mut f_main, "ok")
+    cstr_v := ssa.emit_inst(&mut f_main, m0, ssa.make_inst(.ConstCStr, ht.TY_CSTR, -1, -1, -1, 0, -1, 0, sidx, 0, 0, 0, 0))
+    p_args: []i32 = [cstr_v]
+    pa_s := ssa.push_val_args(&mut f_main, &p_args)
+    puts_res := ssa.add_val(&mut f_main, ht.TY_I32, m0, ssa.DEF_TERM_RESULT)
+    mut ext_tm := ssa.make_term(.ExternCall)
+    ext_tm.callee = 0
+    ext_tm.sig_ty = puts_sig
+    ext_tm.arg_start = pa_s
+    ext_tm.arg_len = 1
+    ext_tm.dest_val = puts_res
+    ext_tm.target_a = m1
+    _ := ssa.set_term(&mut f_main, m0, ext_tm)
+
+    mut s8_args: []i32 = []
+    for k in 1..9 { s8_args.push(ssa.emit_const_int(&mut f_main, m1, ht.TY_I64, i64(k), 0, 0)) }
+    s8_s := ssa.push_val_args(&mut f_main, &s8_args)
+    s8_res := ssa.add_val(&mut f_main, ht.TY_I64, m1, ssa.DEF_TERM_RESULT)
+    mut c_tm := ssa.make_term(.Call)
+    c_tm.callee = 1
+    c_tm.sig_ty = sum8_sig
+    c_tm.arg_start = s8_s
+    c_tm.arg_len = 8
+    c_tm.dest_val = s8_res
+    c_tm.target_a = m2
+    _ := ssa.set_term(&mut f_main, m1, c_tm)
+
+    ret32 := ssa.emit_cast(&mut f_main, m2, ht.TY_I32, s8_res, 0, 0)
+    _ := ssa.set_return(&mut f_main, m2, ret32, 0, 0)
+    ssa.compute_preds(&mut f_main)
+    _ := ssa.add_program_func(&mut sp, move f_main)
+
+    mut vdiags: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&hir.types, &sp, &mut vdiags))
+
+    // Verify dynamic ELF64 with libc `puts` import
+    m_lin := x86_isel.emit_program(&sp, &hir, .X86_64Linux)
+    assert(m_lin.imports.len == 1 && m_lin.imports[0].spec.name == "puts" && m_lin.imports[0].sites.len == 1)
+    elf_dyn := x86_isel.emit_executable(&sp, &hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_dyn)
+    assert(contains_ascii(&elf_dyn, "libc.so.6"))
+    assert(contains_ascii(&elf_dyn, "puts"))
+
+    // Verify PE32+ with kernel32 + msvcrt `puts` imports
+    m_win := x86_isel.emit_program(&sp, &hir, .X86_64Windows)
+    assert(m_win.imports.len == 5)
+    pe_dyn := x86_isel.emit_executable(&sp, &hir, .X86_64Windows)
+    assert_valid_pe32_plus_x86(&pe_dyn)
+    assert(contains_ascii(&pe_dyn, "msvcrt.dll"))
+    assert(contains_ascii(&pe_dyn, "puts"))
+}
+
+// =========================================================================
+// 6. Parallel Copy Cycle Resolution (Direct Swap Loop Test)
+// =========================================================================
+
+@test
+fn x86_isel_parallel_copy_cycle_in_loop() {
+    // Explicit cyclic block-param swap: (a, b, n) -> (b, a, n - 1)
+    mut hir := hb.new_program(2)
+    ht.seal(&mut hir.types)
+    mut sp := ssa.new_program(1, 0)
+
+    mut f := ssa.new_func(0, 0, "main", "cyc.ddr", -1, ht.TY_I32, 0, false)
+    b0 := ssa.add_block(&mut f)
+    b_hdr := ssa.add_block(&mut f)
+    b_body := ssa.add_block(&mut f)
+    b_exit := ssa.add_block(&mut f)
+
+    pa := ssa.add_block_param(&mut f, b_hdr, ht.TY_I32)
+    pb := ssa.add_block_param(&mut f, b_hdr, ht.TY_I32)
+    pn := ssa.add_block_param(&mut f, b_hdr, ht.TY_I32)
+
+    c10 := ssa.emit_const_int(&mut f, b0, ht.TY_I32, 10, 0, 0)
+    c20 := ssa.emit_const_int(&mut f, b0, ht.TY_I32, 20, 0, 0)
+    c3 := ssa.emit_const_int(&mut f, b0, ht.TY_I32, 3, 0, 0)
+    init_args: []i32 = [c10, c20, c3]
+    _ := ssa.set_goto(&mut f, b0, b_hdr, &init_args, 0, 0)
+
+    c0 := ssa.emit_const_int(&mut f, b_hdr, ht.TY_I32, 0, 0, 0)
+    cond := ssa.emit_binary(&mut f, b_hdr, ht.TY_BOOL, hb.BINOP_GT, pn, c0, 0, 0)
+    empty: []i32 = []
+    _ := ssa.set_branch(&mut f, b_hdr, cond, b_body, &empty, b_exit, &empty, 0, 0)
+
+    c1 := ssa.emit_const_int(&mut f, b_body, ht.TY_I32, 1, 0, 0)
+    n_dec := ssa.emit_binary(&mut f, b_body, ht.TY_I32, hb.BINOP_SUB, pn, c1, 0, 0)
+    // Pure cycle: (pa, pb) <- (pb, pa)!
+    swap_args: []i32 = [pb, pa, n_dec]
+    _ := ssa.set_goto(&mut f, b_body, b_hdr, &swap_args, 0, 0)
+
+    _ := ssa.set_return(&mut f, b_exit, pa, 0, 0)
+    ssa.compute_preds(&mut f)
+    _ := ssa.add_program_func(&mut sp, move f)
+
+    mut vdiags: []diag.Diagnostic = []
+    assert(ssa_verify.verify_program(&hir.types, &sp, &mut vdiags))
+
+    elf_img := x86_isel.emit_executable(&sp, &hir, .X86_64Linux)
+    assert_valid_elf64_x86(&elf_img)
+    pe_img := x86_isel.emit_executable(&sp, &hir, .X86_64Windows)
+    assert_valid_pe32_plus_x86(&pe_img)
+}
